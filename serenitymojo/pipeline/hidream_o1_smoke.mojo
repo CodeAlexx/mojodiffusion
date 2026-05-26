@@ -41,6 +41,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.models.dit.hidream_o1 import (
     HiDreamO1Config,
+    HiDreamO1DiT,
     build_mrope_positions,
 )
 from serenitymojo.sampling.hidream_o1_scheduler import HiDreamO1Scheduler
@@ -126,10 +127,148 @@ def gather_image_rows(
     return ts_slice(x_pred, 1, s_text, image_len, ctx)
 
 
+# ── STRUCTURAL WORKAROUND for the 1.0.0b1 comptime-instantiator segfault ─────
+# BISECTED (this session): the EXIT=139 segfault is triggered by `dit.forward`
+# co-monomorphizing with `unpatchify` *while the comptime sequence length is a
+# FUNCTION-LOCAL `comptime`*. Pinned exactly:
+#   - DiT.forward alone .......................... EXIT=0
+#   - DiT.forward + scheduler.step ............... EXIT=0   (NOT the trigger)
+#   - DiT.forward + patchify ..................... EXIT=0
+#   - DiT.forward + save_png ..................... EXIT=0
+#   - DiT.forward + unpatchify (local comptime S)  EXIT=139 ← toxic pair
+#   - same, but S is a MODULE-LEVEL comptime and
+#     the denoise loop is its own top-level def ... EXIT=0  ← the fix
+# Both `unpatchify` and the DiT's internal `_repeat_kv` use the same dynamic
+# `Layout.row_major(-1)` GPU-kernel pattern; instantiating both transitively
+# from one `main` with a function-scoped comptime S crashes the instantiator.
+# Hoisting S to module scope (qwenimage_pipeline_smoke.mojo style) + putting the
+# whole DiT/scheduler denoise loop in its own `def denoise()` (so `main` reaches
+# unpatchify and the DiT loop through separate top-level defs, with S fixed at
+# module scope) avoids the crash. This is the same structure the working
+# qwenimage pipeline uses. NOTE: a mere `def`-split with a *local* comptime S
+# does NOT help — the comptime must be at module scope.
+#
+# S_TOTAL = s_text + image_len is the DiT's static SDPA length. The smoke fixes
+# it for the tiny 2x2-patch case (assert s_text + image_len == S_TOTAL). A real
+# run picks S from the actual prompt/resolution — a production variant templates
+# `denoise` over the supported S values or dispatches on a small table.
+comptime SMOKE_H = 64
+comptime SMOKE_W = 64
+comptime SMOKE_PATCH = 32
+comptime SMOKE_HP = SMOKE_H // SMOKE_PATCH            # 2
+comptime SMOKE_WP = SMOKE_W // SMOKE_PATCH            # 2
+comptime SMOKE_IMAGE_LEN = SMOKE_HP * SMOKE_WP        # 4
+comptime SMOKE_S_TOTAL = 4                            # full seq for the smoke
+
+
+# Full denoise loop (DiT forwards + CFG + scheduler steps), isolated in its own
+# top-level def at the module-level comptime S so it never co-monomorphizes with
+# `unpatchify` in main. Returns the final patched latent z [1, L, 3072].
+# timestep fed to the DiT MUST be t_pixeldit = 1 - step_t/1000, NOT sigma — the
+# t_embedder rescales by *1000 internally (pipeline.rs:487, insight #4).
+def denoise(
+    var z: Tensor,
+    cond: T2ISample,
+    uncond: T2ISample,
+    guidance_scale: Float32,
+    seed: UInt64,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var cfg = HiDreamO1Config.dev_8b()
+    var do_cfg = guidance_scale > Float32(1.0)
+    var image_len = SMOKE_IMAGE_LEN
+
+    # S is fixed at module scope; assert the real seq matches (smoke contract).
+    if cond.s_text + image_len != SMOKE_S_TOTAL:
+        raise Error("hidream_o1 smoke: prompt seq != fixed S_TOTAL")
+    if do_cfg and uncond.s_text + image_len != SMOKE_S_TOTAL:
+        raise Error("hidream_o1 smoke: uncond seq != fixed S_TOTAL")
+
+    # Load the DiT once at the module-level S (never inside the step loop).
+    var dit = HiDreamO1DiT[SMOKE_S_TOTAL].load(
+        String("/home/alex/HiDream-O1-Image-Dev-weights"), cfg, ctx
+    )
+    var sched = HiDreamO1Scheduler.dev_28step()
+    var num_steps = sched.num_inference_steps()
+
+    # noise_scale_start: Dev 7.5 (inference.py:33). noise_clip_std: Dev 2.5
+    # (inference.py:35); only Flash injects per-step noise (pipeline.rs:475-481).
+    var noise_scale_start = Float32(7.5)
+    var noise_clip_std = Float32(2.5)
+
+    # Denoise loop (pipeline.rs:484-577). s_noise is the per-step entry of the
+    # linear noise-scale schedule; for Dev both endpoints equal noise_scale_start
+    # so it is constant 7.5 across steps (pipeline.rs:455).
+    for step_idx in range(num_steps):
+        var step_t = sched.timestep(step_idx)
+        var t_pixeldit = Float32(1.0) - step_t / Float32(1000.0)
+        var sigma_clamped = step_t / Float32(1000.0)
+        if sigma_clamped < Float32(0.001):
+            sigma_clamped = Float32(0.001)
+
+        # cond forward → image-row x_pred → v_cond = (x_pred - z)/sigma.
+        var x_pred_full = dit.forward(
+            cond.text_ids, z, cond.t_pos.copy(), cond.h_pos.copy(),
+            cond.w_pos.copy(), cond.ar_len, t_pixeldit, ctx,
+        )
+        # The DiT concatenates [text_emb_with_t, patch_emb] → image rows are the
+        # contiguous tail at s_text (pipeline.rs:657-700, vinput_mask run).
+        var x_pred_cond = gather_image_rows(
+            x_pred_full, cond.s_text, image_len, ctx
+        )
+        var v_cond = compute_velocity(x_pred_cond, z, sigma_clamped, ctx)
+
+        # CFG: v_guided = v_uncond + s*(v_cond - v_uncond) (pipeline.rs:537-540).
+        # Single forward when do_cfg is false (Dev default, guidance 0).
+        var v_guided: Tensor
+        if do_cfg:
+            var x_pred_full_u = dit.forward(
+                uncond.text_ids, z, uncond.t_pos.copy(), uncond.h_pos.copy(),
+                uncond.w_pos.copy(), uncond.ar_len, t_pixeldit, ctx,
+            )
+            var x_pred_uncond = gather_image_rows(
+                x_pred_full_u, uncond.s_text, image_len, ctx
+            )
+            var v_uncond = compute_velocity(x_pred_uncond, z, sigma_clamped, ctx)
+            var diff = sub(v_cond, v_uncond, ctx)
+            var scaled = mul_scalar(diff, guidance_scale, ctx)
+            v_guided = add(v_uncond, scaled, ctx)
+        else:
+            v_guided = v_cond^
+
+        # F3 sign flip before the scheduler (pipeline.rs:546; skeptic OK).
+        var model_output = mul_scalar(v_guided, Float32(-1.0), ctx)
+
+        # Per-step noise for Flash (stochastic). The Rust draws from one StdRng
+        # stream seeded seed+1 (pipeline.rs:473); the Mojo randn is stateless/
+        # seed-only, so we derive a deterministic per-step seed
+        # = seed + 1 + step_idx. NOT bit-identical to the Rust StdRng stream
+        # (which is itself not bit-identical to the CUDA reference —
+        # pipeline.rs:467-471); the N(0,1) statistics match, which is what the
+        # schedule consumes.
+        var s_noise = noise_scale_start  # constant for Dev (schedule flat)
+        if sched.needs_step_noise():
+            var noise_sh = model_output.shape()
+            var step_seed = seed + UInt64(1) + UInt64(step_idx)
+            var step_noise = randn(noise_sh^, step_seed, STDtype.F32, ctx)
+            z = sched.step(
+                model_output, step_idx, z, step_noise, s_noise,
+                noise_clip_std, ctx,
+            )
+        else:
+            # Deterministic schedulers ignore the noise arg; pass zeros.
+            var noise_sh = model_output.shape()
+            var zeros = randn(noise_sh^, UInt64(0), STDtype.F32, ctx)
+            zeros = mul_scalar(zeros, Float32(0.0), ctx)
+            z = sched.step(
+                model_output, step_idx, z, zeros, s_noise, Float32(0.0), ctx
+            )
+    return z^
+
+
 # End-to-end T2I (compile-only skeleton). Builds the whole path; the GPU work
-# is behind a `False` guard. The real run will: load DiT, draw noise, denoise,
-# decode, save. S (full sequence) is a comptime param of the DiT; the smoke
-# uses a small S so the comptime sdpa case stays cheap to instantiate.
+# is behind a `False` guard. The real run loads DiT, draws noise, denoises in
+# the separate `denoise()` def, then decodes (unpatchify) + saves here.
 def hidream_o1_t2i_smoke(
     model_dir: String,
     tokenizer_json: String,
@@ -141,59 +280,40 @@ def hidream_o1_t2i_smoke(
         raise Error("hidream_o1: unexpected head_dim")
 
     # --- compile-only guard: no GPU ---
-    # We typecheck the pipeline-SPECIFIC glue here (tokenizer, build_t2i_input,
-    # patchify, velocity, gather, scheduler.step, unpatchify, save_png). The DiT
-    # forward is exercised by its own probe (hidream_o1_probe.mojo) — calling
-    # .load()+.forward() AND scheduler+patchify in one function crashed the
-    # 1.0.0b1 comptime instantiator (segfault, not a source error). Keeping the
-    # DiT path in its own translation unit is the workaround. The denoise loop
-    # wiring is documented above and transcribed faithfully; the real run wires
-    # dit.forward(...) into this loop at S = s_total (comptime).
+    # The body below is the REAL denoise pipeline (DiT forward wired, CFG, per-
+    # step RNG, scheduler step). It is gated behind `if False:` because the GPU
+    # is wedged — `mojo build` typechecks/monomorphizes everything WITHOUT
+    # executing. The EXIT=139 segfault is worked around structurally: the denoise
+    # loop lives in the top-level `denoise()` def and S is a module-level
+    # comptime, so the DiT path and `unpatchify` here reach the instantiator
+    # through separate defs (see the bisection note above).
     if False:
         var ctx = DeviceContext()
         var tok = Qwen3Tokenizer(tokenizer_json)
+        var p = SMOKE_PATCH
 
         # 64x64 image -> 2x2 patches (L=4) for the smoke. Real run: 1024+ .
-        comptime H = 64
-        comptime W = 64
-        var p = cfg.patch_size  # 32
-        var h_patches = H // p
-        var w_patches = W // p
-        var image_len = h_patches * w_patches
+        var cond = build_t2i_input(tok, cfg, prompt, SMOKE_HP, SMOKE_WP)
+        var uncond = build_t2i_input(tok, cfg, String(" "), SMOKE_HP, SMOKE_WP)
 
-        var sample = build_t2i_input(tok, cfg, prompt, h_patches, w_patches)
-        var sched = HiDreamO1Scheduler.dev_28step()
+        # Dev default path uses guidance 0 → single forward (pipeline.rs:416).
+        var guidance_scale = Float32(0.0)
+        var seed = UInt64(0)
 
-        # Initial RGB noise [1,3,H,W] * noise_scale_start (Dev 7.5).
+        # Initial RGB noise [1,3,H,W] * noise_scale_start. Initial latent draw is
+        # seeded by `seed` (pipeline.rs:447); per-step noise by `seed+1`.
         var noise_scale_start = Float32(7.5)
         var z_sh = List[Int]()
-        z_sh.append(1); z_sh.append(3); z_sh.append(H); z_sh.append(W)
-        var z0 = randn(z_sh^, UInt64(33), STDtype.BF16, ctx)  # seed+1
+        z_sh.append(1); z_sh.append(3); z_sh.append(SMOKE_H); z_sh.append(SMOKE_W)
+        var z0 = randn(z_sh^, seed, STDtype.BF16, ctx)
         z0 = mul_scalar(z0, noise_scale_start, ctx)
         var z = patchify(z0, p, ctx)  # [1, L, 3*32*32=3072]
 
-        var step_t = sched.timestep(0)
-        var sigma_clamped = step_t / Float32(1000.0)
-        if sigma_clamped < Float32(0.001):
-            sigma_clamped = Float32(0.001)
-
-        # x_pred placeholder = z (the real run supplies dit.forward(...)[image rows]).
-        # compute_velocity borrows both args (read), so pass z for both here.
-        var v = compute_velocity(z, z, sigma_clamped, ctx)
-        var model_output = mul_scalar(v, Float32(-1.0), ctx)  # pipeline F3 sign flip
-
-        var noise_sh = model_output.shape()
-        var step_noise = randn(noise_sh^, UInt64(34), STDtype.F32, ctx)
-        z = sched.step(
-            model_output, 0, z, step_noise, noise_scale_start, Float32(2.5), ctx
-        )
-
-        # gather (tail L) — exercised on a full-stream-shaped tensor.
-        var gathered = gather_image_rows(z, 0, image_len, ctx)
-        _ = gathered
+        # Denoise in the isolated top-level def (DiT forwards + CFG + scheduler).
+        z = denoise(z^, cond, uncond, guidance_scale, seed, ctx)
 
         # unpatchify -> [1,3,H,W] in [-1,1]; save (SIGNED -> (v+1)*127.5).
-        var img = unpatchify(z, 3, H, W, p, ctx)
+        var img = unpatchify(z, 3, SMOKE_H, SMOKE_W, p, ctx)
         save_png(img, out_png, ctx, ValueRange.SIGNED)
 
     print("hidream_o1 pipeline skeleton compiled (run gated; GPU wedged)")

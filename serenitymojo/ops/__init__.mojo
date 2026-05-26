@@ -14,4 +14,4 @@
 #             does F32 reduction + cast-back, numerically matching torch.
 #
 # NOT in this chunk (chunk A2): group_norm / layer_norm / rope / sdpa / conv2d /
-# silu / swiglu / modulate / residual_gate.
+# silu / swiglu / modulate / residual_gate / random.

@@ -39,15 +39,15 @@ new kernel here when there is no callable Mojo/MAX primitive.
 
 | Need | Why it matters |
 |---|---|
-| GPU dtype cast/copy | Replace `_cast`-style host round trips in pipelines. |
-| GPU Gaussian RNG/noise fill | Production inference must not seed/fill latents on host. |
+| GPU dtype cast/copy | `ops/cast.mojo` now covers F32<->BF16/F16; remaining work is replacing older call sites and broadening pairs if needed. |
+| GPU Gaussian RNG/noise fill | `ops/random.mojo` now covers deterministic standard-normal F32/BF16/F16 fills on device and matches Rust rand 0.8 `StdRng`/ChaCha12 for the checked seed-42 reference samples. |
 | Rectangular SDPA / cross-attention | SDXL UNet cross-attn uses image-token `q` length and text-token `k/v` length; current `sdpa` assumes `Sq == Sk == S`. |
 | NCHW <-> NHWC materialized permutes | VAE and SDXL blocks currently need layout bridges; host transpose helpers must not be used in production inference. |
 | OIHW -> RSCF conv-weight adapter | SDK conv expects NHWC/RSCF; PyTorch SDXL weights arrive OIHW. |
 | GPU bias cast/staging | `linear`, `conv`, and `conv3d` currently stage bias through host-side F32 copies. |
 | SDXL UNet concat/skip helpers | Skip concatenation and shape-fixed NCHW/NHWC block glue will be hot in the UNet path. |
-| FLUX.2 packed patchify/unpatchify | Klein VAE uses packed `[B,128,H,W]` tokens and decoder-side 128->32 unpatchify. |
-| Long-sequence Dh128 attention | Klein 9B all-block tiny-token smoke passes, but 1024x1024 uses 4096 image tokens plus 512 text tokens, edit paths can combine image+reference streams, and Dh=128 takes math-mode today. |
+| FLUX.2 packed patchify/unpatchify | Decoder-side packed 128->32 unpatchify exists in `models/vae/klein_decoder.mojo`; encoder/edit patchify still needed. |
+| Long-sequence attention speed | Klein 1024 one-step image now runs with offloaded weights, but DiT Dh128 and VAE Dh512 still take math-mode attention and are slow. |
 | Last-dim reductions | CFG norm-ratio and per-token statistics should not read activations to host. |
 | Device ID/mask builders | Strict zero-host setup would require Qwen/CLIP masks and image/text ID tensors to be built on device. Z-Image DiT/VAE all-zero masks are already device memset. |
 
@@ -66,6 +66,12 @@ new kernel here when there is no callable Mojo/MAX primitive.
 | Kernel triple | Computes | Notes |
 |---|---|---|
 | `_bias_cast_kernel_{f32,bf16,f16}` | `out[m,j] = (C_f32[m,j] + bias[j]) → dtype` | F32 GEMM result + staged-F32 bias, cast to storage dtype; `has_bias` flag gates the add. |
+
+## ops/cast.mojo — materialized dtype casts (one thread/element)
+
+| Kernel | Computes | Notes |
+|---|---|---|
+| `_bf16_to_f32`, `_f32_to_bf16`, `_f16_to_f32`, `_f32_to_f16` | GPU dtype cast over a flat tensor | Used by `cast_tensor`; same-dtype path is a D2D clone. |
 
 ## ops/rope.mojo — rotary embedding (one thread/pair)
 
@@ -111,6 +117,19 @@ new kernel here when there is no callable Mojo/MAX primitive.
 | Kernel triple | Computes | Notes |
 |---|---|---|
 | `_bias_add_kernel_{f32,bf16,f16}` | `+ bias[C_out]` broadcast over `N,H_out,W_out` | follow-up to SDK `conv2d_gpu_naive_nhwc_rscf` (which has no bias). F32 accum. |
+
+## models/vae/klein_decoder.mojo — FLUX.2 packed latent glue
+
+| Kernel | Computes | Notes |
+|---|---|---|
+| `_inverse_bn_kernel_f32` | `z = z * sqrt(running_var+1e-4) + running_mean` per packed channel | FLUX.2/Klein inverse latent BN before VAE decode. |
+| `_unpatchify_packed_kernel_f32` | `[B,128,H,W] -> [B,32,2H,2W]` reverse pixel shuffle | Decoder-side packed latent unpatchify. Current VAE path is F32 because weights are F32. |
+
+## ops/random.mojo — GPU latent noise
+
+| Kernel triple | Computes | Notes |
+|---|---|---|
+| `_randn_kernel_{f32,bf16,f16}` | deterministic standard-normal samples via Rust rand 0.8 `StdRng` stream + Box-Muller | One thread per output pair; supports stable seeded GPU setup. The Klein smoke draws NCHW `[1,128,LH,LW]` then packs to token NHWC to match `inference-flame` layout. |
 
 ## ops/embeddings.mojo — DiT timestep / RoPE-table build (F32 in/out)
 

@@ -21,6 +21,10 @@ file is "where does X live". First target: Z-Image text→image.
   tracks the corrected port scope from `inference-flame` and `/home/alex/modular`,
   including GPU-only blockers, kernel gaps, and the first runnable Klein 9B text
   + DiT slices. Read it before adding SDXL, FLUX.2, or Klein files.
+- **Klein 9B handoff**: `docs/KLEIN9B_HANDOFF_2026-05-26.md` is the focused
+  cold-start note for the current 1024 one-step Klein image path, including the
+  Rust-compatible GPU RNG, offload status, run commands, output stats, and next
+  work.
 - **Run** (JIT, package-relative imports require `-I .`):
   ```
   cd /home/alex/mojodiffusion && pixi run mojo run -I . serenitymojo/pipeline/zimage_pipeline.mojo
@@ -42,7 +46,9 @@ file is "where does X live". First target: Z-Image text→image.
 | `io/json_header.mojo` | Hand-rolled flat-safetensors-header JSON parser → `HeaderEntry`. | ✅ |
 | `io/tensor_view.mojo` | `TensorView[origin]`: typed metadata + origin-bound byte `Span`; `from_parts`. | ✅ |
 | `io/safetensors.mojo` | `SafeTensors`: single-file mmap reader + tensor index. | ✅ |
-| `io/sharded.mojo` | `ShardedSafeTensors`: multi-shard loader (index weight_map or single-file fallback). | ✅ |
+| `io/sharded.mojo` | `ShardedSafeTensors`: multi-shard loader (index weight_map, direct `.safetensors`, or directory single-file fallback). | ✅ |
+| `ops/cast.mojo` | `cast_tensor`: GPU materialized F32<->BF16/F16 casts. | ✅ |
+| `ops/random.mojo` | `randn`: GPU deterministic standard-normal fill matching Rust rand 0.8 `StdRng` seed stream. | ✅ |
 | `ops/linear.mojo` | `linear(x, w, bias)` = x @ wᵀ + b (vendor BLAS matmul, F32 accum). | ✅ |
 | `ops/norm.mojo` | `rms_norm`, `layer_norm`, `group_norm` (NHWC) — hand-rolled. | ✅ |
 | `ops/rope.mojo` | `rope_interleaved` (FLUX/Klein), `rope_halfsplit` (Z-Image). | ✅ |
@@ -58,10 +64,11 @@ file is "where does X live". First target: Z-Image text→image.
 | `offload/block_loader.mojo` | `BlockLoader`: prefix-keyed transformer-block weight streaming. | ✅ |
 | `tokenizer/tokenizer.mojo` | `Qwen3Tokenizer`: pure-Mojo byte-level BPE (Qwen2 regex). | ✅ |
 | `models/dit/zimage_dit.mojo` | `NextDiT[HL,WL,CAPLEN]` Z-Image transformer + `NextDiTConfig`. | ✅ cos 0.99985 |
-| `models/dit/klein_dit.mojo` | `Klein9BDiT`: FLUX.2 Klein 9B real-weight DiT, truncated smoke plus full 8+24 block tiny-token smoke. | ✅ tiny full smoke |
+| `models/dit/klein_dit.mojo` | `Klein9BDiT` / `Klein9BOffloaded`: FLUX.2 Klein 9B DiT, full all-block and offloaded 1024 forward. | ✅ one-step 1024 |
 | `models/text_encoder/qwen3_encoder.mojo` | `Qwen3Encoder` + `Qwen3Config` (Z-Image/Klein text encoder). | ✅ |
 | `models/text_encoder/qwen25vl_encoder.mojo` | `Qwen25VLEncoder` + `Qwen25VLConfig` (Qwen-Image text encoder). | ⏳ built, unverified |
 | `models/vae/zimage_decoder.mojo` | `ZImageDecoder[LH,LW]`: Z-Image AutoencoderKL decoder config. | ✅ cos 0.99998 |
+| `models/vae/klein_decoder.mojo` | `KleinVaeDecoder[LH,LW]`: FLUX.2/Klein VAE decode from packed `[1,128,LH,LW]`. | ✅ 1024 smoke |
 | `models/vae/decoder2d.mojo` | Shared 2D-VAE kit: `ResnetBlock`, `AttnBlock`, `Upsample`, NCHW↔NHWC. | ✅ |
 | `models/vae/vae_ops.mojo` | VAE-local glue: `clone`, `reshape`, `add`. | ✅ |
 | `models/vae/upsample.mojo` | `upsample_nearest2x_nhwc` (2D nearest 2×). | ✅ |
@@ -72,9 +79,12 @@ file is "where does X live". First target: Z-Image text→image.
 | `image/png.mojo` | `save_png` (CHW float → 8-bit RGB PNG, stored-deflate); `crc32`/`adler32`. | ✅ |
 
 **Dev/test harnesses** (not API-documented; run/probe scaffolding):
-`ops_smoke.mojo`, `ops_smoke2.mojo`, `pipeline/count_tokens.mojo`,
+`ops_smoke.mojo`, `ops_smoke2.mojo`, `ops/random_smoke.mojo`,
+`pipeline/count_tokens.mojo`,
 `pipeline/klein9b_text_smoke.mojo`, `pipeline/klein9b_dit_smoke.mojo`,
 `pipeline/klein9b_dit_full_smoke.mojo`,
+`pipeline/klein_vae_smoke.mojo`, `pipeline/klein_vae_1024_smoke.mojo`,
+`pipeline/klein9b_pipeline_64_smoke.mojo`, `pipeline/klein9b_pipeline_1024_smoke.mojo`,
 every `*/parity/*` dir, and the `*_smoke*.mojo` / `*_probe*.mojo` / `*_fuzz.mojo` /
 `*skeptic*.mojo` / `parity_*.mojo` / `sdpa_probe*.mojo` files. Standalone Wan-3D
 files `models/vae/conv3d.mojo` + `models/vae/upsample.mojo` (3D path) are shipped

@@ -85,6 +85,21 @@ inference.
     output shape: `[1,4,128]`; stats were finite (`mean=0.034185875`,
     `std=0.2429931`, `absmax=0.69921875`). GPU memory during the full load
     stayed under the 24GB card limit.
+- Added the first Klein VAE and image pipeline path:
+  - `serenitymojo/models/vae/klein_decoder.mojo`
+  - `serenitymojo/ops/cast.mojo`
+  - `serenitymojo/ops/random.mojo`
+  - `serenitymojo/pipeline/klein_vae_smoke.mojo`
+  - `serenitymojo/pipeline/klein_vae_1024_smoke.mojo`
+  - `serenitymojo/pipeline/klein9b_pipeline_64_smoke.mojo`
+  - `serenitymojo/pipeline/klein9b_pipeline_1024_smoke.mojo`
+  - The 1024 image smoke uses Qwen3-8B conditioning, offloaded Klein 9B DiT,
+    GPU Gaussian latent noise in the Rust NCHW draw/pack order, one denoise
+    step, and the FLUX.2 VAE. Output:
+    `/home/alex/mojodiffusion/output/klein9b_first_1024.png`.
+  - Rust-compatible GPU-RNG one-step rerun stats: initial token mean
+    `-0.00066099525`, std `1.0012506`; image shape `[1,3,1024,1024]`,
+    mean `-0.14633068`, std `0.46503106`, absmax `1.4440922`.
 - Ran the Z-Image GPU pipeline after the denoise sign fix:
   - output: `/home/alex/mojodiffusion/output/zimage_first_1024.png`
   - PNG size: 1024x1024
@@ -185,7 +200,7 @@ Missing Mojo pieces:
 - CLIP tokenizer support, or an explicit cached-embedding-only SDXL entry point
 - `models/vae/ldm_decoder.mojo` or a generalized `decoder2d` wrapper for SDXL
 - full SDXL pipeline wrapper around `sampling/sdxl_euler.mojo`
-- production GPU noise generation and GPU dtype cast helpers
+- production GPU noise generation; SDXL still needs wiring to use `ops/cast.mojo`
 - rectangular cross-attention support in `ops/attention.mojo` or an SDXL-local
   attention wrapper (`q` sequence length often differs from text length)
 - inpaint and LoRA wiring after the base path is correct
@@ -245,6 +260,8 @@ Mojo reuse candidates:
 
 - `models/text_encoder/qwen3_encoder.mojo`
 - `models/dit/klein_dit.mojo` for the current Klein 9B DiT wiring
+- `models/vae/klein_decoder.mojo`
+- `ops/cast.mojo`
 - `ops/rope.mojo` interleaved RoPE
 - `ops/activations.mojo` `swiglu`
 - `ops/attention.mojo` math-mode SDPA for head dim 128
@@ -256,29 +273,41 @@ Implemented Mojo pieces:
 - `models/dit/klein_dit.mojo` has 9B config constants, single-file safetensors
   loading, Klein RoPE table construction, input projections, timestep MLP,
   shared modulation, generic double-stream blocks, generic single-stream
-  blocks, final projection, and both truncated and full all-block forwards.
+  blocks, final projection, truncated and full all-block forwards, and an
+  offloaded full forward that streams one block at a time through
+  `BlockLoader`.
+- `models/vae/klein_decoder.mojo` decodes packed FLUX.2/Klein latents
+  `[1,128,LH,LW]` to `[1,3,16*LH,16*LW]`; it applies inverse BN, packed
+  128->32 unpatchify, `post_quant_conv`, the shared 2D decoder stack, and PNG
+  output through the existing image writer.
+- `ops/cast.mojo` provides GPU dtype casts needed for BF16 DiT output -> F32
+  VAE decode.
 - `pipeline/klein9b_text_smoke.mojo` proves Qwen3-8B -> Klein conditioning
   `[1,512,12288]`.
 - `pipeline/klein9b_dit_smoke.mojo` proves real 9B DiT block math on GPU for a
   fast one-double/one-single slice.
 - `pipeline/klein9b_dit_full_smoke.mojo` proves all 201 DiT tensors and the
   complete 8+24 block sequence run on GPU at tiny token count.
+- `pipeline/klein9b_pipeline_1024_smoke.mojo` proves the current end-to-end
+  Klein 9B 1024 image path. It is intentionally one denoise step with GPU
+  Gaussian noise, so it is a wiring/memory proof, not a quality target.
 
 Missing Mojo pieces:
 
-- Add a memory-safe 1024x1024 denoise path around `models/dit/klein_dit.mojo`.
-  The all-resident tiny smoke fits; production 4096 image tokens will likely
-  need offloading and/or attention memory work.
-- `models/vae/klein_vae.mojo`
-- `pipeline/klein_pipeline.mojo`
+- Turn the one-step 1024 smoke into a quality path: more denoise steps and
+  parity checks against `inference-flame`/Modular.
+- Optimize performance. The current 1024 path is slow because it streams every
+  9B block from safetensors and uses math-mode SDPA for long Dh128 DiT attention
+  and Dh512 VAE attention.
+- `pipeline/klein_pipeline.mojo` as the non-smoke production entry point.
 - `pipeline/klein_edit_pipeline.mojo`
 - production tokenizer/chat-template wrapper for Klein prompts around the
   existing Qwen3 tokenizer
-- GPU `patchify_latents` / `unpatchify_latents` variants matching the packed
-  FLUX.2 VAE layout
+- Broader RNG parity coverage if needed. `ops/random_smoke.mojo` checks the
+  first 16 seed-42 samples against Rust rand 0.8 `StdRng`/ChaCha12; add longer
+  vector checks if future work depends on bit-identical full-latent comparisons.
 - GPU attention-bias or attention-mask construction if strict zero-host setup
   is required
-- production GPU RNG
 - LoRA support after base 4B/9B parity
 
 ## Kernel Work Likely Needed
@@ -289,28 +318,29 @@ small, typed, and cataloged in `docs/SERENITYMOJO_KERNELS.md`.
 
 Likely needed kernels:
 
-- GPU dtype cast/copy for `Tensor` to replace host `_cast`.
+- GPU dtype cast/copy for `Tensor` to replace host `_cast` in remaining paths
+  (`ops/cast.mojo` now covers F32<->BF16/F16).
 - GPU Gaussian RNG/noise fill.
 - NCHW <-> NHWC materialized permutes for VAE and SDXL UNet.
 - OIHW -> RSCF weight conversion or loader-side layout adapter for conv weights.
 - GPU bias cast/staging so `linear`/`conv` do not read bias to host.
 - SDXL UNet skip concat and NCHW-oriented block helpers if we do not rewrite the
   UNet to NHWC end-to-end.
-- Klein/FLUX.2 packed latent patchify/unpatchify kernels.
+- Klein/FLUX.2 packed latent patchify/unpatchify kernels for encoder/edit paths
+  (decoder-side 128->32 unpatchify exists in `klein_decoder.mojo`).
 - Last-dim reductions for norm-ratio CFG and other per-token statistics.
 - Device construction of CLIP/Qwen attention masks if host setup is disallowed.
 
 ## Suggested Next Order
 
-1. Finish strict GPU-only foundation gaps: device cast, device noise, VAE layout
-   permutes, bias staging.
-2. Port Klein VAE decode (`flux2-vae.safetensors`), including inverse BN and
-   packed 128-channel latent unpatchify.
-3. Compose `pipeline/klein_pipeline.mojo`: Qwen3 conditioning -> packed noise ->
-   full Klein DiT -> direct-velocity Euler -> Klein VAE -> PNG.
-4. Add/offload the production 1024x1024 Klein DiT denoise path if full resident
-   weights plus long-sequence attention does not fit comfortably.
-5. Port SDXL cached-embedding path: scheduler, UNet skeleton, LDM VAE decode.
+1. Make the Klein 1024 smoke a quality path: run a practical multi-step schedule
+   toward the 50-step reference, then add parity/visual checks against Rust and
+   Modular.
+2. Optimize Klein performance: reduce block-stream overhead and replace/tile the
+   long-sequence math-mode attentions where needed.
+3. Finish strict GPU-only foundation gaps: VAE layout permutes, bias staging,
+   GPU text/ID/mask setup if required.
+4. Port SDXL cached-embedding path: scheduler, UNet skeleton, LDM VAE decode.
    Keep CLIP tokenizer/encoder separate until the denoise path is stable.
 6. Add edit/inpaint and LoRA paths after base text-to-image parity.
 
@@ -327,10 +357,20 @@ Likely needed kernels:
 - `/tmp/klein9b_dit_smoke`
 - `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/klein9b_dit_full_smoke.mojo -o /tmp/klein9b_dit_full_smoke`
 - `/tmp/klein9b_dit_full_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/klein_vae_smoke.mojo -o /tmp/klein_vae_smoke`
+- `/tmp/klein_vae_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/klein_vae_1024_smoke.mojo -o /tmp/klein_vae_1024_smoke`
+- `/tmp/klein_vae_1024_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/ops/random_smoke.mojo -o /tmp/random_smoke`
+- `/tmp/random_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/klein9b_pipeline_64_smoke.mojo -o /tmp/klein9b_pipeline_64_smoke`
+- `/tmp/klein9b_pipeline_64_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/klein9b_pipeline_1024_smoke.mojo -o /tmp/klein9b_pipeline_1024_smoke`
+- `/tmp/klein9b_pipeline_1024_smoke`
 - `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/zimage_pipeline.mojo -o /tmp/zimage_pipeline_1024`
 - `/tmp/zimage_pipeline_1024`
 
 GPU-heavy commands in this pass were the Z-Image 1024 pipeline rerun, the
-Klein Qwen3-8B text smoke, the truncated Klein 9B DiT smoke, and the full
-all-block Klein 9B DiT tiny-token smoke. Klein still is not a complete image
-pipeline; the text conditioner and full transformer wiring now run.
+Klein Qwen3-8B text smoke, the truncated/full Klein 9B DiT smokes, Klein VAE
+64/1024 smokes, and the one-step end-to-end Klein 9B 1024 image smoke. The path
+now produces an image; quality and speed are the remaining work.

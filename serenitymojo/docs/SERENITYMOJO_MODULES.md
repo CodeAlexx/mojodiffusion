@@ -74,7 +74,7 @@ Movable-not-Copyable mmap of a file region (MAP_PRIVATE\|MAP_NORESERVE; page cac
 
 ### `io/sharded.mojo` — `ShardedSafeTensors` ✅
 Multi-shard loader. `struct ShardedSafeTensors(Movable)` — `shards: List[ArcPointer[SafeTensors]]` (Arc because `SafeTensors` is Movable-not-Copyable), `name_to_shard: Dict[String, Int]`.
-- `@staticmethod open(dir: String) raises -> ShardedSafeTensors` — detects `diffusion_pytorch_model.safetensors.index.json` / `model.safetensors.index.json` and parses its `weight_map` (dedicated string→string scanner, NOT the header parser); else single-file fallback (`diffusion_pytorch_model.safetensors` then `model.safetensors`).
+- `@staticmethod open(dir_or_file: String) raises -> ShardedSafeTensors` — accepts a direct `.safetensors` file, or detects `diffusion_pytorch_model.safetensors.index.json` / `model.safetensors.index.json` and parses its `weight_map` (dedicated string→string scanner, NOT the header parser); else directory single-file fallback (`diffusion_pytorch_model.safetensors` then `model.safetensors`).
 - `num_shards`, `num_tensors`, `names`, `shard_index(name)`, `tensor_info(name)`.
 - `tensor_bytes(self, name) raises -> Span[UInt8, origin_of(self.shards)]` — origin bound to `self.shards`.
 - `tensor_view(self, name) raises -> TensorView[origin_of(self.shards)]` — dtype+shape+span via `from_parts`.
@@ -84,6 +84,12 @@ Multi-shard loader. `struct ShardedSafeTensors(Movable)` — `shards: List[ArcPo
 ## ops/ — kernels
 
 Common convention: each op has a `def _<op>_kernel_{f32,bf16,f16}(...)` triple (one thread per output element, or one block per row for reductions; F32 math, cast at store) and a public dispatcher that branches on `x.dtype().to_mojo_dtype()`. Per-dtype LayoutTensors are built with `RuntimeLayout[_DYN…].row_major(IndexList[…](dims))` over `.buf.unsafe_ptr().bitcast[…]()`. `comptime _BLOCK = 256` / `_TPB = 256`.
+
+### `ops/cast.mojo` ✅
+- `cast_tensor(x: Tensor, dtype: STDtype, ctx) raises -> Tensor` — materialized GPU dtype cast. Supports F32<->BF16/F16 and same-dtype clone. Used to bridge BF16 DiT outputs into the F32 FLUX.2/Klein VAE path without host readback.
+
+### `ops/random.mojo` ✅
+- `randn(shape: List[Int], seed: UInt64, dtype: STDtype, ctx) raises -> Tensor` — GPU-resident deterministic standard-normal fill matching Rust rand 0.8 `StdRng::seed_from_u64` (`PCG32` seed expansion + `ChaCha12Rng` + `Standard<f32>` + Box-Muller). Supports F32/BF16/F16 storage. Used by the Klein image smokes to draw NCHW latent noise on device before packing to token layout. `ops/random_smoke.mojo` checks the first 16 seed-42 samples against a Rust reference.
 
 ### `ops/linear.mojo` ✅
 - `linear(x: Tensor, weight: Tensor, bias: Optional[Tensor], ctx) raises -> Tensor` — `y = x @ weightᵀ + bias`. `x: [..., in]` (leading dims flatten to M), `weight: [out, in]` (PyTorch row-major, same dtype as x), `bias: [out]|None`. Vendor `linalg.matmul.vendor.blas.matmul(C, A, B, transpose_b=True, c_row_major=True)` into an F32 C buffer, then a `_bias_cast_kernel_{dt}` adds bias (staged to F32) and casts to x's dtype. Returns `[..., out]`.
@@ -182,18 +188,20 @@ Z-Image NextDiT transformer (basic/non-omni). Reference = diffusers `transformer
   - **Sign boundary:** `forward` returns the raw diffusers transformer output. Do NOT negate inside `NextDiT`; pipeline code must apply diffusers' post-CFG negate before `FlowMatchEulerDiscreteScheduler.step`. See `docs/ZIMAGE_DENOISE_SIGN_CONVENTION.md`.
   - Debug-only: `debug_nr0_mod`, `debug_nr0_attn[S]`, `debug_stage` (parity instrumentation).
 
-### `models/dit/klein_dit.mojo` — `Klein9BDiT`, `KleinConfig` ✅ tiny full smoke
-FLUX.2 Klein DiT scaffold. Reference = `/home/alex/EriDiffusion/inference-flame/src/models/klein.rs` plus Modular `architectures/flux2`. This is not the full 1024x1024 image pipeline yet; it is a real-weight 9B transformer path that can run a fast truncated smoke and a complete 8+24-block smoke on a tiny token grid.
+### `models/dit/klein_dit.mojo` — `Klein9BDiT`, `Klein9BOffloaded`, `KleinConfig` ✅ one-step 1024
+FLUX.2 Klein DiT scaffold. Reference = `/home/alex/EriDiffusion/inference-flame/src/models/klein.rs` plus Modular `architectures/flux2`. Real-weight 9B transformer path with a fast truncated smoke, a complete all-resident 8+24-block tiny-token smoke, and an offloaded 1024 forward used by the image smoke.
 - `@fieldwise_init struct KleinConfig` — `@staticmethod klein_9b()` = inner dim 4096, input channels 128, joint attention dim 12288, 8 double blocks, 24 single blocks, 32 heads, head dim 128, SwiGLU hidden 12288, timestep dim 256, RoPE theta 2000.
 - `klein9b_truncated_keys() -> List[String]` — the 25 BF16 checkpoint tensors needed for shared projections/modulation, `double_blocks.0`, `single_blocks.0`, and the final layer.
 - `klein9b_all_keys() -> List[String]` — all 201 BF16 DiT tensors for the 9B transformer.
 - `struct Klein9BDiT(Movable)` — single-file safetensors loader over `/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors`, storing weights as `List[ArcPointer[Tensor]]`.
   - `@staticmethod load(path, ctx) raises -> Klein9BDiT` — truncated 25-tensor load for quick block checks.
+  - `@staticmethod load_shared(path, ctx) raises -> Klein9BDiT` — shared non-block weights for offload.
   - `@staticmethod load_full(path, ctx) raises -> Klein9BDiT` — all 201 tensors.
   - `forward_truncated[N_IMG,N_TXT,S](img_tokens, txt_tokens, timestep, cos, sin, ctx) raises -> Tensor` — expects `img_tokens [1,N_IMG,128]`, `txt_tokens [1,N_TXT,12288]`, `timestep [1]` F32, and interleaved RoPE tables for `S=N_IMG+N_TXT`; returns image-token velocity `[1,N_IMG,128]`. Internals: img/txt projections -> timestep MLP -> shared modulation -> one double-stream block with separate txt/img Q/K RMSNorm -> one single-stream block -> final AdaLN/projection.
   - `forward_full[N_IMG,N_TXT,S](...) raises -> Tensor` — same contract, but runs all 8 double blocks and 24 single blocks.
 - `build_klein_rope_tables[N_IMG,N_TXT,H,DH](ctx, dtype) raises -> Tuple[Tensor, Tensor]` — host-built setup table for Klein interleaved RoPE. Text ids are zero; image ids use `[0,row,col,0]` over a square image-token grid.
-- Smoke entry points: `pipeline/klein9b_dit_smoke.mojo` verified the 25-tensor truncated path (`[1,4,128]`, finite stats); `pipeline/klein9b_dit_full_smoke.mojo` verified all 201 tensors and all 8+24 blocks on the same tiny grid (`[1,4,128]`, finite stats).
+- `struct Klein9BOffloaded(Movable)` — keeps shared weights resident and uses `BlockLoader` to stream `double_blocks.i` / `single_blocks.i` one at a time. `forward_full[...]` matches the all-resident contract and is what cleared the native 1024 OOM in `pipeline/klein9b_pipeline_1024_smoke.mojo`.
+- Smoke entry points: `pipeline/klein9b_dit_smoke.mojo` verified the 25-tensor truncated path (`[1,4,128]`, finite stats); `pipeline/klein9b_dit_full_smoke.mojo` verified all 201 tensors and all 8+24 blocks on the same tiny grid (`[1,4,128]`, finite stats); `pipeline/klein9b_pipeline_1024_smoke.mojo` now draws GPU Gaussian noise in Rust NCHW order, runs one offloaded 9B denoise step, decodes with the Klein VAE, and writes `output/klein9b_first_1024.png`.
 
 ### `models/text_encoder/qwen3_encoder.mojo` — `Qwen3Encoder`, `Qwen3Config` ✅
 Qwen3 causal-LM text encoder (Z-Image/Klein). Reuses foundation `rms_norm`/`rope_halfsplit`/`sdpa`/`linear`/`swiglu`; adds encoder-local glue (embedding gather, residual `_add`, GQA `_repeat_kv`, host RoPE tables, host causal mask, `_reshape`). RoPE = HALFSPLIT.
@@ -221,6 +229,15 @@ Z-Image AutoencoderKL decoder config; wires the 2D kit. Reference = `inference-f
 - `struct ZImageDecoder[LH: Int, LW: Int](Movable)` — comptime latent spatial size (conv2d needs static shapes; size changes per upsample, image is 8× latent). Holds conv_in, mid (Res+Attn+Res @ 512), up0/up1 (512→512, 3 resnets + upsample), up2 (512→256, +upsample), up3 (256→128, no upsample), norm_out + conv_out. The VAE mid-attn all-zero mask is device-allocated and zeroed with GPU memset.
   - `@staticmethod load(dir, ctx) raises -> ZImageDecoder[LH,LW]`.
   - `decode(self, latent_nchw: Tensor, ctx) raises -> Tensor` — `[1,16,LH,LW]` → `[1,3,8·LH,8·LW]`. Rescale `z = z/SCALING + SHIFT` (NCHW) → NCHW→NHWC once → conv_in → mid → 4 up blocks → GroupNorm(32, eps 1e-6) → SiLU → conv_out → NHWC→NCHW. post_quant_conv disabled in Z-Image.
+
+### `models/vae/klein_decoder.mojo` — `KleinVaeDecoder` ✅ 1024 smoke
+FLUX.2/Klein VAE decoder. Reference = `inference-flame/src/vae/klein_vae.rs`. Weights are F32 in `/home/alex/.serenity/models/vaes/flux2-vae.safetensors`, so the current decode path expects F32 packed latents.
+- `struct KleinVaeDecoder[LH,LW](Movable)` — input packed latent spatial size. `decode([1,128,LH,LW]) -> [1,3,16*LH,16*LW]`.
+- Decode sequence: inverse BN using `bn.running_var`/`bn.running_mean` (`eps=1e-4`) -> packed unpatchify `[1,128,LH,LW]` to `[1,32,2LH,2LW]` -> `post_quant_conv(32,32,1)` -> shared 2D decoder stack at base size `2LH x 2LW` -> RGB.
+- Smoke outputs:
+  - `pipeline/klein_vae_smoke.mojo` -> `/home/alex/mojodiffusion/output/klein_vae_smoke_64.png`
+  - `pipeline/klein_vae_1024_smoke.mojo` -> `/home/alex/mojodiffusion/output/klein_vae_smoke_1024.png`
+  - `pipeline/klein9b_pipeline_1024_smoke.mojo` -> `/home/alex/mojodiffusion/output/klein9b_first_1024.png` (GPU Gaussian noise, one denoise step; wiring/memory proof, not final quality)
 
 ### `models/vae/decoder2d.mojo` — shared 2D-VAE kit ✅
 NHWC end-to-end (foundation conv2d + group_norm are NHWC-native). `comptime GN_GROUPS=32, GN_EPS=1e-6`.

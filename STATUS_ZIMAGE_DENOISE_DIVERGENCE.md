@@ -123,6 +123,24 @@ pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/klein9b_dit_full_smo
 /tmp/klein9b_dit_full_smoke
 ```
 
-Next practical Klein step: port the FLUX.2/Klein VAE decode, then wire the full
-text-to-image pipeline with an offloaded or otherwise memory-safe 1024x1024 DiT
-denoise path.
+Update later on 2026-05-26: that next step is now done as a smoke. Added
+`KleinVaeDecoder`, GPU `cast_tensor`, GPU `randn`, `Klein9BOffloaded`, and the
+first end-to-end image drivers. Verified files:
+
+- `/home/alex/mojodiffusion/output/klein_vae_smoke_64.png`
+- `/home/alex/mojodiffusion/output/klein_vae_smoke_1024.png`
+- `/home/alex/mojodiffusion/output/klein9b_first_64.png`
+- `/home/alex/mojodiffusion/output/klein9b_first_1024.png`
+
+The native 1024 smoke uses Qwen3-8B conditioning, GPU Gaussian initial noise in
+the Rust reference layout `[1,128,64,64] -> [1,4096,128]`, offloaded Klein 9B
+DiT, one denoise step, and the FLUX.2 VAE. The 2026-05-26 GPU-RNG rerun wrote
+`/home/alex/mojodiffusion/output/klein9b_first_1024.png` as a valid 1024x1024
+RGB PNG; initial token stats were `mean=-0.00066099525`, `std=1.0012506`, and
+the image stats were `mean=-0.14633068`, `std=0.46503106`, `absmax=1.4440922`.
+It is a wiring/memory proof, not a quality target yet. The all-resident 1024
+DiT path OOMed at the first real-sequence forward; offloading one block at a
+time cleared that OOM. `ops/random_smoke.mojo` checks the first 16 seed-42
+Box-Muller samples against Rust rand 0.8 `StdRng`/ChaCha12 with max abs under
+`1e-6`. Remaining Klein work: multi-step denoise/quality and attention/offload
+performance.

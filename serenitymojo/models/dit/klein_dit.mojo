@@ -22,6 +22,7 @@ from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa
 from serenitymojo.ops.embeddings import t_embedder
 from serenitymojo.ops.tensor_algebra import reshape, slice, concat
+from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
 
 
 @fieldwise_init
@@ -54,17 +55,7 @@ def _append_key(mut keys: List[String], name: String):
 
 
 def klein9b_truncated_keys() -> List[String]:
-    var keys = List[String]()
-    _append_key(keys, String("img_in.weight"))
-    _append_key(keys, String("txt_in.weight"))
-    _append_key(keys, String("time_in.in_layer.weight"))
-    _append_key(keys, String("time_in.out_layer.weight"))
-    _append_key(keys, String("double_stream_modulation_img.lin.weight"))
-    _append_key(keys, String("double_stream_modulation_txt.lin.weight"))
-    _append_key(keys, String("single_stream_modulation.lin.weight"))
-    _append_key(keys, String("final_layer.adaLN_modulation.1.weight"))
-    _append_key(keys, String("final_layer.linear.weight"))
-
+    var keys = klein9b_shared_keys()
     var dp = String("double_blocks.0")
     _append_key(keys, dp + ".img_attn.qkv.weight")
     _append_key(keys, dp + ".img_attn.proj.weight")
@@ -84,6 +75,20 @@ def klein9b_truncated_keys() -> List[String]:
     _append_key(keys, sp + ".linear2.weight")
     _append_key(keys, sp + ".norm.query_norm.scale")
     _append_key(keys, sp + ".norm.key_norm.scale")
+    return keys^
+
+
+def klein9b_shared_keys() -> List[String]:
+    var keys = List[String]()
+    _append_key(keys, String("img_in.weight"))
+    _append_key(keys, String("txt_in.weight"))
+    _append_key(keys, String("time_in.in_layer.weight"))
+    _append_key(keys, String("time_in.out_layer.weight"))
+    _append_key(keys, String("double_stream_modulation_img.lin.weight"))
+    _append_key(keys, String("double_stream_modulation_txt.lin.weight"))
+    _append_key(keys, String("single_stream_modulation.lin.weight"))
+    _append_key(keys, String("final_layer.adaLN_modulation.1.weight"))
+    _append_key(keys, String("final_layer.linear.weight"))
     return keys^
 
 
@@ -133,6 +138,12 @@ struct Klein9BDiT(Movable):
     def load(path: String, ctx: DeviceContext) raises -> Klein9BDiT:
         var st = SafeTensors.open(path)
         var keys = klein9b_truncated_keys()
+        return Klein9BDiT._load_keys(st^, keys^, ctx)
+
+    @staticmethod
+    def load_shared(path: String, ctx: DeviceContext) raises -> Klein9BDiT:
+        var st = SafeTensors.open(path)
+        var keys = klein9b_shared_keys()
         return Klein9BDiT._load_keys(st^, keys^, ctx)
 
     @staticmethod
@@ -565,3 +576,132 @@ def build_klein_rope_tables[
         Tensor.from_host(cos_vals, sh.copy(), dtype, ctx),
         Tensor.from_host(sin_vals, sh^, dtype, ctx),
     )
+
+
+@fieldwise_init
+struct Klein9BOffloaded(Movable):
+    var shared: Klein9BDiT
+    var loader: BlockLoader
+
+    @staticmethod
+    def load(path: String, ctx: DeviceContext) raises -> Klein9BOffloaded:
+        var shared = Klein9BDiT.load_shared(path, ctx)
+        var loader = BlockLoader.open(path)
+        return Klein9BOffloaded(shared^, loader^)
+
+    def _block_model(self, block: Block) -> Klein9BDiT:
+        var weights = self.shared.weights.copy()
+        var name_to_idx = self.shared.name_to_idx.copy()
+        for ref e in block.items():
+            name_to_idx[e.key] = len(weights)
+            weights.append(e.value)
+        return Klein9BDiT(weights^, name_to_idx^, self.shared.config)
+
+    def _run_double[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        self,
+        block: Block,
+        prefix: String,
+        img: Tensor,
+        txt: Tensor,
+        img_mod: Tensor,
+        txt_mod: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var tmp = self._block_model(block)
+        return tmp._double_block[N_IMG, N_TXT, S](
+            prefix, img, txt, img_mod, txt_mod, cos, sin, ctx
+        )
+
+    def _run_single[S: Int](
+        self,
+        block: Block,
+        prefix: String,
+        x: Tensor,
+        single_mod: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var tmp = self._block_model(block)
+        return tmp._single_block[S](prefix, x, single_mod, cos, sin, ctx)
+
+    def forward_full[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        self,
+        img_tokens: Tensor,
+        txt_tokens: Tensor,
+        timestep: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+        var cfg = self.shared.config
+        var img = linear(img_tokens, self.shared._w(String("img_in.weight")), None, ctx)
+        var txt = linear(txt_tokens, self.shared._w(String("txt_in.weight")), None, ctx)
+        var vec = t_embedder(
+            timestep,
+            cfg.timestep_dim,
+            self.shared._w(String("time_in.in_layer.weight")),
+            None,
+            self.shared._w(String("time_in.out_layer.weight")),
+            None,
+            ctx,
+        )
+        var vec_silu = silu(vec, ctx)
+        var img_mod = linear(
+            vec_silu,
+            self.shared._w(String("double_stream_modulation_img.lin.weight")),
+            None,
+            ctx,
+        )
+        var txt_mod = linear(
+            vec_silu,
+            self.shared._w(String("double_stream_modulation_txt.lin.weight")),
+            None,
+            ctx,
+        )
+        var single_mod = linear(
+            vec_silu,
+            self.shared._w(String("single_stream_modulation.lin.weight")),
+            None,
+            ctx,
+        )
+
+        for bi in range(cfg.num_double):
+            var prefix = String("double_blocks.") + String(bi)
+            self.loader.prefetch_block(prefix)
+            var block = self.loader.load_block(prefix, ctx)
+            var x = self._run_double[N_IMG, N_TXT, S](
+                block, prefix, img, txt, img_mod, txt_mod, cos, sin, ctx
+            )
+            unload_block(block^)
+            txt = slice(x, 1, 0, N_TXT, ctx)
+            img = slice(x, 1, N_TXT, N_IMG, ctx)
+
+        var x = concat(1, ctx, txt, img)
+        for bi in range(cfg.num_single):
+            var prefix = String("single_blocks.") + String(bi)
+            self.loader.prefetch_block(prefix)
+            var block = self.loader.load_block(prefix, ctx)
+            x = self._run_single[S](block, prefix, x, single_mod, cos, sin, ctx)
+            unload_block(block^)
+
+        var img_out = slice(x, 1, N_TXT, N_IMG, ctx)
+        var final_mod = linear(
+            vec_silu,
+            self.shared._w(String("final_layer.adaLN_modulation.1.weight")),
+            None,
+            ctx,
+        )
+        var shift = self.shared._chunk_last(final_mod, 0, cfg.inner_dim, ctx)
+        var scale = self.shared._chunk_last(final_mod, 1, cfg.inner_dim, ctx)
+        var normed = self.shared._modulate_pre(img_out, shift, scale, ctx)
+        return linear(
+            normed, self.shared._w(String("final_layer.linear.weight")), None, ctx
+        )

@@ -1,0 +1,555 @@
+# lora.mojo — merge-at-load LoRA for inference. Pure-Mojo port of
+# inference-flame/src/lora_merge.rs (the in-place fuse path) + the key-naming
+# conventions from inference-flame/src/lora.rs and models/lora_loader.rs.
+#
+# Inference-only. This is the MINIMALLY-INVASIVE LoRA path: it never touches a
+# model's forward. It loads a LoRA `.safetensors`, computes
+#   delta_W = scale * (B @ A),   scale = (alpha / rank) * multiplier
+# and merges it into the base model's already-loaded weight Dict in place:
+#   W[target] += delta_W
+# (with row/col/row-range slicing for the fused-QKV / single-block targets).
+# The runtime `forward_lora` overlay path (lora.rs::LoraStack::apply) is NOT
+# ported — that requires model-forward changes.
+#
+# ── LoRA math (matches lora_merge.rs:32-37, 520-550) ─────────────────────────
+#   lora_A ("down"): [rank, in_features]   (PyTorch row-major)
+#   lora_B ("up")  : [out_features, rank]
+#   delta_W = scale * (B @ A)              → [out_features, in_features]
+#   scale   = (alpha / rank) * multiplier
+# B @ A is computed via `ops.linear(B, transpose(A))` because foundation
+# `linear(x, w) = x @ wᵀ`; with w = Aᵀ = [in, rank] this gives B @ (Aᵀ)ᵀ = B @ A.
+#
+# ── Key conventions (verified against real on-disk headers, 2026-05-26) ───────
+#   EriDiffusion-v2 train_klein  : bare `<prefix>.lora_A.weight` / `.lora_B.weight`
+#                                  (no `diffusion_model.` prefix), split
+#                                  to_q/to_k/to_v/proj + img_mlp.{0,2}. Detected
+#                                  as DiffusionModel (suffix match), resolved by
+#                                  map_prefix_diffusion_model → `<prefix>.weight`.
+#   edv2-reference (FLUX/Klein)  : `diffusion_model.<key>.lora_A.weight`.
+#   Z-Image trainer              : bare `<prefix>.lora_A` with split
+#                                  attention.to_q/to_k/to_v → fused qkv RowRange.
+#   kohya / sd-scripts (SDXL)    : `lora_unet_<path>.lora_down.weight` /
+#                                  `.lora_up.weight` + per-module `.alpha`
+#                                  (scalar, shape []). Confirmed F16 alpha in
+#                                  my_sdxl_lora_v1.safetensors.
+#
+# Mojo 1.0.0b1, NVIDIA GPU. File I/O via io/safetensors only.
+
+from std.memory import ArcPointer
+from std.gpu.host import DeviceContext
+from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors import SafeTensors, TensorRef
+from serenitymojo.io.tensor_view import TensorView, from_parts
+from serenitymojo.ops.tensor_algebra import transpose, concat, slice, add, mul_scalar
+from serenitymojo.ops.linear import linear
+from serenitymojo.ops.cast import cast_tensor
+
+
+# ── Slot kinds (mirror lora_merge.rs::Slot, lines 53-64) ─────────────────────
+comptime SLOT_FULL = 0
+"""Full overlay: base shape == delta shape. base += delta."""
+comptime SLOT_ROWS = 1
+"""Top `n` rows of base get delta. base[..n, :] += delta. (Klein-4B linear1.)"""
+comptime SLOT_COLS = 2
+"""Left `n` cols of base get delta. base[:, ..n] += delta. (Klein-4B linear2.)"""
+comptime SLOT_ROWRANGE = 3
+"""Row-range [start..start+len] of base gets delta. (Z-Image split-QKV → fused.)"""
+
+# ── LoRA file formats (mirror lora_merge.rs::LoraFormat, lines 67-85) ────────
+comptime FMT_KLEIN_TRAINER = 0
+comptime FMT_ZIMAGE_TRAINER = 1
+comptime FMT_DIFFUSION_MODEL = 2
+comptime FMT_KOHYA_SDXL = 3
+
+# Slot constants. Klein-4B single-block linear slicing (lora_merge.rs:46-47).
+comptime SINGLE_QKV_ROWS = 9216
+comptime SINGLE_OUT_COLS = 3072
+# Z-Image fused QKV is [3*dim, dim], dim=3840 (lora_merge.rs:51).
+comptime ZIMAGE_DIM = 3840
+
+
+@fieldwise_init
+struct LoraMapping(Copyable, Movable):
+    """One resolved LoRA module: which prefix, which base weight key it merges
+    into, and how (slot kind + slot params). Mirrors the `(base_key, slot)`
+    pairs returned by the lora_merge.rs prefix mappers."""
+
+    var prefix: String
+    """LoRA prefix, e.g. `double_blocks.0.img_attn.to_q`."""
+    var base_key: String
+    """Base weight Dict key, e.g. `double_blocks.0.img_attn.to_q.weight`."""
+    var slot_kind: Int
+    """One of SLOT_FULL / SLOT_ROWS / SLOT_COLS / SLOT_ROWRANGE."""
+    var slot_a: Int
+    """Slot param: Rows→n, Cols→n, RowRange→start. (unused for Full.)"""
+    var slot_b: Int
+    """Slot param: RowRange→len. (unused otherwise.)"""
+
+
+def _detect_format(names: List[String]) -> Int:
+    """Detect the LoRA file format from its key shapes. Mirrors
+    lora_merge.rs::detect_format (lines 91-111). Order matters: kohya first
+    (lora_unet_/te + lora_down/up), then DiffusionModel (.lora_A.weight),
+    then Z-Image trainer (split attention/feed_forward), else KleinTrainer."""
+    var has_kohya_prefix = False
+    var has_kohya_suffix = False
+    var has_dm_suffix = False
+    var has_zimage = False
+    for ref n in names:
+        if (
+            n.startswith("lora_unet_")
+            or n.startswith("lora_te1_")
+            or n.startswith("lora_te2_")
+        ):
+            has_kohya_prefix = True
+        if n.endswith(".lora_down.weight") or n.endswith(".lora_up.weight"):
+            has_kohya_suffix = True
+        if n.endswith(".lora_A.weight") or n.endswith(".lora_B.weight"):
+            has_dm_suffix = True
+        if (
+            (".attention.to_q.lora_" in n)
+            or (".feed_forward.w1.lora_" in n)
+        ):
+            has_zimage = True
+    if has_kohya_prefix and has_kohya_suffix:
+        return FMT_KOHYA_SDXL
+    if has_dm_suffix:
+        return FMT_DIFFUSION_MODEL
+    if has_zimage:
+        return FMT_ZIMAGE_TRAINER
+    return FMT_KLEIN_TRAINER
+
+
+def _suffix_a(fmt: Int) -> String:
+    """lora_A suffix for the format (lora_merge.rs:427-431)."""
+    if fmt == FMT_DIFFUSION_MODEL:
+        return ".lora_A.weight"
+    if fmt == FMT_KOHYA_SDXL:
+        return ".lora_down.weight"
+    return ".lora_A"  # KleinTrainer / ZImageTrainer
+
+
+def _suffix_b(fmt: Int) -> String:
+    """lora_B suffix for the format (lora_merge.rs:427-431)."""
+    if fmt == FMT_DIFFUSION_MODEL:
+        return ".lora_B.weight"
+    if fmt == FMT_KOHYA_SDXL:
+        return ".lora_up.weight"
+    return ".lora_B"  # KleinTrainer / ZImageTrainer
+
+
+def _substr_bytes(s: String, start: Int, end: Int) -> String:
+    """Build s[start:end] over BYTES. Tensor key names are ASCII, so per-byte
+    chr() reconstruction is exact here (range-slice `s[byte=a:byte=b]` is not
+    supported in 1.0.0b1; the codebase builds substrings byte-by-byte)."""
+    var out = String("")
+    var bytes = s.as_bytes()
+    for i in range(start, end):
+        out += chr(Int(bytes[i]))
+    return out
+
+
+def _strip_suffix(s: String, suf: String) -> String:
+    """Return s without trailing `suf`, or "" if it doesn't end with suf.
+    (Mojo String has no strip_suffix; "" signals no-match since real prefixes
+    are never empty.)"""
+    if s.endswith(suf) and s.byte_length() > suf.byte_length():
+        return _substr_bytes(s, 0, s.byte_length() - suf.byte_length())
+    return String("")
+
+
+def _strip_prefix(s: String, pre: String) -> String:
+    """Return s without leading `pre` if present, else s unchanged."""
+    if s.startswith(pre):
+        return _substr_bytes(s, pre.byte_length(), s.byte_length())
+    return s
+
+
+def _map_klein_trainer(prefix: String) -> LoraMapping:
+    """Klein-trainer prefix → base key + slot. Mirrors
+    lora_merge.rs::map_prefix_klein_trainer (lines 113-139). Returns a mapping
+    with base_key=="" when the prefix doesn't map (caller skips)."""
+    if prefix.startswith("input_bridges."):
+        return LoraMapping(prefix, String(""), SLOT_FULL, 0, 0)  # trainer-only
+
+    var rest = _strip_suffix(prefix, ".img_attn.qkv_proj")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".img_attn.qkv.weight", SLOT_FULL, 0, 0)
+    rest = _strip_suffix(prefix, ".img_attn.out_proj")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".img_attn.proj.weight", SLOT_FULL, 0, 0)
+    rest = _strip_suffix(prefix, ".txt_attn.qkv_proj")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".txt_attn.qkv.weight", SLOT_FULL, 0, 0)
+    rest = _strip_suffix(prefix, ".txt_attn.out_proj")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".txt_attn.proj.weight", SLOT_FULL, 0, 0)
+    if prefix.startswith("single_blocks."):
+        rest = _strip_suffix(prefix, ".qkv_proj")
+        if rest.byte_length() > 0:
+            return LoraMapping(
+                prefix, rest + ".linear1.weight", SLOT_ROWS, SINGLE_QKV_ROWS, 0
+            )
+        rest = _strip_suffix(prefix, ".out_proj")
+        if rest.byte_length() > 0:
+            return LoraMapping(
+                prefix, rest + ".linear2.weight", SLOT_COLS, SINGLE_OUT_COLS, 0
+            )
+    return LoraMapping(prefix, String(""), SLOT_FULL, 0, 0)
+
+
+def _map_zimage_trainer(prefix: String) -> LoraMapping:
+    """Z-Image trainer prefix → base key + slot. Mirrors
+    lora_merge.rs::map_prefix_zimage_trainer (lines 373-402). Split Q/K/V merge
+    into the fused `attention.qkv.weight` row ranges; out + feed_forward full."""
+    var rest = _strip_suffix(prefix, ".attention.to_q")
+    if rest.byte_length() > 0:
+        return LoraMapping(
+            prefix, rest + ".attention.qkv.weight", SLOT_ROWRANGE, 0, ZIMAGE_DIM
+        )
+    rest = _strip_suffix(prefix, ".attention.to_k")
+    if rest.byte_length() > 0:
+        return LoraMapping(
+            prefix, rest + ".attention.qkv.weight", SLOT_ROWRANGE, ZIMAGE_DIM, ZIMAGE_DIM
+        )
+    rest = _strip_suffix(prefix, ".attention.to_v")
+    if rest.byte_length() > 0:
+        return LoraMapping(
+            prefix,
+            rest + ".attention.qkv.weight",
+            SLOT_ROWRANGE,
+            2 * ZIMAGE_DIM,
+            ZIMAGE_DIM,
+        )
+    rest = _strip_suffix(prefix, ".attention.out")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".attention.out.weight", SLOT_FULL, 0, 0)
+    if (
+        prefix.endswith(".feed_forward.w1")
+        or prefix.endswith(".feed_forward.w2")
+        or prefix.endswith(".feed_forward.w3")
+    ):
+        return LoraMapping(prefix, prefix + ".weight", SLOT_FULL, 0, 0)
+    return LoraMapping(prefix, String(""), SLOT_FULL, 0, 0)
+
+
+def _map_diffusion_model(prefix: String) -> LoraMapping:
+    """edv2-reference / bare-PEFT prefix → base key. Strip leading
+    `diffusion_model.` and trailing `.default`, then append `.weight` (unless
+    the prefix already embeds `.weight`). Full overlay. Mirrors
+    lora_merge.rs::map_prefix_diffusion_model (lines 143-149) AND the PEFT
+    `.weight`-embedded fix from lora.rs:763-768 (avoids `.weight.weight`)."""
+    var stripped = _strip_prefix(prefix, "diffusion_model.")
+    var no_default = _strip_suffix(stripped, ".default")
+    if no_default.byte_length() > 0:
+        stripped = no_default
+    var target: String
+    if stripped.endswith(".weight"):
+        target = stripped
+    else:
+        target = stripped + ".weight"
+    return LoraMapping(prefix, target, SLOT_FULL, 0, 0)
+
+
+def _resolve_mapping(fmt: Int, prefix: String) -> LoraMapping:
+    """Dispatch the prefix → (base_key, slot) mapping by format. kohya SDXL
+    naming-rewrite is NOT ported (SDXL UNet not in this stack); kohya prefixes
+    are resolved by direct dotted-name reconstruction only — see merge_into."""
+    if fmt == FMT_KLEIN_TRAINER:
+        return _map_klein_trainer(prefix)
+    if fmt == FMT_ZIMAGE_TRAINER:
+        return _map_zimage_trainer(prefix)
+    # FMT_DIFFUSION_MODEL and FMT_KOHYA_SDXL direct path both append .weight.
+    return _map_diffusion_model(prefix)
+
+
+def _read_scalar_alpha(st: SafeTensors, key: String, ctx: DeviceContext) raises -> Float32:
+    """Read a per-module `.alpha` scalar tensor (shape [], any compute dtype) as
+    F32. Mirrors lora.rs:273-281 / lora_merge.rs:504-515. Returns the single
+    value; `key` must exist (caller checks membership first)."""
+    var info = st.tensor_info(key)
+    var data = st.tensor_bytes(key)
+    var tv = from_parts(info.dtype, info.shape.copy(), data)
+    var t = Tensor.from_view(tv, ctx)
+    var host = t.to_host(ctx)  # upcasts to F32
+    if len(host) == 0:
+        return 0.0
+    return host[0]
+
+
+struct LoraSet(Movable):
+    """A loaded LoRA file ready to merge into a base weight Dict. Holds an open
+    `SafeTensors` handle (mmap'd, not eagerly read), the detected format, and
+    the resolved per-module mappings (prefix → base_key + slot).
+
+    Movable-not-Copyable: owns the SafeTensors handle (which owns its mmap).
+    Mirrors the load half of lora_merge.rs::merge_klein_lora (lines 440-498)."""
+
+    var st: SafeTensors
+    var format: Int
+    var mappings: List[LoraMapping]
+    var suffix_a: String
+    var suffix_b: String
+
+    def __init__(out self, var st: SafeTensors, format: Int, var mappings: List[LoraMapping], var suffix_a: String, var suffix_b: String):
+        self.st = st^
+        self.format = format
+        self.mappings = mappings^
+        self.suffix_a = suffix_a^
+        self.suffix_b = suffix_b^
+
+    @staticmethod
+    def load(path: String) raises -> LoraSet:
+        """Open a LoRA `.safetensors`, detect its format, and resolve every
+        `<prefix>{suffix_a}` pair into a (base_key, slot) mapping. The data
+        segment is mmap'd — tensors are loaded H2D lazily in `merge_into`.
+
+        kohya SDXL: only direct-named (dotted→underscore) prefixes resolve;
+        text-encoder (lora_te*) and diffusers-named UNet LoRAs are skipped (the
+        diffusers→LDM rewriter is not ported — see module header)."""
+        var st = SafeTensors.open(path)
+        var names = st.names()
+        var fmt = _detect_format(names)
+        var sa = _suffix_a(fmt)
+        var sb = _suffix_b(fmt)
+
+        # Index prefixes from lora_A keys, resolve each to a mapping. A mapping
+        # with base_key=="" is dropped (trainer-only / unknown / skipped).
+        var mappings = List[LoraMapping]()
+        for ref n in names:
+            var prefix = _strip_suffix(n, sa)
+            if prefix.byte_length() == 0:
+                continue
+            # kohya text-encoder LoRAs are not merged into the UNet base.
+            if fmt == FMT_KOHYA_SDXL and (
+                prefix.startswith("lora_te1_") or prefix.startswith("lora_te2_")
+            ):
+                continue
+            var m = _resolve_mapping(fmt, prefix)
+            if m.base_key.byte_length() == 0:
+                continue
+            mappings.append(m^)
+
+        return LoraSet(st^, fmt, mappings^, sa^, sb^)
+
+    def num_mappings(self) -> Int:
+        """Number of resolved LoRA modules (post key-resolution, pre base-match)."""
+        return len(self.mappings)
+
+    def format_name(self) -> String:
+        if self.format == FMT_KLEIN_TRAINER:
+            return String("KleinTrainer")
+        if self.format == FMT_ZIMAGE_TRAINER:
+            return String("ZImageTrainer")
+        if self.format == FMT_DIFFUSION_MODEL:
+            return String("DiffusionModel")
+        return String("KohyaSdxl")
+
+    def _load_lora_tensor(self, key: String, ctx: DeviceContext) raises -> Tensor:
+        """H2D-load one LoRA tensor by full key from the mmap'd file."""
+        var info = self.st.tensor_info(key)
+        var data = self.st.tensor_bytes(key)
+        var tv = from_parts(info.dtype, info.shape.copy(), data)
+        return Tensor.from_view(tv, ctx)
+
+    def _module_scale(
+        self, m: LoraMapping, default_scale: Float32, multiplier: Float32, ctx: DeviceContext
+    ) raises -> Float32:
+        """Resolve the scale for one module: default_scale unless a per-module
+        `<prefix>.alpha` scalar is present, in which case
+        (alpha_module / module_rank) * multiplier (lora.rs:273-282)."""
+        var key_a = m.prefix + self.suffix_a
+        var a_info = self.st.tensor_info(key_a)
+        var module_rank = a_info.shape[0]
+        var alpha_key = m.prefix + ".alpha"
+        if alpha_key in self.st.tensors and module_rank > 0:
+            var alpha_v = _read_scalar_alpha(self.st, alpha_key, ctx)
+            return (alpha_v / Float32(module_rank)) * multiplier
+        return default_scale
+
+    def _compute_delta(
+        self, m: LoraMapping, scale: Float32, base_dtype: STDtype, ctx: DeviceContext
+    ) raises -> Tensor:
+        """Load A,B and return the scaled delta = scale*(B@A) cast to base_dtype.
+        B @ A via linear(B, Aᵀ) = B @ (Aᵀ)ᵀ = B @ A (foundation linear = x@wᵀ)."""
+        var key_a = m.prefix + self.suffix_a
+        var key_b = m.prefix + self.suffix_b
+        var a = self._load_lora_tensor(key_a, ctx)  # [rank, in]
+        var b = self._load_lora_tensor(key_b, ctx)  # [out, rank]
+        # linear needs matching dtypes; cast A to B's dtype first.
+        var a_for_mm: Tensor
+        if a.dtype() != b.dtype():
+            a_for_mm = cast_tensor(a, b.dtype(), ctx)
+        else:
+            a_for_mm = a^
+        var a_t = transpose(a_for_mm, 0, 1, ctx)  # [in, rank]
+        var prod = linear(b, a_t, None, ctx)  # [out, in]
+        var delta = mul_scalar(prod, scale, ctx)
+        if delta.dtype() != base_dtype:
+            return cast_tensor(delta, base_dtype, ctx)
+        return delta^
+
+    def _pair_present(self, m: LoraMapping) raises -> Bool:
+        """True iff both lora_A and lora_B exist and neither is 4D (conv)."""
+        var key_a = m.prefix + self.suffix_a
+        var key_b = m.prefix + self.suffix_b
+        if key_a not in self.st.tensors or key_b not in self.st.tensors:
+            return False
+        var a_info = self.st.tensor_info(key_a)
+        var b_info = self.st.tensor_info(key_b)
+        if len(a_info.shape) == 4 or len(b_info.shape) == 4:
+            return False  # conv LoRA — not supported (lora.rs:289-294)
+        return True
+
+    def merge_into(
+        self,
+        mut base: Dict[String, ArcPointer[Tensor]],
+        multiplier: Float32,
+        alpha: Float32,
+        rank: Int,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        """Merge every resolved LoRA module into `base` IN PLACE:
+            base[target] += scale * (B @ A),  scale = (alpha/rank)*multiplier
+        with row/col/row-range slicing per the resolved slot. Returns the
+        number of modules merged.
+
+        `alpha`/`rank` are the file-level defaults (train_klein default 16/16 →
+        scale=1.0). A per-module `<prefix>.alpha` scalar, when present, OVERRIDES
+        `alpha` for that module and `rank` becomes that module's A rows
+        (A is [rank, in], so rank = A.shape[0]) — mirrors lora.rs:273-282 which
+        reads per-module alpha for ALL formats. This is load-bearing: a
+        musubi/kohya LoRA with alpha=3 rank=96 would otherwise be ~32× too
+        strong (lora.rs:60-64).
+
+        delta is cast to the base weight's dtype before the add
+        (lora_merge.rs:560-564)."""
+        if rank <= 0:
+            raise Error("merge_into: rank must be > 0")
+        var default_scale = (alpha / Float32(rank)) * multiplier
+        var n_merged = 0
+
+        for ref m in self.mappings:
+            if not self._pair_present(m):
+                continue
+            if m.base_key not in base:
+                continue  # base key missing — skip (lora_merge.rs:553-556)
+            var scale = self._module_scale(m, default_scale, multiplier, ctx)
+            # Dict value is ArcPointer[Tensor] (Tensor is not Copyable) → deref
+            # with `[]` to borrow the underlying Tensor.
+            var base_dtype = base[m.base_key][].dtype()
+            var delta = self._compute_delta(m, scale, base_dtype, ctx)
+            var merged = _apply_slot(
+                base[m.base_key][], delta, m.slot_kind, m.slot_a, m.slot_b, ctx
+            )
+            base[m.base_key] = ArcPointer[Tensor](merged^)
+            n_merged += 1
+
+        return n_merged
+
+    def merge_into_indexed(
+        self,
+        mut weights: List[ArcPointer[Tensor]],
+        name_to_idx: Dict[String, Int],
+        multiplier: Float32,
+        alpha: Float32,
+        rank: Int,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        """Same as `merge_into` but for the List+name→idx weight layout used by
+        the Klein/Z-Image DiT models (`Klein9BDiT.weights` + `.name_to_idx`,
+        `NextDiT.weights` + `.name_to_idx`). Mutates `weights[idx]` in place for
+        each matched target. This is the non-invasive Klein integration point:
+        the caller passes `model.weights` and `model.name_to_idx` after
+        `Klein9BDiT.load_full(...)` and before the denoise loop. (The offloaded
+        path streams blocks lazily, so it cannot be merged this way — merge the
+        all-resident `load_full` model, or fold the delta per block at stream
+        time, which is out of scope here.)"""
+        if rank <= 0:
+            raise Error("merge_into_indexed: rank must be > 0")
+        var default_scale = (alpha / Float32(rank)) * multiplier
+        var n_merged = 0
+
+        for ref m in self.mappings:
+            if not self._pair_present(m):
+                continue
+            if m.base_key not in name_to_idx:
+                continue
+            var idx = name_to_idx[m.base_key]
+            var scale = self._module_scale(m, default_scale, multiplier, ctx)
+            var base_dtype = weights[idx][].dtype()
+            var delta = self._compute_delta(m, scale, base_dtype, ctx)
+            var merged = _apply_slot(
+                weights[idx][], delta, m.slot_kind, m.slot_a, m.slot_b, ctx
+            )
+            weights[idx] = ArcPointer[Tensor](merged^)
+            n_merged += 1
+
+        return n_merged
+
+
+def _apply_slot(
+    base_w: Tensor,
+    delta: Tensor,
+    slot_kind: Int,
+    slot_a: Int,
+    slot_b: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Add `delta` into `base_w` per the slot kind, returning the merged weight.
+    Mirrors the per-slot match in lora_merge.rs:566-638.
+      FULL     : base + delta (shapes must match)
+      ROWS(n)  : base[..n,:] += delta; rejoin with base[n..,:]
+      COLS(n)  : base[:,..n] += delta; rejoin with base[:,n..]
+      ROWRANGE : base[start..start+len,:] += delta; rejoin head|mid|tail."""
+    var bdims = base_w.shape()
+
+    if slot_kind == SLOT_FULL:
+        var ddims = delta.shape()
+        if len(bdims) != len(ddims):
+            raise Error("lora Full: rank mismatch base vs delta")
+        for i in range(len(bdims)):
+            if bdims[i] != ddims[i]:
+                raise Error("lora Full: shape mismatch base vs delta")
+        return add(base_w, delta, ctx)
+
+    if slot_kind == SLOT_ROWS:
+        var n = slot_a
+        if len(bdims) != 2 or bdims[0] < n:
+            raise Error("lora Rows: base must be 2D with >= n rows")
+        var top = slice(base_w, 0, 0, n, ctx)
+        var bottom = slice(base_w, 0, n, bdims[0] - n, ctx)
+        var top_merged = add(top, delta, ctx)
+        return concat(0, ctx, top_merged, bottom)
+
+    if slot_kind == SLOT_COLS:
+        var n = slot_a
+        if len(bdims) != 2 or bdims[1] < n:
+            raise Error("lora Cols: base must be 2D with >= n cols")
+        var left = slice(base_w, 1, 0, n, ctx)
+        var right = slice(base_w, 1, n, bdims[1] - n, ctx)
+        var left_merged = add(left, delta, ctx)
+        return concat(1, ctx, left_merged, right)
+
+    # SLOT_ROWRANGE
+    var start = slot_a
+    var length = slot_b
+    if len(bdims) != 2 or start + length > bdims[0]:
+        raise Error("lora RowRange: base must be 2D and range in bounds")
+    var head_len = start
+    var tail_len = bdims[0] - start - length
+    var mid = slice(base_w, 0, start, length, ctx)
+    var mid_merged = add(mid, delta, ctx)
+    if head_len > 0 and tail_len > 0:
+        var head = slice(base_w, 0, 0, head_len, ctx)
+        var tail = slice(base_w, 0, start + length, tail_len, ctx)
+        return concat(0, ctx, head, mid_merged, tail)
+    elif head_len > 0:
+        var head = slice(base_w, 0, 0, head_len, ctx)
+        return concat(0, ctx, head, mid_merged)
+    elif tail_len > 0:
+        var tail = slice(base_w, 0, start + length, tail_len, ctx)
+        return concat(0, ctx, mid_merged, tail)
+    else:
+        return mid_merged^

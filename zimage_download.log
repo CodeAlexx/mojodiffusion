@@ -1,0 +1,2 @@
+Fetching 21 files:   0%|          | 0/21 [00:00<?, ?it/s]Fetching 21 files:   5%|▍         | 1/21 [00:00<00:07,  2.58it/s]Fetching 21 files:  10%|▉         | 2/21 [00:00<00:04,  3.90it/s]Fetching 21 files:  24%|██▍       | 5/21 [00:02<00:06,  2.35it/s]Fetching 21 files: 100%|██████████| 21/21 [00:02<00:00, 10.35it/s]
+DONE -> /home/alex/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image/snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021

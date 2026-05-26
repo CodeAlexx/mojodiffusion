@@ -1,0 +1,98 @@
+{"dtype": "BF16", "fnv1a64": 14698223192214783874, "name": "layers.23.adaLN_modulation.0.bias", "offset": 0, "shape": [15360], "size": 30720}
+{"dtype": "BF16", "fnv1a64": 11616226571412948807, "name": "layers.23.adaLN_modulation.0.weight", "offset": 30720, "shape": [15360, 256], "size": 7864320}
+{"dtype": "BF16", "fnv1a64": 13416544786504496311, "name": "layers.23.attention_norm1.weight", "offset": 7895040, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 11877704514700934067, "name": "layers.23.attention_norm2.weight", "offset": 7902720, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 7181633036545357907, "name": "layers.23.feed_forward.w2.weight", "offset": 7910400, "shape": [3840, 10240], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 2172864112530586159, "name": "layers.23.feed_forward.w3.weight", "offset": 86553600, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 507581578968758163, "name": "layers.23.ffn_norm1.weight", "offset": 165196800, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 16175215002723802109, "name": "layers.23.ffn_norm2.weight", "offset": 165204480, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 4122715242081812305, "name": "layers.24.adaLN_modulation.0.bias", "offset": 165212160, "shape": [15360], "size": 30720}
+{"dtype": "BF16", "fnv1a64": 7930460891656772499, "name": "layers.24.adaLN_modulation.0.weight", "offset": 165242880, "shape": [15360, 256], "size": 7864320}
+{"dtype": "BF16", "fnv1a64": 23438406136279953, "name": "layers.24.attention.norm_k.weight", "offset": 173107200, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 13177649170237060073, "name": "layers.24.attention.norm_q.weight", "offset": 173107456, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 7184752172466775001, "name": "layers.24.attention.to_k.weight", "offset": 173107712, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 16007446729723374416, "name": "layers.24.attention.to_out.0.weight", "offset": 202598912, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 7092488513172779614, "name": "layers.24.attention.to_q.weight", "offset": 232090112, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 388736880845676656, "name": "layers.24.attention.to_v.weight", "offset": 261581312, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 17797632671788599837, "name": "layers.24.attention_norm1.weight", "offset": 291072512, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 9951973518409060328, "name": "layers.24.attention_norm2.weight", "offset": 291080192, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 14131330188045751221, "name": "layers.24.feed_forward.w1.weight", "offset": 291087872, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 1100656856173297904, "name": "layers.24.feed_forward.w2.weight", "offset": 369731072, "shape": [3840, 10240], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 16142517755186636653, "name": "layers.24.feed_forward.w3.weight", "offset": 448374272, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 13089155135988691494, "name": "layers.24.ffn_norm1.weight", "offset": 527017472, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 15438724370309894461, "name": "layers.24.ffn_norm2.weight", "offset": 527025152, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 16192906857805033808, "name": "layers.25.adaLN_modulation.0.bias", "offset": 527032832, "shape": [15360], "size": 30720}
+{"dtype": "BF16", "fnv1a64": 17727698238575622725, "name": "layers.25.adaLN_modulation.0.weight", "offset": 527063552, "shape": [15360, 256], "size": 7864320}
+{"dtype": "BF16", "fnv1a64": 16599239353956711438, "name": "layers.25.attention.norm_k.weight", "offset": 534927872, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 9921960177748503672, "name": "layers.25.attention.norm_q.weight", "offset": 534928128, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 8717644983531487304, "name": "layers.25.attention.to_k.weight", "offset": 534928384, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 2349428239762098882, "name": "layers.25.attention.to_out.0.weight", "offset": 564419584, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 12163813464179903973, "name": "layers.25.attention.to_q.weight", "offset": 593910784, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 11633240339670544820, "name": "layers.25.attention.to_v.weight", "offset": 623401984, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 12773520068794954489, "name": "layers.25.attention_norm1.weight", "offset": 652893184, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 4820202508661290450, "name": "layers.25.attention_norm2.weight", "offset": 652900864, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 5883445199902776779, "name": "layers.25.feed_forward.w1.weight", "offset": 652908544, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 3616103795006145186, "name": "layers.25.feed_forward.w2.weight", "offset": 731551744, "shape": [3840, 10240], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 17495289805652526237, "name": "layers.25.feed_forward.w3.weight", "offset": 810194944, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 7247483592022825882, "name": "layers.25.ffn_norm1.weight", "offset": 888838144, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 13108566784311097734, "name": "layers.25.ffn_norm2.weight", "offset": 888845824, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 5051249752864753827, "name": "layers.26.adaLN_modulation.0.bias", "offset": 888853504, "shape": [15360], "size": 30720}
+{"dtype": "BF16", "fnv1a64": 16199993814697883396, "name": "layers.26.adaLN_modulation.0.weight", "offset": 888884224, "shape": [15360, 256], "size": 7864320}
+{"dtype": "BF16", "fnv1a64": 3767520305784904277, "name": "layers.26.attention.norm_k.weight", "offset": 896748544, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 8425149842480011682, "name": "layers.26.attention.norm_q.weight", "offset": 896748800, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 16836439902544517549, "name": "layers.26.attention.to_k.weight", "offset": 896749056, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 2967583915944787222, "name": "layers.26.attention.to_out.0.weight", "offset": 926240256, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 2465940351591797566, "name": "layers.26.attention.to_q.weight", "offset": 955731456, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 3505563114097606172, "name": "layers.26.attention.to_v.weight", "offset": 985222656, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 5262876351806324952, "name": "layers.26.attention_norm1.weight", "offset": 1014713856, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 4223427260460626135, "name": "layers.26.attention_norm2.weight", "offset": 1014721536, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 123887691688571806, "name": "layers.26.feed_forward.w1.weight", "offset": 1014729216, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 11784320996362242347, "name": "layers.26.feed_forward.w2.weight", "offset": 1093372416, "shape": [3840, 10240], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 795853498730167509, "name": "layers.26.feed_forward.w3.weight", "offset": 1172015616, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 5214533232889794348, "name": "layers.26.ffn_norm1.weight", "offset": 1250658816, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 5171069836549678741, "name": "layers.26.ffn_norm2.weight", "offset": 1250666496, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 1417672001542234638, "name": "layers.27.adaLN_modulation.0.bias", "offset": 1250674176, "shape": [15360], "size": 30720}
+{"dtype": "BF16", "fnv1a64": 6142025279042597753, "name": "layers.27.adaLN_modulation.0.weight", "offset": 1250704896, "shape": [15360, 256], "size": 7864320}
+{"dtype": "BF16", "fnv1a64": 8629804862403543322, "name": "layers.27.attention.norm_k.weight", "offset": 1258569216, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 5502985131104713657, "name": "layers.27.attention.norm_q.weight", "offset": 1258569472, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 5120162596186480453, "name": "layers.27.attention.to_k.weight", "offset": 1258569728, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 12933353161848075652, "name": "layers.27.attention.to_out.0.weight", "offset": 1288060928, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 2933313507617226749, "name": "layers.27.attention.to_q.weight", "offset": 1317552128, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 8326226633995319404, "name": "layers.27.attention.to_v.weight", "offset": 1347043328, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 17077839172169847225, "name": "layers.27.attention_norm1.weight", "offset": 1376534528, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 16406034736605807997, "name": "layers.27.attention_norm2.weight", "offset": 1376542208, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 13471629649870515082, "name": "layers.27.feed_forward.w1.weight", "offset": 1376549888, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 2291188404352481468, "name": "layers.27.feed_forward.w2.weight", "offset": 1455193088, "shape": [3840, 10240], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 4535012901849439589, "name": "layers.27.feed_forward.w3.weight", "offset": 1533836288, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 6219480577048349135, "name": "layers.27.ffn_norm1.weight", "offset": 1612479488, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 5841437100506873919, "name": "layers.27.ffn_norm2.weight", "offset": 1612487168, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 9002352012640114250, "name": "layers.28.adaLN_modulation.0.bias", "offset": 1612494848, "shape": [15360], "size": 30720}
+{"dtype": "BF16", "fnv1a64": 14194200565776020022, "name": "layers.28.adaLN_modulation.0.weight", "offset": 1612525568, "shape": [15360, 256], "size": 7864320}
+{"dtype": "BF16", "fnv1a64": 9420938943441082827, "name": "layers.28.attention.norm_k.weight", "offset": 1620389888, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 6993164428669206355, "name": "layers.28.attention.norm_q.weight", "offset": 1620390144, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 486333721647854436, "name": "layers.28.attention.to_k.weight", "offset": 1620390400, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 16031345440580285952, "name": "layers.28.attention.to_out.0.weight", "offset": 1649881600, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 1184519563759007247, "name": "layers.28.attention.to_q.weight", "offset": 1679372800, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 2335842294671569023, "name": "layers.28.attention.to_v.weight", "offset": 1708864000, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 4015751809056280017, "name": "layers.28.attention_norm1.weight", "offset": 1738355200, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 13411207538805932868, "name": "layers.28.attention_norm2.weight", "offset": 1738362880, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 4346482454696245143, "name": "layers.28.feed_forward.w1.weight", "offset": 1738370560, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 10671123313970167960, "name": "layers.28.feed_forward.w2.weight", "offset": 1817013760, "shape": [3840, 10240], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 8746007299721402472, "name": "layers.28.feed_forward.w3.weight", "offset": 1895656960, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 2511839226461089362, "name": "layers.28.ffn_norm1.weight", "offset": 1974300160, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 11311877429502713156, "name": "layers.28.ffn_norm2.weight", "offset": 1974307840, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 17443468905362879477, "name": "layers.29.adaLN_modulation.0.bias", "offset": 1974315520, "shape": [15360], "size": 30720}
+{"dtype": "BF16", "fnv1a64": 1269282114776594973, "name": "layers.29.adaLN_modulation.0.weight", "offset": 1974346240, "shape": [15360, 256], "size": 7864320}
+{"dtype": "BF16", "fnv1a64": 4438025805042924791, "name": "layers.29.attention.norm_k.weight", "offset": 1982210560, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 16017579876145978913, "name": "layers.29.attention.norm_q.weight", "offset": 1982210816, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 14260591403418667527, "name": "layers.29.attention.to_k.weight", "offset": 1982211072, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 11606409203680565395, "name": "layers.29.attention.to_out.0.weight", "offset": 2011702272, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 15982290359653889536, "name": "layers.29.attention.to_q.weight", "offset": 2041193472, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 8078300542771553260, "name": "layers.29.attention.to_v.weight", "offset": 2070684672, "shape": [3840, 3840], "size": 29491200}
+{"dtype": "BF16", "fnv1a64": 7761437600608395118, "name": "layers.29.attention_norm1.weight", "offset": 2100175872, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 6157127816663201210, "name": "layers.29.attention_norm2.weight", "offset": 2100183552, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 14757107655549802937, "name": "layers.29.feed_forward.w1.weight", "offset": 2100191232, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 9931898472816184545, "name": "layers.29.feed_forward.w2.weight", "offset": 2178834432, "shape": [3840, 10240], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 2112626236320637526, "name": "layers.29.feed_forward.w3.weight", "offset": 2257477632, "shape": [10240, 3840], "size": 78643200}
+{"dtype": "BF16", "fnv1a64": 14618488826876996297, "name": "layers.29.ffn_norm1.weight", "offset": 2336120832, "shape": [3840], "size": 7680}
+{"dtype": "BF16", "fnv1a64": 14692250976766027085, "name": "layers.29.ffn_norm2.weight", "offset": 2336128512, "shape": [3840], "size": 7680}

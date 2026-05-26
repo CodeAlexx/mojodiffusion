@@ -11,18 +11,18 @@
 #   cd /home/alex/mojodiffusion && pixi run mojo build -I . -Xlinker -lm \
 #       serenitymojo/pipeline/klein9b_lora_smoke.mojo -o /tmp/kleinlora
 #
-# ⚠ KEY-LAYOUT GAP (verified 2026-05-26, the sibling-port bite the task warned
-#   about): the Klein9B DiT base stores FUSED `double_blocks.<i>.img_attn.qkv.
-#   weight`, but the EriDiffusion-v2 `train_klein` LoRA I inspected ships SPLIT
-#   `double_blocks.<i>.img_attn.to_q/to_k/to_v.weight` (detected DiffusionModel
-#   format → mapped to `...to_q.weight`, which DOES NOT EXIST in the base, so
-#   those modules NO-OP at merge). A split→fused RowRange mapper for the
-#   `.img_attn.to_q/k/v` Klein names (analogous to the Z-Image `.attention.
-#   to_q/k/v` → fused-qkv RowRange in _map_zimage_trainer) would be needed for a
-#   train_klein LoRA to merge into this fused base. The KleinTrainer-format
-#   `qkv_proj`/`out_proj` LoRAs DO map straight to fused `qkv.weight` (full
-#   overlay) and merge cleanly. This smoke proves the WIRING; whether a given
-#   LoRA's targets resolve depends on the LoRA's key layout vs the base's.
+# KEY-LAYOUT (verified 2026-05-26, fixed 2026-05-26): the Klein9B DiT base
+#   stores FUSED `double_blocks.<i>.{img,txt}_attn.qkv.weight`, and the
+#   EriDiffusion-v2 `train_klein` LoRA ships SPLIT
+#   `double_blocks.<i>.{img,txt}_attn.to_q/to_k/to_v.lora_A.weight` (detected
+#   DiffusionModel format). `LoraSet.load` now routes those split Q/K/V modules
+#   into the fused `qkv.weight` row-ranges via `_map_klein_split_qkv` (offsets
+#   0/out/2*out, len out; out = B-tensor shape[0], read from the file, NOT
+#   hardcoded), mirroring the Z-Image branch in lora.rs:730-750 but keyed on
+#   Klein's `.img_attn`/`.txt_attn` naming. KleinTrainer-format
+#   `qkv_proj`/`out_proj` LoRAs still map straight to fused `qkv.weight` (full
+#   overlay). All valid targets (proj/mlp/single + the 48 attention QKV modules)
+#   now merge.
 
 from std.gpu.host import DeviceContext
 
@@ -35,8 +35,9 @@ comptime KLEIN9B_PATH = "/home/alex/.serenity/models/checkpoints/flux-2-klein-ba
 # gap above: with this file, img_attn merges no-op against the fused base.
 comptime LORA_PATH = "/home/alex/EriDiffusion/EriDiffusion-v2/output/klein_lr3e4_const_b1/klein_lora_step200.safetensors"
 comptime MULTIPLIER: Float32 = 1.0
-comptime ALPHA: Float32 = 16.0  # train_klein default (= rank → scale 1.0)
-comptime RANK = 16
+# No file-level alpha/rank: scale is PER-MODULE (alpha/module_rank, alpha
+# defaulting to module_rank when absent → scale = multiplier). See lora.mojo
+# _module_scale / lora.rs:273-282.
 
 
 def main() raises:
@@ -55,10 +56,10 @@ def main() raises:
         " resolved mappings ", lset.num_mappings(),
     )
     var n = lset.merge_into_indexed(
-        model.weights, model.name_to_idx, MULTIPLIER, ALPHA, RANK, ctx
+        model.weights, model.name_to_idx, MULTIPLIER, ctx
     )
     print("merged ", n, " module(s) into Klein9B weights")
-    print("(targets that hit the fused img_attn.qkv base will be 0 — see header)")
+    print("(split to_q/k/v now route into the fused img_attn/txt_attn.qkv RowRange)")
 
     # Stage 4+: denoise / VAE / PNG would follow here exactly as
     # klein9b_pipeline_1024_smoke.mojo, but the model now carries the merged

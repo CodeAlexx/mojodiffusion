@@ -112,11 +112,12 @@ def main() raises:
             "loaded LoRA format", lset.format_name(),
             "mappings", lset.num_mappings(),
         )
-        # Default alpha/rank 16/16 → scale 1.0 (train_klein default). The synth
-        # base shape [2,2] won't match the real [4096,4096] weight, so the merge
-        # raises on the shape check — caught here. Real use passes the real base.
+        # Scale is per-module (alpha defaults to module_rank when absent →
+        # scale = multiplier = 1.0). The synth base shape [2,2] won't match the
+        # real [4096,4096] weight, so the merge raises on the shape check —
+        # caught here. Real use passes the real base.
         try:
-            var n = lset.merge_into(base, 1.0, 16.0, 16, ctx)
+            var n = lset.merge_into(base, 1.0, ctx)
             print("merged", n, "module(s) into synthetic base")
         except e:
             print("(merge raised on synthetic shape mismatch, as expected:", e, ")")

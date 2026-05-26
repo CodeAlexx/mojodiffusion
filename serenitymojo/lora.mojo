@@ -252,10 +252,56 @@ def _map_diffusion_model(prefix: String) -> LoraMapping:
     return LoraMapping(prefix, target, SLOT_FULL, 0, 0)
 
 
+def _map_klein_split_qkv(prefix: String, out_dim: Int) -> LoraMapping:
+    """Klein DiffusionModel-format SPLIT Q/K/V → FUSED qkv RowRange mapper.
+
+    The EriDiffusion-v2 `train_klein` LoRA ships SPLIT
+    `double_blocks.<i>.{img,txt}_attn.to_q/to_k/to_v.lora_A.weight` (no
+    `diffusion_model.` prefix → detected as DiffusionModel). The Klein9B base
+    stores a FUSED `double_blocks.<i>.{img,txt}_attn.qkv.weight` of shape
+    `[3*out, in]` (out = inner_dim, e.g. 4096 for 9B). The generic
+    `_map_diffusion_model` would emit a nonexistent `...to_q.weight` key and the
+    module would silently no-op at merge — so route Q/K/V into the fused
+    qkv.weight row-ranges `0/out/2*out`, len `out`, exactly mirroring the
+    Z-Image branch in `lora.rs::map_prefix_diffusion_model` (lines 730-750) but
+    keyed on Klein's `.img_attn`/`.txt_attn` naming instead of `.attention`.
+
+    `out_dim` is the per-module out features, read from the B tensor's shape[0]
+    (B is `[out, rank]`) at load time — NOT hardcoded — so a base whose fused
+    qkv first dim != 3*out_dim trips the `_apply_slot` RowRange bounds check
+    (`start + len > bdims[0]`) and is skipped at merge (the shape gate the task
+    asked for). Returns base_key=="" when `prefix` is not a Klein split-QKV name
+    (caller falls back to the generic DiffusionModel mapper)."""
+    var rest = _strip_suffix(prefix, ".img_attn.to_q")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".img_attn.qkv.weight", SLOT_ROWRANGE, 0, out_dim)
+    rest = _strip_suffix(prefix, ".img_attn.to_k")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".img_attn.qkv.weight", SLOT_ROWRANGE, out_dim, out_dim)
+    rest = _strip_suffix(prefix, ".img_attn.to_v")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".img_attn.qkv.weight", SLOT_ROWRANGE, 2 * out_dim, out_dim)
+    rest = _strip_suffix(prefix, ".txt_attn.to_q")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".txt_attn.qkv.weight", SLOT_ROWRANGE, 0, out_dim)
+    rest = _strip_suffix(prefix, ".txt_attn.to_k")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".txt_attn.qkv.weight", SLOT_ROWRANGE, out_dim, out_dim)
+    rest = _strip_suffix(prefix, ".txt_attn.to_v")
+    if rest.byte_length() > 0:
+        return LoraMapping(prefix, rest + ".txt_attn.qkv.weight", SLOT_ROWRANGE, 2 * out_dim, out_dim)
+    return LoraMapping(prefix, String(""), SLOT_FULL, 0, 0)
+
+
 def _resolve_mapping(fmt: Int, prefix: String) -> LoraMapping:
     """Dispatch the prefix → (base_key, slot) mapping by format. kohya SDXL
     naming-rewrite is NOT ported (SDXL UNet not in this stack); kohya prefixes
-    are resolved by direct dotted-name reconstruction only — see merge_into."""
+    are resolved by direct dotted-name reconstruction only — see merge_into.
+
+    NOTE: the Klein split→fused QKV case (`.img_attn`/`.txt_attn.to_q/k/v` →
+    fused `qkv.weight` RowRange) is NOT handled here because it needs the
+    per-module out-dim from the B tensor shape; `LoraSet.load` resolves it via
+    `_map_klein_split_qkv` before falling back to this generic mapper."""
     if fmt == FMT_KLEIN_TRAINER:
         return _map_klein_trainer(prefix)
     if fmt == FMT_ZIMAGE_TRAINER:
@@ -326,6 +372,20 @@ struct LoraSet(Movable):
                 prefix.startswith("lora_te1_") or prefix.startswith("lora_te2_")
             ):
                 continue
+            # Klein DiffusionModel SPLIT Q/K/V → FUSED qkv RowRange. The base
+            # stores fused `{img,txt}_attn.qkv.weight` but train_klein ships
+            # split `to_q/k/v`; route them into row-ranges using the per-module
+            # out-dim read from the B tensor (`[out, rank]`), NOT hardcoded.
+            # Falls through to the generic DiffusionModel mapper otherwise.
+            if fmt == FMT_DIFFUSION_MODEL:
+                var key_b = prefix + sb
+                if key_b in st.tensors:
+                    var b_shape = st.tensor_info(key_b).shape.copy()
+                    if len(b_shape) >= 1 and b_shape[0] > 0:
+                        var ksplit = _map_klein_split_qkv(prefix, b_shape[0])
+                        if ksplit.base_key.byte_length() > 0:
+                            mappings.append(ksplit^)
+                            continue
             var m = _resolve_mapping(fmt, prefix)
             if m.base_key.byte_length() == 0:
                 continue
@@ -354,19 +414,31 @@ struct LoraSet(Movable):
         return Tensor.from_view(tv, ctx)
 
     def _module_scale(
-        self, m: LoraMapping, default_scale: Float32, multiplier: Float32, ctx: DeviceContext
+        self, m: LoraMapping, multiplier: Float32, ctx: DeviceContext
     ) raises -> Float32:
-        """Resolve the scale for one module: default_scale unless a per-module
-        `<prefix>.alpha` scalar is present, in which case
-        (alpha_module / module_rank) * multiplier (lora.rs:273-282)."""
+        """Resolve the scale for one module PER-MODULE (no file-level alpha/rank
+        defaulting), exactly mirroring lora.rs:273-282:
+            module_rank = A.shape[0]   (A is [rank, in])
+            alpha       = <prefix>.alpha scalar if present, else module_rank
+            scale       = (alpha / module_rank) * multiplier
+        When `.alpha` is absent the alpha defaults to module_rank so
+        alpha/rank == 1 and scale == multiplier — matching our trainers'
+        default and the per-module derivation the binary
+        klein_lora_infer.rs:253-261 relies on. This makes the scale robust to
+        mixed-rank files and to callers that pass a mismatched file-level rank
+        (the old fallback computed alpha/rank against caller args, diverging
+        from canonical when caller rank != module rank)."""
         var key_a = m.prefix + self.suffix_a
         var a_info = self.st.tensor_info(key_a)
         var module_rank = a_info.shape[0]
+        if module_rank <= 0:
+            return multiplier
         var alpha_key = m.prefix + ".alpha"
-        if alpha_key in self.st.tensors and module_rank > 0:
+        if alpha_key in self.st.tensors:
             var alpha_v = _read_scalar_alpha(self.st, alpha_key, ctx)
             return (alpha_v / Float32(module_rank)) * multiplier
-        return default_scale
+        # No `.alpha`: alpha defaults to module_rank → scale = multiplier.
+        return multiplier
 
     def _compute_delta(
         self, m: LoraMapping, scale: Float32, base_dtype: STDtype, ctx: DeviceContext
@@ -406,28 +478,24 @@ struct LoraSet(Movable):
         self,
         mut base: Dict[String, ArcPointer[Tensor]],
         multiplier: Float32,
-        alpha: Float32,
-        rank: Int,
         ctx: DeviceContext,
     ) raises -> Int:
         """Merge every resolved LoRA module into `base` IN PLACE:
-            base[target] += scale * (B @ A),  scale = (alpha/rank)*multiplier
+            base[target] += scale * (B @ A)
         with row/col/row-range slicing per the resolved slot. Returns the
         number of modules merged.
 
-        `alpha`/`rank` are the file-level defaults (train_klein default 16/16 →
-        scale=1.0). A per-module `<prefix>.alpha` scalar, when present, OVERRIDES
-        `alpha` for that module and `rank` becomes that module's A rows
-        (A is [rank, in], so rank = A.shape[0]) — mirrors lora.rs:273-282 which
-        reads per-module alpha for ALL formats. This is load-bearing: a
-        musubi/kohya LoRA with alpha=3 rank=96 would otherwise be ~32× too
-        strong (lora.rs:60-64).
+        Scale is PER-MODULE (lora.rs:273-282): scale = (alpha/module_rank)*
+        multiplier, where module_rank = A.shape[0] and alpha is the per-module
+        `<prefix>.alpha` scalar if present, else module_rank (→ scale =
+        multiplier). There is NO file-level alpha/rank knob — `multiplier` is the
+        only caller adjustment. This reads per-module alpha for ALL formats and
+        is load-bearing: a musubi/kohya LoRA with alpha=3 rank=96 would
+        otherwise be ~32× too strong (lora.rs:60-64), and a mixed-rank file is
+        handled correctly per module.
 
         delta is cast to the base weight's dtype before the add
         (lora_merge.rs:560-564)."""
-        if rank <= 0:
-            raise Error("merge_into: rank must be > 0")
-        var default_scale = (alpha / Float32(rank)) * multiplier
         var n_merged = 0
 
         for ref m in self.mappings:
@@ -435,7 +503,7 @@ struct LoraSet(Movable):
                 continue
             if m.base_key not in base:
                 continue  # base key missing — skip (lora_merge.rs:553-556)
-            var scale = self._module_scale(m, default_scale, multiplier, ctx)
+            var scale = self._module_scale(m, multiplier, ctx)
             # Dict value is ArcPointer[Tensor] (Tensor is not Copyable) → deref
             # with `[]` to borrow the underlying Tensor.
             var base_dtype = base[m.base_key][].dtype()
@@ -453,8 +521,6 @@ struct LoraSet(Movable):
         mut weights: List[ArcPointer[Tensor]],
         name_to_idx: Dict[String, Int],
         multiplier: Float32,
-        alpha: Float32,
-        rank: Int,
         ctx: DeviceContext,
     ) raises -> Int:
         """Same as `merge_into` but for the List+name→idx weight layout used by
@@ -465,10 +531,9 @@ struct LoraSet(Movable):
         `Klein9BDiT.load_full(...)` and before the denoise loop. (The offloaded
         path streams blocks lazily, so it cannot be merged this way — merge the
         all-resident `load_full` model, or fold the delta per block at stream
-        time, which is out of scope here.)"""
-        if rank <= 0:
-            raise Error("merge_into_indexed: rank must be > 0")
-        var default_scale = (alpha / Float32(rank)) * multiplier
+        time, which is out of scope here.)
+
+        Scale is PER-MODULE (no file-level alpha/rank) — see `merge_into`."""
         var n_merged = 0
 
         for ref m in self.mappings:
@@ -477,7 +542,7 @@ struct LoraSet(Movable):
             if m.base_key not in name_to_idx:
                 continue
             var idx = name_to_idx[m.base_key]
-            var scale = self._module_scale(m, default_scale, multiplier, ctx)
+            var scale = self._module_scale(m, multiplier, ctx)
             var base_dtype = weights[idx][].dtype()
             var delta = self._compute_delta(m, scale, base_dtype, ctx)
             var merged = _apply_slot(

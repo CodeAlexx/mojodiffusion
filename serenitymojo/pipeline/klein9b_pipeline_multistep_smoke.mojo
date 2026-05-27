@@ -9,8 +9,10 @@
 # Loop reproduced (verified against the Rust source):
 #   - sigma schedule  = build_flux2_sigma_schedule(num_steps, N_IMG)  (= Rust get_schedule)
 #   - per step i: t_curr=sigmas[i], t_next=sigmas[i+1], dt = t_next - t_curr (< 0)
-#   - timestep fed to DiT = raw sigma t_curr as a [1] F32 tensor (NO *1000; the
-#     Rust ref and the Mojo t_embedder both consume the raw sigma directly).
+#   - timestep fed to DiT = sigma t_curr * 1000 as a [1] F32 tensor. The Rust ref
+#     applies the *1000 BFL time_factor INSIDE timestep_embedding (klein.rs:134-160,
+#     called at :744 with time_factor=1000.0); the Mojo shared ops/embeddings.t_embedder
+#     does NOT scale, so the pipeline pre-scales here (mirrors flux1 caller :224).
 #   - CFG = pred_neg + CFG*(pred_pos - pred_neg)  (flux2_cfg). NO post-CFG sign
 #     flip (Klein, unlike Z-Image, does not negate).
 #   - x = x + dt * pred   (direct-velocity Euler, flux2_euler_step form).
@@ -165,9 +167,13 @@ def denoise(caps: KleinCaps, ctx: DeviceContext) raises -> Tensor:
         var t_next = sigmas[i + 1]
         var dt = t_next - t_curr  # sigma[i+1] - sigma[i], normally < 0
         print("  step", i + 1, "/", NUM_STEPS, "sigma", t_curr, "->", t_next)
-        # Timestep fed to DiT: raw sigma as a [1] F32 tensor (no *1000).
+        # Timestep fed to DiT: sigma pre-scaled by 1000 (BFL time_factor). The
+        # Rust ref applies this *1000 INSIDE timestep_embedding (klein.rs:134-160,
+        # called at :744 with time_factor=1000.0), but the Mojo shared
+        # ops/embeddings.t_embedder does NOT scale — so the caller must pre-scale
+        # (mirrors flux1_pipeline_smoke.mojo:224).
         var tvals = List[Float32]()
-        tvals.append(t_curr)
+        tvals.append(t_curr * 1000.0)
         var tsh = List[Int]()
         tsh.append(1)
         var timestep = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)

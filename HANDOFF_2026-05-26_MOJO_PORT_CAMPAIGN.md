@@ -11,10 +11,17 @@
 ## §1 — THE BLOCKER: GPU is wedged → reset BEFORE anything
 A stale `inference-flame/target/release/klein9b_infer` (pre-VAE-fix) hit `CUDA_ERROR_ILLEGAL_ADDRESS` and globally wedged the GPU — every CUDA process (flame-core, MAX/Mojo, torch) fails first-launch; `nvidia-smi` looks idle but no kernel runs. No process to kill (verified fuser/lsof). **Recovery = reboot, OR (SSH+sudo) `systemctl isolate multi-user.target` → `nvidia-smi --gpu-reset -i 0` → `systemctl isolate graphical.target`.** User is doing this at home.
 
+## §1.5 — ROUND-2 AUDIT OUTCOME (read this — it changes the priority)
+A second cross-cutting audit (loading / RoPE-attn / sampler themes) ran after the per-model round-1. Net:
+- 🎯 **KLEIN NOISE ROOT-CAUSED + FIXED (code-only):** the timestep fed to the Klein DiT was missing the **×1000 `time_factor`**. Rust `klein.rs:141` does `t_scaled = t*1000` INSIDE `timestep_embedding`; Mojo's shared `t_embedder` does NOT scale, and Klein never pre-scaled (FLUX/Qwen/Nucleus/Z-Image all do). Fixed: `t_curr*1000.0` in all 3 klein9b smokes (raw Euler vars unchanged), compiles EXIT=0. **VALIDATE FIRST on reboot** — run the multistep smoke, expect a real image not noise. This supersedes the round-1 "VAE/DiT prime suspect" theory.
+- ✅ **RoPE/attention: 0 blockers** — SenseNova's round-1 RoPE-order fix held; all 9 rope builders checked, no other model has the inversion. GQA/masks/non-square sdpa clean.
+- ⚠️ **3 "blockers" were FALSE ALARMS — verified-and-rejected, do NOT re-chase:** (1) Nucleus sampler dt-sign [skeptic read the Rust *comment* not code; Mojo's double-negation already cancels to match]; (2) Nucleus `model.` key prefix [skeptic read `#[cfg(test)]` fixture loader; the *production* `NucleusInferDit::load` uses bare keys, Mojo matches]; (3) Qwen VAE diffusers→Wan remap [direction inverted; Mojo is correctly diffusers-native, the on-disk diffusers file fully matches]. All three: Mojo was already correct; editing would have *introduced* bugs.
+- Lesson reinforced: **verify findings against the Rust *code* (+ real on-disk header) before editing.** 3 of 4 round-2 "blockers" were skeptic errors; only Klein was real. Details: `serenitymojo/parity/SKEPTIC2_FINDINGS_{sampler,rope_attn,loading}_2026-05-26.md`.
+
 ## §2 — What's code-complete this session (builder → skeptic → bugfix, all compile EXIT=0)
 | Model/Infra | Skeptic | Notable | Commit |
 |---|---|---|---|
-| **Klein 9B** (debugged) | — | multi-step loop verified vs Rust; OOM-safe split encode; **output still NOISE** → VAE-or-DiT bug (loop+schedule ruled out) | `9d9af8f` |
+| **Klein 9B** (debugged) | round-2 | multi-step loop verified vs Rust; OOM-safe split encode; **noise ROOT-CAUSED: missing ×1000 timestep — FIXED code-only (§1.5), validate on reboot** | `9d9af8f` + final |
 | **Qwen-Image** | 0 blk | MMDiT 60-block, 3-axis RoPE; **3D causal Wan VAE** (not 2D); mask alloc 60→1 | `9d9af8f` |
 | **SDXL** | 0 blk* | NHWC UNet, CLIP-L/G, rect cross-attn; *VAE diffusers→LDM key fix (`LdmVaeDecoder`)* | `9d9af8f` |
 | **FLUX.1-dev** | 1 blk→fixed | T5 + 19+38-block DiT, guidance_in, no-CFG; VAE LDM loader + mask | `9d9af8f` |
@@ -25,7 +32,7 @@ A stale `inference-flame/target/release/klein9b_infer` (pre-VAE-fix) hit `CUDA_E
 
 ## §3 — Post-reboot sequence (turnkey)
 1. **Reset GPU** (§1). Verify: `cd /home/alex/serenityflow-v2 && .venv/bin/python -c "import torch;x=torch.ones(8,device='cuda');print((x+1).sum().item())"` → expect 16.0.
-2. **Klein noise localize** (highest priority — it's the one with a known bug): oracle = serenityflow Python (`klein9b_t2i.json`) OR a **freshly rebuilt** Rust `klein9b_infer` (`cargo build --release` FIRST — see §5 DO-NOT). VAE-isolation cos first, then DiT velocity cos. See KLEIN9B_NOISE_INVESTIGATION §5.
+2. **Klein noise — VALIDATE THE ×1000 FIX FIRST** (§1.5): `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/klein9b_pipeline_multistep_smoke.mojo -o /tmp/k && /tmp/k` → expect a coherent image, not noise. If it's fixed: done. If STILL noise: fall back to localizing VAE vs DiT velocity (serenityflow Python oracle `klein9b_t2i.json`, OR a **freshly rebuilt** Rust `klein9b_infer` — `cargo build --release` FIRST, see §5 DO-NOT). See KLEIN9B_NOISE_INVESTIGATION §5.
 3. **Per-model parity** (each: build the smoke, run, eyeball + per-component cos vs the Rust/diffusers ref; fix the parity-todos in that model's SKEPTIC_FINDINGS). Build any smoke: `cd /home/alex/mojodiffusion && pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/<model>_*smoke.mojo -o /tmp/x && /tmp/x`.
 
 ## §4 — Per-model parity-todos (the catalogued risks — full detail in each SKEPTIC_FINDINGS)

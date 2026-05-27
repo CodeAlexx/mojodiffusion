@@ -148,8 +148,11 @@ def denoise(caps: KleinCaps, ctx: DeviceContext) raises -> Tensor:
     _stats("init_tokens", x, ctx)
     for i in range(STEPS):
         print("  step", i + 1, "/", STEPS, "sigma", sigmas[i], "->", sigmas[i + 1])
+        # Pre-scale sigma by 1000 (BFL time_factor): the Rust ref applies *1000
+        # INSIDE timestep_embedding (klein.rs:134-160, :744 time_factor=1000.0),
+        # but Mojo ops/embeddings.t_embedder does not scale (mirrors flux1 :224).
         var tvals = List[Float32]()
-        tvals.append(sigmas[i])
+        tvals.append(sigmas[i] * 1000.0)
         var tsh = List[Int]()
         tsh.append(1)
         var timestep = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)

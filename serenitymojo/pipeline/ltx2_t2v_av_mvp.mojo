@@ -36,7 +36,8 @@
 
 from std.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin, pow as fpow, log as flog, pi
-from std.memory import alloc
+from std.memory import alloc, ArcPointer
+from sys import argv
 
 from serenitymojo.io.ffi import (
     sys_open, sys_pwrite, sys_close, sys_system,
@@ -71,6 +72,7 @@ from serenitymojo.models.vae.ltx2_audio_vae import (
 )
 from serenitymojo.models.vocoder.ltx2_vocoder import LTX2VocoderWithBWE
 from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.lora import LoraSet, FMT_LTX2_DISTILLED
 
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -80,6 +82,8 @@ comptime CACHED = "/home/alex/EriDiffusion/inference-flame/cached_ltx2_embedding
 comptime OUT_DIR = "/home/alex/mojodiffusion/output/ltx2_mvp"
 comptime MP4_OUT = OUT_DIR + "/ltx2_t2v_av_256_16f.mp4"
 comptime WAV_OUT = OUT_DIR + "/mvp_audio.wav"
+comptime LORA_PATH = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-lora-384.safetensors"
+comptime LORA_MULT = Float32(1.0)
 
 # ── MVP shape (256x256, 16 input frames) ───────────────────────────────────────
 # latent_f = (num_frames-1)//8 + 1 = (16-1)//8 + 1 = 2  (Rust ltx2_generate_av.rs:213)
@@ -159,6 +163,42 @@ def _load_global_f32(
     return cast_tensor(Tensor.from_view_as_bf16(tv, ctx), STDtype.F32, ctx)
 
 
+def _load_global_weights_dict(
+    st: ShardedSafeTensors, ctx: DeviceContext
+) raises -> Dict[String, ArcPointer[Tensor]]:
+    """Pre-load the 28 global LoRA target weights into a resident dict so that
+    `LoraSet.apply_to_globals` can apply the one-time additive deltas before the
+    denoise loop.  Keys match the LoRA base_key convention (no leading
+    `transformer_blocks.`, just the bare module path + `.weight`)."""
+    var gw = Dict[String, ArcPointer[Tensor]]()
+    # 4 patchify / proj_out projections
+    var patch_keys = List[String]()
+    patch_keys.append(String("patchify_proj.weight"))
+    patch_keys.append(String("audio_patchify_proj.weight"))
+    patch_keys.append(String("proj_out.weight"))
+    patch_keys.append(String("audio_proj_out.weight"))
+    # 24 adaln linears: 8 families × 3 weights each
+    var adaln_families = List[String]()
+    adaln_families.append(String("adaln_single"))
+    adaln_families.append(String("audio_adaln_single"))
+    adaln_families.append(String("prompt_adaln_single"))
+    adaln_families.append(String("audio_prompt_adaln_single"))
+    adaln_families.append(String("av_ca_video_scale_shift_adaln_single"))
+    adaln_families.append(String("av_ca_audio_scale_shift_adaln_single"))
+    adaln_families.append(String("av_ca_a2v_gate_adaln_single"))
+    adaln_families.append(String("av_ca_v2a_gate_adaln_single"))
+    for ref fam in patch_keys:
+        gw[fam] = ArcPointer[Tensor](_load_global_f32(st, fam, ctx))
+    for ref fam in adaln_families:
+        var k1 = fam + ".emb.timestep_embedder.linear_1.weight"
+        var k2 = fam + ".emb.timestep_embedder.linear_2.weight"
+        var k3 = fam + ".linear.weight"
+        gw[k1] = ArcPointer[Tensor](_load_global_f32(st, k1, ctx))
+        gw[k2] = ArcPointer[Tensor](_load_global_f32(st, k2, ctx))
+        gw[k3] = ArcPointer[Tensor](_load_global_f32(st, k3, ctx))
+    return gw^
+
+
 def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
@@ -216,22 +256,28 @@ def _timestep_embedding(ts: List[Float32], dim: Int, ctx: DeviceContext) raises 
 #    embedded = linear_2(silu(linear_1(sinusoidal(ts*?))))   [N, dim]
 #    mod      = linear(silu(embedded))                        [N, n*dim]
 # `ts_vals` are the ALREADY-SCALED timesteps (sigma * TS_MULT * extra).
+# `gw` holds the pre-loaded (and LoRA-applied) global weight tensors so the
+# 28 adaln LoRA deltas are honoured every forward pass via the resident weights.
+# Biases are NOT LoRA targets and are still loaded fresh from `st`.
 def _adaln_single(
     st: ShardedSafeTensors,
+    gw: Dict[String, ArcPointer[Tensor]],
     base: String,        # e.g. "adaln_single"
     ts_vals: List[Float32],
     ctx: DeviceContext,
 ) raises -> Tuple[Tensor, Tensor]:
     var emb = _timestep_embedding(ts_vals, 256, ctx)  # [N,256] F32
-    var w1 = _load_global_f32(st, base + ".emb.timestep_embedder.linear_1.weight", ctx)
+    # Weight tensors come from the pre-loaded (LoRA-applied) global dict;
+    # _clone gives an owned copy so _linear_b can consume them.
+    var w1 = _clone(gw[base + ".emb.timestep_embedder.linear_1.weight"][], ctx)
     var b1 = _load_global_f32(st, base + ".emb.timestep_embedder.linear_1.bias", ctx)
     var h = _linear_b(emb, w1, b1, ctx)
     h = silu(h, ctx)
-    var w2 = _load_global_f32(st, base + ".emb.timestep_embedder.linear_2.weight", ctx)
+    var w2 = _clone(gw[base + ".emb.timestep_embedder.linear_2.weight"][], ctx)
     var b2 = _load_global_f32(st, base + ".emb.timestep_embedder.linear_2.bias", ctx)
     var embedded = _linear_b(h, w2, b2, ctx)  # [N,dim]
     var h2 = silu(embedded, ctx)
-    var lw = _load_global_f32(st, base + ".linear.weight", ctx)
+    var lw = _clone(gw[base + ".linear.weight"][], ctx)
     var lb = _load_global_f32(st, base + ".linear.bias", ctx)
     var mod = _linear_b(h2, lw, lb, ctx)      # [N, n*dim]
     return (mod^, embedded^)
@@ -445,64 +491,90 @@ struct _Mod(Movable):
 
 
 # Build all per-forward modulation tensors from one sigma.
+# `gw` holds the 28 global (and LoRA-applied) weight tensors so adaln MLP
+# weights reflect the global LoRA delta applied once at load.
 def _build_mod(
-    st: ShardedSafeTensors, sigma: Float32, ctx: DeviceContext,
+    st: ShardedSafeTensors,
+    gw: Dict[String, ArcPointer[Tensor]],
+    sigma: Float32,
+    ctx: DeviceContext,
 ) raises -> _Mod:
     var ts_v = List[Float32]()
     for _ in range(S_V): ts_v.append(sigma * TS_MULT)
-    var vt = _adaln_single(st, String("adaln_single"), ts_v, ctx)
+    var vt = _adaln_single(st, gw, String("adaln_single"), ts_v, ctx)
     var v_temb = reshape(vt[0], _sh3(1, S_V, 9 * VD), ctx)
     var v_embedded = reshape(vt[1], _sh3(1, S_V, VD), ctx)
 
     var ts_a = List[Float32]()
     for _ in range(S_A): ts_a.append(sigma * TS_MULT)
-    var at = _adaln_single(st, String("audio_adaln_single"), ts_a, ctx)
+    var at = _adaln_single(st, gw, String("audio_adaln_single"), ts_a, ctx)
     var a_temb = reshape(at[0], _sh3(1, S_A, 9 * AD), ctx)
     var a_embedded = reshape(at[1], _sh3(1, S_A, AD), ctx)
 
     # AV cross-attn global modulation (single global timestep)
     var g1 = List[Float32](); g1.append(sigma * TS_MULT)
-    var vcs = _adaln_single(st, String("av_ca_video_scale_shift_adaln_single"), g1, ctx)
+    var vcs = _adaln_single(st, gw, String("av_ca_video_scale_shift_adaln_single"), g1, ctx)
     var v_ca_ss = reshape(vcs[0], _sh3(1, 1, 4 * VD), ctx)
-    var acs = _adaln_single(st, String("av_ca_audio_scale_shift_adaln_single"), g1, ctx)
+    var acs = _adaln_single(st, gw, String("av_ca_audio_scale_shift_adaln_single"), g1, ctx)
     var a_ca_ss = reshape(acs[0], _sh3(1, 1, 4 * AD), ctx)
     # cross_gate_scale = cross_mult/ts_mult = 1.0 -> same scaled ts
-    var vcg = _adaln_single(st, String("av_ca_a2v_gate_adaln_single"), g1, ctx)
+    var vcg = _adaln_single(st, gw, String("av_ca_a2v_gate_adaln_single"), g1, ctx)
     var v_ca_gate = reshape(vcg[0], _sh3(1, 1, VD), ctx)
-    var acg = _adaln_single(st, String("av_ca_v2a_gate_adaln_single"), g1, ctx)
+    var acg = _adaln_single(st, gw, String("av_ca_v2a_gate_adaln_single"), g1, ctx)
     var a_ca_gate = reshape(acg[0], _sh3(1, 1, AD), ctx)
 
     # prompt_ts (per text token)
     var ts_p = List[Float32]()
     for _ in range(N_TXT): ts_p.append(sigma * TS_MULT)
-    var vpt = _adaln_single(st, String("prompt_adaln_single"), ts_p, ctx)
+    var vpt = _adaln_single(st, gw, String("prompt_adaln_single"), ts_p, ctx)
     var v_prompt_ts = reshape(vpt[0], _sh3(1, N_TXT, 2 * VD), ctx)
-    var apt = _adaln_single(st, String("audio_prompt_adaln_single"), ts_p, ctx)
+    var apt = _adaln_single(st, gw, String("audio_prompt_adaln_single"), ts_p, ctx)
     var a_prompt_ts = reshape(apt[0], _sh3(1, N_TXT, 2 * AD), ctx)
 
     return _Mod(v_temb^, a_temb^, v_embedded^, a_embedded^, v_ca_ss^, a_ca_ss^,
                 v_ca_gate^, a_ca_gate^, v_prompt_ts^, a_prompt_ts^)
 
 
-def main() raises:
+def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
     var ctx = DeviceContext()
     var cfg = LTX2Config.ltx2()
     print("=== LTX-2.3 T2V+AUDIO MVP (P7) — 256x256 / 16f distilled ===")
     print("  S_V/S_A/N_TXT:", S_V, S_A, N_TXT, " blocks:", NUM_LAYERS)
+    print("  LoRA:", "ON" if apply_lora else "OFF", " out_dir:", out_dir,
+          " max_steps:", max_steps)
 
     # ── open checkpoints ──
     var ck = ShardedSafeTensors.open(String(CKPT_FP8))
 
+    # ── LoRA (rank-384 distilled): loaded once; the delta is ADDED at the
+    # dequanted block linear per stream (HARD RULE — never a saved fuse).
+    # Global (non-block) LoRA deltas are applied ONCE here to the resident
+    # global weight dict `gw` (one-time additive add; never written to disk). ──
+    var lora = LoraSet.load(String(LORA_PATH))
+    if apply_lora:
+        if lora.format != FMT_LTX2_DISTILLED:
+            raise Error("MVP: LoRA not FMT_LTX2_DISTILLED")
+        print("  [lora] loaded", lora.num_mappings(),
+              "mappings (", lora.format_name(), ")")
+
     # ── globals (proj_in/proj_out, scale_shift tables) — F32 ──
+    # Pre-load the 28 global LoRA target weights into a resident dict so global
+    # LoRA deltas can be applied once before the loop.  The patchify/proj_out
+    # weights used in _Globals and the adaln MLP weights used in _build_mod are
+    # both sourced from this dict, ensuring LoRA-steered globals are honoured.
     print("  [load] globals")
+    var gw = _load_global_weights_dict(ck, ctx)
+    if apply_lora:
+        var n_global = lora.apply_to_globals(gw, LORA_MULT, ctx)
+        print("  [lora] global deltas applied (one-time additive):", n_global)
     var g = _Globals(
-        _load_global_f32(ck, "patchify_proj.weight", ctx),
+        _clone(gw[String("patchify_proj.weight")][], ctx),
         _load_global_f32(ck, "patchify_proj.bias", ctx),
-        _load_global_f32(ck, "audio_patchify_proj.weight", ctx),
+        _clone(gw[String("audio_patchify_proj.weight")][], ctx),
         _load_global_f32(ck, "audio_patchify_proj.bias", ctx),
-        _load_global_f32(ck, "proj_out.weight", ctx),
+        _clone(gw[String("proj_out.weight")][], ctx),
         _load_global_f32(ck, "proj_out.bias", ctx),
-        _load_global_f32(ck, "audio_proj_out.weight", ctx),
+        _clone(gw[String("audio_proj_out.weight")][], ctx),
         _load_global_f32(ck, "audio_proj_out.bias", ctx),
         _load_global_f32(ck, "scale_shift_table", ctx),
         _load_global_f32(ck, "audio_scale_shift_table", ctx),
@@ -576,7 +648,10 @@ def main() raises:
     print("    running the single distilled-8 schedule at fixed MVP resolution.")
 
     # ── two-stage* distilled denoise loop ──
-    for step in range(sched.num_steps):
+    var n_steps = sched.num_steps
+    if max_steps > 0 and max_steps < n_steps:
+        n_steps = max_steps
+    for step in range(n_steps):
         var sigma = sigmas[step]
         print("  --- step", step + 1, "/", sched.num_steps, " sigma=", sigma, "---")
 
@@ -589,8 +664,8 @@ def main() raises:
         var hs = _linear_b(v_flat, g.v_pin_w, g.v_pin_b, ctx)   # [1,S_V,4096]
         var ahs = _linear_b(a_flat, g.a_pin_w, g.a_pin_b, ctx)  # [1,S_A,2048]
 
-        # modulation
-        var mod = _build_mod(ck, sigma, ctx)
+        # modulation (uses pre-loaded LoRA-applied global weights via gw)
+        var mod = _build_mod(ck, gw, sigma, ctx)
 
         # 48 streamed blocks (boundary BF16, inner FP8 dequant), all F32 compute
         for i in range(NUM_LAYERS):
@@ -600,6 +675,10 @@ def main() raises:
             else:
                 var blk = stream.load_block_bf16(i, ctx)
                 w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx).to_f32(ctx)
+            # AT-DEQUANT LoRA APPLY: add scale*(B@A) onto the F32 dequanted
+            # block linears for THIS stream (re-applied each step; never fused).
+            if apply_lora:
+                _ = lora.apply_to_av_block(i, w, LORA_MULT, ctx)
             var outs = ltx2_block_forward_av[S_V, S_A, N_TXT, S_VPAD, S_APAD](
                 w, hs, ahs, enc, aenc,
                 mod.v_temb, mod.a_temb, mod.v_ca_ss, mod.a_ca_ss,
@@ -653,12 +732,23 @@ def main() raises:
         var fslice = slice(frames, 2, fr, 1, ctx)  # [1,3,1,H,W]
         var fs = fslice.shape()
         var chw = reshape(fslice, _sh4(fs[0], fs[1], fs[3], fs[4]), ctx)
-        var p = String(OUT_DIR) + "/mvp_frame" + _pad2(fr) + ".png"
+        var p = out_dir + "/mvp_frame" + _pad2(fr) + ".png"
         save_png(chw, p, ctx, ValueRange.SIGNED)
         png_paths.append(p)
-    print("  saved", n_frames_out, "frame PNGs ->", OUT_DIR)
+    print("  saved", n_frames_out, "frame PNGs ->", out_dir)
 
     # ── DECODE AUDIO ──
+    # Audio decode + vocoder + mux is OPTIONAL (skipped for the fast LoRA gen
+    # gate, which compares video frames only). Gate it on max_steps==0 meaning
+    # "full run"; any positive max_steps is a fast gen-gate run -> skip audio.
+    if max_steps != 0:
+        print("  [decode] audio SKIPPED (fast gen-gate run); frames saved ->",
+              out_dir)
+        print("=== MVP (fast gen-gate) DONE ===")
+        return
+
+    var wav_out = out_dir + "/mvp_audio.wav"
+    var mp4_out = out_dir + "/ltx2_t2v_av_256_16f.mp4"
     print("  [decode] audio VAE (latent -> mel) -> vocoder (mel -> 48kHz wav)")
     var avae = LTX2AudioVaeDecoderWeights.load(String(CKPT_BF16), ctx)
     var audio_x_bf16 = cast_tensor(audio_x, STDtype.BF16, ctx)
@@ -697,16 +787,41 @@ def main() raises:
     for ch in range(2):
         for s in range(L):
             inter[s * 2 + ch] = wh[ch * L + s]
-    _write_wav(String(WAV_OUT), inter, voc.output_sample_rate())
-    print("  wrote wav:", WAV_OUT)
+    _write_wav(wav_out, inter, voc.output_sample_rate())
+    print("  wrote wav:", wav_out)
 
     # ── MUX (ffmpeg: frames + wav -> mp4) ──
     print("  [mux] ffmpeg frames + wav -> mp4")
-    _mux_mp4(String(OUT_DIR), n_frames_out, String(WAV_OUT), String(MP4_OUT))
+    _mux_mp4(out_dir, n_frames_out, wav_out, mp4_out)
     print("=== MVP DONE ===")
-    print("  mp4:", MP4_OUT)
-    print("  wav:", WAV_OUT)
-    print("  frames:", OUT_DIR, "/mvp_frame00.png ..")
+    print("  mp4:", mp4_out)
+    print("  wav:", wav_out)
+    print("  frames:", out_dir, "/mvp_frame00.png ..")
+
+
+def _mkdir(path: String) raises:
+    var cmd = String("mkdir -p ") + path + " >/dev/null 2>&1"
+    _ = sys_system(cmd)
+
+
+# ── argv-driven entry: `mvp [base|lora] [out_dir] [max_steps]` ──
+#   no args            -> full MVP, LoRA OFF, default OUT_DIR (audio+mux)
+#   "lora"             -> full MVP with LoRA ON
+#   "base <dir> <n>"   -> fast video-only gen-gate run (LoRA OFF) -> <dir>
+#   "lora <dir> <n>"   -> fast video-only gen-gate run (LoRA ON)  -> <dir>
+def main() raises:
+    var a = argv()
+    var apply_lora = False
+    var out_dir = String(OUT_DIR)
+    var max_steps = 0
+    if len(a) >= 2 and String(a[1]) == "lora":
+        apply_lora = True
+    if len(a) >= 3:
+        out_dir = String(a[2])
+    if len(a) >= 4:
+        max_steps = atol(String(a[3]))
+    _mkdir(out_dir)
+    run(apply_lora, out_dir, max_steps)
 
 
 # ── patchify/unpatchify permutations ──

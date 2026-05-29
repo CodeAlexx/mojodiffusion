@@ -922,10 +922,57 @@ struct LTX2AVBlockWeights(Movable):
     def _has(self, name: String) -> Bool:
         return name in self.name_to_idx
 
+    def has_weight(self, name: String) -> Bool:
+        """Public: does this block hold a weight under canonical `name`?"""
+        return name in self.name_to_idx
+
+    def weight_host(self, name: String, ctx: DeviceContext) raises -> List[Float32]:
+        """Public: host (F32) copy of the resident weight `name`. For gates."""
+        return self._w(name).to_host(ctx)
+
+    def weight_shape(self, name: String) raises -> List[Int]:
+        return self._w(name).shape()
+
+    def linear_apply(
+        self, name: String, x: Tensor, ctx: DeviceContext
+    ) raises -> Tensor:
+        """Public: out = x @ W[name]ᵀ (no bias) using the resident weight. For
+        the add-math gate to evaluate base(x) and (base+delta)(x)."""
+        return linear(x, self._w(name), None, ctx)
+
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
         if name not in self.name_to_idx:
             raise Error(String("LTX2AV: missing weight ") + name)
         return self.weights[self.name_to_idx[name]][]
+
+    def add_delta_to(
+        mut self, name: String, delta: Tensor, ctx: DeviceContext
+    ) raises:
+        """ADD a LoRA delta IN PLACE to the resident dequanted weight `name`:
+        `W[name] = W[name] + delta` (shapes must match; same dtype assumed —
+        the caller casts the delta to the weight dtype). This is the LTX-2
+        at-dequant LoRA application hook: blocks are FP8-streamed and dequanted
+        transiently per step, so there is no persistent resident W — the delta
+        is re-added to the freshly-dequanted block weight every time the block
+        streams in (NEVER a one-time fuse, NEVER written to disk). Replaces the
+        ArcPointer with the summed tensor (the same discipline lora.mojo uses
+        for resident merges)."""
+        if name not in self.name_to_idx:
+            raise Error(String("LTX2AV.add_delta_to: missing weight ") + name)
+        var idx = self.name_to_idx[name]
+        var bdims = self.weights[idx][].shape()
+        var ddims = delta.shape()
+        if len(bdims) != len(ddims):
+            raise Error(
+                String("LTX2AV.add_delta_to: rank mismatch for ") + name
+            )
+        for i in range(len(bdims)):
+            if bdims[i] != ddims[i]:
+                raise Error(
+                    String("LTX2AV.add_delta_to: shape mismatch for ") + name
+                )
+        var summed = add(self.weights[idx][], delta, ctx)
+        self.weights[idx] = ArcPointer[Tensor](summed^)
 
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
         var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())

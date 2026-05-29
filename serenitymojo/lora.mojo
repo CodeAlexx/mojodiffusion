@@ -44,6 +44,7 @@ from serenitymojo.io.tensor_view import TensorView, from_parts
 from serenitymojo.ops.tensor_algebra import transpose, concat, slice, add, mul_scalar
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.models.dit.ltx2_dit import LTX2AVBlockWeights
 
 
 # ── Slot kinds (mirror lora_merge.rs::Slot, lines 53-64) ─────────────────────
@@ -61,6 +62,16 @@ comptime FMT_KLEIN_TRAINER = 0
 comptime FMT_ZIMAGE_TRAINER = 1
 comptime FMT_DIFFUSION_MODEL = 2
 comptime FMT_KOHYA_SDXL = 3
+comptime FMT_LTX2_DISTILLED = 4
+"""LTX-2.3 22B distilled rank-384 LoRA. Keys
+`diffusion_model.transformer_blocks.{i}.<module>.lora_{A,B}.weight` for the six
+attn families (attn1/attn2/audio_attn1/audio_attn2/audio_to_video_attn/
+video_to_audio_attn) × {to_q,to_k,to_v,to_out.0,to_gate_logits} + ff/audio_ff
++ the global adaln/prompt/av_ca/patchify/proj_out families. The base weights are
+the FP8-streamed-and-dequanted DiT block linears (no persistent resident W), so
+the delta is ADDED at the dequanted block linear per stream (never a saved
+fuse). Scale = `multiplier` (the LTX-2 path uses `strength*(B@A)`, NO alpha/rank
+division — lora_loader.rs:110-116)."""
 
 # Slot constants. Klein-4B single-block linear slicing (lora_merge.rs:46-47).
 comptime SINGLE_QKV_ROWS = 9216
@@ -96,6 +107,7 @@ def _detect_format(names: List[String]) -> Int:
     var has_kohya_suffix = False
     var has_dm_suffix = False
     var has_zimage = False
+    var has_ltx2 = False
     for ref n in names:
         if (
             n.startswith("lora_unet_")
@@ -112,8 +124,21 @@ def _detect_format(names: List[String]) -> Int:
             or (".feed_forward.w1.lora_" in n)
         ):
             has_zimage = True
+        # LTX-2 distilled signature: the cross-modal AV attention family is
+        # unique to the LTX-2 joint dual-stream DiT (no other format ships
+        # `audio_to_video_attn` / `video_to_audio_attn` LoRA modules).
+        if (
+            (".audio_to_video_attn." in n)
+            or (".video_to_audio_attn." in n)
+            or (".audio_attn1." in n)
+        ):
+            has_ltx2 = True
     if has_kohya_prefix and has_kohya_suffix:
         return FMT_KOHYA_SDXL
+    # LTX-2 must be checked BEFORE the generic DiffusionModel branch: it shares
+    # the `.lora_A.weight` suffix but needs the LTX-2 base-key map + scale rule.
+    if has_ltx2 and has_dm_suffix:
+        return FMT_LTX2_DISTILLED
     if has_dm_suffix:
         return FMT_DIFFUSION_MODEL
     if has_zimage:
@@ -123,7 +148,7 @@ def _detect_format(names: List[String]) -> Int:
 
 def _suffix_a(fmt: Int) -> String:
     """lora_A suffix for the format (lora_merge.rs:427-431)."""
-    if fmt == FMT_DIFFUSION_MODEL:
+    if fmt == FMT_DIFFUSION_MODEL or fmt == FMT_LTX2_DISTILLED:
         return ".lora_A.weight"
     if fmt == FMT_KOHYA_SDXL:
         return ".lora_down.weight"
@@ -132,7 +157,7 @@ def _suffix_a(fmt: Int) -> String:
 
 def _suffix_b(fmt: Int) -> String:
     """lora_B suffix for the format (lora_merge.rs:427-431)."""
-    if fmt == FMT_DIFFUSION_MODEL:
+    if fmt == FMT_DIFFUSION_MODEL or fmt == FMT_LTX2_DISTILLED:
         return ".lora_B.weight"
     if fmt == FMT_KOHYA_SDXL:
         return ".lora_up.weight"
@@ -164,6 +189,20 @@ def _strip_prefix(s: String, pre: String) -> String:
     if s.startswith(pre):
         return _substr_bytes(s, pre.byte_length(), s.byte_length())
     return s
+
+
+def _strip_block_prefix(base_key: String, block_idx: Int) -> String:
+    """If `base_key` is `transformer_blocks.{block_idx}.<rest>`, return `<rest>`;
+    otherwise "". Used by the LTX-2 runtime apply to map a full base key to the
+    block-local canonical name the `LTX2AVBlockWeights` dict is keyed by."""
+    var bp = String("transformer_blocks.") + String(block_idx) + "."
+    if base_key.startswith(bp):
+        return _substr_bytes(base_key, bp.byte_length(), base_key.byte_length())
+    return String("")
+
+
+def _is_block_key(base_key: String) -> Bool:
+    return base_key.startswith("transformer_blocks.")
 
 
 def _map_klein_trainer(prefix: String) -> LoraMapping:
@@ -306,7 +345,12 @@ def _resolve_mapping(fmt: Int, prefix: String) -> LoraMapping:
         return _map_klein_trainer(prefix)
     if fmt == FMT_ZIMAGE_TRAINER:
         return _map_zimage_trainer(prefix)
-    # FMT_DIFFUSION_MODEL and FMT_KOHYA_SDXL direct path both append .weight.
+    # FMT_DIFFUSION_MODEL, FMT_KOHYA_SDXL and FMT_LTX2_DISTILLED all strip the
+    # `diffusion_model.` prefix and append `.weight` (SLOT_FULL). For LTX-2 the
+    # base linears are SEPARATE to_q/to_k/to_v (no fused-QKV remap), so the
+    # generic DiffusionModel mapper is exactly correct: it yields the full base
+    # key `transformer_blocks.{i}.<mod>.weight` (the runtime AV-block apply hook
+    # strips the per-block prefix to match the block-local weight dict).
     return _map_diffusion_model(prefix)
 
 
@@ -404,6 +448,8 @@ struct LoraSet(Movable):
             return String("ZImageTrainer")
         if self.format == FMT_DIFFUSION_MODEL:
             return String("DiffusionModel")
+        if self.format == FMT_LTX2_DISTILLED:
+            return String("LTX2Distilled")
         return String("KohyaSdxl")
 
     def _load_lora_tensor(self, key: String, ctx: DeviceContext) raises -> Tensor:
@@ -552,6 +598,166 @@ struct LoraSet(Movable):
             n_merged += 1
 
         return n_merged
+
+    # ── LTX-2 distilled: runtime at-dequant additive apply ──────────────────
+    def ltx2_block_mapping_count(self, block_idx: Int) -> Int:
+        """How many resolved mappings target `transformer_blocks.{block_idx}.`."""
+        var n = 0
+        for ref m in self.mappings:
+            if _strip_block_prefix(m.base_key, block_idx).byte_length() > 0:
+                n += 1
+        return n
+
+    def ltx2_global_mapping_count(self) -> Int:
+        """How many resolved mappings are NON-block (global) keys."""
+        var n = 0
+        for ref m in self.mappings:
+            if not _is_block_key(m.base_key):
+                n += 1
+        return n
+
+    def apply_to_av_block(
+        self,
+        block_idx: Int,
+        mut block: LTX2AVBlockWeights,
+        multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        """ADD every block-level LoRA delta for `block_idx` onto the resident
+        dequanted weights of `block`, IN PLACE:
+            W[name] += scale * (B @ A)
+        This is the LTX-2 at-dequant application hook (HARD RULE): the FP8 block
+        was streamed in and dequanted transiently for THIS step, so the delta is
+        re-applied to the fresh dequant every time the block streams — never a
+        one-time fuse, never written to disk. Returns the number of deltas added.
+
+        FAIL-CLOSED: a mapping whose block-local name is NOT present in `block`
+        raises (every LoRA key for the block MUST map to a base linear). Scale =
+        `multiplier` (LTX-2 uses `strength*(B@A)`; per-module alpha absent so
+        `_module_scale` returns `multiplier`). `to_gate_logits` (rank 32) and
+        every attn/ff family are covered identically."""
+        var n_applied = 0
+        for ref m in self.mappings:
+            var local = _strip_block_prefix(m.base_key, block_idx)
+            if local.byte_length() == 0:
+                continue
+            if not self._pair_present(m):
+                raise Error(
+                    String("LTX2 apply: A/B pair missing or conv for ")
+                    + m.prefix
+                )
+            if not block.has_weight(local):
+                raise Error(
+                    String("LTX2 apply: block ")
+                    + String(block_idx)
+                    + " has no base linear for LoRA key '"
+                    + local
+                    + "' (base_key=" + m.base_key + ") — fail-closed"
+                )
+            var scale = self._module_scale(m, multiplier, ctx)
+            var base_dtype = block._w(local).dtype()
+            var delta = self._compute_delta(m, scale, base_dtype, ctx)
+            block.add_delta_to(local, delta^, ctx)
+            n_applied += 1
+        return n_applied
+
+    def apply_to_globals(
+        self,
+        mut gw: Dict[String, ArcPointer[Tensor]],
+        multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        """ADD every GLOBAL (non-block) LoRA delta onto the resident persistent
+        weight tensors in `gw`, IN PLACE.  `gw` must map each global base_key
+        (e.g. `patchify_proj.weight`, `adaln_single.linear.weight`) to an
+        ArcPointer[Tensor].  These are PERSISTENT weights (not FP8-streamed per
+        step), so ONE application at load time is correct and consistent with the
+        HARD RULE: we add scale*(B@A) to the in-memory weight; the result is
+        never written to disk.
+
+        FAIL-CLOSED: every global LoRA mapping MUST have a matching key in `gw`;
+        if any global base_key is absent the call raises immediately (this
+        includes any future global LoRA key family that is not pre-loaded into
+        `gw` — they cannot silently fall through the block `continue`).
+
+        Returns the number of deltas applied."""
+        var n_applied = 0
+        for ref m in self.mappings:
+            if _is_block_key(m.base_key):
+                continue          # handled by apply_to_av_block per stream
+            # FAIL-CLOSED: global key must be pre-loaded into gw
+            if m.base_key not in gw:
+                raise Error(
+                    String("LTX2 global apply: base_key '")
+                    + m.base_key
+                    + "' not found in global weight dict — fail-closed"
+                )
+            if not self._pair_present(m):
+                raise Error(
+                    String("LTX2 global apply: A/B pair missing or conv for ")
+                    + m.prefix
+                )
+            var scale = self._module_scale(m, multiplier, ctx)
+            var base_dtype = gw[m.base_key][].dtype()
+            var delta = self._compute_delta(m, scale, base_dtype, ctx)
+            var merged = add(gw[m.base_key][], delta, ctx)
+            gw[m.base_key] = ArcPointer[Tensor](merged^)
+            n_applied += 1
+        return n_applied
+
+    def compute_delta_for_base(
+        self, base_key: String, multiplier: Float32, base_dtype: STDtype,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        """Return scale*(B@A) cast to `base_dtype` for the mapping whose
+        `base_key` matches (full path, e.g. `transformer_blocks.0.attn1.to_q.
+        weight` or `patchify_proj.weight`). Raises if no such mapping. Used by
+        the add-math gate to compare against a host F64 reference."""
+        for ref m in self.mappings:
+            if m.base_key == base_key:
+                var scale = self._module_scale(m, multiplier, ctx)
+                return self._compute_delta(m, scale, base_dtype, ctx)
+        raise Error(String("compute_delta_for_base: no mapping for ") + base_key)
+
+    def scale_for_base(
+        self, base_key: String, multiplier: Float32, ctx: DeviceContext
+    ) raises -> Float32:
+        for ref m in self.mappings:
+            if m.base_key == base_key:
+                return self._module_scale(m, multiplier, ctx)
+        raise Error(String("scale_for_base: no mapping for ") + base_key)
+
+    def has_base(self, base_key: String) -> Bool:
+        for ref m in self.mappings:
+            if m.base_key == base_key:
+                return True
+        return False
+
+    def load_ab_for_base(
+        self, base_key: String, ctx: DeviceContext
+    ) raises -> Tuple[Tensor, Tensor]:
+        """H2D-load the (A [rank,in], B [out,rank]) tensors for `base_key` as
+        device Tensors (verbatim dtype). For the add-math host-F64 reference."""
+        for ref m in self.mappings:
+            if m.base_key == base_key:
+                var a = self._load_lora_tensor(m.prefix + self.suffix_a, ctx)
+                var b = self._load_lora_tensor(m.prefix + self.suffix_b, ctx)
+                return (a^, b^)
+        raise Error(String("load_ab_for_base: no mapping for ") + base_key)
+
+    def num_lora_pairs_in_file(self) raises -> Int:
+        """Count A/B pairs PRESENT IN THE FILE (header), independent of mapping.
+        A pair = a `<prefix>{suffix_a}` whose `<prefix>{suffix_b}` also exists.
+        This is the ground-truth denominator for the key-coverage gate."""
+        var n = 0
+        for ref nm in self.st.names():
+            if nm.endswith(self.suffix_a):
+                var prefix = _strip_suffix(nm, self.suffix_a)
+                if prefix.byte_length() == 0:
+                    continue
+                if (prefix + self.suffix_b) in self.st.tensors:
+                    n += 1
+        return n
 
 
 def _apply_slot(

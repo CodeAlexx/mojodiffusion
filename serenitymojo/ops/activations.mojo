@@ -33,6 +33,11 @@ def _silu_f32(v: Float32) -> Float32:
 
 
 @always_inline
+def _sigmoid_f32(v: Float32) -> Float32:
+    return 1.0 / (1.0 + exp(-v))
+
+
+@always_inline
 def _gelu_f32(v: Float32) -> Float32:
     var inner = _GELU_C * (v + Float32(0.044715) * v * v * v)
     return Float32(0.5) * v * (1.0 + tanh(inner))
@@ -107,6 +112,81 @@ def silu(x: Tensor, ctx: DeviceContext) raises -> Tensor:
             out_buf.unsafe_ptr().bitcast[Float16](), rl
         )
         ctx.enqueue_function[_silu_kernel_f16, _silu_kernel_f16](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    ctx.synchronize()
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
+# ── sigmoid ────────────────────────────────────────────────────────────────
+def _sigmoid_kernel_f32(
+    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.float32]](x[i])
+        o[i] = rebind[o.element_type](_sigmoid_f32(v))
+
+
+def _sigmoid_kernel_bf16(
+    x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type](_sigmoid_f32(v).cast[DType.bfloat16]())
+
+
+def _sigmoid_kernel_f16(
+    x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type](_sigmoid_f32(v).cast[DType.float16]())
+
+
+def sigmoid(x: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """sigmoid(x) = 1 / (1 + exp(-x)), elementwise."""
+    var dt = x.dtype().to_mojo_dtype()
+    var n = x.numel()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_sigmoid_kernel_f32, _sigmoid_kernel_f32](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_sigmoid_kernel_bf16, _sigmoid_kernel_bf16](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_sigmoid_kernel_f16, _sigmoid_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()

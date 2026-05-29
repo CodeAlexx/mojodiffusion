@@ -64,7 +64,9 @@ from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.ops.tensor_algebra import (
     reshape, permute, slice, concat, add, sub, mul, add_scalar, mul_scalar,
 )
-from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
+from serenitymojo.offload.block_loader import BlockLoader, Block
+from serenitymojo.offload.plan import OffloadConfig, build_sensenova_u1_block_plan
+from serenitymojo.offload.planned_loader import PlannedBlockLoader
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -669,12 +671,28 @@ struct KvCache(Movable):
         self.next_t_index = next_t_index
 
 
+def _is_sensenova_t2i_shared(name: String) -> Bool:
+    # T2I-only resident set. The checkpoint also contains language_model.lm_head
+    # (think-mode autoregressive decode) and vision_model.embeddings.* (VQA /
+    # understanding-side image input); neither is used by this Mojo T2I smoke,
+    # and keeping them resident costs ~1.22 GiB of GPU memory.
+    if name == "language_model.model.embed_tokens.weight":
+        return True
+    if name == "language_model.model.norm.weight":
+        return True
+    if name == "language_model.model.norm_mot_gen.weight":
+        return True
+    if name.startswith("fm_modules."):
+        return True
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SenseNovaU1 model
 # ─────────────────────────────────────────────────────────────────────────────
 struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
     """SenseNova-U1-8B-MoT T2I model. Per-layer transformer weights stream from
-    the sharded checkpoint via BlockLoader; shared weights (embed_tokens, final
+    the sharded checkpoint via PlannedBlockLoader; shared weights (embed_tokens, final
     norms, fm_modules, vision_model_mot_gen embedder) are resident.
 
     Comptime params:
@@ -691,13 +709,13 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
 
     var config: SenseNovaU1Config
     var shared: Dict[String, ArcPointer[Tensor]]
-    var loader: BlockLoader
+    var loader: PlannedBlockLoader
 
     def __init__(
         out self,
         config: SenseNovaU1Config,
         var shared: Dict[String, ArcPointer[Tensor]],
-        var loader: BlockLoader,
+        var loader: PlannedBlockLoader,
     ):
         self.config = config
         self.shared = shared^
@@ -705,15 +723,19 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
 
     @staticmethod
     def load(dir: String, ctx: DeviceContext) raises -> SenseNovaU1[Self.L_TOKENS, Self.TEXT_LEN]:
-        """Open the sharded checkpoint. Per-layer weights stream via BlockLoader;
-        shared (non-layer) tensors are loaded resident into a Dict."""
-        var loader = BlockLoader.open(dir)
+        """Open the sharded checkpoint. Per-layer weights stream via PlannedBlockLoader;
+        T2I-required shared tensors are loaded resident into a Dict."""
+        var raw_loader = BlockLoader.open(dir)
         var shared = Dict[String, ArcPointer[Tensor]]()
-        for ref nm in loader.sharded.names():
-            if not nm.startswith("language_model.model.layers."):
-                var tv = loader.sharded.tensor_view(nm)
+        for ref nm in raw_loader.sharded.names():
+            if _is_sensenova_t2i_shared(nm):
+                var tv = raw_loader.sharded.tensor_view(nm)
                 var t = Tensor.from_view(tv, ctx)
                 shared[nm] = ArcPointer(t^)
+        var plan = build_sensenova_u1_block_plan()
+        var loader = PlannedBlockLoader(
+            raw_loader^, plan^, OffloadConfig.synchronous_single()
+        )
         return SenseNovaU1[Self.L_TOKENS, Self.TEXT_LEN](
             SenseNovaU1Config.sensenova_u1_8b(), shared^, loader^
         )
@@ -821,7 +843,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
     # final BASE-norm hidden state is used only by think-mode autoregression
     # (OUT OF SCOPE for T2I), so we compute it for fidelity but do not return it.
     def forward_und(
-        self, token_ids: List[Int], ctx: DeviceContext
+        mut self, token_ids: List[Int], ctx: DeviceContext
     ) raises -> KvCache:
         var cfg = self.config
         var seq = len(token_ids)
@@ -860,14 +882,15 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
         var k_layers = List[ArcPointer[Tensor]]()
         var v_layers = List[ArcPointer[Tensor]]()
         var total = cfg.num_layers
+        self.loader.config = OffloadConfig.synchronous_single()
+        self.loader.prefetch(0)
         for i in range(total):
-            var prefix = String("language_model.model.layers.") + String(i)
-            var block = self.loader.load_block(prefix, ctx)
+            self.loader.prefetch_next(i)
+            var handle = self.loader.await_block(i, ctx)
             hidden = self._und_layer(
-                block, i, hidden, cos_t, sin_t, cos_t_kv, sin_t_kv, mask,
+                handle.block, i, hidden, cos_t, sin_t, cos_t_kv, sin_t_kv, mask,
                 k_layers, v_layers, ctx
             )
-            unload_block(block^)
 
         # final BASE norm (computed for fidelity; consumed only by think-mode).
         ref final_w = self._shared("language_model.model.norm.weight")
@@ -998,7 +1021,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
     # sensenova_u1.rs:890-959. Reads the KV cache, never updates it. text_len is
     # the t-axis RoPE index assigned to ALL image tokens.
     def forward_gen(
-        self,
+        mut self,
         image_embeds: Tensor,
         text_len: Int,
         token_h: Int,
@@ -1046,18 +1069,19 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
 
         var hidden = _clone(image_embeds, ctx)
         var total = cfg.num_layers
+        self.loader.config = OffloadConfig.synchronous_single()
+        self.loader.prefetch(0)
         for i in range(total):
-            var prefix = String("language_model.model.layers.") + String(i)
-            var block = self.loader.load_block(prefix, ctx)
+            self.loader.prefetch_next(i)
+            var handle = self.loader.await_block(i, ctx)
             ref pk = cache.k_layers[i][]
             ref pv = cache.v_layers[i][]
             hidden = self._gen_layer(
-                block, i, hidden,
+                handle.block, i, hidden,
                 cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
                 cos_t_kv, sin_t_kv, cos_h_kv, sin_h_kv, cos_w_kv, sin_w_kv,
                 pk, pv, ctx,
             )
-            unload_block(block^)
 
         # final GEN norm.
         ref final_w = self._shared("language_model.model.norm_mot_gen.weight")

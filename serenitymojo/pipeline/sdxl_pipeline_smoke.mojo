@@ -16,12 +16,14 @@
 #   image = VAE.decode(x)  (scale 0.13025, shift 0.0)
 #
 # Schedule/CFG constants from sdxl_infer.rs: scaled-linear betas 0.00085->0.012,
-# 1000 train steps, leading spacing steps_offset=1, NUM_STEPS=30, CFG=7.5,
-# SEED=42, 1024x1024. The schedule + Euler helpers live in
-# sampling/sdxl_euler.mojo (reused, not re-derived).
+# 1000 train steps, leading spacing steps_offset=1, full-quality STEPS=30,
+# CFG=7.5, SEED=42, 1024x1024. This smoke runs one denoise step so the
+# cache -> UNet -> VAE path can be exercised during normal development.
+# The schedule + Euler helpers live in sampling/sdxl_euler.mojo.
 #
-# RUN LATER (post-reboot): GPU is wedged this session — this file is compile-
-# checked only. The cached-embedding safetensors must exist before running.
+# Runtime smoke output: `output/sdxl_one_step_1024.png`. This is intentionally
+# under-denoised; it proves cached embeddings, UNet forward, VAE decode, and PNG
+# writing meet at 1024x1024 without spending a full 30-step quality run.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -30,10 +32,16 @@ from std.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.registry.checkpoints import default_manifest_by_id
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import mul_scalar, add
+from serenitymojo.ops.tensor_algebra import mul_scalar
 from serenitymojo.models.dit.sdxl_unet import SDXLUNet
 from serenitymojo.models.vae.ldm_decoder import load_sdxl_ldm_decoder
+from serenitymojo.models.dit.sdxl_contract import (
+    sdxl_default_cached_embeddings_path,
+    validate_sdxl_pipeline_contract,
+)
 from serenitymojo.sampling.sdxl_euler import (
     SDXLEulerScheduler,
     sdxl_cfg,
@@ -44,22 +52,14 @@ from serenitymojo.sampling.sdxl_euler import (
 from serenitymojo.image.png import save_png, ValueRange
 
 
-comptime UNET_PATH = (
-    "/home/alex/EriDiffusion/Models/checkpoints/sdxl_unet_bf16.safetensors"
-)
-comptime VAE_PATH = (
-    "/home/alex/.serenity/models/vaes/OfficialStableDiffusion/sdxl_vae.safetensors"
-)
-comptime EMB_PATH = (
-    "/home/alex/EriDiffusion/inference-flame/output/sdxl_embeddings.safetensors"
-)
-comptime OUT = "/home/alex/mojodiffusion/output/sdxl_first_1024.png"
+comptime OUT = "/home/alex/mojodiffusion/output/sdxl_one_step_1024.png"
 
 comptime WIDTH = 1024
 comptime HEIGHT = 1024
 comptime LH = HEIGHT // 8  # latent H (128)
 comptime LW = WIDTH // 8   # latent W (128)
-comptime NUM_STEPS = 30
+comptime FULL_QUALITY_STEPS = 30
+comptime NUM_STEPS = 1
 comptime CFG = Float32(7.5)
 comptime SEED = UInt64(42)
 
@@ -72,12 +72,27 @@ def _load_named(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises
 
 
 def main() raises:
+    var manifest = default_manifest_by_id(String("sdxl"))
+    var emb_path = sdxl_default_cached_embeddings_path()
+    validate_sdxl_pipeline_contract(manifest.denoiser_path, manifest.vae_path, emb_path)
     var ctx = DeviceContext()
     print("=== SDXL pure-Mojo (cached-embedding path) ===")
-    print("  ", WIDTH, "x", HEIGHT, " steps", NUM_STEPS, " CFG", CFG)
+    print(
+        "  ",
+        WIDTH,
+        "x",
+        HEIGHT,
+        " smoke steps",
+        NUM_STEPS,
+        " full steps",
+        FULL_QUALITY_STEPS,
+        " CFG",
+        CFG,
+    )
+    print("  contract OK")
 
     # --- Stage 1: cached CLIP embeddings ---
-    var emb = ShardedSafeTensors.open(String(EMB_PATH))
+    var emb = ShardedSafeTensors.open(emb_path)
     var context = _load_named(emb, String("context"), ctx)          # [1,77,2048]
     var context_uncond = _load_named(emb, String("context_uncond"), ctx)
     var y = _load_named(emb, String("y"), ctx)                       # [1,2816]
@@ -85,7 +100,7 @@ def main() raises:
     print("  context", context.shape()[1], context.shape()[2], " y", y.shape()[1])
 
     # --- Stage 2: UNet ---
-    var unet = SDXLUNet[LH, LW].load(String(UNET_PATH), ctx)
+    var unet = SDXLUNet[LH, LW].load(manifest.denoiser_path, ctx)
     print("  UNet loaded")
 
     # --- Stage 3: noise + Euler denoise (eps prediction) ---
@@ -98,9 +113,9 @@ def main() raises:
     nsh.append(4)
     nsh.append(LH)
     nsh.append(LW)
-    var noise = randn(nsh^, SEED, STDtype.BF16, ctx)
+    var noise = randn(nsh^, SEED, STDtype.F32, ctx)
     var init_sigma = sdxl_initial_noise_sigma(sigmas[0])
-    var x = mul_scalar(noise, init_sigma, ctx)  # [1,4,LH,LW] BF16
+    var x = mul_scalar(noise, init_sigma, ctx)  # [1,4,LH,LW] F32
 
     for i in range(NUM_STEPS):
         var sigma = sigmas[i]
@@ -109,11 +124,14 @@ def main() raises:
 
         # scale input: x_in = x / sqrt(sigma^2+1).
         var c_in = sdxl_input_scale(sigma)
-        var x_in = mul_scalar(x, c_in, ctx)
+        var x_in_f32 = mul_scalar(x, c_in, ctx)
+        var x_in = cast_tensor(x_in_f32, STDtype.BF16, ctx)
 
         # conditional + unconditional eps predictions.
-        var eps_cond = unet.forward(x_in, t_i, context, y, ctx)
-        var eps_uncond = unet.forward(x_in, t_i, context_uncond, y_uncond, ctx)
+        var eps_cond = cast_tensor(unet.forward(x_in, t_i, context, y, ctx), STDtype.F32, ctx)
+        var eps_uncond = cast_tensor(
+            unet.forward(x_in, t_i, context_uncond, y_uncond, ctx), STDtype.F32, ctx
+        )
 
         # CFG: eps_uncond + CFG*(eps_cond - eps_uncond).
         var eps = sdxl_cfg(eps_cond, eps_uncond, CFG, ctx)
@@ -124,7 +142,7 @@ def main() raises:
             print("  step", i + 1, "/", NUM_STEPS, " sigma", sigma)
 
     # --- Stage 4: VAE decode + PNG ---
-    var vae = load_sdxl_ldm_decoder[LH, LW](String(VAE_PATH), ctx)
+    var vae = load_sdxl_ldm_decoder[LH, LW](manifest.vae_path, ctx)
     var image = vae.decode(x, ctx)  # [1,3,8*LH,8*LW] = [1,3,1024,1024]
     print("  decoded", image.shape()[2], "x", image.shape()[3])
 

@@ -4,6 +4,18 @@ Date: 2026-05-26
 Reviewer: skeptic (fresh eyes, assumed the port lies)
 Mode: CODE-ONLY (GPU wedged). `mojo build` confirmed, nothing run.
 
+Update after GPU reboot: Findings 1 and 4 are superseded by the later runtime
+smoke. `pipeline/hidream_o1_smoke.mojo` now calls `HiDreamO1Offloaded.forward`
+for a real one-step `64x64` run, and `HiDreamO1Offloaded[S]` streams F32-on-disk
+layers as BF16 via `BlockLoader.load_block_as_bf16`. `Qwen3Tokenizer` also now
+parses HiDream's string-form BPE merges; `tokenizer/hidream_tok_check.mojo`
+passes 3/3 against HF oracle ids. Verified output:
+`output/hidream_o1_smoke.png`, sha256
+`d7d30463766cb91190352571a7f5e339666d0f7ac3b9d736030c1d22adc774bf`.
+Remaining caveats are CFG common-static-`S` dispatch/padding and GPU Dev Flash
+scheduler noise clipping. See
+`serenitymojo/docs/SENSENOVA_HIDREAM_HANDOFF_2026-05-26.md`.
+
 Scope reviewed:
 - `serenitymojo/models/dit/hidream_o1.mojo` vs `inference-flame/src/models/hidream_o1/{model.rs,decoder.rs,mrope.rs,bottleneck_patch_embed.rs,final_layer.rs,timestep_embedder.rs,weight_loader.rs}`
 - `serenitymojo/sampling/hidream_o1_scheduler.mojo` vs `scheduler.rs`

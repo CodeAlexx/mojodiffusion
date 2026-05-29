@@ -173,6 +173,21 @@ def _scale_mask_f16(
         scores[r, c] = rebind[scores.element_type](v)
 
 
+def _scale_f32(
+    scores: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],  # [B*H*S, S]
+    scale: Float32,
+    rows: Int,
+    cols: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = rows * cols
+    if idx < total:
+        var r = idx // cols
+        var c = idx % cols
+        var v = rebind[Scalar[DType.float32]](scores[r, c]) * scale
+        scores[r, c] = rebind[scores.element_type](v)
+
+
 # ── softmax over last dim, in place on the F32 scores [B*H*S, S] ─────────────
 # One block per row; shared-memory tree reductions in F32 (mirrors softmax.mojo).
 def _softmax_rows_f32(
@@ -301,9 +316,9 @@ def _sdpa_math[
     mask: Tensor,
     scale: Float32,
     ctx: DeviceContext,
+    apply_mask: Bool,
 ) raises -> Tensor:
     var dt = q.dtype().to_mojo_dtype()
-    var mdt = mask.dtype().to_mojo_dtype()
     comptime BH = B * H
 
     # ── 1) gather q/k/v BSHD -> BHSD-contiguous F32 [B*H*S, Dh] ──────────────
@@ -395,7 +410,7 @@ def _sdpa_math[
         # C[S,S] = A[S,Dh] @ Bt[S,Dh]ᵀ  (Q @ Kᵀ). c_row_major so C is row-major.
         matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)
 
-    # ── 3) scale + add mask over the whole [B*H*S, S] scores buffer ──────────
+    # ── 3) scale, optionally adding a mask over [B*H*S, S] scores ────────────
     comptime sm_rows = BH * S
     var sc_full_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](sm_rows, S))
     var sc_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
@@ -403,24 +418,29 @@ def _sdpa_math[
     )
     var nsm = sm_rows * S
     var smgrid = (nsm + _BLOCK - 1) // _BLOCK
-    if mdt == DType.float32:
-        var Mf = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            mask.buf.unsafe_ptr().bitcast[Float32](), sc_full_rl
-        )
-        ctx.enqueue_function[_scale_mask_f32, _scale_mask_f32](
-            sc_full, Mf, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
-    elif mdt == DType.bfloat16:
-        var Mf = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            mask.buf.unsafe_ptr().bitcast[BFloat16](), sc_full_rl
-        )
-        ctx.enqueue_function[_scale_mask_bf16, _scale_mask_bf16](
-            sc_full, Mf, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
-    else:  # float16
-        var Mf = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            mask.buf.unsafe_ptr().bitcast[Float16](), sc_full_rl
-        )
-        ctx.enqueue_function[_scale_mask_f16, _scale_mask_f16](
-            sc_full, Mf, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
+    if apply_mask:
+        var mdt = mask.dtype().to_mojo_dtype()
+        if mdt == DType.float32:
+            var Mf = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                mask.buf.unsafe_ptr().bitcast[Float32](), sc_full_rl
+            )
+            ctx.enqueue_function[_scale_mask_f32, _scale_mask_f32](
+                sc_full, Mf, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
+        elif mdt == DType.bfloat16:
+            var Mf = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                mask.buf.unsafe_ptr().bitcast[BFloat16](), sc_full_rl
+            )
+            ctx.enqueue_function[_scale_mask_bf16, _scale_mask_bf16](
+                sc_full, Mf, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
+        else:  # float16
+            var Mf = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                mask.buf.unsafe_ptr().bitcast[Float16](), sc_full_rl
+            )
+            ctx.enqueue_function[_scale_mask_f16, _scale_mask_f16](
+                sc_full, Mf, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
+    else:
+        ctx.enqueue_function[_scale_f32, _scale_f32](
+            sc_full, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
 
     # ── 4) softmax over last dim (j) in place: one block per [B*H*S] row ─────
     ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
@@ -608,4 +628,35 @@ def sdpa[
     comptime if Dh == 64:
         return _sdpa_flash[B, S, H, Dh](q, k, v, mask, scale, ctx)
     else:
-        return _sdpa_math[B, S, H, Dh](q, k, v, mask, scale, ctx)
+        return _sdpa_math[B, S, H, Dh](q, k, v, mask, scale, ctx, True)
+
+
+def sdpa_nomask[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Scaled dot-product full attention without an additive mask tensor.
+
+    This is for diffusion paths whose attention mask is known to be all zeros.
+    It avoids materializing [B,H,S,S] just to add zero. The implementation uses
+    the math-mode SDPA path for all Dh values so it needs no SDK flash mask arg.
+    """
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype():
+        raise Error("sdpa_nomask: q/k/v dtype mismatch")
+    var qshape = q.shape()
+    if len(qshape) != 4:
+        raise Error("sdpa_nomask: q must be rank-4 [B,S,H,Dh]")
+    if (
+        qshape[0] != B
+        or qshape[1] != S
+        or qshape[2] != H
+        or qshape[3] != Dh
+    ):
+        raise Error("sdpa_nomask: q shape does not match compile-time B/S/H/Dh")
+
+    return _sdpa_math[B, S, H, Dh](q, k, v, q, scale, ctx, False)

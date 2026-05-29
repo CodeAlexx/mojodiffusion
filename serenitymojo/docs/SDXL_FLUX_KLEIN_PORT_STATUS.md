@@ -18,11 +18,18 @@ Existing host readbacks that must be replaced before calling a path GPU-only:
 
 - `pipeline/zimage_pipeline.mojo`: `_cast` and seeded Gaussian noise are
   host round trips today.
-- `models/vae/decoder2d.mojo`: `nchw_to_nhwc` and `nhwc_to_nchw` are documented
-  as host-side transpose round trips.
-- `ops/linear.mojo`, `ops/conv.mojo`, `models/vae/conv3d.mojo`: bias staging
-  currently reads bias tensors to host before uploading an F32 bias copy.
+- `models/vae/decoder2d.mojo`: NCHW/NHWC conversion has been moved to GPU
+  `permute`; older notes that call this a host transpose are superseded.
+- `ops/linear.mojo`: bias add has been moved to device kernels for
+  F32/BF16/F16; older notes that call this a host bias staging path are
+  superseded.
+- `ops/conv.mojo`, `models/vae/conv3d.mojo`: bias staging currently reads bias
+  tensors to host before uploading an F32 bias copy.
 - `sampling/flow_match.mojo`: `cfg_qwen` computes the last-dim L2 ratio on host.
+- `sampling/hidream_o1_scheduler.mojo`: Dev Flash mode clips per-step noise by
+  computing std on host. The current HiDream smoke avoids this with
+  deterministic `full_n_step(1, 3.0)`, but production Dev mode needs a GPU
+  reduction/clamp kernel.
 - `models/text_encoder/qwen3_encoder.mojo` and `models/dit/zimage_dit.mojo` have
   host-built RoPE tables, and the Qwen3 text encoder still has a host-built
   causal mask; those are setup scalars/tables, but they should be reviewed for
@@ -57,6 +64,44 @@ inference.
 - Added `serenitymojo/sampling/sdxl_euler_smoke.mojo`.
   - This is scalar schedule-only and does not create a `DeviceContext`.
   - Verified with `/tmp/sdxl_euler_smoke`: `SDXL Euler schedule smoke PASS`.
+- Added `serenitymojo/models/dit/sdxl_contract.mojo`.
+  - Header-only SDXL contract checks for the 1024 cached-embedding path.
+  - Validates the SDXL manifest profile, standalone UNet tensor count/key
+    shapes, standalone LDM VAE tensor count/key shapes, and BF16 cached
+    embedding schema.
+  - The static checkpoint contract rejects UNet/VAE paths that drift from the
+    registered SDXL manifest.
+  - `pipeline/sdxl_pipeline_smoke.mojo` now calls this strict contract before
+    device-loading tensors.
+- Added `serenitymojo/pipeline/sdxl_contract_smoke.mojo`.
+  - This is metadata-only and does not create a `DeviceContext`.
+  - Verified with `/tmp/sdxl_contract_smoke`: UNet/VAE headers PASS and the
+    local BF16 cached embedding artifact passes dtype/count/shape validation.
+- Added `serenitymojo/models/dit/flux1_contract.mojo`.
+  - Header-only FLUX.1-dev 1024 contract over the registered manifest,
+    CLIP-L/T5 tokenizer and safetensors assets, the 780-tensor
+    `flux1-dev.safetensors` DiT, and the 244-tensor FLUX LDM VAE.
+  - The contract also has an optional captured-input header gate for
+    `/home/alex/EriDiffusion/inference-flame/output/flux1_inputs.safetensors`.
+  - Added `serenitymojo/pipeline/flux1_contract_smoke.mojo`.
+  - Verified with `/tmp/flux1_contract_smoke`: `FLUX.1-dev pipeline contract PASS`.
+  - `pipeline/flux1_pipeline_smoke.mojo` now validates that contract and derives
+    CLIP/T5/DiT/VAE paths from the registered manifest instead of duplicating
+    hardcoded checkpoint paths.
+- Added `serenitymojo/pipeline/flux1_pipeline_cached_smoke.mojo`.
+  - It consumes Rust-captured `img_packed`, `t5_hidden`, and `clip_pooled`
+    tensors, bypassing the current placeholder Mojo token IDs.
+  - The 20-step 1024 smoke ran through FLUX DiT, VAE decode, and PNG output in
+    `17:37.42` after the no-mask SDPA patch, writing
+    `output/flux1_cached_inputs.png` with coherent astronaut/horse imagery and
+    identical denoise stats to the earlier cached-input run.
+  - The placeholder-token `pipeline/flux1_pipeline_smoke.mojo` runtime artifact
+    `output/flux1_first.png` is all-white, so prompt assembly remains the
+    quality blocker.
+- Added `sdpa_nomask` in `serenitymojo/ops/attention.mojo` and wired FLUX.1,
+  Klein, and Z-Image Dh128 attention to it. This avoids allocating full zero
+  additive masks such as `[1,24,4608,4608]` for FLUX.1 1024 full attention;
+  timing is still dominated by math-mode attention and other hot-path costs.
 - Extended `serenitymojo/models/text_encoder/qwen3_encoder.mojo` for Klein:
   - `Qwen3Config.klein_4b()`
   - `Qwen3Config.klein_9b()`
@@ -108,6 +153,30 @@ inference.
   - `pipeline/zimage_pipeline.mojo`: `HL = WL = 128`
   - `models/dit/zimage_dit.mojo`: `_zero_mask` now uses device memset.
   - `models/vae/decoder2d.mojo`: VAE mid-attn zero mask now uses device memset.
+- Post-Lance SenseNova/HiDream runtime smokes:
+  - `tokenizer/tokenizer.mojo` now supports split SenseNova tokenizer assets:
+    `vocab.json` + `merges.txt` + `added_tokens.json`.
+  - Added `tokenizer/sensenova_tok_check.mojo`; SenseNova tokenizer gate is
+    `4/4`.
+  - `models/dit/sensenova_u1.mojo` now loads only T2I-required resident shared
+    weights, skipping `language_model.lm_head` and understanding-side
+    `vision_model.embeddings.*`.
+  - Added `models/dit/sensenova_u1_load_probe.mojo`; load probe reports
+    `resident shared tensors=19`.
+  - `pipeline/sensenova_u1_gen_smoke.mojo` now has a verified real-weight,
+    real-token, full-layer, `64x64`, 2-step output:
+    `output/sensenova_u1_smoke_64.png`.
+  - `tokenizer/tokenizer.mojo` also supports both array-pair and string-pair
+    BPE merge serialization, keeping Z-Image/Qwen-Image parity and fixing
+    HiDream's tokenizer JSON.
+  - Added `tokenizer/hidream_tok_check.mojo`; HiDream tokenizer gate is `3/3`.
+  - Added `Tensor.from_view_as_bf16` and
+    `BlockLoader.load_block_as_bf16` for F32-on-disk 8B checkpoints.
+  - Added `HiDreamO1Offloaded[S]` and converted
+    `pipeline/hidream_o1_smoke.mojo` from run-gated skeleton to real offloaded
+    one-step smoke: `output/hidream_o1_smoke.png`.
+  - Detailed status:
+    `serenitymojo/docs/SENSENOVA_HIDREAM_HANDOFF_2026-05-26.md`.
 
 ## Source Map
 
@@ -124,8 +193,9 @@ SDXL source in `inference-flame`:
 
 FLUX and Klein source in `inference-flame`:
 
-- `src/models/flux1_dit.rs`: FLUX.1 DiT. This is useful background, but the
-  corrected scope is FLUX.2/Klein unless the user explicitly asks for FLUX.1.
+- `src/models/flux1_dit.rs`: FLUX.1 DiT. FLUX.1-dev is active again as of the
+  2026-05-28 user request; keep it in the P1 image bring-up lane alongside
+  SDXL and SD3.
 - `src/bin/flux1_infer.rs`: FLUX.1 end-to-end path.
 - `src/models/klein.rs`: FLUX.2 Klein transformer, 4B and 9B.
 - `src/bin/klein_infer.rs`: Klein 4B text-to-image.
@@ -193,17 +263,79 @@ Mojo reuse candidates:
 - `models/vae/decoder2d.mojo` and `models/vae/zimage_decoder.mojo` patterns
 - `offload/block_loader.mojo` for block-level UNet loading
 
-Missing Mojo pieces:
+Current Mojo pieces:
 
-- `models/dit/sdxl_unet.mojo`
-- `models/text_encoder/clip_encoder.mojo`
-- CLIP tokenizer support, or an explicit cached-embedding-only SDXL entry point
-- `models/vae/ldm_decoder.mojo` or a generalized `decoder2d` wrapper for SDXL
-- full SDXL pipeline wrapper around `sampling/sdxl_euler.mojo`
-- production GPU noise generation; SDXL still needs wiring to use `ops/cast.mojo`
-- rectangular cross-attention support in `ops/attention.mojo` or an SDXL-local
-  attention wrapper (`q` sequence length often differs from text length)
-- inpaint and LoRA wiring after the base path is correct
+- `models/dit/sdxl_unet.mojo` contains the LDM-format SDXL UNet scaffold and
+  SDXL-local rectangular attention wiring.
+- `models/dit/sdxl_attention.mojo` provides the SDXL rectangular SDPA helper.
+- `models/vae/ldm_decoder.mojo` provides the SDXL LDM VAE decode path.
+- `sampling/sdxl_euler.mojo` provides the scaled-linear Euler scheduler, CFG,
+  input scaling, and eps-prediction Euler update helpers.
+- `models/dit/sdxl_contract.mojo` provides the metadata contract for SDXL
+  manifest, UNet/VAE safetensors headers, cached embedding shape/dtype, and
+  the exact Rust `sdxl_encode` handoff command for the default cache artifact.
+- `pipeline/sdxl_pipeline_smoke.mojo` is the cached-embedding SDXL text-to-image
+  wrapper around scheduler -> UNet -> VAE -> PNG. It now runs the strict
+  contract before device loads, pulls UNet/VAE paths from the registered
+  manifest, keeps denoise loop state in F32, casts the UNet input to BF16, and
+  casts eps predictions back to F32 before CFG/Euler. For normal development it
+  runs a one-step 1024 smoke and writes `output/sdxl_one_step_1024.png`; the
+  full Rust-quality schedule remains 30 steps.
+- `pipeline/sdxl_pipeline_full_smoke.mojo` is the long 30-step 1024
+  cached-embedding target. It writes `output/sdxl_30step_1024.png`; the first
+  run completed in `53:38.90` with nonblank RGB output.
+- `pipeline/sdxl_contract_smoke.mojo` validates UNet/VAE headers and validates
+  cached embedding dtype/count/shape when the cache file is present. If it is
+  absent, the smoke prints the expected artifact path and generator handoff.
+- `pipeline/sdxl_pipeline_contract_smoke.mojo` keeps the manifest, scheduler,
+  and cached-embedding pipeline contract compile-checked without opening the
+  full UNet/VAE headers. If the cached embedding file is present, it now uses
+  the same strict cached-embedding validator as the runnable pipeline; if absent,
+  it reports static-contract pass and prints the generator handoff.
+- The default cached embedding artifact now exists at
+  `/home/alex/EriDiffusion/inference-flame/output/sdxl_embeddings.safetensors`
+  and validates as BF16. `src/bin/sdxl_encode.rs` in inference-flame now uses a
+  local BF16 safetensors writer because the shared flame-core `save_tensors`
+  path writes F32 safetensors.
+
+Default cached-embedding handoff:
+
+```bash
+cd /home/alex/EriDiffusion/inference-flame && cargo run --release --bin sdxl_encode -- --prompt '<prompt>' --negative '' --output /home/alex/EriDiffusion/inference-flame/output/sdxl_embeddings.safetensors
+```
+
+Remaining SDXL blockers:
+
+- CLIP tokenizer plus prompt-embedding assembly if SDXL should accept raw
+  prompts inside Mojo instead of relying on cached embeddings.
+- Rust/diffusers parity assessment for the full 30-step artifact.
+- Production GPU-only cleanup for any remaining layout conversions, bias staging,
+  and conv-weight layout adaptation.
+- Inpaint and LoRA wiring after the base cached-embedding path is correct.
+
+## FLUX.1-dev Port Notes
+
+Current FLUX.1-dev status:
+
+- `models/dit/flux1_contract.mojo` validates the manifest, CLIP-L/T5 assets,
+  FLUX DiT checkpoint, FLUX LDM VAE checkpoint, and optional cached-input
+  sidecar.
+- `pipeline/flux1_pipeline_smoke.mojo` builds/runs the end-to-end path from
+  placeholder CLIP/T5 token IDs. A runtime run produced
+  `output/flux1_first.png`, but that image is all-white and should not be used
+  as a quality claim.
+- `pipeline/flux1_pipeline_cached_smoke.mojo` uses the Rust-captured
+  `flux1_inputs.safetensors` sidecar and produced a coherent 1024 PNG at
+  `output/flux1_cached_inputs.png`. The current path uses `sdpa_nomask` instead
+  of materializing a zero additive mask.
+
+Remaining FLUX.1-dev blockers:
+
+- tokenizer-backed CLIP/T5 prompt assembly in Mojo,
+- F32 RoPE table/math parity decision versus the current BF16 table path,
+- memory lifetime cleanup around encoder/DiT/VAE scopes,
+- borrowed-bias/per-call allocation cleanup in the FLUX DiT hot path,
+- Rust/Modular parity once the raw-prompt path feeds real conditioning.
 
 ## FLUX.2/Klein 4B and 9B Port Notes
 
@@ -340,9 +472,14 @@ Likely needed kernels:
    long-sequence math-mode attentions where needed.
 3. Finish strict GPU-only foundation gaps: VAE layout permutes, bias staging,
    GPU text/ID/mask setup if required.
-4. Port SDXL cached-embedding path: scheduler, UNet skeleton, LDM VAE decode.
-   Keep CLIP tokenizer/encoder separate until the denoise path is stable.
-6. Add edit/inpaint and LoRA paths after base text-to-image parity.
+4. Move SDXL past the full cached-embedding artifact by comparing against Rust
+   or diffusers, then wire raw-prompt CLIP assembly for non-cached prompts.
+5. Move FLUX.1-dev past cached-input runtime smoke: tokenizer-backed CLIP/T5
+   assembly, F32/BF16 RoPE decision, memory/per-call allocation cleanup, and
+   Rust/Modular parity.
+6. Start SD3.5 Large implementation behind its manifest/header contract: triple
+   encoder assembly, MMDiT, embedded VAE decode, and shifted-flow CFG.
+7. Add edit/inpaint and LoRA paths after base text-to-image parity.
 
 ## Verification Done
 
@@ -350,6 +487,22 @@ Likely needed kernels:
 - `/tmp/flux2_klein_smoke`
 - `pixi run mojo build -I . -Xlinker -lm serenitymojo/sampling/sdxl_euler_smoke.mojo -o /tmp/sdxl_euler_smoke`
 - `/tmp/sdxl_euler_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/sdxl_contract_smoke.mojo -o /tmp/sdxl_contract_smoke`
+- `/tmp/sdxl_contract_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/sdxl_pipeline_contract_smoke.mojo -o /tmp/sdxl_pipeline_contract_smoke`
+- `/tmp/sdxl_pipeline_contract_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/flux1_contract_smoke.mojo -o /tmp/flux1_contract_smoke`
+- `/tmp/flux1_contract_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/ops_smoke2.mojo -o /tmp/ops_smoke2`
+- `/tmp/ops_smoke2`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/flux1_pipeline_cached_smoke.mojo -o /tmp/flux1_pipeline_cached_smoke`
+- `/usr/bin/time -f 'elapsed=%E user=%U sys=%S maxrss=%MKB' /tmp/flux1_pipeline_cached_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/sd3_pipeline_contract_smoke.mojo -o /tmp/sd3_pipeline_contract_smoke`
+- `/tmp/sd3_pipeline_contract_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/sdxl_pipeline_smoke.mojo -o /tmp/sdxl_pipeline_smoke`
+- `/usr/bin/time -f 'elapsed=%E user=%U sys=%S maxrss=%MKB' /tmp/sdxl_pipeline_smoke`
+- `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/sdxl_pipeline_full_smoke.mojo -o /tmp/sdxl_pipeline_full_smoke`
+- `/usr/bin/time -f 'elapsed=%E user=%U sys=%S maxrss=%MKB' /tmp/sdxl_pipeline_full_smoke`
 - `pixi run mojo build -I . -Xlinker -lm serenitymojo/models/text_encoder/smoke_compile.mojo -o /tmp/qwen3_text_smoke`
 - `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/klein9b_text_smoke.mojo -o /tmp/klein9b_text_smoke`
 - `/tmp/klein9b_text_smoke`
@@ -372,5 +525,6 @@ Likely needed kernels:
 
 GPU-heavy commands in this pass were the Z-Image 1024 pipeline rerun, the
 Klein Qwen3-8B text smoke, the truncated/full Klein 9B DiT smokes, Klein VAE
-64/1024 smokes, and the one-step end-to-end Klein 9B 1024 image smoke. The path
-now produces an image; quality and speed are the remaining work.
+64/1024 smokes, the one-step end-to-end Klein 9B 1024 image smoke, the SDXL
+full 30-step cached run, and the FLUX.1 cached-input run. These paths now
+produce image artifacts; quality parity and speed are the remaining work.

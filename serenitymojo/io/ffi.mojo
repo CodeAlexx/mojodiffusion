@@ -105,6 +105,20 @@ def sys_open(path: String, flags: Int32, mode: Int32 = 0) -> Int:
     return fd
 
 
+def sys_system(command: String) -> Int:
+    """system(3). Returns libc's raw status code, or -1 on error."""
+    var n = command.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = command.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cstr = BytePtr(unsafe_from_address=Int(buf))
+    var status = Int(external_call["system", Int32](cstr))
+    buf.free()
+    return status
+
+
 def sys_pwrite(fd: Int, buf: BytePtr, count: Int, offset: Int) -> Int:
     """pwrite(2). Writes `count` bytes from `buf` at absolute `offset`. Returns
     bytes written, or -1. We use pwrite (not write) because the stdlib's `print`

@@ -789,6 +789,8 @@ def _sdpa_dispatch(
             return sdpa[1, 256, 28, 128](q, k, v, mask, scale, ctx)
         if seq == 512:
             return sdpa[1, 512, 28, 128](q, k, v, mask, scale, ctx)
+        if seq == 546:
+            return sdpa[1, 546, 28, 128](q, k, v, mask, scale, ctx)
     raise Error(
         String("sdpa_dispatch: unsupported (seq,h,dh)=(")
         + String(seq) + "," + String(h) + "," + String(dh)

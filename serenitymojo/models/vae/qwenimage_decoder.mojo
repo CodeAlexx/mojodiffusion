@@ -72,7 +72,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import silu
-from serenitymojo.ops.attention import sdpa
+from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.tensor_algebra import (
     reshape,
     permute,
@@ -156,14 +156,48 @@ struct QwenImageVaeDecoder[LH: Int, LW: Int]:
             name_to_idx[nm] = idx
 
         # unnormalize tensors [1,1,1,1,16] (channel last in NDHWC)
+        var norm_dtype = sharded.tensor_info(String("post_quant_conv.weight")).dtype
         var msh = List[Int]()
         msh.append(1); msh.append(1); msh.append(1); msh.append(1); msh.append(16)
-        var mean = Tensor.from_host(_vae_mean(), msh.copy(), STDtype.F32, ctx)
+        var mean = Tensor.from_host(_vae_mean(), msh.copy(), norm_dtype, ctx)
         var stds = _vae_std()
         var inv = List[Float32]()
         for i in range(len(stds)):
             inv.append(Float32(1.0) / stds[i])
-        var inv_std = Tensor.from_host(inv, msh^, STDtype.F32, ctx)
+        var inv_std = Tensor.from_host(inv, msh^, norm_dtype, ctx)
+        return QwenImageVaeDecoder[Self.LH, Self.LW](weights^, name_to_idx^, mean^, inv_std^)
+
+    @staticmethod
+    def load_wan21_keys(
+        path: String, ctx: DeviceContext
+    ) raises -> QwenImageVaeDecoder[Self.LH, Self.LW]:
+        """Load a Wan2.1/Qwen image VAE using native Wan key names.
+
+        Anima's `qwen_image_vae.safetensors` stores the same 16-channel image
+        decoder topology as Qwen-Image, but under keys like `conv2`,
+        `decoder.conv1`, `decoder.middle.0`, and `decoder.upsamples.*`.
+        """
+        var sharded = ShardedSafeTensors.open(path)
+        var weights = List[ArcPointer[Tensor]]()
+        var name_to_idx = Dict[String, Int]()
+        for ref nm in sharded.names():
+            if nm.startswith("encoder.") or nm.startswith("conv1."):
+                continue
+            var tv = sharded.tensor_view(nm)
+            var t = Tensor.from_view(tv, ctx)
+            var idx = len(weights)
+            weights.append(ArcPointer(t^))
+            name_to_idx[nm] = idx
+
+        var norm_dtype = sharded.tensor_info(String("conv2.weight")).dtype
+        var msh = List[Int]()
+        msh.append(1); msh.append(1); msh.append(1); msh.append(1); msh.append(16)
+        var mean = Tensor.from_host(_vae_mean(), msh.copy(), norm_dtype, ctx)
+        var stds = _vae_std()
+        var inv = List[Float32]()
+        for i in range(len(stds)):
+            inv.append(Float32(1.0) / stds[i])
+        var inv_std = Tensor.from_host(inv, msh^, norm_dtype, ctx)
         return QwenImageVaeDecoder[Self.LH, Self.LW](weights^, name_to_idx^, mean^, inv_std^)
 
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
@@ -251,7 +285,6 @@ struct QwenImageVaeDecoder[LH: Int, LW: Int]:
     ) raises -> Tensor:
         var xs = x.shape()
         var n = xs[0]
-        var di = xs[1]
         var hi = xs[2]
         var wi = xs[3]
         var cin = xs[4]
@@ -306,7 +339,9 @@ struct QwenImageVaeDecoder[LH: Int, LW: Int]:
         return Tensor(dev^, x.shape(), x.dtype())
 
     # ── ResidualBlock (wan21_vae.rs:216-296) ──────────────────────────────────
-    # residual.0 RMS_norm, .2 CausalConv3d(3x3x3), .3 RMS_norm, .6 CausalConv3d.
+    # Diffusers keys: norm1 -> conv1 -> norm2 -> conv2. The Wan reference names
+    # those residual.0/residual.2/residual.3/residual.6 after remap, but this
+    # loader keeps the original checkpoint key spelling.
     # optional shortcut CausalConv3d(1x1x1) when in_dim != out_dim.
     def _residual_block(
         self,
@@ -318,17 +353,17 @@ struct QwenImageVaeDecoder[LH: Int, LW: Int]:
     ) raises -> Tensor:
         var h: Tensor
         if in_dim != out_dim:
-            var wsc = self._conv3d_w(prefix + ".shortcut.weight", ctx)
-            var bsc = self._bias(prefix + ".shortcut.bias", ctx)
+            var wsc = self._conv3d_w(prefix + ".conv_shortcut.weight", ctx)
+            var bsc = self._bias(prefix + ".conv_shortcut.bias", ctx)
             h = self._causal_conv3d(x, wsc^, bsc^, 0, 0, 0, ctx)
         else:
             h = self._clone(x, ctx)
-        var out = self._rms_norm5d(x, prefix + ".residual.0.gamma", in_dim, ctx)
+        var out = self._rms_norm5d(x, prefix + ".norm1.gamma", in_dim, ctx)
         out = silu(out, ctx)
-        out = self._conv3d_named(out, prefix + ".residual.2", 1, ctx)
-        out = self._rms_norm5d(out, prefix + ".residual.3.gamma", out_dim, ctx)
+        out = self._conv3d_named(out, prefix + ".conv1", 1, ctx)
+        out = self._rms_norm5d(out, prefix + ".norm2.gamma", out_dim, ctx)
         out = silu(out, ctx)
-        out = self._conv3d_named(out, prefix + ".residual.6", 1, ctx)
+        out = self._conv3d_named(out, prefix + ".conv2", 1, ctx)
         return add(out, h, ctx)
 
     # ── AttentionBlock (wan21_vae.rs:302-381) ─────────────────────────────────
@@ -352,9 +387,8 @@ struct QwenImageVaeDecoder[LH: Int, LW: Int]:
         var q = reshape(slice(qkv, 1, 0, dim, ctx), _shape4(1, SEQ, 1, dim), ctx)
         var k = reshape(slice(qkv, 1, dim, dim, ctx), _shape4(1, SEQ, 1, dim), ctx)
         var v = reshape(slice(qkv, 1, 2 * dim, dim, ctx), _shape4(1, SEQ, 1, dim), ctx)
-        var mask = self._zeros_mask[SEQ](q.dtype(), ctx)
         var scale = Float32(1.0) / sqrt(Float32(dim))
-        var attn = sdpa[1, SEQ, 1, _ATTN_DH](q, k, v, mask, scale, ctx)  # [1,SEQ,1,C]
+        var attn = sdpa_nomask[1, SEQ, 1, _ATTN_DH](q, k, v, scale, ctx)  # [1,SEQ,1,C]
         var attn_flat = reshape(attn, _shape2(SEQ, dim), ctx)
         var proj_w = self._conv1x1_as_linear(prefix + ".proj.weight", ctx)
         var proj_b = self._bias(prefix + ".proj.bias", ctx)
@@ -398,6 +432,29 @@ struct QwenImageVaeDecoder[LH: Int, LW: Int]:
         var w = self._conv2d_as_qrscf(prefix + ".resample.1.weight", ctx)
         var b = self._bias(prefix + ".resample.1.bias", ctx)
         return self._causal_conv3d(x_up5d, w^, b^, 0, 1, 1, ctx)
+
+    def _residual_block_wan21(
+        self,
+        x: Tensor,
+        prefix: String,
+        in_dim: Int,
+        out_dim: Int,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var h: Tensor
+        if in_dim != out_dim:
+            var wsc = self._conv3d_w(prefix + ".shortcut.weight", ctx)
+            var bsc = self._bias(prefix + ".shortcut.bias", ctx)
+            h = self._causal_conv3d(x, wsc^, bsc^, 0, 0, 0, ctx)
+        else:
+            h = self._clone(x, ctx)
+        var out = self._rms_norm5d(x, prefix + ".residual.0.gamma", in_dim, ctx)
+        out = silu(out, ctx)
+        out = self._conv3d_named(out, prefix + ".residual.2", 1, ctx)
+        out = self._rms_norm5d(out, prefix + ".residual.3.gamma", out_dim, ctx)
+        out = silu(out, ctx)
+        out = self._conv3d_named(out, prefix + ".residual.6", 1, ctx)
+        return add(out, h, ctx)
 
     # ── decode ────────────────────────────────────────────────────────────────
     def decode(self, latent_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -462,6 +519,56 @@ struct QwenImageVaeDecoder[LH: Int, LW: Int]:
         var ow = 8 * Self.LW
         var x_nhwc = reshape(x, _shape4(1, oh, ow, 3), ctx)
         return permute(x_nhwc, _perm4(0, 3, 1, 2), ctx)  # [1,3,oh,ow]
+
+    def decode_wan21_keys(self, latent_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
+        """Decode [1,16,LH,LW] with native Wan2.1 key names.
+
+        This is used by Anima's `qwen_image_vae.safetensors`; it shares the
+        Qwen-Image image-mode math but not the diffusers key spelling.
+        """
+        var ls = latent_nchw.shape()
+        if len(ls) != 4 or ls[1] != 16:
+            raise Error("Wan21 VAE decode: latent must be [1,16,LH,LW]")
+        var lat_nhwc = permute(latent_nchw, _perm4(0, 2, 3, 1), ctx)
+        var z = reshape(lat_nhwc, _shape5(1, 1, Self.LH, Self.LW, 16), ctx)
+
+        z = add(div(z, self.inv_std, ctx), self.mean, ctx)
+
+        var x = self._conv3d_named(z, "conv2", 0, ctx)
+        x = self._conv3d_named(x, "decoder.conv1", 1, ctx)
+
+        x = self._residual_block_wan21(x, "decoder.middle.0", 384, 384, ctx)
+        x = self._attn_block(x, "decoder.middle.1", 384, ctx)
+        x = self._residual_block_wan21(x, "decoder.middle.2", 384, 384, ctx)
+
+        x = self._residual_block_wan21(x, "decoder.upsamples.0", 384, 384, ctx)
+        x = self._residual_block_wan21(x, "decoder.upsamples.1", 384, 384, ctx)
+        x = self._residual_block_wan21(x, "decoder.upsamples.2", 384, 384, ctx)
+        x = self._resample(x, "decoder.upsamples.3", 384, ctx)
+
+        x = self._residual_block_wan21(x, "decoder.upsamples.4", 192, 384, ctx)
+        x = self._residual_block_wan21(x, "decoder.upsamples.5", 384, 384, ctx)
+        x = self._residual_block_wan21(x, "decoder.upsamples.6", 384, 384, ctx)
+        x = self._resample(x, "decoder.upsamples.7", 384, ctx)
+
+        x = self._residual_block_wan21(x, "decoder.upsamples.8", 192, 192, ctx)
+        x = self._residual_block_wan21(x, "decoder.upsamples.9", 192, 192, ctx)
+        x = self._residual_block_wan21(x, "decoder.upsamples.10", 192, 192, ctx)
+        x = self._resample(x, "decoder.upsamples.11", 192, ctx)
+
+        x = self._residual_block_wan21(x, "decoder.upsamples.12", 96, 96, ctx)
+        x = self._residual_block_wan21(x, "decoder.upsamples.13", 96, 96, ctx)
+        x = self._residual_block_wan21(x, "decoder.upsamples.14", 96, 96, ctx)
+
+        x = self._rms_norm5d(x, "decoder.head.0.gamma", 96, ctx)
+        x = silu(x, ctx)
+        x = self._conv3d_named(x, "decoder.head.2", 1, ctx)
+        x = _clamp_unit(x, ctx)
+
+        var oh = 8 * Self.LH
+        var ow = 8 * Self.LW
+        var x_nhwc = reshape(x, _shape4(1, oh, ow, 3), ctx)
+        return permute(x_nhwc, _perm4(0, 3, 1, 2), ctx)
 
 
 # Attention head dim equals the channel count at the mid block (384). The

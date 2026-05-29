@@ -66,7 +66,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `models/dit/zimage_dit.mojo` | `NextDiT[HL,WL,CAPLEN]` Z-Image transformer + `NextDiTConfig`. | ✅ cos 0.99985 |
 | `models/dit/klein_dit.mojo` | `Klein9BDiT` / `Klein9BOffloaded`: FLUX.2 Klein 9B DiT, full all-block and offloaded 1024 forward. | ✅ one-step 1024 |
 | `models/text_encoder/qwen3_encoder.mojo` | `Qwen3Encoder` + `Qwen3Config` (Z-Image/Klein text encoder). | ✅ |
-| `models/text_encoder/qwen25vl_encoder.mojo` | `Qwen25VLEncoder` + `Qwen25VLConfig` (Qwen-Image text encoder). | ⏳ built, unverified |
+| `models/text_encoder/qwen25vl_encoder.mojo` | `Qwen25VLEncoder` + `Qwen25VLConfig` (Qwen-Image text encoder). | ✅ base 512 runtime smoke / parity pending |
 | `models/vae/zimage_decoder.mojo` | `ZImageDecoder[LH,LW]`: Z-Image AutoencoderKL decoder config. | ✅ cos 0.99998 |
 | `models/vae/klein_decoder.mojo` | `KleinVaeDecoder[LH,LW]`: FLUX.2/Klein VAE decode from packed `[1,128,LH,LW]`. | ✅ 1024 smoke |
 | `models/vae/decoder2d.mojo` | Shared 2D-VAE kit: `ResnetBlock`, `AttnBlock`, `Upsample`, NCHW↔NHWC. | ✅ |

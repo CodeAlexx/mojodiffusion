@@ -13,6 +13,7 @@ from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.conv import conv2d
 from serenitymojo.ops.norm import group_norm
 from serenitymojo.ops.activations import silu
@@ -269,10 +270,18 @@ struct KleinVaeDecoder[LH: Int, LW: Int](Movable):
         )
 
     def decode(self, packed_latent_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
-        """[1,128,LH,LW] -> [1,3,16*LH,16*LW]. Current path expects F32."""
+        """[1,128,LH,LW] -> [1,3,16*LH,16*LW]. Input must be F32.
+
+        Weights may be F32 (flux2-vae.safetensors) or BF16 (ERNIE vae). The
+        activation is cast to match the weight dtype before the first conv so
+        both files work without separate load paths. Rule 3 fix 2026-05-28.
+        """
         var z = _inverse_bn(packed_latent_nchw, self.bn_scale, self.bn_bias, ctx)
         z = _unpatchify_packed(z, ctx)  # [1,32,2LH,2LW]
         var h = nchw_to_nhwc(z, ctx)
+        # Cast to match weight dtype (F32 for Klein/flux2-vae, BF16 for ERNIE vae).
+        if h.dtype() != self.post_quant_w.dtype():
+            h = cast_tensor(h, self.post_quant_w.dtype(), ctx)
         h = conv2d[1, 2 * Self.LH, 2 * Self.LW, LATENT_CH, 1, 1, LATENT_CH, 1, 1, 0, 0](
             h, clone(self.post_quant_w, ctx),
             Optional[Tensor](clone(self.post_quant_b, ctx)), ctx

@@ -24,7 +24,7 @@ from serenitymojo.ops.rope import rope_interleaved, rope_halfsplit
 from serenitymojo.ops.activations import silu, gelu, swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.softmax import softmax_lastdim
-from serenitymojo.ops.attention import sdpa
+from serenitymojo.ops.attention import sdpa, sdpa_nomask
 from serenitymojo.ops.conv import conv2d
 
 
@@ -287,6 +287,17 @@ def main() raises:
     )
     r = h.compare(out_sdpa, out_sdpa_ref, ctx)
     print("sdpa(flash)    ", r)
+    all_pass = all_pass and r.passed
+
+    var out_sdpa_nomask = sdpa_nomask[1, 4, 2, 8](
+        Tensor.from_host(q_sdpa, [1, 4, 2, 8], STDtype.F32, ctx),
+        Tensor.from_host(k_sdpa, [1, 4, 2, 8], STDtype.F32, ctx),
+        Tensor.from_host(v_sdpa, [1, 4, 2, 8], STDtype.F32, ctx),
+        Float32(0.35355339),
+        ctx,
+    )
+    r = h.compare(out_sdpa_nomask, out_sdpa_ref, ctx)
+    print("sdpa(nomask)  ", r)
     all_pass = all_pass and r.passed
 
     # ── conv2d NHWC: x[1,5,5,3], filt RSCF[3,3,3,4], bias[4], stride1 pad1 ────

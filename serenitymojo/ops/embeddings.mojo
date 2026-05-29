@@ -45,6 +45,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
+from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -74,6 +75,39 @@ def _timestep_embed_kernel_f32(
         # COS first (cols [0, half)), SIN second (cols [half, dim)).
         o[row, i] = rebind[o.element_type](cos(angle))
         o[row, half + i] = rebind[o.element_type](sin(angle))
+
+
+# ── sinusoidal timestep-embedding kernel — SIN-FIRST variant (ERNIE) ────────
+# ERNIE-Image's `time_embed` (ernie_image.rs:588-609) builds the sinusoidal
+# vector as `cat([sin_part, cos_part], dim=1)` — the OPPOSITE order from
+# Z-Image NextDiT (zimage_nextdit.rs:425-426, cos-first). The trained
+# `time_embedding.linear_1.weight` rows assume the SIN block sits in cols
+# [0, half) and the COS block sits in cols [half, dim); feeding the cos-first
+# kernel's output drives downstream activations into BF16 overflow after the
+# shared AdaLN linear (4096 -> 24576). This kernel is identical to the
+# cos-first kernel above except the two writes are swapped. The new
+# `timestep_embedding_sin_first` host function below dispatches it. Z-Image,
+# FLUX, Klein, Qwen, HiDream, SenseNova and SDXL must continue to call the
+# cos-first `timestep_embedding`.
+def _timestep_embed_kernel_f32_sin_first(
+    t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    n: Int,
+    dim: Int,
+    half: Int,
+    neg_ln_max_period: Float32,
+):
+    var idx = Int(global_idx.x)
+    var total = n * half
+    if idx < total:
+        var row = idx // half
+        var i = idx % half
+        var tv = rebind[Scalar[DType.float32]](t[row])
+        var freq = exp(neg_ln_max_period * (Float32(i) / Float32(half)))
+        var angle = tv * freq
+        # SIN first (cols [0, half)), COS second (cols [half, dim)) — ERNIE.
+        o[row, i] = rebind[o.element_type](sin(angle))
+        o[row, half + i] = rebind[o.element_type](cos(angle))
 
 
 def timestep_embedding(
@@ -114,6 +148,53 @@ def timestep_embedding(
     return Tensor(out_buf^, out_shape^, STDtype.F32)
 
 
+def timestep_embedding_sin_first(
+    t: Tensor, dim: Int, ctx: DeviceContext, max_period: Float32 = 10000.0
+) raises -> Tensor:
+    """Sinusoidal timestep embedding (ERNIE order: SIN then COS).
+
+    Equivalent to `timestep_embedding` except the two halves are swapped:
+        emb[n, i]        = sin(angle)        cols [0, half)
+        emb[n, half + i] = cos(angle)        cols [half, dim)
+    This matches ERNIE-Image (`ernie_image.rs:603` `cat([sin, cos], 1)`).
+    Z-Image and all other DiTs in this repo train against cos-first and MUST
+    keep calling `timestep_embedding`. Confirmed via skeptic finding
+    `serenitymojo/parity/SKEPTIC_FINDINGS_ernie_block0_2026-05-28.md` (A2/A5).
+
+    t:   [N]            scalar timesteps (1-D; flattened length = N). F32.
+    dim: embedding dim  (must be even).
+    returns [N, dim]    F32 storage; F32 math.
+    """
+    if dim % 2 != 0:
+        raise Error("timestep_embedding_sin_first: dim must be even")
+    if t.dtype() != STDtype.F32:
+        raise Error("timestep_embedding_sin_first: t must be F32")
+    var n = t.numel()
+    var half = dim // 2
+    var neg_ln_mp = -log(max_period)
+
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dim * 4)
+    var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, dim))
+    var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        t.buf.unsafe_ptr().bitcast[Float32](), t_rl
+    )
+    var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+    )
+    var total = n * half
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[
+        _timestep_embed_kernel_f32_sin_first,
+        _timestep_embed_kernel_f32_sin_first,
+    ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
+    ctx.synchronize()
+    var out_shape = List[Int]()
+    out_shape.append(n)
+    out_shape.append(dim)
+    return Tensor(out_buf^, out_shape^, STDtype.F32)
+
+
 def t_embedder(
     t: Tensor,
     dim: Int,
@@ -138,14 +219,13 @@ def t_embedder(
     """
     var emb = timestep_embedding(t, dim, ctx, max_period)  # [N, dim] F32
     # Cast the F32 embedding to the MLP weights' compute dtype (BF16 in the
-    # reference). Host round-trip is fine: this is a tiny [N, dim] tensor.
+    # reference) on GPU. Keep inference activations off the CPU path.
     var w_dtype = mlp0_weight.dtype()
     var emb_in: Tensor
     if w_dtype == STDtype.F32:
         emb_in = emb^
     else:
-        var emb_host = emb.to_host(ctx)
-        emb_in = Tensor.from_host(emb_host, emb.shape(), w_dtype, ctx)
+        emb_in = cast_tensor(emb, w_dtype, ctx)
     var h = linear(emb_in, mlp0_weight, mlp0_bias, ctx)    # [N, hidden]
     var ha = silu(h, ctx)
     return linear(ha, mlp2_weight, mlp2_bias, ctx)         # [N, out]

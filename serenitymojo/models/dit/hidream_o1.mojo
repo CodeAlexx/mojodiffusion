@@ -56,6 +56,9 @@ from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.offload.block_loader import BlockLoader, Block
+from serenitymojo.offload.plan import OffloadConfig, build_hidream_o1_block_plan
+from serenitymojo.offload.planned_loader import PlannedBlockLoader
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.rope import rope_halfsplit
@@ -660,6 +663,283 @@ struct HiDreamO1DiT[S: Int]:
         hidden = rms_norm(hidden, nw, cfg.rms_norm_eps, ctx)
 
         # 9) final layer head -> [1, S, 3072]
+        return self._final_layer(hidden, ctx)
+
+
+def _is_hidream_resident_key(name: String) -> Bool:
+    if name == "model.language_model.embed_tokens.weight":
+        return True
+    if name == "model.language_model.norm.weight":
+        return True
+    if name == "model.x_embedder.proj1.weight":
+        return True
+    if name == "model.x_embedder.proj2.weight":
+        return True
+    if name == "model.x_embedder.proj2.bias":
+        return True
+    if name == "model.t_embedder1.mlp.0.weight":
+        return True
+    if name == "model.t_embedder1.mlp.0.bias":
+        return True
+    if name == "model.t_embedder1.mlp.2.weight":
+        return True
+    if name == "model.t_embedder1.mlp.2.bias":
+        return True
+    if name == "model.final_layer2.linear.weight":
+        return True
+    if name == "model.final_layer2.linear.bias":
+        return True
+    return False
+
+
+def _bget_hidream[
+    mut: Bool, //, origin: Origin[mut=mut]
+](ref [origin] block: Block, p: String, suffix: String) raises -> ref [block] Tensor:
+    var full = p + suffix
+    if full not in block:
+        raise Error(String("HiDreamO1Offloaded: missing block weight: ") + full)
+    return block[full][]
+
+
+struct HiDreamO1Offloaded[S: Int](Movable):
+    """HiDream-O1 DiT with F32-on-disk weights converted to BF16 and decoder
+    layers streamed through PlannedBlockLoader. This is the runtime path for 24 GB
+    GPUs; `HiDreamO1DiT` above remains the all-resident compile/parity shell."""
+
+    var shared: Dict[String, ArcPointer[Tensor]]
+    var loader: PlannedBlockLoader
+    var config: HiDreamO1Config
+
+    def __init__(
+        out self,
+        var shared: Dict[String, ArcPointer[Tensor]],
+        var loader: PlannedBlockLoader,
+        config: HiDreamO1Config,
+    ):
+        self.shared = shared^
+        self.loader = loader^
+        self.config = config
+
+    @staticmethod
+    def load(
+        dir: String, config: HiDreamO1Config, ctx: DeviceContext
+    ) raises -> HiDreamO1Offloaded[Self.S]:
+        var raw_loader = BlockLoader.open(dir)
+        var shared = Dict[String, ArcPointer[Tensor]]()
+        for ref nm in raw_loader.sharded.names():
+            if _is_hidream_resident_key(nm):
+                var tv = raw_loader.sharded.tensor_view(nm)
+                var t = Tensor.from_view_as_bf16(tv, ctx)
+                shared[nm] = ArcPointer(t^)
+        var plan = build_hidream_o1_block_plan()
+        var loader = PlannedBlockLoader(
+            raw_loader^, plan^, OffloadConfig.bf16_single()
+        )
+        return HiDreamO1Offloaded[Self.S](shared^, loader^, config)
+
+    def _w(self, name: String) raises -> ref [self.shared] Tensor:
+        if name not in self.shared:
+            raise Error(String("HiDreamO1Offloaded: missing shared weight: ") + name)
+        return self.shared[name][]
+
+    def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
+        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
+        ctx.synchronize()
+        return Tensor(dev^, x.shape(), x.dtype())
+
+    def _embed(self, ids: List[Int], ctx: DeviceContext) raises -> Tensor:
+        ref table = self._w(String("model.language_model.embed_tokens.weight"))
+        var rows = gather_rows(table, ids, ctx)
+        var sh = List[Int]()
+        sh.append(1)
+        sh.append(len(ids))
+        var ts = table.shape()
+        sh.append(ts[len(ts) - 1])
+        return reshape(rows, sh^, ctx)
+
+    def _patch_embed(self, patches: Tensor, ctx: DeviceContext) raises -> Tensor:
+        ref w1 = self._w(String("model.x_embedder.proj1.weight"))
+        var h = linear(patches, w1, None, ctx)
+        ref w2 = self._w(String("model.x_embedder.proj2.weight"))
+        ref b2 = self._w(String("model.x_embedder.proj2.bias"))
+        return linear(h, w2, Optional[Tensor](self._clone(b2, ctx)), ctx)
+
+    def _t_embed(self, timestep: Float32, ctx: DeviceContext) raises -> Tensor:
+        var cfg = self.config
+        var t_host = List[Float32]()
+        t_host.append(timestep * Float32(1000.0))
+        var dtype = self._w(String("model.t_embedder1.mlp.0.weight")).dtype()
+        var t_sh = List[Int]()
+        t_sh.append(1)
+        var t_tensor = Tensor.from_host(t_host, t_sh^, STDtype.F32, ctx)
+        var freq = timestep_embedding(t_tensor, cfg.timestep_freq_dim, ctx)
+        var freq_c = cast_tensor(freq, dtype, ctx)
+        ref w0 = self._w(String("model.t_embedder1.mlp.0.weight"))
+        ref b0 = self._w(String("model.t_embedder1.mlp.0.bias"))
+        var h = linear(freq_c, w0, Optional[Tensor](self._clone(b0, ctx)), ctx)
+        h = silu(h, ctx)
+        ref w2 = self._w(String("model.t_embedder1.mlp.2.weight"))
+        ref b2 = self._w(String("model.t_embedder1.mlp.2.bias"))
+        return linear(h, w2, Optional[Tensor](self._clone(b2, ctx)), ctx)
+
+    def _final_layer(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
+        ref w = self._w(String("model.final_layer2.linear.weight"))
+        ref b = self._w(String("model.final_layer2.linear.bias"))
+        return linear(x, w, Optional[Tensor](self._clone(b, ctx)), ctx)
+
+    def _layer(
+        self,
+        block: Block,
+        layer_idx: Int,
+        hidden: Tensor,
+        cos_q: Tensor,
+        sin_q: Tensor,
+        cos_k: Tensor,
+        sin_k: Tensor,
+        mask: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var cfg = self.config
+        var h = cfg.num_heads
+        var h_kv = cfg.num_kv_heads
+        var dh = cfg.head_dim
+        var n_rep = h // h_kv
+        var eps = cfg.rms_norm_eps
+        var scale = Float32(1.0) / sqrt(Float32(dh))
+        var p = String("model.language_model.layers.") + String(layer_idx)
+        var seq = Self.S
+
+        var normed = rms_norm(
+            hidden, _bget_hidream(block, p, ".input_layernorm.weight"), eps, ctx
+        )
+
+        var q = linear(
+            normed, _bget_hidream(block, p, ".self_attn.q_proj.weight"), None, ctx
+        )
+        var k = linear(
+            normed, _bget_hidream(block, p, ".self_attn.k_proj.weight"), None, ctx
+        )
+        var v = linear(
+            normed, _bget_hidream(block, p, ".self_attn.v_proj.weight"), None, ctx
+        )
+
+        var q_sh = List[Int]()
+        q_sh.append(1); q_sh.append(seq); q_sh.append(h); q_sh.append(dh)
+        q = reshape(q, q_sh^, ctx)
+        var k_sh = List[Int]()
+        k_sh.append(1); k_sh.append(seq); k_sh.append(h_kv); k_sh.append(dh)
+        k = reshape(k, k_sh^, ctx)
+        var v_sh = List[Int]()
+        v_sh.append(1); v_sh.append(seq); v_sh.append(h_kv); v_sh.append(dh)
+        v = reshape(v, v_sh^, ctx)
+
+        q = rms_norm(
+            q, _bget_hidream(block, p, ".self_attn.q_norm.weight"), eps, ctx
+        )
+        k = rms_norm(
+            k, _bget_hidream(block, p, ".self_attn.k_norm.weight"), eps, ctx
+        )
+
+        q = rope_halfsplit(q, cos_q, sin_q, ctx)
+        k = rope_halfsplit(k, cos_k, sin_k, ctx)
+
+        var k_rep = _repeat_kv(k, seq, h_kv, n_rep, dh, ctx)
+        var v_rep = _repeat_kv(v, seq, h_kv, n_rep, dh, ctx)
+        var attn = _sdpa_s[Self.S](q, k_rep, v_rep, mask, scale, ctx)
+
+        var attn_sh = List[Int]()
+        attn_sh.append(1); attn_sh.append(seq); attn_sh.append(h * dh)
+        attn = reshape(attn, attn_sh^, ctx)
+
+        var attn_out = linear(
+            attn, _bget_hidream(block, p, ".self_attn.o_proj.weight"), None, ctx
+        )
+        var hidden2 = add(hidden, attn_out, ctx)
+
+        var normed2 = rms_norm(
+            hidden2,
+            _bget_hidream(block, p, ".post_attention_layernorm.weight"),
+            eps,
+            ctx,
+        )
+        var gate = linear(
+            normed2, _bget_hidream(block, p, ".mlp.gate_proj.weight"), None, ctx
+        )
+        var up = linear(
+            normed2, _bget_hidream(block, p, ".mlp.up_proj.weight"), None, ctx
+        )
+        var act = swiglu(gate, up, ctx)
+        var mlp_out = linear(
+            act, _bget_hidream(block, p, ".mlp.down_proj.weight"), None, ctx
+        )
+        return add(hidden2, mlp_out, ctx)
+
+    def forward(
+        mut self,
+        input_ids: List[Int],
+        noise_patches: Tensor,
+        t_pos: List[Int],
+        h_pos: List[Int],
+        w_pos: List[Int],
+        ar_len: Int,
+        timestep: Float32,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var cfg = self.config
+        var h = cfg.num_heads
+        var h_kv = cfg.num_kv_heads
+        var dh = cfg.head_dim
+        var half = dh // 2
+        var s_text = len(input_ids)
+        var dtype = self._w(String("model.language_model.embed_tokens.weight")).dtype()
+
+        var text_emb = self._embed(input_ids, ctx)
+        var t_emb = self._t_embed(timestep, ctx)
+        var tms_idx = -1
+        for i in range(s_text):
+            if input_ids[i] == cfg.tms_token_id:
+                tms_idx = i
+        var text_emb_with_t = _scatter_row(
+            text_emb, t_emb, tms_idx, s_text, cfg.hidden_size, ctx
+        )
+
+        var patch_emb = self._patch_embed(noise_patches, ctx)
+        var hidden = concat(1, ctx, text_emb_with_t, patch_emb)
+
+        var tables = _build_mrope_tables(
+            t_pos, h_pos, w_pos, dh, cfg.rope_theta, cfg.mrope_h, cfg.mrope_w
+        )
+        var seq = Self.S
+        var cos_q_h = _replicate_heads(tables[0], seq, half, h)
+        var sin_q_h = _replicate_heads(tables[1], seq, half, h)
+        var cos_k_h = _replicate_heads(tables[0], seq, half, h_kv)
+        var sin_k_h = _replicate_heads(tables[1], seq, half, h_kv)
+        var cq_sh = List[Int](); cq_sh.append(seq * h * half)
+        var ck_sh = List[Int](); ck_sh.append(seq * h_kv * half)
+        var cos_q = Tensor.from_host(cos_q_h, cq_sh.copy(), dtype, ctx)
+        var sin_q = Tensor.from_host(sin_q_h, cq_sh.copy(), dtype, ctx)
+        var cos_k = Tensor.from_host(cos_k_h, ck_sh.copy(), dtype, ctx)
+        var sin_k = Tensor.from_host(sin_k_h, ck_sh.copy(), dtype, ctx)
+
+        var mask_data = _build_prefix_causal_mask(seq, h, ar_len)
+        var mask_sh = List[Int]()
+        mask_sh.append(1); mask_sh.append(h); mask_sh.append(seq); mask_sh.append(seq)
+        var mask = Tensor.from_host(mask_data, mask_sh^, dtype, ctx)
+
+        self.loader.config = OffloadConfig.bf16_single()
+        self.loader.prefetch(0)
+        for i in range(cfg.num_layers):
+            self.loader.prefetch_next(i)
+            var handle = self.loader.await_block(i, ctx)
+            hidden = self._layer(
+                handle.block, i, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx
+            )
+
+        hidden = rms_norm(
+            hidden, self._w(String("model.language_model.norm.weight")),
+            cfg.rms_norm_eps, ctx
+        )
         return self._final_layer(hidden, ctx)
 
 

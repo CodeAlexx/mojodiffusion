@@ -268,6 +268,28 @@ def _parse_int(bytes: Span[Byte, _], mut pos: Int) -> Int:
     return -v if neg else v
 
 
+def _read_utf8_file(path: String) raises -> String:
+    # Read UTF-8 tokenizer assets through the repo's libc FFI path so this file
+    # does not collide with stdlib open/external_call declarations.
+    var fd = sys_open(path, O_RDONLY)
+    if fd < 0:
+        raise Error(String("tokenizer: cannot open ") + path)
+    var fsz = file_size(fd)
+    var rbuf = alloc[UInt8](fsz)
+    var rdone = 0
+    while rdone < fsz:
+        var got = sys_pread(fd, rbuf + rdone, fsz - rdone, rdone)
+        if got <= 0:
+            break
+        rdone += got
+    _ = sys_close(fd)
+    var jbytes = List[UInt8](capacity=fsz)
+    for i in range(fsz):
+        jbytes.append(rbuf[i])
+    rbuf.free()
+    return String(unsafe_from_utf8=jbytes)
+
+
 # ----------------------------------------------------------------------------
 # codepoint-list key helpers for Dict
 # ----------------------------------------------------------------------------
@@ -282,6 +304,28 @@ def _cps_to_key(cps: List[Int]) -> String:
             s += String(",")
         s += String(cps[i])
     return s^
+
+
+def _split_merge_pair(cps: List[Int]) -> List[List[Int]]:
+    # tokenizers' string-form BPE merges use one ASCII space as the pair
+    # separator. Byte-level space tokens themselves are U+0120 (Ġ), not 0x20.
+    var out = List[List[Int]]()
+    var sep = -1
+    for i in range(len(cps)):
+        if cps[i] == 0x20:
+            sep = i
+            break
+    if sep <= 0 or sep >= len(cps) - 1:
+        return out^
+    var a = List[Int]()
+    for i in range(sep):
+        a.append(cps[i])
+    var b = List[Int]()
+    for i in range(sep + 1, len(cps)):
+        b.append(cps[i])
+    out.append(a^)
+    out.append(b^)
+    return out^
 
 
 # ----------------------------------------------------------------------------
@@ -319,30 +363,59 @@ struct Qwen3Tokenizer(Movable):
         self.byte_to_uni = build_byte_to_unicode()
         self.id_to_token = Dict[Int, String]()
 
-        # Read the tokenizer JSON via ffi (NOT std Path.read_text — its builtin
-        # `open` collides with the lib's external_call open; see io/ffi.sys_open).
-        var fd = sys_open(json_path, O_RDONLY)
-        if fd < 0:
-            raise Error(String("tokenizer: cannot open ") + json_path)
-        var fsz = file_size(fd)
-        var rbuf = alloc[UInt8](fsz)
-        var rdone = 0
-        while rdone < fsz:
-            var got = sys_pread(fd, rbuf + rdone, fsz - rdone, rdone)
-            if got <= 0:
-                break
-            rdone += got
-        _ = sys_close(fd)
-        var jbytes = List[UInt8](capacity=fsz)
-        for i in range(fsz):
-            jbytes.append(rbuf[i])
-        rbuf.free()
-        var text = String(unsafe_from_utf8=jbytes)
+        var text = _read_utf8_file(json_path)
         var bytes = text.as_bytes()
 
         self._parse_vocab(bytes)
         self._parse_merges(bytes)
         self._parse_added_tokens(bytes)
+
+    def __init__(
+        out self,
+        vocab_json_path: String,
+        merges_txt_path: String,
+        added_tokens_json_path: String,
+    ) raises:
+        self.vocab = Dict[String, Int]()
+        self.merge_rank = Dict[String, Int]()
+        self.special_tokens = List[String]()
+        self.special_ids = List[Int]()
+        self.byte_to_uni = build_byte_to_unicode()
+        self.id_to_token = Dict[Int, String]()
+
+        var vocab_text = _read_utf8_file(vocab_json_path)
+        self._parse_vocab_object(vocab_text.as_bytes())
+
+        var merges_text = _read_utf8_file(merges_txt_path)
+        self._parse_merges_txt(merges_text)
+
+        var added_text = _read_utf8_file(added_tokens_json_path)
+        self._parse_added_tokens_map(added_text.as_bytes())
+
+    def _parse_vocab_object(mut self, bytes: Span[Byte, _]) raises:
+        var p = 0
+        _skip_ws(bytes, p)
+        if p >= len(bytes) or bytes[p] != 0x7B:
+            return
+        p += 1
+        var n = len(bytes)
+        while p < n:
+            _skip_ws(bytes, p)
+            if bytes[p] == 0x7D:
+                p += 1
+                return
+            if bytes[p] == 0x2C:
+                p += 1
+                continue
+            var key_cps = _parse_json_string(bytes, p)
+            _skip_ws(bytes, p)
+            if bytes[p] == 0x3A:
+                p += 1
+            _skip_ws(bytes, p)
+            var id = _parse_int(bytes, p)
+            var k = _cps_to_key(key_cps)
+            self.vocab[k] = id
+            self.id_to_token[id] = k
 
     def _parse_vocab(mut self, bytes: Span[Byte, _]) raises:
         var p = _find_key(bytes, String("vocab"), 0)
@@ -407,9 +480,45 @@ struct Qwen3Tokenizer(Movable):
                 var mk = _cps_to_key(a) + String(chr(0x1F)) + _cps_to_key(b)
                 self.merge_rank[mk] = rank
                 rank += 1
+            elif bytes[p] == 0x22:
+                # Some tokenizer.json files serialize merges as "tokenA tokenB".
+                var pair = _parse_json_string(bytes, p)
+                var parts = _split_merge_pair(pair)
+                if len(parts) == 2:
+                    var mk = _cps_to_key(parts[0]) + String(chr(0x1F)) + _cps_to_key(parts[1])
+                    self.merge_rank[mk] = rank
+                    rank += 1
             else:
                 # unexpected; bail
                 return
+
+    def _parse_merges_txt(mut self, text: String) raises:
+        var cps = _str_to_cps(text)
+        var line = List[Int]()
+        var rank = 0
+        for i in range(len(cps)):
+            var cp = cps[i]
+            if cp == 0x0A:
+                self._parse_merges_txt_line(line, rank)
+                line = List[Int]()
+            elif cp != 0x0D:
+                line.append(cp)
+        if len(line) > 0:
+            self._parse_merges_txt_line(line, rank)
+
+    def _parse_merges_txt_line(
+        mut self, line: List[Int], mut rank: Int
+    ) raises:
+        if len(line) == 0:
+            return
+        if line[0] == 0x23:  # '#'
+            return
+        var parts = _split_merge_pair(line)
+        if len(parts) != 2:
+            return
+        var mk = _cps_to_key(parts[0]) + String(chr(0x1F)) + _cps_to_key(parts[1])
+        self.merge_rank[mk] = rank
+        rank += 1
 
     def _parse_added_tokens(mut self, bytes: Span[Byte, _]) raises:
         # added_tokens is an array of objects with "id" and "content".
@@ -472,6 +581,30 @@ struct Qwen3Tokenizer(Movable):
                     self.special_ids.append(tok_id)
             else:
                 p += 1
+
+    def _parse_added_tokens_map(mut self, bytes: Span[Byte, _]) raises:
+        var p = 0
+        _skip_ws(bytes, p)
+        if p >= len(bytes) or bytes[p] != 0x7B:
+            return
+        p += 1
+        var n = len(bytes)
+        while p < n:
+            _skip_ws(bytes, p)
+            if bytes[p] == 0x7D:
+                p += 1
+                return
+            if bytes[p] == 0x2C:
+                p += 1
+                continue
+            var content_cps = _parse_json_string(bytes, p)
+            _skip_ws(bytes, p)
+            if bytes[p] == 0x3A:
+                p += 1
+            _skip_ws(bytes, p)
+            var tok_id = _parse_int(bytes, p)
+            self.special_tokens.append(_cps_to_string(content_cps))
+            self.special_ids.append(tok_id)
 
     # ------------------------------------------------------------------------
     # Pre-tokenizer scanner: replicate the Qwen2 regex, leftmost-first.

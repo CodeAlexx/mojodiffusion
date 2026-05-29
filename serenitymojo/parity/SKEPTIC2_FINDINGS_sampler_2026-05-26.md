@@ -1,5 +1,20 @@
 # SKEPTIC2 FINDINGS — sampler / denoise / numerics & sign conventions (2026-05-26)
 
+## Post-Reboot Validation
+
+The headline Klein finding below was applied and validated on GPU after reboot.
+The 64x64 multistep and native 1024x1024 multistep Mojo paths now produce
+coherent portrait images instead of noise:
+
+- `output/klein9b_multistep_64.png`
+- `output/klein9b_multistep_1024.png`
+
+The 1024 multistep path used cached Qwen3 captions, `Klein9BOffloaded`, 4
+Euler steps, and `sigma * 1000.0` timesteps. Final latent std was `0.7715113`;
+decoded image stats were `mean=-0.59562224 std=0.59540033 absmax=1.6061474`.
+Treat F1 as fixed/validated for image coherence. F2 remains only a possible
+strict-parity cleanup.
+
 Second-pass skeptic audit of the serenitymojo Mojo ports vs the inference-flame
 Rust references. Theme: post-CFG sign, dt sign, CFG form, timestep convention,
 sigma schedule, F32/BF16. **CODE-ONLY** (GPU wedged); no code modified.
@@ -154,7 +169,8 @@ Files audited:
 NOT apply a `time_factor`. Three classes of consumer exist:
 1. **Bake ×1000 in their own DiT:** Z-Image, Qwen, Nucleus — correct.
 2. **Pre-scale at the caller:** FLUX.1 (`t*1000`, `guidance*1000`) — correct.
-3. **Use the shared `t_embedder` AND forget to pre-scale:** **Klein only** — BUG (F1).
+3. **Use the shared `t_embedder` AND forget to pre-scale:** historical Klein
+   bug (F1), now fixed in the Klein smoke callers.
 
 Any future model wired through the shared `t_embedder` must explicitly decide
 which class it is. Consider adding an `assert`/doc-gate or a `time_factor`
@@ -166,7 +182,7 @@ parameter so the omission can't silently recur.
 
 | Model | Sampler/pipeline | Verdict |
 |-------|------------------|---------|
-| **Klein 9B** | flux2_klein + multistep_smoke | **BLOCKER (F1 ×1000 timestep), FRAGILE (F2 dtype); VAE handoff layout clean (F5)** |
+| **Klein 9B** | flux2_klein + multistep_smoke | **F1 fixed + GPU-validated post-reboot; FRAGILE (F2 dtype); VAE handoff layout clean (F5)** |
 | **Nucleus** | nucleus_gen_smoke | **BLOCKER (F3 inverted net velocity sign)** |
 | Z-Image | flow_match + zimage_pipeline | CLEAN (F6 cosmetic sigma dup) |
 | Qwen-Image | flow_match.cfg_qwen + smoke | CLEAN |
@@ -175,16 +191,15 @@ parameter so the omission can't silently recur.
 | HiDream-O1 | hidream_o1_scheduler + smoke | CLEAN |
 | SenseNova-U1 | sensenova_u1_gen_smoke | CLEAN |
 
-## Total BLOCKERS: 2
-- **F1** — Klein DiT timestep missing ×1000 `time_factor` (**very likely the live Klein noise bug**; highest priority, upstream of the VAE).
+## Total remaining BLOCKERS: 1
+- **F1** — Klein DiT timestep missing ×1000 `time_factor` was the live Klein
+  noise bug and is now fixed/validated.
 - **F3** — Nucleus net velocity sign inverted (negate kept but dt-flip dropped; runs backwards). Latent runtime is stubbed, so not yet runnable, but will produce noise on first real run.
 
 ## FRAGILE: 1 (F2 Klein timestep dtype) · STYLE: 3 (F4 CFG-Zero* scope, F5 VAE-clean note, F6 Z-Image sigma dup)
 
-## Recommended next action (Klein noise)
-Before re-running VAE-vs-DiT localization (handoff §10): apply the F1 fix
-(`klein9b_pipeline_*_smoke.mojo`: build timestep as `t_curr * 1000.0`), rebuild,
-and re-check the one-step velocity against the oracle at the real 512/4096 config.
-F1 explains noise more directly than the VAE and is a one-line change. If the
-velocity then matches the oracle (cos ≥ 0.999), the noise is resolved at the
-source and the VAE suspicion in handoff §6 is superseded.
+## Recommended next action (Klein)
+The noise-localization branch is closed for the observed issue. Next Klein work:
+keep the cached-caption/offloaded 1024 path, raise quality with more steps or a
+production entry point, and optimize block streaming / long attention. If strict
+parity is required, clean up F2 by matching the Rust timestep rounding point.

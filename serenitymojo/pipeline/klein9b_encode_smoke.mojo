@@ -30,8 +30,25 @@ comptime SEQ = 512
 
 # Must match klein9b_pipeline_multistep_smoke.mojo exactly.
 comptime PROMPT = (
-    "a cinematic portrait of a woman in dramatic neon lighting, sharp focus,"
-    " rich color, detailed face, fashion editorial"
+    "Illustrate a surrealist, macro-level close-up of a human eye with black "
+    "lashes and blue iris, a perfectly formed honeycomb pattern fused into the "
+    "iris, each chamber subtly pulsing with golden illumination. The pupil rests "
+    "at the center of this hive tunnel, a dark portal surrounded by symmetry and "
+    "structure, suggesting balance between organic instinct and intelligent "
+    "design. The skin surrounding the eye is covered in a biomimetic mesh "
+    "resembling beehive architecture across the brow and upper cheek, blending "
+    "seamlessly with natural skin tones. A single honeybee lands delicately on "
+    "the lower eyelid, tiny wings catching ambient light, fine legs touching the "
+    "boundary between hive eye and human skin as though delivering a secret. "
+    "The bee is captured in perfect anatomical realism, its eyes reflecting the "
+    "honeycomb pattern. The eyelashes curve like antennae, slightly iridescent "
+    "at the tips. Dramatic intimate lighting, wet iris highlights, subtle lens "
+    "flare in the reflection of the bee's eye, union of nature and consciousness, "
+    "reverence for bees, vision, and hidden geometries of nature woven into "
+    "human form, photorealistic, ultra detailed, natural skin texture, realistic "
+    "lighting, soft shadows, cinematic lighting, 50mm lens, shallow depth of "
+    "field, high dynamic range, subsurface scattering, film grain, RAW photo, "
+    "fine detail, professional photography"
 )
 comptime NEGATIVE = "low quality, blurry, watermark, jpeg artifacts"
 

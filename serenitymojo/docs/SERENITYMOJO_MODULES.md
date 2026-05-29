@@ -119,6 +119,7 @@ All pointwise (one thread per flat element), F32 math.
 
 ### `ops/attention.mojo` ✅
 - `sdpa[B: Int, S: Int, H: Int, Dh: Int](q, k, v, mask, scale: Float32, ctx) raises -> Tensor` — non-causal full SDPA for diffusion. `q,k,v: [B,S,H,Dh]` BSHD (kv already GQA-expanded to H by caller), `mask: [B,H,S,S]` additive score bias (zeros = full attention), `scale` typically `1/sqrt(Dh)`. Returns `[B,S,H,Dh]`. B/S/H/Dh are **compile-time**. Dispatch `comptime if Dh==64`: SDK `flash_attention` (sm_86-supported, faster) else `_sdpa_math` (gather BSHD→BHSD-contig F32, per-head QKᵀ matmul, `_scale_mask`, `_softmax_rows`, P·V matmul, scatter back). All interior math F32.
+- `sdpa_nomask[B: Int, S: Int, H: Int, Dh: Int](q, k, v, scale, ctx) raises -> Tensor` — same BSHD full-attention contract without materializing `[B,H,S,S]` when the additive mask is known to be all zeros. Uses the math-mode path and `_scale_f32`; verified in `ops_smoke2.mojo` against the all-zero-mask reference.
 
 ### `ops/conv.mojo` ✅
 - `conv2d[N,Hi,Wi,Cin,Kh,Kw,Cout,stride_h,stride_w,pad_h,pad_w](x, weight, bias: Optional[Tensor], ctx) raises -> Tensor` — dilation=1, groups=1. `x: [N,Hi,Wi,Cin]` NHWC, `weight: [Kh,Kw,Cin,Cout]` RSCF, `bias: [Cout]|None`. Shapes are **compile-time** (the SDK kernel needs static layouts). `Ho/Wo` derived. Launches SDK `conv2d_gpu_naive_nhwc_rscf` (device-kernel body) via `enqueue_function` (7 runtime args incl. num_groups), then a `_bias_add_kernel_{dt}`. F32 accum. Grid 3D `(Wo, Ho, N)`, block 2D `(16,16)`.
@@ -163,16 +164,156 @@ Broadcasting elementwise + shape ops. `comptime _MAXRANK = 6`.
   - `load_block(self, prefix, ctx) raises -> Block` — H2D every tensor whose name starts with `prefix` (normalized to a dot boundary: `"layers.1"` loads only layer 1, never `"layers.10."`). Returned block owns its VRAM; full names as keys (no prefix strip); dtype preserved (no BF16 coercion).
 - `unload_block(var block: Block)` — explicit drop (free VRAM); call `unload_block(block^)`.
 
+### `offload/plan.mojo` — metadata-only offload planning ✅ compile-smoke
+Shared planner above `BlockLoader`. It does not load weights or allocate GPU
+memory; it describes block order, branch scheduling, dtype policy, and lookahead.
+- `BlockKind`: transformer, double-stream, single-stream, UNet down/mid/up.
+- `DTypePolicy`: preserve or force BF16.
+- `BranchSchedule`: single or CFG-paired; `branch_count()`.
+- `OffloadConfig`: slot count, lookahead, dtype policy, branch schedule.
+- `BlockRecord`: prefix, kind, tensor/byte count hints.
+- `BlockPlan`: ordered records, normalized prefixes, count, branch visits,
+  lookahead prefetch index, total hint accounting.
+- Builders: `build_klein9b_block_plan`, `build_lance_t2v_block_plan`,
+  `build_hidream_o1_block_plan`, `build_sensenova_u1_block_plan`.
+- `offload/plan_smoke.mojo` verifies Klein 8+24 block order, Lance 36 layers,
+  HiDream 36 language-model layers, SenseNova 42 language-model layers,
+  normalized dot prefixes, and CFG-paired visit counts.
+
+### `offload/planned_loader.mojo` — plan-driven block loader wrapper ✅ compile-smoke
+Runner-facing API over `BlockLoader`; still synchronous mmap/H2D, but the call
+site uses block indices and model plans instead of raw string prefixes.
+- `PlannedOffloadStats`: prefetch calls, load calls, branch visits, blocks seen.
+- `PlannedBlockHandle`: index, logical model prefix, and the resident GPU `Block`;
+  dropping the handle drops the block tensors and frees VRAM.
+- `PlannedBlockLoader.open(dir, plan, config) raises -> PlannedBlockLoader`.
+- `count()`, `block_count()`, `branch_visits()`, `prefetch_index(i)`.
+- `pinned_bytes() -> Int` — returns 0 for the synchronous block-stream backend.
+- `prefetch(i)`, `prefetch_next(i)` — plan-indexed warmup.
+- `await_block(i, ctx) raises -> PlannedBlockHandle` — loads the planned block
+  with preserve/BF16 dtype policy and records stats.
+- `planned_loader_smoke.mojo` verifies the metadata/stats path without opening
+  checkpoints or loading tensors.
+
+### `offload/turbo_slots.mojo` — two-slot turbo backend contract ✅ metadata-smoke
+Metadata-only skeleton for the future packed/pinned/async turbo backend. It
+does not allocate pinned host storage, GPU slots, CUDA events, non-owning tensor
+views, or VMM memory yet.
+- `TurboSlotState`: empty, staging, prepared.
+- `TurboSlotRecord`: slot index, planned block index, byte hints, generation.
+- `TurboSlotHandle`: prepared slot identity plus generation and
+  `has_device_tensors=False` until real slot storage lands.
+- `TurboSlotBackend.from_plan(plan, config)` — computes max slot capacity from
+  `BlockPlan` byte hints, exposes `block_count`, `slot_count`, `pinned_bytes`,
+  `planned_pinned_bytes`, `block_prefix`, `normalized_block_prefix`,
+  `block_tensor_count_hint`, `block_byte_count_hint`, `prefetch_index`,
+  `slot_can_hold`, `async_enabled`, `vmm_enabled`, `prefetch_block`,
+  `await_block`, and stale handle detection.
+- `turbo_slots_smoke.mojo` verifies staging, prepared promotion, non-active
+  slot reuse, prefetch hits, planned pinned bytes, metadata eviction, and stale
+  handle retirement.
+
+---
+
+## runtime/ and registry/ — modular pipeline scaffolding
+
+### `runtime/model_manifest.mojo` — `ModelManifest`, `ModelFamily` ✅ compile-smoke
+Metadata-only records for manifest-driven pipeline wrappers. These do not
+perform model math; they select model family, checkpoint paths, default geometry,
+latent downsample factors, token/sequence profiles, and intended production
+entry points.
+- `ModelFamily` enum-like tag with `text_to_image`, `image_to_image`,
+  `text_to_video`, `video_to_video`, and `audio_generation`.
+- `ModelManifest` fields: `model_id`, `family`, `variant`, checkpoint/tokenizer
+  paths, default width/height/frames, latent channels/downsample factors,
+  image/text/total sequence counts, patch size, and `production_entry`.
+- Default manifests: `zimage_default_manifest`, `klein9b_default_manifest`,
+  `qwen_image_default_manifest`, `qwen_image_edit_default_manifest`,
+  `chroma_default_manifest`, `sd15_default_manifest`,
+  `lance_t2v_default_manifest`, `flux1_dev_default_manifest`,
+  `sdxl_default_manifest`, `sensenova_u1_default_manifest`,
+  `hidream_o1_dev_default_manifest`, `sd3_5_large_default_manifest`,
+  `sd3_5_medium_default_manifest`, `anima_default_manifest`,
+  `lens_default_manifest`, `zimage_l2p_default_manifest`, and
+  `ernie_image_default_manifest`.
+
+### `runtime/execution_config.mojo` — `ExecutionConfig` ✅ compile-smoke
+Shared run knobs for future modular wrappers.
+- `PrecisionMode`: `bf16`, `f16`, `f32`.
+- `OffloadMode`: `resident`, `block_stream`, `turbo_slots`.
+- `ExecutionConfig`: steps, seed, guidance scale, precision, offload mode,
+  artifact root, and whether GPU-heavy validation is allowed.
+- Defaults: `default_smoke_config`, `default_quality_config`.
+
+### `runtime/shape_profile.mojo` — `ShapeProfile` ✅ compile-smoke
+Specialization metadata for bridging runtime requests to concrete comptime
+Mojo entry points. Records width/height/frames, latent H/W/T, token counts,
+channels, and patch size.
+- Initial profiles: `zimage_1024_profile`, `klein9b_1024_profile`,
+  `lance_tiny_video_profile`, `lance_256_9f_profile`.
+
+### `runtime/request.mojo` — `GenerationRequest` ✅ compile-smoke
+User-facing request metadata: model id, family, prompt/negative prompt,
+geometry, steps, seed, guidance, and output path. Helpers:
+`default_t2i_request`, `default_t2v_request`.
+
+### `runtime/production_guard.mojo` — `ProductionGuard` ✅ compile-smoke
+Policy record for whether a path still allows host tensor readback or
+host-built activations. Helpers: `production_gpu_math_guard`, `debug_guard`.
+
+### `runtime/static_dispatch.mojo` — `StaticSpecialization` ✅ compile-smoke
+Finite registry for model families whose hot path needs comptime shape
+selection. Current entries cover SenseNova-U1 and HiDream-O1 smoke plus
+native-size profiles.
+- SenseNova: `SenseNovaU1[4,18]` and `SenseNovaU1[4096,512]`.
+- HiDream: `HiDreamO1Offloaded[20]` and `HiDreamO1Offloaded[4608]`.
+- Helpers: `static_specialization_count`, `static_specialization_at`,
+  `find_static_specialization`.
+
+### `runtime/static_entrypoints.mojo` — `StaticEntrypointContract` ✅ compile-smoke
+Metadata-only wrapper contract over `static_dispatch` for SenseNova/HiDream
+family entry points. It does not import model math or load checkpoints.
+- Records wrapper name, smoke path, planned production path, width/height,
+  image/text/total sequence counts, patch size, pixel-space/no-VAE policy, CFG
+  support, prompt-padding need, and whether HiDream requires common static `S`
+  for CFG.
+- Helpers: `static_entrypoint_count`, `static_entrypoint_at`,
+  `find_static_entrypoint`, `validate_static_entrypoint`,
+  `validate_request_for_static_entrypoint`.
+
+### `runtime/static_entrypoints_smoke.mojo` ✅
+Compile/run gate for the static SenseNova/HiDream entrypoint contracts. It
+validates all registered static entrypoint profiles without executing inference.
+
+### `registry/checkpoints.mojo` — checkpoint metadata checks ✅ compile-smoke
+Path-existence checks via `io/ffi.sys_open`, intentionally metadata-only and
+safe while GPU is busy.
+- `CheckpointStatus`: checked/missing counts and `ok()`.
+- `path_exists(path)`.
+- `validate_manifest_paths(manifest)`.
+- `default_manifest_count`, `default_manifest_at`, `default_manifest_by_id`.
+- `validate_registered_manifest_paths()` — validates all registered manifests,
+  including sidecars for split tokenizers/text encoders.
+
+### `runtime/manifest_smoke.mojo` ✅
+Compile/run gate for the modular runtime scaffold. Verified:
+
+```text
+[manifest] registered paths checked/missing: 166 0
+```
+
 ---
 
 ## tokenizer/
 
 ### `tokenizer/tokenizer.mojo` — `Qwen3Tokenizer` ✅
 Pure-Mojo byte-level BPE for the Qwen3 encoder (replaces the Rust `tokenizers` crate). Parses `tokenizer.json` once via `io/ffi` pread (NOT `Path.read_text`). vocab 151643, 26 special tokens.
-- `struct Qwen3Tokenizer(Movable)` — `__init__(out self, json_path: String) raises` loads vocab/merges/added_tokens.
+- `struct Qwen3Tokenizer(Movable)` — `__init__(out self, json_path: String) raises` loads unified `tokenizer.json`; overloaded `__init__(out self, vocab_json_path, merges_txt_path, added_tokens_json_path) raises` loads split SenseNova-style BPE assets.
   - `encode(self, text: String) raises -> List[Int]` — split specials → per-segment NFC(no-op) → Qwen2-regex pre-tokenize → GPT-2 byte-level expand → greedy BPE (lowest merge rank, lowest-index tie) → vocab ids.
   - `decode(self, ids: List[Int]) raises -> String` — id → byte-level token → bytes → UTF-8 (specials re-expanded).
 - Free helpers `build_byte_to_unicode`, `is_letter/is_digit/is_whitespace` (codepoint-range `\p{L}`/`\p{N}`/`\s` approximations — exact for ASCII + common scripts, flagged for rare scripts).
+- Merge parsing accepts both tokenizer JSON array pairs and string-form merge
+  pairs; split `merges.txt` lines are parsed with the same pair splitter.
 - **Z-Image chat template** (applied by the caller, see pipeline): `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
 
 ---
@@ -184,7 +325,7 @@ Z-Image NextDiT transformer (basic/non-omni). Reference = diffusers `transformer
 - `@fieldwise_init struct NextDiTConfig(Copyable, Movable, ImplicitlyCopyable)` — `dim,n_heads,head_dim,n_layers,n_refiner,cap_feat_dim,norm_eps,rope_theta,t_scale,patch_size,in_channels,adaln_embed_dim,axis0,axis1,axis2`. `@staticmethod zimage()` = (3840, 30, 128, 30, 2, 2560, 1e-5, 256.0, 1000.0, 2, 16, 256, 32, 48, 48).
 - `struct NextDiT[HL: Int, WL: Int, CAPLEN: Int]` — latent H/W + caption length are **compile-time** so the unified sequence length is a constant for the comptime-shaped `sdpa`. Holds `weights: List[ArcPointer[Tensor]]` + `name_to_idx` + `config`.
   - `@staticmethod load(dir, ctx) raises -> NextDiT[HL,WL,CAPLEN]` — all 521 transformer tensors via ShardedSafeTensors + `Tensor.from_view`.
-  - `forward(self, x: Tensor, timestep: Float32, cap_feats: Tensor, ctx) raises -> Tensor` — denoise step. `x: [1,16,HL,WL]` latent, `timestep == current sigma` (DiT applies `t·t_scale=t·1000` internally via `_t_embedder`), `cap_feats: [1,CAPLEN,2560]`. Pipeline: t_embedder → patchify(p=2)+embed → pad-to-mult-32 + x_pad_token → noise_refiner (2 modulated blocks) ; cap_embedder(RMSNorm+Linear)+pad+cap_pad_token → context_refiner (2 unmodulated blocks) ; `concat([x, cap], dim=1)` → 30 main modulated blocks → final_layer (LayerNorm-no-affine · (1+Linear(SiLU(adaln))) → Linear) → take image tokens → unpatchify → velocity. RoPE per-axis interleaved (axes_dims [32,48,48], theta 256). Gates are `tanh`-ed. Full-attention all-zero masks are allocated on device and zeroed with GPU memset.
+  - `forward(self, x: Tensor, timestep: Float32, cap_feats: Tensor, ctx) raises -> Tensor` — denoise step. `x: [1,16,HL,WL]` latent, `timestep == current sigma` (DiT applies `t·t_scale=t·1000` internally via `_t_embedder`), `cap_feats: [1,CAPLEN,2560]`. Pipeline: t_embedder → patchify(p=2)+embed → pad-to-mult-32 + x_pad_token → noise_refiner (2 modulated blocks) ; cap_embedder(RMSNorm+Linear)+pad+cap_pad_token → context_refiner (2 unmodulated blocks) ; `concat([x, cap], dim=1)` → 30 main modulated blocks → final_layer (LayerNorm-no-affine · (1+Linear(SiLU(adaln))) → Linear) → take image tokens → unpatchify → velocity. RoPE per-axis interleaved (axes_dims [32,48,48], theta 256). Gates are `tanh`-ed. Full attention now uses `sdpa_nomask` rather than materializing all-zero additive masks.
   - **Sign boundary:** `forward` returns the raw diffusers transformer output. Do NOT negate inside `NextDiT`; pipeline code must apply diffusers' post-CFG negate before `FlowMatchEulerDiscreteScheduler.step`. See `docs/ZIMAGE_DENOISE_SIGN_CONVENTION.md`.
   - Debug-only: `debug_nr0_mod`, `debug_nr0_attn[S]`, `debug_stage` (parity instrumentation).
 
@@ -200,8 +341,359 @@ FLUX.2 Klein DiT scaffold. Reference = `/home/alex/EriDiffusion/inference-flame/
   - `forward_truncated[N_IMG,N_TXT,S](img_tokens, txt_tokens, timestep, cos, sin, ctx) raises -> Tensor` — expects `img_tokens [1,N_IMG,128]`, `txt_tokens [1,N_TXT,12288]`, `timestep [1]` F32, and interleaved RoPE tables for `S=N_IMG+N_TXT`; returns image-token velocity `[1,N_IMG,128]`. Internals: img/txt projections -> timestep MLP -> shared modulation -> one double-stream block with separate txt/img Q/K RMSNorm -> one single-stream block -> final AdaLN/projection.
   - `forward_full[N_IMG,N_TXT,S](...) raises -> Tensor` — same contract, but runs all 8 double blocks and 24 single blocks.
 - `build_klein_rope_tables[N_IMG,N_TXT,H,DH](ctx, dtype) raises -> Tuple[Tensor, Tensor]` — host-built setup table for Klein interleaved RoPE. Text ids are zero; image ids use `[0,row,col,0]` over a square image-token grid.
-- `struct Klein9BOffloaded(Movable)` — keeps shared weights resident and uses `BlockLoader` to stream `double_blocks.i` / `single_blocks.i` one at a time. `forward_full[...]` matches the all-resident contract and is what cleared the native 1024 OOM in `pipeline/klein9b_pipeline_1024_smoke.mojo`.
+- `struct Klein9BOffloaded(Movable)` — keeps shared weights resident and uses
+  `PlannedBlockLoader` to stream `double_blocks.i` / `single_blocks.i` one at a
+  time from the shared Klein block plan. `forward_full[...]` uses the single
+  branch schedule; `forward_full_cfg[...]` uses the CFG-paired schedule and runs
+  positive/negative branches while each block handle is resident. This is the
+  path that cleared native 1024 OOM in `pipeline/klein9b_pipeline_1024_smoke.mojo`.
 - Smoke entry points: `pipeline/klein9b_dit_smoke.mojo` verified the 25-tensor truncated path (`[1,4,128]`, finite stats); `pipeline/klein9b_dit_full_smoke.mojo` verified all 201 tensors and all 8+24 blocks on the same tiny grid (`[1,4,128]`, finite stats); `pipeline/klein9b_pipeline_1024_smoke.mojo` now draws GPU Gaussian noise in Rust NCHW order, runs one offloaded 9B denoise step, decodes with the Klein VAE, and writes `output/klein9b_first_1024.png`.
+
+### `models/dit/sdxl_contract.mojo` — SDXL metadata contract ✅ header-smoke
+Header-only guard for the cached-embedding SDXL 1024 path. It validates the
+registered SDXL manifest profile, standalone UNet safetensors header
+(`1680` tensors plus representative key shape/dtype checks), standalone SDXL
+LDM VAE header (`250` tensors plus post-quant/mid/up/head checks), and cached
+embedding schema (`context`, `context_uncond`, `y`, `y_uncond`, all BF16).
+The static checkpoint contract requires the UNet/VAE paths to match the
+registered manifest.
+- `validate_sdxl_manifest_contract(manifest) raises`
+- `validate_sdxl_unet_header(unet_path) raises`
+- `validate_sdxl_vae_header(vae_path) raises`
+- `validate_sdxl_cached_embedding_header(emb_path) raises`
+- `validate_sdxl_static_checkpoint_contract(unet_path, vae_path) raises`
+- `validate_sdxl_pipeline_contract(unet_path, vae_path, emb_path) raises`
+- Smoke entry point: `pipeline/sdxl_contract_smoke.mojo` validates UNet/VAE
+  locally and validates the default BF16 cached embedding artifact when present.
+- `pipeline/sdxl_pipeline_contract_smoke.mojo` validates the registered SDXL
+  manifest and schedule; the current local cache validates as BF16
+  `context`, `context_uncond`, `y`, and `y_uncond`.
+- `pipeline/sdxl_pipeline_smoke.mojo` now defaults to a one-step 1024 runtime
+  smoke and writes `output/sdxl_one_step_1024.png` after cached embeddings,
+  UNet forward, VAE decode, and PNG output all run.
+- `pipeline/sdxl_pipeline_full_smoke.mojo` is the long 30-step cached-embedding
+  target. It writes `output/sdxl_30step_1024.png`; the first run completed in
+  `53:38.90` with nonblank 1024 RGB output.
+
+### `models/dit/sd3_contract.mojo` — SD3.5 Large/Medium metadata/schedule contract ✅ header-smoke
+Reusable SD3.5 Large and local "small" Medium 1024 contract helpers. It
+validates the registered `sd3_5_large` and `sd3_5_medium` manifests, local
+checkpoint sidecars, checkpoint tensor counts (`1167` Large, `909` Medium),
+representative MMDiT shape/byte-size anchors, Large geometry (`hidden=2432`,
+`depth=38`, `heads=38`), Medium geometry (`hidden=1536`, `depth=24`,
+`heads=24`, first `13` image blocks with `attn2`), embedded SD3 VAE anchors,
+and the scalar shifted-flow schedule (`28` steps, shift `3.0`, model timestep
+`t*1000`).
+This does not create a `DeviceContext`, import SD3 MMDiT math, or load tensors.
+- `validate_sd3_large_manifest_contract(manifest) raises`
+- `validate_sd3_large_checkpoint_header(manifest) raises`
+- `validate_sd3_large_pipeline_contract(manifest) raises`
+- `validate_sd3_medium_manifest_contract(manifest) raises`
+- `validate_sd3_medium_checkpoint_header(manifest) raises`
+- `validate_sd3_medium_pipeline_contract(manifest) raises`
+- `build_sd3_shifted_schedule(num_steps, shift) raises -> List[Float32]`
+- `sd3_shifted_sigma(index, num_steps, shift) raises -> Float32`
+- `sd3_schedule_delta(index, num_steps, shift) raises -> Float32`
+- Smoke entry points:
+  - `pipeline/sd3_pipeline_contract_smoke.mojo` reports
+    `SD3.5 Large pipeline contract PASS` with manifest paths `10 0`.
+  - `pipeline/sd3_medium_pipeline_contract_smoke.mojo` reports
+    `SD3.5 Medium pipeline contract PASS` with manifest paths `10 0`.
+  - `pipeline/sd3_schedule_smoke.mojo` reports
+    `SD3.5 Large+Medium schedule scalar smoke PASS`.
+  - `pipeline/sd3_vae_smoke.mojo` runs the embedded SD3 VAE decoder from the
+    same checkpoint and writes `output/sd3_vae_noise_1024.png`.
+  - `pipeline/sd3_medium_vae_smoke.mojo` runs the embedded SD3 VAE decoder from
+    the Medium checkpoint and writes `output/sd3_medium_vae_noise_1024.png`.
+
+### `models/dit/sd3_mmdit.mojo` — SD3.5 Large/Medium MMDiT pre/post-block slices ✅ runtime-smoke
+Real-weight resident MMDiT gate for SD3.5 Large and local "small" SD3.5
+Medium around the still-missing joint transformer blocks. It loads BF16 weights
+from the combined checkpoint's `model.diffusion_model.*` namespace, keeps only
+resident tensors, and crops learned `pos_embed` to the centered 64x64 patch grid.
+- `SD3MMDiTPreBlockGate.load_large_default(ctx) raises`
+- `SD3MMDiTPreBlockGate.load_medium_default(ctx) raises`
+- `latent_patch_embed[H,W](latents_nchw, ctx) raises -> Tensor` runs NCHW
+  patchify with patch size `2`, `x_embedder.proj`, and centered learned
+  position embedding over `[1,4096,hidden]`.
+- `timestep_embed(sigma, ctx) raises -> Tensor` applies `sigma*1000` and the
+  SD3 timestep MLP.
+- `pooled_embed(pooled, ctx) raises -> Tensor` runs `y_embedder.mlp`.
+- `conditioning(sigma, pooled, ctx) raises -> Tensor` returns timestep plus
+  pooled projection.
+- `context_embed[CTX](encoder_hidden_states, ctx) raises -> Tensor` runs
+  `context_embedder` over bounded text tokens.
+- `final_layer_tokens(x_tokens, c, ctx) raises -> Tensor` runs final no-affine
+  LayerNorm, final AdaLN modulation, and final linear projection to patch
+  vectors.
+- `final_unpatchify[H,W](patch_tokens, ctx) raises -> Tensor` converts
+  `[1,4096,64]` patch vectors back to `[1,16,128,128]`.
+- Smoke entry point: `pipeline/sd3_mmdit_preblock_smoke.mojo` reports
+  `SD3.5 Large/Medium MMDiT pre/post-block real-weight smoke PASS`.
+
+### `sampling/sd3_flow_match.mojo` — SD3 tensor scheduler ✅ smoke
+Reusable SD3.5 shifted-flow runtime helpers. It wraps the shared SD3 scalar
+schedule and adds the production tensor surface: textbook CFG
+`uncond + scale*(cond - uncond)`, `sigma*1000` model timestep, and
+`latent + velocity*(sigma_next - sigma)` Euler updates.
+- `SD3FlowMatchScheduler.large_default() raises -> SD3FlowMatchScheduler`
+- `SD3FlowMatchScheduler.medium_default() raises -> SD3FlowMatchScheduler`
+- `sd3_cfg(v_cond, v_uncond, guidance_scale, ctx) raises -> Tensor`
+- `sd3_euler_step(latent, velocity, dt, ctx) raises -> Tensor`
+- Smoke entry point: `sampling/sd3_flow_match_smoke.mojo` reports
+  `SD3 FlowMatch tensor smoke PASS`.
+
+### `models/dit/anima_contract.mojo` — Anima metadata contract ✅ header-smoke
+Metadata/header guard for the Anima 2B 1024 image path. It validates static
+shape facts, local Anima/Qwen3/VAE safetensors headers, the cached conditioning
+sidecar, and the Rust cached-context latent oracle. It does not create a
+`DeviceContext`, load model weights to GPU, or run MiniTrainDIT/VAE math.
+- `anima_cfg_scale() -> Float32`
+- `anima_default_conditioning_path() -> String`
+- `anima_default_rust_latent_path() -> String`
+- `anima_sigma(index,num_steps) raises -> Float32`
+- `anima_euler_delta(index,num_steps) raises -> Float32`
+- `build_anima_token_plan(width,height,frames,text_tokens) raises -> AnimaTokenPlan`
+- `validate_anima_local_paths() raises -> Int`
+- `validate_anima_static_contract() raises -> AnimaTokenPlan`
+- `validate_anima_metadata_contract() raises -> AnimaTokenPlan`
+- `validate_anima_conditioning_header(embeddings_path) raises`
+  validates `context_cond` and `context_uncond` as `[1,256,1024]`.
+- `validate_anima_rust_latent_header(latent_path) raises` validates
+  `latent [1,16,1,128,128]` F32.
+- Smoke entry point: `pipeline/anima_contract_smoke.mojo` reports
+  `Anima metadata contract PASS`.
+- Runtime tensor smoke: `pipeline/anima_cached_context_smoke.mojo` loads
+  `context_cond`/`context_uncond` and the Rust latent oracle to GPU tensors,
+  validates full-sidecar CFG and zero-velocity latent Euler, and reports
+  `Anima cached-conditioning tensor smoke PASS`.
+- VAE runtime smoke: `pipeline/anima_vae_latent_smoke.mojo` decodes the Rust
+  latent oracle through the local Wan/Qwen-style VAE and writes
+  `output/anima_vae_from_rust_latent_1024.png`.
+
+### `sampling/anima_sampling.mojo` — Anima linear FlowMatch scheduler ✅ tensor-smoke
+Reusable Anima linear FlowMatch runtime helpers. It wraps the 30-step linear
+sigma schedule, no-scale model timestep convention, textbook CFG, and
+`latent + velocity*(sigma_next - sigma)` Euler updates.
+- `AnimaLinearFlowScheduler.default_30() raises -> AnimaLinearFlowScheduler`
+- `build_anima_sigma_schedule(num_steps) raises -> List[Float32]`
+- `anima_model_timestep_from_sigma(sigma) -> Float32`
+- `anima_cfg(v_cond, v_uncond, guidance_scale, ctx) raises -> Tensor`
+- `anima_euler_step(latent, velocity, dt, ctx) raises -> Tensor`
+
+### `models/dit/flux1_contract.mojo` — FLUX.1-dev metadata contract ✅ header-smoke
+Header-only guard for the FLUX.1-dev 1024 path. It validates the registered
+manifest profile, CLIP-L and T5 tokenizer/header assets, the 780-tensor
+`flux1-dev.safetensors` DiT layout, the 244-tensor FLUX LDM VAE layout, and
+the captured Rust cached-input sidecar when requested. This does not create a
+`DeviceContext` or copy tensors to GPU.
+- `validate_flux1_manifest_contract(manifest) raises`
+- `validate_flux1_text_encoder_headers(text_encoder_root, tokenizer_path) raises`
+- `validate_flux1_dit_header(dit_path) raises`
+- `validate_flux1_vae_header(vae_path) raises`
+- `flux1_default_cached_inputs_path() -> String`
+- `validate_flux1_cached_inputs_header(inputs_path) raises` validates
+  `noise_nchw [1,16,128,128]`, `img_packed [1,4096,64]`,
+  `img_ids [4096,3]`, `txt_ids [512,3]`, `t5_hidden [1,512,4096]`, and
+  `clip_pooled [1,768]` as F32 tensors.
+- `validate_flux1_pipeline_contract(manifest) raises`
+- Smoke entry point: `pipeline/flux1_contract_smoke.mojo` validates the local
+  FLUX.1-dev asset set and reports `FLUX.1-dev pipeline contract PASS`; it also
+  validates `/home/alex/EriDiffusion/inference-flame/output/flux1_inputs.safetensors`
+  when present.
+- `pipeline/flux1_pipeline_smoke.mojo` uses the registered manifest plus the
+  shared `sampling/flux1_dev.mojo` schedule/pack contract before the
+  placeholder-token runtime pipeline wiring.
+- `pipeline/flux1_pipeline_cached_smoke.mojo` consumes captured Rust
+  `img_packed`, `t5_hidden`, and `clip_pooled` tensors, then runs the 20-step
+  FLUX DiT -> VAE -> PNG path through `sdpa_nomask` and writes
+  `output/flux1_cached_inputs.png`.
+
+### `models/dit/ernie_contract.mojo` — ERNIE-Image metadata contract ✅ header-smoke
+Header-only guard for Baidu ERNIE-Image 8B. It validates the registered
+`ernie_image` manifest, the local `/home/alex/models/ERNIE-Image` snapshot,
+2-shard ERNIE DiT headers, Mistral3B text encoder headers, tokenizer/scheduler
+assets, Klein VAE headers, and the fixed-shift FlowMatch schedule. It does not
+create a `DeviceContext` or load model tensors to GPU.
+- `build_ernie_token_plan(width,height,frames,text_tokens) raises -> ErnieTokenPlan`
+- `validate_ernie_manifest_contract(manifest) raises`
+- `validate_ernie_local_paths() raises -> Int`
+- `validate_ernie_static_contract() raises -> ErnieTokenPlan`
+- `validate_ernie_metadata_contract(manifest) raises -> ErnieTokenPlan`
+- Smoke entry point: `pipeline/ernie_contract_smoke.mojo` reports
+  `ERNIE-Image metadata contract PASS` with 13 local paths and headers
+  `409/458/251` for transformer/text/VAE tensors.
+
+### `models/dit/ernie_image.mojo` — ERNIE-Image resident/block0 DiT slices ✅ runtime-smoke
+Runtime slices for ERNIE resident DiT math. It loads real transformer weights
+for the pre-block path and, for the block0 smoke, the first ERNIE DiT layer.
+- `ErnieImageResident.load_default(ctx) raises -> ErnieImageResident`
+- `ErnieImageResident.load_default_block0_smoke(ctx) raises -> ErnieImageResident`
+- `patch_embed_1024(latent_nchw, ctx) raises -> Tensor` maps
+  `[1,128,64,64]` to `[1,4096,4096]`.
+- `time_embed(timestep, ctx) raises -> Tensor` maps `[1]` F32 to `[1,4096]`.
+- `shared_adaln(temb, ctx) raises -> Tensor` maps `[1,4096]` to `[1,24576]`.
+- `project_text(text_embeds, ctx) raises -> Tensor` maps
+  `[1,256,3072]` to `[1,256,4096]`.
+- Resident and block0 weight loads validate expected BF16 dtype/shape.
+- `build_ernie_rope_tables[N_IMG,N_TXT,HEADS,HEAD_DIM](...)` builds the
+  full doubled ERNIE half-split RoPE tables for image-first/text-second
+  sequences.
+- `block0_smoke_forward[S](seq, adaln, rope_cos, rope_sin, ctx) raises -> Tensor`
+  runs layer-0 RMSNorm/AdaLN, QKV, QK RMSNorm, RoPE, SDPA, attention output,
+  residual gates, and GELU-gated MLP on a bounded sequence slice.
+- Smoke entry point: `pipeline/ernie_resident_smoke.mojo` reports
+  `ERNIE-Image resident DiT math smoke PASS`.
+- Smoke entry point: `pipeline/ernie_block0_smoke.mojo` reports
+  `ERNIE-Image block0 real-weight smoke PASS`.
+
+### `models/dit/qwenimage_contract.mojo` — Qwen-Image metadata contract ✅ header-smoke
+Header-only guard for the local Qwen-Image-2512 snapshot. It validates the
+registered `qwen_image` manifest, 9-shard 1933-tensor DiT, 4-shard
+Qwen2.5-VL text encoder, tokenizer/scheduler assets, Qwen image VAE, dynamic
+FlowMatch schedule, `DROP_IDX=34`, and 1024 token geometry. No GPU tensor load.
+- Smoke entry point: `pipeline/qwenimage_contract_smoke.mojo` reports
+  `Qwen-Image metadata contract PASS` with 25 local paths.
+- Runtime entry point: `pipeline/qwenimage_pipeline_smoke.mojo` runs a 512
+  tokenizer -> Qwen2.5-VL -> streamed 60-block DiT paired-CFG -> Qwen VAE ->
+  PNG smoke at `output/qwenimage_first_512.png`.
+
+### `models/dit/qwenimage_dit.mojo` — Qwen-Image DiT ✅ 512 runtime smoke
+Qwen-Image MMDiT with both all-resident and block-streamed load paths.
+- `QwenImageDit.load_shared(dir, ctx)` keeps only non-block tensors resident.
+- `QwenImageDitOffloaded.load(dir, ctx)` uses `build_qwenimage_block_plan()` and
+  `PlannedBlockLoader` over `transformer_blocks.{0..59}`.
+- `forward_cfg[N_IMG,N_TXT,S]` runs positive and negative branches while each
+  streamed block is resident, avoiding duplicate block H2D loads for CFG.
+- `forward_edit_cfg[N_TARGET,N_REF,N_TXT,S]` runs the Qwen-Image-Edit
+  target/reference path with two-region RoPE, per-region modulation, and
+  `ref_timestep=0` zero-cond-t behavior, returning the target prediction slice.
+
+### `models/dit/qwenimage_edit_contract.mojo` — Qwen-Image-Edit metadata contract ✅ header-smoke
+Header-only guard for Qwen-Image-Edit-2511. It validates the 5-shard edit DiT,
+Qwen2.5-VL text encoder, processor tokenizer/template, scheduler, VAE, and
+`zero_cond_t=True` edit geometry with target+reference packed tokens.
+- Smoke entry point: `pipeline/qwenimage_edit_contract_smoke.mojo` reports
+  target/reference/image/text/sequence `4096/4096/8192/1024/9216`.
+- Runtime smoke: `pipeline/qwenimage_edit_synthetic_512_smoke.mojo` runs
+  synthetic target/reference latents through streamed edit DiT paired-CFG and
+  Qwen VAE, writing `output/qwenimage_edit_synth_512.png`.
+
+### `models/dit/chroma_contract.mojo` — Chroma metadata contract ✅ header-smoke
+Header-only guard for Chroma1-HD. It validates the merged single DiT checkpoint,
+2-shard diffusers transformer, 2-shard T5 encoder, tokenizer, scheduler, VAE,
+19 double + 38 single blocks, and distilled-guidance modulation index `344`.
+- Smoke entry point: `pipeline/chroma_contract_smoke.mojo` reports headers
+  `1023/219/244` for DiT/text/VAE tensors.
+
+### `models/dit/chroma_dit.mojo` — Chroma DiT cache/block ✅ staged block runtime smoke
+Runtime slice for Chroma's model-specific `distilled_guidance_layer`. It loads
+the real BF16 Chroma weights, builds the `[1,344,64]` approximator input, runs
+the guidance MLP/residual stack, and builds FLUX/Chroma RoPE tables.
+- `load_default_block0_smoke(ctx)` loads the step-cache weights, input
+  projections, and first double block.
+- `load_default_stage_smoke(ctx)` loads the step-cache weights, input
+  projections, double blocks 0-1, single blocks 0-1, and `proj_out`.
+- `project_image_tokens` / `project_text_tokens` run real input projections.
+- Smoke entry point: `pipeline/chroma_dit_smoke.mojo` reports pooled cache
+  `[1,344,3072]`, RoPE `[288,64]`, then runs two double blocks, the first
+  two single blocks, and final image projection on static `N_IMG=4`, `N_TXT=8`.
+- Remaining Chroma work: full 19+38 denoise loop, attention-mask/CFG wrapper,
+  T5 prompt path, VAE decode, and inpaint/staged pipeline wrappers.
+
+### `models/dit/sd15_contract.mojo` — SD1.5 metadata contract ✅ header-smoke
+Header-only guard for the local Stable Diffusion 1.5 diffusers snapshot. It
+validates CLIP-L, UNet, VAE, tokenizer, scheduler, and the 512 profile
+(`latent [1,4,64,64]`, text `77`, sequence `4173`).
+- Smoke entry point: `pipeline/sd15_contract_smoke.mojo` reports
+  `SD1.5 metadata contract PASS`.
+- Runtime smoke: `pipeline/sd15_vae_smoke.mojo` decodes deterministic latent
+  noise through the real SD1.5 VAE and writes `output/sd15_vae_noise_512.png`.
+
+### `sampling/sd15_euler.mojo` — SD1.5 Euler scheduler ✅ scalar-smoke
+SD1.5 wrapper over the same scaled-linear eps-prediction Euler schedule used by
+the SDXL path, with 512x512 defaults and 30 inference steps.
+- `SD15EulerScheduler(num_steps) raises`
+- `build_sd15_sigmas(num_steps) raises -> List[Float32]`
+- `build_sd15_timesteps(num_steps) raises -> List[Float32]`
+- `sd15_cfg(pred_cond, pred_uncond, scale, ctx) raises -> Tensor`
+- `sd15_euler_step(latent, eps_pred, sigma, sigma_next, ctx) raises -> Tensor`
+- Smoke entry point: `sampling/sd15_euler_smoke.mojo` reports
+  `SD1.5 Euler schedule smoke PASS`.
+
+### `sampling/ernie_sampling.mojo` — ERNIE FlowMatch scheduler ✅ tensor-smoke
+Reusable ERNIE fixed-shift FlowMatch runtime helpers. It wraps the scalar
+`shift=3.0`, 50-step sigma schedule and exposes textbook CFG,
+`sigma * 1000` model timestep mapping, and
+`latent + velocity*(sigma_next - sigma)` Euler updates.
+- `ErnieFlowMatchScheduler.default_50() raises -> ErnieFlowMatchScheduler`
+- `build_ernie_sigma_schedule(num_steps, shift) raises -> List[Float32]`
+- `ernie_cfg(v_cond, v_uncond, guidance_scale, ctx) raises -> Tensor`
+- `ernie_euler_step(latent, velocity, dt, ctx) raises -> Tensor`
+- Smoke entry point: `sampling/ernie_sampling_smoke.mojo` reports
+  `ERNIE FlowMatch scheduler/tensor smoke PASS`.
+
+### `models/dit/zimage_l2p_contract.mojo` — Z-Image L2P metadata contract ✅ header-smoke
+Header/static-shape gate for the VAE-less pixel-space Z-Image-Turbo L2P
+variant. It validates the local merged checkpoint header, the 1024 pixel-space
+patch plan, FlowMatch shifted-sigma schedule, `(1 - sigma) * 1000` model
+timestep mapping, representative DiT/refiner/local-decoder tensor anchors, and
+the mixed BF16/F32-on-disk dtype contract.
+- `validate_zimage_l2p_default_checkpoint_contract() raises`
+- `build_zimage_l2p_sigma_schedule(num_steps, shift) raises -> List[Float32]`
+- `zimage_l2p_sigma(index, num_steps, shift) raises -> Float32`
+- `zimage_l2p_schedule_delta(index, num_steps, shift) raises -> Float32`
+- `validate_zimage_l2p_conditioning_header(embeddings_path, require_uncond)`
+  validates cached sidecars with `cap_feats [1, seq, 2560]` and optional
+  `cap_feats_uncond [1, seq, 2560]`, accepting BF16 or F32 because the Rust CLI
+  casts to BF16 before model forward. The current default fixture validates as
+  BF16 `cap_feats [1,32,2560]` and `cap_feats_uncond [1,8,2560]`.
+- `zimage_l2p_infer_command(embeddings_path, output_path)` returns the Rust
+  handoff command for the current default 1024/30-step/CFG-2.0 path.
+- Smoke entry points:
+  - `pipeline/zimage_l2p_contract_smoke.mojo` validates the checkpoint and
+    validates the default cached-conditioning fixture when present.
+  - `pipeline/zimage_l2p_schedule_smoke.mojo` reports
+    `Z-Image L2P schedule scalar smoke PASS`.
+  - `pipeline/zimage_l2p_pixel_smoke.mojo` runs the full 1024 VAE-less pixel
+    patch path on GPU: `[1,3,1024,1024] <-> [1,4096,768]`, exact after BF16
+    storage.
+
+### `models/dit/zimage_l2p_dit.mojo` — Z-Image L2P DiT pre-block slices ✅ runtime-smoke
+Bounded real-weight gate for the VAE-less L2P DiT before transformer blocks.
+It loads BF16 checkpoint weights from
+`/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors`.
+- `ZImageL2PDiTPreBlockGate.load_default(ctx) raises`
+- `patchify16_pixel[H,W](pixels_nchw, ctx) raises -> Tensor` uses the
+  channel-minor L2P/Z-Image patch ordering.
+- `pixel_embed[H,W](pixels_nchw, ctx) raises -> Tensor` runs
+  `all_x_embedder.16-1`.
+- `timestep_embed(sigma, ctx) raises -> Tensor` applies the L2P
+  `(1-sigma)*1000` timestep convention and `t_embedder.mlp`.
+- `caption_embed[CAP](cap_feats, ctx) raises -> Tensor` runs
+  `cap_embedder.0` RMSNorm and `cap_embedder.1`.
+- `load_default_conditioning_sidecar(ctx) raises -> Tuple[Tensor, Tensor]`
+  loads cached BF16 `cap_feats` and `cap_feats_uncond` from the Rust sidecar.
+- Smoke entry point: `pipeline/zimage_l2p_dit_preblock_smoke.mojo` reports
+  `Z-Image L2P DiT pre-block real-weight smoke PASS`.
+
+### `models/dit/zimage_l2p_local_decoder.mojo` — Z-Image L2P local decoder ✅ runtime-smoke
+Bounded real-weight gate for the VAE-less L2P local decoder head. It loads all
+`local_decoder.*` BF16 tensors from
+`/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors`,
+converts conv weights from OIHW to the shared NHWC conv layout, and runs the
+full 4-stage local decoder at tiny spatial size without claiming the native
+1024 decoder.
+- `ZImageL2PLocalDecoderSmoke.load_default(ctx) raises`
+- `enc1_pool(noisy_pixels_nchw, ctx) raises -> Tensor` runs
+  `enc1.0` + SiLU + L2P-local maxpool.
+- `bottleneck(p4, feat_map, ctx) raises -> Tensor` concatenates patch and
+  feature maps, then runs `bottleneck.0` + SiLU.
+- `full_tiny_forward[H,W](noisy_pixels_nchw, feat_map_nchw, ctx) raises -> Tensor`
+  runs enc1-4, bottleneck, up4-1, dec4-1, and `out_conv`, returning
+  `[1,3,H,W]`.
+- Smoke entry point: `pipeline/zimage_l2p_local_decoder_smoke.mojo` reports
+  `Z-Image L2P local decoder smoke PASS`.
 
 ### `models/text_encoder/qwen3_encoder.mojo` — `Qwen3Encoder`, `Qwen3Config` ✅
 Qwen3 causal-LM text encoder (Z-Image/Klein). Reuses foundation `rms_norm`/`rope_halfsplit`/`sdpa`/`linear`/`swiglu`; adds encoder-local glue (embedding gather, residual `_add`, GQA `_repeat_kv`, host RoPE tables, host causal mask, `_reshape`). RoPE = HALFSPLIT.
@@ -219,10 +711,36 @@ Qwen3 causal-LM text encoder (Z-Image/Klein). Reuses foundation `rms_norm`/`rope
   `qwen_3_8b.safetensors` is Comfy-quantized and needs a dequant path before
   this loader can consume it directly.
 
-### `models/text_encoder/qwen25vl_encoder.mojo` — `Qwen25VLEncoder`, `Qwen25VLConfig` ⏳ (built, unverified)
+### `models/text_encoder/qwen25vl_encoder.mojo` — `Qwen25VLEncoder`, `Qwen25VLConfig` ✅ base 512 runtime smoke / parity pending
 Qwen2.5-VL text-only forward (Qwen-Image text encoder). Mirrors `qwen3_encoder.mojo` exactly except: (1) Q/K/V Linears **have biases** (o_proj bias-free); (2) **no** per-head q_norm/k_norm; (3) config. RoPE half-split (text-only mRoPE collapses to 1D). Dh=128 → `sdpa` math-mode.
 - `@fieldwise_init struct Qwen25VLConfig` — same fields; `@staticmethod qwen_image()` = (3584, 28, 28, 4, 128, 1e-6, 1e6) — GQA n_rep=7.
 - `struct Qwen25VLEncoder` — same shape as `Qwen3Encoder`: `load(dir, config, ctx)`, `encode_layer_states`, `encode(token_ids, extract_layer, ctx)`, `final_norm`, `debug_pre_attn`.
+- Runtime coverage: `pipeline/qwenimage_pipeline_smoke.mojo` exercises this
+  encoder in the base 512 tokenizer -> Qwen2.5-VL -> streamed DiT -> VAE path.
+
+### `models/vae/qwenimage_decoder.mojo` — `QwenImageVaeDecoder` ✅ Qwen/Anima runtime smokes
+Wan2.1/Qwen image VAE decoder for 16-channel image latents. It supports the
+diffusers Qwen-Image key spelling and native Wan2.1 key spelling used by
+Anima's `qwen_image_vae.safetensors`.
+- `QwenImageVaeDecoder[LH,LW].load(dir, ctx)` — diffusers Qwen-Image VAE keys.
+- `QwenImageVaeDecoder[LH,LW].load_wan21_keys(path, ctx)` — native Wan2.1 keys:
+  `conv2`, `decoder.conv1`, `decoder.middle.*`, `decoder.upsamples.*`.
+- `decode(latent_nchw, ctx)` — Qwen-Image image decode.
+- `decode_wan21_keys(latent_nchw, ctx)` — Anima/Wan2.1-key image decode.
+- Smokes: `pipeline/qwenimage_vae_smoke.mojo` writes
+  `output/qwenimage_vae_noise_512.png`; `pipeline/anima_vae_latent_smoke.mojo`
+  writes `output/anima_vae_from_rust_latent_1024.png`.
+
+### `models/vae/ldm_decoder.mojo` — LDM AutoencoderKL decoder ✅ SDXL/SD1.5/SD3/FLUX
+Generic 2D LDM VAE decoder wrapper over the shared decoder kit. It supports
+standalone SDXL/FLUX LDM keys, SD1.5 diffusers legacy attention keys, and SD3's
+embedded `first_stage_model.decoder.*` key prefix without post-quant conv.
+- `load_sdxl_ldm_decoder[LH,LW](path, ctx)`
+- `load_sd15_ldm_decoder[LH,LW](path, ctx)`
+- `load_sd3_embedded_ldm_decoder[LH,LW](path, ctx)`
+- `load_flux1_ldm_decoder[LH,LW](path, ctx)`
+- Smokes: SDXL one-step/full pipeline smokes, `pipeline/sd15_vae_smoke.mojo`,
+  `pipeline/sd3_vae_smoke.mojo`, and FLUX.1 cached-input pipeline smoke.
 
 ### `models/vae/zimage_decoder.mojo` — `ZImageDecoder` ✅ (cos 0.99998)
 Z-Image AutoencoderKL decoder config; wires the 2D kit. Reference = `inference-flame/src/vae/ldm_decoder.rs`. `comptime LATENT_CH=16, CH0=512, CH_UP2=256, CH_UP3=128, SCALING=0.3611, SHIFT=0.1159`.
@@ -255,7 +773,94 @@ NHWC end-to-end (foundation conv2d + group_norm are NHWC-native). `comptime GN_G
 - `upsample_nearest2x_nhwc(x, ctx) raises -> Tensor` — nearest 2× of NHWC `[N,H,W,C]` → `[N,2H,2W,C]`.
 
 ### `models/vae/conv3d.mojo` ⏳ (Wan2.1 3D VAE; NOT on the Z-Image path)
-- `conv3d(x, weight, bias: Optional[Tensor], stride_d, stride_h, stride_w, pad_d, pad_h, pad_w, ctx) raises -> Tensor` — NDHWC input `[N,D,H,W,Cin]`, QRSCF filter `[Q,R,S,Cin,Cout]`, dilation=1, groups=1, **symmetric** padding (pad the temporal axis manually for causal conv). Launches SDK `conv3d_gpu_naive_ndhwc_qrscf` (device-kernel body) + bias-add kernel.
+- `conv3d(x, weight, bias: Optional[Tensor], stride_d, stride_h, stride_w, pad_d, pad_h, pad_w, ctx) raises -> Tensor` — NDHWC input `[N,D,H,W,Cin]`, QRSCF filter `[Q,R,S,Cin,Cout]`, dilation=1, groups=1, **symmetric** padding (pad the temporal axis manually for causal conv). Launches SDK `conv3d_gpu_naive_ndhwc_qrscf` (device-kernel body) + device-resident bias-add kernel.
+
+### `models/vae/wan22_decoder_probe.mojo` ✅ metadata gate
+Wan2.2/Lance VAE checkpoint contract probe. Mmap-opens `/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors` and validates key decoder shapes without loading the checkpoint into VRAM.
+- `main() raises` — checks `conv2`, `decoder.conv1`, middle attention, nested Wan2.2 upsample/time-conv keys, `decoder.head`, and `encoder.conv1.weight`. Passed against the local file: `196` tensors, `2818754672` data bytes.
+- Loader note for the future full decoder: RMS gamma tensors can be `[C,1,1]` or `[C,1,1,1]`; flatten to `[C]` before channel-last `rms_norm`.
+
+### `models/vae/wan22_decoder.mojo` ✅ Lance Wan2.2 image/video VAE slice
+Wan2.2 high-compression VAE decoder for first-frame and tiny cached temporal decode. Weights are read from `/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors`, stored as BF16 on GPU, and Conv3d/Resample-Conv2d filters are pre-permuted at load time.
+- `struct Wan22DecodeCache(Movable)` — causal temporal cache state for conv/time-conv/upsample slots. States are `0=None`, `1=first-chunk repeat sentinel`, `2=past tensor available`.
+- `struct Wan22VaeImageDecoder[LH: Int, LW: Int](Movable)` — latent spatial size is comptime; decodes Lance latent tokens `[LH*LW,48]` to `[1,3,16*LH,16*LW]`, or `[T*LH*LW,48]` to video `[1,3,(T-1)*4+1,16*LH,16*LW]`.
+- `@staticmethod load(path, ctx) raises -> Wan22VaeImageDecoder[LH,LW]` — loads `conv2.*` and `decoder.*` tensors only; skips encoder/top-level encode tensors.
+- `decode_tokens(self, latent_lc: Tensor, ctx) raises -> Tensor` — `latent_lc [LH*LW,48]` F32/BF16 -> first-frame RGB `[1,3,H,W]` in signed `[-1,1]` convention.
+- `decode_video_tokens(self, latent_lc: Tensor, latent_t: Int, ctx) raises -> Tensor` — `latent_lc [T*LH*LW,48]` F32/BF16 -> video RGB `[1,3,(T-1)*4+1,16*LH,16*LW]`. Implements the Wan2.2 first-chunk/subsequent-frame cache loop, `upsample3d.time_conv`, temporal interleave, device zero padding, and generalized `DupUp3D(first_chunk)`.
+- Smokes:
+  - `pipeline/lance_wan22_vae_smoke.mojo` -> `output/lance_wan22_vae_smoke_16.png`, `sha256=b8c066a7efd916dc514099b0f7cc4b33280cdf7666c6faf7a1b98df4171dbd9d`.
+  - `pipeline/lance_t2v_image_smoke.mojo` -> `output/lance_t2v_tiny_first_frame_32.png`, `sha256=127681559ac7df1e986413410eb6ea2203fa9745a58e7a747f06bf156a84aba3`.
+  - `pipeline/lance_wan22_vae_video_smoke.mojo` -> `output/lance_wan22_vae_video_t3_frame0_16.png`, shape `[1,3,9,16,16]`, `sha256=1ccb4d354029495a573190363aa8392cc2bf27c2476fb6d9e30b11f191bd94cc`.
+  - `pipeline/lance_t2v_video_smoke.mojo` -> `output/lance_t2v_tiny_video_t3_frame0_16.png` / `output/lance_t2v_tiny_video_t3_frame8_16.png`, shape `[1,3,9,16,16]`, `sha256=637cd1694007637bbaf1b4eda51edf650562d52c7c12faff0fb0e7cc32c4e24d` / `8cd55d18dfa6784bc8f2089d408043577d373a5cac8b9b9ac46b7fd7c68d520f`.
+
+### `models/lance/lance_t2v.mojo` — Lance 3B Video T2V spine ✅ tiny video
+Streamed Lance T2V transformer slice. It uses `PlannedBlockLoader` over
+`build_lance_t2v_block_plan` for all 36 `language_model.model.layers.{i}`
+blocks, while shared embeddings/projections stay resident in `LanceWeights`.
+- `LanceT2VConfig.lance_3b_video()` — hidden 2048, 36 layers, 16 Q heads,
+  2 KV heads, head dim 128, patch latent dim 48, spatial downsample 16,
+  temporal downsample 4.
+- `build_lance_t2v_input(tok, prompt, latent_t, latent_h, latent_w)` —
+  text-template-false token stream plus latent position metadata.
+- `build_lance_t2v_input_from_text_ids(text_ids, latent_t, latent_h, latent_w)` —
+  lower-level constructor used by CFG/uncond scaffolding.
+- `build_lance_t2v_padded_uncond_input(text_token_count, latent_t, latent_h, latent_w)` —
+  same-static-length empty side for dense CFG smokes.
+- `LanceT2VOffloaded[S].load(dir, ctx)` — resident shared weights plus planned
+  streamed layer loader.
+- `forward_velocity(input, x_t, timestep, max_layers, ctx)` — embeds text/video
+  token stream, inserts latent-token conditioning, builds mRoPE/mask, streams
+  layers, and returns gen-row velocity projected to `[L,48]`.
+- `models/lance/cfg_kv_cache.mojo` — variable-length CFG/KV-cache metadata gate
+  for the production path. `build_lance_t2v_text_drop_cfg_kv_plan(input)` maps
+  the upstream KV-cache contract: cache the conditional text prefix, query the
+  visual split on both branches, and shift text-uncond packed indexes after
+  dropping the text prefix.
+- Pipeline smokes use `sampling/lance_t2v.mojo` for shifted schedule, timestep
+  tensor construction, padded-uncond CFG, GPU-only CFG renorm, and Euler
+  updates. Image/video smokes return from the Lance denoise helper before
+  loading the Wan2.2 VAE.
+
+### `pipeline/lance_t2v_pipeline.mojo` — Lance production-entry contract ✅ compile-smoke
+Validates the current static Lance production profile before dispatching to a
+specialized build target.
+- `LanceT2VRunProfile` — width/height/frames, latent geometry, token count,
+  artifact prefix/suffix, MP4 path, and static target metadata.
+- `validate_lance_t2v_contract(manifest, request, config) -> LanceT2VRunProfile` —
+  checks the manifest/default request shape: `256x256`, 9 decoded frames,
+  `T_lat=3,H_lat=W_lat=16`, `768` latent tokens, CFG scale >= 1, and
+  block-stream/turbo offload.
+- `validate_lance_t2v_artifacts(profile) raises -> Int` — validates the
+  current decoded dense target: 9 PNG frames plus MP4.
+- Static target now points at `pipeline/lance_t2v_256_9f_dense_probe.mojo`,
+  which produced `output/lance_t2v_256_9f_dense.mp4` and frames
+  `output/lance_t2v_256_9f_dense_frame0_256.png` through frame 8.
+
+### `models/dit/hidream_o1.mojo` — HiDream O1 pixel-space DiT ✅ smoke-compile
+Qwen3-VL 8B image DiT path with no VAE. The offloaded runtime uses
+`PlannedBlockLoader` over `build_hidream_o1_block_plan` for 36
+`model.language_model.layers.{i}` blocks and `OffloadConfig.bf16_single()` so
+F32-on-disk layer tensors land on GPU as BF16.
+- `HiDreamO1Config.dev_8b()` — hidden 4096, 36 layers, 32 Q heads, 8 KV heads,
+  head dim 128, patch size 32, output patch dim 3072.
+- `HiDreamO1Offloaded[S].load(dir, config, ctx)` — loads resident shared
+  embeddings/heads as BF16 and wraps the remaining layer stream in a plan.
+- `forward(input_ids, noise_patches, t_pos, h_pos, w_pos, ar_len, timestep, ctx)`
+  — builds mRoPE/mask, streams all layers, final-norms, and projects RGB patch
+  velocity for the full sequence.
+
+### `models/dit/sensenova_u1.mojo` — SenseNova U1 pixel-space DiT ✅ smoke-compile
+SenseNova U1 T2I path with separate prefix-cache and generation passes. The
+offloaded runtime uses `PlannedBlockLoader` over `build_sensenova_u1_block_plan`
+for 42 `language_model.model.layers.{i}` blocks.
+- `SenseNovaU1Config.sensenova_u1_8b()` — hidden 4096, 42 layers, 32 Q heads,
+  8 KV heads, patch size 16 with 2x2 merge, output patch dim 3072.
+- `SenseNovaU1[L_TOKENS,TEXT_LEN].load(dir, ctx)` — loads T2I shared tensors
+  resident and wraps layer streaming in the shared plan API.
+- `forward_und(token_ids, ctx)` — text-prefix pass that streams base weights
+  and builds a per-layer `KvCache`.
+- `forward_gen(image_embeds, text_len, token_h, token_w, cache, ctx)` — image
+  generation pass that streams `_mot_gen` weights and reads the prefix cache.
 
 ---
 
@@ -290,6 +895,69 @@ FLUX.2/Klein flow-matching schedule and per-step tensor glue. References
   - `sigmas()`, `timestep(i)`, `dt(i)`.
   - `step(latents, noise_pred, i, ctx)` — uses `dt(i)` and GPU tensor ops.
 
+### `sampling/flux1_dev.mojo` — FLUX.1-dev schedule/pack contract ✅ scalar-smoke
+Host-side FLUX.1-dev BFL time-shift schedule and packed-latent geometry helpers.
+References `inference-flame/src/sampling/flux1_sampling.rs`.
+- `flux1_mu(image_seq_len) raises -> Float64` — linear BFL mu (`0.5 @ 256`,
+  `1.15 @ 4096`).
+- `build_flux1_sigma_schedule(num_steps, image_seq_len) raises -> List[Float32]`
+  — `num_steps+1` descending timesteps/sigmas with endpoint-preserving time
+  shift.
+- `flux1_euler_dt(current_t, next_t) -> Float32` — update delta for
+  `img = img + dt * pred`.
+- `flux1_packed_spatial_dim(image_dim) raises -> Int` and
+  `flux1_latent_spatial_dim(image_dim) raises -> Int`.
+- `Flux1PackedLatentPlan(width,height,text_tokens)` — latent NCHW size,
+  packed grid, image tokens, packed channels, and total sequence.
+- `Flux1DevScheduler(num_steps,image_seq_len)` — schedule wrapper with
+  `sigmas()`, `timestep(i)`, and `dt(i)`.
+- Smoke entry point: `sampling/flux1_dev_smoke.mojo` reports
+  `FLUX.1-dev schedule/pack smoke PASS`.
+
+### `models/lens/lens_dit_math.mojo` — Microsoft Lens block0 sampled QKV/RoPE ✅ runtime-smoke
+Lens-owned real-weight math gates for the first image-side QKV projection and
+sampled Q/K RoPE. These are sampled CPU-side parity/debug paths, not the
+production Lens DiT runner.
+- Loads existing Lens hidden-state, timestep, and block0 QKV captures.
+- Loads real transformer weights for `img_in`, `img_norm1`, `img_mod`, and
+  `img_attn_qkv` from the local Lens checkpoint.
+- Runs `hs -> img_in -> RMSNorm(img_norm1) -> img_mod(silu(temb)) -> img_qkv`
+  for both CFG rows and sampled image tokens.
+- Smoke entry point: `pipeline/lens_dit_qkv_smoke.mojo` compares 36,864 QKV
+  values against the captured BF16 sidecar and reports
+  `Microsoft Lens block0 QKV smoke PASS`.
+- `pipeline/lens_dit_qk_rope_smoke.mojo` splits sampled image Q/K, applies
+  per-head Q/K RMSNorm plus Lens 3-axis interleaved RoPE, compares 24,576 Q/K
+  values against `block_00_step0_qk_after_rope.safetensors`, and reports
+  `Microsoft Lens block-0 image Q/K RoPE sampled smoke PASS`.
+- `pipeline/lens_dit_text_qk_rope_smoke.mojo` runs the sampled text-stream Q/K
+  RMSNorm plus text-position RoPE path and reports all 12,288 sampled values
+  finite.
+
+### `sampling/lens_flowmatch.mojo` — Microsoft Lens FlowMatch schedule ✅ tensor-smoke
+Port of `inference-flame/src/sampling/lens_flowmatch.rs`: host scalar schedule
+plus the GPU tensor Euler update with the Lens/Diffusers BF16 delta behavior.
+- `lens_image_seq_len(width,height) raises -> Int` — image-token scheduler
+  length only, `(height / 16) * (width / 16)`. Do not use the full text+image
+  DiT sequence.
+- `lens_compute_empirical_mu(image_seq_len,num_steps) raises -> Float64` —
+  Lens/BFL empirical dynamic-shift formula.
+- `build_lens_raw_sigmas(num_steps) raises -> List[Float32]` — exactly `N`
+  values from `linspace(1.0, 1.0 / N, N)`, not an `N+1` schedule.
+- `build_lens_shifted_sigmas(num_steps,image_seq_len) raises -> List[Float32]`
+  — exponential FlowMatch shift.
+- `LensFlowMatchScheduler.for_resolution(width,height,num_steps)` — wraps
+  shifted sigmas and exposes `timestep(i)`, `sigma_next(i)`, and `dt(i)`;
+  final step uses `sigma_next=0.0`.
+- `lens_euler_step(latents, noise_pred, sigma_curr, sigma_next, ctx)` — GPU
+  update preserving the BF16 delta, F32 add, and cast-back contract.
+- `LensFlowMatchScheduler.step(latents, noise_pred, i, ctx)` — scheduler-bound
+  tensor update.
+- Smoke entry point: `sampling/lens_flowmatch_smoke.mojo` reports
+  `Microsoft Lens FlowMatch scalar scheduler PASS`.
+- Tensor smoke: `sampling/lens_flowmatch_tensor_smoke.mojo` reports
+  `Microsoft Lens FlowMatch tensor smoke PASS`.
+
 ### `sampling/sdxl_euler.mojo` — `SDXLEulerScheduler`, SDXL CFG ✅ scalar-smoke
 SDXL EulerDiscreteScheduler scalar setup plus GPU tensor CFG/update helpers.
 References `inference-flame/src/bin/sdxl_infer.rs`.
@@ -303,6 +971,44 @@ References `inference-flame/src/bin/sdxl_infer.rs`.
   - `__init__(num_steps) raises`.
   - `sigmas()`, `timesteps()`, `sigma(i)`, `timestep(i)`, `input_scale(i)`, `initial_noise_sigma()`.
   - `step(latent, eps_pred, i, ctx)` — GPU tensor update.
+
+### `sampling/lance_t2v.mojo` — Lance shifted-flow helpers ✅
+Shared Lance T2V scheduler/CFG glue. References
+`inference-flame/src/models/lance.rs` and
+`/home/alex/Lance/modeling/lance/lance.py::validation_gen_KVcache`.
+- `lance_shifted_t(index, num_steps, shift) raises -> Float32` — shifted
+  decreasing schedule value.
+- `build_lance_timestep_schedule(num_steps, shift) raises -> List[Float32]` —
+  host scalar schedule setup.
+- `lance_timestep_tensor(n, t, ctx) raises -> Tensor` — `[n]` F32 timestep
+  tensor for Lance token rows.
+- `lance_cfg(v_uncond, v_cond, guidance_scale, ctx) raises -> Tensor` —
+  textbook CFG: `uncond + scale*(cond-uncond)`.
+- `lance_cfg_renorm(v_cfg, v_cond, min, max, ctx) raises -> Tensor` — global
+  norm CFG renorm on GPU; no host tensor readback.
+- `lance_denoise_step(x_t, v_pred, dt, ctx) raises -> Tensor` — Lance Euler
+  update `x_next = x_t - dt*v_pred`.
+
+---
+
+## components/
+
+### `components/artifacts.mojo` — shared artifact writers ✅
+Frame PNG extraction for video tensors plus ffmpeg-backed MP4 mux.
+- `save_video_frame_png(video, frame_idx, path, latent_h, latent_w, ctx, value_range)` —
+  slices `[1,3,T,H,W]` to one `[1,3,H,W]` PNG.
+- `save_video_frame_pair_png(video, first_path, last_path, latent_h, latent_w, ctx, value_range)` —
+  saves first and last frames from a video tensor.
+- `video_frame_path(prefix, frame_idx, suffix=".png") -> String` — deterministic
+  frame path construction.
+- `save_video_frame_sequence_png(video, prefix, suffix, latent_h, latent_w, ctx, value_range) -> Int` —
+  saves every frame and returns the number of frames written.
+- `ffmpeg_frame_pattern(prefix, suffix=".png") -> String` — converts the same
+  prefix/suffix scheme to ffmpeg's `%d` image-sequence pattern.
+- `build_ffmpeg_mux_command(prefix, suffix, out_path, fps=8) -> String` —
+  constructs the deterministic H.264/yuv420p mux command.
+- `mux_frame_sequence_mp4(prefix, suffix, out_path, fps=8)` — shells out to
+  `ffmpeg` and raises on nonzero status.
 
 ---
 

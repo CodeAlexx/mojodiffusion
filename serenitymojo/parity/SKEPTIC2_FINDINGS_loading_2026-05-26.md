@@ -8,6 +8,13 @@ checkpoint each `load()` path touches and diffed requested keys against on-disk 
 **CODE-ONLY — GPU wedged. `mojo build` to compile-check only; nothing was run.** Compile-honesty
 re-runs at the bottom.
 
+**2026-05-28 supersession note:** Qwen-Image S2/S4 are no longer live load
+blockers. The base Qwen path now has a 512 runtime smoke using tokenizer ->
+Qwen2.5-VL -> streamed 60-block DiT paired-CFG -> Qwen VAE -> PNG at
+`output/qwenimage_first_512.png`, plus `pipeline/qwenimage_vae_smoke.mojo`.
+Keep any remaining Qwen concerns as parity/quality/perf or edit-path work, not
+as VAE/path load failures. Nucleus is intentionally out of active scope.
+
 Method: for each model I (1) read the `load()` + forward `_w(...)` callsites to enumerate the EXACT
 requested key strings, (2) located the file via the smoke/pipeline path constants, (3) dumped the
 real header, (4) diffed. For absent checkpoints (Nucleus) I inferred reference keys from the
@@ -20,7 +27,7 @@ canonical flame-core Rust (`inference-flame/src/...`) which the port claims to m
 | # | Model / file | Severity | One-line |
 |---|---|---|---|
 | S1 | Nucleus DiT `nucleus_dit.mojo` | **BLOCKER** | requests BARE keys; on-disk + flame-core use `model.` prefix on EVERY key → total load failure |
-| S2 | Qwen-Image VAE `qwenimage_decoder.mojo` | **BLOCKER** (latent) | requests Wan-native keys but docstring says "diffusers"; pipeline points at diffusers `up_blocks` VAE → every key MISSes. Only works against the dedicated pre-remapped `qwen_image_vae.safetensors`, which no pipeline points at. |
+| S2 | Qwen-Image VAE `qwenimage_decoder.mojo` | **SUPERSEDED** | 2026-05-28 base Qwen 512 runtime smoke now proves the streamed DiT + Qwen VAE path; remaining work is parity/quality/edit runtime, not a VAE load blocker. |
 | S3 | SDXL VAE `SDXLLdmDecoder` struct (ldm_decoder.mojo:141-295) | FRAGILE | dead diffusers-keyed decoder still present; would no-op against the real LDM `sdxl_vae.safetensors`. Pipeline uses the correct one (`load_sdxl_ldm_decoder`→`LdmVaeDecoder`), so it is a landmine, not a live bug. |
 | S4 | Qwen-Image / Qwen2.5-VL / SDXL pipeline path constants | FRAGILE | `QWENIMAGE_DIR`/`VAE_DIR`/`TEXT_ENCODER_DIR` point at non-existent `/home/alex/.serenity/models/qwen-image/...`. Keys are right; the path is a placeholder. |
 | S5 | `_load_conv_weight_rscf` docstrings (decoder2d.mojo:78, qwenimage_decoder dtype) | STYLE | docstrings say "re-uploaded as BF16" but code re-uploads `w.dtype()` (F32 for the F32 VAE files). Code correct, doc stale. |
@@ -170,7 +177,7 @@ the known project-wide latent-precision floor, not a loading defect.
 | **Klein 9B DiT** | `klein_dit.mojo` | `flux-2-klein-base-9b.safetensors` (201 t, BF16) | **CLEAN** — all 20 probed keys present (img_in [4096,128], fused qkv [12288,4096], single linear1 [36864,4096]=3·4096+2·12288, norm.scale [128]). BFL-native naming matches. |
 | **Klein VAE** | `klein_decoder.mojo` | `flux2-vae.safetensors` (251 t, F32) | **CLEAN** — diffusers keys (`decoder.up_blocks.N.resnets.M`, `bn.running_var/mean`, `post_quant_conv`, attn `to_q/k/v/to_out.0`) all present F32. Model correctly requires F32 latents (raises otherwise). |
 | **Qwen-Image DiT** | `qwenimage_dit.mojo` | `Qwen-Image-2512/transformer` (1933 t, 60 blocks) | **CLEAN (keys)** — all 38 probed keys present (`transformer_blocks.N.attn.{to_q/k/v,add_{q,k,v}_proj,norm_{q,k},norm_added_{q,k},to_out.0,to_add_out}`, `img/txt_mod.1`, `img/txt_mlp.net.0.proj/net.2`, `time_text_embed.*`, `proj_out`). Path is S4. |
-| **Qwen-Image VAE** | `qwenimage_decoder.mojo` | `qwen_image_vae.safetensors` (Wan) / diffusers VAE | **S2 BLOCKER** — keys match the Wan-native file only; pipeline points at diffusers layout; no remap. |
+| **Qwen-Image VAE** | `qwenimage_decoder.mojo` | Qwen-Image VAE snapshot | **SUPERSEDED 2026-05-28** — base 512 streamed DiT/VAE runtime smoke now runs; keep only parity/quality/edit-runtime concerns. |
 | **Qwen2.5-VL encoder** | `qwen25vl_encoder.mojo` | `Qwen2.5-VL-7B-Instruct` (729 t) | **CLEAN** — `model.layers.*` (NOT `model.language_model.*`), Q/K/V biases present, `model.norm`, `model.embed_tokens`, skips `visual.*`+`lm_head`. Path is S4. |
 | **SDXL UNet** | `sdxl_unet.mojo` | `sdxl_unet_bf16.safetensors` (1680 t, BF16) | **CLEAN** — LDM-native bare keys, 0 missing of 32 probed (`input_blocks.N.M`, `time_embed.0/2`, `label_emb.0.0/0.2`, `in/out/emb_layers`, `transformer_blocks…attn1/2`, `proj_in/out` rank-2 Linear, `out.0/out.2`). RSCF conv-conversion correctly gated on rank-4. |
 | **SDXL CLIP** | `clip_encoder.mojo` | `clip_l.safetensors` (196 t, F16) | **CLEAN** — `text_model.*` (token/position embed, encoder.layers.N self_attn q/k/v/out_proj, mlp.fc1/fc2, layer_norm1/2, final_layer_norm) all present; skips non-`text_model.*`. (text_projection is CLIP-G-only, loaded separately — correct.) Note: SDXL pipeline uses cached embeddings, so encoder not exercised there. |

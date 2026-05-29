@@ -1,5 +1,8 @@
 # Plan: text encoders + VAEs + offloading → Mojo (Z-Image / Klein / Qwen)
 
+Scope update 2026-05-28: Nucleus, Helios, and Stable Cascade/Wuerstchen are out
+of active scope. Older queue notes for those families are historical only.
+
 Status: EXECUTING (2026-05-25). Team split = by-component. GPU FREE.
 **Phase A COMPLETE & GPU-VERIFIED** (orchestrator-run ops_smoke + ops_smoke2): Tensor + ParityHarness + full op layer — linear/rms_norm/layer_norm/group_norm/rope×2/silu/gelu/swiglu/modulate/residual_gate/softmax + SDK sdpa(flash)+conv2d, ALL cos≈1.0 incl rms_norm D=2560/3072/4096. No separate op-skeptic — teams stress ops at real shapes.
 **Phase B LAUNCHED** — 3 team builders dispatched (each then skeptic→bugfix = the 9). Tokenizer (tok-builder-1) running alongside.
@@ -16,12 +19,12 @@ Phase A = ONE build→skeptic→bugfix loop, chunked (Tensor first, then ops). G
 ## FOUNDATION COMPLETION PUSH (2026-05-25, "build as much as we can")
 Beyond A1/A2, the foundation needs (VAE builder flagged the algebra gap — hand-added local glue):
 - **A3 (found-builder-3, ops/tensor_algebra.mojo + ops/layout.mojo)**: elementwise add/sub/mul/div (tensor-tensor broadcast + scalar), reshape/view, transpose/permute, concat(dim), slice/narrow, embedding-gather, patchify/unpatchify, deinterleave. Universal — every model needs it; makes VAE's local vae_ops.mojo glue canonical (reconcile later).
-- **A5 (found-builder-4, ops/moe.mojo)**: top-k router+indices, grouped expert FFN (loop callable linalg.matmul), gated scatter-add. For Nucleus(MoE)/SenseNova(MoT). Refs flame-core ops/{moe_routing,grouped_mm,fused_gated_scatter_add,nucleus_moe}.
+- **A5 (found-builder-4, ops/moe.mojo)**: top-k router+indices, grouped expert FFN (loop callable linalg.matmul), gated scatter-add. Historical Nucleus notes are parked; keep this work only for active MoT/MoE consumers such as SenseNova if parity proves it is needed. Refs flame-core ops/{moe_routing,grouped_mm,fused_gated_scatter_add}.
 - **A4 ✅ DONE & VERIFIED 2026-05-25** (`ops/embeddings.mojo`): timestep_embedding (Z-Image order = COS-first/SIN-second, max_period 10000), t_embedder MLP, build_rope_tables (theta=**256** not 10000, half-split [rows,D/2]). GPU parity all cos≈1.0 incl tables→rope_halfsplit round-trip vs numpy RoPE. No separate skeptic (DiT phase stresses these).
 Each GPU parity-gated vs numpy cos≥0.999.
 
 ## DiT-READINESS (scoped zimage_nextdit.rs 2026-05-25 — 722L, 30 main + 2 noise + 2 context-refiner layers, Qwen3 cap_feat 2560)
-DiT ops: rope×37, linear×21, attn×15, rms_norm×9, **adaLN×10**, swiglu, silu, modulate, layer_norm, patchify/unpatchify, residual. Foundation coverage: ALL covered by A1/A2/A3 + the sdpa-math-mode fix + A4, EXCEPT adaLN & cap_embedder which are COMPOSITIONS (norm+linear-on-t_emb→modulate; rms_norm+linear) = wiring, no new kernel. **Conclusion: after A3 + sdpa-fix + A4 land, the entire Z-Image DiT is pure wiring on the foundation** (Phase 4 = assemble, no new kernels). MoE (A5) covers Nucleus later.
+DiT ops: rope×37, linear×21, attn×15, rms_norm×9, **adaLN×10**, swiglu, silu, modulate, layer_norm, patchify/unpatchify, residual. Foundation coverage: ALL covered by A1/A2/A3 + the sdpa-math-mode fix + A4, EXCEPT adaLN & cap_embedder which are COMPOSITIONS (norm+linear-on-t_emb→modulate; rms_norm+linear) = wiring, no new kernel. **Conclusion: after A3 + sdpa-fix + A4 land, the entire Z-Image DiT is pure wiring on the foundation** (Phase 4 = assemble, no new kernels). Older Nucleus MoE follow-up is parked out of active scope.
 
 ## QWEN-IMAGE WAVE (queued 2026-05-25 — user: "full Qwen now, 6 agents WHEN OTHERS DONE")
 Fire 6 agents when the running lanes (Z-Image dit-builder-1) finish (concurrency throttle). Qwen-Image = full 2nd model, 3 NEW big components on the shared foundation: (1) qwen25vl_encoder (749L Qwen2.5-VL-7B, joint-attn 3584), (2) wan21_vae 3D decoder (≠ Z-Image's 2D ldm), (3) qwenimage_dit (1391L, **60 double-stream MMDiT blocks**, no single blocks). +(4) tokenizer reuse-check (Qwen2 BPE, likely our tokenizer works for Qwen-Image-2512), +(5) scheduler reuse-check (flow-matching), +(6) pipeline glue. Refs: inference-flame/src/models/{qwen25vl_encoder,qwenimage_dit}.rs + src/vae/{qwenimage_decoder,wan21_vae}.rs. Weights: ~/.cache/huggingface/.../Qwen--Qwen-Image-2512. Also /home/alex/modular SDK source.

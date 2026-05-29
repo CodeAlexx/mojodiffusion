@@ -33,7 +33,7 @@ from serenitymojo.models.text_encoder.qwen25vl_encoder import (
     Qwen25VLEncoder,
     Qwen25VLConfig,
 )
-from serenitymojo.models.dit.qwenimage_dit import QwenImageDit
+from serenitymojo.models.dit.qwenimage_dit import QwenImageDitOffloaded
 from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
@@ -51,7 +51,7 @@ from serenitymojo.image.png import save_png, ValueRange
 # Qwen-Image text encoder (Qwen2.5-VL-7B language tower) + DiT + VAE dirs. These
 # are placeholders pointing at the standard diffusers Qwen-Image layout; adjust
 # at run time. The text encoder is the `text_encoder/` subdir of the snapshot.
-comptime QWENIMAGE_DIR = "/home/alex/.serenity/models/qwen-image"
+comptime QWENIMAGE_DIR = "/home/alex/.serenity/models/checkpoints/qwen-image-2512"
 comptime TEXT_ENCODER_DIR = QWENIMAGE_DIR + "/text_encoder"
 comptime TOK_JSON = QWENIMAGE_DIR + "/tokenizer/tokenizer.json"
 comptime DIT_DIR = QWENIMAGE_DIR + "/transformer"
@@ -166,8 +166,8 @@ def initial_latent_packed(ctx: DeviceContext) raises -> Tensor:
 
 
 def denoise(caps: QwenCaps, ctx: DeviceContext) raises -> Tensor:
-    print("[denoise] loading Qwen-Image MMDiT")
-    var model = QwenImageDit.load(DIT_DIR, ctx)
+    print("[denoise] loading Qwen-Image MMDiT (block-streamed)")
+    var model = QwenImageDitOffloaded.load(DIT_DIR, ctx)
     var sched = Scheduler.qwen(STEPS, Float32(N_IMG))
     var sigmas = sched.sigmas()
     print("[denoise]", STEPS, "steps, CFG", CFG, "seed", SEED)
@@ -178,17 +178,19 @@ def denoise(caps: QwenCaps, ctx: DeviceContext) raises -> Tensor:
         var t_sigma = sigmas[i]
         var xb = cast_tensor(x, STDtype.BF16, ctx)
         # cond + uncond forwards (true CFG). DiT returns velocity [1, N_IMG, 64].
+        # Smoke pipeline uses a fixed N_TXT with no padded tokens, so pass
+        # real_txt_len = N_TXT to make the padding mask a no-op (matches the
+        # historical _zeros_mask behavior).
+        var preds = model.forward_cfg[N_IMG, N_TXT, S](
+            xb, caps.pos, caps.neg, t_sigma, N_TXT, FRAME, FH, FW, ctx
+        )
         var pred_pos = cast_tensor(
-            model.forward[N_IMG, N_TXT, S](
-                xb, caps.pos, t_sigma, FRAME, FH, FW, ctx
-            ),
+            preds.pos,
             STDtype.F32,
             ctx,
         )
         var pred_neg = cast_tensor(
-            model.forward[N_IMG, N_TXT, S](
-                xb, caps.neg, t_sigma, FRAME, FH, FW, ctx
-            ),
+            preds.neg,
             STDtype.F32,
             ctx,
         )
@@ -206,6 +208,7 @@ def main() raises:
     print("[vae] unpack + decode")
     # unpatchify [1,N_IMG,64] -> latent NCHW [1,16,LH,LW]
     var latent = unpatchify(tokens, 16, LH, LW, PATCH, ctx)
+    latent = cast_tensor(latent, STDtype.BF16, ctx)
     var vae = QwenImageVaeDecoder[LH, LW].load(VAE_DIR, ctx)
     var img = vae.decode(latent, ctx)  # [1,3,8*LH,8*LW]
     var sh = img.shape()

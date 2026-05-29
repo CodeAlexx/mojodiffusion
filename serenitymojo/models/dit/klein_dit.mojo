@@ -19,10 +19,13 @@ from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import silu, swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa
+from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.embeddings import t_embedder
 from serenitymojo.ops.tensor_algebra import reshape, slice, concat
-from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
+from serenitymojo.offload.block_loader import Block
+from serenitymojo.offload.plan import OffloadConfig, build_klein9b_block_plan
+from serenitymojo.offload.planned_loader import PlannedBlockLoader
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 
 
 @fieldwise_init
@@ -171,19 +174,6 @@ struct Klein9BDiT(Movable):
         var idx = self.name_to_idx[name]
         return self.weights[idx][]
 
-    def _zeros_mask[S: Int](self, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
-        comptime H = 32
-        var n = H * S * S
-        var dev = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
-        ctx.enqueue_memset[DType.uint8](dev, 0)
-        ctx.synchronize()
-        var sh = List[Int]()
-        sh.append(1)
-        sh.append(H)
-        sh.append(S)
-        sh.append(S)
-        return Tensor(dev^, sh^, dtype)
-
     def _ones(self, d: Int, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
         var vals = List[Float32]()
         for _ in range(d):
@@ -244,9 +234,8 @@ struct Klein9BDiT(Movable):
     ) raises -> Tensor:
         var q_roped = rope_interleaved(q, cos, sin, ctx)
         var k_roped = rope_interleaved(k, cos, sin, ctx)
-        var mask = self._zeros_mask[S](q_roped.dtype(), ctx)
-        return sdpa[1, S, 32, 128](
-            q_roped, k_roped, v, mask, Float32(1.0) / sqrt(Float32(128)), ctx
+        return sdpa_nomask[1, S, 32, 128](
+            q_roped, k_roped, v, Float32(1.0) / sqrt(Float32(128)), ctx
         )
 
     def _attn[S: Int](
@@ -579,14 +568,23 @@ def build_klein_rope_tables[
 
 
 @fieldwise_init
+struct KleinCfgPreds(Movable):
+    var pos: Tensor
+    var neg: Tensor
+
+
+@fieldwise_init
 struct Klein9BOffloaded(Movable):
     var shared: Klein9BDiT
-    var loader: BlockLoader
+    var loader: PlannedBlockLoader
 
     @staticmethod
     def load(path: String, ctx: DeviceContext) raises -> Klein9BOffloaded:
         var shared = Klein9BDiT.load_shared(path, ctx)
-        var loader = BlockLoader.open(path)
+        var plan = build_klein9b_block_plan()
+        var loader = PlannedBlockLoader.open(
+            path, plan^, OffloadConfig.synchronous_cfg_paired()
+        )
         return Klein9BOffloaded(shared^, loader^)
 
     def _block_model(self, block: Block) -> Klein9BDiT:
@@ -632,7 +630,7 @@ struct Klein9BOffloaded(Movable):
     def forward_full[
         N_IMG: Int, N_TXT: Int, S: Int
     ](
-        self,
+        mut self,
         img_tokens: Tensor,
         txt_tokens: Tensor,
         timestep: Tensor,
@@ -673,24 +671,25 @@ struct Klein9BOffloaded(Movable):
             ctx,
         )
 
+        self.loader.config = OffloadConfig.synchronous_single()
+        self.loader.prefetch(0)
         for bi in range(cfg.num_double):
-            var prefix = String("double_blocks.") + String(bi)
-            self.loader.prefetch_block(prefix)
-            var block = self.loader.load_block(prefix, ctx)
+            self.loader.prefetch_next(bi)
+            var handle = self.loader.await_block(bi, ctx)
             var x = self._run_double[N_IMG, N_TXT, S](
-                block, prefix, img, txt, img_mod, txt_mod, cos, sin, ctx
+                handle.block, handle.prefix, img, txt, img_mod, txt_mod, cos, sin, ctx
             )
-            unload_block(block^)
             txt = slice(x, 1, 0, N_TXT, ctx)
             img = slice(x, 1, N_TXT, N_IMG, ctx)
 
         var x = concat(1, ctx, txt, img)
         for bi in range(cfg.num_single):
-            var prefix = String("single_blocks.") + String(bi)
-            self.loader.prefetch_block(prefix)
-            var block = self.loader.load_block(prefix, ctx)
-            x = self._run_single[S](block, prefix, x, single_mod, cos, sin, ctx)
-            unload_block(block^)
+            var block_idx = cfg.num_double + bi
+            self.loader.prefetch_next(block_idx)
+            var handle = self.loader.await_block(block_idx, ctx)
+            x = self._run_single[S](
+                handle.block, handle.prefix, x, single_mod, cos, sin, ctx
+            )
 
         var img_out = slice(x, 1, N_TXT, N_IMG, ctx)
         var final_mod = linear(
@@ -705,3 +704,392 @@ struct Klein9BOffloaded(Movable):
         return linear(
             normed, self.shared._w(String("final_layer.linear.weight")), None, ctx
         )
+
+    def forward_full_cfg[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        mut self,
+        img_tokens: Tensor,
+        txt_pos_tokens: Tensor,
+        txt_neg_tokens: Tensor,
+        timestep: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ctx: DeviceContext,
+    ) raises -> KleinCfgPreds:
+        """Run positive and negative CFG branches through each streamed block
+        before unloading it. This keeps the working set identical to
+        forward_full() while roughly halving block H2D traffic for CFG."""
+        comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+        var cfg = self.shared.config
+
+        var img_pos = linear(
+            img_tokens, self.shared._w(String("img_in.weight")), None, ctx
+        )
+        var img_neg = linear(
+            img_tokens, self.shared._w(String("img_in.weight")), None, ctx
+        )
+        var txt_pos = linear(
+            txt_pos_tokens, self.shared._w(String("txt_in.weight")), None, ctx
+        )
+        var txt_neg = linear(
+            txt_neg_tokens, self.shared._w(String("txt_in.weight")), None, ctx
+        )
+        var vec = t_embedder(
+            timestep,
+            cfg.timestep_dim,
+            self.shared._w(String("time_in.in_layer.weight")),
+            None,
+            self.shared._w(String("time_in.out_layer.weight")),
+            None,
+            ctx,
+        )
+        var vec_silu = silu(vec, ctx)
+        var img_mod = linear(
+            vec_silu,
+            self.shared._w(String("double_stream_modulation_img.lin.weight")),
+            None,
+            ctx,
+        )
+        var txt_mod = linear(
+            vec_silu,
+            self.shared._w(String("double_stream_modulation_txt.lin.weight")),
+            None,
+            ctx,
+        )
+        var single_mod = linear(
+            vec_silu,
+            self.shared._w(String("single_stream_modulation.lin.weight")),
+            None,
+            ctx,
+        )
+
+        self.loader.config = OffloadConfig.synchronous_cfg_paired()
+        self.loader.prefetch(0)
+        for bi in range(cfg.num_double):
+            self.loader.prefetch_next(bi)
+            var handle = self.loader.await_block(bi, ctx)
+            var x_pos = self._run_double[N_IMG, N_TXT, S](
+                handle.block,
+                handle.prefix,
+                img_pos,
+                txt_pos,
+                img_mod,
+                txt_mod,
+                cos,
+                sin,
+                ctx,
+            )
+            var x_neg = self._run_double[N_IMG, N_TXT, S](
+                handle.block,
+                handle.prefix,
+                img_neg,
+                txt_neg,
+                img_mod,
+                txt_mod,
+                cos,
+                sin,
+                ctx,
+            )
+            txt_pos = slice(x_pos, 1, 0, N_TXT, ctx)
+            img_pos = slice(x_pos, 1, N_TXT, N_IMG, ctx)
+            txt_neg = slice(x_neg, 1, 0, N_TXT, ctx)
+            img_neg = slice(x_neg, 1, N_TXT, N_IMG, ctx)
+
+        var x_pos = concat(1, ctx, txt_pos, img_pos)
+        var x_neg = concat(1, ctx, txt_neg, img_neg)
+        for bi in range(cfg.num_single):
+            var block_idx = cfg.num_double + bi
+            self.loader.prefetch_next(block_idx)
+            var handle = self.loader.await_block(block_idx, ctx)
+            x_pos = self._run_single[S](
+                handle.block, handle.prefix, x_pos, single_mod, cos, sin, ctx
+            )
+            x_neg = self._run_single[S](
+                handle.block, handle.prefix, x_neg, single_mod, cos, sin, ctx
+            )
+
+        var img_out_pos = slice(x_pos, 1, N_TXT, N_IMG, ctx)
+        var img_out_neg = slice(x_neg, 1, N_TXT, N_IMG, ctx)
+        var final_mod = linear(
+            vec_silu,
+            self.shared._w(String("final_layer.adaLN_modulation.1.weight")),
+            None,
+            ctx,
+        )
+        var shift = self.shared._chunk_last(final_mod, 0, cfg.inner_dim, ctx)
+        var scale = self.shared._chunk_last(final_mod, 1, cfg.inner_dim, ctx)
+        var normed_pos = self.shared._modulate_pre(img_out_pos, shift, scale, ctx)
+        var normed_neg = self.shared._modulate_pre(img_out_neg, shift, scale, ctx)
+        var pred_pos = linear(
+            normed_pos, self.shared._w(String("final_layer.linear.weight")), None, ctx
+        )
+        var pred_neg = linear(
+            normed_neg, self.shared._w(String("final_layer.linear.weight")), None, ctx
+        )
+        return KleinCfgPreds(pred_pos^, pred_neg^)
+
+
+# ── Klein9BOffloadedTurbo ─────────────────────────────────────────────────────
+# Phase 3: async-loader variant of Klein9BOffloaded.
+#
+# Identical API surface, uses TurboPlannedLoader instead of PlannedBlockLoader.
+# The synchronous Klein9BOffloaded is UNCHANGED and remains the default.
+# This struct exists solely for parity testing and future turbo production use.
+#
+# Minimal change: one new import (TurboPlannedLoader) + this struct.
+# Klein's block math is NOT modified; _run_double/_run_single are forwarded
+# from the shared field using the same pattern.
+
+@fieldwise_init
+struct Klein9BOffloadedTurbo(Movable):
+    var shared: Klein9BDiT
+    var loader: TurboPlannedLoader
+
+    @staticmethod
+    def load(path: String, ctx: DeviceContext) raises -> Klein9BOffloadedTurbo:
+        var shared = Klein9BDiT.load_shared(path, ctx)
+        var plan = build_klein9b_block_plan()
+        var loader = TurboPlannedLoader.open(
+            path, plan^, OffloadConfig.synchronous_single(), ctx
+        )
+        return Klein9BOffloadedTurbo(shared^, loader^)
+
+    def _block_model(self, block: Block) -> Klein9BDiT:
+        var weights = self.shared.weights.copy()
+        var name_to_idx = self.shared.name_to_idx.copy()
+        for ref e in block.items():
+            name_to_idx[e.key] = len(weights)
+            weights.append(e.value)
+        return Klein9BDiT(weights^, name_to_idx^, self.shared.config)
+
+    def _run_double[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        self,
+        block: Block,
+        prefix: String,
+        img: Tensor,
+        txt: Tensor,
+        img_mod: Tensor,
+        txt_mod: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var tmp = self._block_model(block)
+        return tmp._double_block[N_IMG, N_TXT, S](
+            prefix, img, txt, img_mod, txt_mod, cos, sin, ctx
+        )
+
+    def _run_single[S: Int](
+        self,
+        block: Block,
+        prefix: String,
+        x: Tensor,
+        single_mod: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var tmp = self._block_model(block)
+        return tmp._single_block[S](prefix, x, single_mod, cos, sin, ctx)
+
+    def forward_full[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        mut self,
+        img_tokens: Tensor,
+        txt_tokens: Tensor,
+        timestep: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+        var cfg = self.shared.config
+        var img = linear(img_tokens, self.shared._w(String("img_in.weight")), None, ctx)
+        var txt = linear(txt_tokens, self.shared._w(String("txt_in.weight")), None, ctx)
+        var vec = t_embedder(
+            timestep,
+            cfg.timestep_dim,
+            self.shared._w(String("time_in.in_layer.weight")),
+            None,
+            self.shared._w(String("time_in.out_layer.weight")),
+            None,
+            ctx,
+        )
+        var vec_silu = silu(vec, ctx)
+        var img_mod = linear(
+            vec_silu,
+            self.shared._w(String("double_stream_modulation_img.lin.weight")),
+            None,
+            ctx,
+        )
+        var txt_mod = linear(
+            vec_silu,
+            self.shared._w(String("double_stream_modulation_txt.lin.weight")),
+            None,
+            ctx,
+        )
+        var single_mod = linear(
+            vec_silu,
+            self.shared._w(String("single_stream_modulation.lin.weight")),
+            None,
+            ctx,
+        )
+
+        self.loader.prefetch(0)
+        for bi in range(cfg.num_double):
+            self.loader.prefetch_next(bi)
+            var handle = self.loader.await_block(bi, ctx)
+            var x = self._run_double[N_IMG, N_TXT, S](
+                handle.block, handle.prefix, img, txt, img_mod, txt_mod, cos, sin, ctx
+            )
+            txt = slice(x, 1, 0, N_TXT, ctx)
+            img = slice(x, 1, N_TXT, N_IMG, ctx)
+
+        var x = concat(1, ctx, txt, img)
+        for bi in range(cfg.num_single):
+            var block_idx = cfg.num_double + bi
+            self.loader.prefetch_next(block_idx)
+            var handle = self.loader.await_block(block_idx, ctx)
+            x = self._run_single[S](
+                handle.block, handle.prefix, x, single_mod, cos, sin, ctx
+            )
+
+        var img_out = slice(x, 1, N_TXT, N_IMG, ctx)
+        var final_mod = linear(
+            vec_silu,
+            self.shared._w(String("final_layer.adaLN_modulation.1.weight")),
+            None,
+            ctx,
+        )
+        var shift = self.shared._chunk_last(final_mod, 0, cfg.inner_dim, ctx)
+        var scale = self.shared._chunk_last(final_mod, 1, cfg.inner_dim, ctx)
+        var normed = self.shared._modulate_pre(img_out, shift, scale, ctx)
+        return linear(
+            normed, self.shared._w(String("final_layer.linear.weight")), None, ctx
+        )
+
+    def forward_full_cfg[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        mut self,
+        img_tokens: Tensor,
+        txt_pos_tokens: Tensor,
+        txt_neg_tokens: Tensor,
+        timestep: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ctx: DeviceContext,
+    ) raises -> KleinCfgPreds:
+        """CFG-paired async forward: identical to Klein9BOffloaded.forward_full_cfg
+        but uses TurboPlannedLoader for async H2D overlap."""
+        comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+        var cfg = self.shared.config
+
+        var img_pos = linear(
+            img_tokens, self.shared._w(String("img_in.weight")), None, ctx
+        )
+        var img_neg = linear(
+            img_tokens, self.shared._w(String("img_in.weight")), None, ctx
+        )
+        var txt_pos = linear(
+            txt_pos_tokens, self.shared._w(String("txt_in.weight")), None, ctx
+        )
+        var txt_neg = linear(
+            txt_neg_tokens, self.shared._w(String("txt_in.weight")), None, ctx
+        )
+        var vec = t_embedder(
+            timestep,
+            cfg.timestep_dim,
+            self.shared._w(String("time_in.in_layer.weight")),
+            None,
+            self.shared._w(String("time_in.out_layer.weight")),
+            None,
+            ctx,
+        )
+        var vec_silu = silu(vec, ctx)
+        var img_mod = linear(
+            vec_silu,
+            self.shared._w(String("double_stream_modulation_img.lin.weight")),
+            None,
+            ctx,
+        )
+        var txt_mod = linear(
+            vec_silu,
+            self.shared._w(String("double_stream_modulation_txt.lin.weight")),
+            None,
+            ctx,
+        )
+        var single_mod = linear(
+            vec_silu,
+            self.shared._w(String("single_stream_modulation.lin.weight")),
+            None,
+            ctx,
+        )
+
+        self.loader.prefetch(0)
+        for bi in range(cfg.num_double):
+            self.loader.prefetch_next(bi)
+            var handle = self.loader.await_block(bi, ctx)
+            var x_pos = self._run_double[N_IMG, N_TXT, S](
+                handle.block,
+                handle.prefix,
+                img_pos,
+                txt_pos,
+                img_mod,
+                txt_mod,
+                cos,
+                sin,
+                ctx,
+            )
+            var x_neg = self._run_double[N_IMG, N_TXT, S](
+                handle.block,
+                handle.prefix,
+                img_neg,
+                txt_neg,
+                img_mod,
+                txt_mod,
+                cos,
+                sin,
+                ctx,
+            )
+            txt_pos = slice(x_pos, 1, 0, N_TXT, ctx)
+            img_pos = slice(x_pos, 1, N_TXT, N_IMG, ctx)
+            txt_neg = slice(x_neg, 1, 0, N_TXT, ctx)
+            img_neg = slice(x_neg, 1, N_TXT, N_IMG, ctx)
+
+        var x_pos = concat(1, ctx, txt_pos, img_pos)
+        var x_neg = concat(1, ctx, txt_neg, img_neg)
+        for bi in range(cfg.num_single):
+            var block_idx = cfg.num_double + bi
+            self.loader.prefetch_next(block_idx)
+            var handle = self.loader.await_block(block_idx, ctx)
+            x_pos = self._run_single[S](
+                handle.block, handle.prefix, x_pos, single_mod, cos, sin, ctx
+            )
+            x_neg = self._run_single[S](
+                handle.block, handle.prefix, x_neg, single_mod, cos, sin, ctx
+            )
+
+        var img_out_pos = slice(x_pos, 1, N_TXT, N_IMG, ctx)
+        var img_out_neg = slice(x_neg, 1, N_TXT, N_IMG, ctx)
+        var final_mod = linear(
+            vec_silu,
+            self.shared._w(String("final_layer.adaLN_modulation.1.weight")),
+            None,
+            ctx,
+        )
+        var shift = self.shared._chunk_last(final_mod, 0, cfg.inner_dim, ctx)
+        var scale = self.shared._chunk_last(final_mod, 1, cfg.inner_dim, ctx)
+        var normed_pos = self.shared._modulate_pre(img_out_pos, shift, scale, ctx)
+        var normed_neg = self.shared._modulate_pre(img_out_neg, shift, scale, ctx)
+        var pred_pos = linear(
+            normed_pos, self.shared._w(String("final_layer.linear.weight")), None, ctx
+        )
+        var pred_neg = linear(
+            normed_neg, self.shared._w(String("final_layer.linear.weight")), None, ctx
+        )
+        return KleinCfgPreds(pred_pos^, pred_neg^)

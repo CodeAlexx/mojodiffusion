@@ -75,7 +75,7 @@ def _bias_add_kernel_f32(
 
 def _bias_add_kernel_bf16(
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     rows: Int,
     cols: Int,
 ):
@@ -86,13 +86,13 @@ def _bias_add_kernel_bf16(
         var v = rebind[Scalar[DType.bfloat16]](o[idx // cols, c]).cast[
             DType.float32
         ]()
-        v += rebind[Scalar[DType.float32]](bias[c])
+        v += rebind[Scalar[DType.bfloat16]](bias[c]).cast[DType.float32]()
         o[idx // cols, c] = rebind[o.element_type](v.cast[DType.bfloat16]())
 
 
 def _bias_add_kernel_f16(
     o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    bias: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     rows: Int,
     cols: Int,
 ):
@@ -103,7 +103,7 @@ def _bias_add_kernel_f16(
         var v = rebind[Scalar[DType.float16]](o[idx // cols, c]).cast[
             DType.float32
         ]()
-        v += rebind[Scalar[DType.float32]](bias[c])
+        v += rebind[Scalar[DType.float16]](bias[c]).cast[DType.float32]()
         o[idx // cols, c] = rebind[o.element_type](v.cast[DType.float16]())
 
 
@@ -236,25 +236,19 @@ def conv3d(
 
     # Optional bias add (per-output-channel, broadcast over N,Do,Ho,Wo).
     if bias:
-        var bvals = bias.value().to_host(ctx)
-        if len(bvals) != cout:
+        if bias.value().dtype() != x.dtype():
+            raise Error("conv3d: bias dtype must match x dtype")
+        if bias.value().numel() != cout:
             raise Error("conv3d: bias length != Cout")
-        var bias_f32_buf = ctx.enqueue_create_buffer[DType.uint8](cout * 4)
-        var bhost = ctx.enqueue_create_host_buffer[DType.uint8](cout * 4)
-        var bp = bhost.unsafe_ptr().bitcast[Float32]()
-        for i in range(cout):
-            bp[i] = bvals[i]
-        ctx.enqueue_copy(dst_buf=bias_f32_buf, src_buf=bhost)
-        ctx.synchronize()
 
         var rows = n * do_ * ho * wo
         var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cout))
         var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cout))
-        var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            bias_f32_buf.unsafe_ptr().bitcast[Float32](), b_rl
-        )
         var grid = (rows * cout + _BLOCK - 1) // _BLOCK
         if dt == DType.float32:
+            var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float32](), b_rl
+            )
             var O2 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
                 out_buf.unsafe_ptr().bitcast[Float32](), o_rl
             )
@@ -262,6 +256,9 @@ def conv3d(
                 O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
             )
         elif dt == DType.bfloat16:
+            var bias_lt = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+            )
             var O2 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
                 out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
             )
@@ -269,6 +266,9 @@ def conv3d(
                 O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
             )
         else:
+            var bias_lt = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float16](), b_rl
+            )
             var O2 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
                 out_buf.unsafe_ptr().bitcast[Float16](), o_rl
             )

@@ -30,7 +30,7 @@
 #   final_layer.linear(+bias) -> velocity [B, N_img, 64].
 #
 # Foundation ops reused: linear (with bias), layer_norm (for modulate_pre affine-
-# free path via ones/zeros), rms_norm, rope_interleaved, sdpa (zero additive mask),
+# free path via ones/zeros), rms_norm, rope_interleaved, sdpa_nomask,
 # gelu (tanh-approx; BFL uses nn.GELU(approximate="tanh")), elementwise.modulate,
 # elementwise.residual_gate, embeddings.t_embedder, tensor_algebra.{slice,reshape,
 # concat,add}. No new foundation op required.
@@ -55,7 +55,7 @@ from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import silu, gelu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa
+from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.embeddings import t_embedder
 from serenitymojo.ops.tensor_algebra import reshape, slice, concat, add
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
@@ -167,20 +167,6 @@ struct Flux1DiT(Movable):
         sh.append(d)
         return Tensor.from_host(vals, sh^, dtype, ctx)
 
-    def _zeros_mask[S: Int](self, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
-        # Full-attention additive mask [1, num_heads, S, S] of zeros.
-        comptime H = 24
-        var n = H * S * S
-        var dev = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
-        ctx.enqueue_memset[DType.uint8](dev, 0)
-        ctx.synchronize()
-        var sh = List[Int]()
-        sh.append(1)
-        sh.append(H)
-        sh.append(S)
-        sh.append(S)
-        return Tensor(dev^, sh^, dtype)
-
     # chunk #idx of `chunk` elements out of last dim, flatten to [chunk] (mod
     # vec is [1, 6*d] or [1, 2*d]/[1, 3*d]; we keep it [chunk] for the per-channel
     # modulate/residual_gate broadcast).
@@ -227,17 +213,12 @@ struct Flux1DiT(Movable):
         v: Tensor,
         cos: Tensor,
         sin: Tensor,
-        mask: Tensor,
         ctx: DeviceContext,
     ) raises -> Tensor:
-        # `mask` is the full-attention zero bias [1,24,S,S], built ONCE in forward
-        # and borrowed here (the Rust reference passes None — a zeros additive mask
-        # is a numeric no-op; sdpa mandates the [B,H,S,S] arg). Borrowing it avoids
-        # the ~1 GiB alloc/memset per attention call (57 blocks x 20 steps).
         var q_roped = rope_interleaved(q, cos, sin, ctx)
         var k_roped = rope_interleaved(k, cos, sin, ctx)
-        return sdpa[1, S, 24, 128](
-            q_roped, k_roped, v, mask, Float32(1.0) / sqrt(Float32(128)), ctx
+        return sdpa_nomask[1, S, 24, 128](
+            q_roped, k_roped, v, Float32(1.0) / sqrt(Float32(128)), ctx
         )
 
     # ── double-stream block ─────────────────────────────────────────────────
@@ -253,7 +234,6 @@ struct Flux1DiT(Movable):
         txt_mod: Tensor,
         cos: Tensor,
         sin: Tensor,
-        mask: Tensor,
         ctx: DeviceContext,
     ) raises -> Tensor:
         # Returns cat([txt_final, img_final]) on the seq axis (txt first), so the
@@ -306,7 +286,7 @@ struct Flux1DiT(Movable):
         var q = concat(1, ctx, txt_q, img_q)
         var k = concat(1, ctx, txt_k, img_k)
         var v = concat(1, ctx, txt_v, img_v)
-        var att = self._attn_rope_only[S](q, k, v, cos, sin, mask, ctx)
+        var att = self._attn_rope_only[S](q, k, v, cos, sin, ctx)
 
         var txt_att = slice(att, 1, 0, N_TXT, ctx)
         var img_att = slice(att, 1, N_TXT, N_IMG, ctx)
@@ -378,7 +358,6 @@ struct Flux1DiT(Movable):
         single_mod: Tensor,
         cos: Tensor,
         sin: Tensor,
-        mask: Tensor,
         ctx: DeviceContext,
     ) raises -> Tensor:
         var d = self.config.inner_dim
@@ -405,7 +384,7 @@ struct Flux1DiT(Movable):
         q = rms_norm(q, weights._w(p + ".norm.query_norm.scale"), 1.0e-6, ctx)
         k = rms_norm(k, weights._w(p + ".norm.key_norm.scale"), 1.0e-6, ctx)
 
-        var att = self._attn_rope_only[S](q, k, v, cos, sin, mask, ctx)
+        var att = self._attn_rope_only[S](q, k, v, cos, sin, ctx)
         var att_shape = List[Int]()
         att_shape.append(1)
         att_shape.append(S)
@@ -633,12 +612,6 @@ struct Flux1Offloaded(Movable):
         # vec = time + guidance + vector.
         var vec = self.shared._embed_vec(timestep, guidance, vector, ctx)
 
-        # Full-attention zero mask [1,24,S,S], built ONCE and borrowed by every
-        # block's attention (Rust passes None; zeros == no-op). Avoids the per-call
-        # ~1 GiB alloc/memset across 57 blocks. q/k after RoPE keep `img`'s dtype,
-        # so build the mask in that dtype to satisfy sdpa's q/mask dtype check.
-        var mask = self.shared._zeros_mask[S](img.dtype(), ctx)
-
         # double blocks: per-block img_mod/txt_mod = silu(vec) -> img_mod.lin / txt_mod.lin.
         for bi in range(cfg.num_double):
             var prefix = String("double_blocks.") + String(bi)
@@ -659,7 +632,7 @@ struct Flux1Offloaded(Movable):
                 ctx,
             )
             var merged = bm._double_block[N_IMG, N_TXT, S](
-                prefix, bm, img, txt, img_mod, txt_mod, cos, sin, mask, ctx
+                prefix, bm, img, txt, img_mod, txt_mod, cos, sin, ctx
             )
             txt = slice(merged, 1, 0, N_TXT, ctx)
             img = slice(merged, 1, N_TXT, N_IMG, ctx)
@@ -679,7 +652,7 @@ struct Flux1Offloaded(Movable):
                 Optional[Tensor](_clone(bm._w(prefix + ".modulation.lin.bias"), ctx)),
                 ctx,
             )
-            x = bm._single_block[S](prefix, bm, x, single_mod, cos, sin, mask, ctx)
+            x = bm._single_block[S](prefix, bm, x, single_mod, cos, sin, ctx)
             unload_block(block^)
 
         # extract image tokens (txt first in the merged seq) and run final layer.

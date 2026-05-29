@@ -18,18 +18,16 @@
 #   - x = x + dt * pred   (direct-velocity Euler, flux2_euler_step form).
 #   - latent x stays F32 across the whole loop; cast to BF16 only to feed the DiT.
 #
-# This file is NON-DESTRUCTIVE: the one-step smokes are untouched. Set
-# NUM_STEPS / the GRID comptimes below to bisect (4 small first, then 1024).
-#
-# To switch to the native 1024 grid: set LH=LW=64, N_IMG=4096, swap
-# Klein9BDiT.load_full -> Klein9BOffloaded.load (see commented block in denoise).
+# This file now defaults to the native 1024 grid. For a fast 64x64 diagnostic,
+# set OUT to the 64 path, N_IMG=16, LH=LW=4, and swap Klein9BOffloaded.load
+# back to Klein9BDiT.load_full.
 
 from std.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.models.dit.klein_dit import Klein9BDiT, Klein9BOffloaded, build_klein_rope_tables
+from serenitymojo.models.dit.klein_dit import Klein9BOffloaded, build_klein_rope_tables
 from serenitymojo.models.vae.klein_decoder import KleinVaeDecoder
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
@@ -46,20 +44,20 @@ from serenitymojo.io.cap_cache import load_tensor_bin
 
 comptime KLEIN9B_PATH = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
 comptime VAE_PATH = "/home/alex/.serenity/models/vaes/flux2-vae.safetensors"
-comptime OUT = "/home/alex/mojodiffusion/output/klein9b_multistep_64.png"
+comptime OUT = "/home/alex/mojodiffusion/output/klein9b_honeycomb_eye_bee_20step_1024.png"
 # Caption embeddings produced by klein9b_encode_smoke.mojo (separate process).
 comptime CAPS_POS = "/home/alex/mojodiffusion/output/klein9b_caps_pos.bin"
 comptime CAPS_NEG = "/home/alex/mojodiffusion/output/klein9b_caps_neg.bin"
 
-# --- Grid (small/64-token by default; flip to 64/64/4096 for native 1024) ---
-comptime N_IMG = 16
+# --- Grid: native 1024x1024 target (64x64 latent token grid) ---
+comptime N_IMG = 4096
 comptime N_TXT = 512
 comptime S = N_IMG + N_TXT
-comptime LH = 4
-comptime LW = 4
+comptime LH = 64
+comptime LW = 64
 
 # --- Sampler knobs ---
-comptime NUM_STEPS = 4
+comptime NUM_STEPS = 20
 comptime CFG = Float32(4.0)
 comptime SEED = UInt64(42)
 
@@ -147,12 +145,9 @@ def tokens_to_packed_nchw(tokens: Tensor, ctx: DeviceContext) raises -> Tensor:
 
 
 def denoise(caps: KleinCaps, ctx: DeviceContext) raises -> Tensor:
-    # Small/64 grid uses the all-on-GPU full DiT. For the native 1024 grid
-    # (LH=LW=64, N_IMG=4096) swap this for:
-    #   var model = Klein9BOffloaded.load(KLEIN9B_PATH, ctx)
-    # The rest of the loop body is grid-agnostic.
-    print("[denoise] loading Klein 9B full DiT")
-    var model = Klein9BDiT.load_full(KLEIN9B_PATH, ctx)
+    # Native 1024 needs block-level weight streaming on a 24 GB card.
+    print("[denoise] loading Klein 9B offloaded DiT")
+    var model = Klein9BOffloaded.load(KLEIN9B_PATH, ctx)
     var rope = build_klein_rope_tables[N_IMG, N_TXT, 32, 128](ctx, STDtype.BF16)
     # build_flux2_sigma_schedule returns NUM_STEPS+1 sigmas (1.0 .. 0.0).
     var sigmas = build_flux2_sigma_schedule(NUM_STEPS, N_IMG)
@@ -161,7 +156,6 @@ def denoise(caps: KleinCaps, ctx: DeviceContext) raises -> Tensor:
     # only to feed the DiT). x is moved/reassigned each step — never reference
     # a previous binding after `x = add(...)`.
     var x = initial_tokens(ctx)
-    _stats("init_tokens", x, ctx)
     for i in range(NUM_STEPS):
         var t_curr = sigmas[i]
         var t_next = sigmas[i + 1]
@@ -177,27 +171,18 @@ def denoise(caps: KleinCaps, ctx: DeviceContext) raises -> Tensor:
         var tsh = List[Int]()
         tsh.append(1)
         var timestep = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)
-        # BF16 view of the F32 latent for this step's two DiT passes.
+        # BF16 view of the F32 latent. The offloaded CFG path streams each
+        # block once, runs positive and negative branches, then unloads it.
         var xb = cast_tensor(x, STDtype.BF16, ctx)
-        var pred_pos = cast_tensor(
-            model.forward_full[N_IMG, N_TXT, S](
-                xb, caps.pos, timestep, rope[0], rope[1], ctx
-            ),
-            STDtype.F32,
-            ctx,
+        var preds = model.forward_full_cfg[N_IMG, N_TXT, S](
+            xb, caps.pos, caps.neg, timestep, rope[0], rope[1], ctx
         )
-        var pred_neg = cast_tensor(
-            model.forward_full[N_IMG, N_TXT, S](
-                xb, caps.neg, timestep, rope[0], rope[1], ctx
-            ),
-            STDtype.F32,
-            ctx,
-        )
+        var pred_pos = cast_tensor(preds.pos, STDtype.F32, ctx)
+        var pred_neg = cast_tensor(preds.neg, STDtype.F32, ctx)
         # CFG: neg + CFG*(pos - neg). NO post-CFG sign flip for Klein.
         var pred = flux2_cfg(pred_pos, pred_neg, CFG, ctx)
         # Direct-velocity Euler: x = x + dt * pred (F32 latent in/out).
         x = add(x, mul_scalar(pred, dt, ctx), ctx)
-        _stats("step " + String(i + 1) + " latent", x, ctx)
     return x^
 
 

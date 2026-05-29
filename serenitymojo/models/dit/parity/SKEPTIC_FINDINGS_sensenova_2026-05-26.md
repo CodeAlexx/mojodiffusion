@@ -11,6 +11,25 @@ vs Rust reference:
 
 Compile honesty: `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/sensenova_u1_gen_smoke.mojo -o /tmp/sks` → **EXIT=0** (clean, real build, no skipped errors).
 
+2026-05-27 update: the original blocker and placeholder-token caveat below are
+superseded by runtime-tested code. `_build_rope_for_positions_hs` was fixed in
+the campaign, `Qwen3Tokenizer` now loads SenseNova's split
+`vocab.json`/`merges.txt`/`added_tokens.json`, and
+`tokenizer/sensenova_tok_check.mojo` passes `4/4`. The real-token 64x64 smoke
+completed:
+
+```text
+[sensenova_u1] cond tokens= 18
+[sensenova_u1] uncond tokens= 9
+[sensenova_u1] saved -> /home/alex/mojodiffusion/output/sensenova_u1_smoke_64.png
+elapsed=5:25.46 user=257.30 sys=13.28 maxrss=35041156KB
+sha256=f52542f2f113ee230254cf8d568b9cc33d47d6c8306a9be3fb241b2b06e46013
+```
+
+The T2I loader also now filters resident shared weights to skip
+`language_model.lm_head` and understanding-side `vision_model.embeddings.*`;
+`sensenova_u1_load_probe.mojo` reports `resident shared tensors=19`.
+
 ---
 
 ## BLOCKER 1 — 3D-RoPE table is built HEAD-MAJOR but the data tensor flattens SEQ-MAJOR (positions scrambled)
@@ -115,8 +134,13 @@ for s in range(seq):
 ### FRAGILE 1 — comptime `[L_TOKENS, TEXT_LEN]` specialization, no production dispatch
 `sensenova_u1.mojo:671-686` parameterizes the whole struct on `(L_TOKENS, TEXT_LEN)`. The builder already flags this ("a production run needs a comptime dispatch enumerating (L_TOKENS, TEXT_LEN) cases like qwen3_encoder's `_sdpa_dispatch`"). For a real 2048² run (L=4096, TEXT_LEN≈variable prompt length) every distinct prompt length needs its own specialization, which is impractical. Note: `_attention_nonsquare` itself is fully runtime-dimensioned (sq/skv are runtime Ints) — the comptime params are currently load-bearing only as a struct tag, so the limitation is organizational, not a perf wall. Recommend: drop the comptime params or wire a dispatch before any non-smoke run. Severity: FRAGILE.
 
-### FRAGILE 2 — smoke uses placeholder tokens; no vocab+merges tokenizer
-`sensenova_u1_gen_smoke.mojo:145-150` (`_placeholder_tokens`) and header note: the Mojo `Qwen3Tokenizer` wants a single `tokenizer.json`, but SenseNova ships `vocab.json`+`merges.txt`+`added_tokens.json` (the Rust binary builds a ByteLevel-BPE in-process, gen.rs:179-235). The smoke exercises wiring only; a real run produces noise without a matching tokenizer + the system/chat-template prompt (`SYSTEM_MESSAGE_FOR_GEN`, the `<think>…</think>\n\n<img>` append, the empty uncond query). Builder flagged it. Severity: FRAGILE (smoke-only; blocks a real run).
+### SUPERSEDED — smoke used placeholder tokens; no vocab+merges tokenizer
+This finding was valid when written, but is fixed now. `Qwen3Tokenizer` has a
+split-file constructor for SenseNova's `vocab.json`+`merges.txt`+
+`added_tokens.json`, `sensenova_tok_check.mojo` passes `4/4`, and the smoke uses
+real non-think T2I cond/uncond queries. Remaining caveat: the smoke omits the
+long `SYSTEM_MESSAGE_FOR_GEN` for speed, so production still needs prompt
+length dispatch/padding and full-system-prompt parity.
 
 ### STYLE 1 — think-mode / autoregressive decode path not ported
 The Rust binary supports `--think` (decode_autoregressive + extend_cache_with_text_tokens, rs:1694-1894) and the mixed-prefix 3D path (forward_mixed_prefix, rs:2018-2193). The Mojo ports only the non-think T2I path. In scope for this review (T2I only), so not a defect — noted so it isn't mistaken for complete coverage.
@@ -130,6 +154,13 @@ The "no decoder / no VAE" claim is confirmed from code (no decoder weights refer
 ---
 
 ## SUMMARY
+
+**Current status after 2026-05-27 update:** original BLOCKER 1 is fixed, and
+the placeholder-token FRAGILE item is fixed. Remaining risk is production shape
+management: prompt-length dispatch/padding for real resolutions and full
+system-prompt parity.
+
+Historical summary from the original review:
 
 **BLOCKERS: 1**
 1. 3D-RoPE table built head-major while the BSHD data tensor flattens seq-major → every q/k token rotated by the wrong position's angle, on all axes, both und and gen paths. Compiles clean (identical element count); silent garbage at runtime. Fix: swap the loop nest in `_build_rope_for_positions_hs` to match `zimage_dit.mojo:547-561`.

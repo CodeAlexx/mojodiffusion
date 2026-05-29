@@ -122,6 +122,20 @@ struct BlockLoader(Movable):
                 block[nm] = ArcPointer(t^)
         return block^
 
+    def load_block_as_bf16(self, prefix: String, ctx: DeviceContext) raises -> Block:
+        """Load every tensor in `prefix` as BF16 device storage, converting
+        F32/F16 safetensors on the host before H2D. Use this for large F32
+        checkpoints where a raw `from_view` would put F32 layer weights on the
+        GPU and blow the memory budget."""
+        var block = Block()
+        var p = self._block_prefix(prefix)
+        for ref nm in self.sharded.names():
+            if nm.startswith(p):
+                var tv = self.sharded.tensor_view(nm)
+                var t = Tensor.from_view_as_bf16(tv, ctx)
+                block[nm] = ArcPointer(t^)
+        return block^
+
 
 # ── unload note ───────────────────────────────────────────────────────────────
 # There is no `unload_block(self, ...)` method: the block is a value the caller

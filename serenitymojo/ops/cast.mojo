@@ -72,6 +72,12 @@ def cast_tensor(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
     var src = x.dtype().to_mojo_dtype()
     var dst = dtype.to_mojo_dtype()
     var n = x.numel()
+    # Guard against zero-element tensors (e.g. N_TXT=0 rope tables).
+    # Allocate a zero-byte buffer and return the empty tensor with the target dtype.
+    if n == 0:
+        var empty_buf = ctx.enqueue_create_buffer[DType.uint8](0)
+        ctx.synchronize()
+        return Tensor(empty_buf^, x.shape(), dtype)
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
@@ -115,6 +121,44 @@ def cast_tensor(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
         )
         ctx.enqueue_function[_f32_to_f16, _f32_to_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif src == DType.bfloat16 and dst == DType.float16:
+        # Route through F32 (no direct BF16->F16 kernel needed)
+        var mid_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+        var mid_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            mid_buf.unsafe_ptr().bitcast[Float32](), mid_rl
+        )
+        ctx.enqueue_function[_bf16_to_f32, _bf16_to_f32](
+            X, M, n, grid_dim=grid, block_dim=_BLOCK
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_f32_to_f16, _f32_to_f16](
+            M, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif src == DType.float16 and dst == DType.bfloat16:
+        # Route through F32
+        var mid_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+        var mid_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            mid_buf.unsafe_ptr().bitcast[Float32](), mid_rl
+        )
+        ctx.enqueue_function[_f16_to_f32, _f16_to_f32](
+            X, M, n, grid_dim=grid, block_dim=_BLOCK
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_f32_to_bf16, _f32_to_bf16](
+            M, O, n, grid_dim=grid, block_dim=_BLOCK
         )
     else:
         raise Error("cast_tensor: unsupported dtype pair")

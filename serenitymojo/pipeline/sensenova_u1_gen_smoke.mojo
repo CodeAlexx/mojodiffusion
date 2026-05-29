@@ -1,23 +1,18 @@
 # pipeline/sensenova_u1_gen_smoke.mojo — SenseNova-U1-8B-MoT T2I glue smoke.
 #
-# COMPILE-ONLY (GPU wedged). Wires the full T2I path end to end:
-#   tokenize* -> forward_und (cond + uncond prefixes -> two KV caches)
+# Wires the full T2I path end to end:
+#   split-file tokenizer -> forward_und (cond + uncond prefixes -> two KV caches)
 #     -> denoise loop { patchify -> extract_feature_gen -> +timestep/noise embed
 #        -> forward_gen(cond) + forward_gen(uncond) -> fm_head -> velocity -> CFG
 #        -> Euler step -> unpatchify } -> denorm -> save_png.
 #
 # Reference: inference-flame/src/bin/sensenova_u1_gen.rs::run_t2i (read line by
-# line). This file is the Mojo glue; it does NOT execute (no GPU).
-#
-# *Tokenizer: the SenseNova-U1 dir ships vocab.json + merges.txt +
-#  added_tokens.json (NO unified tokenizer.json). The Mojo Qwen3Tokenizer takes
-#  a single tokenizer.json, so it CANNOT consume the SenseNova format directly.
-#  FLAGGED in the report. This smoke uses a placeholder token list to exercise
-#  the model wiring; a real run needs a vocab+merges tokenizer loader.
+# line). The smoke omits the very long system instruction block to keep the
+# prefix pass small, but uses the real non-think assistant append.
 #
 # Small resolution (64x64) chosen so the comptime sequence lengths stay small:
 #   patch=16, merge=2 -> grid 4x4 (16 pixel patches), token 2x2 -> L_TOKENS=4.
-#   TEXT_LEN is the placeholder prefix length.
+#   TEXT_LEN is the real smoke conditional query length.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -33,14 +28,19 @@ from serenitymojo.ops.tensor_algebra import (
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.models.dit.sensenova_u1 import (
-    SenseNovaU1, SenseNovaU1Config, KvCache,
+    SenseNovaU1, SenseNovaU1Config,
 )
+from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 
 
 comptime WEIGHTS_DIR = "/home/alex/.serenity/models/sensenova_u1"
+comptime VOCAB_JSON = "/home/alex/.serenity/models/sensenova_u1/vocab.json"
+comptime MERGES_TXT = "/home/alex/.serenity/models/sensenova_u1/merges.txt"
+comptime ADDED_TOKENS_JSON = "/home/alex/.serenity/models/sensenova_u1/added_tokens.json"
 comptime OUTPUT = "/home/alex/mojodiffusion/output/sensenova_u1_smoke_64.png"
+comptime PROMPT = "a photo of a cat"
 
-# Small smoke geometry (compile-only). 64x64 image.
+# Small smoke geometry. 64x64 image.
 comptime WIDTH = 64
 comptime HEIGHT = 64
 comptime PATCH = 16
@@ -50,7 +50,7 @@ comptime GRID_W = WIDTH // PATCH         # 4
 comptime TOKEN_H = GRID_H // MERGE       # 2
 comptime TOKEN_W = GRID_W // MERGE       # 2
 comptime L_TOKENS = TOKEN_H * TOKEN_W    # 4
-comptime TEXT_LEN = 8                    # placeholder prefix length
+comptime TEXT_LEN = 18                   # smoke conditional query token count
 comptime FM_OUT = (PATCH * MERGE) * (PATCH * MERGE) * 3  # 3072
 
 comptime NUM_STEPS = 2
@@ -142,11 +142,32 @@ def _apply_time_schedule(
     return out^
 
 
-def _placeholder_tokens(n: Int) -> List[Int]:
-    # Placeholder token ids (real run needs a vocab+merges tokenizer; flagged).
-    var ids = List[Int]()
-    for i in range(n):
-        ids.append(100 + i)
+def _t2i_query(system: String, user: String, append: String) -> String:
+    # Mirrors inference-flame build_t2i_query. System is optional; this smoke
+    # keeps it empty for speed while preserving user/assistant sentinels.
+    var q = String("")
+    if system.byte_length() > 0:
+        q += "<|im_start|>system\n"
+        q += system
+        q += "<|im_end|>\n"
+    q += "<|im_start|>user\n"
+    q += user
+    q += "<|im_end|>\n<|im_start|>assistant\n"
+    q += append
+    return q^
+
+
+def _tokenize_checked(
+    tok: Qwen3Tokenizer, text: String, name: String, expected_len: Int
+) raises -> List[Int]:
+    var ids = tok.encode(text)
+    print("[sensenova_u1]", name, "tokens=", len(ids))
+    if expected_len >= 0 and len(ids) != expected_len:
+        raise Error(
+            String("sensenova_u1: unexpected token count for ") + name
+            + String(": got ") + String(len(ids))
+            + String(" expected ") + String(expected_len)
+        )
     return ids^
 
 
@@ -157,9 +178,24 @@ def main() raises:
     print("[sensenova_u1] loading model from", WEIGHTS_DIR)
     var model = SenseNovaU1[L_TOKENS, TEXT_LEN].load(WEIGHTS_DIR, ctx)
 
-    # ---- prefix forwards (cond + uncond). Placeholder tokens (see header). ----
-    var cond_ids = _placeholder_tokens(TEXT_LEN)
-    var uncond_ids = _placeholder_tokens(TEXT_LEN)
+    # ---- prefix forwards (cond + uncond) with the real split-file tokenizer. ----
+    var tok = Qwen3Tokenizer(
+        String(VOCAB_JSON), String(MERGES_TXT), String(ADDED_TOKENS_JSON)
+    )
+    var cond_ids = _tokenize_checked(
+        tok,
+        _t2i_query(
+            String(""), String(PROMPT), String("<think>\n\n</think>\n\n<img>")
+        ),
+        String("cond"),
+        TEXT_LEN,
+    )
+    var uncond_ids = _tokenize_checked(
+        tok,
+        _t2i_query(String(""), String(""), String("<img>")),
+        String("uncond"),
+        9,
+    )
     var cond_cache = model.forward_und(cond_ids, ctx)
     var uncond_cache = model.forward_und(uncond_ids, ctx)
     print("[sensenova_u1] prefix forwards done")

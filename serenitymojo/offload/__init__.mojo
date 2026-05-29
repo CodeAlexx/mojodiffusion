@@ -9,3 +9,10 @@
 #   block_loader  — BlockLoader: open(dir), load_block(prefix, ctx) -> Block
 #                   (Dict[String, ArcPointer[Tensor]]), prefetch_block(prefix),
 #                   unload_block(block). Block drop frees the device buffers.
+#   plan          — metadata-only block order, dtype, CFG branch, and lookahead.
+#   planned_loader — BlockPlan-aware wrapper over BlockLoader with handle/stats.
+#   turbo_slots   — metadata-only two-slot backend skeleton; no async/VMM yet.
+#   residency     — Phase 2: BlockState FSM, ResidencyEntry, BudgetTracker,
+#                   ResidencyManager (eviction/prefetch scheduling brain).
+#   turbo_planned_loader — Phase 3: TurboPlannedLoader — plan-aware async
+#                   wrapper exposing the PlannedBlockLoader call surface.

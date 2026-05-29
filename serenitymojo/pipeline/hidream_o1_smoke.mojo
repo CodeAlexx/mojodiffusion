@@ -41,7 +41,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.models.dit.hidream_o1 import (
     HiDreamO1Config,
-    HiDreamO1DiT,
+    HiDreamO1Offloaded,
     build_mrope_positions,
 )
 from serenitymojo.sampling.hidream_o1_scheduler import HiDreamO1Scheduler
@@ -158,7 +158,8 @@ comptime SMOKE_PATCH = 32
 comptime SMOKE_HP = SMOKE_H // SMOKE_PATCH            # 2
 comptime SMOKE_WP = SMOKE_W // SMOKE_PATCH            # 2
 comptime SMOKE_IMAGE_LEN = SMOKE_HP * SMOKE_WP        # 4
-comptime SMOKE_S_TOTAL = 4                            # full seq for the smoke
+comptime SMOKE_S_TOTAL = 20                           # 16 text + 4 image rows
+comptime SMOKE_STEPS = 1                              # tiny proof run
 
 
 # Full denoise loop (DiT forwards + CFG + scheduler steps), isolated in its own
@@ -179,16 +180,27 @@ def denoise(
     var image_len = SMOKE_IMAGE_LEN
 
     # S is fixed at module scope; assert the real seq matches (smoke contract).
+    print(
+        "[hidream_o1] cond text_len=", cond.s_text,
+        " image_len=", image_len,
+        " total=", cond.s_text + image_len,
+        " fixed=", SMOKE_S_TOTAL,
+    )
+    print(
+        "[hidream_o1] uncond text_len=", uncond.s_text,
+        " image_len=", image_len,
+        " total=", uncond.s_text + image_len,
+    )
     if cond.s_text + image_len != SMOKE_S_TOTAL:
         raise Error("hidream_o1 smoke: prompt seq != fixed S_TOTAL")
     if do_cfg and uncond.s_text + image_len != SMOKE_S_TOTAL:
         raise Error("hidream_o1 smoke: uncond seq != fixed S_TOTAL")
 
     # Load the DiT once at the module-level S (never inside the step loop).
-    var dit = HiDreamO1DiT[SMOKE_S_TOTAL].load(
+    var dit = HiDreamO1Offloaded[SMOKE_S_TOTAL].load(
         String("/home/alex/HiDream-O1-Image-Dev-weights"), cfg, ctx
     )
-    var sched = HiDreamO1Scheduler.dev_28step()
+    var sched = HiDreamO1Scheduler.full_n_step(SMOKE_STEPS, Float32(3.0))
     var num_steps = sched.num_inference_steps()
 
     # noise_scale_start: Dev 7.5 (inference.py:33). noise_clip_std: Dev 2.5
@@ -266,9 +278,8 @@ def denoise(
     return z^
 
 
-# End-to-end T2I (compile-only skeleton). Builds the whole path; the GPU work
-# is behind a `False` guard. The real run loads DiT, draws noise, denoises in
-# the separate `denoise()` def, then decodes (unpatchify) + saves here.
+# End-to-end T2I smoke. Loads the offloaded DiT, draws noise, denoises in the
+# separate `denoise()` def, then decodes (unpatchify) + saves here.
 def hidream_o1_t2i_smoke(
     model_dir: String,
     tokenizer_json: String,
@@ -279,15 +290,12 @@ def hidream_o1_t2i_smoke(
     if cfg.head_dim != 128:
         raise Error("hidream_o1: unexpected head_dim")
 
-    # --- compile-only guard: no GPU ---
-    # The body below is the REAL denoise pipeline (DiT forward wired, CFG, per-
-    # step RNG, scheduler step). It is gated behind `if False:` because the GPU
-    # is wedged — `mojo build` typechecks/monomorphizes everything WITHOUT
-    # executing. The EXIT=139 segfault is worked around structurally: the denoise
-    # loop lives in the top-level `denoise()` def and S is a module-level
-    # comptime, so the DiT path and `unpatchify` here reach the instantiator
-    # through separate defs (see the bisection note above).
-    if False:
+    # The EXIT=139 segfault is worked around structurally: the denoise loop
+    # lives in the top-level `denoise()` def and S is a module-level comptime,
+    # so the DiT path and `unpatchify` here reach the instantiator through
+    # separate defs (see the bisection note above).
+    var run_smoke = True
+    if run_smoke:
         var ctx = DeviceContext()
         var tok = Qwen3Tokenizer(tokenizer_json)
         var p = SMOKE_PATCH
@@ -295,6 +303,11 @@ def hidream_o1_t2i_smoke(
         # 64x64 image -> 2x2 patches (L=4) for the smoke. Real run: 1024+ .
         var cond = build_t2i_input(tok, cfg, prompt, SMOKE_HP, SMOKE_WP)
         var uncond = build_t2i_input(tok, cfg, String(" "), SMOKE_HP, SMOKE_WP)
+        var tms_seen = False
+        for i in range(len(cond.text_ids)):
+            if cond.text_ids[i] == cfg.tms_token_id:
+                tms_seen = True
+        print("[hidream_o1] tms token seen=", tms_seen)
 
         # Dev default path uses guidance 0 → single forward (pipeline.rs:416).
         var guidance_scale = Float32(0.0)
@@ -315,8 +328,9 @@ def hidream_o1_t2i_smoke(
         # unpatchify -> [1,3,H,W] in [-1,1]; save (SIGNED -> (v+1)*127.5).
         var img = unpatchify(z, 3, SMOKE_H, SMOKE_W, p, ctx)
         save_png(img, out_png, ctx, ValueRange.SIGNED)
+        print("hidream_o1 smoke saved ->", out_png)
 
-    print("hidream_o1 pipeline skeleton compiled (run gated; GPU wedged)")
+    print("hidream_o1 pipeline smoke complete")
 
 
 def main() raises:

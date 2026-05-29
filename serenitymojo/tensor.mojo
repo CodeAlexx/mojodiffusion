@@ -148,6 +148,88 @@ struct Tensor(Movable):
         ctx.synchronize()
         return Tensor(dev^, tv.shape.copy(), tv.dtype)
 
+    @staticmethod
+    def from_view_raw[
+        mut: Bool, //, origin: Origin[mut=mut]
+    ](tv: TensorView[origin], ctx: DeviceContext) raises -> Tensor:
+        """Build a Tensor by a verbatim H2D byte copy, PRESERVING the on-disk
+        dtype (no compute-dtype validation). Use this for non-compute dtypes
+        such as FP8 (F8_E4M3) where the bytes are loaded raw and later
+        dequantized on the GPU (see ops/fp8.mojo). The result's `dtype()`
+        reports the original STDtype (e.g. F8_E4M3); ops that need a compute
+        dtype must dequantize first."""
+        var nbytes = tv.nbytes()
+        var expect = tv.numel() * tv.dtype.byte_size()
+        if nbytes != expect:
+            raise Error(
+                String("from_view_raw: view nbytes=")
+                + String(nbytes)
+                + " != numel*byte_size="
+                + String(expect)
+            )
+        var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+        var hp = host.unsafe_ptr()
+        for i in range(nbytes):
+            hp[i] = tv.data[i]
+        var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+        ctx.enqueue_copy(dst_buf=dev, src_buf=host)
+        ctx.synchronize()
+        return Tensor(dev^, tv.shape.copy(), tv.dtype)
+
+    @staticmethod
+    def from_view_as_bf16[
+        mut: Bool, //, origin: Origin[mut=mut]
+    ](tv: TensorView[origin], ctx: DeviceContext) raises -> Tensor:
+        """Build a BF16 Tensor from a safetensors view, converting F32/F16 on
+        the host before H2D upload. This is the production loader path for
+        F32-on-disk 8B checkpoints such as HiDream-O1: the transient F32 copy
+        never lives on the GPU."""
+        _ = tv.dtype.to_mojo_dtype()
+        var n = tv.numel()
+        var nbytes_in = tv.nbytes()
+        var expect = n * tv.dtype.byte_size()
+        if nbytes_in != expect:
+            raise Error(
+                String("from_view_as_bf16: view nbytes=")
+                + String(nbytes_in)
+                + " != numel*byte_size="
+                + String(expect)
+            )
+
+        var nbytes_out = n * STDtype.BF16.byte_size()
+        var host_out = ctx.enqueue_create_host_buffer[DType.uint8](nbytes_out)
+        var bp = host_out.unsafe_ptr().bitcast[BFloat16]()
+
+        if tv.dtype == STDtype.BF16:
+            var outp = host_out.unsafe_ptr()
+            for i in range(nbytes_out):
+                outp[i] = tv.data[i]
+        else:
+            # Stage the source bytes in a typed host buffer so Mojo can read
+            # F32/F16 scalars safely before casting to BF16.
+            var host_in = ctx.enqueue_create_host_buffer[DType.uint8](nbytes_in)
+            var hp = host_in.unsafe_ptr()
+            for i in range(nbytes_in):
+                hp[i] = tv.data[i]
+            if tv.dtype == STDtype.F32:
+                var fp = host_in.unsafe_ptr().bitcast[Float32]()
+                for i in range(n):
+                    bp[i] = fp[i].cast[DType.bfloat16]()
+            elif tv.dtype == STDtype.F16:
+                var hp16 = host_in.unsafe_ptr().bitcast[Float16]()
+                for i in range(n):
+                    bp[i] = hp16[i].cast[DType.float32]().cast[DType.bfloat16]()
+            else:
+                raise Error(
+                    String("from_view_as_bf16: unsupported source dtype: ")
+                    + tv.dtype.name()
+                )
+
+        var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes_out)
+        ctx.enqueue_copy(dst_buf=dev, src_buf=host_out)
+        ctx.synchronize()
+        return Tensor(dev^, tv.shape.copy(), STDtype.BF16)
+
     # ── Readback ──────────────────────────────────────────────────────────────
     def to_host(self, ctx: DeviceContext) raises -> List[Float32]:
         """Copy device data back to host as F32 (upcasting from the stored

@@ -340,6 +340,11 @@ struct SDXLLdmDecoder[LH: Int, LW: Int](Movable):
 comptime FLUX_LATENT_CH = 16
 comptime FLUX_SCALING = Float32(0.3611)
 comptime FLUX_SHIFT = Float32(0.1159)
+comptime SD3_LATENT_CH = 16
+comptime SD3_SCALING = Float32(1.5305)
+comptime SD3_SHIFT = Float32(0.0609)
+comptime SD15_SCALING = Float32(0.18215)
+comptime SD15_SHIFT = Float32(0.0)
 
 
 # Load a ResnetBlock from LDM-format keys. Identical to ResnetBlock.load except
@@ -412,6 +417,28 @@ def _load_attn_ldm[
         _load_weight(st, prefix + ".v.bias", ctx),
         _load_attn_proj_ldm(st, prefix + ".proj_out.weight", ctx),
         _load_weight(st, prefix + ".proj_out.bias", ctx),
+    )
+
+
+# SD1.5's diffusers VAE snapshot is almost the same key layout as the modern
+# diffusers decoder kit, except the mid attention projections use the older
+# `query/key/value/proj_attn` spelling instead of `to_q/to_k/to_v/to_out.0`.
+def _load_attn_diffusers_legacy[
+    N: Int, H: Int, W: Int, C: Int
+](
+    st: ShardedSafeTensors, prefix: String, ctx: DeviceContext
+) raises -> AttnBlock[N, H, W, C]:
+    return AttnBlock[N, H, W, C](
+        _load_weight(st, prefix + ".group_norm.weight", ctx),
+        _load_weight(st, prefix + ".group_norm.bias", ctx),
+        _load_weight(st, prefix + ".query.weight", ctx),
+        _load_weight(st, prefix + ".query.bias", ctx),
+        _load_weight(st, prefix + ".key.weight", ctx),
+        _load_weight(st, prefix + ".key.bias", ctx),
+        _load_weight(st, prefix + ".value.weight", ctx),
+        _load_weight(st, prefix + ".value.bias", ctx),
+        _load_weight(st, prefix + ".proj_attn.weight", ctx),
+        _load_weight(st, prefix + ".proj_attn.bias", ctx),
     )
 
 
@@ -554,6 +581,171 @@ struct LdmVaeDecoder[LH: Int, LW: Int, LATENT_CH: Int](Movable):
             _load_weight(st, p + ".conv_out.bias", ctx),
         )
 
+    @staticmethod
+    def load_prefixed_no_pqc(
+        dir_or_file: String,
+        prefix: String,
+        scale: Float32,
+        shift: Float32,
+        ctx: DeviceContext,
+    ) raises -> LdmVaeDecoder[Self.LH, Self.LW, Self.LATENT_CH]:
+        """Load LDM-format decoder keys nested under `prefix`, without post_quant_conv."""
+        var st = ShardedSafeTensors.open(dir_or_file)
+        var d = List[Float32]()
+        d.append(0.0)
+        var ds = List[Int]()
+        ds.append(1)
+        var pqc_w = Tensor.from_host(d.copy(), ds.copy(), STDtype.F32, ctx)
+        var pqc_b = Tensor.from_host(d, ds^, STDtype.F32, ctx)
+        return LdmVaeDecoder[Self.LH, Self.LW, Self.LATENT_CH](
+            scale,
+            shift,
+            False,
+            pqc_w^,
+            pqc_b^,
+            _load_conv_weight_rscf(st, prefix + ".conv_in.weight", ctx),
+            _load_weight(st, prefix + ".conv_in.bias", ctx),
+            _load_resnet_ldm[1, Self.LH, Self.LW, CH0, CH0](
+                st, prefix + ".mid.block_1", ctx
+            ),
+            _load_attn_ldm[1, Self.LH, Self.LW, CH0](
+                st, prefix + ".mid.attn_1", ctx
+            ),
+            _load_resnet_ldm[1, Self.LH, Self.LW, CH0, CH0](
+                st, prefix + ".mid.block_2", ctx
+            ),
+            _load_resnet_ldm[1, Self.LH, Self.LW, CH0, CH0](
+                st, prefix + ".up.3.block.0", ctx
+            ),
+            _load_resnet_ldm[1, Self.LH, Self.LW, CH0, CH0](
+                st, prefix + ".up.3.block.1", ctx
+            ),
+            _load_resnet_ldm[1, Self.LH, Self.LW, CH0, CH0](
+                st, prefix + ".up.3.block.2", ctx
+            ),
+            Upsample[1, Self.LH, Self.LW, CH0].load(
+                st, prefix + ".up.3.upsample", ctx
+            ),
+            _load_resnet_ldm[1, 2 * Self.LH, 2 * Self.LW, CH0, CH0](
+                st, prefix + ".up.2.block.0", ctx
+            ),
+            _load_resnet_ldm[1, 2 * Self.LH, 2 * Self.LW, CH0, CH0](
+                st, prefix + ".up.2.block.1", ctx
+            ),
+            _load_resnet_ldm[1, 2 * Self.LH, 2 * Self.LW, CH0, CH0](
+                st, prefix + ".up.2.block.2", ctx
+            ),
+            Upsample[1, 2 * Self.LH, 2 * Self.LW, CH0].load(
+                st, prefix + ".up.2.upsample", ctx
+            ),
+            _load_resnet_ldm[1, 4 * Self.LH, 4 * Self.LW, CH0, CH_UP2](
+                st, prefix + ".up.1.block.0", ctx
+            ),
+            _load_resnet_ldm[1, 4 * Self.LH, 4 * Self.LW, CH_UP2, CH_UP2](
+                st, prefix + ".up.1.block.1", ctx
+            ),
+            _load_resnet_ldm[1, 4 * Self.LH, 4 * Self.LW, CH_UP2, CH_UP2](
+                st, prefix + ".up.1.block.2", ctx
+            ),
+            Upsample[1, 4 * Self.LH, 4 * Self.LW, CH_UP2].load(
+                st, prefix + ".up.1.upsample", ctx
+            ),
+            _load_resnet_ldm[1, 8 * Self.LH, 8 * Self.LW, CH_UP2, CH_UP3](
+                st, prefix + ".up.0.block.0", ctx
+            ),
+            _load_resnet_ldm[1, 8 * Self.LH, 8 * Self.LW, CH_UP3, CH_UP3](
+                st, prefix + ".up.0.block.1", ctx
+            ),
+            _load_resnet_ldm[1, 8 * Self.LH, 8 * Self.LW, CH_UP3, CH_UP3](
+                st, prefix + ".up.0.block.2", ctx
+            ),
+            _load_weight(st, prefix + ".norm_out.weight", ctx),
+            _load_weight(st, prefix + ".norm_out.bias", ctx),
+            _load_conv_weight_rscf(st, prefix + ".conv_out.weight", ctx),
+            _load_weight(st, prefix + ".conv_out.bias", ctx),
+        )
+
+    @staticmethod
+    def load_sd15_diffusers(
+        dir_or_file: String, ctx: DeviceContext
+    ) raises -> LdmVaeDecoder[Self.LH, Self.LW, Self.LATENT_CH]:
+        """Load the SD1.5 diffusers VAE snapshot.
+
+        This keeps the modern diffusers processing order (`up_blocks.0..3`)
+        but handles the legacy mid-attention names used by the local SD1.5
+        checkpoint. It is intentionally separate from the LDM/BFL loader above,
+        whose key layout is `decoder.mid.block_1`, `decoder.up.3`, etc.
+        """
+        var st = ShardedSafeTensors.open(dir_or_file)
+        var p = String("decoder")
+        return LdmVaeDecoder[Self.LH, Self.LW, Self.LATENT_CH](
+            SD15_SCALING,
+            SD15_SHIFT,
+            True,
+            _load_conv_weight_rscf(st, String("post_quant_conv.weight"), ctx),
+            _load_weight(st, String("post_quant_conv.bias"), ctx),
+            _load_conv_weight_rscf(st, p + ".conv_in.weight", ctx),
+            _load_weight(st, p + ".conv_in.bias", ctx),
+            ResnetBlock[1, Self.LH, Self.LW, CH0, CH0].load(
+                st, p + ".mid_block.resnets.0", ctx
+            ),
+            _load_attn_diffusers_legacy[1, Self.LH, Self.LW, CH0](
+                st, p + ".mid_block.attentions.0", ctx
+            ),
+            ResnetBlock[1, Self.LH, Self.LW, CH0, CH0].load(
+                st, p + ".mid_block.resnets.1", ctx
+            ),
+            ResnetBlock[1, Self.LH, Self.LW, CH0, CH0].load(
+                st, p + ".up_blocks.0.resnets.0", ctx
+            ),
+            ResnetBlock[1, Self.LH, Self.LW, CH0, CH0].load(
+                st, p + ".up_blocks.0.resnets.1", ctx
+            ),
+            ResnetBlock[1, Self.LH, Self.LW, CH0, CH0].load(
+                st, p + ".up_blocks.0.resnets.2", ctx
+            ),
+            Upsample[1, Self.LH, Self.LW, CH0].load(
+                st, p + ".up_blocks.0.upsamplers.0", ctx
+            ),
+            ResnetBlock[1, 2 * Self.LH, 2 * Self.LW, CH0, CH0].load(
+                st, p + ".up_blocks.1.resnets.0", ctx
+            ),
+            ResnetBlock[1, 2 * Self.LH, 2 * Self.LW, CH0, CH0].load(
+                st, p + ".up_blocks.1.resnets.1", ctx
+            ),
+            ResnetBlock[1, 2 * Self.LH, 2 * Self.LW, CH0, CH0].load(
+                st, p + ".up_blocks.1.resnets.2", ctx
+            ),
+            Upsample[1, 2 * Self.LH, 2 * Self.LW, CH0].load(
+                st, p + ".up_blocks.1.upsamplers.0", ctx
+            ),
+            ResnetBlock[1, 4 * Self.LH, 4 * Self.LW, CH0, CH_UP2].load(
+                st, p + ".up_blocks.2.resnets.0", ctx
+            ),
+            ResnetBlock[1, 4 * Self.LH, 4 * Self.LW, CH_UP2, CH_UP2].load(
+                st, p + ".up_blocks.2.resnets.1", ctx
+            ),
+            ResnetBlock[1, 4 * Self.LH, 4 * Self.LW, CH_UP2, CH_UP2].load(
+                st, p + ".up_blocks.2.resnets.2", ctx
+            ),
+            Upsample[1, 4 * Self.LH, 4 * Self.LW, CH_UP2].load(
+                st, p + ".up_blocks.2.upsamplers.0", ctx
+            ),
+            ResnetBlock[1, 8 * Self.LH, 8 * Self.LW, CH_UP2, CH_UP3].load(
+                st, p + ".up_blocks.3.resnets.0", ctx
+            ),
+            ResnetBlock[1, 8 * Self.LH, 8 * Self.LW, CH_UP3, CH_UP3].load(
+                st, p + ".up_blocks.3.resnets.1", ctx
+            ),
+            ResnetBlock[1, 8 * Self.LH, 8 * Self.LW, CH_UP3, CH_UP3].load(
+                st, p + ".up_blocks.3.resnets.2", ctx
+            ),
+            _load_weight(st, p + ".conv_norm_out.weight", ctx),
+            _load_weight(st, p + ".conv_norm_out.bias", ctx),
+            _load_conv_weight_rscf(st, p + ".conv_out.weight", ctx),
+            _load_weight(st, p + ".conv_out.bias", ctx),
+        )
+
     def decode(self, latent_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
         """latent NCHW [1,LATENT_CH,Self.LH,Self.LW] -> image NCHW [1,3,8*Self.LH,8*Self.LW].
         """
@@ -627,4 +819,25 @@ def load_sdxl_ldm_decoder[
 ](dir_or_file: String, ctx: DeviceContext) raises -> LdmVaeDecoder[LH, LW, LATENT_CH]:
     return LdmVaeDecoder[LH, LW, LATENT_CH].load(
         dir_or_file, SDXL_SCALING, SDXL_SHIFT, True, ctx
+    )
+
+
+# SD1.5: latent_ch 4, scale 0.18215, shift 0.0, WITH post_quant_conv.
+def load_sd15_ldm_decoder[
+    LH: Int, LW: Int
+](dir_or_file: String, ctx: DeviceContext) raises -> LdmVaeDecoder[LH, LW, LATENT_CH]:
+    return LdmVaeDecoder[LH, LW, LATENT_CH].load_sd15_diffusers(dir_or_file, ctx)
+
+
+# SD3.5 checkpoints: latent_ch 16, scale 1.5305, shift 0.0609, embedded
+# decoder keys, NO post_quant_conv in the local Large/Medium checkpoints.
+def load_sd3_embedded_ldm_decoder[
+    LH: Int, LW: Int
+](dir_or_file: String, ctx: DeviceContext) raises -> LdmVaeDecoder[LH, LW, SD3_LATENT_CH]:
+    return LdmVaeDecoder[LH, LW, SD3_LATENT_CH].load_prefixed_no_pqc(
+        dir_or_file,
+        String("first_stage_model.decoder"),
+        SD3_SCALING,
+        SD3_SHIFT,
+        ctx,
     )

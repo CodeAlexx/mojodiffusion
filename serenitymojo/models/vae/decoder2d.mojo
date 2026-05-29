@@ -50,6 +50,7 @@ from serenitymojo.ops.norm import group_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.attention import sdpa
+from serenitymojo.ops.tensor_algebra import permute
 from serenitymojo.models.vae.vae_ops import clone, add, reshape
 from serenitymojo.models.vae.upsample import upsample_nearest2x_nhwc
 
@@ -108,63 +109,31 @@ def _load_conv_weight_rscf(
     return Tensor.from_host(rscf, rshape^, w.dtype(), ctx)
 
 
-# ── NCHW <-> NHWC host permute (entry/exit only) ──────────────────────────────
+# ── NCHW <-> NHWC GPU permute (entry/exit only) ───────────────────────────────
 
 
 def nchw_to_nhwc(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var sh = x.shape()
     if len(sh) != 4:
         raise Error("nchw_to_nhwc: need rank-4")
-    var n = sh[0]
-    var c = sh[1]
-    var h = sh[2]
-    var w = sh[3]
-    var host = x.to_host(ctx)
-    var out = List[Float32]()
-    var total = n * h * w * c
-    for _ in range(total):
-        out.append(0.0)
-    for ni in range(n):
-        for ci in range(c):
-            for hi in range(h):
-                for wi in range(w):
-                    var src = ((ni * c + ci) * h + hi) * w + wi
-                    var dst = ((ni * h + hi) * w + wi) * c + ci
-                    out[dst] = host[src]
-    var os = List[Int]()
-    os.append(n)
-    os.append(h)
-    os.append(w)
-    os.append(c)
-    return Tensor.from_host(out, os^, x.dtype(), ctx)
+    var p = List[Int]()
+    p.append(0)
+    p.append(2)
+    p.append(3)
+    p.append(1)
+    return permute(x, p^, ctx)
 
 
 def nhwc_to_nchw(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var sh = x.shape()
     if len(sh) != 4:
         raise Error("nhwc_to_nchw: need rank-4")
-    var n = sh[0]
-    var h = sh[1]
-    var w = sh[2]
-    var c = sh[3]
-    var host = x.to_host(ctx)
-    var out = List[Float32]()
-    var total = n * c * h * w
-    for _ in range(total):
-        out.append(0.0)
-    for ni in range(n):
-        for hi in range(h):
-            for wi in range(w):
-                for ci in range(c):
-                    var src = ((ni * h + hi) * w + wi) * c + ci
-                    var dst = ((ni * c + ci) * h + hi) * w + wi
-                    out[dst] = host[src]
-    var os = List[Int]()
-    os.append(n)
-    os.append(c)
-    os.append(h)
-    os.append(w)
-    return Tensor.from_host(out, os^, x.dtype(), ctx)
+    var p = List[Int]()
+    p.append(0)
+    p.append(3)
+    p.append(1)
+    p.append(2)
+    return permute(x, p^, ctx)
 
 
 # ── ResnetBlock (ldm_decoder.rs ResBlock, NHWC) ───────────────────────────────

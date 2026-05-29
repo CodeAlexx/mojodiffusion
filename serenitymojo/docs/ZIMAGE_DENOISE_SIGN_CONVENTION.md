@@ -39,8 +39,8 @@ captures happen before `noise_pred = -noise_pred`.
     dumps.
   - Uses the same full float32 sigma constants.
 - `STATUS_ZIMAGE_DENOISE_DIVERGENCE.md`
-  - Updated from "unresolved precision/radial-bias" to "likely resolved, GPU
-    verify pending".
+  - Updated from "unresolved precision/radial-bias" to resolved after the
+    CPU proof and 1024x1024 GPU pipeline verification.
 
 ## CPU-Only Proof From Existing Dumps
 
@@ -120,4 +120,3 @@ For AOT compile checks without running the GPU-heavy path, pass libm explicitly:
 pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/zimage_pipeline.mojo -o /tmp/mojo_zimage_pipeline_check
 pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/parity/parity_denoise.mojo -o /tmp/mojo_parity_denoise_check
 ```
-

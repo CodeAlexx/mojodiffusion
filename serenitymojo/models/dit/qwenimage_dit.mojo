@@ -77,6 +77,9 @@ from serenitymojo.ops.tensor_algebra import (
     mul,
     add_scalar,
 )
+from serenitymojo.offload.block_loader import Block
+from serenitymojo.offload.planned_loader import PlannedBlockLoader
+from serenitymojo.offload.plan import build_qwenimage_block_plan, OffloadConfig
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -168,9 +171,9 @@ def build_qwenimage_rope_tables(
     var sin_vals = List[Float32]()
     for tok in range(n_total):
         # compute the per-axis positions for this token
-        var p0 = Float32(0.0)
-        var p1 = Float32(0.0)
-        var p2 = Float32(0.0)
+        var p0: Float32
+        var p1: Float32
+        var p2: Float32
         if tok < txt_seq_len:
             var pos = Float32(max_vid_index + tok)
             p0 = pos
@@ -208,8 +211,106 @@ def build_qwenimage_rope_tables(
     )
 
 
+def build_qwenimage_edit_rope_tables(
+    frame: Int,
+    height: Int,
+    width: Int,
+    txt_seq_len: Int,
+    heads: Int,
+    config: QwenImageConfig,
+    dtype: STDtype,
+    ctx: DeviceContext,
+) raises -> Tuple[Tensor, Tensor]:
+    """Two-region Qwen-Image-Edit RoPE tables.
+
+    Token order is txt, target image, reference image. Both image regions use
+    the same spatial patch grid; the reference region's frame coordinate is
+    offset by `frame` so target/reference position embeddings do not collide.
+    """
+    var axes = List[Int]()
+    axes.append(config.axis0)
+    axes.append(config.axis1)
+    axes.append(config.axis2)
+    var total_half = 0
+    for a in range(3):
+        total_half += axes[a] // 2
+
+    var n_region = frame * height * width
+    var n_img = n_region * 2
+    var n_total = txt_seq_len + n_img
+    var theta = config.rope_theta
+
+    var freq0 = List[Float32]()
+    var freq1 = List[Float32]()
+    var freq2 = List[Float32]()
+    for axis in range(3):
+        var axis_dim = axes[axis]
+        var half = axis_dim // 2
+        for i in range(half):
+            var scale = Float64(2 * i) / Float64(axis_dim)
+            var f = Float32(1.0 / fpow(theta, scale))
+            if axis == 0:
+                freq0.append(f)
+            elif axis == 1:
+                freq1.append(f)
+            else:
+                freq2.append(f)
+
+    var hv = height // 2
+    var wv = width // 2
+    var max_vid_index = hv
+    if wv > max_vid_index:
+        max_vid_index = wv
+    if max_vid_index < 1:
+        max_vid_index = 1
+
+    var cos_vals = List[Float32]()
+    var sin_vals = List[Float32]()
+    for tok in range(n_total):
+        var p0: Float32
+        var p1: Float32
+        var p2: Float32
+        if tok < txt_seq_len:
+            var pos = Float32(max_vid_index + tok)
+            p0 = pos
+            p1 = pos
+            p2 = pos
+        else:
+            var img_idx = tok - txt_seq_len
+            var region = img_idx // n_region
+            var local_idx = img_idx % n_region
+            var f_idx = local_idx // (height * width)
+            var rem = local_idx % (height * width)
+            var h_idx = rem // width
+            var w_idx = rem % width
+            p0 = Float32(f_idx + region * frame)
+            p1 = Float32(h_idx) - Float32(height) / Float32(2.0)
+            p2 = Float32(w_idx) - Float32(width) / Float32(2.0)
+        for _h in range(heads):
+            for i in range(len(freq0)):
+                var ang = p0 * freq0[i]
+                cos_vals.append(fcos(ang))
+                sin_vals.append(fsin(ang))
+            for i in range(len(freq1)):
+                var ang = p1 * freq1[i]
+                cos_vals.append(fcos(ang))
+                sin_vals.append(fsin(ang))
+            for i in range(len(freq2)):
+                var ang = p2 * freq2[i]
+                cos_vals.append(fcos(ang))
+                sin_vals.append(fsin(ang))
+
+    var sh = List[Int]()
+    sh.append(n_total * heads)
+    sh.append(total_half)
+    return (
+        Tensor.from_host(cos_vals, sh.copy(), dtype, ctx),
+        Tensor.from_host(sin_vals, sh^, dtype, ctx),
+    )
+
+
 # ── QwenImageDit ──────────────────────────────────────────────────────────────
-struct QwenImageDit:
+struct QwenImageDit(Movable):
     """Qwen-Image MMDiT. All-resident weight load (60 double blocks). Owns
     weights as List[ArcPointer[Tensor]] (Tensor Movable-not-Copyable). Forward
     runs on GPU. comptime params N_IMG/N_TXT/S feed the comptime-shaped sdpa."""
@@ -236,6 +337,30 @@ struct QwenImageDit:
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
         for ref nm in sharded.names():
+            var tv = sharded.tensor_view(nm)
+            var t = Tensor.from_view(tv, ctx)
+            var idx = len(weights)
+            weights.append(ArcPointer(t^))
+            name_to_idx[nm] = idx
+        return QwenImageDit(weights^, name_to_idx^, QwenImageConfig.qwen_image())
+
+    @staticmethod
+    def load_shared(dir: String, ctx: DeviceContext) raises -> QwenImageDit:
+        """Load only the non-block tensors needed around streamed Qwen blocks."""
+        var sharded = ShardedSafeTensors.open(dir)
+        var weights = List[ArcPointer[Tensor]]()
+        var name_to_idx = Dict[String, Int]()
+        for ref nm in sharded.names():
+            var keep = (
+                nm.startswith("img_in.")
+                or nm.startswith("txt_norm.")
+                or nm.startswith("txt_in.")
+                or nm.startswith("time_text_embed.")
+                or nm.startswith("norm_out.")
+                or nm.startswith("proj_out.")
+            )
+            if not keep:
+                continue
             var tv = sharded.tensor_view(nm)
             var t = Tensor.from_view(tv, ctx)
             var idx = len(weights)
@@ -307,6 +432,38 @@ struct QwenImageDit:
         self, mods: Tensor, start: Int, length: Int, ctx: DeviceContext
     ) raises -> Tensor:
         return slice(mods, 1, start, length, ctx)
+
+    def _zeros_tokens(
+        self, seq_len: Int, dim: Int, dtype: STDtype, ctx: DeviceContext
+    ) raises -> Tensor:
+        var data = List[Float32]()
+        data.resize(seq_len * dim, Float32(0.0))
+        var sh = List[Int]()
+        sh.append(1)
+        sh.append(seq_len)
+        sh.append(dim)
+        return Tensor.from_host(data, sh^, dtype, ctx)
+
+    def _mod_slice_pair(
+        self,
+        mods_target: Tensor,
+        mods_ref: Tensor,
+        start: Int,
+        length: Int,
+        target_seq_len: Int,
+        ref_seq_len: Int,
+        dtype: STDtype,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var target = self._mod_slice(mods_target, start, length, ctx)
+        var target_zeros = self._zeros_tokens(target_seq_len, length, dtype, ctx)
+        target = add(target_zeros, target, ctx)
+        if ref_seq_len == 0:
+            return target^
+        var ref_mod = self._mod_slice(mods_ref, start, length, ctx)
+        var ref_zeros = self._zeros_tokens(ref_seq_len, length, dtype, ctx)
+        ref_mod = add(ref_zeros, ref_mod, ctx)
+        return concat(1, ctx, target, ref_mod)
 
     # Reshape [1, N, H*Dh] -> [1, N, H, Dh] (BSHD).
     def _to_bshd(
@@ -474,6 +631,151 @@ struct QwenImageDit:
         )
         txt = add(txt, mul(txt_gate2, txt_mlp, ctx), ctx)
 
+    # ── one edit block with target/reference image modulation ────────────────
+    def _block_forward_edit[
+        N_TARGET: Int, N_REF: Int, N_TXT: Int, S: Int
+    ](
+        self,
+        block_idx: Int,
+        mut img: Tensor,
+        mut txt: Tensor,
+        temb_target: Tensor,
+        temb_ref: Tensor,
+        pe_cos: Tensor,
+        pe_sin: Tensor,
+        ref mask: Tensor,
+        ctx: DeviceContext,
+    ) raises:
+        comptime assert S == N_TARGET + N_REF + N_TXT, "S must equal target + ref + text"
+        var cfg = self.config
+        var h = cfg.num_heads
+        var d = cfg.head_dim
+        var dim = cfg.inner_dim
+        var n_img = N_TARGET + N_REF
+        var scale = Float32(1.0) / sqrt(Float32(d))
+        var p = String("transformer_blocks.") + String(block_idx)
+        var dtype = self._w(String("img_in.weight")).dtype()
+
+        var temb_target_silu = silu(temb_target, ctx)
+        var temb_ref_silu = silu(temb_ref, ctx)
+        var img_mods_t = self._linear_b(
+            temb_target_silu, p + ".img_mod.1.weight", p + ".img_mod.1.bias", ctx
+        )
+        var img_mods_r = self._linear_b(
+            temb_ref_silu, p + ".img_mod.1.weight", p + ".img_mod.1.bias", ctx
+        )
+        var txt_mods = self._linear_b(
+            temb_target_silu, p + ".txt_mod.1.weight", p + ".txt_mod.1.bias", ctx
+        )
+
+        var img_shift1 = self._mod_slice_pair(
+            img_mods_t, img_mods_r, 0 * dim, dim, N_TARGET, N_REF, dtype, ctx
+        )
+        var img_scale1 = self._mod_slice_pair(
+            img_mods_t, img_mods_r, 1 * dim, dim, N_TARGET, N_REF, dtype, ctx
+        )
+        var img_gate1 = self._mod_slice_pair(
+            img_mods_t, img_mods_r, 2 * dim, dim, N_TARGET, N_REF, dtype, ctx
+        )
+        var img_shift2 = self._mod_slice_pair(
+            img_mods_t, img_mods_r, 3 * dim, dim, N_TARGET, N_REF, dtype, ctx
+        )
+        var img_scale2 = self._mod_slice_pair(
+            img_mods_t, img_mods_r, 4 * dim, dim, N_TARGET, N_REF, dtype, ctx
+        )
+        var img_gate2 = self._mod_slice_pair(
+            img_mods_t, img_mods_r, 5 * dim, dim, N_TARGET, N_REF, dtype, ctx
+        )
+
+        var txt_shift1 = self._mod_slice(txt_mods, 0 * dim, dim, ctx)
+        var txt_scale1 = self._mod_slice(txt_mods, 1 * dim, dim, ctx)
+        var txt_gate1 = self._mod_slice(txt_mods, 2 * dim, dim, ctx)
+        var txt_shift2 = self._mod_slice(txt_mods, 3 * dim, dim, ctx)
+        var txt_scale2 = self._mod_slice(txt_mods, 4 * dim, dim, ctx)
+        var txt_gate2 = self._mod_slice(txt_mods, 5 * dim, dim, ctx)
+
+        var img_normed = self._layer_norm_no_affine(img, ctx)
+        var img_modulated = self._modulate(img_normed, img_scale1, img_shift1, ctx)
+        var txt_normed = self._layer_norm_no_affine(txt, ctx)
+        var txt_modulated = self._modulate(txt_normed, txt_scale1, txt_shift1, ctx)
+
+        var img_q = self._to_bshd(
+            self._linear_b(img_modulated, p + ".attn.to_q.weight", p + ".attn.to_q.bias", ctx),
+            n_img, h, d, ctx,
+        )
+        var img_k = self._to_bshd(
+            self._linear_b(img_modulated, p + ".attn.to_k.weight", p + ".attn.to_k.bias", ctx),
+            n_img, h, d, ctx,
+        )
+        var img_v = self._to_bshd(
+            self._linear_b(img_modulated, p + ".attn.to_v.weight", p + ".attn.to_v.bias", ctx),
+            n_img, h, d, ctx,
+        )
+        var txt_q = self._to_bshd(
+            self._linear_b(txt_modulated, p + ".attn.add_q_proj.weight", p + ".attn.add_q_proj.bias", ctx),
+            N_TXT, h, d, ctx,
+        )
+        var txt_k = self._to_bshd(
+            self._linear_b(txt_modulated, p + ".attn.add_k_proj.weight", p + ".attn.add_k_proj.bias", ctx),
+            N_TXT, h, d, ctx,
+        )
+        var txt_v = self._to_bshd(
+            self._linear_b(txt_modulated, p + ".attn.add_v_proj.weight", p + ".attn.add_v_proj.bias", ctx),
+            N_TXT, h, d, ctx,
+        )
+
+        ref nq = self._w(p + ".attn.norm_q.weight")
+        ref nk = self._w(p + ".attn.norm_k.weight")
+        ref naq = self._w(p + ".attn.norm_added_q.weight")
+        ref nak = self._w(p + ".attn.norm_added_k.weight")
+        img_q = rms_norm(img_q, nq, cfg.eps, ctx)
+        img_k = rms_norm(img_k, nk, cfg.eps, ctx)
+        txt_q = rms_norm(txt_q, naq, cfg.eps, ctx)
+        txt_k = rms_norm(txt_k, nak, cfg.eps, ctx)
+
+        var q = concat(1, ctx, txt_q, img_q)
+        var k = concat(1, ctx, txt_k, img_k)
+        var v = concat(1, ctx, txt_v, img_v)
+        q = rope_interleaved(q, pe_cos, pe_sin, ctx)
+        k = rope_interleaved(k, pe_cos, pe_sin, ctx)
+
+        var attn = sdpa[1, S, 24, 128](q, k, v, mask, scale, ctx)
+        var txt_attn = slice(attn, 1, 0, N_TXT, ctx)
+        var img_attn = slice(attn, 1, N_TXT, n_img, ctx)
+        var txt_attn_2d = self._from_bshd(txt_attn, N_TXT, h, d, ctx)
+        var img_attn_2d = self._from_bshd(img_attn, n_img, h, d, ctx)
+
+        var img_o = self._linear_b(
+            img_attn_2d, p + ".attn.to_out.0.weight", p + ".attn.to_out.0.bias", ctx
+        )
+        var txt_o = self._linear_b(
+            txt_attn_2d, p + ".attn.to_add_out.weight", p + ".attn.to_add_out.bias", ctx
+        )
+        img = add(img, mul(img_gate1, img_o, ctx), ctx)
+        txt = add(txt, mul(txt_gate1, txt_o, ctx), ctx)
+
+        var img_normed2 = self._layer_norm_no_affine(img, ctx)
+        var img_mlp_in = self._modulate(img_normed2, img_scale2, img_shift2, ctx)
+        var img_mlp = self._linear_b(
+            img_mlp_in, p + ".img_mlp.net.0.proj.weight", p + ".img_mlp.net.0.proj.bias", ctx
+        )
+        img_mlp = gelu(img_mlp, ctx)
+        img_mlp = self._linear_b(
+            img_mlp, p + ".img_mlp.net.2.weight", p + ".img_mlp.net.2.bias", ctx
+        )
+        img = add(img, mul(img_gate2, img_mlp, ctx), ctx)
+
+        var txt_normed2 = self._layer_norm_no_affine(txt, ctx)
+        var txt_mlp_in = self._modulate(txt_normed2, txt_scale2, txt_shift2, ctx)
+        var txt_mlp = self._linear_b(
+            txt_mlp_in, p + ".txt_mlp.net.0.proj.weight", p + ".txt_mlp.net.0.proj.bias", ctx
+        )
+        txt_mlp = gelu(txt_mlp, ctx)
+        txt_mlp = self._linear_b(
+            txt_mlp, p + ".txt_mlp.net.2.weight", p + ".txt_mlp.net.2.bias", ctx
+        )
+        txt = add(txt, mul(txt_gate2, txt_mlp, ctx), ctx)
+
     # All-zero additive attention mask [1, H, S, S] for full attention.
     def _zeros_mask[S: Int](
         self, dtype: STDtype, heads: Int, ctx: DeviceContext
@@ -482,6 +784,43 @@ struct QwenImageDit:
         var total = heads * S * S
         for _i in range(total):
             data.append(Float32(0.0))
+        var sh = List[Int]()
+        sh.append(1)
+        sh.append(heads)
+        sh.append(S)
+        sh.append(S)
+        return Tensor.from_host(data, sh^, dtype, ctx)
+
+    # Padding-aware additive attention mask [1, H, S, S] for variable text len.
+    # Token layout (TXT FIRST, then IMG): positions [0..N_TXT) are text,
+    # [N_TXT..S) are image. For every query row, key columns in
+    # [real_txt_len, N_TXT) are set to -1e4 (the diffusers/PyTorch additive-bias
+    # convention that survives bf16 cast without producing softmax NaNs); all
+    # other entries are 0. This blocks attention to padded text positions while
+    # leaving the real text + full image grid untouched.
+    def _padding_mask[S: Int, N_TXT: Int](
+        self, real_txt_len: Int, dtype: STDtype, heads: Int, ctx: DeviceContext
+    ) raises -> Tensor:
+        if real_txt_len < 0 or real_txt_len > N_TXT:
+            raise Error(
+                String("_padding_mask: real_txt_len=")
+                + String(real_txt_len)
+                + " out of range [0, "
+                + String(N_TXT)
+                + "]"
+            )
+        var data = List[Float32]()
+        var total = heads * S * S
+        for _i in range(total):
+            data.append(Float32(0.0))
+        var neg_bias = Float32(-1.0e4)
+        # Only fill the pad columns; if real_txt_len == N_TXT, this loop is a no-op.
+        for hd in range(heads):
+            var head_base = hd * S * S
+            for q in range(S):
+                var row_base = head_base + q * S
+                for k in range(real_txt_len, N_TXT):
+                    data[row_base + k] = neg_bias
         var sh = List[Int]()
         sh.append(1)
         sh.append(heads)
@@ -606,3 +945,315 @@ def _cast_like(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
         ctx.synchronize()
         return Tensor(dev^, x.shape(), x.dtype())
     return cast_tensor(x, dtype, ctx)
+
+
+@fieldwise_init
+struct QwenImageCfgPreds(Movable):
+    var pos: Tensor
+    var neg: Tensor
+
+
+@fieldwise_init
+struct QwenImageDitOffloaded(Movable):
+    var shared: QwenImageDit
+    var loader: PlannedBlockLoader
+
+    @staticmethod
+    def load(dir: String, ctx: DeviceContext) raises -> QwenImageDitOffloaded:
+        var shared = QwenImageDit.load_shared(dir, ctx)
+        var plan = build_qwenimage_block_plan()
+        var loader = PlannedBlockLoader.open(
+            dir, plan^, OffloadConfig.synchronous_cfg_paired()
+        )
+        return QwenImageDitOffloaded(shared^, loader^)
+
+    def _block_model(self, block: Block) -> QwenImageDit:
+        var weights = self.shared.weights.copy()
+        var name_to_idx = self.shared.name_to_idx.copy()
+        for ref e in block.items():
+            name_to_idx[e.key] = len(weights)
+            weights.append(e.value)
+        return QwenImageDit(weights^, name_to_idx^, self.shared.config)
+
+    def _prepare_img(
+        self,
+        hidden_states: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        return self.shared._linear_b(
+            hidden_states, "img_in.weight", "img_in.bias", ctx
+        )
+
+    def _prepare_txt(
+        self,
+        encoder_hidden_states: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var cfg = self.shared.config
+        ref txt_norm_w = self.shared._w(String("txt_norm.weight"))
+        var txt_normed = rms_norm(encoder_hidden_states, txt_norm_w, cfg.eps, ctx)
+        return self.shared._linear_b(
+            txt_normed, "txt_in.weight", "txt_in.bias", ctx
+        )
+
+    def _prepare_temb(
+        self,
+        timestep: Float32,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var cfg = self.shared.config
+        var dim = cfg.inner_dim
+        var dtype = self.shared._w(String("img_in.weight")).dtype()
+        var t_host = List[Float32]()
+        t_host.append(timestep * Float32(1000.0))
+        var t_sh = List[Int]()
+        t_sh.append(1)
+        var t_tensor = Tensor.from_host(t_host, t_sh^, STDtype.F32, ctx)
+        var t_embed = timestep_embedding(
+            t_tensor, cfg.timestep_dim, ctx, Float32(10000.0)
+        )
+        var t_embed_3d = reshape(t_embed, _shape3(1, 1, cfg.timestep_dim), ctx)
+        var t_embed_cast = _cast_like(t_embed_3d, dtype, ctx)
+        var h1 = self.shared._linear_b(
+            t_embed_cast,
+            "time_text_embed.timestep_embedder.linear_1.weight",
+            "time_text_embed.timestep_embedder.linear_1.bias",
+            ctx,
+        )
+        h1 = silu(h1, ctx)
+        var temb_3d = self.shared._linear_b(
+            h1,
+            "time_text_embed.timestep_embedder.linear_2.weight",
+            "time_text_embed.timestep_embedder.linear_2.bias",
+            ctx,
+        )
+        return reshape(temb_3d, _shape2(1, dim), ctx)
+
+    def _finish[
+        N_IMG: Int
+    ](self, img: Tensor, temb: Tensor, ctx: DeviceContext) raises -> Tensor:
+        var dim = self.shared.config.inner_dim
+        var temb_silu = silu(temb, ctx)
+        var mods = self.shared._linear_b(
+            temb_silu, "norm_out.linear.weight", "norm_out.linear.bias", ctx
+        )
+        var out_scale = self.shared._mod_slice(mods, 0, dim, ctx)
+        var out_shift = self.shared._mod_slice(mods, dim, dim, ctx)
+        var normed = self.shared._layer_norm_no_affine(img, ctx)
+        var modulated = self.shared._modulate(normed, out_scale, out_shift, ctx)
+        return self.shared._linear_b(
+            modulated, "proj_out.weight", "proj_out.bias", ctx
+        )
+
+    def forward[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        mut self,
+        hidden_states: Tensor,
+        encoder_hidden_states: Tensor,
+        timestep: Float32,
+        frame: Int,
+        h_latent: Int,
+        w_latent: Int,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+        var cfg = self.shared.config
+        var img = self._prepare_img(hidden_states, ctx)
+        var txt = self._prepare_txt(encoder_hidden_states, ctx)
+        var temb = self._prepare_temb(timestep, ctx)
+        var dtype = self.shared._w(String("img_in.weight")).dtype()
+        var rope = build_qwenimage_rope_tables(
+            frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
+        )
+        var mask = self.shared._zeros_mask[S](dtype, cfg.num_heads, ctx)
+
+        self.loader.config = OffloadConfig.synchronous_single()
+        self.loader.prefetch(0)
+        for i in range(cfg.num_layers):
+            self.loader.prefetch_next(i)
+            var handle = self.loader.await_block(i, ctx)
+            var tmp = self._block_model(handle.block)
+            tmp._block_forward[N_IMG, N_TXT, S](
+                i, img, txt, temb, rope[0], rope[1], mask, ctx
+            )
+
+        return self._finish[N_IMG](img, temb, ctx)
+
+    def forward_cfg[
+        N_IMG: Int, N_TXT: Int, S: Int
+    ](
+        mut self,
+        hidden_states: Tensor,
+        encoder_pos: Tensor,
+        encoder_neg: Tensor,
+        timestep: Float32,
+        real_txt_len: Int,
+        frame: Int,
+        h_latent: Int,
+        w_latent: Int,
+        ctx: DeviceContext,
+    ) raises -> QwenImageCfgPreds:
+        """Run positive and negative branches through each streamed block before
+        unloading that block, avoiding duplicate block H2D loads for CFG.
+
+        `real_txt_len` is the number of non-padded text tokens (after the
+        34-token template drop). Text positions in [real_txt_len, N_TXT) are
+        masked out of the joint attention via an additive -1e4 bias. This lets
+        the pipeline pin N_TXT to a generous comptime max (e.g. 512) and accept
+        arbitrary prompts at runtime without recompiling."""
+        comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
+        var cfg = self.shared.config
+        var img_pos = self._prepare_img(hidden_states, ctx)
+        var img_neg = self._prepare_img(hidden_states, ctx)
+        var txt_pos = self._prepare_txt(encoder_pos, ctx)
+        var txt_neg = self._prepare_txt(encoder_neg, ctx)
+        var temb = self._prepare_temb(timestep, ctx)
+        var dtype = self.shared._w(String("img_in.weight")).dtype()
+        var rope = build_qwenimage_rope_tables(
+            frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
+        )
+        var mask = self.shared._padding_mask[S, N_TXT](
+            real_txt_len, dtype, cfg.num_heads, ctx
+        )
+
+        self.loader.config = OffloadConfig.synchronous_cfg_paired()
+        self.loader.prefetch(0)
+        for i in range(cfg.num_layers):
+            self.loader.prefetch_next(i)
+            var handle = self.loader.await_block(i, ctx)
+            var tmp = self._block_model(handle.block)
+            tmp._block_forward[N_IMG, N_TXT, S](
+                i, img_pos, txt_pos, temb, rope[0], rope[1], mask, ctx
+            )
+            tmp._block_forward[N_IMG, N_TXT, S](
+                i, img_neg, txt_neg, temb, rope[0], rope[1], mask, ctx
+            )
+
+        var pred_pos = self._finish[N_IMG](img_pos, temb, ctx)
+        var pred_neg = self._finish[N_IMG](img_neg, temb, ctx)
+        return QwenImageCfgPreds(pred_pos^, pred_neg^)
+
+    def forward_cfg_mixed_text[
+        N_IMG: Int, N_TXT_POS: Int, S_POS: Int, N_TXT_NEG: Int, S_NEG: Int
+    ](
+        mut self,
+        hidden_states: Tensor,
+        encoder_pos: Tensor,
+        encoder_neg: Tensor,
+        timestep: Float32,
+        real_txt_len_pos: Int,
+        real_txt_len_neg: Int,
+        frame: Int,
+        h_latent: Int,
+        w_latent: Int,
+        ctx: DeviceContext,
+    ) raises -> QwenImageCfgPreds:
+        """Run CFG with separate positive/negative text lengths.
+
+        Qwen-Image's diffusers/Rust path drops the 34-token template prefix and
+        keeps only non-padded text hidden states, so cond/uncond sequence lengths
+        normally differ. This method still streams each block once, then runs the
+        two branch-specific comptime attention shapes before unloading it.
+
+        `real_txt_len_pos` / `real_txt_len_neg` are the non-padded text-token
+        counts for each branch; positions in `[real_txt_len_*, N_TXT_*)` are
+        masked out of joint attention with a -1e4 additive bias. The pipeline
+        pads both branches to comptime-fixed N_TXT_POS / N_TXT_NEG (e.g. 512),
+        decoupling prompt length from comptime shape.
+        """
+        comptime assert S_POS == N_IMG + N_TXT_POS, "S_POS must equal N_IMG + N_TXT_POS"
+        comptime assert S_NEG == N_IMG + N_TXT_NEG, "S_NEG must equal N_IMG + N_TXT_NEG"
+        var cfg = self.shared.config
+        var img_pos = self._prepare_img(hidden_states, ctx)
+        var img_neg = self._prepare_img(hidden_states, ctx)
+        var txt_pos = self._prepare_txt(encoder_pos, ctx)
+        var txt_neg = self._prepare_txt(encoder_neg, ctx)
+        var temb = self._prepare_temb(timestep, ctx)
+        var dtype = self.shared._w(String("img_in.weight")).dtype()
+        var rope_pos = build_qwenimage_rope_tables(
+            frame, h_latent, w_latent, N_TXT_POS, cfg.num_heads, cfg, dtype, ctx
+        )
+        var rope_neg = build_qwenimage_rope_tables(
+            frame, h_latent, w_latent, N_TXT_NEG, cfg.num_heads, cfg, dtype, ctx
+        )
+        var mask_pos = self.shared._padding_mask[S_POS, N_TXT_POS](
+            real_txt_len_pos, dtype, cfg.num_heads, ctx
+        )
+        var mask_neg = self.shared._padding_mask[S_NEG, N_TXT_NEG](
+            real_txt_len_neg, dtype, cfg.num_heads, ctx
+        )
+
+        self.loader.config = OffloadConfig.synchronous_cfg_paired()
+        self.loader.prefetch(0)
+        for i in range(cfg.num_layers):
+            self.loader.prefetch_next(i)
+            var handle = self.loader.await_block(i, ctx)
+            var tmp = self._block_model(handle.block)
+            tmp._block_forward[N_IMG, N_TXT_POS, S_POS](
+                i, img_pos, txt_pos, temb, rope_pos[0], rope_pos[1], mask_pos, ctx
+            )
+            tmp._block_forward[N_IMG, N_TXT_NEG, S_NEG](
+                i, img_neg, txt_neg, temb, rope_neg[0], rope_neg[1], mask_neg, ctx
+            )
+
+        var pred_pos = self._finish[N_IMG](img_pos, temb, ctx)
+        var pred_neg = self._finish[N_IMG](img_neg, temb, ctx)
+        return QwenImageCfgPreds(pred_pos^, pred_neg^)
+
+    def forward_edit_cfg[
+        N_TARGET: Int, N_REF: Int, N_TXT: Int, S: Int
+    ](
+        mut self,
+        target_hidden_states: Tensor,
+        reference_hidden_states: Tensor,
+        encoder_pos: Tensor,
+        encoder_neg: Tensor,
+        timestep: Float32,
+        ref_timestep: Float32,
+        frame: Int,
+        h_latent: Int,
+        w_latent: Int,
+        ctx: DeviceContext,
+    ) raises -> QwenImageCfgPreds:
+        """Qwen-Image-Edit single-reference CFG forward.
+
+        Concatenates `[target, reference]`, runs target tokens with `timestep`
+        modulation and reference tokens with `ref_timestep` modulation
+        (`zero_cond_t` path), then returns only the target-token predictions.
+        """
+        comptime assert S == N_TARGET + N_REF + N_TXT, "S must equal target + ref + text"
+        var cfg = self.shared.config
+        var hidden_states = concat(
+            1, ctx, target_hidden_states, reference_hidden_states
+        )
+        var img_pos = self._prepare_img(hidden_states, ctx)
+        var img_neg = self._prepare_img(hidden_states, ctx)
+        var txt_pos = self._prepare_txt(encoder_pos, ctx)
+        var txt_neg = self._prepare_txt(encoder_neg, ctx)
+        var temb_target = self._prepare_temb(timestep, ctx)
+        var temb_ref = self._prepare_temb(ref_timestep, ctx)
+        var dtype = self.shared._w(String("img_in.weight")).dtype()
+        var rope = build_qwenimage_edit_rope_tables(
+            frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
+        )
+        var mask = self.shared._zeros_mask[S](dtype, cfg.num_heads, ctx)
+
+        self.loader.config = OffloadConfig.synchronous_cfg_paired()
+        self.loader.prefetch(0)
+        for i in range(cfg.num_layers):
+            self.loader.prefetch_next(i)
+            var handle = self.loader.await_block(i, ctx)
+            var tmp = self._block_model(handle.block)
+            tmp._block_forward_edit[N_TARGET, N_REF, N_TXT, S](
+                i, img_pos, txt_pos, temb_target, temb_ref, rope[0], rope[1], mask, ctx
+            )
+            tmp._block_forward_edit[N_TARGET, N_REF, N_TXT, S](
+                i, img_neg, txt_neg, temb_target, temb_ref, rope[0], rope[1], mask, ctx
+            )
+
+        var pred_pos_full = self._finish[N_TARGET + N_REF](img_pos, temb_target, ctx)
+        var pred_neg_full = self._finish[N_TARGET + N_REF](img_neg, temb_target, ctx)
+        var pred_pos = slice(pred_pos_full, 1, 0, N_TARGET, ctx)
+        var pred_neg = slice(pred_neg_full, 1, 0, N_TARGET, ctx)
+        return QwenImageCfgPreds(pred_pos^, pred_neg^)

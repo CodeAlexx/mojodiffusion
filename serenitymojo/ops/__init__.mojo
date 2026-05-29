@@ -15,3 +15,15 @@
 #
 # NOT in this chunk (chunk A2): group_norm / layer_norm / rope / sdpa / conv2d /
 # silu / swiglu / modulate / residual_gate / random.
+#
+# LTX2 P0 (LTX2_PORT_PLAN_2026-05-28 §P0):
+#   activations — silu, sigmoid, gelu, swiglu  (sigmoid exported here per P0).
+#   unary       — sin_op, exp_op, sqrt_op, rsqrt_op, tanh_op, reciprocal_op
+#                 (elementwise unary math; f32/bf16/f16, bf16/f16 upcast to f32).
+#                 Import directly, e.g. `from serenitymojo.ops.unary import sin_op`.
+#
+# LTX2 P-reduce (LTX2_PORT_PLAN_2026-05-28 §P-reduce):
+#   reduce      — reduce_sum / reduce_mean / reduce_var / reduce_std over an
+#                 arbitrary set of dims (keepdim), F32-accumulated; output F32.
+#                 Unblocks AdaIN per-(B,C)-over-(F,H,W) + general PixelNorm.
+#                 Import directly, e.g. `from serenitymojo.ops.reduce import reduce_mean`.

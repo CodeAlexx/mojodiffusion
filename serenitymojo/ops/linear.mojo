@@ -91,6 +91,57 @@ def _bias_cast_kernel_f16(
         out_buf[row, col] = rebind[out_buf.element_type](v.cast[DType.float16]())
 
 
+def _bias_cast_direct_kernel_f32(
+    c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    out_buf: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    m: Int,
+    out_dim: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = m * out_dim
+    if idx < total:
+        var row = idx // out_dim
+        var col = idx % out_dim
+        var v = rebind[Scalar[DType.float32]](c_f32[row, col])
+        v += rebind[Scalar[DType.float32]](bias[col])
+        out_buf[row, col] = rebind[out_buf.element_type](v)
+
+
+def _bias_cast_direct_kernel_bf16(
+    c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    out_buf: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    m: Int,
+    out_dim: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = m * out_dim
+    if idx < total:
+        var row = idx // out_dim
+        var col = idx % out_dim
+        var v = rebind[Scalar[DType.float32]](c_f32[row, col])
+        v += rebind[Scalar[DType.bfloat16]](bias[col]).cast[DType.float32]()
+        out_buf[row, col] = rebind[out_buf.element_type](v.cast[DType.bfloat16]())
+
+
+def _bias_cast_direct_kernel_f16(
+    c_f32: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    bias: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    out_buf: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
+    m: Int,
+    out_dim: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = m * out_dim
+    if idx < total:
+        var row = idx // out_dim
+        var col = idx % out_dim
+        var v = rebind[Scalar[DType.float32]](c_f32[row, col])
+        v += rebind[Scalar[DType.float16]](bias[col]).cast[DType.float32]()
+        out_buf[row, col] = rebind[out_buf.element_type](v.cast[DType.float16]())
+
+
 def linear(
     x: Tensor,
     weight: Tensor,
@@ -166,26 +217,21 @@ def linear(
     var bsz = x.dtype().byte_size()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](m * out_dim * bsz)
 
-    # Bias staged as F32 device buffer (cast up from stored dtype). No bias ->
-    # length-1 dummy + has_bias=0.
+    # Bias stays on device. No bias -> length-1 dummy + has_bias=0 using the
+    # older F32-bias kernels. Biases are stored in the same dtype as weights.
     var has_bias = 1 if bias else 0
     var bias_count = out_dim if bias else 1
     var bias_f32_buf = ctx.enqueue_create_buffer[DType.uint8](bias_count * 4)
     if bias:
-        var bvals = bias.value().to_host(ctx)
-        if len(bvals) != out_dim:
+        if bias.value().dtype() != x.dtype():
+            raise Error("linear: bias dtype mismatch")
+        var bshape = bias.value().shape()
+        if len(bshape) != 1 or bshape[0] != out_dim:
             raise Error(
-                String("linear: bias length ")
-                + String(len(bvals))
-                + " != out_dim "
+                String("linear: bias shape mismatch, expected [")
                 + String(out_dim)
+                + "]"
             )
-        var bhost = ctx.enqueue_create_host_buffer[DType.uint8](out_dim * 4)
-        var bp = bhost.unsafe_ptr().bitcast[Float32]()
-        for i in range(out_dim):
-            bp[i] = bvals[i]
-        ctx.enqueue_copy(dst_buf=bias_f32_buf, src_buf=bhost)
-        ctx.synchronize()
 
     var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](bias_count))
     var c_out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
@@ -202,26 +248,59 @@ def linear(
         var o_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float32](), c_out_rl
         )
-        ctx.enqueue_function[_bias_cast_kernel_f32, _bias_cast_kernel_f32](
-            c_lt, bias_lt, o_lt, m, out_dim, has_bias,
-            grid_dim=grid, block_dim=_BLOCK,
-        )
+        if bias:
+            var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float32](), bias_rl
+            )
+            ctx.enqueue_function[
+                _bias_cast_direct_kernel_f32, _bias_cast_direct_kernel_f32
+            ](
+                c_lt, B, o_lt, m, out_dim,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_bias_cast_kernel_f32, _bias_cast_kernel_f32](
+                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
     elif dt == DType.bfloat16:
         var o_lt = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[BFloat16](), c_out_rl
         )
-        ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
-            c_lt, bias_lt, o_lt, m, out_dim, has_bias,
-            grid_dim=grid, block_dim=_BLOCK,
-        )
+        if bias:
+            var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
+            )
+            ctx.enqueue_function[
+                _bias_cast_direct_kernel_bf16, _bias_cast_direct_kernel_bf16
+            ](
+                c_lt, B, o_lt, m, out_dim,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
+                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
     else:  # float16
         var o_lt = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float16](), c_out_rl
         )
-        ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
-            c_lt, bias_lt, o_lt, m, out_dim, has_bias,
-            grid_dim=grid, block_dim=_BLOCK,
-        )
+        if bias:
+            var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float16](), bias_rl
+            )
+            ctx.enqueue_function[
+                _bias_cast_direct_kernel_f16, _bias_cast_direct_kernel_f16
+            ](
+                c_lt, B, o_lt, m, out_dim,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
+                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
     ctx.synchronize()
 
     var out_shape = List[Int]()

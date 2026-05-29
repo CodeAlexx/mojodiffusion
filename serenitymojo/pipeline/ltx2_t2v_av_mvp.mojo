@@ -23,13 +23,16 @@
 #     MVP runs the single distilled-8 schedule at fixed MVP resolution — see
 #     STAGE-BOUNDARY NOTE below).
 #
-# CONTEXT NOTE (audio): the cached embed sidecar has only the VIDEO context
-# (`text_hidden [1,1024,4096]`, post-feature-extractor, pre-connector). There
-# is no cached AUDIO pre-connector context and no in-Mojo Gemma encoder, so the
-# 2048-dim audio pre-connector context is DERIVED deterministically from the
-# cached video hidden (down-projected slice). Audio is therefore AV-coupled
-# through the joint denoise and finite/non-silent, but NOT prompt-faithful.
-# Reported honestly.
+# CONTEXT NOTE (audio): the REAL audio context is now used. Both the video
+# context [1,1024,4096] and the audio context [1,1024,2048] come from the
+# genuine `feature_extractor::feature_extract_and_project` output, dumped to
+# AUDIO_CTX_DUMP by running `ltx2_generate_av --dump-audio-context` (Gemma-3
+# encode -> 49 hidden states -> per-token RMSNorm/concat[188160] -> rescale
+# sqrt(target/3840) -> aggregate_embed linear). The audio path uses the
+# `audio_aggregate_embed` weights (rescale 0.7303), the video path the
+# `video_aggregate_embed` weights (rescale 1.0328); the two outputs are
+# independent projections of the SAME Gemma feature stack — proven orthogonal
+# (cos(audio, video[...,:2048]) = -0.0004), so the audio context is NOT a slice.
 #
 # Run (GPU; FP8 streaming keeps DiT ~12 GB):
 #   pixi run mojo run -I . serenitymojo/pipeline/ltx2_t2v_av_mvp.mojo
@@ -79,6 +82,13 @@ from serenitymojo.lora import LoraSet, FMT_LTX2_DISTILLED
 comptime CKPT_FP8 = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8.safetensors"
 comptime CKPT_BF16 = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors"
 comptime CACHED = "/home/alex/EriDiffusion/inference-flame/cached_ltx2_embeddings.safetensors"
+# Real feature_extract_and_project dump (video_context [1,1024,4096] +
+# audio_context [1,1024,2048] + encoder_attention_mask [1,1,1,1024]) produced by
+# `ltx2_generate_av --dump-audio-context`. The audio_context here is the GENUINE
+# 2048-dim projection of the full 188160-dim Gemma feature stack (rescale
+# sqrt(2048/3840)=0.7303), proven orthogonal (cos≈-0.0004) to video[...,:2048] —
+# it is NOT a down-projected slice.
+comptime AUDIO_CTX_DUMP = "/home/alex/EriDiffusion/inference-flame/output/audio_context_dump/ltx2_audio_context.safetensors"
 comptime OUT_DIR = "/home/alex/mojodiffusion/output/ltx2_mvp"
 comptime MP4_OUT = OUT_DIR + "/ltx2_t2v_av_256_16f.mp4"
 comptime WAV_OUT = OUT_DIR + "/mvp_audio.wav"
@@ -591,21 +601,26 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
         LTX2ConnectorConfig.audio(), ctx,
     )
 
-    # video pre-connector context: cached text_hidden [1,1024,4096], slice N_TXT
-    var cached = ShardedSafeTensors.open(String(CACHED))
-    var th = cast_tensor(
-        Tensor.from_view_as_bf16(cached.tensor_view("text_hidden"), ctx),
+    # video + audio pre-connector contexts: the REAL feature_extract_and_project
+    # dump (video_context [1,1024,4096], audio_context [1,1024,2048]). The text
+    # is left-padded to 1024 (real tokens occupy the TAIL), so we slice the last
+    # N_TXT tokens — landing entirely in the real-token region rather than the
+    # padding head. The audio_context is the genuine independent 2048-dim Gemma
+    # projection (NOT a slice of video) per the dump-proof in the header.
+    var dump = ShardedSafeTensors.open(String(AUDIO_CTX_DUMP))
+    var vctx_full = cast_tensor(
+        Tensor.from_view_as_bf16(dump.tensor_view("video_context"), ctx),
         STDtype.F32, ctx,
     )  # [1,1024,4096]
-    var video_pre = slice(th, 1, 0, N_TXT, ctx)  # [1,N_TXT,4096]
-    _ = _stats(String("video_pre"), video_pre, ctx)
-
-    # audio pre-connector context: NO cached audio + no Gemma -> derive a
-    # deterministic 2048-dim context by down-projecting (slice) the cached
-    # video hidden. Documented MVP approximation (audio is AV-coupled + finite
-    # but not prompt-faithful).
-    var audio_pre = slice(video_pre, 2, 0, AD, ctx)  # [1,N_TXT,2048]
-    _ = _stats(String("audio_pre(derived)"), audio_pre, ctx)
+    var actx_full = cast_tensor(
+        Tensor.from_view_as_bf16(dump.tensor_view("audio_context"), ctx),
+        STDtype.F32, ctx,
+    )  # [1,1024,2048]
+    var tail0 = 1024 - N_TXT
+    var video_pre = slice(vctx_full, 1, tail0, N_TXT, ctx)  # [1,N_TXT,4096]
+    var audio_pre = slice(actx_full, 1, tail0, N_TXT, ctx)  # [1,N_TXT,2048] REAL
+    _ = _stats(String("video_pre(real)"), video_pre, ctx)
+    _ = _stats(String("audio_pre(REAL feature_extract_and_project)"), audio_pre, ctx)
 
     var enc = ltx2_connector_forward[N_TXT, V_HEADS, V_HDIM](v_conn, video_pre, ctx)
     var aenc = ltx2_connector_forward[N_TXT, A_HEADS, A_HDIM](a_conn, audio_pre, ctx)

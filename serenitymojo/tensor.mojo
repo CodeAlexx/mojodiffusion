@@ -230,6 +230,58 @@ struct Tensor(Movable):
         ctx.synchronize()
         return Tensor(dev^, tv.shape.copy(), STDtype.BF16)
 
+    @staticmethod
+    def from_view_as_f32[
+        mut: Bool, //, origin: Origin[mut=mut]
+    ](tv: TensorView[origin], ctx: DeviceContext) raises -> Tensor:
+        """Build an F32 Tensor from a safetensors view, upcasting BF16/F16 on
+        the host before H2D upload. Used by the LTX-2 vocoder parity path: the
+        Mojo conv1d accumulates in F32, so keeping every weight/activation in
+        F32 makes the chain match the F32 oracle (no BF16 round-trip jitter)."""
+        _ = tv.dtype.to_mojo_dtype()
+        var n = tv.numel()
+        var nbytes_in = tv.nbytes()
+        var expect = n * tv.dtype.byte_size()
+        if nbytes_in != expect:
+            raise Error(
+                String("from_view_as_f32: view nbytes=")
+                + String(nbytes_in)
+                + " != numel*byte_size="
+                + String(expect)
+            )
+
+        var nbytes_out = n * STDtype.F32.byte_size()
+        var host_out = ctx.enqueue_create_host_buffer[DType.uint8](nbytes_out)
+        var fp = host_out.unsafe_ptr().bitcast[Float32]()
+
+        if tv.dtype == STDtype.F32:
+            var outp = host_out.unsafe_ptr()
+            for i in range(nbytes_out):
+                outp[i] = tv.data[i]
+        else:
+            var host_in = ctx.enqueue_create_host_buffer[DType.uint8](nbytes_in)
+            var hp = host_in.unsafe_ptr()
+            for i in range(nbytes_in):
+                hp[i] = tv.data[i]
+            if tv.dtype == STDtype.BF16:
+                var bp = host_in.unsafe_ptr().bitcast[BFloat16]()
+                for i in range(n):
+                    fp[i] = bp[i].cast[DType.float32]()
+            elif tv.dtype == STDtype.F16:
+                var hp16 = host_in.unsafe_ptr().bitcast[Float16]()
+                for i in range(n):
+                    fp[i] = hp16[i].cast[DType.float32]()
+            else:
+                raise Error(
+                    String("from_view_as_f32: unsupported source dtype: ")
+                    + tv.dtype.name()
+                )
+
+        var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes_out)
+        ctx.enqueue_copy(dst_buf=dev, src_buf=host_out)
+        ctx.synchronize()
+        return Tensor(dev^, tv.shape.copy(), STDtype.F32)
+
     # ── Readback ──────────────────────────────────────────────────────────────
     def to_host(self, ctx: DeviceContext) raises -> List[Float32]:
         """Copy device data back to host as F32 (upcasting from the stored

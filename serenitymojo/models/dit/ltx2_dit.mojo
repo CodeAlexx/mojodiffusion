@@ -63,6 +63,7 @@ from serenitymojo.ops.tensor_algebra import (
 )
 from serenitymojo.models.dit.ltx2_rope import apply_ltx2_rope
 from serenitymojo.offload.ltx2_block_stream import FP8Block
+from serenitymojo.ops.cast import cast_tensor
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -797,6 +798,126 @@ struct LTX2AVBlockWeights(Movable):
                 weights.append(ArcPointer(Tensor.from_view_as_bf16(tv, ctx)))
 
         return LTX2AVBlockWeights(weights^, name_to_idx^, config)
+
+    @staticmethod
+    def from_fp8_block(
+        var block: FP8Block,
+        config: LTX2Config,
+        ctx: DeviceContext,
+    ) raises -> LTX2AVBlockWeights:
+        """Build a full dual-stream AV block from an FP8-streamed, already-
+        dequantized block (LTX2BlockStream.load_block_bf16). Used for the inner
+        blocks 4-46 of the distilled-fp8 checkpoint: the streamer reads ALL keys
+        under the block prefix (FP8 weights dequantized on-use with their
+        per-tensor weight_scale, BF16/F32 copied), so the streamed dict carries
+        the full AV key set (video + audio + cross-modal + all tables). This
+        rehomes those device Tensors (zero-copy ArcPointer move) into the
+        LTX2AVBlockWeights layout the AV forward expects, resolving the
+        q_norm/k_norm vs norm_q/norm_k naming per module.
+
+        Mirrors the on-disk `load` key set exactly — same six attn modules, both
+        FFNs, all four AdaLN tables, and the optional gate/prompt/norm keys."""
+        var weights = List[ArcPointer[Tensor]]()
+        var name_to_idx = Dict[String, Int]()
+
+        var attn_mods = List[String]()
+        attn_mods.append("attn1")
+        attn_mods.append("audio_attn1")
+        attn_mods.append("attn2")
+        attn_mods.append("audio_attn2")
+        attn_mods.append("audio_to_video_attn")
+        attn_mods.append("video_to_audio_attn")
+
+        var keys = List[Tuple[String, String]]()  # (canonical, src-in-block)
+        for ref m in attn_mods:
+            keys.append((m + ".to_q.weight", m + ".to_q.weight"))
+            keys.append((m + ".to_q.bias", m + ".to_q.bias"))
+            keys.append((m + ".to_k.weight", m + ".to_k.weight"))
+            keys.append((m + ".to_k.bias", m + ".to_k.bias"))
+            keys.append((m + ".to_v.weight", m + ".to_v.weight"))
+            keys.append((m + ".to_v.bias", m + ".to_v.bias"))
+            keys.append((m + ".to_out.0.weight", m + ".to_out.0.weight"))
+            keys.append((m + ".to_out.0.bias", m + ".to_out.0.bias"))
+            var qn = m + ".norm_q.weight"
+            var kn = m + ".norm_k.weight"
+            if (m + ".q_norm.weight") in block:
+                qn = m + ".q_norm.weight"
+                kn = m + ".k_norm.weight"
+            keys.append((m + ".norm_q.weight", qn))
+            keys.append((m + ".norm_k.weight", kn))
+
+        keys.append(("ff.net.0.proj.weight", "ff.net.0.proj.weight"))
+        keys.append(("ff.net.0.proj.bias", "ff.net.0.proj.bias"))
+        keys.append(("ff.net.2.weight", "ff.net.2.weight"))
+        keys.append(("ff.net.2.bias", "ff.net.2.bias"))
+        keys.append(("audio_ff.net.0.proj.weight", "audio_ff.net.0.proj.weight"))
+        keys.append(("audio_ff.net.0.proj.bias", "audio_ff.net.0.proj.bias"))
+        keys.append(("audio_ff.net.2.weight", "audio_ff.net.2.weight"))
+        keys.append(("audio_ff.net.2.bias", "audio_ff.net.2.bias"))
+
+        keys.append(("scale_shift_table", "scale_shift_table"))
+        keys.append(("audio_scale_shift_table", "audio_scale_shift_table"))
+        keys.append((
+            "scale_shift_table_a2v_ca_video",
+            "scale_shift_table_a2v_ca_video",
+        ))
+        keys.append((
+            "scale_shift_table_a2v_ca_audio",
+            "scale_shift_table_a2v_ca_audio",
+        ))
+
+        for ref kv in keys:
+            var canon = kv[0]
+            var src = kv[1]
+            if src not in block:
+                raise Error(
+                    String("from_fp8_block(AV): streamed block missing ") + src
+                )
+            name_to_idx[canon] = len(weights)
+            weights.append(block[src])
+
+        # Optional keys (gate logits per module, prompt tables, cross-modal norms).
+        var opt_keys = List[String]()
+        for ref m in attn_mods:
+            opt_keys.append(m + ".to_gate_logits.weight")
+            opt_keys.append(m + ".to_gate_logits.bias")
+        opt_keys.append("prompt_scale_shift_table")
+        opt_keys.append("audio_prompt_scale_shift_table")
+        opt_keys.append("norm1.weight")
+        opt_keys.append("audio_norm1.weight")
+        opt_keys.append("norm2.weight")
+        opt_keys.append("audio_norm2.weight")
+        opt_keys.append("norm3.weight")
+        opt_keys.append("audio_norm3.weight")
+        opt_keys.append("audio_to_video_norm.weight")
+        opt_keys.append("video_to_audio_norm.weight")
+
+        for ref ok in opt_keys:
+            if ok in block:
+                name_to_idx[ok] = len(weights)
+                weights.append(block[ok])
+
+        return LTX2AVBlockWeights(weights^, name_to_idx^, config)
+
+    def to_f32(self, ctx: DeviceContext) raises -> LTX2AVBlockWeights:
+        """Return a copy of this block with every weight cast to F32.
+
+        The 48-block residual stream (especially the 4096-dim VIDEO stream)
+        grows to |x| ~ 3e3 across the stack, where BF16 storage (~3 sig. figs,
+        step ~16 at that scale) injects framework-dependent rounding that two
+        independent BF16 implementations cannot agree on to cos >= 0.999 over 48
+        accumulations. The Python velocity oracle runs the block math in F32
+        (op-identical to the Rust BF16 path, strictly more accurate); running
+        the Mojo blocks in F32 makes the full-stack gate apples-to-apples,
+        exactly as the connector (ltx2_connector.mojo) already does for its own
+        8-block F32 stream. FP8-sourced inner weights stay at FP8 precision
+        (they were dequantized to BF16 first, then upcast here) — the F32 cast
+        only changes activation/accumulation precision, not the weights' value.
+        """
+        var weights = List[ArcPointer[Tensor]]()
+        for ref w in self.weights:
+            weights.append(ArcPointer(cast_tensor(w[], STDtype.F32, ctx)))
+        return LTX2AVBlockWeights(weights^, self.name_to_idx.copy(), self.config)
 
     def _has(self, name: String) -> Bool:
         return name in self.name_to_idx

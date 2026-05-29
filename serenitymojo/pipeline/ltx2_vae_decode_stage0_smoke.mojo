@@ -22,8 +22,8 @@ from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.vae.ltx2_vae_decoder import (
-    LTX2VaeDecoderStage0Weights,
-    decode_stage0,
+    LTX2VaeDecoderWeights,
+    decode,
 )
 
 
@@ -72,7 +72,7 @@ def main() raises:
 
     print("LTX-2.3 Video VAE decoder STAGE 0 smoke")
     print("  loading stage-0 weights from:", CKPT)
-    var weights = LTX2VaeDecoderStage0Weights.load(CKPT, ctx)
+    var weights = LTX2VaeDecoderWeights.load(CKPT, ctx)
     print("  weights loaded.")
 
     # Synthetic BF16 latent [1,128,4,8,8] (NCDHW) — small deterministic ramp.
@@ -87,17 +87,19 @@ def main() raises:
     var latent = Tensor.from_host(host, sh^, STDtype.BF16, ctx)
     _stats("input latent (NCDHW)", latent, ctx)
 
-    var out = decode_stage0[B, C, F, H, W](weights, latent, ctx)
+    var out = decode[B, C, F, H, W](weights, latent, ctx)
     var os = out.shape()
     print(
-        "  output shape (NDHWC): [", os[0], ",", os[1], ",", os[2], ",",
+        "  output shape (NCDHW): [", os[0], ",", os[1], ",", os[2], ",",
         os[3], ",", os[4], "]",
     )
-    _stats("stage0 output", out, ctx)
+    _stats("full decode output", out, ctx)
 
-    # Expected NDHWC [1, 4, 8, 8, 1024] — stage 0 preserves F/H/W, lifts C->1024.
+    # Expected NCDHW [1, 3, 1+(F-1)*8, H*32, W*32].
+    var f_out = 1 + (F - 1) * 8
     if (
-        os[0] != B or os[1] != F or os[2] != H or os[3] != W or os[4] != 1024
+        os[0] != B or os[1] != 3 or os[2] != f_out
+        or os[3] != H * 32 or os[4] != W * 32
     ):
-        raise Error("stage0 output shape mismatch")
-    print("  PASS: stage-0 forward produced finite output of expected shape.")
+        raise Error("full decode output shape mismatch")
+    print("  PASS: full decode produced finite output of expected shape.")

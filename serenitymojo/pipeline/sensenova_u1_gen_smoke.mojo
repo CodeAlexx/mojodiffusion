@@ -37,27 +37,54 @@ comptime WEIGHTS_DIR = "/home/alex/.serenity/models/sensenova_u1"
 comptime VOCAB_JSON = "/home/alex/.serenity/models/sensenova_u1/vocab.json"
 comptime MERGES_TXT = "/home/alex/.serenity/models/sensenova_u1/merges.txt"
 comptime ADDED_TOKENS_JSON = "/home/alex/.serenity/models/sensenova_u1/added_tokens.json"
-comptime OUTPUT = "/home/alex/mojodiffusion/output/sensenova_u1_smoke_64.png"
-comptime PROMPT = "a photo of a cat"
+comptime OUTPUT = "/home/alex/mojodiffusion/output/sensenova_u1_gen_512.png"
+comptime PROMPT = "a photo of a cat sitting on a windowsill"
 
-# Small smoke geometry. 64x64 image.
-comptime WIDTH = 64
-comptime HEIGHT = 64
+# Coherence geometry. 512x512 image (matches a real generation, not a plumbing smoke).
+#   patch=16, merge=2 -> grid 32x32 (256 pixel patches), token 16x16 -> L_TOKENS=256.
+comptime WIDTH = 512
+comptime HEIGHT = 512
 comptime PATCH = 16
 comptime MERGE = 2
-comptime GRID_H = HEIGHT // PATCH        # 4
-comptime GRID_W = WIDTH // PATCH         # 4
-comptime TOKEN_H = GRID_H // MERGE       # 2
-comptime TOKEN_W = GRID_W // MERGE       # 2
-comptime L_TOKENS = TOKEN_H * TOKEN_W    # 4
-comptime TEXT_LEN = 18                   # smoke conditional query token count
+comptime GRID_H = HEIGHT // PATCH        # 32
+comptime GRID_W = WIDTH // PATCH         # 32
+comptime TOKEN_H = GRID_H // MERGE       # 16
+comptime TOKEN_W = GRID_W // MERGE       # 16
+comptime L_TOKENS = TOKEN_H * TOKEN_W    # 256
+# TEXT_LEN/L_TOKENS are vestigial comptime params (the model derives all SDPA
+# shapes from runtime tensor shapes); pinned here for documentation only.
+comptime TEXT_LEN = 256                  # upper bound; real cond length is runtime
 comptime FM_OUT = (PATCH * MERGE) * (PATCH * MERGE) * 3  # 3072
 
-comptime NUM_STEPS = 2
+comptime NUM_STEPS = 20
 comptime CFG_SCALE = Float32(4.0)
 comptime TIMESTEP_SHIFT = Float32(3.0)
 comptime SEED = UInt64(42)
 comptime T_EPS = Float32(0.05)
+
+# Exact copy of SYSTEM_MESSAGE_FOR_GEN from inference-flame/src/bin/sensenova_u1_gen.rs:27.
+# The model is trained/conditioned with this system prompt for the gen task;
+# omitting it (as the old 64px plumbing smoke did) degrades conditioning.
+comptime SYSTEM_MESSAGE_FOR_GEN = String(
+    "You are an image generation and editing assistant that accurately understands and executes "
+    "user intent.\n\nYou support two modes:\n\n"
+    "1. Think Mode:\nIf the task requires reasoning, you MUST start with a <think></think> block. "
+    "Put all reasoning inside the block using plain text. DO NOT include any image tags. "
+    "Keep it reasonable and directly useful for producing the final image.\n\n"
+    "2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\n"
+    "Task Types:\n\nA. Text-to-Image Generation:\n"
+    "- Generate a high-quality image based on the user's description.\n"
+    "- Ensure visual clarity, semantic consistency, and completeness.\n"
+    "- DO NOT introduce elements that contradict or override the user's intent.\n\n"
+    "B. Image Editing:\n"
+    "- Use the provided image(s) as input or reference for modification or transformation.\n"
+    "- The result can be an edited image or a new image based on the reference(s).\n"
+    "- Preserve all unspecified attributes unless explicitly changed.\n\n"
+    "General Rules:\n"
+    "- For any visible text in the image, follow the language specified for the rendered text in "
+    "the user's description, not the language of the prompt. If no language is specified, use the "
+    "user's input language."
+)
 
 
 # ── patchify / unpatchify (mirror sensenova_u1_gen.rs:300-347) ───────────────
@@ -182,19 +209,22 @@ def main() raises:
     var tok = Qwen3Tokenizer(
         String(VOCAB_JSON), String(MERGES_TXT), String(ADDED_TOKENS_JSON)
     )
+    # cond query includes the full system message + non-think append, exactly
+    # mirroring sensenova_u1_gen.rs::run_t2i (non-think mode).
     var cond_ids = _tokenize_checked(
         tok,
         _t2i_query(
-            String(""), String(PROMPT), String("<think>\n\n</think>\n\n<img>")
+            SYSTEM_MESSAGE_FOR_GEN, String(PROMPT),
+            String("<think>\n\n</think>\n\n<img>")
         ),
         String("cond"),
-        TEXT_LEN,
+        -1,
     )
     var uncond_ids = _tokenize_checked(
         tok,
         _t2i_query(String(""), String(""), String("<img>")),
         String("uncond"),
-        9,
+        -1,
     )
     var cond_cache = model.forward_und(cond_ids, ctx)
     var uncond_cache = model.forward_und(uncond_ids, ctx)

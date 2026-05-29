@@ -43,7 +43,7 @@
 #   final norm_final eps=1e-6.
 #
 # Compile-time params HL, WL, CAPLEN make the sequence lengths comptime so the
-# foundation sdpa[B,S,H,Dh] (comptime-shaped) can be dispatched.
+# foundation sdpa_nomask[B,S,H,Dh] (comptime-shaped) can be dispatched.
 #
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation in foundation ops.
 
@@ -60,7 +60,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa
+from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu, swiglu
 from serenitymojo.ops.tensor_algebra import add, mul, concat, slice, reshape, add_scalar, permute
@@ -380,10 +380,8 @@ struct NextDiT[HL: Int, WL: Int, CAPLEN: Int]:
         q = rope_interleaved(q, cos, sin, ctx)
         k = rope_interleaved(k, cos, sin, ctx)
 
-        # SDPA, no mask (full attention; single batch all-attend). Build a
-        # zero additive mask [1, H, S, S].
-        var mask = self._zero_mask[S](ctx)
-        var attn = sdpa[1, S, 30, 128](q, k, v, mask, scale, ctx)  # [1,S,H,Dh]
+        # SDPA full attention; Rust/diffusers use no additive mask here.
+        var attn = sdpa_nomask[1, S, 30, 128](q, k, v, scale, ctx)  # [1,S,H,Dh]
 
         var asz = List[Int]()
         asz.append(1)
@@ -393,19 +391,6 @@ struct NextDiT[HL: Int, WL: Int, CAPLEN: Int]:
 
         ref ow = self._w(prefix + ".attention.to_out.0.weight")
         return linear(attn, ow, None, ctx)
-
-    def _zero_mask[S: Int](self, ctx: DeviceContext) raises -> Tensor:
-        var dtype = self._dtype()
-        var n = self.config.n_heads * S * S
-        var dev = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
-        ctx.enqueue_memset[DType.uint8](dev, 0)
-        ctx.synchronize()
-        var sh = List[Int]()
-        sh.append(1)
-        sh.append(self.config.n_heads)
-        sh.append(S)
-        sh.append(S)
-        return Tensor(dev^, sh^, dtype)
 
     # ── feed forward: w2(silu(w1(x)) * w3(x)) ──────────────────────────────
     def _feed_forward(self, x: Tensor, prefix: String, ctx: DeviceContext) raises -> Tensor:
@@ -628,13 +613,36 @@ struct NextDiT[HL: Int, WL: Int, CAPLEN: Int]:
     def forward(
         self, x: Tensor, timestep: Float32, cap_feats: Tensor, ctx: DeviceContext
     ) raises -> Tensor:
-        return self._forward_impl(x, timestep, cap_feats, ctx, -1)
+        # Comptime-exact path (verified numerics): every one of Self.CAPLEN cap
+        # rows is a real token; the model only pads up to the next multiple of
+        # 32 with the learned cap_pad_token. real_caplen = Self.CAPLEN.
+        return self._forward_impl(x, timestep, cap_feats, Self.CAPLEN, ctx, -1)
+
+    # Fixed-padded caption path (runtime prompt). cap_feats is [Self.CAPLEN,
+    # cap_feat_dim] where Self.CAPLEN is a comptime MAX; rows [real_caplen,
+    # Self.CAPLEN) are encoder outputs of PAD tokens and are OVERWRITTEN by the
+    # learned cap_pad_token inside _apply_pad_token (real_len=real_caplen). This
+    # mirrors the model's own multiple-of-32 padding, just at a larger fixed
+    # buffer. RoPE for real cap tokens is still 1..real_caplen; pad tokens take
+    # the trailing positions, and the image base position shifts to
+    # cap_padded+1 (= Self.CAPLEN+1 when CAPLEN is a multiple of 32). Z-Image
+    # SDPA uses NO caption mask (sdpa_nomask), matching diffusers which relies on
+    # the learned cap_pad_token rather than a key mask — so the padded rows
+    # participate in attention by design (same as the L2P CAP_PADDED sibling).
+    def forward_runtime_cap(
+        self, x: Tensor, timestep: Float32, cap_feats: Tensor,
+        real_caplen: Int, ctx: DeviceContext,
+    ) raises -> Tensor:
+        return self._forward_impl(x, timestep, cap_feats, real_caplen, ctx, -1)
 
     # capture_stage: -1 = full; otherwise dump nothing extra (parity uses the
     # dedicated debug method below). Kept simple: one code path.
+    # real_caplen: number of real (non-pad) caption tokens in the leading rows of
+    # cap_feats. The forward() entry passes Self.CAPLEN (comptime-exact); the
+    # runtime-prompt entry passes the true token count.
     def _forward_impl(
-        self, x: Tensor, timestep: Float32, cap_feats: Tensor, ctx: DeviceContext,
-        capture_stage: Int,
+        self, x: Tensor, timestep: Float32, cap_feats: Tensor, real_caplen: Int,
+        ctx: DeviceContext, capture_stage: Int,
     ) raises -> Tensor:
         var cfg = self.config
         var dim = cfg.dim
@@ -666,9 +674,14 @@ struct NextDiT[HL: Int, WL: Int, CAPLEN: Int]:
         var x_seq = self._unsqueeze0(xe_flat, ctx)  # [1, img_padded, dim]
 
         # cap embed -> [Self.CAPLEN, dim] -> pad to cap_padded -> cap_pad_token
+        # NOTE: real_caplen rows are real tokens; rows [real_caplen, cap_padded)
+        # are overwritten with the learned cap_pad_token. In the verified
+        # comptime-exact path real_caplen == Self.CAPLEN (only the model's own
+        # mult-of-32 slack is pad). In the runtime-prompt path real_caplen is the
+        # true token count and Self.CAPLEN is a fixed buffer max.
         var cap_e = self._cap_embedder(cap_feats, ctx)  # [Self.CAPLEN, dim]
         var cap_padded_t = self._pad_rows(cap_e, Self.CAPLEN, cap_padded, ctx)  # [cap_padded, dim]
-        cap_padded_t = self._apply_pad_token(cap_padded_t^, String("cap_pad_token"), Self.CAPLEN, ctx)
+        cap_padded_t = self._apply_pad_token(cap_padded_t^, String("cap_pad_token"), real_caplen, ctx)
         var cap_seq = self._unsqueeze0(cap_padded_t, ctx)  # [1, cap_padded, dim]
 
         # ── RoPE positions ──

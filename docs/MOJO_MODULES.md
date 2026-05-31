@@ -203,9 +203,11 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   back out of `out_in` twice. The no-aux real trainer path skips gate-residual
   `y` recomputes for discarded gate/modulation grads, and checkpointed
   single-block backward recompute uses a save-only path that stops at `out_in`
-  instead of producing a discarded block output. Latest clean 4B timing:
-  `PROG ... secs=3.950125` / `3.9545975`, loss `2.734082`, grad `0.17687473`;
-  still above the 2-3s target.
+  instead of producing a discarded block output. The real trainer now routes
+  scratch-aware stack wrappers through a shared 512 MiB `ScratchRingAllocator`
+  for block-local concat/slice temporaries. Latest clean 4B timing:
+  `PROG ... secs=3.7256575` / `3.7467637` / `3.7412038`, loss `2.734082`,
+  grad `0.17687473`; still above the 2-3s target.
 - **`models/klein/lora_block.mojo`** (289 L) — LoRA-on-projection helpers shared by the
   double/single LoRA variants; SAME math as `train_step.mojo` plus the projection
   input-grad contribution `d_x_lo`. The hot `*_device` helpers keep activation and
@@ -231,7 +233,7 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
 | Module | Purpose / key defs | Status |
 |---|---|---|
 | `scratch_ring.mojo` | `ScratchRingAllocator`: OneTrainer-style fixed GPU scratch slabs (`DType.uint8`), 16-byte aligned sub-buffer allocation, forward allocation from the head, reverse allocation from the tail for backward/recompute frames, explicit `mark`/`rewind`/`reset`, and Tensor wrappers over `create_sub_buffer`. Matches the local OneTrainer pattern in `docs/RamOffloading.md` and `modules/util/LayerOffloadConductor.py`: persistent int8 cache tensors, typed slice/view reinterpretation, and ordered forward/backward allocation. The allocator is shared infrastructure for any model, but callers must opt in and own the frame lifetime; it is not a global Tensor allocator. | **PROVEN** (`scratch_ring_smoke`: clone, alignment, mark/rewind, reset, forward+reverse allocation) |
-| `ops/tensor_algebra_scratch.mojo` | Opt-in scratch-backed hot shape helpers: `concat2_scratch`, `concat3_scratch`, `slice_scratch` for F32 rank-2 dim-1 temporaries. Kept separate from `ops/tensor_algebra.mojo` so normal model imports do not compile or use scratch kernels unless explicitly requested. | **PROVEN** (`scratch_ring_smoke`: concat2/slice/concat3 parity) |
+| `ops/tensor_algebra_scratch.mojo` | Opt-in scratch-backed hot shape helpers: `concat2_scratch`, `concat3_scratch`, `slice_scratch`. The F32 rank-2 dim-1 path keeps specialized kernels; other valid ranks/dims use copy-backed scratch output. Each helper can allocate from the ring head or tail (`reverse=True`) for backward/recompute frames. Kept separate from `ops/tensor_algebra.mojo` so normal model imports do not compile or use scratch kernels unless explicitly requested. | **PROVEN** (`scratch_ring_smoke`: concat2/slice/concat3 plus rank-4 generic concat/slice parity) |
 
 ## Training orchestration — `training/`
 
@@ -279,7 +281,7 @@ are imported only by the prepare driver, never by the loop.
 | Module | Intended role (per header, may change) | Status |
 |---|---|---|
 | `pipeline/klein_prepare_alina.mojo` (present) | REAL prepare driver for the Alina LoRA dataset: for 4 staged 512² images + captions, `KleinVaeEncoder.encode` (assert std≈0.96) + Qwen3-8B `encode_klein` (512 tok) → `write_sample` to `output/alina_cache/`. Qwen3+VAE co-reside ONLY in this process; the train process never imports Qwen3. | **IN PROGRESS** — file exists, header complete; not yet lead-run end-to-end. |
-| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It uses cached per-step modulation weights, device modulation chunks, resident RoPE tables loaded before timing, the no-aux gate-residual d_x/d_y path, save-only checkpoint recompute for unsaved single blocks, and `SGL_SAVE_TAIL = 9`. Latest measured one-step runs: `3.950125`, `3.9545975`, loss `2.734082`, grad `0.17687473`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; still above the 2-3s target. |
+| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It uses cached per-step modulation weights, device modulation chunks, resident RoPE tables loaded before timing, the no-aux gate-residual d_x/d_y path, save-only checkpoint recompute for unsaved single blocks, `SGL_SAVE_TAIL = 9`, and one 512 MiB scratch ring reset per step for scratch-aware Klein block temporaries. Latest measured one-step runs: `3.7256575`, `3.7467637`, `3.7412038`, loss `2.734082`, grad `0.17687473`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; still above the 2-3s target. |
 
 ---
 

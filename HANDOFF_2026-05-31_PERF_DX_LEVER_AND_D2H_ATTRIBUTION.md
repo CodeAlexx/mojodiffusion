@@ -45,21 +45,21 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    step-modulation weights, metadata reshape cleanup, device-resident modulation
    chunks/RoPE, single-block backward copy cleanup, no-aux gate-residual
    y-recompute skipping, save-only single-block backward recompute, and
-   `SGL_SAVE_TAIL = 9` are now **~3.95 s/step**: `3.950125`, `3.9545975`,
-   loss `2.734082`, grad `0.17687473`. Previous clean band was `3.9814968`,
-   `3.9988506`; before that `4.106987`, `4.1046743`. Prior clean state after
-   resident LoRA A/B + scratch infrastructure was **5.200673 s/step**; best
-   clean prior was **5.1468015**. This is real progress but **NOT the requested
-   2-3s target**.
+   `SGL_SAVE_TAIL = 9`, with the shared scratch ring now wired through proven
+   Klein frame lifetimes, are **~3.73-3.75 s/step**: `3.7256575`,
+   `3.7467637`, `3.7412038`, loss `2.734082`, grad `0.17687473`.
+   Previous clean band was `3.950125`, `3.9545975`; before that `3.9814968`,
+   `3.9988506` and `4.106987`, `4.1046743`. Prior clean state after resident
+   LoRA A/B + scratch infrastructure was **5.200673 s/step**; best clean prior
+   was **5.1468015**. This is real progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
    - single-block backward is the measured dominant region; next target is
      fusion/view reduction inside the single-block recompute/backward path;
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
-   - wire the enhanced forward/reverse scratch ring only at proven frame
-     boundaries where a model owns all lifetimes (all models can opt in iff
-     needed; no global allocator);
+   - extend scratch usage only at additional proven frame boundaries; the allocator
+     is shared/opt-in for all models, but it is not a global Tensor allocator;
    - longer term: BF16/mixed precision plus fused kernels. The current wall time is
      still dominated by op count and materialized tensor movement.
 
@@ -203,7 +203,9 @@ fragmentation.
   and now supports forward allocation from the head plus reverse allocation
   from the tail for backward/recompute frames.
 - `serenitymojo/ops/tensor_algebra_scratch.mojo`: opt-in `concat2_scratch`,
-  `concat3_scratch`, and `slice_scratch` for F32 rank-2 dim-1 temporaries.
+  `concat3_scratch`, and `slice_scratch` for F32 rank-2 dim-1 temporaries,
+  plus generic copy-backed fallback for other ranks/dims and a `reverse` flag
+  that allocates from the ring tail.
 - The allocator is deliberately **not global** and normal `ops/tensor_algebra.mojo`
   is unchanged. A model must opt in only where the scratch frame lifetime is
   proven safe; this satisfies "all models iff needed" without forcing scratch
@@ -356,6 +358,39 @@ tail boundary:
 This confirms the memory/speed knee moved only slightly after save-only
 recompute. Tail 9 is a small measured win; tail 10 and 12 are worse.
 
+### 2026-05-31 continuation: scratch ring wired into Klein hot path
+
+The shared OneTrainer-style ring is now used by the real Klein trainer at
+explicitly owned frame boundaries:
+
+- `ops/tensor_algebra_scratch.mojo`: `concat2_scratch`, `concat3_scratch`, and
+  `slice_scratch` now cover generic ranks/dims through a copy-backed path, while
+  preserving the specialized F32 rank-2 dim-1 kernels. Each helper can allocate
+  from the head or the tail (`reverse=True`) of the same slab.
+- `models/klein/single_block.mojo`: scratch-specific forward/recompute/backward
+  wrappers use block-local `mark`/`rewind` frames for qkv/gate-up splits and
+  backward concat/split temporaries. Long-lived backward qkv grads allocate from
+  the tail so short-lived front allocations can coexist safely.
+- `models/klein/double_block.mojo`: scratch-specific wrappers use the same frame
+  discipline for joint q/k concat, d_att concat, stream q/k/v splits, d_gu, and
+  qkv backward joins.
+- `models/klein/klein_stack_lora.mojo` and `training/train_klein_real.mojo`:
+  the real trainer owns one 512 MiB `ScratchRingAllocator`, resets it at the
+  start of each step, and routes only the scratch-aware Klein entry points
+  through it. The default Tensor allocator and non-scratch model APIs remain
+  unchanged, so other models opt in only if needed.
+
+| item | result |
+|------|--------|
+| shared scratch gate | `scratch_ring_smoke` PASS, including reverse allocation and rank-4 generic concat/slice |
+| block/stack gates | `single_block_lora_parity` PASS, `double_block_lora_parity` PASS, `klein_stack_lora_parity` PASS |
+| accepted real 4B timing runs | `3.7256575`, `3.7467637`, `3.7412038`, loss `2.734082`, grad `0.17687473` |
+| previous clean band | `3.950125`, `3.9545975`, same loss/grad |
+
+This is a measured allocator/temporary-lifetime win, not a math change. The
+remaining gap to 2-3s still needs fewer D2D materializations and fewer kernels,
+especially in single-block backward.
+
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -407,6 +442,12 @@ models/klein/single_block.mojo,
 models/klein/parity/klein_step_mod_cache_smoke.mojo,
 training/train_klein_real.mojo, docs/MOJO_MODULES.md, this handoff.
 
+Files touched in the scratch-ring hot-path wiring continuation:
+ops/tensor_algebra_scratch.mojo, scratch_ring_smoke.mojo,
+models/klein/single_block.mojo, models/klein/double_block.mojo,
+models/klein/klein_stack_lora.mojo, training/train_klein_real.mojo,
+docs/MOJO_MODULES.md, docs/MOJO_KERNELS.md, this handoff.
+
 Files touched in the no-aux gate-residual y-skip continuation:
 ops/rope_struct_backward.mojo, models/klein/single_block.mojo,
 models/klein/double_block.mojo, docs/MOJO_MODULES.md,
@@ -442,3 +483,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | No-aux gate-residual y-skip | AGENT-DEFAULT | real trainer discards aux modulation/gate grads, so `y` recompute is unnecessary for d_x/d_y and can be skipped without changing trained LoRA gradients |
 | Save-only single-block recompute | AGENT-DEFAULT | checkpointed backward needs `SingleBlockSaved`, not discarded block outputs, so unsaved single blocks can skip final output work during recompute |
 | `SGL_SAVE_TAIL = 9` | AGENT-DEFAULT | measured tail 9 improves the current save-only recompute path, while tail 10 and tail 12 cross the memory/speed knee and slow down |
+| Klein scratch hot-path wiring | USER/AGENT | user asked to finish the OneTrainer-style ring allocator; agent kept it shared/opt-in and wired only proven Klein frame lifetimes, measuring `~3.73-3.75s` with unchanged loss/grad |

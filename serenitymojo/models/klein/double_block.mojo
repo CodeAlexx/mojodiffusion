@@ -84,6 +84,7 @@ from std.math import sqrt
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.scratch_ring import ScratchRingAllocator
 
 # ── forward ops (GPU) ────────────────────────────────────────────────────────
 from serenitymojo.ops.linear import linear
@@ -94,6 +95,9 @@ from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.tensor_algebra import (
     reshape, reshape_owned, reshape_in_place, slice, concat, add,
+)
+from serenitymojo.ops.tensor_algebra_scratch import (
+    concat2_scratch, concat3_scratch, slice_scratch,
 )
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
@@ -1111,6 +1115,54 @@ def double_block_lora_forward_device_resident[
     return DoubleBlockDeviceForward(ipost.out.copy(), tpost.out.copy(), saved^)
 
 
+def double_block_lora_forward_device_resident_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_x: TArc, txt_x: TArc,
+    w: DoubleBlockWeights, img_mod: ModVecsDevice, txt_mod: ModVecsDevice, lora: DoubleBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> DoubleBlockDeviceForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t(_ones(D), [D], ctx)
+    var zeros_t = _t(_zeros(D), [D], ctx)
+
+    var ip = _stream_pre_lora_resident[H, Dh](
+        img_x, w.img, img_mod, lora.img, N_IMG, D, eps, ones_t, zeros_t, ctx)
+    var tp = _stream_pre_lora_resident[H, Dh](
+        txt_x, w.txt, txt_mod, lora.txt, N_TXT, D, eps, ones_t, zeros_t, ctx)
+
+    var qk_mark = scratch.mark()
+    var q = concat2_scratch(1, ctx, scratch, tp.q_rms[], ip.q_rms[])
+    var k = concat2_scratch(1, ctx, scratch, tp.k_rms[], ip.k_rms[])
+    var v = concat(1, ctx, tp.v[], ip.v[])
+
+    var q_rope = rope_interleaved(q, cos, sin, ctx)
+    var k_rope = rope_interleaved(k, cos, sin, ctx)
+    scratch.rewind(qk_mark)
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+
+    var txt_att_4d = slice(att, 1, 0, N_TXT, ctx)
+    var img_att_4d = slice(att, 1, N_TXT, N_IMG, ctx)
+    var txt_att = TArc(reshape_owned(txt_att_4d^, [N_TXT, D]))
+    var img_att = TArc(reshape_owned(img_att_4d^, [N_IMG, D]))
+
+    var ipost = _stream_post_lora_resident(
+        img_x, img_att, w.img, img_mod, lora.img, N_IMG, D, F, eps, ones_t, zeros_t, ctx)
+    var tpost = _stream_post_lora_resident(
+        txt_x, txt_att, w.txt, txt_mod, lora.txt, N_TXT, D, F, eps, ones_t, zeros_t, ctx)
+
+    var img_saved = _make_saved(img_x, ip, img_att, ipost)
+    var txt_saved = _make_saved(txt_x, tp, txt_att, tpost)
+    var saved = DoubleBlockSaved(
+        img_saved^, txt_saved^, TArc(q_rope^), TArc(k_rope^), TArc(v^)
+    )
+
+    return DoubleBlockDeviceForward(ipost.out.copy(), tpost.out.copy(), saved^)
+
+
 def double_block_lora_forward_device[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
@@ -1251,6 +1303,79 @@ def _stream_post_backward_lora_resident(
     return _StreamPostBackLora(base^, d_x_res_t^, TArc(d_att_t^), proj_d_a^, proj_d_b^)
 
 
+def _stream_post_backward_lora_resident_scratch(
+    d_out: TArc, x: TArc, att: TArc,
+    w: StreamWeights, mv: ModVecsDevice, lo: StreamLoraDevice, sv: StreamSaved,
+    N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> _StreamPostBackLora:
+    var grg2: GateResidualGrads
+    var d_gate2 = List[Float32]()
+    if compute_aux_grads:
+        var no_bias_mlp = Optional[Tensor](None)
+        var mlp_y = linear(sv.act[], w.wd[], no_bias_mlp^, ctx)
+        grg2 = gate_residual_backward(
+            d_out[], sv.attn_res[], mv.gate2[], mlp_y, ctx
+        )
+        d_gate2 = grg2.d_g.to_host(ctx)
+    else:
+        grg2 = gate_residual_backward_dxdy(d_out[], mv.gate2[], ctx)
+
+    var d_d_dx = linear_backward_dx(grg2.d_y, w.wd[], N, F, D, ctx)
+
+    var sgb = swiglu_backward(d_d_dx, sv.gate[], sv.up[], ctx)
+    var gu_mark = scratch.mark()
+    var d_gu = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
+
+    var d_gu_dx = linear_backward_dx(d_gu, w.wgu[], N, D, 2 * F, ctx)
+    scratch.rewind(gu_mark)
+
+    var mb2 = modulate_backward(d_gu_dx, sv.ln2[], mv.scale2[], ctx, compute_aux_grads)
+    var d_scale2 = List[Float32]()
+    var d_shift2 = List[Float32]()
+    if compute_aux_grads:
+        d_scale2 = mb2.d_scale.to_host(ctx)
+        d_shift2 = mb2.d_shift.to_host(ctx)
+
+    var d_attn_res_norm = layer_norm_backward_dx(mb2.d_x, sv.attn_res[], ones, eps, ctx)
+    var d_attn_res_total = TArc(add(grg2.d_x, d_attn_res_norm, ctx))
+
+    var grg1: GateResidualGrads
+    var d_gate1 = List[Float32]()
+    if compute_aux_grads:
+        var no_bias = Optional[Tensor](None)
+        var proj_out = linear(att[], w.wproj[], no_bias^, ctx)
+        if lo.proj:
+            var dlt = klein_lora_fwd_device_resident(att[], lo.proj.value(), N, ctx)
+            proj_out = add(proj_out, dlt, ctx)
+        grg1 = gate_residual_backward(
+            d_attn_res_total[], x[], mv.gate1[], proj_out, ctx
+        )
+        d_gate1 = grg1.d_g.to_host(ctx)
+    else:
+        grg1 = gate_residual_backward_dxdy(d_attn_res_total[], mv.gate1[], ctx)
+    var d_x_res_t = d_attn_res_total.copy()
+    var d_x_res = List[Float32]()
+
+    var d_att_t = linear_backward_dx(grg1.d_y, w.wproj[], N, D, D, ctx)
+
+    var proj_d_a = List[Float32]()
+    var proj_d_b = List[Float32]()
+    if lo.proj:
+        var lg = klein_lora_bwd_device_resident(grg1.d_y, att[], lo.proj.value(), N, ctx)
+        d_att_t = add(d_att_t, lg.d_x, ctx)
+        proj_d_a = lg.d_a.copy()
+        proj_d_b = lg.d_b.copy()
+
+    var base = _StreamPostBack(
+        d_x_res^, List[Float32](), List[Float32](), List[Float32](), List[Float32](),
+        d_gate1=d_gate1^,
+        d_shift2=d_shift2^, d_scale2=d_scale2^, d_gate2=d_gate2^,
+    )
+    return _StreamPostBackLora(base^, d_x_res_t^, TArc(d_att_t^), proj_d_a^, proj_d_b^)
+
+
 # ── LoRA-aware per-stream PRE backward ───────────────────────────────────────
 # Mirrors _stream_pre_backward; additionally, when the qkv adapter is present,
 # runs klein_lora_bwd at the wqkv output (d_qkv, input=norm) → qkv_d_a/_b and
@@ -1316,6 +1441,53 @@ def _stream_pre_backward_lora_resident[
         d_x_norm^, List[Float32](), d_q_norm^, d_k_norm^, d_shift1^, d_scale1^
     )
     return _StreamPreBackLora(base^, d_x_norm_arc^, qkv_d_a^, qkv_d_b^)
+
+
+def _stream_pre_backward_lora_resident_scratch[
+    H: Int, Dh: Int
+](
+    d_q_rms: Tensor, d_k_rms: Tensor, d_v_flat: Tensor,
+    w: StreamWeights, mv: ModVecsDevice, lo: StreamLoraDevice, sv: StreamSaved,
+    N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> _StreamPreBackLora:
+    var scratch_mark = scratch.mark()
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, sv.q_pre[], w.q_norm[], eps, ctx)
+    var d_q_norm = List[Float32]()
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, sv.k_pre[], w.k_norm[], eps, ctx)
+    var d_k_norm = List[Float32]()
+
+    var d_q_pre_flat = reshape_owned(d_q_pre^, [N, D])
+    var d_k_pre_flat = reshape_owned(d_k_pre^, [N, D])
+    var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, d_v_flat, True)
+
+    var d_norm_t = linear_backward_dx(d_qkv, w.wqkv[], N, D, 3 * D, ctx)
+
+    var qkv_d_a = List[Float32]()
+    var qkv_d_b = List[Float32]()
+    if lo.qkv:
+        var lg = klein_lora_bwd_device_resident(d_qkv, sv.norm[], lo.qkv.value(), N, ctx)
+        d_norm_t = add(d_norm_t, lg.d_x, ctx)
+        qkv_d_a = lg.d_a.copy()
+        qkv_d_b = lg.d_b.copy()
+
+    var mb1 = modulate_backward(d_norm_t, sv.ln1[], mv.scale1[], ctx, compute_aux_grads)
+    var d_scale1 = List[Float32]()
+    var d_shift1 = List[Float32]()
+    if compute_aux_grads:
+        d_scale1 = mb1.d_scale.to_host(ctx)
+        d_shift1 = mb1.d_shift.to_host(ctx)
+
+    var d_x_norm_t = layer_norm_backward_dx(mb1.d_x, sv.x[], ones, eps, ctx)
+    var d_x_norm_arc = TArc(d_x_norm_t^)
+    var d_x_norm = List[Float32]()
+    var base = _StreamPreBack(
+        d_x_norm^, List[Float32](), d_q_norm^, d_k_norm^, d_shift1^, d_scale1^
+    )
+    var out = _StreamPreBackLora(base^, d_x_norm_arc^, qkv_d_a^, qkv_d_b^)
+    scratch.rewind(scratch_mark)
+    return out^
 
 
 # ── BACKWARD of one DOUBLE block WITH LoRA on the attention projections ──────
@@ -1386,6 +1558,80 @@ def double_block_lora_backward_device_resident[
         tprb.qkv_d_a.copy(), tprb.qkv_d_b.copy(), tpb.proj_d_a.copy(), tpb.proj_d_b.copy(),
     )
     return DoubleBlockLoraDeviceGrads(img_grads^, txt_grads^)
+
+
+def double_block_lora_backward_device_resident_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_io_t: TArc, d_to_t: TArc,
+    w: DoubleBlockWeights, img_mod: ModVecsDevice, txt_mod: ModVecsDevice, lora: DoubleBlockLoraDevice,
+    saved: DoubleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> DoubleBlockLoraDeviceGrads:
+    var scratch_mark = scratch.mark()
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t(_ones(D), [D], ctx)
+
+    var ipb = _stream_post_backward_lora_resident_scratch(
+        d_io_t, saved.img.x, saved.img.att, w.img, img_mod, lora.img, saved.img,
+        N_IMG, D, F, eps, ones_t, ctx, scratch, compute_aux_grads,
+    )
+    var tpb = _stream_post_backward_lora_resident_scratch(
+        d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, lora.txt, saved.txt,
+        N_TXT, D, F, eps, ones_t, ctx, scratch, compute_aux_grads,
+    )
+
+    var d_tatt_4d = reshape(tpb.d_att[], [1, N_TXT, H, Dh], ctx)
+    var d_iatt_4d = reshape(ipb.d_att[], [1, N_IMG, H, Dh], ctx)
+    var d_att_joint = concat2_scratch(1, ctx, scratch, d_tatt_4d, d_iatt_4d)
+
+    var sb = sdpa_backward[1, S, H, Dh](
+        saved.q_rope[], saved.k_rope[], saved.v_joint[], d_att_joint, scale, ctx,
+    )
+
+    var d_q_joint = rope_backward(sb.d_q, cos, sin, True, ctx)
+    var d_k_joint = rope_backward(sb.d_k, cos, sin, True, ctx)
+
+    var d_txt_q = slice_scratch(d_q_joint, 1, 0, N_TXT, ctx, scratch)
+    var d_img_q = slice_scratch(d_q_joint, 1, N_TXT, N_IMG, ctx, scratch)
+    var d_txt_k = slice_scratch(d_k_joint, 1, 0, N_TXT, ctx, scratch)
+    var d_img_k = slice_scratch(d_k_joint, 1, N_TXT, N_IMG, ctx, scratch)
+    var d_txt_v = slice_scratch(sb.d_v, 1, 0, N_TXT, ctx, scratch)
+    var d_img_v = slice_scratch(sb.d_v, 1, N_TXT, N_IMG, ctx, scratch)
+    reshape_in_place(d_img_v, [N_IMG, D])
+    reshape_in_place(d_txt_v, [N_TXT, D])
+
+    var iprb = _stream_pre_backward_lora_resident_scratch[H, Dh](
+        d_img_q, d_img_k, d_img_v, w.img, img_mod, lora.img, saved.img,
+        N_IMG, D, eps, ones_t, ctx, scratch, compute_aux_grads,
+    )
+    var tprb = _stream_pre_backward_lora_resident_scratch[H, Dh](
+        d_txt_q, d_txt_k, d_txt_v, w.txt, txt_mod, lora.txt, saved.txt,
+        N_TXT, D, eps, ones_t, ctx, scratch, compute_aux_grads,
+    )
+
+    var d_img_x_t = TArc(add(ipb.d_x[], iprb.d_x[], ctx))
+    var d_txt_x_t = TArc(add(tpb.d_x[], tprb.d_x[], ctx))
+
+    var img_grads = StreamLoraDeviceGrads(
+        d_img_x_t^,
+        iprb.base.d_shift1.copy(), iprb.base.d_scale1.copy(), ipb.base.d_gate1.copy(),
+        ipb.base.d_shift2.copy(), ipb.base.d_scale2.copy(), ipb.base.d_gate2.copy(),
+        iprb.qkv_d_a.copy(), iprb.qkv_d_b.copy(), ipb.proj_d_a.copy(), ipb.proj_d_b.copy(),
+    )
+    var txt_grads = StreamLoraDeviceGrads(
+        d_txt_x_t^,
+        tprb.base.d_shift1.copy(), tprb.base.d_scale1.copy(), tpb.base.d_gate1.copy(),
+        tpb.base.d_shift2.copy(), tpb.base.d_scale2.copy(), tpb.base.d_gate2.copy(),
+        tprb.qkv_d_a.copy(), tprb.qkv_d_b.copy(), tpb.proj_d_a.copy(), tpb.proj_d_b.copy(),
+    )
+    var out = DoubleBlockLoraDeviceGrads(img_grads^, txt_grads^)
+    scratch.rewind(scratch_mark)
+    return out^
 
 
 def double_block_lora_backward_device[

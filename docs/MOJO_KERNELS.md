@@ -422,15 +422,17 @@ The allocator is intentionally **not** wired into `Tensor` globally. A model or
 op must opt in only when it can prove the scratch frame outlives all tensors and
 all queued device work using them.
 
-`ops/tensor_algebra_scratch.mojo` contains the first opt-in helpers:
-`concat2_scratch`, `concat3_scratch`, and `slice_scratch` for F32 rank-2 dim-1
-temporaries. They are kept in a separate module so default `tensor_algebra`
-imports keep the old allocation behavior unless a caller explicitly requests a
-scratch path.
+`ops/tensor_algebra_scratch.mojo` contains the opt-in helpers
+`concat2_scratch`, `concat3_scratch`, and `slice_scratch`. F32 rank-2 dim-1
+temporaries keep the specialized kernels; other valid ranks/dims use a
+copy-backed scratch output, which lets model code route rank-4 attention
+concat/slice temporaries through the same allocator. Each helper also accepts
+`reverse=True` to allocate from the slab tail for longer-lived backward
+temporaries.
 
 **Parity gate:** `scratch_ring_smoke.mojo` covers clone, alignment,
 mark/rewind, reset, forward+reverse allocation, scratch concat2, scratch slice,
-and scratch concat3.
+scratch concat3, and rank-4 generic concat/slice from the reverse cursor.
 
 ---
 
@@ -454,7 +456,8 @@ files read):
   hand-rolled 2-tensor case, not the multi-tensor 2-stage reduction.
 - **No CUDA-graph capture/replay, no global caching allocator.** Most Mojo ops
   still `enqueue_create_buffer` fresh. A shared opt-in scratch ring now exists,
-  but model paths must explicitly adopt it at proven frame boundaries.
+  and the real Klein LoRA path uses it for proven block-local temporaries, but
+  other model paths must explicitly adopt it at their own frame boundaries.
 
 These are expected for a from-scratch port whose proven scope is *correctness
 through composition*, not throughput. As of this session there is **no open

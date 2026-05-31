@@ -20,6 +20,188 @@ comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
 
 
+def _alloc_scratch_tensor(
+    mut scratch: ScratchRingAllocator,
+    var shape: List[Int],
+    dtype: STDtype,
+    reverse: Bool,
+) raises -> Tensor:
+    if reverse:
+        return scratch.alloc_tensor_reverse(shape^, dtype)
+    return scratch.alloc_tensor(shape^, dtype)
+
+
+def _concat2_copy_scratch(
+    dim: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    a: Tensor,
+    b: Tensor,
+    reverse: Bool,
+) raises -> Tensor:
+    var rank = len(a.shape())
+    if dim < 0 or dim >= rank:
+        raise Error("concat2_scratch: dim out of range")
+    var dt = a.dtype()
+    if b.dtype() != dt:
+        raise Error("concat2_scratch: dtype mismatch")
+    var ash = a.shape()
+    var bsh = b.shape()
+    if len(bsh) != rank:
+        raise Error("concat2_scratch: rank mismatch")
+    for ax in range(rank):
+        if ax != dim and ash[ax] != bsh[ax]:
+            raise Error("concat2_scratch: dim mismatch")
+
+    var oshape = List[Int]()
+    for ax in range(rank):
+        if ax == dim:
+            oshape.append(ash[ax] + bsh[ax])
+        else:
+            oshape.append(ash[ax])
+    var out = _alloc_scratch_tensor(scratch, oshape^, dt, reverse)
+
+    var bsz = dt.byte_size()
+    var outer = 1
+    for ax in range(dim):
+        outer *= ash[ax]
+    var inner = 1
+    for ax in range(dim + 1, rank):
+        inner *= ash[ax]
+    var sum_dim = ash[dim] + bsh[dim]
+    var out_dim_stride = sum_dim * inner
+    var col_off = 0
+    for t in range(2):
+        var in_dim = ash[dim] if t == 0 else bsh[dim]
+        var blk = in_dim * inner
+        for oslice in range(outer):
+            var src_elem = oslice * blk
+            var dst_elem = oslice * out_dim_stride + col_off * inner
+            var src_sub = a.buf.create_sub_buffer[DType.uint8](
+                src_elem * bsz, blk * bsz
+            ) if t == 0 else b.buf.create_sub_buffer[DType.uint8](
+                src_elem * bsz, blk * bsz
+            )
+            var dst_sub = out.buf.create_sub_buffer[DType.uint8](
+                dst_elem * bsz, blk * bsz
+            )
+            ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
+        col_off += in_dim
+    return out^
+
+
+def _concat3_copy_scratch(
+    dim: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    a: Tensor,
+    b: Tensor,
+    c: Tensor,
+    reverse: Bool,
+) raises -> Tensor:
+    var rank = len(a.shape())
+    if dim < 0 or dim >= rank:
+        raise Error("concat3_scratch: dim out of range")
+    var dt = a.dtype()
+    if b.dtype() != dt or c.dtype() != dt:
+        raise Error("concat3_scratch: dtype mismatch")
+    var ash = a.shape()
+    var bsh = b.shape()
+    var csh = c.shape()
+    if len(bsh) != rank or len(csh) != rank:
+        raise Error("concat3_scratch: rank mismatch")
+    for ax in range(rank):
+        if ax != dim and (ash[ax] != bsh[ax] or ash[ax] != csh[ax]):
+            raise Error("concat3_scratch: dim mismatch")
+
+    var oshape = List[Int]()
+    for ax in range(rank):
+        if ax == dim:
+            oshape.append(ash[ax] + bsh[ax] + csh[ax])
+        else:
+            oshape.append(ash[ax])
+    var out = _alloc_scratch_tensor(scratch, oshape^, dt, reverse)
+
+    var bsz = dt.byte_size()
+    var outer = 1
+    for ax in range(dim):
+        outer *= ash[ax]
+    var inner = 1
+    for ax in range(dim + 1, rank):
+        inner *= ash[ax]
+    var sum_dim = ash[dim] + bsh[dim] + csh[dim]
+    var out_dim_stride = sum_dim * inner
+    var col_off = 0
+    for t in range(3):
+        var in_dim = ash[dim]
+        if t == 1:
+            in_dim = bsh[dim]
+        elif t == 2:
+            in_dim = csh[dim]
+        var blk = in_dim * inner
+        for oslice in range(outer):
+            var src_elem = oslice * blk
+            var dst_elem = oslice * out_dim_stride + col_off * inner
+            var src_sub = a.buf.create_sub_buffer[DType.uint8](
+                src_elem * bsz, blk * bsz
+            ) if t == 0 else b.buf.create_sub_buffer[DType.uint8](
+                src_elem * bsz, blk * bsz
+            ) if t == 1 else c.buf.create_sub_buffer[DType.uint8](
+                src_elem * bsz, blk * bsz
+            )
+            var dst_sub = out.buf.create_sub_buffer[DType.uint8](
+                dst_elem * bsz, blk * bsz
+            )
+            ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
+        col_off += in_dim
+    return out^
+
+
+def _slice_copy_scratch(
+    x: Tensor,
+    dim: Int,
+    start: Int,
+    length: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    reverse: Bool,
+) raises -> Tensor:
+    var xshape = x.shape()
+    var rank = len(xshape)
+    if dim < 0 or dim >= rank:
+        raise Error("slice_scratch: dim out of range")
+    if start < 0 or length < 0 or start + length > xshape[dim]:
+        raise Error("slice_scratch: range out of bounds")
+    var oshape = List[Int]()
+    for ax in range(rank):
+        if ax == dim:
+            oshape.append(length)
+        else:
+            oshape.append(xshape[ax])
+    var out = _alloc_scratch_tensor(scratch, oshape^, x.dtype(), reverse)
+
+    var bsz = x.dtype().byte_size()
+    var outer = 1
+    for ax in range(dim):
+        outer *= xshape[ax]
+    var inner = 1
+    for ax in range(dim + 1, rank):
+        inner *= xshape[ax]
+    var in_dim = xshape[dim]
+    var blk = length * inner
+    for oslice in range(outer):
+        var src_elem = oslice * (in_dim * inner) + start * inner
+        var dst_elem = oslice * blk
+        var src_sub = x.buf.create_sub_buffer[DType.uint8](
+            src_elem * bsz, blk * bsz
+        )
+        var dst_sub = out.buf.create_sub_buffer[DType.uint8](
+            dst_elem * bsz, blk * bsz
+        )
+        ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
+    return out^
+
+
 def _concat_dim1_rank2_2_f32_kernel(
     a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
@@ -92,16 +274,17 @@ def concat2_scratch(
     mut scratch: ScratchRingAllocator,
     a: Tensor,
     b: Tensor,
+    reverse: Bool = False,
 ) raises -> Tensor:
     """concat(a,b) using scratch storage when the hot F32 rank-2 path applies."""
-    if a.dtype() != STDtype.F32 or b.dtype() != STDtype.F32:
-        return concat(dim, ctx, a, b)
     var ash = a.shape()
     var bsh = b.shape()
-    if len(ash) != 2 or len(bsh) != 2 or dim != 1:
-        return concat(dim, ctx, a, b)
-    if ash[0] != bsh[0]:
-        return concat(dim, ctx, a, b)
+    if (
+        a.dtype() != STDtype.F32 or b.dtype() != STDtype.F32
+        or len(ash) != 2 or len(bsh) != 2 or dim != 1
+        or ash[0] != bsh[0]
+    ):
+        return _concat2_copy_scratch(dim, ctx, scratch, a, b, reverse)
 
     var rows = ash[0]
     var ca = ash[1]
@@ -110,7 +293,7 @@ def concat2_scratch(
     var oshape = List[Int]()
     oshape.append(rows)
     oshape.append(ca + cb)
-    var out = scratch.alloc_tensor(oshape^, STDtype.F32)
+    var out = _alloc_scratch_tensor(scratch, oshape^, STDtype.F32, reverse)
 
     var rl_a = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * ca))
     var rl_b = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cb))
@@ -138,17 +321,18 @@ def concat3_scratch(
     a: Tensor,
     b: Tensor,
     c: Tensor,
+    reverse: Bool = False,
 ) raises -> Tensor:
     """concat(a,b,c) using scratch storage when the hot F32 rank-2 path applies."""
-    if a.dtype() != STDtype.F32 or b.dtype() != STDtype.F32 or c.dtype() != STDtype.F32:
-        return concat(dim, ctx, a, b, c)
     var ash = a.shape()
     var bsh = b.shape()
     var csh = c.shape()
-    if len(ash) != 2 or len(bsh) != 2 or len(csh) != 2 or dim != 1:
-        return concat(dim, ctx, a, b, c)
-    if ash[0] != bsh[0] or ash[0] != csh[0]:
-        return concat(dim, ctx, a, b, c)
+    if (
+        a.dtype() != STDtype.F32 or b.dtype() != STDtype.F32 or c.dtype() != STDtype.F32
+        or len(ash) != 2 or len(bsh) != 2 or len(csh) != 2 or dim != 1
+        or ash[0] != bsh[0] or ash[0] != csh[0]
+    ):
+        return _concat3_copy_scratch(dim, ctx, scratch, a, b, c, reverse)
 
     var rows = ash[0]
     var ca = ash[1]
@@ -158,7 +342,7 @@ def concat3_scratch(
     var oshape = List[Int]()
     oshape.append(rows)
     oshape.append(ca + cb + cc)
-    var out = scratch.alloc_tensor(oshape^, STDtype.F32)
+    var out = _alloc_scratch_tensor(scratch, oshape^, STDtype.F32, reverse)
 
     var rl_a = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * ca))
     var rl_b = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cb))
@@ -190,12 +374,13 @@ def slice_scratch(
     length: Int,
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
+    reverse: Bool = False,
 ) raises -> Tensor:
     """slice() using scratch storage when the hot F32 rank-2 path applies."""
     var xshape = x.shape()
     var rank = len(xshape)
     if x.dtype() != STDtype.F32 or rank != 2 or dim != 1:
-        return slice(x, dim, start, length, ctx)
+        return _slice_copy_scratch(x, dim, start, length, ctx, scratch, reverse)
     if start < 0 or length < 0 or start + length > xshape[1]:
         return slice(x, dim, start, length, ctx)
 
@@ -205,7 +390,7 @@ def slice_scratch(
     var oshape = List[Int]()
     oshape.append(rows)
     oshape.append(length)
-    var out = scratch.alloc_tensor(oshape^, STDtype.F32)
+    var out = _alloc_scratch_tensor(scratch, oshape^, STDtype.F32, reverse)
 
     var rl_x = RuntimeLayout[_DYN1].row_major(IndexList[1](rows * cols))
     var rl_o = RuntimeLayout[_DYN1].row_major(IndexList[1](n))

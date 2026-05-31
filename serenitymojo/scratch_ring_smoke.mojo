@@ -114,6 +114,19 @@ def main() raises:
     print("scratch concat3     ", r)
     all_pass = all_pass and r.passed
 
+    ring.reset()
+    var ra = Tensor.from_host(_lf(1.0, 2.0, 3.0, 4.0), [1, 2, 1, 2], F32, ctx)
+    var rb = Tensor.from_host(_lf(10.0, 11.0), [1, 1, 1, 2], F32, ctx)
+    var rcat = concat2_scratch(1, ctx, ring, ra, rb, True)
+    r = h.compare(rcat, _lf(1.0, 2.0, 3.0, 4.0, 10.0, 11.0), ctx)
+    print("scratch rank4 cat   ", r)
+    all_pass = all_pass and r.passed
+
+    var rslice = slice_scratch(rcat, 1, 1, 2, ctx, ring, True)
+    r = h.compare(rslice, _lf(3.0, 4.0, 10.0, 11.0), ctx)
+    print("scratch rank4 slice ", r)
+    all_pass = all_pass and r.passed
+
     if all_pass:
         print("ALL SCRATCH RING GATES PASSED")
     else:

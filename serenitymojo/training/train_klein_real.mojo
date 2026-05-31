@@ -45,6 +45,7 @@ from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.scratch_ring import ScratchRingAllocator
 
 from serenitymojo.models.klein.double_block import DoubleBlockWeights
 from serenitymojo.models.klein.single_block import SingleBlockWeights
@@ -56,9 +57,11 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_forward_device_inputs_resident,
     klein_stack_lora_forward_device_inputs_resident_moddev,
     klein_stack_lora_forward_device_inputs_resident_moddev_rope,
+    klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch,
     klein_stack_lora_backward, klein_stack_lora_backward_resident,
     klein_stack_lora_backward_resident_moddev,
     klein_stack_lora_backward_resident_moddev_rope,
+    klein_stack_lora_backward_resident_moddev_rope_scratch,
     klein_lora_adamw_step, save_klein_lora, load_klein_lora_resume,
 )
 from serenitymojo.models.klein.weights import (
@@ -130,6 +133,7 @@ comptime DO_SAMPLE = False
 comptime SAMPLE_STEPS = 20
 comptime SAMPLE_CFG = Float32(4.0)
 comptime SAMPLE_SEED = UInt64(42)
+comptime SCRATCH_SLAB_BYTES = 512 * 1024 * 1024
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,6 +337,8 @@ def main() raises:
     # ── open cache ────────────────────────────────────────────────────────────
     var cache = KleinCache(CACHE_DIR)
     print("  cache samples:", cache.count())
+    var scratch = ScratchRingAllocator(ctx, SCRATCH_SLAB_BYTES, 1)
+    print("  scratch ring:", SCRATCH_SLAB_BYTES, "bytes")
 
     # ── baseline sample (step 0, before any training) ─────────────────────────
     if DO_SAMPLE:
@@ -343,6 +349,7 @@ def main() raises:
 
     # ── training loop ─────────────────────────────────────────────────────────
     for k in range(1, run_steps + 1):
+        scratch.reset()
         var t0 = perf_counter_ns()
 
         # pick a sample (round-robin)
@@ -381,10 +388,10 @@ def main() raises:
         var lora_dev = klein_lora_set_to_device(lora, ctx)
 
         # forward -> velocity [N_IMG, OUT_CH]
-        var fwd = klein_stack_lora_forward_device_inputs_resident_moddev_rope[H, Dh, N_IMG, N_TXT, S](
+        var fwd = klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
             x_t_dev, TArc(txt_tokens_t^), base,
             dbw, sbw, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
-            D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx, scratch,
         )
 
         # MSE loss + d_loss = (2/N)*(velocity - target)
@@ -401,10 +408,10 @@ def main() raises:
         # backward -> LoRA grads
         var empty_img = List[Float32]()
         var empty_txt = List[Float32]()
-        var g = klein_stack_lora_backward_resident_moddev_rope[H, Dh, N_IMG, N_TXT, S](
+        var g = klein_stack_lora_backward_resident_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
             d_loss, empty_img^, empty_txt^, base,
             dbw, sbw, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
-            D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx, False, False,
+            D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx, scratch, False, False,
         )
 
         # grad_norm = L2 of ALL LoRA d_A/d_B

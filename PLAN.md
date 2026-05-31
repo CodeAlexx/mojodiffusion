@@ -3,6 +3,10 @@
 Status: DRAFT for review (2026-05-25). Not yet approved to execute.
 Owner of decisions tagged below: see "Decisions" table. AGENT-DEFAULT = I chose, you have not reviewed → override freely.
 
+Scope update 2026-05-28: Nucleus, Helios, and Stable Cascade are intentionally
+removed from the active port scope. Older draft references to them are not
+active work items.
+
 ## Goal
 
 A standalone, **inference-only**, **GPU-only**, pure-Mojo tensor/kernel library + diffusion model
@@ -28,7 +32,7 @@ Ported = the FORWARD inference subset of flame-core only:
 - Custom kernels to hand-write (CONFIRMED via inventory — all simple elementwise/reshape, NONE are tensor-core/WMMA):
   `modulate` ((1+scale)·x+shift), `residual_gate` (x+gate·y), `swiglu` (silu(gate)·up), `silu`/`gelu`
   (absent from `nn.activations`; compose from `std.math`), `patchify`/`unpatchify`, `deinterleave_pair`.
-- VERIFY in Phase 1/3 (not blockers): grouped/batched matmul in `linalg` for MoE expert FFN (Nucleus); the
+- VERIFY in Phase 1/3 (not blockers): grouped/batched matmul in `linalg` for future active MoE work; the
   correct non-causal full-attention entry for diffusion (flash entries look kv-cache/ragged-oriented for LLM serving).
 - Schedulers (pure Mojo numerics): flow-matching / Euler / UniPC.
 
@@ -68,7 +72,7 @@ the cuBLASLt/cuDNN parity shims (Mojo kernels are native + cross-vendor — thes
 ### Phase 3 — Attention + remaining custom kernels  [GATE: parity per op]
 - Attention via `nn.flash` + `nn.softmax` (find the non-causal full-attention entry; flash entries are kv-cache/ragged-oriented).
 - Custom elementwise/reshape: `swiglu`, `silu`/`gelu`, `residual_gate`, `patchify`/`unpatchify`, `deinterleave_pair`.
-- MoE: `nn.moe` routing + `nn.gather_scatter` + `linalg` grouped/batched matmul (confirm grouped path) — for Nucleus later.
+- MoE/MoT: `nn.moe` routing + `nn.gather_scatter` + `linalg` grouped/batched matmul (confirm grouped path) — for active MoT/MoE families.
 
 ### Phase 4 — Z-Image walking skeleton  [GATE: image parity vs MAX oracle + inference-flame]
 - Z-Image NextDiT forward (reference: inference-flame/src/models/zimage_nextdit.rs, line-by-line).
@@ -89,8 +93,9 @@ the cuBLASLt/cuDNN parity shims (Mojo kernels are native + cross-vendor — thes
 - This is the payoff: the same source running NVIDIA + AMD validates the entire premise.
 
 ### Phase 6+ — MAX-gap models (the real "EDv2 for Mojo" body of work)
-- Reuse the op library to port models MAX lacks: Chroma, HiDream-O1, MagiHuman(+SR), Helios, Nucleus 17B MoE,
-  SenseNova-U1, Anima/Cosmos, ERNIE. (Z-Image/Klein/Qwen/FLUX/Wan are free from MAX — not ports.)
+- Reuse the op library to port models MAX lacks: Chroma, HiDream-O1,
+  MagiHuman(+SR), SenseNova-U1, Anima/Cosmos, ERNIE. (Z-Image/Klein/Qwen/FLUX/Wan
+  are free from MAX — not ports.)
 
 ## Validation discipline (mirrors flame-core's)
 - Per-op: cos vs flame-core kernel output, BF16 atol/rtol. Reference generated per-layer on GPU, never CPU-vs-GPU.

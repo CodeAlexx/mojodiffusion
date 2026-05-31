@@ -114,7 +114,7 @@ def silu(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_silu_kernel_f16, _silu_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -189,7 +189,7 @@ def sigmoid(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_sigmoid_kernel_f16, _sigmoid_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -264,7 +264,7 @@ def gelu(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_gelu_kernel_f16, _gelu_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -358,5 +358,5 @@ def swiglu(x_gate: Tensor, x_up: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_swiglu_kernel_f16, _swiglu_kernel_f16](
             G, U, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x_gate.shape(), x_gate.dtype())

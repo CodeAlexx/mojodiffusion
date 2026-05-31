@@ -171,7 +171,7 @@ def modulate(
         ctx.enqueue_function[_modulate_kernel_f16, _modulate_kernel_f16](
             X, S, SH, O, rows, d, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, xshape.copy(), x.dtype())
 
 
@@ -313,5 +313,5 @@ def residual_gate(
         ctx.enqueue_function[_resgate_kernel_f16, _resgate_kernel_f16](
             X, G, Y, O, rows, d, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, xshape.copy(), x.dtype())

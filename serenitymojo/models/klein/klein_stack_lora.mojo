@@ -1,0 +1,567 @@
+# serenitymojo/models/klein/klein_stack_lora.mojo
+#
+# Klein (FLUX.2) FULL DiT STACK *WITH LoRA* on every trained attention
+# projection: forward (saving acts) + full-depth backward (training) that uses
+# the already-parity-verified per-block LoRA variants for EVERY block, COLLECTS
+# every adapter's d_A/d_B, and supports an AdamW step + a PEFT/ai-toolkit save
+# across all ~80 adapters. This file COMPOSES; it rebuilds NOTHING.
+#
+# WHAT IS ALREADY PROVEN (cos>=0.999 vs torch) AND ONLY REUSED HERE
+#   * models/klein/double_block.mojo : double_block_lora_forward/backward
+#       (img/txt × qkv/proj LoRA, d_A/d_B vs torch cos>=0.999).
+#   * models/klein/single_block.mojo : single_block_lora_forward/backward
+#       (qkv-rows on w1 + cols on w2 LoRA, d_A/d_B vs torch cos>=0.999).
+#   * models/klein/klein_stack.mojo : the BASE full-stack fwd+bwd composition
+#       (input proj → modulation → N double → concat → N single → final layer;
+#       per-block recompute backward). THIS FILE IS THAT FILE with the base
+#       per-block calls swapped for the LoRA variants + LoRA-grad collection.
+#   * models/klein/lora_block.mojo + training/train_step.mojo : LoraAdapter,
+#       _make_lora init (A small randn, B=0), _lora_adamw (the per-adapter AdamW).
+#
+# CARRIER DESIGN (Tenet-2: make the right thing easy)
+#   With 8 double + 24 single blocks the trained-adapter count is large
+#   (8×4 + 24×2 = 80 at real depth). Rather than 80 named fields, KleinLoraSet
+#   holds ONE flat `List[LoraAdapter]` indexed by a deterministic scheme:
+#       doubles first: block bi, slot s in {img_qkv,img_proj,txt_qkv,txt_proj}
+#           flat = bi*4 + s                       (s = 0..3)
+#       singles next : block bi, slot s in {qkv,out}
+#           flat = num_double*4 + bi*2 + s        (s = 0..1)
+#   The forward threads each block's adapters by BUILDING a transient
+#   DoubleBlockLora / SingleBlockLora from those flat slots (LoraAdapter is
+#   Copyable). The backward SCATTERS the returned per-block d_A/d_B back into a
+#   matching flat KleinLoraGrads. klein_lora_adamw_step walks the two flat lists
+#   in lockstep and runs _lora_adamw on every adapter.
+#
+# SCOPE: LoRA-on-attention-projection training. Base weights (input/output proj,
+#   modulation, the qkv/proj/w1/w2 linears) are FROZEN — their grads are computed
+#   by the base path and discarded for the optimizer; only d_A/d_B are trained.
+#   The shared modvec grads are still summed-across-blocks and returned (NOT
+#   backpropped into the modulation MLP — that link is a later finetune phase).
+#
+# Mojo 1.0.0b1: `def` not `fn`; Tensor move-only (return Movable structs, never
+# store Tensor in a collection); host List[Float32] are the Copyable carriers;
+# no-bias linear = linear(x, w, Optional[Tensor](None), ctx).
+
+from std.gpu.host import DeviceContext
+from std.collections import List, Optional
+from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+
+from serenitymojo.models.klein.double_block import (
+    DoubleBlockWeights, ModVecs, DoubleBlockGrads,
+    StreamLora, DoubleBlockLora, DoubleBlockLoraGrads,
+    double_block_lora_forward, double_block_lora_backward,
+)
+from serenitymojo.models.klein.single_block import (
+    SingleBlockWeights, SingleModVecs, SingleBlockGrads,
+    SingleBlockLora, SingleBlockLoraGrads,
+    single_block_lora_forward, single_block_lora_backward,
+)
+from serenitymojo.models.klein.klein_stack import (
+    KleinStackBase, KleinStackForward,
+    _add_lists, _zeros, _ones, _t, _linear_fwd, _linear_fwd_wdev,
+    _concat_seq, _split_seq, _concat3, _modvec6,
+)
+from serenitymojo.ops.norm import layer_norm
+from serenitymojo.ops.elementwise import modulate
+from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.norm_backward import layer_norm_backward
+from serenitymojo.ops.elementwise_backward import modulate_backward
+
+from serenitymojo.models.klein.lora_block import LoraAdapter
+from serenitymojo.training.train_step import LoraGrads, _lora_adamw
+from serenitymojo.training.lora_save import NamedLora, save_lora_peft, load_lora_for_resume
+
+
+# ── flat-index slot scheme (the carrier's contract) ──────────────────────────
+# Double slots (per block): 0=img_qkv 1=img_proj 2=txt_qkv 3=txt_proj.
+# Single slots (per block): 0=qkv 1=out.
+comptime DBL_SLOTS = 4
+comptime SGL_SLOTS = 2
+comptime BK_DOUBLE = 0
+comptime BK_SINGLE = 1
+
+
+# ── adapter init (A small randn, B=0 — PEFT identity at step 0) ───────────────
+# Standalone of train_step._make_lora that takes rank/alpha directly (this file
+# is config-agnostic; the loop-builder supplies rank/alpha).
+def _randn(n: Int, seed: UInt64, scale: Float32) -> List[Float32]:
+    var out = List[Float32]()
+    var state = seed
+    for _ in range(n):
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u = Float32(Int(state >> 40)) * Float32(1.0 / 16777216.0)
+        out.append((u - Float32(0.5)) * scale)
+    return out^
+
+
+def make_lora_adapter(
+    rank: Int, alpha: Float32, in_f: Int, out_f: Int, seed: UInt64
+) -> LoraAdapter:
+    var scale = alpha / Float32(rank)
+    return LoraAdapter(
+        _randn(rank * in_f, seed, 0.01),   # A small randn
+        _zeros(out_f * rank),              # B = 0 (adapter identity at init)
+        rank, in_f, out_f, scale,
+        _zeros(rank * in_f), _zeros(rank * in_f),    # ma / va
+        _zeros(out_f * rank), _zeros(out_f * rank),  # mb / vb
+    )
+
+
+# ── the LoRA carrier: every trained adapter, flat-indexed ────────────────────
+struct KleinLoraSet(Copyable, Movable):
+    var dbl: List[LoraAdapter]   # num_double * DBL_SLOTS, slot order img_qkv,img_proj,txt_qkv,txt_proj
+    var sgl: List[LoraAdapter]   # num_single * SGL_SLOTS, slot order qkv,out
+    var num_double: Int
+    var num_single: Int
+    var rank: Int
+
+    def __init__(
+        out self, var dbl: List[LoraAdapter], var sgl: List[LoraAdapter],
+        num_double: Int, num_single: Int, rank: Int,
+    ):
+        self.dbl = dbl^
+        self.sgl = sgl^
+        self.num_double = num_double
+        self.num_single = num_single
+        self.rank = rank
+
+
+# Accessor by (block_kind, block_idx, slot) → a COPY of the adapter. (LoraAdapter
+# is Copyable; this is the read accessor the task asks for.)
+def klein_lora_get(
+    set: KleinLoraSet, block_kind: Int, block_idx: Int, slot: Int
+) -> LoraAdapter:
+    if block_kind == BK_DOUBLE:
+        return set.dbl[block_idx * DBL_SLOTS + slot].copy()
+    return set.sgl[block_idx * SGL_SLOTS + slot].copy()
+
+
+# ── build the full LoRA set for a Klein stack ────────────────────────────────
+# dims: D (model dim) for the projection in/out shapes:
+#   double img/txt qkv : in=D out=3D ; double img/txt proj : in=D out=D.
+#   single qkv (w1 rows): in=D out=3D ; single out (w2 cols): in=D out=D.
+# Each adapter gets a distinct seed so A is non-degenerate per slot.
+def build_klein_lora_set(
+    num_double: Int, num_single: Int, D: Int, rank: Int, alpha: Float32
+) -> KleinLoraSet:
+    var dbl = List[LoraAdapter]()
+    var seed = UInt64(1000)
+    for _ in range(num_double):
+        # slot 0 img_qkv (in=D,out=3D)
+        dbl.append(make_lora_adapter(rank, alpha, D, 3 * D, seed)); seed += 1
+        # slot 1 img_proj (in=D,out=D)
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1
+        # slot 2 txt_qkv (in=D,out=3D)
+        dbl.append(make_lora_adapter(rank, alpha, D, 3 * D, seed)); seed += 1
+        # slot 3 txt_proj (in=D,out=D)
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1
+    var sgl = List[LoraAdapter]()
+    for _ in range(num_single):
+        # slot 0 qkv on w1 rows (in=D,out=3D)
+        sgl.append(make_lora_adapter(rank, alpha, D, 3 * D, seed)); seed += 1
+        # slot 1 out on w2 cols (in=D,out=D)
+        sgl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1
+    return KleinLoraSet(dbl^, sgl^, num_double, num_single, rank)
+
+
+# build a transient DoubleBlockLora for block bi from the flat set.
+def _dbl_lora_for(set: KleinLoraSet, bi: Int) -> DoubleBlockLora:
+    var base = bi * DBL_SLOTS
+    var img = StreamLora(
+        Optional[LoraAdapter](set.dbl[base + 0].copy()),
+        Optional[LoraAdapter](set.dbl[base + 1].copy()),
+    )
+    var txt = StreamLora(
+        Optional[LoraAdapter](set.dbl[base + 2].copy()),
+        Optional[LoraAdapter](set.dbl[base + 3].copy()),
+    )
+    return DoubleBlockLora(img^, txt^)
+
+
+# build a transient SingleBlockLora for block bi from the flat set.
+def _sgl_lora_for(set: KleinLoraSet, bi: Int) -> SingleBlockLora:
+    var base = bi * SGL_SLOTS
+    return SingleBlockLora(
+        Optional[LoraAdapter](set.sgl[base + 0].copy()),
+        Optional[LoraAdapter](set.sgl[base + 1].copy()),
+    )
+
+
+# ── the collected LoRA grads (flat, parallel to KleinLoraSet) ────────────────
+# Plus the base-weight grads (computed, discarded for the optimizer) and the
+# load-bearing input-token grads + shared modvec grads (same as KleinStackGrads).
+struct KleinLoraGrads(Copyable, Movable):
+    # flat LoRA grads: d_a/d_b per adapter, SAME flat order as KleinLoraSet.dbl/sgl.
+    var dbl_d_a: List[List[Float32]]   # num_double*DBL_SLOTS
+    var dbl_d_b: List[List[Float32]]
+    var sgl_d_a: List[List[Float32]]   # num_single*SGL_SLOTS
+    var sgl_d_b: List[List[Float32]]
+    # load-bearing input-token grads (prove the whole chain).
+    var d_img_tokens: List[Float32]
+    var d_txt_tokens: List[Float32]
+    # shared modulation-vector grads (summed across blocks; NOT into the mod MLP).
+    var d_img_mod: List[Float32]       # [6D]
+    var d_txt_mod: List[Float32]       # [6D]
+    var d_single_mod: List[Float32]    # [3D]
+    # base-weight grads (optional to consume; FROZEN params, discarded by AdamW).
+    var d_img_in: List[Float32]
+    var d_txt_in: List[Float32]
+    var d_final_lin: List[Float32]
+    var d_final_shift: List[Float32]
+    var d_final_scale: List[Float32]
+
+    def __init__(
+        out self,
+        var dbl_d_a: List[List[Float32]], var dbl_d_b: List[List[Float32]],
+        var sgl_d_a: List[List[Float32]], var sgl_d_b: List[List[Float32]],
+        var d_img_tokens: List[Float32], var d_txt_tokens: List[Float32],
+        var d_img_mod: List[Float32], var d_txt_mod: List[Float32],
+        var d_single_mod: List[Float32],
+        var d_img_in: List[Float32], var d_txt_in: List[Float32],
+        var d_final_lin: List[Float32],
+        var d_final_shift: List[Float32], var d_final_scale: List[Float32],
+    ):
+        self.dbl_d_a = dbl_d_a^
+        self.dbl_d_b = dbl_d_b^
+        self.sgl_d_a = sgl_d_a^
+        self.sgl_d_b = sgl_d_b^
+        self.d_img_tokens = d_img_tokens^
+        self.d_txt_tokens = d_txt_tokens^
+        self.d_img_mod = d_img_mod^
+        self.d_txt_mod = d_txt_mod^
+        self.d_single_mod = d_single_mod^
+        self.d_img_in = d_img_in^
+        self.d_txt_in = d_txt_in^
+        self.d_final_lin = d_final_lin^
+        self.d_final_shift = d_final_shift^
+        self.d_final_scale = d_final_scale^
+
+
+# ── FULL FORWARD WITH LoRA (checkpoint inputs only retained) ─────────────────
+# Mirrors klein_stack_forward exactly, swapping the per-block calls for the
+# LoRA variants. `saved` carries the LoRA-MODIFIED activations so the backward
+# recompute regenerates them identically.
+def klein_stack_lora_forward[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraSet,
+    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
+    cos: List[Float32], sin: List[Float32],
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> KleinStackForward:
+    var num_double = len(dbw)
+    var num_single = len(sbw)
+
+    # Resident rope tables: upload ONCE for the whole stack pass (was re-uploaded
+    # per block via cos.copy()/sin.copy() → from_host). Borrowed into every block.
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+
+    var img = _linear_fwd_wdev(img_tokens, base.img_in[], N_IMG, in_ch, ctx)
+    var txt = _linear_fwd_wdev(txt_tokens, base.txt_in[], N_TXT, txt_ch, ctx)
+    var img_in_act = img.copy()
+    var txt_in_act = txt.copy()
+
+    var dbl_img_in = List[List[Float32]]()
+    var dbl_txt_in = List[List[Float32]]()
+    for bi in range(num_double):
+        dbl_img_in.append(img.copy())
+        dbl_txt_in.append(txt.copy())
+        var bl = _dbl_lora_for(lora, bi)
+        var fwd = double_block_lora_forward[H, Dh, N_IMG, N_TXT, S](
+            img.copy(), txt.copy(), dbw[bi], img_mod, txt_mod, bl,
+            cos_t, sin_t, D, F, eps, ctx,
+        )
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+
+    var x = _concat_seq(txt, img)
+
+    var sgl_x_in = List[List[Float32]]()
+    for bi in range(num_single):
+        sgl_x_in.append(x.copy())
+        var sl = _sgl_lora_for(lora, bi)
+        var fwd = single_block_lora_forward[H, Dh, S](
+            x.copy(), sbw[bi], single_mod, sl, cos_t, sin_t, D, F, eps, ctx,
+        )
+        x = fwd.out.copy()
+
+    var parts = _split_seq(x, N_TXT, N_IMG, D)
+    var img_out = parts[1].copy()
+
+    var ln_img_out = layer_norm(
+        _t(img_out, [N_IMG, D], ctx),
+        _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+    ).to_host(ctx)
+    var normed = modulate(
+        _t(ln_img_out, [N_IMG, D], ctx),
+        base.final_scale[], base.final_shift[], ctx,
+    ).to_host(ctx)
+    var out = _linear_fwd_wdev(normed, base.final_lin[], N_IMG, D, ctx)
+
+    return KleinStackForward(
+        out^, img_in_act^, txt_in_act^,
+        dbl_img_in^, dbl_txt_in^, sgl_x_in^,
+        img_out^, ln_img_out^,
+    )
+
+
+# ── FULL BACKWARD WITH LoRA (full-depth; per-block recompute) ────────────────
+# Mirrors klein_stack_backward, calling the LoRA per-block backward and
+# COLLECTING every adapter's d_A/d_B into the flat KleinLoraGrads.
+def klein_stack_lora_backward[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraSet,
+    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
+    cos: List[Float32], sin: List[Float32],
+    saved: KleinStackForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> KleinLoraGrads:
+    var num_double = len(dbw)
+    var num_single = len(sbw)
+
+    # Resident rope tables: upload ONCE for the whole backward pass (recompute
+    # forward + block backward both borrow these instead of per-call from_host).
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+
+    # ── final layer backward (frozen base) ──
+    var normed = modulate(
+        _t(saved.ln_img_out, [N_IMG, D], ctx),
+        base.final_scale[], base.final_shift[], ctx,
+    ).to_host(ctx)
+    var lbf = linear_backward(
+        _t(d_out, [N_IMG, out_ch], ctx), _t(normed, [N_IMG, D], ctx),
+        base.final_lin[],
+        N_IMG, D, out_ch, ctx,
+    )
+    var d_normed = lbf.d_x.to_host(ctx)
+    var d_final_lin = lbf.d_w.to_host(ctx)
+
+    var mbf = modulate_backward(
+        _t(d_normed, [N_IMG, D], ctx), _t(saved.ln_img_out, [N_IMG, D], ctx),
+        base.final_scale[], ctx,
+    )
+    var d_ln_img_out = mbf.d_x.to_host(ctx)
+    var d_final_scale = mbf.d_scale.to_host(ctx)
+    var d_final_shift = mbf.d_shift.to_host(ctx)
+
+    var lnbf = layer_norm_backward(
+        _t(d_ln_img_out, [N_IMG, D], ctx), _t(saved.img_out, [N_IMG, D], ctx),
+        _t(_ones(D), [D], ctx), eps, ctx,
+    )
+    var d_img_out = lnbf.d_x.to_host(ctx)
+
+    var d_x = _concat_seq(_zeros(N_TXT * D), d_img_out)
+
+    # flat single LoRA grads collected in FORWARD order (block 0..num_single-1).
+    var sgl_d_a = List[List[Float32]]()
+    var sgl_d_b = List[List[Float32]]()
+    for _ in range(num_single * SGL_SLOTS):
+        sgl_d_a.append(List[Float32]())
+        sgl_d_b.append(List[Float32]())
+
+    # ── single-stream backward (REVERSE; per-block recompute) ──
+    var d_single_mod = _zeros(3 * D)
+    var bi = num_single - 1
+    while bi >= 0:
+        var sl = _sgl_lora_for(lora, bi)
+        var fwd = single_block_lora_forward[H, Dh, S](
+            saved.sgl_x_in[bi].copy(), sbw[bi], single_mod, sl,
+            cos_t, sin_t, D, F, eps, ctx,
+        )
+        var bg = single_block_lora_backward[H, Dh, S](
+            d_x.copy(), sbw[bi], single_mod, sl, fwd.saved, cos_t, sin_t,
+            D, F, eps, ctx,
+        )
+        d_x = bg.base.d_x.copy()
+        d_single_mod = _add_lists(
+            d_single_mod,
+            _concat3(bg.base.d_shift, bg.base.d_scale, bg.base.d_gate),
+        )
+        # scatter into the flat slots (qkv=slot0, out=slot1).
+        var sbase = bi * SGL_SLOTS
+        sgl_d_a[sbase + 0] = bg.qkv_d_a.copy()
+        sgl_d_b[sbase + 0] = bg.qkv_d_b.copy()
+        sgl_d_a[sbase + 1] = bg.out_d_a.copy()
+        sgl_d_b[sbase + 1] = bg.out_d_b.copy()
+        bi -= 1
+
+    # double→single seam: split d_x [S,D] back into d_txt_out, d_img_out.
+    var seam = _split_seq(d_x, N_TXT, N_IMG, D)
+    var d_txt_out = seam[0].copy()
+    var d_img_out2 = seam[1].copy()
+
+    # flat double LoRA grads (slot order img_qkv,img_proj,txt_qkv,txt_proj).
+    var dbl_d_a = List[List[Float32]]()
+    var dbl_d_b = List[List[Float32]]()
+    for _ in range(num_double * DBL_SLOTS):
+        dbl_d_a.append(List[Float32]())
+        dbl_d_b.append(List[Float32]())
+
+    # ── double-stream backward (REVERSE; per-block recompute) ──
+    var d_img_mod = _zeros(6 * D)
+    var d_txt_mod = _zeros(6 * D)
+    var di = num_double - 1
+    var d_io = d_img_out2.copy()
+    var d_to = d_txt_out.copy()
+    while di >= 0:
+        var bl = _dbl_lora_for(lora, di)
+        var fwd = double_block_lora_forward[H, Dh, N_IMG, N_TXT, S](
+            saved.dbl_img_in[di].copy(), saved.dbl_txt_in[di].copy(),
+            dbw[di], img_mod, txt_mod, bl, cos_t, sin_t, D, F, eps, ctx,
+        )
+        var bg = double_block_lora_backward[H, Dh, N_IMG, N_TXT, S](
+            d_io.copy(), d_to.copy(), dbw[di], img_mod, txt_mod, bl, fwd.saved,
+            cos_t, sin_t, D, F, eps, ctx,
+        )
+        d_io = bg.base.img.d_x.copy()
+        d_to = bg.base.txt.d_x.copy()
+        d_img_mod = _add_lists(d_img_mod, _modvec6(bg.base.img))
+        d_txt_mod = _add_lists(d_txt_mod, _modvec6(bg.base.txt))
+        # scatter into the flat slots.
+        var dbase = di * DBL_SLOTS
+        dbl_d_a[dbase + 0] = bg.img.qkv_d_a.copy()
+        dbl_d_b[dbase + 0] = bg.img.qkv_d_b.copy()
+        dbl_d_a[dbase + 1] = bg.img.proj_d_a.copy()
+        dbl_d_b[dbase + 1] = bg.img.proj_d_b.copy()
+        dbl_d_a[dbase + 2] = bg.txt.qkv_d_a.copy()
+        dbl_d_b[dbase + 2] = bg.txt.qkv_d_b.copy()
+        dbl_d_a[dbase + 3] = bg.txt.proj_d_a.copy()
+        dbl_d_b[dbase + 3] = bg.txt.proj_d_b.copy()
+        di -= 1
+
+    # ── input-projection backward (frozen base; d_tokens load-bearing) ──
+    var lbi = linear_backward(
+        _t(d_io, [N_IMG, D], ctx), _t(img_tokens, [N_IMG, in_ch], ctx),
+        base.img_in[],
+        N_IMG, in_ch, D, ctx,
+    )
+    var d_img_tokens = lbi.d_x.to_host(ctx)
+    var d_img_in = lbi.d_w.to_host(ctx)
+
+    var lbt = linear_backward(
+        _t(d_to, [N_TXT, D], ctx), _t(txt_tokens, [N_TXT, txt_ch], ctx),
+        base.txt_in[],
+        N_TXT, txt_ch, D, ctx,
+    )
+    var d_txt_tokens = lbt.d_x.to_host(ctx)
+    var d_txt_in = lbt.d_w.to_host(ctx)
+
+    return KleinLoraGrads(
+        dbl_d_a^, dbl_d_b^, sgl_d_a^, sgl_d_b^,
+        d_img_tokens^, d_txt_tokens^,
+        d_img_mod^, d_txt_mod^, d_single_mod^,
+        d_img_in^, d_txt_in^, d_final_lin^, d_final_shift^, d_final_scale^,
+    )
+
+
+# ── AdamW step on EVERY adapter (reuses the proven per-adapter _lora_adamw) ───
+# Walks the flat dbl/sgl adapter lists in lockstep with the flat grads and
+# mutates A/B (and the carried ma/va/mb/vb) in place. `t` is the 1-based step.
+def klein_lora_adamw_step(
+    mut set: KleinLoraSet, grads: KleinLoraGrads, t: Int, lr: Float32,
+    ctx: DeviceContext,
+) raises:
+    var nd = set.num_double * DBL_SLOTS
+    for i in range(nd):
+        var lg = LoraGrads(grads.dbl_d_a[i].copy(), grads.dbl_d_b[i].copy())
+        _lora_adamw(set.dbl[i], lg, t, lr, ctx)
+    var ns = set.num_single * SGL_SLOTS
+    for i in range(ns):
+        var lg = LoraGrads(grads.sgl_d_a[i].copy(), grads.sgl_d_b[i].copy())
+        _lora_adamw(set.sgl[i], lg, t, lr, ctx)
+
+
+# ── per-block PEFT/ai-toolkit prefix scheme (the INVERSE of lora.mojo loader) ─
+# lora.mojo::_map_klein_trainer accepts exactly these prefixes (lora.mojo:215-237):
+#   double_blocks.<i>.img_attn.qkv_proj   (FULL slot on .img_attn.qkv.weight)
+#   double_blocks.<i>.img_attn.out_proj   (FULL slot on .img_attn.proj.weight)
+#   double_blocks.<i>.txt_attn.qkv_proj   (FULL slot on .txt_attn.qkv.weight)
+#   double_blocks.<i>.txt_attn.out_proj   (FULL slot on .txt_attn.proj.weight)
+#   single_blocks.<i>.qkv_proj            (ROWS slot on .linear1.weight)
+#   single_blocks.<i>.out_proj            (COLS slot on .linear2.weight)
+# save_lora_peft appends .lora_A.weight / .lora_B.weight, so the saved file is
+# byte-exact loadable by lora.mojo (DiffusionModel format) and ai-toolkit.
+def _klein_lora_prefix(block_kind: Int, block_idx: Int, slot: Int) -> String:
+    if block_kind == BK_DOUBLE:
+        var b = String("double_blocks.") + String(block_idx)
+        if slot == 0:
+            return b + ".img_attn.qkv_proj"
+        elif slot == 1:
+            return b + ".img_attn.out_proj"
+        elif slot == 2:
+            return b + ".txt_attn.qkv_proj"
+        else:
+            return b + ".txt_attn.out_proj"
+    var s = String("single_blocks.") + String(block_idx)
+    if slot == 0:
+        return s + ".qkv_proj"
+    return s + ".out_proj"
+
+
+# Build the ordered prefix list for the whole set (doubles first, then singles),
+# matching the flat KleinLoraSet index order. Exposed so the resume loader and
+# the save use the SAME order.
+def klein_lora_prefixes(num_double: Int, num_single: Int) -> List[String]:
+    var out = List[String]()
+    for bi in range(num_double):
+        for s in range(DBL_SLOTS):
+            out.append(_klein_lora_prefix(BK_DOUBLE, bi, s))
+    for bi in range(num_single):
+        for s in range(SGL_SLOTS):
+            out.append(_klein_lora_prefix(BK_SINGLE, bi, s))
+    return out^
+
+
+# ── SAVE every adapter as a PEFT/ai-toolkit safetensors ──────────────────────
+# Returns the number of (A,B) pairs written (== total adapters).
+def save_klein_lora(set: KleinLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    var named = List[NamedLora]()
+    for bi in range(set.num_double):
+        for s in range(DBL_SLOTS):
+            named.append(NamedLora(
+                _klein_lora_prefix(BK_DOUBLE, bi, s),
+                set.dbl[bi * DBL_SLOTS + s].copy(),
+            ))
+    for bi in range(set.num_single):
+        for s in range(SGL_SLOTS):
+            named.append(NamedLora(
+                _klein_lora_prefix(BK_SINGLE, bi, s),
+                set.sgl[bi * SGL_SLOTS + s].copy(),
+            ))
+    return save_lora_peft(named, path, ctx)
+
+
+# ── RESUME: load the adapter A/B back from a save_klein_lora file ────────────
+# AdamW moments are ZEROED (resume them from a loop TrainState checkpoint, the
+# same contract as load_lora_for_resume). The returned set carries the SAME flat
+# order build_klein_lora_set produces, so the AdamW step + save round-trip.
+def load_klein_lora_resume(
+    num_double: Int, num_single: Int, rank: Int, alpha: Float32,
+    path: String, ctx: DeviceContext,
+) raises -> KleinLoraSet:
+    var prefixes = klein_lora_prefixes(num_double, num_single)
+    var scale = alpha / Float32(rank)
+    var named = load_lora_for_resume(prefixes, scale, path, ctx)   # flat order
+    # split the flat NamedLora list back into dbl/sgl flat adapter lists.
+    var dbl = List[LoraAdapter]()
+    var sgl = List[LoraAdapter]()
+    var n_dbl = num_double * DBL_SLOTS
+    for i in range(n_dbl):
+        dbl.append(named[i].adapter.copy())
+    var n_sgl = num_single * SGL_SLOTS
+    for i in range(n_sgl):
+        sgl.append(named[n_dbl + i].adapter.copy())
+    return KleinLoraSet(dbl^, sgl^, num_double, num_single, rank)

@@ -283,6 +283,69 @@ def _joint_attention[
     return StreamPair(proj_x^, proj_y^)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Joint attention WITH text RoPE (use_text_rope=True path). Identical to
+# _joint_attention but also rotates qy/ky with the broadcast text RoPE tables.
+# ════════════════════════════════════════════════════════════════════════════
+def _joint_attention_textrope[
+    H: Int, hd: Int, Nx: Int, Ny: Int
+](
+    x_n: Tensor, y_n: Tensor,            # [1,Nx,C], [1,Ny,C]
+    w: MMDiTBlockWeights,
+    rope_cos_h: Tensor, rope_sin_h: Tensor,    # [Nx*H, hd/2] image RoPE
+    trope_cos_h: Tensor, trope_sin_h: Tensor,  # [Ny*H, hd/2] text RoPE
+    C: Int,
+    ctx: DeviceContext,
+) raises -> StreamPair:
+    var qkv_x = linear(x_n, w.qkv_x_w, None, ctx)
+    var qkv_y = linear(y_n, w.qkv_y_w, None, ctx)
+    var qx = slice(qkv_x, 2, 0, C, ctx)
+    var kx = slice(qkv_x, 2, C, C, ctx)
+    var vx = slice(qkv_x, 2, 2 * C, C, ctx)
+    var qy = slice(qkv_y, 2, 0, C, ctx)
+    var ky = slice(qkv_y, 2, C, C, ctx)
+    var vy = slice(qkv_y, 2, 2 * C, C, ctx)
+
+    var qxn = _qk_norm_per_head(qx, w.q_norm_x_w, Nx, H, hd, ctx)
+    var kxn = _qk_norm_per_head(kx, w.k_norm_x_w, Nx, H, hd, ctx)
+    var qyn = _qk_norm_per_head(qy, w.q_norm_y_w, Ny, H, hd, ctx)
+    var kyn = _qk_norm_per_head(ky, w.k_norm_y_w, Ny, H, hd, ctx)
+
+    # image RoPE
+    var qx_rows = reshape(qxn, [Nx * H, hd], ctx)
+    var kx_rows = reshape(kxn, [Nx * H, hd], ctx)
+    var qx_rot = rope_interleaved(qx_rows, rope_cos_h, rope_sin_h, ctx)
+    var kx_rot = rope_interleaved(kx_rows, rope_cos_h, rope_sin_h, ctx)
+    # text RoPE (1D)
+    var qy_rows = reshape(qyn, [Ny * H, hd], ctx)
+    var ky_rows = reshape(kyn, [Ny * H, hd], ctx)
+    var qy_rot = rope_interleaved(qy_rows, trope_cos_h, trope_sin_h, ctx)
+    var ky_rot = rope_interleaved(ky_rows, trope_cos_h, trope_sin_h, ctx)
+
+    var qx_bshd = reshape(qx_rot, [1, Nx, H, hd], ctx)
+    var kx_bshd = reshape(kx_rot, [1, Nx, H, hd], ctx)
+    var vx_bshd = reshape(vx, [1, Nx, H, hd], ctx)
+    var qy_bshd = reshape(qy_rot, [1, Ny, H, hd], ctx)
+    var ky_bshd = reshape(ky_rot, [1, Ny, H, hd], ctx)
+    var vy_bshd = reshape(vy, [1, Ny, H, hd], ctx)
+
+    var q_joint = concat(1, ctx, qy_bshd, qx_bshd)
+    var k_joint = concat(1, ctx, ky_bshd, kx_bshd)
+    var v_joint = concat(1, ctx, vy_bshd, vx_bshd)
+
+    comptime S = Ny + Nx
+    var scale = Float32(1.0) / Float32(hd) ** Float32(0.5)
+    var out_joint = sdpa_nomask[1, S, H, hd](q_joint, k_joint, v_joint, scale, ctx)
+
+    var out_y_bshd = slice(out_joint, 1, 0, Ny, ctx)
+    var out_x_bshd = slice(out_joint, 1, Ny, Nx, ctx)
+    var out_y_flat = reshape(out_y_bshd, [1, Ny, C], ctx)
+    var out_x_flat = reshape(out_x_bshd, [1, Nx, C], ctx)
+    var proj_x = linear(out_x_flat, w.proj_x_w, Optional[Tensor](_clone(w.proj_x_b, ctx)), ctx)
+    var proj_y = linear(out_y_flat, w.proj_y_w, Optional[Tensor](_clone(w.proj_y_b, ctx)), ctx)
+    return StreamPair(proj_x^, proj_y^)
+
+
 def _swiglu_ffn(
     x: Tensor, w1: Tensor, w3: Tensor, w2: Tensor, ctx: DeviceContext
 ) raises -> Tensor:
@@ -342,6 +405,58 @@ def mmdit_block_forward[
     var y1 = residual_gate(y, gate_msa_y, attn.y, ctx)
 
     # ── 2) per-stream SwiGLU FFN with AdaLN ───────────────────────────────────
+    var x_mlp_in = modulate(rms_norm(x1, w.norm_x2_w, Float32(1e-6), ctx), scale_mlp_x, shift_mlp_x, ctx)
+    var y_mlp_in = modulate(rms_norm(y1, w.norm_y2_w, Float32(1e-6), ctx), scale_mlp_y, shift_mlp_y, ctx)
+    var x_mlp = _swiglu_ffn(x_mlp_in, w.mlp_x_w1, w.mlp_x_w3, w.mlp_x_w2, ctx)
+    var y_mlp = _swiglu_ffn(y_mlp_in, w.mlp_y_w1, w.mlp_y_w3, w.mlp_y_w2, ctx)
+    var x_out = residual_gate(x1, gate_mlp_x, x_mlp, ctx)
+    var y_out = residual_gate(y1, gate_mlp_y, y_mlp, ctx)
+    return StreamPair(x_out^, y_out^)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MMDiTBlockT2I.forward WITH text RoPE (use_text_rope=True; the released PiD
+# config). Takes precomputed image (rope_*) and text (trope_*) [N, hd/2] tables.
+# ════════════════════════════════════════════════════════════════════════════
+def mmdit_block_forward_textrope[
+    H: Int, hd: Int, Nx: Int, Ny: Int
+](
+    x: Tensor, y: Tensor, c: Tensor,
+    rope_cos: Tensor, rope_sin: Tensor,    # [Nx, hd/2] image RoPE
+    trope_cos: Tensor, trope_sin: Tensor,  # [Ny, hd/2] text RoPE
+    w: MMDiTBlockWeights,
+    C: Int,
+    ctx: DeviceContext,
+) raises -> StreamPair:
+    var half = hd // 2
+    var ci = linear(c, w.adaln_img_w, Optional[Tensor](_clone(w.adaln_img_b, ctx)), ctx)
+    var ct = linear(c, w.adaln_txt_w, Optional[Tensor](_clone(w.adaln_txt_b, ctx)), ctx)
+    var shift_msa_x = _chunk6_vec(ci, C, 0, ctx)
+    var scale_msa_x = _chunk6_vec(ci, C, 1, ctx)
+    var gate_msa_x = _chunk6_vec(ci, C, 2, ctx)
+    var shift_mlp_x = _chunk6_vec(ci, C, 3, ctx)
+    var scale_mlp_x = _chunk6_vec(ci, C, 4, ctx)
+    var gate_mlp_x = _chunk6_vec(ci, C, 5, ctx)
+    var shift_msa_y = _chunk6_vec(ct, C, 0, ctx)
+    var scale_msa_y = _chunk6_vec(ct, C, 1, ctx)
+    var gate_msa_y = _chunk6_vec(ct, C, 2, ctx)
+    var shift_mlp_y = _chunk6_vec(ct, C, 3, ctx)
+    var scale_mlp_y = _chunk6_vec(ct, C, 4, ctx)
+    var gate_mlp_y = _chunk6_vec(ct, C, 5, ctx)
+
+    var rope_cos_h = _broadcast_rope_to_heads(rope_cos, Nx, H, half, ctx)
+    var rope_sin_h = _broadcast_rope_to_heads(rope_sin, Nx, H, half, ctx)
+    var trope_cos_h = _broadcast_rope_to_heads(trope_cos, Ny, H, half, ctx)
+    var trope_sin_h = _broadcast_rope_to_heads(trope_sin, Ny, H, half, ctx)
+
+    var x_norm = modulate(rms_norm(x, w.norm_x1_w, Float32(1e-6), ctx), scale_msa_x, shift_msa_x, ctx)
+    var y_norm = modulate(rms_norm(y, w.norm_y1_w, Float32(1e-6), ctx), scale_msa_y, shift_msa_y, ctx)
+    var attn = _joint_attention_textrope[H, hd, Nx, Ny](
+        x_norm, y_norm, w, rope_cos_h, rope_sin_h, trope_cos_h, trope_sin_h, C, ctx
+    )
+    var x1 = residual_gate(x, gate_msa_x, attn.x, ctx)
+    var y1 = residual_gate(y, gate_msa_y, attn.y, ctx)
+
     var x_mlp_in = modulate(rms_norm(x1, w.norm_x2_w, Float32(1e-6), ctx), scale_mlp_x, shift_mlp_x, ctx)
     var y_mlp_in = modulate(rms_norm(y1, w.norm_y2_w, Float32(1e-6), ctx), scale_mlp_y, shift_mlp_y, ctx)
     var x_mlp = _swiglu_ffn(x_mlp_in, w.mlp_x_w1, w.mlp_x_w3, w.mlp_x_w2, ctx)

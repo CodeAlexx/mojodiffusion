@@ -18,3 +18,15 @@ __pycache__/
 
 # Session archive artifact (324 MB) — not source
 serenitymojo.zip
+
+# Parity oracle weight dumps (regenerable from parity/*.py + GPU, same as *.bin)
+*.safetensors
+
+# Logs (run/profile/skeptic) — not source
+*.log
+
+# Generated probe/sample images
+*.png
+
+# Agent scratch (not source)
+.claude/agent-memory/

@@ -489,7 +489,7 @@ def _sdpa_math[
         )
         ctx.enqueue_function[_scatter_bhsd_to_bshd_f16, _scatter_bhsd_to_bshd_f16](
             out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
 
     var out_shape = List[Int]()
     out_shape.append(B)
@@ -568,7 +568,7 @@ def _sdpa_flash[
             out_buf.unsafe_ptr().bitcast[Float16]()
         )
         flash_attention(O, Q, K, V, M, scale, dcp)
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
 
     var out_shape = List[Int]()
     out_shape.append(B)
@@ -576,6 +576,14 @@ def _sdpa_flash[
     out_shape.append(H)
     out_shape.append(Dh)
     return Tensor(out_buf^, out_shape^, q.dtype())
+
+
+# Whether to route Dh==64 attention through the SDK flash_attention kernel.
+# FALSE on purpose: benched 2026-05-29 on RTX 3090 Ti (sm_86), the SDK flash
+# kernel at Dh=64 is ~2607 us/iter — ~31x SLOWER than flame-core's cuDNN and
+# slower than our own math-mode path. So Dh==64 also uses math-mode here.
+# Flip to True once Modular's flash kernel is fast on the target arch.
+comptime _USE_SDK_FLASH_DH64 = False
 
 
 def sdpa[
@@ -596,10 +604,11 @@ def sdpa[
     scale:   Float32         (typically 1/sqrt(Dh))
     returns  [B, S, H, Dh]   (q's dtype).
 
-    B/S/H/Dh are compile-time params. DISPATCH (comptime on Dh): Dh==64 uses the
-    SDK flash_attention kernel (works + is faster on sm_86); every other Dh uses
-    a math-mode path (matmuls + softmax) because flash's MMA tiling fails to
-    compile for Dh in {128, 512, ...} on this GPU. See SDPA_DH128_REPRO.md.
+    B/S/H/Dh are compile-time params. DISPATCH: math-mode (cuBLAS matmuls + F32
+    softmax) is used for ALL Dh by default. The SDK flash_attention kernel is
+    gated behind `_USE_SDK_FLASH_DH64` (currently False) because on sm_86 it is
+    ~31x slower than cuDNN at Dh=64 and fails to compile at Dh in {128,512,...}
+    (the MMA-tiling wall). See SDPA_DH128_REPRO.md and the 2026-05-29 perf bench.
     """
     if q.dtype() != k.dtype() or q.dtype() != v.dtype():
         raise Error("sdpa: q/k/v dtype mismatch")
@@ -625,7 +634,7 @@ def sdpa[
     ):
         raise Error("sdpa: mask must be [B,H,S,S]")
 
-    comptime if Dh == 64:
+    comptime if Dh == 64 and _USE_SDK_FLASH_DH64:
         return _sdpa_flash[B, S, H, Dh](q, k, v, mask, scale, ctx)
     else:
         return _sdpa_math[B, S, H, Dh](q, k, v, mask, scale, ctx, True)

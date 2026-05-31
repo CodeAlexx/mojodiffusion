@@ -217,8 +217,7 @@ def rms_norm(
         ctx.enqueue_function[_rms_norm_kernel_f16, _rms_norm_kernel_f16](
             X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
         )
-    ctx.synchronize()
-
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, xshape.copy(), x.dtype())
 
 
@@ -456,8 +455,7 @@ def layer_norm(
         ctx.enqueue_function[_layer_norm_kernel_f16, _layer_norm_kernel_f16](
             X, G, B, O, d, eps, grid_dim=rows, block_dim=_TPB
         )
-    ctx.synchronize()
-
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, xshape.copy(), x.dtype())
 
 
@@ -763,6 +761,5 @@ def group_norm(
             X, G, B, O, n, h, w, c, num_groups, eps,
             grid_dim=blocks, block_dim=_TPB,
         )
-    ctx.synchronize()
-
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, xshape.copy(), x.dtype())

@@ -1,0 +1,682 @@
+# serenitymojo/models/klein/single_block.mojo
+#
+# Klein (FLUX.2) SINGLE-STREAM DiT block: forward (saving activations) +
+# hand-chained backward (training), packaged as a reusable unit in the EXACT
+# style proven by serenitymojo/models/klein/double_block.mojo (the double-stream
+# block, gated 28/28 vs torch). This is that pattern HALVED + flattened: ONE
+# stream, a parallel attention+MLP FLUX single block (NO img/txt coupling).
+#
+# DEVICE-RESIDENT INTERIOR (Increment 1 perf refactor, 2026-05-30)
+#   The PUBLIC API is unchanged: `x` enters as host `List[Float32]`, `out` and all
+#   grads leave as host `List[Float32]` (so klein_stack_lora.mojo and the parity
+#   gates compile with ZERO changes). But INTERNALLY the chain now threads device
+#   `Tensor`s op-to-op: `from_host(x)` runs ONCE at the forward entry, `.to_host`
+#   runs ONCE on the returned `out`; saved activations are device `Tensor`s moved
+#   straight from the producing op into `SingleBlockSaved` (no `.to_host()` /
+#   `.clone()` per intermediate). The OLD code bounced EVERY intermediate op's
+#   output to host (`.to_host` → `from_host`), forcing ~70 host-stall syncs per
+#   block (from_host syncs, to_host syncs). Removing the per-INTERMEDIATE bounce
+#   is the entire win; the boundary from_host/to_host stay.
+#
+#   Tensor is MOVE-ONLY, so `SingleBlockSaved` / `SingleBlockForward` are now
+#   Movable-ONLY (Copyable dropped). VERIFIED no caller `.copy()`s a
+#   SingleBlockForward or its `.saved`: klein_stack.mojo / klein_stack_lora.mojo
+#   and both parity gates construct `var fwd = ...forward(...)` then read
+#   `fwd.saved` BY BORROW into backward (they only `.copy()` the `out` List).
+#
+#   The qkv|gate_up channel split, the q/k/v split, and their backward scatters
+#   are now DEVICE slice/concat (ops/tensor_algebra.slice + .concat) instead of
+#   host row-loops. reshape [S,D]<->[1,S,H,Dh] is a row-major byte no-op, so it
+#   is just a Tensor reshape (ops/tensor_algebra.reshape) — same bytes.
+#
+# WHY HOST List[Float32] STILL AT THE API BOUNDARY
+#   The boundary contract is fixed by the callers (stack + gates pass host lists).
+#   The LoRA-delta helpers (lora_block.mojo klein_lora_fwd/bwd, klein_take_cols,
+#   klein_add_cols) are host-list-typed and OUT OF SCOPE for this increment, so
+#   the LoRA branches bridge device<->host AT THOSE CALLS ONLY (small, present
+#   only when an adapter is set). The dominant base chain is fully device-resident.
+#
+# FORWARD GRAPH (mirrors models/dit/klein_dit.mojo `_single_block`, lines 354-390)
+#   With precomputed AdaLN vectors (shift, scale, gate) each [D] from single_mod:
+#     x_norm   = modulate(layer_norm(x,1,0,eps), scale, shift)   # (1+scale)*LN+shift
+#     fused    = linear(x_norm, W1)                              # [1,S, 3D+2F]
+#     qkv      = fused[:, :, :3D]    ; gate_up = fused[:, :, 3D:3D+2F]  (CHANNEL slice)
+#     q,k,v    = split qkv into 3x [1,S,H,Dh]
+#     q        = rms_norm(q, q_norm[Dh]) ; k = rms_norm(k, k_norm[Dh])  (eps 1e-6)
+#     att      = sdpa_nomask(rope_interleaved(q,cos,sin),
+#                            rope_interleaved(k,cos,sin), v, 1/sqrt(Dh))
+#     att_flat = reshape(att, [1,S,D])
+#     mlp_gate = gate_up[:, :, :F] ; mlp_up = gate_up[:, :, F:2F]
+#     mlp      = swiglu(mlp_gate, mlp_up)                        # [1,S,F]
+#     out_in   = concat(axis=2, att_flat, mlp)                   # [1,S, D+F]  CHANNEL concat
+#     out      = linear(out_in, W2)                              # W2 [D, D+F]
+#     result   = residual_gate(x, gate, out)                     # x + gate*out
+#
+# KEY DIFFERENCES from the double block (all handled below):
+#   (1) the att/mlp concat is on the CHANNEL axis (axis=2, sizes D and F), not
+#       the sequence axis -> cat_backward(grad, size0=D, size1=F, axis=2).
+#   (2) the qkv/gate_up split is a contiguous CHANNEL slice of `fused`.
+#   (3) modulate uses the SAME modulate_backward -> layer_norm_backward chain
+#       (LN weight=1 bias=0, discard LN d_g/d_b).
+#   (4) gate_residual_backward needs the gated `y` = `out`; recompute
+#       out = linear(out_in, W2) in the backward (cheap).
+#   single_mod's shift/scale/gate are INPUTS; their grads are OUTPUTS but do NOT
+#   backprop into the modulation MLP (exactly like the double block's ModVecs).
+#
+# Mojo 1.0.0b1: `def` not `fn`; Tensor move-only (return Movable structs, never
+# store Tensor in a collection); no-bias linear = linear(x, w, Optional(None), ctx).
+
+from std.gpu.host import DeviceContext
+from std.collections import List, Optional
+from std.math import sqrt
+from std.memory import ArcPointer
+from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+
+
+# TArc = the Copyable device carrier (ArcPointer[Tensor]); a copy is a refcount
+# bump of the SAME device buffer (no D2D, no sync). Mirrors autograd.mojo:50.
+comptime TArc = ArcPointer[Tensor]
+
+# ── forward ops (GPU) ────────────────────────────────────────────────────────
+from serenitymojo.ops.linear import linear
+from serenitymojo.ops.norm import rms_norm, layer_norm
+from serenitymojo.ops.activations import swiglu
+from serenitymojo.ops.elementwise import modulate, residual_gate
+from serenitymojo.ops.rope import rope_interleaved
+from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.tensor_algebra import reshape, slice, concat
+
+# ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
+from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx, LinearGrads
+from serenitymojo.ops.norm_backward import (
+    rms_norm_backward, RmsNormBackward,
+    layer_norm_backward, LayerNormBackward,
+)
+from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
+from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
+from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
+from serenitymojo.ops.rope_struct_backward import (
+    gate_residual_backward, GateResidualGrads, rope_backward,
+)
+from serenitymojo.ops.shape_backward import (
+    cat_backward, CatGrads2, slice_backward, reshape_backward,
+)
+
+
+# ── host helpers ─────────────────────────────────────────────────────────────
+def _add_lists(a: List[Float32], b: List[Float32]) -> List[Float32]:
+    var o = List[Float32]()
+    for i in range(len(a)):
+        o.append(a[i] + b[i])
+    return o^
+
+
+def _ones(d: Int) -> List[Float32]:
+    var o = List[Float32]()
+    for _ in range(d):
+        o.append(1.0)
+    return o^
+
+
+def _zeros(d: Int) -> List[Float32]:
+    var o = List[Float32]()
+    for _ in range(d):
+        o.append(0.0)
+    return o^
+
+
+# F32 host-list -> device Tensor helper (boundary / weight upload only).
+def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+
+
+# ── single modulation vectors (each [D]) ─────────────────────────────────────
+struct SingleModVecs(Copyable, Movable):
+    var shift: List[Float32]
+    var scale: List[Float32]
+    var gate: List[Float32]
+
+    def __init__(
+        out self,
+        var shift: List[Float32], var scale: List[Float32], var gate: List[Float32],
+    ):
+        self.shift = shift^
+        self.scale = scale^
+        self.gate = gate^
+
+
+# ── trainable weights (A2: DEVICE-RESIDENT, uploaded ONCE) ────────────────────
+#   w1: [3D+2F, D]   (fused qkv + gate_up projection; "linear1")
+#   w2: [D, D+F]     (output projection; "linear2")
+#   q_norm/k_norm: [Dh]  (per-head rms scale)
+#
+# A2 PERF (2026-05-31): the FROZEN base matrices are now device-resident `TArc`
+# carriers uploaded EXACTLY ONCE at construction (load time), not host
+# List[Float32] re-uploaded by `_t(w.field.copy(), ...)` on every op every step.
+# `__init__` takes the host lists (loader + gates pass byte-identical data) + the
+# dims/ctx to upload each at its real shape; use-sites pass `w.field[]` (a borrow
+# of the SAME resident buffer) — no per-op from_host, no per-op sync.
+struct SingleBlockWeights(Copyable, Movable):
+    var w1: TArc        # [3D+2F, D]
+    var w2: TArc        # [D, D+F]
+    var q_norm: TArc    # [Dh]
+    var k_norm: TArc    # [Dh]
+
+    def __init__(
+        out self,
+        var w1: List[Float32], var w2: List[Float32],
+        var q_norm: List[Float32], var k_norm: List[Float32],
+        D: Int, F: Int, Dh: Int, ctx: DeviceContext,
+    ) raises:
+        self.w1 = TArc(Tensor.from_host(w1^, [3 * D + 2 * F, D], STDtype.F32, ctx))
+        self.w2 = TArc(Tensor.from_host(w2^, [D, D + F], STDtype.F32, ctx))
+        self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.F32, ctx))
+        self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.F32, ctx))
+
+
+# ── saved activations (DEVICE-RESIDENT) ──────────────────────────────────────
+# Move-only (Tensor is move-only). Each field is the fresh device Tensor returned
+# by the producing op, MOVED in (no .clone() / .to_host()). Consumed by-borrow in
+# the backward; no caller copies a SingleBlockSaved.
+struct SingleBlockSaved(Movable):
+    var x: Tensor        # [S,D]      block input
+    var ln: Tensor       # [S,D]      layer_norm(x)
+    var norm: Tensor     # [S,D]      modulate(ln, scale, shift)
+    var q_pre: Tensor    # [1,S,H,Dh] q before rms (post-qkv split)
+    var k_pre: Tensor    # [1,S,H,Dh]
+    var q_rms: Tensor    # [1,S,H,Dh] rms_norm(q_pre, q_norm)
+    var k_rms: Tensor    # [1,S,H,Dh]
+    var v: Tensor        # [1,S,H,Dh]
+    var q_rope: Tensor   # [1,S,H,Dh] rope(q_rms)
+    var k_rope: Tensor   # [1,S,H,Dh] rope(k_rms)
+    var att_flat: Tensor # [S,D]      reshape(sdpa(...))
+    var mlp_gate: Tensor # [S,F]      gate_up[:, :F]
+    var mlp_up: Tensor   # [S,F]      gate_up[:, F:2F]
+    var mlp: Tensor      # [S,F]      swiglu(mlp_gate, mlp_up)
+    var out_in: Tensor   # [S, D+F]   concat(axis=1, att_flat, mlp)
+    # cos/sin are NOT saved (constant rope tables borrowed by the backward).
+
+    def __init__(
+        out self,
+        var x: Tensor, var ln: Tensor, var norm: Tensor,
+        var q_pre: Tensor, var k_pre: Tensor,
+        var q_rms: Tensor, var k_rms: Tensor, var v: Tensor,
+        var q_rope: Tensor, var k_rope: Tensor,
+        var att_flat: Tensor,
+        var mlp_gate: Tensor, var mlp_up: Tensor, var mlp: Tensor,
+        var out_in: Tensor,
+    ):
+        self.x = x^
+        self.ln = ln^
+        self.norm = norm^
+        self.q_pre = q_pre^
+        self.k_pre = k_pre^
+        self.q_rms = q_rms^
+        self.k_rms = k_rms^
+        self.v = v^
+        self.q_rope = q_rope^
+        self.k_rope = k_rope^
+        self.att_flat = att_flat^
+        self.mlp_gate = mlp_gate^
+        self.mlp_up = mlp_up^
+        self.mlp = mlp^
+        self.out_in = out_in^
+
+
+struct SingleBlockForward(Movable):
+    var out: List[Float32]   # [S, D]  (host: the block output, boundary readback)
+    var saved: SingleBlockSaved
+
+    def __init__(out self, var out: List[Float32], var saved: SingleBlockSaved):
+        self.out = out^
+        self.saved = saved^
+
+
+# ── backward result: input grad + all trainable weight grads + mod-vec grads ─
+struct SingleBlockGrads(Copyable, Movable):
+    var d_x: List[Float32]
+    var d_w1: List[Float32]
+    var d_w2: List[Float32]
+    var d_q_norm: List[Float32]
+    var d_k_norm: List[Float32]
+    # modulation-vector grads (block outputs; not backproped into mod MLP)
+    var d_shift: List[Float32]
+    var d_scale: List[Float32]
+    var d_gate: List[Float32]
+
+    def __init__(
+        out self,
+        var d_x: List[Float32], var d_w1: List[Float32], var d_w2: List[Float32],
+        var d_q_norm: List[Float32], var d_k_norm: List[Float32],
+        var d_shift: List[Float32], var d_scale: List[Float32], var d_gate: List[Float32],
+    ):
+        self.d_x = d_x^
+        self.d_w1 = d_w1^
+        self.d_w2 = d_w2^
+        self.d_q_norm = d_q_norm^
+        self.d_k_norm = d_k_norm^
+        self.d_shift = d_shift^
+        self.d_scale = d_scale^
+        self.d_gate = d_gate^
+
+
+# ── FORWARD of one SINGLE block ──────────────────────────────────────────────
+# cos/sin: precomputed rope tables for the sequence, [S*H, Dh/2], resident.
+def single_block_forward[
+    H: Int, Dh: Int, S: Int
+](
+    x: List[Float32],
+    w: SingleBlockWeights, mv: SingleModVecs,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> SingleBlockForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    # resident layer_norm ones[D]/zeros[D] + qkv weights (uploaded once).
+    var ones_t = _t(_ones(D), [D], ctx)
+    var zeros_t = _t(_zeros(D), [D], ctx)
+
+    # x ENTERS host -> ONE from_host. Everything below stays on-device.
+    # The GPU ops BORROW their Tensor args, so an activation can feed a downstream
+    # op AND still be moved into `SingleBlockSaved` afterwards — no per-op
+    # .to_host()/from_host() round-trip (that bounce was the whole cost). The only
+    # host transfer is the single `x` in and the single `out` readback.
+    var x_t = _t(x, [S, D], ctx)
+
+    # x_norm = modulate(layer_norm(x), scale, shift)
+    var ln_t = layer_norm(x_t, ones_t, zeros_t, eps, ctx)
+    var norm_t = modulate(ln_t, _t(mv.scale.copy(), [D], ctx), _t(mv.shift.copy(), [D], ctx), ctx)
+
+    # fused = linear(x_norm, W1) ; [S, 3D+2F]
+    var no_bias = Optional[Tensor](None)
+    var fused = linear(norm_t, w.w1[], no_bias^, ctx)
+
+    # channel split: qkv [S,3D] | gate_up [S,2F]  (device slice on dim 1)
+    var qkv = slice(fused, 1, 0, 3 * D, ctx)
+    var gate_up = slice(fused, 1, 3 * D, 2 * F, ctx)
+
+    # q,k,v: each [S,D] (== [1,S,H,Dh] byte-identical)
+    var q_pre_flat = slice(qkv, 1, 0, D, ctx)
+    var k_pre_flat = slice(qkv, 1, D, D, ctx)
+    var v_flat = slice(qkv, 1, 2 * D, D, ctx)
+    # reshape [S,D] -> [1,S,H,Dh] is a row-major byte no-op.
+    var q_pre = reshape(q_pre_flat, [1, S, H, Dh], ctx)
+    var k_pre = reshape(k_pre_flat, [1, S, H, Dh], ctx)
+    var v = reshape(v_flat, [1, S, H, Dh], ctx)
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+
+    # rope then sdpa (cos/sin borrowed — resident)
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    # reshape [1,S,H,Dh] -> [S,D] is a byte no-op.
+    var att_flat = reshape(att, [S, D], ctx)
+
+    # mlp branch
+    var mlp_gate = slice(gate_up, 1, 0, F, ctx)
+    var mlp_up = slice(gate_up, 1, F, F, ctx)
+    var mlp = swiglu(mlp_gate, mlp_up, ctx)
+
+    # concat on CHANNEL axis (dim 1): out_in [S, D+F]
+    var out_in = concat(1, ctx, att_flat, mlp)
+
+    # out = linear(out_in, W2) ; W2 [D, D+F]
+    var no_bias2 = Optional[Tensor](None)
+    var out_proj = linear(out_in, w.w2[], no_bias2^, ctx)
+
+    # result = residual_gate(x, gate, out) ; ONE boundary readback (inline).
+    var result = residual_gate(
+        x_t, _t(mv.gate.copy(), [D], ctx), out_proj, ctx
+    ).to_host(ctx)
+
+    var saved = SingleBlockSaved(
+        x_t^, ln_t^, norm_t^, q_pre^, k_pre^, q_rms^, k_rms^, v^,
+        q_rope^, k_rope^, att_flat^, mlp_gate^, mlp_up^, mlp^, out_in^,
+    )
+    return SingleBlockForward(result^, saved^)
+
+
+# ── BACKWARD of one SINGLE block (hand-chained) ──────────────────────────────
+# d_out: upstream grad of the block output [S,D] (host list in; from_host ONCE).
+def single_block_backward[
+    H: Int, Dh: Int, S: Int
+](
+    d_out: List[Float32],
+    w: SingleBlockWeights, mv: SingleModVecs, saved: SingleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> SingleBlockGrads:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t(_ones(D), [D], ctx)
+    var scale_t = _t(mv.scale.copy(), [D], ctx)
+    var gate_t = _t(mv.gate.copy(), [D], ctx)
+
+    var d_out_t = _t(d_out, [S, D], ctx)
+
+    # result = residual_gate(x, gate, out): o = x + gate*out
+    # `out` (the gated `y`) is recomputed = linear(out_in, W2).
+    var nb = Optional[Tensor](None)
+    var out_y = linear(saved.out_in, w.w2[], nb^, ctx)
+    var grg = gate_residual_backward(d_out_t, saved.x, gate_t, out_y, ctx)
+    # d_x_res (residual branch) and d_out_proj kept device-resident.
+    var d_gate = grg.d_g.to_host(ctx)
+
+    # out = linear(out_in, W2)
+    var lb_w2 = linear_backward(
+        grg.d_y, saved.out_in, w.w2[], S, D + F, D, ctx,
+    )
+    # d_out_in = lb_w2.d_x [S, D+F] ; d_w2 = lb_w2.d_w
+    var d_w2 = lb_w2.d_w.to_host(ctx)
+
+    # out_in = concat(axis=2, att_flat, mlp) on the CHANNEL axis (sizes D, F).
+    # d_out_in is [S, D+F]; reshape to [1,S,D+F] for cat_backward on axis=2.
+    var d_out_in_3d = reshape(lb_w2.d_x, [1, S, D + F], ctx)
+    var cb = cat_backward(d_out_in_3d, D, F, 2, ctx)
+    var d_att_flat = reshape(cb.d_0, [1, S, H, Dh], ctx)   # [1,S,D] == [1,S,H,Dh]
+    var d_mlp = reshape(cb.d_1, [S, F], ctx)               # [1,S,F] == [S,F]
+
+    # mlp = swiglu(mlp_gate, mlp_up)
+    var sgb = swiglu_backward(d_mlp, saved.mlp_gate, saved.mlp_up, ctx)
+    # join gate/up grads back into gate_up [S,2F] (device concat on dim 1)
+    var d_gate_up = concat(1, ctx, sgb.d_gate, sgb.d_up)
+
+    # att branch: d_att_flat [1,S,H,Dh] -> sdpa backward.
+    var sb = sdpa_backward[1, S, H, Dh](
+        saved.q_rope, saved.k_rope, saved.v, d_att_flat, scale, ctx,
+    )
+    # d_q_rope/d_k_rope/d_v device-resident in sb.
+
+    # rope backward (cos/sin non-learnable -> only d_x); cos/sin borrowed resident
+    var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
+    var d_k_rms = rope_backward(sb.d_k, cos, sin, True, ctx)
+
+    # rms_norm backward for q and k
+    var rb_q = rms_norm_backward(d_q_rms, saved.q_pre, w.q_norm[], eps, ctx)
+    var d_q_norm = rb_q.d_g.to_host(ctx)
+    var rb_k = rms_norm_backward(d_k_rms, saved.k_pre, w.k_norm[], eps, ctx)
+    var d_k_norm = rb_k.d_g.to_host(ctx)
+
+    # join d_q_pre|d_k_pre|d_v into d_qkv [S,3D] (reshape each [1,S,H,Dh]->[S,D],
+    # then device concat on dim 1).
+    var d_q_pre_flat = reshape(rb_q.d_x, [S, D], ctx)
+    var d_k_pre_flat = reshape(rb_k.d_x, [S, D], ctx)
+    var d_v_flat = reshape(sb.d_v, [S, D], ctx)
+    var d_qkv = concat(1, ctx, d_q_pre_flat, d_k_pre_flat, d_v_flat)
+
+    # join the qkv grad and gate_up grad back into d_fused [S, 3D+2F]
+    var d_fused = concat(1, ctx, d_qkv, d_gate_up)
+
+    # fused = linear(norm, W1)
+    var lb_w1 = linear_backward(
+        d_fused, saved.norm, w.w1[], S, D, 3 * D + 2 * F, ctx,
+    )
+    var d_w1 = lb_w1.d_w.to_host(ctx)
+    # d_norm = lb_w1.d_x
+
+    # norm = modulate(ln, scale, shift)
+    var mb = modulate_backward(lb_w1.d_x, saved.ln, scale_t, ctx)
+    var d_scale = mb.d_scale.to_host(ctx)
+    var d_shift = mb.d_shift.to_host(ctx)
+
+    # ln = layer_norm(x, 1, 0)
+    var lnb = layer_norm_backward(mb.d_x, saved.x, ones_t, eps, ctx)
+
+    # x feeds BOTH the residual (grg.d_x) AND layer_norm(x) -> SUM.
+    # gate_residual_backward gives d_x = grad_out (passthrough); sum on host at
+    # the boundary readback (both are [S,D] device grads).
+    var d_x_res = grg.d_x.to_host(ctx)
+    var d_x_norm = lnb.d_x.to_host(ctx)
+    var d_x = _add_lists(d_x_res, d_x_norm)
+
+    return SingleBlockGrads(
+        d_x^, d_w1^, d_w2^, d_q_norm^, d_k_norm^,
+        d_shift^, d_scale^, d_gate^,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LoRA-ON-PROJECTION VARIANT
+#
+# Targets (attention-only — matches lora.mojo _map_klein_trainer single_blocks):
+#   linear1 (w1) QKV-ROWS slot: the LoRA delta is added ONLY to the first 3D
+#     output rows of W1 (the qkv rows), NOT the gate_up rows. Equivalently a LoRA
+#     with B=[3D,rank] whose delta [S,3D] lands in the qkv columns of `fused`.
+#   linear2 (w2) COLS slot: the LoRA delta lands on the first D INPUT columns of
+#     W2 (the att_flat portion of out_in). So the LoRA input is att_flat [S,D]
+#     and B=[D,rank] adds to the full out projection [S,D].
+#
+# When both adapters are absent this REDUCES to the verified base single block.
+#
+# NOTE: the LoRA-delta helpers (klein_lora_fwd/bwd, klein_take_cols,
+# klein_add_cols) are host-list-typed (lora_block.mojo, out of scope here), so the
+# LoRA branches bridge device<->host AT THOSE CALLS ONLY. The base chain stays
+# device-resident.
+# ═══════════════════════════════════════════════════════════════════════════
+
+from serenitymojo.models.klein.lora_block import (
+    LoraAdapter, klein_lora_fwd, klein_lora_bwd, KleinLoraGrads,
+    klein_take_cols, klein_add_cols,
+)
+
+
+struct SingleBlockLora(Copyable, Movable):
+    var qkv: Optional[LoraAdapter]    # on w1 qkv-rows (in=D, out=3D)
+    var out: Optional[LoraAdapter]    # on w2 cols     (in=D, out=D)
+
+    def __init__(
+        out self, var qkv: Optional[LoraAdapter], var out: Optional[LoraAdapter]
+    ):
+        self.qkv = qkv^
+        self.out = out^
+
+
+struct SingleBlockLoraGrads(Copyable, Movable):
+    var base: SingleBlockGrads
+    var qkv_d_a: List[Float32]
+    var qkv_d_b: List[Float32]
+    var out_d_a: List[Float32]
+    var out_d_b: List[Float32]
+
+    def __init__(
+        out self, var base: SingleBlockGrads,
+        var qkv_d_a: List[Float32], var qkv_d_b: List[Float32],
+        var out_d_a: List[Float32], var out_d_b: List[Float32],
+    ):
+        self.base = base^
+        self.qkv_d_a = qkv_d_a^
+        self.qkv_d_b = qkv_d_b^
+        self.out_d_a = out_d_a^
+        self.out_d_b = out_d_b^
+
+
+# ── FORWARD of one SINGLE block WITH LoRA on linear1-qkv-rows + linear2-cols ──
+def single_block_lora_forward[
+    H: Int, Dh: Int, S: Int
+](
+    x: List[Float32],
+    w: SingleBlockWeights, mv: SingleModVecs, lora: SingleBlockLora,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> SingleBlockForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t(_ones(D), [D], ctx)
+    var zeros_t = _t(_zeros(D), [D], ctx)
+
+    var x_t = _t(x, [S, D], ctx)
+
+    var ln_t = layer_norm(x_t, ones_t, zeros_t, eps, ctx)
+    var norm_t = modulate(ln_t, _t(mv.scale.copy(), [D], ctx), _t(mv.shift.copy(), [D], ctx), ctx)
+
+    var no_bias = Optional[Tensor](None)
+    var fused = linear(norm_t, w.w1[], no_bias^, ctx)   # [S, 3D+2F]
+    # LoRA on w1 qkv-rows: delta [S,3D] folded into the first 3D cols of `fused`.
+    # Host-bridge at the LoRA helper boundary (klein_lora_fwd/add_cols are host).
+    if lora.qkv:
+        var norm_h = norm_t.to_host(ctx)
+        var dlt = klein_lora_fwd(norm_h, lora.qkv.value(), S, ctx)   # [S,3D]
+        var fused_h0 = fused.to_host(ctx)
+        var fused_h = klein_add_cols(fused_h0, dlt, S, 3 * D + 2 * F, 3 * D)
+        fused = _t(fused_h^, [S, 3 * D + 2 * F], ctx)
+
+    var qkv = slice(fused, 1, 0, 3 * D, ctx)
+    var gate_up = slice(fused, 1, 3 * D, 2 * F, ctx)
+
+    var q_pre_flat = slice(qkv, 1, 0, D, ctx)
+    var k_pre_flat = slice(qkv, 1, D, D, ctx)
+    var v_flat = slice(qkv, 1, 2 * D, D, ctx)
+    var q_pre = reshape(q_pre_flat, [1, S, H, Dh], ctx)
+    var k_pre = reshape(k_pre_flat, [1, S, H, Dh], ctx)
+    var v = reshape(v_flat, [1, S, H, Dh], ctx)
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape(att, [S, D], ctx)
+
+    var mlp_gate = slice(gate_up, 1, 0, F, ctx)
+    var mlp_up = slice(gate_up, 1, F, F, ctx)
+    var mlp = swiglu(mlp_gate, mlp_up, ctx)
+
+    var out_in = concat(1, ctx, att_flat, mlp)
+
+    var no_bias2 = Optional[Tensor](None)
+    var out_proj = linear(out_in, w.w2[], no_bias2^, ctx)
+    # LoRA on w2 cols: input is the att_flat slice [S,D]; delta [S,D] added to out.
+    if lora.out:
+        var att_flat_h = att_flat.to_host(ctx)
+        var dlt2 = klein_lora_fwd(att_flat_h, lora.out.value(), S, ctx)   # [S,D]
+        out_proj = _t(_add_lists(out_proj.to_host(ctx), dlt2), [S, D], ctx)
+
+    var result = residual_gate(
+        x_t, _t(mv.gate.copy(), [D], ctx), out_proj, ctx
+    ).to_host(ctx)
+
+    var saved = SingleBlockSaved(
+        x_t^, ln_t^, norm_t^, q_pre^, k_pre^, q_rms^, k_rms^, v^,
+        q_rope^, k_rope^, att_flat^, mlp_gate^, mlp_up^, mlp^, out_in^,
+    )
+    return SingleBlockForward(result^, saved^)
+
+
+# ── BACKWARD of one SINGLE block WITH LoRA ───────────────────────────────────
+def single_block_lora_backward[
+    H: Int, Dh: Int, S: Int
+](
+    d_out: List[Float32],
+    w: SingleBlockWeights, mv: SingleModVecs, lora: SingleBlockLora,
+    saved: SingleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> SingleBlockLoraGrads:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t(_ones(D), [D], ctx)
+    var scale_t = _t(mv.scale.copy(), [D], ctx)
+    var gate_t = _t(mv.gate.copy(), [D], ctx)
+
+    var d_out_t = _t(d_out, [S, D], ctx)
+
+    # result = residual_gate(x, gate, out); recompute the LoRA-MODIFIED out.
+    var nb = Optional[Tensor](None)
+    var out_y = linear(saved.out_in, w.w2[], nb^, ctx)
+    if lora.out:
+        var att_flat_in = klein_take_cols(saved.out_in.to_host(ctx), S, D + F, D)   # [S,D]
+        var dlt2 = klein_lora_fwd(att_flat_in, lora.out.value(), S, ctx)
+        out_y = _t(_add_lists(out_y.to_host(ctx), dlt2), [S, D], ctx)
+    var grg = gate_residual_backward(d_out_t, saved.x, gate_t, out_y, ctx)
+    var d_gate = grg.d_g.to_host(ctx)
+    var d_out_proj_h = grg.d_y.to_host(ctx)   # grad at the w2 OUTPUT [S,D] (LoRA needs host)
+    var d_out_proj_t = _t(d_out_proj_h.copy(), [S, D], ctx)
+
+    # base w2 backward (frozen W): d_x ONLY — base d_w2 was computed-then-discarded
+    # (W2 is frozen; only LoRA trains). Skipping it drops the d_w2 GEMM + readback.
+    var d_out_in_dx = linear_backward_dx(
+        d_out_proj_t, w.w2[], S, D + F, D, ctx,
+    )
+    var d_out_in_h = d_out_in_dx.to_host(ctx)   # [S, D+F]
+
+    # LoRA on w2 cols: input = att_flat (first D cols of out_in), d_y = d_out_proj.
+    # d_x_lo [S,D] adds into the first D cols of d_out_in.
+    var out_d_a = List[Float32]()
+    var out_d_b = List[Float32]()
+    if lora.out:
+        var att_flat_in2 = klein_take_cols(saved.out_in.to_host(ctx), S, D + F, D)   # [S,D]
+        var lg2 = klein_lora_bwd(d_out_proj_h, att_flat_in2, lora.out.value(), S, ctx)
+        d_out_in_h = klein_add_cols(d_out_in_h, lg2.d_x, S, D + F, D)
+        out_d_a = lg2.d_a.copy()
+        out_d_b = lg2.d_b.copy()
+
+    var d_out_in_3d = _t(d_out_in_h^, [1, S, D + F], ctx)
+    var cb = cat_backward(d_out_in_3d, D, F, 2, ctx)
+    var d_att_flat = reshape(cb.d_0, [1, S, H, Dh], ctx)
+    var d_mlp = reshape(cb.d_1, [S, F], ctx)
+
+    var sgb = swiglu_backward(d_mlp, saved.mlp_gate, saved.mlp_up, ctx)
+    var d_gate_up = concat(1, ctx, sgb.d_gate, sgb.d_up)
+
+    var sb = sdpa_backward[1, S, H, Dh](
+        saved.q_rope, saved.k_rope, saved.v, d_att_flat, scale, ctx,
+    )
+
+    var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
+    var d_k_rms = rope_backward(sb.d_k, cos, sin, True, ctx)
+
+    var rb_q = rms_norm_backward(d_q_rms, saved.q_pre, w.q_norm[], eps, ctx)
+    var d_q_norm = rb_q.d_g.to_host(ctx)
+    var rb_k = rms_norm_backward(d_k_rms, saved.k_pre, w.k_norm[], eps, ctx)
+    var d_k_norm = rb_k.d_g.to_host(ctx)
+
+    var d_q_pre_flat = reshape(rb_q.d_x, [S, D], ctx)
+    var d_k_pre_flat = reshape(rb_k.d_x, [S, D], ctx)
+    var d_v_flat = reshape(sb.d_v, [S, D], ctx)
+    var d_qkv = concat(1, ctx, d_q_pre_flat, d_k_pre_flat, d_v_flat)   # [S,3D]
+
+    var d_fused = concat(1, ctx, d_qkv, d_gate_up)   # [S, 3D+2F]
+
+    # base w1 backward (frozen W): d_x ONLY — base d_w1 was computed-then-discarded
+    # (W1 is frozen; only LoRA trains). Skipping it drops the d_w1 GEMM + readback.
+    var d_norm_dx = linear_backward_dx(
+        d_fused, w.w1[], S, D, 3 * D + 2 * F, ctx,
+    )
+    var d_norm_h = d_norm_dx.to_host(ctx)
+
+    # LoRA on w1 qkv-rows: input = norm, d_y = first 3D cols of d_fused = d_qkv.
+    # d_x_lo [S,D] adds into d_norm. (LoRA helpers are host; bridge here.)
+    var qkv_d_a = List[Float32]()
+    var qkv_d_b = List[Float32]()
+    if lora.qkv:
+        var d_qkv_h = d_qkv.to_host(ctx)
+        var norm_h_b = saved.norm.to_host(ctx)
+        var lg = klein_lora_bwd(d_qkv_h, norm_h_b, lora.qkv.value(), S, ctx)
+        d_norm_h = _add_lists(d_norm_h, lg.d_x)
+        qkv_d_a = lg.d_a.copy()
+        qkv_d_b = lg.d_b.copy()
+
+    var d_norm_t = _t(d_norm_h^, [S, D], ctx)
+    var mb = modulate_backward(d_norm_t, saved.ln, scale_t, ctx)
+    var d_scale = mb.d_scale.to_host(ctx)
+    var d_shift = mb.d_shift.to_host(ctx)
+
+    var lnb = layer_norm_backward(mb.d_x, saved.x, ones_t, eps, ctx)
+
+    var d_x_res = grg.d_x.to_host(ctx)
+    var d_x_norm = lnb.d_x.to_host(ctx)
+    var d_x = _add_lists(d_x_res, d_x_norm)
+
+    # d_w1/d_w2 are frozen-base grads (discarded by the trainer; LoRA gate never
+    # reads them) — stripped (linear_backward_dx above), pass empty placeholders.
+    var base = SingleBlockGrads(
+        d_x^, List[Float32](), List[Float32](), d_q_norm^, d_k_norm^,
+        d_shift^, d_scale^, d_gate^,
+    )
+    return SingleBlockLoraGrads(
+        base^, qkv_d_a^, qkv_d_b^, out_d_a^, out_d_b^,
+    )

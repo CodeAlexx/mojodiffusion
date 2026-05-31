@@ -41,16 +41,43 @@ struct Tensor(Movable):
     var buf: DeviceBuffer[DType.uint8]
     var _shape: List[Int]
     var _dtype: STDtype
+    # Autograd identity. 0 = untracked (the inference default — every existing
+    # 3-arg caller stays untracked, byte-identical). The training `Tape`
+    # stamps a fresh nonzero id when a tensor enters the graph (see
+    # serenitymojo/autograd.mojo). This is the only training-related field on
+    # the otherwise inference-only Tensor; it is inert unless a Tape uses it.
+    var id: Int
 
     def __init__(
         out self,
         var buf: DeviceBuffer[DType.uint8],
         var shape: List[Int],
         dtype: STDtype,
+        id: Int = 0,
     ):
         self.buf = buf^
         self._shape = shape^
         self._dtype = dtype
+        self.id = id
+
+    # ── Autograd identity (training path; inert for inference) ──────────────
+    def set_id(mut self, id: Int):
+        """Stamp the autograd id (called by `Tape` when this tensor enters the
+        graph). Inference never calls this; id stays 0 (untracked)."""
+        self.id = id
+
+    def clone(self, ctx: DeviceContext) raises -> Tensor:
+        """Device→device copy into a fresh buffer (same dtype/shape, id=0).
+
+        Needed by the training tape to SAVE activations for backward (the
+        forward output may be moved/freed by the caller). Pure d2d copy — the
+        same `enqueue_copy(dst_buf=dev, src_buf=self.buf)` pattern the VAE
+        decoders already use. NOT in any inference hot path."""
+        var nbytes = self.nbytes()
+        var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+        ctx.enqueue_copy(dst_buf=dev, src_buf=self.buf)
+        ctx.synchronize()
+        return Tensor(dev^, self._shape.copy(), self._dtype, 0)
 
     # ── Metadata ──────────────────────────────────────────────────────────────
     def shape(self) -> List[Int]:

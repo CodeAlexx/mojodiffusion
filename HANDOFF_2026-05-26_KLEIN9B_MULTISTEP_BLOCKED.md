@@ -1,5 +1,75 @@
 # Klein 9B multi-step / noise root-cause — Handoff (2026-05-26)
 
+## Post-Reboot Update - Resolved
+
+The GPU was rebooted and Klein was re-run on 2026-05-26. The round-2 sampler
+audit was correct: the live noise issue was the missing `*1000` timestep factor,
+not the VAE, DiT block math, or sampler loop.
+
+Verified runs:
+
+- GPU sanity: PyTorch CUDA `ones(8)+1` returned `16.0`.
+- Caption cache: `serenitymojo/pipeline/klein9b_encode_smoke.mojo` wrote
+  `output/klein9b_caps_{pos,neg}.bin`.
+- 64x64 multistep smoke: coherent portrait structure, saved
+  `output/klein9b_multistep_64.png`.
+- Native 1024x1024 multistep smoke: coherent detailed neon portrait, saved
+  `output/klein9b_multistep_1024.png`.
+
+Current native 1024 multistep stats:
+
+```text
+init_tokens mean=-0.00066099525 std=1.0012506 absmax=4.9166226 n=524288
+step 1      mean=-0.0037878805  std=0.9695445 absmax=4.762716  n=524288
+step 2      mean=-0.008100661   std=0.9131945 absmax=4.4850283 n=524288
+step 3      mean=-0.016325992   std=0.79481745 absmax=3.8067355 n=524288
+step 4      mean=-0.058099616   std=0.7715113 absmax=4.7160587 n=524288
+image       mean=-0.59562224    std=0.59540033 absmax=1.6061474 n=3145728
+```
+
+`serenitymojo/pipeline/klein9b_pipeline_multistep_smoke.mojo` now defaults to
+native 1024 (`N_IMG=4096`, `LH=LW=64`) and uses `Klein9BOffloaded.load` plus
+the cached caption embeddings. This file is no longer a "blocked/noise"
+reproducer.
+
+Late-session speed update:
+
+- Three native 1024, 20-step images were produced:
+  `output/klein9b_fairy_fire_ice_1024.png`,
+  `output/klein9b_neon_portrait_20step_1024.png`, and
+  `output/klein9b_honeycomb_eye_bee_20step_1024.png`.
+- Added fused CFG block streaming:
+  `serenitymojo/models/dit/klein_dit.mojo::Klein9BOffloaded.forward_full_cfg`.
+  It streams each block once, runs positive and negative branches, then unloads.
+- `klein9b_pipeline_multistep_smoke.mojo` uses the fused CFG path.
+- `decoder2d.mojo` moved VAE NCHW/NHWC conversion from host loops to GPU
+  `permute`; `ops/embeddings.mojo` moved timestep-embedding dtype conversion to
+  GPU `cast_tensor`.
+- Timed fused-CFG honeycomb run: `elapsed=14:24.76`, and the output PNG was
+  byte-identical to the pre-fused backup
+  (`sha256=97d8215ae1ad2fd61f5fbb5e0bd38a61b85ff75414ddf3c4d522d138f5cf7d03`).
+
+Next priority from the user: Lance T2V from `/home/alex/Lance`, then Sensenova
+and HiDream if time allows.
+
+Lance update: native Mojo Lance now has a real-weight streamed spine smoke and a
+2-step tiny latent denoise loop. See
+`serenitymojo/docs/LANCE_T2V_HANDOFF_2026-05-26.md`. Verified output:
+
+```text
+[lance] step 0 velocity shape: 1 4 48
+[lance] step 1 velocity shape: 1 4 48
+[lance] final latent values: -0.25601763 0.84919244 -1.6421971 1.0904597
+elapsed=1:07.25 user=63.91 sys=3.22 maxrss=23588640KB
+```
+
+Remaining Lance production gates: sparse/flex attention, Wan2.2 video VAE
+decode, CFG text-uncond, and tokenizer parity.
+
+The historical sections below are retained for context only. Treat claims that
+the output is still noise, that raw sigma was correct, or that VAE/DiT should be
+localized first as superseded.
+
 > Read this FIRST after `/clear`. Self-contained: by the end you know the goal, what works, what's ruled out, the IMMEDIATE blocker, and the next action. Mojodiffusion (pure-Mojo) session, NOT EriDiffusion-Rust.
 
 ## §0 — Read these in order (60 seconds)
@@ -33,10 +103,14 @@ All fail on the **first kernel launch**; `nvidia-smi` misleadingly shows the car
 - **Schedule + loop verified identical to Rust** (source read, no GPU): `compute_empirical_mu`, `time_snr_shift`, `build_flux2_sigma_schedule`, `dt = t_next − t_curr`, CFG `uncond + g·(pos−uncond)`, no post-CFG sign flip. See investigation doc §1.
 - **Rust reference DENOISE works** (the 50-step run completed: 2.34 s/step, Klein 9B all-resident in 20.6 GB). Only the STALE binary's VAE crashed — current Rust source is fixed.
 
-## §4 — What's broken / open
-- **Output is noise only** at any step count. `output/klein9b_multistep_1024.png` (4-step) and `klein9b_first_1024.png` (1-step) are both noise.
-- Klein **DiT velocity** was never parity-checked at the real config (only "finite stats" on a tiny `[1,4,128]` grid).
-- Klein **VAE decode** was never cos-checked against any oracle.
+## §4 — Historical broken/open state
+- Superseded: output was noise before the `*1000` timestep fix was applied and
+  validated. Current `output/klein9b_multistep_1024.png` is coherent.
+- Klein **DiT velocity** has still not been strict cos-parity checked at the real
+  config; this is now a parity-polish task, not a live coherence blocker.
+- Klein **VAE decode** has still not been cos-checked against an oracle, but the
+  native 1024 multistep image proves it is not the cause of the observed noise
+  failure.
 
 ## §5 — What's ruled out
 - The sampling loop (schedule / dt / CFG / Euler) — matches Rust exactly.

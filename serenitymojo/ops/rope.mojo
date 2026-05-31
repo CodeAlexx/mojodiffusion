@@ -357,7 +357,7 @@ def rope_interleaved(
         ctx.enqueue_function[
             _rope_interleaved_kernel_f16, _rope_interleaved_kernel_f16
         ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -430,7 +430,7 @@ def rope_halfsplit(
         ctx.enqueue_function[
             _rope_halfsplit_kernel_f16, _rope_halfsplit_kernel_f16
         ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -503,5 +503,5 @@ def rope_halfsplit_full(
         ctx.enqueue_function[
             _rope_halfsplit_full_kernel_f16, _rope_halfsplit_full_kernel_f16
         ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, x.shape(), x.dtype())

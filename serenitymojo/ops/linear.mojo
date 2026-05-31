@@ -301,8 +301,9 @@ def linear(
                 c_lt, bias_lt, o_lt, m, out_dim, has_bias,
                 grid_dim=grid, block_dim=_BLOCK,
             )
-    ctx.synchronize()
-
+    # TIER2-SYNC-REMOVED: single-stream enqueue serializes kernel order; the
+    # downstream .to_host()/optimizer barrier is the only required sync. Output is
+    # a device buffer with no host-staging buffer to protect here.
     var out_shape = List[Int]()
     for i in range(len(xshape) - 1):
         out_shape.append(xshape[i])

@@ -42,8 +42,12 @@
 # *** CODE-ONLY: compile-verified; NOT executed. ***
 
 from std.gpu.host import DeviceContext
+from std.gpu import global_idx
+from std.utils.index import IndexList
 from std.math import sqrt
 from std.memory import ArcPointer
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -51,7 +55,7 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import gelu, sigmoid
-from serenitymojo.ops.attention import sdpa
+from serenitymojo.ops.attention import sdpa, sdpa_nomask
 from serenitymojo.ops.tensor_algebra import (
     reshape,
     add,
@@ -62,6 +66,7 @@ from serenitymojo.ops.tensor_algebra import (
     concat,
 )
 from serenitymojo.models.dit.ltx2_rope import apply_ltx2_rope
+from serenitymojo.models.dit.ltx2_nag import NAGContext
 from serenitymojo.offload.ltx2_block_stream import FP8Block
 from serenitymojo.ops.cast import cast_tensor
 
@@ -449,19 +454,60 @@ def _apply_head_gate[S: Int](
 # (the real text tokens), large-negative for the padded columns [n_kv, S). This
 # lets us reuse the square `sdpa` for a non-square Q(S) x KV(n_kv) cross-attn by
 # zero-padding the K/V seq up to S and masking out the pad.
+#
+# *** Built ON-DEVICE *** via a fill kernel. A host List of H*S*S elements is
+# untenable at the stage-2 grid (S=3072 -> 301M elems / 1.2GB host + the count
+# overflow that crashed the staged run); the column predicate (j < n_kv) is
+# trivially data-parallel.
+comptime _MASK_DYN1 = Layout.row_major(-1)
+comptime _MASK_BLOCK = 256
+
+
+def _cross_pad_mask_kernel_f32(
+    o: LayoutTensor[DType.float32, _MASK_DYN1, MutAnyOrigin],
+    total: Int, S: Int, n_kv: Int, neg: Float32,
+):
+    var idx = Int(global_idx.x)
+    if idx < total:
+        var j = idx % S          # key column
+        o[idx] = Float32(0.0) if j < n_kv else neg
+
+
+def _cross_pad_mask_kernel_bf16(
+    o: LayoutTensor[DType.bfloat16, _MASK_DYN1, MutAnyOrigin],
+    total: Int, S: Int, n_kv: Int, neg: Float32,
+):
+    var idx = Int(global_idx.x)
+    if idx < total:
+        var j = idx % S
+        var v = Float32(0.0) if j < n_kv else neg
+        o[idx] = rebind[o.element_type](v.cast[DType.bfloat16]())
+
+
 def _cross_pad_mask[S: Int](
     heads: Int, n_kv: Int, dtype: STDtype, ctx: DeviceContext
 ) raises -> Tensor:
     var neg = Float32(-1.0e30)
-    var data = List[Float32]()
-    for _ in range(heads):
-        for _ in range(S):          # query row
-            for j in range(S):      # key col
-                if j < n_kv:
-                    data.append(Float32(0.0))
-                else:
-                    data.append(neg)
-    return Tensor.from_host(data, _shape4(1, heads, S, S), dtype, ctx)
+    var total = heads * S * S
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](total * dtype.byte_size())
+    var rl = RuntimeLayout[_MASK_DYN1].row_major(IndexList[1](total))
+    var grid = (total + _MASK_BLOCK - 1) // _MASK_BLOCK
+    if dtype.to_mojo_dtype() == DType.float32:
+        var O = LayoutTensor[DType.float32, _MASK_DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_cross_pad_mask_kernel_f32, _cross_pad_mask_kernel_f32](
+            O, total, S, n_kv, neg, grid_dim=grid, block_dim=_MASK_BLOCK
+        )
+    else:
+        var O = LayoutTensor[DType.bfloat16, _MASK_DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_cross_pad_mask_kernel_bf16, _cross_pad_mask_kernel_bf16](
+            O, total, S, n_kv, neg, grid_dim=grid, block_dim=_MASK_BLOCK
+        )
+    ctx.synchronize()
+    return Tensor(out_buf^, _shape4(1, heads, S, S), dtype)
 
 
 # ── block forward (video self-attn + cross-attn + FFN, video-only) ────────────
@@ -1163,9 +1209,10 @@ def _av_attention[SQ: Int, SKV: Int, SPAD: Int, H: Int, DH: Int](
     # Pad Q and KV up to SPAD, mask the KV-pad columns, run square SDPA, slice.
     var attn_flat: Tensor
     comptime if SQ == SKV and SQ == SPAD:
-        var attn = sdpa[1, SPAD, H, DH](
-            q4, k4, v4, _zeros_mask[SPAD](H, hidden.dtype(), ctx), scale, ctx
-        )
+        # Square self-attention: the additive mask is all-zeros (full attention).
+        # Use sdpa_nomask to AVOID materializing [1,H,S,S] (1.2GB at S=3072 for the
+        # stage-2 upscaled grid — the previous _zeros_mask path overflowed there).
+        var attn = sdpa_nomask[1, SPAD, H, DH](q4, k4, v4, scale, ctx)
         attn_flat = reshape(attn, _shape3(1, SQ, inner), ctx)
     else:
         var q_pad = _pad_seq[SPAD](q4, SQ, H, DH, hidden.dtype(), ctx)
@@ -1349,12 +1396,228 @@ def ltx2_block_forward_av[
     # V2A: Q=audio (mod a_v2a), KV=video (mod v_v2a), to_out->2048.
     var mod_video_v2a = _modulate_bc(norm_a2v, cm.v_v2a_scale, cm.v_v2a_shift, ctx)
     var mod_audio_v2a = _modulate_bc(norm_v2a, cm.a_v2a_scale, cm.a_v2a_shift, ctx)
-    var v2a_out = _av_attention[S_A, S_V, S_APAD, 32, 64](
+    # V2A: SQ=S_A (audio query), SKV=S_V (video KV). The square-SDPA pad target
+    # must be >= max(S_A, S_V). At the stage-2 grid S_V (3072) > S_APAD (1024),
+    # so we pad to S_VPAD (= max(S_V,N_TXT,S_A)), NOT S_APAD — using S_APAD gave a
+    # NEGATIVE pad (S_APAD - S_V) and the from_host(-4194304) crash.
+    var v2a_out = _av_attention[S_A, S_V, S_VPAD, 32, 64](
         weights, "video_to_audio_attn", mod_audio_v2a, mod_video_v2a,
         True, ca_a_cos, ca_a_sin, True, ca_v_cos, ca_v_sin, eps, ctx,
     )
     # Capture the v2a contribution (raw addend) BEFORE mutating ahss.
     # This is a debug-only output; the math is identical to the 2-return version.
+    var v2a_delta = mul(cm.v2a_gate, v2a_out, ctx)
+    ahss = add(ahss, v2a_delta, ctx)
+
+    # ---- 4. FFN (video + audio) ----
+    var mod_ff = _modulate_bc(
+        _rms_norm_opt(hs, weights, "norm3.weight", eps, ctx),
+        v_scale_mlp, v_shift_mlp, ctx,
+    )
+    var ff = weights._linear_b(mod_ff, "ff.net.0.proj.weight", "ff.net.0.proj.bias", ctx)
+    ff = gelu(ff, ctx)
+    ff = weights._linear_b(ff, "ff.net.2.weight", "ff.net.2.bias", ctx)
+    hs = add(hs, mul(v_gate_mlp, ff, ctx), ctx)
+
+    var mod_aff = _modulate_bc(
+        _rms_norm_opt(ahss, weights, "audio_norm3.weight", eps, ctx),
+        a_scale_mlp, a_shift_mlp, ctx,
+    )
+    var aff = weights._linear_b(mod_aff, "audio_ff.net.0.proj.weight", "audio_ff.net.0.proj.bias", ctx)
+    aff = gelu(aff, ctx)
+    aff = weights._linear_b(aff, "audio_ff.net.2.weight", "audio_ff.net.2.bias", ctx)
+    ahss = add(ahss, mul(a_gate_mlp, aff, ctx), ctx)
+
+    return (hs^, ahss^, v2a_delta^)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NAG-AWARE AV BLOCK FORWARD (Normalized Attention Guidance hook)
+#
+# Identical to `ltx2_block_forward_av` EXCEPT the two text cross-attention
+# stages (attn2 video, audio_attn2 audio) are run TWICE when `nag.enabled`:
+# once with the positive (real-prompt) KV-context and once with the NULL-prompt
+# KV-context carried in `nag`. The two cross-attn outputs are fused by
+# `NAGContext.combine_*` (= nag.py:_nag_combine) BEFORE the gated residual add.
+# This is the exact placement of NAGPatch (nag.py:67-90): the wrap is around the
+# attn2 forward, so the combined output replaces the single attn2 output and
+# THEN the per-block gate (v_gate_ca / a_gate_ca) and residual apply unchanged.
+#
+# When `nag.enabled == False` this reduces to the same math as
+# `ltx2_block_forward_av` (the positive-only path); callers can route through
+# this single function for both the NAG (stage1/stage2) and the no-NAG paths.
+#
+# The null KV-context is built with the SAME modulation the positive context
+# gets (_kv_modulate when the prompt table exists, else a raw clone) so that the
+# only difference between out_pos and out_neg is the encoder hidden states —
+# matching nag.py, which calls the unmodified `original(x, ctx, None, ...)` with
+# the null `ctx` and no attention mask.
+# ════════════════════════════════════════════════════════════════════════════
+def ltx2_block_forward_av_nag[
+    S_V: Int, S_A: Int, N_TXT: Int, S_VPAD: Int, S_APAD: Int
+](
+    weights: LTX2AVBlockWeights,
+    hidden: Tensor, ahs: Tensor,
+    enc: Tensor, aenc: Tensor,
+    v_temb: Tensor, a_temb: Tensor,
+    v_ca_ss: Tensor, a_ca_ss: Tensor,
+    v_ca_gate: Tensor, a_ca_gate: Tensor,
+    v_prompt_ts: Tensor, a_prompt_ts: Tensor,
+    v_cos: Tensor, v_sin: Tensor,
+    a_cos: Tensor, a_sin: Tensor,
+    ca_v_cos: Tensor, ca_v_sin: Tensor,
+    ca_a_cos: Tensor, ca_a_sin: Tensor,
+    nag: NAGContext,
+    eps: Float32, ctx: DeviceContext,
+) raises -> Tuple[Tensor, Tensor, Tensor]:
+    var VD = 4096
+    var AD = 2048
+
+    var dummy_data = List[Float32]()
+    dummy_data.append(Float32(1.0))
+    var dummy_sh = List[Int]()
+    dummy_sh.append(1)
+    dummy_sh.append(1)
+    var dummy = Tensor.from_host(dummy_data, dummy_sh^, hidden.dtype(), ctx)
+
+    # ---- 1. Video self-attn ----
+    ref vtab = weights._w("scale_shift_table")
+    var v_shift_msa = _ada_row_pertok(vtab, v_temb, 0, VD, S_V, ctx)
+    var v_scale_msa = _ada_row_pertok(vtab, v_temb, 1, VD, S_V, ctx)
+    var v_gate_msa = _ada_row_pertok(vtab, v_temb, 2, VD, S_V, ctx)
+    var v_shift_mlp = _ada_row_pertok(vtab, v_temb, 3, VD, S_V, ctx)
+    var v_scale_mlp = _ada_row_pertok(vtab, v_temb, 4, VD, S_V, ctx)
+    var v_gate_mlp = _ada_row_pertok(vtab, v_temb, 5, VD, S_V, ctx)
+
+    var mod_h = _modulate_bc(
+        _rms_norm_opt(hidden, weights, "norm1.weight", eps, ctx),
+        v_scale_msa, v_shift_msa, ctx,
+    )
+    var v_attn = _av_attention[S_V, S_V, S_V, 32, 128](
+        weights, "attn1", mod_h, mod_h,
+        True, v_cos, v_sin, False, dummy, dummy, eps, ctx,
+    )
+    var hs = add(hidden, mul(v_gate_msa, v_attn, ctx), ctx)
+
+    # ---- Audio self-attn ----
+    ref atab = weights._w("audio_scale_shift_table")
+    var a_shift_msa = _ada_row_pertok(atab, a_temb, 0, AD, S_A, ctx)
+    var a_scale_msa = _ada_row_pertok(atab, a_temb, 1, AD, S_A, ctx)
+    var a_gate_msa = _ada_row_pertok(atab, a_temb, 2, AD, S_A, ctx)
+    var a_shift_mlp = _ada_row_pertok(atab, a_temb, 3, AD, S_A, ctx)
+    var a_scale_mlp = _ada_row_pertok(atab, a_temb, 4, AD, S_A, ctx)
+    var a_gate_mlp = _ada_row_pertok(atab, a_temb, 5, AD, S_A, ctx)
+
+    var mod_a = _modulate_bc(
+        _rms_norm_opt(ahs, weights, "audio_norm1.weight", eps, ctx),
+        a_scale_msa, a_shift_msa, ctx,
+    )
+    var a_attn = _av_attention[S_A, S_A, S_A, 32, 64](
+        weights, "audio_attn1", mod_a, mod_a,
+        True, a_cos, a_sin, False, dummy, dummy, eps, ctx,
+    )
+    var ahss = add(ahs, mul(a_gate_msa, a_attn, ctx), ctx)
+
+    # ---- 2. Video cross-attn (text) — NAG-wrapped ----
+    var v_shift_ca = _ada_row_pertok(vtab, v_temb, 6, VD, S_V, ctx)
+    var v_scale_ca = _ada_row_pertok(vtab, v_temb, 7, VD, S_V, ctx)
+    var v_gate_ca = _ada_row_pertok(vtab, v_temb, 8, VD, S_V, ctx)
+    var mod_h2 = _modulate_bc(
+        _rms_norm_opt(hs, weights, "norm2.weight", eps, ctx),
+        v_scale_ca, v_shift_ca, ctx,
+    )
+    var mv_ctx: Tensor
+    if weights._has("prompt_scale_shift_table"):
+        mv_ctx = _kv_modulate(
+            enc, weights._w("prompt_scale_shift_table"), v_prompt_ts,
+            N_TXT, VD, ctx,
+        )
+    else:
+        mv_ctx = _clone_t(enc, ctx)
+    var v_ca_out = _av_attention[S_V, N_TXT, S_VPAD, 32, 128](
+        weights, "attn2", mod_h2, mv_ctx,
+        False, dummy, dummy, False, dummy, dummy, eps, ctx,
+    )
+    if nag.enabled:
+        # NULL-context cross-attn (same modulation, null encoder states).
+        var mv_ctx_null: Tensor
+        if weights._has("prompt_scale_shift_table"):
+            mv_ctx_null = _kv_modulate(
+                nag.nag_v_ctx, weights._w("prompt_scale_shift_table"),
+                v_prompt_ts, N_TXT, VD, ctx,
+            )
+        else:
+            mv_ctx_null = _clone_t(nag.nag_v_ctx, ctx)
+        var v_ca_neg = _av_attention[S_V, N_TXT, S_VPAD, 32, 128](
+            weights, "attn2", mod_h2, mv_ctx_null,
+            False, dummy, dummy, False, dummy, dummy, eps, ctx,
+        )
+        v_ca_out = nag.combine_video(v_ca_out, v_ca_neg, ctx)
+    hs = add(hs, mul(v_gate_ca, v_ca_out, ctx), ctx)
+
+    # ---- Audio cross-attn (text) — NAG-wrapped when audio NAG present ----
+    var a_shift_ca = _ada_row_pertok(atab, a_temb, 6, AD, S_A, ctx)
+    var a_scale_ca = _ada_row_pertok(atab, a_temb, 7, AD, S_A, ctx)
+    var a_gate_ca = _ada_row_pertok(atab, a_temb, 8, AD, S_A, ctx)
+    var mod_a2 = _modulate_bc(
+        _rms_norm_opt(ahss, weights, "audio_norm2.weight", eps, ctx),
+        a_scale_ca, a_shift_ca, ctx,
+    )
+    var ma_ctx: Tensor
+    if weights._has("audio_prompt_scale_shift_table"):
+        ma_ctx = _kv_modulate(
+            aenc, weights._w("audio_prompt_scale_shift_table"), a_prompt_ts,
+            N_TXT, AD, ctx,
+        )
+    else:
+        ma_ctx = _clone_t(aenc, ctx)
+    var a_ca_out = _av_attention[S_A, N_TXT, S_APAD, 32, 64](
+        weights, "audio_attn2", mod_a2, ma_ctx,
+        False, dummy, dummy, False, dummy, dummy, eps, ctx,
+    )
+    if nag.enabled and nag.has_audio:
+        var ma_ctx_null: Tensor
+        if weights._has("audio_prompt_scale_shift_table"):
+            ma_ctx_null = _kv_modulate(
+                nag.nag_a_ctx, weights._w("audio_prompt_scale_shift_table"),
+                a_prompt_ts, N_TXT, AD, ctx,
+            )
+        else:
+            ma_ctx_null = _clone_t(nag.nag_a_ctx, ctx)
+        var a_ca_neg = _av_attention[S_A, N_TXT, S_APAD, 32, 64](
+            weights, "audio_attn2", mod_a2, ma_ctx_null,
+            False, dummy, dummy, False, dummy, dummy, eps, ctx,
+        )
+        a_ca_out = nag.combine_audio(a_ca_out, a_ca_neg, ctx)
+    ahss = add(ahss, mul(a_gate_ca, a_ca_out, ctx), ctx)
+
+    # ---- 3. A2V / V2A cross-modal ----
+    var norm_a2v = _rms_norm_opt(hs, weights, "audio_to_video_norm.weight", eps, ctx)
+    var norm_v2a = _rms_norm_opt(ahss, weights, "video_to_audio_norm.weight", eps, ctx)
+    var cm = _compute_cross_mod(
+        weights._w("scale_shift_table_a2v_ca_video"),
+        weights._w("scale_shift_table_a2v_ca_audio"),
+        v_ca_ss, a_ca_ss, v_ca_gate, a_ca_gate, VD, AD, ctx,
+    )
+
+    var mod_video_a2v = _modulate_bc(norm_a2v, cm.v_a2v_scale, cm.v_a2v_shift, ctx)
+    var mod_audio_a2v = _modulate_bc(norm_v2a, cm.a_a2v_scale, cm.a_a2v_shift, ctx)
+    var a2v_out = _av_attention[S_V, S_A, S_VPAD, 32, 64](
+        weights, "audio_to_video_attn", mod_video_a2v, mod_audio_a2v,
+        True, ca_v_cos, ca_v_sin, True, ca_a_cos, ca_a_sin, eps, ctx,
+    )
+    hs = add(hs, mul(cm.a2v_gate, a2v_out, ctx), ctx)
+
+    var mod_video_v2a = _modulate_bc(norm_a2v, cm.v_v2a_scale, cm.v_v2a_shift, ctx)
+    var mod_audio_v2a = _modulate_bc(norm_v2a, cm.a_v2a_scale, cm.a_v2a_shift, ctx)
+    # V2A: SQ=S_A (audio query), SKV=S_V (video KV). The square-SDPA pad target
+    # must be >= max(S_A, S_V). At the stage-2 grid S_V (3072) > S_APAD (1024),
+    # so we pad to S_VPAD (= max(S_V,N_TXT,S_A)), NOT S_APAD — using S_APAD gave a
+    # NEGATIVE pad (S_APAD - S_V) and the from_host(-4194304) crash.
+    var v2a_out = _av_attention[S_A, S_V, S_VPAD, 32, 64](
+        weights, "video_to_audio_attn", mod_audio_v2a, mod_video_v2a,
+        True, ca_a_cos, ca_a_sin, True, ca_v_cos, ca_v_sin, eps, ctx,
+    )
     var v2a_delta = mul(cm.v2a_gate, v2a_out, ctx)
     ahss = add(ahss, v2a_delta, ctx)
 

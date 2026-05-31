@@ -68,6 +68,23 @@ constructing huge host `List[Float32]` masks.
   checked against the exact diffusers table before calling the 30-step schedule
   final.
 
+### Bounded regression snapshot (2026-05-28)
+
+This sidecar did not rerun the full GPU image path. It rechecked the light base
+Z-Image targets that avoid checkpoint load/run cost:
+
+- `pixi run mojo run -I . serenitymojo/sampling/flow_match_smoke.mojo` - PASS.
+  Schedule parity, one Euler step, CFG combine, and the 3-step rollout all
+  reported `PASS`; max abs was at or below `9.536743e-07`.
+- Pipeline AOT:
+  `pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/zimage_pipeline.mojo -o /tmp/zimage_pipeline_sidecar_check`
+  PASS. The only output was the existing unused-`dim` warnings in
+  `serenitymojo/models/dit/zimage_dit.mojo`.
+
+No new base Z-Image blocker was found. The known cleanup remains the hardcoded
+diffusers sigma table in `zimage_pipeline.mojo` (including duplicate terminal
+`0.0`) versus the reusable Rust-style scheduler helper in `flow_match.mojo`.
+
 ## 6. Decision log (owner-tagged)
 | Decision | Owner | Note |
 |---|---|---|

@@ -315,7 +315,7 @@ def _binary(a: Tensor, b: Tensor, op: Int, ctx: DeviceContext) raises -> Tensor:
             bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
             n, op, grid_dim=grid, block_dim=_BLOCK,
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, plan.out_shape.copy(), a.dtype())
 
 
@@ -440,7 +440,7 @@ def _binary_scalar(
         ctx.enqueue_function[_ews_kernel_f16, _ews_kernel_f16](
             A, O, s, n, op, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, a.shape(), a.dtype())
 
 
@@ -483,7 +483,7 @@ def reshape(x: Tensor, var new_shape: List[Int], ctx: DeviceContext) raises -> T
         )
     var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(dev^, new_shape^, x.dtype())
 
 
@@ -643,7 +643,7 @@ def permute(x: Tensor, perm: List[Int], ctx: DeviceContext) raises -> Tensor:
             ss[0], ss[1], ss[2], ss[3], ss[4], ss[5], n,
             grid_dim=grid, block_dim=_BLOCK,
         )
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, oshape^, x.dtype())
 
 
@@ -731,7 +731,7 @@ def concat(dim: Int, ctx: DeviceContext, *tensors: Tensor) raises -> Tensor:
             )
             ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
         col_off += in_dim
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, oshape^, dt)
 
 
@@ -783,7 +783,7 @@ def slice(
             dst_elem * bsz, blk * bsz
         )
         ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
-    ctx.synchronize()
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, oshape^, x.dtype())
 
 

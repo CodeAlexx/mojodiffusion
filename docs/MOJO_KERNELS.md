@@ -396,6 +396,32 @@ The hot stack path uses the resident device sibling through
 
 ---
 
+## 11c. Scratch ring allocator — opt-in temporary Tensor storage
+
+`scratch_ring.mojo::ScratchRingAllocator` is a shared GPU scratch allocator
+modeled after OneTrainer's static activation/layer allocators:
+
+- persistent `DType.uint8` device slabs;
+- 16-byte aligned sub-buffer allocation via `create_sub_buffer`;
+- explicit `mark`/`rewind` and `reset` for re-entrant frame ownership;
+- `alloc_tensor`, `empty_like`, and `clone_tensor` return normal `Tensor`
+  wrappers backed by the slab view.
+
+The allocator is intentionally **not** wired into `Tensor` globally. A model or
+op must opt in only when it can prove the scratch frame outlives all tensors and
+all queued device work using them.
+
+`ops/tensor_algebra_scratch.mojo` contains the first opt-in helpers:
+`concat2_scratch`, `concat3_scratch`, and `slice_scratch` for F32 rank-2 dim-1
+temporaries. They are kept in a separate module so default `tensor_algebra`
+imports keep the old allocation behavior unless a caller explicitly requests a
+scratch path.
+
+**Parity gate:** `scratch_ring_smoke.mojo` covers clone, alignment,
+mark/rewind, reset, scratch concat2, scratch slice, and scratch concat3.
+
+---
+
 ## 12. What flame-core has that the Mojo backward surface does NOT
 
 Gaps worth flagging (flame-core kernels with no Mojo backward analogue, per the
@@ -414,8 +440,9 @@ files read):
   backward kernels are correctness-first scalar/F32.
 - **No multi-tensor L2-norm.** `clip_grad_global_norm` (`optim.mojo:234`) is a
   hand-rolled 2-tensor case, not the multi-tensor 2-stage reduction.
-- **No CUDA-graph capture/replay, no caching allocator.** Each Mojo op
-  `enqueue_create_buffer`s fresh; there is no pool.
+- **No CUDA-graph capture/replay, no global caching allocator.** Most Mojo ops
+  still `enqueue_create_buffer` fresh. A shared opt-in scratch ring now exists,
+  but model paths must explicitly adopt it at proven frame boundaries.
 
 These are expected for a from-scratch port whose proven scope is *correctness
 through composition*, not throughput. As of this session there is **no open

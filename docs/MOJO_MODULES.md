@@ -212,6 +212,13 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
 - `models/klein/parity/load_{double,single}_block_smoke.mojo` — real-weight load
   smokes for the block weight structs.
 
+## Scratch allocation — shared opt-in memory
+
+| Module | Purpose / key defs | Status |
+|---|---|---|
+| `scratch_ring.mojo` | `ScratchRingAllocator`: OneTrainer-style fixed GPU scratch slabs (`DType.uint8`), 16-byte aligned sub-buffer allocation, explicit `mark`/`rewind`/`reset`, and Tensor wrappers over `create_sub_buffer`. The allocator is shared infrastructure for any model, but callers must opt in and own the frame lifetime; it is not a global Tensor allocator. | **PROVEN** (`scratch_ring_smoke`: clone, alignment, mark/rewind, reset) |
+| `ops/tensor_algebra_scratch.mojo` | Opt-in scratch-backed hot shape helpers: `concat2_scratch`, `concat3_scratch`, `slice_scratch` for F32 rank-2 dim-1 temporaries. Kept separate from `ops/tensor_algebra.mojo` so normal model imports do not compile or use scratch kernels unless explicitly requested. | **PROVEN** (`scratch_ring_smoke`: concat2/slice/concat3 parity) |
+
 ## Training orchestration — `training/`
 
 | Module | Purpose / key defs | Status |
@@ -339,6 +346,7 @@ The forward kernels the backward partners pair with: `ops/attention.mojo`
 (`silu`, `swiglu`), `ops/reduce.mojo`, `ops/rope.mojo`, `ops/conv.mojo`
 (SDK conv2d fwd wrapper), `ops/conv1d.mojo`, `ops/elementwise.mojo`,
 `ops/tensor_algebra.mojo` (transpose/concat/slice/add/mul_scalar),
+`ops/tensor_algebra_scratch.mojo` (opt-in scratch-backed shape helpers),
 `ops/softmax.mojo`, `ops/cast.mojo`, `ops/embeddings.mojo`, `ops/layout.mojo`,
 `ops/moe.mojo`, `ops/fp8.mojo`, `ops/mxfp4.mojo`, `ops/snake.mojo`,
 `ops/pixelshuffle.mojo`, `ops/random.mojo`, `ops/unary.mojo`,

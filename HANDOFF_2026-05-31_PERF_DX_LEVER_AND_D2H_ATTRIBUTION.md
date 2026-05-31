@@ -41,19 +41,22 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    - `KleinLoraDeviceSet` uploads LoRA A/B once per step and reuses those tensors
      through forward, backward recompute, and LoRA backward.
 
-5. **Current measured state:** clean `train_klein_real.mojo` run is now
-   **5.1468015 s/step** (`PROG step=1 ... secs=5.1468015`, loss `2.734082`).
-   Previous clean state before resident LoRA A/B was **5.312408 s/step**; best
-   instrumented run in that pass was **5.227653 s**. Phase shape was stable:
-   prep ≈0.79-0.90s, forward ≈1.50-1.52s, backward ≈2.83-2.89s.
+5. **Current measured state:** clean `train_klein_real.mojo` run after the
+   scratch allocator infrastructure is **5.200673 s/step**
+   (`PROG step=1 ... secs=5.200673`, loss `2.734082`). Best clean prior after
+   resident LoRA A/B remains **5.1468015 s/step**. Previous clean state before
+   resident LoRA A/B was **5.312408 s/step**; best instrumented run in that pass
+   was **5.227653 s**. Phase shape was stable: prep ≈0.79-0.90s, forward
+   ≈1.50-1.52s, backward ≈2.83-2.89s.
    This is real progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
-   - longer term: BF16/mixed precision plus fused kernels. Ring/pool allocator helps
-     allocation churn later, but the current wall time is still dominated by op count
-     and materialized tensor movement.
+   - wire the new scratch ring only at proven frame boundaries where a model owns
+     all lifetimes (all models can opt in iff needed; no global allocator);
+   - longer term: BF16/mixed precision plus fused kernels. The current wall time is
+     still dominated by op count and materialized tensor movement.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ## §1 — What changed this session (the dx-lever)
@@ -173,8 +176,37 @@ gone.
 
 Secondary (one-time, low priority): weight loader F32-direct to kill the ~14 GB startup
 roundtrip. Helps cold-start only, not step time. Still open from prior handoffs:
-runtime Tensor views for slice/concat/reshape, ring/pool allocator, and fusion/BF16.
+runtime Tensor views for slice/concat/reshape, wiring scratch frames into proven
+hot-path lifetimes, and fusion/BF16.
 9B config not re-measured.
+
+### 2026-05-31 continuation: shared scratch ring allocator landed
+
+Added shared, opt-in scratch infrastructure modeled after OneTrainer's static
+activation/layer allocators:
+
+- `serenitymojo/scratch_ring.mojo`: `ScratchRingAllocator` owns persistent
+  `DType.uint8` GPU slabs, returns `Tensor` wrappers over `create_sub_buffer`,
+  aligns allocations to 16 bytes, and exposes explicit `mark`/`rewind`/`reset`.
+- `serenitymojo/ops/tensor_algebra_scratch.mojo`: opt-in `concat2_scratch`,
+  `concat3_scratch`, and `slice_scratch` for F32 rank-2 dim-1 temporaries.
+- The allocator is deliberately **not global** and normal `ops/tensor_algebra.mojo`
+  is unchanged. A model must opt in only where the scratch frame lifetime is
+  proven safe; this satisfies "all models iff needed" without forcing scratch
+  storage on every Tensor allocation.
+
+Gates / measurements from this continuation:
+
+| item | result |
+|------|--------|
+| scratch allocator gate | `scratch_ring_smoke` PASS (clone, alignment, mark/rewind, reset, scratch concat/slice) |
+| default algebra gate | `ops/algebra_smoke` PASS |
+| real 4B timing run | `PROG ... secs=5.200673`, loss `2.734082` |
+| speed impact | no speed win yet; infrastructure only until model hot paths opt in |
+
+Do not use `models/klein/parity/klein_stack_lora_real_smoke.mojo` as the timing
+benchmark; it OOMed on the 24 GB 3090 Ti in this session. The timing benchmark is
+`training/train_klein_real.mojo`.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
@@ -205,8 +237,13 @@ Pre-instrumentation: /tmp/tensor_pre_d2htrace.mojo (also recoverable via git che
 Profiles: /tmp/kp_dxl2.nsys-rep + /tmp/kp_dxl2.sqlite (post-dx-lever, 52s). D2H instrumented
 logs: /tmp/d2h_trace.log, d2h_trace2.log, d2h_trace3.log.
 
-Files touched (all committed): ops/linalg_backward.mojo, models/klein/single_block.mojo,
-models/klein/double_block.mojo, models/klein/parity/double_block_lora_parity.mojo, .gitignore.
+Files touched in the dx-lever commit: ops/linalg_backward.mojo,
+models/klein/single_block.mojo, models/klein/double_block.mojo,
+models/klein/parity/double_block_lora_parity.mojo, .gitignore.
+
+Files touched in the scratch-ring continuation: scratch_ring.mojo,
+scratch_ring_smoke.mojo, ops/tensor_algebra_scratch.mojo, docs/MOJO_MODULES.md,
+docs/MOJO_KERNELS.md, this handoff.
 
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
@@ -226,4 +263,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | Investigate remaining D2H ("could it be hidden in mojo layers") | USER | direct question → instrumented + measured |
 | LoRA-helpers device port | USER | continued after user redirected to tensors/autograd; landed device activation carriers and measured 5.31s clean |
 | Resident LoRA A/B carrier | AGENT-DEFAULT | user asked to focus tensors for all models; removes repeated per-use `from_host` in LoRA helpers while preserving host optimizer/save source of truth |
-| Ring/pool allocator | USER later | explicitly deferred; belongs after Tensor view/slab support |
+| Shared scratch ring allocator | USER | requested after OneTrainer comparison; landed as opt-in slabs usable by all models iff needed |

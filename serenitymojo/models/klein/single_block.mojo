@@ -80,14 +80,14 @@ from serenitymojo.scratch_ring import ScratchRingAllocator
 comptime TArc = ArcPointer[Tensor]
 
 # ── forward ops (GPU) ────────────────────────────────────────────────────────
-from serenitymojo.ops.linear import linear, linear_scratch, linear_rows_scratch
+from serenitymojo.ops.linear import linear, linear_scratch, linear_rows, linear_rows_scratch
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.tensor_algebra import (
-    reshape, reshape_owned, reshape_in_place, slice, concat, add,
+    reshape, reshape_owned, reshape_in_place, slice, concat, add, add_in_place_f32,
 )
 from serenitymojo.ops.tensor_algebra_scratch import (
     concat2_scratch, concat3_scratch, slice_scratch,
@@ -502,7 +502,8 @@ def single_block_backward[
 from serenitymojo.models.klein.lora_block import (
     LoraAdapter, LoraAdapterDevice, lora_adapter_to_device,
     klein_lora_fwd_device, klein_lora_bwd_device,
-    klein_lora_fwd_device_resident, klein_lora_bwd_device_resident,
+    klein_lora_fwd_device_resident, klein_lora_fwd_rows_device_resident_scratch,
+    klein_lora_bwd_device_resident,
     klein_take_cols_device, klein_add_cols_device,
 )
 
@@ -678,15 +679,23 @@ def single_block_lora_forward_device_resident_scratch[
     var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
 
     var scratch_mark = scratch.mark()
-    var qkv = linear_rows_scratch(norm_t, w.w1[], 0, 3 * D, ctx, scratch)
+    var q_pre_flat = linear_rows(norm_t, w.w1[], 0, D, ctx)
+    var k_pre_flat = linear_rows(norm_t, w.w1[], D, D, ctx)
+    var v_flat = linear_rows(norm_t, w.w1[], 2 * D, D, ctx)
     var gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
     if lora.qkv:
-        var dlt = klein_lora_fwd_device_resident(norm_t, lora.qkv.value(), S, ctx)
-        qkv = add(qkv, dlt, ctx)
-
-    var q_pre_flat = slice(qkv, 1, 0, D, ctx)
-    var k_pre_flat = slice(qkv, 1, D, D, ctx)
-    var v_flat = slice(qkv, 1, 2 * D, D, ctx)
+        var q_dlt = klein_lora_fwd_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), S, 0, D, ctx, scratch,
+        )
+        add_in_place_f32(q_pre_flat, q_dlt, ctx)
+        var k_dlt = klein_lora_fwd_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), S, D, D, ctx, scratch,
+        )
+        add_in_place_f32(k_pre_flat, k_dlt, ctx)
+        var v_dlt = klein_lora_fwd_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), S, 2 * D, D, ctx, scratch,
+        )
+        add_in_place_f32(v_flat, v_dlt, ctx)
     var q_pre = reshape_owned(q_pre_flat^, [1, S, H, Dh])
     var k_pre = reshape_owned(k_pre_flat^, [1, S, H, Dh])
     var v = reshape_owned(v_flat^, [1, S, H, Dh])
@@ -804,15 +813,23 @@ def single_block_lora_recompute_saved_device_resident_scratch[
     var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
 
     var scratch_mark = scratch.mark()
-    var qkv = linear_rows_scratch(norm_t, w.w1[], 0, 3 * D, ctx, scratch)
+    var q_pre_flat = linear_rows(norm_t, w.w1[], 0, D, ctx)
+    var k_pre_flat = linear_rows(norm_t, w.w1[], D, D, ctx)
+    var v_flat = linear_rows(norm_t, w.w1[], 2 * D, D, ctx)
     var gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
     if lora.qkv:
-        var dlt = klein_lora_fwd_device_resident(norm_t, lora.qkv.value(), S, ctx)
-        qkv = add(qkv, dlt, ctx)
-
-    var q_pre_flat = slice(qkv, 1, 0, D, ctx)
-    var k_pre_flat = slice(qkv, 1, D, D, ctx)
-    var v_flat = slice(qkv, 1, 2 * D, D, ctx)
+        var q_dlt = klein_lora_fwd_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), S, 0, D, ctx, scratch,
+        )
+        add_in_place_f32(q_pre_flat, q_dlt, ctx)
+        var k_dlt = klein_lora_fwd_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), S, D, D, ctx, scratch,
+        )
+        add_in_place_f32(k_pre_flat, k_dlt, ctx)
+        var v_dlt = klein_lora_fwd_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), S, 2 * D, D, ctx, scratch,
+        )
+        add_in_place_f32(v_flat, v_dlt, ctx)
     var q_pre = reshape_owned(q_pre_flat^, [1, S, H, Dh])
     var k_pre = reshape_owned(k_pre_flat^, [1, S, H, Dh])
     var v = reshape_owned(v_flat^, [1, S, H, Dh])

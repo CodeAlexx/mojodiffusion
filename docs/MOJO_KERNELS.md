@@ -442,9 +442,10 @@ temporaries.
 **Parity gate:** `scratch_ring_smoke.mojo` covers clone, alignment,
 mark/rewind, reset, forward+reverse allocation, scratch concat2, scratch slice,
 scratch concat3, rank-4 generic concat/slice from the reverse cursor,
-scratch-backed F32 no-bias `linear_scratch`, row-range `linear_rows_scratch`,
-split-accumulating `linear_backward_dx_split_scratch`, and
-`sdpa_backward_scratch` d_q/d_k/d_v equality against the normal SDPA backward.
+scratch-backed F32 no-bias `linear_scratch`, fresh and scratch row-range
+`linear_rows` / `linear_rows_scratch`, in-place F32 add, split-accumulating
+`linear_backward_dx_split_scratch`, and `sdpa_backward_scratch` d_q/d_k/d_v
+equality against the normal SDPA backward.
 
 ---
 
@@ -469,10 +470,10 @@ files read):
 - **No CUDA-graph capture/replay, no global caching allocator.** Many Mojo ops
   still `enqueue_create_buffer` fresh. The F32 no-bias `linear` path now returns
   the vendor-BLAS GEMM output directly instead of allocating/copying through a
-  second output buffer; `linear_scratch`, `linear_rows_scratch`,
+  second output buffer; `linear_scratch`, `linear_rows`, `linear_rows_scratch`,
   `linear_backward_dx_scratch`, and `linear_backward_dx_split_scratch` can
-  allocate proven short-lived linear outputs from an opt-in ring while avoiding
-  selected row-split materializations; and `sdpa_backward_scratch` reuses ring
+  avoid selected row-split materializations; `add_in_place_f32` supports owned
+  destination-buffer accumulation; and `sdpa_backward_scratch` reuses ring
   storage for large SDPA backward work buffers. A shared scratch ring exists,
   and the real Klein LoRA path uses it for proven block-local temporaries, but
   other model paths must explicitly adopt it at their own frame boundaries.

@@ -34,11 +34,12 @@ from std.collections import List, Optional
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.ops.linear import linear
+from serenitymojo.ops.linear import linear, linear_scratch, linear_rows_scratch
 from serenitymojo.ops.linalg_backward import (
     linear_backward, linear_backward_dx, linear_backward_dw,
 )
 from serenitymojo.ops.tensor_algebra import add, concat, mul_scalar, slice
+from serenitymojo.scratch_ring import ScratchRingAllocator
 
 # REUSE the trainer's LoRA structs (the target authority).
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
@@ -140,6 +141,22 @@ def klein_lora_fwd_device_resident(
     var nb2 = Optional[Tensor](None)
     var dy = linear(t, lo.b[], nb2^, ctx)
     return mul_scalar(dy, lo.scale, ctx)
+
+
+def klein_lora_fwd_rows_device_resident_scratch(
+    x: Tensor,
+    lo: LoraAdapterDevice,
+    M: Int,
+    row_start: Int,
+    row_count: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> Tensor:
+    var nb1 = Optional[Tensor](None)
+    var t = linear_scratch(x, lo.a[], nb1^, ctx, scratch)
+    return linear_rows_scratch(
+        t, lo.b[], row_start, row_count, ctx, scratch, alpha=lo.scale,
+    )
 
 
 def klein_lora_fwd_device(

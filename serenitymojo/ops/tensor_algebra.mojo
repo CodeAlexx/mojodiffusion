@@ -402,6 +402,18 @@ def _ews_kernel_f16(
         o[i] = rebind[o.element_type](rv.cast[DType.float16]())
 
 
+def _add_in_place_kernel_f32(
+    dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var dv = rebind[Scalar[DType.float32]](dst[i])
+        var sv = rebind[Scalar[DType.float32]](src[i])
+        dst[i] = rebind[dst.element_type](dv + sv)
+
+
 def _binary_scalar(
     a: Tensor, s: Float32, op: Int, ctx: DeviceContext
 ) raises -> Tensor:
@@ -447,6 +459,26 @@ def _binary_scalar(
 def add_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:
     """Elementwise a + s (scalar)."""
     return _binary_scalar(a, s, _OP_ADD, ctx)
+
+
+def add_in_place_f32(dst: Tensor, src: Tensor, ctx: DeviceContext) raises:
+    """In-place dst += src for F32 tensors with identical element counts."""
+    if dst.dtype() != STDtype.F32 or src.dtype() != STDtype.F32:
+        raise Error("add_in_place_f32: expected F32 tensors")
+    if dst.numel() != src.numel():
+        raise Error("add_in_place_f32: numel mismatch")
+    var n = dst.numel()
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var D = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        dst.buf.unsafe_ptr().bitcast[Float32](), rl
+    )
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        src.buf.unsafe_ptr().bitcast[Float32](), rl
+    )
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_add_in_place_kernel_f32, _add_in_place_kernel_f32](
+        D, S, n, grid_dim=grid, block_dim=_BLOCK,
+    )
 
 
 def sub_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:

@@ -48,18 +48,19 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    `SGL_SAVE_TAIL = 9`, shared scratch ring hot-path wiring, F32 no-bias
    `linear` returning the GEMM output directly, scratch-backed frozen
    `linear_backward_dx` outputs in proven block frames, the two-slab
-   OneTrainer-style scratch SDPA work-buffer path, and direct row-split W1
-   forward/backward in single-block scratch frames, are **~3.24-3.33 s/step**:
-   `3.3273206`, `3.237176`, loss `2.7340817`, grad `0.1768747`.
-   The immediate pre-row-split band was `3.5673797`, `3.6506753`,
-   `3.6517751`, `3.5703504`.
+   OneTrainer-style scratch SDPA work-buffer path, direct row-split W1
+   forward/backward in single-block scratch frames, and direct q/k/v row outputs
+   for saved single-block activations, are **~3.05 s/step**: `3.0558763`,
+   `3.0548809`, loss `2.7340817`, grad `0.1768747`.
+   The immediate pre-q/k/v direct band was `3.3273206`, `3.237176`; before that
+   `3.5673797`, `3.6506753`, `3.6517751`, `3.5703504`.
    Immediate pre-change baseline was `3.7449117`; previous scratch-only band
    was `3.7256575`, `3.7467637`, `3.7412038`; before that `3.950125`,
    `3.9545975`. This is real progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
    - single-block backward/recompute is still the measured dominant region; next
-     target is the remaining W2 `out_in` concat/split and q/k/v split copies;
+     target is the remaining W2 `out_in` concat/split and LoRA-out add/copy path;
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
    - scratch-backed linear forward, SDPA backward work buffers, cached norm
@@ -504,6 +505,39 @@ band from `~3.57-3.65s` to `~3.24-3.33s`. It is still just above the requested
 focus on W2/out_in materialization and runtime view/offset carriers rather than
 more scratch allocation plumbing alone.
 
+### 2026-05-31 continuation: direct q/k/v row outputs with safe lifetimes landed
+
+After the W1 fused tensor was removed, the scratch single-block path still
+created a `[S,3D]` qkv tensor and sliced it into q/k/v saved activations. This
+continuation removes that copy layer while preserving saved activation lifetime:
+
+- `ops/linear.mojo`: added `linear_rows`, a fresh-output sibling of
+  `linear_rows_scratch`. Saved q/k/v activations use this fresh helper because
+  they must outlive the scratch frame rewind.
+- `models/klein/lora_block.mojo`: added
+  `klein_lora_fwd_rows_device_resident_scratch`, which reuses the resident LoRA
+  A/B tensors but computes only one contiguous output-row range of B. Its
+  temporary `t = x @ A.T` and row delta are scratch-frame temporaries.
+- `ops/tensor_algebra.mojo`: added `add_in_place_f32`, used only when the caller
+  owns the destination buffer. Single-block q/k/v row outputs use it to add
+  LoRA qkv row deltas without allocating another full q/k/v output.
+- `models/klein/single_block.mojo`: scratch forward/recompute now computes q,
+  k, and v directly as fresh row outputs, computes gate/up as scratch, and adds
+  q/k/v LoRA row deltas in place.
+
+| item | result |
+|------|--------|
+| scratch gate | `scratch_ring_smoke` PASS, including `fresh linear rows` and `scratch add in place` |
+| single-block LoRA gate | `single_block_lora_parity` PASS |
+| rejected lifetime-bug trial | `2.6774743s`, loss `2.7340817`, **bad grad `0.13114551`** because saved q/k/v had been scratch-backed then rewound |
+| real 4B timing after fresh q/k/v rows | `3.0558763`, `3.0548809`, loss `2.7340817`, grad `0.1768747` |
+
+Conclusion: the safe direct q/k/v row path is a real win and puts the trainer
+right around the requested few-seconds-per-step target. Do **not** scratch-back
+saved q/k/v without a longer-lived frame; the invalid 2.677s trial proves that
+can silently corrupt gradients while leaving forward loss unchanged. Next
+remaining lever is W2/out_in materialization and LoRA-out add/copy.
+
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -590,6 +624,11 @@ ops/linear.mojo, ops/linalg_backward.mojo, scratch_ring_smoke.mojo,
 models/klein/single_block.mojo, docs/MOJO_MODULES.md,
 docs/MOJO_KERNELS.md, this handoff.
 
+Files touched in the direct q/k/v row-output continuation:
+ops/linear.mojo, ops/tensor_algebra.mojo, models/klein/lora_block.mojo,
+models/klein/single_block.mojo, scratch_ring_smoke.mojo, docs/MOJO_MODULES.md,
+docs/MOJO_KERNELS.md, this handoff.
+
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 
@@ -617,3 +656,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | F32 no-bias linear fast path + scratch dx | AGENT-DEFAULT | removed a redundant post-GEMM copy for all F32 no-bias `linear` calls and used scratch-backed frozen dx outputs only inside proven Klein scratch frames, measuring `~3.57-3.65s` with unchanged loss/grad |
 | Scratch SDPA work-buffer path + two-slab real trainer ring | USER/AGENT | user explicitly pointed at OneTrainer and requested re-entrant ring allocator plumbing usable by all models iff needed; implemented as shared opt-in `sdpa_backward_scratch`, proved with smoke/parity, measured timing-neutral `3.6517751s` and final checked rerun `3.5703504s` |
 | Single-block W1 row-split forward/backward | AGENT-DEFAULT | used contiguous W1 row ranges to avoid materializing the huge `[S,3D+2F]` fused tensor and backward concat in scratch frames; measured `3.3273206s` and `3.237176s` with unchanged loss/grad |
+| Direct q/k/v row outputs must be fresh, not rewound scratch | AGENT-DEFAULT | direct row outputs removed qkv split copies and measured `3.0558763s` / `3.0548809s`; an attempted scratch-backed saved q/k/v path measured `2.6774743s` but corrupted grad norm to `0.13114551`, so saved q/k/v use fresh `linear_rows` |

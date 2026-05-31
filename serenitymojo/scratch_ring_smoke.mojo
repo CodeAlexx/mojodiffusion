@@ -15,12 +15,13 @@ from serenitymojo.ops.tensor_algebra_scratch import (
     concat3_scratch,
     slice_scratch,
 )
+from serenitymojo.ops.tensor_algebra import add_in_place_f32
 from serenitymojo.ops.linalg_backward import (
     linear_backward_dx,
     linear_backward_dx_scratch,
     linear_backward_dx_split_scratch,
 )
-from serenitymojo.ops.linear import linear, linear_scratch, linear_rows_scratch
+from serenitymojo.ops.linear import linear, linear_scratch, linear_rows, linear_rows_scratch
 from serenitymojo.ops.attention_backward import sdpa_backward, sdpa_backward_scratch
 
 
@@ -175,6 +176,18 @@ def main() raises:
     var lin_rows_ref = lin_rows_ref_t.to_host(ctx)
     r = h.compare(lin_rows, lin_rows_ref, ctx)
     print("scratch linear rows ", r)
+    all_pass = all_pass and r.passed
+    var lin_rows_fresh = linear_rows(lin_x, wt, 1, 2, ctx)
+    r = h.compare(lin_rows_fresh, lin_rows_ref, ctx)
+    print("fresh linear rows   ", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
+    var add_dst = ring.clone_tensor(a, ctx)
+    var add_delta = Tensor.from_host(_lf(0.5, 1.0, -1.5, 2.0, -2.5, 3.0), [2, 3], F32, ctx)
+    add_in_place_f32(add_dst, add_delta, ctx)
+    r = h.compare(add_dst, _lf(1.5, -1.0, 2.0, 6.25, -7.5, 9.75), ctx)
+    print("scratch add in place", r)
     all_pass = all_pass and r.passed
 
     var att_ring = ScratchRingAllocator(ctx, 4096, 2)

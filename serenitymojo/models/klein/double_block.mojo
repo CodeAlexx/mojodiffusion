@@ -101,7 +101,9 @@ from serenitymojo.ops.tensor_algebra_scratch import (
 )
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
-from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx, LinearGrads
+from serenitymojo.ops.linalg_backward import (
+    linear_backward, linear_backward_dx, linear_backward_dx_scratch, LinearGrads,
+)
 from serenitymojo.ops.norm_backward import (
     rms_norm_backward, rms_norm_backward_dx, RmsNormBackward,
     layer_norm_backward, layer_norm_backward_dx, LayerNormBackward,
@@ -1322,14 +1324,15 @@ def _stream_post_backward_lora_resident_scratch(
     else:
         grg2 = gate_residual_backward_dxdy(d_out[], mv.gate2[], ctx)
 
-    var d_d_dx = linear_backward_dx(grg2.d_y, w.wd[], N, F, D, ctx)
+    var post_mark = scratch.mark()
+    var d_d_dx = linear_backward_dx_scratch(grg2.d_y, w.wd[], N, F, D, ctx, scratch)
 
     var sgb = swiglu_backward(d_d_dx, sv.gate[], sv.up[], ctx)
-    var gu_mark = scratch.mark()
     var d_gu = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
 
-    var d_gu_dx = linear_backward_dx(d_gu, w.wgu[], N, D, 2 * F, ctx)
-    scratch.rewind(gu_mark)
+    var d_gu_dx = linear_backward_dx_scratch(
+        d_gu, w.wgu[], N, D, 2 * F, ctx, scratch,
+    )
 
     var mb2 = modulate_backward(d_gu_dx, sv.ln2[], mv.scale2[], ctx, compute_aux_grads)
     var d_scale2 = List[Float32]()
@@ -1337,6 +1340,7 @@ def _stream_post_backward_lora_resident_scratch(
     if compute_aux_grads:
         d_scale2 = mb2.d_scale.to_host(ctx)
         d_shift2 = mb2.d_shift.to_host(ctx)
+    scratch.rewind(post_mark)
 
     var d_attn_res_norm = layer_norm_backward_dx(mb2.d_x, sv.attn_res[], ones, eps, ctx)
     var d_attn_res_total = TArc(add(grg2.d_x, d_attn_res_norm, ctx))
@@ -1415,7 +1419,9 @@ def _stream_pre_backward_lora_resident[
     var d_qkv = concat(1, ctx, d_q_pre_flat, d_k_pre_flat, d_v_flat)   # grad at wqkv OUTPUT [N,3D]
 
     # frozen qkv backward: d_x ONLY (base d_wqkv computed-then-discarded).
-    var d_norm_t = linear_backward_dx(d_qkv, w.wqkv[], N, D, 3 * D, ctx)
+    var d_norm_t = linear_backward_dx(
+        d_qkv, w.wqkv[], N, D, 3 * D, ctx,
+    )
 
     # LoRA backward on wqkv (input=norm, d_y=d_qkv): qkv_d_a/_b + d_norm_lo
     var qkv_d_a = List[Float32]()
@@ -1462,7 +1468,9 @@ def _stream_pre_backward_lora_resident_scratch[
     var d_k_pre_flat = reshape_owned(d_k_pre^, [N, D])
     var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, d_v_flat, True)
 
-    var d_norm_t = linear_backward_dx(d_qkv, w.wqkv[], N, D, 3 * D, ctx)
+    var d_norm_t = linear_backward_dx_scratch(
+        d_qkv, w.wqkv[], N, D, 3 * D, ctx, scratch,
+    )
 
     var qkv_d_a = List[Float32]()
     var qkv_d_b = List[Float32]()

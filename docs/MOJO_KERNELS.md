@@ -45,12 +45,13 @@ only at the load/store cast. Most other backward files are **F32-only** (the
 
 | Function | Line | Returns | Math |
 |---|---|---|---|
-| `mm_backward(grad_c, a, b, M, N, K, ctx)` | :153 | `MatmulGrads{d_a, d_b}` | d_a = grad_c@Bᵀ; d_b = Aᵀ@grad_c (vendor BLAS) |
-| `bmm_backward(grad_c, a, b, Batch, M, N, K, ctx)` | :197 | `MatmulGrads{d_a, d_b}` | batched mm backward |
-| `linear_backward(grad_y, x, weight, M, in_features, out_features, ctx)` | :249 | `LinearGrads{d_x, d_w, d_b}` | y=x@Wᵀ+b → d_x=grad@W; d_W=gradᵀ@x; d_b=colsum(grad) |
-| `linear_backward_dx(grad_y, weight, M, in_features, out_features, ctx)` | :295 | `Tensor` | d_x-only path for frozen weights; skips d_W/d_b work and readback |
-| `linear_backward_dw(grad_y, x, M, in_features, out_features, ctx)` | :329 | `Tensor` | d_W-only path used by LoRA d_A/d_B helpers |
-| `addbias_backward(grad_y, M, out_features, ctx)` | :360 | `AddBiasGrads{d_x, d_b}` | d_x=grad; d_b=colsum(grad) |
+| `mm_backward(grad_c, a, b, M, N, K, ctx)` | :169 | `MatmulGrads{d_a, d_b}` | d_a = grad_c@Bᵀ; d_b = Aᵀ@grad_c (vendor BLAS) |
+| `bmm_backward(grad_c, a, b, Batch, M, N, K, ctx)` | :212 | `MatmulGrads{d_a, d_b}` | batched mm backward |
+| `linear_backward(grad_y, x, weight, M, in_features, out_features, ctx)` | :263 | `LinearGrads{d_x, d_w, d_b}` | y=x@Wᵀ+b → d_x=grad@W; d_W=gradᵀ@x; d_b=colsum(grad) |
+| `linear_backward_dx(grad_y, weight, M, in_features, out_features, ctx)` | :311 | `Tensor` | d_x-only path for frozen weights; skips d_W/d_b work and readback |
+| `linear_backward_dx_scratch(..., scratch, reverse=False)` | :342 | `Tensor` | same d_x GEMM as `linear_backward_dx`, but output storage comes from an opt-in scratch ring |
+| `linear_backward_dw(grad_y, x, M, in_features, out_features, ctx)` | :377 | `Tensor` | d_W-only path used by LoRA d_A/d_B helpers |
+| `addbias_backward(grad_y, M, out_features, ctx)` | :408 | `AddBiasGrads{d_x, d_b}` | d_x=grad; d_b=colsum(grad) |
 
 Grad structs: `MatmulGrads{d_a,d_b}` (:60), `LinearGrads{d_x,d_w,d_b}` (:71),
 `AddBiasGrads{d_x,d_b}` (:84). Helper kernels `_colsum_kernel` (:96),
@@ -454,10 +455,13 @@ files read):
   backward kernels are correctness-first scalar/F32.
 - **No multi-tensor L2-norm.** `clip_grad_global_norm` (`optim.mojo:234`) is a
   hand-rolled 2-tensor case, not the multi-tensor 2-stage reduction.
-- **No CUDA-graph capture/replay, no global caching allocator.** Most Mojo ops
-  still `enqueue_create_buffer` fresh. A shared opt-in scratch ring now exists,
-  and the real Klein LoRA path uses it for proven block-local temporaries, but
-  other model paths must explicitly adopt it at their own frame boundaries.
+- **No CUDA-graph capture/replay, no global caching allocator.** Many Mojo ops
+  still `enqueue_create_buffer` fresh. The F32 no-bias `linear` path now returns
+  the vendor-BLAS GEMM output directly instead of allocating/copying through a
+  second output buffer, and `linear_backward_dx_scratch` can allocate frozen dx
+  outputs from an opt-in ring. A shared scratch ring exists, and the real Klein
+  LoRA path uses it for proven block-local temporaries, but other model paths
+  must explicitly adopt it at their own frame boundaries.
 
 These are expected for a from-scratch port whose proven scope is *correctness
 through composition*, not throughput. As of this session there is **no open

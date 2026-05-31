@@ -49,6 +49,7 @@ from linalg.matmul.vendor.blas import matmul
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.scratch_ring import ScratchRingAllocator
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -126,6 +127,21 @@ def _new_f32(rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
     sh.append(rows)
     sh.append(cols)
     return Tensor(buf^, sh^, STDtype.F32)
+
+
+def _new_f32_scratch(
+    rows: Int,
+    cols: Int,
+    mut scratch: ScratchRingAllocator,
+    reverse: Bool,
+) raises -> Tensor:
+    """Allocate a scratch-backed [rows,cols] F32 Tensor."""
+    var sh = List[Int]()
+    sh.append(rows)
+    sh.append(cols)
+    if reverse:
+        return scratch.alloc_tensor_reverse(sh^, STDtype.F32)
+    return scratch.alloc_tensor(sh^, STDtype.F32)
 
 
 def _colsum(grad_y: Tensor, m: Int, out_dim: Int, ctx: DeviceContext) raises -> Tensor:
@@ -319,6 +335,38 @@ def linear_backward_dx(
     var dx = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](d_x.buf.unsafe_ptr().bitcast[Float32](), mi_rl)
 
     # d_x[M,in] = grad_y[M,out] @ W[out,in]   (contraction over out → no transpose)
+    matmul(ctx, dx, gy, wv, c_row_major=True)
+    return d_x^
+
+
+def linear_backward_dx_scratch(
+    grad_y: Tensor,
+    weight: Tensor,
+    M: Int,
+    in_features: Int,
+    out_features: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    reverse: Bool = False,
+) raises -> Tensor:
+    """d_x-only linear backward with opt-in scratch storage for the output.
+
+    Math and GEMM flags match `linear_backward_dx`; only the output allocation
+    source changes. Non-F32 inputs fall back to the normal path because the cast
+    path owns its transient tensors outside the scratch lifetime contract.
+    """
+    if grad_y.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
+        return linear_backward_dx(grad_y, weight, M, in_features, out_features, ctx)
+
+    var d_x = _new_f32_scratch(M, in_features, scratch, reverse)
+
+    var mo_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, out_features))
+    var mi_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, in_features))
+    var oi_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_features, in_features))
+    var gy = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](grad_y.buf.unsafe_ptr().bitcast[Float32](), mo_rl)
+    var wv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](weight.buf.unsafe_ptr().bitcast[Float32](), oi_rl)
+    var dx = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](d_x.buf.unsafe_ptr().bitcast[Float32](), mi_rl)
+
     matmul(ctx, dx, gy, wv, c_row_major=True)
     return d_x^
 

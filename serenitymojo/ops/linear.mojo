@@ -213,13 +213,21 @@ def linear(
         )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
 
+    var out_shape = List[Int]()
+    for i in range(len(xshape) - 1):
+        out_shape.append(xshape[i])
+    out_shape.append(out_dim)
+
+    var has_bias = 1 if bias else 0
+    if dt == DType.float32 and has_bias == 0:
+        return Tensor(c_buf^, out_shape^, x.dtype())
+
     # Output buffer in x's dtype.
     var bsz = x.dtype().byte_size()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](m * out_dim * bsz)
 
     # Bias stays on device. No bias -> length-1 dummy + has_bias=0 using the
     # older F32-bias kernels. Biases are stored in the same dtype as weights.
-    var has_bias = 1 if bias else 0
     var bias_count = out_dim if bias else 1
     var bias_f32_buf = ctx.enqueue_create_buffer[DType.uint8](bias_count * 4)
     if bias:
@@ -304,8 +312,4 @@ def linear(
     # TIER2-SYNC-REMOVED: single-stream enqueue serializes kernel order; the
     # downstream .to_host()/optimizer barrier is the only required sync. Output is
     # a device buffer with no host-staging buffer to protect here.
-    var out_shape = List[Int]()
-    for i in range(len(xshape) - 1):
-        out_shape.append(xshape[i])
-    out_shape.append(out_dim)
     return Tensor(out_buf^, out_shape^, x.dtype())

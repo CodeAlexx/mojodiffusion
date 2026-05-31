@@ -94,7 +94,9 @@ from serenitymojo.ops.tensor_algebra_scratch import (
 )
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
-from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx, LinearGrads
+from serenitymojo.ops.linalg_backward import (
+    linear_backward, linear_backward_dx, linear_backward_dx_scratch, LinearGrads,
+)
 from serenitymojo.ops.norm_backward import (
     rms_norm_backward, rms_norm_backward_dx, RmsNormBackward,
     layer_norm_backward, layer_norm_backward_dx, LayerNormBackward,
@@ -1010,8 +1012,8 @@ def single_block_lora_backward_device_resident_scratch[
     else:
         grg = gate_residual_backward_dxdy(d_out_t[], mv.gate[], ctx)
 
-    var d_out_in_t = linear_backward_dx(
-        grg.d_y, w.w2[], S, D + F, D, ctx,
+    var d_out_in_t = linear_backward_dx_scratch(
+        grg.d_y, w.w2[], S, D + F, D, ctx, scratch,
     )
 
     var out_d_a = List[Float32]()
@@ -1048,8 +1050,8 @@ def single_block_lora_backward_device_resident_scratch[
 
     var d_fused = concat2_scratch(1, ctx, scratch, d_qkv, d_gate_up)
 
-    var d_norm_t = linear_backward_dx(
-        d_fused, w.w1[], S, D, 3 * D + 2 * F, ctx,
+    var d_norm_t = linear_backward_dx_scratch(
+        d_fused, w.w1[], S, D, 3 * D + 2 * F, ctx, scratch,
     )
 
     var qkv_d_a = List[Float32]()

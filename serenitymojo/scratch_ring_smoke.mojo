@@ -14,6 +14,10 @@ from serenitymojo.ops.tensor_algebra_scratch import (
     concat3_scratch,
     slice_scratch,
 )
+from serenitymojo.ops.linalg_backward import (
+    linear_backward_dx,
+    linear_backward_dx_scratch,
+)
 
 
 def _lf(*values: Float64) -> List[Float32]:
@@ -125,6 +129,19 @@ def main() raises:
     var rslice = slice_scratch(rcat, 1, 1, 2, ctx, ring, True)
     r = h.compare(rslice, _lf(3.0, 4.0, 10.0, 11.0), ctx)
     print("scratch rank4 slice ", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
+    var gy = Tensor.from_host(_lf(1.0, -2.0, 3.0, 0.5, 4.0, -1.0), [2, 3], F32, ctx)
+    var wt = Tensor.from_host(
+        _lf(0.25, 1.0, -0.5, 2.0, 1.5, -1.0, 0.75, 0.5, -2.0, 0.125, 1.25, -0.25),
+        [3, 4], F32, ctx,
+    )
+    var dx_ref_t = linear_backward_dx(gy, wt, 2, 4, 3, ctx)
+    var dx_ref = dx_ref_t.to_host(ctx)
+    var dx_scratch = linear_backward_dx_scratch(gy, wt, 2, 4, 3, ctx, ring)
+    r = h.compare(dx_scratch, dx_ref, ctx)
+    print("scratch linear dx   ", r)
     all_pass = all_pass and r.passed
 
     if all_pass:

@@ -45,21 +45,22 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    step-modulation weights, metadata reshape cleanup, device-resident modulation
    chunks/RoPE, single-block backward copy cleanup, no-aux gate-residual
    y-recompute skipping, save-only single-block backward recompute, and
-   `SGL_SAVE_TAIL = 9`, with the shared scratch ring now wired through proven
-   Klein frame lifetimes, are **~3.73-3.75 s/step**: `3.7256575`,
-   `3.7467637`, `3.7412038`, loss `2.734082`, grad `0.17687473`.
-   Previous clean band was `3.950125`, `3.9545975`; before that `3.9814968`,
-   `3.9988506` and `4.106987`, `4.1046743`. Prior clean state after resident
-   LoRA A/B + scratch infrastructure was **5.200673 s/step**; best clean prior
-   was **5.1468015**. This is real progress but **NOT the requested 2-3s target**.
+   `SGL_SAVE_TAIL = 9`, shared scratch ring hot-path wiring, F32 no-bias
+   `linear` returning the GEMM output directly, and scratch-backed frozen
+   `linear_backward_dx` outputs in proven block frames, are **~3.57-3.65
+   s/step**: `3.5673797`, `3.6506753`, loss `2.734082`, grad `0.17687473`.
+   Immediate pre-change baseline was `3.7449117`; previous scratch-only band
+   was `3.7256575`, `3.7467637`, `3.7412038`; before that `3.950125`,
+   `3.9545975`. This is real progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
-   - single-block backward is the measured dominant region; next target is
+   - single-block backward is still the measured dominant region; next target is
      fusion/view reduction inside the single-block recompute/backward path;
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
-   - extend scratch usage only at additional proven frame boundaries; the allocator
-     is shared/opt-in for all models, but it is not a global Tensor allocator;
+   - extend scratch usage only at additional proven frame boundaries, especially
+     short-lived no-bias linear forward outputs in recompute; the allocator is
+     shared/opt-in for all models, but it is not a global Tensor allocator;
    - longer term: BF16/mixed precision plus fused kernels. The current wall time is
      still dominated by op count and materialized tensor movement.
 
@@ -391,6 +392,36 @@ This is a measured allocator/temporary-lifetime win, not a math change. The
 remaining gap to 2-3s still needs fewer D2D materializations and fewer kernels,
 especially in single-block backward.
 
+### 2026-05-31 continuation: F32 no-bias linear fast path + scratch dx outputs
+
+The shared tensor/linalg layer still had two general overheads that hit every
+Klein block:
+
+- `ops/linear.mojo`: for F32 tensors with no bias, `linear` already computes the
+  final output in the vendor-BLAS F32 GEMM buffer. It was still allocating a
+  second F32 output and launching the bias/cast kernel as a pure copy. The F32
+  no-bias case now returns the GEMM buffer directly. Bias and BF16/F16 paths are
+  unchanged.
+- `ops/linalg_backward.mojo`: added `linear_backward_dx_scratch`, an opt-in
+  sibling of `linear_backward_dx` that keeps the same GEMM/math but allocates
+  the d_x output from a caller-owned `ScratchRingAllocator`.
+- `models/klein/single_block.mojo` and `models/klein/double_block.mojo`: the
+  scratch-aware backward wrappers use `linear_backward_dx_scratch` only for
+  short-lived frozen-weight dx tensors whose lifetimes are inside existing
+  scratch marks. Non-scratch APIs remain unchanged.
+
+| item | result |
+|------|--------|
+| scratch/linalg gate | `scratch_ring_smoke` PASS, including `scratch linear dx` |
+| block/stack gates | `single_block_lora_parity` PASS, `double_block_lora_parity` PASS, `klein_stack_lora_parity` PASS |
+| immediate baseline before this continuation | `3.7449117`, loss `2.734082`, grad `0.17687473` |
+| intermediate after single scratch dx + linear fast path | `3.590506`, `3.631371`, same loss/grad |
+| accepted real 4B timing runs after double scratch dx | `3.5673797`, `3.6506753`, same loss/grad |
+
+This is the first post-ring shared tensor-layer win: all F32 no-bias model
+linears avoid the redundant copy, while scratch dx remains opt-in at proven
+lifetimes.
+
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -460,6 +491,11 @@ docs/MOJO_MODULES.md, this handoff.
 Files touched in the single saved-tail tuning continuation:
 models/klein/klein_stack_lora.mojo, docs/MOJO_MODULES.md, this handoff.
 
+Files touched in the F32 no-bias linear / scratch dx continuation:
+ops/linear.mojo, ops/linalg_backward.mojo, scratch_ring_smoke.mojo,
+models/klein/single_block.mojo, models/klein/double_block.mojo,
+docs/MOJO_MODULES.md, docs/MOJO_KERNELS.md, this handoff.
+
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 
@@ -484,3 +520,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | Save-only single-block recompute | AGENT-DEFAULT | checkpointed backward needs `SingleBlockSaved`, not discarded block outputs, so unsaved single blocks can skip final output work during recompute |
 | `SGL_SAVE_TAIL = 9` | AGENT-DEFAULT | measured tail 9 improves the current save-only recompute path, while tail 10 and tail 12 cross the memory/speed knee and slow down |
 | Klein scratch hot-path wiring | USER/AGENT | user asked to finish the OneTrainer-style ring allocator; agent kept it shared/opt-in and wired only proven Klein frame lifetimes, measuring `~3.73-3.75s` with unchanged loss/grad |
+| F32 no-bias linear fast path + scratch dx | AGENT-DEFAULT | removed a redundant post-GEMM copy for all F32 no-bias `linear` calls and used scratch-backed frozen dx outputs only inside proven Klein scratch frames, measuring `~3.57-3.65s` with unchanged loss/grad |

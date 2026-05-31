@@ -27,8 +27,8 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    - **True per-step D2H ≈ 25 GB**, dominated by ACTIVATION host-bounces caused by the
      host-typed LoRA helpers — NOT weight gradients.
 
-4. **2026-05-31 continuation LANDED:** ported the LoRA-adjacent activation path to
-   device carriers and removed the largest host-list bridges:
+4. **2026-05-31 continuation LANDED:** ported the LoRA-adjacent activation path and
+   LoRA A/B parameter path to device carriers:
    - inter-block Klein stack activations are now `ArcPointer[Tensor]` carriers;
    - `single_block_lora_*_device` / `double_block_lora_*_device` keep `d_x`,
      attention slices, qkv, fused streams, and block saves device-resident;
@@ -37,18 +37,18 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    - `reshape_owned` provides metadata-only reshape where the source tensor is owned;
    - `SGL_SAVE_TAIL = 8` saves only the tail single-block activations to fit memory;
    - real LoRA train skips unused input-token and aux mod/gate grads;
-   - LoRA `d_A`/`d_B` readback is batched into one sync per adapter pair.
+   - LoRA `d_A`/`d_B` readback is batched into one sync per adapter pair;
+   - `KleinLoraDeviceSet` uploads LoRA A/B once per step and reuses those tensors
+     through forward, backward recompute, and LoRA backward.
 
 5. **Current measured state:** clean `train_klein_real.mojo` run is now
-   **5.312408 s/step** (`PROG step=1 ... secs=5.312408`, loss `2.734082`).
-   Best instrumented run in this pass was **5.227653 s**; phase shape was stable:
+   **5.1468015 s/step** (`PROG step=1 ... secs=5.1468015`, loss `2.734082`).
+   Previous clean state before resident LoRA A/B was **5.312408 s/step**; best
+   instrumented run in that pass was **5.227653 s**. Phase shape was stable:
    prep ≈0.79-0.90s, forward ≈1.50-1.52s, backward ≈2.83-2.89s.
    This is real progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
-   - make LoRA adapter A/B weights device-resident across forward/recompute/backward
-     so `klein_lora_fwd_device` / `klein_lora_bwd_device` stop `Tensor.from_host`-ing
-     A/B at every use;
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
    - longer term: BF16/mixed precision plus fused kernels. Ring/pool allocator helps
@@ -135,7 +135,7 @@ HOST-typed `List[Float32]` → every LoRA-adjacent activation bounces device→h
 This is exactly the item handoff_A1_A2 §2 deferred as "out of scope."
 
 ═══════════════════════════════════════════════════════════════════════════════
-## §4 — LoRA helper device pass (continuation landed; follow-up remains)
+## §4 — LoRA helper/device-adapter pass (continuation landed)
 ═══════════════════════════════════════════════════════════════════════════════
 
 The large activation host-bounces identified in §3 are now removed from the hot LoRA
@@ -150,19 +150,26 @@ stack path:
   activations as `ArcPointer[Tensor]` and uses device input tokens.
 - `training/train_klein_real.mojo` calls the device-input forward and skips unused
   input-token / aux modulation-gradient outputs in the real LoRA optimizer path.
+- `models/klein/lora_block.mojo` defines `LoraAdapterDevice` and resident LoRA
+  helpers. `models/klein/klein_stack_lora.mojo` defines `KleinLoraDeviceSet` and
+  `klein_lora_set_to_device`; the real trainer builds this once per step so A/B
+  are not re-uploaded at every LoRA forward/recompute/backward use.
 
 Measured result for this continuation:
 
 | metric | measured |
 |--------|----------|
-| clean step time | `5.312408s` |
-| best instrumented step | `5.227653s` |
+| clean step time before resident A/B | `5.312408s` |
+| clean step time after resident A/B | `5.1468015s` |
+| best prior instrumented step | `5.227653s` |
 | loss | `2.734082` |
 | parity | single LoRA PASS, double LoRA PASS, stack LoRA PASS |
 
-Important caveat: LoRA A/B **parameters** are still host-owned `LoraAdapter` lists.
-`klein_lora_fwd_device` and `klein_lora_bwd_device` still upload A/B tensors with
-`Tensor.from_host` at each adapter use. That is the next per-step LoRA H2D target.
+Important caveat: AdamW state and saved LoRA source of truth remain host-owned
+`LoraAdapter` lists, so each optimizer step still mutates host A/B and the next
+training step rebuilds `KleinLoraDeviceSet`. That is intentional for the existing
+save/resume path. The repeated per-use A/B upload inside LoRA forward/backward is
+gone.
 
 Secondary (one-time, low priority): weight loader F32-direct to kill the ~14 GB startup
 roundtrip. Helps cold-start only, not step time. Still open from prior handoffs:
@@ -218,4 +225,5 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | Exclude *.safetensors/*.log/*.png/agent-memory from commit | AGENT-DEFAULT | regenerable / artifacts; matches existing .gitignore policy |
 | Investigate remaining D2H ("could it be hidden in mojo layers") | USER | direct question → instrumented + measured |
 | LoRA-helpers device port | USER | continued after user redirected to tensors/autograd; landed device activation carriers and measured 5.31s clean |
+| Resident LoRA A/B carrier | AGENT-DEFAULT | user asked to focus tensors for all models; removes repeated per-use `from_host` in LoRA helpers while preserving host optimizer/save source of truth |
 | Ring/pool allocator | USER later | explicitly deferred; belongs after Tensor view/slab support |

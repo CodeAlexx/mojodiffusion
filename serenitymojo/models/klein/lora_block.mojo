@@ -31,6 +31,7 @@
 
 from std.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
+from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
@@ -41,6 +42,37 @@ from serenitymojo.ops.tensor_algebra import add, concat, mul_scalar, slice
 
 # REUSE the trainer's LoRA structs (the target authority).
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
+
+
+comptime TArc = ArcPointer[Tensor]
+
+
+struct LoraAdapterDevice(Copyable, Movable):
+    var a: TArc
+    var b: TArc
+    var rank: Int
+    var in_f: Int
+    var out_f: Int
+    var scale: Float32
+
+    def __init__(
+        out self, var a: TArc, var b: TArc,
+        rank: Int, in_f: Int, out_f: Int, scale: Float32,
+    ):
+        self.a = a^
+        self.b = b^
+        self.rank = rank
+        self.in_f = in_f
+        self.out_f = out_f
+        self.scale = scale
+
+
+def lora_adapter_to_device(lo: LoraAdapter, ctx: DeviceContext) raises -> LoraAdapterDevice:
+    return LoraAdapterDevice(
+        TArc(Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx)),
+        TArc(Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx)),
+        lo.rank, lo.in_f, lo.out_f, lo.scale,
+    )
 
 
 struct _HostGradPair(Copyable, Movable):
@@ -98,24 +130,23 @@ def klein_lora_fwd(
     return out^
 
 
-# Device-resident sibling of klein_lora_fwd. A/B still come from the host-owned
-# adapter, but the activation input and delta output stay on device.
+# Device-resident sibling of klein_lora_fwd. A/B are borrowed from a resident
+# adapter carrier, so hot forward/recompute/backward paths do not re-upload them.
+def klein_lora_fwd_device_resident(
+    x: Tensor, lo: LoraAdapterDevice, M: Int, ctx: DeviceContext
+) raises -> Tensor:
+    var nb1 = Optional[Tensor](None)
+    var t = linear(x, lo.a[], nb1^, ctx)
+    var nb2 = Optional[Tensor](None)
+    var dy = linear(t, lo.b[], nb2^, ctx)
+    return mul_scalar(dy, lo.scale, ctx)
+
+
 def klein_lora_fwd_device(
     x: Tensor, lo: LoraAdapter, M: Int, ctx: DeviceContext
 ) raises -> Tensor:
-    var nb1 = Optional[Tensor](None)
-    var t = linear(
-        x,
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
-        nb1^, ctx,
-    )
-    var nb2 = Optional[Tensor](None)
-    var dy = linear(
-        t,
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
-        nb2^, ctx,
-    )
-    return mul_scalar(dy, lo.scale, ctx)
+    var lo_dev = lora_adapter_to_device(lo, ctx)
+    return klein_lora_fwd_device_resident(x, lo_dev, M, ctx)
 
 
 # LoRA backward that ALSO returns the LoRA branch's contribution to d_x.
@@ -183,28 +214,33 @@ struct KleinLoraDeviceGrads(Movable):
 
 # Device-resident sibling of klein_lora_bwd. d_A/d_B still leave as host lists
 # for the existing optimizer, while the large d_x_lo tensor stays on device.
-def klein_lora_bwd_device(
-    d_contrib: Tensor, x: Tensor, lo: LoraAdapter,
+def klein_lora_bwd_device_resident(
+    d_contrib: Tensor, x: Tensor, lo: LoraAdapterDevice,
     M: Int, ctx: DeviceContext,
 ) raises -> KleinLoraDeviceGrads:
-    var a_t = Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx)
-    var b_t = Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx)
-
     # t = x @ Aᵀ  (recompute; cheap)
     var nb_t = Optional[Tensor](None)
-    var t = linear(x, a_t, nb_t^, ctx)                # [M,rank]
+    var t = linear(x, lo.a[], nb_t^, ctx)             # [M,rank]
     var d_dy = mul_scalar(d_contrib, lo.scale, ctx)   # [M,out]
 
     # dy = t @ Bᵀ.
-    var d_t = linear_backward_dx(d_dy, b_t, M, lo.rank, lo.out_f, ctx)
+    var d_t = linear_backward_dx(d_dy, lo.b[], M, lo.rank, lo.out_f, ctx)
     var d_b_t = linear_backward_dw(d_dy, t, M, lo.rank, lo.out_f, ctx)
 
     # t = x @ Aᵀ.
-    var d_x_lo = linear_backward_dx(d_t, a_t, M, lo.in_f, lo.rank, ctx)
+    var d_x_lo = linear_backward_dx(d_t, lo.a[], M, lo.in_f, lo.rank, ctx)
     var d_a_t = linear_backward_dw(d_t, x, M, lo.in_f, lo.rank, ctx)
 
     var pair = _to_host_pair_f32(d_a_t, d_b_t, ctx)
     return KleinLoraDeviceGrads(pair.d_a.copy(), pair.d_b.copy(), d_x_lo^)
+
+
+def klein_lora_bwd_device(
+    d_contrib: Tensor, x: Tensor, lo: LoraAdapter,
+    M: Int, ctx: DeviceContext,
+) raises -> KleinLoraDeviceGrads:
+    var lo_dev = lora_adapter_to_device(lo, ctx)
+    return klein_lora_bwd_device_resident(d_contrib, x, lo_dev, M, ctx)
 
 
 # ── host slice/scatter helpers for partial-projection LoRA (single block) ────

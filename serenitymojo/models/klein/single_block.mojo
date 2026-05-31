@@ -31,10 +31,10 @@
 #
 # WHY HOST List[Float32] STILL AT THE API BOUNDARY
 #   The boundary contract is fixed by the callers (stack + gates pass host lists).
-#   The LoRA-delta helpers (lora_block.mojo klein_lora_fwd/bwd, klein_take_cols,
-#   klein_add_cols) are host-list-typed and OUT OF SCOPE for this increment, so
-#   the LoRA branches bridge device<->host AT THOSE CALLS ONLY (small, present
-#   only when an adapter is set). The dominant base chain is fully device-resident.
+#   The LoRA-delta helpers have device-resident siblings, so LoRA activations and
+#   adapter A/B tensors stay on device in the hot trainer path; only d_A/d_B
+#   leave for the existing host optimizer state. The base chain is fully
+#   device-resident.
 #
 # FORWARD GRAPH (mirrors models/dit/klein_dit.mojo `_single_block`, lines 354-390)
 #   With precomputed AdaLN vectors (shift, scale, gate) each [D] from single_mod:
@@ -482,14 +482,15 @@ def single_block_backward[
 #
 # When both adapters are absent this REDUCES to the verified base single block.
 #
-# NOTE: the LoRA-delta helpers (klein_lora_fwd/bwd, klein_take_cols,
-# klein_add_cols) are host-list-typed (lora_block.mojo, out of scope here), so the
-# LoRA branches bridge device<->host AT THOSE CALLS ONLY. The base chain stays
-# device-resident.
+# NOTE: the LoRA-delta helpers have resident device variants. The host-list
+# helpers remain for compatibility/parity, while the hot trainer path passes
+# `SingleBlockLoraDevice` and avoids per-use A/B uploads.
 # ═══════════════════════════════════════════════════════════════════════════
 
 from serenitymojo.models.klein.lora_block import (
-    LoraAdapter, klein_lora_fwd_device, klein_lora_bwd_device,
+    LoraAdapter, LoraAdapterDevice, lora_adapter_to_device,
+    klein_lora_fwd_device, klein_lora_bwd_device,
+    klein_lora_fwd_device_resident, klein_lora_bwd_device_resident,
     klein_take_cols_device, klein_add_cols_device,
 )
 
@@ -503,6 +504,35 @@ struct SingleBlockLora(Copyable, Movable):
     ):
         self.qkv = qkv^
         self.out = out^
+
+
+struct SingleBlockLoraDevice(Copyable, Movable):
+    var qkv: Optional[LoraAdapterDevice]    # on w1 qkv-rows (in=D, out=3D)
+    var out: Optional[LoraAdapterDevice]    # on w2 cols     (in=D, out=D)
+
+    def __init__(
+        out self,
+        var qkv: Optional[LoraAdapterDevice], var out: Optional[LoraAdapterDevice],
+    ):
+        self.qkv = qkv^
+        self.out = out^
+
+
+def _optional_lora_to_device(
+    lo: Optional[LoraAdapter], ctx: DeviceContext
+) raises -> Optional[LoraAdapterDevice]:
+    if lo:
+        return Optional[LoraAdapterDevice](lora_adapter_to_device(lo.value(), ctx))
+    return Optional[LoraAdapterDevice](None)
+
+
+def single_block_lora_to_device(
+    lora: SingleBlockLora, ctx: DeviceContext
+) raises -> SingleBlockLoraDevice:
+    return SingleBlockLoraDevice(
+        _optional_lora_to_device(lora.qkv, ctx),
+        _optional_lora_to_device(lora.out, ctx),
+    )
 
 
 struct SingleBlockLoraGrads(Copyable, Movable):
@@ -552,11 +582,11 @@ struct SingleBlockLoraDeviceGrads(Copyable, Movable):
 
 
 # ── FORWARD of one SINGLE block WITH LoRA on linear1-qkv-rows + linear2-cols ──
-def single_block_lora_forward_device[
+def single_block_lora_forward_device_resident[
     H: Int, Dh: Int, S: Int
 ](
     x_t: TArc,
-    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLora,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLoraDevice,
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
@@ -572,7 +602,7 @@ def single_block_lora_forward_device[
     var fused = linear(norm_t, w.w1[], no_bias^, ctx)   # [S, 3D+2F]
     # LoRA on w1 qkv-rows: delta [S,3D] folded into the first 3D cols of `fused`.
     if lora.qkv:
-        var dlt = klein_lora_fwd_device(norm_t, lora.qkv.value(), S, ctx)   # [S,3D]
+        var dlt = klein_lora_fwd_device_resident(norm_t, lora.qkv.value(), S, ctx)   # [S,3D]
         fused = klein_add_cols_device(fused, dlt, S, 3 * D + 2 * F, 3 * D, ctx)
 
     var qkv = slice(fused, 1, 0, 3 * D, ctx)
@@ -603,7 +633,7 @@ def single_block_lora_forward_device[
     var out_proj = linear(out_in, w.w2[], no_bias2^, ctx)
     # LoRA on w2 cols: input is the att_flat slice [S,D]; delta [S,D] added to out.
     if lora.out:
-        var dlt2 = klein_lora_fwd_device(att_flat, lora.out.value(), S, ctx)   # [S,D]
+        var dlt2 = klein_lora_fwd_device_resident(att_flat, lora.out.value(), S, ctx)   # [S,D]
         out_proj = add(out_proj, dlt2, ctx)
 
     var result = residual_gate(
@@ -617,6 +647,21 @@ def single_block_lora_forward_device[
         TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in^),
     )
     return SingleBlockDeviceForward(TArc(result^), saved^)
+
+
+def single_block_lora_forward_device[
+    H: Int, Dh: Int, S: Int
+](
+    x_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLora,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> SingleBlockDeviceForward:
+    var lora_dev = single_block_lora_to_device(lora, ctx)
+    return single_block_lora_forward_device_resident[H, Dh, S](
+        x_t, w, mv, lora_dev, cos, sin, D, F, eps, ctx,
+    )
 
 
 def single_block_lora_forward[
@@ -637,11 +682,11 @@ def single_block_lora_forward[
 
 
 # ── BACKWARD of one SINGLE block WITH LoRA ───────────────────────────────────
-def single_block_lora_backward_device[
+def single_block_lora_backward_device_resident[
     H: Int, Dh: Int, S: Int
 ](
     d_out_t: TArc,
-    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLora,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLoraDevice,
     saved: SingleBlockSaved,
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
@@ -656,7 +701,7 @@ def single_block_lora_backward_device[
     var out_y = linear(saved.out_in[], w.w2[], nb^, ctx)
     if lora.out:
         var att_flat_in = klein_take_cols_device(saved.out_in[], S, D + F, D, ctx)   # [S,D]
-        var dlt2 = klein_lora_fwd_device(att_flat_in, lora.out.value(), S, ctx)
+        var dlt2 = klein_lora_fwd_device_resident(att_flat_in, lora.out.value(), S, ctx)
         out_y = add(out_y, dlt2, ctx)
     var grg = gate_residual_backward(
         d_out_t[], saved.x[], mv.gate[], out_y, ctx, compute_aux_grads
@@ -677,7 +722,7 @@ def single_block_lora_backward_device[
     var out_d_b = List[Float32]()
     if lora.out:
         var att_flat_in2 = klein_take_cols_device(saved.out_in[], S, D + F, D, ctx)   # [S,D]
-        var lg2 = klein_lora_bwd_device(grg.d_y, att_flat_in2, lora.out.value(), S, ctx)
+        var lg2 = klein_lora_bwd_device_resident(grg.d_y, att_flat_in2, lora.out.value(), S, ctx)
         d_out_in_t = klein_add_cols_device(d_out_in_t, lg2.d_x, S, D + F, D, ctx)
         out_d_a = lg2.d_a.copy()
         out_d_b = lg2.d_b.copy()
@@ -718,7 +763,7 @@ def single_block_lora_backward_device[
     var qkv_d_a = List[Float32]()
     var qkv_d_b = List[Float32]()
     if lora.qkv:
-        var lg = klein_lora_bwd_device(d_qkv, saved.norm[], lora.qkv.value(), S, ctx)
+        var lg = klein_lora_bwd_device_resident(d_qkv, saved.norm[], lora.qkv.value(), S, ctx)
         d_norm_t = add(d_norm_t, lg.d_x, ctx)
         qkv_d_a = lg.d_a.copy()
         qkv_d_b = lg.d_b.copy()
@@ -737,6 +782,23 @@ def single_block_lora_backward_device[
     return SingleBlockLoraDeviceGrads(
         TArc(d_x_t^), d_shift^, d_scale^, d_gate^,
         qkv_d_a^, qkv_d_b^, out_d_a^, out_d_b^,
+    )
+
+
+def single_block_lora_backward_device[
+    H: Int, Dh: Int, S: Int
+](
+    d_out_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLora,
+    saved: SingleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    compute_aux_grads: Bool = True,
+) raises -> SingleBlockLoraDeviceGrads:
+    var lora_dev = single_block_lora_to_device(lora, ctx)
+    return single_block_lora_backward_device_resident[H, Dh, S](
+        d_out_t, w, mv, lora_dev, saved, cos, sin, D, F, eps, ctx, compute_aux_grads,
     )
 
 

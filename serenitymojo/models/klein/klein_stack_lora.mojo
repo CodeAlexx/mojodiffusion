@@ -26,11 +26,13 @@
 #           flat = bi*4 + s                       (s = 0..3)
 #       singles next : block bi, slot s in {qkv,out}
 #           flat = num_double*4 + bi*2 + s        (s = 0..1)
-#   The forward threads each block's adapters by BUILDING a transient
-#   DoubleBlockLora / SingleBlockLora from those flat slots (LoraAdapter is
-#   Copyable). The backward SCATTERS the returned per-block d_A/d_B back into a
-#   matching flat KleinLoraGrads. klein_lora_adamw_step walks the two flat lists
-#   in lockstep and runs _lora_adamw on every adapter.
+#   The host optimizer/save path keeps this as the source of truth. The hot
+#   trainer path builds a parallel `KleinLoraDeviceSet` once per step; transient
+#   DoubleBlockLoraDevice / SingleBlockLoraDevice wrappers then borrow the same
+#   resident A/B tensors across forward, backward recompute, and LoRA backward.
+#   The backward SCATTERS the returned per-block d_A/d_B back into a matching
+#   flat KleinLoraGrads. klein_lora_adamw_step walks the two flat lists in
+#   lockstep and runs _lora_adamw on every adapter.
 #
 # SCOPE: LoRA-on-attention-projection training. Base weights (input/output proj,
 #   modulation, the qkv/proj/w1/w2 linears) are FROZEN — their grads are computed
@@ -39,8 +41,8 @@
 #   backpropped into the modulation MLP — that link is a later finetune phase).
 #
 # Mojo 1.0.0b1: `def` not `fn`; Tensor move-only (return Movable structs, never
-# store Tensor in a collection); host List[Float32] are the Copyable carriers;
-# no-bias linear = linear(x, w, Optional[Tensor](None), ctx).
+# store Tensor in a collection); `ArcPointer[Tensor]` is the Copyable device
+# carrier; no-bias linear = linear(x, w, Optional[Tensor](None), ctx).
 
 from std.gpu.host import DeviceContext
 from std.collections import List, Optional
@@ -53,16 +55,18 @@ from serenitymojo.ops.tensor_algebra import concat, slice
 from serenitymojo.models.klein.double_block import (
     DoubleBlockWeights, ModVecs, ModVecsDevice, modvecs_to_device,
     DoubleBlockSaved, DoubleBlockGrads,
-    StreamLora, DoubleBlockLora, DoubleBlockLoraGrads,
+    StreamLora, StreamLoraDevice, DoubleBlockLora, DoubleBlockLoraDevice, DoubleBlockLoraGrads,
     double_block_lora_forward, double_block_lora_backward,
     double_block_lora_forward_device, double_block_lora_backward_device,
+    double_block_lora_forward_device_resident, double_block_lora_backward_device_resident,
 )
 from serenitymojo.models.klein.single_block import (
     SingleBlockWeights, SingleModVecs, SingleModVecsDevice, single_modvecs_to_device,
     SingleBlockSaved, SingleBlockGrads,
-    SingleBlockLora, SingleBlockLoraGrads,
+    SingleBlockLora, SingleBlockLoraDevice, SingleBlockLoraGrads,
     single_block_lora_forward, single_block_lora_backward,
     single_block_lora_forward_device, single_block_lora_backward_device,
+    single_block_lora_forward_device_resident, single_block_lora_backward_device_resident,
 )
 from serenitymojo.models.klein.klein_stack import (
     KleinStackBase, KleinStackForward,
@@ -75,7 +79,7 @@ from serenitymojo.ops.linalg_backward import linear_backward_dx
 from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
-from serenitymojo.models.klein.lora_block import LoraAdapter
+from serenitymojo.models.klein.lora_block import LoraAdapter, LoraAdapterDevice, lora_adapter_to_device
 from serenitymojo.training.train_step import LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft, load_lora_for_resume
 
@@ -138,6 +142,38 @@ struct KleinLoraSet(Copyable, Movable):
         self.rank = rank
 
 
+struct KleinLoraDeviceSet(Copyable, Movable):
+    var dbl: List[LoraAdapterDevice]   # same flat order as KleinLoraSet.dbl
+    var sgl: List[LoraAdapterDevice]   # same flat order as KleinLoraSet.sgl
+    var num_double: Int
+    var num_single: Int
+    var rank: Int
+
+    def __init__(
+        out self, var dbl: List[LoraAdapterDevice], var sgl: List[LoraAdapterDevice],
+        num_double: Int, num_single: Int, rank: Int,
+    ):
+        self.dbl = dbl^
+        self.sgl = sgl^
+        self.num_double = num_double
+        self.num_single = num_single
+        self.rank = rank
+
+
+def klein_lora_set_to_device(
+    set: KleinLoraSet, ctx: DeviceContext
+) raises -> KleinLoraDeviceSet:
+    var dbl = List[LoraAdapterDevice]()
+    var nd = set.num_double * DBL_SLOTS
+    for i in range(nd):
+        dbl.append(lora_adapter_to_device(set.dbl[i], ctx))
+    var sgl = List[LoraAdapterDevice]()
+    var ns = set.num_single * SGL_SLOTS
+    for i in range(ns):
+        sgl.append(lora_adapter_to_device(set.sgl[i], ctx))
+    return KleinLoraDeviceSet(dbl^, sgl^, set.num_double, set.num_single, set.rank)
+
+
 # Accessor by (block_kind, block_idx, slot) → a COPY of the adapter. (LoraAdapter
 # is Copyable; this is the read accessor the task asks for.)
 def klein_lora_get(
@@ -196,6 +232,27 @@ def _sgl_lora_for(set: KleinLoraSet, bi: Int) -> SingleBlockLora:
     return SingleBlockLora(
         Optional[LoraAdapter](set.sgl[base + 0].copy()),
         Optional[LoraAdapter](set.sgl[base + 1].copy()),
+    )
+
+
+def _dbl_lora_dev_for(set: KleinLoraDeviceSet, bi: Int) -> DoubleBlockLoraDevice:
+    var base = bi * DBL_SLOTS
+    var img = StreamLoraDevice(
+        Optional[LoraAdapterDevice](set.dbl[base + 0].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 1].copy()),
+    )
+    var txt = StreamLoraDevice(
+        Optional[LoraAdapterDevice](set.dbl[base + 2].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 3].copy()),
+    )
+    return DoubleBlockLoraDevice(img^, txt^)
+
+
+def _sgl_lora_dev_for(set: KleinLoraDeviceSet, bi: Int) -> SingleBlockLoraDevice:
+    var base = bi * SGL_SLOTS
+    return SingleBlockLoraDevice(
+        Optional[LoraAdapterDevice](set.sgl[base + 0].copy()),
+        Optional[LoraAdapterDevice](set.sgl[base + 1].copy()),
     )
 
 
@@ -273,13 +330,13 @@ struct KleinLoraGrads(Copyable, Movable):
 # Mirrors klein_stack_forward exactly, swapping the per-block calls for the
 # LoRA variants. `saved` carries the LoRA-MODIFIED activations so the backward
 # recompute regenerates them identically.
-def klein_stack_lora_forward_device_inputs[
+def klein_stack_lora_forward_device_inputs_resident[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
     img_tokens_t: TArc, txt_tokens_t: TArc,
     base: KleinStackBase,
     dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
-    lora: KleinLoraSet,
+    lora: KleinLoraDeviceSet,
     img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
     cos: List[Float32], sin: List[Float32],
     D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
@@ -309,8 +366,8 @@ def klein_stack_lora_forward_device_inputs[
     for bi in range(num_double):
         dbl_img_in.append(img.copy())
         dbl_txt_in.append(txt.copy())
-        var bl = _dbl_lora_for(lora, bi)
-        var fwd = double_block_lora_forward_device[H, Dh, N_IMG, N_TXT, S](
+        var bl = _dbl_lora_dev_for(lora, bi)
+        var fwd = double_block_lora_forward_device_resident[H, Dh, N_IMG, N_TXT, S](
             img, txt, dbw[bi], img_mod_dev, txt_mod_dev, bl,
             cos_t, sin_t, D, F, eps, ctx,
         )
@@ -323,8 +380,8 @@ def klein_stack_lora_forward_device_inputs[
     var sgl_saved = List[SingleBlockSaved]()
     for bi in range(num_single):
         sgl_x_in.append(x.copy())
-        var sl = _sgl_lora_for(lora, bi)
-        var fwd = single_block_lora_forward_device[H, Dh, S](
+        var sl = _sgl_lora_dev_for(lora, bi)
+        var fwd = single_block_lora_forward_device_resident[H, Dh, S](
             x, sbw[bi], single_mod_dev, sl, cos_t, sin_t, D, F, eps, ctx,
         )
         if bi >= num_single - SGL_SAVE_TAIL:
@@ -351,6 +408,26 @@ def klein_stack_lora_forward_device_inputs[
     )
 
 
+def klein_stack_lora_forward_device_inputs[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens_t: TArc, txt_tokens_t: TArc,
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraSet,
+    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
+    cos: List[Float32], sin: List[Float32],
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> KleinStackForward:
+    var lora_dev = klein_lora_set_to_device(lora, ctx)
+    return klein_stack_lora_forward_device_inputs_resident[H, Dh, N_IMG, N_TXT, S](
+        img_tokens_t, txt_tokens_t, base, dbw, sbw, lora_dev,
+        img_mod, txt_mod, single_mod, cos, sin,
+        D, F, in_ch, txt_ch, out_ch, eps, ctx,
+    )
+
+
 def klein_stack_lora_forward[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
@@ -374,14 +451,14 @@ def klein_stack_lora_forward[
 # ── FULL BACKWARD WITH LoRA (full-depth; per-block recompute) ────────────────
 # Mirrors klein_stack_backward, calling the LoRA per-block backward and
 # COLLECTING every adapter's d_A/d_B into the flat KleinLoraGrads.
-def klein_stack_lora_backward[
+def klein_stack_lora_backward_resident[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
     d_out: List[Float32],
     img_tokens: List[Float32], txt_tokens: List[Float32],
     base: KleinStackBase,
     dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
-    lora: KleinLoraSet,
+    lora: KleinLoraDeviceSet,
     img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
     cos: List[Float32], sin: List[Float32],
     saved: KleinStackForward,
@@ -437,17 +514,17 @@ def klein_stack_lora_backward[
     var bi = num_single - 1
     var saved_single_start = num_single - len(saved.sgl_saved)
     while bi >= 0:
-        var sl = _sgl_lora_for(lora, bi)
+        var sl = _sgl_lora_dev_for(lora, bi)
         var block_saved: SingleBlockSaved
         if bi >= saved_single_start:
             block_saved = saved.sgl_saved[bi - saved_single_start].copy()
         else:
-            var fwd = single_block_lora_forward_device[H, Dh, S](
+            var fwd = single_block_lora_forward_device_resident[H, Dh, S](
                 saved.sgl_x_in[bi], sbw[bi], single_mod_dev, sl,
                 cos_t, sin_t, D, F, eps, ctx,
             )
             block_saved = fwd.saved.copy()
-        var bg = single_block_lora_backward_device[H, Dh, S](
+        var bg = single_block_lora_backward_device_resident[H, Dh, S](
             d_x, sbw[bi], single_mod_dev, sl, block_saved, cos_t, sin_t,
             D, F, eps, ctx, compute_aux_grads,
         )
@@ -483,12 +560,12 @@ def klein_stack_lora_backward[
     var d_io = d_img_out2.copy()
     var d_to = d_txt_out.copy()
     while di >= 0:
-        var bl = _dbl_lora_for(lora, di)
-        var fwd = double_block_lora_forward_device[H, Dh, N_IMG, N_TXT, S](
+        var bl = _dbl_lora_dev_for(lora, di)
+        var fwd = double_block_lora_forward_device_resident[H, Dh, N_IMG, N_TXT, S](
             saved.dbl_img_in[di], saved.dbl_txt_in[di],
             dbw[di], img_mod_dev, txt_mod_dev, bl, cos_t, sin_t, D, F, eps, ctx,
         )
-        var bg = double_block_lora_backward_device[H, Dh, N_IMG, N_TXT, S](
+        var bg = double_block_lora_backward_device_resident[H, Dh, N_IMG, N_TXT, S](
             d_io, d_to, dbw[di], img_mod_dev, txt_mod_dev, bl, fwd.saved,
             cos_t, sin_t, D, F, eps, ctx, compute_aux_grads,
         )
@@ -539,6 +616,30 @@ def klein_stack_lora_backward[
         d_img_tokens^, d_txt_tokens^,
         d_img_mod^, d_txt_mod^, d_single_mod^,
         d_img_in^, d_txt_in^, List[Float32](), d_final_shift^, d_final_scale^,
+    )
+
+
+def klein_stack_lora_backward[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraSet,
+    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
+    cos: List[Float32], sin: List[Float32],
+    saved: KleinStackForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    compute_input_grads: Bool = True,
+    compute_aux_grads: Bool = True,
+) raises -> KleinLoraGrads:
+    var lora_dev = klein_lora_set_to_device(lora, ctx)
+    return klein_stack_lora_backward_resident[H, Dh, N_IMG, N_TXT, S](
+        d_out, img_tokens, txt_tokens, base, dbw, sbw, lora_dev,
+        img_mod, txt_mod, single_mod, cos, sin, saved,
+        D, F, in_ch, txt_ch, out_ch, eps, ctx, compute_input_grads, compute_aux_grads,
     )
 
 

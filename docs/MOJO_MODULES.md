@@ -168,7 +168,7 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   `klein_4b()` (`:24`, inner 3072 / 24 heads / mlp 9216 / 5 double+20 single=25
   blocks). **`models/klein/train.mojo`** — thin `main()` → `run_synthetic` on both.
   **Status: SCAFFOLD** (synthetic).
-- **`models/klein/double_block.mojo`** (1341 L) — Klein FLUX.2 DOUBLE-stream DiT
+- **`models/klein/double_block.mojo`** (1437 L) — Klein FLUX.2 DOUBLE-stream DiT
   block fwd (saving acts) + hand-chained bwd, packaged as a reusable unit (the
   `dit_block.mojo` pattern DOUBLED: img+txt streams coupled by ONE joint attention;
   mirrors `klein_dit.mojo` `_double_block`). Host `List[Float32]` API boundary.
@@ -177,7 +177,7 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   parity.mojo` + `double_block_lora_parity.mojo` with full `ref_*`/`lref_*` `.bin`
   reference sets present). NOTE: built THIS session, not yet in the master handoff's
   lead-verified table — reconcile.
-- **`models/klein/single_block.mojo`** (822 L) — Klein FLUX.2 SINGLE-stream block
+- **`models/klein/single_block.mojo`** (828 L) — Klein FLUX.2 SINGLE-stream block
   fwd+bwd (the double pattern HALVED+flattened: parallel attn+MLP, fused linear1
   qkv+gate_up channel split, linear2 join). + `single_block_lora_*` (qkv-rows on w1
   + cols on w2). **Status: PROVEN per source header** (gates `single_block_parity`
@@ -189,19 +189,22 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   Mirrors `klein_dit.mojo` `forward_full`. The training structs now carry saved
   activations with `ArcPointer[Tensor]` device carriers so inter-block handoff
   avoids host-list traffic.
-- **`models/klein/klein_stack_lora.mojo`** — the stack WITH LoRA on every trained
+- **`models/klein/klein_stack_lora.mojo`** (741 L) — the stack WITH LoRA on every trained
   projection: per-block LoRA variants for every block + collects adapter d_A/d_B
   into one flat `KleinLoraSet`, supports AdamW step + PEFT save. The hot trainer
   path uses device input tokens, resident block/modulation tensors, checkpoint-tail
   single-block saves (`SGL_SAVE_TAIL = 8`), and can skip unused input-token/aux
-  modulation grads in the real LoRA optimizer path. Latest clean 4B timing:
-  `PROG ... secs=5.312408`, loss `2.734082`; still above the 2-3s target.
-- **`models/klein/lora_block.mojo`** — LoRA-on-projection helpers shared by the
+  modulation grads in the real LoRA optimizer path. It also exposes
+  `KleinLoraDeviceSet` / `klein_lora_set_to_device`, so the trainer uploads LoRA
+  A/B once per step and reuses them across forward, backward recompute, and LoRA
+  backward. Latest clean 4B timing: `PROG ... secs=5.1468015`, loss `2.734082`;
+  still above the 2-3s target.
+- **`models/klein/lora_block.mojo`** (289 L) — LoRA-on-projection helpers shared by the
   double/single LoRA variants; SAME math as `train_step.mojo` plus the projection
   input-grad contribution `d_x_lo`. The hot `*_device` helpers keep activation and
-  `d_x_lo` tensors on device and batch `d_A`/`d_B` readback into one sync. Caveat:
-  A/B adapter parameters remain host-list owned and are still uploaded per use;
-  device-resident adapter weights are the next per-step LoRA traffic target.
+  `d_x_lo` tensors on device and batch `d_A`/`d_B` readback into one sync.
+  `LoraAdapterDevice` boxes A/B as `ArcPointer[Tensor]`; legacy host-list helpers
+  remain for compatibility/parity.
 - **`models/klein/weights.mojo`** (172 L) — G1 real-safetensors → training weight
   structs. Loads the 12-tensor-per-double-block + 4-per-single-block key layout
   (same keys the inference `klein_dit.mojo` reads) into the host `List[Float32]`

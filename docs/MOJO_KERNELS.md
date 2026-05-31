@@ -48,7 +48,9 @@ only at the load/store cast. Most other backward files are **F32-only** (the
 | `mm_backward(grad_c, a, b, M, N, K, ctx)` | :153 | `MatmulGrads{d_a, d_b}` | d_a = grad_c@Bᵀ; d_b = Aᵀ@grad_c (vendor BLAS) |
 | `bmm_backward(grad_c, a, b, Batch, M, N, K, ctx)` | :197 | `MatmulGrads{d_a, d_b}` | batched mm backward |
 | `linear_backward(grad_y, x, weight, M, in_features, out_features, ctx)` | :249 | `LinearGrads{d_x, d_w, d_b}` | y=x@Wᵀ+b → d_x=grad@W; d_W=gradᵀ@x; d_b=colsum(grad) |
-| `addbias_backward(grad_y, M, out_features, ctx)` | :293 | `AddBiasGrads{d_x, d_b}` | d_x=grad; d_b=colsum(grad) |
+| `linear_backward_dx(grad_y, weight, M, in_features, out_features, ctx)` | :295 | `Tensor` | d_x-only path for frozen weights; skips d_W/d_b work and readback |
+| `linear_backward_dw(grad_y, x, M, in_features, out_features, ctx)` | :329 | `Tensor` | d_W-only path used by LoRA d_A/d_B helpers |
+| `addbias_backward(grad_y, M, out_features, ctx)` | :360 | `AddBiasGrads{d_x, d_b}` | d_x=grad; d_b=colsum(grad) |
 
 Grad structs: `MatmulGrads{d_a,d_b}` (:60), `LinearGrads{d_x,d_w,d_b}` (:71),
 `AddBiasGrads{d_x,d_b}` (:84). Helper kernels `_colsum_kernel` (:96),
@@ -381,13 +383,16 @@ d_A    = linear_backward_dw(d_t, x)
 ```
 
 Only LoRA `d_A`/`d_B` read back to host because the current optimizer state is
-still host-list based; those two D2H copies are batched behind one sync. A/B
-parameters are still host-owned and uploaded at each use, so device-resident
-adapter weights are the next LoRA traffic lever.
+still host-list based; those two D2H copies are batched behind one sync. A/B can
+be passed as `LoraAdapterDevice` (`ArcPointer[Tensor]` for A and B), and the real
+Klein trainer builds a `KleinLoraDeviceSet` once per step so A/B are reused across
+forward, backward recompute, and LoRA backward instead of being uploaded at every
+adapter use.
 
 The legacy host-list `klein_lora_bwd` remains for compatibility/parity helpers.
-The hot stack path uses the device sibling through `single_block_lora_backward_device`
-and `double_block_lora_backward_device`.
+The hot stack path uses the resident device sibling through
+`single_block_lora_backward_device_resident` and
+`double_block_lora_backward_device_resident`.
 
 ---
 
@@ -398,7 +403,8 @@ files read):
 
 - **No cuDNN/flash SDPA backward.** flame-core has `flame_cudnn_sdpa_bwd_bf16`
   (30–50× faster than decomposed). Mojo only has the decomposed path — slower
-  by construction, and currently broken at H=30.
+  by construction. H=30 correctness is green per §11; this is now a throughput
+  gap, not a correctness blocker.
 - **No fused optimizer kernels with stochastic rounding.** flame-core has 8+
   Adam NVRTC variants (multi-tensor, BF16/F32, stochastic-round) + 8-bit
   blockwise AdamW. Mojo `training/optim.mojo` has a single F32 `_adamw_kernel`,

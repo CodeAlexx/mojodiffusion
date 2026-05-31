@@ -35,7 +35,7 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    - resident modulation vectors avoid per-block modvec re-upload;
    - trainer uses device latent/text inputs and `cast_tensor_if_needed`;
    - `reshape_owned` provides metadata-only reshape where the source tensor is owned;
-   - `SGL_SAVE_TAIL = 8` saves only the tail single-block activations to fit memory;
+   - `SGL_SAVE_TAIL = 9` saves only the tail single-block activations to fit memory;
    - real LoRA train skips unused input-token and aux mod/gate grads;
    - LoRA `d_A`/`d_B` readback is batched into one sync per adapter pair;
    - `KleinLoraDeviceSet` uploads LoRA A/B once per step and reuses those tensors
@@ -44,13 +44,13 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
 5. **Current measured state:** clean `train_klein_real.mojo` runs after cached
    step-modulation weights, metadata reshape cleanup, device-resident modulation
    chunks/RoPE, single-block backward copy cleanup, no-aux gate-residual
-   y-recompute skipping, and save-only single-block backward recompute are now
-   **~4.0 s/step**: `3.9814968`, `3.9988506`, loss `2.734082`, grad
-   `0.17687473`. Previous clean band was `4.106987`, `4.1046743`; previous
-   clean band before that was `4.185293`, `4.2358575`, `4.228305`. Prior clean
-   state after resident LoRA A/B + scratch infrastructure was **5.200673
-   s/step**; best clean prior was **5.1468015**. This is real progress but
-   **NOT the requested 2-3s target**.
+   y-recompute skipping, save-only single-block backward recompute, and
+   `SGL_SAVE_TAIL = 9` are now **~3.95 s/step**: `3.950125`, `3.9545975`,
+   loss `2.734082`, grad `0.17687473`. Previous clean band was `3.9814968`,
+   `3.9988506`; before that `4.106987`, `4.1046743`. Prior clean state after
+   resident LoRA A/B + scratch infrastructure was **5.200673 s/step**; best
+   clean prior was **5.1468015**. This is real progress but **NOT the requested
+   2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
    - single-block backward is the measured dominant region; next target is
@@ -339,6 +339,23 @@ This pushes the measured trainer below 4s/step, but the requested target remains
 runtime views for qkv/gate_up splits and concat/scatter, or fused single-block
 LoRA backward pieces.
 
+### 2026-05-31 continuation: single saved-tail boundary tuned to 9
+
+After save-only single-block recompute, retested the single-block checkpoint
+tail boundary:
+
+| item | result |
+|------|--------|
+| accepted tail | `SGL_SAVE_TAIL = 9` |
+| stack LoRA gate | `klein_stack_lora_parity` PASS |
+| accepted real 4B timing runs | `3.950125`, `3.9545975`, loss `2.734082`, grad `0.17687473` |
+| previous clean band | `3.9814968`, `3.9988506`, same loss/grad |
+| rejected trial | `SGL_SAVE_TAIL = 10` slowed to `4.2023807`, same loss/grad; reverted |
+| earlier rejected trial | `SGL_SAVE_TAIL = 12` passed parity but slowed to `5.3278003`; reverted |
+
+This confirms the memory/speed knee moved only slightly after save-only
+recompute. Tail 9 is a small measured win; tail 10 and 12 are worse.
+
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -399,6 +416,9 @@ Files touched in the save-only single-block recompute continuation:
 models/klein/single_block.mojo, models/klein/klein_stack_lora.mojo,
 docs/MOJO_MODULES.md, this handoff.
 
+Files touched in the single saved-tail tuning continuation:
+models/klein/klein_stack_lora.mojo, docs/MOJO_MODULES.md, this handoff.
+
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 
@@ -421,3 +441,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | Device mod/RoPE + single-block slice cleanup | AGENT-DEFAULT | kept the API compatible, made the real trainer use device-resident per-step tensors, and removed duplicate D2D slices where lifetime was already proven by `SingleBlockSaved.att_flat` |
 | No-aux gate-residual y-skip | AGENT-DEFAULT | real trainer discards aux modulation/gate grads, so `y` recompute is unnecessary for d_x/d_y and can be skipped without changing trained LoRA gradients |
 | Save-only single-block recompute | AGENT-DEFAULT | checkpointed backward needs `SingleBlockSaved`, not discarded block outputs, so unsaved single blocks can skip final output work during recompute |
+| `SGL_SAVE_TAIL = 9` | AGENT-DEFAULT | measured tail 9 improves the current save-only recompute path, while tail 10 and tail 12 cross the memory/speed knee and slow down |

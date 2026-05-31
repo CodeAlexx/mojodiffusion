@@ -96,7 +96,7 @@ comptime DBL_SLOTS = 4
 comptime SGL_SLOTS = 2
 comptime BK_DOUBLE = 0
 comptime BK_SINGLE = 1
-comptime SGL_SAVE_TAIL = 8
+comptime SGL_SAVE_TAIL = 9
 
 
 # ── adapter init (A small randn, B=0 — PEFT identity at step 0) ───────────────

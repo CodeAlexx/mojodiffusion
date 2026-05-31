@@ -66,7 +66,9 @@ from serenitymojo.models.klein.single_block import (
     SingleBlockLora, SingleBlockLoraDevice, SingleBlockLoraGrads,
     single_block_lora_forward, single_block_lora_backward,
     single_block_lora_forward_device, single_block_lora_backward_device,
-    single_block_lora_forward_device_resident, single_block_lora_backward_device_resident,
+    single_block_lora_forward_device_resident,
+    single_block_lora_recompute_saved_device_resident,
+    single_block_lora_backward_device_resident,
 )
 from serenitymojo.models.klein.klein_stack import (
     KleinStackBase, KleinStackForward,
@@ -556,11 +558,10 @@ def klein_stack_lora_backward_resident_moddev_rope[
         if bi >= saved_single_start:
             block_saved = saved.sgl_saved[bi - saved_single_start].copy()
         else:
-            var fwd = single_block_lora_forward_device_resident[H, Dh, S](
+            block_saved = single_block_lora_recompute_saved_device_resident[H, Dh, S](
                 saved.sgl_x_in[bi], sbw[bi], single_mod_dev, sl,
                 cos_t, sin_t, D, F, eps, ctx,
             )
-            block_saved = fwd.saved.copy()
         var bg = single_block_lora_backward_device_resident[H, Dh, S](
             d_x, sbw[bi], single_mod_dev, sl, block_saved, cos_t, sin_t,
             D, F, eps, ctx, compute_aux_grads,

@@ -201,8 +201,10 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   modulation chunks and RoPE tables stay device-resident. Single-block LoRA
   backward also reuses the saved attention-flat tensor instead of slicing it
   back out of `out_in` twice. The no-aux real trainer path skips gate-residual
-  `y` recomputes for discarded gate/modulation grads. Latest clean 4B timing:
-  `PROG ... secs=4.106987` / `4.1046743`, loss `2.734082`, grad `0.17687473`;
+  `y` recomputes for discarded gate/modulation grads, and checkpointed
+  single-block backward recompute uses a save-only path that stops at `out_in`
+  instead of producing a discarded block output. Latest clean 4B timing:
+  `PROG ... secs=3.9814968` / `3.9988506`, loss `2.734082`, grad `0.17687473`;
   still above the 2-3s target.
 - **`models/klein/lora_block.mojo`** (289 L) — LoRA-on-projection helpers shared by the
   double/single LoRA variants; SAME math as `train_step.mojo` plus the projection
@@ -277,7 +279,7 @@ are imported only by the prepare driver, never by the loop.
 | Module | Intended role (per header, may change) | Status |
 |---|---|---|
 | `pipeline/klein_prepare_alina.mojo` (present) | REAL prepare driver for the Alina LoRA dataset: for 4 staged 512² images + captions, `KleinVaeEncoder.encode` (assert std≈0.96) + Qwen3-8B `encode_klein` (512 tok) → `write_sample` to `output/alina_cache/`. Qwen3+VAE co-reside ONLY in this process; the train process never imports Qwen3. | **IN PROGRESS** — file exists, header complete; not yet lead-run end-to-end. |
-| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It uses cached per-step modulation weights, device modulation chunks, resident RoPE tables loaded before timing, and the no-aux gate-residual d_x/d_y path because input-token/modulation grads are skipped. Latest measured one-step runs: `4.106987`, `4.1046743`, loss `2.734082`, grad `0.17687473`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; still above the 2-3s target. |
+| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It uses cached per-step modulation weights, device modulation chunks, resident RoPE tables loaded before timing, the no-aux gate-residual d_x/d_y path, and save-only checkpoint recompute for unsaved single blocks. Latest measured one-step runs: `3.9814968`, `3.9988506`, loss `2.734082`, grad `0.17687473`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; still above the 2-3s target. |
 
 ---
 

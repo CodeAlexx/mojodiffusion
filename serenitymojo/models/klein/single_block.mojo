@@ -652,6 +652,66 @@ def single_block_lora_forward_device_resident[
     return SingleBlockDeviceForward(TArc(result^), saved^)
 
 
+def single_block_lora_recompute_saved_device_resident[
+    H: Int, Dh: Int, S: Int
+](
+    x_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> SingleBlockSaved:
+    """Recompute only the activations needed by backward checkpointing.
+
+    The block output is discarded by stack backward for unsaved single blocks,
+    and no-aux LoRA backward no longer needs the gated output value. Stop at
+    `out_in` to avoid the final W2/LoRA-out/residual output work.
+    """
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t(_ones(D), [D], ctx)
+    var zeros_t = _t(_zeros(D), [D], ctx)
+
+    var ln_t = layer_norm(x_t[], ones_t, zeros_t, eps, ctx)
+    var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
+
+    var no_bias = Optional[Tensor](None)
+    var fused = linear(norm_t, w.w1[], no_bias^, ctx)
+    if lora.qkv:
+        var dlt = klein_lora_fwd_device_resident(norm_t, lora.qkv.value(), S, ctx)
+        fused = klein_add_cols_device(fused, dlt, S, 3 * D + 2 * F, 3 * D, ctx)
+
+    var qkv = slice(fused, 1, 0, 3 * D, ctx)
+    var gate_up = slice(fused, 1, 3 * D, 2 * F, ctx)
+
+    var q_pre_flat = slice(qkv, 1, 0, D, ctx)
+    var k_pre_flat = slice(qkv, 1, D, D, ctx)
+    var v_flat = slice(qkv, 1, 2 * D, D, ctx)
+    var q_pre = reshape_owned(q_pre_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_pre_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var mlp_gate = slice(gate_up, 1, 0, F, ctx)
+    var mlp_up = slice(gate_up, 1, F, F, ctx)
+    var mlp = swiglu(mlp_gate, mlp_up, ctx)
+
+    var out_in = concat(1, ctx, att_flat, mlp)
+
+    return SingleBlockSaved(
+        x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
+        TArc(q_rms^), TArc(k_rms^), TArc(v^),
+        TArc(q_rope^), TArc(k_rope^), TArc(att_flat^),
+        TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in^),
+    )
+
+
 def single_block_lora_forward_device[
     H: Int, Dh: Int, S: Int
 ](

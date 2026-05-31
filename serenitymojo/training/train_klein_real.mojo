@@ -54,14 +54,18 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_lora_set_to_device,
     klein_stack_lora_forward, klein_stack_lora_forward_device_inputs,
     klein_stack_lora_forward_device_inputs_resident,
+    klein_stack_lora_forward_device_inputs_resident_moddev,
+    klein_stack_lora_forward_device_inputs_resident_moddev_rope,
     klein_stack_lora_backward, klein_stack_lora_backward_resident,
+    klein_stack_lora_backward_resident_moddev,
+    klein_stack_lora_backward_resident_moddev_rope,
     klein_lora_adamw_step, save_klein_lora, load_klein_lora_resume,
 )
 from serenitymojo.models.klein.weights import (
     load_double_block_weights, load_single_block_weights,
     load_klein_stack_base, build_klein_vec_silu,
     build_klein_double_modvecs, build_klein_single_modvecs,
-    load_klein_step_mod_weights, build_klein_step_mods_cached,
+    load_klein_step_mod_weights, build_klein_step_mods_device_cached,
 )
 from serenitymojo.models.klein.double_block import ModVecs as ModVecsT
 from serenitymojo.models.klein.single_block import SingleModVecs as SingleModVecsT
@@ -322,6 +326,8 @@ def main() raises:
     var rope = _build_klein_rope_host()
     var cos = rope[0].copy()
     var sin = rope[1].copy()
+    var cos_dev = TArc(Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx))
+    var sin_dev = TArc(Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx))
     print("  rope host tables:", len(cos), "cos /", len(sin), "sin (expect", S * H * (Dh // 2), ")")
 
     # ── open cache ────────────────────────────────────────────────────────────
@@ -366,16 +372,18 @@ def main() raises:
         var target = fm.target.to_host(ctx)
 
         # per-step modulation vecs from this sigma
-        var mods = build_klein_step_mods_cached(mod_weights, sigma, TIMESTEP_DIM, D, ctx)
+        var mods = build_klein_step_mods_device_cached(
+            mod_weights, sigma, TIMESTEP_DIM, D, ctx
+        )
         var img_mod = mods[0].copy()
         var txt_mod = mods[1].copy()
         var single_mod = mods[2].copy()
         var lora_dev = klein_lora_set_to_device(lora, ctx)
 
         # forward -> velocity [N_IMG, OUT_CH]
-        var fwd = klein_stack_lora_forward_device_inputs_resident[H, Dh, N_IMG, N_TXT, S](
+        var fwd = klein_stack_lora_forward_device_inputs_resident_moddev_rope[H, Dh, N_IMG, N_TXT, S](
             x_t_dev, TArc(txt_tokens_t^), base,
-            dbw, sbw, lora_dev, img_mod, txt_mod, single_mod, cos.copy(), sin.copy(),
+            dbw, sbw, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
             D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
         )
 
@@ -393,9 +401,9 @@ def main() raises:
         # backward -> LoRA grads
         var empty_img = List[Float32]()
         var empty_txt = List[Float32]()
-        var g = klein_stack_lora_backward_resident[H, Dh, N_IMG, N_TXT, S](
+        var g = klein_stack_lora_backward_resident_moddev_rope[H, Dh, N_IMG, N_TXT, S](
             d_loss, empty_img^, empty_txt^, base,
-            dbw, sbw, lora_dev, img_mod, txt_mod, single_mod, cos.copy(), sin.copy(), fwd,
+            dbw, sbw, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
             D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx, False, False,
         )
 

@@ -330,28 +330,22 @@ struct KleinLoraGrads(Copyable, Movable):
 # Mirrors klein_stack_forward exactly, swapping the per-block calls for the
 # LoRA variants. `saved` carries the LoRA-MODIFIED activations so the backward
 # recompute regenerates them identically.
-def klein_stack_lora_forward_device_inputs_resident[
+def klein_stack_lora_forward_device_inputs_resident_moddev_rope[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
     img_tokens_t: TArc, txt_tokens_t: TArc,
     base: KleinStackBase,
     dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
     lora: KleinLoraDeviceSet,
-    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
-    cos: List[Float32], sin: List[Float32],
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
     D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> KleinStackForward:
     var num_double = len(dbw)
     var num_single = len(sbw)
-
-    # Resident rope tables: upload ONCE for the whole stack pass (was re-uploaded
-    # per block via cos.copy()/sin.copy() → from_host). Borrowed into every block.
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var img_mod_dev = modvecs_to_device(img_mod, D, ctx)
-    var txt_mod_dev = modvecs_to_device(txt_mod, D, ctx)
-    var single_mod_dev = single_modvecs_to_device(single_mod, D, ctx)
 
     var no_bias = Optional[Tensor](None)
     var img = TArc(linear(img_tokens_t[], base.img_in[], no_bias^, ctx))
@@ -408,6 +402,55 @@ def klein_stack_lora_forward_device_inputs_resident[
     )
 
 
+def klein_stack_lora_forward_device_inputs_resident_moddev[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens_t: TArc, txt_tokens_t: TArc,
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraDeviceSet,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos: List[Float32], sin: List[Float32],
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> KleinStackForward:
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    return klein_stack_lora_forward_device_inputs_resident_moddev_rope[
+        H, Dh, N_IMG, N_TXT, S
+    ](
+        img_tokens_t, txt_tokens_t, base, dbw, sbw, lora,
+        img_mod_dev, txt_mod_dev, single_mod_dev, cos_t, sin_t,
+        D, F, in_ch, txt_ch, out_ch, eps, ctx,
+    )
+
+
+def klein_stack_lora_forward_device_inputs_resident[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens_t: TArc, txt_tokens_t: TArc,
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraDeviceSet,
+    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
+    cos: List[Float32], sin: List[Float32],
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> KleinStackForward:
+    var img_mod_dev = modvecs_to_device(img_mod, D, ctx)
+    var txt_mod_dev = modvecs_to_device(txt_mod, D, ctx)
+    var single_mod_dev = single_modvecs_to_device(single_mod, D, ctx)
+    return klein_stack_lora_forward_device_inputs_resident_moddev[
+        H, Dh, N_IMG, N_TXT, S
+    ](
+        img_tokens_t, txt_tokens_t, base, dbw, sbw, lora,
+        img_mod_dev, txt_mod_dev, single_mod_dev, cos, sin,
+        D, F, in_ch, txt_ch, out_ch, eps, ctx,
+    )
+
+
 def klein_stack_lora_forward_device_inputs[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
@@ -451,7 +494,7 @@ def klein_stack_lora_forward[
 # ── FULL BACKWARD WITH LoRA (full-depth; per-block recompute) ────────────────
 # Mirrors klein_stack_backward, calling the LoRA per-block backward and
 # COLLECTING every adapter's d_A/d_B into the flat KleinLoraGrads.
-def klein_stack_lora_backward_resident[
+def klein_stack_lora_backward_resident_moddev_rope[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
     d_out: List[Float32],
@@ -459,8 +502,10 @@ def klein_stack_lora_backward_resident[
     base: KleinStackBase,
     dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
     lora: KleinLoraDeviceSet,
-    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
-    cos: List[Float32], sin: List[Float32],
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
     saved: KleinStackForward,
     D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
     ctx: DeviceContext,
@@ -469,14 +514,6 @@ def klein_stack_lora_backward_resident[
 ) raises -> KleinLoraGrads:
     var num_double = len(dbw)
     var num_single = len(sbw)
-
-    # Resident rope tables: upload ONCE for the whole backward pass (recompute
-    # forward + block backward both borrow these instead of per-call from_host).
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var img_mod_dev = modvecs_to_device(img_mod, D, ctx)
-    var txt_mod_dev = modvecs_to_device(txt_mod, D, ctx)
-    var single_mod_dev = single_modvecs_to_device(single_mod, D, ctx)
 
     # ── final layer backward (frozen base) ──
     # final_lin is frozen in LoRA training; only d_x flows into the final norm.
@@ -616,6 +653,61 @@ def klein_stack_lora_backward_resident[
         d_img_tokens^, d_txt_tokens^,
         d_img_mod^, d_txt_mod^, d_single_mod^,
         d_img_in^, d_txt_in^, List[Float32](), d_final_shift^, d_final_scale^,
+    )
+
+
+def klein_stack_lora_backward_resident_moddev[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraDeviceSet,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos: List[Float32], sin: List[Float32],
+    saved: KleinStackForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    compute_input_grads: Bool = True,
+    compute_aux_grads: Bool = True,
+) raises -> KleinLoraGrads:
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    return klein_stack_lora_backward_resident_moddev_rope[H, Dh, N_IMG, N_TXT, S](
+        d_out, img_tokens, txt_tokens, base, dbw, sbw, lora,
+        img_mod_dev, txt_mod_dev, single_mod_dev, cos_t, sin_t, saved,
+        D, F, in_ch, txt_ch, out_ch, eps, ctx, compute_input_grads,
+        compute_aux_grads,
+    )
+
+
+def klein_stack_lora_backward_resident[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraDeviceSet,
+    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
+    cos: List[Float32], sin: List[Float32],
+    saved: KleinStackForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    compute_input_grads: Bool = True,
+    compute_aux_grads: Bool = True,
+) raises -> KleinLoraGrads:
+    var img_mod_dev = modvecs_to_device(img_mod, D, ctx)
+    var txt_mod_dev = modvecs_to_device(txt_mod, D, ctx)
+    var single_mod_dev = single_modvecs_to_device(single_mod, D, ctx)
+    return klein_stack_lora_backward_resident_moddev[H, Dh, N_IMG, N_TXT, S](
+        d_out, img_tokens, txt_tokens, base, dbw, sbw, lora,
+        img_mod_dev, txt_mod_dev, single_mod_dev, cos, sin, saved,
+        D, F, in_ch, txt_ch, out_ch, eps, ctx, compute_input_grads,
+        compute_aux_grads,
     )
 
 

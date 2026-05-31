@@ -189,7 +189,7 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   Mirrors `klein_dit.mojo` `forward_full`. The training structs now carry saved
   activations with `ArcPointer[Tensor]` device carriers so inter-block handoff
   avoids host-list traffic.
-- **`models/klein/klein_stack_lora.mojo`** (741 L) — the stack WITH LoRA on every trained
+- **`models/klein/klein_stack_lora.mojo`** (835 L) — the stack WITH LoRA on every trained
   projection: per-block LoRA variants for every block + collects adapter d_A/d_B
   into one flat `KleinLoraSet`, supports AdamW step + PEFT save. The hot trainer
   path uses device input tokens, resident block/modulation tensors, checkpoint-tail
@@ -197,8 +197,12 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   modulation grads in the real LoRA optimizer path. It also exposes
   `KleinLoraDeviceSet` / `klein_lora_set_to_device`, so the trainer uploads LoRA
   A/B once per step and reuses them across forward, backward recompute, and LoRA
-  backward. Latest clean 4B timing after cached step-mod weights:
-  `PROG ... secs=4.3674574`, loss `2.734082`; still above the 2-3s target.
+  backward. The real trainer uses the `_moddev_rope` entry points so per-step
+  modulation chunks and RoPE tables stay device-resident. Single-block LoRA
+  backward also reuses the saved attention-flat tensor instead of slicing it
+  back out of `out_in` twice. Latest clean 4B timing:
+  `PROG ... secs=4.185293` / `4.2358575` / `4.228305`, loss `2.734082`, grad `0.17687473`;
+  still above the 2-3s target.
 - **`models/klein/lora_block.mojo`** (289 L) — LoRA-on-projection helpers shared by the
   double/single LoRA variants; SAME math as `train_step.mojo` plus the projection
   input-grad contribution `d_x_lo`. The hot `*_device` helpers keep activation and
@@ -209,10 +213,13 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   structs. Loads the 12-tensor-per-double-block + 4-per-single-block key layout
   (same keys the inference `klein_dit.mojo` reads) into the host `List[Float32]`
   weight structs the verified block fwd/bwd consume. Also exposes
-  `KleinStepModWeights`, `load_klein_step_mod_weights`, and
-  `build_klein_step_mods_cached`, so frozen timestep/modulation weights are
-  loaded once before timed training steps and reused device-resident. **Status:
-  PROVEN for cached mods** (`klein_step_mod_cache_smoke`: all max_abs 0.0).
+  `KleinStepModWeights`, `load_klein_step_mod_weights`,
+  `build_klein_step_mods_cached`, and `build_klein_step_mods_device_cached`, so
+  frozen timestep/modulation weights are loaded once before timed training steps
+  and reused device-resident. The device-cached variant returns `ModVecsDevice`
+  / `SingleModVecsDevice` chunks for the hot trainer path. **Status: PROVEN for
+  cached mods** (`klein_step_mod_cache_smoke`: host and device chunks all
+  max_abs 0.0).
 - `models/klein/parity/load_{double,single}_block_smoke.mojo` — real-weight load
   smokes for the block weight structs.
 
@@ -220,7 +227,7 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
 
 | Module | Purpose / key defs | Status |
 |---|---|---|
-| `scratch_ring.mojo` | `ScratchRingAllocator`: OneTrainer-style fixed GPU scratch slabs (`DType.uint8`), 16-byte aligned sub-buffer allocation, forward allocation from the head, reverse allocation from the tail for backward/recompute frames, explicit `mark`/`rewind`/`reset`, and Tensor wrappers over `create_sub_buffer`. The allocator is shared infrastructure for any model, but callers must opt in and own the frame lifetime; it is not a global Tensor allocator. | **PROVEN** (`scratch_ring_smoke`: clone, alignment, mark/rewind, reset, forward+reverse allocation) |
+| `scratch_ring.mojo` | `ScratchRingAllocator`: OneTrainer-style fixed GPU scratch slabs (`DType.uint8`), 16-byte aligned sub-buffer allocation, forward allocation from the head, reverse allocation from the tail for backward/recompute frames, explicit `mark`/`rewind`/`reset`, and Tensor wrappers over `create_sub_buffer`. Matches the local OneTrainer pattern in `docs/RamOffloading.md` and `modules/util/LayerOffloadConductor.py`: persistent int8 cache tensors, typed slice/view reinterpretation, and ordered forward/backward allocation. The allocator is shared infrastructure for any model, but callers must opt in and own the frame lifetime; it is not a global Tensor allocator. | **PROVEN** (`scratch_ring_smoke`: clone, alignment, mark/rewind, reset, forward+reverse allocation) |
 | `ops/tensor_algebra_scratch.mojo` | Opt-in scratch-backed hot shape helpers: `concat2_scratch`, `concat3_scratch`, `slice_scratch` for F32 rank-2 dim-1 temporaries. Kept separate from `ops/tensor_algebra.mojo` so normal model imports do not compile or use scratch kernels unless explicitly requested. | **PROVEN** (`scratch_ring_smoke`: concat2/slice/concat3 parity) |
 
 ## Training orchestration — `training/`
@@ -269,7 +276,7 @@ are imported only by the prepare driver, never by the loop.
 | Module | Intended role (per header, may change) | Status |
 |---|---|---|
 | `pipeline/klein_prepare_alina.mojo` (present) | REAL prepare driver for the Alina LoRA dataset: for 4 staged 512² images + captions, `KleinVaeEncoder.encode` (assert std≈0.96) + Qwen3-8B `encode_klein` (512 tok) → `write_sample` to `output/alina_cache/`. Qwen3+VAE co-reside ONLY in this process; the train process never imports Qwen3. | **IN PROGRESS** — file exists, header complete; not yet lead-run end-to-end. |
-| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It now uses cached per-step modulation weights loaded before timing. Latest measured one-step runs: `4.281281`, `4.3405366`, final `4.3674574`, loss `2.734082`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; still above the 2-3s target. |
+| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It uses cached per-step modulation weights, device modulation chunks, and resident RoPE tables loaded before timing. Latest measured one-step runs after the single-block slice cleanup: `4.185293`, `4.2358575`, `4.228305`, loss `2.734082`, grad `0.17687473`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; still above the 2-3s target. |
 
 ---
 

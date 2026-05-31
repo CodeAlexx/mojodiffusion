@@ -401,7 +401,9 @@ The hot stack path uses the resident device sibling through
 ## 11c. Scratch ring allocator — opt-in temporary Tensor storage
 
 `scratch_ring.mojo::ScratchRingAllocator` is a shared GPU scratch allocator
-modeled after OneTrainer's static activation/layer allocators:
+modeled after the local OneTrainer static activation/layer allocator pattern
+(`OneTrainer/docs/RamOffloading.md` and
+`OneTrainer/modules/util/LayerOffloadConductor.py`):
 
 - persistent `DType.uint8` device slabs;
 - 16-byte aligned sub-buffer allocation via `create_sub_buffer`;

@@ -42,13 +42,16 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
      through forward, backward recompute, and LoRA backward.
 
 5. **Current measured state:** clean `train_klein_real.mojo` runs after cached
-   step-modulation weights + metadata reshape cleanup are now **~4.3 s/step**:
-   `4.281281`, `4.3405366`, final `4.3674574`, loss `2.734082`, grad
-   `0.17687473`. Prior clean state after resident LoRA A/B + scratch
-   infrastructure was **5.200673 s/step**; best clean prior was **5.1468015**.
-   This is real progress but **NOT the requested 2-3s target**.
+   step-modulation weights, metadata reshape cleanup, device-resident modulation
+   chunks/RoPE, and single-block backward copy cleanup are now **~4.2 s/step**:
+   `4.185293`, `4.2358575`, `4.228305`, loss `2.734082`, grad `0.17687473`.
+   Previous clean final was `4.3674574`; prior clean state after resident LoRA
+   A/B + scratch infrastructure was **5.200673 s/step**; best clean prior was
+   **5.1468015**. This is real progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
+   - single-block backward is the measured dominant region; next target is
+     fusion/view reduction inside the single-block recompute/backward path;
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
    - wire the enhanced forward/reverse scratch ring only at proven frame
@@ -182,7 +185,14 @@ hot-path lifetimes, and fusion/BF16.
 ### 2026-05-31 continuation: shared scratch ring allocator landed
 
 Added shared, opt-in scratch infrastructure modeled after OneTrainer's static
-activation/layer allocators:
+activation/layer allocators. Source references read locally:
+`/home/alex/OneTrainer/docs/RamOffloading.md` §Memory Management and
+`/home/alex/OneTrainer/modules/util/LayerOffloadConductor.py`
+(`StaticLayerTensorAllocator`, `StaticLayerAllocator`,
+`StaticActivationAllocator`): OneTrainer allocates persistent 1D int8 cache
+tensors, slices/views them into typed tensors, allocates layers from either
+direction for forward/backward order, and condenses activation caches to reduce
+fragmentation.
 
 - `serenitymojo/scratch_ring.mojo`: `ScratchRingAllocator` owns persistent
   `DType.uint8` GPU slabs, returns `Tensor` wrappers over `create_sub_buffer`,
@@ -226,6 +236,41 @@ Gates / measurements from this continuation:
 Do not use `models/klein/parity/klein_stack_lora_real_smoke.mojo` as the timing
 benchmark; it OOMed on the 24 GB 3090 Ti in this session. The timing benchmark is
 `training/train_klein_real.mojo`.
+
+### 2026-05-31 continuation: device step mods/RoPE + single-block slice cleanup landed
+
+The stack API now has fast-path wrappers that accept device-resident modulation
+vectors and already-uploaded RoPE tables while preserving the old host-list API:
+
+- `models/klein/weights.mojo`: `build_klein_step_mods_device_cached` returns
+  `ModVecsDevice` / `SingleModVecsDevice` chunks directly from the cached
+  timestep/modulation MLP.
+- `models/klein/klein_stack_lora.mojo`: added `_moddev` and `_moddev_rope`
+  forward/backward entry points. The real trainer uses `_moddev_rope`, so RoPE
+  tables are uploaded once before timing and borrowed through forward and
+  backward recompute.
+- `training/train_klein_real.mojo`: builds `cos_dev`/`sin_dev` once and uses
+  the device cached modulation path inside the timed loop.
+- `models/klein/single_block.mojo`: single-block LoRA backward now reuses
+  `saved.att_flat` instead of taking the first `D` columns out of `saved.out_in`
+  twice. This removes two `[S,D]` D2D slice/copy operations per single-block
+  backward without changing math.
+
+Gates / measurements from this continuation:
+
+| item | result |
+|------|--------|
+| device modulation gate | `klein_step_mod_cache_smoke` PASS, host and device chunks all max_abs `0.0` |
+| single-block LoRA gate | `single_block_lora_parity` PASS |
+| stack LoRA gate | `klein_stack_lora_parity` PASS |
+| accepted real 4B timing runs | `4.185293`, `4.2358575`, `4.228305`, loss `2.734082`, grad `0.17687473` |
+| previous clean final | `4.3674574`, same loss/grad |
+| rejected trial | `SGL_SAVE_TAIL = 12` passed stack parity but slowed to `5.3278003`; reverted to `8` |
+
+Temporary phase timing, reverted before commit, showed the next real hotspot:
+`prep=0.0304`, `fwd=1.4699`, `loss=0.0005`, `bwd=2.7575`, `opt=0.0490`.
+Inside stack backward: `single=2.3369`, `double=0.4481`, `final=0.0081`.
+That points at single-block backward fusion/views as the next speed lever.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
@@ -272,6 +317,12 @@ models/klein/single_block.mojo, models/klein/double_block.mojo,
 scratch_ring.mojo, scratch_ring_smoke.mojo, docs/MOJO_MODULES.md,
 docs/MOJO_KERNELS.md, this handoff.
 
+Files touched in the device mod/RoPE + single-block copy cleanup continuation:
+models/klein/weights.mojo, models/klein/klein_stack_lora.mojo,
+models/klein/single_block.mojo,
+models/klein/parity/klein_step_mod_cache_smoke.mojo,
+training/train_klein_real.mojo, docs/MOJO_MODULES.md, this handoff.
+
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 
@@ -291,3 +342,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | LoRA-helpers device port | USER | continued after user redirected to tensors/autograd; landed device activation carriers and measured 5.31s clean |
 | Resident LoRA A/B carrier | AGENT-DEFAULT | user asked to focus tensors for all models; removes repeated per-use `from_host` in LoRA helpers while preserving host optimizer/save source of truth |
 | Shared scratch ring allocator | USER | requested after OneTrainer comparison; landed as opt-in slabs usable by all models iff needed |
+| Device mod/RoPE + single-block slice cleanup | AGENT-DEFAULT | kept the API compatible, made the real trainer use device-resident per-step tensors, and removed duplicate D2D slices where lifetime was already proven by `SingleBlockSaved.att_flat` |

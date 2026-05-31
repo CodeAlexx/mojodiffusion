@@ -22,6 +22,7 @@
 
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
+from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
@@ -30,8 +31,13 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.embeddings import t_embedder
-from serenitymojo.models.klein.double_block import StreamWeights, DoubleBlockWeights, ModVecs
-from serenitymojo.models.klein.single_block import SingleBlockWeights, SingleModVecs
+from serenitymojo.ops.tensor_algebra import reshape_owned, slice
+from serenitymojo.models.klein.double_block import (
+    StreamWeights, DoubleBlockWeights, ModVecs, ModVecsDevice,
+)
+from serenitymojo.models.klein.single_block import (
+    SingleBlockWeights, SingleModVecs, SingleModVecsDevice,
+)
 from serenitymojo.models.klein.klein_stack import KleinStackBase
 
 
@@ -295,6 +301,45 @@ def _single_modvec_from_device(
     return SingleModVecs(_chunk(host, 0, d), _chunk(host, 1, d), _chunk(host, 2, d))
 
 
+def _chunk_tensor_1d(
+    x: Tensor, start_chunk: Int, d: Int, ctx: DeviceContext
+) raises -> Tensor:
+    var chunk2d = slice(x, 1, start_chunk * d, d, ctx)
+    return reshape_owned(chunk2d^, [d])
+
+
+def _modvec_device_from_tensor(
+    mod: Tensor, d: Int, ctx: DeviceContext
+) raises -> ModVecsDevice:
+    var shift1 = _chunk_tensor_1d(mod, 0, d, ctx)
+    var scale1 = _chunk_tensor_1d(mod, 1, d, ctx)
+    var gate1 = _chunk_tensor_1d(mod, 2, d, ctx)
+    var shift2 = _chunk_tensor_1d(mod, 3, d, ctx)
+    var scale2 = _chunk_tensor_1d(mod, 4, d, ctx)
+    var gate2 = _chunk_tensor_1d(mod, 5, d, ctx)
+    return ModVecsDevice(
+        ArcPointer[Tensor](shift1^),
+        ArcPointer[Tensor](scale1^),
+        ArcPointer[Tensor](gate1^),
+        ArcPointer[Tensor](shift2^),
+        ArcPointer[Tensor](scale2^),
+        ArcPointer[Tensor](gate2^),
+    )
+
+
+def _single_modvec_device_from_tensor(
+    mod: Tensor, d: Int, ctx: DeviceContext
+) raises -> SingleModVecsDevice:
+    var shift = _chunk_tensor_1d(mod, 0, d, ctx)
+    var scale = _chunk_tensor_1d(mod, 1, d, ctx)
+    var gate = _chunk_tensor_1d(mod, 2, d, ctx)
+    return SingleModVecsDevice(
+        ArcPointer[Tensor](shift^),
+        ArcPointer[Tensor](scale^),
+        ArcPointer[Tensor](gate^),
+    )
+
+
 def build_klein_step_mods_cached(
     weights: KleinStepModWeights,
     sigma: Float32,
@@ -319,6 +364,33 @@ def build_klein_step_mods_cached(
         _modvec_from_device(img_mod, d, ctx),
         _modvec_from_device(txt_mod, d, ctx),
         _single_modvec_from_device(single_mod, d, ctx),
+    )
+
+
+def build_klein_step_mods_device_cached(
+    weights: KleinStepModWeights,
+    sigma: Float32,
+    timestep_dim: Int,
+    d: Int,
+    ctx: DeviceContext,
+) raises -> Tuple[ModVecsDevice, ModVecsDevice, SingleModVecsDevice]:
+    var tvals = List[Float32]()
+    tvals.append(sigma * Float32(1000.0))
+    var tsh = List[Int]()
+    tsh.append(1)
+    var ts = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)
+    var vec_silu = build_klein_vec_silu_device(weights, ts, timestep_dim, ctx)
+
+    var no_bias_img = Optional[Tensor](None)
+    var img_mod = linear(vec_silu, weights.img_mod, no_bias_img^, ctx)
+    var no_bias_txt = Optional[Tensor](None)
+    var txt_mod = linear(vec_silu, weights.txt_mod, no_bias_txt^, ctx)
+    var no_bias_single = Optional[Tensor](None)
+    var single_mod = linear(vec_silu, weights.single_mod, no_bias_single^, ctx)
+    return (
+        _modvec_device_from_tensor(img_mod, d, ctx),
+        _modvec_device_from_tensor(txt_mod, d, ctx),
+        _single_modvec_device_from_tensor(single_mod, d, ctx),
     )
 
 

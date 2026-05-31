@@ -702,8 +702,7 @@ def single_block_lora_backward_device_resident[
     var nb = Optional[Tensor](None)
     var out_y = linear(saved.out_in[], w.w2[], nb^, ctx)
     if lora.out:
-        var att_flat_in = klein_take_cols_device(saved.out_in[], S, D + F, D, ctx)   # [S,D]
-        var dlt2 = klein_lora_fwd_device_resident(att_flat_in, lora.out.value(), S, ctx)
+        var dlt2 = klein_lora_fwd_device_resident(saved.att_flat[], lora.out.value(), S, ctx)
         out_y = add(out_y, dlt2, ctx)
     var grg = gate_residual_backward(
         d_out_t[], saved.x[], mv.gate[], out_y, ctx, compute_aux_grads
@@ -723,8 +722,7 @@ def single_block_lora_backward_device_resident[
     var out_d_a = List[Float32]()
     var out_d_b = List[Float32]()
     if lora.out:
-        var att_flat_in2 = klein_take_cols_device(saved.out_in[], S, D + F, D, ctx)   # [S,D]
-        var lg2 = klein_lora_bwd_device_resident(grg.d_y, att_flat_in2, lora.out.value(), S, ctx)
+        var lg2 = klein_lora_bwd_device_resident(grg.d_y, saved.att_flat[], lora.out.value(), S, ctx)
         d_out_in_t = klein_add_cols_device(d_out_in_t, lg2.d_x, S, D + F, D, ctx)
         out_d_a = lg2.d_a.copy()
         out_d_b = lg2.d_b.copy()

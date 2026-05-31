@@ -39,6 +39,7 @@ from layout.runtime_layout import RuntimeLayout
 from linalg.matmul.vendor.blas import matmul
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.scratch_ring import ScratchRingAllocator
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -58,6 +59,18 @@ struct SdpaGrads(Movable):
         self.d_q = d_q^
         self.d_k = d_k^
         self.d_v = d_v^
+
+
+def _scratch_f32_flat(
+    mut scratch: ScratchRingAllocator,
+    n: Int,
+    reverse: Bool = False,
+) raises -> Tensor:
+    var sh = List[Int]()
+    sh.append(n)
+    if reverse:
+        return scratch.alloc_tensor_reverse(sh^, STDtype.F32)
+    return scratch.alloc_tensor(sh^, STDtype.F32)
 
 
 # ── gather BSHD [B,S,H,Dh] -> BHSD-contiguous F32 [B*H*S, Dh] (cast up) ──────
@@ -478,4 +491,165 @@ def sdpa_backward[
     var dk_t = _scatter_to_tensor(dk_full, B, S, H, Dh, out_dt, src_rl, ctx)
     var dv_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr, bhsd_rl)
     var dv_t = _scatter_to_tensor(dv_full, B, S, H, Dh, out_dt, src_rl, ctx)
+    return SdpaGrads(dq_t^, dk_t^, dv_t^)
+
+
+def sdpa_backward_scratch[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    d_out: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> SdpaGrads:
+    """Scratch-backed SDPA backward.
+
+    The returned d_q/d_k/d_v tensors are normal fresh outputs. The large
+    recompute/work buffers are allocated from the caller-owned scratch ring and
+    rewound before return, following the OneTrainer-style scoped cache pattern.
+    """
+    var scratch_mark = scratch.mark()
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype() or q.dtype() != d_out.dtype():
+        raise Error("sdpa_backward_scratch: q/k/v/d_out dtype mismatch")
+    var qshape = q.shape()
+    if len(qshape) != 4 or qshape[0] != B or qshape[1] != S or qshape[2] != H or qshape[3] != Dh:
+        raise Error("sdpa_backward_scratch: q shape != compile-time [B,S,H,Dh]")
+
+    var out_dt = q.dtype()
+    comptime BH = B * H
+    comptime src_rows = B * S * H
+    comptime bhsd_rows = B * H * S
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    var bhsd_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](bhsd_rows, Dh))
+    var head_qk_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, Dh))
+    var sc_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, S))
+
+    # Inputs are long-lived through the recompute, so place them at the reverse
+    # end of the ring and let forward allocations use the other end.
+    var qf = _scratch_f32_flat(scratch, bhsd_rows * Dh, True)
+    var kf = _scratch_f32_flat(scratch, bhsd_rows * Dh, True)
+    var vf = _scratch_f32_flat(scratch, bhsd_rows * Dh, True)
+    var gof = _scratch_f32_flat(scratch, bhsd_rows * Dh, True)
+    var qd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        qf.buf.unsafe_ptr().bitcast[Float32](), bhsd_rl
+    )
+    var kd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        kf.buf.unsafe_ptr().bitcast[Float32](), bhsd_rl
+    )
+    var vd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        vf.buf.unsafe_ptr().bitcast[Float32](), bhsd_rl
+    )
+    var god = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        gof.buf.unsafe_ptr().bitcast[Float32](), bhsd_rl
+    )
+    _gather_to_f32(q, qd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(k, kd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(v, vd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(d_out, god, B, S, H, Dh, src_rl, ctx)
+
+    var attn = _scratch_f32_flat(scratch, BH * S * S)
+    var qptr = qf.buf.unsafe_ptr().bitcast[Float32]()
+    var kptr = kf.buf.unsafe_ptr().bitcast[Float32]()
+    var vptr = vf.buf.unsafe_ptr().bitcast[Float32]()
+    var goptr = gof.buf.unsafe_ptr().bitcast[Float32]()
+    var aptr = attn.buf.unsafe_ptr().bitcast[Float32]()
+    for bh in range(BH):
+        var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            qptr + bh * S * Dh, head_qk_rl
+        )
+        var Bt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            kptr + bh * S * Dh, head_qk_rl
+        )
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            aptr + bh * S * S, sc_rl
+        )
+        matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)
+
+    comptime sm_rows = BH * S
+    var sc_full_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](sm_rows, S))
+    var attn_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr, sc_full_rl)
+    var nsm = sm_rows * S
+    var smgrid = (nsm + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        attn_full, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK
+    )
+    ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
+        attn_full, S, grid_dim=sm_rows, block_dim=_TPB
+    )
+
+    var dvf = _scratch_f32_flat(scratch, bhsd_rows * Dh)
+    var dvptr = dvf.buf.unsafe_ptr().bitcast[Float32]()
+    for bh in range(BH):
+        var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            aptr + bh * S * S, sc_rl
+        )
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            goptr + bh * S * Dh, head_qk_rl
+        )
+        var DV = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dvptr + bh * S * Dh, head_qk_rl
+        )
+        matmul(ctx, DV, P, GO, transpose_a=True, c_row_major=True)
+
+    var gscores = _scratch_f32_flat(scratch, BH * S * S)
+    var gsptr = gscores.buf.unsafe_ptr().bitcast[Float32]()
+    for bh in range(BH):
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            goptr + bh * S * Dh, head_qk_rl
+        )
+        var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            vptr + bh * S * Dh, head_qk_rl
+        )
+        var GA = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            gsptr + bh * S * S, sc_rl
+        )
+        matmul(ctx, GA, GO, Vh, transpose_b=True, c_row_major=True)
+
+    var gs_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr, sc_full_rl)
+    ctx.enqueue_function[_softmax_bwd_rows_f32, _softmax_bwd_rows_f32](
+        attn_full, gs_full, S, grid_dim=sm_rows, block_dim=_TPB
+    )
+
+    var dqf = _scratch_f32_flat(scratch, bhsd_rows * Dh)
+    var dkf = _scratch_f32_flat(scratch, bhsd_rows * Dh)
+    var dqptr = dqf.buf.unsafe_ptr().bitcast[Float32]()
+    var dkptr = dkf.buf.unsafe_ptr().bitcast[Float32]()
+    for bh in range(BH):
+        var DS = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            gsptr + bh * S * S, sc_rl
+        )
+        var Kh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            kptr + bh * S * Dh, head_qk_rl
+        )
+        var Qh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            qptr + bh * S * Dh, head_qk_rl
+        )
+        var DQ = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dqptr + bh * S * Dh, head_qk_rl
+        )
+        var DK = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dkptr + bh * S * Dh, head_qk_rl
+        )
+        matmul(ctx, DQ, DS, Kh, transpose_b=False, c_row_major=True)
+        matmul(ctx, DK, DS, Qh, transpose_a=True, c_row_major=True)
+
+    var dq_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr, bhsd_rl)
+    var dk_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr, bhsd_rl)
+    var ndqk = bhsd_rows * Dh
+    var dqkgrid = (ndqk + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dq_full, scale, bhsd_rows, Dh, grid_dim=dqkgrid, block_dim=_BLOCK
+    )
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dk_full, scale, bhsd_rows, Dh, grid_dim=dqkgrid, block_dim=_BLOCK
+    )
+
+    var dq_t = _scatter_to_tensor(dq_full, B, S, H, Dh, out_dt, src_rl, ctx)
+    var dk_t = _scatter_to_tensor(dk_full, B, S, H, Dh, out_dt, src_rl, ctx)
+    var dv_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr, bhsd_rl)
+    var dv_t = _scatter_to_tensor(dv_full, B, S, H, Dh, out_dt, src_rl, ctx)
+    scratch.rewind(scratch_mark)
     return SdpaGrads(dq_t^, dk_t^, dv_t^)

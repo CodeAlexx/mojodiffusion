@@ -4,6 +4,7 @@
 #   pixi run mojo run -I . serenitymojo/scratch_ring_smoke.mojo
 
 from std.gpu.host import DeviceContext
+from std.collections import Optional
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness
@@ -18,6 +19,8 @@ from serenitymojo.ops.linalg_backward import (
     linear_backward_dx,
     linear_backward_dx_scratch,
 )
+from serenitymojo.ops.linear import linear, linear_scratch
+from serenitymojo.ops.attention_backward import sdpa_backward, sdpa_backward_scratch
 
 
 def _lf(*values: Float64) -> List[Float32]:
@@ -142,6 +145,48 @@ def main() raises:
     var dx_scratch = linear_backward_dx_scratch(gy, wt, 2, 4, 3, ctx, ring)
     r = h.compare(dx_scratch, dx_ref, ctx)
     print("scratch linear dx   ", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
+    var lin_x = Tensor.from_host(_lf(1.0, -2.0, 0.5, 3.0, 2.0, 1.5, -1.0, 0.25), [2, 4], F32, ctx)
+    var no_bias = Optional[Tensor](None)
+    var lin_ref_t = linear(lin_x, wt, no_bias^, ctx)
+    var lin_ref = lin_ref_t.to_host(ctx)
+    var no_bias_scratch = Optional[Tensor](None)
+    var lin_scratch = linear_scratch(lin_x, wt, no_bias_scratch^, ctx, ring)
+    r = h.compare(lin_scratch, lin_ref, ctx)
+    print("scratch linear fwd  ", r)
+    all_pass = all_pass and r.passed
+
+    var att_ring = ScratchRingAllocator(ctx, 4096, 2)
+    var qv = List[Float32]()
+    var kv = List[Float32]()
+    var vv = List[Float32]()
+    var gov = List[Float32]()
+    for i in range(24):
+        qv.append((Float32((i * 7) % 17) - 8.0) * 0.03)
+        kv.append((Float32((i * 5) % 19) - 9.0) * 0.025)
+        vv.append((Float32((i * 3) % 13) - 6.0) * 0.04)
+        gov.append((Float32((i * 11) % 23) - 11.0) * 0.02)
+    var q = Tensor.from_host(qv, [1, 3, 2, 4], F32, ctx)
+    var k = Tensor.from_host(kv, [1, 3, 2, 4], F32, ctx)
+    var v = Tensor.from_host(vv, [1, 3, 2, 4], F32, ctx)
+    var go = Tensor.from_host(gov, [1, 3, 2, 4], F32, ctx)
+    var sdpa_ref = sdpa_backward[1, 3, 2, 4](q, k, v, go, Float32(0.5), ctx)
+    var sdpa_scratch = sdpa_backward_scratch[1, 3, 2, 4](
+        q, k, v, go, Float32(0.5), ctx, att_ring,
+    )
+    var dq_ref = sdpa_ref.d_q.to_host(ctx)
+    r = h.compare(sdpa_scratch.d_q, dq_ref, ctx)
+    print("scratch sdpa d_q    ", r)
+    all_pass = all_pass and r.passed
+    var dk_ref = sdpa_ref.d_k.to_host(ctx)
+    r = h.compare(sdpa_scratch.d_k, dk_ref, ctx)
+    print("scratch sdpa d_k    ", r)
+    all_pass = all_pass and r.passed
+    var dv_ref = sdpa_ref.d_v.to_host(ctx)
+    r = h.compare(sdpa_scratch.d_v, dv_ref, ctx)
+    print("scratch sdpa d_v    ", r)
     all_pass = all_pass and r.passed
 
     if all_pass:

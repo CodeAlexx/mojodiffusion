@@ -337,8 +337,8 @@ def main() raises:
     # ── open cache ────────────────────────────────────────────────────────────
     var cache = KleinCache(CACHE_DIR)
     print("  cache samples:", cache.count())
-    var scratch = ScratchRingAllocator(ctx, SCRATCH_SLAB_BYTES, 1)
-    print("  scratch ring:", SCRATCH_SLAB_BYTES, "bytes")
+    var scratch = ScratchRingAllocator(ctx, SCRATCH_SLAB_BYTES, 2)
+    print("  scratch ring:", SCRATCH_SLAB_BYTES, "bytes x 2 slabs")
 
     # ── baseline sample (step 0, before any training) ─────────────────────────
     if DO_SAMPLE:

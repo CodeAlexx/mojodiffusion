@@ -464,6 +464,18 @@ def div_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:
     return _binary_scalar(a, s, _OP_DIV, ctx)
 
 
+def zeros_device(
+    var shape: List[Int], dtype: STDtype, ctx: DeviceContext
+) raises -> Tensor:
+    """Allocate a zero-filled device Tensor without staging a host List."""
+    var n = 1
+    for i in range(len(shape)):
+        n *= shape[i]
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
+    out_buf.enqueue_fill(UInt8(0))
+    return Tensor(out_buf^, shape^, dtype)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # reshape / view — same bytes, new shape (numel must match). Tensor owns its
 # buffer and cannot alias, so this is a D2D clone + metadata change (matches the

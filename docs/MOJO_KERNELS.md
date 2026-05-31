@@ -303,6 +303,7 @@ Grad structs: `WhereGrads{d_a,d_b}` (:61), `BinaryGrads{d_a,d_b}` (:72),
 | Function | Returns | Math |
 |---|---|---|
 | `sdpa_backward[B,S,H,Dh](q, k, v, d_out, scale, ctx)` | `SdpaGrads{d_q, d_k, d_v}` | decomposed (math-mode) non-causal SDPA backward |
+| `sdpa_backward_scratch[B,S,H,Dh](..., ctx, scratch)` | `SdpaGrads{d_q, d_k, d_v}` | same math/results; large recompute work buffers come from a caller-owned scratch ring and are rewound before return |
 
 Grad struct `SdpaGrads{d_q,d_k,d_v}` (each BSHD `[B,S,H,Dh]`). Compile-time
 shape params `[B,S,H,Dh]`. **No cuDNN, no flash** — this is the deliberate
@@ -326,6 +327,12 @@ All interior math F32; BF16/F16 only at gather/scatter boundary
 (`_gather_bf16`/`_scatter_bf16` etc.). Per-head loops are plain
 `for bh in range(BH)` with **linear** per-head offsets (`ptr + bh*S*Dh`,
 `ptr + bh*S*S`) — no visible 32-alignment assumption.
+
+`sdpa_backward_scratch` is the OneTrainer-style allocator variant. It returns
+normal fresh `d_q/d_k/d_v` tensors, but places the large temporary BHSD input
+gathers, attention scores, grad-scores, and intermediate dQ/dK/dV buffers inside
+`ScratchRingAllocator` and rewinds its nested frame before returning. It is
+opt-in only; non-scratch model paths still call `sdpa_backward`.
 
 ### Why the old H=30 numbers were noise (the degenerate-data lesson)
 
@@ -433,7 +440,9 @@ temporaries.
 
 **Parity gate:** `scratch_ring_smoke.mojo` covers clone, alignment,
 mark/rewind, reset, forward+reverse allocation, scratch concat2, scratch slice,
-scratch concat3, and rank-4 generic concat/slice from the reverse cursor.
+scratch concat3, rank-4 generic concat/slice from the reverse cursor,
+scratch-backed F32 no-bias `linear_scratch`, and `sdpa_backward_scratch`
+d_q/d_k/d_v equality against the normal SDPA backward.
 
 ---
 
@@ -458,10 +467,12 @@ files read):
 - **No CUDA-graph capture/replay, no global caching allocator.** Many Mojo ops
   still `enqueue_create_buffer` fresh. The F32 no-bias `linear` path now returns
   the vendor-BLAS GEMM output directly instead of allocating/copying through a
-  second output buffer, and `linear_backward_dx_scratch` can allocate frozen dx
-  outputs from an opt-in ring. A shared scratch ring exists, and the real Klein
-  LoRA path uses it for proven block-local temporaries, but other model paths
-  must explicitly adopt it at their own frame boundaries.
+  second output buffer; `linear_scratch` and `linear_backward_dx_scratch` can
+  allocate proven short-lived linear outputs from an opt-in ring; and
+  `sdpa_backward_scratch` reuses ring storage for large SDPA backward work
+  buffers. A shared scratch ring exists, and the real Klein LoRA path uses it
+  for proven block-local temporaries, but other model paths must explicitly
+  adopt it at their own frame boundaries.
 
 These are expected for a from-scratch port whose proven scope is *correctness
 through composition*, not throughput. As of this session there is **no open

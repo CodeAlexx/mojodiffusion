@@ -51,7 +51,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.ops.linear import linear
-from serenitymojo.ops.tensor_algebra import concat, slice
+from serenitymojo.ops.tensor_algebra import concat, slice, zeros_device
 
 from serenitymojo.models.klein.double_block import (
     DoubleBlockWeights, ModVecs, ModVecsDevice, modvecs_to_device,
@@ -434,6 +434,8 @@ def klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch[
     var txt = TArc(linear(txt_tokens_t[], base.txt_in[], no_bias_txt^, ctx))
     var img_in_act = img.copy()
     var txt_in_act = txt.copy()
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
 
     var dbl_img_in = List[TArc]()
     var dbl_txt_in = List[TArc]()
@@ -444,7 +446,7 @@ def klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch[
         var bl = _dbl_lora_dev_for(lora, bi)
         var fwd = double_block_lora_forward_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
             img, txt, dbw[bi], img_mod_dev, txt_mod_dev, bl,
-            cos_t, sin_t, D, F, eps, ctx, scratch,
+            cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
         )
         img = fwd.img_out.copy()
         txt = fwd.txt_out.copy()
@@ -457,7 +459,8 @@ def klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch[
         sgl_x_in.append(x.copy())
         var sl = _sgl_lora_dev_for(lora, bi)
         var fwd = single_block_lora_forward_device_resident_scratch[H, Dh, S](
-            x, sbw[bi], single_mod_dev, sl, cos_t, sin_t, D, F, eps, ctx, scratch,
+            x, sbw[bi], single_mod_dev, sl, cos_t, sin_t, D, F, eps,
+            norm_ones[], norm_zeros[], ctx, scratch,
         )
         if bi >= num_single - SGL_SAVE_TAIL:
             sgl_saved.append(fwd.saved.copy())
@@ -466,7 +469,7 @@ def klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch[
     var img_out = TArc(slice(x[], 0, N_TXT, N_IMG, ctx))
 
     var ln_img_out = TArc(layer_norm(
-        img_out[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+        img_out[], norm_ones[], norm_zeros[], eps, ctx,
     ))
     var normed = modulate(
         ln_img_out[],
@@ -618,7 +621,8 @@ def klein_stack_lora_backward_resident_moddev_rope[
         _t(_ones(D), [D], ctx), eps, ctx,
     )
 
-    var d_x = TArc(concat(0, ctx, _t(_zeros(N_TXT * D), [N_TXT, D], ctx), d_img_out_t))
+    var d_txt_zero = zeros_device([N_TXT, D], STDtype.F32, ctx)
+    var d_x = TArc(concat(0, ctx, d_txt_zero, d_img_out_t))
 
     # flat single LoRA grads collected in FORWARD order (block 0..num_single-1).
     var sgl_d_a = List[List[Float32]]()
@@ -757,6 +761,8 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
 ) raises -> KleinLoraGrads:
     var num_double = len(dbw)
     var num_single = len(sbw)
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
 
     var d_normed_t = linear_backward_dx(
         _t(d_out, [N_IMG, out_ch], ctx), base.final_lin[],
@@ -775,10 +781,11 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
 
     var d_img_out_t = layer_norm_backward_dx(
         mbf.d_x, saved.img_out[],
-        _t(_ones(D), [D], ctx), eps, ctx,
+        norm_ones[], eps, ctx,
     )
 
-    var d_x = TArc(concat(0, ctx, _t(_zeros(N_TXT * D), [N_TXT, D], ctx), d_img_out_t))
+    var d_txt_zero = zeros_device([N_TXT, D], STDtype.F32, ctx)
+    var d_x = TArc(concat(0, ctx, d_txt_zero, d_img_out_t))
 
     var sgl_d_a = List[List[Float32]]()
     var sgl_d_b = List[List[Float32]]()
@@ -797,11 +804,11 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
         else:
             block_saved = single_block_lora_recompute_saved_device_resident_scratch[H, Dh, S](
                 saved.sgl_x_in[bi], sbw[bi], single_mod_dev, sl,
-                cos_t, sin_t, D, F, eps, ctx, scratch,
+                cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
             )
         var bg = single_block_lora_backward_device_resident_scratch[H, Dh, S](
             d_x, sbw[bi], single_mod_dev, sl, block_saved, cos_t, sin_t,
-            D, F, eps, ctx, scratch, compute_aux_grads,
+            D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
         )
         d_x = bg.d_x.copy()
         if compute_aux_grads:
@@ -834,11 +841,12 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
         var bl = _dbl_lora_dev_for(lora, di)
         var fwd = double_block_lora_forward_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
             saved.dbl_img_in[di], saved.dbl_txt_in[di],
-            dbw[di], img_mod_dev, txt_mod_dev, bl, cos_t, sin_t, D, F, eps, ctx, scratch,
+            dbw[di], img_mod_dev, txt_mod_dev, bl, cos_t, sin_t, D, F, eps,
+            norm_ones[], norm_zeros[], ctx, scratch,
         )
         var bg = double_block_lora_backward_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
             d_io, d_to, dbw[di], img_mod_dev, txt_mod_dev, bl, fwd.saved,
-            cos_t, sin_t, D, F, eps, ctx, scratch, compute_aux_grads,
+            cos_t, sin_t, D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
         )
         d_io = bg.img.d_x.copy()
         d_to = bg.txt.d_x.copy()

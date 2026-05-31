@@ -15,7 +15,7 @@ from serenitymojo.parity import ParityHarness, ParityResult
 from serenitymojo.ops.tensor_algebra import (
     add, sub, mul, div,
     add_scalar, sub_scalar, mul_scalar, div_scalar,
-    reshape, transpose, permute, concat, slice, gather_rows,
+    zeros_device, reshape, transpose, permute, concat, slice, gather_rows,
 )
 from serenitymojo.ops.layout import patchify, unpatchify, deinterleave_pair
 
@@ -80,6 +80,9 @@ def main() raises:
     print("mul  scalar    ", r); all_pass = all_pass and r.passed
     r = h.compare(div_scalar(Tensor.from_host(sc_x, [2, 5], F32, ctx), Float32(1.75), ctx), sc_div, ctx)
     print("div  scalar    ", r); all_pass = all_pass and r.passed
+
+    r = h.compare(zeros_device([2, 3], F32, ctx), _lf(0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ctx)
+    print("zeros_device   ", r); all_pass = all_pass and r.passed
 
     # ── reshape [2,3,4] -> [6,4] ─────────────────────────────────────────────
     var rs_x = _lf(-0.44400045, -0.35549238, 0.70796031, -0.20895918, -0.14192675, -0.10702411, 0.28476900, 0.82271850, 0.54236728, -1.04629135, 0.36079362, -1.46044195, 0.34100166, -0.76957011, 0.93819880, 1.11094511, -0.25065991, 1.12459242, -0.71172577, 1.58043003, -0.74006981, -0.09377460, -0.79053849, 0.00337692)

@@ -80,7 +80,7 @@ from serenitymojo.scratch_ring import ScratchRingAllocator
 comptime TArc = ArcPointer[Tensor]
 
 # ── forward ops (GPU) ────────────────────────────────────────────────────────
-from serenitymojo.ops.linear import linear
+from serenitymojo.ops.linear import linear, linear_scratch
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
@@ -102,7 +102,9 @@ from serenitymojo.ops.norm_backward import (
     layer_norm_backward, layer_norm_backward_dx, LayerNormBackward,
 )
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
-from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
+from serenitymojo.ops.attention_backward import (
+    sdpa_backward, sdpa_backward_scratch, SdpaGrads,
+)
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 from serenitymojo.ops.rope_struct_backward import (
     gate_residual_backward, gate_residual_backward_dxdy, GateResidualGrads,
@@ -665,23 +667,22 @@ def single_block_lora_forward_device_resident_scratch[
     w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLoraDevice,
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor, norm_zeros: Tensor,
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
 ) raises -> SingleBlockDeviceForward:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var ones_t = _t(_ones(D), [D], ctx)
-    var zeros_t = _t(_zeros(D), [D], ctx)
 
-    var ln_t = layer_norm(x_t[], ones_t, zeros_t, eps, ctx)
+    var ln_t = layer_norm(x_t[], norm_ones, norm_zeros, eps, ctx)
     var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
 
+    var scratch_mark = scratch.mark()
     var no_bias = Optional[Tensor](None)
-    var fused = linear(norm_t, w.w1[], no_bias^, ctx)
+    var fused = linear_scratch(norm_t, w.w1[], no_bias^, ctx, scratch)
     if lora.qkv:
         var dlt = klein_lora_fwd_device_resident(norm_t, lora.qkv.value(), S, ctx)
         fused = klein_add_cols_device(fused, dlt, S, 3 * D + 2 * F, 3 * D, ctx)
 
-    var scratch_mark = scratch.mark()
     var qkv = slice_scratch(fused, 1, 0, 3 * D, ctx, scratch)
     var gate_up = slice_scratch(fused, 1, 3 * D, 2 * F, ctx, scratch)
 
@@ -707,8 +708,9 @@ def single_block_lora_forward_device_resident_scratch[
 
     var out_in = concat(1, ctx, att_flat, mlp)
 
+    var proj_mark = scratch.mark()
     var no_bias2 = Optional[Tensor](None)
-    var out_proj = linear(out_in, w.w2[], no_bias2^, ctx)
+    var out_proj = linear_scratch(out_in, w.w2[], no_bias2^, ctx, scratch)
     if lora.out:
         var dlt2 = klein_lora_fwd_device_resident(att_flat, lora.out.value(), S, ctx)
         out_proj = add(out_proj, dlt2, ctx)
@@ -716,6 +718,7 @@ def single_block_lora_forward_device_resident_scratch[
     var result = residual_gate(
         x_t[], mv.gate[], out_proj, ctx
     )
+    scratch.rewind(proj_mark)
 
     var saved = SingleBlockSaved(
         x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
@@ -793,23 +796,22 @@ def single_block_lora_recompute_saved_device_resident_scratch[
     w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLoraDevice,
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor, norm_zeros: Tensor,
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
 ) raises -> SingleBlockSaved:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var ones_t = _t(_ones(D), [D], ctx)
-    var zeros_t = _t(_zeros(D), [D], ctx)
 
-    var ln_t = layer_norm(x_t[], ones_t, zeros_t, eps, ctx)
+    var ln_t = layer_norm(x_t[], norm_ones, norm_zeros, eps, ctx)
     var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
 
+    var scratch_mark = scratch.mark()
     var no_bias = Optional[Tensor](None)
-    var fused = linear(norm_t, w.w1[], no_bias^, ctx)
+    var fused = linear_scratch(norm_t, w.w1[], no_bias^, ctx, scratch)
     if lora.qkv:
         var dlt = klein_lora_fwd_device_resident(norm_t, lora.qkv.value(), S, ctx)
         fused = klein_add_cols_device(fused, dlt, S, 3 * D + 2 * F, 3 * D, ctx)
 
-    var scratch_mark = scratch.mark()
     var qkv = slice_scratch(fused, 1, 0, 3 * D, ctx, scratch)
     var gate_up = slice_scratch(fused, 1, 3 * D, 2 * F, ctx, scratch)
 
@@ -989,13 +991,13 @@ def single_block_lora_backward_device_resident_scratch[
     saved: SingleBlockSaved,
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor,
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
 ) raises -> SingleBlockLoraDeviceGrads:
     var scratch_mark = scratch.mark()
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var ones_t = _t(_ones(D), [D], ctx)
 
     var grg: GateResidualGrads
     var d_gate = List[Float32]()
@@ -1033,8 +1035,8 @@ def single_block_lora_backward_device_resident_scratch[
     var sgb = swiglu_backward(d_mlp, saved.mlp_gate[], saved.mlp_up[], ctx)
     var d_gate_up = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
 
-    var sb = sdpa_backward[1, S, H, Dh](
-        saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx,
+    var sb = sdpa_backward_scratch[1, S, H, Dh](
+        saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx, scratch,
     )
 
     var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
@@ -1069,7 +1071,7 @@ def single_block_lora_backward_device_resident_scratch[
         d_scale = mb.d_scale.to_host(ctx)
         d_shift = mb.d_shift.to_host(ctx)
 
-    var d_x_norm_t = layer_norm_backward_dx(mb.d_x, saved.x[], ones_t, eps, ctx)
+    var d_x_norm_t = layer_norm_backward_dx(mb.d_x, saved.x[], norm_ones, eps, ctx)
 
     var d_x_t = add(grg.d_x, d_x_norm_t, ctx)
 

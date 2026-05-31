@@ -109,7 +109,9 @@ from serenitymojo.ops.norm_backward import (
     layer_norm_backward, layer_norm_backward_dx, LayerNormBackward,
 )
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
-from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
+from serenitymojo.ops.attention_backward import (
+    sdpa_backward, sdpa_backward_scratch, SdpaGrads,
+)
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 from serenitymojo.ops.rope_struct_backward import (
     gate_residual_backward, gate_residual_backward_dxdy, GateResidualGrads,
@@ -1124,17 +1126,16 @@ def double_block_lora_forward_device_resident_scratch[
     w: DoubleBlockWeights, img_mod: ModVecsDevice, txt_mod: ModVecsDevice, lora: DoubleBlockLoraDevice,
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor, norm_zeros: Tensor,
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
 ) raises -> DoubleBlockDeviceForward:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var ones_t = _t(_ones(D), [D], ctx)
-    var zeros_t = _t(_zeros(D), [D], ctx)
 
     var ip = _stream_pre_lora_resident[H, Dh](
-        img_x, w.img, img_mod, lora.img, N_IMG, D, eps, ones_t, zeros_t, ctx)
+        img_x, w.img, img_mod, lora.img, N_IMG, D, eps, norm_ones, norm_zeros, ctx)
     var tp = _stream_pre_lora_resident[H, Dh](
-        txt_x, w.txt, txt_mod, lora.txt, N_TXT, D, eps, ones_t, zeros_t, ctx)
+        txt_x, w.txt, txt_mod, lora.txt, N_TXT, D, eps, norm_ones, norm_zeros, ctx)
 
     var qk_mark = scratch.mark()
     var q = concat2_scratch(1, ctx, scratch, tp.q_rms[], ip.q_rms[])
@@ -1152,9 +1153,9 @@ def double_block_lora_forward_device_resident_scratch[
     var img_att = TArc(reshape_owned(img_att_4d^, [N_IMG, D]))
 
     var ipost = _stream_post_lora_resident(
-        img_x, img_att, w.img, img_mod, lora.img, N_IMG, D, F, eps, ones_t, zeros_t, ctx)
+        img_x, img_att, w.img, img_mod, lora.img, N_IMG, D, F, eps, norm_ones, norm_zeros, ctx)
     var tpost = _stream_post_lora_resident(
-        txt_x, txt_att, w.txt, txt_mod, lora.txt, N_TXT, D, F, eps, ones_t, zeros_t, ctx)
+        txt_x, txt_att, w.txt, txt_mod, lora.txt, N_TXT, D, F, eps, norm_ones, norm_zeros, ctx)
 
     var img_saved = _make_saved(img_x, ip, img_att, ipost)
     var txt_saved = _make_saved(txt_x, tp, txt_att, tpost)
@@ -1576,29 +1577,29 @@ def double_block_lora_backward_device_resident_scratch[
     saved: DoubleBlockSaved,
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor,
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
 ) raises -> DoubleBlockLoraDeviceGrads:
     var scratch_mark = scratch.mark()
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var ones_t = _t(_ones(D), [D], ctx)
 
     var ipb = _stream_post_backward_lora_resident_scratch(
         d_io_t, saved.img.x, saved.img.att, w.img, img_mod, lora.img, saved.img,
-        N_IMG, D, F, eps, ones_t, ctx, scratch, compute_aux_grads,
+        N_IMG, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
     )
     var tpb = _stream_post_backward_lora_resident_scratch(
         d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, lora.txt, saved.txt,
-        N_TXT, D, F, eps, ones_t, ctx, scratch, compute_aux_grads,
+        N_TXT, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
     )
 
     var d_tatt_4d = reshape(tpb.d_att[], [1, N_TXT, H, Dh], ctx)
     var d_iatt_4d = reshape(ipb.d_att[], [1, N_IMG, H, Dh], ctx)
     var d_att_joint = concat2_scratch(1, ctx, scratch, d_tatt_4d, d_iatt_4d)
 
-    var sb = sdpa_backward[1, S, H, Dh](
-        saved.q_rope[], saved.k_rope[], saved.v_joint[], d_att_joint, scale, ctx,
+    var sb = sdpa_backward_scratch[1, S, H, Dh](
+        saved.q_rope[], saved.k_rope[], saved.v_joint[], d_att_joint, scale, ctx, scratch,
     )
 
     var d_q_joint = rope_backward(sb.d_q, cos, sin, True, ctx)
@@ -1615,11 +1616,11 @@ def double_block_lora_backward_device_resident_scratch[
 
     var iprb = _stream_pre_backward_lora_resident_scratch[H, Dh](
         d_img_q, d_img_k, d_img_v, w.img, img_mod, lora.img, saved.img,
-        N_IMG, D, eps, ones_t, ctx, scratch, compute_aux_grads,
+        N_IMG, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
     )
     var tprb = _stream_pre_backward_lora_resident_scratch[H, Dh](
         d_txt_q, d_txt_k, d_txt_v, w.txt, txt_mod, lora.txt, saved.txt,
-        N_TXT, D, eps, ones_t, ctx, scratch, compute_aux_grads,
+        N_TXT, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
     )
 
     var d_img_x_t = TArc(add(ipb.d_x[], iprb.d_x[], ctx))

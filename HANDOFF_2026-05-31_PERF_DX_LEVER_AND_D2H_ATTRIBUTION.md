@@ -46,9 +46,11 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    chunks/RoPE, single-block backward copy cleanup, no-aux gate-residual
    y-recompute skipping, save-only single-block backward recompute, and
    `SGL_SAVE_TAIL = 9`, shared scratch ring hot-path wiring, F32 no-bias
-   `linear` returning the GEMM output directly, and scratch-backed frozen
-   `linear_backward_dx` outputs in proven block frames, are **~3.57-3.65
-   s/step**: `3.5673797`, `3.6506753`, loss `2.734082`, grad `0.17687473`.
+   `linear` returning the GEMM output directly, scratch-backed frozen
+   `linear_backward_dx` outputs in proven block frames, and the new two-slab
+   OneTrainer-style scratch SDPA work-buffer path, are **~3.57-3.65 s/step**:
+   `3.5673797`, `3.6506753`, `3.6517751`, `3.5703504`,
+   loss `2.734082`, grad `0.17687473`.
    Immediate pre-change baseline was `3.7449117`; previous scratch-only band
    was `3.7256575`, `3.7467637`, `3.7412038`; before that `3.950125`,
    `3.9545975`. This is real progress but **NOT the requested 2-3s target**.
@@ -58,9 +60,10 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
      fusion/view reduction inside the single-block recompute/backward path;
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
-   - extend scratch usage only at additional proven frame boundaries, especially
-     short-lived no-bias linear forward outputs in recompute; the allocator is
-     shared/opt-in for all models, but it is not a global Tensor allocator;
+   - scratch-backed linear forward, SDPA backward work buffers, cached norm
+     constants, and device-zero helpers are now available/shared but were
+     timing-neutral on the real 4B step; do not expect more allocator-only
+     rewiring to reach 2-3s without reducing kernels/copies;
    - longer term: BF16/mixed precision plus fused kernels. The current wall time is
      still dominated by op count and materialized tensor movement.
 
@@ -422,6 +425,47 @@ This is the first post-ring shared tensor-layer win: all F32 no-bias model
 linears avoid the redundant copy, while scratch dx remains opt-in at proven
 lifetimes.
 
+### 2026-05-31 continuation: OneTrainer-style reentrant scratch attention path
+
+User pointed at the local OneTrainer tree (`/home/alex/OneTrainer`) and asked
+for the "ring allocator" pattern to be usable by all models iff needed. The
+relevant OneTrainer pattern is persistent int8 cache tensors, typed
+slice/view reinterpretation, ordered forward/backward allocation, and explicit
+frame ownership for re-entrant checkpoint/backward replay. This continuation
+extends that shared pattern beyond Klein-specific concat/slice sites:
+
+- `ops/attention_backward.mojo`: added `sdpa_backward_scratch`, an opt-in sibling
+  of `sdpa_backward`. The returned `d_q/d_k/d_v` tensors are normal fresh
+  outputs; the large recompute/work buffers (`q/k/v/d_out` gathered BHSD,
+  `attn`, `grad_scores`, `d_v`, `d_q`, `d_k`) are allocated from the caller's
+  `ScratchRingAllocator` and rewound before return. Persistent gathered inputs
+  allocate from the tail while transient score buffers allocate from the head.
+- `training/train_klein_real.mojo`: the real trainer now creates two 512 MiB
+  scratch slabs (`512 MiB x 2`) so the real 512px SDPA backward work buffers can
+  fit without colliding with existing block-local scratch allocations.
+- `models/klein/single_block.mojo` and `models/klein/double_block.mojo`: scratch
+  backward wrappers call `sdpa_backward_scratch`; non-scratch APIs still call the
+  original `sdpa_backward`.
+- `ops/linear.mojo`: added `linear_scratch` for scratch-backed F32 no-bias
+  forward outputs at proven short-lived frame boundaries. It is shared/opt-in
+  and falls back to normal `linear` for bias or non-F32 paths.
+- `ops/tensor_algebra.mojo`: added `zeros_device(shape, dtype, ctx)` so zero
+  tensors can be created on device without staging a host `List[Float32]`.
+  The Klein backward path uses it for the text-side zero concat.
+
+| item | result |
+|------|--------|
+| scratch gate | `scratch_ring_smoke` PASS, including `scratch linear fwd` and `scratch sdpa d_q/d_k/d_v` |
+| algebra gate | `ops/algebra_smoke` PASS, including `zeros_device` |
+| real 4B timing after SDPA scratch + two slabs | `3.6517751`, final checked rerun `3.5703504`, loss `2.734082`, grad `0.17687473` |
+| rejected/neutral timing trials before SDPA scratch | scratch linear forward `3.605578`, `3.6199477`; cached norm constants `3.602489`, `3.600817`; `zeros_device` `3.6090999`; all same loss/grad |
+
+Conclusion: the OneTrainer-style allocator surface is now broader and safely
+re-entrant for attention backward work buffers, but this was timing-neutral
+relative to the current `~3.57-3.65s` band. The remaining step-time gap is not
+allocator churn alone; it needs fewer materialized tensor copies and fewer
+kernel launches in single-block backward.
+
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -496,6 +540,13 @@ ops/linear.mojo, ops/linalg_backward.mojo, scratch_ring_smoke.mojo,
 models/klein/single_block.mojo, models/klein/double_block.mojo,
 docs/MOJO_MODULES.md, docs/MOJO_KERNELS.md, this handoff.
 
+Files touched in the OneTrainer-style scratch attention / shared tensor helper
+continuation: ops/attention_backward.mojo, ops/linear.mojo,
+ops/tensor_algebra.mojo, ops/algebra_smoke.mojo, scratch_ring_smoke.mojo,
+models/klein/single_block.mojo, models/klein/double_block.mojo,
+models/klein/klein_stack_lora.mojo, training/train_klein_real.mojo,
+docs/MOJO_MODULES.md, docs/MOJO_KERNELS.md, this handoff.
+
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 
@@ -521,3 +572,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | `SGL_SAVE_TAIL = 9` | AGENT-DEFAULT | measured tail 9 improves the current save-only recompute path, while tail 10 and tail 12 cross the memory/speed knee and slow down |
 | Klein scratch hot-path wiring | USER/AGENT | user asked to finish the OneTrainer-style ring allocator; agent kept it shared/opt-in and wired only proven Klein frame lifetimes, measuring `~3.73-3.75s` with unchanged loss/grad |
 | F32 no-bias linear fast path + scratch dx | AGENT-DEFAULT | removed a redundant post-GEMM copy for all F32 no-bias `linear` calls and used scratch-backed frozen dx outputs only inside proven Klein scratch frames, measuring `~3.57-3.65s` with unchanged loss/grad |
+| Scratch SDPA work-buffer path + two-slab real trainer ring | USER/AGENT | user explicitly pointed at OneTrainer and requested re-entrant ring allocator plumbing usable by all models iff needed; implemented as shared opt-in `sdpa_backward_scratch`, proved with smoke/parity, measured timing-neutral `3.6517751s` and final checked rerun `3.5703504s` |

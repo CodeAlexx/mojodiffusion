@@ -37,6 +37,7 @@
 #   pixi run mojo run -I . serenitymojo/training/train_klein_real.mojo
 
 from std.collections import List
+from std.memory import ArcPointer
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 from std.time import perf_counter_ns
@@ -50,7 +51,8 @@ from serenitymojo.models.klein.single_block import SingleBlockWeights
 from serenitymojo.models.klein.klein_stack import KleinStackBase, KleinStackForward
 from serenitymojo.models.klein.klein_stack_lora import (
     KleinLoraSet, build_klein_lora_set,
-    klein_stack_lora_forward, klein_stack_lora_backward,
+    klein_stack_lora_forward, klein_stack_lora_forward_device_inputs,
+    klein_stack_lora_backward,
     klein_lora_adamw_step, save_klein_lora, load_klein_lora_resume,
 )
 from serenitymojo.models.klein.weights import (
@@ -61,12 +63,16 @@ from serenitymojo.models.klein.weights import (
 from serenitymojo.models.klein.double_block import ModVecs as ModVecsT
 from serenitymojo.models.klein.single_block import SingleModVecs as SingleModVecsT
 from serenitymojo.training.klein_dataset import KleinCache, KleinSample
-from serenitymojo.training.schedule import sample_timestep_logit_normal
+from serenitymojo.training.schedule import sample_timestep_logit_normal, flow_match_noise_target
 from serenitymojo.training.validation_sampler import (
     generate_validation, load_caps, pixel_l1,
 )
-from serenitymojo.ops.tensor_algebra import permute, reshape
+from serenitymojo.ops.cast import cast_tensor_if_needed
+from serenitymojo.ops.tensor_algebra import permute, reshape, reshape_owned
 from serenitymojo.io.ffi import sys_system
+
+
+comptime TArc = ArcPointer[Tensor]
 
 
 # ── paths / dims ─────────────────────────────────────────────────────────────
@@ -133,8 +139,17 @@ def _latent_to_img_tokens(latent: Tensor, ctx: DeviceContext) raises -> List[Flo
     var nhwc = permute(latent, p^, ctx)
     var sh = List[Int]()
     sh.append(1); sh.append(N_IMG); sh.append(IN_CH)
-    var packed = reshape(nhwc, sh^, ctx)
+    var packed = reshape_owned(nhwc^, sh^)
     return packed.to_host(ctx)
+
+
+def _latent_to_img_tokens_device(latent: Tensor, ctx: DeviceContext) raises -> Tensor:
+    var p = List[Int]()
+    p.append(0); p.append(2); p.append(3); p.append(1)
+    var nhwc = permute(latent, p^, ctx)
+    var sh = List[Int]()
+    sh.append(N_IMG); sh.append(IN_CH)
+    return reshape_owned(nhwc^, sh^)
 
 
 # Build the Klein rope tables as flat host Lists [S*H*(Dh//2)] — the layout the
@@ -322,26 +337,29 @@ def main() raises:
 
         # pick a sample (round-robin)
         var sample = cache.load((k - 1) % cache.count(), ctx)
-        var latent_tokens = _latent_to_img_tokens(sample.latent, ctx)
-        # text_embedding [1,512,12288] -> host [N_TXT, TXT_CH]
-        var txt_tokens = sample.text_embedding.to_host(ctx)
+        var latent_tokens_t = cast_tensor_if_needed(
+            _latent_to_img_tokens_device(sample.latent, ctx), STDtype.F32, ctx
+        )
+        # text_embedding [1,512,TXT_CH] -> device [N_TXT, TXT_CH]
+        var txt_sh = List[Int]()
+        txt_sh.append(N_TXT); txt_sh.append(TXT_CH)
+        var txt_tokens_t = cast_tensor_if_needed(
+            reshape(sample.text_embedding, txt_sh^, ctx), STDtype.F32, ctx
+        )
 
         var n_img_vals = N_IMG * IN_CH
 
         # sample sigma (logit-normal + qwen-shift)
         var sigma = sample_timestep_logit_normal(SEED_BASE + UInt64(k), TIMESTEP_SHIFT)
 
-        # flow-match in token space (host arithmetic — matches schedule.mojo math):
+        # flow-match in token space (GPU arithmetic — matches schedule.mojo math):
         #   x_t    = (1-sigma)*latent + sigma*noise
         #   target = noise - latent
         var noise = _host_noise(n_img_vals, SEED_BASE * UInt64(7919) + UInt64(k))
-        var x_t = List[Float32]()
-        var target = List[Float32]()
-        for i in range(n_img_vals):
-            var lat = latent_tokens[i]
-            var noi = noise[i]
-            x_t.append((Float32(1.0) - sigma) * lat + sigma * noi)
-            target.append(noi - lat)
+        var noise_t = Tensor.from_host(noise^, [N_IMG, IN_CH], STDtype.F32, ctx)
+        var fm = flow_match_noise_target(latent_tokens_t, sigma, noise_t, ctx)
+        var x_t_dev = TArc(fm.x_t.clone(ctx))
+        var target = fm.target.to_host(ctx)
 
         # per-step modulation vecs from this sigma
         var mods = _build_step_mods(st, sigma, ctx)
@@ -350,8 +368,8 @@ def main() raises:
         var single_mod = mods[2].copy()
 
         # forward -> velocity [N_IMG, OUT_CH]
-        var fwd = klein_stack_lora_forward[H, Dh, N_IMG, N_TXT, S](
-            x_t.copy(), txt_tokens.copy(), base,
+        var fwd = klein_stack_lora_forward_device_inputs[H, Dh, N_IMG, N_TXT, S](
+            x_t_dev, TArc(txt_tokens_t^), base,
             dbw, sbw, lora, img_mod, txt_mod, single_mod, cos.copy(), sin.copy(),
             D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
         )
@@ -368,10 +386,12 @@ def main() raises:
         var loss = Float32(sse / Float64(nout))
 
         # backward -> LoRA grads
+        var empty_img = List[Float32]()
+        var empty_txt = List[Float32]()
         var g = klein_stack_lora_backward[H, Dh, N_IMG, N_TXT, S](
-            d_loss, x_t.copy(), txt_tokens.copy(), base,
+            d_loss, empty_img^, empty_txt^, base,
             dbw, sbw, lora, img_mod, txt_mod, single_mod, cos.copy(), sin.copy(), fwd,
-            D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            D, F, IN_CH, TXT_CH, OUT_CH, EPS, ctx, False, False,
         )
 
         # grad_norm = L2 of ALL LoRA d_A/d_B
@@ -420,7 +440,6 @@ def main() raises:
             " grad=", Float32(grad_norm), " lr=", LR, " clip=", clip_scale,
             " secs=", Float32(secs),
         )
-
         # ── cadence ───────────────────────────────────────────────────────────
         if k == 10 and run_steps >= 10:
             var p10 = LORA_DIR + String("/alina_lora_step10.safetensors")

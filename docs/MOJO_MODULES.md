@@ -182,23 +182,26 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   qkv+gate_up channel split, linear2 join). + `single_block_lora_*` (qkv-rows on w1
   + cols on w2). **Status: PROVEN per source header** (gates `single_block_parity`
   + `single_block_lora_parity`, `slref_*` refs present). Same session caveat.
-- **`models/klein/klein_stack.mojo`** (507 L) — FULL Klein DiT stack: COMPOSES the
+- **`models/klein/klein_stack.mojo`** — FULL Klein DiT stack: COMPOSES the
   parity-verified double+single blocks into the complete model (input proj →
   modulation → N double → concat → N single → final layer), per-block recompute in
   backward (gradient checkpoint at block granularity, fits 8+24 blocks in 24 GB).
-  Mirrors `klein_dit.mojo` `forward_full`. **Status: SCAFFOLD/assembly** (gate
-  `parity/klein_stack_parity.mojo` + `klein_stack_real_smoke.mojo`, `ref_*` refs
-  present; composes proven units — verdict NOT yet in a lead-verified handoff).
-- **`models/klein/klein_stack_lora.mojo`** (556 L) — the stack WITH LoRA on every
-  trained projection: per-block LoRA variants for every block + collects all
-  ~80 adapters' d_A/d_B (8×4 double + 24×2 single) into one flat
-  `KleinLoraSet`, supports AdamW step + PEFT save. **Status: SCAFFOLD/assembly**
-  (gate `klein_stack_lora_parity.mojo` + `klein_stack_lora_real_smoke.mojo`,
-  `klin_*`/`lin_*`/`klref_*` refs present).
-- **`models/klein/lora_block.mojo`** (142 L) — LoRA-on-projection helpers shared by
-  the double/single LoRA variants; SAME math as `train_step.mojo` (`_lora_fwd/_bwd`,
-  reuses `LoraAdapter`/`LoraGrads`) plus the one term the trainer discards: the LoRA
-  branch's contribution to the projection-INPUT grad (d_x). **Status: SCAFFOLD**.
+  Mirrors `klein_dit.mojo` `forward_full`. The training structs now carry saved
+  activations with `ArcPointer[Tensor]` device carriers so inter-block handoff
+  avoids host-list traffic.
+- **`models/klein/klein_stack_lora.mojo`** — the stack WITH LoRA on every trained
+  projection: per-block LoRA variants for every block + collects adapter d_A/d_B
+  into one flat `KleinLoraSet`, supports AdamW step + PEFT save. The hot trainer
+  path uses device input tokens, resident block/modulation tensors, checkpoint-tail
+  single-block saves (`SGL_SAVE_TAIL = 8`), and can skip unused input-token/aux
+  modulation grads in the real LoRA optimizer path. Latest clean 4B timing:
+  `PROG ... secs=5.312408`, loss `2.734082`; still above the 2-3s target.
+- **`models/klein/lora_block.mojo`** — LoRA-on-projection helpers shared by the
+  double/single LoRA variants; SAME math as `train_step.mojo` plus the projection
+  input-grad contribution `d_x_lo`. The hot `*_device` helpers keep activation and
+  `d_x_lo` tensors on device and batch `d_A`/`d_B` readback into one sync. Caveat:
+  A/B adapter parameters remain host-list owned and are still uploaded per use;
+  device-resident adapter weights are the next per-step LoRA traffic target.
 - **`models/klein/weights.mojo`** (172 L) — G1 real-safetensors → training weight
   structs. Loads the 12-tensor-per-double-block + 4-per-single-block key layout
   (same keys the inference `klein_dit.mojo` reads) into the host `List[Float32]`

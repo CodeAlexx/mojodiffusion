@@ -247,7 +247,6 @@ def _run(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Te
             ctx.enqueue_function[_silu_bwd_f16, _silu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
         else:
             ctx.enqueue_function[_gelu_bwd_f16, _gelu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 

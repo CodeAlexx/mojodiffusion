@@ -30,7 +30,6 @@ from serenitymojo.training.dit_block import (
     dit_block_forward,
     dit_block_backward,
 )
-from serenitymojo.training.optim import adamw_step
 from serenitymojo.training.schedule import (
     flow_match_noise_target,
     sample_timestep_logit_normal,
@@ -222,7 +221,44 @@ def _lora_bwd(
     return LoraGrads(d_a^, d_b^)
 
 
-# AdamW one step on a LoRA adapter (A and B) via the proven device adamw_step.
+# AdamW one step on a host-resident LoRA list. LoRA adapters and moments are
+# stored as List[Float32] in the Klein trainer; doing this update on host avoids
+# per-adapter GPU upload/readback churn while matching optim.adamw_step's formula.
+def _adamw_host_list(
+    mut p: List[Float32], g: List[Float32],
+    mut m: List[Float32], mut v: List[Float32],
+    t: Int, lr: Float32, beta1: Float32, beta2: Float32,
+    eps: Float32, weight_decay: Float32,
+) raises:
+    var n = len(p)
+    if len(g) != n or len(m) != n or len(v) != n:
+        raise Error("_adamw_host_list: param/grad/m/v len mismatch")
+    if t < 1:
+        raise Error("_adamw_host_list: t must be >= 1")
+
+    var b1p = Float32(1.0)
+    var b2p = Float32(1.0)
+    for _ in range(t):
+        b1p *= beta1
+        b2p *= beta2
+    var bc1 = Float32(1.0) - b1p
+    var bc2 = Float32(1.0) - b2p
+
+    for i in range(n):
+        var gv = g[i]
+        var mi = beta1 * m[i] + (Float32(1.0) - beta1) * gv
+        var vi = beta2 * v[i] + (Float32(1.0) - beta2) * gv * gv
+        m[i] = mi
+        v[i] = vi
+        var m_hat = mi / bc1
+        var v_hat = vi / bc2
+        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
+        if weight_decay > 0.0:
+            pv = pv - lr * weight_decay * pv
+        p[i] = pv
+
+
+# AdamW one step on a LoRA adapter (A and B).
 def _lora_adamw(
     mut lo: LoraAdapter, g: LoraGrads, t: Int, lr: Float32, ctx: DeviceContext
 ) raises:
@@ -230,22 +266,8 @@ def _lora_adamw(
     var b2 = Float32(0.999)
     var aeps = Float32(1.0e-8)
     var wd = Float32(0.01)   # OneTrainer AdamW weight_decay=0.01
-    var pa = Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx)
-    var ga = Tensor.from_host(g.d_a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx)
-    var maa = Tensor.from_host(lo.ma.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx)
-    var vaa = Tensor.from_host(lo.va.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx)
-    adamw_step(pa, ga, maa, vaa, t, lr, b1, b2, aeps, wd, ctx)
-    lo.a = pa.to_host(ctx)
-    lo.ma = maa.to_host(ctx)
-    lo.va = vaa.to_host(ctx)
-    var pb = Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx)
-    var gb = Tensor.from_host(g.d_b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx)
-    var mbb = Tensor.from_host(lo.mb.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx)
-    var vbb = Tensor.from_host(lo.vb.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx)
-    adamw_step(pb, gb, mbb, vbb, t, lr, b1, b2, aeps, wd, ctx)
-    lo.b = pb.to_host(ctx)
-    lo.mb = mbb.to_host(ctx)
-    lo.vb = vbb.to_host(ctx)
+    _adamw_host_list(lo.a, g.d_a, lo.ma, lo.va, t, lr, b1, b2, aeps, wd)
+    _adamw_host_list(lo.b, g.d_b, lo.mb, lo.vb, t, lr, b1, b2, aeps, wd)
 
 
 # ── ONE training step (single-stream block + ONE trained LoRA adapter) ───────

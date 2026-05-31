@@ -201,12 +201,55 @@ def rms_norm_backward(
     ctx.enqueue_function[_rms_bwd_dg_kernel, _rms_bwd_dg_kernel](
         GO, X, DG, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK
     )
-    ctx.synchronize()
-
     return RmsNormBackward(
         Tensor(dx_buf^, xshape.copy(), STDtype.F32),
         Tensor(dg_buf^, weight.shape().copy(), STDtype.F32),
     )
+
+
+def rms_norm_backward_dx(
+    go: Tensor, x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """Backward of rms_norm when only d_x is needed.
+
+    Frozen-weight training paths should use this instead of `rms_norm_backward`
+    because the full d_g kernel recomputes row stats once per column.
+    """
+    if x.dtype() != STDtype.F32 or go.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
+        var out_dt = x.dtype()
+        var go32 = cast_tensor(go, STDtype.F32, ctx)
+        var x32 = cast_tensor(x, STDtype.F32, ctx)
+        var w32 = cast_tensor(weight, STDtype.F32, ctx)
+        var dx32 = rms_norm_backward_dx(go32, x32, w32, eps, ctx)
+        var dx_dn = cast_tensor(dx32^, out_dt, ctx)
+        return dx_dn^
+    var xshape = x.shape()
+    var d = xshape[len(xshape) - 1]
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+
+    var dx_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
+
+    var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        go.buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+    var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        weight.buf.unsafe_ptr().bitcast[Float32](), g_rl
+    )
+    var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+
+    ctx.enqueue_function[_rms_bwd_dx_kernel, _rms_bwd_dx_kernel](
+        GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB
+    )
+    return Tensor(dx_buf^, xshape.copy(), STDtype.F32)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -410,13 +453,55 @@ def layer_norm_backward(
     ctx.enqueue_function[_ln_bwd_param_kernel, _ln_bwd_param_kernel](
         GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK
     )
-    ctx.synchronize()
-
     return LayerNormBackward(
         Tensor(dx_buf^, xshape.copy(), STDtype.F32),
         Tensor(dg_buf^, weight.shape().copy(), STDtype.F32),
         Tensor(db_buf^, weight.shape().copy(), STDtype.F32),
     )
+
+
+def layer_norm_backward_dx(
+    go: Tensor, x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """Backward of layer_norm when only d_x is needed.
+
+    This skips d_g/d_b parameter reductions. Use it for frozen LayerNorm weights.
+    """
+    if x.dtype() != STDtype.F32 or go.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
+        var out_dt = x.dtype()
+        var go32 = cast_tensor(go, STDtype.F32, ctx)
+        var x32 = cast_tensor(x, STDtype.F32, ctx)
+        var w32 = cast_tensor(weight, STDtype.F32, ctx)
+        var dx32 = layer_norm_backward_dx(go32, x32, w32, eps, ctx)
+        var dx_dn = cast_tensor(dx32^, out_dt, ctx)
+        return dx_dn^
+    var xshape = x.shape()
+    var d = xshape[len(xshape) - 1]
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+
+    var dx_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
+
+    var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        go.buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+    var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        weight.buf.unsafe_ptr().bitcast[Float32](), g_rl
+    )
+    var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+
+    ctx.enqueue_function[_ln_bwd_dx_kernel, _ln_bwd_dx_kernel](
+        GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB
+    )
+    return Tensor(dx_buf^, xshape.copy(), STDtype.F32)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -682,8 +767,6 @@ def group_norm_backward(
         GO, X, DG, DB, n, hw, c, num_groups, eps,
         grid_dim=c_grid, block_dim=_BLOCK,
     )
-    ctx.synchronize()
-
     return GroupNormBackward(
         Tensor(dx_buf^, xshape.copy(), STDtype.F32),
         Tensor(dg_buf^, weight.shape().copy(), STDtype.F32),

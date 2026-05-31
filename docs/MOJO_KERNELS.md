@@ -365,26 +365,29 @@ backward is **no longer a blocker** for a real Z-Image training run.
 
 ---
 
-## 11b. Per-block LoRA backward — composition, NOT a new kernel  (THIS SESSION)
+## 11b. Per-block LoRA backward — composition, device activation path
 
-`models/klein/lora_block.mojo::klein_lora_bwd` (`:81`) is the per-projection
-LoRA backward used by every Klein block LoRA variant. It is **not a new
-kernel** — it hand-chains the *existing* `linear_backward`
-(`linalg_backward.mojo:249`) twice:
+`models/klein/lora_block.mojo::klein_lora_bwd_device` is the hot per-projection
+LoRA backward used by the Klein block LoRA variants. It is **not a new kernel**:
+it composes existing device ops (`linear`, `mul_scalar`, `linear_backward_dx`,
+`linear_backward_dw`) and keeps the projection-input gradient `d_x_lo` on device.
 
 ```
 d_dy   = scale · d_y'
-d_B,d_t = linear_backward(d_dy, t, B)        (t = x@Aᵀ, recomputed)   → d_w, d_x
-d_A,d_x_lo = linear_backward(d_t, x, A)                               → d_w, d_x
+d_t    = linear_backward_dx(d_dy, B)
+d_B    = linear_backward_dw(d_dy, t)       (t = x@Aᵀ, recomputed)
+d_x_lo = linear_backward_dx(d_t, A)
+d_A    = linear_backward_dw(d_t, x)
 ```
 
-returning `KleinLoraGrads{d_a, d_b, d_x}` (`:68`). The only delta over the
-trainer's `train_step._lora_bwd` (the math authority it reuses, `:39-40`) is
-that it **also** returns the LoRA branch's contribution to the projection input
-grad `d_x_lo`, which the caller sums into the base path's `d_x`. So the LoRA
-backward surface adds **zero kernels** — it is pure composition of the linalg
-arm. (cos numbers for the composed LoRA grads are in
-`MOJO_AUTOGRAD_INTERNALS.md` §8, MEASURED-this-session.)
+Only LoRA `d_A`/`d_B` read back to host because the current optimizer state is
+still host-list based; those two D2H copies are batched behind one sync. A/B
+parameters are still host-owned and uploaded at each use, so device-resident
+adapter weights are the next LoRA traffic lever.
+
+The legacy host-list `klein_lora_bwd` remains for compatibility/parity helpers.
+The hot stack path uses the device sibling through `single_block_lora_backward_device`
+and `double_block_lora_backward_device`.
 
 ---
 

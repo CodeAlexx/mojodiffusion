@@ -184,7 +184,6 @@ def rope_backward(
         ctx.enqueue_function[
             _rope_bwd_halfsplit_kernel_f32, _rope_bwd_halfsplit_kernel_f32
         ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     return Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())
 
 
@@ -265,8 +264,6 @@ def qkv_split_permute_backward(
         GK, DST, rows, hd, hd, grid_dim=grid, block_dim=_BLOCK)
     ctx.enqueue_function[_qkv_scatter_kernel_f32, _qkv_scatter_kernel_f32](
         GV, DST, rows, hd, 2 * hd, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
-
     # Fused output shape: replace [..., H, Dh] with [..., 3*H*Dh].
     var out_shape = List[Int]()
     for i in range(len(qshape) - 2):
@@ -350,6 +347,7 @@ def gate_residual_backward(
     g: Tensor,
     y: Tensor,
     ctx: DeviceContext,
+    compute_gate_grad: Bool = True,
 ) raises -> GateResidualGrads:
     """Backward of GateResidual (forward: o = x + g*y, g per-channel [C]).
       d_x = grad_out
@@ -378,7 +376,10 @@ def gate_residual_backward(
 
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     var dy_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
-    var dg_buf = ctx.enqueue_create_buffer[DType.uint8](cols * 4)
+    var dg_nbytes = cols * 4
+    if not compute_gate_grad:
+        dg_nbytes = 0
+    var dg_buf = ctx.enqueue_create_buffer[DType.uint8](dg_nbytes)
 
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
     var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
@@ -391,28 +392,29 @@ def gate_residual_backward(
     var GATE = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         g.buf.unsafe_ptr().bitcast[Float32](), v_rl
     )
-    var Y = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        y.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
     var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
     )
     var DY = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         dy_buf.unsafe_ptr().bitcast[Float32](), x_rl
     )
-    var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dg_buf.unsafe_ptr().bitcast[Float32](), v_rl
-    )
 
     ctx.enqueue_function[_gate_dxdy_kernel_f32, _gate_dxdy_kernel_f32](
         G, GATE, DX, DY, rows, cols, grid_dim=grid, block_dim=_BLOCK)
-    ctx.enqueue_function[_gate_dg_kernel_f32, _gate_dg_kernel_f32](
-        G, Y, DG, rows, cols, grid_dim=cols, block_dim=_TPB)
-    ctx.synchronize()
-
+    var dg_shape = List[Int]()
+    if compute_gate_grad:
+        var Y = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            y.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float32](), v_rl
+        )
+        ctx.enqueue_function[_gate_dg_kernel_f32, _gate_dg_kernel_f32](
+            G, Y, DG, rows, cols, grid_dim=cols, block_dim=_TPB)
+        dg_shape.append(cols)
+    else:
+        dg_shape.append(0)
     var dx_t = Tensor(dx_buf^, grad_out.shape(), STDtype.F32)
     var dy_t = Tensor(dy_buf^, grad_out.shape(), STDtype.F32)
-    var dg_shape = List[Int]()
-    dg_shape.append(cols)
     var dg_t = Tensor(dg_buf^, dg_shape^, STDtype.F32)
     return GateResidualGrads(dx_t^, dg_t^, dy_t^)

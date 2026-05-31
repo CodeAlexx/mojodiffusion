@@ -208,23 +208,26 @@ struct KleinStackBase(Copyable, Movable):
 # input to regenerate `saved`, then runs the verified per-block backward.
 struct KleinStackForward(Copyable, Movable):
     var out: List[Float32]          # [N_IMG, out_ch]
-    var img_in_act: List[Float32]   # [N_IMG, D]   img = linear(img_tokens, img_in)
-    var txt_in_act: List[Float32]   # [N_TXT, D]   txt = linear(txt_tokens, txt_in)
+    var img_in_act: TArc            # [N_IMG, D]   img = linear(img_tokens, img_in)
+    var txt_in_act: TArc            # [N_TXT, D]   txt = linear(txt_tokens, txt_in)
     # per-double-block inputs (img,txt) — checkpoint inputs, one [.,D] pair each.
-    var dbl_img_in: List[List[Float32]]   # num_double x [N_IMG,D]
-    var dbl_txt_in: List[List[Float32]]   # num_double x [N_TXT,D]
+    var dbl_img_in: List[TArc]      # num_double x [N_IMG,D]
+    var dbl_txt_in: List[TArc]      # num_double x [N_TXT,D]
     # per-single-block input x [S,D] — checkpoint inputs.
-    var sgl_x_in: List[List[Float32]]     # num_single x [S,D]
-    var img_out: List[Float32]      # [N_IMG, D]   slice before final layer
-    var ln_img_out: List[Float32]   # [N_IMG, D]   layer_norm(img_out)
+    var sgl_x_in: List[TArc]        # num_single x [S,D]
+    var dbl_saved: List[DoubleBlockSaved]
+    var sgl_saved: List[SingleBlockSaved]
+    var img_out: TArc               # [N_IMG, D]   slice before final layer
+    var ln_img_out: TArc            # [N_IMG, D]   layer_norm(img_out)
 
     def __init__(
         out self,
         var out: List[Float32],
-        var img_in_act: List[Float32], var txt_in_act: List[Float32],
-        var dbl_img_in: List[List[Float32]], var dbl_txt_in: List[List[Float32]],
-        var sgl_x_in: List[List[Float32]],
-        var img_out: List[Float32], var ln_img_out: List[Float32],
+        var img_in_act: TArc, var txt_in_act: TArc,
+        var dbl_img_in: List[TArc], var dbl_txt_in: List[TArc],
+        var sgl_x_in: List[TArc],
+        var dbl_saved: List[DoubleBlockSaved], var sgl_saved: List[SingleBlockSaved],
+        var img_out: TArc, var ln_img_out: TArc,
     ):
         self.out = out^
         self.img_in_act = img_in_act^
@@ -232,6 +235,8 @@ struct KleinStackForward(Copyable, Movable):
         self.dbl_img_in = dbl_img_in^
         self.dbl_txt_in = dbl_txt_in^
         self.sgl_x_in = sgl_x_in^
+        self.dbl_saved = dbl_saved^
+        self.sgl_saved = sgl_saved^
         self.img_out = img_out^
         self.ln_img_out = ln_img_out^
 
@@ -310,19 +315,21 @@ def klein_stack_forward[
     # input projections
     var img = _linear_fwd_wdev(img_tokens, base.img_in[], N_IMG, in_ch, ctx)   # [N_IMG,D]
     var txt = _linear_fwd_wdev(txt_tokens, base.txt_in[], N_TXT, txt_ch, ctx)  # [N_TXT,D]
-    var img_in_act = img.copy()
-    var txt_in_act = txt.copy()
+    var img_in_act = TArc(_t(img.copy(), [N_IMG, D], ctx))
+    var txt_in_act = TArc(_t(txt.copy(), [N_TXT, D], ctx))
 
     # ── double-stream stack ──
-    var dbl_img_in = List[List[Float32]]()
-    var dbl_txt_in = List[List[Float32]]()
+    var dbl_img_in = List[TArc]()
+    var dbl_txt_in = List[TArc]()
+    var dbl_saved = List[DoubleBlockSaved]()
     for bi in range(num_double):
-        dbl_img_in.append(img.copy())
-        dbl_txt_in.append(txt.copy())
+        dbl_img_in.append(TArc(_t(img.copy(), [N_IMG, D], ctx)))
+        dbl_txt_in.append(TArc(_t(txt.copy(), [N_TXT, D], ctx)))
         var fwd = double_block_forward[H, Dh, N_IMG, N_TXT, S](
             img.copy(), txt.copy(), dbw[bi], img_mod, txt_mod,
             cos_t, sin_t, D, F, eps, ctx,
         )
+        dbl_saved.append(fwd.saved.copy())
         # next iteration's img/txt are the block's two stream outputs (the block
         # already returns them separated — forward_full re-slices the concat; we
         # take them directly, which is byte-identical).
@@ -333,12 +340,14 @@ def klein_stack_forward[
     var x = _concat_seq(txt, img)
 
     # ── single-stream stack ──
-    var sgl_x_in = List[List[Float32]]()
+    var sgl_x_in = List[TArc]()
+    var sgl_saved = List[SingleBlockSaved]()
     for bi in range(num_single):
-        sgl_x_in.append(x.copy())
+        sgl_x_in.append(TArc(_t(x.copy(), [S, D], ctx)))
         var fwd = single_block_forward[H, Dh, S](
             x.copy(), sbw[bi], single_mod, cos_t, sin_t, D, F, eps, ctx,
         )
+        sgl_saved.append(fwd.saved.copy())
         x = fwd.out.copy()
 
     # img_out = slice(x, 1, N_TXT, N_IMG) -> [N_IMG,D]
@@ -359,7 +368,8 @@ def klein_stack_forward[
     return KleinStackForward(
         out^, img_in_act^, txt_in_act^,
         dbl_img_in^, dbl_txt_in^, sgl_x_in^,
-        img_out^, ln_img_out^,
+        dbl_saved^, sgl_saved^,
+        TArc(_t(img_out^, [N_IMG, D], ctx)), TArc(_t(ln_img_out^, [N_IMG, D], ctx)),
     )
 
 
@@ -388,7 +398,7 @@ def klein_stack_backward[
     # ── final layer backward ──
     # out = linear(normed, Wf):  d_normed, d_final_lin
     var normed = modulate(
-        _t(saved.ln_img_out, [N_IMG, D], ctx),
+        saved.ln_img_out[],
         base.final_scale[], base.final_shift[], ctx,
     ).to_host(ctx)
     var lbf = linear_backward(
@@ -401,7 +411,7 @@ def klein_stack_backward[
 
     # normed = modulate(ln_img_out, final_scale, final_shift)
     var mbf = modulate_backward(
-        _t(d_normed, [N_IMG, D], ctx), _t(saved.ln_img_out, [N_IMG, D], ctx),
+        _t(d_normed, [N_IMG, D], ctx), saved.ln_img_out[],
         base.final_scale[], ctx,
     )
     var d_ln_img_out = mbf.d_x.to_host(ctx)
@@ -410,7 +420,7 @@ def klein_stack_backward[
 
     # ln_img_out = layer_norm(img_out, 1, 0)
     var lnbf = layer_norm_backward(
-        _t(d_ln_img_out, [N_IMG, D], ctx), _t(saved.img_out, [N_IMG, D], ctx),
+        _t(d_ln_img_out, [N_IMG, D], ctx), saved.img_out[],
         _t(_ones(D), [D], ctx), eps, ctx,
     )
     var d_img_out = lnbf.d_x.to_host(ctx)   # [N_IMG,D]
@@ -424,13 +434,8 @@ def klein_stack_backward[
     var d_single_mod = _zeros(3 * D)
     var bi = num_single - 1
     while bi >= 0:
-        # recompute this block's saved acts from its retained input
-        var fwd = single_block_forward[H, Dh, S](
-            saved.sgl_x_in[bi].copy(), sbw[bi], single_mod,
-            cos_t, sin_t, D, F, eps, ctx,
-        )
         var bg = single_block_backward[H, Dh, S](
-            d_x.copy(), sbw[bi], single_mod, fwd.saved, cos_t, sin_t,
+            d_x.copy(), sbw[bi], single_mod, saved.sgl_saved[bi], cos_t, sin_t,
             D, F, eps, ctx,
         )
         d_x = bg.d_x.copy()                       # INTER-BLOCK HANDOFF: d_x -> d_y
@@ -462,12 +467,8 @@ def klein_stack_backward[
     var d_io = d_img_out2.copy()
     var d_to = d_txt_out.copy()
     while di >= 0:
-        var fwd = double_block_forward[H, Dh, N_IMG, N_TXT, S](
-            saved.dbl_img_in[di].copy(), saved.dbl_txt_in[di].copy(),
-            dbw[di], img_mod, txt_mod, cos_t, sin_t, D, F, eps, ctx,
-        )
         var bg = double_block_backward[H, Dh, N_IMG, N_TXT, S](
-            d_io.copy(), d_to.copy(), dbw[di], img_mod, txt_mod, fwd.saved,
+            d_io.copy(), d_to.copy(), dbw[di], img_mod, txt_mod, saved.dbl_saved[di],
             cos_t, sin_t, D, F, eps, ctx,
         )
         # the block's stream input grads ARE the previous (deeper) block's

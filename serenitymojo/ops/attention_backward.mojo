@@ -478,5 +478,4 @@ def sdpa_backward[
     var dk_t = _scatter_to_tensor(dk_full, B, S, H, Dh, out_dt, src_rl, ctx)
     var dv_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr, bhsd_rl)
     var dv_t = _scatter_to_tensor(dv_full, B, S, H, Dh, out_dt, src_rl, ctx)
-    ctx.synchronize()
     return SdpaGrads(dq_t^, dk_t^, dv_t^)

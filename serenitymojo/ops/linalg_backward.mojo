@@ -188,7 +188,6 @@ def mm_backward(
     matmul(ctx, da, gc, bv, transpose_b=True, c_row_major=True)
     # d_b[K,N] = A[M,K]ᵀ @ grad_c[M,N]  (transpose_a)
     matmul(ctx, db, av, gc, transpose_a=True, c_row_major=True)
-    ctx.synchronize()
     return MatmulGrads(d_a^, d_b^)
 
 
@@ -239,7 +238,6 @@ def bmm_backward(
         matmul(ctx, DA, GC, B, transpose_b=True, c_row_major=True)
         # d_b[K,N] = A[M,K]ᵀ @ grad_c[M,N]
         matmul(ctx, DB, A, GC, transpose_a=True, c_row_major=True)
-    ctx.synchronize()
     return MatmulGrads(d_a^, d_b^)
 
 
@@ -284,7 +282,6 @@ def linear_backward(
     # d_W[out,in] = grad_y[M,out]ᵀ @ x[M,in]  (transpose_a)
     matmul(ctx, dw, gy, xv, transpose_a=True, c_row_major=True)
     var d_b = _colsum(grad_y, M, out_features, ctx)
-    ctx.synchronize()
     return LinearGrads(d_x^, d_w^, d_b^)
 
 
@@ -323,8 +320,39 @@ def linear_backward_dx(
 
     # d_x[M,in] = grad_y[M,out] @ W[out,in]   (contraction over out → no transpose)
     matmul(ctx, dx, gy, wv, c_row_major=True)
-    ctx.synchronize()
     return d_x^
+
+
+# ── linear backward, d_W ONLY (LoRA trainable-weight path) ───────────────────
+#   d_W[out,in] = grad_y[M,out]ᵀ @ x[M,in]. This sibling is useful for LoRA
+#   adapters where d_A/d_B are needed but the bias gradient is not.
+def linear_backward_dw(
+    grad_y: Tensor,
+    x: Tensor,
+    M: Int,
+    in_features: Int,
+    out_features: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    # BF16/F16 storage path mirrors linear_backward: compute in F32, cast down.
+    if grad_y.dtype() != STDtype.F32 or x.dtype() != STDtype.F32:
+        var out_dt = x.dtype()
+        var gy32 = cast_tensor(grad_y, STDtype.F32, ctx)
+        var x32 = cast_tensor(x, STDtype.F32, ctx)
+        var dw32 = linear_backward_dw(gy32, x32, M, in_features, out_features, ctx)
+        return cast_tensor(dw32^, out_dt, ctx)
+    var d_w = _new_f32(out_features, in_features, ctx)
+
+    var mo_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, out_features))
+    var mi_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, in_features))
+    var oi_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_features, in_features))
+    var gy = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](grad_y.buf.unsafe_ptr().bitcast[Float32](), mo_rl)
+    var xv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), mi_rl)
+    var dw = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](d_w.buf.unsafe_ptr().bitcast[Float32](), oi_rl)
+
+    # d_W[out,in] = grad_y[M,out]ᵀ @ x[M,in]  (transpose_a)
+    matmul(ctx, dw, gy, xv, transpose_a=True, c_row_major=True)
+    return d_w^
 
 
 # ── addbias backward ─────────────────────────────────────────────────────────
@@ -351,5 +379,4 @@ def addbias_backward(
     ctx.enqueue_function[_copy_kernel, _copy_kernel](
         src, dst, n, grid_dim=grid, block_dim=_BLOCK
     )
-    ctx.synchronize()
     return AddBiasGrads(d_x^, d_b^)

@@ -487,6 +487,22 @@ def reshape(x: Tensor, var new_shape: List[Int], ctx: DeviceContext) raises -> T
     return Tensor(dev^, new_shape^, x.dtype())
 
 
+def reshape_owned(var x: Tensor, var new_shape: List[Int]) raises -> Tensor:
+    """Metadata-only reshape for callers that no longer need the source Tensor."""
+    var n = 1
+    for i in range(len(new_shape)):
+        n *= new_shape[i]
+    if n != x.numel():
+        raise Error(
+            String("reshape_owned: numel mismatch ")
+            + String(n)
+            + " != "
+            + String(x.numel())
+        )
+    x._shape = new_shape^
+    return x^
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # permute — general axis permutation, materialized contiguous. One thread per
 # OUTPUT element: recover the output multi-index, map each output axis k back to

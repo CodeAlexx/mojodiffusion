@@ -85,7 +85,8 @@ struct ModulateBackward(Movable):
 
 
 def modulate_backward(
-    go: Tensor, x: Tensor, scale: Tensor, ctx: DeviceContext
+    go: Tensor, x: Tensor, scale: Tensor, ctx: DeviceContext,
+    compute_param_grads: Bool = True,
 ) raises -> ModulateBackward:
     """Backward of modulate (forward: o=(1+scale)*x+shift, scale/shift [D]).
     go/x [..,D]; scale [D]. Returns d_x (x's shape), d_scale [D], d_shift [D].
@@ -96,7 +97,7 @@ def modulate_backward(
         var go32 = cast_tensor(go, STDtype.F32, ctx)
         var x32 = cast_tensor(x, STDtype.F32, ctx)
         var s32 = cast_tensor(scale, STDtype.F32, ctx)
-        var g32 = modulate_backward(go32, x32, s32, ctx)
+        var g32 = modulate_backward(go32, x32, s32, ctx, compute_param_grads)
         var dx_dn = cast_tensor(g32.d_x^, out_dt, ctx)
         var ds_dn = cast_tensor(g32.d_scale^, out_dt, ctx)
         var dsh_dn = cast_tensor(g32.d_shift^, out_dt, ctx)
@@ -108,8 +109,11 @@ def modulate_backward(
         rows *= xshape[i]
 
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-    var ds_buf = ctx.enqueue_create_buffer[DType.uint8](scale.nbytes())
-    var dsh_buf = ctx.enqueue_create_buffer[DType.uint8](scale.nbytes())
+    var param_nbytes = scale.nbytes()
+    if not compute_param_grads:
+        param_nbytes = 0
+    var ds_buf = ctx.enqueue_create_buffer[DType.uint8](param_nbytes)
+    var dsh_buf = ctx.enqueue_create_buffer[DType.uint8](param_nbytes)
 
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
@@ -126,26 +130,29 @@ def modulate_backward(
     var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
     )
-    var DS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        ds_buf.unsafe_ptr().bitcast[Float32](), v_rl
-    )
-    var DSH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dsh_buf.unsafe_ptr().bitcast[Float32](), v_rl
-    )
 
     var total = rows * d
     var dx_grid = (total + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_modulate_bwd_dx_kernel, _modulate_bwd_dx_kernel](
         GO, S, DX, rows, d, grid_dim=dx_grid, block_dim=_BLOCK
     )
-    var p_grid = (d + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_modulate_bwd_param_kernel, _modulate_bwd_param_kernel](
-        GO, X, DS, DSH, rows, d, grid_dim=p_grid, block_dim=_BLOCK
-    )
-    ctx.synchronize()
-
+    var param_shape = List[Int]()
+    if compute_param_grads:
+        var DS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            ds_buf.unsafe_ptr().bitcast[Float32](), v_rl
+        )
+        var DSH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dsh_buf.unsafe_ptr().bitcast[Float32](), v_rl
+        )
+        var p_grid = (d + _BLOCK - 1) // _BLOCK
+        ctx.enqueue_function[_modulate_bwd_param_kernel, _modulate_bwd_param_kernel](
+            GO, X, DS, DSH, rows, d, grid_dim=p_grid, block_dim=_BLOCK
+        )
+        param_shape = scale.shape()
+    else:
+        param_shape.append(0)
     return ModulateBackward(
         Tensor(dx_buf^, xshape.copy(), STDtype.F32),
-        Tensor(ds_buf^, scale.shape().copy(), STDtype.F32),
-        Tensor(dsh_buf^, scale.shape().copy(), STDtype.F32),
+        Tensor(ds_buf^, param_shape.copy(), STDtype.F32),
+        Tensor(dsh_buf^, param_shape^, STDtype.F32),
     )

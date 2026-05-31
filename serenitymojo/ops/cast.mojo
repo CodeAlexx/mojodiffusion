@@ -164,3 +164,10 @@ def cast_tensor(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
         raise Error("cast_tensor: unsupported dtype pair")
     ctx.synchronize()
     return Tensor(out_buf^, x.shape(), dtype)
+
+
+def cast_tensor_if_needed(var x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
+    """Move `x` through unchanged when it already has `dtype`; otherwise cast."""
+    if x.dtype() == dtype:
+        return x^
+    return cast_tensor(x^, dtype, ctx)

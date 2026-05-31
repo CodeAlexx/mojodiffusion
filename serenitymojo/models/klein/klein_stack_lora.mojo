@@ -44,18 +44,25 @@
 
 from std.gpu.host import DeviceContext
 from std.collections import List, Optional
+from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.linear import linear
+from serenitymojo.ops.tensor_algebra import concat, slice
 
 from serenitymojo.models.klein.double_block import (
-    DoubleBlockWeights, ModVecs, DoubleBlockGrads,
+    DoubleBlockWeights, ModVecs, ModVecsDevice, modvecs_to_device,
+    DoubleBlockSaved, DoubleBlockGrads,
     StreamLora, DoubleBlockLora, DoubleBlockLoraGrads,
     double_block_lora_forward, double_block_lora_backward,
+    double_block_lora_forward_device, double_block_lora_backward_device,
 )
 from serenitymojo.models.klein.single_block import (
-    SingleBlockWeights, SingleModVecs, SingleBlockGrads,
+    SingleBlockWeights, SingleModVecs, SingleModVecsDevice, single_modvecs_to_device,
+    SingleBlockSaved, SingleBlockGrads,
     SingleBlockLora, SingleBlockLoraGrads,
     single_block_lora_forward, single_block_lora_backward,
+    single_block_lora_forward_device, single_block_lora_backward_device,
 )
 from serenitymojo.models.klein.klein_stack import (
     KleinStackBase, KleinStackForward,
@@ -64,13 +71,16 @@ from serenitymojo.models.klein.klein_stack import (
 )
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.elementwise import modulate
-from serenitymojo.ops.linalg_backward import linear_backward
-from serenitymojo.ops.norm_backward import layer_norm_backward
+from serenitymojo.ops.linalg_backward import linear_backward_dx
+from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
 from serenitymojo.models.klein.lora_block import LoraAdapter
 from serenitymojo.training.train_step import LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft, load_lora_for_resume
+
+
+comptime TArc = ArcPointer[Tensor]
 
 
 # ── flat-index slot scheme (the carrier's contract) ──────────────────────────
@@ -80,6 +90,7 @@ comptime DBL_SLOTS = 4
 comptime SGL_SLOTS = 2
 comptime BK_DOUBLE = 0
 comptime BK_SINGLE = 1
+comptime SGL_SAVE_TAIL = 8
 
 
 # ── adapter init (A small randn, B=0 — PEFT identity at step 0) ───────────────
@@ -188,6 +199,26 @@ def _sgl_lora_for(set: KleinLoraSet, bi: Int) -> SingleBlockLora:
     )
 
 
+def _concat6(
+    a: List[Float32], b: List[Float32], c: List[Float32],
+    d: List[Float32], e: List[Float32], f: List[Float32],
+) -> List[Float32]:
+    var o = List[Float32]()
+    for i in range(len(a)):
+        o.append(a[i])
+    for i in range(len(b)):
+        o.append(b[i])
+    for i in range(len(c)):
+        o.append(c[i])
+    for i in range(len(d)):
+        o.append(d[i])
+    for i in range(len(e)):
+        o.append(e[i])
+    for i in range(len(f)):
+        o.append(f[i])
+    return o^
+
+
 # ── the collected LoRA grads (flat, parallel to KleinLoraSet) ────────────────
 # Plus the base-weight grads (computed, discarded for the optimizer) and the
 # load-bearing input-token grads + shared modvec grads (same as KleinStackGrads).
@@ -242,10 +273,10 @@ struct KleinLoraGrads(Copyable, Movable):
 # Mirrors klein_stack_forward exactly, swapping the per-block calls for the
 # LoRA variants. `saved` carries the LoRA-MODIFIED activations so the backward
 # recompute regenerates them identically.
-def klein_stack_lora_forward[
+def klein_stack_lora_forward_device_inputs[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
-    img_tokens: List[Float32], txt_tokens: List[Float32],
+    img_tokens_t: TArc, txt_tokens_t: TArc,
     base: KleinStackBase,
     dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
     lora: KleinLoraSet,
@@ -261,53 +292,82 @@ def klein_stack_lora_forward[
     # per block via cos.copy()/sin.copy() → from_host). Borrowed into every block.
     var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
     var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var img_mod_dev = modvecs_to_device(img_mod, D, ctx)
+    var txt_mod_dev = modvecs_to_device(txt_mod, D, ctx)
+    var single_mod_dev = single_modvecs_to_device(single_mod, D, ctx)
 
-    var img = _linear_fwd_wdev(img_tokens, base.img_in[], N_IMG, in_ch, ctx)
-    var txt = _linear_fwd_wdev(txt_tokens, base.txt_in[], N_TXT, txt_ch, ctx)
+    var no_bias = Optional[Tensor](None)
+    var img = TArc(linear(img_tokens_t[], base.img_in[], no_bias^, ctx))
+    var no_bias_txt = Optional[Tensor](None)
+    var txt = TArc(linear(txt_tokens_t[], base.txt_in[], no_bias_txt^, ctx))
     var img_in_act = img.copy()
     var txt_in_act = txt.copy()
 
-    var dbl_img_in = List[List[Float32]]()
-    var dbl_txt_in = List[List[Float32]]()
+    var dbl_img_in = List[TArc]()
+    var dbl_txt_in = List[TArc]()
+    var dbl_saved = List[DoubleBlockSaved]()
     for bi in range(num_double):
         dbl_img_in.append(img.copy())
         dbl_txt_in.append(txt.copy())
         var bl = _dbl_lora_for(lora, bi)
-        var fwd = double_block_lora_forward[H, Dh, N_IMG, N_TXT, S](
-            img.copy(), txt.copy(), dbw[bi], img_mod, txt_mod, bl,
+        var fwd = double_block_lora_forward_device[H, Dh, N_IMG, N_TXT, S](
+            img, txt, dbw[bi], img_mod_dev, txt_mod_dev, bl,
             cos_t, sin_t, D, F, eps, ctx,
         )
         img = fwd.img_out.copy()
         txt = fwd.txt_out.copy()
 
-    var x = _concat_seq(txt, img)
+    var x = TArc(concat(0, ctx, txt[], img[]))
 
-    var sgl_x_in = List[List[Float32]]()
+    var sgl_x_in = List[TArc]()
+    var sgl_saved = List[SingleBlockSaved]()
     for bi in range(num_single):
         sgl_x_in.append(x.copy())
         var sl = _sgl_lora_for(lora, bi)
-        var fwd = single_block_lora_forward[H, Dh, S](
-            x.copy(), sbw[bi], single_mod, sl, cos_t, sin_t, D, F, eps, ctx,
+        var fwd = single_block_lora_forward_device[H, Dh, S](
+            x, sbw[bi], single_mod_dev, sl, cos_t, sin_t, D, F, eps, ctx,
         )
+        if bi >= num_single - SGL_SAVE_TAIL:
+            sgl_saved.append(fwd.saved.copy())
         x = fwd.out.copy()
 
-    var parts = _split_seq(x, N_TXT, N_IMG, D)
-    var img_out = parts[1].copy()
+    var img_out = TArc(slice(x[], 0, N_TXT, N_IMG, ctx))
 
-    var ln_img_out = layer_norm(
-        _t(img_out, [N_IMG, D], ctx),
-        _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
-    ).to_host(ctx)
+    var ln_img_out = TArc(layer_norm(
+        img_out[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+    ))
     var normed = modulate(
-        _t(ln_img_out, [N_IMG, D], ctx),
+        ln_img_out[],
         base.final_scale[], base.final_shift[], ctx,
-    ).to_host(ctx)
-    var out = _linear_fwd_wdev(normed, base.final_lin[], N_IMG, D, ctx)
+    )
+    var no_bias_out = Optional[Tensor](None)
+    var out = linear(normed, base.final_lin[], no_bias_out^, ctx).to_host(ctx)
 
     return KleinStackForward(
         out^, img_in_act^, txt_in_act^,
         dbl_img_in^, dbl_txt_in^, sgl_x_in^,
+        dbl_saved^, sgl_saved^,
         img_out^, ln_img_out^,
+    )
+
+
+def klein_stack_lora_forward[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: KleinStackBase,
+    dbw: List[DoubleBlockWeights], sbw: List[SingleBlockWeights],
+    lora: KleinLoraSet,
+    img_mod: ModVecs, txt_mod: ModVecs, single_mod: SingleModVecs,
+    cos: List[Float32], sin: List[Float32],
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> KleinStackForward:
+    return klein_stack_lora_forward_device_inputs[H, Dh, N_IMG, N_TXT, S](
+        TArc(_t(img_tokens, [N_IMG, in_ch], ctx)),
+        TArc(_t(txt_tokens, [N_TXT, txt_ch], ctx)),
+        base, dbw, sbw, lora, img_mod, txt_mod, single_mod, cos, sin,
+        D, F, in_ch, txt_ch, out_ch, eps, ctx,
     )
 
 
@@ -327,6 +387,8 @@ def klein_stack_lora_backward[
     saved: KleinStackForward,
     D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
     ctx: DeviceContext,
+    compute_input_grads: Bool = True,
+    compute_aux_grads: Bool = True,
 ) raises -> KleinLoraGrads:
     var num_double = len(dbw)
     var num_single = len(sbw)
@@ -335,35 +397,33 @@ def klein_stack_lora_backward[
     # forward + block backward both borrow these instead of per-call from_host).
     var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
     var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var img_mod_dev = modvecs_to_device(img_mod, D, ctx)
+    var txt_mod_dev = modvecs_to_device(txt_mod, D, ctx)
+    var single_mod_dev = single_modvecs_to_device(single_mod, D, ctx)
 
     # ── final layer backward (frozen base) ──
-    var normed = modulate(
-        _t(saved.ln_img_out, [N_IMG, D], ctx),
-        base.final_scale[], base.final_shift[], ctx,
-    ).to_host(ctx)
-    var lbf = linear_backward(
-        _t(d_out, [N_IMG, out_ch], ctx), _t(normed, [N_IMG, D], ctx),
-        base.final_lin[],
+    # final_lin is frozen in LoRA training; only d_x flows into the final norm.
+    var d_normed_t = linear_backward_dx(
+        _t(d_out, [N_IMG, out_ch], ctx), base.final_lin[],
         N_IMG, D, out_ch, ctx,
     )
-    var d_normed = lbf.d_x.to_host(ctx)
-    var d_final_lin = lbf.d_w.to_host(ctx)
 
     var mbf = modulate_backward(
-        _t(d_normed, [N_IMG, D], ctx), _t(saved.ln_img_out, [N_IMG, D], ctx),
-        base.final_scale[], ctx,
+        d_normed_t, saved.ln_img_out[],
+        base.final_scale[], ctx, compute_aux_grads,
     )
-    var d_ln_img_out = mbf.d_x.to_host(ctx)
-    var d_final_scale = mbf.d_scale.to_host(ctx)
-    var d_final_shift = mbf.d_shift.to_host(ctx)
+    var d_final_scale = List[Float32]()
+    var d_final_shift = List[Float32]()
+    if compute_aux_grads:
+        d_final_scale = mbf.d_scale.to_host(ctx)
+        d_final_shift = mbf.d_shift.to_host(ctx)
 
-    var lnbf = layer_norm_backward(
-        _t(d_ln_img_out, [N_IMG, D], ctx), _t(saved.img_out, [N_IMG, D], ctx),
+    var d_img_out_t = layer_norm_backward_dx(
+        mbf.d_x, saved.img_out[],
         _t(_ones(D), [D], ctx), eps, ctx,
     )
-    var d_img_out = lnbf.d_x.to_host(ctx)
 
-    var d_x = _concat_seq(_zeros(N_TXT * D), d_img_out)
+    var d_x = TArc(concat(0, ctx, _t(_zeros(N_TXT * D), [N_TXT, D], ctx), d_img_out_t))
 
     # flat single LoRA grads collected in FORWARD order (block 0..num_single-1).
     var sgl_d_a = List[List[Float32]]()
@@ -375,21 +435,28 @@ def klein_stack_lora_backward[
     # ── single-stream backward (REVERSE; per-block recompute) ──
     var d_single_mod = _zeros(3 * D)
     var bi = num_single - 1
+    var saved_single_start = num_single - len(saved.sgl_saved)
     while bi >= 0:
         var sl = _sgl_lora_for(lora, bi)
-        var fwd = single_block_lora_forward[H, Dh, S](
-            saved.sgl_x_in[bi].copy(), sbw[bi], single_mod, sl,
-            cos_t, sin_t, D, F, eps, ctx,
+        var block_saved: SingleBlockSaved
+        if bi >= saved_single_start:
+            block_saved = saved.sgl_saved[bi - saved_single_start].copy()
+        else:
+            var fwd = single_block_lora_forward_device[H, Dh, S](
+                saved.sgl_x_in[bi], sbw[bi], single_mod_dev, sl,
+                cos_t, sin_t, D, F, eps, ctx,
+            )
+            block_saved = fwd.saved.copy()
+        var bg = single_block_lora_backward_device[H, Dh, S](
+            d_x, sbw[bi], single_mod_dev, sl, block_saved, cos_t, sin_t,
+            D, F, eps, ctx, compute_aux_grads,
         )
-        var bg = single_block_lora_backward[H, Dh, S](
-            d_x.copy(), sbw[bi], single_mod, sl, fwd.saved, cos_t, sin_t,
-            D, F, eps, ctx,
-        )
-        d_x = bg.base.d_x.copy()
-        d_single_mod = _add_lists(
-            d_single_mod,
-            _concat3(bg.base.d_shift, bg.base.d_scale, bg.base.d_gate),
-        )
+        d_x = bg.d_x.copy()
+        if compute_aux_grads:
+            d_single_mod = _add_lists(
+                d_single_mod,
+                _concat3(bg.d_shift, bg.d_scale, bg.d_gate),
+            )
         # scatter into the flat slots (qkv=slot0, out=slot1).
         var sbase = bi * SGL_SLOTS
         sgl_d_a[sbase + 0] = bg.qkv_d_a.copy()
@@ -399,9 +466,8 @@ def klein_stack_lora_backward[
         bi -= 1
 
     # double→single seam: split d_x [S,D] back into d_txt_out, d_img_out.
-    var seam = _split_seq(d_x, N_TXT, N_IMG, D)
-    var d_txt_out = seam[0].copy()
-    var d_img_out2 = seam[1].copy()
+    var d_txt_out = TArc(slice(d_x[], 0, 0, N_TXT, ctx))
+    var d_img_out2 = TArc(slice(d_x[], 0, N_TXT, N_IMG, ctx))
 
     # flat double LoRA grads (slot order img_qkv,img_proj,txt_qkv,txt_proj).
     var dbl_d_a = List[List[Float32]]()
@@ -418,18 +484,27 @@ def klein_stack_lora_backward[
     var d_to = d_txt_out.copy()
     while di >= 0:
         var bl = _dbl_lora_for(lora, di)
-        var fwd = double_block_lora_forward[H, Dh, N_IMG, N_TXT, S](
-            saved.dbl_img_in[di].copy(), saved.dbl_txt_in[di].copy(),
-            dbw[di], img_mod, txt_mod, bl, cos_t, sin_t, D, F, eps, ctx,
+        var fwd = double_block_lora_forward_device[H, Dh, N_IMG, N_TXT, S](
+            saved.dbl_img_in[di], saved.dbl_txt_in[di],
+            dbw[di], img_mod_dev, txt_mod_dev, bl, cos_t, sin_t, D, F, eps, ctx,
         )
-        var bg = double_block_lora_backward[H, Dh, N_IMG, N_TXT, S](
-            d_io.copy(), d_to.copy(), dbw[di], img_mod, txt_mod, bl, fwd.saved,
-            cos_t, sin_t, D, F, eps, ctx,
+        var bg = double_block_lora_backward_device[H, Dh, N_IMG, N_TXT, S](
+            d_io, d_to, dbw[di], img_mod_dev, txt_mod_dev, bl, fwd.saved,
+            cos_t, sin_t, D, F, eps, ctx, compute_aux_grads,
         )
-        d_io = bg.base.img.d_x.copy()
-        d_to = bg.base.txt.d_x.copy()
-        d_img_mod = _add_lists(d_img_mod, _modvec6(bg.base.img))
-        d_txt_mod = _add_lists(d_txt_mod, _modvec6(bg.base.txt))
+        d_io = bg.img.d_x.copy()
+        d_to = bg.txt.d_x.copy()
+        if compute_aux_grads:
+            d_img_mod = _add_lists(
+                d_img_mod,
+                _concat6(bg.img.d_shift1, bg.img.d_scale1, bg.img.d_gate1,
+                         bg.img.d_shift2, bg.img.d_scale2, bg.img.d_gate2),
+            )
+            d_txt_mod = _add_lists(
+                d_txt_mod,
+                _concat6(bg.txt.d_shift1, bg.txt.d_scale1, bg.txt.d_gate1,
+                         bg.txt.d_shift2, bg.txt.d_scale2, bg.txt.d_gate2),
+            )
         # scatter into the flat slots.
         var dbase = di * DBL_SLOTS
         dbl_d_a[dbase + 0] = bg.img.qkv_d_a.copy()
@@ -442,28 +517,28 @@ def klein_stack_lora_backward[
         dbl_d_b[dbase + 3] = bg.txt.proj_d_b.copy()
         di -= 1
 
-    # ── input-projection backward (frozen base; d_tokens load-bearing) ──
-    var lbi = linear_backward(
-        _t(d_io, [N_IMG, D], ctx), _t(img_tokens, [N_IMG, in_ch], ctx),
-        base.img_in[],
-        N_IMG, in_ch, D, ctx,
-    )
-    var d_img_tokens = lbi.d_x.to_host(ctx)
-    var d_img_in = lbi.d_w.to_host(ctx)
+    var d_img_in = List[Float32]()
+    var d_txt_in = List[Float32]()
+    var d_img_tokens = List[Float32]()
+    var d_txt_tokens = List[Float32]()
+    if compute_input_grads:
+        # ── input-projection backward (frozen base; d_tokens load-bearing for
+        # parity, but unused by the real LoRA trainer).
+        var d_img_tokens_t = linear_backward_dx(
+            d_io[], base.img_in[], N_IMG, in_ch, D, ctx,
+        )
+        d_img_tokens = d_img_tokens_t.to_host(ctx)
 
-    var lbt = linear_backward(
-        _t(d_to, [N_TXT, D], ctx), _t(txt_tokens, [N_TXT, txt_ch], ctx),
-        base.txt_in[],
-        N_TXT, txt_ch, D, ctx,
-    )
-    var d_txt_tokens = lbt.d_x.to_host(ctx)
-    var d_txt_in = lbt.d_w.to_host(ctx)
+        var d_txt_tokens_t = linear_backward_dx(
+            d_to[], base.txt_in[], N_TXT, txt_ch, D, ctx,
+        )
+        d_txt_tokens = d_txt_tokens_t.to_host(ctx)
 
     return KleinLoraGrads(
         dbl_d_a^, dbl_d_b^, sgl_d_a^, sgl_d_b^,
         d_img_tokens^, d_txt_tokens^,
         d_img_mod^, d_txt_mod^, d_single_mod^,
-        d_img_in^, d_txt_in^, d_final_lin^, d_final_shift^, d_final_scale^,
+        d_img_in^, d_txt_in^, List[Float32](), d_final_shift^, d_final_scale^,
     )
 
 

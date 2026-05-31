@@ -29,15 +29,50 @@
 # Mojo 1.0.0b1: def not fn; Tensor move-only crosses API as host List[Float32];
 # no-bias linear = linear(x, w, Optional[Tensor](None), ctx).
 
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
-from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.linalg_backward import (
+    linear_backward, linear_backward_dx, linear_backward_dw,
+)
+from serenitymojo.ops.tensor_algebra import add, concat, mul_scalar, slice
 
 # REUSE the trainer's LoRA structs (the target authority).
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
+
+
+struct _HostGradPair(Copyable, Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+
+    def __init__(out self, var d_a: List[Float32], var d_b: List[Float32]):
+        self.d_a = d_a^
+        self.d_b = d_b^
+
+
+def _host_from_f32_buffer(
+    host: HostBuffer[DType.uint8], n: Int
+) -> List[Float32]:
+    var out = List[Float32]()
+    var fp = host.unsafe_ptr().bitcast[Float32]()
+    for i in range(n):
+        out.append(fp[i])
+    return out^
+
+
+def _to_host_pair_f32(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> _HostGradPair:
+    if a.dtype() != STDtype.F32 or b.dtype() != STDtype.F32:
+        raise Error("_to_host_pair_f32: expected F32 tensors")
+    var ahost = ctx.enqueue_create_host_buffer[DType.uint8](a.nbytes())
+    var bhost = ctx.enqueue_create_host_buffer[DType.uint8](b.nbytes())
+    ctx.enqueue_copy(dst_buf=ahost, src_buf=a.buf)
+    ctx.enqueue_copy(dst_buf=bhost, src_buf=b.buf)
+    ctx.synchronize()
+    var ah = _host_from_f32_buffer(ahost, a.numel())
+    var bh = _host_from_f32_buffer(bhost, b.numel())
+    return _HostGradPair(ah^, bh^)
 
 
 # Adapter forward contribution on x [M,in] → [M,out] (host list in/out).
@@ -61,6 +96,26 @@ def klein_lora_fwd(
     for i in range(len(dy)):
         out.append(lo.scale * dy[i])
     return out^
+
+
+# Device-resident sibling of klein_lora_fwd. A/B still come from the host-owned
+# adapter, but the activation input and delta output stay on device.
+def klein_lora_fwd_device(
+    x: Tensor, lo: LoraAdapter, M: Int, ctx: DeviceContext
+) raises -> Tensor:
+    var nb1 = Optional[Tensor](None)
+    var t = linear(
+        x,
+        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        nb1^, ctx,
+    )
+    var nb2 = Optional[Tensor](None)
+    var dy = linear(
+        t,
+        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
+        nb2^, ctx,
+    )
+    return mul_scalar(dy, lo.scale, ctx)
 
 
 # LoRA backward that ALSO returns the LoRA branch's contribution to d_x.
@@ -113,6 +168,45 @@ def klein_lora_bwd(
     return KleinLoraGrads(d_a^, d_b^, d_x_lo^)
 
 
+struct KleinLoraDeviceGrads(Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+    var d_x: Tensor
+
+    def __init__(
+        out self, var d_a: List[Float32], var d_b: List[Float32], var d_x: Tensor
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_x = d_x^
+
+
+# Device-resident sibling of klein_lora_bwd. d_A/d_B still leave as host lists
+# for the existing optimizer, while the large d_x_lo tensor stays on device.
+def klein_lora_bwd_device(
+    d_contrib: Tensor, x: Tensor, lo: LoraAdapter,
+    M: Int, ctx: DeviceContext,
+) raises -> KleinLoraDeviceGrads:
+    var a_t = Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx)
+    var b_t = Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx)
+
+    # t = x @ Aᵀ  (recompute; cheap)
+    var nb_t = Optional[Tensor](None)
+    var t = linear(x, a_t, nb_t^, ctx)                # [M,rank]
+    var d_dy = mul_scalar(d_contrib, lo.scale, ctx)   # [M,out]
+
+    # dy = t @ Bᵀ.
+    var d_t = linear_backward_dx(d_dy, b_t, M, lo.rank, lo.out_f, ctx)
+    var d_b_t = linear_backward_dw(d_dy, t, M, lo.rank, lo.out_f, ctx)
+
+    # t = x @ Aᵀ.
+    var d_x_lo = linear_backward_dx(d_t, a_t, M, lo.in_f, lo.rank, ctx)
+    var d_a_t = linear_backward_dw(d_t, x, M, lo.in_f, lo.rank, ctx)
+
+    var pair = _to_host_pair_f32(d_a_t, d_b_t, ctx)
+    return KleinLoraDeviceGrads(pair.d_a.copy(), pair.d_b.copy(), d_x_lo^)
+
+
 # ── host slice/scatter helpers for partial-projection LoRA (single block) ────
 # Take the first `c0` columns of each row of a [rows, total] host buffer.
 def klein_take_cols(
@@ -140,3 +234,20 @@ def klein_add_cols(
             else:
                 o.append(dst[base + c])
     return o^
+
+
+def klein_take_cols_device(
+    src: Tensor, rows: Int, total: Int, c0: Int, ctx: DeviceContext
+) raises -> Tensor:
+    return slice(src, 1, 0, c0, ctx)
+
+
+def klein_add_cols_device(
+    dst: Tensor, delta: Tensor, rows: Int, total: Int, c0: Int, ctx: DeviceContext
+) raises -> Tensor:
+    var first = slice(dst, 1, 0, c0, ctx)
+    var merged = add(first, delta, ctx)
+    if c0 == total:
+        return merged^
+    var rest = slice(dst, 1, c0, total - c0, ctx)
+    return concat(1, ctx, merged, rest)

@@ -103,7 +103,6 @@ def mse_backward(pred: Tensor, target: Tensor, ctx: DeviceContext) raises -> Ten
     ctx.enqueue_function[_mse_bwd_kernel_f32, _mse_bwd_kernel_f32](
         P, T, O, inv_n2, n, grid_dim=grid, block_dim=_BLOCK
     )
-    ctx.synchronize()
     return Tensor(out_buf^, pred.shape(), pred.dtype())
 
 
@@ -170,7 +169,6 @@ def huber_backward(
     ctx.enqueue_function[_huber_bwd_kernel_f32, _huber_bwd_kernel_f32](
         P, T, O, delta, inv_n, n, grid_dim=grid, block_dim=_BLOCK
     )
-    ctx.synchronize()
     return Tensor(out_buf^, pred.shape(), pred.dtype())
 
 
@@ -258,7 +256,6 @@ def swiglu_backward(
     ctx.enqueue_function[_swiglu_bwd_kernel_f32, _swiglu_bwd_kernel_f32](
         GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK
     )
-    ctx.synchronize()
     var dg_t = Tensor(dg_buf^, gate.shape(), gate.dtype())
     var du_t = Tensor(du_buf^, up.shape(), up.dtype())
     return SwigluGrads(dg_t^, du_t^)

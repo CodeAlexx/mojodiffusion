@@ -21,7 +21,10 @@ from serenitymojo.ops.linalg_backward import (
     linear_backward_dx_scratch,
     linear_backward_dx_split_scratch,
 )
-from serenitymojo.ops.linear import linear, linear_scratch, linear_rows, linear_rows_scratch
+from serenitymojo.ops.linear import (
+    linear, linear_scratch, linear_rows, linear_rows_scratch,
+    linear_two_inputs_scratch,
+)
 from serenitymojo.ops.attention_backward import sdpa_backward, sdpa_backward_scratch
 
 
@@ -180,6 +183,21 @@ def main() raises:
     var lin_rows_fresh = linear_rows(lin_x, wt, 1, 2, ctx)
     r = h.compare(lin_rows_fresh, lin_rows_ref, ctx)
     print("fresh linear rows   ", r)
+    all_pass = all_pass and r.passed
+
+    var two_ring = ScratchRingAllocator(ctx, 1024, 2)
+    var two_x0 = Tensor.from_host(_lf(1.0, -2.0, 2.0, 1.5), [2, 2], F32, ctx)
+    var two_x1 = Tensor.from_host(_lf(0.5, 3.0, -1.0, 0.25), [2, 2], F32, ctx)
+    var two_w0 = Tensor.from_host(_lf(0.25, 1.0, 2.0, 1.5, 0.75, 0.5), [3, 2], F32, ctx)
+    var two_w1 = Tensor.from_host(_lf(-0.5, 2.0, -1.0, 0.75, -2.0, 0.125), [3, 2], F32, ctx)
+    var two_full_x = concat2_scratch(1, ctx, two_ring, two_x0, two_x1)
+    var two_full_w = concat2_scratch(1, ctx, two_ring, two_w0, two_w1)
+    var two_no_bias = Optional[Tensor](None)
+    var two_ref_t = linear(two_full_x, two_full_w, two_no_bias^, ctx)
+    var two_ref = two_ref_t.to_host(ctx)
+    var two_out = linear_two_inputs_scratch(two_x0, two_x1, two_w0, two_w1, ctx, two_ring)
+    r = h.compare(two_out, two_ref, ctx)
+    print("scratch linear two  ", r)
     all_pass = all_pass and r.passed
 
     ring.reset()

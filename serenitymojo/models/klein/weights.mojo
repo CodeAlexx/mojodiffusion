@@ -129,7 +129,7 @@ def load_double_block_weights(
 #   F  = (dim0(w1) - 3*D) // 2
 #   Dh = dim0(q_norm)
 def load_single_block_weights(
-    st: SafeTensors, block_idx: Int, ctx: DeviceContext
+    st: SafeTensors, block_idx: Int, ctx: DeviceContext, keep_w2: Bool = True
 ) raises -> SingleBlockWeights:
     var sp = String("single_blocks.") + String(block_idx)
     var D = _dim0(st, sp + String(".linear2.weight"))         # w2 [D, D+F] -> D
@@ -140,7 +140,7 @@ def load_single_block_weights(
         _load_host_f32(st, sp + String(".linear2.weight"), ctx),           # w2
         _load_host_f32(st, sp + String(".norm.query_norm.scale"), ctx),    # q_norm
         _load_host_f32(st, sp + String(".norm.key_norm.scale"), ctx),      # k_norm
-        D, F, Dh, ctx,
+        D, F, Dh, ctx, keep_w2,
     )
 
 

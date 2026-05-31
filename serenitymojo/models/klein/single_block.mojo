@@ -80,7 +80,10 @@ from serenitymojo.scratch_ring import ScratchRingAllocator
 comptime TArc = ArcPointer[Tensor]
 
 # ── forward ops (GPU) ────────────────────────────────────────────────────────
-from serenitymojo.ops.linear import linear, linear_scratch, linear_rows, linear_rows_scratch
+from serenitymojo.ops.linear import (
+    linear, linear_scratch, linear_rows, linear_rows_scratch,
+    linear_two_inputs_scratch,
+)
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
@@ -193,6 +196,8 @@ def single_modvecs_to_device(
 struct SingleBlockWeights(Copyable, Movable):
     var w1: TArc        # [3D+2F, D]
     var w2: TArc        # [D, D+F]
+    var w2_att: TArc    # [D, D] packed w2[:, :D]
+    var w2_mlp: TArc    # [D, F] packed w2[:, D:]
     var q_norm: TArc    # [Dh]
     var k_norm: TArc    # [Dh]
 
@@ -201,9 +206,25 @@ struct SingleBlockWeights(Copyable, Movable):
         var w1: List[Float32], var w2: List[Float32],
         var q_norm: List[Float32], var k_norm: List[Float32],
         D: Int, F: Int, Dh: Int, ctx: DeviceContext,
+        keep_w2: Bool = True,
     ) raises:
+        var w2_att = List[Float32]()
+        var w2_mlp = List[Float32]()
+        for r in range(D):
+            var base = r * (D + F)
+            for c in range(D):
+                w2_att.append(w2[base + c])
+            for c in range(F):
+                w2_mlp.append(w2[base + D + c])
         self.w1 = TArc(Tensor.from_host(w1^, [3 * D + 2 * F, D], STDtype.F32, ctx))
-        self.w2 = TArc(Tensor.from_host(w2^, [D, D + F], STDtype.F32, ctx))
+        if keep_w2:
+            self.w2 = TArc(Tensor.from_host(w2^, [D, D + F], STDtype.F32, ctx))
+        else:
+            var dummy = List[Float32]()
+            dummy.append(0.0)
+            self.w2 = TArc(Tensor.from_host(dummy^, [1, 1], STDtype.F32, ctx))
+        self.w2_att = TArc(Tensor.from_host(w2_att^, [D, D], STDtype.F32, ctx))
+        self.w2_mlp = TArc(Tensor.from_host(w2_mlp^, [D, F], STDtype.F32, ctx))
         self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.F32, ctx))
         self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.F32, ctx))
 
@@ -713,25 +734,25 @@ def single_block_lora_forward_device_resident_scratch[
     var mlp = swiglu(mlp_gate, mlp_up, ctx)
     scratch.rewind(scratch_mark)
 
-    var out_in = concat(1, ctx, att_flat, mlp)
-
     var proj_mark = scratch.mark()
-    var no_bias2 = Optional[Tensor](None)
-    var out_proj = linear_scratch(out_in, w.w2[], no_bias2^, ctx, scratch)
+    var out_proj = linear_two_inputs_scratch(
+        att_flat, mlp, w.w2_att[], w.w2_mlp[], ctx, scratch,
+    )
     if lora.out:
         var dlt2 = klein_lora_fwd_device_resident(att_flat, lora.out.value(), S, ctx)
-        out_proj = add(out_proj, dlt2, ctx)
+        add_in_place_f32(out_proj, dlt2, ctx)
 
     var result = residual_gate(
         x_t[], mv.gate[], out_proj, ctx
     )
     scratch.rewind(proj_mark)
 
+    var mlp_arc = TArc(mlp^)
     var saved = SingleBlockSaved(
         x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
         TArc(q_rms^), TArc(k_rms^), TArc(v^),
         TArc(q_rope^), TArc(k_rope^), TArc(att_flat^),
-        TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in^),
+        TArc(mlp_gate^), TArc(mlp_up^), mlp_arc.copy(), mlp_arc.copy(),
     )
     return SingleBlockDeviceForward(TArc(result^), saved^)
 
@@ -847,13 +868,12 @@ def single_block_lora_recompute_saved_device_resident_scratch[
     var mlp = swiglu(mlp_gate, mlp_up, ctx)
     scratch.rewind(scratch_mark)
 
-    var out_in = concat(1, ctx, att_flat, mlp)
-
+    var mlp_arc = TArc(mlp^)
     return SingleBlockSaved(
         x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
         TArc(q_rms^), TArc(k_rms^), TArc(v^),
         TArc(q_rope^), TArc(k_rope^), TArc(att_flat^),
-        TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in^),
+        TArc(mlp_gate^), TArc(mlp_up^), mlp_arc.copy(), mlp_arc.copy(),
     )
 
 
@@ -1014,11 +1034,12 @@ def single_block_lora_backward_device_resident_scratch[
     var grg: GateResidualGrads
     var d_gate = List[Float32]()
     if compute_aux_grads:
-        var nb = Optional[Tensor](None)
-        var out_y = linear(saved.out_in[], w.w2[], nb^, ctx)
+        var out_y = linear_two_inputs_scratch(
+            saved.att_flat[], saved.mlp[], w.w2_att[], w.w2_mlp[], ctx, scratch,
+        )
         if lora.out:
             var dlt2 = klein_lora_fwd_device_resident(saved.att_flat[], lora.out.value(), S, ctx)
-            out_y = add(out_y, dlt2, ctx)
+            add_in_place_f32(out_y, dlt2, ctx)
         grg = gate_residual_backward(
             d_out_t[], saved.x[], mv.gate[], out_y, ctx
         )
@@ -1026,23 +1047,22 @@ def single_block_lora_backward_device_resident_scratch[
     else:
         grg = gate_residual_backward_dxdy(d_out_t[], mv.gate[], ctx)
 
-    var d_out_in_t = linear_backward_dx_scratch(
-        grg.d_y, w.w2[], S, D + F, D, ctx, scratch,
+    var d_att = linear_backward_dx_scratch(
+        grg.d_y, w.w2_att[], S, D, D, ctx, scratch,
+    )
+    var d_mlp = linear_backward_dx_scratch(
+        grg.d_y, w.w2_mlp[], S, F, D, ctx, scratch,
     )
 
     var out_d_a = List[Float32]()
     var out_d_b = List[Float32]()
     if lora.out:
         var lg2 = klein_lora_bwd_device_resident(grg.d_y, saved.att_flat[], lora.out.value(), S, ctx)
-        d_out_in_t = klein_add_cols_device(d_out_in_t, lg2.d_x, S, D + F, D, ctx)
+        add_in_place_f32(d_att, lg2.d_x, ctx)
         out_d_a = lg2.d_a.copy()
         out_d_b = lg2.d_b.copy()
 
-    var d_out_in_3d = reshape_owned(d_out_in_t^, [1, S, D + F])
-    var d_att = slice_scratch(d_out_in_3d, 2, 0, D, ctx, scratch)
-    var d_mlp = slice_scratch(d_out_in_3d, 2, D, F, ctx, scratch)
     reshape_in_place(d_att, [1, S, H, Dh])
-    reshape_in_place(d_mlp, [S, F])
 
     var sgb = swiglu_backward(d_mlp, saved.mlp_gate[], saved.mlp_up[], ctx)
     var d_gate_up = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)

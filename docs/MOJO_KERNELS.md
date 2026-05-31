@@ -51,6 +51,7 @@ only at the load/store cast. Most other backward files are **F32-only** (the
 | `linear_backward_dx(grad_y, weight, M, in_features, out_features, ctx)` | :311 | `Tensor` | d_x-only path for frozen weights; skips d_W/d_b work and readback |
 | `linear_backward_dx_scratch(..., scratch, reverse=False)` | :342 | `Tensor` | same d_x GEMM as `linear_backward_dx`, but output storage comes from an opt-in scratch ring |
 | `linear_backward_dx_split_scratch(grad_y0, grad_y1, weight, ..., scratch)` | — | `Tensor` | d_x-only path for two contiguous weight-row grad blocks; uses BLAS `beta=1` accumulation to avoid materializing `concat(grad_y0, grad_y1)` |
+| `linear_two_inputs_scratch(x0, x1, weight0, weight1, ctx, scratch, reverse=False)` | `ops/linear.mojo` | `Tensor` | F32 no-bias forward helper: `x0@weight0.T + x1@weight1.T`, using BLAS `beta=1`; avoids materializing a concatenated input when weights are pre-packed by input block |
 | `linear_backward_dw(grad_y, x, M, in_features, out_features, ctx)` | :377 | `Tensor` | d_W-only path used by LoRA d_A/d_B helpers |
 | `addbias_backward(grad_y, M, out_features, ctx)` | :408 | `AddBiasGrads{d_x, d_b}` | d_x=grad; d_b=colsum(grad) |
 
@@ -444,8 +445,9 @@ mark/rewind, reset, forward+reverse allocation, scratch concat2, scratch slice,
 scratch concat3, rank-4 generic concat/slice from the reverse cursor,
 scratch-backed F32 no-bias `linear_scratch`, fresh and scratch row-range
 `linear_rows` / `linear_rows_scratch`, in-place F32 add, split-accumulating
-`linear_backward_dx_split_scratch`, and `sdpa_backward_scratch` d_q/d_k/d_v
-equality against the normal SDPA backward.
+`linear_backward_dx_split_scratch`, two-input scratch linear forward
+(`linear_two_inputs_scratch`), and `sdpa_backward_scratch` d_q/d_k/d_v equality
+against the normal SDPA backward.
 
 ---
 
@@ -471,12 +473,13 @@ files read):
   still `enqueue_create_buffer` fresh. The F32 no-bias `linear` path now returns
   the vendor-BLAS GEMM output directly instead of allocating/copying through a
   second output buffer; `linear_scratch`, `linear_rows`, `linear_rows_scratch`,
-  `linear_backward_dx_scratch`, and `linear_backward_dx_split_scratch` can
-  avoid selected row-split materializations; `add_in_place_f32` supports owned
-  destination-buffer accumulation; and `sdpa_backward_scratch` reuses ring
-  storage for large SDPA backward work buffers. A shared scratch ring exists,
-  and the real Klein LoRA path uses it for proven block-local temporaries, but
-  other model paths must explicitly adopt it at their own frame boundaries.
+  `linear_two_inputs_scratch`, `linear_backward_dx_scratch`, and
+  `linear_backward_dx_split_scratch` can avoid selected concat/row-split
+  materializations; `add_in_place_f32` supports owned destination-buffer
+  accumulation; and `sdpa_backward_scratch` reuses ring storage for large SDPA
+  backward work buffers. A shared scratch ring exists, and the real Klein LoRA
+  path uses it for proven block-local temporaries, but other model paths must
+  explicitly adopt it at their own frame boundaries.
 
 These are expected for a from-scratch port whose proven scope is *correctness
 through composition*, not throughput. As of this session there is **no open

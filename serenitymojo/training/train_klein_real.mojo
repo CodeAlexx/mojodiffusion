@@ -320,7 +320,7 @@ def main() raises:
         dbw.append(load_double_block_weights(st, bi, ctx))
     var sbw = List[SingleBlockWeights]()
     for bi in range(NUM_SINGLE):
-        sbw.append(load_single_block_weights(st, bi, ctx))
+        sbw.append(load_single_block_weights(st, bi, ctx, False))
     var mod_weights = load_klein_step_mod_weights(st, D, ctx)
     print("  loaded", len(dbw), "double +", len(sbw), "single block weights")
 

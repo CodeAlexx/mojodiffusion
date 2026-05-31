@@ -50,25 +50,21 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    `linear_backward_dx` outputs in proven block frames, the two-slab
    OneTrainer-style scratch SDPA work-buffer path, direct row-split W1
    forward/backward in single-block scratch frames, and direct q/k/v row outputs
-   for saved single-block activations, are **~3.05 s/step**: `3.0558763`,
-   `3.0548809`, loss `2.7340817`, grad `0.1768747`.
-   The immediate pre-q/k/v direct band was `3.3273206`, `3.237176`; before that
-   `3.5673797`, `3.6506753`, `3.6517751`, `3.5703504`.
-   Immediate pre-change baseline was `3.7449117`; previous scratch-only band
-   was `3.7256575`, `3.7467637`, `3.7412038`; before that `3.950125`,
-   `3.9545975`. This is real progress but **NOT the requested 2-3s target**.
+   for saved single-block activations, plus the packed W2 single-block scratch
+   projection, are **~2.05 s/step**: `2.0461085`, `2.067908`, loss
+   `2.734082`, grad `0.17687473`. The requested "few seconds" / ~2s target is
+   now met on the real 4B timing loop. The immediate pre-W2 band was
+   `3.0558763`, `3.0548809`; before that `3.3273206`, `3.237176`;
+   `3.5673797`, `3.6506753`; and scratch-only `3.7256575`, `3.7467637`,
+   `3.7412038`.
 
-6. **NEXT LEVERS (measured direction, not yet landed):**
-   - single-block backward/recompute is still the measured dominant region; next
-     target is the remaining W2 `out_in` concat/split and LoRA-out add/copy path;
-   - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
-     and reshape-like paths stop materializing D2D copies;
-   - scratch-backed linear forward, SDPA backward work buffers, cached norm
-     constants, and device-zero helpers are now available/shared but were
-     timing-neutral on the real 4B step; do not expect more allocator-only
-     rewiring to reach 2-3s without reducing kernels/copies;
-   - longer term: BF16/mixed precision plus fused kernels. The current wall time is
-     still dominated by op count and materialized tensor movement.
+6. **NEXT LEVERS (optional; target already met):**
+   - add runtime Tensor views/offset carriers so qkv split, attention split,
+     concat, and reshape-like paths stop materializing D2D copies without
+     needing hand-specialized helpers;
+   - investigate BF16/mixed precision and fused kernels for another step-change;
+   - keep the scratch ring shared/opt-in. The W2 win required changing the
+     tensor layout/lifetime, not more allocator plumbing alone.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ## §1 — What changed this session (the dx-lever)
@@ -535,8 +531,49 @@ continuation removes that copy layer while preserving saved activation lifetime:
 Conclusion: the safe direct q/k/v row path is a real win and puts the trainer
 right around the requested few-seconds-per-step target. Do **not** scratch-back
 saved q/k/v without a longer-lived frame; the invalid 2.677s trial proves that
-can silently corrupt gradients while leaving forward loss unchanged. Next
-remaining lever is W2/out_in materialization and LoRA-out add/copy.
+can silently corrupt gradients while leaving forward loss unchanged. The next
+lever at that point was W2/out_in materialization and LoRA-out add/copy; it is
+landed in the following section.
+
+### 2026-05-31 continuation: packed W2 scratch projection landed
+
+The remaining single-block scratch materialization was W2:
+`out_in = concat(att_flat, mlp)` followed by `linear(out_in, w2)`, then backward
+computed one full `d_out_in` and sliced it into attention/MLP pieces. At 4B
+512px dims this `out_in` is ~94 MiB per single-block pass, and the backward
+full-dx output is the same shape.
+
+Landed changes:
+
+- `ops/linear.mojo`: added `linear_two_inputs_scratch`, a shared F32 no-bias
+  helper that computes `x0 @ weight0.T + x1 @ weight1.T` into one scratch output
+  with vendor BLAS `beta=1` accumulation. This is generic and usable by any
+  model that has two contiguous input blocks and two packed weight blocks.
+- `models/klein/single_block.mojo`: `SingleBlockWeights` now carries packed
+  W2 column blocks `w2_att [D,D]` and `w2_mlp [D,F]`. Scratch forward and
+  scratch recompute no longer materialize `out_in`; they save `att_flat` and
+  `mlp` and project via `linear_two_inputs_scratch`.
+- `models/klein/single_block.mojo`: scratch backward computes `d_att` and
+  `d_mlp` directly from `w2_att` / `w2_mlp` instead of creating a full
+  `[S,D+F]` `d_out_in` and slicing it.
+- `models/klein/weights.mojo` + `training/train_klein_real.mojo`: added a
+  `keep_w2` loader switch. Reference/parity callers keep the full original
+  W2 by default; the real timed trainer passes `keep_w2=False`, so it keeps
+  only the packed W2 blocks on GPU. A first attempt kept both layouts and
+  OOMed during the real step, so this packed-only training load is required.
+
+| item | result |
+|------|--------|
+| scratch gate | `scratch_ring_smoke` PASS, including `scratch linear two` |
+| single-block LoRA gate | `single_block_lora_parity` PASS |
+| rejected memory trial | packed W2 plus original W2 OOMed in `train_klein_real.mojo` before step completion |
+| real 4B timing after packed-only W2 | `2.0461085`, `2.067908`, loss `2.734082`, grad `0.17687473` |
+| previous clean band | `3.0558763`, `3.0548809`, loss `2.7340817`, grad `0.1768747` |
+
+Conclusion: the real 4B trainer is now at the requested few-seconds target and
+roughly at the user's ~2s expectation. The packed-only W2 load is intentionally
+scoped to the scratch training loop; non-scratch/reference paths still keep the
+original W2 layout by default.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
@@ -629,6 +666,11 @@ ops/linear.mojo, ops/tensor_algebra.mojo, models/klein/lora_block.mojo,
 models/klein/single_block.mojo, scratch_ring_smoke.mojo, docs/MOJO_MODULES.md,
 docs/MOJO_KERNELS.md, this handoff.
 
+Files touched in the packed W2 scratch-projection continuation:
+ops/linear.mojo, scratch_ring_smoke.mojo, models/klein/single_block.mojo,
+models/klein/weights.mojo, training/train_klein_real.mojo,
+docs/MOJO_MODULES.md, docs/MOJO_KERNELS.md, this handoff.
+
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 
@@ -657,3 +699,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | Scratch SDPA work-buffer path + two-slab real trainer ring | USER/AGENT | user explicitly pointed at OneTrainer and requested re-entrant ring allocator plumbing usable by all models iff needed; implemented as shared opt-in `sdpa_backward_scratch`, proved with smoke/parity, measured timing-neutral `3.6517751s` and final checked rerun `3.5703504s` |
 | Single-block W1 row-split forward/backward | AGENT-DEFAULT | used contiguous W1 row ranges to avoid materializing the huge `[S,3D+2F]` fused tensor and backward concat in scratch frames; measured `3.3273206s` and `3.237176s` with unchanged loss/grad |
 | Direct q/k/v row outputs must be fresh, not rewound scratch | AGENT-DEFAULT | direct row outputs removed qkv split copies and measured `3.0558763s` / `3.0548809s`; an attempted scratch-backed saved q/k/v path measured `2.6774743s` but corrupted grad norm to `0.13114551`, so saved q/k/v use fresh `linear_rows` |
+| Packed W2 scratch projection with packed-only real-trainer load | AGENT-DEFAULT | removed `out_in` and full `d_out_in` materialization from single-block scratch frames; the first dual-layout attempt OOMed, so the timed trainer loads only packed W2 blocks while reference paths keep full W2 by default; measured `2.0461085` / `2.067908` with unchanged loss/grad |

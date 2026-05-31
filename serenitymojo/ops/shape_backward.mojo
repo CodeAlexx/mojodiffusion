@@ -12,7 +12,7 @@
 #   * device buffers are DType.uint8 (Tensor's storage), bitcast to Float32 at
 #     the LayoutTensor boundary,
 #   * one flat thread per OUTPUT element for the kernels,
-#   * F32 interior, ctx.synchronize() then return fresh Tensor(s),
+#   * F32 interior and single-stream ordering; downstream to_host/sync fences,
 #   * multi-output arms return a Movable struct (Tensor is move-only).
 #
 # Math (verified against flame-core autograd.rs @ 7be76ef):
@@ -123,7 +123,6 @@ def reshape_backward(
             + String(n) + " != " + String(grad_out.numel()))
     var dev = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     ctx.enqueue_copy(dst_buf=dev, src_buf=grad_out.buf)
-    ctx.synchronize()
     var sh = List[Int]()
     for i in range(len(in_shape)):
         sh.append(in_shape[i])
@@ -136,7 +135,6 @@ def cast_backward(grad_out: Tensor, ctx: DeviceContext) raises -> Tensor:
     _require_f32(grad_out, "cast_backward")
     var dev = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     ctx.enqueue_copy(dst_buf=dev, src_buf=grad_out.buf)
-    ctx.synchronize()
     return Tensor(dev^, grad_out.shape(), STDtype.F32)
 
 
@@ -209,7 +207,6 @@ def _permute_materialize(
         X, O, od[0], od[1], od[2], od[3], od[4], od[5],
         ss[0], ss[1], ss[2], ss[3], ss[4], ss[5], n,
         grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     return Tensor(out_buf^, oshape^, STDtype.F32)
 
 
@@ -307,7 +304,6 @@ def _slice_along(
     ctx.enqueue_function[_slice_gather_k, _slice_gather_k](
         X, O, outer, in_dim, inner, length, start,
         grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     return Tensor(out_buf^, oshape^, STDtype.F32)
 
 
@@ -416,7 +412,6 @@ def split_backward(
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_n * 4)
     _write_slab(grad_0, axis, 0, sum_dim, out_buf, ctx)
     _write_slab(grad_1, axis, s0[axis], sum_dim, out_buf, ctx)
-    ctx.synchronize()
     return Tensor(out_buf^, oshape^, STDtype.F32)
 
 
@@ -487,7 +482,6 @@ def slice_backward(
     ctx.enqueue_function[_slice_scatter_k, _slice_scatter_k](
         g, o, outer, full_dim, inner, length, start,
         grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     var sh = List[Int]()
     for i in range(len(full_shape)):
         sh.append(full_shape[i])
@@ -587,7 +581,6 @@ def broadcast_backward(
         odims[0], odims[1], odims[2], odims[3], odims[4], odims[5],
         ostr[0], ostr[1], ostr[2], ostr[3], ostr[4], ostr[5],
         n_in, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     var sh = List[Int]()
     for i in range(len(in_shape)):
         sh.append(in_shape[i])
@@ -685,7 +678,6 @@ def repeat_backward(
         reps[0], reps[1], reps[2], reps[3], reps[4], reps[5],
         ostr[0], ostr[1], ostr[2], ostr[3], ostr[4], ostr[5],
         n_in, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     var sh = List[Int]()
     for i in range(len(in_shape)):
         sh.append(in_shape[i])
@@ -734,7 +726,6 @@ def where_backward(
     var grid = (n + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_where_bwd_k, _where_bwd_k](
         g, c, da, db, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     return WhereGrads(
         Tensor(da_buf^, grad_out.shape(), STDtype.F32),
         Tensor(db_buf^, grad_out.shape(), STDtype.F32))
@@ -777,7 +768,6 @@ def clamp_backward(
     var grid = (n + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_clamp_bwd_k, _clamp_bwd_k](
         g, xt, o, lo, hi, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     return Tensor(out_buf^, x.shape(), STDtype.F32)
 
 
@@ -832,7 +822,6 @@ def _maxmin_backward(
     var grid = (n + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_maxmin_bwd_k, _maxmin_bwd_k](
         g, at, bt, da, db, is_max, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     return BinaryGrads(
         Tensor(da_buf^, a.shape(), STDtype.F32),
         Tensor(db_buf^, b.shape(), STDtype.F32))
@@ -920,7 +909,6 @@ def index_select_backward(
     var grid = (V * D + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_index_select_bwd_k, _index_select_bwd_k](
         g, IDS, o, N, D, V, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
     var sh = List[Int]()
     sh.append(V); sh.append(D)
     return Tensor(out_buf^, sh^, STDtype.F32)

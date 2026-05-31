@@ -253,7 +253,9 @@ Both compile-time-parameterized. Kernels `_maxpool2d_dx_kernel_f32` (:56),
 ## 10. shape_backward.mojo — the Tier-0 shape-op backward surface (18 ops)
 
 The largest backward file (`shape_backward.mojo`, 42 KB). All F32
-(`_require_f32` :106).
+(`_require_f32` :106). These arms rely on single-stream ordering and no longer
+force a local `ctx.synchronize()` before return; downstream readback or explicit
+sync provides the fence.
 
 | Function | Line | Returns | Math |
 |---|---|---|---|
@@ -403,9 +405,12 @@ modeled after OneTrainer's static activation/layer allocators:
 
 - persistent `DType.uint8` device slabs;
 - 16-byte aligned sub-buffer allocation via `create_sub_buffer`;
-- explicit `mark`/`rewind` and `reset` for re-entrant frame ownership;
+- forward allocation from the slab head and reverse allocation from the slab
+  tail, matching ordered forward/backward or recompute lifetimes;
+- explicit `mark`/`rewind` and `reset` for nested/re-entrant frame ownership;
 - `alloc_tensor`, `empty_like`, and `clone_tensor` return normal `Tensor`
-  wrappers backed by the slab view.
+  wrappers backed by the slab view; `alloc_tensor_reverse`,
+  `empty_like_reverse`, and `clone_tensor_reverse` use the tail cursor.
 
 The allocator is intentionally **not** wired into `Tensor` globally. A model or
 op must opt in only when it can prove the scratch frame outlives all tensors and
@@ -418,7 +423,8 @@ imports keep the old allocation behavior unless a caller explicitly requests a
 scratch path.
 
 **Parity gate:** `scratch_ring_smoke.mojo` covers clone, alignment,
-mark/rewind, reset, scratch concat2, scratch slice, and scratch concat3.
+mark/rewind, reset, forward+reverse allocation, scratch concat2, scratch slice,
+and scratch concat3.
 
 ---
 

@@ -41,20 +41,19 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    - `KleinLoraDeviceSet` uploads LoRA A/B once per step and reuses those tensors
      through forward, backward recompute, and LoRA backward.
 
-5. **Current measured state:** clean `train_klein_real.mojo` run after the
-   scratch allocator infrastructure is **5.200673 s/step**
-   (`PROG step=1 ... secs=5.200673`, loss `2.734082`). Best clean prior after
-   resident LoRA A/B remains **5.1468015 s/step**. Previous clean state before
-   resident LoRA A/B was **5.312408 s/step**; best instrumented run in that pass
-   was **5.227653 s**. Phase shape was stable: prep ≈0.79-0.90s, forward
-   ≈1.50-1.52s, backward ≈2.83-2.89s.
+5. **Current measured state:** clean `train_klein_real.mojo` runs after cached
+   step-modulation weights + metadata reshape cleanup are now **~4.3 s/step**:
+   `4.281281`, `4.3405366`, final `4.3674574`, loss `2.734082`, grad
+   `0.17687473`. Prior clean state after resident LoRA A/B + scratch
+   infrastructure was **5.200673 s/step**; best clean prior was **5.1468015**.
    This is real progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
-   - wire the new scratch ring only at proven frame boundaries where a model owns
-     all lifetimes (all models can opt in iff needed; no global allocator);
+   - wire the enhanced forward/reverse scratch ring only at proven frame
+     boundaries where a model owns all lifetimes (all models can opt in iff
+     needed; no global allocator);
    - longer term: BF16/mixed precision plus fused kernels. The current wall time is
      still dominated by op count and materialized tensor movement.
 
@@ -187,7 +186,9 @@ activation/layer allocators:
 
 - `serenitymojo/scratch_ring.mojo`: `ScratchRingAllocator` owns persistent
   `DType.uint8` GPU slabs, returns `Tensor` wrappers over `create_sub_buffer`,
-  aligns allocations to 16 bytes, and exposes explicit `mark`/`rewind`/`reset`.
+  aligns allocations to 16 bytes, exposes explicit `mark`/`rewind`/`reset`,
+  and now supports forward allocation from the head plus reverse allocation
+  from the tail for backward/recompute frames.
 - `serenitymojo/ops/tensor_algebra_scratch.mojo`: opt-in `concat2_scratch`,
   `concat3_scratch`, and `slice_scratch` for F32 rank-2 dim-1 temporaries.
 - The allocator is deliberately **not global** and normal `ops/tensor_algebra.mojo`
@@ -195,14 +196,32 @@ activation/layer allocators:
   proven safe; this satisfies "all models iff needed" without forcing scratch
   storage on every Tensor allocation.
 
+### 2026-05-31 continuation: cached per-step Klein modulation landed
+
+The timed Klein loop was still rebuilding frozen timestep/modulation weights
+inside the timed step. That work is now loaded once before `t0`:
+
+- `models/klein/weights.mojo`: `KleinStepModWeights`,
+  `load_klein_step_mod_weights`, and `build_klein_step_mods_cached`.
+- `training/train_klein_real.mojo`: uses the cached device-resident weights
+  inside the step loop. The returned host `ModVecs` shape is unchanged for the
+  existing stack API.
+- `ops/tensor_algebra.mojo`: `reshape_in_place` adds a metadata-only reshape for
+  Tensor fields/local owned tensors; Klein single/double backward now uses it at
+  reshape-only split/join points. Shape backward sync fences were also removed
+  where single-stream ordering and downstream `to_host`/sync already fence.
+
 Gates / measurements from this continuation:
 
 | item | result |
 |------|--------|
-| scratch allocator gate | `scratch_ring_smoke` PASS (clone, alignment, mark/rewind, reset, scratch concat/slice) |
+| scratch allocator gate | `scratch_ring_smoke` PASS (clone, alignment, mark/rewind, reset, forward+reverse allocation, scratch concat/slice) |
 | default algebra gate | `ops/algebra_smoke` PASS |
-| real 4B timing run | `PROG ... secs=5.200673`, loss `2.734082` |
-| speed impact | no speed win yet; infrastructure only until model hot paths opt in |
+| shape backward gate | `shape_bwd_parity` PASS |
+| Klein block/stack LoRA gates | single LoRA PASS, double LoRA PASS, stack LoRA PASS |
+| cached modulation gate | `klein_step_mod_cache_smoke` PASS, all max_abs `0.0` |
+| real 4B timing runs | `4.281281`, `4.3405366`, final `4.3674574`, loss `2.734082` |
+| speed impact | ~5.20s → ~4.3s from cached step-mod weights + metadata/sync cleanup |
 
 Do not use `models/klein/parity/klein_stack_lora_real_smoke.mojo` as the timing
 benchmark; it OOMed on the 24 GB 3090 Ti in this session. The timing benchmark is
@@ -243,6 +262,14 @@ models/klein/parity/double_block_lora_parity.mojo, .gitignore.
 
 Files touched in the scratch-ring continuation: scratch_ring.mojo,
 scratch_ring_smoke.mojo, ops/tensor_algebra_scratch.mojo, docs/MOJO_MODULES.md,
+docs/MOJO_KERNELS.md, this handoff.
+
+Files touched in the cached step-mod / metadata continuation:
+models/klein/weights.mojo, training/train_klein_real.mojo,
+models/klein/parity/klein_step_mod_cache_smoke.mojo,
+ops/tensor_algebra.mojo, ops/shape_backward.mojo,
+models/klein/single_block.mojo, models/klein/double_block.mojo,
+scratch_ring.mojo, scratch_ring_smoke.mojo, docs/MOJO_MODULES.md,
 docs/MOJO_KERNELS.md, this handoff.
 
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);

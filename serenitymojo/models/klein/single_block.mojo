@@ -85,7 +85,9 @@ from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
-from serenitymojo.ops.tensor_algebra import reshape, reshape_owned, slice, concat, add
+from serenitymojo.ops.tensor_algebra import (
+    reshape, reshape_owned, reshape_in_place, slice, concat, add,
+)
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
 from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx, LinearGrads
@@ -405,19 +407,19 @@ def single_block_backward[
 
     # out_in = concat(axis=2, att_flat, mlp) on the CHANNEL axis (sizes D, F).
     # d_out_in is [S, D+F]; reshape to [1,S,D+F] for cat_backward on axis=2.
-    var d_out_in_3d = reshape(lb_w2.d_x, [1, S, D + F], ctx)
-    var cb = cat_backward(d_out_in_3d, D, F, 2, ctx)
-    var d_att_flat = reshape(cb.d_0, [1, S, H, Dh], ctx)   # [1,S,D] == [1,S,H,Dh]
-    var d_mlp = reshape(cb.d_1, [S, F], ctx)               # [1,S,F] == [S,F]
+    reshape_in_place(lb_w2.d_x, [1, S, D + F])
+    var cb = cat_backward(lb_w2.d_x, D, F, 2, ctx)
+    reshape_in_place(cb.d_0, [1, S, H, Dh])   # [1,S,D] == [1,S,H,Dh]
+    reshape_in_place(cb.d_1, [S, F])          # [1,S,F] == [S,F]
 
     # mlp = swiglu(mlp_gate, mlp_up)
-    var sgb = swiglu_backward(d_mlp, saved.mlp_gate[], saved.mlp_up[], ctx)
+    var sgb = swiglu_backward(cb.d_1, saved.mlp_gate[], saved.mlp_up[], ctx)
     # join gate/up grads back into gate_up [S,2F] (device concat on dim 1)
     var d_gate_up = concat(1, ctx, sgb.d_gate, sgb.d_up)
 
     # att branch: d_att_flat [1,S,H,Dh] -> sdpa backward.
     var sb = sdpa_backward[1, S, H, Dh](
-        saved.q_rope[], saved.k_rope[], saved.v[], d_att_flat, scale, ctx,
+        saved.q_rope[], saved.k_rope[], saved.v[], cb.d_0, scale, ctx,
     )
     # d_q_rope/d_k_rope/d_v device-resident in sb.
 
@@ -433,10 +435,10 @@ def single_block_backward[
 
     # join d_q_pre|d_k_pre|d_v into d_qkv [S,3D] (reshape each [1,S,H,Dh]->[S,D],
     # then device concat on dim 1).
-    var d_q_pre_flat = reshape(rb_q.d_x, [S, D], ctx)
-    var d_k_pre_flat = reshape(rb_k.d_x, [S, D], ctx)
-    var d_v_flat = reshape(sb.d_v, [S, D], ctx)
-    var d_qkv = concat(1, ctx, d_q_pre_flat, d_k_pre_flat, d_v_flat)
+    reshape_in_place(rb_q.d_x, [S, D])
+    reshape_in_place(rb_k.d_x, [S, D])
+    reshape_in_place(sb.d_v, [S, D])
+    var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, sb.d_v)
 
     # join the qkv grad and gate_up grad back into d_fused [S, 3D+2F]
     var d_fused = concat(1, ctx, d_qkv, d_gate_up)
@@ -729,14 +731,14 @@ def single_block_lora_backward_device_resident[
 
     var d_out_in_3d = reshape_owned(d_out_in_t^, [1, S, D + F])
     var cb = cat_backward(d_out_in_3d, D, F, 2, ctx)
-    var d_att_flat = reshape(cb.d_0, [1, S, H, Dh], ctx)
-    var d_mlp = reshape(cb.d_1, [S, F], ctx)
+    reshape_in_place(cb.d_0, [1, S, H, Dh])
+    reshape_in_place(cb.d_1, [S, F])
 
-    var sgb = swiglu_backward(d_mlp, saved.mlp_gate[], saved.mlp_up[], ctx)
+    var sgb = swiglu_backward(cb.d_1, saved.mlp_gate[], saved.mlp_up[], ctx)
     var d_gate_up = concat(1, ctx, sgb.d_gate, sgb.d_up)
 
     var sb = sdpa_backward[1, S, H, Dh](
-        saved.q_rope[], saved.k_rope[], saved.v[], d_att_flat, scale, ctx,
+        saved.q_rope[], saved.k_rope[], saved.v[], cb.d_0, scale, ctx,
     )
 
     var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
@@ -747,8 +749,8 @@ def single_block_lora_backward_device_resident[
 
     var d_q_pre_flat = reshape_owned(d_q_pre_t^, [S, D])
     var d_k_pre_flat = reshape_owned(d_k_pre_t^, [S, D])
-    var d_v_flat = reshape(sb.d_v, [S, D], ctx)
-    var d_qkv = concat(1, ctx, d_q_pre_flat, d_k_pre_flat, d_v_flat)   # [S,3D]
+    reshape_in_place(sb.d_v, [S, D])
+    var d_qkv = concat(1, ctx, d_q_pre_flat, d_k_pre_flat, sb.d_v)   # [S,3D]
 
     var d_fused = concat(1, ctx, d_qkv, d_gate_up)   # [S, 3D+2F]
 

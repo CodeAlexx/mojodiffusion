@@ -503,6 +503,21 @@ def reshape_owned(var x: Tensor, var new_shape: List[Int]) raises -> Tensor:
     return x^
 
 
+def reshape_in_place(mut x: Tensor, var new_shape: List[Int]) raises:
+    """Metadata-only reshape for an owned Tensor field or local Tensor."""
+    var n = 1
+    for i in range(len(new_shape)):
+        n *= new_shape[i]
+    if n != x.numel():
+        raise Error(
+            String("reshape_in_place: numel mismatch ")
+            + String(n)
+            + " != "
+            + String(x.numel())
+        )
+    x._shape = new_shape^
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # permute — general axis permutation, materialized contiguous. One thread per
 # OUTPUT element: recover the output multi-index, map each output axis k back to

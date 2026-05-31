@@ -92,7 +92,9 @@ from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
-from serenitymojo.ops.tensor_algebra import reshape, reshape_owned, slice, concat, add
+from serenitymojo.ops.tensor_algebra import (
+    reshape, reshape_owned, reshape_in_place, slice, concat, add,
+)
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
 from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx, LinearGrads
@@ -730,10 +732,10 @@ def _stream_pre_backward[
 
     # join d_q_pre|d_k_pre|d_v back into d_qkv [N,3D] (reshape [1,N,H,Dh]->[N,D]
     # is a byte no-op; then device concat on dim 1).
-    var d_q_pre_flat = reshape(rb_q.d_x, [N, D], ctx)
-    var d_k_pre_flat = reshape(rb_k.d_x, [N, D], ctx)
+    reshape_in_place(rb_q.d_x, [N, D])
+    reshape_in_place(rb_k.d_x, [N, D])
     var d_v_flat = reshape(d_v, [N, D], ctx)
-    var d_qkv = concat(1, ctx, d_q_pre_flat, d_k_pre_flat, d_v_flat)   # [N,3D]
+    var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, d_v_flat)   # [N,3D]
 
     # qkv = linear(norm, Wqkv)
     var lb_qkv = linear_backward(d_qkv, sv.norm[], w.wqkv[], N, D, 3 * D, ctx)
@@ -1265,7 +1267,7 @@ struct _StreamPreBackLora(Copyable, Movable):
 def _stream_pre_backward_lora_resident[
     H: Int, Dh: Int
 ](
-    d_q_rms: Tensor, d_k_rms: Tensor, d_v: Tensor,
+    d_q_rms: Tensor, d_k_rms: Tensor, d_v_flat: Tensor,
     w: StreamWeights, mv: ModVecsDevice, lo: StreamLoraDevice, sv: StreamSaved,
     N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
     compute_aux_grads: Bool = True,
@@ -1277,7 +1279,6 @@ def _stream_pre_backward_lora_resident[
 
     var d_q_pre_flat = reshape_owned(d_q_pre^, [N, D])
     var d_k_pre_flat = reshape_owned(d_k_pre^, [N, D])
-    var d_v_flat = reshape(d_v, [N, D], ctx)
     var d_qkv = concat(1, ctx, d_q_pre_flat, d_k_pre_flat, d_v_flat)   # grad at wqkv OUTPUT [N,3D]
 
     # frozen qkv backward: d_x ONLY (base d_wqkv computed-then-discarded).
@@ -1349,6 +1350,8 @@ def double_block_lora_backward_device_resident[
     var cq = cat_backward(d_q_joint, N_TXT, N_IMG, 1, ctx)
     var ck = cat_backward(d_k_joint, N_TXT, N_IMG, 1, ctx)
     var cv = cat_backward(sb.d_v, N_TXT, N_IMG, 1, ctx)
+    reshape_in_place(cv.d_1, [N_IMG, D])
+    reshape_in_place(cv.d_0, [N_TXT, D])
 
     var iprb = _stream_pre_backward_lora_resident[H, Dh](
         cq.d_1, ck.d_1, cv.d_1, w.img, img_mod, lora.img, saved.img,

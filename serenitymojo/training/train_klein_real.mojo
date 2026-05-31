@@ -61,6 +61,7 @@ from serenitymojo.models.klein.weights import (
     load_double_block_weights, load_single_block_weights,
     load_klein_stack_base, build_klein_vec_silu,
     build_klein_double_modvecs, build_klein_single_modvecs,
+    load_klein_step_mod_weights, build_klein_step_mods_cached,
 )
 from serenitymojo.models.klein.double_block import ModVecs as ModVecsT
 from serenitymojo.models.klein.single_block import SingleModVecs as SingleModVecsT
@@ -312,6 +313,7 @@ def main() raises:
     var sbw = List[SingleBlockWeights]()
     for bi in range(NUM_SINGLE):
         sbw.append(load_single_block_weights(st, bi, ctx))
+    var mod_weights = load_klein_step_mod_weights(st, D, ctx)
     print("  loaded", len(dbw), "double +", len(sbw), "single block weights")
 
     # ── build LoRA set (80 adapters) + rope tables ────────────────────────────
@@ -364,7 +366,7 @@ def main() raises:
         var target = fm.target.to_host(ctx)
 
         # per-step modulation vecs from this sigma
-        var mods = _build_step_mods(st, sigma, ctx)
+        var mods = build_klein_step_mods_cached(mod_weights, sigma, TIMESTEP_DIM, D, ctx)
         var img_mod = mods[0].copy()
         var txt_mod = mods[1].copy()
         var single_mod = mods[2].copy()

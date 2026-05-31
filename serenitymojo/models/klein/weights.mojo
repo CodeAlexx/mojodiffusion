@@ -35,6 +35,30 @@ from serenitymojo.models.klein.single_block import SingleBlockWeights, SingleMod
 from serenitymojo.models.klein.klein_stack import KleinStackBase
 
 
+struct KleinStepModWeights(Movable):
+    """Frozen timestep/modulation weights reused across every training step."""
+
+    var t_in: Tensor
+    var t_out: Tensor
+    var img_mod: Tensor
+    var txt_mod: Tensor
+    var single_mod: Tensor
+
+    def __init__(
+        out self,
+        var t_in: Tensor,
+        var t_out: Tensor,
+        var img_mod: Tensor,
+        var txt_mod: Tensor,
+        var single_mod: Tensor,
+    ):
+        self.t_in = t_in^
+        self.t_out = t_out^
+        self.img_mod = img_mod^
+        self.txt_mod = txt_mod^
+        self.single_mod = single_mod^
+
+
 # Read one named tensor from the safetensors as a host List[Float32] (casts up
 # from the stored dtype — Klein base is BF16).
 def _load_host_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
@@ -206,6 +230,96 @@ def build_klein_single_modvecs(
     var mod_w = _load_host_f32(st, String("single_stream_modulation.lin.weight"), ctx)
     var mod = _linear_row(vec_silu, mod_w, d, 3 * d, ctx)   # [3D]
     return SingleModVecs(_chunk(mod, 0, d), _chunk(mod, 1, d), _chunk(mod, 2, d))
+
+
+def load_klein_step_mod_weights(
+    st: SafeTensors, d: Int, ctx: DeviceContext
+) raises -> KleinStepModWeights:
+    """Load frozen per-step modulation weights once for the timed loop.
+
+    Timestep MLP weights stay in their checkpoint dtype (BF16). The downstream
+    modulation weights are promoted to F32 once so the math matches the legacy
+    host `_linear_row` path that used F32 lists.
+    """
+    var img_h = _load_host_f32(
+        st, String("double_stream_modulation_img.lin.weight"), ctx
+    )
+    var txt_h = _load_host_f32(
+        st, String("double_stream_modulation_txt.lin.weight"), ctx
+    )
+    var single_h = _load_host_f32(
+        st, String("single_stream_modulation.lin.weight"), ctx
+    )
+    return KleinStepModWeights(
+        _load_tensor(st, String("time_in.in_layer.weight"), ctx),
+        _load_tensor(st, String("time_in.out_layer.weight"), ctx),
+        Tensor.from_host(img_h^, [6 * d, d], STDtype.F32, ctx),
+        Tensor.from_host(txt_h^, [6 * d, d], STDtype.F32, ctx),
+        Tensor.from_host(single_h^, [3 * d, d], STDtype.F32, ctx),
+    )
+
+
+def build_klein_vec_silu_device(
+    weights: KleinStepModWeights,
+    timestep: Tensor,
+    timestep_dim: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var vec = t_embedder(
+        timestep,
+        timestep_dim,
+        weights.t_in,
+        Optional[Tensor](None),
+        weights.t_out,
+        Optional[Tensor](None),
+        ctx,
+    )
+    var vec_silu = silu(vec, ctx)
+    if vec_silu.dtype() == STDtype.F32:
+        return vec_silu^
+    return cast_tensor(vec_silu, STDtype.F32, ctx)
+
+
+def _modvec_from_device(mod: Tensor, d: Int, ctx: DeviceContext) raises -> ModVecs:
+    var host = mod.to_host(ctx)
+    return ModVecs(
+        _chunk(host, 0, d), _chunk(host, 1, d), _chunk(host, 2, d),
+        _chunk(host, 3, d), _chunk(host, 4, d), _chunk(host, 5, d),
+    )
+
+
+def _single_modvec_from_device(
+    mod: Tensor, d: Int, ctx: DeviceContext
+) raises -> SingleModVecs:
+    var host = mod.to_host(ctx)
+    return SingleModVecs(_chunk(host, 0, d), _chunk(host, 1, d), _chunk(host, 2, d))
+
+
+def build_klein_step_mods_cached(
+    weights: KleinStepModWeights,
+    sigma: Float32,
+    timestep_dim: Int,
+    d: Int,
+    ctx: DeviceContext,
+) raises -> Tuple[ModVecs, ModVecs, SingleModVecs]:
+    var tvals = List[Float32]()
+    tvals.append(sigma * Float32(1000.0))
+    var tsh = List[Int]()
+    tsh.append(1)
+    var ts = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)
+    var vec_silu = build_klein_vec_silu_device(weights, ts, timestep_dim, ctx)
+
+    var no_bias_img = Optional[Tensor](None)
+    var img_mod = linear(vec_silu, weights.img_mod, no_bias_img^, ctx)
+    var no_bias_txt = Optional[Tensor](None)
+    var txt_mod = linear(vec_silu, weights.txt_mod, no_bias_txt^, ctx)
+    var no_bias_single = Optional[Tensor](None)
+    var single_mod = linear(vec_silu, weights.single_mod, no_bias_single^, ctx)
+    return (
+        _modvec_from_device(img_mod, d, ctx),
+        _modvec_from_device(txt_mod, d, ctx),
+        _single_modvec_from_device(single_mod, d, ctx),
+    )
 
 
 # load a named tensor as a device Tensor (BF16 stored) without casting to host.

@@ -67,6 +67,24 @@ def main() raises:
     print("scratch reset       ", r)
     all_pass = all_pass and r.passed
 
+    ring.reset()
+    var front_mark = ring.mark()
+    var front = ring.clone_tensor(src, ctx)
+    r = h.compare(front, vals, ctx)
+    print("scratch front       ", r)
+    all_pass = all_pass and r.passed
+    var reverse = ring.clone_tensor_reverse(src, ctx)
+    r = h.compare(reverse, vals, ctx)
+    print("scratch reverse     ", r)
+    all_pass = all_pass and r.passed
+    if ring.used_bytes() != 64:
+        raise Error("scratch_ring_smoke: forward+reverse should use one slab")
+
+    ctx.synchronize()
+    ring.rewind(front_mark)
+    if ring.used_bytes() != 0:
+        raise Error("scratch_ring_smoke: rewind did not restore reverse cursor")
+
     var a = Tensor.from_host(vals, [2, 3], F32, ctx)
     var b_vals = _lf(10.0, 11.0, 12.0, 13.0)
     var b = Tensor.from_host(b_vals, [2, 2], F32, ctx)

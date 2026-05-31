@@ -99,7 +99,8 @@ from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
 from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 from serenitymojo.ops.rope_struct_backward import (
-    gate_residual_backward, GateResidualGrads, rope_backward,
+    gate_residual_backward, gate_residual_backward_dxdy, GateResidualGrads,
+    rope_backward,
 )
 from serenitymojo.ops.shape_backward import (
     cat_backward, CatGrads2, slice_backward, reshape_backward,
@@ -698,18 +699,22 @@ def single_block_lora_backward_device_resident[
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
 
-    # result = residual_gate(x, gate, out); recompute the LoRA-MODIFIED out.
-    var nb = Optional[Tensor](None)
-    var out_y = linear(saved.out_in[], w.w2[], nb^, ctx)
-    if lora.out:
-        var dlt2 = klein_lora_fwd_device_resident(saved.att_flat[], lora.out.value(), S, ctx)
-        out_y = add(out_y, dlt2, ctx)
-    var grg = gate_residual_backward(
-        d_out_t[], saved.x[], mv.gate[], out_y, ctx, compute_aux_grads
-    )
+    # result = residual_gate(x, gate, out). When aux modulation grads are
+    # disabled, d_gate is discarded and `out` is not needed for d_x/d_y.
+    var grg: GateResidualGrads
     var d_gate = List[Float32]()
     if compute_aux_grads:
+        var nb = Optional[Tensor](None)
+        var out_y = linear(saved.out_in[], w.w2[], nb^, ctx)
+        if lora.out:
+            var dlt2 = klein_lora_fwd_device_resident(saved.att_flat[], lora.out.value(), S, ctx)
+            out_y = add(out_y, dlt2, ctx)
+        grg = gate_residual_backward(
+            d_out_t[], saved.x[], mv.gate[], out_y, ctx
+        )
         d_gate = grg.d_g.to_host(ctx)
+    else:
+        grg = gate_residual_backward_dxdy(d_out_t[], mv.gate[], ctx)
 
     # base w2 backward (frozen W): d_x ONLY — base d_w2 was computed-then-discarded
     # (W2 is frozen; only LoRA trains). Skipping it drops the d_w2 GEMM + readback.

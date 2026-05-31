@@ -43,11 +43,13 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
 
 5. **Current measured state:** clean `train_klein_real.mojo` runs after cached
    step-modulation weights, metadata reshape cleanup, device-resident modulation
-   chunks/RoPE, and single-block backward copy cleanup are now **~4.2 s/step**:
-   `4.185293`, `4.2358575`, `4.228305`, loss `2.734082`, grad `0.17687473`.
-   Previous clean final was `4.3674574`; prior clean state after resident LoRA
-   A/B + scratch infrastructure was **5.200673 s/step**; best clean prior was
-   **5.1468015**. This is real progress but **NOT the requested 2-3s target**.
+   chunks/RoPE, single-block backward copy cleanup, and no-aux gate-residual
+   y-recompute skipping are now **~4.1 s/step**: `4.106987`, `4.1046743`,
+   loss `2.734082`, grad `0.17687473`. Previous clean band was `4.185293`,
+   `4.2358575`, `4.228305`; previous clean final before that was `4.3674574`.
+   Prior clean state after resident LoRA A/B + scratch infrastructure was
+   **5.200673 s/step**; best clean prior was **5.1468015**. This is real
+   progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
    - single-block backward is the measured dominant region; next target is
@@ -272,6 +274,41 @@ Temporary phase timing, reverted before commit, showed the next real hotspot:
 Inside stack backward: `single=2.3369`, `double=0.4481`, `final=0.0081`.
 That points at single-block backward fusion/views as the next speed lever.
 
+### 2026-05-31 continuation: no-aux gate-residual y recompute skip landed
+
+The real LoRA trainer calls stack backward with `compute_aux_grads=False`, so
+input-token grads and modulation/gate-vector grads are intentionally discarded.
+For `residual_gate(o = x + g*y)`, the gated `y` value is needed only for
+`d_g = sum(grad_out * y)`. It is not needed for `d_x = grad_out` or
+`d_y = grad_out * g`.
+
+Landed changes:
+
+- `ops/rope_struct_backward.mojo`: added `gate_residual_backward_dxdy`, a
+  no-gate-grad helper that computes only d_x and d_y and does not require the
+  `y` tensor.
+- `models/klein/single_block.mojo`: when `compute_aux_grads=False`,
+  single-block LoRA backward skips recomputing the LoRA-modified `out_y`
+  before gate-residual backward.
+- `models/klein/double_block.mojo`: when `compute_aux_grads=False`,
+  double-block LoRA post-backward skips recomputing `mlp_y` and the
+  LoRA-modified `proj_out` before gate-residual backward.
+
+Gates / measurements from this continuation:
+
+| item | result |
+|------|--------|
+| structural backward gate | `rope_struct_bwd_parity` PASS |
+| single-block LoRA gate | `single_block_lora_parity` PASS |
+| double-block LoRA gate | `double_block_lora_parity` PASS |
+| stack LoRA gate | `klein_stack_lora_parity` PASS |
+| accepted real 4B timing runs | `4.106987`, `4.1046743`, loss `2.734082`, grad `0.17687473` |
+| previous clean band | `4.185293`, `4.2358575`, `4.228305`, same loss/grad |
+
+This is a small but real no-math-change win. The next target is still the
+single-block backward core: qkv/gate split materialization, concat/scatter
+materialization, and possible fusion/view carriers.
+
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -323,6 +360,11 @@ models/klein/single_block.mojo,
 models/klein/parity/klein_step_mod_cache_smoke.mojo,
 training/train_klein_real.mojo, docs/MOJO_MODULES.md, this handoff.
 
+Files touched in the no-aux gate-residual y-skip continuation:
+ops/rope_struct_backward.mojo, models/klein/single_block.mojo,
+models/klein/double_block.mojo, docs/MOJO_MODULES.md,
+docs/MOJO_KERNELS.md, this handoff.
+
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 
@@ -343,3 +385,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | Resident LoRA A/B carrier | AGENT-DEFAULT | user asked to focus tensors for all models; removes repeated per-use `from_host` in LoRA helpers while preserving host optimizer/save source of truth |
 | Shared scratch ring allocator | USER | requested after OneTrainer comparison; landed as opt-in slabs usable by all models iff needed |
 | Device mod/RoPE + single-block slice cleanup | AGENT-DEFAULT | kept the API compatible, made the real trainer use device-resident per-step tensors, and removed duplicate D2D slices where lifetime was already proven by `SingleBlockSaved.att_flat` |
+| No-aux gate-residual y-skip | AGENT-DEFAULT | real trainer discards aux modulation/gate grads, so `y` recompute is unnecessary for d_x/d_y and can be skipped without changing trained LoRA gradients |

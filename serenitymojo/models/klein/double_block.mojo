@@ -106,7 +106,8 @@ from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
 from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 from serenitymojo.ops.rope_struct_backward import (
-    gate_residual_backward, GateResidualGrads, rope_backward,
+    gate_residual_backward, gate_residual_backward_dxdy, GateResidualGrads,
+    rope_backward,
 )
 from serenitymojo.ops.shape_backward import (
     cat_backward, CatGrads2, slice_backward, reshape_backward,
@@ -1174,14 +1175,17 @@ def _stream_post_backward_lora_resident(
     N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
     compute_aux_grads: Bool = True,
 ) raises -> _StreamPostBackLora:
-    var no_bias_mlp = Optional[Tensor](None)
-    var mlp_y = linear(sv.act[], w.wd[], no_bias_mlp^, ctx)
-    var grg2 = gate_residual_backward(
-        d_out[], sv.attn_res[], mv.gate2[], mlp_y, ctx, compute_aux_grads
-    )
+    var grg2: GateResidualGrads
     var d_gate2 = List[Float32]()
     if compute_aux_grads:
+        var no_bias_mlp = Optional[Tensor](None)
+        var mlp_y = linear(sv.act[], w.wd[], no_bias_mlp^, ctx)
+        grg2 = gate_residual_backward(
+            d_out[], sv.attn_res[], mv.gate2[], mlp_y, ctx
+        )
         d_gate2 = grg2.d_g.to_host(ctx)
+    else:
+        grg2 = gate_residual_backward_dxdy(d_out[], mv.gate2[], ctx)
 
     # frozen wd backward: d_x ONLY (base d_wd computed-then-discarded by trainer).
     var d_d_dx = linear_backward_dx(grg2.d_y, w.wd[], N, F, D, ctx)
@@ -1202,22 +1206,26 @@ def _stream_post_backward_lora_resident(
     var d_attn_res_norm = layer_norm_backward_dx(mb2.d_x, sv.attn_res[], ones, eps, ctx)
     var d_attn_res_total = TArc(add(grg2.d_x, d_attn_res_norm, ctx))
 
-    # proj_out = linear(att, Wproj) [+ LoRA]; recompute the LoRA-modified proj.
-    var no_bias = Optional[Tensor](None)
-    var proj_out = linear(att[], w.wproj[], no_bias^, ctx)
-    if lo.proj:
-        var dlt = klein_lora_fwd_device_resident(att[], lo.proj.value(), N, ctx)
-        proj_out = add(proj_out, dlt, ctx)
-    var grg1 = gate_residual_backward(
-        d_attn_res_total[], x[], mv.gate1[], proj_out, ctx, compute_aux_grads
-    )
+    # proj_out = linear(att, Wproj) [+ LoRA]. Recompute it only when d_gate1 is
+    # requested; d_x/d_y do not depend on the gated y value.
+    var grg1: GateResidualGrads
     # Consume grg1 by to_host only (no field `^`-move out of the struct). d_y ->
     # host (LoRA bridge needs host); d_g -> host. d_x is just the incoming
     # residual grad, so the LoRA device path carries it by TArc and leaves the
     # legacy host slot empty.
     var d_gate1 = List[Float32]()
     if compute_aux_grads:
+        var no_bias = Optional[Tensor](None)
+        var proj_out = linear(att[], w.wproj[], no_bias^, ctx)
+        if lo.proj:
+            var dlt = klein_lora_fwd_device_resident(att[], lo.proj.value(), N, ctx)
+            proj_out = add(proj_out, dlt, ctx)
+        grg1 = gate_residual_backward(
+            d_attn_res_total[], x[], mv.gate1[], proj_out, ctx
+        )
         d_gate1 = grg1.d_g.to_host(ctx)
+    else:
+        grg1 = gate_residual_backward_dxdy(d_attn_res_total[], mv.gate1[], ctx)
     var d_x_res_t = d_attn_res_total.copy()
     var d_x_res = List[Float32]()
 

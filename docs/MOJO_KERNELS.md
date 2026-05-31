@@ -156,14 +156,18 @@ the target `in_shape` (no input tensor needed). Kernels `_sqrt_bwd_k` (:50),
 | Function | Line | Returns | Math |
 |---|---|---|---|
 | `rope_backward(grad_out, cos, sin, interleaved, ctx)` | :140 | `Tensor` | RoPE bwd; `interleaved` selects interleaved vs halfsplit kernel |
-| `qkv_split_permute_backward(grad_q, grad_k, grad_v, ctx)` | :213 | `Tensor` | inverse of qkv-split+permute (scatter back into packed layout) |
-| `gate_residual_backward(grad_out, x, g, y, ctx)` | :347 | `GateResidualGrads{d_x, d_g, d_y}` | out = x + g·y → d_x, d_g, d_y |
+| `qkv_split_permute_backward(grad_q, grad_k, grad_v, ctx)` | :212 | `Tensor` | inverse of qkv-split+permute (scatter back into packed layout) |
+| `gate_residual_backward(grad_out, x, g, y, ctx)` | :344 | `GateResidualGrads{d_x, d_g, d_y}` | out = x + g·y → d_x, d_g, d_y |
+| `gate_residual_backward_dxdy(grad_out, g, ctx)` | :423 | `GateResidualGrads{d_x, empty d_g, d_y}` | no-aux fast path: d_x=grad_out, d_y=grad_out·g; skips y and d_g reduction |
 
 Grad struct `GateResidualGrads{d_x,d_g,d_y}` (:281). Kernels
 `_rope_bwd_interleaved_kernel_f32` (:70), `_rope_bwd_halfsplit_kernel_f32` (:92),
 `_qkv_scatter_kernel_f32` (:196), `_gate_dxdy_kernel_f32` (:295),
 `_gate_dg_kernel_f32` (:316). `rope_backward` supports **both** RoPE layouts
 (interleaved + halfsplit) — matching the two flame-core RoPE kernels.
+`gate_residual_backward_dxdy` reuses the same d_x/d_y kernel but does not require
+the gated `y` tensor; the real Klein LoRA trainer uses it only when aux
+modulation/gate-vector grads are intentionally disabled.
 
 **Parity gate:** `ops/parity/rope_struct_bwd_parity.mojo`.
 **MEASURED-by-prior-lead:** rope (interleaved+halfsplit) / qkv / gate cos ≥ 0.999.

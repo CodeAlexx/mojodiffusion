@@ -47,17 +47,19 @@ date: 2026-05-31 · supersedes the §5 "next lever" of HANDOFF_2026-05-31_PERF_A
    y-recompute skipping, save-only single-block backward recompute, and
    `SGL_SAVE_TAIL = 9`, shared scratch ring hot-path wiring, F32 no-bias
    `linear` returning the GEMM output directly, scratch-backed frozen
-   `linear_backward_dx` outputs in proven block frames, and the new two-slab
-   OneTrainer-style scratch SDPA work-buffer path, are **~3.57-3.65 s/step**:
-   `3.5673797`, `3.6506753`, `3.6517751`, `3.5703504`,
-   loss `2.734082`, grad `0.17687473`.
+   `linear_backward_dx` outputs in proven block frames, the two-slab
+   OneTrainer-style scratch SDPA work-buffer path, and direct row-split W1
+   forward/backward in single-block scratch frames, are **~3.24-3.33 s/step**:
+   `3.3273206`, `3.237176`, loss `2.7340817`, grad `0.1768747`.
+   The immediate pre-row-split band was `3.5673797`, `3.6506753`,
+   `3.6517751`, `3.5703504`.
    Immediate pre-change baseline was `3.7449117`; previous scratch-only band
    was `3.7256575`, `3.7467637`, `3.7412038`; before that `3.950125`,
    `3.9545975`. This is real progress but **NOT the requested 2-3s target**.
 
 6. **NEXT LEVERS (measured direction, not yet landed):**
-   - single-block backward is still the measured dominant region; next target is
-     fusion/view reduction inside the single-block recompute/backward path;
+   - single-block backward/recompute is still the measured dominant region; next
+     target is the remaining W2 `out_in` concat/split and q/k/v split copies;
    - add runtime Tensor views/offset carriers so qkv split, attention split, concat,
      and reshape-like paths stop materializing D2D copies;
    - scratch-backed linear forward, SDPA backward work buffers, cached norm
@@ -466,6 +468,42 @@ relative to the current `~3.57-3.65s` band. The remaining step-time gap is not
 allocator churn alone; it needs fewer materialized tensor copies and fewer
 kernel launches in single-block backward.
 
+### 2026-05-31 continuation: single-block W1 row-split copy removal landed
+
+The next measured bottleneck was the huge single-block W1 fused projection
+buffer. At 512px 4B dims, `S=1536`, `D=3072`, `F=9216`, so
+`[S, 3D+2F]` is ~162 MiB per single block. The scratch path was still
+materializing that fused output, slicing it into qkv/gate-up, and later
+re-concatenating qkv/gate-up grads before the W1 dx GEMM.
+
+This continuation removes that materialization from the proven single-block
+scratch frames:
+
+- `ops/linear.mojo`: added `linear_rows_scratch`, an opt-in F32 no-bias linear
+  over a contiguous row range of a row-major `[out, in]` weight. This computes
+  W1 qkv rows and gate/up rows directly into their scratch outputs.
+- `ops/linalg_backward.mojo`: added `linear_backward_dx_split_scratch`, which
+  computes `grad0 @ W0 + grad1 @ W1` into one scratch output using the vendor
+  BLAS `beta=1` accumulation path. This avoids materializing
+  `concat(d_qkv, d_gate_up)` before W1 dx.
+- `models/klein/single_block.mojo`: the scratch forward/recompute W1 path now
+  computes qkv and gate/up directly. The LoRA qkv delta is added directly to
+  qkv instead of `klein_add_cols_device` slicing/concatenating the full fused
+  tensor. The scratch backward path feeds d_qkv and d_gate_up directly to the
+  split dx helper.
+
+| item | result |
+|------|--------|
+| scratch gate | `scratch_ring_smoke` PASS, including `scratch linear rows` and `scratch linear split` |
+| single-block LoRA gate | `single_block_lora_parity` PASS |
+| real 4B timing after W1 row-split | `3.3273206`, `3.237176`, loss `2.7340817`, grad `0.1768747` |
+
+Conclusion: this is a real measured copy-removal win, taking the current clean
+band from `~3.57-3.65s` to `~3.24-3.33s`. It is still just above the requested
+2-3s target, but it is now close enough that the remaining reductions should
+focus on W2/out_in materialization and runtime view/offset carriers rather than
+more scratch allocation plumbing alone.
+
 ═══════════════════════════════════════════════════════════════════════════════
 ## §5 — Discipline / method (reproduce before touching anything)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -547,6 +585,11 @@ models/klein/single_block.mojo, models/klein/double_block.mojo,
 models/klein/klein_stack_lora.mojo, training/train_klein_real.mojo,
 docs/MOJO_MODULES.md, docs/MOJO_KERNELS.md, this handoff.
 
+Files touched in the single-block W1 row-split copy-removal continuation:
+ops/linear.mojo, ops/linalg_backward.mojo, scratch_ring_smoke.mojo,
+models/klein/single_block.mojo, docs/MOJO_MODULES.md,
+docs/MOJO_KERNELS.md, this handoff.
+
 Memory: project_mojo_dx_lever_2026-05-31 (win + corrected D2H attribution + next lever);
 project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 
@@ -573,3 +616,4 @@ project_mojo_a1_carrier_win_2026-05-31 (A1/A2); MEMORY.md index updated.
 | Klein scratch hot-path wiring | USER/AGENT | user asked to finish the OneTrainer-style ring allocator; agent kept it shared/opt-in and wired only proven Klein frame lifetimes, measuring `~3.73-3.75s` with unchanged loss/grad |
 | F32 no-bias linear fast path + scratch dx | AGENT-DEFAULT | removed a redundant post-GEMM copy for all F32 no-bias `linear` calls and used scratch-backed frozen dx outputs only inside proven Klein scratch frames, measuring `~3.57-3.65s` with unchanged loss/grad |
 | Scratch SDPA work-buffer path + two-slab real trainer ring | USER/AGENT | user explicitly pointed at OneTrainer and requested re-entrant ring allocator plumbing usable by all models iff needed; implemented as shared opt-in `sdpa_backward_scratch`, proved with smoke/parity, measured timing-neutral `3.6517751s` and final checked rerun `3.5703504s` |
+| Single-block W1 row-split forward/backward | AGENT-DEFAULT | used contiguous W1 row ranges to avoid materializing the huge `[S,3D+2F]` fused tensor and backward concat in scratch frames; measured `3.3273206s` and `3.237176s` with unchanged loss/grad |

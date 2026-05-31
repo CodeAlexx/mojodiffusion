@@ -106,7 +106,7 @@ storage boundary. All parity-gated under `ops/parity/`.
 | Module | Public backward defs (per header) | Forward partner | Status |
 |---|---|---|---|
 | `ops/attention_backward.mojo` | `sdpa_backward[B,S,H,Dh]` and opt-in `sdpa_backward_scratch[B,S,H,Dh]` → (d_q,d_k,d_v); `_softmax_bwd_rows_f32` kernel | `ops/attention.mojo` (math-mode SDPA fwd) | **PROVEN** for non-degenerate parity; scratch variant is **PROVEN** against the normal path by `scratch_ring_smoke` d_q/d_k/d_v equality. |
-| `ops/linalg_backward.mojo` | `mm_backward`, `bmm`, `linear_backward`, `addbias` grads (transposed GEMMs via vendor BLAS) | `ops/linear.mojo` | **PROVEN** (`linalg_bwd_parity`) |
+| `ops/linalg_backward.mojo` | `mm_backward`, `bmm`, `linear_backward`, `addbias` grads, plus opt-in scratch d_x-only helpers including row-split accumulation (transposed GEMMs via vendor BLAS) | `ops/linear.mojo` | **PROVEN** (`linalg_bwd_parity`; scratch row-split helper covered by `scratch_ring_smoke`) |
 | `ops/norm_backward.mojo` | `rms_norm_backward` (+`RmsNormBackward` struct), layer_norm, group_norm (NHWC) d_x/d_g/d_b | `ops/norm.mojo` | **PROVEN** (`norm_bwd_parity`, 8 grads) |
 | `ops/activation_backward.mojo` | `silu_backward`, relu/sigmoid/tanh/gelu(tanh-approx, verbatim from flame-core `gelu_backward.cu`) | `ops/activations.mojo` | **PROVEN** (`activation_bwd_parity`, 5 arms) |
 | `ops/reduce_backward.mojo` | sqrt/square/log/softmax/logsoftmax/sum/mean backward | `ops/reduce.mojo` | **PROVEN** (`reduce_bwd_parity`, 7 incl softmax@1024) |
@@ -206,10 +206,11 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
   instead of producing a discarded block output. The real trainer now routes
   scratch-aware stack wrappers through a shared two-slab `ScratchRingAllocator`
   (512 MiB x 2) for block-local concat/slice temporaries, scratch-backed frozen
-  linear dx outputs, and scratch-backed SDPA backward work buffers. Together with
-  the shared F32 no-bias `linear` fast path, latest clean 4B timing band is
-  `3.5673797`, `3.6506753`, `3.6517751`, `3.5703504`,
-  loss `2.734082`, grad `0.17687473`; still above the 2-3s target.
+  linear dx outputs, scratch-backed SDPA backward work buffers, and direct
+  row-split W1 single-block forward/backward. Together with the shared F32
+  no-bias `linear` fast path, latest clean 4B timing band is `3.3273206`,
+  `3.237176`, loss `2.7340817`, grad `0.1768747`; still just above the 2-3s
+  target.
 - **`models/klein/lora_block.mojo`** (289 L) — LoRA-on-projection helpers shared by the
   double/single LoRA variants; SAME math as `train_step.mojo` plus the projection
   input-grad contribution `d_x_lo`. The hot `*_device` helpers keep activation and
@@ -236,7 +237,8 @@ Master handoff §2 totals this as **~68 backward arms cos ≥ 0.999 vs torch**
 |---|---|---|
 | `scratch_ring.mojo` | `ScratchRingAllocator`: OneTrainer-style fixed GPU scratch slabs (`DType.uint8`), 16-byte aligned sub-buffer allocation, forward allocation from the head, reverse allocation from the tail for backward/recompute frames, explicit `mark`/`rewind`/`reset`, and Tensor wrappers over `create_sub_buffer`. Matches the local OneTrainer pattern in `docs/RamOffloading.md` and `modules/util/LayerOffloadConductor.py`: persistent int8 cache tensors, typed slice/view reinterpretation, and ordered forward/backward allocation. The allocator is shared infrastructure for any model, but callers must opt in and own the frame lifetime; it is not a global Tensor allocator. | **PROVEN** (`scratch_ring_smoke`: clone, alignment, mark/rewind, reset, forward+reverse allocation) |
 | `ops/tensor_algebra_scratch.mojo` | Opt-in scratch-backed hot shape helpers: `concat2_scratch`, `concat3_scratch`, `slice_scratch`. The F32 rank-2 dim-1 path keeps specialized kernels; other valid ranks/dims use copy-backed scratch output. Each helper can allocate from the ring head or tail (`reverse=True`) for backward/recompute frames. Kept separate from `ops/tensor_algebra.mojo` so normal model imports do not compile or use scratch kernels unless explicitly requested. | **PROVEN** (`scratch_ring_smoke`: concat2/slice/concat3 plus rank-4 generic concat/slice parity) |
-| `ops/linear.mojo` | `linear_scratch`: opt-in F32 no-bias linear forward whose output storage comes from `ScratchRingAllocator`; bias and non-F32 paths fall back to normal `linear`. | **PROVEN** (`scratch_ring_smoke`: `scratch linear fwd`) |
+| `ops/linear.mojo` | `linear_scratch`: opt-in F32 no-bias linear forward whose output storage comes from `ScratchRingAllocator`; `linear_rows_scratch`: same storage policy over a contiguous row range of row-major `[out,in]` weights. Bias and non-F32 full-linear paths fall back to normal `linear`; row-range helper is F32-only. | **PROVEN** (`scratch_ring_smoke`: `scratch linear fwd`, `scratch linear rows`) |
+| `ops/linalg_backward.mojo` | `linear_backward_dx_split_scratch`: opt-in frozen-weight d_x helper for two contiguous output-row grad blocks; uses BLAS `beta=1` to accumulate without materializing a concat. | **PROVEN** (`scratch_ring_smoke`: `scratch linear split`) |
 | `ops/attention_backward.mojo` | `sdpa_backward_scratch`: opt-in decomposed SDPA backward that keeps the large recompute/work buffers in a nested scratch frame, rewinds them before return, and returns normal fresh d_q/d_k/d_v tensors. | **PROVEN** (`scratch_ring_smoke`: scratch d_q/d_k/d_v equal normal `sdpa_backward`) |
 
 ## Training orchestration — `training/`
@@ -285,7 +287,7 @@ are imported only by the prepare driver, never by the loop.
 | Module | Intended role (per header, may change) | Status |
 |---|---|---|
 | `pipeline/klein_prepare_alina.mojo` (present) | REAL prepare driver for the Alina LoRA dataset: for 4 staged 512² images + captions, `KleinVaeEncoder.encode` (assert std≈0.96) + Qwen3-8B `encode_klein` (512 tok) → `write_sample` to `output/alina_cache/`. Qwen3+VAE co-reside ONLY in this process; the train process never imports Qwen3. | **IN PROGRESS** — file exists, header complete; not yet lead-run end-to-end. |
-| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It uses cached per-step modulation weights, device modulation chunks, resident RoPE tables loaded before timing, the no-aux gate-residual d_x/d_y path, save-only checkpoint recompute for unsaved single blocks, `SGL_SAVE_TAIL = 9`, one two-slab 512 MiB scratch ring reset per step for scratch-aware Klein block temporaries, scratch-backed frozen linear dx outputs, scratch-backed SDPA backward work buffers, and the shared F32 no-bias `linear` fast path. Latest measured one-step runs: `3.5673797`, `3.6506753`, `3.6517751`, `3.5703504`, loss `2.734082`, grad `0.17687473`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; still above the 2-3s target. |
+| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It uses cached per-step modulation weights, device modulation chunks, resident RoPE tables loaded before timing, the no-aux gate-residual d_x/d_y path, save-only checkpoint recompute for unsaved single blocks, `SGL_SAVE_TAIL = 9`, one two-slab 512 MiB scratch ring reset per step for scratch-aware Klein block temporaries, scratch-backed frozen linear dx outputs, scratch-backed SDPA backward work buffers, direct row-split W1 single-block forward/backward, and the shared F32 no-bias `linear` fast path. Latest measured one-step runs: `3.3273206`, `3.237176`, loss `2.7340817`, grad `0.1768747`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; still just above the 2-3s target. |
 
 ---
 

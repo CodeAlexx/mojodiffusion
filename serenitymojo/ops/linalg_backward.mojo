@@ -371,6 +371,59 @@ def linear_backward_dx_scratch(
     return d_x^
 
 
+def linear_backward_dx_split_scratch(
+    grad_y0: Tensor,
+    grad_y1: Tensor,
+    weight: Tensor,
+    M: Int,
+    in_features: Int,
+    out0_features: Int,
+    out1_features: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    reverse: Bool = False,
+) raises -> Tensor:
+    """d_x-only linear backward from two contiguous output-row grad blocks.
+
+    For weight [out0+out1, in], computes:
+      d_x = grad_y0 @ weight[0:out0, :] + grad_y1 @ weight[out0:, :]
+
+    This avoids materializing concat(grad_y0, grad_y1) for row-split projections.
+    """
+    if (
+        grad_y0.dtype() != STDtype.F32
+        or grad_y1.dtype() != STDtype.F32
+        or weight.dtype() != STDtype.F32
+    ):
+        raise Error("linear_backward_dx_split_scratch: F32 tensors required")
+
+    var d_x = _new_f32_scratch(M, in_features, scratch, reverse)
+
+    var mo0_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, out0_features))
+    var mo1_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, out1_features))
+    var mi_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, in_features))
+    var w0_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out0_features, in_features))
+    var w1_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out1_features, in_features))
+    var gy0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        grad_y0.buf.unsafe_ptr().bitcast[Float32](), mo0_rl
+    )
+    var gy1 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        grad_y1.buf.unsafe_ptr().bitcast[Float32](), mo1_rl
+    )
+    var wptr = weight.buf.unsafe_ptr().bitcast[Float32]()
+    var w0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](wptr, w0_rl)
+    var w1 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        wptr + out0_features * in_features, w1_rl
+    )
+    var dx = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        d_x.buf.unsafe_ptr().bitcast[Float32](), mi_rl
+    )
+
+    matmul(ctx, dx, gy0, w0, c_row_major=True)
+    matmul(ctx, dx, gy1, w1, c_row_major=True, beta=1.0)
+    return d_x^
+
+
 # ── linear backward, d_W ONLY (LoRA trainable-weight path) ───────────────────
 #   d_W[out,in] = grad_y[M,out]ᵀ @ x[M,in]. This sibling is useful for LoRA
 #   adapters where d_A/d_B are needed but the bias gradient is not.

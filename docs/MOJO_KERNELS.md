@@ -50,6 +50,7 @@ only at the load/store cast. Most other backward files are **F32-only** (the
 | `linear_backward(grad_y, x, weight, M, in_features, out_features, ctx)` | :263 | `LinearGrads{d_x, d_w, d_b}` | y=x@Wᵀ+b → d_x=grad@W; d_W=gradᵀ@x; d_b=colsum(grad) |
 | `linear_backward_dx(grad_y, weight, M, in_features, out_features, ctx)` | :311 | `Tensor` | d_x-only path for frozen weights; skips d_W/d_b work and readback |
 | `linear_backward_dx_scratch(..., scratch, reverse=False)` | :342 | `Tensor` | same d_x GEMM as `linear_backward_dx`, but output storage comes from an opt-in scratch ring |
+| `linear_backward_dx_split_scratch(grad_y0, grad_y1, weight, ..., scratch)` | — | `Tensor` | d_x-only path for two contiguous weight-row grad blocks; uses BLAS `beta=1` accumulation to avoid materializing `concat(grad_y0, grad_y1)` |
 | `linear_backward_dw(grad_y, x, M, in_features, out_features, ctx)` | :377 | `Tensor` | d_W-only path used by LoRA d_A/d_B helpers |
 | `addbias_backward(grad_y, M, out_features, ctx)` | :408 | `AddBiasGrads{d_x, d_b}` | d_x=grad; d_b=colsum(grad) |
 
@@ -441,8 +442,9 @@ temporaries.
 **Parity gate:** `scratch_ring_smoke.mojo` covers clone, alignment,
 mark/rewind, reset, forward+reverse allocation, scratch concat2, scratch slice,
 scratch concat3, rank-4 generic concat/slice from the reverse cursor,
-scratch-backed F32 no-bias `linear_scratch`, and `sdpa_backward_scratch`
-d_q/d_k/d_v equality against the normal SDPA backward.
+scratch-backed F32 no-bias `linear_scratch`, row-range `linear_rows_scratch`,
+split-accumulating `linear_backward_dx_split_scratch`, and
+`sdpa_backward_scratch` d_q/d_k/d_v equality against the normal SDPA backward.
 
 ---
 
@@ -467,12 +469,13 @@ files read):
 - **No CUDA-graph capture/replay, no global caching allocator.** Many Mojo ops
   still `enqueue_create_buffer` fresh. The F32 no-bias `linear` path now returns
   the vendor-BLAS GEMM output directly instead of allocating/copying through a
-  second output buffer; `linear_scratch` and `linear_backward_dx_scratch` can
-  allocate proven short-lived linear outputs from an opt-in ring; and
-  `sdpa_backward_scratch` reuses ring storage for large SDPA backward work
-  buffers. A shared scratch ring exists, and the real Klein LoRA path uses it
-  for proven block-local temporaries, but other model paths must explicitly
-  adopt it at their own frame boundaries.
+  second output buffer; `linear_scratch`, `linear_rows_scratch`,
+  `linear_backward_dx_scratch`, and `linear_backward_dx_split_scratch` can
+  allocate proven short-lived linear outputs from an opt-in ring while avoiding
+  selected row-split materializations; and `sdpa_backward_scratch` reuses ring
+  storage for large SDPA backward work buffers. A shared scratch ring exists,
+  and the real Klein LoRA path uses it for proven block-local temporaries, but
+  other model paths must explicitly adopt it at their own frame boundaries.
 
 These are expected for a from-scratch port whose proven scope is *correctness
 through composition*, not throughput. As of this session there is **no open

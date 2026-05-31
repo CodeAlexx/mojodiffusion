@@ -378,3 +378,60 @@ def linear_scratch(
     )
     matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
     return out^
+
+
+def linear_rows_scratch(
+    x: Tensor,
+    weight: Tensor,
+    row_start: Int,
+    row_count: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    reverse: Bool = False,
+) raises -> Tensor:
+    """Scratch-backed F32 no-bias linear over a contiguous weight-row range."""
+    if x.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
+        raise Error("linear_rows_scratch: F32 tensors required")
+
+    var xshape = x.shape()
+    var wshape = weight.shape()
+    if len(xshape) < 1:
+        raise Error("linear_rows_scratch: x must have rank >= 1")
+    if len(wshape) != 2:
+        raise Error("linear_rows_scratch: weight must be rank-2 [out, in]")
+    var in_dim = xshape[len(xshape) - 1]
+    var out_dim = wshape[0]
+    var k = wshape[1]
+    if k != in_dim:
+        raise Error("linear_rows_scratch: weight in-dim != x last dim")
+    if row_start < 0 or row_count < 0 or row_start + row_count > out_dim:
+        raise Error("linear_rows_scratch: row range out of bounds")
+
+    var m = 1
+    for i in range(len(xshape) - 1):
+        m *= xshape[i]
+
+    var out_shape = List[Int]()
+    for i in range(len(xshape) - 1):
+        out_shape.append(xshape[i])
+    out_shape.append(row_count)
+    var out: Tensor
+    if reverse:
+        out = scratch.alloc_tensor_reverse(out_shape^, STDtype.F32)
+    else:
+        out = scratch.alloc_tensor(out_shape^, STDtype.F32)
+
+    var a_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, in_dim))
+    var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](row_count, k))
+    var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, row_count))
+    var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        x.buf.unsafe_ptr().bitcast[Float32](), a_rl
+    )
+    var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        weight.buf.unsafe_ptr().bitcast[Float32]() + row_start * k, b_rl
+    )
+    var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        out.buf.unsafe_ptr().bitcast[Float32](), c_rl
+    )
+    matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
+    return out^

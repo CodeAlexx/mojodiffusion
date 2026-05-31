@@ -18,8 +18,9 @@ from serenitymojo.ops.tensor_algebra_scratch import (
 from serenitymojo.ops.linalg_backward import (
     linear_backward_dx,
     linear_backward_dx_scratch,
+    linear_backward_dx_split_scratch,
 )
-from serenitymojo.ops.linear import linear, linear_scratch
+from serenitymojo.ops.linear import linear, linear_scratch, linear_rows_scratch
 from serenitymojo.ops.attention_backward import sdpa_backward, sdpa_backward_scratch
 
 
@@ -148,6 +149,16 @@ def main() raises:
     all_pass = all_pass and r.passed
 
     ring.reset()
+    var gy0 = Tensor.from_host(_lf(1.0, 0.5), [2, 1], F32, ctx)
+    var gy1 = Tensor.from_host(_lf(-2.0, 3.0, 4.0, -1.0), [2, 2], F32, ctx)
+    var dx_split = linear_backward_dx_split_scratch(
+        gy0, gy1, wt, 2, 4, 1, 2, ctx, ring,
+    )
+    r = h.compare(dx_split, dx_ref, ctx)
+    print("scratch linear split", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
     var lin_x = Tensor.from_host(_lf(1.0, -2.0, 0.5, 3.0, 2.0, 1.5, -1.0, 0.25), [2, 4], F32, ctx)
     var no_bias = Optional[Tensor](None)
     var lin_ref_t = linear(lin_x, wt, no_bias^, ctx)
@@ -156,6 +167,14 @@ def main() raises:
     var lin_scratch = linear_scratch(lin_x, wt, no_bias_scratch^, ctx, ring)
     r = h.compare(lin_scratch, lin_ref, ctx)
     print("scratch linear fwd  ", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
+    var lin_rows = linear_rows_scratch(lin_x, wt, 1, 2, ctx, ring)
+    var lin_rows_ref_t = slice_scratch(lin_ref_t, 1, 1, 2, ctx, ring)
+    var lin_rows_ref = lin_rows_ref_t.to_host(ctx)
+    r = h.compare(lin_rows, lin_rows_ref, ctx)
+    print("scratch linear rows ", r)
     all_pass = all_pass and r.passed
 
     var att_ring = ScratchRingAllocator(ctx, 4096, 2)

@@ -80,7 +80,7 @@ from serenitymojo.scratch_ring import ScratchRingAllocator
 comptime TArc = ArcPointer[Tensor]
 
 # ── forward ops (GPU) ────────────────────────────────────────────────────────
-from serenitymojo.ops.linear import linear, linear_scratch
+from serenitymojo.ops.linear import linear, linear_scratch, linear_rows_scratch
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
@@ -95,7 +95,8 @@ from serenitymojo.ops.tensor_algebra_scratch import (
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
 from serenitymojo.ops.linalg_backward import (
-    linear_backward, linear_backward_dx, linear_backward_dx_scratch, LinearGrads,
+    linear_backward, linear_backward_dx, linear_backward_dx_scratch,
+    linear_backward_dx_split_scratch, LinearGrads,
 )
 from serenitymojo.ops.norm_backward import (
     rms_norm_backward, rms_norm_backward_dx, RmsNormBackward,
@@ -677,14 +678,11 @@ def single_block_lora_forward_device_resident_scratch[
     var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
 
     var scratch_mark = scratch.mark()
-    var no_bias = Optional[Tensor](None)
-    var fused = linear_scratch(norm_t, w.w1[], no_bias^, ctx, scratch)
+    var qkv = linear_rows_scratch(norm_t, w.w1[], 0, 3 * D, ctx, scratch)
+    var gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
     if lora.qkv:
         var dlt = klein_lora_fwd_device_resident(norm_t, lora.qkv.value(), S, ctx)
-        fused = klein_add_cols_device(fused, dlt, S, 3 * D + 2 * F, 3 * D, ctx)
-
-    var qkv = slice_scratch(fused, 1, 0, 3 * D, ctx, scratch)
-    var gate_up = slice_scratch(fused, 1, 3 * D, 2 * F, ctx, scratch)
+        qkv = add(qkv, dlt, ctx)
 
     var q_pre_flat = slice(qkv, 1, 0, D, ctx)
     var k_pre_flat = slice(qkv, 1, D, D, ctx)
@@ -806,14 +804,11 @@ def single_block_lora_recompute_saved_device_resident_scratch[
     var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
 
     var scratch_mark = scratch.mark()
-    var no_bias = Optional[Tensor](None)
-    var fused = linear_scratch(norm_t, w.w1[], no_bias^, ctx, scratch)
+    var qkv = linear_rows_scratch(norm_t, w.w1[], 0, 3 * D, ctx, scratch)
+    var gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
     if lora.qkv:
         var dlt = klein_lora_fwd_device_resident(norm_t, lora.qkv.value(), S, ctx)
-        fused = klein_add_cols_device(fused, dlt, S, 3 * D + 2 * F, 3 * D, ctx)
-
-    var qkv = slice_scratch(fused, 1, 0, 3 * D, ctx, scratch)
-    var gate_up = slice_scratch(fused, 1, 3 * D, 2 * F, ctx, scratch)
+        qkv = add(qkv, dlt, ctx)
 
     var q_pre_flat = slice(qkv, 1, 0, D, ctx)
     var k_pre_flat = slice(qkv, 1, D, D, ctx)
@@ -1050,10 +1045,8 @@ def single_block_lora_backward_device_resident_scratch[
     reshape_in_place(sb.d_v, [S, D])
     var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, sb.d_v, True)
 
-    var d_fused = concat2_scratch(1, ctx, scratch, d_qkv, d_gate_up)
-
-    var d_norm_t = linear_backward_dx_scratch(
-        d_fused, w.w1[], S, D, 3 * D + 2 * F, ctx, scratch,
+    var d_norm_t = linear_backward_dx_split_scratch(
+        d_qkv, d_gate_up, w.w1[], S, D, 3 * D, 2 * F, ctx, scratch,
     )
 
     var qkv_d_a = List[Float32]()

@@ -58,13 +58,15 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
   staging/prepare/train path for the Alina 512 dataset. It handles the current
   production bucket set `72x56/cap224`, `72x56/cap256`, `88x48/cap224`, and
   `88x48/cap256`.
-- The 2026-06-02 100-step run after the speed fix logged
-  `loss=0.47321588 -> 0.35350168`, `nonfinite=0`, final step `4.075s`, and
-  warm cadence about `4.0-4.15s/step` batch 1. Saved LoRA:
+- The 2026-06-02 100-step run after the tensor-resident main-stack speed fix
+  logged `loss=0.47321588 -> 0.35350168`, `nonfinite=0`, final step `1.993s`,
+  and warm cadence about `1.96-2.00s/step` batch 1. Saved LoRA:
   `output/alina_zimage/zimage_lora_step100.safetensors`.
 - Do not regress to the old `445` loss or `100s/step` path. The speed fix was
-  keeping LoRA adapters device-resident and using `rms_norm_backward_dx` for
-  frozen RMSNorms instead of computing unused norm weight gradients.
+  keeping LoRA adapters device-resident, using `rms_norm_backward_dx` for frozen
+  RMSNorms instead of computing unused norm weight gradients, and keeping the
+  30-layer main stack tensor-resident across forward/backward recompute instead
+  of round-tripping each block through host lists.
 
 ## Gaps vs Rust/Flame
 

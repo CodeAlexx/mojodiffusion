@@ -533,11 +533,17 @@ Speed status after the `nsys` pass:
 
 - Old full-depth diagnostic: about `100s/step`; `nsys` showed about `35s` in
   full RMSNorm backward weight-gradient reductions for frozen norms.
-- Production path now keeps LoRA on device and uses `rms_norm_backward_dx` for
-  frozen norms.
-- 100-step run: `output/logs/zimage_train_100_speedfix_2026-06-02.log`
+- First production speed fix kept LoRA on device and used `rms_norm_backward_dx`
+  for frozen norms, dropping warm cadence to about `4.0-4.15s/step`.
+- Second production speed fix keeps the 30-layer main stack tensor-resident
+  across forward and backward recompute. Do not reintroduce per-main-block
+  `to_host()`/`Tensor.from_host()` boundaries.
+- 100-step run: `output/logs/zimage_train_100_speed2_tensor_main_2026-06-02.log`
 - Result: loss `0.47321588 -> 0.35350168`, `nonfinite=0`, final step
-  `4.075s`, warm cadence about `4.0-4.15s/step` batch 1.
+  `1.993s`, warm cadence about `1.96-2.00s/step` batch 1.
+- Bucket proof on the speed path: cap256 steps `27`, `30`, `44`, `78`, `81`,
+  and `95` stayed finite; the `88x48/cap224` singleton at step `51` ran at
+  `1.981s` with loss `0.46069825`.
 - Saved LoRA: `output/alina_zimage/zimage_lora_step100.safetensors`
 
 Remaining Z-Image gap: validation sampling is not yet wired into

@@ -72,7 +72,7 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.elementwise import modulate
 from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx
-from serenitymojo.ops.norm_backward import layer_norm_backward
+from serenitymojo.ops.norm_backward import layer_norm_backward, layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
 from serenitymojo.models.zimage.weights import ZImageBlockWeights
@@ -86,7 +86,7 @@ from serenitymojo.models.zimage.lora_block import (
     SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_W1, SLOT_W3, SLOT_W2,
     zimage_block_lora_forward, zimage_block_lora_backward,
     zimage_block_lora_forward_device, zimage_block_lora_backward_device,
-    zimage_block_lora_backward_device_tensors,
+    zimage_block_lora_forward_device_tensor, zimage_block_lora_backward_device_tensors,
     zimage_refiner_lora_forward, zimage_refiner_lora_backward,
 )
 from serenitymojo.models.zimage.zimage_stack import (
@@ -628,32 +628,32 @@ def zimage_stack_lora_forward_main_device[
         cs = fwd.out.copy()
 
     var x = _concat_img_cap(xs, cs)
+    var x_arc = TArc(_t(x^, [S, D], ctx))
 
     var main_x_in = List[TArc]()
     for i in range(num_main):
-        main_x_in.append(TArc(_t(x.copy(), [S, D], ctx)))
         var bl = _block_lora_dev_for(lora, lora.main_base() + i)
-        var fwd = zimage_block_lora_forward_device[H, Dh, S](
-            x.copy(), main_blocks[i], main_mod[i], bl, uni_cos, uni_sin, D, F, eps, ctx,
+        var fwd = zimage_block_lora_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod[i], bl, uni_cos, uni_sin, D, F, eps, ctx,
         )
-        x = fwd.out.copy()
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
 
-    var ln_x = layer_norm(
-        _t(x.copy(), [S, D], ctx),
-        _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
-    ).to_host(ctx)
-    var x_out = modulate(
-        _t(ln_x.copy(), [S, D], ctx),
-        _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
-    ).to_host(ctx)
-    var patches = _linear_wdev_bias(x_out, final_lin_w, final_lin_b, S, D, ctx)
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = modulate(
+        ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
     var parts = _split_img_cap(patches, N_IMG, N_TXT, out_ch)
     var out = parts[0].copy()
 
     return ZImageStackForward(
         out^, x_seq.copy(), cap_seq.copy(),
         nr_x_in^, cr_x_in^, main_x_in^,
-        TArc(_t(x^, [S, D], ctx)), TArc(_t(ln_x^, [S, D], ctx)),
+        x_arc.copy(), TArc(ln_t^),
     )
 
 
@@ -675,21 +675,18 @@ def zimage_stack_lora_backward_main_device[
     var num_blocks = lora.num_blocks()
 
     var d_patches = _concat_img_cap(d_out, _zeros(N_TXT * out_ch))
-    var x_out = _saved_x_out(saved, f_scale, D, S, ctx)
     var final_dx = linear_backward_dx(
         _t(d_patches, [S, out_ch], ctx), final_lin_w, S, D, out_ch, ctx,
     )
-    var d_x_out = final_dx.to_host(ctx)
     var d_final_lin = List[Float32]()
     var mbf = modulate_backward(
-        _t(d_x_out, [S, D], ctx), saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+        final_dx, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
     )
-    var d_ln_x = mbf.d_x.to_host(ctx)
     var d_f_scale = mbf.d_scale.to_host(ctx)
-    var lnbf = layer_norm_backward(
-        _t(d_ln_x, [S, D], ctx), saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
     )
-    var d_x = lnbf.d_x.to_host(ctx)
+    var d_x = TArc(d_x_t^)
 
     var grad_indices = List[Int]()
     var d_a_t = List[TArc]()
@@ -698,12 +695,12 @@ def zimage_stack_lora_backward_main_device[
     var bi = num_main - 1
     while bi >= 0:
         var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
-        var refwd = zimage_block_lora_forward_device[H, Dh, S](
-            saved.main_x_in[bi][].to_host(ctx), main_blocks[bi], main_mod[bi], bl,
+        var refwd = zimage_block_lora_forward_device_tensor[H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod[bi], bl,
             uni_cos, uni_sin, D, F, eps, ctx,
         )
         var bg = zimage_block_lora_backward_device_tensors[H, Dh, S](
-            d_x.copy(), main_blocks[bi], main_mod[bi], bl, refwd.saved,
+            d_x[], main_blocks[bi], main_mod[bi], bl, refwd.saved,
             uni_cos, uni_sin, D, F, eps, ctx,
         )
         d_x = bg.d_x.copy()

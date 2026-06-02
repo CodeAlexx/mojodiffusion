@@ -17,21 +17,21 @@
 #     reduces to base when adapters absent; LoRA d_x summed into the proj-input grad.
 #   * training/{lora_save, train_step, optim} : LoraAdapter, _lora_adamw, save_lora_peft.
 #
-# TARGET SET (OneTrainer-faithful) — read line-by-line from OT source:
+# TARGET SET (OneTrainer baseline filter) — read line-by-line from OT source:
 #   ZImageLoRASetup.py:57 -> LoRAModuleWrapper(model.transformer, "transformer",
-#   config, config.layer_filter.split(",")). With the default (empty) filter,
+#   config, config.layer_filter.split(",")). With an empty filter,
 #   LoRAModule.py:638-656 (__create_modules) adapts EVERY nn.Linear/Conv2d child of
 #   the transformer. The diffusers ZImageTransformer2DModel
 #   (transformer_z_image.py:184-224, 359+) gives each block:
 #       attention (diffusers Attention -> to_q, to_k, to_v, to_out.0)  [4 Linear]
 #       feed_forward (FeedForward -> w1, w3, w2)                        [3 Linear]
-#   in noise_refiner.<i>, context_refiner.<i>, and layers.<i>. So the LoRA target
-#   set is 7 adapters per block × every refiner + main layer. (The adaLN_modulation
-#   Linear, t_embedder, x/cap_embedder, FinalLayer.linear ALSO match the default
-#   filter, but those are the TRAIN-LOOP-phase backprop links exactly as the base
-#   stack defers them — this milestone trains the 7 in-block projections, the
-#   canonical attn+MLP LoRA set, matching the Ernie milestone scope. Restricting to
-#   these via `config.layer_filter` is the standard kohya/PEFT recipe.)
+#   in noise_refiner.<i>, context_refiner.<i>, and layers.<i>.
+#
+#   The active OneTrainer Z-Image baseline does NOT use the empty filter. It uses:
+#     ^(?=.*attention)(?!.*refiner).*,^(?=.*feed_forward)(?!.*refiner).*
+#   so only main `layers.<i>.{attention,feed_forward}` are trainable; noise/context
+#   refiners are excluded. This file can carry refiner adapters for parity smokes,
+#   but production train uses the `*_main_only` optimizer/save helpers below.
 #
 # KEY NAMING (round-trip with OT / inference-flame) — slot order Q,K,V,O,w1,w3,w2:
 #   OT saves transformer_lora.state_dict() (ZImageLoRASaver.py:24-25), whose keys
@@ -71,7 +71,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.elementwise import modulate
-from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx
 from serenitymojo.ops.norm_backward import layer_norm_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
@@ -369,12 +369,11 @@ def zimage_stack_lora_backward[
     # ── final-layer backward (identical to base stack) ──
     var d_patches = _concat_img_cap(d_out, _zeros(N_TXT * out_ch))
     var x_out = _saved_x_out(saved, f_scale, D, S, ctx)
-    var lbf = linear_backward(
-        _t(d_patches, [S, out_ch], ctx), _t(x_out, [S, D], ctx),
-        final_lin_w, S, D, out_ch, ctx,
+    var final_dx = linear_backward_dx(
+        _t(d_patches, [S, out_ch], ctx), final_lin_w, S, D, out_ch, ctx,
     )
-    var d_x_out = lbf.d_x.to_host(ctx)
-    var d_final_lin = lbf.d_w.to_host(ctx)
+    var d_x_out = final_dx.to_host(ctx)
+    var d_final_lin = List[Float32]()
     var mbf = modulate_backward(
         _t(d_x_out, [S, D], ctx), saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
     )
@@ -490,6 +489,20 @@ def zimage_lora_adamw_step(
         _lora_adamw(set.ad[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
 
 
+# ── AdamW step on OneTrainer baseline trainable adapters only: main layers. ──
+def zimage_lora_adamw_step_main_only(
+    mut set: ZImageLoraSet, grads: ZImageLoraGrads, t: Int, lr: Float32,
+    ctx: DeviceContext,
+    beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
+    eps: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
+) raises:
+    var start = set.main_base() * ZIMAGE_SLOTS
+    var end = set.num_blocks() * ZIMAGE_SLOTS
+    for i in range(start, end):
+        var lg = LoraGrads(grads.d_a[i].copy(), grads.d_b[i].copy())
+        _lora_adamw(set.ad[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
+
+
 # ── per-block PEFT/kohya prefix scheme (the INVERSE of the inference target map) ─
 # slot -> diffusers module suffix (transformer_z_image.py + zimage/weights.mojo).
 def _slot_suffix(slot: Int) -> String:
@@ -534,6 +547,17 @@ def zimage_lora_prefixes(set: ZImageLoraSet) -> List[String]:
 def save_zimage_lora(set: ZImageLoraSet, path: String, ctx: DeviceContext) raises -> Int:
     var named = List[NamedLora]()
     for bi in range(set.num_blocks()):
+        for s in range(ZIMAGE_SLOTS):
+            named.append(NamedLora(
+                _zimage_lora_prefix(set, bi, s),
+                set.ad[bi * ZIMAGE_SLOTS + s].copy(),
+            ))
+    return save_lora_peft(named, path, ctx)
+
+
+def save_zimage_lora_main_only(set: ZImageLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    var named = List[NamedLora]()
+    for bi in range(set.main_base(), set.num_blocks()):
         for s in range(ZIMAGE_SLOTS):
             named.append(NamedLora(
                 _zimage_lora_prefix(set, bi, s),

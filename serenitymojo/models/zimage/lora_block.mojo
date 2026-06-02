@@ -34,8 +34,8 @@
 #   The base path (frozen W) ALSO yields d_x_base = d_y' @ W; the caller SUMS d_x
 #   into that. d_A/d_B go to the optimizer; the base W grad is discarded for LoRA.
 #
-# NO NEW ops/ PRIMITIVE: forward = two linear()s; backward = two linear_backward()s.
-# Mirrors models/ernie/lora_block.mojo's zimage_lora_fwd/_bwd byte-for-byte.
+# Base weights are frozen during LoRA training, so the base projection backward
+# computes d_x only. LoRA A/B grads still use full low-rank linear_backward.
 #
 # Mojo 1.0.0b1: def not fn; Tensor move-only crosses API as host List[Float32].
 
@@ -46,7 +46,7 @@ from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
-from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx
 
 # REUSE the trainer's LoRA structs (the target authority).
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
@@ -228,19 +228,17 @@ struct ZImageBlockLoraGrads(Copyable, Movable):
         self.d_b = d_b^
 
 
-# proj-backward result: d_x [M,in] (base + LoRA summed) and d_w (base, discarded).
+# proj-backward result: d_x [M,in] (base + LoRA summed). Base d_w is discarded
+# for LoRA training and must not be materialized for Z-Image full depth.
 struct _ProjGrads(Movable):
     var d_x: Tensor
-    var d_w: Tensor
 
-    def __init__(out self, var d_x: Tensor, var d_w: Tensor):
+    def __init__(out self, var d_x: Tensor):
         self.d_x = d_x^
-        self.d_w = d_w^
 
 
-# helper: run base linear_backward d_x then add the LoRA branch's d_x (if present),
+# helper: run frozen-base d_x then add the LoRA branch's d_x (if present),
 # collecting the LoRA d_a/d_b into the slot lists. Returns the SUMMED d_x [M,in].
-# Identical to ernie/lora_block._proj_bwd_with_lora.
 def _proj_bwd_with_lora(
     d_y: Tensor, x_in: Tensor, w: Tensor, x_in_h: List[Float32],
     lo: Optional[LoraAdapter], slot: Int,
@@ -248,18 +246,16 @@ def _proj_bwd_with_lora(
     mut d_a_slots: List[List[Float32]], mut d_b_slots: List[List[Float32]],
     ctx: DeviceContext,
 ) raises -> _ProjGrads:
-    var lb = linear_backward(d_y, x_in, w, M, in_f, out_f, ctx)
-    var d_w = lb.d_w.clone(ctx)
+    var base_dx = linear_backward_dx(d_y, w, M, in_f, out_f, ctx)
     if lo:
         var d_y_h = d_y.to_host(ctx)
         var lg = zimage_lora_bwd(d_y_h, x_in_h, lo.value(), M, ctx)
         d_a_slots[slot] = lg.d_a.copy()
         d_b_slots[slot] = lg.d_b.copy()
-        var base_dx = lb.d_x.to_host(ctx)
-        var summed = _add_lists(base_dx, lg.d_x)
-        return _ProjGrads(_t(summed, [M, in_f], ctx), d_w^)
-    var d_x = lb.d_x.clone(ctx)
-    return _ProjGrads(d_x^, d_w^)
+        var base_dx_h = base_dx.to_host(ctx)
+        var summed = _add_lists(base_dx_h, lg.d_x)
+        return _ProjGrads(_t(summed, [M, in_f], ctx))
+    return _ProjGrads(base_dx^)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -420,7 +416,7 @@ def zimage_block_lora_backward[
         rb_fn2.d_x, saved.act[], w.w2[], act_h,
         lora.w2, SLOT_W2, S, F, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_w2 = lb_w2.d_w.to_host(ctx)
+    var d_w2 = List[Float32]()
 
     # act = swiglu(g_pre, u) -> d_g_pre, d_u
     var sg = swiglu_backward(lb_w2.d_x, saved.g_pre[], saved.u[], ctx)
@@ -431,12 +427,12 @@ def zimage_block_lora_backward[
         sg.d_gate, saved.xfn1s[], w.w1[], xfn1s_h,
         lora.w1, SLOT_W1, S, D, F, d_a_slots, d_b_slots, ctx,
     )
-    var d_w1 = lb_w1.d_w.to_host(ctx)
+    var d_w1 = List[Float32]()
     var lb_w3 = _proj_bwd_with_lora(
         sg.d_up, saved.xfn1s[], w.w3[], xfn1s_h,
         lora.w3, SLOT_W3, S, D, F, d_a_slots, d_b_slots, ctx,
     )
-    var d_w3 = lb_w3.d_w.to_host(ctx)
+    var d_w3 = List[Float32]()
     var d_xfn1s = add(lb_w1.d_x, lb_w3.d_x, ctx)
 
     # xfn1s = modulate(xfn1, scale_mlp, 0)
@@ -463,7 +459,7 @@ def zimage_block_lora_backward[
         rb_n2.d_x, saved.att_flat[], w.wo[], att_flat_h,
         lora.to_out, SLOT_O, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wo = lb_o.d_w.to_host(ctx)
+    var d_wo = List[Float32]()
 
     reshape_in_place(lb_o.d_x, [1, S, H, Dh])
     var sb = sdpa_backward[1, S, H, Dh](
@@ -487,17 +483,17 @@ def zimage_block_lora_backward[
         rb_q.d_x, saved.xn1s[], w.wq[], xn1s_h,
         lora.to_q, SLOT_Q, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wq = lb_q.d_w.to_host(ctx)
+    var d_wq = List[Float32]()
     var lb_k = _proj_bwd_with_lora(
         rb_k.d_x, saved.xn1s[], w.wk[], xn1s_h,
         lora.to_k, SLOT_K, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wk = lb_k.d_w.to_host(ctx)
+    var d_wk = List[Float32]()
     var lb_v = _proj_bwd_with_lora(
         sb.d_v, saved.xn1s[], w.wv[], xn1s_h,
         lora.to_v, SLOT_V, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wv = lb_v.d_w.to_host(ctx)
+    var d_wv = List[Float32]()
     var d_xn1s = add(add(lb_q.d_x, lb_k.d_x, ctx), lb_v.d_x, ctx)
 
     # xn1s = modulate(xn1, scale_msa, 0)
@@ -655,7 +651,7 @@ def zimage_refiner_lora_backward[
         rb_fn2.d_x, saved.act[], w.w2[], act_h,
         lora.w2, SLOT_W2, S, F, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_w2 = lb_w2.d_w.to_host(ctx)
+    var d_w2 = List[Float32]()
 
     var sg = swiglu_backward(lb_w2.d_x, saved.g_pre[], saved.u[], ctx)
 
@@ -665,12 +661,12 @@ def zimage_refiner_lora_backward[
         sg.d_gate, saved.xfn1[], w.w1[], xfn1_h,
         lora.w1, SLOT_W1, S, D, F, d_a_slots, d_b_slots, ctx,
     )
-    var d_w1 = lb_w1.d_w.to_host(ctx)
+    var d_w1 = List[Float32]()
     var lb_w3 = _proj_bwd_with_lora(
         sg.d_up, saved.xfn1[], w.w3[], xfn1_h,
         lora.w3, SLOT_W3, S, D, F, d_a_slots, d_b_slots, ctx,
     )
-    var d_w3 = lb_w3.d_w.to_host(ctx)
+    var d_w3 = List[Float32]()
     var d_xfn1 = add(lb_w1.d_x, lb_w3.d_x, ctx)
 
     # xfn1 = rms_norm(h, fn1)  (no modulation between)
@@ -689,7 +685,7 @@ def zimage_refiner_lora_backward[
         rb_n2.d_x, saved.att_flat[], w.wo[], att_flat_h,
         lora.to_out, SLOT_O, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wo = lb_o.d_w.to_host(ctx)
+    var d_wo = List[Float32]()
 
     reshape_in_place(lb_o.d_x, [1, S, H, Dh])
     var sb = sdpa_backward[1, S, H, Dh](
@@ -713,17 +709,17 @@ def zimage_refiner_lora_backward[
         rb_q.d_x, saved.xn1[], w.wq[], xn1_h,
         lora.to_q, SLOT_Q, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wq = lb_q.d_w.to_host(ctx)
+    var d_wq = List[Float32]()
     var lb_k = _proj_bwd_with_lora(
         rb_k.d_x, saved.xn1[], w.wk[], xn1_h,
         lora.to_k, SLOT_K, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wk = lb_k.d_w.to_host(ctx)
+    var d_wk = List[Float32]()
     var lb_v = _proj_bwd_with_lora(
         sb.d_v, saved.xn1[], w.wv[], xn1_h,
         lora.to_v, SLOT_V, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wv = lb_v.d_w.to_host(ctx)
+    var d_wv = List[Float32]()
     var d_xn1 = add(add(lb_q.d_x, lb_k.d_x, ctx), lb_v.d_x, ctx)
 
     # xn1 = rms_norm(x, n1)  (no modulation between)

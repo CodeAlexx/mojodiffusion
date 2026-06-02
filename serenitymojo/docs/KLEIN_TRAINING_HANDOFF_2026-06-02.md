@@ -21,8 +21,14 @@ same training/runtime foundation applied to Z-Image and Anima.
   loss, grad_norm, step speed, elapsed, ETA, and noise/noising speed.
 - SerenityBoard wiring is required. It is in `/home/alex/serenityboard`.
 - Python/PyTorch is allowed for parity tests and reference stats only. Runtime
-  trainer UI, sampler, and final implementation must be Mojo. Rust side stays
-  pure Rust.
+  trainer UI, sampler, prepare/cache generation, and final implementation must
+  be Mojo. Rust side stays pure Rust.
+- Trainer runtimes must be self-contained Mojo. Do not depend on Rust/EriDiffusion
+  caches or Python/OneTrainer caches for production prepare/train/sample paths.
+- LoRA saves should stay in the generic PEFT/ai-toolkit-compatible safetensors
+  format. It works with our inference side and `/home/alex/ai-toolkit`; do not
+  switch Z-Image/Klein saves to a model-private format unless the inference
+  loader is updated too.
 - Prefer shared/core speed work that benefits all models, not Klein-only hacks.
 
 ## Reference Trees
@@ -33,7 +39,9 @@ same training/runtime foundation applied to Z-Image and Anima.
   for offload, allocator, optimizer, sampler, and convergence behavior.
 
 Do not treat Rust as the preset authority when OneTrainer has the model preset;
-use Rust as proof of solved implementation issues.
+use Rust as proof of solved implementation issues only. OneTrainer is read-only:
+reference formulas, presets, and baseline numbers there, but do not modify it
+and do not make our trainer depend on its cache files.
 
 ## Current Repo State
 
@@ -47,6 +55,7 @@ revert unrelated files. Important touched/added areas include:
 - `serenitymojo/training/progress_display.mojo`
 - `serenitymojo/training/serenityboard.mojo`
 - `serenitymojo/training/sample_prompt_config.mojo`
+- `serenitymojo/training/lora_save.mojo`
 - `serenitymojo/configs/klein9b.json`
 - `serenitymojo/configs/klein9b_alina_samples.json`
 - `serenitymojo/docs/TRAINER_DISPLAY_CONTRACT_2026-05-31.md`
@@ -77,9 +86,29 @@ Warnings were around unreachable code from compile-time constants and an unused
 OneTrainer Klein presets checked so far also use `timestep_shift: 1.0` with
 dynamic shift disabled.
 
-Z-Image note from user: use `timestep_shift=1.8` for 512 training and `3.0` for
-1024 or above. Verify against OneTrainer before final wiring, but the user
-explicitly expects this policy.
+Z-Image correction: the active OneTrainer Z-Image 512 baseline was verified on
+2026-06-02 with `timestep_shift=1.0`, `dynamic_timestep_shifting=false`, and
+`timestep_distribution=LOGIT_NORMAL`. Earlier notes mentioning `1.8` were for
+other Serenity/Klein paths, not the OneTrainer Z-Image baseline. Use OneTrainer
+as source of truth unless a newer Z-Image preset says otherwise.
+
+Z-Image VAE scaling is `shift_factor=0.1159`, `scaling_factor=0.3611`; it is not
+the BN/Flux2/Klein latent normalization path.
+
+Z-Image dtype rule: do not try full-F32 Z-Image training. OneTrainer baseline is
+BF16/BP16-style for train/base/output dtypes, and full-F32 Z-Image model loads
+will OOM on the 24 GB 3090 Ti. F32 LoRA masters/small scalar reductions are fine;
+the large base model must stay BF16/BP16/offloaded.
+
+Z-Image OneTrainer 100-step baseline:
+
+- preset: `/home/alex/OneTrainer/configs/alina_zimage_OTpreset_100_baseline.json`
+- resolution/batch/lr: `512`, batch `2`, learning rate `3e-4`
+- LoRA filter: `^(?=.*attention)(?!.*refiner).*,^(?=.*feed_forward)(?!.*refiner).*`
+- target set: main `layers.*` attention + feed-forward only; exclude noise/context
+  refiners.
+- final observed line near save: loss `0.541`, smooth loss `0.457`
+- warm speed: about `2.0-2.2s/it` for batch 2
 
 ## 2026-06-02 Klein Result
 
@@ -314,10 +343,15 @@ Current relevant files:
 - `serenitymojo/sampling/unipc.mojo`
 - `serenitymojo/training/validation_sampler.mojo`
 - `serenitymojo/training/sample_prompt_config.mojo`
+- `serenitymojo/training/lora_save.mojo`
 
 Sampling should read size, seed, steps, guidance, negative prompt, and cached cap
 paths from shared sample prompt JSON. The trainer should save LoRA, sample, then
 resume at cadence for full 2000-step runs.
+
+LoRA checkpoint format should remain the generic PEFT/ai-toolkit safetensors
+format emitted by `save_lora_peft`; the inference side and `/home/alex/ai-toolkit`
+can use that shape/key convention.
 
 Short smoke runs below `sample_every=500` should skip samples.
 
@@ -452,8 +486,30 @@ fallbacks. Need:
 ### Z-Image
 
 Next after Klein unless user chooses Anima first. Use OneTrainer as training
-reference. Respect user shift policy: `1.8` at 512, `3.0` at 1024+ unless
-verified otherwise. Needs memory/offload and full-depth readiness.
+reference. Current local changes:
+
+- `serenitymojo/models/vae/zimage_encoder.mojo` adds a pure-Mojo Z-Image VAE
+  encoder with diffusers VAE key layout and `encode_mean()` for OneTrainer-style
+  latent caching.
+- `serenitymojo/pipeline/zimage_prepare.mojo` no longer inspects or points at
+  `/home/alex/EriDiffusion/.../cache/alina_zimage_512`; it prepares local
+  `output/alina_zimage_cache` from local staged image tensors and Mojo Qwen3.
+- `serenitymojo/training/train_zimage_real.mojo` points at
+  `output/alina_zimage_cache`, uses full-depth `MAIN_DEPTH=30`, keeps the
+  BF16/BP16 no-full-F32 rule, and optimizes/saves only main-layer LoRA adapters
+  to match the OneTrainer filter that excludes refiners.
+
+Remaining Z-Image gap: raw `/home/alex/datasets/AlinaAignatova` files are JPEG/PNG.
+The trainer stack must not use Rust or Python to turn them into training caches.
+Either add a Mojo raw image decoder/stager, or provide local staged
+`output/alina_zimage_stage/*.safetensors` files created by Mojo code with key
+`image: [1,3,512,512]` in `[-1,1]`. Do not fill this stage/cache from EDv2 or
+OneTrainer and call it production.
+
+Current local one-step full-depth diagnostic before moving off EDv2 cache was
+not baseline quality: about `119s/step` batch 1 and loss around `12.5` after the
+sign fix. Do not run or report a 100-step target comparison until the local
+Mojo-prepared cache and remaining Z-Image parity/speed gaps are fixed.
 
 ### Anima
 

@@ -1,19 +1,18 @@
 # zimage_generate.mojo — reusable Z-Image text→image entry (RUNTIME prompt).
 #
-# Extracted from zimage_pipeline.mojo's hardcoded main(). Same stages:
+# Same public stages as zimage_pipeline.mojo:
 #   tokenizer → Qwen3-4B encoder (layer-34 penultimate) → CFG denoise loop
-#   (dual NextDiT forward + rectified-flow Euler) → Z-Image VAE decode.
+#   (dual Mojo Z-Image stack forward + rectified-flow Euler) → Z-Image VAE decode.
 #
-# THE ONLY BEHAVIORAL CHANGE vs the verified pipeline is the caption length
-# handling: the base pipeline COMPTIME-specializes the NextDiT on the exact
-# token count (CAPLEN/CAPLEN_NEG). That cannot accept a runtime-typed prompt.
-# Here we adopt FIXED PADDING (mirrors zimage_l2p_pipeline_512_multistep.mojo's
-# CAP_PADDED pattern and qwenimage_pipeline_1024_multistep.mojo's N_TXT_KEPT +
-# runtime real_len): the NextDiT is specialized ONCE at a comptime CAPLEN_MAX
-# (multiple of 32). We encode at ENC_SEQ=512 (Qwen3 is causal → trailing PAD
-# rows are inert per-position), slice to CAPLEN_MAX, and tell the DiT the TRUE
-# token count (real_caplen) so its learned cap_pad_token overwrites the trailing
-# rows — exactly what the model already does for its own mult-of-32 slack.
+# LoRA behavior is AI Toolkit-style FORWARD OVERLAY, not a weight merge:
+#   base projection forward + lora_up(lora_down(x)) * multiplier * alpha/rank.
+# Do not swap this back to `LoraSet.merge_into_indexed`; the production trainer
+# saves main-layer PEFT/PERT adapters and sampling must exercise that same path.
+#
+# Runtime prompts use fixed CAPLEN_MAX padding. We encode at ENC_SEQ=512 (Qwen3
+# is causal), slice to CAPLEN_MAX, and replace rows [real_caplen, CAPLEN_MAX)
+# with the learned cap_pad_token. RoPE pad rows follow the trainer convention:
+# cap pad positions are (0,0,0).
 #
 # EVERY OTHER NUMERIC CONVENTION IS BYTE-FOR-BYTE PRESERVED (see header of
 # zimage_pipeline.mojo + docs/ZIMAGE_DENOISE_SIGN_CONVENTION.md):
@@ -25,19 +24,16 @@
 #   • encoder: layer-34, cap fed rank-2 [caplen, 2560]
 #   • VAE: scale=0.3611, shift=0.1159 (baked in decoder); PNG SIGNED [-1,1]
 #
-# ⚠️  GPU RE-VERIFICATION REQUIRED for the padded-caption change:
-#   The fixed-padding shifts the cap_padded count (and thus the image RoPE base
-#   position cap_padded+1) and attends over more cap_pad_token rows than the
-#   comptime-exact run. The L2P sibling accepts this; for base Z-Image it must
-#   be re-checked against the diffusers oracle once the GPU is free.
+# Verified on 2026-06-02: three 1024 caption-based samples from
+# output/alina_zimage/zimage_lora_step2000.safetensors completed with the LoRA
+# overlay loaded (210 main adapters, alpha/rank=0.0625).
 #
-# GPU is busy → compile-only gate:
+# Build:
 #   cd /home/alex/mojodiffusion && pixi run mojo build -I . -Xlinker -lm \
 #     serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_check
-# Do NOT run a generation here.
 #
 # Runtime:
-#   /tmp/zimage_generate_check [lora_path|base] [out_png] [seed]
+#   /tmp/zimage_generate_check [lora_path|base] [out_png] [seed] [prompt]
 
 from std.sys import argv
 from std.gpu.host import DeviceContext
@@ -45,13 +41,24 @@ from std.math import sqrt, log, cos
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
-from serenitymojo.models.dit.zimage_dit import NextDiT, NextDiTConfig
 from serenitymojo.models.vae.zimage_decoder import ZImageDecoder
-from serenitymojo.ops.tensor_algebra import reshape, mul_scalar, add, sub, slice
+from serenitymojo.models.zimage.weights import (
+    ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
+)
+from serenitymojo.models.zimage.block import ZImageModVecs
+from serenitymojo.models.zimage.zimage_stack_lora import (
+    ZImageLoraDeviceSet, build_zimage_lora_set, load_zimage_lora_main_only_resume,
+    zimage_lora_set_to_device, zimage_stack_lora_predict_main_device,
+)
+from serenitymojo.models.zimage.real_weights import (
+    ZImageRealAux, load_zimage_real_aux, build_adaln, build_block_modvecs,
+    build_f_scale, build_cap_seq, build_x_seq, build_rope, build_positions,
+)
+from serenitymojo.ops.tensor_algebra import reshape, permute, mul_scalar, add, sub, slice
 from serenitymojo.image.png import save_png, ValueRange
-from serenitymojo.lora import LoraSet
 
 
 # ── shared verified checkpoint snapshot (DiT + VAE parity used this exact one) ──
@@ -59,10 +66,33 @@ comptime ZROOT = (
     "/home/alex/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image/"
     "snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021"
 )
-comptime TRANSFORMER = ZROOT + "/transformer"
+comptime TRANSFORMER = "/home/alex/.serenity/models/zimage_base/transformer"
 comptime TEXT_ENCODER = ZROOT + "/text_encoder"
 comptime VAE_DIR = ZROOT + "/vae"
 comptime TOK_JSON = ZROOT + "/tokenizer/tokenizer.json"
+
+# ── Z-Image transformer constants shared with train_zimage_real.mojo ─────────
+comptime H = 30
+comptime Dh = 128
+comptime D = H * Dh
+comptime F = 10240
+comptime CAP_DIM = 2560
+comptime ADALN_DIM = 256
+comptime T_SCALE = Float32(1000.0)
+comptime ROPE_THETA = Float32(256.0)
+comptime AXIS0 = 32
+comptime AXIS1 = 48
+comptime AXIS2 = 48
+comptime EPS = Float32(1e-5)
+comptime FINAL_EPS = Float32(1e-6)
+comptime LAT_C = 16
+comptime OUT_CH = 64
+comptime PATCH = 2
+comptime NUM_NR = 2
+comptime NUM_CR = 2
+comptime MAIN_DEPTH = 30
+comptime RANK = 16
+comptime ALPHA = Float32(1.0)
 
 # ── fixed-caption + encoder constants ──
 comptime HIDDEN = 2560
@@ -81,21 +111,10 @@ comptime DEFAULT_CFG = Float32(4.0)
 comptime DEFAULT_SEED = UInt64(42)
 comptime OUT = "/home/alex/mojodiffusion/output/zimage_generate_1024.png"
 comptime DEFAULT_PROMPT = (
-    "a glamorous platinum blonde woman with vintage old Hollywood finger-wave"
-    " hair screaming with mouth wide open, head tilted back, face bathed in a"
-    " harsh dual-tone color gel treatment of deep cobalt blue shadow and acid"
-    " green neon highlight, bold neon yellow-green spray paint XX marks slashed"
-    " aggressively across her face with dripping paint trails running down over"
-    " her nose and cheeks, her ringed hand pressed against her chin adorned with"
-    " oversized diamond and jeweled rings, a thick chunky gold chain necklace"
-    " draped at her chest, the entire image set against a saturated blood red"
-    " background, heavy analog film grain and scratched surface texture over the"
-    " entire composition, the photograph treated with a high-contrast duotone"
-    " darkroom effect that renders skin in cold blue tones against the violent red"
-    " field, the aesthetic of a subversive underground concert poster meets"
-    " transgressive fashion editorial, punk energy, neo-noir, Andy Warhol meets"
-    " Gaspar Noe, hyper-saturated analog photography, gritty film scan texture,"
-    " cinematic portrait, ultra detailed, 8k"
+    "alverone, a high-resolution photograph featuring a young caucasian woman"
+    " with long, straight, platinum blonde hair and fair skin, standing in a"
+    " cobblestone courtyard in a pink sleeveless dress with a fantasy castle in"
+    " the background, overcast sky, casual relaxed atmosphere"
 )
 
 
@@ -198,6 +217,141 @@ def _stats(name: String, t: Tensor, ctx: DeviceContext) raises:
     )
 
 
+def _unified_positions(x_pos: List[List[Int]], cap_pos: List[List[Int]]) -> List[List[Int]]:
+    var uni_pos = List[List[Int]]()
+    for i in range(len(x_pos)):
+        uni_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos)):
+        uni_pos.append(cap_pos[i].copy())
+    return uni_pos^
+
+
+def _cap_seq_with_pad(
+    aux: ZImageRealAux, cap_feats: Tensor, real_caplen: Int,
+    cap_pad_h: List[Float32], ctx: DeviceContext,
+) raises -> List[Float32]:
+    var cap_f32 = _cast(cap_feats, STDtype.F32, ctx)
+    var cap_seq = build_cap_seq(aux, cap_f32, EPS, ctx)
+    var real_len = real_caplen
+    if real_len < 0:
+        real_len = 0
+    if real_len > CAPLEN_MAX:
+        real_len = CAPLEN_MAX
+    for r in range(real_len, CAPLEN_MAX):
+        for c in range(D):
+            cap_seq[r * D + c] = cap_pad_h[c]
+    return cap_seq^
+
+
+def _unpatchify_patch_list[HL: Int, WL: Int](
+    patches: List[Float32], ctx: DeviceContext
+) raises -> Tensor:
+    comptime HT = HL // PATCH
+    comptime WT = WL // PATCH
+    comptime N_IMG_REAL = HT * WT
+    comptime REAL_PATCH_VALUES = N_IMG_REAL * OUT_CH
+    if len(patches) < REAL_PATCH_VALUES:
+        raise Error("zimage_generate: predicted patch list is shorter than the real image grid")
+    var real_vals = List[Float32]()
+    for i in range(REAL_PATCH_VALUES):
+        real_vals.append(patches[i])
+    var seq = Tensor.from_host(real_vals^, [N_IMG_REAL, OUT_CH], STDtype.F32, ctx)
+    var v = reshape(seq, [HT, WT, PATCH, PATCH, LAT_C], ctx)
+    var perm = List[Int]()
+    perm.append(4); perm.append(0); perm.append(2); perm.append(1); perm.append(3)
+    var p = permute(v, perm^, ctx)
+    return reshape(p, [1, LAT_C, HL, WL], ctx)
+
+
+def _latent_velocity_overlay[
+    HL: Int, WL: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    latent: Tensor, cap_seq: List[Float32],
+    nr_blocks: List[ZImageBlockWeights], nr_mod: List[ZImageModVecs],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    aux: ZImageRealAux,
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_pad_h: List[Float32],
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    comptime HT = HL // PATCH
+    comptime WT = WL // PATCH
+    comptime N_IMG_REAL = HT * WT
+    comptime IMG_PAD = N_IMG - N_IMG_REAL
+
+    var x_seq = build_x_seq(aux, latent, LAT_C, HL, WL, PATCH, ctx)
+    for _pad in range(IMG_PAD):
+        for c in range(D):
+            x_seq.append(x_pad_h[c])
+
+    var patches = zimage_stack_lora_predict_main_device[H, Dh, N_IMG, N_TXT, S](
+        x_seq.copy(), cap_seq.copy(),
+        nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora,
+        f_scale.copy(), final_lin_w, final_lin_b,
+        x_cos, x_sin, cap_cos, cap_sin, uni_cos, uni_sin,
+        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+    )
+    return _unpatchify_patch_list[HL, WL](patches, ctx)
+
+
+def _cfg_pred_overlay[
+    HL: Int, WL: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    latent: Tensor, t: Float32, cfg: Float32,
+    cap_seq_cond: List[Float32], cap_seq_uncond: List[Float32],
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    lora: ZImageLoraDeviceSet,
+    aux: ZImageRealAux,
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_pad_h: List[Float32],
+    x_cos_cond: Tensor, x_sin_cond: Tensor,
+    cap_cos_cond: Tensor, cap_sin_cond: Tensor,
+    uni_cos_cond: Tensor, uni_sin_cond: Tensor,
+    x_cos_uncond: Tensor, x_sin_uncond: Tensor,
+    cap_cos_uncond: Tensor, cap_sin_uncond: Tensor,
+    uni_cos_uncond: Tensor, uni_sin_uncond: Tensor,
+    trace: Bool,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var adaln = build_adaln(aux, t, ADALN_DIM, T_SCALE, ctx)
+    var nr_mod = List[ZImageModVecs]()
+    for j in range(NUM_NR):
+        nr_mod.append(build_block_modvecs(aux.nr_mod_w[j][], aux.nr_mod_b[j][], adaln, D, ctx))
+    var main_mod = List[ZImageModVecs]()
+    for j in range(MAIN_DEPTH):
+        main_mod.append(build_block_modvecs(aux.main_mod_w[j][], aux.main_mod_b[j][], adaln, D, ctx))
+    var f_scale = build_f_scale(aux, adaln, D, ctx)
+
+    var vc = _latent_velocity_overlay[HL, WL, N_IMG, N_TXT, S](
+        latent, cap_seq_cond,
+        nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora,
+        f_scale.copy(), aux, final_lin_w, final_lin_b, x_pad_h,
+        x_cos_cond, x_sin_cond, cap_cos_cond, cap_sin_cond,
+        uni_cos_cond, uni_sin_cond, ctx,
+    )
+    var vu = _latent_velocity_overlay[HL, WL, N_IMG, N_TXT, S](
+        latent, cap_seq_uncond,
+        nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora,
+        f_scale.copy(), aux, final_lin_w, final_lin_b, x_pad_h,
+        x_cos_uncond, x_sin_uncond, cap_cos_uncond, cap_sin_uncond,
+        uni_cos_uncond, uni_sin_uncond, ctx,
+    )
+    if trace:
+        _stats("v_cond", vc, ctx)
+        _stats("v_uncond", vu, ctx)
+
+    var pred = add(vc, mul_scalar(sub(vc, vu, ctx), cfg, ctx), ctx)
+    return mul_scalar(pred, -1.0, ctx)
+
+
 def _parse_nonnegative_int(s: String) raises -> Int:
     var out = 0
     var bs = s.as_bytes()
@@ -296,19 +450,67 @@ def _denoise[HL: Int, WL: Int](
     lora_path: String, lora_multiplier: Float32,
     mut events: List[ZImageEvent], ctx: DeviceContext,
 ) raises -> Tensor:
-    print("[denoise] loading NextDiT", HL, "x", WL, "(fixed CAPLEN_MAX", CAPLEN_MAX, ")")
-    var dit_c = NextDiT[HL, WL, CAPLEN_MAX].load(TRANSFORMER, ctx)
+    comptime HT = HL // PATCH
+    comptime WT = WL // PATCH
+    comptime N_IMG_REAL = HT * WT
+    comptime IMG_PAD = (32 - (N_IMG_REAL % 32)) % 32
+    comptime N_IMG = N_IMG_REAL + IMG_PAD
+    comptime N_TXT = CAPLEN_MAX
+    comptime S = N_IMG + N_TXT
+
+    print("[denoise] loading Mojo Z-Image stack", HL, "x", WL, "(CAPLEN_MAX", CAPLEN_MAX, ")")
+    var st = ShardedSafeTensors.open(String(TRANSFORMER))
+    var aux = load_zimage_real_aux(st, NUM_NR, MAIN_DEPTH, ctx)
+    var nr_blocks = List[ZImageBlockWeights]()
+    for i in range(NUM_NR):
+        nr_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("noise_refiner.") + String(i), ctx))
+    var cr_blocks = List[ZImageBlockWeights]()
+    for i in range(NUM_CR):
+        cr_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("context_refiner.") + String(i), ctx))
+    var main_blocks = List[ZImageBlockWeights]()
+    for i in range(MAIN_DEPTH):
+        main_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("layers.") + String(i), ctx))
+    var final_lin_w = aux.final_lin_w[].clone(ctx)
+    var final_lin_b = aux.final_lin_b[].clone(ctx)
+    var x_pad_h = aux.x_pad_token[].to_host(ctx)
+    var cap_pad_h = aux.cap_pad_token[].to_host(ctx)
+
+    var lora_alpha = ALPHA * lora_multiplier
+    var lora = build_zimage_lora_set(NUM_NR, NUM_CR, MAIN_DEPTH, D, F, RANK, lora_alpha)
     if lora_path.byte_length() > 0:
         print("[lora] loading", lora_path)
-        var lora = LoraSet.load(lora_path)
-        var merged = lora.merge_into_indexed(
-            dit_c.weights, dit_c.name_to_idx, lora_multiplier, ctx
+        lora = load_zimage_lora_main_only_resume(
+            NUM_NR, NUM_CR, MAIN_DEPTH, RANK, lora_alpha, D, F, lora_path, ctx,
         )
-        print("[lora] merged", merged, "modules into NextDiT")
-    # uncond instance shares the SAME GPU weights (ArcPointer copy = refcount++,
-    # no VRAM duplication). With fixed padding BOTH share comptime CAPLEN_MAX, so
-    # we can reuse dit_c directly for the uncond forward — no second instance and
-    # no second weight refcount needed.
+        print("[lora] overlay loaded", MAIN_DEPTH * 7, "main-layer adapters; scale alpha/rank =", lora_alpha / Float32(RANK))
+    else:
+        print("[lora] base mode: zero LoRA overlay")
+    var lora_dev = zimage_lora_set_to_device(lora, ctx)
+
+    var cap_seq_cond = _cap_seq_with_pad(aux, caps.cond, caps.real_cond, cap_pad_h, ctx)
+    var cap_seq_uncond = _cap_seq_with_pad(aux, caps.uncond, caps.real_uncond, cap_pad_h, ctx)
+
+    var pos_cond = build_positions(N_IMG, HT, WT, CAPLEN_MAX, caps.real_cond)
+    var x_pos_cond = pos_cond[0].copy()
+    var cap_pos_cond = pos_cond[1].copy()
+    var uni_pos_cond = _unified_positions(x_pos_cond, cap_pos_cond)
+    var xr_cond = build_rope(x_pos_cond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var x_cos_cond = xr_cond[0].copy(); var x_sin_cond = xr_cond[1].copy()
+    var cr_cond = build_rope(cap_pos_cond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cap_cos_cond = cr_cond[0].copy(); var cap_sin_cond = cr_cond[1].copy()
+    var ur_cond = build_rope(uni_pos_cond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var uni_cos_cond = ur_cond[0].copy(); var uni_sin_cond = ur_cond[1].copy()
+
+    var pos_uncond = build_positions(N_IMG, HT, WT, CAPLEN_MAX, caps.real_uncond)
+    var x_pos_uncond = pos_uncond[0].copy()
+    var cap_pos_uncond = pos_uncond[1].copy()
+    var uni_pos_uncond = _unified_positions(x_pos_uncond, cap_pos_uncond)
+    var xr_uncond = build_rope(x_pos_uncond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var x_cos_uncond = xr_uncond[0].copy(); var x_sin_uncond = xr_uncond[1].copy()
+    var cr_uncond = build_rope(cap_pos_uncond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cap_cos_uncond = cr_uncond[0].copy(); var cap_sin_uncond = cr_uncond[1].copy()
+    var ur_uncond = build_rope(uni_pos_uncond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var uni_cos_uncond = ur_uncond[0].copy(); var uni_sin_uncond = ur_uncond[1].copy()
 
     var noise = gaussian_noise(16 * HL * WL, seed)
     var nshape = [1, 16, HL, WL]
@@ -321,23 +523,18 @@ def _denoise[HL: Int, WL: Int](
     events.append(ZImageEvent(ZEVENT_STARTED, 0, steps, String("started")))
     for i in range(steps):
         var t = 1.0 - sigmas[i]  # DiT timestep convention (= 1 - sigma)
-        var x_bf = _cast(x, STDtype.BF16, ctx)  # bf16 only to feed the DiT
-        # cond + uncond velocities at fixed CAPLEN_MAX, runtime real lengths.
-        var vc = _cast(
-            dit_c.forward_runtime_cap(x_bf, t, caps.cond, caps.real_cond, ctx),
-            STDtype.F32, ctx,
-        )
-        var vu = _cast(
-            dit_c.forward_runtime_cap(x_bf, t, caps.uncond, caps.real_uncond, ctx),
-            STDtype.F32, ctx,
-        )
         # Diffusers CFG (code form, F32): pred_raw = vc + cfg*(vc - vu);
         # pipeline_z_image.py negates before FlowMatchEulerDiscreteScheduler.step.
-        var pred = add(vc, mul_scalar(sub(vc, vu, ctx), cfg, ctx), ctx)
-        pred = mul_scalar(pred, -1.0, ctx)
-        if i == 0:
-            _stats("v_cond", vc, ctx)
-            _stats("v_uncond", vu, ctx)
+        var pred = _cfg_pred_overlay[HL, WL, N_IMG, N_TXT, S](
+            x, t, cfg, cap_seq_cond, cap_seq_uncond,
+            nr_blocks, cr_blocks, main_blocks, lora_dev,
+            aux, final_lin_w, final_lin_b, x_pad_h,
+            x_cos_cond[], x_sin_cond[], cap_cos_cond[], cap_sin_cond[],
+            uni_cos_cond[], uni_sin_cond[],
+            x_cos_uncond[], x_sin_uncond[], cap_cos_uncond[], cap_sin_uncond[],
+            uni_cos_uncond[], uni_sin_uncond[],
+            i == 0, ctx,
+        )
         var dt = sigmas[i + 1] - sigmas[i]
         x = add(x, mul_scalar(pred, dt, ctx), ctx)  # F32: x += (σ_next-σ)*(-pred_raw)
         events.append(ZImageEvent(ZEVENT_STEP, i + 1, steps, String("denoise")))
@@ -395,6 +592,7 @@ def main() raises:
     var lora_path = String("")
     var out_path = String(OUT)
     var seed = DEFAULT_SEED
+    var prompt = String(DEFAULT_PROMPT)
     if len(a) >= 2:
         var arg_lora = String(a[1])
         if arg_lora != String("base") and arg_lora != String("none") and arg_lora != String(""):
@@ -403,9 +601,12 @@ def main() raises:
         out_path = String(a[2])
     if len(a) >= 4:
         seed = UInt64(_parse_nonnegative_int(String(a[3])))
+    if len(a) >= 5:
+        prompt = String(a[4])
+    print("[prompt]", prompt)
     var events = List[ZImageEvent]()
     var rgb = zimage_generate(
-        DEFAULT_PROMPT, String(""),
+        prompt, String(""),
         DEFAULT_STEPS, DEFAULT_CFG, seed,
         1024, 1024, lora_path, Float32(1.0), events, ctx,
     )

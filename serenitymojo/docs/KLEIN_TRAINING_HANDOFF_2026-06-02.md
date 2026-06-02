@@ -115,6 +115,29 @@ Z-Image OneTrainer 100-step baseline:
 - final observed line near save: loss `0.541`, smooth loss `0.457`
 - warm speed: about `2.0-2.2s/it` for batch 2
 
+Z-Image Mojo 2000-step result:
+
+- trainer: `serenitymojo/training/train_zimage_real.mojo`
+- log: `output/logs/zimage_train_2000_speed2_tensor_main_2026-06-02.log`
+- final LoRA: `output/alina_zimage/zimage_lora_step2000.safetensors`
+- loss: `0.47321588 -> 0.5490076`, mean `0.459294`
+- speed: mean `2.0215s/step`, last `2.0117514s/step`
+- nonfinite: `0`
+- LoRA-B learned on all main adapters: `210/210`
+
+Z-Image LoRA sampling rule: use AI Toolkit-style forward overlay, not merged
+weights. The sampler loads main-only PEFT/PERT LoRA adapters and applies
+`base_forward(x) + lora_up(lora_down(x)) * alpha/rank`; do not use
+`LoraSet.merge_into_indexed` for this production path. The 1024 sampler uses
+no-save main-block inference (`zimage_block_lora_predict_device_tensor`) because
+the training saved-activation forward can OOM during sampling.
+
+Caption-based 1024 samples completed from the 2000-step LoRA:
+
+- `output/alina_zimage/sample_step2000_alina000_seed42_1024.png`
+- `output/alina_zimage/sample_step2000_alina003_seed31415_1024.png`
+- `output/alina_zimage/sample_step2000_alina007_seed27182_1024.png`
+
 ## 2026-06-02 Klein Result
 
 The 2000-step Klein 9B LoRA run completed successfully with normal checkpoint

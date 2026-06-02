@@ -895,6 +895,80 @@ def zimage_block_lora_forward_device_tensor[
     return ZImageBlockForwardLoraTensor(TArc(result^), saved^)
 
 
+def zimage_block_lora_predict_device_tensor[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ZImageBlockWeights, mv: ZImageModVecs, lora: ZImageBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> TArc:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var zeros = _zeros(D)
+
+    var xn1 = rms_norm(x_arc[], w.n1[], eps, ctx)
+    var xn1s = modulate(
+        xn1, _t(mv.scale_msa.copy(), [D], ctx), _t(zeros.copy(), [D], ctx), ctx
+    )
+
+    var no_bias = Optional[Tensor](None)
+    var q_base = linear(xn1s, w.wq[], no_bias^, ctx)
+    var no_bias_k = Optional[Tensor](None)
+    var k_base = linear(xn1s, w.wk[], no_bias_k^, ctx)
+    var no_bias_v = Optional[Tensor](None)
+    var v_base = linear(xn1s, w.wv[], no_bias_v^, ctx)
+
+    var q = zimage_lora_apply_device(q_base^, xn1s, lora.to_q, S, ctx)
+    var k = zimage_lora_apply_device(k_base^, xn1s, lora.to_k, S, ctx)
+    var v_flat = zimage_lora_apply_device(v_base^, xn1s, lora.to_v, S, ctx)
+
+    var q_pre = reshape_owned(q^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var no_bias_o = Optional[Tensor](None)
+    var att_o_base = linear(att_flat, w.wo[], no_bias_o^, ctx)
+    var att_o = zimage_lora_apply_device(att_o_base^, att_flat, lora.to_out, S, ctx)
+
+    var attn_n2 = rms_norm(att_o, w.n2[], eps, ctx)
+    var gate_msa_raw = _t(mv.gate_msa.copy(), [D], ctx)
+    var gate_msa_t = tanh_op(gate_msa_raw, ctx)
+    var h = residual_gate(x_arc[], gate_msa_t, attn_n2, ctx)
+
+    var xfn1 = rms_norm(h, w.fn1[], eps, ctx)
+    var xfn1s = modulate(
+        xfn1, _t(mv.scale_mlp.copy(), [D], ctx), _t(zeros.copy(), [D], ctx), ctx
+    )
+
+    var no_bias_g = Optional[Tensor](None)
+    var g_base = linear(xfn1s, w.w1[], no_bias_g^, ctx)
+    var no_bias_u = Optional[Tensor](None)
+    var u_base = linear(xfn1s, w.w3[], no_bias_u^, ctx)
+    var g_pre = zimage_lora_apply_device(g_base^, xfn1s, lora.w1, S, ctx)
+    var u = zimage_lora_apply_device(u_base^, xfn1s, lora.w3, S, ctx)
+
+    var act = swiglu(g_pre, u, ctx)
+
+    var no_bias_d = Optional[Tensor](None)
+    var ff_base = linear(act, w.w2[], no_bias_d^, ctx)
+    var ff = zimage_lora_apply_device(ff_base^, act, lora.w2, S, ctx)
+
+    var ff_n2 = rms_norm(ff, w.fn2[], eps, ctx)
+    var gate_mlp_raw = _t(mv.gate_mlp.copy(), [D], ctx)
+    var gate_mlp_t = tanh_op(gate_mlp_raw, ctx)
+    var result = residual_gate(h, gate_mlp_t, ff_n2, ctx)
+    return TArc(result^)
+
+
 def zimage_block_lora_backward_device[
     H: Int, Dh: Int, S: Int
 ](

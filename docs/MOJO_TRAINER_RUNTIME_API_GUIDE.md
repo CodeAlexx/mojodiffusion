@@ -80,18 +80,47 @@ Verified 100-step Mojo run after this speed fix:
 - Warm cadence: about `1.96-2.00s/step`
 - Final saved LoRA: `output/alina_zimage/zimage_lora_step100.safetensors`
 
+Verified 2000-step Mojo convergence run:
+
+- Log: `output/logs/zimage_train_2000_speed2_tensor_main_2026-06-02.log`
+- Loss: `0.47321588 -> 0.5490076`
+- Mean loss: `0.459294`
+- Mean cadence: `2.0215s/step`
+- Last cadence: `2.0117514s/step`
+- Nonfinite count: `0`
+- LoRA-B learned: `loraB_sum=267434.25`, `loraB_nonzero=210/210`
+- Final saved LoRA: `output/alina_zimage/zimage_lora_step2000.safetensors`
+
 Z-Image 1024 sampling hook:
 
 - `serenitymojo/pipeline/zimage_generate.mojo` accepts
-  `[lora_path|base] [out_png] [seed]` at runtime.
-- It loads the resident `NextDiT`, merges the PEFT LoRA through
-  `LoraSet.merge_into_indexed`, denoises at 1024, then decodes with the Mojo
-  Z-Image VAE.
+  `[lora_path|base] [out_png] [seed] [prompt]` at runtime.
+- It loads the same BF16/BP16-preserving Mojo Z-Image stack as the trainer,
+  loads main-only PEFT/PERT LoRA adapters, denoises at 1024, then decodes with
+  the Mojo Z-Image VAE.
+- LoRA sampling must use AI Toolkit-style forward overlay:
+  `base_forward(x) + lora_up(lora_down(x)) * multiplier * alpha/rank`.
+  Do not use `LoraSet.merge_into_indexed` for Z-Image production sampling; that
+  bypasses the trainer's main-only overlay path and is not the reference.
+- Use `zimage_block_lora_predict_device_tensor` for sampling main blocks. The
+  training forward intentionally saves activations for backward, but inference
+  must not allocate those saved tensors or 1024 sampling will run at the memory
+  ceiling and can OOM.
 - Compile gate: `pixi run mojo build -I . -Xlinker -lm
   serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_lora_check`
-  passed on 2026-06-02. Run it after the training process frees the GPU. For
-  the 2000-step Z-Image LoRA check, generate three 1024 samples with distinct
-  seeds.
+  passed on 2026-06-02.
+
+Caption-based 1024 samples from the 2000-step LoRA:
+
+- `output/alina_zimage/sample_step2000_alina000_seed42_1024.png`,
+  `alina_000.txt`, 224 real tokens, elapsed `364.42s`
+- `output/alina_zimage/sample_step2000_alina003_seed31415_1024.png`,
+  `alina_003.txt`, 193 real tokens, elapsed `367.26s`
+- `output/alina_zimage/sample_step2000_alina007_seed27182_1024.png`,
+  `alina_007.txt`, 208 real tokens, elapsed `364.02s`
+
+All three logs show `overlay loaded 210 main-layer adapters; scale alpha/rank =
+0.0625`, and all three PNGs are valid 1024x1024 RGB images.
 
 ## Offloader API Guide
 

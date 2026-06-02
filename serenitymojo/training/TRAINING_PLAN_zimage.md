@@ -147,26 +147,55 @@ speed=~1.96-2.00s/step warm, final step 1.993s
 checkpoint=output/alina_zimage/zimage_lora_step100.safetensors
 ```
 
-A 2000-step convergence run was started from the same code path on 2026-06-02.
-Append its final loss/speed/sample metrics here after it finishes.
+2000-step convergence verification:
+
+```
+log=output/logs/zimage_train_2000_speed2_tensor_main_2026-06-02.log
+loss=0.47321588 -> 0.5490076
+mean_loss=0.459294
+mean_speed=2.0215s/step
+last_speed=2.0117514s/step
+nonfinite=0
+loraB_sum=267434.25
+loraB_nonzero=210/210
+checkpoint=output/alina_zimage/zimage_lora_step2000.safetensors
+```
+
+The run hit the production Alina buckets instead of dropping singleton or
+long-caption cases. This is the current convergence baseline: finite throughout,
+LoRA-B nonzero on every main adapter, and speed in the OneTrainer target band.
 
 1024 sampling hook: `serenitymojo/pipeline/zimage_generate.mojo` now accepts
-`[lora_path|base] [out_png] [seed]`, merges a PEFT LoRA into resident `NextDiT`
-with `LoraSet.merge_into_indexed`, and preserves the existing 1024 denoise/VAE
-path.
+`[lora_path|base] [out_png] [seed] [prompt]`. It loads the BF16/BP16-preserving
+Mojo Z-Image stack and applies main-only LoRA with AI Toolkit-style forward
+overlay:
+
+```
+base_forward(x) + lora_up(lora_down(x)) * multiplier * alpha/rank
+```
+
+Do not change this back to `LoraSet.merge_into_indexed`; Z-Image production
+sampling must exercise the same overlay path as training. The sampler also uses
+`zimage_block_lora_predict_device_tensor`, a no-save inference main-block
+forward, because the training saved-activation forward can OOM at 1024.
+
 Compile-only gate passed:
 
 ```
 pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_lora_check
 ```
 
-Run three samples after the 2000-step trainer frees the GPU:
+Caption-based 1024 samples completed from the 2000-step LoRA:
 
 ```
-/tmp/zimage_generate_lora_check output/alina_zimage/zimage_lora_step2000.safetensors output/alina_zimage/sample_step2000_seed42_1024.png 42
-/tmp/zimage_generate_lora_check output/alina_zimage/zimage_lora_step2000.safetensors output/alina_zimage/sample_step2000_seed31415_1024.png 31415
-/tmp/zimage_generate_lora_check output/alina_zimage/zimage_lora_step2000.safetensors output/alina_zimage/sample_step2000_seed27182_1024.png 27182
+output/alina_zimage/sample_step2000_alina000_seed42_1024.png    # 224 tokens, 364.42s
+output/alina_zimage/sample_step2000_alina003_seed31415_1024.png # 193 tokens, 367.26s
+output/alina_zimage/sample_step2000_alina007_seed27182_1024.png # 208 tokens, 364.02s
 ```
+
+All three logs show `overlay loaded 210 main-layer adapters; scale alpha/rank =
+0.0625`; all three PNGs are valid 1024x1024 RGB and visually align with their
+staged captions.
 
 ### Full-F32 blocker status
 
@@ -176,8 +205,8 @@ residency with F32 limited to LoRA/Adam, reductions, and short transients.
 
 ### NEXT
 
-1. Finish the 2000-step convergence run and sample through the Mojo Z-Image
-   sampler with the saved PEFT LoRA.
+1. Move the sampler to a process-separated cadence hook for long trainer runs
+   if in-process 1024 sampling is needed later.
 2. Add/verify validation sampling cadence for Z-Image so the trainer can save
    and sample like Klein.
 3. Keep expanding tensor-resident and offloaded APIs rather than reintroducing

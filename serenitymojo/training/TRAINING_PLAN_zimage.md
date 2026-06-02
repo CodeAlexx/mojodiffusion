@@ -71,7 +71,11 @@ input/weight dtype. Large block projection and MLP weights (`to_q`, `to_k`,
 `load_zimage_block_weights_prefixed_mixed` and/or an offloaded BF16-preserving
 path.
 
-## STATUS (2026-06-02): reduced-depth real run done; full-depth BF16/offload work pending.
+## STATUS (2026-06-02): full-depth tensor-resident LoRA path running.
+
+Runtime/API guide for future work: `docs/MOJO_TRAINER_RUNTIME_API_GUIDE.md`.
+That guide records the offloader and scratch-ring usage rules that came out of
+this Z-Image speed pass.
 
 ### Files
 - `models/zimage/weights.mojo` — +load_zimage_block_weights_prefixed (nr/cr/main)
@@ -82,7 +86,7 @@ path.
   cache exists). Verified: 51 samples, latent [1,16,64,64], text_emb [1,512,2560].
 - `training/train_zimage_real.mojo` — NEW. The real loop.
 
-### REAL run result (real base weights + real cache, MAIN_DEPTH=4)
+### Historical reduced-depth probe (real base weights + real cache, MAIN_DEPTH=4)
 Overfit-correctness probe (fixed sample+timestep), 10 steps:
 ```
 step1 loss=445.291 loraB_sum=1251 nonzero=56/56 nonfinite=0
@@ -97,8 +101,8 @@ Multi-sample mode (OVERFIT_PROBE=False) runs too but loss oscillates per-step
 (different timestep+sample each step) — expected variance, not divergence.
 
 Do not use the `~445` reduced-depth loss as a baseline. It is a truncated-stack
-wiring/backward smoke only. For full-depth Z-Image, `~445` would be a broken
-run; the target scale is the OneTrainer baseline below.
+wiring/backward smoke only. For full-depth Z-Image, `~445` is a broken run; the
+target scale is the OneTrainer baseline below.
 
 ### OneTrainer 100-Step Baseline (512, Klein/Alina dataset)
 
@@ -118,22 +122,60 @@ The process was manually terminated after OneTrainer continued beyond the 100
 step save; use only the metrics through the `save-99-3-24` checkpoint as the
 baseline.
 
-### BLOCKER for full-depth (MAIN=30) real run
+### Full-depth Mojo result after tensor-resident main-stack fix
 
-MEASURED: full-model resident all-F32 base = 24.62 GB > 24 GB GPU (computed from
-real shapes). That is not a supported training mode. The full-depth Mojo path
-must preserve BF16/BP16 base projection weights and add BF16 residency and/or a
-turbo/offload block loader like Klein's before flipping `MAIN_DEPTH=30`.
+The full-depth Z-Image LoRA trainer now runs all 30 main layers in the real
+Alina 512 path. The speed fix was not a recipe change; it removed hot host
+boundaries:
 
-The existing reduced-depth run is only a correctness probe. Loss MAGNITUDE
-(~445) and the slow per-step delta are partly the MAIN=4 truncation artifact
-(26 missing layers => final output uncalibrated to the latent scale); the
-DIRECTION (monotonic down) is the only correctness signal for that smoke.
+- LoRA adapters upload once per step as device tensors.
+- Main-stack forward/backward recompute stays tensor-resident.
+- Per-block `to_host()` / `Tensor.from_host()` round trips are gone from the
+  production path.
+- Frozen final norm uses dx-only backward instead of computing discarded norm
+  weight grads.
+- Observed cache buckets `72x56/cap224`, `72x56/cap256`, `88x48/cap224`, and
+  `88x48/cap256` are all dispatched.
 
-### NEXT (to land full-depth)
-1. BF16/BP16-preserving zimage block fwd/bwd (or reuse an offload loader) so
-   full-depth training never expands the base model to all-F32. Then flip
-   MAIN_DEPTH=30.
-2. Per-layer parity of build_x_seq/build_adaln/build_block_modvecs/build_f_scale
-   vs zimage_dit.mojo on real weights (cos>=0.999) before the long run, to
-   confirm the loss magnitude is purely the truncation artifact.
+100-step verification:
+
+```
+log=output/logs/zimage_train_100_speed2_tensor_main_2026-06-02.log
+loss=0.47321588 -> 0.35350168
+nonfinite=0
+speed=~1.96-2.00s/step warm, final step 1.993s
+checkpoint=output/alina_zimage/zimage_lora_step100.safetensors
+```
+
+A 2000-step convergence run was started from the same code path on 2026-06-02.
+Append its final loss/speed/sample metrics here after it finishes.
+
+1024 sampling hook: `serenitymojo/pipeline/zimage_generate.mojo` now accepts
+`[lora_path|base] [out_png]`, merges a PEFT LoRA into resident `NextDiT` with
+`LoraSet.merge_into_indexed`, and preserves the existing 1024 denoise/VAE path.
+Compile-only gate passed:
+
+```
+pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_lora_check
+```
+
+Run this after the 2000-step trainer frees the GPU:
+
+```
+/tmp/zimage_generate_lora_check output/alina_zimage/zimage_lora_step2000.safetensors output/alina_zimage/sample_step2000_1024.png
+```
+
+### Full-F32 blocker status
+
+MEASURED: full-model resident all-F32 base = 24.62 GB > 24 GB GPU. That remains
+unsupported and must stay documented. The working path is BF16/BP16-style base
+residency with F32 limited to LoRA/Adam, reductions, and short transients.
+
+### NEXT
+
+1. Finish the 2000-step convergence run and sample through the Mojo Z-Image
+   sampler with the saved PEFT LoRA.
+2. Add/verify validation sampling cadence for Z-Image so the trainer can save
+   and sample like Klein.
+3. Keep expanding tensor-resident and offloaded APIs rather than reintroducing
+   host-list block boundaries in production code.

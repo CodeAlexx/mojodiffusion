@@ -26,6 +26,12 @@ and has had a **training-autograd spine** grafted on top (the 2026-05-30 port).
 The training spine is a thin, sharply-bounded set of modules; the rest of the
 tree is inference forwards that the training path consumes as fixed kernels.
 
+Operational trainer/runtime guidance lives in
+`docs/MOJO_TRAINER_RUNTIME_API_GUIDE.md`. Read it before changing offload,
+scratch-ring, Z-Image, Klein, or production LoRA/full-finetune loops; this module
+map catalogs APIs, while that guide records the production usage rules and
+lessons from real runs.
+
 ---
 
 ## Core types (TRAINING-critical)

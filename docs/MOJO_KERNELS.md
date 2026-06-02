@@ -419,6 +419,11 @@ modeled after the local OneTrainer static activation/layer allocator pattern
 (`OneTrainer/docs/RamOffloading.md` and
 `OneTrainer/modules/util/LayerOffloadConductor.py`):
 
+For production trainer usage rules and examples, see
+`docs/MOJO_TRAINER_RUNTIME_API_GUIDE.md`. This kernel catalog describes the
+primitive; the guide describes when a trainer should use scratch, offload, or a
+fresh owned tensor.
+
 - persistent `DType.uint8` device slabs;
 - 16-byte aligned sub-buffer allocation via `create_sub_buffer`;
 - forward allocation from the slab head and reverse allocation from the slab

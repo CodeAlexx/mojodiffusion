@@ -41,6 +41,8 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
 
 ## 2026-06-02 Z-Image DType Rule And Baseline
 
+- Operational API guide for the lessons in this section:
+  `docs/MOJO_TRAINER_RUNTIME_API_GUIDE.md`.
 - Z-Image training uses BF16/BP16 base model weights. OneTrainer does not train
   Z-Image as a full-F32 model, and SerenityMojo must not try it. A full-F32
   Z-Image base/model load is invalid on the local 24 GB target and will OOM.
@@ -67,6 +69,10 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
   RMSNorms instead of computing unused norm weight gradients, and keeping the
   30-layer main stack tensor-resident across forward/backward recompute instead
   of round-tripping each block through host lists.
+- Future trainer edits should follow the same API discipline: production loops
+  use tensor-resident block APIs, offload/turbo for large base weights, and
+  `ScratchRingAllocator` only for frame-scoped temporaries with explicit
+  mark/rewind lifetimes.
 
 ## Gaps vs Rust/Flame
 

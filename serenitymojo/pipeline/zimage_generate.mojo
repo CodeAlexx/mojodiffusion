@@ -35,7 +35,11 @@
 #   cd /home/alex/mojodiffusion && pixi run mojo build -I . -Xlinker -lm \
 #     serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_check
 # Do NOT run a generation here.
+#
+# Runtime:
+#   /tmp/zimage_generate_check [lora_path|base] [out_png]
 
+from std.sys import argv
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log, cos
 
@@ -47,6 +51,7 @@ from serenitymojo.models.dit.zimage_dit import NextDiT, NextDiTConfig
 from serenitymojo.models.vae.zimage_decoder import ZImageDecoder
 from serenitymojo.ops.tensor_algebra import reshape, mul_scalar, add, sub, slice
 from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.lora import LoraSet
 
 
 # ── shared verified checkpoint snapshot (DiT + VAE parity used this exact one) ──
@@ -277,10 +282,18 @@ def _build_sigmas(steps: Int) raises -> List[Float32]:
 # the runtime real_cond/real_uncond drive the cap_pad_token substitution.
 def _denoise[HL: Int, WL: Int](
     caps: CapFeatsFixed, steps: Int, cfg: Float32, seed: UInt64,
+    lora_path: String, lora_multiplier: Float32,
     mut events: List[ZImageEvent], ctx: DeviceContext,
 ) raises -> Tensor:
     print("[denoise] loading NextDiT", HL, "x", WL, "(fixed CAPLEN_MAX", CAPLEN_MAX, ")")
     var dit_c = NextDiT[HL, WL, CAPLEN_MAX].load(TRANSFORMER, ctx)
+    if lora_path.byte_length() > 0:
+        print("[lora] loading", lora_path)
+        var lora = LoraSet.load(lora_path)
+        var merged = lora.merge_into_indexed(
+            dit_c.weights, dit_c.name_to_idx, lora_multiplier, ctx
+        )
+        print("[lora] merged", merged, "modules into NextDiT")
     # uncond instance shares the SAME GPU weights (ArcPointer copy = refcount++,
     # no VRAM duplication). With fixed padding BOTH share comptime CAPLEN_MAX, so
     # we can reuse dit_c directly for the uncond forward — no second instance and
@@ -331,6 +344,7 @@ def zimage_generate(
     prompt: String, negative: String,
     steps: Int, cfg: Float32, seed: UInt64,
     width: Int, height: Int,
+    lora_path: String, lora_multiplier: Float32,
     mut events: List[ZImageEvent], ctx: DeviceContext,
 ) raises -> Tensor:
     var caps = encode_captions_fixed(prompt, negative, ctx)
@@ -339,7 +353,9 @@ def zimage_generate(
     var hl = height // 8
     var wl = width // 8
     if hl == DEFAULT_HL and wl == DEFAULT_WL:
-        var latent = _denoise[DEFAULT_HL, DEFAULT_WL](caps, steps, cfg, seed, events, ctx)
+        var latent = _denoise[DEFAULT_HL, DEFAULT_WL](
+            caps, steps, cfg, seed, lora_path, lora_multiplier, events, ctx
+        )
         print("[vae] decoding latent → RGB")
         var dec = ZImageDecoder[DEFAULT_HL, DEFAULT_WL].load(VAE_DIR, ctx)
         var rgb = dec.decode(_cast(latent, STDtype.BF16, ctx), ctx)
@@ -364,13 +380,22 @@ def zimage_generate(
 def main() raises:
     var ctx = DeviceContext()
     print("=== Z-Image generate (runtime prompt, fixed-padded caption) — 1024x1024 ===")
+    var a = argv()
+    var lora_path = String("")
+    var out_path = String(OUT)
+    if len(a) >= 2:
+        var arg_lora = String(a[1])
+        if arg_lora != String("base") and arg_lora != String("none") and arg_lora != String(""):
+            lora_path = arg_lora
+    if len(a) >= 3:
+        out_path = String(a[2])
     var events = List[ZImageEvent]()
     var rgb = zimage_generate(
         DEFAULT_PROMPT, String(""),
         DEFAULT_STEPS, DEFAULT_CFG, DEFAULT_SEED,
-        1024, 1024, events, ctx,
+        1024, 1024, lora_path, Float32(1.0), events, ctx,
     )
     var rs = rgb.shape()
     print("[vae] image:", rs[0], rs[1], rs[2], rs[3], " events:", len(events))
-    save_png(rgb, OUT, ctx, ValueRange.SIGNED)
-    print("[done] saved:", OUT)
+    save_png(rgb, out_path, ctx, ValueRange.SIGNED)
+    print("[done] saved:", out_path)

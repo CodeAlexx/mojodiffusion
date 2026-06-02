@@ -4,6 +4,11 @@ This is the restart handoff for the Mojo trainer work. The active user goal is a
 valid Klein 9B LoRA training run with normal sampling and convergence, then the
 same training/runtime foundation applied to Z-Image and Anima.
 
+For future trainer/runtime edits, also read
+`docs/MOJO_TRAINER_RUNTIME_API_GUIDE.md`. It captures the Z-Image speed lessons,
+offloader loop contract, scratch ring allocator lifetimes, dtype rules, and
+PEFT/ai-toolkit save-format rule in one API-facing document.
+
 ## User Priorities
 
 - Klein 9B LoRA must train for a real convergence run, normally 2000 steps.

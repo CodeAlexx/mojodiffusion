@@ -151,18 +151,21 @@ A 2000-step convergence run was started from the same code path on 2026-06-02.
 Append its final loss/speed/sample metrics here after it finishes.
 
 1024 sampling hook: `serenitymojo/pipeline/zimage_generate.mojo` now accepts
-`[lora_path|base] [out_png]`, merges a PEFT LoRA into resident `NextDiT` with
-`LoraSet.merge_into_indexed`, and preserves the existing 1024 denoise/VAE path.
+`[lora_path|base] [out_png] [seed]`, merges a PEFT LoRA into resident `NextDiT`
+with `LoraSet.merge_into_indexed`, and preserves the existing 1024 denoise/VAE
+path.
 Compile-only gate passed:
 
 ```
 pixi run mojo build -I . -Xlinker -lm serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_lora_check
 ```
 
-Run this after the 2000-step trainer frees the GPU:
+Run three samples after the 2000-step trainer frees the GPU:
 
 ```
-/tmp/zimage_generate_lora_check output/alina_zimage/zimage_lora_step2000.safetensors output/alina_zimage/sample_step2000_1024.png
+/tmp/zimage_generate_lora_check output/alina_zimage/zimage_lora_step2000.safetensors output/alina_zimage/sample_step2000_seed42_1024.png 42
+/tmp/zimage_generate_lora_check output/alina_zimage/zimage_lora_step2000.safetensors output/alina_zimage/sample_step2000_seed31415_1024.png 31415
+/tmp/zimage_generate_lora_check output/alina_zimage/zimage_lora_step2000.safetensors output/alina_zimage/sample_step2000_seed27182_1024.png 27182
 ```
 
 ### Full-F32 blocker status

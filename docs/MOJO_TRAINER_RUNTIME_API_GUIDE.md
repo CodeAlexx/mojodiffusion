@@ -83,13 +83,15 @@ Verified 100-step Mojo run after this speed fix:
 Z-Image 1024 sampling hook:
 
 - `serenitymojo/pipeline/zimage_generate.mojo` accepts
-  `[lora_path|base] [out_png]` at runtime.
+  `[lora_path|base] [out_png] [seed]` at runtime.
 - It loads the resident `NextDiT`, merges the PEFT LoRA through
   `LoraSet.merge_into_indexed`, denoises at 1024, then decodes with the Mojo
   Z-Image VAE.
 - Compile gate: `pixi run mojo build -I . -Xlinker -lm
   serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_lora_check`
-  passed on 2026-06-02. Run it after the training process frees the GPU.
+  passed on 2026-06-02. Run it after the training process frees the GPU. For
+  the 2000-step Z-Image LoRA check, generate three 1024 samples with distinct
+  seeds.
 
 ## Offloader API Guide
 

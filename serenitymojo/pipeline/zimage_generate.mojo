@@ -37,7 +37,7 @@
 # Do NOT run a generation here.
 #
 # Runtime:
-#   /tmp/zimage_generate_check [lora_path|base] [out_png]
+#   /tmp/zimage_generate_check [lora_path|base] [out_png] [seed]
 
 from std.sys import argv
 from std.gpu.host import DeviceContext
@@ -196,6 +196,17 @@ def _stats(name: String, t: Tensor, ctx: DeviceContext) raises:
         "  [stat]", name, "mean=", Float32(mean), "std=", Float32(sqrt(var_)),
         "absmax=", Float32(amax), "n=", n,
     )
+
+
+def _parse_nonnegative_int(s: String) raises -> Int:
+    var out = 0
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        var ch = bs[i]
+        if ch < 0x30 or ch > 0x39:
+            raise Error(String("expected integer, got ") + s)
+        out = out * 10 + Int(ch - 0x30)
+    return out
 
 
 # ── one prompt → templated tokens → layer-34 cap_feats [CAPLEN_MAX, HIDDEN] ──
@@ -383,16 +394,19 @@ def main() raises:
     var a = argv()
     var lora_path = String("")
     var out_path = String(OUT)
+    var seed = DEFAULT_SEED
     if len(a) >= 2:
         var arg_lora = String(a[1])
         if arg_lora != String("base") and arg_lora != String("none") and arg_lora != String(""):
             lora_path = arg_lora
     if len(a) >= 3:
         out_path = String(a[2])
+    if len(a) >= 4:
+        seed = UInt64(_parse_nonnegative_int(String(a[3])))
     var events = List[ZImageEvent]()
     var rgb = zimage_generate(
         DEFAULT_PROMPT, String(""),
-        DEFAULT_STEPS, DEFAULT_CFG, DEFAULT_SEED,
+        DEFAULT_STEPS, DEFAULT_CFG, seed,
         1024, 1024, lora_path, Float32(1.0), events, ctx,
     )
     var rs = rgb.shape()

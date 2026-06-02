@@ -49,6 +49,7 @@ struct KleinStepModWeights(Movable):
     var img_mod: Tensor
     var txt_mod: Tensor
     var single_mod: Tensor
+    var final_mod: Tensor   # final_layer.adaLN_modulation.1.weight [2D, D]
 
     def __init__(
         out self,
@@ -57,12 +58,14 @@ struct KleinStepModWeights(Movable):
         var img_mod: Tensor,
         var txt_mod: Tensor,
         var single_mod: Tensor,
+        var final_mod: Tensor,
     ):
         self.t_in = t_in^
         self.t_out = t_out^
         self.img_mod = img_mod^
         self.txt_mod = txt_mod^
         self.single_mod = single_mod^
+        self.final_mod = final_mod^
 
 
 # Read one named tensor from the safetensors as a host List[Float32] (casts up
@@ -256,12 +259,16 @@ def load_klein_step_mod_weights(
     var single_h = _load_host_f32(
         st, String("single_stream_modulation.lin.weight"), ctx
     )
+    var final_h = _load_host_f32(
+        st, String("final_layer.adaLN_modulation.1.weight"), ctx
+    )
     return KleinStepModWeights(
         _load_tensor(st, String("time_in.in_layer.weight"), ctx),
         _load_tensor(st, String("time_in.out_layer.weight"), ctx),
         Tensor.from_host(img_h^, [6 * d, d], STDtype.F32, ctx),
         Tensor.from_host(txt_h^, [6 * d, d], STDtype.F32, ctx),
         Tensor.from_host(single_h^, [3 * d, d], STDtype.F32, ctx),
+        Tensor.from_host(final_h^, [2 * d, d], STDtype.F32, ctx),
     )
 
 
@@ -373,7 +380,7 @@ def build_klein_step_mods_device_cached(
     timestep_dim: Int,
     d: Int,
     ctx: DeviceContext,
-) raises -> Tuple[ModVecsDevice, ModVecsDevice, SingleModVecsDevice]:
+) raises -> Tuple[ModVecsDevice, ModVecsDevice, SingleModVecsDevice, ArcPointer[Tensor], ArcPointer[Tensor]]:
     var tvals = List[Float32]()
     tvals.append(sigma * Float32(1000.0))
     var tsh = List[Int]()
@@ -387,10 +394,18 @@ def build_klein_step_mods_device_cached(
     var txt_mod = linear(vec_silu, weights.txt_mod, no_bias_txt^, ctx)
     var no_bias_single = Optional[Tensor](None)
     var single_mod = linear(vec_silu, weights.single_mod, no_bias_single^, ctx)
+    # per-step final-layer adaLN mod (FIX: was static sigma=0.5). final_mod [1,2D];
+    # chunk0=shift, chunk1=scale (matches the static load_klein_stack_base path).
+    var no_bias_final = Optional[Tensor](None)
+    var final_mod = linear(vec_silu, weights.final_mod, no_bias_final^, ctx)
+    var final_shift = _chunk_tensor_1d(final_mod, 0, d, ctx)   # [d] cols 0:d
+    var final_scale = _chunk_tensor_1d(final_mod, 1, d, ctx)   # [d] cols d:2d
     return (
         _modvec_device_from_tensor(img_mod, d, ctx),
         _modvec_device_from_tensor(txt_mod, d, ctx),
         _single_modvec_device_from_tensor(single_mod, d, ctx),
+        ArcPointer[Tensor](final_shift^),
+        ArcPointer[Tensor](final_scale^),
     )
 
 

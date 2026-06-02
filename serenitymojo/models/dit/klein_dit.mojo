@@ -26,6 +26,7 @@ from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.plan import OffloadConfig, build_klein9b_block_plan
 from serenitymojo.offload.planned_loader import PlannedBlockLoader
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.training.train_config import TrainConfig
 
 
 @fieldwise_init
@@ -44,6 +45,16 @@ struct KleinConfig(Copyable, Movable, ImplicitlyCopyable):
     @staticmethod
     def klein_9b() -> KleinConfig:
         return KleinConfig(4096, 128, 12288, 8, 24, 32, 128, 12288, 256, 2000.0)
+
+    @staticmethod
+    def from_train_config(tc: TrainConfig) -> KleinConfig:
+        """Build a KleinConfig from the run's config-file-driven TrainConfig.
+        This is how the sampler gets its arch WITHOUT hardcoding a variant."""
+        return KleinConfig(
+            tc.d_model, tc.in_channels, tc.joint_attention_dim,
+            tc.num_double, tc.num_single, tc.n_heads, tc.head_dim,
+            tc.mlp_hidden, tc.timestep_dim, tc.rope_theta,
+        )
 
 
 def _load_weight(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
@@ -95,7 +106,11 @@ def klein9b_shared_keys() -> List[String]:
     return keys^
 
 
-def klein9b_all_keys() -> List[String]:
+# Config-driven key list: generate the full weight-key set for a Klein variant
+# with `num_double` double-stream + `num_single` single-stream blocks. The block
+# counts come from the run config (NOT hardcoded) — this is the fix for the
+# sampler "double_blocks.5 not found" bug on the 4B checkpoint.
+def klein_all_keys(num_double: Int, num_single: Int) -> List[String]:
     var keys = List[String]()
     _append_key(keys, String("img_in.weight"))
     _append_key(keys, String("txt_in.weight"))
@@ -107,7 +122,7 @@ def klein9b_all_keys() -> List[String]:
     _append_key(keys, String("final_layer.adaLN_modulation.1.weight"))
     _append_key(keys, String("final_layer.linear.weight"))
 
-    for bi in range(8):
+    for bi in range(num_double):
         var dp = String("double_blocks.") + String(bi)
         _append_key(keys, dp + ".img_attn.qkv.weight")
         _append_key(keys, dp + ".img_attn.proj.weight")
@@ -122,13 +137,18 @@ def klein9b_all_keys() -> List[String]:
         _append_key(keys, dp + ".txt_mlp.0.weight")
         _append_key(keys, dp + ".txt_mlp.2.weight")
 
-    for bi in range(24):
+    for bi in range(num_single):
         var sp = String("single_blocks.") + String(bi)
         _append_key(keys, sp + ".linear1.weight")
         _append_key(keys, sp + ".linear2.weight")
         _append_key(keys, sp + ".norm.query_norm.scale")
         _append_key(keys, sp + ".norm.key_norm.scale")
     return keys^
+
+
+# Back-compat: the 9B key list (8 double + 24 single) for the 9B inference smokes.
+def klein9b_all_keys() -> List[String]:
+    return klein_all_keys(8, 24)
 
 
 @fieldwise_init
@@ -141,23 +161,36 @@ struct Klein9BDiT(Movable):
     def load(path: String, ctx: DeviceContext) raises -> Klein9BDiT:
         var st = SafeTensors.open(path)
         var keys = klein9b_truncated_keys()
-        return Klein9BDiT._load_keys(st^, keys^, ctx)
+        return Klein9BDiT._load_keys(st^, keys^, KleinConfig.klein_9b(), ctx)
 
     @staticmethod
     def load_shared(path: String, ctx: DeviceContext) raises -> Klein9BDiT:
         var st = SafeTensors.open(path)
         var keys = klein9b_shared_keys()
-        return Klein9BDiT._load_keys(st^, keys^, ctx)
+        return Klein9BDiT._load_keys(st^, keys^, KleinConfig.klein_9b(), ctx)
 
     @staticmethod
     def load_full(path: String, ctx: DeviceContext) raises -> Klein9BDiT:
+        # 9B back-compat loader for the 9B inference smokes.
         var st = SafeTensors.open(path)
         var keys = klein9b_all_keys()
-        return Klein9BDiT._load_keys(st^, keys^, ctx)
+        return Klein9BDiT._load_keys(st^, keys^, KleinConfig.klein_9b(), ctx)
+
+    @staticmethod
+    def load_with_config(
+        path: String, cfg: KleinConfig, ctx: DeviceContext
+    ) raises -> Klein9BDiT:
+        """Config-driven full loader: block counts + arch come from `cfg` (built
+        from the run's config file via KleinConfig.from_train_config). This is
+        what the trainer's validation sampler uses so 4B vs 9B is data, not code."""
+        var st = SafeTensors.open(path)
+        var keys = klein_all_keys(cfg.num_double, cfg.num_single)
+        return Klein9BDiT._load_keys(st^, keys^, cfg, ctx)
 
     @staticmethod
     def _load_keys(
-        var st: SafeTensors, var keys: List[String], ctx: DeviceContext
+        var st: SafeTensors, var keys: List[String], cfg: KleinConfig,
+        ctx: DeviceContext,
     ) raises -> Klein9BDiT:
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
@@ -166,7 +199,7 @@ struct Klein9BDiT(Movable):
             var t = _load_weight(st, name, ctx)
             name_to_idx[name] = len(weights)
             weights.append(ArcPointer(t^))
-        return Klein9BDiT(weights^, name_to_idx^, KleinConfig.klein_9b())
+        return Klein9BDiT(weights^, name_to_idx^, cfg)
 
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
         if name not in self.name_to_idx:
@@ -544,6 +577,11 @@ def build_klein_rope_tables[
             var idx = tok - N_TXT
             p1 = idx // img_w
             p2 = idx % img_w
+        else:
+            # text-token RoPE = [0,0,0,k] (upstream Flux2 prepare_text_ids).
+            # Axis-3 carries the L-axis rotary freqs → distinct phase per text
+            # token. Was all-zero (the bug EDv2 klein.rs KLEIN_VERIFY §H2 fixed).
+            p3 = tok
         for _h in range(H):
             for axis in range(4):
                 var pos = p0

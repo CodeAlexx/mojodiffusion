@@ -95,6 +95,18 @@ struct PlannedBlockLoader(Movable):
     def prefetch_next(mut self, index: Int) raises:
         self.prefetch(self.prefetch_index(index))
 
+    def prefetch_with_ctx(mut self, index: Int, ctx: DeviceContext) raises:
+        """Compatibility with TurboPlannedLoader's explicit-context prefetch."""
+        self.prefetch(index)
+
+    def prefetch_next_with_ctx(mut self, index: Int, ctx: DeviceContext) raises:
+        """Compatibility with TurboPlannedLoader's explicit-context lookahead."""
+        self.prefetch_next(index)
+
+    def mark_active_block_done(mut self, ctx: DeviceContext) raises:
+        """Compatibility with TurboPlannedLoader slot-lifetime tracking."""
+        pass
+
     def await_block(mut self, index: Int, ctx: DeviceContext) raises -> PlannedBlockHandle:
         var prefix = self.plan.prefix(index)
         var load_prefix = self.plan.normalized_prefix(index)

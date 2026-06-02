@@ -7,9 +7,10 @@
 # DESIGN (Phase-0 established; Phase-1 implements):
 #   - DeviceContext() is a singleton. Model compute runs on the DEFAULT stream.
 #   - enqueue_copy() is DEFAULT-stream only — cannot stage weights async.
-#   - H2D staging runs as a GPU byte-copy KERNEL on an explicit copy stream
-#     created via ctx.create_stream(). Pinned host buffers are device-accessible,
-#     so the copy kernel reads pinned host bytes and writes the device slab.
+#   - H2D staging uses CUDA's copy engine via cuMemcpyHtoDAsync_v2 on the
+#     explicit copy stream created via ctx.create_stream(). The old GPU
+#     byte-copy kernel is kept as a fallback/probe, but the trainer path must
+#     not spend SM time copying weights.
 #   - Event handshake:
 #       prefetch(): dispatch copy kernel on copy_stream → record event on copy_stream.
 #       await_block(): ctx.stream().enqueue_wait_for(ev) — default stream fences.
@@ -23,13 +24,20 @@
 #
 # Mojo 1.0.0b1, Linux x86-64, NVIDIA RTX 3090 Ti, MAX 26.3.
 
+from std.ffi import external_call
 from std.memory import ArcPointer
 from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer, DeviceStream, DeviceEvent
+from std.gpu.host._nvidia_cuda import CUDA, CUstream
 from std.gpu import global_idx
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.ffi import BytePtr, sys_memcpy
 from serenitymojo.tensor import Tensor
 from serenitymojo.offload.block_loader import Block
+from serenitymojo.offload.telemetry import OffloadTelemetry
+
+comptime TURBO_USE_DEFAULT_STREAM_COPY = False
+comptime TURBO_USE_CUDA_DMA_COPY = True
 
 
 # ─── copy kernel ──────────────────────────────────────────────────────────────
@@ -41,10 +49,54 @@ def _h2d_copy_kernel(
     dst: UnsafePointer[UInt8, MutAnyOrigin],
     n: Int,
 ):
-    """Copy n bytes: dst[i] = src[i]. Called on the explicit copy stream."""
+    """Copy n bytes. Called on the explicit copy stream.
+
+    The first implementation copied one byte per GPU thread. That was correct,
+    but it made block swapping pay excessive launch/thread traffic on every
+    prefetched transformer block. Safetensors tensors and our packed block slabs
+    are naturally aligned enough for the large path here, so copy UInt64 chunks
+    and let only the short tail use byte lanes.
+    """
     var i = Int(global_idx.x)
-    if i < n:
-        dst[i] = src[i]
+    var n64 = n // 8
+    if i < n64:
+        var src64 = src.bitcast[UInt64]()
+        var dst64 = dst.bitcast[UInt64]()
+        dst64[i] = src64[i]
+    else:
+        var tail_i = i - n64
+        var tail_n = n - n64 * 8
+        if tail_i < tail_n:
+            var b = n64 * 8 + tail_i
+            dst[b] = src[b]
+
+
+def _cu_memcpy_htod_async(
+    dst_device_ptr: UInt64,
+    src_host_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    nbytes: Int,
+    stream: CUstream,
+) -> Int32:
+    return external_call["cuMemcpyHtoDAsync_v2", Int32](
+        dst_device_ptr, src_host_ptr, nbytes, stream
+    )
+
+
+def _h2d_dma_copy(
+    dst_device_ptr: UInt64,
+    src_host_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    nbytes: Int,
+    stream: DeviceStream,
+) raises:
+    var cuda_stream = CUDA(stream)
+    var rc = Int(_cu_memcpy_htod_async(
+        dst_device_ptr, src_host_ptr, nbytes, cuda_stream,
+    ))
+    if rc != 0:
+        raise Error(
+            String("TurboBlockLoader: cuMemcpyHtoDAsync_v2 failed rc=")
+            + String(rc)
+        )
 
 
 # ─── per-tensor staging record ────────────────────────────────────────────────
@@ -95,11 +147,20 @@ struct TurboBlockLoader(Movable):
     var dev0: DeviceBuffer[DType.uint8]
     var host1: HostBuffer[DType.uint8]
     var dev1: DeviceBuffer[DType.uint8]
+    var block_store: HostBuffer[DType.uint8]
 
-    # Per-slot events: one event per slot, recorded after copy kernel completes.
+    # Per-slot H2D-done events, recorded after the copy stream finishes staging.
     # await_block() calls ctx.stream().enqueue_wait_for(ev) to fence the default.
     var ev0: DeviceEvent
     var ev1: DeviceEvent
+
+    # Per-slot compute-done events, recorded on the default stream after block
+    # math has been queued. The copy stream waits on these before overwriting a
+    # slot, matching the Rust BlockHandle drop lifecycle.
+    var compute_done0: DeviceEvent
+    var compute_done1: DeviceEvent
+    var compute_recorded0: Bool
+    var compute_recorded1: Bool
 
     # Explicit copy stream (one, shared across both slots).
     var copy_stream: DeviceStream
@@ -107,6 +168,15 @@ struct TurboBlockLoader(Movable):
     # Per-slot staging metadata: tensor layout within the slab.
     var recs0: List[_TensorRecord]
     var recs1: List[_TensorRecord]
+
+    # Prefix index built once at open(). Hot prefetches must not rescan every
+    # safetensor name just to discover which tensors belong to one block.
+    var index_prefixes: List[String]
+    var index_starts: List[Int]
+    var index_lengths: List[Int]
+    var index_names: List[String]
+    var store_offsets: List[Int]
+    var store_nbytes: List[Int]
 
     # Slot state.
     var prefix0: String   # normalized prefix staged in slot 0 ("" = unused)
@@ -120,6 +190,7 @@ struct TurboBlockLoader(Movable):
     var active_slot: Int
 
     var slab_capacity: Int  # max block bytes; both slabs are this size
+    var telemetry: OffloadTelemetry
 
     @staticmethod
     def open(dir: String, ctx: DeviceContext) raises -> TurboBlockLoader:
@@ -132,6 +203,7 @@ struct TurboBlockLoader(Movable):
         # Pass 1: compute max bytes across all blocks.
         # A block is all tensors sharing the same "X.N." prefix.
         var prefix_bytes = Dict[String, Int]()
+        var prefixes = List[String]()
         for ref nm in sharded.names():
             var p = _extract_block_prefix(nm)
             var tv = sharded.tensor_view(nm)
@@ -140,6 +212,7 @@ struct TurboBlockLoader(Movable):
                 prefix_bytes[p] += nb
             else:
                 prefix_bytes[p] = nb
+                prefixes.append(p)
 
         var max_bytes = 0
         for ref e in prefix_bytes.items():
@@ -148,6 +221,51 @@ struct TurboBlockLoader(Movable):
 
         if max_bytes == 0:
             raise Error("TurboBlockLoader.open: no tensors found in " + dir)
+
+        var index_starts = List[Int]()
+        var index_lengths = List[Int]()
+        var index_names = List[String]()
+        for pi in range(len(prefixes)):
+            var p = prefixes[pi].copy()
+            var start = len(index_names)
+            var count = 0
+            for ref nm in sharded.names():
+                if _extract_block_prefix(nm) == p:
+                    index_names.append(nm)
+                    count += 1
+            index_starts.append(start)
+            index_lengths.append(count)
+
+        # Persistent pinned block store. This mirrors the Rust trainer's
+        # PinnedBlockStore: mmap bytes are copied into pinned host memory once
+        # at open(), then hot prefetches only launch pinned-host -> GPU copies.
+        var store_offsets = List[Int]()
+        var store_nbytes = List[Int]()
+        var total_store_bytes = 0
+        for pi in range(len(prefixes)):
+            store_offsets.append(total_store_bytes)
+            var start = index_starts[pi]
+            var end = start + index_lengths[pi]
+            var block_bytes = 0
+            for ni in range(start, end):
+                var tv = sharded.tensor_view(index_names[ni])
+                block_bytes += tv.nbytes()
+            store_nbytes.append(block_bytes)
+            total_store_bytes += block_bytes
+
+        var block_store = ctx.enqueue_create_host_buffer[DType.uint8](total_store_bytes)
+        for pi in range(len(prefixes)):
+            var dst_base = store_offsets[pi]
+            var offset = 0
+            var start = index_starts[pi]
+            var end = start + index_lengths[pi]
+            for ni in range(start, end):
+                var tv = sharded.tensor_view(index_names[ni])
+                var nb = tv.nbytes()
+                var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
+                var dst = BytePtr(unsafe_from_address=Int(block_store.unsafe_ptr())) + dst_base + offset
+                _ = sys_memcpy(dst, src, nb)
+                offset += nb
 
         # Allocate two pinned host slabs and two device slabs.
         var host0 = ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
@@ -159,14 +277,20 @@ struct TurboBlockLoader(Movable):
         # Allocate events and copy stream.
         var ev0 = ctx.create_event[disable_timing=True]()
         var ev1 = ctx.create_event[disable_timing=True]()
+        var compute_done0 = ctx.create_event[disable_timing=True]()
+        var compute_done1 = ctx.create_event[disable_timing=True]()
         var copy_stream = ctx.create_stream()
 
         return TurboBlockLoader(
             sharded^,
             host0^, dev0^,
             host1^, dev1^,
+            block_store^,
             ev0^, ev1^,
+            compute_done0^, compute_done1^,
             copy_stream^,
+            prefixes^, index_starts^, index_lengths^, index_names^,
+            store_offsets^, store_nbytes^,
             max_bytes,
         )
 
@@ -177,9 +301,18 @@ struct TurboBlockLoader(Movable):
         var dev0: DeviceBuffer[DType.uint8],
         var host1: HostBuffer[DType.uint8],
         var dev1: DeviceBuffer[DType.uint8],
+        var block_store: HostBuffer[DType.uint8],
         var ev0: DeviceEvent,
         var ev1: DeviceEvent,
+        var compute_done0: DeviceEvent,
+        var compute_done1: DeviceEvent,
         var copy_stream: DeviceStream,
+        var index_prefixes: List[String],
+        var index_starts: List[Int],
+        var index_lengths: List[Int],
+        var index_names: List[String],
+        var store_offsets: List[Int],
+        var store_nbytes: List[Int],
         slab_capacity: Int,
     ):
         self.sharded = sharded^
@@ -187,11 +320,22 @@ struct TurboBlockLoader(Movable):
         self.dev0 = dev0^
         self.host1 = host1^
         self.dev1 = dev1^
+        self.block_store = block_store^
         self.ev0 = ev0^
         self.ev1 = ev1^
+        self.compute_done0 = compute_done0^
+        self.compute_done1 = compute_done1^
+        self.compute_recorded0 = False
+        self.compute_recorded1 = False
         self.copy_stream = copy_stream^
         self.recs0 = List[_TensorRecord]()
         self.recs1 = List[_TensorRecord]()
+        self.index_prefixes = index_prefixes^
+        self.index_starts = index_starts^
+        self.index_lengths = index_lengths^
+        self.index_names = index_names^
+        self.store_offsets = store_offsets^
+        self.store_nbytes = store_nbytes^
         self.prefix0 = String("")
         self.prefix1 = String("")
         self.staged0 = False
@@ -200,6 +344,7 @@ struct TurboBlockLoader(Movable):
         self.used1 = 0
         self.active_slot = 0
         self.slab_capacity = slab_capacity
+        self.telemetry = OffloadTelemetry(String("TurboBlockLoader"))
 
     def _norm(self, prefix: String) -> String:
         """Normalize block prefix to dot-terminated form (mirrors BlockLoader)."""
@@ -225,88 +370,143 @@ struct TurboBlockLoader(Movable):
 
         # Already staged?
         if self.prefix0 == p and self.staged0:
+            self.telemetry.record_prefetch_hit(p)
             return
         if self.prefix1 == p and self.staged1:
+            self.telemetry.record_prefetch_hit(p)
             return
 
         var slot = self._idle_slot()
+        var telemetry_t0 = self.telemetry.now_ns()
 
-        # ── Step 1: CPU memcpy from mmap into pinned host slab ─────────────
+        # ── Step 1: build this slot's tensor metadata. Bytes already live in
+        # the persistent pinned block store.
         var new_recs = List[_TensorRecord]()
         var offset = 0
 
-        for ref nm in self.sharded.names():
-            if nm.startswith(p):
-                var tv = self.sharded.tensor_view(nm)
-                var nb = tv.nbytes()
-                if offset + nb > self.slab_capacity:
-                    raise Error(
-                        String("TurboBlockLoader.prefetch: block exceeds slab: ")
-                        + String(offset + nb)
-                        + " > "
-                        + String(self.slab_capacity)
-                    )
-                if slot == 0:
-                    var hp = self.host0.unsafe_ptr()
-                    for i in range(nb):
-                        hp[offset + i] = tv.data[i]
-                else:
-                    var hp = self.host1.unsafe_ptr()
-                    for i in range(nb):
-                        hp[offset + i] = tv.data[i]
-
-                var sh = ArcPointer(tv.shape.copy())
-                new_recs.append(
-                    _TensorRecord(nm, offset, nb, sh, tv.dtype)
-                )
-                offset += nb
+        var prefix_idx = -1
+        for i in range(len(self.index_prefixes)):
+            if self.index_prefixes[i] == p:
+                prefix_idx = i
+                break
+        if prefix_idx < 0:
+            raise Error(
+                String("TurboBlockLoader.prefetch: no tensors for prefix: ") + p
+            )
+        var n_bytes = self.store_nbytes[prefix_idx]
+        if n_bytes > self.slab_capacity:
+            raise Error(
+                String("TurboBlockLoader.prefetch: block exceeds slab: ")
+                + String(n_bytes)
+                + " > "
+                + String(self.slab_capacity)
+            )
+        var start = self.index_starts[prefix_idx]
+        var end = start + self.index_lengths[prefix_idx]
+        for ni in range(start, end):
+            var nm = self.index_names[ni].copy()
+            var tv = self.sharded.tensor_view(nm)
+            var nb = tv.nbytes()
+            var sh = ArcPointer(tv.shape.copy())
+            new_recs.append(
+                _TensorRecord(nm, offset, nb, sh, tv.dtype)
+            )
+            offset += nb
 
         if offset == 0:
             raise Error(
                 String("TurboBlockLoader.prefetch: no tensors for prefix: ") + p
             )
 
-        # ── Step 2: dispatch copy kernel on explicit copy stream ────────────
-        # compile_function is JIT-cached by the DeviceContext: first call ~47µs
-        # (cold PTX compile), subsequent calls ~500ns (cache lookup). No re-JIT per
-        # prefetch. DeviceFunction[...] cannot be stored as an unparameterized struct
-        # field in MAX 26.3 without making TurboBlockLoader parametric; the cache
-        # makes this a non-issue in the hot path.
-        var compiled = ctx.compile_function[_h2d_copy_kernel, _h2d_copy_kernel]()
-        var n_bytes = offset
-        comptime COPY_BLOCK = 256
-        var grid = (n_bytes + COPY_BLOCK - 1) // COPY_BLOCK
+        # ── Step 2: dispatch H2D on explicit copy stream ──────────────────
+        # Fast path: CUDA DMA/copy engine through cuMemcpyHtoDAsync_v2.
+        # Fallback path: GPU copy kernel, kept only for portability/probes.
+        var src_ptr = self.block_store.unsafe_ptr() + self.store_offsets[prefix_idx]
+
+        # Rust parity: do not overwrite a slot until default-stream compute
+        # from the previous block has passed the slot's compute_done event.
+        if slot == 0 and self.compute_recorded0:
+            self.copy_stream.enqueue_wait_for(self.compute_done0)
+            self.compute_recorded0 = False
+        elif slot == 1 and self.compute_recorded1:
+            self.copy_stream.enqueue_wait_for(self.compute_done1)
+            self.compute_recorded1 = False
 
         if slot == 0:
-            self.copy_stream.enqueue_function(
-                compiled,
-                self.host0.unsafe_ptr(),
-                self.dev0.unsafe_ptr(),
-                n_bytes,
-                grid_dim=grid,
-                block_dim=COPY_BLOCK,
-            )
-            # ── Step 3: record event on copy stream ─────────────────────────
-            self.copy_stream.record_event(self.ev0)
+            comptime if TURBO_USE_DEFAULT_STREAM_COPY:
+                var src_sub = self.block_store.create_sub_buffer[DType.uint8](
+                    self.store_offsets[prefix_idx], n_bytes
+                )
+                var dst_sub = self.dev0.create_sub_buffer[DType.uint8](0, n_bytes)
+                ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
+                ctx.stream().record_event(self.ev0)
+            else:
+                comptime if TURBO_USE_CUDA_DMA_COPY:
+                    _h2d_dma_copy(
+                        UInt64(Int(self.dev0.unsafe_ptr())),
+                        src_ptr,
+                        n_bytes,
+                        self.copy_stream,
+                    )
+                    self.copy_stream.record_event(self.ev0)
+                else:
+                    var compiled = ctx.compile_function[_h2d_copy_kernel, _h2d_copy_kernel]()
+                    comptime COPY_BLOCK = 256
+                    var n64 = n_bytes // 8
+                    var copy_items = n64 + (n_bytes - n64 * 8)
+                    var grid = (copy_items + COPY_BLOCK - 1) // COPY_BLOCK
+                    self.copy_stream.enqueue_function(
+                        compiled,
+                        src_ptr,
+                        self.dev0.unsafe_ptr(),
+                        n_bytes,
+                        grid_dim=grid,
+                        block_dim=COPY_BLOCK,
+                    )
+                    self.copy_stream.record_event(self.ev0)
             # Update slot state.
             self.prefix0 = p
             self.staged0 = True
             self.used0 = offset
             self.recs0 = new_recs^
         else:
-            self.copy_stream.enqueue_function(
-                compiled,
-                self.host1.unsafe_ptr(),
-                self.dev1.unsafe_ptr(),
-                n_bytes,
-                grid_dim=grid,
-                block_dim=COPY_BLOCK,
-            )
-            self.copy_stream.record_event(self.ev1)
+            comptime if TURBO_USE_DEFAULT_STREAM_COPY:
+                var src_sub = self.block_store.create_sub_buffer[DType.uint8](
+                    self.store_offsets[prefix_idx], n_bytes
+                )
+                var dst_sub = self.dev1.create_sub_buffer[DType.uint8](0, n_bytes)
+                ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
+                ctx.stream().record_event(self.ev1)
+            else:
+                comptime if TURBO_USE_CUDA_DMA_COPY:
+                    _h2d_dma_copy(
+                        UInt64(Int(self.dev1.unsafe_ptr())),
+                        src_ptr,
+                        n_bytes,
+                        self.copy_stream,
+                    )
+                    self.copy_stream.record_event(self.ev1)
+                else:
+                    var compiled = ctx.compile_function[_h2d_copy_kernel, _h2d_copy_kernel]()
+                    comptime COPY_BLOCK = 256
+                    var n64 = n_bytes // 8
+                    var copy_items = n64 + (n_bytes - n64 * 8)
+                    var grid = (copy_items + COPY_BLOCK - 1) // COPY_BLOCK
+                    self.copy_stream.enqueue_function(
+                        compiled,
+                        src_ptr,
+                        self.dev1.unsafe_ptr(),
+                        n_bytes,
+                        grid_dim=grid,
+                        block_dim=COPY_BLOCK,
+                    )
+                    self.copy_stream.record_event(self.ev1)
             self.prefix1 = p
             self.staged1 = True
             self.used1 = offset
             self.recs1 = new_recs^
+        var telemetry_t1 = self.telemetry.now_ns()
+        self.telemetry.record_prefetch(p, n_bytes, telemetry_t1 - telemetry_t0)
 
     def await_block(
         mut self,
@@ -328,6 +528,8 @@ struct TurboBlockLoader(Movable):
             slot = 0
         elif self.prefix1 == p and self.staged1:
             slot = 1
+        var slot_hit = slot >= 0
+        var telemetry_t0 = self.telemetry.now_ns()
 
         if slot < 0:
             # Not yet staged: run prefetch now (will block copy stream
@@ -373,7 +575,26 @@ struct TurboBlockLoader(Movable):
                 var t = Tensor(sub^, rec.shape[].copy(), rec.dtype)
                 block[rec.name] = ArcPointer(t^)
 
+        var telemetry_t1 = self.telemetry.now_ns()
+        self.telemetry.record_await(p, slot_hit, telemetry_t1 - telemetry_t0)
         return block^
+
+    def mark_active_slot_compute_done(
+        mut self,
+        ctx: DeviceContext,
+    ) raises:
+        """Record a default-stream event for the slot returned by await_block().
+
+        Call this after all kernels that read the current block have been
+        queued. The next prefetch that reuses that slot will make the copy
+        stream wait on this event before writing new weights into the slab.
+        """
+        if self.active_slot == 0:
+            ctx.stream().record_event(self.compute_done0)
+            self.compute_recorded0 = True
+        else:
+            ctx.stream().record_event(self.compute_done1)
+            self.compute_recorded1 = True
 
     def async_enabled(self) -> Bool:
         return True
@@ -381,6 +602,9 @@ struct TurboBlockLoader(Movable):
     def slab_bytes(self) -> Int:
         """Total bytes allocated across both slots (pinned host + device each)."""
         return self.slab_capacity * 4  # host0 + dev0 + host1 + dev1
+
+    def print_telemetry(self):
+        self.telemetry.print_summary()
 
 
 # ─── helper: extract block prefix from a tensor name ─────────────────────────

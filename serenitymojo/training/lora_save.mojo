@@ -124,6 +124,43 @@ def save_lora_peft(
     return len(adapters)
 
 
+def save_lora_train_state(
+    adapters: List[NamedLora], path: String, ctx: DeviceContext
+) raises -> Int:
+    """Write trainer-only LoRA state: A/B plus AdamW moments.
+
+    This is intentionally separate from the PEFT file. The PEFT file stays
+    plain external-compatible LoRA, while this state file lets the pure-Mojo
+    cadence supervisor resume without zeroing AdamW moments.
+    """
+    if len(adapters) == 0:
+        raise Error("save_lora_train_state: refusing to write an empty state")
+
+    var names = List[String]()
+    var tensors = List[ArcPointer[Tensor]]()
+    for ref nl in adapters:
+        var a = nl.adapter.copy()
+        if len(a.a) != a.rank * a.in_f or len(a.ma) != a.rank * a.in_f or len(a.va) != a.rank * a.in_f:
+            raise Error(String("save_lora_train_state: A/m/v shape mismatch for ") + nl.prefix)
+        if len(a.b) != a.out_f * a.rank or len(a.mb) != a.out_f * a.rank or len(a.vb) != a.out_f * a.rank:
+            raise Error(String("save_lora_train_state: B/m/v shape mismatch for ") + nl.prefix)
+        names.append(nl.prefix + ".lora_A.weight")
+        tensors.append(ArcPointer(_f32_2d(a.a.copy(), a.rank, a.in_f, ctx)))
+        names.append(nl.prefix + ".lora_B.weight")
+        tensors.append(ArcPointer(_f32_2d(a.b.copy(), a.out_f, a.rank, ctx)))
+        names.append(nl.prefix + ".lora_A.adam_m")
+        tensors.append(ArcPointer(_f32_2d(a.ma.copy(), a.rank, a.in_f, ctx)))
+        names.append(nl.prefix + ".lora_A.adam_v")
+        tensors.append(ArcPointer(_f32_2d(a.va.copy(), a.rank, a.in_f, ctx)))
+        names.append(nl.prefix + ".lora_B.adam_m")
+        tensors.append(ArcPointer(_f32_2d(a.mb.copy(), a.out_f, a.rank, ctx)))
+        names.append(nl.prefix + ".lora_B.adam_v")
+        tensors.append(ArcPointer(_f32_2d(a.vb.copy(), a.out_f, a.rank, ctx)))
+
+    save_safetensors(names, tensors, path, ctx)
+    return len(adapters)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOAD-BACK for resume: read A/B by PEFT key into fresh LoraAdapters. Optimizer
 # state (ma/va/mb/vb) is ZEROED here — the AdamW moments for a *resumed* run come
@@ -138,6 +175,14 @@ def _read_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[
     io/tensor_view.mojo:114-119 so the view's origin binds to `st`."""
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
+    if info.dtype == STDtype.F32:
+        if info.size % 4 != 0:
+            raise Error(String("_read_f32: bad F32 byte size for ") + name)
+        var fp = bytes.unsafe_ptr().bitcast[Float32]()
+        var out = List[Float32]()
+        for i in range(info.size // 4):
+            out.append(fp[i])
+        return out^
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
     var t = Tensor.from_view(tv, ctx)
     return t.to_host(ctx)
@@ -195,6 +240,63 @@ def load_lora_for_resume(
 
         var ad = LoraAdapter(
             a_h^, b_h^, rank, in_f, out_f, scale, ma^, va^, mb^, vb^
+        )
+        out.append(NamedLora(pfx, ad^))
+
+    return out^
+
+
+def load_lora_train_state(
+    prefixes: List[String], scale: Float32, path: String, ctx: DeviceContext
+) raises -> List[NamedLora]:
+    """Read the trainer-only state file written by save_lora_train_state."""
+    var st = SafeTensors.open(path)
+    var out = List[NamedLora]()
+
+    for ref pfx in prefixes:
+        var key_a = pfx + ".lora_A.weight"
+        var key_b = pfx + ".lora_B.weight"
+        var key_ma = pfx + ".lora_A.adam_m"
+        var key_va = pfx + ".lora_A.adam_v"
+        var key_mb = pfx + ".lora_B.adam_m"
+        var key_vb = pfx + ".lora_B.adam_v"
+        if key_a not in st.tensors:
+            raise Error(String("load_lora_train_state: missing ") + key_a)
+        if key_b not in st.tensors:
+            raise Error(String("load_lora_train_state: missing ") + key_b)
+        if key_ma not in st.tensors:
+            raise Error(String("load_lora_train_state: missing ") + key_ma)
+        if key_va not in st.tensors:
+            raise Error(String("load_lora_train_state: missing ") + key_va)
+        if key_mb not in st.tensors:
+            raise Error(String("load_lora_train_state: missing ") + key_mb)
+        if key_vb not in st.tensors:
+            raise Error(String("load_lora_train_state: missing ") + key_vb)
+
+        var a_info = st.tensor_info(key_a)
+        var b_info = st.tensor_info(key_b)
+        if len(a_info.shape) != 2 or len(b_info.shape) != 2:
+            raise Error(String("load_lora_train_state: A/B must be 2-D for ") + pfx)
+        var rank = a_info.shape[0]
+        var in_f = a_info.shape[1]
+        var out_f = b_info.shape[0]
+        if b_info.shape[1] != rank:
+            raise Error(String("load_lora_train_state: B rank mismatch for ") + pfx)
+
+        var a_h = _read_f32(st, key_a, ctx)
+        var b_h = _read_f32(st, key_b, ctx)
+        var ma_h = _read_f32(st, key_ma, ctx)
+        var va_h = _read_f32(st, key_va, ctx)
+        var mb_h = _read_f32(st, key_mb, ctx)
+        var vb_h = _read_f32(st, key_vb, ctx)
+        if len(ma_h) != len(a_h) or len(va_h) != len(a_h):
+            raise Error(String("load_lora_train_state: A moment len mismatch for ") + pfx)
+        if len(mb_h) != len(b_h) or len(vb_h) != len(b_h):
+            raise Error(String("load_lora_train_state: B moment len mismatch for ") + pfx)
+
+        var ad = LoraAdapter(
+            a_h^, b_h^, rank, in_f, out_f, scale,
+            ma_h^, va_h^, mb_h^, vb_h^,
         )
         out.append(NamedLora(pfx, ad^))
 

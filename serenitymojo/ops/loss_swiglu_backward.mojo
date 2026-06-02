@@ -106,6 +106,70 @@ def mse_backward(pred: Tensor, target: Tensor, ctx: DeviceContext) raises -> Ten
     return Tensor(out_buf^, pred.shape(), pred.dtype())
 
 
+# ── MAE / L1 backward: d_pred[i] = sign(pred[i]-target[i]) / N ────────────────
+# (Wave 2A Domain-3 l1-mae-loss-backward item.)
+# MAE (mean reduction, matches torch.nn.functional.l1_loss(reduction='mean')):
+#     loss   = mean(|pred - target|)
+#     d_pred = sign(pred - target) / N      (sign(0) = 0, matches torch subgrad)
+def _mae_bwd_kernel_f32(
+    pred: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    tgt: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    inv_n: Float32,  # = 1.0 / N
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var p = rebind[Scalar[DType.float32]](pred[i])
+        var t = rebind[Scalar[DType.float32]](tgt[i])
+        var x = p - t
+        var s = Float32(0.0)
+        if x > Float32(0.0):
+            s = Float32(1.0)
+        elif x < Float32(0.0):
+            s = Float32(-1.0)
+        o[i] = rebind[o.element_type](s * inv_n)
+
+
+def mae_backward(pred: Tensor, target: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """Gradient of mean(|pred-target|) wrt pred. d_pred = sign(pred-target)/N.
+
+    pred/target: same shape, F32. Returns d_pred [same shape], F32.
+    Matches torch.nn.functional.l1_loss(reduction='mean') autograd (sign(0)=0).
+    """
+    # BF16/F16 storage path: cast up, run F32 interior, cast grad down.
+    if pred.dtype() != STDtype.F32 or target.dtype() != STDtype.F32:
+        if pred.dtype() != target.dtype():
+            raise Error("mae_backward: pred/target dtype mismatch")
+        var out_dt = pred.dtype()
+        var p32 = cast_tensor(pred, STDtype.F32, ctx)
+        var t32 = cast_tensor(target, STDtype.F32, ctx)
+        var dp32 = mae_backward(p32, t32, ctx)
+        return cast_tensor(dp32, out_dt, ctx)
+    if pred.numel() != target.numel():
+        raise Error("mae_backward: pred/target numel mismatch")
+    var n = pred.numel()
+    if n == 0:
+        raise Error("mae_backward: empty input")
+    var inv_n = Float32(1.0) / Float32(n)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](pred.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        pred.buf.unsafe_ptr().bitcast[Float32](), rl
+    )
+    var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        target.buf.unsafe_ptr().bitcast[Float32](), rl
+    )
+    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[Float32](), rl
+    )
+    ctx.enqueue_function[_mae_bwd_kernel_f32, _mae_bwd_kernel_f32](
+        P, T, O, inv_n, n, grid_dim=grid, block_dim=_BLOCK
+    )
+    return Tensor(out_buf^, pred.shape(), pred.dtype())
+
+
 # ── Huber backward: d_pred[i] = clamp(pred[i]-target[i], -δ, δ) / N ───────────
 def _huber_bwd_kernel_f32(
     pred: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],

@@ -238,9 +238,10 @@ def _host_noise(n: Int, seed: UInt64) -> List[Float32]:
 
 # ── logit-normal timestep sample (train_ernie.rs sample_timestep_logit_normal) ─
 # z ~ Normal(0,1); ln = sigmoid(z); t = ln * 1000; shift=1 -> identity.
-# Returns sigma_idx in [0, 999].
-def _sample_sigma_idx(mut state: UInt64) -> Int:
+# Returns sigma_idx in [0, 999] plus the advanced RNG state.
+def _sample_sigma_idx(state0: UInt64) -> Tuple[Int, UInt64]:
     # one Box-Muller normal sample
+    var state = state0
     state = state * 6364136223846793005 + 1442695040888963407
     var u1 = (Float32(Int(state >> 40)) + 1.0) * Float32(1.0 / 16777217.0)
     state = state * 6364136223846793005 + 1442695040888963407
@@ -253,7 +254,7 @@ def _sample_sigma_idx(mut state: UInt64) -> Int:
         idx = 0
     if idx > NUM_TRAIN_TIMESTEPS - 1:
         idx = NUM_TRAIN_TIMESTEPS - 1
-    return idx
+    return (idx, state)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -395,7 +396,9 @@ def main() raises:
         var txt_tokens = _text_to_txt_tokens(text, t_cache)                # [N_TXT, TEXT_IN]
 
         # ── sigma + flow-match noise/target (F32; train_ernie.rs:904-949) ──
-        var sigma_idx = _sample_sigma_idx(rng_state)
+        var sigma_draw = _sample_sigma_idx(rng_state)
+        var sigma_idx = sigma_draw[0]
+        rng_state = sigma_draw[1]
         var sigma = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
         var n_lat = N_IMG * IN_CH
         var noise = _host_noise(n_lat, SEED ^ (UInt64(step) + 1))

@@ -24,8 +24,10 @@ from serenitymojo.training.validation_sampler import (
     generate_validation,
     pixel_l1,
 )
+from serenitymojo.io.train_config_reader import read_model_config
 
 
+comptime CONFIG_PATH = "/home/alex/mojodiffusion/serenitymojo/configs/klein9b.json"
 comptime KLEIN9B_PATH = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
 comptime VAE_PATH = "/home/alex/.serenity/models/vaes/flux2-vae.safetensors"
 comptime CAPS_POS = "/home/alex/mojodiffusion/output/klein9b_caps_pos.bin"
@@ -52,12 +54,13 @@ comptime LORA_MULT = Float32(1.0)
 def main() raises:
     var ctx = DeviceContext()
     print("=== Klein validation sampler — L2P sample-shift gate ===")
+    var cfg = read_model_config(String(CONFIG_PATH))
     var caps = load_caps(String(CAPS_POS), String(CAPS_NEG), ctx)
 
     # (1) baseline — no LoRA.
     print("[1/2] baseline generation (no LoRA)")
     var img_base = generate_validation[N_IMG, N_TXT, S, LH, LW](
-        String(KLEIN9B_PATH), String(VAE_PATH), caps,
+        cfg, String(KLEIN9B_PATH), String(VAE_PATH), caps,
         String(""), LORA_MULT, NUM_STEPS, CFG, SEED, String(OUT_BASE), ctx,
     )
 
@@ -69,7 +72,7 @@ def main() raises:
     # (2) with-LoRA.
     print("[2/2] with-LoRA generation")
     var img_lora = generate_validation[N_IMG, N_TXT, S, LH, LW](
-        String(KLEIN9B_PATH), String(VAE_PATH), caps2,
+        cfg, String(KLEIN9B_PATH), String(VAE_PATH), caps2,
         String(LORA_PATH), LORA_MULT, NUM_STEPS, CFG, SEED, String(OUT_LORA), ctx,
     )
 

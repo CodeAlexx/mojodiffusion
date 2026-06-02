@@ -61,12 +61,15 @@ def _f32_to_f16(
         )
 
 
-def cast_tensor(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
+def cast_tensor(
+    x: Tensor, dtype: STDtype, ctx: DeviceContext, synchronize: Bool = True
+) raises -> Tensor:
     """Materialized GPU dtype cast. Supports F32<->BF16/F16 plus no-op clone."""
     if x.dtype() == dtype:
         var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
         ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
+        if synchronize:
+            ctx.synchronize()
         return Tensor(dev^, x.shape(), dtype)
 
     var src = x.dtype().to_mojo_dtype()
@@ -76,7 +79,8 @@ def cast_tensor(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
     # Allocate a zero-byte buffer and return the empty tensor with the target dtype.
     if n == 0:
         var empty_buf = ctx.enqueue_create_buffer[DType.uint8](0)
-        ctx.synchronize()
+        if synchronize:
+            ctx.synchronize()
         return Tensor(empty_buf^, x.shape(), dtype)
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
@@ -162,7 +166,8 @@ def cast_tensor(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
         )
     else:
         raise Error("cast_tensor: unsupported dtype pair")
-    ctx.synchronize()
+    if synchronize:
+        ctx.synchronize()
     return Tensor(out_buf^, x.shape(), dtype)
 
 

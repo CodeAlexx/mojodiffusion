@@ -260,14 +260,12 @@ def _adamw_host_list(
 
 # AdamW one step on a LoRA adapter (A and B).
 def _lora_adamw(
-    mut lo: LoraAdapter, g: LoraGrads, t: Int, lr: Float32, ctx: DeviceContext
+    mut lo: LoraAdapter, g: LoraGrads, t: Int, lr: Float32, ctx: DeviceContext,
+    beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
+    eps: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
 ) raises:
-    var b1 = Float32(0.9)
-    var b2 = Float32(0.999)
-    var aeps = Float32(1.0e-8)
-    var wd = Float32(0.01)   # OneTrainer AdamW weight_decay=0.01
-    _adamw_host_list(lo.a, g.d_a, lo.ma, lo.va, t, lr, b1, b2, aeps, wd)
-    _adamw_host_list(lo.b, g.d_b, lo.mb, lo.vb, t, lr, b1, b2, aeps, wd)
+    _adamw_host_list(lo.a, g.d_a, lo.ma, lo.va, t, lr, beta1, beta2, eps, weight_decay)
+    _adamw_host_list(lo.b, g.d_b, lo.mb, lo.vb, t, lr, beta1, beta2, eps, weight_decay)
 
 
 # ── ONE training step (single-stream block + ONE trained LoRA adapter) ───────
@@ -327,10 +325,13 @@ def train_step[
 # swaps the comptime _* for cfg dims + a weight loader (GAP G1).
 def run_synthetic(cfg: TrainConfig, ctx: DeviceContext) raises:
     print("=== LoRA training:", cfg.name, "===")
-    var c = TrainConfig(
-        cfg.name, _D, _H, _Dh, _FF, cfg.n_layers,
-        cfg.lr, cfg.timestep_shift, cfg.lora_rank, cfg.lora_alpha, cfg.eps,
-    )
+    # Keep the model's real recipe; override only the dims with the synth comptime
+    # dims (a real run would use cfg's dims + a weight loader — GAP G1).
+    var c = cfg.copy()
+    c.d_model = _D
+    c.n_heads = _H
+    c.head_dim = _Dh
+    c.mlp_hidden = _FF
 
     var w = _make_block_weights(c, 100)
     var lo = _make_lora(c, _D, _D, 7)

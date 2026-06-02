@@ -140,6 +140,11 @@ def sys_pread(fd: Int, buf: BytePtr, count: Int, offset: Int) -> Int:
     return external_call["pread", Int](Int32(fd), buf, count, offset)
 
 
+def sys_memcpy(dst: BytePtr, src: BytePtr, count: Int) -> BytePtr:
+    """memcpy(3). Copies `count` bytes from `src` to `dst`; returns `dst`."""
+    return external_call["memcpy", BytePtr](dst, src, count)
+
+
 def file_size(fd: Int) -> Int:
     """File size in bytes via lseek(fd, 0, SEEK_END). Restores the offset to the
     start (SEEK_SET) afterward so subsequent reads are unaffected. This avoids

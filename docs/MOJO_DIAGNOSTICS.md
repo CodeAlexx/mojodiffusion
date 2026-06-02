@@ -279,3 +279,17 @@ encoder latent-std ≈ 0.96 gate (`klein_encode_smoke`).
 drops AND a sample shifts on the trigger — the only verdict that counts, §5).
 The sdpa H=30 correctness blocker is RESOLVED (false alarm). No open research
 questions — the finish line is assembly + the long run (master handoff §3/§7).
+
+## 2026-06-01 — grad-coverage diagnostic (new standalone module)
+
+`training/grad_coverage.mojo` ports flame-core `diagnostics.rs` (assert_grad_flow,
+grad_is_dead) + EDv2 `grad_coverage.rs`: a `GradCoverage` report (total / nonzero / dead /
+has_nonfinite), `coverage_pct()`, explicit NaN/Inf detection (NaN folds to dead, matching
+flame), and an env-gated abort on strict `FLAME_ASSERT_GRAD_FLOW=="1"` (matches
+`env_flags.rs::flag_enabled`; `=0` does NOT arm). Gate: `training/grad_coverage_smoke.mojo`
+(all-zero + NaN + healthy grads; coverage<100; armed abort exits 1).
+
+It is the in-tree detector for the LyCORIS dead-factor failure mode — every ported LyCORIS
+adapter gate feeds its factor grads through `GradCoverage.measure` and asserts coverage==100
+(deliberate-zero-a-factor exits 1). Standalone module, not wired into the trainer loop.
+See `docs/FLAMECORE_PARITY_PORTED_2026-06-01.md`.

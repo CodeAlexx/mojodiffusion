@@ -1,29 +1,16 @@
-# train_config_reader_smoke.mojo — read the real OneTrainer Klein9B config and
-# print the parsed TrainConfig + OptimExtra. Also asserts the JSON-derived
-# recipe scalars match the known values in the file.
+# train_config_reader_smoke.mojo — read serenitymojo/configs/klein4b.json and
+# assert the parsed TrainConfig matches the checkpoint-verified values.
 #
 # Run (after the compile lock frees):
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #     pixi run mojo run -I . serenitymojo/io/train_config_reader_smoke.mojo
 #
-# Known values in /home/alex/OneTrainer/configs/klein9b_loss_compare.json
-# (verified 2026-05-30):
-#   learning_rate 0.0004 | lora_rank 16 | lora_alpha 16 | model_type "FLUX_2"
-#   optimizer.eps 1e-08 | optimizer.weight_decay 0.01 | beta1 0.9 | beta2 0.999
+# Values verified against flux-2-klein-base-4b.safetensors header (2026-05-31).
 
-from serenitymojo.io.train_config_reader import read_train_config
+from serenitymojo.io.train_config_reader import read_model_config
 
 
-comptime CONFIG = "/home/alex/OneTrainer/configs/klein9b_loss_compare.json"
-
-# Klein9B model dims (NOT in the OneTrainer JSON — caller-supplied, mirroring the
-# per-model config constructor the train_config.mojo header points to). Klein9B:
-# inner_dim 4096 = 32 heads * 128 head_dim; 8 double + 24 single = 32 blocks.
-comptime D_MODEL = 4096
-comptime N_HEADS = 32
-comptime HEAD_DIM = 128
-comptime MLP_HIDDEN = 16384
-comptime N_LAYERS = 32
+comptime CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/klein4b.json"
 
 
 def _close(name: String, a: Float32, b: Float32) raises:
@@ -33,38 +20,66 @@ def _close(name: String, a: Float32, b: Float32) raises:
         raise Error(name + " mismatch: got " + String(a) + " expected " + String(b))
 
 
+def _eq(name: String, a: Int, b: Int) raises:
+    if a != b:
+        raise Error(name + " expected " + String(b) + ", got " + String(a))
+
+
 def main() raises:
     print("=== train_config_reader smoke: ", CONFIG, " ===")
-    var r = read_train_config(
-        String(CONFIG), D_MODEL, N_HEADS, HEAD_DIM, MLP_HIDDEN, N_LAYERS
-    )
-    var c = r.cfg.copy()
+    var c = read_model_config(String(CONFIG))
 
-    print("  name           =", c.name)
-    print("  lr             =", c.lr)
-    print("  lora_rank      =", c.lora_rank)
-    print("  lora_alpha     =", c.lora_alpha)
-    print("  eps            =", c.eps)
-    print("  timestep_shift =", c.timestep_shift, "(caller default 1.8)")
+    print("  name          =", c.name)
+    print("  checkpoint     =", c.checkpoint)
+    print("  vae            =", c.vae)
     print("  d_model        =", c.d_model)
+    print("  in_channels    =", c.in_channels)
+    print("  joint_attn_dim =", c.joint_attention_dim)
+    print("  out_channels   =", c.out_channels)
+    print("  num_double     =", c.num_double)
+    print("  num_single     =", c.num_single)
     print("  n_heads        =", c.n_heads)
     print("  head_dim       =", c.head_dim)
     print("  mlp_hidden     =", c.mlp_hidden)
-    print("  n_layers       =", c.n_layers)
-    print("  optim.weight_decay =", r.optim.weight_decay)
-    print("  optim.beta1        =", r.optim.beta1)
-    print("  optim.beta2        =", r.optim.beta2)
+    print("  timestep_dim   =", c.timestep_dim)
+    print("  rope_theta     =", c.rope_theta)
+    print("  lr             =", c.lr)
+    print("  lora_rank      =", c.lora_rank)
+    print("  lora_alpha     =", c.lora_alpha)
+    print("  timestep_shift =", c.timestep_shift)
+    print("  eps            =", c.eps)
+    print("  weight_decay   =", c.weight_decay)
+    print("  beta1/beta2    =", c.beta1, c.beta2)
+    print("  max_grad_norm  =", c.max_grad_norm)
+    print("  max_steps      =", c.max_steps)
+    print("  save/sample    =", c.save_every, c.sample_every)
+    print("  n_layers()     =", c.n_layers())
 
-    # Assertions against the known file values.
-    _close("lr", c.lr, Float32(0.0004))
-    if c.lora_rank != 16:
-        raise Error("lora_rank expected 16, got " + String(c.lora_rank))
+    # Arch — verified from the 4B checkpoint header.
+    _eq("d_model", c.d_model, 3072)
+    _eq("in_channels", c.in_channels, 128)
+    _eq("joint_attention_dim", c.joint_attention_dim, 7680)
+    _eq("out_channels", c.out_channels, 128)
+    _eq("num_double", c.num_double, 5)
+    _eq("num_single", c.num_single, 20)
+    _eq("n_heads", c.n_heads, 24)
+    _eq("head_dim", c.head_dim, 128)
+    _eq("mlp_hidden", c.mlp_hidden, 9216)
+    _eq("timestep_dim", c.timestep_dim, 256)
+    _eq("n_layers", c.n_layers(), 25)
+    # Consistency: heads * head_dim == inner_dim.
+    _eq("n_heads*head_dim==d_model", c.n_heads * c.head_dim, c.d_model)
+
+    # Recipe.
+    _close("lr", c.lr, Float32(1e-4))
+    _eq("lora_rank", c.lora_rank, 16)
     _close("lora_alpha", c.lora_alpha, Float32(16.0))
-    _close("eps", c.eps, Float32(1e-8))
-    _close("weight_decay", r.optim.weight_decay, Float32(0.01))
-    _close("beta1", r.optim.beta1, Float32(0.9))
-    _close("beta2", r.optim.beta2, Float32(0.999))
-    if c.name != String("FLUX_2"):
-        raise Error("model_type expected FLUX_2, got " + c.name)
+    _close("timestep_shift", c.timestep_shift, Float32(1.8))
+    _close("eps", c.eps, Float32(1e-6))
+    _close("weight_decay", c.weight_decay, Float32(0.0))
+    _close("beta1", c.beta1, Float32(0.9))
+    _close("beta2", c.beta2, Float32(0.999))
+    if c.name != String("klein"):
+        raise Error("model_type expected klein, got " + c.name)
 
-    print("train_config_reader smoke PASS (recipe scalars match the file)")
+    print("train_config_reader smoke PASS (arch + recipe match the file)")

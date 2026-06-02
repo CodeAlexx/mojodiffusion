@@ -70,8 +70,8 @@ struct LoraAdapterDevice(Copyable, Movable):
 
 def lora_adapter_to_device(lo: LoraAdapter, ctx: DeviceContext) raises -> LoraAdapterDevice:
     return LoraAdapterDevice(
-        TArc(Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx)),
-        TArc(Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx)),
+        TArc(Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.BF16, ctx)),
+        TArc(Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.BF16, ctx)),
         lo.rank, lo.in_f, lo.out_f, lo.scale,
     )
 
@@ -159,6 +159,38 @@ def klein_lora_fwd_rows_device_resident_scratch(
     )
 
 
+struct KleinLoraQKVDeltas(Movable):
+    var q: Tensor
+    var k: Tensor
+    var v: Tensor
+
+    def __init__(out self, var q: Tensor, var k: Tensor, var v: Tensor):
+        self.q = q^
+        self.k = k^
+        self.v = v^
+
+
+def klein_lora_fwd_qkv_rows_device_resident_scratch(
+    x: Tensor,
+    lo: LoraAdapterDevice,
+    row_dim: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> KleinLoraQKVDeltas:
+    var nb1 = Optional[Tensor](None)
+    var t = linear_scratch(x, lo.a[], nb1^, ctx, scratch)
+    var q = linear_rows_scratch(
+        t, lo.b[], 0, row_dim, ctx, scratch, alpha=lo.scale,
+    )
+    var k = linear_rows_scratch(
+        t, lo.b[], row_dim, row_dim, ctx, scratch, alpha=lo.scale,
+    )
+    var v = linear_rows_scratch(
+        t, lo.b[], 2 * row_dim, row_dim, ctx, scratch, alpha=lo.scale,
+    )
+    return KleinLoraQKVDeltas(q^, k^, v^)
+
+
 def klein_lora_fwd_device(
     x: Tensor, lo: LoraAdapter, M: Int, ctx: DeviceContext
 ) raises -> Tensor:
@@ -229,6 +261,17 @@ struct KleinLoraDeviceGrads(Movable):
         self.d_x = d_x^
 
 
+struct KleinLoraDeviceGradTensors(Copyable, Movable):
+    var d_a: TArc
+    var d_b: TArc
+    var d_x: TArc
+
+    def __init__(out self, var d_a: TArc, var d_b: TArc, var d_x: TArc):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_x = d_x^
+
+
 # Device-resident sibling of klein_lora_bwd. d_A/d_B still leave as host lists
 # for the existing optimizer, while the large d_x_lo tensor stays on device.
 def klein_lora_bwd_device_resident(
@@ -250,6 +293,29 @@ def klein_lora_bwd_device_resident(
 
     var pair = _to_host_pair_f32(d_a_t, d_b_t, ctx)
     return KleinLoraDeviceGrads(pair.d_a.copy(), pair.d_b.copy(), d_x_lo^)
+
+
+def klein_lora_bwd_device_resident_tensors(
+    d_contrib: Tensor, x: Tensor, lo: LoraAdapterDevice,
+    M: Int, ctx: DeviceContext,
+) raises -> KleinLoraDeviceGradTensors:
+    """Device-resident LoRA backward.
+
+    This variant keeps d_A/d_B on device so the full Klein stack can enqueue all
+    block backward work first and perform one batched D2H fence at the end of the
+    step. The legacy sibling above is kept for parity tests and smaller callers.
+    """
+    var nb_t = Optional[Tensor](None)
+    var t = linear(x, lo.a[], nb_t^, ctx)
+    var d_dy = mul_scalar(d_contrib, lo.scale, ctx)
+
+    var d_t = linear_backward_dx(d_dy, lo.b[], M, lo.rank, lo.out_f, ctx)
+    var d_b_t = linear_backward_dw(d_dy, t, M, lo.rank, lo.out_f, ctx)
+
+    var d_x_lo = linear_backward_dx(d_t, lo.a[], M, lo.in_f, lo.rank, ctx)
+    var d_a_t = linear_backward_dw(d_t, x, M, lo.in_f, lo.rank, ctx)
+
+    return KleinLoraDeviceGradTensors(TArc(d_a_t^), TArc(d_b_t^), TArc(d_x_lo^))
 
 
 def klein_lora_bwd_device(

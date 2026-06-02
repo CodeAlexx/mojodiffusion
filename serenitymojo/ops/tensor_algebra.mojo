@@ -736,6 +736,417 @@ def transpose(x: Tensor, dim0: Int, dim1: Int, ctx: DeviceContext) raises -> Ten
     return permute(x, perm, ctx)
 
 
+def _concat_dim1_rank2_2_f32_kernel(
+    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    ca: Int,
+    cb: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var co = ca + cb
+        var r = idx // co
+        var c = idx % co
+        if c < ca:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float32]](a[r * ca + c])
+            )
+        else:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float32]](b[r * cb + (c - ca)])
+            )
+
+
+def _concat_dim1_rank2_2_bf16_kernel(
+    a: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    ca: Int,
+    cb: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var co = ca + cb
+        var r = idx // co
+        var c = idx % co
+        if c < ca:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.bfloat16]](a[r * ca + c])
+            )
+        else:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.bfloat16]](b[r * cb + (c - ca)])
+            )
+
+
+def _concat_dim1_rank2_2_f16_kernel(
+    a: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    ca: Int,
+    cb: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var co = ca + cb
+        var r = idx // co
+        var c = idx % co
+        if c < ca:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float16]](a[r * ca + c])
+            )
+        else:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float16]](b[r * cb + (c - ca)])
+            )
+
+
+def _concat_dim1_rank2_3_f32_kernel(
+    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    c_t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    ca: Int,
+    cb: Int,
+    cc: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var co = ca + cb + cc
+        var r = idx // co
+        var c = idx % co
+        if c < ca:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float32]](a[r * ca + c])
+            )
+        elif c < ca + cb:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float32]](b[r * cb + (c - ca)])
+            )
+        else:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float32]](c_t[r * cc + (c - ca - cb)])
+            )
+
+
+def _concat_dim1_rank2_3_bf16_kernel(
+    a: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    c_t: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    ca: Int,
+    cb: Int,
+    cc: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var co = ca + cb + cc
+        var r = idx // co
+        var c = idx % co
+        if c < ca:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.bfloat16]](a[r * ca + c])
+            )
+        elif c < ca + cb:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.bfloat16]](b[r * cb + (c - ca)])
+            )
+        else:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.bfloat16]](c_t[r * cc + (c - ca - cb)])
+            )
+
+
+def _concat_dim1_rank2_3_f16_kernel(
+    a: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    c_t: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    ca: Int,
+    cb: Int,
+    cc: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var co = ca + cb + cc
+        var r = idx // co
+        var c = idx % co
+        if c < ca:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float16]](a[r * ca + c])
+            )
+        elif c < ca + cb:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float16]](b[r * cb + (c - ca)])
+            )
+        else:
+            o[idx] = rebind[o.element_type](
+                rebind[Scalar[DType.float16]](c_t[r * cc + (c - ca - cb)])
+            )
+
+
+def _slice_dim1_rank2_f32_kernel(
+    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    cols: Int,
+    start: Int,
+    length: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var r = idx // length
+        var c = idx % length
+        o[idx] = rebind[o.element_type](
+            rebind[Scalar[DType.float32]](x[r * cols + start + c])
+        )
+
+
+def _slice_dim1_rank2_bf16_kernel(
+    x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    cols: Int,
+    start: Int,
+    length: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var r = idx // length
+        var c = idx % length
+        o[idx] = rebind[o.element_type](
+            rebind[Scalar[DType.bfloat16]](x[r * cols + start + c])
+        )
+
+
+def _slice_dim1_rank2_f16_kernel(
+    x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    cols: Int,
+    start: Int,
+    length: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var r = idx // length
+        var c = idx % length
+        o[idx] = rebind[o.element_type](
+            rebind[Scalar[DType.float16]](x[r * cols + start + c])
+        )
+
+
+def _concat_dim1_rank2_2_kerneled(
+    a: Tensor,
+    b: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var ash = a.shape()
+    var bsh = b.shape()
+    var rows = ash[0]
+    var ca = ash[1]
+    var cb = bsh[1]
+    var n_a = rows * ca
+    var n_b = rows * cb
+    var n_o = rows * (ca + cb)
+    var oshape = List[Int]()
+    oshape.append(rows)
+    oshape.append(ca + cb)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n_o * a.dtype().byte_size()
+    )
+    var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_a))
+    var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_b))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_o))
+    var grid = (n_o + _BLOCK - 1) // _BLOCK
+    var dt = a.dtype()
+    if dt == STDtype.F32:
+        var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float32](), a_rl
+        )
+        var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[Float32](), b_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[
+            _concat_dim1_rank2_2_f32_kernel, _concat_dim1_rank2_2_f32_kernel
+        ](A, B, O, ca, cb, n_o, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == STDtype.BF16:
+        var A = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
+        )
+        var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[
+            _concat_dim1_rank2_2_bf16_kernel, _concat_dim1_rank2_2_bf16_kernel
+        ](A, B, O, ca, cb, n_o, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var A = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float16](), a_rl
+        )
+        var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[Float16](), b_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[
+            _concat_dim1_rank2_2_f16_kernel, _concat_dim1_rank2_2_f16_kernel
+        ](A, B, O, ca, cb, n_o, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(out_buf^, oshape^, dt)
+
+
+def _concat_dim1_rank2_3_kerneled(
+    a: Tensor,
+    b: Tensor,
+    c: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var ash = a.shape()
+    var bsh = b.shape()
+    var csh = c.shape()
+    var rows = ash[0]
+    var ca = ash[1]
+    var cb = bsh[1]
+    var cc = csh[1]
+    var n_a = rows * ca
+    var n_b = rows * cb
+    var n_c = rows * cc
+    var n_o = rows * (ca + cb + cc)
+    var oshape = List[Int]()
+    oshape.append(rows)
+    oshape.append(ca + cb + cc)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n_o * a.dtype().byte_size()
+    )
+    var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_a))
+    var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_b))
+    var c_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_c))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_o))
+    var grid = (n_o + _BLOCK - 1) // _BLOCK
+    var dt = a.dtype()
+    if dt == STDtype.F32:
+        var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float32](), a_rl
+        )
+        var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[Float32](), b_rl
+        )
+        var C = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            c.buf.unsafe_ptr().bitcast[Float32](), c_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[
+            _concat_dim1_rank2_3_f32_kernel, _concat_dim1_rank2_3_f32_kernel
+        ](A, B, C, O, ca, cb, cc, n_o, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == STDtype.BF16:
+        var A = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
+        )
+        var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+        )
+        var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            c.buf.unsafe_ptr().bitcast[BFloat16](), c_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[
+            _concat_dim1_rank2_3_bf16_kernel, _concat_dim1_rank2_3_bf16_kernel
+        ](A, B, C, O, ca, cb, cc, n_o, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var A = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float16](), a_rl
+        )
+        var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[Float16](), b_rl
+        )
+        var C = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            c.buf.unsafe_ptr().bitcast[Float16](), c_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[
+            _concat_dim1_rank2_3_f16_kernel, _concat_dim1_rank2_3_f16_kernel
+        ](A, B, C, O, ca, cb, cc, n_o, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(out_buf^, oshape^, dt)
+
+
+def _slice_dim1_rank2_kerneled(
+    x: Tensor,
+    start: Int,
+    length: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var xshape = x.shape()
+    var rows = xshape[0]
+    var cols = xshape[1]
+    var n_x = rows * cols
+    var n_o = rows * length
+    var oshape = List[Int]()
+    oshape.append(rows)
+    oshape.append(length)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n_o * x.dtype().byte_size()
+    )
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_x))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_o))
+    var grid = (n_o + _BLOCK - 1) // _BLOCK
+    var dt = x.dtype()
+    if dt == STDtype.F32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[
+            _slice_dim1_rank2_f32_kernel, _slice_dim1_rank2_f32_kernel
+        ](X, O, cols, start, length, n_o, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == STDtype.BF16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[
+            _slice_dim1_rank2_bf16_kernel, _slice_dim1_rank2_bf16_kernel
+        ](X, O, cols, start, length, n_o, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[
+            _slice_dim1_rank2_f16_kernel, _slice_dim1_rank2_f16_kernel
+        ](X, O, cols, start, length, n_o, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(out_buf^, oshape^, dt)
+
+
+def _shape_dtype_fast_path(dt: STDtype) -> Bool:
+    return dt == STDtype.F32 or dt == STDtype.BF16 or dt == STDtype.F16
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # concat — concatenate tensors along `dim`. All inputs must share rank, dtype,
 # and every dim except `dim`. We compute outer = prod(dims before `dim`), inner
@@ -779,6 +1190,13 @@ def concat(dim: Int, ctx: DeviceContext, *tensors: Tensor) raises -> Tensor:
             oshape.append(sum_dim)
         else:
             oshape.append(base[ax])
+    if rank == 2 and dim == 1 and _shape_dtype_fast_path(dt):
+        if len(tensors) == 2:
+            return _concat_dim1_rank2_2_kerneled(tensors[0], tensors[1], ctx)
+        if len(tensors) == 3:
+            return _concat_dim1_rank2_3_kerneled(
+                tensors[0], tensors[1], tensors[2], ctx
+            )
     # outer = prod(dims < dim), inner = prod(dims > dim).
     var outer = 1
     for ax in range(dim):
@@ -846,6 +1264,8 @@ def slice(
             oshape.append(length)
         else:
             oshape.append(xshape[ax])
+    if rank == 2 and dim == 1 and _shape_dtype_fast_path(x.dtype()):
+        return _slice_dim1_rank2_kerneled(x, start, length, ctx)
     var blk = length * inner  # elements per outer slice in output
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](outer * blk * bsz)
     for oslice in range(outer):

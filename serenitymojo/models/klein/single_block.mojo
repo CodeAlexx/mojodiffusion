@@ -228,6 +228,24 @@ struct SingleBlockWeights(Copyable, Movable):
         self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.F32, ctx))
         self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.F32, ctx))
 
+    def __init__(
+        out self,
+        var w1: TArc, var w2: TArc, var q_norm: TArc, var k_norm: TArc,
+        D: Int, F: Int, ctx: DeviceContext,
+        keep_w2: Bool = True,
+    ) raises:
+        self.w1 = w1^
+        if keep_w2:
+            self.w2 = w2.copy()
+        else:
+            var dummy = List[Float32]()
+            dummy.append(0.0)
+            self.w2 = TArc(Tensor.from_host(dummy^, [1, 1], STDtype.F32, ctx))
+        self.w2_att = TArc(slice(w2[], 1, 0, D, ctx))
+        self.w2_mlp = TArc(slice(w2[], 1, D, F, ctx))
+        self.q_norm = q_norm^
+        self.k_norm = k_norm^
+
 
 # ── saved activations (DEVICE-RESIDENT via TArc) ─────────────────────────────
 # Each field is a refcount handle to a device Tensor. A copy is an Arc bump, not
@@ -293,6 +311,13 @@ struct SingleBlockDeviceForward(Copyable, Movable):
     def __init__(out self, var out: TArc, var saved: SingleBlockSaved):
         self.out = out^
         self.saved = saved^
+
+
+struct SingleBlockDeviceOutput(Copyable, Movable):
+    var out: TArc            # [S, D]  device-resident block output
+
+    def __init__(out self, var out: TArc):
+        self.out = out^
 
 
 # ── backward result: input grad + all trainable weight grads + mod-vec grads ─
@@ -523,8 +548,9 @@ def single_block_backward[
 from serenitymojo.models.klein.lora_block import (
     LoraAdapter, LoraAdapterDevice, lora_adapter_to_device,
     klein_lora_fwd_device, klein_lora_bwd_device,
-    klein_lora_fwd_device_resident, klein_lora_fwd_rows_device_resident_scratch,
-    klein_lora_bwd_device_resident,
+    klein_lora_fwd_device_resident, klein_lora_fwd_qkv_rows_device_resident_scratch,
+    klein_lora_bwd_device_resident, klein_lora_bwd_device_resident_tensors,
+    KleinLoraDeviceGradTensors,
     klein_take_cols_device, klein_add_cols_device,
 )
 
@@ -604,6 +630,33 @@ struct SingleBlockLoraDeviceGrads(Copyable, Movable):
         var d_shift: List[Float32], var d_scale: List[Float32], var d_gate: List[Float32],
         var qkv_d_a: List[Float32], var qkv_d_b: List[Float32],
         var out_d_a: List[Float32], var out_d_b: List[Float32],
+    ):
+        self.d_x = d_x^
+        self.d_shift = d_shift^
+        self.d_scale = d_scale^
+        self.d_gate = d_gate^
+        self.qkv_d_a = qkv_d_a^
+        self.qkv_d_b = qkv_d_b^
+        self.out_d_a = out_d_a^
+        self.out_d_b = out_d_b^
+
+
+struct SingleBlockLoraDeviceGradTensors(Copyable, Movable):
+    var d_x: TArc
+    var d_shift: List[Float32]
+    var d_scale: List[Float32]
+    var d_gate: List[Float32]
+    var qkv_d_a: Optional[TArc]
+    var qkv_d_b: Optional[TArc]
+    var out_d_a: Optional[TArc]
+    var out_d_b: Optional[TArc]
+
+    def __init__(
+        out self,
+        var d_x: TArc,
+        var d_shift: List[Float32], var d_scale: List[Float32], var d_gate: List[Float32],
+        var qkv_d_a: Optional[TArc], var qkv_d_b: Optional[TArc],
+        var out_d_a: Optional[TArc], var out_d_b: Optional[TArc],
     ):
         self.d_x = d_x^
         self.d_shift = d_shift^
@@ -705,18 +758,12 @@ def single_block_lora_forward_device_resident_scratch[
     var v_flat = linear_rows(norm_t, w.w1[], 2 * D, D, ctx)
     var gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
     if lora.qkv:
-        var q_dlt = klein_lora_fwd_rows_device_resident_scratch(
-            norm_t, lora.qkv.value(), S, 0, D, ctx, scratch,
+        var qkv_dlt = klein_lora_fwd_qkv_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), D, ctx, scratch,
         )
-        add_in_place_f32(q_pre_flat, q_dlt, ctx)
-        var k_dlt = klein_lora_fwd_rows_device_resident_scratch(
-            norm_t, lora.qkv.value(), S, D, D, ctx, scratch,
-        )
-        add_in_place_f32(k_pre_flat, k_dlt, ctx)
-        var v_dlt = klein_lora_fwd_rows_device_resident_scratch(
-            norm_t, lora.qkv.value(), S, 2 * D, D, ctx, scratch,
-        )
-        add_in_place_f32(v_flat, v_dlt, ctx)
+        add_in_place_f32(q_pre_flat, qkv_dlt.q, ctx)
+        add_in_place_f32(k_pre_flat, qkv_dlt.k, ctx)
+        add_in_place_f32(v_flat, qkv_dlt.v, ctx)
     var q_pre = reshape_owned(q_pre_flat^, [1, S, H, Dh])
     var k_pre = reshape_owned(k_pre_flat^, [1, S, H, Dh])
     var v = reshape_owned(v_flat^, [1, S, H, Dh])
@@ -755,6 +802,67 @@ def single_block_lora_forward_device_resident_scratch[
         TArc(mlp_gate^), TArc(mlp_up^), mlp_arc.copy(), mlp_arc.copy(),
     )
     return SingleBlockDeviceForward(TArc(result^), saved^)
+
+
+def single_block_lora_predict_device_resident_scratch[
+    H: Int, Dh: Int, S: Int
+](
+    x_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor, norm_zeros: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> SingleBlockDeviceOutput:
+    """Inference-only LoRA single block: same math, no backward tape."""
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var ln_t = layer_norm(x_t[], norm_ones, norm_zeros, eps, ctx)
+    var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
+
+    var scratch_mark = scratch.mark()
+    var q_pre_flat = linear_rows(norm_t, w.w1[], 0, D, ctx)
+    var k_pre_flat = linear_rows(norm_t, w.w1[], D, D, ctx)
+    var v_flat = linear_rows(norm_t, w.w1[], 2 * D, D, ctx)
+    var gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
+    if lora.qkv:
+        var qkv_dlt = klein_lora_fwd_qkv_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), D, ctx, scratch,
+        )
+        add_in_place_f32(q_pre_flat, qkv_dlt.q, ctx)
+        add_in_place_f32(k_pre_flat, qkv_dlt.k, ctx)
+        add_in_place_f32(v_flat, qkv_dlt.v, ctx)
+    var q_pre = reshape_owned(q_pre_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_pre_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var mlp_gate = slice(gate_up, 1, 0, F, ctx)
+    var mlp_up = slice(gate_up, 1, F, F, ctx)
+    var mlp = swiglu(mlp_gate, mlp_up, ctx)
+    scratch.rewind(scratch_mark)
+
+    var proj_mark = scratch.mark()
+    var out_proj = linear_two_inputs_scratch(
+        att_flat, mlp, w.w2_att[], w.w2_mlp[], ctx, scratch,
+    )
+    if lora.out:
+        var dlt2 = klein_lora_fwd_device_resident(att_flat, lora.out.value(), S, ctx)
+        add_in_place_f32(out_proj, dlt2, ctx)
+
+    var result = residual_gate(
+        x_t[], mv.gate[], out_proj, ctx
+    )
+    scratch.rewind(proj_mark)
+    return SingleBlockDeviceOutput(TArc(result^))
 
 
 def single_block_lora_recompute_saved_device_resident[
@@ -839,18 +947,12 @@ def single_block_lora_recompute_saved_device_resident_scratch[
     var v_flat = linear_rows(norm_t, w.w1[], 2 * D, D, ctx)
     var gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
     if lora.qkv:
-        var q_dlt = klein_lora_fwd_rows_device_resident_scratch(
-            norm_t, lora.qkv.value(), S, 0, D, ctx, scratch,
+        var qkv_dlt = klein_lora_fwd_qkv_rows_device_resident_scratch(
+            norm_t, lora.qkv.value(), D, ctx, scratch,
         )
-        add_in_place_f32(q_pre_flat, q_dlt, ctx)
-        var k_dlt = klein_lora_fwd_rows_device_resident_scratch(
-            norm_t, lora.qkv.value(), S, D, D, ctx, scratch,
-        )
-        add_in_place_f32(k_pre_flat, k_dlt, ctx)
-        var v_dlt = klein_lora_fwd_rows_device_resident_scratch(
-            norm_t, lora.qkv.value(), S, 2 * D, D, ctx, scratch,
-        )
-        add_in_place_f32(v_flat, v_dlt, ctx)
+        add_in_place_f32(q_pre_flat, qkv_dlt.q, ctx)
+        add_in_place_f32(k_pre_flat, qkv_dlt.k, ctx)
+        add_in_place_f32(v_flat, qkv_dlt.v, ctx)
     var q_pre = reshape_owned(q_pre_flat^, [1, S, H, Dh])
     var k_pre = reshape_owned(k_pre_flat^, [1, S, H, Dh])
     var v = reshape_owned(v_flat^, [1, S, H, Dh])
@@ -1106,6 +1208,107 @@ def single_block_lora_backward_device_resident_scratch[
     var d_x_t = add(grg.d_x, d_x_norm_t, ctx)
 
     var out = SingleBlockLoraDeviceGrads(
+        TArc(d_x_t^), d_shift^, d_scale^, d_gate^,
+        qkv_d_a^, qkv_d_b^, out_d_a^, out_d_b^,
+    )
+    scratch.rewind(scratch_mark)
+    return out^
+
+
+def single_block_lora_backward_device_resident_scratch_tensors[
+    H: Int, Dh: Int, S: Int
+](
+    d_out_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, lora: SingleBlockLoraDevice,
+    saved: SingleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> SingleBlockLoraDeviceGradTensors:
+    var scratch_mark = scratch.mark()
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var grg: GateResidualGrads
+    var d_gate = List[Float32]()
+    if compute_aux_grads:
+        var out_y = linear_two_inputs_scratch(
+            saved.att_flat[], saved.mlp[], w.w2_att[], w.w2_mlp[], ctx, scratch,
+        )
+        if lora.out:
+            var dlt2 = klein_lora_fwd_device_resident(saved.att_flat[], lora.out.value(), S, ctx)
+            add_in_place_f32(out_y, dlt2, ctx)
+        grg = gate_residual_backward(
+            d_out_t[], saved.x[], mv.gate[], out_y, ctx
+        )
+        d_gate = grg.d_g.to_host(ctx)
+    else:
+        grg = gate_residual_backward_dxdy(d_out_t[], mv.gate[], ctx)
+
+    var d_att = linear_backward_dx_scratch(
+        grg.d_y, w.w2_att[], S, D, D, ctx, scratch,
+    )
+    var d_mlp = linear_backward_dx_scratch(
+        grg.d_y, w.w2_mlp[], S, F, D, ctx, scratch,
+    )
+
+    var out_d_a = Optional[TArc](None)
+    var out_d_b = Optional[TArc](None)
+    if lora.out:
+        var lg2 = klein_lora_bwd_device_resident_tensors(
+            grg.d_y, saved.att_flat[], lora.out.value(), S, ctx
+        )
+        add_in_place_f32(d_att, lg2.d_x[], ctx)
+        out_d_a = Optional[TArc](lg2.d_a.copy())
+        out_d_b = Optional[TArc](lg2.d_b.copy())
+
+    reshape_in_place(d_att, [1, S, H, Dh])
+
+    var sgb = swiglu_backward(d_mlp, saved.mlp_gate[], saved.mlp_up[], ctx)
+    var d_gate_up = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
+
+    var sb = sdpa_backward_scratch[1, S, H, Dh](
+        saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx, scratch,
+    )
+
+    var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
+    var d_k_rms = rope_backward(sb.d_k, cos, sin, True, ctx)
+
+    var d_q_pre_t = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre_t = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
+
+    var d_q_pre_flat = reshape_owned(d_q_pre_t^, [S, D])
+    var d_k_pre_flat = reshape_owned(d_k_pre_t^, [S, D])
+    reshape_in_place(sb.d_v, [S, D])
+    var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, sb.d_v, True)
+
+    var d_norm_t = linear_backward_dx_split_scratch(
+        d_qkv, d_gate_up, w.w1[], S, D, 3 * D, 2 * F, ctx, scratch,
+    )
+
+    var qkv_d_a = Optional[TArc](None)
+    var qkv_d_b = Optional[TArc](None)
+    if lora.qkv:
+        var lg = klein_lora_bwd_device_resident_tensors(
+            d_qkv, saved.norm[], lora.qkv.value(), S, ctx
+        )
+        d_norm_t = add(d_norm_t, lg.d_x[], ctx)
+        qkv_d_a = Optional[TArc](lg.d_a.copy())
+        qkv_d_b = Optional[TArc](lg.d_b.copy())
+
+    var mb = modulate_backward(d_norm_t, saved.ln[], mv.scale[], ctx, compute_aux_grads)
+    var d_scale = List[Float32]()
+    var d_shift = List[Float32]()
+    if compute_aux_grads:
+        d_scale = mb.d_scale.to_host(ctx)
+        d_shift = mb.d_shift.to_host(ctx)
+
+    var d_x_norm_t = layer_norm_backward_dx(mb.d_x, saved.x[], norm_ones, eps, ctx)
+    var d_x_t = add(grg.d_x, d_x_norm_t, ctx)
+
+    var out = SingleBlockLoraDeviceGradTensors(
         TArc(d_x_t^), d_shift^, d_scale^, d_gate^,
         qkv_d_a^, qkv_d_b^, out_d_a^, out_d_b^,
     )

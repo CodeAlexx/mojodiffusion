@@ -1,7 +1,5 @@
-# validation_sampler.mojo — generate ONE validation image from the trained Klein
-# model + a prompt's cached caption embeddings + (optionally) a trained LoRA, by
-# driving the EXISTING Klein flow-match sampler and DiT through one full denoise
-# loop, decoding via the Klein VAE, and saving a PNG.
+# validation_sampler.mojo — shared validation helpers for cached prompt caps and
+# image comparison.
 #
 # PURPOSE — the L2P sample-shift gate. After a LoRA training run we need to KNOW
 # the LoRA actually changes the output (the "WITH vs WITHOUT pixel diff" check
@@ -11,11 +9,10 @@
 # run). `pixel_l1` + `save_png` make the gate concrete.
 #
 # REUSE MAP (every line mirrors a proven module):
-#   * LoRA-into-resident wiring  ← pipeline/klein9b_lora_smoke.mojo
-#       Klein9BDiT.load_full(...) then LoraSet.load(...).merge_into_indexed(
-#       model.weights, model.name_to_idx, multiplier, ctx). The OFFLOADED path
-#       cannot be merged (blocks stream lazily — lora.mojo:565 merge_into_indexed
-#       docstring), so the validation model is the all-resident load_full.
+#   * LoRA validation path       ← sampling/klein_sampler.mojo
+#       Live PEFT adapters are applied by the same stack used during training.
+#       The old resident `Klein9BDiT.load_with_config + merge` path is not used
+#       for 9B validation because it co-resides a full DiT and VAE and can OOM.
 #   * denoise loop               ← pipeline/klein9b_pipeline_multistep_smoke.mojo
 #       build_flux2_sigma_schedule → per-step Euler (dt = sigma[i+1]-sigma[i]),
 #       timestep pre-scaled *1000 (BFL time_factor), CFG = neg+CFG*(pos-neg),
@@ -43,14 +40,14 @@ from std.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.klein_dit import Klein9BDiT, build_klein_rope_tables
-from serenitymojo.models.vae.klein_decoder import KleinVaeDecoder
-from serenitymojo.lora import LoraSet
-from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.ops.cast import cast_tensor, cast_tensor_if_needed
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, reshape, permute
 from serenitymojo.sampling.flux2_klein import build_flux2_sigma_schedule, flux2_cfg
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.io.cap_cache import load_tensor_bin
+from serenitymojo.sampling.klein_sampler import klein_sample
 
 
 # Positive + negative caption embeddings (produced by a SEPARATE encode process,
@@ -169,6 +166,7 @@ def _denoise_resident[
 def generate_validation[
     N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int
 ](
+    cfg: TrainConfig,         # config-file-driven arch (block counts, dims)
     model_path: String,
     vae_path: String,
     caps: ValidationCaps,
@@ -180,30 +178,29 @@ def generate_validation[
     out_png: String,          # "" → don't write a file, just return the tensor
     ctx: DeviceContext,
 ) raises -> Tensor:
-    # Resident DiT (mergeable). load_full brings in all Klein9B weights.
-    var model = Klein9BDiT.load_full(model_path, ctx)
-
-    if lora_path != String(""):
-        var lset = LoraSet.load(lora_path)
-        var merged = lset.merge_into_indexed(
-            model.weights, model.name_to_idx, lora_multiplier, ctx
-        )
-        print("[validation] LoRA format", lset.format_name(), "merged", merged, "module(s)")
+    if model_path != cfg.checkpoint:
+        print("[validation] using config checkpoint instead of model_path override:", cfg.checkpoint)
+    if vae_path != cfg.vae:
+        print("[validation] using config VAE instead of vae_path override:", cfg.vae)
+    if lora_multiplier != Float32(1.0):
+        print("[validation] live LoRA sampler currently uses multiplier=1.0; requested", lora_multiplier)
+    if lora_path == String(""):
+        print("[validation] staged baseline pass (no LoRA)")
     else:
-        print("[validation] baseline pass (no LoRA)")
+        print("[validation] staged live-LoRA pass:", lora_path)
 
-    var latent = _denoise_resident[N_IMG, N_TXT, S, LH, LW](
-        model, caps, num_steps, cfg_scale, seed, ctx
+    var txt_sh = List[Int]()
+    txt_sh.append(N_TXT)
+    txt_sh.append(cfg.joint_attention_dim)
+    var pos_txt = cast_tensor_if_needed(
+        reshape(caps.pos, txt_sh.copy(), ctx), STDtype.F32, ctx
     )
-    var packed = _tokens_to_packed_nchw[LH, LW](latent, ctx)
-    var vae = KleinVaeDecoder[LH, LW].load(vae_path, ctx)
-    var img = vae.decode(packed, ctx)
-
-    if out_png != String(""):
-        save_png(img, out_png, ctx, ValueRange.SIGNED)
-        print("[validation] saved", out_png)
-
-    return img^
+    var neg_txt = cast_tensor_if_needed(
+        reshape(caps.neg, txt_sh^, ctx), STDtype.F32, ctx
+    )
+    return klein_sample[N_IMG, N_TXT, S, LH, LW, 32, 128](
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, out_png, ctx,
+    )
 
 
 # ── Pixel L1 between two decoded RGB tensors — the sample-shift metric ────────

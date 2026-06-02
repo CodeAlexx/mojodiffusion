@@ -21,6 +21,8 @@
 #   TurboPlannedLoader.open(dir, plan, config, ctx) -> TurboPlannedLoader
 #   loader.prefetch(i)               # plan-index bookkeeping (GPU dispatch deferred)
 #   loader.prefetch_next(i)          # same pattern as PlannedBlockLoader
+#   loader.prefetch_with_ctx(i, ctx) # immediate copy-stream dispatch
+#   loader.prefetch_next_with_ctx(i, ctx)
 #   loader.await_block(i, ctx) -> PlannedBlockHandle
 #   loader.block_count() -> Int
 #   loader.branch_visits() -> Int
@@ -31,37 +33,23 @@
 # via BlockLoader.prefetch_block — a CPU-only operation). TurboBlockLoader.prefetch
 # DOES need ctx to dispatch the GPU copy kernel.
 #
-# Approach: prefetch(i) does CPU-side bookkeeping only (residency state advance,
-# record the "pending prefetch" index). The actual GPU copy dispatch happens in
-# await_block(i, ctx) which DOES have ctx. TurboBlockLoader.await_block already
-# calls self.prefetch(prefix, ctx) internally if the block was never staged, so
-# the overlap still works:
+# Current implementation: prefetch(i) does CPU-side bookkeeping only (residency
+# state advance, record one pending index). The actual GPU copy dispatch happens
+# in await_block(i, ctx), which has ctx.
 #
-#   Klein loop pattern:
-#     prefetch(0)                    ← residency bookkeeping only
-#     for bi in range(N):
-#       prefetch_next(bi)            ← residency: record bi+1 as pending
-#       handle = await_block(bi, ctx)   ← turbo dispatches prefetch of bi+1 HERE
-#                                         (TurboBlockLoader sees prefix in idle slot)
+# Field finding, 2026-05-31: the one-pending-index design preserves correctness
+# but can lose overlap in loops that call prefetch_next(i) before await_block(i).
+# The next pending block may overwrite the current block's pending dispatch, so
+# await_block(current) can stage the next block first and then synchronously stage
+# the current block through TurboBlockLoader.await_block's fallback.
 #
-# Actually the overlap is achieved because:
-#   - await_block(bi) fences the DEFAULT stream.
-#   - prefetch_next(bi+1) was called before we reached await_block(bi+1), so
-#     by the time the default stream is processing block bi's compute, the
-#     copy stream may already be staging bi+1.
-#
-# To preserve this overlap we call the real TurboBlockLoader.prefetch from within
-# OUR prefetch() by storing ctx — we store the DeviceContext from the last
-# await_block call and use it for subsequent prefetch calls.
-#
-# But there is a chicken-and-egg: the VERY FIRST prefetch(0) has no ctx yet.
-# Solution: defer the GPU dispatch for the first prefetch until await_block(0)
-# (TurboBlockLoader handles this by calling prefetch internally if not staged).
-# All subsequent prefetch_next calls re-use the stored ctx from the most recent
-# await_block. This is safe because:
-#   - The DeviceContext is a singleton (one per process, MAX 26.3).
-#   - ctx from the last await_block is the same ctx that will be passed to the
-#     next await_block.
+# Shared fix to implement next: add explicit-context prefetch methods
+# (prefetch_with_ctx / prefetch_next_with_ctx) that dispatch the copy stream
+# immediately, then update hot forward/backward loops to:
+#   1. prefetch current with ctx before the loop
+#   2. await current
+#   3. prefetch next/previous with ctx
+#   4. run current block math while copy stream stages the lookahead block.
 #
 # Residency bookkeeping is kept lightweight: we track UNLOADED → HOST_STAGED
 # → PREFETCHING → GPU_READY transitions via ResidencyManager so the budget
@@ -204,17 +192,49 @@ struct TurboPlannedLoader(Movable):
         """Prefetch the lookahead block for the current index."""
         self.prefetch(self.prefetch_index(index))
 
+    def prefetch_with_ctx(mut self, index: Int, ctx: DeviceContext) raises:
+        """Stage block at plan index `index` immediately on the copy stream."""
+        if index < 0 or index >= self._plan.count():
+            return
+        self._advance_residency_to_prefetching(index)
+        if self._pending_idx == index:
+            self._pending_idx = -1
+        # TurboBlockLoader has only two rotating GPU slots. The plan-level
+        # residency state can still say GPU_READY from a prior forward visit
+        # even after that slot has been overwritten by later blocks. Always
+        # delegate to TurboBlockLoader; it has the authoritative slot-prefix
+        # check and will no-op when the block is truly still staged.
+        var prefix = self._plan.normalized_prefix(index)
+        self._turbo.prefetch(prefix, ctx)
+
+    def prefetch_next_with_ctx(mut self, index: Int, ctx: DeviceContext) raises:
+        """Stage the lookahead block for `index` immediately on the copy stream."""
+        self.prefetch_with_ctx(self.prefetch_index(index), ctx)
+
+    def mark_active_block_done(mut self, ctx: DeviceContext) raises:
+        """Record compute completion for the active turbo slot.
+
+        Hot loops call this after all kernels for the returned block have been
+        queued. The low-level turbo loader gates future slot reuse with this
+        event, matching the Rust BlockHandle compute_done contract.
+        """
+        self._turbo.mark_active_slot_compute_done(ctx)
+
+    def print_telemetry(self):
+        """Print the underlying turbo loader counters.
+
+        Shared by training and inference call sites. Keep telemetry on the
+        offload runtime, not in per-model trainers.
+        """
+        self._turbo.print_telemetry()
+
     def _dispatch_pending(mut self, ctx: DeviceContext) raises:
         """Dispatch any pending GPU copy for the queued prefetch index."""
         if self._pending_idx < 0:
             return
         var pidx = self._pending_idx
         self._pending_idx = -1
-        var state = self._residency.get_state(pidx)
-        if state == BlockState.gpu_ready():
-            return  # already resident — nothing to dispatch
-        var prefix = self._plan.normalized_prefix(pidx)
-        self._turbo.prefetch(prefix, ctx)
+        self.prefetch_with_ctx(pidx, ctx)
 
     def await_block(
         mut self, index: Int, ctx: DeviceContext

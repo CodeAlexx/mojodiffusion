@@ -1,30 +1,21 @@
-# models/klein/config.mojo — Klein (FLUX.2) per-model config.
+# models/klein/config.mojo — Klein (FLUX.2) per-variant config accessors.
 #
-# The ONE place Klein diverges from the shared pipeline: dims + recipe values.
-# Values cited from OneTrainer configs (klein9b_loss_compare.json /
-# klein4b_benchmark.json) and models/dit/klein_dit.mojo KleinConfig.klein_9b().
-# Dims CONFIRMED from the real safetensors headers (2026-05-30):
-#   9B: inner 4096, heads 32, head_dim 128, mlp_hidden 12288, 8 double + 24
-#       single = 32 blocks. lr 4e-4, shift 1.8 (project-validated), rank/alpha 16.
-#   4B: inner 3072, heads 24, head_dim 128, mlp_hidden 9216, 5 double + 20
-#       single = 25 blocks (flux-2-klein-base-4b.safetensors). lr 1e-4, shift 1.0.
-# n_layers below is the TOTAL block count; the double/single split (8+24, 5+20)
-# is needed for stacking and is recorded here until TrainConfig carries it.
+# Binding user rule (2026-05-31): NO hardcoded arch/recipe. These helpers now
+# READ the variant's config file (serenitymojo/configs/klein{4b,9b}.json), which
+# is the single source of truth. Pointing at a config file is not "coding params
+# in" — the params live in the JSON, verified against the checkpoint header.
 
 from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.io.train_config_reader import read_model_config
 
 
-def klein_9b() -> TrainConfig:
-    return TrainConfig(
-        String("klein-9b"), 4096, 32, 128, 12288, 32,
-        Float32(4.0e-4), Float32(1.8), 16, Float32(16.0), Float32(1.0e-6),
-    )
+comptime KLEIN4B_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/klein4b.json"
+comptime KLEIN9B_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/klein9b.json"
 
 
-def klein_4b() -> TrainConfig:
-    # Dims confirmed from flux-2-klein-base-4b.safetensors header (G10 fixed):
-    # inner 3072, heads 24, head_dim 128, mlp_hidden 9216, 25 blocks (5 dbl+20 sgl).
-    return TrainConfig(
-        String("klein-4b"), 3072, 24, 128, 9216, 25,
-        Float32(1.0e-4), Float32(1.0), 16, Float32(16.0), Float32(1.0e-6),
-    )
+def klein_9b() raises -> TrainConfig:
+    return read_model_config(String(KLEIN9B_CONFIG))
+
+
+def klein_4b() raises -> TrainConfig:
+    return read_model_config(String(KLEIN4B_CONFIG))

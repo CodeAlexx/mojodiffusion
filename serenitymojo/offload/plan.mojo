@@ -182,19 +182,23 @@ struct BlockPlan(Movable):
         return -1
 
 
-def build_klein9b_block_plan() -> BlockPlan:
-    var plan = BlockPlan(String("klein9b"))
-    for i in range(8):
+def build_klein_block_plan(num_double: Int, num_single: Int) -> BlockPlan:
+    var plan = BlockPlan(String("klein"))
+    for i in range(num_double):
         plan.append(
             String("double_blocks.") + String(i),
             BlockKind.double_stream(),
         )
-    for i in range(24):
+    for i in range(num_single):
         plan.append(
             String("single_blocks.") + String(i),
             BlockKind.single_stream(),
         )
     return plan^
+
+
+def build_klein9b_block_plan() -> BlockPlan:
+    return build_klein_block_plan(8, 24)
 
 
 def build_qwenimage_block_plan() -> BlockPlan:
@@ -237,3 +241,28 @@ def build_sensenova_u1_block_plan() -> BlockPlan:
             BlockKind.transformer(),
         )
     return plan^
+
+
+def build_flux_block_plan(num_double: Int, num_single: Int) -> BlockPlan:
+    # flux1-dev block order (BFL keys, verified against
+    # flux1-dev.safetensors header): 19 double_blocks.<i> then 38
+    # single_blocks.<i>. Mirrors build_klein_block_plan (same double/single
+    # DiT topology); the prefixes match the on-disk safetensors layout so the
+    # offload loader can stream one block at a time. flux1-dev default is
+    # (num_double=19, num_single=38) — see configs/flux.json / config.mojo.
+    var plan = BlockPlan(String("flux"))
+    for i in range(num_double):
+        plan.append(
+            String("double_blocks.") + String(i),
+            BlockKind.double_stream(),
+        )
+    for i in range(num_single):
+        plan.append(
+            String("single_blocks.") + String(i),
+            BlockKind.single_stream(),
+        )
+    return plan^
+
+
+def build_flux1_dev_block_plan() -> BlockPlan:
+    return build_flux_block_plan(19, 38)

@@ -486,3 +486,23 @@ through composition*, not throughput. As of this session there is **no open
 correctness blocker** — the H=30 SDPA-backward "bug" (§11) was a degenerate
 test-data artifact and the unmodified kernel passes the non-degenerate gate at
 H=30. The remaining gaps are throughput-only.
+
+## 2026-06-01 — new vectorized / fused kernels (standalone, parity-gated)
+
+Ported flame-core fast kernels as NEW sibling files (do not replace the scalar kernels;
+parity-vs-scalar + microbench). See `docs/FLAMECORE_PARITY_PORTED_2026-06-01.md` §A.
+
+| New kernel | Scalar ref | Parity | Microbench (3090) |
+|---|---|---|---|
+| `ops/vec_permute0213.mojo` | tensor_algebra permute0213 | bit-exact | 2.47x |
+| `ops/vec_transpose.mojo` | tensor_algebra transpose | bit-exact | up to 1.86x |
+| `training/fused_adamw_multitensor.mojo` | per-tensor AdamW loop | bit-equal | 2.55x |
+| `training/on_device_global_norm.mojo` | host sum-of-squares | rel 5e-7 | 9.2x |
+| `ops/vec_rms_norm.mojo` | norm / norm_backward | cos>=0.99999999 | ~1.09x (bandwidth-bound) |
+| `ops/vec_swiglu.mojo` | activations swiglu | bit-exact | ~1.0x (no win) |
+| `ops/vec_modulate.mojo` | elementwise modulate | cos>=0.99999999 | ~0.97x (no win) |
+
+The three bandwidth-bound elementwise ops show no real speedup (scalar already saturates
+DRAM) — reported honestly, not faked. Each gate requires norm_size/numel % vec-width == 0
+and RAISES (caller routes to scalar) otherwise. NO_MOJO_PATH throughput items (flash-sdpa
+Dh=128 fwd/bwd, cuDNN, CUDA-graph, cuBLASLt bias-epilogue) remain out of scope.

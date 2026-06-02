@@ -134,6 +134,11 @@ Output:
 
 Model loops should migrate from raw string prefixes to this shape:
 
+This module is a pure-Mojo port/proving layer for the Rust stack's new
+speed/functionality work. Rust remains the behavior and performance reference,
+but the Mojo side should own a native implementation rather than calling through
+Rust or Python.
+
 ```mojo
 var plan = build_klein9b_block_plan()
 var offload = PlannedBlockLoader.open(model_dir, plan^, OffloadConfig.synchronous_cfg_paired())
@@ -244,6 +249,45 @@ for i in range(block_count):
 With the current backend this warms the page cache earlier. With slot backends
 it becomes real transfer-stream H2D overlap. Start with `lookahead = 1`; expand
 only after ownership and memory budgets are stable.
+
+### 2026-05-31 Klein Trainer Finding
+
+The first real Klein 9B LoRA training run proved that "turbo exists" is not the
+same thing as "turbo overlaps." `TurboPlannedLoader.prefetch/prefetch_next`
+currently records a single pending index because the public `PlannedBlockLoader`
+surface has no `DeviceContext` at prefetch time. In a loop shaped like:
+
+```mojo
+loader.prefetch(0)
+for i in range(loader.count()):
+    loader.prefetch_next(i)
+    var handle = loader.await_block(i, ctx)
+    run_block(handle)
+```
+
+the pending `0` can be overwritten by pending `1` before block `0` is awaited.
+Then `await_block(0)` may dispatch/stage block `1` first and fall back to a
+synchronous stage for block `0`. That keeps correctness but loses the intended
+copy/compute overlap, and in the 9B trainer it showed up as roughly `46s/step`
+after the OOM and cache-shape fixes.
+
+Preferred shared fix: add an explicit-context prefetch path on
+`TurboPlannedLoader` (for example `prefetch_with_ctx(index, ctx)` and
+`prefetch_next_with_ctx(index, ctx)`) that immediately dispatches the copy stream
+and clears any matching pending index. Hot model loops should then use:
+
+```mojo
+loader.prefetch_with_ctx(0, ctx)
+for i in range(loader.count()):
+    var handle = loader.await_block(i, ctx)
+    loader.prefetch_next_with_ctx(i, ctx)
+    run_block(handle)
+```
+
+Reverse/backward passes should do the same with `i - 1` after awaiting the
+current block and before doing current-block math. Keep this generic in offload
+code first; Klein, LTX, HiDream, SenseNova, and future streamed trainers should
+all be able to use the same overlap contract.
 
 ## VMM / Turbo Feasibility
 

@@ -1,9 +1,9 @@
 # offload/ltx2_block_stream.mojo — FP8 DiT block streamer for LTX-2.3 22B.
 #
-# P2 (LTX2_PORT_PLAN_2026-05-28 §P2): prove the existing per-block streaming
+# P2 (LTX2_PORT_PLAN_2026-05-28 P2): prove the existing per-block streaming
 # discipline (BlockLoader: load → use → drop) works for the FP8 distilled
 # checkpoint, where blocks 4-46 store the attn/FFN weight matrices as
-# float8_e4m3fn (1 byte/element) with a per-tensor F32 `weight_scale`.
+# float8_e4m3fn (1 byte/element) with a per-tensor F32 scale.
 #
 # WHY a new module (not turbo_planned_loader): the Klein turbo loader does a
 # RAW byte H2D copy (on-disk dtype == in-model dtype, both BF16). The FP8
@@ -11,9 +11,9 @@
 # GPU; the block forward needs BF16. This loader DEQUANTS FP8 → BF16 on-use
 # (ops/fp8.mojo), keeping BF16/F32 tensors as a plain H2D copy. It mirrors the
 # Rust production path fp8_resident.rs (RawWeight::FP8 → dequant_fp8_to_bf16
-# with the per-tensor weight_scale) and ltx2_model.rs:3303-3364 (scale_map
-# built from the 0-D `*.weight_scale` scalars; `input_scale` is NOT used for
-# the weight dequant).
+# with the per-tensor scale) and Flame Core's two scale naming conventions:
+# `weight_key + "_scale"` and `weight_key.strip_suffix(".weight") + ".scale_weight"`.
+# `input_scale` / `scale_input` are NOT used for weight dequant.
 #
 # Streaming model (matches BlockLoader semantics): each block is a value the
 # caller owns; dropping it frees its VRAM. A small resident window is achieved
@@ -134,14 +134,24 @@ struct LTX2BlockStream(Movable):
         return self.n_blocks
 
     def _scale_for(self, weight_key: String) raises -> Float32:
-        """Return the per-tensor weight_scale for an FP8 weight, or 1.0 if the
-        `{weight_key}_scale` scalar is absent. Mirrors ltx2_model.rs scale_map
-        (key = full name with `_scale` suffix stripped)."""
+        """Return the per-tensor scale for an FP8 weight, or 1.0 if absent.
+
+        Mirrors Flame Core's safetensors/offload loaders:
+        - LTX-style sidecar: `{weight_key}_scale`
+        - Comfy-scaled sidecar: `{base}.scale_weight` for `{base}.weight`
+        """
         var scale_key = weight_key + "_scale"
         for ref nm in self.sharded.names():
             if nm == scale_key:
                 var tv = self.sharded.tensor_view(scale_key)
                 return _read_f32_scalar(tv.data)
+        if weight_key.endswith(".weight"):
+            var base_key = _substr(weight_key, 0, len(weight_key) - len(String(".weight")))
+            var comfy_scale_key = base_key + ".scale_weight"
+            for ref nm in self.sharded.names():
+                if nm == comfy_scale_key:
+                    var tv = self.sharded.tensor_view(comfy_scale_key)
+                    return _read_f32_scalar(tv.data)
         return 1.0
 
     def load_block_bf16(
@@ -150,7 +160,7 @@ struct LTX2BlockStream(Movable):
         """Load every tensor under `prefix{block_idx}.` to the GPU as BF16.
 
         - F8_E4M3 weights → from_view_raw (verbatim FP8 bytes) → GPU dequant to
-          BF16 with the per-tensor weight_scale (ops/fp8.mojo).
+          BF16 with the per-tensor scale (ops/fp8.mojo).
         - BF16/F32 tensors → from_view_as_bf16 (upcast F32→BF16 host-side).
         - `*_scale` / `*input_scale` scalars are NOT placed in the block (they
           are consumed only as the dequant multiplier), matching the Rust loader
@@ -164,7 +174,12 @@ struct LTX2BlockStream(Movable):
             if not nm.startswith(bp):
                 continue
             # Skip scale scalars (consumed as dequant multipliers, not weights).
-            if nm.endswith("_scale") or nm.endswith("input_scale"):
+            if (
+                nm.endswith("_scale")
+                or nm.endswith("input_scale")
+                or nm.endswith(".scale_weight")
+                or nm.endswith(".scale_input")
+            ):
                 continue
             var canon = _substr(nm, len(bp), len(nm))
             var tv = self.sharded.tensor_view(nm)
@@ -184,8 +199,12 @@ struct LTX2BlockStream(Movable):
         var bp = self.prefix + String(block_idx) + "."
         var n = 0
         for ref nm in self.sharded.names():
-            if nm.startswith(bp) and not nm.endswith("_scale") and not nm.endswith(
-                "input_scale"
+            if (
+                nm.startswith(bp)
+                and not nm.endswith("_scale")
+                and not nm.endswith("input_scale")
+                and not nm.endswith(".scale_weight")
+                and not nm.endswith(".scale_input")
             ):
                 var tv = self.sharded.tensor_view(nm)
                 if tv.dtype == STDtype.F8_E4M3:

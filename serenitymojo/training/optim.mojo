@@ -50,6 +50,7 @@
 # return a LayoutTensor — origin inference — so this follows linalg_backward).
 
 from std.math import sqrt
+from std.memory import ArcPointer
 from std.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
@@ -57,6 +58,11 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+
+
+# Tensor is move-only (MOJO_CONVENTIONS §2a) → box for List storage as
+# ArcPointer[Tensor], the same idiom autograd.mojo's tape uses (`comptime TArc`).
+comptime TArc = ArcPointer[Tensor]
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -231,6 +237,10 @@ def sgd_step(
 
 
 # ── global-norm gradient clipping (2-tensor case, in place) ──────────────────
+# SUPERSEDED by clip_grads_by_global_norm (below), which generalizes this to an
+# arbitrary List of grads and is the reusable path the trainers should call.
+# This 2-tensor entry point is retained for the existing 2-tensor parity gate;
+# do not reach for it in new code — use the N-tensor version.
 def clip_grad_global_norm(
     mut g1: Tensor,
     mut g2: Tensor,
@@ -277,6 +287,56 @@ def clip_grad_global_norm(
         var grid2 = (n2 + _BLOCK - 1) // _BLOCK
         ctx.enqueue_function[_scale_kernel, _scale_kernel](
             gt2, scale, n2, grid_dim=grid2, block_dim=_BLOCK)
+        ctx.synchronize()
+
+    return total_norm
+
+
+# ── global-norm gradient clipping over N grads (reusable, in place) ──────────
+# Generalizes the inline train_klein_real.mojo:657-688 clip path and the dead
+# 2-tensor clip_grad_global_norm above. Mirrors flame-core/src/gradient_clip.rs
+# clip_grads_by_norm + compute_grad_norm (and torch clip_grad_norm_, 2-norm):
+#
+#   total_norm = sqrt( sum over ALL grads of sum(g*g) )         # global L2
+#   if total_norm > max_norm:  scale every grad by max_norm/total_norm
+#   return total_norm                                            # PRE-clip norm
+#
+# Grads are boxed as TArc (List can't hold the move-only Tensor). Each grad is
+# scaled IN PLACE by the SAME factor (the global clip — NOT per-tensor). The
+# norm is computed via host readback (parity-grade, not the hot path), matching
+# the existing 2-tensor helper and the inline trainer path. Returns the pre-clip
+# total_norm so the caller can log it (and so post-clip norm == max_norm holds
+# whenever clipping fired). All grads must be F32.
+def clip_grads_by_global_norm(
+    grads: List[TArc],
+    max_norm: Float32,
+    ctx: DeviceContext,
+) raises -> Float32:
+    """Clip a list of grads by their GLOBAL L2 norm, in place. Returns the
+    pre-clip total_norm (sqrt of summed sum-of-squares over every grad)."""
+    # Sum of squares over ALL grads (F64 accumulate, host readback).
+    var total_sq = Float64(0.0)
+    for i in range(len(grads)):
+        _require_f32(String("grad[") + String(i) + String("]"), grads[i][])
+        var h = grads[i][].to_host(ctx)
+        for j in range(len(h)):
+            var x = Float64(h[j])
+            total_sq += x * x
+    var total_norm = Float32(sqrt(total_sq))
+
+    var scale = Float32(1.0)
+    if total_norm > max_norm and total_norm > 0.0:
+        scale = max_norm / total_norm
+
+    if scale != 1.0:
+        for i in range(len(grads)):
+            var n = grads[i][].numel()
+            var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+            var gt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                grads[i][].buf.unsafe_ptr().bitcast[Float32](), rl)
+            var grid = (n + _BLOCK - 1) // _BLOCK
+            ctx.enqueue_function[_scale_kernel, _scale_kernel](
+                gt, scale, n, grid_dim=grid, block_dim=_BLOCK)
         ctx.synchronize()
 
     return total_norm

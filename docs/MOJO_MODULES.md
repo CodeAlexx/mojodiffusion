@@ -286,19 +286,33 @@ are imported only by the prepare driver, never by the loop.
 |---|---|---|
 | `training/validation_sampler.mojo` (224 L) | The L2P sample-shift gate. `generate_validation[N_IMG,N_TXT,S,LH,LW](...)` (`:169`): load resident `Klein9BDiT.load_full`, OPTIONALLY merge a LoRA (`LoraSet.load.merge_into_indexed`), denoise via the proven Flux-2 sigma schedule + Euler (forward_full ×2 pos/neg → `flux2_cfg`, since the resident model has no fused `forward_full_cfg`), VAE-decode, save PNG, RETURN the RGB tensor. `pixel_l1(a,b,ctx)` (`:213`) = mean abs diff = the WITH-vs-WITHOUT-LoRA metric (0 ⇒ LoRA not applied — the bug it hunts). `load_caps` reads cached pos/neg embeddings (no encoder loaded). | **SCAFFOLD (compiles)** — reuses only proven modules (klein DiT forward, VAE decode, LoRA merge, sigma schedule); compiled, not yet lead-run on real weights. Smoke: `validation_sampler_smoke.mojo` |
 | `training/lora_save.mojo` (201 L) | `save_lora_peft(adapters, path, ctx)` (`:83`) → PEFT/ai-toolkit-keyed safetensors: `<prefix>.lora_A.weight` [rank,in] + `<prefix>.lora_B.weight` [out,rank], F32, the EXACT inverse of `lora.mojo`'s load (so `LoraSet.load` / the validation sampler / ai-toolkit/diffusers open it). `load_lora_for_resume(prefixes, scale, path)` (`:146`) reads A/B back (AdamW moments zeroed — resume those from the `loop.mojo` TrainState). Deliberately writes NO `.alpha` (matches train_klein convention; caller re-supplies alpha/rank as the merge multiplier). `struct NamedLora`. | **PROVEN (byte-exact)** — round-trips byte-exact (F32, no BF16 truncation). Smoke: `lora_save_smoke.mojo` |
-| `io/train_config_reader.mojo` (350 L) | `read_train_config(json_path, d_model, n_heads, head_dim, mlp_hidden, n_layers, timestep_shift=1.8)` (`:274`) → `ReadConfigResult(TrainConfig, OptimExtra)`. Reads a OneTrainer-style JSON config (a NEW general-JSON scalar parser — float/sci-notation/bool/null + one-level `optimizer` descent — REUSING `io/json_header.mojo`'s proven `_Cursor`/`_parse_string`/`_skip_value`). Pulls `learning_rate`→lr, `lora_rank`, `lora_alpha`, `model_type`→name, nested `optimizer.eps`→eps + `weight_decay`/`beta1`/`beta2`→OptimExtra. Model dims + timestep_shift are caller-supplied (JSON doesn't carry them). Pure-Mojo file read via `io/ffi` syscalls. | **PROVEN (verified-finite)** — header (`:18-19`) records it reads `/home/alex/OneTrainer/configs/klein9b_loss_compare.json`. Smoke: `train_config_reader_smoke.mojo` |
+| `io/train_config_reader.mojo` | `read_train_config(json_path)` -> `TrainConfig`. Reads the model config JSON as the single source of truth for arch, paths, LoRA recipe, optimizer, and cadence. The reader is pure Mojo: hand-rolled general JSON scalar parsing over the proven `io/json_header.mojo` cursor helpers; no Python/runtime reflection. It pulls checkpoint/vae paths, model dims, `learning_rate` -> `lr`, `lora_rank`, `lora_alpha`, `timestep_shift`, and nested `optimizer.{eps,weight_decay,beta1,beta2}`. Defaults live in `training/train_config.mojo`; current OneTrainer-style defaults are timestep shift `1.0`, AdamW eps `1e-8`, weight decay `0.01`, betas `0.9/0.999`. | **PROVEN (verified-finite)** — `train_config_reader_smoke.mojo`; `serenitymojo/configs/klein9b.json` currently sets `learning_rate: 4e-4`. |
 
 ---
 
 ## In-progress / mid-write (reconcile next session)
 
-> Another agent is building the integrated real-data loop NOW. Documented as
-> in-progress; do NOT over-claim. Reconcile against source when stable.
+> Keep this section conservative. The Klein 9B LoRA loop is now real enough to
+> sample and step, but not yet at the Rust trainer's few-seconds speed target.
 
 | Module | Intended role (per header, may change) | Status |
 |---|---|---|
 | `pipeline/klein_prepare_alina.mojo` (present) | REAL prepare driver for the Alina LoRA dataset: for 4 staged 512² images + captions, `KleinVaeEncoder.encode` (assert std≈0.96) + Qwen3-8B `encode_klein` (512 tok) → `write_sample` to `output/alina_cache/`. Qwen3+VAE co-reside ONLY in this process; the train process never imports Qwen3. | **IN PROGRESS** — file exists, header complete; not yet lead-run end-to-end. |
-| `training/train_klein_real.mojo` (the integrated loop) | The integrated real-dim Klein LoRA timing loop (`KleinCache` reader → real `klein_stack_lora` fwd/bwd → AdamW → `save_lora_peft`). It uses cached per-step modulation weights, device modulation chunks, resident RoPE tables loaded before timing, the no-aux gate-residual d_x/d_y path, save-only checkpoint recompute for unsaved single blocks, `SGL_SAVE_TAIL = 9`, one two-slab 512 MiB scratch ring reset per step for scratch-aware Klein block temporaries, scratch-backed frozen linear dx outputs, scratch-backed SDPA backward work buffers, direct row-split W1 single-block forward/backward, direct fresh q/k/v row outputs with scratch LoRA row deltas, packed-only W2 scratch projection, and the shared F32 no-bias `linear` fast path. Latest measured one-step runs: `2.0461085`, `2.067908`, loss `2.734082`, grad `0.17687473`. | **PROVEN timing/smoke** — parity is covered by block/stack LoRA gates plus `klein_step_mod_cache_smoke`; target few-seconds timing is met. |
+| `training/train_klein_real.mojo` (the integrated loop) | Real Klein LoRA loop: `KleinCache` reader -> offloaded `klein_stack_lora` fwd/bwd -> AdamW -> `save_lora_peft`. Current run target is Klein 9B at 512 (`N_IMG=1024`, latent `32 x 32`, `N_TXT=512`) with config-driven arch/paths and `learning_rate = 0.0004`. It uses `TurboPlannedLoader`, offloaded blocks, staged CFG sampling, resident RoPE tables, pure-Mojo Rust-style progress display, PEFT-style LoRA saving, and separate forward/backward `ScratchRingAllocator` arenas. | **PARTIAL REAL RUN** — 50-step smoke trains without OOM and reaches the target band after early high loss (`step 18 loss 0.2721` observed). Current speed is ~`8.3s/step` before the next speed pass; target remains Rust-like `2.xs/step`. |
+| `training/progress_display.mojo` | Shared pure-Mojo trainer/sample UI formatter. Provides `print_trainer_progress` plus sample setup/step/saved helpers so Klein, Z-Image, Anima, and later trainers use one display contract. It prints Rust-style operator lines with step, epoch, loss, grad_norm, seconds/step, noising speed, elapsed, and ETA. | **ACTIVE CONTRACT** — trainer runtime UI must call this Mojo module directly. Python wrappers are dev/replay only, not final trainer UI. |
+
+### Klein 9B Trainer Notes - 2026-05-31
+
+- User constraints: final trainer/runtime code stays pure Mojo; Python is allowed only for development/parity/log wrapping. Rust-side code stays pure Rust. Do not introduce Rust-from-Python or Python runtime dependencies.
+- Project context: most of the Mojo stack is a pure-Mojo port/proving ground for the new Rust-stack tech developed for two goals: speed and functionality. Treat Rust as the design/performance reference, but keep the Mojo implementation native.
+- Config: follow OneTrainer presets where possible, but do not quantize Klein for training. Use block swapping/offload instead. Current Klein 9B config sets `learning_rate = 4e-4`, timestep shift `1.0`, AdamW `eps = 1e-8`, weight decay `0.01`, betas `0.9/0.999`.
+- Cache buckets: real SerenityBoard/Alina cache may contain mixed latent sizes. The trainer must filter with `KleinCache.peek_key` and only train on samples matching the compile-time shape (`c=128`, `h=32`, `w=32`, text seq `512` for the current 512 run). Observed cache state: `40 of 118` samples compatible. Without this filter, step 1 hit `reshape_owned: numel mismatch 131072 != 143360`.
+- Scratch/ring allocator: yes, the trainer uses `ScratchRingAllocator`. A shared forward/backward ring exhausted during the first real backward pass; keep separate forward and backward scratch arenas unless the lifetimes are reworked.
+- Sampling: staged validation sampling now mirrors the known-good inference loop: cached positive and negative caps, CFG via `flux2_cfg`, 20-step Flux2/Klein sigma schedule, live PEFT LoRA loaded through `load_klein_lora_resume`, then VAE decode. `sampling/klein_sample_cli.mojo` is a single runtime-dispatch entry for supported resolutions (currently 512/1024); do not add one CLI file per resolution. The quick fix runs positive and negative branches separately, so sample denoise is currently about `7.3s/step` at 512 and will be slower at 1024.
+- Telemetry/UI: trainer runtime display is pure Mojo through `training/progress_display.mojo`, not Python. The screen line must look like `[Klein-lora] step k/total | epoch e/E | loss ... | grad_norm ... | ...s/step | noise ...M/s | elapsed ... | ETA ...`. `scripts/train_progress.py` is only an optional dev/replay helper for old raw logs; do not make final trainer UI depend on Python.
+- Current speed diagnosis: noising is healthy (`~60M elems/sec`) and optimizer is negligible (`~0.07s`). The bottleneck is block streaming/staging/casting in the transformer path, especially per-block clone/cast to F32 and the current turbo prefetch overlap behavior. Fixing this should be done in shared offload code where possible so Klein, LTX, HiDream, SenseNova, etc. benefit.
+- Save format: keep LoRA output plain PEFT-style safetensors via `save_lora_peft`, matching ai-toolkit/diffusers/ComfyUI expectations. Do not save a private-only adapter format.
+- Next model after Klein: Z-Image. Local OneTrainer reference: `modules/model/ZImageModel.py::calculate_timestep_shift` computes dynamic shift from latent size with `patch_size = 2`, and `modules/modelSetup/BaseZImageSetup.py` passes either that value or fixed `config.timestep_shift`. With FlowMatch defaults, 512 training is about `1.88` and 1024 is about `3.16`; use fixed practical shifts `1.8` for 512 and `3.0` for 1024+ unless a config explicitly says otherwise.
 
 ---
 
@@ -426,3 +440,32 @@ cos 0.9975 (F32 accumulation order, not corruption). See
   `T5_ZIMAGE_TRAINING_MAP.md`.
 - **Find the convention/idiom that's biting you**: `docs/MOJO_CONVENTIONS.md`.
 - **Debug a dead/wrong gradient**: `docs/MOJO_DIAGNOSTICS.md`.
+## Trainer Runtime Contracts
+
+- `serenitymojo/training/progress_display.mojo` is the shared pure-Mojo screen
+  display for trainer and sampler progress.
+- `serenitymojo/training/sample_prompt_config.mojo` reads shared
+  `serenity.sample_prompts.v1` JSON files. Trainers read prompt text, sample
+  parameters, and precomputed cap-cache paths from this file.
+- `serenitymojo/training/serenityboard.mojo` writes SerenityBoard `board.db`
+  directly from Mojo via SQLite FFI. It records train scalars, prompt text,
+  save/resume events, and PNG artifacts.
+- `serenitymojo/docs/TRAINER_SAMPLE_PROMPTS_AND_BOARD_2026-05-31.md` documents
+  the production sampling cadence and board tags.
+
+## 2026-06-01 — flame-core parity port (new standalone modules)
+
+New standalone, parity-gated modules porting missing flame-core/EDv2 tools. **None are
+wired into any trainer/sampler/config** — each matches its Rust reference at parity.
+Full inventory + gates + scope caveats: `docs/FLAMECORE_PARITY_PORTED_2026-06-01.md`.
+
+- Levers (modules, not wired): `training/{lr_schedule,loss_weight,timestep_bias,caption_dropout,noise_modifiers,grad_accum,ema_schedule}.mojo`
+- Optimizers: `training/opt_{lion,stableadamw,adafactor,prodigy,schedulefree}.mojo`
+- LyCORIS adapters (PRIMITIVE-ONLY, fail-loud in Klein stack): `training/{loha,dora,lokr,oft,boft,locon_conv,tucker_conv,full}_adapter.mojo` (+ `*_save.mojo`)
+- Diagnostics: `training/grad_coverage.mojo`
+- Samplers: `sampling/{dpmpp_2m,unipc,inpaint,img2img_refpack}.mojo`; encoder `vae/vae_encode_general.mojo` (weight-gated)
+- Perf (new sibling kernels): `ops/vec_{permute0213,transpose,rms_norm,swiglu,modulate}.mojo`, `training/{fused_adamw_multitensor,on_device_global_norm}.mojo`
+- Infra: `offload/transfer_benchmark.mojo`, `io/disk_check.mojo`
+
+NOT ported (in-place-edit-only / NO_MOJO_PATH / user-excluded) + the parked trainer-file
+edits: see sections C and D of the parity-ported doc.

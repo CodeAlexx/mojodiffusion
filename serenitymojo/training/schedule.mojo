@@ -280,6 +280,52 @@ def sample_timestep_logit_normal(seed: UInt64, shift: Float32) -> Float32:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Wave 2A item 2g — selectable Uniform + Sigmoid timestep distributions.
+#
+# The production default stays sample_timestep_logit_normal (logit-normal +
+# qwen-shift). These two additions match EDv2 timestep_dist.rs:
+#   Uniform : t ~ U(0,1)   = rand 0.8.5 Standard<f32> = top-24-bits(word)/2^24
+#             (timestep_dist.rs:172). One ChaCha word at word_pos 0.
+#   Sigmoid : t = sigmoid(noising_weight * (z + noising_bias)), z ~ N(0,1)
+#             (timestep_dist.rs:173-180; musubi-style). One Box-Muller draw.
+# Both reuse the SAME ChaCha12 stream as the production path so the draw is
+# deterministic per seed. Distribution-level (not byte) parity is gated
+# statistically (0.999 cos of the histogram), per the task.
+#
+# Distribution kind enum (matches io reader / TrainConfig.timestep_distribution):
+#   TSD_UNIFORM 0 ; TSD_SIGMOID 1 ; TSD_LOGIT_NORMAL 2
+comptime TSD_UNIFORM = 0
+comptime TSD_SIGMOID = 1
+comptime TSD_LOGIT_NORMAL = 2
+
+
+def sample_timestep_uniform(seed: UInt64) -> Float32:
+    """t ~ U(0,1): rand 0.8.5 Standard<f32> = top-24-bits(word)/2^24.
+
+    Mirrors timestep_dist.rs:172 (`rng.r#gen::<f32>()`). One ChaCha word at
+    word position 0 of the seed's stream."""
+    var ks = _expand_key(seed)
+    var w0 = _chacha12_word_from_key(
+        ks[0], ks[1], ks[2], ks[3], ks[4], ks[5], ks[6], ks[7], UInt64(0), 0
+    )
+    return Float32(_standard_f64(w0))
+
+
+def sample_timestep_sigmoid(seed: UInt64, weight: Float32, bias: Float32) -> Float32:
+    """t = sigmoid(weight * (z + bias)), z ~ N(0,1).
+
+    Mirrors timestep_dist.rs:173-180 (musubi-style continuous sigmoid). With
+    weight=1.8, bias=0 this is the Z-Image pipeline default. One Box-Muller
+    N(0,1) draw from the seed's stream."""
+    var ks = _expand_key(seed)
+    var d = _standard_normal_at(
+        ks[0], ks[1], ks[2], ks[3], ks[4], ks[5], ks[6], ks[7], UInt64(0)
+    )
+    var arg = Float64(weight) * (d.z + Float64(bias))
+    return Float32(_sigmoid64(arg))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # T6.2 — Flow-matching noised input + target.
 # ─────────────────────────────────────────────────────────────────────────────
 @fieldwise_init
@@ -320,6 +366,8 @@ def flow_match_noise_target(
     var n = latent.numel()
     if noise.numel() != n:
         raise Error("flow_match_noise_target: latent/noise numel mismatch")
+    if latent.dtype() != STDtype.F32 or noise.dtype() != STDtype.F32:
+        raise Error("flow_match_noise_target: latent/noise must be F32")
 
     var x_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
     var t_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
@@ -380,6 +428,8 @@ def ema_update(mut shadow: Tensor, live: Tensor, decay: Float32, ctx: DeviceCont
     var n = shadow.numel()
     if live.numel() != n:
         raise Error("ema_update: shadow/live numel mismatch")
+    if shadow.dtype() != STDtype.F32 or live.dtype() != STDtype.F32:
+        raise Error("ema_update: shadow/live must be F32")
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         shadow.buf.unsafe_ptr().bitcast[Float32](), rl
@@ -417,6 +467,8 @@ def grad_accumulate(mut acc: Tensor, new_grad: Tensor, ctx: DeviceContext) raise
     var n = acc.numel()
     if new_grad.numel() != n:
         raise Error("grad_accumulate: acc/new_grad numel mismatch")
+    if acc.dtype() != STDtype.F32 or new_grad.dtype() != STDtype.F32:
+        raise Error("grad_accumulate: acc/new_grad must be F32")
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var ACC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         acc.buf.unsafe_ptr().bitcast[Float32](), rl

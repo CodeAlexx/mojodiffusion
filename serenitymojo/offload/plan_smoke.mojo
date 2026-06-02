@@ -7,6 +7,7 @@ from serenitymojo.offload.plan import (
     build_lance_t2v_block_plan,
     build_qwenimage_block_plan,
     build_sensenova_u1_block_plan,
+    build_flux1_dev_block_plan,
 )
 
 
@@ -22,6 +23,7 @@ def main() raises:
     var lance = build_lance_t2v_block_plan()
     var hidream = build_hidream_o1_block_plan()
     var sensenova = build_sensenova_u1_block_plan()
+    var flux = build_flux1_dev_block_plan()
     var single = OffloadConfig.synchronous_single()
     var cfg = OffloadConfig.synchronous_cfg_paired()
 
@@ -34,6 +36,12 @@ def main() raises:
     _check(String("lance block count"), lance.count(), 36)
     _check(String("hidream block count"), hidream.count(), 36)
     _check(String("sensenova block count"), sensenova.count(), 42)
+    _check(String("flux block count"), flux.count(), 57)
+    _check(String("flux cfg visits"), flux.branch_visits(cfg), 114)
+
+    print("[offload-plan] flux first:", flux.normalized_prefix(0), flux.kind(0).name())
+    print("[offload-plan] flux seam (idx 19):", flux.normalized_prefix(19), flux.kind(19).name())
+    print("[offload-plan] flux last:", flux.normalized_prefix(flux.count() - 1), flux.kind(flux.count() - 1).name())
 
     print("[offload-plan] klein first:", klein.normalized_prefix(0), klein.kind(0).name())
     print("[offload-plan] klein last:", klein.normalized_prefix(klein.count() - 1), klein.kind(klein.count() - 1).name())

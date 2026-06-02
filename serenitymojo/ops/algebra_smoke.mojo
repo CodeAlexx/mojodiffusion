@@ -33,6 +33,8 @@ def main() raises:
     var all_pass = True
 
     comptime F32 = STDtype.F32
+    comptime BF16 = STDtype.BF16
+    comptime F16 = STDtype.F16
 
     # ── elementwise tensor-tensor [3,4] ──────────────────────────────────────
     var ew_a = _lf(0.58661813, 0.95013839, 0.09354459, -0.00894966, 2.82103324, 1.02418983, -0.33264816, 0.54184127, 0.09704504, 0.38438061, -0.45486298, -0.64081633)
@@ -117,11 +119,32 @@ def main() raises:
     r = h.compare(concat(1, ctx, Tensor.from_host(ccl_a, [2, 3], F32, ctx), Tensor.from_host(ccl_b, [2, 2], F32, ctx)), ccl_dim1, ctx)
     print("concat lastdim ", r); all_pass = all_pass and r.passed
 
+    # ── fast rank-2 dim=1 kernels: 3-way concat + BF16/F16 storage ───────────
+    var c3_a = _lf(1.0, 2.0, 3.0, 4.0)
+    var c3_b = _lf(5.0, 6.0)
+    var c3_c = _lf(7.0, 8.0, 9.0, 10.0, 11.0, 12.0)
+    var c3_out = _lf(1.0, 2.0, 5.0, 7.0, 8.0, 9.0, 3.0, 4.0, 6.0, 10.0, 11.0, 12.0)
+    r = h.compare(concat(1, ctx, Tensor.from_host(c3_a, [2, 2], F32, ctx), Tensor.from_host(c3_b, [2, 1], F32, ctx), Tensor.from_host(c3_c, [2, 3], F32, ctx)), c3_out, ctx)
+    print("concat3 f32    ", r); all_pass = all_pass and r.passed
+    r = h.compare(concat(1, ctx, Tensor.from_host(c3_a, [2, 2], BF16, ctx), Tensor.from_host(c3_b, [2, 1], BF16, ctx), Tensor.from_host(c3_c, [2, 3], BF16, ctx)), c3_out, ctx)
+    print("concat3 bf16   ", r); all_pass = all_pass and r.passed
+    r = h.compare(concat(1, ctx, Tensor.from_host(c3_a, [2, 2], F16, ctx), Tensor.from_host(c3_b, [2, 1], F16, ctx), Tensor.from_host(c3_c, [2, 3], F16, ctx)), c3_out, ctx)
+    print("concat3 f16    ", r); all_pass = all_pass and r.passed
+
     # ── slice [2,5,3] dim=1 start=1 length=3 -> [2,3,3] ──────────────────────
     var sl_x = _lf(-0.94717985, -0.14905953, 0.87528324, 0.55640364, 0.35288882, -0.75223935, -0.69661856, 1.01998866, -2.17987442, 1.73126149, 1.25449717, 0.93955821, 0.55210888, -0.47753200, -0.20154808, -0.36186653, -0.87892407, -0.05736860, -1.16921270, -1.11999846, 0.96982151, 1.75427103, -1.12011814, 0.84988368, -1.60016680, 1.23964095, -1.44809473, -0.46836156, 0.07514848, 1.36498582)
     var sl_out = _lf(0.55640364, 0.35288882, -0.75223935, -0.69661856, 1.01998866, -2.17987442, 1.73126149, 1.25449717, 0.93955821, -1.16921270, -1.11999846, 0.96982151, 1.75427103, -1.12011814, 0.84988368, -1.60016680, 1.23964095, -1.44809473)
     r = h.compare(slice(Tensor.from_host(sl_x, [2, 5, 3], F32, ctx), 1, 1, 3, ctx), sl_out, ctx)
     print("slice dim1     ", r); all_pass = all_pass and r.passed
+
+    var sl2_x = _lf(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)
+    var sl2_out = _lf(2.0, 3.0, 4.0, 7.0, 8.0, 9.0)
+    r = h.compare(slice(Tensor.from_host(sl2_x, [2, 5], F32, ctx), 1, 1, 3, ctx), sl2_out, ctx)
+    print("slice r2 f32   ", r); all_pass = all_pass and r.passed
+    r = h.compare(slice(Tensor.from_host(sl2_x, [2, 5], BF16, ctx), 1, 1, 3, ctx), sl2_out, ctx)
+    print("slice r2 bf16  ", r); all_pass = all_pass and r.passed
+    r = h.compare(slice(Tensor.from_host(sl2_x, [2, 5], F16, ctx), 1, 1, 3, ctx), sl2_out, ctx)
+    print("slice r2 f16   ", r); all_pass = all_pass and r.passed
 
     # ── gather_rows: table[6,4], ids=[3,0,5,1,5] -> [5,4] ────────────────────
     var gr_table = _lf(0.51429206, -1.74904037, -0.92698139, -0.63795078, -0.50847751, -0.11651420, 1.54935718, 2.16651034, -0.19504844, 0.40552700, -0.86515230, 0.47413936, 0.07733735, 0.98636383, -0.51895016, -0.31269577, 1.00923896, -0.37294883, -0.07864033, -1.19888794, -0.20076287, -0.33930722, -0.74332780, -0.84884846)

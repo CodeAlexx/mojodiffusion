@@ -43,6 +43,11 @@
 # within 24 GB, proving loss-down + LoRA-B growth. Full MAIN_DEPTH=30 needs
 # BF16-preserving residency and/or turbo/offload, not F32 expansion.
 #
+# LOSS WARNING: the reduced-depth MAIN_DEPTH=4 smoke loss is not a training
+# baseline. The old ~445 loss is only useful to prove finite wiring/backward on
+# a truncated 8-block stack. Full-depth Z-Image training must target the
+# OneTrainer baseline scale (~0.54 at 100 steps); ~445 there means broken.
+#
 # Run (real smoke):
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #     pixi run mojo run -I . serenitymojo/training/train_zimage_real.mojo [steps]
@@ -375,8 +380,8 @@ def main() raises:
         b_absum_final += _absum(lora.ad[i].b)
     var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
     if trains and (last_loss == last_loss):
-        print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
-              "; loss", first_loss, "->", last_loss,
+        print("RESULT: REDUCED-DEPTH WIRING SMOKE OK — LoRA-B grew 0 ->", b_absum_final,
+              "; loss", first_loss, "->", last_loss, " (NOT a baseline)",
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         _ = sys_system(String("mkdir -p ") + String(LORA_DIR))
         _ = save_zimage_lora(lora, String(LORA_DIR) + String("/zimage_lora_smoke.safetensors"), ctx)

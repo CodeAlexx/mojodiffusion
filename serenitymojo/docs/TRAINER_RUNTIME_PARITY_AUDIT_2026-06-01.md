@@ -54,6 +54,9 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
 - Baseline target: `loss=0.541`, `smooth_loss=0.457`, warm cadence
   `2.0-2.2s/it`. Checkpoint:
   `/home/alex/OneTrainer/workspace/alina_zimage_OTpreset_100_baseline/save/2026-06-02_01-06-16-save-99-3-24.safetensors`.
+- The reduced-depth SerenityMojo smoke currently prints loss around `445`.
+  Treat that as truncated-stack wiring/backward proof only, not a baseline.
+  Full-depth Z-Image training with loss around `445` is broken.
 
 ## Gaps vs Rust/Flame
 

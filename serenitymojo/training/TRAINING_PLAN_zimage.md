@@ -96,6 +96,10 @@ adapters; grads finite. Checkpoint saved (37MB, 56 adapters, PEFT names).
 Multi-sample mode (OVERFIT_PROBE=False) runs too but loss oscillates per-step
 (different timestep+sample each step) — expected variance, not divergence.
 
+Do not use the `~445` reduced-depth loss as a baseline. It is a truncated-stack
+wiring/backward smoke only. For full-depth Z-Image, `~445` would be a broken
+run; the target scale is the OneTrainer baseline below.
+
 ### OneTrainer 100-Step Baseline (512, Klein/Alina dataset)
 
 OneTrainer Z-Image LoRA baseline used the local `Otpreset` Z-Image preset, local
@@ -124,7 +128,7 @@ turbo/offload block loader like Klein's before flipping `MAIN_DEPTH=30`.
 The existing reduced-depth run is only a correctness probe. Loss MAGNITUDE
 (~445) and the slow per-step delta are partly the MAIN=4 truncation artifact
 (26 missing layers => final output uncalibrated to the latent scale); the
-DIRECTION (monotonic down) is the correctness signal.
+DIRECTION (monotonic down) is the only correctness signal for that smoke.
 
 ### NEXT (to land full-depth)
 1. BF16/BP16-preserving zimage block fwd/bwd (or reuse an offload loader) so

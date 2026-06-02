@@ -1,9 +1,12 @@
 # TRAINING_PLAN_ernie.md — ERNIE-Image pure-Mojo training port
 
-Status: Phase 1 DONE + Phase 2 (E1/E2/E3-composition) DONE (2026-06-01). Single-
-block AND full-36-layer-stack fwd+bwd are parity-clean vs torch at real hidden
-dims (H=32, Dh=128, D=4096). Maps every remaining piece to the proven Klein
-template (`serenitymojo/models/klein/` + `serenitymojo/training/`).
+Status: Phase 1 DONE + Phase 2 (E1/E2/E3) DONE + E4 (LoRA) DONE + **E5
+(train_ernie_real) DONE & REAL-RUN VERIFIED** (2026-06-01). Single-block AND
+full-36-layer-stack fwd+bwd are parity-clean vs torch at real hidden dims
+(H=32, Dh=128, D=4096). The real training loop runs on the real 36-layer
+checkpoint + real cache: loss finite, grads finite & growing, LoRA-B 0→nonzero
+(learning), nonfinite=0, PEFT save inference-loadable. E6 (full-FT) deferred;
+Mistral3B text-encoder port deferred (cache already holds text embeddings).
 Builder→skeptic→bugfix discipline per phase.
 
 ## What Phase 2 shipped (VERIFIED this session, 2026-06-01)
@@ -165,7 +168,49 @@ every model — nothing inlined in the model file).
   (|dA|_1=0 at step 0 is correct PEFT behavior — d_A path = d_t@x where d_t=d_dy@B=0
   while B=0; A starts moving on step ≥2 once B is nonzero.)
 
-### E5 — train_ernie_real loop  [NEXT; the LoRA step primitives are DONE in E4]
+### E5 — train_ernie_real loop  [DONE + REAL-RUN VERIFIED 2026-06-01]
+- `serenitymojo/training/train_ernie_real.mojo` built (RC=0) and ran a REAL
+  multi-step LoRA training run on the real 36-layer ERNIE checkpoint
+  (`/home/alex/models/ERNIE-Image/transformer`, 2 shards) + the real cache
+  `EriDiffusion-v2/cache/boxjana_ernie_512_FIXED`. TRANSLATION of
+  `train_ernie.rs` (not invention): same cache schema (latent[1,128,32,32]
+  F32 + text_embedding[1,512,3072] + text_real_len), same logit-normal σ sample
+  (shift=1 identity), same flow target `noise-latent`, same integer timestep fed
+  to the DiT (`sigma_idx`, NOT σ*1000 — train_ernie.rs:956), same MSE loss +
+  `d_loss=(2/N)(pred-target)`, same global-L2 clip @1.0, same AdamW, same PEFT
+  save keys.
+- COMPTIME real dims: N_IMG=1024 (32×32 latent), N_TXT=256 (fixed trim of the
+  PAD-padded cache text; observed real_len ≤ ~203 so all real tokens kept),
+  S=1280, D=4096, F=12288, 36 layers, rank=16 α=16. Uses the STREAMED stack
+  (`ernie_stack_lora_forward_streamed`/`_backward_streamed`) — 36 F32 blocks
+  load→use→drop. Peak GPU ~12 GB on the 24 GB 3090, ~188 s/step (host-List path).
+- The deferred E2/E5 shared-AdaLN SOURCE is now BUILT in the trainer
+  (`_shared_adaln_source`): from the resident `ErnieStackBase` weights +
+  `sigma_idx` it computes `c=time_embed(sigma_idx)` (sin-first MLP) →
+  `mv=chunk6(silu(c)@adaLN_modulation.1+b)` and
+  `[f_scale,f_shift]=chunk2(c@final_norm.linear+b)`. Mirrors ernie_image.rs:519-552
+  / ernie_image.mojo time_embed/shared_adaln. All F32.
+- REAL-RUN RESULT (tool output, no faking): nonfinite=0 every step; grads finite
+  and growing (0.00160 → 0.00233); **LoRA-B |.|_1 grew 0.0 (init) → 6319.8
+  (step0) → 9132.5 (step1)** — every adapter slot moving off the PEFT zero-init,
+  i.e. the LoRA is LEARNING. Per-step raw loss varies with the sampled σ
+  (step0 σ_idx=540 loss=0.679; step1 σ_idx=287 loss=1.097) — same σ-dependent
+  magnitude as the Rust trainer, not a regression. Final save → PEFT/ai-toolkit
+  safetensors (`serenitymojo/output/ernie_lora_real.safetensors`,
+  inference-loadable via the ernie_image.rs lora.apply key map).
+- MISTRAL3B TEXT ENCODER: DEFERRED (not needed for this real run). The cache
+  already holds the Mistral text_embedding[1,512,3072]; the loop reads it
+  directly. The Mistral port (`models/text_encoder/mistral3b_encoder.mojo`,
+  mirroring qwen3_encoder.mojo) is only needed to (re)generate caches / encode
+  sample prompts — off the training hot path. FLAGGED as its own intake (YaRN
+  RoPE, GQA 32q/8kv, causal mask, layer-24 extract).
+- FOLLOW-UPS (not blockers): (1) host-List path is slow (188 s/step) — a device-
+  resident activation path (Klein's `*_resident_moddev_rope_scratch` analogue)
+  would cut this ~10×; (2) variable per-sample text trim needs a runtime (non-
+  comptime) seq or a small set of comptime buckets; (3) caching the σ→mv/f_scale
+  source per-step is trivial but the source is cheap relative to 36 blocks.
+
+#### Historical E5 scope (now satisfied)
 - The per-step LoRA mechanics are PROVEN (E4): `ernie_stack_lora_forward_streamed`
   → `ernie_stack_lora_backward_streamed` → host global-norm clip →
   `ernie_lora_adamw_step` → `save_ernie_lora`. E5 = wrap these in the real loop

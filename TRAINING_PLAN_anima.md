@@ -5,6 +5,47 @@
 > labelled. Tenet 4: nothing here is asserted as measured unless a tool result in
 > the session backed it.
 
+## ✅ PHASES D + E DONE — train_anima_real RUNS A REAL RUN (2026-06-01)
+
+`serenitymojo/training/train_anima_real.mojo` (built RC=0) — a line-faithful
+TRANSLATION of `train_anima.rs` onto the parity-verified LoRA stack. It loads the
+REAL `anima-base-v1.0.safetensors` (28 blocks streamed per-step via
+`anima_stack_lora_forward_streamed/_backward_streamed`), the cached latent
+(`anima_synth_smoke/sample0.safetensors`), and the captured frozen LLM-adapter
+context (`anima_embeddings.safetensors::context_cond [1,256,1024]`), computes
+`t_cond`/`base_adaln` from the REAL t_embedder weights (sinusoidal→linear→silu→
+linear + RMSNorm, faithful to anima_dit `_prepare_timestep`), patchifies INPUT
+([Cp,pH,pW]) and the flow TARGET in OUTPUT layout ([pH,pW,C], C-fastest — the
+inverse of `_unpatchify`, VERIFIED anima_dit.mojo:715), then per step:
+sigmoid→shift→clamp sigma → flow noisy/target → forward → MSE loss → d_out=2/N·(pred−target)
+→ backward → global-norm clip(1.0) → AdamW over all 280 adapters → save (kohya keys).
+
+**MEASURED (fixed-sigma smoke, σ=0.5, 6 steps, real weights, S_IMG=64 crop):**
+loss **1.868 → 1.823 → 1.731 → 1.603 → 1.473 → 1.374** (Δ = −0.495, monotone↓);
+LoRA-B |.|₁ **0 → 577 → 1130 → 1624 → 2053 → 2416 → 2724** (280/280 adapters
+nonzero, ratio 1.0); nonfinite=0 every step; 280 LoRA pairs saved; ~22 s/step,
+peak well under 24 GB, 64 °C. **VERDICT: PASS, RUN_RC=0.** The random-sigma
+schedule (FIXED_SIGMA_SMOKE=False, the real recipe) also runs RC=0 with finite
+grads + LoRA-B growth; loss there bounces per-step because each step draws a new
+σ (different target scale) — fixed-σ isolates the learning signal for the
+loss-decrease gate. To run full-resolution / full schedule: set
+FIXED_SIGMA_SMOKE=False, raise LATENT_HW + RUN_STEPS (S_IMG is comptime).
+
+`serenitymojo/pipeline/anima_prepare.mojo` (built RC=0): TRANSLATION of the
+prepare CONTRACT — validates a cache dir against the 5-key schema + reports the
+adapter-context sidecar, and REUSES existing caches (the FAST PATH). It does NOT
+fabricate latents/embeddings: the real-image encode needs the Qwen-Image VAE
+ENCODER (Mojo has only the DECODER) + a Qwen3/T5 text path (not ported) + the
+6-block LLM adapter. Those three ports are the remaining real-image-prep work;
+for LoRA training the adapter output (context) is a FROZEN input, so its backward
+is not needed. Run: `/tmp/anima_prepare <cache_dir>`.
+
+### Remaining (out of THIS milestone's scope — trainer runs without them)
+- Qwen-Image VAE encoder port (decoder exists; encoder is the 8× down stack).
+- Qwen3-0.6B + T5 tokenizer + 6-block LLM adapter port (for real-image prep +
+  per-caption context; currently consumes captured sidecar context).
+- Full-resolution (S_IMG=1024) + random-σ multi-step convergence run on a free GPU.
+
 ## What is DONE + VERIFIED this session (RC=0, ran on GPU)
 
 | Deliverable | File | Status |

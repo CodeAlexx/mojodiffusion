@@ -1,0 +1,395 @@
+# train_flux_real.mojo — Flux (flux1-dev) LoRA REAL training loop.
+#
+# TRANSLATION of EriDiffusion-v2 train_flux.rs onto the parity-verified Mojo
+# Flux LoRA OFFLOAD stack (models/flux/flux_stack_lora.mojo). Real flux1-dev
+# base weights (streamed block-by-block via TurboPlannedLoader), real prepared
+# cache (latent + T5 + CLIP-pooled), full 19+38 block depth. No synthetic
+# tensors. Mirrors train_zimage_real.mojo's loop structure (timing, grad clip,
+# PROG line) and train_flux.rs's recipe.
+#
+# Per step (translated from train_flux.rs main loop, lines 700-857):
+#   1. load cached {latent [1,16,64,64] RAW, t5_embed [1,seq,4096], clip_pool [1,768]}
+#   2. latent_scaled = (latent - SHIFT) * SCALE          (train_flux.rs:736)
+#   3. pack_latents(latent_scaled): [1,16,h,w] -> [N_IMG, 64] channel-major
+#      patchify, h_tok=h/2 w_tok=w/2                      (flux_sampler.rs:59-69)
+#   4. sigma_idx = floor(logit_normal_sigma * 1000) clamp; sigma=(idx+1)/1000;
+#      t_model = idx/1000                                 (train_flux.rs:767-813)
+#   5. noisy = noise*sigma + latent_packed*(1-sigma)      (train_flux.rs:797-799)
+#      target = noise - latent_packed   (rectified-flow)  (train_flux.rs:802)
+#   6. flux_stack_lora_forward_offload(noisy_img_tokens, t5_txt_tokens,
+#        timestep=t_model*1000, guidance=3.5*1000, vector=clip_pool) -> pred [N_IMG,64]
+#   7. loss = MSE(pred, target); d_loss = (2/N)(pred - target)
+#   8. flux_stack_lora_backward_offload -> LoRA grads; global-norm clip(1.0)
+#   9. flux_lora_adamw_step ; PRINT PROG step loss grad lr loraB
+#
+# Recipe scalars (train_flux.rs OneTrainer Flux preset):
+#   lr=1e-4 (OT default), rank=16, alpha=1.0, timestep_shift=1.0 (identity),
+#   guidance=3.5, clip_grad_norm=1.0, SHIFT=0.1159, SCALE=0.3611,
+#   NUM_TRAIN_TIMESTEPS=1000.
+#
+# MEMORY: the flux1-dev transformer is 11.9B params (47.6 GB F32 resident) — does
+# NOT fit a 3090. The OFFLOAD path streams one block at a time
+# (flux_stack_lora_forward_offload / _backward_offload, equivalence-gated vs the
+# resident path at cos>=0.9999). The NON-streamed FluxStackBase (img_in/txt_in,
+# 3 embed MLPs, PER-BLOCK modulation linears, final layer) is ~12.3 GB F32
+# resident; with one streamed block (~0.84 GB) + activations + LoRA optimizer
+# state it fits a 24 GB GPU. FULL 19+38 depth is the default.
+#
+# FIXED_SIGMA_SMOKE: when True, every step uses the SAME cache sample AND a fixed
+# timestep+noise so a correct LoRA backward MUST drive loss DOWN monotonically
+# (the canonical trainer-correctness gate, independent of per-step sampling
+# variance — same probe as train_zimage_real / train_anima_real).
+#
+# Run (real smoke):
+#   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
+#     pixi run mojo build -I . -Xlinker -lm -Xlinker -lcuda \
+#       serenitymojo/training/train_flux_real.mojo -o /tmp/train_flux_real && \
+#     /tmp/train_flux_real [steps]
+
+from sys import argv
+from std.collections import List, Optional
+from std.gpu.host import DeviceContext
+from std.math import sqrt, log as flog, cos as fcos, sin as fsin
+from std.time import perf_counter_ns
+from std.os import listdir
+
+from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.io.tensor_view import from_parts
+from serenitymojo.ops.cast import cast_tensor
+
+from serenitymojo.models.flux.weights import load_flux_stack_base
+from serenitymojo.models.flux.flux_stack_lora import (
+    FluxLoraSet, FluxLoraGradSet, build_flux_lora_set,
+    flux_stack_lora_forward_offload, flux_stack_lora_backward_offload,
+    flux_lora_adamw_step, save_flux_lora, total_adapters,
+)
+from serenitymojo.models.flux.lora_block import DBL_STREAM_SLOTS, SGL_SLOTS
+from serenitymojo.models.dit.flux1_dit import build_flux1_rope_tables
+from serenitymojo.offload.plan import build_flux1_dev_block_plan, OffloadConfig
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.training.schedule import sample_timestep_logit_normal
+
+
+# ── arch (flux1-dev; H/Dh/D fixed comptime, verified vs the checkpoint) ──────
+comptime H = 24
+comptime Dh = 128
+comptime D = H * Dh            # 3072
+comptime FMLP = 12288          # mlp_hidden = D*4
+comptime IN_CH = 64            # patch_dim = 16ch * 2*2
+comptime TXT_CH = 4096         # T5 joint_attention_dim
+comptime OUT_CH = 64
+comptime T_DIM = 256           # timestep_dim
+comptime VEC_DIM = 768         # CLIP-pooled
+comptime NUM_DOUBLE = 19
+comptime NUM_SINGLE = 38
+comptime EPS = Float32(1e-06)
+comptime MAX_PERIOD = Float32(10000.0)
+
+# ── resolution (512px): latent [16,64,64] -> pack2 -> 32x32=1024 img tokens ──
+comptime LAT_C = 16
+comptime LAT_H = 64
+comptime LAT_W = 64
+comptime PATCH = 2
+comptime HT = LAT_H // PATCH   # 32
+comptime WT = LAT_W // PATCH   # 32
+comptime N_IMG = HT * WT       # 1024
+comptime N_TXT = 512           # T5 padded length (BFL convention)
+comptime S = N_TXT + N_IMG     # 1536
+
+# ── recipe (train_flux.rs OneTrainer Flux preset) ────────────────────────────
+comptime RANK = 16
+comptime ALPHA = Float32(1.0)
+comptime LR = Float32(1.0e-4)
+comptime TIMESTEP_SHIFT = Float32(1.0)
+comptime GUIDANCE = Float32(3.5)
+comptime VAE_SHIFT = Float32(0.1159)
+comptime VAE_SCALE = Float32(0.3611)
+comptime NUM_TRAIN_TIMESTEPS = 1000
+comptime CLIP_GRAD_NORM = Float32(1.0)
+comptime SEED_BASE = UInt64(42)
+
+# Overfit-correctness probe (see header). VERIFY monotone loss + LoRA-B growth.
+comptime FIXED_SIGMA_SMOKE = True
+comptime FIXED_SIGMA_IDX = 500   # mid-schedule sigma when FIXED_SIGMA_SMOKE.
+
+comptime CKPT = "/home/alex/.serenity/models/checkpoints/flux1-dev.safetensors"
+comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_flux_512_smoke"
+comptime LORA_DIR = "/home/alex/mojodiffusion/output/alina_flux"
+
+
+# ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
+def _host_noise(n: Int, seed: UInt64) -> List[Float32]:
+    var out = List[Float32]()
+    var state = seed
+    var i = 0
+    while i < n:
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u1f = Float64(Int((state >> 11) & 0xFFFFFFFFFFFFF)) * (1.0 / 9007199254740992.0)
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u2f = Float64(Int((state >> 11) & 0xFFFFFFFFFFFFF)) * (1.0 / 9007199254740992.0)
+        if u1f < 1.0e-12:
+            u1f = 1.0e-12
+        var r = sqrt(-2.0 * flog(Float64(u1f)))
+        var theta = 6.283185307179586 * u2f
+        out.append(Float32(r * fcos(Float64(theta))))
+        if i + 1 < n:
+            out.append(Float32(r * fsin(Float64(theta))))
+        i += 2
+    return out^
+
+
+def _absum(v: List[Float32]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(v)):
+        var x = v[i]
+        s += x if x >= 0.0 else -x
+    return s
+
+
+def _global_norm(grads: FluxLoraGradSet) -> Float64:
+    var ss = 0.0
+    for i in range(len(grads.d_a)):
+        for j in range(len(grads.d_a[i])):
+            ss += Float64(grads.d_a[i][j]) * Float64(grads.d_a[i][j])
+        for j in range(len(grads.d_b[i])):
+            ss += Float64(grads.d_b[i][j]) * Float64(grads.d_b[i][j])
+    return sqrt(ss)
+
+
+def _clip(mut grads: FluxLoraGradSet, max_norm: Float32) -> Float64:
+    var gn = _global_norm(grads)
+    if gn <= Float64(max_norm) or gn == 0.0:
+        return gn
+    var s = Float32(Float64(max_norm) / gn)
+    for i in range(len(grads.d_a)):
+        for j in range(len(grads.d_a[i])):
+            grads.d_a[i][j] = grads.d_a[i][j] * s
+        for j in range(len(grads.d_b[i])):
+            grads.d_b[i][j] = grads.d_b[i][j] * s
+    return gn
+
+
+# ── flux cache reader (prepare_flux.rs schema: latent / t5_embed / clip_pool) ─
+def _list_cache(dir: String) raises -> List[String]:
+    var raw = listdir(dir)
+    var fs = List[String]()
+    for i in range(len(raw)):
+        if raw[i].endswith(".safetensors"):
+            fs.append(dir + String("/") + raw[i])
+    if len(fs) == 0:
+        raise Error(String("flux cache: no .safetensors in ") + dir)
+    # simple insertion sort for reproducible order
+    for i in range(1, len(fs)):
+        var j = i
+        while j > 0 and fs[j - 1] > fs[j]:
+            var tmp = fs[j - 1]
+            fs[j - 1] = fs[j]
+            fs[j] = tmp
+            j -= 1
+    return fs^
+
+
+def _load_host(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
+    var info = st.tensor_info(name)
+    var bytes = st.tensor_bytes(name)
+    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
+    var t = Tensor.from_view(tv, ctx)
+    return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
+
+
+# ── pack_latents: [16,LAT_H,LAT_W] flat -> [N_IMG, 64] channel-major patchify ─
+# Mirrors flux_sampler.rs pack_latents EXACTLY:
+#   reshape [c, ht, p, wt, p] -> permute (ht, wt, c, p, p) -> [ht*wt, c*p*p].
+# So token (ih,iw) carries [c, ph, pw] (c-major, then ph, then pw).
+def _pack_latents(lat: List[Float32]) -> List[Float32]:
+    var out = List[Float32]()
+    for ih in range(HT):
+        for iw in range(WT):
+            for c in range(LAT_C):
+                for ph in range(PATCH):
+                    for pw in range(PATCH):
+                        var hh = ih * PATCH + ph
+                        var ww = iw * PATCH + pw
+                        var idx = c * LAT_H * LAT_W + hh * LAT_W + ww
+                        out.append(lat[idx])
+    return out^
+
+
+def main() raises:
+    var ctx = DeviceContext()
+    var a = argv()
+    var run_steps = 5
+    if len(a) >= 2:
+        var v = 0
+        var bs = String(a[1]).as_bytes()
+        for i in range(String(a[1]).byte_length()):
+            v = v * 10 + Int(bs[i] - 0x30)
+        run_steps = v
+
+    print("=== Flux (flux1-dev) REAL LoRA training loop (block-swap offload) ===")
+    print("  arch: D=", D, " H=", H, " Dh=", Dh, " Fmlp=", FMLP, " out_ch=", OUT_CH)
+    print("  depth: NUM_DOUBLE=", NUM_DOUBLE, " NUM_SINGLE=", NUM_SINGLE, " (FULL flux1-dev)")
+    print("  tokens: N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S)
+    print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT,
+          " guidance=", GUIDANCE, " vae_shift=", VAE_SHIFT, " vae_scale=", VAE_SCALE)
+    print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
+    print("  ckpt:", CKPT)
+    print("  cache:", CACHE_DIR)
+
+    # ── stack-level base (frozen; resident ~12.3 GB F32) ─────────────────────
+    print("[load] FluxStackBase (img/txt_in, embedders, per-block mod.lin, final layer)")
+    var base_st = SafeTensors.open(String(CKPT))
+    var base = load_flux_stack_base(base_st, NUM_DOUBLE, NUM_SINGLE, True, ctx)
+    print("[load] base resident")
+
+    # ── block-swap offload loader (streams attn/mlp blocks one at a time) ────
+    var plan = build_flux1_dev_block_plan()
+    var cfg = OffloadConfig.synchronous_single()
+    var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
+    print("[load] offload loader opened (", loader.block_count(), "blocks)")
+
+    # ── 3-axis RoPE tables (positions fixed for 512px; built once) ───────────
+    var rope = build_flux1_rope_tables[N_IMG, N_TXT, H, Dh](HT, WT, ctx, STDtype.F32)
+    var cos = rope[0].to_host(ctx)
+    var sin = rope[1].to_host(ctx)
+    print("[load] flux 3-axis rope tables built (S*H x Dh/2)")
+
+    # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
+    var lora = build_flux_lora_set(NUM_DOUBLE, NUM_SINGLE, D, FMLP, RANK, ALPHA)
+    var n_adapters = total_adapters(lora)
+    print("[lora] adapters:", n_adapters,
+          " (", DBL_STREAM_SLOTS * 2, "x", NUM_DOUBLE, "double +",
+          SGL_SLOTS, "x", NUM_SINGLE, "single)")
+
+    # ── cache ────────────────────────────────────────────────────────────────
+    var files = _list_cache(String(CACHE_DIR))
+    print("[cache] samples:", len(files))
+
+    var b_absum_init = Float32(0.0)
+    for i in range(n_adapters):
+        b_absum_init += _absum(lora.ad[i].b)
+    print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+
+    # guidance is pre-scaled *1000 (BFL time_factor; same as timestep).
+    var guidance_list = List[Float32]()
+    guidance_list.append(GUIDANCE * Float32(1000.0))
+    var guidance = Optional[List[Float32]](guidance_list^)
+
+    var first_loss = Float32(0.0)
+    var last_loss = Float32(0.0)
+
+    for k in range(1, run_steps + 1):
+        var t0 = perf_counter_ns()
+
+        # ── load sample ──
+        var slot = 0 if FIXED_SIGMA_SMOKE else (k - 1) % len(files)
+        var step_seed = UInt64(1) if FIXED_SIGMA_SMOKE else UInt64(k)
+        var st = SafeTensors.open(files[slot])
+        var lat_raw = _load_host(st, String("latent"), ctx)        # [16*64*64]
+        var clip_pool = _load_host(st, String("clip_pool"), ctx)   # [768]
+
+        # t5_embed [1, seq, 4096] -> pad/truncate to [N_TXT, 4096] (zero pad rows).
+        var t5_info = st.tensor_info(String("t5_embed"))
+        var t5_seq = Int(t5_info.shape[1])
+        var t5_flat = _load_host(st, String("t5_embed"), ctx)       # [seq*4096]
+        var txt_tokens = List[Float32]()
+        for r in range(N_TXT):
+            if r < t5_seq:
+                for c in range(TXT_CH):
+                    txt_tokens.append(t5_flat[r * TXT_CH + c])
+            else:
+                for _ in range(TXT_CH):
+                    txt_tokens.append(Float32(0.0))
+
+        # ── VAE shift/scale (train_flux.rs:736) then pack_latents ──
+        for i in range(len(lat_raw)):
+            lat_raw[i] = (lat_raw[i] - VAE_SHIFT) * VAE_SCALE
+        var latent_packed = _pack_latents(lat_raw)                 # [N_IMG*64]
+
+        # ── timestep (train_flux.rs:767-813) ──
+        var sigma_idx: Int
+        if FIXED_SIGMA_SMOKE:
+            sigma_idx = FIXED_SIGMA_IDX
+        else:
+            var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+            sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
+            if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
+                sigma_idx = NUM_TRAIN_TIMESTEPS - 1
+        var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+        var t_model = Float32(sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
+        # caller pre-scales t by 1000 (BFL time_factor; flux1_dit.mojo convention).
+        var timestep = List[Float32]()
+        timestep.append(t_model * Float32(1000.0))
+
+        # ── flow-match in PACKED latent space ──
+        # noisy = noise*sigma + latent*(1-sigma) ; target = noise - latent.
+        var noise = _host_noise(N_IMG * IN_CH, SEED_BASE * UInt64(7919) + step_seed)
+        var noisy = List[Float32]()
+        var target = List[Float32]()
+        for i in range(len(latent_packed)):
+            noisy.append(noise[i] * sig + latent_packed[i] * (Float32(1.0) - sig))
+            target.append(noise[i] - latent_packed[i])
+
+        # ── forward (offload, full depth) -> velocity [N_IMG, OUT_CH] ──
+        var fwd = flux_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+            noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
+            base, loader, lora, cos.copy(), sin.copy(),
+            D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+        )
+
+        # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
+        var nout = len(fwd.out)
+        var d_loss = List[Float32]()
+        var sse = 0.0
+        var inv_n = Float32(2.0) / Float32(nout)
+        for i in range(nout):
+            var diff = fwd.out[i] - target[i]
+            sse += Float64(diff) * Float64(diff)
+            d_loss.append(inv_n * diff)
+        var loss = Float32(sse / Float64(nout))
+        if k == 1:
+            first_loss = loss
+        last_loss = loss
+
+        # ── backward (offload, full depth) ──
+        var grads = flux_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+            d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
+            cos.copy(), sin.copy(), fwd,
+            D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
+        )
+
+        # ── grad norm + clip(1.0) ──
+        var gn_before = _clip(grads, CLIP_GRAD_NORM)
+
+        # ── AdamW ──
+        flux_lora_adamw_step(lora, grads, k, LR, ctx)
+
+        var t1 = perf_counter_ns()
+        var secs = Float64(t1 - t0) / 1.0e9
+        var b_absum = Float32(0.0)
+        var b_nonzero = 0
+        for i in range(n_adapters):
+            var bs2 = _absum(lora.ad[i].b)
+            b_absum += bs2
+            if bs2 > 0.0:
+                b_nonzero += 1
+        print("PROG step=", k, " total=", run_steps, " loss=", loss,
+              " grad=", Float32(gn_before), " lr=", LR,
+              " loraB_sum=", b_absum, " loraB_nonzero=", b_nonzero, "/", n_adapters,
+              " nonfinite=", grads.nonfinite_lora_grads, " secs=", Float32(secs))
+
+    print("")
+    print("first_loss=", first_loss, " last_loss=", last_loss)
+    var b_absum_final = Float32(0.0)
+    for i in range(n_adapters):
+        b_absum_final += _absum(lora.ad[i].b)
+    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
+    if trains and (last_loss == last_loss):
+        print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
+              "; loss", first_loss, "->", last_loss,
+              (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        _ = save_flux_lora(lora, String(LORA_DIR) + String("/flux_lora_smoke.safetensors"), ctx)
+    else:
+        print("RESULT: FAIL trains=", trains)

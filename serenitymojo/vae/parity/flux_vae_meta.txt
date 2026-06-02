@@ -1,0 +1,3 @@
+LH=8 LW=8 IH=64 IW=64
+moments_shape=[1, 32, 8, 8] mu_shape=[1, 16, 8, 8]
+mu_mean=-0.144719 mu_std=1.422980

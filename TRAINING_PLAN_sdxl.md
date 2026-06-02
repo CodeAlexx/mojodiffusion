@@ -1,7 +1,10 @@
 # TRAINING_PLAN_sdxl.md — SDXL conv-UNet LoRA training port (pure Mojo)
 
-Status: Phases 1–5 + 5b DONE/VERIFIED. Phase 5b = parity-gated LoRA training step
-(attn+ff on the SpatialTransformer) — SDXL per-model milestone CLOSED (2026-06-01).
+Status: **REAL RUN VERIFIED (2026-06-01).** `train_sdxl_real` trains on the real
+`sdxl_unet_bf16` checkpoint with loss↓ (FIXED smoke, monotone) + LoRA-B 0→nonzero.
+The earlier "REAL-RUN BLOCKER AUDIT" (B1–B4) is CLOSED — see "Phase 6/7 — REAL
+RUN" below. Phases 1–5 + 5b were parity scaffolds at tiny dims; the real-dims
+trainable UNet (B1+B2+B3) + cache fast-path (B4) now exist and are gated.
 Parity-gated, phased.
 Companion to FULL_PORT_TRAINING_PLAN.md (engine strategy) and the Klein/Z-Image
 training port. SDXL is a **convolutional UNet**, not a DiT — its training-block
@@ -196,11 +199,98 @@ proj_out → reshape → FP32 residual. Per-block: LN1→self-attn→res, LN2→
   (`<prefix>.weight` → base key). Phase 7 may add the kohya `lora_unet_*` convention
   (needs a new `training/` save path) — orthogonal to this gate.
 
+### ✅ REAL RUN — DONE/VERIFIED (2026-06-01, this session)
+
+The blocker audit below (B1–B4) was resolved this session. `train_sdxl_real`
+performs a REAL run on the real `sdxl_unet_bf16.safetensors`.
+
+**What was built (composes the gated units at REAL dims — NO new ops/ primitive, Tenet 1):**
+- `models/sdxl/sdxl_real_train.mojo` — the real-dims trainable UNet:
+  `SdxlRealWeights` + `sdxl_real_forward[L]` (activation-saving) +
+  `sdxl_real_backward[L]` + LoRA on all 11 SpatialTransformers. **Resolves B1+B2+B3.**
+  Topology verified line-by-line vs `models/dit/sdxl_unet.mojo::forward` (the
+  real-dims inference reference): conv_in→9 input blocks (2 down)→mid(Res+ST+Res)→
+  9 output blocks (2 up, LIFO skip-concat)→GN→SiLU→conv_out. 17 ResBlocks, 11 STs
+  (depths 2/10), 2 down, 2 up. The reduced stack `sdxl_unet_stack.mojo` was the
+  line-by-line backward template; only the comptime dims + exact real topology changed.
+- `models/sdxl/real_weights.mojo` — `build_sdxl_real_weights(st)` assembles
+  EmbWeights / 17 ResBlockWeights (reusing `load_resblock_weights`) / 11
+  SpatialTransformerWeights / conv-in,out / down,up from the checkpoint in run order.
+  Keys verified against the live 1680-tensor checkpoint (prefix-stripped LDM layout).
+- `training/train_sdxl_real.mojo` — the loop (translation of `train_sdxl.rs`):
+  eps-prediction, scaled-linear ᾱ (β 0.00085→0.012/1000), MSE, clip 1.0, AdamW
+  (β(0.9,0.999) eps1e-8 wd0.01); ADM y = concat(pooled_clip_g[1280],
+  sin_embed_256×6→[1536])→[2816]; context = cached text_embedding [1,77,2048].
+  **Resolves B4 via the cache fast-path** (cache `eri2_sdxl_512_smoke`:
+  latent[1,4,64,64]/pooled[1,1280]/text_embedding[1,77,2048]/time_ids[1,6]).
+
+**GATE RESULTS (measured this session, RUN_RC=0):**
+- `parity/real_finitediff.mojo` (REAL weights, L=16) —
+  **`X-PATH FINITE-DIFF SELF-CONSISTENCY PASSED`**, worst |ratio−1| = 0.0086
+  (composed real-dims backward == grad of composed forward, across all 17
+  ResBlocks/11 STs/2 down/2 up/skips/embeds), 0 nonfinite LoRA grads. This is the
+  Klein composition-defect gate at the real topology.
+- `train_sdxl_real 10` (real `sdxl_unet_bf16`, FIXED smoke, latent 16²) —
+  **loss DECREASED monotonically** 0.6497→0.6470→0.6413→0.6320→0.6186→0.6008→…
+  **LoRA-B grew 0→nonzero**, all **700/700 adapters nonzero** (11 STs × depth ×
+  10 slots), grad finite (nonfinite=0), ~27 s/step. Saves 11 per-ST PEFT files.
+
+**Open / next (not blockers to the milestone):**
+- `LATENT_HW` is a knob; raise to 64 (512px) once activation checkpointing lands
+  (Phase 5 memory note — ST self-attn O(N²) at 512²/1024² exceeds 24 GB with all
+  acts retained). The smoke runs at 16² (real weights, real recipe, real LoRA path).
+- Per-ST PEFT save uses the diffusers-path prefix (`<st>.transformer_blocks.<j>...`);
+  the kohya `lora_unet_*` convention is a `training/`-side save variant if the
+  inference target map needs it.
+
+---
+
+### ⛔ REAL-RUN BLOCKER AUDIT (2026-06-01) — SUPERSEDED (kept for history)
+
+A session tasked with making `train_sdxl_real` perform a REAL run (loss↓ +
+LoRA-B 0→nonzero) audited the tree line-by-line against the two Rust binaries
+(`train_sdxl.rs`, `prepare_sdxl.rs`). Verdict: **BUILT-OUT PARITY SCAFFOLDS ONLY;
+no real-dims runnable path exists.** The Phase 5/5b "DONE" gates are real but
+operate on TINY parity dims, not SDXL dims. Four hard blockers, none of which is
+a translation of the Rust binaries — each is a substantial new port:
+
+| # | Blocker | Evidence (file:fact) | Why it blocks |
+|---|---|---|---|
+| B1 | **Full UNet fwd+bwd is comptime-hardcoded to reduced 8×8 parity dims** | `sdxl_unet_stack.mojo:154-174` — `RB=1, RH0=8, RIN=4, RMC=16, RADM=24, RCCTX=16, RHD=8`. Real SDXL = 4-ch latent @ up to 128², MC=320, ADM=2816, CCTX=2048, HEAD_DIM=64. `conv2d[N,H,W,Cin,...]` takes COMPTIME shapes → a real-dims stack must be written anew. Callers of `*_reduced`/`*_backward` are ONLY `parity/unet_stack_{parity,finitediff}.mojo`. | No real-dims UNet backward exists. |
+| B2 | **Real-dims UNet forward (`models/dit/sdxl_unet.mojo SDXLUNet[LH,LW]`) is INFERENCE-ONLY** | `grep backward\|grad sdxl_unet.mojo` → 0 hits. It has real weights + real dims + full `forward()` but saves NO activations and has NO backward. | The one real-dims forward can't be trained through. |
+| B3 | **No full-UNet-with-LoRA path** | `SdxlStLoraFwd`/`build_sdxl_lora_set` callers (`grep`) = ONLY `parity/lora_stack_parity.mojo` + `parity/lora_step_smoke.mojo`. Phase 5b's LoRA gate covered a SINGLE SpatialTransformer at tiny dims, never the 5 STs inside the conv-UNet topology. | LoRA is not wired into any runnable UNet. |
+| B4 | **No real-weight SDXL/LDM VAE *encoder*** | `models/vae/ldm_decoder.mojo` = DECODE only (`sd15_vae_smoke` decodes). `vae/vae_encode_general.mojo` has ONLY `with_synthetic_weights` (no safetensors loader) AND a single `//2` downsample (`latent_h=IH/2`) — SDXL VAE is /8, 4-ch, 3 downsamples. `klein_encoder.mojo` is a real loader but a DIFFERENT arch (32→128-ch BN-packed). The task's "wire a real-weight loader onto GeneralVaeEncoder" is impossible without first porting the SDXL VAE encoder. | prepare_sdxl can't produce real latents. |
+
+**What IS present and real:** weights `sdxl_unet_bf16.safetensors`
+(`/home/alex/.serenity/models/checkpoints/`), VAE `sdxl_vae.safetensors`
+(`.../vaes/OfficialStableDiffusion/`); real-dims CLIP-L/G encoder with `.load()` +
+`encode_sdxl[...]` (`models/text_encoder/clip_encoder.mojo`); inference UNet
+forward; all `training/` infra (optim, lora_save, schedule, board, on_device_global_norm).
+
+**Minimal path to a real run (translation is NOT enough — these are new ports):**
+1. **B2+B1 merged:** Add an activation-saving forward + a backward to the
+   real-dims `SDXLUNet[LH,LW]` (NOT the reduced stack). This is the bulk of the
+   work — every block (conv_in, 9 in, mid, 9 out, conv_out, embeds, skips) needs a
+   bwd arm at real dims. The reduced stack's bwd logic is the line-by-line template
+   but every `conv2d[...]`/`group_norm` comptime instantiation changes.
+2. **B3:** Inject `SdxlLoraSet` (per-ST, 10 slots) into that real-dims forward/backward.
+3. **B4:** Port the SDXL VAE encoder forward (LDM AutoencoderKL, /8, 4-ch, scale
+   0.13025) with a real-weight loader — OR sidestep prepare by caching latents via
+   a one-off Python/inference path and training from cache only.
+4. Memory: at 1024² (latent 128²) the full fwd+bwd FAR exceeds 24 GB (Phase 5
+   note). Gate at 256²/512² first; activation checkpointing required for 1024².
+
+This session did NOT fake a run. No `train_sdxl_real.mojo` / `sdxl_prepare.mojo`
+was written because both would be non-runnable stubs given B1-B4. The honest next
+step is to build B1/B2 (real-dims UNet backward) as its own parity-gated phase.
+
 ### Phase 6 — VAE encode + text path (latent + conditioning for real training)
 - **Latents:** LDM VAE *encoder* (forward — only the DECODER is ported in
   `models/vae/ldm_decoder.mojo`). Training needs ENCODE (image→latent). Port the
   VAE encoder forward (no backward — VAE is frozen; we only need latents).
   Reuse `decoder2d.mojo` conv/GN/attn kit. Scale 0.13025, shift 0.0.
+  **STATUS (2026-06-01): NOT STARTED — blocker B4 above. `vae_encode_general.mojo`
+  is synthetic-weight + /2-downsample only; no SDXL /8 4-ch encoder, no loader.**
 - **Text:** CLIP-L + CLIP-G encoders exist (`models/text_encoder/clip_encoder.mojo`,
   forward). Training uses CACHED embeds (offline) OR live encode. context [B,77,2048]
   (L⊕G hidden), y [B,2816] (L_pool 768 ⊕ G_text_embeds 1280 ⊕ zeros 768). The
@@ -210,6 +300,12 @@ proj_out → reshape → FP32 residual. Per-block: LN1→self-attn→res, LN2→
   MSE(eps_pred, noise). Reuse `training/schedule.mojo` (add SDXL DDPM eps target).
 
 ### Phase 7 — train_sdxl_real loop policy + LoRA save + full-FT extension
+**STATUS (2026-06-01): BLOCKED on B1/B2/B3 (real-dims UNet fwd-with-acts + bwd +
+LoRA). The loop-policy translation of `train_sdxl.rs` is trivial and ready (cache
+schema: latent[1,4,h,w]/text_embedding[1,77,2048]/pooled[1,1280]/time_ids[1,6];
+ᾱ scaled-linear β 0.00085→0.012; eps target = noise; MSE F32; clip 1.0; AdamW
+β(0.9,0.999) eps1e-8 wd0.01; ADM y = cat(pooled_clip_g[1280], sin_embed_256×6 →
+[1536]) → [1,2816]). But it has nothing to call: no trainable real-dims UNet.**
 - `training/train_sdxl_real.mojo` mirroring `train_klein_real.mojo`: load config
   (sdxl.json) → load UNet weights → attach LoRA (attn + optional LoCon conv) →
   per-step: VAE-encode (or cached latent) → sample timestep+noise → eps target →

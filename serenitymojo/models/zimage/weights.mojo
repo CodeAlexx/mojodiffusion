@@ -98,6 +98,35 @@ def _load_f32_device(
     return cast_tensor(t, STDtype.F32, ctx)
 
 
+# Load ONE block's real weights given an explicit stream prefix
+# (noise_refiner.{i} / context_refiner.{i} / layers.{i}). The diffusers
+# transformer dir (/home/alex/.serenity/models/zimage_base/transformer) stores
+# UNFUSED to_q/to_k/to_v/to_out.0 + per-head norm_q/norm_k under each stream,
+# matching the training stack's separate-projection ZImageBlockWeights. Used by
+# the real trainer to populate nr/cr/main block lists. Mirrors the layers-only
+# loader below.
+def load_zimage_block_weights_prefixed(
+    st: ShardedSafeTensors, prefix: String, ctx: DeviceContext
+) raises -> ZImageBlockWeights:
+    var ap = prefix + String(".attention")
+    var fp = prefix + String(".feed_forward")
+    return ZImageBlockWeights(
+        TArc(_load_f32_device(st, prefix + String(".attention_norm1.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".to_q.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".to_k.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".to_v.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".to_out.0.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_f32_device(st, prefix + String(".attention_norm2.weight"), ctx)),
+        TArc(_load_f32_device(st, prefix + String(".ffn_norm1.weight"), ctx)),
+        TArc(_load_f32_device(st, fp + String(".w1.weight"), ctx)),
+        TArc(_load_f32_device(st, fp + String(".w3.weight"), ctx)),
+        TArc(_load_f32_device(st, fp + String(".w2.weight"), ctx)),
+        TArc(_load_f32_device(st, prefix + String(".ffn_norm2.weight"), ctx)),
+    )
+
+
 # Load main-layer block `block_idx`'s real weights (device-resident).
 def load_zimage_block_weights(
     st: ShardedSafeTensors, block_idx: Int, ctx: DeviceContext

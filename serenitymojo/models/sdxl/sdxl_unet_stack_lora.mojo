@@ -498,7 +498,7 @@ def _basic_block_lora_backward[
 # spatial_transformer_{forward,backward}; base proj_in/proj_out/group_norm are
 # NOT LoRA targets (frozen, grads discarded). d_x / d_context are load-bearing.
 # ═══════════════════════════════════════════════════════════════════════════════
-struct SdxlStLoraActs(Movable):
+struct SdxlStLoraActs(Copyable, Movable):
     var x: TArc                # ST input [B,H,W,C] NHWC
     var xn: TArc               # GroupNorm out
     var tok_in: TArc           # proj_in output [B,N,C] (and the hidden seed)

@@ -81,6 +81,15 @@ struct Qwen3Config(Copyable, Movable, ImplicitlyCopyable):
         """Klein 9B text encoder config (Qwen3-8B, hidden=4096)."""
         return Qwen3Config(4096, 36, 32, 8, 128, Float32(1e-6), Float64(1e6))
 
+    @staticmethod
+    def qwen3_06b() -> Qwen3Config:
+        """Qwen3-0.6B text encoder config (Anima text path).
+        hidden=1024, layers=28, heads=16, kv_heads=8 (GQA n_rep=2),
+        head_dim=128, eps=1e-6, theta=1e6. Verified from
+        qwen_3_06b_base.safetensors (q_proj[2048,1024]=16x128;
+        k_proj[1024,1024]=8x128)."""
+        return Qwen3Config(1024, 28, 16, 8, 128, Float32(1e-6), Float64(1e6))
+
 
 def klein_extract_layers() -> List[Int]:
     """Klein conditioning layers, 0-indexed: [8, 17, 26]."""
@@ -846,6 +855,22 @@ def _sdpa_dispatch(
             return sdpa[1, 256, 32, 128](q, k, v, mask, scale, ctx)
         if seq == 512:
             return sdpa[1, 512, 32, 128](q, k, v, mask, scale, ctx)
+    # Qwen3-0.6B (Anima text path): H=16, Dh=128.
+    if h == 16 and dh == 128:
+        if seq == 8:
+            return sdpa[1, 8, 16, 128](q, k, v, mask, scale, ctx)
+        if seq == 16:
+            return sdpa[1, 16, 16, 128](q, k, v, mask, scale, ctx)
+        if seq == 32:
+            return sdpa[1, 32, 16, 128](q, k, v, mask, scale, ctx)
+        if seq == 64:
+            return sdpa[1, 64, 16, 128](q, k, v, mask, scale, ctx)
+        if seq == 128:
+            return sdpa[1, 128, 16, 128](q, k, v, mask, scale, ctx)
+        if seq == 256:
+            return sdpa[1, 256, 16, 128](q, k, v, mask, scale, ctx)
+        if seq == 512:
+            return sdpa[1, 512, 16, 128](q, k, v, mask, scale, ctx)
     raise Error(
         String("sdpa_dispatch: unsupported (seq,h,dh)=(")
         + String(seq) + "," + String(h) + "," + String(dh)

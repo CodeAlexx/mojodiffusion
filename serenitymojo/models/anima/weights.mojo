@@ -185,6 +185,39 @@ def load_anima_block_weights_f32(
     )
 
 
+# Load Anima block `block_idx` for the DEVICE-RESIDENT fast path: big projection
+# weights stay BF16 (memory: 28 blocks ≈ 3.7 GiB), but the tiny norm weights
+# (q/k_norm [128]) are upcast to F32 so the F32 residual stream's per-head
+# rms_norm dtype-matches (rms_norm needs x.dtype == weight.dtype). The AdaLN-mod
+# Linears and projections accept F32 x + BF16 weight via linear's mixed_base path.
+def load_anima_block_weights_bf16_normf32(
+    st: SafeTensors, block_idx: Int, ctx: DeviceContext
+) raises -> AnimaBlockWeights:
+    var bp = String("net.blocks.") + String(block_idx) + String(".")
+    return AnimaBlockWeights(
+        _load_tensor(st, bp + String("adaln_modulation_self_attn.1.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_self_attn.2.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_cross_attn.1.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_cross_attn.2.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_mlp.1.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_mlp.2.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.q_proj.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.k_proj.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.v_proj.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.output_proj.weight"), ctx),
+        _load_tensor_f32(st, bp + String("self_attn.q_norm.weight"), ctx),
+        _load_tensor_f32(st, bp + String("self_attn.k_norm.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.q_proj.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.k_proj.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.v_proj.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.output_proj.weight"), ctx),
+        _load_tensor_f32(st, bp + String("cross_attn.q_norm.weight"), ctx),
+        _load_tensor_f32(st, bp + String("cross_attn.k_norm.weight"), ctx),
+        _load_tensor(st, bp + String("mlp.layer1.weight"), ctx),
+        _load_tensor(st, bp + String("mlp.layer2.weight"), ctx),
+    )
+
+
 # Load ALL `num_blocks` blocks' F32 weights into a List (resident stack).
 def load_anima_all_blocks_f32(
     st: SafeTensors, num_blocks: Int, ctx: DeviceContext

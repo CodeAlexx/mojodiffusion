@@ -31,20 +31,24 @@
 #
 # Mojo 1.0.0b1: def not fn; Tensor move-only; host List[Float32] carriers.
 
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
 from std.memory import ArcPointer
+from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.tensor_algebra import reshape, slice, add, mul, concat
-from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.linalg_backward import (
+    linear_backward, linear_backward_dx, linear_backward_dw,
+)
 from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
 from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.models.anima.weights import (
     AnimaBlockWeights, AnimaStackBase, load_anima_block_weights_f32,
 )
@@ -54,6 +58,8 @@ from serenitymojo.models.anima.lora_block import (
     SLOT_SA_Q, SLOT_SA_K, SLOT_SA_V, SLOT_SA_O,
     SLOT_CA_Q, SLOT_CA_K, SLOT_CA_V, SLOT_CA_O, SLOT_MLP1, SLOT_MLP2,
     anima_block_lora_forward, anima_block_lora_backward,
+    AnimaLoraAdapterDevice, AnimaBlockLoraDevice, anima_lora_adapter_to_device,
+    anima_block_lora_forward_device_tensor, anima_block_lora_backward_device_tensors,
 )
 from serenitymojo.models.anima.anima_stack import (
     AnimaStackForward, _add_lists, _zeros, _ones, _t, _linear_wdev, _row2, _sh3,
@@ -487,6 +493,258 @@ def anima_stack_lora_backward_streamed[
     )
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# DEVICE-RESIDENT LoRA STACK (the fast hot path; mirrors Z-Image's
+# zimage_stack_lora_forward_main_device / _backward_main_device). All 28 blocks +
+# saved block-input activations + LoRA A/B stay DEVICE tensors across forward AND
+# backward recompute. NO to_host()/from_host() inside the block loop. The LoRA set
+# is uploaded to device ONCE per step by the trainer (anima_lora_set_to_device).
+# Base block weights are passed resident (BF16 production / F32 parity); the F32
+# residual stream is preserved via linear's mixed_base path.
+# ═════════════════════════════════════════════════════════════════════════════
+struct AnimaLoraDeviceSet(Copyable, Movable):
+    var ad: List[AnimaLoraAdapterDevice]   # num_blocks * ANIMA_SLOTS
+    var num_blocks: Int
+    var rank: Int
+
+    def __init__(
+        out self, var ad: List[AnimaLoraAdapterDevice], num_blocks: Int, rank: Int
+    ):
+        self.ad = ad^
+        self.num_blocks = num_blocks
+        self.rank = rank
+
+
+def anima_lora_set_to_device(
+    set: AnimaLoraSet, dt: STDtype, ctx: DeviceContext
+) raises -> AnimaLoraDeviceSet:
+    var ad = List[AnimaLoraAdapterDevice]()
+    var n = set.num_blocks * ANIMA_SLOTS
+    for i in range(n):
+        ad.append(anima_lora_adapter_to_device(set.ad[i], dt, ctx))
+    return AnimaLoraDeviceSet(ad^, set.num_blocks, set.rank)
+
+
+def _block_lora_dev_for(set: AnimaLoraDeviceSet, bi: Int) -> AnimaBlockLoraDevice:
+    var base = bi * ANIMA_SLOTS
+    return AnimaBlockLoraDevice(
+        set.ad[base + SLOT_SA_Q].copy(), set.ad[base + SLOT_SA_K].copy(),
+        set.ad[base + SLOT_SA_V].copy(), set.ad[base + SLOT_SA_O].copy(),
+        set.ad[base + SLOT_CA_Q].copy(), set.ad[base + SLOT_CA_K].copy(),
+        set.ad[base + SLOT_CA_V].copy(), set.ad[base + SLOT_CA_O].copy(),
+        set.ad[base + SLOT_MLP1].copy(), set.ad[base + SLOT_MLP2].copy(),
+    )
+
+
+# Bulk D2H of the flat d_a/d_b device tensors into the host List[List[Float32]]
+# grad layout (parallel to AnimaLoraSet). ONE host buffer + ONE sync (mirrors
+# zimage _zimage_tensor_grads_to_host).
+struct _AnimaHostGradLists(Movable):
+    var d_a: List[List[Float32]]
+    var d_b: List[List[Float32]]
+
+    def __init__(out self, var d_a: List[List[Float32]], var d_b: List[List[Float32]]):
+        self.d_a = d_a^
+        self.d_b = d_b^
+
+
+def _host_grad_slice(host: HostBuffer[DType.uint8], offset: Int, numel: Int) -> List[Float32]:
+    var out = List[Float32]()
+    var fp = (host.unsafe_ptr() + offset).bitcast[Float32]()
+    for i in range(numel):
+        out.append(fp[i])
+    return out^
+
+
+def _anima_tensor_grads_to_host(
+    indices: List[Int], d_a_t: List[TArc], d_b_t: List[TArc],
+    total_slots: Int, ctx: DeviceContext,
+) raises -> _AnimaHostGradLists:
+    var total_bytes = 0
+    for i in range(len(d_a_t)):
+        total_bytes += d_a_t[i][].nbytes()
+    for i in range(len(d_b_t)):
+        total_bytes += d_b_t[i][].nbytes()
+
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](total_bytes)
+    var a_off = List[Int](); var a_num = List[Int]()
+    var b_off = List[Int](); var b_num = List[Int]()
+    var cursor = 0
+    for i in range(len(d_a_t)):
+        a_off.append(cursor); a_num.append(d_a_t[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, d_a_t[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=d_a_t[i][].buf)
+        cursor += d_a_t[i][].nbytes()
+    for i in range(len(d_b_t)):
+        b_off.append(cursor); b_num.append(d_b_t[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, d_b_t[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=d_b_t[i][].buf)
+        cursor += d_b_t[i][].nbytes()
+    ctx.synchronize()
+
+    var d_a_flat = List[List[Float32]]()
+    var d_b_flat = List[List[Float32]]()
+    for _ in range(total_slots):
+        d_a_flat.append(List[Float32]())
+        d_b_flat.append(List[Float32]())
+    for i in range(len(indices)):
+        var flat = indices[i]
+        d_a_flat[flat] = _host_grad_slice(host, a_off[i], a_num[i])
+        d_b_flat[flat] = _host_grad_slice(host, b_off[i], b_num[i])
+    return _AnimaHostGradLists(d_a_flat^, d_b_flat^)
+
+
+# Save the t_silu(t_cond) precompute on device ONCE: silu of the host t_cond.
+def anima_stack_lora_forward_device_resident[
+    H: Int, Dh: Int, S_IMG: Int, S_TXT: Int
+](
+    patches: List[Float32],
+    t_cond: List[Float32], base_adaln: List[Float32], context: List[Float32],
+    base: AnimaStackBase, blocks: List[AnimaBlockWeights], lora: AnimaLoraDeviceSet,
+    cos: Tensor, sin: Tensor,
+    B: Int, D: Int, JOINT: Int, F: Int, IN_PATCH: Int, OUT_PATCH: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> AnimaStackForward:
+    var num_blocks = len(blocks)
+
+    # patch embed (base, F32 weight) -> [B*S_img, D]
+    var x_emb = _linear_wdev(patches, base.x_embed[], B * S_IMG, IN_PATCH, ctx)
+
+    # upload the shared per-step conditioning ONCE (device tensors).
+    var t_silu_dev = silu(_t(t_cond.copy(), [B, ANIMA_HIDDEN], ctx), ctx)
+    var t_silu_arc = TArc(t_silu_dev^)
+    var base_t_arc = TArc(_t(base_adaln.copy(), [B, 3 * D], ctx))
+    var ctx_t_arc = TArc(_t(context.copy(), [B, S_TXT, JOINT], ctx))
+
+    var x_arc = TArc(_t(x_emb.copy(), [B, S_IMG, D], ctx))
+    var blk_x_in = List[TArc]()
+    for bi in range(num_blocks):
+        blk_x_in.append(x_arc.copy())   # device block-input checkpoint
+        var bl = _block_lora_dev_for(lora, bi)
+        var fwd = anima_block_lora_forward_device_tensor[H, Dh, S_IMG, S_TXT](
+            x_arc.copy(), t_silu_arc.copy(), base_t_arc.copy(), ctx_t_arc.copy(),
+            blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx,
+        )
+        x_arc = fwd.out.copy()
+
+    # ── final layer (identical to base/streamed stack; device-resident) ──
+    var fl_h = linear(t_silu_arc[], base.fl_mod1[], Optional[Tensor](None), ctx)
+    var fl_modout = linear(fl_h, base.fl_mod2[], Optional[Tensor](None), ctx)
+    var base_half = slice(base_t_arc[], 1, 0, 2 * D, ctx)
+    var fl_added = add(fl_modout, base_half, ctx)
+    var fl_shift = slice(fl_added, 1, 0, D, ctx)
+    var fl_scale = slice(fl_added, 1, D, D, ctx)
+    var ln_ones = _t(_ones(D), [D], ctx)
+    var ln_zeros = _t(_zeros(D), [D], ctx)
+    var fl_ln = layer_norm(x_arc[], ln_ones, ln_zeros, eps, ctx)
+    var scale3 = reshape(fl_scale, _sh3(B, 1, D), ctx)
+    var shift3 = reshape(fl_shift, _sh3(B, 1, D), ctx)
+    var one = _t(_ones(B * D), [B, 1, D], ctx)
+    var factor = add(scale3, one, ctx)
+    var fl_scaled = mul(fl_ln, factor, ctx)
+    var fl_xmod = add(fl_scaled, shift3, ctx)
+    var fl_xmod_2d = reshape(fl_xmod, _row2(B * S_IMG, D), ctx)
+    var out = linear(fl_xmod_2d, base.fl_lin[], Optional[Tensor](None), ctx).to_host(ctx)
+
+    return AnimaStackForward(
+        out^, x_emb.copy(), blk_x_in^,
+        x_arc.copy(), TArc(fl_ln^),
+        TArc(fl_h^), TArc(fl_shift^), TArc(fl_scale^), TArc(fl_xmod^),
+    )
+
+
+def anima_stack_lora_backward_device_resident[
+    H: Int, Dh: Int, S_IMG: Int, S_TXT: Int
+](
+    d_out: List[Float32],
+    patches: List[Float32],
+    t_cond: List[Float32], base_adaln: List[Float32], context: List[Float32],
+    base: AnimaStackBase, blocks: List[AnimaBlockWeights], lora: AnimaLoraDeviceSet,
+    cos: Tensor, sin: Tensor,
+    saved: AnimaStackForward,
+    B: Int, D: Int, JOINT: Int, F: Int, IN_PATCH: Int, OUT_PATCH: Int, eps: Float32,
+    ctx: DeviceContext,
+    trace: Bool = False,
+) raises -> AnimaLoraGrads:
+    var num_blocks = len(blocks)
+    var ln_ones = _t(_ones(D), [D], ctx)
+
+    # shared conditioning (re-uploaded once for the backward recompute).
+    var t_silu_dev = silu(_t(t_cond.copy(), [B, ANIMA_HIDDEN], ctx), ctx)
+    var t_silu_arc = TArc(t_silu_dev^)
+    var base_t_arc = TArc(_t(base_adaln.copy(), [B, 3 * D], ctx))
+    var ctx_t_arc = TArc(_t(context.copy(), [B, S_TXT, JOINT], ctx))
+
+    var d_t_silu_acc = _t(_zeros(B * ANIMA_HIDDEN), [B, ANIMA_HIDDEN], ctx)
+
+    # ── final-layer backward (frozen base; dx-only) ──
+    var fl_xmod_2d = reshape(saved.fl_xmod[], _row2(B * S_IMG, D), ctx)
+    var d_fl_xmod_2d = linear_backward_dx(
+        _t(d_out, [B * S_IMG, OUT_PATCH], ctx), base.fl_lin[], B * S_IMG, D, OUT_PATCH, ctx,
+    )
+    var d_fl_xmod_3d = reshape(d_fl_xmod_2d, _sh3(B, S_IMG, D), ctx)
+    var mbf = modulate_backward(d_fl_xmod_3d, saved.fl_ln[], saved.fl_scale[], ctx)
+    var d_x_final = layer_norm_backward_dx(mbf.d_x, saved.x_final[], ln_ones, eps, ctx)
+    var d_x = TArc(d_x_final^)
+
+    var d_fl_added = concat(1, ctx, mbf.d_shift, mbf.d_scale)
+    var d_base_fl = _scatter_first(d_fl_added.to_host(ctx), B, 2 * D, 3 * D)
+    var fl_ts = silu(_t(t_cond.copy(), [B, ANIMA_HIDDEN], ctx), ctx)
+    var d_fl_modh = linear_backward_dx(d_fl_added, base.fl_mod2[], B, 256, 2 * D, ctx)
+    var d_fl_tsilu = linear_backward_dx(d_fl_modh, base.fl_mod1[], B, ANIMA_HIDDEN, 256, ctx)
+    d_t_silu_acc = add(d_t_silu_acc, d_fl_tsilu, ctx)
+
+    # ── block backward (REVERSE; per-block device recompute) ──
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+    var bi = num_blocks - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, bi)
+        var refwd = anima_block_lora_forward_device_tensor[H, Dh, S_IMG, S_TXT](
+            saved.blk_x_in[bi].copy(), t_silu_arc.copy(), base_t_arc.copy(), ctx_t_arc.copy(),
+            blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx,
+        )
+        var do_trace = trace and (bi == num_blocks - 1)
+        var bg = anima_block_lora_backward_device_tensors[H, Dh, S_IMG, S_TXT](
+            d_x[], refwd.saved, blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx, do_trace,
+        )
+        d_x = bg.d_x.copy()
+        d_t_silu_acc = add(d_t_silu_acc, bg.d_t_silu[], ctx)
+        var base_idx = bi * ANIMA_SLOTS
+        for s in range(ANIMA_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    # ── patch-embed backward (frozen base; d_patches load-bearing) ──
+    var d_x_2d = reshape(d_x[], _row2(B * S_IMG, D), ctx)
+    var d_patches_t = linear_backward_dx(d_x_2d, base.x_embed[], B * S_IMG, IN_PATCH, D, ctx)
+    var d_patches = d_patches_t.to_host(ctx)
+    var d_x_embed = List[Float32]()
+
+    # ── ONE bulk D2H of all LoRA grads ──
+    var host_grads = _anima_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_blocks * ANIMA_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    var d_t_silu_host = d_t_silu_acc.to_host(ctx)
+    var empty_fl1 = List[Float32]()
+    var empty_fl2 = List[Float32]()
+    var empty_fll = List[Float32]()
+    return AnimaLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        d_patches^, d_t_silu_host^, d_base_fl^,
+        d_x_embed^, empty_fll^, empty_fl1^, empty_fl2^,
+        nonfinite,
+    )
+
+
 # ── AdamW step on EVERY adapter (reuses the proven per-adapter _lora_adamw) ───
 def anima_lora_adamw_step(
     mut set: AnimaLoraSet, grads: AnimaLoraGrads, t: Int, lr: Float32,
@@ -550,6 +808,87 @@ def save_anima_lora(set: AnimaLoraSet, path: String, ctx: DeviceContext) raises 
                 set.ad[bi * ANIMA_SLOTS + s].copy(),
             ))
     return save_lora_peft(named, path, ctx)
+
+
+# ── OneTrainer diffusers-state-dict key naming (delta 5) ─────────────────────
+# Mirrors what AnimaLoRASaver dumps: raw transformer_lora.state_dict() of an OT
+# LoRAModuleWrapper(prefix="transformer", filter=attn1,attn2,ff). Each LoRAModule's
+# prefix = "transformer.<diffusers module name>." and state_dict emits per module:
+#   <prefix>.lora_down.weight   [rank, in]   (== LoraAdapter.a)   LoRAModule.lora_down
+#   <prefix>.lora_up.weight     [out, rank]  (== LoraAdapter.b)   LoRAModule.lora_up
+#   <prefix>.alpha              scalar       (register_buffer "alpha", LoRAModule.py:538)
+# The diffusers module names come from AnimaModel.diffusers_to_original() (the exact
+# inverse rename of the saved Cosmos checkpoint):
+#   self_attn   -> attn1.{to_q,to_k,to_v,to_out.0}     (AnimaModel.py:44-47)
+#   cross_attn  -> attn2.{to_q,to_k,to_v,to_out.0}     (AnimaModel.py:52-55)
+#   mlp.layer1  -> ff.net.0.proj   mlp.layer2 -> ff.net.2  (AnimaModel.py:58-59)
+# LoRAModuleWrapper.__create_modules names children via orig_module.named_modules()
+# (LoRAModule.py:897) -> "transformer_blocks.{i}.{attn1.to_q...}"; prefix prepended
+# with "transformer." (AnimaLoRASetup.py:62). So the full OT key is:
+#   transformer.transformer_blocks.{i}.{module}.lora_down.weight  etc.
+def _anima_ot_module(slot: Int) -> String:
+    if slot == SLOT_SA_Q:
+        return String("attn1.to_q")
+    elif slot == SLOT_SA_K:
+        return String("attn1.to_k")
+    elif slot == SLOT_SA_V:
+        return String("attn1.to_v")
+    elif slot == SLOT_SA_O:
+        return String("attn1.to_out.0")
+    elif slot == SLOT_CA_Q:
+        return String("attn2.to_q")
+    elif slot == SLOT_CA_K:
+        return String("attn2.to_k")
+    elif slot == SLOT_CA_V:
+        return String("attn2.to_v")
+    elif slot == SLOT_CA_O:
+        return String("attn2.to_out.0")
+    elif slot == SLOT_MLP1:
+        return String("ff.net.0.proj")
+    return String("ff.net.2")
+
+
+def _anima_ot_prefix(block_idx: Int, slot: Int) -> String:
+    return (String("transformer.transformer_blocks.") + String(block_idx)
+            + String(".") + _anima_ot_module(slot))
+
+
+def anima_ot_prefixes(num_blocks: Int) -> List[String]:
+    var out = List[String]()
+    for bi in range(num_blocks):
+        for s in range(ANIMA_SLOTS):
+            out.append(_anima_ot_prefix(bi, s))
+    return out^
+
+
+# ── SAVE every adapter in OneTrainer diffusers key naming (OT-loadable) ───────
+# Writes lora_down.weight [rank,in] / lora_up.weight [out,rank] / alpha (scalar)
+# per module, byte-exact to AnimaLoRASaver's transformer_lora.state_dict() layout.
+def save_anima_lora_ot(
+    set: AnimaLoraSet, alpha: Float32, path: String, ctx: DeviceContext
+) raises -> Int:
+    var names = List[String]()
+    var tensors = List[ArcPointer[Tensor]]()
+    for bi in range(set.num_blocks):
+        for s in range(ANIMA_SLOTS):
+            var ad = set.ad[bi * ANIMA_SLOTS + s].copy()
+            var pfx = _anima_ot_prefix(bi, s)
+            if len(ad.a) != ad.rank * ad.in_f:
+                raise Error(String("save_anima_lora_ot: A numel mismatch for ") + pfx)
+            if len(ad.b) != ad.out_f * ad.rank:
+                raise Error(String("save_anima_lora_ot: B numel mismatch for ") + pfx)
+            var a_sh = List[Int](); a_sh.append(ad.rank); a_sh.append(ad.in_f)
+            var b_sh = List[Int](); b_sh.append(ad.out_f); b_sh.append(ad.rank)
+            var al_sh = List[Int](); al_sh.append(1)
+            var al_v = List[Float32](); al_v.append(alpha)
+            names.append(pfx + String(".lora_down.weight"))
+            tensors.append(ArcPointer(Tensor.from_host(ad.a.copy(), a_sh^, STDtype.F32, ctx)))
+            names.append(pfx + String(".lora_up.weight"))
+            tensors.append(ArcPointer(Tensor.from_host(ad.b.copy(), b_sh^, STDtype.F32, ctx)))
+            names.append(pfx + String(".alpha"))
+            tensors.append(ArcPointer(Tensor.from_host(al_v^, al_sh^, STDtype.F32, ctx)))
+    save_safetensors(names, tensors, path, ctx)
+    return set.num_blocks * ANIMA_SLOTS
 
 
 # ── RESUME: load the adapter A/B back from a save_anima_lora file ────────────

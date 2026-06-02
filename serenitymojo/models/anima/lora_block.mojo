@@ -49,10 +49,13 @@ from std.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt as fsqrt
 from std.memory import ArcPointer
+from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
-from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.linalg_backward import (
+    linear_backward, linear_backward_dx, linear_backward_dw,
+)
 
 # REUSE the trainer's LoRA structs (the target authority).
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
@@ -60,13 +63,15 @@ from serenitymojo.training.train_step import LoraAdapter, LoraGrads
 # Forward + backward ops shared with the base block (Tenet 1: nothing new here).
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import gelu, silu
-from serenitymojo.ops.tensor_algebra import reshape, slice, add, mul, concat
+from serenitymojo.ops.tensor_algebra import (
+    reshape, reshape_in_place, slice, add, mul, mul_scalar, concat,
+)
 from serenitymojo.ops.reduce import reduce_sum
 from serenitymojo.ops.rope import rope_halfsplit
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.models.dit.sdxl_attention import sdxl_sdpa
 from serenitymojo.ops.norm_backward import (
-    rms_norm_backward, layer_norm_backward_dx,
+    rms_norm_backward, rms_norm_backward_dx, layer_norm_backward_dx,
 )
 from serenitymojo.ops.activation_backward import silu_backward, gelu_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward
@@ -214,6 +219,143 @@ def anima_lora_bwd(
     var d_x_lo = lbA.d_x.to_host(ctx)                # [M,in_f]
     var d_a = lbA.d_w.to_host(ctx)                   # [rank,in_f]
     return AnimaLoraGrads(d_a^, d_b^, d_x_lo^)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVICE-RESIDENT LoRA (mirrors models/zimage/lora_block.mojo ZImageLoraAdapterDevice
+# + zimage_lora_apply_device + zimage_lora_bwd_device_resident_tensors). The adapter
+# A/B live as device Tensors (BF16 for production, F32 for the parity gate), uploaded
+# ONCE per step. forward = two device linear()s (F32-out via mixed_base when BF16);
+# backward = linear_backward_dx/_dw on device → d_a/d_b/d_x stay DEVICE tensors.
+# ══════════════════════════════════════════════════════════════════════════════
+struct AnimaLoraAdapterDevice(Copyable, Movable):
+    var a: TArc
+    var b: TArc
+    var rank: Int
+    var in_f: Int
+    var out_f: Int
+    var scale: Float32
+
+    def __init__(
+        out self, var a: TArc, var b: TArc,
+        rank: Int, in_f: Int, out_f: Int, scale: Float32,
+    ):
+        self.a = a^
+        self.b = b^
+        self.rank = rank
+        self.in_f = in_f
+        self.out_f = out_f
+        self.scale = scale
+
+
+def anima_lora_adapter_to_device(
+    lo: LoraAdapter, dt: STDtype, ctx: DeviceContext
+) raises -> AnimaLoraAdapterDevice:
+    return AnimaLoraAdapterDevice(
+        TArc(Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], dt, ctx)),
+        TArc(Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], dt, ctx)),
+        lo.rank, lo.in_f, lo.out_f, lo.scale,
+    )
+
+
+# base_y[M,out] + scale·((x @ Aᵀ) @ Bᵀ). x is the SAME device tensor the base
+# linear consumes; output stays F32 (mixed_base when adapters are BF16).
+def anima_lora_apply_device(
+    var base_y: Tensor, x: Tensor, lo: AnimaLoraAdapterDevice,
+    M: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var nb1 = Optional[Tensor](None)
+    var t = linear(x, lo.a[], nb1^, ctx)            # [M,rank] F32
+    var nb2 = Optional[Tensor](None)
+    var dy = linear(t, lo.b[], nb2^, ctx)           # [M,out]  F32
+    var contrib = mul_scalar(dy, lo.scale, ctx)
+    return add(base_y^, contrib^, ctx)
+
+
+# LoRA backward as DEVICE tensors. Returns d_a/d_b (F32) and the LoRA branch's
+# d_x [M,in] (F32). Mirrors zimage_lora_bwd_device_resident_tensors.
+struct AnimaLoraDeviceGradTensors(Copyable, Movable):
+    var d_a: TArc
+    var d_b: TArc
+    var d_x: TArc
+
+    def __init__(out self, var d_a: TArc, var d_b: TArc, var d_x: TArc):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_x = d_x^
+
+
+def anima_lora_bwd_device_tensors(
+    d_contrib: Tensor, x: Tensor, lo: AnimaLoraAdapterDevice,
+    M: Int, ctx: DeviceContext,
+) raises -> AnimaLoraDeviceGradTensors:
+    var nb_t = Optional[Tensor](None)
+    var t = linear(x, lo.a[], nb_t^, ctx)           # [M,rank] F32
+    var d_dy = mul_scalar(d_contrib, lo.scale, ctx) # [M,out]  F32
+
+    var d_t = linear_backward_dx(d_dy, lo.b[], M, lo.rank, lo.out_f, ctx)   # [M,rank]
+    var d_b_t = linear_backward_dw(d_dy, t, M, lo.rank, lo.out_f, ctx)      # [out,rank]
+
+    var d_x_lo = linear_backward_dx(d_t, lo.a[], M, lo.in_f, lo.rank, ctx)  # [M,in]
+    var d_a_t = linear_backward_dw(d_t, x, M, lo.in_f, lo.rank, ctx)        # [rank,in]
+    return AnimaLoraDeviceGradTensors(TArc(d_a_t^), TArc(d_b_t^), TArc(d_x_lo^))
+
+
+# ── per-block device LoRA carrier: the 10 device adapters (slot order canonical) ─
+struct AnimaBlockLoraDevice(Copyable, Movable):
+    var sa_q: AnimaLoraAdapterDevice
+    var sa_k: AnimaLoraAdapterDevice
+    var sa_v: AnimaLoraAdapterDevice
+    var sa_out: AnimaLoraAdapterDevice
+    var ca_q: AnimaLoraAdapterDevice
+    var ca_k: AnimaLoraAdapterDevice
+    var ca_v: AnimaLoraAdapterDevice
+    var ca_out: AnimaLoraAdapterDevice
+    var mlp1: AnimaLoraAdapterDevice
+    var mlp2: AnimaLoraAdapterDevice
+
+    def __init__(
+        out self,
+        var sa_q: AnimaLoraAdapterDevice, var sa_k: AnimaLoraAdapterDevice,
+        var sa_v: AnimaLoraAdapterDevice, var sa_out: AnimaLoraAdapterDevice,
+        var ca_q: AnimaLoraAdapterDevice, var ca_k: AnimaLoraAdapterDevice,
+        var ca_v: AnimaLoraAdapterDevice, var ca_out: AnimaLoraAdapterDevice,
+        var mlp1: AnimaLoraAdapterDevice, var mlp2: AnimaLoraAdapterDevice,
+    ):
+        self.sa_q = sa_q^; self.sa_k = sa_k^; self.sa_v = sa_v^; self.sa_out = sa_out^
+        self.ca_q = ca_q^; self.ca_k = ca_k^; self.ca_v = ca_v^; self.ca_out = ca_out^
+        self.mlp1 = mlp1^; self.mlp2 = mlp2^
+
+
+# proj-backward: frozen-base d_x (BF16/F32 weight) + LoRA branch d_x (summed when
+# keep_dx). Returns the summed d_x + the LoRA d_a/d_b DEVICE tensors. For frozen
+# cross-attn k/v inputs keep_dx=False (their base d_x flows into frozen context).
+struct _ProjTensorGrads(Movable):
+    var d_x: Tensor
+    var d_a: TArc
+    var d_b: TArc
+
+    def __init__(out self, var d_x: Tensor, var d_a: TArc, var d_b: TArc):
+        self.d_x = d_x^
+        self.d_a = d_a^
+        self.d_b = d_b^
+
+
+def _proj_bwd_with_lora_device_tensors(
+    d_y: Tensor, x_in: Tensor, w: Tensor,
+    lo: AnimaLoraAdapterDevice,
+    M: Int, in_f: Int, out_f: Int, keep_dx: Bool,
+    ctx: DeviceContext,
+) raises -> _ProjTensorGrads:
+    var lg = anima_lora_bwd_device_tensors(d_y, x_in, lo, M, ctx)
+    if keep_dx:
+        var base_dx = linear_backward_dx(d_y, w, M, in_f, out_f, ctx)
+        var summed = add(base_dx^, lg.d_x[], ctx)
+        return _ProjTensorGrads(summed^, lg.d_a.copy(), lg.d_b.copy())
+    # frozen-context input: base d_x is discarded; return a placeholder d_x (the
+    # caller ignores it for ca k/v). Keep the LoRA d_a/d_b.
+    var base_dx2 = linear_backward_dx(d_y, w, M, in_f, out_f, ctx)
+    return _ProjTensorGrads(base_dx2^, lg.d_a.copy(), lg.d_b.copy())
 
 
 # ── per-block LoRA carrier: the 10 optional adapters (slot order is canonical) ──
@@ -428,6 +570,193 @@ def anima_block_lora_forward[
         sa_sub^, ca_sub^, mlp_sub^, sa_attn^, ca_attn^, TArc(mlp_h1^), TArc(mlp_ha^),
     )
     return AnimaBlockForward(out_host^, saved^)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVICE-RESIDENT LoRA-aware block forward. Mirrors anima_block_lora_forward but:
+#   * x_arc enters as a DEVICE Tensor (no host List[Float32] carrier);
+#   * the 10 LoRA projections use anima_lora_apply_device (no to_host per proj);
+#   * the output stays a DEVICE Tensor (TArc) — no per-block to_host/from_host;
+#   * the F32 residual stream is preserved (BF16 base weights give F32 via
+#     linear's mixed_base path) so parity vs the host path holds at F32 LoRA.
+# Saves the SAME AnimaBlockSaved struct contract, so the existing device backward
+# consumes it unchanged.
+# ══════════════════════════════════════════════════════════════════════════════
+struct AnimaBlockForwardLoraTensor(Movable):
+    var out: TArc
+    var saved: AnimaBlockSaved
+
+    def __init__(out self, var out: TArc, var saved: AnimaBlockSaved):
+        self.out = out^
+        self.saved = saved^
+
+
+def anima_block_lora_forward_device_tensor[
+    H: Int, Dh: Int, S_IMG: Int, S_TXT: Int
+](
+    x_arc: TArc,                 # [B,S_img,D] F32 residual-stream input (DEVICE)
+    t_silu_arc: TArc,            # [B,2048] silu(t_cond) — uploaded ONCE per step
+    base_t_arc: TArc,            # [B,6144] base_adaln — uploaded ONCE per step
+    ctx_t_arc: TArc,             # [B,S_txt,1024] frozen text context — ONCE per step
+    w: AnimaBlockWeights, lora: AnimaBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    B: Int, D: Int, JOINT: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> AnimaBlockForwardLoraTensor:
+    var ln_ones = _t(_ones(D), [D], ctx)
+    var ln_zeros = _t(_zeros(D), [D], ctx)
+    var sa_scale = Float32(1.0) / fsqrt(Float32(Dh))
+
+    # ── sub-block 1: SELF-ATTENTION ──────────────────────────────────────────
+    var sa_h = linear(t_silu_arc[], w.sa_mod1[], Optional[Tensor](None), ctx)   # [B,256]
+    var sa_modout = linear(sa_h, w.sa_mod2[], Optional[Tensor](None), ctx)
+    var sa_added = add(sa_modout, base_t_arc[], ctx)
+    var sa_shift = slice(sa_added, 1, 0, D, ctx)
+    var sa_scalev = slice(sa_added, 1, D, D, ctx)
+    var sa_gate = slice(sa_added, 1, 2 * D, D, ctx)
+
+    var sa_ln = layer_norm(x_arc[], ln_ones, ln_zeros, eps, ctx)
+    var sa_xmod = _adaln_pre_dev(x_arc[], sa_shift, sa_scalev, ln_ones, ln_zeros, B, D, eps, ctx)
+
+    var sa_q_base = linear(sa_xmod, w.sa_q[], Optional[Tensor](None), ctx)
+    var sa_k_base = linear(sa_xmod, w.sa_k[], Optional[Tensor](None), ctx)
+    var sa_v_base = linear(sa_xmod, w.sa_v[], Optional[Tensor](None), ctx)
+    var sa_q_f = anima_lora_apply_device(sa_q_base^, sa_xmod, lora.sa_q, B * S_IMG, ctx)
+    var sa_k_f = anima_lora_apply_device(sa_k_base^, sa_xmod, lora.sa_k, B * S_IMG, ctx)
+    var sa_v_f = anima_lora_apply_device(sa_v_base^, sa_xmod, lora.sa_v, B * S_IMG, ctx)
+
+    var sh4 = List[Int](); sh4.append(B); sh4.append(S_IMG); sh4.append(H); sh4.append(Dh)
+    var sa_q4 = reshape(sa_q_f, sh4.copy(), ctx)
+    var sa_k4 = reshape(sa_k_f, sh4.copy(), ctx)
+    var sa_v4 = reshape(sa_v_f, sh4.copy(), ctx)
+    var sa_qrms = _rms_per_head(sa_q4, w.sa_qn[], ctx)
+    var sa_krms = _rms_per_head(sa_k4, w.sa_kn[], ctx)
+    var sa_qrope = rope_halfsplit(sa_qrms, cos, sin, ctx)
+    var sa_krope = rope_halfsplit(sa_krms, cos, sin, ctx)
+    var sa_att = sdpa_nomask[1, S_IMG, H, Dh](sa_qrope, sa_krope, sa_v4, sa_scale, ctx)
+    var saf = List[Int](); saf.append(B); saf.append(S_IMG); saf.append(D)
+    var sa_attflat = reshape(sa_att, saf.copy(), ctx)
+
+    var sa_out_base = linear(sa_attflat, w.sa_out[], Optional[Tensor](None), ctx)
+    var sa_out = anima_lora_apply_device(sa_out_base^, sa_attflat, lora.sa_out, B * S_IMG, ctx)
+
+    var g3 = List[Int](); g3.append(B); g3.append(1); g3.append(D)
+    var sa_gate3 = reshape(sa_gate, g3.copy(), ctx)
+    var sa_gated = mul(sa_out, sa_gate3, ctx)
+    var x_after_sa = add(x_arc[], sa_gated, ctx)
+
+    # ── sub-block 2: CROSS-ATTENTION (no RoPE, rectangular SDPA, no mask) ─────
+    var ca_h = linear(t_silu_arc[], w.ca_mod1[], Optional[Tensor](None), ctx)
+    var ca_modout = linear(ca_h, w.ca_mod2[], Optional[Tensor](None), ctx)
+    var ca_added = add(ca_modout, base_t_arc[], ctx)
+    var ca_shift = slice(ca_added, 1, 0, D, ctx)
+    var ca_scalev = slice(ca_added, 1, D, D, ctx)
+    var ca_gate = slice(ca_added, 1, 2 * D, D, ctx)
+
+    var ca_ln = layer_norm(x_after_sa, ln_ones, ln_zeros, eps, ctx)
+    var ca_xmod = _adaln_pre_dev(x_after_sa, ca_shift, ca_scalev, ln_ones, ln_zeros, B, D, eps, ctx)
+
+    var ca_q_base = linear(ca_xmod, w.ca_q[], Optional[Tensor](None), ctx)
+    var ca_k_base = linear(ctx_t_arc[], w.ca_k[], Optional[Tensor](None), ctx)
+    var ca_v_base = linear(ctx_t_arc[], w.ca_v[], Optional[Tensor](None), ctx)
+    var ca_q_f = anima_lora_apply_device(ca_q_base^, ca_xmod, lora.ca_q, B * S_IMG, ctx)
+    var ca_k_f = anima_lora_apply_device(ca_k_base^, ctx_t_arc[], lora.ca_k, B * S_TXT, ctx)
+    var ca_v_f = anima_lora_apply_device(ca_v_base^, ctx_t_arc[], lora.ca_v, B * S_TXT, ctx)
+
+    var caq4s = List[Int](); caq4s.append(B); caq4s.append(S_IMG); caq4s.append(H); caq4s.append(Dh)
+    var cak4s = List[Int](); cak4s.append(B); cak4s.append(S_TXT); cak4s.append(H); cak4s.append(Dh)
+    var ca_q4 = reshape(ca_q_f, caq4s.copy(), ctx)
+    var ca_k4 = reshape(ca_k_f, cak4s.copy(), ctx)
+    var ca_v4 = reshape(ca_v_f, cak4s.copy(), ctx)
+    var ca_qrms = _rms_per_head(ca_q4, w.ca_qn[], ctx)
+    var ca_krms = _rms_per_head(ca_k4, w.ca_kn[], ctx)
+    var ca_att = sdxl_sdpa[1, S_IMG, S_TXT, H, Dh](ca_qrms, ca_krms, ca_v4, sa_scale, ctx)
+    var caf = List[Int](); caf.append(B); caf.append(S_IMG); caf.append(D)
+    var ca_attflat = reshape(ca_att, caf.copy(), ctx)
+
+    var ca_out_base = linear(ca_attflat, w.ca_out[], Optional[Tensor](None), ctx)
+    var ca_out = anima_lora_apply_device(ca_out_base^, ca_attflat, lora.ca_out, B * S_IMG, ctx)
+
+    var ca_gate3 = reshape(ca_gate, g3.copy(), ctx)
+    var ca_gated = mul(ca_out, ca_gate3, ctx)
+    var x_after_ca = add(x_after_sa, ca_gated, ctx)
+
+    # ── sub-block 3: MLP (GELU) ──────────────────────────────────────────────
+    var mlp_h_ = linear(t_silu_arc[], w.mlp_mod1[], Optional[Tensor](None), ctx)
+    var mlp_modout = linear(mlp_h_, w.mlp_mod2[], Optional[Tensor](None), ctx)
+    var mlp_added = add(mlp_modout, base_t_arc[], ctx)
+    var mlp_shift = slice(mlp_added, 1, 0, D, ctx)
+    var mlp_scalev = slice(mlp_added, 1, D, D, ctx)
+    var mlp_gate = slice(mlp_added, 1, 2 * D, D, ctx)
+
+    var mlp_ln = layer_norm(x_after_ca, ln_ones, ln_zeros, eps, ctx)
+    var mlp_xmod = _adaln_pre_dev(x_after_ca, mlp_shift, mlp_scalev, ln_ones, ln_zeros, B, D, eps, ctx)
+
+    var mlp_h1_base = linear(mlp_xmod, w.mlp1[], Optional[Tensor](None), ctx)
+    var mlp_h1 = anima_lora_apply_device(mlp_h1_base^, mlp_xmod, lora.mlp1, B * S_IMG, ctx)
+    var mlp_ha = gelu(mlp_h1, ctx)
+
+    var mlp_out_base = linear(mlp_ha, w.mlp2[], Optional[Tensor](None), ctx)
+    var mlp_out = anima_lora_apply_device(mlp_out_base^, mlp_ha, lora.mlp2, B * S_IMG, ctx)
+
+    var mlp_gate3 = reshape(mlp_gate, g3.copy(), ctx)
+    var mlp_gated = mul(mlp_out, mlp_gate3, ctx)
+    var x_final = add(x_after_ca, mlp_gated, ctx)
+
+    # ── save activations (LoRA-MODIFIED) — same struct contract as base block ──
+    var sa_xmod_a = TArc(sa_xmod^)
+    var ca_xmod_a = TArc(ca_xmod^)
+    var mlp_xmod_a = TArc(mlp_xmod^)
+    var t_silu_a = t_silu_arc.copy()
+
+    var sa_sub = _SubSaved(
+        x_arc.copy(), TArc(sa_ln^), sa_xmod_a.copy(),
+        TArc(sa_shift^), TArc(sa_scalev^), TArc(sa_gate^),
+        t_silu_a.copy(), TArc(sa_h^), TArc(sa_out^),
+    )
+    var ca_sub = _SubSaved(
+        TArc(x_after_sa^), TArc(ca_ln^), ca_xmod_a.copy(),
+        TArc(ca_shift^), TArc(ca_scalev^), TArc(ca_gate^),
+        t_silu_a.copy(), TArc(ca_h^), TArc(ca_out^),
+    )
+    var mlp_sub = _SubSaved(
+        TArc(x_after_ca^), TArc(mlp_ln^), mlp_xmod_a.copy(),
+        TArc(mlp_shift^), TArc(mlp_scalev^), TArc(mlp_gate^),
+        t_silu_a.copy(), TArc(mlp_h_^), TArc(mlp_out^),
+    )
+    var ctx_t_a = ctx_t_arc.copy()
+    var sa_attn = _AttnSaved(
+        TArc(sa_qrope^), TArc(sa_krope^), TArc(sa_v4^),
+        TArc(sa_q4^), TArc(sa_k4^), TArc(sa_qrms^), TArc(sa_krms^),
+        TArc(sa_attflat^), sa_xmod_a.copy(), sa_xmod_a.copy(),
+    )
+    var ca_qrms_a = TArc(ca_qrms^)
+    var ca_krms_a = TArc(ca_krms^)
+    var ca_attn = _AttnSaved(
+        ca_qrms_a.copy(), ca_krms_a.copy(), TArc(ca_v4^),
+        TArc(ca_q4^), TArc(ca_k4^), ca_qrms_a.copy(), ca_krms_a.copy(),
+        TArc(ca_attflat^), ca_xmod_a.copy(), ctx_t_a.copy(),
+    )
+    var saved = AnimaBlockSaved(
+        sa_sub^, ca_sub^, mlp_sub^, sa_attn^, ca_attn^, TArc(mlp_h1^), TArc(mlp_ha^),
+    )
+    return AnimaBlockForwardLoraTensor(TArc(x_final^), saved^)
+
+
+# AdaLN-pre on device tensors: (1+scale)*LayerNorm(x,no-affine,eps)+shift.
+# Same math as block._adaln_pre but takes B,D explicitly (no host hop).
+def _adaln_pre_dev(
+    x_f32: Tensor, shift: Tensor, scale: Tensor,
+    ln_ones: Tensor, ln_zeros: Tensor, B: Int, D: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Tensor:
+    var normed = layer_norm(x_f32, ln_ones, ln_zeros, eps, ctx)
+    var s3 = List[Int](); s3.append(B); s3.append(1); s3.append(D)
+    var scale_3d = reshape(scale, s3.copy(), ctx)
+    var shift_3d = reshape(shift, s3.copy(), ctx)
+    var one = _t(_ones(B * D), [B, 1, D], ctx)
+    var factor = add(scale_3d, one, ctx)
+    var scaled = mul(normed, factor, ctx)
+    return add(scaled, shift_3d, ctx)
 
 
 # ── LoRA-aware block backward ─────────────────────────────────────────────────
@@ -683,3 +1012,185 @@ def anima_block_lora_backward[
         d_sa_mod1^, d_sa_mod2^, d_ca_mod1^, d_ca_mod2^, d_mlp_mod1^, d_mlp_mod2^,
     )
     return AnimaBlockLoraBackward(base^, AnimaBlockLoraGrads(d_a_slots^, d_b_slots^))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVICE-RESIDENT LoRA-aware block backward. Mirrors anima_block_lora_backward but:
+#   * d_out enters as a DEVICE Tensor (no host carrier);
+#   * frozen base projection d_x via linear_backward_dx (no discarded d_w matmul);
+#   * frozen per-head RMSNorm (q/k_norm) via rms_norm_backward_dx (no d_g reduction);
+#   * frozen AdaLN LayerNorm-no-affine via layer_norm_backward_dx;
+#   * the AdaLN-mod Linears (sa/ca/mlp_mod1/2) use linear_backward_dx only (their
+#     d_w is discarded for LoRA) — d_t_silu still threaded for the parity gate;
+#   * LoRA d_a/d_b returned as DEVICE TArc lists (10 slots, slot order canonical);
+#   * d_x (block input) + d_t_silu returned as DEVICE Tensors — no per-block to_host.
+# `trace=True` prints per-phase timing (mlp / cross / self) for profiling.
+# ══════════════════════════════════════════════════════════════════════════════
+struct AnimaBlockLoraTensorBackward(Movable):
+    var d_x: TArc          # [B,S_img,D] grad into block input
+    var d_t_silu: TArc     # [B,2048] grad into shared silu(t_cond)
+    var d_a: List[TArc]    # 10 slots
+    var d_b: List[TArc]
+
+    def __init__(
+        out self, var d_x: TArc, var d_t_silu: TArc,
+        var d_a: List[TArc], var d_b: List[TArc],
+    ):
+        self.d_x = d_x^
+        self.d_t_silu = d_t_silu^
+        self.d_a = d_a^
+        self.d_b = d_b^
+
+
+def anima_block_lora_backward_device_tensors[
+    H: Int, Dh: Int, S_IMG: Int, S_TXT: Int
+](
+    d_out: Tensor,             # [B,S_img,D] DEVICE
+    saved: AnimaBlockSaved,
+    w: AnimaBlockWeights, lora: AnimaBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    B: Int, D: Int, JOINT: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    trace: Bool = False,
+) raises -> AnimaBlockLoraTensorBackward:
+    var ln_ones = _t(_ones(D), [D], ctx)
+    var sa_scale = Float32(1.0) / fsqrt(Float32(Dh))
+    var ts0 = perf_counter_ns()
+
+    # per-slot LoRA grad device tensors (filled below).
+    var d_a = List[TArc]()
+    var d_b = List[TArc]()
+    for _ in range(ANIMA_SLOTS):
+        d_a.append(TArc(_t(_zeros(1), [1], ctx)))
+        d_b.append(TArc(_t(_zeros(1), [1], ctx)))
+
+    var d_t_silu_acc = _t(_zeros(B * ANIMA_HIDDEN), [B, ANIMA_HIDDEN], ctx)
+
+    # ─────────────────────────────── MLP sub-block (last in forward) ──────────
+    var mlp_gg = _gate_residual_bwd(d_out, saved.mlp.gate[], saved.mlp.sub_out[], B, S_IMG, D, ctx)
+    var d_x_after_ca = add(d_out, _t(_zeros(B * S_IMG * D), [B, S_IMG, D], ctx), ctx)  # residual copy of d_out
+    # mlp2: mlp_out = linear(mlp_ha, mlp2)[+LoRA]  in=F out=D ; input mlp_ha
+    var pg_mlp2 = _proj_bwd_with_lora_device_tensors(
+        mlp_gg.d_sub_out, saved.mlp_ha[], w.mlp2[], lora.mlp2, B * S_IMG, F, D, True, ctx,
+    )
+    d_a[SLOT_MLP2] = pg_mlp2.d_a.copy(); d_b[SLOT_MLP2] = pg_mlp2.d_b.copy()
+    var d_mlp_ha = reshape(pg_mlp2.d_x, [B, S_IMG, F], ctx)
+    var d_mlp_h1 = gelu_backward(d_mlp_ha, saved.mlp_h[], ctx)
+    # mlp1: mlp_h1 = linear(mlp_xmod, mlp1)[+LoRA]  in=D out=F ; input mlp_xmod
+    var pg_mlp1 = _proj_bwd_with_lora_device_tensors(
+        d_mlp_h1, saved.mlp.x_mod[], w.mlp1[], lora.mlp1, B * S_IMG, D, F, True, ctx,
+    )
+    d_a[SLOT_MLP1] = pg_mlp1.d_a.copy(); d_b[SLOT_MLP1] = pg_mlp1.d_b.copy()
+    var d_mlp_xmod = reshape(pg_mlp1.d_x, [B, S_IMG, D], ctx)
+    var mlp_mb = modulate_backward(d_mlp_xmod, saved.mlp.ln[], saved.mlp.scale[], ctx)
+    var mlp_dxin = layer_norm_backward_dx(mlp_mb.d_x, saved.mlp.x_in[], ln_ones, eps, ctx)
+    d_x_after_ca = add(d_x_after_ca, mlp_dxin, ctx)
+    var mlp_dadd = concat(1, ctx, mlp_mb.d_shift, mlp_mb.d_scale, mlp_gg.d_gate)
+    var d_mlp_modh = linear_backward_dx(mlp_dadd, w.mlp_mod2[], B, 256, 3 * D, ctx)
+    var d_mlp_tsilu = linear_backward_dx(d_mlp_modh, w.mlp_mod1[], B, ANIMA_HIDDEN, 256, ctx)
+    d_t_silu_acc = add(d_t_silu_acc, d_mlp_tsilu, ctx)
+    if trace:
+        ctx.synchronize()
+    var ts_mlp = perf_counter_ns()
+
+    # ─────────────────────────────── CROSS-ATTENTION sub-block ────────────────
+    var ca_gg = _gate_residual_bwd(d_x_after_ca, saved.ca.gate[], saved.ca.sub_out[], B, S_IMG, D, ctx)
+    var d_x_after_sa = add(d_x_after_ca, _t(_zeros(B * S_IMG * D), [B, S_IMG, D], ctx), ctx)
+    # ca out: ca_out = linear(attn_flat, ca_out)[+LoRA]  in=D out=D ; input attn_flat
+    var pg_caout = _proj_bwd_with_lora_device_tensors(
+        ca_gg.d_sub_out, saved.ca_attn.attn_flat[], w.ca_out[], lora.ca_out,
+        B * S_IMG, D, D, True, ctx,
+    )
+    d_a[SLOT_CA_O] = pg_caout.d_a.copy(); d_b[SLOT_CA_O] = pg_caout.d_b.copy()
+    var d_ca_att4 = reshape(pg_caout.d_x, [B, S_IMG, H, Dh], ctx)
+    var ca_sb = sdpa_backward_rect[1, S_IMG, S_TXT, H, Dh](
+        saved.ca_attn.q_sdpa[], saved.ca_attn.k_sdpa[], saved.ca_attn.v4[],
+        d_ca_att4, sa_scale, ctx,
+    )
+    var d_ca_q_rms_f = reshape(ca_sb.d_q, [B * S_IMG * H, Dh], ctx)
+    var d_ca_k_rms_f = reshape(ca_sb.d_k, [B * S_TXT * H, Dh], ctx)
+    var ca_qpre_f = reshape(saved.ca_attn.q_pre[], [B * S_IMG * H, Dh], ctx)
+    var ca_kpre_f = reshape(saved.ca_attn.k_pre[], [B * S_TXT * H, Dh], ctx)
+    var d_ca_q_pre = rms_norm_backward_dx(d_ca_q_rms_f, ca_qpre_f, w.ca_qn[], Float32(1e-6), ctx)
+    var d_ca_k_pre = rms_norm_backward_dx(d_ca_k_rms_f, ca_kpre_f, w.ca_kn[], Float32(1e-6), ctx)
+    var d_ca_q_proj = reshape(d_ca_q_pre, [B, S_IMG, D], ctx)
+    var d_ca_k_proj = reshape(d_ca_k_pre, [B, S_TXT, D], ctx)
+    var d_ca_v_proj = reshape(ca_sb.d_v, [B, S_TXT, D], ctx)
+    # ca q: input ca_xmod (trained); ca k/v: input FROZEN context (keep_dx=False).
+    var pg_caq = _proj_bwd_with_lora_device_tensors(
+        d_ca_q_proj, saved.ca_attn.q_ctx_in[], w.ca_q[], lora.ca_q, B * S_IMG, D, D, True, ctx,
+    )
+    d_a[SLOT_CA_Q] = pg_caq.d_a.copy(); d_b[SLOT_CA_Q] = pg_caq.d_b.copy()
+    var pg_cak = _proj_bwd_with_lora_device_tensors(
+        d_ca_k_proj, saved.ca_attn.kv_ctx_in[], w.ca_k[], lora.ca_k, B * S_TXT, JOINT, D, False, ctx,
+    )
+    d_a[SLOT_CA_K] = pg_cak.d_a.copy(); d_b[SLOT_CA_K] = pg_cak.d_b.copy()
+    var pg_cav = _proj_bwd_with_lora_device_tensors(
+        d_ca_v_proj, saved.ca_attn.kv_ctx_in[], w.ca_v[], lora.ca_v, B * S_TXT, JOINT, D, False, ctx,
+    )
+    d_a[SLOT_CA_V] = pg_cav.d_a.copy(); d_b[SLOT_CA_V] = pg_cav.d_b.copy()
+    var d_ca_xmod = reshape(pg_caq.d_x, [B, S_IMG, D], ctx)
+    var ca_mb = modulate_backward(d_ca_xmod, saved.ca.ln[], saved.ca.scale[], ctx)
+    var ca_dxin = layer_norm_backward_dx(ca_mb.d_x, saved.ca.x_in[], ln_ones, eps, ctx)
+    d_x_after_sa = add(d_x_after_sa, ca_dxin, ctx)
+    var ca_dadd = concat(1, ctx, ca_mb.d_shift, ca_mb.d_scale, ca_gg.d_gate)
+    var d_ca_modh = linear_backward_dx(ca_dadd, w.ca_mod2[], B, 256, 3 * D, ctx)
+    var d_ca_tsilu = linear_backward_dx(d_ca_modh, w.ca_mod1[], B, ANIMA_HIDDEN, 256, ctx)
+    d_t_silu_acc = add(d_t_silu_acc, d_ca_tsilu, ctx)
+    if trace:
+        ctx.synchronize()
+    var ts_ca = perf_counter_ns()
+
+    # ─────────────────────────────── SELF-ATTENTION sub-block ─────────────────
+    var sa_gg = _gate_residual_bwd(d_x_after_sa, saved.sa.gate[], saved.sa.sub_out[], B, S_IMG, D, ctx)
+    var d_x_in = add(d_x_after_sa, _t(_zeros(B * S_IMG * D), [B, S_IMG, D], ctx), ctx)
+    var pg_saout = _proj_bwd_with_lora_device_tensors(
+        sa_gg.d_sub_out, saved.sa_attn.attn_flat[], w.sa_out[], lora.sa_out,
+        B * S_IMG, D, D, True, ctx,
+    )
+    d_a[SLOT_SA_O] = pg_saout.d_a.copy(); d_b[SLOT_SA_O] = pg_saout.d_b.copy()
+    var d_sa_att4 = reshape(pg_saout.d_x, [B, S_IMG, H, Dh], ctx)
+    var sa_sb = sdpa_backward[1, S_IMG, H, Dh](
+        saved.sa_attn.q_sdpa[], saved.sa_attn.k_sdpa[], saved.sa_attn.v4[],
+        d_sa_att4, sa_scale, ctx,
+    )
+    var d_sa_q_rope_f = reshape(sa_sb.d_q, [B * S_IMG * H, Dh], ctx)
+    var d_sa_k_rope_f = reshape(sa_sb.d_k, [B * S_IMG * H, Dh], ctx)
+    var d_sa_q_rms_f = rope_backward(d_sa_q_rope_f, cos, sin, False, ctx)
+    var d_sa_k_rms_f = rope_backward(d_sa_k_rope_f, cos, sin, False, ctx)
+    var sa_qpre_f = reshape(saved.sa_attn.q_pre[], [B * S_IMG * H, Dh], ctx)
+    var sa_kpre_f = reshape(saved.sa_attn.k_pre[], [B * S_IMG * H, Dh], ctx)
+    var d_sa_q_pre = rms_norm_backward_dx(d_sa_q_rms_f, sa_qpre_f, w.sa_qn[], Float32(1e-6), ctx)
+    var d_sa_k_pre = rms_norm_backward_dx(d_sa_k_rms_f, sa_kpre_f, w.sa_kn[], Float32(1e-6), ctx)
+    var d_sa_q_proj = reshape(d_sa_q_pre, [B, S_IMG, D], ctx)
+    var d_sa_k_proj = reshape(d_sa_k_pre, [B, S_IMG, D], ctx)
+    var d_sa_v_proj = reshape(sa_sb.d_v, [B, S_IMG, D], ctx)
+    # q/k/v all from sa_xmod (trained) -> sum the 3 (base+LoRA) d_x contributions.
+    var pg_saq = _proj_bwd_with_lora_device_tensors(
+        d_sa_q_proj, saved.sa_attn.q_ctx_in[], w.sa_q[], lora.sa_q, B * S_IMG, D, D, True, ctx,
+    )
+    d_a[SLOT_SA_Q] = pg_saq.d_a.copy(); d_b[SLOT_SA_Q] = pg_saq.d_b.copy()
+    var pg_sak = _proj_bwd_with_lora_device_tensors(
+        d_sa_k_proj, saved.sa_attn.q_ctx_in[], w.sa_k[], lora.sa_k, B * S_IMG, D, D, True, ctx,
+    )
+    d_a[SLOT_SA_K] = pg_sak.d_a.copy(); d_b[SLOT_SA_K] = pg_sak.d_b.copy()
+    var pg_sav = _proj_bwd_with_lora_device_tensors(
+        d_sa_v_proj, saved.sa_attn.q_ctx_in[], w.sa_v[], lora.sa_v, B * S_IMG, D, D, True, ctx,
+    )
+    d_a[SLOT_SA_V] = pg_sav.d_a.copy(); d_b[SLOT_SA_V] = pg_sav.d_b.copy()
+    var d_sa_xmod = add(add(pg_saq.d_x, pg_sak.d_x, ctx), pg_sav.d_x, ctx)
+    var sa_mb = modulate_backward(d_sa_xmod, saved.sa.ln[], saved.sa.scale[], ctx)
+    var sa_dxin = layer_norm_backward_dx(sa_mb.d_x, saved.sa.x_in[], ln_ones, eps, ctx)
+    d_x_in = add(d_x_in, sa_dxin, ctx)
+    var sa_dadd = concat(1, ctx, sa_mb.d_shift, sa_mb.d_scale, sa_gg.d_gate)
+    var d_sa_modh = linear_backward_dx(sa_dadd, w.sa_mod2[], B, 256, 3 * D, ctx)
+    var d_sa_tsilu = linear_backward_dx(d_sa_modh, w.sa_mod1[], B, ANIMA_HIDDEN, 256, ctx)
+    d_t_silu_acc = add(d_t_silu_acc, d_sa_tsilu, ctx)
+    if trace:
+        ctx.synchronize()
+        var ts_sa = perf_counter_ns()
+        print("[ANIMA_BWD] mlp=", Float32(Float64(ts_mlp - ts0) / 1.0e9),
+              " ca=", Float32(Float64(ts_ca - ts_mlp) / 1.0e9),
+              " sa=", Float32(Float64(ts_sa - ts_ca) / 1.0e9))
+
+    return AnimaBlockLoraTensorBackward(TArc(d_x_in^), TArc(d_t_silu_acc^), d_a^, d_b^)

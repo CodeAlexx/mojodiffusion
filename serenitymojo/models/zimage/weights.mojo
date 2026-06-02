@@ -86,8 +86,24 @@ struct ZImageBlockWeights(Copyable, Movable):
         self.fn2 = fn2^
 
 
+# Read one named tensor from the sharded safetensors as a device Tensor at its
+# real stored shape and dtype. Z-Image's released base is BF16. Keeping large
+# projection matrices BF16 matches the OneTrainer preset and avoids expanding the
+# full stack to all-F32 residency.
+def _load_device_preserve(
+    st: ShardedSafeTensors, name: String, ctx: DeviceContext
+) raises -> Tensor:
+    var info = st.tensor_info(name)
+    var bytes = st.tensor_bytes(name)
+    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
+    return Tensor.from_view(tv, ctx)
+
+
 # Read one named tensor from the sharded safetensors as a device F32 Tensor at
-# its real stored shape (casts up from BF16). Mirrors ernie _load_f32_device.
+# its real stored shape (casts up from BF16). Use this for small norm-vector
+# compatibility and parity probes. Do not use it for Z-Image training projection
+# matrices; full-F32 base/model loading is OOM-prone and not the OneTrainer
+# policy.
 def _load_f32_device(
     st: ShardedSafeTensors, name: String, ctx: DeviceContext
 ) raises -> Tensor:
@@ -98,13 +114,43 @@ def _load_f32_device(
     return cast_tensor(t, STDtype.F32, ctx)
 
 
+# Load one block with mixed base dtype:
+#   - large Linear projection weights stay in checkpoint dtype (BF16 for Z-Image)
+#   - small norm scale vectors are F32 because the current rms_norm kernels
+#     require x and weight dtypes to match and the stack carries activations F32.
+#
+# This is the training path that matches OneTrainer's BF16/BP16 weight policy
+# without rewriting the already-parity-tested F32 activation stack.
+def load_zimage_block_weights_prefixed_mixed(
+    st: ShardedSafeTensors, prefix: String, ctx: DeviceContext
+) raises -> ZImageBlockWeights:
+    var ap = prefix + String(".attention")
+    var fp = prefix + String(".feed_forward")
+    return ZImageBlockWeights(
+        TArc(_load_f32_device(st, prefix + String(".attention_norm1.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".to_q.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".to_k.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".to_v.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".to_out.0.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_f32_device(st, prefix + String(".attention_norm2.weight"), ctx)),
+        TArc(_load_f32_device(st, prefix + String(".ffn_norm1.weight"), ctx)),
+        TArc(_load_device_preserve(st, fp + String(".w1.weight"), ctx)),
+        TArc(_load_device_preserve(st, fp + String(".w3.weight"), ctx)),
+        TArc(_load_device_preserve(st, fp + String(".w2.weight"), ctx)),
+        TArc(_load_f32_device(st, prefix + String(".ffn_norm2.weight"), ctx)),
+    )
+
+
 # Load ONE block's real weights given an explicit stream prefix
 # (noise_refiner.{i} / context_refiner.{i} / layers.{i}). The diffusers
 # transformer dir (/home/alex/.serenity/models/zimage_base/transformer) stores
 # UNFUSED to_q/to_k/to_v/to_out.0 + per-head norm_q/norm_k under each stream,
 # matching the training stack's separate-projection ZImageBlockWeights. Used by
 # the real trainer to populate nr/cr/main block lists. Mirrors the layers-only
-# loader below.
+# loader below. Keep this as a parity/debug loader only; training should call
+# load_zimage_block_weights_prefixed_mixed so base projections remain BF16/BP16.
 def load_zimage_block_weights_prefixed(
     st: ShardedSafeTensors, prefix: String, ctx: DeviceContext
 ) raises -> ZImageBlockWeights:

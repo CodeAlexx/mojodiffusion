@@ -56,10 +56,26 @@ latent [16,64,64] → patchify(p=2) → (32×32)=1024 img tokens, ch=64.
 WAIT: 64/2=32 grid → 32*32=1024 img tokens (img_pad: 1024%32==0 → 0 pad).
 cap 512 (already mult of 32). S = 1024 + 512 = 1536.
 
-## STATUS (2026-06-01): DONE for the reduced-depth real run; full-depth BLOCKED.
+## HARD DTYPE RULE (2026-06-02)
+
+Z-Image training is BF16/BP16 for the base model weights. OneTrainer does not
+train a full-F32 Z-Image model, and this Mojo trainer must not try to do that
+either. A full-F32 Z-Image base/model load is invalid for the local 24 GB target
+and will OOM.
+
+Allowed F32 uses are narrow: scalar loss/reduction math, optimizer masters,
+transient accumulators, activations currently carried by the parity stack, and
+small norm-vector compatibility tensors while `rms_norm` requires matching
+input/weight dtype. Large block projection and MLP weights (`to_q`, `to_k`,
+`to_v`, `to_out`, `w1`, `w3`, `w2`) must stay in checkpoint dtype through
+`load_zimage_block_weights_prefixed_mixed` and/or an offloaded BF16-preserving
+path.
+
+## STATUS (2026-06-02): reduced-depth real run done; full-depth BF16/offload work pending.
 
 ### Files
-- `models/zimage/weights.mojo` — +load_zimage_block_weights_prefixed (nr/cr/main).
+- `models/zimage/weights.mojo` — +load_zimage_block_weights_prefixed (nr/cr/main)
+  for parity plus `load_zimage_block_weights_prefixed_mixed` for training.
 - `models/zimage/real_weights.mojo` — NEW. ZImageRealAux + embedder/modvec/
   rope/f_scale builders translating zimage_dit.mojo host math.
 - `pipeline/zimage_prepare.mojo` — NEW. cache reader/inspector (VAE port skipped;
@@ -80,21 +96,40 @@ adapters; grads finite. Checkpoint saved (37MB, 56 adapters, PEFT names).
 Multi-sample mode (OVERFIT_PROBE=False) runs too but loss oscillates per-step
 (different timestep+sample each step) — expected variance, not divergence.
 
+### OneTrainer 100-Step Baseline (512, Klein/Alina dataset)
+
+OneTrainer Z-Image LoRA baseline used the local `Otpreset` Z-Image preset, local
+`/home/alex/.serenity/models/zimage_base`, batch 2, LR `3e-4`, logit-normal
+timestep sampling, BFLOAT_16 train/weight/output dtype, and the Klein/Alina
+cache. At the 100-step save:
+
+```
+loss=0.541
+smooth_loss=0.457
+warm_speed=2.0-2.2s/it
+checkpoint=/home/alex/OneTrainer/workspace/alina_zimage_OTpreset_100_baseline/save/2026-06-02_01-06-16-save-99-3-24.safetensors
+```
+
+The process was manually terminated after OneTrainer continued beyond the 100
+step save; use only the metrics through the `save-99-3-24` checkpoint as the
+baseline.
+
 ### BLOCKER for full-depth (MAIN=30) real run
-MEASURED: full-model resident F32 base = 24.62 GB > 24 GB GPU (computed from
-real shapes; MAIN=4 = 5.80 GB, which ran). The verified Z-Image LoRA stack is
-F32-HOST-CARRIER-ONLY (x_seq/cap_seq/modvecs are List[Float32]; backward
-recompute does .to_host). There is NO BF16 or offload variant for zimage. A
-full-depth real run needs either (a) a BF16-resident zimage stack (12.3 GB —
-needs the block fwd/bwd to accept BF16 base weights, a flame-core-tenet stack
-change, out of a translation's scope) or (b) a turbo/offload block loader like
-Klein's. Loss MAGNITUDE (~445) and the slow per-step delta are partly the
-MAIN=4 truncation artifact (26 missing layers => final output uncalibrated to
-the latent scale); the DIRECTION (monotonic down) is the correctness signal.
+
+MEASURED: full-model resident all-F32 base = 24.62 GB > 24 GB GPU (computed from
+real shapes). That is not a supported training mode. The full-depth Mojo path
+must preserve BF16/BP16 base projection weights and add BF16 residency and/or a
+turbo/offload block loader like Klein's before flipping `MAIN_DEPTH=30`.
+
+The existing reduced-depth run is only a correctness probe. Loss MAGNITUDE
+(~445) and the slow per-step delta are partly the MAIN=4 truncation artifact
+(26 missing layers => final output uncalibrated to the latent scale); the
+DIRECTION (monotonic down) is the correctness signal.
 
 ### NEXT (to land full-depth)
-1. BF16-resident zimage block fwd/bwd (or reuse an offload loader) — flame-core
-   stack work, NOT trainer work. Then flip MAIN_DEPTH=30.
+1. BF16/BP16-preserving zimage block fwd/bwd (or reuse an offload loader) so
+   full-depth training never expands the base model to all-F32. Then flip
+   MAIN_DEPTH=30.
 2. Per-layer parity of build_x_seq/build_adaln/build_block_modvecs/build_f_scale
    vs zimage_dit.mojo on real weights (cos>=0.999) before the long run, to
    confirm the loss magnitude is purely the truncation artifact.

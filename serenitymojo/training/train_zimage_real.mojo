@@ -27,13 +27,21 @@
 #   lr=3e-4, rank=16, alpha=1.0, timestep_shift=1.0, clip_grad_norm=1.0,
 #   VAE_SHIFT=0.1159, VAE_SCALE=0.3611, NUM_TRAIN_TIMESTEPS=1000.
 #
-# MEMORY (measured budget): full-depth resident F32 base = 24.6 GB > 24 GB. The
-# verified Z-Image LoRA stack is F32-host-carrier-only (no BF16/offload variant
-# exists for zimage — that would be a flame-core-tenet stack rewrite, out of a
-# translation's scope). So MAIN_DEPTH is a knob: the DEFAULT reduced depth runs a
-# REAL end-to-end step (real weights + real cache + real LoRA train) within
-# 24 GB, proving loss-down + LoRA-B growth. Setting MAIN_DEPTH=30 attempts the
-# full model and will OOM until a BF16/offload zimage stack lands.
+# HARD DTYPE RULE (2026-06-02): Z-Image training is BF16/BP16 for base model
+# weights. OneTrainer does not train a full-F32 Z-Image model, and neither
+# should this trainer. A full-F32 base/model load will OOM on 24 GB cards.
+#
+# The current stack still carries activations, scalar reductions, LoRA masters,
+# and a few small norm compatibility tensors as F32. That is not a full-F32
+# model. Large block projection and MLP weights must stay in checkpoint dtype
+# via load_zimage_block_weights_prefixed_mixed until a full mixed/offload stack
+# lands.
+#
+# MEMORY (measured budget): full-depth resident all-F32 base = 24.6 GB > 24 GB.
+# So MAIN_DEPTH is a temporary correctness knob: the DEFAULT reduced depth runs
+# a REAL end-to-end step (real cache + BF16 base projections + real LoRA train)
+# within 24 GB, proving loss-down + LoRA-B growth. Full MAIN_DEPTH=30 needs
+# BF16-preserving residency and/or turbo/offload, not F32 expansion.
 #
 # Run (real smoke):
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
@@ -48,10 +56,11 @@ from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.io.ffi import sys_system
 from serenitymojo.ops.cast import cast_tensor
 
 from serenitymojo.models.zimage.weights import (
-    ZImageBlockWeights, load_zimage_block_weights_prefixed,
+    ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
 )
 from serenitymojo.models.zimage.block import ZImageModVecs
 from serenitymojo.models.zimage.lora_block import ZIMAGE_SLOTS
@@ -98,7 +107,7 @@ comptime S = N_IMG + N_TXT    # 1536
 
 # ── depth knob (see MEMORY note above). Full model: NR=2 CR=2 MAIN=30. ───────
 # Reduced default keeps full-resolution tokens + real weights but a subset of
-# the 30 main layers so the F32-resident stack fits 24 GB for the real smoke.
+# the 30 main layers so the BF16-preserving block stack fits 24 GB for smoke.
 comptime NUM_NR = 2
 comptime NUM_CR = 2
 comptime MAIN_DEPTH = 4
@@ -214,13 +223,13 @@ def main() raises:
     print("[load] blocks: NR + CR + MAIN")
     var nr_blocks = List[ZImageBlockWeights]()
     for i in range(NUM_NR):
-        nr_blocks.append(load_zimage_block_weights_prefixed(st, String("noise_refiner.") + String(i), ctx))
+        nr_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("noise_refiner.") + String(i), ctx))
     var cr_blocks = List[ZImageBlockWeights]()
     for i in range(NUM_CR):
-        cr_blocks.append(load_zimage_block_weights_prefixed(st, String("context_refiner.") + String(i), ctx))
+        cr_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("context_refiner.") + String(i), ctx))
     var main_blocks = List[ZImageBlockWeights]()
     for i in range(MAIN_DEPTH):
-        main_blocks.append(load_zimage_block_weights_prefixed(st, String("layers.") + String(i), ctx))
+        main_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("layers.") + String(i), ctx))
     print("[load] resident blocks:", len(nr_blocks), "nr +", len(cr_blocks), "cr +", len(main_blocks), "main")
     var final_lin_w = aux.final_lin_w[].clone(ctx)
     var final_lin_b = aux.final_lin_b[].clone(ctx)
@@ -369,6 +378,7 @@ def main() raises:
         print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        _ = sys_system(String("mkdir -p ") + String(LORA_DIR))
         _ = save_zimage_lora(lora, String(LORA_DIR) + String("/zimage_lora_smoke.safetensors"), ctx)
     else:
         print("RESULT: FAIL trains=", trains)

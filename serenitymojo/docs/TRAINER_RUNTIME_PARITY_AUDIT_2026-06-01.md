@@ -39,6 +39,22 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
   memory behavior, and known fixes, but the OneTrainer trees above are the
   source for model-specific training presets and sampling/timestep policy.
 
+## 2026-06-02 Z-Image DType Rule And Baseline
+
+- Z-Image training uses BF16/BP16 base model weights. OneTrainer does not train
+  Z-Image as a full-F32 model, and SerenityMojo must not try it. A full-F32
+  Z-Image base/model load is invalid on the local 24 GB target and will OOM.
+- F32 is still allowed for scalar reductions, transient accumulators, LoRA/Adam
+  masters, current F32 activation carriers, and small norm-vector compatibility.
+  That is not a full-F32 model. Large block projection and MLP weights must stay
+  BF16/BP16 or be streamed/offloaded in checkpoint dtype.
+- OneTrainer 100-step Z-Image LoRA baseline on the Klein/Alina 512 dataset:
+  batch 2, LR `3e-4`, logit-normal timestep sampling, BFLOAT_16
+  train/weight/output dtype, final save at `save-99-3-24`.
+- Baseline target: `loss=0.541`, `smooth_loss=0.457`, warm cadence
+  `2.0-2.2s/it`. Checkpoint:
+  `/home/alex/OneTrainer/workspace/alina_zimage_OTpreset_100_baseline/save/2026-06-02_01-06-16-save-99-3-24.safetensors`.
+
 ## Gaps vs Rust/Flame
 
 | Area | Rust/Flame source | Mojo status | Required parity work |

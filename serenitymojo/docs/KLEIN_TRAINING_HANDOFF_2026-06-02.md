@@ -466,8 +466,9 @@ Main findings:
   without broader tests.
 - Anima trainer is not production: currently smoke/reduced, with hard-coded
   small latent dimensions and simplified pieces.
-- Z-Image trainer is not production: current depth/memory path is reduced and
-  needs BF16/offload/full-depth work.
+- Z-Image LoRA trainer is now full-depth for the 512 Alina path, self-contained
+  Mojo for staging/prepare/train, and speed-fixed. Remaining gap is validation
+  sampling wired through the Mojo Z-Image generator with trained LoRA.
 - SDXL trainer is not production: current crop/latent path is reduced.
 
 ## Model Readiness
@@ -485,31 +486,63 @@ fallbacks. Need:
 
 ### Z-Image
 
-Next after Klein unless user chooses Anima first. Use OneTrainer as training
-reference. Current local changes:
+Use OneTrainer as the parity reference only. Do not modify OneTrainer, do not
+use MGDS, and do not use Rust/Python/EDv2/OneTrainer caches in production. The
+trainer, stager, text encoder, VAE encoder, cache writer, and LoRA saver are
+Mojo-owned.
 
-- `serenitymojo/models/vae/zimage_encoder.mojo` adds a pure-Mojo Z-Image VAE
-  encoder with diffusers VAE key layout and `encode_mean()` for OneTrainer-style
-  latent caching.
-- `serenitymojo/pipeline/zimage_prepare.mojo` no longer inspects or points at
-  `/home/alex/EriDiffusion/.../cache/alina_zimage_512`; it prepares local
-  `output/alina_zimage_cache` from local staged image tensors and Mojo Qwen3.
-- `serenitymojo/training/train_zimage_real.mojo` points at
-  `output/alina_zimage_cache`, uses full-depth `MAIN_DEPTH=30`, keeps the
-  BF16/BP16 no-full-F32 rule, and optimizes/saves only main-layer LoRA adapters
-  to match the OneTrainer filter that excludes refiners.
+Current production LoRA path:
 
-Remaining Z-Image gap: raw `/home/alex/datasets/AlinaAignatova` files are JPEG/PNG.
-The trainer stack must not use Rust or Python to turn them into training caches.
-Either add a Mojo raw image decoder/stager, or provide local staged
-`output/alina_zimage_stage/*.safetensors` files created by Mojo code with key
-`image: [1,3,512,512]` in `[-1,1]`. Do not fill this stage/cache from EDv2 or
-OneTrainer and call it production.
+- `serenitymojo/image/decode.mojo` adds pure-Mojo PNG/JPEG loading through
+  libpng/libturbojpeg FFI.
+- `serenitymojo/pipeline/zimage_stage_alina.mojo` stages raw
+  `/home/alex/datasets/AlinaAignatova` images/captions into
+  `output/alina_zimage_stage` with OneTrainer-style 512 buckets quantized to 64.
+  Current buckets are `576x448` (`72x56` latents) and `704x384` (`88x48`
+  latents).
+- `serenitymojo/pipeline/zimage_prepare.mojo` prepares
+  `output/alina_zimage_cache` from the staged Mojo image tensors using the Mojo
+  Qwen3 text encoder and Mojo Z-Image VAE encoder. It dispatches all current
+  production cases: `72x56/cap224`, `72x56/cap256`, `88x48/cap224`, and
+  `88x48/cap256`.
+- `serenitymojo/training/train_zimage_real.mojo` uses full-depth
+  `MAIN_DEPTH=30`, frozen noise/context refiners, BF16/BP16 base weights, and
+  main-layer attention/feed-forward LoRA only, matching the OneTrainer filter
+  that excludes refiners.
+- LoRA saving stays PEFT/ai-toolkit-compatible for `/home/alex/ai-toolkit` and
+  Serenity inference; do not switch Z-Image LoRA output to a private format.
 
-Current local one-step full-depth diagnostic before moving off EDv2 cache was
-not baseline quality: about `119s/step` batch 1 and loss around `12.5` after the
-sign fix. Do not run or report a 100-step target comparison until the local
-Mojo-prepared cache and remaining Z-Image parity/speed gaps are fixed.
+Do not try full-F32 Z-Image. OneTrainer does not train this model in full F32,
+and a full-F32 base/model load will OOM on the local 24 GB GPU. Keep large base
+weights BF16/BP16/offloaded. F32 is allowed only for small reductions,
+transients, LoRA/Adam masters, and compatibility carriers.
+
+Important parity fixes already landed:
+
+- Z-Image VAE scaling is `(latent - 0.1159) * 0.3611`, not the Klein/BN path.
+- Logit-normal timestep policy uses OneTrainer's Z-Image baseline settings:
+  `timestep_shift=1.0`, dynamic shift disabled.
+- Noise generation now uses the full 53-bit uniform path. The old mask biased
+  the target mean and caused unstable loss.
+- Final-layer modulation now passes raw scale into `modulate()`. Do not apply
+  `1 + scale` twice.
+- Learned caption/image pad tokens and position rows are used for padded rows;
+  padded image rows are excluded from loss.
+
+Speed status after the `nsys` pass:
+
+- Old full-depth diagnostic: about `100s/step`; `nsys` showed about `35s` in
+  full RMSNorm backward weight-gradient reductions for frozen norms.
+- Production path now keeps LoRA on device and uses `rms_norm_backward_dx` for
+  frozen norms.
+- 100-step run: `output/logs/zimage_train_100_speedfix_2026-06-02.log`
+- Result: loss `0.47321588 -> 0.35350168`, `nonfinite=0`, final step
+  `4.075s`, warm cadence about `4.0-4.15s/step` batch 1.
+- Saved LoRA: `output/alina_zimage/zimage_lora_step100.safetensors`
+
+Remaining Z-Image gap: validation sampling is not yet wired into
+`train_zimage_real.mojo`. Add it through the Mojo Z-Image generator/LoRA path,
+not Python or Rust, before calling the trainer sample cadence complete.
 
 ### Anima
 

@@ -14,11 +14,8 @@
 # parity-verified inference oracle) line-for-line:
 #   * _t_embedder      : sinusoidal(256, t*1000) -> mlp.0 -> silu -> mlp.2  [1,256]
 #   * adaLN per block  : Linear(adaln) [4D] (RAW; block applies tanh/+1 itself)
-#   * final f_scale    : 1 + Linear(silu(adaln)) ... but stack expects f_scale
-#                        such that modulate(ln, f_scale, 0) = (1+f_scale)*ln, so
-#                        we pass RAW Linear(silu(adaln)) (the stack adds the +1?
-#                        NO — stack does modulate(ln, f_scale, 0) = f_scale*ln,
-#                        so we pass (1 + raw) here. See _build_f_scale).
+#   * final f_scale    : diffusers uses 1 + Linear(silu(adaln)); our shared
+#                        modulate() op applies the +1 internally, so pass raw.
 #   * cap_embedder     : RMSNorm(2560) -> Linear -> [CAPLEN, D]
 #   * x_embedder       : patchify(channel-minor) -> Linear -> [IMG_TOK, D]
 #   * rope             : 3-axis (theta=256, axes 32/48/48) interleaved [S*H, Dh/2]
@@ -86,6 +83,8 @@ struct ZImageRealAux(Movable):
     # x_embedder
     var x_w: TArc           # [D, 64]
     var x_b: TArc           # [D]
+    var x_pad_token: TArc   # [1, D]
+    var cap_pad_token: TArc # [1, D]
     # per-block adaLN_modulation.0 (RAW [4D] = scale_msa|gate_msa|scale_mlp|gate_mlp)
     var nr_mod_w: List[TArc]    # num_nr   x [4D, 256]
     var nr_mod_b: List[TArc]    # num_nr   x [4D]
@@ -101,7 +100,7 @@ struct ZImageRealAux(Movable):
         out self,
         var t_w0: TArc, var t_b0: TArc, var t_w2: TArc, var t_b2: TArc,
         var cap_norm: TArc, var cap_lin_w: TArc, var cap_lin_b: TArc,
-        var x_w: TArc, var x_b: TArc,
+        var x_w: TArc, var x_b: TArc, var x_pad_token: TArc, var cap_pad_token: TArc,
         var nr_mod_w: List[TArc], var nr_mod_b: List[TArc],
         var main_mod_w: List[TArc], var main_mod_b: List[TArc],
         var final_mod_w: TArc, var final_mod_b: TArc,
@@ -116,6 +115,8 @@ struct ZImageRealAux(Movable):
         self.cap_lin_b = cap_lin_b^
         self.x_w = x_w^
         self.x_b = x_b^
+        self.x_pad_token = x_pad_token^
+        self.cap_pad_token = cap_pad_token^
         self.nr_mod_w = nr_mod_w^
         self.nr_mod_b = nr_mod_b^
         self.main_mod_w = main_mod_w^
@@ -153,6 +154,8 @@ def load_zimage_real_aux(
         TArc(_load_f32_device(st, String("cap_embedder.1.bias"), ctx)),
         TArc(_load_f32_device(st, String("all_x_embedder.2-1.weight"), ctx)),
         TArc(_load_f32_device(st, String("all_x_embedder.2-1.bias"), ctx)),
+        TArc(_load_f32_device(st, String("x_pad_token"), ctx)),
+        TArc(_load_f32_device(st, String("cap_pad_token"), ctx)),
         nr_mod_w^, nr_mod_b^, main_mod_w^, main_mod_b^,
         TArc(_load_f32_device(st, String("all_final_layer.2-1.adaLN_modulation.1.weight"), ctx)),
         TArc(_load_f32_device(st, String("all_final_layer.2-1.adaLN_modulation.1.bias"), ctx)),
@@ -197,9 +200,9 @@ def build_block_modvecs(
     )
 
 
-# ── final-layer f_scale: (1 + Linear(silu(adaln))) as the stack's modulate scale.
-# The stack does modulate(ln, f_scale, 0) = f_scale * ln (elementwise, no shift).
-# The diffusers final layer is (1 + Linear(silu(adaln))) * ln, so f_scale = 1+raw.
+# ── final-layer f_scale: raw Linear(silu(adaln)) as the stack's modulate scale.
+# The stack uses modulate(ln, f_scale, 0) = (1 + f_scale) * ln.
+# Diffusers final layer is (1 + Linear(silu(adaln))) * ln, so f_scale = raw.
 def build_f_scale(
     aux: ZImageRealAux, adaln: Tensor, D: Int, ctx: DeviceContext
 ) raises -> List[Float32]:
@@ -208,7 +211,7 @@ def build_f_scale(
     var h = raw.to_host(ctx)
     var o = List[Float32]()
     for i in range(D):
-        o.append(Float32(1.0) + h[i])
+        o.append(h[i])
     return o^
 
 
@@ -273,15 +276,22 @@ def build_rope(
     return (cos_t^, sin_t^)
 
 
-# ── rope positions for img / cap / unified (512px, no padding needed) ─────────
-# cap tokens: (i+1, 0, 0). img tokens: (cap_len+1, ih, iw). unified = img ++ cap.
+# ── rope positions for img / cap / unified ───────────────────────────────────
+# cap tokens: real rows (i+1,0,0), pad rows (0,0,0). image tokens:
+# (cap_padded+1, ih, iw), followed by image pad rows (0,0,0). unified = img ++ cap.
 def build_positions(
-    n_img: Int, ht: Int, wt: Int, cap_len: Int
+    n_img: Int, ht: Int, wt: Int, cap_len: Int, valid_cap: Int
 ) -> Tuple[List[List[Int]], List[List[Int]]]:
+    var real_cap = valid_cap
+    if real_cap < 0 or real_cap > cap_len:
+        real_cap = cap_len
     var cap_pos = List[List[Int]]()
     for i in range(cap_len):
         var pl = List[Int]()
-        pl.append(i + 1); pl.append(0); pl.append(0)
+        if i < real_cap:
+            pl.append(i + 1); pl.append(0); pl.append(0)
+        else:
+            pl.append(0); pl.append(0); pl.append(0)
         cap_pos.append(pl^)
     var x0 = cap_len + 1
     var x_pos = List[List[Int]]()
@@ -290,4 +300,8 @@ def build_positions(
             var pl = List[Int]()
             pl.append(x0); pl.append(ih); pl.append(iw)
             x_pos.append(pl^)
+    while len(x_pos) < n_img:
+        var pl = List[Int]()
+        pl.append(0); pl.append(0); pl.append(0)
+        x_pos.append(pl^)
     return (x_pos^, cap_pos^)

@@ -54,9 +54,17 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
 - Baseline target: `loss=0.541`, `smooth_loss=0.457`, warm cadence
   `2.0-2.2s/it`. Checkpoint:
   `/home/alex/OneTrainer/workspace/alina_zimage_OTpreset_100_baseline/save/2026-06-02_01-06-16-save-99-3-24.safetensors`.
-- The reduced-depth SerenityMojo smoke currently prints loss around `445`.
-  Treat that as truncated-stack wiring/backward proof only, not a baseline.
-  Full-depth Z-Image training with loss around `445` is broken.
+- SerenityMojo full-depth Z-Image LoRA is now on the self-contained Mojo
+  staging/prepare/train path for the Alina 512 dataset. It handles the current
+  production bucket set `72x56/cap224`, `72x56/cap256`, `88x48/cap224`, and
+  `88x48/cap256`.
+- The 2026-06-02 100-step run after the speed fix logged
+  `loss=0.47321588 -> 0.35350168`, `nonfinite=0`, final step `4.075s`, and
+  warm cadence about `4.0-4.15s/step` batch 1. Saved LoRA:
+  `output/alina_zimage/zimage_lora_step100.safetensors`.
+- Do not regress to the old `445` loss or `100s/step` path. The speed fix was
+  keeping LoRA adapters device-resident and using `rms_norm_backward_dx` for
+  frozen RMSNorms instead of computing unused norm weight gradients.
 
 ## Gaps vs Rust/Flame
 
@@ -166,5 +174,7 @@ these runtime primitives directly rather than adding inference-only copies.
   previous path sampled from a local RNG copy each step.
 - New runnable model trainers are not uniformly production-ready:
   SDXL uses a 16x16 latent crop, Anima is a reduced/smoke geometry with cache
-  sidecars, Z-Image is reduced to 4/30 main layers until BF16/offload lands, and
-  all non-Klein loops still depend on precomputed caches for text/data pieces.
+  sidecars, and all non-Klein loops still need their sampling/save/resume
+  cadence audited. Z-Image LoRA is full-depth for the Alina 512 path with Mojo
+  staging/prepare/train, but validation sampling still needs to be wired through
+  the Mojo Z-Image generator with trained LoRA.

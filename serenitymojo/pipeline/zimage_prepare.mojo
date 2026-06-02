@@ -5,13 +5,13 @@
 # files:
 #
 #   output/alina_zimage_stage/*.safetensors
-#     image: [1,3,512,512] F32 or BF16, RGB, values in [-1,1]
+#     image: [1,3,H,W] BF16, RGB, values in [-1,1]
 #   output/alina_zimage_stage/<same stem>.txt
 #
 # and writes the cache consumed by `train_zimage_real.mojo`:
 #
 #   output/alina_zimage_cache/*.safetensors
-#     latent:         [1,16,64,64]    mean VAE latent, unscaled
+#     latent:         [1,16,H/8,W/8]  mean VAE latent, unscaled
 #     text_embedding: [1,512,2560]    Qwen3 layer-34 hidden state
 #     text_mask:      [1,512]         1.0 for real tokens, 0.0 for pad
 #
@@ -47,10 +47,14 @@ comptime TEXT_ENCODER_DIR = ZROOT + "/text_encoder"
 comptime TOK_JSON = ZROOT + "/tokenizer/tokenizer.json"
 comptime STAGE_DIR = "/home/alex/mojodiffusion/output/alina_zimage_stage"
 comptime CACHE_DIR = "/home/alex/mojodiffusion/output/alina_zimage_cache"
-comptime IH = 512
-comptime IW = 512
-comptime LH = IH // 8
-comptime LW = IW // 8
+comptime IH_MAIN = 576
+comptime IW_MAIN = 448
+comptime LH_MAIN = IH_MAIN // 8
+comptime LW_MAIN = IW_MAIN // 8
+comptime IH_TALL = 704
+comptime IW_TALL = 384
+comptime LH_TALL = IH_TALL // 8
+comptime LW_TALL = IW_TALL // 8
 comptime SEQ = 512
 comptime HIDDEN = 2560
 comptime PAD_ID = 151643
@@ -123,10 +127,15 @@ def _load_image(path: String, ctx: DeviceContext) raises -> Tensor:
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
     var image = Tensor.from_view(tv, ctx)
     var sh = image.shape()
-    if len(sh) != 4 or sh[0] != 1 or sh[1] != 3 or sh[2] != IH or sh[3] != IW:
-        raise Error("zimage_prepare: staged image must be [1,3,512,512]")
-    if image.dtype() != STDtype.F32 and image.dtype() != STDtype.BF16:
-        raise Error("zimage_prepare: staged image must be F32 or BF16")
+    if len(sh) != 4 or sh[0] != 1 or sh[1] != 3:
+        raise Error("zimage_prepare: staged image must be [1,3,H,W]")
+    if not (
+        (sh[2] == IH_MAIN and sh[3] == IW_MAIN)
+        or (sh[2] == IH_TALL and sh[3] == IW_TALL)
+    ):
+        raise Error("zimage_prepare: staged image bucket unsupported for this Alina Z-Image run")
+    if image.dtype() != STDtype.BF16:
+        raise Error("zimage_prepare: staged image must be BF16; do not stage Z-Image in F32")
     return image^
 
 
@@ -178,8 +187,10 @@ def main() raises:
     _ = sys_system(String("mkdir -p ") + String(CACHE_DIR))
     _ = sys_system(String("rm -f ") + String(CACHE_DIR) + String("/*.safetensors"))
 
-    print("[load] ZImageVaeEncoder", VAE_DIR)
-    var vae = ZImageVaeEncoder[LH, LW].load(String(VAE_DIR), ctx)
+    print("[load] ZImageVaeEncoder main", VAE_DIR)
+    var vae_main = ZImageVaeEncoder[LH_MAIN, LW_MAIN].load(String(VAE_DIR), ctx)
+    print("[load] ZImageVaeEncoder tall", VAE_DIR)
+    var vae_tall = ZImageVaeEncoder[LH_TALL, LW_TALL].load(String(VAE_DIR), ctx)
     print("[load] Qwen3 text encoder", TEXT_ENCODER_DIR)
     var tok = Qwen3Tokenizer(String(TOK_JSON))
     var qenc = Qwen3Encoder.load(String(TEXT_ENCODER_DIR), Qwen3Config.zimage(), ctx)
@@ -193,9 +204,21 @@ def main() raises:
         print("-- sample", idx + 1, "/", len(files), name)
 
         var image = _load_image(img_path, ctx)
-        var latent = vae.encode_mean(image, ctx)
+        var ish = image.shape()
+        var latent: Tensor
+        if ish[2] == IH_MAIN and ish[3] == IW_MAIN:
+            latent = vae_main.encode_mean(image, ctx)
+        elif ish[2] == IH_TALL and ish[3] == IW_TALL:
+            latent = vae_tall.encode_mean(image, ctx)
+        else:
+            raise Error("zimage_prepare: staged image bucket changed after validation")
         var lsh = latent.shape()
-        if lsh[1] != 16 or lsh[2] != LH or lsh[3] != LW:
+        if lsh[1] != 16 or (
+            not (
+                (lsh[2] == LH_MAIN and lsh[3] == LW_MAIN)
+                or (lsh[2] == LH_TALL and lsh[3] == LW_TALL)
+            )
+        ):
             raise Error("zimage_prepare: VAE latent shape wrong")
 
         var cap = _read_caption(cap_path)

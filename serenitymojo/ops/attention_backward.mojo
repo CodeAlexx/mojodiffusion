@@ -494,6 +494,174 @@ def sdpa_backward[
     return SdpaGrads(dq_t^, dk_t^, dv_t^)
 
 
+# ── decomposed RECTANGULAR SDPA backward (S_q != S_kv, any Dh) ───────────────
+# Shared asymmetric/cross-attention backward primitive (Tenet 1: build once,
+# both Anima cross-attn [Sq=4096,Skv=256,Dh=128] and SDXL cross-attn
+# [Sq=H·W,Skv=77,Dh=64] inherit it).
+#
+# This is a SIBLING of sdpa_backward, NOT an extension of it. The square
+# sdpa_backward bakes a single `S` into every matmul/softmax layout via comptime
+# params; there is no runtime-shape path to generalize without rewriting that
+# comptime API and re-validating Klein/Z-Image/Ernie. A sibling keeps the square
+# entry bit-identical (zero regression) while giving cross-attention its own
+# correct, easy-to-call entry point (Tenet 2: the main rectangular entry is
+# itself correct/fast; callers don't pick a "variant" of the square one).
+#
+# Math (same decomposition, S_q != S_kv shapes):
+#   attn       = softmax_{Skv}(Q@Kᵀ · scale)               [BH, Sq, Skv]
+#   d_v        = attnᵀ @ d_out                              [BH, Skv, Dh]
+#   grad_attn  = d_out @ Vᵀ                                 [BH, Sq, Skv]
+#   grad_scores= softmax_bwd(attn, grad_attn) over Skv      [BH, Sq, Skv]
+#   d_q        = (grad_scores @ K)  · scale                 [BH, Sq, Dh]
+#   d_k        = (grad_scoresᵀ @ Q) · scale                 [BH, Skv, Dh]
+# All interior math F32; BF16/F16 only at the gather/scatter storage boundary.
+# Non-causal, no mask grad (mask is additive bias / zero for diffusion paths).
+def sdpa_backward_rect[
+    B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int
+](
+    q: Tensor,      # [B, Sq,  H, Dh]
+    k: Tensor,      # [B, Skv, H, Dh]
+    v: Tensor,      # [B, Skv, H, Dh]
+    d_out: Tensor,  # [B, Sq,  H, Dh]
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaGrads:
+    """Decomposed (math-mode) RECTANGULAR SDPA backward (S_q != S_kv).
+
+    q, d_out: [B, Sq, H, Dh]; k, v: [B, Skv, H, Dh] (BSHD row-major, same dtype).
+    scale:    Float32 (the SAME 1/sqrt(Dh) used in the forward).
+    returns SdpaGrads{d_q [B,Sq,H,Dh], d_k [B,Skv,H,Dh], d_v [B,Skv,H,Dh]} in
+    q's dtype. Self-attention (Sq==Skv) also works through here.
+    """
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype() or q.dtype() != d_out.dtype():
+        raise Error("sdpa_backward_rect: q/k/v/d_out dtype mismatch")
+    var qshape = q.shape()
+    if len(qshape) != 4 or qshape[0] != B or qshape[1] != Sq or qshape[2] != H or qshape[3] != Dh:
+        raise Error("sdpa_backward_rect: q shape != [B,Sq,H,Dh]")
+    var kshape = k.shape()
+    if len(kshape) != 4 or kshape[0] != B or kshape[1] != Skv or kshape[2] != H or kshape[3] != Dh:
+        raise Error("sdpa_backward_rect: k shape != [B,Skv,H,Dh]")
+    var vshape = v.shape()
+    if len(vshape) != 4 or vshape[0] != B or vshape[1] != Skv or vshape[2] != H or vshape[3] != Dh:
+        raise Error("sdpa_backward_rect: v shape != [B,Skv,H,Dh]")
+    var doshape = d_out.shape()
+    if len(doshape) != 4 or doshape[0] != B or doshape[1] != Sq or doshape[2] != H or doshape[3] != Dh:
+        raise Error("sdpa_backward_rect: d_out shape != [B,Sq,H,Dh]")
+
+    var out_dt = q.dtype()
+    comptime BH = B * H
+    comptime q_src_rows = B * Sq * H        # BSHD row count for q-side tensors
+    comptime kv_src_rows = B * Skv * H      # BSHD row count for kv-side tensors
+    comptime q_bhsd_rows = B * H * Sq       # BHSD-contig row count, q side
+    comptime kv_bhsd_rows = B * H * Skv     # BHSD-contig row count, kv side
+
+    # The shared gather/scatter helpers take B,S,H,Dh as RUNTIME args, so the
+    # same kernels serve both Sq-length (q, d_out, d_q) and Skv-length (k, v,
+    # d_k, d_v) tensors; only the RuntimeLayout row counts differ.
+    var q_src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](q_src_rows, Dh))
+    var kv_src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](kv_src_rows, Dh))
+    var q_bhsd_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](q_bhsd_rows, Dh))
+    var kv_bhsd_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](kv_bhsd_rows, Dh))
+    var q_head_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Sq, Dh))   # [Sq,Dh]
+    var kv_head_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Skv, Dh)) # [Skv,Dh]
+    var sc_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Sq, Skv))      # [Sq,Skv]
+
+    # ── 1) gather q,d_out (Sq) and k,v (Skv) BSHD -> BHSD-contig F32 ─────────
+    var qf = ctx.enqueue_create_buffer[DType.float32](q_bhsd_rows * Dh)
+    var kf = ctx.enqueue_create_buffer[DType.float32](kv_bhsd_rows * Dh)
+    var vf = ctx.enqueue_create_buffer[DType.float32](kv_bhsd_rows * Dh)
+    var gof = ctx.enqueue_create_buffer[DType.float32](q_bhsd_rows * Dh)
+    var qd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](qf.unsafe_ptr(), q_bhsd_rl)
+    var kd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](kf.unsafe_ptr(), kv_bhsd_rl)
+    var vd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](vf.unsafe_ptr(), kv_bhsd_rl)
+    var god = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gof.unsafe_ptr(), q_bhsd_rl)
+    _gather_to_f32(q, qd, B, Sq, H, Dh, q_src_rl, ctx)
+    _gather_to_f32(k, kd, B, Skv, H, Dh, kv_src_rl, ctx)
+    _gather_to_f32(v, vd, B, Skv, H, Dh, kv_src_rl, ctx)
+    _gather_to_f32(d_out, god, B, Sq, H, Dh, q_src_rl, ctx)
+
+    # ── 2) recompute attn = softmax_{Skv}(Q@Kᵀ * scale)  [BH,Sq,Skv] ────────
+    var attn = ctx.enqueue_create_buffer[DType.float32](BH * Sq * Skv)
+    var qptr = qf.unsafe_ptr()
+    var kptr = kf.unsafe_ptr()
+    var vptr = vf.unsafe_ptr()
+    var goptr = gof.unsafe_ptr()
+    var aptr = attn.unsafe_ptr()
+    for bh in range(BH):
+        var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](qptr + bh * Sq * Dh, q_head_rl)
+        var Bt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](kptr + bh * Skv * Dh, kv_head_rl)
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr + bh * Sq * Skv, sc_rl)
+        matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)  # Q@Kᵀ -> [Sq,Skv]
+    # scale + softmax over last dim Skv (one block per [BH*Sq] row)
+    comptime sm_rows = BH * Sq
+    var sc_full_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](sm_rows, Skv))
+    var attn_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr, sc_full_rl)
+    var nsm = sm_rows * Skv
+    var smgrid = (nsm + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        attn_full, scale, sm_rows, Skv, grid_dim=smgrid, block_dim=_BLOCK)
+    ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
+        attn_full, Skv, grid_dim=sm_rows, block_dim=_TPB)
+
+    # ── 3) d_v = attnᵀ @ d_out  [BH,Skv,Dh] ─────────────────────────────────
+    var dvf = ctx.enqueue_create_buffer[DType.float32](kv_bhsd_rows * Dh)
+    var dvptr = dvf.unsafe_ptr()
+    for bh in range(BH):
+        var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr + bh * Sq * Skv, sc_rl)
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](goptr + bh * Sq * Dh, q_head_rl)
+        var DV = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr + bh * Skv * Dh, kv_head_rl)
+        # DV[Skv,Dh] = Pᵀ[Skv,Sq] @ GO[Sq,Dh]  → transpose_a (attnᵀ)
+        matmul(ctx, DV, P, GO, transpose_a=True, c_row_major=True)
+
+    # ── 4) grad_attn = d_out @ Vᵀ  [BH,Sq,Skv] (fresh scores buffer) ────────
+    var gscores = ctx.enqueue_create_buffer[DType.float32](BH * Sq * Skv)
+    var gsptr = gscores.unsafe_ptr()
+    for bh in range(BH):
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](goptr + bh * Sq * Dh, q_head_rl)
+        var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](vptr + bh * Skv * Dh, kv_head_rl)
+        var GA = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr + bh * Sq * Skv, sc_rl)
+        # GA[Sq,Skv] = GO[Sq,Dh] @ Vh[Skv,Dh]ᵀ
+        matmul(ctx, GA, GO, Vh, transpose_b=True, c_row_major=True)
+
+    # ── 5) softmax backward over Skv: grad_scores = attn*(grad_attn - rowsum) ─
+    var gs_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr, sc_full_rl)
+    ctx.enqueue_function[_softmax_bwd_rows_f32, _softmax_bwd_rows_f32](
+        attn_full, gs_full, Skv, grid_dim=sm_rows, block_dim=_TPB)
+
+    # ── 6) d_q = (grad_scores @ K)·scale [BH,Sq,Dh] ;
+    #        d_k = (grad_scoresᵀ @ Q)·scale [BH,Skv,Dh] ──────────────────────
+    var dqf = ctx.enqueue_create_buffer[DType.float32](q_bhsd_rows * Dh)
+    var dkf = ctx.enqueue_create_buffer[DType.float32](kv_bhsd_rows * Dh)
+    var dqptr = dqf.unsafe_ptr()
+    var dkptr = dkf.unsafe_ptr()
+    for bh in range(BH):
+        var DS = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr + bh * Sq * Skv, sc_rl)
+        var Kh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](kptr + bh * Skv * Dh, kv_head_rl)
+        var Qh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](qptr + bh * Sq * Dh, q_head_rl)
+        var DQ = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr + bh * Sq * Dh, q_head_rl)
+        var DK = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr + bh * Skv * Dh, kv_head_rl)
+        matmul(ctx, DQ, DS, Kh, transpose_b=False, c_row_major=True)  # [Sq,Skv]@[Skv,Dh]
+        matmul(ctx, DK, DS, Qh, transpose_a=True, c_row_major=True)   # [Skv,Sq]@[Sq,Dh]
+    # scale d_q and d_k by `scale`
+    var dq_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr, q_bhsd_rl)
+    var dk_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr, kv_bhsd_rl)
+    var ndq = q_bhsd_rows * Dh
+    var ndk = kv_bhsd_rows * Dh
+    var dqgrid = (ndq + _BLOCK - 1) // _BLOCK
+    var dkgrid = (ndk + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dq_full, scale, q_bhsd_rows, Dh, grid_dim=dqgrid, block_dim=_BLOCK)
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dk_full, scale, kv_bhsd_rows, Dh, grid_dim=dkgrid, block_dim=_BLOCK)
+
+    # ── 7) scatter BHSD F32 -> BSHD storage dtype (Sq for d_q, Skv for d_k/d_v)
+    var dq_t = _scatter_to_tensor(dq_full, B, Sq, H, Dh, out_dt, q_src_rl, ctx)
+    var dk_t = _scatter_to_tensor(dk_full, B, Skv, H, Dh, out_dt, kv_src_rl, ctx)
+    var dv_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr, kv_bhsd_rl)
+    var dv_t = _scatter_to_tensor(dv_full, B, Skv, H, Dh, out_dt, kv_src_rl, ctx)
+    return SdpaGrads(dq_t^, dk_t^, dv_t^)
+
+
 def sdpa_backward_scratch[
     B: Int, S: Int, H: Int, Dh: Int
 ](

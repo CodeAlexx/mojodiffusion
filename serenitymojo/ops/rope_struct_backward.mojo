@@ -111,6 +111,40 @@ def _rope_bwd_halfsplit_kernel_f32(
         dx[r, i + half] = rebind[dx.element_type](-g0 * sv + g1 * cv)
 
 
+# HALFSPLIT backward with a FULL-WIDTH table (cos[i] may differ from cos[i+half]).
+# Forward (rope._rope_halfsplit_full_kernel, = diffusers ERNIE apply_rotary_emb on
+# the interleaved-doubled table):
+#   o[i]      = x[i]*c0 - x[i+half]*s0     (c0=cos[i],      s0=sin[i])
+#   o[i+half] = x[i+half]*c1 + x[i]*s1     (c1=cos[i+half], s1=sin[i+half])
+# Jacobian-transpose (g = grad_out):
+#   dx[i]      = g[i]*c0 + g[i+half]*s1
+#   dx[i+half] = -g[i]*s0 + g[i+half]*c1
+# Reduces to the single-angle halfsplit kernel ONLY when c0==c1 and s0==s1
+# (the degenerate table). The real ERNIE table has c0!=c1, so the half-width
+# kernel is wrong there — this kernel reads BOTH angles (full-width table).
+def _rope_bwd_halfsplit_full_kernel_f32(
+    g: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],   # grad_out [rows, D]
+    cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin], # [rows, D] full-width
+    sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin], # [rows, D] full-width
+    dx: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],  # [rows, D]
+    rows: Int,
+    half: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = rows * half
+    if idx < total:
+        var r = idx // half
+        var i = idx % half
+        var g0 = rebind[Scalar[DType.float32]](g[r, i])
+        var g1 = rebind[Scalar[DType.float32]](g[r, i + half])
+        var c0 = rebind[Scalar[DType.float32]](cos[r, i])
+        var s0 = rebind[Scalar[DType.float32]](sin[r, i])
+        var c1 = rebind[Scalar[DType.float32]](cos[r, i + half])
+        var s1 = rebind[Scalar[DType.float32]](sin[r, i + half])
+        dx[r, i] = rebind[dx.element_type](g0 * c0 + g1 * s1)
+        dx[r, i + half] = rebind[dx.element_type](-g0 * s0 + g1 * c1)
+
+
 def _rope_bwd_validate(
     grad_out: Tensor, cos: Tensor, sin: Tensor
 ) raises -> List[Int]:
@@ -184,6 +218,84 @@ def rope_backward(
         ctx.enqueue_function[
             _rope_bwd_halfsplit_kernel_f32, _rope_bwd_halfsplit_kernel_f32
         ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())
+
+
+def _rope_bwd_full_validate(
+    grad_out: Tensor, cos: Tensor, sin: Tensor
+) raises -> List[Int]:
+    """Shape checks for the FULL-WIDTH halfsplit backward. Returns [rows, half].
+
+    Mirrors rope._rope_full_validate: cos/sin are [rows, D] (NOT [rows, D/2]),
+    so the kernel can read both cos[i] and cos[i+half]."""
+    var gshape = grad_out.shape()
+    if len(gshape) < 1:
+        raise Error("rope_halfsplit_full_backward: grad_out must have rank >= 1")
+    var d = gshape[len(gshape) - 1]
+    if d % 2 != 0:
+        raise Error("rope_halfsplit_full_backward: last dim D must be even")
+    var half = d // 2
+    var rows = 1
+    for i in range(len(gshape) - 1):
+        rows *= gshape[i]
+    if cos.numel() != rows * d:
+        raise Error("rope_halfsplit_full_backward: cos numel must equal rows*D")
+    if sin.numel() != rows * d:
+        raise Error("rope_halfsplit_full_backward: sin numel must equal rows*D")
+    if (grad_out.dtype() != STDtype.F32 or cos.dtype() != STDtype.F32
+            or sin.dtype() != STDtype.F32):
+        raise Error("rope_halfsplit_full_backward: F32 only (grad_out/cos/sin)")
+    var out = List[Int]()
+    out.append(rows)
+    out.append(half)
+    return out^
+
+
+def rope_halfsplit_full_backward(
+    grad_out: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Backward of the half-split RoPE forward `rope.rope_halfsplit_full`, where
+    the cos/sin tables are FULL-WIDTH [rows, D] and cos[i] may differ from
+    cos[i+D/2] (the real ERNIE interleaved-doubled table). Returns d_x only
+    (cos/sin are non-learnable). Matches diffusers ERNIE apply_rotary_emb autograd.
+
+    grad_out: [..., D] (D even; leading dims flattened to rows)
+    cos/sin:  [rows, D]  (FULL-WIDTH — both halves carry their own angle)
+
+    Use this (NOT `rope_backward(..., interleaved=False)`) whenever the forward
+    used `rope_halfsplit_full` on a table where the two halves differ. The
+    half-width `rope_backward` arm is correct only for the degenerate
+    cos[i]==cos[i+half] table; it silently aliases the wrong angle otherwise.
+    """
+    var dims = _rope_bwd_full_validate(grad_out, cos, sin)
+    var rows = dims[0]
+    var half = dims[1]
+    var d = half * 2
+
+    var dx_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var f_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var total = rows * half
+    var grid = (total + _BLOCK - 1) // _BLOCK
+
+    var G = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        grad_out.buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+    var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+    )
+    var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+    )
+    var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+    ctx.enqueue_function[
+        _rope_bwd_halfsplit_full_kernel_f32, _rope_bwd_halfsplit_full_kernel_f32
+    ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())
 
 

@@ -1,0 +1,35 @@
+{
+  "model_type": "sdxl",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/sdxl_unet_bf16.safetensors",
+  "vae": "/home/alex/madebyollin_sdxl-vae-fp16-fix/sdxl_vae.safetensors",
+
+  "in_channels": 4,
+  "out_channels": 4,
+  "model_channels": 320,
+  "channel_mult": [1, 2, 4],
+  "num_res_blocks": 2,
+  "context_dim": 2048,
+  "head_dim": 64,
+  "adm_in_channels": 2816,
+  "num_groups": 32,
+  "transformer_depth_input": [0, 0, 2, 2, 10, 10],
+  "transformer_depth_middle": 10,
+  "transformer_depth_output": [10, 10, 10, 2, 2, 2, 0, 0, 0],
+  "time_embed_dim": 1280,
+
+  "learning_rate": 1e-4,
+  "lora_rank": 16,
+  "lora_alpha": 16,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 3000,
+  "save_every": 500,
+  "sample_every": 250,
+
+  "beta_start": 0.00085,
+  "beta_end": 0.012,
+  "num_train_timesteps": 1000,
+  "prediction_type": "epsilon",
+
+  "optimizer": { "eps": 1e-8, "weight_decay": 0.0, "beta1": 0.9, "beta2": 0.999 }
+}

@@ -1,0 +1,32 @@
+# pixi environments (5.6 GB; regenerate with `pixi install`)
+.pixi/*
+!.pixi/config.toml
+
+# Generated images
+output/
+
+# Parity oracle dumps (~479 MB; regenerable from serenitymojo/**/parity/*.py + GPU)
+*.bin
+*.shape
+
+# Python / build cruft
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.mojopkg
+
+# Session archive artifact (324 MB) — not source
+serenitymojo.zip
+
+# Parity oracle weight dumps (regenerable from parity/*.py + GPU, same as *.bin)
+*.safetensors
+
+# Logs (run/profile/skeptic) — not source
+*.log
+
+# Generated probe/sample images
+*.png
+
+# Agent scratch (not source)
+.claude/agent-memory/

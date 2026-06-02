@@ -1,0 +1,39 @@
+# Z-Image text-to-image serving benchmark on MAX (3090 Ti test).
+# Mirrors max's serving_flux2_t2i_random_config.yaml, swapped to Z-Image.
+# Run via run_zimage_max_bench.sh (which serves the model first).
+name: "Serving Benchmark - Z-Image T2I Random (3090)"
+description: "Measure MAX Z-Image t2i latency/throughput on consumer Ampere via /v1/responses."
+version: "0.0.1"
+
+benchmark_config:
+  model: "Tongyi-MAI/Z-Image"
+  benchmark_task: "text-to-image"
+  endpoint: "/v1/responses"
+  dataset_name: "synthetic-pixel"
+  num_chat_sessions: null
+
+  # Workload — small, single-stream, just enough to get a steady latency.
+  num_prompts: 4
+  request_rate: "inf"
+  max_concurrency: 1
+  max_benchmark_duration_s: null
+
+  # Server target
+  host: "localhost"
+  port: 8000
+  base_url: null
+
+  # T2I generation options — 1024^2, modest step count (per-step scales linearly).
+  image_width: 1024
+  image_height: 1024
+  image_steps: 20
+  image_guidance_scale: 3.5
+  image_negative_prompt: null
+  image_seed: 42
+
+  # Output and observability
+  skip_test_prompt: false
+  collect_gpu_stats: true
+  collect_cpu_stats: true
+  collect_server_stats: true
+  result_filename: "zimage_max_bench_result.json"

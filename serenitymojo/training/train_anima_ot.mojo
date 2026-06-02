@@ -845,13 +845,19 @@ def main() raises:
         )
         if prof:
             ctx.synchronize()
-            print("[PROF] backward(incl per-block recompute) =",
+            print("[PROF] backward(reads saved activations; no recompute) =",
                   Float32(Float64(perf_counter_ns() - t_bwd0) / 1.0e9), "s")
 
         # ── global-norm clip then AdamW over all adapters ──
+        var t_opt0 = perf_counter_ns()
         var gn_before = _global_norm(grads)
         _clip(grads, CLIP_NORM)
         anima_lora_adamw_step(lora, grads, step + 1, LR, ctx)
+        if prof:
+            ctx.synchronize()
+            print("[PROF] optimizer(global_norm+clip+host AdamW) =",
+                  Float32(Float64(perf_counter_ns() - t_opt0) / 1.0e9),
+                  "s  (lever-2 target: device-resident LoRA optimizer)")
 
         var b_after = Float32(0.0)
         var b_nonzero = 0

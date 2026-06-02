@@ -113,12 +113,17 @@ struct AnimaStackForward(Movable):
     var fl_shift: TArc            # [B,D]
     var fl_scale: TArc            # [B,D]
     var fl_xmod: TArc             # [B,S_img,D] apply_adaln output (final_linear input)
+    # SAVED-ACTIVATION fast path (device-resident only): each block's full
+    # AnimaBlockSaved retained so backward READS it instead of recomputing the
+    # block forward. Empty for the recompute paths (streamed / small-depth parity).
+    var blk_saved: List[AnimaBlockSaved]
 
     def __init__(
         out self,
         var out: List[Float32], var x_emb: List[Float32],
         var blk_x_in: List[TArc], var x_final: TArc, var fl_ln: TArc,
         var fl_mod_h: TArc, var fl_shift: TArc, var fl_scale: TArc, var fl_xmod: TArc,
+        var blk_saved: List[AnimaBlockSaved] = List[AnimaBlockSaved](),
     ):
         self.out = out^
         self.x_emb = x_emb^
@@ -129,6 +134,7 @@ struct AnimaStackForward(Movable):
         self.fl_shift = fl_shift^
         self.fl_scale = fl_scale^
         self.fl_xmod = fl_xmod^
+        self.blk_saved = blk_saved^
 
 
 # ── BACKWARD RESULT: input-patch grad + per-block grads + summed shared grads ─

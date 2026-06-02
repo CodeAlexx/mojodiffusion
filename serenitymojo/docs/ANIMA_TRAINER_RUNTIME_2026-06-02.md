@@ -9,9 +9,11 @@ the slow anti-pattern) with an all-device-tensor forward/backward. See
 ## Result
 
 - Speed at 512px (LATENT_HW=64, S_IMG=1024, S_TXT=512, batch 1, BF16 base):
-  **~1.34 s/step** (20-step wall 26.83s, incl. step-0 warmup), down from the
-  streamed host path's **~46 s/step** — a **~34× speedup**.
-- Peak VRAM **~7.2 GiB** / 24 GiB; GPU temp ~55–57 °C (cap 78 °C).
+  **~1.14 s/step** warm (was ~1.37 before the saved-activation lever below; the
+  original streamed host path was ~46 s/step — a ~40× speedup overall).
+- Peak VRAM **~13.6 GiB** / 24 GiB (was ~7.2 GiB before activations were retained;
+  the saved-activation fast path adds ~6.4 GiB and stays well inside budget); GPU
+  temp ≤64 °C (cap 78 °C).
 - `nonfinite = 0` every step; all 280 LoRA-B adapters grow (B-nonzero 280/280);
   loss falls under the fixed-σ smoke (0.1493 → 0.1426 over 6 steps).
 - Still above OneTrainer's 0.69 s/step Anima 512px target — remaining gap is the
@@ -98,26 +100,69 @@ New code (host-streamed path left intact behind a flag for the parity gate):
    from the Klein nsys fix) cover the AdaLN shift/scale/gate split — no per-row D2D
    storm.
 
+## Saved-activation fast path (recompute removed) — 2026-06-02 update
+
+The backward no longer recomputes the per-block forward. The device-resident
+forward now RETAINS every block's full `AnimaBlockSaved` (all internal
+activations, device-resident) in `AnimaStackForward.blk_saved`; the backward READS
+`saved.blk_saved[bi]` and runs `anima_block_lora_backward_device_tensors` directly.
+A recompute fallback is kept for the (unused-in-trainer) empty-`blk_saved` path.
+
+What changed:
+- `models/anima/block.mojo`: `_SubSaved`/`_AttnSaved`/`AnimaBlockSaved` made
+  `Copyable` (they hold only `TArc`/`ArcPointer` — a copy is a refcount bump that
+  shares device storage, so List storage + the per-block `.copy()` are cheap).
+- `models/anima/anima_stack.mojo`: `AnimaStackForward` gained
+  `var blk_saved: List[AnimaBlockSaved]` (default empty; the 3 recompute/streamed
+  construction sites pass empty, the device-resident forward fills it).
+- `models/anima/anima_stack_lora.mojo`: device-resident forward appends each
+  block's `fwd.saved.copy()`; device-resident backward branches on
+  `have_saved == (len(blk_saved)==num_blocks)` → READ saved (no recompute) vs the
+  recompute fallback. Shared conditioning is only re-uploaded in the fallback.
+
+PARITY (unchanged, PASS): `anima_resident_vs_streamed_parity` cos(out)=1.0,
+cos(d_A)=1.0, cos(d_B)=0.9999999999999998, cos(d_patches)=1.0, cos(d_t_silu)=1.0,
+worst per-adapter cos=0.9999999999999998, nonfinite=0 both paths. Identical to
+before — saving activations did not change the math.
+
+SPEED (512px, S_IMG=1024, batch 1, BF16 base, fixed-σ smoke, device-synced):
+
+| phase | before (recompute) | after (saved) |
+| --- | --- | --- |
+| forward | 0.202 s | 0.203 s |
+| backward | 0.921 s | **0.707 s** |
+| optimizer (global_norm+clip+host AdamW) | ~0.125 s | 0.125 s |
+| warm s/step | ~1.37 | **~1.14** |
+
+Peak VRAM **~13.6 GiB** / 24 (was ~7.2 GiB; the retained 28-block activations add
+~6.4 GiB — well inside budget, NO tail/subset needed). GPU temp ≤64 °C (cap 78).
+nonfinite=0 every step; loss falls 0.1493 → 0.1259 over 16 steps; LoRA-B grows
+280/280; LEARNING PASS (lora closer to target than base). The recompute was ~0.21 s
+of the old 0.92 s backward (less than the 0.25 s estimate); removing it is the full
+win this lever can give.
+
 ## Remaining gap to OT's 0.69 s/step
 
-Measured warm-step split (step 2, device-synced): **forward = 0.202 s**,
-**backward (incl per-block recompute) = 0.921 s**; the rest of the ~1.3s step is
-host-side loss/d_out, patchify, LoRA upload, grad D2H + host AdamW. The backward
-RECOMPUTES the full block forward per block before running the block backward
-(the Z-Image activation-memory tradeoff — only block INPUTS are saved, not all
-internal activations). Per-block backward sub-phases (trace): mlp≈7ms ca≈8ms
-sa≈9ms ≈ 24ms/block × 28 ≈ 0.67s actual backward, so ≈0.25s of the 0.92s is the
-recompute-forward. Closing the gap to OT means either:
+After the saved-activation lever, the warm step is ~1.14 s, split: forward 0.20 s +
+backward **0.707 s** + optimizer 0.125 s + ~0.11 s host tail (loss/d_out, patchify,
+LoRA upload, grad D2H). The backward is now near pure backward MATH: per-block trace
+mlp≈9.5 ms ca≈7.8 ms sa≈9.3 ms ≈ 26 ms/block × 28 ≈ 0.71 s. There is no recompute
+left to remove — the 0.71 s IS the 28-block LoRA backward. So the primary lever
+alone cannot reach OT's 0.69 s; the backward math itself is the floor.
 
-- save more per-block activations (memory-budgeted) to skip the recompute — OT
-  keeps activations resident; we have ~17 GiB headroom at S_IMG=1024 batch 1; or
-- a device-resident LoRA optimizer + on-device global-norm (the Klein handoff's
-  shared next step) to drop the per-step grad D2H + host AdamW; or
-- fuse the AdaLN-mod chain / batch the 10 LoRA projections.
+Next levers (each a separate, smaller win — none reaches OT alone):
 
-The per-block backward trace (step 1): `mlp≈10ms ca≈7.5ms sa≈8.9ms` ≈ 26ms/block ×
-28 ≈ 0.73s actual backward; the rest is recompute. Saving activations to skip the
-recompute is the single biggest lever left and should land it near OT.
+- **Device-resident LoRA optimizer (lever 2, ~0.125 s):** keep LoRA A/B + Adam m/v
+  device-resident across steps, compute global-norm on device
+  (`training/on_device_global_norm.mojo`), apply AdamW on device
+  (`training/fused_adamw_multitensor.mojo`), removing the per-step bulk grad D2H +
+  host per-adapter AdamW loop. This is a real state-management rewrite of
+  `AnimaLoraSet`/`LoraAdapter` (state currently lives host-side and is saved/resumed
+  host-side) — left for a follow-up; ROI is ~0.125 s, landing ~1.02 s, still above
+  OT.
+- **Shrink the 0.71 s backward math:** fuse the AdaLN-mod chain, batch the 10 LoRA
+  projections, or BF16 the backward matmuls (parity-gated). This is the only lever
+  that can actually approach 0.69 s, because the backward math is the floor.
 
 ## Build / run
 

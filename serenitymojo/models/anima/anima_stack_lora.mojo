@@ -618,6 +618,10 @@ def anima_stack_lora_forward_device_resident[
 
     var x_arc = TArc(_t(x_emb.copy(), [B, S_IMG, D], ctx))
     var blk_x_in = List[TArc]()
+    # SAVED-ACTIVATION fast path: retain each block's full AnimaBlockSaved so the
+    # backward READS it instead of recomputing the block forward (the OT-parity
+    # speed lever). Device-resident; ~17 GiB headroom at 512px/S_IMG=1024 BF16.
+    var blk_saved = List[AnimaBlockSaved]()
     for bi in range(num_blocks):
         blk_x_in.append(x_arc.copy())   # device block-input checkpoint
         var bl = _block_lora_dev_for(lora, bi)
@@ -626,6 +630,7 @@ def anima_stack_lora_forward_device_resident[
             blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx,
         )
         x_arc = fwd.out.copy()
+        blk_saved.append(fwd.saved.copy())   # retain for backward (no recompute)
 
     # ── final layer (identical to base/streamed stack; device-resident) ──
     var fl_h = linear(t_silu_arc[], base.fl_mod1[], Optional[Tensor](None), ctx)
@@ -650,6 +655,7 @@ def anima_stack_lora_forward_device_resident[
         out^, x_emb.copy(), blk_x_in^,
         x_arc.copy(), TArc(fl_ln^),
         TArc(fl_h^), TArc(fl_shift^), TArc(fl_scale^), TArc(fl_xmod^),
+        blk_saved^,
     )
 
 
@@ -669,11 +675,11 @@ def anima_stack_lora_backward_device_resident[
     var num_blocks = len(blocks)
     var ln_ones = _t(_ones(D), [D], ctx)
 
-    # shared conditioning (re-uploaded once for the backward recompute).
-    var t_silu_dev = silu(_t(t_cond.copy(), [B, ANIMA_HIDDEN], ctx), ctx)
-    var t_silu_arc = TArc(t_silu_dev^)
-    var base_t_arc = TArc(_t(base_adaln.copy(), [B, 3 * D], ctx))
-    var ctx_t_arc = TArc(_t(context.copy(), [B, S_TXT, JOINT], ctx))
+    # SAVED-ACTIVATION fast path: the forward retained every block's AnimaBlockSaved,
+    # so the backward READS it (no per-block recompute forward, no re-upload of the
+    # shared conditioning for the block loop). This removes the recompute that
+    # dominated the backward time.
+    var have_saved = len(saved.blk_saved) == num_blocks
 
     var d_t_silu_acc = _t(_zeros(B * ANIMA_HIDDEN), [B, ANIMA_HIDDEN], ctx)
 
@@ -694,28 +700,52 @@ def anima_stack_lora_backward_device_resident[
     var d_fl_tsilu = linear_backward_dx(d_fl_modh, base.fl_mod1[], B, ANIMA_HIDDEN, 256, ctx)
     d_t_silu_acc = add(d_t_silu_acc, d_fl_tsilu, ctx)
 
-    # ── block backward (REVERSE; per-block device recompute) ──
+    # shared conditioning is only needed for the recompute FALLBACK (have_saved=False).
+    var t_silu_arc = TArc(_t(_zeros(1), [1], ctx))
+    var base_t_arc = TArc(_t(_zeros(1), [1], ctx))
+    var ctx_t_arc = TArc(_t(_zeros(1), [1], ctx))
+    if not have_saved:
+        t_silu_arc = TArc(silu(_t(t_cond.copy(), [B, ANIMA_HIDDEN], ctx), ctx))
+        base_t_arc = TArc(_t(base_adaln.copy(), [B, 3 * D], ctx))
+        ctx_t_arc = TArc(_t(context.copy(), [B, S_TXT, JOINT], ctx))
+
+    # ── block backward (REVERSE; READ saved activations, no recompute) ──
     var grad_indices = List[Int]()
     var d_a_t = List[TArc]()
     var d_b_t = List[TArc]()
     var bi = num_blocks - 1
     while bi >= 0:
         var bl = _block_lora_dev_for(lora, bi)
-        var refwd = anima_block_lora_forward_device_tensor[H, Dh, S_IMG, S_TXT](
-            saved.blk_x_in[bi].copy(), t_silu_arc.copy(), base_t_arc.copy(), ctx_t_arc.copy(),
-            blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx,
-        )
         var do_trace = trace and (bi == num_blocks - 1)
-        var bg = anima_block_lora_backward_device_tensors[H, Dh, S_IMG, S_TXT](
-            d_x[], refwd.saved, blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx, do_trace,
-        )
-        d_x = bg.d_x.copy()
-        d_t_silu_acc = add(d_t_silu_acc, bg.d_t_silu[], ctx)
-        var base_idx = bi * ANIMA_SLOTS
-        for s in range(ANIMA_SLOTS):
-            grad_indices.append(base_idx + s)
-            d_a_t.append(bg.d_a[s].copy())
-            d_b_t.append(bg.d_b[s].copy())
+        if have_saved:
+            # READ the retained activations directly (no recompute forward).
+            var bg = anima_block_lora_backward_device_tensors[H, Dh, S_IMG, S_TXT](
+                d_x[], saved.blk_saved[bi], blocks[bi], bl, cos, sin,
+                B, D, JOINT, F, eps, ctx, do_trace,
+            )
+            d_x = bg.d_x.copy()
+            d_t_silu_acc = add(d_t_silu_acc, bg.d_t_silu[], ctx)
+            var base_idx = bi * ANIMA_SLOTS
+            for s in range(ANIMA_SLOTS):
+                grad_indices.append(base_idx + s)
+                d_a_t.append(bg.d_a[s].copy())
+                d_b_t.append(bg.d_b[s].copy())
+        else:
+            # Recompute fallback (empty blk_saved path).
+            var refwd = anima_block_lora_forward_device_tensor[H, Dh, S_IMG, S_TXT](
+                saved.blk_x_in[bi].copy(), t_silu_arc.copy(), base_t_arc.copy(), ctx_t_arc.copy(),
+                blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx,
+            )
+            var bg = anima_block_lora_backward_device_tensors[H, Dh, S_IMG, S_TXT](
+                d_x[], refwd.saved, blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx, do_trace,
+            )
+            d_x = bg.d_x.copy()
+            d_t_silu_acc = add(d_t_silu_acc, bg.d_t_silu[], ctx)
+            var base_idx = bi * ANIMA_SLOTS
+            for s in range(ANIMA_SLOTS):
+                grad_indices.append(base_idx + s)
+                d_a_t.append(bg.d_a[s].copy())
+                d_b_t.append(bg.d_b[s].copy())
         bi -= 1
 
     # ── patch-embed backward (frozen base; d_patches load-bearing) ──

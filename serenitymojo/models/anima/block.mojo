@@ -178,7 +178,7 @@ def _rms_per_head(x: Tensor, norm_w: Tensor, ctx: DeviceContext) raises -> Tenso
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Per-sub-block saved activations for the hand-chained backward.
-struct _SubSaved(Movable):
+struct _SubSaved(Copyable, Movable):
     var x_in: TArc       # [B,S,D] F32   residual-stream input to this sub-block
     var ln: TArc         # [B,S,D] F32   layer_norm(x_in) (no affine)
     var x_mod: TArc      # [B,S,D] F32   adaln-pre output  (sub-block input)
@@ -208,7 +208,7 @@ struct _SubSaved(Movable):
 #   attn_flat:    [B,Sq,D] reshape(sdpa(...)) — input to output_proj
 #   q_ctx_in:     attention q-side input (sa_xmod for self, ca_xmod for cross)
 #   kv_ctx_in:    attention k/v-side input (sa_xmod for self, context for cross)
-struct _AttnSaved(Movable):
+struct _AttnSaved(Copyable, Movable):
     var q_sdpa: TArc     # [B,Sq,H,Dh]
     var k_sdpa: TArc     # [B,Skv,H,Dh]
     var v4: TArc         # [B,Skv,H,Dh]
@@ -231,7 +231,7 @@ struct _AttnSaved(Movable):
         self.attn_flat = attn_flat^; self.q_ctx_in = q_ctx_in^; self.kv_ctx_in = kv_ctx_in^
 
 
-struct AnimaBlockSaved(Movable):
+struct AnimaBlockSaved(Copyable, Movable):
     var sa: _SubSaved
     var ca: _SubSaved
     var mlp: _SubSaved

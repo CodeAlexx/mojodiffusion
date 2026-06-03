@@ -585,7 +585,18 @@ Do not present it as production.
 
 ### SDXL / Ernie
 
-Have compile/smoke progress but are not the active immediate goal.
+SDXL has compile/smoke progress but is not the active immediate goal.
+
+Ernie is the next target after Anima. The OneTrainer mapping is now recorded in
+`serenitymojo/training/TRAINING_PLAN_ernie.md`. Key reminders:
+
+- OneTrainer is read-only reference only.
+- Production Ernie must be self-contained Mojo, not MGDS/Rust/Python cache
+  dependent.
+- Ernie uses Flux2/Klein-style VAE BatchNorm scaling after patchify.
+- LoRA train shift is OneTrainer default `1.0`; sampling scheduler shift is
+  `3.0`.
+- Batch-2 parity requires masked attention or same-length text bucketing.
 
 ## Do Not Forget
 

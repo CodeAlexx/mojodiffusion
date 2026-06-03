@@ -122,6 +122,44 @@ Caption-based 1024 samples from the 2000-step LoRA:
 All three logs show `overlay loaded 210 main-layer adapters; scale alpha/rank =
 0.0625`, and all three PNGs are valid 1024x1024 RGB images.
 
+## Ernie LoRA Mapping - 2026-06-02
+
+Detailed plan: `serenitymojo/training/TRAINING_PLAN_ernie.md`.
+
+OneTrainer ERNIE reference files:
+
+- `/home/alex/OneTrainer/training_presets/#ernie LoRA 8GB.json`
+- `/home/alex/OneTrainer/training_presets/#ernie LoRA 16GB.json`
+- `/home/alex/OneTrainer/modules/modelSetup/BaseErnieSetup.py`
+- `/home/alex/OneTrainer/modules/model/ErnieModel.py`
+- `/home/alex/OneTrainer/modules/dataLoader/ErnieBaseDataLoader.py`
+- `/home/alex/OneTrainer/modules/modelSampler/ErnieSampler.py`
+
+Important Ernie-specific rules:
+
+- ERNIE trains in the Flux2/Klein BatchNorm latent family. Patchify VAE mean
+  latents `[B,32,H,W] -> [B,128,H/2,W/2]`, then apply
+  `(latent - bn.running_mean) / sqrt(bn.running_var + batch_norm_eps)`.
+  It is not a Z-Image `shift_factor/scaling_factor` model.
+- The OneTrainer LoRA train preset uses LOGIT_NORMAL with default
+  `timestep_shift=1.0` and dynamic shifting disabled. The local scheduler config
+  has `shift=3.0`, but that is the sampling denoise shift, not the LoRA train
+  baseline.
+- Ernie LoRA targets are the 7 Linear projections per transformer layer:
+  self-attention `to_q`, `to_k`, `to_v`, `to_out.0` plus MLP `gate_proj`,
+  `up_proj`, and `linear_fc2`. With 36 layers this is 252 adapters.
+- Do not use OneTrainer MGDS, Rust caches, Python caches, or fixed text
+  embeddings in production. The Mojo path needs its own image staging, VAE
+  encode, tokenizer, Mistral3 text encoder, cache writer, trainer, sampler, and
+  LoRA save/load path.
+- Do not attempt full-F32 ERNIE residency. OneTrainer uses BF16 train/output,
+  INT_W8A8 transformer, FLOAT_8 text encoder, and FLOAT_32 VAE. Keep large base
+  weights mixed/quantized/offloaded; reserve F32 for reductions, BN stats,
+  LoRA/Adam masters, and short transients.
+- Batch-2 parity needs attention masking or exact same-length text buckets.
+  OneTrainer trims text embeddings to batch max length but still passes
+  `text_lens` and masks shorter rows.
+
 ## Offloader API Guide
 
 Use offloaders for base weights that cannot stay resident in the target dtype.

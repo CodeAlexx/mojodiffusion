@@ -20,17 +20,17 @@
 #        (the deferred E2/E5 link): c = time_embed(sigma_idx);
 #        mv = chunk6(silu(c)@adaLN_modulation.1 + bias);
 #        [f_scale,f_shift] = chunk2(c@final_norm.linear + bias).
-#   6. ernie_stack_lora_forward_streamed -> pred [N_IMG,128]  (streamed 36-block path).
+#   6. ernie_stack_lora_forward_resident_device -> pred [N_IMG,128]  (BF16 block-resident path).
 #   7. loss = mean MSE(pred, target) in F32;  d_loss = (2/N)*(pred - target).
-#   8. ernie_stack_lora_backward_streamed -> LoRA d_A/d_B for all 7*36 adapters.
+#   8. ernie_stack_lora_backward_resident_device -> LoRA d_A/d_B for all 7*36 adapters.
 #   9. host global-L2-norm clip (max_norm = 1.0; train_ernie.rs:1072) -> ernie_lora_adamw_step.
 #  10. save_ernie_lora at the end (PEFT/ai-toolkit keys, inference-loadable).
 #
 # Per-step line (stdout):  PROG step=<k> total=<MAX> loss=<f> grad=<f> lr=<f> secs=<wall>
 #
-# WHY STREAMED: 36 F32 blocks ~= 31 GB > 24 GB 3090 (TRAINING_PLAN_ernie.md E2 memory
-# finding). The streamed path loads each block on demand (load->use->drop), bounding
-# resident weight memory to ~one block. The LoRA adapters stay host-resident (small).
+# WHY BF16-RESIDENT: 36 F32 blocks ~= 31 GB > 24 GB 3090, but ERNIE's released
+# block matrices are BF16 on disk. Keeping large block matrices BF16 and only
+# norm vectors F32 fits the local 3090 target and removes per-step block reloads.
 #
 # MISTRAL TEXT ENCODER IS DEFERRED for this first real run: the cache ALREADY holds
 # the Mistral text_embedding [1,512,3072], so the train loop reads it directly. The
@@ -44,6 +44,7 @@
 #       serenitymojo/training/train_ernie_real.mojo -o /tmp/train_ernie_real
 #   /tmp/train_ernie_real
 
+from std.sys import argv
 from std.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.math import sqrt, log as flog, exp as fexp, isfinite, sin as fsin, cos as fcos
@@ -62,12 +63,15 @@ from serenitymojo.ops.embeddings import timestep_embedding_sin_first
 
 from serenitymojo.models.dit.ernie_contract import ERNIE_TRANSFORMER_DIR
 from serenitymojo.models.dit.ernie_image import build_ernie_rope_tables
-from serenitymojo.models.ernie.weights import ErnieStackBase, load_ernie_stack_base
+from serenitymojo.models.ernie.weights import (
+    ErnieStackBase, load_ernie_stack_base, load_ernie_all_blocks_bf16_normf32,
+)
 from serenitymojo.models.ernie.block import ErnieModVecs
 from serenitymojo.models.ernie.lora_block import ERNIE_SLOTS
 from serenitymojo.models.ernie.ernie_stack_lora import (
     ErnieLoraSet, ErnieLoraGrads, build_ernie_lora_set,
-    ernie_stack_lora_forward_streamed, ernie_stack_lora_backward_streamed,
+    ernie_lora_set_to_device,
+    ernie_stack_lora_forward_resident_device, ernie_stack_lora_backward_resident_device,
     ernie_lora_adamw_step, save_ernie_lora,
 )
 
@@ -342,14 +346,38 @@ def _lora_b_nonzero_slots(set: ErnieLoraSet) -> Int:
     return n
 
 
+def _parse_int(s: String) -> Int:
+    var out = 0
+    var bytes = s.as_bytes()
+    for i in range(s.byte_length()):
+        out = out * 10 + Int(bytes[i] - 0x30)
+    return out
+
+
 def main() raises:
+    var args = argv()
+    var run_steps = MAX_STEPS
+    if len(args) >= 2:
+        run_steps = _parse_int(String(args[1]))
+    if run_steps < 1:
+        raise Error("run_steps must be >= 1")
+
+    var save_path = String(SAVE_PATH)
+    if len(args) >= 3:
+        save_path = String(args[2])
+
+    var cache_dir = String(CACHE_DIR)
+    if len(args) >= 4:
+        cache_dir = String(args[3])
+
     var ctx = DeviceContext()
     print("==== ERNIE REAL LoRA training loop (pure Mojo) ====")
     print("  D=", D, " H=", H, " Dh=", Dh, " F=", F, " NUM_LAYERS=", NUM_LAYERS)
     print("  N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S, " IN_CH=", IN_CH,
           " TEXT_IN=", TEXT_IN, " OUT_CH=", OUT_CH)
-    print("  cache=", CACHE_DIR)
-    print("  max_steps=", MAX_STEPS, " rank=", RANK, " alpha=", ALPHA, " lr=", LR)
+    print("  cache=", cache_dir)
+    print("  max_steps=", run_steps, " rank=", RANK, " alpha=", ALPHA, " lr=", LR)
+    print("  save_path=", save_path)
     print("  checkpoint=", ERNIE_TRANSFORMER_DIR)
 
     var mem0 = ctx.get_memory_info()
@@ -360,6 +388,10 @@ def main() raises:
     print("  opened transformer: num_shards =", st.num_shards())
     var base = load_ernie_stack_base(st, D, IN_CH, ctx)
     print("  base weights resident (patch/text/time/adaLN/final).")
+    var blocks = load_ernie_all_blocks_bf16_normf32(st, NUM_LAYERS, ctx)
+    var mem_blocks = ctx.get_memory_info()
+    print("  block weights resident BF16/norm-F32:", len(blocks),
+          " free VRAM after block load (bytes):", mem_blocks[0])
 
     # ── build the LoRA set (B=0 init -> adapter identity at step 0) ──
     var lora = build_ernie_lora_set(NUM_LAYERS, D, F, RANK, ALPHA)
@@ -375,7 +407,7 @@ def main() raises:
     )
     print("  RoPE tables built: cos/sin [S*H, Dh] = [", S * H, ",", Dh, "]")
 
-    var cache_files = _list_cache(String(CACHE_DIR))
+    var cache_files = _list_cache(cache_dir)
     if len(cache_files) == 0:
         raise Error("no cache files found")
     print("  found", len(cache_files), "cached samples")
@@ -383,7 +415,7 @@ def main() raises:
     var rng_state = SEED
     var t_start = perf_counter()
 
-    for step in range(MAX_STEPS):
+    for step in range(run_steps):
         var cache_idx = step % len(cache_files)
         var cs = SafeTensors.open(cache_files[cache_idx])
 
@@ -417,9 +449,10 @@ def main() raises:
         var f_scale = src[1].copy()
         var f_shift = src[2].copy()
 
-        # ── streamed LoRA forward (36 blocks load->use->drop) ──
-        var fwd = ernie_stack_lora_forward_streamed[H, Dh, N_IMG, N_TXT, S](
-            noisy_tokens.copy(), txt_tokens.copy(), base, st, lora, mv,
+        # ── device-resident LoRA forward (BF16 base blocks loaded once) ──
+        var lora_dev = ernie_lora_set_to_device(lora, STDtype.F32, ctx)
+        var fwd = ernie_stack_lora_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
+            noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
             f_scale.copy(), f_shift.copy(), rope[0], rope[1],
             D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
         )
@@ -436,9 +469,9 @@ def main() raises:
             d_out.append(diff * inv_n)
         var loss = Float32(sse / Float64(n_out))
 
-        # ── streamed LoRA backward -> all 7*36 adapter grads ──
-        var grads = ernie_stack_lora_backward_streamed[H, Dh, N_IMG, N_TXT, S](
-            d_out, noisy_tokens.copy(), txt_tokens.copy(), base, st, lora, mv,
+        # ── resident LoRA backward -> all 7*36 adapter grads ──
+        var grads = ernie_stack_lora_backward_resident_device[H, Dh, N_IMG, N_TXT, S](
+            d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
             f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd,
             D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
         )
@@ -448,7 +481,7 @@ def main() raises:
         ernie_lora_adamw_step(lora, grads, step + 1, LR, ctx)
 
         var secs = perf_counter() - t_start
-        print("PROG step=", step, " total=", MAX_STEPS, " loss=", loss,
+        print("PROG step=", step, " total=", run_steps, " loss=", loss,
               " grad=", Float32(gn), " lr=", LR, " secs=", secs,
               " sigma_idx=", sigma_idx, " nonfinite=", grads.nonfinite_lora_grads,
               " LoRA-B|.|1=", _lora_b_abs_sum(lora))
@@ -461,5 +494,5 @@ def main() raises:
     print("  LoRA-B |.|_1 after training =", b_sum, " (init 0.0)")
     print("  LoRA-B nonzero slots =", b_nz, "/", n_adapters,
           " ratio =", Float32(b_nz) / Float32(n_adapters))
-    var npairs = save_ernie_lora(lora, SAVE_PATH, ctx)
-    print("  saved", npairs, "adapter pairs to", SAVE_PATH)
+    var npairs = save_ernie_lora(lora, save_path, ctx)
+    print("  saved", npairs, "adapter pairs to", save_path)

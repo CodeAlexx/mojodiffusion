@@ -89,6 +89,18 @@ def _load_f32_device(
     return cast_tensor(t, STDtype.F32, ctx)
 
 
+# Read one named tensor from the sharded safetensors as a device Tensor in the
+# checkpoint's stored dtype. ERNIE's large projection matrices are BF16; keeping
+# them BF16 avoids doubling block-stream traffic while linear()/dX use mixed GEMM.
+def _load_stored_device(
+    st: ShardedSafeTensors, name: String, ctx: DeviceContext
+) raises -> Tensor:
+    var info = st.tensor_info(name)
+    var bytes = st.tensor_bytes(name)
+    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
+    return Tensor.from_view(tv, ctx)
+
+
 # Dim 0 of a named tensor's stored shape (for verification / dim derivation).
 def _dim0(st: ShardedSafeTensors, name: String) raises -> Int:
     var info = st.tensor_info(name)
@@ -114,6 +126,30 @@ def load_ernie_block_weights(
         TArc(_load_f32_device(st, mp + String(".gate_proj.weight"), ctx)),
         TArc(_load_f32_device(st, mp + String(".up_proj.weight"), ctx)),
         TArc(_load_f32_device(st, mp + String(".linear_fc2.weight"), ctx)),
+    )
+
+
+# Load block `block_idx` for the production device-streamed fast path: large
+# Linear matrices stay BF16 in device memory, while tiny RMSNorm scale vectors
+# stay F32 so the F32 residual stream's norm ops keep their existing dtype path.
+def load_ernie_block_weights_bf16_normf32(
+    st: ShardedSafeTensors, block_idx: Int, ctx: DeviceContext
+) raises -> ErnieBlockWeights:
+    var p = String("layers.") + String(block_idx)
+    var ap = p + String(".self_attention")
+    var mp = p + String(".mlp")
+    return ErnieBlockWeights(
+        TArc(_load_f32_device(st, p + String(".adaLN_sa_ln.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".to_q.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".to_k.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".to_v.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".to_out.0.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_f32_device(st, p + String(".adaLN_mlp_ln.weight"), ctx)),
+        TArc(_load_stored_device(st, mp + String(".gate_proj.weight"), ctx)),
+        TArc(_load_stored_device(st, mp + String(".up_proj.weight"), ctx)),
+        TArc(_load_stored_device(st, mp + String(".linear_fc2.weight"), ctx)),
     )
 
 
@@ -237,6 +273,18 @@ def load_ernie_all_blocks(
     var blocks = List[ErnieBlockWeights]()
     for i in range(num_layers):
         blocks.append(load_ernie_block_weights(st, i, ctx))
+    return blocks^
+
+
+# Load ALL `num_layers` blocks for the production resident fast path: BF16 large
+# matrices, F32 norm vectors. On ERNIE-4B this is roughly half the F32 residency
+# footprint and avoids per-step block reloads when VRAM allows it.
+def load_ernie_all_blocks_bf16_normf32(
+    st: ShardedSafeTensors, num_layers: Int, ctx: DeviceContext
+) raises -> List[ErnieBlockWeights]:
+    var blocks = List[ErnieBlockWeights]()
+    for i in range(num_layers):
+        blocks.append(load_ernie_block_weights_bf16_normf32(st, i, ctx))
     return blocks^
 
 

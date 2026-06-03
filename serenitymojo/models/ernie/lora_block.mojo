@@ -37,7 +37,7 @@ from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
-from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx, linear_backward_dw
 
 # REUSE the trainer's LoRA structs (the target authority).
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
@@ -48,8 +48,8 @@ from serenitymojo.ops.activations import gelu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_halfsplit_full
 from serenitymojo.ops.attention import sdpa_nomask
-from serenitymojo.ops.tensor_algebra import reshape_owned, reshape_in_place, mul, add
-from serenitymojo.ops.norm_backward import rms_norm_backward
+from serenitymojo.ops.tensor_algebra import reshape_owned, reshape_in_place, mul, add, mul_scalar
+from serenitymojo.ops.norm_backward import rms_norm_backward, rms_norm_backward_dx
 from serenitymojo.ops.activation_backward import gelu_backward
 from serenitymojo.ops.attention_backward import sdpa_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward
@@ -164,6 +164,78 @@ def ernie_lora_bwd(
     return ErnieLoraGrads(d_a^, d_b^, d_x_lo^)
 
 
+# ── device-resident LoRA adapter and helpers ─────────────────────────────────
+# A/B live as device tensors for the duration of a training step. This removes
+# the per-projection A/B upload and activation readback/re-upload bridge.
+struct ErnieLoraAdapterDevice(Copyable, Movable):
+    var a: TArc
+    var b: TArc
+    var rank: Int
+    var in_f: Int
+    var out_f: Int
+    var scale: Float32
+
+    def __init__(
+        out self, var a: TArc, var b: TArc,
+        rank: Int, in_f: Int, out_f: Int, scale: Float32,
+    ):
+        self.a = a^
+        self.b = b^
+        self.rank = rank
+        self.in_f = in_f
+        self.out_f = out_f
+        self.scale = scale
+
+
+def ernie_lora_adapter_to_device(
+    lo: LoraAdapter, dtype: STDtype, ctx: DeviceContext
+) raises -> ErnieLoraAdapterDevice:
+    return ErnieLoraAdapterDevice(
+        TArc(Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], dtype, ctx)),
+        TArc(Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], dtype, ctx)),
+        lo.rank, lo.in_f, lo.out_f, lo.scale,
+    )
+
+
+def ernie_lora_apply_device(
+    var base_y: Tensor, x: Tensor, lo: ErnieLoraAdapterDevice,
+    M: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var nb1 = Optional[Tensor](None)
+    var t = linear(x, lo.a[], nb1^, ctx)             # [M,rank]
+    var nb2 = Optional[Tensor](None)
+    var dy = linear(t, lo.b[], nb2^, ctx)            # [M,out]
+    var contrib = mul_scalar(dy, lo.scale, ctx)
+    return add(base_y^, contrib^, ctx)
+
+
+struct ErnieLoraDeviceGradTensors(Copyable, Movable):
+    var d_a: TArc
+    var d_b: TArc
+    var d_x: TArc
+
+    def __init__(out self, var d_a: TArc, var d_b: TArc, var d_x: TArc):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_x = d_x^
+
+
+def ernie_lora_bwd_device_tensors(
+    d_contrib: Tensor, x: Tensor, lo: ErnieLoraAdapterDevice,
+    M: Int, ctx: DeviceContext,
+) raises -> ErnieLoraDeviceGradTensors:
+    var nb_t = Optional[Tensor](None)
+    var t = linear(x, lo.a[], nb_t^, ctx)            # [M,rank]
+    var d_dy = mul_scalar(d_contrib, lo.scale, ctx)  # [M,out]
+
+    var d_t = linear_backward_dx(d_dy, lo.b[], M, lo.rank, lo.out_f, ctx)
+    var d_b_t = linear_backward_dw(d_dy, t, M, lo.rank, lo.out_f, ctx)
+
+    var d_x_lo = linear_backward_dx(d_t, lo.a[], M, lo.in_f, lo.rank, ctx)
+    var d_a_t = linear_backward_dw(d_t, x, M, lo.in_f, lo.rank, ctx)
+    return ErnieLoraDeviceGradTensors(TArc(d_a_t^), TArc(d_b_t^), TArc(d_x_lo^))
+
+
 # ── per-block LoRA carrier: the 7 optional adapters (slot order is canonical) ──
 # slot 0 to_q, 1 to_k, 2 to_v, 3 to_out.0, 4 gate_proj, 5 up_proj, 6 linear_fc2.
 comptime ERNIE_SLOTS = 7
@@ -191,6 +263,31 @@ struct ErnieBlockLora(Copyable, Movable):
         var to_v: Optional[LoraAdapter], var to_out: Optional[LoraAdapter],
         var gate_proj: Optional[LoraAdapter], var up_proj: Optional[LoraAdapter],
         var linear_fc2: Optional[LoraAdapter],
+    ):
+        self.to_q = to_q^
+        self.to_k = to_k^
+        self.to_v = to_v^
+        self.to_out = to_out^
+        self.gate_proj = gate_proj^
+        self.up_proj = up_proj^
+        self.linear_fc2 = linear_fc2^
+
+
+struct ErnieBlockLoraDevice(Copyable, Movable):
+    var to_q: ErnieLoraAdapterDevice
+    var to_k: ErnieLoraAdapterDevice
+    var to_v: ErnieLoraAdapterDevice
+    var to_out: ErnieLoraAdapterDevice
+    var gate_proj: ErnieLoraAdapterDevice
+    var up_proj: ErnieLoraAdapterDevice
+    var linear_fc2: ErnieLoraAdapterDevice
+
+    def __init__(
+        out self,
+        var to_q: ErnieLoraAdapterDevice, var to_k: ErnieLoraAdapterDevice,
+        var to_v: ErnieLoraAdapterDevice, var to_out: ErnieLoraAdapterDevice,
+        var gate_proj: ErnieLoraAdapterDevice, var up_proj: ErnieLoraAdapterDevice,
+        var linear_fc2: ErnieLoraAdapterDevice,
     ):
         self.to_q = to_q^
         self.to_k = to_k^
@@ -309,6 +406,95 @@ def ernie_block_lora_forward[
     return ErnieBlockForward(result^, saved^)
 
 
+struct ErnieBlockForwardLoraTensor(Movable):
+    var out: TArc
+    var saved: ErnieBlockSaved
+
+    def __init__(out self, var out: TArc, var saved: ErnieBlockSaved):
+        self.out = out^
+        self.saved = saved^
+
+
+def ernie_block_lora_forward_device_tensor[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ErnieBlockWeights, mv: ErnieModVecs, lora: ErnieBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ErnieBlockForwardLoraTensor:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    # --- self-attention sub-block ---
+    var sa_norm = rms_norm(x_arc[], w.sa_norm[], eps, ctx)
+    var sa_in = modulate(
+        sa_norm, _t(mv.scale_msa.copy(), [D], ctx), _t(mv.shift_msa.copy(), [D], ctx), ctx
+    )
+
+    var no_bias = Optional[Tensor](None)
+    var q_base = linear(sa_in, w.wq[], no_bias^, ctx)
+    var no_bias_k = Optional[Tensor](None)
+    var k_base = linear(sa_in, w.wk[], no_bias_k^, ctx)
+    var no_bias_v = Optional[Tensor](None)
+    var v_base = linear(sa_in, w.wv[], no_bias_v^, ctx)
+
+    var q_f = ernie_lora_apply_device(q_base^, sa_in, lora.to_q, S, ctx)
+    var k_f = ernie_lora_apply_device(k_base^, sa_in, lora.to_k, S, ctx)
+    var v_f = ernie_lora_apply_device(v_base^, sa_in, lora.to_v, S, ctx)
+
+    var q_pre = reshape_owned(q_f^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_f^, [1, S, H, Dh])
+    var v = reshape_owned(v_f^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    var q_rope = rope_halfsplit_full(q_rms, cos, sin, ctx)
+    var k_rope = rope_halfsplit_full(k_rms, cos, sin, ctx)
+
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var no_bias_o = Optional[Tensor](None)
+    var att_out_base = linear(att_flat, w.wo[], no_bias_o^, ctx)
+    var att_out = ernie_lora_apply_device(att_out_base^, att_flat, lora.to_out, S, ctx)
+
+    var h = residual_gate(x_arc[], _t(mv.gate_msa.copy(), [D], ctx), att_out, ctx)
+
+    # --- MLP sub-block (GELU-gated) ---
+    var mlp_norm = rms_norm(h, w.mlp_norm[], eps, ctx)
+    var mlp_in = modulate(
+        mlp_norm, _t(mv.scale_mlp.copy(), [D], ctx), _t(mv.shift_mlp.copy(), [D], ctx), ctx
+    )
+
+    var no_bias_g = Optional[Tensor](None)
+    var gate_base = linear(mlp_in, w.wgate[], no_bias_g^, ctx)
+    var no_bias_u = Optional[Tensor](None)
+    var up_base = linear(mlp_in, w.wup[], no_bias_u^, ctx)
+    var gate_pre = ernie_lora_apply_device(gate_base^, mlp_in, lora.gate_proj, S, ctx)
+    var up = ernie_lora_apply_device(up_base^, mlp_in, lora.up_proj, S, ctx)
+
+    var gelu_gate = gelu(gate_pre, ctx)
+    var activated = mul(gelu_gate, up, ctx)
+
+    var no_bias_d = Optional[Tensor](None)
+    var mlp_out_base = linear(activated, w.wdown[], no_bias_d^, ctx)
+    var mlp_out = ernie_lora_apply_device(mlp_out_base^, activated, lora.linear_fc2, S, ctx)
+
+    var result = residual_gate(
+        h, _t(mv.gate_mlp.copy(), [D], ctx), mlp_out, ctx
+    )
+
+    var saved = ErnieBlockSaved(
+        x_arc.copy(), TArc(sa_norm^), TArc(sa_in^),
+        TArc(q_pre^), TArc(k_pre^), TArc(v^),
+        TArc(q_rms^), TArc(k_rms^), TArc(q_rope^), TArc(k_rope^),
+        TArc(att_flat^), TArc(h^), TArc(mlp_norm^), TArc(mlp_in^),
+        TArc(gate_pre^), TArc(gelu_gate^), TArc(up^), TArc(activated^),
+    )
+    return ErnieBlockForwardLoraTensor(TArc(result^), saved^)
+
+
 # ── LoRA-aware block backward ─────────────────────────────────────────────────
 # Mirrors ernie_block_backward EXACTLY. At each of the 7 trained projections the
 # d_y flowing INTO that projection (the same grad the base linear_backward sees)
@@ -329,11 +515,9 @@ struct ErnieBlockLoraBackward(Movable):
 # proj-backward result: d_x [M,in] (base + LoRA summed) and d_w (base, discarded).
 struct _ProjGrads(Movable):
     var d_x: Tensor
-    var d_w: Tensor
 
-    def __init__(out self, var d_x: Tensor, var d_w: Tensor):
+    def __init__(out self, var d_x: Tensor):
         self.d_x = d_x^
-        self.d_w = d_w^
 
 
 # helper: run base linear_backward d_x then add the LoRA branch's d_x (if present),
@@ -345,21 +529,19 @@ def _proj_bwd_with_lora(
     mut d_a_slots: List[List[Float32]], mut d_b_slots: List[List[Float32]],
     ctx: DeviceContext,
 ) raises -> _ProjGrads:
-    var lb = linear_backward(d_y, x_in, w, M, in_f, out_f, ctx)
-    # clone d_w out of `lb` (base weight grad; discarded by the LoRA optimizer but
-    # returned for completeness). Cloning avoids a partial move of the LinearGrads.
-    var d_w = lb.d_w.clone(ctx)
+    # Base weights are frozen in LoRA training. Only d_x is load-bearing; d_W/d_b
+    # would be computed, read back, then discarded by the stack optimizer.
+    var base_dx = linear_backward_dx(d_y, w, M, in_f, out_f, ctx)
     if lo:
         var d_y_h = d_y.to_host(ctx)
         var lg = ernie_lora_bwd(d_y_h, x_in_h, lo.value(), M, ctx)
         d_a_slots[slot] = lg.d_a.copy()
         d_b_slots[slot] = lg.d_b.copy()
         # SUM the LoRA d_x into the base d_x (frozen W base path + LoRA path).
-        var base_dx = lb.d_x.to_host(ctx)
-        var summed = _add_lists(base_dx, lg.d_x)
-        return _ProjGrads(_t(summed, [M, in_f], ctx), d_w^)
-    var d_x = lb.d_x.clone(ctx)
-    return _ProjGrads(d_x^, d_w^)
+        var base_dx_h = base_dx.to_host(ctx)
+        var summed = _add_lists(base_dx_h, lg.d_x)
+        return _ProjGrads(_t(summed, [M, in_f], ctx))
+    return _ProjGrads(base_dx^)
 
 
 def ernie_block_lora_backward[
@@ -398,7 +580,6 @@ def ernie_block_lora_backward[
         grg2.d_y, saved.activated[], w.wdown[], activated_h,
         lora.linear_fc2, SLOT_DOWN, S, F, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wdown = lb_down.d_w.to_host(ctx)
 
     # activated = gelu_gate * up
     var d_gelu_gate = mul(lb_down.d_x, saved.up[], ctx)
@@ -411,12 +592,10 @@ def ernie_block_lora_backward[
         d_gate_pre, saved.mlp_in[], w.wgate[], mlp_in_h,
         lora.gate_proj, SLOT_GATE, S, D, F, d_a_slots, d_b_slots, ctx,
     )
-    var d_wgate = lb_gate.d_w.to_host(ctx)
     var lb_up = _proj_bwd_with_lora(
         d_up, saved.mlp_in[], w.wup[], mlp_in_h,
         lora.up_proj, SLOT_UP, S, D, F, d_a_slots, d_b_slots, ctx,
     )
-    var d_wup = lb_up.d_w.to_host(ctx)
     var d_mlp_in = add(lb_gate.d_x, lb_up.d_x, ctx)
 
     var mb_mlp = modulate_backward(d_mlp_in, saved.mlp_norm[], _t(mv.scale_mlp.copy(), [D], ctx), ctx)
@@ -442,7 +621,6 @@ def ernie_block_lora_backward[
         grg1.d_y, saved.att_flat[], w.wo[], att_flat_h,
         lora.to_out, SLOT_O, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wo = lb_o.d_w.to_host(ctx)
 
     reshape_in_place(lb_o.d_x, [1, S, H, Dh])
     var sb = sdpa_backward[1, S, H, Dh](
@@ -466,17 +644,14 @@ def ernie_block_lora_backward[
         rb_q.d_x, saved.sa_in[], w.wq[], sa_in_h,
         lora.to_q, SLOT_Q, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wq = lb_q.d_w.to_host(ctx)
     var lb_k = _proj_bwd_with_lora(
         rb_k.d_x, saved.sa_in[], w.wk[], sa_in_h,
         lora.to_k, SLOT_K, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wk = lb_k.d_w.to_host(ctx)
     var lb_v = _proj_bwd_with_lora(
         sb.d_v, saved.sa_in[], w.wv[], sa_in_h,
         lora.to_v, SLOT_V, S, D, D, d_a_slots, d_b_slots, ctx,
     )
-    var d_wv = lb_v.d_w.to_host(ctx)
     var d_sa_in = add(add(lb_q.d_x, lb_k.d_x, ctx), lb_v.d_x, ctx)
 
     var mb_sa = modulate_backward(d_sa_in, saved.sa_norm[], _t(mv.scale_msa.copy(), [D], ctx), ctx)
@@ -491,11 +666,181 @@ def ernie_block_lora_backward[
 
     var base = ErnieBlockGrads(
         d_x^,
-        d_wq^, d_wk^, d_wv^, d_wo^,
+        List[Float32](), List[Float32](), List[Float32](), List[Float32](),
         d_q_norm^, d_k_norm^,
         d_sa_norm^, d_mlp_norm^,
-        d_wgate^, d_wup^, d_wdown^,
+        List[Float32](), List[Float32](), List[Float32](),
         d_shift_msa^, d_scale_msa^, d_gate_msa^,
         d_shift_mlp^, d_scale_mlp^, d_gate_mlp^,
     )
     return ErnieBlockLoraBackward(base^, ErnieBlockLoraGrads(d_a_slots^, d_b_slots^))
+
+
+struct _ProjTensorGrads(Movable):
+    var d_x: Tensor
+    var d_a: TArc
+    var d_b: TArc
+
+    def __init__(out self, var d_x: Tensor, var d_a: TArc, var d_b: TArc):
+        self.d_x = d_x^
+        self.d_a = d_a^
+        self.d_b = d_b^
+
+
+def _proj_bwd_with_lora_device_tensors(
+    d_y: Tensor, x_in: Tensor, w: Tensor, lo: ErnieLoraAdapterDevice,
+    M: Int, in_f: Int, out_f: Int,
+    ctx: DeviceContext,
+) raises -> _ProjTensorGrads:
+    var lg = ernie_lora_bwd_device_tensors(d_y, x_in, lo, M, ctx)
+    var base_dx = linear_backward_dx(d_y, w, M, in_f, out_f, ctx)
+    var summed = add(base_dx^, lg.d_x[], ctx)
+    return _ProjTensorGrads(summed^, lg.d_a.copy(), lg.d_b.copy())
+
+
+def _pack_mod6(
+    d_shift_msa: List[Float32], d_scale_msa: List[Float32], d_gate_msa: List[Float32],
+    d_shift_mlp: List[Float32], d_scale_mlp: List[Float32], d_gate_mlp: List[Float32],
+) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(d_shift_msa)):
+        out.append(d_shift_msa[i])
+    for i in range(len(d_scale_msa)):
+        out.append(d_scale_msa[i])
+    for i in range(len(d_gate_msa)):
+        out.append(d_gate_msa[i])
+    for i in range(len(d_shift_mlp)):
+        out.append(d_shift_mlp[i])
+    for i in range(len(d_scale_mlp)):
+        out.append(d_scale_mlp[i])
+    for i in range(len(d_gate_mlp)):
+        out.append(d_gate_mlp[i])
+    return out^
+
+
+struct ErnieBlockLoraTensorBackward(Movable):
+    var d_x: TArc
+    var d_a: List[TArc]
+    var d_b: List[TArc]
+    var d_shared_mod: List[Float32]
+
+    def __init__(
+        out self, var d_x: TArc, var d_a: List[TArc], var d_b: List[TArc],
+        var d_shared_mod: List[Float32],
+    ):
+        self.d_x = d_x^
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_shared_mod = d_shared_mod^
+
+
+def ernie_block_lora_backward_device_tensors[
+    H: Int, Dh: Int, S: Int
+](
+    d_out: Tensor,
+    w: ErnieBlockWeights, mv: ErnieModVecs, lora: ErnieBlockLoraDevice,
+    saved: ErnieBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ErnieBlockLoraTensorBackward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    # out = residual_gate(h, gate_mlp, mlp_out); recompute mlp_out with LoRA.
+    var nb = Optional[Tensor](None)
+    var mlp_out_base = linear(saved.activated[], w.wdown[], nb^, ctx)
+    var mlp_out_y = ernie_lora_apply_device(
+        mlp_out_base^, saved.activated[], lora.linear_fc2, S, ctx
+    )
+    var grg2 = gate_residual_backward(
+        d_out, saved.h[], _t(mv.gate_mlp.copy(), [D], ctx), mlp_out_y, ctx
+    )
+    var d_gate_mlp = grg2.d_g.to_host(ctx)
+
+    var pg_down = _proj_bwd_with_lora_device_tensors(
+        grg2.d_y, saved.activated[], w.wdown[], lora.linear_fc2, S, F, D, ctx,
+    )
+
+    var d_gelu_gate = mul(pg_down.d_x, saved.up[], ctx)
+    var d_up = mul(pg_down.d_x, saved.gelu_gate[], ctx)
+    var d_gate_pre = gelu_backward(d_gelu_gate, saved.gate_pre[], ctx)
+
+    var pg_gate = _proj_bwd_with_lora_device_tensors(
+        d_gate_pre, saved.mlp_in[], w.wgate[], lora.gate_proj, S, D, F, ctx,
+    )
+    var pg_up = _proj_bwd_with_lora_device_tensors(
+        d_up, saved.mlp_in[], w.wup[], lora.up_proj, S, D, F, ctx,
+    )
+    var d_mlp_in = add(pg_gate.d_x, pg_up.d_x, ctx)
+
+    var mb_mlp = modulate_backward(
+        d_mlp_in, saved.mlp_norm[], _t(mv.scale_mlp.copy(), [D], ctx), ctx
+    )
+    var d_scale_mlp = mb_mlp.d_scale.to_host(ctx)
+    var d_shift_mlp = mb_mlp.d_shift.to_host(ctx)
+    var d_mlp_norm_dx = rms_norm_backward_dx(mb_mlp.d_x, saved.h[], w.mlp_norm[], eps, ctx)
+    var d_h = add(grg2.d_x, d_mlp_norm_dx, ctx)
+
+    # --- self-attention sub-block backward ---
+    var nb2 = Optional[Tensor](None)
+    var att_out_base = linear(saved.att_flat[], w.wo[], nb2^, ctx)
+    var att_out_y = ernie_lora_apply_device(
+        att_out_base^, saved.att_flat[], lora.to_out, S, ctx
+    )
+    var grg1 = gate_residual_backward(
+        d_h, saved.x[], _t(mv.gate_msa.copy(), [D], ctx), att_out_y, ctx
+    )
+    var d_gate_msa = grg1.d_g.to_host(ctx)
+
+    var pg_o = _proj_bwd_with_lora_device_tensors(
+        grg1.d_y, saved.att_flat[], w.wo[], lora.to_out, S, D, D, ctx,
+    )
+
+    reshape_in_place(pg_o.d_x, [1, S, H, Dh])
+    var sb = sdpa_backward[1, S, H, Dh](
+        saved.q_rope[], saved.k_rope[], saved.v[], pg_o.d_x, scale, ctx
+    )
+    var d_q_rms = rope_halfsplit_full_backward(sb.d_q, cos, sin, ctx)
+    var d_k_rms = rope_halfsplit_full_backward(sb.d_k, cos, sin, ctx)
+
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
+
+    reshape_in_place(d_q_pre, [S, D])
+    reshape_in_place(d_k_pre, [S, D])
+    reshape_in_place(sb.d_v, [S, D])
+
+    var pg_q = _proj_bwd_with_lora_device_tensors(
+        d_q_pre, saved.sa_in[], w.wq[], lora.to_q, S, D, D, ctx,
+    )
+    var pg_k = _proj_bwd_with_lora_device_tensors(
+        d_k_pre, saved.sa_in[], w.wk[], lora.to_k, S, D, D, ctx,
+    )
+    var pg_v = _proj_bwd_with_lora_device_tensors(
+        sb.d_v, saved.sa_in[], w.wv[], lora.to_v, S, D, D, ctx,
+    )
+    var d_sa_in = add(add(pg_q.d_x, pg_k.d_x, ctx), pg_v.d_x, ctx)
+
+    var mb_sa = modulate_backward(
+        d_sa_in, saved.sa_norm[], _t(mv.scale_msa.copy(), [D], ctx), ctx
+    )
+    var d_scale_msa = mb_sa.d_scale.to_host(ctx)
+    var d_shift_msa = mb_sa.d_shift.to_host(ctx)
+    var d_sa_norm_dx = rms_norm_backward_dx(mb_sa.d_x, saved.x[], w.sa_norm[], eps, ctx)
+    var d_x = add(grg1.d_x, d_sa_norm_dx, ctx)
+
+    var d_a = List[TArc]()
+    var d_b = List[TArc]()
+    d_a.append(pg_q.d_a.copy()); d_b.append(pg_q.d_b.copy())
+    d_a.append(pg_k.d_a.copy()); d_b.append(pg_k.d_b.copy())
+    d_a.append(pg_v.d_a.copy()); d_b.append(pg_v.d_b.copy())
+    d_a.append(pg_o.d_a.copy()); d_b.append(pg_o.d_b.copy())
+    d_a.append(pg_gate.d_a.copy()); d_b.append(pg_gate.d_b.copy())
+    d_a.append(pg_up.d_a.copy()); d_b.append(pg_up.d_b.copy())
+    d_a.append(pg_down.d_a.copy()); d_b.append(pg_down.d_b.copy())
+
+    var shared = _pack_mod6(
+        d_shift_msa, d_scale_msa, d_gate_msa,
+        d_shift_mlp, d_scale_mlp, d_gate_mlp,
+    )
+    return ErnieBlockLoraTensorBackward(TArc(d_x^), d_a^, d_b^, shared^)

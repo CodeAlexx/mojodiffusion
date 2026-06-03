@@ -35,7 +35,7 @@
 #
 # Mojo 1.0.0b1: def not fn; Tensor move-only; host List[Float32] carriers.
 
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
@@ -43,21 +43,26 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.elementwise import modulate
-from serenitymojo.ops.linalg_backward import linear_backward
-from serenitymojo.ops.norm_backward import layer_norm_backward
+from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx
+from serenitymojo.ops.norm_backward import layer_norm_backward, layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
+from serenitymojo.ops.tensor_algebra import concat, slice
 
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.ernie.weights import (
     ErnieBlockWeights, ErnieStackBase, load_ernie_block_weights,
+    load_ernie_block_weights_bf16_normf32,
 )
 from serenitymojo.models.ernie.block import (
     ErnieModVecs, ErnieBlockSaved, ErnieBlockGrads, ernie_block_forward,
 )
 from serenitymojo.models.ernie.lora_block import (
-    ErnieBlockLora, ErnieBlockLoraGrads, ERNIE_SLOTS,
+    ErnieLoraAdapterDevice, ErnieBlockLora, ErnieBlockLoraDevice,
+    ErnieBlockLoraGrads, ERNIE_SLOTS,
     SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_GATE, SLOT_UP, SLOT_DOWN,
+    ernie_lora_adapter_to_device,
     ernie_block_lora_forward, ernie_block_lora_backward,
+    ernie_block_lora_forward_device_tensor, ernie_block_lora_backward_device_tensors,
 )
 from serenitymojo.models.ernie.ernie_stack import (
     ErnieStackForward, _zeros, _ones, _t, _linear_wdev, _linear_wdev_bias,
@@ -152,6 +157,42 @@ def ernie_block_lora_for(set: ErnieLoraSet, bi: Int) -> ErnieBlockLora:
     return _block_lora_for(set, bi)
 
 
+struct ErnieLoraDeviceSet(Copyable, Movable):
+    var ad: List[ErnieLoraAdapterDevice]
+    var num_layers: Int
+    var rank: Int
+
+    def __init__(
+        out self, var ad: List[ErnieLoraAdapterDevice], num_layers: Int, rank: Int
+    ):
+        self.ad = ad^
+        self.num_layers = num_layers
+        self.rank = rank
+
+
+def ernie_lora_set_to_device(
+    set: ErnieLoraSet, dtype: STDtype, ctx: DeviceContext
+) raises -> ErnieLoraDeviceSet:
+    var ad = List[ErnieLoraAdapterDevice]()
+    var n = set.num_layers * ERNIE_SLOTS
+    for i in range(n):
+        ad.append(ernie_lora_adapter_to_device(set.ad[i], dtype, ctx))
+    return ErnieLoraDeviceSet(ad^, set.num_layers, set.rank)
+
+
+def _block_lora_dev_for(set: ErnieLoraDeviceSet, bi: Int) -> ErnieBlockLoraDevice:
+    var base = bi * ERNIE_SLOTS
+    return ErnieBlockLoraDevice(
+        set.ad[base + SLOT_Q].copy(),
+        set.ad[base + SLOT_K].copy(),
+        set.ad[base + SLOT_V].copy(),
+        set.ad[base + SLOT_O].copy(),
+        set.ad[base + SLOT_GATE].copy(),
+        set.ad[base + SLOT_UP].copy(),
+        set.ad[base + SLOT_DOWN].copy(),
+    )
+
+
 # ── collected LoRA grads (flat, parallel to ErnieLoraSet) ────────────────────
 struct ErnieLoraGrads(Movable):
     var d_a: List[List[Float32]]   # num_layers*ERNIE_SLOTS
@@ -209,6 +250,65 @@ def _nonfinite(v: List[Float32]) -> Int:
         if (x != x) or (x - x != Float32(0.0)):
             bad += 1
     return bad
+
+
+struct _ErnieHostGradLists(Movable):
+    var d_a: List[List[Float32]]
+    var d_b: List[List[Float32]]
+
+    def __init__(out self, var d_a: List[List[Float32]], var d_b: List[List[Float32]]):
+        self.d_a = d_a^
+        self.d_b = d_b^
+
+
+def _host_grad_slice(host: HostBuffer[DType.uint8], offset: Int, numel: Int) -> List[Float32]:
+    var out = List[Float32]()
+    var fp = (host.unsafe_ptr() + offset).bitcast[Float32]()
+    for i in range(numel):
+        out.append(fp[i])
+    return out^
+
+
+def _ernie_tensor_grads_to_host(
+    indices: List[Int], d_a_t: List[TArc], d_b_t: List[TArc],
+    total_slots: Int, ctx: DeviceContext,
+) raises -> _ErnieHostGradLists:
+    var total_bytes = 0
+    for i in range(len(d_a_t)):
+        total_bytes += d_a_t[i][].nbytes()
+    for i in range(len(d_b_t)):
+        total_bytes += d_b_t[i][].nbytes()
+
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](total_bytes)
+    var a_off = List[Int]()
+    var a_num = List[Int]()
+    var b_off = List[Int]()
+    var b_num = List[Int]()
+    var cursor = 0
+    for i in range(len(d_a_t)):
+        a_off.append(cursor)
+        a_num.append(d_a_t[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, d_a_t[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=d_a_t[i][].buf)
+        cursor += d_a_t[i][].nbytes()
+    for i in range(len(d_b_t)):
+        b_off.append(cursor)
+        b_num.append(d_b_t[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, d_b_t[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=d_b_t[i][].buf)
+        cursor += d_b_t[i][].nbytes()
+    ctx.synchronize()
+
+    var d_a_flat = List[List[Float32]]()
+    var d_b_flat = List[List[Float32]]()
+    for _ in range(total_slots):
+        d_a_flat.append(List[Float32]())
+        d_b_flat.append(List[Float32]())
+    for i in range(len(indices)):
+        var flat = indices[i]
+        d_a_flat[flat] = _host_grad_slice(host, a_off[i], a_num[i])
+        d_b_flat[flat] = _host_grad_slice(host, b_off[i], b_num[i])
+    return _ErnieHostGradLists(d_a_flat^, d_b_flat^)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +378,6 @@ def ernie_stack_lora_backward[
 ) raises -> ErnieLoraGrads:
     var num_layers = len(blocks)
 
-    # ── final-layer backward (identical to base stack) ──
     var d_patches = _concat_img_txt(d_out, _zeros(N_TXT * out_ch))
     var x_out = saved_x_out(saved, f_scale, f_shift, D, S, ctx)
     var lbf = linear_backward(
@@ -419,12 +518,13 @@ def ernie_stack_lora_backward_streamed[
 
     var d_patches = _concat_img_txt(d_out, _zeros(N_TXT * out_ch))
     var x_out = saved_x_out(saved, f_scale, f_shift, D, S, ctx)
-    var lbf = linear_backward(
-        _t(d_patches, [S, out_ch], ctx), _t(x_out, [S, D], ctx),
-        base.final_lin_w[], S, D, out_ch, ctx,
-    )
-    var d_x_out = lbf.d_x.to_host(ctx)
-    var d_final_lin = lbf.d_w.to_host(ctx)
+    # Streamed LoRA training freezes the base stack. Only d_x_out is needed to
+    # continue the chain; final_lin d_W would be computed/read then discarded.
+    var d_x_out = linear_backward_dx(
+        _t(d_patches, [S, out_ch], ctx), base.final_lin_w[],
+        S, D, out_ch, ctx,
+    ).to_host(ctx)
+    var d_final_lin = List[Float32]()
     var mbf = modulate_backward(
         _t(d_x_out, [S, D], ctx), saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
     )
@@ -463,24 +563,249 @@ def ernie_stack_lora_backward_streamed[
         bi -= 1
         # `w` + `bg` drop here -> resident weight + per-block grads freed.
 
-    var seam = _split_img_txt(d_x, N_IMG, N_TXT, D)
-    var d_img = seam[0].copy()
-    var d_txt = seam[1].copy()
-    var lbi = linear_backward(
-        _t(d_img, [N_IMG, D], ctx), _t(img_tokens, [N_IMG, in_ch], ctx),
-        base.patch_w[], N_IMG, in_ch, D, ctx,
-    )
-    var d_img_tokens = lbi.d_x.to_host(ctx)
-    var lbt = linear_backward(
-        _t(d_txt, [N_TXT, D], ctx), _t(txt_tokens, [N_TXT, text_in], ctx),
-        base.text_proj[], N_TXT, text_in, D, ctx,
-    )
-    var d_txt_tokens = lbt.d_x.to_host(ctx)
+    # Input token gradients are not consumed by the LoRA optimizer in the real
+    # streamed trainer. Keep placeholders so the result shape stays compatible.
+    var d_img_tokens = List[Float32]()
+    var d_txt_tokens = List[Float32]()
 
     return ErnieLoraGrads(
         d_a_flat^, d_b_flat^,
         d_img_tokens^, d_txt_tokens^,
         d_shared_mod^, d_f_scale^, d_f_shift^, d_final_lin^,
+        nonfinite,
+    )
+
+
+def ernie_stack_lora_forward_streamed_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, st: ShardedSafeTensors,
+    lora: ErnieLoraDeviceSet, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ErnieStackForward:
+    var num_layers = lora.num_layers
+
+    var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
+    var img = linear(
+        _t(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+    )
+    var no_txt_bias = Optional[Tensor](None)
+    var txt = linear(_t(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
+    var x = concat(0, ctx, img, txt)
+    var x_arc = TArc(x^)
+
+    var blk_x_in = List[TArc]()
+    for bi in range(num_layers):
+        blk_x_in.append(x_arc.copy())
+        var w = load_ernie_block_weights_bf16_normf32(st, bi, ctx)
+        var bl = _block_lora_dev_for(lora, bi)
+        var fwd = ernie_block_lora_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), w, mv, bl, cos, sin, D, F, eps, ctx,
+        )
+        x_arc = fwd.out.copy()
+
+    var ln_x = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+    )
+    var x_out = modulate(
+        ln_x, _t(f_scale.copy(), [D], ctx), _t(f_shift.copy(), [D], ctx), ctx,
+    )
+    var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
+    var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
+    var out_img = slice(patches, 0, 0, N_IMG, ctx).to_host(ctx)
+
+    return ErnieStackForward(
+        out_img^, List[Float32](), List[Float32](), blk_x_in^,
+        x_arc.copy(), TArc(ln_x^),
+    )
+
+
+def ernie_stack_lora_backward_streamed_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, st: ShardedSafeTensors,
+    lora: ErnieLoraDeviceSet, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    saved: ErnieStackForward,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ErnieLoraGrads:
+    var num_layers = lora.num_layers
+
+    var d_img = _t(d_out, [N_IMG, out_ch], ctx)
+    var d_txt = _t(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
+    var d_patches = concat(0, ctx, d_img, d_txt)
+
+    var d_x_out = linear_backward_dx(d_patches, base.final_lin_w[], S, D, out_ch, ctx)
+    var mbf = modulate_backward(
+        d_x_out, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+    )
+    var d_f_scale = mbf.d_scale.to_host(ctx)
+    var d_f_shift = mbf.d_shift.to_host(ctx)
+    var d_x_final = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), eps, ctx,
+    )
+    var d_x_arc = TArc(d_x_final^)
+
+    var d_shared_mod = _zeros(6 * D)
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_layers - 1
+    while bi >= 0:
+        var w = load_ernie_block_weights_bf16_normf32(st, bi, ctx)
+        var bl = _block_lora_dev_for(lora, bi)
+        var refwd = ernie_block_lora_forward_device_tensor[H, Dh, S](
+            saved.blk_x_in[bi].copy(), w, mv, bl, cos, sin, D, F, eps, ctx,
+        )
+        var bg = ernie_block_lora_backward_device_tensors[H, Dh, S](
+            d_x_arc[], w, mv, bl, refwd.saved, cos, sin, D, F, eps, ctx,
+        )
+        d_x_arc = bg.d_x.copy()
+        d_shared_mod = _add_lists(d_shared_mod, bg.d_shared_mod)
+        var base_idx = bi * ERNIE_SLOTS
+        for s in range(ERNIE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    var host_grads = _ernie_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_layers * ERNIE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    return ErnieLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        List[Float32](), List[Float32](),
+        d_shared_mod^, d_f_scale^, d_f_shift^, List[Float32](),
+        nonfinite,
+    )
+
+
+def ernie_stack_lora_forward_resident_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, blocks: List[ErnieBlockWeights],
+    lora: ErnieLoraDeviceSet, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ErnieStackForward:
+    var num_layers = len(blocks)
+
+    var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
+    var img = linear(
+        _t(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+    )
+    var no_txt_bias = Optional[Tensor](None)
+    var txt = linear(_t(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
+    var x = concat(0, ctx, img, txt)
+    var x_arc = TArc(x^)
+
+    var blk_x_in = List[TArc]()
+    for bi in range(num_layers):
+        blk_x_in.append(x_arc.copy())
+        var bl = _block_lora_dev_for(lora, bi)
+        var fwd = ernie_block_lora_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), blocks[bi], mv, bl, cos, sin, D, F, eps, ctx,
+        )
+        x_arc = fwd.out.copy()
+
+    var ln_x = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+    )
+    var x_out = modulate(
+        ln_x, _t(f_scale.copy(), [D], ctx), _t(f_shift.copy(), [D], ctx), ctx,
+    )
+    var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
+    var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
+    var out_img = slice(patches, 0, 0, N_IMG, ctx).to_host(ctx)
+
+    return ErnieStackForward(
+        out_img^, List[Float32](), List[Float32](), blk_x_in^,
+        x_arc.copy(), TArc(ln_x^),
+    )
+
+
+def ernie_stack_lora_backward_resident_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, blocks: List[ErnieBlockWeights],
+    lora: ErnieLoraDeviceSet, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    saved: ErnieStackForward,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ErnieLoraGrads:
+    var num_layers = len(blocks)
+
+    var d_img = _t(d_out, [N_IMG, out_ch], ctx)
+    var d_txt = _t(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
+    var d_patches = concat(0, ctx, d_img, d_txt)
+
+    var d_x_out = linear_backward_dx(d_patches, base.final_lin_w[], S, D, out_ch, ctx)
+    var mbf = modulate_backward(
+        d_x_out, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+    )
+    var d_f_scale = mbf.d_scale.to_host(ctx)
+    var d_f_shift = mbf.d_shift.to_host(ctx)
+    var d_x_final = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), eps, ctx,
+    )
+    var d_x_arc = TArc(d_x_final^)
+
+    var d_shared_mod = _zeros(6 * D)
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_layers - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, bi)
+        var refwd = ernie_block_lora_forward_device_tensor[H, Dh, S](
+            saved.blk_x_in[bi].copy(), blocks[bi], mv, bl, cos, sin, D, F, eps, ctx,
+        )
+        var bg = ernie_block_lora_backward_device_tensors[H, Dh, S](
+            d_x_arc[], blocks[bi], mv, bl, refwd.saved, cos, sin, D, F, eps, ctx,
+        )
+        d_x_arc = bg.d_x.copy()
+        d_shared_mod = _add_lists(d_shared_mod, bg.d_shared_mod)
+        var base_idx = bi * ERNIE_SLOTS
+        for s in range(ERNIE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    var host_grads = _ernie_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_layers * ERNIE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    return ErnieLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        List[Float32](), List[Float32](),
+        d_shared_mod^, d_f_scale^, d_f_shift^, List[Float32](),
         nonfinite,
     )
 

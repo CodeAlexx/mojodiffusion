@@ -1,8 +1,9 @@
 # TRAINING_PLAN_ernie.md - ERNIE-Image LoRA trainer, pure Mojo
 
-Status: MAPPED (2026-06-02). Anima is running on the GPU, so this pass only
-maps OneTrainer behavior onto the current Mojo ERNIE code. Do not start ERNIE
-training until the active Anima run is finished.
+Status: UPDATED (2026-06-03). OneTrainer behavior is mapped, the OneTrainer
+100-step baseline is captured, and the Mojo ERNIE real-cache smoke now hits the
+local speed target with resident BF16 blocks: 3 steps in 8.03s measured loop
+time, about 2.68 s/step, finite loss/grads, and all 252 LoRA slots updated.
 
 ## Source Of Truth
 
@@ -122,19 +123,23 @@ changing the production save format.
 Existing useful pieces:
 
 - `serenitymojo/models/ernie/weights.mojo` loads the real ERNIE transformer keys.
+  It now has a BF16/norm-F32 all-block loader
+  `load_ernie_all_blocks_bf16_normf32` for the production speed path.
 - `serenitymojo/models/ernie/block.mojo` and `lora_block.mojo` implement the
   single-stream ERNIE block and LoRA block.
 - `serenitymojo/models/ernie/ernie_stack_lora.mojo` has the 36-layer 7-slot LoRA
-  carrier, streamed forward/backward, AdamW step, and PEFT/ai-toolkit save.
+  carrier, streamed fallback paths, device-resident BF16 block forward/backward,
+  AdamW step, bulk LoRA-grad D2H gather, and PEFT/ai-toolkit save.
 - `serenitymojo/ops/rope.mojo` and `rope_struct_backward.mojo` now expose the
   full-width half-split RoPE path ERNIE needs; use `rope_halfsplit_full` and
   `rope_halfsplit_full_backward`, not the older half-width half-split backward.
 
 Current non-production gaps:
 
-- `serenitymojo/training/train_ernie_real.mojo` is still a historical
-  Rust-cache smoke. It hard-codes `MAX_STEPS=3`, a Rust cache path, a fixed
-  `N_TXT=256`, and host-list boundaries through the hot stack.
+- `serenitymojo/training/train_ernie_real.mojo` is now a real speed/correctness
+  smoke, not production training. It accepts run steps, save path, and cache dir
+  as CLI args, but still uses the historical prepared cache path by default and
+  a fixed `N_TXT=256`.
 - There is no Mojo Mistral3 text encoder/tokenizer path yet. OneTrainer uses
   `Mistral3Model`, tokenizer max length `512`, hidden layer `-2`, and real
   `text_lens`. We must write the Mojo encoder instead of consuming Rust/Python
@@ -148,10 +153,33 @@ Current non-production gaps:
   patchify/BN scale policy, tokenizer, Mistral hidden state cache, and metadata.
 - The production trainer needs bucket dispatch from raw dataset dimensions,
   quantized to 64 like OneTrainer. Do not drop singleton or long-caption buckets.
-- The host-list streamed stack is a correctness path, not a speed target. Port
-  ERNIE training toward tensor-resident adapters, BF16/BP16/offloaded base
-  weights, dx-only frozen backward helpers, and the shared offloader/ring
-  allocator patterns from Z-Image.
+- The host-list streamed stack is now only a correctness/fallback path. The hot
+  path keeps all 36 block matrices BF16-resident, keeps norm vectors F32, uses
+  frozen-base dX-only backward helpers, and uploads LoRA adapters to device each
+  step.
+
+## Baselines And Targets
+
+OneTrainer baseline on `/home/alex/models/ERNIE-Image` + `/home/alex/eri2`
+(2026-06-03), batch 2, rank 16 alpha 16, transformer `INT_W8A8`, text encoder
+`FLOAT_8`, BF16 train/output, `LOGIT_NORMAL`:
+
+- `compile=false`: 100/100 steps complete, final loss `0.7464916`, smooth/mean
+  loss `0.6612294`, warmed median `2.77 s/step`, warmed mean after first 20
+  intervals `2.76 s/step`, warmed p90 `2.90 s/step`, peak sampled VRAM
+  `13083 MiB`.
+- `compile=true`: not a valid target yet; torch inductor failed at step 3 on an
+  ERNIE attention backward stride assertion.
+
+Mojo real-cache smoke on the local ERNIE cache and checkpoint (2026-06-03):
+
+- Speed ladder: host streamed `~175 s/step` -> frozen dX-only `~161 s/step` ->
+  device LoRA/bulk D2H `~49 s/step` -> BF16 streamed blocks `43.31 s/step` ->
+  resident BF16 blocks `2.68 s/step`.
+- Latest 3-step resident BF16 run: losses `0.6786737`, `1.0965953`,
+  `0.47514582`; grads finite; nonfinite `0`; final LoRA-B |.|_1 `11546.05`;
+  `252/252` LoRA slots nonzero. Resident block fit receipt: all 36 blocks loaded
+  and ~5.2 GB VRAM remained before the step.
 
 ## Sampling Contract
 
@@ -176,6 +204,7 @@ path as training and Serenity inference, not by permanently merging base weights
    512, batch 2, LR `3e-4`, rank 16, alpha 16, train shift 1.0, LOGIT_NORMAL.
 3. Add masked attention or same-length bucket dispatch before claiming batch-2
    parity.
-4. Replace hot host-list boundaries with tensor-resident/offloaded block APIs.
-5. Run the OneTrainer 100-step baseline on the same dataset, then a Mojo 100-step
-   run with loss/speed/LoRA-B/nonfinite metrics and caption-based samples.
+4. Run a Mojo 100-step production-style benchmark against the OneTrainer target,
+   then compare loss/speed/LoRA-B/nonfinite metrics and caption-based samples.
+5. Ring allocator/saved-activation reuse is a later shared memory-DX project;
+   it is no longer required for the current ERNIE speed target.

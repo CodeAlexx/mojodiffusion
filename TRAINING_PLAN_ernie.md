@@ -1,11 +1,14 @@
 # TRAINING_PLAN_ernie.md — ERNIE-Image pure-Mojo training port
 
 Status: Phase 1 DONE + Phase 2 (E1/E2/E3) DONE + E4 (LoRA) DONE + **E5
-(train_ernie_real) DONE & REAL-RUN VERIFIED** (2026-06-01). Single-block AND
+(train_ernie_real) DONE & REAL-RUN VERIFIED** (2026-06-01) + **E5 speed target
+hit** (2026-06-03). Single-block AND
 full-36-layer-stack fwd+bwd are parity-clean vs torch at real hidden dims
 (H=32, Dh=128, D=4096). The real training loop runs on the real 36-layer
 checkpoint + real cache: loss finite, grads finite & growing, LoRA-B 0→nonzero
-(learning), nonfinite=0, PEFT save inference-loadable. E6 (full-FT) deferred;
+(learning), nonfinite=0, PEFT save inference-loadable. The production hot path
+now keeps all ERNIE block matrices BF16-resident on the 3090 and measures
+~2.68 s/step on the local real-cache smoke. E6 (full-FT) deferred;
 Mistral3B text-encoder port deferred (cache already holds text embeddings).
 Builder→skeptic→bugfix discipline per phase.
 
@@ -25,16 +28,14 @@ composed forward at depth L=3, including the genuinely-new SHARED-AdaLN grad tha
 SUMS across all blocks (cos 0.9999999999999001). Real 36-layer fwd+bwd on the
 real checkpoint is finite with no OOM.
 
-### MEMORY FINDING (E6 input): full F32 residency of all 36 blocks is ~31 GB and
-does NOT fit a 24 GB 3090 (measured: load_ernie_all_blocks OOMs at ~block 22).
-The per-block recompute bounds the ACTIVATION footprint, NOT the resident WEIGHT
-footprint. The real-depth smoke runs via STREAMED blocks (load→use→drop per
-layer, resident weights bounded to ~1 block, peak 0.72 GiB) — mirroring the Rust
-`ErnieImageSwapped`/`BlockOffloader` contract. `ernie_stack_forward_streamed` /
-`ernie_stack_backward_streamed` are in `ernie_stack.mojo`. The training loop (E5)
-MUST use the streamed path (or a BF16-resident path — but BF16 residency needs
-the block ops to accept BF16 weight + F32 activations, which rms_norm currently
-rejects; streamed F32 is the working budget today).
+### MEMORY FINDING (updated 2026-06-03): full F32 residency of all 36 blocks is
+~31 GB and does NOT fit a 24 GB 3090 (measured: `load_ernie_all_blocks` OOMs at
+~block 22). BF16/norm-F32 residency DOES fit: `load_ernie_all_blocks_bf16_normf32`
+loads all 36 blocks and leaves ~5.2 GB free before the step on the local 3090.
+The trainer's production hot path now uses resident BF16 block matrices + F32
+norm vectors (`ernie_stack_lora_forward_resident_device` /
+`ernie_stack_lora_backward_resident_device`). The older streamed F32 paths remain
+as correctness/fallback paths; they are no longer the speed target.
 
 ERNIE-Image = Baidu single-stream DiT: hidden 4096, 36 layers, 32 heads, head
 dim 128, FFN 12288, SHARED AdaLN modulation (one mod computed once, broadcast to
@@ -148,8 +149,12 @@ every model — nothing inlined in the model file).
 - `models/ernie/ernie_stack_lora.mojo`: `ErnieLoraSet` (flat List[LoraAdapter],
   7×num_layers, slot order Q,K,V,O,gate,up,down) + `build_ernie_lora_set` + RESIDENT
   `ernie_stack_lora_forward`/`backward` (composition gate) + STREAMED
-  `ernie_stack_lora_forward_streamed`/`backward_streamed` (E5 path) + scatter of the
-  per-block 7-slot d_A/d_B into flat grads + `ernie_lora_adamw_step` (reuses
+  `ernie_stack_lora_forward_streamed`/`backward_streamed` (fallback/correctness path)
+  + DEVICE hot paths (`ernie_lora_set_to_device`,
+  `ernie_stack_lora_forward_streamed_device`/`backward_streamed_device`,
+  `ernie_stack_lora_forward_resident_device`/`backward_resident_device`) + one bulk
+  LoRA-grad D2H gather + scatter of the per-block 7-slot d_A/d_B into flat grads +
+  `ernie_lora_adamw_step` (reuses
   _lora_adamw) + `save_ernie_lora`/`load_ernie_lora_resume` (PEFT keys
   `layers.<i>.self_attention.{to_q,to_k,to_v,to_out.0}` / `.mlp.{gate_proj,up_proj,
   linear_fc2}` — inverse of inference-flame ernie_image.rs lora.apply; reuses
@@ -181,9 +186,11 @@ every model — nothing inlined in the model file).
   save keys.
 - COMPTIME real dims: N_IMG=1024 (32×32 latent), N_TXT=256 (fixed trim of the
   PAD-padded cache text; observed real_len ≤ ~203 so all real tokens kept),
-  S=1280, D=4096, F=12288, 36 layers, rank=16 α=16. Uses the STREAMED stack
-  (`ernie_stack_lora_forward_streamed`/`_backward_streamed`) — 36 F32 blocks
-  load→use→drop. Peak GPU ~12 GB on the 24 GB 3090, ~188 s/step (host-List path).
+  S=1280, D=4096, F=12288, 36 layers, rank=16 α=16. Current hot path uses
+  BF16/norm-F32 block residency: all 36 base blocks load once, LoRA A/B upload to
+  device each step, frozen base backward uses dX-only helpers, and all LoRA grads
+  return through one bulk D2H gather. Fit receipt: after resident block load,
+  free VRAM was 5.20-5.25 GB on the local 3090.
 - The deferred E2/E5 shared-AdaLN SOURCE is now BUILT in the trainer
   (`_shared_adaln_source`): from the resident `ErnieStackBase` weights +
   `sigma_idx` it computes `c=time_embed(sigma_idx)` (sin-first MLP) →
@@ -191,24 +198,52 @@ every model — nothing inlined in the model file).
   `[f_scale,f_shift]=chunk2(c@final_norm.linear+b)`. Mirrors ernie_image.rs:519-552
   / ernie_image.mojo time_embed/shared_adaln. All F32.
 - REAL-RUN RESULT (tool output, no faking): nonfinite=0 every step; grads finite
-  and growing (0.00160 → 0.00233); **LoRA-B |.|_1 grew 0.0 (init) → 6319.8
-  (step0) → 9132.5 (step1)** — every adapter slot moving off the PEFT zero-init,
-  i.e. the LoRA is LEARNING. Per-step raw loss varies with the sampled σ
-  (step0 σ_idx=540 loss=0.679; step1 σ_idx=287 loss=1.097) — same σ-dependent
-  magnitude as the Rust trainer, not a regression. Final save → PEFT/ai-toolkit
-  safetensors (`serenitymojo/output/ernie_lora_real.safetensors`,
-  inference-loadable via the ernie_image.rs lora.apply key map).
+  and growing; every adapter slot moves off the PEFT zero-init, i.e. the LoRA is
+  LEARNING. Latest 3-step BF16-resident device run (2026-06-03):
+  step0 loss=0.6786737 grad=0.0016256 secs=2.7459, step1 loss=1.0965953
+  grad=0.0023452 cumulative=5.3837, step2 loss=0.47514582 grad=0.0018576
+  cumulative=8.0317. Mean measured loop speed = **2.68 s/step**; all 252/252
+  LoRA slots nonzero; final LoRA-B |.|_1=11546.05. Save →
+  `/tmp/ernie_probe_lora_resident_bf16_3step.safetensors` with PEFT/ai-toolkit
+  keys. Per-step raw loss varies with sampled σ; this matches the expected
+  σ-dependent magnitude rather than indicating a regression.
+- SPEED LADDER (same real checkpoint/cache, 2026-06-03): legacy host streamed
+  path started at ~175 s/step; frozen-base dX-only stripping reduced that to
+  ~161 s/step; device LoRA + bulk grad D2H reduced it to ~49 s/step; BF16
+  streamed blocks reduced it to ~43.3 s/step; BF16-resident all-block path hit
+  2.68 s/step. This is the target class the user wanted: "few seconds per step."
+- ONETRAINER BASELINE (2026-06-03): local OneTrainer run on
+  `/home/alex/models/ERNIE-Image` + `/home/alex/eri2`, batch=2, LoRA, transformer
+  `INT_W8A8`, text encoder `FLOAT_8`, train/output BF16, `LOGIT_NORMAL`,
+  252 selected LoRA layers. `compile=true` hit a torch-inductor ERNIE attention
+  backward stride bug at step 3
+  (`attn_bias.stride(1)=1500625 should be multiple of 4`), so the baseline target
+  is the `compile=false` run:
+  `configs/ernie_eri2_100step_baseline.json` +
+  `scripts/benchmark_ernie_100.py`. Result: 100/100 steps completed, final LoRA
+  saved to `/home/alex/OneTrainer/output/ernie_eri2_100step_baseline/lora.safetensors`.
+  Final loss=0.7464916, smooth loss=0.6612294, mean loss=0.6612294,
+  median loss=0.6428585, final grad_norm=0.0014650, median grad_norm=0.0010599,
+  peak sampled GPU memory=13083 MiB (torch max allocated=10777 MiB,
+  reserved=11088 MiB), mean sampled GPU util=92.2%. Timing: warmed median
+  2.77 s/step; warmed mean after first 20 intervals 2.76 s/step; warmed p90
+  2.90 s/step. Full train-loop wall including epoch/cache overhead was 355.8 s
+  (3.56 s/step); all callback intervals excluding only the first averaged
+  3.21 s because warmup/epoch-boundary intervals are included. This is the
+  practical Mojo ERNIE speed target: first match OneTrainer's stable
+  ~2.7-2.9 s/step, then optimize below it.
 - MISTRAL3B TEXT ENCODER: DEFERRED (not needed for this real run). The cache
   already holds the Mistral text_embedding[1,512,3072]; the loop reads it
   directly. The Mistral port (`models/text_encoder/mistral3b_encoder.mojo`,
   mirroring qwen3_encoder.mojo) is only needed to (re)generate caches / encode
   sample prompts — off the training hot path. FLAGGED as its own intake (YaRN
   RoPE, GQA 32q/8kv, causal mask, layer-24 extract).
-- FOLLOW-UPS (not blockers): (1) host-List path is slow (188 s/step) — a device-
-  resident activation path (Klein's `*_resident_moddev_rope_scratch` analogue)
-  would cut this ~10×; (2) variable per-sample text trim needs a runtime (non-
-  comptime) seq or a small set of comptime buckets; (3) caching the σ→mv/f_scale
-  source per-step is trivial but the source is cheap relative to 36 blocks.
+- FOLLOW-UPS (not blockers): (1) convert this smoke into the production
+  config/dataset loop (batch 2, 512 buckets, train shift 1.0, LOGIT_NORMAL);
+  (2) add masked attention or same-length buckets before claiming OneTrainer
+  batch-2 parity; (3) port Mojo Mistral3/tokenizer and VAE prepare so Rust/Python
+  cache files are not required; (4) ring allocator/saved-activation reuse remains
+  a later memory-DX project, not needed to hit the current speed target.
 
 #### Historical E5 scope (now satisfied)
 - The per-step LoRA mechanics are PROVEN (E4): `ernie_stack_lora_forward_streamed`

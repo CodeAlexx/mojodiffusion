@@ -60,6 +60,12 @@ serenitymojo/
   ops/  autograd.mojo  tensor.mojo  io/   # unchanged primitives
 ```
 
+All trainer drivers must also satisfy
+`serenitymojo/docs/TRAINER_MANDATORY_RUNTIME_CONTRACT.md`: standard
+`print_trainer_progress` output, shared `serenity.sample_prompts.v1` prompt JSON
+for validation samples, image sample defaults of 1024x1024, PEFT plus AdamW-state
+checkpoints, and the sample/train/save/resume smoke.
+
 ## The seam, shaped for Mojo (not OOP)
 
 Mojo has no inheritance and attention dims must be comptime, so the OneTrainer

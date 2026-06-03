@@ -42,7 +42,7 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.rope import rope_halfsplit
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask, sdpa
 from serenitymojo.ops.tensor_algebra import reshape, add
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -232,6 +232,7 @@ def _attn(
     prefix: String,     # e.g. 'blocks.0.self_attn'
     rope_q: _RopePair,
     rope_k: _RopePair,
+    key_mask: Tensor,   # additive [1,H,S,S] (0 keep / -1e9 pad key) — OT attn mask
     ctx: DeviceContext,
 ) raises -> Tensor:
     var H = ADP_HEADS
@@ -266,9 +267,11 @@ def _attn(
     q = rope_halfsplit(q, rope_q.cos, rope_q.sin, ctx)
     k = rope_halfsplit(k, rope_k.cos, rope_k.sin, ctx)
 
-    # SDPA no-mask (BSHD, S_q==S_k). Comptime B=1,S=512,H=16,Dh=64.
-    var attn = sdpa_nomask[1, 512, ADP_HEADS, ADP_HEAD_DIM](
-        q, k, v, scale, ctx
+    # Masked SDPA (BSHD, S_q==S_k==512). key_mask zeros padding keys so the
+    # softmax never attends to Qwen3/T5 pad positions (OT AnimaTextConditioner
+    # source/target_attention_mask). Comptime B=1,S=512,H=16,Dh=64.
+    var attn = sdpa[1, 512, ADP_HEADS, ADP_HEAD_DIM](
+        q, k, v, key_mask, scale, ctx
     )
     var a_sh = List[Int]()
     a_sh.append(1); a_sh.append(sq); a_sh.append(H * Dh)
@@ -284,18 +287,20 @@ def _block(
     j: Int,
     rope_q: _RopePair,
     rope_k: _RopePair,
+    self_mask: Tensor,   # additive [1,H,S,S] keyed by TARGET (T5) padding
+    cross_mask: Tensor,  # additive [1,H,S,S] keyed by SOURCE (Qwen3) padding
     ctx: DeviceContext,
 ) raises -> Tensor:
     var bp = String("blocks.") + String(j)
 
-    # self-attn (q,k both target positions)
+    # self-attn (q,k both target positions) — mask T5 padding keys
     var n1 = rms_norm(x, wts.get(bp + ".norm_self_attn.weight"), ADP_EPS, ctx)
-    var sa = _attn(n1, n1, wts, bp + ".self_attn", rope_q, rope_q, ctx)
+    var sa = _attn(n1, n1, wts, bp + ".self_attn", rope_q, rope_q, self_mask, ctx)
     var x1 = add(x, sa, ctx)
 
-    # cross-attn (q target pos, k context pos)
+    # cross-attn (q target pos, k context pos) — mask Qwen3 padding keys
     var n2 = rms_norm(x1, wts.get(bp + ".norm_cross_attn.weight"), ADP_EPS, ctx)
-    var ca = _attn(n2, context, wts, bp + ".cross_attn", rope_q, rope_k, ctx)
+    var ca = _attn(n2, context, wts, bp + ".cross_attn", rope_q, rope_k, cross_mask, ctx)
     var x2 = add(x1, ca, ctx)
 
     # MLP (bias, exact GELU)
@@ -363,26 +368,84 @@ def zero_pad_positions_f32(
     return Tensor(out_buf^, hidden.shape(), STDtype.F32)
 
 
+# ── additive key-mask [1,H,S,S] from a 0/1 mask list ─────────────────────────
+# o[.,.,.,sk] = 0 if mask01[sk]!=0 else -1e9  (broadcast over query+head).
+def _keymask_kernel_f32(
+    m: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [S] additive values
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [H*S*S]
+    S: Int,
+    total: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < total:
+        var sk = idx % S
+        o[idx] = m[sk]
+
+def _build_keymask(mask01: List[Int], S: Int, ctx: DeviceContext) raises -> Tensor:
+    """Additive attention mask [1,H,S,S] F32: 0 where mask01[sk]==1, -1e9 (pad)."""
+    var H = ADP_HEADS
+    var mvals = List[Float32]()
+    for i in range(S):
+        mvals.append(Float32(0.0) if mask01[i] != 0 else Float32(-1.0e9))
+    var msh = List[Int]()
+    msh.append(S)
+    var m_t = Tensor.from_host(mvals^, msh^, STDtype.F32, ctx)
+
+    var total = H * S * S
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](total * 4)
+    var m_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](S))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
+    var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        m_t.buf.unsafe_ptr().bitcast[Float32](), m_rl
+    )
+    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+    )
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_keymask_kernel_f32, _keymask_kernel_f32](
+        M, O, S, total, grid_dim=grid, block_dim=_BLOCK
+    )
+    ctx.synchronize()
+    var osh = List[Int]()
+    osh.append(1); osh.append(H); osh.append(S); osh.append(S)
+    return Tensor(out_buf^, osh^, STDtype.F32)
+
+
 # ── full adapter forward ─────────────────────────────────────────────────────
 def anima_llm_adapter_forward(
-    t5_ids: List[Int],     # [S_TXT] T5 token ids (queries)
+    t5_ids: List[Int],     # [S_TXT] T5 token ids (queries; pad id 0)
     qwen_hidden: Tensor,   # [1, S_LLM, 1024] F32 (Qwen3 last_hidden_state, pad-zeroed)
+    qwen_mask: List[Int],  # [S_LLM] 0/1 Qwen3 attention mask (SOURCE keys)
     wts: AnimaAdapterWeights,
     ctx: DeviceContext,
 ) raises -> Tensor:
-    """Run net.llm_adapter -> context [1, S_TXT, 1024] (F32). FORWARD ONLY."""
+    """Run net.llm_adapter -> context [1, S_TXT, 1024] (F32). FORWARD ONLY.
+
+    OT AnimaTextConditioner: self-attn masks T5 padding (target), cross-attn masks
+    Qwen3 padding (source), and padding context positions are zeroed at the output.
+    """
     var s_txt = len(t5_ids)
     var qs = qwen_hidden.shape()
     var s_llm = qs[1]
+
+    # target (T5) 0/1 mask: pad id is 0. Build from t5_ids.
+    var t5_mask = List[Int]()
+    for i in range(s_txt):
+        t5_mask.append(1 if t5_ids[i] != 0 else 0)
+
+    var self_mask = _build_keymask(t5_mask, s_txt, ctx)      # target keys (S_TXT)
+    var cross_mask = _build_keymask(qwen_mask, s_llm, ctx)   # source keys (S_LLM)
 
     var x = embed_lookup_f32(wts.get(String("embed.weight")), t5_ids, ctx)
     var rope_q = _rope_pair(s_txt, ADP_HEADS, ADP_HEAD_DIM, ctx)
     var rope_k = _rope_pair(s_llm, ADP_HEADS, ADP_HEAD_DIM, ctx)
 
     for j in range(ADP_BLOCKS):
-        x = _block(x, qwen_hidden, wts, j, rope_q, rope_k, ctx)
+        x = _block(x, qwen_hidden, wts, j, rope_q, rope_k, self_mask, cross_mask, ctx)
 
     var ob = Optional[Tensor](wts.get(String("out_proj.bias")).clone(ctx))
     x = linear(x, wts.get(String("out_proj.weight")), ob^, ctx)
     x = rms_norm(x, wts.get(String("norm.weight")), ADP_EPS, ctx)
+    # OT zeros padding context positions (target padding) at the output.
+    x = zero_pad_positions_f32(x, t5_mask, ctx)
     return x^

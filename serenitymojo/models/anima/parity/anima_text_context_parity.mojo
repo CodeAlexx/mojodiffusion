@@ -150,7 +150,13 @@ def main() raises:
     var qwen_hidden = Tensor.from_host(_in("in_qwen_hidden"), qh_sh^, STDtype.F32, ctx)
 
     print("[anima-text-context-parity] running Mojo adapter forward (F32)...")
-    var context = anima_llm_adapter_forward(t5_ids, qwen_hidden, wts, ctx)
+    # NOTE: oracle fixtures predate the OT attention masks. Pass an all-ones
+    # source mask to preserve the legacy no-mask comparison; regenerate the
+    # oracle WITH source/target masks to re-validate the masked path.
+    var qwen_mask = List[Int]()
+    for _i in range(S_LLM):
+        qwen_mask.append(1)
+    var context = anima_llm_adapter_forward(t5_ids, qwen_hidden, qwen_mask, wts, ctx)
 
     var cs = context.shape()
     print("[anima-text-context-parity] context shape = [",

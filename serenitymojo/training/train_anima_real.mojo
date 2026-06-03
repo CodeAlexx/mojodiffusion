@@ -85,6 +85,7 @@ from serenitymojo.models.dit.anima_contract import (
 )
 
 from serenitymojo.training.schedule import sample_timestep_sigmoid
+from serenitymojo.training.progress_display import print_trainer_progress
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -434,6 +435,7 @@ def main() raises:
     var last_loss = Float32(0.0)
 
     for step in range(RUN_STEPS):
+        var step_t0 = perf_counter_ns()
         # ── timestep sampling (sigmoid -> shift -> clamp), rs:328-834 ──
         # In FIXED_SIGMA_SMOKE we hold sigma + the noise draw constant so the
         # target is identical every step (loss-decrease isolation, see header).
@@ -517,10 +519,15 @@ def main() raises:
             first_loss = loss
         last_loss = loss
 
-        print("PROG step=", step, " sigma=", sigma, " loss=", loss,
-              " |dA|_1=", da, " |dB|_1=", db, " gradnorm=", gn_before,
-              " nonfinite=", grads.nonfinite_lora_grads,
-              " LoRA-B|.|_1=", b_after, " B-nonzero=", b_nonzero, "/", n_adapters)
+        var step_now = perf_counter_ns()
+        print_trainer_progress(
+            String("Anima-lora"), step + 1, RUN_STEPS, 1,
+            loss, Float64(gn_before),
+            Float64(step_now - step_t0) / 1.0e9, 0.0,
+            Float64(step_now - t0) / 1.0e9,
+        )
+        if grads.nonfinite_lora_grads != 0:
+            print("[Anima-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
     var t1 = perf_counter_ns()
     var secs = Float64(t1 - t0) / 1.0e9

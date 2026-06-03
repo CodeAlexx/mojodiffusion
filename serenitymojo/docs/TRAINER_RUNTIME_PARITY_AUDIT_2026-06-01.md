@@ -10,8 +10,8 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
   `lr=0.0004`, 2000 steps, samples at step 0 and every 500 steps, 1024x1024,
   and two cached prompt embeddings from the shared sample prompt JSON.
 - Expected mature runtime behavior is Rust-like progress:
-  `loss`, `grad_norm`, `sec/step`, `elapsed`, `ETA`, and sampling/noising speed
-  visible in the Mojo display plus SerenityBoard.
+  `loss`, `grad_norm`, `sec/step`, `elapsed`, and `ETA` visible in the Mojo
+  display plus SerenityBoard.
 - A 50-step run is only a smoke. Useful visual convergence normally starts
   around 1400-1600 steps and can need the full 2000.
 
@@ -60,6 +60,10 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
   staging/prepare/train path for the Alina 512 dataset. It handles the current
   production bucket set `72x56/cap224`, `72x56/cap256`, `88x48/cap224`, and
   `88x48/cap256`.
+- Flux.1-dev and SDXL trainer paths are not production-tested. Flux.1-dev is not
+  Flux.2/Klein or dev2. Their shared progress display plumbing may be present,
+  but sampler/save/resume contract verification is a later task and must not be
+  inferred from the display format.
 - The 2026-06-02 100-step run after the tensor-resident main-stack speed fix
   logged `loss=0.47321588 -> 0.35350168`, `nonfinite=0`, final step `1.993s`,
   and warm cadence about `1.96-2.00s/step` batch 1. Saved LoRA:
@@ -126,10 +130,10 @@ Klein is a downstream customer of this runtime, not the owner of the fixes.
 - The winning speed fix was rank-2 concat/slice shape kernels in
   `ops/tensor_algebra.mojo`, which removed the Klein q/k/v and gate split/join
   D2D copy storm. Nsight D2D copies dropped from `321626` to `1013`.
-- In-process training validation currently uses 512 prompt JSON because 1024
-  sampling co-resident with the trainer OOMs. Standalone 1024 sampling from the
-  final LoRA works with `N_IMG=4096`, about `4.8-4.9s/denoise step`, and
-  `fallbacks 0`.
+- Validation samples must stay 1024x1024 by prompt JSON. If co-resident
+  sampling OOMs, use process-separated sampler/cadence rather than lowering the
+  prompt resolution. Standalone 1024 sampling from the final LoRA works with
+  `N_IMG=4096`, about `4.8-4.9s/denoise step`, and `fallbacks 0`.
 
 ## Next Runtime Port Order
 

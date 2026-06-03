@@ -1,7 +1,7 @@
 {
   "model_type": "zimage",
   "checkpoint": "/home/alex/models/Z-Image/transformer",
-  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/zimage_alina_samples.json",
 
   "inner_dim": 3840,
   "in_channels": 16,

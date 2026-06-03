@@ -1,6 +1,7 @@
 # Trainer Sample Prompts + SerenityBoard Contract
 
 Status: binding trainer runtime contract for Klein and future Mojo trainers.
+See also `serenitymojo/docs/TRAINER_MANDATORY_RUNTIME_CONTRACT.md`.
 
 ## Shared Sample Prompt JSON
 
@@ -22,8 +23,9 @@ Top-level `defaults` apply to every prompt unless the prompt overrides them:
 - `sample_at_start`: `true` for baseline samples before step 1
 - `save_before_sample`: `true`
 - `precache_required`: `true`
-- `width`, `height`: image sample size. Klein 9B supports `512x512` and
-  `1024x1024` in the shared sampler CLI.
+- `width`, `height`: image sample size. Image validation defaults to
+  `1024x1024`; prompt entries must be `1024x1024` or larger unless the model is
+  a non-image/video path with its own explicit frame contract.
 - `frames`, `fps`: video trainers can use these; image trainers require `frames=1`
 - `steps`, `cfg`, `seed`, `negative`
 
@@ -55,9 +57,9 @@ Production Klein LoRA cadence:
   worker process.
 - Final `2000`: save final PEFT LoRA/state and sample.
 
-Do not run Klein 9B 1024px validation sampling inside the live trainer process.
-The trainer stack, offload loader, and scratch slabs can remain resident in the
-CUDA context, and the sampler will OOM on a 24 GB 3090 Ti. Use:
+Do not lower validation sample size to avoid OOM. If a large model cannot
+sample `1024x1024` while live trainer allocations remain resident, use
+process-separated cadence/offload. For Klein 9B, use:
 
 ```bash
 /home/alex/mojodiffusion/output/bin/train_klein_cadence \
@@ -76,8 +78,9 @@ To register existing cadence samples without continuing training:
   500 sampleonly
 ```
 
-Short smoke runs below `sample_every` skip quality samples. A 50-step LoRA image
-is not treated as a useful visual validation artifact.
+Short smoke runs may label samples as wiring checks, but image outputs are still
+`1024x1024` or larger. A 50-step LoRA image is not treated as a useful visual
+validation artifact.
 
 ## LoRA Saves
 
@@ -91,6 +94,10 @@ Klein writes two files at production checkpoints:
 Do not reload the PEFT file into a live trainer just to prove save/load. PEFT
 files do not carry optimizer moments, so doing that resets AdamW and harms
 convergence.
+
+Every trainer must prove the save/resume path with the standard smoke: sample at
+step 0, train 10 steps, save PEFT+state, sample, resume trainer state, train to
+25 total steps, save PEFT+state, and sample again.
 
 ## SerenityBoard
 
@@ -130,8 +137,10 @@ Verified on 2026-06-02 after the rank-2 concat/slice fast paths and the final
 - Warm training speed held around `2.0-2.1s/step`; only post-sample restarts
   showed `3.1-3.2s/step`.
 - Offload fallbacks stayed at `0`.
-- In-process full-run validation used 512 prompt JSON because 1024 validation
-  can OOM when trainer allocations remain resident.
+- Earlier in-process full-run validation lowered sample resolution because 1024
+  validation could OOM when trainer allocations remained resident. That is no
+  longer an accepted normal-output workaround; use the process-separated 1024+
+  sampler/cadence path instead.
 - Standalone 1024 sampling from the final LoRA succeeded for
   `sample_step2000_alina_garden_1024.png`; it used `N_IMG=4096`, denoised at
   about `4.8-4.9s/step`, and reported `fallbacks 0`.

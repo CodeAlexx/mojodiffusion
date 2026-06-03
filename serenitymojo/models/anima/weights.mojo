@@ -228,6 +228,18 @@ def load_anima_all_blocks_f32(
     return blocks^
 
 
+# Load ALL `num_blocks` blocks BF16 (norms F32) resident ONCE — the 24GB-safe
+# device-resident inference stack (28 blocks ≈ 3.7 GiB). Used by the no-save
+# sampler forward so there is NO per-block disk reload across denoise steps.
+def load_anima_all_blocks_bf16_normf32(
+    st: SafeTensors, num_blocks: Int, ctx: DeviceContext
+) raises -> List[AnimaBlockWeights]:
+    var blocks = List[AnimaBlockWeights]()
+    for i in range(num_blocks):
+        blocks.append(load_anima_block_weights_bf16_normf32(st, i, ctx))
+    return blocks^
+
+
 # ── Resident (shared) base weights: x_embedder / t_embedder / t_embedding_norm /
 #    final_layer. The LLM adapter (6 frozen blocks) is NOT loaded here — for LoRA
 #    training the adapter output (context) is a cached, frozen INPUT; its weights

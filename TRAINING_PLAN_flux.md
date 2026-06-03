@@ -1,16 +1,12 @@
 # TRAINING_PLAN — Flux (flux1-dev) pure-Mojo training port
 
-Status: **Phase 1 (block fwd+bwd parity) DONE + MEASURED. Phase 2 (full-stack
-composition fwd+bwd) DONE + VERIFIED. Phase 3 (LoRA step) DONE + MEASURED.
-Phase 4 (INTEGRATED REAL TRAINING LOOP on flux1-dev) — DONE + MEASURED
-(2026-06-01 PM). All three blockers A/B/C closed this session, then
-`train_flux_real.mojo` wired the verified pieces into the Klein-style loop and
-produced a REAL run on flux1-dev via the block-swap offload path:
-step-1 loss=1.4944 finite, LoRA-B grew 0 -> 2418.2 with loraB_nonzero=418/418
-(EVERY adapter across the FULL 19+38 depth), nonfinite=0. See §7 for the
-measured run + files. The offload step is slow (~324 s/step: the full 24 GB
-checkpoint is streamed from disk each fwd AND bwd at the host-list boundary) —
-correctness is proven; offload throughput is the documented next increment.**
+Status: **Flux.1-dev only, not Flux.2/Klein/dev2. Not production-tested.** The
+block, stack, and LoRA-step parity notes below are useful, but the integrated
+trainer/sampler/save/resume contract must be revalidated later before Flux is
+treated as a supported trainer. Historical sections that mention a "real run" are
+kept as prior agent notes, not as current acceptance evidence. TODO: rerun a real
+Flux.1-dev smoke with the mandatory progress display, shared prompt JSON sampler,
+checkpoint save, resume, and final 1024x1024 sample.
 
 Scope of this doc: the Flux **transformer (DiT)** training port inside
 `serenitymojo/models/flux/`. Reuses Klein's `training/` + `ops/` by calling,
@@ -552,12 +548,12 @@ gateable prerequisite landed (flux block plan) to advance Blocker A.
 
 ---
 
-## 7. Phase 4 — REAL TRAINING LOOP DONE + MEASURED (2026-06-01 PM)
+## 7. Phase 4 — Historical Flux.1-dev Trainer Notes, Revalidate Later
 
-All three Phase-4 blockers (A offload stack / B base-weight loader / C flux1 VAE
-encoder) were closed THIS session, and `train_flux_real.mojo` wired the verified
-pieces into a Klein-style real loop that produced a REAL run on the REAL
-flux1-dev checkpoint via the block-swap offload path.
+Current status: Flux.1-dev trainer plumbing exists, but it is not
+production-tested and it is not Flux.2/Klein/dev2. Re-run this section later as a
+fresh acceptance gate using the mandatory trainer runtime contract. The notes
+below are retained as historical implementation context.
 
 ### Blockers closed (all built + gated BEFORE the trainer)
 - **A — offload LoRA stack.** `flux_stack_lora.mojo` now has
@@ -590,7 +586,7 @@ streamed) → MSE loss → `flux_stack_lora_backward_offload` → global-norm cl
 FIXED_SIGMA_SMOKE mode pins sample+timestep+noise so a correct backward MUST
 drive loss down monotonically (same correctness probe as zimage/anima).
 
-### MEASURED real run (REAL flux1-dev, full depth, offload)
+### Historical smoke log (not current acceptance evidence)
 ```
 === Flux (flux1-dev) REAL LoRA training loop (block-swap offload) ===
   depth: NUM_DOUBLE=19 NUM_SINGLE=38 (FULL flux1-dev)

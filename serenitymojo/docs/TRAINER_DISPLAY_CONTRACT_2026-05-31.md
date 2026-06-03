@@ -1,6 +1,7 @@
 # Trainer Display Contract - 2026-05-31
 
-All trainer runtime display is pure Mojo.
+All trainer runtime display is pure Mojo. The current binding all-trainer
+contract is `serenitymojo/docs/TRAINER_MANDATORY_RUNTIME_CONTRACT.md`.
 
 ## Rule
 
@@ -8,6 +9,8 @@ All trainer runtime display is pure Mojo.
 - Do not require Python for trainer UI.
 - Python scripts may exist only for development, parity replay, or old-log filtering.
 - The trainer itself must print the operator-facing line.
+- Every trainer must use this display module for normal output. Per-model
+  `PROG`/debug lines may exist only as secondary machine/debug output.
 - Other trainers are valid reference sources. For every new Mojo trainer, capture
   baseline stats from OneTrainer/Rust/PyTorch as needed: loss curve, grad_norm,
   noising speed, step speed, save format, validation sample settings, and any
@@ -24,7 +27,7 @@ All trainer runtime display is pure Mojo.
 Format:
 
 ```text
-[Klein-lora] step 18/50 | epoch 1/2 | loss 0.2721 | grad_norm 0.6860 | 8.4s/step | noise 56.6M/s | elapsed 0:05:51 | ETA 0:04:27
+[Klein-lora] step 1613/2000 | epoch 14/17 | loss 0.5909 | grad_norm 0.1527 | 2.1s/step | elapsed 0:55:37 | ETA 0:13:20
 ```
 
 Required fields:
@@ -34,7 +37,6 @@ Required fields:
 - `loss`
 - `grad_norm`
 - seconds per train step
-- noising speed
 - elapsed time
 - ETA
 

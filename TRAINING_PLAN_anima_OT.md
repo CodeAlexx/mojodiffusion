@@ -16,7 +16,7 @@ The transformer math == the Cosmos math OT calls (diffusers_to_original is a pur
 | # | Delta | OT source (cite) | Current Mojo |
 |---|---|---|---|
 | 1 | context len **512** | `AnimaModel.py:23 PROMPT_MAX_LENGTH=512`; `AnimaBaseDataLoader.py:38` "(512,1024)" | `ANIMA_MAX_SEQ_LEN=256` |
-| 2 | **scale_latents** before flow | `BaseAnimaSetup.py:108`; `AnimaModel.py:233` per-ch (x−mean)·(1/std) | none (raw latent) |
+| 2 | **scale_latents** before flow | `BaseAnimaSetup.py:108`; `AnimaModel.py:233` per-ch (x−mean)·(1/std) | implemented in `train_anima_ot.mojo`; sampler emits scaled latents |
 | 3 | OT discrete timestep + σ | `ModelSetupNoiseMixin._get_timestep_discrete`; `_add_noise_discrete` σ=idx/N | sigmoid (rs) |
 | 4 | OT MSE flow loss | `_flow_matching_losses` unmasked `mse_loss(pred,target)`; target=noise−scaled_latent | MSE (ok, re-verify) |
 | 5 | OT LoRA save keys | `AnimaLoRASaver` raw `transformer_lora.state_dict()` (diffusers names) | kohya `lora_unet_blocks_*` |
@@ -75,6 +75,29 @@ Timestep→model (`BaseAnimaSetup.py:137`): `transformer(timestep=timestep/1000,
 - **GAP 1 (Chunk C wired into prepare):** caption = "a photo collage grid of a woman with a white cat, a smiling woman, a pink lotus flower, traditional Chinese ink paintings, a swan on a lake, and bowls of food" (the test_256.png teaser collage). HF tokenizer sidecar (Qwen2 38 tok + T5 49 tok @ max_len 512) → `pipeline/anima_text_context.mojo` (real Qwen3-0.6B → zero-pad → `net.llm_adapter`) → context_cond [1,512,1024] finite, mean_abs 0.0449 → `output/anima_gap2/anima_context_mojo.safetensors`. `train_anima_ot.CONTEXT_PATH` now points here (src_tokens=512, used as-is). PROVENANCE: latent = real Qwen-Image VAE encode of test_256.png (prepare cache); context = ENTIRELY Mojo pipeline (Qwen3+adapter). DIFF vs old captured sidecar: cos 0.038 (orthogonal), mean_abs 0.045 vs 0.0026 — wholly different (the old sidecar was a different caption captured at 256 tok).
 - **GAP 2 (directional learning proof):** single-image overfit, fixed-σ (idx 500), 20 steps, S_IMG=256, 24.7 s/step, peak temp 64°C, RC=0. Loss 1.783→0.408 (Δ−1.375); first-half mean 1.330→second-half 0.563 (trend −0.767). 280/280 LoRA-B grew, 0 nonfinite. Sample-shift mad 0.365 / cos 0.920. **DIRECTIONAL (Tenet-4): L2(base→target)=109.53, L2(lora→target)=70.57 → lora CLOSER by 38.96 = TRUE.** 3 decoded PNGs (qwenimage_decoder wan21-keys, BF16) under `output/anima_gap2/{base_sample,lora_sample,target}.png`: target = faithful collage; base = near-empty striped field; lora = textured warm field (visibly shifted toward target). VERDICT: LEARNING PASS (all four gates).
 - CAVEATS: 20-step overfit (loss had largely plateaued by ~step 24 in a longer run). Two earlier longer runs (90/80-step) were silently SIGKILLed mid-train (~step 27/44, likely host-RAM OOM from per-step List allocations — un-investigated; 20-step is safely under). 4-step Euler sample is too few steps to render the full target image (the lora PNG is a directional bias, not a reproduction) — expected at this step budget. 1024² still out of scope.
+
+## STATUS 2026-06-03 -- Codex operational memory
+
+- Use `/home/alex/OneTrainer-anima-ref` for Anima. Do not use the default
+  `/home/alex/OneTrainer` tree for Anima parity decisions.
+- OneTrainer Anima trains and samples in scaled latent space:
+  `scaled = (raw - mean) * (1/std)`, target `noise - scaled`, training model
+  timestep `timestep/1000`, sampler denoise from scaled Gaussian latent noise.
+  The Mojo `QwenImageVaeDecoder.decode_wan21_keys` internally applies
+  `z / inv_std + mean`, so feed scaled latents directly to decode. Do not
+  pre-unscale unless intentionally debugging a non-standard latent.
+- `models/anima/anima_text_context.mojo` now mirrors the OneTrainer conditioner
+  masking: zero Qwen padding, T5 self-attn mask, Qwen cross-attn mask, and
+  zero padded T5 output rows.
+- `pipeline/anima_sample_cli.mojo` is the process-separated 1024 LoRA sampler.
+  It accepts either a direct `context_cond` safetensors sidecar or the shared
+  `serenity.sample_prompts.v1` JSON (`configs/anima_alina_samples.json`), reads
+  precomputed context paths, applies PEFT LoRA as an overlay, and writes a
+  scaled latent for fresh-process VAE decode.
+- `training/train_anima_ot.mojo` now uses the mandatory Mojo progress display
+  and writes PEFT plus optimizer-state sidecars for faithful resume. Remaining
+  production proof is a completed long dataset run plus the standard 10-step
+  save/resume-to-25 smoke.
 
 ## Discipline
 - Pure Mojo shipped; torch only under `parity/`, run via `/home/alex/serenityflow-v2/.venv/bin/python` (or OT venv).

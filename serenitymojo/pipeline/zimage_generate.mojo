@@ -34,10 +34,12 @@
 #
 # Runtime:
 #   /tmp/zimage_generate_check [lora_path|base] [out_png] [seed] [prompt]
+#   /tmp/zimage_generate_check [lora_path|base] [out_png] [sample_prompts.json] [prompt_id]
 
 from std.sys import argv
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log, cos
+from std.time import perf_counter_ns
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -59,6 +61,10 @@ from serenitymojo.models.zimage.real_weights import (
 )
 from serenitymojo.ops.tensor_algebra import reshape, permute, mul_scalar, add, sub, slice
 from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.training.sample_prompt_config import (
+    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+)
+from serenitymojo.training.progress_display import print_sample_step, print_sample_saved
 
 
 # ── shared verified checkpoint snapshot (DiT + VAE parity used this exact one) ──
@@ -522,6 +528,7 @@ def _denoise[HL: Int, WL: Int](
     _stats("init_noise", x, ctx)
     events.append(ZImageEvent(ZEVENT_STARTED, 0, steps, String("started")))
     for i in range(steps):
+        var step_t0 = perf_counter_ns()
         var t = 1.0 - sigmas[i]  # DiT timestep convention (= 1 - sigma)
         # Diffusers CFG (code form, F32): pred_raw = vc + cfg*(vc - vu);
         # pipeline_z_image.py negates before FlowMatchEulerDiscreteScheduler.step.
@@ -539,7 +546,11 @@ def _denoise[HL: Int, WL: Int](
         x = add(x, mul_scalar(pred, dt, ctx), ctx)  # F32: x += (σ_next-σ)*(-pred_raw)
         events.append(ZImageEvent(ZEVENT_STEP, i + 1, steps, String("denoise")))
         if (i + 1) % 10 == 0 or i == steps - 1:
-            print("  step", i + 1, "/", steps, "sigma", sigmas[i], "→", sigmas[i + 1])
+            var secs = Float64(perf_counter_ns() - step_t0) / 1.0e9
+            var rate = Float64(0.0)
+            if secs > 0.0:
+                rate = Float64(1.0) / secs
+            print_sample_step(String("ZImage-sample"), i + 1, steps, sigmas[i], secs, rate)
     _stats("final_latent", x, ctx)
     return x^  # dit_c destroyed → weights freed before VAE load
 
@@ -583,6 +594,36 @@ def zimage_generate(
     )
 
 
+def _select_prompt(sample_cfg: SamplePromptConfig, wanted: String) raises -> SamplePrompt:
+    if len(sample_cfg.prompts) == 0:
+        raise Error("zimage_generate: sample prompt JSON has no prompts")
+    if wanted == String(""):
+        return sample_cfg.prompts[0].copy()
+    for i in range(len(sample_cfg.prompts)):
+        if sample_cfg.prompts[i].label == wanted:
+            return sample_cfg.prompts[i].copy()
+    raise Error(String("zimage_generate: prompt id not found: ") + wanted)
+
+
+def _load_prompt_json(
+    path: String, wanted: String,
+    mut prompt: String, mut negative: String,
+    mut steps: Int, mut cfg: Float32, mut seed: UInt64,
+    mut width: Int, mut height: Int,
+) raises:
+    var sample_cfg = read_sample_prompt_config(path)
+    var p = _select_prompt(sample_cfg, wanted)
+    if p.frames != 1:
+        raise Error("zimage_generate: only image prompts are supported")
+    prompt = p.prompt.copy()
+    negative = p.negative.copy()
+    steps = p.steps
+    cfg = p.cfg
+    seed = p.seed
+    width = p.width
+    height = p.height
+
+
 # ── standalone demo: drives zimage_generate with the original constants so the
 # existing single-image path still works (compile + behavior preserved). ──
 def main() raises:
@@ -593,24 +634,40 @@ def main() raises:
     var out_path = String(OUT)
     var seed = DEFAULT_SEED
     var prompt = String(DEFAULT_PROMPT)
+    var negative = String("")
+    var steps = DEFAULT_STEPS
+    var cfg = DEFAULT_CFG
+    var width = 1024
+    var height = 1024
     if len(a) >= 2:
         var arg_lora = String(a[1])
         if arg_lora != String("base") and arg_lora != String("none") and arg_lora != String(""):
             lora_path = arg_lora
     if len(a) >= 3:
         out_path = String(a[2])
-    if len(a) >= 4:
+    if len(a) >= 4 and String(a[3]).endswith(".json"):
+        var wanted = String("")
+        if len(a) >= 5:
+            wanted = String(a[4])
+        _load_prompt_json(String(a[3]), wanted, prompt, negative, steps, cfg, seed, width, height)
+    elif len(a) >= 4:
         seed = UInt64(_parse_nonnegative_int(String(a[3])))
-    if len(a) >= 5:
-        prompt = String(a[4])
+        if len(a) >= 5 and String(a[4]).endswith(".json"):
+            var wanted2 = String("")
+            if len(a) >= 6:
+                wanted2 = String(a[5])
+            _load_prompt_json(String(a[4]), wanted2, prompt, negative, steps, cfg, seed, width, height)
+        elif len(a) >= 5:
+            prompt = String(a[4])
     print("[prompt]", prompt)
     var events = List[ZImageEvent]()
     var rgb = zimage_generate(
-        prompt, String(""),
-        DEFAULT_STEPS, DEFAULT_CFG, seed,
-        1024, 1024, lora_path, Float32(1.0), events, ctx,
+        prompt, negative,
+        steps, cfg, seed,
+        width, height, lora_path, Float32(1.0), events, ctx,
     )
     var rs = rgb.shape()
     print("[vae] image:", rs[0], rs[1], rs[2], rs[3], " events:", len(events))
     save_png(rgb, out_path, ctx, ValueRange.SIGNED)
+    print_sample_saved(String("ZImage-sample"), out_path)
     print("[done] saved:", out_path)

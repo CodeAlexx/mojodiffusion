@@ -17,12 +17,12 @@
   "rope_theta": 256,
   "rope_axes_dim": [32, 48, 48],
 
-  "learning_rate": 1e-4,
+  "learning_rate": 3e-4,
   "lora_rank": 16,
-  "lora_alpha": 16,
-  "timestep_shift": 3.0,
+  "lora_alpha": 1.0,
+  "timestep_shift": 1.0,
   "max_grad_norm": 1.0,
-  "max_steps": 2000,
+  "max_steps": 2500,
   "save_every": 500,
   "sample_every": 500,
 

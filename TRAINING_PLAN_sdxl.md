@@ -1,11 +1,12 @@
 # TRAINING_PLAN_sdxl.md — SDXL conv-UNet LoRA training port (pure Mojo)
 
-Status: **REAL RUN VERIFIED (2026-06-01).** `train_sdxl_real` trains on the real
-`sdxl_unet_bf16` checkpoint with loss↓ (FIXED smoke, monotone) + LoRA-B 0→nonzero.
-The earlier "REAL-RUN BLOCKER AUDIT" (B1–B4) is CLOSED — see "Phase 6/7 — REAL
-RUN" below. Phases 1–5 + 5b were parity scaffolds at tiny dims; the real-dims
-trainable UNet (B1+B2+B3) + cache fast-path (B4) now exist and are gated.
-Parity-gated, phased.
+Status: **Not production-tested.** The block/stack/LoRA parity notes below are
+useful, but SDXL still needs a fresh acceptance run before it is treated as a
+supported trainer. TODO: later run the mandatory trainer runtime contract:
+sample from the shared prompt JSON, train, save checkpoint, resume, final save,
+and final 1024x1024-or-higher sample with the shared progress display.
+Historical sections that mention a "real run" are retained as prior agent notes,
+not current acceptance evidence. Parity-gated, phased.
 Companion to FULL_PORT_TRAINING_PLAN.md (engine strategy) and the Klein/Z-Image
 training port. SDXL is a **convolutional UNet**, not a DiT — its training-block
 decomposition differs from Klein (ResBlock + cross-attn SpatialTransformer +
@@ -199,10 +200,12 @@ proj_out → reshape → FP32 residual. Per-block: LN1→self-attn→res, LN2→
   (`<prefix>.weight` → base key). Phase 7 may add the kohya `lora_unet_*` convention
   (needs a new `training/` save path) — orthogonal to this gate.
 
-### ✅ REAL RUN — DONE/VERIFIED (2026-06-01, this session)
+### Historical SDXL Trainer Notes — Revalidate Later
 
-The blocker audit below (B1–B4) was resolved this session. `train_sdxl_real`
-performs a REAL run on the real `sdxl_unet_bf16.safetensors`.
+Current status: SDXL trainer plumbing exists, but it is not production-tested.
+Re-run this section later as a fresh acceptance gate using the mandatory trainer
+runtime contract. The notes below are retained as historical implementation
+context.
 
 **What was built (composes the gated units at REAL dims — NO new ops/ primitive, Tenet 1):**
 - `models/sdxl/sdxl_real_train.mojo` — the real-dims trainable UNet:

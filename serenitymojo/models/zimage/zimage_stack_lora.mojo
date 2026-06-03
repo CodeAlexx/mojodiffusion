@@ -98,6 +98,7 @@ from serenitymojo.models.zimage.zimage_stack import (
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_peft, load_lora_for_resume,
+    save_lora_train_state, load_lora_train_state,
 )
 
 
@@ -878,6 +879,19 @@ def save_zimage_lora_main_only(set: ZImageLoraSet, path: String, ctx: DeviceCont
     return save_lora_peft(named, path, ctx)
 
 
+def save_zimage_lora_main_only_state(
+    set: ZImageLoraSet, path: String, ctx: DeviceContext
+) raises -> Int:
+    var named = List[NamedLora]()
+    for bi in range(set.main_base(), set.num_blocks()):
+        for s in range(ZIMAGE_SLOTS):
+            named.append(NamedLora(
+                _zimage_lora_prefix(set, bi, s),
+                set.ad[bi * ZIMAGE_SLOTS + s].copy(),
+            ))
+    return save_lora_train_state(named, path, ctx)
+
+
 # ── RESUME: load the adapter A/B back from a save_zimage_lora file ───────────
 # AdamW moments are ZEROED (resume them from a loop TrainState checkpoint). The
 # returned set carries the SAME flat order build_zimage_lora_set produces.
@@ -907,6 +921,25 @@ def load_zimage_lora_main_only_resume(
             prefixes.append(_zimage_lora_prefix(template, bi, s))
     var scale = alpha / Float32(rank)
     var named = load_lora_for_resume(prefixes, scale, path, ctx)
+    var j = 0
+    for bi in range(template.main_base(), template.num_blocks()):
+        for s in range(ZIMAGE_SLOTS):
+            template.ad[bi * ZIMAGE_SLOTS + s] = named[j].adapter.copy()
+            j += 1
+    return template^
+
+
+def load_zimage_lora_main_only_state(
+    num_nr: Int, num_cr: Int, num_main: Int, rank: Int, alpha: Float32,
+    D: Int, F: Int, path: String, ctx: DeviceContext,
+) raises -> ZImageLoraSet:
+    var template = build_zimage_lora_set(num_nr, num_cr, num_main, D, F, rank, alpha)
+    var prefixes = List[String]()
+    for bi in range(template.main_base(), template.num_blocks()):
+        for s in range(ZIMAGE_SLOTS):
+            prefixes.append(_zimage_lora_prefix(template, bi, s))
+    var scale = alpha / Float32(rank)
+    var named = load_lora_train_state(prefixes, scale, path, ctx)
     var j = 0
     for bi in range(template.main_base(), template.num_blocks()):
         for s in range(ZIMAGE_SLOTS):

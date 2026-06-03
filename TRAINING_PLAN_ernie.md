@@ -2,15 +2,18 @@
 
 Status: Phase 1 DONE + Phase 2 (E1/E2/E3) DONE + E4 (LoRA) DONE + **E5
 (train_ernie_real) DONE & REAL-RUN VERIFIED** (2026-06-01) + **E5 speed target
-hit** (2026-06-03). Single-block AND
-full-36-layer-stack fwd+bwd are parity-clean vs torch at real hidden dims
-(H=32, Dh=128, D=4096). The real training loop runs on the real 36-layer
-checkpoint + real cache: loss finite, grads finite & growing, LoRA-B 0→nonzero
-(learning), nonfinite=0, PEFT save inference-loadable. The production hot path
-now keeps all ERNIE block matrices BF16-resident on the 3090 and measures
-~2.68 s/step on the local real-cache smoke. E6 (full-FT) deferred;
-Mistral3B text-encoder port deferred (cache already holds text embeddings).
-Builder→skeptic→bugfix discipline per phase.
+hit** (2026-06-03) + **Mojo Mistral3B prompt path landed** (2026-06-03).
+Single-block AND full-36-layer-stack fwd+bwd are parity-clean vs torch at real
+hidden dims (H=32, Dh=128, D=4096). The real training loop runs on the real
+36-layer checkpoint + real BoxJana cache: loss finite, grads finite & growing,
+LoRA-B 0→nonzero (learning), nonfinite=0, PEFT/state save works, and the
+built-in sampler writes 1024x1024 validation samples from Mojo-Mistral prompt
+sidecars. The production hot path now keeps all ERNIE block matrices
+BF16-resident on the 3090 and measures ~2.6-2.7 s/step on local real-cache
+smokes. The 2500-step BoxJana convergence run completed with final loss
+`0.4701`, grad_norm `0.0549`, `2.6s/step`, elapsed `1:54:53`, final LoRA-B
+|.|_1 `509872.78111666883`, and `252/252` LoRA-B slots nonzero. E6 (full-FT)
+deferred. Builder→skeptic→bugfix discipline per phase.
 
 ## What Phase 2 shipped (VERIFIED this session, 2026-06-01)
 
@@ -186,7 +189,8 @@ every model — nothing inlined in the model file).
   save keys.
 - COMPTIME real dims: N_IMG=1024 (32×32 latent), N_TXT=256 (fixed trim of the
   PAD-padded cache text; observed real_len ≤ ~203 so all real tokens kept),
-  S=1280, D=4096, F=12288, 36 layers, rank=16 α=16. Current hot path uses
+  S=1280, D=4096, F=12288, 36 layers, rank=16 α=1.0 for OneTrainer-default
+  scale parity. Current hot path uses
   BF16/norm-F32 block residency: all 36 base blocks load once, LoRA A/B upload to
   device each step, frozen base backward uses dX-only helpers, and all LoRA grads
   return through one bulk D2H gather. Fit receipt: after resident block load,
@@ -215,7 +219,8 @@ every model — nothing inlined in the model file).
 - ONETRAINER BASELINE (2026-06-03): local OneTrainer run on
   `/home/alex/models/ERNIE-Image` + `/home/alex/eri2`, batch=2, LoRA, transformer
   `INT_W8A8`, text encoder `FLOAT_8`, train/output BF16, `LOGIT_NORMAL`,
-  252 selected LoRA layers. `compile=true` hit a torch-inductor ERNIE attention
+  rank=16 alpha=1.0 by TrainConfig default, 252 selected LoRA layers.
+  `compile=true` hit a torch-inductor ERNIE attention
   backward stride bug at step 3
   (`attn_bias.stride(1)=1500625 should be multiple of 4`), so the baseline target
   is the `compile=false` run:
@@ -232,12 +237,36 @@ every model — nothing inlined in the model file).
   3.21 s because warmup/epoch-boundary intervals are included. This is the
   practical Mojo ERNIE speed target: first match OneTrainer's stable
   ~2.7-2.9 s/step, then optimize below it.
-- MISTRAL3B TEXT ENCODER: DEFERRED (not needed for this real run). The cache
-  already holds the Mistral text_embedding[1,512,3072]; the loop reads it
-  directly. The Mistral port (`models/text_encoder/mistral3b_encoder.mojo`,
-  mirroring qwen3_encoder.mojo) is only needed to (re)generate caches / encode
-  sample prompts — off the training hot path. FLAGGED as its own intake (YaRN
-  RoPE, GQA 32q/8kv, causal mask, layer-24 extract).
+- MISTRAL3B TEXT ENCODER: LANDED for prompt/cap sidecars. The train loop still
+  consumes the historical BoxJana cache for latents/text during this convergence
+  run, but validation prompts are encoded by
+  `serenitymojo/models/text_encoder/mistral3b_encoder.mojo` through
+  `serenitymojo/pipeline/ernie_precache_sample_prompts.mojo`. Tokenizer parity
+  passes for empty/studio/beach prompts; encoder smoke loads the local ERNIE
+  text encoder and emits `[1,256,3072]`.
+- COMPLETED 2500-STEP RUN (launched/completed 2026-06-03):
+  `tail -f /home/alex/mojodiffusion/logs/ernie_boxjana_2500_20260603_033140_setsid.log`.
+  Output target:
+  `/home/alex/mojodiffusion/serenitymojo/output/ernie_boxjana_2500/ernie_lora.safetensors`.
+  Step-500 cadence passed: PEFT save and trainer-state save wrote
+  `ernie_lora_step500.safetensors*`, both validation prompts sampled, the trainer
+  reloaded `.state.safetensors`, and training continued. Step-500 LoRA sample
+  shifts: studio `pixel_l1=0.040247522`, beach `pixel_l1=0.01677309`.
+  Step-1000 cadence also passed and resumed. Step-1000 LoRA sample shifts:
+  studio `pixel_l1=0.07029573`, beach `pixel_l1=0.025967646`.
+  Step-1500 cadence passed with PEFT save, trainer-state save, both 1024x1024
+  validation samples, and state reload. Step 1500 logged loss `0.1961`,
+  grad_norm `0.0080`, `2.6s/step`, elapsed `1:08:26`; sample shifts: studio
+  `pixel_l1=0.07712812`, beach `pixel_l1=0.029465288`.
+  Step-2000 cadence passed with the same save/sample/reload sequence. Step 2000
+  logged loss `0.7755`, grad_norm `0.0170`, `2.6s/step`, elapsed `1:31:40`;
+  sample shifts: studio `pixel_l1=0.05731641`, beach
+  `pixel_l1=0.043643314`.
+  Step-2500/final cadence passed with final PEFT/state save, both 1024x1024
+  validation samples, and final output save. Step 2500 logged loss `0.4701`,
+  grad_norm `0.0549`, `2.6s/step`, elapsed `1:54:53`; sample shifts: studio
+  `pixel_l1=0.05692175`, beach `pixel_l1=0.040390998`; final LoRA-B |.|_1
+  `509872.78111666883`, nonzero slots `252/252`.
 - FOLLOW-UPS (not blockers): (1) convert this smoke into the production
   config/dataset loop (batch 2, 512 buckets, train shift 1.0, LOGIT_NORMAL);
   (2) add masked attention or same-length buckets before claiming OneTrainer
@@ -294,6 +323,19 @@ every model — nothing inlined in the model file).
   consumes them). `ErnieStackBase` already holds te_w1/te_w2/adaln_w/adaln_b/
   final_norm_w/final_norm_b resident (loaded by `load_ernie_stack_base`) for
   building `c`, mv, f_scale/f_shift.
+
+### Current Runtime Wiring (2026-06-03)
+
+- `serenitymojo/configs/ernie_image.json` now points at
+  `serenitymojo/configs/ernie_image_samples.json`, the shared
+  `serenity.sample_prompts.v1` prompt file.
+- `train_ernie_real.mojo` reads that prompt JSON, emits the mandatory
+  `print_trainer_progress` display line, and supports resume-smoke mode:
+  sample at step 0, train 10, save PEFT plus trainer state, reload trainer
+  state, train to step 25, save, then sample again.
+- `training/ernie_validation_sampler.mojo` applies the active LoRA through the
+  resident no-save ERNIE forward path, decodes via the Klein VAE path, and writes
+  1024x1024 validation PNGs from the prompt JSON cap paths.
 
 ### E6 — Full fine-tune extension  [DEFERRED, path exists]
 - The block backward ALREADY returns all base-weight grads (d_wq..d_wdown,

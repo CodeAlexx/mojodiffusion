@@ -14,8 +14,9 @@
 #   6. loss = MSE(velocity, target);  d_loss = 2/N * (velocity - target)
 #   7. klein_stack_lora_backward -> LoRA grads ;  grad_norm = L2(all LoRA grads)
 #   8. klein_lora_adamw_step
-#   PRINT (machine-parseable, one per completed step):
-#     PROG step=<k> total=<MAX> loss=<f> grad=<f> lr=<f> secs=<wallclock>
+#   PRINT (human display, one per completed step):
+#     [Klein-lora] step k/total | epoch e/E | loss ... | grad_norm ... | ...s/step | elapsed ... | ETA ...
+#   Optional machine `PROG` output stays behind MACHINE_PROGRESS_LOG=False.
 #
 # Cadence (Klein production):
 #   Production cadence is driven by train_klein_cadence.mojo. This file is the

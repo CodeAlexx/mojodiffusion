@@ -1,9 +1,14 @@
 # TRAINING_PLAN_ernie.md - ERNIE-Image LoRA trainer, pure Mojo
 
 Status: UPDATED (2026-06-03). OneTrainer behavior is mapped, the OneTrainer
-100-step baseline is captured, and the Mojo ERNIE real-cache smoke now hits the
-local speed target with resident BF16 blocks: 3 steps in 8.03s measured loop
-time, about 2.68 s/step, finite loss/grads, and all 252 LoRA slots updated.
+100-step baseline is captured, Mojo Mistral3B text prompt encoding is live, and
+the Mojo ERNIE real-cache trainer now hits the local speed target with resident
+BF16 blocks. The current smoke ran one full train step at about `2.6 s/step`,
+saved PEFT LoRA plus trainer state, and sampled two 1024x1024 validation prompts
+with nonzero LoRA shift after step 1. The 2500-step BoxJana convergence run
+completed: final step logged loss `0.4701`, grad_norm `0.0549`, `2.6s/step`,
+elapsed `1:54:53`; LoRA-B |.|_1 reached `509872.78111666883` and `252/252`
+LoRA-B slots were nonzero.
 
 ## Source Of Truth
 
@@ -133,22 +138,24 @@ Existing useful pieces:
 - `serenitymojo/ops/rope.mojo` and `rope_struct_backward.mojo` now expose the
   full-width half-split RoPE path ERNIE needs; use `rope_halfsplit_full` and
   `rope_halfsplit_full_backward`, not the older half-width half-split backward.
+- `serenitymojo/models/text_encoder/mistral3b_encoder.mojo` is a pure-Mojo
+  ERNIE Mistral3B encoder for validation prompt/cache sidecars. Tokenizer parity
+  passes for the empty prompt and the two BoxJana validation prompts. Encoder
+  smoke loads `/home/alex/models/ERNIE-Image/text_encoder` and emits
+  `[1,256,3072]`.
+- `serenitymojo/pipeline/ernie_precache_sample_prompts.mojo` reads the shared
+  prompt JSON, encodes positive/negative prompts through Mojo Mistral, and writes
+  safetensors cap files consumed by the built-in trainer sampler.
 
 Current non-production gaps:
 
-- `serenitymojo/training/train_ernie_real.mojo` is now a real speed/correctness
-  smoke, not production training. It accepts run steps, save path, and cache dir
-  as CLI args, but still uses the historical prepared cache path by default and
-  a fixed `N_TXT=256`.
-- There is no Mojo Mistral3 text encoder/tokenizer path yet. OneTrainer uses
-  `Mistral3Model`, tokenizer max length `512`, hidden layer `-2`, and real
-  `text_lens`. We must write the Mojo encoder instead of consuming Rust/Python
-  cache files.
+- `serenitymojo/training/train_ernie_real.mojo` is a real convergence-run driver
+  over the historical BoxJana ERNIE cache. It accepts run steps, save path, and
+  cache dir as CLI args, samples every configured cadence, saves PEFT+state, and
+  reloads trainer state after cadence saves. It still uses a fixed `N_TXT=256`.
 - The trainer currently does not implement the OneTrainer batch attention mask.
   OneTrainer trims text to the batch max length but still masks shorter rows.
   Batch size `2` parity needs masked SDPA or strict same-length bucketing.
-- The trainer config file currently carries `timestep_shift=3.0`, which is a
-  sampling scheduler value. The LoRA train baseline must override this to `1.0`.
 - The prepare path must be Mojo-owned: image decode/crop/bucket, VAE encode,
   patchify/BN scale policy, tokenizer, Mistral hidden state cache, and metadata.
 - The production trainer needs bucket dispatch from raw dataset dimensions,
@@ -161,8 +168,9 @@ Current non-production gaps:
 ## Baselines And Targets
 
 OneTrainer baseline on `/home/alex/models/ERNIE-Image` + `/home/alex/eri2`
-(2026-06-03), batch 2, rank 16 alpha 16, transformer `INT_W8A8`, text encoder
-`FLOAT_8`, BF16 train/output, `LOGIT_NORMAL`:
+(2026-06-03), batch 2, rank 16 alpha 1.0 (TrainConfig default when the ERNIE
+preset omits alpha), transformer `INT_W8A8`, text encoder `FLOAT_8`, BF16
+train/output, `LOGIT_NORMAL`:
 
 - `compile=false`: 100/100 steps complete, final loss `0.7464916`, smooth/mean
   loss `0.6612294`, warmed median `2.77 s/step`, warmed mean after first 20
@@ -180,6 +188,34 @@ Mojo real-cache smoke on the local ERNIE cache and checkpoint (2026-06-03):
   `0.47514582`; grads finite; nonfinite `0`; final LoRA-B |.|_1 `11546.05`;
   `252/252` LoRA slots nonzero. Resident block fit receipt: all 36 blocks loaded
   and ~5.2 GB VRAM remained before the step.
+- Latest 1-step sampler/save smoke: two 1024x1024 step-0 samples wrote from
+  Mojo-Mistral prompt sidecars; step 1 loss `0.6787`, grad_norm `0.0001`,
+  `2.6s/step`; PEFT and trainer-state safetensors saved; step-1 samples showed
+  nonzero LoRA shift (`pixel_l1=0.002767` studio, `0.001518` beach).
+- Completed 2500-step run:
+  `tail -f /home/alex/mojodiffusion/logs/ernie_boxjana_2500_20260603_033140_setsid.log`.
+  Output target:
+  `/home/alex/mojodiffusion/serenitymojo/output/ernie_boxjana_2500/ernie_lora.safetensors`.
+  Step-500 cadence passed: `ernie_lora_step500.safetensors` and
+  `.state.safetensors` saved, both prompts sampled, trainer state reloaded, and
+  training continued. Step-500 sample shifts: studio `pixel_l1=0.040247522`,
+  beach `pixel_l1=0.01677309`.
+  Step-1000 cadence passed with the same save/sample/reload sequence; training
+  continued past step 1016. Step-1000 sample shifts: studio
+  `pixel_l1=0.07029573`, beach `pixel_l1=0.025967646`.
+  Step-1500 cadence passed with PEFT save, trainer-state save, both 1024x1024
+  validation samples, and state reload. Step 1500 logged loss `0.1961`,
+  grad_norm `0.0080`, `2.6s/step`, elapsed `1:08:26`; sample shifts: studio
+  `pixel_l1=0.07712812`, beach `pixel_l1=0.029465288`.
+  Step-2000 cadence passed with the same save/sample/reload sequence. Step 2000
+  logged loss `0.7755`, grad_norm `0.0170`, `2.6s/step`, elapsed `1:31:40`;
+  sample shifts: studio `pixel_l1=0.05731641`, beach
+  `pixel_l1=0.043643314`.
+  Step-2500/final cadence passed with final PEFT/state save, both 1024x1024
+  validation samples, and final output save. Step 2500 logged loss `0.4701`,
+  grad_norm `0.0549`, `2.6s/step`, elapsed `1:54:53`; sample shifts: studio
+  `pixel_l1=0.05692175`, beach `pixel_l1=0.040390998`; final LoRA-B |.|_1
+  `509872.78111666883`, nonzero slots `252/252`.
 
 ## Sampling Contract
 
@@ -196,15 +232,34 @@ OneTrainer's Ernie sampler:
 Production sampling must apply trained LoRA through the same forward-overlay
 path as training and Serenity inference, not by permanently merging base weights.
 
+Current Mojo wiring (2026-06-03):
+
+- `serenitymojo/configs/ernie_image.json` points at the shared prompt JSON
+  `serenitymojo/configs/ernie_image_samples.json`.
+- `train_ernie_real.mojo` reads that JSON through
+  `training/sample_prompt_config.mojo`, samples all configured prompts at step 0,
+  every cadence, and final if needed, and routes progress through
+  `training/progress_display.mojo`.
+- The validation sampler is `training/ernie_validation_sampler.mojo`. It loads
+  Mojo-Mistral cap sidecars, applies the active LoRA overlay through the resident
+  no-save ERNIE forward, decodes with the Klein VAE path, and writes 1024x1024
+  PNGs.
+- Resume smoke mode saves PEFT LoRA plus `.state.safetensors` trainer state at
+  step 10, reloads that state, continues to step 25, then saves and samples.
+  Cadence saves in normal train mode also reload the `.state.safetensors` file
+  after sampling, proving resume from trainer state rather than PEFT-only LoRA.
+
 ## Next Work After Anima
 
-1. Add an Ernie prepare/stage path in Mojo from the target dataset, using the
+1. Let the 2500-step BoxJana convergence run complete; record loss curve, speed,
+   cadence sample paths, save/resume receipts, and final LoRA.
+2. Add an Ernie prepare/stage path in Mojo from the target dataset, using the
    OneTrainer image, VAE, tokenization, Mistral, and bucket contracts above.
-2. Fix `train_ernie_real.mojo` into a config-driven production loop:
-   512, batch 2, LR `3e-4`, rank 16, alpha 16, train shift 1.0, LOGIT_NORMAL.
-3. Add masked attention or same-length bucket dispatch before claiming batch-2
+3. Fix `train_ernie_real.mojo` into a config-driven production loop:
+   512, batch 2, LR `3e-4`, rank 16, alpha 1.0, train shift 1.0, LOGIT_NORMAL.
+4. Add masked attention or same-length bucket dispatch before claiming batch-2
    parity.
-4. Run a Mojo 100-step production-style benchmark against the OneTrainer target,
+5. Run a Mojo 100-step production-style benchmark against the OneTrainer target,
    then compare loss/speed/LoRA-B/nonfinite metrics and caption-based samples.
-5. Ring allocator/saved-activation reuse is a later shared memory-DX project;
+6. Ring allocator/saved-activation reuse is a later shared memory-DX project;
    it is no longer required for the current ERNIE speed target.

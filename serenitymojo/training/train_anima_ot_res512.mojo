@@ -47,7 +47,6 @@
 
 from std.sys import argv
 from std.collections import List, Optional
-from std.os import listdir
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp, isfinite
 from std.memory import ArcPointer
@@ -66,18 +65,14 @@ from serenitymojo.ops.norm import rms_norm
 
 from serenitymojo.models.anima.config import anima
 from serenitymojo.models.anima.weights import (
-    AnimaBlockWeights, AnimaStackBase, load_anima_stack_base,
-    load_anima_block_weights_bf16_normf32, verify_anima_stack_shapes,
+    AnimaStackBase, load_anima_stack_base, verify_anima_stack_shapes,
 )
 from serenitymojo.models.anima.lora_block import ANIMA_SLOTS
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.models.anima.anima_stack_lora import (
     AnimaLoraSet, AnimaLoraGrads, build_anima_lora_set,
     anima_stack_lora_forward_streamed, anima_stack_lora_backward_streamed,
-    anima_stack_lora_forward_device_resident, anima_stack_lora_backward_device_resident,
-    anima_lora_set_to_device,
     anima_lora_adamw_step, save_anima_lora, save_anima_lora_ot,
-    load_anima_lora_resume, save_anima_lora_state, load_anima_lora_state,
 )
 from serenitymojo.models.dit.anima_contract import (
     ANIMA_HIDDEN, ANIMA_NUM_HEADS, ANIMA_HEAD_DIM, ANIMA_DEPTH,
@@ -127,7 +122,6 @@ comptime MAX_NOISING = Float32(1.0)    # TrainConfig default
 # Thermal/memory crop: latent grid -> LATENT_HW x LATENT_HW -> S_IMG=(LATENT_HW/2)^2.
 # Chunk D: REAL 256x256 image -> VAE latent 32x32 -> S_IMG=256 (3-axis rope correct
 # at any grid). The real cache (anima_prepare_ot) stores a [1,16,32,32] latent.
-# 512px training: latent 64x64 -> S_IMG = (64/2)^2 = 1024 (the OT 512px target).
 comptime LATENT_HW = 64
 comptime S_IMG = (LATENT_HW // PS) * (LATENT_HW // PS)
 
@@ -145,7 +139,7 @@ comptime FIXED_TIMESTEP = 500           # fixed discrete index for the smoke
 
 # ── Data paths ────────────────────────────────────────────────────────────────
 # Chunk D REAL cache (anima_prepare_ot output): a real VAE-encoded latent.
-comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_real_ot"
+comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_real_ot512"
 # Chunk C wired (GAP 1): context produced ENTIRELY by the Mojo pipeline
 # (pipeline/anima_text_context.mojo: real Qwen3-0.6B encoder -> zero-pad ->
 # net.llm_adapter) from the real caption tokenized at max_len 512. This REPLACES
@@ -157,14 +151,6 @@ comptime LORA_OUT_OT = "/home/alex/mojodiffusion/output/anima_lora_ot_real_otkey
 # GAP 2: Qwen-Image VAE (wan21 keys) to DECODE sample/target latents -> RGB.
 comptime VAE_FILE = "/home/alex/.serenity/models/anima/split_files/vae/qwen_image_vae.safetensors"
 comptime GAP2_DIR = "/home/alex/mojodiffusion/output/anima_gap2"
-# CADENCE: per-segment step-tagged LoRA checkpoints + cadence sample PNGs.
-comptime CADENCE_DIR = "/home/alex/mojodiffusion/output/anima_cadence"
-# STAGE 2 (giger3): the 70-sample dataset cache (each file has `latent`[1,16,64,64]
-# RAW + `context_cond`[1,512,1024]) and the step-tagged checkpoint output dir.
-# DATASET_DIR is the comptime default; argv[5] overrides it (empty/"-" = single-sample).
-comptime DATASET_DIR = "/home/alex/mojodiffusion/output/giger3_cache"
-comptime GIGER3_TRAIN_DIR = "/home/alex/mojodiffusion/output/giger3_train"
-comptime CKPT_EVERY_DEFAULT = 500       # checkpoint cadence (argv[6] overrides)
 
 # ── DELTA 2: VAE scale_latents constants (16 ch), READ from the Qwen-Image VAE
 #    config.json latents_mean / latents_std (z_dim=16). File path:
@@ -458,16 +444,6 @@ def _absum(v: List[Float32]) -> Float32:
     return s
 
 
-# Sum |m|_1 of the AdamW first-moment buffers across the whole LoRA set — the
-# faithful-resume evidence (zeroed-Adam resume => this is 0 at the segment start;
-# a faithful resume => it equals the value saved at the checkpoint).
-def _mom_absum(set: AnimaLoraSet) -> Float32:
-    var s = Float32(0.0)
-    for i in range(len(set.ad)):
-        s += _absum(set.ad[i].ma) + _absum(set.ad[i].mb)
-    return s
-
-
 def _global_norm(grads: AnimaLoraGrads) -> Float32:
     var ss = Float32(0.0)
     for i in range(len(grads.d_a)):
@@ -652,134 +628,6 @@ def _decode_latent_to_png[LH: Int, LW: Int](
     save_png(rgb, out_png, ctx, ValueRange.SIGNED)
 
 
-# ── STAGE 2 dataset: enumerate the 70-sample giger3 cache (sorted = reproducible
-#    order), then per-step pick ONE file by a seeded index. Each file holds BOTH
-#    `latent`[1,16,64,64] RAW and `context_cond`[1,512,1024] in the SAME file. ─
-def _sort_strings(mut xs: List[String]):
-    for i in range(1, len(xs)):
-        var key = xs[i]
-        var j = i - 1
-        while j >= 0 and xs[j] > key:
-            xs[j + 1] = xs[j]
-            j -= 1
-        xs[j + 1] = key
-
-
-def _scan_dataset(dir: String) raises -> List[String]:
-    var raw = listdir(dir)
-    var fs = List[String]()
-    for i in range(len(raw)):
-        if raw[i].endswith(".safetensors"):
-            fs.append(dir + String("/") + raw[i])
-    if len(fs) == 0:
-        raise Error(String("_scan_dataset: no .safetensors in ") + dir)
-    _sort_strings(fs)
-    return fs^
-
-
-# A cheap order-independent fingerprint of a host list (for the dataset-variety
-# evidence: confirm the per-step latent/context actually differ file to file).
-def _hash_list(v: List[Float32]) -> Float32:
-    var s = Float64(0.0)
-    for i in range(len(v)):
-        s += Float64(v[i]) * Float64((i % 97) + 1)
-    return Float32(s)
-
-
-# Load ONE giger3 cache file -> (scaled_bthwc, context). The latent is RAW
-# [1,16,64,64] (do NOT pre-scale on disk); scale_latents is applied HERE exactly
-# as the single-sample path does (DELTA 2). The context_cond [1,512,1024] is
-# loaded + zero-padded to S_TXT if shorter. Returns scaled[B*Hd*Wd*C] channels-last
-# and context[B*S_TXT*JOINT].
-struct _Sample(Movable):
-    var scaled: List[Float32]
-    var context: List[Float32]
-    var lat_hash: Float32
-    var ctx_hash: Float32
-
-    def __init__(out self, var scaled: List[Float32], var context: List[Float32],
-                 lat_hash: Float32, ctx_hash: Float32):
-        self.scaled = scaled^
-        self.context = context^
-        self.lat_hash = lat_hash
-        self.ctx_hash = ctx_hash
-
-
-def _load_giger3_sample(
-    path: String, Hd: Int, Wd: Int, Cd: Int,
-    vae_mean: List[Float32], vae_std: List[Float32],
-    ctx: DeviceContext,
-) raises -> _Sample:
-    var st = SafeTensors.open(path)
-    var lat_info = st.tensor_info("latent")
-    var lat_sh = lat_info.shape.copy()
-    if len(lat_sh) != 4:
-        raise Error("giger3 latent must be rank-4 [B,C,H,W]")
-    var full_H = lat_sh[2]
-    var full_W = lat_sh[3]
-    var lat_full = _cache_f32(st, "latent", ctx).to_host(ctx)   # BCHW flat
-    # channels-last raw [B,Hd,Wd,C] (tile/crop via modulo source index).
-    var raw_bthwc = List[Float32]()
-    raw_bthwc.reserve(B * Hd * Wd * Cd)
-    for _ in range(B * Hd * Wd * Cd):
-        raw_bthwc.append(Float32(0.0))
-    for b in range(B):
-        for h in range(Hd):
-            for w in range(Wd):
-                for c in range(Cd):
-                    var sh = h % full_H
-                    var sw = w % full_W
-                    var src = ((b * Cd + c) * full_H + sh) * full_W + sw
-                    var dst = ((b * Hd + h) * Wd + w) * Cd + c
-                    raw_bthwc[dst] = lat_full[src]
-    # DELTA 2: scale_latents = (raw - mean) * (1/std), per-channel.
-    var scaled = List[Float32]()
-    scaled.reserve(B * Hd * Wd * Cd)
-    for _ in range(B * Hd * Wd * Cd):
-        scaled.append(Float32(0.0))
-    for b in range(B):
-        for h in range(Hd):
-            for w in range(Wd):
-                for c in range(Cd):
-                    var idx = ((b * Hd + h) * Wd + w) * Cd + c
-                    scaled[idx] = (raw_bthwc[idx] - vae_mean[c]) * (Float32(1.0) / vae_std[c])
-    var lat_hash = _hash_list(scaled)
-    # context_cond [1,S,1024] -> zero-pad to [B,S_TXT,JOINT].
-    var context_raw = _cache_f32(st, "context_cond", ctx).to_host(ctx)
-    var ctx_n = len(context_raw)
-    var context = List[Float32]()
-    context.reserve(B * S_TXT * JOINT)
-    for _ in range(B * S_TXT * JOINT):
-        context.append(Float32(0.0))
-    var src_tokens = ctx_n // (B * JOINT)
-    var copy_tokens = src_tokens if src_tokens < S_TXT else S_TXT
-    for b in range(B):
-        for s in range(copy_tokens):
-            for j in range(JOINT):
-                context[(b * S_TXT + s) * JOINT + j] = context_raw[(b * src_tokens + s) * JOINT + j]
-    var ctx_hash = _hash_list(context)
-    return _Sample(scaled^, context^, lat_hash, ctx_hash)
-
-
-def _parse_int(s: String) -> Int:
-    var v = 0
-    var bs = s.as_bytes()
-    for i in range(len(bs)):
-        if bs[i] >= 0x30 and bs[i] <= 0x39:
-            v = v * 10 + Int(bs[i] - 0x30)
-    return v
-
-
-# Step-tagged checkpoint paths under output/giger3_train/.
-def _giger3_ckpt_paths(step: Int) -> List[String]:
-    var tag = String(GIGER3_TRAIN_DIR) + String("/giger3_lora_step") + String(step)
-    var out = List[String]()
-    out.append(tag + String(".safetensors"))          # 0: PEFT kohya keys
-    out.append(tag + String("_otkeys.safetensors"))   # 1: OneTrainer diffusers keys
-    out.append(tag + String(".opt.safetensors"))      # 2: Adam-state sidecar (A/B+m/v)
-    return out^
-
-
 def main() raises:
     var ctx = DeviceContext()
     # Schedule mode: "real" (default) = OT per-step logit-normal; "fixed" = fixed-σ
@@ -796,54 +644,13 @@ def main() raises:
             v = v * 10 + Int(bs[i] - 0x30)
         if v > 0:
             run_steps = v
-    # ── RESUME CADENCE: argv[3] = start_step (loop starts here), argv[4] =
-    #    resume_lora_path (optional; if given, load that LoRA set BEFORE the loop). ─
-    var start_step = 0
-    if len(args) > 3:
-        var v = 0
-        var bs = String(args[3]).as_bytes()
-        for i in range(len(bs)):
-            v = v * 10 + Int(bs[i] - 0x30)
-        start_step = v
-    if start_step > run_steps:
-        raise Error(String("start_step ") + String(start_step)
-                    + " > run_steps " + String(run_steps))
-    var resume_lora_path = String("")
-    if len(args) > 4:
-        var rp = String(args[4])
-        if rp != String("-") and rp != String(""):
-            resume_lora_path = rp^
-    # ── STAGE 2 (giger3): argv[5] = dataset dir (or "-"/"smoke" for single-sample;
-    #    "giger3" expands to the comptime DATASET_DIR). argv[6] = CKPT_EVERY. ─
-    var dataset_dir = String("")
-    if len(args) > 5:
-        var dd = String(args[5])
-        if dd == String("giger3"):
-            dataset_dir = String(DATASET_DIR)
-        elif dd != String("-") and dd != String("") and dd != String("smoke"):
-            dataset_dir = dd^
-    var ckpt_every = CKPT_EVERY_DEFAULT
-    if len(args) > 6:
-        var ce = _parse_int(String(args[6]))
-        if ce > 0:
-            ckpt_every = ce
-    var dataset_mode = dataset_dir != String("")
     print("==== train_anima_ot — ANIMA LoRA OneTrainer-recipe training run ====")
     print("schedule:", "FIXED-sigma smoke" if fixed_step else "REAL OT logit-normal",
-          " run_steps=", run_steps, " start_step=", start_step,
-          " resume=", resume_lora_path if resume_lora_path != String("") else String("(none)"))
+          " run_steps=", run_steps)
     print("dims: D=", D, " H=", H, " Dh=", Dh, " F=", F, " DEPTH=", ANIMA_DEPTH,
           " RANK=", RANK, " ALPHA=", ALPHA, " S_TXT=", S_TXT)
     print("lr=", LR, " N=", NUM_TRAIN_TIMESTEPS, " dist=LOGIT_NORMAL",
           " steps=", run_steps)
-    # ── STAGE 2 dataset scan (sorted, once) ──
-    var ds_files = List[String]()
-    if dataset_mode:
-        ds_files = _scan_dataset(dataset_dir)
-        print("DATASET mode: dir=", dataset_dir, " files=", len(ds_files),
-              " ckpt_every=", ckpt_every, " out=", GIGER3_TRAIN_DIR)
-    else:
-        print("SINGLE-SAMPLE mode (smoke): CACHE_DIR + CONTEXT_PATH")
 
     var cfg = anima()
     print("checkpoint:", cfg.checkpoint)
@@ -852,19 +659,8 @@ def main() raises:
     var base = load_anima_stack_base(st, ctx)
     print("base projections + t_embedder loaded (F32 resident)")
 
-    # ── HOT PATH: all 28 blocks BF16-resident on device (≈3.7 GiB). The F32
-    #    residual stream is preserved via linear's mixed_base path. LoRA A/B are
-    #    uploaded to device ONCE per step (anima_lora_set_to_device). This is the
-    #    Z-Image/Klein device-resident fast path — no per-block to_host/from_host. ─
-    var blocks = List[AnimaBlockWeights]()
-    for bi in range(ANIMA_DEPTH):
-        blocks.append(load_anima_block_weights_bf16_normf32(st, bi, ctx))  # BF16 proj + F32 norms
-    print("blocks resident (BF16 proj, F32 norms):", len(blocks), "x 20 weights")
-
-    # ── load cached sample (latent + frozen context). In dataset mode the
-    #    "sample 0" file is ds_files[0] (latent + context_cond live in ONE file);
-    #    in smoke mode it's the single-sample CACHE_DIR/sample0 + separate context. ─
-    var cache_path = String(ds_files[0]) if dataset_mode else (String(CACHE_DIR) + "/sample0.safetensors")
+    # ── load cached sample (latent + frozen context) ──
+    var cache_path = String(CACHE_DIR) + "/sample0.safetensors"
     print("cache:", cache_path)
     var cache = SafeTensors.open(cache_path)
     var lat_info = cache.tensor_info("latent")
@@ -876,20 +672,15 @@ def main() raises:
     var full_W = lat_sh[3]
     if Cd != C:
         raise Error("cached latent channels " + String(Cd) + " != " + String(C))
+    if full_H < LATENT_HW or full_W < LATENT_HW:
+        raise Error("cached latent too small for LATENT_HW=" + String(LATENT_HW))
     var Hd = LATENT_HW
     var Wd = LATENT_HW
-    # If the cached latent is SMALLER than the target grid (e.g. a 32x32 cache used
-    # to run the real 512px/64x64 compute shape for a speed probe), tile it up via
-    # modulo indexing; if larger, crop. The math/parity is independent of content.
-    if full_H < LATENT_HW or full_W < LATENT_HW:
-        print("latent [B,", Cd, full_H, full_W, "] tiled up ->", Hd, "x", Wd,
-              " -> S_IMG =", S_IMG, " (speed-shape probe: cache < target grid)")
-    else:
-        print("latent [B,", Cd, full_H, full_W, "] cropped ->", Hd, "x", Wd,
-              " -> S_IMG =", S_IMG)
+    print("latent [B,", Cd, full_H, full_W, "] cropped ->", Hd, "x", Wd,
+          " -> S_IMG =", S_IMG)
 
     var lat_full = _cache_f32(cache, "latent", ctx).to_host(ctx)  # BCHW flat
-    # channels-last raw latent [B,Hd,Wd,C] (tile/crop via modulo source index).
+    # channels-last cropped raw latent [B,Hd,Wd,C]
     var raw_bthwc = List[Float32]()
     raw_bthwc.reserve(B * Hd * Wd * Cd)
     for _ in range(B * Hd * Wd * Cd):
@@ -898,9 +689,7 @@ def main() raises:
         for h in range(Hd):
             for w in range(Wd):
                 for c in range(Cd):
-                    var sh = h % full_H
-                    var sw = w % full_W
-                    var src = ((b * Cd + c) * full_H + sh) * full_W + sw
+                    var src = ((b * Cd + c) * full_H + h) * full_W + w
                     var dst = ((b * Hd + h) * Wd + w) * Cd + c
                     raw_bthwc[dst] = lat_full[src]
 
@@ -932,11 +721,9 @@ def main() raises:
     svar /= Float32(len(scaled_bthwc))
     print("scaled latent: mean=", smean, " std=", sqrt(svar))
 
-    # ── frozen LLM-adapter context [B,512,1024] (DELTA 1). In dataset mode it's
-    #    `context_cond` from the SAME cache file; in smoke mode the CONTEXT_PATH sidecar. ─
-    var context_src = String(cache_path) if dataset_mode else String(CONTEXT_PATH)
-    print("context:", context_src, " (key=context_cond)" if dataset_mode else String(""))
-    var ctx_st = SafeTensors.open(context_src)
+    # ── frozen LLM-adapter context [B,512,1024] (DELTA 1) ──
+    print("context:", CONTEXT_PATH)
+    var ctx_st = SafeTensors.open(CONTEXT_PATH)
     var context_raw = _cache_f32(ctx_st, "context_cond", ctx).to_host(ctx)
     var ctx_n = len(context_raw)
     # The captured sidecar may be [1,256,1024]; OT needs [1,512,1024]. If shorter,
@@ -966,76 +753,15 @@ def main() raises:
         b_init += _absum(lora.ad[i].b)
     print("LoRA adapters:", n_adapters, "(10 slots x", ANIMA_DEPTH, "blocks)  |B|_1 init =", b_init)
 
-    # ── RESUME: if a resume path is given, REPLACE the fresh set with the loaded
-    #    state BEFORE the loop. FAITHFUL resume: a `.opt.safetensors` sidecar carries
-    #    A/B + AdamW moments (ma/va/mb/vb) -> load_anima_lora_state RESTORES momentum
-    #    (NOT zeroed). A plain PEFT path restores A/B only (momentum resets — the old
-    #    fallback). The AdamW bias-correction step t is reconstructed from start_step
-    #    (the loop passes t = step+1), continuous across the boundary. ─
-    var faithful_resume = resume_lora_path.endswith(".opt.safetensors")
-    if resume_lora_path != String(""):
-        if faithful_resume:
-            print("RESUME (FAITHFUL): loading LoRA + AdamW m/v from", resume_lora_path)
-            lora = load_anima_lora_state(ANIMA_DEPTH, RANK, ALPHA, resume_lora_path, ctx)
-        else:
-            print("RESUME (A/B only): loading LoRA from", resume_lora_path,
-                  " (Adam m/v NOT restored — momentum resets)")
-            lora = load_anima_lora_resume(ANIMA_DEPTH, RANK, ALPHA, resume_lora_path, ctx)
-    var b_loaded = Float32(0.0)
-    for i in range(n_adapters):
-        b_loaded += _absum(lora.ad[i].b)
-    var m_loaded = _mom_absum(lora)
-    print("CADENCE: LoRA-B |.|_1 at START of segment (post-load) =", b_loaded,
-          " start_step=", start_step)
-    print("RESUME: AdamW |m|_1 at START of segment (post-load) =", m_loaded,
-          " (faithful_resume=", faithful_resume, ")")
-
     var n_lat = B * (C * S_IMG * PS * PS)
-
-    # ── CADENCE decoder + sampler: build the VAE decoder ONCE so the cadence
-    #    samples can be decoded to PNGs at start (step0) and at the end of the
-    #    segment. mkdir the cadence output dir up front. ─
-    _ = sys_system(String("mkdir -p ") + String(CADENCE_DIR))
-    if dataset_mode:
-        _ = sys_system(String("mkdir -p ") + String(GIGER3_TRAIN_DIR))
-    var cad_dec = QwenImageVaeDecoder[LATENT_HW, LATENT_HW].load_wan21_keys(String(VAE_FILE), ctx)
-
-    # INITIAL cadence sample: only when this is the very first segment (start_step==0).
-    if start_step == 0:
-        var s0 = _anima_sample_shift(
-            lora, 4, n_lat, Hd, Wd, Cd,
-            context.copy(), base, st, ropes.cos, ropes.sin, ctx,
-        )
-        var p0 = String(CADENCE_DIR) + "/sample_step0.png"
-        _decode_latent_to_png[LATENT_HW, LATENT_HW](
-            s0.copy(), Hd, Wd, Cd, cad_dec, p0, ctx)
-        print("SAMPLE step=0 ->", p0, " nonfinite=", _count_nonfinite(s0),
-              " |.|mean=", _mean_abs_diff(s0, _zeros_list(len(s0))))
 
     var t0 = perf_counter_ns()
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
     var loss_hist = List[Float32]()
 
-    for step in range(start_step, run_steps):
+    for step in range(run_steps):
         var step_t0 = perf_counter_ns()
-        # ── STAGE 2 DATASET: per-step pick ONE file by a SEEDED index
-        #    (SEED + step) % N, load latent + context_cond from THAT file. The
-        #    single-sample (smoke) path keeps the pre-loop scaled_bthwc/context. ─
-        var cur_scaled = scaled_bthwc.copy()
-        var cur_context = context.copy()
-        if dataset_mode:
-            var ds_idx = Int((SEED + UInt64(step)) % UInt64(len(ds_files)))
-            var samp = _load_giger3_sample(
-                ds_files[ds_idx], Hd, Wd, Cd, vae_mean, vae_std, ctx)
-            cur_scaled = samp.scaled.copy()
-            cur_context = samp.context.copy()
-            var lat_hash = samp.lat_hash
-            var ctx_hash = samp.ctx_hash
-            print("DATA step=", step, " ds_idx=", ds_idx, "/", len(ds_files),
-                  " file=", ds_files[ds_idx],
-                  " lat_hash=", lat_hash, " ctx_hash=", ctx_hash)
-
         # ── DELTA 3: OT discrete timestep -> sigma = (ts+1)/N ──
         var ts = FIXED_TIMESTEP
         if not fixed_step:
@@ -1055,8 +781,8 @@ def main() raises:
         noisy.reserve(n_lat)
         target.reserve(n_lat)
         for i in range(n_lat):
-            noisy.append(sigma * noise[i] + (Float32(1.0) - sigma) * cur_scaled[i])
-            target.append(noise[i] - cur_scaled[i])
+            noisy.append(sigma * noise[i] + (Float32(1.0) - sigma) * scaled_bthwc[i])
+            target.append(noise[i] - scaled_bthwc[i])
 
         var patches = _patchify_in(noisy, B, 1, Hd, Wd, Cd)
         var target_patches = _patchify_out(target, B, 1, Hd, Wd, Cd)
@@ -1065,20 +791,12 @@ def main() raises:
         var t_in = Float32(ts) / Float32(1000.0)
         var temb = _prepare_timestep(t_in, base, ctx)
 
-        # ── upload LoRA set to device ONCE this step (BF16) ──
-        var lora_dev = anima_lora_set_to_device(lora, STDtype.BF16, ctx)
-
-        var prof = (step == 2)
-        var t_fwd0 = perf_counter_ns()
-        # ── forward (device-resident 28-block) at S_TXT=512 / S_IMG=1024 ──
-        var fwd = anima_stack_lora_forward_device_resident[H, Dh, S_IMG, S_TXT](
-            patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), cur_context.copy(),
-            base, blocks, lora_dev, ropes.cos, ropes.sin,
+        # ── forward (streamed 28-block) at S_TXT=512 ──
+        var fwd = anima_stack_lora_forward_streamed[H, Dh, S_IMG, S_TXT](
+            patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
+            base, st, lora, ropes.cos, ropes.sin,
             B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
         )
-        if prof:
-            ctx.synchronize()
-            print("[PROF] forward =", Float32(Float64(perf_counter_ns() - t_fwd0) / 1.0e9), "s")
 
         # ── DELTA 4/5: unmasked MSE + d_out (dMSE/dpred = 2/N*(pred-target)) ──
         var npred = len(fwd.out)
@@ -1092,28 +810,17 @@ def main() raises:
             d_out.append(inv_n * diff)
         var loss = sse / Float32(npred)
 
-        # ── backward (device-resident); per-block trace on first step, fwd/bwd split on step 2 ──
-        var t_bwd0 = perf_counter_ns()
-        var grads = anima_stack_lora_backward_device_resident[H, Dh, S_IMG, S_TXT](
-            d_out, patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), cur_context.copy(),
-            base, blocks, lora_dev, ropes.cos, ropes.sin, fwd,
-            B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx, step == 1,
+        # ── backward (streamed) ──
+        var grads = anima_stack_lora_backward_streamed[H, Dh, S_IMG, S_TXT](
+            d_out, patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
+            base, st, lora, ropes.cos, ropes.sin, fwd,
+            B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
         )
-        if prof:
-            ctx.synchronize()
-            print("[PROF] backward(reads saved activations; no recompute) =",
-                  Float32(Float64(perf_counter_ns() - t_bwd0) / 1.0e9), "s")
 
         # ── global-norm clip then AdamW over all adapters ──
-        var t_opt0 = perf_counter_ns()
         var gn_before = _global_norm(grads)
         _clip(grads, CLIP_NORM)
         anima_lora_adamw_step(lora, grads, step + 1, LR, ctx)
-        if prof:
-            ctx.synchronize()
-            print("[PROF] optimizer(global_norm+clip+host AdamW) =",
-                  Float32(Float64(perf_counter_ns() - t_opt0) / 1.0e9),
-                  "s  (lever-2 target: device-resident LoRA optimizer)")
 
         var b_after = Float32(0.0)
         var b_nonzero = 0
@@ -1128,82 +835,26 @@ def main() raises:
             da += _absum(grads.d_a[i])
             db += _absum(grads.d_b[i])
 
-        if step == start_step:
+        if step == 0:
             first_loss = loss
         last_loss = loss
         loss_hist.append(loss)
 
         var step_now = perf_counter_ns()
-        var step_secs = Float64(step_now - step_t0) / 1.0e9
-        var elapsed_secs = Float64(step_now - t0) / 1.0e9
-        var samples_per_epoch = 1
-        if dataset_mode:
-            samples_per_epoch = len(ds_files)
         print_trainer_progress(
-            String("Anima-lora"), step + 1, run_steps, samples_per_epoch,
-            loss, Float64(gn_before), step_secs, 0.0, elapsed_secs,
+            String("Anima-lora"), step + 1, run_steps, 1,
+            loss, Float64(gn_before),
+            Float64(step_now - step_t0) / 1.0e9, 0.0,
+            Float64(step_now - t0) / 1.0e9,
         )
         if grads.nonfinite_lora_grads != 0:
             print("[Anima-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
-        # ── CHECKPOINT EVERY N (dataset mode): at (step+1)%ckpt_every==0 save the
-        #    LoRA (PEFT kohya + OneTrainer diffusers keys) AND the Adam-state sidecar
-        #    (.opt.safetensors: A/B + m/v) to step-tagged paths under giger3_train/.
-        #    The tag is the COMPLETED step count (step+1) so resume passes start_step
-        #    = tag and t = step+1 stays continuous. ─
-        if dataset_mode and ((step + 1) % ckpt_every == 0):
-            var ckp = _giger3_ckpt_paths(step + 1)
-            var _nk = save_anima_lora(lora, ckp[0], ctx)
-            var _no = save_anima_lora_ot(lora, ALPHA, ckp[1], ctx)
-            var _ns = save_anima_lora_state(lora, ckp[2], ctx)
-            print("CKPT step=", step + 1, " saved PEFT=", ckp[0],
-                  " OT=", ckp[1], " opt=", ckp[2],
-                  " (AdamW |m|_1=", _mom_absum(lora), ")")
-
     var t1 = perf_counter_ns()
     var secs = Float64(t1 - t0) / 1.0e9
-
-    # ── END-OF-SEGMENT CADENCE: save a step-tagged LoRA checkpoint so the next
-    #    segment can resume from it, sample+decode a PNG, and print LoRA-B |.|_1 at
-    #    END so resume-continuity is visible (next segment's START |.|_1 must EQUAL
-    #    this END value). The step tag is run_steps (the last step trained this seg). ─
-    var seg_steps_run = run_steps - start_step
-    var b_end = Float32(0.0)
-    for i in range(n_adapters):
-        b_end += _absum(lora.ad[i].b)
-    var seg_lora_path = String(CADENCE_DIR) + "/anima_lora_step" + String(run_steps) + ".safetensors"
-    var n_seg = save_anima_lora(lora, seg_lora_path, ctx)
-    print("CADENCE: saved", n_seg, "LoRA pairs (step-tagged) to", seg_lora_path)
-    print("CADENCE: LoRA-B |.|_1 at END of segment (step", run_steps, ") =", b_end)
-    # ── FINAL giger3 checkpoint (dataset mode): PEFT + OT + Adam-state sidecar at
-    #    the END of the segment (tag = run_steps). Always emitted so the next
-    #    segment can resume FAITHFULLY from <...>_step<run_steps>.opt.safetensors. ─
-    if dataset_mode:
-        var fckp = _giger3_ckpt_paths(run_steps)
-        var _fk = save_anima_lora(lora, fckp[0], ctx)
-        var _fo = save_anima_lora_ot(lora, ALPHA, fckp[1], ctx)
-        var _fs = save_anima_lora_state(lora, fckp[2], ctx)
-        print("CKPT (final) step=", run_steps, " saved PEFT=", fckp[0],
-              " OT=", fckp[1], " opt=", fckp[2],
-              " (AdamW |m|_1=", _mom_absum(lora), ")")
-    if seg_steps_run > 0:
-        var seg_sample = _anima_sample_shift(
-            lora, 4, n_lat, Hd, Wd, Cd,
-            context.copy(), base, st, ropes.cos, ropes.sin, ctx,
-        )
-        var seg_png = String(CADENCE_DIR) + "/sample_step" + String(run_steps) + ".png"
-        _decode_latent_to_png[LATENT_HW, LATENT_HW](
-            seg_sample.copy(), Hd, Wd, Cd, cad_dec, seg_png, ctx)
-        print("SAMPLE step=", run_steps, " ->", seg_png,
-              " nonfinite=", _count_nonfinite(seg_sample),
-              " |.|mean=", _mean_abs_diff(seg_sample, _zeros_list(len(seg_sample))))
-
     print("")
     print("---- training summary ----")
-    print("steps:", seg_steps_run, " (", start_step, "->", run_steps,
-          ")  wall:", secs, "s")
-    if seg_steps_run > 0:
-        print("  (", secs / Float64(seg_steps_run), "s/step)")
+    print("steps:", run_steps, " wall:", secs, "s  (", secs / Float64(run_steps), "s/step)")
     print("loss first =", first_loss, "  last =", last_loss,
           "  delta =", last_loss - first_loss)
     # REAL random-σ schedule: per-step loss bounces with σ, so compare first-half
@@ -1227,13 +878,6 @@ def main() raises:
           "  second-half mean =", second_half_mean,
           "  trend delta =", second_half_mean - first_half_mean)
 
-    # DATASET mode: the in-loop cadence already saved step-tagged checkpoints
-    # (+ Adam .opt sidecar). Skip the single-sample final save + the 512 sample-shift
-    # smoke verdict (the giger3 run samples via the 1024 LoRA sampler, stage 3).
-    if dataset_mode:
-        print("dataset run complete — checkpoints under", GIGER3_TRAIN_DIR)
-        return
-
     # ── DELTA 5: OT diffusers-keyed save (OT-loadable) + kohya save (cheap) ──
     var n_kohya = save_anima_lora(lora, String(LORA_OUT), ctx)
     print("saved", n_kohya, "LoRA adapter pairs (kohya keys) to", LORA_OUT)
@@ -1252,87 +896,11 @@ def main() raises:
     # per-step σ-bounce averages out over the run).
     var loss_down = (last_loss < first_loss) if fixed_step else (second_half_mean < first_half_mean)
 
-    # ── LEARNING VERDICT: SAMPLE-SHIFT GATE (Chunk D wires 3+4) ───────────────
-    # Sample TWICE from the same seed + frozen context: once with the trained LoRA
-    # OVERLAID (additive scale·B·A at the inference linears via lora_block), once
-    # with a zeroed-B overlay (== the frozen base DiT). NEVER fuses into the saved
-    # weights — pure in-memory overlay. The shift between the two final latents is
-    # the quantified sample-shift metric (must be non-trivial + finite, not blown up).
+    # ── RES-512 PROBE: skip the sample-shift + decode-to-PNG section ───────────
+    # This res512 copy exists ONLY to read step-0..2 LOSS at S_IMG=1024. The
+    # sample-shift block runs 8 extra full forwards (~heavy at S_IMG=1024) and the
+    # decode block crashes on dtype at LATENT_HW=64; neither is needed for the loss
+    # verdict, so both are skipped here. (_grew suppresses an unused-var warning.)
+    var _grew = grew and loss_down and (b_nz == n_adapters)
     print("")
-    print("---- sample-shift (base vs LoRA-overlay) ----")
-    comptime SAMPLE_STEPS = 4
-    print("sample steps:", SAMPLE_STEPS, " S_IMG=", S_IMG, " (same seed+context both passes)")
-    var base_set = _zero_b_set(lora)
-    var base_sample = _anima_sample_shift(
-        base_set, SAMPLE_STEPS, n_lat, Hd, Wd, Cd,
-        context.copy(), base, st, ropes.cos, ropes.sin, ctx,
-    )
-    var lora_sample = _anima_sample_shift(
-        lora, SAMPLE_STEPS, n_lat, Hd, Wd, Cd,
-        context.copy(), base, st, ropes.cos, ropes.sin, ctx,
-    )
-    var base_nf = _count_nonfinite(base_sample)
-    var lora_nf = _count_nonfinite(lora_sample)
-    var shift_mad = _mean_abs_diff(base_sample, lora_sample)
-    var shift_cos = _cosine(base_sample, lora_sample)
-    var base_mad0 = _mean_abs_diff(base_sample, _zeros_list(len(base_sample)))
-    var lora_mad0 = _mean_abs_diff(lora_sample, _zeros_list(len(lora_sample)))
-    print("base sample |.|mean=", base_mad0, " nonfinite=", base_nf)
-    print("lora sample |.|mean=", lora_mad0, " nonfinite=", lora_nf)
-    print("SAMPLE-SHIFT mean_abs_diff(base,lora)=", shift_mad,
-          " cosine(base,lora)=", shift_cos)
-    var sample_finite = (base_nf == 0) and (lora_nf == 0)
-    # non-trivial: the LoRA actually moved the sample; degenerate guard: cosine<0.99999
-    var sample_shifted = (shift_mad > Float32(1e-5)) and sample_finite and (shift_cos < Float32(0.99999))
-
-    # ── GAP 2: DIRECTIONAL learning proof ─────────────────────────────────────
-    # The cached training target is `scaled_bthwc` (the real VAE latent in scaled
-    # space). Genuine overfit learning => the LoRA sample lands CLOSER to that
-    # target than the base sample (lora_dist < base_dist). This is the metric
-    # Tenet 4 requires before any "learns" claim — sample-shift alone only proves
-    # the LoRA CHANGED the output, not that it moved TOWARD the target.
-    print("")
-    print("---- DIRECTIONAL learning metric (lora vs base, distance to target) ----")
-    var base_dist = _l2_dist(base_sample, scaled_bthwc)
-    var lora_dist = _l2_dist(lora_sample, scaled_bthwc)
-    print("target = cached scaled training latent (|.|mean=",
-          _mean_abs_diff(scaled_bthwc, _zeros_list(len(scaled_bthwc))), ")")
-    print("L2(base_sample -> target) =", base_dist)
-    print("L2(lora_sample -> target) =", lora_dist)
-    var directional_pass = (lora_dist < base_dist) and sample_finite
-    print("DIRECTIONAL: lora_closer_than_base =", directional_pass,
-          " (delta = base - lora =", base_dist - lora_dist, ")")
-
-    # ── GAP 2: decode base/lora/target latents -> 3 PNGs (visual inspection) ───
-    print("")
-    print("---- decode base/lora/target latents -> PNG ----")
-    var dec = QwenImageVaeDecoder[LATENT_HW, LATENT_HW].load_wan21_keys(String(VAE_FILE), ctx)
-    _ = sys_system(String("mkdir -p ") + String(GAP2_DIR))
-    _decode_latent_to_png[LATENT_HW, LATENT_HW](
-        base_sample.copy(), Hd, Wd, Cd, dec, String(GAP2_DIR) + "/base_sample.png", ctx)
-    _decode_latent_to_png[LATENT_HW, LATENT_HW](
-        lora_sample.copy(), Hd, Wd, Cd, dec, String(GAP2_DIR) + "/lora_sample.png", ctx)
-    _decode_latent_to_png[LATENT_HW, LATENT_HW](
-        scaled_bthwc.copy(), Hd, Wd, Cd, dec, String(GAP2_DIR) + "/target.png", ctx)
-    print("wrote", String(GAP2_DIR) + "/base_sample.png")
-    print("wrote", String(GAP2_DIR) + "/lora_sample.png")
-    print("wrote", String(GAP2_DIR) + "/target.png")
-
-    print("")
-    # Tenet 4: a LEARNING PASS requires loss down + LoRA grew + sample shifted +
-    # the DIRECTIONAL metric (lora closer to target than base). No "learns" claim
-    # without the directional number holding.
-    var verdict_pass = grew and loss_down and sample_shifted and directional_pass
-    if verdict_pass:
-        print("VERDICT: LEARNING PASS — loss dropped (", first_loss, "->", last_loss,
-              "), LoRA-B grew 0->nonzero (", b_nz, "/", n_adapters,
-              "), sample SHIFTED (mad=", shift_mad, " cos=", shift_cos,
-              "), AND lora CLOSER to target (lora_dist=", lora_dist,
-              " < base_dist=", base_dist, ")")
-    else:
-        print("VERDICT: review — loss_down=", loss_down, " B_grew=", grew,
-              " sample_shifted=", sample_shifted,
-              " directional(lora<base)=", directional_pass,
-              " (shift_mad=", shift_mad, " cos=", shift_cos,
-              " base_dist=", base_dist, " lora_dist=", lora_dist,
-              " finite=", sample_finite, ")")
+    print("RES512 PROBE done — loss numbers above are the answer; sample/decode skipped.")

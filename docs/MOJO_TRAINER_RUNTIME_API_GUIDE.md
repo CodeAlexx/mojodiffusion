@@ -8,6 +8,10 @@ numbers, but runtime prepare/train/sample code must stay Mojo.
 
 ## Hard Rules
 
+- Follow `serenitymojo/docs/TRAINER_MANDATORY_RUNTIME_CONTRACT.md` for every
+  trainer: shared Mojo progress display, shared sample prompt JSON, 1024x1024
+  default image samples, PEFT plus trainer-state checkpointing, and the
+  sample/train/save/resume smoke.
 - Do not modify OneTrainer. Treat `/home/alex/OneTrainer` as a read-only source
   of truth for Klein, SDXL, Z-Image, and Ernie presets, losses, timestep policy,
   and sampling references. Use `/home/alex/OneTrainer-anima-ref` for Anima.
@@ -93,8 +97,9 @@ Verified 2000-step Mojo convergence run:
 
 Z-Image 1024 sampling hook:
 
-- `serenitymojo/pipeline/zimage_generate.mojo` accepts
-  `[lora_path|base] [out_png] [seed] [prompt]` at runtime.
+- `serenitymojo/pipeline/zimage_generate.mojo` accepts either direct prompt
+  mode `[lora_path|base] [out_png] [seed] [prompt]` or shared prompt JSON mode
+  `[lora_path|base] [out_png] [sample_prompts.json] [prompt_id]`.
 - It loads the same BF16/BP16-preserving Mojo Z-Image stack as the trainer,
   loads main-only PEFT/PERT LoRA adapters, denoises at 1024, then decodes with
   the Mojo Z-Image VAE.
@@ -106,6 +111,12 @@ Z-Image 1024 sampling hook:
   training forward intentionally saves activations for backward, but inference
   must not allocate those saved tensors or 1024 sampling will run at the memory
   ceiling and can OOM.
+- `serenitymojo/configs/zimage.json` points at
+  `serenitymojo/configs/zimage_alina_samples.json`. Z-Image owns its runtime
+  Qwen text encoder, so this prompt JSON sets `precache_required=false`.
+- `train_zimage_real.mojo` writes
+  `zimage_lora_step<N>.safetensors.state.safetensors` and can resume from it via
+  `train_zimage_real <run_steps> <start_step> <state_path>`.
 - Compile gate: `pixi run mojo build -I . -Xlinker -lm
   serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_lora_check`
   passed on 2026-06-02.
@@ -283,5 +294,8 @@ Before calling a trainer production-ready:
   grad norm, nonfinite count, and saved LoRA.
 - Run a long convergence pass, usually 2000 steps for current Klein/Z-Image
   goals.
-- Sample through the Mojo sampler with the saved PEFT LoRA.
+- Sample through the Mojo sampler with the saved PEFT LoRA. Image samples must
+  come from the shared prompt JSON and default to 1024x1024 or larger.
+- Prove save/resume with the trainer-state checkpoint, not only a PEFT LoRA
+  reload.
 - Commit docs and metrics with the code change that produced them.

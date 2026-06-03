@@ -168,12 +168,9 @@ Saved final artifacts:
 - `output/alina_train/sample_step2000_alina_evening.png`
 
 Checkpoints and samples at steps `500`, `1000`, and `1500` also completed.
-The final 512 PNGs were visually checked and are nonblank.
-
-The in-process run used `512x512` validation prompts because `1024x1024`
-samples in the live trainer context OOM on the 24 GB 3090 Ti. Use the
-process-separated sampler/cadence path for 1024 validation. A standalone 1024
-garden sample from the final LoRA succeeded:
+Use the process-separated sampler/cadence path for validation so image samples
+stay at the mandatory 1024x1024 default. A standalone 1024 garden sample from
+the final LoRA succeeded:
 
 ```bash
 /tmp/klein_sample_cli_1024_current \
@@ -539,6 +536,16 @@ Current production LoRA path:
   that excludes refiners.
 - LoRA saving stays PEFT/ai-toolkit-compatible for `/home/alex/ai-toolkit` and
   Serenity inference; do not switch Z-Image LoRA output to a private format.
+- `train_zimage_real.mojo` uses `print_trainer_progress` for the normal human
+  progress line and writes a `.state.safetensors` optimizer-state sidecar beside
+  the PEFT LoRA. Resume form:
+  `train_zimage_real <run_steps> <start_step> <state_path>`.
+- `pipeline/zimage_generate.mojo` is the 1024 validation sampler. It can read
+  direct prompts or shared `serenity.sample_prompts.v1` prompt JSON:
+  `zimage_generate <lora|base> <out.png> <sample_prompts.json> <prompt_id>`.
+- `configs/zimage.json` points at `configs/zimage_alina_samples.json`, which
+  defaults image samples to 1024x1024. Z-Image owns its runtime Qwen text
+  encoder, so that prompt file uses `precache_required=false`.
 
 Do not try full-F32 Z-Image. OneTrainer does not train this model in full F32,
 and a full-F32 base/model load will OOM on the local 24 GB GPU. Keep large base
@@ -574,9 +581,9 @@ Speed status after the `nsys` pass:
   `1.981s` with loss `0.46069825`.
 - Saved LoRA: `output/alina_zimage/zimage_lora_step100.safetensors`
 
-Remaining Z-Image gap: validation sampling is not yet wired into
-`train_zimage_real.mojo`. Add it through the Mojo Z-Image generator/LoRA path,
-not Python or Rust, before calling the trainer sample cadence complete.
+Remaining Z-Image gap: `train_zimage_real.mojo` still does not launch
+process-separated sampler cadence itself. Use `pipeline/zimage_generate.mojo`
+for validation until a cadence wrapper like Klein's is added.
 
 ### Anima
 
@@ -586,6 +593,9 @@ Do not present it as production.
 ### SDXL / Ernie
 
 SDXL has compile/smoke progress but is not the active immediate goal.
+Flux.1-dev and SDXL are not production-tested; do their sampler/save/resume
+contract audit later before treating either as integrated. Flux.1-dev is not
+Flux.2/Klein or dev2.
 
 Ernie is the next target after Anima. The OneTrainer mapping is now recorded in
 `serenitymojo/training/TRAINING_PLAN_ernie.md`. Key reminders:

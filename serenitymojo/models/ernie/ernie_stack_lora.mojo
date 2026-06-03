@@ -72,6 +72,7 @@ from serenitymojo.models.ernie.ernie_stack import (
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_peft, load_lora_for_resume,
+    save_lora_train_state, load_lora_train_state,
 )
 
 
@@ -741,6 +742,47 @@ def ernie_stack_lora_forward_resident_device[
     )
 
 
+def ernie_stack_lora_predict_resident_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, blocks: List[ErnieBlockWeights],
+    lora: ErnieLoraDeviceSet, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    var num_layers = len(blocks)
+
+    var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
+    var img = linear(
+        _t(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+    )
+    var no_txt_bias = Optional[Tensor](None)
+    var txt = linear(_t(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
+    var x = concat(0, ctx, img, txt)
+    var x_arc = TArc(x^)
+
+    for bi in range(num_layers):
+        var bl = _block_lora_dev_for(lora, bi)
+        var fwd = ernie_block_lora_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), blocks[bi], mv, bl, cos, sin, D, F, eps, ctx,
+        )
+        x_arc = fwd.out.copy()
+
+    var ln_x = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+    )
+    var x_out = modulate(
+        ln_x, _t(f_scale.copy(), [D], ctx), _t(f_shift.copy(), [D], ctx), ctx,
+    )
+    var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
+    var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
+    var out_img = slice(patches, 0, 0, N_IMG, ctx).to_host(ctx)
+    return out_img^
+
+
 def ernie_stack_lora_backward_resident_device[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
@@ -854,8 +896,7 @@ def ernie_lora_prefixes(num_layers: Int) -> List[String]:
     return out^
 
 
-# ── SAVE every adapter as a PEFT/ai-toolkit safetensors ──────────────────────
-def save_ernie_lora(set: ErnieLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+def _ernie_named_loras(set: ErnieLoraSet) -> List[NamedLora]:
     var named = List[NamedLora]()
     for bi in range(set.num_layers):
         for s in range(ERNIE_SLOTS):
@@ -863,7 +904,20 @@ def save_ernie_lora(set: ErnieLoraSet, path: String, ctx: DeviceContext) raises 
                 _ernie_lora_prefix(bi, s),
                 set.ad[bi * ERNIE_SLOTS + s].copy(),
             ))
+    return named^
+
+
+# ── SAVE every adapter as a PEFT/ai-toolkit safetensors ──────────────────────
+def save_ernie_lora(set: ErnieLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    var named = _ernie_named_loras(set)
     return save_lora_peft(named, path, ctx)
+
+
+def save_ernie_lora_state(
+    set: ErnieLoraSet, path: String, ctx: DeviceContext
+) raises -> Int:
+    var named = _ernie_named_loras(set)
+    return save_lora_train_state(named, path, ctx)
 
 
 # ── RESUME: load the adapter A/B back from a save_ernie_lora file ────────────
@@ -876,6 +930,19 @@ def load_ernie_lora_resume(
     var prefixes = ernie_lora_prefixes(num_layers)
     var scale = alpha / Float32(rank)
     var named = load_lora_for_resume(prefixes, scale, path, ctx)   # flat order
+    var ad = List[LoraAdapter]()
+    for i in range(num_layers * ERNIE_SLOTS):
+        ad.append(named[i].adapter.copy())
+    return ErnieLoraSet(ad^, num_layers, rank)
+
+
+def load_ernie_lora_state(
+    num_layers: Int, rank: Int, alpha: Float32,
+    path: String, ctx: DeviceContext,
+) raises -> ErnieLoraSet:
+    var prefixes = ernie_lora_prefixes(num_layers)
+    var scale = alpha / Float32(rank)
+    var named = load_lora_train_state(prefixes, scale, path, ctx)
     var ad = List[LoraAdapter]()
     for i in range(num_layers * ERNIE_SLOTS):
         ad.append(named[i].adapter.copy())

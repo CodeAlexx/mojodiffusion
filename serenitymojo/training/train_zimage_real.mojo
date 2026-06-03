@@ -3,7 +3,7 @@
 # Z-Image LoRA stack (models/zimage/zimage_stack_lora.mojo). Real base weights,
 # local Mojo-prepared cache; no synthetic tensors and no Rust/Python cache
 # dependency. Mirrors train_klein_real.mojo's loop structure (timing, grad clip,
-# board, PROG line).
+# shared progress display, PEFT save, and optimizer-state sidecar).
 #
 # Per step (translated from train_zimage.rs main loop):
 #   1. load cached {latent [1,16,72,56], text_embedding [1,512,2560], text_mask}
@@ -21,7 +21,7 @@
 #      (the stack outputs ONLY the N_IMG image rows, so the flow-match target is
 #       taken on the IMAGE-token sub-sequence — see _img_target.)
 #   9. zimage_stack_lora_backward -> LoRA grads; grad_norm = L2; clip(1.0)
-#  10. zimage_lora_adamw_step_main_only ; PRINT PROG step loss grad lr secs
+#  10. zimage_lora_adamw_step_main_only; print shared progress display
 #
 # Recipe scalars (train_zimage.rs released-preset defaults):
 #   lr=3e-4, rank=16, alpha=1.0, timestep_shift=1.0, clip_grad_norm=1.0,
@@ -49,7 +49,7 @@
 #
 # Run (real 512-bucket LoRA training):
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
-#     pixi run mojo run -I . serenitymojo/training/train_zimage_real.mojo [steps]
+#     pixi run mojo run -I . serenitymojo/training/train_zimage_real.mojo [steps] [start_step] [state.safetensors]
 
 from std.sys import argv
 from std.collections import List, Optional
@@ -73,6 +73,7 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
     zimage_lora_set_to_device,
     zimage_stack_lora_forward_main_device, zimage_stack_lora_backward_main_device,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
+    save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
 )
 from serenitymojo.models.zimage.real_weights import (
     ZImageRealAux, load_zimage_real_aux, build_adaln, build_block_modvecs,
@@ -80,6 +81,7 @@ from serenitymojo.models.zimage.real_weights import (
 )
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.klein_dataset import KleinCache
+from serenitymojo.training.progress_display import print_trainer_progress
 
 
 # ── arch (Z-Image, from transformer config; H/Dh/D fixed comptime) ───────────
@@ -267,6 +269,7 @@ def _train_one_step_bucket[
     final_lin_b: Tensor,
     x_pad_h: List[Float32],
     cap_pad_h: List[Float32],
+    train_start_ns: UInt,
     ctx: DeviceContext,
 ) raises -> StepResult:
     comptime HT_B = LAT_H_B // PATCH
@@ -408,11 +411,13 @@ def _train_one_step_bucket[
         b_absum += bs2
         if bs2 > 0.0:
             b_nonzero += 1
-    print("PROG step=", k, " total=", run_steps, " slot=", slot,
-          " bucket=", LAT_H_B, "x", LAT_W_B, " cap=", CAP_LEN_B,
-          " loss=", loss, " grad=", Float32(gn_before), " lr=", LR,
-          " loraB_sum=", b_absum, " loraB_nonzero=", b_nonzero, "/", TRAIN_ADAPTER_COUNT,
-          " nonfinite=", grads.nonfinite_lora_grads, " secs=", Float32(secs))
+    print_trainer_progress(
+        String("ZImage-lora"), k, run_steps, 1,
+        loss, Float64(gn_before), secs, 0.0,
+        Float64(t1 - train_start_ns) / 1.0e9,
+    )
+    if grads.nonfinite_lora_grads != 0:
+        print("[ZImage-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
     print("[TIMING step=", k,
           "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
           " lora_upload=", Float32(Float64(t_lora - t_prep) / 1.0e9),
@@ -433,6 +438,18 @@ def main() raises:
         for i in range(String(a[1]).byte_length()):
             v = v * 10 + Int(bs[i] - 0x30)
         run_steps = v
+    var start_step = 0
+    if len(a) >= 3:
+        var v2 = 0
+        var bs2 = String(a[2]).as_bytes()
+        for i in range(String(a[2]).byte_length()):
+            v2 = v2 * 10 + Int(bs2[i] - 0x30)
+        start_step = v2
+    if start_step > run_steps:
+        raise Error(String("start_step ") + String(start_step) + String(" > run_steps ") + String(run_steps))
+    var resume_state = String("")
+    if len(a) >= 4:
+        resume_state = String(a[3])
 
     print("=== Z-Image REAL LoRA training loop ===")
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " F=", F, " out_ch=", OUT_CH)
@@ -475,6 +492,11 @@ def main() raises:
 
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
     var lora = build_zimage_lora_set(NUM_NR, NUM_CR, MAIN_DEPTH, D, F, RANK, ALPHA)
+    if resume_state != String("") and resume_state != String("-"):
+        print("[ZImage-lora] loading resume state:", resume_state)
+        lora = load_zimage_lora_main_only_state(
+            NUM_NR, NUM_CR, MAIN_DEPTH, RANK, ALPHA, D, F, resume_state, ctx,
+        )
     var n_adapters = (NUM_NR + NUM_CR + MAIN_DEPTH) * ZIMAGE_SLOTS
     print("[lora] adapters:", TRAIN_ADAPTER_COUNT, "trainable main-layer adapters;",
           n_adapters, "allocated total (refiners frozen/excluded)")
@@ -486,7 +508,8 @@ def main() raises:
         b_absum_init += _absum(lora.ad[i].b)
     print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
 
-    for k in range(1, run_steps + 1):
+    var train_start = perf_counter_ns()
+    for k in range(start_step + 1, run_steps + 1):
         var slot = 0 if OVERFIT_PROBE else (k - 1) % cache.count()
         var step_seed = UInt64(1) if OVERFIT_PROBE else UInt64(k)
         var key = cache.peek_key(slot, ctx)
@@ -498,13 +521,15 @@ def main() raises:
             if valid_cap <= 224:
                 var r_72_224 = _train_one_step_bucket[72, 56, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h, ctx,
+                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_start, ctx,
                 )
                 loss = r_72_224.loss
             elif valid_cap <= 256:
                 var r_72_256 = _train_one_step_bucket[72, 56, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h, ctx,
+                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_start, ctx,
                 )
                 loss = r_72_256.loss
             else:
@@ -513,20 +538,22 @@ def main() raises:
             if valid_cap <= 224:
                 var r_88_224 = _train_one_step_bucket[88, 48, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h, ctx,
+                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_start, ctx,
                 )
                 loss = r_88_224.loss
             elif valid_cap <= 256:
                 var r_88_256 = _train_one_step_bucket[88, 48, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h, ctx,
+                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_start, ctx,
                 )
                 loss = r_88_256.loss
             else:
                 raise Error("train_zimage_real: caption too long for 256-token production bucket")
         else:
             raise Error("train_zimage_real: unsupported Z-Image production bucket")
-        if k == 1:
+        if k == start_step + 1:
             first_loss = loss
         last_loss = loss
 
@@ -535,13 +562,17 @@ def main() raises:
     var b_absum_final = Float32(0.0)
     for i in range(TRAIN_ADAPTER_START, n_adapters):
         b_absum_final += _absum(lora.ad[i].b)
-    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
+    var trains = b_absum_final > 0.0
     if trains and (last_loss == last_loss):
         print("RESULT: REAL Z-IMAGE LORA TRAIN OK — LoRA-B grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         _ = sys_system(String("mkdir -p ") + String(LORA_DIR))
-        _ = save_zimage_lora_main_only(lora, String(LORA_DIR) + String("/zimage_lora_step") + String(run_steps) + String(".safetensors"), ctx)
+        var lora_out = String(LORA_DIR) + String("/zimage_lora_step") + String(run_steps) + String(".safetensors")
+        _ = save_zimage_lora_main_only(lora, lora_out, ctx)
+        var state_out = lora_out + String(".state.safetensors")
+        _ = save_zimage_lora_main_only_state(lora, state_out, ctx)
+        print("[ZImage-lora] save_state step=", run_steps, " path=", state_out)
     else:
         print("RESULT: FAIL trains=", trains)
 

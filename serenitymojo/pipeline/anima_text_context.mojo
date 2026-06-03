@@ -81,7 +81,7 @@ def anima_text_context_from_tokens(
 
     # 3) net.llm_adapter -> context.
     var wts = AnimaAdapterWeights.load_checkpoint(CKPT, ctx)
-    return anima_llm_adapter_forward(t5_ids, hidden_zeroed, wts, ctx)
+    return anima_llm_adapter_forward(t5_ids, hidden_zeroed, qwen_mask, wts, ctx)
 
 
 def main() raises:

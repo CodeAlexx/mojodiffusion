@@ -230,6 +230,17 @@ def _parse_prompts(mut cur: _Cursor, mut cfg: SamplePromptConfig) raises:
         raise Error("sample prompt config: expected ',' or ']' in prompts")
 
 
+def _validate_prompt_sizes(cfg: SamplePromptConfig) raises:
+    for i in range(len(cfg.prompts)):
+        var p = cfg.prompts[i].copy()
+        if p.frames == 1 and (p.width < 1024 or p.height < 1024):
+            raise Error(
+                String("sample prompt config: image prompt ") + p.label
+                + String(" is ") + String(p.width) + String("x") + String(p.height)
+                + String("; image validation samples must be 1024x1024 or larger")
+            )
+
+
 def _parse_top_defaults(var bytes: List[UInt8]) raises -> SamplePromptConfig:
     var cur = _Cursor(bytes^)
     var cfg = SamplePromptConfig()
@@ -286,4 +297,5 @@ def read_sample_prompt_config(path: String) raises -> SamplePromptConfig:
         raise Error("sample prompt config: expected ',' or '}' at top level")
     if len(cfg.prompts) == 0:
         raise Error(String("sample prompt config has no prompts: ") + path)
+    _validate_prompt_sizes(cfg)
     return cfg^

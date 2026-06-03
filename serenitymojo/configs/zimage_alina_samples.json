@@ -4,7 +4,7 @@
     "sample_every": 500,
     "sample_at_start": true,
     "save_before_sample": true,
-    "precache_required": true,
+    "precache_required": false,
     "width": 1024,
     "height": 1024,
     "frames": 1,
@@ -18,20 +18,12 @@
     {
       "id": "alina_garden",
       "prompt": "alverone , a high-resolution photograph featuring a young caucasian woman with long blonde hair, wearing a casual white sundress, standing in a sunlit garden, soft natural lighting, professional photography",
-      "seed": 42,
-      "caps": {
-        "positive": "/home/alex/mojodiffusion/output/sample_caps/klein9b_alina/alina_garden_pos.bin",
-        "negative": "/home/alex/mojodiffusion/output/sample_caps/klein9b_alina/alina_garden_neg.bin"
-      }
+      "seed": 42
     },
     {
       "id": "alina_evening",
       "prompt": "alverone , a high-resolution photograph featuring a young caucasian woman with long blonde hair, wearing a black evening dress, in an elegant indoor setting, dramatic studio lighting, professional photography",
-      "seed": 43,
-      "caps": {
-        "positive": "/home/alex/mojodiffusion/output/sample_caps/klein9b_alina/alina_evening_pos.bin",
-        "negative": "/home/alex/mojodiffusion/output/sample_caps/klein9b_alina/alina_evening_neg.bin"
-      }
+      "seed": 43
     }
   ]
 }

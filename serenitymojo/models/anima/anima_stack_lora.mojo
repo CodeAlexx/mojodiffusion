@@ -37,6 +37,7 @@ from std.memory import ArcPointer
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.activations import silu
@@ -70,6 +71,7 @@ from serenitymojo.models.dit.anima_contract import ANIMA_HIDDEN  # 2048
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_peft, load_lora_for_resume,
+    save_lora_train_state, load_lora_train_state,
 )
 
 
@@ -659,6 +661,90 @@ def anima_stack_lora_forward_device_resident[
     )
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# NO-SAVE device-resident forward (INFERENCE/SAMPLING only). Identical math to
+# anima_stack_lora_forward_device_resident, but DISCARDS each block's saved
+# activations immediately (only one block's activations live at a time) and
+# returns ONLY the host output velocity [B*S_IMG, OUT_PATCH]. This is the
+# 24GB-safe 1024 sampling path: all 28 blocks stay resident (BF16, ~3.7 GiB) and
+# there is NO per-block disk reload (unlike the streamed path) and NO 28× saved-
+# activation retention (unlike the backward/training resident path). The LoRA
+# overlay is applied additively per block (scale·B·A, NEVER fused). Used by the
+# standalone anima_sample_cli.
+# ═════════════════════════════════════════════════════════════════════════════
+def anima_stack_lora_forward_device_resident_nosave[
+    H: Int, Dh: Int, S_IMG: Int, S_TXT: Int
+](
+    patches: List[Float32],
+    t_cond: List[Float32], base_adaln: List[Float32], context: List[Float32],
+    base: AnimaStackBase, blocks: List[AnimaBlockWeights], lora: AnimaLoraDeviceSet,
+    cos: Tensor, sin: Tensor,
+    B: Int, D: Int, JOINT: Int, F: Int, IN_PATCH: Int, OUT_PATCH: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    var num_blocks = len(blocks)
+
+    # patch embed (base, F32 weight) -> [B*S_img, D]
+    var x_emb = _linear_wdev(patches, base.x_embed[], B * S_IMG, IN_PATCH, ctx)
+
+    # upload the shared per-step conditioning ONCE (device tensors).
+    var t_silu_dev = silu(_t(t_cond.copy(), [B, ANIMA_HIDDEN], ctx), ctx)
+    var t_silu_arc = TArc(t_silu_dev^)
+    var base_t_arc = TArc(_t(base_adaln.copy(), [B, 3 * D], ctx))
+    var ctx_t_arc = TArc(_t(context.copy(), [B, S_TXT, JOINT], ctx))
+
+    var x_arc = TArc(_t(x_emb.copy(), [B, S_IMG, D], ctx))
+    for bi in range(num_blocks):
+        var bl = _block_lora_dev_for(lora, bi)
+        var fwd = anima_block_lora_forward_device_tensor[H, Dh, S_IMG, S_TXT](
+            x_arc.copy(), t_silu_arc.copy(), base_t_arc.copy(), ctx_t_arc.copy(),
+            blocks[bi], bl, cos, sin, B, D, JOINT, F, eps, ctx,
+        )
+        x_arc = fwd.out.copy()
+
+    # ── final layer (identical to the resident/streamed stack) ──
+    var fl_h = linear(t_silu_arc[], base.fl_mod1[], Optional[Tensor](None), ctx)
+    var fl_modout = linear(fl_h, base.fl_mod2[], Optional[Tensor](None), ctx)
+    var base_half = slice(base_t_arc[], 1, 0, 2 * D, ctx)
+    var fl_added = add(fl_modout, base_half, ctx)
+    var fl_shift = slice(fl_added, 1, 0, D, ctx)
+    var fl_scale = slice(fl_added, 1, D, D, ctx)
+    var ln_ones = _t(_ones(D), [D], ctx)
+    var ln_zeros = _t(_zeros(D), [D], ctx)
+    var fl_ln = layer_norm(x_arc[], ln_ones, ln_zeros, eps, ctx)
+    var scale3 = reshape(fl_scale, _sh3(B, 1, D), ctx)
+    var shift3 = reshape(fl_shift, _sh3(B, 1, D), ctx)
+    var one = _t(_ones(B * D), [B, 1, D], ctx)
+    var factor = add(scale3, one, ctx)
+    var fl_scaled = mul(fl_ln, factor, ctx)
+    var fl_xmod = add(fl_scaled, shift3, ctx)
+    var fl_xmod_2d = reshape(fl_xmod, _row2(B * S_IMG, D), ctx)
+    var out = linear(fl_xmod_2d, base.fl_lin[], Optional[Tensor](None), ctx).to_host(ctx)
+    return out^
+
+
+# Public INFERENCE entrypoint name (mirrors zimage_block_lora_predict_device_tensor):
+# a resident, NO-SAVE forward used by anima_sample_cli. Blocks are loaded ONCE
+# (BF16, resident) and the LoRA set is uploaded ONCE to device; this is called per
+# CFG branch per denoise step with NO disk reload and NO saved-for-backward
+# activations. Thin alias over anima_stack_lora_forward_device_resident_nosave.
+def anima_stack_lora_predict_device_resident[
+    H: Int, Dh: Int, S_IMG: Int, S_TXT: Int
+](
+    patches: List[Float32],
+    t_cond: List[Float32], base_adaln: List[Float32], context: List[Float32],
+    base: AnimaStackBase, blocks: List[AnimaBlockWeights], lora: AnimaLoraDeviceSet,
+    cos: Tensor, sin: Tensor,
+    B: Int, D: Int, JOINT: Int, F: Int, IN_PATCH: Int, OUT_PATCH: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    return anima_stack_lora_forward_device_resident_nosave[H, Dh, S_IMG, S_TXT](
+        patches, t_cond, base_adaln, context,
+        base, blocks, lora, cos, sin,
+        B, D, JOINT, F, IN_PATCH, OUT_PATCH, eps, ctx,
+    )
+
+
 def anima_stack_lora_backward_device_resident[
     H: Int, Dh: Int, S_IMG: Int, S_TXT: Int
 ](
@@ -931,6 +1017,37 @@ def load_anima_lora_resume(
     var prefixes = anima_lora_prefixes(num_blocks)
     var scale = alpha / Float32(rank)
     var named = load_lora_for_resume(prefixes, scale, path, ctx)   # flat order
+    var ad = List[LoraAdapter]()
+    for i in range(num_blocks * ANIMA_SLOTS):
+        ad.append(named[i].adapter.copy())
+    return AnimaLoraSet(ad^, num_blocks, rank)
+
+
+# ── FAITHFUL-RESUME state sidecar: A/B + AdamW moments (ma/va/mb/vb) ──────────
+# Mirrors save_klein_lora_state / load_klein_lora_state. The PEFT file
+# (save_anima_lora) stays plain external-compatible LoRA; this `.opt`/state file
+# additionally persists the AdamW moments so a resumed run does NOT zero momentum.
+# The AdamW bias-correction step `t` is reconstructed by the trainer from
+# start_step (it passes t = step+1, continuous across the resume boundary), so it
+# is not stored here — only the load-bearing m/v carry across.
+def save_anima_lora_state(set: AnimaLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    var named = List[NamedLora]()
+    for bi in range(set.num_blocks):
+        for s in range(ANIMA_SLOTS):
+            named.append(NamedLora(
+                _anima_lora_prefix(bi, s),
+                set.ad[bi * ANIMA_SLOTS + s].copy(),
+            ))
+    return save_lora_train_state(named, path, ctx)
+
+
+def load_anima_lora_state(
+    num_blocks: Int, rank: Int, alpha: Float32,
+    path: String, ctx: DeviceContext,
+) raises -> AnimaLoraSet:
+    var prefixes = anima_lora_prefixes(num_blocks)
+    var scale = alpha / Float32(rank)
+    var named = load_lora_train_state(prefixes, scale, path, ctx)   # A/B + m/v
     var ad = List[LoraAdapter]()
     for i in range(num_blocks * ANIMA_SLOTS):
         ad.append(named[i].adapter.copy())

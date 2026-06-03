@@ -15,6 +15,7 @@
 #     -o /tmp/anima_1024 && /tmp/anima_1024
 
 from std.gpu.host import DeviceContext
+from std.sys import argv
 from std.math import sqrt as fsqrt
 
 from serenitymojo.tensor import Tensor
@@ -208,9 +209,14 @@ def main() raises:
     print("Anima 1024x1024 — 30-step Euler CFG 4.5, seed 42")
     print("============================================================")
 
-    # ── Stage 1: Load cached context ─────────────────────────────────────────
+    # ── Stage 1: Load cached context (argv[1] overrides the path; argv[2]=out png) ─
     print("\n--- Stage 1: Load cached context ---")
-    var ctx_pair = _load_context(String(EMBEDDINGS_PATH), ctx)
+    var _a = argv()
+    var ctx_path = String(EMBEDDINGS_PATH)
+    if len(_a) > 1:
+        ctx_path = String(_a[1])
+    print("  context path:", ctx_path)
+    var ctx_pair = _load_context(ctx_path, ctx)
     # Cast to BF16 if loaded as F32 (the sidecar may be BF16 or F32)
     var context_cond: Tensor
     var context_uncond: Tensor
@@ -303,8 +309,12 @@ def main() raises:
     )
     var image = vae.decode_wan21_keys(vae_input, ctx)
     print("  decoded:", image.shape()[2], "x", image.shape()[3])
-    save_png(image, String(OUT_PNG), ctx, ValueRange.SIGNED)
-    print("IMAGE SAVED:", OUT_PNG)
+    var _out_p = String(OUT_PNG)
+    if len(_a) > 2:
+        _out_p = String(_a[2])
+    save_png(image, _out_p, ctx, ValueRange.SIGNED)
+    print("FINAL IMAGE:", _out_p)
+    print("IMAGE SAVED:", _out_p)
 
     print("\n============================================================")
     print("Anima pipeline 1024 complete")

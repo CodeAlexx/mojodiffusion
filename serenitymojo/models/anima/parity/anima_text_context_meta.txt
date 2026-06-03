@@ -1,0 +1,2 @@
+S_TXT=512 S_LLM=512 DIM=1024 N_HEADS=16 HEAD_DIM=64 N_BLOCKS=6
+context_mean_abs=0.068672 context_std=0.091159

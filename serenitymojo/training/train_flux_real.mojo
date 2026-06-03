@@ -1,11 +1,16 @@
-# train_flux_real.mojo — Flux (flux1-dev) LoRA REAL training loop.
+# train_flux_real.mojo — Flux.1-dev LoRA training loop.
+#
+# STATUS: not production-tested. This is Flux.1-dev only. Do not confuse it
+# with Flux.2/Klein or dev2 paths. The shared progress display is wired for
+# consistency, but Flux.1-dev trainer/sample/save/resume contract verification is
+# a later task.
 #
 # TRANSLATION of EriDiffusion-v2 train_flux.rs onto the parity-verified Mojo
 # Flux LoRA OFFLOAD stack (models/flux/flux_stack_lora.mojo). Real flux1-dev
 # base weights (streamed block-by-block via TurboPlannedLoader), real prepared
 # cache (latent + T5 + CLIP-pooled), full 19+38 block depth. No synthetic
 # tensors. Mirrors train_zimage_real.mojo's loop structure (timing, grad clip,
-# PROG line) and train_flux.rs's recipe.
+# shared progress display) and train_flux.rs's recipe.
 #
 # Per step (translated from train_flux.rs main loop, lines 700-857):
 #   1. load cached {latent [1,16,64,64] RAW, t5_embed [1,seq,4096], clip_pool [1,768]}
@@ -20,7 +25,7 @@
 #        timestep=t_model*1000, guidance=3.5*1000, vector=clip_pool) -> pred [N_IMG,64]
 #   7. loss = MSE(pred, target); d_loss = (2/N)(pred - target)
 #   8. flux_stack_lora_backward_offload -> LoRA grads; global-norm clip(1.0)
-#   9. flux_lora_adamw_step ; PRINT PROG step loss grad lr loraB
+#   9. flux_lora_adamw_step; print shared progress display
 #
 # Recipe scalars (train_flux.rs OneTrainer Flux preset):
 #   lr=1e-4 (OT default), rank=16, alpha=1.0, timestep_shift=1.0 (identity),
@@ -70,6 +75,7 @@ from serenitymojo.models.dit.flux1_dit import build_flux1_rope_tables
 from serenitymojo.offload.plan import build_flux1_dev_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.schedule import sample_timestep_logit_normal
+from serenitymojo.training.progress_display import print_trainer_progress
 
 
 # ── arch (flux1-dev; H/Dh/D fixed comptime, verified vs the checkpoint) ──────
@@ -280,6 +286,7 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
+    var train_start = perf_counter_ns()
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
 
@@ -375,10 +382,13 @@ def main() raises:
             b_absum += bs2
             if bs2 > 0.0:
                 b_nonzero += 1
-        print("PROG step=", k, " total=", run_steps, " loss=", loss,
-              " grad=", Float32(gn_before), " lr=", LR,
-              " loraB_sum=", b_absum, " loraB_nonzero=", b_nonzero, "/", n_adapters,
-              " nonfinite=", grads.nonfinite_lora_grads, " secs=", Float32(secs))
+        print_trainer_progress(
+            String("Flux-lora"), k, run_steps, 1,
+            loss, Float64(gn_before), secs, 0.0,
+            Float64(t1 - train_start) / 1.0e9,
+        )
+        if grads.nonfinite_lora_grads != 0:
+            print("[Flux-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)

@@ -1,7 +1,7 @@
 # Shared pure-Mojo trainer/sample progress display.
 #
 # Keep trainer UIs here so every trainer prints the same operator-facing line:
-#   [Name] step k/total | epoch e/E | loss ... | grad_norm ... | speed | ETA
+#   [Name] step k/total | epoch e/E | loss ... | grad_norm ... | speed | elapsed | ETA
 #
 # This is display-only. Machine logs and Python replay helpers are optional dev
 # tools; trainer runtime should call these Mojo functions directly.
@@ -75,7 +75,6 @@ def print_trainer_progress(
         + String(" | loss ") + _fmt_fixed(Float64(loss), 4)
         + String(" | grad_norm ") + _fmt_fixed(grad_norm, 4)
         + String(" | ") + _fmt_fixed(step_secs, 1) + String("s/step")
-        + String(" | noise ") + _fmt_fixed(noise_speed / 1.0e6, 1) + String("M/s")
         + String(" | elapsed ") + _hms(elapsed_secs)
         + String(" | ETA ") + _hms(eta)
     )

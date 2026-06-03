@@ -1,10 +1,14 @@
 # train_sdxl_real.mojo — SDXL conv-UNet LoRA REAL training loop.
 #
+# STATUS: not production-tested. The shared progress display is wired for
+# consistency, but SDXL trainer/sample/save/resume contract verification is a
+# later task.
+#
 # TRANSLATION of EriDiffusion-v2 train_sdxl.rs onto the real-dims trainable SDXL
 # UNet (models/sdxl/sdxl_real_train.mojo) + the parity-verified per-ST LoRA stack.
 # Real base weights (sdxl_unet_bf16.safetensors), real prepared cache; no synthetic
 # tensors. Mirrors train_zimage_real.mojo's loop structure (timing, grad clip,
-# PROG line, B-norm tracking, FIXED smoke).
+# shared progress display, B-norm tracking, FIXED smoke).
 #
 # Per step (translated from train_sdxl.rs main loop, eps-prediction NOT flow):
 #   1. load cached {latent [1,4,h,w], text_embedding [1,77,2048], pooled [1,1280],
@@ -17,7 +21,7 @@
 #   5. UNet forward (NHWC, save acts) -> eps_pred [1,4,h,w]
 #   6. loss = mean MSE(eps_pred, ε) F32 ; d_loss = (2/N)(eps_pred - ε)
 #   7. UNet backward -> per-ST LoRA d_A/d_B ; global-norm clip(1.0)
-#   8. AdamW step (β(0.9,0.999) eps1e-8 wd0.01) on every adapter ; PROG line
+#   8. AdamW step (β(0.9,0.999) eps1e-8 wd0.01) on every adapter; print shared progress display
 #
 # Recipe scalars (train_sdxl.rs preset defaults):
 #   BETA_START 0.00085, BETA_END 0.012, NUM_TRAIN_TIMESTEPS 1000, eps-prediction,
@@ -62,6 +66,7 @@ from serenitymojo.models.sdxl.sdxl_unet_stack_lora import (
 )
 from serenitymojo.models.sdxl.lora_block import SDXL_SLOTS
 from serenitymojo.training.train_step import LoraGrads, _lora_adamw
+from serenitymojo.training.progress_display import print_trainer_progress
 
 
 # ── arch comptimes ────────────────────────────────────────────────────────────
@@ -350,10 +355,13 @@ def main() raises:
                 b_absum += bs2
                 if bs2 > 0.0:
                     b_nonzero += 1
-        print("PROG step=", k, " total=", run_steps, " loss=", loss,
-              " grad=", Float32(gn_before), " lr=", LR,
-              " loraB_sum=", b_absum, " loraB_nonzero=", b_nonzero, "/", n_adapters,
-              " nonfinite=", grads.nonfinite, " secs=", Float32(secs))
+        print_trainer_progress(
+            String("SDXL-lora"), k, run_steps, 1,
+            loss, Float64(gn_before), secs, 0.0,
+            Float64(t1 - train_start) / 1.0e9,
+        )
+        if grads.nonfinite != 0:
+            print("[SDXL-lora] warning nonfinite_lora_grads=", grads.nonfinite)
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)

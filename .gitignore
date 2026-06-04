@@ -30,3 +30,11 @@ serenitymojo.zip
 
 # Agent scratch (not source)
 .claude/agent-memory/
+
+# Internal handoff/status/plan docs — keep LOCAL, not on public repo
+*HANDOFF*.md
+*TRAINER_STATUS*.md
+*PORT_GAP*.md
+*PORT_PLAN*.md
+*RUST_STATE*.md
+*ARCH_INVENTORY*.md

@@ -303,6 +303,32 @@ def _build_prefix_causal_mask(
     return data^
 
 
+# ── pad-aware prefix-causal/full additive mask [1, H, S, S] ──────────────────
+# Same prefix-causal/full rule as _build_prefix_causal_mask, but ALSO masks out
+# any KEY column j whose key_valid[j]==0 (padding slot), for EVERY query row and
+# head. This is a mask-only change (the layer math is identical); it lets the
+# CFG uncond stream be padded up to cond's common static S while the pad tokens
+# contribute nothing to attention. key_valid length MUST equal s.
+def _build_prefix_causal_mask_padded(
+    s: Int, heads: Int, ar_len: Int, key_valid: List[Int]
+) raises -> List[Float32]:
+    var neg = Float32(-1.0e4)
+    var data = List[Float32]()
+    for _hh in range(heads):
+        for i in range(s):
+            var is_gen = i >= ar_len
+            for j in range(s):
+                if key_valid[j] == 0:
+                    data.append(neg)  # padding key: blocked everywhere
+                elif is_gen:
+                    data.append(Float32(0.0))  # gen rows: full attention
+                elif j <= i:
+                    data.append(Float32(0.0))  # AR rows: causal
+                else:
+                    data.append(neg)
+    return data^
+
+
 # ── comptime SDPA dispatch (H=32, Dh=128, parameterized on S) ────────────────
 def _sdpa_s[S: Int](
     q: Tensor, k: Tensor, v: Tensor, mask: Tensor, scale: Float32, ctx: DeviceContext
@@ -923,6 +949,80 @@ struct HiDreamO1Offloaded[S: Int](Movable):
         var sin_k = Tensor.from_host(sin_k_h, ck_sh.copy(), dtype, ctx)
 
         var mask_data = _build_prefix_causal_mask(seq, h, ar_len)
+        var mask_sh = List[Int]()
+        mask_sh.append(1); mask_sh.append(h); mask_sh.append(seq); mask_sh.append(seq)
+        var mask = Tensor.from_host(mask_data, mask_sh^, dtype, ctx)
+
+        self.loader.config = OffloadConfig.bf16_single()
+        self.loader.prefetch(0)
+        for i in range(cfg.num_layers):
+            self.loader.prefetch_next(i)
+            var handle = self.loader.await_block(i, ctx)
+            hidden = self._layer(
+                handle.block, i, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx
+            )
+
+        hidden = rms_norm(
+            hidden, self._w(String("model.language_model.norm.weight")),
+            cfg.rms_norm_eps, ctx
+        )
+        return self._final_layer(hidden, ctx)
+
+    # ── pad-aware single denoise-step forward (for CFG common-S) ─────────────
+    # Identical to `forward` except it accepts `key_valid` (length S over the
+    # FULL stream: 1=real token/image row, 0=padding slot) and builds the
+    # pad-aware attention mask so padding keys are blocked everywhere. Used by
+    # the CFG uncond branch, whose text is padded up to cond's common static S.
+    # The layer math is byte-identical to `forward`; only the mask differs.
+    def forward_padded(
+        mut self,
+        input_ids: List[Int],
+        noise_patches: Tensor,
+        t_pos: List[Int],
+        h_pos: List[Int],
+        w_pos: List[Int],
+        ar_len: Int,
+        key_valid: List[Int],
+        timestep: Float32,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var cfg = self.config
+        var h = cfg.num_heads
+        var h_kv = cfg.num_kv_heads
+        var dh = cfg.head_dim
+        var half = dh // 2
+        var s_text = len(input_ids)
+        var dtype = self._w(String("model.language_model.embed_tokens.weight")).dtype()
+
+        var text_emb = self._embed(input_ids, ctx)
+        var t_emb = self._t_embed(timestep, ctx)
+        var tms_idx = -1
+        for i in range(s_text):
+            if input_ids[i] == cfg.tms_token_id:
+                tms_idx = i
+        var text_emb_with_t = _scatter_row(
+            text_emb, t_emb, tms_idx, s_text, cfg.hidden_size, ctx
+        )
+
+        var patch_emb = self._patch_embed(noise_patches, ctx)
+        var hidden = concat(1, ctx, text_emb_with_t, patch_emb)
+
+        var tables = _build_mrope_tables(
+            t_pos, h_pos, w_pos, dh, cfg.rope_theta, cfg.mrope_h, cfg.mrope_w
+        )
+        var seq = Self.S
+        var cos_q_h = _replicate_heads(tables[0], seq, half, h)
+        var sin_q_h = _replicate_heads(tables[1], seq, half, h)
+        var cos_k_h = _replicate_heads(tables[0], seq, half, h_kv)
+        var sin_k_h = _replicate_heads(tables[1], seq, half, h_kv)
+        var cq_sh = List[Int](); cq_sh.append(seq * h * half)
+        var ck_sh = List[Int](); ck_sh.append(seq * h_kv * half)
+        var cos_q = Tensor.from_host(cos_q_h, cq_sh.copy(), dtype, ctx)
+        var sin_q = Tensor.from_host(sin_q_h, cq_sh.copy(), dtype, ctx)
+        var cos_k = Tensor.from_host(cos_k_h, ck_sh.copy(), dtype, ctx)
+        var sin_k = Tensor.from_host(sin_k_h, ck_sh.copy(), dtype, ctx)
+
+        var mask_data = _build_prefix_causal_mask_padded(seq, h, ar_len, key_valid)
         var mask_sh = List[Int]()
         mask_sh.append(1); mask_sh.append(h); mask_sh.append(seq); mask_sh.append(seq)
         var mask = Tensor.from_host(mask_data, mask_sh^, dtype, ctx)

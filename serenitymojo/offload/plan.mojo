@@ -266,3 +266,49 @@ def build_flux_block_plan(num_double: Int, num_single: Int) -> BlockPlan:
 
 def build_flux1_dev_block_plan() -> BlockPlan:
     return build_flux_block_plan(19, 38)
+
+
+def build_chroma_block_plan(num_double: Int, num_single: Int) -> BlockPlan:
+    # Chroma1-HD uses DIFFUSERS block keys (verified against the real
+    # chroma1_hd_bf16.safetensors header this session): transformer_blocks.<i>
+    # (19 double) then single_transformer_blocks.<i> (38 single). The block-swap
+    # loader streams one prefix at a time; the keys inside each block are the
+    # separate to_q/to_k/to_v projections (fused on the fly by
+    # chroma_stack_lora.mojo). Same flat order the FluxLoraSet carrier expects.
+    var plan = BlockPlan(String("chroma"))
+    for i in range(num_double):
+        plan.append(
+            String("transformer_blocks.") + String(i),
+            BlockKind.double_stream(),
+        )
+    for i in range(num_single):
+        plan.append(
+            String("single_transformer_blocks.") + String(i),
+            BlockKind.single_stream(),
+        )
+    return plan^
+
+
+def build_chroma1_hd_block_plan() -> BlockPlan:
+    return build_chroma_block_plan(19, 38)
+
+
+def build_sd35_block_plan(num_joint: Int = 38) -> BlockPlan:
+    # SD3.5-Large uses 38 joint (double-stream) blocks ONLY — no single-stream.
+    # Checkpoint prefix: "model.diffusion_model." (added by the loader).
+    # Block keys: "model.diffusion_model.joint_blocks.{i}.{context_block,x_block}.*"
+    # The TurboPlannedLoader streams one block prefix at a time; within each block
+    # the loader finds all keys that start with the prefix. We register the prefix
+    # WITHOUT the model.diffusion_model. part (the SafeTensors loader adds it).
+    # CONFIRMED from sd3.5_large.safetensors header: 38 joint blocks, depth=38.
+    var plan = BlockPlan(String("sd35"))
+    for i in range(num_joint):
+        plan.append(
+            String("model.diffusion_model.joint_blocks.") + String(i),
+            BlockKind.double_stream(),
+        )
+    return plan^
+
+
+def build_sd35_large_block_plan() -> BlockPlan:
+    return build_sd35_block_plan(38)

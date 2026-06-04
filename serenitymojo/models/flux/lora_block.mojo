@@ -54,6 +54,7 @@ from std.math import sqrt
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.linalg_backward import linear_backward
 
@@ -109,26 +110,58 @@ def _zeros(d: Int) -> List[Float32]:
     return o^
 
 
+# NATIVE BF16 COMPUTE: F32-host carriers → BF16 device tensors so matmuls hit
+# linear's native bf16·bf16 path (F32 accumulate inside the GEMM, like flame-core).
 def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_host(vals, shape^, STDtype.BF16, ctx)
+
+
+# F32 upload — ONLY at F32-only op boundaries (rope_backward cos/sin,
+# gate_residual_backward grad_out/gate, cat_backward grad).
+def _tf32(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+
+
+# Re-upload a saved BF16 host activation → BF16 *device* tensor (native, no F32
+# detour) so the backward matmuls run on bf16 saved acts.
+def _tb16(vals: List[BFloat16], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_host_bf16(vals, shape^, ctx)
+
+
+# Convert F32 host list → BFloat16 (for saving the x input copy as BF16).
+def _f32_to_bf16(v: List[Float32]) -> List[BFloat16]:
+    var o = List[BFloat16]()
+    for i in range(len(v)):
+        o.append(BFloat16(v[i]))
+    return o^
+
+
+# Local bf16↔F32 device casts for single F32-only op calls (no shared-op edits).
+def _to_f32(t: Tensor, ctx: DeviceContext) raises -> Tensor:
+    return cast_tensor(t, STDtype.F32, ctx)
+
+
+def _to_bf16(t: Tensor, ctx: DeviceContext) raises -> Tensor:
+    return cast_tensor(t, STDtype.BF16, ctx)
 
 
 # ── LoRA fwd/bwd (host list; byte-identical to train_step._lora_fwd/_lora_bwd) ─
 def flux_lora_fwd(
     x_h: List[Float32], lo: LoraAdapter, M: Int, ctx: DeviceContext
 ) raises -> List[Float32]:
+    # NATIVE BF16: adapter A/B matmuls upload bf16 → bf16·bf16 GEMM (F32 accumulate).
     var nb1 = Optional[Tensor](None)
     var t = linear(
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.BF16, ctx),
         nb1^, ctx,
-    ).to_host(ctx)                                   # [M,rank]
+    ).to_host(ctx)                                   # [M,rank] (upcast bf16→F32)
     var nb2 = Optional[Tensor](None)
     var dy = linear(
-        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
+        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.BF16, ctx),
         nb2^, ctx,
-    ).to_host(ctx)                                   # [M,out]
+    ).to_host(ctx)                                   # [M,out] (upcast bf16→F32)
     var out = List[Float32]()
     for i in range(len(dy)):
         out.append(lo.scale * dy[i])
@@ -166,27 +199,29 @@ def flux_lora_bwd(
     d_contrib_h: List[Float32], x_h: List[Float32], lo: LoraAdapter,
     M: Int, ctx: DeviceContext,
 ) raises -> FluxLoraGrads:
+    # NATIVE BF16: adapter A/B matmuls + their backward upload bf16 (F32 accumulate
+    # inside the GEMM). Returned grads upcast bf16→F32 via to_host for the optimizer.
     var nb_t = Optional[Tensor](None)
     var t = linear(
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.BF16, ctx),
         nb_t^, ctx,
     ).to_host(ctx)                                   # [M,rank]
     var d_dy = List[Float32]()
     for i in range(len(d_contrib_h)):
         d_dy.append(lo.scale * d_contrib_h[i])       # [M,out]
     var lbB = linear_backward(
-        Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.F32, ctx),
-        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
+        Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.BF16, ctx),
+        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.BF16, ctx),
         M, lo.rank, lo.out_f, ctx,
     )
     var d_t = lbB.d_x.to_host(ctx)                   # [M,rank]
     var d_b = lbB.d_w.to_host(ctx)                   # [out_f,rank]
     var lbA = linear_backward(
-        Tensor.from_host(d_t^, [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(d_t^, [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.BF16, ctx),
         M, lo.in_f, lo.rank, ctx,
     )
     var d_x_lo = lbA.d_x.to_host(ctx)                # [M,in_f]
@@ -377,15 +412,15 @@ struct _StreamPreH(Movable):
     var q_rms: Tensor
     var k_rms: Tensor
     var v: Tensor
-    var ln1_h: List[Float32]
-    var norm_h: List[Float32]
-    var q_pre_h: List[Float32]
-    var k_pre_h: List[Float32]
+    var ln1_h: List[BFloat16]
+    var norm_h: List[BFloat16]
+    var q_pre_h: List[BFloat16]
+    var k_pre_h: List[BFloat16]
 
     def __init__(
         out self, var q_rms: Tensor, var k_rms: Tensor, var v: Tensor,
-        var ln1_h: List[Float32], var norm_h: List[Float32],
-        var q_pre_h: List[Float32], var k_pre_h: List[Float32],
+        var ln1_h: List[BFloat16], var norm_h: List[BFloat16],
+        var q_pre_h: List[BFloat16], var k_pre_h: List[BFloat16],
     ):
         self.q_rms = q_rms^
         self.k_rms = k_rms^
@@ -404,7 +439,7 @@ def _stream_pre_lora[
 ) raises -> _StreamPreH:
     var ln1 = layer_norm(x, ones, zeros, eps, ctx)
     var norm = modulate(ln1, _t(mv.scale1.copy(), [D], ctx), _t(mv.shift1.copy(), [D], ctx), ctx)
-    var norm_h = norm.to_host(ctx)                          # [N,D] LoRA input for q/k/v
+    var norm_h_f32 = norm.to_host(ctx)                      # F32 for LoRA computation
     var b = Optional[Tensor](w.bqkv[].clone(ctx))
     var qkv = linear(norm, w.wqkv[], b, ctx)                # [N,3D]
     # base q/k/v slices
@@ -412,32 +447,33 @@ def _stream_pre_lora[
     var k_base = slice(qkv, 1, D, D, ctx).to_host(ctx)
     var v_base = slice(qkv, 1, 2 * D, D, ctx).to_host(ctx)
     # LoRA on each (separate to_q/to_k/to_v adapters; shared norm input)
-    var q_h = flux_lora_apply(q_base, norm_h, lo.to_q, N, ctx)
-    var k_h = flux_lora_apply(k_base, norm_h, lo.to_k, N, ctx)
-    var v_h = flux_lora_apply(v_base, norm_h, lo.to_v, N, ctx)
+    var q_h = flux_lora_apply(q_base, norm_h_f32, lo.to_q, N, ctx)
+    var k_h = flux_lora_apply(k_base, norm_h_f32, lo.to_k, N, ctx)
+    var v_h = flux_lora_apply(v_base, norm_h_f32, lo.to_v, N, ctx)
     var q_pre = reshape_owned(_t(q_h, [N, D], ctx)^, [1, N, H, Dh])
     var k_pre = reshape_owned(_t(k_h, [N, D], ctx)^, [1, N, H, Dh])
     var v = reshape_owned(_t(v_h, [N, D], ctx)^, [1, N, H, Dh])
     var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
     var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
     return _StreamPreH(
-        q_rms^, k_rms^, v^, ln1.to_host(ctx), norm_h.copy(),
-        q_pre.to_host(ctx), k_pre.to_host(ctx),
+        q_rms^, k_rms^, v^,
+        ln1.to_host_bf16(ctx), _f32_to_bf16(norm_h_f32),
+        q_pre.to_host_bf16(ctx), k_pre.to_host_bf16(ctx),
     )
 
 
 struct _StreamPostH(Movable):
     var out: Tensor
-    var attn_res_h: List[Float32]
-    var ln2_h: List[Float32]
-    var mlp_in_h: List[Float32]
-    var mlp_pre_h: List[Float32]
-    var mlp_h_h: List[Float32]
+    var attn_res_h: List[BFloat16]
+    var ln2_h: List[BFloat16]
+    var mlp_in_h: List[BFloat16]
+    var mlp_pre_h: List[BFloat16]
+    var mlp_h_h: List[BFloat16]
 
     def __init__(
-        out self, var out: Tensor, var attn_res_h: List[Float32],
-        var ln2_h: List[Float32], var mlp_in_h: List[Float32],
-        var mlp_pre_h: List[Float32], var mlp_h_h: List[Float32],
+        out self, var out: Tensor, var attn_res_h: List[BFloat16],
+        var ln2_h: List[BFloat16], var mlp_in_h: List[BFloat16],
+        var mlp_pre_h: List[BFloat16], var mlp_h_h: List[BFloat16],
     ):
         self.out = out^
         self.attn_res_h = attn_res_h^
@@ -448,33 +484,33 @@ struct _StreamPostH(Movable):
 
 
 def _stream_post_lora(
-    x: Tensor, att: Tensor, att_h: List[Float32],
+    x: Tensor, att: Tensor, att_h_f32: List[Float32],
     w: StreamWeights, mv: ModVecs, lo: StreamLora,
     N: Int, D: Int, Fmlp: Int, eps: Float32, ones: Tensor, zeros: Tensor,
     ctx: DeviceContext,
 ) raises -> _StreamPostH:
     var bp = Optional[Tensor](w.bproj[].clone(ctx))
     var out_base = linear(att, w.wproj[], bp, ctx).to_host(ctx)   # [N,D]
-    var out_h = flux_lora_apply(out_base, att_h, lo.proj, N, ctx)
+    var out_h = flux_lora_apply(out_base, att_h_f32, lo.proj, N, ctx)
     var out = _t(out_h, [N, D], ctx)
     var attn_res = residual_gate(x, _t(mv.gate1.copy(), [D], ctx), out, ctx)
     var ln2 = layer_norm(attn_res, ones, zeros, eps, ctx)
     var mlp_in = modulate(ln2, _t(mv.scale2.copy(), [D], ctx), _t(mv.shift2.copy(), [D], ctx), ctx)
-    var mlp_in_h = mlp_in.to_host(ctx)                           # [N,D] LoRA input mlp0
+    var mlp_in_h_f32 = mlp_in.to_host(ctx)                       # F32 for LoRA computation
     var b0 = Optional[Tensor](w.bmlp0[].clone(ctx))
     var mlp_pre_base = linear(mlp_in, w.wmlp0[], b0, ctx).to_host(ctx)   # [N,Fmlp]
-    var mlp_pre_h = flux_lora_apply(mlp_pre_base, mlp_in_h, lo.mlp0, N, ctx)
+    var mlp_pre_h = flux_lora_apply(mlp_pre_base, mlp_in_h_f32, lo.mlp0, N, ctx)
     var mlp_pre = _t(mlp_pre_h, [N, Fmlp], ctx)
     var mlp_h = gelu(mlp_pre, ctx)                               # [N,Fmlp]
-    var mlp_h_h = mlp_h.to_host(ctx)                             # LoRA input mlp2
+    var mlp_h_h_f32 = mlp_h.to_host(ctx)                         # F32 for LoRA computation
     var b2 = Optional[Tensor](w.bmlp2[].clone(ctx))
     var mlp_base = linear(mlp_h, w.wmlp2[], b2, ctx).to_host(ctx)   # [N,D]
-    var mlp_out_h = flux_lora_apply(mlp_base, mlp_h_h, lo.mlp2, N, ctx)
+    var mlp_out_h = flux_lora_apply(mlp_base, mlp_h_h_f32, lo.mlp2, N, ctx)
     var mlp = _t(mlp_out_h, [N, D], ctx)
     var final = residual_gate(attn_res, _t(mv.gate2.copy(), [D], ctx), mlp, ctx)
     return _StreamPostH(
-        final^, attn_res.to_host(ctx), ln2.to_host(ctx),
-        mlp_in_h^, mlp_pre_h^, mlp_h_h^,
+        final^, attn_res.to_host_bf16(ctx), ln2.to_host_bf16(ctx),
+        _f32_to_bf16(mlp_in_h_f32), _f32_to_bf16(mlp_pre_h), _f32_to_bf16(mlp_h_h_f32),
     )
 
 
@@ -490,6 +526,8 @@ def double_block_lora_forward[
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
     var zeros_t = _t(_zeros(D), [D], ctx)
+    var cos_b = _to_bf16(cos, ctx)
+    var sin_b = _to_bf16(sin, ctx)
 
     var img_x = _t(img, [N_IMG, D], ctx)
     var txt_x = _t(txt, [N_TXT, D], ctx)
@@ -501,37 +539,37 @@ def double_block_lora_forward[
     var k = concat(1, ctx, tp.k_rms, ip.k_rms)
     var v = concat(1, ctx, tp.v, ip.v)
 
-    var q_rope = rope_interleaved(q, cos, sin, ctx)
-    var k_rope = rope_interleaved(k, cos, sin, ctx)
+    var q_rope = rope_interleaved(q, cos_b, sin_b, ctx)
+    var k_rope = rope_interleaved(k, cos_b, sin_b, ctx)
     var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
 
     var txt_att_4d = slice(att, 1, 0, N_TXT, ctx)
     var img_att_4d = slice(att, 1, N_TXT, N_IMG, ctx)
     var txt_att = reshape_owned(txt_att_4d^, [N_TXT, D])
     var img_att = reshape_owned(img_att_4d^, [N_IMG, D])
-    var img_att_h = img_att.to_host(ctx)
-    var txt_att_h = txt_att.to_host(ctx)
+    var img_att_h_f32 = img_att.to_host(ctx)                     # F32 for proj LoRA computation
+    var txt_att_h_f32 = txt_att.to_host(ctx)
 
-    var ipost = _stream_post_lora(img_x, img_att, img_att_h, w.img, img_mod, lora.img, N_IMG, D, Fmlp, eps, ones_t, zeros_t, ctx)
-    var tpost = _stream_post_lora(txt_x, txt_att, txt_att_h, w.txt, txt_mod, lora.txt, N_TXT, D, Fmlp, eps, ones_t, zeros_t, ctx)
+    var ipost = _stream_post_lora(img_x, img_att, img_att_h_f32, w.img, img_mod, lora.img, N_IMG, D, Fmlp, eps, ones_t, zeros_t, ctx)
+    var tpost = _stream_post_lora(txt_x, txt_att, txt_att_h_f32, w.txt, txt_mod, lora.txt, N_TXT, D, Fmlp, eps, ones_t, zeros_t, ctx)
 
     var img_saved = StreamSaved(
-        img.copy(), ip.ln1_h.copy(), ip.norm_h.copy(),
+        _f32_to_bf16(img), ip.ln1_h.copy(), ip.norm_h.copy(),
         ip.q_pre_h.copy(), ip.k_pre_h.copy(),
-        img_att_h.copy(), ipost.attn_res_h.copy(),
+        _f32_to_bf16(img_att_h_f32), ipost.attn_res_h.copy(),
         ipost.ln2_h.copy(), ipost.mlp_in_h.copy(),
         ipost.mlp_pre_h.copy(), ipost.mlp_h_h.copy(),
     )
     var txt_saved = StreamSaved(
-        txt.copy(), tp.ln1_h.copy(), tp.norm_h.copy(),
+        _f32_to_bf16(txt), tp.ln1_h.copy(), tp.norm_h.copy(),
         tp.q_pre_h.copy(), tp.k_pre_h.copy(),
-        txt_att_h.copy(), tpost.attn_res_h.copy(),
+        _f32_to_bf16(txt_att_h_f32), tpost.attn_res_h.copy(),
         tpost.ln2_h.copy(), tpost.mlp_in_h.copy(),
         tpost.mlp_pre_h.copy(), tpost.mlp_h_h.copy(),
     )
     var saved = DoubleBlockSaved(
         img_saved^, txt_saved^,
-        q_rope.to_host(ctx), k_rope.to_host(ctx), v.to_host(ctx),
+        q_rope.to_host_bf16(ctx), k_rope.to_host_bf16(ctx), v.to_host_bf16(ctx),
     )
 
     var img_out = ipost.out.to_host(ctx)
@@ -583,59 +621,74 @@ def _stream_post_backward_lora(
     mut d_a_slots: List[List[Float32]], mut d_b_slots: List[List[Float32]],
     ctx: DeviceContext,
 ) raises -> _StreamPostBackL:
-    var attn_res_t = _t(sv.attn_res.copy(), [N, D], ctx)
-    var mlp_h_t = _t(sv.mlp_h.copy(), [N, Fmlp], ctx)
+    # Saved acts re-uploaded BF16 (native bf16 backward matmuls).
+    # d_out is F32 (upstream grad); gate_residual_backward needs grad_out + gate F32.
+    var attn_res_t = _tb16(sv.attn_res.copy(), [N, D], ctx)
+    var mlp_h_b = _tb16(sv.mlp_h.copy(), [N, Fmlp], ctx)
     # recompute mlp output WITH LoRA(mlp2) so gate_residual_backward y matches fwd.
     var b2 = Optional[Tensor](w.bmlp2[].clone(ctx))
-    var mlp_base = linear(mlp_h_t, w.wmlp2[], b2, ctx).to_host(ctx)
-    var mlp_y_h = flux_lora_apply(mlp_base, sv.mlp_h.copy(), lo.mlp2, N, ctx)
-    var mlp_y = _t(mlp_y_h, [N, D], ctx)
-    var grg2 = gate_residual_backward(d_out, attn_res_t, _t(mv.gate2.copy(), [D], ctx), mlp_y, ctx)
+    var mlp_base = linear(mlp_h_b, w.wmlp2[], b2, ctx).to_host(ctx)
+    var mlp_h_vals_f32 = List[Float32]()
+    for i in range(len(sv.mlp_h)):
+        mlp_h_vals_f32.append(Float32(sv.mlp_h[i]))
+    var mlp_y_h = flux_lora_apply(mlp_base, mlp_h_vals_f32, lo.mlp2, N, ctx)
+    var mlp_y = _t(mlp_y_h, [N, D], ctx)              # bf16
+    # F32-ONLY: gate_residual_backward grad_out/gate F32 (x/y may be bf16).
+    var grg2 = gate_residual_backward(
+        d_out, attn_res_t, _tf32(mv.gate2.copy(), [D], ctx), mlp_y, ctx
+    )
     var d_gate2 = grg2.d_g.to_host(ctx)
 
-    # mlp = linear(mlp_h, Wmlp2)[+LoRA(mlp2)]  W [D, Fmlp]
+    # mlp = linear(mlp_h, Wmlp2)[+LoRA(mlp2)]  W [D, Fmlp]. grg2.d_y F32 → bf16.
     var pm2 = _proj_bwd_with_lora(
-        grg2.d_y, mlp_h_t, w.wmlp2[], sv.mlp_h.copy(), lo.mlp2, D_MLP2, N, Fmlp, D,
+        _to_bf16(grg2.d_y, ctx), mlp_h_b, w.wmlp2[], mlp_h_vals_f32, lo.mlp2, D_MLP2, N, Fmlp, D,
         d_a_slots, d_b_slots, ctx,
     )
     var d_wmlp2 = pm2.d_w.to_host(ctx)
     var d_bmlp2 = pm2.d_b.to_host(ctx)
 
     # mlp_h = gelu(mlp_pre)
-    var mlp_pre_t = _t(sv.mlp_pre.copy(), [N, Fmlp], ctx)
-    var d_mlp_pre = gelu_backward(pm2.d_x, mlp_pre_t, ctx)
+    var mlp_pre_t = _tb16(sv.mlp_pre.copy(), [N, Fmlp], ctx)
+    var d_mlp_pre = gelu_backward(pm2.d_x, mlp_pre_t, ctx)  # bf16
 
     # mlp_pre = linear(mlp_in, Wmlp0)[+LoRA(mlp0)]  W [Fmlp, D]
-    var mlp_in_t = _t(sv.mlp_in.copy(), [N, D], ctx)
+    var mlp_in_t = _tb16(sv.mlp_in.copy(), [N, D], ctx)
+    var mlp_in_vals_f32 = List[Float32]()
+    for i in range(len(sv.mlp_in)):
+        mlp_in_vals_f32.append(Float32(sv.mlp_in[i]))
     var pm0 = _proj_bwd_with_lora(
-        d_mlp_pre, mlp_in_t, w.wmlp0[], sv.mlp_in.copy(), lo.mlp0, D_MLP0, N, D, Fmlp,
+        d_mlp_pre, mlp_in_t, w.wmlp0[], mlp_in_vals_f32, lo.mlp0, D_MLP0, N, D, Fmlp,
         d_a_slots, d_b_slots, ctx,
     )
     var d_wmlp0 = pm0.d_w.to_host(ctx)
     var d_bmlp0 = pm0.d_b.to_host(ctx)
 
-    # mlp_in = modulate(ln2, scale2, shift2)
-    var ln2_t = _t(sv.ln2.copy(), [N, D], ctx)
+    # mlp_in = modulate(ln2, scale2, shift2)  (pm0.d_x, ln2_t, scale2 all bf16)
+    var ln2_t = _tb16(sv.ln2.copy(), [N, D], ctx)
     var mb2 = modulate_backward(pm0.d_x, ln2_t, _t(mv.scale2.copy(), [D], ctx), ctx)
     var d_scale2 = mb2.d_scale.to_host(ctx)
     var d_shift2 = mb2.d_shift.to_host(ctx)
 
-    var lnb2 = layer_norm_backward(mb2.d_x, attn_res_t, ones, eps, ctx)
-    var d_attn_res_total = add(grg2.d_x, lnb2.d_x, ctx)
+    var lnb2 = layer_norm_backward(mb2.d_x, attn_res_t, ones, eps, ctx)  # bf16
+    # attn_res feeds residual (grg2.d_x F32) AND ln2 (bf16) → SUM bf16, then F32 for gate bwd.
+    var d_attn_res_total = add(_to_bf16(grg2.d_x, ctx), lnb2.d_x, ctx)
+    var d_attn_res_f32 = _to_f32(d_attn_res_total, ctx)
 
     # attn_res = residual_gate(x, gate1, proj_out): recompute proj WITH LoRA(proj)
     var bp = Optional[Tensor](w.bproj[].clone(ctx))
     var proj_base = linear(att, w.wproj[], bp, ctx).to_host(ctx)
     var att_h = att.to_host(ctx)
     var proj_y_h = flux_lora_apply(proj_base, att_h, lo.proj, N, ctx)
-    var proj_out = _t(proj_y_h, [N, D], ctx)
-    var grg1 = gate_residual_backward(d_attn_res_total, x, _t(mv.gate1.copy(), [D], ctx), proj_out, ctx)
+    var proj_out = _t(proj_y_h, [N, D], ctx)         # bf16
+    var grg1 = gate_residual_backward(
+        d_attn_res_f32, x, _tf32(mv.gate1.copy(), [D], ctx), proj_out, ctx
+    )
     var d_gate1 = grg1.d_g.to_host(ctx)
     var d_x_res = grg1.d_x.to_host(ctx)
 
-    # proj_out = linear(att, Wproj)[+LoRA(proj)]  W [D, D]
+    # proj_out = linear(att, Wproj)[+LoRA(proj)]  W [D, D]. grg1.d_y F32 → bf16.
     var pproj = _proj_bwd_with_lora(
-        grg1.d_y, att, w.wproj[], att_h, lo.proj, D_PROJ, N, D, D,
+        _to_bf16(grg1.d_y, ctx), att, w.wproj[], att_h, lo.proj, D_PROJ, N, D, D,
         d_a_slots, d_b_slots, ctx,
     )
     var d_wproj = pproj.d_w.to_host(ctx)
@@ -683,55 +736,62 @@ def _stream_pre_backward_lora[
     mut d_a_slots: List[List[Float32]], mut d_b_slots: List[List[Float32]],
     ctx: DeviceContext,
 ) raises -> _StreamPreBackL:
-    var q_pre_t = _t(sv.q_pre.copy(), [1, N, H, Dh], ctx)
-    var k_pre_t = _t(sv.k_pre.copy(), [1, N, H, Dh], ctx)
-    var rb_q = rms_norm_backward(d_q_rms, q_pre_t, w.q_norm[], eps, ctx)
+    # Incoming grads (cat_backward outputs) F32 → bf16 for the bf16-native chain.
+    var dq_b = _to_bf16(d_q_rms, ctx)
+    var dk_b = _to_bf16(d_k_rms, ctx)
+    var dv_b = _to_bf16(d_v, ctx)
+    var q_pre_t = _tb16(sv.q_pre.copy(), [1, N, H, Dh], ctx)
+    var k_pre_t = _tb16(sv.k_pre.copy(), [1, N, H, Dh], ctx)
+    var rb_q = rms_norm_backward(dq_b, q_pre_t, w.q_norm[], eps, ctx)   # bf16
     var d_q_norm = rb_q.d_g.to_host(ctx)
-    var rb_k = rms_norm_backward(d_k_rms, k_pre_t, w.k_norm[], eps, ctx)
+    var rb_k = rms_norm_backward(dk_b, k_pre_t, w.k_norm[], eps, ctx)   # bf16
     var d_k_norm = rb_k.d_g.to_host(ctx)
 
     reshape_in_place(rb_q.d_x, [N, D])
     reshape_in_place(rb_k.d_x, [N, D])
-    var d_v_flat = reshape(d_v, [N, D], ctx)
+    var d_v_flat = reshape(dv_b, [N, D], ctx)
 
     # The fused qkv linear's base d_w/d_b come from the joined d_qkv [N,3D]; the
     # LoRA on to_q/to_k/to_v consumes the per-slice d_y (rb_q.d_x / rb_k.d_x /
     # d_v_flat) against the SHARED input `norm`. d_x_lo from all three slices SUMS
     # into the base norm grad (LoRA contribution to the projection input).
-    var norm_t = _t(sv.norm.copy(), [N, D], ctx)
+    var norm_t = _tb16(sv.norm.copy(), [N, D], ctx)
     var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, d_v_flat)   # [N,3D]
     var lb_qkv = linear_backward(d_qkv, norm_t, w.wqkv[], N, D, 3 * D, ctx)
     var d_wqkv = lb_qkv.d_w.to_host(ctx)
     var d_bqkv = lb_qkv.d_b.to_host(ctx)
     var d_norm = lb_qkv.d_x.to_host(ctx)   # base norm grad [N,D]
 
-    # to_q / to_k / to_v LoRA: each consumes its own d_y slice, input = norm.
+    # to_q / to_k / to_v LoRA: each consumes its own d_y slice, input = norm (F32).
+    var norm_vals_f32 = List[Float32]()
+    for i in range(len(sv.norm)):
+        norm_vals_f32.append(Float32(sv.norm[i]))
     var d_q_h = rb_q.d_x.to_host(ctx)
     var d_k_h = rb_k.d_x.to_host(ctx)
     var d_v_h = d_v_flat.to_host(ctx)
     if lo.to_q:
-        var lg = flux_lora_bwd(d_q_h, sv.norm.copy(), lo.to_q.value(), N, ctx)
+        var lg = flux_lora_bwd(d_q_h, norm_vals_f32, lo.to_q.value(), N, ctx)
         d_a_slots[D_SQ] = lg.d_a.copy()
         d_b_slots[D_SQ] = lg.d_b.copy()
         d_norm = _add_lists(d_norm, lg.d_x)
     if lo.to_k:
-        var lg = flux_lora_bwd(d_k_h, sv.norm.copy(), lo.to_k.value(), N, ctx)
+        var lg = flux_lora_bwd(d_k_h, norm_vals_f32, lo.to_k.value(), N, ctx)
         d_a_slots[D_SK] = lg.d_a.copy()
         d_b_slots[D_SK] = lg.d_b.copy()
         d_norm = _add_lists(d_norm, lg.d_x)
     if lo.to_v:
-        var lg = flux_lora_bwd(d_v_h, sv.norm.copy(), lo.to_v.value(), N, ctx)
+        var lg = flux_lora_bwd(d_v_h, norm_vals_f32, lo.to_v.value(), N, ctx)
         d_a_slots[D_SV] = lg.d_a.copy()
         d_b_slots[D_SV] = lg.d_b.copy()
         d_norm = _add_lists(d_norm, lg.d_x)
 
     # norm = modulate(ln1, scale1, shift1)
-    var ln1_t = _t(sv.ln1.copy(), [N, D], ctx)
+    var ln1_t = _tb16(sv.ln1.copy(), [N, D], ctx)
     var mb1 = modulate_backward(_t(d_norm, [N, D], ctx), ln1_t, _t(mv.scale1.copy(), [D], ctx), ctx)
     var d_scale1 = mb1.d_scale.to_host(ctx)
     var d_shift1 = mb1.d_shift.to_host(ctx)
 
-    var x_t = _t(sv.x.copy(), [N, D], ctx)
+    var x_t = _tb16(sv.x.copy(), [N, D], ctx)
     var lnb1 = layer_norm_backward(mb1.d_x, x_t, ones, eps, ctx)
     var d_x_norm = lnb1.d_x.to_host(ctx)
     return _StreamPreBackL(d_x_norm^, d_wqkv^, d_bqkv^, d_q_norm^, d_k_norm^, d_shift1^, d_scale1^)
@@ -750,13 +810,14 @@ def double_block_lora_backward[
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
 
-    var d_io_t = _t(d_img_out, [N_IMG, D], ctx)
-    var d_to_t = _t(d_txt_out, [N_TXT, D], ctx)
+    # Upstream output grads stay F32 — gate_residual_backward needs grad_out F32.
+    var d_io_t = _tf32(d_img_out, [N_IMG, D], ctx)
+    var d_to_t = _tf32(d_txt_out, [N_TXT, D], ctx)
 
-    var img_x = _t(saved.img.x.copy(), [N_IMG, D], ctx)
-    var txt_x = _t(saved.txt.x.copy(), [N_TXT, D], ctx)
-    var img_att = _t(saved.img.att.copy(), [N_IMG, D], ctx)
-    var txt_att = _t(saved.txt.att.copy(), [N_TXT, D], ctx)
+    var img_x = _tb16(saved.img.x.copy(), [N_IMG, D], ctx)
+    var txt_x = _tb16(saved.txt.x.copy(), [N_TXT, D], ctx)
+    var img_att = _tb16(saved.img.att.copy(), [N_IMG, D], ctx)
+    var txt_att = _tb16(saved.txt.att.copy(), [N_TXT, D], ctx)
 
     # slot lists per stream
     var ia = List[List[Float32]]()
@@ -776,22 +837,26 @@ def double_block_lora_backward[
         N_TXT, D, Fmlp, eps, ones_t, ta, tb, ctx,
     )
 
-    # join per-stream attention-slice grads into joint d_att (txt FIRST)
+    # join per-stream attention-slice grads into joint d_att (txt FIRST).
+    # _t uploads bf16 → matches bf16 q_rope/k_rope/v for sdpa_backward.
     var d_tatt_4d = _t(tpb.d_att.copy(), [1, N_TXT, H, Dh], ctx)
     var d_iatt_4d = _t(ipb.d_att.copy(), [1, N_IMG, H, Dh], ctx)
-    var d_att_joint = concat(1, ctx, d_tatt_4d, d_iatt_4d)   # [1,S,H,Dh]
+    var d_att_joint = concat(1, ctx, d_tatt_4d, d_iatt_4d)   # [1,S,H,Dh] bf16
 
-    var q_rope_t = _t(saved.q_rope.copy(), [1, S, H, Dh], ctx)
-    var k_rope_t = _t(saved.k_rope.copy(), [1, S, H, Dh], ctx)
-    var v_joint_t = _t(saved.v_joint.copy(), [1, S, H, Dh], ctx)
+    # sdpa backward (JOINT) — bf16-native.
+    var q_rope_t = _tb16(saved.q_rope.copy(), [1, S, H, Dh], ctx)
+    var k_rope_t = _tb16(saved.k_rope.copy(), [1, S, H, Dh], ctx)
+    var v_joint_t = _tb16(saved.v_joint.copy(), [1, S, H, Dh], ctx)
     var sb = sdpa_backward[1, S, H, Dh](q_rope_t, k_rope_t, v_joint_t, d_att_joint, scale, ctx)
 
-    var d_q_joint = rope_backward(sb.d_q, cos, sin, True, ctx)
-    var d_k_joint = rope_backward(sb.d_k, cos, sin, True, ctx)
+    # F32-ONLY: rope_backward grad + cos/sin F32. sb.d_q/d_k bf16 → cast up.
+    var d_q_joint = rope_backward(_to_f32(sb.d_q, ctx), cos, sin, True, ctx)
+    var d_k_joint = rope_backward(_to_f32(sb.d_k, ctx), cos, sin, True, ctx)
 
+    # F32-ONLY: cat_backward grad F32. sb.d_v bf16 → cast up.
     var cq = cat_backward(d_q_joint, N_TXT, N_IMG, 1, ctx)
     var ck = cat_backward(d_k_joint, N_TXT, N_IMG, 1, ctx)
-    var cv = cat_backward(sb.d_v, N_TXT, N_IMG, 1, ctx)
+    var cv = cat_backward(_to_f32(sb.d_v, ctx), N_TXT, N_IMG, 1, ctx)
 
     var iprb = _stream_pre_backward_lora[H, Dh](
         cq.d_1, ck.d_1, cv.d_1, w.img, img_mod, saved.img, lora.img,
@@ -850,11 +915,13 @@ def single_block_lora_forward[
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
     var zeros_t = _t(_zeros(D), [D], ctx)
+    var cos_b = _to_bf16(cos, ctx)
+    var sin_b = _to_bf16(sin, ctx)
 
     var x_t = _t(x, [S, D], ctx)
     var ln_t = layer_norm(x_t, ones_t, zeros_t, eps, ctx)
     var norm_t = modulate(ln_t, _t(mv.scale.copy(), [D], ctx), _t(mv.shift.copy(), [D], ctx), ctx)
-    var norm_h = norm_t.to_host(ctx)                       # [S,D] LoRA input
+    var norm_h = norm_t.to_host(ctx)                       # [S,D] F32 for LoRA computation
 
     var b1 = Optional[Tensor](w.b1[].clone(ctx))
     var fused = linear(norm_t, w.w1[], b1, ctx)            # [S, 3D+Fmlp]
@@ -875,8 +942,8 @@ def single_block_lora_forward[
 
     var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
     var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
-    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
-    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+    var q_rope = rope_interleaved(q_rms, cos_b, sin_b, ctx)
+    var k_rope = rope_interleaved(k_rms, cos_b, sin_b, ctx)
     var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
     var att_flat = reshape_owned(att^, [S, D])
 
@@ -884,21 +951,21 @@ def single_block_lora_forward[
     var mlp_h = gelu(mlp_in, ctx)                          # [S,Fmlp]
 
     var out_in = concat(1, ctx, att_flat, mlp_h)           # [S, D+Fmlp]
-    var out_in_h = out_in.to_host(ctx)                     # LoRA input for linear2
+    var out_in_h_f32 = out_in.to_host(ctx)                 # F32 for LoRA computation
 
     var b2 = Optional[Tensor](w.b2[].clone(ctx))
     var out_base = linear(out_in, w.w2[], b2, ctx).to_host(ctx)   # [S,D]
-    var out_h = flux_lora_apply(out_base, out_in_h, lora.linear2, S, ctx)
+    var out_h = flux_lora_apply(out_base, out_in_h_f32, lora.linear2, S, ctx)
     var out_proj = _t(out_h, [S, D], ctx)
 
     var result = residual_gate(x_t, _t(mv.gate.copy(), [D], ctx), out_proj, ctx)
 
     var saved = SingleBlockSaved(
-        x.copy(), ln_t.to_host(ctx), norm_h.copy(),
-        q_pre.to_host(ctx), k_pre.to_host(ctx),
-        q_rope.to_host(ctx), k_rope.to_host(ctx), v.to_host(ctx),
-        att_flat.to_host(ctx),
-        mlp_in_h.copy(), mlp_h.to_host(ctx), out_in_h.copy(),
+        _f32_to_bf16(x), ln_t.to_host_bf16(ctx), _f32_to_bf16(norm_h),
+        q_pre.to_host_bf16(ctx), k_pre.to_host_bf16(ctx),
+        q_rope.to_host_bf16(ctx), k_rope.to_host_bf16(ctx), v.to_host_bf16(ctx),
+        att_flat.to_host_bf16(ctx),
+        _f32_to_bf16(mlp_in_h), mlp_h.to_host_bf16(ctx), _f32_to_bf16(out_in_h_f32),
     )
     return SingleBlockForward(result.to_host(ctx), saved^)
 
@@ -914,12 +981,12 @@ def single_block_lora_backward[
 ) raises -> SingleBlockLoraBackward:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
-    var scale_t = _t(mv.scale.copy(), [D], ctx)
-    var gate_t = _t(mv.gate.copy(), [D], ctx)
+    var scale_t = _t(mv.scale.copy(), [D], ctx)        # bf16 for modulate_backward
+    var gate_t_f32 = _tf32(mv.gate.copy(), [D], ctx)   # F32 for gate_residual_backward
 
-    var d_out_t = _t(d_out, [S, D], ctx)
-    var x_t = _t(saved.x.copy(), [S, D], ctx)
-    var out_in_t = _t(saved.out_in.copy(), [S, D + Fmlp], ctx)
+    var d_out_t = _tf32(d_out, [S, D], ctx)            # F32 (gate_residual_backward grad_out)
+    var x_t = _tb16(saved.x.copy(), [S, D], ctx)
+    var out_in_t = _tb16(saved.out_in.copy(), [S, D + Fmlp], ctx)
 
     var d_a_slots = List[List[Float32]]()
     var d_b_slots = List[List[Float32]]()
@@ -927,86 +994,98 @@ def single_block_lora_backward[
         d_a_slots.append(List[Float32]()); d_b_slots.append(List[Float32]())
 
     # result = residual_gate(x, gate, out): recompute out WITH LoRA(linear2)
+    # F32-ONLY: gate_residual_backward grad_out/gate F32 (x/y may be bf16).
     var b2 = Optional[Tensor](w.b2[].clone(ctx))
     var out_base = linear(out_in_t, w.w2[], b2, ctx).to_host(ctx)
-    var out_y_h = flux_lora_apply(out_base, saved.out_in.copy(), lora.linear2, S, ctx)
-    var out_y = _t(out_y_h, [S, D], ctx)
-    var grg = gate_residual_backward(d_out_t, x_t, gate_t, out_y, ctx)
+    var out_in_vals_f32 = List[Float32]()
+    for i in range(len(saved.out_in)):
+        out_in_vals_f32.append(Float32(saved.out_in[i]))
+    var out_y_h = flux_lora_apply(out_base, out_in_vals_f32, lora.linear2, S, ctx)
+    var out_y = _t(out_y_h, [S, D], ctx)               # bf16
+    var grg = gate_residual_backward(d_out_t, x_t, gate_t_f32, out_y, ctx)
     var d_gate = grg.d_g.to_host(ctx)
 
-    # out = linear(out_in, W2)[+LoRA(linear2)]  W2 [D, D+Fmlp]
+    # out = linear(out_in, W2)[+LoRA(linear2)]  W2 [D, D+Fmlp]. grg.d_y F32 → bf16.
     var pl2 = _proj_bwd_with_lora(
-        grg.d_y, out_in_t, w.w2[], saved.out_in.copy(), lora.linear2, S_L2,
+        _to_bf16(grg.d_y, ctx), out_in_t, w.w2[], out_in_vals_f32, lora.linear2, S_L2,
         S, D + Fmlp, D, d_a_slots, d_b_slots, ctx,
     )
     var d_w2 = pl2.d_w.to_host(ctx)
     var d_b2 = pl2.d_b.to_host(ctx)
 
-    # out_in = concat(att_flat, mlp_h) on channel axis (sizes D, Fmlp)
-    reshape_in_place(pl2.d_x, [1, S, D + Fmlp])
-    var cb = cat_backward(pl2.d_x, D, Fmlp, 2, ctx)
+    # out_in = concat(att_flat, mlp_h). F32-ONLY: cat_backward needs F32 grad.
+    var dx_w2_f32 = _to_f32(pl2.d_x, ctx)
+    reshape_in_place(dx_w2_f32, [1, S, D + Fmlp])
+    var cb = cat_backward(dx_w2_f32, D, Fmlp, 2, ctx)
     reshape_in_place(cb.d_0, [1, S, H, Dh])
     reshape_in_place(cb.d_1, [S, Fmlp])
+    var d_att_flat_b = _to_bf16(cb.d_0, ctx)
+    var d_mlp_h_b = _to_bf16(cb.d_1, ctx)
 
     # mlp_h = gelu(mlp_in)
-    var mlp_in_t = _t(saved.mlp_in.copy(), [S, Fmlp], ctx)
-    var d_mlp_in = gelu_backward(cb.d_1, mlp_in_t, ctx)   # [S,Fmlp]
+    var mlp_in_t = _tb16(saved.mlp_in.copy(), [S, Fmlp], ctx)
+    var d_mlp_in = gelu_backward(d_mlp_h_b, mlp_in_t, ctx)   # [S,Fmlp] bf16
 
-    # attention branch
-    var q_rope_t = _t(saved.q_rope.copy(), [1, S, H, Dh], ctx)
-    var k_rope_t = _t(saved.k_rope.copy(), [1, S, H, Dh], ctx)
-    var v_t = _t(saved.v.copy(), [1, S, H, Dh], ctx)
-    var sb = sdpa_backward[1, S, H, Dh](q_rope_t, k_rope_t, v_t, cb.d_0, scale, ctx)
+    # attention branch (bf16-native sdpa).
+    var q_rope_t = _tb16(saved.q_rope.copy(), [1, S, H, Dh], ctx)
+    var k_rope_t = _tb16(saved.k_rope.copy(), [1, S, H, Dh], ctx)
+    var v_t = _tb16(saved.v.copy(), [1, S, H, Dh], ctx)
+    var sb = sdpa_backward[1, S, H, Dh](q_rope_t, k_rope_t, v_t, d_att_flat_b, scale, ctx)
 
-    var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
-    var d_k_rms = rope_backward(sb.d_k, cos, sin, True, ctx)
+    # F32-ONLY: rope_backward grad + cos/sin F32. sb.d_q/d_k bf16 → cast up.
+    var d_q_rms = rope_backward(_to_f32(sb.d_q, ctx), cos, sin, True, ctx)
+    var d_k_rms = rope_backward(_to_f32(sb.d_k, ctx), cos, sin, True, ctx)
 
-    var q_pre_t = _t(saved.q_pre.copy(), [1, S, H, Dh], ctx)
-    var k_pre_t = _t(saved.k_pre.copy(), [1, S, H, Dh], ctx)
-    var rb_q = rms_norm_backward(d_q_rms, q_pre_t, w.q_norm[], eps, ctx)
+    var q_pre_t = _tb16(saved.q_pre.copy(), [1, S, H, Dh], ctx)
+    var k_pre_t = _tb16(saved.k_pre.copy(), [1, S, H, Dh], ctx)
+    # back to bf16 for the bf16-native rms_norm_backward chain.
+    var rb_q = rms_norm_backward(_to_bf16(d_q_rms, ctx), q_pre_t, w.q_norm[], eps, ctx)
     var d_q_norm = rb_q.d_g.to_host(ctx)
-    var rb_k = rms_norm_backward(d_k_rms, k_pre_t, w.k_norm[], eps, ctx)
+    var rb_k = rms_norm_backward(_to_bf16(d_k_rms, ctx), k_pre_t, w.k_norm[], eps, ctx)
     var d_k_norm = rb_k.d_g.to_host(ctx)
 
     reshape_in_place(rb_q.d_x, [S, D])
     reshape_in_place(rb_k.d_x, [S, D])
     reshape_in_place(sb.d_v, [S, D])
 
-    # join the per-slice d_y into d_fused [S, 3D+Fmlp]
-    var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, sb.d_v)   # [S,3D]
-    var d_fused = concat(1, ctx, d_qkv, d_mlp_in)            # [S,3D+Fmlp]
+    # join the per-slice d_y into d_fused [S, 3D+Fmlp] (all bf16). sb.d_v bf16.
+    var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, sb.d_v)   # [S,3D] bf16
+    var d_fused = concat(1, ctx, d_qkv, d_mlp_in)            # [S,3D+Fmlp] bf16
 
     # fused = linear(norm, W1, b1)
-    var norm_t = _t(saved.norm.copy(), [S, D], ctx)
+    var norm_t = _tb16(saved.norm.copy(), [S, D], ctx)
     var lb_w1 = linear_backward(d_fused, norm_t, w.w1[], S, D, 3 * D + Fmlp, ctx)
     var d_w1 = lb_w1.d_w.to_host(ctx)
     var d_b1 = lb_w1.d_b.to_host(ctx)
     var d_norm = lb_w1.d_x.to_host(ctx)   # base norm grad [S,D]
 
-    # LoRA on to_q/to_k/to_v (input = norm, d_y = per-slice grads) + proj_mlp.
+    # LoRA on to_q/to_k/to_v (input = norm F32) + proj_mlp.
+    var norm_vals_f32 = List[Float32]()
+    for i in range(len(saved.norm)):
+        norm_vals_f32.append(Float32(saved.norm[i]))
     var d_q_h = rb_q.d_x.to_host(ctx)
     var d_k_h = rb_k.d_x.to_host(ctx)
     var d_v_h = sb.d_v.to_host(ctx)
     var d_mlp_in_h = d_mlp_in.to_host(ctx)
     if lora.to_q:
-        var lg = flux_lora_bwd(d_q_h, saved.norm.copy(), lora.to_q.value(), S, ctx)
+        var lg = flux_lora_bwd(d_q_h, norm_vals_f32, lora.to_q.value(), S, ctx)
         d_a_slots[S_SQ] = lg.d_a.copy(); d_b_slots[S_SQ] = lg.d_b.copy()
         d_norm = _add_lists(d_norm, lg.d_x)
     if lora.to_k:
-        var lg = flux_lora_bwd(d_k_h, saved.norm.copy(), lora.to_k.value(), S, ctx)
+        var lg = flux_lora_bwd(d_k_h, norm_vals_f32, lora.to_k.value(), S, ctx)
         d_a_slots[S_SK] = lg.d_a.copy(); d_b_slots[S_SK] = lg.d_b.copy()
         d_norm = _add_lists(d_norm, lg.d_x)
     if lora.to_v:
-        var lg = flux_lora_bwd(d_v_h, saved.norm.copy(), lora.to_v.value(), S, ctx)
+        var lg = flux_lora_bwd(d_v_h, norm_vals_f32, lora.to_v.value(), S, ctx)
         d_a_slots[S_SV] = lg.d_a.copy(); d_b_slots[S_SV] = lg.d_b.copy()
         d_norm = _add_lists(d_norm, lg.d_x)
     if lora.proj_mlp:
-        var lg = flux_lora_bwd(d_mlp_in_h, saved.norm.copy(), lora.proj_mlp.value(), S, ctx)
+        var lg = flux_lora_bwd(d_mlp_in_h, norm_vals_f32, lora.proj_mlp.value(), S, ctx)
         d_a_slots[S_PMLP] = lg.d_a.copy(); d_b_slots[S_PMLP] = lg.d_b.copy()
         d_norm = _add_lists(d_norm, lg.d_x)
 
     # norm = modulate(ln, scale, shift)
-    var ln_t = _t(saved.ln.copy(), [S, D], ctx)
+    var ln_t = _tb16(saved.ln.copy(), [S, D], ctx)
     var mb = modulate_backward(_t(d_norm, [S, D], ctx), ln_t, scale_t, ctx)
     var d_scale = mb.d_scale.to_host(ctx)
     var d_shift = mb.d_shift.to_host(ctx)

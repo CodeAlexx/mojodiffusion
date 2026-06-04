@@ -625,6 +625,48 @@ def ernie_stack_lora_forward_streamed_device[
     )
 
 
+def ernie_stack_lora_predict_streamed_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, st: ShardedSafeTensors,
+    lora: ErnieLoraDeviceSet, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    var num_layers = lora.num_layers
+
+    var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
+    var img = linear(
+        _t(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+    )
+    var no_txt_bias = Optional[Tensor](None)
+    var txt = linear(_t(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
+    var x = concat(0, ctx, img, txt)
+    var x_arc = TArc(x^)
+
+    for bi in range(num_layers):
+        var w = load_ernie_block_weights_bf16_normf32(st, bi, ctx)
+        var bl = _block_lora_dev_for(lora, bi)
+        var fwd = ernie_block_lora_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), w, mv, bl, cos, sin, D, F, eps, ctx,
+        )
+        x_arc = fwd.out.copy()
+
+    var ln_x = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+    )
+    var x_out = modulate(
+        ln_x, _t(f_scale.copy(), [D], ctx), _t(f_shift.copy(), [D], ctx), ctx,
+    )
+    var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
+    var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
+    var out_img = slice(patches, 0, 0, N_IMG, ctx).to_host(ctx)
+    return out_img^
+
+
 def ernie_stack_lora_backward_streamed_device[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](

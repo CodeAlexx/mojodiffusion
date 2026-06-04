@@ -1,0 +1,356 @@
+# train_ltx2_real.mojo — LTX-2 video DiT LoRA training loop (block-swap offload).
+#
+# TRANSLATION of the musubi-tuner LTX-2 LoRA recipe onto the Mojo LTX-2 LoRA
+# OFFLOAD stack (models/ltx2/ltx2_stack_lora.mojo). Streams all 48 identical
+# transformer_blocks block-by-block via TurboPlannedLoader; the frozen
+# patchify_proj/proj_out + adaln_single conditioning network are resident. No
+# synthetic block math — every block fwd/bwd is the proven ltx2_block.mojo arm.
+# Mirrors train_chroma_real.mojo's loop (timing, grad clip, shared progress).
+#
+# LTX-2 vs CHROMA (the deltas; see ltx2_stack_lora.mojo header):
+#   - NO double/single split: 48 identical blocks (BlockKind.transformer()).
+#   - Modulation: per-block scale_shift_table[9,D] (frozen) + a single global
+#     adaln_single(sigma) -> 6*D delta (frozen) ADDED on top. Built once/step.
+#   - LoRA target set (musubi networks/lora_ltx2.py LTX2_INCLUDE_PATTERNS_T2V):
+#     attn1.to_q/to_k/to_v/to_out.0 -> 4 adapters x 48 = 192 total.
+#   - RoPE: SPLIT type (rope_halfsplit), tables [S*H, Dh//2] split layout.
+#
+# Per step (flow-match; musubi ltx2_scheduler.py + ltx2_train.py):
+#   1. load cached latent tokens [N, in_ch] (already patchify-ready)
+#   2. sigma via logit-normal (shift=1.0 -> identity sigmoid(N(0,1)) clamp);
+#      ltx2_scheduler SD3-shift with shift=1.0 is identity.
+#   3. noisy = (1-sigma)*latent + sigma*noise ; target = noise - latent
+#        (musubi ltx2_train.py _build_noisy_input_for_sigma:
+#         noisy_input = (1-sigma)*latents + sigma*noise; velocity = noise - x0)
+#   4. adaln_delta = adaln_single(timestep_embed(sigma))   (frozen, once/step)
+#   5. ltx2_stack_lora_forward_offload(noisy, adaln_delta, ...) -> pred [N,out_ch]
+#   6. loss = MSE(pred, target); d_loss = (2/N)(pred - target)
+#   7. ltx2_stack_lora_backward_offload -> LoRA grads; global-norm clip(1.0)
+#   8. ltx2_lora_adamw_step; print shared progress display
+#
+# Recipe scalars (configs/ltx2.json): lr=3e-4, rank=16, alpha=1.0,
+#   timestep_shift=1.0, clip_grad_norm=1.0.
+#
+# FIXED_SIGMA_SMOKE: every step uses the SAME sample + fixed sigma+noise so a
+# correct LoRA backward MUST drive loss DOWN monotonically (trainer-correctness
+# gate, same probe as train_chroma_real).
+#
+# Run (real smoke):
+#   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
+#     pixi run mojo build -I . -Xlinker -lm -Xlinker -lcuda \
+#       serenitymojo/training/train_ltx2_real.mojo -o /tmp/train_ltx2_real && \
+#     /tmp/train_ltx2_real [steps]
+
+from sys import argv
+from std.collections import List, Optional
+from std.gpu.host import DeviceContext
+from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
+from std.time import perf_counter_ns
+from std.os import listdir
+
+from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.io.tensor_view import from_parts
+from serenitymojo.ops.cast import cast_tensor
+
+from serenitymojo.models.ltx2.weights import load_ltx2_stack_base
+from serenitymojo.models.ltx2.ltx2_stack_lora import (
+    LTX2LoraSet, LTX2LoraGradSet, build_ltx2_lora_set, total_ltx2_adapters,
+    ltx2_adaln_delta, ltx2_stack_lora_forward_offload,
+    ltx2_stack_lora_backward_offload, ltx2_lora_adamw_step, save_ltx2_lora,
+)
+from serenitymojo.models.dit.ltx2_rope import build_ltx2_rope
+from serenitymojo.offload.ltx2_plan import build_ltx2_block_plan
+from serenitymojo.offload.plan import OffloadConfig
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.training.schedule import sample_timestep_logit_normal
+from serenitymojo.training.progress_display import print_trainer_progress
+
+
+# ── arch (LTX-2 video DiT; from configs/ltx2.json) ───────────────────────────
+comptime H = 32
+comptime Dh = 128
+comptime D = H * Dh            # 4096
+comptime FF = 16384            # mlp_hidden
+comptime IN_CH = 128           # patchify in_channels
+comptime OUT_CH = 128
+comptime NUM_LAYERS = 48
+comptime EPS = Float32(1e-06)
+
+# ── token grid (smoke): frame x height x width latent positions. S = F*HT*WT.
+#   Keep the working set bounded for the correctness gate (real configs are
+#   larger; S is the only dim that scales the per-block matmuls).
+comptime GRID_F = 1
+comptime GRID_H = 16
+comptime GRID_W = 16
+comptime S = GRID_F * GRID_H * GRID_W   # 256 tokens
+
+# ── recipe (configs/ltx2.json) ──────────────────────────────────────────────
+comptime RANK = 16
+comptime ALPHA = Float32(1.0)
+comptime LR = Float32(3.0e-4)
+comptime TIMESTEP_SHIFT = Float32(1.0)   # SD3-shift identity at 1.0
+comptime NUM_TRAIN_TIMESTEPS = 1000
+comptime CLIP_GRAD_NORM = Float32(1.0)
+comptime SEED_BASE = UInt64(42)
+
+comptime FIXED_SIGMA_SMOKE = True
+comptime FIXED_SIGMA = Float32(0.5)
+
+# ── adaln timestep embedding dim (adaln_single.emb.timestep_embedder in_dim) ──
+comptime TEMB_DIM = 256
+
+comptime CKPT = "/home/alex/.serenity/models/checkpoints/ltx2_video_bf16.safetensors"
+comptime CACHE_DIR = "/home/alex/datasets/ltx2_cache_512"
+comptime LORA_DIR = "/home/alex/mojodiffusion/output/ltx2_lora"
+
+
+# ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
+def _host_noise(n: Int, seed: UInt64) -> List[Float32]:
+    var out = List[Float32]()
+    var state = seed
+    var i = 0
+    while i < n:
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u1f = Float64(Int((state >> 12) & 0xFFFFFFFFFFFFF)) * (1.0 / 4503599627370496.0)
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u2f = Float64(Int((state >> 12) & 0xFFFFFFFFFFFFF)) * (1.0 / 4503599627370496.0)
+        if u1f < 1.0e-12:
+            u1f = 1.0e-12
+        var r = sqrt(-2.0 * flog(Float64(u1f)))
+        var theta = 6.283185307179586 * u2f
+        out.append(Float32(r * fcos(Float64(theta))))
+        if i + 1 < n:
+            out.append(Float32(r * fsin(Float64(theta))))
+        i += 2
+    return out^
+
+
+# sinusoidal timestep embedding [dim] for a scalar t (diffusers get_timestep_embedding,
+# sin-first, max_period=10000). Feeds the adaln_single timestep_embedder linears.
+def _sinusoidal_temb(t: Float32, dim: Int) -> List[Float32]:
+    var half = dim // 2
+    var out = List[Float32]()
+    for _ in range(dim):
+        out.append(Float32(0.0))
+    for i in range(half):
+        var freq = fexp(-flog(10000.0) * Float64(i) / Float64(half))
+        var arg = Float64(t) * freq
+        out[i] = Float32(fsin(arg))         # sin first
+        out[half + i] = Float32(fcos(arg))  # cos second
+    return out^
+
+
+def _absum(v: List[Float32]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(v)):
+        var x = v[i]
+        s += x if x >= 0.0 else -x
+    return s
+
+
+def _global_norm(grads: LTX2LoraGradSet) -> Float64:
+    var ss = 0.0
+    for i in range(len(grads.d_a)):
+        for j in range(len(grads.d_a[i])):
+            ss += Float64(grads.d_a[i][j]) * Float64(grads.d_a[i][j])
+        for j in range(len(grads.d_b[i])):
+            ss += Float64(grads.d_b[i][j]) * Float64(grads.d_b[i][j])
+    return sqrt(ss)
+
+
+def _clip(mut grads: LTX2LoraGradSet, max_norm: Float32) -> Float64:
+    var gn = _global_norm(grads)
+    if gn <= Float64(max_norm) or gn == 0.0:
+        return gn
+    var s = Float32(Float64(max_norm) / gn)
+    for i in range(len(grads.d_a)):
+        for j in range(len(grads.d_a[i])):
+            grads.d_a[i][j] = grads.d_a[i][j] * s
+        for j in range(len(grads.d_b[i])):
+            grads.d_b[i][j] = grads.d_b[i][j] * s
+    return gn
+
+
+def _list_cache(dir: String) raises -> List[String]:
+    var raw = listdir(dir)
+    var fs = List[String]()
+    for i in range(len(raw)):
+        if raw[i].endswith(".safetensors"):
+            fs.append(dir + String("/") + raw[i])
+    if len(fs) == 0:
+        raise Error(String("ltx2 cache: no .safetensors in ") + dir)
+    for i in range(1, len(fs)):
+        var j = i
+        while j > 0 and fs[j - 1] > fs[j]:
+            var tmp = fs[j - 1]
+            fs[j - 1] = fs[j]
+            fs[j] = tmp
+            j -= 1
+    return fs^
+
+
+def _load_host(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
+    var info = st.tensor_info(name)
+    var bytes = st.tensor_bytes(name)
+    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
+    var t = Tensor.from_view(tv, ctx)
+    return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
+
+
+def main() raises:
+    var ctx = DeviceContext()
+    var a = argv()
+    var run_steps = 5
+    if len(a) >= 2:
+        var v = 0
+        var bs = String(a[1]).as_bytes()
+        for i in range(String(a[1]).byte_length()):
+            v = v * 10 + Int(bs[i] - 0x30)
+        run_steps = v
+
+    print("=== LTX-2 (video DiT) REAL LoRA training loop (block-swap offload) ===")
+    print("  arch: D=", D, " H=", H, " Dh=", Dh, " FF=", FF, " in_ch=", IN_CH, " out_ch=", OUT_CH)
+    print("  depth: NUM_LAYERS=", NUM_LAYERS)
+    print("  tokens: grid", GRID_F, "x", GRID_H, "x", GRID_W, " S=", S)
+    print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT)
+    print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
+    print("  ckpt:", CKPT)
+    print("  cache:", CACHE_DIR)
+
+    # ── stack-level base (frozen; patchify_proj/proj_out/adaln_single) ────────
+    print("[load] LTX2StackBase (patchify_proj, proj_out, adaln_single)")
+    var base_st = SafeTensors.open(String(CKPT))
+    var base = load_ltx2_stack_base(base_st, NUM_LAYERS, D, IN_CH, OUT_CH, ctx)
+    print("[load] base resident")
+
+    # ── block-swap offload loader ─────────────────────────────────────────────
+    var plan = build_ltx2_block_plan(NUM_LAYERS)
+    var cfg = OffloadConfig.synchronous_single()
+    var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
+    print("[load] offload loader opened (", loader.block_count(), "blocks)")
+
+    # ── split-rope tables [S*H, Dh//2] (built once, F32) ──────────────────────
+    var rope = build_ltx2_rope[GRID_F, GRID_H, GRID_W](
+        H, Dh, 10000.0, Float64(GRID_F), Float64(GRID_H), Float64(GRID_W),
+        STDtype.F32, ctx,
+    )
+    var cos = rope[0].to_host(ctx)
+    var sin = rope[1].to_host(ctx)
+    print("[load] ltx2 split-rope tables built (S*H x Dh/2)")
+
+    # ── LoRA set (B=0 init -> identity at step 0) ─────────────────────────────
+    var lora = build_ltx2_lora_set(NUM_LAYERS, D, RANK, ALPHA)
+    var n_adapters = total_ltx2_adapters(lora)
+    print("[lora] adapters:", n_adapters, " (4 x", NUM_LAYERS, "blocks: q,k,v,out)")
+
+    var files = _list_cache(String(CACHE_DIR))
+    print("[cache] samples:", len(files))
+
+    var b_absum_init = Float32(0.0)
+    for i in range(n_adapters):
+        b_absum_init += _absum(lora.ad[i].b)
+    print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+
+    var first_loss = Float32(0.0)
+    var last_loss = Float32(0.0)
+
+    var train_start = perf_counter_ns()
+    for k in range(1, run_steps + 1):
+        var t0 = perf_counter_ns()
+
+        var slot = 0 if FIXED_SIGMA_SMOKE else (k - 1) % len(files)
+        var step_seed = UInt64(1) if FIXED_SIGMA_SMOKE else UInt64(k)
+        var st = SafeTensors.open(files[slot])
+
+        # latent tokens [S, in_ch]: cached patchify-ready (channel-last per token).
+        var lat = _load_host(st, String("latent"), ctx)   # expect S*IN_CH flat
+        # truncate/pad to S*IN_CH (the cache may carry a larger grid).
+        var latent = List[Float32]()
+        for i in range(S * IN_CH):
+            if i < len(lat):
+                latent.append(lat[i])
+            else:
+                latent.append(Float32(0.0))
+
+        # ── timestep / sigma ──
+        var sigma: Float32
+        if FIXED_SIGMA_SMOKE:
+            sigma = FIXED_SIGMA
+        else:
+            sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+            if sigma > Float32(1.0):
+                sigma = Float32(1.0)
+            if sigma < Float32(1.0e-3):
+                sigma = Float32(1.0e-3)
+        var t_model = sigma * Float32(NUM_TRAIN_TIMESTEPS)   # musubi: timesteps = sigma*1000
+
+        # ── flow-match: noisy=(1-sigma)*latent+sigma*noise ; target=noise-latent ──
+        var noise = _host_noise(S * IN_CH, SEED_BASE * UInt64(7919) + step_seed)
+        var noisy = List[Float32]()
+        var target = List[Float32]()
+        for i in range(len(latent)):
+            noisy.append(latent[i] * (Float32(1.0) - sigma) + noise[i] * sigma)
+            target.append(noise[i] - latent[i])
+
+        # ── adaln_single conditioning delta (frozen, once/step) ──
+        var temb = _sinusoidal_temb(t_model, TEMB_DIM)
+        var adaln_delta = ltx2_adaln_delta(base, temb, ctx)   # [6*D]
+
+        # ── forward (offload, full depth) -> velocity [S, OUT_CH] ──
+        var fwd = ltx2_stack_lora_forward_offload[H, Dh, S](
+            noisy.copy(), adaln_delta.copy(), base, loader, lora,
+            cos.copy(), sin.copy(), D, FF, IN_CH, OUT_CH, EPS, True, ctx,
+        )
+
+        # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
+        var nout = len(fwd.out)
+        var d_loss = List[Float32]()
+        var sse = 0.0
+        var inv_n = Float32(2.0) / Float32(nout)
+        for i in range(nout):
+            var diff = fwd.out[i] - target[i]
+            sse += Float64(diff) * Float64(diff)
+            d_loss.append(inv_n * diff)
+        var loss = Float32(sse / Float64(nout))
+        if k == 1:
+            first_loss = loss
+        last_loss = loss
+
+        # ── backward (offload, full depth) ──
+        var grads = ltx2_stack_lora_backward_offload[H, Dh, S](
+            d_loss, noisy.copy(), base, loader, lora,
+            cos.copy(), sin.copy(), fwd,
+            D, FF, IN_CH, OUT_CH, EPS, True, ctx,
+        )
+
+        # ── grad norm + clip(1.0) ──
+        var gn_before = _clip(grads, CLIP_GRAD_NORM)
+
+        # ── AdamW ──
+        ltx2_lora_adamw_step(lora, grads, k, LR, ctx)
+
+        var t1 = perf_counter_ns()
+        var secs = Float64(t1 - t0) / 1.0e9
+        print_trainer_progress(
+            String("LTX2-lora"), k, run_steps, 1,
+            loss, Float64(gn_before), secs, 0.0,
+            Float64(t1 - train_start) / 1.0e9,
+        )
+        if grads.nonfinite_lora_grads != 0:
+            print("[LTX2-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
+
+    print("")
+    print("first_loss=", first_loss, " last_loss=", last_loss)
+    var b_absum_final = Float32(0.0)
+    for i in range(n_adapters):
+        b_absum_final += _absum(lora.ad[i].b)
+    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
+    if trains and (last_loss == last_loss):
+        print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
+              "; loss", first_loss, "->", last_loss,
+              (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        _ = save_ltx2_lora(lora, String(LORA_DIR) + String("/ltx2_lora_smoke.safetensors"), ctx)
+    else:
+        print("RESULT: FAIL trains=", trains)

@@ -1,0 +1,23 @@
+{
+  "img_shape": [
+    1,
+    3,
+    64,
+    64
+  ],
+  "moments_shape_nhwc": [
+    1,
+    8,
+    8,
+    8
+  ],
+  "mode_shape_nchw": [
+    1,
+    4,
+    8,
+    8
+  ],
+  "dtype": "bf16-on-gpu, dumped as f32",
+  "vae": "/home/alex/madebyollin_sdxl-vae-fp16-fix",
+  "unscaled": true
+}

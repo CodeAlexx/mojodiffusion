@@ -78,6 +78,7 @@ from std.math import sqrt
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 
 # TArc = Copyable device carrier (ArcPointer[Tensor]); a copy is a refcount bump
 # of the SAME device buffer (mirrors klein/double_block.mojo:127). Lets the
@@ -132,8 +133,45 @@ def _zeros(d: Int) -> List[Float32]:
     return o^
 
 
+# NATIVE BF16 COMPUTE: every F32-host carrier (block input activations, weights,
+# biases, modulation vectors) is uploaded as a BF16 *device* tensor so the
+# matmuls/elementwise ops hit linear's `dt==bfloat16` native bf16·bf16 path
+# (F32 accumulate inside the GEMM, exactly like flame-core's cuBLAS). from_host
+# casts F32-host → BF16-device.
 def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_host(vals, shape^, STDtype.BF16, ctx)
+
+
+# F32 upload — used ONLY at the F32-only op boundaries (rope_backward cos/sin,
+# gate_residual_backward grad_out/gate, cat_backward grad). Keeps the public
+# List[Float32] verbatim on the device as F32.
+def _tf32(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+
+
+# Re-upload a saved BF16 host activation back to a BF16 *device* tensor (native,
+# no F32 detour) so the backward matmuls (linear_backward) run on bf16 saved acts.
+def _tb16(vals: List[BFloat16], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_host_bf16(vals, shape^, ctx)
+
+
+# Convert a F32 host list to BFloat16 (for saving the x/input copy as BF16).
+def _f32_to_bf16(v: List[Float32]) -> List[BFloat16]:
+    var o = List[BFloat16]()
+    for i in range(len(v)):
+        o.append(BFloat16(v[i]))
+    return o^
+
+
+# Local bf16→F32 cast for a single op call that hard-requires F32 (rope_backward,
+# cat_backward). Does NOT edit any shared op — casts on device for that one call.
+def _to_f32(t: Tensor, ctx: DeviceContext) raises -> Tensor:
+    return cast_tensor(t, STDtype.F32, ctx)
+
+
+# Local F32→bf16 cast to re-enter the bf16 chain after an F32-only op.
+def _to_bf16(t: Tensor, ctx: DeviceContext) raises -> Tensor:
+    return cast_tensor(t, STDtype.BF16, ctx)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -202,16 +240,16 @@ struct StreamWeights(Copyable, Movable):
         var q_norm: List[Float32], var k_norm: List[Float32],
         D: Int, Fmlp: Int, Dh: Int, ctx: DeviceContext,
     ) raises:
-        self.wqkv = TArc(Tensor.from_host(wqkv^, [3 * D, D], STDtype.F32, ctx))
-        self.bqkv = TArc(Tensor.from_host(bqkv^, [3 * D], STDtype.F32, ctx))
-        self.wproj = TArc(Tensor.from_host(wproj^, [D, D], STDtype.F32, ctx))
-        self.bproj = TArc(Tensor.from_host(bproj^, [D], STDtype.F32, ctx))
-        self.wmlp0 = TArc(Tensor.from_host(wmlp0^, [Fmlp, D], STDtype.F32, ctx))
-        self.bmlp0 = TArc(Tensor.from_host(bmlp0^, [Fmlp], STDtype.F32, ctx))
-        self.wmlp2 = TArc(Tensor.from_host(wmlp2^, [D, Fmlp], STDtype.F32, ctx))
-        self.bmlp2 = TArc(Tensor.from_host(bmlp2^, [D], STDtype.F32, ctx))
-        self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.F32, ctx))
-        self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.F32, ctx))
+        self.wqkv = TArc(Tensor.from_host(wqkv^, [3 * D, D], STDtype.BF16, ctx))
+        self.bqkv = TArc(Tensor.from_host(bqkv^, [3 * D], STDtype.BF16, ctx))
+        self.wproj = TArc(Tensor.from_host(wproj^, [D, D], STDtype.BF16, ctx))
+        self.bproj = TArc(Tensor.from_host(bproj^, [D], STDtype.BF16, ctx))
+        self.wmlp0 = TArc(Tensor.from_host(wmlp0^, [Fmlp, D], STDtype.BF16, ctx))
+        self.bmlp0 = TArc(Tensor.from_host(bmlp0^, [Fmlp], STDtype.BF16, ctx))
+        self.wmlp2 = TArc(Tensor.from_host(wmlp2^, [D, Fmlp], STDtype.BF16, ctx))
+        self.bmlp2 = TArc(Tensor.from_host(bmlp2^, [D], STDtype.BF16, ctx))
+        self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.BF16, ctx))
+        self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.BF16, ctx))
 
 
 struct DoubleBlockWeights(Copyable, Movable):
@@ -223,27 +261,27 @@ struct DoubleBlockWeights(Copyable, Movable):
         self.txt = txt^
 
 
-# ── DOUBLE block saved activations (host F32; recompute-free backward) ────────
+# ── DOUBLE block saved activations (host BF16; half the bytes of F32) ────────
 struct StreamSaved(Copyable, Movable):
-    var x: List[Float32]        # [N,D]
-    var ln1: List[Float32]      # [N,D]   layer_norm(x)
-    var norm: List[Float32]     # [N,D]   modulate(ln1, scale1, shift1)
-    var q_pre: List[Float32]    # [1,N,H,Dh]
-    var k_pre: List[Float32]    # [1,N,H,Dh]
-    var att: List[Float32]      # [N,D]   per-stream attention slice
-    var attn_res: List[Float32] # [N,D]
-    var ln2: List[Float32]      # [N,D]   layer_norm(attn_res)
-    var mlp_in: List[Float32]   # [N,D]   modulate(ln2, scale2, shift2)
-    var mlp_pre: List[Float32]  # [N,Fmlp]  linear(mlp_in, Wmlp0)+b  (gelu input)
-    var mlp_h: List[Float32]    # [N,Fmlp]  gelu(mlp_pre)
+    var x: List[BFloat16]        # [N,D]
+    var ln1: List[BFloat16]      # [N,D]   layer_norm(x)
+    var norm: List[BFloat16]     # [N,D]   modulate(ln1, scale1, shift1)
+    var q_pre: List[BFloat16]    # [1,N,H,Dh]
+    var k_pre: List[BFloat16]    # [1,N,H,Dh]
+    var att: List[BFloat16]      # [N,D]   per-stream attention slice
+    var attn_res: List[BFloat16] # [N,D]
+    var ln2: List[BFloat16]      # [N,D]   layer_norm(attn_res)
+    var mlp_in: List[BFloat16]   # [N,D]   modulate(ln2, scale2, shift2)
+    var mlp_pre: List[BFloat16]  # [N,Fmlp]  linear(mlp_in, Wmlp0)+b  (gelu input)
+    var mlp_h: List[BFloat16]    # [N,Fmlp]  gelu(mlp_pre)
 
     def __init__(
         out self,
-        var x: List[Float32], var ln1: List[Float32], var norm: List[Float32],
-        var q_pre: List[Float32], var k_pre: List[Float32],
-        var att: List[Float32], var attn_res: List[Float32],
-        var ln2: List[Float32], var mlp_in: List[Float32],
-        var mlp_pre: List[Float32], var mlp_h: List[Float32],
+        var x: List[BFloat16], var ln1: List[BFloat16], var norm: List[BFloat16],
+        var q_pre: List[BFloat16], var k_pre: List[BFloat16],
+        var att: List[BFloat16], var attn_res: List[BFloat16],
+        var ln2: List[BFloat16], var mlp_in: List[BFloat16],
+        var mlp_pre: List[BFloat16], var mlp_h: List[BFloat16],
     ):
         self.x = x^
         self.ln1 = ln1^
@@ -261,13 +299,13 @@ struct StreamSaved(Copyable, Movable):
 struct DoubleBlockSaved(Copyable, Movable):
     var img: StreamSaved
     var txt: StreamSaved
-    var q_rope: List[Float32]   # [1,S,H,Dh]
-    var k_rope: List[Float32]
-    var v_joint: List[Float32]  # [1,S,H,Dh]
+    var q_rope: List[BFloat16]   # [1,S,H,Dh]
+    var k_rope: List[BFloat16]
+    var v_joint: List[BFloat16]  # [1,S,H,Dh]
 
     def __init__(
         out self, var img: StreamSaved, var txt: StreamSaved,
-        var q_rope: List[Float32], var k_rope: List[Float32], var v_joint: List[Float32],
+        var q_rope: List[BFloat16], var k_rope: List[BFloat16], var v_joint: List[BFloat16],
     ):
         self.img = img^
         self.txt = txt^
@@ -451,6 +489,9 @@ def double_block_forward[
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
     var zeros_t = _t(_zeros(D), [D], ctx)
+    # rope tables in bf16 to match the bf16 q/k for the native bf16 rope/sdpa path.
+    var cos_b = _to_bf16(cos, ctx)
+    var sin_b = _to_bf16(sin, ctx)
 
     var img_x = _t(img, [N_IMG, D], ctx)
     var txt_x = _t(txt, [N_TXT, D], ctx)
@@ -463,8 +504,8 @@ def double_block_forward[
     var k = concat(1, ctx, tp.k_rms, ip.k_rms)
     var v = concat(1, ctx, tp.v, ip.v)
 
-    var q_rope = rope_interleaved(q, cos, sin, ctx)
-    var k_rope = rope_interleaved(k, cos, sin, ctx)
+    var q_rope = rope_interleaved(q, cos_b, sin_b, ctx)
+    var k_rope = rope_interleaved(k, cos_b, sin_b, ctx)
     var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)   # [1,S,H,Dh]
 
     var txt_att_4d = slice(att, 1, 0, N_TXT, ctx)
@@ -476,22 +517,22 @@ def double_block_forward[
     var tpost = _stream_post(txt_x, txt_att, w.txt, txt_mod, N_TXT, D, Fmlp, eps, ones_t, zeros_t, ctx)
 
     var img_saved = StreamSaved(
-        img.copy(), ip.ln1.to_host(ctx), ip.norm.to_host(ctx),
-        ip.q_pre.to_host(ctx), ip.k_pre.to_host(ctx),
-        img_att.to_host(ctx), ipost.attn_res.to_host(ctx),
-        ipost.ln2.to_host(ctx), ipost.mlp_in.to_host(ctx),
-        ipost.mlp_pre.to_host(ctx), ipost.mlp_h.to_host(ctx),
+        _f32_to_bf16(img), ip.ln1.to_host_bf16(ctx), ip.norm.to_host_bf16(ctx),
+        ip.q_pre.to_host_bf16(ctx), ip.k_pre.to_host_bf16(ctx),
+        img_att.to_host_bf16(ctx), ipost.attn_res.to_host_bf16(ctx),
+        ipost.ln2.to_host_bf16(ctx), ipost.mlp_in.to_host_bf16(ctx),
+        ipost.mlp_pre.to_host_bf16(ctx), ipost.mlp_h.to_host_bf16(ctx),
     )
     var txt_saved = StreamSaved(
-        txt.copy(), tp.ln1.to_host(ctx), tp.norm.to_host(ctx),
-        tp.q_pre.to_host(ctx), tp.k_pre.to_host(ctx),
-        txt_att.to_host(ctx), tpost.attn_res.to_host(ctx),
-        tpost.ln2.to_host(ctx), tpost.mlp_in.to_host(ctx),
-        tpost.mlp_pre.to_host(ctx), tpost.mlp_h.to_host(ctx),
+        _f32_to_bf16(txt), tp.ln1.to_host_bf16(ctx), tp.norm.to_host_bf16(ctx),
+        tp.q_pre.to_host_bf16(ctx), tp.k_pre.to_host_bf16(ctx),
+        txt_att.to_host_bf16(ctx), tpost.attn_res.to_host_bf16(ctx),
+        tpost.ln2.to_host_bf16(ctx), tpost.mlp_in.to_host_bf16(ctx),
+        tpost.mlp_pre.to_host_bf16(ctx), tpost.mlp_h.to_host_bf16(ctx),
     )
     var saved = DoubleBlockSaved(
         img_saved^, txt_saved^,
-        q_rope.to_host(ctx), k_rope.to_host(ctx), v.to_host(ctx),
+        q_rope.to_host_bf16(ctx), k_rope.to_host_bf16(ctx), v.to_host_bf16(ctx),
     )
 
     var img_out = ipost.out.to_host(ctx)
@@ -541,49 +582,59 @@ def _stream_post_backward(
     w: StreamWeights, mv: ModVecs, sv: StreamSaved,
     N: Int, D: Int, Fmlp: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
 ) raises -> _StreamPostBack:
-    # final = residual_gate(attn_res, gate2, mlp): o = attn_res + gate2*mlp
-    var attn_res_t = _t(sv.attn_res.copy(), [N, D], ctx)
-    var mlp_h_t = _t(sv.mlp_h.copy(), [N, Fmlp], ctx)
+    # All saved acts re-uploaded as BF16 device → bf16-native backward matmuls.
+    # d_out is F32 (the upstream grad); gate_residual_backward needs grad_out + gate F32.
+    var attn_res_t = _tb16(sv.attn_res.copy(), [N, D], ctx)
+    var mlp_h_t = _tb16(sv.mlp_h.copy(), [N, Fmlp], ctx)
     var b2 = Optional[Tensor](w.bmlp2[].clone(ctx))
-    var mlp_y = linear(mlp_h_t, w.wmlp2[], b2, ctx)
-    var grg2 = gate_residual_backward(d_out, attn_res_t, _t(mv.gate2.copy(), [D], ctx), mlp_y, ctx)
+    var mlp_y = linear(mlp_h_t, w.wmlp2[], b2, ctx)            # bf16
+    # F32-ONLY: gate_residual_backward grad_out/gate must be F32 (x/y may be bf16).
+    var grg2 = gate_residual_backward(
+        d_out, attn_res_t, _tf32(mv.gate2.copy(), [D], ctx), mlp_y, ctx
+    )
     var d_gate2 = grg2.d_g.to_host(ctx)
+    # grg2.d_y is F32 → cast to bf16 to feed the bf16 backward matmul chain.
+    var d_y2_b = _to_bf16(grg2.d_y, ctx)
 
     # mlp = linear(mlp_h, Wmlp2, bmlp2)
-    var lb_mlp2 = linear_backward(grg2.d_y, mlp_h_t, w.wmlp2[], N, Fmlp, D, ctx)
+    var lb_mlp2 = linear_backward(d_y2_b, mlp_h_t, w.wmlp2[], N, Fmlp, D, ctx)
     var d_wmlp2 = lb_mlp2.d_w.to_host(ctx)
     var d_bmlp2 = lb_mlp2.d_b.to_host(ctx)
 
     # mlp_h = gelu(mlp_pre)
-    var mlp_pre_t = _t(sv.mlp_pre.copy(), [N, Fmlp], ctx)
-    var d_mlp_pre = gelu_backward(lb_mlp2.d_x, mlp_pre_t, ctx)
+    var mlp_pre_t = _tb16(sv.mlp_pre.copy(), [N, Fmlp], ctx)
+    var d_mlp_pre = gelu_backward(lb_mlp2.d_x, mlp_pre_t, ctx)  # bf16
 
     # mlp_pre = linear(mlp_in, Wmlp0, bmlp0)
-    var mlp_in_t = _t(sv.mlp_in.copy(), [N, D], ctx)
+    var mlp_in_t = _tb16(sv.mlp_in.copy(), [N, D], ctx)
     var lb_mlp0 = linear_backward(d_mlp_pre, mlp_in_t, w.wmlp0[], N, D, Fmlp, ctx)
     var d_wmlp0 = lb_mlp0.d_w.to_host(ctx)
     var d_bmlp0 = lb_mlp0.d_b.to_host(ctx)
 
     # mlp_in = modulate(ln2, scale2, shift2)
-    var ln2_t = _t(sv.ln2.copy(), [N, D], ctx)
+    var ln2_t = _tb16(sv.ln2.copy(), [N, D], ctx)
     var mb2 = modulate_backward(lb_mlp0.d_x, ln2_t, _t(mv.scale2.copy(), [D], ctx), ctx)
     var d_scale2 = mb2.d_scale.to_host(ctx)
     var d_shift2 = mb2.d_shift.to_host(ctx)
 
     # ln2 = layer_norm(attn_res, 1, 0)
-    var lnb2 = layer_norm_backward(mb2.d_x, attn_res_t, ones, eps, ctx)
-    # attn_res feeds BOTH the residual (grg2.d_x) AND ln2 -> SUM on device.
-    var d_attn_res_total = add(grg2.d_x, lnb2.d_x, ctx)
+    var lnb2 = layer_norm_backward(mb2.d_x, attn_res_t, ones, eps, ctx)  # bf16
+    # attn_res feeds BOTH the residual (grg2.d_x F32) AND ln2 (bf16) -> SUM (bf16).
+    var d_attn_res_total = add(_to_bf16(grg2.d_x, ctx), lnb2.d_x, ctx)
+    # gate_residual_backward grad_out must be F32 again.
+    var d_attn_res_f32 = _to_f32(d_attn_res_total, ctx)
 
     # attn_res = residual_gate(x, gate1, proj_out): o = x + gate1*proj_out
     var bp = Optional[Tensor](w.bproj[].clone(ctx))
-    var proj_out = linear(att, w.wproj[], bp, ctx)   # recompute proj output
-    var grg1 = gate_residual_backward(d_attn_res_total, x, _t(mv.gate1.copy(), [D], ctx), proj_out, ctx)
+    var proj_out = linear(att, w.wproj[], bp, ctx)   # recompute proj output (bf16)
+    var grg1 = gate_residual_backward(
+        d_attn_res_f32, x, _tf32(mv.gate1.copy(), [D], ctx), proj_out, ctx
+    )
     var d_gate1 = grg1.d_g.to_host(ctx)
     var d_x_res = grg1.d_x.to_host(ctx)
 
     # proj_out = linear(att, Wproj, bproj)
-    var lb_p = linear_backward(grg1.d_y, att, w.wproj[], N, D, D, ctx)
+    var lb_p = linear_backward(_to_bf16(grg1.d_y, ctx), att, w.wproj[], N, D, D, ctx)
     var d_wproj = lb_p.d_w.to_host(ctx)
     var d_bproj = lb_p.d_b.to_host(ctx)
     var d_att = lb_p.d_x.to_host(ctx)
@@ -627,32 +678,37 @@ def _stream_pre_backward[
     w: StreamWeights, mv: ModVecs, sv: StreamSaved,
     N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
 ) raises -> _StreamPreBack:
-    var q_pre_t = _t(sv.q_pre.copy(), [1, N, H, Dh], ctx)
-    var k_pre_t = _t(sv.k_pre.copy(), [1, N, H, Dh], ctx)
-    var rb_q = rms_norm_backward(d_q_rms, q_pre_t, w.q_norm[], eps, ctx)
+    # Incoming grads (cat_backward outputs) are F32; cast to bf16 to keep the
+    # pre-attention backward bf16-native and dtype-consistent with the bf16 saved acts.
+    var dq_b = _to_bf16(d_q_rms, ctx)
+    var dk_b = _to_bf16(d_k_rms, ctx)
+    var dv_b = _to_bf16(d_v, ctx)
+    var q_pre_t = _tb16(sv.q_pre.copy(), [1, N, H, Dh], ctx)
+    var k_pre_t = _tb16(sv.k_pre.copy(), [1, N, H, Dh], ctx)
+    var rb_q = rms_norm_backward(dq_b, q_pre_t, w.q_norm[], eps, ctx)  # bf16
     var d_q_norm = rb_q.d_g.to_host(ctx)
-    var rb_k = rms_norm_backward(d_k_rms, k_pre_t, w.k_norm[], eps, ctx)
+    var rb_k = rms_norm_backward(dk_b, k_pre_t, w.k_norm[], eps, ctx)  # bf16
     var d_k_norm = rb_k.d_g.to_host(ctx)
 
     reshape_in_place(rb_q.d_x, [N, D])
     reshape_in_place(rb_k.d_x, [N, D])
-    var d_v_flat = reshape(d_v, [N, D], ctx)
-    var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, d_v_flat)   # [N,3D]
+    var d_v_flat = reshape(dv_b, [N, D], ctx)
+    var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, d_v_flat)   # [N,3D] bf16
 
     # qkv = linear(norm, Wqkv, bqkv)
-    var norm_t = _t(sv.norm.copy(), [N, D], ctx)
+    var norm_t = _tb16(sv.norm.copy(), [N, D], ctx)
     var lb_qkv = linear_backward(d_qkv, norm_t, w.wqkv[], N, D, 3 * D, ctx)
     var d_wqkv = lb_qkv.d_w.to_host(ctx)
     var d_bqkv = lb_qkv.d_b.to_host(ctx)
 
     # norm = modulate(ln1, scale1, shift1)
-    var ln1_t = _t(sv.ln1.copy(), [N, D], ctx)
+    var ln1_t = _tb16(sv.ln1.copy(), [N, D], ctx)
     var mb1 = modulate_backward(lb_qkv.d_x, ln1_t, _t(mv.scale1.copy(), [D], ctx), ctx)
     var d_scale1 = mb1.d_scale.to_host(ctx)
     var d_shift1 = mb1.d_shift.to_host(ctx)
 
     # ln1 = layer_norm(x, 1, 0)
-    var x_t = _t(sv.x.copy(), [N, D], ctx)
+    var x_t = _tb16(sv.x.copy(), [N, D], ctx)
     var lnb1 = layer_norm_backward(mb1.d_x, x_t, ones, eps, ctx)
     var d_x_norm = lnb1.d_x.to_host(ctx)
     return _StreamPreBack(d_x_norm^, d_wqkv^, d_bqkv^, d_q_norm^, d_k_norm^, d_shift1^, d_scale1^)
@@ -671,13 +727,14 @@ def double_block_backward[
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
 
-    var d_io_t = _t(d_img_out, [N_IMG, D], ctx)
-    var d_to_t = _t(d_txt_out, [N_TXT, D], ctx)
+    # Upstream output grads stay F32 — gate_residual_backward needs grad_out F32.
+    var d_io_t = _tf32(d_img_out, [N_IMG, D], ctx)
+    var d_to_t = _tf32(d_txt_out, [N_TXT, D], ctx)
 
-    var img_x = _t(saved.img.x.copy(), [N_IMG, D], ctx)
-    var txt_x = _t(saved.txt.x.copy(), [N_TXT, D], ctx)
-    var img_att = _t(saved.img.att.copy(), [N_IMG, D], ctx)
-    var txt_att = _t(saved.txt.att.copy(), [N_TXT, D], ctx)
+    var img_x = _tb16(saved.img.x.copy(), [N_IMG, D], ctx)
+    var txt_x = _tb16(saved.txt.x.copy(), [N_TXT, D], ctx)
+    var img_att = _tb16(saved.img.att.copy(), [N_IMG, D], ctx)
+    var txt_att = _tb16(saved.txt.att.copy(), [N_TXT, D], ctx)
 
     var ipb = _stream_post_backward(
         d_io_t, img_x, img_att, w.img, img_mod, saved.img, N_IMG, D, Fmlp, eps, ones_t, ctx
@@ -687,24 +744,26 @@ def double_block_backward[
     )
 
     # join per-stream attention-slice grads back into joint d_att (txt FIRST).
+    # _t uploads bf16 → matches the bf16 q_rope/k_rope/v for sdpa_backward.
     var d_tatt_4d = _t(tpb.d_att.copy(), [1, N_TXT, H, Dh], ctx)
     var d_iatt_4d = _t(ipb.d_att.copy(), [1, N_IMG, H, Dh], ctx)
-    var d_att_joint = concat(1, ctx, d_tatt_4d, d_iatt_4d)   # [1,S,H,Dh]
+    var d_att_joint = concat(1, ctx, d_tatt_4d, d_iatt_4d)   # [1,S,H,Dh] bf16
 
-    # sdpa backward (JOINT)
-    var q_rope_t = _t(saved.q_rope.copy(), [1, S, H, Dh], ctx)
-    var k_rope_t = _t(saved.k_rope.copy(), [1, S, H, Dh], ctx)
-    var v_joint_t = _t(saved.v_joint.copy(), [1, S, H, Dh], ctx)
+    # sdpa backward (JOINT) — bf16-native (q/k/v/d_out all bf16).
+    var q_rope_t = _tb16(saved.q_rope.copy(), [1, S, H, Dh], ctx)
+    var k_rope_t = _tb16(saved.k_rope.copy(), [1, S, H, Dh], ctx)
+    var v_joint_t = _tb16(saved.v_joint.copy(), [1, S, H, Dh], ctx)
     var sb = sdpa_backward[1, S, H, Dh](q_rope_t, k_rope_t, v_joint_t, d_att_joint, scale, ctx)
 
-    # rope backward (cos/sin non-learnable)
-    var d_q_joint = rope_backward(sb.d_q, cos, sin, True, ctx)
-    var d_k_joint = rope_backward(sb.d_k, cos, sin, True, ctx)
+    # F32-ONLY: rope_backward needs grad + cos/sin F32. sb.d_q/d_k are bf16 → cast up.
+    var d_q_joint = rope_backward(_to_f32(sb.d_q, ctx), cos, sin, True, ctx)
+    var d_k_joint = rope_backward(_to_f32(sb.d_k, ctx), cos, sin, True, ctx)
 
-    # split joint q/k/v grads back per stream (txt FIRST) along axis=1
+    # F32-ONLY: cat_backward needs F32 grad. d_q_joint/d_k_joint already F32;
+    # sb.d_v is bf16 → cast up.
     var cq = cat_backward(d_q_joint, N_TXT, N_IMG, 1, ctx)
     var ck = cat_backward(d_k_joint, N_TXT, N_IMG, 1, ctx)
-    var cv = cat_backward(sb.d_v, N_TXT, N_IMG, 1, ctx)
+    var cv = cat_backward(_to_f32(sb.d_v, ctx), N_TXT, N_IMG, 1, ctx)
 
     var iprb = _stream_pre_backward[H, Dh](
         cq.d_1, ck.d_1, cv.d_1, w.img, img_mod, saved.img, N_IMG, D, eps, ones_t, ctx
@@ -760,35 +819,35 @@ struct SingleBlockWeights(Copyable, Movable):
         var q_norm: List[Float32], var k_norm: List[Float32],
         D: Int, Fmlp: Int, Dh: Int, ctx: DeviceContext,
     ) raises:
-        self.w1 = TArc(Tensor.from_host(w1^, [3 * D + Fmlp, D], STDtype.F32, ctx))
-        self.b1 = TArc(Tensor.from_host(b1^, [3 * D + Fmlp], STDtype.F32, ctx))
-        self.w2 = TArc(Tensor.from_host(w2^, [D, D + Fmlp], STDtype.F32, ctx))
-        self.b2 = TArc(Tensor.from_host(b2^, [D], STDtype.F32, ctx))
-        self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.F32, ctx))
-        self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.F32, ctx))
+        self.w1 = TArc(Tensor.from_host(w1^, [3 * D + Fmlp, D], STDtype.BF16, ctx))
+        self.b1 = TArc(Tensor.from_host(b1^, [3 * D + Fmlp], STDtype.BF16, ctx))
+        self.w2 = TArc(Tensor.from_host(w2^, [D, D + Fmlp], STDtype.BF16, ctx))
+        self.b2 = TArc(Tensor.from_host(b2^, [D], STDtype.BF16, ctx))
+        self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.BF16, ctx))
+        self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.BF16, ctx))
 
 
 struct SingleBlockSaved(Copyable, Movable):
-    var x: List[Float32]        # [S,D]
-    var ln: List[Float32]       # [S,D]
-    var norm: List[Float32]     # [S,D]
-    var q_pre: List[Float32]    # [1,S,H,Dh]
-    var k_pre: List[Float32]
-    var q_rope: List[Float32]   # [1,S,H,Dh]
-    var k_rope: List[Float32]
-    var v: List[Float32]        # [1,S,H,Dh]
-    var att_flat: List[Float32] # [S,D]
-    var mlp_in: List[Float32]   # [S,Fmlp]  gelu input (= fused[:, 3D:])
-    var mlp_h: List[Float32]    # [S,Fmlp]  gelu output
-    var out_in: List[Float32]   # [S, D+Fmlp]  concat(att_flat, mlp_h)
+    var x: List[BFloat16]        # [S,D]
+    var ln: List[BFloat16]       # [S,D]
+    var norm: List[BFloat16]     # [S,D]
+    var q_pre: List[BFloat16]    # [1,S,H,Dh]
+    var k_pre: List[BFloat16]
+    var q_rope: List[BFloat16]   # [1,S,H,Dh]
+    var k_rope: List[BFloat16]
+    var v: List[BFloat16]        # [1,S,H,Dh]
+    var att_flat: List[BFloat16] # [S,D]
+    var mlp_in: List[BFloat16]   # [S,Fmlp]  gelu input (= fused[:, 3D:])
+    var mlp_h: List[BFloat16]    # [S,Fmlp]  gelu output
+    var out_in: List[BFloat16]   # [S, D+Fmlp]  concat(att_flat, mlp_h)
 
     def __init__(
         out self,
-        var x: List[Float32], var ln: List[Float32], var norm: List[Float32],
-        var q_pre: List[Float32], var k_pre: List[Float32],
-        var q_rope: List[Float32], var k_rope: List[Float32], var v: List[Float32],
-        var att_flat: List[Float32],
-        var mlp_in: List[Float32], var mlp_h: List[Float32], var out_in: List[Float32],
+        var x: List[BFloat16], var ln: List[BFloat16], var norm: List[BFloat16],
+        var q_pre: List[BFloat16], var k_pre: List[BFloat16],
+        var q_rope: List[BFloat16], var k_rope: List[BFloat16], var v: List[BFloat16],
+        var att_flat: List[BFloat16],
+        var mlp_in: List[BFloat16], var mlp_h: List[BFloat16], var out_in: List[BFloat16],
     ):
         self.x = x^
         self.ln = ln^
@@ -858,6 +917,8 @@ def single_block_forward[
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
     var zeros_t = _t(_zeros(D), [D], ctx)
+    var cos_b = _to_bf16(cos, ctx)
+    var sin_b = _to_bf16(sin, ctx)
 
     var x_t = _t(x, [S, D], ctx)
     var ln_t = layer_norm(x_t, ones_t, zeros_t, eps, ctx)
@@ -879,8 +940,8 @@ def single_block_forward[
     var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
     var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
 
-    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
-    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+    var q_rope = rope_interleaved(q_rms, cos_b, sin_b, ctx)
+    var k_rope = rope_interleaved(k_rms, cos_b, sin_b, ctx)
     var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
     var att_flat = reshape_owned(att^, [S, D])
 
@@ -894,11 +955,11 @@ def single_block_forward[
     var result = residual_gate(x_t, _t(mv.gate.copy(), [D], ctx), out_proj, ctx)
 
     var saved = SingleBlockSaved(
-        x.copy(), ln_t.to_host(ctx), norm_t.to_host(ctx),
-        q_pre.to_host(ctx), k_pre.to_host(ctx),
-        q_rope.to_host(ctx), k_rope.to_host(ctx), v.to_host(ctx),
-        att_flat.to_host(ctx),
-        mlp_in.to_host(ctx), mlp_h.to_host(ctx), out_in.to_host(ctx),
+        _f32_to_bf16(x), ln_t.to_host_bf16(ctx), norm_t.to_host_bf16(ctx),
+        q_pre.to_host_bf16(ctx), k_pre.to_host_bf16(ctx),
+        q_rope.to_host_bf16(ctx), k_rope.to_host_bf16(ctx), v.to_host_bf16(ctx),
+        att_flat.to_host_bf16(ctx),
+        mlp_in.to_host_bf16(ctx), mlp_h.to_host_bf16(ctx), out_in.to_host_bf16(ctx),
     )
     return SingleBlockForward(result.to_host(ctx), saved^)
 
@@ -915,69 +976,74 @@ def single_block_backward[
 ) raises -> SingleBlockGrads:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var ones_t = _t(_ones(D), [D], ctx)
-    var scale_t = _t(mv.scale.copy(), [D], ctx)
-    var gate_t = _t(mv.gate.copy(), [D], ctx)
+    var scale_t = _t(mv.scale.copy(), [D], ctx)       # bf16 for modulate_backward
+    var gate_t_f32 = _tf32(mv.gate.copy(), [D], ctx)  # F32 for gate_residual_backward
 
-    var d_out_t = _t(d_out, [S, D], ctx)
-    var x_t = _t(saved.x.copy(), [S, D], ctx)
-    var out_in_t = _t(saved.out_in.copy(), [S, D + Fmlp], ctx)
+    var d_out_t = _tf32(d_out, [S, D], ctx)           # F32 (gate_residual_backward grad_out)
+    var x_t = _tb16(saved.x.copy(), [S, D], ctx)      # bf16 saved act
+    var out_in_t = _tb16(saved.out_in.copy(), [S, D + Fmlp], ctx)
 
     # result = residual_gate(x, gate, out): o = x + gate*out
+    # F32-ONLY: gate_residual_backward grad_out/gate F32 (x/y may be bf16).
     var b2 = Optional[Tensor](w.b2[].clone(ctx))
-    var out_y = linear(out_in_t, w.w2[], b2, ctx)
-    var grg = gate_residual_backward(d_out_t, x_t, gate_t, out_y, ctx)
+    var out_y = linear(out_in_t, w.w2[], b2, ctx)     # bf16
+    var grg = gate_residual_backward(d_out_t, x_t, gate_t_f32, out_y, ctx)
     var d_gate = grg.d_g.to_host(ctx)
 
-    # out = linear(out_in, W2, b2)
-    var lb_w2 = linear_backward(grg.d_y, out_in_t, w.w2[], S, D + Fmlp, D, ctx)
+    # out = linear(out_in, W2, b2) — grg.d_y is F32 → bf16 for the matmul chain.
+    var lb_w2 = linear_backward(_to_bf16(grg.d_y, ctx), out_in_t, w.w2[], S, D + Fmlp, D, ctx)
     var d_w2 = lb_w2.d_w.to_host(ctx)
     var d_b2 = lb_w2.d_b.to_host(ctx)
 
-    # out_in = concat(axis=2, att_flat, mlp_h) on the CHANNEL axis (sizes D, Fmlp)
-    reshape_in_place(lb_w2.d_x, [1, S, D + Fmlp])
-    var cb = cat_backward(lb_w2.d_x, D, Fmlp, 2, ctx)
+    # out_in = concat(axis=2, att_flat, mlp_h). F32-ONLY: cat_backward needs F32 grad.
+    var dx_w2_f32 = _to_f32(lb_w2.d_x, ctx)
+    reshape_in_place(dx_w2_f32, [1, S, D + Fmlp])
+    var cb = cat_backward(dx_w2_f32, D, Fmlp, 2, ctx)   # F32 outputs
     reshape_in_place(cb.d_0, [1, S, H, Dh])   # [1,S,D] == [1,S,H,Dh]
     reshape_in_place(cb.d_1, [S, Fmlp])       # [1,S,Fmlp] == [S,Fmlp]
+    # back to bf16 for the bf16-native arms.
+    var d_att_flat_b = _to_bf16(cb.d_0, ctx)
+    var d_mlp_h_b = _to_bf16(cb.d_1, ctx)
 
     # mlp_h = gelu(mlp_in)
-    var mlp_in_t = _t(saved.mlp_in.copy(), [S, Fmlp], ctx)
-    var d_mlp_in = gelu_backward(cb.d_1, mlp_in_t, ctx)   # [S,Fmlp]
+    var mlp_in_t = _tb16(saved.mlp_in.copy(), [S, Fmlp], ctx)
+    var d_mlp_in = gelu_backward(d_mlp_h_b, mlp_in_t, ctx)   # [S,Fmlp] bf16
 
-    # att branch: d_att_flat [1,S,H,Dh] -> sdpa backward
-    var q_rope_t = _t(saved.q_rope.copy(), [1, S, H, Dh], ctx)
-    var k_rope_t = _t(saved.k_rope.copy(), [1, S, H, Dh], ctx)
-    var v_t = _t(saved.v.copy(), [1, S, H, Dh], ctx)
-    var sb = sdpa_backward[1, S, H, Dh](q_rope_t, k_rope_t, v_t, cb.d_0, scale, ctx)
+    # att branch: d_att_flat [1,S,H,Dh] -> sdpa backward (bf16-native).
+    var q_rope_t = _tb16(saved.q_rope.copy(), [1, S, H, Dh], ctx)
+    var k_rope_t = _tb16(saved.k_rope.copy(), [1, S, H, Dh], ctx)
+    var v_t = _tb16(saved.v.copy(), [1, S, H, Dh], ctx)
+    var sb = sdpa_backward[1, S, H, Dh](q_rope_t, k_rope_t, v_t, d_att_flat_b, scale, ctx)
 
-    # rope backward (cos/sin non-learnable)
-    var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
-    var d_k_rms = rope_backward(sb.d_k, cos, sin, True, ctx)
+    # F32-ONLY: rope_backward grad + cos/sin F32. sb.d_q/d_k bf16 → cast up.
+    var d_q_rms = rope_backward(_to_f32(sb.d_q, ctx), cos, sin, True, ctx)  # F32
+    var d_k_rms = rope_backward(_to_f32(sb.d_k, ctx), cos, sin, True, ctx)  # F32
 
-    # rms_norm backward for q and k
-    var q_pre_t = _t(saved.q_pre.copy(), [1, S, H, Dh], ctx)
-    var k_pre_t = _t(saved.k_pre.copy(), [1, S, H, Dh], ctx)
-    var rb_q = rms_norm_backward(d_q_rms, q_pre_t, w.q_norm[], eps, ctx)
+    # rms_norm backward for q and k (back to bf16 to keep the chain bf16-native).
+    var q_pre_t = _tb16(saved.q_pre.copy(), [1, S, H, Dh], ctx)
+    var k_pre_t = _tb16(saved.k_pre.copy(), [1, S, H, Dh], ctx)
+    var rb_q = rms_norm_backward(_to_bf16(d_q_rms, ctx), q_pre_t, w.q_norm[], eps, ctx)
     var d_q_norm = rb_q.d_g.to_host(ctx)
-    var rb_k = rms_norm_backward(d_k_rms, k_pre_t, w.k_norm[], eps, ctx)
+    var rb_k = rms_norm_backward(_to_bf16(d_k_rms, ctx), k_pre_t, w.k_norm[], eps, ctx)
     var d_k_norm = rb_k.d_g.to_host(ctx)
 
-    # join d_q_pre|d_k_pre|d_v into d_qkv [S,3D]
+    # join d_q_pre|d_k_pre|d_v into d_qkv [S,3D] (all bf16). sb.d_v is bf16.
     reshape_in_place(rb_q.d_x, [S, D])
     reshape_in_place(rb_k.d_x, [S, D])
     reshape_in_place(sb.d_v, [S, D])
-    var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, sb.d_v)   # [S,3D]
+    var d_qkv = concat(1, ctx, rb_q.d_x, rb_k.d_x, sb.d_v)   # [S,3D] bf16
 
     # join the qkv grad and mlp_in grad back into d_fused [S, 3D+Fmlp]
-    var d_fused = concat(1, ctx, d_qkv, d_mlp_in)
+    var d_fused = concat(1, ctx, d_qkv, d_mlp_in)            # bf16
 
     # fused = linear(norm, W1, b1)
-    var norm_t = _t(saved.norm.copy(), [S, D], ctx)
+    var norm_t = _tb16(saved.norm.copy(), [S, D], ctx)
     var lb_w1 = linear_backward(d_fused, norm_t, w.w1[], S, D, 3 * D + Fmlp, ctx)
     var d_w1 = lb_w1.d_w.to_host(ctx)
     var d_b1 = lb_w1.d_b.to_host(ctx)
 
-    # norm = modulate(ln, scale, shift)
-    var ln_t = _t(saved.ln.copy(), [S, D], ctx)
+    # norm = modulate(ln, scale, shift)  (lb_w1.d_x, ln_t, scale_t all bf16)
+    var ln_t = _tb16(saved.ln.copy(), [S, D], ctx)
     var mb = modulate_backward(lb_w1.d_x, ln_t, scale_t, ctx)
     var d_scale = mb.d_scale.to_host(ctx)
     var d_shift = mb.d_shift.to_host(ctx)
@@ -985,7 +1051,7 @@ def single_block_backward[
     # ln = layer_norm(x, 1, 0)
     var lnb = layer_norm_backward(mb.d_x, x_t, ones_t, eps, ctx)
 
-    # x feeds BOTH the residual (grg.d_x) AND layer_norm(x) -> SUM.
+    # x feeds BOTH the residual (grg.d_x) AND layer_norm(x) -> SUM (host F32).
     var d_x_res = grg.d_x.to_host(ctx)
     var d_x_norm = lnb.d_x.to_host(ctx)
     var d_x = _add_lists(d_x_res, d_x_norm)

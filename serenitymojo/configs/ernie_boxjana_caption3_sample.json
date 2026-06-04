@@ -1,0 +1,27 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 0,
+    "sample_at_start": false,
+    "save_before_sample": false,
+    "precache_required": true,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 8,
+    "cfg": 4.0,
+    "seed": 44,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "boxjana_caption3_beach_photo",
+      "prompt": "box1jana, a photograph featuring a box1jana with a light skin tone and straight, dark brown hair, she has a confident, slightly mischievous expression, with a wide, inviting smile revealing white teeth, her eyes are large and almond-shaped, framed by thick, dark eyelashes, she is wearing a light pink, knitted sweater with a high collar and gold buttons, which add a touch of elegance to her casual attire, the sweater is slightly oversized, revealing her shoulders and upper arms, she also wears a gold necklace with a small pendant, the background shows a beach scene with a clear blue ocean and a distant mountain range, suggesting a serene, coastal setting, the beach is sandy, and the sky is a gradient of soft pastel hues, indicating either sunrise or sunset, the overall mood of the photograph is casual and relaxed, with box1jana's relaxed posture and the serene beach setting adding a sense of tranquility and natural beauty to the scene",
+      "caps": {
+        "positive": "/home/alex/mojodiffusion/serenitymojo/output/ernie_prompt_caps/boxjana_caption3_beach_photo_pos.safetensors",
+        "negative": "/home/alex/mojodiffusion/serenitymojo/output/ernie_prompt_caps/boxjana_caption3_beach_photo_neg.safetensors"
+      }
+    }
+  ]
+}

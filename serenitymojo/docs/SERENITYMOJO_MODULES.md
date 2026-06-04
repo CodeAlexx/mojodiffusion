@@ -104,11 +104,17 @@ Common convention: each op has a `def _<op>_kernel_{f32,bf16,f16}(...)` triple (
 - `rope_halfsplit(x, cos, sin, ctx) raises -> Tensor` — HALFSPLIT pairing (Z-Image, HF rotate_half): pair `(x[i], x[i+D/2])`.
 - Both: `x: [..., D]` (D even, leading dims → rows), `cos/sin: [rows, D/2]` (row index shared with x, same dtype), one thread per pair, F32 math.
 
+### `ops/rope_tables.mojo` ✅ (probe-verified)
+- `build_multiaxis_rope_tables(positions: Tensor, axes_dims: List[Int], theta: Float32, ctx) raises -> Tuple[Tensor, Tensor]` — 3-axis (3D) RoPE cos/sin table builder for the Phase 2-4 video/image DiTs (wan22, wan_vace, hunyuan15, kandinsky5, cosmos, magihuman, nava-video). `positions: [rows*num_axes]` F32 token-major (`t*num_axes+a` = token t's grid position on axis a). `axes_dims`: per-axis FULL rotary dim (each even; e.g. `[88,84,84]` for wan22/cosmos). Returns `(cos, sin)` each `[rows, sum(axes_dims)/2]` F32, concatenated over axes with per-axis `inv_freq_i = theta^(-i/half_a)`. Feed straight into `rope_interleaved` (complex/pair, wan22 `view_as_complex`) or `rope_halfsplit` (GPT-NeoX, cosmos). One GPU thread per `(row, col)`; axis half-dims uploaded as an I32 device buffer; `num_axes ≤ 4`. Replaces the per-model host concat loop that `models/dit/zimage_dit.mojo::_build_rope` open-codes. Probe `ops/rope_tables_probe.mojo` (max_err 1.27e-7); oracle `ops/parity/gen_rope_tables_reference.py`.
+
 ### `ops/activations.mojo` ✅
 - `silu(x, ctx) raises -> Tensor` — `x·sigmoid(x)`.
 - `gelu(x, ctx) raises -> Tensor` — tanh-approx GELU (`comptime _GELU_C = sqrt(2/pi)`), matches torch `approximate="tanh"`.
 - `swiglu(x_gate, x_up, ctx) raises -> Tensor` — `silu(gate)·up`, elementwise, same-shape inputs.
 All pointwise (one thread per flat element), F32 math.
+
+### `ops/fused_bias_gelu.mojo` ✅ cos 0.99999 (bf16 GPU)
+- `bias_gelu(x, bias, ctx) raises -> Tensor` — fused `GELU_tanh(x + bias)` in one kernel pass; `bias` is the per-hidden-channel vector `[H]` (H == last dim of x), broadcast over leading axes via `idx % H`. Reuses `ops/activations._gelu_f32` (tanh-approx, c0=sqrt(2/pi), c1=0.044715); F32 interior, store-cast. Matches flame-core `bias_gelu`. f32/bf16/f16 paths.
 
 ### `ops/softmax.mojo` ✅ (hand-rolled — SDK `softmax_gpu` uncallable)
 - `softmax_lastdim(x, ctx) raises -> Tensor` — numerically-stable softmax over last dim (`exp(x-max)/Σexp`). One block/row, two F32 tree reductions (max, then sum). `comptime _NEG_BIG = -3.0e38` seeds the max.
@@ -144,6 +150,11 @@ Broadcasting elementwise + shape ops. `comptime _MAXRANK = 6`.
 - `patchify(x, patch: Int, ctx) raises -> Tensor` — image `[B,C,H,W]` → seq `[B,(H/p)(W/p), C·p·p]`, within-patch order `(c,ph,pw)` (channels-major), `p` divides H,W.
 - `unpatchify(seq, channels, height, width, patch, ctx) raises -> Tensor` — inverse → `[B,C,H,W]` (geometry passed explicitly; requires `L==(H/p)(W/p)`, last dim `==C·p·p`).
 - `deinterleave_pair(x, ctx) raises -> Tuple[Tensor, Tensor]` — last dim `[...,2K]` → `(evens [...,K], odds [...,K])` (interleaved-SwiGLU un-fuse).
+
+### `ops/patchify3d.mojo` ✅ (probe-verified)
+- `patchify3d(x: Tensor, patch_f: Int, patch_h: Int, patch_w: Int, ctx) raises -> Tensor` — video-DiT 3D patch-embed unfold: `[C,F,H,W]` → `[n_patches, C·pf·ph·pw]`, non-overlapping cubes (kernel==stride==patch). Token order F-major then H then W (`patch = fi·HO·WO + hi·WO + wi`); within-patch flatten `(c,pf,ph,pw)` with **channel SLOWEST** — exactly the row-major memory order of a torch `Conv3d` weight `[out,C,pf,ph,pw]`, so the patch-embed is `linear(patchify3d(x,…), pe_w.reshape([out, C·pf·ph·pw]), pe_bias)` (REUSE `ops/linear.linear`; conv kernel flattens with NO transpose). Matches `wan22_dit.rs:667` / `cosmos_predict25_dit.rs:1544` `patchify`. pf,ph,pw must divide F,H,W. **Conv3d-patch-embed == unfold+linear PROVEN** (oracle f32 cos=1.0, max_abs=0.0). Positional embedding kept OUT (caller responsibility, like `rope_tables`). Used by wan22, wan_vace, hunyuan15, cosmos, nava-video.
+- `unpatchify3d(seq, out_channels, frames, height, width, patch_f, patch_h, patch_w, ctx) raises -> Tensor` — inverse fold AFTER the output Linear: `[n_patches, C_out·pf·ph·pw]` → `[C_out, F, H, W]`. Within-patch READ order `(pf,ph,pw,c)` with **channel FASTEST** — mirrors `wan22_dit.rs:705` einsum `'fhwpqrc->cfphqwr'` (and `cosmos:1588` `(p1 p2 t' c)`). **INTENTIONALLY different** from `patchify3d`'s c-slowest order (the model's FinalLayer linear is trained to this layout) — NOT a literal transpose-inverse of `patchify3d`. Geometry passed explicitly; requires `L==(F/pf)(H/ph)(W/pw)`, last dim `==C_out·pf·ph·pw`.
+- Probe `ops/patchify3d_probe.mojo` (standalone, self-recompute, exit 0; unfold + unpatchify both max-abs 0.0). Parity `ops/parity/patchify3d_parity.mojo` (+oracle `patchify3d_oracle.py`): bf16 GPU `patchify3d+linear` vs torch `Conv3d(stride=kernel)` **cos 0.99999625, magRatio 1.00005**, gate cos≥0.999 PASS; `unpatchify3d` vs wan22 einsum max-abs 0.0.
 
 ### `ops/moe.mojo` ✅
 - `@fieldwise_init struct RouterPlan(Movable)` — `expert_ids: List[Int]`, `gating: List[Float32]` (both length T·k, token-major slot `s=t·k+j`), `num_tokens`, `num_experts`, `top_k`.

@@ -56,6 +56,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -470,9 +471,12 @@ def gate_residual_backward(
 
     grad_out, x, y: [..., C] ; g: [C] (per-channel gate).
     """
-    if (grad_out.dtype() != STDtype.F32 or x.dtype() != STDtype.F32
-            or g.dtype() != STDtype.F32 or y.dtype() != STDtype.F32):
-        raise Error("gate_residual_backward: F32 only")
+    if grad_out.dtype() != STDtype.F32 or g.dtype() != STDtype.F32:
+        raise Error("gate_residual_backward: grad_out/g must be F32")
+    if x.dtype() != STDtype.F32 and x.dtype() != STDtype.BF16:
+        raise Error("gate_residual_backward: x must be F32 or BF16")
+    if y.dtype() != STDtype.F32 and y.dtype() != STDtype.BF16:
+        raise Error("gate_residual_backward: y must be F32 or BF16")
     var gshape = grad_out.shape()
     if len(gshape) < 1:
         raise Error("gate_residual_backward: grad_out must have rank >= 1")
@@ -485,6 +489,20 @@ def gate_residual_backward(
     var rows = 1
     for i in range(len(gshape) - 1):
         rows *= gshape[i]
+
+    # Cast saved-act tensors up to F32 if stored as BF16 (activation-save path).
+    # `x` value is unused in computation (d_x = grad_out); needed only for numel.
+    # `y` IS used for d_g = sum(grad_out * y), must be F32 for the kernel.
+    var y32: Tensor
+    if y.dtype() == STDtype.F32:
+        y32 = y.clone(ctx)
+    else:
+        y32 = cast_tensor(y, STDtype.F32, ctx)
+    var x32: Tensor
+    if x.dtype() == STDtype.F32:
+        x32 = x.clone(ctx)
+    else:
+        x32 = cast_tensor(x, STDtype.F32, ctx)
 
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     var dy_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
@@ -516,7 +534,7 @@ def gate_residual_backward(
     var dg_shape = List[Int]()
     if compute_gate_grad:
         var Y = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            y.buf.unsafe_ptr().bitcast[Float32](), x_rl
+            y32.buf.unsafe_ptr().bitcast[Float32](), x_rl
         )
         var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
             dg_buf.unsafe_ptr().bitcast[Float32](), v_rl
@@ -526,6 +544,8 @@ def gate_residual_backward(
         dg_shape.append(cols)
     else:
         dg_shape.append(0)
+    # suppress unused x32 warning
+    _ = x32
     var dx_t = Tensor(dx_buf^, grad_out.shape(), STDtype.F32)
     var dy_t = Tensor(dy_buf^, grad_out.shape(), STDtype.F32)
     var dg_t = Tensor(dg_buf^, dg_shape^, STDtype.F32)

@@ -499,3 +499,328 @@ def pixel_shuffle(x: Tensor, r: Int, ctx: DeviceContext) raises -> Tensor:
         )
     ctx.synchronize()
     return Tensor(out_buf^, [B, C, Ho, Wo], x.dtype())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# space_to_depth_3d — EXACT inverse of depth_to_space_3d (the encoder downsample
+# main+residual rearrange). ltx2_encoder.rs:350-363:
+#   [B,C,F,H,W] -> [B, C*p1*p2*p3, F/p1, H/p2, W/p3]
+#   reshape [B,C,f2,p1,h2,p2,w2,p3] -> permute [0,1,3,5,7,2,4,6]
+#     -> [B,C,p1,p2,p3,f2,h2,w2] -> reshape [B, C*p1*p2*p3, f2,h2,w2].
+#   Output channel split is c-major (same as d2s):
+#     ct = ((c*p1 + i1)*p2 + i2)*p3 + i3
+#   and output (fo,ho,wo) reads input (fo*p1+i1, ho*p2+i2, wo*p3+i3) at chan c.
+# One thread per OUTPUT element; pure gather (no math) -> bit-exact relocation.
+# Caller is responsible for any causal temporal pre-pad (F must be divisible by
+# p1 here).
+# ─────────────────────────────────────────────────────────────────────────────
+def _s2d_kernel_f32(
+    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    B: Int, C: Int, F2: Int, H2: Int, W2: Int,
+    p1: Int, p2: Int, p3: Int, Fi: Int, Hi: Int, Wi: Int,
+):
+    var idx = Int(global_idx.x)
+    var Ctot = C * p1 * p2 * p3
+    var total = B * Ctot * F2 * H2 * W2
+    if idx < total:
+        var wo = idx % W2
+        var t0 = idx // W2
+        var ho = t0 % H2
+        var t1 = t0 // H2
+        var fo = t1 % F2
+        var t2 = t1 // F2
+        var ct = t2 % Ctot
+        var b = t2 // Ctot
+        var i3 = ct % p3
+        var u0 = ct // p3
+        var i2 = u0 % p2
+        var u1 = u0 // p2
+        var i1 = u1 % p1
+        var c = u1 // p1
+        var f = fo * p1 + i1
+        var h = ho * p2 + i2
+        var w = wo * p3 + i3
+        var in_off = (((b * C + c) * Fi + f) * Hi + h) * Wi + w
+        o[idx] = rebind[o.element_type](rebind[Scalar[DType.float32]](x[in_off]))
+
+
+def _s2d_kernel_bf16(
+    x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    B: Int, C: Int, F2: Int, H2: Int, W2: Int,
+    p1: Int, p2: Int, p3: Int, Fi: Int, Hi: Int, Wi: Int,
+):
+    var idx = Int(global_idx.x)
+    var Ctot = C * p1 * p2 * p3
+    var total = B * Ctot * F2 * H2 * W2
+    if idx < total:
+        var wo = idx % W2
+        var t0 = idx // W2
+        var ho = t0 % H2
+        var t1 = t0 // H2
+        var fo = t1 % F2
+        var t2 = t1 // F2
+        var ct = t2 % Ctot
+        var b = t2 // Ctot
+        var i3 = ct % p3
+        var u0 = ct // p3
+        var i2 = u0 % p2
+        var u1 = u0 // p2
+        var i1 = u1 % p1
+        var c = u1 // p1
+        var f = fo * p1 + i1
+        var h = ho * p2 + i2
+        var w = wo * p3 + i3
+        var in_off = (((b * C + c) * Fi + f) * Hi + h) * Wi + w
+        o[idx] = rebind[o.element_type](rebind[Scalar[DType.bfloat16]](x[in_off]))
+
+
+def _s2d_kernel_f16(
+    x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    B: Int, C: Int, F2: Int, H2: Int, W2: Int,
+    p1: Int, p2: Int, p3: Int, Fi: Int, Hi: Int, Wi: Int,
+):
+    var idx = Int(global_idx.x)
+    var Ctot = C * p1 * p2 * p3
+    var total = B * Ctot * F2 * H2 * W2
+    if idx < total:
+        var wo = idx % W2
+        var t0 = idx // W2
+        var ho = t0 % H2
+        var t1 = t0 // H2
+        var fo = t1 % F2
+        var t2 = t1 // F2
+        var ct = t2 % Ctot
+        var b = t2 // Ctot
+        var i3 = ct % p3
+        var u0 = ct // p3
+        var i2 = u0 % p2
+        var u1 = u0 // p2
+        var i1 = u1 % p1
+        var c = u1 // p1
+        var f = fo * p1 + i1
+        var h = ho * p2 + i2
+        var w = wo * p3 + i3
+        var in_off = (((b * C + c) * Fi + f) * Hi + h) * Wi + w
+        o[idx] = rebind[o.element_type](rebind[Scalar[DType.float16]](x[in_off]))
+
+
+def space_to_depth_3d(
+    x: Tensor, p1: Int, p2: Int, p3: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """space_to_depth_3d: [B,C,F,H,W] -> [B, C*p1*p2*p3, F/p1, H/p2, W/p3].
+
+    Exact inverse of depth_to_space_3d (channel split c-major:
+    ct=((c*p1+i1)*p2+i2)*p3+i3). F,H,W must be divisible by p1,p2,p3 (caller does
+    any causal temporal pre-pad). Pure gather — bit-exact relocation, no math."""
+    var xs = x.shape()
+    if len(xs) != 5:
+        raise Error("space_to_depth_3d: x must be rank-5 [B,C,F,H,W]")
+    var B = xs[0]
+    var C = xs[1]
+    var Fi = xs[2]
+    var Hi = xs[3]
+    var Wi = xs[4]
+    if p1 <= 0 or p2 <= 0 or p3 <= 0:
+        raise Error("space_to_depth_3d: strides must be positive")
+    if Fi % p1 != 0 or Hi % p2 != 0 or Wi % p3 != 0:
+        raise Error("space_to_depth_3d: F/H/W must be divisible by strides")
+    var F2 = Fi // p1
+    var H2 = Hi // p2
+    var W2 = Wi // p3
+    var Ctot = C * p1 * p2 * p3
+    var total = B * Ctot * F2 * H2 * W2
+
+    var dt = x.dtype().to_mojo_dtype()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var in_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), in_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        ctx.enqueue_function[_s2d_kernel_f32, _s2d_kernel_f32](
+            X, O, B, C, F2, H2, W2, p1, p2, p3, Fi, Hi, Wi,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), in_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        ctx.enqueue_function[_s2d_kernel_bf16, _s2d_kernel_bf16](
+            X, O, B, C, F2, H2, W2, p1, p2, p3, Fi, Hi, Wi,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), in_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        ctx.enqueue_function[_s2d_kernel_f16, _s2d_kernel_f16](
+            X, O, B, C, F2, H2, W2, p1, p2, p3, Fi, Hi, Wi,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    ctx.synchronize()
+    return Tensor(out_buf^, [B, Ctot, F2, H2, W2], x.dtype())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# patchify_3d — encoder spatial pixel-unshuffle (patch_size p on H,W only).
+# ltx2_encoder.rs:379-393:
+#   [B,C,T,H,W] -> reshape [B,C,T,1,H/p,p,W/p,p]
+#     -> permute (0,1,3,7,5,2,4,6) -> [B,C,1,p_w,p_h,T,H/p,W/p]
+#     -> flatten(1,4) -> [B, C*p*p, T, H/p, W/p]
+#   Output channel (c-major then width-patch then height-patch):
+#     ct = (c*p + iw)*p + ih
+#   Output (t,ho,wo) reads input (t, h = ho*p + ih, w = wo*p + iw) at channel c.
+# One thread per OUTPUT element; pure gather.
+# ─────────────────────────────────────────────────────────────────────────────
+def _patch_kernel_f32(
+    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    B: Int, C: Int, T: Int, Hp: Int, Wp: Int, p: Int, Hi: Int, Wi: Int,
+):
+    var idx = Int(global_idx.x)
+    var Cout = C * p * p
+    var total = B * Cout * T * Hp * Wp
+    if idx < total:
+        var wo = idx % Wp
+        var t0 = idx // Wp
+        var ho = t0 % Hp
+        var t1 = t0 // Hp
+        var t = t1 % T
+        var t2 = t1 // T
+        var ct = t2 % Cout
+        var b = t2 // Cout
+        var ih = ct % p
+        var u0 = ct // p
+        var iw = u0 % p
+        var c = u0 // p
+        var h = ho * p + ih
+        var w = wo * p + iw
+        var in_off = (((b * C + c) * T + t) * Hi + h) * Wi + w
+        o[idx] = rebind[o.element_type](rebind[Scalar[DType.float32]](x[in_off]))
+
+
+def _patch_kernel_bf16(
+    x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    B: Int, C: Int, T: Int, Hp: Int, Wp: Int, p: Int, Hi: Int, Wi: Int,
+):
+    var idx = Int(global_idx.x)
+    var Cout = C * p * p
+    var total = B * Cout * T * Hp * Wp
+    if idx < total:
+        var wo = idx % Wp
+        var t0 = idx // Wp
+        var ho = t0 % Hp
+        var t1 = t0 // Hp
+        var t = t1 % T
+        var t2 = t1 // T
+        var ct = t2 % Cout
+        var b = t2 // Cout
+        var ih = ct % p
+        var u0 = ct // p
+        var iw = u0 % p
+        var c = u0 // p
+        var h = ho * p + ih
+        var w = wo * p + iw
+        var in_off = (((b * C + c) * T + t) * Hi + h) * Wi + w
+        o[idx] = rebind[o.element_type](rebind[Scalar[DType.bfloat16]](x[in_off]))
+
+
+def _patch_kernel_f16(
+    x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    B: Int, C: Int, T: Int, Hp: Int, Wp: Int, p: Int, Hi: Int, Wi: Int,
+):
+    var idx = Int(global_idx.x)
+    var Cout = C * p * p
+    var total = B * Cout * T * Hp * Wp
+    if idx < total:
+        var wo = idx % Wp
+        var t0 = idx // Wp
+        var ho = t0 % Hp
+        var t1 = t0 // Hp
+        var t = t1 % T
+        var t2 = t1 // T
+        var ct = t2 % Cout
+        var b = t2 // Cout
+        var ih = ct % p
+        var u0 = ct // p
+        var iw = u0 % p
+        var c = u0 // p
+        var h = ho * p + ih
+        var w = wo * p + iw
+        var in_off = (((b * C + c) * T + t) * Hi + h) * Wi + w
+        o[idx] = rebind[o.element_type](rebind[Scalar[DType.float16]](x[in_off]))
+
+
+def patchify_3d(x: Tensor, p: Int, ctx: DeviceContext) raises -> Tensor:
+    """patchify_3d: [B,C,T,H,W] -> [B, C*p*p, T, H/p, W/p] (spatial only).
+
+    Encoder pixel-unshuffle (ltx2_encoder.rs patchify, pt=1). Output channel
+    ct=(c*p+iw)*p+ih reads input (h=ho*p+ih, w=wo*p+iw). Pure gather."""
+    var xs = x.shape()
+    if len(xs) != 5:
+        raise Error("patchify_3d: x must be rank-5 [B,C,T,H,W]")
+    var B = xs[0]
+    var C = xs[1]
+    var T = xs[2]
+    var Hi = xs[3]
+    var Wi = xs[4]
+    if p <= 0 or Hi % p != 0 or Wi % p != 0:
+        raise Error("patchify_3d: H/W must be divisible by patch size")
+    var Hp = Hi // p
+    var Wp = Wi // p
+    var Cout = C * p * p
+    var total = B * Cout * T * Hp * Wp
+
+    var dt = x.dtype().to_mojo_dtype()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var in_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), in_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        ctx.enqueue_function[_patch_kernel_f32, _patch_kernel_f32](
+            X, O, B, C, T, Hp, Wp, p, Hi, Wi, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), in_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        ctx.enqueue_function[_patch_kernel_bf16, _patch_kernel_bf16](
+            X, O, B, C, T, Hp, Wp, p, Hi, Wi, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), in_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        ctx.enqueue_function[_patch_kernel_f16, _patch_kernel_f16](
+            X, O, B, C, T, Hp, Wp, p, Hi, Wi, grid_dim=grid, block_dim=_BLOCK
+        )
+    ctx.synchronize()
+    return Tensor(out_buf^, [B, Cout, T, Hp, Wp], x.dtype())

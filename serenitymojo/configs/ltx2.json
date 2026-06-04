@@ -1,0 +1,29 @@
+{
+  "model_type": "ltx2",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors",
+  "vae": "/home/alex/.cache/huggingface/hub/models--Lightricks--LTX-2/snapshots/f90a633df707f1522c754181183b08193b4f3d9a/vae/diffusion_pytorch_model.safetensors",
+  "validation_prompts_file": "",
+
+  "inner_dim": 4096,
+  "in_channels": 128,
+  "joint_attention_dim": 3840,
+  "out_channels": 128,
+  "num_double": 0,
+  "num_single": 48,
+  "num_heads": 32,
+  "head_dim": 128,
+  "mlp_hidden": 16384,
+  "timestep_dim": 256,
+  "rope_theta": 10000,
+
+  "learning_rate": 3e-4,
+  "lora_rank": 16,
+  "lora_alpha": 1.0,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 100,
+  "save_every": 0,
+  "sample_every": 0,
+
+  "optimizer": { "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
+}

@@ -333,3 +333,63 @@ struct Tensor(Movable):
             for i in range(n):
                 out.append(hp[i].cast[DType.float32]())
         return out^
+
+    def to_host_bf16(self, ctx: DeviceContext) raises -> List[BFloat16]:
+        """Copy device data back to host as raw BF16 (HALF the bytes of
+        `to_host`'s F32 list). This is the TRAINING hot-path activation-save
+        carrier: flame-core keeps saved activations in BF16, and a BF16 host
+        list (`List[BFloat16]`) is the faithful, memory-correct store — using
+        `to_host` here doubled the resident activation set (the offload-trainer
+        OOM). The stored compute dtype is cast DOWN to BF16 as we pack; a BF16
+        source is a verbatim copy (no precision change)."""
+        var n = self.numel()
+        var nbytes = self.nbytes()
+        var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+        ctx.enqueue_copy(dst_buf=host, src_buf=self.buf)
+        ctx.synchronize()
+        var out = List[BFloat16]()
+        var dt = self._dtype.to_mojo_dtype()
+        if dt == DType.bfloat16:
+            var bp = host.unsafe_ptr().bitcast[BFloat16]()
+            for i in range(n):
+                out.append(bp[i])
+        elif dt == DType.float32:
+            var fp = host.unsafe_ptr().bitcast[Float32]()
+            for i in range(n):
+                out.append(fp[i].cast[DType.bfloat16]())
+        else:  # float16
+            var hp = host.unsafe_ptr().bitcast[Float16]()
+            for i in range(n):
+                out.append(hp[i].cast[DType.float32]().cast[DType.bfloat16]())
+        return out^
+
+    @staticmethod
+    def from_host_bf16(
+        values: List[BFloat16],
+        var shape: List[Int],
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        """Upload a host BF16 list to a fresh BF16 device buffer (verbatim, no
+        F32 detour). The re-upload counterpart of `to_host_bf16` for the
+        training activation-save path: `saved = t.to_host_bf16(ctx)` then in
+        backward `Tensor.from_host_bf16(saved, shape, ctx)`. numel(shape) must
+        equal len(values)."""
+        var n = 1
+        for i in range(len(shape)):
+            n *= shape[i]
+        if n != len(values):
+            raise Error(
+                String("from_host_bf16: numel(shape)=")
+                + String(n)
+                + " != len(values)="
+                + String(len(values))
+            )
+        var nbytes = n * STDtype.BF16.byte_size()
+        var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+        var bp = host.unsafe_ptr().bitcast[BFloat16]()
+        for i in range(n):
+            bp[i] = values[i]
+        var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+        ctx.enqueue_copy(dst_buf=dev, src_buf=host)
+        ctx.synchronize()
+        return Tensor(dev^, shape^, STDtype.BF16)

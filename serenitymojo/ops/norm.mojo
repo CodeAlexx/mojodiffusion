@@ -459,6 +459,205 @@ def layer_norm(
     return Tensor(out_buf^, xshape.copy(), x.dtype())
 
 
+# ── layer_norm_no_affine ────────────────────────────────────────────────────
+#
+#   layer_norm_no_affine: y[...,j] = (x[...,j] - mean) / sqrt(var + eps)
+#   over the last dim. NO learned gamma/beta (elementwise_affine=False).
+#
+# This is the AdaLN(-zero) normalization in every Phase 2-4 DiT (Wan2.2,
+# Hunyuan1.5, Kandinsky5, Nava-AV, plus SD3/Qwen-Image/LTX2/FLUX/Chroma): the
+# block normalizes with no affine, then `modulate((1+scale)·x + shift)` applies
+# the timestep-conditioned affine separately. Mirrors flame-core
+# layer_norm_bf16(x, None, None, eps). Biased (population) variance, same F32
+# tree-reduce as `layer_norm`; only the store path drops the gamma/beta multiply.
+def _layer_norm_noaffine_kernel_f32(
+    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var s_sum = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var s_sqr = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var lsum: Float32 = 0.0
+    var lsqr: Float32 = 0.0
+    var c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.float32]](x[row, c])
+        lsum += v
+        lsqr += v * v
+        c += _TPB
+    s_sum[tid] = lsum
+    s_sqr[tid] = lsqr
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            s_sum[tid] = s_sum[tid] + s_sum[tid + active]
+            s_sqr[tid] = s_sqr[tid] + s_sqr[tid + active]
+        barrier()
+        active //= 2
+    var mean = s_sum[0] / Float32(cols)
+    var var_ = s_sqr[0] / Float32(cols) - mean * mean
+    var inv = 1.0 / sqrt(var_ + eps)
+    c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.float32]](x[row, c])
+        o[row, c] = rebind[o.element_type]((v - mean) * inv)
+        c += _TPB
+
+
+def _layer_norm_noaffine_kernel_bf16(
+    x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var s_sum = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var s_sqr = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var lsum: Float32 = 0.0
+    var lsqr: Float32 = 0.0
+    var c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.bfloat16]](x[row, c]).cast[DType.float32]()
+        lsum += v
+        lsqr += v * v
+        c += _TPB
+    s_sum[tid] = lsum
+    s_sqr[tid] = lsqr
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            s_sum[tid] = s_sum[tid] + s_sum[tid + active]
+            s_sqr[tid] = s_sqr[tid] + s_sqr[tid + active]
+        barrier()
+        active //= 2
+    var mean = s_sum[0] / Float32(cols)
+    var var_ = s_sqr[0] / Float32(cols) - mean * mean
+    var inv = 1.0 / sqrt(var_ + eps)
+    c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.bfloat16]](x[row, c]).cast[DType.float32]()
+        o[row, c] = rebind[o.element_type](
+            ((v - mean) * inv).cast[DType.bfloat16]()
+        )
+        c += _TPB
+
+
+def _layer_norm_noaffine_kernel_f16(
+    x: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var s_sum = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var s_sqr = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var lsum: Float32 = 0.0
+    var lsqr: Float32 = 0.0
+    var c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.float16]](x[row, c]).cast[DType.float32]()
+        lsum += v
+        lsqr += v * v
+        c += _TPB
+    s_sum[tid] = lsum
+    s_sqr[tid] = lsqr
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            s_sum[tid] = s_sum[tid] + s_sum[tid + active]
+            s_sqr[tid] = s_sqr[tid] + s_sqr[tid + active]
+        barrier()
+        active //= 2
+    var mean = s_sum[0] / Float32(cols)
+    var var_ = s_sqr[0] / Float32(cols) - mean * mean
+    var inv = 1.0 / sqrt(var_ + eps)
+    c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.float16]](x[row, c]).cast[DType.float32]()
+        o[row, c] = rebind[o.element_type](
+            ((v - mean) * inv).cast[DType.float16]()
+        )
+        c += _TPB
+
+
+def layer_norm_no_affine(
+    x: Tensor, eps: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """Layer-normalize over the last dim of x with NO affine (no gamma/beta).
+
+    x:      [..., D]   (any compute dtype; leading dims flattened to rows)
+    returns [..., D]   (x's dtype; F32-accumulated mean/biased-var).
+
+    y = (x - mean) / sqrt(var + eps). The DiT block applies the
+    timestep-conditioned (1+scale)·y + shift separately via `modulate`.
+    """
+    var xshape = x.shape()
+    if len(xshape) < 1:
+        raise Error("layer_norm_no_affine: x must have rank >= 1")
+    var d = xshape[len(xshape) - 1]
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+
+    var dt = x.dtype().to_mojo_dtype()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[
+            _layer_norm_noaffine_kernel_f32, _layer_norm_noaffine_kernel_f32
+        ](X, O, d, eps, grid_dim=rows, block_dim=_TPB)
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        ctx.enqueue_function[
+            _layer_norm_noaffine_kernel_bf16, _layer_norm_noaffine_kernel_bf16
+        ](X, O, d, eps, grid_dim=rows, block_dim=_TPB)
+    else:  # float16
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        ctx.enqueue_function[
+            _layer_norm_noaffine_kernel_f16, _layer_norm_noaffine_kernel_f16
+        ](X, O, d, eps, grid_dim=rows, block_dim=_TPB)
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, xshape.copy(), x.dtype())
+
+
 # ── group_norm (NHWC) ──────────────────────────────────────────────────────
 #
 #   group_norm: split the C channels into `num_groups` groups; normalize each

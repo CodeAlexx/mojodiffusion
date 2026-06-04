@@ -11,7 +11,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.math import exp, tanh, sqrt
+from std.math import exp, tanh, sqrt, erf
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
@@ -41,6 +41,17 @@ def _sigmoid_f32(v: Float32) -> Float32:
 def _gelu_f32(v: Float32) -> Float32:
     var inner = _GELU_C * (v + Float32(0.044715) * v * v * v)
     return Float32(0.5) * v * (1.0 + tanh(inner))
+
+
+# 1/sqrt(2) for the exact (erf) GELU. Matches CUDA's M_SQRT1_2 used by
+# flame-core gelu_exact.cu and torch.nn.GELU(approximate="none").
+comptime _INV_SQRT2 = Float32(0.7071067811865476)
+
+
+@always_inline
+def _gelu_exact_f32(v: Float32) -> Float32:
+    # y = 0.5 * x * (1 + erf(x / sqrt(2)))  — PyTorch-exact GELU.
+    return Float32(0.5) * v * (1.0 + erf(v * _INV_SQRT2))
 
 
 # ── silu ───────────────────────────────────────────────────────────────────
@@ -262,6 +273,87 @@ def gelu(x: Tensor, ctx: DeviceContext) raises -> Tensor:
             out_buf.unsafe_ptr().bitcast[Float16](), rl
         )
         ctx.enqueue_function[_gelu_kernel_f16, _gelu_kernel_f16](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
+# ── gelu_exact (erf) ───────────────────────────────────────────────────────
+#
+#   gelu_exact(x) = 0.5*x*(1 + erf(x / sqrt(2)))   (torch GELU approximate="none")
+#
+# Cosmos-Predict2.5 (and asymflux2) use bare nn.GELU() — the tanh-approx variant
+# above diverges ~9e-4 per element from the erf form (flame-core gelu_exact.cu).
+# Same one-thread-per-element flat-buffer pattern as `gelu`; F32 math, store cast.
+def _gelu_exact_kernel_f32(
+    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.float32]](x[i])
+        o[i] = rebind[o.element_type](_gelu_exact_f32(v))
+
+
+def _gelu_exact_kernel_bf16(
+    x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type](_gelu_exact_f32(v).cast[DType.bfloat16]())
+
+
+def _gelu_exact_kernel_f16(
+    x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var v = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type](_gelu_exact_f32(v).cast[DType.float16]())
+
+
+def gelu_exact(x: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """gelu(x), exact (erf) form, elementwise. torch GELU approximate="none"."""
+    var dt = x.dtype().to_mojo_dtype()
+    var n = x.numel()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_gelu_exact_kernel_f32, _gelu_exact_kernel_f32](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_gelu_exact_kernel_bf16, _gelu_exact_kernel_bf16](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_gelu_exact_kernel_f16, _gelu_exact_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.

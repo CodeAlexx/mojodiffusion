@@ -1,0 +1,2 @@
+F=1 H=4 W=4 seq_len=16 n_patches=16 text_len=512 ctx_len=12 dim=3072 nheads=24 headdim=128 in_dim=48 ffn=14336 timestep=500.0
+axes_dims=[44,42,42] theta=10000

@@ -1,0 +1,22 @@
+{
+  "img": [
+    1,
+    3,
+    256,
+    256
+  ],
+  "moments_nhwc": [
+    1,
+    32,
+    32,
+    8
+  ],
+  "mode_nchw": [
+    1,
+    4,
+    32,
+    32
+  ],
+  "dtype": "bf16-gpu->f32",
+  "unscaled": true
+}

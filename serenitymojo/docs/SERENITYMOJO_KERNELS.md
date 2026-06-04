@@ -88,6 +88,12 @@ new kernel here when there is no callable Mojo/MAX primitive.
 | `_gelu_kernel_{f32,bf16,f16}` | `0.5·x·(1+tanh(√(2/π)·(x+0.044715·x³)))` | tanh-approx (`_GELU_C`); matches torch `approximate="tanh"`. |
 | `_swiglu_kernel_{f32,bf16,f16}` | `silu(gate)·up` | two inputs, same shape. |
 
+## ops/fused_bias_gelu.mojo — fused bias-add + tanh-GELU (one thread/element)
+
+| Kernel triple | Computes | Notes |
+|---|---|---|
+| `_bias_gelu_kernel_{f32,bf16,f16}` | `GELU_tanh(x[i] + bias[i % H])` | per-channel bias broadcast (H = last dim); reuses `activations._gelu_f32`; F32 interior, store-cast. Matches flame-core `bias_gelu`. |
+
 ## ops/softmax.mojo — stable softmax (one block/row, two F32 reductions)
 
 | Kernel triple | Computes | Notes |

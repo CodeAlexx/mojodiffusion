@@ -51,15 +51,17 @@ file is "where does X live". First target: Z-Image text→image.
 | `ops/random.mojo` | `randn`: GPU deterministic standard-normal fill matching Rust rand 0.8 `StdRng` seed stream. | ✅ |
 | `ops/linear.mojo` | `linear(x, w, bias)` = x @ wᵀ + b (vendor BLAS matmul, F32 accum). | ✅ |
 | `ops/norm.mojo` | `rms_norm`, `layer_norm`, `group_norm` (NHWC) — hand-rolled. | ✅ |
-| `ops/rope.mojo` | `rope_interleaved` (FLUX/Klein), `rope_halfsplit` (Z-Image). | ✅ |
+| `ops/rope.mojo` | `rope_interleaved` (FLUX/Klein), `rope_halfsplit` (Z-Image), `rope_halfsplit_full` (Qwen2.5-VL mRoPE). | ✅ |
+| `ops/rope_tables.mojo` | `build_multiaxis_rope_tables` — 3-axis (3D) RoPE cos/sin tables `[rows, Dh/2]` for wan22/cosmos/kandinsky5/nava-video (feeds `rope_interleaved`/`rope_halfsplit`). | ✅ probe |
 | `ops/activations.mojo` | `silu`, `gelu` (tanh-approx), `swiglu`. | ✅ |
 | `ops/softmax.mojo` | `softmax_lastdim` (stable, one block/row). | ✅ |
 | `ops/elementwise.mojo` | `modulate` ((1+s)x+sh), `residual_gate` (x+g·y) — DiT AdaLN. | ✅ |
-| `ops/attention.mojo` | `sdpa[B,S,H,Dh]` — flash (Dh==64) + math-mode fallback (any Dh). | ✅ |
+| `ops/attention.mojo` | `sdpa[B,S,H,Dh]` — flash (Dh==64) + math-mode fallback (any Dh); `sdpa_tiled`/`sdpa_nomask_tiled` — online-softmax (never materializes [S,S]) for LARGE S at Dh∈{64,128} (cosmos full-res, no OOM; cos=1.0 vs math-mode). | ✅ |
 | `ops/conv.mojo` | `conv2d[...]` (NHWC/RSCF, SDK naive kernel + bias add). | ✅ |
 | `ops/embeddings.mojo` | `timestep_embedding`, `t_embedder`, `build_rope_tables`. | ✅ |
 | `ops/tensor_algebra.mojo` | `add/sub/mul/div` (+scalar), `reshape`, `permute`, `transpose`, `concat`, `slice`, `gather_rows`. | ✅ |
 | `ops/layout.mojo` | `patchify`, `unpatchify`, `deinterleave_pair`. | ✅ |
+| `ops/patchify3d.mojo` | `patchify3d` (video-DiT 3D patch unfold `[C,F,H,W]→[n_patches,C·pf·ph·pw]`) + `unpatchify3d` (wan22 einsum inverse) for wan22/wan_vace/hunyuan15/cosmos/nava-video. Conv3d patch-embed == unfold+linear (proven). | ✅ probe |
 | `ops/moe.mojo` | `top_k_router`, `grouped_expert_ffn`, `gated_scatter_add` (+`RouterPlan`). | ✅ |
 | `offload/block_loader.mojo` | `BlockLoader`: prefix-keyed transformer-block weight streaming. | ✅ |
 | `tokenizer/tokenizer.mojo` | `Qwen3Tokenizer`: pure-Mojo byte-level BPE (Qwen2 regex). | ✅ |
@@ -69,13 +71,18 @@ file is "where does X live". First target: Z-Image text→image.
 | `models/text_encoder/qwen25vl_encoder.mojo` | `Qwen25VLEncoder` + `Qwen25VLConfig` (Qwen-Image text encoder). | ✅ base 512 runtime smoke / parity pending |
 | `models/vae/zimage_decoder.mojo` | `ZImageDecoder[LH,LW]`: Z-Image AutoencoderKL decoder config. | ✅ cos 0.99998 |
 | `models/vae/klein_decoder.mojo` | `KleinVaeDecoder[LH,LW]`: FLUX.2/Klein VAE decode from packed `[1,128,LH,LW]`. | ✅ 1024 smoke |
+| `models/vae/ldm_decoder.mojo` | `LdmVaeDecoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL decoder; factories `load_sdxl/sd15/flux1/sd3_embedded_ldm_decoder`. | ✅ |
+| `models/vae/ldm_encoder.mojo` | `LdmVaeEncoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL encoder (mirror of decoder); factories `load_sdxl/sd15/sd3_embedded_ldm_encoder`. SD3=16ch, scale 1.5305/shift 0.0609, no quant_conv. | ✅ SDXL 4ch + SD3 16ch cos 0.99999 (256²) |
 | `models/vae/decoder2d.mojo` | Shared 2D-VAE kit: `ResnetBlock`, `AttnBlock`, `Upsample`, NCHW↔NHWC. | ✅ |
 | `models/vae/vae_ops.mojo` | VAE-local glue: `clone`, `reshape`, `add`. | ✅ |
 | `models/vae/upsample.mojo` | `upsample_nearest2x_nhwc` (2D nearest 2×). | ✅ |
 | `models/vae/conv3d.mojo` | `conv3d` (NDHWC/QRSCF) — for a Wan2.1 3D VAE; NOT on the Z-Image path. | ⏳ |
+| `models/vae/wan22_decoder.mojo` | `Wan22VaeImageDecoder[LH,LW]`: Wan2.2 high-compression VAE decode (latent→RGB), reuses conv3d block library. | ✅ |
+| `models/vae/wan22_vae_encoder.mojo` | `Wan22VaeImageEncoder[H,W]`: Wan2.2 high-compression VAE encode (RGB→latent mu, image mode T=1), REUSES the decoder block library + patchify2/AvgDown3D/downsample2d. | ✅ cos 0.99998 (64²&256²) |
 | `sampling/flow_match.mojo` | `Scheduler` (rectified-flow Euler), `cfg`, `build_sigma_schedule`; Qwen variants. | ✅ |
 | `sampling/flux2_klein.mojo` | FLUX.2/Klein dynamic-mu sigma schedule, textbook CFG, direct-velocity Euler step. | ✅ scalar smoke |
 | `sampling/sdxl_euler.mojo` | SDXL scaled-linear beta sigmas/timesteps, textbook CFG, eps-prediction Euler step. | ✅ scalar smoke |
+| `sampling/acestep_flow_match.mojo` | ACE-Step rectified-flow (Euler ODE) sampler: reuses `build_sigma_schedule`, textbook CFG, `xt - vt*dt` step. Step-parity gate cos=1.0 vs canonical generate_audio. | ✅ step-parity |
 | `image/png.mojo` | `save_png` (CHW float → 8-bit RGB PNG, stored-deflate); `crc32`/`adler32`. | ✅ |
 
 **Dev/test harnesses** (not API-documented; run/probe scaffolding):

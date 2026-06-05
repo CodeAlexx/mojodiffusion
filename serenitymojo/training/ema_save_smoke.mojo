@@ -7,7 +7,7 @@
 #
 # Procedure:
 #   - build a tiny KleinLoraSet (1 double + 1 single, D=8, rank=2);
-#   - construct shadow A/B lists that DIFFER from live (live + 100.0);
+#   - construct BF16 shadow A/B lists that DIFFER from live (live + 100.0);
 #   - save_klein_lora(live) -> live.safetensors;
 #   - save_klein_lora_ema(live, shadows) -> ema.safetensors;
 #   - reopen both, read one adapter's lora_A.weight:
@@ -32,11 +32,11 @@ from serenitymojo.models.klein.klein_stack_lora import (
 )
 
 
-def _offset_group(src: List[Float32]) -> List[Float32]:
+def _offset_group(src: List[BFloat16]) -> List[BFloat16]:
     """live + 100 so any collision with live is impossible."""
-    var out = List[Float32]()
+    var out = List[BFloat16]()
     for v in src:
-        out.append(v + Float32(100.0))
+        out.append(BFloat16(v.cast[DType.float32]() + Float32(100.0)))
     return out^
 
 
@@ -46,13 +46,13 @@ def main() raises:
 
     var lora = build_klein_lora_set(1, 1, 8, 2, Float32(2.0))
     # shadow lists in the SAME flat order the trainer allocates them.
-    var ema_dbl_a = List[List[Float32]]()
-    var ema_dbl_b = List[List[Float32]]()
+    var ema_dbl_a = List[List[BFloat16]]()
+    var ema_dbl_b = List[List[BFloat16]]()
     for i in range(len(lora.dbl)):
         ema_dbl_a.append(_offset_group(lora.dbl[i].a))
         ema_dbl_b.append(_offset_group(lora.dbl[i].b))
-    var ema_sgl_a = List[List[Float32]]()
-    var ema_sgl_b = List[List[Float32]]()
+    var ema_sgl_a = List[List[BFloat16]]()
+    var ema_sgl_b = List[List[BFloat16]]()
     for i in range(len(lora.sgl)):
         ema_sgl_a.append(_offset_group(lora.sgl[i].a))
         ema_sgl_b.append(_offset_group(lora.sgl[i].b))
@@ -85,7 +85,7 @@ def main() raises:
     # ── (3) control: live file == live set ────────────────────────────────────
     var ctrl_err = Float32(0.0)
     for i in range(len(live_a)):
-        var e = live_a[i] - live_set_a[i]
+        var e = live_a[i] - live_set_a[i].cast[DType.float32]()
         if e < Float32(0.0): e = -e
         if e > ctrl_err: ctrl_err = e
     print("control max |live_file - live_set| =", ctrl_err)
@@ -97,7 +97,7 @@ def main() raises:
     # ── (1) ema file == shadow ────────────────────────────────────────────────
     var shadow_err = Float32(0.0)
     for i in range(len(ema_a)):
-        var e = ema_a[i] - shadow_a[i]
+        var e = ema_a[i] - shadow_a[i].cast[DType.float32]()
         if e < Float32(0.0): e = -e
         if e > shadow_err: shadow_err = e
     print("ema max |ema_file - shadow| =", shadow_err)

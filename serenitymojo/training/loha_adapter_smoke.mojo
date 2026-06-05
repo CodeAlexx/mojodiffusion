@@ -67,21 +67,48 @@ def _env_is_set(name: String) -> Bool:
     return ret[0] == UInt8(49) and ret[1] == UInt8(0)
 
 
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
+def _max_abs_diff_bf16(a: List[BFloat16], b: List[BFloat16]) raises -> Float32:
+    if len(a) != len(b):
+        raise Error("max_abs_diff_bf16: len mismatch " + String(len(a)) + " != " + String(len(b)))
+    var mx = Float32(0.0)
+    for i in range(len(a)):
+        var d = abs(a[i].cast[DType.float32]() - b[i].cast[DType.float32]())
+        if d > mx:
+            mx = d
+    return mx
+
+
 # ── INDEPENDENT oracle: ΔW = (w1a@w1b) ⊙ (w2a@w2b) * scale via raw triple loops ─
-def _oracle_diff(lo: LoHaAdapter) -> List[Float32]:
-    var IN = lo.in_f
-    var OUT = lo.out_f
-    var R = lo.rank
+def _oracle_diff_values(
+    w1a: List[Float32], w1b: List[Float32],
+    w2a: List[Float32], w2b: List[Float32],
+    IN: Int, OUT: Int, R: Int, scale: Float32,
+) -> List[Float32]:
     var out = List[Float32]()
     for i in range(IN):
         for j in range(OUT):
             var s1 = Float32(0.0)
             var s2 = Float32(0.0)
             for r in range(R):
-                s1 += lo.w1a[i * R + r] * lo.w1b[r * OUT + j]
-                s2 += lo.w2a[i * R + r] * lo.w2b[r * OUT + j]
-            out.append(s1 * s2 * lo.scale)
+                s1 += w1a[i * R + r] * w1b[r * OUT + j]
+                s2 += w2a[i * R + r] * w2b[r * OUT + j]
+            out.append(s1 * s2 * scale)
     return out^
+
+
+def _oracle_diff(lo: LoHaAdapter) -> List[Float32]:
+    return _oracle_diff_values(
+        _bf16_to_f32_list(lo.w1a), _bf16_to_f32_list(lo.w1b),
+        _bf16_to_f32_list(lo.w2a), _bf16_to_f32_list(lo.w2b),
+        lo.in_f, lo.out_f, lo.rank, lo.scale,
+    )
 
 
 # Independent forward y = x @ ΔW.
@@ -119,32 +146,53 @@ def _loss_for_fd(lo: LoHaAdapter, x: List[Float32], M: Int) -> Float32:
     return s
 
 
+def _loss_for_fd_values(
+    w1a: List[Float32], w1b: List[Float32],
+    w2a: List[Float32], w2b: List[Float32],
+    x: List[Float32], M: Int, IN: Int, OUT: Int, R: Int, scale: Float32,
+) -> Float32:
+    var diff = _oracle_diff_values(w1a, w1b, w2a, w2b, IN, OUT, R, scale)
+    var y = _oracle_fwd(x, diff, M, IN, OUT)
+    var s = Float32(0.0)
+    for i in range(len(y)):
+        s += y[i]
+    return s
+
+
 # ── module-level FD grad over one factor (which: 0=w1a 1=w1b 2=w2a 3=w2b) ────
 # Central difference on _loss_for_fd. Lifted to module level so it captures
 # nothing (Mojo 1.0.0b1 can't infer captures for nested defs — MOJO_CONVENTIONS).
 def _fd_grad(lo_in: LoHaAdapter, which: Int, x: List[Float32], M: Int, h: Float32) raises -> List[Float32]:
+    var w1a0 = _bf16_to_f32_list(lo_in.w1a)
+    var w1b0 = _bf16_to_f32_list(lo_in.w1b)
+    var w2a0 = _bf16_to_f32_list(lo_in.w2a)
+    var w2b0 = _bf16_to_f32_list(lo_in.w2b)
     var out = List[Float32]()
     var n: Int
     if which == 0:
-        n = len(lo_in.w1a)
+        n = len(w1a0)
     elif which == 1:
-        n = len(lo_in.w1b)
+        n = len(w1b0)
     elif which == 2:
-        n = len(lo_in.w2a)
+        n = len(w2a0)
     else:
-        n = len(lo_in.w2b)
+        n = len(w2b0)
     for k in range(n):
-        var lp = lo_in.copy()
-        var lm = lo_in.copy()
+        var w1ap = w1a0.copy(); var w1am = w1a0.copy()
+        var w1bp = w1b0.copy(); var w1bm = w1b0.copy()
+        var w2ap = w2a0.copy(); var w2am = w2a0.copy()
+        var w2bp = w2b0.copy(); var w2bm = w2b0.copy()
         if which == 0:
-            lp.w1a[k] = lp.w1a[k] + h; lm.w1a[k] = lm.w1a[k] - h
+            w1ap[k] = w1ap[k] + h; w1am[k] = w1am[k] - h
         elif which == 1:
-            lp.w1b[k] = lp.w1b[k] + h; lm.w1b[k] = lm.w1b[k] - h
+            w1bp[k] = w1bp[k] + h; w1bm[k] = w1bm[k] - h
         elif which == 2:
-            lp.w2a[k] = lp.w2a[k] + h; lm.w2a[k] = lm.w2a[k] - h
+            w2ap[k] = w2ap[k] + h; w2am[k] = w2am[k] - h
         else:
-            lp.w2b[k] = lp.w2b[k] + h; lm.w2b[k] = lm.w2b[k] - h
-        out.append((_loss_for_fd(lp, x, M) - _loss_for_fd(lm, x, M)) / (Float32(2.0) * h))
+            w2bp[k] = w2bp[k] + h; w2bm[k] = w2bm[k] - h
+        var lp = _loss_for_fd_values(w1ap, w1bp, w2ap, w2bp, x, M, lo_in.in_f, lo_in.out_f, lo_in.rank, lo_in.scale)
+        var lm = _loss_for_fd_values(w1am, w1bm, w2am, w2bm, x, M, lo_in.in_f, lo_in.out_f, lo_in.rank, lo_in.scale)
+        out.append((lp - lm) / (Float32(2.0) * h))
     return out^
 
 
@@ -174,7 +222,7 @@ def main() raises:
     # Use a non-degenerate adapter: hand-set w2a to nonzero deterministic values.
     var lo = new_loha_adapter(IN, OUT, R, alpha, 7)
     for i in range(len(lo.w2a)):
-        lo.w2a[i] = Float32(0.05) * Float32((i % 7) + 1)
+        lo.w2a[i] = BFloat16(Float32(0.05) * Float32((i % 7) + 1))
     if lo.scale != Float32(1.0):
         print("FAIL: expected scale 1.0, got", lo.scale); ok = False
 
@@ -311,8 +359,8 @@ def main() raises:
         print("FAIL (c): alpha mismatch got", rb.alpha, "expected", alpha); ok = False
     else:
         print("PASS (c): alpha round-trip =", rb.alpha)
-    var w1a_mx = _max_abs_diff(rb.w1a, lo.w1a)
-    var w2a_mx = _max_abs_diff(rb.w2a, lo.w2a)
+    var w1a_mx = _max_abs_diff_bf16(rb.w1a, lo.w1a)
+    var w2a_mx = _max_abs_diff_bf16(rb.w2a, lo.w2a)
     if w1a_mx > Float32(1.0e-6) or w2a_mx > Float32(1.0e-6):
         print("FAIL (c): factor values not byte-exact, w1a Δ=", w1a_mx, " w2a Δ=", w2a_mx); ok = False
     else:

@@ -89,7 +89,7 @@ def sdxl_lora_apply(
     var base_h = base_y.to_host(ctx)                   # host [M,out]
     var summed = _add_lists(base_h, contrib)
     var sh = List[Int](); sh.append(M); sh.append(out_f)
-    return Tensor.from_host(summed^, sh^, STDtype.F32, ctx)
+    return Tensor.from_host(summed^, sh^, base_y.dtype(), ctx)
 
 
 # LoRA backward that ALSO returns the LoRA branch's contribution to d_x (as a host
@@ -118,8 +118,8 @@ def sdxl_lora_bwd(
     # t = x @ Aᵀ  (recompute; cheap)
     var nb_t = Optional[Tensor](None)
     var t = linear(
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         nb_t^, ctx,
     ).to_host(ctx)                                     # [M,rank]
     var d_dy = List[Float32]()
@@ -127,17 +127,17 @@ def sdxl_lora_bwd(
         d_dy.append(lo.scale * d_contrib_h[i])         # [M,out]
     # dy = t @ Bᵀ  -> d_t (the linear's d_x w.r.t. t)
     var lbB = linear_backward(
-        Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.F32, ctx),
-        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
+        Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.BF16, ctx),
+        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
         M, lo.rank, lo.out_f, ctx,
     )
     var d_t = lbB.d_x.to_host(ctx)                     # [M,rank]
     # t = x @ Aᵀ  -> d_x_lo = (linear's d_x w.r.t. x)
     var lbA = linear_backward(
-        Tensor.from_host(d_t^, [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(d_t^, [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         M, lo.in_f, lo.rank, ctx,
     )
     var d_x_lo = lbA.d_x.to_host(ctx)                  # [M,in_f]
@@ -166,7 +166,7 @@ def sdxl_proj_lora_into_dx(
     var base_dx = d_x_base.to_host(ctx)
     var summed = _add_lists(base_dx, lg.d_x)
     var sh = List[Int](); sh.append(M); sh.append(in_f)
-    return Tensor.from_host(summed^, sh^, STDtype.F32, ctx)
+    return Tensor.from_host(summed^, sh^, d_x_base.dtype(), ctx)
 
 
 # ── per-block LoRA carrier: the 10 optional adapters (slot order is canonical) ──

@@ -3,7 +3,7 @@
 # Faithful port of sd3_infer.rs:
 #   1. Load cached conditioning sidecar (produced by Rust encode-only run):
 #      context_cond/uncond [1, 410, 4096] F32→BF16, pooled_cond/uncond [1, 2048] F32→BF16.
-#   2. Init noise latent [1, 16, 128, 128] F32 (Box-Muller, seed=42).
+#   2. Init noise latent [1, 16, 128, 128] BF16 (Box-Muller, seed=42).
 #   3. 28-step shifted rectified-flow CFG Euler loop:
 #      - sigma schedule: shift=3.0, descending (same as Medium)
 #      - model timestep: sigma * 1000
@@ -200,20 +200,19 @@ def main() raises:
     var loader = BlockLoader.open(String(MODEL_PATH))
     print("  Block loader ready for 38 x ~426 MB blocks")
 
-    # Stage 4: Init noise latent [1, 16, 128, 128] F32
+    # Stage 4: Init noise latent [1, 16, 128, 128] BF16
     print("\n--- Stage 4: Init noise latent [1,", LC, ",", LH, ",", LW, "] ---")
     var noise_sh = List[Int]()
     noise_sh.append(1)
     noise_sh.append(LC)
     noise_sh.append(LH)
     noise_sh.append(LW)
-    var latent_f32 = randn(noise_sh^, SEED, STDtype.F32, ctx)
-    _stats("initial_noise", latent_f32, ctx)
+    var latent = randn(noise_sh^, SEED, STDtype.BF16, ctx)
+    _stats("initial_noise", latent, ctx)
 
     # Stage 5: Denoise loop
     print("\n--- Stage 5: Denoise (", NUM_STEPS, "steps, CFG=", CFG_SCALE, ") ---")
     var sched = SD3FlowMatchScheduler.large_default()
-    var latent = latent_f32^   # F32 throughout loop
 
     for step in range(NUM_STEPS):
         var sigma = sched.timestep(step)
@@ -221,23 +220,18 @@ def main() raises:
 
         print("  step", step + 1, "/", NUM_STEPS, "sigma=", sigma)
 
-        # Cast F32 latent -> BF16 for DiT
-        var latent_bf16 = cast_tensor(latent, STDtype.BF16, ctx)
-
         # Conditional forward (38 blocks streamed)
         var v_cond = _sd3_large_forward(
-            latent_bf16, sigma, context_cond, pooled_cond, gate, loader, ctx
+            latent, sigma, context_cond, pooled_cond, gate, loader, ctx
         )
 
         # Unconditional forward (38 blocks streamed again)
         var v_uncond = _sd3_large_forward(
-            latent_bf16, sigma, context_uncond, pooled_uncond, gate, loader, ctx
+            latent, sigma, context_uncond, pooled_uncond, gate, loader, ctx
         )
 
-        # CFG (in F32)
-        var vc_f32 = cast_tensor(v_cond, STDtype.F32, ctx)
-        var vu_f32 = cast_tensor(v_uncond, STDtype.F32, ctx)
-        var velocity = sd3_cfg(vc_f32, vu_f32, CFG_SCALE, ctx)
+        # CFG/Euler tensor ops use F32 arithmetic internally and store BF16.
+        var velocity = sd3_cfg(v_cond, v_uncond, CFG_SCALE, ctx)
 
         # Euler step
         latent = sd3_euler_step(latent, velocity, dt, ctx)
@@ -249,9 +243,8 @@ def main() raises:
 
     # Stage 6: VAE decode (uses embedded first_stage_model.decoder.* in Large checkpoint)
     print("\n--- Stage 6: VAE Decode ---")
-    var latent_bf16_final = cast_tensor(latent, STDtype.BF16, ctx)
     var vae = load_sd3_embedded_ldm_decoder[LH, LW](String(MODEL_PATH), ctx)
-    var image = vae.decode(latent_bf16_final, ctx)
+    var image = vae.decode(latent, ctx)
     var imsh = image.shape()
     print("  decoded:", imsh[2], "x", imsh[3])
     _stats("decoded_image", image, ctx)

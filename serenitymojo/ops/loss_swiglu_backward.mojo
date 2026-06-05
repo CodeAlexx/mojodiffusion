@@ -24,9 +24,9 @@
 #     silu'(g) = sig + g*sig*(1 - sig)         (sig = sigmoid(g))
 #              = sig * (1 + g*(1 - sig))        (the spec's spelling; identical)
 #
-# All interior math is F32 (the storage dtype IS F32 here — the training engine
-# keeps loss/activation backward in F32 master precision). Loud-fail on shape
-# / dtype / numel mismatch.
+# All interior math is F32. BF16/F16 public storage paths keep full tensors in
+# their storage dtype; kernels cast scalar elements to F32 and write gradients
+# back to the input dtype. Only scalar reduction values remain F32.
 #
 # Mojo 1.0.0b1, NVIDIA GPU. Mirrors activations.mojo / attention_backward.mojo
 # gather/scatter + per-element kernel scaffolding.
@@ -39,7 +39,6 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -52,36 +51,28 @@ def _sigmoid_f32(v: Float32) -> Float32:
 
 
 # ── MSE backward: d_pred[i] = 2 * (pred[i] - target[i]) / N ───────────────────
-def _mse_bwd_kernel_f32(
-    pred: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    tgt: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _mse_bwd_kernel[dtype: DType](
+    pred: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    tgt: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     inv_n2: Float32,  # = 2.0 / N
     n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var p = rebind[Scalar[DType.float32]](pred[i])
-        var t = rebind[Scalar[DType.float32]](tgt[i])
-        o[i] = rebind[o.element_type]((p - t) * inv_n2)
+        var p = rebind[Scalar[dtype]](pred[i]).cast[DType.float32]()
+        var t = rebind[Scalar[dtype]](tgt[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type](((p - t) * inv_n2).cast[dtype]())
 
 
 def mse_backward(pred: Tensor, target: Tensor, ctx: DeviceContext) raises -> Tensor:
     """Gradient of mean((pred-target)^2) wrt pred. d_pred = 2*(pred-target)/N.
 
-    pred/target: same shape, F32. Returns d_pred [same shape], F32.
+    pred/target: same shape and dtype. Returns d_pred in pred storage dtype.
     Matches torch.nn.functional.mse_loss(reduction='mean') autograd.
     """
-    # BF16/F16 storage path: cast up, run F32 interior, cast grad down.
-    # F32 path byte-identical (branch only on non-F32 input).
-    if pred.dtype() != STDtype.F32 or target.dtype() != STDtype.F32:
-        if pred.dtype() != target.dtype():
-            raise Error("mse_backward: pred/target dtype mismatch")
-        var out_dt = pred.dtype()
-        var p32 = cast_tensor(pred, STDtype.F32, ctx)
-        var t32 = cast_tensor(target, STDtype.F32, ctx)
-        var dp32 = mse_backward(p32, t32, ctx)
-        return cast_tensor(dp32, out_dt, ctx)
+    if pred.dtype() != target.dtype():
+        raise Error("mse_backward: pred/target dtype mismatch")
     if pred.numel() != target.numel():
         raise Error("mse_backward: pred/target numel mismatch")
     var n = pred.numel()
@@ -91,18 +82,37 @@ def mse_backward(pred: Tensor, target: Tensor, ctx: DeviceContext) raises -> Ten
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](pred.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
-    var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        pred.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        target.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    ctx.enqueue_function[_mse_bwd_kernel_f32, _mse_bwd_kernel_f32](
-        P, T, O, inv_n2, n, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = pred.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[
+            _mse_bwd_kernel[DType.float32], _mse_bwd_kernel[DType.float32]
+        ](P, T, O, inv_n2, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var T = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[
+            _mse_bwd_kernel[DType.bfloat16], _mse_bwd_kernel[DType.bfloat16]
+        ](P, T, O, inv_n2, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var P = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var T = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[
+            _mse_bwd_kernel[DType.float16], _mse_bwd_kernel[DType.float16]
+        ](P, T, O, inv_n2, n, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, pred.shape(), pred.dtype())
 
 
@@ -111,41 +121,34 @@ def mse_backward(pred: Tensor, target: Tensor, ctx: DeviceContext) raises -> Ten
 # MAE (mean reduction, matches torch.nn.functional.l1_loss(reduction='mean')):
 #     loss   = mean(|pred - target|)
 #     d_pred = sign(pred - target) / N      (sign(0) = 0, matches torch subgrad)
-def _mae_bwd_kernel_f32(
-    pred: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    tgt: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _mae_bwd_kernel[dtype: DType](
+    pred: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    tgt: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     inv_n: Float32,  # = 1.0 / N
     n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var p = rebind[Scalar[DType.float32]](pred[i])
-        var t = rebind[Scalar[DType.float32]](tgt[i])
+        var p = rebind[Scalar[dtype]](pred[i]).cast[DType.float32]()
+        var t = rebind[Scalar[dtype]](tgt[i]).cast[DType.float32]()
         var x = p - t
         var s = Float32(0.0)
         if x > Float32(0.0):
             s = Float32(1.0)
         elif x < Float32(0.0):
             s = Float32(-1.0)
-        o[i] = rebind[o.element_type](s * inv_n)
+        o[i] = rebind[o.element_type]((s * inv_n).cast[dtype]())
 
 
 def mae_backward(pred: Tensor, target: Tensor, ctx: DeviceContext) raises -> Tensor:
     """Gradient of mean(|pred-target|) wrt pred. d_pred = sign(pred-target)/N.
 
-    pred/target: same shape, F32. Returns d_pred [same shape], F32.
+    pred/target: same shape and dtype. Returns d_pred in pred storage dtype.
     Matches torch.nn.functional.l1_loss(reduction='mean') autograd (sign(0)=0).
     """
-    # BF16/F16 storage path: cast up, run F32 interior, cast grad down.
-    if pred.dtype() != STDtype.F32 or target.dtype() != STDtype.F32:
-        if pred.dtype() != target.dtype():
-            raise Error("mae_backward: pred/target dtype mismatch")
-        var out_dt = pred.dtype()
-        var p32 = cast_tensor(pred, STDtype.F32, ctx)
-        var t32 = cast_tensor(target, STDtype.F32, ctx)
-        var dp32 = mae_backward(p32, t32, ctx)
-        return cast_tensor(dp32, out_dt, ctx)
+    if pred.dtype() != target.dtype():
+        raise Error("mae_backward: pred/target dtype mismatch")
     if pred.numel() != target.numel():
         raise Error("mae_backward: pred/target numel mismatch")
     var n = pred.numel()
@@ -155,41 +158,60 @@ def mae_backward(pred: Tensor, target: Tensor, ctx: DeviceContext) raises -> Ten
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](pred.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
-    var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        pred.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        target.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    ctx.enqueue_function[_mae_bwd_kernel_f32, _mae_bwd_kernel_f32](
-        P, T, O, inv_n, n, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = pred.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[
+            _mae_bwd_kernel[DType.float32], _mae_bwd_kernel[DType.float32]
+        ](P, T, O, inv_n, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var T = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[
+            _mae_bwd_kernel[DType.bfloat16], _mae_bwd_kernel[DType.bfloat16]
+        ](P, T, O, inv_n, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var P = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var T = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[
+            _mae_bwd_kernel[DType.float16], _mae_bwd_kernel[DType.float16]
+        ](P, T, O, inv_n, n, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, pred.shape(), pred.dtype())
 
 
 # ── Huber backward: d_pred[i] = clamp(pred[i]-target[i], -δ, δ) / N ───────────
-def _huber_bwd_kernel_f32(
-    pred: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    tgt: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _huber_bwd_kernel[dtype: DType](
+    pred: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    tgt: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     delta: Float32,
     inv_n: Float32,  # = 1.0 / N
     n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var p = rebind[Scalar[DType.float32]](pred[i])
-        var t = rebind[Scalar[DType.float32]](tgt[i])
+        var p = rebind[Scalar[dtype]](pred[i]).cast[DType.float32]()
+        var t = rebind[Scalar[dtype]](tgt[i]).cast[DType.float32]()
         var x = p - t
         var c = x
         if c > delta:
             c = delta
         elif c < -delta:
             c = -delta
-        o[i] = rebind[o.element_type](c * inv_n)
+        o[i] = rebind[o.element_type]((c * inv_n).cast[dtype]())
 
 
 def huber_backward(
@@ -198,18 +220,10 @@ def huber_backward(
     """Gradient of huber/smooth-L1 (mean) wrt pred. d_pred = clamp(x,-δ,δ)/N,
     x = pred - target. Matches torch.nn.functional.huber_loss(delta=δ) autograd.
 
-    pred/target: same shape, F32. delta > 0. Returns d_pred [same shape], F32.
+    pred/target: same shape and dtype. delta > 0. Returns d_pred in pred dtype.
     """
-    # BF16/F16 storage path: cast up, run F32 interior, cast grad down.
-    # F32 path byte-identical (branch only on non-F32 input).
-    if pred.dtype() != STDtype.F32 or target.dtype() != STDtype.F32:
-        if pred.dtype() != target.dtype():
-            raise Error("huber_backward: pred/target dtype mismatch")
-        var out_dt = pred.dtype()
-        var p32 = cast_tensor(pred, STDtype.F32, ctx)
-        var t32 = cast_tensor(target, STDtype.F32, ctx)
-        var dp32 = huber_backward(p32, t32, delta, ctx)
-        return cast_tensor(dp32, out_dt, ctx)
+    if pred.dtype() != target.dtype():
+        raise Error("huber_backward: pred/target dtype mismatch")
     if pred.numel() != target.numel():
         raise Error("huber_backward: pred/target numel mismatch")
     if delta <= 0.0:
@@ -221,18 +235,37 @@ def huber_backward(
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](pred.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
-    var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        pred.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        target.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    ctx.enqueue_function[_huber_bwd_kernel_f32, _huber_bwd_kernel_f32](
-        P, T, O, delta, inv_n, n, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = pred.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[
+            _huber_bwd_kernel[DType.float32], _huber_bwd_kernel[DType.float32]
+        ](P, T, O, delta, inv_n, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var T = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[
+            _huber_bwd_kernel[DType.bfloat16], _huber_bwd_kernel[DType.bfloat16]
+        ](P, T, O, delta, inv_n, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var P = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var T = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[
+            _huber_bwd_kernel[DType.float16], _huber_bwd_kernel[DType.float16]
+        ](P, T, O, delta, inv_n, n, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, pred.shape(), pred.dtype())
 
 
@@ -248,24 +281,24 @@ struct SwigluGrads(Movable):
         self.d_up = d_up^
 
 
-def _swiglu_bwd_kernel_f32(
-    grad_out: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    gate: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    up: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    d_gate: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    d_up: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _swiglu_bwd_kernel[dtype: DType](
+    grad_out: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    gate: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    up: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    d_gate: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    d_up: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var g = rebind[Scalar[DType.float32]](grad_out[i])
-        var x = rebind[Scalar[DType.float32]](gate[i])
-        var u = rebind[Scalar[DType.float32]](up[i])
+        var g = rebind[Scalar[dtype]](grad_out[i]).cast[DType.float32]()
+        var x = rebind[Scalar[dtype]](gate[i]).cast[DType.float32]()
+        var u = rebind[Scalar[dtype]](up[i]).cast[DType.float32]()
         var sig = _sigmoid_f32(x)
         var silu_x = x * sig
         var dsilu = sig + x * sig * (1.0 - sig)
-        d_up[i] = rebind[d_up.element_type](g * silu_x)
-        d_gate[i] = rebind[d_gate.element_type](g * dsilu * u)
+        d_up[i] = rebind[d_up.element_type]((g * silu_x).cast[dtype]())
+        d_gate[i] = rebind[d_gate.element_type]((g * dsilu * u).cast[dtype]())
 
 
 def swiglu_backward(
@@ -276,23 +309,10 @@ def swiglu_backward(
         d_gate = grad_out * up * silu'(gate),  silu'(g) = sig + g*sig*(1-sig)
     Ports flame-core kernels/swiglu_backward.cu verbatim.
 
-    grad_out/gate/up: same shape, F32. Returns SwigluGrads{d_gate, d_up}, F32.
+    grad_out/gate/up: same shape and dtype. Returns gradients in storage dtype.
     """
-    # BF16/F16 storage path: cast up, run F32 interior, cast grads down.
-    # F32 path byte-identical (branch only on non-F32 input).
-    if (
-        grad_out.dtype() != STDtype.F32
-        or gate.dtype() != STDtype.F32
-        or up.dtype() != STDtype.F32
-    ):
-        var out_dt = gate.dtype()
-        var go32 = cast_tensor(grad_out, STDtype.F32, ctx)
-        var g32 = cast_tensor(gate, STDtype.F32, ctx)
-        var u32 = cast_tensor(up, STDtype.F32, ctx)
-        var grads32 = swiglu_backward(go32, g32, u32, ctx)
-        var dg_dn = cast_tensor(grads32.d_gate^, out_dt, ctx)
-        var du_dn = cast_tensor(grads32.d_up^, out_dt, ctx)
-        return SwigluGrads(dg_dn^, du_dn^)
+    if grad_out.dtype() != gate.dtype() or gate.dtype() != up.dtype():
+        raise Error("swiglu_backward: grad_out/gate/up dtype mismatch")
     if grad_out.numel() != gate.numel() or gate.numel() != up.numel():
         raise Error("swiglu_backward: grad_out/gate/up numel mismatch")
     var n = gate.numel()
@@ -302,24 +322,50 @@ def swiglu_backward(
     var du_buf = ctx.enqueue_create_buffer[DType.uint8](up.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
-    var GO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        grad_out.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        gate.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var U = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        up.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dg_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var DU = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        du_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    ctx.enqueue_function[_swiglu_bwd_kernel_f32, _swiglu_bwd_kernel_f32](
-        GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = gate.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var U = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            up.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float32](), rl)
+        var DU = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            du_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[
+            _swiglu_bwd_kernel[DType.float32], _swiglu_bwd_kernel[DType.float32]
+        ](GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var U = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            up.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var DG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var DU = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            du_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[
+            _swiglu_bwd_kernel[DType.bfloat16], _swiglu_bwd_kernel[DType.bfloat16]
+        ](GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var U = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            up.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var DG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float16](), rl)
+        var DU = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            du_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[
+            _swiglu_bwd_kernel[DType.float16], _swiglu_bwd_kernel[DType.float16]
+        ](GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK)
+    ctx.synchronize()
     var dg_t = Tensor(dg_buf^, gate.shape(), gate.dtype())
     var du_t = Tensor(du_buf^, up.shape(), up.dtype())
     return SwigluGrads(dg_t^, du_t^)

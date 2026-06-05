@@ -22,12 +22,22 @@
 #   timestep_dim | rope_theta | learning_rate→lr | lora_rank | lora_alpha
 #   timestep_shift | max_grad_norm | max_steps | save_every | sample_every
 #   optimizer.{eps,weight_decay,beta1,beta2}
+#   train_modality/ltx2_mode | lora_target_preset | dataset_cache_dir/cache_dir
+#   require_cached_video_latents | require_cached_text_embeddings
+#   require_cached_audio_latents | hot_loop_device_only
+#   video_loss_weight | audio_loss_weight
 #
 # Mojo 1.0.0b1: `def` not `fn`; no Python.
 
 from std.collections import List
 from serenitymojo.io.json_header import _Cursor, _parse_string, _skip_value
-from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.train_config import (
+    TrainConfig,
+    TRAIN_MODALITY_VIDEO, TRAIN_MODALITY_AV, TRAIN_MODALITY_AUDIO,
+    LORA_TARGET_LEGACY_VIDEO_ATTN1, LORA_TARGET_LTX2_T2V,
+    LORA_TARGET_LTX2_V2V, LORA_TARGET_LTX2_AUDIO,
+    LORA_TARGET_LTX2_AUDIO_REF_ONLY_IC, LORA_TARGET_LTX2_FULL,
+)
 
 
 # ── General JSON number parser (signed, fractional, scientific) ──────────────
@@ -266,6 +276,64 @@ def _adapter_algo_int(s: String) raises -> Int:
     )
 
 
+def _checked_train_modality(v: Int) raises -> Int:
+    if v == TRAIN_MODALITY_VIDEO or v == TRAIN_MODALITY_AV or v == TRAIN_MODALITY_AUDIO:
+        return v
+    raise Error(
+        String("JSON config: unknown train_modality ")
+        + String(v) + String(" (expected 0=video, 1=av, 2=audio)")
+    )
+
+
+def _train_modality_int(s: String) raises -> Int:
+    if s == "video" or s == "v":
+        return TRAIN_MODALITY_VIDEO
+    elif s == "av" or s == "audio_video" or s == "va":
+        return TRAIN_MODALITY_AV
+    elif s == "audio" or s == "a":
+        return TRAIN_MODALITY_AUDIO
+    raise Error(
+        String("JSON config: unknown train_modality '") + s
+        + String("' (expected video|av|audio)")
+    )
+
+
+def _checked_lora_target_preset(v: Int) raises -> Int:
+    if (
+        v == LORA_TARGET_LEGACY_VIDEO_ATTN1
+        or v == LORA_TARGET_LTX2_T2V
+        or v == LORA_TARGET_LTX2_V2V
+        or v == LORA_TARGET_LTX2_AUDIO
+        or v == LORA_TARGET_LTX2_AUDIO_REF_ONLY_IC
+        or v == LORA_TARGET_LTX2_FULL
+    ):
+        return v
+    raise Error(
+        String("JSON config: unknown lora_target_preset ")
+        + String(v)
+        + String(" (expected 0=legacy_video_attn1, 1=t2v, 2=v2v, 3=audio, 4=audio_ref_only_ic, 5=full)")
+    )
+
+
+def _lora_target_preset_int(s: String) raises -> Int:
+    if s == "legacy_video_attn1" or s == "legacy":
+        return LORA_TARGET_LEGACY_VIDEO_ATTN1
+    elif s == "t2v":
+        return LORA_TARGET_LTX2_T2V
+    elif s == "v2v":
+        return LORA_TARGET_LTX2_V2V
+    elif s == "audio":
+        return LORA_TARGET_LTX2_AUDIO
+    elif s == "audio_ref_only_ic":
+        return LORA_TARGET_LTX2_AUDIO_REF_ONLY_IC
+    elif s == "full":
+        return LORA_TARGET_LTX2_FULL
+    raise Error(
+        String("JSON config: unknown lora_target_preset '") + s
+        + String("' (expected legacy_video_attn1|t2v|v2v|audio|audio_ref_only_ic|full)")
+    )
+
+
 # ── Read a whole file's bytes via raw syscalls (pure-Mojo, no Python). ───────
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, BytePtr, O_RDONLY
 from std.memory import alloc
@@ -460,6 +528,35 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             if not sc.is_string:
                 raise Error("JSON config: algo must be a string")
             cfg.adapter_algo = _adapter_algo_int(sc.s)
+        # ── cached-input / AV trainer contract ──
+        elif key == "train_modality" or key == "ltx2_mode" or key == "modality":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.train_modality = _train_modality_int(sc.s)
+            else:
+                cfg.train_modality = _checked_train_modality(Int(sc.num))
+        elif key == "lora_target_preset" or key == "ltx2_lora_target_preset":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.lora_target_preset = _lora_target_preset_int(sc.s)
+            else:
+                cfg.lora_target_preset = _checked_lora_target_preset(Int(sc.num))
+        elif key == "dataset_cache_dir" or key == "cache_dir" or key == "train_cache_dir":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.dataset_cache_dir = sc.s
+        elif key == "require_cached_video_latents" or key == "cache_video_latents":
+            cfg.require_cached_video_latents = _read_scalar(cur).num != 0.0
+        elif key == "require_cached_text_embeddings" or key == "cache_text_embeddings":
+            cfg.require_cached_text_embeddings = _read_scalar(cur).num != 0.0
+        elif key == "require_cached_audio_latents" or key == "cache_audio_latents":
+            cfg.require_cached_audio_latents = _read_scalar(cur).num != 0.0
+        elif key == "hot_loop_device_only" or key == "device_hot_loop":
+            cfg.hot_loop_device_only = _read_scalar(cur).num != 0.0
+        elif key == "video_loss_weight":
+            cfg.video_loss_weight = Float32(_read_scalar(cur).num)
+        elif key == "audio_loss_weight":
+            cfg.audio_loss_weight = Float32(_read_scalar(cur).num)
         else:
             _skip_value(cur)  # skip unknown top-level keys
 

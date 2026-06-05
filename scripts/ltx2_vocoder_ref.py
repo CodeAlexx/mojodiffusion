@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """LTX-2.3 BigVGAN vocoder + BWE parity oracle (Plan P4 / P1).
 
-Faithful Python port of the Rust `LTX2VocoderWithBWE::forward`
-(inference-flame/src/vae/ltx2_vocoder.rs), loading the REAL vocoder weights from
-the distilled checkpoint. Reproduces every op of the Rust REFERENCE tensor path
-(activation1d kaiser anti-alias, snake-beta, ConvTranspose1d upsample, AMPBlock1
-averaging, BWE compute_mel + bwe_generator + sinc skip + clamp), in BF16 compute
-to match the Rust `to_dtype(BF16)` path.
+Faithful Python port of the production LTX2 `VocoderWithBWE.forward` boundary:
+BF16 mel input/output with the internal BigVGAN+BWE chain computed in F32
+(`mel_spec.float()` inside an autocast-F32 block, then `.to(input_dtype)`).
 
 Dumps, all as F32, to output/ltx2_vocoder/vocoder_ref.safetensors:
   mel_in      [1, 2, T, 64]   deterministic test mel-spectrogram input
@@ -31,11 +28,9 @@ CKPT = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensor
 OUT_DIR = "/home/alex/mojodiffusion/output/ltx2_vocoder"
 OUT = os.path.join(OUT_DIR, "vocoder_ref.safetensors")
 
-# F32 compute (op-identical to the Rust BF16 path, strictly more accurate) so
-# the gate reflects STRUCTURAL correctness, not BF16 conv-accumulation jitter
-# — the same doctrine as scripts/ltx2_av_block0_parity.py. The Mojo conv1d
-# accumulates in F32; matching the oracle in F32 makes the gate meaningful.
-DTYPE = torch.float32
+BOUNDARY_DTYPE = torch.bfloat16
+COMPUTE_DTYPE = torch.float32
+DTYPE = COMPUTE_DTYPE
 NUM_KERNELS_PER_STAGE = 3
 RESBLOCK_KERNEL_SIZES = [3, 7, 11]
 DILATIONS = [1, 3, 5]
@@ -243,7 +238,7 @@ def hann_sinc_resample_filter(ratio, dev):
 class VocoderWithBWE:
     def __init__(self, w, dev):
         self.dev = dev
-        self.vocoder = Vocoder(w, "vocoder.vocoder", True, dev)
+        self.vocoder = Vocoder(w, "vocoder.vocoder", False, dev)
         self.bwe = Vocoder(w, "vocoder.bwe_generator", False, dev)
         self.mel_basis = w["vocoder.mel_stft.mel_basis"].to(dev, DTYPE)
         self.forward_basis = w["vocoder.mel_stft.stft_fn.forward_basis"].to(dev, DTYPE)
@@ -339,10 +334,33 @@ def main():
     g = torch.Generator(device="cpu").manual_seed(1234)
     n_mels = model.mel_basis.shape[0]  # 64
     mel_in = (torch.rand(1, 2, T_MEL, n_mels, generator=g) * 8.0 - 6.0)  # ~[-6, 2]
-    mel_in_d = mel_in.to(dev, DTYPE)
+    mel_in_boundary = mel_in.to(BOUNDARY_DTYPE)
+    mel_in_d = mel_in_boundary.to(dev, COMPUTE_DTYPE)
 
     with torch.no_grad():
-        wav, wav16 = model.forward(mel_in_d)
+        x = model.vocoder.forward(mel_in_d)
+        wav16 = x.clone()
+        length_low_rate = x.shape[2]
+        output_length = length_low_rate * model.output_sr // model.input_sr
+        remainder = length_low_rate % model.hop_length
+        if remainder != 0:
+            x = F.pad(x, (0, model.hop_length - remainder))
+        mel_bwe = model.compute_mel(x)
+        mel_for_bwe = mel_bwe.permute(0, 1, 3, 2)
+        residual = model.bwe.forward(mel_for_bwe)
+        skip = model.sinc_upsample(x)
+        mix = min(residual.shape[2], skip.shape[2])
+        residual = residual[:, :, :mix]
+        skip = skip[:, :, :mix]
+        wav = (residual + skip).clamp(-1.0, 1.0)
+        if wav.shape[2] > output_length:
+            wav = wav[:, :, :output_length]
+            residual = residual[:, :, :output_length]
+            skip = skip[:, :, :output_length]
+        wav = wav.to(BOUNDARY_DTYPE)
+        wav16 = wav16.to(BOUNDARY_DTYPE)
+        residual = residual.to(BOUNDARY_DTYPE)
+        skip = skip.to(BOUNDARY_DTYPE)
 
     print(f"mel_in {tuple(mel_in.shape)}")
     print(f"wav16  {tuple(wav16.shape)} range [{wav16.float().min():.4f}, {wav16.float().max():.4f}]")
@@ -351,9 +369,12 @@ def main():
     print(f"wav48 rms {rms:.5f}")
 
     out = {
-        "mel_in": mel_in.float().contiguous(),
+        "mel_in": mel_in_boundary.float().contiguous(),
         "wav_ref": wav.float().cpu().contiguous(),
         "wav16_ref": wav16.float().cpu().contiguous(),
+        "mel_bwe_ref": mel_for_bwe.to(BOUNDARY_DTYPE).float().cpu().contiguous(),
+        "residual_ref": residual.float().cpu().contiguous(),
+        "skip_ref": skip.float().cpu().contiguous(),
     }
     save_file(out, OUT)
     print(f"wrote {OUT}")

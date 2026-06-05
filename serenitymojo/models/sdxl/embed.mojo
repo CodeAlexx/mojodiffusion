@@ -110,7 +110,9 @@ def embed_forward[
     t: Tensor, y: Tensor, w: EmbWeights, ctx: DeviceContext,
 ) raises -> EmbFwd:
     # time: sinusoidal -> Linear0 -> SiLU -> Linear2
-    var ts = timestep_embedding(t, Sdim, ctx, Float32(10000.0))   # [B,Sdim]
+    var ts = timestep_embedding(
+        t, Sdim, ctx, Float32(10000.0), w.t0_w.dtype()
+    )
     var t0lin = linear(ts.clone(ctx), w.t0_w.clone(ctx), Optional[Tensor](w.t0_b.clone(ctx)), ctx)
     var t0silu = silu(t0lin, ctx)
     var te = linear(t0silu.clone(ctx), w.t2_w.clone(ctx), Optional[Tensor](w.t2_b.clone(ctx)), ctx)

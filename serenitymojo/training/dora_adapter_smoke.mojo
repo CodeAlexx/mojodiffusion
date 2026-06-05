@@ -84,6 +84,24 @@ def _max_abs_diff(a: List[Float32], b: List[Float32]) raises -> Float32:
     return mx
 
 
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
+def _max_abs_diff_bf16(a: List[BFloat16], b: List[BFloat16]) raises -> Float32:
+    if len(a) != len(b):
+        raise Error("max_abs_diff_bf16: len mismatch " + String(len(a)) + " != " + String(len(b)))
+    var mx = Float32(0.0)
+    for i in range(len(a)):
+        var d = abs(a[i].cast[DType.float32]() - b[i].cast[DType.float32]())
+        if d > mx:
+            mx = d
+    return mx
+
+
 # ── INDEPENDENT oracle: WP_dora = m * (WP / (‖WP‖₂+eps)) via raw triple loops ─
 # Open-coded, NOT using dora_adapter helpers. ΔW = (B@A)*scale, WP = W_orig+ΔW,
 # norm along input axis (wd_on_out=true). Returns wp_dora:[out,in].
@@ -220,7 +238,7 @@ def main() raises:
     # Drive B off zero so all 3 trainables are live for parity / grad-flow.
     var d = new_dora_adapter(w_orig, IN, OUT, R, alpha, 7, eps)
     for i in range(len(d.b)):
-        d.b[i] = Float32(0.03) * Float32((i % 5) + 1)
+        d.b[i] = BFloat16(Float32(0.03) * Float32((i % 5) + 1))
     if d.scale != Float32(1.0):
         print("FAIL: expected scale 1.0, got", d.scale); ok = False
 
@@ -231,7 +249,10 @@ def main() raises:
 
     # ── GATE (a) effective-weight + forward parity vs independent oracle ─────
     var eff = dora_effective_weight(w_orig, d)
-    var wp_oracle = _oracle_wp_dora(w_orig, d.a, d.b, d.m, OUT, IN, R, d.scale, eps)
+    var d_a_h = _bf16_to_f32_list(d.a)
+    var d_b_h = _bf16_to_f32_list(d.b)
+    var d_m_h = _bf16_to_f32_list(d.m)
+    var wp_oracle = _oracle_wp_dora(w_orig, d_a_h, d_b_h, d_m_h, OUT, IN, R, d.scale, eps)
     var wp_mx = _max_abs_diff(eff.wp_dora, wp_oracle)
     if wp_mx > Float32(1.0e-5):
         print("FAIL (a-wp): WP_dora vs oracle max|Δ|=", wp_mx); ok = False
@@ -253,10 +274,10 @@ def main() raises:
     var g = dora_backward(d_y, x, w_orig, d, M)
 
     var h = Float32(1.0e-3)
-    var den_base = _den_base(w_orig, d.a, d.b, OUT, IN, R, d.scale, eps)
-    var fda = _fd_grad(0, w_orig, d.a, d.b, d.m, den_base, x, OUT, IN, R, M, d.scale, h)
-    var fdb = _fd_grad(1, w_orig, d.a, d.b, d.m, den_base, x, OUT, IN, R, M, d.scale, h)
-    var fdm = _fd_grad(2, w_orig, d.a, d.b, d.m, den_base, x, OUT, IN, R, M, d.scale, h)
+    var den_base = _den_base(w_orig, d_a_h, d_b_h, OUT, IN, R, d.scale, eps)
+    var fda = _fd_grad(0, w_orig, d_a_h, d_b_h, d_m_h, den_base, x, OUT, IN, R, M, d.scale, h)
+    var fdb = _fd_grad(1, w_orig, d_a_h, d_b_h, d_m_h, den_base, x, OUT, IN, R, M, d.scale, h)
+    var fdm = _fd_grad(2, w_orig, d_a_h, d_b_h, d_m_h, den_base, x, OUT, IN, R, M, d.scale, h)
 
     var tol_fd = Float32(2.0e-2)
     var ea = _max_abs_diff(g.d_a, fda)
@@ -344,9 +365,9 @@ def main() raises:
         print("FAIL (c): alpha mismatch got", rb.alpha, "expected", alpha); ok = False
     else:
         print("PASS (c): alpha round-trip =", rb.alpha)
-    var a_mx = _max_abs_diff(rb.a, d.a)
-    var b_mx = _max_abs_diff(rb.b, d.b)
-    var m_mx = _max_abs_diff(rb.m, d.m)
+    var a_mx = _max_abs_diff_bf16(rb.a, d.a)
+    var b_mx = _max_abs_diff_bf16(rb.b, d.b)
+    var m_mx = _max_abs_diff_bf16(rb.m, d.m)
     if a_mx > Float32(1.0e-6) or b_mx > Float32(1.0e-6) or m_mx > Float32(1.0e-6):
         print("FAIL (c): values not byte-exact, A Δ=", a_mx, " B Δ=", b_mx, " m Δ=", m_mx); ok = False
     else:

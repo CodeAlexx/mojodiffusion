@@ -9,8 +9,9 @@
 # correct at scale (A1 skeptic-bait). For that we generate inputs + reference
 # on the fly in-driver (rms_norm has a closed form; no numpy needed).
 #
-# Storage dtype = F32 throughout so parity isolates op correctness from BF16
-# quantization (the ops also support BF16/F16 storage).
+# Storage dtype = F32 throughout for parity cases so op math is isolated from
+# BF16/F16 quantization. Small dtype-dispatch smokes cover selected BF16/F16
+# storage paths.
 #
 # Run: pixi run mojo run -I . serenitymojo/ops_smoke2.mojo
 
@@ -335,6 +336,37 @@ def main() raises:
     )
     r = h.compare(out_cv, out_cv_ref, ctx)
     print("conv2d         ", r)
+    all_pass = all_pass and r.passed
+
+    # ── conv2d narrow bias dispatch: zero conv output + BF16/F16 bias add ─────
+    var conv_bias_ref = _lf(
+        1.5, -2.25,
+        1.5, -2.25,
+        1.5, -2.25,
+        1.5, -2.25,
+    )
+    var out_cv_bf16 = conv2d[1, 2, 2, 1, 1, 1, 2, 1, 1, 0, 0](
+        Tensor.from_host(_lf(0.0, 0.0, 0.0, 0.0), [1, 2, 2, 1], STDtype.BF16, ctx),
+        Tensor.from_host(_lf(0.0, 0.0), [1, 1, 1, 2], STDtype.BF16, ctx),
+        Optional[Tensor](Tensor.from_host(_lf(1.5, -2.25), [2], STDtype.BF16, ctx)),
+        ctx,
+    )
+    if out_cv_bf16.dtype() != STDtype.BF16:
+        raise Error("conv2d bf16 bias smoke: output dtype mismatch")
+    r = h.compare(out_cv_bf16, conv_bias_ref, ctx)
+    print("conv2d bf16 bias", r)
+    all_pass = all_pass and r.passed
+
+    var out_cv_f16 = conv2d[1, 2, 2, 1, 1, 1, 2, 1, 1, 0, 0](
+        Tensor.from_host(_lf(0.0, 0.0, 0.0, 0.0), [1, 2, 2, 1], STDtype.F16, ctx),
+        Tensor.from_host(_lf(0.0, 0.0), [1, 1, 1, 2], STDtype.F16, ctx),
+        Optional[Tensor](Tensor.from_host(_lf(1.5, -2.25), [2], STDtype.F16, ctx)),
+        ctx,
+    )
+    if out_cv_f16.dtype() != STDtype.F16:
+        raise Error("conv2d f16 bias smoke: output dtype mismatch")
+    r = h.compare(out_cv_f16, conv_bias_ref, ctx)
+    print("conv2d f16 bias ", r)
     all_pass = all_pass and r.passed
 
     # ── rms_norm at scale: D in {2560, 3072, 4096} (cols > _TPB=256) ─────────

@@ -1,12 +1,11 @@
-# ops/norm_backward.mojo — BACKWARD for rms_norm / layer_norm / group_norm (F32).
+# ops/norm_backward.mojo — BACKWARD for rms_norm / layer_norm / group_norm.
 #
-# Backward partner of ops/norm.mojo. F32-only (the parity gate runs F32; the
-# storage-dtype variants can be added later by mirroring the forward's dispatch).
-# Same scaffolding as the forward: one block per row (rms/layer) or per (n,group)
-# (group), shared-memory F32 tree reductions; the parameter grads (d_g, d_b) use
-# a cross-row/spatial reduction kernel (one thread per column/channel) that
-# recomputes the per-row/per-group stats — same recompute discipline as
-# flame-core's layer_norm/group_norm backward (flame_norm_bf16.cu).
+# Backward partner of ops/norm.mojo. Same scaffolding as the forward: one block
+# per row (rms/layer) or per
+# (n,group) (group), shared-memory F32 tree reductions; the parameter grads
+# (d_g, d_b) use a cross-row/spatial reduction kernel (one thread per
+# column/channel) that recomputes the per-row/per-group stats — same recompute
+# discipline as flame-core's layer_norm/group_norm backward (flame_norm_bf16.cu).
 #
 # Math (normalize over feature dim D / group; weight g, bias b, eps). LayerNorm
 # uses BIASED variance (matches the forward + torch). All interior math F32.
@@ -24,6 +23,9 @@
 #     same d_x form as LayerNorm reduced over the group;
 #     d_g[c] = sum_{n,hw}( go*norm ) ;  d_b[c] = sum_{n,hw}( go )   (per channel)
 #
+# Storage dtype is preserved; kernels read BF16/F16/F32 elements, cast scalar
+# values to F32 for math, and write gradients back in the input/weight dtype.
+#
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import sqrt
@@ -36,7 +38,6 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -50,11 +51,11 @@ comptime _BLOCK = 256
 # ════════════════════════════════════════════════════════════════════════════
 
 # d_x: one block per row [rows, D]. Reduce sum(x^2) then sum(go*g*x), then write.
-def _rms_bwd_dx_kernel(
-    go: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    dx: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+def _rms_bwd_dx_kernel[dtype: DType](
+    go: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    g: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dx: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     cols: Int,
     eps: Float32,
 ):
@@ -68,7 +69,7 @@ def _rms_bwd_dx_kernel(
     var lsq: Float32 = 0.0
     var c = tid
     while c < cols:
-        var v = rebind[Scalar[DType.float32]](x[row, c])
+        var v = rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]()
         lsq += v * v
         c += _TPB
     sh[tid] = lsq
@@ -86,9 +87,9 @@ def _rms_bwd_dx_kernel(
     var lgwx: Float32 = 0.0
     c = tid
     while c < cols:
-        var gov = rebind[Scalar[DType.float32]](go[row, c])
-        var gv = rebind[Scalar[DType.float32]](g[c])
-        var xv = rebind[Scalar[DType.float32]](x[row, c])
+        var gov = rebind[Scalar[dtype]](go[row, c]).cast[DType.float32]()
+        var gv = rebind[Scalar[dtype]](g[c]).cast[DType.float32]()
+        var xv = rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]()
         lgwx += gov * gv * xv
         c += _TPB
     sh[tid] = lgwx
@@ -105,19 +106,19 @@ def _rms_bwd_dx_kernel(
     var inv3 = inv * inv * inv
     c = tid
     while c < cols:
-        var xv = rebind[Scalar[DType.float32]](x[row, c])
-        var gv = rebind[Scalar[DType.float32]](g[c])
-        var gov = rebind[Scalar[DType.float32]](go[row, c])
+        var xv = rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]()
+        var gv = rebind[Scalar[dtype]](g[c]).cast[DType.float32]()
+        var gov = rebind[Scalar[dtype]](go[row, c]).cast[DType.float32]()
         var out = gv * gov * inv - xv * inv3 * (sum_gwx / Float32(cols))
-        dx[row, c] = rebind[dx.element_type](out)
+        dx[row, c] = rebind[dx.element_type](out.cast[dtype]())
         c += _TPB
 
 
 # d_g: one thread per column. d_g[c] = sum_rows( go[r,c]*x[r,c]*inv_rms[r] ).
-def _rms_bwd_dg_kernel(
-    go: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    dg: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _rms_bwd_dg_kernel[dtype: DType](
+    go: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    dg: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     rows: Int,
     cols: Int,
     eps: Float32,
@@ -129,13 +130,13 @@ def _rms_bwd_dg_kernel(
     for r in range(rows):
         var sq: Float32 = 0.0
         for cc in range(cols):
-            var v = rebind[Scalar[DType.float32]](x[r, cc])
+            var v = rebind[Scalar[dtype]](x[r, cc]).cast[DType.float32]()
             sq += v * v
         var inv = 1.0 / sqrt(sq / Float32(cols) + eps)
-        var gov = rebind[Scalar[DType.float32]](go[r, col])
-        var xv = rebind[Scalar[DType.float32]](x[r, col])
+        var gov = rebind[Scalar[dtype]](go[r, col]).cast[DType.float32]()
+        var xv = rebind[Scalar[dtype]](x[r, col]).cast[DType.float32]()
         acc += gov * xv * inv
-    dg[col] = rebind[dg.element_type](acc)
+    dg[col] = rebind[dg.element_type](acc.cast[dtype]())
 
 
 struct RmsNormBackward(Movable):
@@ -152,20 +153,10 @@ struct RmsNormBackward(Movable):
 def rms_norm_backward(
     go: Tensor, x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> RmsNormBackward:
-    """Backward of rms_norm. go/x same shape [..,D] (F32); weight [D] (F32).
-    Returns d_x (x's shape) and d_g [D]."""
-    # BF16/F16 storage path: cast inputs up to F32, run the F32 interior below
-    # verbatim, then cast grads back down to the storage dtype. The F32 path is
-    # byte-identical (the branch is only taken when an input is not F32).
-    if x.dtype() != STDtype.F32 or go.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
-        var out_dt = x.dtype()
-        var go32 = cast_tensor(go, STDtype.F32, ctx)
-        var x32 = cast_tensor(x, STDtype.F32, ctx)
-        var w32 = cast_tensor(weight, STDtype.F32, ctx)
-        var g32 = rms_norm_backward(go32, x32, w32, eps, ctx)
-        var dx_dn = cast_tensor(g32.d_x^, out_dt, ctx)
-        var dg_dn = cast_tensor(g32.d_g^, out_dt, ctx)
-        return RmsNormBackward(dx_dn^, dg_dn^)
+    """Backward of rms_norm. go/x same shape [..,D]; weight [D].
+    Returns d_x and d_g in the same storage dtype as the inputs."""
+    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
+        raise Error("rms_norm_backward: go/x/weight dtype mismatch")
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     var rows = 1
@@ -178,32 +169,63 @@ def rms_norm_backward(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 
-    var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        go.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight.buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-    var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dg_buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-
-    ctx.enqueue_function[_rms_bwd_dx_kernel, _rms_bwd_dx_kernel](
-        GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB
-    )
     var dg_grid = (d + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_rms_bwd_dg_kernel, _rms_bwd_dg_kernel](
-        GO, X, DG, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.float32], _rms_bwd_dx_kernel[DType.float32]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[
+            _rms_bwd_dg_kernel[DType.float32], _rms_bwd_dg_kernel[DType.float32]
+        ](GO, X, DG, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var DG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.bfloat16], _rms_bwd_dx_kernel[DType.bfloat16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[
+            _rms_bwd_dg_kernel[DType.bfloat16], _rms_bwd_dg_kernel[DType.bfloat16]
+        ](GO, X, DG, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var DG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[
+            _rms_bwd_dg_kernel[DType.float16], _rms_bwd_dg_kernel[DType.float16]
+        ](GO, X, DG, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+    ctx.synchronize()
     return RmsNormBackward(
-        Tensor(dx_buf^, xshape.copy(), STDtype.F32),
-        Tensor(dg_buf^, weight.shape().copy(), STDtype.F32),
+        Tensor(dx_buf^, xshape.copy(), x.dtype()),
+        Tensor(dg_buf^, weight.shape().copy(), weight.dtype()),
     )
 
 
@@ -215,14 +237,8 @@ def rms_norm_backward_dx(
     Frozen-weight training paths should use this instead of `rms_norm_backward`
     because the full d_g kernel recomputes row stats once per column.
     """
-    if x.dtype() != STDtype.F32 or go.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
-        var out_dt = x.dtype()
-        var go32 = cast_tensor(go, STDtype.F32, ctx)
-        var x32 = cast_tensor(x, STDtype.F32, ctx)
-        var w32 = cast_tensor(weight, STDtype.F32, ctx)
-        var dx32 = rms_norm_backward_dx(go32, x32, w32, eps, ctx)
-        var dx_dn = cast_tensor(dx32^, out_dt, ctx)
-        return dx_dn^
+    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
+        raise Error("rms_norm_backward_dx: go/x/weight dtype mismatch")
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     var rows = 1
@@ -233,23 +249,45 @@ def rms_norm_backward_dx(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 
-    var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        go.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight.buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-    var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-
-    ctx.enqueue_function[_rms_bwd_dx_kernel, _rms_bwd_dx_kernel](
-        GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB
-    )
-    return Tensor(dx_buf^, xshape.copy(), STDtype.F32)
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.float32], _rms_bwd_dx_kernel[DType.float32]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.bfloat16], _rms_bwd_dx_kernel[DType.bfloat16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    ctx.synchronize()
+    return Tensor(dx_buf^, xshape.copy(), x.dtype())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -257,11 +295,11 @@ def rms_norm_backward_dx(
 # ════════════════════════════════════════════════════════════════════════════
 
 # d_x: one block per row. Reduce mean, var, sum_wg, sum_wgn; then write d_x.
-def _ln_bwd_dx_kernel(
-    go: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    dx: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+def _ln_bwd_dx_kernel[dtype: DType](
+    go: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    g: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dx: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     cols: Int,
     eps: Float32,
 ):
@@ -275,7 +313,7 @@ def _ln_bwd_dx_kernel(
     var ls: Float32 = 0.0
     var c = tid
     while c < cols:
-        ls += rebind[Scalar[DType.float32]](x[row, c])
+        ls += rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]()
         c += _TPB
     sh[tid] = ls
     barrier()
@@ -292,7 +330,7 @@ def _ln_bwd_dx_kernel(
     var lv: Float32 = 0.0
     c = tid
     while c < cols:
-        var dd = rebind[Scalar[DType.float32]](x[row, c]) - mean
+        var dd = rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]() - mean
         lv += dd * dd
         c += _TPB
     sh[tid] = lv
@@ -310,7 +348,10 @@ def _ln_bwd_dx_kernel(
     var lwg: Float32 = 0.0
     c = tid
     while c < cols:
-        lwg += rebind[Scalar[DType.float32]](g[c]) * rebind[Scalar[DType.float32]](go[row, c])
+        lwg += (
+            rebind[Scalar[dtype]](g[c]).cast[DType.float32]()
+            * rebind[Scalar[dtype]](go[row, c]).cast[DType.float32]()
+        )
         c += _TPB
     sh[tid] = lwg
     barrier()
@@ -327,8 +368,12 @@ def _ln_bwd_dx_kernel(
     var lwgn: Float32 = 0.0
     c = tid
     while c < cols:
-        var norm = (rebind[Scalar[DType.float32]](x[row, c]) - mean) * inv
-        lwgn += rebind[Scalar[DType.float32]](g[c]) * rebind[Scalar[DType.float32]](go[row, c]) * norm
+        var norm = (rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]() - mean) * inv
+        lwgn += (
+            rebind[Scalar[dtype]](g[c]).cast[DType.float32]()
+            * rebind[Scalar[dtype]](go[row, c]).cast[DType.float32]()
+            * norm
+        )
         c += _TPB
     sh[tid] = lwgn
     barrier()
@@ -343,20 +388,20 @@ def _ln_bwd_dx_kernel(
 
     c = tid
     while c < cols:
-        var norm = (rebind[Scalar[DType.float32]](x[row, c]) - mean) * inv
-        var wv = rebind[Scalar[DType.float32]](g[c])
-        var gov = rebind[Scalar[DType.float32]](go[row, c])
+        var norm = (rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]() - mean) * inv
+        var wv = rebind[Scalar[dtype]](g[c]).cast[DType.float32]()
+        var gov = rebind[Scalar[dtype]](go[row, c]).cast[DType.float32]()
         var out = inv * wv * gov - (inv / Float32(cols)) * sum_wg - (norm * inv / Float32(cols)) * sum_wgn
-        dx[row, c] = rebind[dx.element_type](out)
+        dx[row, c] = rebind[dx.element_type](out.cast[dtype]())
         c += _TPB
 
 
 # d_g, d_b: one thread per column, recompute per-row mean/inv_std.
-def _ln_bwd_param_kernel(
-    go: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    dg: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    db: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _ln_bwd_param_kernel[dtype: DType](
+    go: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    dg: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    db: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     rows: Int,
     cols: Int,
     eps: Float32,
@@ -369,19 +414,19 @@ def _ln_bwd_param_kernel(
     for r in range(rows):
         var s: Float32 = 0.0
         for cc in range(cols):
-            s += rebind[Scalar[DType.float32]](x[r, cc])
+            s += rebind[Scalar[dtype]](x[r, cc]).cast[DType.float32]()
         var mean = s / Float32(cols)
         var vs: Float32 = 0.0
         for cc in range(cols):
-            var dd = rebind[Scalar[DType.float32]](x[r, cc]) - mean
+            var dd = rebind[Scalar[dtype]](x[r, cc]).cast[DType.float32]() - mean
             vs += dd * dd
         var inv = 1.0 / sqrt(vs / Float32(cols) + eps)
-        var norm = (rebind[Scalar[DType.float32]](x[r, col]) - mean) * inv
-        var gov = rebind[Scalar[DType.float32]](go[r, col])
+        var norm = (rebind[Scalar[dtype]](x[r, col]).cast[DType.float32]() - mean) * inv
+        var gov = rebind[Scalar[dtype]](go[r, col]).cast[DType.float32]()
         acc_g += gov * norm
         acc_b += gov
-    dg[col] = rebind[dg.element_type](acc_g)
-    db[col] = rebind[db.element_type](acc_b)
+    dg[col] = rebind[dg.element_type](acc_g.cast[dtype]())
+    db[col] = rebind[db.element_type](acc_b.cast[dtype]())
 
 
 struct LayerNormBackward(Movable):
@@ -400,20 +445,10 @@ struct LayerNormBackward(Movable):
 def layer_norm_backward(
     go: Tensor, x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> LayerNormBackward:
-    """Backward of layer_norm. go/x [..,D] (F32); weight [D] (F32).
-    Returns d_x (x's shape), d_g [D], d_b [D]."""
-    # BF16/F16 storage path: cast up, run F32 interior, cast grads down.
-    # F32 path byte-identical (branch only on non-F32 input).
-    if x.dtype() != STDtype.F32 or go.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
-        var out_dt = x.dtype()
-        var go32 = cast_tensor(go, STDtype.F32, ctx)
-        var x32 = cast_tensor(x, STDtype.F32, ctx)
-        var w32 = cast_tensor(weight, STDtype.F32, ctx)
-        var g32 = layer_norm_backward(go32, x32, w32, eps, ctx)
-        var dx_dn = cast_tensor(g32.d_x^, out_dt, ctx)
-        var dg_dn = cast_tensor(g32.d_g^, out_dt, ctx)
-        var db_dn = cast_tensor(g32.d_b^, out_dt, ctx)
-        return LayerNormBackward(dx_dn^, dg_dn^, db_dn^)
+    """Backward of layer_norm. go/x [..,D]; weight [D].
+    Returns d_x, d_g, and d_b in the same storage dtype as the inputs."""
+    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
+        raise Error("layer_norm_backward: go/x/weight dtype mismatch")
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     var rows = 1
@@ -427,36 +462,70 @@ def layer_norm_backward(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 
-    var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        go.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight.buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-    var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dg_buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-    var DB = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        db_buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-
-    ctx.enqueue_function[_ln_bwd_dx_kernel, _ln_bwd_dx_kernel](
-        GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB
-    )
     var dg_grid = (d + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_ln_bwd_param_kernel, _ln_bwd_param_kernel](
-        GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var DB = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            db_buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.float32], _ln_bwd_dx_kernel[DType.float32]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[
+            _ln_bwd_param_kernel[DType.float32], _ln_bwd_param_kernel[DType.float32]
+        ](GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var DG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var DB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            db_buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.bfloat16], _ln_bwd_dx_kernel[DType.bfloat16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[
+            _ln_bwd_param_kernel[DType.bfloat16], _ln_bwd_param_kernel[DType.bfloat16]
+        ](GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var DG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var DB = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            db_buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.float16], _ln_bwd_dx_kernel[DType.float16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        ctx.enqueue_function[
+            _ln_bwd_param_kernel[DType.float16], _ln_bwd_param_kernel[DType.float16]
+        ](GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+    ctx.synchronize()
     return LayerNormBackward(
-        Tensor(dx_buf^, xshape.copy(), STDtype.F32),
-        Tensor(dg_buf^, weight.shape().copy(), STDtype.F32),
-        Tensor(db_buf^, weight.shape().copy(), STDtype.F32),
+        Tensor(dx_buf^, xshape.copy(), x.dtype()),
+        Tensor(dg_buf^, weight.shape().copy(), weight.dtype()),
+        Tensor(db_buf^, weight.shape().copy(), weight.dtype()),
     )
 
 
@@ -467,14 +536,8 @@ def layer_norm_backward_dx(
 
     This skips d_g/d_b parameter reductions. Use it for frozen LayerNorm weights.
     """
-    if x.dtype() != STDtype.F32 or go.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
-        var out_dt = x.dtype()
-        var go32 = cast_tensor(go, STDtype.F32, ctx)
-        var x32 = cast_tensor(x, STDtype.F32, ctx)
-        var w32 = cast_tensor(weight, STDtype.F32, ctx)
-        var dx32 = layer_norm_backward_dx(go32, x32, w32, eps, ctx)
-        var dx_dn = cast_tensor(dx32^, out_dt, ctx)
-        return dx_dn^
+    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
+        raise Error("layer_norm_backward_dx: go/x/weight dtype mismatch")
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     var rows = 1
@@ -485,23 +548,45 @@ def layer_norm_backward_dx(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 
-    var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        go.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight.buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-    var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-
-    ctx.enqueue_function[_ln_bwd_dx_kernel, _ln_bwd_dx_kernel](
-        GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB
-    )
-    return Tensor(dx_buf^, xshape.copy(), STDtype.F32)
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.float32], _ln_bwd_dx_kernel[DType.float32]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.bfloat16], _ln_bwd_dx_kernel[DType.bfloat16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.float16], _ln_bwd_dx_kernel[DType.float16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    ctx.synchronize()
+    return Tensor(dx_buf^, xshape.copy(), x.dtype())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -513,11 +598,11 @@ def layer_norm_backward_dx(
 
 # d_x: one block per (n, group) = grid n*G. Reduce mean, var, sum_wg, sum_wgn
 # over the group's cpg*hw elements; then write d_x.
-def _gn_bwd_dx_kernel(
-    go: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    dx: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _gn_bwd_dx_kernel[dtype: DType](
+    go: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    g: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dx: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     n_dim: Int,
     hw: Int,
     c_dim: Int,
@@ -542,7 +627,7 @@ def _gn_bwd_dx_kernel(
         var pix = i // cpg
         var cc = i % cpg
         var off = (n * hw + pix) * c_dim + (c0 + cc)
-        ls += rebind[Scalar[DType.float32]](x[off])
+        ls += rebind[Scalar[dtype]](x[off]).cast[DType.float32]()
         i += _TPB
     sh[tid] = ls
     barrier()
@@ -562,7 +647,7 @@ def _gn_bwd_dx_kernel(
         var pix = i // cpg
         var cc = i % cpg
         var off = (n * hw + pix) * c_dim + (c0 + cc)
-        var dd = rebind[Scalar[DType.float32]](x[off]) - mean
+        var dd = rebind[Scalar[dtype]](x[off]).cast[DType.float32]() - mean
         lv += dd * dd
         i += _TPB
     sh[tid] = lv
@@ -584,7 +669,10 @@ def _gn_bwd_dx_kernel(
         var cc = i % cpg
         var ch = c0 + cc
         var off = (n * hw + pix) * c_dim + ch
-        lwg += rebind[Scalar[DType.float32]](g[ch]) * rebind[Scalar[DType.float32]](go[off])
+        lwg += (
+            rebind[Scalar[dtype]](g[ch]).cast[DType.float32]()
+            * rebind[Scalar[dtype]](go[off]).cast[DType.float32]()
+        )
         i += _TPB
     sh[tid] = lwg
     barrier()
@@ -605,8 +693,12 @@ def _gn_bwd_dx_kernel(
         var cc = i % cpg
         var ch = c0 + cc
         var off = (n * hw + pix) * c_dim + ch
-        var norm = (rebind[Scalar[DType.float32]](x[off]) - mean) * inv
-        lwgn += rebind[Scalar[DType.float32]](g[ch]) * rebind[Scalar[DType.float32]](go[off]) * norm
+        var norm = (rebind[Scalar[dtype]](x[off]).cast[DType.float32]() - mean) * inv
+        lwgn += (
+            rebind[Scalar[dtype]](g[ch]).cast[DType.float32]()
+            * rebind[Scalar[dtype]](go[off]).cast[DType.float32]()
+            * norm
+        )
         i += _TPB
     sh[tid] = lwgn
     barrier()
@@ -625,21 +717,21 @@ def _gn_bwd_dx_kernel(
         var cc = i % cpg
         var ch = c0 + cc
         var off = (n * hw + pix) * c_dim + ch
-        var norm = (rebind[Scalar[DType.float32]](x[off]) - mean) * inv
-        var wv = rebind[Scalar[DType.float32]](g[ch])
-        var gov = rebind[Scalar[DType.float32]](go[off])
+        var norm = (rebind[Scalar[dtype]](x[off]).cast[DType.float32]() - mean) * inv
+        var wv = rebind[Scalar[dtype]](g[ch]).cast[DType.float32]()
+        var gov = rebind[Scalar[dtype]](go[off]).cast[DType.float32]()
         var out = inv * wv * gov - (inv / Float32(count)) * sum_wg - (norm * inv / Float32(count)) * sum_wgn
-        dx[off] = rebind[dx.element_type](out)
+        dx[off] = rebind[dx.element_type](out.cast[dtype]())
         i += _TPB
 
 
 # d_g, d_b: one thread per channel; recompute (n,group) stats, accumulate over
 # all n and spatial positions for that channel.
-def _gn_bwd_param_kernel(
-    go: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    dg: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    db: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _gn_bwd_param_kernel[dtype: DType](
+    go: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dg: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    db: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     n_dim: Int,
     hw: Int,
     c_dim: Int,
@@ -663,25 +755,25 @@ def _gn_bwd_param_kernel(
             var pix = ii // cpg
             var cc = ii % cpg
             var off = (n * hw + pix) * c_dim + (c0 + cc)
-            s += rebind[Scalar[DType.float32]](x[off])
+            s += rebind[Scalar[dtype]](x[off]).cast[DType.float32]()
         var mean = s / Float32(count)
         var vs: Float32 = 0.0
         for ii in range(count):
             var pix = ii // cpg
             var cc = ii % cpg
             var off = (n * hw + pix) * c_dim + (c0 + cc)
-            var dd = rebind[Scalar[DType.float32]](x[off]) - mean
+            var dd = rebind[Scalar[dtype]](x[off]).cast[DType.float32]() - mean
             vs += dd * dd
         var inv = 1.0 / sqrt(vs / Float32(count) + eps)
         # accumulate over spatial for this channel
         for pix in range(hw):
             var off = (n * hw + pix) * c_dim + ch
-            var norm = (rebind[Scalar[DType.float32]](x[off]) - mean) * inv
-            var gov = rebind[Scalar[DType.float32]](go[off])
+            var norm = (rebind[Scalar[dtype]](x[off]).cast[DType.float32]() - mean) * inv
+            var gov = rebind[Scalar[dtype]](go[off]).cast[DType.float32]()
             acc_g += gov * norm
             acc_b += gov
-    dg[ch] = rebind[dg.element_type](acc_g)
-    db[ch] = rebind[db.element_type](acc_b)
+    dg[ch] = rebind[dg.element_type](acc_g.cast[dtype]())
+    db[ch] = rebind[db.element_type](acc_b.cast[dtype]())
 
 
 struct GroupNormBackward(Movable):
@@ -705,20 +797,10 @@ def group_norm_backward(
     eps: Float32,
     ctx: DeviceContext,
 ) raises -> GroupNormBackward:
-    """Backward of group_norm (NHWC). go/x [N,H,W,C] (F32); weight [C] (F32).
-    Returns d_x [N,H,W,C], d_g [C], d_b [C]."""
-    # BF16/F16 storage path: cast up, run F32 interior, cast grads down.
-    # F32 path byte-identical (branch only on non-F32 input).
-    if x.dtype() != STDtype.F32 or go.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
-        var out_dt = x.dtype()
-        var go32 = cast_tensor(go, STDtype.F32, ctx)
-        var x32 = cast_tensor(x, STDtype.F32, ctx)
-        var w32 = cast_tensor(weight, STDtype.F32, ctx)
-        var g32 = group_norm_backward(go32, x32, w32, num_groups, eps, ctx)
-        var dx_dn = cast_tensor(g32.d_x^, out_dt, ctx)
-        var dg_dn = cast_tensor(g32.d_g^, out_dt, ctx)
-        var db_dn = cast_tensor(g32.d_b^, out_dt, ctx)
-        return GroupNormBackward(dx_dn^, dg_dn^, db_dn^)
+    """Backward of group_norm (NHWC). go/x [N,H,W,C]; weight [C].
+    Returns d_x [N,H,W,C], d_g [C], d_b [C] in input storage dtype."""
+    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
+        raise Error("group_norm_backward: go/x/weight dtype mismatch")
     var xshape = x.shape()
     if len(xshape) != 4:
         raise Error("group_norm_backward: x must be NHWC [N,H,W,C]")
@@ -738,37 +820,87 @@ def group_norm_backward(
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
     var c_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](c))
 
-    var GO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        go.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        weight.buf.unsafe_ptr().bitcast[Float32](), c_rl
-    )
-    var DX = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dg_buf.unsafe_ptr().bitcast[Float32](), c_rl
-    )
-    var DB = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        db_buf.unsafe_ptr().bitcast[Float32](), c_rl
-    )
-
     var dx_blocks = n * num_groups
-    ctx.enqueue_function[_gn_bwd_dx_kernel, _gn_bwd_dx_kernel](
-        GO, X, G, DX, n, hw, c, num_groups, eps,
-        grid_dim=dx_blocks, block_dim=_TPB,
-    )
     var c_grid = (c + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_gn_bwd_param_kernel, _gn_bwd_param_kernel](
-        GO, X, DG, DB, n, hw, c, num_groups, eps,
-        grid_dim=c_grid, block_dim=_BLOCK,
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), c_rl)
+        var DX = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float32](), c_rl)
+        var DB = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            db_buf.unsafe_ptr().bitcast[Float32](), c_rl)
+        ctx.enqueue_function[
+            _gn_bwd_dx_kernel[DType.float32], _gn_bwd_dx_kernel[DType.float32]
+        ](
+            GO, X, G, DX, n, hw, c, num_groups, eps,
+            grid_dim=dx_blocks, block_dim=_TPB,
+        )
+        ctx.enqueue_function[
+            _gn_bwd_param_kernel[DType.float32], _gn_bwd_param_kernel[DType.float32]
+        ](
+            GO, X, DG, DB, n, hw, c, num_groups, eps,
+            grid_dim=c_grid, block_dim=_BLOCK,
+        )
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var DG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
+        var DB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            db_buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
+        ctx.enqueue_function[
+            _gn_bwd_dx_kernel[DType.bfloat16], _gn_bwd_dx_kernel[DType.bfloat16]
+        ](
+            GO, X, G, DX, n, hw, c, num_groups, eps,
+            grid_dim=dx_blocks, block_dim=_TPB,
+        )
+        ctx.enqueue_function[
+            _gn_bwd_param_kernel[DType.bfloat16], _gn_bwd_param_kernel[DType.bfloat16]
+        ](
+            GO, X, DG, DB, n, hw, c, num_groups, eps,
+            grid_dim=c_grid, block_dim=_BLOCK,
+        )
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), c_rl)
+        var DX = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var DG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float16](), c_rl)
+        var DB = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            db_buf.unsafe_ptr().bitcast[Float16](), c_rl)
+        ctx.enqueue_function[
+            _gn_bwd_dx_kernel[DType.float16], _gn_bwd_dx_kernel[DType.float16]
+        ](
+            GO, X, G, DX, n, hw, c, num_groups, eps,
+            grid_dim=dx_blocks, block_dim=_TPB,
+        )
+        ctx.enqueue_function[
+            _gn_bwd_param_kernel[DType.float16], _gn_bwd_param_kernel[DType.float16]
+        ](
+            GO, X, DG, DB, n, hw, c, num_groups, eps,
+            grid_dim=c_grid, block_dim=_BLOCK,
+        )
+    ctx.synchronize()
     return GroupNormBackward(
-        Tensor(dx_buf^, xshape.copy(), STDtype.F32),
-        Tensor(dg_buf^, weight.shape().copy(), STDtype.F32),
-        Tensor(db_buf^, weight.shape().copy(), STDtype.F32),
+        Tensor(dx_buf^, xshape.copy(), x.dtype()),
+        Tensor(dg_buf^, weight.shape().copy(), weight.dtype()),
+        Tensor(db_buf^, weight.shape().copy(), weight.dtype()),
     )

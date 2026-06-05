@@ -29,8 +29,8 @@
 #   norm_out(GN32) + silu + conv_out 512->32 @ IH/8
 #   -> moments NHWC [1,LH,LW,32]; encode() splits mu|logvar + reparam.
 #
-# DTYPE: F32 end-to-end (latent-correctness precision, like klein_encoder /
-# vae_encode_general). Conv weights loaded BF16->F32 via _load_conv_weight_rscf.
+# DTYPE: activations follow checkpoint weight storage. Reparam does F32 math
+# inside the kernel and stores the sampled latent in the moment dtype.
 #
 # Mojo 0.26.x+: `def`, move-only Tensor, comptime spatial dims for conv2d.
 
@@ -44,6 +44,7 @@ from serenitymojo.ops.conv import conv2d
 from serenitymojo.ops.norm import group_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.random import randn
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import slice, concat, zeros_device
 from serenitymojo.models.vae.decoder2d import (
     ResnetBlock, AttnBlock, nchw_to_nhwc, nhwc_to_nchw, GN_GROUPS, GN_EPS,
@@ -201,13 +202,19 @@ struct FluxVaeEncoder[LH: Int, LW: Int](Movable):
         )
 
     def encode_moments(self, image_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
-        """[1,3,IH,IW] (F32) -> NHWC moments [1,LH,LW,2*ZC] = mu|logvar."""
+        """[1,3,IH,IW] -> NHWC moments [1,LH,LW,2*ZC] in checkpoint dtype."""
         var sh = image_nchw.shape()
         if len(sh) != 4 or sh[1] != 3 or sh[2] != Self.IH or sh[3] != Self.IW:
             raise Error("encode_moments: expected [1,3,8*LH,8*LW]")
-        if image_nchw.dtype() != STDtype.F32:
-            raise Error("encode_moments: F32 only")
+        if (
+            image_nchw.dtype() != STDtype.F32
+            and image_nchw.dtype() != STDtype.BF16
+            and image_nchw.dtype() != STDtype.F16
+        ):
+            raise Error("encode_moments: expected F32, BF16, or F16 input")
         var h = nchw_to_nhwc(image_nchw, ctx)            # [1,IH,IW,3]
+        if h.dtype() != self.conv_in_w.dtype():
+            h = cast_tensor(h, self.conv_in_w.dtype(), ctx)
         h = conv2d[1, Self.IH, Self.IW, 3, 3, 3, FLUX_CH, 1, 1, 1, 1](
             h, clone(self.conv_in_w, ctx),
             Optional[Tensor](clone(self.conv_in_b, ctx)), ctx
@@ -266,5 +273,5 @@ struct FluxVaeEncoder[LH: Int, LW: Int](Movable):
         var mu = nhwc_to_nchw(mu_nhwc, ctx)
         var lv = nhwc_to_nchw(lv_nhwc, ctx)
         var eps_shape = mu.shape()
-        var eps = randn(eps_shape^, eps_seed, STDtype.F32, ctx)
+        var eps = randn(eps_shape^, eps_seed, mu.dtype(), ctx)
         return diag_gaussian_sample(mu, lv, eps, ctx)

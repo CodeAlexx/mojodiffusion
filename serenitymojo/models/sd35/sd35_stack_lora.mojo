@@ -397,13 +397,13 @@ def _lora_delta(
     # intermediate = x @ A.T   [rows, rank]
     var inter = linear(
         _t(x_h, [rows, in_f], ctx),
-        _t(ad.a.copy(), [rank, in_f], ctx),
+        Tensor.from_host_bf16(ad.a.copy(), [rank, in_f], ctx),
         Optional[Tensor](None), ctx,
     )
     # delta = inter @ B.T  [rows, out_f]
     var delta = linear(
         inter,
-        _t(ad.b.copy(), [out_f, rank], ctx),
+        Tensor.from_host_bf16(ad.b.copy(), [out_f, rank], ctx),
         Optional[Tensor](None), ctx,
     )
     # scale and flatten

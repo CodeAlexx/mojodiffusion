@@ -873,10 +873,10 @@ struct QwenImageDit(Movable):
         # timestep_embedding computes angle = t * exp(-ln(max_period)*i/half),
         # cos-first-then-sin (matches diffusers flip_sin_to_cos=True). max_period
         # 10000. We pre-scaled t by 1000 to fold in diffusers scale=1000.
-        var t_embed = timestep_embedding(t_tensor, cfg.timestep_dim, ctx, Float32(10000.0))
-        # cast to weight dtype for the MLP, run as [1, 1, 256] then squeeze
-        var t_embed_3d = reshape(t_embed, _shape3(1, 1, cfg.timestep_dim), ctx)
-        var t_embed_cast = _cast_like(t_embed_3d, dtype, ctx)
+        var t_embed = timestep_embedding(
+            t_tensor, cfg.timestep_dim, ctx, Float32(10000.0), dtype
+        )
+        var t_embed_cast = reshape(t_embed, _shape3(1, 1, cfg.timestep_dim), ctx)
         var h1 = self._linear_b(
             t_embed_cast,
             "time_text_embed.timestep_embedder.linear_1.weight",
@@ -1010,10 +1010,9 @@ struct QwenImageDitOffloaded(Movable):
         t_sh.append(1)
         var t_tensor = Tensor.from_host(t_host, t_sh^, STDtype.F32, ctx)
         var t_embed = timestep_embedding(
-            t_tensor, cfg.timestep_dim, ctx, Float32(10000.0)
+            t_tensor, cfg.timestep_dim, ctx, Float32(10000.0), dtype
         )
-        var t_embed_3d = reshape(t_embed, _shape3(1, 1, cfg.timestep_dim), ctx)
-        var t_embed_cast = _cast_like(t_embed_3d, dtype, ctx)
+        var t_embed_cast = reshape(t_embed, _shape3(1, 1, cfg.timestep_dim), ctx)
         var h1 = self.shared._linear_b(
             t_embed_cast,
             "time_text_embed.timestep_embedder.linear_1.weight",

@@ -29,7 +29,6 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.klein_dit import Klein9BOffloadedTurbo, build_klein_rope_tables
 from serenitymojo.models.vae.klein_decoder import KleinVaeDecoder
-from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, reshape, permute
 from serenitymojo.sampling.flux2_klein import build_flux2_sigma_schedule, flux2_cfg
@@ -115,7 +114,7 @@ def initial_tokens(ctx: DeviceContext) raises -> Tensor:
     nchw_shape.append(128)
     nchw_shape.append(LH)
     nchw_shape.append(LW)
-    var noise_nchw = randn(nchw_shape^, SEED, STDtype.F32, ctx)
+    var noise_nchw = randn(nchw_shape^, SEED, STDtype.BF16, ctx)
     var p = List[Int]()
     p.append(0)
     p.append(2)
@@ -152,9 +151,8 @@ def denoise(caps: KleinCaps, ctx: DeviceContext) raises -> Tensor:
     # build_flux2_sigma_schedule returns NUM_STEPS+1 sigmas (1.0 .. 0.0).
     var sigmas = build_flux2_sigma_schedule(NUM_STEPS, N_IMG)
     print("[denoise]", NUM_STEPS, "steps, CFG", CFG, "seed", SEED)
-    # x is the latent; kept F32 across the whole loop (cast to BF16 per step
-    # only to feed the DiT). x is moved/reassigned each step — never reference
-    # a previous binding after `x = add(...)`.
+    # x is the BF16 latent carrier. Tensor ops use F32 arithmetic internally;
+    # never materialize the full latent/prediction loop in F32.
     var x = initial_tokens(ctx)
     for i in range(NUM_STEPS):
         var t_curr = sigmas[i]
@@ -171,17 +169,12 @@ def denoise(caps: KleinCaps, ctx: DeviceContext) raises -> Tensor:
         var tsh = List[Int]()
         tsh.append(1)
         var timestep = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)
-        # BF16 view of the F32 latent. The offloaded CFG path streams each
-        # block once, runs positive and negative branches, then unloads it.
-        var xb = cast_tensor(x, STDtype.BF16, ctx)
         var preds = model.forward_full_cfg[N_IMG, N_TXT, S](
-            xb, caps.pos, caps.neg, timestep, rope[0], rope[1], ctx
+            x, caps.pos, caps.neg, timestep, rope[0], rope[1], ctx
         )
-        var pred_pos = cast_tensor(preds.pos, STDtype.F32, ctx)
-        var pred_neg = cast_tensor(preds.neg, STDtype.F32, ctx)
         # CFG: neg + CFG*(pos - neg). NO post-CFG sign flip for Klein.
-        var pred = flux2_cfg(pred_pos, pred_neg, CFG, ctx)
-        # Direct-velocity Euler: x = x + dt * pred (F32 latent in/out).
+        var pred = flux2_cfg(preds.pos, preds.neg, CFG, ctx)
+        # Direct-velocity Euler: x = x + dt * pred; storage remains BF16.
         x = add(x, mul_scalar(pred, dt, ctx), ctx)
     return x^
 

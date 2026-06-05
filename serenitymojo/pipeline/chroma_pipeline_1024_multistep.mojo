@@ -2,7 +2,7 @@
 #
 # Faithful port of chroma_gen.rs (inference-flame):
 #   1. Load cached T5 sidecar (cond + uncond) — skip T5 port.
-#   2. Init noise latent [1, 16, 128, 128] F32 (Box-Muller, seed=42).
+#   2. Init noise latent [1, 16, 128, 128] BF16 (Box-Muller, seed=42).
 #   3. 30-step shifted rectified-flow CFG Euler loop:
 #      - FLUX get_schedule (mu linear 0.5..1.15, shift=True)
 #      - approximator forward (distilled_guidance_layer) once per step
@@ -714,8 +714,8 @@ def main() raises:
     noise_shape.append(LC)
     noise_shape.append(LH)
     noise_shape.append(LW)
-    var noise_nchw = randn(noise_shape^, SEED, STDtype.F32, ctx)
-    var img_packed = cast_tensor(_pack_latent(noise_nchw, ctx), STDtype.BF16, ctx)
+    var noise_nchw = randn(noise_shape^, SEED, STDtype.BF16, ctx)
+    var img_packed = _pack_latent(noise_nchw, ctx)
     var psh = img_packed.shape()
     print("  Packed latent:", psh[0], psh[1], psh[2])
     _stats("init_latent", img_packed, ctx)
@@ -769,7 +769,8 @@ def main() raises:
     _ = _sink_loader
     print("  DiT weights dropped")
 
-    # ae.safetensors weights are F32 — cast latent to F32 before decode.
+    # The current Flux VAE decoder path is F32-weight/file-format only; this is
+    # the remaining decode-boundary cast until that VAE path is dtype-generic.
     var latent_f32 = cast_tensor(latent, STDtype.F32, ctx)
 
     # Load FLUX VAE decoder (ae.safetensors, 16ch, scale=0.3611, shift=0.1159)

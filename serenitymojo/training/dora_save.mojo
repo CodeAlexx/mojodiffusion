@@ -8,9 +8,9 @@
 # load alias). The base low-rank legs use the project PEFT LoRA convention
 # (lora_save.mojo:24-25):
 #
-#       "<prefix>.lora_A.weight"   F32 [rank, in]    (== DoRAAdapter.a / lora_down)
-#       "<prefix>.lora_B.weight"   F32 [out, rank]   (== DoRAAdapter.b / lora_up)
-#       "<prefix>.dora_scale"      F32 [out, 1]      (== DoRAAdapter.m magnitude)
+#       "<prefix>.lora_A.weight"   BF16 [rank, in]   (== DoRAAdapter.a / lora_down)
+#       "<prefix>.lora_B.weight"   BF16 [out, rank]  (== DoRAAdapter.b / lora_up)
+#       "<prefix>.dora_scale"      BF16 [out, 1]     (== DoRAAdapter.m magnitude)
 #       "<prefix>.alpha"           F32 [1]
 #
 # ── AGENT-DEFAULT (flagged for review) ────────────────────────────────────────
@@ -21,7 +21,7 @@
 # - Plain LoRA (lora_save.mojo) deliberately OMITS `.alpha`; DoRA follows the
 #   LyCORIS convention and DOES carry `.alpha` (so scale=alpha/rank reconstructs).
 #
-# Mojo 0.26.x: `def` not `fn`; move-only Tensor → ArcPointer; STDtype.F32 a value.
+# Mojo 0.26.x: `def` not `fn`; move-only Tensor → ArcPointer.
 
 from std.collections import List
 from std.memory import ArcPointer
@@ -41,11 +41,11 @@ struct NamedDoRA(Copyable, Movable):
     var adapter: DoRAAdapter
 
 
-def _f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+def _bf16_2d(var values: List[BFloat16], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(rows)
     sh.append(cols)
-    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+    return Tensor.from_host_bf16(values^, sh^, ctx)
 
 
 def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
@@ -54,6 +54,13 @@ def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(1)
     return Tensor.from_host(v^, sh^, STDtype.F32, ctx)
+
+
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,11 +89,11 @@ def save_dora_peft(
             raise Error(String("save_dora_peft: magnitude numel ") + String(len(a.m)) + " != out for '" + nd.prefix + "'")
 
         names.append(nd.prefix + ".lora_A.weight")
-        tensors.append(ArcPointer(_f32_2d(a.a.copy(), R, IN, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.a.copy(), R, IN, ctx)))
         names.append(nd.prefix + ".lora_B.weight")
-        tensors.append(ArcPointer(_f32_2d(a.b.copy(), OUT, R, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.b.copy(), OUT, R, ctx)))
         names.append(nd.prefix + ".dora_scale")
-        tensors.append(ArcPointer(_f32_2d(a.m.copy(), OUT, 1, ctx)))   # [out,1]
+        tensors.append(ArcPointer(_bf16_2d(a.m.copy(), OUT, 1, ctx)))   # [out,1]
         names.append(nd.prefix + ".alpha")
         tensors.append(ArcPointer(_f32_scalar(a.alpha, ctx)))
 
@@ -111,6 +118,10 @@ def _read_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[
     return t.to_host(ctx)
 
 
+def _read_bf16(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[BFloat16]:
+    return _f32_to_bf16_list(_read_f32(st, name, ctx))
+
+
 # True iff `name` is present in the file.
 def _has_key(st: SafeTensors, name: String) -> Bool:
     try:
@@ -123,9 +134,9 @@ def _has_key(st: SafeTensors, name: String) -> Bool:
 # A read-back of one DoRA module: A, B, magnitude (+ shapes) + alpha.
 @fieldwise_init
 struct DoRAReadback(Copyable, Movable):
-    var a: List[Float32]
-    var b: List[Float32]
-    var m: List[Float32]
+    var a: List[BFloat16]
+    var b: List[BFloat16]
+    var m: List[BFloat16]
     var in_f: Int
     var out_f: Int
     var rank: Int
@@ -162,9 +173,9 @@ def read_dora_module(prefix: String, path: String, ctx: DeviceContext) raises ->
     if im.shape[0] != OUT:
         raise Error("read_dora_module: magnitude first dim != out")
 
-    var a = _read_f32(st, prefix + ".lora_A.weight", ctx)
-    var b = _read_f32(st, prefix + ".lora_B.weight", ctx)
-    var m = _read_f32(st, mag_key, ctx)
+    var a = _read_bf16(st, prefix + ".lora_A.weight", ctx)
+    var b = _read_bf16(st, prefix + ".lora_B.weight", ctx)
+    var m = _read_bf16(st, mag_key, ctx)
     if len(m) != OUT:
         raise Error("read_dora_module: magnitude numel != out")
     var alpha_h = _read_f32(st, prefix + ".alpha", ctx)

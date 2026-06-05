@@ -60,7 +60,7 @@ def _ones(d: Int) -> List[Float32]:
 
 
 def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
-    return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+    return Tensor.from_host(vals, shape^, STDtype.BF16, ctx)
 
 
 # biased linear forward (host list in/out): y = x @ W.T + b
@@ -72,7 +72,7 @@ def _linear_b(
     ctx.synchronize()
     var bt = Tensor(bclone^, b.shape(), b.dtype())
     return linear(
-        Tensor.from_host(x_h.copy(), [M, in_f], STDtype.F32, ctx),
+        Tensor.from_host(x_h.copy(), [M, in_f], STDtype.BF16, ctx),
         w, Optional[Tensor](bt^), ctx,
     ).to_host(ctx)
 
@@ -93,12 +93,12 @@ struct QwenStackBase(Copyable, Movable):
         var proj_out_w: List[Float32], var proj_out_b: List[Float32],
         D: Int, in_ch: Int, txt_ch: Int, out_ch: Int, ctx: DeviceContext,
     ) raises:
-        self.img_in_w = TArc(Tensor.from_host(img_in_w^, [D, in_ch], STDtype.F32, ctx))
-        self.img_in_b = TArc(Tensor.from_host(img_in_b^, [D], STDtype.F32, ctx))
-        self.txt_in_w = TArc(Tensor.from_host(txt_in_w^, [D, txt_ch], STDtype.F32, ctx))
-        self.txt_in_b = TArc(Tensor.from_host(txt_in_b^, [D], STDtype.F32, ctx))
-        self.proj_out_w = TArc(Tensor.from_host(proj_out_w^, [out_ch, D], STDtype.F32, ctx))
-        self.proj_out_b = TArc(Tensor.from_host(proj_out_b^, [out_ch], STDtype.F32, ctx))
+        self.img_in_w = TArc(Tensor.from_host(img_in_w^, [D, in_ch], STDtype.BF16, ctx))
+        self.img_in_b = TArc(Tensor.from_host(img_in_b^, [D], STDtype.BF16, ctx))
+        self.txt_in_w = TArc(Tensor.from_host(txt_in_w^, [D, txt_ch], STDtype.BF16, ctx))
+        self.txt_in_b = TArc(Tensor.from_host(txt_in_b^, [D], STDtype.BF16, ctx))
+        self.proj_out_w = TArc(Tensor.from_host(proj_out_w^, [out_ch, D], STDtype.BF16, ctx))
+        self.proj_out_b = TArc(Tensor.from_host(proj_out_b^, [out_ch], STDtype.BF16, ctx))
 
 
 # ── forward result (CHECKPOINT INPUTS ONLY — true per-block recompute) ────────
@@ -169,8 +169,8 @@ def qwenimage_stack_forward[
     ctx: DeviceContext,
 ) raises -> QwenStackForward:
     var num_double = len(dbw)
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
 
     var img = _linear_b(img_tokens, base.img_in_w[], base.img_in_b[], N_IMG, in_ch, ctx)
     var txt = _linear_b(txt_tokens, base.txt_in_w[], base.txt_in_b[], N_TXT, txt_ch, ctx)
@@ -221,8 +221,8 @@ def qwenimage_stack_backward[
     ctx: DeviceContext,
 ) raises -> QwenStackGrads:
     var num_double = len(dbw)
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
 
     # ── final layer backward ──
     var normed = modulate(

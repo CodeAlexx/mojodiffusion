@@ -13,14 +13,15 @@
 # manual alloc/free; the Arc refcount frees the saved/grad tensors.
 #
 # T1 proves the ENGINE on Add/Sub/Mul. The 66-arm set (plan s3) is added
-# incrementally, each parity-gated. F32 only for the spike. Mojo 1.0.0b1, NVIDIA.
+# incrementally, each parity-gated. Tape storage follows the runtime dtype:
+# BF16/F16 activations and saved tensors stay BF16/F16, while GEMM/reduction
+# math may allocate transient F32 compute buffers. Mojo 1.0.0b1, NVIDIA.
 #
 # NOTE (micro-opt for later): every op currently saves BOTH operands (uniform).
 # Add/Sub don't need saved tensors for backward; a per-op "needs_saved" gate
 # will drop those clones. Inert for correctness; trivial for the T1 shapes.
 
 from std.gpu.host import DeviceContext
-from std.gpu import global_idx
 from std.utils.index import IndexList
 from std.memory import ArcPointer
 from std.collections import Dict
@@ -30,11 +31,20 @@ from layout.runtime_layout import RuntimeLayout
 from linalg.matmul.vendor.blas import matmul
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.linalg_backward import mm_backward, linear_backward
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import silu, swiglu
-from serenitymojo.ops.reduce import reduce_sum
+from serenitymojo.ops.reduce import reduce_sum_f32
+from serenitymojo.ops.tensor_algebra import (
+    add as _ta_add,
+    sub as _ta_sub,
+    mul as _ta_mul,
+    add_scalar as _ta_add_scalar,
+    mul_scalar as _ta_mul_scalar,
+    zeros_device as _ta_zeros_device,
+)
 from serenitymojo.ops.norm_backward import rms_norm_backward, RmsNormBackward
 from serenitymojo.ops.activation_backward import silu_backward
 from serenitymojo.ops.loss_swiglu_backward import (
@@ -44,9 +54,7 @@ from serenitymojo.ops.loss_swiglu_backward import (
 )
 
 
-comptime _DYN1 = Layout.row_major(-1)
 comptime _DYN2 = Layout.row_major(-1, -1)
-comptime _BLOCK = 256
 comptime TArc = ArcPointer[Tensor]
 
 comptime OP_ADD = 0
@@ -66,67 +74,9 @@ comptime OP_MSE = 8
 comptime _RMS_EPS = Float32(1e-6)
 
 
-# tiny F32 elementwise kernels (self-contained for the T1 spike)
-def _k_add(
-    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
-):
-    var i = Int(global_idx.x)
-    if i < n:
-        o[i] = rebind[o.element_type](
-            rebind[Scalar[DType.float32]](a[i]) + rebind[Scalar[DType.float32]](b[i])
-        )
-
-
-def _k_sub(
-    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
-):
-    var i = Int(global_idx.x)
-    if i < n:
-        o[i] = rebind[o.element_type](
-            rebind[Scalar[DType.float32]](a[i]) - rebind[Scalar[DType.float32]](b[i])
-        )
-
-
-def _k_mul(
-    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
-):
-    var i = Int(global_idx.x)
-    if i < n:
-        o[i] = rebind[o.element_type](
-            rebind[Scalar[DType.float32]](a[i]) * rebind[Scalar[DType.float32]](b[i])
-        )
-
-
-def _k_neg(
-    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    n: Int,
-):
-    var i = Int(global_idx.x)
-    if i < n:
-        o[i] = rebind[o.element_type](-rebind[Scalar[DType.float32]](a[i]))
-
-
-def _k_fill(
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    val: Float32,
-    n: Int,
-):
-    var i = Int(global_idx.x)
-    if i < n:
-        o[i] = rebind[o.element_type](val)
-
-
-# F32 tensor helpers (untracked outputs)
+# F32 compute-buffer helpers (untracked outputs). These are intentionally used
+# only around vendor BLAS/reduction math; tape-visible storage is cast back to
+# the activation dtype before returning.
 def _empty_f32(var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
     var n = 1
     for i in range(len(shape)):
@@ -135,55 +85,40 @@ def _empty_f32(var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
     return Tensor(buf^, shape^, STDtype.F32, 0)
 
 
-def _lt(t: Tensor, n: Int) -> LayoutTensor[DType.float32, _DYN1, MutAnyOrigin]:
-    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    return LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        t.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-
-
 def _raw_add(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var n = a.numel()
-    var o = _empty_f32(a.shape(), ctx)
-    var g = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_k_add, _k_add](
-        _lt(a, n), _lt(b, n), _lt(o, n), n, grid_dim=g, block_dim=_BLOCK)
-    return o^
+    if b.dtype() == a.dtype():
+        return _ta_add(a, b, ctx)
+    var bb = cast_tensor(b, a.dtype(), ctx)
+    return _ta_add(a, bb, ctx)
 
 
 def _raw_sub(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var n = a.numel()
-    var o = _empty_f32(a.shape(), ctx)
-    var g = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_k_sub, _k_sub](
-        _lt(a, n), _lt(b, n), _lt(o, n), n, grid_dim=g, block_dim=_BLOCK)
-    return o^
+    if b.dtype() == a.dtype():
+        return _ta_sub(a, b, ctx)
+    var bb = cast_tensor(b, a.dtype(), ctx)
+    return _ta_sub(a, bb, ctx)
 
 
 def _raw_mul(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var n = a.numel()
-    var o = _empty_f32(a.shape(), ctx)
-    var g = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_k_mul, _k_mul](
-        _lt(a, n), _lt(b, n), _lt(o, n), n, grid_dim=g, block_dim=_BLOCK)
-    return o^
+    if b.dtype() == a.dtype():
+        return _ta_mul(a, b, ctx)
+    var bb = cast_tensor(b, a.dtype(), ctx)
+    return _ta_mul(a, bb, ctx)
 
 
 def _raw_neg(a: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var n = a.numel()
-    var o = _empty_f32(a.shape(), ctx)
-    var g = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_k_neg, _k_neg](
-        _lt(a, n), _lt(o, n), n, grid_dim=g, block_dim=_BLOCK)
-    return o^
+    return _ta_mul_scalar(a, Float32(-1.0), ctx)
 
 
-# F32 GEMM via the vendor blas (transpose_a/transpose_b both supported — proven
-# in ops/attention_backward.mojo). C[rc,cc] in F32. Inputs must be F32.
+# GEMM via vendor BLAS. A/B stay in their storage dtype; C is the F32
+# accumulator buffer. transpose_a/transpose_b are both proven in
+# ops/attention_backward.mojo.
 def _raw_gemm(
     a: Tensor, b: Tensor, rc: Int, cc: Int, kk: Int,
     ta: Bool, tb: Bool, ctx: DeviceContext,
 ) raises -> Tensor:
+    if a.dtype() != b.dtype():
+        raise Error("_raw_gemm: input dtype mismatch")
     var out_shape = List[Int]()
     out_shape.append(rc)
     out_shape.append(cc)
@@ -196,49 +131,53 @@ def _raw_gemm(
     var a_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](a_rows, a_cols))
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](b_rows, b_cols))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rc, cc))
-    var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        a.buf.unsafe_ptr().bitcast[Float32](), a_rl)
-    var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        b.buf.unsafe_ptr().bitcast[Float32](), b_rl)
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         o.buf.unsafe_ptr().bitcast[Float32](), c_rl)
-    matmul(ctx, C, A, B, transpose_a=ta, transpose_b=tb, c_row_major=True)
+    var dt = a.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float32](), a_rl)
+        var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[Float32](), b_rl)
+        matmul(ctx, C, A, B, transpose_a=ta, transpose_b=tb, c_row_major=True)
+    elif dt == DType.bfloat16:
+        var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[BFloat16](), a_rl)
+        var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[BFloat16](), b_rl)
+        matmul(ctx, C, A, B, transpose_a=ta, transpose_b=tb, c_row_major=True)
+    else:
+        var A = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float16](), a_rl)
+        var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[Float16](), b_rl)
+        matmul(ctx, C, A, B, transpose_a=ta, transpose_b=tb, c_row_major=True)
     ctx.synchronize()
     return o^
 
 
 def ones_like(t: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var n = t.numel()
-    var o = _empty_f32(t.shape(), ctx)
-    var g = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_k_fill, _k_fill](
-        _lt(o, n), Float32(1.0), n, grid_dim=g, block_dim=_BLOCK)
-    return o^
+    var z = _ta_zeros_device(t.shape(), t.dtype(), ctx)
+    return _ta_add_scalar(z^, Float32(1.0), ctx)
 
 
-# F32 2D matmul forward C[M,N] = A[M,K] @ B[K,N] via vendor blas (no transpose).
+# 2D matmul forward C[M,N] = A[M,K] @ B[K,N]. The vendor BLAS workspace is F32;
+# the returned tape tensor is cast back to the activation storage dtype.
 def _raw_matmul(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
     var ash = a.shape()
     var bsh = b.shape()
     var M = ash[0]
     var K = ash[1]
     var N = bsh[1]
-    var out_shape = List[Int]()
-    out_shape.append(M)
-    out_shape.append(N)
-    var o = _empty_f32(out_shape^, ctx)
-    var a_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, K))
-    var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](K, N))
-    var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](M, N))
-    var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        a.buf.unsafe_ptr().bitcast[Float32](), a_rl)
-    var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        b.buf.unsafe_ptr().bitcast[Float32](), b_rl)
-    var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        o.buf.unsafe_ptr().bitcast[Float32](), c_rl)
-    matmul(ctx, C, A, B, transpose_a=False, transpose_b=False, c_row_major=True)
-    ctx.synchronize()
-    return o^
+    if a.dtype() != b.dtype():
+        raise Error("_raw_matmul: input dtype mismatch")
+    # BLAS writes an F32 accumulator buffer; return the activation storage dtype
+    # so the tape does not retain F32 activations.
+    var out_dt = a.dtype()
+    if out_dt == STDtype.F32:
+        return _raw_gemm(a, b, M, N, K, False, False, ctx)
+    var c32 = _raw_gemm(a, b, M, N, K, False, False, ctx)
+    return cast_tensor(c32^, out_dt, ctx)
 
 
 struct TapeEntry(Copyable, Movable):
@@ -414,7 +353,7 @@ struct Tape(Movable):
         var all_dims = List[Int]()
         for i in range(len(sq.shape())):
             all_dims.append(i)
-        var out = reduce_sum(sq, all_dims^, False, ctx)   # scalar
+        var out = reduce_sum_f32(sq, all_dims^, False, ctx)   # scalar
         var oid = self._fresh()
         out.set_id(oid)
         self.entries.append(

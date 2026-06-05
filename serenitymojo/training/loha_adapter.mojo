@@ -46,9 +46,9 @@
 # behavior. (GradCoverage is asserted at step >= 1, after the optimizer drives
 # w2a off zero, when ALL FOUR are nonzero — see grad_coverage.mojo step gate.)
 #
-# Host F32 master throughout (training masters are F32 per MOJO_CONVENTIONS §3),
-# and the factors are tiny ([IN,RANK]/[RANK,OUT]/RANK²) so host matmul is exact
-# and auditable — no GPU layout-convention ambiguity in the parity gate.
+# BF16 trainable storage, F32 internal compute/moments. The factors are tiny
+# ([IN,RANK]/[RANK,OUT]/RANK²), so host matmul is exact and auditable after
+# explicit BF16->F32 materialization.
 #
 # Mojo 1.0.0b1: `def` not `fn`; move-only Tensor → ArcPointer in collections;
 # multi-return via Movable struct; STDtype.F32 is a value.
@@ -125,12 +125,26 @@ def _zeros(n: Int) -> List[Float32]:
     return out^
 
 
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
+
+
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
 # ── the LoHa adapter (Linear) — 4 factors + AdamW moments, host F32 ──────────
 struct LoHaAdapter(Copyable, Movable):
-    var w1a: List[Float32]   # [in, rank]
-    var w1b: List[Float32]   # [rank, out]
-    var w2a: List[Float32]   # [in, rank]
-    var w2b: List[Float32]   # [rank, out]
+    var w1a: List[BFloat16]  # [in, rank]
+    var w1b: List[BFloat16]  # [rank, out]
+    var w2a: List[BFloat16]  # [in, rank]
+    var w2b: List[BFloat16]  # [rank, out]
     var rank: Int
     var in_f: Int
     var out_f: Int
@@ -156,10 +170,10 @@ struct LoHaAdapter(Copyable, Movable):
         var m2a: List[Float32], var v2a: List[Float32],
         var m2b: List[Float32], var v2b: List[Float32],
     ):
-        self.w1a = w1a^
-        self.w1b = w1b^
-        self.w2a = w2a^
-        self.w2b = w2b^
+        self.w1a = _f32_to_bf16_list(w1a)
+        self.w1b = _f32_to_bf16_list(w1b)
+        self.w2a = _f32_to_bf16_list(w2a)
+        self.w2b = _f32_to_bf16_list(w2b)
         self.rank = rank
         self.in_f = in_f
         self.out_f = out_f
@@ -200,8 +214,12 @@ def new_loha_adapter(in_f: Int, out_f: Int, rank: Int, alpha: Float32, seed: UIn
 def loha_diff_weight(lo: LoHaAdapter) raises -> List[Float32]:
     if lo.scale == Float32(0.0):
         return _zeros(lo.in_f * lo.out_f)
-    var w1 = _matmul(lo.w1a, lo.in_f, lo.rank, lo.w1b, lo.rank, lo.out_f)  # [in,out]
-    var w2 = _matmul(lo.w2a, lo.in_f, lo.rank, lo.w2b, lo.rank, lo.out_f)  # [in,out]
+    var w1a = _bf16_to_f32_list(lo.w1a)
+    var w1b = _bf16_to_f32_list(lo.w1b)
+    var w2a = _bf16_to_f32_list(lo.w2a)
+    var w2b = _bf16_to_f32_list(lo.w2b)
+    var w1 = _matmul(w1a, lo.in_f, lo.rank, w1b, lo.rank, lo.out_f)  # [in,out]
+    var w2 = _matmul(w2a, lo.in_f, lo.rank, w2b, lo.rank, lo.out_f)  # [in,out]
     var diff = _hadamard(w1, w2)
     _scale_inplace(diff, lo.scale)
     return diff^
@@ -253,21 +271,25 @@ def loha_backward(d_y_h: List[Float32], x_h: List[Float32], lo: LoHaAdapter, M: 
     var g = d_diff.copy()
     _scale_inplace(g, lo.scale)                               # g = d_diff * scale
 
-    var w1 = _matmul(lo.w1a, IN, R, lo.w1b, R, OUT)           # [in,out]
-    var w2 = _matmul(lo.w2a, IN, R, lo.w2b, R, OUT)           # [in,out]
+    var w1a = _bf16_to_f32_list(lo.w1a)
+    var w1b = _bf16_to_f32_list(lo.w1b)
+    var w2a = _bf16_to_f32_list(lo.w2a)
+    var w2b = _bf16_to_f32_list(lo.w2b)
+    var w1 = _matmul(w1a, IN, R, w1b, R, OUT)                 # [in,out]
+    var w2 = _matmul(w2a, IN, R, w2b, R, OUT)                 # [in,out]
 
     # --- factor pair 1: temp = g ⊙ (w2a@w2b) ---
     var t1 = _hadamard(g, w2)                                 # [in,out]
-    var w1b_t = _transpose(lo.w1b, R, OUT)                    # [out,rank]
+    var w1b_t = _transpose(w1b, R, OUT)                       # [out,rank]
     var d_w1a = _matmul(t1, IN, OUT, w1b_t, OUT, R)           # [in,rank]
-    var w1a_t = _transpose(lo.w1a, IN, R)                     # [rank,in]
+    var w1a_t = _transpose(w1a, IN, R)                        # [rank,in]
     var d_w1b = _matmul(w1a_t, R, IN, t1, IN, OUT)            # [rank,out]
 
     # --- factor pair 2: temp = g ⊙ (w1a@w1b) ---
     var t2 = _hadamard(g, w1)                                 # [in,out]
-    var w2b_t = _transpose(lo.w2b, R, OUT)                    # [out,rank]
+    var w2b_t = _transpose(w2b, R, OUT)                       # [out,rank]
     var d_w2a = _matmul(t2, IN, OUT, w2b_t, OUT, R)           # [in,rank]
-    var w2a_t = _transpose(lo.w2a, IN, R)                     # [rank,in]
+    var w2a_t = _transpose(w2a, IN, R)                        # [rank,in]
     var d_w2b = _matmul(w2a_t, R, IN, t2, IN, OUT)            # [rank,out]
 
     return LoHaGrads(d_w1a^, d_w1b^, d_w2a^, d_w2b^, d_x^)
@@ -275,7 +297,7 @@ def loha_backward(d_y_h: List[Float32], x_h: List[Float32], lo: LoHaAdapter, M: 
 
 # ── AdamW one step over all 4 factors (mirrors train_step._adamw_host_list) ──
 def _adamw_host_list(
-    mut p: List[Float32], g: List[Float32],
+    mut p: List[BFloat16], g: List[Float32],
     mut m: List[Float32], mut v: List[Float32],
     t: Int, lr: Float32, beta1: Float32, beta2: Float32,
     eps: Float32, weight_decay: Float32,
@@ -300,10 +322,10 @@ def _adamw_host_list(
         v[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
+        var pv = p[i].cast[DType.float32]() - lr * m_hat / (sqrt(v_hat) + eps)
         if weight_decay > 0.0:
             pv = pv - lr * weight_decay * pv
-        p[i] = pv
+        p[i] = BFloat16(pv)
 
 
 def loha_adamw(

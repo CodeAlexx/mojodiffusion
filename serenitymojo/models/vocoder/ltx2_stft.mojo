@@ -43,6 +43,7 @@ from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.conv1d import conv1d
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.tensor_algebra import permute, reshape
 
@@ -452,7 +453,9 @@ def compute_mel(
     # linear(x[...,F], mel_basis[n_mels,F]) = x @ mel_basis^T -> [...,n_mels]
     var mag_t = permute(mag, [0, 2, 1], ctx)         # [BC, Tf, F]
     var mag_flat = reshape(mag_t, [BC * Tf, n_freqs], ctx)
-    var mel_flat = linear(mag_flat, mel_basis, None, ctx)  # [BC*Tf, n_mels]
+    # Match LTX2: mel_basis is converted to magnitude.dtype before matmul.
+    var mel_basis_compute = cast_tensor(mel_basis, mag_flat.dtype(), ctx)
+    var mel_flat = linear(mag_flat, mel_basis_compute, None, ctx)  # [BC*Tf, n_mels]
     var mel_t = reshape(mel_flat, [BC, Tf, n_mels], ctx)
     var mel_ct = permute(mel_t, [0, 2, 1], ctx)      # [BC, n_mels, Tf]
 

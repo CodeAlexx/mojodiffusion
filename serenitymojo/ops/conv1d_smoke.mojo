@@ -210,8 +210,28 @@ def main() raises:
         wb64.append(_bf16_round(wv[i].cast[DType.float64]()))
     var dummy = List[Float64]()
     var ref_a2 = _ref_conv1d(xb64, B, Cin, L, wb64, Cout, K, dummy, False, 1, 1, 1, 1)
-    var y_a2 = conv1d(xbt, wbt, None, 1, 1, 1, 1, ctx).to_host(ctx)
+    var y_a2_obj = conv1d(xbt, wbt, None, 1, 1, 1, 1, ctx)
+    var y_a2_storage = y_a2_obj.dtype() == STDtype.BF16
+    print("  [" + ("PASS" if y_a2_storage else "FAIL")
+          + "] conv1d BF16 nobias output storage is BF16")
+    all_pass = y_a2_storage and all_pass
+    var y_a2 = y_a2_obj.to_host(ctx)
     all_pass = _gate_rel("conv1d BF16 s1p1d1g1 nobias", y_a2, ref_a2) and all_pass
+
+    var bb64 = List[Float64]()
+    for i in range(len(bv)):
+        bb64.append(_bf16_round(bv[i].cast[DType.float64]()))
+    var ref_a2b = _ref_conv1d(xb64, B, Cin, L, wb64, Cout, K, bb64, True, 1, 1, 1, 1)
+    var y_a2b_obj = conv1d(
+        xbt, wbt, Tensor.from_host(bv, [Cout], STDtype.BF16, ctx),
+        1, 1, 1, 1, ctx,
+    )
+    var y_a2b_storage = y_a2b_obj.dtype() == STDtype.BF16
+    print("  [" + ("PASS" if y_a2b_storage else "FAIL")
+          + "] conv1d BF16+bias output storage is BF16")
+    all_pass = y_a2b_storage and all_pass
+    var y_a2b = y_a2b_obj.to_host(ctx)
+    all_pass = _gate_rel("conv1d BF16 s1p1d1g1+bias", y_a2b, ref_a2b) and all_pass
 
     # ---- (a3) dilation=3, stride=2, pad=2 (F32) ----
     var ref_a3 = _ref_conv1d(x64, B, Cin, L, w64, Cout, K, b64, True, 2, 2, 3, 1)

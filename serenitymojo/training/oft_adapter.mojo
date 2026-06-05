@@ -49,7 +49,7 @@
 # Skew chain (Q = 0.5(S - Sᵀ)):
 #   d_S_g = 0.5 * (d_Q_g - d_Q_gᵀ)        [b,b]
 #
-# Host F32 master throughout (training masters are F32 per MOJO_CONVENTIONS §3).
+# BF16 trainable S storage, F32 internal compute/moments.
 # Mojo 0.26.x: `def` not `fn`; multi-return via Movable struct. MIRRORS
 # loha/dora/lokr_adapter.mojo structure.
 
@@ -100,6 +100,13 @@ def _randn(n: Int, seed: UInt64, scale: Float32) -> List[Float32]:
         state = state * 6364136223846793005 + 1442695040888963407
         var u = Float32(Int(state >> 40)) * Float32(1.0 / 16777216.0)
         out.append((u - Float32(0.5)) * scale)
+    return out^
+
+
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
     return out^
 
 
@@ -157,7 +164,7 @@ def _inverse(a: List[Float32], n: Int) raises -> List[Float32]:
 # S       : [num_blocks, b, b] flat (trainable; the pre-skew square per block)
 # w_base  : [out, in]               (frozen base weight; out = num_blocks * b)
 struct OFTAdapter(Copyable, Movable):
-    var s: List[Float32]            # [num_blocks*b*b]
+    var s: List[BFloat16]           # [num_blocks*b*b]
     var w_base: List[Float32]       # [out, in]  (frozen)
     var num_blocks: Int
     var block_size: Int
@@ -174,7 +181,7 @@ struct OFTAdapter(Copyable, Movable):
         num_blocks: Int, block_size: Int, in_f: Int, out_f: Int, alpha: Float32,
         var m_s: List[Float32], var v_s: List[Float32],
     ):
-        self.s = s^
+        self.s = _f32_to_bf16_list(s)
         self.w_base = w_base^
         self.num_blocks = num_blocks
         self.block_size = block_size
@@ -213,7 +220,7 @@ def _block_s(lo: OFTAdapter, g: Int) -> List[Float32]:
     var out = List[Float32]()
     var base = g * b * b
     for i in range(b * b):
-        out.append(lo.s[base + i])
+        out.append(lo.s[base + i].cast[DType.float32]())
     return out^
 
 
@@ -365,7 +372,7 @@ def _cayley_from_minv(minv: List[Float32], q: List[Float32], b: Int) raises -> L
 
 # ── AdamW one step over S (W frozen) ──────────────────────────────────────────
 def _adamw_host_list(
-    mut p: List[Float32], g: List[Float32],
+    mut p: List[BFloat16], g: List[Float32],
     mut mom: List[Float32], mut vmo: List[Float32],
     t: Int, lr: Float32, beta1: Float32, beta2: Float32,
     eps: Float32, weight_decay: Float32,
@@ -390,10 +397,10 @@ def _adamw_host_list(
         vmo[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
+        var pv = p[i].cast[DType.float32]() - lr * m_hat / (sqrt(v_hat) + eps)
         if weight_decay > 0.0:
             pv = pv - lr * weight_decay * pv
-        p[i] = pv
+        p[i] = BFloat16(pv)
 
 
 def oft_adamw(

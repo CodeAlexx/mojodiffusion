@@ -5,12 +5,10 @@
 # CrossEntropy backward feeds SenseNova's +0.1*CE aux loss; Embedding backward
 # feeds token conditioning.
 #
-# Each fn returns a fresh F32 Tensor holding the gradient. All interior math is
-# F32. Conventions mirror ops/reduce_backward.mojo + ops/shape_backward.mojo
-# (the proven sibling templates):
-#   * device buffers are DType.uint8 (Tensor's storage), bitcast to Float32 at
-#     the LayoutTensor boundary,
-#   * F32 interior, ctx.synchronize() then return a fresh Tensor,
+# Each fn returns a fresh Tensor in the input storage dtype. All interior math is
+# F32. Conventions mirror ops/reduce_backward.mojo + ops/shape_backward.mojo:
+#   * device buffers are DType.uint8 (Tensor's storage),
+#   * kernels cast scalar elements to F32 for math and cast back on store,
 #   * loud-fail on shape/dtype mismatch.
 #
 # Integer indices are passed host-side as List[Int] (the caller's natural form),
@@ -53,9 +51,9 @@ comptime _BLOCK = 256
 comptime _TPB = 256
 
 
-def _require_f32(t: Tensor, who: String) raises:
-    if t.dtype() != STDtype.F32:
-        raise Error(who + ": inputs must be F32")
+def _require_same_dtype(a: Tensor, b: Tensor, who: String) raises:
+    if a.dtype() != b.dtype():
+        raise Error(who + ": input dtype mismatch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -64,10 +62,10 @@ def _require_f32(t: Tensor, who: String) raises:
 # softmax recompute), then write (p - onehot)/N. Matches the softmax recompute
 # style of attention_backward._softmax_rows_f32.
 # ══════════════════════════════════════════════════════════════════════════════
-def _ce_bwd_rows_k(
-    logits: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],   # [N, C]
+def _ce_bwd_rows_k[dtype: DType](
+    logits: LayoutTensor[dtype, _DYN2, MutAnyOrigin],           # [N, C]
     targets: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],    # [N]
-    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],        # [N, C] d_logits
+    o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],                # [N, C] d_logits
     C: Int, inv_n: Float32,
 ):
     var row = Int(block_idx.x)
@@ -79,7 +77,7 @@ def _ce_bwd_rows_k(
     var lmax: Float32 = -3.0e38
     var c = tid
     while c < C:
-        var v = rebind[Scalar[DType.float32]](logits[row, c])
+        var v = rebind[Scalar[dtype]](logits[row, c]).cast[DType.float32]()
         if v > lmax:
             lmax = v
         c += _TPB
@@ -99,7 +97,7 @@ def _ce_bwd_rows_k(
     var lsum: Float32 = 0.0
     c = tid
     while c < C:
-        lsum += exp(rebind[Scalar[DType.float32]](logits[row, c]) - rmax)
+        lsum += exp(rebind[Scalar[dtype]](logits[row, c]).cast[DType.float32]() - rmax)
         c += _TPB
     shared[tid] = lsum
     barrier()
@@ -115,9 +113,9 @@ def _ce_bwd_rows_k(
     var tgt = Int(rebind[Scalar[DType.int32]](targets[row]))
     c = tid
     while c < C:
-        var p = exp(rebind[Scalar[DType.float32]](logits[row, c]) - rmax) * inv
+        var p = exp(rebind[Scalar[dtype]](logits[row, c]).cast[DType.float32]() - rmax) * inv
         var onehot = Float32(1.0) if c == tgt else Float32(0.0)
-        o[row, c] = rebind[o.element_type]((p - onehot) * inv_n)
+        o[row, c] = rebind[o.element_type](((p - onehot) * inv_n).cast[dtype]())
         c += _TPB
 
 
@@ -126,9 +124,8 @@ def cross_entropy_backward(
 ) raises -> Tensor:
     """d_logits = (softmax(logits) - onehot(target)) / N  (mean reduction).
 
-    logits: [N, C] F32; target_idx: N class indices. Returns [N, C] F32.
+    logits: [N, C]; target_idx: N class indices. Returns [N, C] logits dtype.
     Matches torch.nn.functional.cross_entropy(reduction="mean")."""
-    _require_f32(logits, "cross_entropy_backward")
     var sh = logits.shape()
     if len(sh) != 2:
         raise Error("cross_entropy_backward: expected [N, C]")
@@ -149,30 +146,48 @@ def cross_entropy_backward(
     var t_dev = ctx.enqueue_create_buffer[DType.int32](N)
     ctx.enqueue_copy(dst_buf=t_dev, src_buf=t_host)
 
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](N * C * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](N * C * logits.dtype().byte_size())
     var lg_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](N, C))
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](N))
-    var LG = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        logits.buf.unsafe_ptr().bitcast[Float32](), lg_rl)
     var TG = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
         t_dev.unsafe_ptr(), t_rl)
-    var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), lg_rl)
-    ctx.enqueue_function[_ce_bwd_rows_k, _ce_bwd_rows_k](
-        LG, TG, O, C, Float32(1.0) / Float32(N),
-        grid_dim=N, block_dim=_TPB)
+    var dt = logits.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var LG = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            logits.buf.unsafe_ptr().bitcast[Float32](), lg_rl)
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), lg_rl)
+        ctx.enqueue_function[
+            _ce_bwd_rows_k[DType.float32], _ce_bwd_rows_k[DType.float32]
+        ](LG, TG, O, C, Float32(1.0) / Float32(N), grid_dim=N, block_dim=_TPB)
+    elif dt == DType.bfloat16:
+        var LG = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            logits.buf.unsafe_ptr().bitcast[BFloat16](), lg_rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), lg_rl)
+        ctx.enqueue_function[
+            _ce_bwd_rows_k[DType.bfloat16], _ce_bwd_rows_k[DType.bfloat16]
+        ](LG, TG, O, C, Float32(1.0) / Float32(N), grid_dim=N, block_dim=_TPB)
+    else:
+        var LG = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            logits.buf.unsafe_ptr().bitcast[Float16](), lg_rl)
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), lg_rl)
+        ctx.enqueue_function[
+            _ce_bwd_rows_k[DType.float16], _ce_bwd_rows_k[DType.float16]
+        ](LG, TG, O, C, Float32(1.0) / Float32(N), grid_dim=N, block_dim=_TPB)
     ctx.synchronize()
     var os = [N, C]
-    return Tensor(out_buf^, os^, STDtype.F32)
+    return Tensor(out_buf^, os^, logits.dtype())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NLL — d_log_probs = -onehot(target)/N. Zero everywhere except the target column
 # of each row. One thread per OUTPUT element; the target column gets -1/N.
 # ══════════════════════════════════════════════════════════════════════════════
-def _nll_bwd_k(
+def _nll_bwd_k[dtype: DType](
     targets: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],   # [N]
-    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],       # [N, C]
+    o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],               # [N, C]
     C: Int, neg_inv_n: Float32,
 ):
     var t = Int(global_idx.x)
@@ -182,7 +197,7 @@ def _nll_bwd_k(
     if row < N:
         var tgt = Int(rebind[Scalar[DType.int32]](targets[row]))
         var v = neg_inv_n if col == tgt else Float32(0.0)
-        o[row, col] = rebind[o.element_type](v)
+        o[row, col] = rebind[o.element_type](v.cast[dtype]())
 
 
 def nll_backward(
@@ -190,9 +205,9 @@ def nll_backward(
 ) raises -> Tensor:
     """d_log_probs = -onehot(target) / N  (mean reduction).
 
-    log_probs: [N, C] F32 (already log-probabilities); target_idx: N indices.
-    Returns [N, C] F32. Matches torch.nn.functional.nll_loss(reduction="mean")."""
-    _require_f32(log_probs, "nll_backward")
+    log_probs: [N, C] (already log-probabilities); target_idx: N indices.
+    Returns [N, C] log_probs dtype.
+    Matches torch.nn.functional.nll_loss(reduction="mean")."""
     var sh = log_probs.shape()
     if len(sh) != 2:
         raise Error("nll_backward: expected [N, C]")
@@ -212,39 +227,55 @@ def nll_backward(
     var t_dev = ctx.enqueue_create_buffer[DType.int32](N)
     ctx.enqueue_copy(dst_buf=t_dev, src_buf=t_host)
 
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](N * C * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        N * C * log_probs.dtype().byte_size()
+    )
     var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](N, C))
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](N))
     var TG = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
         t_dev.unsafe_ptr(), t_rl)
-    var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), o_rl)
     var n = N * C
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_nll_bwd_k, _nll_bwd_k](
-        TG, O, C, Float32(-1.0) / Float32(N),
-        grid_dim=grid, block_dim=_BLOCK)
+    var dt = log_probs.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl)
+        ctx.enqueue_function[
+            _nll_bwd_k[DType.float32], _nll_bwd_k[DType.float32]
+        ](TG, O, C, Float32(-1.0) / Float32(N), grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl)
+        ctx.enqueue_function[
+            _nll_bwd_k[DType.bfloat16], _nll_bwd_k[DType.bfloat16]
+        ](TG, O, C, Float32(-1.0) / Float32(N), grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl)
+        ctx.enqueue_function[
+            _nll_bwd_k[DType.float16], _nll_bwd_k[DType.float16]
+        ](TG, O, C, Float32(-1.0) / Float32(N), grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var os = [N, C]
-    return Tensor(out_buf^, os^, STDtype.F32)
+    return Tensor(out_buf^, os^, log_probs.dtype())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BCE (PLAIN probability form) — d_p[i] = (p - t) / (p*(1-p)) / N.
 # One thread per element. Matches torch F.binary_cross_entropy (NOT with-logits).
 # ══════════════════════════════════════════════════════════════════════════════
-def _bce_bwd_k(
-    pred: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    target: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _bce_bwd_k[dtype: DType](
+    pred: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    target: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     n: Int, inv_n: Float32,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var p = rebind[Scalar[DType.float32]](pred[i])
-        var t = rebind[Scalar[DType.float32]](target[i])
+        var p = rebind[Scalar[dtype]](pred[i]).cast[DType.float32]()
+        var t = rebind[Scalar[dtype]](target[i]).cast[DType.float32]()
         o[i] = rebind[o.element_type](
-            ((p - t) / (p * (Float32(1.0) - p))) * inv_n)
+            (((p - t) / (p * (Float32(1.0) - p))) * inv_n).cast[dtype]())
 
 
 def bce_backward(
@@ -254,26 +285,47 @@ def bce_backward(
 
     PLAIN probability form: pred in (0,1). Matches
     torch.nn.functional.binary_cross_entropy(reduction="mean"). pred/target are
-    flat F32 of equal numel. Returns d_pred F32, pred's shape."""
-    _require_f32(pred, "bce_backward")
-    _require_f32(target, "bce_backward")
+    equal-shape tensors with the same dtype. Returns d_pred in pred dtype."""
+    _require_same_dtype(pred, target, "bce_backward")
     var n = pred.numel()
     if target.numel() != n:
         raise Error("bce_backward: pred/target numel mismatch")
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](pred.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        pred.buf.unsafe_ptr().bitcast[Float32](), rl)
-    var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        target.buf.unsafe_ptr().bitcast[Float32](), rl)
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl)
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_bce_bwd_k, _bce_bwd_k](
-        P, T, O, n, Float32(1.0) / Float32(n),
-        grid_dim=grid, block_dim=_BLOCK)
+    var dt = pred.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[
+            _bce_bwd_k[DType.float32], _bce_bwd_k[DType.float32]
+        ](P, T, O, n, Float32(1.0) / Float32(n), grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var P = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var T = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[
+            _bce_bwd_k[DType.bfloat16], _bce_bwd_k[DType.bfloat16]
+        ](P, T, O, n, Float32(1.0) / Float32(n), grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var P = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            pred.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var T = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            target.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[
+            _bce_bwd_k[DType.float16], _bce_bwd_k[DType.float16]
+        ](P, T, O, n, Float32(1.0) / Float32(n), grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
-    return Tensor(out_buf^, pred.shape(), STDtype.F32)
+    return Tensor(out_buf^, pred.shape(), pred.dtype())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -282,10 +334,10 @@ def bce_backward(
 # shape_backward.index_select_backward: one thread per d_table element (row v,
 # col d), summing grad_out[i, d] over all i with idx[i] == v.
 # ══════════════════════════════════════════════════════════════════════════════
-def _embedding_bwd_k(
-    g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],     # grad_out [Ni, D]
+def _embedding_bwd_k[dtype: DType](
+    g: LayoutTensor[dtype, _DYN1, MutAnyOrigin],             # grad_out [Ni, D]
     idx: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],     # indices [Ni]
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],     # d_table [V, D]
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],             # d_table [V, D]
     Ni: Int, D: Int, V: Int,
 ):
     var t = Int(global_idx.x)
@@ -295,8 +347,8 @@ def _embedding_bwd_k(
         var acc: Float32 = 0.0
         for i in range(Ni):
             if Int(rebind[Scalar[DType.int32]](idx[i])) == v:
-                acc += rebind[Scalar[DType.float32]](g[i * D + d])
-        o[t] = rebind[o.element_type](acc)
+                acc += rebind[Scalar[dtype]](g[i * D + d]).cast[DType.float32]()
+        o[t] = rebind[o.element_type](acc.cast[dtype]())
 
 
 def embedding_backward(
@@ -305,9 +357,9 @@ def embedding_backward(
 ) raises -> Tensor:
     """Scatter-ADD grad_out rows into zeros([num_embeddings, dim]) at `indices`.
 
-    grad_out: [Ni, D] F32 (Ni == len(indices)); repeated indices accumulate.
-    Returns d_table [num_embeddings, D] F32. Matches nn.Embedding weight grad."""
-    _require_f32(grad_out, "embedding_backward")
+    grad_out: [Ni, D] (Ni == len(indices)); repeated indices accumulate.
+    Returns d_table [num_embeddings, D] in grad_out dtype.
+    Matches nn.Embedding weight grad."""
     var gsh = grad_out.shape()
     if len(gsh) != 2:
         raise Error("embedding_backward: grad_out must be [Ni, D]")
@@ -327,19 +379,40 @@ def embedding_backward(
     var id_dev = ctx.enqueue_create_buffer[DType.int32](Ni)
     ctx.enqueue_copy(dst_buf=id_dev, src_buf=id_host)
 
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](num_embeddings * D * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        num_embeddings * D * grad_out.dtype().byte_size()
+    )
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](Ni * D))
     var id_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](Ni))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](num_embeddings * D))
-    var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl)
     var IDS = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
         id_dev.unsafe_ptr(), id_rl)
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), o_rl)
     var grid = (num_embeddings * D + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_embedding_bwd_k, _embedding_bwd_k](
-        G, IDS, O, Ni, D, num_embeddings, grid_dim=grid, block_dim=_BLOCK)
+    var dt = grad_out.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl)
+        ctx.enqueue_function[
+            _embedding_bwd_k[DType.float32], _embedding_bwd_k[DType.float32]
+        ](G, IDS, O, Ni, D, num_embeddings, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl)
+        ctx.enqueue_function[
+            _embedding_bwd_k[DType.bfloat16], _embedding_bwd_k[DType.bfloat16]
+        ](G, IDS, O, Ni, D, num_embeddings, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl)
+        ctx.enqueue_function[
+            _embedding_bwd_k[DType.float16], _embedding_bwd_k[DType.float16]
+        ](G, IDS, O, Ni, D, num_embeddings, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var os = [num_embeddings, D]
-    return Tensor(out_buf^, os^, STDtype.F32)
+    return Tensor(out_buf^, os^, grad_out.dtype())

@@ -37,6 +37,11 @@
 # Mojo 1.0.0b1. Inference-only. No autograd, no Python at runtime.
 
 from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops import (
+    torch_bf16_eager_add_scaled,
+    torch_bf16_eager_blend_with_f32_mask,
+)
 from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar
 from std.gpu.host import DeviceContext
 from std.math import exp, log, sqrt
@@ -71,7 +76,7 @@ def ltx2_distilled_sigmas() -> List[Float32]:
 def ltx2_stage2_distilled_sigmas() -> List[Float32]:
     """Stage-2 refinement sigmas (3 denoise steps, 4 values incl. trailing 0.0).
 
-    Exact copy of `LTX2_STAGE2_DISTILLED_SIGMAS` (ltx2_sampling.rs:15-17).
+    Exact copy of Lightricks `STAGE_2_DISTILLED_SIGMA_VALUES`.
     Applied after the stage-boundary spatial 2x upsample + AdaIN; the first
     value (0.909375) is also the stage-2 noise-injection sigma.
     """
@@ -81,6 +86,24 @@ def ltx2_stage2_distilled_sigmas() -> List[Float32]:
     out.append(0.421875)
     out.append(0.0)
     return out^
+
+
+def ltx2_creator_noiser_from_noise(
+    clean_latent: Tensor,
+    torch_noise: Tensor,
+    scaled_mask: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Creator/PyTorch GaussianNoiser handoff with external noise.
+
+    Matches creator Desktop:
+        `(torch_noise * scaled_mask + clean_latent * (1 - scaled_mask)).to(bfloat16)`
+
+    `torch_noise` must come from the creator/PyTorch oracle or another proven
+    same-contract RNG. Mojo-native `randn` is not same-seed-equivalent to
+    `torch.Generator` and must not be used for bit parity claims.
+    """
+    return torch_bf16_eager_blend_with_f32_mask(torch_noise, clean_latent, scaled_mask, ctx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -254,12 +277,17 @@ struct LTX2Scheduler(Movable):
             )
         var sigma = self._sigmas[i]
         var sigma_next = self._sigmas[i + 1]
+        var dt = sigma_next - sigma
+        if latent.dtype() == STDtype.BF16 and velocity.dtype() == STDtype.BF16:
+            # Creator/Desktop PyTorch eager materializes F32 temporaries before
+            # BF16 storage. Use the shared parity helper instead of fused
+            # tensor algebra so tie cases match bit-for-bit.
+            return torch_bf16_eager_add_scaled(latent, velocity, dt, ctx)
         if sigma_next == 0.0:
             # Final step: denoised = x - v*sigma.
             var scaled = mul_scalar(velocity, sigma, ctx)
             return sub(latent, scaled, ctx)
         # Interior Euler step: x + v*(sigma_next - sigma)  (dt < 0).
-        var dt = sigma_next - sigma
         var scaled2 = mul_scalar(velocity, dt, ctx)
         return add(latent, scaled2, ctx)
 

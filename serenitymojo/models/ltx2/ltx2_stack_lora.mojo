@@ -16,9 +16,11 @@
 #       The combined modvec = sst_rows[r] + adaln_delta[r] per block. Both the
 #       table AND the adaln_single network are FROZEN (LoRA scope) so all
 #       returned modvec grads are DISCARDED.
-#   (3) LoRA TARGET SET (musubi networks/lora_ltx2.py, LTX2_INCLUDE_PATTERNS_T2V):
-#       attn1.to_q, attn1.to_k, attn1.to_v, attn1.to_out.0  -> 4 adapters/block,
+#   (3) LEGACY NARROW LoRA TARGET SET:
+#       attn1.to_q, attn1.to_k, attn1.to_v, attn1.to_out.0 -> 4 adapters/block,
 #       4*48 = 192 total. Flat-indexed bi*4 + {0:q,1:k,2:v,3:o}.
+#       This is NOT musubi's production T2V preset, which targets all AV
+#       attention modules. See training/ltx2_av_training_readiness.mojo.
 #   (4) RoPE is SPLIT type (rope_halfsplit). cos/sin built via
 #       models/dit/ltx2_rope.build_ltx2_rope, flattened to [S*H, Dh//2] in the
 #       split layout the block expects (NOT interleaved).
@@ -47,7 +49,7 @@ from serenitymojo.models.ltx2.ltx2_block import (
     ltx2_block_forward, ltx2_block_backward,
 )
 from serenitymojo.models.ltx2.weights import (
-    LTX2StackBase, LTX2BlockWeightsHost, load_ltx2_block_weights_from_block,
+    LTX2StackBase, LTX2BlockOffloadWeights, load_ltx2_block_offload_from_block,
 )
 
 # reuse the proven host-list LoRA carrier + AdamW + PEFT save.
@@ -181,7 +183,7 @@ def ltx2_adaln_delta(
     # timestep_embed_256 is the [256] sinusoidal+MLP timestep embedding from the
     # trainer (built once per step). We run the two adaln timestep linears then
     # the 6*D projection. silu between matches diffusers AdaLayerNormSingle.
-    var emb = Tensor.from_host(timestep_embed_256.copy(), [1, 256], STDtype.F32, ctx)
+    var emb = Tensor.from_host(timestep_embed_256.copy(), [1, 256], STDtype.BF16, ctx)
     var b1 = Optional[Tensor](base.adaln_lin1_b[].clone(ctx))
     var h1 = linear(emb, base.adaln_lin1_w[], b1, ctx)        # [1,256]
     var h1a = silu(h1, ctx)
@@ -194,7 +196,7 @@ def ltx2_adaln_delta(
 
 
 # Build per-block combined modvecs: sst_base[r] + adaln_delta[r] for r in 0..5.
-def _block_modvecs(h: LTX2BlockWeightsHost, adaln_delta: List[Float32], D: Int) -> LTX2ModVecs:
+def _block_modvecs(h: LTX2BlockOffloadWeights, adaln_delta: List[Float32], D: Int) -> LTX2ModVecs:
     # adaln_delta is [6*D]: rows shift_msa,scale_msa,gate_msa,shift_mlp,scale_mlp,gate_mlp.
     var d_shift_msa = List[Float32]()
     var d_scale_msa = List[Float32]()
@@ -255,12 +257,12 @@ struct LTX2StackForward(Movable):
     var out: List[Float32]                    # [N, out_ch] de-patchified output
     var saved: List[List[List[BFloat16]]]     # num_layers x 20 BF16 act fields
     var modvecs: List[List[Float32]]          # num_layers x [6*D] (combined modvecs flat)
-    var x_in: List[Float32]                   # [N, D] post-patchify (block-stream input)
+    var x_in: List[BFloat16]                  # [N, D] post-patchify BF16 block-stream input
 
     def __init__(
         out self,
         var out: List[Float32], var saved: List[List[List[BFloat16]]],
-        var modvecs: List[List[Float32]], var x_in: List[Float32],
+        var modvecs: List[List[Float32]], var x_in: List[BFloat16],
     ):
         self.out = out^
         self.saved = saved^
@@ -323,15 +325,15 @@ def ltx2_stack_lora_forward_offload[
     loader.prefetch_with_ctx(0, ctx)
 
     # split-rope tables: [S*H, Dh//2] (built by ltx2_rope, already split layout).
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
 
     # patchify_proj (frozen base linear): [N,in_ch] -> [N,D]
     var pb = Optional[Tensor](base.patchify_b[].clone(ctx))
     var x = linear(
-        Tensor.from_host(x_tokens.copy(), [S, in_ch], STDtype.F32, ctx),
+        Tensor.from_host(x_tokens.copy(), [S, in_ch], STDtype.BF16, ctx),
         base.patchify_w[], pb, ctx,
-    ).to_host(ctx)
+    ).to_host_bf16(ctx)
     var x_in = x.copy()
 
     var saved = List[List[List[BFloat16]]]()
@@ -339,18 +341,13 @@ def ltx2_stack_lora_forward_offload[
     for bi in range(num_layers):
         var handle = loader.await_block(bi, ctx)
         loader.prefetch_next_with_ctx(bi, ctx)
-        var h = load_ltx2_block_weights_from_block(handle.block, handle.prefix + String("."), D, H, ctx)
-        var w = LTX2BlockWeights(
-            h.wq.copy(), h.bq.copy(), h.wk.copy(), h.bk.copy(),
-            h.wv.copy(), h.bv.copy(), h.wo.copy(), h.bo.copy(),
-            h.q_norm.copy(), h.k_norm.copy(), h.gate_w.copy(), h.gate_b.copy(),
-            h.wff0.copy(), h.bff0.copy(), h.wff2.copy(), h.bff2.copy(),
-            D, H, FF, ctx,
+        var h = load_ltx2_block_offload_from_block(
+            handle.block, handle.prefix + String("."), D, H, ctx,
         )
         var mv = _block_modvecs(h, adaln_delta, D)
         var bl = _block_loras(lora, bi)
         var fwd = ltx2_block_forward[H, Dh, S](
-            x.copy(), w, mv, cos_t, sin_t,
+            x.copy(), h.weights.copy(), mv, cos_t, sin_t,
             bl[0], bl[1], bl[2], bl[3], use_lora,
             D, FF, eps, ctx,
         )
@@ -362,7 +359,7 @@ def ltx2_stack_lora_forward_offload[
     # proj_out (frozen base): [N,D] -> [N,out_ch]
     var ob = Optional[Tensor](base.proj_out_b[].clone(ctx))
     var out = linear(
-        Tensor.from_host(x.copy(), [S, D], STDtype.F32, ctx),
+        Tensor.from_host_bf16(x.copy(), [S, D], ctx),
         base.proj_out_w[], ob, ctx,
     ).to_host(ctx)
 
@@ -393,8 +390,8 @@ def ltx2_stack_lora_backward_offload[
     if loader.block_count() > 0:
         loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
 
     var n_adapters = total_ltx2_adapters(lora)
     var d_a_flat = List[List[Float32]]()
@@ -405,8 +402,8 @@ def ltx2_stack_lora_backward_offload[
 
     # ── proj_out backward (frozen; grads discarded, arm exercised) ──
     var lbo = linear_backward(
-        Tensor.from_host(d_out.copy(), [S, out_ch], STDtype.F32, ctx),
-        Tensor.from_host(saved.x_in.copy(), [S, D], STDtype.F32, ctx),  # placeholder x (unused for d_x scale)
+        Tensor.from_host(d_out.copy(), [S, out_ch], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(saved.x_in.copy(), [S, D], ctx),  # placeholder x (unused for d_x scale)
         base.proj_out_w[], S, D, out_ch, ctx,
     )
     var d_x = lbo.d_x.to_host(ctx)   # [N,D] grad into the last block output
@@ -417,19 +414,14 @@ def ltx2_stack_lora_backward_offload[
         var handle = loader.await_block(bi, ctx)
         if bi > 0:
             loader.prefetch_with_ctx(bi - 1, ctx)
-        var h = load_ltx2_block_weights_from_block(handle.block, handle.prefix + String("."), D, H, ctx)
-        var w = LTX2BlockWeights(
-            h.wq.copy(), h.bq.copy(), h.wk.copy(), h.bk.copy(),
-            h.wv.copy(), h.bv.copy(), h.wo.copy(), h.bo.copy(),
-            h.q_norm.copy(), h.k_norm.copy(), h.gate_w.copy(), h.gate_b.copy(),
-            h.wff0.copy(), h.bff0.copy(), h.wff2.copy(), h.bff2.copy(),
-            D, H, FF, ctx,
+        var h = load_ltx2_block_offload_from_block(
+            handle.block, handle.prefix + String("."), D, H, ctx,
         )
         var mv = _modvecs_from_flat(saved.modvecs[bi].copy(), D)
         var bl = _block_loras(lora, bi)
         var blk_saved = _rebuild_saved(saved.saved[bi])
         var bg = ltx2_block_backward[H, Dh, S](
-            d_x.copy(), w, mv, blk_saved, cos_t, sin_t,
+            d_x.copy(), h.weights.copy(), mv, blk_saved, cos_t, sin_t,
             bl[0], bl[1], bl[2], bl[3], use_lora,
             D, FF, eps, ctx,
         )
@@ -449,8 +441,8 @@ def ltx2_stack_lora_backward_offload[
 
     # ── patchify backward (frozen; grads discarded, arm exercised) ──
     var lbi = linear_backward(
-        Tensor.from_host(d_x.copy(), [S, D], STDtype.F32, ctx),
-        Tensor.from_host(x_tokens.copy(), [S, in_ch], STDtype.F32, ctx),
+        Tensor.from_host(d_x.copy(), [S, D], STDtype.BF16, ctx),
+        Tensor.from_host(x_tokens.copy(), [S, in_ch], STDtype.BF16, ctx),
         base.patchify_w[], S, in_ch, D, ctx,
     )
     var d_in = lbi.d_x.to_host(ctx)

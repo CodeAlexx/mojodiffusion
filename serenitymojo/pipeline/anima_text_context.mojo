@@ -53,7 +53,10 @@ comptime DIM = 1024
 
 
 def _read_ids(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises -> List[Int]:
-    """Read an int-id array (stored F32 or I64) from the sidecar into List[Int]."""
+    """Read a dev-time token sidecar array into host List[Int].
+
+    `from_view_as_f32` is intentional here: these are tokenizer ids, not model
+    activations or weights, and the result leaves tensor storage immediately."""
     var t = Tensor.from_view_as_f32(st.tensor_view(name), ctx)
     var host = t.to_host(ctx)
     var out = List[Int]()

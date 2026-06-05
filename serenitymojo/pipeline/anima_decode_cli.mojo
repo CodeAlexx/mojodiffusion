@@ -4,7 +4,7 @@
 #
 #   anima_decode_cli <latent.safetensors> <out.png>
 #
-# Reads a SCALED latent [1,16,128,128] F32/BF16 (key `latent`, the schema
+# Reads a SCALED latent [1,16,128,128] BF16/F32 (key `latent`, the schema
 # anima_sample_cli writes) and decodes it through the Qwen-Image (wan21-keys) VAE
 # to a 1024x1024 PNG ([-1,1] SIGNED range). The Mojo decoder internally applies
 # z/inv_std + mean, matching OneTrainer AnimaModel.unscale_latents before
@@ -88,6 +88,7 @@ def main() raises:
     var lat4 = reshape(lat_raw, sh^, ctx)
     var hv = lat4.to_host(ctx)
     print("  latent mean_abs:", _mean_abs16(hv))
+    var lat: Tensor
     if do_unscale:
         var lmean = _lat_mean()
         var lstd = _lat_std()
@@ -96,11 +97,12 @@ def main() raises:
             for i in range(hw):
                 hv[c * hw + i] = hv[c * hw + i] * lstd[c] + lmean[c]
         print("  latent (raw) mean_abs after unscale:", _mean_abs16(hv))
-    var sh2 = List[Int]()
-    sh2.append(1); sh2.append(ANIMA_LATENT_CHANNELS)
-    sh2.append(ANIMA_LATENT_H); sh2.append(ANIMA_LATENT_W)
-    var lat4u = Tensor.from_host(hv, sh2^, STDtype.F32, ctx)
-    var lat = cast_tensor(lat4u, STDtype.BF16, ctx)
+        var sh2 = List[Int]()
+        sh2.append(1); sh2.append(ANIMA_LATENT_CHANNELS)
+        sh2.append(ANIMA_LATENT_H); sh2.append(ANIMA_LATENT_W)
+        lat = Tensor.from_host(hv, sh2^, STDtype.BF16, ctx)
+    else:
+        lat = cast_tensor(lat4, STDtype.BF16, ctx)
 
     var dec = QwenImageVaeDecoder[ANIMA_LATENT_H, ANIMA_LATENT_W].load_wan21_keys(
         String(ANIMA_VAE_PATH), ctx

@@ -197,8 +197,8 @@ def denoise(cap_c: Tensor, cap_u: Tensor, ctx: DeviceContext) raises -> Tensor:
 
     var noise = gaussian_noise(16 * HL * WL)
     var nshape = [1, 16, HL, WL]
-    # latent kept in F32 (diffusers keeps latents fp32; bf16 only for model input).
-    var x = Tensor.from_host(noise, nshape^, STDtype.F32, ctx)
+    # Keep the latent boundary BF16; scheduler arithmetic below casts locally.
+    var x = Tensor.from_host(noise, nshape^, STDtype.BF16, ctx)
 
     # diffusers FlowMatchEulerDiscreteScheduler sigmas (steps=30, shift=6.0) —
     # exact values from the oracle. (build_sigma_schedule spaces the pre-shift
@@ -219,9 +219,8 @@ def denoise(cap_c: Tensor, cap_u: Tensor, ctx: DeviceContext) raises -> Tensor:
     _stats("init_noise", x, ctx)
     for i in range(STEPS):
         var t = 1.0 - sigmas[i]  # DiT timestep convention
-        var x_bf = _cast(x, STDtype.BF16, ctx)  # bf16 only to feed the DiT
-        var vc = _cast(dit_c.forward(x_bf, t, cap_c, ctx), STDtype.F32, ctx)
-        var vu = _cast(dit_u.forward(x_bf, t, cap_u, ctx), STDtype.F32, ctx)
+        var vc = _cast(dit_c.forward(x, t, cap_c, ctx), STDtype.F32, ctx)
+        var vu = _cast(dit_u.forward(x, t, cap_u, ctx), STDtype.F32, ctx)
         # Diffusers CFG (code form, F32), then pipeline_z_image.py negates before
         # FlowMatchEulerDiscreteScheduler.step().
         var pred = add(vc, mul_scalar(sub(vc, vu, ctx), CFG, ctx), ctx)
@@ -230,7 +229,8 @@ def denoise(cap_c: Tensor, cap_u: Tensor, ctx: DeviceContext) raises -> Tensor:
             _stats("v_cond", vc, ctx)
             _stats("v_uncond", vu, ctx)
         var dt = sigmas[i + 1] - sigmas[i]
-        x = add(x, mul_scalar(pred, dt, ctx), ctx)  # F32: x += (σ_next-σ)*(-pred_raw)
+        var x_compute = _cast(x, STDtype.F32, ctx)
+        x = _cast(add(x_compute, mul_scalar(pred, dt, ctx), ctx), STDtype.BF16, ctx)
         if (i + 1) % 10 == 0 or i == STEPS - 1:
             print("  step", i + 1, "/", STEPS, "sigma", sigmas[i], "→", sigmas[i + 1])
     _stats("final_latent", x, ctx)

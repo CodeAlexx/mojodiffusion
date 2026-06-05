@@ -19,7 +19,8 @@
 # D2H copies. The block-reduce + atomic-into-scalar shape mirrors flame-core's
 # sum_bf16_to_f32_scalar_kernel (FLAME_KERNELS.md bf16_reduce.rs:50).
 #
-# Grads boxed as TArc (Tensor is move-only). F32-only (master grads).
+# Grads boxed as TArc (Tensor is move-only). Grad storage may be F32/BF16/F16;
+# the reduction always accumulates into a single F32 scalar.
 # AGENT-DEFAULT: block size 256, grid capped at 4096 with a grid-stride loop
 # (covers arbitrary total element counts — same cap flame-core uses).
 #
@@ -47,7 +48,7 @@ comptime _GRID_CAP = 4096
 # Stage 1: each block grid-strides over the global element range. Per element it
 # locates its tensor via the prefix-sum offset table, reads g[j], accumulates
 # g^2, tree-reduces in shared memory, atomicAdds the block total into out[0].
-def _global_sq_kernel(
+def _global_sq_kernel[g_dtype: DType](
     g_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     offs: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
     out_scalar: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
@@ -68,8 +69,8 @@ def _global_sq_kernel(
             ti += 1
         var j = gid - Int(rebind[Scalar[DType.int64]](offs[ti]))
         var ga = rebind[Scalar[DType.uint64]](g_addr[ti])
-        var gp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(ga))
-        var v = gp[j]
+        var gp = UnsafePointer[Scalar[g_dtype], MutExternalOrigin](unsafe_from_address=Int(ga))
+        var v = gp[j].cast[DType.float32]()
         acc += v * v
         gid += stride
     sh[tid] = acc
@@ -84,15 +85,41 @@ def _global_sq_kernel(
         _ = Atomic[DType.float32].fetch_add(out_scalar.ptr, sh[0])
 
 
+def _supported_grad_dtype(dt: STDtype) -> Bool:
+    return dt == STDtype.F32 or dt == STDtype.BF16 or dt == STDtype.F16
+
+
+def _launch_global_sq[g_dtype: DType](
+    ctx: DeviceContext,
+    GA: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
+    OFF: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
+    OUT: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    nt: Int,
+    total: Int,
+    nblocks: Int,
+) raises:
+    ctx.enqueue_function[
+        _global_sq_kernel[g_dtype], _global_sq_kernel[g_dtype]
+    ](
+        GA, OFF, OUT, nt, total, grid_dim=nblocks, block_dim=_BLOCK,
+    )
+
+
 def on_device_global_norm(
     grads: List[TArc], ctx: DeviceContext
 ) raises -> Float32:
     """Global L2 norm = sqrt(sum over ALL grads of sum(g*g)), computed fully on
-    device with a single 4-byte D2H. F32-only. Matches the host sum-of-squares
-    in optim.mojo clip_grads_by_global_norm (to F32 accumulation eps)."""
+    device with a single 4-byte D2H. F32/BF16/F16 grad storage is read in its
+    original dtype and accumulated as F32."""
     var nt = len(grads)
     if nt == 0:
         raise Error("on_device_global_norm: empty grad list")
+    var grad_dtype = grads[0][].dtype()
+    if not _supported_grad_dtype(grad_dtype):
+        raise Error(
+            String("on_device_global_norm: unsupported grad dtype ")
+            + grad_dtype.name()
+        )
 
     # host address + offset tables
     var g_host = ctx.enqueue_create_host_buffer[DType.uint8](nt * 8)
@@ -102,9 +129,9 @@ def on_device_global_norm(
     var total = 0
     op[0] = Int64(0)
     for i in range(nt):
-        if grads[i][].dtype() != STDtype.F32:
-            raise Error("on_device_global_norm: all grads must be F32")
-        gp[i] = UInt64(Int(grads[i][].buf.unsafe_ptr().bitcast[Float32]()))
+        if grads[i][].dtype() != grad_dtype:
+            raise Error("on_device_global_norm: mixed grad dtypes in one launch")
+        gp[i] = UInt64(Int(grads[i][].buf.unsafe_ptr()))
         total += grads[i][].numel()
         op[i + 1] = Int64(total)
 
@@ -128,9 +155,12 @@ def on_device_global_norm(
     var nblocks = (total + _BLOCK - 1) // _BLOCK
     if nblocks > _GRID_CAP:
         nblocks = _GRID_CAP
-    ctx.enqueue_function[_global_sq_kernel, _global_sq_kernel](
-        GA, OFF, OUT, nt, total, grid_dim=nblocks, block_dim=_BLOCK,
-    )
+    if grad_dtype == STDtype.F32:
+        _launch_global_sq[DType.float32](ctx, GA, OFF, OUT, nt, total, nblocks)
+    elif grad_dtype == STDtype.BF16:
+        _launch_global_sq[DType.bfloat16](ctx, GA, OFF, OUT, nt, total, nblocks)
+    else:
+        _launch_global_sq[DType.float16](ctx, GA, OFF, OUT, nt, total, nblocks)
     # single 4-byte D2H of the summed sum-of-squares
     var host = ctx.enqueue_create_host_buffer[DType.uint8](4)
     ctx.enqueue_copy(dst_buf=host, src_buf=scal_dev)

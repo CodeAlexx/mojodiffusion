@@ -6,7 +6,7 @@
 # Run: cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #   pixi run mojo run -I . serenitymojo/training/parity/on_device_global_norm_parity.mojo
 
-from sys import argv
+from std.sys import argv
 from std.math import sqrt
 from std.memory import ArcPointer
 from std.time import perf_counter_ns
@@ -24,6 +24,44 @@ def _fill(n: Int, seed: UInt64, scale: Float32) -> List[Float32]:
         var u = Float32(Int(state >> 40)) * Float32(1.0 / 16777216.0)
         out.append((u - Float32(0.5)) * scale)
     return out^
+
+
+def _storage_dtype_gate(dtype: STDtype, ctx: DeviceContext) raises:
+    var sizes = List[Int]()
+    sizes.append(1024)
+    sizes.append(3072)
+    sizes.append(777)
+
+    var grads = List[TArc]()
+    for i in range(len(sizes)):
+        grads.append(
+            TArc(Tensor.from_host(
+                _fill(sizes[i], 2000 + UInt64(i), 0.3), [sizes[i]], dtype, ctx
+            ))
+        )
+
+    var total_sq = Float64(0.0)
+    for i in range(len(sizes)):
+        if grads[i][].dtype() != dtype:
+            raise Error("on_device_global_norm storage gate: grad dtype changed")
+        var h = grads[i][].to_host(ctx)
+        for j in range(len(h)):
+            var x = Float64(h[j])
+            total_sq += x * x
+    var ref_norm = Float32(sqrt(total_sq))
+    var dev_norm = on_device_global_norm(grads, ctx)
+    var rel = Float64(dev_norm - ref_norm)
+    if rel < 0.0:
+        rel = -rel
+    rel = rel / Float64(ref_norm)
+    if rel < 1.0e-3:
+        print("PASS: on_device_global_norm preserves ", dtype.name(), " grad storage")
+    else:
+        raise Error(
+            String("on_device_global_norm ")
+            + dtype.name()
+            + " storage gate FAILED"
+        )
 
 
 def main() raises:
@@ -94,3 +132,6 @@ def main() raises:
         print("PASS: on_device_global_norm matches host sum-of-squares (rel<1e-3)")
     else:
         raise Error("on_device_global_norm_parity gate FAILED")
+
+    _storage_dtype_gate(STDtype.BF16, ctx)
+    _storage_dtype_gate(STDtype.F16, ctx)

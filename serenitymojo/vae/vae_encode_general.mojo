@@ -25,7 +25,9 @@
 # module targets the AutoencoderKL 2D form. Channel counts must be GroupNorm-
 # divisible (GN_GROUPS=32); the gate uses CH=32.
 #
-# DTYPE: F32 end-to-end (the latent-correctness precision, like klein_encoder).
+# DTYPE: synthetic weights default to BF16 and may be constructed as
+# F32/BF16/F16 for tests. Activations are cast once to weight storage at entry;
+# reparam does F32 arithmetic inside the kernel and stores in the moment dtype.
 #
 # Mojo 1.0.0b1: `def` not `fn`; move-only Tensor; comptime spatial dims so
 # conv2d (which needs comptime H/W/Cin/Cout) can be called.
@@ -43,6 +45,7 @@ from serenitymojo.ops.conv import conv2d
 from serenitymojo.ops.norm import group_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.random import randn
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import slice, add, mul, mul_scalar
 from serenitymojo.models.vae.decoder2d import (
     ResnetBlock,
@@ -62,114 +65,161 @@ comptime LOGVAR_MAX = Float32(20.0)
 
 
 # ── diagonal-Gaussian reparam kernel: z = mu + exp(0.5*clamp(logvar))*eps ──────
-def _reparam_kernel_f32(
-    mu: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    logvar: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    eps: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _reparam_kernel[dtype: DType](
+    mu: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    logvar: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    eps: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var m = rebind[Scalar[DType.float32]](mu[i])
-        var lv = rebind[Scalar[DType.float32]](logvar[i])
+        var m = rebind[Scalar[dtype]](mu[i]).cast[DType.float32]()
+        var lv = rebind[Scalar[dtype]](logvar[i]).cast[DType.float32]()
         if lv < LOGVAR_MIN:
             lv = LOGVAR_MIN
         if lv > LOGVAR_MAX:
             lv = LOGVAR_MAX
         var std = exp(Float32(0.5) * lv)
-        var e = rebind[Scalar[DType.float32]](eps[i])
-        o[i] = rebind[o.element_type](m + std * e)
+        var e = rebind[Scalar[dtype]](eps[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type]((m + std * e).cast[dtype]())
 
 
 def diag_gaussian_sample(
     mu: Tensor, logvar: Tensor, eps: Tensor, ctx: DeviceContext
 ) raises -> Tensor:
-    """z = mu + exp(0.5*clamp(logvar,-30,20)) * eps. All F32, same shape."""
-    if mu.dtype() != STDtype.F32 or logvar.dtype() != STDtype.F32 or eps.dtype() != STDtype.F32:
-        raise Error("diag_gaussian_sample: F32 only")
+    """z = mu + exp(0.5*clamp(logvar,-30,20)) * eps; F32 math, store dtype."""
+    var storage = mu.dtype()
+    if logvar.dtype() != storage or eps.dtype() != storage:
+        raise Error("diag_gaussian_sample: inputs must share storage dtype")
+    var dt = storage.to_mojo_dtype()
+    if dt != DType.float32 and dt != DType.bfloat16 and dt != DType.float16:
+        raise Error("diag_gaussian_sample: expected F32, BF16, or F16 storage")
     var n = mu.numel()
     if logvar.numel() != n or eps.numel() != n:
         raise Error("diag_gaussian_sample: shape mismatch")
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](mu.nbytes())
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * storage.byte_size())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var MU = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        mu.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var LV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        logvar.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var EP = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        eps.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_reparam_kernel_f32, _reparam_kernel_f32](
-        MU, LV, EP, O, n, grid_dim=grid, block_dim=_BLOCK
-    )
+    if dt == DType.float32:
+        var MU = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            mu.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var LV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            logvar.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var EP = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            eps.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_reparam_kernel[DType.float32], _reparam_kernel[DType.float32]](
+            MU, LV, EP, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var MU = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            mu.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var LV = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            logvar.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var EP = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            eps.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_reparam_kernel[DType.bfloat16], _reparam_kernel[DType.bfloat16]](
+            MU, LV, EP, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var MU = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            mu.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var LV = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            logvar.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var EP = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            eps.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_reparam_kernel[DType.float16], _reparam_kernel[DType.float16]](
+            MU, LV, EP, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
     ctx.synchronize()
-    return Tensor(out_buf^, mu.shape(), STDtype.F32)
+    return Tensor(out_buf^, mu.shape(), storage)
 
 
 # ── synthetic-weight helpers (no checkpoint; deterministic, small) ─────────────
-def _w(var shape: List[Int], seed: UInt64, ctx: DeviceContext) raises -> Tensor:
+def _w(
+    var shape: List[Int], seed: UInt64, dtype: STDtype, ctx: DeviceContext
+) raises -> Tensor:
     # Small N(0,1)*0.1 weights so the forward stays finite + non-degenerate.
-    var t = randn(shape^, seed, STDtype.F32, ctx)
+    var t = randn(shape^, seed, dtype, ctx)
     return mul_scalar(t, 0.1, ctx)
 
 
-def _ones(c: Int, ctx: DeviceContext) raises -> Tensor:
+def _ones(c: Int, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
     var v = List[Float32]()
     for _ in range(c):
         v.append(1.0)
     var s = List[Int]()
     s.append(c)
-    return Tensor.from_host(v, s^, STDtype.F32, ctx)
+    return Tensor.from_host(v, s^, dtype, ctx)
 
 
-def _zeros(c: Int, ctx: DeviceContext) raises -> Tensor:
+def _zeros(c: Int, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
     var v = List[Float32]()
     for _ in range(c):
         v.append(0.0)
     var s = List[Int]()
     s.append(c)
-    return Tensor.from_host(v, s^, STDtype.F32, ctx)
+    return Tensor.from_host(v, s^, dtype, ctx)
 
 
-def _conv_w(kh: Int, kw: Int, cin: Int, cout: Int, seed: UInt64, ctx: DeviceContext) raises -> Tensor:
+def _conv_w(
+    kh: Int,
+    kw: Int,
+    cin: Int,
+    cout: Int,
+    seed: UInt64,
+    dtype: STDtype,
+    ctx: DeviceContext,
+) raises -> Tensor:
     var s = List[Int]()
     s.append(kh); s.append(kw); s.append(cin); s.append(cout)  # RSCF
-    return _w(s^, seed, ctx)
+    return _w(s^, seed, dtype, ctx)
 
 
 def _make_resnet[
     N: Int, H: Int, W: Int, C: Int
-](seed: UInt64, ctx: DeviceContext) raises -> ResnetBlock[N, H, W, C, C]:
+](seed: UInt64, dtype: STDtype, ctx: DeviceContext) raises -> ResnetBlock[N, H, W, C, C]:
     # Cin == Cout → no shortcut. Build all fields synthetically.
-    var dummy = _zeros(1, ctx)
+    var dummy = _zeros(1, dtype, ctx)
     return ResnetBlock[N, H, W, C, C](
-        _ones(C, ctx), _zeros(C, ctx),                 # norm1 w/b
-        _conv_w(3, 3, C, C, seed, ctx), _zeros(C, ctx),# conv1 w/b
-        _ones(C, ctx), _zeros(C, ctx),                 # norm2 w/b
-        _conv_w(3, 3, C, C, seed + 1, ctx), _zeros(C, ctx),  # conv2 w/b
-        False, dummy^, _zeros(1, ctx),                 # no shortcut
+        _ones(C, dtype, ctx), _zeros(C, dtype, ctx),  # norm1 w/b
+        _conv_w(3, 3, C, C, seed, dtype, ctx), _zeros(C, dtype, ctx),  # conv1 w/b
+        _ones(C, dtype, ctx), _zeros(C, dtype, ctx),  # norm2 w/b
+        _conv_w(3, 3, C, C, seed + 1, dtype, ctx), _zeros(C, dtype, ctx),  # conv2 w/b
+        False, dummy^, _zeros(1, dtype, ctx),  # no shortcut
     )
 
 
 def _make_attn[
     N: Int, H: Int, W: Int, C: Int
-](seed: UInt64, ctx: DeviceContext) raises -> AttnBlock[N, H, W, C]:
+](seed: UInt64, dtype: STDtype, ctx: DeviceContext) raises -> AttnBlock[N, H, W, C]:
     # Linear weights are [C, C] (out, in) as the decoder2d AttnBlock expects.
     var ww = List[Int]()
     ww.append(C); ww.append(C)
     return AttnBlock[N, H, W, C](
-        _ones(C, ctx), _zeros(C, ctx),                          # group_norm w/b
-        _w(ww.copy(), seed, ctx), _zeros(C, ctx),               # to_q w/b
-        _w(ww.copy(), seed + 1, ctx), _zeros(C, ctx),           # to_k w/b
-        _w(ww.copy(), seed + 2, ctx), _zeros(C, ctx),           # to_v w/b
-        _w(ww^, seed + 3, ctx), _zeros(C, ctx),                 # to_out.0 w/b
+        _ones(C, dtype, ctx), _zeros(C, dtype, ctx),  # group_norm w/b
+        _w(ww.copy(), seed, dtype, ctx), _zeros(C, dtype, ctx),  # to_q w/b
+        _w(ww.copy(), seed + 1, dtype, ctx), _zeros(C, dtype, ctx),  # to_k w/b
+        _w(ww.copy(), seed + 2, dtype, ctx), _zeros(C, dtype, ctx),  # to_v w/b
+        _w(ww^, seed + 3, dtype, ctx), _zeros(C, dtype, ctx),  # to_out.0 w/b
     )
 
 
@@ -199,27 +249,44 @@ struct GeneralVaeEncoder[CIN: Int, IH: Int, IW: Int, CH: Int, ZC: Int](Movable):
     def with_synthetic_weights(
         ctx: DeviceContext,
     ) raises -> GeneralVaeEncoder[Self.CIN, Self.IH, Self.IW, Self.CH, Self.ZC]:
+        """Deterministic BF16 synthetic-weight encoder for weight-free parity."""
+        return Self.with_synthetic_weights_dtype(STDtype.BF16, ctx)
+
+    @staticmethod
+    def with_synthetic_weights_dtype(
+        dtype: STDtype,
+        ctx: DeviceContext,
+    ) raises -> GeneralVaeEncoder[Self.CIN, Self.IH, Self.IW, Self.CH, Self.ZC]:
         """Deterministic synthetic-weight encoder for weight-free parity."""
+        var dt = dtype.to_mojo_dtype()
+        if dt != DType.float32 and dt != DType.bfloat16 and dt != DType.float16:
+            raise Error("with_synthetic_weights_dtype: expected F32, BF16, or F16")
         return GeneralVaeEncoder[Self.CIN, Self.IH, Self.IW, Self.CH, Self.ZC](
-            _conv_w(3, 3, Self.CIN, Self.CH, 1, ctx), _zeros(Self.CH, ctx),
-            _make_resnet[1, Self.IH, Self.IW, Self.CH](10, ctx),
-            _make_resnet[1, Self.IH, Self.IW, Self.CH](20, ctx),
-            _conv_w(3, 3, Self.CH, Self.CH, 30, ctx), _zeros(Self.CH, ctx),
-            _make_resnet[1, Self.IH // 2, Self.IW // 2, Self.CH](40, ctx),
-            _make_attn[1, Self.IH // 2, Self.IW // 2, Self.CH](50, ctx),
-            _make_resnet[1, Self.IH // 2, Self.IW // 2, Self.CH](60, ctx),
-            _ones(Self.CH, ctx), _zeros(Self.CH, ctx),
-            _conv_w(3, 3, Self.CH, 2 * Self.ZC, 70, ctx), _zeros(2 * Self.ZC, ctx),
+            _conv_w(3, 3, Self.CIN, Self.CH, 1, dtype, ctx), _zeros(Self.CH, dtype, ctx),
+            _make_resnet[1, Self.IH, Self.IW, Self.CH](10, dtype, ctx),
+            _make_resnet[1, Self.IH, Self.IW, Self.CH](20, dtype, ctx),
+            _conv_w(3, 3, Self.CH, Self.CH, 30, dtype, ctx), _zeros(Self.CH, dtype, ctx),
+            _make_resnet[1, Self.IH // 2, Self.IW // 2, Self.CH](40, dtype, ctx),
+            _make_attn[1, Self.IH // 2, Self.IW // 2, Self.CH](50, dtype, ctx),
+            _make_resnet[1, Self.IH // 2, Self.IW // 2, Self.CH](60, dtype, ctx),
+            _ones(Self.CH, dtype, ctx), _zeros(Self.CH, dtype, ctx),
+            _conv_w(3, 3, Self.CH, 2 * Self.ZC, 70, dtype, ctx), _zeros(2 * Self.ZC, dtype, ctx),
         )
 
     def encode_moments(self, image_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
-        """[1,CIN,IH,IW] (F32) -> NHWC moments [1,IH/2,IW/2,2*ZC] = mu|logvar."""
+        """[1,CIN,IH,IW] -> NHWC moments [1,IH/2,IW/2,2*ZC] in weight dtype."""
         var sh = image_nchw.shape()
         if len(sh) != 4 or sh[1] != Self.CIN:
             raise Error("encode_moments: expected [1,CIN,IH,IW]")
-        if image_nchw.dtype() != STDtype.F32:
-            raise Error("encode_moments: F32 only")
+        if (
+            image_nchw.dtype() != STDtype.F32
+            and image_nchw.dtype() != STDtype.BF16
+            and image_nchw.dtype() != STDtype.F16
+        ):
+            raise Error("encode_moments: expected F32, BF16, or F16 input")
         var h = nchw_to_nhwc(image_nchw, ctx)               # [1,IH,IW,CIN]
+        if h.dtype() != self.conv_in_w.dtype():
+            h = cast_tensor(h, self.conv_in_w.dtype(), ctx)
         h = conv2d[1, Self.IH, Self.IW, Self.CIN, 3, 3, Self.CH, 1, 1, 1, 1](
             h, clone(self.conv_in_w, ctx),
             Optional[Tensor](clone(self.conv_in_b, ctx)), ctx
@@ -252,7 +319,7 @@ struct GeneralVaeEncoder[CIN: Int, IH: Int, IW: Int, CH: Int, ZC: Int](Movable):
         var mu = nhwc_to_nchw(mu_nhwc, ctx)                  # [1,ZC,h,w]
         var lv = nhwc_to_nchw(lv_nhwc, ctx)
         var eps_shape = mu.shape()
-        var eps = randn(eps_shape^, eps_seed, STDtype.F32, ctx)
+        var eps = randn(eps_shape^, eps_seed, mu.dtype(), ctx)
         return diag_gaussian_sample(mu, lv, eps, ctx)
 
     @staticmethod

@@ -7,7 +7,9 @@
 # and compares each stage to the numpy reference via ParityHarness.
 #
 # Config: T=16 tokens, E=4 experts, top-2, hidden=32, ffn=64 (F32 storage so the
-# parity gate isolates op correctness from quantization). Gate: cos >= 0.999.
+# main parity gate isolates op correctness from quantization). BF16/F16 storage
+# smoke paths assert dtype preservation at MoE tensor boundaries. Gate:
+# cos >= 0.999.
 #
 # Run: pixi run mojo run -I . serenitymojo/ops/moe_smoke.mojo
 
@@ -16,6 +18,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness
 from serenitymojo.ops.moe import (
+    RouterPlan,
     top_k_router,
     grouped_expert_ffn,
     gated_scatter_add,
@@ -36,6 +39,78 @@ from serenitymojo.ops.parity.moe_ref_data import (
     ref_expert_out,
     ref_accum,
 )
+
+
+def _slot_indices() -> List[Int]:
+    var indices = List[Int]()
+    for t in range(MOE_T):
+        for _ in range(MOE_K):
+            indices.append(t)
+    return indices^
+
+
+def _zeros(n: Int) -> List[Float32]:
+    var zeros = List[Float32]()
+    for _ in range(n):
+        zeros.append(Float32(0.0))
+    return zeros^
+
+
+def _run_storage_smoke(
+    dtype: STDtype,
+    name: String,
+    plan: RouterPlan,
+    indices: List[Int],
+    ctx: DeviceContext,
+    harness: ParityHarness,
+) raises -> Bool:
+    var tok = Tensor.from_host(ref_tokens(), [MOE_T, MOE_H], dtype, ctx)
+    var gate_w = Tensor.from_host(
+        ref_gate_w(), [MOE_E, MOE_F, MOE_H], dtype, ctx
+    )
+    var up_w = Tensor.from_host(
+        ref_up_w(), [MOE_E, MOE_F, MOE_H], dtype, ctx
+    )
+    var down_w = Tensor.from_host(
+        ref_down_w(), [MOE_E, MOE_H, MOE_F], dtype, ctx
+    )
+
+    var expert_out = grouped_expert_ffn(tok, gate_w, up_w, down_w, plan, ctx)
+    if expert_out.dtype() != dtype:
+        raise Error(
+            name
+            + String(" grouped_expert_ffn dtype changed to ")
+            + expert_out.dtype().name()
+        )
+    var r_ffn = harness.compare(expert_out, ref_expert_out(), ctx)
+    print("grouped_ffn/", name, " ", r_ffn, " dtype=", expert_out.dtype().name())
+
+    var accum = Tensor.from_host(
+        _zeros(MOE_T * MOE_H), [MOE_T, MOE_H], dtype, ctx
+    )
+    gated_scatter_add(expert_out, plan.gating.copy(), indices, accum, ctx)
+    if accum.dtype() != dtype:
+        raise Error(
+            name
+            + String(" gated_scatter_add accum dtype changed to ")
+            + accum.dtype().name()
+        )
+    var r_final = harness.compare(accum, ref_accum(), ctx)
+    print("scatter_add/", name, " ", r_final, " dtype=", accum.dtype().name())
+
+    var accum_f32 = Tensor.from_host(
+        _zeros(MOE_T * MOE_H), [MOE_T, MOE_H], STDtype.F32, ctx
+    )
+    gated_scatter_add(expert_out, plan.gating.copy(), indices, accum_f32, ctx)
+    if accum_f32.dtype() != STDtype.F32:
+        raise Error(name + String(" F32 accumulator dtype changed"))
+    var r_final_f32 = harness.compare(accum_f32, ref_accum(), ctx)
+    print(
+        "scatter_add/", name, "->f32 ", r_final_f32,
+        " dtype=", accum_f32.dtype().name(),
+    )
+
+    return r_ffn.passed and r_final.passed and r_final_f32.passed
 
 
 def main() raises:
@@ -86,18 +161,22 @@ def main() raises:
 
     # ── stage 3: gated scatter-add ────────────────────────────────────────────
     # indices: token-major, slot s = t*K + j -> token t.
-    var indices = List[Int]()
-    for t in range(MOE_T):
-        for _ in range(MOE_K):
-            indices.append(t)
+    var indices = _slot_indices()
     # accum starts at zero [T, H].
-    var zeros = List[Float32]()
-    for _ in range(MOE_T * MOE_H):
-        zeros.append(Float32(0.0))
-    var accum = Tensor.from_host(zeros, [MOE_T, MOE_H], STDtype.F32, ctx)
+    var accum = Tensor.from_host(
+        _zeros(MOE_T * MOE_H), [MOE_T, MOE_H], STDtype.F32, ctx
+    )
     gated_scatter_add(expert_out, plan.gating.copy(), indices, accum, ctx)
     var r_final = harness.compare(accum, ref_accum(), ctx)
     print("scatter_add/final ", r_final)
+
+    # ── BF16/F16 boundary contract smoke ─────────────────────────────────────
+    var bf16_pass = _run_storage_smoke(
+        STDtype.BF16, String("bf16"), plan, indices, ctx, harness
+    )
+    var f16_pass = _run_storage_smoke(
+        STDtype.F16, String("f16"), plan, indices, ctx, harness
+    )
 
     # ── overall gate ──────────────────────────────────────────────────────────
     var all_pass = (
@@ -106,6 +185,8 @@ def main() raises:
         and r_gate.passed
         and r_ffn.passed
         and r_final.passed
+        and bf16_pass
+        and f16_pass
     )
     print("")
     if all_pass:

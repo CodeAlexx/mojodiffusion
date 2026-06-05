@@ -141,11 +141,12 @@ ignores the incoming out-grad by design.
 | `log_backward(grad_out, x, ctx)` | :226 | grad/x |
 | `softmax_backward(grad_out, softmax_out, ctx)` | :232 | y·(grad − rowsum(grad·y)) |
 | `logsoftmax_backward(grad_out, logsoftmax_out, ctx)` | :276 | grad − exp(ls)·rowsum(grad) |
-| `sum_backward(grad_out_scalar, in_shape, ctx)` | :339 | broadcast scalar grad to in_shape |
-| `mean_backward(grad_out_scalar, in_shape, ctx)` | :346 | broadcast scalar grad / numel |
+| `sum_backward(grad_out_scalar, in_shape, ctx, dtype)` | :447 | broadcast scalar grad to in_shape |
+| `mean_backward(grad_out_scalar, in_shape, ctx, dtype)` | :457 | broadcast scalar grad / numel |
 
 Note `sum_backward`/`mean_backward` take a **host `Float32` scalar** grad plus
-the target `in_shape` (no input tensor needed). Kernels `_sqrt_bwd_k` (:50),
+the target `in_shape` and require the output storage dtype explicitly because
+there is no input tensor to infer it from. Kernels `_sqrt_bwd_k` (:50),
 `_square_bwd_k` (:63), `_log_bwd_k` (:76), `_broadcast_scalar_k` (:89),
 `_softmax_bwd_rows_f32` (:102), `_logsoftmax_bwd_rows_f32` (:140).
 

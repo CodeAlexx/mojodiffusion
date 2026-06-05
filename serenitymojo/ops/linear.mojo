@@ -440,16 +440,18 @@ def linear_rows(
     ctx: DeviceContext,
     alpha: Float32 = 1.0,
 ) raises -> Tensor:
-    """F32 no-bias linear over a contiguous weight-row range."""
-    if (
-        x.dtype() != STDtype.F32
-        or not (
-            weight.dtype() == STDtype.F32
-            or weight.dtype() == STDtype.BF16
-            or weight.dtype() == STDtype.F16
-        )
+    """No-bias linear over a contiguous weight-row range.
+
+    Output storage follows `x.dtype()`. GEMM accumulation uses an F32 C buffer
+    and immediately casts to BF16/F16 when the activation storage is narrow."""
+    if not (
+        weight.dtype() == STDtype.F32
+        or weight.dtype() == STDtype.BF16
+        or weight.dtype() == STDtype.F16
     ):
-        raise Error("linear_rows: x F32 and weight F32/BF16/F16 required")
+        raise Error("linear_rows: weight must be F32/BF16/F16")
+    if x.dtype() != weight.dtype() and x.dtype() != STDtype.F32:
+        raise Error("linear_rows: x/weight dtype mismatch")
 
     var xshape = x.shape()
     var wshape = weight.shape()
@@ -473,41 +475,82 @@ def linear_rows(
     for i in range(len(xshape) - 1):
         out_shape.append(xshape[i])
     out_shape.append(row_count)
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](m * row_count * 4)
+    var c_buf = ctx.enqueue_create_buffer[DType.uint8](m * row_count * 4)
 
     var a_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, in_dim))
     var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](row_count, k))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, row_count))
-    var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), a_rl
-    )
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), c_rl
+        c_buf.unsafe_ptr().bitcast[Float32](), c_rl
     )
     if weight.dtype() == STDtype.F32:
+        if x.dtype() != STDtype.F32:
+            raise Error("linear_rows: F32 weight requires F32 x")
+        var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), a_rl
+        )
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             weight.buf.unsafe_ptr().bitcast[Float32]() + row_start * k, b_rl
         )
         matmul(ctx, C, A, B, transpose_b=True, c_row_major=True, alpha=alpha)
     elif weight.dtype() == STDtype.BF16:
-        var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
-        var A16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
-        )
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             weight.buf.unsafe_ptr().bitcast[BFloat16]() + row_start * k, b_rl
         )
-        matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
+        if x.dtype() == STDtype.F32:
+            var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
+            var A16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                x_cast.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
+            )
+            matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
+        else:
+            var A16 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                x.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
+            )
+            matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
     else:
-        var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
-        var A16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            x_cast.buf.unsafe_ptr().bitcast[Float16](), a_rl
-        )
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             weight.buf.unsafe_ptr().bitcast[Float16]() + row_start * k, b_rl
         )
-        matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
-    return Tensor(out_buf^, out_shape^, STDtype.F32)
+        if x.dtype() == STDtype.F32:
+            var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
+            var A16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                x_cast.buf.unsafe_ptr().bitcast[Float16](), a_rl
+            )
+            matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
+        else:
+            var A16 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                x.buf.unsafe_ptr().bitcast[Float16](), a_rl
+            )
+            matmul(ctx, C, A16, B, transpose_b=True, c_row_major=True, alpha=alpha)
+    if x.dtype() == STDtype.F32:
+        return Tensor(c_buf^, out_shape^, STDtype.F32)
+
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        m * row_count * x.dtype().byte_size()
+    )
+    var bias_buf = ctx.enqueue_create_buffer[DType.uint8](4)
+    var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
+    var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        bias_buf.unsafe_ptr().bitcast[Float32](), bias_rl
+    )
+    var total = m * row_count
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    if x.dtype() == STDtype.BF16:
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), c_rl
+        )
+        ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
+            C, bias_lt, O, m, row_count, 0, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), c_rl
+        )
+        ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
+            C, bias_lt, O, m, row_count, 0, grid_dim=grid, block_dim=_BLOCK
+        )
+    return Tensor(out_buf^, out_shape^, x.dtype())
 
 
 def linear_rows_scratch(
@@ -520,16 +563,19 @@ def linear_rows_scratch(
     reverse: Bool = False,
     alpha: Float32 = 1.0,
 ) raises -> Tensor:
-    """Scratch-backed F32 no-bias linear over a contiguous weight-row range."""
-    if (
-        x.dtype() != STDtype.F32
-        or not (
-            weight.dtype() == STDtype.F32
-            or weight.dtype() == STDtype.BF16
-            or weight.dtype() == STDtype.F16
-        )
+    """Scratch-backed no-bias linear over a contiguous weight-row range.
+
+    Scratch is used only for F32 output storage. Narrow activation storage
+    delegates to `linear_rows`, which casts the F32 GEMM workspace back to the
+    activation dtype before returning."""
+    if x.dtype() != STDtype.F32:
+        return linear_rows(x, weight, row_start, row_count, ctx, alpha)
+    if not (
+        weight.dtype() == STDtype.F32
+        or weight.dtype() == STDtype.BF16
+        or weight.dtype() == STDtype.F16
     ):
-        raise Error("linear_rows_scratch: x F32 and weight F32/BF16/F16 required")
+        raise Error("linear_rows_scratch: weight must be F32/BF16/F16")
 
     var xshape = x.shape()
     var wshape = weight.shape()
@@ -594,6 +640,169 @@ def linear_rows_scratch(
     return out^
 
 
+def linear_two_inputs(
+    x0: Tensor,
+    x1: Tensor,
+    weight0: Tensor,
+    weight1: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """No-bias linear over two input blocks.
+
+    Computes x0 @ weight0.T + x1 @ weight1.T. Output storage follows x0/x1.
+    """
+    if x0.dtype() != x1.dtype():
+        raise Error("linear_two_inputs: x0/x1 dtype mismatch")
+    if weight1.dtype() != weight0.dtype():
+        raise Error("linear_two_inputs: weight dtype mismatch")
+    if x0.dtype() != weight0.dtype() and x0.dtype() != STDtype.F32:
+        raise Error("linear_two_inputs: x/weight dtype mismatch")
+    if not (
+        weight0.dtype() == STDtype.F32
+        or weight0.dtype() == STDtype.BF16
+        or weight0.dtype() == STDtype.F16
+    ):
+        raise Error("linear_two_inputs: weight must be F32/BF16/F16")
+
+    var x0shape = x0.shape()
+    var x1shape = x1.shape()
+    var w0shape = weight0.shape()
+    var w1shape = weight1.shape()
+    if len(x0shape) < 1 or len(x1shape) < 1:
+        raise Error("linear_two_inputs: inputs must have rank >= 1")
+    if len(w0shape) != 2 or len(w1shape) != 2:
+        raise Error("linear_two_inputs: weights must be rank-2")
+    var in0 = x0shape[len(x0shape) - 1]
+    var in1 = x1shape[len(x1shape) - 1]
+    var out_dim = w0shape[0]
+    if w0shape[1] != in0 or w1shape[1] != in1 or w1shape[0] != out_dim:
+        raise Error("linear_two_inputs: shape mismatch")
+
+    var m = 1
+    for i in range(len(x0shape) - 1):
+        m *= x0shape[i]
+    var m1 = 1
+    for i in range(len(x1shape) - 1):
+        m1 *= x1shape[i]
+    if m1 != m:
+        raise Error("linear_two_inputs: leading dimensions mismatch")
+
+    var out_shape = List[Int]()
+    for i in range(len(x0shape) - 1):
+        out_shape.append(x0shape[i])
+    out_shape.append(out_dim)
+
+    var c_buf = ctx.enqueue_create_buffer[DType.uint8](m * out_dim * 4)
+    var x0_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, in0))
+    var x1_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, in1))
+    var w0_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_dim, in0))
+    var w1_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_dim, in1))
+    var out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
+    var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        c_buf.unsafe_ptr().bitcast[Float32](), out_rl
+    )
+    if weight0.dtype() == STDtype.F32:
+        if x0.dtype() != STDtype.F32:
+            raise Error("linear_two_inputs: F32 weight requires F32 inputs")
+        var X0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x0.buf.unsafe_ptr().bitcast[Float32](), x0_rl
+        )
+        var X1 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x1.buf.unsafe_ptr().bitcast[Float32](), x1_rl
+        )
+        var W0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            weight0.buf.unsafe_ptr().bitcast[Float32](), w0_rl
+        )
+        var W1 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            weight1.buf.unsafe_ptr().bitcast[Float32](), w1_rl
+        )
+        matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
+        matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
+    elif weight0.dtype() == STDtype.BF16:
+        var W0 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            weight0.buf.unsafe_ptr().bitcast[BFloat16](), w0_rl
+        )
+        var W1 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            weight1.buf.unsafe_ptr().bitcast[BFloat16](), w1_rl
+        )
+        if x0.dtype() == STDtype.F32:
+            var x0_cast = cast_tensor(x0, STDtype.BF16, ctx, False)
+            var x1_cast = cast_tensor(x1, STDtype.BF16, ctx, False)
+            var X0 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                x0_cast.buf.unsafe_ptr().bitcast[BFloat16](), x0_rl
+            )
+            var X1 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                x1_cast.buf.unsafe_ptr().bitcast[BFloat16](), x1_rl
+            )
+            matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
+            matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
+        else:
+            var X0 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                x0.buf.unsafe_ptr().bitcast[BFloat16](), x0_rl
+            )
+            var X1 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                x1.buf.unsafe_ptr().bitcast[BFloat16](), x1_rl
+            )
+            matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
+            matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
+    else:
+        var W0 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            weight0.buf.unsafe_ptr().bitcast[Float16](), w0_rl
+        )
+        var W1 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            weight1.buf.unsafe_ptr().bitcast[Float16](), w1_rl
+        )
+        if x0.dtype() == STDtype.F32:
+            var x0_cast = cast_tensor(x0, STDtype.F16, ctx, False)
+            var x1_cast = cast_tensor(x1, STDtype.F16, ctx, False)
+            var X0 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                x0_cast.buf.unsafe_ptr().bitcast[Float16](), x0_rl
+            )
+            var X1 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                x1_cast.buf.unsafe_ptr().bitcast[Float16](), x1_rl
+            )
+            matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
+            matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
+        else:
+            var X0 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                x0.buf.unsafe_ptr().bitcast[Float16](), x0_rl
+            )
+            var X1 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                x1.buf.unsafe_ptr().bitcast[Float16](), x1_rl
+            )
+            matmul(ctx, O, X0, W0, transpose_b=True, c_row_major=True)
+            matmul(ctx, O, X1, W1, transpose_b=True, c_row_major=True, beta=1.0)
+
+    if x0.dtype() == STDtype.F32:
+        return Tensor(c_buf^, out_shape^, STDtype.F32)
+
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        m * out_dim * x0.dtype().byte_size()
+    )
+    var bias_buf = ctx.enqueue_create_buffer[DType.uint8](4)
+    var bias_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](1))
+    var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        bias_buf.unsafe_ptr().bitcast[Float32](), bias_rl
+    )
+    var total = m * out_dim
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    if x0.dtype() == STDtype.BF16:
+        var OUT = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
+            O, bias_lt, OUT, m, out_dim, 0, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var OUT = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
+            O, bias_lt, OUT, m, out_dim, 0, grid_dim=grid, block_dim=_BLOCK
+        )
+    return Tensor(out_buf^, out_shape^, x0.dtype())
+
+
 def linear_two_inputs_scratch(
     x0: Tensor,
     x1: Tensor,
@@ -608,10 +817,10 @@ def linear_two_inputs_scratch(
     Computes x0 @ weight0.T + x1 @ weight1.T, where both weights have the same
     output dimension and contiguous row-major storage.
     """
+    if x0.dtype() != STDtype.F32 or x1.dtype() != STDtype.F32:
+        return linear_two_inputs(x0, x1, weight0, weight1, ctx)
     if (
-        x0.dtype() != STDtype.F32
-        or x1.dtype() != STDtype.F32
-        or not (
+        not (
             weight0.dtype() == STDtype.F32
             or weight0.dtype() == STDtype.BF16
             or weight0.dtype() == STDtype.F16

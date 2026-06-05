@@ -91,8 +91,15 @@ def _load_mod() raises -> LTX2ModVecs:
     )
 
 
+def _f32_to_bf16(vals: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(vals)):
+        out.append(BFloat16(vals[i]))
+    return out^
+
+
 def _lora(a_name: String, b_name: String) raises -> LTX2Lora:
-    return LTX2Lora(_in(a_name), _in(b_name), RANK, D, D, SCALE)
+    return LTX2Lora(_f32_to_bf16(_in(a_name)), _f32_to_bf16(_in(b_name)), RANK, D, D, SCALE)
 
 
 def _check(
@@ -104,6 +111,14 @@ def _check(
           "  n =", r.n, "  ", "PASS" if r.passed else "FAIL")
     if not r.passed:
         allok = False
+
+
+def _bf16_host(vals: List[Float32], ctx: DeviceContext) raises -> List[BFloat16]:
+    return Tensor.from_host(vals, [S, D], STDtype.BF16, ctx).to_host_bf16(ctx)
+
+
+def _bf16_to_f32(vals: List[BFloat16], ctx: DeviceContext) raises -> List[Float32]:
+    return Tensor.from_host_bf16(vals, [S, D], ctx).to_host(ctx)
 
 
 def main() raises:
@@ -122,8 +137,9 @@ def main() raises:
     var sin = Tensor.from_host(_in("in_sin"), [S * H, Dh // 2], STDtype.F32, ctx)
 
     # ── forward ──
+    var hidden_b = _bf16_host(hidden.copy(), ctx)
     var fwd = ltx2_block_forward[H, Dh, S](
-        hidden.copy(), w, mv, cos, sin, lq, lk, lv, lo, True,
+        hidden_b, w, mv, cos, sin, lq, lk, lv, lo, True,
         D, FF, EPS, ctx,
     )
 
@@ -132,7 +148,7 @@ def main() raises:
 
     print("")
     print("---- forward output vs torch ----")
-    _check(harness, "out", fwd.out, _in("ref_out"), allok)
+    _check(harness, "out", _bf16_to_f32(fwd.out.copy(), ctx), _in("ref_out"), allok)
 
     # ── backward ──
     var d_out = _in("in_d_out")

@@ -84,6 +84,24 @@ def _max_abs_diff(a: List[Float32], b: List[Float32]) raises -> Float32:
     return mx
 
 
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
+def _max_abs_diff_bf16(a: List[BFloat16], b: List[BFloat16]) raises -> Float32:
+    if len(a) != len(b):
+        raise Error("max_abs_diff_bf16: len mismatch " + String(len(a)) + " != " + String(len(b)))
+    var mx = Float32(0.0)
+    for i in range(len(a)):
+        var d = abs(a[i].cast[DType.float32]() - b[i].cast[DType.float32]())
+        if d > mx:
+            mx = d
+    return mx
+
+
 # Relative grad-parity error (same rationale as lokr_adapter_smoke): a
 # multiplicative analytic-backward bug is below a fixed abs tolerance when the
 # grad is intrinsically small, so the gate would silently pass. `b` is the FD
@@ -271,7 +289,8 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
 
     # Drive S off zero so the rotation is non-trivial and all S entries exercised.
     for i in range(len(lo.s)):
-        lo.s[i] = Float32(0.07) * Float32((i % 7) - 3) + Float32(0.05)
+        lo.s[i] = BFloat16(Float32(0.07) * Float32((i % 7) - 3) + Float32(0.05))
+    var s_h = _bf16_to_f32_list(lo.s)
 
     # ── (a) orthogonality of the trained R: RᵀR ≈ I ──
     var R = oft_rotation_full(lo)
@@ -288,7 +307,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
 
     # ── (a) W_eff + forward parity vs independent oracle ──
     var weff_impl = oft_effective_weight(lo)
-    var weff_oracle = _oracle_weff(lo.s, lo.w_base, NB, B, IN)
+    var weff_oracle = _oracle_weff(s_h, lo.w_base, NB, B, IN)
     var weff_mx = _max_abs_diff(weff_impl, weff_oracle)
     if weff_mx > Float32(1.0e-5):
         print("FAIL (a-weff): W_eff vs oracle max|Δ|=", weff_mx); ok = False
@@ -313,7 +332,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
     var tol_rel = Float32(2.0e-2)
     var rel_floor = Float32(1.0e-4)
 
-    var fd_s = _fd_grad_s(lo.s, lo.w_base, x, NB, B, IN, OUT, M, h)
+    var fd_s = _fd_grad_s(s_h, lo.w_base, x, NB, B, IN, OUT, M, h)
     var e_s = _max_abs_diff(g.d_s, fd_s)
     var er_s = _max_rel_diff(g.d_s, fd_s, rel_floor)
     if e_s > tol_fd or er_s > tol_rel:
@@ -380,7 +399,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
         print("FAIL (c): alpha mismatch got", rb.alpha, "expected", alpha); ok = False
     else:
         print("PASS (c): alpha round-trip =", rb.alpha)
-    var s_mx = _max_abs_diff(rb.s, lo.s)
+    var s_mx = _max_abs_diff_bf16(rb.s, lo.s)
     if s_mx > Float32(1.0e-6):
         print("FAIL (c): oft_blocks(S) not byte-exact, Δ=", s_mx); ok = False
     else:

@@ -16,12 +16,17 @@
 #   pixi run mojo run -I . serenitymojo/training/full_adapter_smoke.mojo
 
 from std.gpu.host import DeviceContext
+from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.ffi import sys_system
 from serenitymojo.training.full_adapter import (
     FullAdapter, new_full_adapter, full_delta_weight, full_delta_bias,
     NamedFull, save_full_adapters,
 )
+
+
+def _bf16(v: BFloat16) -> Float32:
+    return v.cast[DType.float32]()
 
 
 def main() raises:
@@ -33,16 +38,16 @@ def main() raises:
     var shape = List[Int](); shape.append(4); shape.append(3)
     var adapter = new_full_adapter(shape, 4)
     for i in range(adapter.numel()):
-        adapter.diff[i] = Float32(i) * Float32(0.25) - Float32(1.0)
+        adapter.diff[i] = BFloat16(Float32(i) * Float32(0.25) - Float32(1.0))
     for i in range(4):
-        adapter.diff_b[i] = Float32(i) * Float32(0.5)
+        adapter.diff_b[i] = BFloat16(Float32(i) * Float32(0.5))
 
     # ── (1) delta math ────────────────────────────────────────────────────────
     var strength = Float32(0.7)
     var dw = full_delta_weight(adapter, strength)
     var maxerr = Float32(0.0)
     for i in range(len(dw)):
-        var e = dw[i] - strength * adapter.diff[i]
+        var e = dw[i] - strength * _bf16(adapter.diff[i])
         if e < Float32(0.0):
             e = -e
         if e > maxerr:
@@ -56,7 +61,7 @@ def main() raises:
     var dw1 = full_delta_weight(adapter, Float32(1.0))
     var bit = True
     for i in range(len(dw1)):
-        if dw1[i] != adapter.diff[i]:
+        if dw1[i] != _bf16(adapter.diff[i]):
             bit = False
     if bit:
         print("PASS delta_weight(strength=1.0) == diff (bit-exact)")
@@ -66,7 +71,7 @@ def main() raises:
     var db = full_delta_bias(adapter, strength)
     var berr = Float32(0.0)
     for i in range(len(db)):
-        var e = db[i] - strength * adapter.diff_b[i]
+        var e = db[i] - strength * _bf16(adapter.diff_b[i])
         if e < Float32(0.0):
             e = -e
         if e > berr:
@@ -94,24 +99,28 @@ def main() raises:
         print("FAIL missing key", key_w); ok = False
     else:
         var info = st.tensor_info(key_w)
-        print("diff.weight shape:", info.shape[0], "x", info.shape[1], " dtype-ok")
+        print("diff.weight shape:", info.shape[0], "x", info.shape[1], " dtype=", info.dtype)
         if len(info.shape) != 2 or info.shape[0] != 4 or info.shape[1] != 3:
             print("FAIL diff.weight shape != [4,3]"); ok = False
+        elif info.dtype != STDtype.BF16:
+            print("FAIL diff.weight dtype != BF16"); ok = False
         else:
-            print("PASS .diff.weight key present with base weight shape [4,3]")
+            print("PASS .diff.weight key present with base weight shape [4,3] and BF16 dtype")
     if key_b not in st.tensors:
         print("FAIL missing key", key_b); ok = False
     else:
         var binfo = st.tensor_info(key_b)
         if len(binfo.shape) != 1 or binfo.shape[0] != 4:
             print("FAIL diff_b shape != [4]"); ok = False
+        elif binfo.dtype != STDtype.BF16:
+            print("FAIL diff_b dtype != BF16"); ok = False
         else:
-            print("PASS .diff_b key present with shape [4]")
+            print("PASS .diff_b key present with shape [4] and BF16 dtype")
 
     # ── (3) BITROT-FAIL DEMO ──────────────────────────────────────────────────
     var wrong_maxerr = Float32(0.0)
     for i in range(len(dw)):
-        var e = dw[i] - (strength + Float32(1.0)) * adapter.diff[i]
+        var e = dw[i] - (strength + Float32(1.0)) * _bf16(adapter.diff[i])
         if e < Float32(0.0):
             e = -e
         if e > wrong_maxerr:

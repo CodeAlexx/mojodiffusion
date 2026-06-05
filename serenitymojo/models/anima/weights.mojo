@@ -104,8 +104,8 @@ def _load_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Te
     return Tensor.from_view(tv, ctx)
 
 
-# Load a named tensor and cast to F32 (the dtype the block fwd/bwd parity path
-# runs in — F32 residual stream + F32 weights → clean cos, no BF16 floor).
+# Load a named tensor and cast to F32 for explicit compatibility/parity uses:
+# current F32 residual-stream norm weights and old oracle-only callers.
 def _load_tensor_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
@@ -154,34 +154,34 @@ def load_anima_block_weights(
     )
 
 
-# Load Anima block `block_idx`'s 20 real weights as F32 (resident-stack path).
-# Identical key layout to load_anima_block_weights; only the dtype differs (F32
-# so the resident composition stack matches the block's F32 parity path exactly).
+# Legacy symbol retained for streamed-stack callers. It now follows the runtime
+# dtype contract: large weights preserve checkpoint dtype; only q/k norm scales
+# stay F32 for the current F32 residual-stream rms_norm boundary.
 def load_anima_block_weights_f32(
     st: SafeTensors, block_idx: Int, ctx: DeviceContext
 ) raises -> AnimaBlockWeights:
     var bp = String("net.blocks.") + String(block_idx) + String(".")
     return AnimaBlockWeights(
-        _load_tensor_f32(st, bp + String("adaln_modulation_self_attn.1.weight"), ctx),
-        _load_tensor_f32(st, bp + String("adaln_modulation_self_attn.2.weight"), ctx),
-        _load_tensor_f32(st, bp + String("adaln_modulation_cross_attn.1.weight"), ctx),
-        _load_tensor_f32(st, bp + String("adaln_modulation_cross_attn.2.weight"), ctx),
-        _load_tensor_f32(st, bp + String("adaln_modulation_mlp.1.weight"), ctx),
-        _load_tensor_f32(st, bp + String("adaln_modulation_mlp.2.weight"), ctx),
-        _load_tensor_f32(st, bp + String("self_attn.q_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("self_attn.k_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("self_attn.v_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("self_attn.output_proj.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_self_attn.1.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_self_attn.2.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_cross_attn.1.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_cross_attn.2.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_mlp.1.weight"), ctx),
+        _load_tensor(st, bp + String("adaln_modulation_mlp.2.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.q_proj.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.k_proj.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.v_proj.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.output_proj.weight"), ctx),
         _load_tensor_f32(st, bp + String("self_attn.q_norm.weight"), ctx),
         _load_tensor_f32(st, bp + String("self_attn.k_norm.weight"), ctx),
-        _load_tensor_f32(st, bp + String("cross_attn.q_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("cross_attn.k_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("cross_attn.v_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("cross_attn.output_proj.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.q_proj.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.k_proj.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.v_proj.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.output_proj.weight"), ctx),
         _load_tensor_f32(st, bp + String("cross_attn.q_norm.weight"), ctx),
         _load_tensor_f32(st, bp + String("cross_attn.k_norm.weight"), ctx),
-        _load_tensor_f32(st, bp + String("mlp.layer1.weight"), ctx),
-        _load_tensor_f32(st, bp + String("mlp.layer2.weight"), ctx),
+        _load_tensor(st, bp + String("mlp.layer1.weight"), ctx),
+        _load_tensor(st, bp + String("mlp.layer2.weight"), ctx),
     )
 
 
@@ -218,7 +218,8 @@ def load_anima_block_weights_bf16_normf32(
     )
 
 
-# Load ALL `num_blocks` blocks' F32 weights into a List (resident stack).
+# Legacy symbol retained for callers; block matrices preserve checkpoint dtype
+# and only q/k norm vectors are F32.
 def load_anima_all_blocks_f32(
     st: SafeTensors, num_blocks: Int, ctx: DeviceContext
 ) raises -> List[AnimaBlockWeights]:
@@ -244,7 +245,10 @@ def load_anima_all_blocks_bf16_normf32(
 #    final_layer. The LLM adapter (6 frozen blocks) is NOT loaded here — for LoRA
 #    training the adapter output (context) is a cached, frozen INPUT; its weights
 #    need no grad and are not on the LoRA-DiT path. (Full-FT would add them.)
-#    All F32 (resident-stack dtype). Key layout VERIFIED vs the checkpoint header:
+#    No-bias resident weights preserve checkpoint dtype. The norm scale remains
+#    F32 because the current stack builds the timestep embedding residual stream
+#    as F32 before rms_norm, outside this loader's boundary. Key layout VERIFIED
+#    vs the checkpoint header:
 #      net.x_embedder.proj.1.weight       [2048, 68]
 #      net.t_embedder.1.linear_1.weight   [2048, 2048]
 #      net.t_embedder.1.linear_2.weight   [6144, 2048]
@@ -277,13 +281,13 @@ struct AnimaStackBase(Movable):
 
 def load_anima_stack_base(st: SafeTensors, ctx: DeviceContext) raises -> AnimaStackBase:
     return AnimaStackBase(
-        TArc(_load_tensor_f32(st, String("net.x_embedder.proj.1.weight"), ctx)),
-        TArc(_load_tensor_f32(st, String("net.t_embedder.1.linear_1.weight"), ctx)),
-        TArc(_load_tensor_f32(st, String("net.t_embedder.1.linear_2.weight"), ctx)),
+        TArc(_load_tensor(st, String("net.x_embedder.proj.1.weight"), ctx)),
+        TArc(_load_tensor(st, String("net.t_embedder.1.linear_1.weight"), ctx)),
+        TArc(_load_tensor(st, String("net.t_embedder.1.linear_2.weight"), ctx)),
         TArc(_load_tensor_f32(st, String("net.t_embedding_norm.weight"), ctx)),
-        TArc(_load_tensor_f32(st, String("net.final_layer.adaln_modulation.1.weight"), ctx)),
-        TArc(_load_tensor_f32(st, String("net.final_layer.adaln_modulation.2.weight"), ctx)),
-        TArc(_load_tensor_f32(st, String("net.final_layer.linear.weight"), ctx)),
+        TArc(_load_tensor(st, String("net.final_layer.adaln_modulation.1.weight"), ctx)),
+        TArc(_load_tensor(st, String("net.final_layer.adaln_modulation.2.weight"), ctx)),
+        TArc(_load_tensor(st, String("net.final_layer.linear.weight"), ctx)),
     )
 
 

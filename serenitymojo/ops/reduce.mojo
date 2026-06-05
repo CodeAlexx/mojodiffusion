@@ -22,9 +22,9 @@
 # F32. Arbitrary (possibly non-contiguous) axis sets are handled by uploading
 # the input row-major strides + a per-dim reduce mask + the reduced-subspace
 # shape/strides as small Int32 device buffers. F32 accumulation regardless of
-# storage dtype (bf16/f16 upcast on read; cast back on store for sum/mean;
-# var/std always emit F32 since the consumers — AdaIN std, PixelNorm rms — want
-# F32 stats).
+# storage dtype (bf16/f16 cast on scalar read); public reductions preserve input
+# storage dtype unless the explicit *_f32 API is used for scalar/stat workspace
+# paths.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -53,9 +53,9 @@ comptime _MAXDIM = 8  # max tensor rank we support
 # The kernel takes ndim-agnostic small arrays + counts.
 
 
-def _reduce_kernel_f32(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _reduce_kernel[in_dtype: DType, out_dtype: DType](
+    x: LayoutTensor[in_dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[out_dtype, _DYN1, MutAnyOrigin],
     kept_shape: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     kept_strides: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     red_shape: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
@@ -69,10 +69,10 @@ def _reduce_kernel_f32(
     var oid = Int(global_idx.x)
     if oid >= n_out:
         return
+
     # Decompose output linear index over kept dims (row-major) -> input base.
     var base = 0
     var rem = oid
-    # iterate kept dims from last to first to peel off row-major coords.
     for k in range(n_kept - 1, -1, -1):
         var sz = Int(rebind[Scalar[DType.int32]](kept_shape[k]))
         var coord = rem % sz
@@ -83,7 +83,6 @@ def _reduce_kernel_f32(
     var acc = Float32(0.0)
     var acc_sq = Float32(0.0)
     for r in range(n_reduce_elems):
-        # decompose r over reduced dims (row-major) -> input offset delta.
         var off = base
         var rr = r
         for d in range(n_red - 1, -1, -1):
@@ -91,7 +90,7 @@ def _reduce_kernel_f32(
             var coord = rr % sz
             rr = rr // sz
             off += coord * Int(rebind[Scalar[DType.int32]](red_strides[d]))
-        var v = rebind[Scalar[DType.float32]](x[off])
+        var v = rebind[Scalar[in_dtype]](x[off]).cast[DType.float32]()
         acc += v
         acc_sq += v * v
 
@@ -113,119 +112,7 @@ def _reduce_kernel_f32(
             result = sqrt(var_u)
         else:
             result = var_u
-    o[oid] = rebind[o.element_type](result)
-
-
-def _reduce_kernel_bf16(
-    x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    kept_shape: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    kept_strides: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    red_shape: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    red_strides: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    n_out: Int,
-    n_kept: Int,
-    n_red: Int,
-    n_reduce_elems: Int,
-    mode: Int,
-):
-    var oid = Int(global_idx.x)
-    if oid >= n_out:
-        return
-    var base = 0
-    var rem = oid
-    for k in range(n_kept - 1, -1, -1):
-        var sz = Int(rebind[Scalar[DType.int32]](kept_shape[k]))
-        var coord = rem % sz
-        rem = rem // sz
-        base += coord * Int(rebind[Scalar[DType.int32]](kept_strides[k]))
-    var acc = Float32(0.0)
-    var acc_sq = Float32(0.0)
-    for r in range(n_reduce_elems):
-        var off = base
-        var rr = r
-        for d in range(n_red - 1, -1, -1):
-            var sz = Int(rebind[Scalar[DType.int32]](red_shape[d]))
-            var coord = rr % sz
-            rr = rr // sz
-            off += coord * Int(rebind[Scalar[DType.int32]](red_strides[d]))
-        var v = rebind[Scalar[DType.bfloat16]](x[off]).cast[DType.float32]()
-        acc += v
-        acc_sq += v * v
-    var n = Float32(n_reduce_elems)
-    var result = acc
-    if mode == 1:
-        result = acc / n
-    elif mode == 2 or mode == 3:
-        var mean = acc / n
-        var sse = acc_sq - acc * mean
-        var denom = n - Float32(1.0)
-        if denom < Float32(1.0):
-            denom = Float32(1.0)
-        var var_u = sse / denom
-        if var_u < Float32(0.0):
-            var_u = Float32(0.0)
-        if mode == 3:
-            result = sqrt(var_u)
-        else:
-            result = var_u
-    o[oid] = rebind[o.element_type](result)
-
-
-def _reduce_kernel_f16(
-    x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    kept_shape: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    kept_strides: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    red_shape: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    red_strides: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    n_out: Int,
-    n_kept: Int,
-    n_red: Int,
-    n_reduce_elems: Int,
-    mode: Int,
-):
-    var oid = Int(global_idx.x)
-    if oid >= n_out:
-        return
-    var base = 0
-    var rem = oid
-    for k in range(n_kept - 1, -1, -1):
-        var sz = Int(rebind[Scalar[DType.int32]](kept_shape[k]))
-        var coord = rem % sz
-        rem = rem // sz
-        base += coord * Int(rebind[Scalar[DType.int32]](kept_strides[k]))
-    var acc = Float32(0.0)
-    var acc_sq = Float32(0.0)
-    for r in range(n_reduce_elems):
-        var off = base
-        var rr = r
-        for d in range(n_red - 1, -1, -1):
-            var sz = Int(rebind[Scalar[DType.int32]](red_shape[d]))
-            var coord = rr % sz
-            rr = rr // sz
-            off += coord * Int(rebind[Scalar[DType.int32]](red_strides[d]))
-        var v = rebind[Scalar[DType.float16]](x[off]).cast[DType.float32]()
-        acc += v
-        acc_sq += v * v
-    var n = Float32(n_reduce_elems)
-    var result = acc
-    if mode == 1:
-        result = acc / n
-    elif mode == 2 or mode == 3:
-        var mean = acc / n
-        var sse = acc_sq - acc * mean
-        var denom = n - Float32(1.0)
-        if denom < Float32(1.0):
-            denom = Float32(1.0)
-        var var_u = sse / denom
-        if var_u < Float32(0.0):
-            var_u = Float32(0.0)
-        if mode == 3:
-            result = sqrt(var_u)
-        else:
-            result = var_u
-    o[oid] = rebind[o.element_type](result)
+    o[oid] = rebind[o.element_type](result.cast[out_dtype]())
 
 
 # ── host driver ─────────────────────────────────────────────────────────────
@@ -266,7 +153,8 @@ def _upload_i32(vals: List[Int], ctx: DeviceContext) raises -> DeviceBuffer[DTyp
 
 
 def _reduce_impl(
-    x: Tensor, dims: List[Int], keepdim: Bool, mode: Int, ctx: DeviceContext
+    x: Tensor, dims: List[Int], keepdim: Bool, mode: Int, out_dtype: STDtype,
+    ctx: DeviceContext,
 ) raises -> Tensor:
     var shape = x.shape()
     var ndim = len(shape)
@@ -363,78 +251,149 @@ def _reduce_impl(
         RuntimeLayout[_DYN1].row_major(IndexList[1](len(rstride_u))),
     )
 
-    # Output is always F32 (stats consumers want F32; sum/mean of bf16 also
-    # benefit from F32 storage to avoid double-rounding).
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n_out * 4)
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](),
-        RuntimeLayout[_DYN1].row_major(IndexList[1](n_out)),
-    )
-
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n_out * out_dtype.byte_size())
     var n_in = x.numel()
     var rl_in = RuntimeLayout[_DYN1].row_major(IndexList[1](n_in))
+    var rl_out = RuntimeLayout[_DYN1].row_major(IndexList[1](n_out))
     var grid = (n_out + _BLOCK - 1) // _BLOCK
-    var dt = x.dtype().to_mojo_dtype()
+    var in_dt = x.dtype().to_mojo_dtype()
+    var out_dt = out_dtype.to_mojo_dtype()
 
-    if dt == DType.float32:
+    if in_dt == DType.float32:
+        if out_dt != DType.float32:
+            raise Error("reduce: F32 input only supports F32 output")
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float32](), rl_in
         )
-        ctx.enqueue_function[_reduce_kernel_f32, _reduce_kernel_f32](
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl_out
+        )
+        ctx.enqueue_function[
+            _reduce_kernel[DType.float32, DType.float32],
+            _reduce_kernel[DType.float32, DType.float32],
+        ](
             X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
             grid_dim=grid, block_dim=_BLOCK,
         )
-    elif dt == DType.bfloat16:
+    elif in_dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[BFloat16](), rl_in
         )
-        ctx.enqueue_function[_reduce_kernel_bf16, _reduce_kernel_bf16](
-            X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
-            grid_dim=grid, block_dim=_BLOCK,
-        )
+        if out_dt == DType.float32:
+            var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                out_buf.unsafe_ptr().bitcast[Float32](), rl_out
+            )
+            ctx.enqueue_function[
+                _reduce_kernel[DType.bfloat16, DType.float32],
+                _reduce_kernel[DType.bfloat16, DType.float32],
+            ](
+                X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        elif out_dt == DType.bfloat16:
+            var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                out_buf.unsafe_ptr().bitcast[BFloat16](), rl_out
+            )
+            ctx.enqueue_function[
+                _reduce_kernel[DType.bfloat16, DType.bfloat16],
+                _reduce_kernel[DType.bfloat16, DType.bfloat16],
+            ](
+                X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            raise Error("reduce: BF16 input supports only BF16 or F32 output")
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float16](), rl_in
         )
-        ctx.enqueue_function[_reduce_kernel_f16, _reduce_kernel_f16](
-            X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
-            grid_dim=grid, block_dim=_BLOCK,
-        )
+        if out_dt == DType.float32:
+            var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                out_buf.unsafe_ptr().bitcast[Float32](), rl_out
+            )
+            ctx.enqueue_function[
+                _reduce_kernel[DType.float16, DType.float32],
+                _reduce_kernel[DType.float16, DType.float32],
+            ](
+                X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        elif out_dt == DType.float16:
+            var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                out_buf.unsafe_ptr().bitcast[Float16](), rl_out
+            )
+            ctx.enqueue_function[
+                _reduce_kernel[DType.float16, DType.float16],
+                _reduce_kernel[DType.float16, DType.float16],
+            ](
+                X, O, KS, KST, RS, RST, n_out, n_kept, n_red, n_reduce_elems, mode,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            raise Error("reduce: F16 input supports only F16 or F32 output")
     ctx.synchronize()
     # keep metadata buffers alive until the kernel has run.
     _ = ks_buf^
     _ = kst_buf^
     _ = rs_buf^
     _ = rst_buf^
-    return Tensor(out_buf^, out_shape^, STDtype.F32)
+    return Tensor(out_buf^, out_shape^, out_dtype)
 
 
 # ── public API ──────────────────────────────────────────────────────────────
 def reduce_sum(
     x: Tensor, dims: List[Int], keepdim: Bool, ctx: DeviceContext
 ) raises -> Tensor:
-    """Σ over `dims`, F32-accumulated. Output dtype F32. (torch.sum)."""
-    return _reduce_impl(x, dims, keepdim, 0, ctx)
+    """Σ over `dims`, F32-accumulated. Output preserves x storage dtype."""
+    return _reduce_impl(x, dims, keepdim, 0, x.dtype(), ctx)
 
 
 def reduce_mean(
     x: Tensor, dims: List[Int], keepdim: Bool, ctx: DeviceContext
 ) raises -> Tensor:
-    """mean over `dims` = sum / N, F32-accumulated. Output F32. (torch.mean)."""
-    return _reduce_impl(x, dims, keepdim, 1, ctx)
+    """mean over `dims`, F32-accumulated. Output preserves x storage dtype."""
+    return _reduce_impl(x, dims, keepdim, 1, x.dtype(), ctx)
+
+
+def reduce_sum_f32(
+    x: Tensor, dims: List[Int], keepdim: Bool, ctx: DeviceContext
+) raises -> Tensor:
+    """Σ over `dims`, F32-accumulated and stored as F32 for scalar/stat paths."""
+    return _reduce_impl(x, dims, keepdim, 0, STDtype.F32, ctx)
+
+
+def reduce_mean_f32(
+    x: Tensor, dims: List[Int], keepdim: Bool, ctx: DeviceContext
+) raises -> Tensor:
+    """Mean over `dims`, F32-accumulated and stored as F32 for scalar/stat paths."""
+    return _reduce_impl(x, dims, keepdim, 1, STDtype.F32, ctx)
 
 
 def reduce_var(
     x: Tensor, dims: List[Int], keepdim: Bool, ctx: DeviceContext
 ) raises -> Tensor:
-    """Unbiased variance Σ(x-μ)²/(N-1) over `dims` (torch default). Output F32."""
-    return _reduce_impl(x, dims, keepdim, 2, ctx)
+    """Unbiased variance Σ(x-μ)²/(N-1), preserving x storage dtype."""
+    return _reduce_impl(x, dims, keepdim, 2, x.dtype(), ctx)
 
 
 def reduce_std(
     x: Tensor, dims: List[Int], keepdim: Bool, ctx: DeviceContext
 ) raises -> Tensor:
-    """Unbiased std = sqrt(var) over `dims` (torch default). Output F32.
+    """Unbiased std = sqrt(var), preserving x storage dtype.
 
     Mirrors ltx2_multiscale.rs AdaIN per-(B,C)-over-(F,H,W) std."""
-    return _reduce_impl(x, dims, keepdim, 3, ctx)
+    return _reduce_impl(x, dims, keepdim, 3, x.dtype(), ctx)
+
+
+def reduce_var_f32(
+    x: Tensor, dims: List[Int], keepdim: Bool, ctx: DeviceContext
+) raises -> Tensor:
+    """Unbiased variance over `dims`, F32-accumulated and stored as F32."""
+    return _reduce_impl(x, dims, keepdim, 2, STDtype.F32, ctx)
+
+
+def reduce_std_f32(
+    x: Tensor, dims: List[Int], keepdim: Bool, ctx: DeviceContext
+) raises -> Tensor:
+    """Unbiased std over `dims`, F32-accumulated and stored as F32."""
+    return _reduce_impl(x, dims, keepdim, 3, STDtype.F32, ctx)

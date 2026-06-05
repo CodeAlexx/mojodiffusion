@@ -65,7 +65,8 @@ comptime _GN_EPS = Float32(1e-5)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Weight-load helpers (load every tensor as F32; checkpoint is bf16 on disk).
+# Weight-load helpers. PiD is a documented full-F32 model path for parity with
+# the F32 SD3 res2k oracle, so checkpoint BF16 tensors are intentionally widened.
 # ════════════════════════════════════════════════════════════════════════════
 def _ld(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var tv = st.tensor_view(name)

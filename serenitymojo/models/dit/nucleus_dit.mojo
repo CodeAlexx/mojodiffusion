@@ -618,10 +618,8 @@ struct NucleusDiT[S_IMG: Int, S_TXT: Int]:
             capacity,
             self.config.route_scale,
             ctx,
-        )  # [S, D] F32
-        # Cast routed back to model dtype.
-        var routed = cast_tensor(routed_flat, self._dtype(), ctx)
-        routed = reshape(routed, _sh3(1, s, d), ctx)
+        )  # [S, D] model storage dtype
+        var routed = reshape(routed_flat, _sh3(1, s, d), ctx)
 
         # Shared expert: dense SwiGLU on modulated ([up, gate] layout).
         var shared = self._dense_ffn(

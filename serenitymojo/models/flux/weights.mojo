@@ -28,8 +28,9 @@
 # flux1-dev: D = inner_dim = 3072, Dh = head_dim = 128, n_heads = 24,
 #   Fmlp = mlp_hidden = 12288 (= D*4). 19 double blocks, 38 single blocks.
 #
-# DTYPE: checkpoint is BF16; loaded as host F32 lists (the block structs upload
-# to device F32 in __init__, matching Klein's StreamWeights/SingleBlockWeights).
+# DTYPE: checkpoint is BF16. This loader converts to host F32 lists because the
+# legacy constructors take List[Float32]; the block structs immediately upload
+# BF16 device tensors in __init__, so inference weights stay BF16 at runtime.
 #
 # Mojo 0.26.x+: `def` not `fn`; move-only Tensor; reuses io.safetensors.SafeTensors
 # + io.tensor_view.from_parts + ops.cast.cast_tensor, exactly like Klein.

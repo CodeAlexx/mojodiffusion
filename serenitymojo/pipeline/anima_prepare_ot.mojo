@@ -136,13 +136,13 @@ def main() raises:
     if not allfin:
         raise Error("encoded latent contains non-finite values")
 
-    # 4) save key `latent` [1,16,32,32] F32 into <out_dir>/sample0.safetensors
+    # 4) save key `latent` [1,16,32,32] BF16 into <out_dir>/sample0.safetensors
     _ = sys_system(String("mkdir -p ") + out_dir)
-    var lat_f32 = Tensor.from_host(lh.copy(), [1, 16, LH, LW], STDtype.F32, ctx)
+    var lat_bf16 = Tensor.from_host(lh.copy(), [1, 16, LH, LW], STDtype.BF16, ctx)
     var names = List[String]()
     names.append(String("latent"))
     var tensors = List[ArcPointer[Tensor]]()
-    tensors.append(ArcPointer(lat_f32^))
+    tensors.append(ArcPointer(lat_bf16^))
     var out_path = out_dir + String("/sample0.safetensors")
     save_safetensors(names, tensors, out_path, ctx)
     print("wrote REAL latent [1,16,", LH, ",", LW, "] ->", out_path)

@@ -178,14 +178,21 @@ def main() raises:
     all_pass = all_pass and r_sqrt.passed
 
     # ── sqrt BF16: same inputs downcast to BF16, SAME F32 ref, thr 0.99. ───────
-    # sqrt/square/log all route through _elementwise_bwd, whose BF16 arm casts up
-    # to F32, runs the SAME kernel, casts grad back to BF16.
+    # sqrt/square/log route through dtype-param kernels that read BF16 storage,
+    # do scalar F32 math, and write BF16 gradients.
     var d_sqrt_bf = sqrt_backward(
         cast_tensor(Tensor.from_host(g_elem, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.BF16, ctx),
         cast_tensor(Tensor.from_host(x_pos, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.BF16, ctx), ctx)
     var r_sqrt_bf = h.compare_host(d_sqrt_bf.to_host(ctx), _read_ref(String("sqrt_dx")))
     print("sqrt_dx   _bf16 cos:", r_sqrt_bf.cos)
     all_pass = all_pass and (r_sqrt_bf.cos >= 0.99)
+
+    var d_sqrt_f16 = sqrt_backward(
+        cast_tensor(Tensor.from_host(g_elem, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.F16, ctx),
+        cast_tensor(Tensor.from_host(x_pos, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.F16, ctx), ctx)
+    var r_sqrt_f16 = h.compare_host(d_sqrt_f16.to_host(ctx), _read_ref(String("sqrt_dx")))
+    print("sqrt_dx   _f16 cos:", r_sqrt_f16.cos)
+    all_pass = all_pass and (r_sqrt_f16.cos >= 0.99)
 
     var d_sq = square_backward(
         Tensor.from_host(g_elem, _shape1(N_ELEM), STDtype.F32, ctx),
@@ -194,13 +201,20 @@ def main() raises:
     print("square_dx vs torch:", r_sq)
     all_pass = all_pass and r_sq.passed
 
-    # ── square BF16: SAME F32 ref, thr 0.99 (via _elementwise_bwd BF16 arm). ────
+    # ── square BF16: SAME F32 ref, thr 0.99 (BF16 storage, F32 scalar math). ───
     var d_sq_bf = square_backward(
         cast_tensor(Tensor.from_host(g_elem, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.BF16, ctx),
         cast_tensor(Tensor.from_host(x_pos, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.BF16, ctx), ctx)
     var r_sq_bf = h.compare_host(d_sq_bf.to_host(ctx), _read_ref(String("square_dx")))
     print("square_dx _bf16 cos:", r_sq_bf.cos)
     all_pass = all_pass and (r_sq_bf.cos >= 0.99)
+
+    var d_sq_f16 = square_backward(
+        cast_tensor(Tensor.from_host(g_elem, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.F16, ctx),
+        cast_tensor(Tensor.from_host(x_pos, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.F16, ctx), ctx)
+    var r_sq_f16 = h.compare_host(d_sq_f16.to_host(ctx), _read_ref(String("square_dx")))
+    print("square_dx _f16 cos:", r_sq_f16.cos)
+    all_pass = all_pass and (r_sq_f16.cos >= 0.99)
 
     var d_log = log_backward(
         Tensor.from_host(g_elem, _shape1(N_ELEM), STDtype.F32, ctx),
@@ -209,13 +223,20 @@ def main() raises:
     print("log_dx    vs torch:", r_log)
     all_pass = all_pass and r_log.passed
 
-    # ── log BF16: SAME F32 ref, thr 0.99 (via _elementwise_bwd BF16 arm). ──────
+    # ── log BF16: SAME F32 ref, thr 0.99 (BF16 storage, F32 scalar math). ──────
     var d_log_bf = log_backward(
         cast_tensor(Tensor.from_host(g_elem, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.BF16, ctx),
         cast_tensor(Tensor.from_host(x_pos, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.BF16, ctx), ctx)
     var r_log_bf = h.compare_host(d_log_bf.to_host(ctx), _read_ref(String("log_dx")))
     print("log_dx    _bf16 cos:", r_log_bf.cos)
     all_pass = all_pass and (r_log_bf.cos >= 0.99)
+
+    var d_log_f16 = log_backward(
+        cast_tensor(Tensor.from_host(g_elem, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.F16, ctx),
+        cast_tensor(Tensor.from_host(x_pos, _shape1(N_ELEM), STDtype.F32, ctx), STDtype.F16, ctx), ctx)
+    var r_log_f16 = h.compare_host(d_log_f16.to_host(ctx), _read_ref(String("log_dx")))
+    print("log_dx    _f16 cos:", r_log_f16.cos)
+    all_pass = all_pass and (r_log_f16.cos >= 0.99)
 
     # ── softmax / logsoftmax (2D [ROWS, COLS], reduce over COLS) ──────────────
     var x_sig = _fill_signed(ROWS * COLS)
@@ -231,8 +252,8 @@ def main() raises:
     all_pass = all_pass and r_sm.passed
 
     # ── softmax BF16: same inputs downcast to BF16, SAME F32 ref, thr 0.99. ────
-    # softmax_backward's BF16 arm casts up to F32, runs the SAME row-reduction
-    # kernel, casts grad back to BF16. BF16 ~3 decimal digits -> gate 0.99.
+    # The BF16 arm reads BF16 storage, uses F32 row reductions, and writes BF16.
+    # BF16 ~3 decimal digits -> gate 0.99.
     var d_sm_bf = softmax_backward(
         cast_tensor(Tensor.from_host(g_sm, _shape2(ROWS, COLS), STDtype.F32, ctx), STDtype.BF16, ctx),
         cast_tensor(Tensor.from_host(sm_out, _shape2(ROWS, COLS), STDtype.F32, ctx), STDtype.BF16, ctx),
@@ -240,6 +261,14 @@ def main() raises:
     var r_sm_bf = h.compare_host(d_sm_bf.to_host(ctx), _read_ref(String("softmax_dx")))
     print("softmax_dx _bf16 cos:", r_sm_bf.cos)
     all_pass = all_pass and (r_sm_bf.cos >= 0.99)
+
+    var d_sm_f16 = softmax_backward(
+        cast_tensor(Tensor.from_host(g_sm, _shape2(ROWS, COLS), STDtype.F32, ctx), STDtype.F16, ctx),
+        cast_tensor(Tensor.from_host(sm_out, _shape2(ROWS, COLS), STDtype.F32, ctx), STDtype.F16, ctx),
+        ctx)
+    var r_sm_f16 = h.compare_host(d_sm_f16.to_host(ctx), _read_ref(String("softmax_dx")))
+    print("softmax_dx _f16 cos:", r_sm_f16.cos)
+    all_pass = all_pass and (r_sm_f16.cos >= 0.99)
 
     var d_lsm = logsoftmax_backward(
         Tensor.from_host(g_sm, _shape2(ROWS, COLS), STDtype.F32, ctx),
@@ -250,14 +279,20 @@ def main() raises:
     all_pass = all_pass and r_lsm.passed
 
     # ── logsoftmax BF16: same inputs downcast to BF16, SAME F32 ref, thr 0.99. ──
-    # logsoftmax_backward's BF16 arm casts up to F32, runs the SAME row-reduction
-    # kernel, casts grad back to BF16.
+    # The BF16 arm reads BF16 storage, uses F32 row reductions, and writes BF16.
     var d_lsm_bf = logsoftmax_backward(
         cast_tensor(Tensor.from_host(g_sm, _shape2(ROWS, COLS), STDtype.F32, ctx), STDtype.BF16, ctx),
         cast_tensor(Tensor.from_host(lsm_out, _shape2(ROWS, COLS), STDtype.F32, ctx), STDtype.BF16, ctx), ctx)
     var r_lsm_bf = h.compare_host(d_lsm_bf.to_host(ctx), _read_ref(String("logsoftmax_dx")))
     print("logsoftmax_dx _bf16 cos:", r_lsm_bf.cos)
     all_pass = all_pass and (r_lsm_bf.cos >= 0.99)
+
+    var d_lsm_f16 = logsoftmax_backward(
+        cast_tensor(Tensor.from_host(g_sm, _shape2(ROWS, COLS), STDtype.F32, ctx), STDtype.F16, ctx),
+        cast_tensor(Tensor.from_host(lsm_out, _shape2(ROWS, COLS), STDtype.F32, ctx), STDtype.F16, ctx), ctx)
+    var r_lsm_f16 = h.compare_host(d_lsm_f16.to_host(ctx), _read_ref(String("logsoftmax_dx")))
+    print("logsoftmax_dx _f16 cos:", r_lsm_f16.cos)
+    all_pass = all_pass and (r_lsm_f16.cos >= 0.99)
 
     # ── softmax / logsoftmax WIDE (cols=1024 > _TPB): real attention width ────
     var x_sig_w = _fill_signed(ROWS * COLS_WIDE)
@@ -282,19 +317,39 @@ def main() raises:
     all_pass = all_pass and r_lsm_w.passed
 
     # ── sum / mean (scalar grad 1.0 broadcast to [N_ELEM]) ───────────────────
-    var d_sum = sum_backward(Float32(1.0), _shape1(N_ELEM), ctx)
+    var d_sum = sum_backward(Float32(1.0), _shape1(N_ELEM), ctx, STDtype.F32)
     var r_sum = h.compare_host(d_sum.to_host(ctx), _read_ref(String("sum_dx")))
     print("sum_dx    vs torch:", r_sum)
     all_pass = all_pass and r_sum.passed
 
-    var d_mean = mean_backward(Float32(1.0), _shape1(N_ELEM), ctx)
+    var d_mean = mean_backward(Float32(1.0), _shape1(N_ELEM), ctx, STDtype.F32)
     var r_mean = h.compare_host(d_mean.to_host(ctx), _read_ref(String("mean_dx")))
     print("mean_dx   vs torch:", r_mean)
     all_pass = all_pass and r_mean.passed
 
+    var d_sum_bf = sum_backward(Float32(1.0), _shape1(N_ELEM), ctx, STDtype.BF16)
+    var r_sum_bf = h.compare_host(d_sum_bf.to_host(ctx), _read_ref(String("sum_dx")))
+    print("sum_dx    _bf16 cos:", r_sum_bf.cos)
+    all_pass = all_pass and d_sum_bf.dtype() == STDtype.BF16 and (r_sum_bf.cos >= 0.99)
+
+    var d_mean_bf = mean_backward(Float32(1.0), _shape1(N_ELEM), ctx, STDtype.BF16)
+    var r_mean_bf = h.compare_host(d_mean_bf.to_host(ctx), _read_ref(String("mean_dx")))
+    print("mean_dx   _bf16 cos:", r_mean_bf.cos)
+    all_pass = all_pass and d_mean_bf.dtype() == STDtype.BF16 and (r_mean_bf.cos >= 0.99)
+
+    var d_sum_f16 = sum_backward(Float32(1.0), _shape1(N_ELEM), ctx, STDtype.F16)
+    var r_sum_f16 = h.compare_host(d_sum_f16.to_host(ctx), _read_ref(String("sum_dx")))
+    print("sum_dx    _f16 cos:", r_sum_f16.cos)
+    all_pass = all_pass and (r_sum_f16.cos >= 0.99)
+
+    var d_mean_f16 = mean_backward(Float32(1.0), _shape1(N_ELEM), ctx, STDtype.F16)
+    var r_mean_f16 = h.compare_host(d_mean_f16.to_host(ctx), _read_ref(String("mean_dx")))
+    print("mean_dx   _f16 cos:", r_mean_f16.cos)
+    all_pass = all_pass and (r_mean_f16.cos >= 0.99)
+
     print("")
     if all_pass:
-        print("ALL REDUCE BACKWARD GATES PASSED (cos >= 0.999 vs PyTorch)")
+        print("ALL REDUCE BACKWARD GATES PASSED")
     else:
         print("REDUCE BACKWARD PARITY FAILURE")
         raise Error("reduce_bwd_parity gate failed")

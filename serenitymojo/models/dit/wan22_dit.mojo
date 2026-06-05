@@ -119,10 +119,7 @@ def wan22_build_rope(
 ) raises -> Tuple[Tensor, Tensor]:
     var positions = wan22_rope_positions(f, h, w, ctx)
     var axes = wan22_rope_axes(head_dim)
-    var cs = build_multiaxis_rope_tables(positions, axes, theta, ctx)
-    var cos_d = cast_tensor(cs[0], dtype, ctx)
-    var sin_d = cast_tensor(cs[1], dtype, ctx)
-    return (cos_d^, sin_d^)
+    return build_multiaxis_rope_tables(positions, axes, theta, ctx, dtype)
 
 
 # ── Per-token AdaLN helpers (scale/shift/gate are [1,S,dim] tensors) ─────────
@@ -513,8 +510,9 @@ struct Wan22DiT(Movable):
         var t_shape = List[Int]()
         t_shape.append(S)
         var t_vec = Tensor.from_host(t_host^, t_shape^, STDtype.F32, ctx)
-        var sin_emb = timestep_embedding(t_vec, cfg.freq_dim, ctx, 10000.0)  # [S,256] F32
-        var sin_bf = cast_tensor(sin_emb, bf, ctx)
+        var sin_bf = timestep_embedding(
+            t_vec, cfg.freq_dim, ctx, 10000.0, bf
+        )
         # time_embedding: Linear -> SiLU -> Linear (all bf16)
         var e = linear(sin_bf, self._w("time_embedding.0.weight"),
                        Optional(self._w("time_embedding.0.bias").clone(ctx)), ctx)

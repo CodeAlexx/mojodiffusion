@@ -139,6 +139,48 @@ def _run_nd_case[
     return rdq.passed and rdk.passed and rdv.passed
 
 
+def _run_bf16_storage_case[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    ctx: DeviceContext,
+    h: ParityHarness,
+    label: String,
+    dq_ref: String,
+    dk_ref: String,
+    dv_ref: String,
+) raises -> Bool:
+    var n = B * S * H * Dh
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var g = sdpa_backward[B, S, H, Dh](
+        Tensor.from_host(_fill_q(n), _bshd(B, S, H, Dh), STDtype.BF16, ctx),
+        Tensor.from_host(_fill_k(n), _bshd(B, S, H, Dh), STDtype.BF16, ctx),
+        Tensor.from_host(_fill_v(n), _bshd(B, S, H, Dh), STDtype.BF16, ctx),
+        Tensor.from_host(_fill_dout(n), _bshd(B, S, H, Dh), STDtype.BF16, ctx),
+        scale, ctx,
+    )
+    if (
+        g.d_q.dtype() != STDtype.BF16
+        or g.d_k.dtype() != STDtype.BF16
+        or g.d_v.dtype() != STDtype.BF16
+    ):
+        raise Error(
+            label
+            + ": expected BF16 gradient storage, got d_q="
+            + g.d_q.dtype().name()
+            + " d_k="
+            + g.d_k.dtype().name()
+            + " d_v="
+            + g.d_v.dtype().name()
+        )
+    var rdq = h.compare(g.d_q, _read_ref(dq_ref), ctx)
+    var rdk = h.compare(g.d_k, _read_ref(dk_ref), ctx)
+    var rdv = h.compare(g.d_v, _read_ref(dv_ref), ctx)
+    print(label, "BF16 d_q cos:", rdq.cos)
+    print(label, "BF16 d_k cos:", rdk.cos)
+    print(label, "BF16 d_v cos:", rdv.cos)
+    return rdq.cos >= 0.99 and rdk.cos >= 0.99 and rdv.cos >= 0.99
+
+
 # ── read one tagged space-separated float line (mirrors sdpa_math_parity) ─────
 def _read_ref(tag: String) raises -> List[Float32]:
     var fd = sys_open(String(REF_PATH), O_RDONLY)
@@ -248,6 +290,16 @@ def main() raises:
     print("B) Dh=64  d_k vs torch:", rB_dk)
     print("B) Dh=64  d_v vs torch:", rB_dv)
     all_pass = all_pass and rB_dq.passed and rB_dk.passed and rB_dv.passed
+
+    var rB_bf16 = _run_bf16_storage_case[BB, SB, HB, DhB](
+        ctx,
+        h,
+        String("B) Dh=64 "),
+        String("dh64_dq"),
+        String("dh64_dk"),
+        String("dh64_dv"),
+    )
+    all_pass = all_pass and rB_bf16
 
     # ── Case C: H=30 — Z-Image's REAL (non-32-aligned) head count ─────────────
     # Regression guard for BUG_sdpa_backward_H30_dq_dk_zero: non-degenerate data

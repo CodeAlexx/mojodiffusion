@@ -424,20 +424,23 @@ struct LdmVaeEncoder[LH: Int, LW: Int, LATENT_CH: Int](Movable):
     def encode_moments(
         self, image_nchw: Tensor, ctx: DeviceContext
     ) raises -> Tensor:
-        """[1,3,8*LH,8*LW] F32/BF16 -> NHWC moments [1,LH,LW,2*LATENT_CH]."""
+        """[1,3,8*LH,8*LW] -> NHWC moments [1,LH,LW,2*LATENT_CH] in weight dtype."""
         var sh = image_nchw.shape()
         if len(sh) != 4 or sh[1] != 3 or sh[2] != Self.IH or sh[3] != Self.IW:
             raise Error("LdmVaeEncoder.encode_moments: expected [1,3,8*LH,8*LW]")
         if (
             image_nchw.dtype() != STDtype.F32
             and image_nchw.dtype() != STDtype.BF16
+            and image_nchw.dtype() != STDtype.F16
         ):
-            raise Error("LdmVaeEncoder.encode_moments: expected F32 or BF16 input")
+            raise Error("LdmVaeEncoder.encode_moments: expected F32, BF16, or F16 input")
 
         comptime ZC2 = 2 * Self.LATENT_CH
 
         # NCHW -> NHWC once.
         var h = nchw_to_nhwc(image_nchw, ctx)
+        if h.dtype() != self.conv_in_w.dtype():
+            h = cast_tensor(h, self.conv_in_w.dtype(), ctx)
         # conv_in: 3 -> 128.
         h = conv2d[1, Self.IH, Self.IW, 3, 3, 3, ENC_CH0, 1, 1, 1, 1](
             h, clone(self.conv_in_w, ctx),
@@ -506,12 +509,9 @@ struct LdmVaeEncoder[LH: Int, LW: Int, LATENT_CH: Int](Movable):
         var moments = self.encode_moments(image_nchw, ctx)
         var mu_nhwc = slice(moments, 3, 0, Self.LATENT_CH, ctx)
         var lv_nhwc = slice(moments, 3, Self.LATENT_CH, Self.LATENT_CH, ctx)
-        # Moments are BF16 (faithful BF16 forward); the reparam kernel is F32-only,
-        # so upcast mu/logvar to F32 for sampling. Rust's deterministic encode()
-        # returns the mean and never samples, so this path is parity-irrelevant.
-        var mu = cast_tensor(nhwc_to_nchw(mu_nhwc, ctx), STDtype.F32, ctx)
-        var lv = cast_tensor(nhwc_to_nchw(lv_nhwc, ctx), STDtype.F32, ctx)
-        var eps = randn(mu.shape(), eps_seed, STDtype.F32, ctx)
+        var mu = nhwc_to_nchw(mu_nhwc, ctx)
+        var lv = nhwc_to_nchw(lv_nhwc, ctx)
+        var eps = randn(mu.shape(), eps_seed, mu.dtype(), ctx)
         return diag_gaussian_sample(mu, lv, eps, ctx)
 
 

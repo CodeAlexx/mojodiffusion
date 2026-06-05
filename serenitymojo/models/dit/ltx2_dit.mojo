@@ -8,11 +8,10 @@
 #       QK-RMSNorm, RoPE, SDPA, per-head gate, to_out.
 #   compute_ada_params_6                                (line 1505) — modulation.
 #
-# *** SCOPE (per task): block-0 self-attention (attn1) + FFN ONLY. ***
-# The Rust forward_video_only ALSO runs a text cross-attention (attn2) between
-# self-attn and FFN. This Mojo port implements the self-attn + gated residual
-# and the FFN + gated residual, and OMITS the cross-attn stage (no
-# encoder_hidden_states in the bounded smoke). See report deviations.
+# *** SCOPE: LTX-2 video-only and AV block inference paths. ***
+# The video-only path includes attn1, text cross-attn attn2, and FFN. The AV
+# path includes video/audio self-attn, text cross-attn, and cross-modal A2V/V2A
+# attention.
 #
 # ── scale_shift_table chunk order (ltx2_model.rs:1533-1538) ──────────────────
 #   ada = table[0:6] + temb            (broadcast add over tokens)
@@ -42,12 +41,8 @@
 # *** CODE-ONLY: compile-verified; NOT executed. ***
 
 from std.gpu.host import DeviceContext
-from std.gpu import global_idx
-from std.utils.index import IndexList
 from std.math import sqrt
 from std.memory import ArcPointer
-from layout import Layout, LayoutTensor
-from layout.runtime_layout import RuntimeLayout
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -55,7 +50,11 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import gelu, sigmoid
-from serenitymojo.ops.attention import sdpa, sdpa_nomask
+from serenitymojo.ops.attention import (
+    sdpa_nomask,
+    sdpa_nomask_tiled,
+    sdpa_cross_nomask,
+)
 from serenitymojo.ops.tensor_algebra import (
     reshape,
     add,
@@ -63,7 +62,6 @@ from serenitymojo.ops.tensor_algebra import (
     mul_scalar,
     add_scalar,
     slice,
-    concat,
 )
 from serenitymojo.models.dit.ltx2_rope import apply_ltx2_rope
 from serenitymojo.models.dit.ltx2_nag import NAGContext
@@ -450,66 +448,6 @@ def _apply_head_gate[S: Int](
     return reshape(gated, _shape3(1, S, num_heads * head_dim), ctx)
 
 
-# Additive cross-attention mask [1, H, S, S]: 0.0 for the first `n_kv` KV columns
-# (the real text tokens), large-negative for the padded columns [n_kv, S). This
-# lets us reuse the square `sdpa` for a non-square Q(S) x KV(n_kv) cross-attn by
-# zero-padding the K/V seq up to S and masking out the pad.
-#
-# *** Built ON-DEVICE *** via a fill kernel. A host List of H*S*S elements is
-# untenable at the stage-2 grid (S=3072 -> 301M elems / 1.2GB host + the count
-# overflow that crashed the staged run); the column predicate (j < n_kv) is
-# trivially data-parallel.
-comptime _MASK_DYN1 = Layout.row_major(-1)
-comptime _MASK_BLOCK = 256
-
-
-def _cross_pad_mask_kernel_f32(
-    o: LayoutTensor[DType.float32, _MASK_DYN1, MutAnyOrigin],
-    total: Int, S: Int, n_kv: Int, neg: Float32,
-):
-    var idx = Int(global_idx.x)
-    if idx < total:
-        var j = idx % S          # key column
-        o[idx] = Float32(0.0) if j < n_kv else neg
-
-
-def _cross_pad_mask_kernel_bf16(
-    o: LayoutTensor[DType.bfloat16, _MASK_DYN1, MutAnyOrigin],
-    total: Int, S: Int, n_kv: Int, neg: Float32,
-):
-    var idx = Int(global_idx.x)
-    if idx < total:
-        var j = idx % S
-        var v = Float32(0.0) if j < n_kv else neg
-        o[idx] = rebind[o.element_type](v.cast[DType.bfloat16]())
-
-
-def _cross_pad_mask[S: Int](
-    heads: Int, n_kv: Int, dtype: STDtype, ctx: DeviceContext
-) raises -> Tensor:
-    var neg = Float32(-1.0e30)
-    var total = heads * S * S
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](total * dtype.byte_size())
-    var rl = RuntimeLayout[_MASK_DYN1].row_major(IndexList[1](total))
-    var grid = (total + _MASK_BLOCK - 1) // _MASK_BLOCK
-    if dtype.to_mojo_dtype() == DType.float32:
-        var O = LayoutTensor[DType.float32, _MASK_DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[Float32](), rl
-        )
-        ctx.enqueue_function[_cross_pad_mask_kernel_f32, _cross_pad_mask_kernel_f32](
-            O, total, S, n_kv, neg, grid_dim=grid, block_dim=_MASK_BLOCK
-        )
-    else:
-        var O = LayoutTensor[DType.bfloat16, _MASK_DYN1, MutAnyOrigin](
-            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
-        )
-        ctx.enqueue_function[_cross_pad_mask_kernel_bf16, _cross_pad_mask_kernel_bf16](
-            O, total, S, n_kv, neg, grid_dim=grid, block_dim=_MASK_BLOCK
-        )
-    ctx.synchronize()
-    return Tensor(out_buf^, _shape4(1, heads, S, S), dtype)
-
-
 # ── block forward (video self-attn + cross-attn + FFN, video-only) ────────────
 # hidden:    [1, S, inner_dim] BF16
 # temb:      [1, 9*inner_dim]  BF16   (timestep embedding, pre-broadcast;
@@ -529,7 +467,6 @@ def ltx2_block_forward_video_only[B: Int, S: Int, N_TXT: Int](
     ctx: DeviceContext,
 ) raises -> Tensor:
     comptime assert B == 1, "LTX2 block smoke supports B==1"
-    comptime assert N_TXT <= S, "cross-attn pad-mask requires N_TXT <= S"
     var dim = num_heads * head_dim
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
 
@@ -570,7 +507,12 @@ def ltx2_block_forward_video_only[B: Int, S: Int, N_TXT: Int](
     q4 = apply_ltx2_rope(q4, rope_cos, rope_sin, ctx)
     k4 = apply_ltx2_rope(k4, rope_cos, rope_sin, ctx)
 
-    var attn = sdpa[B, S, 32, 128](q4, k4, v4, _zeros_mask[S](32, hidden.dtype(), ctx), scale, ctx)
+    var attn: Tensor
+    comptime score_mib = (B * S * S * 32 * 4) // (1024 * 1024)
+    comptime if score_mib >= 3584:
+        attn = sdpa_nomask_tiled[B, S, 32, 128](q4, k4, v4, scale, ctx)
+    else:
+        attn = sdpa_nomask[B, S, 32, 128](q4, k4, v4, scale, ctx)
     var attn_flat = _from_bshd(attn, S, num_heads, head_dim, ctx)  # [1, S, dim]
 
     # Per-head gate (ltx2_model.rs:858-872): gates = 2*sigmoid(to_gate_logits(
@@ -610,16 +552,14 @@ def ltx2_block_forward_video_only[B: Int, S: Int, N_TXT: Int](
     q2 = rms_norm(q2, weights._w("attn2.norm_q.weight"), eps, ctx)
     k2 = rms_norm(k2, weights._w("attn2.norm_k.weight"), eps, ctx)
 
-    # Non-square Q(S) x KV(N_TXT): pad K/V seq up to S with zeros and mask the
-    # pad columns (large-negative additive bias) so the square sdpa is exact.
+    # Non-square Q(S) x KV(N_TXT): rectangular online-softmax attention.
+    # This is exact and avoids the old square pad/mask [S,S] allocation.
     var q2_4 = _to_bshd(q2, S, num_heads, head_dim, ctx)            # [1, S, H, Dh]
     var k2_4 = _to_bshd(k2, N_TXT, num_heads, head_dim, ctx)        # [1, N_TXT, H, Dh]
     var v2_4 = _to_bshd(v2, N_TXT, num_heads, head_dim, ctx)
-    var kv_pad = _zeros4[S](N_TXT, num_heads, head_dim, hidden.dtype(), ctx)
-    var k2_pad = concat(1, ctx, k2_4, kv_pad)                       # [1, S, H, Dh]
-    var v2_pad = concat(1, ctx, v2_4, _clone_t(kv_pad, ctx))
-    var cmask = _cross_pad_mask[S](num_heads, N_TXT, hidden.dtype(), ctx)
-    var attn2 = sdpa[B, S, 32, 128](q2_4, k2_pad, v2_pad, cmask, scale, ctx)
+    var attn2 = sdpa_cross_nomask[B, S, N_TXT, 32, 128](
+        q2_4, k2_4, v2_4, scale, ctx,
+    )
     var attn2_flat = _from_bshd(attn2, S, num_heads, head_dim, ctx)  # [1, S, dim]
 
     # attn2's OWN per-head gate; gate input = the modulated query mod_q2.
@@ -653,30 +593,7 @@ def ltx2_block_forward_video_only[B: Int, S: Int, N_TXT: Int](
     return hs^
 
 
-# All-zeros additive attention mask [1, H, S, S] for full attention (the Mojo
-# sdpa requires a mask; Rust passes None). Built once per block here.
-def _zeros_mask[S: Int](
-    heads: Int, dtype: STDtype, ctx: DeviceContext
-) raises -> Tensor:
-    var data = List[Float32]()
-    for _ in range(heads * S * S):
-        data.append(Float32(0.0))
-    return Tensor.from_host(data, _shape4(1, heads, S, S), dtype, ctx)
-
-
-# Zero pad block [1, S-n_kv, H, Dh] to extend cross-attn K/V seq to S.
-def _zeros4[S: Int](
-    n_kv: Int, h: Int, dh: Int, dtype: STDtype, ctx: DeviceContext
-) raises -> Tensor:
-    var pad = S - n_kv
-    var data = List[Float32]()
-    for _ in range(pad * h * dh):
-        data.append(Float32(0.0))
-    return Tensor.from_host(data, _shape4(1, pad, h, dh), dtype, ctx)
-
-
-# D2D buffer clone (Tensor is uniquely-owning; concat consumes by reference but
-# we need two independent pad tensors).
+# D2D buffer clone for contexts reused across regular and NAG branches.
 def _clone_t(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
@@ -718,6 +635,10 @@ struct LTX2AVBlockWeights(Movable):
 
     var weights: List[ArcPointer[Tensor]]
     var name_to_idx: Dict[String, Int]
+    var lora_names: List[String]
+    var lora_a: List[ArcPointer[Tensor]]
+    var lora_b: List[ArcPointer[Tensor]]
+    var lora_scales: List[Float32]
     var config: LTX2Config
 
     def __init__(
@@ -728,6 +649,10 @@ struct LTX2AVBlockWeights(Movable):
     ):
         self.weights = weights^
         self.name_to_idx = name_to_idx^
+        self.lora_names = List[String]()
+        self.lora_a = List[ArcPointer[Tensor]]()
+        self.lora_b = List[ArcPointer[Tensor]]()
+        self.lora_scales = List[Float32]()
         self.config = config
 
     @staticmethod
@@ -1020,6 +945,62 @@ struct LTX2AVBlockWeights(Movable):
         var summed = add(self.weights[idx][], delta, ctx)
         self.weights[idx] = ArcPointer[Tensor](summed^)
 
+    def add_lora_factor(
+        mut self,
+        name: String,
+        var a: Tensor,
+        var b: Tensor,
+        scale: Float32,
+    ) raises:
+        """Attach one factorized LoRA adapter for a block-local linear weight.
+
+        Runtime applies this as:
+            linear(x, W, bias) + scale * linear(linear(x, A), B)
+        where A is [rank, in] and B is [out, rank]. This avoids materializing the
+        full [out, in] delta tensor for LTX-2's very large AV blocks.
+        """
+        if name not in self.name_to_idx:
+            raise Error(String("LTX2AV.add_lora_factor: missing weight ") + name)
+        self.lora_names.append(name)
+        self.lora_a.append(ArcPointer[Tensor](a^))
+        self.lora_b.append(ArcPointer[Tensor](b^))
+        self.lora_scales.append(scale)
+
+    def add_lora_factor_arc(
+        mut self,
+        name: String,
+        var a: ArcPointer[Tensor],
+        var b: ArcPointer[Tensor],
+        scale: Float32,
+    ) raises:
+        """Attach an already device-resident factorized LoRA adapter.
+
+        This is the hot inference path: A/B tensors are preloaded once and the
+        transient streamed block just holds ArcPointer refs while it runs.
+        """
+        if name not in self.name_to_idx:
+            raise Error(String("LTX2AV.add_lora_factor_arc: missing weight ") + name)
+        self.lora_names.append(name)
+        self.lora_a.append(a^)
+        self.lora_b.append(b^)
+        self.lora_scales.append(scale)
+
+    def _linear_lora_delta(
+        self,
+        x: Tensor,
+        w_key: String,
+        var base_out: Tensor,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        var out = base_out^
+        for i in range(len(self.lora_names)):
+            if self.lora_names[i] == w_key:
+                var down = linear(x, self.lora_a[i][], None, ctx)
+                var up = linear(down, self.lora_b[i][], None, ctx)
+                var scaled = mul_scalar(up, self.lora_scales[i], ctx)
+                out = add(out, scaled, ctx)
+        return out^
+
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
         var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
         ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
@@ -1031,7 +1012,8 @@ struct LTX2AVBlockWeights(Movable):
     ) raises -> Tensor:
         ref w = self._w(w_key)
         ref b = self._w(b_key)
-        return linear(x, w, Optional[Tensor](self._clone(b, ctx)), ctx)
+        var out = linear(x, w, Optional[Tensor](self._clone(b, ctx)), ctx)
+        return self._linear_lora_delta(x, w_key, out^, ctx)
 
 
 # ── RMSNorm with an OPTIONAL affine weight (cross-modal norms may have one) ──
@@ -1206,30 +1188,34 @@ def _av_attention[SQ: Int, SKV: Int, SPAD: Int, H: Int, DH: Int](
     elif has_q_rope:
         k4 = apply_ltx2_rope(k4, q_rope_cos, q_rope_sin, ctx)
 
-    # Pad Q and KV up to SPAD, mask the KV-pad columns, run square SDPA, slice.
+    # Square self-attn uses the exact no-mask path. Rectangular cross-attn uses
+    # online-softmax directly over Q(SQ) x KV(SKV) without square padding.
     var attn_flat: Tensor
     comptime if SQ == SKV and SQ == SPAD:
         # Square self-attention: the additive mask is all-zeros (full attention).
-        # Use sdpa_nomask to AVOID materializing [1,H,S,S] (1.2GB at S=3072 for the
-        # stage-2 upscaled grid — the previous _zeros_mask path overflowed there).
-        var attn = sdpa_nomask[1, SPAD, H, DH](q4, k4, v4, scale, ctx)
+        # Use vendor-matmul SDPA while the score slab fits the explicit budget.
+        # The scalar online-softmax path is for truly huge grids such as
+        # 2x AudioSync stage-2, not for 97-frame stage-1.
+        var attn: Tensor
+        comptime score_mib = (SPAD * SPAD * H * 4) // (1024 * 1024)
+        comptime if score_mib >= 3584:
+            attn = sdpa_nomask_tiled[1, SPAD, H, DH](q4, k4, v4, scale, ctx)
+        else:
+            attn = sdpa_nomask[1, SPAD, H, DH](q4, k4, v4, scale, ctx)
         attn_flat = reshape(attn, _shape3(1, SQ, inner), ctx)
     else:
-        var q_pad = _pad_seq[SPAD](q4, SQ, H, DH, hidden.dtype(), ctx)
-        var k_pad = _pad_seq[SPAD](k4, SKV, H, DH, hidden.dtype(), ctx)
-        var v_pad = _pad_seq[SPAD](v4, SKV, H, DH, hidden.dtype(), ctx)
-        var cmask = _cross_pad_mask[SPAD](H, SKV, hidden.dtype(), ctx)
-        var attn = sdpa[1, SPAD, H, DH](q_pad, k_pad, v_pad, cmask, scale, ctx)
-        var attn_full = reshape(attn, _shape3(1, SPAD, inner), ctx)
-        attn_flat = slice(attn_full, 1, 0, SQ, ctx)      # [1, SQ, inner]
+        # Rectangular cross-attention. The old path padded Q/K/V to SPAD and
+        # built [SPAD,SPAD] masks; AudioSync-size video would OOM there.
+        var attn = sdpa_cross_nomask[1, SQ, SKV, H, DH](q4, k4, v4, scale, ctx)
+        attn_flat = reshape(attn, _shape3(1, SQ, inner), ctx)
 
     # Per-head gate: gate_logits = linear(hidden) -> [1,SQ,H]; *2sigmoid.
     if weights._has(mod_name + ".to_gate_logits.weight"):
-        var gl = linear(
-            hidden, weights._w(mod_name + ".to_gate_logits.weight"),
-            Optional[Tensor](
-                weights._clone(weights._w(mod_name + ".to_gate_logits.bias"), ctx)
-            ), ctx,
+        var gl = weights._linear_b(
+            hidden,
+            mod_name + ".to_gate_logits.weight",
+            mod_name + ".to_gate_logits.bias",
+            ctx,
         )                                                # [1, SQ, H]
         var gates = mul_scalar(sigmoid(gl, ctx), Float32(2.0), ctx)
         var gates4 = reshape(gates, _shape4(1, SQ, H, 1), ctx)
@@ -1239,21 +1225,6 @@ def _av_attention[SQ: Int, SKV: Int, SPAD: Int, H: Int, DH: Int](
     return weights._linear_b(
         attn_flat, mod_name + ".to_out.0.weight", mod_name + ".to_out.0.bias", ctx
     )
-
-
-# Pad a [1, S, H, Dh] tensor's seq dim up to SPAD with zeros.
-def _pad_seq[SPAD: Int](
-    x: Tensor, s: Int, h: Int, dh: Int, dtype: STDtype, ctx: DeviceContext
-) raises -> Tensor:
-    if s == SPAD:
-        return _clone_t(x, ctx)
-    var pad = SPAD - s
-    var data = List[Float32]()
-    for _ in range(pad * h * dh):
-        data.append(Float32(0.0))
-    var pad_t = Tensor.from_host(data, _shape4(1, pad, h, dh), dtype, ctx)
-    return concat(1, ctx, x, pad_t)
-
 
 # ── full dual-stream AV block forward ──
 # Consumes pre-computed modulation/rope tensors (dumped by the oracle):

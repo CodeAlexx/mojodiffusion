@@ -1,4 +1,11 @@
-# train_ltx2_real.mojo — LTX-2 video DiT LoRA training loop (block-swap offload).
+# train_ltx2_real.mojo — LEGACY LTX-2 video-only LoRA training loop.
+#
+# This file is intentionally fail-closed by default. It trains the old
+# `models/ltx2/ltx2_stack_lora.mojo` video-only stack, not the production
+# full-AV inference spine in `models/dit/ltx2_dit.mojo`. Use it only as a legacy
+# backward smoke with `--legacy-video-only`; production LTX-2 training must land
+# on the full AV block forward/backward. See
+# `training/ltx2_av_training_readiness.mojo` for the executable readiness gate.
 #
 # TRANSLATION of the musubi-tuner LTX-2 LoRA recipe onto the Mojo LTX-2 LoRA
 # OFFLOAD stack (models/ltx2/ltx2_stack_lora.mojo). Streams all 48 identical
@@ -11,8 +18,10 @@
 #   - NO double/single split: 48 identical blocks (BlockKind.transformer()).
 #   - Modulation: per-block scale_shift_table[9,D] (frozen) + a single global
 #     adaln_single(sigma) -> 6*D delta (frozen) ADDED on top. Built once/step.
-#   - LoRA target set (musubi networks/lora_ltx2.py LTX2_INCLUDE_PATTERNS_T2V):
+#   - Legacy narrowed LoRA target set:
 #     attn1.to_q/to_k/to_v/to_out.0 -> 4 adapters x 48 = 192 total.
+#     musubi's production T2V preset targets all AV attention modules; see
+#     ltx2_av_training_readiness.mojo.
 #   - RoPE: SPLIT type (rope_halfsplit), tables [S*H, Dh//2] split layout.
 #
 # Per step (flow-match; musubi ltx2_scheduler.py + ltx2_train.py):
@@ -35,13 +44,16 @@
 # correct LoRA backward MUST drive loss DOWN monotonically (trainer-correctness
 # gate, same probe as train_chroma_real).
 #
-# Run (real smoke):
+# Run (legacy smoke only):
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
 #     pixi run mojo build -I . -Xlinker -lm -Xlinker -lcuda \
 #       serenitymojo/training/train_ltx2_real.mojo -o /tmp/train_ltx2_real && \
-#     /tmp/train_ltx2_real [steps]
+#     /tmp/train_ltx2_real --legacy-video-only [steps]
+#
+# Readiness status:
+#   pixi run mojo run -I . serenitymojo/training/ltx2_av_training_readiness.mojo --expect-not-ready
 
-from sys import argv
+from std.sys import argv
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
@@ -127,8 +139,8 @@ def _host_noise(n: Int, seed: UInt64) -> List[Float32]:
     return out^
 
 
-# sinusoidal timestep embedding [dim] for a scalar t (diffusers get_timestep_embedding,
-# sin-first, max_period=10000). Feeds the adaln_single timestep_embedder linears.
+# sinusoidal timestep embedding [dim] for a scalar t. LTX-2 uses
+# Timesteps(... flip_sin_to_cos=True, downscale_freq_shift=0), i.e. cos first.
 def _sinusoidal_temb(t: Float32, dim: Int) -> List[Float32]:
     var half = dim // 2
     var out = List[Float32]()
@@ -137,8 +149,8 @@ def _sinusoidal_temb(t: Float32, dim: Int) -> List[Float32]:
     for i in range(half):
         var freq = fexp(-flog(10000.0) * Float64(i) / Float64(half))
         var arg = Float64(t) * freq
-        out[i] = Float32(fsin(arg))         # sin first
-        out[half + i] = Float32(fcos(arg))  # cos second
+        out[i] = Float32(fcos(arg))
+        out[half + i] = Float32(fsin(arg))
     return out^
 
 
@@ -146,6 +158,14 @@ def _absum(v: List[Float32]) -> Float32:
     var s = Float32(0.0)
     for i in range(len(v)):
         var x = v[i]
+        s += x if x >= 0.0 else -x
+    return s
+
+
+def _absum(v: List[BFloat16]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(v)):
+        var x = v[i].cast[DType.float32]()
         s += x if x >= 0.0 else -x
     return s
 
@@ -202,20 +222,34 @@ def _load_host(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List
 def main() raises:
     var ctx = DeviceContext()
     var a = argv()
+    if len(a) < 2 or String(a[1]) != "--legacy-video-only":
+        print("LTX2 trainer guard: this binary is the legacy video-only trainer.")
+        print("It is not production LTX2 AV training and is not wired to ltx2_dit.")
+        print("The legacy smoke still uses host-side noise/loss bookkeeping; production AV must keep the hot loop on device.")
+        print("Run training/ltx2_av_training_readiness.mojo --expect-not-ready for the current contract.")
+        print("Run with --legacy-video-only only when intentionally testing the old stack.")
+        raise Error("train_ltx2_real: production AV trainer not implemented here")
+
     var run_steps = 5
-    if len(a) >= 2:
+    if len(a) >= 3:
         var v = 0
-        var bs = String(a[1]).as_bytes()
-        for i in range(String(a[1]).byte_length()):
+        var bs = String(a[2]).as_bytes()
+        for i in range(String(a[2]).byte_length()):
+            if bs[i] < 0x30 or bs[i] > 0x39:
+                raise Error("train_ltx2_real: steps must be a positive integer")
             v = v * 10 + Int(bs[i] - 0x30)
+        if v <= 0:
+            raise Error("train_ltx2_real: steps must be a positive integer")
         run_steps = v
 
-    print("=== LTX-2 (video DiT) REAL LoRA training loop (block-swap offload) ===")
+    print("=== LTX-2 LEGACY video-only LoRA training loop (block-swap offload) ===")
+    print("  WARNING: legacy stack; not production full-AV LTX2 training")
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " FF=", FF, " in_ch=", IN_CH, " out_ch=", OUT_CH)
     print("  depth: NUM_LAYERS=", NUM_LAYERS)
     print("  tokens: grid", GRID_F, "x", GRID_H, "x", GRID_W, " S=", S)
     print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT)
     print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
+    print("  hot loop note: legacy smoke uses host noise/loss; not production AV device-loop training")
     print("  ckpt:", CKPT)
     print("  cache:", CACHE_DIR)
 
@@ -231,10 +265,10 @@ def main() raises:
     var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
 
-    # ── split-rope tables [S*H, Dh//2] (built once, F32) ──────────────────────
+    # ── split-rope tables [S*H, Dh//2] (built once, BF16 storage) ─────────────
     var rope = build_ltx2_rope[GRID_F, GRID_H, GRID_W](
         H, Dh, 10000.0, Float64(GRID_F), Float64(GRID_H), Float64(GRID_W),
-        STDtype.F32, ctx,
+        STDtype.BF16, ctx,
     )
     var cos = rope[0].to_host(ctx)
     var sin = rope[1].to_host(ctx)

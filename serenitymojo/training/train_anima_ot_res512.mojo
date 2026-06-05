@@ -444,6 +444,14 @@ def _absum(v: List[Float32]) -> Float32:
     return s
 
 
+def _absum(v: List[BFloat16]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(v)):
+        var x = v[i].cast[DType.float32]()
+        s += x if x >= 0.0 else -x
+    return s
+
+
 def _global_norm(grads: AnimaLoraGrads) -> Float32:
     var ss = Float32(0.0)
     for i in range(len(grads.d_a)):
@@ -622,8 +630,7 @@ def _decode_latent_to_png[LH: Int, LW: Int](
     # The wan21 VAE weights + mean/inv_std are BF16; build the latent BF16 so the
     # decoder's internal div/add (z/inv_std + mean) dtype-matches (else elementwise
     # a/b dtype mismatch). The roundtrip parity feeds BF16 the same way.
-    var lat_f32 = Tensor.from_host(nchw, [1, Cd, Hd, Wd], STDtype.F32, ctx)
-    var lat = cast_tensor(lat_f32^, STDtype.BF16, ctx)
+    var lat = Tensor.from_host(nchw, [1, Cd, Hd, Wd], STDtype.BF16, ctx)
     var rgb = dec.decode_wan21_keys(lat, ctx)   # NCHW [1,3,8*LH,8*LW], [-1,1]
     save_png(rgb, out_png, ctx, ValueRange.SIGNED)
 

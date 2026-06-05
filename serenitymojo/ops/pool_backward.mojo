@@ -1,4 +1,4 @@
-# ops/pool_backward.mojo — naive F32 BACKWARD for MaxPool2D + UpsampleNearest2D
+# ops/pool_backward.mojo — naive BACKWARD for MaxPool2D + UpsampleNearest2D
 # (the VAE / decoder path). Tier-5 de-risk: hand-written naive GPU kernels (one
 # thread per INPUT element), F32 interior, no shared memory, no atomics —
 # correctness first, parity-gated vs PyTorch (cos >= 0.999).
@@ -32,8 +32,10 @@
 #                          grad_out[n, ih*scale+dh, iw*scale+dw, c]
 #   One thread per INPUT element. d_x shape == input shape [N,in_h,in_w,C].
 #
-# Mojo 1.0.0b1, NVIDIA GPU. F32 only. Loud-fail on shape. Single d_x each, so
-# plain `def` returning a `Tensor` (no Movable multi-output struct needed).
+# Mojo 1.0.0b1, NVIDIA GPU. BF16/F16 storage is read directly, F32 is used only
+# for scalar routing/sum math inside the kernel, and d_x stores back to the
+# activation dtype. Single d_x each, so plain `def` returning a `Tensor` (no
+# Movable multi-output struct needed).
 
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
@@ -53,10 +55,10 @@ comptime _NEG_BIG = Float32(-3.0e38)
 # Scans every output window that covers (ih,iw); for each window recomputes its
 # argmax from x (first-max tie-break, row-major (kh,kw) scan, == PyTorch) and,
 # if (ih,iw) is that argmax, accumulates the window's grad_y.
-def _maxpool2d_dx_kernel_f32(
-    grad_y: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [N*Ho*Wo*C]
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],       # [N*Hi*Wi*C]
-    d_x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],     # [N*Hi*Wi*C]
+def _maxpool2d_dx_kernel[dtype: DType](
+    grad_y: LayoutTensor[dtype, _DYN1, MutAnyOrigin],  # [N*Ho*Wo*C]
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],       # [N*Hi*Wi*C]
+    d_x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],     # [N*Hi*Wi*C]
     N: Int, Hi: Int, Wi: Int, C: Int,
     Kh: Int, Kw: Int, Sh: Int, Sw: Int,
     Ho: Int, Wo: Int,
@@ -108,7 +110,7 @@ def _maxpool2d_dx_kernel_f32(
                 for wkw in range(Kw):
                     var xiw = ow * Sw + wkw
                     var xoff = (((n * Hi + xih) * Wi + xiw) * C) + c
-                    var v = rebind[Scalar[DType.float32]](x[xoff])
+                    var v = rebind[Scalar[dtype]](x[xoff]).cast[DType.float32]()
                     if v > best:
                         best = v
                         best_kh = wkh
@@ -116,15 +118,15 @@ def _maxpool2d_dx_kernel_f32(
             # if THIS input pixel is the window's argmax, take the grad
             if best_kh == kh and best_kw == kw:
                 var goff = (((n * Ho + oh) * Wo + ow) * C) + c
-                acc += rebind[Scalar[DType.float32]](grad_y[goff])
-    d_x[idx] = rebind[d_x.element_type](acc)
+                acc += rebind[Scalar[dtype]](grad_y[goff]).cast[DType.float32]()
+    d_x[idx] = rebind[d_x.element_type](acc.cast[dtype]())
 
 
 # ── UpsampleNearest2D backward kernel: one thread per INPUT element ───────────
 # d_x[n,ih,iw,c] = sum over the scale*scale grad_out cells it was broadcast to.
-def _upsample_nearest_dx_kernel_f32(
-    grad_out: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [N*Ho*Wo*C]
-    d_x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],       # [N*Hi*Wi*C]
+def _upsample_nearest_dx_kernel[dtype: DType](
+    grad_out: LayoutTensor[dtype, _DYN1, MutAnyOrigin],  # [N*Ho*Wo*C]
+    d_x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],       # [N*Hi*Wi*C]
     N: Int, Hi: Int, Wi: Int, C: Int,
     scale: Int, Ho: Int, Wo: Int,
 ):
@@ -149,8 +151,8 @@ def _upsample_nearest_dx_kernel_f32(
             if ow >= Wo:
                 continue
             var goff = (((n * Ho + oh) * Wo + ow) * C) + c
-            acc += rebind[Scalar[DType.float32]](grad_out[goff])
-    d_x[idx] = rebind[d_x.element_type](acc)
+            acc += rebind[Scalar[dtype]](grad_out[goff]).cast[DType.float32]()
+    d_x[idx] = rebind[d_x.element_type](acc.cast[dtype]())
 
 
 def maxpool2d_backward[
@@ -174,10 +176,6 @@ def maxpool2d_backward[
     comptime Ho = (Hi - Kh) // Sh + 1
     comptime Wo = (Wi - Kw) // Sw + 1
 
-    if x.dtype() != STDtype.F32:
-        raise Error("maxpool2d_backward: x must be F32")
-    if grad_out.dtype() != STDtype.F32:
-        raise Error("maxpool2d_backward: grad_out must be F32")
     var xshape = x.shape()
     if (
         len(xshape) != 4
@@ -194,6 +192,8 @@ def maxpool2d_backward[
         raise Error(
             "maxpool2d_backward: grad_out shape must match [N,Ho,Wo,C]"
         )
+    if x.dtype() != grad_out.dtype():
+        raise Error("maxpool2d_backward: x/grad_out dtype mismatch")
 
     comptime nx = N * Hi * Wi * C
     comptime ng = N * Ho * Wo * C
@@ -201,29 +201,71 @@ def maxpool2d_backward[
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nx))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](ng))
 
-    var xv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var gv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-
-    var dx_buf = ctx.enqueue_create_buffer[DType.uint8](nx * 4)
-    var dxv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
+    var dx_buf = ctx.enqueue_create_buffer[DType.uint8](
+        nx * x.dtype().byte_size()
     )
 
     var grid = (nx + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_maxpool2d_dx_kernel_f32, _maxpool2d_dx_kernel_f32](
-        gv, xv, dxv,
-        N, Hi, Wi, C, Kh, Kw, Sh, Sw, Ho, Wo,
-        grid_dim=grid, block_dim=_BLOCK,
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var xv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var gv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl
+        )
+        var dxv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[
+            _maxpool2d_dx_kernel[DType.float32],
+            _maxpool2d_dx_kernel[DType.float32],
+        ](
+            gv, xv, dxv,
+            N, Hi, Wi, C, Kh, Kw, Sh, Sw, Ho, Wo,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    elif dt == DType.bfloat16:
+        var xv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var gv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
+        )
+        var dxv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        ctx.enqueue_function[
+            _maxpool2d_dx_kernel[DType.bfloat16],
+            _maxpool2d_dx_kernel[DType.bfloat16],
+        ](
+            gv, xv, dxv,
+            N, Hi, Wi, C, Kh, Kw, Sh, Sw, Ho, Wo,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    else:
+        var xv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var gv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float16](), g_rl
+        )
+        var dxv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        ctx.enqueue_function[
+            _maxpool2d_dx_kernel[DType.float16],
+            _maxpool2d_dx_kernel[DType.float16],
+        ](
+            gv, xv, dxv,
+            N, Hi, Wi, C, Kh, Kw, Sh, Sw, Ho, Wo,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
     ctx.synchronize()
 
     var dx_shape = List[Int]()
     dx_shape.append(N); dx_shape.append(Hi); dx_shape.append(Wi); dx_shape.append(C)
-    return Tensor(dx_buf^, dx_shape^, STDtype.F32)
+    return Tensor(dx_buf^, dx_shape^, x.dtype())
 
 
 def upsample_nearest2d_backward[
@@ -244,8 +286,6 @@ def upsample_nearest2d_backward[
     comptime Ho = in_h * scale
     comptime Wo = in_w * scale
 
-    if grad_out.dtype() != STDtype.F32:
-        raise Error("upsample_nearest2d_backward: grad_out must be F32")
     var gshape = grad_out.shape()
     if (
         len(gshape) != 4
@@ -256,31 +296,65 @@ def upsample_nearest2d_backward[
             "upsample_nearest2d_backward: grad_out shape must match"
             " [N,in_h*scale,in_w*scale,C]"
         )
-
     comptime nx = N * in_h * in_w * C
     comptime ng = N * Ho * Wo * C
 
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nx))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](ng))
 
-    var gv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-    var dx_buf = ctx.enqueue_create_buffer[DType.uint8](nx * 4)
-    var dxv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
+    var dx_buf = ctx.enqueue_create_buffer[DType.uint8](
+        nx * grad_out.dtype().byte_size()
     )
 
     var grid = (nx + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _upsample_nearest_dx_kernel_f32, _upsample_nearest_dx_kernel_f32
-    ](
-        gv, dxv,
-        N, in_h, in_w, C, scale, Ho, Wo,
-        grid_dim=grid, block_dim=_BLOCK,
-    )
+    var dt = grad_out.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var gv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl
+        )
+        var dxv = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[
+            _upsample_nearest_dx_kernel[DType.float32],
+            _upsample_nearest_dx_kernel[DType.float32],
+        ](
+            gv, dxv,
+            N, in_h, in_w, C, scale, Ho, Wo,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    elif dt == DType.bfloat16:
+        var gv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
+        )
+        var dxv = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        ctx.enqueue_function[
+            _upsample_nearest_dx_kernel[DType.bfloat16],
+            _upsample_nearest_dx_kernel[DType.bfloat16],
+        ](
+            gv, dxv,
+            N, in_h, in_w, C, scale, Ho, Wo,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    else:
+        var gv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float16](), g_rl
+        )
+        var dxv = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        ctx.enqueue_function[
+            _upsample_nearest_dx_kernel[DType.float16],
+            _upsample_nearest_dx_kernel[DType.float16],
+        ](
+            gv, dxv,
+            N, in_h, in_w, C, scale, Ho, Wo,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
     ctx.synchronize()
 
     var dx_shape = List[Int]()
     dx_shape.append(N); dx_shape.append(in_h); dx_shape.append(in_w); dx_shape.append(C)
-    return Tensor(dx_buf^, dx_shape^, STDtype.F32)
+    return Tensor(dx_buf^, dx_shape^, grad_out.dtype())

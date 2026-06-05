@@ -17,8 +17,10 @@
 #   output NHWC  = [N, H_out, W_out, C_out]
 # Our row-major Tensor buffers already match these layouts — no transpose.
 #
-# The kernel has NO bias. We add bias[C_out] (broadcast over N,H_out,W_out) with
-# a tiny follow-up elementwise kernel (F32 accumulation, cast to storage dtype).
+# The kernel has NO bias. We add bias[C_out] (broadcast over N,H_out,W_out)
+# with a tiny follow-up elementwise kernel. Bias stays in storage dtype at the
+# op boundary; each thread casts scalars to F32 for the add, then stores output
+# in x's storage dtype.
 # Shapes are compile-time params (static layouts the kernel needs).
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
@@ -58,7 +60,7 @@ def _bias_add_kernel_f32(
 
 def _bias_add_kernel_bf16(
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
-    bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     rows: Int,
     cols: Int,
 ):
@@ -69,13 +71,13 @@ def _bias_add_kernel_bf16(
         var v = rebind[Scalar[DType.bfloat16]](o[idx // cols, c]).cast[
             DType.float32
         ]()
-        v += rebind[Scalar[DType.float32]](bias[c])
+        v += rebind[Scalar[DType.bfloat16]](bias[c]).cast[DType.float32]()
         o[idx // cols, c] = rebind[o.element_type](v.cast[DType.bfloat16]())
 
 
 def _bias_add_kernel_f16(
     o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
-    bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    bias: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     rows: Int,
     cols: Int,
 ):
@@ -86,7 +88,7 @@ def _bias_add_kernel_f16(
         var v = rebind[Scalar[DType.float16]](o[idx // cols, c]).cast[
             DType.float32
         ]()
-        v += rebind[Scalar[DType.float32]](bias[c])
+        v += rebind[Scalar[DType.float16]](bias[c]).cast[DType.float32]()
         o[idx // cols, c] = rebind[o.element_type](v.cast[DType.float16]())
 
 
@@ -219,44 +221,45 @@ def conv2d[
 
     # Optional bias add (per-output-channel, broadcast over N,Ho,Wo).
     if bias:
-        var bvals = bias.value().to_host(ctx)
-        if len(bvals) != Cout:
-            raise Error("conv2d: bias length != Cout")
-        var bias_f32_buf = ctx.enqueue_create_buffer[DType.uint8](Cout * 4)
-        var bhost = ctx.enqueue_create_host_buffer[DType.uint8](Cout * 4)
-        var bp = bhost.unsafe_ptr().bitcast[Float32]()
-        for i in range(Cout):
-            bp[i] = bvals[i]
-        ctx.enqueue_copy(dst_buf=bias_f32_buf, src_buf=bhost)
-        ctx.synchronize()
+        if bias.value().dtype() != x.dtype():
+            raise Error("conv2d: bias dtype mismatch")
+        var bshape = bias.value().shape()
+        if len(bshape) != 1 or bshape[0] != Cout:
+            raise Error("conv2d: bias must be [Cout]")
 
         var rows = N * Ho * Wo
         var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, Cout))
         var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](Cout))
-        var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            bias_f32_buf.unsafe_ptr().bitcast[Float32](), b_rl
-        )
         var grid = (rows * Cout + _BLOCK - 1) // _BLOCK
         if dt == DType.float32:
             var O2 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
                 out_buf.unsafe_ptr().bitcast[Float32](), o_rl
             )
+            var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float32](), b_rl
+            )
             ctx.enqueue_function[_bias_add_kernel_f32, _bias_add_kernel_f32](
-                O2, bias_lt, rows, Cout, grid_dim=grid, block_dim=_BLOCK
+                O2, B, rows, Cout, grid_dim=grid, block_dim=_BLOCK
             )
         elif dt == DType.bfloat16:
             var O2 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
                 out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
             )
+            var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+            )
             ctx.enqueue_function[_bias_add_kernel_bf16, _bias_add_kernel_bf16](
-                O2, bias_lt, rows, Cout, grid_dim=grid, block_dim=_BLOCK
+                O2, B, rows, Cout, grid_dim=grid, block_dim=_BLOCK
             )
         else:
             var O2 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
                 out_buf.unsafe_ptr().bitcast[Float16](), o_rl
             )
+            var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float16](), b_rl
+            )
             ctx.enqueue_function[_bias_add_kernel_f16, _bias_add_kernel_f16](
-                O2, bias_lt, rows, Cout, grid_dim=grid, block_dim=_BLOCK
+                O2, B, rows, Cout, grid_dim=grid, block_dim=_BLOCK
             )
         ctx.synchronize()
 

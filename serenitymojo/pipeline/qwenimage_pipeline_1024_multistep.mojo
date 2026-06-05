@@ -200,7 +200,7 @@ def initial_latent_packed(ctx: DeviceContext) raises -> Tensor:
     nchw_shape.append(16)
     nchw_shape.append(LH)
     nchw_shape.append(LW)
-    var noise = randn(nchw_shape^, SEED, STDtype.F32, ctx)
+    var noise = randn(nchw_shape^, SEED, STDtype.BF16, ctx)
     return patchify(noise, PATCH, ctx)
 
 
@@ -215,17 +215,14 @@ def denoise(caps: QwenCaps, ctx: DeviceContext) raises -> Tensor:
     _stats("init_latent", x, ctx)
     for i in range(STEPS):
         print("  step", i + 1, "/", STEPS, "sigma", sigmas[i], "->", sigmas[i + 1])
-        var xb = cast_tensor(x, STDtype.BF16, ctx)
         var preds = model.forward_cfg_mixed_text[
             N_IMG, N_TXT_KEPT, S_POS, N_TXT_KEPT, S_NEG
         ](
-            xb, caps.pos, caps.neg, sigmas[i],
+            x, caps.pos, caps.neg, sigmas[i],
             caps.real_pos, caps.real_neg,
             FRAME, FH, FW, ctx,
         )
-        var pred_pos = cast_tensor(preds.pos, STDtype.F32, ctx)
-        var pred_neg = cast_tensor(preds.neg, STDtype.F32, ctx)
-        var pred = cfg_qwen(pred_pos, pred_neg, CFG, ctx)
+        var pred = cfg_qwen(preds.pos, preds.neg, CFG, ctx)
         x = sched.step(x, pred, i, ctx)
         if (i + 1) % 5 == 0 or i == 0 or i + 1 == STEPS:
             _stats("latent", x, ctx)

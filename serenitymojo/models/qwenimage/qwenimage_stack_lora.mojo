@@ -14,8 +14,9 @@
 #
 # 2026-06-04: Added qwenimage_stack_lora_forward_offload +
 #   qwenimage_stack_lora_backward_offload — TurboPlannedLoader block-swap offload
-#   (mirrors chroma_stack_lora.mojo). Per-block mod-MLP weights (img_mod.1 /
-#   txt_mod.1) are read from the streamed Block each iteration (cast F32 host).
+#   (mirrors chroma_stack_lora.mojo). Per-block projection and mod-MLP weights
+#   are read from the streamed Block each iteration and cast on device for the
+#   current Qwen block API, avoiding host F32 block-weight materialization.
 #   Frozen mod-MLP grads are discarded (LoRA-scope: only d_A/d_B collected).
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
@@ -43,6 +44,7 @@ from serenitymojo.models.qwenimage.qwenimage_block import (
     double_block_lora_forward, double_block_lora_backward,
     DoubleBlockLoraForward, DoubleBlockSaved,
     StreamWeights,
+    _clone_t,
 )
 from serenitymojo.models.qwenimage.qwenimage_stack import (
     QwenStackBase, QwenStackForward, QwenStackGrads,
@@ -278,10 +280,28 @@ struct QwenOffloadForward(Movable):
 
 # ── helpers for reading from Block ────────────────────────────────────────────
 
-def _block_f32_host(block: Block, key: String, ctx: DeviceContext) raises -> List[Float32]:
+def _empty_f32() -> List[Float32]:
+    return List[Float32]()
+
+
+def _empty_stream_weights(ctx: DeviceContext) raises -> StreamWeights:
+    return StreamWeights(
+        _empty_f32(), _empty_f32(), _empty_f32(),
+        _empty_f32(), _empty_f32(), _empty_f32(),
+        _empty_f32(), _empty_f32(),
+        _empty_f32(), _empty_f32(),
+        _empty_f32(), _empty_f32(),
+        _empty_f32(), _empty_f32(),
+        0, 0, 0, ctx,
+    )
+
+
+def _block_tensor_bf16(block: Block, key: String, ctx: DeviceContext) raises -> TArc:
     if not (key in block):
         raise Error(String("QwenImage offload block missing tensor: ") + key)
-    return cast_tensor(block[key][], STDtype.F32, ctx).to_host(ctx)
+    # Keep streamed checkpoint tensors in BF16 storage. Kernels cast internally
+    # for accumulation; do not materialize block weights as host List[Float32].
+    return TArc(cast_tensor(block[key][], STDtype.BF16, ctx, False))
 
 
 def _nonfinite_check(v: List[Float32]) -> Int:
@@ -321,23 +341,22 @@ def _stream_weights_from_block_offload(
         nqp = ".attn.norm_added_q"
         nkp = ".attn.norm_added_k"
         mlp = ".txt_mlp"
-    return StreamWeights(
-        _block_f32_host(block, bp + qp + ".weight", ctx),
-        _block_f32_host(block, bp + kp + ".weight", ctx),
-        _block_f32_host(block, bp + vp + ".weight", ctx),
-        _block_f32_host(block, bp + qp + ".bias", ctx),
-        _block_f32_host(block, bp + kp + ".bias", ctx),
-        _block_f32_host(block, bp + vp + ".bias", ctx),
-        _block_f32_host(block, bp + op + ".weight", ctx),
-        _block_f32_host(block, bp + op + ".bias", ctx),
-        _block_f32_host(block, bp + mlp + ".net.0.proj.weight", ctx),
-        _block_f32_host(block, bp + mlp + ".net.0.proj.bias", ctx),
-        _block_f32_host(block, bp + mlp + ".net.2.weight", ctx),
-        _block_f32_host(block, bp + mlp + ".net.2.bias", ctx),
-        _block_f32_host(block, bp + nqp + ".weight", ctx),
-        _block_f32_host(block, bp + nkp + ".weight", ctx),
-        D, F, Dh, ctx,
-    )
+    var w = _empty_stream_weights(ctx)
+    w.wq = _block_tensor_bf16(block, bp + qp + ".weight", ctx)
+    w.wk = _block_tensor_bf16(block, bp + kp + ".weight", ctx)
+    w.wv = _block_tensor_bf16(block, bp + vp + ".weight", ctx)
+    w.bq = _block_tensor_bf16(block, bp + qp + ".bias", ctx)
+    w.bk = _block_tensor_bf16(block, bp + kp + ".bias", ctx)
+    w.bv = _block_tensor_bf16(block, bp + vp + ".bias", ctx)
+    w.wout = _block_tensor_bf16(block, bp + op + ".weight", ctx)
+    w.bout = _block_tensor_bf16(block, bp + op + ".bias", ctx)
+    w.wup = _block_tensor_bf16(block, bp + mlp + ".net.0.proj.weight", ctx)
+    w.bup = _block_tensor_bf16(block, bp + mlp + ".net.0.proj.bias", ctx)
+    w.wdn = _block_tensor_bf16(block, bp + mlp + ".net.2.weight", ctx)
+    w.bdn = _block_tensor_bf16(block, bp + mlp + ".net.2.bias", ctx)
+    w.q_norm = _block_tensor_bf16(block, bp + nqp + ".weight", ctx)
+    w.k_norm = _block_tensor_bf16(block, bp + nkp + ".weight", ctx)
+    return w^
 
 
 def _double_block_weights_from_block(
@@ -359,15 +378,14 @@ def _modvecs_from_block(
         mk = ".img_mod.1"
     else:
         mk = ".txt_mod.1"
-    var mw = _block_f32_host(block, bp + mk + ".weight", ctx)  # [6D, D]
-    var mb = _block_f32_host(block, bp + mk + ".bias", ctx)    # [6D]
-    var temb = Tensor.from_host(temb_h.copy(), [1, D], STDtype.F32, ctx)
+    var mw = _block_tensor_bf16(block, bp + mk + ".weight", ctx)  # [6D, D]
+    var mb = _block_tensor_bf16(block, bp + mk + ".bias", ctx)    # [6D]
+    var temb = Tensor.from_host(temb_h.copy(), [1, D], STDtype.BF16, ctx)
     # temb_h is already silu-activated (caller pre-activates once)
-    var bt = Tensor.from_host(mb^, [6 * D], STDtype.F32, ctx)
     var mods = linear(
         temb,
-        Tensor.from_host(mw^, [6 * D, D], STDtype.F32, ctx),
-        Optional[Tensor](bt^), ctx,
+        mw[],
+        Optional[Tensor](_clone_t(mb[], ctx)), ctx,
     ).to_host(ctx)   # [1, 6D]
     # chunk order: shift1, scale1, gate1, shift2, scale2, gate2
     var out = List[List[Float32]]()
@@ -389,14 +407,14 @@ def _modvecs_from_block(
 # function takes the temb and the loaded norm_out weights.
 def _compute_final_modvecs(
     silu_temb_h: List[Float32],
-    norm_out_w: List[Float32], norm_out_b: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
     D: Int, ctx: DeviceContext,
 ) raises -> List[List[Float32]]:
-    var temb = Tensor.from_host(silu_temb_h.copy(), [1, D], STDtype.F32, ctx)
-    var bt = Tensor.from_host(norm_out_b.copy(), [2 * D], STDtype.F32, ctx)
+    var temb = Tensor.from_host(silu_temb_h.copy(), [1, D], STDtype.BF16, ctx)
+    var bt = Tensor.from_host_bf16(norm_out_b.copy(), [2 * D], ctx)
     var fmods = linear(
         temb,
-        Tensor.from_host(norm_out_w.copy(), [2 * D, D], STDtype.F32, ctx),
+        Tensor.from_host_bf16(norm_out_w.copy(), [2 * D, D], ctx),
         Optional[Tensor](bt^), ctx,
     ).to_host(ctx)   # [1, 2D]
     var fscale = List[Float32]()
@@ -414,19 +432,19 @@ def _compute_final_modvecs(
 # Extended from QwenStackBase to carry the norm_out linear for final modvec.
 struct QwenOffloadBase(Movable):
     var stack: QwenStackBase
-    var norm_out_w: List[Float32]    # [2D, D]  norm_out.linear.weight
-    var norm_out_b: List[Float32]    # [2D]     norm_out.linear.bias
-    var te_lin1_w: List[Float32]     # [D, timestep_dim]  timestep MLP linear_1
-    var te_lin1_b: List[Float32]     # [D]
-    var te_lin2_w: List[Float32]     # [D, D]   timestep MLP linear_2
-    var te_lin2_b: List[Float32]     # [D]
+    var norm_out_w: List[BFloat16]   # [2D, D]  norm_out.linear.weight
+    var norm_out_b: List[BFloat16]   # [2D]     norm_out.linear.bias
+    var te_lin1_w: List[BFloat16]    # [D, timestep_dim]  timestep MLP linear_1
+    var te_lin1_b: List[BFloat16]    # [D]
+    var te_lin2_w: List[BFloat16]    # [D, D]   timestep MLP linear_2
+    var te_lin2_b: List[BFloat16]    # [D]
 
     def __init__(
         out self,
         var stack: QwenStackBase,
-        var norm_out_w: List[Float32], var norm_out_b: List[Float32],
-        var te_lin1_w: List[Float32], var te_lin1_b: List[Float32],
-        var te_lin2_w: List[Float32], var te_lin2_b: List[Float32],
+        var norm_out_w: List[BFloat16], var norm_out_b: List[BFloat16],
+        var te_lin1_w: List[BFloat16], var te_lin1_b: List[BFloat16],
+        var te_lin2_w: List[BFloat16], var te_lin2_b: List[BFloat16],
     ):
         self.stack = stack^
         self.norm_out_w = norm_out_w^
@@ -444,18 +462,18 @@ def compute_silu_temb(
     base: QwenOffloadBase, temb_sinusoidal_h: List[Float32],
     timestep_dim: Int, D: Int, ctx: DeviceContext,
 ) raises -> List[Float32]:
-    var t_emb = Tensor.from_host(temb_sinusoidal_h.copy(), [1, timestep_dim], STDtype.F32, ctx)
-    var b1 = Tensor.from_host(base.te_lin1_b.copy(), [D], STDtype.F32, ctx)
+    var t_emb = Tensor.from_host(temb_sinusoidal_h.copy(), [1, timestep_dim], STDtype.BF16, ctx)
+    var b1 = Tensor.from_host_bf16(base.te_lin1_b.copy(), [D], ctx)
     var h1 = linear(
         t_emb,
-        Tensor.from_host(base.te_lin1_w.copy(), [D, timestep_dim], STDtype.F32, ctx),
+        Tensor.from_host_bf16(base.te_lin1_w.copy(), [D, timestep_dim], ctx),
         Optional[Tensor](b1^), ctx,
     )
     var h1_silu = silu(h1, ctx)
-    var b2 = Tensor.from_host(base.te_lin2_b.copy(), [D], STDtype.F32, ctx)
+    var b2 = Tensor.from_host_bf16(base.te_lin2_b.copy(), [D], ctx)
     var temb_out = linear(
         h1_silu,
-        Tensor.from_host(base.te_lin2_w.copy(), [D, D], STDtype.F32, ctx),
+        Tensor.from_host_bf16(base.te_lin2_w.copy(), [D, D], ctx),
         Optional[Tensor](b2^), ctx,
     )
     # silu the output for use as per-block mod MLP input
@@ -479,7 +497,7 @@ def qwenimage_stack_lora_forward_offload[
     base: QwenOffloadBase,
     mut loader: TurboPlannedLoader, lora: QwenLoraSet,
     cos: List[Float32], sin: List[Float32],
-    norm_out_w: List[Float32], norm_out_b: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
     D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> QwenOffloadForward:
@@ -490,8 +508,8 @@ def qwenimage_stack_lora_forward_offload[
 
     loader.prefetch_with_ctx(0, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
 
     # input projections (frozen base)
     var img = _linear_b(img_tokens, base.stack.img_in_w[], base.stack.img_in_b[], N_IMG, in_ch, ctx)
@@ -527,24 +545,24 @@ def qwenimage_stack_lora_forward_offload[
     var final_scale = final_mods[0].copy()
     var final_shift = final_mods[1].copy()
 
-    var img_t = Tensor.from_host(img.copy(), [N_IMG, D], STDtype.F32, ctx)
+    var img_t = Tensor.from_host(img.copy(), [N_IMG, D], STDtype.BF16, ctx)
     var ln_img_out_t = layer_norm(
         img_t,
-        Tensor.from_host(_qstack_ones(D), [D], STDtype.F32, ctx),
-        Tensor.from_host(_qstack_zeros(D), [D], STDtype.F32, ctx),
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        Tensor.from_host(_qstack_zeros(D), [D], STDtype.BF16, ctx),
         eps, ctx,
     )
     var ln_img_out_h = ln_img_out_t.to_host(ctx)
     var normed = modulate(
-        Tensor.from_host(ln_img_out_h.copy(), [N_IMG, D], STDtype.F32, ctx),
-        Tensor.from_host(final_scale.copy(), [D], STDtype.F32, ctx),
-        Tensor.from_host(final_shift.copy(), [D], STDtype.F32, ctx),
+        Tensor.from_host(ln_img_out_h.copy(), [N_IMG, D], STDtype.BF16, ctx),
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift.copy(), [D], STDtype.BF16, ctx),
         ctx,
     ).to_host(ctx)
     var out = _linear_b(normed, base.stack.proj_out_w[], base.stack.proj_out_b[], N_IMG, D, ctx)
 
-    var img_arc = ArcPointer[Tensor](Tensor.from_host(img^, [N_IMG, D], STDtype.F32, ctx))
-    var ln_arc = ArcPointer[Tensor](Tensor.from_host(ln_img_out_h^, [N_IMG, D], STDtype.F32, ctx))
+    var img_arc = ArcPointer[Tensor](Tensor.from_host(img^, [N_IMG, D], STDtype.BF16, ctx))
+    var ln_arc = ArcPointer[Tensor](Tensor.from_host(ln_img_out_h^, [N_IMG, D], STDtype.BF16, ctx))
 
     return QwenOffloadForward(
         out^, dbl_img_in^, dbl_txt_in^, dbl_saved^,
@@ -566,7 +584,7 @@ def qwenimage_stack_lora_backward_offload[
     base: QwenOffloadBase,
     mut loader: TurboPlannedLoader, lora: QwenLoraSet,
     cos: List[Float32], sin: List[Float32],
-    norm_out_w: List[Float32], norm_out_b: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
     saved: QwenOffloadForward,
     D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
     ctx: DeviceContext,
@@ -582,8 +600,8 @@ def qwenimage_stack_lora_backward_offload[
     if loader.block_count() > 0:
         loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
 
     # flat grad accumulators (one entry per adapter)
     var d_a_flat = List[List[Float32]]()
@@ -599,31 +617,31 @@ def qwenimage_stack_lora_backward_offload[
 
     var normed = modulate(
         saved.ln_img_out[],
-        Tensor.from_host(final_scale.copy(), [D], STDtype.F32, ctx),
-        Tensor.from_host(final_shift.copy(), [D], STDtype.F32, ctx),
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift.copy(), [D], STDtype.BF16, ctx),
         ctx,
     ).to_host(ctx)
 
     var lbf = linear_backward(
-        Tensor.from_host(d_out, [N_IMG, out_ch], STDtype.F32, ctx),
-        Tensor.from_host(normed, [N_IMG, D], STDtype.F32, ctx),
+        Tensor.from_host(d_out, [N_IMG, out_ch], STDtype.BF16, ctx),
+        Tensor.from_host(normed, [N_IMG, D], STDtype.BF16, ctx),
         base.stack.proj_out_w[],
         N_IMG, D, out_ch, ctx,
     )
     var d_normed = lbf.d_x.to_host(ctx)
 
     var mbf = modulate_backward(
-        Tensor.from_host(d_normed, [N_IMG, D], STDtype.F32, ctx),
+        Tensor.from_host(d_normed, [N_IMG, D], STDtype.BF16, ctx),
         saved.ln_img_out[],
-        Tensor.from_host(final_scale.copy(), [D], STDtype.F32, ctx),
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
         ctx,
     )
     var d_ln_img_out = mbf.d_x.to_host(ctx)
 
     var lnbf = layer_norm_backward(
-        Tensor.from_host(d_ln_img_out, [N_IMG, D], STDtype.F32, ctx),
+        Tensor.from_host(d_ln_img_out, [N_IMG, D], STDtype.BF16, ctx),
         saved.img_out[],
-        Tensor.from_host(_qstack_ones(D), [D], STDtype.F32, ctx),
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
         eps, ctx,
     )
     var d_img_out = lnbf.d_x.to_host(ctx)
@@ -688,15 +706,15 @@ def qwenimage_stack_lora_backward_offload[
 
     # input-projection backward (frozen; grads exercised but discarded)
     var lbi = linear_backward(
-        Tensor.from_host(d_img_out, [N_IMG, D], STDtype.F32, ctx),
-        Tensor.from_host(img_tokens, [N_IMG, in_ch], STDtype.F32, ctx),
+        Tensor.from_host(d_img_out, [N_IMG, D], STDtype.BF16, ctx),
+        Tensor.from_host(img_tokens, [N_IMG, in_ch], STDtype.BF16, ctx),
         base.stack.img_in_w[], N_IMG, in_ch, D, ctx,
     )
     var d_img_tokens = lbi.d_x.to_host(ctx)
 
     var lbt = linear_backward(
-        Tensor.from_host(d_txt_out, [N_TXT, D], STDtype.F32, ctx),
-        Tensor.from_host(txt_tokens, [N_TXT, txt_ch], STDtype.F32, ctx),
+        Tensor.from_host(d_txt_out, [N_TXT, D], STDtype.BF16, ctx),
+        Tensor.from_host(txt_tokens, [N_TXT, txt_ch], STDtype.BF16, ctx),
         base.stack.txt_in_w[], N_TXT, txt_ch, D, ctx,
     )
     var d_txt_tokens = lbt.d_x.to_host(ctx)

@@ -40,8 +40,6 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.training.lokr_adapter import (
     LoKrAdapter,
     new_lokr_adapter,
-    lokr_factorization,
-    lokr_resolve_w2,
     lokr_delta_weight,
     lokr_forward,
     lokr_backward,
@@ -80,6 +78,24 @@ def _max_abs_diff(a: List[Float32], b: List[Float32]) raises -> Float32:
     var mx = Float32(0.0)
     for i in range(len(a)):
         var d = abs(a[i] - b[i])
+        if d > mx:
+            mx = d
+    return mx
+
+
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
+def _max_abs_diff_bf16(a: List[BFloat16], b: List[BFloat16]) raises -> Float32:
+    if len(a) != len(b):
+        raise Error("max_abs_diff_bf16: len mismatch " + String(len(a)) + " != " + String(len(b)))
+    var mx = Float32(0.0)
+    for i in range(len(a)):
+        var d = abs(a[i].cast[DType.float32]() - b[i].cast[DType.float32]())
         if d > mx:
             mx = d
     return mx
@@ -277,16 +293,16 @@ def _run_config(label: String, in_f: Int, out_f: Int, rank: Int, factor: Int,
     var drive = Float32(1.0) if lo.w1_factored else Float32(0.04)
     if lo.w2_factored:
         for i in range(len(lo.w2b)):
-            lo.w2b[i] = drive * Float32((i % 5) + 1)
+            lo.w2b[i] = BFloat16(drive * Float32((i % 5) + 1))
     else:
         for i in range(len(lo.w2)):
-            lo.w2[i] = drive * Float32((i % 5) + 1)
+            lo.w2[i] = BFloat16(drive * Float32((i % 5) + 1))
     # Amplify the (kaiming-init) W1 factor legs in the factored config too.
     if lo.w1_factored:
         for i in range(len(lo.w1a)):
-            lo.w1a[i] = lo.w1a[i] * Float32(10.0)
+            lo.w1a[i] = BFloat16(lo.w1a[i].cast[DType.float32]() * Float32(10.0))
         for i in range(len(lo.w1b)):
-            lo.w1b[i] = lo.w1b[i] * Float32(10.0)
+            lo.w1b[i] = BFloat16(lo.w1b[i].cast[DType.float32]() * Float32(10.0))
 
     # deterministic input x [M,IN]
     var xscale = Float32(1.0) if lo.w1_factored else Float32(0.1)
@@ -295,17 +311,16 @@ def _run_config(label: String, in_f: Int, out_f: Int, rank: Int, factor: Int,
         x.append(xscale * Float32(((i * 3) % 11) - 5))
 
     # ── (a) delta + forward parity vs independent oracle ──
-    var w2d = lokr_resolve_w2(lo)
     var w2d_oracle: List[Float32]
     if lo.w2_factored:
-        w2d_oracle = _oracle_w2_factored(lo.w2a, lo.w2b, OK, R, INn)
+        w2d_oracle = _oracle_w2_factored(_bf16_to_f32_list(lo.w2a), _bf16_to_f32_list(lo.w2b), OK, R, INn)
     else:
-        w2d_oracle = lo.w2.copy()
+        w2d_oracle = _bf16_to_f32_list(lo.w2)
     var w1d_oracle: List[Float32]
     if lo.w1_factored:
-        w1d_oracle = _oracle_w1_factored(lo.w1a, lo.w1b, OL, R, IM)
+        w1d_oracle = _oracle_w1_factored(_bf16_to_f32_list(lo.w1a), _bf16_to_f32_list(lo.w1b), OL, R, IM)
     else:
-        w1d_oracle = lo.w1.copy()
+        w1d_oracle = _bf16_to_f32_list(lo.w1)
     var dw_impl = lokr_delta_weight(lo)
     var dw_oracle = _oracle_delta(w1d_oracle, w2d_oracle, OL, OK, IM, INn, lo.scale)
     var dw_mx = _max_abs_diff(dw_impl, dw_oracle)
@@ -336,6 +351,12 @@ def _run_config(label: String, in_f: Int, out_f: Int, rank: Int, factor: Int,
     # 1e-3 step) so near-zero FD components don't trip a false positive.
     var tol_rel = Float32(2.0e-2)
     var rel_floor = Float32(1.0e-4)
+    var w1_h = _bf16_to_f32_list(lo.w1)
+    var w1a_h = _bf16_to_f32_list(lo.w1a)
+    var w1b_h = _bf16_to_f32_list(lo.w1b)
+    var w2_h = _bf16_to_f32_list(lo.w2)
+    var w2a_h = _bf16_to_f32_list(lo.w2a)
+    var w2b_h = _bf16_to_f32_list(lo.w2b)
 
     if lo.w1_factored:
         # PARITY-BITROT DEMO: corrupt analytic d_w1a (×1.5) — the FD parity gate
@@ -344,8 +365,8 @@ def _run_config(label: String, in_f: Int, out_f: Int, rank: Int, factor: Int,
             for _bz in range(len(g.d_w1a)):
                 g.d_w1a[_bz] = g.d_w1a[_bz] * Float32(1.5)
             print("INFO: LOKR_BREAK_BWD set — scaling analytic d_w1a by 1.5 to prove the FD gate catches it")
-        var fd_w1a = _fd_grad(4, lo.w1, lo.w1a, lo.w1b, True, lo.w2, lo.w2a, lo.w2b, lo.w2_factored, x, OL, OK, IM, INn, R, M, lo.scale, h)
-        var fd_w1b = _fd_grad(5, lo.w1, lo.w1a, lo.w1b, True, lo.w2, lo.w2a, lo.w2b, lo.w2_factored, x, OL, OK, IM, INn, R, M, lo.scale, h)
+        var fd_w1a = _fd_grad(4, w1_h, w1a_h, w1b_h, True, w2_h, w2a_h, w2b_h, lo.w2_factored, x, OL, OK, IM, INn, R, M, lo.scale, h)
+        var fd_w1b = _fd_grad(5, w1_h, w1a_h, w1b_h, True, w2_h, w2a_h, w2b_h, lo.w2_factored, x, OL, OK, IM, INn, R, M, lo.scale, h)
         var e_w1a = _max_abs_diff(g.d_w1a, fd_w1a)
         var er_w1a = _max_rel_diff(g.d_w1a, fd_w1a, rel_floor)
         var e_w1b = _max_abs_diff(g.d_w1b, fd_w1b)
@@ -359,7 +380,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, rank: Int, factor: Int,
         else:
             print("PASS (a-bwd w1b): max|Δ| vs FD=", e_w1b, " rel=", er_w1b)
     else:
-        var fd_w1 = _fd_grad(0, lo.w1, lo.w1a, lo.w1b, False, lo.w2, lo.w2a, lo.w2b, lo.w2_factored, x, OL, OK, IM, INn, R, M, lo.scale, h)
+        var fd_w1 = _fd_grad(0, w1_h, w1a_h, w1b_h, False, w2_h, w2a_h, w2b_h, lo.w2_factored, x, OL, OK, IM, INn, R, M, lo.scale, h)
         var e_w1 = _max_abs_diff(g.d_w1, fd_w1)
         var er_w1 = _max_rel_diff(g.d_w1, fd_w1, rel_floor)
         if e_w1 > tol_fd or er_w1 > tol_rel:
@@ -368,8 +389,8 @@ def _run_config(label: String, in_f: Int, out_f: Int, rank: Int, factor: Int,
             print("PASS (a-bwd w1): max|Δ| vs FD=", e_w1, " rel=", er_w1)
 
     if lo.w2_factored:
-        var fd_w2a = _fd_grad(2, lo.w1, lo.w1a, lo.w1b, lo.w1_factored, lo.w2, lo.w2a, lo.w2b, True, x, OL, OK, IM, INn, R, M, lo.scale, h)
-        var fd_w2b = _fd_grad(3, lo.w1, lo.w1a, lo.w1b, lo.w1_factored, lo.w2, lo.w2a, lo.w2b, True, x, OL, OK, IM, INn, R, M, lo.scale, h)
+        var fd_w2a = _fd_grad(2, w1_h, w1a_h, w1b_h, lo.w1_factored, w2_h, w2a_h, w2b_h, True, x, OL, OK, IM, INn, R, M, lo.scale, h)
+        var fd_w2b = _fd_grad(3, w1_h, w1a_h, w1b_h, lo.w1_factored, w2_h, w2a_h, w2b_h, True, x, OL, OK, IM, INn, R, M, lo.scale, h)
         var e_w2a = _max_abs_diff(g.d_w2a, fd_w2a)
         var er_w2a = _max_rel_diff(g.d_w2a, fd_w2a, rel_floor)
         var e_w2b = _max_abs_diff(g.d_w2b, fd_w2b)
@@ -383,7 +404,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, rank: Int, factor: Int,
         else:
             print("PASS (a-bwd w2b): max|Δ| vs FD=", e_w2b, " rel=", er_w2b)
     else:
-        var fd_w2 = _fd_grad(1, lo.w1, lo.w1a, lo.w1b, lo.w1_factored, lo.w2, lo.w2a, lo.w2b, False, x, OL, OK, IM, INn, R, M, lo.scale, h)
+        var fd_w2 = _fd_grad(1, w1_h, w1a_h, w1b_h, lo.w1_factored, w2_h, w2a_h, w2b_h, False, x, OL, OK, IM, INn, R, M, lo.scale, h)
         var e_w2 = _max_abs_diff(g.d_w2, fd_w2)
         var er_w2 = _max_rel_diff(g.d_w2, fd_w2, rel_floor)
         if e_w2 > tol_fd or er_w2 > tol_rel:
@@ -477,27 +498,27 @@ def _run_config(label: String, in_f: Int, out_f: Int, rank: Int, factor: Int,
         print("PASS (c): alpha round-trip =", rb.alpha)
     # W1 byte-exact (factored: w1a/w1b ; full: w1).
     if lo.w1_factored:
-        var a1_mx = _max_abs_diff(rb.w1a, lo.w1a)
-        var b1_mx = _max_abs_diff(rb.w1b, lo.w1b)
+        var a1_mx = _max_abs_diff_bf16(rb.w1a, lo.w1a)
+        var b1_mx = _max_abs_diff_bf16(rb.w1b, lo.w1b)
         if a1_mx > Float32(1.0e-6) or b1_mx > Float32(1.0e-6):
             print("FAIL (c): w1a/w1b not byte-exact, w1a Δ=", a1_mx, " w1b Δ=", b1_mx); ok = False
         else:
             print("PASS (c): lokr_w1_a/w1_b values round-trip byte-exact")
     else:
-        var w1_mx = _max_abs_diff(rb.w1, lo.w1)
+        var w1_mx = _max_abs_diff_bf16(rb.w1, lo.w1)
         if w1_mx > Float32(1.0e-6):
             print("FAIL (c): w1 not byte-exact, Δ=", w1_mx); ok = False
         else:
             print("PASS (c): lokr_w1 values round-trip byte-exact")
     if lo.w2_factored:
-        var a_mx = _max_abs_diff(rb.w2a, lo.w2a)
-        var b_mx = _max_abs_diff(rb.w2b, lo.w2b)
+        var a_mx = _max_abs_diff_bf16(rb.w2a, lo.w2a)
+        var b_mx = _max_abs_diff_bf16(rb.w2b, lo.w2b)
         if a_mx > Float32(1.0e-6) or b_mx > Float32(1.0e-6):
             print("FAIL (c): w2a/w2b not byte-exact, w2a Δ=", a_mx, " w2b Δ=", b_mx); ok = False
         else:
             print("PASS (c): lokr_w1/w2_a/w2_b values round-trip byte-exact")
     else:
-        var w2_mx = _max_abs_diff(rb.w2, lo.w2)
+        var w2_mx = _max_abs_diff_bf16(rb.w2, lo.w2)
         if w2_mx > Float32(1.0e-6):
             print("FAIL (c): w2 not byte-exact, Δ=", w2_mx); ok = False
         else:

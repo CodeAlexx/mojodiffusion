@@ -16,8 +16,8 @@
 #       angle[t, off_a + i] = pos[t, a] * theta^(-i / half_a),   i in [0, half_a)
 #   where `half_a = axes_dims[a] / 2`, `off_a = sum_{b<a} half_b`, and the total
 #   width is `half = sum_a half_a == head_dim/2`. cos/sin tables are
-#   `[rows, half]`, F32 (parity isolates op math from BF16 quantization; cast at
-#   the apply site if BF16 q/k are wanted).
+#   `[rows, half]` in the caller-requested storage dtype; trig math stays F32
+#   inside the kernel.
 #
 #   inv_freq convention: `theta^(-i/half_a)`. This equals zimage's
 #   `theta^(-2i/axis_dim)` (since half_a = axis_dim/2) and wan22/cosmos's
@@ -32,7 +32,7 @@
 # blocks to find which axis owns column i and the local index within it. num_axes
 # is bounded (<= _MAX_AXES); axis dims are passed as a small device buffer.
 #
-# Mojo 1.0.0b1, NVIDIA GPU. Compute F32; outputs F32.
+# Mojo 1.0.0b1, NVIDIA GPU. Compute F32; output storage is explicit.
 
 from std.math import exp, log, cos, sin
 from std.gpu.host import DeviceContext, DeviceBuffer
@@ -50,11 +50,11 @@ comptime _BLOCK = 256
 comptime _MAX_AXES = 4  # frame/height/width (+ optional 4th); bounded.
 
 
-def _multiaxis_rope_kernel_f32(
+def _multiaxis_rope_kernel[out_dtype: DType](
     positions: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [rows*num_axes]
     axes_half: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],    # [num_axes]
-    cos_t: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],      # [rows, half]
-    sin_t: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],      # [rows, half]
+    cos_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],          # [rows, half]
+    sin_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],          # [rows, half]
     rows: Int,
     half: Int,         # sum of axes_half == head_dim/2
     num_axes: Int,
@@ -85,8 +85,8 @@ def _multiaxis_rope_kernel_f32(
     # inv_freq = theta^(-local_i / ha)
     var inv_freq = exp(-log(theta) * (Float32(local_i) / Float32(ha)))
     var angle = pos * inv_freq
-    cos_t[row, col] = rebind[cos_t.element_type](cos(angle))
-    sin_t[row, col] = rebind[sin_t.element_type](sin(angle))
+    cos_t[row, col] = rebind[cos_t.element_type](cos(angle).cast[out_dtype]())
+    sin_t[row, col] = rebind[sin_t.element_type](sin(angle).cast[out_dtype]())
 
 
 def build_multiaxis_rope_tables(
@@ -94,6 +94,7 @@ def build_multiaxis_rope_tables(
     axes_dims: List[Int],
     theta: Float32,
     ctx: DeviceContext,
+    out_dtype: STDtype,
 ) raises -> Tuple[Tensor, Tensor]:
     """Multi-axis (3D) RoPE cos/sin tables for `rope_interleaved`/`rope_halfsplit`.
 
@@ -109,7 +110,7 @@ def build_multiaxis_rope_tables(
                a single scalar theta — sufficient for default NTK ratios (1.0),
                but cannot express cosmos per-axis NTK extrapolation variants
                (e.g. _2b_image); those need a per-axis theta extension.
-    returns (cos, sin), each [rows, half] F32. Feed straight into
+    returns (cos, sin), each [rows, half] out_dtype. Feed straight into
             ops/rope.rope_interleaved (complex/pair layout) or rope_halfsplit
             (GPT-NeoX half-split) with q/k of shape [..., head_dim].
     CALLER RESPONSIBILITY: build `positions` by decomposing each flat token index
@@ -146,8 +147,12 @@ def build_multiaxis_rope_tables(
     var axes_buf = ctx.enqueue_create_buffer[DType.uint8](num_axes * 4)
     ctx.enqueue_copy(dst_buf=axes_buf, src_buf=axes_host)
 
-    var cos_buf = ctx.enqueue_create_buffer[DType.uint8](rows * half * 4)
-    var sin_buf = ctx.enqueue_create_buffer[DType.uint8](rows * half * 4)
+    var cos_buf = ctx.enqueue_create_buffer[DType.uint8](
+        rows * half * out_dtype.byte_size()
+    )
+    var sin_buf = ctx.enqueue_create_buffer[DType.uint8](
+        rows * half * out_dtype.byte_size()
+    )
 
     var p_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](pn))
     var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](num_axes))
@@ -159,18 +164,42 @@ def build_multiaxis_rope_tables(
     var A = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
         axes_buf.unsafe_ptr().bitcast[Int32](), a_rl
     )
-    var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        cos_buf.unsafe_ptr().bitcast[Float32](), f_rl
-    )
-    var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        sin_buf.unsafe_ptr().bitcast[Float32](), f_rl
-    )
-
     var total = rows * half
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _multiaxis_rope_kernel_f32, _multiaxis_rope_kernel_f32
-    ](P, A, C, S, rows, half, num_axes, theta, grid_dim=grid, block_dim=_BLOCK)
+    var odt = out_dtype.to_mojo_dtype()
+    if odt == DType.float32:
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        ctx.enqueue_function[
+            _multiaxis_rope_kernel[DType.float32],
+            _multiaxis_rope_kernel[DType.float32],
+        ](P, A, C, S, rows, half, num_axes, theta, grid_dim=grid, block_dim=_BLOCK)
+    elif odt == DType.bfloat16:
+        var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+        )
+        var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+        )
+        ctx.enqueue_function[
+            _multiaxis_rope_kernel[DType.bfloat16],
+            _multiaxis_rope_kernel[DType.bfloat16],
+        ](P, A, C, S, rows, half, num_axes, theta, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[Float16](), f_rl
+        )
+        var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[Float16](), f_rl
+        )
+        ctx.enqueue_function[
+            _multiaxis_rope_kernel[DType.float16],
+            _multiaxis_rope_kernel[DType.float16],
+        ](P, A, C, S, rows, half, num_axes, theta, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
 
     var cos_shape = List[Int]()
@@ -179,8 +208,8 @@ def build_multiaxis_rope_tables(
     var sin_shape = List[Int]()
     sin_shape.append(rows)
     sin_shape.append(half)
-    var cos_out = Tensor(cos_buf^, cos_shape^, STDtype.F32)
-    var sin_out = Tensor(sin_buf^, sin_shape^, STDtype.F32)
+    var cos_out = Tensor(cos_buf^, cos_shape^, out_dtype)
+    var sin_out = Tensor(sin_buf^, sin_shape^, out_dtype)
     return (cos_out^, sin_out^)
 
 
@@ -197,12 +226,12 @@ def build_multiaxis_rope_tables(
 # VideoRopePosition3DEmb.generate_embeddings (minimal_v4_dit.py:730-795).
 
 
-def _multiaxis_rope_kernel_per_axis_f32(
+def _multiaxis_rope_kernel_per_axis[out_dtype: DType](
     positions: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [rows*num_axes]
     axes_half: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],    # [num_axes]
     axes_theta: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], # [num_axes]
-    cos_t: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],      # [rows, half]
-    sin_t: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],      # [rows, half]
+    cos_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],          # [rows, half]
+    sin_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],          # [rows, half]
     rows: Int,
     half: Int,
     num_axes: Int,
@@ -232,8 +261,8 @@ def _multiaxis_rope_kernel_per_axis_f32(
     # inv_freq = theta_a^(-local_i / ha)
     var inv_freq = exp(-log(theta_a) * (Float32(local_i) / Float32(ha)))
     var angle = pos * inv_freq
-    cos_t[row, col] = rebind[cos_t.element_type](cos(angle))
-    sin_t[row, col] = rebind[sin_t.element_type](sin(angle))
+    cos_t[row, col] = rebind[cos_t.element_type](cos(angle).cast[out_dtype]())
+    sin_t[row, col] = rebind[sin_t.element_type](sin(angle).cast[out_dtype]())
 
 
 def build_multiaxis_rope_tables_per_axis(
@@ -241,6 +270,7 @@ def build_multiaxis_rope_tables_per_axis(
     axes_dims: List[Int],
     thetas: List[Float32],
     ctx: DeviceContext,
+    out_dtype: STDtype,
 ) raises -> Tuple[Tensor, Tensor]:
     """Per-axis-theta variant of build_multiaxis_rope_tables (cosmos NTK).
 
@@ -248,7 +278,8 @@ def build_multiaxis_rope_tables_per_axis(
     carries its OWN theta `thetas[a]` (the NTK-scaled base, already computed by
     the caller as 10000 * ratio^(dim_a/(dim_a-2))). len(thetas) must equal
     len(axes_dims). When all thetas are equal this reduces exactly to the scalar
-    builder. Feeds rope_halfsplit (cosmos GPT-NeoX) or rope_interleaved.
+    builder. Feeds rope_halfsplit (cosmos GPT-NeoX) or rope_interleaved. Output
+    storage is out_dtype; trig math remains F32 inside the kernel.
     """
     var num_axes = len(axes_dims)
     if num_axes < 1 or num_axes > _MAX_AXES:
@@ -288,8 +319,12 @@ def build_multiaxis_rope_tables_per_axis(
     var theta_buf = ctx.enqueue_create_buffer[DType.uint8](num_axes * 4)
     ctx.enqueue_copy(dst_buf=theta_buf, src_buf=theta_host)
 
-    var cos_buf = ctx.enqueue_create_buffer[DType.uint8](rows * half * 4)
-    var sin_buf = ctx.enqueue_create_buffer[DType.uint8](rows * half * 4)
+    var cos_buf = ctx.enqueue_create_buffer[DType.uint8](
+        rows * half * out_dtype.byte_size()
+    )
+    var sin_buf = ctx.enqueue_create_buffer[DType.uint8](
+        rows * half * out_dtype.byte_size()
+    )
 
     var p_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](pn))
     var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](num_axes))
@@ -304,18 +339,42 @@ def build_multiaxis_rope_tables_per_axis(
     var TH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         theta_buf.unsafe_ptr().bitcast[Float32](), a_rl
     )
-    var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        cos_buf.unsafe_ptr().bitcast[Float32](), f_rl
-    )
-    var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        sin_buf.unsafe_ptr().bitcast[Float32](), f_rl
-    )
-
     var total = rows * half
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _multiaxis_rope_kernel_per_axis_f32, _multiaxis_rope_kernel_per_axis_f32
-    ](P, A, TH, C, S, rows, half, num_axes, grid_dim=grid, block_dim=_BLOCK)
+    var odt = out_dtype.to_mojo_dtype()
+    if odt == DType.float32:
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        ctx.enqueue_function[
+            _multiaxis_rope_kernel_per_axis[DType.float32],
+            _multiaxis_rope_kernel_per_axis[DType.float32],
+        ](P, A, TH, C, S, rows, half, num_axes, grid_dim=grid, block_dim=_BLOCK)
+    elif odt == DType.bfloat16:
+        var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+        )
+        var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+        )
+        ctx.enqueue_function[
+            _multiaxis_rope_kernel_per_axis[DType.bfloat16],
+            _multiaxis_rope_kernel_per_axis[DType.bfloat16],
+        ](P, A, TH, C, S, rows, half, num_axes, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[Float16](), f_rl
+        )
+        var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[Float16](), f_rl
+        )
+        ctx.enqueue_function[
+            _multiaxis_rope_kernel_per_axis[DType.float16],
+            _multiaxis_rope_kernel_per_axis[DType.float16],
+        ](P, A, TH, C, S, rows, half, num_axes, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
 
     var cos_shape = List[Int]()
@@ -324,6 +383,6 @@ def build_multiaxis_rope_tables_per_axis(
     var sin_shape = List[Int]()
     sin_shape.append(rows)
     sin_shape.append(half)
-    var cos_out = Tensor(cos_buf^, cos_shape^, STDtype.F32)
-    var sin_out = Tensor(sin_buf^, sin_shape^, STDtype.F32)
+    var cos_out = Tensor(cos_buf^, cos_shape^, out_dtype)
+    var sin_out = Tensor(sin_buf^, sin_shape^, out_dtype)
     return (cos_out^, sin_out^)

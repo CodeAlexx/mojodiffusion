@@ -231,9 +231,10 @@ struct ErnieImageResident(Movable):
         keep the cos-first `timestep_embedding`. See skeptic finding
         `serenitymojo/parity/SKEPTIC_FINDINGS_ernie_block0_2026-05-28.md` (A2).
         """
-        var emb = timestep_embedding_sin_first(timestep, ERNIE_DIT_HIDDEN, ctx, 10000.0)
-        var emb_bf16 = cast_tensor(emb, self._w(String("time_embedding.linear_1.weight")).dtype(), ctx)
         ref w1 = self._w(String("time_embedding.linear_1.weight"))
+        var emb_bf16 = timestep_embedding_sin_first(
+            timestep, ERNIE_DIT_HIDDEN, ctx, 10000.0, w1.dtype()
+        )
         ref b1 = self._w(String("time_embedding.linear_1.bias"))
         var h = linear(emb_bf16, w1, Optional[Tensor](self._clone(b1, ctx)), ctx)
         h = silu(h, ctx)

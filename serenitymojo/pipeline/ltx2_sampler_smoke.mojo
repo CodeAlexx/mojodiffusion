@@ -19,8 +19,8 @@
 #      out=[1.3,2.6,3.9,5.2].
 #   6. One LTX2Scheduler.step (final-step denoise path) sanity.
 #
-# *** CODE-ONLY: COMPILE-VERIFIED, NOT executed here. A later pass runs it on GPU
-# for the actual parity numbers. ***
+# Run:
+#   pixi run mojo run -I . serenitymojo/pipeline/ltx2_sampler_smoke.mojo
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -28,7 +28,7 @@ from std.gpu.host import DeviceContext
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.sampling.ltx2_sampling import (
+from serenitymojo.sampling import (
     LTX2Scheduler,
     build_ltx2_distilled_sigma_schedule,
     ltx2_distilled_sigmas,

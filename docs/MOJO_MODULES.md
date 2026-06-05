@@ -390,6 +390,12 @@ the forwards whose `conv2d`/`pool`/`upsample` backward partners live in
 offloaders (`offload/`) and samplers' schedule math but does not backprop
 through them.
 
+`sampling/ltx2_sampling.mojo` exposes the creator-fast LTX2 public surface
+through `serenitymojo.sampling`: `LTX2Scheduler`, distilled sigma tables, and
+`ltx2_creator_noiser_from_noise`. BF16 `LTX2Scheduler.step` uses the shared
+PyTorch-eager BF16 API so noiser/scheduler phase parity is not lost in fused
+tensor algebra.
+
 ---
 
 ## Forward op library (INFERENCE) — `ops/*.mojo` (non-`_backward`)
@@ -403,7 +409,18 @@ The forward kernels the backward partners pair with: `ops/attention.mojo`
 `ops/softmax.mojo`, `ops/cast.mojo`, `ops/embeddings.mojo`, `ops/layout.mojo`,
 `ops/moe.mojo`, `ops/fp8.mojo`, `ops/mxfp4.mojo`, `ops/snake.mojo`,
 `ops/pixelshuffle.mojo`, `ops/random.mojo`, `ops/unary.mojo`,
-`ops/activation1d.mojo`. Status: **INFERENCE** (each has a `*_smoke.mojo`).
+`ops/activation1d.mojo`, `ops/torch_bf16.mojo`. Status: **INFERENCE** (each has
+a `*_smoke.mojo` or an end-to-end parity gate).
+
+`ops/torch_bf16.mojo` is the cross-model PyTorch-eager BF16 numeric API:
+`torch_f32_to_bf16_rne`, `torch_bf16_eager_blend_with_f32_mask`,
+`torch_bf16_eager_velocity_from_x0`, and `torch_bf16_eager_add_scaled`.
+Import these through `from serenitymojo.ops import ...` for noiser/scheduler
+handoffs that must match PyTorch eager F32 temporaries before a BF16 storage
+boundary. The LTX2 creator phase gate also records raw transformer velocity at
+the first/last stage steps; noiser and Euler phase math are exact, while raw
+velocity vs x0-derived velocity is gated with the documented BF16 x0 round-trip
+tolerance. See `docs/MOJO_DIFFUSION_NUMERIC_API.md`.
 
 ---
 

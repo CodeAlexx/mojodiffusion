@@ -16,14 +16,13 @@
 #        (cast_tensor F32 master -> BF16; the master stays F32)
 #     2. caller runs its OWN BF16 forward + backward and obtains BF16 grads,
 #     3. caller hands those BF16 grads back: state.accumulate_grads(grads, ctx)
-#        (cast BF16 -> F32, sum into the F32 accumulators)
+#        (sum in F32 inside the elementwise kernel, store BF16 accumulators)
 #   after `micro_steps` micro-batches:
 #     4. state.apply_step(lr, ctx)   # mean-grad AdamW on the F32 masters
 #
 # The harness OWNS: F32 master weights, AdamW (m, v) device tensors + the 1-based
-# step counter `t`, and one F32 grad accumulator per param. It is the single
-# source of truth for trained weights + optimizer state, so checkpoint save/load
-# is a pure harness concern.
+# step counter `t`, and one BF16 grad accumulator per param. F32 remains only for
+# optimizer master state and the transient grad handed to AdamW.
 #
 # Move-only Tensor cannot be a bare List element (Mojo collections need
 # Copyable), so every per-param list is List[ArcPointer[Tensor]] — the SAME idiom
@@ -49,6 +48,7 @@ from std.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.tensor_algebra import add, mul_scalar, zeros_device
 from serenitymojo.training.optim import adamw_step
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.safetensors import SafeTensors
@@ -65,6 +65,10 @@ def _zeros_like_f32(t: Tensor, ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(z^, t.shape(), STDtype.F32, ctx)
 
 
+def _zeros_like_bf16(t: Tensor, ctx: DeviceContext) raises -> Tensor:
+    return zeros_device(t.shape(), STDtype.BF16, ctx)
+
+
 # ── fresh 1-D F32 tensor from a host list ────────────────────────────────────
 def _f32_1d(var values: List[Float32], n: Int, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
@@ -73,14 +77,14 @@ def _f32_1d(var values: List[Float32], n: Int, ctx: DeviceContext) raises -> Ten
 
 
 # ----------------------------------------------------------------------------
-# TrainState — the harness. F32 masters + AdamW (m,v) + F32 grad accumulators,
+# TrainState — the harness. F32 masters + AdamW (m,v) + BF16 grad accumulators,
 # all as List[ArcPointer[Tensor]] (move-only Tensor can't live in a List bare).
 # ----------------------------------------------------------------------------
 struct TrainState(Movable):
     var masters: List[ArcPointer[Tensor]]   # F32 master weights (source of truth)
     var m: List[ArcPointer[Tensor]]         # AdamW first moment per param (F32)
     var v: List[ArcPointer[Tensor]]         # AdamW second moment per param (F32)
-    var accum: List[ArcPointer[Tensor]]     # F32 grad accumulator per param
+    var accum: List[ArcPointer[Tensor]]     # BF16 grad accumulator per param
     var t: Int                              # 1-based AdamW step counter
     var accum_count: Int                    # micro-batches since the last apply
 
@@ -101,7 +105,7 @@ struct TrainState(Movable):
             self.masters.append(init_masters[i])  # Arc refcount bump
             self.m.append(ArcPointer(_zeros_like_f32(init_masters[i][], ctx)))
             self.v.append(ArcPointer(_zeros_like_f32(init_masters[i][], ctx)))
-            self.accum.append(ArcPointer(_zeros_like_f32(init_masters[i][], ctx)))
+            self.accum.append(ArcPointer(_zeros_like_bf16(init_masters[i][], ctx)))
 
     def num_params(self) -> Int:
         return len(self.masters)
@@ -116,25 +120,23 @@ struct TrainState(Movable):
     def master_host(self, i: Int, ctx: DeviceContext) raises -> List[Float32]:
         return self.masters[i][].to_host(ctx)
 
-    # Accumulate one micro-batch's grads. `grads` may be BF16 (the compute dtype)
-    # — each is cast to F32 and SUMMED into the F32 accumulators. Order must match
-    # the param order. Host-side add (parity-grade; not a hot path).
+    # Accumulate one micro-batch's grads in BF16 storage. The add kernel casts to
+    # F32 internally, then stores back to BF16; AdamW receives an F32 transient in
+    # apply_step because optimizer math/master state is explicitly F32.
     def accumulate_grads(
         mut self, grads: List[ArcPointer[Tensor]], ctx: DeviceContext
     ) raises:
         if len(grads) != len(self.accum):
             raise Error("accumulate_grads: grad count != param count")
         for i in range(len(grads)):
-            var g_f32 = cast_tensor(grads[i][], STDtype.F32, ctx)
-            if g_f32.numel() != self.accum[i][].numel():
+            var g_bf16 = (
+                grads[i][].clone(ctx)
+                if grads[i][].dtype() == STDtype.BF16
+                else cast_tensor(grads[i][], STDtype.BF16, ctx)
+            )
+            if g_bf16.numel() != self.accum[i][].numel():
                 raise Error("accumulate_grads: grad numel mismatch at param")
-            var acc_h = self.accum[i][].to_host(ctx)
-            var g_h = g_f32.to_host(ctx)
-            var summed = List[Float32]()
-            for j in range(len(acc_h)):
-                summed.append(acc_h[j] + g_h[j])
-            self.accum[i] = ArcPointer(
-                Tensor.from_host(summed^, self.accum[i][].shape(), STDtype.F32, ctx))
+            self.accum[i] = ArcPointer(add(self.accum[i][], g_bf16, ctx))
         self.accum_count += 1
 
     # Apply ONE AdamW step from the accumulated grads (mean over the micro-batches
@@ -154,13 +156,10 @@ struct TrainState(Movable):
         self.t += 1
         var inv = Float32(1.0) / Float32(self.accum_count)
         for i in range(len(self.masters)):
-            # mean grad = accum / accum_count (fresh F32 grad tensor)
-            var acc_h = self.accum[i][].to_host(ctx)
-            var mean_h = List[Float32]()
-            for j in range(len(acc_h)):
-                mean_h.append(acc_h[j] * inv)
-            var grad = Tensor.from_host(
-                mean_h^, self.accum[i][].shape(), STDtype.F32, ctx)
+            # AdamW expects F32 grads because optimizer math and master state are
+            # F32. The persistent accumulation carrier remains BF16.
+            var acc_f32 = cast_tensor(self.accum[i][], STDtype.F32, ctx)
+            var grad = mul_scalar(acc_f32, inv, ctx)
             # AdamW updates master, m, v IN PLACE on the device buffers. The
             # ArcPointer payload is the SAME device buffer, so the in-place write
             # persists (refcount keeps it alive).
@@ -170,7 +169,7 @@ struct TrainState(Movable):
             adamw_step(p[], grad, mm[], vv[], self.t,
                        lr, beta1, beta2, eps, weight_decay, ctx)
             # zero the accumulator for the next cycle
-            self.accum[i] = ArcPointer(_zeros_like_f32(self.masters[i][], ctx))
+            self.accum[i] = ArcPointer(_zeros_like_bf16(self.masters[i][], ctx))
         self.accum_count = 0
 
     def opt_step(self) -> Int:

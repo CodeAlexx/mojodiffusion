@@ -1,4 +1,4 @@
-# training/fused_adamw_multitensor.mojo — FUSED multi-tensor AdamW (F32).
+# training/fused_adamw_multitensor.mojo — FUSED multi-tensor AdamW.
 #
 # NEW STANDALONE kernel. Does NOT replace training/optim.mojo `adamw_step`; it
 # is a faster sibling. Parity is gated against running the scalar per-tensor
@@ -22,8 +22,11 @@
 # as optim.mojo does. DECOUPLED weight decay applied to p AFTER the Adam step —
 # matching optim.mojo and flame-core/src/adam.rs (NOT Adam+L2).
 #
-# All tensors must be F32 (master-weight path). Tensors are boxed as TArc for
-# List storage (Tensor is move-only — MOJO_CONVENTIONS §2a).
+# Params/grads may be F32/BF16/F16. Adam math is F32 inside the kernel, then
+# params are written back to their original storage dtype. m/v remain F32
+# optimizer-state storage, matching optim.mojo and Adam's moment contract; these
+# are not model/checkpoint tensor boundaries. Tensors are boxed as TArc for List
+# storage (Tensor is move-only — MOJO_CONVENTIONS §2a).
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -49,7 +52,7 @@ comptime _BLOCK = 256
 #   offs                        : element-offset prefix sum, offs[N] = total
 # A thread finds its tensor `ti` by scanning offs (N is small — dozens), then
 # its intra-tensor index `j = gid - offs[ti]`.
-def _fused_adamw_kernel(
+def _fused_adamw_kernel[p_dtype: DType, g_dtype: DType](
     p_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     g_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
     m_addr: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
@@ -78,13 +81,13 @@ def _fused_adamw_kernel(
     var ga = rebind[Scalar[DType.uint64]](g_addr[ti])
     var ma = rebind[Scalar[DType.uint64]](m_addr[ti])
     var va = rebind[Scalar[DType.uint64]](v_addr[ti])
-    var pp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(pa))
-    var gp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(ga))
+    var pp = UnsafePointer[Scalar[p_dtype], MutExternalOrigin](unsafe_from_address=Int(pa))
+    var gp = UnsafePointer[Scalar[g_dtype], MutExternalOrigin](unsafe_from_address=Int(ga))
     var mp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(ma))
     var vp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(va))
 
-    var gv = gp[j]
-    var pv = pp[j]
+    var gv = gp[j].cast[DType.float32]()
+    var pv = pp[j].cast[DType.float32]()
     var mi = beta1 * mp[j] + (1.0 - beta1) * gv
     var vi = beta2 * vp[j] + (1.0 - beta2) * gv * gv
     mp[j] = mi
@@ -94,7 +97,38 @@ def _fused_adamw_kernel(
     pv = pv - lr * m_hat / (sqrt(v_hat) + eps)
     if weight_decay > 0.0:
         pv = pv - lr * weight_decay * pv
-    pp[j] = pv
+    pp[j] = pv.cast[p_dtype]()
+
+
+def _supported_param_or_grad_dtype(dt: STDtype) -> Bool:
+    return dt == STDtype.F32 or dt == STDtype.BF16 or dt == STDtype.F16
+
+
+def _launch_fused_adamw[p_dtype: DType, g_dtype: DType](
+    ctx: DeviceContext,
+    PA: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
+    GA: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
+    MA: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
+    VA: LayoutTensor[DType.uint64, _DYN1, MutAnyOrigin],
+    OFF: LayoutTensor[DType.int64, _DYN1, MutAnyOrigin],
+    nt: Int,
+    total: Int,
+    lr: Float32,
+    beta1: Float32,
+    beta2: Float32,
+    eps: Float32,
+    weight_decay: Float32,
+    bc1: Float32,
+    bc2: Float32,
+) raises:
+    var grid = (total + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[
+        _fused_adamw_kernel[p_dtype, g_dtype],
+        _fused_adamw_kernel[p_dtype, g_dtype],
+    ](
+        PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps, weight_decay,
+        bc1, bc2, grid_dim=grid, block_dim=_BLOCK,
+    )
 
 
 def fused_adamw_step(
@@ -111,8 +145,9 @@ def fused_adamw_step(
     ctx: DeviceContext,
 ) raises:
     """One fused AdamW step over N tensors in a SINGLE launch. params/m/v are
-    updated IN PLACE; grads read-only. All F32; matching numel per (p,g,m,v).
-    Per-element math is identical to optim.mojo adamw_step."""
+    updated IN PLACE; grads read-only. Params and grads preserve F32/BF16/F16
+    storage; m/v are F32 optimizer states. Matching numel per (p,g,m,v).
+    Per-element math matches optim.mojo adamw_step in F32."""
     var nt = len(params)
     if nt == 0:
         raise Error("fused_adamw_step: empty tensor list")
@@ -130,7 +165,21 @@ def fused_adamw_step(
     var bc1 = Float32(1.0) - b1p
     var bc2 = Float32(1.0) - b2p
 
-    # Build host address + offset tables.
+    var param_dtype = params[0][].dtype()
+    var grad_dtype = grads[0][].dtype()
+    if not _supported_param_or_grad_dtype(param_dtype):
+        raise Error(
+            String("fused_adamw_step: unsupported param dtype ")
+            + param_dtype.name()
+        )
+    if not _supported_param_or_grad_dtype(grad_dtype):
+        raise Error(
+            String("fused_adamw_step: unsupported grad dtype ")
+            + grad_dtype.name()
+        )
+
+    # Build host address + offset tables. Tables are metadata only; tensor
+    # payloads stay device-resident and keep their storage dtype.
     var p_host = ctx.enqueue_create_host_buffer[DType.uint8](nt * 8)
     var g_host = ctx.enqueue_create_host_buffer[DType.uint8](nt * 8)
     var m_host = ctx.enqueue_create_host_buffer[DType.uint8](nt * 8)
@@ -145,14 +194,17 @@ def fused_adamw_step(
     var total = 0
     op[0] = Int64(0)
     for i in range(nt):
-        if params[i][].dtype() != STDtype.F32 or grads[i][].dtype() != STDtype.F32 \
-           or m_states[i][].dtype() != STDtype.F32 or v_states[i][].dtype() != STDtype.F32:
-            raise Error("fused_adamw_step: all tensors must be F32")
+        if params[i][].dtype() != param_dtype:
+            raise Error("fused_adamw_step: mixed param dtypes in one launch")
+        if grads[i][].dtype() != grad_dtype:
+            raise Error("fused_adamw_step: mixed grad dtypes in one launch")
+        if m_states[i][].dtype() != STDtype.F32 or v_states[i][].dtype() != STDtype.F32:
+            raise Error("fused_adamw_step: m/v optimizer states must be F32")
         var n = params[i][].numel()
         if grads[i][].numel() != n or m_states[i][].numel() != n or v_states[i][].numel() != n:
             raise Error("fused_adamw_step: per-tensor numel mismatch at " + String(i))
-        pp[i] = UInt64(Int(params[i][].buf.unsafe_ptr().bitcast[Float32]()))
-        gp[i] = UInt64(Int(grads[i][].buf.unsafe_ptr().bitcast[Float32]()))
+        pp[i] = UInt64(Int(params[i][].buf.unsafe_ptr()))
+        gp[i] = UInt64(Int(grads[i][].buf.unsafe_ptr()))
         mp[i] = UInt64(Int(m_states[i][].buf.unsafe_ptr().bitcast[Float32]()))
         vp[i] = UInt64(Int(v_states[i][].buf.unsafe_ptr().bitcast[Float32]()))
         total += n
@@ -182,9 +234,52 @@ def fused_adamw_step(
     var OFF = LayoutTensor[DType.int64, _DYN1, MutAnyOrigin](
         off_dev.unsafe_ptr().bitcast[Int64](), o_rl)
 
-    var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_fused_adamw_kernel, _fused_adamw_kernel](
-        PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps, weight_decay,
-        bc1, bc2, grid_dim=grid, block_dim=_BLOCK,
-    )
+    if param_dtype == STDtype.F32:
+        if grad_dtype == STDtype.F32:
+            _launch_fused_adamw[DType.float32, DType.float32](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
+        elif grad_dtype == STDtype.BF16:
+            _launch_fused_adamw[DType.float32, DType.bfloat16](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
+        else:
+            _launch_fused_adamw[DType.float32, DType.float16](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
+    elif param_dtype == STDtype.BF16:
+        if grad_dtype == STDtype.F32:
+            _launch_fused_adamw[DType.bfloat16, DType.float32](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
+        elif grad_dtype == STDtype.BF16:
+            _launch_fused_adamw[DType.bfloat16, DType.bfloat16](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
+        else:
+            _launch_fused_adamw[DType.bfloat16, DType.float16](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
+    else:
+        if grad_dtype == STDtype.F32:
+            _launch_fused_adamw[DType.float16, DType.float32](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
+        elif grad_dtype == STDtype.BF16:
+            _launch_fused_adamw[DType.float16, DType.bfloat16](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
+        else:
+            _launch_fused_adamw[DType.float16, DType.float16](
+                ctx, PA, GA, MA, VA, OFF, nt, total, lr, beta1, beta2, eps,
+                weight_decay, bc1, bc2,
+            )
     ctx.synchronize()

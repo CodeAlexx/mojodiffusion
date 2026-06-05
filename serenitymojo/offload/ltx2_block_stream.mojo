@@ -86,6 +86,12 @@ struct LTX2BlockStream(Movable):
     var sharded: ShardedSafeTensors
     var prefix: String
     var n_blocks: Int
+    var resident_enabled: Bool
+    var resident_loaded: List[Bool]
+    var resident_blocks: List[FP8Block]
+    var resident_scales: List[Dict[String, Float32]]
+    var resident_bytes_: Int
+    var scale_cache: Dict[String, Float32]
 
     @staticmethod
     def open(checkpoint_path: String) raises -> LTX2BlockStream:
@@ -121,17 +127,42 @@ struct LTX2BlockStream(Movable):
                     except:
                         pass
         var n = max_idx + 1
-        return LTX2BlockStream(st^, prefix, n)
+        var scales = Dict[String, Float32]()
+        for ref nm in st.names():
+            if nm.endswith("_scale"):
+                var weight_key = _substr(nm, 0, len(nm) - len(String("_scale")))
+                var tv = st.tensor_view(nm)
+                scales[weight_key] = _read_f32_scalar(tv.data)
+            elif nm.endswith(".scale_weight"):
+                var base_key = _substr(
+                    nm, 0, len(nm) - len(String(".scale_weight"))
+                )
+                var tv = st.tensor_view(nm)
+                scales[base_key + ".weight"] = _read_f32_scalar(tv.data)
+        return LTX2BlockStream(st^, prefix, n, scales^)
 
     def __init__(
-        out self, var sharded: ShardedSafeTensors, prefix: String, n_blocks: Int
+        out self,
+        var sharded: ShardedSafeTensors,
+        prefix: String,
+        n_blocks: Int,
+        var scale_cache: Dict[String, Float32],
     ):
         self.sharded = sharded^
         self.prefix = prefix
         self.n_blocks = n_blocks
+        self.resident_enabled = False
+        self.resident_loaded = List[Bool]()
+        self.resident_blocks = List[FP8Block]()
+        self.resident_scales = List[Dict[String, Float32]]()
+        self.resident_bytes_ = 0
+        self.scale_cache = scale_cache^
 
     def block_count(self) -> Int:
         return self.n_blocks
+
+    def resident_bytes(self) -> Int:
+        return self.resident_bytes_
 
     def _scale_for(self, weight_key: String) raises -> Float32:
         """Return the per-tensor scale for an FP8 weight, or 1.0 if absent.
@@ -140,18 +171,8 @@ struct LTX2BlockStream(Movable):
         - LTX-style sidecar: `{weight_key}_scale`
         - Comfy-scaled sidecar: `{base}.scale_weight` for `{base}.weight`
         """
-        var scale_key = weight_key + "_scale"
-        for ref nm in self.sharded.names():
-            if nm == scale_key:
-                var tv = self.sharded.tensor_view(scale_key)
-                return _read_f32_scalar(tv.data)
-        if weight_key.endswith(".weight"):
-            var base_key = _substr(weight_key, 0, len(weight_key) - len(String(".weight")))
-            var comfy_scale_key = base_key + ".scale_weight"
-            for ref nm in self.sharded.names():
-                if nm == comfy_scale_key:
-                    var tv = self.sharded.tensor_view(comfy_scale_key)
-                    return _read_f32_scalar(tv.data)
+        if weight_key in self.scale_cache:
+            return self.scale_cache[weight_key]
         return 1.0
 
     def load_block_bf16(
@@ -168,6 +189,14 @@ struct LTX2BlockStream(Movable):
 
         Keys are stripped of the block prefix so the block dict is keyed by the
         canonical sub-name (e.g. `attn1.to_q.weight`)."""
+        if (
+            self.resident_enabled
+            and block_idx >= 0
+            and block_idx < len(self.resident_loaded)
+            and self.resident_loaded[block_idx]
+        ):
+            return self._load_resident_block_bf16(block_idx, ctx)
+
         var block = FP8Block()
         var bp = self.prefix + String(block_idx) + "."
         for ref nm in self.sharded.names():
@@ -193,6 +222,76 @@ struct LTX2BlockStream(Movable):
                 var t = Tensor.from_view_as_bf16(tv, ctx)
                 block[canon] = ArcPointer(t^)
         return block^
+
+    def _load_resident_block_bf16(
+        self, block_idx: Int, ctx: DeviceContext
+    ) raises -> FP8Block:
+        """Materialize one BF16 block from GPU-resident raw storage.
+
+        FP8 tensors are already on the GPU as raw bytes, so this avoids the
+        repeated host→device copy in the streamed path. Non-FP8 tensors are
+        stored resident as BF16 and reused by Arc; the caller materializes a
+        mutable BF16 block and kernels do any F32 accumulation internally."""
+        var block = FP8Block()
+        ref raw_block = self.resident_blocks[block_idx]
+        ref scale_block = self.resident_scales[block_idx]
+        for ref e in raw_block.items():
+            if e.value[].dtype() == STDtype.F8_E4M3:
+                var scale = Float32(1.0)
+                if e.key in scale_block:
+                    scale = scale_block[e.key]
+                var deq = fp8_e4m3_dequant_to_bf16(e.value[], scale, ctx)
+                block[e.key] = ArcPointer(deq^)
+            else:
+                block[e.key] = e.value
+        return block^
+
+    def enable_fp8_resident_range(
+        mut self, first_block: Int, last_block: Int, ctx: DeviceContext
+    ) raises:
+        """Preload raw FP8/storage tensors for `first_block..last_block`.
+
+        This is the production-speed path for repeated denoise evals: FP8 bytes
+        stay in VRAM, while each eval still materializes only the current block
+        as BF16/F32 for the existing forward. The range form lets callers keep
+        BF16 boundary blocks out of the resident set on 24 GB cards."""
+        if first_block < 0 or last_block >= self.n_blocks or first_block > last_block:
+            raise Error("enable_fp8_resident_range: invalid block range")
+        if len(self.resident_blocks) != 0:
+            raise Error("enable_fp8_resident_range: resident store already initialized")
+
+        self.resident_enabled = True
+        self.resident_bytes_ = 0
+        for block_idx in range(self.n_blocks):
+            var block = FP8Block()
+            var scales = Dict[String, Float32]()
+            var loaded = block_idx >= first_block and block_idx <= last_block
+            if loaded:
+                var bp = self.prefix + String(block_idx) + "."
+                for ref nm in self.sharded.names():
+                    if not nm.startswith(bp):
+                        continue
+                    if (
+                        nm.endswith("_scale")
+                        or nm.endswith("input_scale")
+                        or nm.endswith(".scale_weight")
+                        or nm.endswith(".scale_input")
+                    ):
+                        continue
+                    var canon = _substr(nm, len(bp), len(nm))
+                    var tv = self.sharded.tensor_view(nm)
+                    if tv.dtype == STDtype.F8_E4M3:
+                        var raw = Tensor.from_view_raw(tv, ctx)
+                        self.resident_bytes_ += raw.nbytes()
+                        scales[canon] = self._scale_for(nm)
+                        block[canon] = ArcPointer(raw^)
+                    else:
+                        var t = Tensor.from_view_as_bf16(tv, ctx)
+                        self.resident_bytes_ += t.nbytes()
+                        block[canon] = ArcPointer(t^)
+            self.resident_blocks.append(block^)
+            self.resident_scales.append(scales^)
+            self.resident_loaded.append(loaded)
 
     def fp8_tensor_count(self, block_idx: Int) raises -> Int:
         """How many F8_E4M3 weight tensors block `block_idx` has (diagnostic)."""

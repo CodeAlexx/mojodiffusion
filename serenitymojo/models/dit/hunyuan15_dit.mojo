@@ -136,10 +136,7 @@ def hunyuan15_build_rope(
 ) raises -> Tuple[Tensor, Tensor]:
     var positions = hunyuan15_rope_positions(tt, th, tw, ctx)
     var axes = cfg.rope_axes()
-    var cs = build_multiaxis_rope_tables(positions, axes, cfg.rope_theta, ctx)
-    var cos_d = cast_tensor(cs[0], dt, ctx)
-    var sin_d = cast_tensor(cs[1], dt, ctx)
-    return (cos_d^, sin_d^)
+    return build_multiaxis_rope_tables(positions, axes, cfg.rope_theta, ctx, dt)
 
 
 # ── linear(x, w[wname], bias=w[bname]) helper (clone bias into Optional) ──────
@@ -249,6 +246,15 @@ def _apply_rope_bshd(
 
 # ── Double-stream block (double_block_forward, hunyuan15_dit.rs:416-549) ──────
 # S_IMG / S_TXT / H / DH are comptime (sdpa_nomask specializes on S=S_IMG+S_TXT).
+struct Hunyuan15DoubleOut(Copyable, Movable):
+    var img: ArcPointer[Tensor]
+    var txt: ArcPointer[Tensor]
+
+    def __init__(out self, var img: Tensor, var txt: Tensor):
+        self.img = ArcPointer(img^)
+        self.txt = ArcPointer(txt^)
+
+
 def hunyuan15_double_block[
     S_IMG: Int, S_TXT: Int, H: Int, DH: Int
 ](
@@ -260,7 +266,7 @@ def hunyuan15_double_block[
     w: Dict[String, ArcPointer[Tensor]],
     cfg: Hunyuan15Config,
     ctx: DeviceContext,
-) raises -> Tuple[Tensor, Tensor]:
+) raises -> Hunyuan15DoubleOut:
     comptime S = S_IMG + S_TXT
     var dim = cfg.hidden_size
     var eps = cfg.eps
@@ -347,7 +353,7 @@ def hunyuan15_double_block[
     txt_mlp = _lin(txt_mlp, w, "txt_mlp.fc2.weight", "txt_mlp.fc2.bias", ctx)
     var txt_out = _gated_residual(txt1, txt_mlp, txt_g2, dim, ctx)
 
-    return (img_out^, txt_out^)
+    return Hunyuan15DoubleOut(img_out^, txt_out^)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -476,8 +482,7 @@ struct Hunyuan15Dit(Movable):
         var t_vec = Tensor.from_host(t_host^, t_shape^, STDtype.F32, ctx)
         # freq_dim=256. NOTE: Rust uses cos-first/sin-second sinusoidal embedding
         # (timestep_embedding here is COS-first, matching).
-        var t_emb = timestep_embedding(t_vec, 256, ctx, 10000.0)  # [1,256] F32
-        var t_emb_bf = cast_tensor(t_emb, bf, ctx)
+        var t_emb_bf = timestep_embedding(t_vec, 256, ctx, 10000.0, bf)
         var vec = linear(t_emb_bf, self._w("time_in.mlp.0.weight"),
                          Optional(self._w("time_in.mlp.0.bias").clone(ctx)), ctx)
         vec = silu(vec, ctx)
@@ -493,15 +498,15 @@ struct Hunyuan15Dit(Movable):
         var sin_e = _expand_rope_per_head(cs[1], S_IMG, H, DH // 2, ctx)
 
         # ── 54 double-stream blocks ──
-        var img_s = img^
-        var txt_s = txt^
+        var img_s = ArcPointer(img^)
+        var txt_s = ArcPointer(txt^)
         for i in range(cfg.num_double_blocks):
             var bw = self._block_weights(i, ctx)
             var pair = hunyuan15_double_block[S_IMG, S_TXT, H, DH](
-                img_s, txt_s, vec, cos_e, sin_e, bw, cfg, ctx,
+                img_s[], txt_s[], vec, cos_e, sin_e, bw, cfg, ctx,
             )
-            img_s = pair[0]^
-            txt_s = pair[1]^
+            img_s = pair.img
+            txt_s = pair.txt
 
         # ── Final layer: AdaLN(shift,scale)=chunk2(Linear(SiLU(vec))) -> Linear ──
         var fl_silu = silu(vec, ctx)
@@ -512,7 +517,7 @@ struct Hunyuan15Dit(Movable):
         )  # [1, 2*dim]
         var fl_shift = _chunk(fl_mods, 0, dim, ctx)
         var fl_scale = _chunk(fl_mods, 1, dim, ctx)
-        var fl_in = _modulate(img_s, fl_scale, fl_shift, dim, cfg.eps, ctx)
+        var fl_in = _modulate(img_s[], fl_scale, fl_shift, dim, cfg.eps, ctx)
         var out_tokens = linear(fl_in, self._w("final_layer.linear.weight"),
                                 Optional(self._w("final_layer.linear.bias").clone(ctx)), ctx)
         # out_tokens: [1, S_IMG, out_channels*pf*ph*pw]

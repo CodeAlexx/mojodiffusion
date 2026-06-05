@@ -20,6 +20,20 @@
 from std.collections import List
 
 
+# Shared encodings for trainer mode/target selectors. These are runtime config
+# values; model kernels still choose shape-critical paths with comptime params.
+comptime TRAIN_MODALITY_VIDEO = 0
+comptime TRAIN_MODALITY_AV = 1
+comptime TRAIN_MODALITY_AUDIO = 2
+
+comptime LORA_TARGET_LEGACY_VIDEO_ATTN1 = 0
+comptime LORA_TARGET_LTX2_T2V = 1
+comptime LORA_TARGET_LTX2_V2V = 2
+comptime LORA_TARGET_LTX2_AUDIO = 3
+comptime LORA_TARGET_LTX2_AUDIO_REF_ONLY_IC = 4
+comptime LORA_TARGET_LTX2_FULL = 5
+
+
 struct TrainConfig(Copyable, Movable):
     # ── identity + paths ──
     var name: String          # "model_type" (e.g. "klein")
@@ -127,6 +141,23 @@ struct TrainConfig(Copyable, Movable):
     #   fail loud in the Klein stack until the integration wave wires them.
     var adapter_algo: Int
 
+    # ── cached-input / AV trainer contract (default-off) ──
+    # train_modality: 0=video, 1=audio-video, 2=audio.
+    # lora_target_preset mirrors musubi LTX2 presets:
+    #   0=legacy_video_attn1, 1=t2v, 2=v2v, 3=audio,
+    #   4=audio_ref_only_ic, 5=full.
+    # Production AV trainers should set modality=AV, require cached video/text/
+    # audio inputs, and keep the hot forward/loss/backward/update loop on device.
+    var train_modality: Int
+    var lora_target_preset: Int
+    var dataset_cache_dir: String
+    var require_cached_video_latents: Bool
+    var require_cached_text_embeddings: Bool
+    var require_cached_audio_latents: Bool
+    var hot_loop_device_only: Bool
+    var video_loss_weight: Float32
+    var audio_loss_weight: Float32
+
     # ── cadence ──
     var max_steps: Int
     var save_every: Int
@@ -195,6 +226,15 @@ struct TrainConfig(Copyable, Movable):
             ema_min_decay=Float32(0.0),
             ema_max_decay=Float32(0.9999),
             adapter_algo=0,                      # plain LoRA (default-off)
+            train_modality=TRAIN_MODALITY_VIDEO,
+            lora_target_preset=LORA_TARGET_LEGACY_VIDEO_ATTN1,
+            dataset_cache_dir=String(""),
+            require_cached_video_latents=False,
+            require_cached_text_embeddings=False,
+            require_cached_audio_latents=False,
+            hot_loop_device_only=False,
+            video_loss_weight=Float32(1.0),
+            audio_loss_weight=Float32(0.0),
             max_steps=3000,
             save_every=500,
             sample_every=250,
@@ -224,6 +264,10 @@ struct TrainConfig(Copyable, Movable):
         ema_enabled: Bool, ema_inv_gamma: Float32, ema_power: Float32,
         ema_update_after_step: Int, ema_min_decay: Float32, ema_max_decay: Float32,
         adapter_algo: Int,
+        train_modality: Int, lora_target_preset: Int, var dataset_cache_dir: String,
+        require_cached_video_latents: Bool, require_cached_text_embeddings: Bool,
+        require_cached_audio_latents: Bool, hot_loop_device_only: Bool,
+        video_loss_weight: Float32, audio_loss_weight: Float32,
         max_steps: Int, save_every: Int, sample_every: Int,
     ):
         self.name = name^
@@ -280,6 +324,15 @@ struct TrainConfig(Copyable, Movable):
         self.ema_min_decay = ema_min_decay
         self.ema_max_decay = ema_max_decay
         self.adapter_algo = adapter_algo
+        self.train_modality = train_modality
+        self.lora_target_preset = lora_target_preset
+        self.dataset_cache_dir = dataset_cache_dir^
+        self.require_cached_video_latents = require_cached_video_latents
+        self.require_cached_text_embeddings = require_cached_text_embeddings
+        self.require_cached_audio_latents = require_cached_audio_latents
+        self.hot_loop_device_only = hot_loop_device_only
+        self.video_loss_weight = video_loss_weight
+        self.audio_loss_weight = audio_loss_weight
         self.max_steps = max_steps
         self.save_every = save_every
         self.sample_every = sample_every

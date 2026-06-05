@@ -118,7 +118,7 @@ def _ones_bf16(n: Int, ctx: DeviceContext) raises -> Tensor:
         vals.append(1.0)
     var sh = List[Int]()
     sh.append(n)
-    return cast_tensor(Tensor.from_host(vals, sh^, STDtype.F32, ctx), STDtype.BF16, ctx)
+    return Tensor.from_host(vals, sh^, STDtype.BF16, ctx)
 
 
 def _zeros_bf16(n: Int, ctx: DeviceContext) raises -> Tensor:
@@ -127,7 +127,7 @@ def _zeros_bf16(n: Int, ctx: DeviceContext) raises -> Tensor:
         vals.append(0.0)
     var sh = List[Int]()
     sh.append(n)
-    return cast_tensor(Tensor.from_host(vals, sh^, STDtype.F32, ctx), STDtype.BF16, ctx)
+    return Tensor.from_host(vals, sh^, STDtype.BF16, ctx)
 
 
 # Extract one [DIM] chunk from adaln output [1, 6*DIM]
@@ -328,10 +328,10 @@ def build_lens_rope_tables(ctx: DeviceContext) raises -> LensRopeTables:
     tc_sh.append(N_TXT * NUM_HEADS)
     tc_sh.append(ROPE_HALF)
 
-    var ic = cast_tensor(Tensor.from_host(img_cos_tiled, ic_sh.copy(), STDtype.F32, ctx), STDtype.BF16, ctx)
-    var is_ = cast_tensor(Tensor.from_host(img_sin_tiled, ic_sh.copy(), STDtype.F32, ctx), STDtype.BF16, ctx)
-    var tc = cast_tensor(Tensor.from_host(txt_cos_tiled, tc_sh.copy(), STDtype.F32, ctx), STDtype.BF16, ctx)
-    var ts = cast_tensor(Tensor.from_host(txt_sin_tiled, tc_sh.copy(), STDtype.F32, ctx), STDtype.BF16, ctx)
+    var ic = Tensor.from_host(img_cos_tiled, ic_sh.copy(), STDtype.BF16, ctx)
+    var is_ = Tensor.from_host(img_sin_tiled, ic_sh.copy(), STDtype.BF16, ctx)
+    var tc = Tensor.from_host(txt_cos_tiled, tc_sh.copy(), STDtype.BF16, ctx)
+    var ts = Tensor.from_host(txt_sin_tiled, tc_sh.copy(), STDtype.BF16, ctx)
 
     print("[rope] img tables:", N_IMG * NUM_HEADS, "x", ROPE_HALF)
     print("[rope] txt tables:", N_TXT * NUM_HEADS, "x", ROPE_HALF)
@@ -459,8 +459,9 @@ def make_temb(sigma: Float32, resident: LensResident, ctx: DeviceContext) raises
     var tsh = List[Int]()
     tsh.append(1)
     var t = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)
-    var proj = timestep_embedding(t, TEMB_DIM, ctx)  # [1, 256] F32
-    var proj_bf16 = cast_tensor(proj, STDtype.BF16, ctx)
+    var proj_bf16 = timestep_embedding(
+        t, TEMB_DIM, ctx, Float32(10000.0), STDtype.BF16
+    )
     var l1w = cast_tensor(resident.temb_lin1_w, STDtype.BF16, ctx)
     var l1b = cast_tensor(resident.temb_lin1_b, STDtype.BF16, ctx)
     var l2w = cast_tensor(resident.temb_lin2_w, STDtype.BF16, ctx)
@@ -814,14 +815,14 @@ def denoise(
 
 # ── VAE decode ────────────────────────────────────────────────────────────────
 def vae_decode(latents: Tensor, ctx: DeviceContext) raises -> Tensor:
-    # [1, N_IMG=4096, 128] BF16 -> [1, 128, 64, 64] F32 -> decode -> [1,3,1024,1024]
-    var lat_f32 = cast_tensor(latents, STDtype.F32, ctx)
+    # [1, N_IMG=4096, 128] BF16 -> [1, 128, 64, 64] BF16 at the decoder
+    # boundary. KleinVaeDecoder handles F32 Flux VAE weights internally.
     var nhwc_sh = List[Int]()
     nhwc_sh.append(1)
     nhwc_sh.append(LH)
     nhwc_sh.append(LW)
     nhwc_sh.append(IN_CH)
-    var nhwc = reshape(lat_f32, nhwc_sh^, ctx)
+    var nhwc = reshape(latents, nhwc_sh^, ctx)
     var perm = List[Int]()
     perm.append(0)
     perm.append(3)

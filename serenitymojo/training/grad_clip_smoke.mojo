@@ -30,10 +30,10 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.training.optim import clip_grads_by_global_norm, TArc
 
 
-def _grad(vals: List[Float32], ctx: DeviceContext) raises -> TArc:
+def _grad(vals: List[Float32], dtype: STDtype, ctx: DeviceContext) raises -> TArc:
     var shape = List[Int]()
     shape.append(len(vals))
-    return TArc(Tensor.from_host(vals, shape^, STDtype.F32, ctx))
+    return TArc(Tensor.from_host(vals, shape^, dtype, ctx))
 
 
 # recompute the global L2 norm of a list of grads via host readback (independent
@@ -47,16 +47,35 @@ def _global_norm(grads: List[TArc], ctx: DeviceContext) raises -> Float64:
     return sqrt(ss)
 
 
-def _build(ctx: DeviceContext) raises -> List[TArc]:
+def _build(dtype: STDtype, ctx: DeviceContext) raises -> List[TArc]:
     var v0 = List[Float32](); v0.append(3.0); v0.append(4.0)
     var v1 = List[Float32](); v1.append(0.0); v1.append(0.0); v1.append(0.0)
     var v2 = List[Float32](); v2.append(1.0); v2.append(2.0); v2.append(2.0)
     var v3 = List[Float32](); v3.append(5.0)
     var v4 = List[Float32](); v4.append(-1.0); v4.append(1.0); v4.append(-1.0); v4.append(1.0)
     var g = List[TArc]()
-    g.append(_grad(v0, ctx)); g.append(_grad(v1, ctx)); g.append(_grad(v2, ctx))
-    g.append(_grad(v3, ctx)); g.append(_grad(v4, ctx))
+    g.append(_grad(v0, dtype, ctx)); g.append(_grad(v1, dtype, ctx)); g.append(_grad(v2, dtype, ctx))
+    g.append(_grad(v3, dtype, ctx)); g.append(_grad(v4, dtype, ctx))
     return g^
+
+
+def _storage_dtype_gate(dtype: STDtype, tol: Float64, ctx: DeviceContext) raises:
+    var grads = _build(dtype, ctx)
+    var max_norm = Float32(2.0)
+    var returned = clip_grads_by_global_norm(grads, max_norm, ctx)
+    var expected_norm = sqrt(Float64(63.0))
+    var ok = True
+    if abs(Float64(returned) - expected_norm) > 1e-5:
+        print("FAIL ", dtype.name(), " returned norm mismatch"); ok = False
+    for i in range(len(grads)):
+        if grads[i][].dtype() != dtype:
+            print("FAIL ", dtype.name(), " grad dtype changed at", i); ok = False
+    var post = _global_norm(grads, ctx)
+    if abs(post - Float64(2.0)) > tol:
+        print("FAIL ", dtype.name(), " post-clip norm mismatch: ", post); ok = False
+    if not ok:
+        raise Error(String("grad_clip_smoke ") + dtype.name() + " storage gate FAILED")
+    print("PASS clip_grads_by_global_norm preserves ", dtype.name(), " grad storage")
 
 
 def main() raises:
@@ -67,7 +86,7 @@ def main() raises:
     print("hand-computed total_norm = sqrt(63) =", expected_norm)
 
     # ── case 1: clip fires (max_norm < total_norm) ────────────────────────────
-    var grads = _build(ctx)
+    var grads = _build(STDtype.F32, ctx)
     var max_norm = Float32(2.0)
     var returned = clip_grads_by_global_norm(grads, max_norm, ctx)
     print("case1 clip max_norm=2.0 -> returned pre-clip norm =", returned)
@@ -85,7 +104,7 @@ def main() raises:
         print("PASS post-clip recomputed norm == max_norm (2.0) to 1e-4")
 
     # ── case 2: no-op (max_norm > total_norm) ─────────────────────────────────
-    var grads2 = _build(ctx)
+    var grads2 = _build(STDtype.F32, ctx)
     var big = Float32(100.0)
     var returned2 = clip_grads_by_global_norm(grads2, big, ctx)
     print("case2 no-clip max_norm=100 -> returned norm =", returned2)
@@ -101,4 +120,6 @@ def main() raises:
 
     if not ok:
         raise Error("grad_clip_smoke FAILED")
+    _storage_dtype_gate(STDtype.BF16, 1e-2, ctx)
+    _storage_dtype_gate(STDtype.F16, 1e-3, ctx)
     print("grad_clip_smoke gate PASS")

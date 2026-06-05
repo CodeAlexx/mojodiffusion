@@ -17,7 +17,8 @@
 #
 # Layout: x is [R, C] row-major; output is [C, R] row-major. Tiles are 32x32;
 # the grid is (ceil(C/32), ceil(R/32)) blocks of 32x32 threads. Edge tiles are
-# bounds-checked (R/C need NOT be multiples of 32). F32-only.
+# bounds-checked (R/C need NOT be multiples of 32). Non-F32 input falls back to
+# the dtype-preserving general transpose.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -29,6 +30,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.tensor_algebra import transpose as _general_transpose
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -65,13 +67,12 @@ def _vec_transpose_kernel(
 
 
 def vec_transpose(x: Tensor, ctx: DeviceContext) raises -> Tensor:
-    """2D transpose [R,C] -> [C,R] via 32x32 shared-mem tiles. F32-only.
-    Byte-identical to transpose(x, 0, 1)."""
-    if x.dtype() != STDtype.F32:
-        raise Error("vec_transpose: F32-only fast path")
+    """2D transpose [R,C] -> [C,R] via 32x32 shared-mem tiles for F32."""
     var xshape = x.shape()
     if len(xshape) != 2:
         raise Error("vec_transpose: x must be rank-2 [R,C]")
+    if x.dtype() != STDtype.F32:
+        return _general_transpose(x, 0, 1, ctx)
     var R = xshape[0]
     var C = xshape[1]
     var n = x.numel()

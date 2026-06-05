@@ -520,8 +520,8 @@ def _denoise[HL: Int, WL: Int](
 
     var noise = gaussian_noise(16 * HL * WL, seed)
     var nshape = [1, 16, HL, WL]
-    # latent kept in F32 (diffusers keeps latents fp32; bf16 only for model input).
-    var x = Tensor.from_host(noise, nshape^, STDtype.F32, ctx)
+    # Keep the latent boundary BF16; scheduler arithmetic below casts locally.
+    var x = Tensor.from_host(noise, nshape^, STDtype.BF16, ctx)
 
     var sigmas = _build_sigmas(steps)
     print("[denoise]", steps, "steps, shift", SHIFT, "CFG", cfg, "seed", seed)
@@ -543,7 +543,8 @@ def _denoise[HL: Int, WL: Int](
             i == 0, ctx,
         )
         var dt = sigmas[i + 1] - sigmas[i]
-        x = add(x, mul_scalar(pred, dt, ctx), ctx)  # F32: x += (σ_next-σ)*(-pred_raw)
+        var x_compute = _cast(x, STDtype.F32, ctx)
+        x = _cast(add(x_compute, mul_scalar(pred, dt, ctx), ctx), STDtype.BF16, ctx)
         events.append(ZImageEvent(ZEVENT_STEP, i + 1, steps, String("denoise")))
         if (i + 1) % 10 == 0 or i == steps - 1:
             var secs = Float64(perf_counter_ns() - step_t0) / 1.0e9

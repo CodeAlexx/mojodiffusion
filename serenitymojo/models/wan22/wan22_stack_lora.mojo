@@ -116,6 +116,21 @@ def _t16(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -
     return Tensor.from_host(vals, shape^, STDtype.BF16, ctx)
 
 
+def _t_like(
+    vals: List[Float32], var shape: List[Int], ref_weight: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    var t = _t(vals, shape^, ctx)
+    if t.dtype() == ref_weight.dtype():
+        return t^
+    return cast_tensor(t, ref_weight.dtype(), ctx)
+
+
+def _cast_like(x: Tensor, ref_weight: Tensor, ctx: DeviceContext) raises -> Tensor:
+    if x.dtype() == ref_weight.dtype():
+        return x.clone(ctx)
+    return cast_tensor(x, ref_weight.dtype(), ctx)
+
+
 def _clone_t(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
@@ -314,18 +329,20 @@ def _time_features(
     # time_embedding: Linear -> SiLU -> Linear  [S, freq_dim] -> [S, dim]
     var nb0 = Optional[Tensor](base.tme0_b[].clone(ctx))
     var e = linear(
-        _t(sin_emb^, [S, freq_dim], ctx),
+        _t_like(sin_emb^, [S, freq_dim], base.tme0_w[], ctx),
         base.tme0_w[], nb0, ctx,
     )
     e = silu(e, ctx)
     var nb2 = Optional[Tensor](base.tme2_b[].clone(ctx))
-    e = linear(e, base.tme2_w[], nb2, ctx)   # [S, dim]
+    var e2_in = _cast_like(e, base.tme2_w[], ctx)
+    e = linear(e2_in, base.tme2_w[], nb2, ctx)   # [S, dim]
     # e_head = F32 copy of e  [S, dim]
     var e_head = cast_tensor(e, STDtype.F32, ctx).to_host(ctx)
     # time_projection: SiLU(e) -> Linear(dim -> 6*dim)
     var e_silu = silu(e, ctx)
     var ntp = Optional[Tensor](base.tp1_b[].clone(ctx))
-    var e0_flat_t = linear(e_silu, base.tp1_w[], ntp, ctx)    # [S, 6*dim]
+    var e_proj_in = _cast_like(e_silu, base.tp1_w[], ctx)
+    var e0_flat_t = linear(e_proj_in, base.tp1_w[], ntp, ctx)    # [S, 6*dim]
     var e0_f32 = cast_tensor(e0_flat_t, STDtype.F32, ctx).to_host(ctx)
     var res = List[List[Float32]]()
     res.append(e0_f32^)     # index 0: e0_flat F32 [S*6*dim]
@@ -434,10 +451,11 @@ def _embed_context(
     base: Wan22StackBase, ctx: DeviceContext,
 ) raises -> List[Float32]:
     var nb0 = Optional[Tensor](base.te0_b[].clone(ctx))
-    var h = linear(_t(txt_tokens, [TXT, text_dim], ctx), base.te0_w[], nb0, ctx)
+    var h = linear(_t_like(txt_tokens, [TXT, text_dim], base.te0_w[], ctx), base.te0_w[], nb0, ctx)
     h = gelu(h, ctx)
     var nb2 = Optional[Tensor](base.te2_b[].clone(ctx))
-    h = linear(h, base.te2_w[], nb2, ctx)   # [TXT, dim]
+    var h2_in = _cast_like(h, base.te2_w[], ctx)
+    h = linear(h2_in, base.te2_w[], nb2, ctx)   # [TXT, dim]
     return cast_tensor(h, STDtype.F32, ctx).to_host(ctx)
 
 
@@ -447,7 +465,7 @@ def _embed_image(
     base: Wan22StackBase, ctx: DeviceContext,
 ) raises -> List[Float32]:
     var nb = Optional[Tensor](base.pe_b[].clone(ctx))
-    var h = linear(_t(img_tokens, [S, in_ch], ctx), base.pe_w[], nb, ctx)
+    var h = linear(_t_like(img_tokens, [S, in_ch], base.pe_w[], ctx), base.pe_w[], nb, ctx)
     return cast_tensor(h, STDtype.F32, ctx).to_host(ctx)
 
 
@@ -477,7 +495,8 @@ def _head_forward(
     from serenitymojo.ops.tensor_algebra import add as _tadd
     var modulated = _tadd(prod, shift_d, ctx)
     var nb = Optional[Tensor](base.hh_b[].clone(ctx))
-    var out = linear(modulated, base.hh_w[], nb, ctx)   # [S, out_ch]
+    var head_in = _cast_like(modulated, base.hh_w[], ctx)
+    var out = linear(head_in, base.hh_w[], nb, ctx)   # [S, out_ch]
     return cast_tensor(out, STDtype.F32, ctx).to_host(ctx)
 
 
@@ -614,7 +633,8 @@ def wan22_stack_lora_backward_offload[
     modulated = add(modulated, shift_d, ctx)
     # linear backward through head.head
     var lbh = linear_backward(
-        _t(d_out, [S, out_ch], ctx), modulated, base.hh_w[],
+        _t_like(d_out, [S, out_ch], base.hh_w[], ctx),
+        _cast_like(modulated, base.hh_w[], ctx), base.hh_w[],
         S, dim, out_ch, ctx,
     )
     var d_modulated = lbh.d_x.to_host(ctx)
@@ -692,7 +712,8 @@ def wan22_stack_lora_backward_offload[
 
     # ── input projection backward (frozen; grads discarded) ──
     var lbi = linear_backward(
-        _t(d_x_img, [S, in_ch], ctx), _t(img_tokens, [S, in_ch], ctx), base.pe_w[],
+        _t_like(d_x_img, [S, dim], base.pe_w[], ctx),
+        _t_like(img_tokens, [S, in_ch], base.pe_w[], ctx), base.pe_w[],
         S, in_ch, dim, ctx,
     )
     var d_img_tokens = lbi.d_x.to_host(ctx)

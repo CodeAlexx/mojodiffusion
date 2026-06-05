@@ -36,10 +36,8 @@ from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
-from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import reshape
 
 from serenitymojo.models.wan22.wan22_stack_lora import Wan22StackBase
@@ -48,23 +46,12 @@ from serenitymojo.models.wan22.wan22_stack_lora import Wan22StackBase
 comptime TArc = ArcPointer[Tensor]
 
 
-# ── Load a tensor from safetensors as a device F32 Tensor ────────────────────
-def _load_dev_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
+# ── Load a tensor from safetensors preserving checkpoint storage dtype ───────
+def _load_dev_preserve(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx)
-
-
-# ── Load a tensor as a host List[Float32] (for passing to block constructors) ─
-def _load_host_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    var t32 = cast_tensor(t, STDtype.F32, ctx)
-    return t32.to_host(ctx)
+    return Tensor.from_view(tv, ctx)
 
 
 # ── Load the RESIDENT (frozen-base) tensors: embeddings, proj, head ──────────
@@ -75,33 +62,33 @@ def load_wan22_stack_base(
     st: SafeTensors, ctx: DeviceContext,
 ) raises -> Wan22StackBase:
     # patch_embedding: reshape [5120,16,1,2,2] -> [5120,64]
-    var pe_w_raw = _load_dev_f32(st, String("patch_embedding.weight"), ctx)
+    var pe_w_raw = _load_dev_preserve(st, String("patch_embedding.weight"), ctx)
     var pe_shape = List[Int]()
     pe_shape.append(5120)
     pe_shape.append(64)
     var pe_w = reshape(pe_w_raw^, pe_shape^, ctx)
-    var pe_b = _load_dev_f32(st, String("patch_embedding.bias"), ctx)
+    var pe_b = _load_dev_preserve(st, String("patch_embedding.bias"), ctx)
 
     # text_embedding MLP: Linear -> GELU -> Linear  (frozen; produces context [TXT,dim])
-    var te0_w = _load_dev_f32(st, String("text_embedding.0.weight"), ctx)
-    var te0_b = _load_dev_f32(st, String("text_embedding.0.bias"), ctx)
-    var te2_w = _load_dev_f32(st, String("text_embedding.2.weight"), ctx)
-    var te2_b = _load_dev_f32(st, String("text_embedding.2.bias"), ctx)
+    var te0_w = _load_dev_preserve(st, String("text_embedding.0.weight"), ctx)
+    var te0_b = _load_dev_preserve(st, String("text_embedding.0.bias"), ctx)
+    var te2_w = _load_dev_preserve(st, String("text_embedding.2.weight"), ctx)
+    var te2_b = _load_dev_preserve(st, String("text_embedding.2.bias"), ctx)
 
     # time_embedding MLP: Linear -> SiLU -> Linear  (frozen; produces time features)
-    var tme0_w = _load_dev_f32(st, String("time_embedding.0.weight"), ctx)
-    var tme0_b = _load_dev_f32(st, String("time_embedding.0.bias"), ctx)
-    var tme2_w = _load_dev_f32(st, String("time_embedding.2.weight"), ctx)
-    var tme2_b = _load_dev_f32(st, String("time_embedding.2.bias"), ctx)
+    var tme0_w = _load_dev_preserve(st, String("time_embedding.0.weight"), ctx)
+    var tme0_b = _load_dev_preserve(st, String("time_embedding.0.bias"), ctx)
+    var tme2_w = _load_dev_preserve(st, String("time_embedding.2.weight"), ctx)
+    var tme2_b = _load_dev_preserve(st, String("time_embedding.2.bias"), ctx)
 
     # time_projection: SiLU -> Linear(dim -> 6*dim)  (frozen; produces per-token e0)
-    var tp1_w = _load_dev_f32(st, String("time_projection.1.weight"), ctx)
-    var tp1_b = _load_dev_f32(st, String("time_projection.1.bias"), ctx)
+    var tp1_w = _load_dev_preserve(st, String("time_projection.1.weight"), ctx)
+    var tp1_b = _load_dev_preserve(st, String("time_projection.1.bias"), ctx)
 
     # head: final linear + modulation
-    var hh_w = _load_dev_f32(st, String("head.head.weight"), ctx)
-    var hh_b = _load_dev_f32(st, String("head.head.bias"), ctx)
-    var hmod = _load_dev_f32(st, String("head.modulation"), ctx)   # [1,2,5120]
+    var hh_w = _load_dev_preserve(st, String("head.head.weight"), ctx)
+    var hh_b = _load_dev_preserve(st, String("head.head.bias"), ctx)
+    var hmod = _load_dev_preserve(st, String("head.modulation"), ctx)   # [1,2,5120]
 
     return Wan22StackBase(
         TArc(pe_w^), TArc(pe_b^),

@@ -6,14 +6,12 @@
 # (`linspace(1.0, 1.0 / N, N)` after dynamic exponential shift), and the final
 # Euler step uses `sigma_next = 0.0` outside that list.
 #
-# Includes the host schedule and the GPU tensor Euler step. The tensor update
-# preserves the Rust/Diffusers BF16 delta nuance: scale the model output in its
-# storage dtype, upcast for the add, then cast back to the latent dtype.
+# Includes the host schedule and the GPU tensor Euler step. Tensor ops may use
+# F32 arithmetic internally, but the latent carrier stays in its storage dtype.
 
 from std.gpu.host import DeviceContext
 from std.math import exp
 
-from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import add, mul_scalar
 from serenitymojo.tensor import Tensor
@@ -105,17 +103,14 @@ def lens_euler_step(
 ) raises -> Tensor:
     """One Lens FlowMatch Euler step.
 
-    Mirrors the Rust/diffusers dtype contract: `dt * noise_pred` is rounded in
-    `noise_pred`'s dtype first, then added to F32 latents, then cast back to the
-    original latent dtype.
+    `dt * noise_pred` is rounded in the latent storage dtype. F32 is limited to
+    scalar `dt` and tensor-op internals; the latent tensor is not stored in F32.
     """
     var target_dtype = latents.dtype()
     var dt = sigma_next - sigma_curr
-    var delta = mul_scalar(noise_pred, dt, ctx)
-    var latents_f32 = cast_tensor(latents, STDtype.F32, ctx)
-    var delta_f32 = cast_tensor(delta, STDtype.F32, ctx)
-    var result_f32 = add(latents_f32, delta_f32, ctx)
-    return cast_tensor(result_f32, target_dtype, ctx)
+    var pred = cast_tensor(noise_pred, target_dtype, ctx)
+    var delta = mul_scalar(pred, dt, ctx)
+    return add(latents, delta, ctx)
 
 
 def build_lens_shifted_sigmas(

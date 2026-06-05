@@ -54,13 +54,15 @@ def ema_decay_at_step(
 
 # ── host EMA update: shadow = decay*shadow + (1-decay)*live (in place) ───────
 # The HOST analog of schedule.mojo `ema_update` (device kernel). Klein LoRA
-# params live as host List[Float32] (train_step.mojo LoraAdapter.a/.b), so the
+# params live as host List[BFloat16] (train_step.mojo LoraAdapter.a/.b), so the
 # shadow copies + update are host-side — no device buffer plumbing. Same math as
 # the device kernel: hand-check decay=0.999, shadow=1.0, live=2.0 -> 1.001.
-def ema_update_host(mut shadow: List[Float32], live: List[Float32], decay: Float32):
+def ema_update_host(mut shadow: List[BFloat16], live: List[BFloat16], decay: Float32):
     """In-place: shadow[i] = decay*shadow[i] + (1-decay)*live[i]. decay==0.0
     is a NO-OP-equivalent skip-marker handled by the caller (it never calls
     this with decay 0 because the schedule returns 0 to mean "skip")."""
     var one_minus = Float32(1.0) - decay
     for i in range(len(shadow)):
-        shadow[i] = decay * shadow[i] + one_minus * live[i]
+        var sv = shadow[i].cast[DType.float32]()
+        var lv = live[i].cast[DType.float32]()
+        shadow[i] = BFloat16(decay * sv + one_minus * lv)

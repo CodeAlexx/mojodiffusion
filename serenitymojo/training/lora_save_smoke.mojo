@@ -2,8 +2,7 @@
 #
 # Build two small LoraAdapters with KNOWN A/B host values, save them via
 # save_lora_peft, read them back via load_lora_for_resume, and assert the A/B
-# host lists are BYTE-EXACT (F32 round-trips with no truncation, the same
-# property loop.mojo's master-checkpoint gate relies on — max_abs == 0).
+# BF16 host lists are exact after the save/load round trip.
 #
 # Run (after the compile lock frees):
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
@@ -43,18 +42,18 @@ def _make_adapter(rank: Int, in_f: Int, out_f: Int, base: Float32) -> LoraAdapte
     return LoraAdapter(a^, b^, rank, in_f, out_f, Float32(1.0), ma^, va^, mb^, vb^)
 
 
-def _assert_exact(name: String, a: List[Float32], b: List[Float32]) raises:
+def _assert_exact_bf16(name: String, a: List[BFloat16], b: List[BFloat16]) raises:
     if len(a) != len(b):
         raise Error(name + ": length mismatch " + String(len(a)) + " vs " + String(len(b)))
     var maxd = Float32(0.0)
     for i in range(len(a)):
-        var d = a[i] - b[i]
+        var d = a[i].cast[DType.float32]() - b[i].cast[DType.float32]()
         var ad = d if d >= 0.0 else -d
         if ad > maxd:
             maxd = ad
     if maxd != Float32(0.0):
-        raise Error(name + ": NOT byte-exact, max_abs_diff=" + String(maxd))
-    print("  ", name, " byte-exact (max_abs_diff=0, n=", len(a), ")")
+        raise Error(name + ": NOT BF16-exact, max_abs_diff=" + String(maxd))
+    print("  ", name, " BF16-exact (max_abs_diff=0, n=", len(a), ")")
 
 
 def main() raises:
@@ -91,13 +90,13 @@ def main() raises:
     # Module 0
     if loaded[0].adapter.rank != 4 or loaded[0].adapter.in_f != 8 or loaded[0].adapter.out_f != 6:
         raise Error("module 0 shape mismatch on reload")
-    _assert_exact("module0.A", a0_orig, loaded[0].adapter.a)
-    _assert_exact("module0.B", b0_orig, loaded[0].adapter.b)
+    _assert_exact_bf16("module0.A", a0_orig, loaded[0].adapter.a)
+    _assert_exact_bf16("module0.B", b0_orig, loaded[0].adapter.b)
 
     # Module 1
     if loaded[1].adapter.rank != 2 or loaded[1].adapter.in_f != 5 or loaded[1].adapter.out_f != 7:
         raise Error("module 1 shape mismatch on reload")
-    _assert_exact("module1.A", a1_orig, loaded[1].adapter.a)
-    _assert_exact("module1.B", b1_orig, loaded[1].adapter.b)
+    _assert_exact_bf16("module1.A", a1_orig, loaded[1].adapter.a)
+    _assert_exact_bf16("module1.B", b1_orig, loaded[1].adapter.b)
 
-    print("lora_save round-trip smoke PASS (PEFT keys, F32 byte-exact)")
+    print("lora_save round-trip smoke PASS (PEFT keys, BF16 A/B exact)")

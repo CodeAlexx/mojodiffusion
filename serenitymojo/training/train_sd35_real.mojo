@@ -137,6 +137,14 @@ def _absum(v: List[Float32]) -> Float32:
     return s
 
 
+def _absum(v: List[BFloat16]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(v)):
+        var x = v[i].cast[DType.float32]()
+        s += x if x >= 0.0 else -x
+    return s
+
+
 def _global_norm(grads: SD35LoraGradSet) -> Float64:
     var ss = 0.0
     for i in range(len(grads.d_a)):

@@ -25,7 +25,11 @@ from serenitymojo.io.ffi import (
     sys_open, sys_close, sys_pwrite, BytePtr,
     O_WRONLY, O_CREAT, O_TRUNC,
 )
-from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.train_config import (
+    TrainConfig,
+    TRAIN_MODALITY_VIDEO, TRAIN_MODALITY_AV,
+    LORA_TARGET_LEGACY_VIDEO_ATTN1, LORA_TARGET_LTX2_V2V,
+)
 from std.memory import alloc
 
 
@@ -61,6 +65,11 @@ def _eq(name: String, a: Int, b: Int) raises:
 def _eqb(name: String, a: Bool, b: Bool) raises:
     if a != b:
         raise Error(name + " expected " + String(b) + ", got " + String(a))
+
+
+def _eqs(name: String, a: String, b: String) raises:
+    if a != b:
+        raise Error(name + " expected " + b + ", got " + a)
 
 
 # A minimal-but-valid arch stub shared by both JSONs so the parser walks a
@@ -109,6 +118,16 @@ def _gate_all_set() raises:
     js += '"ema_update_after_step":50,'
     js += '"ema_min_decay":0.1,'
     js += '"ema_max_decay":0.999,'
+    # Cached-input / AV trainer contract.
+    js += '"train_modality":"av",'
+    js += '"lora_target_preset":"v2v",'
+    js += '"dataset_cache_dir":"/tmp/ltx2_av_cache",'
+    js += '"require_cached_video_latents":true,'
+    js += '"require_cached_text_embeddings":true,'
+    js += '"require_cached_audio_latents":true,'
+    js += '"hot_loop_device_only":true,'
+    js += '"video_loss_weight":1.0,'
+    js += '"audio_loss_weight":0.25,'
     js += '"algo":"full"'
     js += "}"
     _write_file(path, js)
@@ -152,9 +171,19 @@ def _gate_all_set() raises:
     _eq("ema_update_after_step", c.ema_update_after_step, 50)
     _close("ema_min_decay", c.ema_min_decay, Float32(0.1))
     _close("ema_max_decay", c.ema_max_decay, Float32(0.999))
+    # Cached-input / AV trainer contract.
+    _eq("train_modality(av->1)", c.train_modality, TRAIN_MODALITY_AV)
+    _eq("lora_target_preset(v2v->2)", c.lora_target_preset, LORA_TARGET_LTX2_V2V)
+    _eqs("dataset_cache_dir", c.dataset_cache_dir, String("/tmp/ltx2_av_cache"))
+    _eqb("require_cached_video_latents", c.require_cached_video_latents, True)
+    _eqb("require_cached_text_embeddings", c.require_cached_text_embeddings, True)
+    _eqb("require_cached_audio_latents", c.require_cached_audio_latents, True)
+    _eqb("hot_loop_device_only", c.hot_loop_device_only, True)
+    _close("video_loss_weight", c.video_loss_weight, Float32(1.0))
+    _close("audio_loss_weight", c.audio_loss_weight, Float32(0.25))
     # Wave 2B — adapter algo (string -> int)
     _eq("adapter_algo(full->1)", c.adapter_algo, 1)
-    print("  gate (a) PASS — all 30 Wave 2 keys reachable + mapped correctly")
+    print("  gate (a) PASS — Wave 2 keys and AV cache contract keys reachable + mapped correctly")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +226,15 @@ def _gate_none_set() raises:
     _eq("ema_update_after_step", c.ema_update_after_step, d.ema_update_after_step)
     _close("ema_min_decay", c.ema_min_decay, d.ema_min_decay)
     _close("ema_max_decay", c.ema_max_decay, d.ema_max_decay)
+    _eq("train_modality", c.train_modality, TRAIN_MODALITY_VIDEO)
+    _eq("lora_target_preset", c.lora_target_preset, LORA_TARGET_LEGACY_VIDEO_ATTN1)
+    _eqs("dataset_cache_dir", c.dataset_cache_dir, d.dataset_cache_dir)
+    _eqb("require_cached_video_latents", c.require_cached_video_latents, d.require_cached_video_latents)
+    _eqb("require_cached_text_embeddings", c.require_cached_text_embeddings, d.require_cached_text_embeddings)
+    _eqb("require_cached_audio_latents", c.require_cached_audio_latents, d.require_cached_audio_latents)
+    _eqb("hot_loop_device_only", c.hot_loop_device_only, d.hot_loop_device_only)
+    _close("video_loss_weight", c.video_loss_weight, d.video_loss_weight)
+    _close("audio_loss_weight", c.audio_loss_weight, d.audio_loss_weight)
     _eq("adapter_algo", c.adapter_algo, d.adapter_algo)
     print("  gate (b) PASS — absent keys preserve default() (baseline byte-unchanged)")
 

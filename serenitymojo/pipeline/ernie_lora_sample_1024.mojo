@@ -88,8 +88,10 @@ def _shared_adaln_source(
     var ts = List[Float32]()
     ts.append(timestep_value)
     var ts_t = Tensor.from_host(ts, [1], STDtype.F32, ctx)
-    var emb = timestep_embedding_sin_first(ts_t, D, ctx, 10000.0)
-    var h1 = linear(emb, base.te_w1[], Optional[Tensor](base.te_b1[].clone(ctx)), ctx)
+    var emb_in = timestep_embedding_sin_first(
+        ts_t, D, ctx, 10000.0, base.te_w1[].dtype()
+    )
+    var h1 = linear(emb_in, base.te_w1[], Optional[Tensor](base.te_b1[].clone(ctx)), ctx)
     h1 = silu(h1, ctx)
     var c = linear(h1, base.te_w2[], Optional[Tensor](base.te_b2[].clone(ctx)), ctx)
 
@@ -212,12 +214,12 @@ def _sample_prompt[COND_TXT: Int, S_COND: Int](
     var cond = _load_prompt_caps(pos_path, COND_TXT, ctx)
     var neg = _load_prompt_caps(neg_path, NEG_TXT, ctx)
 
-    var lora_dev = ernie_lora_set_to_device(lora, STDtype.F32, ctx)
+    var lora_dev = ernie_lora_set_to_device(lora, STDtype.BF16, ctx)
     var cond_rope = build_ernie_rope_tables[N_IMG, COND_TXT, H, Dh](
-        LH, LW, cond.real_len, ctx, STDtype.F32
+        LH, LW, cond.real_len, ctx, STDtype.BF16
     )
     var neg_rope = build_ernie_rope_tables[N_IMG, NEG_TXT, H, Dh](
-        LH, LW, neg.real_len, ctx, STDtype.F32
+        LH, LW, neg.real_len, ctx, STDtype.BF16
     )
 
     var sh = List[Int]()
@@ -225,7 +227,7 @@ def _sample_prompt[COND_TXT: Int, S_COND: Int](
     sh.append(IN_CH)
     sh.append(LH)
     sh.append(LW)
-    var noise = randn(sh^, seed, STDtype.F32, ctx)
+    var noise = randn(sh^, seed, STDtype.BF16, ctx)
     var latent_tokens = _latent_nchw_to_tokens(noise.to_host(ctx))
     var sigmas = build_ernie_sigma_schedule(steps, SHIFT)
 

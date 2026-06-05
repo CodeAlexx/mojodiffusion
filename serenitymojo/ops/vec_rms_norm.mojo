@@ -1,4 +1,4 @@
-# ops/vec_rms_norm.mojo — VECTORIZED RMSNorm forward + backward (F32).
+# ops/vec_rms_norm.mojo — VECTORIZED RMSNorm forward + backward (F32 fast path).
 #
 # NEW STANDALONE kernel. Does NOT replace ops/norm.mojo / ops/norm_backward.mojo
 # — it is a faster sibling whose math is byte-identical to the scalar ones, and
@@ -10,11 +10,9 @@
 # which is the same trick flame-core's vectorized BF16 kernels use (`__hadd2`,
 # `float2`, `__nv_bfloat162` — 2/4 elements per thread, FLAME_KERNELS.md).
 #
-# Requirement: the normalized feature dim D must be a multiple of 4 (Klein Dh=128
-# satisfies this; the full hidden D=3072/3840/4096 all do too). If D % 4 != 0 we
-# RAISE and the caller should fall back to the scalar ops/norm.mojo path
-# (AGENT-DEFAULT: assert-and-raise rather than silently materializing a slow
-# scalar tail here — keeps this file a pure fast path).
+# Requirement for the vector path: the normalized feature dim D must be a
+# multiple of 4. BF16/F16 and non-multiple-D tensors fall back to the general
+# dtype-preserving norm kernels instead of materializing F32 storage here.
 #
 # Math (matches ops/norm.mojo rms_norm + ops/norm_backward.mojo rms_norm_backward
 # EXACTLY):
@@ -22,7 +20,8 @@
 #   y[c]   = x[c]*inv*g[c]
 #   d_x[c] = g[c]*go[c]*inv - x[c]*inv^3*(1/D)*sum_j(go[j]*g[j]*x[j])
 #   d_g[c] = sum_rows( go[c] * x[c]*inv )
-# F32 interior (this file is F32-only, like ops/norm_backward.mojo).
+# F32 interior. The vectorized fast path is F32-only, but BF16/F16 storage
+# routes to the general dtype-preserving norm/backward kernels.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -36,6 +35,8 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.norm import rms_norm as _general_rms_norm
+from serenitymojo.ops.norm_backward import rms_norm_backward as _general_rms_norm_backward
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -90,19 +91,13 @@ def _vec_rms_fwd_kernel(
 def vec_rms_norm(
     x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> Tensor:
-    """Vectorized RMSNorm over the last dim. F32-only; D must be a multiple of 4.
-
-    Byte-identical math to ops/norm.mojo rms_norm (F32 path)."""
+    """Vectorized RMSNorm over the last dim for F32-friendly shapes."""
     if x.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
-        raise Error("vec_rms_norm: F32-only fast path (cast or use ops/norm.mojo)")
+        return _general_rms_norm(x, weight, eps, ctx)
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     if d % _VW != 0:
-        raise Error(
-            String("vec_rms_norm: D must be a multiple of 4 (got ")
-            + String(d)
-            + ") — use the scalar ops/norm.mojo path"
-        )
+        return _general_rms_norm(x, weight, eps, ctx)
     var rows = 1
     for i in range(len(xshape) - 1):
         rows *= xshape[i]
@@ -232,17 +227,19 @@ struct VecRmsNormBackward(Movable):
 def vec_rms_norm_backward(
     go: Tensor, x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> VecRmsNormBackward:
-    """Vectorized backward of rms_norm. F32-only; D must be a multiple of 4.
-    Byte-identical math to ops/norm_backward.mojo rms_norm_backward (F32)."""
+    """Vectorized backward of rms_norm for F32-friendly shapes."""
     if x.dtype() != STDtype.F32 or go.dtype() != STDtype.F32 or weight.dtype() != STDtype.F32:
-        raise Error("vec_rms_norm_backward: F32-only fast path")
+        var general = _general_rms_norm_backward(go, x, weight, eps, ctx)
+        var dx = general.d_x.clone(ctx)
+        var dg = general.d_g.clone(ctx)
+        return VecRmsNormBackward(dx^, dg^)
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     if d % _VW != 0:
-        raise Error(
-            String("vec_rms_norm_backward: D must be a multiple of 4 (got ")
-            + String(d) + ")"
-        )
+        var general = _general_rms_norm_backward(go, x, weight, eps, ctx)
+        var dx = general.d_x.clone(ctx)
+        var dg = general.d_g.clone(ctx)
+        return VecRmsNormBackward(dx^, dg^)
     var rows = 1
     for i in range(len(xshape) - 1):
         rows *= xshape[i]

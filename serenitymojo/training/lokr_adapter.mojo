@@ -61,7 +61,7 @@
 #              d_w2b = w2aᵀ @ d_W2.
 # (W1 full only this wave → d_w1 is the single full-W1 grad.)
 #
-# Host F32 master throughout (training masters are F32 per MOJO_CONVENTIONS §3).
+# BF16 trainable storage, F32 internal compute/moments.
 # Mojo 0.26.x: `def` not `fn`; multi-return via Movable struct. MIRRORS
 # loha_adapter.mojo structure.
 
@@ -148,18 +148,32 @@ def _zeros(n: Int) -> List[Float32]:
     return out^
 
 
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
+
+
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
 # ── the LoKr adapter (Linear) — W1 full + W2 (full or factored) + AdamW ──────
 # W1 : [out_l, in_m]  (full this wave)
 # W2 : full [out_k, in_n]  OR  factored w2a:[out_k,r] @ w2b:[r,in_n]
 # w2_factored flags which W2 storage is live.
 struct LoKrAdapter(Copyable, Movable):
-    var w1: List[Float32]         # [out_l, in_m]  (empty if W1 factored)
-    var w1a: List[Float32]        # [out_l, rank]  (empty if W1 full)
-    var w1b: List[Float32]        # [rank, in_m]   (empty if W1 full)
+    var w1: List[BFloat16]        # [out_l, in_m]  (empty if W1 factored)
+    var w1a: List[BFloat16]       # [out_l, rank]  (empty if W1 full)
+    var w1b: List[BFloat16]       # [rank, in_m]   (empty if W1 full)
     var w1_factored: Bool
-    var w2: List[Float32]         # [out_k, in_n]  (empty if factored)
-    var w2a: List[Float32]        # [out_k, rank]  (empty if full)
-    var w2b: List[Float32]        # [rank, in_n]   (empty if full)
+    var w2: List[BFloat16]        # [out_k, in_n]  (empty if factored)
+    var w2a: List[BFloat16]       # [out_k, rank]  (empty if full)
+    var w2b: List[BFloat16]       # [rank, in_n]   (empty if full)
     var w2_factored: Bool
     var rank: Int
     var in_f: Int
@@ -199,13 +213,13 @@ struct LoKrAdapter(Copyable, Movable):
         var m_w2a: List[Float32], var v_w2a: List[Float32],
         var m_w2b: List[Float32], var v_w2b: List[Float32],
     ):
-        self.w1 = w1^
-        self.w1a = w1a^
-        self.w1b = w1b^
+        self.w1 = _f32_to_bf16_list(w1)
+        self.w1a = _f32_to_bf16_list(w1a)
+        self.w1b = _f32_to_bf16_list(w1b)
         self.w1_factored = w1_factored
-        self.w2 = w2^
-        self.w2a = w2a^
-        self.w2b = w2b^
+        self.w2 = _f32_to_bf16_list(w2)
+        self.w2a = _f32_to_bf16_list(w2a)
+        self.w2b = _f32_to_bf16_list(w2b)
         self.w2_factored = w2_factored
         self.rank = rank
         self.in_f = in_f
@@ -295,15 +309,19 @@ def new_lokr_adapter(
 # Resolve W2 as a dense [out_k, in_n] matrix (materialize w2a@w2b if factored).
 def lokr_resolve_w2(lo: LoKrAdapter) raises -> List[Float32]:
     if lo.w2_factored:
-        return _matmul(lo.w2a, lo.out_k, lo.rank, lo.w2b, lo.rank, lo.in_n)  # [out_k,in_n]
-    return lo.w2.copy()
+        var w2a = _bf16_to_f32_list(lo.w2a)
+        var w2b = _bf16_to_f32_list(lo.w2b)
+        return _matmul(w2a, lo.out_k, lo.rank, w2b, lo.rank, lo.in_n)  # [out_k,in_n]
+    return _bf16_to_f32_list(lo.w2)
 
 
 # Resolve W1 as a dense [out_l, in_m] matrix (materialize w1a@w1b if factored).
 def lokr_resolve_w1(lo: LoKrAdapter) raises -> List[Float32]:
     if lo.w1_factored:
-        return _matmul(lo.w1a, lo.out_l, lo.rank, lo.w1b, lo.rank, lo.in_m)  # [out_l,in_m]
-    return lo.w1.copy()
+        var w1a = _bf16_to_f32_list(lo.w1a)
+        var w1b = _bf16_to_f32_list(lo.w1b)
+        return _matmul(w1a, lo.out_l, lo.rank, w1b, lo.rank, lo.in_m)  # [out_l,in_m]
+    return _bf16_to_f32_list(lo.w1)
 
 
 # ── ΔW = kron(W1, W2) * scale  →  [out,in] flat ──────────────────────────────
@@ -406,9 +424,11 @@ def lokr_backward(d_y_h: List[Float32], x_h: List[Float32], lo: LoKrAdapter, M: 
     var d_w1b = List[Float32]()
     if lo.w1_factored:
         # W1 = w1a @ w1b ;  d_w1a = d_W1 @ w1bᵀ ;  d_w1b = w1aᵀ @ d_W1.
-        var w1b_t = _transpose(lo.w1b, R, IM)             # [in_m,rank]
+        var w1b = _bf16_to_f32_list(lo.w1b)
+        var w1a = _bf16_to_f32_list(lo.w1a)
+        var w1b_t = _transpose(w1b, R, IM)                # [in_m,rank]
         d_w1a = _matmul(d_w1full, OL, IM, w1b_t, IM, R)   # [out_l,rank]
-        var w1a_t = _transpose(lo.w1a, OL, R)             # [rank,out_l]
+        var w1a_t = _transpose(w1a, OL, R)                # [rank,out_l]
         d_w1b = _matmul(w1a_t, R, OL, d_w1full, OL, IM)   # [rank,in_m]
     else:
         d_w1 = d_w1full.copy()
@@ -419,9 +439,11 @@ def lokr_backward(d_y_h: List[Float32], x_h: List[Float32], lo: LoKrAdapter, M: 
     var d_w2b = List[Float32]()
     if lo.w2_factored:
         # W2 = w2a @ w2b ;  d_w2a = d_W2 @ w2bᵀ ;  d_w2b = w2aᵀ @ d_W2.
-        var w2b_t = _transpose(lo.w2b, R, INn)            # [in_n,rank]
+        var w2b = _bf16_to_f32_list(lo.w2b)
+        var w2a = _bf16_to_f32_list(lo.w2a)
+        var w2b_t = _transpose(w2b, R, INn)               # [in_n,rank]
         d_w2a = _matmul(d_w2full, OK, INn, w2b_t, INn, R) # [out_k,rank]
-        var w2a_t = _transpose(lo.w2a, OK, R)             # [rank,out_k]
+        var w2a_t = _transpose(w2a, OK, R)                # [rank,out_k]
         d_w2b = _matmul(w2a_t, R, OK, d_w2full, OK, INn)  # [rank,in_n]
     else:
         d_w2 = d_w2full.copy()
@@ -431,7 +453,7 @@ def lokr_backward(d_y_h: List[Float32], x_h: List[Float32], lo: LoKrAdapter, M: 
 
 # ── AdamW one step over the live factors ─────────────────────────────────────
 def _adamw_host_list(
-    mut p: List[Float32], g: List[Float32],
+    mut p: List[BFloat16], g: List[Float32],
     mut mom: List[Float32], mut vmo: List[Float32],
     t: Int, lr: Float32, beta1: Float32, beta2: Float32,
     eps: Float32, weight_decay: Float32,
@@ -456,10 +478,10 @@ def _adamw_host_list(
         vmo[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
+        var pv = p[i].cast[DType.float32]() - lr * m_hat / (sqrt(v_hat) + eps)
         if weight_decay > 0.0:
             pv = pv - lr * weight_decay * pv
-        p[i] = pv
+        p[i] = BFloat16(pv)
 
 
 def lokr_adamw(

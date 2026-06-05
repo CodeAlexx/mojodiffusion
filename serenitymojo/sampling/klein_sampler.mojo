@@ -98,7 +98,7 @@ def _rope_host[N_IMG: Int, N_TXT: Int, S: Int, H: Int]() raises -> Tuple[List[Fl
     return (cos_vals^, sin_vals^)
 
 
-# Initial noise as img tokens [N_IMG, in_ch]: randn NCHW [1,in_ch,LH,LW] ->
+# Initial BF16 noise as img tokens [N_IMG, in_ch]: randn NCHW [1,in_ch,LH,LW] ->
 # NHWC -> [N_IMG, in_ch] (the shape klein_stack_lora_forward's img path expects,
 # mirroring train_klein_real._latent_to_img_tokens_device).
 def _initial_noise_tokens[N_IMG: Int, LH: Int, LW: Int](
@@ -106,7 +106,7 @@ def _initial_noise_tokens[N_IMG: Int, LH: Int, LW: Int](
 ) raises -> Tensor:
     var nchw = List[Int]()
     nchw.append(1); nchw.append(in_ch); nchw.append(LH); nchw.append(LW)
-    var noise = randn(nchw^, seed, STDtype.F32, ctx)
+    var noise = randn(nchw^, seed, STDtype.BF16, ctx)
     var p = List[Int]()
     p.append(0); p.append(2); p.append(3); p.append(1)
     var nhwc = permute(noise, p^, ctx)

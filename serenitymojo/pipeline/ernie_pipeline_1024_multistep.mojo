@@ -158,7 +158,7 @@ def _ones_bf16(n: Int, ctx: DeviceContext) raises -> Tensor:
         vals.append(1.0)
     var sh = List[Int]()
     sh.append(n)
-    return cast_tensor(Tensor.from_host(vals, sh^, STDtype.F32, ctx), STDtype.BF16, ctx)
+    return Tensor.from_host(vals, sh^, STDtype.BF16, ctx)
 
 
 def _zeros_bf16(n: Int, ctx: DeviceContext) raises -> Tensor:
@@ -167,7 +167,7 @@ def _zeros_bf16(n: Int, ctx: DeviceContext) raises -> Tensor:
         vals.append(0.0)
     var sh = List[Int]()
     sh.append(n)
-    return cast_tensor(Tensor.from_host(vals, sh^, STDtype.F32, ctx), STDtype.BF16, ctx)
+    return Tensor.from_host(vals, sh^, STDtype.BF16, ctx)
 
 
 # ── Single ERNIE block forward (BlockLoader dict) ─────────────────────────────
@@ -408,10 +408,8 @@ def main() raises:
     noise_sh.append(ERNIE_LATENT_CHANNELS)
     noise_sh.append(LH)
     noise_sh.append(LW)
-    var noise = randn(noise_sh^, SEED, STDtype.F32, ctx)
-    _stats("initial_noise", noise, ctx)
-
-    var latent = noise^   # F32 throughout the loop; transferred (noise consumed)
+    var latent = randn(noise_sh^, SEED, STDtype.BF16, ctx)
+    _stats("initial_noise", latent, ctx)
 
     for step in range(NUM_STEPS):
         var sigma = sched.sigma(step)
@@ -427,21 +425,16 @@ def main() raises:
         t_sh.append(1)
         var timestep = Tensor.from_host(t_list, t_sh^, STDtype.F32, ctx)
 
-        # Cast F32 latent -> BF16 for DiT
-        var latent_bf16 = cast_tensor(latent, STDtype.BF16, ctx)
-
         # Sequential CFG: cond forward then uncond forward
         var v_cond = _ernie_forward[S_COND, N_IMG, N_TXT_COND](
-            latent_bf16, cond_trim, N_TXT_COND, timestep, resident, loader, ctx
+            latent, cond_trim, N_TXT_COND, timestep, resident, loader, ctx
         )
         var v_uncond = _ernie_forward[S_UNCOND, N_IMG, N_TXT_UNCOND](
-            latent_bf16, uncond_trim, N_TXT_UNCOND, timestep, resident, loader, ctx
+            latent, uncond_trim, N_TXT_UNCOND, timestep, resident, loader, ctx
         )
 
-        # CFG (F32 arithmetic)
-        var vc_f32 = cast_tensor(v_cond, STDtype.F32, ctx)
-        var vu_f32 = cast_tensor(v_uncond, STDtype.F32, ctx)
-        var pred = ernie_cfg(vc_f32, vu_f32, CFG_SCALE, ctx)
+        # CFG/Euler tensor ops use F32 arithmetic internally and store BF16.
+        var pred = ernie_cfg(v_cond, v_uncond, CFG_SCALE, ctx)
 
         # Euler step
         latent = ernie_euler_step(latent, pred, dt, ctx)
@@ -449,8 +442,8 @@ def main() raises:
     _stats("final_latent", latent, ctx)
 
     # Stage 5: VAE decode
-    # KleinVaeDecoder expects F32 latents in NCHW layout [1, 128, LH, LW].
-    # latent is already F32 from the denoise loop.
+    # KleinVaeDecoder accepts BF16 packed latents; inverse-BN/unpack use F32
+    # arithmetic internally and return the latent storage dtype.
     print("\n[5/5] VAE decode...")
     var vae = KleinVaeDecoder[LH, LW].load(String(ERNIE_VAE_FILE), ctx)
     var img = vae.decode(latent, ctx)

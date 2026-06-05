@@ -83,9 +83,9 @@ comptime _BLOCK = 256
 # so encode->patchify->decode->unpatchify round-trips the packing.
 
 
-def _patchify_packed_kernel_f32(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [B,32,2H,2W]
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [B,128,H,W]
+def _patchify_packed_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [B,32,2H,2W]
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [B,128,H,W]
     B: Int,
     H: Int,
     W: Int,
@@ -109,52 +109,78 @@ def _patchify_packed_kernel_f32(
         var IH = H * 2
         var IW = W * 2
         var src = ((b * LATENT_CH + c) * IH + ih) * IW + iw
-        o[idx] = rebind[o.element_type](rebind[Scalar[DType.float32]](x[src]))
+        o[idx] = rebind[o.element_type](rebind[Scalar[dtype]](x[src]))
 
 
 def _patchify_packed(x: Tensor, ctx: DeviceContext) raises -> Tensor:
-    """[B,32,2H,2W] (NCHW) -> [B,128,H,W] (NCHW). F32 only."""
+    """[B,32,2H,2W] (NCHW) -> [B,128,H,W] (NCHW), preserving storage dtype."""
     var sh = x.shape()
     if len(sh) != 4 or sh[1] != LATENT_CH:
         raise Error("_patchify_packed: expected [B,32,2H,2W]")
-    if x.dtype() != STDtype.F32:
-        raise Error("_patchify_packed: F32 only")
+    var storage = x.dtype()
+    var dt = storage.to_mojo_dtype()
+    if dt != DType.float32 and dt != DType.bfloat16 and dt != DType.float16:
+        raise Error("_patchify_packed: expected F32, BF16, or F16 storage")
     if sh[2] % 2 != 0 or sh[3] % 2 != 0:
         raise Error("_patchify_packed: spatial dims must be even")
     var B = sh[0]
     var H = sh[2] // 2
     var W = sh[3] // 2
     var out_n = B * PACKED_CH * H * W
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_n * storage.byte_size())
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_n))
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-    )
     var grid = (out_n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_patchify_packed_kernel_f32, _patchify_packed_kernel_f32](
-        X, O, B, H, W, grid_dim=grid, block_dim=_BLOCK
-    )
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[
+            _patchify_packed_kernel[DType.float32],
+            _patchify_packed_kernel[DType.float32],
+        ](X, O, B, H, W, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[
+            _patchify_packed_kernel[DType.bfloat16],
+            _patchify_packed_kernel[DType.bfloat16],
+        ](X, O, B, H, W, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[
+            _patchify_packed_kernel[DType.float16],
+            _patchify_packed_kernel[DType.float16],
+        ](X, O, B, H, W, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var osh = List[Int]()
     osh.append(B)
     osh.append(PACKED_CH)
     osh.append(H)
     osh.append(W)
-    return Tensor(out_buf^, osh^, STDtype.F32)
+    return Tensor(out_buf^, osh^, storage)
 
 
 # ── BatchNorm forward kernel: (z - mean) * inv_scale, per packed channel ───────
 
 
-def _bn_forward_kernel_f32(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],       # [B,128,H,W]
+def _bn_forward_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],       # [B,128,H,W]
     inv_scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [128]
     mean: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],       # [128]
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     H: Int,
     W: Int,
     n: Int,
@@ -163,10 +189,10 @@ def _bn_forward_kernel_f32(
     if i < n:
         var hw = H * W
         var c = (i // hw) % PACKED_CH
-        var v = rebind[Scalar[DType.float32]](x[i])
+        var v = rebind[Scalar[dtype]](x[i]).cast[DType.float32]()
         var m = rebind[Scalar[DType.float32]](mean[c])
         var s = rebind[Scalar[DType.float32]](inv_scale[c])
-        o[i] = rebind[o.element_type]((v - m) * s)
+        o[i] = rebind[o.element_type](((v - m) * s).cast[dtype]())
 
 
 def _bn_forward(
@@ -175,32 +201,60 @@ def _bn_forward(
     var sh = x.shape()
     if len(sh) != 4 or sh[1] != PACKED_CH:
         raise Error("_bn_forward: expected [B,128,H,W]")
-    if x.dtype() != STDtype.F32:
-        raise Error("_bn_forward: F32 only")
+    var storage = x.dtype()
+    var dt = storage.to_mojo_dtype()
+    if dt != DType.float32 and dt != DType.bfloat16 and dt != DType.float16:
+        raise Error("_bn_forward: expected F32, BF16, or F16 storage")
+    if inv_scale.dtype() != STDtype.F32 or mean.dtype() != STDtype.F32:
+        raise Error("_bn_forward: BN stats must be F32")
     var H = sh[2]
     var W = sh[3]
     var n = x.numel()
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * storage.byte_size())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var crl = RuntimeLayout[_DYN1].row_major(IndexList[1](PACKED_CH))
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         inv_scale.buf.unsafe_ptr().bitcast[Float32](), crl
     )
     var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         mean.buf.unsafe_ptr().bitcast[Float32](), crl
     )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_bn_forward_kernel_f32, _bn_forward_kernel_f32](
-        X, S, M, O, H, W, n, grid_dim=grid, block_dim=_BLOCK
-    )
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[
+            _bn_forward_kernel[DType.float32],
+            _bn_forward_kernel[DType.float32],
+        ](X, S, M, O, H, W, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[
+            _bn_forward_kernel[DType.bfloat16],
+            _bn_forward_kernel[DType.bfloat16],
+        ](X, S, M, O, H, W, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[
+            _bn_forward_kernel[DType.float16],
+            _bn_forward_kernel[DType.float16],
+        ](X, S, M, O, H, W, n, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
-    return Tensor(out_buf^, sh^, STDtype.F32)
+    return Tensor(out_buf^, sh^, storage)
 
 
 # ── BN running stats loaders ──────────────────────────────────────────────────
@@ -433,7 +487,5 @@ struct KleinVaeEncoder[IH: Int, IW: Int](Movable):
         # h is NHWC [1, IH/8, IW/8, 64] = [mu(32) | logvar(32)]. Take mu.
         var mu_nhwc = slice(h, 3, 0, LATENT_CH, ctx)  # [1,IH/8,IW/8,32]
         var mu = nhwc_to_nchw(mu_nhwc, ctx)            # [1,32,IH/8,IW/8]
-        if mu.dtype() != STDtype.F32:
-            mu = cast_tensor(mu, STDtype.F32, ctx)
         var z = _patchify_packed(mu, ctx)              # [1,128,IH/16,IW/16]
         return _bn_forward(z, self.bn_inv_scale, self.bn_mean, ctx)

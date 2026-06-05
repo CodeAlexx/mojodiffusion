@@ -276,10 +276,8 @@ struct SDXLUNet[LH: Int, LW: Int]:
         var tsh = List[Int]()
         tsh.append(1)
         var t = Tensor.from_host(th, tsh^, STDtype.F32, ctx)
-        var emb = timestep_embedding(t, MC, ctx, Float32(10000.0))  # [1,320] F32
-        # cast to BF16 to match weights (linear requires same dtype).
         var dtype = self._w(String("time_embed.0.weight")).dtype()
-        emb = _cast_to(emb, dtype, ctx)
+        var emb = timestep_embedding(t, MC, ctx, Float32(10000.0), dtype)
         var h = self._lin_b(emb, String("time_embed.0.weight"), String("time_embed.0.bias"), ctx)
         h = silu(h, ctx)
         return self._lin_b(h, String("time_embed.2.weight"), String("time_embed.2.bias"), ctx)

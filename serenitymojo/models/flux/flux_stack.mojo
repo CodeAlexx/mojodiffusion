@@ -107,7 +107,7 @@ def _ones(d: Int) -> List[Float32]:
 
 
 def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
-    return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+    return Tensor.from_host(vals, shape^, STDtype.BF16, ctx)
 
 
 def _concat_seq(txt: List[Float32], img: List[Float32]) -> List[Float32]:
@@ -198,8 +198,8 @@ struct ModLin(Copyable, Movable):
     var b: TArc      # [chunk]
 
     def __init__(out self, var w: List[Float32], var b: List[Float32], chunk: Int, D: Int, ctx: DeviceContext) raises:
-        self.w = TArc(Tensor.from_host(w^, [chunk, D], STDtype.F32, ctx))
-        self.b = TArc(Tensor.from_host(b^, [chunk], STDtype.F32, ctx))
+        self.w = TArc(Tensor.from_host(w^, [chunk, D], STDtype.BF16, ctx))
+        self.b = TArc(Tensor.from_host(b^, [chunk], STDtype.BF16, ctx))
 
 
 struct DoubleModLin(Copyable, Movable):
@@ -229,10 +229,10 @@ struct EmbedMlp(Copyable, Movable):
         var out_w: List[Float32], var out_b: List[Float32],
         in_dim: Int, D: Int, ctx: DeviceContext,
     ) raises:
-        self.in_w = TArc(Tensor.from_host(in_w^, [D, in_dim], STDtype.F32, ctx))
-        self.in_b = TArc(Tensor.from_host(in_b^, [D], STDtype.F32, ctx))
-        self.out_w = TArc(Tensor.from_host(out_w^, [D, D], STDtype.F32, ctx))
-        self.out_b = TArc(Tensor.from_host(out_b^, [D], STDtype.F32, ctx))
+        self.in_w = TArc(Tensor.from_host(in_w^, [D, in_dim], STDtype.BF16, ctx))
+        self.in_b = TArc(Tensor.from_host(in_b^, [D], STDtype.BF16, ctx))
+        self.out_w = TArc(Tensor.from_host(out_w^, [D, D], STDtype.BF16, ctx))
+        self.out_b = TArc(Tensor.from_host(out_b^, [D], STDtype.BF16, ctx))
 
 
 # ── stack-level frozen/shared base (embeds + per-block mod.lin + final layer) ─
@@ -263,20 +263,20 @@ struct FluxStackBase(Copyable, Movable):
         var final_lin: List[Float32], var final_lin_b: List[Float32],
         D: Int, in_ch: Int, txt_ch: Int, out_ch: Int, ctx: DeviceContext,
     ) raises:
-        self.img_in = TArc(Tensor.from_host(img_in^, [D, in_ch], STDtype.F32, ctx))
-        self.img_in_b = TArc(Tensor.from_host(img_in_b^, [D], STDtype.F32, ctx))
-        self.txt_in = TArc(Tensor.from_host(txt_in^, [D, txt_ch], STDtype.F32, ctx))
-        self.txt_in_b = TArc(Tensor.from_host(txt_in_b^, [D], STDtype.F32, ctx))
+        self.img_in = TArc(Tensor.from_host(img_in^, [D, in_ch], STDtype.BF16, ctx))
+        self.img_in_b = TArc(Tensor.from_host(img_in_b^, [D], STDtype.BF16, ctx))
+        self.txt_in = TArc(Tensor.from_host(txt_in^, [D, txt_ch], STDtype.BF16, ctx))
+        self.txt_in_b = TArc(Tensor.from_host(txt_in_b^, [D], STDtype.BF16, ctx))
         self.time_in = time_in^
         self.has_guidance = has_guidance
         self.guidance_in = guidance_in^
         self.vector_in = vector_in^
         self.dbl_mod = dbl_mod^
         self.sgl_mod = sgl_mod^
-        self.final_adaln_w = TArc(Tensor.from_host(final_adaln_w^, [2 * D, D], STDtype.F32, ctx))
-        self.final_adaln_b = TArc(Tensor.from_host(final_adaln_b^, [2 * D], STDtype.F32, ctx))
-        self.final_lin = TArc(Tensor.from_host(final_lin^, [out_ch, D], STDtype.F32, ctx))
-        self.final_lin_b = TArc(Tensor.from_host(final_lin_b^, [out_ch], STDtype.F32, ctx))
+        self.final_adaln_w = TArc(Tensor.from_host(final_adaln_w^, [2 * D, D], STDtype.BF16, ctx))
+        self.final_adaln_b = TArc(Tensor.from_host(final_adaln_b^, [2 * D], STDtype.BF16, ctx))
+        self.final_lin = TArc(Tensor.from_host(final_lin^, [out_ch, D], STDtype.BF16, ctx))
+        self.final_lin_b = TArc(Tensor.from_host(final_lin_b^, [out_ch], STDtype.BF16, ctx))
 
 
 # ── forward result ───────────────────────────────────────────────────────────
@@ -410,7 +410,9 @@ def _embed_vec_forward(
     # itself is produced here via t_embedder? No — t_embedder fuses sinusoid+MLP;
     # we need the intermediate, so we build the sinusoid + MLP explicitly.
     from serenitymojo.ops.embeddings import timestep_embedding
-    var t_emb = timestep_embedding(_t(timestep, [1], ctx), T_DIM, ctx).to_host(ctx)  # [1,T_DIM]
+    var t_emb = timestep_embedding(
+        _t(timestep, [1], ctx), T_DIM, ctx, Float32(10000.0), STDtype.F32
+    ).to_host(ctx)  # legacy host MLP path
     var tr = _mlp_embed_fwd(t_emb.copy(), base.time_in, T_DIM, D, ctx)
     var vec = tr[0].copy()
     var t_hid = tr[1].copy()
@@ -418,7 +420,13 @@ def _embed_vec_forward(
     var g_emb = _zeros(T_DIM)
     var g_hid = _zeros(D)
     if base.has_guidance and guidance:
-        g_emb = timestep_embedding(_t(guidance.value().copy(), [1], ctx), T_DIM, ctx).to_host(ctx)
+        g_emb = timestep_embedding(
+            _t(guidance.value().copy(), [1], ctx),
+            T_DIM,
+            ctx,
+            Float32(10000.0),
+            STDtype.F32,
+        ).to_host(ctx)
         var gr = _mlp_embed_fwd(g_emb.copy(), base.guidance_in, T_DIM, D, ctx)
         vec = _add_lists(vec, gr[0])
         g_hid = gr[1].copy()
@@ -453,8 +461,8 @@ def flux_stack_forward[
     var num_double = len(dbw)
     var num_single = len(sbw)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
 
     # ── embeds -> vec ──
     var vf = _embed_vec_forward(timestep, guidance, vector, base, D, T_DIM, VEC_DIM, ctx)
@@ -628,8 +636,8 @@ def flux_stack_backward[
     var num_double = len(dbw)
     var num_single = len(sbw)
 
-    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
 
     # accumulator: d_vec_silu (grad into silu(vec)). Every mod.lin + final adaLN
     # reads silu(vec); we accumulate their d_vec_silu, then silu_backward once.

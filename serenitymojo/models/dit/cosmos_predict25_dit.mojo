@@ -173,10 +173,7 @@ def cosmos_build_rope(
     var thetas = cosmos_rope_thetas(
         cfg.head_dim, cfg.rope_t_ratio, cfg.rope_h_ratio, cfg.rope_w_ratio
     )
-    var cs = build_multiaxis_rope_tables_per_axis(positions, axes, thetas, ctx)
-    var cos_d = cast_tensor(cs[0], dtype, ctx)
-    var sin_d = cast_tensor(cs[1], dtype, ctx)
-    return (cos_d^, sin_d^)
+    return build_multiaxis_rope_tables_per_axis(positions, axes, thetas, ctx, dtype)
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────
@@ -599,8 +596,7 @@ struct CosmosPredict25Dit(Movable):
         var t_shape = List[Int]()
         t_shape.append(tp)
         var t_vec = Tensor.from_host(t_host^, t_shape^, STDtype.F32, ctx)
-        var sin_emb = timestep_embedding(t_vec, D, ctx, 10000.0)  # [Tp,D] F32, cos-first
-        var sample = cast_tensor(sin_emb, bf, ctx)               # emb_B_T_D (use_adaln_lora)
+        var sample = timestep_embedding(t_vec, D, ctx, 10000.0, bf)  # emb_B_T_D
         var h1 = linear(sample, self._w("t_embedder.1.linear_1.weight"), None, ctx)  # [Tp,D]
         h1 = silu(h1, ctx)
         var adaln_lora = linear(h1, self._w("t_embedder.1.linear_2.weight"), None, ctx)  # [Tp,3D]

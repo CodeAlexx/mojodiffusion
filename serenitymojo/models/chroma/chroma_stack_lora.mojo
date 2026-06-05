@@ -92,6 +92,15 @@ from serenitymojo.ops.elementwise_backward import modulate_backward
 comptime TArc = ArcPointer[Tensor]
 
 
+def _t_like(
+    vals: List[Float32], var shape: List[Int], ref_weight: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    var t = _t(vals, shape^, ctx)
+    if t.dtype() == ref_weight.dtype():
+        return t^
+    return cast_tensor(t, ref_weight.dtype(), ctx)
+
+
 # ── frozen stack-level base: x_embedder / context_embedder / proj_out + the
 #    per-step pooled_temb modulation table (built by the approximator). ─────────
 struct ChromaStackBase(Movable):
@@ -353,9 +362,15 @@ def chroma_stack_lora_forward_offload[
 
     # input projections (frozen base linears).
     var bi_img = Optional[Tensor](base.x_embedder_b[].clone(ctx))
-    var img = linear(_t(img_tokens.copy(), [N_IMG, in_ch], ctx), base.x_embedder_w[], bi_img, ctx).to_host(ctx)
+    var img = linear(
+        _t_like(img_tokens.copy(), [N_IMG, in_ch], base.x_embedder_w[], ctx),
+        base.x_embedder_w[], bi_img, ctx,
+    ).to_host(ctx)
     var bi_txt = Optional[Tensor](base.context_embedder_b[].clone(ctx))
-    var txt = linear(_t(txt_tokens.copy(), [N_TXT, txt_ch], ctx), base.context_embedder_w[], bi_txt, ctx).to_host(ctx)
+    var txt = linear(
+        _t_like(txt_tokens.copy(), [N_TXT, txt_ch], base.context_embedder_w[], ctx),
+        base.context_embedder_w[], bi_txt, ctx,
+    ).to_host(ctx)
 
     var dbl_img_mod = List[List[Float32]]()
     var dbl_txt_mod = List[List[Float32]]()
@@ -417,7 +432,10 @@ def chroma_stack_lora_forward_offload[
         _t(final_scale.copy(), [D], ctx), _t(final_shift.copy(), [D], ctx), ctx,
     ).to_host(ctx)
     var pb = Optional[Tensor](base.proj_out_b[].clone(ctx))
-    var out = linear(_t(normed, [N_IMG, D], ctx), base.proj_out_w[], pb, ctx).to_host(ctx)
+    var out = linear(
+        _t_like(normed, [N_IMG, D], base.proj_out_w[], ctx),
+        base.proj_out_w[], pb, ctx,
+    ).to_host(ctx)
 
     return ChromaStackForward(
         out^, dbl_saved^, sgl_saved^,
@@ -466,7 +484,8 @@ def chroma_stack_lora_backward_offload[
         _t(saved.final_scale.copy(), [D], ctx), _t(saved.final_shift.copy(), [D], ctx), ctx,
     ).to_host(ctx)
     var lbf = linear_backward(
-        _t(d_out, [N_IMG, out_ch], ctx), _t(normed, [N_IMG, D], ctx), base.proj_out_w[],
+        _t_like(d_out, [N_IMG, out_ch], base.proj_out_w[], ctx),
+        _t_like(normed, [N_IMG, D], base.proj_out_w[], ctx), base.proj_out_w[],
         N_IMG, D, out_ch, ctx,
     )
     var d_normed = lbf.d_x.to_host(ctx)
@@ -539,12 +558,14 @@ def chroma_stack_lora_backward_offload[
 
     # input-projection backward (frozen base; grads discarded, arms exercised).
     var lbi = linear_backward(
-        _t(d_io, [N_IMG, D], ctx), _t(img_tokens, [N_IMG, in_ch], ctx), base.x_embedder_w[],
+        _t_like(d_io, [N_IMG, D], base.x_embedder_w[], ctx),
+        _t_like(img_tokens, [N_IMG, in_ch], base.x_embedder_w[], ctx), base.x_embedder_w[],
         N_IMG, in_ch, D, ctx,
     )
     var d_img_tokens = lbi.d_x.to_host(ctx)
     var lbt = linear_backward(
-        _t(d_to, [N_TXT, D], ctx), _t(txt_tokens, [N_TXT, txt_ch], ctx), base.context_embedder_w[],
+        _t_like(d_to, [N_TXT, D], base.context_embedder_w[], ctx),
+        _t_like(txt_tokens, [N_TXT, txt_ch], base.context_embedder_w[], ctx), base.context_embedder_w[],
         N_TXT, txt_ch, D, ctx,
     )
     var d_txt_tokens = lbt.d_x.to_host(ctx)

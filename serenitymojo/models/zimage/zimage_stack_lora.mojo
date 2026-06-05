@@ -68,6 +68,7 @@ from std.collections import List, Optional
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.elementwise import modulate
@@ -342,15 +343,30 @@ def _host_grad_slice_to_list(
     return out^
 
 
+def _grad_arc_f32(t: TArc, ctx: DeviceContext) raises -> TArc:
+    if t[].dtype() == STDtype.F32:
+        return t.copy()
+    # Host AdamW stores master params and moments as F32; device grads may be BF16.
+    var t32 = cast_tensor(t[], STDtype.F32, ctx)
+    return TArc(t32^)
+
+
 def _zimage_tensor_grads_to_host(
     indices: List[Int], d_a_t: List[TArc], d_b_t: List[TArc],
     total_slots: Int, ctx: DeviceContext,
 ) raises -> _ZImageHostGradLists:
-    var total_bytes = 0
+    var a_f32 = List[TArc]()
+    var b_f32 = List[TArc]()
     for i in range(len(d_a_t)):
-        total_bytes += d_a_t[i][].nbytes()
+        a_f32.append(_grad_arc_f32(d_a_t[i], ctx))
     for i in range(len(d_b_t)):
-        total_bytes += d_b_t[i][].nbytes()
+        b_f32.append(_grad_arc_f32(d_b_t[i], ctx))
+
+    var total_bytes = 0
+    for i in range(len(a_f32)):
+        total_bytes += a_f32[i][].nbytes()
+    for i in range(len(b_f32)):
+        total_bytes += b_f32[i][].nbytes()
 
     var host = ctx.enqueue_create_host_buffer[DType.uint8](total_bytes)
     var a_offsets = List[Int]()
@@ -358,18 +374,18 @@ def _zimage_tensor_grads_to_host(
     var b_offsets = List[Int]()
     var b_numels = List[Int]()
     var cursor = 0
-    for i in range(len(d_a_t)):
+    for i in range(len(a_f32)):
         a_offsets.append(cursor)
-        a_numels.append(d_a_t[i][].numel())
-        var dst_a = host.create_sub_buffer[DType.uint8](cursor, d_a_t[i][].nbytes())
-        ctx.enqueue_copy(dst_buf=dst_a, src_buf=d_a_t[i][].buf)
-        cursor += d_a_t[i][].nbytes()
-    for i in range(len(d_b_t)):
+        a_numels.append(a_f32[i][].numel())
+        var dst_a = host.create_sub_buffer[DType.uint8](cursor, a_f32[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst_a, src_buf=a_f32[i][].buf)
+        cursor += a_f32[i][].nbytes()
+    for i in range(len(b_f32)):
         b_offsets.append(cursor)
-        b_numels.append(d_b_t[i][].numel())
-        var dst_b = host.create_sub_buffer[DType.uint8](cursor, d_b_t[i][].nbytes())
-        ctx.enqueue_copy(dst_buf=dst_b, src_buf=d_b_t[i][].buf)
-        cursor += d_b_t[i][].nbytes()
+        b_numels.append(b_f32[i][].numel())
+        var dst_b = host.create_sub_buffer[DType.uint8](cursor, b_f32[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst_b, src_buf=b_f32[i][].buf)
+        cursor += b_f32[i][].nbytes()
     ctx.synchronize()
 
     var d_a_flat = List[List[Float32]]()
@@ -505,9 +521,12 @@ def zimage_stack_lora_backward[
     var d_x = lnbf.d_x.to_host(ctx)
 
     # flat LoRA grad slots.
-    var grad_indices = List[Int]()
-    var d_a_t = List[TArc]()
-    var d_b_t = List[TArc]()
+    var d_a_flat = List[List[Float32]]()
+    var d_b_flat = List[List[Float32]]()
+    for _ in range(num_blocks * ZIMAGE_SLOTS):
+        d_a_flat.append(List[Float32]())
+        d_b_flat.append(List[Float32]())
+    var nonfinite = 0
 
     # ── main layers backward (REVERSE; per-block recompute) ──
     var main_mod_rev = List[List[Float32]]()

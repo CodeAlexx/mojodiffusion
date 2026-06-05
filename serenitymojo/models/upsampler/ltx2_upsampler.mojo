@@ -44,11 +44,12 @@
 # whole (cpg, D, H, W) slab; feeding group_norm a [N, D*H*W, 1, C] NHWC view
 # reduces over exactly (D*H*W, cpg) — identical statistic (verified vs torch).
 #
-# Weights load as F32 (BF16 on disk) and are transposed at load time:
+# Weights load as BF16 (BF16 on disk) and are transposed at load time:
 #   Conv3d  [Cout,Cin,Q,R,S] -> QRSCF [Q,R,S,Cin,Cout]
 #   Conv2d  [Cout,Cin,R,S]   -> RSCF  [R,S,Cin,Cout]
 #
-# GroupNorm eps = 1e-5 (torch nn.GroupNorm default).  Compute in F32.
+# GroupNorm eps = 1e-5 (torch nn.GroupNorm default).  Kernels accumulate in F32
+# and store back to the input dtype.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -67,17 +68,16 @@ from serenitymojo.ops.activations import silu
 
 comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
-comptime F32 = STDtype.F32
 comptime _GN_GROUPS = 32
 comptime _GN_EPS = Float32(1e-5)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Weight-load helpers (BF16 on disk -> F32 device tensors, transposed to NDHWC).
+# Weight-load helpers (BF16 on disk -> BF16 device tensors, transposed to NDHWC).
 # ════════════════════════════════════════════════════════════════════════════
 def _ld(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var tv = st.tensor_view(name)
-    return Tensor.from_view_as_f32(tv, ctx)
+    return Tensor.from_view_as_bf16(tv, ctx)
 
 
 def _ld_conv3d_qrscf(
@@ -104,7 +104,7 @@ def _ld_conv3d_qrscf(
                         dst[d] = host[src]
     var os = List[Int]()
     os.append(q); os.append(r); os.append(s); os.append(cin); os.append(cout)
-    return Tensor.from_host(dst, os^, F32, ctx)
+    return Tensor.from_host(dst, os^, w.dtype(), ctx)
 
 
 def _ld_conv2d_rscf(
@@ -132,7 +132,7 @@ def _ld_conv2d_rscf(
                     dst[d] = host[src]
     var os = List[Int]()
     os.append(1); os.append(r); os.append(s); os.append(cin); os.append(cout)
-    return Tensor.from_host(dst, os^, F32, ctx)
+    return Tensor.from_host(dst, os^, w.dtype(), ctx)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -169,30 +169,46 @@ def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Elementwise add  (residual): out = a + b, same shape, F32.
+# Elementwise add (residual): out = a + b, same shape/dtype; F32 arithmetic.
 # ════════════════════════════════════════════════════════════════════════════
-def _add_kernel(
-    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _add_kernel[dtype: DType](
+    a: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     total: Int,
 ):
     var idx = Int(global_idx.x)
     if idx < total:
-        o[idx] = rebind[Scalar[DType.float32]](a[idx]) + rebind[Scalar[DType.float32]](b[idx])
+        var av = rebind[Scalar[dtype]](a[idx]).cast[DType.float32]()
+        var bv = rebind[Scalar[dtype]](b[idx]).cast[DType.float32]()
+        o[idx] = rebind[o.element_type]((av + bv).cast[dtype]())
 
 
 def _add(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
+    if a.dtype() != b.dtype():
+        raise Error("_add: dtype mismatch")
     var n = a.numel()
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * a.dtype().byte_size())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](a.buf.unsafe_ptr().bitcast[Float32](), rl)
-    var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](b.buf.unsafe_ptr().bitcast[Float32](), rl)
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_add_kernel, _add_kernel](A, B, O, n, grid_dim=grid, block_dim=_BLOCK)
+    var dt = a.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](a.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](b.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[_add_kernel[DType.float32], _add_kernel[DType.float32]](A, B, O, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var A = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](a.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](b.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[_add_kernel[DType.bfloat16], _add_kernel[DType.bfloat16]](A, B, O, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var A = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](a.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](b.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[_add_kernel[DType.float16], _add_kernel[DType.float16]](A, B, O, n, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
-    return Tensor(out_buf^, a.shape(), F32)
+    return Tensor(out_buf^, a.shape(), a.dtype())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -202,9 +218,9 @@ def _add(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
 #   src channel index sc = c_out * (p1*p2) + p1_i*p2 + p2_i, mapping to
 #   out (h_out = h*2 + p1_i, w_out = w*2 + p2_i).
 # ════════════════════════════════════════════════════════════════════════════
-def _pixshuffle2d_kernel(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N*D*H*W*C]
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N*D*2H*2W*(C/4)]
+def _pixshuffle2d_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*D*H*W*C]
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*D*2H*2W*(C/4)]
     N: Int, D: Int, H: Int, W: Int, C: Int,
 ):
     # one thread per OUTPUT element. out idx over [N,D,Ho,Wo,Co]
@@ -228,7 +244,7 @@ def _pixshuffle2d_kernel(
         var w = wo // 2
         var sc = co * 4 + p1 * 2 + p2   # source channel
         var src = ((((n * D + d) * H + h) * W + w) * C + sc)
-        o[idx] = x[src]
+        o[idx] = rebind[o.element_type](rebind[Scalar[dtype]](x[src]))
 
 
 def _pixshuffle2d(x: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -236,19 +252,33 @@ def _pixshuffle2d(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var N = sh[0]; var D = sh[1]; var H = sh[2]; var W = sh[3]; var C = sh[4]
     var Co = C // 4; var Ho = H * 2; var Wo = W * 2
     var n = N * D * Ho * Wo * Co
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * x.dtype().byte_size())
     var rl_in = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
     var rl_out = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl_in)
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl_out)
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_pixshuffle2d_kernel, _pixshuffle2d_kernel](
-        X, O, N, D, H, W, C, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl_in)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl_out)
+        ctx.enqueue_function[_pixshuffle2d_kernel[DType.float32], _pixshuffle2d_kernel[DType.float32]](
+            X, O, N, D, H, W, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl_in)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl_out)
+        ctx.enqueue_function[_pixshuffle2d_kernel[DType.bfloat16], _pixshuffle2d_kernel[DType.bfloat16]](
+            X, O, N, D, H, W, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl_in)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl_out)
+        ctx.enqueue_function[_pixshuffle2d_kernel[DType.float16], _pixshuffle2d_kernel[DType.float16]](
+            X, O, N, D, H, W, C, grid_dim=grid, block_dim=_BLOCK
+        )
     ctx.synchronize()
     var os = List[Int]()
     os.append(N); os.append(D); os.append(Ho); os.append(Wo); os.append(Co)
-    return Tensor(out_buf^, os^, F32)
+    return Tensor(out_buf^, os^, x.dtype())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -257,9 +287,9 @@ def _pixshuffle2d(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 #   our NDHWC out [N,2D,H,W,C//2]; src channel sc = c_out*2 + p1_i,
 #   out d_out = d*2 + p1_i.
 # ════════════════════════════════════════════════════════════════════════════
-def _pixshuffle_t_kernel(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N*D*H*W*C]
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N*2D*H*W*(C/2)]
+def _pixshuffle_t_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*D*H*W*C]
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*2D*H*W*(C/2)]
     N: Int, D: Int, H: Int, W: Int, C: Int,
 ):
     var Co = C // 2
@@ -279,7 +309,7 @@ def _pixshuffle_t_kernel(
         var d = do_ // 2
         var sc = co * 2 + p1
         var src = ((((n * D + d) * H + h) * W + w) * C + sc)
-        o[idx] = x[src]
+        o[idx] = rebind[o.element_type](rebind[Scalar[dtype]](x[src]))
 
 
 def _pixshuffle_t(x: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -287,25 +317,39 @@ def _pixshuffle_t(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var N = sh[0]; var D = sh[1]; var H = sh[2]; var W = sh[3]; var C = sh[4]
     var Co = C // 2; var Do = D * 2
     var n = N * Do * H * W * Co
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * x.dtype().byte_size())
     var rl_in = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
     var rl_out = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl_in)
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl_out)
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_pixshuffle_t_kernel, _pixshuffle_t_kernel](
-        X, O, N, D, H, W, C, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl_in)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl_out)
+        ctx.enqueue_function[_pixshuffle_t_kernel[DType.float32], _pixshuffle_t_kernel[DType.float32]](
+            X, O, N, D, H, W, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl_in)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl_out)
+        ctx.enqueue_function[_pixshuffle_t_kernel[DType.bfloat16], _pixshuffle_t_kernel[DType.bfloat16]](
+            X, O, N, D, H, W, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl_in)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl_out)
+        ctx.enqueue_function[_pixshuffle_t_kernel[DType.float16], _pixshuffle_t_kernel[DType.float16]](
+            X, O, N, D, H, W, C, grid_dim=grid, block_dim=_BLOCK
+        )
     ctx.synchronize()
     var os = List[Int]()
     os.append(N); os.append(Do); os.append(H); os.append(W); os.append(Co)
-    return Tensor(out_buf^, os^, F32)
+    return Tensor(out_buf^, os^, x.dtype())
 
 
 # Drop the FIRST frame along D:  x[:, 1:, :, :, :]  (NDHWC).
-def _drop_first_frame_kernel(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N*D*H*W*C]
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],   # [N*(D-1)*H*W*C]
+def _drop_first_frame_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*D*H*W*C]
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],   # [N*(D-1)*H*W*C]
     N: Int, D: Int, HWC: Int,
 ):
     var idx = Int(global_idx.x)
@@ -317,7 +361,7 @@ def _drop_first_frame_kernel(
         var d = rest % Dm1
         var n = rest // Dm1
         var src = ((n * D + (d + 1)) * HWC + k)
-        o[idx] = x[src]
+        o[idx] = rebind[o.element_type](rebind[Scalar[dtype]](x[src]))
 
 
 def _drop_first_frame(x: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -325,19 +369,33 @@ def _drop_first_frame(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var N = sh[0]; var D = sh[1]; var H = sh[2]; var W = sh[3]; var C = sh[4]
     var HWC = H * W * C
     var n = N * (D - 1) * HWC
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * x.dtype().byte_size())
     var rl_in = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
     var rl_out = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl_in)
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl_out)
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_drop_first_frame_kernel, _drop_first_frame_kernel](
-        X, O, N, D, HWC, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl_in)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl_out)
+        ctx.enqueue_function[_drop_first_frame_kernel[DType.float32], _drop_first_frame_kernel[DType.float32]](
+            X, O, N, D, HWC, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl_in)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl_out)
+        ctx.enqueue_function[_drop_first_frame_kernel[DType.bfloat16], _drop_first_frame_kernel[DType.bfloat16]](
+            X, O, N, D, HWC, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl_in)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl_out)
+        ctx.enqueue_function[_drop_first_frame_kernel[DType.float16], _drop_first_frame_kernel[DType.float16]](
+            X, O, N, D, HWC, grid_dim=grid, block_dim=_BLOCK
+        )
     ctx.synchronize()
     var os = List[Int]()
     os.append(N); os.append(D - 1); os.append(H); os.append(W); os.append(C)
-    return Tensor(out_buf^, os^, F32)
+    return Tensor(out_buf^, os^, x.dtype())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -462,61 +520,85 @@ struct LatentUpsampler(Movable):
 # ════════════════════════════════════════════════════════════════════════════
 # upsample_video: normalize-wrapped upsample using VAE per-channel stats.
 #   un_normalize(x) = x*std + mean ; normalize(y) = (y-mean)/std  (per channel).
-#   std/mean are [128] device F32 tensors (NDHWC channel = last dim).
+#   std/mean are [128] device tensors in the model storage dtype (NDHWC channel
+#   = last dim); affine kernels do F32 arithmetic and store back to that dtype.
 # ════════════════════════════════════════════════════════════════════════════
-def _affine_chan_kernel(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [C]
-    shift: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [C]
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _affine_chan_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    scale: LayoutTensor[dtype, _DYN1, MutAnyOrigin],  # [C]
+    shift: LayoutTensor[dtype, _DYN1, MutAnyOrigin],  # [C]
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     total: Int, C: Int,
 ):
     var idx = Int(global_idx.x)
     if idx < total:
         var c = idx % C
-        var v = rebind[Scalar[DType.float32]](x[idx])
-        var sc = rebind[Scalar[DType.float32]](scale[c])
-        var sh = rebind[Scalar[DType.float32]](shift[c])
-        o[idx] = v * sc + sh
+        var v = rebind[Scalar[dtype]](x[idx]).cast[DType.float32]()
+        var sc = rebind[Scalar[dtype]](scale[c]).cast[DType.float32]()
+        var sh = rebind[Scalar[dtype]](shift[c]).cast[DType.float32]()
+        o[idx] = rebind[o.element_type]((v * sc + sh).cast[dtype]())
 
 
 def _affine_chan(x: Tensor, scale: Tensor, shift: Tensor, ctx: DeviceContext) raises -> Tensor:
+    if x.dtype() != scale.dtype() or x.dtype() != shift.dtype():
+        raise Error("_affine_chan: x/scale/shift dtype mismatch")
     var C = x.shape()[len(x.shape()) - 1]
     var n = x.numel()
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * x.dtype().byte_size())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var rlc = RuntimeLayout[_DYN1].row_major(IndexList[1](C))
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl)
-    var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](scale.buf.unsafe_ptr().bitcast[Float32](), rlc)
-    var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](shift.buf.unsafe_ptr().bitcast[Float32](), rlc)
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_affine_chan_kernel, _affine_chan_kernel](
-        X, SC, SH, O, n, C, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](scale.buf.unsafe_ptr().bitcast[Float32](), rlc)
+        var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](shift.buf.unsafe_ptr().bitcast[Float32](), rlc)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[_affine_chan_kernel[DType.float32], _affine_chan_kernel[DType.float32]](
+            X, SC, SH, O, n, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var SC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](scale.buf.unsafe_ptr().bitcast[BFloat16](), rlc)
+        var SH = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](shift.buf.unsafe_ptr().bitcast[BFloat16](), rlc)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[_affine_chan_kernel[DType.bfloat16], _affine_chan_kernel[DType.bfloat16]](
+            X, SC, SH, O, n, C, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var SC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](scale.buf.unsafe_ptr().bitcast[Float16](), rlc)
+        var SH = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](shift.buf.unsafe_ptr().bitcast[Float16](), rlc)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[_affine_chan_kernel[DType.float16], _affine_chan_kernel[DType.float16]](
+            X, SC, SH, O, n, C, grid_dim=grid, block_dim=_BLOCK
+        )
     ctx.synchronize()
-    return Tensor(out_buf^, x.shape(), F32)
+    return Tensor(out_buf^, x.shape(), x.dtype())
 
 
-def _recip_kernel(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _recip_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     total: Int,
 ):
     var idx = Int(global_idx.x)
     if idx < total:
-        o[idx] = Float32(1.0) / rebind[Scalar[DType.float32]](x[idx])
+        var xv = rebind[Scalar[dtype]](x[idx]).cast[DType.float32]()
+        o[idx] = rebind[o.element_type]((Float32(1.0) / xv).cast[dtype]())
 
 
-def _neg_div_kernel(
-    mean: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    std: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _neg_div_kernel[dtype: DType](
+    mean: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    std: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     total: Int,
 ):
     var idx = Int(global_idx.x)
     if idx < total:
-        o[idx] = -rebind[Scalar[DType.float32]](mean[idx]) / rebind[Scalar[DType.float32]](std[idx])
+        var mv = rebind[Scalar[dtype]](mean[idx]).cast[DType.float32]()
+        var sv = rebind[Scalar[dtype]](std[idx]).cast[DType.float32]()
+        o[idx] = rebind[o.element_type]((-mv / sv).cast[dtype]())
 
 
 def upsample_video(
@@ -536,17 +618,39 @@ def upsample_video(
     var un = _affine_chan(latent_ndhwc, std_of_means, mean_of_means, ctx)
     var up = upsampler.forward(un, ctx)
     # normalize: x*(1/std) + (-mean/std)
-    var inv_buf = ctx.enqueue_create_buffer[DType.uint8](C * 4)
-    var neg_buf = ctx.enqueue_create_buffer[DType.uint8](C * 4)
+    if std_of_means.dtype() != mean_of_means.dtype():
+        raise Error("upsample_video: stat dtype mismatch")
+    var inv_buf = ctx.enqueue_create_buffer[DType.uint8](
+        C * std_of_means.dtype().byte_size()
+    )
+    var neg_buf = ctx.enqueue_create_buffer[DType.uint8](
+        C * std_of_means.dtype().byte_size()
+    )
     var rlc = RuntimeLayout[_DYN1].row_major(IndexList[1](C))
-    var STD = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](std_of_means.buf.unsafe_ptr().bitcast[Float32](), rlc)
-    var MEAN = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](mean_of_means.buf.unsafe_ptr().bitcast[Float32](), rlc)
-    var INV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](inv_buf.unsafe_ptr().bitcast[Float32](), rlc)
-    var NEG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](neg_buf.unsafe_ptr().bitcast[Float32](), rlc)
     var gc = (C + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_recip_kernel, _recip_kernel](STD, INV, C, grid_dim=gc, block_dim=_BLOCK)
-    ctx.enqueue_function[_neg_div_kernel, _neg_div_kernel](MEAN, STD, NEG, C, grid_dim=gc, block_dim=_BLOCK)
+    var dt = std_of_means.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var STD = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](std_of_means.buf.unsafe_ptr().bitcast[Float32](), rlc)
+        var MEAN = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](mean_of_means.buf.unsafe_ptr().bitcast[Float32](), rlc)
+        var INV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](inv_buf.unsafe_ptr().bitcast[Float32](), rlc)
+        var NEG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](neg_buf.unsafe_ptr().bitcast[Float32](), rlc)
+        ctx.enqueue_function[_recip_kernel[DType.float32], _recip_kernel[DType.float32]](STD, INV, C, grid_dim=gc, block_dim=_BLOCK)
+        ctx.enqueue_function[_neg_div_kernel[DType.float32], _neg_div_kernel[DType.float32]](MEAN, STD, NEG, C, grid_dim=gc, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var STD = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](std_of_means.buf.unsafe_ptr().bitcast[BFloat16](), rlc)
+        var MEAN = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](mean_of_means.buf.unsafe_ptr().bitcast[BFloat16](), rlc)
+        var INV = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](inv_buf.unsafe_ptr().bitcast[BFloat16](), rlc)
+        var NEG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](neg_buf.unsafe_ptr().bitcast[BFloat16](), rlc)
+        ctx.enqueue_function[_recip_kernel[DType.bfloat16], _recip_kernel[DType.bfloat16]](STD, INV, C, grid_dim=gc, block_dim=_BLOCK)
+        ctx.enqueue_function[_neg_div_kernel[DType.bfloat16], _neg_div_kernel[DType.bfloat16]](MEAN, STD, NEG, C, grid_dim=gc, block_dim=_BLOCK)
+    else:
+        var STD = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](std_of_means.buf.unsafe_ptr().bitcast[Float16](), rlc)
+        var MEAN = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](mean_of_means.buf.unsafe_ptr().bitcast[Float16](), rlc)
+        var INV = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](inv_buf.unsafe_ptr().bitcast[Float16](), rlc)
+        var NEG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](neg_buf.unsafe_ptr().bitcast[Float16](), rlc)
+        ctx.enqueue_function[_recip_kernel[DType.float16], _recip_kernel[DType.float16]](STD, INV, C, grid_dim=gc, block_dim=_BLOCK)
+        ctx.enqueue_function[_neg_div_kernel[DType.float16], _neg_div_kernel[DType.float16]](MEAN, STD, NEG, C, grid_dim=gc, block_dim=_BLOCK)
     ctx.synchronize()
-    var inv_t = Tensor(inv_buf^, [C], F32)
-    var neg_t = Tensor(neg_buf^, [C], F32)
+    var inv_t = Tensor(inv_buf^, [C], std_of_means.dtype())
+    var neg_t = Tensor(neg_buf^, [C], std_of_means.dtype())
     return _affine_chan(up, inv_t, neg_t, ctx)

@@ -55,7 +55,7 @@
 #   d_Q_i[g] = -M⁻ᵀ @ d_R_i[g] @ (R_i[g] + I)ᵀ ,  M = I+Q_i[g]
 #   d_S_i[g] = 0.5*(d_Q_i[g] - d_Q_i[g]ᵀ)
 #
-# Host F32 master throughout. Mojo 0.26.x. MIRRORS oft_adapter.mojo (reuses its
+# BF16 trainable S storage, F32 internal compute/moments. Mojo 0.26.x. MIRRORS oft_adapter.mojo (reuses its
 # inverse/skew/Cayley helpers re-implemented here to keep the file self-contained).
 
 from std.collections import List
@@ -102,6 +102,13 @@ def _identity(n: Int) -> List[Float32]:
     var out = _zeros(n * n)
     for i in range(n):
         out[i * n + i] = Float32(1.0)
+    return out^
+
+
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
     return out^
 
 
@@ -194,7 +201,7 @@ def _butterfly_perm(out_f: Int, b: Int, stage: Int) raises -> List[Float32]:
 # s       : [boft_m, num_blocks, b, b] flat (trainable; pre-skew squares)
 # w_base  : [out, in]                       (frozen; out = num_blocks * b)
 struct BOFTAdapter(Copyable, Movable):
-    var s: List[Float32]            # [boft_m*num_blocks*b*b]
+    var s: List[BFloat16]           # [boft_m*num_blocks*b*b]
     var w_base: List[Float32]       # [out, in]  (frozen)
     var boft_m: Int
     var num_blocks: Int
@@ -211,7 +218,7 @@ struct BOFTAdapter(Copyable, Movable):
         boft_m: Int, num_blocks: Int, block_size: Int, in_f: Int, out_f: Int, alpha: Float32,
         var m_s: List[Float32], var v_s: List[Float32],
     ):
-        self.s = s^
+        self.s = _f32_to_bf16_list(s)
         self.w_base = w_base^
         self.boft_m = boft_m
         self.num_blocks = num_blocks
@@ -279,7 +286,7 @@ def _stage_R(lo: BOFTAdapter, stage: Int) raises -> List[Float32]:
         var sblk = List[Float32]()
         var sb = stage_base + g * b * b
         for i in range(b * b):
-            sblk.append(lo.s[sb + i])
+            sblk.append(lo.s[sb + i].cast[DType.float32]())
         var q = _skew(sblk, b)
         var rg = _cayley(q, b)
         var base = g * b
@@ -385,7 +392,7 @@ def boft_backward(d_y_h: List[Float32], x_h: List[Float32], lo: BOFTAdapter, M: 
             var sblk = List[Float32]()
             var sb = stage_base + grp * b * b
             for q in range(b * b):
-                sblk.append(lo.s[sb + q])
+                sblk.append(lo.s[sb + q].cast[DType.float32]())
             var qmat = _skew(sblk, b)
             var minv = _inverse_mplus(qmat, b)
             var rg = _cayley_from_minv(minv, qmat, b)
@@ -436,7 +443,7 @@ def _cayley_from_minv(minv: List[Float32], q: List[Float32], b: Int) raises -> L
 
 # ── AdamW one step over S (W frozen) ──────────────────────────────────────────
 def _adamw_host_list(
-    mut p: List[Float32], g: List[Float32],
+    mut p: List[BFloat16], g: List[Float32],
     mut mom: List[Float32], mut vmo: List[Float32],
     t: Int, lr: Float32, beta1: Float32, beta2: Float32,
     eps: Float32, weight_decay: Float32,
@@ -461,10 +468,10 @@ def _adamw_host_list(
         vmo[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
+        var pv = p[i].cast[DType.float32]() - lr * m_hat / (sqrt(v_hat) + eps)
         if weight_decay > 0.0:
             pv = pv - lr * weight_decay * pv
-        p[i] = pv
+        p[i] = BFloat16(pv)
 
 
 def boft_adamw(

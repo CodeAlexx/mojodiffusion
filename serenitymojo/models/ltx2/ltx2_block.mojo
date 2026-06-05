@@ -45,9 +45,9 @@
 # gate logits are part of the frozen base in the LoRA recipe (we still compute
 # their grads for the parity gate's completeness — base weight grads).
 #
-# Mojo 1.0.0b1: `def` not `fn`; Tensor move-only (return Movable structs); host
-# List[Float32] at the API boundary (move-only Tensor cannot be a collection
-# element across the seam); no-bias linear = linear(x, w, Optional(None), ctx).
+# Mojo 1.0.0b1: `def` not `fn`; Tensor move-only (return Movable structs); BF16
+# host lists carry activation boundaries where tensors must be stored in
+# collections; no-bias linear = linear(x, w, Optional(None), ctx).
 
 from std.gpu.host import DeviceContext
 from std.collections import List, Optional
@@ -200,20 +200,40 @@ struct LTX2BlockWeights(Copyable, Movable):
         self.wff2 = TArc(Tensor.from_host(wff2^, [D, FF], STDtype.BF16, ctx))
         self.bff2 = TArc(Tensor.from_host(bff2^, [D], STDtype.BF16, ctx))
 
+    def __init__(
+        out self,
+        var wq: TArc, var bq: TArc,
+        var wk: TArc, var bk: TArc,
+        var wv: TArc, var bv: TArc,
+        var wo: TArc, var bo: TArc,
+        var q_norm: TArc, var k_norm: TArc,
+        var gate_w: TArc, var gate_b: TArc,
+        var wff0: TArc, var bff0: TArc,
+        var wff2: TArc, var bff2: TArc,
+    ):
+        self.wq = wq^; self.bq = bq^
+        self.wk = wk^; self.bk = bk^
+        self.wv = wv^; self.bv = bv^
+        self.wo = wo^; self.bo = bo^
+        self.q_norm = q_norm^; self.k_norm = k_norm^
+        self.gate_w = gate_w^; self.gate_b = gate_b^
+        self.wff0 = wff0^; self.bff0 = bff0^
+        self.wff2 = wff2^; self.bff2 = bff2^
+
 
 # ── LoRA adapter (A [rank,in], B [out,rank], scale=alpha/rank) ───────────────
 # Same math/shape contract as training/train_step.mojo LoraAdapter. We keep a
 # self-contained host-list adapter here so the block is independently gateable.
 struct LTX2Lora(Copyable, Movable):
-    var a: List[Float32]   # [rank, in]
-    var b: List[Float32]   # [out, rank]
+    var a: List[BFloat16]  # [rank, in]
+    var b: List[BFloat16]  # [out, rank]
     var rank: Int
     var in_f: Int
     var out_f: Int
     var scale: Float32
 
     def __init__(
-        out self, var a: List[Float32], var b: List[Float32],
+        out self, var a: List[BFloat16], var b: List[BFloat16],
         rank: Int, in_f: Int, out_f: Int, scale: Float32,
     ):
         self.a = a^
@@ -229,11 +249,11 @@ struct LTX2Lora(Copyable, Movable):
 def _lora_contrib(x: Tensor, lo: LTX2Lora, M: Int, ctx: DeviceContext) raises -> Tensor:
     var nb1 = Optional[Tensor](None)
     var t = linear(
-        x, _tb(lo.a.copy(), [lo.rank, lo.in_f], ctx), nb1^, ctx,
+        x, _tbf16(lo.a.copy(), [lo.rank, lo.in_f], ctx), nb1^, ctx,
     )  # [M,rank]
     var nb2 = Optional[Tensor](None)
     var dy = linear(
-        t, _tb(lo.b.copy(), [lo.out_f, lo.rank], ctx), nb2^, ctx,
+        t, _tbf16(lo.b.copy(), [lo.out_f, lo.rank], ctx), nb2^, ctx,
     )  # [M,out]
     return mul_scalar(dy, lo.scale, ctx)
 
@@ -257,17 +277,17 @@ def _lora_bwd(
 ) raises -> LTX2LoraGrads:
     var nb_t = Optional[Tensor](None)
     var t = linear(
-        x, _tb(lo.a.copy(), [lo.rank, lo.in_f], ctx), nb_t^, ctx,
+        x, _tbf16(lo.a.copy(), [lo.rank, lo.in_f], ctx), nb_t^, ctx,
     )  # [M,rank]
     var d_dy = mul_scalar(d_proj_out, lo.scale, ctx)  # [M,out]
     var lbB = linear_backward(
-        d_dy, t, _tb(lo.b.copy(), [lo.out_f, lo.rank], ctx),
+        d_dy, t, _tbf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
         M, lo.rank, lo.out_f, ctx,
     )
     var d_t = lbB.d_x.clone(ctx)    # [M,rank]
     var d_b = lbB.d_w.to_host(ctx)  # [out,rank] -> F32
     var lbA = linear_backward(
-        d_t, x, _tb(lo.a.copy(), [lo.rank, lo.in_f], ctx),
+        d_t, x, _tbf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         M, lo.in_f, lo.rank, ctx,
     )
     var d_a = lbA.d_w.to_host(ctx)  # [rank,in] -> F32
@@ -335,10 +355,10 @@ struct LTX2BlockSaved(Movable):
 
 
 struct LTX2BlockForward(Movable):
-    var out: List[Float32]   # [S,D] block output (host boundary readback)
+    var out: List[BFloat16]   # [S,D] block output (BF16 host boundary)
     var saved: LTX2BlockSaved
 
-    def __init__(out self, var out: List[Float32], var saved: LTX2BlockSaved):
+    def __init__(out self, var out: List[BFloat16], var saved: LTX2BlockSaved):
         self.out = out^
         self.saved = saved^
 
@@ -363,7 +383,7 @@ def D_of(H: Int, Dh: Int) -> Int:
 def ltx2_block_forward[
     H: Int, Dh: Int, S: Int
 ](
-    hidden: List[Float32],
+    hidden: List[BFloat16],
     w: LTX2BlockWeights, mv: LTX2ModVecs,
     cos: Tensor, sin: Tensor,
     lq: LTX2Lora, lk: LTX2Lora, lv: LTX2Lora, lo: LTX2Lora,
@@ -379,7 +399,7 @@ def ltx2_block_forward[
     var cos_b = cast_tensor(cos, STDtype.BF16, ctx)
     var sin_b = cast_tensor(sin, STDtype.BF16, ctx)
 
-    var x_t = _tb(hidden, [S, D], ctx)
+    var x_t = _tbf16(hidden, [S, D], ctx)
 
     # self-attn AdaLN
     var norm_h = _rms_no_affine(x_t, ones_t, eps, ctx)
@@ -435,8 +455,7 @@ def ltx2_block_forward[
     var h1 = linear(mod_ff, w.wff0[], Optional[Tensor](_clone(w.bff0[], ctx)), ctx)  # [S,FF]
     var h1g = gelu(h1, ctx)
     var ff = linear(h1g, w.wff2[], Optional[Tensor](_clone(w.bff2[], ctx)), ctx)     # [S,D]
-    # Block output read back as F32 (to_host upcasts bf16->F32): public API stays F32.
-    var out = residual_gate(hs, _tb(mv.gate_mlp.copy(), [D], ctx), ff, ctx).to_host(ctx)
+    var out = residual_gate(hs, _tb(mv.gate_mlp.copy(), [D], ctx), ff, ctx).to_host_bf16(ctx)
 
     # Save activations as BF16 host lists (halves working set vs F32 device TArc).
     var saved = LTX2BlockSaved(
@@ -556,10 +575,9 @@ def ltx2_block_backward[
     ctx: DeviceContext,
 ) raises -> LTX2BlockGrads:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    # d_out is the incoming gradient: kept F32 (gate_residual_backward requires
-    # an F32 grad_out and an F32 per-channel gate). All other backward ops run
-    # native bf16; the few F32-only boundaries are local-cast (noted at each site).
-    var d_out_t = _t(d_out, [S, D], ctx)
+    # d_out is the incoming gradient. Store it as BF16 at the op boundary; the
+    # residual-gate kernels still do their reductions in F32 internally.
+    var d_out_t = _tb(d_out, [S, D], ctx)
 
     # Re-upload saved BF16 activations to NATIVE BF16 device tensors (verbatim,
     # no F32 widening) so backward matmuls run bf16·bf16, F32 accumulate.
@@ -586,11 +604,10 @@ def ltx2_block_backward[
     var ones_t = _tb(_ones(D), [D], ctx)
 
     # ── FFN gated residual: out = hs + gate_mlp * ff ──
-    # gate_residual_backward is an F32-grad-out boundary: d_out_t stays F32, the
-    # per-channel gate is F32; it accepts bf16 x/y (sv_hs/sv_ff) and returns F32
-    # grads. Cast its F32 d_x/d_y down to bf16 to rejoin the bf16 grad chain.
+    # BF16 tensors enter/leave the op; gate reductions accumulate in F32 inside
+    # the kernel and narrow back to BF16 storage.
     var grg_mlp = gate_residual_backward(
-        d_out_t, sv_hs, _t(mv.gate_mlp.copy(), [D], ctx), sv_ff, ctx
+        d_out_t, sv_hs, _tb(mv.gate_mlp.copy(), [D], ctx), sv_ff, ctx
     )
     var d_gate_mlp = grg_mlp.d_g.to_host(ctx)   # [D] -> F32 returned grad
     var d_hs = cast_tensor(grg_mlp.d_x, STDtype.BF16, ctx)   # [S,D] bf16
@@ -625,12 +642,10 @@ def ltx2_block_backward[
 
     # accumulate the two paths into d_hs (residual + ffn-norm), both bf16.
     var d_hs_total_b = add(d_hs, d_hs_from_ff, ctx)  # [S,D] bf16
-    # gate_residual_backward needs an F32 grad_out -> local cast up for the call.
-    var d_hs_total = cast_tensor(d_hs_total_b, STDtype.F32, ctx)
 
     # ── self-attn gated residual: hs = hidden + gate_msa * ao ──
     var grg_msa = gate_residual_backward(
-        d_hs_total, sv_hidden, _t(mv.gate_msa.copy(), [D], ctx), _ao(saved, w, lo, use_lora, S, D, FF, ctx), ctx
+        d_hs_total_b, sv_hidden, _tb(mv.gate_msa.copy(), [D], ctx), _ao(saved, w, lo, use_lora, S, D, FF, ctx), ctx
     )
     var d_gate_msa = grg_msa.d_g.to_host(ctx)
     var d_hidden_res = cast_tensor(grg_msa.d_x, STDtype.BF16, ctx)  # [S,D] bf16

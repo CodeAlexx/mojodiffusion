@@ -28,10 +28,9 @@
 #   `serenitymojo/ops/rope.rope_halfsplit` consumes (cos/sin = [rows, D/2], the
 #   row index shared between data tensor and freq tensor; Z-Image rope_theta=256).
 #
-# Compute is F32; outputs stored as F32 here (so the parity gate isolates op
-# correctness from BF16 quantization). Only two new kernels are introduced — the
-# sinusoidal compute and the freq-table build; everything else reuses
-# ops/linear + ops/activations.silu.
+# Compute is F32; public builders store the caller-requested dtype so production
+# paths can keep BF16/F16 activations and RoPE tables at tensor boundaries.
+# Parity callers can still request F32 explicitly.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -45,7 +44,6 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
-from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -53,10 +51,10 @@ comptime _DYN2 = Layout.row_major(-1, -1)
 comptime _BLOCK = 256
 
 
-# ── sinusoidal timestep-embedding kernel (F32 in / F32 out) ─────────────────
-def _timestep_embed_kernel_f32(
+# ── sinusoidal timestep-embedding kernel (F32 scalar in / typed out) ────────
+def _timestep_embed_kernel[out_dtype: DType](
     t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    o: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
     n: Int,
     dim: Int,
     half: Int,
@@ -73,8 +71,8 @@ def _timestep_embed_kernel_f32(
         var freq = exp(neg_ln_max_period * (Float32(i) / Float32(half)))
         var angle = tv * freq
         # COS first (cols [0, half)), SIN second (cols [half, dim)).
-        o[row, i] = rebind[o.element_type](cos(angle))
-        o[row, half + i] = rebind[o.element_type](sin(angle))
+        o[row, i] = rebind[o.element_type](cos(angle).cast[out_dtype]())
+        o[row, half + i] = rebind[o.element_type](sin(angle).cast[out_dtype]())
 
 
 # ── sinusoidal timestep-embedding kernel — SIN-FIRST variant (ERNIE) ────────
@@ -89,9 +87,9 @@ def _timestep_embed_kernel_f32(
 # `timestep_embedding_sin_first` host function below dispatches it. Z-Image,
 # FLUX, Klein, Qwen, HiDream, SenseNova and SDXL must continue to call the
 # cos-first `timestep_embedding`.
-def _timestep_embed_kernel_f32_sin_first(
+def _timestep_embed_kernel_sin_first[out_dtype: DType](
     t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    o: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
     n: Int,
     dim: Int,
     half: Int,
@@ -106,18 +104,22 @@ def _timestep_embed_kernel_f32_sin_first(
         var freq = exp(neg_ln_max_period * (Float32(i) / Float32(half)))
         var angle = tv * freq
         # SIN first (cols [0, half)), COS second (cols [half, dim)) — ERNIE.
-        o[row, i] = rebind[o.element_type](sin(angle))
-        o[row, half + i] = rebind[o.element_type](cos(angle))
+        o[row, i] = rebind[o.element_type](sin(angle).cast[out_dtype]())
+        o[row, half + i] = rebind[o.element_type](cos(angle).cast[out_dtype]())
 
 
 def timestep_embedding(
-    t: Tensor, dim: Int, ctx: DeviceContext, max_period: Float32 = 10000.0
+    t: Tensor,
+    dim: Int,
+    ctx: DeviceContext,
+    max_period: Float32,
+    out_dtype: STDtype,
 ) raises -> Tensor:
     """Sinusoidal timestep embedding (Z-Image NextDiT order: COS then SIN).
 
     t:   [N]            scalar timesteps (1-D; flattened length = N). F32.
     dim: embedding dim  (must be even; half = dim/2 cos + half sin).
-    returns [N, dim]    F32 storage; F32 math.
+    returns [N, dim]    out_dtype storage; F32 math.
     """
     if dim % 2 != 0:
         raise Error("timestep_embedding: dim must be even")
@@ -127,29 +129,54 @@ def timestep_embedding(
     var half = dim // 2
     var neg_ln_mp = -log(max_period)
 
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dim * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n * dim * out_dtype.byte_size()
+    )
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, dim))
     var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         t.buf.unsafe_ptr().bitcast[Float32](), t_rl
     )
-    var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-    )
     var total = n * half
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _timestep_embed_kernel_f32, _timestep_embed_kernel_f32
-    ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
+    var odt = out_dtype.to_mojo_dtype()
+    if odt == DType.float32:
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[
+            _timestep_embed_kernel[DType.float32],
+            _timestep_embed_kernel[DType.float32],
+        ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
+    elif odt == DType.bfloat16:
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[
+            _timestep_embed_kernel[DType.bfloat16],
+            _timestep_embed_kernel[DType.bfloat16],
+        ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[
+            _timestep_embed_kernel[DType.float16],
+            _timestep_embed_kernel[DType.float16],
+        ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var out_shape = List[Int]()
     out_shape.append(n)
     out_shape.append(dim)
-    return Tensor(out_buf^, out_shape^, STDtype.F32)
+    return Tensor(out_buf^, out_shape^, out_dtype)
 
 
 def timestep_embedding_sin_first(
-    t: Tensor, dim: Int, ctx: DeviceContext, max_period: Float32 = 10000.0
+    t: Tensor,
+    dim: Int,
+    ctx: DeviceContext,
+    max_period: Float32,
+    out_dtype: STDtype,
 ) raises -> Tensor:
     """Sinusoidal timestep embedding (ERNIE order: SIN then COS).
 
@@ -163,7 +190,7 @@ def timestep_embedding_sin_first(
 
     t:   [N]            scalar timesteps (1-D; flattened length = N). F32.
     dim: embedding dim  (must be even).
-    returns [N, dim]    F32 storage; F32 math.
+    returns [N, dim]    out_dtype storage; F32 math.
     """
     if dim % 2 != 0:
         raise Error("timestep_embedding_sin_first: dim must be even")
@@ -173,26 +200,46 @@ def timestep_embedding_sin_first(
     var half = dim // 2
     var neg_ln_mp = -log(max_period)
 
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dim * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n * dim * out_dtype.byte_size()
+    )
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, dim))
     var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         t.buf.unsafe_ptr().bitcast[Float32](), t_rl
     )
-    var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-    )
     var total = n * half
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _timestep_embed_kernel_f32_sin_first,
-        _timestep_embed_kernel_f32_sin_first,
-    ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
+    var odt = out_dtype.to_mojo_dtype()
+    if odt == DType.float32:
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[
+            _timestep_embed_kernel_sin_first[DType.float32],
+            _timestep_embed_kernel_sin_first[DType.float32],
+        ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
+    elif odt == DType.bfloat16:
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[
+            _timestep_embed_kernel_sin_first[DType.bfloat16],
+            _timestep_embed_kernel_sin_first[DType.bfloat16],
+        ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[
+            _timestep_embed_kernel_sin_first[DType.float16],
+            _timestep_embed_kernel_sin_first[DType.float16],
+        ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var out_shape = List[Int]()
     out_shape.append(n)
     out_shape.append(dim)
-    return Tensor(out_buf^, out_shape^, STDtype.F32)
+    return Tensor(out_buf^, out_shape^, out_dtype)
 
 
 def t_embedder(
@@ -214,28 +261,21 @@ def t_embedder(
     mlp2_weight: [out, hidden]      PyTorch row-major (t_embedder.mlp.2.weight).
     mlp2_bias:   [out] or None      (t_embedder.mlp.2.bias).
     returns [N, out].
-    The sinusoidal embedding is F32; it is cast to the MLP weights' dtype before
-    the first Linear so the GEMM dtype matches (mirrors the Rust BF16 t-embed).
+    The sinusoidal embedding is stored in the MLP weights' dtype, with F32 used
+    only inside the trig kernel.
     """
-    var emb = timestep_embedding(t, dim, ctx, max_period)  # [N, dim] F32
-    # Cast the F32 embedding to the MLP weights' compute dtype (BF16 in the
-    # reference) on GPU. Keep inference activations off the CPU path.
     var w_dtype = mlp0_weight.dtype()
-    var emb_in: Tensor
-    if w_dtype == STDtype.F32:
-        emb_in = emb^
-    else:
-        emb_in = cast_tensor(emb, w_dtype, ctx)
+    var emb_in = timestep_embedding(t, dim, ctx, max_period, w_dtype)
     var h = linear(emb_in, mlp0_weight, mlp0_bias, ctx)    # [N, hidden]
     var ha = silu(h, ctx)
     return linear(ha, mlp2_weight, mlp2_bias, ctx)         # [N, out]
 
 
-# ── RoPE freq-table build kernel (F32 in / F32 out) ─────────────────────────
-def _rope_tables_kernel_f32(
+# ── RoPE freq-table build kernel (F32 positions in / typed out) ─────────────
+def _rope_tables_kernel[out_dtype: DType](
     positions: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    cos_t: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
-    sin_t: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    cos_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
+    sin_t: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
     rows: Int,
     half: Int,  # head_dim/2
     theta: Float32,
@@ -250,19 +290,23 @@ def _rope_tables_kernel_f32(
         # inv_freq = 1 / theta^(i / half) = theta^(-i/half)
         var inv_freq = exp(-log(theta) * (Float32(i) / Float32(half)))
         var angle = pos * inv_freq
-        cos_t[row, i] = rebind[cos_t.element_type](cos(angle))
-        sin_t[row, i] = rebind[sin_t.element_type](sin(angle))
+        cos_t[row, i] = rebind[cos_t.element_type](cos(angle).cast[out_dtype]())
+        sin_t[row, i] = rebind[sin_t.element_type](sin(angle).cast[out_dtype]())
 
 
 def build_rope_tables(
-    positions: Tensor, head_dim: Int, theta: Float32, ctx: DeviceContext
+    positions: Tensor,
+    head_dim: Int,
+    theta: Float32,
+    ctx: DeviceContext,
+    out_dtype: STDtype,
 ) raises -> Tuple[Tensor, Tensor]:
     """RoPE cos/sin tables in the half-split layout `rope_halfsplit` consumes.
 
     positions: [rows]            position indices (F32).
     head_dim:  rotary head dim   (must be even; half = head_dim/2 angles).
     theta:     rope_theta        (Z-Image = 256.0).
-    returns (cos, sin), each [rows, head_dim/2], F32. Feed straight into
+    returns (cos, sin), each [rows, head_dim/2], out_dtype. Feed straight into
     ops/rope.rope_halfsplit with an x of shape [rows, head_dim].
     """
     if head_dim % 2 != 0:
@@ -272,24 +316,53 @@ def build_rope_tables(
     var rows = positions.numel()
     var half = head_dim // 2
 
-    var cos_buf = ctx.enqueue_create_buffer[DType.uint8](rows * half * 4)
-    var sin_buf = ctx.enqueue_create_buffer[DType.uint8](rows * half * 4)
+    var cos_buf = ctx.enqueue_create_buffer[DType.uint8](
+        rows * half * out_dtype.byte_size()
+    )
+    var sin_buf = ctx.enqueue_create_buffer[DType.uint8](
+        rows * half * out_dtype.byte_size()
+    )
     var p_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](rows))
     var f_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, half))
     var P = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         positions.buf.unsafe_ptr().bitcast[Float32](), p_rl
     )
-    var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        cos_buf.unsafe_ptr().bitcast[Float32](), f_rl
-    )
-    var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        sin_buf.unsafe_ptr().bitcast[Float32](), f_rl
-    )
     var total = rows * half
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_rope_tables_kernel_f32, _rope_tables_kernel_f32](
-        P, C, S, rows, half, theta, grid_dim=grid, block_dim=_BLOCK
-    )
+    var odt = out_dtype.to_mojo_dtype()
+    if odt == DType.float32:
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        ctx.enqueue_function[
+            _rope_tables_kernel[DType.float32],
+            _rope_tables_kernel[DType.float32],
+        ](P, C, S, rows, half, theta, grid_dim=grid, block_dim=_BLOCK)
+    elif odt == DType.bfloat16:
+        var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+        )
+        var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+        )
+        ctx.enqueue_function[
+            _rope_tables_kernel[DType.bfloat16],
+            _rope_tables_kernel[DType.bfloat16],
+        ](P, C, S, rows, half, theta, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            cos_buf.unsafe_ptr().bitcast[Float16](), f_rl
+        )
+        var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            sin_buf.unsafe_ptr().bitcast[Float16](), f_rl
+        )
+        ctx.enqueue_function[
+            _rope_tables_kernel[DType.float16],
+            _rope_tables_kernel[DType.float16],
+        ](P, C, S, rows, half, theta, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
 
     var cos_shape = List[Int]()
@@ -298,6 +371,6 @@ def build_rope_tables(
     var sin_shape = List[Int]()
     sin_shape.append(rows)
     sin_shape.append(half)
-    var cos_out = Tensor(cos_buf^, cos_shape^, STDtype.F32)
-    var sin_out = Tensor(sin_buf^, sin_shape^, STDtype.F32)
+    var cos_out = Tensor(cos_buf^, cos_shape^, out_dtype)
+    var sin_out = Tensor(sin_buf^, sin_shape^, out_dtype)
     return (cos_out^, sin_out^)

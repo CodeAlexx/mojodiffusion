@@ -86,7 +86,7 @@ from serenitymojo.ops.tensor_algebra import (
     mul,
 )
 from serenitymojo.ops.pixelshuffle import depth_to_space_3d
-from serenitymojo.models.vae.conv3d import conv3d
+from serenitymojo.models.vae.conv3d import conv3d_fcqrs_cudnn
 
 
 comptime LATENT_CH = 128
@@ -264,11 +264,12 @@ struct LTX2VaeDecoderWeights(Movable):
         return Tensor(dev^, x.shape(), x.dtype())
 
     # ── CausalConv3d (NON-causal replicate-pad on time, k=3) ──────────────────
-    # x: NDHWC [N,D,H,W,C]. weight already QRSCF [3,3,3,Cin,Cout].
+    # x: NDHWC [N,D,H,W,C]. weight is raw checkpoint FCQRS/OIDHW
+    # [Cout,Cin,kD,kH,kW], which is the layout cuDNN expects.
     def _causal_conv3d(
         self,
         x: Tensor,
-        var w_qrscf: Tensor,
+        var w_fcqrs: Tensor,
         var bias: Tensor,
         ctx: DeviceContext,
     ) raises -> Tensor:
@@ -280,15 +281,15 @@ struct LTX2VaeDecoderWeights(Movable):
         var first = slice(x, 1, 0, 1, ctx)
         var last = slice(x, 1, d - 1, 1, ctx)
         var x_pad = concat(1, ctx, first, x, last)
-        return conv3d(
-            x_pad, w_qrscf^, Optional[Tensor](bias^),
+        return conv3d_fcqrs_cudnn(
+            x_pad, w_fcqrs^, Optional[Tensor](bias^),
             1, 1, 1, 0, HALF_PAD, HALF_PAD, ctx,
         )
 
     def _conv3d_named(
         self, x: Tensor, prefix: String, ctx: DeviceContext
     ) raises -> Tensor:
-        var w = self._conv3d_w(prefix + ".weight", ctx)
+        var w = self._clone(self._w(prefix + ".weight"), ctx)
         var b = self._bias(prefix + ".bias", ctx)
         return self._causal_conv3d(x, w^, b^, ctx)
 

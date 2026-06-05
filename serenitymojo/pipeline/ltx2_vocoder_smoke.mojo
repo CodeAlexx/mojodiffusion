@@ -36,7 +36,9 @@ from serenitymojo.io.ffi import (
     O_TRUNC,
     BytePtr,
 )
-from serenitymojo.models.vocoder.ltx2_vocoder import LTX2VocoderWithBWE
+from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.tensor_algebra import permute
+from serenitymojo.models.vocoder.ltx2_vocoder import LTX2VocoderWithBWE, vocoder_forward
 
 
 comptime _CKPT = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors"
@@ -57,7 +59,7 @@ def _load_bf16(ref st: SafeTensors, name: String, ctx: DeviceContext) raises -> 
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var view = from_parts(info.dtype, info.shape.copy(), bytes)
-    return Tensor.from_view_as_f32(view, ctx)
+    return Tensor.from_view_as_bf16(view, ctx)
 
 
 # Write a 16-bit-PCM little-endian stereo WAV. `samples` is the interleaved
@@ -133,6 +135,29 @@ def _write_wav(path: String, samples: List[Float32], sr: Int) raises:
         raise Error(String("write_wav: short write to ") + path)
 
 
+def _print_compare(tag: String, got_t: Tensor, ref_t: Tensor, ctx: DeviceContext) raises:
+    var got = got_t.to_host(ctx)
+    var refv = ref_t.to_host(ctx)
+    var n = len(got) if len(got) < len(refv) else len(refv)
+    var dot = Float64(0.0)
+    var sg = Float64(0.0)
+    var sr2 = Float64(0.0)
+    var maxabs = Float64(0.0)
+    for i in range(n):
+        var g = got[i].cast[DType.float64]()
+        var r = refv[i].cast[DType.float64]()
+        dot += g * r
+        sg += g * g
+        sr2 += r * r
+        var dd = (g - r).__abs__()
+        if dd > maxabs:
+            maxabs = dd
+    var cos = Float64(0.0)
+    if sg > 0.0 and sr2 > 0.0:
+        cos = dot / (sqrt(sg) * sqrt(sr2))
+    print("  [diag] " + tag + ": cos=" + String(cos) + " max_abs=" + String(maxabs))
+
+
 def main() raises:
     var ctx = DeviceContext()
     print("=== LTX-2.3 vocoder + BWE GPU smoke (BF16) ===")
@@ -141,6 +166,10 @@ def main() raises:
     var orc = SafeTensors.open(String(_ORACLE))
     var mel_in = _load_bf16(orc, String("mel_in"), ctx)
     var wav_ref = _load_bf16(orc, String("wav_ref"), ctx)
+    var wav16_ref = _load_bf16(orc, String("wav16_ref"), ctx)
+    var mel_bwe_ref = _load_bf16(orc, String("mel_bwe_ref"), ctx)
+    var residual_ref = _load_bf16(orc, String("residual_ref"), ctx)
+    var skip_ref = _load_bf16(orc, String("skip_ref"), ctx)
     var msh = mel_in.shape()
     var rsh = wav_ref.shape()
     print(
@@ -153,6 +182,38 @@ def main() raises:
     print("  loading vocoder weights from checkpoint ...")
     var voc = LTX2VocoderWithBWE.from_file(String(_CKPT), ctx)
     print("  vocoder loaded; output_sr=" + String(voc.output_sample_rate()))
+
+    # ── base-vocoder diagnostic gate ────────────────────────────────────────────
+    var mel_compute = cast_tensor(mel_in, STDtype.F32, ctx)
+    var wav16 = vocoder_forward(voc.voc, String("vocoder.vocoder"), mel_compute^, ctx)
+    var base_got = wav16.to_host(ctx)
+    var base_ref = wav16_ref.to_host(ctx)
+    var nb = len(base_got) if len(base_got) < len(base_ref) else len(base_ref)
+    var bdot = Float64(0.0)
+    var bsg = Float64(0.0)
+    var bsr = Float64(0.0)
+    var bmax = Float64(0.0)
+    for i in range(nb):
+        var g = base_got[i].cast[DType.float64]()
+        var r = base_ref[i].cast[DType.float64]()
+        bdot += g * r
+        bsg += g * g
+        bsr += r * r
+        var dd = (g - r).__abs__()
+        if dd > bmax:
+            bmax = dd
+    var bcos = Float64(0.0)
+    if bsg > 0.0 and bsr > 0.0:
+        bcos = bdot / (sqrt(bsg) * sqrt(bsr))
+    print("  [diag] base wav16: cos=" + String(bcos) + " max_abs=" + String(bmax))
+
+    var mel_bwe = voc._compute_mel(wav16, ctx)
+    var mel_for_bwe = permute(mel_bwe, [0, 1, 3, 2], ctx)
+    _print_compare(String("bwe mel"), mel_for_bwe, mel_bwe_ref, ctx)
+    var residual = vocoder_forward(voc.bwe, String("vocoder.bwe_generator"), mel_for_bwe, ctx)
+    var skip = voc._sinc_upsample(wav16, ctx)
+    _print_compare(String("bwe residual"), residual, residual_ref, ctx)
+    _print_compare(String("sinc skip"), skip, skip_ref, ctx)
 
     # ── run forward ────────────────────────────────────────────────────────────
     var wav = voc.forward(mel_in, ctx)
@@ -214,7 +275,6 @@ def main() raises:
     )
 
     # ── write .wav (interleave L,R from [1,2,L]) ───────────────────────────────
-    var B = wsh[0]
     var C = wsh[1]
     var L = wsh[2]
     var inter = List[Float32]()

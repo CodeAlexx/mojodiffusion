@@ -1,4 +1,4 @@
-# ops/vec_swiglu.mojo — VECTORIZED fused SwiGLU (silu(gate)*up), F32.
+# ops/vec_swiglu.mojo — VECTORIZED fused SwiGLU (silu(gate)*up), F32 fast path.
 #
 # NEW STANDALONE kernel. Does NOT replace ops/activations.mojo `swiglu`; it is a
 # faster sibling. Parity gated against the scalar swiglu (vec_swiglu_parity.mojo).
@@ -25,6 +25,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.activations import swiglu as _scalar_swiglu
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -35,7 +36,7 @@ comptime _VW = 4
 # silu over a SIMD[F32,4]: v / (1 + exp(-v)), lanewise. `exp` is overloaded for
 # SIMD so this stays one vector op (no per-lane scalar loop).
 @always_inline
-fn _silu_vec(v: SIMD[DType.float32, _VW]) -> SIMD[DType.float32, _VW]:
+def _silu_vec(v: SIMD[DType.float32, _VW]) -> SIMD[DType.float32, _VW]:
     return v / (SIMD[DType.float32, _VW](1.0) + exp(-v))
 
 
@@ -56,10 +57,12 @@ def _vec_swiglu_kernel(
 
 
 def vec_swiglu(x_gate: Tensor, x_up: Tensor, ctx: DeviceContext) raises -> Tensor:
-    """Vectorized swiglu(gate, up) = silu(gate)*up. F32-only; numel % 4 == 0.
-    Byte-identical to ops/activations.mojo swiglu (F32 path)."""
+    """Vectorized swiglu(gate, up) = silu(gate)*up for F32.
+
+    BF16/F16 use the dtype-preserving scalar implementation instead of
+    materializing F32 fast-path storage."""
     if x_gate.dtype() != STDtype.F32 or x_up.dtype() != STDtype.F32:
-        raise Error("vec_swiglu: F32-only fast path")
+        return _scalar_swiglu(x_gate, x_up, ctx)
     if x_gate.numel() != x_up.numel():
         raise Error("vec_swiglu: gate/up numel mismatch")
     var n = x_gate.numel()

@@ -4,7 +4,7 @@
 # Mirrors EDv2 crates/eridiffusion-core/src/lycoris.rs BOFT save
 # (lycoris.rs:908-913 `out.insert(format!("{full}.oft_blocks.weight"), pt(&m.blocks))`):
 #
-#       "<prefix>.oft_blocks.weight"  F32 [boft_m, num_blocks, block_size, block_size]
+#       "<prefix>.oft_blocks.weight"  BF16 [boft_m, num_blocks, block_size, block_size]
 #       "<prefix>.alpha"              F32 [1]
 #
 # Same `oft_blocks` suffix as Diag-OFT — the 4D shape [boft_m, nb, b, b] is what
@@ -42,13 +42,13 @@ struct NamedBOFT(Copyable, Movable):
     var adapter: BOFTAdapter
 
 
-def _f32_4d(var values: List[Float32], d0: Int, d1: Int, d2: Int, d3: Int, ctx: DeviceContext) raises -> Tensor:
+def _bf16_4d(var values: List[BFloat16], d0: Int, d1: Int, d2: Int, d3: Int, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(d0)
     sh.append(d1)
     sh.append(d2)
     sh.append(d3)
-    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+    return Tensor.from_host_bf16(values^, sh^, ctx)
 
 
 def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
@@ -57,6 +57,13 @@ def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(1)
     return Tensor.from_host(v^, sh^, STDtype.F32, ctx)
+
+
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +86,7 @@ def save_boft_peft(
             raise Error(String("save_boft_peft: s numel ") + String(len(a.s)) + " != boft_m*num_blocks*b*b for '" + nk.prefix + "'")
 
         names.append(nk.prefix + ".oft_blocks.weight")
-        tensors.append(ArcPointer(_f32_4d(a.s.copy(), MM, NB, B, B, ctx)))
+        tensors.append(ArcPointer(_bf16_4d(a.s.copy(), MM, NB, B, B, ctx)))
 
         names.append(nk.prefix + ".alpha")
         tensors.append(ArcPointer(_f32_scalar(a.alpha, ctx)))
@@ -105,10 +112,14 @@ def _read_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[
     return t.to_host(ctx)
 
 
+def _read_bf16(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[BFloat16]:
+    return _f32_to_bf16_list(_read_f32(st, name, ctx))
+
+
 # A read-back of one BOFT module: S squares + shapes + alpha.
 @fieldwise_init
 struct BOFTReadback(Copyable, Movable):
-    var s: List[Float32]
+    var s: List[BFloat16]
     var boft_m: Int
     var num_blocks: Int
     var block_size: Int
@@ -128,7 +139,7 @@ def read_boft_module(prefix: String, path: String, ctx: DeviceContext) raises ->
     var B = info.shape[2]
     if info.shape[3] != B:
         raise Error("read_boft_module: oft_blocks last two dims must be equal (square blocks)")
-    var s = _read_f32(st, prefix + ".oft_blocks.weight", ctx)
+    var s = _read_bf16(st, prefix + ".oft_blocks.weight", ctx)
 
     var alpha_h = _read_f32(st, prefix + ".alpha", ctx)
     if len(alpha_h) != 1:

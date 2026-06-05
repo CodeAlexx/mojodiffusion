@@ -86,6 +86,24 @@ def _max_abs_diff(a: List[Float32], b: List[Float32]) raises -> Float32:
     return mx
 
 
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
+def _max_abs_diff_bf16(a: List[BFloat16], b: List[BFloat16]) raises -> Float32:
+    if len(a) != len(b):
+        raise Error("max_abs_diff_bf16: len mismatch " + String(len(a)) + " != " + String(len(b)))
+    var mx = Float32(0.0)
+    for i in range(len(a)):
+        var d = abs(a[i].cast[DType.float32]() - b[i].cast[DType.float32]())
+        if d > mx:
+            mx = d
+    return mx
+
+
 def _max_rel_diff(a: List[Float32], b: List[Float32], floor: Float32) raises -> Float32:
     if len(a) != len(b):
         raise Error("max_rel_diff: len mismatch " + String(len(a)) + " != " + String(len(b)))
@@ -330,7 +348,8 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
 
     # Drive S off zero across all stages so every factor is exercised.
     for i in range(len(lo.s)):
-        lo.s[i] = Float32(0.06) * Float32((i % 7) - 3) + Float32(0.04)
+        lo.s[i] = BFloat16(Float32(0.06) * Float32((i % 7) - 3) + Float32(0.04))
+    var s_h = _bf16_to_f32_list(lo.s)
 
     # ── (a) orthogonality of overall transform: TᵀT ≈ I ──
     var T = boft_transform(lo)
@@ -341,7 +360,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
         print("PASS (a-orth): TᵀT == I (product of orthogonals), max|TᵀT - I|=", ttt)
 
     # independent-oracle transform cross-check
-    var T_oracle = _oracle_transform(lo.s, MM, NB, B, OUT)
+    var T_oracle = _oracle_transform(s_h, MM, NB, B, OUT)
     var T_mx = _max_abs_diff(T, T_oracle)
     if T_mx > Float32(1.0e-5):
         print("FAIL (a-T): transform vs oracle max|Δ|=", T_mx); ok = False
@@ -354,7 +373,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
 
     # ── (a) W_eff + forward parity vs independent oracle ──
     var weff_impl = boft_effective_weight(lo)
-    var weff_oracle = _oracle_weff(lo.s, lo.w_base, MM, NB, B, IN, OUT)
+    var weff_oracle = _oracle_weff(s_h, lo.w_base, MM, NB, B, IN, OUT)
     var weff_mx = _max_abs_diff(weff_impl, weff_oracle)
     if weff_mx > Float32(1.0e-5):
         print("FAIL (a-weff): W_eff vs oracle max|Δ|=", weff_mx); ok = False
@@ -379,7 +398,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
     var tol_rel = Float32(2.0e-2)
     var rel_floor = Float32(1.0e-4)
 
-    var fd_s = _fd_grad_s(lo.s, lo.w_base, x, MM, NB, B, IN, OUT, M, h)
+    var fd_s = _fd_grad_s(s_h, lo.w_base, x, MM, NB, B, IN, OUT, M, h)
     var e_s = _max_abs_diff(g.d_s, fd_s)
     var er_s = _max_rel_diff(g.d_s, fd_s, rel_floor)
     if e_s > tol_fd or er_s > tol_rel:
@@ -452,7 +471,7 @@ def _run_config(label: String, in_f: Int, out_f: Int, block_size: Int,
         print("FAIL (c): alpha mismatch got", rb.alpha, "expected", alpha); ok = False
     else:
         print("PASS (c): alpha round-trip =", rb.alpha)
-    var s_mx = _max_abs_diff(rb.s, lo.s)
+    var s_mx = _max_abs_diff_bf16(rb.s, lo.s)
     if s_mx > Float32(1.0e-6):
         print("FAIL (c): oft_blocks(S) not byte-exact, Δ=", s_mx); ok = False
     else:

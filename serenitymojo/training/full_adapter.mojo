@@ -28,7 +28,7 @@
 # full-delta weights is a larger follow-up (flagged). The gate proves the delta
 # math and the save key/shape, per the item-2j acceptance.
 #
-# Mojo 1.0.0b1. Host F32 master (training masters are F32 per MOJO_CONVENTIONS §3).
+# Mojo 1.0.0b1. BF16 trainable storage; F32 moments/compute.
 
 from std.collections import List
 from std.memory import ArcPointer
@@ -38,15 +38,15 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors_writer import save_safetensors
 
 
-# A full-shape weight delta with AdamW moments, host F32. `diff` is row-major
+# A full-shape weight delta with AdamW moments. `diff` is row-major BF16 storage
 # with the base weight's shape (stored flat + the shape dims).
 struct FullAdapter(Copyable, Movable):
-    var diff: List[Float32]        # flat, len == prod(shape)
+    var diff: List[BFloat16]       # flat, len == prod(shape)
     var shape: List[Int]           # base weight shape (e.g. [out, in])
     var m: List[Float32]           # AdamW first moment
     var v: List[Float32]           # AdamW second moment
     var has_bias: Bool
-    var diff_b: List[Float32]      # flat [bias_size] (empty when has_bias=False)
+    var diff_b: List[BFloat16]     # flat [bias_size] (empty when has_bias=False)
     var mb: List[Float32]
     var vb: List[Float32]
 
@@ -56,12 +56,12 @@ struct FullAdapter(Copyable, Movable):
         has_bias: Bool, var diff_b: List[Float32],
         var mb: List[Float32], var vb: List[Float32],
     ):
-        self.diff = diff^
+        self.diff = _f32_to_bf16_list(diff)
         self.shape = shape^
         self.m = m^
         self.v = v^
         self.has_bias = has_bias
-        self.diff_b = diff_b^
+        self.diff_b = _f32_to_bf16_list(diff_b)
         self.mb = mb^
         self.vb = vb^
 
@@ -70,6 +70,13 @@ struct FullAdapter(Copyable, Movable):
         for i in range(len(self.shape)):
             n = n * self.shape[i]
         return n
+
+
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
 
 
 # Construct a fresh zero-initialized Full adapter (ΔW=0, ΔB=0), AdamW moments 0.
@@ -100,10 +107,10 @@ def full_delta_weight(adapter: FullAdapter, strength: Float32) -> List[Float32]:
     var out = List[Float32]()
     if strength == Float32(1.0):
         for i in range(len(adapter.diff)):
-            out.append(adapter.diff[i])
+            out.append(adapter.diff[i].cast[DType.float32]())
         return out^
     for i in range(len(adapter.diff)):
-        out.append(strength * adapter.diff[i])
+        out.append(strength * adapter.diff[i].cast[DType.float32]())
     return out^
 
 
@@ -115,10 +122,10 @@ def full_delta_bias(adapter: FullAdapter, strength: Float32) -> List[Float32]:
         return out^
     if strength == Float32(1.0):
         for i in range(len(adapter.diff_b)):
-            out.append(adapter.diff_b[i])
+            out.append(adapter.diff_b[i].cast[DType.float32]())
         return out^
     for i in range(len(adapter.diff_b)):
-        out.append(strength * adapter.diff_b[i])
+        out.append(strength * adapter.diff_b[i].cast[DType.float32]())
     return out^
 
 
@@ -148,10 +155,10 @@ def save_full_adapters(
                 + " != prod(shape) " + String(a.numel()) + " for '" + nf.prefix + "'"
             )
         names.append(nf.prefix + ".diff.weight")
-        tensors.append(ArcPointer(Tensor.from_host(a.diff.copy(), a.shape.copy(), STDtype.F32, ctx)))
+        tensors.append(ArcPointer(Tensor.from_host_bf16(a.diff.copy(), a.shape.copy(), ctx)))
         if a.has_bias:
             var bsh = List[Int](); bsh.append(len(a.diff_b))
             names.append(nf.prefix + ".diff_b")
-            tensors.append(ArcPointer(Tensor.from_host(a.diff_b.copy(), bsh^, STDtype.F32, ctx)))
+            tensors.append(ArcPointer(Tensor.from_host_bf16(a.diff_b.copy(), bsh^, ctx)))
     save_safetensors(names, tensors, path, ctx)
     return len(names)

@@ -48,12 +48,13 @@
 #                                       (== weight_v layout), does flip+zero-insert+pad+conv.
 #   ops/snake.{snake_beta,snake_beta_precompute} — Snake1d, launch-for-launch.
 #   ops/tensor_algebra.{add,slice}    — residual add + center-trim.
-#   io/safetensors + Tensor.from_view_as_f32 — F32 weight load (matches F32 oracle).
+#   io/safetensors + Tensor.from_view — checkpoint dtype-preserving weight load.
 #
 # === DTYPE ===
-# Weights are BF16 on disk; loaded as F32 (from_view_as_f32) so the conv F32
-# accumulation matches the canonical bf16-GPU oracle without BF16 round-trip
-# jitter. Activations stay F32. Snake precompute is exp/recip in F32.
+# Persistent weights preserve checkpoint storage dtype. conv1d/conv_transpose1d
+# stage weights and biases as F32 locally for accumulation, then store outputs in
+# the activation dtype. Snake precompute follows checkpoint dtype, with local
+# casts only when the current activation dtype differs.
 #
 # Gate: serenitymojo/parity/acestep_vae_probe.mojo decodes the fixed oracle
 # latent and compares the waveform (cos>=0.999 + magnitude ratio).
@@ -67,11 +68,11 @@ from std.gpu.host import DeviceContext
 from std.math import sqrt
 
 from serenitymojo.tensor import Tensor
-from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.conv1d import conv1d, conv_transpose1d
 from serenitymojo.ops.snake import snake_beta, snake_beta_precompute
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import add, slice, reshape
 
 
@@ -82,13 +83,11 @@ comptime CONV2_PAD = 3      # k=7 -> pad 3
 
 
 # ── weight load helper ────────────────────────────────────────────────────────
-# F32 storage: conv1d accumulates in F32, so an all-F32 chain matches the
-# bf16-GPU oracle without BF16 round-trip jitter (vocoder doctrine).
-def _load_f32(ref st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
+def _load_weight(ref st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var view = from_parts(info.dtype, info.shape.copy(), bytes)
-    return Tensor.from_view_as_f32(view, ctx)
+    return Tensor.from_view(view, ctx)
 
 
 # Fresh device-to-device copy of a tensor — needed to build an Optional[Tensor]
@@ -119,8 +118,12 @@ def _fuse_weight_norm(
     var d2 = vs[2]
     var tail = d1 * d2
 
-    var vh = v.to_host(ctx)   # F32, [d0, d1, d2] row-major
-    var gh = g.to_host(ctx)   # F32, [d0, 1, 1] -> d0 elems
+    if g.dtype() != v.dtype():
+        raise Error("acestep_vae: weight_g/weight_v dtype mismatch")
+
+    var storage = v.dtype()
+    var vh = v.to_host(ctx)   # Host F32 values, [d0, d1, d2] row-major.
+    var gh = g.to_host(ctx)   # Host F32 values, [d0, 1, 1] -> d0 elems.
 
     var out = List[Float32]()
     out.resize(d0 * tail, Float32(0.0))
@@ -137,7 +140,7 @@ def _fuse_weight_norm(
 
     var osh = List[Int]()
     osh.append(d0); osh.append(d1); osh.append(d2)
-    return Tensor.from_host(out, osh^, STDtype.F32, ctx)
+    return Tensor.from_host(out, osh^, storage, ctx)
 
 
 # A fused WN conv: weight + bias. (Tuple element moves are awkward in this Mojo;
@@ -156,10 +159,10 @@ struct WnConv(Movable):
 def _load_wn(
     ref st: SafeTensors, prefix: String, ctx: DeviceContext
 ) raises -> WnConv:
-    var g = _load_f32(st, prefix + ".weight_g", ctx)
-    var v = _load_f32(st, prefix + ".weight_v", ctx)
+    var g = _load_weight(st, prefix + ".weight_g", ctx)
+    var v = _load_weight(st, prefix + ".weight_v", ctx)
     var w = _fuse_weight_norm(g, v, ctx)
-    var b = _load_f32(st, prefix + ".bias", ctx)
+    var b = _load_weight(st, prefix + ".bias", ctx)
     return WnConv(w^, b^)
 
 
@@ -174,8 +177,8 @@ struct Snake1d(Movable):
 
     @staticmethod
     def load(ref st: SafeTensors, prefix: String, ctx: DeviceContext) raises -> Snake1d:
-        var alpha = _load_f32(st, prefix + ".alpha", ctx)  # [1,C,1]
-        var beta = _load_f32(st, prefix + ".beta", ctx)    # [1,C,1]
+        var alpha = _load_weight(st, prefix + ".alpha", ctx)  # [1,C,1]
+        var beta = _load_weight(st, prefix + ".beta", ctx)    # [1,C,1]
         var C = alpha.shape()[1]
         var pre = snake_beta_precompute(alpha, beta, ctx)
         # reshape consumes the tuple element by value (working vocoder idiom;
@@ -185,7 +188,12 @@ struct Snake1d(Movable):
         return Snake1d(ae^, ibe^)
 
     def forward(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
-        return snake_beta(x, self.alpha_exp, self.inv_beta_eps, ctx)
+        if x.dtype() == self.alpha_exp.dtype():
+            return snake_beta(x, self.alpha_exp, self.inv_beta_eps, ctx)
+        # Tensor algebra requires matching storage dtype; keep Snake output in x dtype.
+        var alpha = cast_tensor(self.alpha_exp, x.dtype(), ctx)
+        var inv_beta = cast_tensor(self.inv_beta_eps, x.dtype(), ctx)
+        return snake_beta(x, alpha, inv_beta, ctx)
 
 
 # ── OobleckResidualUnit ────────────────────────────────────────────────────────
@@ -340,8 +348,8 @@ struct OobleckVaeDecoder(Movable):
         var sn = Snake1d.load(st, "decoder.snake1", ctx)
 
         # conv2 has NO bias: fuse g/v only.
-        var c2g = _load_f32(st, "decoder.conv2.weight_g", ctx)
-        var c2v = _load_f32(st, "decoder.conv2.weight_v", ctx)
+        var c2g = _load_weight(st, "decoder.conv2.weight_g", ctx)
+        var c2v = _load_weight(st, "decoder.conv2.weight_v", ctx)
         var c2w = _fuse_weight_norm(c2g, c2v, ctx)
 
         return OobleckVaeDecoder(c1^, b0^, b1^, b2^, b3^, b4^, sn^, c2w^)

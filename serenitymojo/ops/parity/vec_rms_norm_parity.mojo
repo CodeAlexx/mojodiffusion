@@ -76,6 +76,28 @@ def main() raises:
     print("    bwd dx:", r_dx)
     print("    bwd dg:", r_dg)
 
+    # BF16/F16 take the general dtype-preserving path through this wrapper.
+    var xb = Tensor.from_host(x_h.copy(), [rows, d], STDtype.BF16, ctx)
+    var gb = Tensor.from_host(g_h.copy(), [d], STDtype.BF16, ctx)
+    var gob = Tensor.from_host(go_h.copy(), [rows, d], STDtype.BF16, ctx)
+    var yb = vec_rms_norm(xb, gb, eps, ctx)
+    if yb.dtype() != STDtype.BF16:
+        raise Error("vec_rms_norm BF16 forward returned " + yb.dtype().name())
+    var vgb = vec_rms_norm_backward(gob, xb, gb, eps, ctx)
+    if vgb.d_x.dtype() != STDtype.BF16 or vgb.d_g.dtype() != STDtype.BF16:
+        raise Error(
+            "vec_rms_norm_backward BF16 returned d_x="
+            + vgb.d_x.dtype().name()
+            + " d_g="
+            + vgb.d_g.dtype().name()
+        )
+    var rb_y = h.compare(yb, y_scalar, ctx)
+    var rb_dx = h.compare(vgb.d_x, dx_scalar, ctx)
+    var rb_dg = h.compare(vgb.d_g, dg_scalar, ctx)
+    print("    bf16 fwd y cos :", rb_y.cos)
+    print("    bf16 bwd dx cos:", rb_dx.cos)
+    print("    bf16 bwd dg cos:", rb_dg.cos)
+
     # ── microbench ──
     var reps = 200
     # scalar fwd
@@ -123,7 +145,14 @@ def main() raises:
     print("    [microbench fwd D=4096 rows=1024] scalar=", s2, "ms  vec=", v2,
           "ms  speedup=", s2 / v2, "x")
 
-    if r_y.passed and r_dx.passed and r_dg.passed:
+    if (
+        r_y.passed
+        and r_dx.passed
+        and r_dg.passed
+        and rb_y.cos >= 0.99
+        and rb_dx.cos >= 0.99
+        and rb_dg.cos >= 0.99
+    ):
         print("PASS: vec_rms_norm matches scalar cos>=0.999 (fwd+dx+dg)")
     else:
         raise Error("vec_rms_norm_parity gate FAILED")

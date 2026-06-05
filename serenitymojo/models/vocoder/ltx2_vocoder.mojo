@@ -14,7 +14,8 @@
 #     x = mean over 3 AMPBlock1(stage convs, dilations [1,3,5])
 #   act_post  Activation1d(SnakeBeta(final_ch))
 #   conv_post Conv1d(final_ch -> 2, k=7, pad=3)
-#   tanh (only for the base vocoder; BWE generator skips the final tanh)
+#   no final tanh for LTX2.3 checkpoint metadata (`use_tanh_at_final=false`);
+#   BWE generator also skips final activation.
 #
 # upsample_rates: 6 stages -> [5,2,2,2,2,2]; 5 stages (BWE) -> [6,5,2,2,2].
 # resblock kernel sizes per stage position: [3,7,11]; dilations [1,3,5].
@@ -29,12 +30,12 @@
 #   skip     = sinc_upsample(x16, ratio=3)                # [B,2,~L48]
 #   out      = clamp(residual[:mix] + skip[:mix], -1, 1), trimmed to L16*3.
 #
-# All compute in BF16 (Rust `to_dtype(BF16)` on every weight) so the Mojo BF16
-# path matches the dumped reference within cos>=0.999 / max_abs<0.01.
+# Weights and activations stay in BF16 storage at runtime. Kernels accumulate
+# internally in F32 where needed and return to the input/storage dtype.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from math import cos, sin, pi
+from std.math import cos, sin, pi
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 
@@ -49,6 +50,7 @@ from serenitymojo.ops.conv1d import (
     zero_insert1d,
     replicate_pad1d,
 )
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.snake import snake_beta, snake_beta_precompute
 from serenitymojo.ops.activation1d import activation1d
 from serenitymojo.ops.tensor_algebra import (
@@ -110,13 +112,13 @@ def _get_padding(k: Int, d: Int) -> Int:
 
 
 # ── weight loading helper ─────────────────────────────────────────────────────
-# F32 storage throughout: conv1d accumulates in F32, so an all-F32 chain matches
-# the F32 parity oracle without BF16 round-trip jitter (Plan gate doctrine).
+# Runtime loader: preserve BF16 checkpoint storage. Conv/STFT/Snake kernels own
+# any needed F32 internal math and store back to the tensor storage dtype.
 def _load_bf16(ref st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var view = from_parts(info.dtype, info.shape.copy(), bytes)
-    return Tensor.from_view_as_f32(view, ctx)
+    return Tensor.from_view_as_bf16(view, ctx)
 
 
 def _put(
@@ -145,8 +147,12 @@ def _snake_params(
 ) raises -> Tuple[Tensor, Tensor]:
     """Load act.alpha/act.beta [C], precompute (alpha_exp, inv_beta_eps) in
     [C,1,1] layout (matches ltx2_vocoder.rs:522-524)."""
-    var alpha = _load_bf16(st, prefix + ".act.alpha", ctx)
-    var beta = _load_bf16(st, prefix + ".act.beta", ctx)
+    var alpha_bf = _load_bf16(st, prefix + ".act.alpha", ctx)
+    var beta_bf = _load_bf16(st, prefix + ".act.beta", ctx)
+    # dtype-contract: allow-f32-boundary
+    # LTX2 computes SnakeBeta exp/reciprocal inside the vocoder F32 autocast block.
+    var alpha = cast_tensor(alpha_bf^, STDtype.F32, ctx)
+    var beta = cast_tensor(beta_bf^, STDtype.F32, ctx)
     var C = alpha.shape()[0]
     var alpha3 = reshape(alpha, [C, 1, 1], ctx)
     var beta3 = reshape(beta, [C, 1, 1], ctx)
@@ -190,6 +196,13 @@ struct ActParams(Movable):
         return ActParams(ae^, ibe^, up^, down^)
 
     def apply(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
+        if x.dtype() != self.alpha_exp.dtype():
+            var ae = cast_tensor(self.alpha_exp, x.dtype(), ctx)
+            var ibe = cast_tensor(self.inv_beta_eps, x.dtype(), ctx)
+            return activation1d(
+                x, ae, ibe,
+                self.up_filter, self.down_filter, ctx,
+            )
         return activation1d(
             x, self.alpha_exp, self.inv_beta_eps,
             self.up_filter, self.down_filter, ctx,
@@ -458,7 +471,7 @@ def hann_sinc_resample_filter(
         data.append(Float32(sinc * window * rolloff / Float64(ratio)))
     var fsh = List[Int]()
     fsh.append(1); fsh.append(1); fsh.append(kernel_size)
-    var filt = Tensor.from_host(data, fsh^, STDtype.F32, ctx)
+    var filt = Tensor.from_host(data, fsh^, STDtype.BF16, ctx)
     return (filt^, pad, pad_left, pad_right)
 
 
@@ -508,7 +521,7 @@ struct LTX2VocoderWithBWE(Movable):
     @staticmethod
     def from_file(path: String, ctx: DeviceContext) raises -> LTX2VocoderWithBWE:
         var st = SafeTensors.open(path)
-        var voc = VocoderWeights.load(st, String("vocoder.vocoder"), True, ctx)
+        var voc = VocoderWeights.load(st, String("vocoder.vocoder"), False, ctx)
         var bwe = VocoderWeights.load(st, String("vocoder.bwe_generator"), False, ctx)
         var mel_basis = _load_bf16(st, String("vocoder.mel_stft.mel_basis"), ctx)
         var forward_basis = _load_bf16(
@@ -558,7 +571,13 @@ struct LTX2VocoderWithBWE(Movable):
         )
 
     def forward(self, mel: Tensor, ctx: DeviceContext) raises -> Tensor:
-        var x = vocoder_forward(self.voc, String("vocoder.vocoder"), mel, ctx)
+        var output_dtype = mel.dtype()
+        # dtype-contract: allow-f32-boundary
+        # LTX2 VocoderWithBWE.forward autocasts the whole BigVGAN+BWE chain to F32
+        # compute, then returns to the input dtype; BF16 intermediates compound
+        # through 108 convolutions and fail spectral parity.
+        var mel_compute = cast_tensor(mel, STDtype.F32, ctx)
+        var x = vocoder_forward(self.voc, String("vocoder.vocoder"), mel_compute^, ctx)
         var length_low_rate = x.shape()[2]
         var output_length = length_low_rate * self.output_sr // self.input_sr
 
@@ -594,6 +613,8 @@ struct LTX2VocoderWithBWE(Movable):
         var out_len = out.shape()[2]
         if out_len > output_length:
             out = slice(out, 2, 0, output_length, ctx)
+        if output_dtype != STDtype.F32:
+            return cast_tensor(out, output_dtype, ctx)
         return out^
 
 

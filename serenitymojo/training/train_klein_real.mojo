@@ -663,13 +663,13 @@ def main() raises:
 
     # ── EMA shadow params (Wave 2B item 2i; default-off => NO allocation) ─────
     # Shadow copies of every trainable LoRA A/B, host-side (LoRA params are host
-    # List[Float32]). Updated post-AdamW with the power-decay schedule. When
+    # List[BFloat16]). Updated post-AdamW with F32 math and BF16 storage. When
     # ema_enabled=False these Lists stay empty and the update loop is skipped =>
     # zero shadow allocation, baseline byte-unchanged.
-    var ema_dbl_a = List[List[Float32]]()
-    var ema_dbl_b = List[List[Float32]]()
-    var ema_sgl_a = List[List[Float32]]()
-    var ema_sgl_b = List[List[Float32]]()
+    var ema_dbl_a = List[List[BFloat16]]()
+    var ema_dbl_b = List[List[BFloat16]]()
+    var ema_sgl_a = List[List[BFloat16]]()
+    var ema_sgl_b = List[List[BFloat16]]()
     if cfg.ema_enabled:
         for i in range(len(lora.dbl)):
             ema_dbl_a.append(lora.dbl[i].a.copy())
@@ -683,8 +683,8 @@ def main() raises:
     var rope = _build_klein_rope_host()
     var cos = rope[0].copy()
     var sin = rope[1].copy()
-    var cos_dev = TArc(Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx))
-    var sin_dev = TArc(Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx))
+    var cos_dev = TArc(Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx))
+    var sin_dev = TArc(Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx))
     print("  rope host tables:", len(cos), "cos /", len(sin), "sin (expect", S * H * (Dh // 2), ")")
 
     # ── open cache ────────────────────────────────────────────────────────────
@@ -834,7 +834,9 @@ def main() raises:
         )
         if multires_skipped and runtime_profile:
             print("PROG_STAGE step=", k, " phase=multires_noise skipped=token_space_2d")
-        var noise_t = Tensor.from_host(noise^, [N_IMG, cfg.in_channels], STDtype.F32, ctx)
+        var noise_t = Tensor.from_host(
+            noise^, [N_IMG, cfg.in_channels], latent_tokens_t[].dtype(), ctx
+        )
         var fm = flow_match_noise_target(latent_tokens_t[], sigma, noise_t, ctx)
         var x_t_dev = TArc(fm.x_t.clone(ctx))
         var target = fm.target.to_host(ctx)

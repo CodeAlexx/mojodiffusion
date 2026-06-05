@@ -1,7 +1,9 @@
 # models/ltx2/weights.mojo — LTX-2 video DiT stack-level base weights.
 #
 # Loads the FROZEN stack-level (non-block) weights from a safetensors checkpoint
-# and provides the per-block host-F32 weight extractor for the offload training loop.
+# and provides per-block extractors for offload training. The legacy host-F32
+# extractor remains for parity surfaces; production offload uses the BF16
+# resident loader below.
 #
 # LTX-2 key layout (confirmed against checkpoint header, config.mojo):
 #   inner_dim D = 4096, num_heads H = 32, head_dim Dh = 128, mlp_hidden FF = 16384
@@ -26,7 +28,7 @@
 #
 # PER-BLOCK (streamed, one at a time from TurboPlannedLoader):
 #   For block bi (transformer_blocks.{bi}.*):
-#     attn1.to_q.weight       [D, D]   ─┐  LoRA targets (t2v preset)
+#     attn1.to_q.weight       [D, D]   ─┐  legacy narrowed LoRA targets
 #     attn1.to_k.weight       [D, D]    |
 #     attn1.to_v.weight       [D, D]    |
 #     attn1.to_out.0.weight   [D, D]   ─┘
@@ -55,9 +57,10 @@
 #
 # NOTE ON AV JOINT BLOCK: The full LTX-2.x checkpoint has a joint audio-video
 # block (LTX2AVBlockWeights in ltx2_dit.mojo) with audio_attn*, audio_ff,
-# audio_to_video_attn, video_to_audio_attn. This weights.mojo targets the VIDEO-
-# ONLY LoRA training surface (musubi LTX2_INCLUDE_PATTERNS_T2V preset) which only
-# touches attn1.to_{q,k,v,out.0}. The audio branches are SKIPPED by the loader.
+# audio_to_video_attn, video_to_audio_attn. This weights.mojo targets the legacy
+# VIDEO-ONLY LoRA training surface, which only touches attn1.to_{q,k,v,out.0}.
+# musubi's production T2V preset targets all AV attention modules; the audio and
+# cross-modal branches are SKIPPED by this loader.
 #
 # Mojo 0.26.x+: def not fn; move-only Tensor; host List[Float32] carriers.
 
@@ -70,43 +73,25 @@ from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.offload.block_loader import Block
+from serenitymojo.models.ltx2.ltx2_block import LTX2BlockWeights
 
 comptime TArc = ArcPointer[Tensor]
 
 
-# ── host F32 loader helper ──────────────────────────────────────────────────────
-def _load_host_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
+def _load_dev_preserve(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    var t32 = cast_tensor(t, STDtype.F32, ctx)
-    return t32.to_host(ctx)
-
-
-def _load_dev_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx)
+    return Tensor.from_view(tv, ctx)
 
 
 def _try_key(st: SafeTensors, key: String, fallback: String, ctx: DeviceContext) raises -> Tensor:
     # Try ComfyUI-prefixed key first, then bare key.
     var comfy = String("model.diffusion_model.") + key
     try:
-        return _load_dev_f32(st, comfy, ctx)
+        return _load_dev_preserve(st, comfy, ctx)
     except:
-        return _load_dev_f32(st, key, ctx)
-
-
-def _try_key_host(st: SafeTensors, key: String, ctx: DeviceContext) raises -> List[Float32]:
-    var comfy = String("model.diffusion_model.") + key
-    try:
-        return _load_host_f32(st, comfy, ctx)
-    except:
-        return _load_host_f32(st, key, ctx)
+        return _load_dev_preserve(st, key, ctx)
 
 
 # ── Stack-level base (frozen, resident) ────────────────────────────────────────
@@ -206,6 +191,116 @@ def _block_f32_or_zeros(block: Block, key: String, n: Int, ctx: DeviceContext) r
             z.append(Float32(0.0))
         return z^
     return cast_tensor(block[key][], STDtype.F32, ctx).to_host(ctx)
+
+
+def _block_bf16_tensor(block: Block, key: String) raises -> TArc:
+    if not (key in block):
+        raise Error(String("LTX2 block missing tensor: ") + key)
+    if block[key][].dtype() != STDtype.BF16:
+        raise Error(
+            String("LTX2 offload block tensor is not BF16: ")
+            + key + String(" dtype=") + block[key][].dtype().name()
+        )
+    return block[key].copy()
+
+
+def _zeros(n: Int) -> List[Float32]:
+    var z = List[Float32]()
+    for _ in range(n):
+        z.append(Float32(0.0))
+    return z^
+
+
+def _zeros_bf16_tensor(n: Int, var shape: List[Int], ctx: DeviceContext) raises -> TArc:
+    return TArc(Tensor.from_host(_zeros(n), shape^, STDtype.BF16, ctx))
+
+
+def _block_bf16_or_zeros(
+    block: Block, key: String, n: Int, var shape: List[Int], ctx: DeviceContext,
+) raises -> TArc:
+    if not (key in block):
+        return _zeros_bf16_tensor(n, shape^, ctx)
+    return _block_bf16_tensor(block, key)
+
+
+struct LTX2BlockOffloadWeights(Movable):
+    var weights: LTX2BlockWeights
+    var sst_shift_msa: List[Float32]
+    var sst_scale_msa: List[Float32]
+    var sst_gate_msa: List[Float32]
+    var sst_shift_mlp: List[Float32]
+    var sst_scale_mlp: List[Float32]
+    var sst_gate_mlp: List[Float32]
+
+    def __init__(
+        out self,
+        var weights: LTX2BlockWeights,
+        var sst_shift_msa: List[Float32], var sst_scale_msa: List[Float32],
+        var sst_gate_msa: List[Float32],
+        var sst_shift_mlp: List[Float32], var sst_scale_mlp: List[Float32],
+        var sst_gate_mlp: List[Float32],
+    ):
+        self.weights = weights^
+        self.sst_shift_msa = sst_shift_msa^
+        self.sst_scale_msa = sst_scale_msa^
+        self.sst_gate_msa = sst_gate_msa^
+        self.sst_shift_mlp = sst_shift_mlp^
+        self.sst_scale_mlp = sst_scale_mlp^
+        self.sst_gate_mlp = sst_gate_mlp^
+
+
+def load_ltx2_block_offload_from_block(
+    block: Block, bp: String, D: Int, H: Int, ctx: DeviceContext,
+) raises -> LTX2BlockOffloadWeights:
+    """Load a streamed LTX2 block for the offload training path.
+
+    Checkpoint weights/biases/norms stay resident in BF16 device storage. The
+    scale_shift_table rows remain host F32 because they are combined with the
+    F32 per-step AdaLN delta before the block casts the resulting modvecs to
+    BF16 at its compute boundary.
+    """
+    var sst = _block_f32(block, bp + String("scale_shift_table"), ctx)
+    var shift_msa = List[Float32]()
+    var scale_msa = List[Float32]()
+    var gate_msa = List[Float32]()
+    var shift_mlp = List[Float32]()
+    var scale_mlp = List[Float32]()
+    var gate_mlp = List[Float32]()
+    for c in range(D):
+        shift_msa.append(sst[0 * D + c])
+        scale_msa.append(sst[1 * D + c])
+        gate_msa.append(sst[2 * D + c])
+        shift_mlp.append(sst[3 * D + c])
+        scale_mlp.append(sst[4 * D + c])
+        gate_mlp.append(sst[5 * D + c])
+
+    var weights = LTX2BlockWeights(
+        _block_bf16_tensor(block, bp + String("attn1.to_q.weight")),
+        _block_bf16_tensor(block, bp + String("attn1.to_q.bias")),
+        _block_bf16_tensor(block, bp + String("attn1.to_k.weight")),
+        _block_bf16_tensor(block, bp + String("attn1.to_k.bias")),
+        _block_bf16_tensor(block, bp + String("attn1.to_v.weight")),
+        _block_bf16_tensor(block, bp + String("attn1.to_v.bias")),
+        _block_bf16_tensor(block, bp + String("attn1.to_out.0.weight")),
+        _block_bf16_tensor(block, bp + String("attn1.to_out.0.bias")),
+        _block_bf16_tensor(block, bp + String("attn1.q_norm.weight")),
+        _block_bf16_tensor(block, bp + String("attn1.k_norm.weight")),
+        _block_bf16_or_zeros(
+            block, bp + String("attn1.to_gate_logits.weight"), H * D, [H, D], ctx,
+        ),
+        _block_bf16_or_zeros(
+            block, bp + String("attn1.to_gate_logits.bias"), H, [H], ctx,
+        ),
+        _block_bf16_tensor(block, bp + String("ff.net.0.proj.weight")),
+        _block_bf16_tensor(block, bp + String("ff.net.0.proj.bias")),
+        _block_bf16_tensor(block, bp + String("ff.net.2.weight")),
+        _block_bf16_tensor(block, bp + String("ff.net.2.bias")),
+    )
+    return LTX2BlockOffloadWeights(
+        weights^,
+        shift_msa^, scale_msa^, gate_msa^,
+        shift_mlp^, scale_mlp^, gate_mlp^,
+    )
 
 
 struct LTX2BlockWeightsHost(Movable):

@@ -156,6 +156,14 @@ def _absum(v: List[Float32]) -> Float32:
     return s
 
 
+def _absum(v: List[BFloat16]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(v)):
+        var x = v[i].cast[DType.float32]()
+        s += x if x >= 0.0 else -x
+    return s
+
+
 def _global_norm(grads: QwenLoraGradSet) -> Float64:
     var ss = 0.0
     for i in range(len(grads.d_a)):
@@ -211,13 +219,21 @@ def _load_host_f32_sharded(st: ShardedSafeTensors, name: String, ctx: DeviceCont
     return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
 
 
+def _load_host_bf16_sharded(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises -> List[BFloat16]:
+    var tv = st.tensor_view(name)
+    var t = Tensor.from_view(tv, ctx)
+    return t.to_host_bf16(ctx)
+
+
 # Sinusoidal timestep embedding (host, returns [timestep_dim] F32).
 # t_val: sigma in [0,1]; Qwen scales by 1000 before embedding.
 def _sinusoidal_temb(t_val: Float32, ctx: DeviceContext) raises -> List[Float32]:
     var t_h = List[Float32]()
     t_h.append(t_val * Float32(1000.0))
     var t_tensor = Tensor.from_host(t_h, [1], STDtype.F32, ctx)
-    var t_emb = timestep_embedding(t_tensor, Int(TIMESTEP_DIM), ctx, Float32(10000.0))
+    var t_emb = timestep_embedding(
+        t_tensor, Int(TIMESTEP_DIM), ctx, Float32(10000.0), STDtype.F32
+    )
     return t_emb.to_host(ctx)   # [1, TIMESTEP_DIM] flat = [TIMESTEP_DIM] scalars
 
 
@@ -225,24 +241,24 @@ def _sinusoidal_temb(t_val: Float32, ctx: DeviceContext) raises -> List[Float32]
 # te_lin1_w [D, timestep_dim], te_lin1_b [D], te_lin2_w [D,D], te_lin2_b [D].
 def _build_silu_temb(
     t_val: Float32,
-    te_lin1_w: List[Float32], te_lin1_b: List[Float32],
-    te_lin2_w: List[Float32], te_lin2_b: List[Float32],
+    te_lin1_w: List[BFloat16], te_lin1_b: List[BFloat16],
+    te_lin2_w: List[BFloat16], te_lin2_b: List[BFloat16],
     ctx: DeviceContext,
 ) raises -> List[Float32]:
     from serenitymojo.ops.linear import linear
     var sin_emb_h = _sinusoidal_temb(t_val, ctx)        # [TIMESTEP_DIM]
-    var t_emb = Tensor.from_host(sin_emb_h, [1, Int(TIMESTEP_DIM)], STDtype.F32, ctx)
-    var b1 = Tensor.from_host(te_lin1_b.copy(), [Int(D)], STDtype.F32, ctx)
+    var t_emb = Tensor.from_host(sin_emb_h, [1, Int(TIMESTEP_DIM)], STDtype.BF16, ctx)
+    var b1 = Tensor.from_host_bf16(te_lin1_b.copy(), [Int(D)], ctx)
     var h1 = linear(
         t_emb,
-        Tensor.from_host(te_lin1_w.copy(), [Int(D), Int(TIMESTEP_DIM)], STDtype.F32, ctx),
+        Tensor.from_host_bf16(te_lin1_w.copy(), [Int(D), Int(TIMESTEP_DIM)], ctx),
         Optional[Tensor](b1^), ctx,
     )
     var h1_silu = silu(h1, ctx)
-    var b2 = Tensor.from_host(te_lin2_b.copy(), [Int(D)], STDtype.F32, ctx)
+    var b2 = Tensor.from_host_bf16(te_lin2_b.copy(), [Int(D)], ctx)
     var temb_out = linear(
         h1_silu,
-        Tensor.from_host(te_lin2_w.copy(), [Int(D), Int(D)], STDtype.F32, ctx),
+        Tensor.from_host_bf16(te_lin2_w.copy(), [Int(D), Int(D)], ctx),
         Optional[Tensor](b2^), ctx,
     )
     # final silu for use as per-block mod MLP input
@@ -288,22 +304,22 @@ def main() raises:
     var base_stack = load_qwen_stack_base(st, Int(D), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), ctx)
 
     # timestep MLP weights (top-level in checkpoint)
-    var te_lin1_w = _load_host_f32_sharded(
+    var te_lin1_w = _load_host_bf16_sharded(
         st, "time_text_embed.timestep_embedder.linear_1.weight", ctx
     )   # [D, TIMESTEP_DIM]
-    var te_lin1_b = _load_host_f32_sharded(
+    var te_lin1_b = _load_host_bf16_sharded(
         st, "time_text_embed.timestep_embedder.linear_1.bias", ctx
     )   # [D]
-    var te_lin2_w = _load_host_f32_sharded(
+    var te_lin2_w = _load_host_bf16_sharded(
         st, "time_text_embed.timestep_embedder.linear_2.weight", ctx
     )   # [D, D]
-    var te_lin2_b = _load_host_f32_sharded(
+    var te_lin2_b = _load_host_bf16_sharded(
         st, "time_text_embed.timestep_embedder.linear_2.bias", ctx
     )   # [D]
 
     # norm_out.linear weights (for final scale/shift)
-    var norm_out_w = _load_host_f32_sharded(st, "norm_out.linear.weight", ctx)  # [2D, D]
-    var norm_out_b = _load_host_f32_sharded(st, "norm_out.linear.bias", ctx)    # [2D]
+    var norm_out_w = _load_host_bf16_sharded(st, "norm_out.linear.weight", ctx)  # [2D, D]
+    var norm_out_b = _load_host_bf16_sharded(st, "norm_out.linear.bias", ctx)    # [2D]
 
     var base = QwenOffloadBase(
         base_stack^,

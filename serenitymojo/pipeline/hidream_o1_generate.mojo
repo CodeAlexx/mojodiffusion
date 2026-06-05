@@ -106,11 +106,14 @@ def build_t2i_input(
     return T2ISample(text_ids^, pos[0].copy(), pos[1].copy(), pos[2].copy(), s_text, ar_len)
 
 
-# v = (x_pred - z) / sigma  (F32).  pipeline.rs:702-708.
+# v = (x_pred - z) / sigma. F32 scalar arithmetic happens inside tensor ops;
+# the velocity carrier returns in the latent/checkpoint storage dtype.
 def compute_velocity(x_pred: Tensor, z: Tensor, sigma: Float32, ctx: DeviceContext) raises -> Tensor:
-    var xf = cast_tensor(x_pred, STDtype.F32, ctx)
-    var zf = cast_tensor(z, STDtype.F32, ctx)
-    var diff = sub(xf, zf, ctx)
+    if x_pred.dtype() == z.dtype():
+        var diff = sub(x_pred, z, ctx)
+        return mul_scalar(diff, Float32(1.0) / sigma, ctx)
+    var pred = cast_tensor(x_pred, z.dtype(), ctx)
+    var diff = sub(pred, z, ctx)
     return mul_scalar(diff, Float32(1.0) / sigma, ctx)
 
 
@@ -194,7 +197,7 @@ def denoise(
 
         # Deterministic Default scheduler ignores the noise arg; pass zeros.
         var noise_sh = model_output.shape()
-        var zeros = randn(noise_sh^, UInt64(0), STDtype.F32, ctx)
+        var zeros = randn(noise_sh^, UInt64(0), model_output.dtype(), ctx)
         zeros = mul_scalar(zeros, Float32(0.0), ctx)
         z = sched.step(
             model_output, step_idx, z, zeros, noise_scale_start,

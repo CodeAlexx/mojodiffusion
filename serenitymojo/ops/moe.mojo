@@ -22,9 +22,10 @@
 #
 #   gated_scatter_add(expert_out[T*k,H], gating[T*k], indices[T*k], accum[N,H])
 #     accum[indices[s]] += expert_out[s] * gating[s]   (in-place, all s).
-#     Mirrors fused_gated_scatter_add.rs: atomic-add scatter into an F32
-#     accumulator (so the k slots that collide on the same token row combine
-#     correctly for top-k>1). Out-of-range / negative indices are skipped.
+#     Mirrors fused_gated_scatter_add.rs: atomic-add scatter through an F32
+#     accumulator workspace (so the k slots that collide on the same token row
+#     combine correctly for top-k>1), then stores back in the caller's accum
+#     dtype. Out-of-range / negative indices are skipped.
 #     `indices` is a host List[Int] copied HtoD as a REAL i32 buffer (flame-core
 #     passes host &[i32] the same way — its DType::I32 Tensors are f32-bytes-
 #     relabeled, so it never routes indices through a Tensor either).
@@ -32,7 +33,8 @@
 # (MoT note: SenseNova-U1's per-modality dispatch is just top_k_router applied
 # per modality-stream — no extra kernel; the router here covers it.)
 #
-# Mojo 1.0.0b1, NVIDIA GPU. F32 accumulation. Reuses ops.linear + ops.swiglu.
+# Mojo 1.0.0b1, NVIDIA GPU. F32 accumulation, storage-preserving boundaries.
+# Reuses ops.linear + ops.swiglu.
 
 from std.math import exp
 from std.gpu.host import DeviceContext, DeviceBuffer
@@ -45,6 +47,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import swiglu
+from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -140,10 +143,10 @@ def top_k_router(
 
 # ── row gather / scatter kernels (build per-expert blocks; write back) ────────
 # gather_rows: dst[i, :] = src[row_idx[i], :]   (row_idx is a device i32 buffer)
-def _gather_rows_kernel_f32(
-    src: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+def _gather_rows_kernel[dtype: DType](
+    src: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     row_idx: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    dst: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    dst: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     n: Int,
     h: Int,
 ):
@@ -153,14 +156,16 @@ def _gather_rows_kernel_f32(
         var i = idx // h
         var col = idx % h
         var srow = Int(rebind[Scalar[DType.int32]](row_idx[i]))
-        dst[i, col] = src[srow, col]
+        dst[i, col] = rebind[dst.element_type](
+            rebind[Scalar[dtype]](src[srow, col])
+        )
 
 
 # scatter_rows: dst[row_idx[i], :] = src[i, :]
-def _scatter_rows_kernel_f32(
-    src: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+def _scatter_rows_kernel[dtype: DType](
+    src: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     row_idx: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
-    dst: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    dst: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     n: Int,
     h: Int,
 ):
@@ -170,7 +175,22 @@ def _scatter_rows_kernel_f32(
         var i = idx // h
         var col = idx % h
         var drow = Int(rebind[Scalar[DType.int32]](row_idx[i]))
-        dst[drow, col] = src[i, col]
+        dst[drow, col] = rebind[dst.element_type](
+            rebind[Scalar[dtype]](src[i, col])
+        )
+
+
+def _copy_bytes_kernel(
+    src: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    src_offset: Int,
+    nbytes: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < nbytes:
+        dst[idx] = rebind[dst.element_type](
+            rebind[Scalar[DType.uint8]](src[src_offset + idx])
+        )
 
 
 def _idx_to_dev_i32(
@@ -189,6 +209,136 @@ def _idx_to_dev_i32(
     return dev^
 
 
+def _copy_tensor_slab_bytes(
+    src: Tensor,
+    elem_offset: Int,
+    elem_count: Int,
+    ctx: DeviceContext,
+) raises -> DeviceBuffer[DType.uint8]:
+    var bsz = src.dtype().byte_size()
+    var nbytes = elem_count * bsz
+    var dst = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](src.nbytes()))
+    var dst_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nbytes))
+    var src_lt = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        src.buf.unsafe_ptr(), src_rl
+    )
+    var dst_lt = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        dst.unsafe_ptr(), dst_rl
+    )
+    var grid = (nbytes + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_copy_bytes_kernel, _copy_bytes_kernel](
+        src_lt, dst_lt, elem_offset * bsz, nbytes,
+        grid_dim=grid, block_dim=_BLOCK,
+    )
+    return dst^
+
+
+def _enqueue_gather_rows(
+    tokens: Tensor,
+    row_idx_dev: DeviceBuffer[DType.uint8],
+    block_buf: DeviceBuffer[DType.uint8],
+    n: Int,
+    h: Int,
+    ctx: DeviceContext,
+) raises:
+    var tsh = tokens.shape()
+    var t = tsh[0]
+    var tok_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](t, h))
+    var blk_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, h))
+    var idx_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var idx_lt = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        row_idx_dev.unsafe_ptr().bitcast[Int32](), idx_rl
+    )
+    var grid = (n * h + _BLOCK - 1) // _BLOCK
+    var dt = tokens.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var src = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            tokens.buf.unsafe_ptr().bitcast[Float32](), tok_rl
+        )
+        var dst = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            block_buf.unsafe_ptr().bitcast[Float32](), blk_rl
+        )
+        ctx.enqueue_function[
+            _gather_rows_kernel[DType.float32],
+            _gather_rows_kernel[DType.float32],
+        ](src, idx_lt, dst, n, h, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var src = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            tokens.buf.unsafe_ptr().bitcast[BFloat16](), tok_rl
+        )
+        var dst = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            block_buf.unsafe_ptr().bitcast[BFloat16](), blk_rl
+        )
+        ctx.enqueue_function[
+            _gather_rows_kernel[DType.bfloat16],
+            _gather_rows_kernel[DType.bfloat16],
+        ](src, idx_lt, dst, n, h, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var src = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            tokens.buf.unsafe_ptr().bitcast[Float16](), tok_rl
+        )
+        var dst = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            block_buf.unsafe_ptr().bitcast[Float16](), blk_rl
+        )
+        ctx.enqueue_function[
+            _gather_rows_kernel[DType.float16],
+            _gather_rows_kernel[DType.float16],
+        ](src, idx_lt, dst, n, h, grid_dim=grid, block_dim=_BLOCK)
+
+
+def _enqueue_scatter_rows(
+    src_tensor: Tensor,
+    row_idx_dev: DeviceBuffer[DType.uint8],
+    dst_buf: DeviceBuffer[DType.uint8],
+    n_slots: Int,
+    n: Int,
+    h: Int,
+    ctx: DeviceContext,
+) raises:
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, h))
+    var dst_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n_slots, h))
+    var idx_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var idx_lt = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        row_idx_dev.unsafe_ptr().bitcast[Int32](), idx_rl
+    )
+    var grid = (n * h + _BLOCK - 1) // _BLOCK
+    var dt = src_tensor.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var src = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            src_tensor.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        var dst = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dst_buf.unsafe_ptr().bitcast[Float32](), dst_rl
+        )
+        ctx.enqueue_function[
+            _scatter_rows_kernel[DType.float32],
+            _scatter_rows_kernel[DType.float32],
+        ](src, idx_lt, dst, n, h, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var src = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            src_tensor.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        var dst = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dst_buf.unsafe_ptr().bitcast[BFloat16](), dst_rl
+        )
+        ctx.enqueue_function[
+            _scatter_rows_kernel[DType.bfloat16],
+            _scatter_rows_kernel[DType.bfloat16],
+        ](src, idx_lt, dst, n, h, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var src = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            src_tensor.buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        var dst = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dst_buf.unsafe_ptr().bitcast[Float16](), dst_rl
+        )
+        ctx.enqueue_function[
+            _scatter_rows_kernel[DType.float16],
+            _scatter_rows_kernel[DType.float16],
+        ](src, idx_lt, dst, n, h, grid_dim=grid, block_dim=_BLOCK)
+
+
 # ── stage 2: grouped expert FFN (loop over experts, callable matmul each) ─────
 def grouped_expert_ffn(
     tokens: Tensor,
@@ -200,7 +350,7 @@ def grouped_expert_ffn(
 ) raises -> Tensor:
     """Per-expert SwiGLU FFN over the routed slots.
 
-    tokens: [T, H]            (compute dtype)
+    tokens: [T, H]            (F32/BF16/F16 storage)
     gate_w: [E, F, H]         per-expert gate proj (PyTorch row-major [out,in])
     up_w:   [E, F, H]         per-expert up   proj
     down_w: [E, H, F]         per-expert down proj
@@ -210,12 +360,12 @@ def grouped_expert_ffn(
     Implementation: loop over experts. For each expert gather the token rows of
     its routed slots into a contiguous block, run the SwiGLU FFN via the
     callable `linear` (linalg matmul) three times, then scatter the result rows
-    back to their slot positions in expert_out. F32-accumulated GEMM throughout.
+    back to their slot positions in expert_out. F32-accumulated GEMM throughout;
+    tensor storage at the boundary stays in the input/weight dtype.
     """
     var tsh = tokens.shape()
     if len(tsh) != 2:
         raise Error("grouped_expert_ffn: tokens must be 2-D [T, H]")
-    var t = tsh[0]
     var h = tsh[1]
     var gsh = gate_w.shape()
     var ush = up_w.shape()
@@ -231,34 +381,20 @@ def grouped_expert_ffn(
     if e != plan.num_experts:
         raise Error("grouped_expert_ffn: expert count mismatch vs plan")
 
-    var dt = tokens.dtype().to_mojo_dtype()
-    if dt != DType.float32:
-        # Gather/scatter kernels here are F32-typed for clarity; the parity gate
-        # runs F32 storage. (BF16 path would add bf16-typed gather/scatter twins
-        # — omitted to keep this minimal and correct.)
-        raise Error("grouped_expert_ffn: only F32 storage supported in this build")
+    var storage = tokens.dtype()
+    _ = storage.to_mojo_dtype()
+    if (
+        gate_w.dtype() != storage
+        or up_w.dtype() != storage
+        or down_w.dtype() != storage
+    ):
+        raise Error("grouped_expert_ffn: tokens and weights must share dtype")
 
     var n_slots = len(plan.expert_ids)  # T*k
 
-    # Per-expert weight slices live contiguously in gate_w/up_w/down_w; we build
-    # a [out, in] weight Tensor for expert e by H2D-uploading that slab. We read
-    # the full weights once to host (dev oracle path is F32 anyway), then upload
-    # per-expert blocks. Tokens are gathered on-GPU via the row kernel.
-    var gate_host = gate_w.to_host(ctx)  # E*F*H
-    var up_host = up_w.to_host(ctx)      # E*F*H
-    var down_host = down_w.to_host(ctx)  # E*H*F
-
-    # Output buffer [T*k, H], zero-init (slots get filled per expert).
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n_slots * h * 4)
-    var out_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n_slots, h))
-
-    # tokens as a device LayoutTensor for the gather kernel.
-    var tok_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](t, h))
-    var tok_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        tokens.buf.unsafe_ptr().bitcast[Float32](), tok_rl
-    )
-    var out_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+    # Output buffer [T*k, H]; every routed slot is filled by its expert pass.
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n_slots * h * storage.byte_size()
     )
 
     for ei in range(e):
@@ -277,37 +413,22 @@ def grouped_expert_ffn(
 
         # Gather this expert's token rows into a [n_e, H] block on-GPU.
         var src_idx_dev = _idx_to_dev_i32(src_tokens, ctx)
-        var blk_buf = ctx.enqueue_create_buffer[DType.uint8](n_e * h * 4)
-        var blk_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n_e, h))
-        var src_idx_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_e))
-        var blk_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            blk_buf.unsafe_ptr().bitcast[Float32](), blk_rl
+        var blk_buf = ctx.enqueue_create_buffer[DType.uint8](
+            n_e * h * storage.byte_size()
         )
-        var src_idx_lt = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-            src_idx_dev.unsafe_ptr().bitcast[Int32](), src_idx_rl
-        )
-        var ggrid = (n_e * h + _BLOCK - 1) // _BLOCK
-        ctx.enqueue_function[_gather_rows_kernel_f32, _gather_rows_kernel_f32](
-            tok_lt, src_idx_lt, blk_lt, n_e, h,
-            grid_dim=ggrid, block_dim=_BLOCK,
-        )
-        ctx.synchronize()
-        var x_e = Tensor(blk_buf^, [n_e, h], STDtype.F32)
+        _enqueue_gather_rows(tokens, src_idx_dev, blk_buf, n_e, h, ctx)
+        var x_e = Tensor(blk_buf^, [n_e, h], storage)
 
-        # Upload this expert's weight slabs.
-        var gate_slab = List[Float32]()
-        var up_slab = List[Float32]()
-        var down_slab = List[Float32]()
+        # Copy this expert's contiguous weight slabs on device, preserving the
+        # checkpoint storage dtype. `linear` owns the F32 GEMM accumulator.
         var gbase = ei * f * h
-        for i in range(f * h):
-            gate_slab.append(gate_host[gbase + i])
-            up_slab.append(up_host[gbase + i])
         var dbase = ei * h * f
-        for i in range(h * f):
-            down_slab.append(down_host[dbase + i])
-        var gate_we = Tensor.from_host(gate_slab, [f, h], STDtype.F32, ctx)
-        var up_we = Tensor.from_host(up_slab, [f, h], STDtype.F32, ctx)
-        var down_we = Tensor.from_host(down_slab, [h, f], STDtype.F32, ctx)
+        var gate_buf = _copy_tensor_slab_bytes(gate_w, gbase, f * h, ctx)
+        var up_buf = _copy_tensor_slab_bytes(up_w, gbase, f * h, ctx)
+        var down_buf = _copy_tensor_slab_bytes(down_w, dbase, h * f, ctx)
+        var gate_we = Tensor(gate_buf^, [f, h], storage)
+        var up_we = Tensor(up_buf^, [f, h], storage)
+        var down_we = Tensor(down_buf^, [h, f], storage)
 
         # SwiGLU FFN:  down( silu(x@gate^T) * (x@up^T) ).
         var g_proj = linear(x_e, gate_we, None, ctx)   # [n_e, F]
@@ -317,26 +438,15 @@ def grouped_expert_ffn(
 
         # Scatter the result rows back to their slots in expert_out.
         var dst_idx_dev = _idx_to_dev_i32(dst_slots, ctx)
-        var dst_idx_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_e))
-        var dst_idx_lt = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-            dst_idx_dev.unsafe_ptr().bitcast[Int32](), dst_idx_rl
-        )
-        var y_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n_e, h))
-        var y_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            y_e.buf.unsafe_ptr().bitcast[Float32](), y_rl
-        )
-        ctx.enqueue_function[_scatter_rows_kernel_f32, _scatter_rows_kernel_f32](
-            y_lt, dst_idx_lt, out_lt, n_e, h,
-            grid_dim=ggrid, block_dim=_BLOCK,
-        )
+        _enqueue_scatter_rows(y_e, dst_idx_dev, out_buf, n_slots, n_e, h, ctx)
         ctx.synchronize()
 
-    return Tensor(out_buf^, [n_slots, h], STDtype.F32)
+    return Tensor(out_buf^, [n_slots, h], storage)
 
 
 # ── stage 3: gated scatter-add (atomic, mirrors fused_gated_scatter_add) ──────
-def _gated_scatter_add_kernel_f32(
-    expert_out: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+def _gated_scatter_add_kernel[dtype: DType](
+    expert_out: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     gating: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     indices: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin],
     accum: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
@@ -354,10 +464,72 @@ def _gated_scatter_add_kernel_f32(
         if row < 0 or row >= n_rows:
             return  # out-of-range row skipped (flame-core's "no expert" case)
         var g = rebind[Scalar[DType.float32]](gating[s])
-        var v = rebind[Scalar[DType.float32]](expert_out[s, col]) * g
+        var v = rebind[Scalar[dtype]](expert_out[s, col]).cast[DType.float32]() * g
         # Atomic add: k>1 slots collide on the same accum row.
         var dst_ptr = accum.ptr + (row * d + col)
         _ = Atomic[DType.float32].fetch_add(dst_ptr, v)
+
+
+def _enqueue_gated_scatter_add_f32_accum(
+    expert_out: Tensor,
+    gating_buf: DeviceBuffer[DType.uint8],
+    idx_dev: DeviceBuffer[DType.uint8],
+    accum_buf: DeviceBuffer[DType.uint8],
+    n_slots: Int,
+    d: Int,
+    n_rows: Int,
+    ctx: DeviceContext,
+) raises:
+    var eo_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n_slots, d))
+    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_slots))
+    var i_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_slots))
+    var acc_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n_rows, d))
+
+    var g_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        gating_buf.unsafe_ptr().bitcast[Float32](), g_rl
+    )
+    var i_lt = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        idx_dev.unsafe_ptr().bitcast[Int32](), i_rl
+    )
+    var acc_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        accum_buf.unsafe_ptr().bitcast[Float32](), acc_rl
+    )
+
+    var grid = (n_slots * d + _BLOCK - 1) // _BLOCK
+    var dt = expert_out.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var eo_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            expert_out.buf.unsafe_ptr().bitcast[Float32](), eo_rl
+        )
+        ctx.enqueue_function[
+            _gated_scatter_add_kernel[DType.float32],
+            _gated_scatter_add_kernel[DType.float32],
+        ](
+            eo_lt, g_lt, i_lt, acc_lt, n_slots, d, n_rows,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    elif dt == DType.bfloat16:
+        var eo_lt = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            expert_out.buf.unsafe_ptr().bitcast[BFloat16](), eo_rl
+        )
+        ctx.enqueue_function[
+            _gated_scatter_add_kernel[DType.bfloat16],
+            _gated_scatter_add_kernel[DType.bfloat16],
+        ](
+            eo_lt, g_lt, i_lt, acc_lt, n_slots, d, n_rows,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    else:
+        var eo_lt = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            expert_out.buf.unsafe_ptr().bitcast[Float16](), eo_rl
+        )
+        ctx.enqueue_function[
+            _gated_scatter_add_kernel[DType.float16],
+            _gated_scatter_add_kernel[DType.float16],
+        ](
+            eo_lt, g_lt, i_lt, acc_lt, n_slots, d, n_rows,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
 
 
 def gated_scatter_add(
@@ -369,10 +541,12 @@ def gated_scatter_add(
 ) raises:
     """accum[indices[s]] += expert_out[s] * gating[s]   (in-place, all s).
 
-    expert_out: [T*k, D]  (F32 storage)
+    expert_out: [T*k, D]  (F32/BF16/F16 storage)
     gating:     host List[Float32] length T*k
     indices:    host List[Int]     length T*k (negative/out-of-range skipped)
-    accum:      [N, D]    F32, updated IN PLACE via atomic add.
+    accum:      [N, D]    F32/BF16/F16, updated IN PLACE. BF16/F16 accum uses
+                a private F32 atomic accumulator scratch and casts back before
+                returning.
     """
     var eosh = expert_out.shape()
     var accsh = accum.shape()
@@ -389,8 +563,8 @@ def gated_scatter_add(
         raise Error("gated_scatter_add: gating length != T*k")
     if len(indices) != n_slots:
         raise Error("gated_scatter_add: indices length != T*k")
-    if expert_out.dtype() != STDtype.F32 or accum.dtype() != STDtype.F32:
-        raise Error("gated_scatter_add: expert_out and accum must be F32")
+    _ = expert_out.dtype().to_mojo_dtype()
+    _ = accum.dtype().to_mojo_dtype()
 
     # Stage gating (F32) + indices (i32) to device buffers.
     var g_buf = ctx.enqueue_create_buffer[DType.uint8](n_slots * 4)
@@ -402,29 +576,16 @@ def gated_scatter_add(
     ctx.synchronize()
     var idx_dev = _idx_to_dev_i32(indices, ctx)
 
-    var eo_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n_slots, d))
-    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_slots))
-    var i_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_slots))
-    var acc_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n_rows, d))
-
-    var eo_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        expert_out.buf.unsafe_ptr().bitcast[Float32](), eo_rl
-    )
-    var g_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        g_buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
-    var i_lt = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
-        idx_dev.unsafe_ptr().bitcast[Int32](), i_rl
-    )
-    var acc_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        accum.buf.unsafe_ptr().bitcast[Float32](), acc_rl
-    )
-
-    var grid = (n_slots * d + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _gated_scatter_add_kernel_f32, _gated_scatter_add_kernel_f32
-    ](
-        eo_lt, g_lt, i_lt, acc_lt, n_slots, d, n_rows,
-        grid_dim=grid, block_dim=_BLOCK,
-    )
-    ctx.synchronize()
+    if accum.dtype() == STDtype.F32:
+        _enqueue_gated_scatter_add_f32_accum(
+            expert_out, g_buf, idx_dev, accum.buf, n_slots, d, n_rows, ctx
+        )
+        ctx.synchronize()
+    else:
+        var accum_f32 = cast_tensor(accum, STDtype.F32, ctx, False)
+        _enqueue_gated_scatter_add_f32_accum(
+            expert_out, g_buf, idx_dev, accum_f32.buf, n_slots, d, n_rows, ctx
+        )
+        var accum_storage = cast_tensor(accum_f32, accum.dtype(), ctx, False)
+        ctx.enqueue_copy(dst_buf=accum.buf, src_buf=accum_storage.buf)
+        ctx.synchronize()

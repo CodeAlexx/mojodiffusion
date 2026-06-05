@@ -23,7 +23,7 @@
 #   - Unpatchify: [B,N,64] -> [B,T,H,W,16]
 #
 # Data layout throughout: [B, T*nH*nW, 2048] (2048 = hidden)
-# F32 residual stream within each block (BF16 for weight ops).
+# Residual stream stays in activation storage dtype; kernels use F32 internally.
 #
 # NOTE: head_dim=128, so sdpa_nomask[B,S,16,128] — uses math-mode (flash fails
 # on sm_86 for Dh=128, confirmed from attention.mojo comments).
@@ -122,9 +122,9 @@ comptime ANIMA_S_TXT = 256
 
 # ── sinusoidal timestep embedding (COS first, same as anima.rs prepare_timestep) ─
 # anima.rs uses cos first then sin (same as zimage_nextdit.rs / embeddings.mojo)
-def _anima_sinusoidal_kernel_f32(
+def _anima_sinusoidal_kernel[out_dtype: DType](
     t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    o: LayoutTensor[out_dtype, _DYN2, MutAnyOrigin],
     n: Int,
     half: Int,
     neg_ln_max_period: Float32,
@@ -137,38 +137,59 @@ def _anima_sinusoidal_kernel_f32(
         var tv = rebind[Scalar[DType.float32]](t[row])
         var freq = fexp(neg_ln_max_period * (Float32(i) / Float32(half)))
         var angle = tv * freq
-        o[row, i] = rebind[o.element_type](fcos(angle))
-        o[row, half + i] = rebind[o.element_type](fsin(angle))
+        o[row, i] = rebind[o.element_type](fcos(angle).cast[out_dtype]())
+        o[row, half + i] = rebind[o.element_type](fsin(angle).cast[out_dtype]())
 
 
 def _anima_sinusoidal_emb(
-    t: Tensor, dim: Int, ctx: DeviceContext
+    t: Tensor, dim: Int, out_dtype: STDtype, ctx: DeviceContext
 ) raises -> Tensor:
-    """Sinusoidal timestep embedding [N] -> [N, dim], cos-first (matches Rust)."""
+    """Sinusoidal timestep embedding [N] -> [N, dim], cos-first; F32 math, typed storage."""
     if t.dtype() != STDtype.F32:
         raise Error("_anima_sinusoidal_emb: t must be F32")
     var n = t.numel()
     var half = dim // 2
     var neg_ln = -flog(Float32(10000.0))
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dim * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n * dim * out_dtype.byte_size()
+    )
     var t_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](n, dim))
     var T = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         t.buf.unsafe_ptr().bitcast[Float32](), t_rl
     )
-    var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-    )
     var total = n * half
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_anima_sinusoidal_kernel_f32, _anima_sinusoidal_kernel_f32](
-        T, O, n, half, neg_ln, grid_dim=grid, block_dim=_BLOCK
-    )
+    var odt = out_dtype.to_mojo_dtype()
+    if odt == DType.float32:
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[
+            _anima_sinusoidal_kernel[DType.float32],
+            _anima_sinusoidal_kernel[DType.float32],
+        ](T, O, n, half, neg_ln, grid_dim=grid, block_dim=_BLOCK)
+    elif odt == DType.bfloat16:
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[
+            _anima_sinusoidal_kernel[DType.bfloat16],
+            _anima_sinusoidal_kernel[DType.bfloat16],
+        ](T, O, n, half, neg_ln, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[
+            _anima_sinusoidal_kernel[DType.float16],
+            _anima_sinusoidal_kernel[DType.float16],
+        ](T, O, n, half, neg_ln, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var sh = List[Int]()
     sh.append(n)
     sh.append(dim)
-    return Tensor(out_buf^, sh^, STDtype.F32)
+    return Tensor(out_buf^, sh^, out_dtype)
 
 
 # ── AdaLN: modulate(x, shift, scale) = LayerNorm(x, eps=1e-6) * (1+scale) + shift ──
@@ -180,8 +201,8 @@ def _anima_sinusoidal_emb(
 
 def _adaln_modulate_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B*S, D]
-    shift: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],  # [B, D] (broadcast over S)
-    scale: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],  # [B, D]
+    shift: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B, D] (broadcast over S)
+    scale: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B, D]
     o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B*S, D]
     rows: Int,  # B*S
     cols: Int,  # D
@@ -241,8 +262,8 @@ def _adaln_modulate_kernel_bf16(
     while c < cols:
         var v = rebind[Scalar[DType.bfloat16]](x[row, c]).cast[DType.float32]()
         var normed = (v - mean) * inv
-        var sc = rebind[Scalar[DType.float32]](scale[b, c])
-        var sh = rebind[Scalar[DType.float32]](shift[b, c])
+        var sc = rebind[Scalar[DType.bfloat16]](scale[b, c]).cast[DType.float32]()
+        var sh = rebind[Scalar[DType.bfloat16]](shift[b, c]).cast[DType.float32]()
         var out_v = (1.0 + sc) * normed + sh
         o[row, c] = rebind[o.element_type](out_v.cast[DType.bfloat16]())
         c += _TPB
@@ -260,9 +281,8 @@ def _apply_adaln_modulate(
     var b = xsh[0]
     var s = xsh[1]
     var d = xsh[2]
-    # Cast shift/scale to F32 for F32 arithmetic
-    var shift_f32 = cast_tensor(shift, STDtype.F32, ctx)
-    var scale_f32 = cast_tensor(scale, STDtype.F32, ctx)
+    if x.dtype() != STDtype.BF16 or shift.dtype() != STDtype.BF16 or scale.dtype() != STDtype.BF16:
+        raise Error("_apply_adaln_modulate: x/shift/scale must be BF16")
     var rows = b * s
 
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](rows * d * 2)  # BF16
@@ -271,11 +291,11 @@ def _apply_adaln_modulate(
     var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
         x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
     )
-    var Sh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        shift_f32.buf.unsafe_ptr().bitcast[Float32](), bd_rl
+    var Sh = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        shift.buf.unsafe_ptr().bitcast[BFloat16](), bd_rl
     )
-    var Sc = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        scale_f32.buf.unsafe_ptr().bitcast[Float32](), bd_rl
+    var Sc = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        scale.buf.unsafe_ptr().bitcast[BFloat16](), bd_rl
     )
     var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
         out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
@@ -293,7 +313,7 @@ def _apply_adaln_modulate(
 
 
 # ── 3D RoPE cos/sin construction (matches build_3d_rope_cossin in anima.rs) ───
-# Returns (cos, sin) each [1, 1, S, D/2] BF16
+# Returns (cos, sin) each [1, 1, S, D/2] in activation storage dtype.
 # Cosmos Predict2 3D RoPE: halfsplit, axis-split frequencies (t/h/w),
 # NTK-scaled thetas (h_extra=4.0, w_extra=4.0, t_extra=1.0 for 16ch model).
 def build_anima_3d_rope(
@@ -301,10 +321,11 @@ def build_anima_3d_rope(
     nh: Int,
     nw: Int,
     head_dim: Int,
+    out_dtype: STDtype,
     ctx: DeviceContext,
 ) raises -> _TensorPair:
     """Build 3D RoPE cos/sin tables for Anima self-attention.
-    Returns _TensorPair(cos, sin) each [1,1,S,D/2] in F32.
+    Returns _TensorPair(cos, sin) each [1,1,S,D/2] in out_dtype.
     Matches build_3d_rope_cossin() in anima.rs exactly.
     """
     var half_d = head_dim // 2  # 64
@@ -372,7 +393,7 @@ def build_anima_3d_rope(
                     cos_data.append(fcos(angle))
                     sin_data.append(fsin(angle))
 
-    # Shape [1, 1, total_seq, half_d] for rope_halfsplit_bf16 format
+    # Shape [1, 1, total_seq, half_d] for halfsplit RoPE.
     var cos_sh = List[Int]()
     cos_sh.append(1)
     cos_sh.append(1)
@@ -380,20 +401,20 @@ def build_anima_3d_rope(
     cos_sh.append(half_d)
     var sin_sh = cos_sh.copy()
 
-    var cos_t = Tensor.from_host(cos_data^, cos_sh^, STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin_data^, sin_sh^, STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos_data^, cos_sh^, out_dtype, ctx)
+    var sin_t = Tensor.from_host(sin_data^, sin_sh^, out_dtype, ctx)
     return _TensorPair(cos_t^, sin_t^)
 
 
-# ── RoPE halfsplit on [B, S, H, D] (BF16) ────────────────────────────────────
-# rope_cos/sin: [1, 1, S, D/2] F32 (broadcast over B and H).
+# ── RoPE halfsplit on [B, S, H, D] ───────────────────────────────────────────
+# x and rope_cos/sin share storage dtype; kernel casts to F32 for trig math.
 # out[b,s,h,i]      = x[b,s,h,i]*cos[s,i]     - x[b,s,h,i+D/2]*sin[s,i]
 # out[b,s,h,i+D/2]  = x[b,s,h,i+D/2]*cos[s,i] + x[b,s,h,i]*sin[s,i]
-def _rope_bshd_halfsplit_kernel_bf16(
-    x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],   # [B*S*H, D]
-    c: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],    # [S, D/2]
-    s: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],    # [S, D/2]
-    o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],   # [B*S*H, D]
+def _rope_bshd_halfsplit_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # [B*S*H, D]
+    c: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # [S, D/2]
+    s: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # [S, D/2]
+    o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # [B*S*H, D]
     B: Int,
     S: Int,
     H: Int,
@@ -407,23 +428,25 @@ def _rope_bshd_halfsplit_kernel_bf16(
         var bsh_idx = idx // half_d
         var si = (bsh_idx // H) % S   # position index -> cos/sin row
         var row = bsh_idx             # [B*S*H] flat row in x
-        var x1 = rebind[Scalar[DType.bfloat16]](x[row, pair_idx]).cast[DType.float32]()
-        var x2 = rebind[Scalar[DType.bfloat16]](x[row, pair_idx + half_d]).cast[DType.float32]()
-        var cv = rebind[Scalar[DType.float32]](c[si, pair_idx])
-        var sv = rebind[Scalar[DType.float32]](s[si, pair_idx])
+        var x1 = rebind[Scalar[dtype]](x[row, pair_idx]).cast[DType.float32]()
+        var x2 = rebind[Scalar[dtype]](x[row, pair_idx + half_d]).cast[DType.float32]()
+        var cv = rebind[Scalar[dtype]](c[si, pair_idx]).cast[DType.float32]()
+        var sv = rebind[Scalar[dtype]](s[si, pair_idx]).cast[DType.float32]()
         var out1 = x1 * cv - x2 * sv
         var out2 = x2 * cv + x1 * sv
-        o[row, pair_idx] = rebind[o.element_type](out1.cast[DType.bfloat16]())
-        o[row, pair_idx + half_d] = rebind[o.element_type](out2.cast[DType.bfloat16]())
+        o[row, pair_idx] = rebind[o.element_type](out1.cast[dtype]())
+        o[row, pair_idx + half_d] = rebind[o.element_type](out2.cast[dtype]())
 
 
 def _rope_halfsplit_4d(
-    x: Tensor,       # [B, S, H, D] BF16
-    rope_cos: Tensor, # [1, 1, S, D/2] F32
-    rope_sin: Tensor, # [1, 1, S, D/2] F32
+    x: Tensor,       # [B, S, H, D]
+    rope_cos: Tensor, # [1, 1, S, D/2], same dtype as x
+    rope_sin: Tensor, # [1, 1, S, D/2], same dtype as x
     ctx: DeviceContext,
 ) raises -> Tensor:
-    """Apply halfsplit RoPE to [B,S,H,D] BF16 tensor."""
+    """Apply halfsplit RoPE to [B,S,H,D] while preserving storage dtype."""
+    if rope_cos.dtype() != x.dtype() or rope_sin.dtype() != x.dtype():
+        raise Error("_rope_halfsplit_4d: x and RoPE tables must have the same dtype")
     var xsh = x.shape()
     var B = xsh[0]
     var S = xsh[1]
@@ -432,33 +455,72 @@ def _rope_halfsplit_4d(
     var half_d = D // 2
     var rows = B * S * H
 
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](rows * D * 2)  # BF16
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        rows * D * x.dtype().byte_size()
+    )
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, D))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, half_d))
-    var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-    )
-    var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        rope_cos.buf.unsafe_ptr().bitcast[Float32](), c_rl
-    )
-    var Sv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        rope_sin.buf.unsafe_ptr().bitcast[Float32](), c_rl
-    )
-    var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
-    )
     var ntotal = B * S * H * half_d
     var grid = (ntotal + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _rope_bshd_halfsplit_kernel_bf16, _rope_bshd_halfsplit_kernel_bf16
-    ](X, C, Sv, O, B, S, H, D, half_d, grid_dim=grid, block_dim=_BLOCK)
+    var odt = x.dtype().to_mojo_dtype()
+    if odt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            rope_cos.buf.unsafe_ptr().bitcast[Float32](), c_rl
+        )
+        var Sv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            rope_sin.buf.unsafe_ptr().bitcast[Float32](), c_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[
+            _rope_bshd_halfsplit_kernel[DType.float32],
+            _rope_bshd_halfsplit_kernel[DType.float32],
+        ](X, C, Sv, O, B, S, H, D, half_d, grid_dim=grid, block_dim=_BLOCK)
+    elif odt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            rope_cos.buf.unsafe_ptr().bitcast[BFloat16](), c_rl
+        )
+        var Sv = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            rope_sin.buf.unsafe_ptr().bitcast[BFloat16](), c_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        ctx.enqueue_function[
+            _rope_bshd_halfsplit_kernel[DType.bfloat16],
+            _rope_bshd_halfsplit_kernel[DType.bfloat16],
+        ](X, C, Sv, O, B, S, H, D, half_d, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            rope_cos.buf.unsafe_ptr().bitcast[Float16](), c_rl
+        )
+        var Sv = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            rope_sin.buf.unsafe_ptr().bitcast[Float16](), c_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        ctx.enqueue_function[
+            _rope_bshd_halfsplit_kernel[DType.float16],
+            _rope_bshd_halfsplit_kernel[DType.float16],
+        ](X, C, Sv, O, B, S, H, D, half_d, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var osh = List[Int]()
     osh.append(B)
     osh.append(S)
     osh.append(H)
     osh.append(D)
-    return Tensor(out_buf^, osh^, STDtype.BF16)
+    return Tensor(out_buf^, osh^, x.dtype())
 
 
 # ── Patchify kernel: [B,T,H,W,C+1] -> [B,T,nH,nW,C+1,pH,pW] ─────────────────
@@ -825,9 +887,8 @@ struct AnimaDiT:
         """Returns _TimestepResult(t_cond [B,2048], base_adaln [B,6144]).
         Faithful to anima.rs prepare_timestep."""
         # 1. Sinusoidal(2048)
-        var emb_f32 = _anima_sinusoidal_emb(t, ANIMA_HIDDEN, ctx)   # [B, 2048] F32
-        # Cast to BF16 for weight ops
-        var emb = cast_tensor(emb_f32, STDtype.BF16, ctx)           # [B, 2048] BF16
+        var emb_dtype = self._w(String("net.t_embedder.1.linear_1.weight")).dtype()
+        var emb = _anima_sinusoidal_emb(t, ANIMA_HIDDEN, emb_dtype, ctx)
 
         # 2. hidden = SiLU(Linear(emb))  [B, 2048] — no bias
         var h = self._linear(emb, String("net.t_embedder.1.linear_1.weight"), ctx)
@@ -914,8 +975,8 @@ struct AnimaDiT:
     def _self_attn(
         self,
         x: Tensor,         # [B, S, 2048] BF16
-        rope_cos: Tensor,  # [1, 1, S, 64] F32
-        rope_sin: Tensor,  # [1, 1, S, 64] F32
+        rope_cos: Tensor,  # [1, 1, S, 64], same dtype as x
+        rope_sin: Tensor,  # [1, 1, S, 64], same dtype as x
         prefix: String,
         ctx: DeviceContext,
     ) raises -> Tensor:
@@ -944,8 +1005,7 @@ struct AnimaDiT:
         q = self._rms_norm_per_head_bshd(q, prefix + String(".q_norm.weight"), ctx)
         k = self._rms_norm_per_head_bshd(k, prefix + String(".k_norm.weight"), ctx)
 
-        # Apply 3D RoPE (halfsplit) on [B, S, H, Dh] using [1,1,S,Dh/2] cos/sin
-        # cos/sin are F32; rope kernel expects F32 cos/sin
+        # Apply 3D RoPE (halfsplit) on [B, S, H, Dh] using typed [1,1,S,Dh/2] cos/sin
         q = _rope_halfsplit_4d(q, rope_cos, rope_sin, ctx)
         k = _rope_halfsplit_4d(k, rope_cos, rope_sin, ctx)
 
@@ -1023,7 +1083,7 @@ struct AnimaDiT:
     # ── Transformer block ────────────────────────────────────────────────────
     def _transformer_block(
         self,
-        x: Tensor,           # [B, S, 2048] BF16 (but residual in F32 inside)
+        x: Tensor,           # [B, S, 2048] BF16
         context: Tensor,     # [B, S_txt, 1024] BF16
         t_cond: Tensor,      # [B, 2048] BF16
         base_adaln: Tensor,  # [B, 6144] BF16
@@ -1033,69 +1093,57 @@ struct AnimaDiT:
         ctx: DeviceContext,
     ) raises -> Tensor:
         """Single MiniTrainDIT block with AdaLN-LoRA modulation.
-        Faithful to anima.rs transformer_block.
-        Uses F32 residual stream (x_f32) across all 3 sub-blocks."""
+        Faithful to anima.rs transformer_block."""
         var prefix = String("net.blocks.") + String(block_idx)
 
-        # F32 residual stream (model has large activations ~200+, BF16 loses precision)
-        var x_f32 = cast_tensor(x, STDtype.F32, ctx)  # [B, S, 2048] F32
+        var x_res = x.clone(ctx)
 
         # --- Self-attention ---
         var sa_mods = self._adaln_mod(
             t_cond, base_adaln,
             prefix + String(".adaln_modulation_self_attn"), ctx
         )
-        var x_bf16 = cast_tensor(x_f32, STDtype.BF16, ctx)
-        var x_mod = _apply_adaln_modulate(x_bf16, sa_mods.shift, sa_mods.scale, ctx)
+        var x_mod = _apply_adaln_modulate(x_res, sa_mods.shift, sa_mods.scale, ctx)
         var attn_out = self._self_attn(x_mod, rope_cos, rope_sin,
                                         prefix + String(".self_attn"), ctx)
         # gate: [B, D] -> reshape to [B, 1, D] for broadcasting with [B, S, D]
-        var gate_sa_f32 = cast_tensor(sa_mods.gate, STDtype.F32, ctx)
-        var gsh = gate_sa_f32.shape()
+        var gsh = sa_mods.gate.shape()
         var gate_sa_3d_sh = List[Int]()
         gate_sa_3d_sh.append(gsh[0]); gate_sa_3d_sh.append(1); gate_sa_3d_sh.append(gsh[1])
-        var gate_sa_3d = reshape(gate_sa_f32, gate_sa_3d_sh^, ctx)
-        var attn_f32 = cast_tensor(attn_out, STDtype.F32, ctx)
-        var gated_attn = mul(attn_f32, gate_sa_3d, ctx)
-        x_f32 = add(x_f32, gated_attn, ctx)
+        var gate_sa_3d = reshape(sa_mods.gate, gate_sa_3d_sh^, ctx)
+        var gated_attn = mul(attn_out, gate_sa_3d, ctx)
+        x_res = add(x_res, gated_attn, ctx)
 
         # --- Cross-attention ---
         var ca_mods = self._adaln_mod(
             t_cond, base_adaln,
             prefix + String(".adaln_modulation_cross_attn"), ctx
         )
-        x_bf16 = cast_tensor(x_f32, STDtype.BF16, ctx)
-        x_mod = _apply_adaln_modulate(x_bf16, ca_mods.shift, ca_mods.scale, ctx)
+        x_mod = _apply_adaln_modulate(x_res, ca_mods.shift, ca_mods.scale, ctx)
         var cross_out = self._cross_attn(x_mod, context,
                                           prefix + String(".cross_attn"), ctx)
-        var gate_ca_f32 = cast_tensor(ca_mods.gate, STDtype.F32, ctx)
-        var gca_sh = gate_ca_f32.shape()
+        var gca_sh = ca_mods.gate.shape()
         var gate_ca_3d_sh = List[Int]()
         gate_ca_3d_sh.append(gca_sh[0]); gate_ca_3d_sh.append(1); gate_ca_3d_sh.append(gca_sh[1])
-        var gate_ca_3d = reshape(gate_ca_f32, gate_ca_3d_sh^, ctx)
-        var cross_f32 = cast_tensor(cross_out, STDtype.F32, ctx)
-        var gated_cross = mul(cross_f32, gate_ca_3d, ctx)
-        x_f32 = add(x_f32, gated_cross, ctx)
+        var gate_ca_3d = reshape(ca_mods.gate, gate_ca_3d_sh^, ctx)
+        var gated_cross = mul(cross_out, gate_ca_3d, ctx)
+        x_res = add(x_res, gated_cross, ctx)
 
         # --- MLP ---
         var mlp_mods = self._adaln_mod(
             t_cond, base_adaln,
             prefix + String(".adaln_modulation_mlp"), ctx
         )
-        x_bf16 = cast_tensor(x_f32, STDtype.BF16, ctx)
-        x_mod = _apply_adaln_modulate(x_bf16, mlp_mods.shift, mlp_mods.scale, ctx)
+        x_mod = _apply_adaln_modulate(x_res, mlp_mods.shift, mlp_mods.scale, ctx)
         var mlp_out = self._mlp(x_mod, prefix + String(".mlp"), ctx)
-        var gate_mlp_f32 = cast_tensor(mlp_mods.gate, STDtype.F32, ctx)
-        var gmlp_sh = gate_mlp_f32.shape()
+        var gmlp_sh = mlp_mods.gate.shape()
         var gate_mlp_3d_sh = List[Int]()
         gate_mlp_3d_sh.append(gmlp_sh[0]); gate_mlp_3d_sh.append(1); gate_mlp_3d_sh.append(gmlp_sh[1])
-        var gate_mlp_3d = reshape(gate_mlp_f32, gate_mlp_3d_sh^, ctx)
-        var mlp_f32 = cast_tensor(mlp_out, STDtype.F32, ctx)
-        var gated_mlp = mul(mlp_f32, gate_mlp_3d, ctx)
-        x_f32 = add(x_f32, gated_mlp, ctx)
+        var gate_mlp_3d = reshape(mlp_mods.gate, gate_mlp_3d_sh^, ctx)
+        var gated_mlp = mul(mlp_out, gate_mlp_3d, ctx)
+        x_res = add(x_res, gated_mlp, ctx)
 
-        # Return BF16 (matches Rust: x_f32.to_dtype(DType::BF16))
-        return cast_tensor(x_f32, STDtype.BF16, ctx)
+        return x_res^
 
     # ── Full forward pass ────────────────────────────────────────────────────
     def forward_with_context(
@@ -1126,8 +1174,10 @@ struct AnimaDiT:
         # 3. Patch embed: [B, N, 68] -> [B, N, 2048]
         var x_emb = self._linear(patches, String("net.x_embedder.proj.1.weight"), ctx)
 
-        # 4. Build 3D RoPE cos/sin [1, 1, S, 64] F32
-        var rope_result = build_anima_3d_rope(T, nH, nW, ANIMA_HEAD_DIM, ctx)
+        # 4. Build 3D RoPE cos/sin [1, 1, S, 64] in activation storage dtype
+        var rope_result = build_anima_3d_rope(
+            T, nH, nW, ANIMA_HEAD_DIM, x_emb.dtype(), ctx
+        )
 
         # 5. Run through 28 transformer blocks
         var x_hidden = x_emb^
@@ -1153,6 +1203,30 @@ struct AnimaDiT:
 # The standard sdpa_nomask[B,S,H,Dh] requires S_q == S_k.
 # For cross-attention: S_q = N_img (4096), S_k = S_txt (256).
 # We implement directly via the math-mode path.
+
+def _anima_gather_bshd_to_bhsd_bf16_f32(
+    src: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],  # [B*S*H, Dh]
+    dst: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],   # [B*H*S, Dh]
+    B: Int,
+    S: Int,
+    H: Int,
+    Dh: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = B * H * S * Dh
+    if idx < total:
+        var d = idx % Dh
+        var t = idx // Dh
+        var s = t % S
+        var t2 = t // S
+        var h = t2 % H
+        var b = t2 // H
+        var src_row = (b * S + s) * H + h
+        var dst_row = (b * H + h) * S + s
+        var v = rebind[Scalar[DType.bfloat16]](src[src_row, d]).cast[DType.float32]()
+        dst[dst_row, d] = rebind[dst.element_type](v)
+
+
 def _cross_sdpa_nomask[
     B: Int, S_q: Int, S_k: Int, H: Int, Dh: Int
 ](
@@ -1171,7 +1245,7 @@ def _cross_sdpa_nomask[
     comptime src_q_rows = B * S_q * H
     comptime src_k_rows = B * S_k * H
 
-    # Gather q [B,S_q,H,Dh] -> BHSD-contiguous [B*H,S_q,Dh]
+    # Gather q/k/v [B,S,H,Dh] -> F32 BHSD compute scratch [B*H,S,Dh].
     var q_f32 = ctx.enqueue_create_buffer[DType.float32](bhsd_q_rows * Dh)
     var k_f32 = ctx.enqueue_create_buffer[DType.float32](bhsd_k_rows * Dh)
     var v_f32 = ctx.enqueue_create_buffer[DType.float32](bhsd_k_rows * Dh)
@@ -1188,8 +1262,7 @@ def _cross_sdpa_nomask[
     var Kd = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](k_f32.unsafe_ptr(), bhsd_k_rl)
     var Vd = LayoutTensor[DType.float32, _DYN2l, MutAnyOrigin](v_f32.unsafe_ptr(), bhsd_k_rl)
 
-    # Gather BF16 BSHD -> F32 BHSD
-    from serenitymojo.ops.attention import _gather_bshd_to_bhsd_bf16
+    # Gather BF16 BSHD -> F32 BHSD compute scratch.
     var Qs = LayoutTensor[DType.bfloat16, _DYN2l, MutAnyOrigin](
         q.buf.unsafe_ptr().bitcast[BFloat16](), q_src_rl
     )
@@ -1201,11 +1274,20 @@ def _cross_sdpa_nomask[
     )
     var ngq = B * H * S_q * Dh
     var ngk = B * H * S_k * Dh
-    ctx.enqueue_function[_gather_bshd_to_bhsd_bf16, _gather_bshd_to_bhsd_bf16](
+    ctx.enqueue_function[
+        _anima_gather_bshd_to_bhsd_bf16_f32,
+        _anima_gather_bshd_to_bhsd_bf16_f32,
+    ](
         Qs, Qd, B, S_q, H, Dh, grid_dim=(ngq + BLOCK - 1) // BLOCK, block_dim=BLOCK)
-    ctx.enqueue_function[_gather_bshd_to_bhsd_bf16, _gather_bshd_to_bhsd_bf16](
+    ctx.enqueue_function[
+        _anima_gather_bshd_to_bhsd_bf16_f32,
+        _anima_gather_bshd_to_bhsd_bf16_f32,
+    ](
         Ks, Kd, B, S_k, H, Dh, grid_dim=(ngk + BLOCK - 1) // BLOCK, block_dim=BLOCK)
-    ctx.enqueue_function[_gather_bshd_to_bhsd_bf16, _gather_bshd_to_bhsd_bf16](
+    ctx.enqueue_function[
+        _anima_gather_bshd_to_bhsd_bf16_f32,
+        _anima_gather_bshd_to_bhsd_bf16_f32,
+    ](
         Vs, Vd, B, S_k, H, Dh, grid_dim=(ngk + BLOCK - 1) // BLOCK, block_dim=BLOCK)
 
     # QKT scores [B*H, S_q, S_k]

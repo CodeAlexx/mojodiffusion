@@ -203,7 +203,10 @@ struct AnimaAdapterWeights(Movable):
     @staticmethod
     def load_checkpoint(path: String, ctx: DeviceContext) raises -> AnimaAdapterWeights:
         """Load all `net.llm_adapter.*` tensors from a single-file checkpoint as
-        F32 GPU tensors, keyed by the flat sub-name (prefix stripped)."""
+        F32 GPU tensors, keyed by the flat sub-name (prefix stripped).
+
+        This adapter is an F32 text-context oracle path; its output is a frozen
+        context cache, not diffusion-model weight storage."""
         var st = ShardedSafeTensors.open(path)
         var w = Dict[String, ArcPointer[Tensor]]()
         var prefix = String("net.llm_adapter.")

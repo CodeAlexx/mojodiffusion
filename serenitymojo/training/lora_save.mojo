@@ -1,5 +1,5 @@
 # lora_save.mojo — save / load TRAINED LoRA adapters as a PEFT/ai-toolkit-keyed
-# safetensors. The LoRA-WEIGHTS half of resume; the training-STATE half (F32
+# safetensors. The LoRA-WEIGHTS half of resume; the training-STATE half (BF16
 # master + AdamW m/v + step counter) already exists in training/loop.mojo
 # (TrainState / save_checkpoint / load_checkpoint) and is reused unchanged.
 #
@@ -38,7 +38,7 @@
 # round-trip without a multiplier is wanted later.)
 #
 # Mojo 1.0.0b1: `def` not `fn`; move-only Tensor → collections hold
-# ArcPointer[Tensor]; STDtype.F32 is a value; from_host(values, shape, dtype, ctx).
+# ArcPointer[Tensor]; A/B are BF16 model storage; AdamW moments remain F32.
 
 from std.collections import List
 from std.memory import ArcPointer
@@ -62,12 +62,15 @@ struct NamedLora(Copyable, Movable):
     var adapter: LoraAdapter
 
 
+def _bf16_2d(var values: List[BFloat16], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+    var sh = List[Int]()
+    sh.append(rows)
+    sh.append(cols)
+    return Tensor.from_host_bf16(values^, sh^, ctx)
+
+
 # ── F32 device tensor from a host List[Float32] with a 2-D shape ─────────────
-# Mirrors train_step.mojo:169 (`Tensor.from_host(x_h.copy(), [M, in], F32, ctx)`).
-# A/B are F32 in the LoraAdapter (host master precision per MOJO_CONVENTIONS §3
-# "training masters are F32 throughout"), so the saved file is F32 — byte-exact
-# on reload (no BF16 truncation), the same property loop.mojo relies on for the
-# F32 masters.
+# Used for optimizer moments only. Trainable LoRA A/B use `_bf16_2d`.
 def _f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(rows)
@@ -84,11 +87,11 @@ def save_lora_peft(
     adapters: List[NamedLora], path: String, ctx: DeviceContext
 ) raises -> Int:
     """Write `adapters` to `path` as a PEFT-keyed LoRA safetensors. Returns the
-    number of (A,B) PAIRS written. Tensors are F32, byte-exact on reload.
+    number of (A,B) PAIRS written. Tensors are BF16 model-storage tensors.
 
     For each NamedLora we emit two tensors, in A-then-B order per module:
-        "<prefix>.lora_A.weight"  F32 [rank, in]   (== LoraAdapter.a)
-        "<prefix>.lora_B.weight"  F32 [out, rank]  (== LoraAdapter.b)
+        "<prefix>.lora_A.weight"  BF16 [rank, in]   (== LoraAdapter.a)
+        "<prefix>.lora_B.weight"  BF16 [out, rank]  (== LoraAdapter.b)
     This is the exact inverse of lora.mojo::LoraSet._compute_delta's load. The
     writer lays tensors out in insertion order with contiguous data_offsets
     (safetensors_writer.mojo:111-127), and SafeTensors.open reads them back by
@@ -116,9 +119,9 @@ def save_lora_peft(
                 + " for '" + nl.prefix + "'"
             )
         names.append(nl.prefix + ".lora_A.weight")
-        tensors.append(ArcPointer(_f32_2d(a.a.copy(), a.rank, a.in_f, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.a.copy(), a.rank, a.in_f, ctx)))
         names.append(nl.prefix + ".lora_B.weight")
-        tensors.append(ArcPointer(_f32_2d(a.b.copy(), a.out_f, a.rank, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.b.copy(), a.out_f, a.rank, ctx)))
 
     save_safetensors(names, tensors, path, ctx)
     return len(adapters)
@@ -145,9 +148,9 @@ def save_lora_train_state(
         if len(a.b) != a.out_f * a.rank or len(a.mb) != a.out_f * a.rank or len(a.vb) != a.out_f * a.rank:
             raise Error(String("save_lora_train_state: B/m/v shape mismatch for ") + nl.prefix)
         names.append(nl.prefix + ".lora_A.weight")
-        tensors.append(ArcPointer(_f32_2d(a.a.copy(), a.rank, a.in_f, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.a.copy(), a.rank, a.in_f, ctx)))
         names.append(nl.prefix + ".lora_B.weight")
-        tensors.append(ArcPointer(_f32_2d(a.b.copy(), a.out_f, a.rank, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.b.copy(), a.out_f, a.rank, ctx)))
         names.append(nl.prefix + ".lora_A.adam_m")
         tensors.append(ArcPointer(_f32_2d(a.ma.copy(), a.rank, a.in_f, ctx)))
         names.append(nl.prefix + ".lora_A.adam_v")

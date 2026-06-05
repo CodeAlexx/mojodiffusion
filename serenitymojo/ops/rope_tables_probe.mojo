@@ -14,7 +14,6 @@
 #   axis2 half=1: inv[0]=1
 # angle[t,col] = pos[t,axis(col)] * inv[local_i(col)]; cols = [a0i0,a0i1,a1i0,a1i1,a2i0]
 
-from std.math import cos as fcos, sin as fsin, abs as fabs
 from std.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -30,6 +29,56 @@ def _positions() -> List[Float32]:
     return p^
 
 
+def _ref_cos(row: Int, col: Int) -> Float32:
+    if row == 0:
+        return Float32(1.0)
+    if row == 1:
+        if col == 0:
+            return Float32(0.5403023058681398)
+        if col == 1:
+            return Float32(0.9950041652780258)
+        if col == 4:
+            return Float32(0.5403023058681398)
+        return Float32(1.0)
+    if col == 0:
+        return Float32(-0.4161468365471424)
+    if col == 1:
+        return Float32(0.9800665778412416)
+    if col == 2:
+        return Float32(-0.9899924966004454)
+    if col == 3:
+        return Float32(0.9553364891256060)
+    return Float32(1.0)
+
+
+def _ref_sin(row: Int, col: Int) -> Float32:
+    if row == 0:
+        return Float32(0.0)
+    if row == 1:
+        if col == 0:
+            return Float32(0.8414709848078965)
+        if col == 1:
+            return Float32(0.0998334166468282)
+        if col == 4:
+            return Float32(0.8414709848078965)
+        return Float32(0.0)
+    if col == 0:
+        return Float32(0.9092974268256817)
+    if col == 1:
+        return Float32(0.1986693307950612)
+    if col == 2:
+        return Float32(0.1411200080598672)
+    if col == 3:
+        return Float32(0.2955202066613396)
+    return Float32(0.0)
+
+
+def _absf(x: Float32) -> Float32:
+    if x < Float32(0.0):
+        return -x
+    return x
+
+
 def main() raises:
     var ctx = DeviceContext()
 
@@ -38,7 +87,7 @@ def main() raises:
     axes.append(4); axes.append(4); axes.append(2)
     var theta = Float32(100.0)
 
-    var tabs = build_multiaxis_rope_tables(pos, axes, theta, ctx)
+    var tabs = build_multiaxis_rope_tables(pos, axes, theta, ctx, STDtype.F32)
     var cos_h = tabs[0].to_host(ctx)
     var sin_h = tabs[1].to_host(ctx)
 
@@ -47,27 +96,11 @@ def main() raises:
     if len(cos_h) != rows * half or len(sin_h) != rows * half:
         raise Error("rope_tables_probe: bad output size")
 
-    # Recompute the reference the same way the oracle does.
-    var inv01 = Float32(1.0)
-    var inv0h = Float32(0.1)  # 100^-0.5
-    # col layout: [a0 i0, a0 i1, a1 i0, a1 i1, a2 i0]
-    var positions = _positions()
     var max_err = Float32(0.0)
     for t in range(rows):
-        var f = positions[t * 3 + 0]
-        var h = positions[t * 3 + 1]
-        var w = positions[t * 3 + 2]
-        var angles = List[Float32]()
-        angles.append(f * inv01)
-        angles.append(f * inv0h)
-        angles.append(h * inv01)
-        angles.append(h * inv0h)
-        angles.append(w * inv01)
         for c in range(half):
-            var ec = fcos(angles[c])
-            var es = fsin(angles[c])
-            var dc = fabs(cos_h[t * half + c] - ec)
-            var ds = fabs(sin_h[t * half + c] - es)
+            var dc = _absf(cos_h[t * half + c] - _ref_cos(t, c))
+            var ds = _absf(sin_h[t * half + c] - _ref_sin(t, c))
             if dc > max_err:
                 max_err = dc
             if ds > max_err:
@@ -76,4 +109,26 @@ def main() raises:
     print("rope_tables_probe max_err:", max_err)
     if max_err > Float32(1e-5):
         raise Error("rope_tables_probe: FAIL max_err too large")
+    var pos_bf16 = Tensor.from_host(_positions(), [9], STDtype.F32, ctx)
+    var tabs_bf16 = build_multiaxis_rope_tables(
+        pos_bf16, axes, theta, ctx, STDtype.BF16
+    )
+    if tabs_bf16[0].dtype() != STDtype.BF16:
+        raise Error("rope_tables_probe: BF16 cos returned non-BF16 storage")
+    if tabs_bf16[1].dtype() != STDtype.BF16:
+        raise Error("rope_tables_probe: BF16 sin returned non-BF16 storage")
+    var cos_bf16_h = tabs_bf16[0].to_host(ctx)
+    var sin_bf16_h = tabs_bf16[1].to_host(ctx)
+    var max_err_bf16 = Float32(0.0)
+    for t in range(rows):
+        for c in range(half):
+            var dc = _absf(cos_bf16_h[t * half + c] - _ref_cos(t, c))
+            var ds = _absf(sin_bf16_h[t * half + c] - _ref_sin(t, c))
+            if dc > max_err_bf16:
+                max_err_bf16 = dc
+            if ds > max_err_bf16:
+                max_err_bf16 = ds
+    print("rope_tables_probe BF16 max_err:", max_err_bf16)
+    if max_err_bf16 > Float32(0.003):
+        raise Error("rope_tables_probe: FAIL BF16 max_err too large")
     print("rope_tables_probe PASS")

@@ -51,8 +51,8 @@
 # m always gets grad even at init (d_m depends on WP, not on ΔW), and A/B follow
 # the plain-LoRA zero-leaf rule (B=0 at init → d_A=0 at step 0, live at step≥1).
 #
-# Host F32 master throughout (training masters are F32 per MOJO_CONVENTIONS §3),
-# and all tensors are tiny so host matmul is exact and auditable.
+# BF16 trainable storage, F32 internal compute/moments. All tensors are tiny so
+# host matmul is exact and auditable after explicit BF16->F32 materialization.
 #
 # Mojo 0.26.x: `def` not `fn`; move-only Tensor → ArcPointer in collections;
 # multi-return via Movable struct. MIRRORS loha_adapter.mojo structure.
@@ -112,6 +112,20 @@ def _zeros(n: Int) -> List[Float32]:
     return out^
 
 
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
+
+
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
 # Per-output-row L2 norm of W:[out,in] along the INPUT axis (wd_on_out=true).
 # Returns [out] = sqrt(Σ_i W[o,i]²). Mirrors dora.rs init_magnitude /
 # apply_weight_decompose reduce path (reduce dim 1 of a 2D [out,in] weight).
@@ -131,9 +145,9 @@ def _row_l2_norm(w: List[Float32], out_f: Int, in_f: Int) -> List[Float32]:
 # magnitude m [out]. The FROZEN base weight W_orig:[out,in] is supplied to the
 # forward/backward (the primitive needs it for the column-norm normalization).
 struct DoRAAdapter(Copyable, Movable):
-    var a: List[Float32]          # lora_down [rank,in]
-    var b: List[Float32]          # lora_up   [out,rank]
-    var m: List[Float32]          # magnitude [out]  (per-output column)
+    var a: List[BFloat16]         # lora_down [rank,in]
+    var b: List[BFloat16]         # lora_up   [out,rank]
+    var m: List[BFloat16]         # magnitude [out]  (per-output column)
     var rank: Int
     var in_f: Int
     var out_f: Int
@@ -156,9 +170,9 @@ struct DoRAAdapter(Copyable, Movable):
         var mb: List[Float32], var vb: List[Float32],
         var mm: List[Float32], var vm: List[Float32],
     ):
-        self.a = a^
-        self.b = b^
-        self.m = m^
+        self.a = _f32_to_bf16_list(a)
+        self.b = _f32_to_bf16_list(b)
+        self.m = _f32_to_bf16_list(m)
         self.rank = rank
         self.in_f = in_f
         self.out_f = out_f
@@ -208,7 +222,9 @@ def new_dora_adapter(
 def dora_delta_weight(d: DoRAAdapter) raises -> List[Float32]:
     if d.scale == Float32(0.0):
         return _zeros(d.out_f * d.in_f)
-    var dw = _matmul(d.b, d.out_f, d.rank, d.a, d.rank, d.in_f)  # [out,in]
+    var b = _bf16_to_f32_list(d.b)
+    var a = _bf16_to_f32_list(d.a)
+    var dw = _matmul(b, d.out_f, d.rank, a, d.rank, d.in_f)  # [out,in]
     for i in range(len(dw)):
         dw[i] = dw[i] * d.scale
     return dw^
@@ -240,8 +256,9 @@ def dora_effective_weight(w_orig: List[Float32], d: DoRAAdapter) raises -> DoRAE
     for o in range(d.out_f):
         den.append(norm[o] + d.eps)
     var wp_dora = List[Float32]()
+    var m = _bf16_to_f32_list(d.m)
     for o in range(d.out_f):
-        var mo = d.m[o]
+        var mo = m[o]
         var deno = den[o]
         for i in range(d.in_f):
             wp_dora.append(mo * wp[o * d.in_f + i] / deno)
@@ -300,7 +317,7 @@ def dora_backward(d_y_h: List[Float32], x_h: List[Float32], w_orig: List[Float32
         d_wp.append(Float32(0.0))
     for o in range(OUT):
         var deno = eff.den[o]
-        var mo = d.m[o]
+        var mo = d.m[o].cast[DType.float32]()
         var acc = Float32(0.0)
         for i in range(IN):
             var idx = o * IN + i
@@ -315,9 +332,11 @@ def dora_backward(d_y_h: List[Float32], x_h: List[Float32], w_orig: List[Float32
         g[i] = g[i] * d.scale                              # [out,in]
 
     # d_B = g @ Aᵀ  [out,rank] ; d_A = Bᵀ @ g  [rank,in]
-    var a_t = _transpose(d.a, R, IN)                       # [in,rank]
+    var a = _bf16_to_f32_list(d.a)
+    var b = _bf16_to_f32_list(d.b)
+    var a_t = _transpose(a, R, IN)                         # [in,rank]
     var d_b = _matmul(g, OUT, IN, a_t, IN, R)              # [out,rank]
-    var b_t = _transpose(d.b, OUT, R)                      # [rank,out]
+    var b_t = _transpose(b, OUT, R)                        # [rank,out]
     var d_a = _matmul(b_t, R, OUT, g, OUT, IN)             # [rank,in]
 
     return DoRAGrads(d_a^, d_b^, d_m^, d_x^)
@@ -325,7 +344,7 @@ def dora_backward(d_y_h: List[Float32], x_h: List[Float32], w_orig: List[Float32
 
 # ── AdamW one step over A, B, m (mirrors loha _adamw_host_list) ──────────────
 def _adamw_host_list(
-    mut p: List[Float32], g: List[Float32],
+    mut p: List[BFloat16], g: List[Float32],
     mut mom: List[Float32], mut vmo: List[Float32],
     t: Int, lr: Float32, beta1: Float32, beta2: Float32,
     eps: Float32, weight_decay: Float32,
@@ -350,10 +369,10 @@ def _adamw_host_list(
         vmo[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
+        var pv = p[i].cast[DType.float32]() - lr * m_hat / (sqrt(v_hat) + eps)
         if weight_decay > 0.0:
             pv = pv - lr * weight_decay * pv
-        p[i] = pv
+        p[i] = BFloat16(pv)
 
 
 def dora_adamw(

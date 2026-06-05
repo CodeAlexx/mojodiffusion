@@ -558,30 +558,45 @@ def _host_grad_slice(host: HostBuffer[DType.uint8], offset: Int, numel: Int) -> 
     return out^
 
 
+def _grad_arc_f32(t: TArc, ctx: DeviceContext) raises -> TArc:
+    if t[].dtype() == STDtype.F32:
+        return t.copy()
+    # Host AdamW stores master params and moments as F32; device grads may be BF16.
+    var t32 = cast_tensor(t[], STDtype.F32, ctx)
+    return TArc(t32^)
+
+
 def _anima_tensor_grads_to_host(
     indices: List[Int], d_a_t: List[TArc], d_b_t: List[TArc],
     total_slots: Int, ctx: DeviceContext,
 ) raises -> _AnimaHostGradLists:
-    var total_bytes = 0
+    var a_f32 = List[TArc]()
+    var b_f32 = List[TArc]()
     for i in range(len(d_a_t)):
-        total_bytes += d_a_t[i][].nbytes()
+        a_f32.append(_grad_arc_f32(d_a_t[i], ctx))
     for i in range(len(d_b_t)):
-        total_bytes += d_b_t[i][].nbytes()
+        b_f32.append(_grad_arc_f32(d_b_t[i], ctx))
+
+    var total_bytes = 0
+    for i in range(len(a_f32)):
+        total_bytes += a_f32[i][].nbytes()
+    for i in range(len(b_f32)):
+        total_bytes += b_f32[i][].nbytes()
 
     var host = ctx.enqueue_create_host_buffer[DType.uint8](total_bytes)
     var a_off = List[Int](); var a_num = List[Int]()
     var b_off = List[Int](); var b_num = List[Int]()
     var cursor = 0
-    for i in range(len(d_a_t)):
-        a_off.append(cursor); a_num.append(d_a_t[i][].numel())
-        var dst = host.create_sub_buffer[DType.uint8](cursor, d_a_t[i][].nbytes())
-        ctx.enqueue_copy(dst_buf=dst, src_buf=d_a_t[i][].buf)
-        cursor += d_a_t[i][].nbytes()
-    for i in range(len(d_b_t)):
-        b_off.append(cursor); b_num.append(d_b_t[i][].numel())
-        var dst = host.create_sub_buffer[DType.uint8](cursor, d_b_t[i][].nbytes())
-        ctx.enqueue_copy(dst_buf=dst, src_buf=d_b_t[i][].buf)
-        cursor += d_b_t[i][].nbytes()
+    for i in range(len(a_f32)):
+        a_off.append(cursor); a_num.append(a_f32[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, a_f32[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=a_f32[i][].buf)
+        cursor += a_f32[i][].nbytes()
+    for i in range(len(b_f32)):
+        b_off.append(cursor); b_num.append(b_f32[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, b_f32[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=b_f32[i][].buf)
+        cursor += b_f32[i][].nbytes()
     ctx.synchronize()
 
     var d_a_flat = List[List[Float32]]()
@@ -998,9 +1013,9 @@ def save_anima_lora_ot(
             var al_sh = List[Int](); al_sh.append(1)
             var al_v = List[Float32](); al_v.append(alpha)
             names.append(pfx + String(".lora_down.weight"))
-            tensors.append(ArcPointer(Tensor.from_host(ad.a.copy(), a_sh^, STDtype.F32, ctx)))
+            tensors.append(ArcPointer(Tensor.from_host_bf16(ad.a.copy(), a_sh^, ctx)))
             names.append(pfx + String(".lora_up.weight"))
-            tensors.append(ArcPointer(Tensor.from_host(ad.b.copy(), b_sh^, STDtype.F32, ctx)))
+            tensors.append(ArcPointer(Tensor.from_host_bf16(ad.b.copy(), b_sh^, ctx)))
             names.append(pfx + String(".alpha"))
             tensors.append(ArcPointer(Tensor.from_host(al_v^, al_sh^, STDtype.F32, ctx)))
     save_safetensors(names, tensors, path, ctx)

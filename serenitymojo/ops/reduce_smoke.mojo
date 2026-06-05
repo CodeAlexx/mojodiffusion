@@ -8,10 +8,10 @@
 #   * BONUS (AdaIN consumer): reduce_var/reduce_std unbiased (N-1) on (F,H,W)
 #     match host F64 two-pass var/std (mirrors ltx2_multiscale.rs:78-92).
 #
-# Storage is F32 so the host-F64 reference and the GPU agree to ~1e-5 and the
-# 1e-4 max_abs gate isolates reduction logic (index/stride/accumulation) from
-# any bf16 quantization. The bf16/f16 kernel triplets are structurally identical
-# (only the read cast differs) and are smoke-touched via a small bf16 mean check.
+# Main numeric cases use F32 storage so the host-F64 reference and the GPU agree
+# to ~1e-5 and the 1e-4 max_abs gate isolates reduction logic
+# (index/stride/accumulation) from any bf16 quantization. BF16 is smoke-touched
+# with dtype-boundary checks for storage-preserving mean and explicit F32 mean.
 #
 # Build:
 #   pixi run mojo build -I . -Xlinker -lm serenitymojo/ops/reduce_smoke.mojo -o /tmp/p_reduce_smoke
@@ -25,8 +25,11 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.reduce import (
     reduce_sum,
     reduce_mean,
+    reduce_mean_f32,
     reduce_var,
+    reduce_var_f32,
     reduce_std,
+    reduce_std_f32,
 )
 
 
@@ -219,9 +222,9 @@ def main() raises:
     all_pass = _gate("AdaIN std unbiased (F,H,W)", std5.to_host(ctx), ref_std_bc) and all_pass
 
     # ── Case 5: bf16 storage smoke-touch (read-cast path) ───────────────────
-    # mean over the whole [2,3,4,5] ramp dims (0,1,2,3); small magnitudes so the
-    # bf16 input rounding stays under 1e-4 is NOT expected — use a looser local
-    # check (cos-equivalent ratio) just to prove the bf16 kernel runs & is sane.
+    # mean/var/std over the whole [2,3,4] ramp dims (0,1,2); small magnitudes
+    # are bf16-exact, so storage-preserving public reductions and explicit F32
+    # reductions can both be checked directly.
     var small = List[Float32]()
     for i in range(24):
         small.append(Float32(Float64(i % 5) - 2.0))  # [-2..2], bf16-exact
@@ -230,15 +233,63 @@ def main() raises:
     dims_all.append(0)
     dims_all.append(1)
     dims_all.append(2)
-    var mb = reduce_mean(xb, dims_all, False, ctx).to_host(ctx)
+    var mb_t = reduce_mean(xb, dims_all, False, ctx)
+    var mb = mb_t.to_host(ctx)
     var ref_all = Float64(0.0)
+    var ref_sq_all = Float64(0.0)
     for i in range(24):
-        ref_all += Float64(small[i].cast[DType.float64]())
+        var v = Float64(small[i].cast[DType.float64]())
+        ref_all += v
+        ref_sq_all += v * v
     ref_all /= 24.0
+    var ref_sse_all = ref_sq_all - ref_all * ref_all * 24.0
+    var ref_var_all = ref_sse_all / 23.0
+    if ref_var_all < 0.0:
+        ref_var_all = 0.0
+    var ref_std_all = sqrt(ref_var_all)
     var bf_ok = (mb[0].cast[DType.float64]() - ref_all).__abs__() < 1e-3
+    bf_ok = bf_ok and mb_t.dtype() == STDtype.BF16
     print("  [" + ("PASS" if bf_ok else "FAIL") + "] bf16 full-reduce mean="
-          + String(mb[0]) + " (ref " + String(ref_all) + ", small bf16-exact ramp)")
+          + String(mb[0]) + " dtype=" + mb_t.dtype().name()
+          + " (ref " + String(ref_all) + ", small bf16-exact ramp)")
     all_pass = bf_ok and all_pass
+
+    var mb32_t = reduce_mean_f32(xb, dims_all, False, ctx)
+    var mb32 = mb32_t.to_host(ctx)
+    var bf32_ok = (
+        (mb32[0].cast[DType.float64]() - ref_all).__abs__() < 1e-3
+    ) and mb32_t.dtype() == STDtype.F32
+    print("  [" + ("PASS" if bf32_ok else "FAIL") + "] bf16 explicit f32 mean="
+          + String(mb32[0]) + " dtype=" + mb32_t.dtype().name())
+    all_pass = bf32_ok and all_pass
+
+    var vb_t = reduce_var(xb, dims_all.copy(), False, ctx)
+    var vb = vb_t.to_host(ctx)
+    var sb_t = reduce_std(xb, dims_all.copy(), False, ctx)
+    var sb = sb_t.to_host(ctx)
+    var bf_stats_ok = (
+        (vb[0].cast[DType.float64]() - ref_var_all).__abs__() < 1e-2
+    ) and (
+        (sb[0].cast[DType.float64]() - ref_std_all).__abs__() < 1e-2
+    ) and vb_t.dtype() == STDtype.BF16 and sb_t.dtype() == STDtype.BF16
+    print("  [" + ("PASS" if bf_stats_ok else "FAIL")
+          + "] bf16 public var/std preserve dtype var="
+          + String(vb[0]) + " std=" + String(sb[0]))
+    all_pass = bf_stats_ok and all_pass
+
+    var vb32_t = reduce_var_f32(xb, dims_all.copy(), False, ctx)
+    var vb32 = vb32_t.to_host(ctx)
+    var sb32_t = reduce_std_f32(xb, dims_all^, False, ctx)
+    var sb32 = sb32_t.to_host(ctx)
+    var f32_stats_ok = (
+        (vb32[0].cast[DType.float64]() - ref_var_all).__abs__() < 1e-4
+    ) and (
+        (sb32[0].cast[DType.float64]() - ref_std_all).__abs__() < 1e-4
+    ) and vb32_t.dtype() == STDtype.F32 and sb32_t.dtype() == STDtype.F32
+    print("  [" + ("PASS" if f32_stats_ok else "FAIL")
+          + "] bf16 explicit f32 var/std dtype="
+          + vb32_t.dtype().name() + "/" + sb32_t.dtype().name())
+    all_pass = f32_stats_ok and all_pass
 
     print("=== " + ("ALL PASS" if all_pass else "FAILED") + " ===")
     if not all_pass:

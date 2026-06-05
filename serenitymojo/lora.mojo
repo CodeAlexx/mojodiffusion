@@ -98,6 +98,53 @@ struct LoraMapping(Copyable, Movable):
     """Slot param: RowRange→len. (unused otherwise.)"""
 
 
+struct LTX2BlockLoraDeltaSet(Copyable, Movable):
+    """Merged runtime LoRA deltas for one LTX-2 AV block.
+
+    The production renderer streams/dequants fresh FP8 block weights for every
+    DiT eval. Computing every LoRA `B @ A` inside every eval is CPU/host-heavy
+    and repeats identical math. This carrier precomputes the merged delta per
+    block-local weight once, then each eval only adds ready device tensors to the
+    freshly materialized block weights.
+    """
+
+    var names: List[String]
+    var name_to_idx: Dict[String, Int]
+    var deltas: List[ArcPointer[Tensor]]
+
+    def __init__(out self):
+        self.names = List[String]()
+        self.name_to_idx = Dict[String, Int]()
+        self.deltas = List[ArcPointer[Tensor]]()
+
+    def num_deltas(self) -> Int:
+        return len(self.names)
+
+    def add_delta(
+        mut self,
+        name: String,
+        var delta: Tensor,
+        ctx: DeviceContext,
+    ) raises:
+        if name in self.name_to_idx:
+            var idx = self.name_to_idx[name]
+            var merged = add(self.deltas[idx][], delta, ctx)
+            self.deltas[idx] = ArcPointer[Tensor](merged^)
+            return
+        self.name_to_idx[name] = len(self.names)
+        self.names.append(name)
+        self.deltas.append(ArcPointer[Tensor](delta^))
+
+    def apply_to_av_block(
+        self,
+        mut block: LTX2AVBlockWeights,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        for i in range(len(self.names)):
+            block.add_delta_to(self.names[i], self.deltas[i][], ctx)
+        return len(self.names)
+
+
 def _detect_format(names: List[String]) -> Int:
     """Detect the LoRA file format from its key shapes. Mirrors
     lora_merge.rs::detect_format (lines 91-111). Order matters: kohya first
@@ -203,6 +250,50 @@ def _strip_block_prefix(base_key: String, block_idx: Int) -> String:
 
 def _is_block_key(base_key: String) -> Bool:
     return base_key.startswith("transformer_blocks.")
+
+
+def _is_ltx2_av_lora_block_target(local: String) -> Bool:
+    """Known LTX-2 AV block weight targets that can legally receive LoRA deltas.
+
+    This mirrors LTX2AVBlockWeights' canonical key space for LoRA-bearing
+    modules. It is intentionally static so delta-cache construction does not
+    materialize FP8 checkpoint weights just to validate names.
+    """
+    if local == "ff.net.0.proj.weight" or local == "ff.net.2.weight":
+        return True
+    if (
+        local == "audio_ff.net.0.proj.weight"
+        or local == "audio_ff.net.2.weight"
+    ):
+        return True
+
+    var mod = String("attn1.")
+    if local.startswith("attn1."):
+        pass
+    elif local.startswith("audio_attn1."):
+        mod = String("audio_attn1.")
+    elif local.startswith("attn2."):
+        mod = String("attn2.")
+    elif local.startswith("audio_attn2."):
+        mod = String("audio_attn2.")
+    elif local.startswith("audio_to_video_attn."):
+        mod = String("audio_to_video_attn.")
+    elif local.startswith("video_to_audio_attn."):
+        mod = String("video_to_audio_attn.")
+    else:
+        return False
+
+    if local == mod + "to_q.weight":
+        return True
+    if local == mod + "to_k.weight":
+        return True
+    if local == mod + "to_v.weight":
+        return True
+    if local == mod + "to_out.0.weight":
+        return True
+    if local == mod + "to_gate_logits.weight":
+        return True
+    return False
 
 
 def _map_klein_trainer(prefix: String) -> LoraMapping:
@@ -381,6 +472,11 @@ struct LoraSet(Movable):
     var mappings: List[LoraMapping]
     var suffix_a: String
     var suffix_b: String
+    var ltx2_factor_cache_ready: Bool
+    var ltx2_factor_base_keys: List[String]
+    var ltx2_factor_a: List[ArcPointer[Tensor]]
+    var ltx2_factor_b: List[ArcPointer[Tensor]]
+    var ltx2_factor_base_scales: List[Float32]
 
     def __init__(out self, var st: SafeTensors, format: Int, var mappings: List[LoraMapping], var suffix_a: String, var suffix_b: String):
         self.st = st^
@@ -388,6 +484,11 @@ struct LoraSet(Movable):
         self.mappings = mappings^
         self.suffix_a = suffix_a^
         self.suffix_b = suffix_b^
+        self.ltx2_factor_cache_ready = False
+        self.ltx2_factor_base_keys = List[String]()
+        self.ltx2_factor_a = List[ArcPointer[Tensor]]()
+        self.ltx2_factor_b = List[ArcPointer[Tensor]]()
+        self.ltx2_factor_base_scales = List[Float32]()
 
     @staticmethod
     def load(path: String) raises -> LoraSet:
@@ -452,12 +553,61 @@ struct LoraSet(Movable):
             return String("LTX2Distilled")
         return String("KohyaSdxl")
 
+    def release_to_os(self):
+        """Drop mmap-backed file pages after tensors have been uploaded to GPU.
+
+        The SafeTensors mapping stays valid; Linux can fault pages back in on the
+        next tensor read. This keeps large LoRA files from inflating process RSS
+        during streamed per-block factor attachment.
+        """
+        self.st.release_to_os()
+
     def _load_lora_tensor(self, key: String, ctx: DeviceContext) raises -> Tensor:
         """H2D-load one LoRA tensor by full key from the mmap'd file."""
         var info = self.st.tensor_info(key)
         var data = self.st.tensor_bytes(key)
         var tv = from_parts(info.dtype, info.shape.copy(), data)
         return Tensor.from_view(tv, ctx)
+
+    def preload_ltx2_block_factors(mut self, ctx: DeviceContext) raises -> Int:
+        """Upload every block-local LTX-2 LoRA A/B tensor once.
+
+        Stage-1 and stage-2 use different multipliers, but the factor tensors
+        are identical. Cache the device tensors and the multiplier-free
+        alpha/rank scale, then each streamed block attaches Arc refs instead of
+        reopening safetensors and copying A/B for every sigma.
+        """
+        if self.ltx2_factor_cache_ready:
+            return len(self.ltx2_factor_base_keys)
+
+        self.ltx2_factor_base_keys = List[String]()
+        self.ltx2_factor_a = List[ArcPointer[Tensor]]()
+        self.ltx2_factor_b = List[ArcPointer[Tensor]]()
+        self.ltx2_factor_base_scales = List[Float32]()
+
+        for ref m in self.mappings:
+            if not _is_block_key(m.base_key):
+                continue
+            if not self._pair_present(m):
+                raise Error(
+                    String("LTX2 factor preload: A/B pair missing or conv for ")
+                    + m.prefix
+                )
+            var key_a = m.prefix + self.suffix_a
+            var key_b = m.prefix + self.suffix_b
+            var a = self._load_lora_tensor(key_a, ctx)
+            var b = self._load_lora_tensor(key_b, ctx)
+            if a.dtype() != STDtype.BF16 and a.dtype() != STDtype.F16:
+                a = cast_tensor(a^, STDtype.BF16, ctx)
+            if b.dtype() != STDtype.BF16 and b.dtype() != STDtype.F16:
+                b = cast_tensor(b^, STDtype.BF16, ctx)
+            self.ltx2_factor_base_keys.append(m.base_key)
+            self.ltx2_factor_a.append(ArcPointer[Tensor](a^))
+            self.ltx2_factor_b.append(ArcPointer[Tensor](b^))
+            self.ltx2_factor_base_scales.append(self._module_scale(m, Float32(1.0), ctx))
+
+        self.ltx2_factor_cache_ready = True
+        return len(self.ltx2_factor_base_keys)
 
     def _module_scale(
         self, m: LoraMapping, multiplier: Float32, ctx: DeviceContext
@@ -495,14 +645,21 @@ struct LoraSet(Movable):
         var key_b = m.prefix + self.suffix_b
         var a = self._load_lora_tensor(key_a, ctx)  # [rank, in]
         var b = self._load_lora_tensor(key_b, ctx)  # [out, rank]
-        # linear needs matching dtypes; cast A to B's dtype first.
+        # Match the PyTorch oracle when the target weight is F32: LoRA factors
+        # are promoted before B @ A, not after the product has already rounded.
+        var b_for_mm: Tensor
         var a_for_mm: Tensor
-        if a.dtype() != b.dtype():
-            a_for_mm = cast_tensor(a, b.dtype(), ctx)
+        if base_dtype == STDtype.F32:
+            a_for_mm = cast_tensor(a^, STDtype.F32, ctx)
+            b_for_mm = cast_tensor(b^, STDtype.F32, ctx)
+        elif a.dtype() != b.dtype():
+            a_for_mm = cast_tensor(a^, b.dtype(), ctx)
+            b_for_mm = b^
         else:
             a_for_mm = a^
+            b_for_mm = b^
         var a_t = transpose(a_for_mm, 0, 1, ctx)  # [in, rank]
-        var prod = linear(b, a_t, None, ctx)  # [out, in]
+        var prod = linear(b_for_mm, a_t, None, ctx)  # [out, in]
         var delta = mul_scalar(prod, scale, ctx)
         if delta.dtype() != base_dtype:
             return cast_tensor(delta, base_dtype, ctx)
@@ -658,6 +815,145 @@ struct LoraSet(Movable):
             var base_dtype = block._w(local).dtype()
             var delta = self._compute_delta(m, scale, base_dtype, ctx)
             block.add_delta_to(local, delta^, ctx)
+            n_applied += 1
+        return n_applied
+
+    def accumulate_ltx2_block_deltas(
+        self,
+        block_idx: Int,
+        mut out: LTX2BlockLoraDeltaSet,
+        multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        """Precompute and merge this LoRA file's block-level deltas into `out`.
+
+        Deltas are materialized as BF16 because LTX-2 runtime block weights are
+        BF16 after FP8 dequant, and the downstream add keeps the block storage
+        dtype. Multiple LoRA files
+        can call this against the same `out`; deltas targeting the same local
+        weight are summed once, so runtime block application becomes one add per
+        unique weight instead of one matrix product per LoRA module per eval.
+        """
+        var n_applied = 0
+        for ref m in self.mappings:
+            var local = _strip_block_prefix(m.base_key, block_idx)
+            if local.byte_length() == 0:
+                continue
+            if not self._pair_present(m):
+                raise Error(
+                    String("LTX2 delta-cache: A/B pair missing or conv for ")
+                    + m.prefix
+                )
+            if not _is_ltx2_av_lora_block_target(local):
+                raise Error(
+                    String("LTX2 delta-cache: block ")
+                    + String(block_idx)
+                    + " has unsupported LoRA key '"
+                    + local
+                    + "' (base_key=" + m.base_key + ") — fail-closed"
+                )
+            var scale = self._module_scale(m, multiplier, ctx)
+            var delta = self._compute_delta(m, scale, STDtype.BF16, ctx)
+            out.add_delta(local, delta^, ctx)
+            n_applied += 1
+        return n_applied
+
+    def attach_ltx2_block_factors(
+        self,
+        block_idx: Int,
+        mut block: LTX2AVBlockWeights,
+        multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        """Attach factorized LoRA A/B tensors to an LTX-2 AV block.
+
+        This is the production path for streamed FP8 inference: keep LoRA in
+        low-rank form and let each linear compute
+        `base + scale * ((x @ A.T) @ B.T)` on the GPU. Factors stay in their
+        on-disk compute dtype when possible; `linear` supports F32 activations
+        with BF16/F16 weights and accumulates in F32. That keeps memory traffic
+        bounded without forcing full F32 factor expansion.
+        """
+        var n_applied = 0
+        for ref m in self.mappings:
+            var local = _strip_block_prefix(m.base_key, block_idx)
+            if local.byte_length() == 0:
+                continue
+            if not self._pair_present(m):
+                raise Error(
+                    String("LTX2 factorized apply: A/B pair missing or conv for ")
+                    + m.prefix
+                )
+            if not _is_ltx2_av_lora_block_target(local):
+                raise Error(
+                    String("LTX2 factorized apply: block ")
+                    + String(block_idx)
+                    + " has unsupported LoRA key '"
+                    + local
+                    + "' (base_key=" + m.base_key + ") — fail-closed"
+                )
+            if not block.has_weight(local):
+                raise Error(
+                    String("LTX2 factorized apply: block ")
+                    + String(block_idx)
+                    + " has no base linear for LoRA key '"
+                    + local
+                    + "' — fail-closed"
+                )
+            var scale = self._module_scale(m, multiplier, ctx)
+            var a = self._load_lora_tensor(m.prefix + self.suffix_a, ctx)
+            var b = self._load_lora_tensor(m.prefix + self.suffix_b, ctx)
+            if a.dtype() != STDtype.BF16 and a.dtype() != STDtype.F16:
+                a = cast_tensor(a^, STDtype.BF16, ctx)
+            if b.dtype() != STDtype.BF16 and b.dtype() != STDtype.F16:
+                b = cast_tensor(b^, STDtype.BF16, ctx)
+            block.add_lora_factor(local, a^, b^, scale)
+            n_applied += 1
+        return n_applied
+
+    def attach_ltx2_cached_block_factors(
+        self,
+        block_idx: Int,
+        mut block: LTX2AVBlockWeights,
+        multiplier: Float32,
+        ctx: DeviceContext,
+    ) raises -> Int:
+        """Attach preloaded factorized LoRA tensors to a streamed LTX-2 block.
+
+        Falls back to the legacy loader if callers did not preload, preserving
+        existing smoke tests while giving the HQ path a non-pathological hot
+        loop.
+        """
+        if not self.ltx2_factor_cache_ready:
+            return self.attach_ltx2_block_factors(block_idx, block, multiplier, ctx)
+
+        var n_applied = 0
+        for i in range(len(self.ltx2_factor_base_keys)):
+            var local = _strip_block_prefix(self.ltx2_factor_base_keys[i], block_idx)
+            if local.byte_length() == 0:
+                continue
+            if not _is_ltx2_av_lora_block_target(local):
+                raise Error(
+                    String("LTX2 cached factor apply: block ")
+                    + String(block_idx)
+                    + " has unsupported LoRA key '"
+                    + local
+                    + "' — fail-closed"
+                )
+            if not block.has_weight(local):
+                raise Error(
+                    String("LTX2 cached factor apply: block ")
+                    + String(block_idx)
+                    + " has no base linear for LoRA key '"
+                    + local
+                    + "' — fail-closed"
+                )
+            block.add_lora_factor_arc(
+                local,
+                self.ltx2_factor_a[i].copy(),
+                self.ltx2_factor_b[i].copy(),
+                self.ltx2_factor_base_scales[i] * multiplier,
+            )
             n_applied += 1
         return n_applied
 

@@ -52,6 +52,7 @@ from std.memory import ArcPointer
 from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.linalg_backward import (
     linear_backward, linear_backward_dx, linear_backward_dw,
@@ -140,14 +141,14 @@ def anima_lora_fwd(
 ) raises -> List[Float32]:
     var nb1 = Optional[Tensor](None)
     var t = linear(
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         nb1^, ctx,
     ).to_host(ctx)                                   # [M,rank]
     var nb2 = Optional[Tensor](None)
     var dy = linear(
-        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
+        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
         nb2^, ctx,
     ).to_host(ctx)                                   # [M,out]
     var out = List[Float32]()
@@ -193,8 +194,8 @@ def anima_lora_bwd(
     # t = x @ Aᵀ  (recompute; cheap)
     var nb_t = Optional[Tensor](None)
     var t = linear(
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         nb_t^, ctx,
     ).to_host(ctx)                                   # [M,rank]
     var d_dy = List[Float32]()
@@ -202,18 +203,18 @@ def anima_lora_bwd(
         d_dy.append(lo.scale * d_contrib_h[i])       # [M,out]
     # dy = t @ Bᵀ  -> d_B (d_w) and d_t (d_x)
     var lbB = linear_backward(
-        Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.F32, ctx),
-        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
+        Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.BF16, ctx),
+        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
         M, lo.rank, lo.out_f, ctx,
     )
     var d_t = lbB.d_x.to_host(ctx)                   # [M,rank]
     var d_b = lbB.d_w.to_host(ctx)                   # [out_f,rank]
     # t = x @ Aᵀ  -> d_A (d_w) and d_x_lo (d_x)
     var lbA = linear_backward(
-        Tensor.from_host(d_t^, [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(d_t^, [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         M, lo.in_f, lo.rank, ctx,
     )
     var d_x_lo = lbA.d_x.to_host(ctx)                # [M,in_f]
@@ -251,9 +252,14 @@ struct AnimaLoraAdapterDevice(Copyable, Movable):
 def anima_lora_adapter_to_device(
     lo: LoraAdapter, dt: STDtype, ctx: DeviceContext
 ) raises -> AnimaLoraAdapterDevice:
+    var a = Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx)
+    var b = Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx)
+    if dt != STDtype.BF16:
+        a = cast_tensor(a^, dt, ctx)
+        b = cast_tensor(b^, dt, ctx)
     return AnimaLoraAdapterDevice(
-        TArc(Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], dt, ctx)),
-        TArc(Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], dt, ctx)),
+        TArc(a^),
+        TArc(b^),
         lo.rank, lo.in_f, lo.out_f, lo.scale,
     )
 

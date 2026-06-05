@@ -126,10 +126,7 @@ def kandinsky5_build_text_rope(
     var positions = Tensor.from_host(host^, shp^, STDtype.F32, ctx)
     var axes = List[Int]()
     axes.append(head_dim)  # single axis spanning the whole head
-    var cs = build_multiaxis_rope_tables(positions, axes, theta, ctx)
-    var cos_d = cast_tensor(cs[0], dt, ctx)
-    var sin_d = cast_tensor(cs[1], dt, ctx)
-    return (cos_d^, sin_d^)
+    return build_multiaxis_rope_tables(positions, axes, theta, ctx, dt)
 
 
 # 3D visual RoPE: per-token (t,h,w) positions, token order F-major then H then W
@@ -157,10 +154,7 @@ def kandinsky5_build_visual_rope(
     axes.append(cfg.axis_t)
     axes.append(cfg.axis_h)
     axes.append(cfg.axis_w)
-    var cs = build_multiaxis_rope_tables(positions, axes, theta, ctx)
-    var cos_d = cast_tensor(cs[0], dt, ctx)
-    var sin_d = cast_tensor(cs[1], dt, ctx)
-    return (cos_d^, sin_d^)
+    return build_multiaxis_rope_tables(positions, axes, theta, ctx, dt)
 
 
 # ── AdaLN helpers (scale/shift/gate are per-sample [1,dim] F32) ──────────────
@@ -198,14 +192,15 @@ def _lin(
     return linear(x, w[wname][], Optional(w[bname][].clone(ctx)), ctx)
 
 
-# Modulation: SiLU(time_embed[1,time_dim]) -> Linear(F32 weights) -> [1, np*dim].
-# Returns the flat F32 params; chunk via _mod_chunk.
+# Modulation: SiLU(time_embed[1,time_dim]) -> Linear(weight) -> [1, np*dim].
+# The time embedding is F32 and linear returns F32 params; weights stay in their
+# checkpoint storage dtype and are consumed by mixed GEMM.
 def kandinsky5_modulation(
     time_embed_f32: Tensor, w: Dict[String, ArcPointer[Tensor]],
     wkey: String, bkey: String, ctx: DeviceContext,
 ) raises -> Tensor:
     var act = silu(time_embed_f32, ctx)                    # [1,time_dim] F32
-    # modulation weights stored F32; linear keeps F32 accumulation, F32 out.
+    # F32 activation path; weights remain checkpoint dtype, accumulation is F32.
     return linear(act, w[wkey][], Optional(w[bkey][].clone(ctx)), ctx)
 
 
@@ -604,14 +599,20 @@ struct Kandinsky5DiT(Movable):
                          self._w("text_embeddings.norm.bias"), cfg.eps, ctx)
         var txt3 = _flatten_sd(txt, TXT, dim, ctx)  # [1,TXT,dim]
 
-        # time embedding: timestep_embedding(model_dim) -> Linear -> SiLU -> Linear (F32)
+        # time embedding: F32 sinusoid -> stored weight dtype -> Linear -> SiLU -> Linear
         var t_host = List[Float32]()
         t_host.append(timestep)
         var t_shape = List[Int]()
         t_shape.append(1)
         var t_vec = Tensor.from_host(t_host^, t_shape^, STDtype.F32, ctx)
-        var te = timestep_embedding(t_vec, dim, ctx, cfg.max_period)  # [1,model_dim] F32
-        var th = linear(te, self._w("time_embeddings.in_layer.weight"),
+        var te_in = timestep_embedding(
+            t_vec,
+            dim,
+            ctx,
+            cfg.max_period,
+            self._w("time_embeddings.in_layer.weight").dtype(),
+        )
+        var th = linear(te_in, self._w("time_embeddings.in_layer.weight"),
                         Optional(self._w("time_embeddings.in_layer.bias").clone(ctx)), ctx)
         th = silu(th, ctx)
         var time_embed = linear(th, self._w("time_embeddings.out_layer.weight"),

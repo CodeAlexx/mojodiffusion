@@ -5,10 +5,10 @@
 # LoHa arm (lycoris.rs:864-874) and upstream lycoris/modules/loha.py
 # custom_state_dict (loha.py:272-275):
 #
-#       "<prefix>.hada_w1_a.weight"   F32 [in, rank]
-#       "<prefix>.hada_w1_b.weight"   F32 [rank, out]
-#       "<prefix>.hada_w2_a.weight"   F32 [in, rank]
-#       "<prefix>.hada_w2_b.weight"   F32 [rank, out]
+#       "<prefix>.hada_w1_a.weight"   BF16 [in, rank]
+#       "<prefix>.hada_w1_b.weight"   BF16 [rank, out]
+#       "<prefix>.hada_w2_a.weight"   BF16 [in, rank]
+#       "<prefix>.hada_w2_b.weight"   BF16 [rank, out]
 #       "<prefix>.alpha"              F32 [1]
 #
 # Unlike plain LoRA (lora_save.mojo deliberately OMITS `.alpha` and lets the
@@ -41,11 +41,11 @@ struct NamedLoHa(Copyable, Movable):
     var adapter: LoHaAdapter
 
 
-def _f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+def _bf16_2d(var values: List[BFloat16], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(rows)
     sh.append(cols)
-    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+    return Tensor.from_host_bf16(values^, sh^, ctx)
 
 
 def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
@@ -54,6 +54,13 @@ def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(1)
     return Tensor.from_host(v^, sh^, STDtype.F32, ctx)
+
+
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,13 +93,13 @@ def save_loha_peft(
             raise Error(String("save_loha_peft: w2b numel ") + String(len(a.w2b)) + " != rank*out for '" + nh.prefix + "'")
 
         names.append(nh.prefix + ".hada_w1_a.weight")
-        tensors.append(ArcPointer(_f32_2d(a.w1a.copy(), IN, R, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.w1a.copy(), IN, R, ctx)))
         names.append(nh.prefix + ".hada_w1_b.weight")
-        tensors.append(ArcPointer(_f32_2d(a.w1b.copy(), R, OUT, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.w1b.copy(), R, OUT, ctx)))
         names.append(nh.prefix + ".hada_w2_a.weight")
-        tensors.append(ArcPointer(_f32_2d(a.w2a.copy(), IN, R, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.w2a.copy(), IN, R, ctx)))
         names.append(nh.prefix + ".hada_w2_b.weight")
-        tensors.append(ArcPointer(_f32_2d(a.w2b.copy(), R, OUT, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(a.w2b.copy(), R, OUT, ctx)))
         names.append(nh.prefix + ".alpha")
         tensors.append(ArcPointer(_f32_scalar(a.alpha, ctx)))
 
@@ -117,14 +124,18 @@ def _read_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[
     return t.to_host(ctx)
 
 
+def _read_bf16(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[BFloat16]:
+    return _f32_to_bf16_list(_read_f32(st, name, ctx))
+
+
 # A read-back of one LoHa module: the 4 factors (with shapes) + alpha. Used by
 # the SAVE gate to assert keys/shapes/alpha round-trip.
 @fieldwise_init
 struct LoHaReadback(Copyable, Movable):
-    var w1a: List[Float32]
-    var w1b: List[Float32]
-    var w2a: List[Float32]
-    var w2b: List[Float32]
+    var w1a: List[BFloat16]
+    var w1b: List[BFloat16]
+    var w2a: List[BFloat16]
+    var w2b: List[BFloat16]
     var in_f: Int
     var out_f: Int
     var rank: Int
@@ -154,10 +165,10 @@ def read_loha_module(prefix: String, path: String, ctx: DeviceContext) raises ->
     if i2b.shape[0] != R or i2b.shape[1] != OUT:
         raise Error("read_loha_module: w2b shape mismatch")
 
-    var w1a = _read_f32(st, prefix + ".hada_w1_a.weight", ctx)
-    var w1b = _read_f32(st, prefix + ".hada_w1_b.weight", ctx)
-    var w2a = _read_f32(st, prefix + ".hada_w2_a.weight", ctx)
-    var w2b = _read_f32(st, prefix + ".hada_w2_b.weight", ctx)
+    var w1a = _read_bf16(st, prefix + ".hada_w1_a.weight", ctx)
+    var w1b = _read_bf16(st, prefix + ".hada_w1_b.weight", ctx)
+    var w2a = _read_bf16(st, prefix + ".hada_w2_a.weight", ctx)
+    var w2b = _read_bf16(st, prefix + ".hada_w2_b.weight", ctx)
     var alpha_h = _read_f32(st, prefix + ".alpha", ctx)
     if len(alpha_h) != 1:
         raise Error("read_loha_module: .alpha must be a 1-element tensor")

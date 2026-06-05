@@ -515,10 +515,9 @@ struct HiDreamO1DiT[S: Int]:
         var t_sh = List[Int]()
         t_sh.append(1)
         var t_tensor = Tensor.from_host(t_host, t_sh^, STDtype.F32, ctx)
-        # timestep_embedding wants F32 [N]; returns [N, dim] F32.
-        var freq = timestep_embedding(t_tensor, cfg.timestep_freq_dim, ctx)
-        # cast freq to the MLP dtype.
-        var freq_c = cast_tensor(freq, dtype, ctx)
+        var freq_c = timestep_embedding(
+            t_tensor, cfg.timestep_freq_dim, ctx, Float32(10000.0), dtype
+        )
         ref w0 = self._w(String("model.t_embedder1.mlp.0.weight"))
         ref b0 = self._w(String("model.t_embedder1.mlp.0.bias"))
         var h = linear(freq_c, w0, Optional[Tensor](self._clone(b0, ctx)), ctx)  # [1, H]
@@ -799,8 +798,9 @@ struct HiDreamO1Offloaded[S: Int](Movable):
         var t_sh = List[Int]()
         t_sh.append(1)
         var t_tensor = Tensor.from_host(t_host, t_sh^, STDtype.F32, ctx)
-        var freq = timestep_embedding(t_tensor, cfg.timestep_freq_dim, ctx)
-        var freq_c = cast_tensor(freq, dtype, ctx)
+        var freq_c = timestep_embedding(
+            t_tensor, cfg.timestep_freq_dim, ctx, Float32(10000.0), dtype
+        )
         ref w0 = self._w(String("model.t_embedder1.mlp.0.weight"))
         ref b0 = self._w(String("model.t_embedder1.mlp.0.bias"))
         var h = linear(freq_c, w0, Optional[Tensor](self._clone(b0, ctx)), ctx)

@@ -167,9 +167,9 @@ def _replace_span(
     return concat(1, ctx, head, repl, tail)
 
 
-def _repeat_kv_kernel_f32(
-    src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _repeat_kv_kernel[dtype: DType](
+    src: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dst: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     seq: Int, h: Int, h_kv: Int, dh: Int, n_rep: Int,
 ):
     var idx = Int(global_idx.x)
@@ -187,26 +187,50 @@ def _repeat_kv_kernel_f32(
 def _repeat_kv(
     x: Tensor, s: Int, h_kv: Int, n_rep: Int, dh: Int, ctx: DeviceContext
 ) raises -> Tensor:
-    if x.dtype() != STDtype.F32:
-        raise Error("Lance _repeat_kv: F32 checkpoint path expected")
     var h = h_kv * n_rep
     var out_n = s * h * dh
     var src_n = s * h_kv * dh
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        out_n * x.dtype().byte_size()
+    )
     var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](src_n))
     var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_n))
     var grid = (out_n + _BLOCK - 1) // _BLOCK
-    var SRC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), src_rl
-    )
-    var DST = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-    )
-    ctx.enqueue_function[_repeat_kv_kernel_f32, _repeat_kv_kernel_f32](
-        SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var SRC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        var DST = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        ctx.enqueue_function[_repeat_kv_kernel[DType.float32], _repeat_kv_kernel[DType.float32]](
+            SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var SRC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        var DST = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        ctx.enqueue_function[_repeat_kv_kernel[DType.bfloat16], _repeat_kv_kernel[DType.bfloat16]](
+            SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.float16:
+        var SRC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        var DST = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        ctx.enqueue_function[_repeat_kv_kernel[DType.float16], _repeat_kv_kernel[DType.float16]](
+            SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        raise Error("Lance _repeat_kv: unsupported storage dtype")
     ctx.synchronize()
-    return Tensor(out_buf^, _shape4(1, s, h, dh), STDtype.F32)
+    return Tensor(out_buf^, _shape4(1, s, h, dh), x.dtype())
 
 
 def _sdpa_lance[S: Int](

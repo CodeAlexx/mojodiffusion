@@ -24,6 +24,18 @@
 #
 # LTX2 P-reduce (LTX2_PORT_PLAN_2026-05-28 §P-reduce):
 #   reduce      — reduce_sum / reduce_mean / reduce_var / reduce_std over an
-#                 arbitrary set of dims (keepdim), F32-accumulated; output F32.
+#                 arbitrary set of dims (keepdim), F32-accumulated. sum/mean
+#                 /var/std preserve storage dtype; *_f32 variants emit F32.
 #                 Unblocks AdaIN per-(B,C)-over-(F,H,W) + general PixelNorm.
 #                 Import directly, e.g. `from serenitymojo.ops.reduce import reduce_mean`.
+
+# Cross-model diffusion parity helpers. These preserve PyTorch eager F32
+# operation boundaries before final BF16 stores, avoiding fused-kernel BF16 tie
+# drift in scheduler/noiser math. Public API:
+#   from serenitymojo.ops import torch_bf16_eager_add_scaled
+from serenitymojo.ops.torch_bf16 import (
+    torch_bf16_eager_add_scaled,
+    torch_bf16_eager_blend_with_f32_mask,
+    torch_bf16_eager_velocity_from_x0,
+    torch_f32_to_bf16_rne,
+)

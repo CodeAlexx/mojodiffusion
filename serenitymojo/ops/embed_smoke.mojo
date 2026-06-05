@@ -7,14 +7,15 @@
 # cos >= 0.999.
 #
 # Three checks:
-#   1. timestep_embedding  — sinusoidal embed (COS then SIN), F32.
-#   2. t_embedder          — timestep_embedding -> Linear -> SiLU -> Linear, F32.
+#   1. timestep_embedding  — sinusoidal embed (COS then SIN), F32 + BF16 storage.
+#   2. t_embedder          — timestep_embedding -> Linear -> SiLU -> Linear.
 #   3. rope-tables-through-rope_halfsplit — build_rope_tables, feed cos/sin into
 #      ops/rope.rope_halfsplit, compare to a full numpy RoPE reference. This is
 #      the load-bearing check: it proves the tables are in the layout
 #      rope_halfsplit expects (cos/sin = [rows, head_dim/2]).
 #
-# Storage dtype = F32 throughout (isolates op correctness from BF16 quant).
+# F32 parity isolates op math. BF16 branches prove tensor-boundary storage stays
+# in the model dtype.
 #
 # Run: pixi run mojo run -I . serenitymojo/ops/embed_smoke.mojo
 
@@ -58,10 +59,20 @@ def main() raises:
 
     # ── 1. timestep_embedding ─────────────────────────────────────────────────
     var t_t = Tensor.from_host(t_vals(), [EMB_N], STDtype.F32, ctx)
-    var ts_emb = timestep_embedding(t_t, EMB_DIM, ctx, EMB_MAX_PERIOD)
+    var ts_emb = timestep_embedding(t_t, EMB_DIM, ctx, EMB_MAX_PERIOD, STDtype.F32)
     var r_ts = harness.compare(ts_emb, ts_emb_ref(), ctx)
     print("timestep_embedding ", r_ts)
     if not r_ts.passed:
+        all_pass = False
+    var t_t_bf16 = Tensor.from_host(t_vals(), [EMB_N], STDtype.F32, ctx)
+    var ts_emb_bf16 = timestep_embedding(
+        t_t_bf16, EMB_DIM, ctx, EMB_MAX_PERIOD, STDtype.BF16
+    )
+    if ts_emb_bf16.dtype() != STDtype.BF16:
+        raise Error("timestep_embedding BF16 branch returned non-BF16 storage")
+    var r_ts_bf16 = harness.compare(ts_emb_bf16, ts_emb_ref(), ctx)
+    print("timestep_embedding BF16", r_ts_bf16)
+    if not r_ts_bf16.passed:
         all_pass = False
 
     # ── 2. t_embedder (MLP) ───────────────────────────────────────────────────
@@ -84,10 +95,31 @@ def main() raises:
     print("t_embedder         ", r_te)
     if not r_te.passed:
         all_pass = False
+    var t_t3 = Tensor.from_host(t_vals(), [EMB_N], STDtype.F32, ctx)
+    var w0_bf16 = Tensor.from_host(mlp0_w(), [EMB_HIDDEN, EMB_DIM], STDtype.BF16, ctx)
+    var b0_bf16 = Tensor.from_host(mlp0_b(), [EMB_HIDDEN], STDtype.BF16, ctx)
+    var w2_bf16 = Tensor.from_host(mlp2_w(), [EMB_DIM, EMB_HIDDEN], STDtype.BF16, ctx)
+    var b2_bf16 = Tensor.from_host(mlp2_b(), [EMB_DIM], STDtype.BF16, ctx)
+    var te_bf16 = t_embedder(
+        t_t3,
+        EMB_DIM,
+        w0_bf16,
+        Optional[Tensor](b0_bf16^),
+        w2_bf16,
+        Optional[Tensor](b2_bf16^),
+        ctx,
+        EMB_MAX_PERIOD,
+    )
+    if te_bf16.dtype() != STDtype.BF16:
+        raise Error("t_embedder BF16 branch returned non-BF16 storage")
+    var r_te_bf16 = harness.compare(te_bf16, t_embedder_ref(), ctx)
+    print("t_embedder BF16    ", r_te_bf16)
+    if not r_te_bf16.passed:
+        all_pass = False
 
     # ── 3a. rope tables vs numpy tables (direct) ──────────────────────────────
     var pos_t = Tensor.from_host(positions(), [ROPE_ROWS], STDtype.F32, ctx)
-    var tables = build_rope_tables(pos_t, ROPE_HEAD_DIM, ROPE_THETA, ctx)
+    var tables = build_rope_tables(pos_t, ROPE_HEAD_DIM, ROPE_THETA, ctx, STDtype.F32)
     var r_cos = harness.compare(tables[0], cos_tab_ref(), ctx)
     var r_sin = harness.compare(tables[1], sin_tab_ref(), ctx)
     print("rope cos table     ", r_cos)
@@ -95,6 +127,22 @@ def main() raises:
     if not r_cos.passed:
         all_pass = False
     if not r_sin.passed:
+        all_pass = False
+    var pos_bf16_t = Tensor.from_host(positions(), [ROPE_ROWS], STDtype.F32, ctx)
+    var tables_bf16 = build_rope_tables(
+        pos_bf16_t, ROPE_HEAD_DIM, ROPE_THETA, ctx, STDtype.BF16
+    )
+    if tables_bf16[0].dtype() != STDtype.BF16:
+        raise Error("build_rope_tables BF16 cos returned non-BF16 storage")
+    if tables_bf16[1].dtype() != STDtype.BF16:
+        raise Error("build_rope_tables BF16 sin returned non-BF16 storage")
+    var r_cos_bf16 = harness.compare(tables_bf16[0], cos_tab_ref(), ctx)
+    var r_sin_bf16 = harness.compare(tables_bf16[1], sin_tab_ref(), ctx)
+    print("rope cos table BF16", r_cos_bf16)
+    print("rope sin table BF16", r_sin_bf16)
+    if not r_cos_bf16.passed:
+        all_pass = False
+    if not r_sin_bf16.passed:
         all_pass = False
 
     # ── 3b. rope tables THROUGH rope_halfsplit vs full numpy RoPE ─────────────
@@ -106,6 +154,18 @@ def main() raises:
     var r_rope = harness.compare(roped, rope_out_ref(), ctx)
     print("rope_halfsplit(out)", r_rope)
     if not r_rope.passed:
+        all_pass = False
+    var x_bf16_t = Tensor.from_host(
+        rope_x(), [ROPE_ROWS, ROPE_HEAD_DIM], STDtype.BF16, ctx
+    )
+    var roped_bf16 = rope_halfsplit(
+        x_bf16_t, tables_bf16[0], tables_bf16[1], ctx
+    )
+    if roped_bf16.dtype() != STDtype.BF16:
+        raise Error("rope_halfsplit BF16 branch returned non-BF16 storage")
+    var r_rope_bf16 = harness.compare(roped_bf16, rope_out_ref(), ctx)
+    print("rope_halfsplit BF16", r_rope_bf16)
+    if not r_rope_bf16.passed:
         all_pass = False
 
     print()

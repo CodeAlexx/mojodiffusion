@@ -45,11 +45,24 @@ import sys
 
 import torch
 from safetensors.torch import save_file
+from safetensors import safe_open
 
 CKPT = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8.safetensors"
 CACHED = "/home/alex/EriDiffusion/inference-flame/cached_ltx2_embeddings.safetensors"
 OUT_DIR = "/home/alex/mojodiffusion/output/ltx2_dit_forward"
 OUT = os.path.join(OUT_DIR, "dit_forward_ref.safetensors")
+OUT_HQ_LORA = os.path.join(OUT_DIR, "dit_forward_hq_lora_ref.safetensors")
+
+DISTILLED_LORA = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-lora-384.safetensors"
+CAMERA_STATIC_LORA = "/home/alex/.serenity/models/loras/ltx-2-19b-lora-camera-control-static.safetensors"
+DETAILER_LORA = "/home/alex/.serenity/models/loras/ltx-2-19b-ic-lora-detailer.safetensors"
+HQ_LORA_STACK_STAGE2 = (
+    # Current staged-HQ production stack: stage-2 distilled support + camera.
+    # Detailer remains listed at 0.0 until IC/reference conditioning is wired.
+    (DISTILLED_LORA, 0.5, "distilled_stage2"),
+    (CAMERA_STATIC_LORA, 0.3, "camera_static"),
+    (DETAILER_LORA, 0.0, "detailer_disabled"),
+)
 
 PREFIX = "model.diffusion_model."
 EPS = 1e-6
@@ -89,6 +102,14 @@ SIGMA = 0.7
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 BOUNDARY_BLOCKS = set([0, 1, 2, 3, 47])
+CAPTURE_AFTER_BLOCKS = set(range(NUM_LAYERS))
+
+if DEV == "cuda":
+    # Mojo's vendor BLAS F32 path uses tensor-core style math on NVIDIA. Keep the
+    # oracle in the same numerical regime; strict CUDA F32 drifts enough over 48
+    # blocks to become a false negative at the final video head.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
 
 # ---------------------------------------------------------------------------
@@ -578,10 +599,106 @@ def synth(shape, seed, scale, device):
     return (torch.randn(*shape, generator=g) * scale).to(torch.float32).to(device)
 
 
+def _lora_prefixes(path):
+    with safe_open(path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+    suffix = ".lora_A.weight"
+    return [k[:-len(suffix)] for k in keys if k.endswith(suffix)]
+
+
+def _lora_base_key(prefix):
+    if prefix.startswith("diffusion_model."):
+        prefix = prefix[len("diffusion_model."):]
+    return prefix + ".weight"
+
+
+def _lora_scale(reader, prefix, multiplier, rank):
+    if multiplier == 0.0:
+        return 0.0
+    alpha_key = prefix + ".alpha"
+    if alpha_key in reader.keys():
+        alpha = reader.get_tensor(alpha_key).to(torch.float32).reshape(()).item()
+        return float(alpha) / float(rank) * float(multiplier)
+    return float(multiplier)
+
+
+def _lora_delta(reader, prefix, multiplier, device):
+    a = reader.get_tensor(prefix + ".lora_A.weight")
+    b = reader.get_tensor(prefix + ".lora_B.weight")
+    if a.ndim != 2 or b.ndim != 2:
+        raise RuntimeError(f"unsupported conv/nonlinear LoRA tensor: {prefix}")
+    if a.shape[0] != b.shape[1]:
+        raise RuntimeError(f"LoRA rank mismatch: {prefix} A={tuple(a.shape)} B={tuple(b.shape)}")
+    scale = _lora_scale(reader, prefix, multiplier, int(a.shape[0]))
+    if scale == 0.0:
+        return None
+    return (b.to(torch.float32).to(device) @ a.to(torch.float32).to(device)) * scale
+
+
+def _apply_hq_lora_globals(W, stack):
+    applied = 0
+    for path, mult, label in stack:
+        if mult == 0.0:
+            continue
+        with safe_open(path, framework="pt", device="cpu") as reader:
+            for prefix in _lora_prefixes(path):
+                base_key = _lora_base_key(prefix)
+                if base_key.startswith("transformer_blocks."):
+                    continue
+                if base_key not in W:
+                    raise RuntimeError(f"{label}: global LoRA base missing from W: {base_key}")
+                delta = _lora_delta(reader, prefix, mult, W[base_key].device)
+                if delta is None:
+                    continue
+                if tuple(delta.shape) != tuple(W[base_key].shape):
+                    raise RuntimeError(
+                        f"{label}: global LoRA shape mismatch for {base_key}: "
+                        f"delta={tuple(delta.shape)} base={tuple(W[base_key].shape)}"
+                    )
+                W[base_key] = W[base_key] + delta.to(W[base_key].device)
+                applied += 1
+    print(f"[oracle] applied HQ LoRA globals: {applied}", flush=True)
+    return applied
+
+
+def _apply_hq_lora_block(bw, block_idx, stack, device):
+    applied = 0
+    block_prefix = f"transformer_blocks.{block_idx}."
+    for path, mult, label in stack:
+        if mult == 0.0:
+            continue
+        with safe_open(path, framework="pt", device="cpu") as reader:
+            for prefix in _lora_prefixes(path):
+                base_key = _lora_base_key(prefix)
+                if not base_key.startswith(block_prefix):
+                    continue
+                local = base_key[len(block_prefix):]
+                if local not in bw:
+                    raise RuntimeError(
+                        f"{label}: block {block_idx} missing LoRA base {local} "
+                        f"(base_key={base_key})"
+                    )
+                delta = _lora_delta(reader, prefix, mult, device)
+                if delta is None:
+                    continue
+                if tuple(delta.shape) != tuple(bw[local].shape):
+                    raise RuntimeError(
+                        f"{label}: block {block_idx} LoRA shape mismatch for {local}: "
+                        f"delta={tuple(delta.shape)} base={tuple(bw[local].shape)}"
+                    )
+                bw[local] = bw[local] + delta.to(device)
+                applied += 1
+    return applied
+
+
 def main():
+    hq_lora = "--hq-lora" in sys.argv
+    out_path = OUT_HQ_LORA if hq_lora else OUT
     os.makedirs(OUT_DIR, exist_ok=True)
     print(f"[oracle] device={DEV}  shape: NF={NF} NH={NH} NW={NW} -> S_V={S_V}, "
           f"S_A={S_A}, N_TXT={N_TXT}, blocks={NUM_LAYERS}")
+    if hq_lora:
+        print("[oracle] HQ LoRA mode: distilled_stage2=0.5 camera_static=0.3 detailer=0.0")
 
     # --- deterministic latents (patchified domain, the smoke ingests these) ---
     v_flat = synth((1, S_V, 128), SEED + 100, 0.5, DEV)         # [B,N,128] video
@@ -615,6 +732,8 @@ def main():
     raw = load_selected(CKPT, want, want_exact)
     W = {k[len(PREFIX):]: v.to(torch.float32).to(DEV) for k, v in raw.items()}
     del raw
+    if hq_lora:
+        _apply_hq_lora_globals(W, HQ_LORA_STACK_STAGE2)
     ckpt_hdr, ckpt_data_off = _read_header(CKPT)
     hdr_keys = {k[len(PREFIX):]: 1 for k in ckpt_hdr if k.startswith(PREFIX)}
 
@@ -679,18 +798,34 @@ def main():
     caarope = compute_rope(a_tc, AUDIO_CROSS_ATTN_DIM, ca_max, ROPE_THETA,
                            AUDIO_HEADS, DEV)
 
+    captures = {
+        "hs_after_projin": hs.detach().to(torch.float32).cpu().contiguous(),
+        "ahs_after_projin": ahs.detach().to(torch.float32).cpu().contiguous(),
+    }
+
     # --- 48-block loop ---
     # The block math runs on DEV (GPU). W is held on CPU (48 blocks of F32 won't
     # fit on 24 GB); each block's weights are moved to GPU just for that block
     # and freed after, mirroring the Mojo single-resident-window stream.
     for i in range(NUM_LAYERS):
         bw = load_block_from_disk(CKPT, ckpt_hdr, ckpt_data_off, i, DEV)
+        if hq_lora:
+            n_lora = _apply_hq_lora_block(bw, i, HQ_LORA_STACK_STAGE2, DEV)
+            if i == 0 or i == 47 or (i + 1) % 12 == 0:
+                print(f"[oracle]   block {i+1}/{NUM_LAYERS} LoRA deltas={n_lora}", flush=True)
         # boundary blocks (0-3,47) are pure BF16 in the ckpt; inner blocks 4-46
         # already came from FP8 storage (dequantized in load_block_from_disk).
         # Nothing further to fp8_cast — the disk dtype already matched the path.
         hs, ahs = run_block(bw, hs, ahs, enc, aenc, v_temb, a_temb,
                             v_ca_ss, a_ca_ss, v_ca_gate, a_ca_gate, vpt, apt,
                             vrope, arope, cavrope, caarope)
+        if i in CAPTURE_AFTER_BLOCKS:
+            tag = f"after_block_{i + 1:02d}"
+            captures[f"{tag}_hs"] = hs.detach().to(torch.float32).cpu().contiguous()
+            captures[f"{tag}_ahs"] = ahs.detach().to(torch.float32).cpu().contiguous()
+            tag_plain = f"after_block_{i + 1}"
+            captures[f"{tag_plain}_hs"] = captures[f"{tag}_hs"].clone()
+            captures[f"{tag_plain}_ahs"] = captures[f"{tag}_ahs"].clone()
         del bw
         if DEV == "cuda":
             torch.cuda.empty_cache()
@@ -706,6 +841,8 @@ def main():
     v_scale = v_final[:, :, 1, :]
     v_norm = layer_norm_no_affine(hs, EPS)
     v_out = v_norm * (v_scale + 1.0) + v_shift
+    captures["video_final_norm"] = v_norm.detach().to(torch.float32).cpu().contiguous()
+    captures["video_final_mod"] = v_out.detach().to(torch.float32).cpu().contiguous()
     v_out = linear3d(v_out, W["proj_out.weight"], W["proj_out.bias"])  # [1,N,128]
 
     a_ss = W["audio_scale_shift_table"].reshape(1, 1, 2, AUDIO_INNER_DIM)
@@ -715,6 +852,8 @@ def main():
     a_scale = a_final[:, :, 1, :]
     a_norm = layer_norm_no_affine(ahs, EPS)
     a_out = a_norm * (a_scale + 1.0) + a_shift
+    captures["audio_final_norm"] = a_norm.detach().to(torch.float32).cpu().contiguous()
+    captures["audio_final_mod"] = a_out.detach().to(torch.float32).cpu().contiguous()
     a_out = linear3d(a_out, W["audio_proj_out.weight"],
                      W["audio_proj_out.bias"])  # [1,T,128]
 
@@ -770,8 +909,9 @@ def main():
         "video_velocity": f32(v_out),
         "audio_velocity": f32(a_out),
     }
-    save_file(out, OUT)
-    print(f"[oracle] dumped {len(out)} tensors -> {OUT}")
+    out.update(captures)
+    save_file(out, out_path)
+    print(f"[oracle] dumped {len(out)} tensors -> {out_path}")
 
 
 if __name__ == "__main__":

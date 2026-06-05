@@ -1,6 +1,9 @@
 # training/optim.mojo — optimizers (AdamW, SGD) + global-norm grad clip.
 #
-# Phase T4 of FULL_PORT_TRAINING_PLAN.md. F32 throughout (master-weight path).
+# Phase T4 of FULL_PORT_TRAINING_PLAN.md. This module is intentionally F32:
+# optimizer master weights, moments, bias correction, and norm reductions are
+# F32 state/math. BF16 training grads should be cast up at the optimizer boundary
+# by the caller, not stored as long-lived F32 tape activations.
 # Parity-gated: one optimizer step on a fixed (param, grad, moment) tuple must
 # match the PyTorch reference at cos >= 0.999 (training/parity/optim_*).
 #
@@ -125,14 +128,51 @@ def _sgd_kernel(
         p[idx] = rebind[p.element_type](pv)
 
 
-# ── scale a flat F32 buffer in place ─────────────────────────────────────────
-def _scale_kernel(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], scale: Float32, n: Int
+# ── scale a flat buffer in place, preserving storage dtype ───────────────────
+def _scale_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin], scale: Float32, n: Int
 ):
     var idx = Int(global_idx.x)
     if idx < n:
-        x[idx] = rebind[x.element_type](
-            rebind[Scalar[DType.float32]](x[idx]) * scale
+        var v = rebind[Scalar[dtype]](x[idx]).cast[DType.float32]() * scale
+        x[idx] = rebind[x.element_type](v.cast[dtype]())
+
+
+def _scale_tensor_in_place(mut x: Tensor, scale: Float32, ctx: DeviceContext) raises:
+    var n = x.numel()
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var XT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[
+            _scale_kernel[DType.float32], _scale_kernel[DType.float32]
+        ](XT, scale, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var XT = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[
+            _scale_kernel[DType.bfloat16], _scale_kernel[DType.bfloat16]
+        ](XT, scale, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var XT = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[
+            _scale_kernel[DType.float16], _scale_kernel[DType.float16]
+        ](XT, scale, n, grid_dim=grid, block_dim=_BLOCK)
+
+
+def _require_compute_storage(name: String, t: Tensor) raises:
+    var dt = t.dtype()
+    if dt != STDtype.F32 and dt != STDtype.BF16 and dt != STDtype.F16:
+        raise Error(
+            String("optim: ") + name + " must be F32/BF16/F16 (got "
+            + dt.name()
+            + ")"
         )
 
 
@@ -252,9 +292,9 @@ def clip_grad_global_norm(
 
     total_norm = sqrt(sum over BOTH tensors of sum(g^2)) — matches flame-core
     compute_grad_norm (per-tensor L2 summed in quadrature) and torch
-    clip_grad_norm_. Both grads must be F32."""
-    _require_f32("g1", g1)
-    _require_f32("g2", g2)
+    clip_grad_norm_. F32/BF16/F16 grad storage is preserved."""
+    _require_compute_storage("g1", g1)
+    _require_compute_storage("g2", g2)
 
     # Sum of squares over both grads (host readback — parity-grade, not hot).
     var total_sq = Float64(0.0)
@@ -273,20 +313,8 @@ def clip_grad_global_norm(
         scale = max_norm / total_norm
 
     if scale != 1.0:
-        var n1 = g1.numel()
-        var rl1 = RuntimeLayout[_DYN1].row_major(IndexList[1](n1))
-        var gt1 = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            g1.buf.unsafe_ptr().bitcast[Float32](), rl1)
-        var grid1 = (n1 + _BLOCK - 1) // _BLOCK
-        ctx.enqueue_function[_scale_kernel, _scale_kernel](
-            gt1, scale, n1, grid_dim=grid1, block_dim=_BLOCK)
-        var n2 = g2.numel()
-        var rl2 = RuntimeLayout[_DYN1].row_major(IndexList[1](n2))
-        var gt2 = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-            g2.buf.unsafe_ptr().bitcast[Float32](), rl2)
-        var grid2 = (n2 + _BLOCK - 1) // _BLOCK
-        ctx.enqueue_function[_scale_kernel, _scale_kernel](
-            gt2, scale, n2, grid_dim=grid2, block_dim=_BLOCK)
+        _scale_tensor_in_place(g1, scale, ctx)
+        _scale_tensor_in_place(g2, scale, ctx)
         ctx.synchronize()
 
     return total_norm
@@ -306,7 +334,7 @@ def clip_grad_global_norm(
 # norm is computed via host readback (parity-grade, not the hot path), matching
 # the existing 2-tensor helper and the inline trainer path. Returns the pre-clip
 # total_norm so the caller can log it (and so post-clip norm == max_norm holds
-# whenever clipping fired). All grads must be F32.
+# whenever clipping fired). F32/BF16/F16 grad storage is preserved.
 def clip_grads_by_global_norm(
     grads: List[TArc],
     max_norm: Float32,
@@ -317,7 +345,7 @@ def clip_grads_by_global_norm(
     # Sum of squares over ALL grads (F64 accumulate, host readback).
     var total_sq = Float64(0.0)
     for i in range(len(grads)):
-        _require_f32(String("grad[") + String(i) + String("]"), grads[i][])
+        _require_compute_storage(String("grad[") + String(i) + String("]"), grads[i][])
         var h = grads[i][].to_host(ctx)
         for j in range(len(h)):
             var x = Float64(h[j])
@@ -330,13 +358,7 @@ def clip_grads_by_global_norm(
 
     if scale != 1.0:
         for i in range(len(grads)):
-            var n = grads[i][].numel()
-            var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-            var gt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                grads[i][].buf.unsafe_ptr().bitcast[Float32](), rl)
-            var grid = (n + _BLOCK - 1) // _BLOCK
-            ctx.enqueue_function[_scale_kernel, _scale_kernel](
-                gt, scale, n, grid_dim=grid, block_dim=_BLOCK)
+            _scale_tensor_in_place(grads[i][], scale, ctx)
         ctx.synchronize()
 
     return total_norm

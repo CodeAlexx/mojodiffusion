@@ -223,7 +223,12 @@ def _l2_ratio_lastdim(
     Both inputs are [..., dim]; we reduce the trailing `dim`. Returns a tensor
     with the last dim collapsed to 1 so `mul(comb, ratio)` broadcasts it back.
     Computed host-side (see `cfg_qwen` note) — only the row count of scalars moves.
+    The reduction uses F32 host statistics, then stores the tiny ratio tensor in
+    the prediction storage dtype so the full latent/prediction carrier stays BF16
+    on BF16 inference paths.
     """
+    if cond.dtype() != comb.dtype():
+        raise Error("_l2_ratio_lastdim: cond/comb dtype mismatch")
     var cs = cond.shape()
     var ms = comb.shape()
     if len(cs) == 0 or len(ms) == 0:
@@ -254,7 +259,7 @@ def _l2_ratio_lastdim(
         var cn = sqrt(cs_sum)
         var mn = sqrt(ms_sum)
         ratio_h.append(cn / mn)
-    return Tensor.from_host(ratio_h, ratio_shape^, STDtype.F32, ctx)
+    return Tensor.from_host(ratio_h, ratio_shape^, cond.dtype(), ctx)
 
 
 struct Scheduler(Movable):

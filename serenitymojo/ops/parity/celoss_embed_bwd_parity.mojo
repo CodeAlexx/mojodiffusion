@@ -100,6 +100,7 @@ def main() raises:
 
     var ctx = DeviceContext()
     var h = ParityHarness()
+    var h_bf16 = ParityHarness(0.99)
     var all_pass = True
 
     # ── CrossEntropy: [N=5, C=7] ──────────────────────────────────────────────
@@ -146,6 +147,46 @@ def main() raises:
     var r_emb = h.compare_host(e_d.to_host(ctx), _read_ref(String("embed_dtable")))
     print("embed_dtable vs torch:", r_emb)
     all_pass = all_pass and r_emb.passed
+
+    # ── BF16 storage smoke: same F32 refs, relaxed cos. These are not bit parity
+    # gates; they prove the storage-preserving kernels run and return BF16.
+    var ce_logits_b = Tensor.from_host(
+        _read_ref(String("ce_logits")), [ce_N, ce_C], STDtype.BF16, ctx)
+    var ce_dl_b = cross_entropy_backward(ce_logits_b, ce_target, ctx)
+    var r_ce_b = h_bf16.compare_host(
+        ce_dl_b.to_host(ctx), _read_ref(String("ce_dlogits")))
+    var ce_b_ok = ce_dl_b.dtype() == STDtype.BF16 and r_ce_b.passed
+    print("bf16 ce_dlogits storage/parity:", r_ce_b, " dtype=", ce_dl_b.dtype().name())
+    all_pass = all_pass and ce_b_ok
+
+    var nl_lp_b = Tensor.from_host(
+        _read_ref(String("nll_logprobs")), [nl_N, nl_C], STDtype.BF16, ctx)
+    var nl_d_b = nll_backward(nl_lp_b, nl_target, ctx)
+    var r_nll_b = h_bf16.compare_host(
+        nl_d_b.to_host(ctx), _read_ref(String("nll_dlp")))
+    var nll_b_ok = nl_d_b.dtype() == STDtype.BF16 and r_nll_b.passed
+    print("bf16 nll_dlp storage/parity:", r_nll_b, " dtype=", nl_d_b.dtype().name())
+    all_pass = all_pass and nll_b_ok
+
+    var b_pred_b = Tensor.from_host(
+        _read_ref(String("bce_pred")), [b_N], STDtype.BF16, ctx)
+    var b_target_b = Tensor.from_host(
+        _read_ref(String("bce_target")), [b_N], STDtype.BF16, ctx)
+    var b_d_b = bce_backward(b_pred_b, b_target_b, ctx)
+    var r_bce_b = h_bf16.compare_host(
+        b_d_b.to_host(ctx), _read_ref(String("bce_dpred")))
+    var bce_b_ok = b_d_b.dtype() == STDtype.BF16 and r_bce_b.passed
+    print("bf16 bce_dpred storage/parity:", r_bce_b, " dtype=", b_d_b.dtype().name())
+    all_pass = all_pass and bce_b_ok
+
+    var e_go_b = Tensor.from_host(
+        _read_ref(String("embed_gradout")), [n_idx, dim], STDtype.BF16, ctx)
+    var e_d_b = embedding_backward(e_go_b, e_idx, num_emb, ctx)
+    var r_emb_b = h_bf16.compare_host(
+        e_d_b.to_host(ctx), _read_ref(String("embed_dtable")))
+    var emb_b_ok = e_d_b.dtype() == STDtype.BF16 and r_emb_b.passed
+    print("bf16 embed_dtable storage/parity:", r_emb_b, " dtype=", e_d_b.dtype().name())
+    all_pass = all_pass and emb_b_ok
 
     print("")
     if all_pass:

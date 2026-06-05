@@ -27,16 +27,16 @@
 #   conv_out:   CausalConv3d(1024 -> 129, k=3)
 #   expand:     last channel repeat 127x, concat -> 256 = 2*128
 #   take mean:  first 128 channels (deterministic, no sampling)
-#   normalize:  (mu - mean_of_means) / std_of_means  (per-channel, F32)
+#   normalize:  (mu - mean_of_means) / std_of_means  (per-channel, BF16 boundary)
 #
 # Input:  NCDHW [B, 3, T, H, W] video in [-1,1] (T = 1 + 8k frames).
 # Output: NCDHW [B, 128, T', H', W']  (T'=T//8-ish, H'=H/32, W'=W/32) normalized.
 #
 # === DTYPE — MATCH RUST EXACTLY ===
 # The Rust encoder casts every weight to BF16 (get_bf16) and runs the forward in
-# BF16 (cudnn_conv2d_bf16, F32-accumulate inside the conv; pixel_norm + stats in
-# F32 then cast back to BF16). We do the same: weights load BF16, conv3d.mojo
-# F32-accumulates, rms_norm/normalize compute in F32. Input fed as BF16.
+# BF16 (cudnn_conv2d_bf16, F32-accumulate inside compute kernels). We do the
+# same: weights and activations stay in BF16 storage while conv3d.mojo,
+# rms_norm, and elementwise stats own their internal F32 math.
 #
 # === LAYOUT: NDHWC for conv/resnet/pixelnorm; NCDHW for patchify/space_to_depth
 # === The foundation conv3d (models/vae/conv3d.mojo) is NDHWC. We keep all
@@ -364,8 +364,8 @@ struct LTX2VaeEncoderWeights(Movable):
             var resid6 = reshape(resid_ncdhw, r6^, ctx)
             var dims = List[Int]()
             dims.append(2)
-            var meaned = reduce_mean(resid6, dims^, False, ctx)  # F32 [B,ng,Do,Ho,Wo]
-            # cast back to compute dtype, then to NDHWC.
+            var meaned = reduce_mean(resid6, dims^, False, ctx)  # [B,ng,Do,Ho,Wo], storage-preserving
+            # Convert to the encoder input dtype, then to NDHWC.
             resid_ncdhw = cast_tensor(meaned, x.dtype(), ctx)
         var residual = self._to_ndhwc(resid_ncdhw, ctx)
 
@@ -378,16 +378,11 @@ struct LTX2VaeEncoderWeights(Movable):
         # 4. out = main + residual.
         return add(main, residual, ctx)
 
-    # ── per-channel normalize: (mu - mean) / std  (computed in F32, like Rust
-    #    PerChannelStatistics::normalize, then cast back to compute dtype) ──────
+    # ── per-channel normalize: (mu - mean) / std. PyTorch
+    #    PerChannelStatistics.normalize casts buffers to x.dtype; tensor_algebra
+    #    does F32 arithmetic inside the kernels and stores back to x.dtype.
     def _normalize(self, mu_ncdhw: Tensor, ctx: DeviceContext) raises -> Tensor:
-        var out_dt = mu_ncdhw.dtype()
-        var mu_f = cast_tensor(mu_ncdhw, STDtype.F32, ctx)
-        var mean_f = cast_tensor(self.stat_mean, STDtype.F32, ctx)
-        var std_f = cast_tensor(self.stat_std, STDtype.F32, ctx)
-        var centered = sub(mu_f, mean_f, ctx)
-        var normalized = div(centered, std_f, ctx)
-        return cast_tensor(normalized, out_dt, ctx)
+        return div(sub(mu_ncdhw, self.stat_mean, ctx), self.stat_std, ctx)
 
 
 # ── encode ────────────────────────────────────────────────────────────────────
@@ -449,7 +444,7 @@ def encode(
     # 7. bridge -> NCDHW [B,128,T',H',W'].
     var mu_ncdhw = weights._to_ncdhw(mu_ndhwc, ctx)
 
-    # 8. per-channel normalization (F32).
+    # 8. per-channel normalization. Storage dtype stays with mu_ncdhw.
     return weights._normalize(mu_ncdhw, ctx)
 
 

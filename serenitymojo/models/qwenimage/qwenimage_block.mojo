@@ -49,8 +49,8 @@
 # the cat/slice backward (txt FIRST).
 #
 # API boundary: img/txt enter + img_out/txt_out + every grad leave as host
-# List[Float32] (so the stack + parity gates use it unchanged). Interior is
-# device-resident (TArc = ArcPointer[Tensor], refcount-bump carrier).
+# List[Float32] for the current stack/parity callers. Device tensors use BF16
+# storage; kernels accumulate internally in F32.
 #
 # Mojo 1.0.0b1, NVIDIA GPU. `def` not `fn`; Tensor move-only (TArc in saved
 # structs); biased linear = linear(x, w, Optional[Tensor](b), ctx).
@@ -114,11 +114,11 @@ def _zeros(d: Int) -> List[Float32]:
 
 
 def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
-    return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+    return Tensor.from_host(vals, shape^, STDtype.BF16, ctx)
 
 
 def _ta(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> TArc:
-    return TArc(Tensor.from_host(vals, shape^, STDtype.F32, ctx))
+    return TArc(Tensor.from_host(vals, shape^, STDtype.BF16, ctx))
 
 
 # ── per-stream AdaLN modulation vectors (each [D]) ───────────────────────────
@@ -178,20 +178,20 @@ struct StreamWeights(Copyable, Movable):
         var q_norm: List[Float32], var k_norm: List[Float32],
         D: Int, F: Int, Dh: Int, ctx: DeviceContext,
     ) raises:
-        self.wq = TArc(Tensor.from_host(wq^, [D, D], STDtype.F32, ctx))
-        self.wk = TArc(Tensor.from_host(wk^, [D, D], STDtype.F32, ctx))
-        self.wv = TArc(Tensor.from_host(wv^, [D, D], STDtype.F32, ctx))
-        self.bq = TArc(Tensor.from_host(bq^, [D], STDtype.F32, ctx))
-        self.bk = TArc(Tensor.from_host(bk^, [D], STDtype.F32, ctx))
-        self.bv = TArc(Tensor.from_host(bv^, [D], STDtype.F32, ctx))
-        self.wout = TArc(Tensor.from_host(wout^, [D, D], STDtype.F32, ctx))
-        self.bout = TArc(Tensor.from_host(bout^, [D], STDtype.F32, ctx))
-        self.wup = TArc(Tensor.from_host(wup^, [F, D], STDtype.F32, ctx))
-        self.bup = TArc(Tensor.from_host(bup^, [F], STDtype.F32, ctx))
-        self.wdn = TArc(Tensor.from_host(wdn^, [D, F], STDtype.F32, ctx))
-        self.bdn = TArc(Tensor.from_host(bdn^, [D], STDtype.F32, ctx))
-        self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.F32, ctx))
-        self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.F32, ctx))
+        self.wq = TArc(Tensor.from_host(wq^, [D, D], STDtype.BF16, ctx))
+        self.wk = TArc(Tensor.from_host(wk^, [D, D], STDtype.BF16, ctx))
+        self.wv = TArc(Tensor.from_host(wv^, [D, D], STDtype.BF16, ctx))
+        self.bq = TArc(Tensor.from_host(bq^, [D], STDtype.BF16, ctx))
+        self.bk = TArc(Tensor.from_host(bk^, [D], STDtype.BF16, ctx))
+        self.bv = TArc(Tensor.from_host(bv^, [D], STDtype.BF16, ctx))
+        self.wout = TArc(Tensor.from_host(wout^, [D, D], STDtype.BF16, ctx))
+        self.bout = TArc(Tensor.from_host(bout^, [D], STDtype.BF16, ctx))
+        self.wup = TArc(Tensor.from_host(wup^, [F, D], STDtype.BF16, ctx))
+        self.bup = TArc(Tensor.from_host(bup^, [F], STDtype.BF16, ctx))
+        self.wdn = TArc(Tensor.from_host(wdn^, [D, F], STDtype.BF16, ctx))
+        self.bdn = TArc(Tensor.from_host(bdn^, [D], STDtype.BF16, ctx))
+        self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.BF16, ctx))
+        self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.BF16, ctx))
 
 
 struct DoubleBlockWeights(Copyable, Movable):

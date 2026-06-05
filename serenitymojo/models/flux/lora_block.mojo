@@ -153,13 +153,13 @@ def flux_lora_fwd(
     var nb1 = Optional[Tensor](None)
     var t = linear(
         Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         nb1^, ctx,
     ).to_host(ctx)                                   # [M,rank] (upcast bf16→F32)
     var nb2 = Optional[Tensor](None)
     var dy = linear(
         Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
         nb2^, ctx,
     ).to_host(ctx)                                   # [M,out] (upcast bf16→F32)
     var out = List[Float32]()
@@ -204,7 +204,7 @@ def flux_lora_bwd(
     var nb_t = Optional[Tensor](None)
     var t = linear(
         Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         nb_t^, ctx,
     ).to_host(ctx)                                   # [M,rank]
     var d_dy = List[Float32]()
@@ -213,7 +213,7 @@ def flux_lora_bwd(
     var lbB = linear_backward(
         Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.BF16, ctx),
         Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
         M, lo.rank, lo.out_f, ctx,
     )
     var d_t = lbB.d_x.to_host(ctx)                   # [M,rank]
@@ -221,7 +221,7 @@ def flux_lora_bwd(
     var lbA = linear_backward(
         Tensor.from_host(d_t^, [M, lo.rank], STDtype.BF16, ctx),
         Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         M, lo.in_f, lo.rank, ctx,
     )
     var d_x_lo = lbA.d_x.to_host(ctx)                # [M,in_f]

@@ -33,9 +33,9 @@
 # of &mut Tensor). `flow_match_noise_target` builds two NEW tensors and returns
 # them in a Movable struct (multi-return for move-only types).
 #
-# Mojo 1.0.0b1, NVIDIA GPU. F32 device buffers; LayoutTensor flat-index kernels
-# built INLINE at each call site (a `def` helper cannot return a LayoutTensor —
-# origin inference — same discipline as optim.mojo / linalg_backward).
+# Mojo 1.0.0b1, NVIDIA GPU. Tensor storage dtype is preserved at the public
+# boundary; kernels load BF16/F16 as scalars, compute in F32, and store back to
+# the input storage dtype.
 
 from std.math import sqrt, log, cos, exp
 from std.gpu.host import DeviceContext
@@ -335,60 +335,97 @@ struct FlowMatchOut(Movable):
     var target: Tensor
 
 
-def _flow_match_kernel(
-    x_t: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    target: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    latent: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    noise: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _flow_match_kernel[dtype: DType](
+    x_t: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    target: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    latent: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    noise: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     sigma: Float32, n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var lat = latent[i]
-        var noi = noise[i]
+        var lat = rebind[Scalar[dtype]](latent[i]).cast[DType.float32]()
+        var noi = rebind[Scalar[dtype]](noise[i]).cast[DType.float32]()
         # x_t = (1 - sigma)*latent + sigma*noise
-        x_t[i] = rebind[x_t.element_type]((Float32(1.0) - sigma) * lat + sigma * noi)
+        x_t[i] = rebind[x_t.element_type](
+            ((Float32(1.0) - sigma) * lat + sigma * noi).cast[dtype]()
+        )
         # target = noise - latent
-        target[i] = rebind[target.element_type](noi - lat)
+        target[i] = rebind[target.element_type]((noi - lat).cast[dtype]())
 
 
 def flow_match_noise_target(
     latent: Tensor, sigma: Float32, noise: Tensor, ctx: DeviceContext
 ) raises -> FlowMatchOut:
-    """Build the flow-matching noised input and v-target (F32).
+    """Build the flow-matching noised input and v-target.
 
       x_t    = (1 - sigma)*latent + sigma*noise
       target = noise - latent
 
-    Matches train_qwenimage.rs:1093-1099 byte-for-byte (F32 affine + add/sub).
-    `latent` and `noise` must be F32 and the same numel. Returns two NEW
-    tensors with `latent`'s shape (move-only multi-return)."""
+    Matches train_qwenimage.rs:1093-1099 at the math level. Storage follows
+    `latent.dtype()`: BF16/F16 inputs do F32 scalar math inside the kernel and
+    write BF16/F16 outputs."""
     var n = latent.numel()
     if noise.numel() != n:
         raise Error("flow_match_noise_target: latent/noise numel mismatch")
-    if latent.dtype() != STDtype.F32 or noise.dtype() != STDtype.F32:
-        raise Error("flow_match_noise_target: latent/noise must be F32")
+    if latent.dtype() != noise.dtype():
+        raise Error("flow_match_noise_target: latent/noise dtype mismatch")
 
-    var x_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
-    var t_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    var storage_dtype = latent.dtype()
+    var dt = storage_dtype.to_mojo_dtype()
+    var x_buf = ctx.enqueue_create_buffer[DType.uint8](n * storage_dtype.byte_size())
+    var t_buf = ctx.enqueue_create_buffer[DType.uint8](n * storage_dtype.byte_size())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
 
-    var XT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var TG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        t_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var LAT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        latent.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var NOI = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        noise.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var grid = (n + _BLK - 1) // _BLK
-    ctx.enqueue_function[_flow_match_kernel, _flow_match_kernel](
-        XT, TG, LAT, NOI, sigma, n, grid_dim=grid, block_dim=_BLK
-    )
+    if dt == DType.float32:
+        var XT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var TG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            t_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var LAT = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            latent.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var NOI = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            noise.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[
+            _flow_match_kernel[DType.float32], _flow_match_kernel[DType.float32]
+        ](XT, TG, LAT, NOI, sigma, n, grid_dim=grid, block_dim=_BLK)
+    elif dt == DType.bfloat16:
+        var XT = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var TG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            t_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var LAT = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            latent.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var NOI = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            noise.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[
+            _flow_match_kernel[DType.bfloat16], _flow_match_kernel[DType.bfloat16]
+        ](XT, TG, LAT, NOI, sigma, n, grid_dim=grid, block_dim=_BLK)
+    else:
+        var XT = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var TG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            t_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var LAT = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            latent.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var NOI = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            noise.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[
+            _flow_match_kernel[DType.float16], _flow_match_kernel[DType.float16]
+        ](XT, TG, LAT, NOI, sigma, n, grid_dim=grid, block_dim=_BLK)
     ctx.synchronize()
 
     # Duplicate latent's shape into two fresh Lists (move-only Tensor needs an
@@ -400,23 +437,25 @@ def flow_match_noise_target(
         shape_xt.append(lshape[di])
         shape_tg.append(lshape[di])
     return FlowMatchOut(
-        Tensor(x_buf^, shape_xt^, STDtype.F32),
-        Tensor(t_buf^, shape_tg^, STDtype.F32),
+        Tensor(x_buf^, shape_xt^, storage_dtype),
+        Tensor(t_buf^, shape_tg^, storage_dtype),
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # T6.3 — EMA update:  shadow = decay*shadow + (1-decay)*live  (in place).
 # ─────────────────────────────────────────────────────────────────────────────
-def _ema_update_kernel(
-    shadow: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    live: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _ema_update_kernel[dtype: DType](
+    shadow: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    live: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     decay: Float32, n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var s = decay * shadow[i] + (Float32(1.0) - decay) * live[i]
-        shadow[i] = rebind[shadow.element_type](s)
+        var sv = rebind[Scalar[dtype]](shadow[i]).cast[DType.float32]()
+        var lv = rebind[Scalar[dtype]](live[i]).cast[DType.float32]()
+        var s = decay * sv + (Float32(1.0) - decay) * lv
+        shadow[i] = rebind[shadow.element_type](s.cast[dtype]())
 
 
 def ema_update(mut shadow: Tensor, live: Tensor, decay: Float32, ctx: DeviceContext) raises:
@@ -424,37 +463,63 @@ def ema_update(mut shadow: Tensor, live: Tensor, decay: Float32, ctx: DeviceCont
 
     Matches ema.rs / ParameterEma: decay=0.999, shadow=1.0, live=2.0 -> 1.001
     (the hand-checked single step). `shadow` is mutated; `live` is read-only.
-    Both must be F32 and same numel."""
+    Both tensors must have the same storage dtype and numel. F32 shadow/master
+    EMA remains supported; BF16/F16 shadows no longer route through a full F32
+    device copy."""
     var n = shadow.numel()
     if live.numel() != n:
         raise Error("ema_update: shadow/live numel mismatch")
-    if shadow.dtype() != STDtype.F32 or live.dtype() != STDtype.F32:
-        raise Error("ema_update: shadow/live must be F32")
+    if shadow.dtype() != live.dtype():
+        raise Error("ema_update: shadow/live dtype mismatch")
+    var dt = shadow.dtype().to_mojo_dtype()
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        shadow.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var LV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        live.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var grid = (n + _BLK - 1) // _BLK
-    ctx.enqueue_function[_ema_update_kernel, _ema_update_kernel](
-        SH, LV, decay, n, grid_dim=grid, block_dim=_BLK
-    )
+    if dt == DType.float32:
+        var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            shadow.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var LV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            live.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[
+            _ema_update_kernel[DType.float32], _ema_update_kernel[DType.float32]
+        ](SH, LV, decay, n, grid_dim=grid, block_dim=_BLK)
+    elif dt == DType.bfloat16:
+        var SH = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            shadow.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var LV = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            live.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[
+            _ema_update_kernel[DType.bfloat16], _ema_update_kernel[DType.bfloat16]
+        ](SH, LV, decay, n, grid_dim=grid, block_dim=_BLK)
+    else:
+        var SH = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            shadow.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var LV = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            live.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[
+            _ema_update_kernel[DType.float16], _ema_update_kernel[DType.float16]
+        ](SH, LV, decay, n, grid_dim=grid, block_dim=_BLK)
     ctx.synchronize()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # T6.4 — Gradient accumulation:  acc += new_grad  (in place, micro-batching).
 # ─────────────────────────────────────────────────────────────────────────────
-def _grad_accum_kernel(
-    acc: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    new_grad: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _grad_accum_kernel[dtype: DType](
+    acc: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    new_grad: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        acc[i] = rebind[acc.element_type](acc[i] + new_grad[i])
+        var av = rebind[Scalar[dtype]](acc[i]).cast[DType.float32]()
+        var gv = rebind[Scalar[dtype]](new_grad[i]).cast[DType.float32]()
+        acc[i] = rebind[acc.element_type]((av + gv).cast[dtype]())
 
 
 def grad_accumulate(mut acc: Tensor, new_grad: Tensor, ctx: DeviceContext) raises:
@@ -462,22 +527,45 @@ def grad_accumulate(mut acc: Tensor, new_grad: Tensor, ctx: DeviceContext) raise
 
     For micro-batch gradient accumulation: zero `acc` once, then call this per
     micro-step; divide by the accumulation count (or pre-scale grads) before the
-    optimizer step, per the trainer's accumulation policy. Both tensors F32 and
-    same numel; `acc` is mutated, `new_grad` is read-only."""
+    optimizer step, per the trainer's accumulation policy. Both tensors must
+    have the same storage dtype and numel; `acc` is mutated, `new_grad` is
+    read-only."""
     var n = acc.numel()
     if new_grad.numel() != n:
         raise Error("grad_accumulate: acc/new_grad numel mismatch")
-    if acc.dtype() != STDtype.F32 or new_grad.dtype() != STDtype.F32:
-        raise Error("grad_accumulate: acc/new_grad must be F32")
+    if acc.dtype() != new_grad.dtype():
+        raise Error("grad_accumulate: acc/new_grad dtype mismatch")
+    var dt = acc.dtype().to_mojo_dtype()
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var ACC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        acc.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var NG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        new_grad.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var grid = (n + _BLK - 1) // _BLK
-    ctx.enqueue_function[_grad_accum_kernel, _grad_accum_kernel](
-        ACC, NG, n, grid_dim=grid, block_dim=_BLK
-    )
+    if dt == DType.float32:
+        var ACC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            acc.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var NG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            new_grad.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[
+            _grad_accum_kernel[DType.float32], _grad_accum_kernel[DType.float32]
+        ](ACC, NG, n, grid_dim=grid, block_dim=_BLK)
+    elif dt == DType.bfloat16:
+        var ACC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            acc.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var NG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            new_grad.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[
+            _grad_accum_kernel[DType.bfloat16], _grad_accum_kernel[DType.bfloat16]
+        ](ACC, NG, n, grid_dim=grid, block_dim=_BLK)
+    else:
+        var ACC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            acc.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var NG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            new_grad.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[
+            _grad_accum_kernel[DType.float16], _grad_accum_kernel[DType.float16]
+        ](ACC, NG, n, grid_dim=grid, block_dim=_BLK)
     ctx.synchronize()

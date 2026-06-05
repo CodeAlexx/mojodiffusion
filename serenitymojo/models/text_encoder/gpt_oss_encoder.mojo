@@ -43,7 +43,7 @@
 # Mojo 1.0.0b1, NVIDIA GPU. BF16 storage, F32 accumulation in foundation ops.
 
 from std.math import cos as fcos, sin as fsin, log as flog, ldexp
-from std.memory import ArcPointer
+from std.memory import ArcPointer, stack_allocation
 from std.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
@@ -56,13 +56,19 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.rope import rope_halfsplit
 from serenitymojo.ops.linear import linear
-from serenitymojo.ops.tensor_algebra import add as t_add, mul as t_mul, slice as t_slice
+from serenitymojo.ops.tensor_algebra import (
+    add as t_add,
+    gather_rows,
+    mul as t_mul,
+    slice as t_slice,
+)
 from serenitymojo.ops.moe import top_k_router, gated_scatter_add, RouterPlan
 from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
+comptime _SDPA_DH_MAX = 128
 # FP4 e2m1 lookup table (transformers integrations/mxfp4.py FP4_VALUES).
 comptime _FP4_LUT = SIMD[DType.float32, 16](
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -387,23 +393,24 @@ def _gptoss_act_kernel_bf16(
     o[idx] = rebind[o.element_type](act.cast[DType.bfloat16]())
 
 
-# ── SDPA with attention sinks (math mode, F32). ─────────────────────────────
-# q,k,v are BSHD [1, S, H, Dh] (k,v already GQA-expanded to H). mask is additive
-# [H, S, S] (0 attend, large-neg masked). sinks [H] is one extra logit per head
-# appended to the K axis BEFORE softmax, then dropped after. scale = 1/sqrt(Dh).
-# Output BSHD [1, S, H, Dh]. One thread per (head, query) row computes the full
-# softmax over [S sink-augmented scores] and the weighted V sum.
-def _sdpa_sinks_kernel(
-    q: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    k: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    v: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    mask: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    sinks: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+# ── SDPA with attention sinks. Storage stays q/k/v dtype; score/value math F32.
+# q,k,v are BSHD [1, S, H, Dh] (k,v already GQA-expanded to H). sinks [H] is
+# one extra logit per head appended to the K axis BEFORE softmax, then dropped
+# after. Causal/sliding masking is scalar control in-kernel, not a tensor
+# boundary. Output BSHD [1, S, H, Dh].
+def _sdpa_sinks_kernel[dtype: DType](
+    q: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    k: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    v: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    sinks: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     seq: Int,
     h: Int,
     dh: Int,
     scale: Float32,
+    real_len: Int,
+    sliding: Int,
+    window: Int,
 ):
     var idx = Int(global_idx.x)
     var total = h * seq
@@ -413,55 +420,70 @@ def _sdpa_sinks_kernel(
     var head = idx // seq
     # q row offset in BSHD: [1, S, H, Dh] -> (qi*h + head)*dh
     var q_base = (qi * h + head) * dh
+    var qreg = stack_allocation[_SDPA_DH_MAX, Scalar[DType.float32]]()
+    for d in range(dh):
+        qreg[d] = rebind[Scalar[dtype]](q[q_base + d]).cast[DType.float32]()
     # First pass: max over scores (incl sink).
-    var sink_logit = rebind[Scalar[DType.float32]](sinks[head])
+    var sink_logit = rebind[Scalar[dtype]](sinks[head]).cast[DType.float32]()
     var m = sink_logit
     for kj in range(seq):
-        var k_base = (kj * h + head) * dh
-        var dot = Float32(0.0)
-        for d in range(dh):
-            dot += rebind[Scalar[DType.float32]](q[q_base + d]) * rebind[
-                Scalar[DType.float32]
-            ](k[k_base + d])
-        var score = dot * scale + rebind[Scalar[DType.float32]](
-            mask[(head * seq + qi) * seq + kj]
-        )
+        var keep = (kj <= qi) and (kj < real_len)
+        if keep and sliding != 0:
+            if (qi - kj) >= window:
+                keep = False
+        var score = Float32(-1.0e9)
+        if keep:
+            var k_base = (kj * h + head) * dh
+            var dot = Float32(0.0)
+            for d in range(dh):
+                dot += qreg[d] * rebind[Scalar[dtype]](
+                    k[k_base + d]
+                ).cast[DType.float32]()
+            score = dot * scale
         if score > m:
             m = score
     # Second pass: denom.
     var denom = fexp(sink_logit - m)
     for kj in range(seq):
-        var k_base = (kj * h + head) * dh
-        var dot = Float32(0.0)
-        for d in range(dh):
-            dot += rebind[Scalar[DType.float32]](q[q_base + d]) * rebind[
-                Scalar[DType.float32]
-            ](k[k_base + d])
-        var score = dot * scale + rebind[Scalar[DType.float32]](
-            mask[(head * seq + qi) * seq + kj]
-        )
-        denom += fexp(score - m)
-    # Third pass: weighted V sum (sink contributes 0 to V).
+        var keep = (kj <= qi) and (kj < real_len)
+        if keep and sliding != 0:
+            if (qi - kj) >= window:
+                keep = False
+        if keep:
+            var k_base = (kj * h + head) * dh
+            var dot = Float32(0.0)
+            for d in range(dh):
+                dot += qreg[d] * rebind[Scalar[dtype]](
+                    k[k_base + d]
+                ).cast[DType.float32]()
+            var score = dot * scale
+            denom += fexp(score - m)
+    # Third pass: weighted V sum in private F32 registers (sink contributes 0).
     var o_base = (qi * h + head) * dh
+    var acc = stack_allocation[_SDPA_DH_MAX, Scalar[DType.float32]]()
     for d in range(dh):
-        o[o_base + d] = rebind[o.element_type](Float32(0.0))
+        acc[d] = 0.0
     for kj in range(seq):
-        var k_base = (kj * h + head) * dh
-        var dot = Float32(0.0)
-        for d in range(dh):
-            dot += rebind[Scalar[DType.float32]](q[q_base + d]) * rebind[
-                Scalar[DType.float32]
-            ](k[k_base + d])
-        var score = dot * scale + rebind[Scalar[DType.float32]](
-            mask[(head * seq + qi) * seq + kj]
-        )
-        var w = fexp(score - m) / denom
-        var v_base = (kj * h + head) * dh
-        for d in range(dh):
-            var prev = rebind[Scalar[DType.float32]](o[o_base + d])
-            o[o_base + d] = rebind[o.element_type](
-                prev + w * rebind[Scalar[DType.float32]](v[v_base + d])
-            )
+        var keep = (kj <= qi) and (kj < real_len)
+        if keep and sliding != 0:
+            if (qi - kj) >= window:
+                keep = False
+        if keep:
+            var k_base = (kj * h + head) * dh
+            var dot = Float32(0.0)
+            for d in range(dh):
+                dot += qreg[d] * rebind[Scalar[dtype]](
+                    k[k_base + d]
+                ).cast[DType.float32]()
+            var score = dot * scale
+            var w = fexp(score - m) / denom
+            var v_base = (kj * h + head) * dh
+            for d in range(dh):
+                acc[d] += w * rebind[Scalar[dtype]](
+                    v[v_base + d]
+                ).cast[DType.float32]()
+    for d in range(dh):
+        o[o_base + d] = rebind[o.element_type](acc[d].cast[dtype]())
 
 
 # ── host-side dispatch helpers ──────────────────────────────────────────────
@@ -564,61 +586,111 @@ def _repeat_kv(var x: Tensor, h: Int, h_kv: Int, ctx: DeviceContext) raises -> T
 
 
 def _sdpa_with_sinks(
-    q: Tensor,  # BSHD [1,S,H,Dh] BF16
-    k: Tensor,  # BSHD [1,S,H,Dh] BF16 (GQA-expanded)
-    v: Tensor,  # BSHD [1,S,H,Dh] BF16
-    mask_f32: List[Float32],  # additive [H,S,S]
-    sinks_f32: List[Float32],  # [H]
+    q: Tensor,  # BSHD [1,S,H,Dh]
+    k: Tensor,  # BSHD [1,S,H,Dh] (GQA-expanded)
+    v: Tensor,  # BSHD [1,S,H,Dh]
+    sinks: Tensor,  # [H], q dtype
     seq: Int,
     h: Int,
     dh: Int,
     scale: Float32,
+    real_len: Int,
+    sliding: Bool,
+    window: Int,
     ctx: DeviceContext,
 ) raises -> Tensor:
     """Math-mode SDPA with per-head attention sinks. Returns BSHD [1,S,H,Dh]
-    BF16. Interior math F32; q/k/v are cast BF16->F32 ON-DEVICE (no host bounce)
-    so the per-layer streaming is not defeated by a host sync."""
-    # Cast q/k/v BF16->F32 on-device. Buffers stay row-major BSHD; the kernel
-    # reads them flat as [n], so the shape is irrelevant beyond numel.
-    var n = seq * h * dh
-    var qT = cast_tensor(q, STDtype.F32, ctx)
-    var kT = cast_tensor(k, STDtype.F32, ctx)
-    var vT = cast_tensor(v, STDtype.F32, ctx)
-    # mask/sinks are host-built F32 -> single H2D upload (no D2H round-trip).
-    var mT = Tensor.from_host(mask_f32, [h * seq * seq], STDtype.F32, ctx)
-    var sT = Tensor.from_host(sinks_f32, [h], STDtype.F32, ctx)
+    in q's storage dtype. Interior score/value math is F32."""
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype():
+        raise Error("sdpa_with_sinks: q/k/v dtype mismatch")
+    if sinks.dtype() != q.dtype():
+        raise Error("sdpa_with_sinks: sinks dtype must match q dtype")
+    if dh > _SDPA_DH_MAX:
+        raise Error("sdpa_with_sinks: head_dim exceeds scratch limit")
+    if sinks.numel() != h:
+        raise Error("sdpa_with_sinks: sinks length != num_heads")
 
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    var n = seq * h * dh
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n * q.dtype().byte_size()
+    )
     var n_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var m_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](h * seq * seq))
     var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](h))
-    var Q = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        qT.buf.unsafe_ptr().bitcast[Float32](), n_rl
-    )
-    var K = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        kT.buf.unsafe_ptr().bitcast[Float32](), n_rl
-    )
-    var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        vT.buf.unsafe_ptr().bitcast[Float32](), n_rl
-    )
-    var M = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        mT.buf.unsafe_ptr().bitcast[Float32](), m_rl
-    )
-    var SK = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        sT.buf.unsafe_ptr().bitcast[Float32](), s_rl
-    )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), n_rl
-    )
     var total = h * seq
     var grid = (total + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_sdpa_sinks_kernel, _sdpa_sinks_kernel](
-        Q, K, V, M, SK, O, seq, h, dh, scale, grid_dim=grid, block_dim=_BLOCK
-    )
+    var do_sliding = 1 if sliding else 0
+    var dt = q.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var Q = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float32](), n_rl
+        )
+        var K = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float32](), n_rl
+        )
+        var V = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float32](), n_rl
+        )
+        var SK = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            sinks.buf.unsafe_ptr().bitcast[Float32](), s_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), n_rl
+        )
+        ctx.enqueue_function[
+            _sdpa_sinks_kernel[DType.float32],
+            _sdpa_sinks_kernel[DType.float32],
+        ](
+            Q, K, V, SK, O, seq, h, dh, scale, real_len, do_sliding, window,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    elif dt == DType.bfloat16:
+        var Q = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[BFloat16](), n_rl
+        )
+        var K = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[BFloat16](), n_rl
+        )
+        var V = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[BFloat16](), n_rl
+        )
+        var SK = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            sinks.buf.unsafe_ptr().bitcast[BFloat16](), s_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), n_rl
+        )
+        ctx.enqueue_function[
+            _sdpa_sinks_kernel[DType.bfloat16],
+            _sdpa_sinks_kernel[DType.bfloat16],
+        ](
+            Q, K, V, SK, O, seq, h, dh, scale, real_len, do_sliding, window,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
+    else:
+        var Q = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float16](), n_rl
+        )
+        var K = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float16](), n_rl
+        )
+        var V = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float16](), n_rl
+        )
+        var SK = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            sinks.buf.unsafe_ptr().bitcast[Float16](), s_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), n_rl
+        )
+        ctx.enqueue_function[
+            _sdpa_sinks_kernel[DType.float16],
+            _sdpa_sinks_kernel[DType.float16],
+        ](
+            Q, K, V, SK, O, seq, h, dh, scale, real_len, do_sliding, window,
+            grid_dim=grid, block_dim=_BLOCK,
+        )
     ctx.synchronize()
-    var out_f32 = Tensor(out_buf^, [1, seq, h, dh], STDtype.F32)
-    # cast back to BF16 ON-DEVICE to match the BF16 forward dtype flow.
-    return cast_tensor(out_f32, STDtype.BF16, ctx)
+    return Tensor(out_buf^, [1, seq, h, dh], q.dtype())
 
 
 def _embed(
@@ -653,28 +725,6 @@ def _embed(
     )
     ctx.synchronize()
     return Tensor(out_buf^, [1, seq, hidden], STDtype.BF16)
-
-
-# Additive mask [H, S, S] for the layer's attention type.
-#   sliding (window w): row qi attends kj iff (kj <= qi) and (qi - kj < w) and kj<real_len
-#   full:               row qi attends kj iff (kj <= qi) and kj<real_len
-def _build_mask(
-    seq: Int, h: Int, real_len: Int, sliding: Bool, window: Int
-) raises -> List[Float32]:
-    var neg = Float32(-1.0e9)
-    var data = List[Float32]()
-    for _hh in range(h):
-        for qi in range(seq):
-            for kj in range(seq):
-                var keep = (kj <= qi) and (kj < real_len)
-                if keep and sliding:
-                    if (qi - kj) >= window:
-                        keep = False
-                if keep:
-                    data.append(Float32(0.0))
-                else:
-                    data.append(neg)
-    return data^
 
 
 # ── one layer's weight block (streamed) ─────────────────────────────────────
@@ -743,7 +793,7 @@ struct GptOssEncoder:
         sin_q: Tensor,
         cos_k: Tensor,
         sin_k: Tensor,
-        mask_f32: List[Float32],
+        real_len: Int,
         seq: Int,
         ctx: DeviceContext,
     ) raises -> Tensor:
@@ -775,12 +825,18 @@ struct GptOssEncoder:
         var k_rep = _repeat_kv(k^, h, h_kv, ctx)
         var v_rep = _repeat_kv(v^, h, h_kv, ctx)
 
-        # sinks [H] -> host F32.
+        # Sinks are a checkpoint tensor boundary. Keep them in q storage dtype;
+        # only scalar reads cast to F32 inside the SDPA kernel.
         ref sinks_w = self._bw(block, p + "sinks")
-        var sinks_f32 = sinks_w.to_host(ctx)
+        var sinks_q: Tensor
+        if sinks_w.dtype() == q.dtype():
+            sinks_q = _clone(sinks_w, ctx)
+        else:
+            sinks_q = cast_tensor(_clone(sinks_w, ctx), q.dtype(), ctx)
 
         var attn = _sdpa_with_sinks(
-            q, k_rep, v_rep, mask_f32, sinks_f32, seq, h, dh, scale, ctx
+            q, k_rep, v_rep, sinks_q, seq, h, dh, scale,
+            real_len, _is_sliding(layer_idx), cfg.sliding_window, ctx,
         )
         attn = _reshape(attn, [1, seq, h * dh], ctx)
 
@@ -823,20 +879,21 @@ struct GptOssEncoder:
 
         var two_inter = 2 * inter
 
-        # Accumulator [T, hidden] F32 (gated_scatter_add expects F32 accum).
-        var accum_host = List[Float32]()
-        for _i in range(t * hidden):
-            accum_host.append(Float32(0.0))
-        var accum = Tensor.from_host(accum_host, [t, hidden], STDtype.F32, ctx)
+        # Accumulator [T, hidden] in model storage dtype. gated_scatter_add uses
+        # private F32 atomic scratch for BF16 and writes back before returning.
+        var storage = x2.dtype()
+        var acc_buf = ctx.enqueue_create_buffer[DType.uint8](
+            t * hidden * storage.byte_size()
+        )
+        ctx.enqueue_memset[DType.uint8](acc_buf, 0)
+        ctx.synchronize()
+        var accum = Tensor(acc_buf^, [t, hidden], storage)
 
         # Process each expert: gather its routed tokens, run FFN, scatter.
         # We loop experts (mirrors the Rust looped-expert semantics) and reuse
         # the slot-based router plan: a slot s (token-major, t*k+j) routes
         # plan.expert_ids[s] with gating plan.gating[s].
         var n_slots = len(plan.expert_ids)
-        # Host copy of the MoE input rows [t*hidden]: invariant across experts,
-        # so download ONCE here instead of per-expert (was 32 D2H copies/layer).
-        var x_rows_host = x2.to_host(ctx)
         for ei in range(e):
             # Collect tokens routed to expert ei (by source token index) and
             # their slots for scatter.
@@ -864,16 +921,8 @@ struct GptOssEncoder:
             dn_sc_e = _reshape(dn_sc_e, [hidden, inter // 32], ctx)
             var down_w = _mxfp4_dequant_expert(dn_blk_e, dn_sc_e, ctx)  # [hidden, inter]
 
-            # Gather this expert's input rows [ntok, hidden] from x2 (host copy
-            # hoisted above the loop).
-            var gathered_host = List[Float32]()
-            for r in range(ntok):
-                var tr = tok_rows[r]
-                for j in range(hidden):
-                    gathered_host.append(x_rows_host[tr * hidden + j])
-            var xe = Tensor.from_host(
-                gathered_host, [ntok, hidden], STDtype.BF16, ctx
-            )
+            # Gather this expert's input rows [ntok, hidden] from x2 on device.
+            var xe = gather_rows(x2, tok_rows, ctx)
 
             # gate_up = xe @ gate_up_w^T + bias  ([ntok, 2*inter]).
             var gu_bias_e = t_slice(gu_bias, 0, ei, 1, ctx)  # [1, 5760]
@@ -891,9 +940,6 @@ struct GptOssEncoder:
             dn_bias_e = _reshape(dn_bias_e, [hidden], ctx)
             var down_out = linear(act, down_w, None, ctx)
             down_out = _add_row_bias(down_out, dn_bias_e, ctx)
-            # gated_scatter_add requires F32 expert_out (accum is F32); the MoE
-            # accumulation is F32 by design. Cast the BF16 down-projection up.
-            down_out = cast_tensor(down_out, STDtype.F32, ctx)
 
             # Weighted scatter-add into accum: accum[tok_rows[r]] +=
             #   down_out[r] * gating[slot]. Use the foundation gated_scatter_add
@@ -905,9 +951,7 @@ struct GptOssEncoder:
                 idx_e.append(tok_rows[r])
             gated_scatter_add(down_out, gating_e, idx_e, accum, ctx)
 
-        # accum F32 [T, hidden] -> BF16 [1, S, hidden].
-        var accum_host_out = accum.to_host(ctx)
-        return Tensor.from_host(accum_host_out, [1, seq, hidden], STDtype.BF16, ctx)
+        return _reshape(accum, [1, seq, hidden], ctx)
 
     def _layer(
         self,
@@ -918,7 +962,7 @@ struct GptOssEncoder:
         sin_q: Tensor,
         cos_k: Tensor,
         sin_k: Tensor,
-        mask_f32: List[Float32],
+        real_len: Int,
         seq: Int,
         ctx: DeviceContext,
     ) raises -> Tensor:
@@ -929,7 +973,8 @@ struct GptOssEncoder:
         ref pre_w = self._bw(block, p + "input_layernorm.weight")
         var normed = rms_norm(hidden_in, pre_w, eps, ctx)
         var attn_out = self._attention(
-            block, layer_idx, normed, cos_q, sin_q, cos_k, sin_k, mask_f32, seq, ctx
+            block, layer_idx, normed, cos_q, sin_q, cos_k, sin_k,
+            real_len, seq, ctx,
         )
         var h1 = t_add(hidden_in, attn_out, ctx)
 
@@ -995,12 +1040,6 @@ struct GptOssEncoder:
         var cos_k = Tensor.from_host(k_tab[0], [seq * h_kv * half], STDtype.BF16, ctx)
         var sin_k = Tensor.from_host(k_tab[1], [seq * h_kv * half], STDtype.BF16, ctx)
 
-        # Masks (full + sliding) built once; selected per layer.
-        var full_mask = _build_mask(seq, h, real_len, False, cfg.sliding_window)
-        var sliding_mask = _build_mask(
-            seq, h, real_len, True, cfg.sliding_window
-        )
-
         # Embedding: load table, gather, then free table.
         var emb_tv = self.sharded.tensor_view(String("model.embed_tokens.weight"))
         var emb_table = Tensor.from_view(emb_tv, ctx)
@@ -1013,16 +1052,10 @@ struct GptOssEncoder:
 
         for li in range(max_layer + 1):
             var block = self._load_layer(li, ctx)
-            if _is_sliding(li):
-                hidden_state = self._layer(
-                    block, li, hidden_state, cos_q, sin_q, cos_k, sin_k,
-                    sliding_mask, seq, ctx
-                )
-            else:
-                hidden_state = self._layer(
-                    block, li, hidden_state, cos_q, sin_q, cos_k, sin_k,
-                    full_mask, seq, ctx
-                )
+            hidden_state = self._layer(
+                block, li, hidden_state, cos_q, sin_q, cos_k, sin_k,
+                real_len, seq, ctx,
+            )
             # capture if requested.
             for j in range(len(sorted_layers)):
                 if sorted_layers[j] == li:

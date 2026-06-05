@@ -163,14 +163,14 @@ def _st_has(st: ShardedSafeTensors, name: String) -> Bool:
     return False
 
 
-def _load_global_f32(
+def _load_global_bf16(
     st: ShardedSafeTensors, name: String, ctx: DeviceContext
 ) raises -> Tensor:
     var key = String("model.diffusion_model.") + name
     if not _st_has(st, key):
         key = name
     var tv = st.tensor_view(key)
-    return cast_tensor(Tensor.from_view_as_bf16(tv, ctx), STDtype.F32, ctx)
+    return Tensor.from_view_as_bf16(tv, ctx)
 
 
 def _load_global_weights_dict(
@@ -198,14 +198,14 @@ def _load_global_weights_dict(
     adaln_families.append(String("av_ca_a2v_gate_adaln_single"))
     adaln_families.append(String("av_ca_v2a_gate_adaln_single"))
     for ref fam in patch_keys:
-        gw[fam] = ArcPointer[Tensor](_load_global_f32(st, fam, ctx))
+        gw[fam] = ArcPointer[Tensor](_load_global_bf16(st, fam, ctx))
     for ref fam in adaln_families:
         var k1 = fam + ".emb.timestep_embedder.linear_1.weight"
         var k2 = fam + ".emb.timestep_embedder.linear_2.weight"
         var k3 = fam + ".linear.weight"
-        gw[k1] = ArcPointer[Tensor](_load_global_f32(st, k1, ctx))
-        gw[k2] = ArcPointer[Tensor](_load_global_f32(st, k2, ctx))
-        gw[k3] = ArcPointer[Tensor](_load_global_f32(st, k3, ctx))
+        gw[k1] = ArcPointer[Tensor](_load_global_bf16(st, k1, ctx))
+        gw[k2] = ArcPointer[Tensor](_load_global_bf16(st, k2, ctx))
+        gw[k3] = ArcPointer[Tensor](_load_global_bf16(st, k3, ctx))
     return gw^
 
 
@@ -246,7 +246,8 @@ def _stats(name: String, t: Tensor, ctx: DeviceContext) raises -> Bool:
 
 # ── sinusoidal timestep embedding (diffusers get_timestep_embedding,
 #    flip_sin_to_cos=True, shift=0) — built on host for a [N] timestep vector.
-#    Returns [N, 256] F32 device tensor. (scripts/...ref.py timestep_embedding) ──
+#    Returns [N, 256] BF16 device tensor; scalar construction is F32/F64 host
+#    math, but the runtime tensor boundary follows the model storage dtype. ──
 def _timestep_embedding(ts: List[Float32], dim: Int, ctx: DeviceContext) raises -> Tensor:
     var n = len(ts)
     var half = dim // 2
@@ -259,7 +260,7 @@ def _timestep_embedding(ts: List[Float32], dim: Int, ctx: DeviceContext) raises 
             var arg = t * freq
             out[r * dim + i] = Float32(fcos(arg))          # cos first
             out[r * dim + half + i] = Float32(fsin(arg))   # then sin
-    return Tensor.from_host(out, _sh2(n, dim), STDtype.F32, ctx)
+    return Tensor.from_host(out, _sh2(n, dim), STDtype.BF16, ctx)
 
 
 # ── AdaLayerNormSingle.forward (ltx2_model.rs:574-582) ──
@@ -276,26 +277,26 @@ def _adaln_single(
     ts_vals: List[Float32],
     ctx: DeviceContext,
 ) raises -> Tuple[Tensor, Tensor]:
-    var emb = _timestep_embedding(ts_vals, 256, ctx)  # [N,256] F32
+    var emb = _timestep_embedding(ts_vals, 256, ctx)  # [N,256] BF16
     # Weight tensors come from the pre-loaded (LoRA-applied) global dict;
     # _clone gives an owned copy so _linear_b can consume them.
     var w1 = _clone(gw[base + ".emb.timestep_embedder.linear_1.weight"][], ctx)
-    var b1 = _load_global_f32(st, base + ".emb.timestep_embedder.linear_1.bias", ctx)
+    var b1 = _load_global_bf16(st, base + ".emb.timestep_embedder.linear_1.bias", ctx)
     var h = _linear_b(emb, w1, b1, ctx)
     h = silu(h, ctx)
     var w2 = _clone(gw[base + ".emb.timestep_embedder.linear_2.weight"][], ctx)
-    var b2 = _load_global_f32(st, base + ".emb.timestep_embedder.linear_2.bias", ctx)
+    var b2 = _load_global_bf16(st, base + ".emb.timestep_embedder.linear_2.bias", ctx)
     var embedded = _linear_b(h, w2, b2, ctx)  # [N,dim]
     var h2 = silu(embedded, ctx)
     var lw = _clone(gw[base + ".linear.weight"][], ctx)
-    var lb = _load_global_f32(st, base + ".linear.bias", ctx)
+    var lb = _load_global_bf16(st, base + ".linear.bias", ctx)
     var mod = _linear_b(h2, lw, lb, ctx)      # [N, n*dim]
     return (mod^, embedded^)
 
 
 # ── RoPE: port of compute_rope_frequencies for general coords.
 #    coords_host is [num_pos_dims, P, 2] (start,end) F64. Returns the table in
-#    (s,h) row order [P*num_heads, head_dim/2] F32, ready for apply_ltx2_rope. ──
+#    (s,h) row order [P*num_heads, head_dim/2] BF16, ready for apply_ltx2_rope. ──
 def _compute_rope(
     coords: List[Float64],   # [num_pos_dims * P * 2] row-major [d,p,2]
     num_pos_dims: Int,
@@ -359,8 +360,8 @@ def _compute_rope(
                 cos_rows.append(cos_tok[src + j])
                 sin_rows.append(sin_tok[src + j])
     var sh = _sh2(P * num_heads, half_head)
-    var cos_t = Tensor.from_host(cos_rows, sh.copy(), STDtype.F32, ctx)
-    var sin_t = Tensor.from_host(sin_rows, sh^, STDtype.F32, ctx)
+    var cos_t = Tensor.from_host(cos_rows, sh.copy(), STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin_rows, sh^, STDtype.BF16, ctx)
     return (cos_t^, sin_t^)
 
 
@@ -460,8 +461,8 @@ def _output_stage(
     var ones = List[Float32](); var zeros = List[Float32]()
     for _ in range(dim):
         ones.append(Float32(1.0)); zeros.append(Float32(0.0))
-    var w_ln = Tensor.from_host(ones, _sh1d(dim), STDtype.F32, ctx)
-    var b_ln = Tensor.from_host(zeros, _sh1d(dim), STDtype.F32, ctx)
+    var w_ln = Tensor.from_host(ones, _sh1d(dim), hs.dtype(), ctx)
+    var b_ln = Tensor.from_host(zeros, _sh1d(dim), hs.dtype(), ctx)
     var normed = layer_norm(hs, w_ln, b_ln, EPS, ctx)
     var shift_row = reshape(slice(sst, 0, 0, 1, ctx), _sh3(1, 1, dim), ctx)
     var scale_row = reshape(slice(sst, 0, 1, 1, ctx), _sh3(1, 1, dim), ctx)
@@ -567,7 +568,7 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
         print("  [lora] loaded", lora.num_mappings(),
               "mappings (", lora.format_name(), ")")
 
-    # ── globals (proj_in/proj_out, scale_shift tables) — F32 ──
+    # ── globals (proj_in/proj_out, scale_shift tables) — BF16 storage ──
     # Pre-load the 28 global LoRA target weights into a resident dict so global
     # LoRA deltas can be applied once before the loop.  The patchify/proj_out
     # weights used in _Globals and the adaln MLP weights used in _build_mod are
@@ -579,19 +580,19 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
         print("  [lora] global deltas applied (one-time additive):", n_global)
     var g = _Globals(
         _clone(gw[String("patchify_proj.weight")][], ctx),
-        _load_global_f32(ck, "patchify_proj.bias", ctx),
+        _load_global_bf16(ck, "patchify_proj.bias", ctx),
         _clone(gw[String("audio_patchify_proj.weight")][], ctx),
-        _load_global_f32(ck, "audio_patchify_proj.bias", ctx),
+        _load_global_bf16(ck, "audio_patchify_proj.bias", ctx),
         _clone(gw[String("proj_out.weight")][], ctx),
-        _load_global_f32(ck, "proj_out.bias", ctx),
+        _load_global_bf16(ck, "proj_out.bias", ctx),
         _clone(gw[String("audio_proj_out.weight")][], ctx),
-        _load_global_f32(ck, "audio_proj_out.bias", ctx),
-        _load_global_f32(ck, "scale_shift_table", ctx),
-        _load_global_f32(ck, "audio_scale_shift_table", ctx),
+        _load_global_bf16(ck, "audio_proj_out.bias", ctx),
+        _load_global_bf16(ck, "scale_shift_table", ctx),
+        _load_global_bf16(ck, "audio_scale_shift_table", ctx),
     )
 
     # ── contexts via connectors (run ONCE, sigma-independent) ──
-    print("  [connector] loading + running video/audio (F32)")
+    print("  [connector] loading + running video/audio")
     var v_conn = LTX2ConnectorWeights.load(
         String(CKPT_FP8), String("video_embeddings_connector"),
         LTX2ConnectorConfig.video(), ctx,
@@ -608,13 +609,11 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
     # padding head. The audio_context is the genuine independent 2048-dim Gemma
     # projection (NOT a slice of video) per the dump-proof in the header.
     var dump = ShardedSafeTensors.open(String(AUDIO_CTX_DUMP))
-    var vctx_full = cast_tensor(
-        Tensor.from_view_as_bf16(dump.tensor_view("video_context"), ctx),
-        STDtype.F32, ctx,
+    var vctx_full = Tensor.from_view_as_bf16(
+        dump.tensor_view("video_context"), ctx
     )  # [1,1024,4096]
-    var actx_full = cast_tensor(
-        Tensor.from_view_as_bf16(dump.tensor_view("audio_context"), ctx),
-        STDtype.F32, ctx,
+    var actx_full = Tensor.from_view_as_bf16(
+        dump.tensor_view("audio_context"), ctx
     )  # [1,1024,2048]
     var tail0 = 1024 - N_TXT
     var video_pre = slice(vctx_full, 1, tail0, N_TXT, ctx)  # [1,N_TXT,4096]
@@ -622,6 +621,8 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
     _ = _stats(String("video_pre(real)"), video_pre, ctx)
     _ = _stats(String("audio_pre(REAL feature_extract_and_project)"), audio_pre, ctx)
 
+    # Connector preserves BF16 hidden-state storage; kernels perform F32 internal
+    # math and return to the input dtype.
     var enc = ltx2_connector_forward[N_TXT, V_HEADS, V_HDIM](v_conn, video_pre, ctx)
     var aenc = ltx2_connector_forward[N_TXT, A_HEADS, A_HDIM](a_conn, audio_pre, ctx)
     _ = _stats(String("enc"), enc, ctx)
@@ -647,10 +648,13 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
     if stream.block_count() != NUM_LAYERS:
         raise Error("stream block_count != 48")
 
-    # ── init noise latents (Mojo randn; see RNG NOTE) ──
+    # ── init noise latents ──
     print("  [noise] init video + audio latents")
-    var video_x = randn(_sh5(1, 128, NF, NH, NW), SEED, STDtype.F32, ctx)
-    var audio_x = randn(_sh4(1, AUDIO_C, S_A, AUDIO_MEL), SEED + 1, STDtype.F32, ctx)
+    # rng-contract: mojo-native-not-pytorch-parity. LTX-2 Python uses
+    # torch.Generator + torch.randn(... dtype=latent.dtype); same-seed PyTorch
+    # parity requires oracle noise tensors or a proven matching RNG.
+    var video_x = randn(_sh5(1, 128, NF, NH, NW), SEED, STDtype.BF16, ctx)
+    var audio_x = randn(_sh4(1, AUDIO_C, S_A, AUDIO_MEL), SEED + 1, STDtype.BF16, ctx)
 
     # ── sampler (distilled 8 steps; the table tail IS the stage-2 sigmas) ──
     var sched = LTX2Scheduler.distilled()
@@ -682,15 +686,16 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
         # modulation (uses pre-loaded LoRA-applied global weights via gw)
         var mod = _build_mod(ck, gw, sigma, ctx)
 
-        # 48 streamed blocks (boundary BF16, inner FP8 dequant), all F32 compute
+        # 48 streamed blocks: BF16 storage boundaries, FP8 middle blocks
+        # dequantized to BF16; shared kernels do F32 internal accumulation.
         for i in range(NUM_LAYERS):
             var w: LTX2AVBlockWeights
             if _is_boundary(i):
-                w = LTX2AVBlockWeights.load(String(CKPT_FP8), i, cfg, ctx).to_f32(ctx)
+                w = LTX2AVBlockWeights.load(String(CKPT_FP8), i, cfg, ctx)
             else:
                 var blk = stream.load_block_bf16(i, ctx)
-                w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx).to_f32(ctx)
-            # AT-DEQUANT LoRA APPLY: add scale*(B@A) onto the F32 dequanted
+                w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx)
+            # AT-DEQUANT LoRA APPLY: add scale*(B@A) onto the BF16 dequanted
             # block linears for THIS stream (re-applied each step; never fused).
             if apply_lora:
                 _ = lora.apply_to_av_block(i, w, LORA_MULT, ctx)
@@ -768,11 +773,9 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
     var avae = LTX2AudioVaeDecoderWeights.load(String(CKPT_BF16), ctx)
     var audio_x_bf16 = cast_tensor(audio_x, STDtype.BF16, ctx)
     var mel_raw = decode_audio(avae, audio_x_bf16, ctx)  # [1,2,T_out,F_out]
-    # Vocoder's gated path is F32 (ltx2_vocoder_smoke loads mel via from_view_as_f32);
-    # the BF16 activation1d path has a dtype bug, so run the vocoder in F32.
-    var mel = cast_tensor(mel_raw, STDtype.F32, ctx)
+    var mel = mel_raw^
     var msh = mel.shape()
-    print("  mel NCHW: [", msh[0], ",", msh[1], ",", msh[2], ",", msh[3], "] dtype-cast F32")
+    print("  mel NCHW: [", msh[0], ",", msh[1], ",", msh[2], ",", msh[3], "]")
     _ = _stats(String("mel"), mel, ctx)
 
     var voc = LTX2VocoderWithBWE.from_file(String(CKPT_BF16), ctx)

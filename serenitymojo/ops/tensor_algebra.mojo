@@ -133,6 +133,16 @@ def _bcast_plan(ashape: List[Int], bshape: List[Int]) raises -> _BcastPlan:
     return _BcastPlan(oshape^, odims, astr, bstr, _MAXRANK, n)
 
 
+def _shape_debug(shape: List[Int]) -> String:
+    var out = String("[")
+    for i in range(len(shape)):
+        if i != 0:
+            out += String(",")
+        out += String(shape[i])
+    out += String("]")
+    return out^
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Elementwise binary, broadcast (tensor-tensor). One thread per OUTPUT element;
 # recover the output multi-index from the flat id, dot it with each operand's
@@ -247,7 +257,16 @@ def _ew_kernel_f16(
 def _binary(a: Tensor, b: Tensor, op: Int, ctx: DeviceContext) raises -> Tensor:
     """Shared launcher for add/sub/mul/div tensor-tensor (broadcast)."""
     if a.dtype() != b.dtype():
-        raise Error("elementwise: a/b dtype mismatch")
+        raise Error(
+            String("elementwise: a/b dtype mismatch a=")
+            + a.dtype().name()
+            + String(" shape=")
+            + _shape_debug(a.shape())
+            + String(" b=")
+            + b.dtype().name()
+            + String(" shape=")
+            + _shape_debug(b.shape())
+        )
     var plan = _bcast_plan(a.shape(), b.shape())
     var dt = a.dtype().to_mojo_dtype()
     var n = plan.numel
@@ -402,16 +421,16 @@ def _ews_kernel_f16(
         o[i] = rebind[o.element_type](rv.cast[DType.float16]())
 
 
-def _add_in_place_kernel_f32(
-    dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    src: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _add_in_place_kernel[dtype: DType](
+    dst: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    src: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     n: Int,
 ):
     var i = Int(global_idx.x)
     if i < n:
-        var dv = rebind[Scalar[DType.float32]](dst[i])
-        var sv = rebind[Scalar[DType.float32]](src[i])
-        dst[i] = rebind[dst.element_type](dv + sv)
+        var dv = rebind[Scalar[dtype]](dst[i]).cast[DType.float32]()
+        var sv = rebind[Scalar[dtype]](src[i]).cast[DType.float32]()
+        dst[i] = rebind[dst.element_type]((dv + sv).cast[dtype]())
 
 
 def _binary_scalar(
@@ -461,24 +480,52 @@ def add_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:
     return _binary_scalar(a, s, _OP_ADD, ctx)
 
 
-def add_in_place_f32(dst: Tensor, src: Tensor, ctx: DeviceContext) raises:
-    """In-place dst += src for F32 tensors with identical element counts."""
-    if dst.dtype() != STDtype.F32 or src.dtype() != STDtype.F32:
-        raise Error("add_in_place_f32: expected F32 tensors")
+def add_in_place(dst: Tensor, src: Tensor, ctx: DeviceContext) raises:
+    """In-place dst += src for tensors with matching storage dtype."""
+    if dst.dtype() != src.dtype():
+        raise Error("add_in_place: dtype mismatch")
     if dst.numel() != src.numel():
-        raise Error("add_in_place_f32: numel mismatch")
+        raise Error("add_in_place: numel mismatch")
     var n = dst.numel()
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
-    var D = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        dst.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
-    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        src.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_add_in_place_kernel_f32, _add_in_place_kernel_f32](
-        D, S, n, grid_dim=grid, block_dim=_BLOCK,
-    )
+    var dt = dst.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var D = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dst.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            src.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[
+            _add_in_place_kernel[DType.float32], _add_in_place_kernel[DType.float32]
+        ](D, S, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var D = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dst.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            src.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[
+            _add_in_place_kernel[DType.bfloat16],
+            _add_in_place_kernel[DType.bfloat16],
+        ](D, S, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var D = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dst.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var S = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            src.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[
+            _add_in_place_kernel[DType.float16], _add_in_place_kernel[DType.float16]
+        ](D, S, n, grid_dim=grid, block_dim=_BLOCK)
+
+
+def add_in_place_f32(dst: Tensor, src: Tensor, ctx: DeviceContext) raises:
+    """Compatibility wrapper for old call sites. Prefer `add_in_place`."""
+    add_in_place(dst, src, ctx)
 
 
 def sub_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:

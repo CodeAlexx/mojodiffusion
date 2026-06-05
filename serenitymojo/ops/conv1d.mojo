@@ -44,8 +44,8 @@ comptime _BLOCK = 256
 # ── conv1d direct kernel (NCL), F32 accumulate ────────────────────────────────
 # Tensors are passed as flat [-1] LayoutTensors; we index with the explicit
 # row-major strides (B,Cin,L) / (Cout,Cin_g,K) / (B,Cout,Lo). One thread per
-# output element. Weight is always read as F32 (we stage it as F32 host-side for
-# accumulation fidelity); x/out follow the storage dtype.
+# output element. Input/weight/bias/output storage stays in the model dtype;
+# the kernel casts scalar taps to F32 only for the accumulator.
 def _conv1d_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     w: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
@@ -88,8 +88,8 @@ def _conv1d_kernel_f32(
 
 def _conv1d_kernel_bf16(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
-    w: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    w: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
     B: Int, Cin: Int, L: Int,
     Cout: Int, K: Int, Lo: Int,
@@ -121,17 +121,19 @@ def _conv1d_kernel_bf16(
                 var xv = rebind[Scalar[DType.bfloat16]](x[x_row + li]).cast[
                     DType.float32
                 ]()
-                var wv = rebind[Scalar[DType.float32]](w[w_row + k])
+                var wv = rebind[Scalar[DType.bfloat16]](w[w_row + k]).cast[
+                    DType.float32
+                ]()
                 acc += xv * wv
     if has_bias != 0:
-        acc += rebind[Scalar[DType.float32]](bias[oc])
+        acc += rebind[Scalar[DType.bfloat16]](bias[oc]).cast[DType.float32]()
     o[idx] = rebind[o.element_type](acc.cast[DType.bfloat16]())
 
 
 def _conv1d_kernel_f16(
     x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
-    w: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    w: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    bias: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
     B: Int, Cin: Int, L: Int,
     Cout: Int, K: Int, Lo: Int,
@@ -163,26 +165,13 @@ def _conv1d_kernel_f16(
                 var xv = rebind[Scalar[DType.float16]](x[x_row + li]).cast[
                     DType.float32
                 ]()
-                var wv = rebind[Scalar[DType.float32]](w[w_row + k])
+                var wv = rebind[Scalar[DType.float16]](w[w_row + k]).cast[
+                    DType.float32
+                ]()
                 acc += xv * wv
     if has_bias != 0:
-        acc += rebind[Scalar[DType.float32]](bias[oc])
+        acc += rebind[Scalar[DType.float16]](bias[oc]).cast[DType.float32]()
     o[idx] = rebind[o.element_type](acc.cast[DType.float16]())
-
-
-def _stage_f32(t: Tensor, ctx: DeviceContext) raises -> DeviceBuffer[DType.uint8]:
-    """Upload a Tensor's values to a fresh F32 device buffer (for the weight /
-    bias path, which the kernel always reads as F32)."""
-    var vals = t.to_host(ctx)
-    var n = len(vals)
-    var dev = ctx.enqueue_create_buffer[DType.uint8](n * 4)
-    var host = ctx.enqueue_create_host_buffer[DType.uint8](n * 4)
-    var hp = host.unsafe_ptr().bitcast[Float32]()
-    for i in range(n):
-        hp[i] = vals[i]
-    ctx.enqueue_copy(dst_buf=dev, src_buf=host)
-    ctx.synchronize()
-    return dev^
 
 
 def conv1d(
@@ -198,8 +187,8 @@ def conv1d(
     """conv1d (NCL input, [Cout, Cin/groups, K] weight), F32-accumulated.
 
     x:      [B, Cin, L]                (compute dtype)
-    weight: [Cout, Cin/groups, K]      (any compute dtype; read as F32)
-    bias:   [Cout] or None
+    weight: [Cout, Cin/groups, K]      (same dtype as x)
+    bias:   [Cout] or None             (same dtype as x)
     returns [B, Cout, Lo]              (x's dtype)
     """
     var xs = x.shape()
@@ -218,6 +207,8 @@ def conv1d(
         raise Error("conv1d: groups must divide Cin and Cout")
     if cin_g != Cin // groups:
         raise Error("conv1d: weight Cin/groups mismatch")
+    if x.dtype() != weight.dtype():
+        raise Error("conv1d: x/weight dtype mismatch")
 
     var Lo = (L + 2 * pad - dilation * (K - 1) - 1) // stride + 1
     if Lo <= 0:
@@ -229,22 +220,20 @@ def conv1d(
         total * x.dtype().byte_size()
     )
 
-    # Stage weight (and bias) as F32 for the accumulation path.
-    var w_buf = _stage_f32(weight, ctx)
     var has_bias = 0
     var b_n = 1
-    # Always allocate a (possibly dummy 1-elem) bias buffer so the kernel arg is
-    # a valid pointer.
-    var bias_buf: DeviceBuffer[DType.uint8]
     if bias:
         ref bt = bias.value()
+        if bt.dtype() != x.dtype():
+            raise Error("conv1d: bias dtype mismatch")
         if bt.numel() != Cout:
             raise Error("conv1d: bias length != Cout")
         b_n = Cout
         has_bias = 1
-        bias_buf = _stage_f32(bt, ctx)
-    else:
-        bias_buf = ctx.enqueue_create_buffer[DType.uint8](4)
+    # No-bias launches still pass a valid pointer; has_bias gates all reads.
+    var dummy_bias_buf = ctx.enqueue_create_buffer[DType.uint8](
+        x.dtype().byte_size()
+    )
 
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](B * Cin * L))
     var w_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](Cout * cin_g * K))
@@ -252,49 +241,90 @@ def conv1d(
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](total))
     var grid = (total + _BLOCK - 1) // _BLOCK
 
-    var W = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        w_buf.unsafe_ptr().bitcast[Float32](), w_rl
-    )
-    var Bias = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        bias_buf.unsafe_ptr().bitcast[Float32](), b_rl
-    )
-
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float32](), x_rl
         )
+        var W = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), w_rl
+        )
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float32](), o_rl
         )
-        ctx.enqueue_function[_conv1d_kernel_f32, _conv1d_kernel_f32](
-            X, W, Bias, O, B, Cin, L, Cout, K, Lo,
-            stride, pad, dilation, groups, has_bias,
-            grid_dim=grid, block_dim=_BLOCK,
-        )
+        if bias:
+            var Bias = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float32](), b_rl
+            )
+            ctx.enqueue_function[_conv1d_kernel_f32, _conv1d_kernel_f32](
+                X, W, Bias, O, B, Cin, L, Cout, K, Lo,
+                stride, pad, dilation, groups, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            var Bias = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                dummy_bias_buf.unsafe_ptr().bitcast[Float32](), b_rl
+            )
+            ctx.enqueue_function[_conv1d_kernel_f32, _conv1d_kernel_f32](
+                X, W, Bias, O, B, Cin, L, Cout, K, Lo,
+                stride, pad, dilation, groups, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
         )
+        var W = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), w_rl
+        )
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
         )
-        ctx.enqueue_function[_conv1d_kernel_bf16, _conv1d_kernel_bf16](
-            X, W, Bias, O, B, Cin, L, Cout, K, Lo,
-            stride, pad, dilation, groups, has_bias,
-            grid_dim=grid, block_dim=_BLOCK,
-        )
+        if bias:
+            var Bias = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+            )
+            ctx.enqueue_function[_conv1d_kernel_bf16, _conv1d_kernel_bf16](
+                X, W, Bias, O, B, Cin, L, Cout, K, Lo,
+                stride, pad, dilation, groups, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            var Bias = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                dummy_bias_buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+            )
+            ctx.enqueue_function[_conv1d_kernel_bf16, _conv1d_kernel_bf16](
+                X, W, Bias, O, B, Cin, L, Cout, K, Lo,
+                stride, pad, dilation, groups, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
     else:
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float16](), x_rl
         )
+        var W = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), w_rl
+        )
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float16](), o_rl
         )
-        ctx.enqueue_function[_conv1d_kernel_f16, _conv1d_kernel_f16](
-            X, W, Bias, O, B, Cin, L, Cout, K, Lo,
-            stride, pad, dilation, groups, has_bias,
-            grid_dim=grid, block_dim=_BLOCK,
-        )
+        if bias:
+            var Bias = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float16](), b_rl
+            )
+            ctx.enqueue_function[_conv1d_kernel_f16, _conv1d_kernel_f16](
+                X, W, Bias, O, B, Cin, L, Cout, K, Lo,
+                stride, pad, dilation, groups, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            var Bias = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                dummy_bias_buf.unsafe_ptr().bitcast[Float16](), b_rl
+            )
+            ctx.enqueue_function[_conv1d_kernel_f16, _conv1d_kernel_f16](
+                X, W, Bias, O, B, Cin, L, Cout, K, Lo,
+                stride, pad, dilation, groups, has_bias,
+                grid_dim=grid, block_dim=_BLOCK,
+            )
     ctx.synchronize()
 
     var out_shape = List[Int]()

@@ -27,6 +27,7 @@
 from std.gpu.host import DeviceContext, DeviceBuffer
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.tensor_view import TensorView
+from serenitymojo.io.ffi import BytePtr, sys_memcpy
 
 
 struct Tensor(Movable):
@@ -167,9 +168,9 @@ struct Tensor(Movable):
         # Stage the host bytes (tv.data is host-resident mmap pages) into a
         # pinned host buffer, then H2D.
         var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
-        var hp = host.unsafe_ptr()
-        for i in range(nbytes):
-            hp[i] = tv.data[i]
+        var dst = BytePtr(unsafe_from_address=Int(host.unsafe_ptr()))
+        var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
+        _ = sys_memcpy(dst, src, nbytes)
         var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
         ctx.enqueue_copy(dst_buf=dev, src_buf=host)
         ctx.synchronize()
@@ -262,9 +263,10 @@ struct Tensor(Movable):
         mut: Bool, //, origin: Origin[mut=mut]
     ](tv: TensorView[origin], ctx: DeviceContext) raises -> Tensor:
         """Build an F32 Tensor from a safetensors view, upcasting BF16/F16 on
-        the host before H2D upload. Used by the LTX-2 vocoder parity path: the
-        Mojo conv1d accumulates in F32, so keeping every weight/activation in
-        F32 makes the chain match the F32 oracle (no BF16 round-trip jitter)."""
+        the host before H2D upload. Use only at explicit F32 boundaries such as
+        full-F32 model/parity paths, F32 text-adapter or vocoder oracle paths,
+        and dev-time token sidecar decoding. Production BF16 model weights
+        should use `from_view` or `from_view_as_bf16`."""
         _ = tv.dtype.to_mojo_dtype()
         var n = tv.numel()
         var nbytes_in = tv.nbytes()

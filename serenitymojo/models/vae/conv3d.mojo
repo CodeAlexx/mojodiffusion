@@ -1,8 +1,8 @@
-# conv3d.mojo — conv3d via the SDK naive NDHWC kernel + a bias-add kernel.
+# conv3d.mojo — 3D convolution helpers for video VAEs.
 #
-# This is the ONE genuinely-new op for the Wan2.1 3D VAE decoder (the foundation
-# ships conv2d but no conv3d). It is wired EXACTLY like ops/conv.mojo wires
-# conv2d_gpu_naive_nhwc_rscf, just one rank up.
+# The existing QRSCF helper uses the SDK naive NDHWC kernel plus a bias-add
+# kernel. LTX2 video VAE uses the separate FCQRS/cuDNN helper below because its
+# checkpoint weights are already stored as OIDHW == FCQRS.
 #
 # === CONV3D-CALLABILITY FINDING ===
 # SDK symbol `nn.conv.conv.conv3d_gpu_naive_ndhwc_qrscf` IS callable. Like its 2D
@@ -40,12 +40,12 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.math import ceildiv
-from std.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu.host import DeviceContext
 from std.gpu import global_idx
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
-from nn.conv.conv import conv3d_gpu_naive_ndhwc_qrscf
+from nn.conv.conv import conv3d_gpu_naive_ndhwc_qrscf, conv3d_cudnn
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 
@@ -105,6 +105,162 @@ def _bias_add_kernel_f16(
         ]()
         v += rebind[Scalar[DType.float16]](bias[c]).cast[DType.float32]()
         o[idx // cols, c] = rebind[o.element_type](v.cast[DType.float16]())
+
+
+def conv3d_fcqrs_cudnn(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    stride_d: Int,
+    stride_h: Int,
+    stride_w: Int,
+    pad_d: Int,
+    pad_h: Int,
+    pad_w: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """cuDNN conv3d for NDHWC input and FCQRS filter.
+
+    x:      [N, D, H, W, Cin]            (NDHWC)
+    weight: [Cout, Cin, Q, R, S]         (FCQRS / checkpoint OIDHW)
+    bias:   [Cout] or None
+    returns [N, Do, Ho, Wo, Cout].
+
+    This is the fast path for LTX2 VAE weights, which are already stored as
+    OIDHW and do not need the QRSCF transpose required by the naive kernel.
+    """
+    var xshape = x.shape()
+    if len(xshape) != 5:
+        raise Error("conv3d_fcqrs_cudnn: x must be rank-5 NDHWC [N,D,H,W,Cin]")
+    var wshape = weight.shape()
+    if len(wshape) != 5:
+        raise Error("conv3d_fcqrs_cudnn: weight must be rank-5 [Cout,Cin,Q,R,S]")
+    if x.dtype() != weight.dtype():
+        raise Error("conv3d_fcqrs_cudnn: x/weight dtype mismatch")
+
+    var n = xshape[0]
+    var di = xshape[1]
+    var hi = xshape[2]
+    var wi = xshape[3]
+    var cin = xshape[4]
+
+    var cout = wshape[0]
+    if wshape[1] != cin:
+        raise Error("conv3d_fcqrs_cudnn: weight Cin != x Cin")
+    var q = wshape[2]
+    var r = wshape[3]
+    var s = wshape[4]
+
+    var do_ = (di + 2 * pad_d - q) // stride_d + 1
+    var ho = (hi + 2 * pad_h - r) // stride_h + 1
+    var wo = (wi + 2 * pad_w - s) // stride_w + 1
+
+    var dt = x.dtype().to_mojo_dtype()
+    var out_n = n * do_ * ho * wo * cout
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        out_n * x.dtype().byte_size()
+    )
+
+    var in_rl = RuntimeLayout[_DYN5].row_major(IndexList[5](n, di, hi, wi, cin))
+    var filt_rl = RuntimeLayout[_DYN5].row_major(IndexList[5](cout, cin, q, r, s))
+    var out_rl = RuntimeLayout[_DYN5].row_major(
+        IndexList[5](n, do_, ho, wo, cout)
+    )
+
+    var stride = IndexList[3](stride_d, stride_h, stride_w)
+    var dilation = IndexList[3](1, 1, 1)
+    var padding = IndexList[3](pad_d, pad_h, pad_w)
+
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), in_rl
+        )
+        var F = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), filt_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN5, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        conv3d_cudnn[DType.float32, DType.float32, DType.float32](
+            X, F, O, stride, dilation, padding, 1, ctx
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), in_rl
+        )
+        var F = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), filt_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN5, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        conv3d_cudnn[DType.bfloat16, DType.bfloat16, DType.bfloat16](
+            X, F, O, stride, dilation, padding, 1, ctx
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), in_rl
+        )
+        var F = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), filt_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN5, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        conv3d_cudnn[DType.float16, DType.float16, DType.float16](
+            X, F, O, stride, dilation, padding, 1, ctx
+        )
+    ctx.synchronize()
+
+    if bias:
+        if bias.value().dtype() != x.dtype():
+            raise Error("conv3d_fcqrs_cudnn: bias dtype must match x dtype")
+        if bias.value().numel() != cout:
+            raise Error("conv3d_fcqrs_cudnn: bias length != Cout")
+
+        var rows = n * do_ * ho * wo
+        var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cout))
+        var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cout))
+        var grid = (rows * cout + _BLOCK - 1) // _BLOCK
+        if dt == DType.float32:
+            var bias_lt = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float32](), b_rl
+            )
+            var O2 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+            )
+            ctx.enqueue_function[_bias_add_kernel_f32, _bias_add_kernel_f32](
+                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+            )
+        elif dt == DType.bfloat16:
+            var bias_lt = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+            )
+            var O2 = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+            )
+            ctx.enqueue_function[_bias_add_kernel_bf16, _bias_add_kernel_bf16](
+                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+            )
+        else:
+            var bias_lt = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                bias.value().buf.unsafe_ptr().bitcast[Float16](), b_rl
+            )
+            var O2 = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+            )
+            ctx.enqueue_function[_bias_add_kernel_f16, _bias_add_kernel_f16](
+                O2, bias_lt, rows, cout, grid_dim=grid, block_dim=_BLOCK
+            )
+        ctx.synchronize()
+
+    var out_shape = List[Int]()
+    out_shape.append(n)
+    out_shape.append(do_)
+    out_shape.append(ho)
+    out_shape.append(wo)
+    out_shape.append(cout)
+    return Tensor(out_buf^, out_shape^, x.dtype())
 
 
 def conv3d(

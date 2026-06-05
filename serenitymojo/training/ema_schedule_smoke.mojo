@@ -2,7 +2,7 @@
 #
 # Asserts:
 #   (1) HOST ema_update_host hand-check: decay=0.999, shadow=1.0, live=2.0 ->
-#       1.001 (matches schedule.mojo:377 / ema.rs hand-check) to 1e-6.
+#       BF16(1.001), proving F32 math with BF16 at-rest storage.
 #   (2) DEVICE ema_update primitive: same hand-check on a 1-elem F32 tensor.
 #   (3) POWER-DECAY schedule vs the Rust ema_advanced.rs decay_at_step at
 #       t in {0,1,2,11,100,1e6} (defaults inv_gamma=1, power=0.6667,
@@ -27,15 +27,17 @@ def main() raises:
     var ok = True
 
     # ── (1) host hand-check ───────────────────────────────────────────────────
-    var shadow = List[Float32](); shadow.append(Float32(1.0))
-    var live = List[Float32](); live.append(Float32(2.0))
+    var shadow = List[BFloat16](); shadow.append(BFloat16(Float32(1.0)))
+    var live = List[BFloat16](); live.append(BFloat16(Float32(2.0)))
     ema_update_host(shadow, live, Float32(0.999))
-    print("host ema_update shadow (expect 1.001):", shadow[0])
-    var he = Float64(shadow[0]) - 1.001
+    var expected_host = BFloat16(Float32(1.001)).cast[DType.float32]()
+    var got_host = shadow[0].cast[DType.float32]()
+    print("host ema_update shadow (expect BF16(1.001)):", got_host)
+    var he = Float64(got_host - expected_host)
     if (he if he >= 0.0 else -he) > 1.0e-6:
-        print("FAIL host ema_update != 1.001"); ok = False
+        print("FAIL host ema_update != BF16(1.001)"); ok = False
     else:
-        print("PASS host ema_update hand-check (1.001) to 1e-6")
+        print("PASS host ema_update hand-check BF16(1.001) to 1e-6")
 
     # ── (2) device primitive hand-check ───────────────────────────────────────
     var sh_t = Tensor.from_host([Float32(1.0)], [1], STDtype.F32, ctx)

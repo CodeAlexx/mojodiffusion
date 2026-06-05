@@ -76,9 +76,10 @@ struct ErnieBlockWeights(Copyable, Movable):
         self.wdown = wdown^
 
 
-# Read one named tensor from the sharded safetensors as a device F32 Tensor at
-# its real stored shape (casts up from BF16). Mirrors klein _load_host_f32 but
-# returns a device Tensor (uploaded once) instead of a host list.
+# Read one named tensor from the sharded safetensors as a device F32 Tensor.
+# Use only for small F32 residual-stream norm compatibility, or the remaining
+# biased patch/final stack helpers called out below. Do not use for generic
+# projection-matrix checkpoint loading.
 def _load_f32_device(
     st: ShardedSafeTensors, name: String, ctx: DeviceContext
 ) raises -> Tensor:
@@ -116,16 +117,16 @@ def load_ernie_block_weights(
     var mp = p + String(".mlp")
     return ErnieBlockWeights(
         TArc(_load_f32_device(st, p + String(".adaLN_sa_ln.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".to_q.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".to_k.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".to_v.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".to_out.0.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".to_q.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".to_k.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".to_v.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".to_out.0.weight"), ctx)),
         TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
         TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
         TArc(_load_f32_device(st, p + String(".adaLN_mlp_ln.weight"), ctx)),
-        TArc(_load_f32_device(st, mp + String(".gate_proj.weight"), ctx)),
-        TArc(_load_f32_device(st, mp + String(".up_proj.weight"), ctx)),
-        TArc(_load_f32_device(st, mp + String(".linear_fc2.weight"), ctx)),
+        TArc(_load_stored_device(st, mp + String(".gate_proj.weight"), ctx)),
+        TArc(_load_stored_device(st, mp + String(".up_proj.weight"), ctx)),
+        TArc(_load_stored_device(st, mp + String(".linear_fc2.weight"), ctx)),
     )
 
 
@@ -176,9 +177,12 @@ def verify_block_to_q_shape(
 
 # ── shared / resident base weights (input projections + final layer) ──────────
 # Mirrors klein_stack.KleinStackBase: every tensor uploaded to the device ONCE.
-# These are FROZEN (read on every forward + backward). Stored BF16 in the
-# checkpoint, cast up to F32 once at load (the training interior is F32 to match
-# the Klein training path + the torch oracle). Keys from ernie_image.rs load():
+# These are FROZEN (read on every forward + backward). The no-bias text
+# projection and the shared timestep/AdaLN/final-norm MLP preserve checkpoint
+# dtype; their callers already cast transient inputs to the stored weight dtype.
+# BUG: patch_embed and final_linear still upcast BF16 checkpoint tensors because
+# their biased stack helpers live outside this loader scope and still build F32
+# input tensors. Keys from ernie_image.rs load():
 #   x_embedder.proj.{weight,bias}            patch embed (Conv2d k=1 -> linear)
 #   text_proj.weight                         Mistral hidden -> hidden (no bias)
 #   time_embedding.linear_{1,2}.{weight,bias}  timestep MLP
@@ -251,15 +255,15 @@ def load_ernie_stack_base(
     return ErnieStackBase(
         TArc(patch_w^),
         TArc(_load_f32_device(st, String("x_embedder.proj.bias"), ctx)),
-        TArc(_load_f32_device(st, String("text_proj.weight"), ctx)),
-        TArc(_load_f32_device(st, String("time_embedding.linear_1.weight"), ctx)),
-        TArc(_load_f32_device(st, String("time_embedding.linear_1.bias"), ctx)),
-        TArc(_load_f32_device(st, String("time_embedding.linear_2.weight"), ctx)),
-        TArc(_load_f32_device(st, String("time_embedding.linear_2.bias"), ctx)),
-        TArc(_load_f32_device(st, String("adaLN_modulation.1.weight"), ctx)),
-        TArc(_load_f32_device(st, String("adaLN_modulation.1.bias"), ctx)),
-        TArc(_load_f32_device(st, String("final_norm.linear.weight"), ctx)),
-        TArc(_load_f32_device(st, String("final_norm.linear.bias"), ctx)),
+        TArc(_load_stored_device(st, String("text_proj.weight"), ctx)),
+        TArc(_load_stored_device(st, String("time_embedding.linear_1.weight"), ctx)),
+        TArc(_load_stored_device(st, String("time_embedding.linear_1.bias"), ctx)),
+        TArc(_load_stored_device(st, String("time_embedding.linear_2.weight"), ctx)),
+        TArc(_load_stored_device(st, String("time_embedding.linear_2.bias"), ctx)),
+        TArc(_load_stored_device(st, String("adaLN_modulation.1.weight"), ctx)),
+        TArc(_load_stored_device(st, String("adaLN_modulation.1.bias"), ctx)),
+        TArc(_load_stored_device(st, String("final_norm.linear.weight"), ctx)),
+        TArc(_load_stored_device(st, String("final_norm.linear.bias"), ctx)),
         TArc(_load_f32_device(st, String("final_linear.weight"), ctx)),
         TArc(_load_f32_device(st, String("final_linear.bias"), ctx)),
     )

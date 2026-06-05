@@ -37,7 +37,7 @@ def latent_grid_edge(resolution: Int) -> Int:
     return resolution // 16
 
 
-# Initial latent tokens: NCHW [1,128,LH,LW] randn -> NHWC -> [1, N_IMG, 128].
+# Initial BF16 latent tokens: NCHW [1,128,LH,LW] randn -> NHWC -> [1, N_IMG, 128].
 # Model-agnostic for the Klein/Flux2 latent family. Byte-identical to the
 # validation_sampler / multistep-smoke initial_tokens routine.
 def initial_tokens[N_IMG: Int, LH: Int, LW: Int](
@@ -47,7 +47,7 @@ def initial_tokens[N_IMG: Int, LH: Int, LW: Int](
     from serenitymojo.io.dtype import STDtype
     var nchw_shape = List[Int]()
     nchw_shape.append(1); nchw_shape.append(128); nchw_shape.append(LH); nchw_shape.append(LW)
-    var noise_nchw = randn(nchw_shape^, seed, STDtype.F32, ctx)
+    var noise_nchw = randn(nchw_shape^, seed, STDtype.BF16, ctx)
     var p = List[Int]()
     p.append(0); p.append(2); p.append(3); p.append(1)
     var nhwc = permute(noise_nchw, p^, ctx)
@@ -68,7 +68,8 @@ def tokens_to_packed_nchw[LH: Int, LW: Int](
     return permute(nhwc, p^, ctx)
 
 
-# Direct-velocity Euler step: x = x + dt*pred (F32 latent in/out).
+# Direct-velocity Euler step: x = x + dt*pred. Tensor op arithmetic may use F32
+# internally, but the latent carrier preserves its storage dtype.
 def euler_step(x: Tensor, pred: Tensor, dt: Float32, ctx: DeviceContext) raises -> Tensor:
     return add(x, mul_scalar(pred, dt, ctx), ctx)
 

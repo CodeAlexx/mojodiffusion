@@ -26,8 +26,9 @@
 #     single_transformer_blocks.{bi}.attn.norm_q/.norm_k.weight  [Dh] -> q/k_norm
 #
 # Dims CONFIRMED from the real safetensors header (this session): D=3072, H=24,
-# Dh=128, Fmlp=12288, 19 double + 38 single. The checkpoint is BF16; loaded as
-# host F32 (the block structs upload F32, matching Flux/Klein).
+# Dh=128, Fmlp=12288, 19 double + 38 single. The checkpoint is BF16. Streamed
+# block structs still use the legacy host-F32 API; resident stack-base tensors
+# are kept in checkpoint dtype.
 #
 # Mojo 0.26.x+: def not fn; move-only Tensor; reuses io.safetensors +
 # io.tensor_view.from_parts + ops.cast.cast_tensor (the Flux loader pattern).
@@ -175,12 +176,11 @@ def load_single_block_weights(
 # (chroma_stack_lora.mojo) holds them resident. The approximator
 # (distilled_guidance_layer) is loaded separately via models/dit/chroma_dit.mojo
 # ChromaDitCache (it produces the per-step pooled_temb modulation table).
-def _load_dev_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
+def _load_dev_preserve(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx)
+    return Tensor.from_view(tv, ctx)
 
 
 from serenitymojo.models.chroma.chroma_stack_lora import ChromaStackBase
@@ -190,11 +190,11 @@ def load_chroma_stack_base(
     st: SafeTensors, num_double: Int, num_single: Int, ctx: DeviceContext
 ) raises -> ChromaStackBase:
     return ChromaStackBase(
-        ArcPointer(_load_dev_f32(st, String("x_embedder.weight"), ctx)),
-        ArcPointer(_load_dev_f32(st, String("x_embedder.bias"), ctx)),
-        ArcPointer(_load_dev_f32(st, String("context_embedder.weight"), ctx)),
-        ArcPointer(_load_dev_f32(st, String("context_embedder.bias"), ctx)),
-        ArcPointer(_load_dev_f32(st, String("proj_out.weight"), ctx)),
-        ArcPointer(_load_dev_f32(st, String("proj_out.bias"), ctx)),
+        ArcPointer(_load_dev_preserve(st, String("x_embedder.weight"), ctx)),
+        ArcPointer(_load_dev_preserve(st, String("x_embedder.bias"), ctx)),
+        ArcPointer(_load_dev_preserve(st, String("context_embedder.weight"), ctx)),
+        ArcPointer(_load_dev_preserve(st, String("context_embedder.bias"), ctx)),
+        ArcPointer(_load_dev_preserve(st, String("proj_out.weight"), ctx)),
+        ArcPointer(_load_dev_preserve(st, String("proj_out.bias"), ctx)),
         num_double, num_single,
     )

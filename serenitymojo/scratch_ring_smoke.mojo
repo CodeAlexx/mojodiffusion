@@ -163,6 +163,55 @@ def main() raises:
     all_pass = all_pass and r.passed
 
     ring.reset()
+    var BF16 = STDtype.BF16
+    var gy_bf = Tensor.from_host(
+        _lf(1.0, -2.0, 3.0, 0.5, 4.0, -1.0), [2, 3], BF16, ctx,
+    )
+    var wt_bf = Tensor.from_host(
+        _lf(0.25, 1.0, -0.5, 2.0, 1.5, -1.0, 0.75, 0.5, -2.0, 0.125, 1.25, -0.25),
+        [3, 4], BF16, ctx,
+    )
+    var dx_ref_bf = linear_backward_dx(gy_bf, wt_bf, 2, 4, 3, ctx)
+    var dx_scratch_bf = linear_backward_dx_scratch(gy_bf, wt_bf, 2, 4, 3, ctx, ring)
+    if dx_scratch_bf.dtype() != BF16:
+        raise Error("scratch linear dx BF16 returned " + dx_scratch_bf.dtype().name())
+    r = h.compare(dx_scratch_bf, dx_ref_bf.to_host(ctx), ctx)
+    print("scratch linear bf16 ", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
+    var dx_mixed_bf = linear_backward_dx_scratch(
+        gy, wt_bf, 2, 4, 3, ctx, ring, False, BF16,
+    )
+    if dx_mixed_bf.dtype() != BF16:
+        raise Error("scratch mixed linear dx returned " + dx_mixed_bf.dtype().name())
+    r = h.compare(dx_mixed_bf, dx_ref_bf.to_host(ctx), ctx)
+    print("scratch mixed bf16  ", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
+    var gy0_bf = Tensor.from_host(_lf(1.0, 0.5), [2, 1], BF16, ctx)
+    var gy1_bf = Tensor.from_host(_lf(-2.0, 3.0, 4.0, -1.0), [2, 2], BF16, ctx)
+    var dx_split_bf = linear_backward_dx_split_scratch(
+        gy0_bf, gy1_bf, wt_bf, 2, 4, 1, 2, ctx, ring,
+    )
+    if dx_split_bf.dtype() != BF16:
+        raise Error("scratch split BF16 returned " + dx_split_bf.dtype().name())
+    r = h.compare(dx_split_bf, dx_ref_bf.to_host(ctx), ctx)
+    print("scratch split bf16  ", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
+    var dx_split_mixed_bf = linear_backward_dx_split_scratch(
+        gy0, gy1, wt_bf, 2, 4, 1, 2, ctx, ring, False, BF16,
+    )
+    if dx_split_mixed_bf.dtype() != BF16:
+        raise Error("scratch mixed split returned " + dx_split_mixed_bf.dtype().name())
+    r = h.compare(dx_split_mixed_bf, dx_ref_bf.to_host(ctx), ctx)
+    print("scratch split mixed ", r)
+    all_pass = all_pass and r.passed
+
+    ring.reset()
     var lin_x = Tensor.from_host(_lf(1.0, -2.0, 0.5, 3.0, 2.0, 1.5, -1.0, 0.25), [2, 4], F32, ctx)
     var no_bias = Optional[Tensor](None)
     var lin_ref_t = linear(lin_x, wt, no_bias^, ctx)

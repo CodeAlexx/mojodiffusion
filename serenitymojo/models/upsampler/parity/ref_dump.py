@@ -16,6 +16,7 @@ from ltx_core.model.upsampler.model import LatentUpsampler
 
 W = "/home/alex/.serenity/models/ltx2_upscalers"
 OUT = os.path.dirname(os.path.abspath(__file__))
+DTYPE = torch.bfloat16
 
 
 def build_spatial():
@@ -32,8 +33,9 @@ def build_spatial():
         rational_resampler=True,
     )
     sd = load_file(os.path.join(W, "ltx-2-spatial-upscaler-x2-1.0.safetensors"))
-    sd = {k: v.float() for k, v in sd.items()}
+    sd = {k: v.to(dtype=DTYPE) for k, v in sd.items()}
     missing, unexpected = m.load_state_dict(sd, strict=True)
+    m.to(dtype=DTYPE)
     m.eval()
     return m
 
@@ -52,8 +54,9 @@ def build_temporal():
         rational_resampler=False,
     )
     sd = load_file(os.path.join(W, "ltx-2-temporal-upscaler-x2-1.0.safetensors"))
-    sd = {k: v.float() for k, v in sd.items()}
+    sd = {k: v.to(dtype=DTYPE) for k, v in sd.items()}
     m.load_state_dict(sd, strict=True)
+    m.to(dtype=DTYPE)
     m.eval()
     return m
 
@@ -61,24 +64,28 @@ def build_temporal():
 @torch.no_grad()
 def run(tag, model, latent):
     out = model(latent)
-    np.save(os.path.join(OUT, f"{tag}_in.npy"), latent.cpu().numpy().astype(np.float32))
-    np.save(os.path.join(OUT, f"{tag}_out.npy"), out.cpu().numpy().astype(np.float32))
+    lat_np = latent.cpu().numpy().astype(np.float32)
+    out_np = out.cpu().numpy().astype(np.float32)
+    np.save(os.path.join(OUT, f"{tag}_in.npy"), lat_np)
+    np.save(os.path.join(OUT, f"{tag}_out.npy"), out_np)
+    lat_np.tofile(os.path.join(OUT, f"{tag}_in.bin"))
+    out_np.tofile(os.path.join(OUT, f"{tag}_out.bin"))
     print(f"{tag}: in {tuple(latent.shape)} -> out {tuple(out.shape)}")
     return out
 
 
 def main():
     torch.manual_seed(0)
-    dev = "cpu"
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Small spatial latent: B=1, C=128, F=2, H=8, W=8 -> H,W double to 16
     sp = build_spatial().to(dev)
-    lat_sp = (torch.randn(1, 128, 2, 8, 8) * 0.5).to(dev)
+    lat_sp = (torch.randn(1, 128, 2, 8, 8) * 0.5).to(device=dev, dtype=DTYPE)
     run("spatial", sp, lat_sp)
 
     # Small temporal latent: B=1, C=128, F=3, H=6, W=6 -> F doubles then -1 frame
     tp = build_temporal().to(dev)
-    lat_tp = (torch.randn(1, 128, 3, 6, 6) * 0.5).to(dev)
+    lat_tp = (torch.randn(1, 128, 3, 6, 6) * 0.5).to(device=dev, dtype=DTYPE)
     run("temporal", tp, lat_tp)
 
     print("DONE")

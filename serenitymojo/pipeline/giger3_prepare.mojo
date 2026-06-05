@@ -116,6 +116,10 @@ def _image_to_nchw_m1p1(
 
 
 def _read_ids(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises -> List[Int]:
+    """Read tokenizer sidecar ids to host ints.
+
+    F32 widening is only for decoding the sidecar numeric array; no model tensor
+    boundary stores these ids as F32."""
     var t = Tensor.from_view_as_f32(st.tensor_view(name), ctx)
     var host = t.to_host(ctx)
     var out = List[Int]()
@@ -259,12 +263,12 @@ def main() raises:
             continue
 
         # --- 3) write <id>.safetensors with BOTH keys ---
-        var lat_f32 = Tensor.from_host(lh.copy(), [1, 16, LH, LW], STDtype.F32, ctx)
+        var lat_bf16 = Tensor.from_host(lh.copy(), [1, 16, LH, LW], STDtype.BF16, ctx)
         var names = List[String]()
         names.append(String("latent"))
         names.append(String("context_cond"))
         var tensors = List[ArcPointer[Tensor]]()
-        tensors.append(ArcPointer(lat_f32^))
+        tensors.append(ArcPointer(lat_bf16^))
         tensors.append(ArcPointer(context^))
         save_safetensors(names, tensors, out_path, ctx)
         written += 1

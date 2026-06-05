@@ -546,10 +546,9 @@ def main() raises:
     nchw_shape.append(ZIMAGE_L2P_PIXEL_CHANNELS)
     nchw_shape.append(L2P_H)
     nchw_shape.append(L2P_W)
-    # Draw F32 noise, then cast to BF16 (matches Rust: init_l2p_noise returns F32,
-    # then caller casts to BF16 before entering the loop).
-    var x_f32 = randn(nchw_shape^, SEED, STDtype.F32, ctx)
-    var x = cast_tensor(x_f32, STDtype.BF16, ctx)
+    # Keep the production pixel-noise carrier BF16; tensor ops use F32 math
+    # internally where needed.
+    var x = randn(nchw_shape^, SEED, STDtype.BF16, ctx)
     _stats("init_pixel_noise", x, ctx)
 
     # ── Stage 6: Build sigma schedule ────────────────────────────────────────

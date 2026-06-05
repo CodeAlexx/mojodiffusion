@@ -121,8 +121,8 @@ def main() raises:
 
     # ── matmul BF16: same inputs downcast to BF16, SAME F32 torch ref. ─────────
     # Relaxed gate cos >= 0.99 (BF16 ~3 decimal digits; F32-exact 0.999 is
-    # unreachable). mm_backward's BF16 arm casts up to F32, runs the SAME GEMMs,
-    # casts grads back to BF16 — "runs & approximately right".
+    # unreachable). mm_backward passes BF16 operands to BLAS with an F32
+    # accumulator and stores gradients back as BF16.
     var a_bf = cast_tensor(a, STDtype.BF16, ctx)
     var b_bf = cast_tensor(b, STDtype.BF16, ctx)
     var gc_bf = cast_tensor(gc, STDtype.BF16, ctx)
@@ -146,8 +146,8 @@ def main() raises:
     all_pass = all_pass and r_bmm_da.passed and r_bmm_db.passed
 
     # ── bmm BF16: same inputs downcast to BF16, SAME F32 torch ref, thr 0.99. ──
-    # bmm_backward's BF16 arm casts up to F32, runs the SAME per-batch GEMMs,
-    # casts grads back to BF16.
+    # bmm_backward passes BF16 operands to BLAS with an F32 accumulator and
+    # stores gradients back as BF16.
     var ba_bf = cast_tensor(ba, STDtype.BF16, ctx)
     var bb_bf = cast_tensor(bb, STDtype.BF16, ctx)
     var bgc_bf = cast_tensor(bgc, STDtype.BF16, ctx)

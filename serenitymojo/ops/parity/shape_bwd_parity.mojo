@@ -137,6 +137,20 @@ def _read_ref(tag: String) raises -> List[Float32]:
     raise Error(String("ref tag not found: ") + tag)
 
 
+def _require_bf16(t: Tensor, name: String) raises:
+    if t.dtype() != STDtype.BF16:
+        raise Error(name + ": expected BF16 storage, got " + t.dtype().name())
+
+
+def _bf16_ref_gate(
+    h: ParityHarness, t: Tensor, tag: String, ctx: DeviceContext
+) raises -> Bool:
+    _require_bf16(t, tag + String(" bf16"))
+    var r = h.compare(t, _read_ref(tag), ctx)
+    print(tag, " bf16 vs torch:", r)
+    return r.cos >= 0.99
+
+
 def main() raises:
     var ctx = DeviceContext()
     var h = ParityHarness()
@@ -259,6 +273,86 @@ def main() raises:
     var r_is = h.compare_host(index_select_dx.to_host(ctx), _read_ref(String("index_select_dx")))
     print("index_select_dx vs torch:", r_is)
     all_pass = all_pass and r_is.passed
+
+    # ── BF16 storage contract gates: same shapes, F32 math internally allowed,
+    # outputs must remain BF16 and stay close to the F32 torch references. ─────
+    var cat_gy_b = Tensor.from_host(_fill_grad(5 * 4), _shape2(5, 4), STDtype.BF16, ctx)
+    var cat_b = cat_backward(cat_gy_b, 2, 3, 0, ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, cat_b.d_0, String("cat_d0"), ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, cat_b.d_1, String("cat_d1"), ctx)
+
+    var sp0_b = Tensor.from_host(_fill_grad(2 * 4), _shape2(2, 4), STDtype.BF16, ctx)
+    var sp1_b = Tensor.from_host(_scaled(_fill_grad(3 * 4), 2.0), _shape2(3, 4), STDtype.BF16, ctx)
+    var split_b = split_backward(sp0_b, sp1_b, 0, ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, split_b, String("split_dx"), ctx)
+
+    var sl_gy_b = Tensor.from_host(_fill_grad(3 * 4), _shape2(3, 4), STDtype.BF16, ctx)
+    var slice_b = slice_backward(sl_gy_b, _shape2(6, 4), 0, 1, ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, slice_b, String("slice_dx"), ctx)
+
+    var rs_gy_b = Tensor.from_host(_fill_grad(24), _shape2(2, 12), STDtype.BF16, ctx)
+    var reshape_b = reshape_backward(rs_gy_b, _shape2(4, 6), ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, reshape_b, String("reshape_dx"), ctx)
+
+    var tr_gy_b = Tensor.from_host(_fill_grad(15), _shape2(5, 3), STDtype.BF16, ctx)
+    var transpose_b = transpose_backward(tr_gy_b, 0, 1, ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, transpose_b, String("transpose_dx"), ctx)
+
+    var pm_gy_b = Tensor.from_host(_fill_grad(24), _shape3(4, 2, 3), STDtype.BF16, ctx)
+    var permute_b = permute_backward(pm_gy_b, pm_perm, ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, permute_b, String("permute_dx"), ctx)
+
+    var bc_gy_b = Tensor.from_host(_fill_grad(12), _shape2(3, 4), STDtype.BF16, ctx)
+    var broadcast_b = broadcast_backward(bc_gy_b, _shape2(1, 4), ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, broadcast_b, String("broadcast_dx"), ctx)
+
+    var rp_gy_b = Tensor.from_host(_fill_grad(24), _shape2(4, 6), STDtype.BF16, ctx)
+    var repeat_b = repeat_backward(rp_gy_b, _shape2(2, 3), rp_reps, ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, repeat_b, String("repeat_dx"), ctx)
+
+    var wh_gy_b = Tensor.from_host(_fill_grad(8), _shape(8), STDtype.BF16, ctx)
+    var wh_cond_b = Tensor.from_host(_cond_mask(8), _shape(8), STDtype.BF16, ctx)
+    var wh_b = where_backward(wh_gy_b, wh_cond_b, ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, wh_b.d_a, String("where_da"), ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, wh_b.d_b, String("where_db"), ctx)
+
+    var cl_gy_b = Tensor.from_host(_fill_grad(16), _shape(16), STDtype.BF16, ctx)
+    var cl_x_b = Tensor.from_host(_fill_default(16), _shape(16), STDtype.BF16, ctx)
+    var clamp_b = clamp_backward(cl_gy_b, cl_x_b, Float32(-0.2), Float32(0.2), ctx)
+    # Branch decisions use the BF16 forward input, so threshold-tie value parity
+    # against the F32 oracle is not meaningful here. Storage is the contract.
+    _require_bf16(clamp_b, String("clamp_dx bf16"))
+    print("clamp_dx bf16 storage: PASS")
+
+    var mx_gy_b = Tensor.from_host(_fill_grad(16), _shape(16), STDtype.BF16, ctx)
+    var mx_a_b = Tensor.from_host(_fill_default(16), _shape(16), STDtype.BF16, ctx)
+    var mx_b_b = Tensor.from_host(_fill_alt(16), _shape(16), STDtype.BF16, ctx)
+    var max_b = maximum_backward(mx_gy_b, mx_a_b, mx_b_b, ctx)
+    _require_bf16(max_b.d_a, String("max_da bf16"))
+    _require_bf16(max_b.d_b, String("max_db bf16"))
+    print("max_da/max_db bf16 storage: PASS")
+
+    var mn_gy_b = Tensor.from_host(_fill_grad(16), _shape(16), STDtype.BF16, ctx)
+    var mn_a_b = Tensor.from_host(_fill_default(16), _shape(16), STDtype.BF16, ctx)
+    var mn_b_b = Tensor.from_host(_fill_alt(16), _shape(16), STDtype.BF16, ctx)
+    var min_b = minimum_backward(mn_gy_b, mn_a_b, mn_b_b, ctx)
+    _require_bf16(min_b.d_a, String("min_da bf16"))
+    _require_bf16(min_b.d_b, String("min_db bf16"))
+    print("min_da/min_db bf16 storage: PASS")
+
+    var ca_gy_b = Tensor.from_host(_fill_grad(12), _shape(12), STDtype.BF16, ctx)
+    var cast_b = cast_backward(ca_gy_b, ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, cast_b, String("cast_dx"), ctx)
+
+    var cast_f32_to_bf16 = cast_backward(ca_gy, ctx, STDtype.BF16)
+    all_pass = all_pass and _bf16_ref_gate(
+        h, cast_f32_to_bf16, String("cast_dx"), ctx,
+    )
+
+    var is_gy_b = Tensor.from_host(_fill_grad(16), _shape2(4, 4), STDtype.BF16, ctx)
+    var index_select_b = index_select_backward(is_gy_b, is_idx, 0, _shape2(5, 4), ctx)
+    all_pass = all_pass and _bf16_ref_gate(h, index_select_b, String("index_select_dx"), ctx)
+    print("BF16 shape backward storage gates: PASS")
 
     print("")
     if all_pass:

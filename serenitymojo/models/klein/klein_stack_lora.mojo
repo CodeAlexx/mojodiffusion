@@ -50,6 +50,7 @@ from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.scratch_ring import ScratchRingAllocator
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.tensor_algebra import concat, slice, zeros_device
 
@@ -468,6 +469,14 @@ def _host_grad_slice_to_list(
     return out^
 
 
+def _grad_arc_f32(t: TArc, ctx: DeviceContext) raises -> TArc:
+    if t[].dtype() == STDtype.F32:
+        return t.copy()
+    # Host AdamW stores master params and moments as F32; device grads may be BF16.
+    var t32 = cast_tensor(t[], STDtype.F32, ctx)
+    return TArc(t32^)
+
+
 def _host_grad_group_to_lists(
     host: HostBuffer[DType.uint8],
     offsets: List[Int],
@@ -491,44 +500,57 @@ def _required_tarc(opt: Optional[TArc], name: String) raises -> TArc:
 def klein_lora_tensor_grads_to_host(
     tg: KleinLoraTensorGrads, ctx: DeviceContext
 ) raises -> KleinLoraGrads:
-    var total_bytes = 0
+    var dbl_a_f32 = List[TArc]()
+    var dbl_b_f32 = List[TArc]()
+    var sgl_a_f32 = List[TArc]()
+    var sgl_b_f32 = List[TArc]()
     for i in range(len(tg.dbl_d_a)):
-        total_bytes += tg.dbl_d_a[i][].nbytes()
+        dbl_a_f32.append(_grad_arc_f32(tg.dbl_d_a[i], ctx))
     for i in range(len(tg.dbl_d_b)):
-        total_bytes += tg.dbl_d_b[i][].nbytes()
+        dbl_b_f32.append(_grad_arc_f32(tg.dbl_d_b[i], ctx))
     for i in range(len(tg.sgl_d_a)):
-        total_bytes += tg.sgl_d_a[i][].nbytes()
+        sgl_a_f32.append(_grad_arc_f32(tg.sgl_d_a[i], ctx))
     for i in range(len(tg.sgl_d_b)):
-        total_bytes += tg.sgl_d_b[i][].nbytes()
+        sgl_b_f32.append(_grad_arc_f32(tg.sgl_d_b[i], ctx))
+
+    var total_bytes = 0
+    for i in range(len(dbl_a_f32)):
+        total_bytes += dbl_a_f32[i][].nbytes()
+    for i in range(len(dbl_b_f32)):
+        total_bytes += dbl_b_f32[i][].nbytes()
+    for i in range(len(sgl_a_f32)):
+        total_bytes += sgl_a_f32[i][].nbytes()
+    for i in range(len(sgl_b_f32)):
+        total_bytes += sgl_b_f32[i][].nbytes()
 
     var host = ctx.enqueue_create_host_buffer[DType.uint8](total_bytes)
     var offsets = List[Int]()
     var numels = List[Int]()
     var cursor = 0
-    for i in range(len(tg.dbl_d_a)):
+    for i in range(len(dbl_a_f32)):
         offsets.append(cursor)
-        numels.append(tg.dbl_d_a[i][].numel())
-        var dst = host.create_sub_buffer[DType.uint8](cursor, tg.dbl_d_a[i][].nbytes())
-        ctx.enqueue_copy(dst_buf=dst, src_buf=tg.dbl_d_a[i][].buf)
-        cursor += tg.dbl_d_a[i][].nbytes()
-    for i in range(len(tg.dbl_d_b)):
+        numels.append(dbl_a_f32[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, dbl_a_f32[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=dbl_a_f32[i][].buf)
+        cursor += dbl_a_f32[i][].nbytes()
+    for i in range(len(dbl_b_f32)):
         offsets.append(cursor)
-        numels.append(tg.dbl_d_b[i][].numel())
-        var dst = host.create_sub_buffer[DType.uint8](cursor, tg.dbl_d_b[i][].nbytes())
-        ctx.enqueue_copy(dst_buf=dst, src_buf=tg.dbl_d_b[i][].buf)
-        cursor += tg.dbl_d_b[i][].nbytes()
-    for i in range(len(tg.sgl_d_a)):
+        numels.append(dbl_b_f32[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, dbl_b_f32[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=dbl_b_f32[i][].buf)
+        cursor += dbl_b_f32[i][].nbytes()
+    for i in range(len(sgl_a_f32)):
         offsets.append(cursor)
-        numels.append(tg.sgl_d_a[i][].numel())
-        var dst = host.create_sub_buffer[DType.uint8](cursor, tg.sgl_d_a[i][].nbytes())
-        ctx.enqueue_copy(dst_buf=dst, src_buf=tg.sgl_d_a[i][].buf)
-        cursor += tg.sgl_d_a[i][].nbytes()
-    for i in range(len(tg.sgl_d_b)):
+        numels.append(sgl_a_f32[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, sgl_a_f32[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=sgl_a_f32[i][].buf)
+        cursor += sgl_a_f32[i][].nbytes()
+    for i in range(len(sgl_b_f32)):
         offsets.append(cursor)
-        numels.append(tg.sgl_d_b[i][].numel())
-        var dst = host.create_sub_buffer[DType.uint8](cursor, tg.sgl_d_b[i][].nbytes())
-        ctx.enqueue_copy(dst_buf=dst, src_buf=tg.sgl_d_b[i][].buf)
-        cursor += tg.sgl_d_b[i][].nbytes()
+        numels.append(sgl_b_f32[i][].numel())
+        var dst = host.create_sub_buffer[DType.uint8](cursor, sgl_b_f32[i][].nbytes())
+        ctx.enqueue_copy(dst_buf=dst, src_buf=sgl_b_f32[i][].buf)
+        cursor += sgl_b_f32[i][].nbytes()
     ctx.synchronize()
 
     var dbl_a_start = 0
@@ -1799,8 +1821,8 @@ def save_klein_lora(set: KleinLoraSet, path: String, ctx: DeviceContext) raises 
 # overwrite a/b only — the optimizer moments are irrelevant to a PEFT save.
 def save_klein_lora_ema(
     set: KleinLoraSet,
-    shadow_dbl_a: List[List[Float32]], shadow_dbl_b: List[List[Float32]],
-    shadow_sgl_a: List[List[Float32]], shadow_sgl_b: List[List[Float32]],
+    shadow_dbl_a: List[List[BFloat16]], shadow_dbl_b: List[List[BFloat16]],
+    shadow_sgl_a: List[List[BFloat16]], shadow_sgl_b: List[List[BFloat16]],
     path: String, ctx: DeviceContext,
 ) raises -> Int:
     var named = List[NamedLora]()

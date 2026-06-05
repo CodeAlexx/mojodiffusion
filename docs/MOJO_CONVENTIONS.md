@@ -159,6 +159,14 @@ training engine keeps loss/activation backward in F32 master precision").
 This mirrors flame-core's "no F32 fallback in *inference*" rule inverted: the
 training path is deliberately F32-master.
 
+For inference paths that must match PyTorch eager BF16 phase math, use the
+shared `serenitymojo.ops` API instead of fusing the expression into one kernel:
+`torch_bf16_eager_blend_with_f32_mask`,
+`torch_bf16_eager_velocity_from_x0`, and `torch_bf16_eager_add_scaled`.
+These helpers intentionally materialize F32 temporaries before final BF16
+round-to-nearest-even stores, matching PyTorch noiser/scheduler boundaries.
+See `docs/MOJO_DIFFUSION_NUMERIC_API.md`.
+
 ### Vendor BLAS matmul import
 ```mojo
 from linalg.matmul.vendor.blas import matmul   # transpose_a/transpose_b + c_row_major

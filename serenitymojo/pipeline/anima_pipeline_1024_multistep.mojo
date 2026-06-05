@@ -142,13 +142,12 @@ def _load_context(
 
 
 def _init_latent(ctx: DeviceContext) raises -> Tensor:
-    """Init latent [1, T, H, W, 16] F32 with Box-Muller Rust-StdRng(seed=42).
-    Matches anima_infer.rs noise generation exactly."""
+    """Init BF16 latent [1, T, H, W, 16] with Box-Muller noise."""
     var numel = LATENT_T_FRAMES * LH * LW * LATENT_C  # 1*128*128*16 = 262144
     # randn generates [numel] in layout [T*H*W*C] = [numel].
     var flat_sh = List[Int]()
     flat_sh.append(numel)
-    var noise_flat = randn(flat_sh^, SEED, STDtype.F32, ctx)
+    var noise_flat = randn(flat_sh^, SEED, STDtype.BF16, ctx)
     # Reshape to [1, T, H, W, 16] (Anima layout)
     var sh5 = List[Int]()
     sh5.append(1)
@@ -236,7 +235,7 @@ def main() raises:
 
     # ── Stage 3: Init noise latent ────────────────────────────────────────────
     print("\n--- Stage 3: Init latent [1,", LATENT_T_FRAMES, ",", LH, ",", LW, ",", LATENT_C, "] ---")
-    var x = _init_latent(ctx)  # F32 noise
+    var x = _init_latent(ctx)
     print("  initial noise mean_abs:", _mean_abs(x, ctx))
 
     # ── Stage 4: Denoise loop ─────────────────────────────────────────────────
@@ -267,15 +266,12 @@ def main() raises:
         var timestep2 = Tensor.from_host(tvals2, tsh2^, STDtype.F32, ctx)
         var pred_uncond = model.forward_with_context(x, timestep2, context_uncond, ctx)
 
-        # CFG: uncond + scale * (cond - uncond)
-        # Cast predictions to F32 for CFG/Euler
-        var pc_f32 = cast_tensor(pred_cond, STDtype.F32, ctx)
-        var pu_f32 = cast_tensor(pred_uncond, STDtype.F32, ctx)
-        var diff = sub(pc_f32, pu_f32, ctx)
+        # CFG/Euler tensor ops use F32 arithmetic internally and store BF16.
+        var diff = sub(pred_cond, pred_uncond, ctx)
         var scaled_diff = mul_scalar(diff, CFG_SCALE, ctx)
-        var pred = add(pu_f32, scaled_diff, ctx)
+        var pred = add(pred_uncond, scaled_diff, ctx)
 
-        # Euler step: x = x + dt * pred  (x stays F32 throughout for max precision)
+        # Euler step: x = x + dt * pred; storage remains BF16.
         var delta = mul_scalar(pred, dt, ctx)
         x = add(x, delta, ctx)
 

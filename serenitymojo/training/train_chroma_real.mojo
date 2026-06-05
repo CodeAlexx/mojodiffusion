@@ -149,6 +149,14 @@ def _absum(v: List[Float32]) -> Float32:
     return s
 
 
+def _absum(v: List[BFloat16]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(v)):
+        var x = v[i].cast[DType.float32]()
+        s += x if x >= 0.0 else -x
+    return s
+
+
 def _global_norm(grads: FluxLoraGradSet) -> Float64:
     var ss = 0.0
     for i in range(len(grads.d_a)):
@@ -258,8 +266,8 @@ def main() raises:
     var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
 
-    # ── 3-axis RoPE tables (positions fixed for 512px; built once, F32) ──────
-    var rope = build_flux1_rope_tables[N_IMG, N_TXT, H, Dh](HT, WT, ctx, STDtype.F32)
+    # ── 3-axis RoPE tables (positions fixed for 512px; built once, BF16) ─────
+    var rope = build_flux1_rope_tables[N_IMG, N_TXT, H, Dh](HT, WT, ctx, STDtype.BF16)
     var cos = rope[0].to_host(ctx)
     var sin = rope[1].to_host(ctx)
     print("[load] chroma 3-axis rope tables built (S*H x Dh/2)")

@@ -537,7 +537,7 @@ def _select_prompt(sample_cfg: SamplePromptConfig, wanted: String) raises -> Sam
     raise Error(String("anima_sample_cli: prompt id not found: ") + wanted)
 
 
-# ── save channels-last latent [B,H,W,C] -> NCHW [1,16,128,128] F32 safetensors ─
+# ── save channels-last latent [B,H,W,C] -> NCHW [1,16,128,128] BF16 safetensors ─
 # Key `latent` (same schema anima_decode_cli + the VAE smoke read).
 def _save_latent_nchw(
     bhwc: List[Float32], path: String, ctx: DeviceContext,
@@ -551,7 +551,7 @@ def _save_latent_nchw(
                     var src = ((b * LATENT_HW + h) * LATENT_HW + w) * C + c
                     var dst = ((b * C + c) * LATENT_HW + h) * LATENT_HW + w
                     nchw[dst] = bhwc[src]
-    var lat = Tensor.from_host(nchw, [1, C, LATENT_HW, LATENT_HW], STDtype.F32, ctx)
+    var lat = Tensor.from_host(nchw, [1, C, LATENT_HW, LATENT_HW], STDtype.BF16, ctx)
     var names = List[String]()
     names.append(String("latent"))
     var tensors = List[ArcPointer[Tensor]]()

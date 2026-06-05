@@ -560,19 +560,19 @@ def wrapped_forward(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Initial pixel noise (1, 3, H, W) F32 — reuse ops/random.randn (GPU).
+# Initial pixel noise (1, 3, H, W) BF16 at the tensor boundary.
 # ─────────────────────────────────────────────────────────────────────────────
 def make_pixel_noise(ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(1); sh.append(3); sh.append(H); sh.append(W)
-    return randn(sh^, SEED, STDtype.F32, ctx)
+    return randn(sh^, SEED, STDtype.BF16, ctx)
 
 
 def sample(
     model: AsymFlux2Klein, caps: KleinCaps, cos: Tensor, sin: Tensor,
     ctx: DeviceContext,
 ) raises -> Tensor:
-    var x_t = make_pixel_noise(ctx)  # (1,3,H,W) F32
+    var x_t = make_pixel_noise(ctx)  # (1,3,H,W) BF16 storage
     var shift = klein_dynamic_shift()
     var sigmas = compute_sigma_schedule(STEPS, shift)
     print("[sample] shift", shift, "sigma0", sigmas[0], "->", sigmas[STEPS - 1])
@@ -580,7 +580,8 @@ def sample(
         var sigma_cur = sigmas[step]
         var sigma_next = sigmas[step + 1]
         # patchify+pack pixel → (1, N_IMG, 768) F32
-        var x_t_packed = pixel_to_packed(x_t, PATCH, ctx)
+        var x_t_compute = cast_tensor(x_t, STDtype.F32, ctx)
+        var x_t_packed = pixel_to_packed(x_t_compute, PATCH, ctx)
         # cond
         var u_cond = wrapped_forward(
             model, x_t_packed, caps.pos, cos, sin, sigma_cur, ctx
@@ -594,7 +595,7 @@ def sample(
             var u_cond_px = velocity_to_pixel(u_cond, H, W, PATCH, ctx)
             var u_uncond_px = velocity_to_pixel(u_uncond, H, W, PATCH, ctx)
             var scaled = mul_scalar(u_cond_px, sigma_cur, ctx)
-            var denoised = sub(x_t, scaled, ctx)
+            var denoised = sub(x_t_compute, scaled, ctx)
             var bias = guidance_bias(
                 u_cond_px, u_uncond_px, CFG_SCALE, CFG_ORTHO, denoised, ctx
             )
@@ -602,10 +603,10 @@ def sample(
         else:
             u_final = velocity_to_pixel(u_cond, H, W, PATCH, ctx)
         # Oklab gamut clamp
-        var u_for_step = clamp_denoised_oklab(x_t, u_final, sigma_cur, ctx)
+        var u_for_step = clamp_denoised_oklab(x_t_compute, u_final, sigma_cur, ctx)
         # Euler: x = x + u * (sigma_next - sigma_cur)
         var dt = sigma_next - sigma_cur
-        x_t = add(x_t, mul_scalar(u_for_step, dt, ctx), ctx)
+        x_t = cast_tensor(add(x_t_compute, mul_scalar(u_for_step, dt, ctx), ctx), STDtype.BF16, ctx)
         if step == 0 or step == STEPS - 1 or step % 5 == 0:
             print("  step", step + 1, "/", STEPS, "sigma", sigma_cur, "->", sigma_next)
     return x_t^

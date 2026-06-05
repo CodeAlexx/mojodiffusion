@@ -1,4 +1,4 @@
-# ops/vec_permute0213.mojo — VECTORIZED specialized [0,2,1,3] permute (F32).
+# ops/vec_permute0213.mojo — VECTORIZED specialized [0,2,1,3] permute.
 #
 # NEW STANDALONE kernel. Does NOT replace ops/tensor_algebra.mojo `permute`; it
 # is a faster sibling for the ONE permutation that dominates DiT attention: the
@@ -21,7 +21,8 @@
 # caller falls back to the general scalar permute (AGENT-DEFAULT: raise, no
 # silent slow tail).
 #
-# Mojo 1.0.0b1, NVIDIA GPU.
+# Mojo 1.0.0b1, NVIDIA GPU. Non-F32 input falls back to the dtype-preserving
+# general permute.
 
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
@@ -30,6 +31,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.tensor_algebra import permute as _general_permute
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -65,13 +67,13 @@ def _vec_permute0213_kernel(
 
 
 def vec_permute0213(x: Tensor, ctx: DeviceContext) raises -> Tensor:
-    """Specialized [0,2,1,3] permute: [B,S,H,Dh] -> [B,H,S,Dh]. F32-only;
-    Dh must be a multiple of 4. Byte-identical to permute(x,[0,2,1,3])."""
-    if x.dtype() != STDtype.F32:
-        raise Error("vec_permute0213: F32-only fast path")
+    """Specialized [0,2,1,3] permute: [B,S,H,Dh] -> [B,H,S,Dh]."""
     var xshape = x.shape()
     if len(xshape) != 4:
         raise Error("vec_permute0213: x must be rank-4 [B,S,H,Dh]")
+    if x.dtype() != STDtype.F32:
+        var perm = [0, 2, 1, 3]
+        return _general_permute(x, perm, ctx)
     var B = xshape[0]
     var S = xshape[1]
     var H = xshape[2]

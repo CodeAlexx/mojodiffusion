@@ -1,4 +1,4 @@
-# ops/vec_modulate.mojo — VECTORIZED fused adaLN modulate (1+scale)*x+shift, F32.
+# ops/vec_modulate.mojo — VECTORIZED fused adaLN modulate, F32 fast path.
 #
 # NEW STANDALONE kernel. Does NOT replace ops/elementwise.mojo `modulate`; it is
 # a faster sibling. Parity gated against the scalar modulate (vec_modulate_parity).
@@ -26,6 +26,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.elementwise import modulate as _scalar_modulate
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -58,10 +59,12 @@ def _vec_modulate_kernel(
 def vec_modulate(
     x: Tensor, scale: Tensor, shift: Tensor, ctx: DeviceContext
 ) raises -> Tensor:
-    """Vectorized modulate(x, scale, shift) = (1+scale)*x + shift. F32-only;
-    D % 4 == 0. Byte-identical to ops/elementwise.mojo modulate (F32 path)."""
+    """Vectorized modulate(x, scale, shift) = (1+scale)*x + shift for F32.
+
+    BF16/F16 use the dtype-preserving scalar implementation instead of
+    materializing F32 fast-path storage."""
     if x.dtype() != STDtype.F32 or scale.dtype() != STDtype.F32 or shift.dtype() != STDtype.F32:
-        raise Error("vec_modulate: F32-only fast path")
+        return _scalar_modulate(x, scale, shift, ctx)
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     var sshape = scale.shape()

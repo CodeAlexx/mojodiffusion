@@ -121,7 +121,7 @@ struct L2PRealAux(Movable):
     layout (patchify16 input proj key: all_x_embedder.16-1.*, timestep MLP
     kept identical key structure; NO all_final_layer in L2P).
     """
-    # t_embedder MLP (BF16 in checkpoint; loaded F32 for host math)
+    # t_embedder MLP (checkpoint dtype; builders cast transient inputs)
     var t_w0: TArc          # [1024, 256]
     var t_b0: TArc          # [1024]
     var t_w2: TArc          # [256, 1024]
@@ -178,32 +178,34 @@ def load_l2p_real_aux(
       * adaLN weight shape = [15360, 256] (4*3840 vs 4*3840; same but for 4D)
       * context_refiner has NO adaLN_modulation keys (not loaded here)
       * NO all_final_layer (local_decoder is a ConvNet head, loaded separately)
-    All loaded as F32 for the host math path (small tensors; match ZImageRealAux).
+    Auxiliary tensors preserve checkpoint dtype; the builder functions below cast
+    transient F32 cache/schedule inputs to the relevant weight dtype before
+    biased linears or norm ops.
     """
     var nr_mod_w = List[TArc]()
     var nr_mod_b = List[TArc]()
     for i in range(num_nr):
         var p = String("noise_refiner.") + String(i) + String(".adaLN_modulation.0")
-        nr_mod_w.append(TArc(_load_l2p_f32_device(st, p + String(".weight"), ctx)))
-        nr_mod_b.append(TArc(_load_l2p_f32_device(st, p + String(".bias"), ctx)))
+        nr_mod_w.append(TArc(_load_l2p_device_preserve(st, p + String(".weight"), ctx)))
+        nr_mod_b.append(TArc(_load_l2p_device_preserve(st, p + String(".bias"), ctx)))
     var main_mod_w = List[TArc]()
     var main_mod_b = List[TArc]()
     for i in range(num_main):
         var p = String("layers.") + String(i) + String(".adaLN_modulation.0")
-        main_mod_w.append(TArc(_load_l2p_f32_device(st, p + String(".weight"), ctx)))
-        main_mod_b.append(TArc(_load_l2p_f32_device(st, p + String(".bias"), ctx)))
+        main_mod_w.append(TArc(_load_l2p_device_preserve(st, p + String(".weight"), ctx)))
+        main_mod_b.append(TArc(_load_l2p_device_preserve(st, p + String(".bias"), ctx)))
     return L2PRealAux(
-        TArc(_load_l2p_f32_device(st, String("t_embedder.mlp.0.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("t_embedder.mlp.0.bias"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("t_embedder.mlp.2.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("t_embedder.mlp.2.bias"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("cap_embedder.0.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("cap_embedder.1.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("cap_embedder.1.bias"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("all_x_embedder.16-1.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("all_x_embedder.16-1.bias"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("x_pad_token"), ctx)),
-        TArc(_load_l2p_f32_device(st, String("cap_pad_token"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("t_embedder.mlp.0.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("t_embedder.mlp.0.bias"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("t_embedder.mlp.2.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("t_embedder.mlp.2.bias"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("cap_embedder.0.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("cap_embedder.1.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("cap_embedder.1.bias"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("all_x_embedder.16-1.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("all_x_embedder.16-1.bias"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("x_pad_token"), ctx)),
+        TArc(_load_l2p_device_preserve(st, String("cap_pad_token"), ctx)),
         nr_mod_w^, nr_mod_b^,
         main_mod_w^, main_mod_b^,
     )
@@ -248,7 +250,8 @@ def build_l2p_adaln(
         var freq = fexp(-log_mp * Float32(i) / Float32(half))
         emb.append(fsin(scaled * freq))
     var t_freq = Tensor.from_host(emb, [1, adaln_dim], STDtype.F32, ctx)
-    var h = linear(t_freq, aux.t_w0[], Optional[Tensor](aux.t_b0[].clone(ctx)), ctx)
+    var t_in = cast_tensor(t_freq, aux.t_w0[].dtype(), ctx)
+    var h = linear(t_in, aux.t_w0[], Optional[Tensor](aux.t_b0[].clone(ctx)), ctx)
     var ha = silu(h, ctx)
     return linear(ha, aux.t_w2[], Optional[Tensor](aux.t_b2[].clone(ctx)), ctx)
 
@@ -261,7 +264,8 @@ def build_l2p_block_modvecs(
     mod_w: Tensor, mod_b: Tensor, adaln: Tensor, D: Int, ctx: DeviceContext
 ) raises -> ZImageModVecs:
     """Build RAW 4-chunk modvec for one L2P block. Identical to build_block_modvecs."""
-    var mod = linear(adaln, mod_w, Optional[Tensor](mod_b.clone(ctx)), ctx)
+    var adaln_in = cast_tensor(adaln, mod_w.dtype(), ctx)
+    var mod = linear(adaln_in, mod_w, Optional[Tensor](mod_b.clone(ctx)), ctx)
     var h = mod.to_host(ctx)
     return ZImageModVecs(
         _slice_cols_l2p(h, 1, 4 * D, 0 * D, D),
@@ -275,8 +279,10 @@ def build_l2p_block_modvecs(
 def build_l2p_cap_seq(
     aux: L2PRealAux, cap_feats: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> List[Float32]:
-    var normed = rms_norm(cap_feats, aux.cap_norm[], eps, ctx)
-    var emb = linear(normed, aux.cap_lin_w[], Optional[Tensor](aux.cap_lin_b[].clone(ctx)), ctx)
+    var cap_in = cast_tensor(cap_feats, aux.cap_norm[].dtype(), ctx)
+    var normed = rms_norm(cap_in, aux.cap_norm[], eps, ctx)
+    var normed_in = cast_tensor(normed, aux.cap_lin_w[].dtype(), ctx)
+    var emb = linear(normed_in, aux.cap_lin_w[], Optional[Tensor](aux.cap_lin_b[].clone(ctx)), ctx)
     return emb.to_host(ctx)
 
 
@@ -303,7 +309,8 @@ def build_l2p_x_seq(
     # reshape [ht*wt, 768]
     var patches = reshape_owned(pm^, [ht * wt, P * P * 3])
     # linear -> [ht*wt, D]
-    var emb = linear(patches, aux.x_w[], Optional[Tensor](aux.x_b[].clone(ctx)), ctx)
+    var patches_in = cast_tensor(patches, aux.x_w[].dtype(), ctx)
+    var emb = linear(patches_in, aux.x_w[], Optional[Tensor](aux.x_b[].clone(ctx)), ctx)
     return emb.to_host(ctx)
 
 

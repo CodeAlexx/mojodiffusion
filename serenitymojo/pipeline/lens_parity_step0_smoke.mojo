@@ -396,8 +396,9 @@ def make_temb(sigma: Float32, resident: LensResident, ctx: DeviceContext) raises
     var tsh = List[Int]()
     tsh.append(1)
     var t = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)
-    var proj = timestep_embedding(t, TEMB_DIM, ctx)
-    var proj_bf16 = cast_tensor(proj, STDtype.BF16, ctx)
+    var proj_bf16 = timestep_embedding(
+        t, TEMB_DIM, ctx, Float32(10000.0), STDtype.BF16
+    )
     var l1w = cast_tensor(resident.temb_lin1_w, STDtype.BF16, ctx)
     var l1b = cast_tensor(resident.temb_lin1_b, STDtype.BF16, ctx)
     var l2w = cast_tensor(resident.temb_lin2_w, STDtype.BF16, ctx)

@@ -98,12 +98,51 @@ def _run[B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int](
     return a.passed and b.passed and c.passed
 
 
+def _run_bf16[B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int](
+    ctx: DeviceContext, tag: String
+) raises -> Bool:
+    var h = ParityHarness()
+    var nq = B * Sq * H * Dh
+    var nkv = B * Skv * H * Dh
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var sb = sdpa_backward_rect[B, Sq, Skv, H, Dh](
+        Tensor.from_host(_fq(nq), _bshd(B, Sq, H, Dh), STDtype.BF16, ctx),
+        Tensor.from_host(_fk(nkv), _bshd(B, Skv, H, Dh), STDtype.BF16, ctx),
+        Tensor.from_host(_fv(nkv), _bshd(B, Skv, H, Dh), STDtype.BF16, ctx),
+        Tensor.from_host(_fdo(nq), _bshd(B, Sq, H, Dh), STDtype.BF16, ctx),
+        scale, ctx,
+    )
+    if (
+        sb.d_q.dtype() != STDtype.BF16
+        or sb.d_k.dtype() != STDtype.BF16
+        or sb.d_v.dtype() != STDtype.BF16
+    ):
+        raise Error(
+            tag
+            + ": expected BF16 gradient storage, got d_q="
+            + sb.d_q.dtype().name()
+            + " d_k="
+            + sb.d_k.dtype().name()
+            + " d_v="
+            + sb.d_v.dtype().name()
+        )
+    var a = h.compare(sb.d_q, _read_bin(REF_DIR + tag + "_dq.bin"), ctx)
+    var b = h.compare(sb.d_k, _read_bin(REF_DIR + tag + "_dk.bin"), ctx)
+    var c = h.compare(sb.d_v, _read_bin(REF_DIR + tag + "_dv.bin"), ctx)
+    print("[", tag, " BF16]")
+    print("    d_q cos:", a.cos)
+    print("    d_k cos:", b.cos)
+    print("    d_v cos:", c.cos)
+    return a.cos >= 0.99 and b.cos >= 0.99 and c.cos >= 0.99
+
+
 def main() raises:
     var ctx = DeviceContext()
     var ok = True
     print("=== RECTANGULAR SDPA BACKWARD parity (S_q != S_kv) ===")
     # SDXL cross-attn class (Dh=64).
     ok = _run[1, 64, 77, 5, 64](ctx, String("rect_Sq64_Skv77_H5_Dh64")) and ok
+    ok = _run_bf16[1, 64, 77, 5, 64](ctx, String("rect_Sq64_Skv77_H5_Dh64")) and ok
     # Anima cross-attn class (Dh=128).
     ok = _run[1, 96, 16, 4, 128](ctx, String("rect_Sq96_Skv16_H4_Dh128")) and ok
     print("")

@@ -26,8 +26,9 @@
 #   (i+1)%2==1 (i.e. i even: 0,2,...,22 = 12 sliding layers), else "full".
 #   At T/2 <= 128 the sliding mask is all-zeros == full == no mask, so
 #   sdpa_nomask is exact (block-0 gate S=64; full gate SP=100). At T/2 > 128 the
-#   sliding layers build the |i-j|<=window mask [1,H,S,S] F32 and run sdpa_tiled
-#   (full-mask, online softmax, no [S,S] OOM); full layers stay sdpa_nomask.
+#   sliding layers build the |i-j|<=window mask [1,H,S,S] in Q's storage dtype
+#   and run sdpa_tiled (full-mask, online softmax, no [S,S] OOM); full layers
+#   stay sdpa_nomask.
 #   Verified: long-seq gate SP=300 cos=0.99976 vs canonical (forcing all-global
 #   diverges to 0.9919 — the mask is load-bearing). See _self_attn /
 #   _build_sliding_mask + acestep_full_longseq_gate.mojo.
@@ -211,12 +212,13 @@ def _tile_rows_kernel(
         dst[idx] = rebind[dst.element_type](src[src_idx])
 
 
-# ── bidirectional sliding-window additive mask [1,H,S,S] F32 ─────────────────
+# ── bidirectional sliding-window additive mask [1,H,S,S] storage dtype ───────
 # Matches canonical create_4d_mask(is_sliding_window=True, is_causal=False):
 #   keep (0.0) where |i-j| <= window, else large-negative (-1e9, == MLX/finfo).
-# F32 so it feeds sdpa_tiled's _scale_mask_f32 path directly.
-def _sliding_mask_kernel(
-    dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+# The tensor boundary matches q/k/v storage; sdpa_tiled casts the mask scalar to
+# F32 internally for score math.
+def _sliding_mask_kernel[dtype: DType](
+    dst: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     h: Int, s: Int, window: Int,
 ):
     var idx = Int(global_idx.x)
@@ -229,27 +231,51 @@ def _sliding_mask_kernel(
         if d < 0:
             d = -d
         if d <= window:
-            dst[idx] = rebind[dst.element_type](Float32(0.0))
+            dst[idx] = rebind[dst.element_type](Float32(0.0).cast[dtype]())
         else:
-            dst[idx] = rebind[dst.element_type](Float32(-1.0e9))
+            var blocked = Float32(-30000.0)
+            comptime if dtype == DType.float32:
+                blocked = Float32(-1.0e9)
+            dst[idx] = rebind[dst.element_type](blocked.cast[dtype]())
 
 
 def _build_sliding_mask(
-    h: Int, s: Int, window: Int, ctx: DeviceContext
+    h: Int, s: Int, window: Int, dtype: STDtype, ctx: DeviceContext
 ) raises -> Tensor:
     var n = h * s * s
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)  # F32
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
     var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
-    var DST = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
-    )
-    ctx.enqueue_function[_sliding_mask_kernel, _sliding_mask_kernel](
-        DST, h, s, window, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = dtype.to_mojo_dtype()
+    if dt == DType.float32:
+        var DST = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        ctx.enqueue_function[
+            _sliding_mask_kernel[DType.float32],
+            _sliding_mask_kernel[DType.float32],
+        ](DST, h, s, window, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var DST = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        ctx.enqueue_function[
+            _sliding_mask_kernel[DType.bfloat16],
+            _sliding_mask_kernel[DType.bfloat16],
+        ](DST, h, s, window, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.float16:
+        var DST = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        ctx.enqueue_function[
+            _sliding_mask_kernel[DType.float16],
+            _sliding_mask_kernel[DType.float16],
+        ](DST, h, s, window, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        raise Error("_build_sliding_mask: expected F32/BF16/F16 dtype")
     ctx.synchronize()
     var sh = [1, h, s, s]
-    return Tensor(out_buf^, sh^, STDtype.F32)
+    return Tensor(out_buf^, sh^, dtype)
 
 
 # Self-attention (S==SKV, with RoPE). layer_type: 0=full, 1=sliding(window).
@@ -291,7 +317,7 @@ def _self_attn[S: Int](
     # when S <= window (mask is all-zeros == no mask), sdpa_nomask is exact.
     var attn: Tensor
     if layer_type == 1 and S > window:
-        var smask = _build_sliding_mask(nh, S, window, ctx)
+        var smask = _build_sliding_mask(nh, S, window, qh.dtype(), ctx)
         attn = sdpa_tiled[1, S, 16, 128](qh, kfull, vfull, smask, scale, ctx)
     else:
         attn = sdpa_nomask[1, S, 16, 128](qh, kfull, vfull, scale, ctx)
@@ -577,8 +603,9 @@ def _time_embed(
     var t_scaled = List[Float32]()
     t_scaled.append(t_val * 1000.0)
     var t_t = Tensor.from_host(t_scaled, [1], STDtype.F32, ctx)
-    var emb_f32 = timestep_embedding(t_t, 256, ctx)          # [1,256] F32
-    var emb = cast_tensor(emb_f32, STDtype.BF16, ctx)
+    var emb = timestep_embedding(
+        t_t, 256, ctx, Float32(10000.0), STDtype.BF16
+    )
     # linear_1 -> silu -> linear_2
     var l1 = linear(emb, _w(bw, prefix + ".linear_1.weight", ctx),
                     Optional[Tensor](_w(bw, prefix + ".linear_1.bias", ctx)), ctx)

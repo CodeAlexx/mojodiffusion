@@ -1201,11 +1201,12 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
         ref b0 = self._shared(prefix + ".mlp.0.bias")
         ref w2 = self._shared(prefix + ".mlp.2.weight")
         ref b2 = self._shared(prefix + ".mlp.2.bias")
-        # sinusoidal freq embed [N,256] F32 (cos-first), cast to BF16.
-        var fe = timestep_embedding(t, 256, ctx, Float32(10000.0))  # [N,256] F32
+        # sinusoidal freq embed [N,256] in MLP weight dtype (cos-first).
+        var fe = timestep_embedding(
+            t, 256, ctx, Float32(10000.0), w0.dtype()
+        )
         var n = fe.shape()[0]
-        var fe_bf16 = _cast_f32_to_bf16(fe, ctx)
-        var f3d = _reshape3(fe_bf16, 1, n, 256, ctx)
+        var f3d = _reshape3(fe, 1, n, 256, ctx)
         var h0 = linear(f3d, w0, Optional(_clone(b0, ctx)), ctx)
         h0 = silu(h0, ctx)
         var h2 = linear(h0, w2, Optional(_clone(b2, ctx)), ctx)

@@ -2,7 +2,7 @@
 #
 # Loads spatial-x2 and temporal-x2 weights, runs the BARE upsampler forward on
 # the small fixed latents dumped by parity/ref_dump.py, and reports cosine
-# similarity vs the PyTorch reference output. Gate target: cos >= 0.999.
+# similarity vs the BF16 PyTorch reference output. Gate target: cos >= 0.999.
 #
 # Reference .bin layout is NCDHW (PyTorch). conv3d/group_norm here run NDHWC,
 # so we transpose in on load and out before comparison.
@@ -18,7 +18,7 @@ from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDO
 from std.memory import alloc
 from serenitymojo.models.upsampler.ltx2_upsampler import LatentUpsampler
 
-comptime F32 = STDtype.F32
+comptime MODEL_DTYPE = STDtype.BF16
 comptime PD = "/home/alex/mojodiffusion/serenitymojo/models/upsampler/parity"
 comptime SPATIAL_W = "/home/alex/.serenity/models/ltx2_upscalers/ltx-2-spatial-upscaler-x2-1.0.safetensors"
 comptime TEMPORAL_W = "/home/alex/.serenity/models/ltx2_upscalers/ltx-2-temporal-upscaler-x2-1.0.safetensors"
@@ -119,7 +119,7 @@ def _run_one(
     var lat_ndhwc = _ncdhw_to_ndhwc(lat_ncdhw, N, C, Din, Hin, Win)
     var in_shape = List[Int]()
     in_shape.append(N); in_shape.append(Din); in_shape.append(Hin); in_shape.append(Win); in_shape.append(C)
-    var lat_t = Tensor.from_host(lat_ndhwc, in_shape^, F32, ctx)
+    var lat_t = Tensor.from_host(lat_ndhwc, in_shape^, MODEL_DTYPE, ctx)
 
     var out_t = model.forward(lat_t, ctx)
     var osh = out_t.shape()

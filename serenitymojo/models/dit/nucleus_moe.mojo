@@ -19,18 +19,24 @@
 #
 # Out of scope here (caller handles): the router matmul + softmax + transpose
 # producing `affinity [B,E,S]`, the modulation split (modulated -> experts,
-# unmodulated -> router), and the shared-expert FFN add. F32 storage path
-# (matches the F32 parity gate; BF16 weights are cast up before the GEMMs).
+# unmodulated -> router), and the shared-expert FFN add. Tensor boundaries
+# preserve x/weight storage dtype; F32 remains inside GEMM/scatter math.
 
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu import global_idx
+from std.utils.index import IndexList
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 from serenitymojo.tensor import Tensor
-from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import swiglu
-from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import gather_rows
 from serenitymojo.ops.moe import gated_scatter_add
+
+
+comptime _DYN1 = Layout.row_major(-1)
+comptime _BLOCK = 256
 
 
 # ── expert-choice routing plan (host-side; mirrors expert_choice_route) ───────
@@ -142,9 +148,154 @@ def expert_choice_route(
     )
 
 
+def _gate_up_slab_kernel[dtype: DType](
+    src: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    gate: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    up: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    expert: Int,
+    d: Int,
+    inter: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = inter * d
+    if idx < total:
+        var ni = idx // d
+        var di = idx % d
+        var two_inter = inter * 2
+        var src_base = expert * d * two_inter + di * two_inter
+        gate[idx] = rebind[gate.element_type](
+            rebind[Scalar[dtype]](src[src_base + ni])
+        )
+        up[idx] = rebind[up.element_type](
+            rebind[Scalar[dtype]](src[src_base + inter + ni])
+        )
+
+
+def _down_slab_kernel[dtype: DType](
+    src: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dst: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    expert: Int,
+    d: Int,
+    inter: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = d * inter
+    if idx < total:
+        var di = idx // inter
+        var fi = idx % inter
+        var src_idx = expert * inter * d + fi * d + di
+        dst[idx] = rebind[dst.element_type](
+            rebind[Scalar[dtype]](src[src_idx])
+        )
+
+
+def _enqueue_gate_up_slabs(
+    gate_up_w: Tensor,
+    gate_buf: DeviceBuffer[DType.uint8],
+    up_buf: DeviceBuffer[DType.uint8],
+    expert: Int,
+    d: Int,
+    inter: Int,
+    ctx: DeviceContext,
+) raises:
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](gate_up_w.numel()))
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](inter * d))
+    var grid = (inter * d + _BLOCK - 1) // _BLOCK
+    var dt = gate_up_w.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var src = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            gate_up_w.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        var gate = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            gate_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        var up = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            up_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        ctx.enqueue_function[
+            _gate_up_slab_kernel[DType.float32],
+            _gate_up_slab_kernel[DType.float32],
+        ](src, gate, up, expert, d, inter, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var src = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            gate_up_w.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        var gate = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            gate_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        var up = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            up_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        ctx.enqueue_function[
+            _gate_up_slab_kernel[DType.bfloat16],
+            _gate_up_slab_kernel[DType.bfloat16],
+        ](src, gate, up, expert, d, inter, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var src = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            gate_up_w.buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        var gate = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            gate_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        var up = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            up_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        ctx.enqueue_function[
+            _gate_up_slab_kernel[DType.float16],
+            _gate_up_slab_kernel[DType.float16],
+        ](src, gate, up, expert, d, inter, grid_dim=grid, block_dim=_BLOCK)
+
+
+def _enqueue_down_slab(
+    down_w: Tensor,
+    down_buf: DeviceBuffer[DType.uint8],
+    expert: Int,
+    d: Int,
+    inter: Int,
+    ctx: DeviceContext,
+) raises:
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](down_w.numel()))
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d * inter))
+    var grid = (d * inter + _BLOCK - 1) // _BLOCK
+    var dt = down_w.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var src = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            down_w.buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        var dst = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            down_buf.unsafe_ptr().bitcast[Float32](), out_rl
+        )
+        ctx.enqueue_function[
+            _down_slab_kernel[DType.float32],
+            _down_slab_kernel[DType.float32],
+        ](src, dst, expert, d, inter, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var src = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            down_w.buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        var dst = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            down_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+        )
+        ctx.enqueue_function[
+            _down_slab_kernel[DType.bfloat16],
+            _down_slab_kernel[DType.bfloat16],
+        ](src, dst, expert, d, inter, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var src = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            down_w.buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        var dst = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            down_buf.unsafe_ptr().bitcast[Float16](), out_rl
+        )
+        ctx.enqueue_function[
+            _down_slab_kernel[DType.float16],
+            _down_slab_kernel[DType.float16],
+        ](src, dst, expert, d, inter, grid_dim=grid, block_dim=_BLOCK)
+
+
 # ── expert-choice grouped SwiGLU FFN ──────────────────────────────────────────
 def nucleus_moe_expert_forward(
-    x_flat: Tensor,        # [B*S, D]  modulated hidden states (compute dtype)
+    x_flat: Tensor,        # [B*S, D]  modulated hidden states (storage dtype)
     affinity: Tensor,      # [B, E, S] F32
     gate_up_w: Tensor,     # [E, D, 2*inter]  per-expert stacked gate||up
     down_w: Tensor,        # [E, inter, D]
@@ -152,7 +303,7 @@ def nucleus_moe_expert_forward(
     route_scale: Float32,
     ctx: DeviceContext,
 ) raises -> Tensor:
-    """SwiGLU MoE expert forward (expert-choice). Returns [B*S, D] F32.
+    """SwiGLU MoE expert forward (expert-choice). Returns [B*S, D] in x dtype.
 
     Mirrors flame-core nucleus_moe_expert_forward step-for-step but with a
     per-expert loop (callable `linear`) instead of a grouped GEMM, and reusing
@@ -177,26 +328,21 @@ def nucleus_moe_expert_forward(
     var dwd = down_w.shape()
     if len(dwd) != 3 or dwd[0] != e or dwd[1] != inter or dwd[2] != d:
         raise Error("nucleus_moe_expert_forward: down_w must be [E, inter, D]")
-
-    # Cast weights / x up to F32 for the callable `linear` path (F32 storage).
-    # cast_tensor no-op-clones when already F32, so this is uniform.
-    var x_f32 = cast_tensor(x_flat, STDtype.F32, ctx)
-    var gate_up_f32 = cast_tensor(gate_up_w, STDtype.F32, ctx)
-    var down_f32 = cast_tensor(down_w, STDtype.F32, ctx)
+    var storage = x_flat.dtype()
+    _ = storage.to_mojo_dtype()
+    if gate_up_w.dtype() != storage or down_w.dtype() != storage:
+        raise Error("nucleus_moe_expert_forward: x/weight dtype mismatch")
 
     var plan = expert_choice_route(affinity, capacity, route_scale, ctx)
     var total_tokens = plan.batch_size * plan.seq_len
 
-    # Per-expert weight host copies (slice into per-expert [F,H] / [H,F] tensors).
-    var gate_up_host = gate_up_f32.to_host(ctx)  # E * D * (2*inter)
-    var down_host = down_f32.to_host(ctx)        # E * inter * D
-
-    # Accumulator [N, D] F32 zero-init; gated_scatter_add writes into it.
-    var acc_bytes = total_tokens * d * 4
+    # Accumulator [N, D] in model storage dtype. gated_scatter_add uses private
+    # F32 atomic scratch for BF16/F16 and writes back before returning.
+    var acc_bytes = total_tokens * d * storage.byte_size()
     var acc_buf = ctx.enqueue_create_buffer[DType.uint8](acc_bytes)
     ctx.enqueue_memset[DType.uint8](acc_buf, 0)
     ctx.synchronize()
-    var accum = Tensor(acc_buf^, [total_tokens, d], STDtype.F32)
+    var accum = Tensor(acc_buf^, [total_tokens, d], storage)
 
     var bc = plan.batch_size * plan.capacity  # picks per expert
 
@@ -210,36 +356,27 @@ def nucleus_moe_expert_forward(
             gidx[c] = plan.global_token_indices[slot0 + c]
 
         # Gather this expert's token rows -> [bc, D] via foundation gather_rows.
-        var x_e = gather_rows(x_f32, gidx, ctx)  # [bc, D] F32
+        var x_e = gather_rows(x_flat, gidx, ctx)  # [bc, D]
 
-        # Upload this expert's gate_up [D, 2*inter] and down [inter, D] slabs.
+        # Slice this expert's gate_up [D, 2*inter] and down [inter, D] slabs on
+        # device, preserving storage dtype. linear() wants weight [out, in].
         # gate_up_w is [E, D, 2*inter]; linear() wants weight [out, in].
         # gate proj: out=inter, in=D  -> rows are cols [0:inter] of gate_up.
-        # We slice host-side into [inter, D] (gate) / [inter, D] (up) / [D, inter] (down).
-        var gbase = ei * d * two_inter
-        var gate_slab = List[Float32]()
-        var up_slab = List[Float32]()
-        gate_slab.resize(inter * d, Float32(0.0))
-        up_slab.resize(inter * d, Float32(0.0))
-        # gate_up_host[(di)*two_inter + ni] for di in [0,D), ni in [0,two_inter).
-        # gate weight[o=ni, in=di] = gate_up[di, ni]; up weight[o=ni-inter, di].
-        for di in range(d):
-            var row = gbase + di * two_inter
-            for ni in range(inter):
-                gate_slab[ni * d + di] = gate_up_host[row + ni]
-                up_slab[ni * d + di] = gate_up_host[row + inter + ni]
-        var dbase = ei * inter * d
-        var down_slab = List[Float32]()
-        down_slab.resize(d * inter, Float32(0.0))
         # down_w [E, inter, D]; down weight[o=di, in=fi] = down[fi, di].
-        for fi in range(inter):
-            var drow = dbase + fi * d
-            for di in range(d):
-                down_slab[di * inter + fi] = down_host[drow + di]
-
-        var gate_we = Tensor.from_host(gate_slab, [inter, d], STDtype.F32, ctx)
-        var up_we = Tensor.from_host(up_slab, [inter, d], STDtype.F32, ctx)
-        var down_we = Tensor.from_host(down_slab, [d, inter], STDtype.F32, ctx)
+        var gate_buf = ctx.enqueue_create_buffer[DType.uint8](
+            inter * d * storage.byte_size()
+        )
+        var up_buf = ctx.enqueue_create_buffer[DType.uint8](
+            inter * d * storage.byte_size()
+        )
+        var down_buf = ctx.enqueue_create_buffer[DType.uint8](
+            d * inter * storage.byte_size()
+        )
+        _enqueue_gate_up_slabs(gate_up_w, gate_buf, up_buf, ei, d, inter, ctx)
+        _enqueue_down_slab(down_w, down_buf, ei, d, inter, ctx)
+        var gate_we = Tensor(gate_buf^, [inter, d], storage)
+        var up_we = Tensor(up_buf^, [inter, d], storage)
+        var down_we = Tensor(down_buf^, [d, inter], storage)
 
         var g_proj = linear(x_e, gate_we, None, ctx)   # [bc, inter]
         var u_proj = linear(x_e, up_we, None, ctx)      # [bc, inter]

@@ -216,6 +216,14 @@ def _abs_sum(h: List[Float32]) -> Float64:
     return s
 
 
+def _abs_sum(h: List[BFloat16]) -> Float64:
+    var s = Float64(0.0)
+    for i in range(len(h)):
+        var x = h[i].cast[DType.float32]()
+        s += Float64(x) if x >= 0.0 else Float64(-x)
+    return s
+
+
 def _scale_inplace(mut h: List[Float32], s: Float32):
     for i in range(len(h)):
         h[i] = h[i] * s
@@ -277,7 +285,8 @@ def _sample_sigma_idx(state0: UInt64) -> Tuple[Int, UInt64]:
 # ─────────────────────────────────────────────────────────────────────────────
 # shared-AdaLN SOURCE (the deferred E2/E5 link). Built from the RESIDENT base
 # weights + sigma_idx. Mirrors ernie_image.mojo time_embed/shared_adaln + the
-# final-norm chunk, and ernie_image.rs:519-552. All F32 (ErnieStackBase is F32).
+# final-norm chunk, and ernie_image.rs:519-552. Sinusoid math is F32, then
+# cast to the resident time-weight dtype before the MLP.
 #   c   = linear2(silu(linear1(timestep_embedding_sin_first(idx))))
 #   mv  = chunk6(silu(c) @ adaln_w + adaln_b)
 #   fs  = chunk2(c @ final_norm_w + final_norm_b)  -> [f_scale, f_shift]
@@ -298,9 +307,10 @@ def _shared_adaln_source(
     var ts = List[Float32]()
     ts.append(Float32(sigma_idx))
     var ts_t = Tensor.from_host(ts, [1], STDtype.F32, ctx)
-    # time embed: sin-first sinusoid -> linear1 -> silu -> linear2  (all F32)
-    var emb = timestep_embedding_sin_first(ts_t, D, ctx, 10000.0)   # [1,D]
-    var h1 = linear(emb, base.te_w1[], Optional[Tensor](base.te_b1[].clone(ctx)), ctx)
+    var emb_in = timestep_embedding_sin_first(
+        ts_t, D, ctx, 10000.0, base.te_w1[].dtype()
+    )
+    var h1 = linear(emb_in, base.te_w1[], Optional[Tensor](base.te_b1[].clone(ctx)), ctx)
     h1 = silu(h1, ctx)
     var c = linear(h1, base.te_w2[], Optional[Tensor](base.te_b2[].clone(ctx)), ctx)  # [1,D]
 
@@ -543,7 +553,7 @@ def main() raises:
     # text_len_real for axis-0 offset: use N_TXT (the comptime trim) — every real
     # token is within [0,N_TXT). build_ernie_rope_tables requires real in (0,N_TXT].
     var rope = build_ernie_rope_tables[N_IMG, N_TXT, H, Dh](
-        IMG_H, IMG_W, N_TXT, ctx, STDtype.F32
+        IMG_H, IMG_W, N_TXT, ctx, STDtype.BF16
     )
     print("  RoPE tables built: cos/sin [S*H, Dh] = [", S * H, ",", Dh, "]")
 
@@ -596,7 +606,7 @@ def main() raises:
         var f_shift = src[2].copy()
 
         # ── device-resident LoRA forward (BF16 base blocks loaded once) ──
-        var lora_dev = ernie_lora_set_to_device(lora, STDtype.F32, ctx)
+        var lora_dev = ernie_lora_set_to_device(lora, STDtype.BF16, ctx)
         var fwd = ernie_stack_lora_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
             noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
             f_scale.copy(), f_shift.copy(), rope[0], rope[1],

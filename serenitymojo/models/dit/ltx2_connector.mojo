@@ -57,8 +57,8 @@ from serenitymojo.ops.tensor_algebra import (
     mul,
     mul_scalar,
 )
-from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.rope import rope_halfsplit
+from serenitymojo.ops.cast import cast_tensor
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -174,39 +174,16 @@ struct LTX2ConnectorWeights(Movable):
                 var src = bp + lv[1]
                 var tv = st.tensor_view(src)
                 name_to_idx[canon + lv[0]] = len(weights)
-                # F32 weights: the connector is small (8 blocks, GPU-light) and
-                # its activations grow to |x|~5e3 across blocks, where BF16 GEMM
-                # (cuBLASLt vs torch) disagrees too much to gate at cos>=0.999.
-                # F32 throughout is strictly more accurate and gives an
-                # apples-to-apples gate vs the F32 Python reference.
-                weights.append(
-                    ArcPointer(
-                        cast_tensor(
-                            Tensor.from_view_as_bf16(tv, ctx), STDtype.F32, ctx
-                        )
-                    )
-                )
+                weights.append(ArcPointer(Tensor.from_view_as_bf16(tv, ctx)))
 
             # Optional per-head gate (present in ComfyUI 22B for both connectors).
             if _st_has(st, bp + "attn1.to_gate_logits.weight"):
                 var gw = st.tensor_view(bp + "attn1.to_gate_logits.weight")
                 name_to_idx[canon + "attn1.to_gate_logits.weight"] = len(weights)
-                weights.append(
-                    ArcPointer(
-                        cast_tensor(
-                            Tensor.from_view_as_bf16(gw, ctx), STDtype.F32, ctx
-                        )
-                    )
-                )
+                weights.append(ArcPointer(Tensor.from_view_as_bf16(gw, ctx)))
                 var gb = st.tensor_view(bp + "attn1.to_gate_logits.bias")
                 name_to_idx[canon + "attn1.to_gate_logits.bias"] = len(weights)
-                weights.append(
-                    ArcPointer(
-                        cast_tensor(
-                            Tensor.from_view_as_bf16(gb, ctx), STDtype.F32, ctx
-                        )
-                    )
-                )
+                weights.append(ArcPointer(Tensor.from_view_as_bf16(gb, ctx)))
 
         return LTX2ConnectorWeights(weights^, name_to_idx^, config)
 
@@ -217,6 +194,18 @@ struct LTX2ConnectorWeights(Movable):
         if name not in self.name_to_idx:
             raise Error(String("LTX2 connector: missing weight ") + name)
         return self.weights[self.name_to_idx[name]][]
+
+    def to_f32(self, ctx: DeviceContext) raises -> LTX2ConnectorWeights:
+        """Return a copy with every connector weight cast to F32.
+
+        This is for Python-oracle parity gates that intentionally run the whole
+        connector/DiT stack in F32. The production entrypoints keep BF16 storage
+        and rely on F32 accumulation inside kernels.
+        """
+        var weights = List[ArcPointer[Tensor]]()
+        for ref w in self.weights:
+            weights.append(ArcPointer(cast_tensor(w[], STDtype.F32, ctx)))
+        return LTX2ConnectorWeights(weights^, self.name_to_idx.copy(), self.config)
 
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
         var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
@@ -265,8 +254,8 @@ def _shape4(a: Int, b: Int, c: Int, d: Int) -> List[Int]:
 
 # RMSNorm with NO affine (ones weight) over the last dim — connector norm1/norm2
 # and the final norm have no weight in the checkpoint (ltx2_model.rs uses
-# rms_norm(x, None, eps) for those). Preserves the input dtype (the whole
-# connector runs in F32 for the parity gate).
+# rms_norm(x, None, eps) for those). Preserves the input dtype; kernels
+# accumulate in F32 and store back to the hidden dtype.
 def _rms_norm_no_affine(
     x: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> Tensor:
@@ -403,13 +392,12 @@ def _connector_attention[N: Int, H: Int, Dh: Int](
 
 
 # ── connector block (no AdaLN) ───────────────────────────────────────────────
-# Runs in F32 throughout (see ltx2_connector_forward). The audio connector's
-# activations grow to |x|~5e3 across 8 blocks, where BF16 GEMM disagrees between
-# frameworks; F32 is strictly more accurate and gives a clean parity gate vs the
-# F32 Python reference. Op-by-op math identical to the Rust connector.
+# Hidden/weight storage follows the incoming dtype (BF16 in the active LTX2
+# runtime). Linear, norm, attention, and RoPE kernels still use F32 internal
+# accumulation before storing back to that dtype.
 def _connector_block_forward[N: Int, H: Int, Dh: Int](
     weights: LTX2ConnectorWeights,
-    hidden: Tensor,   # [1, N, inner] F32 residual accumulator
+    hidden: Tensor,   # [1, N, inner] BF16 in the active runtime
     block_idx: Int,
     eps: Float32,
     rope_cos: Tensor,
@@ -450,15 +438,15 @@ def ltx2_connector_forward[N: Int, H: Int, Dh: Int](
     if H != cfg.num_heads or Dh != cfg.head_dim:
         raise Error("ltx2_connector_forward: H/Dh != config")
 
-    # F32 throughout (see _connector_block_forward). RoPE table in F32.
+    # RoPE kernels require x/cos/sin dtype parity and accumulate internally in F32.
     var rope = build_connector_rope_1d(
         N, cfg.num_heads, cfg.head_dim, cfg.rope_theta, cfg.rope_max_pos,
-        STDtype.F32, ctx,
+        x.dtype(), ctx,
     )
     ref rope_cos = rope[0]
     ref rope_sin = rope[1]
 
-    var h = cast_tensor(x, STDtype.F32, ctx)
+    var h = weights._clone(x, ctx)
     for i in range(cfg.num_blocks):
         h = _connector_block_forward[N, H, Dh](
             weights, h, i, cfg.eps, rope_cos, rope_sin, ctx

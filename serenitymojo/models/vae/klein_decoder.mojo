@@ -42,11 +42,11 @@ comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
 
 
-def _inverse_bn_kernel_f32(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _inverse_bn_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     H: Int,
     W: Int,
     n: Int,
@@ -55,15 +55,16 @@ def _inverse_bn_kernel_f32(
     if i < n:
         var hw = H * W
         var c = (i // hw) % PACKED_CH
-        var v = rebind[Scalar[DType.float32]](x[i])
+        # BN stats are F32 file/stat parameters; activation storage remains dtype.
+        var v = rebind[Scalar[dtype]](x[i]).cast[DType.float32]()
         var s = rebind[Scalar[DType.float32]](scale[c])
         var b = rebind[Scalar[DType.float32]](bias[c])
-        o[i] = rebind[o.element_type](v * s + b)
+        o[i] = rebind[o.element_type]((v * s + b).cast[dtype]())
 
 
-def _unpatchify_packed_kernel_f32(
-    x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
-    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+def _unpatchify_packed_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     B: Int,
     H: Int,
     W: Int,
@@ -87,7 +88,7 @@ def _unpatchify_packed_kernel_f32(
         var iw = ow // 2
         var pc = (c * 2 + ph) * 2 + pw
         var src = ((b * PACKED_CH + pc) * H + ih) * W + iw
-        o[idx] = rebind[o.element_type](rebind[Scalar[DType.float32]](x[src]))
+        o[idx] = rebind[o.element_type](rebind[Scalar[dtype]](x[src]))
 
 
 def _inverse_bn(
@@ -96,64 +97,110 @@ def _inverse_bn(
     var sh = x.shape()
     if len(sh) != 4 or sh[1] != PACKED_CH:
         raise Error("_inverse_bn: expected [B,128,H,W]")
-    if x.dtype() != STDtype.F32:
-        raise Error("_inverse_bn: current Klein VAE path expects F32 latents")
     var H = sh[2]
     var W = sh[3]
     var n = x.numel()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var crl = RuntimeLayout[_DYN1].row_major(IndexList[1](PACKED_CH))
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         scale.buf.unsafe_ptr().bitcast[Float32](), crl
     )
     var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
         bias.buf.unsafe_ptr().bitcast[Float32](), crl
     )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), rl
-    )
     var grid = (n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[_inverse_bn_kernel_f32, _inverse_bn_kernel_f32](
-        X, S, B, O, H, W, n, grid_dim=grid, block_dim=_BLOCK
-    )
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_inverse_bn_kernel[DType.float32], _inverse_bn_kernel[DType.float32]](
+            X, S, B, O, H, W, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_inverse_bn_kernel[DType.bfloat16], _inverse_bn_kernel[DType.bfloat16]](
+            X, S, B, O, H, W, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.float16:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_inverse_bn_kernel[DType.float16], _inverse_bn_kernel[DType.float16]](
+            X, S, B, O, H, W, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        raise Error("_inverse_bn: unsupported storage dtype")
     ctx.synchronize()
-    return Tensor(out_buf^, sh^, STDtype.F32)
+    return Tensor(out_buf^, sh^, x.dtype())
 
 
 def _unpatchify_packed(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     var sh = x.shape()
     if len(sh) != 4 or sh[1] != PACKED_CH:
         raise Error("_unpatchify_packed: expected [B,128,H,W]")
-    if x.dtype() != STDtype.F32:
-        raise Error("_unpatchify_packed: current Klein VAE path expects F32")
     var B = sh[0]
     var H = sh[2]
     var W = sh[3]
     var out_n = B * LATENT_CH * H * 2 * W * 2
-    var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_n * 4)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        out_n * x.dtype().byte_size()
+    )
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](x.numel()))
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_n))
-    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
-    )
-    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        out_buf.unsafe_ptr().bitcast[Float32](), o_rl
-    )
     var grid = (out_n + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _unpatchify_packed_kernel_f32, _unpatchify_packed_kernel_f32
-    ](X, O, B, H, W, grid_dim=grid, block_dim=_BLOCK)
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[_unpatchify_packed_kernel[DType.float32], _unpatchify_packed_kernel[DType.float32]](
+            X, O, B, H, W, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[_unpatchify_packed_kernel[DType.bfloat16], _unpatchify_packed_kernel[DType.bfloat16]](
+            X, O, B, H, W, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.float16:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[_unpatchify_packed_kernel[DType.float16], _unpatchify_packed_kernel[DType.float16]](
+            X, O, B, H, W, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        raise Error("_unpatchify_packed: unsupported storage dtype")
     ctx.synchronize()
     var osh = List[Int]()
     osh.append(B)
     osh.append(LATENT_CH)
     osh.append(H * 2)
     osh.append(W * 2)
-    return Tensor(out_buf^, osh^, STDtype.F32)
+    return Tensor(out_buf^, osh^, x.dtype())
 
 
 def _load_bn_scale(st: ShardedSafeTensors, ctx: DeviceContext) raises -> Tensor:
@@ -204,7 +251,7 @@ struct KleinVaeDecoder[LH: Int, LW: Int](Movable):
         var p = String("decoder")
         return KleinVaeDecoder[Self.LH, Self.LW](
             _load_bn_scale(st, ctx),
-            _load_weight(st, String("bn.running_mean"), ctx),
+            cast_tensor(_load_weight(st, String("bn.running_mean"), ctx), STDtype.F32, ctx),
             _load_conv_weight_rscf(st, String("post_quant_conv.weight"), ctx),
             _load_weight(st, String("post_quant_conv.bias"), ctx),
             _load_conv_weight_rscf(st, p + ".conv_in.weight", ctx),
@@ -270,7 +317,8 @@ struct KleinVaeDecoder[LH: Int, LW: Int](Movable):
         )
 
     def decode(self, packed_latent_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
-        """[1,128,LH,LW] -> [1,3,16*LH,16*LW]. Input must be F32.
+        """[1,128,LH,LW] -> [1,3,16*LH,16*LW]. Preserves input storage dtype
+        through inverse-BN/unpack, then casts to the VAE weight dtype.
 
         Weights may be F32 (flux2-vae.safetensors) or BF16 (ERNIE vae). The
         activation is cast to match the weight dtype before the first conv so

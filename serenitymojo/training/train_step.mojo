@@ -76,6 +76,20 @@ def _abs_sum(h: List[Float32]) -> Float32:
     return s
 
 
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
+
+
+def _bf16_to_f32_list(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
 # ── inline MSE leaf (loss_swiglu_backward.mse_backward is UNIMPORTABLE — same as
 #    zimage_train_step / composed_chain_parity) ───────────────────────────────
 def _mse_loss(pred_h: List[Float32], tgt_h: List[Float32]) -> Float32:
@@ -117,8 +131,8 @@ def _make_block_weights(cfg: TrainConfig, seed: UInt64) raises -> BlockWeights:
 # y = x@Wᵀ; delta y += scale·(x@Aᵀ)@Bᵀ, A:[rank,in], B:[out,rank],
 # scale=(alpha/rank)·multiplier. Train A,B; base W FROZEN. Proven linear path.
 struct LoraAdapter(Copyable, Movable):
-    var a: List[Float32]   # [rank, in]
-    var b: List[Float32]   # [out, rank]
+    var a: List[BFloat16]  # [rank, in] BF16 model storage
+    var b: List[BFloat16]  # [out, rank] BF16 model storage
     var rank: Int
     var in_f: Int
     var out_f: Int
@@ -134,8 +148,8 @@ struct LoraAdapter(Copyable, Movable):
         var ma: List[Float32], var va: List[Float32],
         var mb: List[Float32], var vb: List[Float32],
     ):
-        self.a = a^
-        self.b = b^
+        self.a = _f32_to_bf16_list(a)
+        self.b = _f32_to_bf16_list(b)
         self.rank = rank
         self.in_f = in_f
         self.out_f = out_f
@@ -165,14 +179,14 @@ def _lora_fwd(
 ) raises -> List[Float32]:
     var nb1 = Optional[Tensor](None)
     var t = linear(
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         nb1^, ctx,
     ).to_host(ctx)                                   # [M,rank]
     var nb2 = Optional[Tensor](None)
     var dy = linear(
-        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
+        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
         nb2^, ctx,
     ).to_host(ctx)                                   # [M,out]
     var out = List[Float32]()
@@ -196,25 +210,25 @@ def _lora_bwd(
 ) raises -> LoraGrads:
     var nb_t = Optional[Tensor](None)
     var t = linear(
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         nb_t^, ctx,
     ).to_host(ctx)                                   # [M,rank]
     var d_dy = List[Float32]()
     for i in range(len(d_contrib_h)):
         d_dy.append(lo.scale * d_contrib_h[i])       # [M,out]
     var lbB = linear_backward(
-        Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.F32, ctx),
-        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(lo.b.copy(), [lo.out_f, lo.rank], STDtype.F32, ctx),
+        Tensor.from_host(d_dy^, [M, lo.out_f], STDtype.BF16, ctx),
+        Tensor.from_host(t.copy(), [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
         M, lo.rank, lo.out_f, ctx,
     )
     var d_t = lbB.d_x.to_host(ctx)                   # [M,rank]
     var d_b = lbB.d_w.to_host(ctx)                   # [out_f,rank]
     var lbA = linear_backward(
-        Tensor.from_host(d_t^, [M, lo.rank], STDtype.F32, ctx),
-        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.F32, ctx),
-        Tensor.from_host(lo.a.copy(), [lo.rank, lo.in_f], STDtype.F32, ctx),
+        Tensor.from_host(d_t^, [M, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host(x_h.copy(), [M, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
         M, lo.in_f, lo.rank, ctx,
     )
     var d_a = lbA.d_w.to_host(ctx)                   # [rank,in_f]
@@ -225,7 +239,7 @@ def _lora_bwd(
 # stored as List[Float32] in the Klein trainer; doing this update on host avoids
 # per-adapter GPU upload/readback churn while matching optim.adamw_step's formula.
 def _adamw_host_list(
-    mut p: List[Float32], g: List[Float32],
+    mut p: List[BFloat16], g: List[Float32],
     mut m: List[Float32], mut v: List[Float32],
     t: Int, lr: Float32, beta1: Float32, beta2: Float32,
     eps: Float32, weight_decay: Float32,
@@ -252,10 +266,10 @@ def _adamw_host_list(
         v[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
+        var pv = p[i].cast[DType.float32]() - lr * m_hat / (sqrt(v_hat) + eps)
         if weight_decay > 0.0:
             pv = pv - lr * weight_decay * pv
-        p[i] = pv
+        p[i] = BFloat16(pv)
 
 
 # AdamW one step on a LoRA adapter (A and B).

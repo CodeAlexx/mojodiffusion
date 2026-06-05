@@ -4,12 +4,12 @@
 # Mirrors EDv2 crates/eridiffusion-core/src/lycoris.rs LoKr save
 # (lycoris.rs:878-893) and upstream lycoris/modules/lokr.py custom_state_dict:
 #
-#       "<prefix>.lokr_w1.weight"     F32 [out_l, in_m]        (W1 full)        OR
-#       "<prefix>.lokr_w1_a.weight"   F32 [out_l, rank]        (W1 factored)    +
-#       "<prefix>.lokr_w1_b.weight"   F32 [rank, in_m]
-#       "<prefix>.lokr_w2.weight"     F32 [out_k, in_n]        (W2 full)        OR
-#       "<prefix>.lokr_w2_a.weight"   F32 [out_k, rank]        (W2 factored)    +
-#       "<prefix>.lokr_w2_b.weight"   F32 [rank, in_n]
+#       "<prefix>.lokr_w1.weight"     BF16 [out_l, in_m]       (W1 full)        OR
+#       "<prefix>.lokr_w1_a.weight"   BF16 [out_l, rank]       (W1 factored)    +
+#       "<prefix>.lokr_w1_b.weight"   BF16 [rank, in_m]
+#       "<prefix>.lokr_w2.weight"     BF16 [out_k, in_n]       (W2 full)        OR
+#       "<prefix>.lokr_w2_a.weight"   BF16 [out_k, rank]       (W2 factored)    +
+#       "<prefix>.lokr_w2_b.weight"   BF16 [rank, in_n]
 #       "<prefix>.alpha"              F32 [1]
 #
 # Both W1-full and W1-factored (decompose_both) paths now ship. The conv-only
@@ -43,11 +43,11 @@ struct NamedLoKr(Copyable, Movable):
     var adapter: LoKrAdapter
 
 
-def _f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+def _bf16_2d(var values: List[BFloat16], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(rows)
     sh.append(cols)
-    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+    return Tensor.from_host_bf16(values^, sh^, ctx)
 
 
 def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
@@ -56,6 +56,13 @@ def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
     var sh = List[Int]()
     sh.append(1)
     return Tensor.from_host(v^, sh^, STDtype.F32, ctx)
+
+
+def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
+    var out = List[BFloat16]()
+    for i in range(len(v)):
+        out.append(BFloat16(v[i]))
+    return out^
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,14 +88,14 @@ def save_lokr_peft(
             if len(a.w1b) != R * IM:
                 raise Error(String("save_lokr_peft: w1b numel mismatch for '") + nk.prefix + "'")
             names.append(nk.prefix + ".lokr_w1_a.weight")
-            tensors.append(ArcPointer(_f32_2d(a.w1a.copy(), OL, R, ctx)))
+            tensors.append(ArcPointer(_bf16_2d(a.w1a.copy(), OL, R, ctx)))
             names.append(nk.prefix + ".lokr_w1_b.weight")
-            tensors.append(ArcPointer(_f32_2d(a.w1b.copy(), R, IM, ctx)))
+            tensors.append(ArcPointer(_bf16_2d(a.w1b.copy(), R, IM, ctx)))
         else:
             if len(a.w1) != OL * IM:
                 raise Error(String("save_lokr_peft: w1 numel ") + String(len(a.w1)) + " != out_l*in_m for '" + nk.prefix + "'")
             names.append(nk.prefix + ".lokr_w1.weight")
-            tensors.append(ArcPointer(_f32_2d(a.w1.copy(), OL, IM, ctx)))
+            tensors.append(ArcPointer(_bf16_2d(a.w1.copy(), OL, IM, ctx)))
 
         if a.w2_factored:
             if len(a.w2a) != OK * R:
@@ -96,14 +103,14 @@ def save_lokr_peft(
             if len(a.w2b) != R * INn:
                 raise Error(String("save_lokr_peft: w2b numel mismatch for '") + nk.prefix + "'")
             names.append(nk.prefix + ".lokr_w2_a.weight")
-            tensors.append(ArcPointer(_f32_2d(a.w2a.copy(), OK, R, ctx)))
+            tensors.append(ArcPointer(_bf16_2d(a.w2a.copy(), OK, R, ctx)))
             names.append(nk.prefix + ".lokr_w2_b.weight")
-            tensors.append(ArcPointer(_f32_2d(a.w2b.copy(), R, INn, ctx)))
+            tensors.append(ArcPointer(_bf16_2d(a.w2b.copy(), R, INn, ctx)))
         else:
             if len(a.w2) != OK * INn:
                 raise Error(String("save_lokr_peft: w2 numel mismatch for '") + nk.prefix + "'")
             names.append(nk.prefix + ".lokr_w2.weight")
-            tensors.append(ArcPointer(_f32_2d(a.w2.copy(), OK, INn, ctx)))
+            tensors.append(ArcPointer(_bf16_2d(a.w2.copy(), OK, INn, ctx)))
 
         names.append(nk.prefix + ".alpha")
         tensors.append(ArcPointer(_f32_scalar(a.alpha, ctx)))
@@ -129,6 +136,10 @@ def _read_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[
     return t.to_host(ctx)
 
 
+def _read_bf16(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[BFloat16]:
+    return _f32_to_bf16_list(_read_f32(st, name, ctx))
+
+
 def _has_key(st: SafeTensors, name: String) -> Bool:
     try:
         var _info = st.tensor_info(name)
@@ -140,13 +151,13 @@ def _has_key(st: SafeTensors, name: String) -> Bool:
 # A read-back of one LoKr module: W1 + (W2 full OR W2_a/W2_b) + shapes + alpha.
 @fieldwise_init
 struct LoKrReadback(Copyable, Movable):
-    var w1: List[Float32]
-    var w1a: List[Float32]
-    var w1b: List[Float32]
+    var w1: List[BFloat16]
+    var w1a: List[BFloat16]
+    var w1b: List[BFloat16]
     var w1_factored: Bool
-    var w2: List[Float32]
-    var w2a: List[Float32]
-    var w2b: List[Float32]
+    var w2: List[BFloat16]
+    var w2a: List[BFloat16]
+    var w2b: List[BFloat16]
     var w2_factored: Bool
     var out_l: Int
     var out_k: Int
@@ -165,9 +176,9 @@ def read_lokr_module(prefix: String, path: String, ctx: DeviceContext) raises ->
     var st = SafeTensors.open(path)
 
     # ── W1 ──
-    var w1 = List[Float32]()
-    var w1a = List[Float32]()
-    var w1b = List[Float32]()
+    var w1 = List[BFloat16]()
+    var w1a = List[BFloat16]()
+    var w1b = List[BFloat16]()
     var w1_factored = _has_key(st, prefix + ".lokr_w1_a.weight")
     var OL: Int
     var IM: Int
@@ -180,18 +191,18 @@ def read_lokr_module(prefix: String, path: String, ctx: DeviceContext) raises ->
         IM = i1b.shape[1]
         if i1b.shape[0] != R1:
             raise Error("read_lokr_module: w1b rows != rank")
-        w1a = _read_f32(st, prefix + ".lokr_w1_a.weight", ctx)
-        w1b = _read_f32(st, prefix + ".lokr_w1_b.weight", ctx)
+        w1a = _read_bf16(st, prefix + ".lokr_w1_a.weight", ctx)
+        w1b = _read_bf16(st, prefix + ".lokr_w1_b.weight", ctx)
     else:
         var i1 = st.tensor_info(prefix + ".lokr_w1.weight")
         OL = i1.shape[0]
         IM = i1.shape[1]
-        w1 = _read_f32(st, prefix + ".lokr_w1.weight", ctx)
+        w1 = _read_bf16(st, prefix + ".lokr_w1.weight", ctx)
 
     # ── W2 ──
-    var w2 = List[Float32]()
-    var w2a = List[Float32]()
-    var w2b = List[Float32]()
+    var w2 = List[BFloat16]()
+    var w2a = List[BFloat16]()
+    var w2b = List[BFloat16]()
     var factored = _has_key(st, prefix + ".lokr_w2_a.weight")
     var OK: Int
     var INn: Int
@@ -204,14 +215,14 @@ def read_lokr_module(prefix: String, path: String, ctx: DeviceContext) raises ->
         INn = ib.shape[1]
         if ib.shape[0] != R:
             raise Error("read_lokr_module: w2b rows != rank")
-        w2a = _read_f32(st, prefix + ".lokr_w2_a.weight", ctx)
-        w2b = _read_f32(st, prefix + ".lokr_w2_b.weight", ctx)
+        w2a = _read_bf16(st, prefix + ".lokr_w2_a.weight", ctx)
+        w2b = _read_bf16(st, prefix + ".lokr_w2_b.weight", ctx)
     else:
         var i2 = st.tensor_info(prefix + ".lokr_w2.weight")
         OK = i2.shape[0]
         INn = i2.shape[1]
         R = 0
-        w2 = _read_f32(st, prefix + ".lokr_w2.weight", ctx)
+        w2 = _read_bf16(st, prefix + ".lokr_w2.weight", ctx)
 
     # Single LoKr rank: when both factored, the ranks must match.
     if w1_factored and factored and R1 != R:

@@ -38,11 +38,12 @@ from std.math import exp as fexp, log as flog, cos as fcos, sin as fsin
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.tensor_algebra import reshape, permute, reshape_owned
-from serenitymojo.models.zimage.weights import _load_f32_device
+from serenitymojo.models.zimage.weights import _load_device_preserve, _load_f32_device
 from serenitymojo.models.zimage.block import ZImageModVecs
 
 
@@ -67,8 +68,10 @@ def _slice_cols(v: List[Float32], rows: Int, cols: Int, col0: Int, w: Int) -> Li
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Holder for the frozen embedder / modulation / final-layer weights. Loaded ONCE
-# (device-resident F32). The trainer keeps this and rebuilds per-step inputs.
+# Holder for the frozen embedder / modulation / final-layer weights. Loaded ONCE.
+# Builder-owned biased linears cast transient inputs to checkpoint weight dtype.
+# The final projection remains F32 until the stack forward's host-F32 biased
+# helper is converted outside this loader scope.
 # ─────────────────────────────────────────────────────────────────────────────
 struct ZImageRealAux(Movable):
     # t_embedder mlp
@@ -136,29 +139,32 @@ def load_zimage_real_aux(
     var nr_mod_b = List[TArc]()
     for i in range(num_nr):
         var p = String("noise_refiner.") + String(i) + String(".adaLN_modulation.0")
-        nr_mod_w.append(TArc(_load_f32_device(st, p + String(".weight"), ctx)))
-        nr_mod_b.append(TArc(_load_f32_device(st, p + String(".bias"), ctx)))
+        nr_mod_w.append(TArc(_load_device_preserve(st, p + String(".weight"), ctx)))
+        nr_mod_b.append(TArc(_load_device_preserve(st, p + String(".bias"), ctx)))
     var main_mod_w = List[TArc]()
     var main_mod_b = List[TArc]()
     for i in range(num_main):
         var p = String("layers.") + String(i) + String(".adaLN_modulation.0")
-        main_mod_w.append(TArc(_load_f32_device(st, p + String(".weight"), ctx)))
-        main_mod_b.append(TArc(_load_f32_device(st, p + String(".bias"), ctx)))
+        main_mod_w.append(TArc(_load_device_preserve(st, p + String(".weight"), ctx)))
+        main_mod_b.append(TArc(_load_device_preserve(st, p + String(".bias"), ctx)))
     return ZImageRealAux(
-        TArc(_load_f32_device(st, String("t_embedder.mlp.0.weight"), ctx)),
-        TArc(_load_f32_device(st, String("t_embedder.mlp.0.bias"), ctx)),
-        TArc(_load_f32_device(st, String("t_embedder.mlp.2.weight"), ctx)),
-        TArc(_load_f32_device(st, String("t_embedder.mlp.2.bias"), ctx)),
-        TArc(_load_f32_device(st, String("cap_embedder.0.weight"), ctx)),
-        TArc(_load_f32_device(st, String("cap_embedder.1.weight"), ctx)),
-        TArc(_load_f32_device(st, String("cap_embedder.1.bias"), ctx)),
-        TArc(_load_f32_device(st, String("all_x_embedder.2-1.weight"), ctx)),
-        TArc(_load_f32_device(st, String("all_x_embedder.2-1.bias"), ctx)),
-        TArc(_load_f32_device(st, String("x_pad_token"), ctx)),
-        TArc(_load_f32_device(st, String("cap_pad_token"), ctx)),
+        TArc(_load_device_preserve(st, String("t_embedder.mlp.0.weight"), ctx)),
+        TArc(_load_device_preserve(st, String("t_embedder.mlp.0.bias"), ctx)),
+        TArc(_load_device_preserve(st, String("t_embedder.mlp.2.weight"), ctx)),
+        TArc(_load_device_preserve(st, String("t_embedder.mlp.2.bias"), ctx)),
+        TArc(_load_device_preserve(st, String("cap_embedder.0.weight"), ctx)),
+        TArc(_load_device_preserve(st, String("cap_embedder.1.weight"), ctx)),
+        TArc(_load_device_preserve(st, String("cap_embedder.1.bias"), ctx)),
+        TArc(_load_device_preserve(st, String("all_x_embedder.2-1.weight"), ctx)),
+        TArc(_load_device_preserve(st, String("all_x_embedder.2-1.bias"), ctx)),
+        TArc(_load_device_preserve(st, String("x_pad_token"), ctx)),
+        TArc(_load_device_preserve(st, String("cap_pad_token"), ctx)),
         nr_mod_w^, nr_mod_b^, main_mod_w^, main_mod_b^,
-        TArc(_load_f32_device(st, String("all_final_layer.2-1.adaLN_modulation.1.weight"), ctx)),
-        TArc(_load_f32_device(st, String("all_final_layer.2-1.adaLN_modulation.1.bias"), ctx)),
+        TArc(_load_device_preserve(st, String("all_final_layer.2-1.adaLN_modulation.1.weight"), ctx)),
+        TArc(_load_device_preserve(st, String("all_final_layer.2-1.adaLN_modulation.1.bias"), ctx)),
+        # BUG: the stack final projection still takes host-F32 x_out with a
+        # biased linear helper outside this loader scope, so these two still
+        # upcast BF16 checkpoints until that call site casts to weight dtype.
         TArc(_load_f32_device(st, String("all_final_layer.2-1.linear.weight"), ctx)),
         TArc(_load_f32_device(st, String("all_final_layer.2-1.linear.bias"), ctx)),
     )
@@ -181,7 +187,8 @@ def build_adaln(
         var freq = fexp(-log_mp * Float32(i) / Float32(half))
         emb.append(fsin(scaled * freq))
     var t_freq = Tensor.from_host(emb, [1, adaln_dim], STDtype.F32, ctx)
-    var h = linear(t_freq, aux.t_w0[], Optional[Tensor](aux.t_b0[].clone(ctx)), ctx)
+    var t_in = cast_tensor(t_freq, aux.t_w0[].dtype(), ctx)
+    var h = linear(t_in, aux.t_w0[], Optional[Tensor](aux.t_b0[].clone(ctx)), ctx)
     var ha = silu(h, ctx)
     return linear(ha, aux.t_w2[], Optional[Tensor](aux.t_b2[].clone(ctx)), ctx)  # [1,256]
 
@@ -190,7 +197,8 @@ def build_adaln(
 def build_block_modvecs(
     mod_w: Tensor, mod_b: Tensor, adaln: Tensor, D: Int, ctx: DeviceContext
 ) raises -> ZImageModVecs:
-    var mod = linear(adaln, mod_w, Optional[Tensor](mod_b.clone(ctx)), ctx)  # [1,4D]
+    var adaln_in = cast_tensor(adaln, mod_w.dtype(), ctx)
+    var mod = linear(adaln_in, mod_w, Optional[Tensor](mod_b.clone(ctx)), ctx)  # [1,4D]
     var h = mod.to_host(ctx)
     return ZImageModVecs(
         _slice_cols(h, 1, 4 * D, 0 * D, D),   # scale_msa
@@ -207,7 +215,8 @@ def build_f_scale(
     aux: ZImageRealAux, adaln: Tensor, D: Int, ctx: DeviceContext
 ) raises -> List[Float32]:
     var c_silu = silu(adaln, ctx)
-    var raw = linear(c_silu, aux.final_mod_w[], Optional[Tensor](aux.final_mod_b[].clone(ctx)), ctx)  # [1,D]
+    var c_in = cast_tensor(c_silu, aux.final_mod_w[].dtype(), ctx)
+    var raw = linear(c_in, aux.final_mod_w[], Optional[Tensor](aux.final_mod_b[].clone(ctx)), ctx)  # [1,D]
     var h = raw.to_host(ctx)
     var o = List[Float32]()
     for i in range(D):
@@ -220,8 +229,10 @@ def build_f_scale(
 def build_cap_seq(
     aux: ZImageRealAux, cap_feats: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> List[Float32]:
-    var normed = rms_norm(cap_feats, aux.cap_norm[], eps, ctx)
-    var emb = linear(normed, aux.cap_lin_w[], Optional[Tensor](aux.cap_lin_b[].clone(ctx)), ctx)
+    var cap_in = cast_tensor(cap_feats, aux.cap_norm[].dtype(), ctx)
+    var normed = rms_norm(cap_in, aux.cap_norm[], eps, ctx)
+    var normed_in = cast_tensor(normed, aux.cap_lin_w[].dtype(), ctx)
+    var emb = linear(normed_in, aux.cap_lin_w[], Optional[Tensor](aux.cap_lin_b[].clone(ctx)), ctx)
     return emb.to_host(ctx)
 
 
@@ -241,7 +252,8 @@ def build_x_seq(
     perm.append(1); perm.append(3); perm.append(2); perm.append(4); perm.append(0)
     var pm = permute(v5, perm^, ctx)
     var patches = reshape_owned(pm^, [ht * wt, p * p * C])   # [IMG_TOK, 64]
-    var emb = linear(patches, aux.x_w[], Optional[Tensor](aux.x_b[].clone(ctx)), ctx)  # [IMG_TOK, D]
+    var patches_in = cast_tensor(patches, aux.x_w[].dtype(), ctx)
+    var emb = linear(patches_in, aux.x_w[], Optional[Tensor](aux.x_b[].clone(ctx)), ctx)  # [IMG_TOK, D]
     return emb.to_host(ctx)
 
 

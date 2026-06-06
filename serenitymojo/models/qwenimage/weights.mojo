@@ -21,7 +21,8 @@
 # ModVecs themselves are computed per-step (modulation depends on the timestep).
 #
 # Mojo 1.0.0b1, NVIDIA GPU. Qwen-Image base is BF16 in the checkpoint; loaded
-# host lists are cast up to F32 (training master precision).
+# checkpoint tensors stay in their stored dtype. F32 is used for generated
+# modulation values and host-side training scalars, not for base weight storage.
 
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
@@ -40,15 +41,20 @@ from serenitymojo.models.qwenimage.qwenimage_block import (
 from serenitymojo.models.qwenimage.qwenimage_stack import QwenStackBase
 
 
-# Read one named tensor from the sharded transformer as a host List[Float32]
-# (casts up from the stored dtype — Qwen-Image base is BF16).
-def _load_host_f32(
+comptime TArc = ArcPointer[Tensor]
+
+
+def _load_tensor(
     st: ShardedSafeTensors, name: String, ctx: DeviceContext
-) raises -> List[Float32]:
+) raises -> Tensor:
     var tv = st.tensor_view(name)
-    var t = Tensor.from_view(tv, ctx)
-    var t32 = cast_tensor(t, STDtype.F32, ctx)
-    return t32.to_host(ctx)
+    return Tensor.from_view(tv, ctx)
+
+
+def _cast_to_weight_dtype(var x: Tensor, weight: Tensor, ctx: DeviceContext) raises -> Tensor:
+    if x.dtype() == weight.dtype():
+        return x^
+    return cast_tensor(x, weight.dtype(), ctx)
 
 
 # ── per-stream weights from a block (img or txt prefix selects the projections) ─
@@ -81,21 +87,20 @@ def _stream_weights_from_block(
         mlp = ".txt_mlp"
 
     return StreamWeights(
-        _load_host_f32(st, block_prefix + qp + ".weight", ctx),
-        _load_host_f32(st, block_prefix + kp + ".weight", ctx),
-        _load_host_f32(st, block_prefix + vp + ".weight", ctx),
-        _load_host_f32(st, block_prefix + qp + ".bias", ctx),
-        _load_host_f32(st, block_prefix + kp + ".bias", ctx),
-        _load_host_f32(st, block_prefix + vp + ".bias", ctx),
-        _load_host_f32(st, block_prefix + op + ".weight", ctx),
-        _load_host_f32(st, block_prefix + op + ".bias", ctx),
-        _load_host_f32(st, block_prefix + mlp + ".net.0.proj.weight", ctx),
-        _load_host_f32(st, block_prefix + mlp + ".net.0.proj.bias", ctx),
-        _load_host_f32(st, block_prefix + mlp + ".net.2.weight", ctx),
-        _load_host_f32(st, block_prefix + mlp + ".net.2.bias", ctx),
-        _load_host_f32(st, block_prefix + nqp + ".weight", ctx),
-        _load_host_f32(st, block_prefix + nkp + ".weight", ctx),
-        D, F, Dh, ctx,
+        TArc(_load_tensor(st, block_prefix + qp + ".weight", ctx)),
+        TArc(_load_tensor(st, block_prefix + kp + ".weight", ctx)),
+        TArc(_load_tensor(st, block_prefix + vp + ".weight", ctx)),
+        TArc(_load_tensor(st, block_prefix + qp + ".bias", ctx)),
+        TArc(_load_tensor(st, block_prefix + kp + ".bias", ctx)),
+        TArc(_load_tensor(st, block_prefix + vp + ".bias", ctx)),
+        TArc(_load_tensor(st, block_prefix + op + ".weight", ctx)),
+        TArc(_load_tensor(st, block_prefix + op + ".bias", ctx)),
+        TArc(_load_tensor(st, block_prefix + mlp + ".net.0.proj.weight", ctx)),
+        TArc(_load_tensor(st, block_prefix + mlp + ".net.0.proj.bias", ctx)),
+        TArc(_load_tensor(st, block_prefix + mlp + ".net.2.weight", ctx)),
+        TArc(_load_tensor(st, block_prefix + mlp + ".net.2.bias", ctx)),
+        TArc(_load_tensor(st, block_prefix + nqp + ".weight", ctx)),
+        TArc(_load_tensor(st, block_prefix + nkp + ".weight", ctx)),
     )
 
 
@@ -124,10 +129,12 @@ def load_qwen_stack_base(
     # scale is applied OUTSIDE the stack (caller pre-normalizes), so here txt_in is
     # just the projection. img_in/txt_in/proj_out are biased linears.
     return QwenStackBase(
-        _load_host_f32(st, "img_in.weight", ctx), _load_host_f32(st, "img_in.bias", ctx),
-        _load_host_f32(st, "txt_in.weight", ctx), _load_host_f32(st, "txt_in.bias", ctx),
-        _load_host_f32(st, "proj_out.weight", ctx), _load_host_f32(st, "proj_out.bias", ctx),
-        D, in_ch, txt_ch, out_ch, ctx,
+        TArc(_load_tensor(st, "img_in.weight", ctx)),
+        TArc(_load_tensor(st, "img_in.bias", ctx)),
+        TArc(_load_tensor(st, "txt_in.weight", ctx)),
+        TArc(_load_tensor(st, "txt_in.bias", ctx)),
+        TArc(_load_tensor(st, "proj_out.weight", ctx)),
+        TArc(_load_tensor(st, "proj_out.bias", ctx)),
     )
 
 
@@ -137,15 +144,14 @@ def load_qwen_stack_base(
 # linear for this block+stream. Returns the 6 chunks shift1,scale1,gate1,shift2,
 # scale2,gate2 each [D] (diffusers chunk order, qwenimage.rs:1683).
 def modvecs_from_temb(
-    temb_h: List[Float32], mod_w: List[Float32], mod_b: List[Float32],
+    temb_h: List[Float32], mod_w: Tensor, mod_b: Tensor,
     D: Int, ctx: DeviceContext,
 ) raises -> ModVecs:
     var temb = Tensor.from_host(temb_h.copy(), [1, D], STDtype.F32, ctx)
     var act = silu(temb, ctx)
-    var bt = Tensor.from_host(mod_b.copy(), [6 * D], STDtype.F32, ctx)
+    var act_in = _cast_to_weight_dtype(act, mod_w, ctx)
     var mods = linear(
-        act, Tensor.from_host(mod_w.copy(), [6 * D, D], STDtype.F32, ctx),
-        Optional[Tensor](bt^), ctx,
+        act_in, mod_w, Optional[Tensor](mod_b), ctx,
     ).to_host(ctx)   # [1,6D]
     return ModVecs(
         _chunk_d(mods, 0, D), _chunk_d(mods, 1, D), _chunk_d(mods, 2, D),
@@ -185,22 +191,20 @@ def build_qwen_per_block_mods(
     var txt_mods = List[ModVecs]()
     for bi in range(num_double):
         var p = String("transformer_blocks.") + String(bi)
-        var imw = _load_host_f32(st, p + ".img_mod.1.weight", ctx)
-        var imb = _load_host_f32(st, p + ".img_mod.1.bias", ctx)
-        var tmw = _load_host_f32(st, p + ".txt_mod.1.weight", ctx)
-        var tmb = _load_host_f32(st, p + ".txt_mod.1.bias", ctx)
+        var imw = _load_tensor(st, p + ".img_mod.1.weight", ctx)
+        var imb = _load_tensor(st, p + ".img_mod.1.bias", ctx)
+        var tmw = _load_tensor(st, p + ".txt_mod.1.weight", ctx)
+        var tmb = _load_tensor(st, p + ".txt_mod.1.bias", ctx)
         img_mods.append(modvecs_from_temb(temb_h, imw, imb, D, ctx))
         txt_mods.append(modvecs_from_temb(temb_h, tmw, tmb, D, ctx))
 
     # final layer: norm_out.linear -> [2D]: chunk 0 scale, chunk 1 shift
     var temb = Tensor.from_host(temb_h.copy(), [1, D], STDtype.F32, ctx)
     var act = silu(temb, ctx)
-    var fb = _load_host_f32(st, "norm_out.linear.bias", ctx)
-    var fw = _load_host_f32(st, "norm_out.linear.weight", ctx)
-    var fmods = linear(
-        act, Tensor.from_host(fw^, [2 * D, D], STDtype.F32, ctx),
-        Optional[Tensor](Tensor.from_host(fb^, [2 * D], STDtype.F32, ctx)), ctx,
-    ).to_host(ctx)   # [1,2D]
+    var fb = _load_tensor(st, "norm_out.linear.bias", ctx)
+    var fw = _load_tensor(st, "norm_out.linear.weight", ctx)
+    var act_in = _cast_to_weight_dtype(act, fw, ctx)
+    var fmods = linear(act_in, fw, Optional[Tensor](fb), ctx).to_host(ctx)   # [1,2D]
     var fscale = List[Float32]()
     var fshift = List[Float32]()
     for i in range(D):

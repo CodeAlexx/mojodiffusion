@@ -18,7 +18,10 @@
 #   matches torch.nn.functional rms_norm (verified in ops_smoke.mojo vs numpy).
 #
 # F32 accumulation: x² sum and the normalize/scale arithmetic are all F32 even
-# for BF16/F16 storage; only the final store casts down.
+# for BF16/F16 storage; only the final store casts down. If checkpoint norm
+# weights use a different storage dtype than the activation, the tiny [D] weight
+# vector is cast inside this op to the activation dtype before dispatch. That is
+# an intentional compute boundary so model loaders can preserve checkpoint dtype.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -32,6 +35,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -150,7 +154,7 @@ def rms_norm(
     """RMS-normalize over the last dim of x, then scale by `weight`.
 
     x:      [..., D]   (any compute dtype; leading dims flattened to rows)
-    weight: [D]        (same dtype as x)
+    weight: [D]        (same dtype as x, or checkpoint storage dtype)
     returns [..., D]   (x's dtype; F32-accumulated reduction).
     """
     var xshape = x.shape()
@@ -166,7 +170,8 @@ def rms_norm(
             + String(len(wshape))
         )
     if x.dtype() != weight.dtype():
-        raise Error("rms_norm: x and weight dtype mismatch")
+        var compute_weight = cast_tensor(weight, x.dtype(), ctx)
+        return rms_norm(x, compute_weight^, eps, ctx)
     var rows = 1
     for i in range(len(xshape) - 1):
         rows *= xshape[i]

@@ -15,6 +15,10 @@
 # ── 1) RoPePrecomputed backward ──────────────────────────────────────────────
 # Forward (rope.mojo) rotates pairs of channels by a precomputed angle theta;
 # cos/sin are NON-learnable tables (no grad), so backward yields only d_x.
+# BF16/F16 activations may carry F32 cos/sin tables: diffusers Flux/Klein uses
+# float table math (`x.float() * cos/sin`) and casts the rotated tensor back to
+# the activation dtype. Backward mirrors that F32 table compute while preserving
+# d_x storage dtype.
 # A 2x2 rotation R(theta) = [[c,-s],[s,c]] is orthogonal: R(theta)^T = R(-theta).
 # d_x = R(theta)^T @ grad_out = R(-theta) @ grad_out  (rotate grad_out by -theta).
 #
@@ -90,6 +94,27 @@ def _rope_bwd_interleaved_kernel[dtype: DType](
         dx[r, 2 * i + 1] = rebind[dx.element_type]((-g0 * sv + g1 * cv).cast[dtype]())
 
 
+def _rope_bwd_interleaved_kernel_f32_tables[dtype: DType](
+    g: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    dx: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    rows: Int,
+    half: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = rows * half
+    if idx < total:
+        var r = idx // half
+        var i = idx % half
+        var g0 = rebind[Scalar[dtype]](g[r, 2 * i]).cast[DType.float32]()
+        var g1 = rebind[Scalar[dtype]](g[r, 2 * i + 1]).cast[DType.float32]()
+        var cv = rebind[Scalar[DType.float32]](cos[r, i])
+        var sv = rebind[Scalar[DType.float32]](sin[r, i])
+        dx[r, 2 * i] = rebind[dx.element_type]((g0 * cv + g1 * sv).cast[dtype]())
+        dx[r, 2 * i + 1] = rebind[dx.element_type]((-g0 * sv + g1 * cv).cast[dtype]())
+
+
 def _rope_bwd_halfsplit_kernel[dtype: DType](
     g: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     cos: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
@@ -108,6 +133,27 @@ def _rope_bwd_halfsplit_kernel[dtype: DType](
         var cv = rebind[Scalar[dtype]](cos[r, i]).cast[DType.float32]()
         var sv = rebind[Scalar[dtype]](sin[r, i]).cast[DType.float32]()
         # R(-theta): dx0 = g0*c + g1*s ; dx1 = -g0*s + g1*c
+        dx[r, i] = rebind[dx.element_type]((g0 * cv + g1 * sv).cast[dtype]())
+        dx[r, i + half] = rebind[dx.element_type]((-g0 * sv + g1 * cv).cast[dtype]())
+
+
+def _rope_bwd_halfsplit_kernel_f32_tables[dtype: DType](
+    g: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    dx: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    rows: Int,
+    half: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = rows * half
+    if idx < total:
+        var r = idx // half
+        var i = idx % half
+        var g0 = rebind[Scalar[dtype]](g[r, i]).cast[DType.float32]()
+        var g1 = rebind[Scalar[dtype]](g[r, i + half]).cast[DType.float32]()
+        var cv = rebind[Scalar[DType.float32]](cos[r, i])
+        var sv = rebind[Scalar[DType.float32]](sin[r, i])
         dx[r, i] = rebind[dx.element_type]((g0 * cv + g1 * sv).cast[dtype]())
         dx[r, i + half] = rebind[dx.element_type]((-g0 * sv + g1 * cv).cast[dtype]())
 
@@ -146,6 +192,29 @@ def _rope_bwd_halfsplit_full_kernel[dtype: DType](
         dx[r, i + half] = rebind[dx.element_type]((-g0 * s0 + g1 * c1).cast[dtype]())
 
 
+def _rope_bwd_halfsplit_full_kernel_f32_tables[dtype: DType](
+    g: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    cos: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    sin: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    dx: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    rows: Int,
+    half: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = rows * half
+    if idx < total:
+        var r = idx // half
+        var i = idx % half
+        var g0 = rebind[Scalar[dtype]](g[r, i]).cast[DType.float32]()
+        var g1 = rebind[Scalar[dtype]](g[r, i + half]).cast[DType.float32]()
+        var c0 = rebind[Scalar[DType.float32]](cos[r, i])
+        var s0 = rebind[Scalar[DType.float32]](sin[r, i])
+        var c1 = rebind[Scalar[DType.float32]](cos[r, i + half])
+        var s1 = rebind[Scalar[DType.float32]](sin[r, i + half])
+        dx[r, i] = rebind[dx.element_type]((g0 * c0 + g1 * s1).cast[dtype]())
+        dx[r, i + half] = rebind[dx.element_type]((-g0 * s0 + g1 * c1).cast[dtype]())
+
+
 def _rope_bwd_validate(
     grad_out: Tensor, cos: Tensor, sin: Tensor
 ) raises -> List[Int]:
@@ -164,8 +233,14 @@ def _rope_bwd_validate(
         raise Error("rope_backward: cos numel must equal rows*(D/2)")
     if sin.numel() != rows * half:
         raise Error("rope_backward: sin numel must equal rows*(D/2)")
-    if grad_out.dtype() != cos.dtype() or grad_out.dtype() != sin.dtype():
-        raise Error("rope_backward: grad_out/cos/sin dtype mismatch")
+    var grad_dt = grad_out.dtype()
+    var cos_dt = cos.dtype()
+    var sin_dt = sin.dtype()
+    if cos_dt != sin_dt:
+        raise Error("rope_backward: cos/sin dtype mismatch")
+    if grad_dt != cos_dt:
+        if cos_dt != STDtype.F32 or grad_dt == STDtype.F32:
+            raise Error("rope_backward: grad_out/cos/sin dtype mismatch")
     var out = List[Int]()
     out.append(rows)
     out.append(half)
@@ -181,10 +256,10 @@ def rope_backward(
 ) raises -> Tensor:
     """Backward of RoPePrecomputed: apply the inverse rotation R(-theta) to
     grad_out. cos/sin are non-learnable precomputed tables, so this returns only
-    d_x (same shape/dtype as grad_out, F32).
+    d_x (same shape/dtype as grad_out; F32 scalar math).
 
     grad_out: [..., D] (D even; leading dims flattened to rows)
-    cos/sin:  [rows, D/2]
+    cos/sin:  [rows, D/2] (same dtype as grad_out or F32)
     interleaved: True = FLUX/Klein pairing (2i, 2i+1); False = Z-Image halfsplit
                  pairing (i, i+D/2). MUST match the forward variant used.
     """
@@ -200,6 +275,7 @@ def rope_backward(
     var grid = (total + _BLOCK - 1) // _BLOCK
 
     var dt = grad_out.dtype().to_mojo_dtype()
+    var table_dt = cos.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var G = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             grad_out.buf.unsafe_ptr().bitcast[Float32](), x_rl)
@@ -222,41 +298,73 @@ def rope_backward(
     elif dt == DType.bfloat16:
         var G = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             grad_out.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-        var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
-        var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
         var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-        if interleaved:
-            ctx.enqueue_function[
-                _rope_bwd_interleaved_kernel[DType.bfloat16],
-                _rope_bwd_interleaved_kernel[DType.bfloat16],
-            ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel_f32_tables[DType.bfloat16],
+                    _rope_bwd_interleaved_kernel_f32_tables[DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel_f32_tables[DType.bfloat16],
+                    _rope_bwd_halfsplit_kernel_f32_tables[DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _rope_bwd_halfsplit_kernel[DType.bfloat16],
-                _rope_bwd_halfsplit_kernel[DType.bfloat16],
-            ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel[DType.bfloat16],
+                    _rope_bwd_interleaved_kernel[DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel[DType.bfloat16],
+                    _rope_bwd_halfsplit_kernel[DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
     else:
         var G = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             grad_out.buf.unsafe_ptr().bitcast[Float16](), x_rl)
-        var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float16](), f_rl)
-        var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float16](), f_rl)
         var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
-        if interleaved:
-            ctx.enqueue_function[
-                _rope_bwd_interleaved_kernel[DType.float16],
-                _rope_bwd_interleaved_kernel[DType.float16],
-            ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel_f32_tables[DType.float16],
+                    _rope_bwd_interleaved_kernel_f32_tables[DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel_f32_tables[DType.float16],
+                    _rope_bwd_halfsplit_kernel_f32_tables[DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
         else:
-            ctx.enqueue_function[
-                _rope_bwd_halfsplit_kernel[DType.float16],
-                _rope_bwd_halfsplit_kernel[DType.float16],
-            ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel[DType.float16],
+                    _rope_bwd_interleaved_kernel[DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel[DType.float16],
+                    _rope_bwd_halfsplit_kernel[DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())
 
 
@@ -281,8 +389,14 @@ def _rope_bwd_full_validate(
         raise Error("rope_halfsplit_full_backward: cos numel must equal rows*D")
     if sin.numel() != rows * d:
         raise Error("rope_halfsplit_full_backward: sin numel must equal rows*D")
-    if grad_out.dtype() != cos.dtype() or grad_out.dtype() != sin.dtype():
-        raise Error("rope_halfsplit_full_backward: grad_out/cos/sin dtype mismatch")
+    var grad_dt = grad_out.dtype()
+    var cos_dt = cos.dtype()
+    var sin_dt = sin.dtype()
+    if cos_dt != sin_dt:
+        raise Error("rope_halfsplit_full_backward: cos/sin dtype mismatch")
+    if grad_dt != cos_dt:
+        if cos_dt != STDtype.F32 or grad_dt == STDtype.F32:
+            raise Error("rope_halfsplit_full_backward: grad_out/cos/sin dtype mismatch")
     var out = List[Int]()
     out.append(rows)
     out.append(half)
@@ -301,7 +415,8 @@ def rope_halfsplit_full_backward(
     (cos/sin are non-learnable). Matches diffusers ERNIE apply_rotary_emb autograd.
 
     grad_out: [..., D] (D even; leading dims flattened to rows)
-    cos/sin:  [rows, D]  (FULL-WIDTH — both halves carry their own angle)
+    cos/sin:  [rows, D]  (FULL-WIDTH — both halves carry their own angle;
+               same dtype as grad_out or F32)
 
     Use this (NOT `rope_backward(..., interleaved=False)`) whenever the forward
     used `rope_halfsplit_full` on a table where the two halves differ. The
@@ -320,6 +435,7 @@ def rope_halfsplit_full_backward(
     var grid = (total + _BLOCK - 1) // _BLOCK
 
     var dt = grad_out.dtype().to_mojo_dtype()
+    var table_dt = cos.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var G = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             grad_out.buf.unsafe_ptr().bitcast[Float32](), x_rl)
@@ -336,29 +452,49 @@ def rope_halfsplit_full_backward(
     elif dt == DType.bfloat16:
         var G = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             grad_out.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-        var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
-        var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
         var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-        ctx.enqueue_function[
-            _rope_bwd_halfsplit_full_kernel[DType.bfloat16],
-            _rope_bwd_halfsplit_full_kernel[DType.bfloat16],
-        ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            ctx.enqueue_function[
+                _rope_bwd_halfsplit_full_kernel_f32_tables[DType.bfloat16],
+                _rope_bwd_halfsplit_full_kernel_f32_tables[DType.bfloat16],
+            ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            ctx.enqueue_function[
+                _rope_bwd_halfsplit_full_kernel[DType.bfloat16],
+                _rope_bwd_halfsplit_full_kernel[DType.bfloat16],
+            ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
     else:
         var G = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             grad_out.buf.unsafe_ptr().bitcast[Float16](), x_rl)
-        var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            cos.buf.unsafe_ptr().bitcast[Float16](), f_rl)
-        var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
-            sin.buf.unsafe_ptr().bitcast[Float16](), f_rl)
         var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
-        ctx.enqueue_function[
-            _rope_bwd_halfsplit_full_kernel[DType.float16],
-            _rope_bwd_halfsplit_full_kernel[DType.float16],
-        ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            ctx.enqueue_function[
+                _rope_bwd_halfsplit_full_kernel_f32_tables[DType.float16],
+                _rope_bwd_halfsplit_full_kernel_f32_tables[DType.float16],
+            ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            ctx.enqueue_function[
+                _rope_bwd_halfsplit_full_kernel[DType.float16],
+                _rope_bwd_halfsplit_full_kernel[DType.float16],
+            ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())
 
 

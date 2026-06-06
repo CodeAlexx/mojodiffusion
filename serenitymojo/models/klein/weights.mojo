@@ -3,7 +3,7 @@
 # Loads Klein double-block weights from a real .safetensors into the
 # DoubleBlockWeights the verified double_block_forward/backward consume. The
 # inference path (models/dit/klein_dit.mojo) already reads these exact keys; this
-# is the cross-pollination into the TRAINING weight structs (host List[Float32]).
+# loader keeps checkpoint matrices device-resident in their stored dtype.
 #
 # Key layout (per double block bi), from klein_dit.mojo:112-123 — 12 tensors:
 #   double_blocks.{bi}.{img,txt}_attn.qkv.weight            -> StreamWeights.wqkv
@@ -41,6 +41,9 @@ from serenitymojo.models.klein.single_block import (
 from serenitymojo.models.klein.klein_stack import KleinStackBase
 
 
+comptime TArc = ArcPointer[Tensor]
+
+
 struct KleinStepModWeights(Movable):
     """Frozen timestep/modulation weights reused across every training step."""
 
@@ -68,45 +71,26 @@ struct KleinStepModWeights(Movable):
         self.final_mod = final_mod^
 
 
-# Read one named tensor from the safetensors as a host List[Float32] (casts up
-# from the stored dtype — Klein base is BF16).
-def _load_host_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    var t32 = cast_tensor(t, STDtype.F32, ctx)
-    return t32.to_host(ctx)
-
-
 # Dim 0 of a named tensor's stored shape (for deriving D/F/Dh from the weights).
 def _dim0(st: SafeTensors, name: String) raises -> Int:
     var info = st.tensor_info(name)
     return Int(info.shape[0])
 
 
-# A2: StreamWeights now uploads its 6 matrices to the device ONCE in __init__
-# (TArc). The loader still reads host F32 lists, then derives D/F/Dh from the
-# stored shapes and hands them to the constructor for the one-time upload:
-#   wqkv [3D, D]  -> D  = dim1(wqkv) = dim0(wqkv)//3 ; here from wproj [D,D] dim0.
-#   wgu  [2F, D]  -> F  = dim0(wgu)//2.
-#   q_norm [Dh]   -> Dh = dim0(q_norm).
+# StreamWeights receives device tensor handles directly. Norm scale vectors stay
+# in checkpoint dtype; rms_norm handles the tiny mixed-dtype compute boundary.
 def _load_stream(
     st: SafeTensors, dp: String, stream: String, ctx: DeviceContext
 ) raises -> StreamWeights:
     var ap = dp + String(".") + stream + String("_attn")
     var mp = dp + String(".") + stream + String("_mlp")
-    var D = _dim0(st, ap + String(".proj.weight"))        # wproj [D, D] -> D
-    var F = _dim0(st, mp + String(".0.weight")) // 2       # wgu  [2F, D] -> F
-    var Dh = _dim0(st, ap + String(".norm.query_norm.scale"))  # q_norm [Dh]
     return StreamWeights(
-        _load_host_f32(st, ap + String(".qkv.weight"), ctx),               # wqkv
-        _load_host_f32(st, ap + String(".proj.weight"), ctx),              # wproj
-        _load_host_f32(st, mp + String(".0.weight"), ctx),                 # wgu
-        _load_host_f32(st, mp + String(".2.weight"), ctx),                 # wd
-        _load_host_f32(st, ap + String(".norm.query_norm.scale"), ctx),    # q_norm
-        _load_host_f32(st, ap + String(".norm.key_norm.scale"), ctx),      # k_norm
-        D, F, Dh, ctx,
+        TArc(_load_tensor(st, ap + String(".qkv.weight"), ctx)),            # wqkv
+        TArc(_load_tensor(st, ap + String(".proj.weight"), ctx)),           # wproj
+        TArc(_load_tensor(st, mp + String(".0.weight"), ctx)),              # wgu
+        TArc(_load_tensor(st, mp + String(".2.weight"), ctx)),              # wd
+        TArc(_load_tensor(st, ap + String(".norm.query_norm.scale"), ctx)), # q_norm
+        TArc(_load_tensor(st, ap + String(".norm.key_norm.scale"), ctx)),   # k_norm
     )
 
 
@@ -123,7 +107,7 @@ def load_double_block_weights(
 
 # Load single block `block_idx`'s real weights into SingleBlockWeights.
 # Keys: single_blocks.{bi}.linear1.weight, .linear2.weight,
-#       .norm.query_norm.scale, .norm.key_norm.scale (BF16 -> F32 -> host).
+#       .norm.query_norm.scale, .norm.key_norm.scale (checkpoint dtype).
 # A2: SingleBlockWeights uploads its 4 matrices to the device ONCE in __init__.
 # Dims from stored shapes: w2 [D, D+F] -> D = dim0(w2); F = dim1(w2) - D where
 # dim1(w2) = dim0(w1)? no: derive D from w2 dim0, F from (w1 dim0 - 3D)/2... use
@@ -139,11 +123,11 @@ def load_single_block_weights(
     var F = (_dim0(st, sp + String(".linear1.weight")) - 3 * D) // 2  # w1 [3D+2F, D]
     var Dh = _dim0(st, sp + String(".norm.query_norm.scale"))
     return SingleBlockWeights(
-        _load_host_f32(st, sp + String(".linear1.weight"), ctx),           # w1
-        _load_host_f32(st, sp + String(".linear2.weight"), ctx),           # w2
-        _load_host_f32(st, sp + String(".norm.query_norm.scale"), ctx),    # q_norm
-        _load_host_f32(st, sp + String(".norm.key_norm.scale"), ctx),      # k_norm
-        D, F, Dh, ctx, keep_w2,
+        TArc(_load_tensor(st, sp + String(".linear1.weight"), ctx)),        # w1
+        TArc(_load_tensor(st, sp + String(".linear2.weight"), ctx)),        # w2
+        TArc(_load_tensor(st, sp + String(".norm.query_norm.scale"), ctx)), # q_norm
+        TArc(_load_tensor(st, sp + String(".norm.key_norm.scale"), ctx)),   # k_norm
+        D, F, ctx, keep_w2,
     )
 
 
@@ -169,29 +153,29 @@ def load_klein_stack_base(
     var in_ch = _dim1(st, String("img_in.weight"))     # img_in [D, in_ch]
     var txt_ch = _dim1(st, String("txt_in.weight"))    # txt_in [D, txt_ch]
     var out_ch = _dim0(st, String("final_layer.linear.weight"))  # final_lin [out_ch, D]
-    var img_in = _load_host_f32(st, String("img_in.weight"), ctx)
-    var txt_in = _load_host_f32(st, String("txt_in.weight"), ctx)
-    var final_lin = _load_host_f32(st, String("final_layer.linear.weight"), ctx)
     # final adaLN: linear(vec_silu, final_mod_w) -> [1, 2D]; chunk 0=shift, 1=scale.
-    var final_mod_w = _load_host_f32(st, String("final_layer.adaLN_modulation.1.weight"), ctx)
-    var final_mod = _linear_row(vec_silu, final_mod_w, d, 2 * d, ctx)   # [2D]
+    var final_mod_w = _load_tensor(st, String("final_layer.adaLN_modulation.1.weight"), ctx)
+    var final_mod = _linear_row_tensor(vec_silu, final_mod_w, d, ctx)   # [2D]
     var final_shift = _chunk(final_mod, 0, d)
     var final_scale = _chunk(final_mod, 1, d)
     return KleinStackBase(
-        img_in^, txt_in^, final_lin^, final_shift^, final_scale^,
-        d, in_ch, txt_ch, out_ch, ctx,
+        TArc(_load_tensor(st, String("img_in.weight"), ctx)),
+        TArc(_load_tensor(st, String("txt_in.weight"), ctx)),
+        TArc(_load_tensor(st, String("final_layer.linear.weight"), ctx)),
+        TArc(Tensor.from_host(final_shift^, [d], STDtype.F32, ctx)),
+        TArc(Tensor.from_host(final_scale^, [d], STDtype.F32, ctx)),
     )
 
 
-# linear of a single [in_dim] row by a [out_dim, in_dim] weight -> [out_dim].
-def _linear_row(
-    x: List[Float32], w: List[Float32], in_dim: Int, out_dim: Int, ctx: DeviceContext
+def _linear_row_tensor(
+    x: List[Float32], w: Tensor, in_dim: Int, ctx: DeviceContext
 ) raises -> List[Float32]:
     var no_bias = Optional[Tensor](None)
     return linear(
         Tensor.from_host(x, [1, in_dim], STDtype.F32, ctx),
-        Tensor.from_host(w, [out_dim, in_dim], STDtype.F32, ctx),
-        no_bias^, ctx,
+        w,
+        no_bias^,
+        ctx,
     ).to_host(ctx)
 
 
@@ -223,10 +207,10 @@ def build_klein_vec_silu(
 def build_klein_double_modvecs(
     st: SafeTensors, vec_silu: List[Float32], stream: String, d: Int, ctx: DeviceContext
 ) raises -> ModVecs:
-    var mod_w = _load_host_f32(
+    var mod_w = _load_tensor(
         st, String("double_stream_modulation_") + stream + String(".lin.weight"), ctx
     )
-    var mod = _linear_row(vec_silu, mod_w, d, 6 * d, ctx)   # [6D]
+    var mod = _linear_row_tensor(vec_silu, mod_w, d, ctx)   # [6D]
     return ModVecs(
         _chunk(mod, 0, d), _chunk(mod, 1, d), _chunk(mod, 2, d),
         _chunk(mod, 3, d), _chunk(mod, 4, d), _chunk(mod, 5, d),
@@ -236,8 +220,8 @@ def build_klein_double_modvecs(
 def build_klein_single_modvecs(
     st: SafeTensors, vec_silu: List[Float32], d: Int, ctx: DeviceContext
 ) raises -> SingleModVecs:
-    var mod_w = _load_host_f32(st, String("single_stream_modulation.lin.weight"), ctx)
-    var mod = _linear_row(vec_silu, mod_w, d, 3 * d, ctx)   # [3D]
+    var mod_w = _load_tensor(st, String("single_stream_modulation.lin.weight"), ctx)
+    var mod = _linear_row_tensor(vec_silu, mod_w, d, ctx)   # [3D]
     return SingleModVecs(_chunk(mod, 0, d), _chunk(mod, 1, d), _chunk(mod, 2, d))
 
 
@@ -246,29 +230,17 @@ def load_klein_step_mod_weights(
 ) raises -> KleinStepModWeights:
     """Load frozen per-step modulation weights once for the timed loop.
 
-    Timestep MLP weights stay in their checkpoint dtype (BF16). The downstream
-    modulation weights are promoted to F32 once so the math matches the legacy
-    host `_linear_row` path that used F32 lists.
+    Timestep and downstream modulation weights stay in their checkpoint dtype
+    (Klein BF16); linear() uses F32 accumulation internally and returns the F32
+    residual stream without storing base matrices as F32.
     """
-    var img_h = _load_host_f32(
-        st, String("double_stream_modulation_img.lin.weight"), ctx
-    )
-    var txt_h = _load_host_f32(
-        st, String("double_stream_modulation_txt.lin.weight"), ctx
-    )
-    var single_h = _load_host_f32(
-        st, String("single_stream_modulation.lin.weight"), ctx
-    )
-    var final_h = _load_host_f32(
-        st, String("final_layer.adaLN_modulation.1.weight"), ctx
-    )
     return KleinStepModWeights(
         _load_tensor(st, String("time_in.in_layer.weight"), ctx),
         _load_tensor(st, String("time_in.out_layer.weight"), ctx),
-        Tensor.from_host(img_h^, [6 * d, d], STDtype.F32, ctx),
-        Tensor.from_host(txt_h^, [6 * d, d], STDtype.F32, ctx),
-        Tensor.from_host(single_h^, [3 * d, d], STDtype.F32, ctx),
-        Tensor.from_host(final_h^, [2 * d, d], STDtype.F32, ctx),
+        _load_tensor(st, String("double_stream_modulation_img.lin.weight"), ctx),
+        _load_tensor(st, String("double_stream_modulation_txt.lin.weight"), ctx),
+        _load_tensor(st, String("single_stream_modulation.lin.weight"), ctx),
+        _load_tensor(st, String("final_layer.adaLN_modulation.1.weight"), ctx),
     )
 
 

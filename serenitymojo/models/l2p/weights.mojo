@@ -17,9 +17,9 @@
 # Weight-dtype quirk (confirmed from header):
 #   layers.0..4   = BF16   layers.5..24 = F32   layers.25..29 = BF16
 #   noise_refiner / context_refiner = BF16
-# The loader preserves checkpoint dtype for large projection matrices (same
-# mixed-dtype contract as load_zimage_block_weights_prefixed_mixed) and upcast
-# small norm scale vectors to F32 (rms_norm kernel contract).
+# The loader preserves checkpoint dtype for projection matrices and norm scale
+# vectors. rms_norm owns the small mixed-dtype compute boundary when activations
+# are F32.
 #
 # SCOPE: Real single-file SafeTensors (NOT sharded). L2P is one file.
 # The L2P block key layout is IDENTICAL to the base Z-Image layout, so we
@@ -67,17 +67,6 @@ def _load_l2p_device_preserve(
     return Tensor.from_view(tv, ctx)
 
 
-def _load_l2p_f32_device(
-    st: SafeTensors, name: String, ctx: DeviceContext
-) raises -> Tensor:
-    """Load tensor and upcast to F32 (for small norm/scale vectors)."""
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx)
-
-
 # ── block weight loader ───────────────────────────────────────────────────────
 
 def load_l2p_block_weights_prefixed(
@@ -86,27 +75,26 @@ def load_l2p_block_weights_prefixed(
     """Load one Z-Image block from the L2P single-file checkpoint.
 
     Reuses ZImageBlockWeights (identical block structure to Z-Image base).
-    Mixed dtype: large projections stay in checkpoint dtype (BF16 or F32);
-    small norm scale vectors are upcast to F32 (rms_norm kernel contract).
+    Projection and norm scale tensors stay in checkpoint dtype (BF16 or F32).
     Mirrors load_zimage_block_weights_prefixed_mixed but reads SafeTensors
     (single file) instead of ShardedSafeTensors.
     """
     var ap = prefix + String(".attention")
     var fp = prefix + String(".feed_forward")
     return ZImageBlockWeights(
-        TArc(_load_l2p_f32_device(st, prefix + String(".attention_norm1.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, prefix + String(".attention_norm1.weight"), ctx)),
         TArc(_load_l2p_device_preserve(st, ap + String(".to_q.weight"), ctx)),
         TArc(_load_l2p_device_preserve(st, ap + String(".to_k.weight"), ctx)),
         TArc(_load_l2p_device_preserve(st, ap + String(".to_v.weight"), ctx)),
         TArc(_load_l2p_device_preserve(st, ap + String(".to_out.0.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, ap + String(".norm_q.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, ap + String(".norm_k.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, prefix + String(".attention_norm2.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, prefix + String(".ffn_norm1.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, prefix + String(".attention_norm2.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, prefix + String(".ffn_norm1.weight"), ctx)),
         TArc(_load_l2p_device_preserve(st, fp + String(".w1.weight"), ctx)),
         TArc(_load_l2p_device_preserve(st, fp + String(".w3.weight"), ctx)),
         TArc(_load_l2p_device_preserve(st, fp + String(".w2.weight"), ctx)),
-        TArc(_load_l2p_f32_device(st, prefix + String(".ffn_norm2.weight"), ctx)),
+        TArc(_load_l2p_device_preserve(st, prefix + String(".ffn_norm2.weight"), ctx)),
     )
 
 

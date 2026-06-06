@@ -193,6 +193,30 @@ struct StreamWeights(Copyable, Movable):
         self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.BF16, ctx))
         self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.BF16, ctx))
 
+    def __init__(
+        out self,
+        var wq: TArc, var wk: TArc, var wv: TArc,
+        var bq: TArc, var bk: TArc, var bv: TArc,
+        var wout: TArc, var bout: TArc,
+        var wup: TArc, var bup: TArc,
+        var wdn: TArc, var bdn: TArc,
+        var q_norm: TArc, var k_norm: TArc,
+    ):
+        self.wq = wq^
+        self.wk = wk^
+        self.wv = wv^
+        self.bq = bq^
+        self.bk = bk^
+        self.bv = bv^
+        self.wout = wout^
+        self.bout = bout^
+        self.wup = wup^
+        self.bup = bup^
+        self.wdn = wdn^
+        self.bdn = bdn^
+        self.q_norm = q_norm^
+        self.k_norm = k_norm^
+
 
 struct DoubleBlockWeights(Copyable, Movable):
     var img: StreamWeights

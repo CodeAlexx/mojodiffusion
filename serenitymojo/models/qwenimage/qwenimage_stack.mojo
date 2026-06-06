@@ -100,6 +100,19 @@ struct QwenStackBase(Copyable, Movable):
         self.proj_out_w = TArc(Tensor.from_host(proj_out_w^, [out_ch, D], STDtype.BF16, ctx))
         self.proj_out_b = TArc(Tensor.from_host(proj_out_b^, [out_ch], STDtype.BF16, ctx))
 
+    def __init__(
+        out self,
+        var img_in_w: TArc, var img_in_b: TArc,
+        var txt_in_w: TArc, var txt_in_b: TArc,
+        var proj_out_w: TArc, var proj_out_b: TArc,
+    ):
+        self.img_in_w = img_in_w^
+        self.img_in_b = img_in_b^
+        self.txt_in_w = txt_in_w^
+        self.txt_in_b = txt_in_b^
+        self.proj_out_w = proj_out_w^
+        self.proj_out_b = proj_out_b^
+
 
 # ── forward result (CHECKPOINT INPUTS ONLY — true per-block recompute) ────────
 # To bound memory at real depth (60 blocks x F=12288) we retain ONLY each block's

@@ -25,6 +25,9 @@
 #
 # Storage dtype is preserved; kernels read BF16/F16/F32 elements, cast scalar
 # values to F32 for math, and write gradients back in the input/weight dtype.
+# If a frozen checkpoint norm scale has different storage dtype than the
+# activation, the tiny scale vector is cast inside the op for compute and d_g is
+# cast back to the original weight dtype before returning.
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -139,6 +142,91 @@ def _rms_bwd_dg_kernel[dtype: DType](
     dg[col] = rebind[dg.element_type](acc.cast[dtype]())
 
 
+def _rms_bwd_dx_kernel_mixed[x_dtype: DType, g_dtype: DType](
+    go: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    x: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    g: LayoutTensor[g_dtype, _DYN1, MutAnyOrigin],
+    dx: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var sh = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+
+    var lsq: Float32 = 0.0
+    var c = tid
+    while c < cols:
+        var v = rebind[Scalar[x_dtype]](x[row, c]).cast[DType.float32]()
+        lsq += v * v
+        c += _TPB
+    sh[tid] = lsq
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            sh[tid] = sh[tid] + sh[tid + active]
+        barrier()
+        active //= 2
+    var inv = 1.0 / sqrt(sh[0] / Float32(cols) + eps)
+    barrier()
+
+    var lgwx: Float32 = 0.0
+    c = tid
+    while c < cols:
+        var gov = rebind[Scalar[x_dtype]](go[row, c]).cast[DType.float32]()
+        var gv = rebind[Scalar[g_dtype]](g[c]).cast[DType.float32]()
+        var xv = rebind[Scalar[x_dtype]](x[row, c]).cast[DType.float32]()
+        lgwx += gov * gv * xv
+        c += _TPB
+    sh[tid] = lgwx
+    barrier()
+    active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            sh[tid] = sh[tid] + sh[tid + active]
+        barrier()
+        active //= 2
+    var sum_gwx = sh[0]
+    barrier()
+
+    var inv3 = inv * inv * inv
+    c = tid
+    while c < cols:
+        var xv = rebind[Scalar[x_dtype]](x[row, c]).cast[DType.float32]()
+        var gv = rebind[Scalar[g_dtype]](g[c]).cast[DType.float32]()
+        var gov = rebind[Scalar[x_dtype]](go[row, c]).cast[DType.float32]()
+        var out = gv * gov * inv - xv * inv3 * (sum_gwx / Float32(cols))
+        dx[row, c] = rebind[dx.element_type](out.cast[x_dtype]())
+        c += _TPB
+
+
+def _rms_bwd_dg_kernel_mixed[x_dtype: DType, g_dtype: DType](
+    go: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    x: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    dg: LayoutTensor[g_dtype, _DYN1, MutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    eps: Float32,
+):
+    var col = Int(global_idx.x)
+    if col >= cols:
+        return
+    var acc: Float32 = 0.0
+    for r in range(rows):
+        var sq: Float32 = 0.0
+        for cc in range(cols):
+            var v = rebind[Scalar[x_dtype]](x[r, cc]).cast[DType.float32]()
+            sq += v * v
+        var inv = 1.0 / sqrt(sq / Float32(cols) + eps)
+        var gov = rebind[Scalar[x_dtype]](go[r, col]).cast[DType.float32]()
+        var xv = rebind[Scalar[x_dtype]](x[r, col]).cast[DType.float32]()
+        acc += gov * xv * inv
+    dg[col] = rebind[dg.element_type](acc.cast[g_dtype]())
+
+
 struct RmsNormBackward(Movable):
     """Backward outputs of rms_norm: d_x [rows..,D] and d_g [D]."""
 
@@ -155,8 +243,60 @@ def rms_norm_backward(
 ) raises -> RmsNormBackward:
     """Backward of rms_norm. go/x same shape [..,D]; weight [D].
     Returns d_x and d_g in the same storage dtype as the inputs."""
-    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
-        raise Error("rms_norm_backward: go/x/weight dtype mismatch")
+    if x.dtype() != go.dtype():
+        raise Error("rms_norm_backward: go/x dtype mismatch")
+    if x.dtype() != weight.dtype():
+        if x.dtype() != STDtype.F32:
+            raise Error("rms_norm_backward: mixed weight dtype requires F32 activations")
+        var xshape_m = x.shape()
+        var d_m = xshape_m[len(xshape_m) - 1]
+        var rows_m = 1
+        for i in range(len(xshape_m) - 1):
+            rows_m *= xshape_m[i]
+        var dx_buf_m = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+        var dg_buf_m = ctx.enqueue_create_buffer[DType.uint8](weight.nbytes())
+        var x_rl_m = RuntimeLayout[_DYN2].row_major(IndexList[2](rows_m, d_m))
+        var g_rl_m = RuntimeLayout[_DYN1].row_major(IndexList[1](d_m))
+        var dg_grid_m = (d_m + _BLOCK - 1) // _BLOCK
+        var GOm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        var Xm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        var DXm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf_m.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        if weight.dtype() == STDtype.BF16:
+            var Gm = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl_m)
+            var DGm = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                dg_buf_m.unsafe_ptr().bitcast[BFloat16](), g_rl_m)
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.bfloat16],
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.bfloat16],
+            ](GOm, Xm, Gm, DXm, d_m, eps, grid_dim=rows_m, block_dim=_TPB)
+            ctx.enqueue_function[
+                _rms_bwd_dg_kernel_mixed[DType.float32, DType.bfloat16],
+                _rms_bwd_dg_kernel_mixed[DType.float32, DType.bfloat16],
+            ](GOm, Xm, DGm, rows_m, d_m, eps, grid_dim=dg_grid_m, block_dim=_BLOCK)
+        elif weight.dtype() == STDtype.F16:
+            var Gm = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                weight.buf.unsafe_ptr().bitcast[Float16](), g_rl_m)
+            var DGm = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                dg_buf_m.unsafe_ptr().bitcast[Float16](), g_rl_m)
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.float16],
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.float16],
+            ](GOm, Xm, Gm, DXm, d_m, eps, grid_dim=rows_m, block_dim=_TPB)
+            ctx.enqueue_function[
+                _rms_bwd_dg_kernel_mixed[DType.float32, DType.float16],
+                _rms_bwd_dg_kernel_mixed[DType.float32, DType.float16],
+            ](GOm, Xm, DGm, rows_m, d_m, eps, grid_dim=dg_grid_m, block_dim=_BLOCK)
+        else:
+            raise Error("rms_norm_backward: unsupported mixed weight dtype")
+        ctx.synchronize()
+        return RmsNormBackward(
+            Tensor(dx_buf_m^, xshape_m.copy(), x.dtype()),
+            Tensor(dg_buf_m^, weight.shape().copy(), weight.dtype()),
+        )
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     var rows = 1
@@ -237,8 +377,43 @@ def rms_norm_backward_dx(
     Frozen-weight training paths should use this instead of `rms_norm_backward`
     because the full d_g kernel recomputes row stats once per column.
     """
-    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
-        raise Error("rms_norm_backward_dx: go/x/weight dtype mismatch")
+    if x.dtype() != go.dtype():
+        raise Error("rms_norm_backward_dx: go/x dtype mismatch")
+    if x.dtype() != weight.dtype():
+        if x.dtype() != STDtype.F32:
+            raise Error("rms_norm_backward_dx: mixed weight dtype requires F32 activations")
+        var xshape_m = x.shape()
+        var d_m = xshape_m[len(xshape_m) - 1]
+        var rows_m = 1
+        for i in range(len(xshape_m) - 1):
+            rows_m *= xshape_m[i]
+        var dx_buf_m = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+        var x_rl_m = RuntimeLayout[_DYN2].row_major(IndexList[2](rows_m, d_m))
+        var g_rl_m = RuntimeLayout[_DYN1].row_major(IndexList[1](d_m))
+        var GOm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        var Xm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        var DXm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf_m.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        if weight.dtype() == STDtype.BF16:
+            var Gm = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl_m)
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.bfloat16],
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.bfloat16],
+            ](GOm, Xm, Gm, DXm, d_m, eps, grid_dim=rows_m, block_dim=_TPB)
+        elif weight.dtype() == STDtype.F16:
+            var Gm = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                weight.buf.unsafe_ptr().bitcast[Float16](), g_rl_m)
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.float16],
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.float16],
+            ](GOm, Xm, Gm, DXm, d_m, eps, grid_dim=rows_m, block_dim=_TPB)
+        else:
+            raise Error("rms_norm_backward_dx: unsupported mixed weight dtype")
+        ctx.synchronize()
+        return Tensor(dx_buf_m^, xshape_m.copy(), x.dtype())
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     var rows = 1

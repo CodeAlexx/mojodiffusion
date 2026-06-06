@@ -200,6 +200,17 @@ struct KleinStackBase(Copyable, Movable):
         self.final_shift = TArc(Tensor.from_host(final_shift^, [D], STDtype.F32, ctx))
         self.final_scale = TArc(Tensor.from_host(final_scale^, [D], STDtype.F32, ctx))
 
+    def __init__(
+        out self,
+        var img_in: TArc, var txt_in: TArc, var final_lin: TArc,
+        var final_shift: TArc, var final_scale: TArc,
+    ):
+        self.img_in = img_in^
+        self.txt_in = txt_in^
+        self.final_lin = final_lin^
+        self.final_shift = final_shift^
+        self.final_scale = final_scale^
+
 
 # ── forward result: out + everything the backward needs to recompute/chain ───
 # To keep memory bounded we DO NOT retain per-block saved activations. We retain

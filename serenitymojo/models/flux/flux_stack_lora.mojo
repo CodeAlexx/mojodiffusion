@@ -594,19 +594,17 @@ def load_flux_lora_resume(
 # device-resident blocks discard most saved tensors).
 #
 # Tenet 1: NO new block math. The block weight struct is built from streamed
-# device tensors via the EXISTING StreamWeights/SingleBlockWeights constructors
-# (host F32 -> device upload, same as the resident path). Tenet 2: the offload
-# entry points take the same args as the resident ones with `dbw`/`sbw` replaced
-# by `mut loader`.
+# device tensors by copying ArcPointer handles, preserving checkpoint dtype and
+# avoiding D2H/H2D round-trips. Tenet 2: the offload entry points take the same
+# args as the resident ones with `dbw`/`sbw` replaced by `mut loader`.
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Read one streamed block tensor (BF16 on disk) as a host F32 list. The flux
-# block weight constructors take host F32 lists and upload; this bridges the
-# streamed device tensor (block[key]) to that boundary.
-def _block_host_f32(block: Block, key: String, ctx: DeviceContext) raises -> List[Float32]:
+# Borrow/copy one streamed block tensor as a device-resident Arc. The copied Arc
+# keeps the tensor alive after the loader's active block handle is released.
+def _block_tensor(block: Block, key: String) raises -> TArc:
     if not (key in block):
         raise Error(String("Flux offload block missing tensor: ") + key)
-    return cast_tensor(block[key][], STDtype.F32, ctx).to_host(ctx)
+    return block[key].copy()
 
 
 def _stream_weights_from_block(
@@ -616,17 +614,16 @@ def _stream_weights_from_block(
     var ap = dp + String(".") + stream + String("_attn")
     var mp = dp + String(".") + stream + String("_mlp")
     return StreamWeights(
-        _block_host_f32(block, ap + String(".qkv.weight"), ctx),
-        _block_host_f32(block, ap + String(".qkv.bias"), ctx),
-        _block_host_f32(block, ap + String(".proj.weight"), ctx),
-        _block_host_f32(block, ap + String(".proj.bias"), ctx),
-        _block_host_f32(block, mp + String(".0.weight"), ctx),
-        _block_host_f32(block, mp + String(".0.bias"), ctx),
-        _block_host_f32(block, mp + String(".2.weight"), ctx),
-        _block_host_f32(block, mp + String(".2.bias"), ctx),
-        _block_host_f32(block, ap + String(".norm.query_norm.scale"), ctx),
-        _block_host_f32(block, ap + String(".norm.key_norm.scale"), ctx),
-        D, Fmlp, Dh, ctx,
+        _block_tensor(block, ap + String(".qkv.weight")),
+        _block_tensor(block, ap + String(".qkv.bias")),
+        _block_tensor(block, ap + String(".proj.weight")),
+        _block_tensor(block, ap + String(".proj.bias")),
+        _block_tensor(block, mp + String(".0.weight")),
+        _block_tensor(block, mp + String(".0.bias")),
+        _block_tensor(block, mp + String(".2.weight")),
+        _block_tensor(block, mp + String(".2.bias")),
+        _block_tensor(block, ap + String(".norm.query_norm.scale")),
+        _block_tensor(block, ap + String(".norm.key_norm.scale")),
     )
 
 
@@ -643,13 +640,12 @@ def _single_weights_from_block(
     block: Block, sp: String, D: Int, Fmlp: Int, Dh: Int, ctx: DeviceContext,
 ) raises -> SingleBlockWeights:
     return SingleBlockWeights(
-        _block_host_f32(block, sp + String(".linear1.weight"), ctx),
-        _block_host_f32(block, sp + String(".linear1.bias"), ctx),
-        _block_host_f32(block, sp + String(".linear2.weight"), ctx),
-        _block_host_f32(block, sp + String(".linear2.bias"), ctx),
-        _block_host_f32(block, sp + String(".norm.query_norm.scale"), ctx),
-        _block_host_f32(block, sp + String(".norm.key_norm.scale"), ctx),
-        D, Fmlp, Dh, ctx,
+        _block_tensor(block, sp + String(".linear1.weight")),
+        _block_tensor(block, sp + String(".linear1.bias")),
+        _block_tensor(block, sp + String(".linear2.weight")),
+        _block_tensor(block, sp + String(".linear2.bias")),
+        _block_tensor(block, sp + String(".norm.query_norm.scale")),
+        _block_tensor(block, sp + String(".norm.key_norm.scale")),
     )
 
 

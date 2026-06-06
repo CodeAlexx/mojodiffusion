@@ -671,6 +671,8 @@ def linear_backward_dx_split_scratch(
 # ── linear backward, d_W ONLY (LoRA trainable-weight path) ───────────────────
 #   d_W[out,in] = grad_y[M,out]ᵀ @ x[M,in]. This sibling is useful for LoRA
 #   adapters where d_A/d_B are needed but the bias gradient is not.
+# Default output storage follows x.dtype(); `output_dtype` is explicit for
+# trainable weight-grad storage such as OneTrainer LoRA F32 adapter grads.
 def linear_backward_dw(
     grad_y: Tensor,
     x: Tensor,
@@ -678,6 +680,7 @@ def linear_backward_dw(
     in_features: Int,
     out_features: Int,
     ctx: DeviceContext,
+    output_dtype: STDtype = STDtype.BOOL,
 ) raises -> Tensor:
     if grad_y.dtype() != x.dtype():
         raise Error("linear_backward_dw: grad_y/x dtype mismatch")
@@ -701,9 +704,18 @@ def linear_backward_dw(
         var gy = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](grad_y.buf.unsafe_ptr().bitcast[Float16](), mo_rl)
         var xv = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), mi_rl)
         matmul(ctx, dw, gy, xv, transpose_a=True, c_row_major=True)
-    if x.dtype() == STDtype.F32:
+    var out_dtype = output_dtype
+    if out_dtype == STDtype.BOOL:
+        out_dtype = x.dtype()
+    if not (
+        out_dtype == STDtype.F32
+        or out_dtype == STDtype.BF16
+        or out_dtype == STDtype.F16
+    ):
+        raise Error("linear_backward_dw: unsupported output dtype")
+    if out_dtype == STDtype.F32:
         return d_w^
-    return cast_tensor(d_w^, x.dtype(), ctx)
+    return cast_tensor(d_w^, out_dtype, ctx)
 
 
 # ── addbias backward ─────────────────────────────────────────────────────────

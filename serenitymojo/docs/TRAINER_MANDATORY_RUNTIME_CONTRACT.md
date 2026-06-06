@@ -1,6 +1,20 @@
 # Trainer Mandatory Runtime Contract
 
-Status: binding for every Mojo trainer.
+Status: binding for every supported Mojo trainer.
+
+The OneTrainer-parity Mojo port is the official trainer direction for this
+repo. Legacy mojodiffusion trainer experiments are compatibility/reference
+surfaces only unless they use the same `serenitymojo` model loaders, ops,
+offload runtime, progress display, sampler, save/resume, and dtype contracts
+documented here. Inference must share those same model/runtime primitives so a
+trainer fix cannot silently diverge from sampling behavior.
+
+Checkpoint tensors must preserve their storage dtype at loader boundaries.
+BF16 checkpoint weights, biases, norm scales, LoRA tensors, and offload block
+payloads stay BF16 unless the checkpoint itself stores another dtype. F32 is
+allowed for compute internals, reductions, schedules, generated modulation
+vectors, host optimizer master state, and debug/parity oracles. A production
+loader must not use a host-F32 detour for checkpoint storage.
 
 ## Output Line
 

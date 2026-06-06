@@ -201,6 +201,10 @@ struct ModLin(Copyable, Movable):
         self.w = TArc(Tensor.from_host(w^, [chunk, D], STDtype.BF16, ctx))
         self.b = TArc(Tensor.from_host(b^, [chunk], STDtype.BF16, ctx))
 
+    def __init__(out self, var w: TArc, var b: TArc):
+        self.w = w^
+        self.b = b^
+
 
 struct DoubleModLin(Copyable, Movable):
     var img: ModLin
@@ -233,6 +237,16 @@ struct EmbedMlp(Copyable, Movable):
         self.in_b = TArc(Tensor.from_host(in_b^, [D], STDtype.BF16, ctx))
         self.out_w = TArc(Tensor.from_host(out_w^, [D, D], STDtype.BF16, ctx))
         self.out_b = TArc(Tensor.from_host(out_b^, [D], STDtype.BF16, ctx))
+
+    def __init__(
+        out self,
+        var in_w: TArc, var in_b: TArc,
+        var out_w: TArc, var out_b: TArc,
+    ):
+        self.in_w = in_w^
+        self.in_b = in_b^
+        self.out_w = out_w^
+        self.out_b = out_b^
 
 
 # ── stack-level frozen/shared base (embeds + per-block mod.lin + final layer) ─
@@ -277,6 +291,31 @@ struct FluxStackBase(Copyable, Movable):
         self.final_adaln_b = TArc(Tensor.from_host(final_adaln_b^, [2 * D], STDtype.BF16, ctx))
         self.final_lin = TArc(Tensor.from_host(final_lin^, [out_ch, D], STDtype.BF16, ctx))
         self.final_lin_b = TArc(Tensor.from_host(final_lin_b^, [out_ch], STDtype.BF16, ctx))
+
+    def __init__(
+        out self,
+        var img_in: TArc, var img_in_b: TArc,
+        var txt_in: TArc, var txt_in_b: TArc,
+        var time_in: EmbedMlp, has_guidance: Bool, var guidance_in: EmbedMlp,
+        var vector_in: EmbedMlp,
+        var dbl_mod: List[DoubleModLin], var sgl_mod: List[ModLin],
+        var final_adaln_w: TArc, var final_adaln_b: TArc,
+        var final_lin: TArc, var final_lin_b: TArc,
+    ):
+        self.img_in = img_in^
+        self.img_in_b = img_in_b^
+        self.txt_in = txt_in^
+        self.txt_in_b = txt_in_b^
+        self.time_in = time_in^
+        self.has_guidance = has_guidance
+        self.guidance_in = guidance_in^
+        self.vector_in = vector_in^
+        self.dbl_mod = dbl_mod^
+        self.sgl_mod = sgl_mod^
+        self.final_adaln_w = final_adaln_w^
+        self.final_adaln_b = final_adaln_b^
+        self.final_lin = final_lin^
+        self.final_lin_b = final_lin_b^
 
 
 # ── forward result ───────────────────────────────────────────────────────────

@@ -251,6 +251,25 @@ struct StreamWeights(Copyable, Movable):
         self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.BF16, ctx))
         self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.BF16, ctx))
 
+    def __init__(
+        out self,
+        var wqkv: TArc, var bqkv: TArc,
+        var wproj: TArc, var bproj: TArc,
+        var wmlp0: TArc, var bmlp0: TArc,
+        var wmlp2: TArc, var bmlp2: TArc,
+        var q_norm: TArc, var k_norm: TArc,
+    ):
+        self.wqkv = wqkv^
+        self.bqkv = bqkv^
+        self.wproj = wproj^
+        self.bproj = bproj^
+        self.wmlp0 = wmlp0^
+        self.bmlp0 = bmlp0^
+        self.wmlp2 = wmlp2^
+        self.bmlp2 = bmlp2^
+        self.q_norm = q_norm^
+        self.k_norm = k_norm^
+
 
 struct DoubleBlockWeights(Copyable, Movable):
     var img: StreamWeights
@@ -825,6 +844,19 @@ struct SingleBlockWeights(Copyable, Movable):
         self.b2 = TArc(Tensor.from_host(b2^, [D], STDtype.BF16, ctx))
         self.q_norm = TArc(Tensor.from_host(q_norm^, [Dh], STDtype.BF16, ctx))
         self.k_norm = TArc(Tensor.from_host(k_norm^, [Dh], STDtype.BF16, ctx))
+
+    def __init__(
+        out self,
+        var w1: TArc, var b1: TArc,
+        var w2: TArc, var b2: TArc,
+        var q_norm: TArc, var k_norm: TArc,
+    ):
+        self.w1 = w1^
+        self.b1 = b1^
+        self.w2 = w2^
+        self.b2 = b2^
+        self.q_norm = q_norm^
+        self.k_norm = k_norm^
 
 
 struct SingleBlockSaved(Copyable, Movable):

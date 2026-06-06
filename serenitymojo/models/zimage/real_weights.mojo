@@ -43,7 +43,7 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.tensor_algebra import reshape, permute, reshape_owned
-from serenitymojo.models.zimage.weights import _load_device_preserve, _load_f32_device
+from serenitymojo.models.zimage.weights import _load_device_preserve
 from serenitymojo.models.zimage.block import ZImageModVecs
 
 
@@ -70,8 +70,8 @@ def _slice_cols(v: List[Float32], rows: Int, cols: Int, col0: Int, w: Int) -> Li
 # ─────────────────────────────────────────────────────────────────────────────
 # Holder for the frozen embedder / modulation / final-layer weights. Loaded ONCE.
 # Builder-owned biased linears cast transient inputs to checkpoint weight dtype.
-# The final projection remains F32 until the stack forward's host-F32 biased
-# helper is converted outside this loader scope.
+# The final projection also preserves checkpoint dtype; stack forward/backward
+# call mixed-dtype linear kernels instead of storing BF16 checkpoints as F32.
 # ─────────────────────────────────────────────────────────────────────────────
 struct ZImageRealAux(Movable):
     # t_embedder mlp
@@ -162,11 +162,8 @@ def load_zimage_real_aux(
         nr_mod_w^, nr_mod_b^, main_mod_w^, main_mod_b^,
         TArc(_load_device_preserve(st, String("all_final_layer.2-1.adaLN_modulation.1.weight"), ctx)),
         TArc(_load_device_preserve(st, String("all_final_layer.2-1.adaLN_modulation.1.bias"), ctx)),
-        # BUG: the stack final projection still takes host-F32 x_out with a
-        # biased linear helper outside this loader scope, so these two still
-        # upcast BF16 checkpoints until that call site casts to weight dtype.
-        TArc(_load_f32_device(st, String("all_final_layer.2-1.linear.weight"), ctx)),
-        TArc(_load_f32_device(st, String("all_final_layer.2-1.linear.bias"), ctx)),
+        TArc(_load_device_preserve(st, String("all_final_layer.2-1.linear.weight"), ctx)),
+        TArc(_load_device_preserve(st, String("all_final_layer.2-1.linear.bias"), ctx)),
     )
 
 

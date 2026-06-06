@@ -84,6 +84,7 @@ from serenitymojo.models.flux.flux_stack import (
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.elementwise import modulate
+from serenitymojo.ops.tensor_algebra import concat
 from serenitymojo.ops.linalg_backward import linear_backward
 from serenitymojo.ops.norm_backward import layer_norm_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward
@@ -236,34 +237,38 @@ def _nonfinite(v: List[Float32]) -> Int:
 
 
 # ── streamed-block -> fused weight structs (diffusers keys; row-stack q;k;v) ──
-def _block_host_f32(block: Block, key: String, ctx: DeviceContext) raises -> List[Float32]:
+# Keep checkpoint tensors device-resident in their stored dtype. Only the fused
+# qkv/w1 tensors are materialized, because the proven Flux block consumes fused
+# projections; unfused block tensors are passed by ArcPointer handle.
+def _block_tensor(block: Block, key: String) raises -> TArc:
     if not (key in block):
         raise Error(String("Chroma offload block missing tensor: ") + key)
-    return cast_tensor(block[key][], STDtype.F32, ctx).to_host(ctx)
+    return block[key].copy()
 
 
-def _row_stack3(var a: List[Float32], var b: List[Float32], var c: List[Float32]) -> List[Float32]:
-    var out = List[Float32]()
-    for i in range(len(a)):
-        out.append(a[i])
-    for i in range(len(b)):
-        out.append(b[i])
-    for i in range(len(c)):
-        out.append(c[i])
-    return out^
+def _block_clone(block: Block, key: String, ctx: DeviceContext) raises -> Tensor:
+    if not (key in block):
+        raise Error(String("Chroma offload block missing tensor: ") + key)
+    return block[key][].clone(ctx)
 
 
-def _row_stack4(var a: List[Float32], var b: List[Float32], var c: List[Float32], var d: List[Float32]) -> List[Float32]:
-    var out = List[Float32]()
-    for i in range(len(a)):
-        out.append(a[i])
-    for i in range(len(b)):
-        out.append(b[i])
-    for i in range(len(c)):
-        out.append(c[i])
-    for i in range(len(d)):
-        out.append(d[i])
-    return out^
+def _row_stack3_block(
+    block: Block, ka: String, kb: String, kc: String, ctx: DeviceContext
+) raises -> TArc:
+    var a = _block_clone(block, ka, ctx)
+    var b = _block_clone(block, kb, ctx)
+    var c = _block_clone(block, kc, ctx)
+    return TArc(concat(0, ctx, a, b, c))
+
+
+def _row_stack4_block(
+    block: Block, ka: String, kb: String, kc: String, kd: String, ctx: DeviceContext
+) raises -> TArc:
+    var a = _block_clone(block, ka, ctx)
+    var b = _block_clone(block, kb, ctx)
+    var c = _block_clone(block, kc, ctx)
+    var d = _block_clone(block, kd, ctx)
+    return TArc(concat(0, ctx, a, b, c, d))
 
 
 def _chroma_stream_from_block(
@@ -272,25 +277,24 @@ def _chroma_stream_from_block(
     mlp0k: String, mlp2k: String, nqk: String, nkk: String,
     D: Int, Fmlp: Int, Dh: Int, ctx: DeviceContext,
 ) raises -> ChromaStreamWeights:
-    var wq = _block_host_f32(block, bp + qk + String(".weight"), ctx)
-    var wk = _block_host_f32(block, bp + kk + String(".weight"), ctx)
-    var wv = _block_host_f32(block, bp + vk + String(".weight"), ctx)
-    var wqkv = _row_stack3(wq^, wk^, wv^)
-    var bq = _block_host_f32(block, bp + qk + String(".bias"), ctx)
-    var bk = _block_host_f32(block, bp + kk + String(".bias"), ctx)
-    var bv = _block_host_f32(block, bp + vk + String(".bias"), ctx)
-    var bqkv = _row_stack3(bq^, bk^, bv^)
+    var wqkv = _row_stack3_block(
+        block, bp + qk + String(".weight"), bp + kk + String(".weight"),
+        bp + vk + String(".weight"), ctx,
+    )
+    var bqkv = _row_stack3_block(
+        block, bp + qk + String(".bias"), bp + kk + String(".bias"),
+        bp + vk + String(".bias"), ctx,
+    )
     return ChromaStreamWeights(
         wqkv^, bqkv^,
-        _block_host_f32(block, bp + outk + String(".weight"), ctx),
-        _block_host_f32(block, bp + outk + String(".bias"), ctx),
-        _block_host_f32(block, bp + mlp0k + String(".weight"), ctx),
-        _block_host_f32(block, bp + mlp0k + String(".bias"), ctx),
-        _block_host_f32(block, bp + mlp2k + String(".weight"), ctx),
-        _block_host_f32(block, bp + mlp2k + String(".bias"), ctx),
-        _block_host_f32(block, bp + nqk + String(".weight"), ctx),
-        _block_host_f32(block, bp + nkk + String(".weight"), ctx),
-        D, Fmlp, Dh, ctx,
+        _block_tensor(block, bp + outk + String(".weight")),
+        _block_tensor(block, bp + outk + String(".bias")),
+        _block_tensor(block, bp + mlp0k + String(".weight")),
+        _block_tensor(block, bp + mlp0k + String(".bias")),
+        _block_tensor(block, bp + mlp2k + String(".weight")),
+        _block_tensor(block, bp + mlp2k + String(".bias")),
+        _block_tensor(block, bp + nqk + String(".weight")),
+        _block_tensor(block, bp + nkk + String(".weight")),
     )
 
 
@@ -315,23 +319,22 @@ def _chroma_double_from_block(
 def _chroma_single_from_block(
     block: Block, sp: String, D: Int, Fmlp: Int, Dh: Int, ctx: DeviceContext,
 ) raises -> ChromaSingleBlockWeights:
-    var wq = _block_host_f32(block, sp + String("attn.to_q.weight"), ctx)
-    var wk = _block_host_f32(block, sp + String("attn.to_k.weight"), ctx)
-    var wv = _block_host_f32(block, sp + String("attn.to_v.weight"), ctx)
-    var wm = _block_host_f32(block, sp + String("proj_mlp.weight"), ctx)
-    var w1 = _row_stack4(wq^, wk^, wv^, wm^)
-    var bq = _block_host_f32(block, sp + String("attn.to_q.bias"), ctx)
-    var bk = _block_host_f32(block, sp + String("attn.to_k.bias"), ctx)
-    var bv = _block_host_f32(block, sp + String("attn.to_v.bias"), ctx)
-    var bm = _block_host_f32(block, sp + String("proj_mlp.bias"), ctx)
-    var b1 = _row_stack4(bq^, bk^, bv^, bm^)
+    var w1 = _row_stack4_block(
+        block,
+        sp + String("attn.to_q.weight"), sp + String("attn.to_k.weight"),
+        sp + String("attn.to_v.weight"), sp + String("proj_mlp.weight"), ctx,
+    )
+    var b1 = _row_stack4_block(
+        block,
+        sp + String("attn.to_q.bias"), sp + String("attn.to_k.bias"),
+        sp + String("attn.to_v.bias"), sp + String("proj_mlp.bias"), ctx,
+    )
     return ChromaSingleBlockWeights(
         w1^, b1^,
-        _block_host_f32(block, sp + String("proj_out.weight"), ctx),
-        _block_host_f32(block, sp + String("proj_out.bias"), ctx),
-        _block_host_f32(block, sp + String("attn.norm_q.weight"), ctx),
-        _block_host_f32(block, sp + String("attn.norm_k.weight"), ctx),
-        D, Fmlp, Dh, ctx,
+        _block_tensor(block, sp + String("proj_out.weight")),
+        _block_tensor(block, sp + String("proj_out.bias")),
+        _block_tensor(block, sp + String("attn.norm_q.weight")),
+        _block_tensor(block, sp + String("attn.norm_k.weight")),
     )
 
 

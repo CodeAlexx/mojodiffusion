@@ -295,12 +295,6 @@ def klein_single_lora_device_for(set: KleinLoraDeviceSet, bi: Int) -> SingleBloc
     return _sgl_lora_dev_for(set, bi)
 
 
-def _block_tensor_f32(block: Block, key: String, ctx: DeviceContext) raises -> TArc:
-    if not (key in block):
-        raise Error(String("Klein offload block missing tensor: ") + key)
-    return TArc(cast_tensor(block[key][], STDtype.F32, ctx, False))
-
-
 def _block_tensor_base(block: Block, key: String) raises -> TArc:
     if not (key in block):
         raise Error(String("Klein offload block missing tensor: ") + key)
@@ -320,8 +314,8 @@ def _stream_weights_from_block(
         _block_tensor_base(block, ap + String(".proj.weight")),
         _block_tensor_base(block, mp + String(".0.weight")),
         _block_tensor_base(block, mp + String(".2.weight")),
-        _block_tensor_f32(block, ap + String(".norm.query_norm.scale"), ctx),
-        _block_tensor_f32(block, ap + String(".norm.key_norm.scale"), ctx),
+        _block_tensor_base(block, ap + String(".norm.query_norm.scale")),
+        _block_tensor_base(block, ap + String(".norm.key_norm.scale")),
     )
 
 
@@ -340,8 +334,8 @@ def _single_weights_from_block(
     return SingleBlockWeights(
         _block_tensor_base(block, prefix + String(".linear1.weight")),
         _block_tensor_base(block, prefix + String(".linear2.weight")),
-        _block_tensor_f32(block, prefix + String(".norm.query_norm.scale"), ctx),
-        _block_tensor_f32(block, prefix + String(".norm.key_norm.scale"), ctx),
+        _block_tensor_base(block, prefix + String(".norm.query_norm.scale")),
+        _block_tensor_base(block, prefix + String(".norm.key_norm.scale")),
         D, F, ctx, False,
     )
 

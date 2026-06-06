@@ -38,10 +38,8 @@ from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
-from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -99,25 +97,10 @@ def _load_device_preserve(
     return Tensor.from_view(tv, ctx)
 
 
-# Read one named tensor from the sharded safetensors as a device F32 Tensor at
-# its real stored shape (casts up from BF16). Use this for small norm-vector
-# compatibility and parity probes. Do not use it for Z-Image training projection
-# matrices; full-F32 base/model loading is OOM-prone and not the OneTrainer
-# policy.
-def _load_f32_device(
-    st: ShardedSafeTensors, name: String, ctx: DeviceContext
-) raises -> Tensor:
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx)
-
-
 # Load one block with mixed base dtype:
-#   - large Linear projection weights stay in checkpoint dtype (BF16 for Z-Image)
-#   - small norm scale vectors are F32 because the current rms_norm kernels
-#     require x and weight dtypes to match and the stack carries activations F32.
+#   - Linear projection weights stay in checkpoint dtype (BF16 for Z-Image)
+#   - norm scale vectors also stay in checkpoint dtype; rms_norm handles the
+#     tiny mixed-dtype compute boundary when the activation stream is F32.
 #
 # This is the training path that matches OneTrainer's BF16/BP16 weight policy
 # without rewriting the already-parity-tested F32 activation stack.
@@ -127,19 +110,19 @@ def load_zimage_block_weights_prefixed_mixed(
     var ap = prefix + String(".attention")
     var fp = prefix + String(".feed_forward")
     return ZImageBlockWeights(
-        TArc(_load_f32_device(st, prefix + String(".attention_norm1.weight"), ctx)),
+        TArc(_load_device_preserve(st, prefix + String(".attention_norm1.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_q.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_k.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_v.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_out.0.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
-        TArc(_load_f32_device(st, prefix + String(".attention_norm2.weight"), ctx)),
-        TArc(_load_f32_device(st, prefix + String(".ffn_norm1.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_device_preserve(st, prefix + String(".attention_norm2.weight"), ctx)),
+        TArc(_load_device_preserve(st, prefix + String(".ffn_norm1.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w1.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w3.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w2.weight"), ctx)),
-        TArc(_load_f32_device(st, prefix + String(".ffn_norm2.weight"), ctx)),
+        TArc(_load_device_preserve(st, prefix + String(".ffn_norm2.weight"), ctx)),
     )
 
 
@@ -147,28 +130,27 @@ def load_zimage_block_weights_prefixed_mixed(
 # (noise_refiner.{i} / context_refiner.{i} / layers.{i}). The diffusers
 # transformer dir (/home/alex/.serenity/models/zimage_base/transformer) stores
 # UNFUSED to_q/to_k/to_v/to_out.0 + per-head norm_q/norm_k under each stream,
-# matching the training stack's separate-projection ZImageBlockWeights. Large
-# projection matrices preserve checkpoint dtype; only norm scale vectors stay F32
-# for the current F32 residual stream.
+# matching the training stack's separate-projection ZImageBlockWeights. Projection
+# matrices and norm scales preserve checkpoint dtype.
 def load_zimage_block_weights_prefixed(
     st: ShardedSafeTensors, prefix: String, ctx: DeviceContext
 ) raises -> ZImageBlockWeights:
     var ap = prefix + String(".attention")
     var fp = prefix + String(".feed_forward")
     return ZImageBlockWeights(
-        TArc(_load_f32_device(st, prefix + String(".attention_norm1.weight"), ctx)),
+        TArc(_load_device_preserve(st, prefix + String(".attention_norm1.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_q.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_k.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_v.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_out.0.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
-        TArc(_load_f32_device(st, prefix + String(".attention_norm2.weight"), ctx)),
-        TArc(_load_f32_device(st, prefix + String(".ffn_norm1.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_device_preserve(st, prefix + String(".attention_norm2.weight"), ctx)),
+        TArc(_load_device_preserve(st, prefix + String(".ffn_norm1.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w1.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w3.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w2.weight"), ctx)),
-        TArc(_load_f32_device(st, prefix + String(".ffn_norm2.weight"), ctx)),
+        TArc(_load_device_preserve(st, prefix + String(".ffn_norm2.weight"), ctx)),
     )
 
 
@@ -180,19 +162,19 @@ def load_zimage_block_weights(
     var ap = p + String(".attention")
     var fp = p + String(".feed_forward")
     return ZImageBlockWeights(
-        TArc(_load_f32_device(st, p + String(".attention_norm1.weight"), ctx)),
+        TArc(_load_device_preserve(st, p + String(".attention_norm1.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_q.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_k.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_v.weight"), ctx)),
         TArc(_load_device_preserve(st, ap + String(".to_out.0.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
-        TArc(_load_f32_device(st, p + String(".attention_norm2.weight"), ctx)),
-        TArc(_load_f32_device(st, p + String(".ffn_norm1.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_device_preserve(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_device_preserve(st, p + String(".attention_norm2.weight"), ctx)),
+        TArc(_load_device_preserve(st, p + String(".ffn_norm1.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w1.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w3.weight"), ctx)),
         TArc(_load_device_preserve(st, fp + String(".w2.weight"), ctx)),
-        TArc(_load_f32_device(st, p + String(".ffn_norm2.weight"), ctx)),
+        TArc(_load_device_preserve(st, p + String(".ffn_norm2.weight"), ctx)),
     )
 
 

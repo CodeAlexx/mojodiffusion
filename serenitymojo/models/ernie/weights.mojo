@@ -6,10 +6,9 @@
 # inference path (models/dit/ernie_image.mojo `block0_smoke_forward`) reads these
 # exact keys; this is the cross-pollination into the TRAINING weight structs.
 #
-# Mirrors models/klein/weights.mojo: read each named tensor as a host F32 list
-# (casts up from the stored BF16), upload to device ONCE (TArc carriers) at the
-# tensor's real shape. The frozen base matrices are device-resident — never
-# re-uploaded per op per step (the A2 perf lesson from Klein).
+# Mirrors models/klein/weights.mojo: read each named tensor into a device Tensor
+# at the checkpoint's stored dtype and shape. The frozen base matrices are
+# device-resident — never re-uploaded per op per step.
 #
 # Key layout (per block `bi`), from ernie_image.rs:411-425 / ernie_image.mojo:
 #   layers.{bi}.adaLN_sa_ln.weight              -> sa_norm   [hidden]      (RMSNorm scale)
@@ -29,14 +28,12 @@
 # stored [out, in] layout is consumed DIRECTLY (no pre-transpose) — same contract
 # as klein/weights.mojo (Rust pre-transposes; Mojo linear transposes inside).
 
-from std.collections import List, Optional
+from std.collections import List
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
-from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import reshape_owned
 
 
@@ -76,20 +73,6 @@ struct ErnieBlockWeights(Copyable, Movable):
         self.wdown = wdown^
 
 
-# Read one named tensor from the sharded safetensors as a device F32 Tensor.
-# Use only for small F32 residual-stream norm compatibility, or the remaining
-# biased patch/final stack helpers called out below. Do not use for generic
-# projection-matrix checkpoint loading.
-def _load_f32_device(
-    st: ShardedSafeTensors, name: String, ctx: DeviceContext
-) raises -> Tensor:
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx)
-
-
 # Read one named tensor from the sharded safetensors as a device Tensor in the
 # checkpoint's stored dtype. ERNIE's large projection matrices are BF16; keeping
 # them BF16 avoids doubling block-stream traffic while linear()/dX use mixed GEMM.
@@ -116,23 +99,23 @@ def load_ernie_block_weights(
     var ap = p + String(".self_attention")
     var mp = p + String(".mlp")
     return ErnieBlockWeights(
-        TArc(_load_f32_device(st, p + String(".adaLN_sa_ln.weight"), ctx)),
+        TArc(_load_stored_device(st, p + String(".adaLN_sa_ln.weight"), ctx)),
         TArc(_load_stored_device(st, ap + String(".to_q.weight"), ctx)),
         TArc(_load_stored_device(st, ap + String(".to_k.weight"), ctx)),
         TArc(_load_stored_device(st, ap + String(".to_v.weight"), ctx)),
         TArc(_load_stored_device(st, ap + String(".to_out.0.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
-        TArc(_load_f32_device(st, p + String(".adaLN_mlp_ln.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_stored_device(st, p + String(".adaLN_mlp_ln.weight"), ctx)),
         TArc(_load_stored_device(st, mp + String(".gate_proj.weight"), ctx)),
         TArc(_load_stored_device(st, mp + String(".up_proj.weight"), ctx)),
         TArc(_load_stored_device(st, mp + String(".linear_fc2.weight"), ctx)),
     )
 
 
-# Load block `block_idx` for the production device-streamed fast path: large
-# Linear matrices stay BF16 in device memory, while tiny RMSNorm scale vectors
-# stay F32 so the F32 residual stream's norm ops keep their existing dtype path.
+# Load block `block_idx` for the production device-streamed fast path. Linear and
+# RMSNorm checkpoint tensors preserve stored dtype; rms_norm owns the small
+# mixed-dtype compute boundary.
 def load_ernie_block_weights_bf16_normf32(
     st: ShardedSafeTensors, block_idx: Int, ctx: DeviceContext
 ) raises -> ErnieBlockWeights:
@@ -140,14 +123,14 @@ def load_ernie_block_weights_bf16_normf32(
     var ap = p + String(".self_attention")
     var mp = p + String(".mlp")
     return ErnieBlockWeights(
-        TArc(_load_f32_device(st, p + String(".adaLN_sa_ln.weight"), ctx)),
+        TArc(_load_stored_device(st, p + String(".adaLN_sa_ln.weight"), ctx)),
         TArc(_load_stored_device(st, ap + String(".to_q.weight"), ctx)),
         TArc(_load_stored_device(st, ap + String(".to_k.weight"), ctx)),
         TArc(_load_stored_device(st, ap + String(".to_v.weight"), ctx)),
         TArc(_load_stored_device(st, ap + String(".to_out.0.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_q.weight"), ctx)),
-        TArc(_load_f32_device(st, ap + String(".norm_k.weight"), ctx)),
-        TArc(_load_f32_device(st, p + String(".adaLN_mlp_ln.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".norm_q.weight"), ctx)),
+        TArc(_load_stored_device(st, ap + String(".norm_k.weight"), ctx)),
+        TArc(_load_stored_device(st, p + String(".adaLN_mlp_ln.weight"), ctx)),
         TArc(_load_stored_device(st, mp + String(".gate_proj.weight"), ctx)),
         TArc(_load_stored_device(st, mp + String(".up_proj.weight"), ctx)),
         TArc(_load_stored_device(st, mp + String(".linear_fc2.weight"), ctx)),
@@ -178,11 +161,9 @@ def verify_block_to_q_shape(
 # ── shared / resident base weights (input projections + final layer) ──────────
 # Mirrors klein_stack.KleinStackBase: every tensor uploaded to the device ONCE.
 # These are FROZEN (read on every forward + backward). The no-bias text
-# projection and the shared timestep/AdaLN/final-norm MLP preserve checkpoint
-# dtype; their callers already cast transient inputs to the stored weight dtype.
-# BUG: patch_embed and final_linear still upcast BF16 checkpoint tensors because
-# their biased stack helpers live outside this loader scope and still build F32
-# input tensors. Keys from ernie_image.rs load():
+# projection, patch embed, and final linear preserve checkpoint dtype; their
+# callers already use mixed-dtype linear kernels instead of storing BF16
+# checkpoint tensors as F32. Keys from ernie_image.rs load():
 #   x_embedder.proj.{weight,bias}            patch embed (Conv2d k=1 -> linear)
 #   text_proj.weight                         Mistral hidden -> hidden (no bias)
 #   time_embedding.linear_{1,2}.{weight,bias}  timestep MLP
@@ -231,30 +212,29 @@ struct ErnieStackBase(Copyable, Movable):
         self.final_lin_b = final_lin_b^
 
 
-# Load one named tensor as a device F32 Tensor, FORCING a target shape (used for
-# the patch_proj conv weight [hidden,in_ch,1,1] -> [hidden,in_ch] byte no-op).
-def _load_f32_device_reshaped(
+# Load one named tensor as a device Tensor in checkpoint dtype, FORCING a target
+# shape (used for patch_proj conv weight [hidden,in_ch,1,1] -> [hidden,in_ch]).
+def _load_stored_device_reshaped(
     st: ShardedSafeTensors, name: String, var shape: List[Int], ctx: DeviceContext
 ) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
     var t = Tensor.from_view(tv, ctx)
-    var f = cast_tensor(t, STDtype.F32, ctx)
     # reshape is a metadata-only byte no-op (numel validated by reshape_owned).
-    return reshape_owned(f^, shape^)
+    return reshape_owned(t^, shape^)
 
 
 # Load the resident / shared base weights (input projections + final layer).
 def load_ernie_stack_base(
     st: ShardedSafeTensors, hidden: Int, in_ch: Int, ctx: DeviceContext
 ) raises -> ErnieStackBase:
-    var patch_w = _load_f32_device_reshaped(
+    var patch_w = _load_stored_device_reshaped(
         st, String("x_embedder.proj.weight"), [hidden, in_ch], ctx
     )
     return ErnieStackBase(
         TArc(patch_w^),
-        TArc(_load_f32_device(st, String("x_embedder.proj.bias"), ctx)),
+        TArc(_load_stored_device(st, String("x_embedder.proj.bias"), ctx)),
         TArc(_load_stored_device(st, String("text_proj.weight"), ctx)),
         TArc(_load_stored_device(st, String("time_embedding.linear_1.weight"), ctx)),
         TArc(_load_stored_device(st, String("time_embedding.linear_1.bias"), ctx)),
@@ -264,8 +244,8 @@ def load_ernie_stack_base(
         TArc(_load_stored_device(st, String("adaLN_modulation.1.bias"), ctx)),
         TArc(_load_stored_device(st, String("final_norm.linear.weight"), ctx)),
         TArc(_load_stored_device(st, String("final_norm.linear.bias"), ctx)),
-        TArc(_load_f32_device(st, String("final_linear.weight"), ctx)),
-        TArc(_load_f32_device(st, String("final_linear.bias"), ctx)),
+        TArc(_load_stored_device(st, String("final_linear.weight"), ctx)),
+        TArc(_load_stored_device(st, String("final_linear.bias"), ctx)),
     )
 
 
@@ -281,8 +261,8 @@ def load_ernie_all_blocks(
 
 
 # Load ALL `num_layers` blocks for the production resident fast path: BF16 large
-# matrices, F32 norm vectors. On ERNIE-4B this is roughly half the F32 residency
-# footprint and avoids per-step block reloads when VRAM allows it.
+# matrices and norm vectors. On ERNIE-4B this avoids per-step block reloads when
+# VRAM allows it.
 def load_ernie_all_blocks_bf16_normf32(
     st: ShardedSafeTensors, num_layers: Int, ctx: DeviceContext
 ) raises -> List[ErnieBlockWeights]:

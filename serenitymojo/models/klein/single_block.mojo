@@ -91,6 +91,7 @@ from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.tensor_algebra import (
     reshape, reshape_owned, reshape_in_place, slice, concat, add, add_in_place_f32,
+    zeros_device,
 )
 from serenitymojo.ops.tensor_algebra_scratch import (
     concat2_scratch, concat3_scratch, slice_scratch,
@@ -238,9 +239,7 @@ struct SingleBlockWeights(Copyable, Movable):
         if keep_w2:
             self.w2 = w2.copy()
         else:
-            var dummy = List[Float32]()
-            dummy.append(0.0)
-            self.w2 = TArc(Tensor.from_host(dummy^, [1, 1], STDtype.F32, ctx))
+            self.w2 = TArc(zeros_device([1, 1], w2[].dtype(), ctx))
         self.w2_att = TArc(slice(w2[], 1, 0, D, ctx))
         self.w2_mlp = TArc(slice(w2[], 1, D, F, ctx))
         self.q_norm = q_norm^

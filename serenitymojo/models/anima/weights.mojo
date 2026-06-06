@@ -29,7 +29,6 @@ from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
-from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 
@@ -91,10 +90,6 @@ struct AnimaBlockWeights(Copyable, Movable):
         self.ca_qn = TArc(ca_qn^); self.ca_kn = TArc(ca_kn^)
         self.mlp1 = TArc(mlp1^); self.mlp2 = TArc(mlp2^)
 
-
-from serenitymojo.ops.cast import cast_tensor
-
-
 # Load a named tensor as a device Tensor in its stored dtype (Anima base = BF16).
 # Mirrors klein/weights.mojo::_load_tensor.
 def _load_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
@@ -102,16 +97,6 @@ def _load_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Te
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
     return Tensor.from_view(tv, ctx)
-
-
-# Load a named tensor and cast to F32 for explicit compatibility/parity uses:
-# current F32 residual-stream norm weights and old oracle-only callers.
-def _load_tensor_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t^, STDtype.F32, ctx)
 
 
 # Dim 0 of a named tensor's stored shape (for shape verification).
@@ -155,8 +140,8 @@ def load_anima_block_weights(
 
 
 # Legacy symbol retained for streamed-stack callers. It now follows the runtime
-# dtype contract: large weights preserve checkpoint dtype; only q/k norm scales
-# stay F32 for the current F32 residual-stream rms_norm boundary.
+# dtype contract: all checkpoint tensors, including q/k norm scales, preserve
+# stored dtype; rms_norm handles the tiny mixed-dtype compute boundary.
 def load_anima_block_weights_f32(
     st: SafeTensors, block_idx: Int, ctx: DeviceContext
 ) raises -> AnimaBlockWeights:
@@ -172,24 +157,22 @@ def load_anima_block_weights_f32(
         _load_tensor(st, bp + String("self_attn.k_proj.weight"), ctx),
         _load_tensor(st, bp + String("self_attn.v_proj.weight"), ctx),
         _load_tensor(st, bp + String("self_attn.output_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("self_attn.q_norm.weight"), ctx),
-        _load_tensor_f32(st, bp + String("self_attn.k_norm.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.q_norm.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.k_norm.weight"), ctx),
         _load_tensor(st, bp + String("cross_attn.q_proj.weight"), ctx),
         _load_tensor(st, bp + String("cross_attn.k_proj.weight"), ctx),
         _load_tensor(st, bp + String("cross_attn.v_proj.weight"), ctx),
         _load_tensor(st, bp + String("cross_attn.output_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("cross_attn.q_norm.weight"), ctx),
-        _load_tensor_f32(st, bp + String("cross_attn.k_norm.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.q_norm.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.k_norm.weight"), ctx),
         _load_tensor(st, bp + String("mlp.layer1.weight"), ctx),
         _load_tensor(st, bp + String("mlp.layer2.weight"), ctx),
     )
 
 
-# Load Anima block `block_idx` for the DEVICE-RESIDENT fast path: big projection
-# weights stay BF16 (memory: 28 blocks ≈ 3.7 GiB), but the tiny norm weights
-# (q/k_norm [128]) are upcast to F32 so the F32 residual stream's per-head
-# rms_norm dtype-matches (rms_norm needs x.dtype == weight.dtype). The AdaLN-mod
-# Linears and projections accept F32 x + BF16 weight via linear's mixed_base path.
+# Load Anima block `block_idx` for the DEVICE-RESIDENT fast path. Projection and
+# norm checkpoint tensors all preserve stored dtype; mixed activation/norm dtype
+# is handled inside rms_norm.
 def load_anima_block_weights_bf16_normf32(
     st: SafeTensors, block_idx: Int, ctx: DeviceContext
 ) raises -> AnimaBlockWeights:
@@ -205,21 +188,20 @@ def load_anima_block_weights_bf16_normf32(
         _load_tensor(st, bp + String("self_attn.k_proj.weight"), ctx),
         _load_tensor(st, bp + String("self_attn.v_proj.weight"), ctx),
         _load_tensor(st, bp + String("self_attn.output_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("self_attn.q_norm.weight"), ctx),
-        _load_tensor_f32(st, bp + String("self_attn.k_norm.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.q_norm.weight"), ctx),
+        _load_tensor(st, bp + String("self_attn.k_norm.weight"), ctx),
         _load_tensor(st, bp + String("cross_attn.q_proj.weight"), ctx),
         _load_tensor(st, bp + String("cross_attn.k_proj.weight"), ctx),
         _load_tensor(st, bp + String("cross_attn.v_proj.weight"), ctx),
         _load_tensor(st, bp + String("cross_attn.output_proj.weight"), ctx),
-        _load_tensor_f32(st, bp + String("cross_attn.q_norm.weight"), ctx),
-        _load_tensor_f32(st, bp + String("cross_attn.k_norm.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.q_norm.weight"), ctx),
+        _load_tensor(st, bp + String("cross_attn.k_norm.weight"), ctx),
         _load_tensor(st, bp + String("mlp.layer1.weight"), ctx),
         _load_tensor(st, bp + String("mlp.layer2.weight"), ctx),
     )
 
 
-# Legacy symbol retained for callers; block matrices preserve checkpoint dtype
-# and only q/k norm vectors are F32.
+# Legacy symbol retained for callers; block tensors preserve checkpoint dtype.
 def load_anima_all_blocks_f32(
     st: SafeTensors, num_blocks: Int, ctx: DeviceContext
 ) raises -> List[AnimaBlockWeights]:
@@ -229,7 +211,7 @@ def load_anima_all_blocks_f32(
     return blocks^
 
 
-# Load ALL `num_blocks` blocks BF16 (norms F32) resident ONCE — the 24GB-safe
+# Load ALL `num_blocks` blocks in stored dtype resident ONCE — the 24GB-safe
 # device-resident inference stack (28 blocks ≈ 3.7 GiB). Used by the no-save
 # sampler forward so there is NO per-block disk reload across denoise steps.
 def load_anima_all_blocks_bf16_normf32(
@@ -245,9 +227,8 @@ def load_anima_all_blocks_bf16_normf32(
 #    final_layer. The LLM adapter (6 frozen blocks) is NOT loaded here — for LoRA
 #    training the adapter output (context) is a cached, frozen INPUT; its weights
 #    need no grad and are not on the LoRA-DiT path. (Full-FT would add them.)
-#    No-bias resident weights preserve checkpoint dtype. The norm scale remains
-#    F32 because the current stack builds the timestep embedding residual stream
-#    as F32 before rms_norm, outside this loader's boundary. Key layout VERIFIED
+#    Resident weights preserve checkpoint dtype. rms_norm handles the small
+#    mixed-dtype timestep norm compute boundary. Key layout VERIFIED
 #    vs the checkpoint header:
 #      net.x_embedder.proj.1.weight       [2048, 68]
 #      net.t_embedder.1.linear_1.weight   [2048, 2048]
@@ -284,7 +265,7 @@ def load_anima_stack_base(st: SafeTensors, ctx: DeviceContext) raises -> AnimaSt
         TArc(_load_tensor(st, String("net.x_embedder.proj.1.weight"), ctx)),
         TArc(_load_tensor(st, String("net.t_embedder.1.linear_1.weight"), ctx)),
         TArc(_load_tensor(st, String("net.t_embedder.1.linear_2.weight"), ctx)),
-        TArc(_load_tensor_f32(st, String("net.t_embedding_norm.weight"), ctx)),
+        TArc(_load_tensor(st, String("net.t_embedding_norm.weight"), ctx)),
         TArc(_load_tensor(st, String("net.final_layer.adaln_modulation.1.weight"), ctx)),
         TArc(_load_tensor(st, String("net.final_layer.adaln_modulation.2.weight"), ctx)),
         TArc(_load_tensor(st, String("net.final_layer.linear.weight"), ctx)),

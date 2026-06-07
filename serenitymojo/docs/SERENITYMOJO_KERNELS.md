@@ -73,6 +73,15 @@ new kernel here when there is no callable Mojo/MAX primitive.
 |---|---|---|
 | `_bf16_to_f32`, `_f32_to_bf16`, `_f16_to_f32`, `_f32_to_f16` | GPU dtype cast over a flat tensor | Used by `cast_tensor`; same-dtype path is a D2D clone. |
 
+## ops/fp8.mojo — FP8 E4M3 → BF16 dequant (one thread/byte, grid-stride)
+
+E4M3 = 1 sign / 4 exp (bias 7) / 3 mantissa, no inf; `_fp8_e4m3_decode` is F32. Grid clamps to 65535 like the CUDA reference (`fp8_dequant.cu`).
+
+| Kernel | Computes | Notes |
+|---|---|---|
+| `_fp8_dequant_kernel` | `out[i] = bf16(e4m3_decode(byte[i])·scale)` — PER-TENSOR scalar scale | grid-stride; F32 decode, store-cast BF16. Bit-exact w/ flame-core `fp8_dequant.cu` (LTX-2.3 fp8 stream). |
+| `_fp8_dequant_perrow_kernel` | `out[o,i] = bf16(e4m3_decode(w[o,i])·scale[o])` — PER-OUTPUT-ROW F32 scale | Ideogram-4 weight-only FP8 Linear; `row = i // cols`, scale `[out]` broadcast over `in`. ✅ cos 0.99999878 vs torch `Fp8Linear`. |
+
 ## ops/rope.mojo — rotary embedding (one thread/pair)
 
 | Kernel triple | Computes | Notes |
@@ -178,6 +187,19 @@ new kernel here when there is no callable Mojo/MAX primitive.
 | `_padtok_kernel_{bf16,f32}` | overwrite rows `[real_len, total_len)` of `[total_len,dim]` with `pad_token[dim]` | learned x_pad_token / cap_pad_token substitution after pad-to-mult-32. |
 | `_tanh_kernel_{bf16,f32}` | `tanh(x)`, elementwise (gates) | F32 math; gate activations in the modulated blocks. |
 
+## models/dit/ideogram4_dit.mojo — Ideogram-4 DiT glue kernels
+
+| Kernel | Computes | Notes |
+|---|---|---|
+| `_embedscalar_sinusoid_kernel` | sin-first sinusoidal `[N,dim]` of `t·1e4`; cols `[0,half)`=sin, `[half,dim)`=cos | `freq_i=exp(-i·ln(1e4)/(half-1))`. GPU has no F64 trig → **F64 range-reduction** (subtract `k·2π`) then F32 sin/cos. F32 in → BF16 store. |
+| `_rope_kernel[dt]` | halfsplit RoPE `[B,L,H,Dh]`: `d<half → x·cos-x[d+half]·sin`; `d≥half → x·cos+x[d-half]·sin` | full-width cos/sin `[1,L,Dh]` (duplicated halves), token base `cbase=l·Dh`; F32 math, store dt. ✅ transformer-block cos 0.99999895. |
+
+## models/dit/ideogram4_mrope.mojo — interleaved MRoPE cos/sin build (one thread per (l,d))
+
+| Kernel | Computes | Notes |
+|---|---|---|
+| `_ideogram4_mrope_kernel[out_dtype]` | per `(l,d)` cos/sin `[1,L,head_dim]`: pick axis t/h/w by `d%3` + section bound, `angle = pos[axis]·inv_freq` | `inv_freq=theta^(-d/half)` **bf16-rounded** to match the bf16 model (it casts the buffer to bf16; f32 inv gives cos 0.71 at pos 65536, bf16 gives 1.0); GPU has no F64 trig → **F64 range-reduction** then F32 sin/cos. theta 5e6, section (24,20,20). ✅ cos 0.99999999. |
+
 ## models/text_encoder/{qwen3,qwen25vl}_encoder.mojo — encoder-local glue (identical in both)
 
 | Kernel | Computes | Notes |
@@ -198,3 +220,8 @@ new kernel here when there is no callable Mojo/MAX primitive.
 ## image/png.mojo — CPU only (no GPU kernel)
 
 `crc32` / `adler32` / `_zlib_stored` / `_quantize` run on host after a single `to_host` readback. `_quantize`: SIGNED `(v+1)·127.5`, UNIT `v·255`, clamp+round to u8.
+
+## Ideogram-4 fp8 kernels
+- `ops/fp8.mojo::_fp8_dequant_perrow_kernel` — E4M3 byte × per-OUTPUT-ROW F32 scale → BF16 (Ideogram fp8 Linear; per-tensor sibling `_fp8_dequant_kernel`).
+- `ops/fp8_gemm.mojo::_linear_fp8_kernel` — tiled (TILE=16, shared-mem) fp8×bf16 GEMM: decodes fp8 weight tiles in-kernel, F32 accum, ×scale+bias on store. Avoids bf16-weight materialization (both transformers fit fp8-resident). Reference; cuBLAS-on-dequant is faster on the hot path.
+- `models/dit/ideogram4_mrope.mojo::_ideogram4_mrope_kernel`, `ideogram4_dit.mojo::{_embedscalar_sinusoid_kernel,_rope_kernel}` — bf16-rounded inv_freq + F64 range-reduction (no GPU F64 trig).

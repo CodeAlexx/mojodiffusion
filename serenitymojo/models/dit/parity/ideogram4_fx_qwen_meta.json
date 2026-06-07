@@ -1,0 +1,20 @@
+{
+  "prompt": "a red cube on a white table",
+  "seq": 15,
+  "taps": [
+    0,
+    3,
+    6,
+    9,
+    12,
+    15,
+    18,
+    21,
+    24,
+    27,
+    30,
+    33,
+    35
+  ],
+  "rendered": "<|im_start|>user\na red cube on a white table<|im_end|>\n<|im_start|>assistant\n"
+}

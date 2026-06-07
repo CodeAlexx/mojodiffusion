@@ -841,3 +841,45 @@ def load_sd3_embedded_ldm_decoder[
         SD3_SHIFT,
         ctx,
     )
+
+
+# ── Ideogram-4 VAE decoder (AutoencoderKLFlux2, diffusers keys, LATENT_CH=32) ──
+# The .serenity ideogram-4 vae is diffusers AutoencoderKLFlux2: decoder.* diffusers
+# keys (to_q/to_out attn, conv_shortcut, up_blocks.0..3, up_blocks.3 NO upsampler),
+# post_quant_conv present, latent_channels=32, block_out [128,256,512,512]. The
+# Ideogram pipeline feeds z to the decoder UNSCALED (latent_shift/scale handled
+# upstream), so scale=1, shift=0. Reuses the decoder2d kit verbatim.
+def load_ideogram4_vae_decoder[
+    LH: Int, LW: Int
+](dir_or_file: String, ctx: DeviceContext) raises -> LdmVaeDecoder[LH, LW, 32]:
+    var st = ShardedSafeTensors.open(dir_or_file)
+    var p = String("decoder")
+    return LdmVaeDecoder[LH, LW, 32](
+        Float32(1.0), Float32(0.0), True,
+        _load_conv_weight_rscf(st, String("post_quant_conv.weight"), ctx),
+        _load_weight(st, String("post_quant_conv.bias"), ctx),
+        _load_conv_weight_rscf(st, p + ".conv_in.weight", ctx),
+        _load_weight(st, p + ".conv_in.bias", ctx),
+        ResnetBlock[1, LH, LW, CH0, CH0].load(st, p + ".mid_block.resnets.0", ctx),
+        AttnBlock[1, LH, LW, CH0].load(st, p + ".mid_block.attentions.0", ctx),
+        ResnetBlock[1, LH, LW, CH0, CH0].load(st, p + ".mid_block.resnets.1", ctx),
+        ResnetBlock[1, LH, LW, CH0, CH0].load(st, p + ".up_blocks.0.resnets.0", ctx),
+        ResnetBlock[1, LH, LW, CH0, CH0].load(st, p + ".up_blocks.0.resnets.1", ctx),
+        ResnetBlock[1, LH, LW, CH0, CH0].load(st, p + ".up_blocks.0.resnets.2", ctx),
+        Upsample[1, LH, LW, CH0].load(st, p + ".up_blocks.0.upsamplers.0", ctx),
+        ResnetBlock[1, 2 * LH, 2 * LW, CH0, CH0].load(st, p + ".up_blocks.1.resnets.0", ctx),
+        ResnetBlock[1, 2 * LH, 2 * LW, CH0, CH0].load(st, p + ".up_blocks.1.resnets.1", ctx),
+        ResnetBlock[1, 2 * LH, 2 * LW, CH0, CH0].load(st, p + ".up_blocks.1.resnets.2", ctx),
+        Upsample[1, 2 * LH, 2 * LW, CH0].load(st, p + ".up_blocks.1.upsamplers.0", ctx),
+        ResnetBlock[1, 4 * LH, 4 * LW, CH0, CH_UP2].load(st, p + ".up_blocks.2.resnets.0", ctx),
+        ResnetBlock[1, 4 * LH, 4 * LW, CH_UP2, CH_UP2].load(st, p + ".up_blocks.2.resnets.1", ctx),
+        ResnetBlock[1, 4 * LH, 4 * LW, CH_UP2, CH_UP2].load(st, p + ".up_blocks.2.resnets.2", ctx),
+        Upsample[1, 4 * LH, 4 * LW, CH_UP2].load(st, p + ".up_blocks.2.upsamplers.0", ctx),
+        ResnetBlock[1, 8 * LH, 8 * LW, CH_UP2, CH_UP3].load(st, p + ".up_blocks.3.resnets.0", ctx),
+        ResnetBlock[1, 8 * LH, 8 * LW, CH_UP3, CH_UP3].load(st, p + ".up_blocks.3.resnets.1", ctx),
+        ResnetBlock[1, 8 * LH, 8 * LW, CH_UP3, CH_UP3].load(st, p + ".up_blocks.3.resnets.2", ctx),
+        _load_weight(st, p + ".conv_norm_out.weight", ctx),
+        _load_weight(st, p + ".conv_norm_out.bias", ctx),
+        _load_conv_weight_rscf(st, p + ".conv_out.weight", ctx),
+        _load_weight(st, p + ".conv_out.bias", ctx),
+    )

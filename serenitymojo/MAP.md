@@ -25,6 +25,12 @@ file is "where does X live". First target: Z-Image text→image.
   cold-start note for the current 1024 one-step Klein image path, including the
   Rust-compatible GPU RNG, offload status, run commands, output stats, and next
   work.
+- **Ideogram-4 pipeline driver**: `pipeline/ideogram4_pipeline.mojo` — the
+  Ideogram-4 text→image sampler (`main()`): fp8 cond/uncond DiT + interleaved
+  MRoPE + logit-normal Euler (8 steps, CFG 7) → latent denorm/unpatch → Flux2
+  VAE decode → PNG. This is serenitymojo's **first fp8-weight model**; the
+  reference is diffusers `/home/alex/ideogram4-ref` (NOT OneTrainer). 256²
+  end-to-end image PSNR 29.7 dB vs torch; writes `output/ideogram4_256.png`.
 - **Run** (JIT, package-relative imports require `-I .`):
   ```
   cd /home/alex/mojodiffusion && pixi run mojo run -I . serenitymojo/pipeline/zimage_pipeline.mojo
@@ -48,6 +54,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `io/safetensors.mojo` | `SafeTensors`: single-file mmap reader + tensor index. | ✅ |
 | `io/sharded.mojo` | `ShardedSafeTensors`: multi-shard loader (index weight_map, direct `.safetensors`, or directory single-file fallback). | ✅ |
 | `ops/cast.mojo` | `cast_tensor`: GPU materialized F32<->BF16/F16 casts. | ✅ |
+| `ops/fp8.mojo` | FP8 E4M3→BF16 dequant: `fp8_e4m3_dequant_to_bf16` (per-tensor), `fp8_e4m3_dequant_perrow_to_bf16` + `load_fp8_dequant` (per-output-row, Ideogram-4). serenitymojo's first fp8-weight path. | ✅ per-row cos 0.99999878 |
 | `ops/random.mojo` | `randn`: GPU deterministic standard-normal fill matching Rust rand 0.8 `StdRng` seed stream. | ✅ |
 | `ops/linear.mojo` | `linear(x, w, bias)` = x @ wᵀ + b (vendor BLAS matmul, F32 accum). | ✅ |
 | `ops/norm.mojo` | `rms_norm`, `layer_norm`, `group_norm` (NHWC) — hand-rolled. | ✅ |
@@ -67,11 +74,14 @@ file is "where does X live". First target: Z-Image text→image.
 | `tokenizer/tokenizer.mojo` | `Qwen3Tokenizer`: pure-Mojo byte-level BPE (Qwen2 regex). | ✅ |
 | `models/dit/zimage_dit.mojo` | `NextDiT[HL,WL,CAPLEN]` Z-Image transformer + `NextDiTConfig`. | ✅ cos 0.99985 |
 | `models/dit/klein_dit.mojo` | `Klein9BDiT` / `Klein9BOffloaded`: FLUX.2 Klein 9B DiT, full all-block and offloaded 1024 forward. | ✅ one-step 1024 |
+| `models/dit/ideogram4_dit.mojo` | Ideogram-4 single-stream DiT (fp8 weights→BF16, per-layer load); `ideogram4_forward[S]` + block/attention/t-embed/RoPE helpers. First fp8-weight model; ref = diffusers `ideogram4-ref` (NOT OneTrainer). | ✅ 34-layer velocity cos 0.9996 |
+| `models/dit/ideogram4_mrope.mojo` | `build_ideogram4_mrope`: 3-axis (t,h,w) interleaved MRoPE cos/sin (bf16-rounded inv_freq, F64 range-reduction). | ✅ cos 0.99999999 |
 | `models/text_encoder/qwen3_encoder.mojo` | `Qwen3Encoder` + `Qwen3Config` (Z-Image/Klein text encoder). | ✅ |
 | `models/text_encoder/qwen25vl_encoder.mojo` | `Qwen25VLEncoder` + `Qwen25VLConfig` (Qwen-Image text encoder). | ✅ base 512 runtime smoke / parity pending |
+| `models/text_encoder/ideogram_qwen3vl.mojo` | `load_ideogram_qwen3vl` / `encode_ideogram_taps`: Ideogram-4 Qwen3-VL text path (reuses `Qwen3Encoder`; θ=5e6, fp8 load, 13-tap concat → [1,L,53248]). | ✅ 13-tap cos 0.99998625 |
 | `models/vae/zimage_decoder.mojo` | `ZImageDecoder[LH,LW]`: Z-Image AutoencoderKL decoder config. | ✅ cos 0.99998 |
 | `models/vae/klein_decoder.mojo` | `KleinVaeDecoder[LH,LW]`: FLUX.2/Klein VAE decode from packed `[1,128,LH,LW]`. | ✅ 1024 smoke |
-| `models/vae/ldm_decoder.mojo` | `LdmVaeDecoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL decoder; factories `load_sdxl/sd15/flux1/sd3_embedded_ldm_decoder`. | ✅ |
+| `models/vae/ldm_decoder.mojo` | `LdmVaeDecoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL decoder; factories `load_sdxl/sd15/flux1/sd3_embedded_ldm_decoder` + `load_ideogram4_vae_decoder` (AutoencoderKLFlux2, latent_ch 32, scale 1/shift 0, has_pqc). | ✅ Flux2 decode cos 0.99995 |
 | `models/vae/ldm_encoder.mojo` | `LdmVaeEncoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL encoder (mirror of decoder); factories `load_sdxl/sd15/sd3_embedded_ldm_encoder`. SD3=16ch, scale 1.5305/shift 0.0609, no quant_conv. | ✅ SDXL 4ch + SD3 16ch cos 0.99999 (256²) |
 | `models/vae/decoder2d.mojo` | Shared 2D-VAE kit: `ResnetBlock`, `AttnBlock`, `Upsample`, NCHW↔NHWC. | ✅ |
 | `models/vae/vae_ops.mojo` | VAE-local glue: `clone`, `reshape`, `add`. | ✅ |
@@ -83,6 +93,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `sampling/flux2_klein.mojo` | FLUX.2/Klein dynamic-mu sigma schedule, textbook CFG, direct-velocity Euler step. | ✅ scalar smoke |
 | `sampling/sdxl_euler.mojo` | SDXL scaled-linear beta sigmas/timesteps, textbook CFG, eps-prediction Euler step. | ✅ scalar smoke |
 | `sampling/acestep_flow_match.mojo` | ACE-Step rectified-flow (Euler ODE) sampler: reuses `build_sigma_schedule`, textbook CFG, `xt - vt*dt` step. Step-parity gate cos=1.0 vs canonical generate_audio. | ✅ step-parity |
+| `sampling/ideogram4_schedule.mojo` | Ideogram-4 logit-normal Euler schedule: `ideogram4_logitnormal`, `ideogram4_schedule_mean`, `make_step_intervals`, `_ndtri` (Acklam, host scalar F64). | ✅ exact (0.0 max-abs) |
 | `image/png.mojo` | `save_png` (CHW float → 8-bit RGB PNG, stored-deflate); `crc32`/`adler32`. | ✅ |
 
 **Dev/test harnesses** (not API-documented; run/probe scaffolding):
@@ -126,3 +137,6 @@ but unused by the Z-Image pipeline.
 - `docs/SDXL_FLUX_KLEIN_PORT_STATUS.md` — corrected SDXL + FLUX/Klein port map,
   what was changed on 2026-05-26, and GPU-only kernel blockers.
 - Rust parity references live under `inference-flame/src/...` (read line-by-line; the docstrings cite exact files+lines).
+
+## Ideogram-4 (fp8) — first fp8-weight model (docs/IDEOGRAM4_STATUS.md)
+Ref = diffusers `/home/alex/ideogram4-ref` (NOT OneTrainer). DiT `models/dit/ideogram4_{dit,resident,mrope}.mojo`, text `models/text_encoder/ideogram_qwen3vl.mojo` (+`qwen3_magic.mojo` magic-prompt via Qwen3-8B), VAE `models/vae/ldm_decoder.load_ideogram4_vae_decoder` (z=32), fp8 `ops/{fp8,fp8_gemm}.mojo`, schedule `sampling/ideogram4_schedule.mojo`, pipelines `pipeline/ideogram4_{generate,pipeline,magic}.mojo`. Hot path = resident fp8 (`Ideogram4Weights`) + dequant→cuBLAS + hoisted masks. All 9 chunks parity-pass; e2e image matches torch (PSNR 29.7).

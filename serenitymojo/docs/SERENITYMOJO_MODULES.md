@@ -88,6 +88,12 @@ Common convention: each op has a `def _<op>_kernel_{f32,bf16,f16}(...)` triple (
 ### `ops/cast.mojo` ✅
 - `cast_tensor(x: Tensor, dtype: STDtype, ctx) raises -> Tensor` — materialized GPU dtype cast. Supports F32<->BF16/F16 and same-dtype clone. Used to bridge BF16 DiT outputs into the F32 FLUX.2/Klein VAE path without host readback.
 
+### `ops/fp8.mojo` ✅ (per-row cos 0.99999878 vs torch `Fp8Linear`)
+FP8 E4M3 → BF16 dequantization (port of flame-core `fp8_dequant.cu`). E4M3 = 1 sign / 4 exp (bias 7) / 3 mantissa, no inf; decode in F32, store BF16. The Ideogram-4 vertical is serenitymojo's first fp8-weight model.
+- `fp8_e4m3_dequant_to_bf16(x: Tensor, scale: Float32, ctx) raises -> Tensor` — PER-TENSOR scalar scale: `out[i] = bf16(e4m3_decode(x[i])·scale)`, same shape as `x` (U8/F8_E4M3 input). Bit-exact with the CUDA reference (LTX-2.3 distilled-fp8 stream).
+- `fp8_e4m3_dequant_perrow_to_bf16(w: Tensor, scale: Tensor, ctx) raises -> Tensor` — PER-OUTPUT-ROW scale: `w: [out,in]` F8_E4M3, `scale: [out]` F32, `out[o,i] = bf16(e4m3_decode(w[o,i])·scale[o])` (scale broadcast over `in`). Mirrors Ideogram-4 `Fp8Linear.forward` (`quantized_loading.py:197-200`).
+- `load_fp8_dequant(st: ShardedSafeTensors, weight_name: String, ctx) raises -> Tensor` — reads `<weight_name>` (F8_E4M3 `[out,in]`) + its sibling F32 per-row scale `<weight_name>_scale` (`[out]`) and returns the dequantized BF16 weight; diffusers/Ideogram `FP8_SCALE_SUFFIX` convention. Used by every Ideogram-4 Linear loader.
+
 ### `ops/random.mojo` ✅
 - `randn(shape: List[Int], seed: UInt64, dtype: STDtype, ctx) raises -> Tensor` — GPU-resident deterministic standard-normal fill matching Rust rand 0.8 `StdRng::seed_from_u64` (`PCG32` seed expansion + `ChaCha12Rng` + `Standard<f32>` + Box-Muller). Supports F32/BF16/F16 storage. Used by the Klein image smokes to draw NCHW latent noise on device before packing to token layout. `ops/random_smoke.mojo` checks the first 16 seed-42 samples against a Rust reference.
 
@@ -361,6 +367,31 @@ FLUX.2 Klein DiT scaffold. Reference = `/home/alex/EriDiffusion/inference-flame/
   positive/negative branches while each block handle is resident. This is the
   path that cleared native 1024 OOM in `pipeline/klein9b_pipeline_1024_smoke.mojo`.
 - Smoke entry points: `pipeline/klein9b_dit_smoke.mojo` verified the 25-tensor truncated path (`[1,4,128]`, finite stats); `pipeline/klein9b_dit_full_smoke.mojo` verified all 201 tensors and all 8+24 blocks on the same tiny grid (`[1,4,128]`, finite stats); `pipeline/klein9b_pipeline_1024_smoke.mojo` now draws GPU Gaussian noise in Rust NCHW order, runs one offloaded 9B denoise step, decodes with the Klein VAE, and writes `output/klein9b_first_1024.png`.
+
+### `models/dit/ideogram4_dit.mojo` — Ideogram-4 DiT ✅ (full 34-layer velocity cos 0.9996)
+Ideogram-4 single-stream DiT (inference). Reference = diffusers `/home/alex/ideogram4-ref/src/ideogram4/modeling_ideogram4.py` (NOT OneTrainer). Weight-only FP8: Linear `.weight` is F8_E4M3 + per-row `.weight_scale` → BF16 via `ops/fp8.load_fp8_dequant`; bias/norm/embed stay BF16. Blocks loaded per-layer to bound VRAM. Config: hidden 4608, 34 layers, 18 heads, head_dim 256, adaln_dim 512, llm_dim 53248.
+- `load_w_fp8(st, name, ctx) raises -> Tensor` — fp8 Linear weight → BF16 `[out,in]`.
+- `load_w_bf16(st, name, ctx) raises -> Tensor` — dtype-preserving load (bias/norm/embed).
+- `ideogram4_embedscalar_sinusoid(t: Tensor, dim: Int, ctx) raises -> Tensor` — `t: F32 [N]` → BF16 `[N,dim]` sin-first sinusoidal of `t·1e4`, `freq_i=exp(-i·ln(1e4)/(half-1))` (EmbedScalar pre-scale).
+- `ideogram4_t_embedding(t, dim, mlp_in_w, mlp_in_b, mlp_out_w, mlp_out_b, ctx) raises -> Tensor` — EmbedScalar → Linear → SiLU → Linear timestep MLP. ✅ t-embedding cos 0.99999616.
+- `apply_rope_ideogram(x: Tensor, cosf: Tensor, sinf: Tensor, ctx) raises -> Tensor` — halfsplit RoPE over `x: [B,L,H,Dh]` BF16 with full-width cos/sin `[1,L,Dh]` (duplicated halves), B=1.
+- `ideogram4_attention[S](x, qkv_w, o_w, normq_w, normk_w, cosf, sinf, num_heads, head_dim, ctx) raises -> Tensor` — fused QKV Linear → reshape/split → per-head q/k RMSNorm (eps 1e-5) → RoPE → `sdpa_nomask[1,S,18,256]` → o_proj. `S` (= total seq) compile-time.
+- `ideogram4_block[S](x, adaln_input, cosf, sinf, adaln_mod_w/b, an1_w, an2_w, fn1_w, fn2_w, qkv_w, o_w, normq_w, normk_w, w1_w, w2_w, w3_w, num_heads, head_dim, hidden, ctx) raises -> Tensor` — AdaLN modulation (`scale=mod+1`, `gate=tanh(mod)`) → RMSNorm-modulate-attention-gate residual → RMSNorm-modulate-SwiGLU(w1/w3→w2)-gate residual. ✅ block cos 0.99999895.
+- `ideogram4_forward[S](st, x_in, llm_in, t_in, indicator, cosf, sinf, num_layers, num_heads, head_dim, hidden, ctx) raises -> Tensor` — full denoise step. `x_in: [1,L,128]` noise tokens, `llm_in: [1,L,53248]` Qwen features, `t_in: [1]` F32, `indicator: [1,L]` F32 (0/2/3; llm=3, image=2, host-built masks). Pipeline: indicator masks → input_proj (fp8) → t_embedding → adaln_proj+SiLU → llm RMSNorm(eps 1e-6)+proj+mask → add + image-indicator embedding → 34 per-layer blocks → final-layer no-affine LayerNorm·(1+adaln_mod(SiLU)) → Linear. Returns velocity `[1,L,128]` cast to F32. Probes: `models/dit/parity/chunk{1..8}_*.mojo` + `ideogram4_oracle.py`.
+
+### `models/dit/ideogram4_mrope.mojo` — Ideogram-4 interleaved MRoPE ✅ (cos 0.99999999)
+1:1 port of `Ideogram4MRoPE.forward` (modeling_ideogram4.py:65-104). 3-axis (t,h,w) MRoPE cos/sin builder.
+- `build_ideogram4_mrope(position_ids: Tensor, head_dim: Int, mrope_section: List[Int], theta: Float32, ctx, out_dtype: STDtype) raises -> Tuple[Tensor, Tensor]` — `position_ids: F32 [1,L,3]` (t,h,w grid pos), returns `(cos, sin)` each `[1,L,head_dim]` in `out_dtype` (F32 or BF16). Per `(l,d)`: axis chosen by `d%3` + per-axis section bound (`mrope_section·3`), `angle = pos[axis]·inv_freq`, `inv_freq=theta^(-d/half)`. **Fidelity note:** `inv_freq` is bf16-rounded to match the bf16 model (the model casts the buffer to bf16; f32 inv gave cos 0.71 at pos 65536, bf16 gives 1.0). GPU has no F64 trig → F64 range-reduction then F32 sin/cos. Ideogram-4 uses head_dim 256, theta 5e6, section (24,20,20).
+
+### `sampling/ideogram4_schedule.mojo` — Ideogram-4 logit-normal Euler schedule ✅ (exact, 0.0 max-abs)
+1:1 port of `scheduler.py` (host scalar F64; no GPU kernel).
+- `ideogram4_logitnormal(t, mean, std=1.0, logsnr_min=-15.0, logsnr_max=18.0) -> Float32` — `LogitNormalSchedule`: `z=ndtri(t)`, `y=mean+std·z`, `t_=1-expit(y)`, clamped to logSNR-derived `[t_min,t_max]`.
+- `ideogram4_schedule_mean(height, width, known_mean=1.0, known_h=512, known_w=512) -> Float64` — resolution-aware mean shift `known_mean + 0.5·ln(num_px/known_px)`.
+- `make_step_intervals(num_steps) -> List[Float32]` — `[i/num_steps]` for `i∈[0,num_steps]`.
+- `_ndtri(p) -> Float64` — inverse standard-normal CDF (Acklam rational approx, ~1.15e-9), host scalar; replaces `torch.special.ndtri`. Probe `models/dit/parity/chunk4_schedule_probe.mojo`.
+
+### `pipeline/ideogram4_pipeline.mojo` — Ideogram-4 end-to-end sampler ✅ (256² PSNR 29.7 dB vs torch)
+Entry point (`main()`). 1:1 port of `pipeline_ideogram4.__call__` denoise + `_decode` (587-637). Consumes the Wave-0 sampler fixture (`ideogram4_fx_sampler.safetensors`: dumped `z0` + `llm_full` + packed inputs, decoupling RNG/tokenizer/Qwen which are gated separately). Native CFG denoise: builds cond/uncond MRoPE → 8-step loop with logit-normal `t`/`s` per step, cond `ideogram4_forward[TOTAL]` + uncond `ideogram4_forward[NIMG]`, textbook CFG (scale 7) and `z += v·(s-t)` Euler → latent denorm (`z·scale+shift`) → Ideogram unpatch (`[1,gh,gw,2,2,32]→permute(0,5,1,3,2,4)→[1,32,2gh,2gw]`) → Flux2 VAE decode → PNG. Gates `final_z`/`final_latent`/`decoded` against the torch oracle (latent cos 0.96 = bf16+CFG-cancellation accumulation, not a bug; final image PSNR 29.7 dB). Writes `output/ideogram4_256.png`.
 
 ### `models/dit/sdxl_contract.mojo` — SDXL metadata contract ✅ header-smoke
 Header-only guard for the cached-embedding SDXL 1024 path. It validates the
@@ -724,6 +755,11 @@ Qwen3 causal-LM text encoder (Z-Image/Klein). Reuses foundation `rms_norm`/`rope
   `qwen_3_8b.safetensors` is Comfy-quantized and needs a dequant path before
   this loader can consume it directly.
 
+### `models/text_encoder/ideogram_qwen3vl.mojo` — Ideogram-4 Qwen3-VL text path ✅ (13-tap cos 0.99998625)
+Ideogram-4 text encoder. **Reuses `Qwen3Encoder`** (the Qwen3-VL text decoder layer is byte-identical to Qwen3: input_layernorm / q,k,v,o_proj + q_norm,k_norm / post_attention_layernorm / mlp.gate,up,down). Differences vs Qwen3: weight-only FP8 (`*_proj.weight` → BF16 via `load_fp8_dequant`), `language_model.*` keys remapped to `model.*`, config theta = 5e6.
+- `load_ideogram_qwen3vl(dir_or_file: String, ctx) raises -> Qwen3Encoder` — `Qwen3Config(4096, 36, 32, 8, 128, 1e-6, 5e6)`; fp8-dequants the 36 layers' `*_proj.weight`, loads norms/embed as BF16.
+- `encode_ideogram_taps(enc: Qwen3Encoder, ids: List[Int], ctx) raises -> Tensor` — 13-tap interleaved concat: takes layer states `[0,3,6,…,33,35]`, reshapes each to `[1,L,H,1]`, concats on the tap axis, reshapes to `[1,L,H·13=53248]` (`out[..,f·13+t]=tap_t[..,f]`). Matches `pipeline_ideogram4._encode_text` (414-480). Probe `models/dit/parity/chunk7_qwen_probe.mojo`.
+
 ### `models/text_encoder/qwen25vl_encoder.mojo` — `Qwen25VLEncoder`, `Qwen25VLConfig` ✅ base 512 runtime smoke / parity pending
 Qwen2.5-VL text-only forward (Qwen-Image text encoder). Mirrors `qwen3_encoder.mojo` exactly except: (1) Q/K/V Linears **have biases** (o_proj bias-free); (2) **no** per-head q_norm/k_norm; (3) config. RoPE half-split (text-only mRoPE collapses to 1D). Dh=128 → `sdpa` math-mode.
 - `@fieldwise_init struct Qwen25VLConfig` — same fields; `@staticmethod qwen_image()` = (3584, 28, 28, 4, 128, 1e-6, 1e6) — GQA n_rep=7.
@@ -752,8 +788,10 @@ embedded `first_stage_model.decoder.*` key prefix without post-quant conv.
 - `load_sd15_ldm_decoder[LH,LW](path, ctx)`
 - `load_sd3_embedded_ldm_decoder[LH,LW](path, ctx)`
 - `load_flux1_ldm_decoder[LH,LW](path, ctx)`
+- `load_ideogram4_vae_decoder[LH,LW](dir_or_file, ctx) raises -> LdmVaeDecoder[LH,LW,32]` — diffusers `AutoencoderKLFlux2` keys (`decoder.*`, `to_q`/`to_out` attn, `conv_shortcut`, `up_blocks.0..3` with `up_blocks.3` having NO upsampler), `post_quant_conv` present, `latent_channels=32`, block_out `[128,256,512,512]`. scale=1/shift=0 (Ideogram applies latent denorm upstream); reuses the `decoder2d` kit verbatim. ✅ Flux2 VAE decode cos 0.99995.
 - Smokes: SDXL one-step/full pipeline smokes, `pipeline/sd15_vae_smoke.mojo`,
-  `pipeline/sd3_vae_smoke.mojo`, and FLUX.1 cached-input pipeline smoke.
+  `pipeline/sd3_vae_smoke.mojo`, FLUX.1 cached-input pipeline smoke, and
+  `pipeline/ideogram4_pipeline.mojo`.
 
 ### `models/vae/zimage_decoder.mojo` — `ZImageDecoder` ✅ (cos 0.99998)
 Z-Image AutoencoderKL decoder config; wires the 2D kit. Reference = `inference-flame/src/vae/ldm_decoder.rs`. `comptime LATENT_CH=16, CH0=512, CH_UP2=256, CH_UP3=128, SCALING=0.3611, SHIFT=0.1159`.
@@ -1039,3 +1077,10 @@ Pure-CPU PNG encoder (uncompressed STORED deflate — valid PNG, just larger). N
 - `@fieldwise_init struct ValueRange(...)` — `SIGNED` ([-1,1] → `(v+1)·127.5`, **default**), `UNIT` ([0,1] → `v·255`); both clamp+round to u8.
 - `crc32(data: Span[UInt8,_]) -> UInt32`, `adler32(data) -> UInt32` — PNG/zlib convention.
 - `save_png(image: Tensor, path: String, ctx, value_range: ValueRange = ValueRange.SIGNED) raises` — encode a `[1,3,H,W]` CHW float Tensor as 8-bit RGB PNG. Reads GPU→host F32, CHW→HWC interleave, filter-0 scanlines, IHDR/IDAT(zlib-stored)/IEND chunks, writes via `io/ffi` `sys_write` (binary-safe).
+
+### Ideogram-4 perf + magic round (see docs/IDEOGRAM4_STATUS.md)
+- `models/dit/ideogram4_resident.mojo` — `Ideogram4Weights` (resident fp8 cache: `.load(st,ctx)`, `.w(name)`), `ideogram4_build_masks(indicator,ctx)->Ideogram4Masks` (hoisted constant masks), `ideogram4_forward_r[S](w,x,llm,t,masks,cos,sin,...)` (hot path; `_lin` = dequant resident fp8→bf16 then vendor cuBLAS `linear`). Resident DiT cos 0.99961 vs fixture.
+- `ops/fp8_gemm.mojo` — `linear_fp8(x,w_fp8,scale,bias,ctx)` fused tiled fp8 GEMM (cos 0.99999698 vs dequant+BLAS; reference, slower than cuBLAS, not on hot path).
+- `models/text_encoder/qwen3_encoder.mojo` — `+lm_logits_last(token_ids,pos,ctx)` (lm_head logits for autoregressive decode; needs checkpoint lm_head).
+- `models/text_encoder/qwen3_magic.mojo` — `generate_greedy(qwen,prompt_ids,max_new,eos,pad,maxseq,ctx)` greedy LM decode (no KV-cache yet).
+- `pipeline/ideogram4_generate.mojo` (native text→image), `pipeline/ideogram4_magic.mojo` (Qwen3-8B plain→JSON).

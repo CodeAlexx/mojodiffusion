@@ -44,7 +44,7 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.rope import rope_halfsplit
 from serenitymojo.ops.attention import sdpa
-from serenitymojo.ops.tensor_algebra import concat
+from serenitymojo.ops.tensor_algebra import concat, slice
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import swiglu
 
@@ -485,6 +485,16 @@ struct Qwen3Encoder:
             name_to_idx[nm] = idx
         return Qwen3Encoder(weights^, name_to_idx^, config)
 
+    def lm_logits_last(self, token_ids: List[Int], pos: Int, ctx: DeviceContext) raises -> Tensor:
+        """Autoregressive head: full forward over token_ids, then
+        lm_head(model.norm(hidden[pos])) -> [1,1,vocab] logits. Requires the
+        checkpoint to ship `lm_head.weight` (Qwen3-8B/instruct does; the Ideogram
+        text_encoder does NOT). Used by the pure-Mojo magic-prompt generator."""
+        var states = self.encode_layer_states(token_ids, ctx)
+        var row = slice(states[len(states) - 1][], 1, pos, 1, ctx)  # [1,1,hidden]
+        var normed = rms_norm(row, self._w(String("model.norm.weight")), self.config.rms_norm_eps, ctx)
+        return linear(normed, self._w(String("lm_head.weight")), None, ctx)  # [1,1,vocab]
+
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
         """Borrow a weight Tensor by name (no copy)."""
         if name not in self.name_to_idx:
@@ -855,6 +865,8 @@ def _sdpa_dispatch(
             return sdpa[1, 256, 32, 128](q, k, v, mask, scale, ctx)
         if seq == 512:
             return sdpa[1, 512, 32, 128](q, k, v, mask, scale, ctx)
+        if seq == 1024:
+            return sdpa[1, 1024, 32, 128](q, k, v, mask, scale, ctx)
     # Qwen3-0.6B (Anima text path): H=16, Dh=128.
     if h == 16 and dh == 128:
         if seq == 8:

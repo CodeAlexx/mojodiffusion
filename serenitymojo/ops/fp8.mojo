@@ -42,6 +42,8 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.io.tensor_view import from_parts
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -156,3 +158,119 @@ def fp8_e4m3_dequant_to_bf16(
     )
     ctx.synchronize()
     return Tensor(out_buf^, out_shape^, STDtype.BF16)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PER-ROW (per-output-channel) FP8 E4M3 → BF16 dequant — the Ideogram-4 path.
+# Ideogram-4 weight-only FP8 Linear: weight [out,in] float8_e4m3fn + sibling F32
+# per-output-row scale [out]. Reference (1:1):
+#   /home/alex/ideogram4-ref/src/ideogram4/quantized_loading.py
+#   Fp8Linear.forward:197-200  → w[o,i] = float(weight[o,i]) * scale[o]
+#   (scale[:,None] broadcast over `in`). Decode F32 (exact), store BF16.
+# ─────────────────────────────────────────────────────────────────────────────
+def _fp8_dequant_perrow_kernel(
+    x: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    cols: Int,
+    n: Int,
+):
+    var idx = Int(global_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    var i = idx
+    while i < n:
+        var row = i // cols
+        var byte_u8 = rebind[Scalar[DType.uint8]](x[i])
+        var byte_u32 = UInt32(Int(byte_u8))
+        var s = rebind[Scalar[DType.float32]](scale[row])
+        var v = _fp8_e4m3_decode(byte_u32) * s
+        o[i] = rebind[o.element_type](v.cast[DType.bfloat16]())
+        i += stride
+
+
+def fp8_e4m3_dequant_perrow_to_bf16(
+    w: Tensor,
+    scale: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Dequantize a weight-only FP8 E4M3 Linear weight with PER-ROW F32 scales.
+
+    out[o, i] = bf16(e4m3_decode(w[o, i]) * scale[o]). Mirrors Fp8Linear.forward
+    (quantized_loading.py:197-200): per-output-channel scale broadcast over `in`.
+    """
+    if w.dtype() != STDtype.U8 and w.dtype() != STDtype.F8_E4M3:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16: w must be U8/F8_E4M3, got ")
+            + w.dtype().name()
+        )
+    if scale.dtype() != STDtype.F32:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16: scale must be F32, got ")
+            + scale.dtype().name()
+        )
+    var wshape = w.shape()
+    if len(wshape) != 2:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16: w must be 2-D [out,in], rank=")
+            + String(len(wshape))
+        )
+    var out_rows = wshape[0]
+    var cols = wshape[1]
+    var n = w.numel()
+    if n == 0:
+        raise Error("fp8_e4m3_dequant_perrow_to_bf16: empty input")
+    if scale.numel() != out_rows:
+        raise Error(
+            String("fp8_e4m3_dequant_perrow_to_bf16: scale len ")
+            + String(scale.numel()) + " != out rows " + String(out_rows)
+        )
+
+    var out_shape = w.shape()
+    var out_bytes = n * STDtype.BF16.byte_size()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_bytes)
+
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_rows))
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+
+    var X = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w.buf.unsafe_ptr(), x_rl)
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+    )
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl
+    )
+
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if grid > 65535:
+        grid = 65535
+    ctx.enqueue_function[_fp8_dequant_perrow_kernel, _fp8_dequant_perrow_kernel](
+        X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
+    )
+    ctx.synchronize()
+    return Tensor(out_buf^, out_shape^, STDtype.BF16)
+
+
+def load_fp8_dequant(
+    st: ShardedSafeTensors,
+    weight_name: String,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Read a weight-only-FP8 Linear weight `<weight_name>` (F8_E4M3 [out,in]) +
+    its sibling F32 per-row scale `<weight_name>_scale` [out] from a (sharded)
+    safetensors, and return the dequantized BF16 weight [out,in].
+
+    Mirrors the diffusers/Ideogram convention (swap_linears_to_fp8 /
+    FP8_SCALE_SUFFIX, quantized_loading.py:203-232): module-prefix + '.weight'
+    and module-prefix + '.weight_scale'.
+    """
+    var scale_name = weight_name + "_scale"
+    var w_info = st.tensor_info(weight_name)
+    var w_bytes = st.tensor_bytes(weight_name)
+    var w_view = from_parts(w_info.dtype, w_info.shape.copy(), w_bytes)
+    var w = Tensor.from_view_raw(w_view, ctx)
+    var s_info = st.tensor_info(scale_name)
+    var s_bytes = st.tensor_bytes(scale_name)
+    var s_view = from_parts(s_info.dtype, s_info.shape.copy(), s_bytes)
+    var scale = Tensor.from_view_as_f32(s_view, ctx)
+    return fp8_e4m3_dequant_perrow_to_bf16(w^, scale^, ctx)

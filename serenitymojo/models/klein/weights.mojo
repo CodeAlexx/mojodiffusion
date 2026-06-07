@@ -167,6 +167,32 @@ def load_klein_stack_base(
     )
 
 
+def _zeros_f32(n: Int) -> List[Float32]:
+    var out = List[Float32]()
+    for _ in range(n):
+        out.append(Float32(0.0))
+    return out^
+
+
+def load_klein_stack_base_training(
+    st: SafeTensors, d: Int, ctx: DeviceContext
+) raises -> KleinStackBase:
+    """Load frozen stack projections for training without a seed final-mod GEMM.
+
+    The trainer overwrites `final_shift` and `final_scale` from the per-step
+    timestep modulation before every forward. Initial zeros are therefore only a
+    placeholder and avoid loading/running final_layer.adaLN_modulation twice.
+    """
+    var zeros = _zeros_f32(d)
+    return KleinStackBase(
+        TArc(_load_tensor(st, String("img_in.weight"), ctx)),
+        TArc(_load_tensor(st, String("txt_in.weight"), ctx)),
+        TArc(_load_tensor(st, String("final_layer.linear.weight"), ctx)),
+        TArc(Tensor.from_host(zeros.copy(), [d], STDtype.F32, ctx)),
+        TArc(Tensor.from_host(zeros^, [d], STDtype.F32, ctx)),
+    )
+
+
 def _linear_row_tensor(
     x: List[Float32], w: Tensor, in_dim: Int, ctx: DeviceContext
 ) raises -> List[Float32]:

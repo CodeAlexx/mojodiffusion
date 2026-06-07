@@ -2,8 +2,9 @@
 #
 # SDXL SpatialTransformer *WITH LoRA* on every trained projection: a LoRA-aware
 # forward (saving ckpt-inputs) + hand-chained backward that COLLECTS every
-# adapter's d_A/d_B, supports an AdamW step + a PEFT save across all 10×num_blocks
-# adapters. This file COMPOSES; it builds NO new ops/ primitive (Tenet 1).
+# adapter's d_A/d_B, supports an AdamW step + a OneTrainer raw-key save across
+# all currently implemented SpatialTransformer adapters. This file COMPOSES; it
+# builds NO new ops/ primitive (Tenet 1).
 #
 # WHY THE SpatialTransformer IS THE COMPOSITION UNIT (not the whole conv-UNet):
 #   SDXL's LoRA targets live ENTIRELY inside the SpatialTransformer's
@@ -19,7 +20,7 @@
 #   * models/sdxl/spatial_transformer.mojo : base ST fwd+bwd (29/29, 48/48 vs torch).
 #   * models/sdxl/lora_block.mojo : sdxl_lora_apply / sdxl_lora_bwd / sdxl_proj_lora_into_dx
 #     (reduce to base when adapters absent; LoRA d_x summed into the proj-input grad).
-#   * training/{train_step, lora_save} : LoraAdapter, _lora_adamw, save_lora_peft.
+#   * training/{train_step, lora_save} : LoraAdapter, _lora_adamw, save_lora_onetrainer.
 #
 # CARRIER DESIGN (Tenet-2: make the right thing easy) — mirrors ErnieLoraSet:
 #   SdxlLoraSet holds ONE flat List[LoraAdapter] of 10×num_blocks adapters indexed
@@ -68,7 +69,8 @@ from serenitymojo.models.sdxl.lora_block import (
 
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
-    NamedLora, save_lora_peft, load_lora_for_resume,
+    NamedLora, save_lora_onetrainer, load_lora_for_resume,
+    save_lora_train_state, load_lora_train_state,
 )
 
 
@@ -639,40 +641,73 @@ def sdxl_lora_adamw_step(
         _lora_adamw(set.ad[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
 
 
-# ── per-block PEFT prefix scheme (the INVERSE of the inference target map) ─────
-# inference-flame lora.rs map_prefix_diffusion_model generic fallback maps
-#   <prefix>.weight -> base key, so a PEFT save with prefix = the diffusers module
-#   path loads byte-exact. SDXL transformer-block linears (sdxl_unet.rs:673-751):
-#   <st>.transformer_blocks.<j>.attn1.{to_q,to_k,to_v,to_out.0}
-#   <st>.transformer_blocks.<j>.attn2.{to_q,to_k,to_v,to_out.0}
-#   <st>.transformer_blocks.<j>.ff.net.0.proj  and  .ff.net.2
-# `st_prefix` is the SpatialTransformer base path (e.g.
-#   "input_blocks.4.1" / "middle_block.1" / "output_blocks.0.1"); the train loop
-#   passes the real one per ST. For the gate we use a synthetic placeholder.
+# -- per-block OneTrainer raw legacy prefix scheme ----------------------------
+# OneTrainer's SDXL LoRAModuleWrapper installs adapters on every Linear/Conv2d
+# under model.unet with raw-save prefix `lora_unet`, and optional text encoder
+# prefixes `lora_te1` / `lora_te2`. This Mojo module currently implements the
+# SpatialTransformer BasicTransformerBlock linears only. The helpers below make
+# that bounded surface explicit: implemented ST linears save as OT raw keys,
+# while the still-missing conv/resnet/add-embedding/proj_in/proj_out/TE targets
+# are listed and fail before an incomplete TE-enabled file can be written.
+#
+# The trainer still passes local LDM SpatialTransformer prefixes
+# ("input_blocks.4.1", "middle_block.1", ...). The product LoRA save exposes the
+# matching OneTrainer raw module prefixes, e.g.
+#   lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q
+# and save_lora_onetrainer appends .alpha/.lora_down.weight/.lora_up.weight.
+def _sdxl_lora_st_prefix(st_prefix: String) -> String:
+    if st_prefix == "input_blocks.4.1":
+        return "lora_unet_down_blocks_1_attentions_0"
+    elif st_prefix == "input_blocks.5.1":
+        return "lora_unet_down_blocks_1_attentions_1"
+    elif st_prefix == "input_blocks.7.1":
+        return "lora_unet_down_blocks_2_attentions_0"
+    elif st_prefix == "input_blocks.8.1":
+        return "lora_unet_down_blocks_2_attentions_1"
+    elif st_prefix == "middle_block.1":
+        return "lora_unet_mid_block_attentions_0"
+    elif st_prefix == "output_blocks.0.1":
+        return "lora_unet_up_blocks_0_attentions_0"
+    elif st_prefix == "output_blocks.1.1":
+        return "lora_unet_up_blocks_0_attentions_1"
+    elif st_prefix == "output_blocks.2.1":
+        return "lora_unet_up_blocks_0_attentions_2"
+    elif st_prefix == "output_blocks.3.1":
+        return "lora_unet_up_blocks_1_attentions_0"
+    elif st_prefix == "output_blocks.4.1":
+        return "lora_unet_up_blocks_1_attentions_1"
+    elif st_prefix == "output_blocks.5.1":
+        return "lora_unet_up_blocks_1_attentions_2"
+    return st_prefix
+
+
 def _slot_suffix(slot: Int) -> String:
     if slot == SLOT_A1_Q:
-        return ".attn1.to_q"
+        return "attn1_to_q"
     elif slot == SLOT_A1_K:
-        return ".attn1.to_k"
+        return "attn1_to_k"
     elif slot == SLOT_A1_V:
-        return ".attn1.to_v"
+        return "attn1_to_v"
     elif slot == SLOT_A1_O:
-        return ".attn1.to_out.0"
+        return "attn1_to_out_0"
     elif slot == SLOT_A2_Q:
-        return ".attn2.to_q"
+        return "attn2_to_q"
     elif slot == SLOT_A2_K:
-        return ".attn2.to_k"
+        return "attn2_to_k"
     elif slot == SLOT_A2_V:
-        return ".attn2.to_v"
+        return "attn2_to_v"
     elif slot == SLOT_A2_O:
-        return ".attn2.to_out.0"
+        return "attn2_to_out_0"
     elif slot == SLOT_FF_PROJ:
-        return ".ff.net.0.proj"
-    return ".ff.net.2"
+        return "ff_net_0_proj"
+    return "ff_net_2"
 
 
 def _sdxl_lora_prefix(st_prefix: String, block_idx: Int, slot: Int) -> String:
-    return st_prefix + ".transformer_blocks." + String(block_idx) + _slot_suffix(slot)
+    return (
+        _sdxl_lora_st_prefix(st_prefix) + "_transformer_blocks_"
+        + String(block_idx) + "_" + _slot_suffix(slot)
+    )
 
 
 def sdxl_lora_prefixes(st_prefix: String, num_blocks: Int) -> List[String]:
@@ -683,10 +718,47 @@ def sdxl_lora_prefixes(st_prefix: String, num_blocks: Int) -> List[String]:
     return out^
 
 
-# ── SAVE every adapter as a PEFT/ai-toolkit safetensors ──────────────────────
-def save_sdxl_lora(
-    set: SdxlLoraSet, st_prefix: String, path: String, ctx: DeviceContext
-) raises -> Int:
+def sdxl_lora_supported_unet_prefixes(st_prefix: String, num_blocks: Int) -> List[String]:
+    """Implemented OneTrainer SDXL UNet LoRA module prefixes.
+
+    This is intentionally identical to `sdxl_lora_prefixes`, but named for the
+    contract checker/smokes so the supported OT save surface is source-visible.
+    """
+    return sdxl_lora_prefixes(st_prefix, num_blocks)
+
+
+def sdxl_lora_unsupported_onetrainer_targets() -> List[String]:
+    """OneTrainer SDXL LoRA targets not yet implemented by this Mojo carrier."""
+    var out = List[String]()
+    out.append("lora_unet_conv_in")
+    out.append("lora_unet_time_embedding_linear_1")
+    out.append("lora_unet_time_embedding_linear_2")
+    out.append("lora_unet_add_embedding_linear_1")
+    out.append("lora_unet_add_embedding_linear_2")
+    out.append("lora_unet_*_resnets_*_time_emb_proj")
+    out.append("lora_unet_*_resnets_*_conv1")
+    out.append("lora_unet_*_resnets_*_conv2")
+    out.append("lora_unet_*_resnets_*_conv_shortcut")
+    out.append("lora_unet_*_samplers_*_conv")
+    out.append("lora_unet_*_attentions_*_proj_in")
+    out.append("lora_unet_*_attentions_*_proj_out")
+    out.append("lora_unet_conv_norm_out")
+    out.append("lora_unet_conv_out")
+    out.append("lora_te1")
+    out.append("lora_te2")
+    return out^
+
+
+def sdxl_lora_requires_text_encoder_surface(enable_te1: Bool, enable_te2: Bool) raises:
+    if enable_te1 or enable_te2:
+        raise Error(
+            "SDXL OneTrainer LoRA save requested text-encoder adapters "
+            + "(lora_te1/lora_te2), but the Mojo SDXL LoRA carrier currently "
+            + "implements only lora_unet SpatialTransformer linears"
+        )
+
+
+def _sdxl_named_loras(set: SdxlLoraSet, st_prefix: String) -> List[NamedLora]:
     var named = List[NamedLora]()
     for bi in range(set.num_blocks):
         for s in range(SDXL_SLOTS):
@@ -694,10 +766,31 @@ def save_sdxl_lora(
                 _sdxl_lora_prefix(st_prefix, bi, s),
                 set.ad[bi * SDXL_SLOTS + s].copy(),
             ))
-    return save_lora_peft(named, path, ctx)
+    return named^
 
 
-# ── RESUME: load the adapter A/B back from a save_sdxl_lora file ─────────────
+# -- SAVE every adapter as a OneTrainer raw-keyed safetensors -----------------
+def save_sdxl_lora(
+    set: SdxlLoraSet, st_prefix: String, path: String, ctx: DeviceContext
+) raises -> Int:
+    return save_lora_onetrainer(_sdxl_named_loras(set, st_prefix), path, ctx)
+
+
+def save_sdxl_lora_with_text_encoder_flags(
+    set: SdxlLoraSet, st_prefix: String, path: String, ctx: DeviceContext,
+    enable_te1: Bool, enable_te2: Bool,
+) raises -> Int:
+    sdxl_lora_requires_text_encoder_surface(enable_te1, enable_te2)
+    return save_sdxl_lora(set, st_prefix, path, ctx)
+
+
+def save_sdxl_lora_state(
+    set: SdxlLoraSet, st_prefix: String, path: String, ctx: DeviceContext
+) raises -> Int:
+    return save_lora_train_state(_sdxl_named_loras(set, st_prefix), path, ctx)
+
+
+# -- RESUME: load raw or PEFT A/B back through the shared resume helper --------
 def load_sdxl_lora_resume(
     st_prefix: String, num_blocks: Int, rank: Int, alpha: Float32,
     C: Int, Cctx: Int, Cff: Int,
@@ -706,6 +799,20 @@ def load_sdxl_lora_resume(
     var prefixes = sdxl_lora_prefixes(st_prefix, num_blocks)
     var scale = alpha / Float32(rank)
     var named = load_lora_for_resume(prefixes, scale, path, ctx)   # flat order
+    var ad = List[LoraAdapter]()
+    for i in range(num_blocks * SDXL_SLOTS):
+        ad.append(named[i].adapter.copy())
+    return SdxlLoraSet(ad^, num_blocks, rank)
+
+
+def load_sdxl_lora_state(
+    st_prefix: String, num_blocks: Int, rank: Int, alpha: Float32,
+    C: Int, Cctx: Int, Cff: Int,
+    path: String, ctx: DeviceContext,
+) raises -> SdxlLoraSet:
+    var prefixes = sdxl_lora_prefixes(st_prefix, num_blocks)
+    var scale = alpha / Float32(rank)
+    var named = load_lora_train_state(prefixes, scale, path, ctx)
     var ad = List[LoraAdapter]()
     for i in range(num_blocks * SDXL_SLOTS):
         ad.append(named[i].adapter.copy())

@@ -15,8 +15,10 @@ work for those families.
 
 **DONE / verified:** foundation — `tensor`, `parity` (ParityHarness), all `ops/` (linear, norm{rms/layer/group}, rope{interleaved/halfsplit}, attention/sdpa[math-mode Dh=128], conv2d, **conv3d**, **moe**{router/grouped-FFN/scatter}, embeddings, layout{patchify/unpatchify/deinterleave}, tensor_algebra, activations, softmax); `io/` loader (byte-parity); `offload/BlockLoader`; `tokenizer` (Qwen BPE); `image/png`; samplers `flow_match` + `flux2_klein` + `sdxl_euler`; VAE kit `decoder2d`+`conv3d`+`upsample`+`vae_ops`.
 - **Z-Image** — WORKING end-to-end (1024², coherent images). Encoder `qwen3`, `zimage_nextdit`, VAE `zimage_decoder`, flow-match.
-- **Klein 4B/9B** — coherent offloaded smokes exist; remaining work is
-  production wrapper/parity/perf polish.
+- **Klein 4B/9B** — coherent block-streamed inference/image smokes exist.
+  These are not OneTrainer `CPU_OFFLOADED` activation/layer parity, train
+  backward replay, sampler trajectory parity, speed parity, or GPU parity.
+  Remaining work is production wrapper/parity/perf polish.
 - **SDXL** — cached-embedding one-step and full 30-step 1024 runtime smokes
   exist: `output/sdxl_one_step_1024.png` and `output/sdxl_30step_1024.png`
   from cache -> UNet -> VAE -> PNG. Remaining work is Rust/diffusers parity

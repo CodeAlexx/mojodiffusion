@@ -56,7 +56,9 @@ from serenitymojo.training.train_step import LoraAdapter, LoraGrads
 # Forward + backward ops shared with the base block (Tenet 1: nothing new here).
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import swiglu
+from serenitymojo.ops.vec_swiglu import vec_swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
+from serenitymojo.ops.vec_modulate import vec_modulate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.unary import tanh_op
@@ -80,6 +82,37 @@ comptime TArc = ArcPointer[Tensor]
 
 def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+
+
+struct ZImageModVecsDevice(Copyable, Movable):
+    var scale_msa: TArc
+    var gate_msa: TArc
+    var scale_mlp: TArc
+    var gate_mlp: TArc
+    var zeros: TArc
+
+    def __init__(
+        out self,
+        var scale_msa: TArc, var gate_msa: TArc,
+        var scale_mlp: TArc, var gate_mlp: TArc, var zeros: TArc,
+    ):
+        self.scale_msa = scale_msa^
+        self.gate_msa = gate_msa^
+        self.scale_mlp = scale_mlp^
+        self.gate_mlp = gate_mlp^
+        self.zeros = zeros^
+
+
+def zimage_modvecs_to_device(
+    mv: ZImageModVecs, D: Int, ctx: DeviceContext
+) raises -> ZImageModVecsDevice:
+    return ZImageModVecsDevice(
+        TArc(_t(mv.scale_msa.copy(), [D], ctx)),
+        TArc(_t(mv.gate_msa.copy(), [D], ctx)),
+        TArc(_t(mv.scale_mlp.copy(), [D], ctx)),
+        TArc(_t(mv.gate_mlp.copy(), [D], ctx)),
+        TArc(_t(_zeros(D), [D], ctx)),
+    )
 
 
 def _add_lists(a: List[Float32], b: List[Float32]) -> List[Float32]:
@@ -279,6 +312,8 @@ def zimage_lora_apply_device(
     var base_y: Tensor, x: Tensor, lo: ZImageLoraAdapterDevice,
     M: Int, ctx: DeviceContext,
 ) raises -> Tensor:
+    if lo.scale == Float32(0.0):
+        return base_y^
     var nb1 = Optional[Tensor](None)
     var t = linear(x, lo.a[], nb1^, ctx)
     var nb2 = Optional[Tensor](None)
@@ -912,12 +947,26 @@ def zimage_block_lora_predict_device_tensor[
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> TArc:
+    var mv_dev = zimage_modvecs_to_device(mv, D, ctx)
+    return zimage_block_lora_predict_device_tensor_moddev[H, Dh, S](
+        x_arc, w, mv_dev, lora, cos, sin, D, F, eps, ctx,
+    )
+
+
+def zimage_block_lora_predict_device_tensor_moddev[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ZImageBlockWeights, mv: ZImageModVecsDevice, lora: ZImageBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> TArc:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var zeros = _zeros(D)
 
     var xn1 = rms_norm(x_arc[], w.n1[], eps, ctx)
-    var xn1s = modulate(
-        xn1, _t(mv.scale_msa.copy(), [D], ctx), _t(zeros.copy(), [D], ctx), ctx
+    var xn1s = vec_modulate(
+        xn1, mv.scale_msa[], mv.zeros[], ctx
     )
 
     var no_bias = Optional[Tensor](None)
@@ -948,13 +997,12 @@ def zimage_block_lora_predict_device_tensor[
     var att_o = zimage_lora_apply_device(att_o_base^, att_flat, lora.to_out, S, ctx)
 
     var attn_n2 = rms_norm(att_o, w.n2[], eps, ctx)
-    var gate_msa_raw = _t(mv.gate_msa.copy(), [D], ctx)
-    var gate_msa_t = tanh_op(gate_msa_raw, ctx)
+    var gate_msa_t = tanh_op(mv.gate_msa[], ctx)
     var h = residual_gate(x_arc[], gate_msa_t, attn_n2, ctx)
 
     var xfn1 = rms_norm(h, w.fn1[], eps, ctx)
-    var xfn1s = modulate(
-        xfn1, _t(mv.scale_mlp.copy(), [D], ctx), _t(zeros.copy(), [D], ctx), ctx
+    var xfn1s = vec_modulate(
+        xfn1, mv.scale_mlp[], mv.zeros[], ctx
     )
 
     var no_bias_g = Optional[Tensor](None)
@@ -964,15 +1012,14 @@ def zimage_block_lora_predict_device_tensor[
     var g_pre = zimage_lora_apply_device(g_base^, xfn1s, lora.w1, S, ctx)
     var u = zimage_lora_apply_device(u_base^, xfn1s, lora.w3, S, ctx)
 
-    var act = swiglu(g_pre, u, ctx)
+    var act = vec_swiglu(g_pre, u, ctx)
 
     var no_bias_d = Optional[Tensor](None)
     var ff_base = linear(act, w.w2[], no_bias_d^, ctx)
     var ff = zimage_lora_apply_device(ff_base^, act, lora.w2, S, ctx)
 
     var ff_n2 = rms_norm(ff, w.fn2[], eps, ctx)
-    var gate_mlp_raw = _t(mv.gate_mlp.copy(), [D], ctx)
-    var gate_mlp_t = tanh_op(gate_mlp_raw, ctx)
+    var gate_mlp_t = tanh_op(mv.gate_mlp[], ctx)
     var result = residual_gate(h, gate_mlp_t, ff_n2, ctx)
     return TArc(result^)
 

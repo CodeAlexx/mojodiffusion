@@ -343,7 +343,7 @@ Z-Image NextDiT transformer (basic/non-omni). Reference = diffusers `transformer
   - Debug-only: `debug_nr0_mod`, `debug_nr0_attn[S]`, `debug_stage` (parity instrumentation).
 
 ### `models/dit/klein_dit.mojo` — `Klein9BDiT`, `Klein9BOffloaded`, `KleinConfig` ✅ one-step 1024
-FLUX.2 Klein DiT scaffold. Reference = `/home/alex/EriDiffusion/inference-flame/src/models/klein.rs` plus Modular `architectures/flux2`. Real-weight 9B transformer path with a fast truncated smoke, a complete all-resident 8+24-block tiny-token smoke, and an offloaded 1024 forward used by the image smoke.
+FLUX.2 Klein DiT scaffold. Reference = `/home/alex/EriDiffusion/inference-flame/src/models/klein.rs` plus Modular `architectures/flux2`. Real-weight 9B transformer path with a fast truncated smoke, a complete all-resident 8+24-block tiny-token smoke, and a block-streamed 1024 forward used by the image smoke. That image smoke is not OneTrainer `CPU_OFFLOADED` activation/layer parity, training backward parity, or speed/VRAM parity.
 - `@fieldwise_init struct KleinConfig` — `@staticmethod klein_9b()` = inner dim 4096, input channels 128, joint attention dim 12288, 8 double blocks, 24 single blocks, 32 heads, head dim 128, SwiGLU hidden 12288, timestep dim 256, RoPE theta 2000.
 - `klein9b_truncated_keys() -> List[String]` — the 25 BF16 checkpoint tensors needed for shared projections/modulation, `double_blocks.0`, `single_blocks.0`, and the final layer.
 - `klein9b_all_keys() -> List[String]` — all 201 BF16 DiT tensors for the 9B transformer.
@@ -891,21 +891,28 @@ Rectified-flow (flow-matching) Euler scheduler. References `inference-flame/src/
   - `sigmas() -> List[Float32]`, `timesteps() -> List[Float32]` (= `sigmas[0..num_steps-1]`; the model timestep IS the sigma), `sigma(i) -> Float32`.
   - `step(self, latent, velocity, i: Int, ctx) raises -> Tensor` — `x_next = latent + velocity·(sigma[i+1] - sigma[i])` (dt negative; velocity already CFG-combined).
 
-### `sampling/flux2_klein.mojo` — `Flux2KleinScheduler`, FLUX.2/Klein CFG ✅ scalar-smoke
-FLUX.2/Klein flow-matching schedule and per-step tensor glue. References
-`inference-flame/src/sampling/klein_sampling.rs` and Modular
-`diffusion/schedulers/scheduling_flow_match_euler_discrete.py`,
-`architectures/flux2/components/{cfg_combine,denoise_predict}.py`.
+### `sampling/flux2_klein.mojo` — `Flux2KleinScheduler`, FLUX.2 dev/Klein CFG ✅ scalar-smoke
+Shared OneTrainer FLUX.2 dev/Klein flow-matching scalar schedule and per-step
+tensor glue. The product runner split remains separate: Flux2-dev must not be
+dispatched through the Klein runner until a real Flux2-dev runner and evidence
+exist. This section covers scheduler/CFG/update helpers only, not text
+conditioning, denoise trajectory, VAE decode, image output, speed, or VRAM
+parity.
 - `compute_empirical_mu(image_seq_len: Int, num_steps: Int) -> Float64` — BFL empirical mu for packed image token count.
 - `time_snr_shift(t: Float64, mu: Float64) -> Float64` — exponential time-SNR shift with sigma parameter 1.0.
-- `build_flux2_sigma_schedule(num_steps, image_seq_len) raises -> List[Float32]` — `num_steps+1` sigmas from 1.0 to 0.0 after dynamic empirical-mu shift.
+- `build_flux2_sigma_schedule(num_steps, image_seq_len) raises -> List[Float32]` — OneTrainer `np.linspace(1.0, 1/num_steps, num_steps)` plus terminal `0.0`, shifted by dynamic empirical `mu`.
 - `build_flux2_fixed_shift_schedule(num_steps, shift) raises -> List[Float32]` — fixed-shift Klein edit/img2img schedule (`SHIFT=2.02` in inference-flame edit bins).
 - `build_flux2_img2img_sigmas(num_steps, shift, denoise) raises -> List[Float32]` — truncated fixed-shift img2img schedule.
+- `flux2_scheduler_timestep_from_sigma(sigma) -> Float32` — Diffusers scheduler timestep value before OneTrainer `/ 1000`.
+- `flux2_model_timestep_from_scheduler_timestep(timestep) -> Float32` / `flux2_model_timestep_from_sigma(sigma) -> Float32` — transformer timestep contract.
+- `flux2_cfg_batch_size(guidance_scale, guidance_embeds) -> Int` and `flux2_guidance_embed_value(cfg_scale) -> Float32` — OneTrainer true-CFG versus guidance-embed branch.
+- `flux2_cfg_value(pred_pos, pred_neg, guidance_scale) -> Float32` — scalar textbook CFG contract.
 - `flux2_cfg(pred_pos, pred_neg, guidance_scale, ctx) raises -> Tensor` — textbook CFG: `neg + scale*(pos-neg)`.
+- `flux2_euler_dt(current_sigma, next_sigma) -> Float32` and `flux2_euler_update_value(...) -> Float32` — scalar Euler contracts.
 - `flux2_euler_step(latents, noise_pred, dt, ctx) raises -> Tensor` — direct velocity update `latents + dt*noise_pred`.
 - `struct Flux2KleinScheduler(Movable)` — `_sigmas`, `num_steps`, `image_seq_len`, `mu`.
   - `__init__(num_steps, image_seq_len) raises`.
-  - `sigmas()`, `timestep(i)`, `dt(i)`.
+  - `sigmas()`, `timestep(i)`, `scheduler_timestep(i)`, `model_timestep(i)`, `dt(i)`.
   - `step(latents, noise_pred, i, ctx)` — uses `dt(i)` and GPU tensor ops.
 
 ### `sampling/flux1_dev.mojo` — FLUX.1-dev schedule/pack contract ✅ scalar-smoke

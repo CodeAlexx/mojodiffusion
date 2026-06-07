@@ -63,15 +63,20 @@
 #
 # Mojo 1.0.0b1: def not fn; Tensor move-only; host List[Float32] carriers.
 
+from std.gpu import global_idx
 from std.gpu.host import DeviceContext, HostBuffer
+from std.utils.index import IndexList
 from std.collections import List, Optional
 from std.memory import ArcPointer
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.elementwise import modulate
+from serenitymojo.ops.vec_modulate import vec_modulate
 from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx
 from serenitymojo.ops.norm_backward import layer_norm_backward, layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
@@ -83,12 +88,14 @@ from serenitymojo.models.zimage.block import (
 )
 from serenitymojo.models.zimage.lora_block import (
     ZImageBlockLora, ZImageBlockLoraDevice, ZImageBlockLoraGrads,
+    ZImageModVecsDevice, zimage_modvecs_to_device,
     ZImageLoraAdapterDevice, zimage_lora_adapter_to_device, ZIMAGE_SLOTS,
     SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_W1, SLOT_W3, SLOT_W2,
     zimage_block_lora_forward, zimage_block_lora_backward,
     zimage_block_lora_forward_device, zimage_block_lora_backward_device,
     zimage_block_lora_forward_device_tensor, zimage_block_lora_backward_device_tensors,
     zimage_block_lora_predict_device_tensor,
+    zimage_block_lora_predict_device_tensor_moddev,
     zimage_refiner_lora_forward, zimage_refiner_lora_backward,
 )
 from serenitymojo.models.zimage.zimage_stack import (
@@ -104,6 +111,83 @@ from serenitymojo.training.lora_save import (
 
 
 comptime TArc = ArcPointer[Tensor]
+comptime _ZIMG_DYN1 = Layout.row_major(-1)
+comptime _ZIMG_BLOCK = 256
+
+
+def _zimage_patch_rows_to_nchw_f32(
+    patches: LayoutTensor[DType.float32, _ZIMG_DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.float32, _ZIMG_DYN1, MutAnyOrigin],
+    channels: Int,
+    height: Int,
+    width: Int,
+    patch: Int,
+):
+    var idx = Int(global_idx.x)
+    var total = channels * height * width
+    if idx < total:
+        var iw = idx % width
+        var rem = idx // width
+        var ih = rem % height
+        var c = rem // height
+        var ht = ih // patch
+        var wt = iw // patch
+        var ph = ih % patch
+        var pw = iw % patch
+        var patch_w = width // patch
+        var row = ht * patch_w + wt
+        var out_ch = channels * patch * patch
+        # Z-Image/diffusers stores patch features channel-minor:
+        # [Ht,Wt,patch_h,patch_w,C], unlike the generic DiT C-major helper.
+        var col = ((ph * patch) + pw) * channels + c
+        dst[idx] = rebind[dst.element_type](
+            rebind[Scalar[DType.float32]](patches[row * out_ch + col])
+        )
+
+
+def zimage_unpatchify_image_rows_channel_minor(
+    patches: Tensor,
+    channels: Int,
+    height: Int,
+    width: Int,
+    patch: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Device-only inverse for Z-Image final patch rows.
+
+    The input is the final projection [S, C*p*p]. Only the leading real image
+    rows are consumed; caption and image-pad rows stay ignored.
+    """
+    if patches.dtype() != STDtype.F32:
+        raise Error("zimage_unpatchify_image_rows_channel_minor: expected F32 patches")
+    var sh = patches.shape()
+    if len(sh) != 2:
+        raise Error("zimage_unpatchify_image_rows_channel_minor: patches must be [S, C*p*p]")
+    if patch <= 0 or height % patch != 0 or width % patch != 0:
+        raise Error("zimage_unpatchify_image_rows_channel_minor: patch must divide height/width")
+    var real_rows = (height // patch) * (width // patch)
+    var out_ch = channels * patch * patch
+    if sh[0] < real_rows or sh[1] != out_ch:
+        raise Error("zimage_unpatchify_image_rows_channel_minor: patch tensor shape mismatch")
+
+    var total = channels * height * width
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](total * 4)
+    var src_rl = RuntimeLayout[_ZIMG_DYN1].row_major(IndexList[1](patches.numel()))
+    var out_rl = RuntimeLayout[_ZIMG_DYN1].row_major(IndexList[1](total))
+    var P = LayoutTensor[DType.float32, _ZIMG_DYN1, MutAnyOrigin](
+        patches.buf.unsafe_ptr().bitcast[Float32](), src_rl
+    )
+    var O = LayoutTensor[DType.float32, _ZIMG_DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[Float32](), out_rl
+    )
+    var grid = (total + _ZIMG_BLOCK - 1) // _ZIMG_BLOCK
+    ctx.enqueue_function[
+        _zimage_patch_rows_to_nchw_f32, _zimage_patch_rows_to_nchw_f32
+    ](
+        P, O, channels, height, width, patch,
+        grid_dim=grid, block_dim=_ZIMG_BLOCK,
+    )
+    return Tensor(out_buf^, [1, channels, height, width], STDtype.F32)
 
 
 # ── adapter init (A small randn, B=0 — PEFT identity at step 0) ───────────────
@@ -201,6 +285,19 @@ def zimage_lora_set_to_device(
     for i in range(n):
         ad.append(zimage_lora_adapter_to_device(set.ad[i], ctx))
     return ZImageLoraDeviceSet(ad^, set.num_nr, set.num_cr, set.num_main, set.rank)
+
+
+def build_zimage_zero_lora_device_set(
+    num_nr: Int, num_cr: Int, num_main: Int, ctx: DeviceContext
+) raises -> ZImageLoraDeviceSet:
+    var ad = List[ZImageLoraAdapterDevice]()
+    var zero = TArc(Tensor.from_host([Float32(0.0)], [1, 1], STDtype.BF16, ctx))
+    var n = (num_nr + num_cr + num_main) * ZIMAGE_SLOTS
+    for _ in range(n):
+        ad.append(ZImageLoraAdapterDevice(
+            zero.copy(), zero.copy(), 1, 1, 1, Float32(0.0)
+        ))
+    return ZImageLoraDeviceSet(ad^, num_nr, num_cr, num_main, 1)
 
 
 # ── per-block adapter slot shapes (in, out) for slot s, given D (hidden), F (ffn) ─
@@ -663,7 +760,7 @@ def zimage_stack_lora_forward_main_device[
     var ln_t = layer_norm(
         x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
     )
-    var x_out_t = modulate(
+    var x_out_t = vec_modulate(
         ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
     )
     var bias = Optional[Tensor](final_lin_b.clone(ctx))
@@ -675,6 +772,120 @@ def zimage_stack_lora_forward_main_device[
         out^, x_seq.copy(), cap_seq.copy(),
         nr_x_in^, cr_x_in^, main_x_in^,
         x_arc.copy(), TArc(ln_t^),
+    )
+
+
+def zimage_refine_x_seq[
+    H: Int, Dh: Int, N_IMG: Int
+](
+    x_seq: List[Float32],
+    nr_blocks: List[ZImageBlockWeights], nr_mod: List[ZImageModVecs],
+    x_cos: Tensor, x_sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    var xs = x_seq.copy()
+    for i in range(len(nr_blocks)):
+        var fwd = zimage_block_forward[H, Dh, N_IMG](
+            xs.copy(), nr_blocks[i], nr_mod[i], x_cos, x_sin, D, F, eps, ctx,
+        )
+        xs = fwd.out.copy()
+    return xs^
+
+
+def zimage_stack_lora_predict_main_from_refined_device_tensor[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    xs: List[Float32], cap_seq: List[Float32],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var main_mod_dev = List[ZImageModVecsDevice]()
+    for i in range(len(main_mod)):
+        main_mod_dev.append(zimage_modvecs_to_device(main_mod[i], D, ctx))
+    return zimage_stack_lora_predict_main_from_refined_moddev_tensor[H, Dh, N_IMG, N_TXT, S](
+        xs, cap_seq, cr_blocks, main_blocks, main_mod_dev^, lora,
+        f_scale, final_lin_w, final_lin_b,
+        cap_cos, cap_sin, uni_cos, uni_sin,
+        D, F, out_ch, eps, final_eps, ctx,
+    )
+
+
+def zimage_stack_lora_predict_main_from_refined_moddev_tensor[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    xs: List[Float32], cap_seq: List[Float32],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var num_cr = len(cr_blocks)
+    var num_main = len(main_blocks)
+
+    var cs = cap_seq.copy()
+    for i in range(num_cr):
+        var fwd = zimage_refiner_forward[H, Dh, N_TXT](
+            cs.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
+        )
+        cs = fwd.out.copy()
+
+    var x = _concat_img_cap(xs, cs)
+    var x_arc = TArc(_t(x^, [S, D], ctx))
+
+    for i in range(num_main):
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        x_arc = zimage_block_lora_predict_device_tensor_moddev[H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod[i], bl, uni_cos, uni_sin, D, F, eps, ctx,
+        )
+
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = modulate(
+        ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    return linear(x_out_t, final_lin_w, bias^, ctx)
+
+
+def zimage_stack_lora_predict_main_device_tensor[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    x_seq: List[Float32], cap_seq: List[Float32],
+    nr_blocks: List[ZImageBlockWeights], nr_mod: List[ZImageModVecs],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var xs = zimage_refine_x_seq[H, Dh, N_IMG](
+        x_seq, nr_blocks, nr_mod, x_cos, x_sin, D, F, eps, ctx,
+    )
+    return zimage_stack_lora_predict_main_from_refined_device_tensor[H, Dh, N_IMG, N_TXT, S](
+        xs^, cap_seq,
+        cr_blocks, main_blocks, main_mod, lora,
+        f_scale, final_lin_w, final_lin_b,
+        cap_cos, cap_sin, uni_cos, uni_sin,
+        D, F, out_ch, eps, final_eps, ctx,
     )
 
 
@@ -694,41 +905,14 @@ def zimage_stack_lora_predict_main_device[
     D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
     ctx: DeviceContext,
 ) raises -> List[Float32]:
-    var num_nr = len(nr_blocks)
-    var num_cr = len(cr_blocks)
-    var num_main = len(main_blocks)
-
-    var xs = x_seq.copy()
-    for i in range(num_nr):
-        var fwd = zimage_block_forward[H, Dh, N_IMG](
-            xs.copy(), nr_blocks[i], nr_mod[i], x_cos, x_sin, D, F, eps, ctx,
-        )
-        xs = fwd.out.copy()
-
-    var cs = cap_seq.copy()
-    for i in range(num_cr):
-        var fwd = zimage_refiner_forward[H, Dh, N_TXT](
-            cs.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
-        )
-        cs = fwd.out.copy()
-
-    var x = _concat_img_cap(xs, cs)
-    var x_arc = TArc(_t(x^, [S, D], ctx))
-
-    for i in range(num_main):
-        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
-        x_arc = zimage_block_lora_predict_device_tensor[H, Dh, S](
-            x_arc.copy(), main_blocks[i], main_mod[i], bl, uni_cos, uni_sin, D, F, eps, ctx,
-        )
-
-    var ln_t = layer_norm(
-        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    var patches_t = zimage_stack_lora_predict_main_device_tensor[H, Dh, N_IMG, N_TXT, S](
+        x_seq, cap_seq,
+        nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora,
+        f_scale, final_lin_w, final_lin_b,
+        x_cos, x_sin, cap_cos, cap_sin, uni_cos, uni_sin,
+        D, F, out_ch, eps, final_eps, ctx,
     )
-    var x_out_t = modulate(
-        ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
-    )
-    var bias = Optional[Tensor](final_lin_b.clone(ctx))
-    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+    var patches = patches_t.to_host(ctx)
     var parts = _split_img_cap(patches, N_IMG, N_TXT, out_ch)
     return parts[0].copy()
 

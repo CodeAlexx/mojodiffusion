@@ -37,3 +37,11 @@ tensors, and generated noise unless a checkpoint tensor is explicitly FP8/F16.
   known production anti-patterns; passing it is necessary, not sufficient.
 
 The standard is not "we got something to run." The standard is "a person can use this and trust what it claims."
+
+## OneTrainer -> Mojo Skill Pack
+
+For OneTrainer-to-Mojo model work, Codex and Claude Code should use the shared
+workflow skills listed in `ONETRAINER_MOJO_SKILLS.md`. The canonical skill
+files are mirrored under `.claude/skills/` and `.codex/skills/`. They cover
+intake, shared Mojo model runtime/inference, training port, sampler port, parity
+gates, production use, and agent handoff.

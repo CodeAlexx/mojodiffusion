@@ -36,7 +36,8 @@ from serenitymojo.training.train_config import TrainConfig
 from serenitymojo.models.klein.klein_stack import KleinStackBase
 from serenitymojo.models.klein.klein_stack_lora import (
     KleinLoraSet, build_klein_lora_set, klein_lora_set_to_device,
-    load_klein_lora_resume,
+    load_klein_lora_resume, scale_klein_lora_set,
+    klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch,
     klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch,
 )
 from serenitymojo.models.klein.weights import (
@@ -115,9 +116,58 @@ def _initial_noise_tokens[N_IMG: Int, LH: Int, LW: Int](
     return reshape_owned(nhwc^, sh^)
 
 
+def _shape_str(shape: List[Int]) -> String:
+    var out = String("[")
+    for i in range(len(shape)):
+        if i != 0:
+            out += String(",")
+        out += String(shape[i])
+    out += String("]")
+    return out^
+
+
+# Parity-only initial noise adapter. OneTrainer draws raw PyTorch F32 noise as
+# [1,32,2*LH,2*LW], then patchifies/packs it before the transformer. This
+# adapter expects that OT-equivalent post-patch/post-pack tensor:
+# [1,in_ch,LH,LW] or [N_IMG,in_ch]. It preserves the sidecar dtype exactly and
+# is only used by `klein_sample_with_initial_noise`; the default product path
+# still uses `_initial_noise_tokens(... STDtype.BF16 ...)`.
+def _initial_noise_tokens_from_sidecar[N_IMG: Int, LH: Int, LW: Int](
+    var initial_noise: Tensor, in_ch: Int, ctx: DeviceContext
+) raises -> Tensor:
+    _ = initial_noise.dtype().to_mojo_dtype()
+    var sh = initial_noise.shape()
+    if len(sh) == 4:
+        if sh[0] == 1 and sh[1] == in_ch and sh[2] == LH and sh[3] == LW:
+            var p = List[Int]()
+            p.append(0); p.append(2); p.append(3); p.append(1)
+            var nhwc = permute(initial_noise^, p^, ctx)
+            var out_sh = List[Int]()
+            out_sh.append(N_IMG); out_sh.append(in_ch)
+            return reshape_owned(nhwc^, out_sh^)
+    elif len(sh) == 2:
+        if sh[0] == N_IMG and sh[1] == in_ch:
+            return initial_noise^
+    raise Error(
+        String("Klein post-patch/post-pack initial-noise sidecar shape ")
+        + _shape_str(sh)
+        + String(" is not [1,")
+        + String(in_ch)
+        + String(",")
+        + String(LH)
+        + String(",")
+        + String(LW)
+        + String("] or [")
+        + String(N_IMG)
+        + String(",")
+        + String(in_ch)
+        + String("]")
+    )
+
+
 # ── STAGE 2: denoise on a freshly-loaded base stack + LIVE LoRA. The stack is
 # local here, so its weights FREE on return (before the VAE loads).
-def _denoise_lora[
+def _denoise_lora_from_initial[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int
 ](
     cfg: TrainConfig,
@@ -126,8 +176,9 @@ def _denoise_lora[
     neg_txt: Tensor,            # [N_TXT, joint] negative caption embedding
     cfg_scale: Float32,
     num_steps: Int,
-    seed: UInt64,
+    var x: Tensor,              # [N_IMG, in_ch] initial latent/noise tokens
     ctx: DeviceContext,
+    lora_multiplier: Float32 = Float32(1.0),
 ) raises -> Tensor:
     var st = SafeTensors.open(cfg.checkpoint)
     var seed_ts = Tensor.from_host([Float32(500.0)], [1], STDtype.F32, ctx)
@@ -143,12 +194,14 @@ def _denoise_lora[
     var lora: KleinLoraSet
     if lora_path == String(""):
         lora = build_klein_lora_set(
-            cfg.num_double, cfg.num_single, cfg.d_model, cfg.lora_rank, cfg.lora_alpha
+            cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            cfg.lora_rank, cfg.lora_alpha
         )
     else:
         lora = load_klein_lora_resume(
             cfg.num_double, cfg.num_single, cfg.lora_rank, cfg.lora_alpha, lora_path, ctx
         )
+    scale_klein_lora_set(lora, lora_multiplier)
     var lora_dev = klein_lora_set_to_device(lora, ctx)
     var rope = _rope_host[N_IMG, N_TXT, S, H]()
     var cos_dev = Tensor.from_host(rope[0].copy(), [S * H, Dh // 2], STDtype.F32, ctx)
@@ -157,7 +210,6 @@ def _denoise_lora[
     var txt_tokens_t = TArc(pos_txt.clone(ctx))
     var neg_tokens_t = TArc(neg_txt.clone(ctx))
     var sigmas = build_flux2_sigma_schedule(num_steps, N_IMG)
-    var x = _initial_noise_tokens[N_IMG, LH, LW](cfg.in_channels, seed, ctx)
     # Keep validation under 24GB when live LoRA is loaded at 1024. CFG is paired
     # per streamed block, so one scratch frame covers both branches for a step.
     var scratch = ScratchRingAllocator(ctx, 512 * 1024 * 1024, 2)
@@ -178,13 +230,22 @@ def _denoise_lora[
         base.final_shift = mods[3].copy()
         base.final_scale = mods[4].copy()
 
-        var preds = klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
-            TArc(x.clone(ctx)), txt_tokens_t, neg_tokens_t, base,
-            loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
-            cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
-            cfg.out_channels, cfg.eps, ctx, scratch,
-        )
-        var v_dev = flux2_cfg(preds.pos, preds.neg, cfg_scale, ctx)
+        var v_dev: Tensor
+        if cfg_scale == Float32(1.0):
+            v_dev = klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
+                TArc(x.clone(ctx)), txt_tokens_t, base,
+                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch,
+            )
+        else:
+            var preds = klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
+                TArc(x.clone(ctx)), txt_tokens_t, neg_tokens_t, base,
+                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch,
+            )
+            v_dev = flux2_cfg(preds.pos, preds.neg, cfg_scale, ctx)
         # velocity [N_IMG, out_ch]; Euler: x = x + dt*v.
         x = add(x, mul_scalar(v_dev, dt, ctx), ctx)
         ctx.synchronize()
@@ -196,6 +257,26 @@ def _denoise_lora[
             print_sample_step(String("Klein-sample"), step, num_steps, sigma, secs, speed)
 
     return x.clone(ctx)
+
+
+def _denoise_lora[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int
+](
+    cfg: TrainConfig,
+    lora_path: String,
+    pos_txt: Tensor,
+    neg_txt: Tensor,
+    cfg_scale: Float32,
+    num_steps: Int,
+    seed: UInt64,
+    ctx: DeviceContext,
+    lora_multiplier: Float32 = Float32(1.0),
+) raises -> Tensor:
+    var x = _initial_noise_tokens[N_IMG, LH, LW](cfg.in_channels, seed, ctx)
+    return _denoise_lora_from_initial[H, Dh, N_IMG, N_TXT, S, LH, LW](
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^, ctx,
+        lora_multiplier,
+    )
 
 
 # ── PUBLIC: sample one Klein image, staged (stack freed before VAE). ──────────
@@ -211,6 +292,7 @@ def klein_sample[
     seed: UInt64,
     out_png: String,
     ctx: DeviceContext,
+    lora_multiplier: Float32 = Float32(1.0),
 ) raises -> Tensor:
     if cfg.n_heads != H:
         raise Error(String("klein_sample: cfg.n_heads ") + String(cfg.n_heads)
@@ -221,10 +303,51 @@ def klein_sample[
 
     # STAGE 2 — denoise; the base stack + LoRA free when this returns.
     var latent = _denoise_lora[H, Dh, N_IMG, N_TXT, S, LH, LW](
-        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, ctx
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, ctx,
+        lora_multiplier,
     )
 
     # STAGE 3 — VAE decode (loaded only now that the DiT stack is gone).
+    var packed = tokens_to_packed_nchw[LH, LW](latent, ctx)
+    var vae = KleinVaeDecoder[LH, LW].load(cfg.vae, ctx)
+    var img = vae.decode(packed, ctx)
+    if out_png != String(""):
+        save_image(img, out_png, ctx)
+        print_sample_saved(String("Klein-sample"), out_png)
+    return img^
+
+
+# Explicit parity/debug entry for OneTrainer trajectory replay. `initial_noise`
+# can be a raw cap-cache-format tensor dumped after OneTrainer patchify as NCHW
+# [1,in_ch,LH,LW] or after pack as [N_IMG,in_ch]. It is never dtype-cast here.
+def klein_sample_with_initial_noise[
+    N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int, H: Int, Dh: Int
+](
+    cfg: TrainConfig,
+    lora_path: String,
+    pos_txt: Tensor,
+    neg_txt: Tensor,
+    cfg_scale: Float32,
+    num_steps: Int,
+    var initial_noise: Tensor,
+    out_png: String,
+    ctx: DeviceContext,
+    lora_multiplier: Float32 = Float32(1.0),
+) raises -> Tensor:
+    if cfg.n_heads != H:
+        raise Error(String("klein_sample_with_initial_noise: cfg.n_heads ") + String(cfg.n_heads)
+            + " != comptime H " + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("klein_sample_with_initial_noise: cfg.head_dim ") + String(cfg.head_dim)
+            + " != comptime Dh " + String(Dh))
+
+    var x = _initial_noise_tokens_from_sidecar[N_IMG, LH, LW](
+        initial_noise^, cfg.in_channels, ctx
+    )
+    var latent = _denoise_lora_from_initial[H, Dh, N_IMG, N_TXT, S, LH, LW](
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^, ctx,
+        lora_multiplier,
+    )
     var packed = tokens_to_packed_nchw[LH, LW](latent, ctx)
     var vae = KleinVaeDecoder[LH, LW].load(cfg.vae, ctx)
     var img = vae.decode(packed, ctx)

@@ -154,6 +154,12 @@ def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> 
     return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
 
 
+def _t_dtype(
+    vals: List[Float32], var shape: List[Int], dtype: STDtype, ctx: DeviceContext
+) raises -> Tensor:
+    return Tensor.from_host(vals, shape^, dtype, ctx)
+
+
 # F32 host-list -> resident device Tensor boxed as a Copyable carrier.
 def _ta(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> TArc:
     return TArc(Tensor.from_host(vals, shape^, STDtype.F32, ctx))
@@ -561,8 +567,11 @@ def double_block_forward[
     # cos/sin are RESIDENT rope tables borrowed from the caller (uploaded once).
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     # resident layer_norm ones[D]/zeros[D] (uploaded once, borrowed by every LN).
-    var ones_t = _t(_ones(D), [D], ctx)
-    var zeros_t = _t(_zeros(D), [D], ctx)
+    var norm_dtype = STDtype.F32
+    if w.img.wqkv[].dtype() == STDtype.BF16:
+        norm_dtype = STDtype.BF16
+    var ones_t = _t_dtype(_ones(D), [D], norm_dtype, ctx)
+    var zeros_t = _t_dtype(_zeros(D), [D], norm_dtype, ctx)
 
     # img/txt ENTER host -> ONE from_host each (boxed as TArc carriers so the
     # input can feed BOTH the pre AND the post residual AND the saved struct).
@@ -874,10 +883,10 @@ def double_block_backward[
 # ═══════════════════════════════════════════════════════════════════════════
 # LoRA-ON-PROJECTION VARIANT
 #
-# Targets (per stream, attention-only — matches lora.mojo _map_klein_trainer):
-#   wqkv (qkv_proj, FULL [3D,D])  and  wproj (out_proj, FULL [D,D]).
-# Forward adds the LoRA delta at those two linears; backward returns d_A/d_B for
-# each and folds the LoRA d_x contribution back into the projection-input grad.
+# Targets (per stream, matching OneTrainer Flux2LoRASetup):
+#   q, k, v, attention out, ff linear_in, and ff linear_out. Base weights remain
+# fused where the checkpoint stores them fused, but LoRA adapters are separate
+# OneTrainer modules with separate A/B tensors and gradients.
 #
 # NOTE: the LoRA-delta helpers have resident device variants. The host-list
 # helpers remain for compatibility/parity, while the hot trainer path passes
@@ -891,30 +900,135 @@ from serenitymojo.models.klein.lora_block import (
     klein_lora_bwd_device_resident_tensors,
     KleinLoraDeviceGrads, KleinLoraDeviceGradTensors,
 )
+# LoRA dropout primitives (LoRAModule.py:328, applied to EVERY LoRAModule via
+# set_dropout, Flux2LoRASetup.py:65). Identical machinery to single_block; the
+# double block reuses it 1:1 so all 96 double-block adapters honor
+# config.dropout_probability. p==0 -> mask all-ones -> reduces EXACTLY to the
+# verified no-dropout klein_lora_*_device_resident path (parity-byte-identical).
+from serenitymojo.models.klein.single_block import (
+    LoraDropout,
+    _klein_lora_fwd_dropout,
+    _klein_lora_bwd_dropout,
+    _klein_lora_bwd_dropout_tensors,
+)
 
 
-# Optional LoRA adapters for one stream's two attention projections.
-struct StreamLora(Copyable, Movable):
-    var qkv: Optional[LoraAdapter]    # on wqkv  (in=D, out=3D)
-    var proj: Optional[LoraAdapter]   # on wproj (in=D, out=D)
-
-    def __init__(
-        out self, var qkv: Optional[LoraAdapter], var proj: Optional[LoraAdapter]
-    ):
-        self.qkv = qkv^
-        self.proj = proj^
-
-
-struct StreamLoraDevice(Copyable, Movable):
-    var qkv: Optional[LoraAdapterDevice]    # on wqkv  (in=D, out=3D)
-    var proj: Optional[LoraAdapterDevice]   # on wproj (in=D, out=D)
+# Per-stream LoRA dropout salts for the 6 SEPARATE OneTrainer adapters
+# (q,k,v,out,ff_in,ff_out). OneTrainer gives every LoRAModule its own dropout
+# (Flux2LoRASetup.py:65 -> LoRAModule.py:806-813,328). Each slot carries a
+# distinct salt so q/k/v/out/ff adapters draw independent masks; default p==0
+# keeps every existing call byte-identical to the no-dropout base.
+struct StreamLoraDropout(ImplicitlyCopyable, Movable):
+    var q: LoraDropout
+    var k: LoraDropout
+    var v: LoraDropout
+    var out: LoraDropout
+    var ff_in: LoraDropout
+    var ff_out: LoraDropout
 
     def __init__(
         out self,
-        var qkv: Optional[LoraAdapterDevice], var proj: Optional[LoraAdapterDevice],
+        q: LoraDropout = LoraDropout(), k: LoraDropout = LoraDropout(),
+        v: LoraDropout = LoraDropout(), out_: LoraDropout = LoraDropout(),
+        ff_in: LoraDropout = LoraDropout(), ff_out: LoraDropout = LoraDropout(),
     ):
-        self.qkv = qkv^
-        self.proj = proj^
+        self.q = q
+        self.k = k
+        self.v = v
+        self.out = out_
+        self.ff_in = ff_in
+        self.ff_out = ff_out
+
+
+struct DoubleBlockLoraDropout(ImplicitlyCopyable, Movable):
+    var img: StreamLoraDropout
+    var txt: StreamLoraDropout
+
+    def __init__(
+        out self,
+        img: StreamLoraDropout = StreamLoraDropout(),
+        txt: StreamLoraDropout = StreamLoraDropout(),
+    ):
+        self.img = img
+        self.txt = txt
+
+
+# ── 1:1 OneTrainer SEPARATE-Linear LoRA adapters per stream ──────────────────
+# OneTrainer/Flux2LoRASetup.py:57 wraps SEPARATE diffusers nn.Linear modules
+# (LoRAModuleWrapper, LoRAModule.py:648-650 wraps EVERY nn.Linear child). The
+# `qkv_fusion` in Flux2Model.py:35-72 is a CHECKPOINT-CONVERSION concern (mapping
+# diffusers weight NAMES → original fused names) — it does NOT fuse the live LoRA
+# adapters. So each separate nn.Linear gets its OWN lora_down/lora_up/alpha:
+#
+#   diffusers (transformer_flux2.py)         OneTrainer wraps  → our slot
+#   attn.to_q        (Linear D→D)  526        img q             q
+#   attn.to_k        (Linear D→D)  527        img k             k
+#   attn.to_v        (Linear D→D)  528        img v             v
+#   attn.to_out.0    (Linear D→D)  535        img to_out.0      out
+#   ff.linear_in     (Linear D→2F) 314        img ff_in         ff_in
+#   ff.linear_out    (Linear F→D)  316        img ff_out        ff_out
+#   attn.add_q_proj  (Linear D→D)  541        txt q             q
+#   attn.add_k_proj  (Linear D→D)  542        txt k             k
+#   attn.add_v_proj  (Linear D→D)  543        txt v             v
+#   attn.to_add_out  (Linear D→D)  544        txt to_add_out    out
+#   ff_context.linear_in  (D→2F)   314        txt ff_in         ff_in
+#   ff_context.linear_out (F→D)    316        txt ff_out        ff_out
+#
+# 6 adapters per stream × 2 streams = 12 per double block (vs the old fused 2/2).
+# Klein 9B: 8 double blocks × 12 = 96 double adapters (was 32). With 24×2 single
+# = 48, the total is 96 + 48 = 144 — matching OneTrainer exactly (was 80).
+#
+# KEY 1:1 DIFFERENCE FROM THE OLD FUSED qkv ADAPTER
+#   A fused qkv adapter [D→3D] with ONE shared lora_down [rank,D] and lora_up
+#   [3D,rank] is NOT equivalent to three SEPARATE q/k/v adapters each [D→D] with
+#   their OWN lora_down/lora_up. OneTrainer has three separate down-projections,
+#   so the q/k/v deltas occupy disjoint rank subspaces. We now apply each
+#   separately and add the delta into the matching column band of the fused base
+#   qkv output (q→[0:D], k→[D:2D], v→[2D:3D]); the base WEIGHTS stay fused
+#   ([3D,D] etc.) since fused-base = column-concat of the separate bases (the
+#   forward math is identical), only the LoRA deltas are now separate.
+struct StreamLora(Copyable, Movable):
+    var q: Optional[LoraAdapter]       # attn.to_q / attn.add_q_proj   (in=D,  out=D)
+    var k: Optional[LoraAdapter]       # attn.to_k / attn.add_k_proj   (in=D,  out=D)
+    var v: Optional[LoraAdapter]       # attn.to_v / attn.add_v_proj   (in=D,  out=D)
+    var out: Optional[LoraAdapter]     # attn.to_out.0 / to_add_out    (in=D,  out=D)
+    var ff_in: Optional[LoraAdapter]   # ff.linear_in / ff_context.linear_in  (in=D, out=2F)
+    var ff_out: Optional[LoraAdapter]  # ff.linear_out / ff_context.linear_out (in=F, out=D)
+
+    def __init__(
+        out self,
+        var q: Optional[LoraAdapter], var k: Optional[LoraAdapter],
+        var v: Optional[LoraAdapter], var out: Optional[LoraAdapter],
+        var ff_in: Optional[LoraAdapter], var ff_out: Optional[LoraAdapter],
+    ):
+        self.q = q^
+        self.k = k^
+        self.v = v^
+        self.out = out^
+        self.ff_in = ff_in^
+        self.ff_out = ff_out^
+
+
+struct StreamLoraDevice(Copyable, Movable):
+    var q: Optional[LoraAdapterDevice]
+    var k: Optional[LoraAdapterDevice]
+    var v: Optional[LoraAdapterDevice]
+    var out: Optional[LoraAdapterDevice]
+    var ff_in: Optional[LoraAdapterDevice]
+    var ff_out: Optional[LoraAdapterDevice]
+
+    def __init__(
+        out self,
+        var q: Optional[LoraAdapterDevice], var k: Optional[LoraAdapterDevice],
+        var v: Optional[LoraAdapterDevice], var out: Optional[LoraAdapterDevice],
+        var ff_in: Optional[LoraAdapterDevice], var ff_out: Optional[LoraAdapterDevice],
+    ):
+        self.q = q^
+        self.k = k^
+        self.v = v^
+        self.out = out^
+        self.ff_in = ff_in^
+        self.ff_out = ff_out^
 
 
 def _optional_lora_to_device(
@@ -927,8 +1041,12 @@ def _optional_lora_to_device(
 
 def stream_lora_to_device(lo: StreamLora, ctx: DeviceContext) raises -> StreamLoraDevice:
     return StreamLoraDevice(
-        _optional_lora_to_device(lo.qkv, ctx),
-        _optional_lora_to_device(lo.proj, ctx),
+        _optional_lora_to_device(lo.q, ctx),
+        _optional_lora_to_device(lo.k, ctx),
+        _optional_lora_to_device(lo.v, ctx),
+        _optional_lora_to_device(lo.out, ctx),
+        _optional_lora_to_device(lo.ff_in, ctx),
+        _optional_lora_to_device(lo.ff_out, ctx),
     )
 
 
@@ -959,23 +1077,43 @@ def double_block_lora_to_device(
     )
 
 
-# Per-stream LoRA grads: d_A/d_B for the qkv and proj adapters (empty when the
-# corresponding adapter is absent).
+# Per-stream LoRA grads: d_A/d_B for the 6 SEPARATE OneTrainer adapters
+# (q,k,v,out,ff_in,ff_out). Empty list when the corresponding adapter is absent.
 struct StreamLoraGrads(Copyable, Movable):
-    var qkv_d_a: List[Float32]
-    var qkv_d_b: List[Float32]
-    var proj_d_a: List[Float32]
-    var proj_d_b: List[Float32]
+    var q_d_a: List[Float32]
+    var q_d_b: List[Float32]
+    var k_d_a: List[Float32]
+    var k_d_b: List[Float32]
+    var v_d_a: List[Float32]
+    var v_d_b: List[Float32]
+    var out_d_a: List[Float32]
+    var out_d_b: List[Float32]
+    var ff_in_d_a: List[Float32]
+    var ff_in_d_b: List[Float32]
+    var ff_out_d_a: List[Float32]
+    var ff_out_d_b: List[Float32]
 
     def __init__(
         out self,
-        var qkv_d_a: List[Float32], var qkv_d_b: List[Float32],
-        var proj_d_a: List[Float32], var proj_d_b: List[Float32],
+        var q_d_a: List[Float32], var q_d_b: List[Float32],
+        var k_d_a: List[Float32], var k_d_b: List[Float32],
+        var v_d_a: List[Float32], var v_d_b: List[Float32],
+        var out_d_a: List[Float32], var out_d_b: List[Float32],
+        var ff_in_d_a: List[Float32], var ff_in_d_b: List[Float32],
+        var ff_out_d_a: List[Float32], var ff_out_d_b: List[Float32],
     ):
-        self.qkv_d_a = qkv_d_a^
-        self.qkv_d_b = qkv_d_b^
-        self.proj_d_a = proj_d_a^
-        self.proj_d_b = proj_d_b^
+        self.q_d_a = q_d_a^
+        self.q_d_b = q_d_b^
+        self.k_d_a = k_d_a^
+        self.k_d_b = k_d_b^
+        self.v_d_a = v_d_a^
+        self.v_d_b = v_d_b^
+        self.out_d_a = out_d_a^
+        self.out_d_b = out_d_b^
+        self.ff_in_d_a = ff_in_d_a^
+        self.ff_in_d_b = ff_in_d_b^
+        self.ff_out_d_a = ff_out_d_a^
+        self.ff_out_d_b = ff_out_d_b^
 
 
 struct DoubleBlockLoraGrads(Copyable, Movable):
@@ -1000,18 +1138,30 @@ struct StreamLoraDeviceGrads(Copyable, Movable):
     var d_shift2: List[Float32]
     var d_scale2: List[Float32]
     var d_gate2: List[Float32]
-    var qkv_d_a: List[Float32]
-    var qkv_d_b: List[Float32]
-    var proj_d_a: List[Float32]
-    var proj_d_b: List[Float32]
+    var q_d_a: List[Float32]
+    var q_d_b: List[Float32]
+    var k_d_a: List[Float32]
+    var k_d_b: List[Float32]
+    var v_d_a: List[Float32]
+    var v_d_b: List[Float32]
+    var out_d_a: List[Float32]
+    var out_d_b: List[Float32]
+    var ff_in_d_a: List[Float32]
+    var ff_in_d_b: List[Float32]
+    var ff_out_d_a: List[Float32]
+    var ff_out_d_b: List[Float32]
 
     def __init__(
         out self,
         var d_x: TArc,
         var d_shift1: List[Float32], var d_scale1: List[Float32], var d_gate1: List[Float32],
         var d_shift2: List[Float32], var d_scale2: List[Float32], var d_gate2: List[Float32],
-        var qkv_d_a: List[Float32], var qkv_d_b: List[Float32],
-        var proj_d_a: List[Float32], var proj_d_b: List[Float32],
+        var q_d_a: List[Float32], var q_d_b: List[Float32],
+        var k_d_a: List[Float32], var k_d_b: List[Float32],
+        var v_d_a: List[Float32], var v_d_b: List[Float32],
+        var out_d_a: List[Float32], var out_d_b: List[Float32],
+        var ff_in_d_a: List[Float32], var ff_in_d_b: List[Float32],
+        var ff_out_d_a: List[Float32], var ff_out_d_b: List[Float32],
     ):
         self.d_x = d_x^
         self.d_shift1 = d_shift1^
@@ -1020,10 +1170,18 @@ struct StreamLoraDeviceGrads(Copyable, Movable):
         self.d_shift2 = d_shift2^
         self.d_scale2 = d_scale2^
         self.d_gate2 = d_gate2^
-        self.qkv_d_a = qkv_d_a^
-        self.qkv_d_b = qkv_d_b^
-        self.proj_d_a = proj_d_a^
-        self.proj_d_b = proj_d_b^
+        self.q_d_a = q_d_a^
+        self.q_d_b = q_d_b^
+        self.k_d_a = k_d_a^
+        self.k_d_b = k_d_b^
+        self.v_d_a = v_d_a^
+        self.v_d_b = v_d_b^
+        self.out_d_a = out_d_a^
+        self.out_d_b = out_d_b^
+        self.ff_in_d_a = ff_in_d_a^
+        self.ff_in_d_b = ff_in_d_b^
+        self.ff_out_d_a = ff_out_d_a^
+        self.ff_out_d_b = ff_out_d_b^
 
 
 struct DoubleBlockLoraDeviceGrads(Copyable, Movable):
@@ -1045,18 +1203,30 @@ struct StreamLoraDeviceGradTensors(Copyable, Movable):
     var d_shift2: List[Float32]
     var d_scale2: List[Float32]
     var d_gate2: List[Float32]
-    var qkv_d_a: Optional[TArc]
-    var qkv_d_b: Optional[TArc]
-    var proj_d_a: Optional[TArc]
-    var proj_d_b: Optional[TArc]
+    var q_d_a: Optional[TArc]
+    var q_d_b: Optional[TArc]
+    var k_d_a: Optional[TArc]
+    var k_d_b: Optional[TArc]
+    var v_d_a: Optional[TArc]
+    var v_d_b: Optional[TArc]
+    var out_d_a: Optional[TArc]
+    var out_d_b: Optional[TArc]
+    var ff_in_d_a: Optional[TArc]
+    var ff_in_d_b: Optional[TArc]
+    var ff_out_d_a: Optional[TArc]
+    var ff_out_d_b: Optional[TArc]
 
     def __init__(
         out self,
         var d_x: TArc,
         var d_shift1: List[Float32], var d_scale1: List[Float32], var d_gate1: List[Float32],
         var d_shift2: List[Float32], var d_scale2: List[Float32], var d_gate2: List[Float32],
-        var qkv_d_a: Optional[TArc], var qkv_d_b: Optional[TArc],
-        var proj_d_a: Optional[TArc], var proj_d_b: Optional[TArc],
+        var q_d_a: Optional[TArc], var q_d_b: Optional[TArc],
+        var k_d_a: Optional[TArc], var k_d_b: Optional[TArc],
+        var v_d_a: Optional[TArc], var v_d_b: Optional[TArc],
+        var out_d_a: Optional[TArc], var out_d_b: Optional[TArc],
+        var ff_in_d_a: Optional[TArc], var ff_in_d_b: Optional[TArc],
+        var ff_out_d_a: Optional[TArc], var ff_out_d_b: Optional[TArc],
     ):
         self.d_x = d_x^
         self.d_shift1 = d_shift1^
@@ -1065,10 +1235,18 @@ struct StreamLoraDeviceGradTensors(Copyable, Movable):
         self.d_shift2 = d_shift2^
         self.d_scale2 = d_scale2^
         self.d_gate2 = d_gate2^
-        self.qkv_d_a = qkv_d_a^
-        self.qkv_d_b = qkv_d_b^
-        self.proj_d_a = proj_d_a^
-        self.proj_d_b = proj_d_b^
+        self.q_d_a = q_d_a^
+        self.q_d_b = q_d_b^
+        self.k_d_a = k_d_a^
+        self.k_d_b = k_d_b^
+        self.v_d_a = v_d_a^
+        self.v_d_b = v_d_b^
+        self.out_d_a = out_d_a^
+        self.out_d_b = out_d_b^
+        self.ff_in_d_a = ff_in_d_a^
+        self.ff_in_d_b = ff_in_d_b^
+        self.ff_out_d_a = ff_out_d_a^
+        self.ff_out_d_b = ff_out_d_b^
 
 
 struct DoubleBlockLoraDeviceGradTensors(Copyable, Movable):
@@ -1088,18 +1266,27 @@ def _stream_pre_lora_resident[
 ](
     x: TArc, w: StreamWeights, mv: ModVecsDevice, lo: StreamLoraDevice,
     N: Int, D: Int, eps: Float32, ones: Tensor, zeros: Tensor, ctx: DeviceContext,
+    drop: StreamLoraDropout = StreamLoraDropout(),
 ) raises -> _StreamPre:
     var ln1 = layer_norm(x[], ones, zeros, eps, ctx)
     var norm = modulate(ln1, mv.scale1[], mv.shift1[], ctx)
     var no_bias = Optional[Tensor](None)
     var qkv = linear(norm, w.wqkv[], no_bias^, ctx)   # [N,3D]
-    # LoRA on wqkv: delta [N,3D] added to qkv.
-    if lo.qkv:
-        var dlt = klein_lora_fwd_device_resident(norm, lo.qkv.value(), N, ctx)   # [N,3D]
-        qkv = add(qkv, dlt, ctx)
+    # SEPARATE q/k/v LoRA (OneTrainer attn.to_q/to_k/to_v, transformer_flux2.py
+    # :526-528; txt add_q/k/v_proj :541-543). Each adapter has its OWN lora_down
+    # (in=D) → distinct rank subspace, so we split the base qkv into the three
+    # [N,D] column bands and add the matching per-adapter delta. NOT equivalent to
+    # one fused [D→3D] adapter with a shared lora_down. Each adapter also carries
+    # its own dropout (LoRAModule.py:328); p==0 -> identity.
     var q_pre_flat = slice(qkv, 1, 0, D, ctx)
     var k_pre_flat = slice(qkv, 1, D, D, ctx)
     var v_flat = slice(qkv, 1, 2 * D, D, ctx)
+    if lo.q:
+        q_pre_flat = add(q_pre_flat, _klein_lora_fwd_dropout(norm, lo.q.value(), N, drop.q, ctx), ctx)
+    if lo.k:
+        k_pre_flat = add(k_pre_flat, _klein_lora_fwd_dropout(norm, lo.k.value(), N, drop.k, ctx), ctx)
+    if lo.v:
+        v_flat = add(v_flat, _klein_lora_fwd_dropout(norm, lo.v.value(), N, drop.v, ctx), ctx)
     var q_pre = reshape_owned(q_pre_flat^, [1, N, H, Dh])
     var k_pre = reshape_owned(k_pre_flat^, [1, N, H, Dh])
     var v = reshape_owned(v_flat^, [1, N, H, Dh])
@@ -1116,23 +1303,33 @@ def _stream_post_lora_resident(
     x: TArc, att: TArc, w: StreamWeights, mv: ModVecsDevice,
     lo: StreamLoraDevice, N: Int, D: Int, F: Int, eps: Float32,
     ones: Tensor, zeros: Tensor, ctx: DeviceContext,
+    drop: StreamLoraDropout = StreamLoraDropout(),
 ) raises -> _StreamPost:
     var no_bias = Optional[Tensor](None)
     var out = linear(att[], w.wproj[], no_bias^, ctx)   # [N,D]
-    # LoRA on wproj: input is att [N,D]; delta [N,D] added to out.
-    if lo.proj:
-        var dlt = klein_lora_fwd_device_resident(att[], lo.proj.value(), N, ctx)
-        out = add(out, dlt, ctx)
+    # LoRA on attn out-proj (OneTrainer attn.to_out.0 / attn.to_add_out,
+    # transformer_flux2.py:535/544): input att [N,D]; delta [N,D] added to out.
+    # Own dropout (LoRAModule.py:328); p==0 -> identity.
+    if lo.out:
+        out = add(out, _klein_lora_fwd_dropout(att[], lo.out.value(), N, drop.out, ctx), ctx)
     var attn_res = residual_gate(x[], mv.gate1[], out, ctx)
     var ln2 = layer_norm(attn_res, ones, zeros, eps, ctx)
     var mlp_in = modulate(ln2, mv.scale2[], mv.shift2[], ctx)
     var no_bias2 = Optional[Tensor](None)
     var gu = linear(mlp_in, w.wgu[], no_bias2^, ctx)   # [N,2F]
+    # LoRA on ff.linear_in / ff_context.linear_in (transformer_flux2.py:314,
+    # Flux2Model.py:58/63): one adapter in=D out=2F added to the FULL gu output.
+    if lo.ff_in:
+        gu = add(gu, _klein_lora_fwd_dropout(mlp_in, lo.ff_in.value(), N, drop.ff_in, ctx), ctx)
     var gate = slice(gu, 1, 0, F, ctx)
     var up = slice(gu, 1, F, F, ctx)
     var act = swiglu(gate, up, ctx)
     var no_bias3 = Optional[Tensor](None)
     var mlp = linear(act, w.wd[], no_bias3^, ctx)   # [N,D]
+    # LoRA on ff.linear_out / ff_context.linear_out (transformer_flux2.py:316,
+    # Flux2Model.py:59/64): adapter in=F out=D added to mlp (input is act [N,F]).
+    if lo.ff_out:
+        mlp = add(mlp, _klein_lora_fwd_dropout(act, lo.ff_out.value(), N, drop.ff_out, ctx), ctx)
     var final = residual_gate(attn_res, mv.gate2[], mlp, ctx)
     return _StreamPost(
         TArc(final^), TArc(attn_res^), TArc(ln2^), TArc(mlp_in^),
@@ -1152,13 +1349,15 @@ def double_block_lora_forward_device_resident[
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
+    drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
 ) raises -> DoubleBlockDeviceForward:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var ones_t = _t(_ones(D), [D], ctx)
-    var zeros_t = _t(_zeros(D), [D], ctx)
+    var norm_dtype = img_x[].dtype()
+    var ones_t = _t_dtype(_ones(D), [D], norm_dtype, ctx)
+    var zeros_t = _t_dtype(_zeros(D), [D], norm_dtype, ctx)
 
-    var ip = _stream_pre_lora_resident[H, Dh](img_x, w.img, img_mod, lora.img, N_IMG, D, eps, ones_t, zeros_t, ctx)
-    var tp = _stream_pre_lora_resident[H, Dh](txt_x, w.txt, txt_mod, lora.txt, N_TXT, D, eps, ones_t, zeros_t, ctx)
+    var ip = _stream_pre_lora_resident[H, Dh](img_x, w.img, img_mod, lora.img, N_IMG, D, eps, ones_t, zeros_t, ctx, drop.img)
+    var tp = _stream_pre_lora_resident[H, Dh](txt_x, w.txt, txt_mod, lora.txt, N_TXT, D, eps, ones_t, zeros_t, ctx, drop.txt)
 
     var q = concat(1, ctx, tp.q_rms[], ip.q_rms[])
     var k = concat(1, ctx, tp.k_rms[], ip.k_rms[])
@@ -1174,9 +1373,9 @@ def double_block_lora_forward_device_resident[
     var img_att = TArc(reshape_owned(img_att_4d^, [N_IMG, D]))
 
     var ipost = _stream_post_lora_resident(
-        img_x, img_att, w.img, img_mod, lora.img, N_IMG, D, F, eps, ones_t, zeros_t, ctx)
+        img_x, img_att, w.img, img_mod, lora.img, N_IMG, D, F, eps, ones_t, zeros_t, ctx, drop.img)
     var tpost = _stream_post_lora_resident(
-        txt_x, txt_att, w.txt, txt_mod, lora.txt, N_TXT, D, F, eps, ones_t, zeros_t, ctx)
+        txt_x, txt_att, w.txt, txt_mod, lora.txt, N_TXT, D, F, eps, ones_t, zeros_t, ctx, drop.txt)
 
     var img_saved = _make_saved(img_x, ip, img_att, ipost)
     var txt_saved = _make_saved(txt_x, tp, txt_att, tpost)
@@ -1197,13 +1396,14 @@ def double_block_lora_forward_device_resident_scratch[
     norm_ones: Tensor, norm_zeros: Tensor,
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
+    drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
 ) raises -> DoubleBlockDeviceForward:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
 
     var ip = _stream_pre_lora_resident[H, Dh](
-        img_x, w.img, img_mod, lora.img, N_IMG, D, eps, norm_ones, norm_zeros, ctx)
+        img_x, w.img, img_mod, lora.img, N_IMG, D, eps, norm_ones, norm_zeros, ctx, drop.img)
     var tp = _stream_pre_lora_resident[H, Dh](
-        txt_x, w.txt, txt_mod, lora.txt, N_TXT, D, eps, norm_ones, norm_zeros, ctx)
+        txt_x, w.txt, txt_mod, lora.txt, N_TXT, D, eps, norm_ones, norm_zeros, ctx, drop.txt)
 
     var qk_mark = scratch.mark()
     var q = concat2_scratch(1, ctx, scratch, tp.q_rms[], ip.q_rms[])
@@ -1221,9 +1421,9 @@ def double_block_lora_forward_device_resident_scratch[
     var img_att = TArc(reshape_owned(img_att_4d^, [N_IMG, D]))
 
     var ipost = _stream_post_lora_resident(
-        img_x, img_att, w.img, img_mod, lora.img, N_IMG, D, F, eps, norm_ones, norm_zeros, ctx)
+        img_x, img_att, w.img, img_mod, lora.img, N_IMG, D, F, eps, norm_ones, norm_zeros, ctx, drop.img)
     var tpost = _stream_post_lora_resident(
-        txt_x, txt_att, w.txt, txt_mod, lora.txt, N_TXT, D, F, eps, norm_ones, norm_zeros, ctx)
+        txt_x, txt_att, w.txt, txt_mod, lora.txt, N_TXT, D, F, eps, norm_ones, norm_zeros, ctx, drop.txt)
 
     var img_saved = _make_saved(img_x, ip, img_att, ipost)
     var txt_saved = _make_saved(txt_x, tp, txt_att, tpost)
@@ -1284,10 +1484,11 @@ def double_block_lora_forward_device[
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
+    drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
 ) raises -> DoubleBlockDeviceForward:
     var lora_dev = double_block_lora_to_device(lora, ctx)
     return double_block_lora_forward_device_resident[H, Dh, N_IMG, N_TXT, S](
-        img_x, txt_x, w, img_mod, txt_mod, lora_dev, cos, sin, D, F, eps, ctx,
+        img_x, txt_x, w, img_mod, txt_mod, lora_dev, cos, sin, D, F, eps, ctx, drop,
     )
 
 
@@ -1312,45 +1513,66 @@ def double_block_lora_forward[
 
 
 # ── LoRA-aware per-stream POST backward ──────────────────────────────────────
-# Mirrors _stream_post_backward; additionally, when the proj adapter is present,
-# runs klein_lora_bwd at the wproj output (d_proj_out, input=att) → proj_d_a/_b
-# and adds the LoRA d_x into d_att (so d_att flowing into sdpa is correct).
+# Mirrors _stream_post_backward; additionally runs SEPARATE LoRA backward for the
+# out-proj (att, d_proj_out → out_d_a/_b; folds LoRA d_x into d_att), ff_in (mlp_in,
+# d_gu → ff_in_d_a/_b), and ff_out (act, d_mlp → ff_out_d_a/_b), each folding its
+# LoRA d_x into the matching base grad so the upstream chain stays correct.
 struct _StreamPostBackLora(Copyable, Movable):
     var base: _StreamPostBack
     var d_x: TArc
     var d_att: TArc
-    var proj_d_a: List[Float32]
-    var proj_d_b: List[Float32]
+    var out_d_a: List[Float32]
+    var out_d_b: List[Float32]
+    var ff_in_d_a: List[Float32]
+    var ff_in_d_b: List[Float32]
+    var ff_out_d_a: List[Float32]
+    var ff_out_d_b: List[Float32]
 
     def __init__(
         out self, var base: _StreamPostBack,
         var d_x: TArc, var d_att: TArc,
-        var proj_d_a: List[Float32], var proj_d_b: List[Float32],
+        var out_d_a: List[Float32], var out_d_b: List[Float32],
+        var ff_in_d_a: List[Float32], var ff_in_d_b: List[Float32],
+        var ff_out_d_a: List[Float32], var ff_out_d_b: List[Float32],
     ):
         self.base = base^
         self.d_x = d_x^
         self.d_att = d_att^
-        self.proj_d_a = proj_d_a^
-        self.proj_d_b = proj_d_b^
+        self.out_d_a = out_d_a^
+        self.out_d_b = out_d_b^
+        self.ff_in_d_a = ff_in_d_a^
+        self.ff_in_d_b = ff_in_d_b^
+        self.ff_out_d_a = ff_out_d_a^
+        self.ff_out_d_b = ff_out_d_b^
 
 
 struct _StreamPostBackLoraTensors(Copyable, Movable):
     var base: _StreamPostBack
     var d_x: TArc
     var d_att: TArc
-    var proj_d_a: Optional[TArc]
-    var proj_d_b: Optional[TArc]
+    var out_d_a: Optional[TArc]
+    var out_d_b: Optional[TArc]
+    var ff_in_d_a: Optional[TArc]
+    var ff_in_d_b: Optional[TArc]
+    var ff_out_d_a: Optional[TArc]
+    var ff_out_d_b: Optional[TArc]
 
     def __init__(
         out self, var base: _StreamPostBack,
         var d_x: TArc, var d_att: TArc,
-        var proj_d_a: Optional[TArc], var proj_d_b: Optional[TArc],
+        var out_d_a: Optional[TArc], var out_d_b: Optional[TArc],
+        var ff_in_d_a: Optional[TArc], var ff_in_d_b: Optional[TArc],
+        var ff_out_d_a: Optional[TArc], var ff_out_d_b: Optional[TArc],
     ):
         self.base = base^
         self.d_x = d_x^
         self.d_att = d_att^
-        self.proj_d_a = proj_d_a^
-        self.proj_d_b = proj_d_b^
+        self.out_d_a = out_d_a^
+        self.out_d_b = out_d_b^
+        self.ff_in_d_a = ff_in_d_a^
+        self.ff_in_d_b = ff_in_d_b^
+        self.ff_out_d_a = ff_out_d_a^
+        self.ff_out_d_b = ff_out_d_b^
 
 
 def _stream_post_backward_lora_resident(
@@ -1358,6 +1580,7 @@ def _stream_post_backward_lora_resident(
     w: StreamWeights, mv: ModVecsDevice, lo: StreamLoraDevice, sv: StreamSaved,
     N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
     compute_aux_grads: Bool = True,
+    drop: StreamLoraDropout = StreamLoraDropout(),
 ) raises -> _StreamPostBackLora:
     var grg2: GateResidualGrads
     var d_gate2 = List[Float32]()
@@ -1374,11 +1597,32 @@ def _stream_post_backward_lora_resident(
     # frozen wd backward: d_x ONLY (base d_wd computed-then-discarded by trainer).
     var d_d_dx = linear_backward_dx(grg2.d_y, w.wd[], N, F, D, ctx)
 
+    # LoRA on ff.linear_out / ff_context.linear_out (input=act, d_y=grg2.d_y=d_mlp):
+    # ff_out_d_a/_b + d_act_lo (folded into the grad into act). Dropout-aware: same
+    # mask as forward regenerated bit-identically (LoRAModule.py:328); p==0 -> base.
+    var ff_out_d_a = List[Float32]()
+    var ff_out_d_b = List[Float32]()
+    if lo.ff_out:
+        var lg = _klein_lora_bwd_dropout(grg2.d_y, sv.act[], lo.ff_out.value(), N, drop.ff_out, ctx)
+        d_d_dx = add(d_d_dx, lg.d_x, ctx)
+        ff_out_d_a = lg.d_a.copy()
+        ff_out_d_b = lg.d_b.copy()
+
     var sgb = swiglu_backward(d_d_dx, sv.gate[], sv.up[], ctx)
     var d_gu = concat(1, ctx, sgb.d_gate, sgb.d_up)
 
     # frozen wgu backward: d_x ONLY (base d_wgu computed-then-discarded).
     var d_gu_dx = linear_backward_dx(d_gu, w.wgu[], N, D, 2 * F, ctx)
+
+    # LoRA on ff.linear_in / ff_context.linear_in (input=mlp_in, d_y=d_gu [N,2F]):
+    # ff_in_d_a/_b + d_mlp_in_lo (folded into the grad into mlp_in).
+    var ff_in_d_a = List[Float32]()
+    var ff_in_d_b = List[Float32]()
+    if lo.ff_in:
+        var lg = _klein_lora_bwd_dropout(d_gu, sv.mlp_in[], lo.ff_in.value(), N, drop.ff_in, ctx)
+        d_gu_dx = add(d_gu_dx, lg.d_x, ctx)
+        ff_in_d_a = lg.d_a.copy()
+        ff_in_d_b = lg.d_b.copy()
 
     var mb2 = modulate_backward(d_gu_dx, sv.ln2[], mv.scale2[], ctx, compute_aux_grads)
     var d_scale2 = List[Float32]()
@@ -1391,7 +1635,8 @@ def _stream_post_backward_lora_resident(
     var d_attn_res_total = TArc(add(grg2.d_x, d_attn_res_norm, ctx))
 
     # proj_out = linear(att, Wproj) [+ LoRA]. Recompute it only when d_gate1 is
-    # requested; d_x/d_y do not depend on the gated y value.
+    # requested; d_x/d_y do not depend on the gated y value. Dropout-aware so the
+    # recomputed proj_out matches the forward value (same mask, p==0 -> identity).
     var grg1: GateResidualGrads
     # Consume grg1 by to_host only (no field `^`-move out of the struct). d_y ->
     # host (LoRA bridge needs host); d_g -> host. d_x is just the incoming
@@ -1401,8 +1646,8 @@ def _stream_post_backward_lora_resident(
     if compute_aux_grads:
         var no_bias = Optional[Tensor](None)
         var proj_out = linear(att[], w.wproj[], no_bias^, ctx)
-        if lo.proj:
-            var dlt = klein_lora_fwd_device_resident(att[], lo.proj.value(), N, ctx)
+        if lo.out:
+            var dlt = _klein_lora_fwd_dropout(att[], lo.out.value(), N, drop.out, ctx)
             proj_out = add(proj_out, dlt, ctx)
         grg1 = gate_residual_backward(
             d_attn_res_total[], x[], mv.gate1[], proj_out, ctx
@@ -1416,14 +1661,14 @@ def _stream_post_backward_lora_resident(
     # frozen proj backward: d_x ONLY (base d_wproj computed-then-discarded).
     var d_att_t = linear_backward_dx(grg1.d_y, w.wproj[], N, D, D, ctx)
 
-    # LoRA backward on wproj (input=att, d_y=d_proj_out): proj_d_a/_b + d_att_lo
-    var proj_d_a = List[Float32]()
-    var proj_d_b = List[Float32]()
-    if lo.proj:
-        var lg = klein_lora_bwd_device_resident(grg1.d_y, att[], lo.proj.value(), N, ctx)
+    # LoRA backward on attn out-proj (input=att, d_y=d_proj_out): out_d_a/_b + d_att_lo
+    var out_d_a = List[Float32]()
+    var out_d_b = List[Float32]()
+    if lo.out:
+        var lg = _klein_lora_bwd_dropout(grg1.d_y, att[], lo.out.value(), N, drop.out, ctx)
         d_att_t = add(d_att_t, lg.d_x, ctx)   # LoRA contribution to projection input
-        proj_d_a = lg.d_a.copy()
-        proj_d_b = lg.d_b.copy()
+        out_d_a = lg.d_a.copy()
+        out_d_b = lg.d_b.copy()
 
     # d_wproj/d_wgu/d_wd are frozen-base grads (stripped above; LoRA path discards
     # them, base double gate still validates that exact d_w math) — empty placeholders.
@@ -1432,7 +1677,10 @@ def _stream_post_backward_lora_resident(
         d_gate1=d_gate1^,
         d_shift2=d_shift2^, d_scale2=d_scale2^, d_gate2=d_gate2^,
     )
-    return _StreamPostBackLora(base^, d_x_res_t^, TArc(d_att_t^), proj_d_a^, proj_d_b^)
+    return _StreamPostBackLora(
+        base^, d_x_res_t^, TArc(d_att_t^),
+        out_d_a^, out_d_b^, ff_in_d_a^, ff_in_d_b^, ff_out_d_a^, ff_out_d_b^,
+    )
 
 
 def _stream_post_backward_lora_resident_scratch(
@@ -1441,6 +1689,7 @@ def _stream_post_backward_lora_resident_scratch(
     N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
+    drop: StreamLoraDropout = StreamLoraDropout(),
 ) raises -> _StreamPostBackLora:
     var grg2: GateResidualGrads
     var d_gate2 = List[Float32]()
@@ -1457,12 +1706,28 @@ def _stream_post_backward_lora_resident_scratch(
     var post_mark = scratch.mark()
     var d_d_dx = linear_backward_dx_scratch(grg2.d_y, w.wd[], N, F, D, ctx, scratch)
 
+    var ff_out_d_a = List[Float32]()
+    var ff_out_d_b = List[Float32]()
+    if lo.ff_out:
+        var lg = _klein_lora_bwd_dropout(grg2.d_y, sv.act[], lo.ff_out.value(), N, drop.ff_out, ctx)
+        d_d_dx = add(d_d_dx, lg.d_x, ctx)
+        ff_out_d_a = lg.d_a.copy()
+        ff_out_d_b = lg.d_b.copy()
+
     var sgb = swiglu_backward(d_d_dx, sv.gate[], sv.up[], ctx)
     var d_gu = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
 
     var d_gu_dx = linear_backward_dx_scratch(
         d_gu, w.wgu[], N, D, 2 * F, ctx, scratch,
     )
+
+    var ff_in_d_a = List[Float32]()
+    var ff_in_d_b = List[Float32]()
+    if lo.ff_in:
+        var lg = _klein_lora_bwd_dropout(d_gu, sv.mlp_in[], lo.ff_in.value(), N, drop.ff_in, ctx)
+        d_gu_dx = add(d_gu_dx, lg.d_x, ctx)
+        ff_in_d_a = lg.d_a.copy()
+        ff_in_d_b = lg.d_b.copy()
 
     var mb2 = modulate_backward(d_gu_dx, sv.ln2[], mv.scale2[], ctx, compute_aux_grads)
     var d_scale2 = List[Float32]()
@@ -1480,8 +1745,8 @@ def _stream_post_backward_lora_resident_scratch(
     if compute_aux_grads:
         var no_bias = Optional[Tensor](None)
         var proj_out = linear(att[], w.wproj[], no_bias^, ctx)
-        if lo.proj:
-            var dlt = klein_lora_fwd_device_resident(att[], lo.proj.value(), N, ctx)
+        if lo.out:
+            var dlt = _klein_lora_fwd_dropout(att[], lo.out.value(), N, drop.out, ctx)
             proj_out = add(proj_out, dlt, ctx)
         grg1 = gate_residual_backward(
             d_attn_res_total[], x[], mv.gate1[], proj_out, ctx
@@ -1494,20 +1759,23 @@ def _stream_post_backward_lora_resident_scratch(
 
     var d_att_t = linear_backward_dx(grg1.d_y, w.wproj[], N, D, D, ctx)
 
-    var proj_d_a = List[Float32]()
-    var proj_d_b = List[Float32]()
-    if lo.proj:
-        var lg = klein_lora_bwd_device_resident(grg1.d_y, att[], lo.proj.value(), N, ctx)
+    var out_d_a = List[Float32]()
+    var out_d_b = List[Float32]()
+    if lo.out:
+        var lg = _klein_lora_bwd_dropout(grg1.d_y, att[], lo.out.value(), N, drop.out, ctx)
         d_att_t = add(d_att_t, lg.d_x, ctx)
-        proj_d_a = lg.d_a.copy()
-        proj_d_b = lg.d_b.copy()
+        out_d_a = lg.d_a.copy()
+        out_d_b = lg.d_b.copy()
 
     var base = _StreamPostBack(
         d_x_res^, List[Float32](), List[Float32](), List[Float32](), List[Float32](),
         d_gate1=d_gate1^,
         d_shift2=d_shift2^, d_scale2=d_scale2^, d_gate2=d_gate2^,
     )
-    return _StreamPostBackLora(base^, d_x_res_t^, TArc(d_att_t^), proj_d_a^, proj_d_b^)
+    return _StreamPostBackLora(
+        base^, d_x_res_t^, TArc(d_att_t^),
+        out_d_a^, out_d_b^, ff_in_d_a^, ff_in_d_b^, ff_out_d_a^, ff_out_d_b^,
+    )
 
 
 def _stream_post_backward_lora_resident_scratch_tensors(
@@ -1516,6 +1784,7 @@ def _stream_post_backward_lora_resident_scratch_tensors(
     N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
+    drop: StreamLoraDropout = StreamLoraDropout(),
 ) raises -> _StreamPostBackLoraTensors:
     var grg2: GateResidualGrads
     var d_gate2 = List[Float32]()
@@ -1532,12 +1801,28 @@ def _stream_post_backward_lora_resident_scratch_tensors(
     var post_mark = scratch.mark()
     var d_d_dx = linear_backward_dx_scratch(grg2.d_y, w.wd[], N, F, D, ctx, scratch)
 
+    var ff_out_d_a = Optional[TArc](None)
+    var ff_out_d_b = Optional[TArc](None)
+    if lo.ff_out:
+        var lg = _klein_lora_bwd_dropout_tensors(grg2.d_y, sv.act[], lo.ff_out.value(), N, drop.ff_out, ctx)
+        d_d_dx = add(d_d_dx, lg.d_x[], ctx)
+        ff_out_d_a = Optional[TArc](lg.d_a.copy())
+        ff_out_d_b = Optional[TArc](lg.d_b.copy())
+
     var sgb = swiglu_backward(d_d_dx, sv.gate[], sv.up[], ctx)
     var d_gu = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
 
     var d_gu_dx = linear_backward_dx_scratch(
         d_gu, w.wgu[], N, D, 2 * F, ctx, scratch,
     )
+
+    var ff_in_d_a = Optional[TArc](None)
+    var ff_in_d_b = Optional[TArc](None)
+    if lo.ff_in:
+        var lg = _klein_lora_bwd_dropout_tensors(d_gu, sv.mlp_in[], lo.ff_in.value(), N, drop.ff_in, ctx)
+        d_gu_dx = add(d_gu_dx, lg.d_x[], ctx)
+        ff_in_d_a = Optional[TArc](lg.d_a.copy())
+        ff_in_d_b = Optional[TArc](lg.d_b.copy())
 
     var mb2 = modulate_backward(d_gu_dx, sv.ln2[], mv.scale2[], ctx, compute_aux_grads)
     var d_scale2 = List[Float32]()
@@ -1555,8 +1840,8 @@ def _stream_post_backward_lora_resident_scratch_tensors(
     if compute_aux_grads:
         var no_bias = Optional[Tensor](None)
         var proj_out = linear(att[], w.wproj[], no_bias^, ctx)
-        if lo.proj:
-            var dlt = klein_lora_fwd_device_resident(att[], lo.proj.value(), N, ctx)
+        if lo.out:
+            var dlt = _klein_lora_fwd_dropout(att[], lo.out.value(), N, drop.out, ctx)
             proj_out = add(proj_out, dlt, ctx)
         grg1 = gate_residual_backward(
             d_attn_res_total[], x[], mv.gate1[], proj_out, ctx
@@ -1569,60 +1854,84 @@ def _stream_post_backward_lora_resident_scratch_tensors(
 
     var d_att_t = linear_backward_dx(grg1.d_y, w.wproj[], N, D, D, ctx)
 
-    var proj_d_a = Optional[TArc](None)
-    var proj_d_b = Optional[TArc](None)
-    if lo.proj:
-        var lg = klein_lora_bwd_device_resident_tensors(
-            grg1.d_y, att[], lo.proj.value(), N, ctx
+    var out_d_a = Optional[TArc](None)
+    var out_d_b = Optional[TArc](None)
+    if lo.out:
+        var lg = _klein_lora_bwd_dropout_tensors(
+            grg1.d_y, att[], lo.out.value(), N, drop.out, ctx
         )
         d_att_t = add(d_att_t, lg.d_x[], ctx)
-        proj_d_a = Optional[TArc](lg.d_a.copy())
-        proj_d_b = Optional[TArc](lg.d_b.copy())
+        out_d_a = Optional[TArc](lg.d_a.copy())
+        out_d_b = Optional[TArc](lg.d_b.copy())
 
     var base = _StreamPostBack(
         d_x_res^, List[Float32](), List[Float32](), List[Float32](), List[Float32](),
         d_gate1=d_gate1^,
         d_shift2=d_shift2^, d_scale2=d_scale2^, d_gate2=d_gate2^,
     )
-    return _StreamPostBackLoraTensors(base^, d_x_res_t^, TArc(d_att_t^), proj_d_a^, proj_d_b^)
+    return _StreamPostBackLoraTensors(
+        base^, d_x_res_t^, TArc(d_att_t^),
+        out_d_a^, out_d_b^, ff_in_d_a^, ff_in_d_b^, ff_out_d_a^, ff_out_d_b^,
+    )
 
 
 # ── LoRA-aware per-stream PRE backward ───────────────────────────────────────
-# Mirrors _stream_pre_backward; additionally, when the qkv adapter is present,
-# runs klein_lora_bwd at the wqkv output (d_qkv, input=norm) → qkv_d_a/_b and
-# adds the LoRA d_x into d_norm (so d_x via layer_norm is correct).
+# Mirrors _stream_pre_backward; additionally runs SEPARATE q/k/v LoRA backward,
+# each at its own column band of the wqkv-output grad (q→d_q_pre_flat,
+# k→d_k_pre_flat, v→d_v_flat, input=norm) → q/k/v_d_a/_b, folding each LoRA d_x
+# into d_norm (so d_x via layer_norm is correct).
 struct _StreamPreBackLora(Copyable, Movable):
     var base: _StreamPreBack
     var d_x: TArc
-    var qkv_d_a: List[Float32]
-    var qkv_d_b: List[Float32]
+    var q_d_a: List[Float32]
+    var q_d_b: List[Float32]
+    var k_d_a: List[Float32]
+    var k_d_b: List[Float32]
+    var v_d_a: List[Float32]
+    var v_d_b: List[Float32]
 
     def __init__(
         out self, var base: _StreamPreBack,
         var d_x: TArc,
-        var qkv_d_a: List[Float32], var qkv_d_b: List[Float32],
+        var q_d_a: List[Float32], var q_d_b: List[Float32],
+        var k_d_a: List[Float32], var k_d_b: List[Float32],
+        var v_d_a: List[Float32], var v_d_b: List[Float32],
     ):
         self.base = base^
         self.d_x = d_x^
-        self.qkv_d_a = qkv_d_a^
-        self.qkv_d_b = qkv_d_b^
+        self.q_d_a = q_d_a^
+        self.q_d_b = q_d_b^
+        self.k_d_a = k_d_a^
+        self.k_d_b = k_d_b^
+        self.v_d_a = v_d_a^
+        self.v_d_b = v_d_b^
 
 
 struct _StreamPreBackLoraTensors(Copyable, Movable):
     var base: _StreamPreBack
     var d_x: TArc
-    var qkv_d_a: Optional[TArc]
-    var qkv_d_b: Optional[TArc]
+    var q_d_a: Optional[TArc]
+    var q_d_b: Optional[TArc]
+    var k_d_a: Optional[TArc]
+    var k_d_b: Optional[TArc]
+    var v_d_a: Optional[TArc]
+    var v_d_b: Optional[TArc]
 
     def __init__(
         out self, var base: _StreamPreBack,
         var d_x: TArc,
-        var qkv_d_a: Optional[TArc], var qkv_d_b: Optional[TArc],
+        var q_d_a: Optional[TArc], var q_d_b: Optional[TArc],
+        var k_d_a: Optional[TArc], var k_d_b: Optional[TArc],
+        var v_d_a: Optional[TArc], var v_d_b: Optional[TArc],
     ):
         self.base = base^
         self.d_x = d_x^
-        self.qkv_d_a = qkv_d_a^
-        self.qkv_d_b = qkv_d_b^
+        self.q_d_a = q_d_a^
+        self.q_d_b = q_d_b^
+        self.k_d_a = k_d_a^
+        self.k_d_b = k_d_b^
+        self.v_d_a = v_d_a^
+        self.v_d_b = v_d_b^
 
 
 def _stream_pre_backward_lora_resident[
@@ -1632,6 +1941,7 @@ def _stream_pre_backward_lora_resident[
     w: StreamWeights, mv: ModVecsDevice, lo: StreamLoraDevice, sv: StreamSaved,
     N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
     compute_aux_grads: Bool = True,
+    drop: StreamLoraDropout = StreamLoraDropout(),
 ) raises -> _StreamPreBackLora:
     var d_q_pre = rms_norm_backward_dx(d_q_rms, sv.q_pre[], w.q_norm[], eps, ctx)
     var d_q_norm = List[Float32]()
@@ -1647,14 +1957,31 @@ def _stream_pre_backward_lora_resident[
         d_qkv, w.wqkv[], N, D, 3 * D, ctx,
     )
 
-    # LoRA backward on wqkv (input=norm, d_y=d_qkv): qkv_d_a/_b + d_norm_lo
-    var qkv_d_a = List[Float32]()
-    var qkv_d_b = List[Float32]()
-    if lo.qkv:
-        var lg = klein_lora_bwd_device_resident(d_qkv, sv.norm[], lo.qkv.value(), N, ctx)
+    # SEPARATE q/k/v LoRA backward (OneTrainer to_q/to_k/to_v, add_q/k/v_proj).
+    # Each adapter's d_y is its OWN column band of d_qkv (q→[N,D] d_q_pre_flat,
+    # k→d_k_pre_flat, v→d_v_flat), input=sv.norm; each LoRA d_x folds into d_norm.
+    # Dropout-aware (LoRAModule.py:328); p==0 -> base klein_lora_bwd_device_resident.
+    var q_d_a = List[Float32]()
+    var q_d_b = List[Float32]()
+    var k_d_a = List[Float32]()
+    var k_d_b = List[Float32]()
+    var v_d_a = List[Float32]()
+    var v_d_b = List[Float32]()
+    if lo.q:
+        var lg = _klein_lora_bwd_dropout(d_q_pre_flat, sv.norm[], lo.q.value(), N, drop.q, ctx)
         d_norm_t = add(d_norm_t, lg.d_x, ctx)
-        qkv_d_a = lg.d_a.copy()
-        qkv_d_b = lg.d_b.copy()
+        q_d_a = lg.d_a.copy()
+        q_d_b = lg.d_b.copy()
+    if lo.k:
+        var lg = _klein_lora_bwd_dropout(d_k_pre_flat, sv.norm[], lo.k.value(), N, drop.k, ctx)
+        d_norm_t = add(d_norm_t, lg.d_x, ctx)
+        k_d_a = lg.d_a.copy()
+        k_d_b = lg.d_b.copy()
+    if lo.v:
+        var lg = _klein_lora_bwd_dropout(d_v_flat, sv.norm[], lo.v.value(), N, drop.v, ctx)
+        d_norm_t = add(d_norm_t, lg.d_x, ctx)
+        v_d_a = lg.d_a.copy()
+        v_d_b = lg.d_b.copy()
 
     var mb1 = modulate_backward(d_norm_t, sv.ln1[], mv.scale1[], ctx, compute_aux_grads)
     var d_scale1 = List[Float32]()
@@ -1670,7 +1997,7 @@ def _stream_pre_backward_lora_resident[
     var base = _StreamPreBack(
         d_x_norm^, List[Float32](), d_q_norm^, d_k_norm^, d_shift1^, d_scale1^
     )
-    return _StreamPreBackLora(base^, d_x_norm_arc^, qkv_d_a^, qkv_d_b^)
+    return _StreamPreBackLora(base^, d_x_norm_arc^, q_d_a^, q_d_b^, k_d_a^, k_d_b^, v_d_a^, v_d_b^)
 
 
 def _stream_pre_backward_lora_resident_scratch[
@@ -1681,6 +2008,7 @@ def _stream_pre_backward_lora_resident_scratch[
     N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
+    drop: StreamLoraDropout = StreamLoraDropout(),
 ) raises -> _StreamPreBackLora:
     var scratch_mark = scratch.mark()
     var d_q_pre = rms_norm_backward_dx(d_q_rms, sv.q_pre[], w.q_norm[], eps, ctx)
@@ -1696,13 +2024,29 @@ def _stream_pre_backward_lora_resident_scratch[
         d_qkv, w.wqkv[], N, D, 3 * D, ctx, scratch,
     )
 
-    var qkv_d_a = List[Float32]()
-    var qkv_d_b = List[Float32]()
-    if lo.qkv:
-        var lg = klein_lora_bwd_device_resident(d_qkv, sv.norm[], lo.qkv.value(), N, ctx)
+    # SEPARATE q/k/v LoRA backward (see resident variant for the OneTrainer mapping).
+    # Dropout-aware (LoRAModule.py:328); p==0 -> base klein_lora_bwd_device_resident.
+    var q_d_a = List[Float32]()
+    var q_d_b = List[Float32]()
+    var k_d_a = List[Float32]()
+    var k_d_b = List[Float32]()
+    var v_d_a = List[Float32]()
+    var v_d_b = List[Float32]()
+    if lo.q:
+        var lg = _klein_lora_bwd_dropout(d_q_pre_flat, sv.norm[], lo.q.value(), N, drop.q, ctx)
         d_norm_t = add(d_norm_t, lg.d_x, ctx)
-        qkv_d_a = lg.d_a.copy()
-        qkv_d_b = lg.d_b.copy()
+        q_d_a = lg.d_a.copy()
+        q_d_b = lg.d_b.copy()
+    if lo.k:
+        var lg = _klein_lora_bwd_dropout(d_k_pre_flat, sv.norm[], lo.k.value(), N, drop.k, ctx)
+        d_norm_t = add(d_norm_t, lg.d_x, ctx)
+        k_d_a = lg.d_a.copy()
+        k_d_b = lg.d_b.copy()
+    if lo.v:
+        var lg = _klein_lora_bwd_dropout(d_v_flat, sv.norm[], lo.v.value(), N, drop.v, ctx)
+        d_norm_t = add(d_norm_t, lg.d_x, ctx)
+        v_d_a = lg.d_a.copy()
+        v_d_b = lg.d_b.copy()
 
     var mb1 = modulate_backward(d_norm_t, sv.ln1[], mv.scale1[], ctx, compute_aux_grads)
     var d_scale1 = List[Float32]()
@@ -1717,7 +2061,9 @@ def _stream_pre_backward_lora_resident_scratch[
     var base = _StreamPreBack(
         d_x_norm^, List[Float32](), d_q_norm^, d_k_norm^, d_shift1^, d_scale1^
     )
-    var out = _StreamPreBackLora(base^, d_x_norm_arc^, qkv_d_a^, qkv_d_b^)
+    var out = _StreamPreBackLora(
+        base^, d_x_norm_arc^, q_d_a^, q_d_b^, k_d_a^, k_d_b^, v_d_a^, v_d_b^,
+    )
     scratch.rewind(scratch_mark)
     return out^
 
@@ -1730,6 +2076,7 @@ def _stream_pre_backward_lora_resident_scratch_tensors[
     N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
+    drop: StreamLoraDropout = StreamLoraDropout(),
 ) raises -> _StreamPreBackLoraTensors:
     var scratch_mark = scratch.mark()
     var d_q_pre = rms_norm_backward_dx(d_q_rms, sv.q_pre[], w.q_norm[], eps, ctx)
@@ -1745,15 +2092,29 @@ def _stream_pre_backward_lora_resident_scratch_tensors[
         d_qkv, w.wqkv[], N, D, 3 * D, ctx, scratch,
     )
 
-    var qkv_d_a = Optional[TArc](None)
-    var qkv_d_b = Optional[TArc](None)
-    if lo.qkv:
-        var lg = klein_lora_bwd_device_resident_tensors(
-            d_qkv, sv.norm[], lo.qkv.value(), N, ctx
-        )
+    # SEPARATE q/k/v LoRA backward (device-tensor grads kept on device).
+    # Dropout-aware (LoRAModule.py:328); p==0 -> base klein_lora_bwd_device_resident_tensors.
+    var q_d_a = Optional[TArc](None)
+    var q_d_b = Optional[TArc](None)
+    var k_d_a = Optional[TArc](None)
+    var k_d_b = Optional[TArc](None)
+    var v_d_a = Optional[TArc](None)
+    var v_d_b = Optional[TArc](None)
+    if lo.q:
+        var lg = _klein_lora_bwd_dropout_tensors(d_q_pre_flat, sv.norm[], lo.q.value(), N, drop.q, ctx)
         d_norm_t = add(d_norm_t, lg.d_x[], ctx)
-        qkv_d_a = Optional[TArc](lg.d_a.copy())
-        qkv_d_b = Optional[TArc](lg.d_b.copy())
+        q_d_a = Optional[TArc](lg.d_a.copy())
+        q_d_b = Optional[TArc](lg.d_b.copy())
+    if lo.k:
+        var lg = _klein_lora_bwd_dropout_tensors(d_k_pre_flat, sv.norm[], lo.k.value(), N, drop.k, ctx)
+        d_norm_t = add(d_norm_t, lg.d_x[], ctx)
+        k_d_a = Optional[TArc](lg.d_a.copy())
+        k_d_b = Optional[TArc](lg.d_b.copy())
+    if lo.v:
+        var lg = _klein_lora_bwd_dropout_tensors(d_v_flat, sv.norm[], lo.v.value(), N, drop.v, ctx)
+        d_norm_t = add(d_norm_t, lg.d_x[], ctx)
+        v_d_a = Optional[TArc](lg.d_a.copy())
+        v_d_b = Optional[TArc](lg.d_b.copy())
 
     var mb1 = modulate_backward(d_norm_t, sv.ln1[], mv.scale1[], ctx, compute_aux_grads)
     var d_scale1 = List[Float32]()
@@ -1768,7 +2129,9 @@ def _stream_pre_backward_lora_resident_scratch_tensors[
     var base = _StreamPreBack(
         d_x_norm^, List[Float32](), d_q_norm^, d_k_norm^, d_shift1^, d_scale1^
     )
-    var out = _StreamPreBackLoraTensors(base^, d_x_norm_arc^, qkv_d_a^, qkv_d_b^)
+    var out = _StreamPreBackLoraTensors(
+        base^, d_x_norm_arc^, q_d_a^, q_d_b^, k_d_a^, k_d_b^, v_d_a^, v_d_b^,
+    )
     scratch.rewind(scratch_mark)
     return out^
 
@@ -1784,17 +2147,18 @@ def double_block_lora_backward_device_resident[
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
     compute_aux_grads: Bool = True,
+    drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
 ) raises -> DoubleBlockLoraDeviceGrads:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
-    var ones_t = _t(_ones(D), [D], ctx)
+    var ones_t = _t_dtype(_ones(D), [D], saved.img.x[].dtype(), ctx)
 
     var ipb = _stream_post_backward_lora_resident(
         d_io_t, saved.img.x, saved.img.att, w.img, img_mod, lora.img, saved.img,
-        N_IMG, D, F, eps, ones_t, ctx, compute_aux_grads,
+        N_IMG, D, F, eps, ones_t, ctx, compute_aux_grads, drop.img,
     )
     var tpb = _stream_post_backward_lora_resident(
         d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, lora.txt, saved.txt,
-        N_TXT, D, F, eps, ones_t, ctx, compute_aux_grads,
+        N_TXT, D, F, eps, ones_t, ctx, compute_aux_grads, drop.txt,
     )
 
     # d_att per stream stays device-resident; reshape [N,D] -> [1,N,H,Dh] is
@@ -1818,11 +2182,11 @@ def double_block_lora_backward_device_resident[
 
     var iprb = _stream_pre_backward_lora_resident[H, Dh](
         cq.d_1, ck.d_1, cv.d_1, w.img, img_mod, lora.img, saved.img,
-        N_IMG, D, eps, ones_t, ctx, compute_aux_grads,
+        N_IMG, D, eps, ones_t, ctx, compute_aux_grads, drop.img,
     )
     var tprb = _stream_pre_backward_lora_resident[H, Dh](
         cq.d_0, ck.d_0, cv.d_0, w.txt, txt_mod, lora.txt, saved.txt,
-        N_TXT, D, eps, ones_t, ctx, compute_aux_grads,
+        N_TXT, D, eps, ones_t, ctx, compute_aux_grads, drop.txt,
     )
 
     var d_img_x_t = TArc(add(ipb.d_x[], iprb.d_x[], ctx))
@@ -1832,13 +2196,17 @@ def double_block_lora_backward_device_resident[
         d_img_x_t^,
         iprb.base.d_shift1.copy(), iprb.base.d_scale1.copy(), ipb.base.d_gate1.copy(),
         ipb.base.d_shift2.copy(), ipb.base.d_scale2.copy(), ipb.base.d_gate2.copy(),
-        iprb.qkv_d_a.copy(), iprb.qkv_d_b.copy(), ipb.proj_d_a.copy(), ipb.proj_d_b.copy(),
+        iprb.q_d_a.copy(), iprb.q_d_b.copy(), iprb.k_d_a.copy(), iprb.k_d_b.copy(),
+        iprb.v_d_a.copy(), iprb.v_d_b.copy(), ipb.out_d_a.copy(), ipb.out_d_b.copy(),
+        ipb.ff_in_d_a.copy(), ipb.ff_in_d_b.copy(), ipb.ff_out_d_a.copy(), ipb.ff_out_d_b.copy(),
     )
     var txt_grads = StreamLoraDeviceGrads(
         d_txt_x_t^,
         tprb.base.d_shift1.copy(), tprb.base.d_scale1.copy(), tpb.base.d_gate1.copy(),
         tpb.base.d_shift2.copy(), tpb.base.d_scale2.copy(), tpb.base.d_gate2.copy(),
-        tprb.qkv_d_a.copy(), tprb.qkv_d_b.copy(), tpb.proj_d_a.copy(), tpb.proj_d_b.copy(),
+        tprb.q_d_a.copy(), tprb.q_d_b.copy(), tprb.k_d_a.copy(), tprb.k_d_b.copy(),
+        tprb.v_d_a.copy(), tprb.v_d_b.copy(), tpb.out_d_a.copy(), tpb.out_d_b.copy(),
+        tpb.ff_in_d_a.copy(), tpb.ff_in_d_b.copy(), tpb.ff_out_d_a.copy(), tpb.ff_out_d_b.copy(),
     )
     return DoubleBlockLoraDeviceGrads(img_grads^, txt_grads^)
 
@@ -1855,17 +2223,18 @@ def double_block_lora_backward_device_resident_scratch[
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
+    drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
 ) raises -> DoubleBlockLoraDeviceGrads:
     var scratch_mark = scratch.mark()
     var scale = Float32(1.0) / sqrt(Float32(Dh))
 
     var ipb = _stream_post_backward_lora_resident_scratch(
         d_io_t, saved.img.x, saved.img.att, w.img, img_mod, lora.img, saved.img,
-        N_IMG, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
+        N_IMG, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.img,
     )
     var tpb = _stream_post_backward_lora_resident_scratch(
         d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, lora.txt, saved.txt,
-        N_TXT, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
+        N_TXT, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.txt,
     )
 
     var d_tatt_4d = reshape(tpb.d_att[], [1, N_TXT, H, Dh], ctx)
@@ -1890,11 +2259,11 @@ def double_block_lora_backward_device_resident_scratch[
 
     var iprb = _stream_pre_backward_lora_resident_scratch[H, Dh](
         d_img_q, d_img_k, d_img_v, w.img, img_mod, lora.img, saved.img,
-        N_IMG, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
+        N_IMG, D, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.img,
     )
     var tprb = _stream_pre_backward_lora_resident_scratch[H, Dh](
         d_txt_q, d_txt_k, d_txt_v, w.txt, txt_mod, lora.txt, saved.txt,
-        N_TXT, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
+        N_TXT, D, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.txt,
     )
 
     var d_img_x_t = TArc(add(ipb.d_x[], iprb.d_x[], ctx))
@@ -1904,13 +2273,17 @@ def double_block_lora_backward_device_resident_scratch[
         d_img_x_t^,
         iprb.base.d_shift1.copy(), iprb.base.d_scale1.copy(), ipb.base.d_gate1.copy(),
         ipb.base.d_shift2.copy(), ipb.base.d_scale2.copy(), ipb.base.d_gate2.copy(),
-        iprb.qkv_d_a.copy(), iprb.qkv_d_b.copy(), ipb.proj_d_a.copy(), ipb.proj_d_b.copy(),
+        iprb.q_d_a.copy(), iprb.q_d_b.copy(), iprb.k_d_a.copy(), iprb.k_d_b.copy(),
+        iprb.v_d_a.copy(), iprb.v_d_b.copy(), ipb.out_d_a.copy(), ipb.out_d_b.copy(),
+        ipb.ff_in_d_a.copy(), ipb.ff_in_d_b.copy(), ipb.ff_out_d_a.copy(), ipb.ff_out_d_b.copy(),
     )
     var txt_grads = StreamLoraDeviceGrads(
         d_txt_x_t^,
         tprb.base.d_shift1.copy(), tprb.base.d_scale1.copy(), tpb.base.d_gate1.copy(),
         tpb.base.d_shift2.copy(), tpb.base.d_scale2.copy(), tpb.base.d_gate2.copy(),
-        tprb.qkv_d_a.copy(), tprb.qkv_d_b.copy(), tpb.proj_d_a.copy(), tpb.proj_d_b.copy(),
+        tprb.q_d_a.copy(), tprb.q_d_b.copy(), tprb.k_d_a.copy(), tprb.k_d_b.copy(),
+        tprb.v_d_a.copy(), tprb.v_d_b.copy(), tpb.out_d_a.copy(), tpb.out_d_b.copy(),
+        tpb.ff_in_d_a.copy(), tpb.ff_in_d_b.copy(), tpb.ff_out_d_a.copy(), tpb.ff_out_d_b.copy(),
     )
     var out = DoubleBlockLoraDeviceGrads(img_grads^, txt_grads^)
     scratch.rewind(scratch_mark)
@@ -1929,17 +2302,18 @@ def double_block_lora_backward_device_resident_scratch_tensors[
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
+    drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
 ) raises -> DoubleBlockLoraDeviceGradTensors:
     var scratch_mark = scratch.mark()
     var scale = Float32(1.0) / sqrt(Float32(Dh))
 
     var ipb = _stream_post_backward_lora_resident_scratch_tensors(
         d_io_t, saved.img.x, saved.img.att, w.img, img_mod, lora.img, saved.img,
-        N_IMG, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
+        N_IMG, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.img,
     )
     var tpb = _stream_post_backward_lora_resident_scratch_tensors(
         d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, lora.txt, saved.txt,
-        N_TXT, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
+        N_TXT, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.txt,
     )
 
     var d_tatt_4d = reshape(tpb.d_att[], [1, N_TXT, H, Dh], ctx)
@@ -1964,11 +2338,11 @@ def double_block_lora_backward_device_resident_scratch_tensors[
 
     var iprb = _stream_pre_backward_lora_resident_scratch_tensors[H, Dh](
         d_img_q, d_img_k, d_img_v, w.img, img_mod, lora.img, saved.img,
-        N_IMG, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
+        N_IMG, D, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.img,
     )
     var tprb = _stream_pre_backward_lora_resident_scratch_tensors[H, Dh](
         d_txt_q, d_txt_k, d_txt_v, w.txt, txt_mod, lora.txt, saved.txt,
-        N_TXT, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
+        N_TXT, D, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.txt,
     )
 
     var d_img_x_t = TArc(add(ipb.d_x[], iprb.d_x[], ctx))
@@ -1978,13 +2352,17 @@ def double_block_lora_backward_device_resident_scratch_tensors[
         d_img_x_t^,
         iprb.base.d_shift1.copy(), iprb.base.d_scale1.copy(), ipb.base.d_gate1.copy(),
         ipb.base.d_shift2.copy(), ipb.base.d_scale2.copy(), ipb.base.d_gate2.copy(),
-        iprb.qkv_d_a.copy(), iprb.qkv_d_b.copy(), ipb.proj_d_a.copy(), ipb.proj_d_b.copy(),
+        iprb.q_d_a.copy(), iprb.q_d_b.copy(), iprb.k_d_a.copy(), iprb.k_d_b.copy(),
+        iprb.v_d_a.copy(), iprb.v_d_b.copy(), ipb.out_d_a.copy(), ipb.out_d_b.copy(),
+        ipb.ff_in_d_a.copy(), ipb.ff_in_d_b.copy(), ipb.ff_out_d_a.copy(), ipb.ff_out_d_b.copy(),
     )
     var txt_grads = StreamLoraDeviceGradTensors(
         d_txt_x_t^,
         tprb.base.d_shift1.copy(), tprb.base.d_scale1.copy(), tpb.base.d_gate1.copy(),
         tpb.base.d_shift2.copy(), tpb.base.d_scale2.copy(), tpb.base.d_gate2.copy(),
-        tprb.qkv_d_a.copy(), tprb.qkv_d_b.copy(), tpb.proj_d_a.copy(), tpb.proj_d_b.copy(),
+        tprb.q_d_a.copy(), tprb.q_d_b.copy(), tprb.k_d_a.copy(), tprb.k_d_b.copy(),
+        tprb.v_d_a.copy(), tprb.v_d_b.copy(), tpb.out_d_a.copy(), tpb.out_d_b.copy(),
+        tpb.ff_in_d_a.copy(), tpb.ff_in_d_b.copy(), tpb.ff_out_d_a.copy(), tpb.ff_out_d_b.copy(),
     )
     var out = DoubleBlockLoraDeviceGradTensors(img_grads^, txt_grads^)
     scratch.rewind(scratch_mark)
@@ -2001,11 +2379,12 @@ def double_block_lora_backward_device[
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
     compute_aux_grads: Bool = True,
+    drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
 ) raises -> DoubleBlockLoraDeviceGrads:
     var lora_dev = double_block_lora_to_device(lora, ctx)
     return double_block_lora_backward_device_resident[H, Dh, N_IMG, N_TXT, S](
         d_io_t, d_to_t, w, img_mod, txt_mod, lora_dev, saved,
-        cos, sin, D, F, eps, ctx, compute_aux_grads,
+        cos, sin, D, F, eps, ctx, compute_aux_grads, drop,
     )
 
 
@@ -2041,11 +2420,19 @@ def double_block_lora_backward[
     )
     var base_grads = DoubleBlockGrads(img_grads^, txt_grads^)
     var img_lora = StreamLoraGrads(
-        dg.img.qkv_d_a.copy(), dg.img.qkv_d_b.copy(),
-        dg.img.proj_d_a.copy(), dg.img.proj_d_b.copy(),
+        dg.img.q_d_a.copy(), dg.img.q_d_b.copy(),
+        dg.img.k_d_a.copy(), dg.img.k_d_b.copy(),
+        dg.img.v_d_a.copy(), dg.img.v_d_b.copy(),
+        dg.img.out_d_a.copy(), dg.img.out_d_b.copy(),
+        dg.img.ff_in_d_a.copy(), dg.img.ff_in_d_b.copy(),
+        dg.img.ff_out_d_a.copy(), dg.img.ff_out_d_b.copy(),
     )
     var txt_lora = StreamLoraGrads(
-        dg.txt.qkv_d_a.copy(), dg.txt.qkv_d_b.copy(),
-        dg.txt.proj_d_a.copy(), dg.txt.proj_d_b.copy(),
+        dg.txt.q_d_a.copy(), dg.txt.q_d_b.copy(),
+        dg.txt.k_d_a.copy(), dg.txt.k_d_b.copy(),
+        dg.txt.v_d_a.copy(), dg.txt.v_d_b.copy(),
+        dg.txt.out_d_a.copy(), dg.txt.out_d_b.copy(),
+        dg.txt.ff_in_d_a.copy(), dg.txt.ff_in_d_b.copy(),
+        dg.txt.ff_out_d_a.copy(), dg.txt.ff_out_d_b.copy(),
     )
     return DoubleBlockLoraGrads(base_grads^, img_lora^, txt_lora^)

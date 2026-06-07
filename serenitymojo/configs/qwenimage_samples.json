@@ -1,0 +1,27 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "save_before_sample": true,
+    "precache_required": true,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 20,
+    "cfg": 4.0,
+    "seed": 42,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "qwen_portrait_daylight",
+      "prompt": "trigger word, high-resolution portrait, daylight, natural background",
+      "caps": {
+        "positive": "/path/to/precache/qwen_portrait_daylight_pos.safetensors",
+        "negative": "/path/to/precache/qwen_portrait_daylight_neg.safetensors"
+      }
+    }
+  ]
+}

@@ -58,6 +58,8 @@ def main() raises:
     var cond = Tensor.from_host(cond_vals, sh.copy(), STDtype.BF16, ctx)
     var uncond = Tensor.from_host(uncond_vals, sh.copy(), STDtype.BF16, ctx)
     var cfg = ernie_cfg(cond, uncond, 2.0, ctx)
+    if cfg.dtype() != STDtype.BF16:
+        raise Error("ERNIE CFG changed tensor dtype")
     var cfg_host = cfg.to_host(ctx)
     _check_close(String("cfg[0]"), cfg_host[0], 3.0, 0.0001)
     _check_close(String("cfg[1]"), cfg_host[1], 7.0, 0.0001)
@@ -72,6 +74,8 @@ def main() raises:
     var velocity = Tensor.from_host(vel_vals, sh^, STDtype.BF16, ctx)
     var tiny_sched = ErnieFlowMatchScheduler(2, 3.0)
     var stepped = tiny_sched.step(latent, velocity, 0, ctx)
+    if stepped.dtype() != STDtype.BF16:
+        raise Error("ERNIE Euler step changed tensor dtype")
     var stepped_host = stepped.to_host(ctx)
     _check_close(String("step[0]"), stepped_host[0], 0.25, 0.0001)
     _check_close(String("step[1]"), stepped_host[1], 0.0, 0.0001)

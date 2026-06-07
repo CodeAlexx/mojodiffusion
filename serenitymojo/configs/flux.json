@@ -18,12 +18,14 @@
 
   "learning_rate": 1e-4,
   "lora_rank": 16,
-  "lora_alpha": 1.0,
+  "lora_alpha": 16.0,
   "timestep_shift": 1.0,
   "max_grad_norm": 1.0,
   "max_steps": 2000,
   "save_every": 500,
   "sample_every": 500,
+  "gradient_checkpointing": "CPU_OFFLOADED",
+  "layer_offload_fraction": 0.7,
 
   "optimizer": { "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
 }

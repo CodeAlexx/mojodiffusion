@@ -1,8 +1,8 @@
 # training/parity/lr_schedule_parity.mojo — LR scheduler parity gate (item 2a).
 #
-# Gates training/lr_schedule.mojo against a host F64 re-derivation of the EDv2
-# Rust formula (lr_schedule.rs). The F64 host computation IS the oracle (same
-# discipline as schedule_parity.mojo / optim_parity.mojo). Tolerance 1e-6.
+# Gates training/lr_schedule.mojo against a host F64 re-derivation of the local
+# OneTrainer Python reference in modules/util/lr_scheduler_util.py. The F64 host
+# computation IS the oracle. Tolerance 1e-6.
 #
 # BITROT GUARD: pass argv "--bitrot" to feed a deliberately-wrong expected value
 # and prove the gate EXITS NONZERO. Run without args for the real PASS.
@@ -15,7 +15,7 @@
 #
 # Mojo 1.0.0b1. Loud-fail: prints FAIL + raises on any arm over tolerance.
 
-import sys
+from std.sys import argv
 from std.math import cos, pi
 from serenitymojo.training.lr_schedule import (
     lr_for_step,
@@ -61,26 +61,38 @@ def _ref(
         var cf = Float64(0.5) * (Float64(1.0) + cos(_PI64 * p))
         return base * (min_factor + (Float64(1.0) - min_factor) * cf)
     if kind == LR_COSINE_RESTARTS:
+        var s = step - warmup
+        var scheduler_steps = total - warmup
+        if scheduler_steps < 1:
+            scheduler_steps = 1
+        if s > scheduler_steps - 1:
+            s = scheduler_steps - 1
+        var progress = Float64(s) / Float64(scheduler_steps)
         var c = cycles
         if c < Float64(1.0):
             c = Float64(1.0)
-        var cp = p * c
-        cp = cp - Float64(Int(cp))
-        var cf = Float64(0.5) * (Float64(1.0) + cos(_PI64 * cp))
+        var cf = Float64(0.5) * (Float64(1.0) + cos(Float64(2.0) * _PI64 * progress * c))
         return base * (min_factor + (Float64(1.0) - min_factor) * cf)
     if kind == LR_POLYNOMIAL:
         var f = (Float64(1.0) - p) ** power
         return base * (min_factor + (Float64(1.0) - min_factor) * f)
     if kind == LR_REX:
-        var f = (Float64(1.0) - p) / (Float64(1.0) - Float64(0.5) * p)
-        if f < Float64(0.0):
-            f = Float64(0.0)
+        var s = step - warmup
+        var scheduler_steps = total - warmup
+        if scheduler_steps < 1:
+            scheduler_steps = 1
+        var f = Float64(0.0)
+        if s < scheduler_steps:
+            var progress = Float64(s) / Float64(scheduler_steps)
+            var d = Float64(0.9)
+            var div = (Float64(1.0) - d) + (d * (Float64(1.0) - progress))
+            f = (Float64(1.0) - progress) / div
         return base * (min_factor + (Float64(1.0) - min_factor) * f)
     return _constant64(base, step, warmup)
 
 
 def main() raises:
-    var args = sys.argv()
+    var args = argv()
     var bitrot = len(args) > 1 and args[1] == String("--bitrot")
     print("=== lr_schedule parity (item 2a) ===")
     if bitrot:

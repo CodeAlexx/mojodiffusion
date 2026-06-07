@@ -32,6 +32,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import (
     BytePtr,
+    file_size,
     sys_open,
     sys_pwrite,
     sys_pread,
@@ -66,6 +67,113 @@ def _read_i64(fd: Int, offset: Int) raises -> Int64:
     if r != 8:
         raise Error("cap_cache: short header read")
     return v
+
+
+def _close_and_raise(fd: Int, message: String) raises:
+    _ = sys_close(fd)
+    raise Error(message)
+
+
+def validate_klein_cap_cache_header(path: String, expected_joint_dim: Int) raises:
+    """Validate a Klein sample cap-cache header without CUDA allocation.
+
+    Accepted production shapes are BF16 [512, joint_dim] and
+    [1, 512, joint_dim]. This intentionally checks only metadata and file size;
+    `load_tensor_bin` remains the body-load path once a DeviceContext exists.
+    """
+    var fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0:
+        raise Error(String("cap_cache.header: open failed for ") + path)
+
+    var got_size = file_size(fd)
+    if got_size < 24:
+        _close_and_raise(
+            fd,
+            String("cap_cache.header: fixed header too small for ") + path,
+        )
+
+    var magic = _read_i64(fd, 0)
+    if magic != _MAGIC:
+        _close_and_raise(fd, String("cap_cache.header: bad magic for ") + path)
+
+    var dtype_tag = Int(_read_i64(fd, 8))
+    if dtype_tag != STDtype.BF16.tag:
+        _close_and_raise(
+            fd,
+            String("cap_cache.header: expected BF16 dtype tag ")
+            + String(STDtype.BF16.tag)
+            + String(" for ")
+            + path
+            + String(", got ")
+            + String(dtype_tag),
+        )
+
+    var rank = Int(_read_i64(fd, 16))
+    if rank != 2 and rank != 3:
+        _close_and_raise(
+            fd,
+            String("cap_cache.header: expected rank 2 or 3 for ")
+            + path
+            + String(", got ")
+            + String(rank),
+        )
+
+    var header_size = 24 + rank * 8
+    if got_size < header_size:
+        _close_and_raise(
+            fd,
+            String("cap_cache.header: dim header too small for ") + path,
+        )
+
+    var off = 24
+    var dims = List[Int]()
+    var numel = 1
+    for _ in range(rank):
+        var d = Int(_read_i64(fd, off))
+        off += 8
+        if d <= 0:
+            _close_and_raise(
+                fd,
+                String("cap_cache.header: nonpositive dim for ") + path,
+            )
+        dims.append(d)
+        numel *= d
+
+    if rank == 2:
+        if not (dims[0] == 512 and dims[1] == expected_joint_dim):
+            _close_and_raise(
+                fd,
+                String("cap_cache.header: expected BF16 [512,")
+                + String(expected_joint_dim)
+                + String("] for ")
+                + path,
+            )
+    else:
+        if not (
+            dims[0] == 1 and dims[1] == 512
+            and dims[2] == expected_joint_dim
+        ):
+            _close_and_raise(
+                fd,
+                String("cap_cache.header: expected BF16 [1,512,")
+                + String(expected_joint_dim)
+                + String("] for ")
+                + path,
+            )
+
+    var expected_size = off + numel * STDtype.BF16.byte_size()
+    if got_size != expected_size:
+        _close_and_raise(
+            fd,
+            String("cap_cache.header: size mismatch for ")
+            + path
+            + String(", got ")
+            + String(got_size)
+            + String(" expected ")
+            + String(expected_size),
+        )
+
+    _ = sys_close(fd)
 
 
 def save_tensor_bin(t: Tensor, path: String, ctx: DeviceContext) raises:

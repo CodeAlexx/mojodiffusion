@@ -1,7 +1,12 @@
-# sampling/anima_sampling.mojo - Anima linear FlowMatch scheduler helpers.
+# sampling/anima_sampling.mojo - Anima FlowMatch scheduler helpers.
 #
-# Anima's image path uses a linear sigma schedule from 1.0 to 0.0, textbook CFG,
-# and direct-velocity Euler updates with no timestep *1000 scaling.
+# OneTrainer's Anima sampler passes explicit raw sigmas
+# linspace(1.0, 1.0 / diffusion_steps, diffusion_steps) into
+# FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=...). With the local
+# Anima scheduler config, set_timesteps applies the static FlowMatch shift=3.0,
+# appends terminal sigma 0.0, and the model receives timestep / 1000.0, which is
+# the shifted sigma itself. Schedule scalars are F32 host math; tensor updates
+# preserve the input tensor storage dtype through tensor_algebra ops.
 
 from std.gpu.host import DeviceContext
 
@@ -9,20 +14,25 @@ from serenitymojo.ops.tensor_algebra import add, mul_scalar, sub
 from serenitymojo.tensor import Tensor
 
 
-def anima_sigma(index: Int, num_steps: Int) raises -> Float32:
+def anima_shifted_sigma(index: Int, num_steps: Int, shift: Float32) raises -> Float32:
     if num_steps <= 0:
-        raise Error("anima_sigma: num_steps must be > 0")
+        raise Error("anima_shifted_sigma: num_steps must be > 0")
     if index < 0 or index > num_steps:
-        raise Error("anima_sigma: index out of range")
-    return 1.0 - Float32(index) / Float32(num_steps)
+        raise Error("anima_shifted_sigma: index out of range")
+    if index == 0:
+        return 1.0
+    if index == num_steps:
+        return 0.0
+    var sigma = 1.0 - Float32(index) / Float32(num_steps)
+    return shift * sigma / (1.0 + (shift - 1.0) * sigma)
 
 
-def build_anima_sigma_schedule(num_steps: Int) raises -> List[Float32]:
+def build_anima_sigma_schedule(num_steps: Int, shift: Float32) raises -> List[Float32]:
     if num_steps <= 0:
         raise Error("build_anima_sigma_schedule: num_steps must be > 0")
     var out = List[Float32]()
     for i in range(num_steps + 1):
-        out.append(anima_sigma(i, num_steps))
+        out.append(anima_shifted_sigma(i, num_steps, shift))
     return out^
 
 
@@ -58,14 +68,21 @@ def anima_euler_step(
 struct AnimaLinearFlowScheduler(Movable):
     var _sigmas: List[Float32]
     var num_steps: Int
+    var shift: Float32
 
     def __init__(out self, num_steps: Int) raises:
-        self._sigmas = build_anima_sigma_schedule(num_steps)
+        self._sigmas = build_anima_sigma_schedule(num_steps, 3.0)
         self.num_steps = num_steps
+        self.shift = 3.0
+
+    def __init__(out self, num_steps: Int, shift: Float32) raises:
+        self._sigmas = build_anima_sigma_schedule(num_steps, shift)
+        self.num_steps = num_steps
+        self.shift = shift
 
     @staticmethod
     def default_30() raises -> AnimaLinearFlowScheduler:
-        return AnimaLinearFlowScheduler(30)
+        return AnimaLinearFlowScheduler(30, 3.0)
 
     def sigmas(self) -> List[Float32]:
         return self._sigmas.copy()

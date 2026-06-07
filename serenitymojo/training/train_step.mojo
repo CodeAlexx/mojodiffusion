@@ -237,7 +237,8 @@ def _lora_bwd(
 
 # AdamW one step on a host-resident LoRA list. LoRA adapters and moments are
 # stored as List[Float32] in the Klein trainer; doing this update on host avoids
-# per-adapter GPU upload/readback churn while matching optim.adamw_step's formula.
+# per-adapter GPU upload/readback churn while matching PyTorch/OneTrainer AdamW:
+# decoupled weight decay is applied before the adaptive Adam subtraction.
 def _adamw_host_list(
     mut p: List[BFloat16], g: List[Float32],
     mut m: List[Float32], mut v: List[Float32],
@@ -266,9 +267,10 @@ def _adamw_host_list(
         v[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i].cast[DType.float32]() - lr * m_hat / (sqrt(v_hat) + eps)
+        var pv = p[i].cast[DType.float32]()
         if weight_decay > 0.0:
-            pv = pv - lr * weight_decay * pv
+            pv = pv * (Float32(1.0) - lr * weight_decay)
+        pv = pv - lr * m_hat / (sqrt(v_hat) + eps)
         p[i] = BFloat16(pv)
 
 

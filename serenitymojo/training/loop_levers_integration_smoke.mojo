@@ -44,6 +44,7 @@ from serenitymojo.training.schedule import (
 )
 from serenitymojo.training.timestep_bias import apply_bias
 from serenitymojo.training.loss_weight import apply_loss_weight, combined_loss_grad_elem
+from serenitymojo.models.klein.klein_stack_lora import DBL_SLOTS
 
 
 comptime SEED_BASE = UInt64(1234)
@@ -158,6 +159,15 @@ def _bit_equal(a: List[Float32], b: List[Float32]) -> Bool:
     return True
 
 
+def _bit_equal_bf16(a: List[BFloat16], b: List[BFloat16]) -> Bool:
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
 # Build an enabled config the way the reader would: start from default(), flip
 # the lever fields by name. (Reader key-parsing for these keys is Wave 2C; here
 # we mutate in-code, which exercises the SAME fields the loop reads.)
@@ -232,7 +242,7 @@ def main() raises:
         print("FAIL (B) all-off noise path mutated the list"); ok = False
 
     # ── (C) grad-accum boundary: meaned grad over a window != single g1 ───────
-    var n_ad = cfg.num_double * 4 + cfg.num_single * 2
+    var n_ad = cfg.num_double * DBL_SLOTS + cfg.num_single * 2
     var g1 = _group(2, n_ad, 20)
     var g2 = _group(5, n_ad, 20)
     # mirror the loop: zeros at window start, accumulate each micro-step, mean at
@@ -270,11 +280,11 @@ def main() raises:
         print("FAIL (C) N=1 != g1"); ok = False
 
     # ── (D) EMA wire path: shadow diverges from live; decay from schedule ─────
-    var live = List[Float32]()
-    var shadow = List[Float32]()
+    var live = List[BFloat16]()
+    var shadow = List[BFloat16]()
     for i in range(16):
-        live.append(Float32(i) * Float32(0.1) + Float32(0.05))
-        shadow.append(Float32(0.0))
+        live.append(BFloat16(Float32(i) * Float32(0.1) + Float32(0.05)))
+        shadow.append(BFloat16(Float32(0.0)))
     var shadow0 = shadow.copy()
     var any_update = False
     for k in range(1, 4):                       # micro-loop steps 1..3
@@ -287,9 +297,9 @@ def main() raises:
             any_update = True
     if not any_update:
         print("FAIL (D) EMA schedule returned no positive decay (update never ran)"); ok = False
-    elif _bit_equal(shadow, shadow0):
+    elif _bit_equal_bf16(shadow, shadow0):
         print("FAIL (D) EMA shadow unchanged after updates (lever not wired)"); ok = False
-    elif _bit_equal(shadow, live):
+    elif _bit_equal_bf16(shadow, live):
         print("FAIL (D) EMA shadow collapsed to live (decay==0 path)"); ok = False
     else:
         print("PASS (D) EMA shadow DIVERGED from both init and live (loop wired)")

@@ -1,14 +1,14 @@
-# lora_save.mojo — save / load TRAINED LoRA adapters as a PEFT/ai-toolkit-keyed
-# safetensors. The LoRA-WEIGHTS half of resume; the training-STATE half (BF16
-# master + AdamW m/v + step counter) already exists in training/loop.mojo
-# (TrainState / save_checkpoint / load_checkpoint) and is reused unchanged.
+# lora_save.mojo — save / load TRAINED LoRA adapters as model-keyed safetensors.
+# The LoRA-WEIGHTS half of resume; the training-STATE half (BF16 master + AdamW
+# m/v + step counter) already exists in training/loop.mojo (TrainState /
+# save_checkpoint / load_checkpoint) and is reused unchanged.
 #
 # ── Why this file exists ─────────────────────────────────────────────────────
 # training/loop.mojo persists the GENERIC optimizer state (param.<i>/adam_m.<i>/
 # adam_v.<i>/__meta__) for an opaque parameter set. It does NOT know the LoRA
 # key naming, so a loop checkpoint cannot be opened by an inference loader
 # (lora.mojo) or by ai-toolkit. This module writes the trained A/B in the
-# canonical PEFT key convention so:
+# canonical PEFT key convention, plus explicit model parity variants, so:
 #   * lora.mojo::LoraSet.load detects it as FMT_DIFFUSION_MODEL and merges it,
 #   * the validation sampler (training/validation_sampler.mojo) can load it,
 #   * external tools (ai-toolkit / diffusers PEFT) open it.
@@ -28,14 +28,12 @@
 # save_lora_peft the byte-exact inverse of LoraSet._compute_delta's load
 # (lora.mojo:~480: load A [rank,in], B [out,rank], delta = scale*(B@A)).
 #
-# NOTE on scale/alpha: we do NOT write a per-module `.alpha` scalar. The
-# LoraAdapter carries `scale = alpha/rank` (train_step.mojo:153), but the
-# canonical PEFT/train_klein file omits `.alpha`, and lora.mojo::_module_scale
-# (lora.mojo:~300-320) then DEFAULTS alpha = module_rank → scale = multiplier.
-# To reproduce the trained scale at inference the caller passes the SAME
-# alpha/rank ratio as the `multiplier` to merge_into_indexed. (Writing a `.alpha`
-# tensor is a 3-line extension flagged in the return notes if exact-alpha
-# round-trip without a multiplier is wanted later.)
+# NOTE on scale/alpha for generic PEFT saves: save_lora_peft does NOT write a
+# per-module `.alpha` scalar. The LoraAdapter carries `scale = alpha/rank`
+# (train_step.mojo:153), but the canonical PEFT/train_klein file omits `.alpha`,
+# and lora.mojo::_module_scale (lora.mojo:~300-320) then DEFAULTS alpha =
+# module_rank → scale = multiplier. Qwen's OneTrainer parity path is explicit
+# below in save_lora_onetrainer and does write BF16 scalar `.alpha` tensors.
 #
 # Mojo 1.0.0b1: `def` not `fn`; move-only Tensor → collections hold
 # ArcPointer[Tensor]; A/B are BF16 model storage; AdamW moments remain F32.
@@ -66,6 +64,13 @@ def _bf16_2d(var values: List[BFloat16], rows: Int, cols: Int, ctx: DeviceContex
     var sh = List[Int]()
     sh.append(rows)
     sh.append(cols)
+    return Tensor.from_host_bf16(values^, sh^, ctx)
+
+
+def _bf16_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
+    var values = List[BFloat16]()
+    values.append(value.cast[DType.bfloat16]())
+    var sh = List[Int]()
     return Tensor.from_host_bf16(values^, sh^, ctx)
 
 
@@ -121,6 +126,51 @@ def save_lora_peft(
         names.append(nl.prefix + ".lora_A.weight")
         tensors.append(ArcPointer(_bf16_2d(a.a.copy(), a.rank, a.in_f, ctx)))
         names.append(nl.prefix + ".lora_B.weight")
+        tensors.append(ArcPointer(_bf16_2d(a.b.copy(), a.out_f, a.rank, ctx)))
+
+    save_safetensors(names, tensors, path, ctx)
+    return len(adapters)
+
+
+def save_lora_onetrainer(
+    adapters: List[NamedLora], path: String, ctx: DeviceContext
+) raises -> Int:
+    """Write `adapters` using OneTrainer's raw LoRA state_dict convention.
+
+    For each module prefix we emit:
+        "<prefix>.alpha"             BF16 scalar [] (= alpha)
+        "<prefix>.lora_down.weight"  BF16 [rank, in]   (== LoraAdapter.a)
+        "<prefix>.lora_up.weight"    BF16 [out, rank]  (== LoraAdapter.b)
+
+    This is separate from `save_lora_peft` so existing generic PEFT/ai-toolkit
+    saves keep their lora_A/lora_B convention. Qwen uses this path for direct
+    OneTrainer parity."""
+    if len(adapters) == 0:
+        raise Error("save_lora_onetrainer: refusing to write an empty LoRA file")
+
+    var names = List[String]()
+    var tensors = List[ArcPointer[Tensor]]()
+
+    for ref nl in adapters:
+        var a = nl.adapter.copy()
+        if len(a.a) != a.rank * a.in_f:
+            raise Error(
+                String("save_lora_onetrainer: A numel ") + String(len(a.a))
+                + " != rank*in " + String(a.rank * a.in_f)
+                + " for '" + nl.prefix + "'"
+            )
+        if len(a.b) != a.out_f * a.rank:
+            raise Error(
+                String("save_lora_onetrainer: B numel ") + String(len(a.b))
+                + " != out*rank " + String(a.out_f * a.rank)
+                + " for '" + nl.prefix + "'"
+            )
+
+        names.append(nl.prefix + ".alpha")
+        tensors.append(ArcPointer(_bf16_scalar(a.scale * Float32(a.rank), ctx)))
+        names.append(nl.prefix + ".lora_down.weight")
+        tensors.append(ArcPointer(_bf16_2d(a.a.copy(), a.rank, a.in_f, ctx)))
+        names.append(nl.prefix + ".lora_up.weight")
         tensors.append(ArcPointer(_bf16_2d(a.b.copy(), a.out_f, a.rank, ctx)))
 
     save_safetensors(names, tensors, path, ctx)
@@ -194,10 +244,12 @@ def _read_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[
 def load_lora_for_resume(
     prefixes: List[String], scale: Float32, path: String, ctx: DeviceContext
 ) raises -> List[NamedLora]:
-    """Read the LoRA file written by save_lora_peft back into LoraAdapters, one
-    per `prefix`. `scale` (= alpha/rank) is re-supplied by the caller (it is not
-    persisted, matching the no-`.alpha` PEFT convention). AdamW moments are
-    zeroed (resume them from a loop.mojo TrainState checkpoint instead).
+    """Read a PEFT or OneTrainer raw LoRA file back into LoraAdapters, one per
+    `prefix`. PEFT uses `.lora_A.weight` / `.lora_B.weight` and receives the
+    caller supplied `scale`. OneTrainer raw saves use `.lora_down.weight` /
+    `.lora_up.weight` plus `.alpha`; when alpha exists, the adapter scale is
+    reconstructed as alpha/rank. AdamW moments are zeroed (resume them from a
+    loop.mojo TrainState checkpoint instead).
 
     Shapes are read from the file header: A is [rank,in], B is [out,rank], so
     rank = A.shape[0], in = A.shape[1], out = B.shape[0]. The B.shape[1] is
@@ -208,6 +260,10 @@ def load_lora_for_resume(
     for ref pfx in prefixes:
         var key_a = pfx + ".lora_A.weight"
         var key_b = pfx + ".lora_B.weight"
+        var key_alpha = pfx + ".alpha"
+        if key_a not in st.tensors or key_b not in st.tensors:
+            key_a = pfx + ".lora_down.weight"
+            key_b = pfx + ".lora_up.weight"
         if key_a not in st.tensors:
             raise Error(String("load_lora_for_resume: missing ") + key_a)
         if key_b not in st.tensors:
@@ -228,6 +284,12 @@ def load_lora_for_resume(
 
         var a_h = _read_f32(st, key_a, ctx)
         var b_h = _read_f32(st, key_b, ctx)
+        var adapter_scale = scale
+        if key_alpha in st.tensors:
+            var alpha_h = _read_f32(st, key_alpha, ctx)
+            if len(alpha_h) != 1:
+                raise Error(String("load_lora_for_resume: .alpha must have one value for ") + pfx)
+            adapter_scale = alpha_h[0] / Float32(rank)
 
         # Fresh zeroed AdamW moments (resumed from the loop checkpoint elsewhere).
         var ma = List[Float32]()
@@ -242,7 +304,7 @@ def load_lora_for_resume(
             vb.append(Float32(0.0))
 
         var ad = LoraAdapter(
-            a_h^, b_h^, rank, in_f, out_f, scale, ma^, va^, mb^, vb^
+            a_h^, b_h^, rank, in_f, out_f, adapter_scale, ma^, va^, mb^, vb^
         )
         out.append(NamedLora(pfx, ad^))
 

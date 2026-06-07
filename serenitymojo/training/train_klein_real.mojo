@@ -39,7 +39,7 @@
 #   rm -f serenitymojo.mojopkg
 #   pixi run mojo run -I . serenitymojo/training/train_klein_real.mojo
 
-from sys import argv
+from std.sys import argv
 from std.collections import List, Optional
 from std.memory import ArcPointer
 from std.gpu.host import DeviceContext
@@ -48,14 +48,12 @@ from std.time import perf_counter_ns
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.cap_cache import validate_klein_cap_cache_header
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.scratch_ring import ScratchRingAllocator
 
-from serenitymojo.models.klein.double_block import DoubleBlockWeights
-from serenitymojo.models.klein.single_block import SingleBlockWeights
-from serenitymojo.models.klein.klein_stack import KleinStackBase, KleinStackForward
 from serenitymojo.models.klein.klein_stack_lora import (
-    KleinLoraSet, build_klein_lora_set,
+    KleinLoraSet, KleinLoraGrads, build_klein_lora_set,
     klein_lora_set_to_device,
     klein_stack_lora_forward, klein_stack_lora_forward_device_inputs,
     klein_stack_lora_forward_device_inputs_resident,
@@ -63,22 +61,23 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_forward_device_inputs_resident_moddev_rope,
     klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch,
     klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch,
+    klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape,
     klein_stack_lora_backward, klein_stack_lora_backward_resident,
     klein_stack_lora_backward_resident_moddev,
     klein_stack_lora_backward_resident_moddev_rope,
     klein_stack_lora_backward_resident_moddev_rope_scratch,
     klein_stack_lora_backward_offload_turbo_moddev_rope_scratch,
+    klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch,
     klein_lora_adamw_step, save_klein_lora, load_klein_lora_resume,
     save_klein_lora_state, load_klein_lora_state, save_klein_lora_ema,
+    DBL_SLOTS,
 )
 from serenitymojo.models.klein.weights import (
     load_double_block_weights, load_single_block_weights,
-    load_klein_stack_base, build_klein_vec_silu,
+    load_klein_stack_base_training,
     build_klein_double_modvecs, build_klein_single_modvecs,
     load_klein_step_mod_weights, build_klein_step_mods_device_cached,
 )
-from serenitymojo.models.klein.double_block import ModVecs as ModVecsT
-from serenitymojo.models.klein.single_block import SingleModVecs as SingleModVecsT
 from serenitymojo.training.klein_dataset import KleinCache, KleinSample
 from serenitymojo.training.schedule import (
     sample_timestep_logit_normal, flow_match_noise_target,
@@ -95,19 +94,41 @@ from serenitymojo.training.ema_schedule import ema_decay_at_step, ema_update_hos
 from serenitymojo.training.grad_accum import (
     accumulate_grad_group, scale_grad_group, zeros_like_group,
 )
-from serenitymojo.training.lr_schedule import lr_for_step
 from serenitymojo.training.validation_sampler import load_caps
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.sample_prompt_config import (
-    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+    SamplePrompt, SamplePromptConfig, SampleCadence,
+    read_sample_prompt_config, read_sample_cadence_config,
+    validate_step_sample_cadence, should_sample_completed_step,
+    next_sample_completed_step, sample_time_unit_name,
+    SAMPLE_UNIT_NEVER, SAMPLE_UNIT_STEP,
+)
+from serenitymojo.training.onetrainer_train_loop_policy import (
+    OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED,
+    ot_cache_dir_from_train_config,
+    ot_final_or_step_lora_path,
+    ot_sample_cadence_from_train_config,
+    ot_sampling_enabled,
+    ot_should_save_before_sample,
+    ot_should_save_checkpoint,
+    ot_state_path_for_lora,
+    ot_lr_for_optimizer_step,
+    validate_ot_gradient_checkpointing_policy,
+    validate_ot_lora_adamw_loop_policy,
+    validate_ot_train_math_policy,
 )
 from serenitymojo.training.serenityboard import SerenityBoardWriter
 from serenitymojo.sampling.klein_sampler import klein_sample
 from serenitymojo.offload.plan import build_klein_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
-from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.train_config import (
+    TrainConfig,
+)
+from serenitymojo.training.onetrainer_cache_preflight import (
+    create_onetrainer_cache_preflight_plan,
+    validate_onetrainer_cache_preflight_plan,
+)
 from serenitymojo.io.train_config_reader import read_model_config
-from serenitymojo.ops.cast import cast_tensor_if_needed
 from serenitymojo.ops.tensor_algebra import permute, reshape, reshape_owned
 from serenitymojo.io.ffi import sys_system, sys_open, sys_close, O_RDONLY
 
@@ -171,7 +192,9 @@ comptime MACHINE_PROGRESS_LOG = False
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# Latent [1,in_ch,LH,LW] (F32 device) -> img_tokens device [N_IMG, in_ch].
+# Latent [1,in_ch,LH,LW] -> img_tokens device [N_IMG, in_ch], preserving
+# cache storage dtype. Flow-match kernels do any needed F32 arithmetic inside
+# the op and return the input/storage dtype.
 # NCHW -> permute(0,2,3,1) -> NHWC -> reshape [N_IMG, in_ch]. `in_ch` is config-
 # driven (cfg.in_channels); N_IMG stays comptime (resolution).
 def _latent_to_img_tokens_device(
@@ -183,6 +206,88 @@ def _latent_to_img_tokens_device(
     var sh = List[Int]()
     sh.append(N_IMG); sh.append(in_ch)
     return reshape_owned(nhwc^, sh^)
+
+
+def _host_f32_for_step_math(t: Tensor, ctx: DeviceContext) raises -> List[Float32]:
+    """Stage tensors through their stored dtype before host loss/stat math."""
+    if t.dtype() == STDtype.BF16:
+        var bf = t.to_host_bf16(ctx)
+        var out = List[Float32]()
+        for i in range(len(bf)):
+            out.append(bf[i].cast[DType.float32]())
+        return out^
+    if t.dtype() == STDtype.F16:
+        var hf = t.to_host_f16(ctx)
+        var out = List[Float32]()
+        for i in range(len(hf)):
+            out.append(hf[i].cast[DType.float32]())
+        return out^
+    return t.to_host(ctx)
+
+
+struct KleinLossGrad(Movable):
+    var loss: Float32
+    var d_loss: List[Float32]
+
+    def __init__(out self, loss: Float32, var d_loss: List[Float32]):
+        self.loss = loss
+        self.d_loss = d_loss^
+
+
+def _klein_loss_grad(
+    pred: List[Float32],
+    target: List[Float32],
+    sigma: Float32,
+    cfg: TrainConfig,
+) raises -> KleinLossGrad:
+    if len(pred) != len(target):
+        raise Error("Klein loss: predicted/target length mismatch")
+    var nout = len(pred)
+    var w = apply_loss_weight(
+        sigma, cfg.min_snr_gamma, cfg.debiased, True
+    )
+    var mse_s = cfg.loss_mse_strength
+    var mae_s = cfg.loss_mae_strength
+    var huber_s = cfg.loss_huber_strength
+    var combined_levers_on = (
+        mae_s != Float32(0.0) or huber_s != Float32(0.0)
+        or mse_s != Float32(1.0)
+    )
+    var loss_default_path = (w == Float32(1.0)) and (not combined_levers_on)
+    var d_loss = List[Float32]()
+    var loss: Float32
+    if loss_default_path:
+        var sse = 0.0
+        var inv_n = Float32(2.0) / Float32(nout)
+        for i in range(nout):
+            var diff = pred[i] - target[i]
+            sse += Float64(diff) * Float64(diff)
+            d_loss.append(inv_n * diff)
+        loss = Float32(sse / Float64(nout))
+    else:
+        var sum_sq = 0.0
+        var sum_abs = 0.0
+        var sum_hub = 0.0
+        for i in range(nout):
+            var diff = pred[i] - target[i]
+            var fd = Float64(diff)
+            sum_sq += fd * fd
+            var ad = fd if fd >= 0.0 else -fd
+            sum_abs += ad
+            var ac = ad if ad <= 1.0 else 1.0
+            var lin = ad - 1.0
+            if lin < 0.0:
+                lin = 0.0
+            sum_hub += 0.5 * ac * ac + lin
+            d_loss.append(w * combined_loss_grad_elem(diff, nout, mse_s, mae_s, huber_s))
+        var invn = 1.0 / Float64(nout)
+        var combined = (
+            Float64(mse_s) * (sum_sq * invn)
+            + Float64(mae_s) * (sum_abs * invn)
+            + Float64(huber_s) * (sum_hub * invn)
+        )
+        loss = Float32(Float64(w) * combined)
+    return KleinLossGrad(loss, d_loss^)
 
 
 # Build the Klein rope tables as flat host Lists [S*H*(Dh//2)] — the layout the
@@ -319,6 +424,13 @@ def _parse_nonnegative_int(s: String) raises -> Int:
     return out
 
 
+def _close_f32(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
+    var d = a - b
+    if d < Float32(0.0):
+        d = -d
+    return d <= tol
+
+
 def _mode_disables_sampling(mode: String) -> Bool:
     return mode == String("nosample") or mode == String("nosample_profile")
 
@@ -335,13 +447,13 @@ def _path_exists(path: String) -> Bool:
     return True
 
 
-def _validate_precached_caps(sample_cfg: SamplePromptConfig) raises:
+def _validate_precached_caps(
+    sample_cfg: SamplePromptConfig, expected_joint_dim: Int
+) raises:
     for i in range(len(sample_cfg.prompts)):
         var p = sample_cfg.prompts[i].copy()
-        if not _path_exists(p.caps_pos):
-            raise Error(String("missing positive sample cap for ") + p.label + String(": ") + p.caps_pos)
-        if not _path_exists(p.caps_neg):
-            raise Error(String("missing negative sample cap for ") + p.label + String(": ") + p.caps_neg)
+        validate_klein_cap_cache_header(p.caps_pos, expected_joint_dim)
+        validate_klein_cap_cache_header(p.caps_neg, expected_joint_dim)
 
 
 def _sample_png_path(step: Int, label: String) -> String:
@@ -352,7 +464,7 @@ def _sample_png_path(step: Int, label: String) -> String:
 
 
 def _state_path_for_lora(lora_path: String) -> String:
-    return lora_path + String(".state.safetensors")
+    return ot_state_path_for_lora(lora_path)
 
 
 # EMA shadow checkpoint sibling path: alina_lora_step100.safetensors ->
@@ -362,6 +474,85 @@ def _ema_path_for_lora(lora_path: String) -> String:
     if lora_path.endswith(suffix):
         return lora_path.removesuffix(suffix) + String("_ema.safetensors")
     return lora_path + String("_ema.safetensors")
+
+
+def _lora_path_for_step(base_path: String, step: Int, max_steps: Int) -> String:
+    return ot_final_or_step_lora_path(
+        base_path,
+        String(LORA_DIR),
+        String("alina_lora_final.safetensors"),
+        String("alina_lora_step"),
+        step,
+        max_steps,
+    )
+
+
+def validate_klein_train_config(cfg: TrainConfig) raises:
+    if cfg.checkpoint == String(""):
+        raise Error("Klein trainer config must set checkpoint")
+    if not cfg.checkpoint.endswith(String(".safetensors")):
+        raise Error(
+            String("Klein trainer currently requires a single safetensors checkpoint; ")
+            + String("sharded transformer dirs need a dedicated product loader")
+        )
+    if cfg.n_heads != H:
+        raise Error(String("config n_heads ") + String(cfg.n_heads) + " != comptime H " + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("config head_dim ") + String(cfg.head_dim) + " != comptime Dh " + String(Dh))
+    if cfg.d_model != H * Dh:
+        raise Error(String("config d_model ") + String(cfg.d_model) + " != H*Dh " + String(H * Dh))
+    if cfg.in_channels != 128:
+        raise Error(String("Klein 9B trainer requires in_channels=128; parsed ") + String(cfg.in_channels))
+    if cfg.joint_attention_dim != 12288:
+        raise Error(String("Klein 9B trainer requires joint_attention_dim=12288; parsed ") + String(cfg.joint_attention_dim))
+    if cfg.out_channels != 128:
+        raise Error(String("Klein 9B trainer requires out_channels=128; parsed ") + String(cfg.out_channels))
+    if cfg.num_double != 8 or cfg.num_single != 24:
+        raise Error(
+            String("Klein 9B trainer requires double=8 single=24; got double=")
+            + String(cfg.num_double) + String(" single=") + String(cfg.num_single)
+        )
+    if cfg.mlp_hidden != 12288:
+        raise Error(String("Klein 9B trainer requires mlp_hidden=12288; parsed ") + String(cfg.mlp_hidden))
+    if cfg.timestep_dim != 256:
+        raise Error(String("Klein 9B trainer requires timestep_dim=256; parsed ") + String(cfg.timestep_dim))
+    if not _close_f32(Float32(cfg.rope_theta), Float32(2000.0)):
+        raise Error(String("Klein 9B trainer requires rope_theta=2000; parsed ") + String(cfg.rope_theta))
+    validate_ot_lora_adamw_loop_policy(cfg, String("Klein trainer"))
+    validate_ot_train_math_policy(cfg, String("Klein trainer"))
+    validate_ot_gradient_checkpointing_policy(
+        cfg, String("Klein trainer"), OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED
+    )
+
+
+def klein_cache_dir_from_train_config(cfg: TrainConfig) -> String:
+    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+
+
+def klein_output_lora_path_from_train_config(
+    cfg: TrainConfig, completed_step: Int,
+) -> String:
+    return _lora_path_for_step(cfg.output_model_destination, completed_step, cfg.max_steps)
+
+
+def klein_sample_cadence_from_train_config(
+    cfg_path: String, cfg: TrainConfig,
+) raises -> SampleCadence:
+    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+
+
+def klein_sampling_enabled(cadence: SampleCadence) -> Bool:
+    return ot_sampling_enabled(cadence)
+
+
+def klein_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
+    return ot_should_save_checkpoint(cfg, completed_step)
+
+
+def klein_should_save_before_sample(
+    cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
+) raises -> Bool:
+    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 def _do_sample_prompt(
@@ -378,12 +569,8 @@ def _do_sample_prompt(
     var txt_sh = List[Int]()
     txt_sh.append(N_TXT)
     txt_sh.append(cfg.joint_attention_dim)
-    var pos_txt = cast_tensor_if_needed(
-        reshape(caps.pos, txt_sh.copy(), ctx), STDtype.F32, ctx
-    )
-    var neg_txt = cast_tensor_if_needed(
-        reshape(caps.neg, txt_sh^, ctx), STDtype.F32, ctx
-    )
+    var pos_txt = reshape(caps.pos, txt_sh.copy(), ctx)
+    var neg_txt = reshape(caps.neg, txt_sh^, ctx)
     if p.width == 1024 and p.height == 1024:
         var _img1024 = klein_sample[SAMPLE_N_IMG, N_TXT, SAMPLE_S, SAMPLE_LH, SAMPLE_LW, H, Dh](
             cfg, lora_path, pos_txt, neg_txt, p.cfg, p.steps, p.seed, png, ctx,
@@ -418,28 +605,18 @@ def _do_sample_all(
 
 
 def main() raises:
-    var ctx = DeviceContext()
-    _ = sys_system(String("mkdir -p ") + SAMPLE_DIR)
-
     # ── read the model config FILE (arch + recipe + paths). argv[1] overrides. ─
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
     if len(a) >= 2:
         cfg_path = String(a[1])
     var cfg = read_model_config(cfg_path)
-
-    # ASSERT the comptime attention-shape generics match the config (single
-    # source of truth — fail loudly rather than silently mis-size).
-    if cfg.n_heads != H:
-        raise Error(String("config n_heads ") + String(cfg.n_heads) + " != comptime H " + String(H))
-    if cfg.head_dim != Dh:
-        raise Error(String("config head_dim ") + String(cfg.head_dim) + " != comptime Dh " + String(Dh))
-    if cfg.d_model != H * Dh:
-        raise Error(String("config d_model ") + String(cfg.d_model) + " != H*Dh " + String(H * Dh))
-
-    if cfg.validation_prompts_file == String(""):
-        raise Error("Klein trainer config must set validation_prompts_file")
-    var sample_cfg = read_sample_prompt_config(cfg.validation_prompts_file)
+    validate_klein_train_config(cfg)
+    var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
+    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var output_lora_path = String("")
+    if cfg.output_model_destination != String(""):
+        output_lora_path = cfg.output_model_destination.copy()
     var run_steps = cfg.max_steps
     if RUN_STEPS > 0:
         run_steps = RUN_STEPS
@@ -463,12 +640,35 @@ def main() raises:
     var mode = String("")
     if len(a) >= 6:
         mode = String(a[5])
-    var runtime_sample_enabled = DO_SAMPLE and not _mode_disables_sampling(mode)
     var runtime_profile = VERBOSE_STAGE_LOG or _mode_enables_profile(mode)
-    var sample_every = sample_cfg.every_steps
-    if sample_every <= 0:
-        sample_every = cfg.sample_every
-    _validate_precached_caps(sample_cfg)
+    var cache_dir = klein_cache_dir_from_train_config(cfg)
+
+    print("=== Klein REAL LoRA training loop:", cfg.name, "===")
+    print("  config:", cfg_path)
+    print("  cache:", cache_dir)
+    print("  checkpoint:", cfg.checkpoint)
+    print("  output_lora:", klein_output_lora_path_from_train_config(cfg, run_steps))
+
+    if cfg.only_cache:
+        print("[Klein] only_cache requested; no CUDA context or train steps will run in this trainer")
+        return
+
+    if cfg.validation_prompts_file == String(""):
+        raise Error("Klein trainer config must set validation_prompts_file")
+    var sample_cadence = klein_sample_cadence_from_train_config(cfg_path, cfg)
+    if sample_cadence.sample_definition_file_name == String(""):
+        raise Error("Klein trainer sampling requires sample_definition_file_name or validation_prompts_file")
+    var sample_cfg = read_sample_prompt_config(sample_cadence.sample_definition_file_name)
+    var runtime_sample_enabled = (
+        DO_SAMPLE and not _mode_disables_sampling(mode)
+        and klein_sampling_enabled(sample_cadence)
+    )
+    var sample_every = sample_cadence.sample_every_steps(sample_cfg.every_steps)
+    if runtime_sample_enabled:
+        _validate_precached_caps(sample_cfg, cfg.joint_attention_dim)
+
+    var ctx = DeviceContext()
+    _ = sys_system(String("mkdir -p ") + SAMPLE_DIR)
     var board = SerenityBoardWriter.open(String(SAMPLE_DIR), String("klein_lora_mojo"), start_step)
     board.log_hparams(
         String("{\"model\":\"") + cfg.name + String("\",\"lr\":") + String(cfg.lr)
@@ -477,11 +677,9 @@ def main() raises:
         + String(",\"sample_every\":") + String(sample_every) + String("}")
     )
     board.log_text(String("config/train"), 0, cfg_path)
-    board.log_text(String("config/sample_prompts"), 0, cfg.validation_prompts_file)
+    board.log_text(String("config/sample_prompts"), 0, sample_cadence.sample_definition_file_name)
 
-    print("=== Klein REAL LoRA training loop:", cfg.name, "===")
-    print("  config:", cfg_path)
-    print("  sample prompts:", cfg.validation_prompts_file, " count=", len(sample_cfg.prompts))
+    print("  sample prompts:", sample_cadence.sample_definition_file_name, " count=", len(sample_cfg.prompts))
     print(
         "  512px latent: N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S,
         " rank=", cfg.lora_rank, " alpha=", cfg.lora_alpha, " lr=", cfg.lr,
@@ -492,12 +690,20 @@ def main() raises:
         "  cadence target max_steps=", cfg.max_steps,
         " worker range=", start_step + 1, "..", run_steps,
         " sample_every=", sample_every,
+        " sample_unit=", sample_time_unit_name(sample_cadence.sample_after_unit),
+        " sample_skip_first=", sample_cadence.sample_skip_first,
         " mode=", mode,
     )
+    var next_sample = next_sample_completed_step(sample_cadence, start_step, cfg.max_steps)
+    print("[cadence] next sample completed_step=", next_sample)
 
     # Step-0 baseline samples run before the training stack loads. A short smoke
     # (< sample_every) skips sampling so we do not waste time judging a 50-step LoRA.
-    if runtime_sample_enabled and start_step == 0 and sample_cfg.sample_at_start and run_steps >= sample_every:
+    if (
+        runtime_sample_enabled and start_step == 0
+        and should_sample_completed_step(sample_cadence, 0)
+        and run_steps >= sample_every
+    ):
         print("[cadence] step 0 baseline samples (no LoRA)")
         _do_sample_all(cfg, sample_cfg, 0, String(""), board, ctx)
     else:
@@ -506,17 +712,28 @@ def main() raises:
     # ── load shared projections/modulation; stream transformer blocks on demand ─
     print("[load] Klein base projections + turbo block loader")
     var st = SafeTensors.open(cfg.checkpoint)
-    # vec_silu at sigma=0.5 just to seed the base struct's final-layer mod; the
-    # PER-STEP mods (built from the sampled sigma) are what the loop uses.
-    var seed_ts = Tensor.from_host([Float32(500.0)], [1], STDtype.F32, ctx)
-    var seed_vec_silu = build_klein_vec_silu(st, seed_ts, cfg.timestep_dim, cfg.d_model, ctx)
-    var base = load_klein_stack_base(st, seed_vec_silu, cfg.d_model, ctx)
+    # Training overwrites final_shift/final_scale from per-step timestep mods
+    # before every forward, so avoid the old seed final-mod GEMM at startup.
+    var base = load_klein_stack_base_training(st, cfg.d_model, ctx)
+    if runtime_profile:
+        print("PROG_STAGE step=0 total=", run_steps, " phase=load_base")
     var mod_weights = load_klein_step_mod_weights(st, cfg.d_model, ctx)
+    if runtime_profile:
+        print("PROG_STAGE step=0 total=", run_steps, " phase=load_step_mod_weights")
     var plan = build_klein_block_plan(cfg.num_double, cfg.num_single)
     var loader = TurboPlannedLoader.open(
         cfg.checkpoint, plan^, OffloadConfig.synchronous_single(), ctx
     )
+    if runtime_profile:
+        print("PROG_STAGE step=0 total=", run_steps, " phase=open_turbo_loader")
     print("  block stream:", cfg.num_double, "double +", cfg.num_single, "single blocks")
+    var use_activation_tape_offload = cfg.activation_offload_enabled()
+    if cfg.gradient_checkpointing_offload():
+        print(
+            "  cpu_offloaded:",
+            " activation_offload=", use_activation_tape_offload,
+            " layer_offload_fraction=", Float32(cfg.layer_offload_fraction),
+        )
 
     # ── adapter algo selector (Wave 2B item 2j; default 0 = plain LoRA) ───────
     # adapter_algo==1 selects LyCORIS Full (full-shape weight delta). The Full
@@ -638,9 +855,10 @@ def main() raises:
     elif cfg.adapter_algo != 0:
         raise Error(String("unknown adapter_algo ") + String(cfg.adapter_algo) + " (0=LoRA, 1=Full, 2=LoHa, 3=DoRA, 4=LoKr, 5=OFT, 6=BOFT)")
 
-    # ── build LoRA set (80 adapters) + rope tables ────────────────────────────
+    # ── build LoRA set (OneTrainer split slots: 12 double + 2 single) ─────────
     var lora = build_klein_lora_set(
-        cfg.num_double, cfg.num_single, cfg.d_model, cfg.lora_rank, cfg.lora_alpha
+        cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+        cfg.lora_rank, cfg.lora_alpha
     )
     if resume_lora != String(""):
         var state_path = _state_path_for_lora(resume_lora)
@@ -683,12 +901,14 @@ def main() raises:
     var rope = _build_klein_rope_host()
     var cos = rope[0].copy()
     var sin = rope[1].copy()
-    var cos_dev = TArc(Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx))
-    var sin_dev = TArc(Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx))
+    # RoPE tables are compute constants. The train stream is currently F32, and
+    # ops.rope allows F32 tables as the diffusers Flux/Klein compute boundary.
+    var cos_dev = TArc(Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx))
+    var sin_dev = TArc(Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx))
     print("  rope host tables:", len(cos), "cos /", len(sin), "sin (expect", S * H * (Dh // 2), ")")
 
     # ── open cache ────────────────────────────────────────────────────────────
-    var cache = KleinCache(CACHE_DIR)
+    var cache = KleinCache(cache_dir)
     print("  cache samples:", cache.count())
     var compatible = _compatible_cache_indices(cache, cfg, ctx)
     print("  cache compatible samples:", len(compatible), "of", cache.count(), "for", LH, "x", LW)
@@ -699,14 +919,8 @@ def main() raises:
     preload_txt_sh.append(N_TXT); preload_txt_sh.append(cfg.joint_attention_dim)
     for ci in range(len(compatible)):
         var sample = cache.load(compatible[ci], ctx)
-        var img_tok = cast_tensor_if_needed(
-            _latent_to_img_tokens_device(sample.latent, cfg.in_channels, ctx),
-            STDtype.F32, ctx,
-        )
-        var txt_tok = cast_tensor_if_needed(
-            reshape(sample.text_embedding, preload_txt_sh.copy(), ctx),
-            STDtype.F32, ctx,
-        )
+        var img_tok = _latent_to_img_tokens_device(sample.latent, cfg.in_channels, ctx)
+        var txt_tok = reshape(sample.text_embedding, preload_txt_sh.copy(), ctx)
         cached_img_tokens.append(TArc(img_tok^))
         cached_txt_tokens.append(TArc(txt_tok^))
     print("  preloaded cache tensors:", len(cached_img_tokens), "samples")
@@ -715,13 +929,18 @@ def main() raises:
     # Default-off must not allocate an unconditional tensor. When enabled, use a
     # ZERO text-token tensor [N_TXT, joint_attention_dim] as the reproducible
     # uncond/empty-caption embedding until Klein precaches a real empty prompt.
+    # Keep the carrier dtype at the cache/model input boundary; the Float32
+    # zero list below is only a host scalar source for Tensor.from_host.
     var uncond_txt = Optional[TArc](None)
     if cfg.caption_dropout_prob > Float32(0.0):
+        var uncond_dtype = STDtype.BF16
+        if len(cached_txt_tokens) > 0:
+            uncond_dtype = cached_txt_tokens[0][].dtype()
         uncond_txt = Optional[TArc](
             TArc(
                 Tensor.from_host(
                     List[Float32]() if N_TXT * cfg.joint_attention_dim == 0 else _zeros(N_TXT * cfg.joint_attention_dim),
-                    [N_TXT, cfg.joint_attention_dim], STDtype.F32, ctx,
+                    [N_TXT, cfg.joint_attention_dim], uncond_dtype, ctx,
                 )
             )
         )
@@ -839,7 +1058,7 @@ def main() raises:
         )
         var fm = flow_match_noise_target(latent_tokens_t[], sigma, noise_t, ctx)
         var x_t_dev = TArc(fm.x_t.clone(ctx))
-        var target = fm.target.to_host(ctx)
+        var target = _host_f32_for_step_math(fm.target, ctx)
         var t_noise1 = perf_counter_ns()
         var noise_secs = Float64(t_noise1 - t_noise0) / 1.0e9
         var noise_speed = Float64(n_img_vals) / noise_secs if noise_secs > 0.0 else Float64(0.0)
@@ -863,94 +1082,66 @@ def main() raises:
         base.final_scale = mods[4].copy()
         var lora_dev = klein_lora_set_to_device(lora, ctx)
 
-        # forward -> velocity [N_IMG, OUT_CH]
+        # forward -> loss/d_loss -> backward. Loss math is shared between the
+        # resident checkpoint-input path and the CPU_OFFLOADED activation tape
+        # path so the offload branch cannot drift numerically.
+        var empty_img = List[Float32]()
+        var empty_txt = List[Float32]()
+        var loss: Float32
+        var g: KleinLoraGrads
+        var t_bwd0 = UInt(0)
         if runtime_profile:
             print("PROG_STAGE step=", k, " total=", run_steps, " phase=forward_begin")
         var t_fwd0 = perf_counter_ns()
-        var fwd = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
-            x_t_dev, txt_tokens_t, base,
-            loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
-            cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
-            cfg.out_channels, cfg.eps, ctx, scratch_fwd,
-        )
-        var t_fwd1 = perf_counter_ns()
-        if runtime_profile:
-            print(
-                "PROG_STAGE step=", k, " total=", run_steps, " phase=forward",
-                " secs=", Float32(Float64(t_fwd1 - t_fwd0) / 1.0e9),
+        if use_activation_tape_offload:
+            var fwd_tape = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape[H, Dh, N_IMG, N_TXT, S](
+                x_t_dev, txt_tokens_t, base,
+                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch_fwd,
             )
-
-        # ── (Wave 2D wire 3+4+5) loss = w * combined(MSE/MAE/Huber) ───────────
-        # DEFAULT-OFF (mse=1,mae=0,huber=0 AND gamma<0 & debiased=False) takes the
-        # EXACT pre-wave path below (F64 sse accumulation, d_loss=(2/N)*diff,
-        # w=1.0) => BYTE-IDENTICAL. Any enabled lever takes the combined branch.
-        var nout = len(fwd.out)
-        # per-step scalar loss weight (Klein flow-match => is_v_prediction=True).
-        # gamma<0 & debiased=False => 1.0, so the multiply is identity.
-        var w = apply_loss_weight(
-            sigma, cfg.min_snr_gamma, cfg.debiased, True
-        )
-        var mse_s = cfg.loss_mse_strength
-        var mae_s = cfg.loss_mae_strength
-        var huber_s = cfg.loss_huber_strength
-        var combined_levers_on = (
-            mae_s != Float32(0.0) or huber_s != Float32(0.0)
-            or mse_s != Float32(1.0)
-        )
-        var loss_default_path = (w == Float32(1.0)) and (not combined_levers_on)
-        var d_loss = List[Float32]()
-        var loss: Float32
-        if loss_default_path:
-            # ── PRE-WAVE PATH (byte-identical) ───────────────────────────────
-            var sse = 0.0
-            var inv_n = Float32(2.0) / Float32(nout)
-            for i in range(nout):
-                var diff = fwd.out[i] - target[i]
-                sse += Float64(diff) * Float64(diff)
-                d_loss.append(inv_n * diff)
-            loss = Float32(sse / Float64(nout))
+            var t_fwd1 = perf_counter_ns()
+            if runtime_profile:
+                print(
+                    "PROG_STAGE step=", k, " total=", run_steps, " phase=forward",
+                    " secs=", Float32(Float64(t_fwd1 - t_fwd0) / 1.0e9),
+                    " activation_tape_host_bytes=", fwd_tape.total_host_bytes(),
+                )
+            var lg = _klein_loss_grad(fwd_tape.out, target, sigma, cfg)
+            loss = lg.loss
+            if runtime_profile:
+                print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
+            t_bwd0 = perf_counter_ns()
+            g = klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
+                lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
+                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+            )
         else:
-            # ── COMBINED + WEIGHTED PATH (only when a lever is enabled) ──────
-            # value: w * ( mse_s*mean(x^2) + mae_s*mean|x| + huber_s*mean(huber) ),
-            # F64-accumulated (mirrors loss_weight.combined_loss_value math but in
-            # F64 to match the trainer's reduction precision).
-            # grad : w * d(combined)/dpred = w * combined_loss_grad_elem(x,N,...).
-            var sum_sq = 0.0
-            var sum_abs = 0.0
-            var sum_hub = 0.0
-            for i in range(nout):
-                var diff = fwd.out[i] - target[i]
-                var fd = Float64(diff)
-                sum_sq += fd * fd
-                var ad = fd if fd >= 0.0 else -fd
-                sum_abs += ad
-                # Huber δ=1: 0.5*min(|x|,1)^2 + max(|x|-1,0)
-                var ac = ad if ad <= 1.0 else 1.0
-                var lin = ad - 1.0
-                if lin < 0.0:
-                    lin = 0.0
-                sum_hub += 0.5 * ac * ac + lin
-                d_loss.append(w * combined_loss_grad_elem(diff, nout, mse_s, mae_s, huber_s))
-            var invn = 1.0 / Float64(nout)
-            var combined = (
-                Float64(mse_s) * (sum_sq * invn)
-                + Float64(mae_s) * (sum_abs * invn)
-                + Float64(huber_s) * (sum_hub * invn)
+            var fwd = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
+                x_t_dev, txt_tokens_t, base,
+                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch_fwd,
             )
-            loss = Float32(Float64(w) * combined)
-
-        # backward -> LoRA grads
-        var empty_img = List[Float32]()
-        var empty_txt = List[Float32]()
-        if runtime_profile:
-            print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
-        var t_bwd0 = perf_counter_ns()
-        var g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
-            d_loss, empty_img^, empty_txt^, base,
-            loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
-            cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
-            cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
-        )
+            var t_fwd1 = perf_counter_ns()
+            if runtime_profile:
+                print(
+                    "PROG_STAGE step=", k, " total=", run_steps, " phase=forward",
+                    " secs=", Float32(Float64(t_fwd1 - t_fwd0) / 1.0e9),
+                )
+            var lg = _klein_loss_grad(fwd.out, target, sigma, cfg)
+            loss = lg.loss
+            if runtime_profile:
+                print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
+            t_bwd0 = perf_counter_ns()
+            g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
+                lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
+                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+            )
         var t_bwd1 = perf_counter_ns()
         if runtime_profile:
             print(
@@ -987,10 +1178,8 @@ def main() raises:
                     k, cfg.max_steps, len(compatible), loss, 0.0, secsm, noise_speed,
                     Float64(t1m - train_start) / 1.0e9,
                 )
-                var pending_lr = lr_for_step(
-                    cfg.lr, k, cfg.lr_warmup_steps, cfg.max_steps, cfg.lr_scheduler,
-                    cfg.lr_min_factor, cfg.lr_cycles, Float32(2.0),
-                )
+                var pending_optimizer_step = ((k - 1) // accum_steps) + 1
+                var pending_lr = ot_lr_for_optimizer_step(cfg, pending_optimizer_step)
                 board.log_train_step(k, loss, 0.0, pending_lr, secsm, noise_speed)
                 continue
             # boundary: MEAN the window then overwrite g's four groups with it.
@@ -1009,7 +1198,7 @@ def main() raises:
 
         # grad_norm = L2 of ALL LoRA d_A/d_B
         var gsum = 0.0
-        var nd = cfg.num_double * 4
+        var nd = cfg.num_double * DBL_SLOTS
         for i in range(nd):
             var a = _l2(g.dbl_d_a[i]); var b = _l2(g.dbl_d_b[i])
             gsum += a * a + b * b
@@ -1046,12 +1235,10 @@ def main() raises:
         var t_optim0 = perf_counter_ns()
         # Wave 2A item 2a: scheduled lr. Default-off (lr_scheduler=0 Constant +
         # lr_warmup_steps=0) returns cfg.lr for every step => baseline unchanged.
-        var step_lr = lr_for_step(
-            cfg.lr, k, cfg.lr_warmup_steps, cfg.max_steps, cfg.lr_scheduler,
-            cfg.lr_min_factor, cfg.lr_cycles, Float32(2.0),
-        )
+        var optimizer_step = ((k - 1) // accum_steps) + 1
+        var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
         klein_lora_adamw_step(
-            lora, g, k, step_lr, ctx, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay
+            lora, g, optimizer_step, step_lr, ctx, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay
         )
         # ── EMA shadow update post-AdamW (Wave 2B item 2i; default-off skip) ──
         # decay schedule returns 0.0 before update_after_step (skip). Off =>
@@ -1093,14 +1280,15 @@ def main() raises:
         )
         board.log_train_step(k, loss, grad_norm, step_lr, secs, noise_speed)
         # ── cadence ───────────────────────────────────────────────────────────
-        var save_due = cfg.save_every > 0 and k % cfg.save_every == 0
-        var sample_due = runtime_sample_enabled and sample_every > 0 and k % sample_every == 0 and run_steps >= sample_every
+        var save_due = klein_should_save_checkpoint(cfg, k)
+        var sample_due = (
+            runtime_sample_enabled
+            and should_sample_completed_step(sample_cadence, k)
+            and run_steps >= sample_every
+        )
         var chunk_final_due = k == run_steps
-        var target_final_due = k == cfg.max_steps
         if save_due or sample_due or chunk_final_due:
-            var ckpt = LORA_DIR + String("/alina_lora_step") + String(k) + String(".safetensors")
-            if target_final_due:
-                ckpt = LORA_DIR + String("/alina_lora_final.safetensors")
+            var ckpt = _lora_path_for_step(output_lora_path, k, cfg.max_steps)
             var npairs = save_klein_lora(lora, ckpt, ctx)
             print("[Klein-lora] save step=", k, " path=", ckpt, " pairs=", npairs)
             board.log_text(String("events/save"), k, ckpt)

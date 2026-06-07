@@ -1,31 +1,33 @@
 # serenitymojo/models/klein/klein_stack_lora.mojo
 #
-# Klein (FLUX.2) FULL DiT STACK *WITH LoRA* on every trained attention
+# Klein (FLUX.2) FULL DiT STACK *WITH LoRA* on every OneTrainer-wrapped
 # projection: forward (saving acts) + full-depth backward (training) that uses
 # the already-parity-verified per-block LoRA variants for EVERY block, COLLECTS
 # every adapter's d_A/d_B, and supports an AdamW step + a PEFT/ai-toolkit save
-# across all ~80 adapters. This file COMPOSES; it rebuilds NOTHING.
+# across all adapters. This file COMPOSES; it rebuilds NOTHING.
 #
 # WHAT IS ALREADY PROVEN (cos>=0.999 vs torch) AND ONLY REUSED HERE
 #   * models/klein/double_block.mojo : double_block_lora_forward/backward
-#       (img/txt × qkv/proj LoRA, d_A/d_B vs torch cos>=0.999).
+#       (img/txt × q/k/v/out/ff_in/ff_out LoRA slots).
 #   * models/klein/single_block.mojo : single_block_lora_forward/backward
-#       (qkv-rows on w1 + cols on w2 LoRA, d_A/d_B vs torch cos>=0.999).
+#       (full to_qkv_mlp_proj + full to_out LoRA slots).
 #   * models/klein/klein_stack.mojo : the BASE full-stack fwd+bwd composition
 #       (input proj → modulation → N double → concat → N single → final layer;
 #       per-block recompute backward). THIS FILE IS THAT FILE with the base
 #       per-block calls swapped for the LoRA variants + LoRA-grad collection.
-#   * models/klein/lora_block.mojo + training/train_step.mojo : LoraAdapter,
-#       _make_lora init (A small randn, B=0), _lora_adamw (the per-adapter AdamW).
+#   * models/klein/lora_block.mojo + models/klein/lora_adapter.mojo :
+#       LoraAdapter, _make_lora init (A small randn, B=0), _lora_adamw
+#       (the per-adapter OneTrainer-style AdamW).
 #
 # CARRIER DESIGN (Tenet-2: make the right thing easy)
 #   With 8 double + 24 single blocks the trained-adapter count is large
-#   (8×4 + 24×2 = 80 at real depth). Rather than 80 named fields, KleinLoraSet
+#   (8*12 + 24*2 = 144 at real depth). Rather than 144 named fields, KleinLoraSet
 #   holds ONE flat `List[LoraAdapter]` indexed by a deterministic scheme:
-#       doubles first: block bi, slot s in {img_qkv,img_proj,txt_qkv,txt_proj}
-#           flat = bi*4 + s                       (s = 0..3)
+#       doubles first: block bi, slot s in
+#           img {q,k,v,out,ff_in,ff_out}, txt {q,k,v,out,ff_in,ff_out}
+#           flat = bi*12 + s                      (s = 0..11)
 #       singles next : block bi, slot s in {qkv,out}
-#           flat = num_double*4 + bi*2 + s        (s = 0..1)
+#           flat = num_double*12 + bi*2 + s       (s = 0..1)
 #   The host optimizer/save path keeps this as the source of truth. The hot
 #   trainer path builds a parallel `KleinLoraDeviceSet` once per step; transient
 #   DoubleBlockLoraDevice / SingleBlockLoraDevice wrappers then borrow the same
@@ -47,6 +49,7 @@
 from std.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
 from std.memory import ArcPointer
+from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.scratch_ring import ScratchRingAllocator
@@ -94,12 +97,14 @@ from serenitymojo.ops.linalg_backward import linear_backward_dx
 from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
-from serenitymojo.models.klein.lora_block import LoraAdapter, LoraAdapterDevice, lora_adapter_to_device
-from serenitymojo.training.train_step import LoraGrads, _lora_adamw
+from serenitymojo.models.klein.lora_block import LoraAdapterDevice, lora_adapter_to_device
+from serenitymojo.models.klein.lora_adapter import LoraAdapter, _lora_adamw_precomputed
 from serenitymojo.training.lora_save import (
-    NamedLora, save_lora_peft, load_lora_for_resume,
+    NamedLora, save_lora_onetrainer, load_lora_for_resume,
     save_lora_train_state, load_lora_train_state,
 )
+from serenitymojo.training.checkpoint import HostOffload, offload_to_host, restore_to_device
+from serenitymojo.models.klein.activation_tape import KleinStackLoraOffloadedTape
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.ops.cast import cast_tensor
@@ -115,29 +120,31 @@ struct KleinLoraCfgPreds(Movable):
 
 
 # ── flat-index slot scheme (the carrier's contract) ──────────────────────────
-# Double slots (per block): 0=img_qkv 1=img_proj 2=txt_qkv 3=txt_proj.
+# Double slots (per block, 12):
+#   0=img_q 1=img_k 2=img_v 3=img_out 4=img_ff_in 5=img_ff_out
+#   6=txt_q 7=txt_k 8=txt_v 9=txt_out 10=txt_ff_in 11=txt_ff_out
 # Single slots (per block): 0=qkv 1=out.
-comptime DBL_SLOTS = 4
+comptime DBL_SLOTS = 12
 comptime SGL_SLOTS = 2
 comptime BK_DOUBLE = 0
 comptime BK_SINGLE = 1
-# Saving double-block activations reduces backward recompute but is expensive:
-# DBL_SAVE_TAIL=4 OOMed on a 24GB 3090 Ti before step 1 forward completed.
-# Keep the production default at full recompute until this is memory-planned.
+# Saving block activations reduces backward recompute but is expensive at real
+# Klein sequence length. Keep production parity default at full recompute until
+# activation offload is wired through the accepted train replay.
 comptime DBL_SAVE_TAIL = 0
-comptime SGL_SAVE_TAIL = 24
+comptime SGL_SAVE_TAIL = 0
 
 
-# ── adapter init (A small randn, B=0 — PEFT identity at step 0) ───────────────
-# Standalone of train_step._make_lora that takes rank/alpha directly (this file
-# is config-agnostic; the loop-builder supplies rank/alpha).
-def _randn(n: Int, seed: UInt64, scale: Float32) -> List[Float32]:
+# ── adapter init (A = kaiming_uniform(a=sqrt(5)), B=0) ───────────────────────
+# Matches OneTrainer LoRAModule.initialize_weights for lora_down/lora_up shape.
+def _kaiming_uniform_a_sqrt5(n: Int, in_f: Int, seed: UInt64) -> List[Float32]:
+    var bound = Float32(1.0) / sqrt(Float32(in_f))
     var out = List[Float32]()
     var state = seed
     for _ in range(n):
         state = state * 6364136223846793005 + 1442695040888963407
         var u = Float32(Int(state >> 40)) * Float32(1.0 / 16777216.0)
-        out.append((u - Float32(0.5)) * scale)
+        out.append((u * Float32(2.0) - Float32(1.0)) * bound)
     return out^
 
 
@@ -146,7 +153,7 @@ def make_lora_adapter(
 ) -> LoraAdapter:
     var scale = alpha / Float32(rank)
     return LoraAdapter(
-        _randn(rank * in_f, seed, 0.01),   # A small randn
+        _kaiming_uniform_a_sqrt5(rank * in_f, in_f, seed),
         _zeros(out_f * rank),              # B = 0 (adapter identity at init)
         rank, in_f, out_f, scale,
         _zeros(rank * in_f), _zeros(rank * in_f),    # ma / va
@@ -156,7 +163,7 @@ def make_lora_adapter(
 
 # ── the LoRA carrier: every trained adapter, flat-indexed ────────────────────
 struct KleinLoraSet(Copyable, Movable):
-    var dbl: List[LoraAdapter]   # num_double * DBL_SLOTS, slot order img_qkv,img_proj,txt_qkv,txt_proj
+    var dbl: List[LoraAdapter]   # num_double * DBL_SLOTS, slots 0-5 img, 6-11 txt
     var sgl: List[LoraAdapter]   # num_single * SGL_SLOTS, slot order qkv,out
     var num_double: Int
     var num_single: Int
@@ -205,6 +212,22 @@ def klein_lora_set_to_device(
     return KleinLoraDeviceSet(dbl^, sgl^, set.num_double, set.num_single, set.rank)
 
 
+def scale_klein_lora_set(mut set: KleinLoraSet, multiplier: Float32):
+    """Apply a runtime LoRA multiplier by scaling adapter contribution only.
+
+    This intentionally does not touch BF16 A/B storage or AdamW moments. The
+    live Klein forward multiplies every LoRA contribution by `adapter.scale`.
+    """
+    if multiplier == Float32(1.0):
+        return
+    var nd = set.num_double * DBL_SLOTS
+    for i in range(nd):
+        set.dbl[i].scale *= multiplier
+    var ns = set.num_single * SGL_SLOTS
+    for i in range(ns):
+        set.sgl[i].scale *= multiplier
+
+
 # Accessor by (block_kind, block_idx, slot) → a COPY of the adapter. (LoraAdapter
 # is Copyable; this is the read accessor the task asks for.)
 def klein_lora_get(
@@ -216,30 +239,34 @@ def klein_lora_get(
 
 
 # ── build the full LoRA set for a Klein stack ────────────────────────────────
-# dims: D (model dim) for the projection in/out shapes:
-#   double img/txt qkv : in=D out=3D ; double img/txt proj : in=D out=D.
-#   single qkv (w1 rows): in=D out=3D ; single out (w2 cols): in=D out=D.
+# dims: D (model dim) and F (MLP hidden dim) for the projection in/out shapes:
+#   double img/txt q,k,v,out: in=D out=D ; ff_in: in=D out=2F ; ff_out: in=F out=D.
+#   single to_qkv_mlp: in=D out=3D+2F ; single to_out: in=D+F out=D.
 # Each adapter gets a distinct seed so A is non-degenerate per slot.
 def build_klein_lora_set(
-    num_double: Int, num_single: Int, D: Int, rank: Int, alpha: Float32
+    num_double: Int, num_single: Int, D: Int, F: Int, rank: Int, alpha: Float32
 ) -> KleinLoraSet:
     var dbl = List[LoraAdapter]()
     var seed = UInt64(1000)
     for _ in range(num_double):
-        # slot 0 img_qkv (in=D,out=3D)
-        dbl.append(make_lora_adapter(rank, alpha, D, 3 * D, seed)); seed += 1
-        # slot 1 img_proj (in=D,out=D)
-        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1
-        # slot 2 txt_qkv (in=D,out=3D)
-        dbl.append(make_lora_adapter(rank, alpha, D, 3 * D, seed)); seed += 1
-        # slot 3 txt_proj (in=D,out=D)
-        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1        # 0 img_q
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1        # 1 img_k
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1        # 2 img_v
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1        # 3 img_out
+        dbl.append(make_lora_adapter(rank, alpha, D, 2 * F, seed)); seed += 1    # 4 img_ff_in
+        dbl.append(make_lora_adapter(rank, alpha, F, D, seed)); seed += 1        # 5 img_ff_out
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1        # 6 txt_q
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1        # 7 txt_k
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1        # 8 txt_v
+        dbl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1        # 9 txt_out
+        dbl.append(make_lora_adapter(rank, alpha, D, 2 * F, seed)); seed += 1    # 10 txt_ff_in
+        dbl.append(make_lora_adapter(rank, alpha, F, D, seed)); seed += 1        # 11 txt_ff_out
     var sgl = List[LoraAdapter]()
     for _ in range(num_single):
-        # slot 0 qkv on w1 rows (in=D,out=3D)
-        sgl.append(make_lora_adapter(rank, alpha, D, 3 * D, seed)); seed += 1
-        # slot 1 out on w2 cols (in=D,out=D)
-        sgl.append(make_lora_adapter(rank, alpha, D, D, seed)); seed += 1
+        # slot 0 to_qkv_mlp on w1 (in=D,out=3D+2F)
+        sgl.append(make_lora_adapter(rank, alpha, D, 3 * D + 2 * F, seed)); seed += 1
+        # slot 1 to_out on w2 (in=D+F,out=D)
+        sgl.append(make_lora_adapter(rank, alpha, D + F, D, seed)); seed += 1
     return KleinLoraSet(dbl^, sgl^, num_double, num_single, rank)
 
 
@@ -249,10 +276,18 @@ def _dbl_lora_for(set: KleinLoraSet, bi: Int) -> DoubleBlockLora:
     var img = StreamLora(
         Optional[LoraAdapter](set.dbl[base + 0].copy()),
         Optional[LoraAdapter](set.dbl[base + 1].copy()),
-    )
-    var txt = StreamLora(
         Optional[LoraAdapter](set.dbl[base + 2].copy()),
         Optional[LoraAdapter](set.dbl[base + 3].copy()),
+        Optional[LoraAdapter](set.dbl[base + 4].copy()),
+        Optional[LoraAdapter](set.dbl[base + 5].copy()),
+    )
+    var txt = StreamLora(
+        Optional[LoraAdapter](set.dbl[base + 6].copy()),
+        Optional[LoraAdapter](set.dbl[base + 7].copy()),
+        Optional[LoraAdapter](set.dbl[base + 8].copy()),
+        Optional[LoraAdapter](set.dbl[base + 9].copy()),
+        Optional[LoraAdapter](set.dbl[base + 10].copy()),
+        Optional[LoraAdapter](set.dbl[base + 11].copy()),
     )
     return DoubleBlockLora(img^, txt^)
 
@@ -271,10 +306,18 @@ def _dbl_lora_dev_for(set: KleinLoraDeviceSet, bi: Int) -> DoubleBlockLoraDevice
     var img = StreamLoraDevice(
         Optional[LoraAdapterDevice](set.dbl[base + 0].copy()),
         Optional[LoraAdapterDevice](set.dbl[base + 1].copy()),
-    )
-    var txt = StreamLoraDevice(
         Optional[LoraAdapterDevice](set.dbl[base + 2].copy()),
         Optional[LoraAdapterDevice](set.dbl[base + 3].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 4].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 5].copy()),
+    )
+    var txt = StreamLoraDevice(
+        Optional[LoraAdapterDevice](set.dbl[base + 6].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 7].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 8].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 9].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 10].copy()),
+        Optional[LoraAdapterDevice](set.dbl[base + 11].copy()),
     )
     return DoubleBlockLoraDevice(img^, txt^)
 
@@ -804,7 +847,7 @@ def klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch[
     )
 
 
-def klein_stack_lora_predict_offload_turbo_moddev_rope_scratch[
+def klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
     img_tokens_t: TArc, txt_tokens_t: TArc,
@@ -818,7 +861,100 @@ def klein_stack_lora_predict_offload_turbo_moddev_rope_scratch[
     D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
-) raises -> List[Float32]:
+) raises -> KleinStackLoraOffloadedTape:
+    """Forward for OneTrainer CPU_OFFLOADED-style Klein LoRA training.
+
+    Base weights still stream through TurboPlannedLoader. Unlike the normal
+    streamed forward, this path parks the checkpoint/backward inputs in
+    HostOffload raw-byte carriers as soon as each block boundary is reached.
+    BF16/F16 storage stays BF16/F16; only compute internals use F32.
+    """
+    var num_double = lora.num_double
+    var num_single = lora.num_single
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    var no_bias = Optional[Tensor](None)
+    var img = TArc(linear(img_tokens_t[], base.img_in[], no_bias^, ctx))
+    var no_bias_txt = Optional[Tensor](None)
+    var txt = TArc(linear(txt_tokens_t[], base.txt_in[], no_bias_txt^, ctx))
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
+
+    var dbl_img_in = List[HostOffload]()
+    var dbl_txt_in = List[HostOffload]()
+    for bi in range(num_double):
+        var off_img = offload_to_host(img[], ctx)
+        dbl_img_in.append(off_img^)
+        var off_txt = offload_to_host(txt[], ctx)
+        dbl_txt_in.append(off_txt^)
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var w = _double_weights_from_block(handle.block, handle.prefix, ctx)
+        var bl = _dbl_lora_dev_for(lora, bi)
+        var fwd = double_block_lora_forward_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
+            img, txt, w, img_mod_dev, txt_mod_dev, bl,
+            cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        loader.mark_active_block_done(ctx)
+    var x = TArc(concat(0, ctx, txt[], img[]))
+
+    var sgl_x_in = List[HostOffload]()
+    for bi in range(num_single):
+        var off_x = offload_to_host(x[], ctx)
+        sgl_x_in.append(off_x^)
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        loader.prefetch_next_with_ctx(block_idx, ctx)
+        var w = _single_weights_from_block(handle.block, handle.prefix, D, F, ctx)
+        var sl = _sgl_lora_dev_for(lora, bi)
+        var fwd = single_block_lora_forward_device_resident_scratch[H, Dh, S](
+            x, w, single_mod_dev, sl, cos_t, sin_t, D, F, eps,
+            norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        x = fwd.out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var img_out = TArc(slice(x[], 0, N_TXT, N_IMG, ctx))
+    var ln_img_out = TArc(layer_norm(
+        img_out[], norm_ones[], norm_zeros[], eps, ctx,
+    ))
+    var normed = modulate(
+        ln_img_out[],
+        base.final_scale[], base.final_shift[], ctx,
+    )
+    var no_bias_out = Optional[Tensor](None)
+    var out = linear(normed, base.final_lin[], no_bias_out^, ctx).to_host(ctx)
+    var off_img_out = offload_to_host(img_out[], ctx)
+    var off_ln_img_out = offload_to_host(ln_img_out[], ctx)
+
+    return KleinStackLoraOffloadedTape(
+        out^,
+        dbl_img_in^,
+        dbl_txt_in^,
+        sgl_x_in^,
+        off_img_out^,
+        off_ln_img_out^,
+    )
+
+
+def klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens_t: TArc, txt_tokens_t: TArc,
+    base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    lora: KleinLoraDeviceSet,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> Tensor:
     """Inference-only Klein LoRA forward.
 
     The training forward returns a KleinStackForward tape with per-block inputs
@@ -850,7 +986,6 @@ def klein_stack_lora_predict_offload_turbo_moddev_rope_scratch[
         img = fwd.img_out.copy()
         txt = fwd.txt_out.copy()
         loader.mark_active_block_done(ctx)
-        ctx.synchronize()
 
     var x = TArc(concat(0, ctx, txt[], img[]))
 
@@ -866,7 +1001,6 @@ def klein_stack_lora_predict_offload_turbo_moddev_rope_scratch[
         )
         x = fwd.out.copy()
         loader.mark_active_block_done(ctx)
-        ctx.synchronize()
 
     var img_out = TArc(slice(x[], 0, N_TXT, N_IMG, ctx))
     var ln_img_out = TArc(layer_norm(
@@ -877,8 +1011,33 @@ def klein_stack_lora_predict_offload_turbo_moddev_rope_scratch[
         base.final_scale[], base.final_shift[], ctx,
     )
     var no_bias_out = Optional[Tensor](None)
-    var out = linear(normed, base.final_lin[], no_bias_out^, ctx).to_host(ctx)
+    var out = linear(normed, base.final_lin[], no_bias_out^, ctx)
     return out^
+
+
+def klein_stack_lora_predict_offload_turbo_moddev_rope_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens_t: TArc, txt_tokens_t: TArc,
+    base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    lora: KleinLoraDeviceSet,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> List[Float32]:
+    var out = klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[
+        H, Dh, N_IMG, N_TXT, S
+    ](
+        img_tokens_t, txt_tokens_t, base, loader, lora,
+        img_mod_dev, txt_mod_dev, single_mod_dev, cos_t, sin_t,
+        D, F, in_ch, txt_ch, out_ch, eps, ctx, scratch,
+    )
+    return out.to_host(ctx)
 
 
 def klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
@@ -1245,7 +1404,7 @@ def klein_stack_lora_backward_resident_moddev_rope[
     var d_txt_out = TArc(slice(d_x[], 0, 0, N_TXT, ctx))
     var d_img_out2 = TArc(slice(d_x[], 0, N_TXT, N_IMG, ctx))
 
-    # flat double LoRA grads (slot order img_qkv,img_proj,txt_qkv,txt_proj).
+    # flat double LoRA grads (slots 0-5 img q,k,v,out,ff_in,ff_out; 6-11 txt).
     var dbl_d_a = List[List[Float32]]()
     var dbl_d_b = List[List[Float32]]()
     for _ in range(num_double * DBL_SLOTS):
@@ -1281,16 +1440,32 @@ def klein_stack_lora_backward_resident_moddev_rope[
                 _concat6(bg.txt.d_shift1, bg.txt.d_scale1, bg.txt.d_gate1,
                          bg.txt.d_shift2, bg.txt.d_scale2, bg.txt.d_gate2),
             )
-        # scatter into the flat slots.
+        # scatter into the flat slots (0-5 img, 6-11 txt; order q,k,v,out,ff_in,ff_out).
         var dbase = di * DBL_SLOTS
-        dbl_d_a[dbase + 0] = bg.img.qkv_d_a.copy()
-        dbl_d_b[dbase + 0] = bg.img.qkv_d_b.copy()
-        dbl_d_a[dbase + 1] = bg.img.proj_d_a.copy()
-        dbl_d_b[dbase + 1] = bg.img.proj_d_b.copy()
-        dbl_d_a[dbase + 2] = bg.txt.qkv_d_a.copy()
-        dbl_d_b[dbase + 2] = bg.txt.qkv_d_b.copy()
-        dbl_d_a[dbase + 3] = bg.txt.proj_d_a.copy()
-        dbl_d_b[dbase + 3] = bg.txt.proj_d_b.copy()
+        dbl_d_a[dbase + 0] = bg.img.q_d_a.copy()
+        dbl_d_b[dbase + 0] = bg.img.q_d_b.copy()
+        dbl_d_a[dbase + 1] = bg.img.k_d_a.copy()
+        dbl_d_b[dbase + 1] = bg.img.k_d_b.copy()
+        dbl_d_a[dbase + 2] = bg.img.v_d_a.copy()
+        dbl_d_b[dbase + 2] = bg.img.v_d_b.copy()
+        dbl_d_a[dbase + 3] = bg.img.out_d_a.copy()
+        dbl_d_b[dbase + 3] = bg.img.out_d_b.copy()
+        dbl_d_a[dbase + 4] = bg.img.ff_in_d_a.copy()
+        dbl_d_b[dbase + 4] = bg.img.ff_in_d_b.copy()
+        dbl_d_a[dbase + 5] = bg.img.ff_out_d_a.copy()
+        dbl_d_b[dbase + 5] = bg.img.ff_out_d_b.copy()
+        dbl_d_a[dbase + 6] = bg.txt.q_d_a.copy()
+        dbl_d_b[dbase + 6] = bg.txt.q_d_b.copy()
+        dbl_d_a[dbase + 7] = bg.txt.k_d_a.copy()
+        dbl_d_b[dbase + 7] = bg.txt.k_d_b.copy()
+        dbl_d_a[dbase + 8] = bg.txt.v_d_a.copy()
+        dbl_d_b[dbase + 8] = bg.txt.v_d_b.copy()
+        dbl_d_a[dbase + 9] = bg.txt.out_d_a.copy()
+        dbl_d_b[dbase + 9] = bg.txt.out_d_b.copy()
+        dbl_d_a[dbase + 10] = bg.txt.ff_in_d_a.copy()
+        dbl_d_b[dbase + 10] = bg.txt.ff_in_d_b.copy()
+        dbl_d_a[dbase + 11] = bg.txt.ff_out_d_a.copy()
+        dbl_d_b[dbase + 11] = bg.txt.ff_out_d_b.copy()
         di -= 1
 
     var d_img_in = List[Float32]()
@@ -1440,14 +1615,30 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
                          bg.txt.d_shift2, bg.txt.d_scale2, bg.txt.d_gate2),
             )
         var dbase = di * DBL_SLOTS
-        dbl_d_a[dbase + 0] = bg.img.qkv_d_a.copy()
-        dbl_d_b[dbase + 0] = bg.img.qkv_d_b.copy()
-        dbl_d_a[dbase + 1] = bg.img.proj_d_a.copy()
-        dbl_d_b[dbase + 1] = bg.img.proj_d_b.copy()
-        dbl_d_a[dbase + 2] = bg.txt.qkv_d_a.copy()
-        dbl_d_b[dbase + 2] = bg.txt.qkv_d_b.copy()
-        dbl_d_a[dbase + 3] = bg.txt.proj_d_a.copy()
-        dbl_d_b[dbase + 3] = bg.txt.proj_d_b.copy()
+        dbl_d_a[dbase + 0] = bg.img.q_d_a.copy()
+        dbl_d_b[dbase + 0] = bg.img.q_d_b.copy()
+        dbl_d_a[dbase + 1] = bg.img.k_d_a.copy()
+        dbl_d_b[dbase + 1] = bg.img.k_d_b.copy()
+        dbl_d_a[dbase + 2] = bg.img.v_d_a.copy()
+        dbl_d_b[dbase + 2] = bg.img.v_d_b.copy()
+        dbl_d_a[dbase + 3] = bg.img.out_d_a.copy()
+        dbl_d_b[dbase + 3] = bg.img.out_d_b.copy()
+        dbl_d_a[dbase + 4] = bg.img.ff_in_d_a.copy()
+        dbl_d_b[dbase + 4] = bg.img.ff_in_d_b.copy()
+        dbl_d_a[dbase + 5] = bg.img.ff_out_d_a.copy()
+        dbl_d_b[dbase + 5] = bg.img.ff_out_d_b.copy()
+        dbl_d_a[dbase + 6] = bg.txt.q_d_a.copy()
+        dbl_d_b[dbase + 6] = bg.txt.q_d_b.copy()
+        dbl_d_a[dbase + 7] = bg.txt.k_d_a.copy()
+        dbl_d_b[dbase + 7] = bg.txt.k_d_b.copy()
+        dbl_d_a[dbase + 8] = bg.txt.v_d_a.copy()
+        dbl_d_b[dbase + 8] = bg.txt.v_d_b.copy()
+        dbl_d_a[dbase + 9] = bg.txt.out_d_a.copy()
+        dbl_d_b[dbase + 9] = bg.txt.out_d_b.copy()
+        dbl_d_a[dbase + 10] = bg.txt.ff_in_d_a.copy()
+        dbl_d_b[dbase + 10] = bg.txt.ff_in_d_b.copy()
+        dbl_d_a[dbase + 11] = bg.txt.ff_out_d_a.copy()
+        dbl_d_b[dbase + 11] = bg.txt.ff_out_d_b.copy()
         di -= 1
 
     var d_img_in = List[Float32]()
@@ -1614,14 +1805,224 @@ def klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[
                          bg.txt.d_shift2, bg.txt.d_scale2, bg.txt.d_gate2),
             )
         var dbase = di * DBL_SLOTS
-        dbl_d_a[dbase + 0] = bg.img.qkv_d_a.copy()
-        dbl_d_b[dbase + 0] = bg.img.qkv_d_b.copy()
-        dbl_d_a[dbase + 1] = bg.img.proj_d_a.copy()
-        dbl_d_b[dbase + 1] = bg.img.proj_d_b.copy()
-        dbl_d_a[dbase + 2] = bg.txt.qkv_d_a.copy()
-        dbl_d_b[dbase + 2] = bg.txt.qkv_d_b.copy()
-        dbl_d_a[dbase + 3] = bg.txt.proj_d_a.copy()
-        dbl_d_b[dbase + 3] = bg.txt.proj_d_b.copy()
+        dbl_d_a[dbase + 0] = bg.img.q_d_a.copy()
+        dbl_d_b[dbase + 0] = bg.img.q_d_b.copy()
+        dbl_d_a[dbase + 1] = bg.img.k_d_a.copy()
+        dbl_d_b[dbase + 1] = bg.img.k_d_b.copy()
+        dbl_d_a[dbase + 2] = bg.img.v_d_a.copy()
+        dbl_d_b[dbase + 2] = bg.img.v_d_b.copy()
+        dbl_d_a[dbase + 3] = bg.img.out_d_a.copy()
+        dbl_d_b[dbase + 3] = bg.img.out_d_b.copy()
+        dbl_d_a[dbase + 4] = bg.img.ff_in_d_a.copy()
+        dbl_d_b[dbase + 4] = bg.img.ff_in_d_b.copy()
+        dbl_d_a[dbase + 5] = bg.img.ff_out_d_a.copy()
+        dbl_d_b[dbase + 5] = bg.img.ff_out_d_b.copy()
+        dbl_d_a[dbase + 6] = bg.txt.q_d_a.copy()
+        dbl_d_b[dbase + 6] = bg.txt.q_d_b.copy()
+        dbl_d_a[dbase + 7] = bg.txt.k_d_a.copy()
+        dbl_d_b[dbase + 7] = bg.txt.k_d_b.copy()
+        dbl_d_a[dbase + 8] = bg.txt.v_d_a.copy()
+        dbl_d_b[dbase + 8] = bg.txt.v_d_b.copy()
+        dbl_d_a[dbase + 9] = bg.txt.out_d_a.copy()
+        dbl_d_b[dbase + 9] = bg.txt.out_d_b.copy()
+        dbl_d_a[dbase + 10] = bg.txt.ff_in_d_a.copy()
+        dbl_d_b[dbase + 10] = bg.txt.ff_in_d_b.copy()
+        dbl_d_a[dbase + 11] = bg.txt.ff_out_d_a.copy()
+        dbl_d_b[dbase + 11] = bg.txt.ff_out_d_b.copy()
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    var d_img_in = List[Float32]()
+    var d_txt_in = List[Float32]()
+    var d_img_tokens = List[Float32]()
+    var d_txt_tokens = List[Float32]()
+    if compute_input_grads:
+        var d_img_tokens_t = linear_backward_dx(
+            d_io[], base.img_in[], N_IMG, in_ch, D, ctx,
+        )
+        d_img_tokens = d_img_tokens_t.to_host(ctx)
+
+        var d_txt_tokens_t = linear_backward_dx(
+            d_to[], base.txt_in[], N_TXT, txt_ch, D, ctx,
+        )
+        d_txt_tokens = d_txt_tokens_t.to_host(ctx)
+
+    return KleinLoraGrads(
+        dbl_d_a^, dbl_d_b^, sgl_d_a^, sgl_d_b^,
+        d_img_tokens^, d_txt_tokens^,
+        d_img_mod^, d_txt_mod^, d_single_mod^,
+        d_img_in^, d_txt_in^, List[Float32](), d_final_shift^, d_final_scale^,
+    )
+
+
+def klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    lora: KleinLoraDeviceSet,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
+    tape: KleinStackLoraOffloadedTape,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_input_grads: Bool = True,
+    compute_aux_grads: Bool = True,
+) raises -> KleinLoraGrads:
+    """Backward over a raw-byte offloaded Klein LoRA activation tape.
+
+    This is the product-shaped CPU_OFFLOADED path: base weights stream in
+    reverse through TurboPlannedLoader, and each saved activation boundary is
+    restored from host only when its block is recomputed/backpropped.
+    """
+    var num_double = lora.num_double
+    var num_single = lora.num_single
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var d_normed_t = linear_backward_dx(
+        _t(d_out, [N_IMG, out_ch], ctx), base.final_lin[],
+        N_IMG, D, out_ch, ctx,
+    )
+
+    var ln_img_out_t = restore_to_device(tape.ln_img_out, ctx)
+    var mbf = modulate_backward(
+        d_normed_t, ln_img_out_t,
+        base.final_scale[], ctx, compute_aux_grads,
+    )
+    var d_final_scale = List[Float32]()
+    var d_final_shift = List[Float32]()
+    if compute_aux_grads:
+        d_final_scale = mbf.d_scale.to_host(ctx)
+        d_final_shift = mbf.d_shift.to_host(ctx)
+
+    var img_out_t = restore_to_device(tape.img_out, ctx)
+    var d_img_out_t = layer_norm_backward_dx(
+        mbf.d_x, img_out_t,
+        norm_ones[], eps, ctx,
+    )
+
+    var d_txt_zero = zeros_device([N_TXT, D], STDtype.F32, ctx)
+    var d_x = TArc(concat(0, ctx, d_txt_zero, d_img_out_t))
+
+    var sgl_d_a = List[List[Float32]]()
+    var sgl_d_b = List[List[Float32]]()
+    for _ in range(num_single * SGL_SLOTS):
+        sgl_d_a.append(List[Float32]())
+        sgl_d_b.append(List[Float32]())
+
+    var d_single_mod = _zeros(3 * D)
+    var bi = num_single - 1
+    while bi >= 0:
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+        var w = _single_weights_from_block(handle.block, handle.prefix, D, F, ctx)
+        var sl = _sgl_lora_dev_for(lora, bi)
+        var x_t = restore_to_device(tape.sgl_x_in[bi], ctx)
+        var x_arc = TArc(x_t^)
+        var block_saved = single_block_lora_recompute_saved_device_resident_scratch[H, Dh, S](
+            x_arc, w, single_mod_dev, sl,
+            cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        var bg = single_block_lora_backward_device_resident_scratch[H, Dh, S](
+            d_x, w, single_mod_dev, sl, block_saved, cos_t, sin_t,
+            D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
+        )
+        d_x = bg.d_x.copy()
+        if compute_aux_grads:
+            d_single_mod = _add_lists(
+                d_single_mod,
+                _concat3(bg.d_shift, bg.d_scale, bg.d_gate),
+            )
+        var sbase = bi * SGL_SLOTS
+        sgl_d_a[sbase + 0] = bg.qkv_d_a.copy()
+        sgl_d_b[sbase + 0] = bg.qkv_d_b.copy()
+        sgl_d_a[sbase + 1] = bg.out_d_a.copy()
+        sgl_d_b[sbase + 1] = bg.out_d_b.copy()
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    var d_txt_out = TArc(slice(d_x[], 0, 0, N_TXT, ctx))
+    var d_img_out2 = TArc(slice(d_x[], 0, N_TXT, N_IMG, ctx))
+
+    var dbl_d_a = List[List[Float32]]()
+    var dbl_d_b = List[List[Float32]]()
+    for _ in range(num_double * DBL_SLOTS):
+        dbl_d_a.append(List[Float32]())
+        dbl_d_b.append(List[Float32]())
+
+    var d_img_mod = _zeros(6 * D)
+    var d_txt_mod = _zeros(6 * D)
+    var di = num_double - 1
+    var d_io = d_img_out2.copy()
+    var d_to = d_txt_out.copy()
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var w = _double_weights_from_block(handle.block, handle.prefix, ctx)
+        var bl = _dbl_lora_dev_for(lora, di)
+        var img_t = restore_to_device(tape.dbl_img_in[di], ctx)
+        var txt_t = restore_to_device(tape.dbl_txt_in[di], ctx)
+        var img_arc = TArc(img_t^)
+        var txt_arc = TArc(txt_t^)
+        var fwd = double_block_lora_forward_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
+            img_arc, txt_arc,
+            w, img_mod_dev, txt_mod_dev, bl, cos_t, sin_t, D, F, eps,
+            norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        var bg = double_block_lora_backward_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
+            d_io, d_to, w, img_mod_dev, txt_mod_dev, bl, fwd.saved,
+            cos_t, sin_t, D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
+        )
+        d_io = bg.img.d_x.copy()
+        d_to = bg.txt.d_x.copy()
+        if compute_aux_grads:
+            d_img_mod = _add_lists(
+                d_img_mod,
+                _concat6(bg.img.d_shift1, bg.img.d_scale1, bg.img.d_gate1,
+                         bg.img.d_shift2, bg.img.d_scale2, bg.img.d_gate2),
+            )
+            d_txt_mod = _add_lists(
+                d_txt_mod,
+                _concat6(bg.txt.d_shift1, bg.txt.d_scale1, bg.txt.d_gate1,
+                         bg.txt.d_shift2, bg.txt.d_scale2, bg.txt.d_gate2),
+            )
+        var dbase = di * DBL_SLOTS
+        dbl_d_a[dbase + 0] = bg.img.q_d_a.copy()
+        dbl_d_b[dbase + 0] = bg.img.q_d_b.copy()
+        dbl_d_a[dbase + 1] = bg.img.k_d_a.copy()
+        dbl_d_b[dbase + 1] = bg.img.k_d_b.copy()
+        dbl_d_a[dbase + 2] = bg.img.v_d_a.copy()
+        dbl_d_b[dbase + 2] = bg.img.v_d_b.copy()
+        dbl_d_a[dbase + 3] = bg.img.out_d_a.copy()
+        dbl_d_b[dbase + 3] = bg.img.out_d_b.copy()
+        dbl_d_a[dbase + 4] = bg.img.ff_in_d_a.copy()
+        dbl_d_b[dbase + 4] = bg.img.ff_in_d_b.copy()
+        dbl_d_a[dbase + 5] = bg.img.ff_out_d_a.copy()
+        dbl_d_b[dbase + 5] = bg.img.ff_out_d_b.copy()
+        dbl_d_a[dbase + 6] = bg.txt.q_d_a.copy()
+        dbl_d_b[dbase + 6] = bg.txt.q_d_b.copy()
+        dbl_d_a[dbase + 7] = bg.txt.k_d_a.copy()
+        dbl_d_b[dbase + 7] = bg.txt.k_d_b.copy()
+        dbl_d_a[dbase + 8] = bg.txt.v_d_a.copy()
+        dbl_d_b[dbase + 8] = bg.txt.v_d_b.copy()
+        dbl_d_a[dbase + 9] = bg.txt.out_d_a.copy()
+        dbl_d_b[dbase + 9] = bg.txt.out_d_b.copy()
+        dbl_d_a[dbase + 10] = bg.txt.ff_in_d_a.copy()
+        dbl_d_b[dbase + 10] = bg.txt.ff_in_d_b.copy()
+        dbl_d_a[dbase + 11] = bg.txt.ff_out_d_a.copy()
+        dbl_d_b[dbase + 11] = bg.txt.ff_out_d_b.copy()
         loader.mark_active_block_done(ctx)
         di -= 1
 
@@ -1727,7 +2128,7 @@ def klein_stack_lora_backward[
     )
 
 
-# ── AdamW step on EVERY adapter (reuses the proven per-adapter _lora_adamw) ───
+# ── AdamW step on EVERY adapter (reuses the proven per-adapter AdamW math) ────
 # Walks the flat dbl/sgl adapter lists in lockstep with the flat grads and
 # mutates A/B (and the carried ma/va/mb/vb) in place. `t` is the 1-based step.
 def klein_lora_adamw_step(
@@ -1736,41 +2137,74 @@ def klein_lora_adamw_step(
     beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
     eps: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
 ) raises:
+    _ = ctx
+    if t < 1:
+        raise Error("klein_lora_adamw_step: t must be >= 1")
+
+    var b1p = Float32(1.0)
+    var b2p = Float32(1.0)
+    for _ in range(t):
+        b1p *= beta1
+        b2p *= beta2
+    var bc1 = Float32(1.0) - b1p
+    var bc2 = Float32(1.0) - b2p
+    var step_size = lr / bc1
+    var bc2_sqrt = sqrt(bc2)
+    var decay = Float32(1.0) - lr * weight_decay
+    var one_minus_beta1 = Float32(1.0) - beta1
+    var one_minus_beta2 = Float32(1.0) - beta2
+    var seed = UInt32(t)
+
     var nd = set.num_double * DBL_SLOTS
     for i in range(nd):
-        var lg = LoraGrads(grads.dbl_d_a[i].copy(), grads.dbl_d_b[i].copy())
-        _lora_adamw(set.dbl[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
+        _lora_adamw_precomputed(
+            set.dbl[i], grads.dbl_d_a[i], grads.dbl_d_b[i],
+            step_size, bc2_sqrt, decay, one_minus_beta1, beta2,
+            one_minus_beta2, eps, seed,
+        )
     var ns = set.num_single * SGL_SLOTS
     for i in range(ns):
-        var lg = LoraGrads(grads.sgl_d_a[i].copy(), grads.sgl_d_b[i].copy())
-        _lora_adamw(set.sgl[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
+        _lora_adamw_precomputed(
+            set.sgl[i], grads.sgl_d_a[i], grads.sgl_d_b[i],
+            step_size, bc2_sqrt, decay, one_minus_beta1, beta2,
+            one_minus_beta2, eps, seed,
+        )
 
 
-# ── per-block PEFT/ai-toolkit prefix scheme (the INVERSE of lora.mojo loader) ─
-# lora.mojo::_map_klein_trainer accepts exactly these prefixes (lora.mojo:215-237):
-#   double_blocks.<i>.img_attn.qkv_proj   (FULL slot on .img_attn.qkv.weight)
-#   double_blocks.<i>.img_attn.out_proj   (FULL slot on .img_attn.proj.weight)
-#   double_blocks.<i>.txt_attn.qkv_proj   (FULL slot on .txt_attn.qkv.weight)
-#   double_blocks.<i>.txt_attn.out_proj   (FULL slot on .txt_attn.proj.weight)
-#   single_blocks.<i>.qkv_proj            (ROWS slot on .linear1.weight)
-#   single_blocks.<i>.out_proj            (COLS slot on .linear2.weight)
-# save_lora_peft appends .lora_A.weight / .lora_B.weight, so the saved file is
-# byte-exact loadable by lora.mojo (DiffusionModel format) and ai-toolkit.
+# ── per-block prefix scheme in OneTrainer target order ───────────────────────
+# The generic PEFT writer appends .lora_A.weight / .lora_B.weight, but the prefix
+# is the OneTrainer Flux2 LoRAModule target path. Keep this block-major order in
+# lockstep with build_klein_lora_set and Flux2LoRASetup.
 def _klein_lora_prefix(block_kind: Int, block_idx: Int, slot: Int) -> String:
     if block_kind == BK_DOUBLE:
-        var b = String("double_blocks.") + String(block_idx)
+        var b = String("transformer.transformer_blocks.") + String(block_idx)
         if slot == 0:
-            return b + ".img_attn.qkv_proj"
+            return b + ".attn.to_q"
         elif slot == 1:
-            return b + ".img_attn.out_proj"
+            return b + ".attn.to_k"
         elif slot == 2:
-            return b + ".txt_attn.qkv_proj"
-        else:
-            return b + ".txt_attn.out_proj"
-    var s = String("single_blocks.") + String(block_idx)
+            return b + ".attn.to_v"
+        elif slot == 3:
+            return b + ".attn.to_out.0"
+        elif slot == 4:
+            return b + ".ff.linear_in"
+        elif slot == 5:
+            return b + ".ff.linear_out"
+        elif slot == 6:
+            return b + ".attn.add_q_proj"
+        elif slot == 7:
+            return b + ".attn.add_k_proj"
+        elif slot == 8:
+            return b + ".attn.add_v_proj"
+        elif slot == 9:
+            return b + ".attn.to_add_out"
+        elif slot == 10:
+            return b + ".ff_context.linear_in"
+        return b + ".ff_context.linear_out"
+    var s = String("transformer.single_transformer_blocks.") + String(block_idx)
     if slot == 0:
-        return s + ".qkv_proj"
-    return s + ".out_proj"
+        return s + ".attn.to_qkv_mlp_proj"
+    return s + ".attn.to_out"
 
 
 # Build the ordered prefix list for the whole set (doubles first, then singles),
@@ -1787,8 +2221,10 @@ def klein_lora_prefixes(num_double: Int, num_single: Int) -> List[String]:
     return out^
 
 
-# ── SAVE every adapter as a PEFT/ai-toolkit safetensors ──────────────────────
-# Returns the number of (A,B) pairs written (== total adapters).
+# ── SAVE every adapter as a OneTrainer raw LoRA safetensors ──────────────────
+# Returns the number of (A,B) pairs written (== total adapters). The train-state
+# saver below stays PEFT-like plus AdamW moments; this product LoRA file is for
+# OneTrainer parity and validation/sampler loading.
 def save_klein_lora(set: KleinLoraSet, path: String, ctx: DeviceContext) raises -> Int:
     var named = List[NamedLora]()
     for bi in range(set.num_double):
@@ -1803,7 +2239,7 @@ def save_klein_lora(set: KleinLoraSet, path: String, ctx: DeviceContext) raises 
                 _klein_lora_prefix(BK_SINGLE, bi, s),
                 set.sgl[bi * SGL_SLOTS + s].copy(),
             ))
-    return save_lora_peft(named, path, ctx)
+    return save_lora_onetrainer(named, path, ctx)
 
 
 # ── EMA SAVE (Wave 2B item 2i): write the EMA SHADOW params, not the live ones ─
@@ -1812,7 +2248,8 @@ def save_klein_lora(set: KleinLoraSet, path: String, ctx: DeviceContext) raises 
 # are flat in the SAME order the trainer allocated them (range(len(set.dbl)) then
 # range(len(set.sgl))), so shadow_dbl_a[bi*DBL_SLOTS+s] aligns with
 # set.dbl[bi*DBL_SLOTS+s]. We copy the live adapter for shapes/scale/prefix and
-# overwrite a/b only — the optimizer moments are irrelevant to a PEFT save.
+# overwrite a/b only — the optimizer moments are irrelevant to the product LoRA
+# save.
 def save_klein_lora_ema(
     set: KleinLoraSet,
     shadow_dbl_a: List[List[BFloat16]], shadow_dbl_b: List[List[BFloat16]],
@@ -1834,7 +2271,7 @@ def save_klein_lora_ema(
             ad.a = shadow_sgl_a[flat].copy()
             ad.b = shadow_sgl_b[flat].copy()
             named.append(NamedLora(_klein_lora_prefix(BK_SINGLE, bi, s), ad^))
-    return save_lora_peft(named, path, ctx)
+    return save_lora_onetrainer(named, path, ctx)
 
 
 def save_klein_lora_state(set: KleinLoraSet, path: String, ctx: DeviceContext) raises -> Int:

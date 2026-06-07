@@ -17,6 +17,7 @@
 #       serenitymojo/models/sdxl/parity/lora_step_smoke.mojo -o /tmp/sdxl_lora_step
 #   /tmp/sdxl_lora_step
 
+from std.builtin.dtype import DType
 from std.gpu.host import DeviceContext
 from std.collections import List
 from std.math import sqrt
@@ -136,6 +137,23 @@ def _absum(v: List[Float32]) -> Float32:
     return s
 
 
+def _bf16(v: BFloat16) -> Float32:
+    return v.cast[DType.float32]()
+
+
+def _absum_bf16(v: List[BFloat16]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(v)):
+        var x = _bf16(v[i])
+        s += x if x >= 0.0 else -x
+    return s
+
+
+def _absdiff_bf16(a: BFloat16, b: BFloat16) -> Float32:
+    var d = _bf16(a) - _bf16(b)
+    return d if d >= 0.0 else -d
+
+
 # host global L2 norm over the flat LoRA grads (the clip basis).
 def _global_norm(grads: SdxlStLoraGrads) -> Float32:
     var ss = Float32(0.0)
@@ -179,7 +197,7 @@ def main() raises:
 
     var b_absum_init = Float32(0.0)
     for i in range(n_adapters):
-        b_absum_init += _absum(lora.ad[i].b)
+        b_absum_init += _absum_bf16(lora.ad[i].b)
     print("LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
 
     # ── forward ──
@@ -213,7 +231,7 @@ def main() raises:
     var b_nonzero_slots = 0
     var b_absum_after = Float32(0.0)
     for i in range(n_adapters):
-        var s = _absum(lora.ad[i].b)
+        var s = _absum_bf16(lora.ad[i].b)
         b_absum_after += s
         if s > 0.0:
             b_nonzero_slots += 1
@@ -235,13 +253,11 @@ def main() raises:
         if len(lora.ad[i].a) != len(reloaded.ad[i].a) or len(lora.ad[i].b) != len(reloaded.ad[i].b):
             raise Error("round-trip shape mismatch")
         for j in range(len(lora.ad[i].a)):
-            var d = lora.ad[i].a[j] - reloaded.ad[i].a[j]
-            d = d if d >= 0.0 else -d
+            var d = _absdiff_bf16(lora.ad[i].a[j], reloaded.ad[i].a[j])
             if d > max_abs_diff:
                 max_abs_diff = d
         for j in range(len(lora.ad[i].b)):
-            var d = lora.ad[i].b[j] - reloaded.ad[i].b[j]
-            d = d if d >= 0.0 else -d
+            var d = _absdiff_bf16(lora.ad[i].b[j], reloaded.ad[i].b[j])
             if d > max_abs_diff:
                 max_abs_diff = d
     print("save/load max_abs_diff (A+B over all adapters) =", max_abs_diff,

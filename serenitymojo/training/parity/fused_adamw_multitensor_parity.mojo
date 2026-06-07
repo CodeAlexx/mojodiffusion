@@ -54,15 +54,16 @@ def _adamw_ref_inplace(
 
     for i in range(n):
         var gv = g[i]
+        var pv = p[i]
+        if weight_decay > 0.0:
+            pv = pv * (Float32(1.0) - lr * weight_decay)
         var mi = beta1 * m[i] + (Float32(1.0) - beta1) * gv
         var vi = beta2 * v[i] + (Float32(1.0) - beta2) * gv * gv
         m[i] = mi
         v[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
-        if weight_decay > 0.0:
-            pv = pv - lr * weight_decay * pv
+        pv = pv - lr * m_hat / (sqrt(v_hat) + eps)
         p[i] = pv
 
 

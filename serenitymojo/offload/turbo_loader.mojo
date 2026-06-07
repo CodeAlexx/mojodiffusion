@@ -11,6 +11,9 @@
 #     explicit copy stream created via ctx.create_stream(). The old GPU
 #     byte-copy kernel is kept as a fallback/probe, but the trainer path must
 #     not spend SM time copying weights.
+#   - Large checkpoints do not get copied into one full-model pinned host store
+#     at open(). Each prefetch fills the selected pinned slot from the mmap, then
+#     DMA-copies that slot to its device slab. This keeps startup memory bounded.
 #   - Event handshake:
 #       prefetch(): dispatch copy kernel on copy_stream → record event on copy_stream.
 #       await_block(): ctx.stream().enqueue_wait_for(ev) — default stream fences.
@@ -38,6 +41,7 @@ from serenitymojo.offload.telemetry import OffloadTelemetry
 
 comptime TURBO_USE_DEFAULT_STREAM_COPY = False
 comptime TURBO_USE_CUDA_DMA_COPY = True
+comptime TURBO_USE_PERSISTENT_BLOCK_STORE = False
 
 
 # ─── copy kernel ──────────────────────────────────────────────────────────────
@@ -236,9 +240,9 @@ struct TurboBlockLoader(Movable):
             index_starts.append(start)
             index_lengths.append(count)
 
-        # Persistent pinned block store. This mirrors the Rust trainer's
-        # PinnedBlockStore: mmap bytes are copied into pinned host memory once
-        # at open(), then hot prefetches only launch pinned-host -> GPU copies.
+        # Optional persistent pinned block store. The default keeps startup
+        # bounded to two slot-sized pinned slabs; hot prefetches fill the active
+        # host slot from mmap before dispatching H2D.
         var store_offsets = List[Int]()
         var store_nbytes = List[Int]()
         var total_store_bytes = 0
@@ -253,19 +257,23 @@ struct TurboBlockLoader(Movable):
             store_nbytes.append(block_bytes)
             total_store_bytes += block_bytes
 
-        var block_store = ctx.enqueue_create_host_buffer[DType.uint8](total_store_bytes)
-        for pi in range(len(prefixes)):
-            var dst_base = store_offsets[pi]
-            var offset = 0
-            var start = index_starts[pi]
-            var end = start + index_lengths[pi]
-            for ni in range(start, end):
-                var tv = sharded.tensor_view(index_names[ni])
-                var nb = tv.nbytes()
-                var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
-                var dst = BytePtr(unsafe_from_address=Int(block_store.unsafe_ptr())) + dst_base + offset
-                _ = sys_memcpy(dst, src, nb)
-                offset += nb
+        var block_store: HostBuffer[DType.uint8]
+        comptime if TURBO_USE_PERSISTENT_BLOCK_STORE:
+            block_store = ctx.enqueue_create_host_buffer[DType.uint8](total_store_bytes)
+            for pi in range(len(prefixes)):
+                var dst_base = store_offsets[pi]
+                var offset = 0
+                var start = index_starts[pi]
+                var end = start + index_lengths[pi]
+                for ni in range(start, end):
+                    var tv = sharded.tensor_view(index_names[ni])
+                    var nb = tv.nbytes()
+                    var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
+                    var dst = BytePtr(unsafe_from_address=Int(block_store.unsafe_ptr())) + dst_base + offset
+                    _ = sys_memcpy(dst, src, nb)
+                    offset += nb
+        else:
+            block_store = ctx.enqueue_create_host_buffer[DType.uint8](1)
 
         # Allocate two pinned host slabs and two device slabs.
         var host0 = ctx.enqueue_create_host_buffer[DType.uint8](max_bytes)
@@ -379,8 +387,7 @@ struct TurboBlockLoader(Movable):
         var slot = self._idle_slot()
         var telemetry_t0 = self.telemetry.now_ns()
 
-        # ── Step 1: build this slot's tensor metadata. Bytes already live in
-        # the persistent pinned block store.
+        # ── Step 1: build this slot's tensor metadata.
         var new_recs = List[_TensorRecord]()
         var offset = 0
 
@@ -421,7 +428,20 @@ struct TurboBlockLoader(Movable):
         # ── Step 2: dispatch H2D on explicit copy stream ──────────────────
         # Fast path: CUDA DMA/copy engine through cuMemcpyHtoDAsync_v2.
         # Fallback path: GPU copy kernel, kept only for portability/probes.
-        var src_ptr = self.block_store.unsafe_ptr() + self.store_offsets[prefix_idx]
+        var src_ptr = self.host0.unsafe_ptr()
+        if slot == 1:
+            src_ptr = self.host1.unsafe_ptr()
+        comptime if TURBO_USE_PERSISTENT_BLOCK_STORE:
+            src_ptr = self.block_store.unsafe_ptr() + self.store_offsets[prefix_idx]
+        else:
+            var host_offset = 0
+            for ni in range(start, end):
+                var tv = self.sharded.tensor_view(self.index_names[ni])
+                var nb = tv.nbytes()
+                var src = BytePtr(unsafe_from_address=Int(tv.data.unsafe_ptr()))
+                var dst = BytePtr(unsafe_from_address=Int(src_ptr)) + host_offset
+                _ = sys_memcpy(dst, src, nb)
+                host_offset += nb
 
         # Rust parity: do not overwrite a slot until default-stream compute
         # from the previous block has passed the slot's compute_done event.

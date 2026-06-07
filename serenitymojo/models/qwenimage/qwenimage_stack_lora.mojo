@@ -2,15 +2,15 @@
 #
 # Qwen-Image MMDiT stack WITH LoRA on every trained projection: a flat LoRA set
 # across all 60 double blocks (12 adapters/block: img/txt x q/k/v/out/ff_up/ff_down),
-# the LoRA stack fwd+bwd (per-block recompute), grad scatter, AdamW step, and PEFT
-# save. Mirrors models/klein/klein_stack_lora.mojo, specialized to Qwen-Image's
+# the LoRA stack fwd+bwd (per-block recompute), grad scatter, AdamW step, and
+# OneTrainer-key save. Mirrors models/klein/klein_stack_lora.mojo, specialized to Qwen-Image's
 # 12-target double block. REUSES the shared training/ LoRA math (LoraAdapter,
-# _lora_adamw) + lora_save.save_lora_peft — does NOT fork it.
+# _lora_adamw) + lora_save.save_lora_onetrainer — does NOT fork it.
 #
 # SLOT order per block (DBL_SLOTS = 12): img q,k,v,out,ff_up,ff_down then
-# txt q,k,v,out,ff_up,ff_down. LoRA save prefixes use the diffusers transformer
-# key layout (transformer_blocks.{i}.attn.to_q, ...; .img_mlp.net.0.proj, ...)
-# matching EDv2 qwenimage.rs::lora_module_path (qwenimage.rs:419-430).
+# txt q,k,v,out,ff_up,ff_down. LoRA save prefixes use OneTrainer's raw Qwen
+# transformer wrapper layout (transformer.transformer_blocks.{i}.attn.to_q, ...
+# .img_mlp.net.0.proj, ...).
 #
 # 2026-06-04: Added qwenimage_stack_lora_forward_offload +
 #   qwenimage_stack_lora_backward_offload — TurboPlannedLoader block-swap offload
@@ -27,6 +27,7 @@ from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.fp8 import fp8_e4m3_dequant_to_bf16
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.linalg_backward import linear_backward
@@ -36,7 +37,10 @@ from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 
 from serenitymojo.models.klein.lora_block import LoraAdapter
 from serenitymojo.training.train_step import _lora_adamw, LoraGrads
-from serenitymojo.training.lora_save import NamedLora, save_lora_peft
+from serenitymojo.training.lora_save import (
+    NamedLora, save_lora_onetrainer, load_lora_for_resume,
+    save_lora_train_state, load_lora_train_state,
+)
 
 from serenitymojo.models.qwenimage.qwenimage_block import (
     DoubleBlockWeights, ModVecs, StreamLora, DoubleBlockLora,
@@ -190,8 +194,8 @@ def qwen_lora_adamw_step(
         _lora_adamw(set.dbl[base + 11], _slot_grads(tg.ff_down_d_a, tg.ff_down_d_b), t, lr, ctx, beta1, beta2, eps, weight_decay)
 
 
-# ── PEFT save (diffusers transformer key layout) ─────────────────────────────
-# slot -> module suffix; prefix = "transformer_blocks.{bi}.<suffix>".
+# ── OneTrainer raw save-key layout ───────────────────────────────────────────
+# slot -> module suffix; prefix = "transformer.transformer_blocks.{bi}.<suffix>".
 def _slot_suffix(slot: Int) -> String:
     # img stream
     if slot == 0: return String("attn.to_q")
@@ -210,10 +214,18 @@ def _slot_suffix(slot: Int) -> String:
 
 
 def _qwen_lora_prefix(block_idx: Int, slot: Int) -> String:
-    return String("transformer_blocks.") + String(block_idx) + "." + _slot_suffix(slot)
+    return String("transformer.transformer_blocks.") + String(block_idx) + "." + _slot_suffix(slot)
 
 
-def save_qwen_lora(set: QwenLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+def qwen_lora_prefixes(num_double: Int) -> List[String]:
+    var out = List[String]()
+    for bi in range(num_double):
+        for s in range(DBL_SLOTS):
+            out.append(_qwen_lora_prefix(bi, s))
+    return out^
+
+
+def _qwen_named_loras(set: QwenLoraSet) -> List[NamedLora]:
     var named = List[NamedLora]()
     for bi in range(set.num_double):
         for s in range(DBL_SLOTS):
@@ -221,7 +233,43 @@ def save_qwen_lora(set: QwenLoraSet, path: String, ctx: DeviceContext) raises ->
                 _qwen_lora_prefix(bi, s),
                 set.dbl[bi * DBL_SLOTS + s].copy(),
             ))
-    return save_lora_peft(named^, path, ctx)
+    return named^
+
+
+def save_qwen_lora(set: QwenLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    return save_lora_onetrainer(_qwen_named_loras(set), path, ctx)
+
+
+def save_qwen_lora_state(
+    set: QwenLoraSet, path: String, ctx: DeviceContext
+) raises -> Int:
+    return save_lora_train_state(_qwen_named_loras(set), path, ctx)
+
+
+def load_qwenimage_lora_resume(
+    num_double: Int, rank: Int, alpha: Float32,
+    path: String, ctx: DeviceContext,
+) raises -> QwenLoraSet:
+    var prefixes = qwen_lora_prefixes(num_double)
+    var scale = alpha / Float32(rank)
+    var named = load_lora_for_resume(prefixes, scale, path, ctx)
+    var dbl = List[LoraAdapter]()
+    for i in range(num_double * DBL_SLOTS):
+        dbl.append(named[i].adapter.copy())
+    return QwenLoraSet(dbl^, num_double, rank)
+
+
+def load_qwenimage_lora_state(
+    num_double: Int, rank: Int, alpha: Float32,
+    path: String, ctx: DeviceContext,
+) raises -> QwenLoraSet:
+    var prefixes = qwen_lora_prefixes(num_double)
+    var scale = alpha / Float32(rank)
+    var named = load_lora_train_state(prefixes, scale, path, ctx)
+    var dbl = List[LoraAdapter]()
+    for i in range(num_double * DBL_SLOTS):
+        dbl.append(named[i].adapter.copy())
+    return QwenLoraSet(dbl^, num_double, rank)
 
 
 # ── LoRA grad accumulator (flat d_a/d_b per adapter + nonfinite counter) ─────
@@ -299,9 +347,25 @@ def _empty_stream_weights(ctx: DeviceContext) raises -> StreamWeights:
 def _block_tensor_bf16(block: Block, key: String, ctx: DeviceContext) raises -> TArc:
     if not (key in block):
         raise Error(String("QwenImage offload block missing tensor: ") + key)
-    # Keep streamed checkpoint tensors in BF16 storage. Kernels cast internally
-    # for accumulation; do not materialize block weights as host List[Float32].
-    return TArc(cast_tensor(block[key][], STDtype.BF16, ctx, False))
+    # Qwen local checkpoints are F8_E4M3 without sidecar scales. Decode FP8 to
+    # BF16 on use; reuse BF16 turbo-slot tensors by Arc to avoid a second block
+    # clone. Kernels cast internally for accumulation; never materialize block
+    # weights as host List[Float32].
+    var t = block[key].copy()
+    if t[].dtype() == STDtype.BF16:
+        return t^
+    if t[].dtype() == STDtype.F8_E4M3:
+        var deq = fp8_e4m3_dequant_to_bf16(t[], Float32(1.0), ctx)
+        return TArc(deq^)
+    if t[].dtype() == STDtype.F16 or t[].dtype() == STDtype.F32:
+        var bf = cast_tensor(t[], STDtype.BF16, ctx, False)
+        return TArc(bf^)
+    raise Error(
+        String("QwenImage offload unsupported tensor dtype for ")
+        + key
+        + String(": ")
+        + t[].dtype().name()
+    )
 
 
 def _nonfinite_check(v: List[Float32]) -> Int:

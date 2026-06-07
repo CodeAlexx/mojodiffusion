@@ -1,6 +1,6 @@
 {
   "model_type": "chroma",
-  "checkpoint": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/transformer",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/chroma1_hd_bf16.safetensors",
   "vae": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/vae/diffusion_pytorch_model.safetensors",
   "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json",
 

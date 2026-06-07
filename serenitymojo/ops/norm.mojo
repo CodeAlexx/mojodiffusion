@@ -386,8 +386,8 @@ def layer_norm(
     """Layer-normalize over the last dim of x, then scale + shift.
 
     x:      [..., D]   (any compute dtype; leading dims flattened to rows)
-    weight: [D]        (gamma; same dtype as x)
-    bias:   [D]        (beta; same dtype as x)
+    weight: [D]        (gamma; same dtype as x, or checkpoint storage dtype)
+    bias:   [D]        (beta; same dtype as x, or checkpoint storage dtype)
     returns [..., D]   (x's dtype; F32-accumulated mean/var).
     """
     var xshape = x.shape()
@@ -400,8 +400,15 @@ def layer_norm(
         raise Error("layer_norm: weight must be [D] matching x last dim")
     if len(bshape) != 1 or bshape[0] != d:
         raise Error("layer_norm: bias must be [D] matching x last dim")
-    if x.dtype() != weight.dtype() or x.dtype() != bias.dtype():
-        raise Error("layer_norm: x/weight/bias dtype mismatch")
+    if x.dtype() != weight.dtype():
+        var compute_weight = cast_tensor(weight, x.dtype(), ctx)
+        if x.dtype() != bias.dtype():
+            var compute_bias = cast_tensor(bias, x.dtype(), ctx)
+            return layer_norm(x, compute_weight^, compute_bias^, eps, ctx)
+        return layer_norm(x, compute_weight^, bias, eps, ctx)
+    if x.dtype() != bias.dtype():
+        var compute_bias = cast_tensor(bias, x.dtype(), ctx)
+        return layer_norm(x, weight, compute_bias^, eps, ctx)
     var rows = 1
     for i in range(len(xshape) - 1):
         rows *= xshape[i]

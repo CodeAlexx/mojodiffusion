@@ -28,7 +28,7 @@
 #   9. flux_lora_adamw_step; print shared progress display
 #
 # Recipe scalars (train_flux.rs OneTrainer Flux preset):
-#   lr=1e-4 (OT default), rank=16, alpha=1.0, timestep_shift=1.0 (identity),
+#   lr=1e-4, rank=16, alpha=16.0, timestep_shift=1.0 (identity),
 #   guidance=3.5, clip_grad_norm=1.0, SHIFT=0.1159, SCALE=0.3611,
 #   NUM_TRAIN_TIMESTEPS=1000.
 #
@@ -51,7 +51,7 @@
 #       serenitymojo/training/train_flux_real.mojo -o /tmp/train_flux_real && \
 #     /tmp/train_flux_real [steps]
 
-from sys import argv
+from std.sys import argv
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
@@ -62,20 +62,47 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 
 from serenitymojo.models.flux.weights import load_flux_stack_base
 from serenitymojo.models.flux.flux_stack_lora import (
     FluxLoraSet, FluxLoraGradSet, build_flux_lora_set,
     flux_stack_lora_forward_offload, flux_stack_lora_backward_offload,
-    flux_lora_adamw_step, save_flux_lora, total_adapters,
+    flux_lora_adamw_step, save_flux_lora, save_flux_lora_state, total_adapters,
 )
 from serenitymojo.models.flux.lora_block import DBL_STREAM_SLOTS, SGL_SLOTS
 from serenitymojo.models.dit.flux1_dit import build_flux1_rope_tables
 from serenitymojo.offload.plan import build_flux1_dev_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.sample_prompt_config import (
+    SampleCadence, read_sample_cadence_config,
+    validate_step_sample_cadence, should_sample_completed_step,
+    next_sample_completed_step, sample_time_unit_name,
+    SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+)
+from serenitymojo.training.onetrainer_train_loop_policy import (
+    OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED,
+    ot_cache_dir_from_train_config,
+    ot_output_lora_path_from_train_config,
+    ot_sample_cadence_from_train_config,
+    ot_sampling_enabled,
+    ot_should_save_before_sample,
+    ot_should_save_checkpoint,
+    ot_step_lora_path,
+    ot_lr_for_optimizer_step,
+    validate_ot_gradient_checkpointing_policy,
+    validate_ot_lora_adamw_loop_policy,
+    validate_ot_train_math_policy,
+)
+from serenitymojo.training.train_config import (
+    TrainConfig, GRADIENT_CHECKPOINTING_ON, GRADIENT_CHECKPOINTING_CPU_OFFLOADED,
+)
+from serenitymojo.training.onetrainer_cache_preflight import (
+    create_onetrainer_cache_preflight_plan,
+    validate_onetrainer_cache_preflight_plan,
+)
 
 
 # ── arch (flux1-dev; H/Dh/D fixed comptime, verified vs the checkpoint) ──────
@@ -106,7 +133,7 @@ comptime S = N_TXT + N_IMG     # 1536
 
 # ── recipe (train_flux.rs OneTrainer Flux preset) ────────────────────────────
 comptime RANK = 16
-comptime ALPHA = Float32(1.0)
+comptime ALPHA = Float32(16.0)
 comptime LR = Float32(1.0e-4)
 comptime TIMESTEP_SHIFT = Float32(1.0)
 comptime GUIDANCE = Float32(3.5)
@@ -123,6 +150,123 @@ comptime FIXED_SIGMA_IDX = 500   # mid-schedule sigma when FIXED_SIGMA_SMOKE.
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/flux1-dev.safetensors"
 comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_flux_512_smoke"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/alina_flux"
+comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/flux.json"
+comptime DEFAULT_RUN_STEPS = 5
+
+
+def _is_nonnegative_int(s: String) -> Bool:
+    if s.byte_length() == 0:
+        return False
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        if bs[i] < 0x30 or bs[i] > 0x39:
+            return False
+    return True
+
+
+def _parse_nonnegative_int(s: String) raises -> Int:
+    if not _is_nonnegative_int(s):
+        raise Error(String("expected non-negative integer, got ") + s)
+    var out = 0
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        out = out * 10 + Int(bs[i] - 0x30)
+    return out
+
+
+def _close_f32(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
+    var d = a - b
+    if d < Float32(0.0):
+        d = -d
+    return d <= tol
+
+
+def validate_flux_train_config(cfg: TrainConfig) raises:
+    if cfg.checkpoint == String(""):
+        raise Error("Flux trainer config must set checkpoint")
+    if cfg.n_heads != H:
+        raise Error(String("Flux config n_heads ") + String(cfg.n_heads) + String(" != H ") + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("Flux config head_dim ") + String(cfg.head_dim) + String(" != Dh ") + String(Dh))
+    if cfg.d_model != D:
+        raise Error(String("Flux config d_model ") + String(cfg.d_model) + String(" != D ") + String(D))
+    if cfg.in_channels != IN_CH:
+        raise Error(String("Flux config in_channels ") + String(cfg.in_channels) + String(" != IN_CH ") + String(IN_CH))
+    if cfg.joint_attention_dim != TXT_CH:
+        raise Error(String("Flux config joint_attention_dim ") + String(cfg.joint_attention_dim) + String(" != TXT_CH ") + String(TXT_CH))
+    if cfg.out_channels != OUT_CH:
+        raise Error(String("Flux config out_channels ") + String(cfg.out_channels) + String(" != OUT_CH ") + String(OUT_CH))
+    if cfg.num_double != NUM_DOUBLE or cfg.num_single != NUM_SINGLE:
+        raise Error(
+            String("Flux trainer requires double=") + String(NUM_DOUBLE)
+            + String(" single=") + String(NUM_SINGLE)
+            + String("; got double=") + String(cfg.num_double)
+            + String(" single=") + String(cfg.num_single)
+        )
+    if cfg.mlp_hidden != FMLP:
+        raise Error(String("Flux config mlp_hidden ") + String(cfg.mlp_hidden) + String(" != FMLP ") + String(FMLP))
+    if cfg.timestep_dim != T_DIM:
+        raise Error(String("Flux config timestep_dim ") + String(cfg.timestep_dim) + String(" != T_DIM ") + String(T_DIM))
+    if cfg.lora_rank != RANK:
+        raise Error(
+            String("Flux trainer is compiled for lora_rank=")
+            + String(RANK)
+            + String("; parsed ")
+            + String(cfg.lora_rank)
+        )
+    if not _close_f32(cfg.lora_alpha, ALPHA):
+        raise Error("Flux trainer lora_alpha does not match compiled constant")
+    if not _close_f32(cfg.lr, LR, Float32(1.0e-9)):
+        raise Error("Flux trainer learning_rate does not match compiled constant")
+    if not _close_f32(cfg.timestep_shift, TIMESTEP_SHIFT):
+        raise Error("Flux trainer timestep_shift does not match compiled constant")
+    if not _close_f32(cfg.max_grad_norm, CLIP_GRAD_NORM):
+        raise Error("Flux trainer max_grad_norm does not match compiled constant")
+    validate_ot_lora_adamw_loop_policy(cfg, String("Flux trainer"))
+    validate_ot_train_math_policy(cfg, String("Flux trainer"))
+    validate_ot_gradient_checkpointing_policy(
+        cfg, String("Flux trainer"), OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED
+    )
+
+
+def flux_checkpoint_from_train_config(cfg: TrainConfig) -> String:
+    if cfg.checkpoint != String(""):
+        return cfg.checkpoint.copy()
+    return String(CKPT)
+
+
+def flux_cache_dir_from_train_config(cfg: TrainConfig) -> String:
+    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+
+
+def flux_output_lora_path_from_train_config(cfg: TrainConfig, completed_step: Int) -> String:
+    return ot_output_lora_path_from_train_config(
+        cfg, String(LORA_DIR), String("flux_lora"), completed_step
+    )
+
+
+def flux_sample_cadence_from_train_config(
+    cfg_path: String, cfg: TrainConfig,
+) raises -> SampleCadence:
+    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+
+
+def flux_sampling_enabled(cadence: SampleCadence) -> Bool:
+    return ot_sampling_enabled(cadence)
+
+
+def flux_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
+    return ot_should_save_checkpoint(cfg, completed_step)
+
+
+def flux_should_save_before_sample(
+    cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
+) raises -> Bool:
+    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+
+
+def _step_lora_path(base_path: String, step: Int) -> String:
+    return ot_step_lora_path(base_path, step)
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -205,12 +349,29 @@ def _list_cache(dir: String) raises -> List[String]:
     return fs^
 
 
-def _load_host(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
+def _cache_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
     var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
+    return t^
+
+
+def _host_f32_for_step_math(t: Tensor, ctx: DeviceContext) raises -> List[Float32]:
+    """Stage cache tensors through their stored dtype before host step math."""
+    if t.dtype() == STDtype.BF16:
+        var bf = t.to_host_bf16(ctx)
+        var out = List[Float32]()
+        for i in range(len(bf)):
+            out.append(bf[i].cast[DType.float32]())
+        return out^
+    if t.dtype() == STDtype.F16:
+        var hf = t.to_host_f16(ctx)
+        var out = List[Float32]()
+        for i in range(len(hf)):
+            out.append(hf[i].cast[DType.float32]())
+        return out^
+    return t.to_host(ctx)
 
 
 # ── pack_latents: [16,LAT_H,LAT_W] flat -> [N_IMG, 64] channel-major patchify ─
@@ -232,36 +393,68 @@ def _pack_latents(lat: List[Float32]) -> List[Float32]:
 
 
 def main() raises:
-    var ctx = DeviceContext()
     var a = argv()
-    var run_steps = 5
+    var cfg_path = String(DEFAULT_CONFIG)
+    var arg_base = 1
     if len(a) >= 2:
-        var v = 0
-        var bs = String(a[1]).as_bytes()
-        for i in range(String(a[1]).byte_length()):
-            v = v * 10 + Int(bs[i] - 0x30)
-        run_steps = v
+        var first = String(a[1])
+        if first.endswith(String(".json")):
+            cfg_path = first.copy()
+            arg_base = 2
+
+    var train_cfg = read_model_config(cfg_path)
+    validate_flux_train_config(train_cfg)
+    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
+    validate_onetrainer_cache_preflight_plan(cache_preflight)
+
+    var run_steps = DEFAULT_RUN_STEPS
+    if len(a) > arg_base:
+        run_steps = _parse_nonnegative_int(String(a[arg_base]))
+    elif train_cfg.only_cache:
+        run_steps = 0
+
+    var ckpt = flux_checkpoint_from_train_config(train_cfg)
+    var cache_dir = flux_cache_dir_from_train_config(train_cfg)
+    var sample_cadence = flux_sample_cadence_from_train_config(cfg_path, train_cfg)
+    var sample_enabled = flux_sampling_enabled(sample_cadence)
 
     print("=== Flux (flux1-dev) REAL LoRA training loop (block-swap offload) ===")
+    print("  config:", cfg_path)
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " Fmlp=", FMLP, " out_ch=", OUT_CH)
     print("  depth: NUM_DOUBLE=", NUM_DOUBLE, " NUM_SINGLE=", NUM_SINGLE, " (FULL flux1-dev)")
     print("  tokens: N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S)
-    print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT,
+    print("  recipe: rank=", train_cfg.lora_rank, " alpha=", train_cfg.lora_alpha,
+          " lr=", train_cfg.lr, " shift=", train_cfg.timestep_shift,
           " guidance=", GUIDANCE, " vae_shift=", VAE_SHIFT, " vae_scale=", VAE_SCALE)
+    print("  run_steps=", run_steps, " config_max_steps=", train_cfg.max_steps)
+    print(
+        "  cadence: save_every=", train_cfg.save_every,
+        " sample_after=", sample_cadence.sample_after,
+        " unit=", sample_time_unit_name(sample_cadence.sample_after_unit),
+        " skip_first=", sample_cadence.sample_skip_first,
+        " sample_file=", sample_cadence.sample_definition_file_name,
+    )
     print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
-    print("  ckpt:", CKPT)
-    print("  cache:", CACHE_DIR)
+    print("  ckpt:", ckpt)
+    print("  cache:", cache_dir)
+    if train_cfg.enable_async_offloading:
+        print("[offload] async offload requested by config; Flux trainer currently uses synchronous TurboPlannedLoader")
+    if train_cfg.only_cache:
+        print("[Flux] only_cache requested; no train steps will run in this trainer")
+        return
+
+    var ctx = DeviceContext()
 
     # ── stack-level base (frozen; resident ~12.3 GB F32) ─────────────────────
     print("[load] FluxStackBase (img/txt_in, embedders, per-block mod.lin, final layer)")
-    var base_st = SafeTensors.open(String(CKPT))
+    var base_st = SafeTensors.open(ckpt)
     var base = load_flux_stack_base(base_st, NUM_DOUBLE, NUM_SINGLE, True, ctx)
     print("[load] base resident")
 
     # ── block-swap offload loader (streams attn/mlp blocks one at a time) ────
     var plan = build_flux1_dev_block_plan()
     var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
+    var loader = TurboPlannedLoader.open(ckpt, plan^, cfg, ctx)
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
 
     # ── 3-axis RoPE tables (positions fixed for 512px; built once) ───────────
@@ -278,7 +471,7 @@ def main() raises:
           SGL_SLOTS, "x", NUM_SINGLE, "single)")
 
     # ── cache ────────────────────────────────────────────────────────────────
-    var files = _list_cache(String(CACHE_DIR))
+    var files = _list_cache(cache_dir)
     print("[cache] samples:", len(files))
 
     var b_absum_init = Float32(0.0)
@@ -291,6 +484,11 @@ def main() raises:
     guidance_list.append(GUIDANCE * Float32(1000.0))
     var guidance = Optional[List[Float32]](guidance_list^)
 
+    if sample_enabled and should_sample_completed_step(sample_cadence, 0):
+        print("[cadence] step 0 sample due; Flux validation sampler is not wired in this bounded loop")
+    var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
+    print("[cadence] next sample completed_step=", next_sample)
+
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
@@ -302,13 +500,16 @@ def main() raises:
         var slot = 0 if FIXED_SIGMA_SMOKE else (k - 1) % len(files)
         var step_seed = UInt64(1) if FIXED_SIGMA_SMOKE else UInt64(k)
         var st = SafeTensors.open(files[slot])
-        var lat_raw = _load_host(st, String("latent"), ctx)        # [16*64*64]
-        var clip_pool = _load_host(st, String("clip_pool"), ctx)   # [768]
+        var lat_cache = _cache_tensor(st, String("latent"), ctx)        # [16*64*64]
+        var clip_pool_cache = _cache_tensor(st, String("clip_pool"), ctx)   # [768]
+        var lat_raw = _host_f32_for_step_math(lat_cache, ctx)
+        var clip_pool = _host_f32_for_step_math(clip_pool_cache, ctx)
 
         # t5_embed [1, seq, 4096] -> pad/truncate to [N_TXT, 4096] (zero pad rows).
         var t5_info = st.tensor_info(String("t5_embed"))
         var t5_seq = Int(t5_info.shape[1])
-        var t5_flat = _load_host(st, String("t5_embed"), ctx)       # [seq*4096]
+        var t5_cache = _cache_tensor(st, String("t5_embed"), ctx)       # [seq*4096]
+        var t5_flat = _host_f32_for_step_math(t5_cache, ctx)
         var txt_tokens = List[Float32]()
         for r in range(N_TXT):
             if r < t5_seq:
@@ -375,11 +576,16 @@ def main() raises:
             D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
         )
 
-        # ── grad norm + clip(1.0) ──
-        var gn_before = _clip(grads, CLIP_GRAD_NORM)
+        # ── grad norm + configured clip ──
+        var gn_before = _clip(grads, train_cfg.max_grad_norm)
 
         # ── AdamW ──
-        flux_lora_adamw_step(lora, grads, k, LR, ctx)
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        flux_lora_adamw_step(
+            lora, grads, k, step_lr, ctx,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+            train_cfg.weight_decay,
+        )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -398,6 +604,31 @@ def main() raises:
         if grads.nonfinite_lora_grads != 0:
             print("[Flux-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
+        var saved_this_step = False
+        if flux_should_save_checkpoint(train_cfg, k):
+            var save_path = _step_lora_path(
+                flux_output_lora_path_from_train_config(train_cfg, run_steps), k
+            )
+            _ = save_flux_lora(lora, save_path, ctx)
+            var state_path = save_path + String(".state.safetensors")
+            _ = save_flux_lora_state(lora, state_path, ctx)
+            saved_this_step = True
+            print("[Flux-lora] save_state step=", k, " path=", state_path)
+        if sample_enabled and should_sample_completed_step(sample_cadence, k):
+            if flux_should_save_before_sample(sample_cadence, k, saved_this_step):
+                var sample_path = _step_lora_path(
+                    flux_output_lora_path_from_train_config(train_cfg, run_steps), k
+                )
+                _ = save_flux_lora(lora, sample_path, ctx)
+                var sample_state = sample_path + String(".state.safetensors")
+                _ = save_flux_lora_state(lora, sample_state, ctx)
+                print("[Flux-lora] save_before_sample step=", k, " path=", sample_state)
+            print(
+                "[cadence] sample due at completed_step=", k,
+                " sample_file=", sample_cadence.sample_definition_file_name,
+                " (sampler not wired in this bounded loop)",
+            )
+
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
     var b_absum_final = Float32(0.0)
@@ -408,6 +639,10 @@ def main() raises:
         print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        _ = save_flux_lora(lora, String(LORA_DIR) + String("/flux_lora_smoke.safetensors"), ctx)
+        var lora_out = flux_output_lora_path_from_train_config(train_cfg, run_steps)
+        _ = save_flux_lora(lora, lora_out, ctx)
+        var state_out = lora_out + String(".state.safetensors")
+        _ = save_flux_lora_state(lora, state_out, ctx)
+        print("[Flux-lora] save_state step=", run_steps, " path=", state_out)
     else:
         print("RESULT: FAIL trains=", trains)

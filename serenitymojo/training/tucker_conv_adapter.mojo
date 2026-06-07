@@ -377,9 +377,10 @@ def _adamw_host_list(
         vmo[i] = vi
         var m_hat = mi / bc1
         var v_hat = vi / bc2
-        var pv = p[i] - lr * m_hat / (sqrt(v_hat) + eps)
+        var pv = p[i]
         if weight_decay > 0.0:
-            pv = pv - lr * weight_decay * pv
+            pv = pv * (Float32(1.0) - lr * weight_decay)
+        pv = pv - lr * m_hat / (sqrt(v_hat) + eps)
         p[i] = pv
 
 

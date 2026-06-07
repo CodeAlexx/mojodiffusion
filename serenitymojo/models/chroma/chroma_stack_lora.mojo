@@ -6,7 +6,8 @@
 # EXACTLY for the block math — Chroma's per-block compute IS the proven Flux
 # block (after the separate->fused row-stack the loader does), so this file
 # REUSES the verified per-block LoRA fwd/bwd (models/flux/lora_block.mojo) and
-# the FluxLoraSet carrier / optimizer / save (models/flux/flux_stack_lora.mojo).
+# the FluxLoraSet carrier / optimizer while using Chroma-owned OneTrainer
+# raw-key save/resume wrappers.
 #
 # WHAT DIFFERS FROM FLUX (and why this is a Chroma-specific stack, not a direct
 # reuse of flux_stack_lora_*_offload):
@@ -67,15 +68,23 @@ from serenitymojo.models.chroma.chroma_block import (
     chroma_double_block_lora_forward, chroma_double_block_lora_backward,
     chroma_single_block_lora_forward, chroma_single_block_lora_backward,
     DBL_STREAM_SLOTS, SGL_SLOTS,
+    D_SQ, D_SK, D_SV, D_PROJ, D_MLP0, D_MLP2,
+    S_SQ, S_SK, S_SV, S_PMLP,
 )
 
-# reuse the proven Flux LoRA carrier + optimizer + save (Chroma's LoRA target
-# set maps 1:1 onto the Flux slot scheme — see chroma_block.mojo header).
+# Reuse the proven Flux LoRA carrier + optimizer. Chroma save/load is owned in
+# this file because OneTrainer Chroma has its own target inventory and filters.
 from serenitymojo.models.flux.flux_stack_lora import (
     FluxLoraSet, FluxLoraGradSet,
     build_flux_lora_set, total_adapters,
-    flux_lora_adamw_step, save_flux_lora, load_flux_lora_resume,
+    flux_lora_adamw_step,
     _dbl_base, _sgl_base, _double_lora_for, _single_lora_for,
+)
+from serenitymojo.training.train_step import LoraAdapter
+from serenitymojo.training.lora_save import (
+    NamedLora,
+    save_lora_onetrainer, load_lora_for_resume,
+    save_lora_train_state, load_lora_train_state,
 )
 from serenitymojo.models.flux.flux_stack import (
     _add_lists, _zeros, _ones, _t, _concat_seq, _split_seq, _chunk,
@@ -234,6 +243,256 @@ def _nonfinite(v: List[Float32]) -> Int:
         if (x != x) or (x - x != Float32(0.0)):
             bad += 1
     return bad
+
+
+# ── OneTrainer raw-key save/resume surface for Chroma block adapters ─────────
+# The default save/resume path keeps the full current block-projection surface.
+# The `_for_layer_filter` variants below apply OneTrainer's substring
+# layer_filter contract at save/resume time, so the local Chroma baseline
+# `attn,ff.net` can save its 304-adapter inventory without narrowing the
+# broader full-surface carrier.
+def _chroma_dbl_stream_prefix(bi: Int, stream_img: Bool, slot: Int) -> String:
+    var b = String("lora_transformer_transformer_blocks_") + String(bi) + "_"
+    if stream_img:
+        if slot == D_SQ:
+            return b + "attn_to_q"
+        elif slot == D_SK:
+            return b + "attn_to_k"
+        elif slot == D_SV:
+            return b + "attn_to_v"
+        elif slot == D_PROJ:
+            return b + "attn_to_out_0"
+        elif slot == D_MLP0:
+            return b + "ff_net_0_proj"
+        return b + "ff_net_2"
+    else:
+        if slot == D_SQ:
+            return b + "attn_add_q_proj"
+        elif slot == D_SK:
+            return b + "attn_add_k_proj"
+        elif slot == D_SV:
+            return b + "attn_add_v_proj"
+        elif slot == D_PROJ:
+            return b + "attn_to_add_out"
+        elif slot == D_MLP0:
+            return b + "ff_context_net_0_proj"
+        return b + "ff_context_net_2"
+
+
+def _chroma_sgl_prefix(bi: Int, slot: Int) -> String:
+    var b = String("lora_transformer_single_transformer_blocks_") + String(bi) + "_"
+    if slot == S_SQ:
+        return b + "attn_to_q"
+    elif slot == S_SK:
+        return b + "attn_to_k"
+    elif slot == S_SV:
+        return b + "attn_to_v"
+    elif slot == S_PMLP:
+        return b + "proj_mlp"
+    return b + "proj_out"
+
+
+def _chroma_dbl_stream_raw_name(bi: Int, stream_img: Bool, slot: Int) -> String:
+    var b = String("transformer_blocks.") + String(bi) + "."
+    if stream_img:
+        if slot == D_SQ:
+            return b + "attn.to_q"
+        elif slot == D_SK:
+            return b + "attn.to_k"
+        elif slot == D_SV:
+            return b + "attn.to_v"
+        elif slot == D_PROJ:
+            return b + "attn.to_out.0"
+        elif slot == D_MLP0:
+            return b + "ff.net.0.proj"
+        return b + "ff.net.2"
+    else:
+        if slot == D_SQ:
+            return b + "attn.add_q_proj"
+        elif slot == D_SK:
+            return b + "attn.add_k_proj"
+        elif slot == D_SV:
+            return b + "attn.add_v_proj"
+        elif slot == D_PROJ:
+            return b + "attn.to_add_out"
+        elif slot == D_MLP0:
+            return b + "ff_context.net.0.proj"
+        return b + "ff_context.net.2"
+
+
+def _chroma_sgl_raw_name(bi: Int, slot: Int) -> String:
+    var b = String("single_transformer_blocks.") + String(bi) + "."
+    if slot == S_SQ:
+        return b + "attn.to_q"
+    elif slot == S_SK:
+        return b + "attn.to_k"
+    elif slot == S_SV:
+        return b + "attn.to_v"
+    elif slot == S_PMLP:
+        return b + "proj_mlp"
+    return b + "proj_out"
+
+
+def _chroma_layer_filter_matches(raw_name: String, layer_filter: String) -> Bool:
+    # Mirrors OneTrainer's non-regex layer_filter: split on comma and match
+    # selected substrings against the raw Diffusers module name.
+    var parts = layer_filter.split(",")
+    if len(parts) == 0:
+        return True
+    for i in range(len(parts)):
+        var part = parts[i].strip()
+        if part == String("") or raw_name.find(part) >= 0:
+            return True
+    return False
+
+
+def chroma_lora_prefixes(num_double: Int, num_single: Int) -> List[String]:
+    var out = List[String]()
+    for bi in range(num_double):
+        for s in range(DBL_STREAM_SLOTS):
+            out.append(_chroma_dbl_stream_prefix(bi, True, s))
+        for s in range(DBL_STREAM_SLOTS):
+            out.append(_chroma_dbl_stream_prefix(bi, False, s))
+    for bi in range(num_single):
+        for s in range(SGL_SLOTS):
+            out.append(_chroma_sgl_prefix(bi, s))
+    return out^
+
+
+def chroma_lora_prefixes_for_layer_filter(
+    num_double: Int, num_single: Int, layer_filter: String
+) -> List[String]:
+    var out = List[String]()
+    for bi in range(num_double):
+        for s in range(DBL_STREAM_SLOTS):
+            if _chroma_layer_filter_matches(
+                _chroma_dbl_stream_raw_name(bi, True, s), layer_filter
+            ):
+                out.append(_chroma_dbl_stream_prefix(bi, True, s))
+        for s in range(DBL_STREAM_SLOTS):
+            if _chroma_layer_filter_matches(
+                _chroma_dbl_stream_raw_name(bi, False, s), layer_filter
+            ):
+                out.append(_chroma_dbl_stream_prefix(bi, False, s))
+    for bi in range(num_single):
+        for s in range(SGL_SLOTS):
+            if _chroma_layer_filter_matches(_chroma_sgl_raw_name(bi, s), layer_filter):
+                out.append(_chroma_sgl_prefix(bi, s))
+    return out^
+
+
+def _chroma_set_from_named(
+    named: List[NamedLora], num_double: Int, num_single: Int, rank: Int,
+) -> FluxLoraSet:
+    var ad = List[LoraAdapter]()
+    for i in range(len(named)):
+        ad.append(named[i].adapter.copy())
+    return FluxLoraSet(ad^, num_double, num_single, rank)
+
+
+def _chroma_named_loras(set: FluxLoraSet) -> List[NamedLora]:
+    var prefixes = chroma_lora_prefixes(set.num_double, set.num_single)
+    var named = List[NamedLora]()
+    var n = total_adapters(set)
+    for i in range(n):
+        named.append(NamedLora(prefixes[i], set.ad[i].copy()))
+    return named^
+
+
+def _chroma_named_loras_for_layer_filter(
+    set: FluxLoraSet, layer_filter: String
+) -> List[NamedLora]:
+    var named = List[NamedLora]()
+    var idx = 0
+    for bi in range(set.num_double):
+        for s in range(DBL_STREAM_SLOTS):
+            if _chroma_layer_filter_matches(
+                _chroma_dbl_stream_raw_name(bi, True, s), layer_filter
+            ):
+                named.append(
+                    NamedLora(_chroma_dbl_stream_prefix(bi, True, s), set.ad[idx].copy())
+                )
+            idx += 1
+        for s in range(DBL_STREAM_SLOTS):
+            if _chroma_layer_filter_matches(
+                _chroma_dbl_stream_raw_name(bi, False, s), layer_filter
+            ):
+                named.append(
+                    NamedLora(_chroma_dbl_stream_prefix(bi, False, s), set.ad[idx].copy())
+                )
+            idx += 1
+    for bi in range(set.num_single):
+        for s in range(SGL_SLOTS):
+            if _chroma_layer_filter_matches(_chroma_sgl_raw_name(bi, s), layer_filter):
+                named.append(NamedLora(_chroma_sgl_prefix(bi, s), set.ad[idx].copy()))
+            idx += 1
+    return named^
+
+
+def save_chroma_lora(set: FluxLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    return save_lora_onetrainer(_chroma_named_loras(set), path, ctx)
+
+
+def save_chroma_lora_for_layer_filter(
+    set: FluxLoraSet, layer_filter: String, path: String, ctx: DeviceContext
+) raises -> Int:
+    return save_lora_onetrainer(_chroma_named_loras_for_layer_filter(set, layer_filter), path, ctx)
+
+
+def save_chroma_lora_state(set: FluxLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    return save_lora_train_state(_chroma_named_loras(set), path, ctx)
+
+
+def save_chroma_lora_state_for_layer_filter(
+    set: FluxLoraSet, layer_filter: String, path: String, ctx: DeviceContext
+) raises -> Int:
+    return save_lora_train_state(_chroma_named_loras_for_layer_filter(set, layer_filter), path, ctx)
+
+
+def load_chroma_lora_resume(
+    num_double: Int, num_single: Int, rank: Int, alpha: Float32,
+    path: String, ctx: DeviceContext,
+) raises -> FluxLoraSet:
+    var scale = alpha / Float32(rank)
+    var named = load_lora_for_resume(
+        chroma_lora_prefixes(num_double, num_single), scale, path, ctx
+    )
+    return _chroma_set_from_named(named, num_double, num_single, rank)
+
+
+def load_chroma_lora_resume_for_layer_filter(
+    num_double: Int, num_single: Int, rank: Int, alpha: Float32,
+    layer_filter: String, path: String, ctx: DeviceContext,
+) raises -> FluxLoraSet:
+    var scale = alpha / Float32(rank)
+    var named = load_lora_for_resume(
+        chroma_lora_prefixes_for_layer_filter(num_double, num_single, layer_filter),
+        scale, path, ctx,
+    )
+    return _chroma_set_from_named(named, num_double, num_single, rank)
+
+
+def load_chroma_lora_state(
+    num_double: Int, num_single: Int, rank: Int, alpha: Float32,
+    path: String, ctx: DeviceContext,
+) raises -> FluxLoraSet:
+    var scale = alpha / Float32(rank)
+    var named = load_lora_train_state(
+        chroma_lora_prefixes(num_double, num_single), scale, path, ctx
+    )
+    return _chroma_set_from_named(named, num_double, num_single, rank)
+
+
+def load_chroma_lora_state_for_layer_filter(
+    num_double: Int, num_single: Int, rank: Int, alpha: Float32,
+    layer_filter: String, path: String, ctx: DeviceContext,
+) raises -> FluxLoraSet:
+    var scale = alpha / Float32(rank)
+    var named = load_lora_train_state(
+        chroma_lora_prefixes_for_layer_filter(num_double, num_single, layer_filter),
+        scale, path, ctx,
+    )
+    return _chroma_set_from_named(named, num_double, num_single, rank)
 
 
 # ── streamed-block -> fused weight structs (diffusers keys; row-stack q;k;v) ──

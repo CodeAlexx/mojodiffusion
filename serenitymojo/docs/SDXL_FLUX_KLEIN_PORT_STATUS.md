@@ -41,6 +41,49 @@ inference.
 
 ## What Changed In This Pass
 
+### 2026-06-06 Klein Trainer/Sampler Update
+
+- Klein 9B LoRA product training now has bounded `CPU_OFFLOADED` smoke evidence
+  on the local RTX 3090 Ti. The 5-step run completed with BF16 LoRA saves,
+  BF16 adapter state plus F32 AdamW moments, `838,860,800` host activation-tape
+  bytes, and warmed step time around `13-14s`.
+- Resume from the 5-step state through step `10` completed from
+  `/tmp/klein9b_cpu_offloaded_5step_smoke.safetensors`; the resume save
+  `/tmp/klein9b_cpu_offloaded_resume10_smoke.safetensors` preserves the same
+  BF16/F32 state split.
+- Resume from the 10-step state through step `20` also completed from
+  `/tmp/klein9b_cpu_offloaded_resume10_smoke.safetensors`; losses for steps
+  `11-20` included several `.2-.8` range values (`0.7975194`, `0.6252446`,
+  `0.70147544`, `0.712633`, `0.24021716`, `0.6145748`) and the resume20 save
+  `/tmp/klein9b_cpu_offloaded_resume20_smoke.safetensors` passed the same
+  BF16/F32 product artifact split. Warmed timing shows the current path is
+  optimizer-bound: forward `2.52-2.68s`, backward `3.92-4.09s`, optimizer
+  `6.89-7.16s`.
+- The standalone sampler `serenitymojo/sampling/klein_sample_cli.mojo` now runs
+  separately from the trainer, preflights checkpoint/VAE/LoRA/cap files before
+  CUDA setup, and writes real 512x512 PNG smoke artifacts from the resumed
+  LoRA. Guided `cfg=4.0` one-step denoise measured `24.5s/step`; the fast
+  validation preset uses `cfg=1.0` and measured `3.1s/step`, including from
+  the resume20 LoRA at
+  `output/alina_train/klein_lora_resume20_fast512_cfg1.png`.
+- The default Klein sample caps for `alina_garden` and `alina_evening`
+  positive/negative prompts are now generated and validate as BF16
+  `[1,512,12288]`; cap-cache readiness is no longer a sampler-contract blocker.
+- Validation sampling now honors `lora_multiplier` by scaling the live adapter
+  contribution scalar before upload, without changing BF16 LoRA A/B storage.
+- `layer_norm`, `modulate`, and `residual_gate` now handle the Klein BF16
+  activation plus F32 modulation-vector boundary by casting the small
+  affine/modulation tensors internally and returning BF16 activations.
+- `klein_full_finetune_inventory_smoke` validates the current Klein 9B
+  transformer full-weight inventory at `201` keys, and
+  `klein_full_finetune_checkpoint_smoke` saves/loads the synthetic BF16
+  full-weight payload plus name manifest in that order. The new
+  `klein_full_finetune_state_smoke` also binds those `201` manifest tensors to
+  `604` TrainState sidecar tensors in `param.N`, `adam_m.N`, `adam_v.N`,
+  `__meta__` order. This is scaffolding for the later OneTrainer
+  full-finetune port; product full-finetune remains unsupported until
+  product-loop dispatch/parity, runtime rebind, and parity artifacts exist.
+
 - Removed the out-of-scope Qwen-Image helper files that were started before the
   target was corrected:
   - `serenitymojo/ops/qwenimage.mojo`
@@ -420,9 +463,13 @@ Implemented Mojo pieces:
   fast one-double/one-single slice.
 - `pipeline/klein9b_dit_full_smoke.mojo` proves all 201 DiT tensors and the
   complete 8+24 block sequence run on GPU at tiny token count.
-- `pipeline/klein9b_pipeline_1024_smoke.mojo` proves the current end-to-end
+- `pipeline/klein9b_pipeline_1024_smoke.mojo` exercises the current end-to-end
   Klein 9B 1024 image path. It is intentionally one denoise step with GPU
-  Gaussian noise, so it is a wiring/memory proof, not a quality target.
+  Gaussian noise, so it is a wiring/memory proof, not a quality target. It is
+  not OneTrainer sampler/trajectory/VAE-PNG parity or speed/VRAM parity. The
+  separate bounded trainer path now has `CPU_OFFLOADED` activation-tape product
+  smoke evidence, but full train-ref backward/AdamW replay parity is still
+  required before calling it production training parity.
 
 Missing Mojo pieces:
 

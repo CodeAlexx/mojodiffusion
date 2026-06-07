@@ -1,11 +1,27 @@
 # sampling/flux1_dev.mojo - FLUX.1-dev schedule and packed-latent contracts.
 #
-# Host-side scalar helpers ported from inference-flame
-# `src/sampling/flux1_sampling.rs`. Tensor pack/unpack remains in the pipeline
-# because it is a GPU layout operation; this module owns the dimensions and
-# schedule scalars that those GPU operations must obey.
+# Host-side scalar helpers mirroring local OneTrainer:
+#   * modules/modelSampler/FluxSampler.py
+#   * modules/modelSetup/BaseFluxSetup.py
+#   * modules/model/FluxModel.py
+# Tensor pack/unpack remains in the pipeline because it is a GPU layout
+# operation; this module owns the dimensions and schedule scalars that those GPU
+# operations must obey.
 
+from std.gpu.host import DeviceContext
 from std.math import exp
+
+from serenitymojo.tensor import Tensor
+from serenitymojo.ops.tensor_algebra import add, mul_scalar
+
+
+comptime FLUX1_DEV_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
+comptime FLUX1_DEV_NUM_TRAIN_TIMESTEPS = 1000
+comptime FLUX1_DEV_SCHEDULER_SHIFT = 3.0
+comptime FLUX1_DEV_BASE_IMAGE_SEQ_LEN = 256
+comptime FLUX1_DEV_MAX_IMAGE_SEQ_LEN = 4096
+comptime FLUX1_DEV_BASE_SHIFT = 0.5
+comptime FLUX1_DEV_MAX_SHIFT = 1.15
 
 
 def _ceil_div(a: Int, b: Int) raises -> Int:
@@ -14,6 +30,65 @@ def _ceil_div(a: Int, b: Int) raises -> Int:
     if b <= 0:
         raise Error("FLUX.1 ceil_div: denominator must be > 0")
     return (a + b - 1) // b
+
+
+def _close_f64(actual: Float64, expected: Float64) -> Bool:
+    var diff = actual - expected
+    if diff < 0.0:
+        diff = -diff
+    return diff <= 1.0e-9
+
+
+def _require_config_float(name: String, actual: Float64, expected: Float64) raises:
+    if not _close_f64(actual, expected):
+        raise Error(
+            name
+            + String(" mismatch: actual=")
+            + String(actual)
+            + String(" expected=")
+            + String(expected)
+        )
+
+
+def validate_flux1_flow_match_scheduler_config(
+    scheduler_class_name: String,
+    num_train_timesteps: Int,
+    shift: Float64,
+    base_image_seq_len: Int,
+    max_image_seq_len: Int,
+    base_shift: Float64,
+    max_shift: Float64,
+    use_dynamic_shifting: Bool,
+) raises:
+    """Fail-loud guard for the local OneTrainer FLUX.1-dev scheduler config."""
+    if scheduler_class_name != String(FLUX1_DEV_SCHEDULER_CLASS):
+        raise Error(
+            String("FLUX.1-dev scheduler class mismatch: ")
+            + scheduler_class_name
+        )
+    if num_train_timesteps != FLUX1_DEV_NUM_TRAIN_TIMESTEPS:
+        raise Error("FLUX.1-dev scheduler num_train_timesteps must be 1000")
+    if base_image_seq_len != FLUX1_DEV_BASE_IMAGE_SEQ_LEN:
+        raise Error("FLUX.1-dev scheduler base_image_seq_len must be 256")
+    if max_image_seq_len != FLUX1_DEV_MAX_IMAGE_SEQ_LEN:
+        raise Error("FLUX.1-dev scheduler max_image_seq_len must be 4096")
+    _require_config_float(
+        String("FLUX.1-dev scheduler shift"),
+        shift,
+        FLUX1_DEV_SCHEDULER_SHIFT,
+    )
+    _require_config_float(
+        String("FLUX.1-dev scheduler base_shift"),
+        base_shift,
+        FLUX1_DEV_BASE_SHIFT,
+    )
+    _require_config_float(
+        String("FLUX.1-dev scheduler max_shift"),
+        max_shift,
+        FLUX1_DEV_MAX_SHIFT,
+    )
+    if not use_dynamic_shifting:
+        raise Error("FLUX.1-dev scheduler must use dynamic timestep shifting")
 
 
 def flux1_mu(image_seq_len: Int) raises -> Float64:
@@ -35,6 +110,15 @@ def flux1_time_shift(mu: Float64, t: Float64) -> Float64:
         return t
     var em = exp(mu)
     return em / (em + (1.0 / t - 1.0))
+
+
+def flux1_dynamic_shift(image_seq_len: Int) raises -> Float64:
+    """OneTrainer FluxModel.calculate_timestep_shift return value.
+
+    FluxSampler passes `mu=math.log(shift)` into the scheduler, so this
+    exponentiated shift round-trips to `flux1_mu(image_seq_len)`.
+    """
+    return exp(flux1_mu(image_seq_len))
 
 
 def build_flux1_sigma_schedule(
@@ -59,6 +143,57 @@ def build_flux1_sigma_schedule(
 def flux1_euler_dt(current_t: Float32, next_t: Float32) -> Float32:
     """FLUX.1 Euler delta for `img = img + (next_t - current_t) * pred`."""
     return next_t - current_t
+
+
+def flux1_scheduler_timestep_from_sigma(sigma: Float32) -> Float32:
+    """Diffusers FlowMatch scheduler timestep value before OneTrainer `/ 1000`."""
+    return sigma * 1000.0
+
+
+def flux1_model_timestep_from_scheduler_timestep(timestep: Float32) -> Float32:
+    """OneTrainer transformer input convention: `timestep=expanded_timestep / 1000`."""
+    return timestep / 1000.0
+
+
+def flux1_model_timestep_from_sigma(sigma: Float32) -> Float32:
+    """The model sees the sigma value after the scheduler timestep is divided."""
+    return flux1_model_timestep_from_scheduler_timestep(
+        flux1_scheduler_timestep_from_sigma(sigma)
+    )
+
+
+def flux1_guidance_embed_value(cfg_scale: Float32) -> Float32:
+    """Flux.1-dev uses a guidance embedding value, not negative-prompt true CFG."""
+    return cfg_scale
+
+
+def flux1_cfg_batch_size() -> Int:
+    """OneTrainer FluxSampler runs a single model batch for FLUX.1-dev."""
+    return 1
+
+
+def flux1_euler_update_value(
+    latent_value: Float32,
+    noise_pred_value: Float32,
+    current_sigma: Float32,
+    next_sigma: Float32,
+) -> Float32:
+    """Scalar contract for `latent + (next_sigma - current_sigma) * pred`."""
+    return latent_value + flux1_euler_dt(current_sigma, next_sigma) * noise_pred_value
+
+
+def flux1_euler_step(
+    latents: Tensor,
+    noise_pred: Tensor,
+    current_sigma: Float32,
+    next_sigma: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Tensor Euler step matching OneTrainer's scheduler update convention."""
+    # F32 is only the schedule scalar here; tensor_algebra preserves tensor storage
+    # dtype at the latent/noise_pred boundary.
+    var scaled = mul_scalar(noise_pred, flux1_euler_dt(current_sigma, next_sigma), ctx)
+    return add(latents, scaled, ctx)
 
 
 def flux1_packed_spatial_dim(image_dim: Int) raises -> Int:
@@ -143,6 +278,16 @@ struct Flux1DevScheduler(Movable):
         if i < 0 or i >= self.num_steps:
             raise Error("Flux1DevScheduler.timestep: step out of range")
         return self._sigmas[i]
+
+    def scheduler_timestep(self, i: Int) raises -> Float32:
+        if i < 0 or i >= self.num_steps:
+            raise Error("Flux1DevScheduler.scheduler_timestep: step out of range")
+        return flux1_scheduler_timestep_from_sigma(self._sigmas[i])
+
+    def model_timestep(self, i: Int) raises -> Float32:
+        if i < 0 or i >= self.num_steps:
+            raise Error("Flux1DevScheduler.model_timestep: step out of range")
+        return flux1_model_timestep_from_sigma(self._sigmas[i])
 
     def dt(self, i: Int) raises -> Float32:
         if i < 0 or i >= self.num_steps:

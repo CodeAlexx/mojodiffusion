@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """prepare_sd35_cache.py — Build SD3.5 training cache from raw jpg/txt pairs.
 
-Cache format per EDv2 prepare_sd35.rs / OneTrainer #SD3-LoRA preset:
-  latent         : [1, 16, H/8, W/8] BF16  (VAE shift=0.0609, scale=1.5305)
-  text_embedding : [1, 154, 4096]    BF16  (77 CLIP-L/G padded + 77 T5)
-  pooled         : [1, 2048]         BF16  (clip_l_pool[768] + clip_g_pool[1280])
+Cache format follows OneTrainer StableDiffusion3BaseDataLoader:
+  latent_image                 : [1, 16, H/8, W/8] BF16 raw VAE posterior mean
+  tokens_1 / tokens_mask_1     : [1, 77] tokenizer output for CLIP-L
+  tokens_2 / tokens_mask_2     : [1, 77] tokenizer output for CLIP-G
+  tokens_3 / tokens_mask_3     : [1, 77] tokenizer output for T5
+  text_encoder_1_hidden_state  : [1, 77, 768]  BF16
+  text_encoder_1_pooled_state  : [1, 768]      BF16
+  text_encoder_2_hidden_state  : [1, 77, 1280] BF16
+  text_encoder_2_pooled_state  : [1, 1280]     BF16
+  text_encoder_3_hidden_state  : [1, 77, 4096] BF16
+
+VAE shift=0.0609 and scale=1.5305 are applied inside the train loop, matching
+BaseStableDiffusion3Setup.predict, not when writing the cache.
 
 Resolution: 1024x1024 (locked per EDv2 TRAIN_RES=1024).
 T5 max_len: 77 (hard: combined seq = 77+77=154).
@@ -138,40 +147,65 @@ def encode_text(
     t5_tok, t5_model,
     device: torch.device,
 ):
-    """Returns (text_embedding [1,154,4096] BF16, pooled [1,2048] BF16)."""
+    """Returns OneTrainer-style split text cache fields."""
     with torch.no_grad():
         # CLIP-L
-        cl_ids = clip_l_tok(caption, return_tensors="pt", max_length=CLIP_MAX_LEN,
-                            padding="max_length", truncation=True).input_ids.to(device)
+        cl_tok = clip_l_tok(
+            caption,
+            return_tensors="pt",
+            max_length=CLIP_MAX_LEN,
+            padding="max_length",
+            truncation=True,
+            return_attention_mask=True,
+        )
+        cl_ids = cl_tok.input_ids.to(device)
+        cl_mask = cl_tok.attention_mask.to(device)
         cl_out = clip_l_model(cl_ids, output_hidden_states=True)
         cl_h = cl_out.hidden_states[-2].to(torch.float32)   # [1,77,768]
         cl_pool = cl_out.pooler_output.to(torch.float32)    # [1,768]
 
         # CLIP-G
-        cg_ids = clip_g_tok(caption, return_tensors="pt", max_length=CLIP_MAX_LEN,
-                            padding="max_length", truncation=True).input_ids.to(device)
+        cg_tok = clip_g_tok(
+            caption,
+            return_tensors="pt",
+            max_length=CLIP_MAX_LEN,
+            padding="max_length",
+            truncation=True,
+            return_attention_mask=True,
+        )
+        cg_ids = cg_tok.input_ids.to(device)
+        cg_mask = cg_tok.attention_mask.to(device)
         cg_out = clip_g_model(cg_ids, output_hidden_states=True)
         cg_h = cg_out.hidden_states[-2].to(torch.float32)   # [1,77,1280]
         cg_pool = cg_out.text_embeds.to(torch.float32)      # [1,1280]
 
         # T5
-        t5_ids = t5_tok(caption, return_tensors="pt", max_length=T5_MAX_LEN,
-                        padding="max_length", truncation=True).input_ids.to(device)
+        t5_tok_out = t5_tok(
+            caption,
+            return_tensors="pt",
+            max_length=T5_MAX_LEN,
+            padding="max_length",
+            truncation=True,
+            return_attention_mask=True,
+        )
+        t5_ids = t5_tok_out.input_ids.to(device)
+        t5_mask = t5_tok_out.attention_mask.to(device)
         t5_out = t5_model(t5_ids)
         t5_h = t5_out.last_hidden_state.to(torch.float32)   # [1,77,4096]
 
-        # Combine: CLIP-L [1,77,768] + CLIP-G [1,77,1280] -> [1,77,2048] pad to [1,77,4096]
-        clip_lg = torch.cat([cl_h, cg_h], dim=-1)           # [1,77,2048]
-        pad = torch.zeros(1, CLIP_MAX_LEN, 4096 - 2048, device=device, dtype=torch.float32)
-        clip_lg_pad = torch.cat([clip_lg, pad], dim=-1)     # [1,77,4096]
-
-        # Combined context: [CLIP, T5] -> [1,154,4096]
-        context = torch.cat([clip_lg_pad, t5_h], dim=1)    # [1,154,4096]
-
-        # Pooled: [cl_pool, cg_pool] -> [1,2048]
-        pooled = torch.cat([cl_pool, cg_pool], dim=-1)     # [1,2048]
-
-    return context.to(torch.bfloat16), pooled.to(torch.bfloat16)
+    return {
+        "tokens_1": cl_ids.cpu(),
+        "tokens_mask_1": cl_mask.cpu(),
+        "text_encoder_1_hidden_state": cl_h.to(torch.bfloat16).cpu(),
+        "text_encoder_1_pooled_state": cl_pool.to(torch.bfloat16).cpu(),
+        "tokens_2": cg_ids.cpu(),
+        "tokens_mask_2": cg_mask.cpu(),
+        "text_encoder_2_hidden_state": cg_h.to(torch.bfloat16).cpu(),
+        "text_encoder_2_pooled_state": cg_pool.to(torch.bfloat16).cpu(),
+        "tokens_3": t5_ids.cpu(),
+        "tokens_mask_3": t5_mask.cpu(),
+        "text_encoder_3_hidden_state": t5_h.to(torch.bfloat16).cpu(),
+    }
 
 
 def main():
@@ -213,22 +247,25 @@ def main():
         img_t = load_image(str(img_path), TRAIN_RES).to(device)
         with torch.no_grad():
             dist = vae.encode(img_t).latent_dist
-            z = dist.sample()
-            z = (z - VAE_SHIFT) * VAE_SCALE
+            z = dist.mean
         latent = z.to(torch.bfloat16)
 
         # Encode text
-        text_embedding, pooled = encode_text(
+        text_cache = encode_text(
             caption, cl_tok, cl_model, cg_tok, cg_model, t5_tok, t5_model, device
         )
 
         out = {
-            "latent": latent.cpu(),
-            "text_embedding": text_embedding.cpu(),
-            "pooled": pooled.cpu(),
+            "latent_image": latent.cpu(),
         }
+        out.update(text_cache)
         save_file(out, str(out_file))
-        print(f"  -> latent {latent.shape}, text {text_embedding.shape}, pooled {pooled.shape}")
+        print(
+            "  -> latent_image "
+            f"{latent.shape}, te1 {out['text_encoder_1_hidden_state'].shape}, "
+            f"te2 {out['text_encoder_2_hidden_state'].shape}, "
+            f"te3 {out['text_encoder_3_hidden_state'].shape}"
+        )
 
     print(f"[done] Cache at {out_dir}")
 

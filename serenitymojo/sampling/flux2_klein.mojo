@@ -1,11 +1,14 @@
-# sampling/flux2_klein.mojo — FLUX.2 / Klein flow-matching scheduler glue.
+# sampling/flux2_klein.mojo — shared FLUX.2 dev/Klein scheduler glue.
 #
-# Ported from:
-#   * inference-flame/src/sampling/klein_sampling.rs
-#   * /home/alex/modular/max/python/max/pipelines/diffusion/schedulers/
-#     scheduling_flow_match_euler_discrete.py
-#   * /home/alex/modular/max/python/max/pipelines/architectures/flux2/
-#     components/{cfg_combine.py,denoise_predict.py}
+# Local OneTrainer references:
+#   * modules/modelSampler/Flux2Sampler.py
+#   * modules/modelSetup/BaseFlux2Setup.py
+#   * modules/model/Flux2Model.py
+#   * modules/modelLoader/Flux2ModelLoader.py
+#
+# OneTrainer uses one Flux2Sampler for both Flux2 dev and Flux2/Klein. The
+# product runner split is still separate: sharing these scalar schedule helpers
+# does not make Flux2 dev dispatchable through the Klein runner.
 #
 # The schedule is host-side scalar setup. The per-step latent update and CFG
 # combine stay on GPU through serenitymojo tensor ops. Production inference must
@@ -21,7 +24,8 @@ from serenitymojo.ops.tensor_algebra import add, sub, mul_scalar
 def compute_empirical_mu(image_seq_len: Int, num_steps: Int) -> Float64:
     """BFL FLUX.2 empirical `mu` as a function of packed image token count.
 
-    Reference: inference-flame `klein_sampling.rs::compute_empirical_mu`.
+    OneTrainer Flux2Sampler imports `compute_empirical_mu` and passes the result
+    as `mu` to FlowMatchEulerDiscreteScheduler.set_timesteps.
     `image_seq_len` is the packed latent token count, e.g. 1024x1024 Klein:
     output / 16 => 64x64 packed tokens => 4096.
     """
@@ -52,13 +56,11 @@ def time_snr_shift(t: Float64, mu: Float64) -> Float64:
 def build_flux2_sigma_schedule(
     num_steps: Int, image_seq_len: Int
 ) raises -> List[Float32]:
-    """Build `num_steps + 1` descending FLUX.2/Klein sigmas.
+    """Build `num_steps + 1` descending FLUX.2 dev/Klein sigmas.
 
-    Equivalent forms in the references:
-    - inference-flame builds `linspace(1, 0, num_steps+1)` then shifts.
-    - Modular builds `linspace(1, 1/num_steps, num_steps)`, shifts, then
-      appends 0.0.
-    Those produce the same table.
+    OneTrainer Flux2Sampler supplies `np.linspace(1.0, 1/num_steps, num_steps)`
+    and an empirical `mu`. This helper emits the equivalent shifted body plus the
+    terminal 0.0 used for `dt = sigma[i+1] - sigma[i]`.
     """
     if num_steps <= 0:
         raise Error("build_flux2_sigma_schedule: num_steps must be > 0")
@@ -77,11 +79,10 @@ def build_flux2_sigma_schedule(
 def build_flux2_fixed_shift_schedule(
     num_steps: Int, shift: Float32
 ) raises -> List[Float32]:
-    """Klein edit/img2img fixed-shift schedule from `klein_sampling.rs`.
+    """Legacy Klein edit/img2img fixed-shift schedule.
 
-    This is the legacy/ComfyUI-compatible path used by the inference-flame
-    Klein edit bins (`SHIFT = 2.02`). It samples a 10k-entry shifted sigma
-    buffer and appends terminal 0.0.
+    This is not the OneTrainer Flux2Sampler path, which uses empirical `mu` plus
+    explicit linspace sigmas. Kept for existing Klein edit/img2img smokes.
     """
     if num_steps <= 0:
         raise Error("build_flux2_fixed_shift_schedule: num_steps must be > 0")
@@ -125,6 +126,42 @@ def build_flux2_img2img_sigmas(
     return out^
 
 
+def flux2_scheduler_timestep_from_sigma(sigma: Float32) -> Float32:
+    """Diffusers FlowMatch scheduler timestep value before OneTrainer `/ 1000`."""
+    return sigma * 1000.0
+
+
+def flux2_model_timestep_from_scheduler_timestep(timestep: Float32) -> Float32:
+    """OneTrainer Flux2Sampler transformer input: `expanded_timestep / 1000`."""
+    return timestep / 1000.0
+
+
+def flux2_model_timestep_from_sigma(sigma: Float32) -> Float32:
+    """The model sees the sigma value after scheduler timestep division."""
+    return flux2_model_timestep_from_scheduler_timestep(
+        flux2_scheduler_timestep_from_sigma(sigma)
+    )
+
+
+def flux2_cfg_batch_size(guidance_scale: Float32, guidance_embeds: Bool) -> Int:
+    """OneTrainer Flux2Sampler true-CFG batch rule."""
+    if guidance_scale > 1.0 and not guidance_embeds:
+        return 2
+    return 1
+
+
+def flux2_guidance_embed_value(cfg_scale: Float32) -> Float32:
+    """Flux2 dev/Klein guidance-embed path passes cfg_scale directly."""
+    return cfg_scale
+
+
+def flux2_cfg_value(
+    pred_pos: Float32, pred_neg: Float32, guidance_scale: Float32
+) -> Float32:
+    """Scalar textbook CFG: `neg + scale * (pos - neg)`."""
+    return pred_neg + guidance_scale * (pred_pos - pred_neg)
+
+
 def flux2_cfg(
     pred_pos: Tensor, pred_neg: Tensor, guidance_scale: Float32, ctx: DeviceContext
 ) raises -> Tensor:
@@ -139,19 +176,35 @@ def flux2_cfg(
     return add(pred_neg, scaled, ctx)
 
 
+def flux2_euler_dt(current_sigma: Float32, next_sigma: Float32) -> Float32:
+    return next_sigma - current_sigma
+
+
+def flux2_euler_update_value(
+    latent_value: Float32,
+    noise_pred_value: Float32,
+    current_sigma: Float32,
+    next_sigma: Float32,
+) -> Float32:
+    """Scalar contract for `latent + (next_sigma - current_sigma) * pred`."""
+    return latent_value + flux2_euler_dt(current_sigma, next_sigma) * noise_pred_value
+
+
 def flux2_euler_step(
     latents: Tensor, noise_pred: Tensor, dt: Float32, ctx: DeviceContext
 ) raises -> Tensor:
-    """One FLUX.2/Klein Euler step: `latents + dt * noise_pred`.
+    """One FLUX.2 dev/Klein Euler step: `latents + dt * noise_pred`.
 
     `dt` is `sigma[i+1] - sigma[i]` and is normally negative.
     """
+    # F32 is only the schedule delta; tensor_algebra preserves tensor storage
+    # dtype for BF16/F16 latent and prediction carriers.
     var scaled = mul_scalar(noise_pred, dt, ctx)
     return add(latents, scaled, ctx)
 
 
 struct Flux2KleinScheduler(Movable):
-    """Host scalar schedule plus GPU tensor update for FLUX.2/Klein."""
+    """Host scalar schedule plus GPU tensor update for FLUX.2 dev/Klein."""
 
     var _sigmas: List[Float32]
     var num_steps: Int
@@ -172,10 +225,20 @@ struct Flux2KleinScheduler(Movable):
             raise Error("Flux2KleinScheduler.timestep: step out of range")
         return self._sigmas[i]
 
+    def scheduler_timestep(self, i: Int) raises -> Float32:
+        if i < 0 or i >= self.num_steps:
+            raise Error("Flux2KleinScheduler.scheduler_timestep: step out of range")
+        return flux2_scheduler_timestep_from_sigma(self._sigmas[i])
+
+    def model_timestep(self, i: Int) raises -> Float32:
+        if i < 0 or i >= self.num_steps:
+            raise Error("Flux2KleinScheduler.model_timestep: step out of range")
+        return flux2_model_timestep_from_sigma(self._sigmas[i])
+
     def dt(self, i: Int) raises -> Float32:
         if i < 0 or i >= self.num_steps:
             raise Error("Flux2KleinScheduler.dt: step out of range")
-        return self._sigmas[i + 1] - self._sigmas[i]
+        return flux2_euler_dt(self._sigmas[i], self._sigmas[i + 1])
 
     def step(
         self, latents: Tensor, noise_pred: Tensor, i: Int, ctx: DeviceContext

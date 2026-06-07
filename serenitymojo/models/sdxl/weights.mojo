@@ -16,15 +16,14 @@
 #   {prefix}.out_layers.3.weight/bias   Conv3x3        OIHW [Cout,Cout,3,3] / [Cout]
 #   {prefix}.skip_connection.weight/bias  Conv1x1 OIHW [Cout,Cin,1,1] (only Cin!=Cout)
 #
-# All tensors are returned as F32 device Tensors (training-side compute dtype;
-# the conv2d backward + group_norm backward are F32 primitives).
+# GroupNorm, embedding-linear, and conv tensors preserve checkpoint dtype. Conv
+# weights are remapped OIHW -> RSCF on the host without widening BF16/F16 lists.
 
 from std.gpu.host import DeviceContext
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 
 
 # Does the safetensors contain `name`? (SafeTensors has no .has(); scan names.)
@@ -36,28 +35,53 @@ def _has(st: SafeTensors, name: String) -> Bool:
     return False
 
 
-# Read one named tensor from the safetensors as an F32 device Tensor.
-def _load_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
+# Read one named tensor from the safetensors preserving checkpoint storage dtype.
+def _load_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx)
+    return Tensor.from_view(tv, ctx)
 
 
-# Load a PyTorch conv weight (OIHW [Cout,Cin,Kh,Kw]) and remap on host to RSCF
-# [Kh,Kw,Cin,Cout]. Index remap proven in sdxl_unet.mojo::_to_rscf:
-#   OIHW idx = ((o*Cin + ci)*Kh + r)*Kw + s
-#   RSCF idx = ((r*Kw + s)*Cin + ci)*Cout + o
-def _load_conv_rscf(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
-    var w = _load_f32(st, name, ctx)
-    var sh = w.shape()
-    if len(sh) != 4:
-        raise Error(String("conv weight ") + name + " not rank-4 OIHW")
-    var cout = sh[0]
-    var cin = sh[1]
-    var kh = sh[2]
-    var kw = sh[3]
+def _rscf_shape(kh: Int, kw: Int, cin: Int, cout: Int) -> List[Int]:
+    var rshape = List[Int]()
+    rshape.append(kh); rshape.append(kw); rshape.append(cin); rshape.append(cout)
+    return rshape^
+
+
+def _load_conv_rscf_bf16(var w: Tensor, kh: Int, kw: Int, cin: Int, cout: Int, ctx: DeviceContext) raises -> Tensor:
+    var host = w.to_host_bf16(ctx)
+    var rscf = List[BFloat16]()
+    var total = kh * kw * cin * cout
+    for _ in range(total):
+        rscf.append(BFloat16(Float32(0.0)))
+    for o in range(cout):
+        for ci in range(cin):
+            for r in range(kh):
+                for s in range(kw):
+                    var src = ((o * cin + ci) * kh + r) * kw + s
+                    var dst = ((r * kw + s) * cin + ci) * cout + o
+                    rscf[dst] = host[src]
+    return Tensor.from_host_bf16(rscf^, _rscf_shape(kh, kw, cin, cout), ctx)
+
+
+def _load_conv_rscf_f16(var w: Tensor, kh: Int, kw: Int, cin: Int, cout: Int, ctx: DeviceContext) raises -> Tensor:
+    var host = w.to_host_f16(ctx)
+    var rscf = List[Float16]()
+    var total = kh * kw * cin * cout
+    for _ in range(total):
+        rscf.append(Float16(0.0))
+    for o in range(cout):
+        for ci in range(cin):
+            for r in range(kh):
+                for s in range(kw):
+                    var src = ((o * cin + ci) * kh + r) * kw + s
+                    var dst = ((r * kw + s) * cin + ci) * cout + o
+                    rscf[dst] = host[src]
+    return Tensor.from_host_f16(rscf^, _rscf_shape(kh, kw, cin, cout), ctx)
+
+
+def _load_conv_rscf_f32(var w: Tensor, kh: Int, kw: Int, cin: Int, cout: Int, ctx: DeviceContext) raises -> Tensor:
     var host = w.to_host(ctx)
     var rscf = List[Float32]()
     var total = kh * kw * cin * cout
@@ -70,13 +94,31 @@ def _load_conv_rscf(st: SafeTensors, name: String, ctx: DeviceContext) raises ->
                     var src = ((o * cin + ci) * kh + r) * kw + s
                     var dst = ((r * kw + s) * cin + ci) * cout + o
                     rscf[dst] = host[src]
-    var rshape = List[Int]()
-    rshape.append(kh); rshape.append(kw); rshape.append(cin); rshape.append(cout)
-    return Tensor.from_host(rscf, rshape^, STDtype.F32, ctx)
+    return Tensor.from_host(rscf^, _rscf_shape(kh, kw, cin, cout), STDtype.F32, ctx)
+
+
+# Load a PyTorch conv weight (OIHW [Cout,Cin,Kh,Kw]) and remap on host to RSCF
+# [Kh,Kw,Cin,Cout]. Index remap proven in sdxl_unet.mojo::_to_rscf:
+#   OIHW idx = ((o*Cin + ci)*Kh + r)*Kw + s
+#   RSCF idx = ((r*Kw + s)*Cin + ci)*Cout + o
+def load_conv_rscf_checkpoint_dtype(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
+    var w = _load_tensor(st, name, ctx)
+    var sh = w.shape()
+    if len(sh) != 4:
+        raise Error(String("conv weight ") + name + " not rank-4 OIHW")
+    var cout = sh[0]
+    var cin = sh[1]
+    var kh = sh[2]
+    var kw = sh[3]
+    if w.dtype() == STDtype.BF16:
+        return _load_conv_rscf_bf16(w^, kh, kw, cin, cout, ctx)
+    if w.dtype() == STDtype.F16:
+        return _load_conv_rscf_f16(w^, kh, kw, cin, cout, ctx)
+    return _load_conv_rscf_f32(w^, kh, kw, cin, cout, ctx)
 
 
 struct ResBlockWeights(Movable):
-    """One SDXL ResBlock's weights, F32, conv filters in RSCF.
+    """One SDXL ResBlock's weights, conv filters in RSCF.
 
     gn1_w/gn1_b: GroupNorm1 scale/shift   [Cin]
     conv1_w:     Conv1 filter RSCF        [3,3,Cin,Cout]
@@ -127,22 +169,22 @@ struct ResBlockWeights(Movable):
 def load_resblock_weights(
     st: SafeTensors, prefix: String, ctx: DeviceContext
 ) raises -> ResBlockWeights:
-    var gn1_w = _load_f32(st, prefix + String(".in_layers.0.weight"), ctx)
-    var gn1_b = _load_f32(st, prefix + String(".in_layers.0.bias"), ctx)
-    var conv1_w = _load_conv_rscf(st, prefix + String(".in_layers.2.weight"), ctx)
-    var conv1_b = _load_f32(st, prefix + String(".in_layers.2.bias"), ctx)
-    var emb_w = _load_f32(st, prefix + String(".emb_layers.1.weight"), ctx)
-    var emb_b = _load_f32(st, prefix + String(".emb_layers.1.bias"), ctx)
-    var gn2_w = _load_f32(st, prefix + String(".out_layers.0.weight"), ctx)
-    var gn2_b = _load_f32(st, prefix + String(".out_layers.0.bias"), ctx)
-    var conv2_w = _load_conv_rscf(st, prefix + String(".out_layers.3.weight"), ctx)
-    var conv2_b = _load_f32(st, prefix + String(".out_layers.3.bias"), ctx)
+    var gn1_w = _load_tensor(st, prefix + String(".in_layers.0.weight"), ctx)
+    var gn1_b = _load_tensor(st, prefix + String(".in_layers.0.bias"), ctx)
+    var conv1_w = load_conv_rscf_checkpoint_dtype(st, prefix + String(".in_layers.2.weight"), ctx)
+    var conv1_b = _load_tensor(st, prefix + String(".in_layers.2.bias"), ctx)
+    var emb_w = _load_tensor(st, prefix + String(".emb_layers.1.weight"), ctx)
+    var emb_b = _load_tensor(st, prefix + String(".emb_layers.1.bias"), ctx)
+    var gn2_w = _load_tensor(st, prefix + String(".out_layers.0.weight"), ctx)
+    var gn2_b = _load_tensor(st, prefix + String(".out_layers.0.bias"), ctx)
+    var conv2_w = load_conv_rscf_checkpoint_dtype(st, prefix + String(".out_layers.3.weight"), ctx)
+    var conv2_b = _load_tensor(st, prefix + String(".out_layers.3.bias"), ctx)
 
     var skip_key = prefix + String(".skip_connection.weight")
     var has_skip = _has(st, skip_key)
     if has_skip:
-        var skip_w = _load_conv_rscf(st, skip_key, ctx)
-        var skip_b = _load_f32(st, prefix + String(".skip_connection.bias"), ctx)
+        var skip_w = load_conv_rscf_checkpoint_dtype(st, skip_key, ctx)
+        var skip_b = _load_tensor(st, prefix + String(".skip_connection.bias"), ctx)
         return ResBlockWeights(
             gn1_w^, gn1_b^, conv1_w^, conv1_b^, emb_w^, emb_b^,
             gn2_w^, gn2_b^, conv2_w^, conv2_b^, True, skip_w^, skip_b^,

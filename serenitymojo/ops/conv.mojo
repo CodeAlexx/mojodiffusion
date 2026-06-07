@@ -255,7 +255,11 @@ def conv2d[
         or wshape[3] != Cout
     ):
         raise Error("conv2d: weight must be RSCF [Kh,Kw,Cin,Cout]")
-    if x.dtype() != weight.dtype():
+    var mixed_checkpoint_weight = (
+        x.dtype() == STDtype.F32
+        and (weight.dtype() == STDtype.BF16 or weight.dtype() == STDtype.F16)
+    )
+    if x.dtype() != weight.dtype() and not mixed_checkpoint_weight:
         raise Error("conv2d: x/weight dtype mismatch")
 
     # Fast path: im2col + F32-accumulated `linear` gemm (numerically equal to the

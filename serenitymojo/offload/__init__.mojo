@@ -11,6 +11,8 @@
 #                   unload_block(block). Block drop frees the device buffers.
 #   plan          — metadata-only block order, dtype, CFG branch, and lookahead.
 #   planned_loader — BlockPlan-aware wrapper over BlockLoader with handle/stats.
+#   conductor_policy — OneTrainer CPU_OFFLOADED scalar policy and loaded-byte
+#                   target math; no tensor movement or CUDA allocation.
 #   turbo_slots   — metadata-only two-slot backend skeleton; no async/VMM yet.
 #   residency     — Phase 2: BlockState FSM, ResidencyEntry, BudgetTracker,
 #                   ResidencyManager (eviction/prefetch scheduling brain).

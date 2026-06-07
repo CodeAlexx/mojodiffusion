@@ -26,9 +26,23 @@ from serenitymojo.ops.tensor_algebra import permute, reshape, add, mul_scalar
 from serenitymojo.image.png import save_png, ValueRange
 
 
-# OneTrainer BaseModelSampler.quantize_resolution: round to a multiple of `q`.
+# OneTrainer BaseModelSampler.quantize_resolution:
+#   return round(resolution / quantization) * quantization
+# Python round uses bankers ties, so exact half-grid values round to the even
+# quotient. That matters for odd test sizes such as 1056 at q=64.
 def quantize_resolution(resolution: Int, quantization: Int) -> Int:
-    return ((resolution + quantization // 2) // quantization) * quantization
+    if quantization <= 0:
+        return resolution
+    var quotient = resolution // quantization
+    var remainder = resolution - quotient * quantization
+    var twice = remainder * 2
+    if twice < quantization:
+        return quotient * quantization
+    if twice > quantization:
+        return (quotient + 1) * quantization
+    if quotient % 2 == 0:
+        return quotient * quantization
+    return (quotient + 1) * quantization
 
 
 # Latent grid edge for a pixel resolution: Klein packs res/16 tokens per side

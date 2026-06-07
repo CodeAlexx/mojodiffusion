@@ -42,8 +42,8 @@ from serenitymojo.ops.linalg_backward import (
 from serenitymojo.ops.tensor_algebra import add, concat, mul_scalar, slice
 from serenitymojo.scratch_ring import ScratchRingAllocator
 
-# REUSE the trainer's LoRA structs (the target authority).
-from serenitymojo.training.train_step import LoraAdapter, LoraGrads
+# REUSE the core OneTrainer-style LoRA structs (BF16 storage + SR AdamW).
+from serenitymojo.models.klein.lora_adapter import LoraAdapter, LoraGrads
 
 
 comptime TArc = ArcPointer[Tensor]

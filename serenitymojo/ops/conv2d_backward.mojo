@@ -40,6 +40,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -218,8 +219,8 @@ def conv2d_backward[
     comptime Wo = (Wi + 2 * pad_w - Kw) // stride_w + 1
 
     # ── loud-fail shape / dtype validation ───────────────────────────────────
-    if x.dtype() != weight.dtype() or x.dtype() != grad_y.dtype():
-        raise Error("conv2d_backward: x/weight/grad_y dtype mismatch")
+    if x.dtype() != grad_y.dtype():
+        raise Error("conv2d_backward: x/grad_y dtype mismatch")
     var xshape = x.shape()
     if (
         len(xshape) != 4
@@ -241,6 +242,21 @@ def conv2d_backward[
         or gshape[2] != Wo or gshape[3] != Cout
     ):
         raise Error("conv2d_backward: grad_y shape must match [N,Ho,Wo,Cout]")
+    if x.dtype() != weight.dtype():
+        if x.dtype() != STDtype.F32:
+            raise Error("conv2d_backward: mixed checkpoint weight requires F32 activations")
+        if weight.dtype() != STDtype.BF16 and weight.dtype() != STDtype.F16:
+            raise Error("conv2d_backward: unsupported mixed checkpoint weight dtype")
+        var compute_weight = cast_tensor(weight, x.dtype(), ctx)
+        var mixed = conv2d_backward[
+            N, Hi, Wi, Cin, Kh, Kw, Cout, stride_h, stride_w, pad_h, pad_w
+        ](x, compute_weight^, grad_y, ctx)
+        var d_x = mixed.d_x.clone(ctx)
+        var d_w_src = mixed.d_w.clone(ctx)
+        var d_b_src = mixed.d_b.clone(ctx)
+        var d_w = cast_tensor(d_w_src^, weight.dtype(), ctx)
+        var d_b = cast_tensor(d_b_src^, weight.dtype(), ctx)
+        return Conv2dBwd(d_x^, d_w^, d_b^)
 
     # ── flat (1-D) views of the device buffers ───────────────────────────────
     comptime nx = N * Hi * Wi * Cin

@@ -1,10 +1,9 @@
 # training/lr_schedule.mojo — learning-rate scheduler dispatch (Wave 2A item 2a).
 #
-# Pure host F32 scalar math (no device). Ports EDv2
-# EriDiffusion-v2/crates/eridiffusion-core/src/training/features/lr_schedule.rs
-# (constant+warmup / linear / cosine / cosine-with-restarts / polynomial / rex)
-# VERBATIM. Each fn mirrors the Rust math line-for-line so the host parity
-# oracle (the Rust formula recomputed in F64) matches to 1e-6.
+# Pure host F32 scalar math (no device). Ports OneTrainer
+# modules/util/lr_scheduler_util.py for the scheduler kinds used by the target
+# presets. Each fn mirrors the Python lambda math so the host parity oracle
+# matches to 1e-6.
 #
 # ── Default-off invariance ────────────────────────────────────────────────────
 # LR_CONSTANT with warmup_steps=0 returns base_lr for EVERY step — byte-identical
@@ -16,8 +15,8 @@
 #   LR_CONSTANT             0  -> constant_lr (linear warmup -> flat base)
 #   LR_LINEAR               1  -> linear_lr
 #   LR_COSINE               2  -> cosine_lr
-#   LR_COSINE_RESTARTS      3  -> cosine_restarts_lr
-#   LR_POLYNOMIAL           4  -> polynomial_lr (power=2.0, matches Rust default)
+#   LR_COSINE_RESTARTS      3  -> OneTrainer COSINE_WITH_RESTARTS
+#   LR_POLYNOMIAL           4  -> local extension, not a OneTrainer enum member
 #   LR_REX                  5  -> rex_lr
 #
 # Mojo 1.0.0b1.
@@ -92,19 +91,24 @@ def cosine_lr(
     return base_lr * (min_factor + (Float32(1.0) - min_factor) * cos_factor)
 
 
-# ── LR_COSINE_RESTARTS: cosine with `cycles` hard restarts ────────────────────
+# ── LR_COSINE_RESTARTS: OneTrainer COSINE_WITH_RESTARTS ──────────────────────
 def cosine_restarts_lr(
     base_lr: Float32, step: Int, total_steps: Int, warmup_steps: Int,
     min_factor: Float32, cycles: Float32,
 ) -> Float32:
     if step < warmup_steps:
         return constant_lr(base_lr, step, warmup_steps)
-    var progress = _progress(step, total_steps, warmup_steps)
+    var s = step - warmup_steps
+    var scheduler_steps = total_steps - warmup_steps
+    if scheduler_steps < 1:
+        scheduler_steps = 1
+    if s > scheduler_steps - 1:
+        s = scheduler_steps - 1
+    var progress = Float32(s) / Float32(scheduler_steps)
     var c = cycles
     if c < Float32(1.0):
         c = Float32(1.0)
-    var cycle_progress = _fract(progress * c)
-    var cos_factor = Float32(0.5) * (Float32(1.0) + cos(_PI * cycle_progress))
+    var cos_factor = Float32(0.5) * (Float32(1.0) + cos(Float32(2.0) * _PI * progress * c))
     return base_lr * (min_factor + (Float32(1.0) - min_factor) * cos_factor)
 
 
@@ -120,16 +124,22 @@ def polynomial_lr(
     return base_lr * (min_factor + (Float32(1.0) - min_factor) * factor)
 
 
-# ── LR_REX: reflected-exponential schedule (Mishra & Sarawagi 2019) ───────────
+# ── LR_REX: OneTrainer REX lambda, d=0.9 ─────────────────────────────────────
 def rex_lr(
     base_lr: Float32, step: Int, total_steps: Int, warmup_steps: Int, min_factor: Float32
 ) -> Float32:
     if step < warmup_steps:
         return constant_lr(base_lr, step, warmup_steps)
-    var progress = _progress(step, total_steps, warmup_steps)
-    var factor = (Float32(1.0) - progress) / (Float32(1.0) - Float32(0.5) * progress)
-    if factor < Float32(0.0):
-        factor = Float32(0.0)
+    var s = step - warmup_steps
+    var scheduler_steps = total_steps - warmup_steps
+    if scheduler_steps < 1:
+        scheduler_steps = 1
+    var factor = Float32(0.0)
+    if s < scheduler_steps:
+        var progress = Float32(s) / Float32(scheduler_steps)
+        var d = Float32(0.9)
+        var div = (Float32(1.0) - d) + (d * (Float32(1.0) - progress))
+        factor = (Float32(1.0) - progress) / div
     return base_lr * (min_factor + (Float32(1.0) - min_factor) * factor)
 
 
@@ -141,7 +151,7 @@ def lr_for_step(
     """Dispatch a learning-rate value for `step` based on `kind`.
 
     Default-off: kind=LR_CONSTANT with warmup_steps=0 returns base_lr exactly.
-    Mirrors lr_schedule.rs:136-157 (dispatch_lr)."""
+    Mirrors OneTrainer's scheduler lambda dispatch."""
     if kind == LR_CONSTANT:
         return constant_lr(base_lr, step, warmup_steps)
     elif kind == LR_LINEAR:

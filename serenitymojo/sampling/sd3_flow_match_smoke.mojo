@@ -1,7 +1,8 @@
-# SD3 shifted-flow tensor scheduler smoke.
+# SD3 OneTrainer FlowMatch tensor scheduler smoke.
 #
 # Tiny tensor-only check for the production SD3 scheduler surface: textbook CFG,
-# model timestep scaling, negative Euler deltas, and `x + v * dt` update.
+# set_timesteps(num_steps) schedule, model timestep scaling, negative Euler
+# deltas, textbook CFG, and `x + v * dt` update.
 
 from std.gpu.host import DeviceContext
 
@@ -43,10 +44,11 @@ def main() raises:
     if len(sigmas) != SD3_LARGE_NUM_STEPS + 1:
         raise Error("SD3 flow-match schedule length mismatch")
     _check_close(String("sigma[0]"), sigmas[0], 1.0, 0.000001)
-    _check_close(String("sigma[1]"), sigmas[1], 0.9878049, 0.000001)
-    _check_close(String("sigma[14]"), sigmas[14], 0.75, 0.000001)
+    _check_close(String("sigma[1]"), sigmas[1], 0.98738063, 0.000001)
+    _check_close(String("sigma[14]"), sigmas[14], 0.73705584, 0.000001)
+    _check_close(String("sigma[27]"), sigmas[27], 0.00892857, 0.000001)
     _check_close(String("sigma[28]"), sigmas[28], 0.0, 0.000001)
-    _check_close(String("model_timestep[1]"), sched.model_timestep(1), 987.8049, 0.001)
+    _check_close(String("model_timestep[1]"), sched.model_timestep(1), 987.38063, 0.001)
 
     for i in range(SD3_LARGE_NUM_STEPS):
         if sched.dt(i) >= 0.0:
@@ -73,6 +75,24 @@ def main() raises:
     var sv2 = stepped2.to_host(ctx)
     _check_close(String("standalone_step[1]"), sv2[1], 2.0 + dt, 0.000001)
 
+    var bf16_uncond = Tensor.from_host([1.0, 1.0, 1.0, 1.0], sh.copy(), STDtype.BF16, ctx)
+    var bf16_cond = Tensor.from_host([2.0, 4.0, 2.0, 4.0], sh.copy(), STDtype.BF16, ctx)
+    var bf16_guided = sd3_cfg(bf16_cond, bf16_uncond, 2.0, ctx)
+    if bf16_guided.dtype() != STDtype.BF16:
+        raise Error("SD3 CFG changed BF16 tensor dtype")
+    var bf16_guided_host = bf16_guided.to_host(ctx)
+    _check_close(String("bf16 cfg[0]"), bf16_guided_host[0], 3.0, 0.0001)
+    _check_close(String("bf16 cfg[1]"), bf16_guided_host[1], 7.0, 0.0001)
+
+    var bf16_latent = Tensor.from_host([0.5, -0.5, 0.5, -0.5], sh.copy(), STDtype.BF16, ctx)
+    var bf16_velocity = Tensor.from_host([1.0, -2.0, 1.0, -2.0], sh.copy(), STDtype.BF16, ctx)
+    var bf16_stepped = sd3_euler_step(bf16_latent, bf16_velocity, -0.25, ctx)
+    if bf16_stepped.dtype() != STDtype.BF16:
+        raise Error("SD3 Euler step changed BF16 tensor dtype")
+    var bf16_stepped_host = bf16_stepped.to_host(ctx)
+    _check_close(String("bf16 step[0]"), bf16_stepped_host[0], 0.25, 0.0001)
+    _check_close(String("bf16 step[1]"), bf16_stepped_host[1], 0.0, 0.0001)
+
     print(
         "[sd3-flow-match] steps/shift first/mid/last=",
         sched.num_steps,
@@ -87,12 +107,14 @@ def main() raises:
     if len(medium_sigmas) != SD3_MEDIUM_NUM_STEPS + 1:
         raise Error("SD3 medium flow-match schedule length mismatch")
     _check_close(String("medium sigma[0]"), medium_sigmas[0], 1.0, 0.000001)
-    _check_close(String("medium sigma[14]"), medium_sigmas[14], 0.75, 0.000001)
+    _check_close(String("medium sigma[1]"), medium_sigmas[1], 0.98738063, 0.000001)
+    _check_close(String("medium sigma[14]"), medium_sigmas[14], 0.73705584, 0.000001)
+    _check_close(String("medium sigma[27]"), medium_sigmas[27], 0.00892857, 0.000001)
     _check_close(String("medium sigma[28]"), medium_sigmas[28], 0.0, 0.000001)
     _check_close(
         String("medium model_timestep[1]"),
         medium.medium_model_timestep(1),
-        987.8049,
+        987.38063,
         0.001,
     )
     print(

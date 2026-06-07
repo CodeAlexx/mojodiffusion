@@ -6,8 +6,8 @@
 #
 # Pipeline per step (mirrors train_ernie.rs:853-1130 + BaseErnieSetup.py predict):
 #   1. Load a cached sample produced by prepare_ernie.rs:
-#        latent          [1,128,32,32] F32  (post-VAE post-patchify, 128-ch)
-#        text_embedding  [1,512,3072]  F32  (Mistral-3B layer hidden states, PAD-padded)
+#        latent          [1,128,32,32]  (read back as BF16 runtime carrier)
+#        text_embedding  [1,512,3072]   (read back as BF16 runtime carrier)
 #        text_real_len   [1]                (real token count, pre-pad)
 #   2. latent -> img_tokens [N_IMG,128]  (NCHW->NHWC pack; N_IMG = 32*32 = 1024)
 #      text   -> txt_tokens [N_TXT,3072] (fixed comptime trim to N_TXT rows of the cache)
@@ -57,12 +57,10 @@ from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.ffi import sys_system
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.io.sharded import ShardedSafeTensors
-from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.embeddings import timestep_embedding_sin_first
 
-from serenitymojo.models.dit.ernie_contract import ERNIE_TRANSFORMER_DIR
 from serenitymojo.models.dit.ernie_image import build_ernie_rope_tables
 from serenitymojo.models.ernie.weights import (
     ErnieBlockWeights, ErnieStackBase,
@@ -78,8 +76,31 @@ from serenitymojo.models.ernie.ernie_stack_lora import (
     save_ernie_lora_state, load_ernie_lora_state,
 )
 from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.onetrainer_cache_preflight import (
+    create_onetrainer_cache_preflight_plan,
+    validate_onetrainer_cache_preflight_plan,
+)
 from serenitymojo.training.sample_prompt_config import (
-    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+    SamplePrompt, SamplePromptConfig, SampleCadence,
+    read_sample_prompt_config, read_sample_cadence_config,
+    validate_step_sample_cadence, should_sample_completed_step,
+    sample_time_unit_name,
+    SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+)
+from serenitymojo.training.onetrainer_train_loop_policy import (
+    OT_GRAD_POLICY_ON_OR_OFF,
+    ot_cache_dir_from_train_config,
+    ot_fixed_output_lora_path_from_train_config,
+    ot_lr_for_optimizer_step,
+    ot_sample_cadence_from_train_config,
+    ot_sampling_enabled_checked,
+    ot_should_save_before_sample,
+    ot_should_save_checkpoint,
+    ot_state_path_for_lora,
+    ot_step_lora_path,
+    validate_ot_gradient_checkpointing_policy,
+    validate_ot_train_math_policy,
 )
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.ernie_validation_sampler import (
@@ -110,13 +131,8 @@ comptime N_IMG = IMG_H * IMG_W     # 1024
 comptime N_TXT = 256
 comptime S = N_IMG + N_TXT         # 1280
 
-# ── run knobs (mirror train_ernie.rs Args defaults) ───────────────────────────
+# ── runtime paths; recipe/cadence scalars come from CONFIG_PATH ───────────────
 comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/boxjana_ernie_512_FIXED"
-comptime MAX_STEPS = 2500          # convergence run target
-comptime RANK = 16                 # train_ernie.rs --rank default
-comptime ALPHA = Float32(1.0)      # OneTrainer default lora_alpha -> scale 1/16
-comptime LR = Float32(3.0e-4)      # OneTrainer ERNIE LoRA preset
-comptime CLIP = Float32(1.0)       # train_ernie.rs CLIP_GRAD_NORM
 comptime NUM_TRAIN_TIMESTEPS = 1000
 comptime SEED = UInt64(42)         # train_ernie.rs SEED
 comptime SAVE_PATH = "/home/alex/mojodiffusion/serenitymojo/output/ernie_lora_real.safetensors"
@@ -125,15 +141,14 @@ comptime SAMPLE_OUT_DIR = "/home/alex/mojodiffusion/serenitymojo/output"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# cache reading: a single safetensors tensor -> host List[Float32]
+# cache reading: a single safetensors tensor -> device Tensor in stored dtype.
+# Cache readback stays BF16; existing token math casts locally to F32 compute lists.
 # ─────────────────────────────────────────────────────────────────────────────
-def _read_cache_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
+def _read_cache_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    var f = cast_tensor(t, STDtype.F32, ctx)
-    return f.to_host(ctx)
+    return Tensor.from_view(tv, ctx)
 
 
 def _cache_dims(st: SafeTensors, name: String) raises -> List[Int]:
@@ -168,22 +183,22 @@ def _list_cache(dir: String) raises -> List[String]:
 # Mirrors the Rust patch_embed reshape: [B,C,H,W] -> reshape [B,C,H*W] -> permute
 # [B,H*W,C]. With B=1: token t (= r*W + c), channel ch -> latent[ch*H*W + t].
 # ─────────────────────────────────────────────────────────────────────────────
-def _latent_to_img_tokens(latent: List[Float32]) -> List[Float32]:
+def _latent_to_img_tokens(latent: List[BFloat16]) -> List[Float32]:
     var out = List[Float32]()
     var hw = IMG_H * IMG_W
     for t in range(hw):
         for ch in range(IN_CH):
-            out.append(latent[ch * hw + t])
+            out.append(latent[ch * hw + t].cast[DType.float32]())
     return out^
 
 
 # ── trim/pad cached text [1, T, 3072] -> [N_TXT, 3072] rows ───────────────────
-def _text_to_txt_tokens(text: List[Float32], t_cache: Int) -> List[Float32]:
+def _text_to_txt_tokens(text: List[BFloat16], t_cache: Int) -> List[Float32]:
     var out = List[Float32]()
     for r in range(N_TXT):
         if r < t_cache:
             for c in range(TEXT_IN):
-                out.append(text[r * TEXT_IN + c])
+                out.append(text[r * TEXT_IN + c].cast[DType.float32]())
         else:
             for _c in range(TEXT_IN):
                 out.append(Float32(0.0))   # beyond cache rows (unreachable; cache T=512)
@@ -378,7 +393,7 @@ def _parse_int(s: String) -> Int:
 
 
 def _state_path_for_lora(lora_path: String) -> String:
-    return lora_path + String(".state.safetensors")
+    return ot_state_path_for_lora(lora_path)
 
 
 def _substr(s: String, start: Int, end: Int) -> String:
@@ -408,10 +423,77 @@ def _mkdir_parent(path: String):
 
 
 def _step_lora_path(save_path: String, step: Int) -> String:
-    var suffix = String(".safetensors")
-    if save_path.endswith(suffix):
-        return String(save_path.removesuffix(suffix)) + String("_step") + String(step) + suffix
-    return save_path + String("_step") + String(step) + suffix
+    return ot_step_lora_path(save_path, step)
+
+
+def validate_ernie_train_config(cfg: TrainConfig) raises:
+    if cfg.name != String("ernie_image"):
+        raise Error(String("ERNIE trainer config requires model_type=ernie_image, got ") + cfg.name)
+    if cfg.checkpoint == String(""):
+        raise Error("ERNIE trainer config must set checkpoint")
+    if cfg.n_heads != H:
+        raise Error(String("ERNIE config num_heads ") + String(cfg.n_heads) + String(" != H ") + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("ERNIE config head_dim ") + String(cfg.head_dim) + String(" != Dh ") + String(Dh))
+    if cfg.d_model != D:
+        raise Error(String("ERNIE config inner_dim ") + String(cfg.d_model) + String(" != D ") + String(D))
+    if cfg.in_channels != IN_CH:
+        raise Error(String("ERNIE config in_channels ") + String(cfg.in_channels) + String(" != IN_CH ") + String(IN_CH))
+    if cfg.joint_attention_dim != TEXT_IN:
+        raise Error(
+            String("ERNIE config joint_attention_dim ")
+            + String(cfg.joint_attention_dim) + String(" != TEXT_IN ") + String(TEXT_IN)
+        )
+    if cfg.out_channels != OUT_CH:
+        raise Error(String("ERNIE config out_channels ") + String(cfg.out_channels) + String(" != OUT_CH ") + String(OUT_CH))
+    if cfg.num_double != 0 or cfg.num_single != NUM_LAYERS:
+        raise Error(
+            String("ERNIE trainer requires 0 double-stream blocks and ")
+            + String(NUM_LAYERS) + String(" single blocks; got double=")
+            + String(cfg.num_double) + String(" single=") + String(cfg.num_single)
+        )
+    if cfg.mlp_hidden != F:
+        raise Error(String("ERNIE config mlp_hidden ") + String(cfg.mlp_hidden) + String(" != F ") + String(F))
+    if cfg.timestep_dim != D:
+        raise Error(String("ERNIE config timestep_dim ") + String(cfg.timestep_dim) + String(" != D ") + String(D))
+    if cfg.timestep_shift != Float32(1.0):
+        raise Error("ERNIE trainer currently implements timestep_shift=1.0 only")
+    if cfg.lora_rank <= 0:
+        raise Error("ERNIE trainer config requires lora_rank > 0")
+    if cfg.lora_alpha <= Float32(0.0):
+        raise Error("ERNIE trainer config requires lora_alpha > 0")
+    if cfg.lr <= Float32(0.0):
+        raise Error("ERNIE trainer config requires learning_rate > 0")
+    if cfg.max_grad_norm <= Float32(0.0):
+        raise Error("ERNIE trainer config requires max_grad_norm > 0")
+    validate_ot_train_math_policy(cfg, String("ERNIE trainer"))
+    if cfg.max_steps <= 0:
+        raise Error("ERNIE trainer config requires max_steps > 0")
+    if cfg.save_every < 0:
+        raise Error("ERNIE trainer config requires save_every >= 0")
+    validate_ot_gradient_checkpointing_policy(
+        cfg, String("ERNIE trainer"), OT_GRAD_POLICY_ON_OR_OFF
+    )
+
+
+def ernie_sample_cadence_from_train_config(
+    cfg_path: String, cfg: TrainConfig,
+) raises -> SampleCadence:
+    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+
+
+def ernie_sampling_enabled(cadence: SampleCadence) raises -> Bool:
+    return ot_sampling_enabled_checked(cadence)
+
+
+def ernie_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
+    return ot_should_save_checkpoint(cfg, completed_step)
+
+
+def ernie_should_save_before_sample(
+    cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
+) raises -> Bool:
+    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 def _sample_png_path(step: Int, label: String) -> String:
@@ -484,56 +566,91 @@ def _sample_ernie_prompts(
 
 def main() raises:
     var args = argv()
-    var run_steps = MAX_STEPS
-    var mode = String("train")
+    var cfg_path = String(CONFIG_PATH)
+    var arg_base = 1
     if len(args) >= 2:
-        var a1 = String(args[1])
+        var first = String(args[1])
+        if first.endswith(String(".json")):
+            cfg_path = first.copy()
+            arg_base = 2
+
+    var run_steps = -1
+    var mode = String("train")
+    if len(args) > arg_base:
+        var a1 = String(args[arg_base])
         if a1 == String("resume_smoke") or a1 == String("smoke_resume"):
             mode = String("resume_smoke")
             run_steps = 25
         else:
             run_steps = _parse_int(a1)
+
+    var train_cfg = read_model_config(cfg_path)
+    var save_path = ot_fixed_output_lora_path_from_train_config(
+        train_cfg, String(SAVE_PATH)
+    )
+    if len(args) > arg_base + 1:
+        save_path = String(args[arg_base + 1])
+
+    var cache_dir = ot_cache_dir_from_train_config(train_cfg, String(CACHE_DIR))
+    if len(args) > arg_base + 2:
+        cache_dir = String(args[arg_base + 2])
+
+    if len(args) > arg_base + 3:
+        mode = String(args[arg_base + 3])
+
+    validate_ernie_train_config(train_cfg)
+    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
+    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    if run_steps < 0:
+        run_steps = train_cfg.max_steps
+    if mode == String("resume_smoke") and run_steps < 25:
+        run_steps = 25
     if run_steps < 1:
         raise Error("run_steps must be >= 1")
 
-    var save_path = String(SAVE_PATH)
-    if len(args) >= 3:
-        save_path = String(args[2])
-
-    var cache_dir = String(CACHE_DIR)
-    if len(args) >= 4:
-        cache_dir = String(args[3])
-
-    if len(args) >= 5:
-        mode = String(args[4])
-    if mode == String("resume_smoke") and run_steps < 25:
-        run_steps = 25
+    var sample_cadence = ernie_sample_cadence_from_train_config(cfg_path, train_cfg)
+    var sample_enabled = ernie_sampling_enabled(sample_cadence)
+    var sample_cfg = SamplePromptConfig()
+    if train_cfg.only_cache:
+        print("[Ernie-lora] only_cache requested; no train steps will run in this trainer")
+        return
+    if sample_enabled:
+        if sample_cadence.sample_definition_file_name == String(""):
+            raise Error("ERNIE trainer sampling requires validation_prompts_file or sample_definition_file_name")
+        sample_cfg = read_sample_prompt_config(sample_cadence.sample_definition_file_name)
+        if len(sample_cfg.prompts) == 0:
+            raise Error("ERNIE trainer requires at least one validation prompt when sampling is enabled")
+        _ = sys_system(String("mkdir -p ") + String(SAMPLE_OUT_DIR))
 
     var ctx = DeviceContext()
-    var cfg = read_model_config(String(CONFIG_PATH))
-    if cfg.validation_prompts_file == String(""):
-        raise Error("ERNIE trainer config must set validation_prompts_file")
-    var sample_cfg = read_sample_prompt_config(cfg.validation_prompts_file)
-    if len(sample_cfg.prompts) == 0:
-        raise Error("ERNIE trainer requires at least one validation prompt")
-    _ = sys_system(String("mkdir -p ") + String(SAMPLE_OUT_DIR))
 
     print("==== ERNIE REAL LoRA training loop (pure Mojo) ====")
     print("  D=", D, " H=", H, " Dh=", Dh, " F=", F, " NUM_LAYERS=", NUM_LAYERS)
     print("  N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S, " IN_CH=", IN_CH,
           " TEXT_IN=", TEXT_IN, " OUT_CH=", OUT_CH)
     print("  cache=", cache_dir)
-    print("  max_steps=", run_steps, " rank=", RANK, " alpha=", ALPHA, " lr=", LR)
+    print("  max_steps=", run_steps, " rank=", train_cfg.lora_rank,
+          " alpha=", train_cfg.lora_alpha, " lr=", train_cfg.lr)
     print("  mode=", mode)
     print("  save_path=", save_path)
-    print("  sample_prompts=", cfg.validation_prompts_file, " count=", len(sample_cfg.prompts))
-    print("  checkpoint=", ERNIE_TRANSFORMER_DIR)
+    print("  checkpoint=", train_cfg.checkpoint)
+    print(
+        "  cadence: save_every=", train_cfg.save_every,
+        " sample_after=", sample_cadence.sample_after,
+        " unit=", sample_time_unit_name(sample_cadence.sample_after_unit),
+        " skip_first=", sample_cadence.sample_skip_first,
+        " sample_file=", sample_cadence.sample_definition_file_name,
+        " enabled=", sample_enabled,
+    )
+    if sample_enabled:
+        print("  sample_prompts=", sample_cadence.sample_definition_file_name,
+              " count=", len(sample_cfg.prompts))
 
     var mem0 = ctx.get_memory_info()
     print("  free VRAM at start (bytes):", mem0[0], " total:", mem0[1])
 
     # ── open the real sharded transformer checkpoint (streamed block source) ──
-    var st = ShardedSafeTensors.open(String(ERNIE_TRANSFORMER_DIR))
+    var st = ShardedSafeTensors.open(train_cfg.checkpoint)
     print("  opened transformer: num_shards =", st.num_shards())
     var base = load_ernie_stack_base(st, D, IN_CH, ctx)
     print("  base weights resident (patch/text/time/adaLN/final).")
@@ -543,8 +660,8 @@ def main() raises:
           " free VRAM after block load (bytes):", mem_blocks[0])
 
     # ── build the LoRA set (B=0 init -> adapter identity at step 0) ──
-    var lora = build_ernie_lora_set(NUM_LAYERS, D, F, RANK, ALPHA)
-    var baseline_lora = build_ernie_lora_set(NUM_LAYERS, D, F, RANK, ALPHA)
+    var lora = build_ernie_lora_set(NUM_LAYERS, D, F, train_cfg.lora_rank, train_cfg.lora_alpha)
+    var baseline_lora = build_ernie_lora_set(NUM_LAYERS, D, F, train_cfg.lora_rank, train_cfg.lora_alpha)
     var n_adapters = NUM_LAYERS * ERNIE_SLOTS
     print("  LoRA adapters:", n_adapters, " (7 slots x", NUM_LAYERS, "layers)")
     print("  LoRA-B |.|_1 at init =", _lora_b_abs_sum(lora), " (expect 0.0)")
@@ -563,7 +680,7 @@ def main() raises:
     print("  found", len(cache_files), "cached samples")
 
     var last_sample_step = -1
-    if sample_cfg.sample_at_start or mode == String("resume_smoke"):
+    if sample_enabled and (should_sample_completed_step(sample_cadence, 0) or mode == String("resume_smoke")):
         _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, 0, ctx)
         last_sample_step = 0
 
@@ -575,8 +692,10 @@ def main() raises:
         var cache_idx = step % len(cache_files)
         var cs = SafeTensors.open(cache_files[cache_idx])
 
-        var latent = _read_cache_f32(cs, String("latent"), ctx)            # [128*32*32]
-        var text = _read_cache_f32(cs, String("text_embedding"), ctx)      # [512*3072]
+        var latent_cache = _read_cache_tensor(cs, String("latent"), ctx)
+        var latent = latent_cache.to_host_bf16(ctx)                        # [128*32*32]
+        var text_cache = _read_cache_tensor(cs, String("text_embedding"), ctx)
+        var text = text_cache.to_host_bf16(ctx)                            # [512*3072]
         var tdims = _cache_dims(cs, String("text_embedding"))
         var t_cache = tdims[1]
 
@@ -632,10 +751,14 @@ def main() raises:
             D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
         )
 
-        # ── global-norm clip (max_norm = 1.0) then AdamW on every adapter ──
-        var gn = _clip_grads(grads, CLIP)
+        # ── global-norm clip then AdamW on every adapter ──
+        var gn = _clip_grads(grads, train_cfg.max_grad_norm)
         var done_step = step + 1
-        ernie_lora_adamw_step(lora, grads, done_step, LR, ctx)
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, done_step)
+        ernie_lora_adamw_step(
+            lora, grads, done_step, step_lr, ctx,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+        )
 
         var now = perf_counter()
         var step_secs = now - step_t0
@@ -650,27 +773,37 @@ def main() raises:
                 " count=", grads.nonfinite_lora_grads,
             )
 
+        var saved_this_step = False
+        var saved_lora_path = String("")
+
         if mode == String("resume_smoke") and done_step == 10:
             var smoke_lora = _step_lora_path(save_path, done_step)
             _save_lora_and_state(lora, smoke_lora, done_step, ctx)
-            _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, done_step, ctx)
-            last_sample_step = done_step
+            saved_this_step = True
+            saved_lora_path = smoke_lora.copy()
+            if sample_enabled:
+                _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, done_step, ctx)
+                last_sample_step = done_step
             var smoke_state = _state_path_for_lora(smoke_lora)
-            lora = load_ernie_lora_state(NUM_LAYERS, RANK, ALPHA, smoke_state, ctx)
+            lora = load_ernie_lora_state(NUM_LAYERS, train_cfg.lora_rank, train_cfg.lora_alpha, smoke_state, ctx)
             print("[Ernie-lora] resume_state step=", done_step, " path=", smoke_state)
 
-        if (
-            sample_cfg.every_steps > 0
-            and done_step % sample_cfg.every_steps == 0
-        ):
+        if ernie_should_save_checkpoint(train_cfg, done_step) and not saved_this_step:
+            var save_cadence_lora = _step_lora_path(save_path, done_step)
+            _save_lora_and_state(lora, save_cadence_lora, done_step, ctx)
+            saved_this_step = True
+            saved_lora_path = save_cadence_lora.copy()
+
+        if sample_enabled and should_sample_completed_step(sample_cadence, done_step):
             var cadence_lora = _step_lora_path(save_path, done_step)
-            if sample_cfg.save_before_sample:
+            if ernie_should_save_before_sample(sample_cadence, done_step, saved_this_step):
                 _save_lora_and_state(lora, cadence_lora, done_step, ctx)
+                saved_lora_path = cadence_lora.copy()
             _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, done_step, ctx)
             last_sample_step = done_step
-            if sample_cfg.save_before_sample:
+            if sample_cadence.save_before_sample and saved_lora_path == cadence_lora:
                 var cadence_state = _state_path_for_lora(cadence_lora)
-                lora = load_ernie_lora_state(NUM_LAYERS, RANK, ALPHA, cadence_state, ctx)
+                lora = load_ernie_lora_state(NUM_LAYERS, train_cfg.lora_rank, train_cfg.lora_alpha, cadence_state, ctx)
                 print("[Ernie-lora] resume_state step=", done_step, " path=", cadence_state)
 
     # ── final LoRA-B growth report + save ──
@@ -682,5 +815,5 @@ def main() raises:
     print("  LoRA-B nonzero slots =", b_nz, "/", n_adapters,
           " ratio =", Float32(b_nz) / Float32(n_adapters))
     _save_lora_and_state(lora, save_path, run_steps, ctx)
-    if last_sample_step != run_steps:
+    if sample_enabled and last_sample_step != run_steps:
         _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, run_steps, ctx)

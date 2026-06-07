@@ -1,0 +1,44 @@
+{
+  "model_type": "STABLE_DIFFUSION_35",
+  "base_model_name": "/home/alex/.serenity/models/checkpoints/sd3.5_large.safetensors",
+  "vae": "/home/alex/.serenity/models/checkpoints/sd3.5_large.safetensors",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json",
+
+  "inner_dim": 2432,
+  "in_channels": 64,
+  "joint_attention_dim": 4096,
+  "out_channels": 64,
+  "num_double": 38,
+  "num_single": 0,
+  "num_heads": 38,
+  "head_dim": 64,
+  "mlp_hidden": 9728,
+  "timestep_dim": 256,
+
+  "learning_rate": 1e-4,
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 2000,
+  "save_every": 500,
+  "sample_every": 500,
+
+  "training_method": "LORA",
+  "train_dtype": "BFLOAT_16",
+  "output_dtype": "BFLOAT_16",
+  "gradient_checkpointing": "ON",
+  "cache_dir": "/home/alex/datasets/andrsd35_sd35_cache",
+  "output_model_destination": "/home/alex/mojodiffusion/output/sd35_lora/sd35_lora_last.safetensors",
+
+  "optimizer": {
+    "optimizer": "ADAMW",
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "fused": false,
+    "fused_back_pass": false,
+    "stochastic_rounding": false
+  }
+}

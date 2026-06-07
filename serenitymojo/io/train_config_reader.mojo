@@ -22,10 +22,13 @@
 #   timestep_dim | rope_theta | learning_rate→lr | lora_rank | lora_alpha
 #   timestep_shift | max_grad_norm | max_steps | save_every | sample_every
 #   optimizer.{eps,weight_decay,beta1,beta2}
+#   training_method/train_method/method
 #   train_modality/ltx2_mode | lora_target_preset | dataset_cache_dir/cache_dir
 #   require_cached_video_latents | require_cached_text_embeddings
 #   require_cached_audio_latents | hot_loop_device_only
 #   video_loss_weight | audio_loss_weight
+#   continue_last_backup | gradient_checkpointing | enable_async_offloading
+#   enable_activation_offloading | layer_offload_fraction
 #
 # Mojo 1.0.0b1: `def` not `fn`; no Python.
 
@@ -37,6 +40,21 @@ from serenitymojo.training.train_config import (
     LORA_TARGET_LEGACY_VIDEO_ATTN1, LORA_TARGET_LTX2_T2V,
     LORA_TARGET_LTX2_V2V, LORA_TARGET_LTX2_AUDIO,
     LORA_TARGET_LTX2_AUDIO_REF_ONLY_IC, LORA_TARGET_LTX2_FULL,
+    TRAINING_METHOD_LORA, TRAINING_METHOD_FINE_TUNE,
+    GRADIENT_CHECKPOINTING_OFF, GRADIENT_CHECKPOINTING_ON,
+    GRADIENT_CHECKPOINTING_CPU_OFFLOADED,
+    TRAIN_DTYPE_NONE, TRAIN_DTYPE_FLOAT_8, TRAIN_DTYPE_FLOAT_16,
+    TRAIN_DTYPE_FLOAT_32, TRAIN_DTYPE_BFLOAT_16, TRAIN_DTYPE_TFLOAT_32,
+    TRAIN_DTYPE_INT_8, TRAIN_DTYPE_NFLOAT_4, TRAIN_DTYPE_FLOAT_W8A8,
+    TRAIN_DTYPE_INT_W8A8, TRAIN_DTYPE_GGUF, TRAIN_DTYPE_GGUF_A8_FLOAT,
+    TRAIN_DTYPE_GGUF_A8_INT,
+    TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAM, TRAIN_OPTIMIZER_ADAFACTOR,
+    TRAIN_OPTIMIZER_CAME, TRAIN_OPTIMIZER_LION, TRAIN_OPTIMIZER_PRODIGY,
+    TRAIN_OPTIMIZER_SGD, TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
+    TRAIN_TIME_UNIT_EPOCH, TRAIN_TIME_UNIT_STEP, TRAIN_TIME_UNIT_SECOND,
+    TRAIN_TIME_UNIT_MINUTE, TRAIN_TIME_UNIT_HOUR, TRAIN_TIME_UNIT_NEVER,
+    TRAIN_TIME_UNIT_ALWAYS,
+    EMA_MODE_OFF, EMA_MODE_GPU, EMA_MODE_CPU,
 )
 
 
@@ -158,7 +176,96 @@ def _read_scalar(mut cur: _Cursor) raises -> _Scalar:
     return _Scalar(False, String(""), _parse_number(cur))
 
 
-# Parse the nested "optimizer" object, mutating eps/weight_decay/beta1/beta2 on cfg.
+def _read_string_required(mut cur: _Cursor, field: String) raises -> String:
+    var sc = _read_scalar(cur)
+    if not sc.is_string:
+        raise Error(String("JSON config: ") + field + String(" must be a string"))
+    return sc.s.copy()
+
+
+def _read_bool(mut cur: _Cursor) raises -> Bool:
+    return _read_scalar(cur).num != 0.0
+
+
+def _dtype_int(s: String) raises -> Int:
+    if s == "NONE":
+        return TRAIN_DTYPE_NONE
+    elif s == "FLOAT_8":
+        return TRAIN_DTYPE_FLOAT_8
+    elif s == "FLOAT_16":
+        return TRAIN_DTYPE_FLOAT_16
+    elif s == "FLOAT_32":
+        return TRAIN_DTYPE_FLOAT_32
+    elif s == "BFLOAT_16":
+        return TRAIN_DTYPE_BFLOAT_16
+    elif s == "TFLOAT_32":
+        return TRAIN_DTYPE_TFLOAT_32
+    elif s == "INT_8":
+        return TRAIN_DTYPE_INT_8
+    elif s == "NFLOAT_4":
+        return TRAIN_DTYPE_NFLOAT_4
+    elif s == "FLOAT_W8A8":
+        return TRAIN_DTYPE_FLOAT_W8A8
+    elif s == "INT_W8A8":
+        return TRAIN_DTYPE_INT_W8A8
+    elif s == "GGUF":
+        return TRAIN_DTYPE_GGUF
+    elif s == "GGUF_A8_FLOAT":
+        return TRAIN_DTYPE_GGUF_A8_FLOAT
+    elif s == "GGUF_A8_INT":
+        return TRAIN_DTYPE_GGUF_A8_INT
+    raise Error(String("JSON config: unknown DataType '") + s + String("'"))
+
+
+def _optimizer_int(s: String) raises -> Int:
+    if s == "ADAMW" or s == "ADAMW_8BIT" or s == "ADAMW_ADV":
+        return TRAIN_OPTIMIZER_ADAMW
+    elif s == "ADAM" or s == "ADAM_8BIT":
+        return TRAIN_OPTIMIZER_ADAM
+    elif s == "ADAFACTOR":
+        return TRAIN_OPTIMIZER_ADAFACTOR
+    elif s == "CAME" or s == "CAME_8BIT":
+        return TRAIN_OPTIMIZER_CAME
+    elif s == "LION" or s == "LION_8BIT" or s == "LION_ADV":
+        return TRAIN_OPTIMIZER_LION
+    elif s == "PRODIGY" or s == "PRODIGY_PLUS_SCHEDULE_FREE" or s == "PRODIGY_ADV":
+        return TRAIN_OPTIMIZER_PRODIGY
+    elif s == "SGD" or s == "SGD_8BIT":
+        return TRAIN_OPTIMIZER_SGD
+    elif s == "SCHEDULE_FREE_ADAMW":
+        return TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW
+    raise Error(String("JSON config: unknown Optimizer '") + s + String("'"))
+
+
+def _time_unit_int(s: String) raises -> Int:
+    if s == "EPOCH" or s == "epoch":
+        return TRAIN_TIME_UNIT_EPOCH
+    elif s == "STEP" or s == "step":
+        return TRAIN_TIME_UNIT_STEP
+    elif s == "SECOND" or s == "second":
+        return TRAIN_TIME_UNIT_SECOND
+    elif s == "MINUTE" or s == "minute":
+        return TRAIN_TIME_UNIT_MINUTE
+    elif s == "HOUR" or s == "hour":
+        return TRAIN_TIME_UNIT_HOUR
+    elif s == "NEVER" or s == "never":
+        return TRAIN_TIME_UNIT_NEVER
+    elif s == "ALWAYS" or s == "always":
+        return TRAIN_TIME_UNIT_ALWAYS
+    raise Error(String("JSON config: unknown TimeUnit '") + s + String("'"))
+
+
+def _ema_mode_int(s: String) raises -> Int:
+    if s == "OFF" or s == "off":
+        return EMA_MODE_OFF
+    elif s == "GPU" or s == "gpu":
+        return EMA_MODE_GPU
+    elif s == "CPU" or s == "cpu":
+        return EMA_MODE_CPU
+    raise Error(String("JSON config: unknown EMAMode '") + s + String("'"))
+
+
+# Parse a nested optimizer object, mutating the active optimizer policy on cfg.
 def _parse_optimizer(mut cur: _Cursor, mut cfg: TrainConfig) raises:
     cur.expect(0x7B)
     cur.skip_ws()
@@ -168,14 +275,34 @@ def _parse_optimizer(mut cur: _Cursor, mut cfg: TrainConfig) raises:
     while True:
         var field = _parse_string(cur)
         cur.expect(0x3A)
-        if field == "eps":
+        if field == "optimizer":
+            cfg.optimizer = _optimizer_int(_read_string_required(cur, String("optimizer.optimizer")))
+        elif field == "eps":
             cfg.eps = Float32(_read_scalar(cur).num)
+        elif field == "eps2":
+            cfg.optimizer_eps2 = Float32(_read_scalar(cur).num)
         elif field == "weight_decay":
             cfg.weight_decay = Float32(_read_scalar(cur).num)
         elif field == "beta1":
             cfg.beta1 = Float32(_read_scalar(cur).num)
         elif field == "beta2":
             cfg.beta2 = Float32(_read_scalar(cur).num)
+        elif field == "clip_threshold":
+            cfg.optimizer_clip_threshold = Float32(_read_scalar(cur).num)
+        elif field == "decay_rate":
+            cfg.optimizer_decay_rate = Float32(_read_scalar(cur).num)
+        elif field == "relative_step":
+            cfg.optimizer_relative_step = _read_bool(cur)
+        elif field == "scale_parameter":
+            cfg.optimizer_scale_parameter = _read_bool(cur)
+        elif field == "warmup_init":
+            cfg.optimizer_warmup_init = _read_bool(cur)
+        elif field == "fused":
+            cfg.optimizer_fused = _read_bool(cur)
+        elif field == "fused_back_pass":
+            cfg.optimizer_fused_back_pass = _read_bool(cur)
+        elif field == "stochastic_rounding":
+            cfg.optimizer_stochastic_rounding = _read_bool(cur)
         else:
             _skip_value(cur)
         cur.skip_ws()
@@ -192,6 +319,153 @@ def _parse_optimizer(mut cur: _Cursor, mut cfg: TrainConfig) raises:
         )
 
 
+def _parse_optimizer_defaults(mut cur: _Cursor, mut cfg: TrainConfig) raises:
+    cur.expect(0x7B)
+    cur.skip_ws()
+    if cur.peek() == 0x7D:
+        cur.advance()
+        return
+    while True:
+        _ = _parse_string(cur)
+        cur.expect(0x3A)
+        cur.skip_ws()
+        if cur.peek() == 0x7B:
+            _parse_optimizer(cur, cfg)
+        else:
+            _skip_value(cur)
+        cur.skip_ws()
+        var ch = cur.peek()
+        if ch == 0x2C:
+            cur.advance()
+            continue
+        if ch == 0x7D:
+            cur.advance()
+            break
+        raise Error(
+            String("JSON config: expected ',' or '}' in optimizer_defaults at byte ")
+            + String(cur.pos)
+        )
+
+
+def _set_part_model_name(mut cfg: TrainConfig, part: String, var value: String):
+    if part == "unet":
+        cfg.unet_model_name = value^
+    elif part == "prior":
+        cfg.prior_model_name = value^
+    elif part == "transformer":
+        cfg.transformer_model_name = value^
+    elif part == "text_encoder":
+        cfg.text_encoder_model_name = value^
+    elif part == "text_encoder_2":
+        cfg.text_encoder_2_model_name = value^
+    elif part == "text_encoder_3":
+        cfg.text_encoder_3_model_name = value^
+    elif part == "text_encoder_4":
+        cfg.text_encoder_4_model_name = value^
+    elif part == "vae":
+        cfg.vae_model_name = value^
+
+
+def _set_part_train(mut cfg: TrainConfig, part: String, value: Bool):
+    if part == "unet":
+        cfg.unet_train = value
+    elif part == "prior":
+        cfg.prior_train = value
+    elif part == "transformer":
+        cfg.transformer_train = value
+    elif part == "text_encoder":
+        cfg.text_encoder_train = value
+    elif part == "text_encoder_2":
+        cfg.text_encoder_2_train = value
+    elif part == "text_encoder_3":
+        cfg.text_encoder_3_train = value
+    elif part == "text_encoder_4":
+        cfg.text_encoder_4_train = value
+    elif part == "vae":
+        cfg.vae_train = value
+
+
+def _set_part_dtype(mut cfg: TrainConfig, part: String, value: Int):
+    if part == "unet":
+        cfg.unet_weight_dtype = value
+    elif part == "prior":
+        cfg.prior_weight_dtype = value
+    elif part == "transformer":
+        cfg.transformer_weight_dtype = value
+    elif part == "text_encoder":
+        cfg.text_encoder_weight_dtype = value
+    elif part == "text_encoder_2":
+        cfg.text_encoder_2_weight_dtype = value
+    elif part == "text_encoder_3":
+        cfg.text_encoder_3_weight_dtype = value
+    elif part == "text_encoder_4":
+        cfg.text_encoder_4_weight_dtype = value
+    elif part == "vae":
+        cfg.vae_weight_dtype = value
+
+
+def _parse_model_part(mut cur: _Cursor, mut cfg: TrainConfig, part: String) raises:
+    cur.expect(0x7B)
+    cur.skip_ws()
+    if cur.peek() == 0x7D:
+        cur.advance()
+        return
+    while True:
+        var field = _parse_string(cur)
+        cur.expect(0x3A)
+        if field == "model_name":
+            _set_part_model_name(cfg, part, _read_string_required(cur, part + String(".model_name")))
+        elif field == "train":
+            _set_part_train(cfg, part, _read_bool(cur))
+        elif field == "weight_dtype":
+            _set_part_dtype(cfg, part, _dtype_int(_read_string_required(cur, part + String(".weight_dtype"))))
+        else:
+            _skip_value(cur)
+        cur.skip_ws()
+        var ch = cur.peek()
+        if ch == 0x2C:
+            cur.advance()
+            continue
+        if ch == 0x7D:
+            cur.advance()
+            break
+        raise Error(
+            String("JSON config: expected ',' or '}' in model part at byte ")
+            + String(cur.pos)
+        )
+
+
+def _parse_quantization(mut cur: _Cursor, mut cfg: TrainConfig) raises:
+    cur.expect(0x7B)
+    cur.skip_ws()
+    if cur.peek() == 0x7D:
+        cur.advance()
+        return
+    while True:
+        var field = _parse_string(cur)
+        cur.expect(0x3A)
+        if field == "layer_filter":
+            cfg.quantization_layer_filter = _read_string_required(cur, String("quantization.layer_filter"))
+        elif field == "layer_filter_preset":
+            cfg.quantization_layer_filter_preset = _read_string_required(cur, String("quantization.layer_filter_preset"))
+        elif field == "layer_filter_regex":
+            cfg.quantization_layer_filter_regex = _read_bool(cur)
+        else:
+            _skip_value(cur)
+        cur.skip_ws()
+        var ch = cur.peek()
+        if ch == 0x2C:
+            cur.advance()
+            continue
+        if ch == 0x7D:
+            cur.advance()
+            break
+        raise Error(
+            String("JSON config: expected ',' or '}' in quantization at byte ")
+            + String(cur.pos)
+        )
+
+
 # ── Wave 2 enum string -> comptime-int mappers (fail loud on unknown). ───────
 # Each maps the EDv2 canonical config STRING to the comptime-Int encoding the
 # Wave 2 builders chose (LR_* in lr_schedule.mojo, TSB_* in timestep_bias.mojo,
@@ -203,17 +477,17 @@ def _parse_optimizer(mut cur: _Cursor, mut cfg: TrainConfig) raises:
 def _lr_scheduler_int(s: String) raises -> Int:
     # LR_CONSTANT 0 / LR_LINEAR 1 / LR_COSINE 2 / LR_COSINE_RESTARTS 3
     # / LR_POLYNOMIAL 4 / LR_REX 5  (lr_schedule.mojo).
-    if s == "constant":
+    if s == "constant" or s == "CONSTANT":
         return 0
-    elif s == "linear":
+    elif s == "linear" or s == "LINEAR":
         return 1
-    elif s == "cosine":
+    elif s == "cosine" or s == "COSINE":
         return 2
-    elif s == "cosine_with_restarts":
+    elif s == "cosine_with_restarts" or s == "COSINE_WITH_RESTARTS":
         return 3
-    elif s == "polynomial":
+    elif s == "polynomial" or s == "POLYNOMIAL":
         return 4
-    elif s == "rex":
+    elif s == "rex" or s == "REX":
         return 5
     raise Error(
         String("JSON config: unknown lr_scheduler '") + s
@@ -239,15 +513,23 @@ def _timestep_bias_int(s: String) raises -> Int:
 
 def _timestep_distribution_int(s: String) raises -> Int:
     # TSD_UNIFORM 0 / TSD_SIGMOID 1 / TSD_LOGIT_NORMAL 2 (schedule.mojo).
-    if s == "uniform":
+    # OneTrainer carries additional distribution tags; preserve them as policy
+    # tags even where current loops still need a separate implementation gate.
+    if s == "uniform" or s == "UNIFORM":
         return 0
-    elif s == "sigmoid":
+    elif s == "sigmoid" or s == "SIGMOID":
         return 1
-    elif s == "logit_normal":
+    elif s == "logit_normal" or s == "LOGIT_NORMAL":
         return 2
+    elif s == "HEAVY_TAIL" or s == "heavy_tail":
+        return 3
+    elif s == "COS_MAP" or s == "cos_map":
+        return 4
+    elif s == "INVERTED_PARABOLA" or s == "inverted_parabola":
+        return 5
     raise Error(
         String("JSON config: unknown timestep_distribution '") + s
-        + "' (expected uniform|sigmoid|logit_normal)"
+        + "' (expected uniform|sigmoid|logit_normal|HEAVY_TAIL|COS_MAP|INVERTED_PARABOLA)"
     )
 
 
@@ -273,6 +555,41 @@ def _adapter_algo_int(s: String) raises -> Int:
         return 6
     raise Error(
         String("JSON config: unknown algo '") + s + "' (expected lora|full|loha|dora|lokr|oft|boft)"
+    )
+
+
+def _training_method_int(s: String) raises -> Int:
+    # OneTrainer TrainingMethod values plus common full-finetune shorthands.
+    if s == "LORA" or s == "lora" or s == "LoRA":
+        return TRAINING_METHOD_LORA
+    elif (
+        s == "FINE_TUNE"
+        or s == "fine_tune"
+        or s == "FineTune"
+        or s == "finetune"
+        or s == "FINETUNE"
+        or s == "full"
+        or s == "FULL"
+        or s == "Full"
+    ):
+        return TRAINING_METHOD_FINE_TUNE
+    raise Error(
+        String("JSON config: unknown training_method '") + s
+        + String("' (expected LORA|FINE_TUNE|fine_tune|full|finetune)")
+    )
+
+
+def _gradient_checkpointing_int(s: String) raises -> Int:
+    # OneTrainer GradientCheckpointingMethod values.
+    if s == "OFF" or s == "off":
+        return GRADIENT_CHECKPOINTING_OFF
+    elif s == "ON" or s == "on":
+        return GRADIENT_CHECKPOINTING_ON
+    elif s == "CPU_OFFLOADED" or s == "cpu_offloaded":
+        return GRADIENT_CHECKPOINTING_CPU_OFFLOADED
+    raise Error(
+        String("JSON config: unknown gradient_checkpointing '") + s
+        + String("' (expected OFF|ON|CPU_OFFLOADED)")
     )
 
 
@@ -392,18 +709,61 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             var sc = _read_scalar(cur)
             if sc.is_string:
                 cfg.name = sc.s
+        elif key == "base_model_name":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.base_model_name = sc.s
         elif key == "checkpoint":
             var sc = _read_scalar(cur)
             if sc.is_string:
                 cfg.checkpoint = sc.s
         elif key == "vae":
-            var sc = _read_scalar(cur)
-            if sc.is_string:
-                cfg.vae = sc.s
+            cur.skip_ws()
+            if cur.peek() == 0x7B:
+                _parse_model_part(cur, cfg, String("vae"))
+            else:
+                var sc = _read_scalar(cur)
+                if sc.is_string:
+                    cfg.vae = sc.s
         elif key == "validation_prompts_file" or key == "sample_prompts_file":
             var sc = _read_scalar(cur)
             if sc.is_string:
                 cfg.validation_prompts_file = sc.s
+        elif key == "sample_definition_file_name":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.sample_definition_file_name = sc.s
+                if cfg.validation_prompts_file == String(""):
+                    cfg.validation_prompts_file = sc.s
+        elif key == "workspace_dir":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.workspace_dir = sc.s
+        elif key == "cache_dir":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.cache_dir = sc.s
+                cfg.dataset_cache_dir = sc.s
+        elif key == "output_model_destination":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.output_model_destination = sc.s
+        elif key == "output_model_format":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.output_model_format = sc.s
+        elif key == "concept_file_name":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.concept_file_name = sc.s
+        elif key == "resolution":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.resolution = sc.s
+        elif key == "frames":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.frames = sc.s
         # arch (ints)
         elif key == "inner_dim":
             cfg.d_model = Int(_read_scalar(cur).num)
@@ -430,33 +790,122 @@ def read_model_config(json_path: String) raises -> TrainConfig:
         # recipe
         elif key == "learning_rate":
             cfg.lr = Float32(_read_scalar(cur).num)
+        elif key == "batch_size":
+            cfg.batch_size = Int(_read_scalar(cur).num)
+        elif key == "epochs":
+            cfg.epochs = Int(_read_scalar(cur).num)
+        elif key == "stop_training_after":
+            cfg.stop_training_after = Int(_read_scalar(cur).num)
+            if cfg.stop_training_after_unit == TRAIN_TIME_UNIT_STEP:
+                cfg.max_steps = cfg.stop_training_after
+        elif key == "stop_training_after_unit":
+            cfg.stop_training_after_unit = _time_unit_int(
+                _read_string_required(cur, String("stop_training_after_unit"))
+            )
+            if cfg.stop_training_after > 0 and cfg.stop_training_after_unit == TRAIN_TIME_UNIT_STEP:
+                cfg.max_steps = cfg.stop_training_after
+        elif key == "seed":
+            cfg.seed = UInt64(Int(_read_scalar(cur).num))
+        elif key == "compile":
+            cfg.compile_model = _read_bool(cur)
+        elif key == "dataloader_threads":
+            cfg.dataloader_threads = Int(_read_scalar(cur).num)
+        elif key == "latent_caching":
+            cfg.latent_caching = _read_bool(cur)
+        elif key == "clear_cache_before_training":
+            cfg.clear_cache_before_training = _read_bool(cur)
+        elif key == "only_cache":
+            cfg.only_cache = _read_bool(cur)
+        elif key == "tensorboard":
+            cfg.tensorboard = _read_bool(cur)
+        elif key == "tensorboard_always_on":
+            cfg.tensorboard_always_on = _read_bool(cur)
+        elif key == "samples_to_tensorboard":
+            cfg.samples_to_tensorboard = _read_bool(cur)
         elif key == "lora_rank":
             cfg.lora_rank = Int(_read_scalar(cur).num)
         elif key == "lora_alpha":
             cfg.lora_alpha = Float32(_read_scalar(cur).num)
         elif key == "timestep_shift":
             cfg.timestep_shift = Float32(_read_scalar(cur).num)
-        elif key == "max_grad_norm":
+        elif key == "max_grad_norm" or key == "clip_grad_norm":
             cfg.max_grad_norm = Float32(_read_scalar(cur).num)
-        elif key == "max_steps":
+        elif key == "max_steps" or key == "max_train_steps":
             cfg.max_steps = Int(_read_scalar(cur).num)
-        elif key == "save_every":
+        elif key == "save_every" or key == "save_every_n_steps" or key == "save_after":
             cfg.save_every = Int(_read_scalar(cur).num)
-        elif key == "sample_every":
+        elif key == "sample_every" or key == "sample_every_n_steps":
             cfg.sample_every = Int(_read_scalar(cur).num)
+            cfg.sample_after = cfg.sample_every
+            cfg.sample_after_unit = TRAIN_TIME_UNIT_STEP
         elif key == "optimizer":
             _parse_optimizer(cur, cfg)
-        # ── Wave 2A: lr scheduler ──
-        elif key == "lr_scheduler":
+        elif key == "optimizer_defaults":
+            _parse_optimizer_defaults(cur, cfg)
+        elif key == "training_method" or key == "train_method" or key == "method":
             var sc = _read_scalar(cur)
             if not sc.is_string:
-                raise Error("JSON config: lr_scheduler must be a string")
+                raise Error("JSON config: training_method/train_method/method must be a string")
+            cfg.training_method = _training_method_int(sc.s)
+        elif key == "train_dtype":
+            cfg.train_dtype = _dtype_int(_read_string_required(cur, String("train_dtype")))
+        elif key == "fallback_train_dtype":
+            cfg.fallback_train_dtype = _dtype_int(_read_string_required(cur, String("fallback_train_dtype")))
+        elif key == "weight_dtype":
+            cfg.weight_dtype = _dtype_int(_read_string_required(cur, String("weight_dtype")))
+        elif key == "output_dtype":
+            cfg.output_dtype = _dtype_int(_read_string_required(cur, String("output_dtype")))
+        elif key == "lora_weight_dtype":
+            cfg.lora_weight_dtype = _dtype_int(_read_string_required(cur, String("lora_weight_dtype")))
+        elif key == "embedding_weight_dtype":
+            cfg.embedding_weight_dtype = _dtype_int(_read_string_required(cur, String("embedding_weight_dtype")))
+        elif key == "unet" or key == "prior" or key == "transformer" or key == "text_encoder" or key == "text_encoder_2" or key == "text_encoder_3" or key == "text_encoder_4":
+            _parse_model_part(cur, cfg, key)
+        elif key == "unet_weight_dtype":
+            cfg.unet_weight_dtype = _dtype_int(_read_string_required(cur, String("unet_weight_dtype")))
+        elif key == "prior_weight_dtype":
+            cfg.prior_weight_dtype = _dtype_int(_read_string_required(cur, String("prior_weight_dtype")))
+        elif key == "transformer_weight_dtype":
+            cfg.transformer_weight_dtype = _dtype_int(_read_string_required(cur, String("transformer_weight_dtype")))
+        elif key == "text_encoder_weight_dtype":
+            cfg.text_encoder_weight_dtype = _dtype_int(_read_string_required(cur, String("text_encoder_weight_dtype")))
+        elif key == "text_encoder_2_weight_dtype":
+            cfg.text_encoder_2_weight_dtype = _dtype_int(_read_string_required(cur, String("text_encoder_2_weight_dtype")))
+        elif key == "text_encoder_3_weight_dtype":
+            cfg.text_encoder_3_weight_dtype = _dtype_int(_read_string_required(cur, String("text_encoder_3_weight_dtype")))
+        elif key == "text_encoder_4_weight_dtype":
+            cfg.text_encoder_4_weight_dtype = _dtype_int(_read_string_required(cur, String("text_encoder_4_weight_dtype")))
+        elif key == "vae_weight_dtype":
+            cfg.vae_weight_dtype = _dtype_int(_read_string_required(cur, String("vae_weight_dtype")))
+        elif key == "train_unet":
+            cfg.unet_train = _read_bool(cur)
+        elif key == "train_prior":
+            cfg.prior_train = _read_bool(cur)
+        elif key == "train_transformer":
+            cfg.transformer_train = _read_bool(cur)
+        elif key == "train_text_encoder":
+            cfg.text_encoder_train = _read_bool(cur)
+        elif key == "train_text_encoder_2":
+            cfg.text_encoder_2_train = _read_bool(cur)
+        elif key == "quantization":
+            _parse_quantization(cur, cfg)
+        elif key == "layer_filter":
+            cfg.layer_filter = _read_string_required(cur, String("layer_filter"))
+        elif key == "layer_filter_preset":
+            cfg.layer_filter_preset = _read_string_required(cur, String("layer_filter_preset"))
+        elif key == "layer_filter_regex":
+            cfg.layer_filter_regex = _read_bool(cur)
+        # ── Wave 2A: lr scheduler ──
+        elif key == "lr_scheduler" or key == "learning_rate_scheduler":
+            var sc = _read_scalar(cur)
+            if not sc.is_string:
+                raise Error("JSON config: lr_scheduler/learning_rate_scheduler must be a string")
             cfg.lr_scheduler = _lr_scheduler_int(sc.s)
-        elif key == "lr_warmup_steps":
+        elif key == "lr_warmup_steps" or key == "learning_rate_warmup_steps":
             cfg.lr_warmup_steps = Int(_read_scalar(cur).num)
-        elif key == "lr_min_factor":
+        elif key == "lr_min_factor" or key == "learning_rate_min_factor":
             cfg.lr_min_factor = Float32(_read_scalar(cur).num)
-        elif key == "lr_cycles":
+        elif key == "lr_cycles" or key == "learning_rate_cycles":
             cfg.lr_cycles = Float32(_read_scalar(cur).num)
         # ── Wave 2A: loss weighting ──
         elif key == "min_snr_gamma":
@@ -464,11 +913,11 @@ def read_model_config(json_path: String) raises -> TrainConfig:
         elif key == "debiased":
             cfg.debiased = _read_scalar(cur).num != 0.0
         # ── Wave 2A: combined loss strengths ──
-        elif key == "loss_mse_strength":
+        elif key == "loss_mse_strength" or key == "mse_strength":
             cfg.loss_mse_strength = Float32(_read_scalar(cur).num)
-        elif key == "loss_mae_strength":
+        elif key == "loss_mae_strength" or key == "mae_strength":
             cfg.loss_mae_strength = Float32(_read_scalar(cur).num)
-        elif key == "loss_huber_strength":
+        elif key == "loss_huber_strength" or key == "huber_strength":
             cfg.loss_huber_strength = Float32(_read_scalar(cur).num)
         # ── Wave 2A: timestep bias ──
         elif key == "timestep_bias_strategy":
@@ -488,9 +937,9 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             if not sc.is_string:
                 raise Error("JSON config: timestep_distribution must be a string")
             cfg.timestep_distribution = _timestep_distribution_int(sc.s)
-        elif key == "timestep_noising_weight":
+        elif key == "timestep_noising_weight" or key == "noising_weight":
             cfg.timestep_noising_weight = Float32(_read_scalar(cur).num)
-        elif key == "timestep_noising_bias":
+        elif key == "timestep_noising_bias" or key == "noising_bias":
             cfg.timestep_noising_bias = Float32(_read_scalar(cur).num)
         # ── Wave 2B: caption dropout ──
         elif key == "caption_dropout_prob":
@@ -500,16 +949,19 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.offset_noise_weight = Float32(_read_scalar(cur).num)
         elif key == "offset_noise_prob":
             cfg.offset_noise_prob = Float32(_read_scalar(cur).num)
-        elif key == "input_perturbation":
+        elif key == "input_perturbation" or key == "perturbation_noise_weight":
             cfg.input_perturbation = Float32(_read_scalar(cur).num)
         elif key == "multires_iterations":
             cfg.multires_iterations = Int(_read_scalar(cur).num)
         elif key == "multires_discount":
             cfg.multires_discount = Float32(_read_scalar(cur).num)
         # ── Wave 2B: gradient accumulation ──
-        elif key == "grad_accum_steps":
+        elif key == "grad_accum_steps" or key == "gradient_accumulation_steps":
             cfg.grad_accum_steps = Int(_read_scalar(cur).num)
         # ── Wave 2B: EMA ──
+        elif key == "ema":
+            cfg.ema_mode = _ema_mode_int(_read_string_required(cur, String("ema")))
+            cfg.ema_enabled = cfg.ema_mode != EMA_MODE_OFF
         elif key == "ema_enabled":
             cfg.ema_enabled = _read_scalar(cur).num != 0.0
         elif key == "ema_inv_gamma":
@@ -522,6 +974,27 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.ema_min_decay = Float32(_read_scalar(cur).num)
         elif key == "ema_max_decay":
             cfg.ema_max_decay = Float32(_read_scalar(cur).num)
+        elif key == "ema_decay":
+            cfg.ema_decay = Float32(_read_scalar(cur).num)
+            cfg.ema_max_decay = cfg.ema_decay
+        elif key == "ema_update_step_interval":
+            cfg.ema_update_step_interval = Int(_read_scalar(cur).num)
+        # ── OneTrainer offload/checkpoint policy ──
+        elif key == "gradient_checkpointing":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.gradient_checkpointing = _gradient_checkpointing_int(sc.s)
+            elif sc.num != 0.0:
+                # Mirrors OneTrainer migration of legacy bool True -> ON.
+                cfg.gradient_checkpointing = GRADIENT_CHECKPOINTING_ON
+            else:
+                cfg.gradient_checkpointing = GRADIENT_CHECKPOINTING_OFF
+        elif key == "enable_async_offloading":
+            cfg.enable_async_offloading = _read_scalar(cur).num != 0.0
+        elif key == "enable_activation_offloading":
+            cfg.enable_activation_offloading = _read_scalar(cur).num != 0.0
+        elif key == "layer_offload_fraction":
+            cfg.layer_offload_fraction = _read_scalar(cur).num
         # ── Wave 2B: adapter algo selector ──
         elif key == "algo" or key == "adapter_algo":
             var sc = _read_scalar(cur)
@@ -541,7 +1014,7 @@ def read_model_config(json_path: String) raises -> TrainConfig:
                 cfg.lora_target_preset = _lora_target_preset_int(sc.s)
             else:
                 cfg.lora_target_preset = _checked_lora_target_preset(Int(sc.num))
-        elif key == "dataset_cache_dir" or key == "cache_dir" or key == "train_cache_dir":
+        elif key == "dataset_cache_dir" or key == "train_cache_dir":
             var sc = _read_scalar(cur)
             if sc.is_string:
                 cfg.dataset_cache_dir = sc.s
@@ -557,6 +1030,54 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.video_loss_weight = Float32(_read_scalar(cur).num)
         elif key == "audio_loss_weight":
             cfg.audio_loss_weight = Float32(_read_scalar(cur).num)
+        elif key == "validation":
+            cfg.validation = _read_bool(cur)
+        elif key == "validate_after":
+            cfg.validate_after = Int(_read_scalar(cur).num)
+        elif key == "validate_after_unit":
+            cfg.validate_after_unit = _time_unit_int(_read_string_required(cur, String("validate_after_unit")))
+        elif key == "continue_last_backup":
+            cfg.continue_last_backup = _read_bool(cur)
+        elif key == "sample_after":
+            cfg.sample_after = Int(_read_scalar(cur).num)
+            if cfg.sample_after_unit == TRAIN_TIME_UNIT_STEP:
+                cfg.sample_every = cfg.sample_after
+        elif key == "sample_after_unit":
+            cfg.sample_after_unit = _time_unit_int(_read_string_required(cur, String("sample_after_unit")))
+            if cfg.sample_after > 0 and cfg.sample_after_unit == TRAIN_TIME_UNIT_STEP:
+                cfg.sample_every = cfg.sample_after
+        elif key == "sample_skip_first":
+            cfg.sample_skip_first = Int(_read_scalar(cur).num)
+        elif key == "non_ema_sampling":
+            cfg.non_ema_sampling = _read_bool(cur)
+        elif key == "backup_after":
+            cfg.backup_after = Int(_read_scalar(cur).num)
+        elif key == "backup_after_unit":
+            cfg.backup_after_unit = _time_unit_int(_read_string_required(cur, String("backup_after_unit")))
+        elif key == "rolling_backup":
+            cfg.rolling_backup = _read_bool(cur)
+        elif key == "rolling_backup_count":
+            cfg.rolling_backup_count = Int(_read_scalar(cur).num)
+        elif key == "backup_before_save":
+            cfg.backup_before_save = _read_bool(cur)
+        elif key == "save_every_unit" or key == "save_after_unit":
+            cfg.save_every_unit = _time_unit_int(_read_string_required(cur, String("save_every_unit")))
+        elif key == "save_skip_first":
+            cfg.save_skip_first = Int(_read_scalar(cur).num)
+        elif key == "save_filename_prefix":
+            cfg.save_filename_prefix = _read_string_required(cur, String("save_filename_prefix"))
+        elif key == "masked_training":
+            cfg.masked_training = _read_bool(cur)
+        elif key == "unmasked_probability":
+            cfg.unmasked_probability = Float32(_read_scalar(cur).num)
+        elif key == "unmasked_weight":
+            cfg.unmasked_weight = Float32(_read_scalar(cur).num)
+        elif key == "normalize_masked_area_loss":
+            cfg.normalize_masked_area_loss = _read_bool(cur)
+        elif key == "masked_prior_preservation_weight":
+            cfg.masked_prior_preservation_weight = Float32(_read_scalar(cur).num)
+        elif key == "custom_conditioning_image":
+            cfg.custom_conditioning_image = _read_bool(cur)
         else:
             _skip_value(cur)  # skip unknown top-level keys
 
@@ -573,4 +1094,7 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             + String(cur.pos)
         )
 
+    cfg.validate_training_method_config()
+    cfg.validate_offload_checkpoint_config()
+    cfg.validate_onetrainer_policy_config()
     return cfg^

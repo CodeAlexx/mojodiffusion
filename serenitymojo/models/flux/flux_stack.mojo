@@ -110,6 +110,12 @@ def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> 
     return Tensor.from_host(vals, shape^, STDtype.BF16, ctx)
 
 
+def _t_f32(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
+    # Scalar schedule inputs stay F32 because timestep_embedding requires F32
+    # timesteps for sinusoidal math; embedding output storage is chosen by caller.
+    return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+
+
 def _concat_seq(txt: List[Float32], img: List[Float32]) -> List[Float32]:
     # [N_TXT,D] then [N_IMG,D] -> [S,D] (txt FIRST), row-major append.
     var o = List[Float32]()
@@ -450,7 +456,7 @@ def _embed_vec_forward(
     # we need the intermediate, so we build the sinusoid + MLP explicitly.
     from serenitymojo.ops.embeddings import timestep_embedding
     var t_emb = timestep_embedding(
-        _t(timestep, [1], ctx), T_DIM, ctx, Float32(10000.0), STDtype.F32
+        _t_f32(timestep, [1], ctx), T_DIM, ctx, Float32(10000.0), STDtype.F32
     ).to_host(ctx)  # legacy host MLP path
     var tr = _mlp_embed_fwd(t_emb.copy(), base.time_in, T_DIM, D, ctx)
     var vec = tr[0].copy()
@@ -460,7 +466,7 @@ def _embed_vec_forward(
     var g_hid = _zeros(D)
     if base.has_guidance and guidance:
         g_emb = timestep_embedding(
-            _t(guidance.value().copy(), [1], ctx),
+            _t_f32(guidance.value().copy(), [1], ctx),
             T_DIM,
             ctx,
             Float32(10000.0),

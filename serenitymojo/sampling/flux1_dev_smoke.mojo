@@ -6,9 +6,17 @@ from serenitymojo.sampling.flux1_dev import (
     Flux1DevScheduler,
     build_flux1_packed_latent_plan,
     build_flux1_sigma_schedule,
+    flux1_cfg_batch_size,
+    flux1_dynamic_shift,
+    flux1_euler_update_value,
+    flux1_guidance_embed_value,
     flux1_latent_spatial_dim,
+    flux1_model_timestep_from_scheduler_timestep,
+    flux1_model_timestep_from_sigma,
     flux1_mu,
     flux1_packed_spatial_dim,
+    flux1_scheduler_timestep_from_sigma,
+    validate_flux1_flow_match_scheduler_config,
 )
 
 
@@ -51,7 +59,39 @@ def _check_strictly_less(name: String, actual: Float64, upper_bound: Float64) ra
         )
 
 
+def _expect_scheduler_config_block() raises:
+    var raised = False
+    try:
+        validate_flux1_flow_match_scheduler_config(
+            String("FlowMatchEulerDiscreteScheduler"),
+            1000,
+            3.0,
+            256,
+            4096,
+            0.5,
+            1.15,
+            False,
+        )
+    except e:
+        raised = True
+        print("  scheduler config drift blocked as expected:", String(e))
+    if not raised:
+        raise Error("expected FLUX.1-dev scheduler config drift to be blocked")
+
+
 def main() raises:
+    validate_flux1_flow_match_scheduler_config(
+        String("FlowMatchEulerDiscreteScheduler"),
+        1000,
+        3.0,
+        256,
+        4096,
+        0.5,
+        1.15,
+        True,
+    )
+    _expect_scheduler_config_block()
+
     var plan = build_flux1_packed_latent_plan(1024, 1024, 512)
     plan.validate_dev_1024_contract()
     _check_equal("latent_h", plan.latent_h, 128)
@@ -79,6 +119,29 @@ def main() raises:
 
     _check_close("mu(256)", flux1_mu(256), 0.5)
     _check_close("mu(4096)", flux1_mu(4096), 1.15)
+    _check_close("dynamic shift(4096)", flux1_dynamic_shift(4096), 3.15819291)
+    _check_equal("cfg batch size", flux1_cfg_batch_size(), 1)
+    _check_close("guidance embed", Float64(flux1_guidance_embed_value(3.5)), 3.5)
+    _check_close(
+        "scheduler timestep",
+        Float64(flux1_scheduler_timestep_from_sigma(0.25)),
+        250.0,
+    )
+    _check_close(
+        "model timestep from scheduler",
+        Float64(flux1_model_timestep_from_scheduler_timestep(250.0)),
+        0.25,
+    )
+    _check_close(
+        "model timestep from sigma",
+        Float64(flux1_model_timestep_from_sigma(0.25)),
+        0.25,
+    )
+    _check_close(
+        "scalar Euler update",
+        Float64(flux1_euler_update_value(2.0, -4.0, 0.75, 0.25)),
+        4.0,
+    )
 
     var sigmas = build_flux1_sigma_schedule(20, 4096)
     _check_equal("schedule len", len(sigmas), 21)
@@ -97,6 +160,8 @@ def main() raises:
     var sched = Flux1DevScheduler(3, 4096)
     _check_close("sched.mu", sched.mu, 1.15)
     _check_close("sched.timestep(1)", Float64(sched.timestep(1)), 0.86332049)
+    _check_close("sched.scheduler_timestep(1)", Float64(sched.scheduler_timestep(1)), 863.32049)
+    _check_close("sched.model_timestep(1)", Float64(sched.model_timestep(1)), 0.86332049)
     _check_close("sched.dt(0)", Float64(sched.dt(0)), -0.13667951)
     _check_close(
         "sched.dt adjacent delta",

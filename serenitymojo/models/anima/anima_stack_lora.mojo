@@ -15,7 +15,7 @@
 #   * models/anima/lora_block.mojo : anima_block_lora_forward/backward (reduces to
 #     base when adapters absent; LoRA d_x summed into the trained-stream projection
 #     input grad; ca k/v LoRA d_x discarded since input is frozen context).
-#   * training/{lora_save, train_step} : LoraAdapter, _lora_adamw, save_lora_peft.
+#   * training/{lora_save, train_step} : LoraAdapter, _lora_adamw, save_lora_onetrainer.
 #
 # CARRIER DESIGN (Tenet-2: make the right thing easy) — mirrors ErnieLoraSet:
 #   AnimaLoraSet holds ONE flat List[LoraAdapter] of 10×num_blocks adapters indexed
@@ -49,7 +49,6 @@ from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
 from serenitymojo.io.safetensors import SafeTensors
-from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.models.anima.weights import (
     AnimaBlockWeights, AnimaStackBase, load_anima_block_weights_f32,
 )
@@ -70,7 +69,7 @@ from serenitymojo.models.dit.anima_contract import ANIMA_HIDDEN  # 2048
 
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
-    NamedLora, save_lora_peft, load_lora_for_resume,
+    NamedLora, save_lora_onetrainer, load_lora_for_resume,
     save_lora_train_state, load_lora_train_state,
 )
 
@@ -896,8 +895,8 @@ def anima_lora_adamw_step(
 #   net.blocks.<i>.self_attn.{q_proj,k_proj,v_proj,output_proj}    (anima.rs:365-390)
 #   net.blocks.<i>.cross_attn.{q_proj,k_proj,v_proj,output_proj}   (anima.rs:411-440)
 #   net.blocks.<i>.mlp.{layer1,layer2}                             (anima.rs:449-451)
-# save_lora_peft appends .lora_A.weight / .lora_B.weight, so the file is byte-exact
-# loadable by the inference LoRA path (FMT_DIFFUSION_MODEL) and ai-toolkit/PEFT.
+# This legacy prefix is kept for the trainer-only state sidecar, whose keys are
+# private to Mojo resume. Product LoRA saves use the raw OneTrainer prefixes below.
 def _anima_lora_prefix(block_idx: Int, slot: Int) -> String:
     var b = String("net.blocks.") + String(block_idx)
     if slot == SLOT_SA_Q:
@@ -929,16 +928,15 @@ def anima_lora_prefixes(num_blocks: Int) -> List[String]:
     return out^
 
 
-# ── SAVE every adapter as a PEFT/ai-toolkit safetensors ──────────────────────
-def save_anima_lora(set: AnimaLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+def _anima_ot_named(set: AnimaLoraSet) -> List[NamedLora]:
     var named = List[NamedLora]()
     for bi in range(set.num_blocks):
         for s in range(ANIMA_SLOTS):
             named.append(NamedLora(
-                _anima_lora_prefix(bi, s),
+                _anima_ot_prefix(bi, s),
                 set.ad[bi * ANIMA_SLOTS + s].copy(),
             ))
-    return save_lora_peft(named, path, ctx)
+    return named^
 
 
 # ── OneTrainer diffusers-state-dict key naming (delta 5) ─────────────────────
@@ -993,33 +991,16 @@ def anima_ot_prefixes(num_blocks: Int) -> List[String]:
 
 
 # ── SAVE every adapter in OneTrainer diffusers key naming (OT-loadable) ───────
-# Writes lora_down.weight [rank,in] / lora_up.weight [out,rank] / alpha (scalar)
-# per module, byte-exact to AnimaLoRASaver's transformer_lora.state_dict() layout.
+def save_anima_lora(set: AnimaLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    return save_lora_onetrainer(_anima_ot_named(set), path, ctx)
+
+
+# Compatibility alias for older Anima OT training entrypoints. The shared saver
+# derives alpha from each adapter's scale*rank, preserving BF16 raw OT tensors.
 def save_anima_lora_ot(
     set: AnimaLoraSet, alpha: Float32, path: String, ctx: DeviceContext
 ) raises -> Int:
-    var names = List[String]()
-    var tensors = List[ArcPointer[Tensor]]()
-    for bi in range(set.num_blocks):
-        for s in range(ANIMA_SLOTS):
-            var ad = set.ad[bi * ANIMA_SLOTS + s].copy()
-            var pfx = _anima_ot_prefix(bi, s)
-            if len(ad.a) != ad.rank * ad.in_f:
-                raise Error(String("save_anima_lora_ot: A numel mismatch for ") + pfx)
-            if len(ad.b) != ad.out_f * ad.rank:
-                raise Error(String("save_anima_lora_ot: B numel mismatch for ") + pfx)
-            var a_sh = List[Int](); a_sh.append(ad.rank); a_sh.append(ad.in_f)
-            var b_sh = List[Int](); b_sh.append(ad.out_f); b_sh.append(ad.rank)
-            var al_sh = List[Int](); al_sh.append(1)
-            var al_v = List[Float32](); al_v.append(alpha)
-            names.append(pfx + String(".lora_down.weight"))
-            tensors.append(ArcPointer(Tensor.from_host_bf16(ad.a.copy(), a_sh^, ctx)))
-            names.append(pfx + String(".lora_up.weight"))
-            tensors.append(ArcPointer(Tensor.from_host_bf16(ad.b.copy(), b_sh^, ctx)))
-            names.append(pfx + String(".alpha"))
-            tensors.append(ArcPointer(Tensor.from_host(al_v^, al_sh^, STDtype.F32, ctx)))
-    save_safetensors(names, tensors, path, ctx)
-    return set.num_blocks * ANIMA_SLOTS
+    return save_anima_lora(set, path, ctx)
 
 
 # ── RESUME: load the adapter A/B back from a save_anima_lora file ────────────
@@ -1029,7 +1010,7 @@ def load_anima_lora_resume(
     num_blocks: Int, rank: Int, alpha: Float32,
     path: String, ctx: DeviceContext,
 ) raises -> AnimaLoraSet:
-    var prefixes = anima_lora_prefixes(num_blocks)
+    var prefixes = anima_ot_prefixes(num_blocks)
     var scale = alpha / Float32(rank)
     var named = load_lora_for_resume(prefixes, scale, path, ctx)   # flat order
     var ad = List[LoraAdapter]()
@@ -1039,9 +1020,9 @@ def load_anima_lora_resume(
 
 
 # ── FAITHFUL-RESUME state sidecar: A/B + AdamW moments (ma/va/mb/vb) ──────────
-# Mirrors save_klein_lora_state / load_klein_lora_state. The PEFT file
-# (save_anima_lora) stays plain external-compatible LoRA; this `.opt`/state file
-# additionally persists the AdamW moments so a resumed run does NOT zero momentum.
+# Mirrors save_klein_lora_state / load_klein_lora_state. The exported LoRA file
+# (save_anima_lora) is raw OneTrainer; this `.opt`/state file additionally
+# persists the AdamW moments so a resumed run does NOT zero momentum.
 # The AdamW bias-correction step `t` is reconstructed by the trainer from
 # start_step (it passes t = step+1, continuous across the resume boundary), so it
 # is not stored here — only the load-bearing m/v carry across.

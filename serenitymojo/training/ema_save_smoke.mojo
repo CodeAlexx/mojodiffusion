@@ -44,7 +44,7 @@ def main() raises:
     var ctx = DeviceContext()
     var ok = True
 
-    var lora = build_klein_lora_set(1, 1, 8, 2, Float32(2.0))
+    var lora = build_klein_lora_set(1, 1, 8, 16, 2, Float32(2.0))
     # shadow lists in the SAME flat order the trainer allocates them.
     var ema_dbl_a = List[List[BFloat16]]()
     var ema_dbl_b = List[List[BFloat16]]()

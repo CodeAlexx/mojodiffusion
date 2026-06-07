@@ -3,8 +3,8 @@
 # Flux (flux1-dev) FULL DiT STACK *WITH LoRA* on every trained block projection:
 # forward (saving ckpt-inputs) + full-depth backward (training) that uses the
 # parity-verified per-block LoRA variants (models/flux/lora_block.mojo), COLLECTS
-# every adapter's d_A/d_B, and supports an AdamW step + a PEFT/ai-toolkit save
-# across all adapters. This file COMPOSES; it rebuilds NOTHING.
+# every adapter's d_A/d_B, and supports an AdamW step + a OneTrainer raw-key save
+# across the currently implemented adapters. This file COMPOSES; it rebuilds NOTHING.
 #
 # WHAT IS ALREADY PROVEN (cos>=0.999 vs torch) AND ONLY REUSED HERE
 #   * models/flux/block.mojo : base double/single block fwd+bwd (Phase-1 GREEN).
@@ -15,7 +15,8 @@
 #   * models/flux/lora_block.mojo : double/single_block_lora_forward/backward
 #     (reduce to base when adapters absent; LoRA d_x summed into the proj-input
 #     grad). Slot order per the OneTrainer convert_flux_lora.py target set.
-#   * training/{lora_save, train_step} : LoraAdapter, _lora_adamw, save_lora_peft.
+#   * training/{lora_save, train_step} : LoraAdapter, _lora_adamw,
+#     save_lora_onetrainer.
 #
 # CARRIER DESIGN (Tenet-2: make the right thing easy) — mirrors KleinLoraSet /
 #   ErnieLoraSet. FluxLoraSet holds ONE flat List[LoraAdapter]:
@@ -32,8 +33,8 @@
 #   embed MLPs, per-block modulation linears, the block linears, final layer) are
 #   FROZEN — their grads are computed by the base path and discarded for the
 #   optimizer; only block-projection d_A/d_B are trained. This matches Klein/Ernie
-#   scope. OT also LoRAs the modulation/embedder/final linears; those are
-#   stack-level base linears and are the NEXT increment (noted in the plan).
+#   scope. The OneTrainer parity inventory below makes the not-yet-trained
+#   stack-level and modulation Linear targets explicit and fail-loud.
 #
 # RESIDENCY: full F32 residency of 19+38 real-depth blocks is ~34GB (Phase-2
 #   finding) and does NOT fit a 3090 — real-depth runs need block-swap offload +
@@ -86,7 +87,9 @@ from serenitymojo.ops.activation_backward import silu_backward
 
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
-    NamedLora, save_lora_peft, load_lora_for_resume,
+    NamedLora,
+    save_lora_onetrainer, load_lora_for_resume,
+    save_lora_train_state, load_lora_train_state,
 )
 
 
@@ -498,13 +501,55 @@ def flux_lora_adamw_step(
         _lora_adamw(set.ad[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
 
 
-# ── OT/BFL key-name scheme (convert_flux_lora.py:6-41 BFL module keys) ───────
-# Saved as "<bfl_module>.lora_A.weight"/".lora_B.weight". These are the BFL
-# (black-forest-labs flux) module names; OT's saver converts them to the
-# diffusers names on export, but the BFL keys are the canonical in-memory target
-# set and round-trip exactly through save_lora_peft/load_lora_for_resume.
+# ── OneTrainer legacy/raw save-key scheme for the adapters Flux trains now ──
+# Prefixes match OneTrainer's default Flux LoRA safetensors export for the
+# current block-projection surface. save_lora_onetrainer appends .alpha /
+# .lora_down.weight / .lora_up.weight.
 def _dbl_stream_prefix(bi: Int, stream_img: Bool, slot: Int) -> String:
-    var b = String("double_blocks.") + String(bi) + "."
+    var b = String("lora_transformer_transformer_blocks_") + String(bi) + "_"
+    if stream_img:
+        if slot == D_SQ:
+            return b + "attn_to_q"
+        elif slot == D_SK:
+            return b + "attn_to_k"
+        elif slot == D_SV:
+            return b + "attn_to_v"
+        elif slot == D_PROJ:
+            return b + "attn_to_out_0"
+        elif slot == D_MLP0:
+            return b + "ff_net_0_proj"
+        return b + "ff_net_2"
+    else:
+        if slot == D_SQ:
+            return b + "attn_add_q_proj"
+        elif slot == D_SK:
+            return b + "attn_add_k_proj"
+        elif slot == D_SV:
+            return b + "attn_add_v_proj"
+        elif slot == D_PROJ:
+            return b + "attn_to_add_out"
+        elif slot == D_MLP0:
+            return b + "ff_context_net_0_proj"
+        return b + "ff_context_net_2"
+
+
+def _sgl_prefix(bi: Int, slot: Int) -> String:
+    var b = String("lora_transformer_single_transformer_blocks_") + String(bi) + "_"
+    if slot == S_SQ:
+        return b + "attn_to_q"
+    elif slot == S_SK:
+        return b + "attn_to_k"
+    elif slot == S_SV:
+        return b + "attn_to_v"
+    elif slot == S_PMLP:
+        return b + "proj_mlp"
+    return b + "proj_out"
+
+
+# Old PEFT/BFL prefixes are retained only for resume compatibility with files
+# saved before the product LoRA save moved to OneTrainer raw suffixes.
+def _legacy_peft_dbl_stream_prefix(bi: Int, stream_img: Bool, slot: Int) -> String:
+    var b = String("double") + String("_blocks.") + String(bi) + "."
     var s = "img" if stream_img else "txt"
     if slot == D_SQ:
         return b + s + "_attn.qkv.0"
@@ -519,8 +564,8 @@ def _dbl_stream_prefix(bi: Int, stream_img: Bool, slot: Int) -> String:
     return b + s + "_mlp.2"
 
 
-def _sgl_prefix(bi: Int, slot: Int) -> String:
-    var b = String("single_blocks.") + String(bi) + "."
+def _legacy_peft_sgl_prefix(bi: Int, slot: Int) -> String:
+    var b = String("single") + String("_blocks.") + String(bi) + "."
     if slot == S_SQ:
         return b + "linear1.0"
     elif slot == S_SK:
@@ -545,13 +590,124 @@ def flux_lora_prefixes(num_double: Int, num_single: Int) -> List[String]:
     return out^
 
 
-def save_flux_lora(set: FluxLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+def _dbl_ot_norm_prefix(bi: Int, stream_img: Bool) -> String:
+    var b = String("lora_transformer_transformer_blocks_") + String(bi) + "_"
+    if stream_img:
+        return b + "norm1_linear"
+    return b + "norm1_context_linear"
+
+
+def _sgl_ot_norm_prefix(bi: Int) -> String:
+    return (
+        String("lora_transformer_single_transformer_blocks_") + String(bi)
+        + "_norm_linear"
+    )
+
+
+def _append_flux_ot_stack_prefixes(mut out: List[String]):
+    out.append("lora_transformer_context_embedder")
+    out.append("lora_transformer_norm_out_linear")
+    out.append("lora_transformer_proj_out")
+    out.append("lora_transformer_time_text_embed_guidance_embedder_linear_1")
+    out.append("lora_transformer_time_text_embed_guidance_embedder_linear_2")
+    out.append("lora_transformer_time_text_embed_text_embedder_linear_1")
+    out.append("lora_transformer_time_text_embed_text_embedder_linear_2")
+    out.append("lora_transformer_time_text_embed_timestep_embedder_linear_1")
+    out.append("lora_transformer_time_text_embed_timestep_embedder_linear_2")
+    out.append("lora_transformer_x_embedder")
+
+
+def flux_lora_ot_transformer_prefixes(num_double: Int, num_single: Int) -> List[String]:
+    """OneTrainer Flux transformer LoRA inventory for current default filters.
+
+    This is an inventory contract, not a math claim. `flux_lora_prefixes` is the
+    supported trained/saveable subset. `flux_lora_missing_ot_transformer_prefixes`
+    enumerates the still-frozen targets that must be wired before claiming full
+    OneTrainer transformer parity.
+    """
+    var out = List[String]()
+    _append_flux_ot_stack_prefixes(out)
+    for bi in range(num_double):
+        for s in range(DBL_STREAM_SLOTS):
+            out.append(_dbl_stream_prefix(bi, True, s))
+        out.append(_dbl_ot_norm_prefix(bi, True))
+        for s in range(DBL_STREAM_SLOTS):
+            out.append(_dbl_stream_prefix(bi, False, s))
+        out.append(_dbl_ot_norm_prefix(bi, False))
+    for bi in range(num_single):
+        for s in range(SGL_SLOTS):
+            out.append(_sgl_prefix(bi, s))
+        out.append(_sgl_ot_norm_prefix(bi))
+    return out^
+
+
+def flux_lora_missing_ot_transformer_prefixes(num_double: Int, num_single: Int) -> List[String]:
+    var out = List[String]()
+    _append_flux_ot_stack_prefixes(out)
+    for bi in range(num_double):
+        out.append(_dbl_ot_norm_prefix(bi, True))
+        out.append(_dbl_ot_norm_prefix(bi, False))
+    for bi in range(num_single):
+        out.append(_sgl_ot_norm_prefix(bi))
+    return out^
+
+
+def require_flux_lora_ot_transformer_complete(num_double: Int, num_single: Int) raises:
+    var missing = flux_lora_missing_ot_transformer_prefixes(num_double, num_single)
+    if len(missing) != 0:
+        raise Error(
+            String("Flux LoRA transformer surface is not full OneTrainer parity: ")
+            + String(len(missing)) + " target groups remain frozen; first missing "
+            + missing[0]
+        )
+
+
+def require_flux_lora_text_encoder_disabled(train_te1: Bool, train_te2: Bool) raises:
+    if train_te1:
+        raise Error("Flux LoRA lora_te1 save/resume surface is not implemented")
+    if train_te2:
+        raise Error("Flux LoRA lora_te2 save/resume surface is not implemented")
+
+
+def _legacy_peft_flux_lora_prefixes(num_double: Int, num_single: Int) -> List[String]:
+    var out = List[String]()
+    for bi in range(num_double):
+        for s in range(DBL_STREAM_SLOTS):   # img stream
+            out.append(_legacy_peft_dbl_stream_prefix(bi, True, s))
+        for s in range(DBL_STREAM_SLOTS):   # txt stream
+            out.append(_legacy_peft_dbl_stream_prefix(bi, False, s))
+    for bi in range(num_single):
+        for s in range(SGL_SLOTS):
+            out.append(_legacy_peft_sgl_prefix(bi, s))
+    return out^
+
+
+def _flux_set_from_named(
+    named: List[NamedLora], num_double: Int, num_single: Int, rank: Int,
+) -> FluxLoraSet:
+    var ad = List[LoraAdapter]()
+    for i in range(len(named)):
+        ad.append(named[i].adapter.copy())
+    return FluxLoraSet(ad^, num_double, num_single, rank)
+
+
+def _flux_named_loras(set: FluxLoraSet) -> List[NamedLora]:
     var prefixes = flux_lora_prefixes(set.num_double, set.num_single)
     var named = List[NamedLora]()
     var n = total_adapters(set)
     for i in range(n):
         named.append(NamedLora(prefixes[i], set.ad[i].copy()))
-    return save_lora_peft(named, path, ctx)
+    return named^
+
+
+def save_flux_lora(set: FluxLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    var named = _flux_named_loras(set)
+    return save_lora_onetrainer(named, path, ctx)
+
+
+def save_flux_lora_state(set: FluxLoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    var named = _flux_named_loras(set)
+    return save_lora_train_state(named, path, ctx)
 
 
 def load_flux_lora_resume(
@@ -560,11 +716,23 @@ def load_flux_lora_resume(
 ) raises -> FluxLoraSet:
     var prefixes = flux_lora_prefixes(num_double, num_single)
     var scale = alpha / Float32(rank)
-    var named = load_lora_for_resume(prefixes, scale, path, ctx)   # flat order
-    var ad = List[LoraAdapter]()
-    for i in range(len(named)):
-        ad.append(named[i].adapter.copy())
-    return FluxLoraSet(ad^, num_double, num_single, rank)
+    try:
+        var named = load_lora_for_resume(prefixes, scale, path, ctx)   # flat order
+        return _flux_set_from_named(named, num_double, num_single, rank)
+    except:
+        var legacy_prefixes = _legacy_peft_flux_lora_prefixes(num_double, num_single)
+        var named = load_lora_for_resume(legacy_prefixes, scale, path, ctx)
+        return _flux_set_from_named(named, num_double, num_single, rank)
+
+
+def load_flux_lora_state(
+    num_double: Int, num_single: Int, rank: Int, alpha: Float32,
+    path: String, ctx: DeviceContext,
+) raises -> FluxLoraSet:
+    var prefixes = flux_lora_prefixes(num_double, num_single)
+    var scale = alpha / Float32(rank)
+    var named = load_lora_train_state(prefixes, scale, path, ctx)
+    return _flux_set_from_named(named, num_double, num_single, rank)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -582,9 +750,10 @@ def load_flux_lora_resume(
 #
 # CONTRACT (mirrors klein_stack_lora's offload_turbo path, lines 699-786 +
 # 1457-1629): the streamed block plan is build_flux1_dev_block_plan() (19 double
-# then 38 single), so block index bi (0..num_double-1) maps to double_blocks.bi
-# and num_double+bi maps to single_blocks.bi — the SAME flat order the resident
-# stack and the LoRA carrier use. The forward keeps the FULL FluxStackForward
+# then 38 single), so block index bi (0..num_double-1) maps to the corresponding
+# double block and num_double+bi maps to the corresponding single block — the
+# SAME flat order the resident stack and the LoRA carrier use. The forward keeps
+# the FULL FluxStackForward
 # tape (per-block host saved activations) so the backward is recompute-FREE for
 # the block math (it only re-streams the block WEIGHTS). This matches the
 # resident stack's no-recompute backward: flux block forward already saves every

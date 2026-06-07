@@ -11,9 +11,9 @@
 # PARAMETER (and the clip total_norm scalar) against the tags emitted here.
 #
 # CRITICAL: we use torch.optim.AdamW (DECOUPLED weight decay), NOT
-# torch.optim.Adam(weight_decay=...) (which is Adam+L2). weight_decay > 0 is
-# used so the two forms would differ — this is the load-bearing distinction the
-# Mojo port must match (see flame-core/src/adam.rs receipt).
+# torch.optim.Adam(weight_decay=...) (which is Adam+L2). PyTorch AdamW applies
+# p *= (1 - lr * weight_decay) before the adaptive Adam subtraction.
+# weight_decay > 0 is used so order/form bugs are load-bearing.
 #
 # Emits tagged space-separated float lines into optim_ref.txt:
 #   adamw_p1   — param after 1 AdamW step

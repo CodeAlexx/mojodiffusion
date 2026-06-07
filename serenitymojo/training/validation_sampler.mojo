@@ -41,7 +41,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.dit.klein_dit import Klein9BDiT, build_klein_rope_tables
 from serenitymojo.training.train_config import TrainConfig
-from serenitymojo.ops.cast import cast_tensor, cast_tensor_if_needed
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, reshape, permute
 from serenitymojo.sampling.flux2_klein import build_flux2_sigma_schedule, flux2_cfg
@@ -182,25 +182,29 @@ def generate_validation[
         print("[validation] using config checkpoint instead of model_path override:", cfg.checkpoint)
     if vae_path != cfg.vae:
         print("[validation] using config VAE instead of vae_path override:", cfg.vae)
-    if lora_multiplier != Float32(1.0):
-        print("[validation] live LoRA sampler currently uses multiplier=1.0; requested", lora_multiplier)
     if lora_path == String(""):
         print("[validation] staged baseline pass (no LoRA)")
     else:
-        print("[validation] staged live-LoRA pass:", lora_path)
+        print("[validation] staged live-LoRA pass:", lora_path, " multiplier=", lora_multiplier)
 
     var txt_sh = List[Int]()
     txt_sh.append(N_TXT)
     txt_sh.append(cfg.joint_attention_dim)
-    var pos_txt = cast_tensor_if_needed(
-        reshape(caps.pos, txt_sh.copy(), ctx), STDtype.F32, ctx
-    )
-    var neg_txt = cast_tensor_if_needed(
-        reshape(caps.neg, txt_sh^, ctx), STDtype.F32, ctx
-    )
-    return klein_sample[N_IMG, N_TXT, S, LH, LW, 32, 128](
-        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, out_png, ctx,
-    )
+    var pos_txt = reshape(caps.pos, txt_sh.copy(), ctx)
+    var neg_txt = reshape(caps.neg, txt_sh^, ctx)
+    if cfg.head_dim != 128:
+        raise Error(String("generate_validation: unsupported Klein head_dim ") + String(cfg.head_dim))
+    if cfg.n_heads == 32:
+        return klein_sample[N_IMG, N_TXT, S, LH, LW, 32, 128](
+            cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, out_png, ctx,
+            lora_multiplier,
+        )
+    if cfg.n_heads == 24:
+        return klein_sample[N_IMG, N_TXT, S, LH, LW, 24, 128](
+            cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, out_png, ctx,
+            lora_multiplier,
+        )
+    raise Error(String("generate_validation: unsupported Klein num_heads ") + String(cfg.n_heads))
 
 
 # ── Pixel L1 between two decoded RGB tensors — the sample-shift metric ────────

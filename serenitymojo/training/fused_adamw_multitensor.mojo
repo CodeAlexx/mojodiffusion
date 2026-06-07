@@ -19,8 +19,8 @@
 #
 # Bias correction (bc1 = 1-beta1^t, bc2 = 1-beta2^t) is shared across all
 # tensors (they step together at the same t) and precomputed host-side, exactly
-# as optim.mojo does. DECOUPLED weight decay applied to p AFTER the Adam step —
-# matching optim.mojo and flame-core/src/adam.rs (NOT Adam+L2).
+# as optim.mojo does. DECOUPLED weight decay is applied to p before the adaptive
+# Adam subtraction, matching torch.optim.AdamW / OneTrainer AdamW (NOT Adam+L2).
 #
 # Params/grads may be F32/BF16/F16. Adam math is F32 inside the kernel, then
 # params are written back to their original storage dtype. m/v remain F32
@@ -88,6 +88,8 @@ def _fused_adamw_kernel[p_dtype: DType, g_dtype: DType](
 
     var gv = gp[j].cast[DType.float32]()
     var pv = pp[j].cast[DType.float32]()
+    if weight_decay > 0.0:
+        pv = pv * (1.0 - lr * weight_decay)
     var mi = beta1 * mp[j] + (1.0 - beta1) * gv
     var vi = beta2 * vp[j] + (1.0 - beta2) * gv * gv
     mp[j] = mi
@@ -95,8 +97,6 @@ def _fused_adamw_kernel[p_dtype: DType, g_dtype: DType](
     var m_hat = mi / bc1
     var v_hat = vi / bc2
     pv = pv - lr * m_hat / (sqrt(v_hat) + eps)
-    if weight_decay > 0.0:
-        pv = pv - lr * weight_decay * pv
     pp[j] = pv.cast[p_dtype]()
 
 

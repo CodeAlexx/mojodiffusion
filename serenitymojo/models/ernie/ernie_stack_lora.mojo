@@ -3,8 +3,8 @@
 # ERNIE-Image FULL DiT STACK *WITH LoRA* on every trained projection: forward
 # (saving ckpt-inputs) + full-depth backward (training) that uses the parity-
 # verified per-block LoRA variants (models/ernie/lora_block.mojo), COLLECTS every
-# adapter's d_A/d_B, and supports an AdamW step + a PEFT/ai-toolkit save across
-# all 7×num_layers adapters. This file COMPOSES; it rebuilds NOTHING.
+# adapter's d_A/d_B, and supports an AdamW step + a OneTrainer raw LoRA save
+# across all 7×num_layers adapters. This file COMPOSES; it rebuilds NOTHING.
 #
 # WHAT IS ALREADY PROVEN (cos>=0.999 vs torch) AND ONLY REUSED HERE
 #   * models/ernie/block.mojo : base block fwd+bwd (19/19 cos>=0.99999 vs torch).
@@ -14,7 +14,7 @@
 #     collection.
 #   * models/ernie/lora_block.mojo : ernie_block_lora_forward/backward (reduces to
 #     base when adapters absent; LoRA d_x summed into the projection-input grad).
-#   * training/{lora_save, train_step, optim} : LoraAdapter, _lora_adamw, save_lora_peft.
+#   * training/{lora_save, train_step, optim} : LoraAdapter, _lora_adamw, save_lora_onetrainer.
 #
 # CARRIER DESIGN (Tenet-2: make the right thing easy) — mirrors KleinLoraSet:
 #   ErnieLoraSet holds ONE flat List[LoraAdapter] of 7×num_layers adapters indexed
@@ -72,7 +72,7 @@ from serenitymojo.models.ernie.ernie_stack import (
 
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
-    NamedLora, save_lora_peft, load_lora_for_resume,
+    NamedLora, save_lora_onetrainer, load_lora_for_resume,
     save_lora_train_state, load_lora_train_state,
 )
 
@@ -923,14 +923,15 @@ def ernie_lora_adamw_step(
         _lora_adamw(set.ad[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
 
 
-# ── per-block PEFT/kohya prefix scheme (the INVERSE of the inference target map) ─
-# inference-flame ernie_image.rs lora.apply uses these module keys:
-#   layers.<i>.self_attention.{to_q, to_k, to_v, to_out.0}
-#   layers.<i>.mlp.{gate_proj, up_proj, linear_fc2}
-# save_lora_peft appends .lora_A.weight / .lora_B.weight, so the saved file is
-# byte-exact loadable by the inference LoRA path and ai-toolkit/PEFT.
+# ── per-block OneTrainer raw prefix scheme ──────────────────────────────────
+# OneTrainer ErnieLoRASetup wraps model.transformer with prefix "transformer".
+# LoRAModuleWrapper then prefixes child module names from the diffusers
+# transformer, yielding:
+#   transformer.layers.<i>.self_attention.{to_q, to_k, to_v, to_out.0}
+#   transformer.layers.<i>.mlp.{gate_proj, up_proj, linear_fc2}
+# save_lora_onetrainer appends .alpha / .lora_down.weight / .lora_up.weight.
 def _ernie_lora_prefix(block_idx: Int, slot: Int) -> String:
-    var b = String("layers.") + String(block_idx)
+    var b = String("transformer.layers.") + String(block_idx)
     if slot == SLOT_Q:
         return b + ".self_attention.to_q"
     elif slot == SLOT_K:
@@ -965,10 +966,10 @@ def _ernie_named_loras(set: ErnieLoraSet) -> List[NamedLora]:
     return named^
 
 
-# ── SAVE every adapter as a PEFT/ai-toolkit safetensors ──────────────────────
+# ── SAVE every adapter as a OneTrainer raw LoRA safetensors ──────────────────
 def save_ernie_lora(set: ErnieLoraSet, path: String, ctx: DeviceContext) raises -> Int:
     var named = _ernie_named_loras(set)
-    return save_lora_peft(named, path, ctx)
+    return save_lora_onetrainer(named, path, ctx)
 
 
 def save_ernie_lora_state(

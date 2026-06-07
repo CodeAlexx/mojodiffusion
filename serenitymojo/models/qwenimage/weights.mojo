@@ -20,9 +20,11 @@
 # norm_out weights so the trainer can compute per-block ModVecs from a temb. The
 # ModVecs themselves are computed per-step (modulation depends on the timestep).
 #
-# Mojo 1.0.0b1, NVIDIA GPU. Qwen-Image base is BF16 in the checkpoint; loaded
-# checkpoint tensors stay in their stored dtype. F32 is used for generated
-# modulation values and host-side training scalars, not for base weight storage.
+# Mojo 1.0.0b1, NVIDIA GPU. Qwen-Image local checkpoints may store tensors as
+# F8_E4M3. The training/runtime storage contract is BF16: FP8 bytes are
+# dequantized to BF16 on load, while BF16/F16/F32 side tensors enter through the
+# BF16 loader boundary. F32 is used for generated modulation values and
+# host-side training scalars, not for base weight storage.
 
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
@@ -31,6 +33,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.fp8 import fp8_e4m3_dequant_to_bf16
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.embeddings import timestep_embedding
@@ -44,11 +47,26 @@ from serenitymojo.models.qwenimage.qwenimage_stack import QwenStackBase
 comptime TArc = ArcPointer[Tensor]
 
 
-def _load_tensor(
+def load_qwen_tensor_bf16(
     st: ShardedSafeTensors, name: String, ctx: DeviceContext
 ) raises -> Tensor:
     var tv = st.tensor_view(name)
-    return Tensor.from_view(tv, ctx)
+    if tv.dtype == STDtype.F8_E4M3:
+        var raw = Tensor.from_view_raw(tv, ctx)
+        return fp8_e4m3_dequant_to_bf16(raw, Float32(1.0), ctx)
+    return Tensor.from_view_as_bf16(tv, ctx)
+
+
+def load_qwen_host_bf16(
+    st: ShardedSafeTensors, name: String, ctx: DeviceContext
+) raises -> List[BFloat16]:
+    return load_qwen_tensor_bf16(st, name, ctx).to_host_bf16(ctx)
+
+
+def _load_tensor(
+    st: ShardedSafeTensors, name: String, ctx: DeviceContext
+) raises -> Tensor:
+    return load_qwen_tensor_bf16(st, name, ctx)
 
 
 def _cast_to_weight_dtype(var x: Tensor, weight: Tensor, ctx: DeviceContext) raises -> Tensor:

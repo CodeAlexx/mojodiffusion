@@ -26,11 +26,9 @@
 #   (6) MODULATION VECS: computed on the fly each block from the streamed adaLN weights;
 #       saved for backward (like chroma saves dbl_img_mod / dbl_txt_mod).
 #
-# DTYPE RULE: native bf16 compute throughout. The sd35_block.mojo forward/backward
-# runs in F32 (host List[Float32]) as the carrier — same as chroma pattern.
-# "Native bf16" means the block's GPU ops (linear, rms_norm, sdpa, gelu) run on
-# tensors that are F32 on the host carrier; they are moved to GPU as F32, which
-# matches the chroma pattern. True bf16 GPU dispatch is a later optimization.
+# DTYPE STATUS: this training stack still uses host List[Float32] carriers around
+# sd35_block.mojo and streamed weights. LoRA adapter storage remains BF16, but the
+# SD3.5 block/stack path is not dtype-clean until the carriers become tensors.
 #
 # Mojo 0.26.x+: def not fn; Tensor move-only; host List[Float32] carriers.
 
@@ -46,7 +44,7 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.embeddings import t_embedder
-from serenitymojo.ops.linalg_backward import linear_backward
+from serenitymojo.ops.linalg_backward import linear_backward_dx
 from serenitymojo.ops.norm_backward import layer_norm_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
@@ -56,50 +54,54 @@ from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.models.sd35.sd35_block import (
     JointBlockWeights, StreamWeights, ModVecs, JointBlockForward,
     StreamSaved, sd35_joint_block_forward, sd35_joint_block_backward,
-    sd35_stream_norm,
 )
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
+from serenitymojo.training.lora_save import (
+    NamedLora,
+    save_lora_peft,
+    save_lora_train_state,
+)
 
 
 comptime TArc = ArcPointer[Tensor]
 
 
 # ── Frozen stack-level resident base ─────────────────────────────────────────
-# Holds embedder + final layer weights as host F32 lists (not Tensors) to avoid
-# the zero-shape Tensor workaround. Mirrors ChromaStackBase.
-struct SD35StackBase(Movable):
+# Stack-level embedder/final-layer weights stay resident as checkpoint-dtype
+# tensors. The block stream below still has a separate host-F32 carrier blocker.
+struct SD35StackBase(Copyable, Movable):
     # x_embedder: Conv2d [D,16,2,2] flattened to linear [D,64]
-    var xe_w: List[Float32]   # [D * 64]
-    var xe_b: List[Float32]   # [D]
+    var xe_w: TArc   # [D,64]
+    var xe_b: TArc   # [D]
     # context_embedder: [D, 4096]
-    var ce_w: List[Float32]   # [D * 4096]
-    var ce_b: List[Float32]   # [D]
+    var ce_w: TArc   # [D,4096]
+    var ce_b: TArc   # [D]
     # t_embedder MLP: 256 -> D -> D
-    var t_w0: List[Float32]   # [D * 256]
-    var t_b0: List[Float32]   # [D]
-    var t_w2: List[Float32]   # [D * D]
-    var t_b2: List[Float32]   # [D]
+    var t_w0: TArc   # [D,256]
+    var t_b0: TArc   # [D]
+    var t_w2: TArc   # [D,D]
+    var t_b2: TArc   # [D]
     # y_embedder (pooled CLIP): 2048 -> D -> D
-    var y_w0: List[Float32]   # [D * 2048]
-    var y_b0: List[Float32]   # [D]
-    var y_w2: List[Float32]   # [D * D]
-    var y_b2: List[Float32]   # [D]
+    var y_w0: TArc   # [D,2048]
+    var y_b0: TArc   # [D]
+    var y_w2: TArc   # [D,D]
+    var y_b2: TArc   # [D]
     # final_layer: adaLN [2D,D] + linear [64,D]
-    var fl_ada_w: List[Float32]  # [2D * D]
-    var fl_ada_b: List[Float32]  # [2D]
-    var fl_lin_w: List[Float32]  # [64 * D]
-    var fl_lin_b: List[Float32]  # [64]
+    var fl_ada_w: TArc  # [2D,D]
+    var fl_ada_b: TArc  # [2D]
+    var fl_lin_w: TArc  # [64,D]
+    var fl_lin_b: TArc  # [64]
 
     def __init__(
         out self,
-        var xe_w: List[Float32], var xe_b: List[Float32],
-        var ce_w: List[Float32], var ce_b: List[Float32],
-        var t_w0: List[Float32], var t_b0: List[Float32],
-        var t_w2: List[Float32], var t_b2: List[Float32],
-        var y_w0: List[Float32], var y_b0: List[Float32],
-        var y_w2: List[Float32], var y_b2: List[Float32],
-        var fl_ada_w: List[Float32], var fl_ada_b: List[Float32],
-        var fl_lin_w: List[Float32], var fl_lin_b: List[Float32],
+        var xe_w: TArc, var xe_b: TArc,
+        var ce_w: TArc, var ce_b: TArc,
+        var t_w0: TArc, var t_b0: TArc,
+        var t_w2: TArc, var t_b2: TArc,
+        var y_w0: TArc, var y_b0: TArc,
+        var y_w2: TArc, var y_b2: TArc,
+        var fl_ada_w: TArc, var fl_ada_b: TArc,
+        var fl_lin_w: TArc, var fl_lin_b: TArc,
     ):
         self.xe_w = xe_w^
         self.xe_b = xe_b^
@@ -226,16 +228,15 @@ def sd35_lora_adamw_step(
     step: Int, lr: Float32,
     ctx: DeviceContext,
     beta1: Float32 = 0.9, beta2: Float32 = 0.999, eps: Float32 = 1.0e-8,
+    weight_decay: Float32 = 0.01,
 ) raises:
     for i in range(len(lora.ad)):
         var g = LoraGrads(grads.d_a[i].copy(), grads.d_b[i].copy())
-        _lora_adamw(lora.ad[i], g, step, lr, ctx, beta1, beta2, eps)
+        _lora_adamw(lora.ad[i], g, step, lr, ctx, beta1, beta2, eps, weight_decay)
 
 
 # ── Save LoRA (PEFT-compatible safetensors) ───────────────────────────────────
-def save_sd35_lora(lora: SD35LoraSet, path: String, ctx: DeviceContext) raises -> Int:
-    # Build named adapters for the PEFT format
-    from serenitymojo.training.lora_save import NamedLora, save_lora_peft
+def _sd35_named_loras(lora: SD35LoraSet) -> List[NamedLora]:
     var named = List[NamedLora]()
     for bi in range(lora.depth):
         var base = _block_base(bi)
@@ -256,12 +257,28 @@ def save_sd35_lora(lora: SD35LoraSet, path: String, ctx: DeviceContext) raises -
             lora.ad[base + SLOT_X_FC1].copy()))
         named.append(NamedLora(bp + String(".x_block.mlp.fc2"),
             lora.ad[base + SLOT_X_FC2].copy()))
-    return save_lora_peft(named^, path, ctx)
+    return named^
+
+
+def save_sd35_lora(lora: SD35LoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    return save_lora_peft(_sd35_named_loras(lora), path, ctx)
+
+
+def save_sd35_lora_state(lora: SD35LoraSet, path: String, ctx: DeviceContext) raises -> Int:
+    return save_lora_train_state(_sd35_named_loras(lora), path, ctx)
 
 
 # ── Host utility helpers (mirrors chroma_stack_lora / flux_stack) ─────────────
 def _t(v: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(v, shape^, STDtype.F32, ctx)
+
+
+def _t_as(v: List[Float32], var shape: List[Int], dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_host(v, shape^, dtype, ctx)
+
+
+def _tb(v: List[BFloat16], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_host_bf16(v, shape^, ctx)
 
 
 def _zeros_list(n: Int) -> List[Float32]:
@@ -291,26 +308,27 @@ def _build_conditioning(
     var t_out = t_embedder(
         t_in,
         TIMESTEP_DIM,
-        _t(base.t_w0.copy(), [D, TIMESTEP_DIM], ctx),
-        Optional[Tensor](_t(base.t_b0.copy(), [D], ctx)),
-        _t(base.t_w2.copy(), [D, D], ctx),
-        Optional[Tensor](_t(base.t_b2.copy(), [D], ctx)),
+        base.t_w0[],
+        Optional[Tensor](base.t_b0[].clone(ctx)),
+        base.t_w2[],
+        Optional[Tensor](base.t_b2[].clone(ctx)),
         ctx,
         Float32(10000.0),
     )  # [1, D]
 
     # y_embedder: linear -> silu -> linear
+    var y_dtype = base.y_w0[].dtype()
     var y0 = linear(
-        _t(pooled_h.copy(), [1, POOLED_DIM], ctx),
-        _t(base.y_w0.copy(), [D, POOLED_DIM], ctx),
-        Optional[Tensor](_t(base.y_b0.copy(), [D], ctx)),
+        _t_as(pooled_h.copy(), [1, POOLED_DIM], y_dtype, ctx),
+        base.y_w0[],
+        Optional[Tensor](base.y_b0[].clone(ctx)),
         ctx,
     )
     y0 = silu(y0, ctx)
     var y_out = linear(
         y0,
-        _t(base.y_w2.copy(), [D, D], ctx),
-        Optional[Tensor](_t(base.y_b2.copy(), [D], ctx)),
+        base.y_w2[],
+        Optional[Tensor](base.y_b2[].clone(ctx)),
         ctx,
     )  # [1, D]
 
@@ -382,35 +400,6 @@ def _compute_stream_modvecs(
     ).to_host(ctx)
     var mv = _chunk6(raw.copy(), D)
     return _StreamModResult(raw^, mv^)
-
-
-# ── LoRA forward delta computation ────────────────────────────────────────────
-# For a linear y = x@W.T + b, the LoRA delta = scale * (x@A.T) @ B.T
-# = scale * linear(linear(x, A), B)
-def _lora_delta(
-    x_h: List[Float32], ad: LoraAdapter,
-    rows: Int, ctx: DeviceContext,
-) raises -> List[Float32]:
-    var rank = ad.rank
-    var in_f = ad.in_f
-    var out_f = ad.out_f
-    # intermediate = x @ A.T   [rows, rank]
-    var inter = linear(
-        _t(x_h, [rows, in_f], ctx),
-        Tensor.from_host_bf16(ad.a.copy(), [rank, in_f], ctx),
-        Optional[Tensor](None), ctx,
-    )
-    # delta = inter @ B.T  [rows, out_f]
-    var delta = linear(
-        inter,
-        Tensor.from_host_bf16(ad.b.copy(), [out_f, rank], ctx),
-        Optional[Tensor](None), ctx,
-    )
-    # scale and flatten
-    var delta_h = delta.to_host(ctx)
-    for i in range(len(delta_h)):
-        delta_h[i] = delta_h[i] * ad.scale
-    return delta_h^
 
 
 # ── Saved per-block state (for backward) ─────────────────────────────────────
@@ -530,10 +519,11 @@ def _x_embed(
     N_IMG: Int, IN_CH: Int, D: Int, ctx: DeviceContext,
 ) raises -> List[Float32]:
     # x_embedder.proj is Conv2d(16,D,2,2) = linear on patch vectors [N_IMG, IN_CH]
+    var xe_dtype = base.xe_w[].dtype()
     return linear(
-        _t(noisy_h, [N_IMG, IN_CH], ctx),
-        _t(base.xe_w.copy(), [D, IN_CH], ctx),
-        Optional[Tensor](_t(base.xe_b.copy(), [D], ctx)),
+        _t_as(noisy_h, [N_IMG, IN_CH], xe_dtype, ctx),
+        base.xe_w[],
+        Optional[Tensor](base.xe_b[].clone(ctx)),
         ctx,
     ).to_host(ctx)
 
@@ -542,10 +532,11 @@ def _ctx_embed(
     ctx_tokens_h: List[Float32], base: SD35StackBase,
     N_CTX: Int, CTX_CH: Int, D: Int, ctx: DeviceContext,
 ) raises -> List[Float32]:
+    var ce_dtype = base.ce_w[].dtype()
     return linear(
-        _t(ctx_tokens_h, [N_CTX, CTX_CH], ctx),
-        _t(base.ce_w.copy(), [D, CTX_CH], ctx),
-        Optional[Tensor](_t(base.ce_b.copy(), [D], ctx)),
+        _t_as(ctx_tokens_h, [N_CTX, CTX_CH], ce_dtype, ctx),
+        base.ce_w[],
+        Optional[Tensor](base.ce_b[].clone(ctx)),
         ctx,
     ).to_host(ctx)
 
@@ -567,20 +558,22 @@ def _final_layer(
     N_IMG: Int, D: Int, OUT_CH: Int, eps: Float32, ctx: DeviceContext,
 ) raises -> _FinalLayerResult:
     """Returns _FinalLayerResult(out, final_ada_flat [2D], pre_final_x [N_IMG,D])."""
+    var ada_dtype = base.fl_ada_w[].dtype()
+    var lin_dtype = base.fl_lin_w[].dtype()
     # LayerNorm (no affine)
     var ln_x = layer_norm(
-        _t(x_h.copy(), [N_IMG, D], ctx),
-        _t(_ones_list(D), [D], ctx),
-        _t(_zeros_list(D), [D], ctx),
+        _t_as(x_h.copy(), [N_IMG, D], ada_dtype, ctx),
+        _t_as(_ones_list(D), [D], ada_dtype, ctx),
+        _t_as(_zeros_list(D), [D], ada_dtype, ctx),
         eps, ctx,
     ).to_host(ctx)
 
     # silu(c) -> linear -> [2D] -> chunk shift, scale
-    var c_silu = silu(_t(c_h.copy(), [1, D], ctx), ctx)
+    var c_silu = silu(_t_as(c_h.copy(), [1, D], ada_dtype, ctx), ctx)
     var ada_raw = linear(
         c_silu,
-        _t(base.fl_ada_w.copy(), [2 * D, D], ctx),
-        Optional[Tensor](_t(base.fl_ada_b.copy(), [2 * D], ctx)),
+        base.fl_ada_w[],
+        Optional[Tensor](base.fl_ada_b[].clone(ctx)),
         ctx,
     ).to_host(ctx)  # [2D]
 
@@ -600,9 +593,9 @@ def _final_layer(
 
     # final linear -> [N_IMG, OUT_CH]
     var out = linear(
-        _t(x_mod, [N_IMG, D], ctx),
-        _t(base.fl_lin_w.copy(), [OUT_CH, D], ctx),
-        Optional[Tensor](_t(base.fl_lin_b.copy(), [OUT_CH], ctx)),
+        _t_as(x_mod, [N_IMG, D], lin_dtype, ctx),
+        base.fl_lin_w[],
+        Optional[Tensor](base.fl_lin_b[].clone(ctx)),
         ctx,
     ).to_host(ctx)
 
@@ -677,28 +670,18 @@ def sd35_stack_lora_forward_offload[
 
         var base_lora = _block_base(bi)
 
-        # For context stream qkv LoRA: compute context norm, then LoRA delta
-        var ctx_norm_for_lora = sd35_stream_norm(context.copy(), ctx_mv.copy(), N_CTX, D, eps, ctx)
-        var ctx_qkv_delta = _lora_delta(ctx_norm_for_lora, lora.ad[base_lora + SLOT_CTX_QKV].copy(), N_CTX, ctx)
-
-        # For x stream qkv LoRA
-        var x_norm_for_lora = sd35_stream_norm(x.copy(), x_mv.copy(), N_IMG, D, eps, ctx)
-        var x_qkv_delta = _lora_delta(x_norm_for_lora, lora.ad[base_lora + SLOT_X_QKV].copy(), N_IMG, ctx)
-
-        # LoRA on proj outputs is handled in the backward; for forward we pass
-        # only qkv deltas (added to qkv linear output before attention).
-        # Actually, for proj/fc1/fc2 LoRA, we'd need to inject into post-attention.
-        # For simplicity (matching chroma pattern): add LoRA only on qkv in forward.
-        # The backward will compute d_A, d_B for all slots from the saved inputs.
-        # NOTE: proj/fc1/fc2 LoRA deltas are not injected in forward here to keep
-        # the forward identical to the base block + qkv delta only. This matches
-        # the chroma pattern where LoRA is on specific slots.
-        # TODO: extend to proj/fc1/fc2 if parity warrants it.
-
         var fwd = sd35_joint_block_forward[1, S, H, Dh](
             context.copy(), x.copy(), w, ctx_mv.copy(), x_mv.copy(),
             N_CTX, N_IMG, D, MLP, eps, qk_eps, scale, ctx,
-            Optional[List[Float32]](x_qkv_delta^),
+            Optional[List[Float32]](None),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_QKV].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_PROJ].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_FC1].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_FC2].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_QKV].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_PROJ].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_FC1].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_FC2].copy()),
         )
         context = fwd.ctx_out.copy()
         x = fwd.x_out.copy()
@@ -751,13 +734,12 @@ def sd35_stack_lora_backward_offload[
     # ── final layer backward ──
     # out = linear(modulate(layernorm(x), scale, shift), fl_lin_w)
     # d_out -> d_x_mod -> d_layernorm -> d_x
-    var lb_fl = linear_backward(
-        _t(d_out, [N_IMG, OUT_CH], ctx),
-        _t(_compute_final_modulate(saved, D, N_IMG, eps, ctx), [N_IMG, D], ctx),
-        _t(base.fl_lin_w.copy(), [OUT_CH, D], ctx),
+    var final_dtype = base.fl_lin_w[].dtype()
+    var d_x_mod = linear_backward_dx(
+        _t_as(d_out, [N_IMG, OUT_CH], final_dtype, ctx),
+        base.fl_lin_w[],
         N_IMG, D, OUT_CH, ctx,
-    )
-    var d_x_mod = lb_fl.d_x^.to_host(ctx)
+    ).to_host(ctx)
 
     # modulate backward: o = (1+scale)*ln_x + shift; saved final_ada_flat[D:2D]=scale
     var scale_final = List[Float32]()
@@ -767,16 +749,16 @@ def sd35_stack_lora_backward_offload[
     for i in range(D):
         scale_final.append(saved.final_ada_flat[D + i])
     var mb_fl = modulate_backward(
-        _t(d_x_mod, [N_IMG, D], ctx),
-        _t(_layer_norm_x(saved.pre_final_x.copy(), N_IMG, D, eps, ctx), [N_IMG, D], ctx),
-        _t(scale_final^, [D], ctx), ctx,
+        _t_as(d_x_mod, [N_IMG, D], final_dtype, ctx),
+        _t_as(_layer_norm_x(saved.pre_final_x.copy(), N_IMG, D, eps, final_dtype, ctx), [N_IMG, D], final_dtype, ctx),
+        _t_as(scale_final^, [D], final_dtype, ctx), ctx,
     )
     var d_ln_x = mb_fl.d_x^.to_host(ctx)
     # layer_norm backward
     var lnb_fl = layer_norm_backward(
-        _t(d_ln_x, [N_IMG, D], ctx),
-        _t(saved.pre_final_x.copy(), [N_IMG, D], ctx),
-        _t(_ones_list(D), [D], ctx),
+        _t_as(d_ln_x, [N_IMG, D], final_dtype, ctx),
+        _t_as(saved.pre_final_x.copy(), [N_IMG, D], final_dtype, ctx),
+        _t_as(_ones_list(D), [D], final_dtype, ctx),
         eps, ctx,
     )
     var d_x = lnb_fl.d_x^.to_host(ctx)
@@ -799,140 +781,44 @@ def sd35_stack_lora_backward_offload[
         var x_mv = _chunk6(saved.blocks[bi].x_ada_flat.copy(), D)
 
         var scale = Float32(1.0) / Float32(8.0)
+        var base_lora = _block_base(bi)
         var bg = sd35_joint_block_backward[1, S, H, Dh](
             d_ctx.copy(), d_x.copy(),
             w, ctx_mv.copy(), x_mv.copy(),
             saved.blocks[bi].fwd,
             N_CTX, N_IMG, D, MLP, eps, qk_eps, scale, ctx,
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_QKV].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_PROJ].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_FC1].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_FC2].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_QKV].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_PROJ].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_FC1].copy()),
+            Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_FC2].copy()),
         )
         d_x = bg.d_x.copy()
         d_ctx = bg.d_ctx.copy()
 
-        # ── Collect LoRA grads for all 8 slots ──
-        var base_lora = _block_base(bi)
+        d_a_flat[base_lora + SLOT_CTX_QKV] = bg.ctx_lora.qkv_d_a.copy()
+        d_b_flat[base_lora + SLOT_CTX_QKV] = bg.ctx_lora.qkv_d_b.copy()
+        d_a_flat[base_lora + SLOT_CTX_PROJ] = bg.ctx_lora.proj_d_a.copy()
+        d_b_flat[base_lora + SLOT_CTX_PROJ] = bg.ctx_lora.proj_d_b.copy()
+        d_a_flat[base_lora + SLOT_CTX_FC1] = bg.ctx_lora.fc1_d_a.copy()
+        d_b_flat[base_lora + SLOT_CTX_FC1] = bg.ctx_lora.fc1_d_b.copy()
+        d_a_flat[base_lora + SLOT_CTX_FC2] = bg.ctx_lora.fc2_d_a.copy()
+        d_b_flat[base_lora + SLOT_CTX_FC2] = bg.ctx_lora.fc2_d_b.copy()
+        d_a_flat[base_lora + SLOT_X_QKV] = bg.x_lora.qkv_d_a.copy()
+        d_b_flat[base_lora + SLOT_X_QKV] = bg.x_lora.qkv_d_b.copy()
+        d_a_flat[base_lora + SLOT_X_PROJ] = bg.x_lora.proj_d_a.copy()
+        d_b_flat[base_lora + SLOT_X_PROJ] = bg.x_lora.proj_d_b.copy()
+        d_a_flat[base_lora + SLOT_X_FC1] = bg.x_lora.fc1_d_a.copy()
+        d_b_flat[base_lora + SLOT_X_FC1] = bg.x_lora.fc1_d_b.copy()
+        d_a_flat[base_lora + SLOT_X_FC2] = bg.x_lora.fc2_d_a.copy()
+        d_b_flat[base_lora + SLOT_X_FC2] = bg.x_lora.fc2_d_b.copy()
 
-        # ctx_qkv: input to qkv linear is saved.blocks[bi].fwd.ctx_saved.norm [N_CTX, D]
-        # d_qkv for ctx stream is derivable from bg.ctx_g.d_wqkv's input.
-        # Since we saved ctx_saved.norm and the block backward produced d_wqkv,
-        # we use the block's saved ctx_saved.norm to compute d_A/d_B.
-        var ctx_norm_in = saved.blocks[bi].fwd.ctx_saved.norm.copy()  # [N_CTX, D]
-        var x_norm_in = saved.blocks[bi].fwd.x_saved.norm.copy()      # [N_IMG, D]
-
-        # LoRA grads via chain rule: for qkv (ctx):
-        # The qkv output = ctx_norm @ W_qkv.T + (LoRA delta = scale*(ctx_norm@A.T)@B.T)
-        # d_A = (bg.ctx_g.d_wqkv's grad at A) = scale * B.T @ d_qkv_out.T @ ctx_norm
-        # We use the block backward's d_bqkv (= sum of d_qkv rows) and d_wqkv
-        # to derive the upstream grad at the qkv linear output.
-        # Simpler: recompute the LoRA forward path gradient directly.
-        # d_B = (1/N_CTX) * out.T @ (d_out . scale) where d_out is the grad at qkv output.
-        # For now, use the grad at d_wqkv to get an approximate d_B via the outer product.
-        # The exact LoRA backward: given d_loss/d_qkv_delta (same as d_loss/d_qkv for the
-        # LoRA contribution), which equals bg.ctx_g.d_wqkv summed over input direction.
-        # Actually the cleanest way: the grad at the qkv output = d_wqkv @ input^T is wrong
-        # shape. We need the ACTIVATION-space grad.
-        # The block backward returns d_wqkv [3D, D] which is the weight grad.
-        # To get the LoRA grads: d_B [out_f, rank] = (scale/N) * d_qkv_out.T @ intermediate
-        # where intermediate = ctx_norm @ A.T [N_CTX, rank].
-        # We have saved ctx_norm_in and ad.a, so:
-        # intermediate = _lora_delta_inter(ctx_norm_in, ad.ctx_qkv.a)  [N_CTX, rank]
-        # d_B = (1/N_CTX) * sum_n d_qkv_out[n, :] * intermediate[n, :]^T... but we don't
-        # have d_qkv_out directly from the block backward.
-
-        # PRAGMATIC APPROACH (same as chroma/flux): Use the linear_backward arms directly
-        # from the saved activation inputs (ctx_norm_in) and upstream grads.
-        # The upstream grad at qkv is embedded in bg.ctx_g.d_wqkv = sum_n x_n^T * d_y_n
-        # i.e., d_W = X.T @ d_Y. From this: d_Y = X @ (d_W / X) -- not invertible.
-        # Instead: we need the grad at the qkv OUTPUT (d_qkv_out [N_CTX, 3D]).
-        # We can recompute it: d_qkv_out is the grad at qkv = linear(ctx_norm, W_qkv).
-        # linear_backward gives d_x (= d_qkv_out @ W_qkv), d_w, d_b. We use d_x = d_ctx_norm
-        # and work backward from it to get d_qkv_out from the qkv linear.
-        # The qkv output gradient: since qkv = ctx_norm @ W.T, d_qkv_out = d_x_inner @ W
-        # where d_x_inner is the grad at ctx_norm from the qkv path ONLY.
-        # bg.ctx_g.d_wqkv and bg.ctx_g.d_bqkv are the weight grads. We get d_qkv_out via:
-        # d_qkv_out = d_shift_msa (from modulate) @ W... This is circular.
-        #
-        # CORRECT APPROACH for LoRA grads: treat the LoRA adapter as an extra linear
-        # on top of the frozen qkv: output = frozen_qkv + LoRA_delta. Backward:
-        # d_LoRA_delta = same as d_qkv_out (the upstream grad at the combined output).
-        # This equals d_ctx_norm @ W_qkv (the grad at qkv output from the block bwd).
-        # d_ctx_norm_from_qkv = the portion of d_input that flows through the qkv path.
-        # That is exactly what linear_backward(d_qkv_out, ctx_norm, W_qkv) returns as d_x.
-        # The block backward computes and returns this as cprb.d_input (combined with ln1 path).
-        # We need d_qkv_out specifically. Since the block already ran the full qkv linear_backward
-        # to get d_norm (returned as part of d_input path), we can recover d_qkv_out via:
-        # d_norm -> modulate_backward -> d_ln1 -> ... this is deep in the block.
-        #
-        # SIMPLEST SOUND APPROXIMATION: extract LoRA grads using the saved pre-qkv activations
-        # and the block's returned weight grad d_wqkv:
-        # d_B = (X^T @ d_W^T) but this is wrong size.
-        #
-        # FINAL DECISION: compute LoRA grads using a direct linear_backward on the saved
-        # qkv-output gradient. We reconstruct d_qkv_out by noting that the block backward
-        # returns bg.x_d_qkv (the grad at x_block's qkv output [N_IMG, 3D]).
-        # That field is included in JointBlockGrads for precisely this purpose.
-        # For ctx_qkv we need to add the same field. For now, use x_d_qkv for x stream
-        # and approximate ctx via d_wqkv sum.
-        # TODO: add ctx_d_qkv field to JointBlockGrads.
-
-        # X stream QKV LoRA grads (we have x_d_qkv [N_IMG, 3D] from bg.x_d_qkv):
-        var x_d_qkv = bg.x_d_qkv.copy()  # [N_IMG, 3D] — grad at x_qkv output
-        var ad_x_qkv = lora.ad[base_lora + SLOT_X_QKV].copy()
-        var rank = ad_x_qkv.rank
-        # intermediate = x_norm_in @ A.T  [N_IMG, rank]
-        var inter_x = linear(
-            _t(x_norm_in.copy(), [N_IMG, D], ctx),
-            _t(ad_x_qkv.a.copy(), [rank, D], ctx),
-            Optional[Tensor](None), ctx,
-        )  # [N_IMG, rank]
-        # d_B = ad_x_qkv.scale * inter_x.T @ x_d_qkv  [out_f=3D, rank] from [rank, N_IMG] @ [N_IMG, 3D]
-        # Using linear_backward: treat it as d_B = linear_backward(x_d_qkv, inter_x, B).d_w
-        var lb_xqkv_b = linear_backward(
-            _t(x_d_qkv.copy(), [N_IMG, 3 * D], ctx),
-            inter_x,
-            _t(ad_x_qkv.b.copy(), [3 * D, rank], ctx),
-            N_IMG, rank, 3 * D, ctx,
-        )
-        var d_b_x_qkv = lb_xqkv_b.d_w^.to_host(ctx)
-        for i in range(len(d_b_x_qkv)):
-            d_b_x_qkv[i] = d_b_x_qkv[i] * ad_x_qkv.scale
-        # d_A: use linear_backward(inter_x_grad, x_norm_in, A)
-        # inter_x_grad = x_d_qkv @ B  [N_IMG, rank]
-        var inter_x_grad = linear(
-            _t(x_d_qkv.copy(), [N_IMG, 3 * D], ctx),
-            _t(ad_x_qkv.b.copy(), [3 * D, rank], ctx),
-            Optional[Tensor](None), ctx,
-        )  # [N_IMG, rank] -- this is d_inter
-        var lb_xqkv_a = linear_backward(
-            inter_x_grad,
-            _t(x_norm_in.copy(), [N_IMG, D], ctx),
-            _t(ad_x_qkv.a.copy(), [rank, D], ctx),
-            N_IMG, D, rank, ctx,
-        )
-        var d_a_x_qkv = lb_xqkv_a.d_w^.to_host(ctx)
-        for i in range(len(d_a_x_qkv)):
-            d_a_x_qkv[i] = d_a_x_qkv[i] * ad_x_qkv.scale
-
-        # Store x_qkv grads
-        d_a_flat[base_lora + SLOT_X_QKV] = d_a_x_qkv^
-        d_b_flat[base_lora + SLOT_X_QKV] = d_b_x_qkv^
-
-        # For ctx_qkv, proj, fc1, fc2 and x proj, fc1, fc2: use the block's
-        # saved weight grads as a proxy. The exact LoRA grads require the activation
-        # at each linear's input and the upstream grad at its output.
-        # We have from the block backward: d_wqkv, d_wproj, d_wfc1, d_wfc2 per stream.
-        # d_W = X.T @ d_Y (outer product) so d_Y = (d_W @ pinv(X)) -- intractable.
-        # PRACTICAL: for non-qkv slots, zero out grads for this step (safe: B starts at 0,
-        # A grads will still drive A updates via weight grad approximation in future passes).
-        # The qkv slot is the most important for early training signal.
-        # Fill remaining slots with zeros (they'll accumulate in later iterations):
         for s in range(SLOTS_PER_BLOCK):
-            if s != SLOT_X_QKV:
-                var ad_s = lora.ad[base_lora + s].copy()
-                d_a_flat[base_lora + s] = _zeros_list(len(ad_s.a))
-                d_b_flat[base_lora + s] = _zeros_list(len(ad_s.b))
-
-        nonfinite += _nonfinite_count(d_a_flat[base_lora + SLOT_X_QKV])
-        nonfinite += _nonfinite_count(d_b_flat[base_lora + SLOT_X_QKV])
+            nonfinite += _nonfinite_count(d_a_flat[base_lora + s])
+            nonfinite += _nonfinite_count(d_b_flat[base_lora + s])
 
         loader.mark_active_block_done(ctx)
         bi -= 1
@@ -942,29 +828,11 @@ def sd35_stack_lora_backward_offload[
 
 # ── Helpers for backward ──────────────────────────────────────────────────────
 def _layer_norm_x(
-    x_h: List[Float32], N: Int, D: Int, eps: Float32, ctx: DeviceContext,
+    x_h: List[Float32], N: Int, D: Int, eps: Float32, dtype: STDtype, ctx: DeviceContext,
 ) raises -> List[Float32]:
     return layer_norm(
-        _t(x_h, [N, D], ctx),
-        _t(_ones_list(D), [D], ctx),
-        _t(_zeros_list(D), [D], ctx),
+        _t_as(x_h, [N, D], dtype, ctx),
+        _t_as(_ones_list(D), [D], dtype, ctx),
+        _t_as(_zeros_list(D), [D], dtype, ctx),
         eps, ctx,
     ).to_host(ctx)
-
-
-def _compute_final_modulate(
-    saved: SD35StackForward, D: Int, N_IMG: Int, eps: Float32, ctx: DeviceContext,
-) raises -> List[Float32]:
-    """Recompute the modulated input to final linear for backward."""
-    var ln_x = _layer_norm_x(saved.pre_final_x.copy(), N_IMG, D, eps, ctx)
-    var scale = List[Float32]()
-    var shift = List[Float32]()
-    for i in range(D):
-        shift.append(saved.final_ada_flat[i])
-    for i in range(D):
-        scale.append(saved.final_ada_flat[D + i])
-    var x_mod = List[Float32]()
-    for r in range(N_IMG):
-        for c_idx in range(D):
-            x_mod.append((1.0 + scale[c_idx]) * ln_x[r * D + c_idx] + shift[c_idx])
-    return x_mod^

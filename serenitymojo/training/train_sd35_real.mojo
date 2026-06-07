@@ -2,21 +2,30 @@
 #
 # TRANSLATION of the proven Chroma block-swap pattern onto SD3.5-Large.
 # Real SD3.5-Large base weights (streamed block-by-block via TurboPlannedLoader),
-# real prepared cache (latent + text_embedding + pooled), full 38 joint-block depth.
+# real OneTrainer cache (latent_image + split CLIP/T5 hidden/pooled fields),
+# full 38 joint-block depth.
 # No synthetic tensors. Mirrors train_chroma_real.mojo's loop structure.
 #
 # SD3.5 vs CHROMA (the deltas):
 #   - NO frozen approximator. Modulation comes from per-block adaLN_modulation.1
 #     (streamed with each block), conditioned on c = t_embed(sigma*1000) + y_embed(pooled).
 #   - JOINT BLOCKS ONLY: 38 joint blocks, no single-stream blocks.
-#   - Cache keys: "latent" [1,16,128,128], "text_embedding" [1,154,4096], "pooled" [1,2048].
+#   - OneTrainer cache keys:
+#       "latent_image" [1,16,128,128]
+#       "text_encoder_1_hidden_state" [1,77,768]
+#       "text_encoder_2_hidden_state" [1,77,1280]
+#       "text_encoder_3_hidden_state" [1,77,4096]
+#       "text_encoder_1_pooled_state" [1,768]
+#       "text_encoder_2_pooled_state" [1,1280]
+#     The legacy local combined keys "latent", "text_embedding", and "pooled"
+#     are accepted only as a compatibility fallback.
 #   - NO RoPE (pos_embed added once at patchify, before blocks, in inference;
 #     for training the patchify linear already encodes position via weight layout).
 #   - LoRA: SD35LoraSet with 8 adapters/block (4 ctx + 4 x: qkv, proj, fc1, fc2).
 #
 # Per step:
-#   1. Load cached {latent [1,16,128,128], text_embedding [1,154,4096], pooled [1,2048]}
-#   2. latent_scaled = (latent - VAE_SHIFT) * VAE_SCALE
+#   1. Load cached OneTrainer {latent_image, split hidden/pooled text fields}
+#   2. latent_scaled = (latent_image - VAE_SHIFT) * VAE_SCALE
 #   3. pack_latents([16,128,128]) -> [N_IMG=4096, 64] channel-major patchify
 #   4. sigma_idx = floor(logit_normal_sigma(shift=1.0) * 1000) clamp;
 #      sig=(idx+1)/1000 ; sigma_cont=sig (passed to t_embedder as sigma*1000)
@@ -39,7 +48,7 @@
 #       serenitymojo/training/train_sd35_real.mojo -o /tmp/train_sd35_real && \
 #     /tmp/train_sd35_real [steps]
 
-from sys import argv
+from std.sys import argv
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
@@ -50,18 +59,55 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 
 from serenitymojo.models.sd35.weights import load_sd35_stack_base
 from serenitymojo.models.sd35.sd35_stack_lora import (
     SD35LoraSet, SD35LoraGradSet, SD35StackBase,
-    build_sd35_lora_set, sd35_lora_adamw_step, save_sd35_lora, total_adapters,
+    build_sd35_lora_set, sd35_lora_adamw_step,
+    save_sd35_lora, save_sd35_lora_state, total_adapters,
     sd35_stack_lora_forward_offload, sd35_stack_lora_backward_offload,
 )
 from serenitymojo.offload.plan import build_sd35_large_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
+from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.sample_prompt_config import (
+    SampleCadence, SamplePrompt, SamplePromptConfig,
+    read_sample_cadence_config, read_sample_prompt_config,
+    validate_step_sample_cadence, should_sample_completed_step,
+    next_sample_completed_step, sample_time_unit_name,
+    SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+)
+from serenitymojo.sampling.product_sampler_harness import (
+    build_product_sampler_run_contract,
+    empty_sampler_product_measurements,
+    product_sampler_contract_summary,
+    product_sampler_missing_summary,
+    sampler_product_scaffold_status,
+    validate_product_sampler_ready,
+    validate_product_sampler_run_contract,
+)
+from serenitymojo.training.onetrainer_train_loop_policy import (
+    OT_GRAD_POLICY_ON_ONLY,
+    ot_cache_dir_from_train_config,
+    ot_lr_for_optimizer_step,
+    ot_output_lora_path_from_train_config,
+    ot_sample_cadence_from_train_config,
+    ot_sampling_enabled,
+    ot_should_save_before_sample,
+    ot_should_save_checkpoint,
+    ot_step_lora_path,
+    validate_ot_gradient_checkpointing_policy,
+    validate_ot_train_math_policy,
+)
+from serenitymojo.training.train_config import (
+    TrainConfig, GRADIENT_CHECKPOINTING_ON,
+)
+from serenitymojo.training.onetrainer_cache_preflight import (
+    create_onetrainer_cache_preflight_plan,
+    validate_onetrainer_cache_preflight_plan,
+)
 
 
 # ── arch (sd3.5-large; H/Dh/D fixed comptime, verified vs the checkpoint) ────
@@ -106,6 +152,204 @@ comptime FIXED_SIGMA_IDX = 500
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/sd3.5_large.safetensors"
 comptime CACHE_DIR = "/home/alex/datasets/andrsd35_sd35_cache"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/sd35_lora"
+comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/sd35.json"
+comptime DEFAULT_RUN_STEPS = 5
+
+
+def _is_nonnegative_int(s: String) -> Bool:
+    if s.byte_length() == 0:
+        return False
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        if bs[i] < 0x30 or bs[i] > 0x39:
+            return False
+    return True
+
+
+def _parse_nonnegative_int(s: String) raises -> Int:
+    if not _is_nonnegative_int(s):
+        raise Error(String("expected non-negative integer, got ") + s)
+    var out = 0
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        out = out * 10 + Int(bs[i] - 0x30)
+    return out
+
+
+def _close_f32(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
+    var d = a - b
+    if d < Float32(0.0):
+        d = -d
+    return d <= tol
+
+
+def sd35_checkpoint_from_train_config(cfg: TrainConfig) -> String:
+    if cfg.checkpoint != String(""):
+        return cfg.checkpoint.copy()
+    if cfg.base_model_name != String(""):
+        return cfg.base_model_name.copy()
+    return String(CKPT)
+
+
+def validate_sd35_train_config(cfg: TrainConfig) raises:
+    if (
+        cfg.name != String("STABLE_DIFFUSION_35")
+        and cfg.name != String("sd35")
+        and cfg.name != String("sd3.5")
+        and cfg.name != String("sd3-5")
+    ):
+        raise Error(
+            String("SD3.5 trainer only supports STABLE_DIFFUSION_35/sd35; plain SD3 is not a port target")
+        )
+    if cfg.checkpoint == String("") and cfg.base_model_name == String(""):
+        raise Error("SD3.5 trainer config must set checkpoint or base_model_name")
+    var ckpt = sd35_checkpoint_from_train_config(cfg)
+    if not ckpt.endswith(String(".safetensors")):
+        raise Error(
+            String("SD3.5 trainer currently requires a single safetensors checkpoint; ")
+            + String("sharded transformer dirs need a dedicated SD3.5 loader")
+        )
+    if cfg.n_heads != H:
+        raise Error(String("SD3.5 config n_heads ") + String(cfg.n_heads) + String(" != H ") + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("SD3.5 config head_dim ") + String(cfg.head_dim) + String(" != Dh ") + String(Dh))
+    if cfg.d_model != D:
+        raise Error(String("SD3.5 config d_model ") + String(cfg.d_model) + String(" != D ") + String(D))
+    if cfg.in_channels != IN_CH:
+        raise Error(String("SD3.5 config in_channels ") + String(cfg.in_channels) + String(" != IN_CH ") + String(IN_CH))
+    if cfg.joint_attention_dim != TXT_CH:
+        raise Error(String("SD3.5 config joint_attention_dim ") + String(cfg.joint_attention_dim) + String(" != TXT_CH ") + String(TXT_CH))
+    if cfg.out_channels != OUT_CH:
+        raise Error(String("SD3.5 config out_channels ") + String(cfg.out_channels) + String(" != OUT_CH ") + String(OUT_CH))
+    if cfg.num_double != NUM_JOINT or cfg.num_single != 0:
+        raise Error(
+            String("SD3.5 Large trainer requires joint blocks=") + String(NUM_JOINT)
+            + String(" and no single-stream blocks; got num_double=")
+            + String(cfg.num_double)
+            + String(" num_single=")
+            + String(cfg.num_single)
+        )
+    if cfg.mlp_hidden != FMLP:
+        raise Error(String("SD3.5 config mlp_hidden ") + String(cfg.mlp_hidden) + String(" != FMLP ") + String(FMLP))
+    if cfg.timestep_dim != TIMESTEP_DIM:
+        raise Error(String("SD3.5 config timestep_dim ") + String(cfg.timestep_dim) + String(" != TIMESTEP_DIM ") + String(TIMESTEP_DIM))
+    if cfg.lora_rank != RANK:
+        raise Error(
+            String("SD3.5 trainer is compiled for lora_rank=")
+            + String(RANK)
+            + String("; parsed ")
+            + String(cfg.lora_rank)
+        )
+    if not _close_f32(cfg.lora_alpha, ALPHA):
+        raise Error("SD3.5 trainer lora_alpha does not match compiled constant")
+    if not _close_f32(cfg.lr, LR, Float32(1.0e-9)):
+        raise Error("SD3.5 trainer learning_rate does not match compiled constant")
+    if not _close_f32(cfg.timestep_shift, TIMESTEP_SHIFT):
+        raise Error("SD3.5 trainer timestep_shift does not match compiled constant")
+    if not _close_f32(cfg.max_grad_norm, CLIP_GRAD_NORM):
+        raise Error("SD3.5 trainer max_grad_norm does not match compiled constant")
+    validate_ot_train_math_policy(cfg, String("SD3.5 trainer"))
+    validate_ot_gradient_checkpointing_policy(
+        cfg, String("SD3.5 trainer"), OT_GRAD_POLICY_ON_ONLY
+    )
+
+
+def sd35_cache_dir_from_train_config(cfg: TrainConfig) -> String:
+    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+
+
+def sd35_output_lora_path_from_train_config(cfg: TrainConfig, completed_step: Int) -> String:
+    return ot_output_lora_path_from_train_config(
+        cfg, String(LORA_DIR), String("sd35_lora"), completed_step
+    )
+
+
+def sd35_sample_cadence_from_train_config(
+    cfg_path: String, cfg: TrainConfig,
+) raises -> SampleCadence:
+    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+
+
+def sd35_sampling_enabled(cadence: SampleCadence) -> Bool:
+    return ot_sampling_enabled(cadence)
+
+
+def sd35_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
+    return ot_should_save_checkpoint(cfg, completed_step)
+
+
+def sd35_should_save_before_sample(
+    cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
+) raises -> Bool:
+    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+
+
+def _step_lora_path(base_path: String, step: Int) -> String:
+    return ot_step_lora_path(base_path, step)
+
+
+def sd35_sample_prompt_config_for_sampler(
+    cadence: SampleCadence,
+) raises -> SamplePromptConfig:
+    if cadence.sample_definition_file_name == String(""):
+        raise Error("SD3.5 trainer sampling requires validation_prompts_file or sample_definition_file_name")
+    var cfg = read_sample_prompt_config(cadence.sample_definition_file_name)
+    if len(cfg.prompts) == 0:
+        raise Error("SD3.5 trainer requires at least one validation prompt when sampling is enabled")
+    return cfg^
+
+
+def _sd35_sample_png_path(completed_step: Int, label: String) -> String:
+    return (
+        String(LORA_DIR) + String("/samples/sd35_sample_step")
+        + String(completed_step) + String("_") + label + String(".png")
+    )
+
+
+def _validate_sd35_sampler_prompt(p: SamplePrompt) raises:
+    if p.frames != 1:
+        raise Error(String("SD3.5 image sampler expects frames=1 for ") + p.label)
+    if p.sample_inpainting:
+        raise Error(String("SD3.5 trainer sample prompt ") + p.label + String(" requests inpainting; SD3.5 sampler inpaint runtime is not wired"))
+    if p.width < 1024 or p.height < 1024:
+        raise Error(
+            String("SD3.5 sample prompt ") + p.label
+            + String(" is ") + String(p.width) + String("x") + String(p.height)
+            + String("; image validation samples must be 1024x1024 or larger")
+        )
+
+
+def sd35_assert_product_sampler_runtime_wired(
+    sample_cfg: SamplePromptConfig, completed_step: Int,
+) raises:
+    var checked = 0
+    for i in range(len(sample_cfg.prompts)):
+        var prompt = sample_cfg.prompts[i].copy()
+        if not prompt.enabled:
+            continue
+        _validate_sd35_sampler_prompt(prompt)
+        var run = build_product_sampler_run_contract(
+            String("STABLE_DIFFUSION_35"),
+            prompt,
+            _sd35_sample_png_path(completed_step, prompt.label),
+        )
+        validate_product_sampler_run_contract(run)
+        var status = sampler_product_scaffold_status()
+        var missing_runtime = product_sampler_missing_summary(status)
+        if missing_runtime != String("none"):
+            raise Error(
+                String("SD3.5 product sampler runtime wiring missing at completed_step=")
+                + String(completed_step)
+                + String(": missing stages=")
+                + missing_runtime
+                + String("; contract=")
+                + product_sampler_contract_summary(run)
+                + String("; SD3.5 sampler parity evidence missing: no accepted image/trajectory/speed/VRAM artifact")
+            )
+        validate_product_sampler_ready(run, status, empty_sampler_product_measurements())
+        checked += 1
+    if checked == 0:
+        raise Error("SD3.5 trainer requires at least one enabled validation prompt when sampling is enabled")
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -186,12 +430,136 @@ def _list_cache(dir: String) raises -> List[String]:
     return fs^
 
 
-def _load_host(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
+def _load_cache_preserving_dtype(
+    st: SafeTensors, name: String, ctx: DeviceContext
+) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
+    return Tensor.from_view(tv, ctx)
+
+
+def _cache_has_tensor(st: SafeTensors, name: String) -> Bool:
+    return name in st.tensors
+
+
+def _load_cache_preferred(
+    st: SafeTensors, preferred: String, legacy: String, ctx: DeviceContext
+) raises -> Tensor:
+    if _cache_has_tensor(st, preferred):
+        return _load_cache_preserving_dtype(st, preferred, ctx)
+    if legacy != String("") and _cache_has_tensor(st, legacy):
+        return _load_cache_preserving_dtype(st, legacy, ctx)
+    raise Error(
+        String("SD3.5 cache missing required tensor ")
+        + preferred
+        + String(" (legacy fallback ")
+        + legacy
+        + String(" not found)")
+    )
+
+
+def _cache_tensor_to_stack_f32(
+    t: Tensor, device_ctx: DeviceContext
+) raises -> List[Float32]:
+    # The current SD3.5 stack interface is still host List[Float32]. Keep cache
+    # tensors device-resident and stage through their stored dtype at this
+    # explicit host-list handoff.
+    if t.dtype() == STDtype.BF16:
+        var bf = t.to_host_bf16(device_ctx)
+        var out = List[Float32]()
+        for i in range(len(bf)):
+            out.append(bf[i].cast[DType.float32]())
+        return out^
+    if t.dtype() == STDtype.F16:
+        var hf = t.to_host_f16(device_ctx)
+        var out = List[Float32]()
+        for i in range(len(hf)):
+            out.append(hf[i].cast[DType.float32]())
+        return out^
+    return t.to_host(device_ctx)
+
+
+def _append_padding(mut out: List[Float32], count: Int):
+    for _ in range(count):
+        out.append(Float32(0.0))
+
+
+def _stage_sd35_context_for_stack(
+    st: SafeTensors, ctx: DeviceContext
+) raises -> List[Float32]:
+    # Legacy local cache stored OneTrainer's combined text handoff directly.
+    if _cache_has_tensor(st, String("text_embedding")):
+        var te_info = st.tensor_info(String("text_embedding"))
+        var te_seq = Int(te_info.shape[1])
+        var te_tensor = _load_cache_preserving_dtype(
+            st, String("text_embedding"), ctx
+        )
+        var te_flat = _cache_tensor_to_stack_f32(te_tensor, ctx)
+        var tokens = List[Float32]()
+        for r in range(N_TXT):
+            if r < te_seq:
+                for c in range(TXT_CH):
+                    tokens.append(te_flat[r * TXT_CH + c])
+            else:
+                _append_padding(tokens, TXT_CH)
+        return tokens^
+
+    var te1_tensor = _load_cache_preserving_dtype(
+        st, String("text_encoder_1_hidden_state"), ctx
+    )
+    var te2_tensor = _load_cache_preserving_dtype(
+        st, String("text_encoder_2_hidden_state"), ctx
+    )
+    var te3_tensor = _load_cache_preserving_dtype(
+        st, String("text_encoder_3_hidden_state"), ctx
+    )
+    var te1 = _cache_tensor_to_stack_f32(te1_tensor, ctx)
+    var te2 = _cache_tensor_to_stack_f32(te2_tensor, ctx)
+    var te3 = _cache_tensor_to_stack_f32(te3_tensor, ctx)
+
+    var tokens = List[Float32]()
+    for r in range(77):
+        for c in range(768):
+            tokens.append(te1[r * 768 + c])
+        for c in range(1280):
+            tokens.append(te2[r * 1280 + c])
+        _append_padding(tokens, TXT_CH - 2048)
+    for r in range(77):
+        for c in range(TXT_CH):
+            tokens.append(te3[r * TXT_CH + c])
+    return tokens^
+
+
+def _stage_sd35_pooled_for_stack(
+    st: SafeTensors, ctx: DeviceContext
+) raises -> List[Float32]:
+    # Legacy local cache stored cat([clip_l_pool, clip_g_pool]) as "pooled".
+    if _cache_has_tensor(st, String("pooled")):
+        var pooled_tensor = _load_cache_preserving_dtype(st, String("pooled"), ctx)
+        var pooled_raw = _cache_tensor_to_stack_f32(pooled_tensor, ctx)
+        var pooled_h = List[Float32]()
+        for i in range(POOLED_DIM):
+            if i < len(pooled_raw):
+                pooled_h.append(pooled_raw[i])
+            else:
+                pooled_h.append(Float32(0.0))
+        return pooled_h^
+
+    var pooled_1_tensor = _load_cache_preserving_dtype(
+        st, String("text_encoder_1_pooled_state"), ctx
+    )
+    var pooled_2_tensor = _load_cache_preserving_dtype(
+        st, String("text_encoder_2_pooled_state"), ctx
+    )
+    var pooled_1 = _cache_tensor_to_stack_f32(pooled_1_tensor, ctx)
+    var pooled_2 = _cache_tensor_to_stack_f32(pooled_2_tensor, ctx)
+    var pooled_h = List[Float32]()
+    for i in range(768):
+        pooled_h.append(pooled_1[i])
+    for i in range(1280):
+        pooled_h.append(pooled_2[i])
+    return pooled_h^
 
 
 # pack_latents: [16, LAT_H, LAT_W] flat (CHW) -> [N_IMG, IN_CH] channel-major patchify.
@@ -212,37 +580,84 @@ def _pack_latents(lat: List[Float32]) -> List[Float32]:
 
 
 def main() raises:
-    var ctx = DeviceContext()
     var a = argv()
-    var run_steps = 5
+    var cfg_path = String(DEFAULT_CONFIG)
+    var arg_base = 1
     if len(a) >= 2:
-        var v = 0
-        var bs = String(a[1]).as_bytes()
-        for i in range(String(a[1]).byte_length()):
-            v = v * 10 + Int(bs[i] - 0x30)
-        run_steps = v
+        var first = String(a[1])
+        if first.endswith(String(".json")):
+            cfg_path = first.copy()
+            arg_base = 2
+
+    var train_cfg = read_model_config(cfg_path)
+    validate_sd35_train_config(train_cfg)
+    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
+    validate_onetrainer_cache_preflight_plan(cache_preflight)
+
+    var run_steps = DEFAULT_RUN_STEPS
+    if len(a) > arg_base:
+        run_steps = _parse_nonnegative_int(String(a[arg_base]))
+    elif train_cfg.only_cache:
+        run_steps = 0
+
+    if len(a) > arg_base + 1:
+        raise Error(
+            String("SD3.5 trainer accepts [config.json] [steps] only; ")
+            + String("start_step/state resume args are not wired for this loop")
+        )
+
+    var ckpt = sd35_checkpoint_from_train_config(train_cfg)
+    var cache_dir = sd35_cache_dir_from_train_config(train_cfg)
+    var sample_cadence = sd35_sample_cadence_from_train_config(cfg_path, train_cfg)
+    var sample_enabled = sd35_sampling_enabled(sample_cadence)
 
     print("=== SD3.5-Large REAL LoRA training loop (block-swap offload) ===")
+    print("  config:", cfg_path)
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " Fmlp=", FMLP, " out_ch=", OUT_CH)
     print("  depth: NUM_JOINT=", NUM_JOINT)
     print("  tokens: N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S)
     print("  resolution: LAT_H=", LAT_H, " LAT_W=", LAT_W, " patch=", PATCH)
-    print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT,
+    print("  recipe: rank=", train_cfg.lora_rank, " alpha=", train_cfg.lora_alpha,
+          " lr=", train_cfg.lr, " shift=", train_cfg.timestep_shift,
           " vae_shift=", VAE_SHIFT, " vae_scale=", VAE_SCALE)
+    print("  run_steps=", run_steps, " config_max_steps=", train_cfg.max_steps)
+    print(
+        "  cadence: save_every=", train_cfg.save_every,
+        " sample_after=", sample_cadence.sample_after,
+        " unit=", sample_time_unit_name(sample_cadence.sample_after_unit),
+        " skip_first=", sample_cadence.sample_skip_first,
+        " sample_file=", sample_cadence.sample_definition_file_name,
+    )
     print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
-    print("  ckpt:", CKPT)
-    print("  cache:", CACHE_DIR)
+    print("  ckpt:", ckpt)
+    print("  cache:", cache_dir)
+    if train_cfg.enable_async_offloading:
+        print("[offload] async offload requested by config; SD3.5 trainer currently uses synchronous TurboPlannedLoader")
+    if train_cfg.only_cache:
+        print("[SD35-lora] only_cache requested; no train steps will run in this trainer")
+        return
+    var sample_cfg = SamplePromptConfig()
+    if sample_enabled:
+        sample_cfg = sd35_sample_prompt_config_for_sampler(sample_cadence)
+        print(
+            "  sample_prompts=", sample_cadence.sample_definition_file_name,
+            " count=", len(sample_cfg.prompts),
+        )
+        if should_sample_completed_step(sample_cadence, 0):
+            sd35_assert_product_sampler_runtime_wired(sample_cfg, 0)
+
+    var ctx = DeviceContext()
 
     # ── stack-level base (frozen; embedders + final layer) ───────────────────
     print("[load] SD35StackBase (x_embedder, context_embedder, t_embedder, y_embedder, final_layer)")
-    var base_st = SafeTensors.open(String(CKPT))
+    var base_st = SafeTensors.open(ckpt)
     var base = load_sd35_stack_base(base_st, ctx)
     print("[load] base resident")
 
     # ── block-swap offload loader ────────────────────────────────────────────
     var plan = build_sd35_large_block_plan()
     var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
+    var loader = TurboPlannedLoader.open(ckpt, plan^, cfg, ctx)
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
 
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
@@ -250,13 +665,16 @@ def main() raises:
     var n_adapters = total_adapters(lora)
     print("[lora] adapters:", n_adapters, " (8 per joint block x", NUM_JOINT, "blocks)")
 
-    var files = _list_cache(String(CACHE_DIR))
+    var files = _list_cache(cache_dir)
     print("[cache] samples:", len(files))
 
     var b_absum_init = Float32(0.0)
     for i in range(n_adapters):
         b_absum_init += _absum(lora.ad[i].b)
     print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+
+    var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
+    print("[cadence] next sample completed_step=", next_sample)
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -269,40 +687,26 @@ def main() raises:
         var step_seed = UInt64(1) if FIXED_SIGMA_SMOKE else UInt64(k)
         var st = SafeTensors.open(files[slot])
 
-        # latent: [1, 16, 128, 128] -> flat [1*16*128*128] = [262144]
-        var lat_raw = _load_host(st, String("latent"), ctx)
+        # latent_image: [1, 16, 128, 128] -> flat [1*16*128*128] = [262144].
+        # OneTrainer caches raw VAE posterior mean here and applies
+        # (latent_image - shift) * scale inside BaseStableDiffusion3Setup.predict.
+        var latent_tensor = _load_cache_preferred(
+            st, String("latent_image"), String("latent"), ctx
+        )
+        var latent_raw = _cache_tensor_to_stack_f32(latent_tensor, ctx)
 
-        # text_embedding: [1, 154, 4096] -> flat [1*154*4096] = [631808]
-        var te_info = st.tensor_info(String("text_embedding"))
-        var te_seq = Int(te_info.shape[1])   # should be 154
-        var te_flat = _load_host(st, String("text_embedding"), ctx)
-        # Flatten to [N_TXT, TXT_CH]: pad/truncate to exactly N_TXT rows
-        var txt_tokens = List[Float32]()
-        for r in range(N_TXT):
-            if r < te_seq:
-                for c in range(TXT_CH):
-                    txt_tokens.append(te_flat[r * TXT_CH + c])
-            else:
-                for _ in range(TXT_CH):
-                    txt_tokens.append(Float32(0.0))
-
-        # pooled: [1, 2048] -> flat [2048]
-        var pooled_raw = _load_host(st, String("pooled"), ctx)
-        # Trim/pad to POOLED_DIM
-        var pooled_h = List[Float32]()
-        for i in range(POOLED_DIM):
-            if i < len(pooled_raw):
-                pooled_h.append(pooled_raw[i])
-            else:
-                pooled_h.append(Float32(0.0))
+        # OneTrainer caches split CLIP-L, CLIP-G, and T5 fields. The legacy
+        # local combined text cache is accepted only as a compatibility fallback.
+        var txt_tokens = _stage_sd35_context_for_stack(st, ctx)
+        var pooled_h = _stage_sd35_pooled_for_stack(st, ctx)
 
         # ── VAE shift/scale then pack_latents ──
-        # lat_raw is flat [1, 16, 128, 128] in CHW; drop batch dim (offset 0).
-        # Scale: latent_scaled = (latent - VAE_SHIFT) * VAE_SCALE
-        var lat_chw = List[Float32]()
+        # latent_raw is flat [1, 16, 128, 128] in CHW; drop batch dim (offset 0).
+        # Scale: latent_scaled = (latent_image - VAE_SHIFT) * VAE_SCALE
+        var latent_scaled_chw = List[Float32]()
         for i in range(LAT_C * LAT_H * LAT_W):
-            lat_chw.append((lat_raw[i] - VAE_SHIFT) * VAE_SCALE)
-        var latent_packed = _pack_latents(lat_chw)   # [N_IMG=4096, 64]
+            latent_scaled_chw.append((latent_raw[i] - VAE_SHIFT) * VAE_SCALE)
+        var latent_packed = _pack_latents(latent_scaled_chw)   # [N_IMG=4096, 64]
 
         # ── timestep ──
         var sigma_idx: Int
@@ -359,7 +763,12 @@ def main() raises:
         var gn_before = _clip(grads, CLIP_GRAD_NORM)
 
         # ── AdamW ──
-        sd35_lora_adamw_step(lora, grads, k, LR, ctx)
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        sd35_lora_adamw_step(
+            lora, grads, k, step_lr, ctx,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+            train_cfg.weight_decay,
+        )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -371,6 +780,27 @@ def main() raises:
         if grads.nonfinite != 0:
             print("[SD35-lora] warning nonfinite=", grads.nonfinite)
 
+        var saved_this_step = False
+        if sd35_should_save_checkpoint(train_cfg, k):
+            var save_path = _step_lora_path(
+                sd35_output_lora_path_from_train_config(train_cfg, run_steps), k
+            )
+            _ = save_sd35_lora(lora, save_path, ctx)
+            var state_path = save_path + String(".state.safetensors")
+            _ = save_sd35_lora_state(lora, state_path, ctx)
+            saved_this_step = True
+            print("[SD35-lora] save_state step=", k, " path=", state_path)
+        if sample_enabled and should_sample_completed_step(sample_cadence, k):
+            if sd35_should_save_before_sample(sample_cadence, k, saved_this_step):
+                var sample_path = _step_lora_path(
+                    sd35_output_lora_path_from_train_config(train_cfg, run_steps), k
+                )
+                _ = save_sd35_lora(lora, sample_path, ctx)
+                var sample_state = sample_path + String(".state.safetensors")
+                _ = save_sd35_lora_state(lora, sample_state, ctx)
+                print("[SD35-lora] save_before_sample step=", k, " path=", sample_state)
+            sd35_assert_product_sampler_runtime_wired(sample_cfg, k)
+
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
     var b_absum_final = Float32(0.0)
@@ -381,6 +811,10 @@ def main() raises:
         print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        _ = save_sd35_lora(lora, String(LORA_DIR) + String("/sd35_lora_smoke.safetensors"), ctx)
+        var lora_out = sd35_output_lora_path_from_train_config(train_cfg, run_steps)
+        _ = save_sd35_lora(lora, lora_out, ctx)
+        var state_out = lora_out + String(".state.safetensors")
+        _ = save_sd35_lora_state(lora, state_out, ctx)
+        print("[SD35-lora] save_state step=", run_steps, " path=", state_out)
     else:
         print("RESULT: FAIL trains=", trains)

@@ -71,6 +71,7 @@ from serenitymojo.ops.norm_backward import (
 from serenitymojo.ops.activation_backward import gelu_backward
 from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
+from serenitymojo.training.train_step import LoraAdapter
 
 
 # ── host helpers (the by-hand grad threading; NO tape) ──────────────────────
@@ -93,6 +94,85 @@ def _zeros(d: Int) -> List[Float32]:
     for _ in range(d):
         o.append(0.0)
     return o^
+
+
+struct _LoraBack(Copyable, Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+    var d_x: List[Float32]
+
+    def __init__(
+        out self, var d_a: List[Float32], var d_b: List[Float32], var d_x: List[Float32]
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_x = d_x^
+
+
+def _sd35_lora_fwd(
+    x_h: List[Float32], lo: LoraAdapter, rows: Int, ctx: DeviceContext
+) raises -> List[Float32]:
+    var nb1 = Optional[Tensor](None)
+    var t = linear(
+        Tensor.from_host(x_h.copy(), [rows, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
+        nb1^, ctx,
+    ).to_host(ctx)
+    var nb2 = Optional[Tensor](None)
+    var dy = linear(
+        Tensor.from_host(t.copy(), [rows, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
+        nb2^, ctx,
+    ).to_host(ctx)
+    var out = List[Float32]()
+    for i in range(len(dy)):
+        out.append(lo.scale * dy[i])
+    return out^
+
+
+def _add_lora_if_present(
+    base_y: List[Float32], x_h: List[Float32], lo: Optional[LoraAdapter],
+    rows: Int, ctx: DeviceContext,
+) raises -> List[Float32]:
+    if not lo:
+        return base_y.copy()
+    var delta = _sd35_lora_fwd(x_h, lo.value().copy(), rows, ctx)
+    var out = base_y.copy()
+    for i in range(len(out)):
+        out[i] = out[i] + delta[i]
+    return out^
+
+
+def _sd35_lora_bwd(
+    d_contrib_h: List[Float32], x_h: List[Float32], lo: LoraAdapter,
+    rows: Int, ctx: DeviceContext,
+) raises -> _LoraBack:
+    var nb_t = Optional[Tensor](None)
+    var t = linear(
+        Tensor.from_host(x_h.copy(), [rows, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
+        nb_t^, ctx,
+    ).to_host(ctx)
+    var d_dy = List[Float32]()
+    for i in range(len(d_contrib_h)):
+        d_dy.append(lo.scale * d_contrib_h[i])
+    var lb_b = linear_backward(
+        Tensor.from_host(d_dy^, [rows, lo.out_f], STDtype.BF16, ctx),
+        Tensor.from_host(t.copy(), [rows, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.b.copy(), [lo.out_f, lo.rank], ctx),
+        rows, lo.rank, lo.out_f, ctx,
+    )
+    var d_t = lb_b.d_x^.to_host(ctx)
+    var d_b = lb_b.d_w^.to_host(ctx)
+    var lb_a = linear_backward(
+        Tensor.from_host(d_t^, [rows, lo.rank], STDtype.BF16, ctx),
+        Tensor.from_host(x_h.copy(), [rows, lo.in_f], STDtype.BF16, ctx),
+        Tensor.from_host_bf16(lo.a.copy(), [lo.rank, lo.in_f], ctx),
+        rows, lo.in_f, lo.rank, ctx,
+    )
+    var d_x = lb_a.d_x^.to_host(ctx)
+    var d_a = lb_a.d_w^.to_host(ctx)
+    return _LoraBack(d_a^, d_b^, d_x^)
 
 
 # modulate forward: o = (1+scale)*x + shift; scale/shift [D] broadcast over N rows.
@@ -361,23 +441,58 @@ struct StreamGrads(Copyable, Movable):
         self.d_gate_mlp = d_gate_mlp^
 
 
+struct StreamLoraGrads(Copyable, Movable):
+    var qkv_d_a: List[Float32]
+    var qkv_d_b: List[Float32]
+    var proj_d_a: List[Float32]
+    var proj_d_b: List[Float32]
+    var fc1_d_a: List[Float32]
+    var fc1_d_b: List[Float32]
+    var fc2_d_a: List[Float32]
+    var fc2_d_b: List[Float32]
+
+    def __init__(
+        out self,
+        var qkv_d_a: List[Float32], var qkv_d_b: List[Float32],
+        var proj_d_a: List[Float32], var proj_d_b: List[Float32],
+        var fc1_d_a: List[Float32], var fc1_d_b: List[Float32],
+        var fc2_d_a: List[Float32], var fc2_d_b: List[Float32],
+    ):
+        self.qkv_d_a = qkv_d_a^
+        self.qkv_d_b = qkv_d_b^
+        self.proj_d_a = proj_d_a^
+        self.proj_d_b = proj_d_b^
+        self.fc1_d_a = fc1_d_a^
+        self.fc1_d_b = fc1_d_b^
+        self.fc2_d_a = fc2_d_a^
+        self.fc2_d_b = fc2_d_b^
+
+
 struct JointBlockGrads(Copyable, Movable):
     var d_ctx: List[Float32]      # [N_CTX, D]
     var d_x: List[Float32]        # [N_IMG, D]
     var ctx_g: StreamGrads
     var x_g: StreamGrads
+    var ctx_lora: StreamLoraGrads
+    var x_lora: StreamLoraGrads
+    var ctx_d_qkv: List[Float32]  # grad at context_block qkv output [N_CTX,3D]
     var x_d_qkv: List[Float32]    # grad at x_block qkv output [N_IMG,3D] (LoRA d_contrib)
 
     def __init__(
         out self,
         var d_ctx: List[Float32], var d_x: List[Float32],
         var ctx_g: StreamGrads, var x_g: StreamGrads,
+        var ctx_lora: StreamLoraGrads, var x_lora: StreamLoraGrads,
+        var ctx_d_qkv: List[Float32],
         var x_d_qkv: List[Float32],
     ):
         self.d_ctx = d_ctx^
         self.d_x = d_x^
         self.ctx_g = ctx_g^
         self.x_g = x_g^
+        self.ctx_lora = ctx_lora^
+        self.x_lora = x_lora^
+        self.ctx_d_qkv = ctx_d_qkv^
         self.x_d_qkv = x_d_qkv^
 
 
@@ -411,10 +526,15 @@ def _stream_pre(
     s: List[Float32], w: StreamWeights, m: ModVecs,
     N: Int, D: Int, H: Int, Dh: Int, eps: Float32, qk_eps: Float32, ctx: DeviceContext,
     qkv_lora_delta: Optional[List[Float32]] = None,
+    qkv_lora: Optional[LoraAdapter] = None,
 ) raises -> _StreamPre:
     var ln1 = _layer_norm_fwd(s, N, D, eps, ctx)
     var norm = _modulate_fwd(ln1, m.scale_msa, m.shift_msa, N, D)
     var qkv = _linear_fwd(norm, w.wqkv, w.bqkv, N, D, 3 * D, ctx)  # [N,3D]
+    if qkv_lora:
+        var lora_delta = _sd35_lora_fwd(norm.copy(), qkv_lora.value().copy(), N, ctx)
+        for i in range(len(qkv)):
+            qkv[i] = qkv[i] + lora_delta[i]
     if qkv_lora_delta:
         var delta = qkv_lora_delta.value().copy()
         for i in range(len(qkv)):
@@ -468,14 +588,20 @@ struct _StreamPost(Copyable, Movable):
 def _stream_post(
     s: List[Float32], att: List[Float32], w: StreamWeights, m: ModVecs,
     N: Int, D: Int, MLP: Int, eps: Float32, ctx: DeviceContext,
+    proj_lora: Optional[LoraAdapter] = None,
+    fc1_lora: Optional[LoraAdapter] = None,
+    fc2_lora: Optional[LoraAdapter] = None,
 ) raises -> _StreamPost:
-    var proj = _linear_fwd(att, w.wproj, w.bproj, N, D, D, ctx)
+    var proj_base = _linear_fwd(att, w.wproj, w.bproj, N, D, D, ctx)
+    var proj = _add_lora_if_present(proj_base, att.copy(), proj_lora, N, ctx)
     var attn_res = _gated_residual_fwd(s, m.gate_msa, proj, N, D)
     var ln2 = _layer_norm_fwd(attn_res, N, D, eps, ctx)
     var mlp_in = _modulate_fwd(ln2, m.scale_mlp, m.shift_mlp, N, D)
-    var h1 = _linear_fwd(mlp_in, w.wfc1, w.bfc1, N, D, MLP, ctx)
+    var h1_base = _linear_fwd(mlp_in, w.wfc1, w.bfc1, N, D, MLP, ctx)
+    var h1 = _add_lora_if_present(h1_base, mlp_in.copy(), fc1_lora, N, ctx)
     var hg = _gelu_fwd(h1, N, MLP, ctx)
-    var mlp = _linear_fwd(hg, w.wfc2, w.bfc2, N, MLP, D, ctx)
+    var mlp_base = _linear_fwd(hg, w.wfc2, w.bfc2, N, MLP, D, ctx)
+    var mlp = _add_lora_if_present(mlp_base, hg.copy(), fc2_lora, N, ctx)
     var out = _gated_residual_fwd(attn_res, m.gate_mlp, mlp, N, D)
     return _StreamPost(att.copy(), proj^, attn_res^, ln2^, mlp_in^, h1^, hg^, mlp^, out^)
 
@@ -503,12 +629,27 @@ def sd35_joint_block_forward[
     eps: Float32, qk_eps: Float32, scale: Float32,
     ctx: DeviceContext,
     x_qkv_lora_delta: Optional[List[Float32]] = None,
+    ctx_qkv_lora: Optional[LoraAdapter] = None,
+    ctx_proj_lora: Optional[LoraAdapter] = None,
+    ctx_fc1_lora: Optional[LoraAdapter] = None,
+    ctx_fc2_lora: Optional[LoraAdapter] = None,
+    x_qkv_lora: Optional[LoraAdapter] = None,
+    x_proj_lora: Optional[LoraAdapter] = None,
+    x_fc1_lora: Optional[LoraAdapter] = None,
+    x_fc2_lora: Optional[LoraAdapter] = None,
+    ctx_qkv_lora_delta: Optional[List[Float32]] = None,
 ) raises -> JointBlockForward:
     var H = Hp
     var Dh = Dhp
     # ── pre-attention per stream ──
-    var cp = _stream_pre(context, w.ctxw, ctx_mod, N_CTX, D, H, Dh, eps, qk_eps, ctx)
-    var xp = _stream_pre(x, w.xw, x_mod, N_IMG, D, H, Dh, eps, qk_eps, ctx, x_qkv_lora_delta)
+    var cp = _stream_pre(
+        context, w.ctxw, ctx_mod, N_CTX, D, H, Dh, eps, qk_eps, ctx,
+        ctx_qkv_lora_delta, ctx_qkv_lora,
+    )
+    var xp = _stream_pre(
+        x, w.xw, x_mod, N_IMG, D, H, Dh, eps, qk_eps, ctx,
+        x_qkv_lora_delta, x_qkv_lora,
+    )
 
     # ── JOINT attention: concat ctx FIRST, then x along sequence (dim 1) ──
     # q_rms is [1,N,H,Dh] == [N*H*Dh] row-major; concat along S means interleave
@@ -532,8 +673,14 @@ def sd35_joint_block_forward[
         x_att.append(att_joint[N_CTX * HDh + i])
 
     # ── post-attention per stream ──
-    var cpost = _stream_post(context, ctx_att, w.ctxw, ctx_mod, N_CTX, D, MLP, eps, ctx)
-    var xpost = _stream_post(x, x_att, w.xw, x_mod, N_IMG, D, MLP, eps, ctx)
+    var cpost = _stream_post(
+        context, ctx_att, w.ctxw, ctx_mod, N_CTX, D, MLP, eps, ctx,
+        ctx_proj_lora, ctx_fc1_lora, ctx_fc2_lora,
+    )
+    var xpost = _stream_post(
+        x, x_att, w.xw, x_mod, N_IMG, D, MLP, eps, ctx,
+        x_proj_lora, x_fc1_lora, x_fc2_lora,
+    )
 
     var ctx_saved = StreamSaved(
         context.copy(), cp.ln1.copy(), cp.norm.copy(), cp.q_pre.copy(), cp.k_pre.copy(), cp.v.copy(),
@@ -565,6 +712,12 @@ struct _StreamPostBack(Copyable, Movable):
     var d_shift_mlp: List[Float32]
     var d_scale_mlp: List[Float32]
     var d_gate_mlp: List[Float32]
+    var proj_lora_d_a: List[Float32]
+    var proj_lora_d_b: List[Float32]
+    var fc1_lora_d_a: List[Float32]
+    var fc1_lora_d_b: List[Float32]
+    var fc2_lora_d_a: List[Float32]
+    var fc2_lora_d_b: List[Float32]
 
     def __init__(
         out self,
@@ -574,6 +727,9 @@ struct _StreamPostBack(Copyable, Movable):
         var d_wfc2: List[Float32], var d_bfc2: List[Float32],
         var d_gate_msa: List[Float32],
         var d_shift_mlp: List[Float32], var d_scale_mlp: List[Float32], var d_gate_mlp: List[Float32],
+        var proj_lora_d_a: List[Float32], var proj_lora_d_b: List[Float32],
+        var fc1_lora_d_a: List[Float32], var fc1_lora_d_b: List[Float32],
+        var fc2_lora_d_a: List[Float32], var fc2_lora_d_b: List[Float32],
     ):
         self.d_s = d_s^
         self.d_att = d_att^
@@ -587,6 +743,12 @@ struct _StreamPostBack(Copyable, Movable):
         self.d_shift_mlp = d_shift_mlp^
         self.d_scale_mlp = d_scale_mlp^
         self.d_gate_mlp = d_gate_mlp^
+        self.proj_lora_d_a = proj_lora_d_a^
+        self.proj_lora_d_b = proj_lora_d_b^
+        self.fc1_lora_d_a = fc1_lora_d_a^
+        self.fc1_lora_d_b = fc1_lora_d_b^
+        self.fc2_lora_d_a = fc2_lora_d_a^
+        self.fc2_lora_d_b = fc2_lora_d_b^
 
 
 def _linear_backward_host(
@@ -604,7 +766,7 @@ def _linear_backward_host(
 # d_bias for a linear y=x@W.T+b is sum over rows of d_y.
 def _bias_grad(d_y: List[Float32], rows: Int, nout: Int) -> List[Float32]:
     var o = List[Float32]()
-    for c in range(nout):
+    for _ in range(nout):
         o.append(0.0)
     for r in range(rows):
         for c in range(nout):
@@ -630,7 +792,7 @@ def _gated_residual_backward(
     var d_s = d_out.copy()           # out = s + ... -> d_s gets d_out
     var d_y = List[Float32]()
     var d_gate = List[Float32]()
-    for c in range(D):
+    for _ in range(D):
         d_gate.append(0.0)
     for r in range(N):
         for c in range(D):
@@ -684,18 +846,32 @@ def _layer_norm_backward_dx(
 def _stream_post_backward(
     d_out: List[Float32], sv: StreamSaved, w: StreamWeights, m: ModVecs,
     N: Int, D: Int, MLP: Int, eps: Float32, ctx: DeviceContext,
+    proj_lora: Optional[LoraAdapter] = None,
+    fc1_lora: Optional[LoraAdapter] = None,
+    fc2_lora: Optional[LoraAdapter] = None,
 ) raises -> _StreamPostBack:
     # out = attn_res + gate_mlp * mlp
     var grb2 = _gated_residual_backward(d_out, m.gate_mlp, sv.mlp, N, D)
     var d_attn_res = grb2.d_s.copy()    # residual path #2: attn_res's 1st branch
     var d_mlp = grb2.d_y.copy()
     var d_gate_mlp = grb2.d_gate.copy()
+    var proj_lora_d_a = List[Float32]()
+    var proj_lora_d_b = List[Float32]()
+    var fc1_lora_d_a = List[Float32]()
+    var fc1_lora_d_b = List[Float32]()
+    var fc2_lora_d_a = List[Float32]()
+    var fc2_lora_d_b = List[Float32]()
 
     # mlp = linear(hg, Wfc2)
     var lb_fc2 = _linear_backward_host(d_mlp, sv.hg, w.wfc2, N, MLP, D, ctx)
     var d_hg = lb_fc2.d_x^.to_host(ctx)
     var d_wfc2 = lb_fc2.d_w^.to_host(ctx)
     var d_bfc2 = _bias_grad(d_mlp, N, D)
+    if fc2_lora:
+        var lg_fc2 = _sd35_lora_bwd(d_mlp.copy(), sv.hg.copy(), fc2_lora.value().copy(), N, ctx)
+        d_hg = _add_lists(d_hg, lg_fc2.d_x.copy())
+        fc2_lora_d_a = lg_fc2.d_a.copy()
+        fc2_lora_d_b = lg_fc2.d_b.copy()
 
     # hg = gelu(h1)
     var d_h1 = gelu_backward(
@@ -709,6 +885,11 @@ def _stream_post_backward(
     var d_mlp_in = lb_fc1.d_x^.to_host(ctx)
     var d_wfc1 = lb_fc1.d_w^.to_host(ctx)
     var d_bfc1 = _bias_grad(d_h1, N, MLP)
+    if fc1_lora:
+        var lg_fc1 = _sd35_lora_bwd(d_h1.copy(), sv.mlp_in.copy(), fc1_lora.value().copy(), N, ctx)
+        d_mlp_in = _add_lists(d_mlp_in, lg_fc1.d_x.copy())
+        fc1_lora_d_a = lg_fc1.d_a.copy()
+        fc1_lora_d_b = lg_fc1.d_b.copy()
 
     # mlp_in = modulate(ln2, scale_mlp, shift_mlp)
     var mb2 = _modulate_backward_host(d_mlp_in, sv.ln2, m.scale_mlp, N, D, ctx)
@@ -731,10 +912,17 @@ def _stream_post_backward(
     var d_att = lb_proj.d_x^.to_host(ctx)
     var d_wproj = lb_proj.d_w^.to_host(ctx)
     var d_bproj = _bias_grad(d_proj, N, D)
+    if proj_lora:
+        var lg_proj = _sd35_lora_bwd(d_proj.copy(), sv.att.copy(), proj_lora.value().copy(), N, ctx)
+        d_att = _add_lists(d_att, lg_proj.d_x.copy())
+        proj_lora_d_a = lg_proj.d_a.copy()
+        proj_lora_d_b = lg_proj.d_b.copy()
 
     return _StreamPostBack(
         d_s^, d_att^, d_wproj^, d_bproj^, d_wfc1^, d_bfc1^, d_wfc2^, d_bfc2^,
         d_gate_msa^, d_shift_mlp^, d_scale_mlp^, d_gate_mlp^,
+        proj_lora_d_a^, proj_lora_d_b^, fc1_lora_d_a^, fc1_lora_d_b^,
+        fc2_lora_d_a^, fc2_lora_d_b^,
     )
 
 
@@ -750,6 +938,8 @@ struct _StreamPreBack(Copyable, Movable):
     var d_shift_msa: List[Float32]
     var d_scale_msa: List[Float32]
     var d_qkv: List[Float32]   # grad at the qkv-linear OUTPUT [N,3D] (LoRA branch d_contrib)
+    var qkv_lora_d_a: List[Float32]
+    var qkv_lora_d_b: List[Float32]
 
     def __init__(
         out self,
@@ -757,6 +947,7 @@ struct _StreamPreBack(Copyable, Movable):
         var d_qnorm: List[Float32], var d_knorm: List[Float32],
         var d_shift_msa: List[Float32], var d_scale_msa: List[Float32],
         var d_qkv: List[Float32],
+        var qkv_lora_d_a: List[Float32], var qkv_lora_d_b: List[Float32],
     ):
         self.d_input = d_input^
         self.d_wqkv = d_wqkv^
@@ -766,6 +957,8 @@ struct _StreamPreBack(Copyable, Movable):
         self.d_shift_msa = d_shift_msa^
         self.d_scale_msa = d_scale_msa^
         self.d_qkv = d_qkv^
+        self.qkv_lora_d_a = qkv_lora_d_a^
+        self.qkv_lora_d_b = qkv_lora_d_b^
 
 
 def _stream_pre_backward(
@@ -773,6 +966,7 @@ def _stream_pre_backward(
     d_s_partial: List[Float32],
     sv: StreamSaved, w: StreamWeights, m: ModVecs,
     N: Int, D: Int, H: Int, Dh: Int, eps: Float32, qk_eps: Float32, ctx: DeviceContext,
+    qkv_lora: Optional[LoraAdapter] = None,
 ) raises -> _StreamPreBack:
     # q_rms = rms_norm(q_pre, q_norm)  (over last dim Dh; rows = N*H)
     var rb_q = rms_norm_backward(
@@ -807,6 +1001,13 @@ def _stream_pre_backward(
     var d_norm = lb_qkv.d_x^.to_host(ctx)
     var d_wqkv = lb_qkv.d_w^.to_host(ctx)
     var d_bqkv = _bias_grad(d_qkv, N, 3 * D)
+    var qkv_lora_d_a = List[Float32]()
+    var qkv_lora_d_b = List[Float32]()
+    if qkv_lora:
+        var lg_qkv = _sd35_lora_bwd(d_qkv.copy(), sv.norm.copy(), qkv_lora.value().copy(), N, ctx)
+        d_norm = _add_lists(d_norm, lg_qkv.d_x.copy())
+        qkv_lora_d_a = lg_qkv.d_a.copy()
+        qkv_lora_d_b = lg_qkv.d_b.copy()
 
     # norm = modulate(ln1, scale_msa, shift_msa)
     var mb1 = _modulate_backward_host(d_norm, sv.ln1, m.scale_msa, N, D, ctx)
@@ -821,7 +1022,7 @@ def _stream_pre_backward(
 
     return _StreamPreBack(
         d_input^, d_wqkv^, d_bqkv^, d_qnorm^, d_knorm^, d_shift_msa^, d_scale_msa^,
-        d_qkv^,
+        d_qkv^, qkv_lora_d_a^, qkv_lora_d_b^,
     )
 
 
@@ -836,14 +1037,28 @@ def sd35_joint_block_backward[
     N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
     eps: Float32, qk_eps: Float32, scale: Float32,
     ctx: DeviceContext,
+    ctx_qkv_lora: Optional[LoraAdapter] = None,
+    ctx_proj_lora: Optional[LoraAdapter] = None,
+    ctx_fc1_lora: Optional[LoraAdapter] = None,
+    ctx_fc2_lora: Optional[LoraAdapter] = None,
+    x_qkv_lora: Optional[LoraAdapter] = None,
+    x_proj_lora: Optional[LoraAdapter] = None,
+    x_fc1_lora: Optional[LoraAdapter] = None,
+    x_fc2_lora: Optional[LoraAdapter] = None,
 ) raises -> JointBlockGrads:
     var H = Hp
     var Dh = Dhp
     var HDh = H * Dh
 
     # ── post-attention backward per stream ──
-    var cpb = _stream_post_backward(d_ctx_out, fwd.ctx_saved, w.ctxw, ctx_mod, N_CTX, D, MLP, eps, ctx)
-    var xpb = _stream_post_backward(d_x_out, fwd.x_saved, w.xw, x_mod, N_IMG, D, MLP, eps, ctx)
+    var cpb = _stream_post_backward(
+        d_ctx_out, fwd.ctx_saved, w.ctxw, ctx_mod, N_CTX, D, MLP, eps, ctx,
+        ctx_proj_lora, ctx_fc1_lora, ctx_fc2_lora,
+    )
+    var xpb = _stream_post_backward(
+        d_x_out, fwd.x_saved, w.xw, x_mod, N_IMG, D, MLP, eps, ctx,
+        x_proj_lora, x_fc1_lora, x_fc2_lora,
+    )
 
     # ── joint sdpa backward ──
     # The forward concat was ctx FIRST then x; d_att per stream go back into the
@@ -891,11 +1106,11 @@ def sd35_joint_block_backward[
     # ── pre-attention backward per stream ──
     var cprb = _stream_pre_backward(
         ctx_dq, ctx_dk, ctx_dv, cpb.d_s, fwd.ctx_saved, w.ctxw, ctx_mod,
-        N_CTX, D, H, Dh, eps, qk_eps, ctx,
+        N_CTX, D, H, Dh, eps, qk_eps, ctx, ctx_qkv_lora,
     )
     var xprb = _stream_pre_backward(
         x_dq, x_dk, x_dv, xpb.d_s, fwd.x_saved, w.xw, x_mod,
-        N_IMG, D, H, Dh, eps, qk_eps, ctx,
+        N_IMG, D, H, Dh, eps, qk_eps, ctx, x_qkv_lora,
     )
 
     var ctx_g = StreamGrads(
@@ -912,6 +1127,19 @@ def sd35_joint_block_backward[
         xprb.d_shift_msa.copy(), xprb.d_scale_msa.copy(), xpb.d_gate_msa.copy(),
         xpb.d_shift_mlp.copy(), xpb.d_scale_mlp.copy(), xpb.d_gate_mlp.copy(),
     )
+    var ctx_lora = StreamLoraGrads(
+        cprb.qkv_lora_d_a.copy(), cprb.qkv_lora_d_b.copy(),
+        cpb.proj_lora_d_a.copy(), cpb.proj_lora_d_b.copy(),
+        cpb.fc1_lora_d_a.copy(), cpb.fc1_lora_d_b.copy(),
+        cpb.fc2_lora_d_a.copy(), cpb.fc2_lora_d_b.copy(),
+    )
+    var x_lora = StreamLoraGrads(
+        xprb.qkv_lora_d_a.copy(), xprb.qkv_lora_d_b.copy(),
+        xpb.proj_lora_d_a.copy(), xpb.proj_lora_d_b.copy(),
+        xpb.fc1_lora_d_a.copy(), xpb.fc1_lora_d_b.copy(),
+        xpb.fc2_lora_d_a.copy(), xpb.fc2_lora_d_b.copy(),
+    )
     return JointBlockGrads(
-        cprb.d_input.copy(), xprb.d_input.copy(), ctx_g^, x_g^, xprb.d_qkv.copy()
+        cprb.d_input.copy(), xprb.d_input.copy(), ctx_g^, x_g^, ctx_lora^, x_lora^,
+        cprb.d_qkv.copy(), xprb.d_qkv.copy()
     )

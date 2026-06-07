@@ -117,11 +117,11 @@ At 36 layers this is `252` adapters. Q/K/V/O are `[4096,4096]`, gate/up are
 `[12288,4096]`, and `linear_fc2` is `[4096,12288]`.
 
 The Mojo LoRA stack already uses this 7-slot map in
-`serenitymojo/models/ernie/ernie_stack_lora.mojo`. Keep saving in the generic
-PEFT/ai-toolkit-compatible format used by Serenity inference:
-`<prefix>.lora_A.weight` and `<prefix>.lora_B.weight`. If direct OneTrainer LoRA
-import/export is needed later, add an explicit key conversion instead of
-changing the production save format.
+`serenitymojo/models/ernie/ernie_stack_lora.mojo`. The product save path now
+uses the raw OneTrainer state-dict convention:
+`<prefix>.alpha`, `<prefix>.lora_down.weight`, and
+`<prefix>.lora_up.weight`. The trainer-state file remains separate and carries
+the AdamW moments for resume.
 
 ## Current Mojo Status
 
@@ -134,7 +134,8 @@ Existing useful pieces:
   single-stream ERNIE block and LoRA block.
 - `serenitymojo/models/ernie/ernie_stack_lora.mojo` has the 36-layer 7-slot LoRA
   carrier, streamed fallback paths, device-resident BF16 block forward/backward,
-  AdamW step, bulk LoRA-grad D2H gather, and PEFT/ai-toolkit save.
+  AdamW step, bulk LoRA-grad D2H gather, raw OneTrainer LoRA saves, and separate
+  trainer-state saves for AdamW resume.
 - `serenitymojo/ops/rope.mojo` and `rope_struct_backward.mojo` now expose the
   full-width half-split RoPE path ERNIE needs; use `rope_halfsplit_full` and
   `rope_halfsplit_full_backward`, not the older half-width half-split backward.
@@ -244,7 +245,7 @@ Current Mojo wiring (2026-06-03):
   Mojo-Mistral cap sidecars, applies the active LoRA overlay through the resident
   no-save ERNIE forward, decodes with the Klein VAE path, and writes 1024x1024
   PNGs.
-- Resume smoke mode saves PEFT LoRA plus `.state.safetensors` trainer state at
+- Resume smoke mode saves raw OneTrainer LoRA plus `.state.safetensors` trainer state at
   step 10, reloads that state, continues to step 25, then saves and samples.
   Cadence saves in normal train mode also reload the `.state.safetensors` file
   after sampling, proving resume from trainer state rather than PEFT-only LoRA.

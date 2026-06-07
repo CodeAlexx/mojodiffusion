@@ -1,8 +1,11 @@
 # sampling/ernie_sampling.mojo - ERNIE-Image FlowMatch scheduler and CFG helpers.
 #
-# ERNIE uses a fixed-shift FlowMatchEulerDiscreteScheduler:
-# shift=3.0, num_train_timesteps=1000, no dynamic shifting. The DiT receives
-# `sigma * 1000` as its timestep and predicts velocity.
+# OneTrainer's ERNIE sampler passes explicit raw sigmas
+# linspace(1.0, 1.0 / diffusion_steps, diffusion_steps) into a fixed-shift
+# FlowMatchEulerDiscreteScheduler: shift=3.0, num_train_timesteps=1000, no
+# dynamic shifting. The DiT receives `sigma * 1000` as its timestep and predicts
+# velocity. Schedule scalars are F32 host math; tensor updates preserve input
+# storage dtype through tensor_algebra ops.
 
 from std.gpu.host import DeviceContext
 

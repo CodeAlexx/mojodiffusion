@@ -1,0 +1,3 @@
+interface:
+  display_name: "Mojo Model Runtime Port"
+  short_description: "Build shared Mojo inference runtimes that also feed training ports"

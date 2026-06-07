@@ -38,8 +38,7 @@
 # byte copy (NOT tensor.to_host, which widens to F32) -- we copy storage bytes
 # verbatim so restore is bit-exact, mirroring the from_view H2D byte-copy path.
 
-from collections import List
-from collections.optional import Optional
+from std.collections import List, Optional
 from std.gpu.host import DeviceContext, DeviceBuffer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype

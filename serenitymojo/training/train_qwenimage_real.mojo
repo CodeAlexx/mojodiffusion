@@ -37,8 +37,8 @@
 #     -o /tmp/train_qwenimage_real
 #
 # ── UNVERIFIABLE-WITHOUT-CACHE ITEMS (flagged for future parity gate) ──────────
-# (1) Checkpoint dtype FP8-E4M3: cast_tensor handles FP8→F32 dequant; parity vs
-#     torch FP8 checkpoint not gated (no local FP8 reference weights).
+# (1) Checkpoint dtype FP8-E4M3: Qwen loaders dequant FP8 bytes to BF16 on use;
+#     parity vs torch FP8 checkpoint still needs a local reference gate.
 # (2) txt_ch=3584: the Qwen2.5-VL text encoder; cache dir uses placeholder zeros.
 # (3) RoPE total_half = 8+28+28 = 64 = Dh//2: matches config axes (16,56,56);
 #     parity to qwenimage.rs RoPE verified per-block cos>=0.999 in the block tests.
@@ -48,7 +48,7 @@
 #     in the trainer we skip it (match train_qwenimage.rs which operates on already-
 #     normalized text embeddings from the cache).
 
-from sys import argv
+from std.sys import argv
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
@@ -60,17 +60,16 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.ops.activations import silu
 
 from serenitymojo.models.qwenimage.qwenimage_stack import (
     QwenStackBase, _t as _qstack_t,
 )
-from serenitymojo.models.qwenimage.weights import load_qwen_stack_base
+from serenitymojo.models.qwenimage.weights import load_qwen_stack_base, load_qwen_host_bf16
 from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
     QwenLoraSet, QwenLoraGradSet, QwenOffloadBase, QwenOffloadForward,
-    build_qwen_lora_set, save_qwen_lora,
+    build_qwen_lora_set, save_qwen_lora, save_qwen_lora_state,
     qwenimage_stack_lora_forward_offload,
     qwenimage_stack_lora_backward_offload,
     qwen_offload_lora_adamw_step,
@@ -84,6 +83,30 @@ from serenitymojo.offload.plan import OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.train_config import (
+    TrainConfig, GRADIENT_CHECKPOINTING_ON,
+)
+from serenitymojo.training.onetrainer_cache_preflight import (
+    create_onetrainer_cache_preflight_plan,
+    validate_onetrainer_cache_preflight_plan,
+)
+from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.sample_prompt_config import (
+    SampleCadence, read_sample_cadence_config,
+    validate_step_sample_cadence, should_sample_completed_step,
+    next_sample_completed_step, sample_time_unit_name,
+    SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+)
+from serenitymojo.training.onetrainer_train_loop_policy import (
+    OT_GRAD_POLICY_ON_ONLY,
+    ot_lr_for_optimizer_step,
+    ot_sample_cadence_from_train_config,
+    ot_should_save_before_sample,
+    ot_state_path_for_lora,
+    ot_step_lora_path,
+    validate_ot_gradient_checkpointing_policy,
+    validate_ot_train_math_policy,
+)
 
 
 # ── arch (qwen-image; confirmed from config.json + qwenimage_dit.mojo) ────────
@@ -111,20 +134,116 @@ comptime ROPE_FRAME = 1
 comptime ROPE_H = 32           # == LAT_H (latent height in patch coords)
 comptime ROPE_W = 32           # == LAT_W
 
-# ── recipe (configs/qwenimage.json + qwenimage.rs) ────────────────────────────
-comptime RANK = 16
-comptime ALPHA = Float32(16.0)
-comptime LR = Float32(1.0e-4)
-comptime TIMESTEP_SHIFT = Float32(3.0)
-comptime CLIP_GRAD_NORM = Float32(1.0)
+# ── recipe defaults (configs/qwenimage.json is the runtime source of truth) ───
 comptime SEED_BASE = UInt64(42)
 
 comptime FIXED_SIGMA_SMOKE = True
 comptime FIXED_SIGMA_VAL = Float32(0.5)    # fixed sigma for smoke test
 
-comptime CKPT = "/home/alex/.serenity/models/checkpoints/qwen_image_fp8_e4m3fn.safetensors"
-comptime CACHE_DIR = "/home/alex/datasets/qwenimage_cache_512"
+comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/qwenimage.json"
+comptime DEFAULT_RUN_STEPS = 5
+comptime DEFAULT_CACHE_DIR = "/home/alex/datasets/qwenimage_cache_512"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/qwenimage_lora"
+
+
+def _is_nonnegative_int(s: String) -> Bool:
+    if s.byte_length() == 0:
+        return False
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        if bs[i] < 0x30 or bs[i] > 0x39:
+            return False
+    return True
+
+
+def _parse_nonnegative_int(s: String) raises -> Int:
+    if not _is_nonnegative_int(s):
+        raise Error(String("expected non-negative integer, got ") + s)
+    var out = 0
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        out = out * 10 + Int(bs[i] - 0x30)
+    return out
+
+
+def qwen_patchified_out_channels(cfg: TrainConfig) -> Int:
+    var qcfg = QwenImageConfig.qwen_image()
+    return cfg.out_channels * qcfg.patch_size * qcfg.patch_size
+
+
+def validate_qwen_train_config(cfg: TrainConfig) raises:
+    # The hot stack functions are still comptime-specialized for the 512px
+    # Qwen-Image bucket. Fail here instead of silently using mismatched metadata.
+    if cfg.checkpoint == String(""):
+        raise Error("Qwen trainer config must set checkpoint")
+    if cfg.n_heads != H:
+        raise Error(String("Qwen config n_heads ") + String(cfg.n_heads) + String(" != comptime H ") + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("Qwen config head_dim ") + String(cfg.head_dim) + String(" != comptime Dh ") + String(Dh))
+    if cfg.d_model != H * Dh:
+        raise Error(String("Qwen config d_model ") + String(cfg.d_model) + String(" != H*Dh ") + String(H * Dh))
+    if cfg.in_channels != IN_CH:
+        raise Error(String("Qwen config in_channels ") + String(cfg.in_channels) + String(" != IN_CH ") + String(IN_CH))
+    if cfg.joint_attention_dim != TXT_CH:
+        raise Error(String("Qwen config joint_attention_dim ") + String(cfg.joint_attention_dim) + String(" != TXT_CH ") + String(TXT_CH))
+    if cfg.num_double != NUM_DOUBLE or cfg.num_single != 0:
+        raise Error(
+            String("Qwen trainer requires 60 double-stream blocks and 0 single blocks; got double=")
+            + String(cfg.num_double) + String(" single=") + String(cfg.num_single)
+        )
+    if cfg.mlp_hidden != FMLP:
+        raise Error(String("Qwen config mlp_hidden ") + String(cfg.mlp_hidden) + String(" != FMLP ") + String(FMLP))
+    if cfg.timestep_dim != TIMESTEP_DIM:
+        raise Error(String("Qwen config timestep_dim ") + String(cfg.timestep_dim) + String(" != TIMESTEP_DIM ") + String(TIMESTEP_DIM))
+    if qwen_patchified_out_channels(cfg) != OUT_CH:
+        raise Error(
+            String("Qwen config out_channels ") + String(cfg.out_channels)
+            + String(" with patch_size=2 gives ")
+            + String(qwen_patchified_out_channels(cfg))
+            + String(" patchified channels, expected ") + String(OUT_CH)
+        )
+    if cfg.lora_rank <= 0:
+        raise Error("Qwen trainer config requires lora_rank > 0")
+    if cfg.lora_alpha <= Float32(0.0):
+        raise Error("Qwen trainer config requires lora_alpha > 0")
+    if cfg.lr <= Float32(0.0):
+        raise Error("Qwen trainer config requires learning_rate > 0")
+    if cfg.max_grad_norm <= Float32(0.0):
+        raise Error("Qwen trainer config requires max_grad_norm > 0")
+    validate_ot_train_math_policy(cfg, String("Qwen trainer"))
+    validate_ot_gradient_checkpointing_policy(
+        cfg, String("Qwen trainer"), OT_GRAD_POLICY_ON_ONLY
+    )
+
+
+def qwen_offload_config_from_train_config(cfg: TrainConfig) raises -> OffloadConfig:
+    validate_qwen_train_config(cfg)
+    if cfg.activation_offload_enabled() or cfg.layer_offload_enabled():
+        raise Error(
+            String("Qwen trainer cannot honor CPU activation/layer offload yet; ")
+            + String("set gradient_checkpointing=ON for the current synchronous block loader")
+        )
+    return OffloadConfig.synchronous_single()
+
+
+def qwen_sample_cadence_from_train_config(
+    cfg_path: String, cfg: TrainConfig,
+) raises -> SampleCadence:
+    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+
+
+def qwen_should_save_before_sample(
+    cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
+) raises -> Bool:
+    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+
+
+def qwen_state_path_for_lora(lora_path: String) -> String:
+    return ot_state_path_for_lora(lora_path)
+
+
+def _step_lora_path(base_path: String, step: Int) -> String:
+    return ot_step_lora_path(base_path, step)
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -205,24 +324,23 @@ def _list_cache(dir: String) raises -> List[String]:
     return fs^
 
 
-def _load_host_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
+def _load_cache_preserving_dtype(
+    st: SafeTensors, name: String, ctx: DeviceContext
+) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
+    return Tensor.from_view(tv, ctx)
 
 
 def _load_host_f32_sharded(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
     var tv = st.tensor_view(name)
     var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
+    return t.to_host(ctx)
 
 
 def _load_host_bf16_sharded(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises -> List[BFloat16]:
-    var tv = st.tensor_view(name)
-    var t = Tensor.from_view(tv, ctx)
-    return t.to_host_bf16(ctx)
+    return load_qwen_host_bf16(st, name, ctx)
 
 
 # Sinusoidal timestep embedding (host, returns [timestep_dim] F32).
@@ -275,33 +393,81 @@ def _build_silu_temb(
 
 
 def main() raises:
-    var ctx = DeviceContext()
     var a = argv()
-    var run_steps = 5
+    var cfg_path = String(DEFAULT_CONFIG)
+    var run_steps = DEFAULT_RUN_STEPS
     if len(a) >= 2:
-        var v = 0
-        var bs = String(a[1]).as_bytes()
-        for i in range(String(a[1]).byte_length()):
-            v = v * 10 + Int(bs[i] - 0x30)
-        run_steps = v
+        var arg1 = String(a[1])
+        if _is_nonnegative_int(arg1):
+            run_steps = _parse_nonnegative_int(arg1)
+        else:
+            cfg_path = arg1^
+    if len(a) >= 3:
+        run_steps = _parse_nonnegative_int(String(a[2]))
+
+    var train_cfg = read_model_config(cfg_path)
+    validate_qwen_train_config(train_cfg)
+    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
+    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var sample_cadence = qwen_sample_cadence_from_train_config(cfg_path, train_cfg)
+    var offload_cfg = qwen_offload_config_from_train_config(train_cfg)
+    if run_steps <= 0:
+        run_steps = train_cfg.max_steps
+    if run_steps > train_cfg.max_steps:
+        run_steps = train_cfg.max_steps
+    var cache_dir = String(DEFAULT_CACHE_DIR)
+    if train_cfg.dataset_cache_dir != String(""):
+        cache_dir = train_cfg.dataset_cache_dir.copy()
+    var output_lora_path = String(LORA_DIR) + String("/qwenimage_lora_smoke.safetensors")
+    if train_cfg.output_model_destination != String(""):
+        output_lora_path = train_cfg.output_model_destination.copy()
 
     print("=== Qwen-Image REAL LoRA training loop (block-swap offload) ===")
+    print("  config:", cfg_path)
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " F=", FMLP, " in_ch=", IN_CH,
           " txt_ch=", TXT_CH, " out_ch=", OUT_CH)
     print("  depth: NUM_DOUBLE=", NUM_DOUBLE, " (all-double)")
     print("  tokens: N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S)
-    print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR,
-          " shift=", TIMESTEP_SHIFT)
+    print("  recipe: rank=", train_cfg.lora_rank, " alpha=", train_cfg.lora_alpha,
+          " lr=", train_cfg.lr, " shift=", train_cfg.timestep_shift,
+          " max_grad_norm=", train_cfg.max_grad_norm)
+    print("  run_steps=", run_steps, " config_max_steps=", train_cfg.max_steps)
+    print(
+        "  cadence: save_every=", train_cfg.save_every,
+        " sample_after=", sample_cadence.sample_after,
+        " unit=", sample_time_unit_name(sample_cadence.sample_after_unit),
+        " skip_first=", sample_cadence.sample_skip_first,
+        " sample_file=", sample_cadence.sample_definition_file_name,
+    )
+    if train_cfg.enable_async_offloading:
+        print("[offload] async offload requested by config; Qwen trainer currently uses synchronous TurboPlannedLoader")
     print("  LoRA targets: 12/block (img/txt x q,k,v,out,ff_up,ff_down) x 60 = 720")
     print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
-    print("  ckpt:", CKPT)
-    print("  cache:", CACHE_DIR)
+    print("  ckpt:", train_cfg.checkpoint)
+    print("  cache:", cache_dir)
+
+    if should_sample_completed_step(sample_cadence, 0):
+        print("[cadence] step 0 sample due; Qwen validation sampler is not wired in this bounded loop")
+    var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
+    print("[cadence] next sample completed_step=", next_sample)
+    if train_cfg.only_cache:
+        print("[QwenImage-lora] only_cache requested; no train steps will run in this trainer")
+        return
+
+    var ctx = DeviceContext()
 
     # ── load frozen stack-level base (img_in/txt_in/proj_out + timestep MLP) ──
     print("[load] QwenStackBase from checkpoint")
-    var st = ShardedSafeTensors.open(String(CKPT))
+    var st = ShardedSafeTensors.open(train_cfg.checkpoint)
 
-    var base_stack = load_qwen_stack_base(st, Int(D), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), ctx)
+    var base_stack = load_qwen_stack_base(
+        st,
+        train_cfg.d_model,
+        train_cfg.in_channels,
+        train_cfg.joint_attention_dim,
+        qwen_patchified_out_channels(train_cfg),
+        ctx,
+    )
 
     # timestep MLP weights (top-level in checkpoint)
     var te_lin1_w = _load_host_bf16_sharded(
@@ -331,8 +497,7 @@ def main() raises:
 
     # ── block-swap offload loader ────────────────────────────────────────────
     var plan = build_qwenimage_offload_plan()
-    var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
+    var loader = TurboPlannedLoader.open(train_cfg.checkpoint, plan^, offload_cfg, ctx)
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
 
     # ── 3-axis RoPE tables (fixed for 512px / 1 frame) ──────────────────────
@@ -346,19 +511,25 @@ def main() raises:
     print("[load] Qwen-Image 3-axis RoPE tables built (S*H x Dh//2)")
 
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
-    var lora = build_qwen_lora_set(Int(NUM_DOUBLE), Int(D), Int(FMLP), Int(RANK), ALPHA)
-    var n_adapters = Int(NUM_DOUBLE) * Int(DBL_SLOTS)
+    var lora = build_qwen_lora_set(
+        train_cfg.num_double,
+        train_cfg.d_model,
+        train_cfg.mlp_hidden,
+        train_cfg.lora_rank,
+        train_cfg.lora_alpha,
+    )
+    var n_adapters = train_cfg.num_double * Int(DBL_SLOTS)
     print("[lora] adapters:", n_adapters, " (", DBL_SLOTS, "x", NUM_DOUBLE, "double)")
 
     var files: List[String]
     var have_cache = True
     try:
-        files = _list_cache(String(CACHE_DIR))
+        files = _list_cache(cache_dir)
         print("[cache] samples:", len(files))
     except:
         files = List[String]()
         have_cache = False
-        print("[cache] WARNING: no cache at", CACHE_DIR, "- using synthetic tokens")
+        print("[cache] WARNING: no cache at", cache_dir, "- using synthetic tokens")
 
     var b_absum_init = Float32(0.0)
     for i in range(n_adapters):
@@ -378,7 +549,7 @@ def main() raises:
         if FIXED_SIGMA_SMOKE:
             sigma = FIXED_SIGMA_VAL
         else:
-            sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+            sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, train_cfg.timestep_shift)
 
         # ── load / synthesize tokens ──
         var img_tokens = List[Float32]()   # [N_IMG, IN_CH]
@@ -387,14 +558,18 @@ def main() raises:
         if have_cache and len(files) > 0:
             var slot = 0 if FIXED_SIGMA_SMOKE else (k - 1) % len(files)
             var cst = SafeTensors.open(files[slot])
-            img_tokens = _load_host_f32(cst, String("latent"), ctx)
+            var latent_cache = _load_cache_preserving_dtype(cst, String("latent"), ctx)
+            var latent_h = latent_cache.to_host_bf16(ctx)
+            for i in range(len(latent_h)):
+                img_tokens.append(latent_h[i].cast[DType.float32]())
             # txt embed may be stored as "t5_embed" or "txt_embed"
-            var txt_flat = _load_host_f32(cst, String("txt_embed"), ctx)
+            var txt_cache = _load_cache_preserving_dtype(cst, String("txt_embed"), ctx)
+            var txt_flat = txt_cache.to_host_bf16(ctx)
             var txt_seq = len(txt_flat) // Int(TXT_CH)
             for r in range(Int(N_TXT)):
                 if r < txt_seq:
                     for c in range(Int(TXT_CH)):
-                        txt_tokens.append(txt_flat[r * Int(TXT_CH) + c])
+                        txt_tokens.append(txt_flat[r * Int(TXT_CH) + c].cast[DType.float32]())
                 else:
                     for _ in range(Int(TXT_CH)):
                         txt_tokens.append(Float32(0.0))
@@ -456,10 +631,14 @@ def main() raises:
         )
 
         # ── grad norm + clip(1.0) ──
-        var gn_before = _clip(grads, CLIP_GRAD_NORM)
+        var gn_before = _clip(grads, train_cfg.max_grad_norm)
 
         # ── AdamW ──
-        qwen_offload_lora_adamw_step(lora, grads, k, LR, ctx)
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        qwen_offload_lora_adamw_step(
+            lora, grads, k, step_lr, ctx,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+        )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -471,6 +650,27 @@ def main() raises:
         if grads.nonfinite_lora_grads != 0:
             print("[QwenImage-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
+        var saved_this_step = False
+        if train_cfg.save_every > 0 and k % train_cfg.save_every == 0:
+            var ckpt_path = _step_lora_path(output_lora_path, k)
+            _ = save_qwen_lora(lora, ckpt_path, ctx)
+            var ckpt_state = qwen_state_path_for_lora(ckpt_path)
+            _ = save_qwen_lora_state(lora, ckpt_state, ctx)
+            saved_this_step = True
+            print("[checkpoint] saved step=", k, " state=", ckpt_state)
+        if should_sample_completed_step(sample_cadence, k):
+            if qwen_should_save_before_sample(sample_cadence, k, saved_this_step):
+                var pre_sample_path = _step_lora_path(output_lora_path, k)
+                _ = save_qwen_lora(lora, pre_sample_path, ctx)
+                var pre_sample_state = qwen_state_path_for_lora(pre_sample_path)
+                _ = save_qwen_lora_state(lora, pre_sample_state, ctx)
+                print("[checkpoint] saved before sample step=", k, " state=", pre_sample_state)
+            print(
+                "[cadence] sample due at completed_step=", k,
+                " sample_file=", sample_cadence.sample_definition_file_name,
+                " (Qwen validation sampler not wired in this bounded trainer)",
+            )
+
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
     var b_absum_final = Float32(0.0)
@@ -481,6 +681,7 @@ def main() raises:
         print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        _ = save_qwen_lora(lora, String(LORA_DIR) + String("/qwenimage_lora_smoke.safetensors"), ctx)
+        _ = save_qwen_lora(lora, output_lora_path, ctx)
+        _ = save_qwen_lora_state(lora, qwen_state_path_for_lora(output_lora_path), ctx)
     else:
         print("RESULT: FAIL trains=", trains)

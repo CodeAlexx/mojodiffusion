@@ -53,6 +53,7 @@
 #       serenitymojo/training/train_anima_real.mojo -o /tmp/train_anima_real
 #   /tmp/train_anima_real
 
+from std.sys import argv
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp, isfinite
@@ -63,13 +64,12 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.norm import rms_norm
 
-from serenitymojo.models.anima.config import anima
+from serenitymojo.models.anima.config import ANIMA_CONFIG
 from serenitymojo.models.anima.weights import (
     AnimaStackBase, load_anima_stack_base, verify_anima_stack_shapes,
 )
@@ -77,7 +77,7 @@ from serenitymojo.models.anima.lora_block import ANIMA_SLOTS
 from serenitymojo.models.anima.anima_stack_lora import (
     AnimaLoraSet, AnimaLoraGrads, build_anima_lora_set,
     anima_stack_lora_forward_streamed, anima_stack_lora_backward_streamed,
-    anima_lora_adamw_step, save_anima_lora,
+    anima_lora_adamw_step, save_anima_lora, save_anima_lora_state,
 )
 from serenitymojo.models.dit.anima_contract import (
     ANIMA_HIDDEN, ANIMA_NUM_HEADS, ANIMA_HEAD_DIM, ANIMA_DEPTH,
@@ -86,6 +86,32 @@ from serenitymojo.models.dit.anima_contract import (
 
 from serenitymojo.training.schedule import sample_timestep_sigmoid
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.train_config import TrainConfig, GRADIENT_CHECKPOINTING_ON
+from serenitymojo.training.onetrainer_cache_preflight import (
+    create_onetrainer_cache_preflight_plan,
+    validate_onetrainer_cache_preflight_plan,
+)
+from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.sample_prompt_config import (
+    SampleCadence, read_sample_cadence_config,
+    validate_step_sample_cadence, should_sample_completed_step,
+    next_sample_completed_step, sample_time_unit_name,
+    SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+)
+from serenitymojo.training.onetrainer_train_loop_policy import (
+    OT_GRAD_POLICY_ON_ONLY,
+    ot_cache_dir_from_train_config,
+    ot_fixed_output_lora_path_from_train_config,
+    ot_lr_for_optimizer_step,
+    ot_sample_cadence_from_train_config,
+    ot_sampling_enabled_checked,
+    ot_should_save_before_sample,
+    ot_should_save_checkpoint,
+    ot_state_path_for_lora,
+    ot_step_lora_path,
+    validate_ot_gradient_checkpointing_policy,
+    validate_ot_train_math_policy,
+)
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -104,15 +130,10 @@ comptime OUT_PATCH = C * PS * PS        # 64
 comptime S_TXT = ANIMA_MAX_SEQ_LEN  # 256 context tokens
 comptime EPS = Float32(1e-06)
 
-# ── Training config (mirrors train_anima.rs CLI defaults) ─────────────────────
-comptime RANK = 16
-comptime ALPHA = Float32(16.0)
-comptime LR = Float32(5.0e-5)          # rs:92 default 5e-5
+# ── Training config defaults (runtime source of truth is TrainConfig) ─────────
 comptime SIGMOID_SCALE = Float32(1.0)  # rs:99
-comptime FLOW_SHIFT = Float32(3.0)     # rs:107 canonical Anima discrete_flow_shift
-comptime CLIP_NORM = Float32(1.0)      # rs:988
 comptime SEED = UInt64(42)             # rs:71
-comptime RUN_STEPS = 6                 # short smoke (thermal-safe). Bump for real runs.
+comptime DEFAULT_RUN_STEPS = 6         # short smoke (thermal-safe). Pass 0 for config max_steps.
 # The DiT stack is templated on S_IMG (comptime). The cached latent grid can be
 # large (512^2 -> 64x64 latent -> S_IMG=1024); for a thermal/memory-safe smoke on
 # a shared 24GB 3090 we CROP the latent to LATENT_HW x LATENT_HW (top-left),
@@ -135,6 +156,115 @@ comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_synth_
 # Captured frozen LLM-adapter context [1,256,1024] (context_cond key).
 comptime CONTEXT_PATH = "/home/alex/EriDiffusion/inference-flame/output/anima_embeddings.safetensors"
 comptime LORA_OUT = "/home/alex/mojodiffusion/output/anima_lora_smoke.safetensors"
+
+
+def _is_nonnegative_int(s: String) -> Bool:
+    if s.byte_length() == 0:
+        return False
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        if bs[i] < 0x30 or bs[i] > 0x39:
+            return False
+    return True
+
+
+def _parse_nonnegative_int(s: String) raises -> Int:
+    if not _is_nonnegative_int(s):
+        raise Error(String("expected non-negative integer, got ") + s)
+    var out = 0
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        out = out * 10 + Int(bs[i] - 0x30)
+    return out
+
+
+def validate_anima_train_config(cfg: TrainConfig) raises:
+    if cfg.name != String("anima") and cfg.name != String("ANIMA"):
+        raise Error(String("Anima trainer config requires model_type=anima/ANIMA, got ") + cfg.name)
+    if cfg.checkpoint == String(""):
+        raise Error("Anima trainer config must set checkpoint")
+    if cfg.n_heads != H:
+        raise Error(String("Anima config num_heads ") + String(cfg.n_heads) + String(" != H ") + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("Anima config head_dim ") + String(cfg.head_dim) + String(" != Dh ") + String(Dh))
+    if cfg.d_model != D:
+        raise Error(String("Anima config inner_dim ") + String(cfg.d_model) + String(" != D ") + String(D))
+    if cfg.in_channels != IN_PATCH:
+        raise Error(String("Anima config in_channels ") + String(cfg.in_channels) + String(" != IN_PATCH ") + String(IN_PATCH))
+    if cfg.joint_attention_dim != JOINT:
+        raise Error(
+            String("Anima config joint_attention_dim ")
+            + String(cfg.joint_attention_dim) + String(" != JOINT ") + String(JOINT)
+        )
+    if cfg.out_channels != OUT_PATCH:
+        raise Error(String("Anima config out_channels ") + String(cfg.out_channels) + String(" != OUT_PATCH ") + String(OUT_PATCH))
+    if cfg.num_double != 0 or cfg.num_single != ANIMA_DEPTH:
+        raise Error(
+            String("Anima trainer requires 0 double-stream blocks and ")
+            + String(ANIMA_DEPTH) + String(" single blocks; got double=")
+            + String(cfg.num_double) + String(" single=") + String(cfg.num_single)
+        )
+    if cfg.mlp_hidden != F:
+        raise Error(String("Anima config mlp_hidden ") + String(cfg.mlp_hidden) + String(" != F ") + String(F))
+    if cfg.timestep_dim != D:
+        raise Error(String("Anima config timestep_dim ") + String(cfg.timestep_dim) + String(" != D ") + String(D))
+    if cfg.lora_rank <= 0:
+        raise Error("Anima trainer config requires lora_rank > 0")
+    if cfg.lora_alpha <= Float32(0.0):
+        raise Error("Anima trainer config requires lora_alpha > 0")
+    if cfg.lr <= Float32(0.0):
+        raise Error("Anima trainer config requires learning_rate > 0")
+    if cfg.max_grad_norm <= Float32(0.0):
+        raise Error("Anima trainer config requires max_grad_norm > 0")
+    validate_ot_train_math_policy(cfg, String("Anima trainer"))
+    if cfg.max_steps <= 0:
+        raise Error("Anima trainer config requires max_steps > 0")
+    if cfg.save_every < 0:
+        raise Error("Anima trainer config requires save_every >= 0")
+    validate_ot_gradient_checkpointing_policy(
+        cfg, String("Anima trainer"), OT_GRAD_POLICY_ON_ONLY
+    )
+
+
+def anima_offload_policy_from_train_config(cfg: TrainConfig) raises -> String:
+    validate_anima_train_config(cfg)
+    return String("sync_streamed_block_recompute")
+
+
+def anima_sample_cadence_from_train_config(
+    cfg_path: String, cfg: TrainConfig,
+) raises -> SampleCadence:
+    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+
+
+def anima_sampling_enabled(cadence: SampleCadence) raises -> Bool:
+    return ot_sampling_enabled_checked(cadence)
+
+
+def anima_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
+    return ot_should_save_checkpoint(cfg, completed_step)
+
+
+def anima_should_save_before_sample(
+    cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
+) raises -> Bool:
+    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+
+
+def anima_cache_dir_from_train_config(cfg: TrainConfig) -> String:
+    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+
+
+def anima_output_lora_path_from_train_config(cfg: TrainConfig) -> String:
+    return ot_fixed_output_lora_path_from_train_config(cfg, String(LORA_OUT))
+
+
+def anima_state_path_for_lora(lora_path: String) -> String:
+    return ot_state_path_for_lora(lora_path)
+
+
+def _step_lora_path(base_path: String, completed_step: Int) -> String:
+    return ot_step_lora_path(base_path, completed_step)
 
 
 # ── deterministic host gaussian noise (Box-Muller on a PCG stream) ────────────
@@ -174,13 +304,30 @@ def _clamp(x: Float32, lo: Float32, hi: Float32) -> Float32:
     return x
 
 
-# ── load a cache tensor as host F32 (BF16/F32 view -> upcast) ─────────────────
-def _cache_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
+# ── load a cache tensor preserving its safetensors storage dtype ──────────────
+def _cache_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
     var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t^, STDtype.F32, ctx)
+    return t^
+
+
+def _host_f32_for_step_math(t: Tensor, ctx: DeviceContext) raises -> List[Float32]:
+    """Stage cache tensors through their stored dtype before host step math."""
+    if t.dtype() == STDtype.BF16:
+        var bf = t.to_host_bf16(ctx)
+        var out = List[Float32]()
+        for i in range(len(bf)):
+            out.append(bf[i].cast[DType.float32]())
+        return out^
+    if t.dtype() == STDtype.F16:
+        var hf = t.to_host_f16(ctx)
+        var out = List[Float32]()
+        for i in range(len(hf)):
+            out.append(hf[i].cast[DType.float32]())
+        return out^
+    return t.to_host(ctx)
 
 
 # ── patchify INPUT layout: 5D channels-last [B,T,H,W,C] -> patches [B*N, 68].
@@ -362,15 +509,56 @@ def _clip(mut grads: AnimaLoraGrads, max_norm: Float32):
 
 
 def main() raises:
+    var args = argv()
+    var cfg_path = String(ANIMA_CONFIG)
+    var run_steps = DEFAULT_RUN_STEPS
+    if len(args) >= 2:
+        var arg1 = String(args[1])
+        if _is_nonnegative_int(arg1):
+            run_steps = _parse_nonnegative_int(arg1)
+        else:
+            cfg_path = arg1^
+    if len(args) >= 3:
+        run_steps = _parse_nonnegative_int(String(args[2]))
+
+    var cfg = read_model_config(cfg_path)
+    validate_anima_train_config(cfg)
+    var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
+    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var offload_policy = anima_offload_policy_from_train_config(cfg)
+    var sample_cadence = anima_sample_cadence_from_train_config(cfg_path, cfg)
+    var sample_enabled = anima_sampling_enabled(sample_cadence)
+    if run_steps <= 0:
+        run_steps = cfg.max_steps
+    if run_steps > cfg.max_steps:
+        run_steps = cfg.max_steps
+    var lora_out = anima_output_lora_path_from_train_config(cfg)
+    var cache_dir = anima_cache_dir_from_train_config(cfg)
+    if cfg.only_cache:
+        print("[Anima-lora] only_cache requested; no train steps will run in this trainer")
+        return
+
     var ctx = DeviceContext()
     print("==== train_anima_real — ANIMA LoRA REAL training run ====")
+    print("config:", cfg_path)
     print("dims: D=", D, " H=", H, " Dh=", Dh, " F=", F, " DEPTH=", ANIMA_DEPTH,
-          " RANK=", RANK, " ALPHA=", ALPHA)
-    print("lr=", LR, " sigmoid_scale=", SIGMOID_SCALE, " flow_shift=", FLOW_SHIFT,
-          " steps=", RUN_STEPS)
+          " RANK=", cfg.lora_rank, " ALPHA=", cfg.lora_alpha)
+    print("lr=", cfg.lr, " sigmoid_scale=", SIGMOID_SCALE, " flow_shift=", cfg.timestep_shift,
+          " steps=", run_steps, " config_max_steps=", cfg.max_steps)
+    print("save_every=", cfg.save_every, " offload_policy=", offload_policy)
+    print("cache_dir=", cache_dir)
+    print(
+        "cadence: sample_after=", sample_cadence.sample_after,
+        " unit=", sample_time_unit_name(sample_cadence.sample_after_unit),
+        " skip_first=", sample_cadence.sample_skip_first,
+        " sample_file=", sample_cadence.sample_definition_file_name,
+        " enabled=", sample_enabled,
+    )
+    if sample_enabled:
+        var next_sample = next_sample_completed_step(sample_cadence, 0, cfg.max_steps)
+        print("[cadence] Anima validation sampler is not wired in this training path; next configured sample step=", next_sample)
 
     # ── open the real DiT checkpoint (streamed per-block) ──
-    var cfg = anima()
     print("checkpoint:", cfg.checkpoint)
     var st = SafeTensors.open(cfg.checkpoint)
     verify_anima_stack_shapes(st, ANIMA_DEPTH)
@@ -378,7 +566,7 @@ def main() raises:
     print("base projections + t_embedder loaded (F32 resident)")
 
     # ── load cached sample (latent + frozen context) ──
-    var cache_path = String(CACHE_DIR) + "/sample0.safetensors"
+    var cache_path = cache_dir + "/sample0.safetensors"
     print("cache:", cache_path)
     var cache = SafeTensors.open(cache_path)
     var lat_info = cache.tensor_info("latent")
@@ -400,7 +588,8 @@ def main() raises:
     print("latent [B,", Cd, full_H, full_W, "] cropped ->", Hd, "x", Wd,
           " -> S_IMG =", S_IMG)
 
-    var lat_full = _cache_f32(cache, "latent", ctx).to_host(ctx)  # BCHW flat
+    var latent_cache = _cache_tensor(cache, "latent", ctx)
+    var lat_full = _host_f32_for_step_math(latent_cache, ctx)  # BCHW flat
     # channels-last cropped: dst [B,Hd,Wd,C] = src[b,c, h, w] (h,w in crop window)
     var lat_bthwc = List[Float32]()
     lat_bthwc.reserve(B * Hd * Wd * Cd)
@@ -417,7 +606,8 @@ def main() raises:
     # frozen LLM-adapter context [B,256,1024] (captured sidecar context_cond).
     print("context:", CONTEXT_PATH)
     var ctx_st = SafeTensors.open(CONTEXT_PATH)
-    var context = _cache_f32(ctx_st, "context_cond", ctx).to_host(ctx)
+    var context_cache = _cache_tensor(ctx_st, "context_cond", ctx)
+    var context = _host_f32_for_step_math(context_cache, ctx)
     var ctx_n = len(context)
     if ctx_n != B * S_TXT * JOINT:
         raise Error("context numel " + String(ctx_n) + " != B*S_TXT*JOINT="
@@ -429,7 +619,7 @@ def main() raises:
     var ropes = _rope_tables(S_IMG, ctx)
 
     # ── build the LoRA set (B=0 init -> PEFT identity at step 0) ──
-    var lora = build_anima_lora_set(ANIMA_DEPTH, D, JOINT, F, RANK, ALPHA)
+    var lora = build_anima_lora_set(ANIMA_DEPTH, D, JOINT, F, cfg.lora_rank, cfg.lora_alpha)
     var n_adapters = ANIMA_DEPTH * ANIMA_SLOTS
     var b_init = Float32(0.0)
     for i in range(n_adapters):
@@ -442,23 +632,23 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
-    for step in range(RUN_STEPS):
+    for step in range(run_steps):
         var step_t0 = perf_counter_ns()
         # ── timestep sampling (sigmoid -> shift -> clamp), rs:328-834 ──
         # In FIXED_SIGMA_SMOKE we hold sigma + the noise draw constant so the
         # target is identical every step (loss-decrease isolation, see header).
         var sigma = FIXED_SIGMA
-        if not FIXED_SIGMA_SMOKE:
+        comptime if not FIXED_SIGMA_SMOKE:
             var sigma_seed = SEED * UInt64(7919) + UInt64(step) * UInt64(2654435761)
             var sigma0 = sample_timestep_sigmoid(sigma_seed, SIGMOID_SCALE, Float32(0.0))
-            sigma = _apply_shift(sigma0, FLOW_SHIFT)
+            sigma = _apply_shift(sigma0, cfg.timestep_shift)
             sigma = _clamp(sigma, Float32(1.0e-5), Float32(1.0) - Float32(1.0e-5))
 
         # ── flow-matching noise + target at LATENT level (rs:859-863) ──
         #   noisy  = sigma*noise + (1-sigma)*latent
         #   target = noise - latent
         var noise_seed = SEED * UInt64(104729)
-        if not FIXED_SIGMA_SMOKE:
+        comptime if not FIXED_SIGMA_SMOKE:
             noise_seed += UInt64(step)
         var noise = _host_noise(n_lat, noise_seed)
         var noisy = List[Float32]()
@@ -506,8 +696,13 @@ def main() raises:
 
         # ── global-norm clip (1.0) then AdamW over all adapters ──
         var gn_before = _global_norm(grads)
-        _clip(grads, CLIP_NORM)
-        anima_lora_adamw_step(lora, grads, step + 1, LR, ctx)
+        _clip(grads, cfg.max_grad_norm)
+        var completed_step = step + 1
+        var step_lr = ot_lr_for_optimizer_step(cfg, completed_step)
+        anima_lora_adamw_step(
+            lora, grads, completed_step, step_lr, ctx,
+            cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+        )
 
         # diagnostics
         var b_after = Float32(0.0)
@@ -529,7 +724,7 @@ def main() raises:
 
         var step_now = perf_counter_ns()
         print_trainer_progress(
-            String("Anima-lora"), step + 1, RUN_STEPS, 1,
+            String("Anima-lora"), step + 1, run_steps, 1,
             loss, Float64(gn_before),
             Float64(step_now - step_t0) / 1.0e9, 0.0,
             Float64(step_now - t0) / 1.0e9,
@@ -537,17 +732,40 @@ def main() raises:
         if grads.nonfinite_lora_grads != 0:
             print("[Anima-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
+        var saved_this_step = False
+        if anima_should_save_checkpoint(cfg, completed_step):
+            var ckpt_path = _step_lora_path(lora_out, completed_step)
+            _ = save_anima_lora(lora, ckpt_path, ctx)
+            var ckpt_state = anima_state_path_for_lora(ckpt_path)
+            _ = save_anima_lora_state(lora, ckpt_state, ctx)
+            saved_this_step = True
+            print("[checkpoint] saved step=", completed_step, " state=", ckpt_state)
+        if sample_enabled and should_sample_completed_step(sample_cadence, completed_step):
+            if anima_should_save_before_sample(sample_cadence, completed_step, saved_this_step):
+                var pre_sample_path = _step_lora_path(lora_out, completed_step)
+                _ = save_anima_lora(lora, pre_sample_path, ctx)
+                var pre_sample_state = anima_state_path_for_lora(pre_sample_path)
+                _ = save_anima_lora_state(lora, pre_sample_state, ctx)
+                print("[checkpoint] saved before sample step=", completed_step, " state=", pre_sample_state)
+            print(
+                "[cadence] sample due at completed_step=", completed_step,
+                " sample_file=", sample_cadence.sample_definition_file_name,
+                " (Anima validation sampler not wired in this training path)",
+            )
+
     var t1 = perf_counter_ns()
     var secs = Float64(t1 - t0) / 1.0e9
     print("")
     print("---- training summary ----")
-    print("steps:", RUN_STEPS, " wall:", secs, "s  (", secs / Float64(RUN_STEPS), "s/step)")
+    print("steps:", run_steps, " wall:", secs, "s  (", secs / Float64(run_steps), "s/step)")
     print("loss first =", first_loss, "  last =", last_loss,
           "  delta =", last_loss - first_loss)
 
     # ── final LoRA save (kohya net.blocks.<i>.* keys, rs:1136-1155) ──
-    var npairs = save_anima_lora(lora, String(LORA_OUT), ctx)
-    print("saved", npairs, "LoRA adapter pairs to", LORA_OUT)
+    var npairs = save_anima_lora(lora, lora_out, ctx)
+    print("saved", npairs, "LoRA adapter pairs to", lora_out)
+    var nstate = save_anima_lora_state(lora, anima_state_path_for_lora(lora_out), ctx)
+    print("saved", nstate, "LoRA adapter state pairs to", anima_state_path_for_lora(lora_out))
 
     var b_final = Float32(0.0)
     var b_nz = 0

@@ -2,6 +2,7 @@
   "model_type": "sdxl",
   "checkpoint": "/home/alex/.serenity/models/checkpoints/sdxl_unet_bf16.safetensors",
   "vae": "/home/alex/madebyollin_sdxl-vae-fp16-fix/sdxl_vae.safetensors",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json",
 
   "in_channels": 4,
   "out_channels": 4,

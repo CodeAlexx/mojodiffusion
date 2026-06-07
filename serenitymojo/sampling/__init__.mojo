@@ -7,8 +7,8 @@
 #   flow_match  — Z-Image rectified-flow Euler scheduler and Qwen-Image helpers.
 #   sdxl_euler  — SDXL EulerDiscreteScheduler scalar setup plus GPU CFG/update.
 #   sd15_euler  — SD1.5 EulerDiscreteScheduler wrapper around the same schedule.
-#   flux2_klein — FLUX.2/Klein dynamic-mu/fixed-shift schedules plus GPU
-#                 CFG/update helpers.
+#   flux2_klein — shared FLUX.2 dev/Klein dynamic-mu/fixed-shift schedules plus
+#                 GPU CFG/update helpers.
 #   flux1_dev   — FLUX.1-dev BFL time-shift schedule and packed-latent plan.
 #   sd3_flow_match — SD3 shifted-flow schedule plus textbook CFG/update helpers.
 #   lens_flowmatch — Microsoft Lens N-sigma dynamic FlowMatch scalar schedule.

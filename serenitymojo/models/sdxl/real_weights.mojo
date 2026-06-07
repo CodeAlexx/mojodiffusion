@@ -5,8 +5,8 @@
 # This is the missing piece between the parity-gated block units (which used
 # SYNTHETIC weights) and a REAL run: it builds the SAME structs the gated
 # forward/backward consume, but from real disk tensors. NO new ops/ primitive
-# (Tenet 1) — pure key→tensor assembly reusing weights._load_f32 / _load_conv_rscf
-# and the proven load_resblock_weights.
+# (Tenet 1) — pure key→tensor assembly reusing the proven SDXL ResBlock and
+# checkpoint-dtype conv loaders.
 #
 # Keys verified vs the live checkpoint (1680 tensors, prefix-stripped):
 #   time_embed.0/2.weight|bias              [1280,320]/[1280] , [1280,1280]/[1280]
@@ -20,7 +20,9 @@
 #   <st>.transformer_blocks.<j>.ff.net.0.proj.weight|bias        [2*Cff,C]/[2*Cff]
 #   <st>.transformer_blocks.<j>.ff.net.2.weight|bias             [C,Cff]/[C]
 #
-# All returned F32 (training compute dtype); conv filters RSCF [Kh,Kw,Cin,Cout].
+# Embedding, SpatialTransformer, final-GN, ResBlock, and conv tensors preserve
+# checkpoint dtype. Conv filters are remapped OIHW -> RSCF without widening
+# BF16/F16 host lists.
 
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
@@ -29,10 +31,11 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
-from serenitymojo.ops.cast import cast_tensor
 
 from serenitymojo.models.sdxl.embed import EmbWeights
-from serenitymojo.models.sdxl.weights import ResBlockWeights, load_resblock_weights
+from serenitymojo.models.sdxl.weights import (
+    ResBlockWeights, load_resblock_weights, load_conv_rscf_checkpoint_dtype,
+)
 from serenitymojo.models.sdxl.spatial_transformer import (
     AttnWeights, BasicTransformerBlockWeights, SpatialTransformerWeights,
 )
@@ -40,26 +43,25 @@ from serenitymojo.models.sdxl.spatial_transformer import (
 comptime TArc = ArcPointer[Tensor]
 
 
-# ── one named tensor as an F32 device Tensor (mirrors weights._load_f32) ──────
-def _f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
+# ── one named tensor preserving checkpoint storage dtype ─────────────────────
+def _tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return cast_tensor(t, STDtype.F32, ctx)
+    return Tensor.from_view(tv, ctx)
 
 
 def _arc(st: SafeTensors, name: String, ctx: DeviceContext) raises -> TArc:
-    return TArc(_f32(st, name, ctx))
+    return TArc(_tensor(st, name, ctx))
 
 
 # ── EmbWeights (time + label MLPs) ────────────────────────────────────────────
 def load_emb_weights(st: SafeTensors, ctx: DeviceContext) raises -> EmbWeights:
     return EmbWeights(
-        _f32(st, String("time_embed.0.weight"), ctx), _f32(st, String("time_embed.0.bias"), ctx),
-        _f32(st, String("time_embed.2.weight"), ctx), _f32(st, String("time_embed.2.bias"), ctx),
-        _f32(st, String("label_emb.0.0.weight"), ctx), _f32(st, String("label_emb.0.0.bias"), ctx),
-        _f32(st, String("label_emb.0.2.weight"), ctx), _f32(st, String("label_emb.0.2.bias"), ctx),
+        _tensor(st, String("time_embed.0.weight"), ctx), _tensor(st, String("time_embed.0.bias"), ctx),
+        _tensor(st, String("time_embed.2.weight"), ctx), _tensor(st, String("time_embed.2.bias"), ctx),
+        _tensor(st, String("label_emb.0.0.weight"), ctx), _tensor(st, String("label_emb.0.0.bias"), ctx),
+        _tensor(st, String("label_emb.0.2.weight"), ctx), _tensor(st, String("label_emb.0.2.bias"), ctx),
     )
 
 
@@ -103,30 +105,11 @@ def load_st_weights(
 
 # ── conv_in / conv_out / final-GN (loose tensors the stack threads directly) ──
 def load_conv_rscf(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
-    # OIHW [Cout,Cin,Kh,Kw] -> RSCF [Kh,Kw,Cin,Cout]; same remap as weights._load_conv_rscf.
-    var w = _f32(st, name, ctx)
-    var sh = w.shape()
-    if len(sh) != 4:
-        raise Error(String("conv weight ") + name + " not rank-4 OIHW")
-    var cout = sh[0]; var cin = sh[1]; var kh = sh[2]; var kw = sh[3]
-    var host = w.to_host(ctx)
-    var rscf = List[Float32]()
-    for _ in range(kh * kw * cin * cout):
-        rscf.append(0.0)
-    for o in range(cout):
-        for ci in range(cin):
-            for r in range(kh):
-                for s in range(kw):
-                    var src = ((o * cin + ci) * kh + r) * kw + s
-                    var dst = ((r * kw + s) * cin + ci) * cout + o
-                    rscf[dst] = host[src]
-    var rshape = List[Int]()
-    rshape.append(kh); rshape.append(kw); rshape.append(cin); rshape.append(cout)
-    return Tensor.from_host(rscf, rshape^, STDtype.F32, ctx)
+    return load_conv_rscf_checkpoint_dtype(st, name, ctx)
 
 
 def load_bias(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
-    return _f32(st, name, ctx)
+    return _tensor(st, name, ctx)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -141,8 +124,8 @@ def build_sdxl_real_weights(st: SafeTensors, ctx: DeviceContext) raises -> SdxlR
     var emb = load_emb_weights(st, ctx)
     var conv_in_w = load_conv_rscf(st, String("input_blocks.0.0.weight"), ctx)
     var conv_in_b = load_bias(st, String("input_blocks.0.0.bias"), ctx)
-    var out_gn_w = _f32(st, String("out.0.weight"), ctx)
-    var out_gn_b = _f32(st, String("out.0.bias"), ctx)
+    var out_gn_w = _tensor(st, String("out.0.weight"), ctx)
+    var out_gn_b = _tensor(st, String("out.0.bias"), ctx)
     var conv_out_w = load_conv_rscf(st, String("out.2.weight"), ctx)
     var conv_out_b = load_bias(st, String("out.2.bias"), ctx)
 

@@ -78,11 +78,14 @@ def to_bf16_round(x):
 def adamw_step_f32(p, g, m, v, t, lr, b1, b2, eps, wd):
     """One AdamW (decoupled-WD) step, F32 numpy. Mirrors training/optim.mojo
     _adamw_kernel exactly: moments in F32, bias correction 1-beta^t, decoupled
-    weight decay applied to p AFTER the Adam step. Returns (p, m, v) updated."""
+    weight decay applied to p before the adaptive Adam subtraction. Returns
+    (p, m, v) updated."""
     p = p.astype(np.float32).copy()
     g = g.astype(np.float32)
     m = m.astype(np.float32).copy()
     v = v.astype(np.float32).copy()
+    if wd > 0.0:
+        p = p * (np.float32(1.0) - np.float32(lr) * np.float32(wd))
     m = b1 * m + (1.0 - b1) * g
     v = b2 * v + (1.0 - b2) * g * g
     bc1 = np.float32(1.0 - b1 ** t)
@@ -90,8 +93,6 @@ def adamw_step_f32(p, g, m, v, t, lr, b1, b2, eps, wd):
     mhat = m / bc1
     vhat = v / bc2
     p = p - np.float32(lr) * mhat / (np.sqrt(vhat) + np.float32(eps))
-    if wd > 0.0:
-        p = p - np.float32(lr) * np.float32(wd) * p
     return p, m, v
 
 

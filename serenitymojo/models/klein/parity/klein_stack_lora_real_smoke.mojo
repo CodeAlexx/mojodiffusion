@@ -2,11 +2,11 @@
 #
 # REAL-WEIGHT FINITE + ROUND-TRIP SMOKE for the Klein FULL DiT STACK *WITH LoRA*.
 # Loads REAL Klein-9B weights (8 double + 24 single blocks + input projections +
-# modulation MLP + final layer), builds the full KleinLoraSet (8×4 + 24×2 = 80
+# modulation MLP + final layer), builds the full KleinLoraSet (8×12 + 24×2 = 144
 # adapters), runs klein_stack_lora_forward + klein_stack_lora_backward at REAL
 # dims (D=4096, H=32, Dh=128, F=12288) with per-block recompute, then:
 #   1. asserts every forward output + every collected LoRA d_A/d_B is FINITE,
-#   2. runs ONE klein_lora_adamw_step on all 80 adapters (asserts A/B stay finite
+#   2. runs ONE klein_lora_adamw_step on all 144 adapters (asserts A/B stay finite
 #      and B moved off zero — proving the step actually updated trained params),
 #   3. saves the set with save_klein_lora and reloads it byte-exact, asserting
 #      the reloaded A/B match the in-memory A/B exactly (round-trip).
@@ -32,6 +32,7 @@ from serenitymojo.models.klein.klein_stack_lora import (
     KleinLoraSet, build_klein_lora_set,
     klein_stack_lora_forward, klein_stack_lora_backward,
     klein_lora_adamw_step, save_klein_lora, klein_lora_prefixes,
+    DBL_SLOTS,
 )
 from serenitymojo.models.klein.weights import (
     load_double_block_weights, load_single_block_weights,
@@ -76,10 +77,29 @@ def _all_finite(h: List[Float32]) -> Bool:
     return True
 
 
+def _all_finite(h: List[BFloat16]) -> Bool:
+    for i in range(len(h)):
+        var v = h[i].cast[DType.float32]()
+        if v != v:
+            return False
+        var a = v if v >= 0.0 else -v
+        if a > Float32(1.0e30):
+            return False
+    return True
+
+
 def _abs_sum(h: List[Float32]) -> Float32:
     var s = Float32(0.0)
     for i in range(len(h)):
         var v = h[i]
+        s += v if v >= 0.0 else -v
+    return s
+
+
+def _abs_sum(h: List[BFloat16]) -> Float32:
+    var s = Float32(0.0)
+    for i in range(len(h)):
+        var v = h[i].cast[DType.float32]()
         s += v if v >= 0.0 else -v
     return s
 
@@ -100,6 +120,18 @@ def _max_abs_diff(a: List[Float32], b: List[Float32]) -> Float32:
     var m = Float32(0.0)
     for i in range(len(a)):
         var d = a[i] - b[i]
+        var ad = d if d >= 0.0 else -d
+        if ad > m:
+            m = ad
+    return m
+
+
+def _max_abs_diff(a: List[Float32], b: List[BFloat16]) -> Float32:
+    if len(a) != len(b):
+        return Float32(1.0e30)
+    var m = Float32(0.0)
+    for i in range(len(a)):
+        var d = a[i] - b[i].cast[DType.float32]()
         var ad = d if d >= 0.0 else -d
         if ad > m:
             m = ad
@@ -141,9 +173,9 @@ def main() raises:
         sbw.append(load_single_block_weights(st, bi, ctx))
     print("  loaded", len(dbw), "double +", len(sbw), "single block weights")
 
-    # ── build the full LoRA set (80 adapters) ──
-    var lora = build_klein_lora_set(NUM_DOUBLE, NUM_SINGLE, D, RANK, ALPHA)
-    var total_adapters = NUM_DOUBLE * 4 + NUM_SINGLE * 2
+    # ── build the full OneTrainer split-slot LoRA set (144 adapters) ──
+    var lora = build_klein_lora_set(NUM_DOUBLE, NUM_SINGLE, D, F, RANK, ALPHA)
+    var total_adapters = NUM_DOUBLE * DBL_SLOTS + NUM_SINGLE * 2
     print("  built KleinLoraSet:", len(lora.dbl), "double-slot +", len(lora.sgl),
           "single-slot adapters (expect", total_adapters, ")")
 
@@ -182,7 +214,7 @@ def main() raises:
     if not _all_finite(g.d_img_mod): print("  d_img_mod NOT finite"); ok = False
     if not _all_finite(g.d_txt_mod): print("  d_txt_mod NOT finite"); ok = False
     if not _all_finite(g.d_single_mod): print("  d_single_mod NOT finite"); ok = False
-    var nd = NUM_DOUBLE * 4
+    var nd = NUM_DOUBLE * DBL_SLOTS
     for i in range(nd):
         if not _all_finite(g.dbl_d_a[i]) or not _all_finite(g.dbl_d_b[i]):
             print("  double LoRA grad slot", i, "NOT finite"); ok = False
@@ -226,17 +258,17 @@ def main() raises:
     var st2 = SafeTensors.open(SAVE_PATH)
     var prefixes = klein_lora_prefixes(NUM_DOUBLE, NUM_SINGLE)
     var max_diff = Float32(0.0)
-    # walk the flat order: first NUM_DOUBLE*4 prefixes are double slots, rest single.
+    # walk the flat order: first NUM_DOUBLE*DBL_SLOTS prefixes are double slots, rest single.
     for i in range(nd):
-        var ra = _read_f32(st2, prefixes[i] + ".lora_A.weight", ctx)
-        var rb = _read_f32(st2, prefixes[i] + ".lora_B.weight", ctx)
+        var ra = _read_f32(st2, prefixes[i] + ".lora_down.weight", ctx)
+        var rb = _read_f32(st2, prefixes[i] + ".lora_up.weight", ctx)
         var da = _max_abs_diff(ra, lora.dbl[i].a)
         var db = _max_abs_diff(rb, lora.dbl[i].b)
         if da > max_diff: max_diff = da
         if db > max_diff: max_diff = db
     for i in range(ns):
-        var ra = _read_f32(st2, prefixes[nd + i] + ".lora_A.weight", ctx)
-        var rb = _read_f32(st2, prefixes[nd + i] + ".lora_B.weight", ctx)
+        var ra = _read_f32(st2, prefixes[nd + i] + ".lora_down.weight", ctx)
+        var rb = _read_f32(st2, prefixes[nd + i] + ".lora_up.weight", ctx)
         var da = _max_abs_diff(ra, lora.sgl[i].a)
         var db = _max_abs_diff(rb, lora.sgl[i].b)
         if da > max_diff: max_diff = da

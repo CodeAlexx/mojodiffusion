@@ -8,19 +8,18 @@
 # match the PyTorch reference at cos >= 0.999 (training/parity/optim_*).
 #
 # ── AdamW decoupled weight decay (Loshchilov & Hutter, 2017) ─────────────────
-# Ported to match flame-core/src/adam.rs EXACTLY (and torch.optim.AdamW, NOT
-# Adam+L2). The per-element update is:
+# Ported to match torch.optim.AdamW / OneTrainer AdamW (NOT Adam+L2). The
+# per-element update is:
+#     if weight_decay > 0:  p = p * (1 - lr * weight_decay)  # DECOUPLED, on p
 #     m    = beta1*m + (1-beta1)*g
 #     v    = beta2*v + (1-beta2)*g*g
 #     mhat = m / (1 - beta1^t)
 #     vhat = v / (1 - beta2^t)
 #     p    = p - lr * mhat / (sqrt(vhat) + eps)
-#     if weight_decay > 0:  p -= lr * weight_decay * p     # DECOUPLED, on p
-# The weight-decay term is applied to `p` DIRECTLY after the Adam step. It must
-# NOT be folded into `g` before the moments — that is the Adam+L2 form, which
-# contaminates the adaptive rate and destroyed klein LoRA_A training (see the
-# receipt at the top of flame-core/src/adam.rs). The parity oracle exercises
-# weight_decay > 0 so this distinction is tested.
+# The weight-decay term is applied to `p` directly before the adaptive Adam
+# subtraction. It must NOT be folded into `g` before the moments — that is the
+# Adam+L2 form — and must not be moved after the adaptive subtraction. The parity
+# oracle exercises weight_decay > 0 so this distinction is tested.
 #
 # ── SGD ──────────────────────────────────────────────────────────────────────
 # PyTorch SGD-with-momentum (no Nesterov, no dampening):
@@ -75,7 +74,8 @@ comptime _BLOCK = 256
 # ── AdamW elementwise kernel (F32 param/grad/m/v) ────────────────────────────
 # Reads grad + old (m,v,p), writes new (m,v,p) in place. Bias correction
 # (bc1 = 1 - beta1^t, bc2 = 1 - beta2^t) is passed pre-computed by the host so
-# the kernel needs no `pow`. DECOUPLED WD applied to p AFTER the Adam step.
+# the kernel needs no `pow`. DECOUPLED WD is applied to p before the adaptive
+# Adam subtraction, matching PyTorch/OneTrainer AdamW order.
 def _adamw_kernel(
     p: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
@@ -94,6 +94,8 @@ def _adamw_kernel(
     if idx < n:
         var gv = rebind[Scalar[DType.float32]](g[idx])
         var pv = rebind[Scalar[DType.float32]](p[idx])
+        if weight_decay > 0.0:
+            pv = pv * (1.0 - lr * weight_decay)
         var mi = beta1 * rebind[Scalar[DType.float32]](m[idx]) + (1.0 - beta1) * gv
         var vi = beta2 * rebind[Scalar[DType.float32]](v[idx]) + (1.0 - beta2) * gv * gv
         m[idx] = rebind[m.element_type](mi)
@@ -101,8 +103,6 @@ def _adamw_kernel(
         var m_hat = mi / bc1
         var v_hat = vi / bc2
         pv = pv - lr * m_hat / (sqrt(v_hat) + eps)
-        if weight_decay > 0.0:
-            pv = pv - lr * weight_decay * pv
         p[idx] = rebind[p.element_type](pv)
 
 

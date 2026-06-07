@@ -55,13 +55,16 @@ from std.sys import argv
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
+from std.memory import alloc
 from std.time import perf_counter_ns
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
-from serenitymojo.io.ffi import sys_system
-from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.io.ffi import (
+    sys_system, sys_open, sys_close, sys_pwrite, BytePtr,
+    O_WRONLY, O_CREAT, O_TRUNC,
+)
 
 from serenitymojo.models.zimage.weights import (
     ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
@@ -79,9 +82,36 @@ from serenitymojo.models.zimage.real_weights import (
     ZImageRealAux, load_zimage_real_aux, build_adaln, build_block_modvecs,
     build_f_scale, build_cap_seq, build_x_seq, build_rope, build_positions,
 )
+from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.klein_dataset import KleinCache
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.sample_prompt_config import (
+    SampleCadence, read_sample_cadence_config,
+    validate_step_sample_cadence, should_sample_completed_step,
+    next_sample_completed_step, sample_time_unit_name,
+    SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+)
+from serenitymojo.training.onetrainer_train_loop_policy import (
+    OT_GRAD_POLICY_ON_ONLY,
+    ot_cache_dir_from_train_config,
+    ot_lr_for_optimizer_step,
+    ot_output_lora_path_from_train_config,
+    ot_sample_cadence_from_train_config,
+    ot_sampling_enabled,
+    ot_should_save_before_sample,
+    ot_should_save_checkpoint,
+    ot_step_lora_path,
+    validate_ot_gradient_checkpointing_policy,
+    validate_ot_train_math_policy,
+)
+from serenitymojo.training.train_config import (
+    TrainConfig, GRADIENT_CHECKPOINTING_ON,
+)
+from serenitymojo.training.onetrainer_cache_preflight import (
+    create_onetrainer_cache_preflight_plan,
+    validate_onetrainer_cache_preflight_plan,
+)
 
 
 # ── arch (Z-Image, from transformer config; H/Dh/D fixed comptime) ───────────
@@ -137,8 +167,231 @@ comptime SEED_BASE = UInt64(42)
 comptime TRANSFORMER_DIR = "/home/alex/.serenity/models/zimage_base/transformer"
 comptime CACHE_DIR = "/home/alex/mojodiffusion/output/alina_zimage_cache"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/alina_zimage"
+comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/zimage.json"
+comptime DEFAULT_RUN_STEPS = 5
 comptime TRAIN_ADAPTER_START = (NUM_NR + NUM_CR) * ZIMAGE_SLOTS
 comptime TRAIN_ADAPTER_COUNT = MAIN_DEPTH * ZIMAGE_SLOTS
+comptime ZIMAGE_GENERATE_SOURCE = "serenitymojo/pipeline/zimage_generate.mojo"
+comptime ZIMAGE_GENERATE_BINARY = "/tmp/zimage_generate_prod"
+
+
+def _is_nonnegative_int(s: String) -> Bool:
+    if s.byte_length() == 0:
+        return False
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        if bs[i] < 0x30 or bs[i] > 0x39:
+            return False
+    return True
+
+
+def _parse_nonnegative_int(s: String) raises -> Int:
+    if not _is_nonnegative_int(s):
+        raise Error(String("expected non-negative integer, got ") + s)
+    var out = 0
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        out = out * 10 + Int(bs[i] - 0x30)
+    return out
+
+
+def _close_f32(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
+    var d = a - b
+    if d < Float32(0.0):
+        d = -d
+    return d <= tol
+
+
+def zimage_patchified_out_channels(cfg: TrainConfig) -> Int:
+    return cfg.out_channels * PATCH * PATCH
+
+
+def validate_zimage_train_config(cfg: TrainConfig) raises:
+    if cfg.checkpoint == String(""):
+        raise Error("Z-Image trainer config must set checkpoint transformer dir")
+    if cfg.n_heads != H:
+        raise Error(String("Z-Image config n_heads ") + String(cfg.n_heads) + String(" != H ") + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("Z-Image config head_dim ") + String(cfg.head_dim) + String(" != Dh ") + String(Dh))
+    if cfg.d_model != D:
+        raise Error(String("Z-Image config d_model ") + String(cfg.d_model) + String(" != D ") + String(D))
+    if cfg.in_channels != LAT_C:
+        raise Error(String("Z-Image config in_channels ") + String(cfg.in_channels) + String(" != LAT_C ") + String(LAT_C))
+    if cfg.joint_attention_dim != CAP_DIM:
+        raise Error(String("Z-Image config joint_attention_dim ") + String(cfg.joint_attention_dim) + String(" != CAP_DIM ") + String(CAP_DIM))
+    if zimage_patchified_out_channels(cfg) != OUT_CH:
+        raise Error(
+            String("Z-Image config out_channels ") + String(cfg.out_channels)
+            + String(" with patch_size=2 gives ")
+            + String(zimage_patchified_out_channels(cfg))
+            + String(" patchified channels, expected ") + String(OUT_CH)
+        )
+    if cfg.num_double != 0 or cfg.num_single != MAIN_DEPTH:
+        raise Error(
+            String("Z-Image trainer requires 0 double blocks and ")
+            + String(MAIN_DEPTH)
+            + String(" main layers; got double=")
+            + String(cfg.num_double)
+            + String(" single=")
+            + String(cfg.num_single)
+        )
+    if cfg.mlp_hidden != F:
+        raise Error(String("Z-Image config mlp_hidden ") + String(cfg.mlp_hidden) + String(" != F ") + String(F))
+    if not _close_f32(Float32(cfg.rope_theta), ROPE_THETA):
+        raise Error(String("Z-Image config rope_theta ") + String(cfg.rope_theta) + String(" != ") + String(ROPE_THETA))
+    if cfg.lora_rank != RANK:
+        raise Error(
+            String("Z-Image trainer is compiled for lora_rank=")
+            + String(RANK)
+            + String("; parsed ")
+            + String(cfg.lora_rank)
+        )
+    if not _close_f32(cfg.lora_alpha, ALPHA):
+        raise Error("Z-Image trainer lora_alpha does not match compiled constant")
+    if not _close_f32(cfg.lr, LR, Float32(1.0e-9)):
+        raise Error("Z-Image trainer learning_rate does not match compiled constant")
+    if not _close_f32(cfg.timestep_shift, TIMESTEP_SHIFT):
+        raise Error("Z-Image trainer timestep_shift does not match compiled constant")
+    if not _close_f32(cfg.max_grad_norm, CLIP_GRAD_NORM):
+        raise Error("Z-Image trainer max_grad_norm does not match compiled constant")
+    validate_ot_train_math_policy(cfg, String("Z-Image trainer"))
+    validate_ot_gradient_checkpointing_policy(
+        cfg, String("Z-Image trainer"), OT_GRAD_POLICY_ON_ONLY
+    )
+
+
+def zimage_cache_dir_from_train_config(cfg: TrainConfig) -> String:
+    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+
+
+def zimage_transformer_dir_from_train_config(cfg: TrainConfig) -> String:
+    if cfg.checkpoint != String(""):
+        return cfg.checkpoint.copy()
+    return String(TRANSFORMER_DIR)
+
+
+def zimage_output_lora_path_from_train_config(cfg: TrainConfig, completed_step: Int) -> String:
+    return ot_output_lora_path_from_train_config(
+        cfg, String(LORA_DIR), String("zimage_lora"), completed_step
+    )
+
+
+def zimage_sample_cadence_from_train_config(
+    cfg_path: String, cfg: TrainConfig,
+) raises -> SampleCadence:
+    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+
+
+def zimage_sampling_enabled(cadence: SampleCadence) -> Bool:
+    return ot_sampling_enabled(cadence)
+
+
+def zimage_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
+    return ot_should_save_checkpoint(cfg, completed_step)
+
+
+def zimage_should_save_before_sample(
+    cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
+) raises -> Bool:
+    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+
+
+def _step_lora_path(base_path: String, step: Int) -> String:
+    return ot_step_lora_path(base_path, step)
+
+
+def zimage_sample_request_dir() -> String:
+    return String(LORA_DIR) + String("/sample_requests")
+
+
+def zimage_sample_request_path(completed_step: Int) -> String:
+    return (
+        zimage_sample_request_dir()
+        + String("/step")
+        + String(completed_step)
+        + String("_request.json")
+    )
+
+
+def zimage_sample_output_path(completed_step: Int) -> String:
+    return (
+        zimage_sample_request_dir()
+        + String("/step")
+        + String(completed_step)
+        + String("_sample.png")
+    )
+
+
+def zimage_sample_result_path(completed_step: Int) -> String:
+    return (
+        zimage_sample_request_dir()
+        + String("/step")
+        + String(completed_step)
+        + String("_sample_result.json")
+    )
+
+
+def _write_text_file(path: String, content: String) raises:
+    var fd = sys_open(path, O_CREAT | O_WRONLY | O_TRUNC, Int32(0o644))
+    if fd < 0:
+        raise Error(String("train_zimage_real: cannot create ") + path)
+    var n = content.byte_length()
+    var buf = alloc[UInt8](n if n > 0 else 1)
+    var src = content.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    var wrote = sys_pwrite(fd, BytePtr(unsafe_from_address=Int(buf)), n, 0)
+    buf.free()
+    _ = sys_close(fd)
+    if wrote != n:
+        raise Error(String("train_zimage_real: short write to ") + path)
+
+
+def _write_zimage_sample_request(
+    completed_step: Int,
+    lora_path: String,
+    state_path: String,
+    sample_file: String,
+) raises -> String:
+    """Queue validation sampling for a later standalone process.
+
+    Z-Image sampling loads Qwen3, the full transformer, and the VAE. Running it
+    inside this train process would co-reside those allocations with the trainer
+    and is not a safe 24GB product path.
+    """
+    var out_png = zimage_sample_output_path(completed_step)
+    var result_manifest = zimage_sample_result_path(completed_step)
+    var request_path = zimage_sample_request_path(completed_step)
+    var build_command = (
+        String("pixi run mojo build -I . -Xlinker -lm ")
+        + String(ZIMAGE_GENERATE_SOURCE)
+        + String(" -o ")
+        + String(ZIMAGE_GENERATE_BINARY)
+    )
+    var run_command = (
+        String(ZIMAGE_GENERATE_BINARY)
+        + String(" --request ")
+        + request_path
+    )
+    var content = String("{\n")
+    content += String('  "schema":"serenity.zimage.sample_request.v1",\n')
+    content += String('  "model":"zimage",\n')
+    content += String('  "sampler_mode":"split_process_after_train_memory_release",\n')
+    content += String('  "completed_step":') + String(completed_step) + String(",\n")
+    content += String('  "lora_path":"') + lora_path + String('",\n')
+    content += String('  "state_path":"') + state_path + String('",\n')
+    content += String('  "sample_file":"') + sample_file + String('",\n')
+    content += String('  "output_png":"') + out_png + String('",\n')
+    content += String('  "result_manifest":"') + result_manifest + String('",\n')
+    content += String('  "sampler_source":"') + String(ZIMAGE_GENERATE_SOURCE) + String('",\n')
+    content += String('  "build_command":"') + build_command + String('",\n')
+    content += String('  "run_command":"') + run_command + String('",\n')
+    content += String('  "accepted_parity":false,\n')
+    content += String('  "note":"request only; run standalone sampler after trainer exits or memory is released"\n')
+    content += String("}\n")
+    _ = sys_system(String("mkdir -p ") + zimage_sample_request_dir())
+    _write_text_file(request_path, content)
+    return request_path^
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -246,12 +499,151 @@ struct StepResult(Copyable, Movable):
 
 
 def _valid_cap_from_mask(mask: Tensor, ctx: DeviceContext) raises -> Int:
-    var mask_h = cast_tensor(mask, STDtype.F32, ctx).to_host(ctx)
+    if mask.dtype() == STDtype.BF16:
+        var mask_bf = mask.to_host_bf16(ctx)
+        var valid_cap_bf = 0
+        for i in range(len(mask_bf)):
+            if mask_bf[i].cast[DType.float32]() > 0.5:
+                valid_cap_bf += 1
+        return valid_cap_bf
+    if mask.dtype() == STDtype.F16:
+        var mask_f16 = mask.to_host_f16(ctx)
+        var valid_cap_f16 = 0
+        for i in range(len(mask_f16)):
+            if mask_f16[i].cast[DType.float32]() > 0.5:
+                valid_cap_f16 += 1
+        return valid_cap_f16
+
+    # F32 masks are already F32 at the cache boundary.
+    var mask_h = mask.to_host(ctx)
     var valid_cap = 0
     for i in range(len(mask_h)):
         if mask_h[i] > 0.5:
             valid_cap += 1
     return valid_cap
+
+
+@fieldwise_init
+struct ZImageLatentStepInputs(Movable):
+    var noisy_latent: Tensor
+    var target_patch: List[Float32]
+
+
+def _build_latent_step_inputs_bf16[
+    LAT_H_B: Int, LAT_W_B: Int
+](
+    latent: Tensor, noise_lat: List[Float32], sig: Float32, ctx: DeviceContext
+) raises -> ZImageLatentStepInputs:
+    var lat_bf = latent.to_host_bf16(ctx)
+    var noisy = List[Float32]()
+    for i in range(len(lat_bf)):
+        var lat = (lat_bf[i].cast[DType.float32]() - VAE_SHIFT) * VAE_SCALE
+        noisy.append(noise_lat[i] * sig + lat * (Float32(1.0) - sig))
+    var noisy_latent = Tensor.from_host(
+        noisy^, [1, LAT_C, LAT_H_B, LAT_W_B], latent.dtype(), ctx,
+    )
+    var target = _patchify_target_bf16[LAT_H_B, LAT_W_B](noise_lat, lat_bf)
+    return ZImageLatentStepInputs(noisy_latent^, target^)
+
+
+def _build_latent_step_inputs_f16[
+    LAT_H_B: Int, LAT_W_B: Int
+](
+    latent: Tensor, noise_lat: List[Float32], sig: Float32, ctx: DeviceContext
+) raises -> ZImageLatentStepInputs:
+    var lat_f16 = latent.to_host_f16(ctx)
+    var noisy = List[Float32]()
+    for i in range(len(lat_f16)):
+        var lat = (lat_f16[i].cast[DType.float32]() - VAE_SHIFT) * VAE_SCALE
+        noisy.append(noise_lat[i] * sig + lat * (Float32(1.0) - sig))
+    var noisy_latent = Tensor.from_host(
+        noisy^, [1, LAT_C, LAT_H_B, LAT_W_B], latent.dtype(), ctx,
+    )
+    var target = _patchify_target_f16[LAT_H_B, LAT_W_B](noise_lat, lat_f16)
+    return ZImageLatentStepInputs(noisy_latent^, target^)
+
+
+def _build_latent_step_inputs_f32[
+    LAT_H_B: Int, LAT_W_B: Int
+](
+    latent: Tensor, noise_lat: List[Float32], sig: Float32, ctx: DeviceContext
+) raises -> ZImageLatentStepInputs:
+    var lat_f32 = latent.to_host(ctx)
+    var noisy = List[Float32]()
+    for i in range(len(lat_f32)):
+        lat_f32[i] = (lat_f32[i] - VAE_SHIFT) * VAE_SCALE
+        noisy.append(noise_lat[i] * sig + lat_f32[i] * (Float32(1.0) - sig))
+    var noisy_latent = Tensor.from_host(
+        noisy^, [1, LAT_C, LAT_H_B, LAT_W_B], latent.dtype(), ctx,
+    )
+    var target = _patchify_target_f32[LAT_H_B, LAT_W_B](noise_lat, lat_f32)
+    return ZImageLatentStepInputs(noisy_latent^, target^)
+
+
+def _build_latent_step_inputs[
+    LAT_H_B: Int, LAT_W_B: Int
+](
+    latent: Tensor, noise_lat: List[Float32], sig: Float32, ctx: DeviceContext
+) raises -> ZImageLatentStepInputs:
+    if latent.dtype() == STDtype.BF16:
+        return _build_latent_step_inputs_bf16[LAT_H_B, LAT_W_B](latent, noise_lat, sig, ctx)
+    if latent.dtype() == STDtype.F16:
+        return _build_latent_step_inputs_f16[LAT_H_B, LAT_W_B](latent, noise_lat, sig, ctx)
+    # F32 cache tensors are already F32 at the storage boundary.
+    return _build_latent_step_inputs_f32[LAT_H_B, LAT_W_B](latent, noise_lat, sig, ctx)
+
+
+def _cap_tensor_from_cache_bf16[
+    CAP_LEN_B: Int
+](text_embedding: Tensor, valid_cap: Int, ctx: DeviceContext) raises -> Tensor:
+    var cap_bf = text_embedding.to_host_bf16(ctx)
+    var cap_vals = List[Float32]()
+    for r in range(CAP_LEN_B):
+        var src_r = r if r < valid_cap else valid_cap - 1
+        for c in range(CAP_DIM):
+            cap_vals.append(cap_bf[src_r * CAP_DIM + c].cast[DType.float32]())
+    return Tensor.from_host(
+        cap_vals^, [CAP_LEN_B, CAP_DIM], text_embedding.dtype(), ctx,
+    )
+
+
+def _cap_tensor_from_cache_f16[
+    CAP_LEN_B: Int
+](text_embedding: Tensor, valid_cap: Int, ctx: DeviceContext) raises -> Tensor:
+    var cap_f16 = text_embedding.to_host_f16(ctx)
+    var cap_vals = List[Float32]()
+    for r in range(CAP_LEN_B):
+        var src_r = r if r < valid_cap else valid_cap - 1
+        for c in range(CAP_DIM):
+            cap_vals.append(cap_f16[src_r * CAP_DIM + c].cast[DType.float32]())
+    return Tensor.from_host(
+        cap_vals^, [CAP_LEN_B, CAP_DIM], text_embedding.dtype(), ctx,
+    )
+
+
+def _cap_tensor_from_cache_f32[
+    CAP_LEN_B: Int
+](text_embedding: Tensor, valid_cap: Int, ctx: DeviceContext) raises -> Tensor:
+    var cap_f32 = text_embedding.to_host(ctx)
+    var cap_vals = List[Float32]()
+    for r in range(CAP_LEN_B):
+        var src_r = r if r < valid_cap else valid_cap - 1
+        for c in range(CAP_DIM):
+            cap_vals.append(cap_f32[src_r * CAP_DIM + c])
+    return Tensor.from_host(
+        cap_vals^, [CAP_LEN_B, CAP_DIM], text_embedding.dtype(), ctx,
+    )
+
+
+def _cap_tensor_from_cache[
+    CAP_LEN_B: Int
+](text_embedding: Tensor, valid_cap: Int, ctx: DeviceContext) raises -> Tensor:
+    if text_embedding.dtype() == STDtype.BF16:
+        return _cap_tensor_from_cache_bf16[CAP_LEN_B](text_embedding, valid_cap, ctx)
+    if text_embedding.dtype() == STDtype.F16:
+        return _cap_tensor_from_cache_f16[CAP_LEN_B](text_embedding, valid_cap, ctx)
+    # F32 cache tensors are already F32 at the storage boundary.
+    return _cap_tensor_from_cache_f32[CAP_LEN_B](text_embedding, valid_cap, ctx)
 
 
 def _cache_valid_cap(cache: KleinCache, slot: Int, ctx: DeviceContext) raises -> Int:
@@ -277,6 +669,7 @@ def _train_one_step_bucket[
     final_lin_b: Tensor,
     x_pad_h: List[Float32],
     cap_pad_h: List[Float32],
+    train_cfg: TrainConfig,
     train_start_ns: UInt,
     ctx: DeviceContext,
 ) raises -> StepResult:
@@ -295,10 +688,6 @@ def _train_one_step_bucket[
     if lsh[1] != LAT_C or lsh[2] != LAT_H_B or lsh[3] != LAT_W_B:
         raise Error("train_zimage_real: dispatched sample to wrong latent bucket")
 
-    var lat_h = cast_tensor(s.latent, STDtype.F32, ctx).to_host(ctx)
-    for i in range(len(lat_h)):
-        lat_h[i] = (lat_h[i] - VAE_SHIFT) * VAE_SCALE
-
     var valid_cap = _valid_cap_from_mask(s.text_mask, ctx)
     if valid_cap <= 0 or valid_cap > CAP_LEN_B:
         raise Error("train_zimage_real: dispatched sample to wrong text bucket")
@@ -311,24 +700,16 @@ def _train_one_step_bucket[
     var t_value = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
 
     var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + step_seed)
-    var noisy_lat_h = List[Float32]()
-    for i in range(len(lat_h)):
-        noisy_lat_h.append(noise_lat[i] * sig + lat_h[i] * (Float32(1.0) - sig))
-    var noisy_latent = Tensor.from_host(noisy_lat_h^, [1, LAT_C, LAT_H_B, LAT_W_B], STDtype.F32, ctx)
+    var latent_inputs = _build_latent_step_inputs[LAT_H_B, LAT_W_B](
+        s.latent, noise_lat, sig, ctx,
+    )
 
-    var x_t = build_x_seq(aux, noisy_latent, LAT_C, LAT_H_B, LAT_W_B, PATCH, ctx)
+    var x_t = build_x_seq(aux, latent_inputs.noisy_latent, LAT_C, LAT_H_B, LAT_W_B, PATCH, ctx)
     for _pad in range(IMG_PAD_B):
         for c in range(D):
             x_t.append(x_pad_h[c])
 
-    var cap_feats = cast_tensor(s.text_embedding, STDtype.F32, ctx)
-    var cap_full = cap_feats.to_host(ctx)
-    var cap_vals = List[Float32]()
-    for r in range(CAP_LEN_B):
-        var src_r = r if r < valid_cap else valid_cap - 1
-        for c in range(CAP_DIM):
-            cap_vals.append(cap_full[src_r * CAP_DIM + c])
-    var cap2 = Tensor.from_host(cap_vals^, [CAP_LEN_B, CAP_DIM], STDtype.F32, ctx)
+    var cap2 = _cap_tensor_from_cache[CAP_LEN_B](s.text_embedding, valid_cap, ctx)
     var cap_seq = build_cap_seq(aux, cap2, EPS, ctx)
     for r in range(valid_cap, CAP_LEN_B):
         for c in range(D):
@@ -371,7 +752,7 @@ def _train_one_step_bucket[
     )
     var t_fwd = perf_counter_ns()
 
-    var tgt_patch = _patchify_target[LAT_H_B, LAT_W_B](noise_lat, lat_h, sig)
+    var tgt_patch = latent_inputs.target_patch.copy()
     var real_nout = len(tgt_patch)
     var seq_nout = len(fwd.out)
     var d_loss = List[Float32]()
@@ -407,7 +788,11 @@ def _train_one_step_bucket[
     var t_bwd = perf_counter_ns()
 
     var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
-    zimage_lora_adamw_step_main_only(lora, grads, k, LR, ctx)
+    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    zimage_lora_adamw_step_main_only(
+        lora, grads, k, step_lr, ctx,
+        train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+    )
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()
@@ -437,47 +822,73 @@ def _train_one_step_bucket[
 
 
 def main() raises:
-    var ctx = DeviceContext()
     var a = argv()
-    var run_steps = 5
+    var cfg_path = String(DEFAULT_CONFIG)
+    var arg_base = 1
     if len(a) >= 2:
-        var v = 0
-        var bs = String(a[1]).as_bytes()
-        for i in range(String(a[1]).byte_length()):
-            v = v * 10 + Int(bs[i] - 0x30)
-        run_steps = v
+        var first = String(a[1])
+        if first.endswith(String(".json")):
+            cfg_path = first.copy()
+            arg_base = 2
+
+    var train_cfg = read_model_config(cfg_path)
+    validate_zimage_train_config(train_cfg)
+    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
+    validate_onetrainer_cache_preflight_plan(cache_preflight)
+
+    var run_steps = DEFAULT_RUN_STEPS
+    if len(a) > arg_base:
+        run_steps = _parse_nonnegative_int(String(a[arg_base]))
+    elif train_cfg.only_cache:
+        run_steps = 0
     var start_step = 0
-    if len(a) >= 3:
-        var v2 = 0
-        var bs2 = String(a[2]).as_bytes()
-        for i in range(String(a[2]).byte_length()):
-            v2 = v2 * 10 + Int(bs2[i] - 0x30)
-        start_step = v2
+    if len(a) > arg_base + 1:
+        start_step = _parse_nonnegative_int(String(a[arg_base + 1]))
     if start_step > run_steps:
         raise Error(String("start_step ") + String(start_step) + String(" > run_steps ") + String(run_steps))
     var resume_state = String("")
-    if len(a) >= 4:
-        resume_state = String(a[3])
+    if len(a) > arg_base + 2:
+        resume_state = String(a[arg_base + 2])
+
+    var transformer_dir = zimage_transformer_dir_from_train_config(train_cfg)
+    var cache_dir = zimage_cache_dir_from_train_config(train_cfg)
+    var sample_cadence = zimage_sample_cadence_from_train_config(cfg_path, train_cfg)
+    var sample_enabled = zimage_sampling_enabled(sample_cadence)
 
     print("=== Z-Image REAL LoRA training loop ===")
+    print("  config:", cfg_path)
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " F=", F, " out_ch=", OUT_CH)
     print("  depth: NR=", NUM_NR, " CR=", NUM_CR, " MAIN=", MAIN_DEPTH, " (full model MAIN=30)")
     print("  buckets: 72x56 cap224/cap256, 88x48 cap224/cap256")
-    print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT,
+    print("  recipe: rank=", train_cfg.lora_rank, " alpha=", train_cfg.lora_alpha,
+          " lr=", train_cfg.lr, " shift=", train_cfg.timestep_shift,
           " vae_shift=", VAE_SHIFT, " vae_scale=", VAE_SCALE)
-    print("  weights:", TRANSFORMER_DIR)
-    print("  cache:", CACHE_DIR)
+    print("  run_steps=", run_steps, " config_max_steps=", train_cfg.max_steps)
+    print(
+        "  cadence: save_every=", train_cfg.save_every,
+        " sample_after=", sample_cadence.sample_after,
+        " unit=", sample_time_unit_name(sample_cadence.sample_after_unit),
+        " skip_first=", sample_cadence.sample_skip_first,
+        " sample_file=", sample_cadence.sample_definition_file_name,
+    )
+    print("  weights:", transformer_dir)
+    print("  cache:", cache_dir)
+    if train_cfg.only_cache:
+        print("[ZImage] only_cache requested; no train steps will run in this trainer")
+        return
+
+    var ctx = DeviceContext()
 
     # ── cache first: fail before loading the 24 GB-class model if prepare has
     # not produced the local Mojo cache yet.
-    var cache = KleinCache(String(CACHE_DIR))
+    var cache = KleinCache(cache_dir)
     print("[cache] samples:", cache.count())
     var k0 = cache.peek_key(0, ctx)
     print("[cache] first latent: C=", k0.c, " H=", k0.h, " W=", k0.w, " text_seq=", k0.seq)
 
     # ── load real base weights (frozen) ──────────────────────────────────────
     print("[load] opening sharded transformer dir")
-    var st = ShardedSafeTensors.open(String(TRANSFORMER_DIR))
+    var st = ShardedSafeTensors.open(transformer_dir)
     print("[load] aux (embedders / per-block adaLN / final layer)")
     var aux = load_zimage_real_aux(st, NUM_NR, MAIN_DEPTH, ctx)
     print("[load] blocks: NR + CR + MAIN")
@@ -516,6 +927,11 @@ def main() raises:
         b_absum_init += _absum(lora.ad[i].b)
     print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
 
+    if sample_enabled and should_sample_completed_step(sample_cadence, 0):
+        print("[cadence] step 0 sample due; Z-Image uses split-process sampler requests")
+    var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
+    print("[cadence] next sample completed_step=", next_sample)
+
     var train_start = perf_counter_ns()
     for k in range(start_step + 1, run_steps + 1):
         var slot = 0 if OVERFIT_PROBE else (k - 1) % cache.count()
@@ -530,14 +946,14 @@ def main() raises:
                 var r_72_224 = _train_one_step_bucket[72, 56, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_start, ctx,
+                    train_cfg, train_start, ctx,
                 )
                 loss = r_72_224.loss
             elif valid_cap <= 256:
                 var r_72_256 = _train_one_step_bucket[72, 56, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_start, ctx,
+                    train_cfg, train_start, ctx,
                 )
                 loss = r_72_256.loss
             else:
@@ -547,14 +963,14 @@ def main() raises:
                 var r_88_224 = _train_one_step_bucket[88, 48, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_start, ctx,
+                    train_cfg, train_start, ctx,
                 )
                 loss = r_88_224.loss
             elif valid_cap <= 256:
                 var r_88_256 = _train_one_step_bucket[88, 48, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_start, ctx,
+                    train_cfg, train_start, ctx,
                 )
                 loss = r_88_256.loss
             else:
@@ -564,6 +980,48 @@ def main() raises:
         if k == start_step + 1:
             first_loss = loss
         last_loss = loss
+
+        var saved_this_step = False
+        if zimage_should_save_checkpoint(train_cfg, k):
+            var save_path = _step_lora_path(
+                zimage_output_lora_path_from_train_config(train_cfg, run_steps), k
+            )
+            _ = save_zimage_lora_main_only(lora, save_path, ctx)
+            var state_path = save_path + String(".state.safetensors")
+            _ = save_zimage_lora_main_only_state(lora, state_path, ctx)
+            saved_this_step = True
+            print("[ZImage-lora] save_state step=", k, " path=", state_path)
+        if sample_enabled and should_sample_completed_step(sample_cadence, k):
+            if zimage_should_save_before_sample(sample_cadence, k, saved_this_step):
+                var sample_path = _step_lora_path(
+                    zimage_output_lora_path_from_train_config(train_cfg, run_steps), k
+                )
+                _ = save_zimage_lora_main_only(lora, sample_path, ctx)
+                var sample_state = sample_path + String(".state.safetensors")
+                _ = save_zimage_lora_main_only_state(lora, sample_state, ctx)
+                print("[ZImage-lora] save_before_sample step=", k, " path=", sample_state)
+                var request_path = _write_zimage_sample_request(
+                    k, sample_path, sample_state, sample_cadence.sample_definition_file_name
+                )
+                print(
+                    "[cadence] sample request queued completed_step=", k,
+                    " request=", request_path,
+                )
+            else:
+                var existing_lora = _step_lora_path(
+                    zimage_output_lora_path_from_train_config(train_cfg, run_steps), k
+                )
+                var existing_state = existing_lora + String(".state.safetensors")
+                var request_path2 = _write_zimage_sample_request(
+                    k, existing_lora, existing_state, sample_cadence.sample_definition_file_name
+                )
+                print(
+                    "[cadence] sample request queued completed_step=", k,
+                    " request=", request_path2,
+                )
+            print(
+                "[cadence] Z-Image sampler is split-process; run request after trainer memory is released",
+            )
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
@@ -576,7 +1034,7 @@ def main() raises:
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         _ = sys_system(String("mkdir -p ") + String(LORA_DIR))
-        var lora_out = String(LORA_DIR) + String("/zimage_lora_step") + String(run_steps) + String(".safetensors")
+        var lora_out = zimage_output_lora_path_from_train_config(train_cfg, run_steps)
         _ = save_zimage_lora_main_only(lora, lora_out, ctx)
         var state_out = lora_out + String(".state.safetensors")
         _ = save_zimage_lora_main_only_state(lora, state_out, ctx)
@@ -588,7 +1046,9 @@ def main() raises:
 # ── helper: patchify the v-target (noise - latent) into OUT_CH channel-minor ──
 # Ordering matches build_x_seq's patchify exactly: view [C,Ht,p,Wt,p] ->
 # permute (Ht,Wt,p,p,C) -> reshape [Ht*Wt, p*p*C]. v-target = noise - latent.
-def _patchify_target[LAT_H_B: Int, LAT_W_B: Int](noise_lat: List[Float32], lat_flat: List[Float32], sig: Float32) -> List[Float32]:
+def _patchify_target_bf16[
+    LAT_H_B: Int, LAT_W_B: Int
+](noise_lat: List[Float32], lat_flat: List[BFloat16]) -> List[Float32]:
     var C = LAT_C
     var Hh = LAT_H_B
     var Ww = LAT_W_B
@@ -597,6 +1057,52 @@ def _patchify_target[LAT_H_B: Int, LAT_W_B: Int](noise_lat: List[Float32], lat_f
     var wt = Ww // p
     # token target in [C,H,W]: t[c,h,w] = noise - latent
     # output ordering: token (ih,iw) -> [ph, pw, c] channel-minor (p*p*C=64).
+    var out = List[Float32]()
+    for ih in range(ht):
+        for iw in range(wt):
+            for ph in range(p):
+                for pw in range(p):
+                    for c in range(C):
+                        var hh = ih * p + ph
+                        var ww = iw * p + pw
+                        var idx = c * Hh * Ww + hh * Ww + ww
+                        var lat = (lat_flat[idx].cast[DType.float32]() - VAE_SHIFT) * VAE_SCALE
+                        out.append(noise_lat[idx] - lat)
+    return out^
+
+
+def _patchify_target_f16[
+    LAT_H_B: Int, LAT_W_B: Int
+](noise_lat: List[Float32], lat_flat: List[Float16]) -> List[Float32]:
+    var C = LAT_C
+    var Hh = LAT_H_B
+    var Ww = LAT_W_B
+    var p = PATCH
+    var ht = Hh // p
+    var wt = Ww // p
+    var out = List[Float32]()
+    for ih in range(ht):
+        for iw in range(wt):
+            for ph in range(p):
+                for pw in range(p):
+                    for c in range(C):
+                        var hh = ih * p + ph
+                        var ww = iw * p + pw
+                        var idx = c * Hh * Ww + hh * Ww + ww
+                        var lat = (lat_flat[idx].cast[DType.float32]() - VAE_SHIFT) * VAE_SCALE
+                        out.append(noise_lat[idx] - lat)
+    return out^
+
+
+def _patchify_target_f32[
+    LAT_H_B: Int, LAT_W_B: Int
+](noise_lat: List[Float32], lat_flat: List[Float32]) -> List[Float32]:
+    var C = LAT_C
+    var Hh = LAT_H_B
+    var Ww = LAT_W_B
+    var p = PATCH
+    var ht = Hh // p
+    var wt = Ww // p
     var out = List[Float32]()
     for ih in range(ht):
         for iw in range(wt):

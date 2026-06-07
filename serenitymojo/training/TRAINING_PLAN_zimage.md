@@ -120,7 +120,9 @@ checkpoint=/home/alex/OneTrainer/workspace/alina_zimage_OTpreset_100_baseline/sa
 
 The process was manually terminated after OneTrainer continued beyond the 100
 step save; use only the metrics through the `save-99-3-24` checkpoint as the
-baseline.
+baseline. This is training-speed evidence only. It is not a sampler-speed
+parity claim because it has no matched prompt, seed, guidance, denoise timing,
+VAE decode timing, peak VRAM, or image artifact pair.
 
 ### Full-depth Mojo result after tensor-resident main-stack fix
 
@@ -163,7 +165,10 @@ checkpoint=output/alina_zimage/zimage_lora_step2000.safetensors
 
 The run hit the production Alina buckets instead of dropping singleton or
 long-caption cases. This is the current convergence baseline: finite throughout,
-LoRA-B nonzero on every main adapter, and speed in the OneTrainer target band.
+LoRA-B nonzero on every main adapter. Treat the speed lines above as historical
+run notes unless the named log/checkpoint artifacts are present in the current
+workspace and a strict speed manifest records matched OneTrainer/Mojo identity,
+stage timings, and peak VRAM.
 
 1024 sampling hook: `serenitymojo/pipeline/zimage_generate.mojo` now accepts
 `[lora_path|base] [out_png] [seed] [prompt]`. It loads the BF16/BP16-preserving
@@ -195,7 +200,142 @@ output/alina_zimage/sample_step2000_alina007_seed27182_1024.png # 208 tokens, 36
 
 All three logs show `overlay loaded 210 main-layer adapters; scale alpha/rank =
 0.0625`; all three PNGs are valid 1024x1024 RGB and visually align with their
-staged captions.
+staged captions. These wall times are not accepted sampler speed parity: the
+current no-CUDA gate requires prompt, seed, resolution, steps, guidance, dtype,
+OneTrainer/Mojo denoise seconds per step, VAE decode seconds, peak VRAM, and
+artifact paths before a strict speed claim can pass.
+
+Strict sampler-speed readiness is guarded by
+`scripts/check_zimage_sampler_contract.py --strict-speed`. That gate is
+manifest-only and no-CUDA: it reads the existing sampler/forward JSON plus an
+optional `zimage_sampler_speed.json` or `zi_sampler_speed.json`. It accepts
+either a shared `run_identity` or side-specific OneTrainer/Mojo identity fields,
+but the effective prompt, seed, resolution, steps, guidance, and dtype must
+match exactly between the two runs. It also requires paired OneTrainer and Mojo
+denoise seconds per step, VAE decode seconds, peak VRAM MiB, and non-empty
+artifact paths that exist locally. It still does not compare pixels.
+
+Use `scripts/check_zimage_sampler_contract.py --write-speed-readiness <path>`
+to write the same field audit as JSON. As of 2026-06-06,
+`scripts/check_zimage_sampler_contract.py --strict-speed` passes as comparable
+speed evidence against `/home/alex/onetrainer-mojo/parity/zimage_sampler_speed.json`.
+That is not a speed-parity claim: the paired 1024x1024, 28-step, seed 42,
+CFG 3.5 record has OneTrainer denoise `2.144007647s/step`, VAE
+`1.0628398s`, peak `14340 MiB`, while the paired Mojo record has denoise
+`5.206695175s/step`, text encode `33.874484788s`, VAE `1.809631493s`,
+peak `22238 MiB`, and supervisor wall `225.13s`.
+Use `scripts/check_zimage_sampler_contract.py --write-strict-speed-template /tmp/zimage_sampler_speed_template.json`
+to write the expected speed-manifest shape. The template contains placeholder
+values and does not satisfy `--strict-speed`; it is only a checklist for the
+matched OneTrainer/Mojo timing and VRAM run.
+
+Product-control smoke now covers the OneTrainer-style entrypoint for
+`zimage_lora_16gb`: it resolves to `train_zimage_real`, binds Z-Image cache
+preflight fields, requires the sample prompt file, and proves step-500
+save-before-sample cadence. At sample cadence, `train_zimage_real` now saves
+LoRA/state and writes a `serenity.zimage.sample_request.v1` manifest under
+`output/alina_zimage/sample_requests/` with the standalone `zimage_generate.mojo`
+build/run command plus a `result_manifest` path. The generator now accepts
+`--request <manifest.json>`, validates the LoRA/state/sample paths before CUDA
+setup, runs the existing LoRA overlay sampler, saves the PNG, and writes a
+`serenity.zimage.sample_result.v1` JSON with Mojo-side text-encode, denoise,
+and VAE-decode timings. The result manifest intentionally records
+`accepted_sampler_parity=false` and `accepted_speed_parity=false`; it does not
+measure peak VRAM. This is the safe 24GB direction: run the sampler after
+trainer memory is released. It is not sampled-output parity until a supervisor
+or manual standalone run consumes a real request and records the matched
+OneTrainer/Mojo artifact, timing, and VRAM bundle.
+
+`serenitymojo/training/zimage_sample_supervisor.mojo` now provides the
+Mojo-native process-separation runner for queued requests:
+
+```
+pixi run mojo build -I . serenitymojo/training/zimage_sample_supervisor.mojo -o /tmp/zimage_sample_supervisor
+/tmp/zimage_sample_supervisor output/alina_zimage/sample_requests/step500_request.json /tmp/zimage_generate_prod dryrun
+```
+
+For measurement runs, `scripts/run_zimage_sample_requests.py` is the support
+wrapper that can launch the Mojo sampler, poll `nvidia-smi`, validate the
+emitted result manifest, and write a Mojo-side `zimage_sampler_speed.json`
+shape. Dry-run metadata and generator-only `peak_vram_mib=0` do not satisfy
+`--strict-speed`; the strict gate still needs positive measured VRAM plus
+paired OneTrainer fields.
+
+### 2026-06-06 sampler speed/profile pass
+
+Current code-path changes for the standalone 1024 sampler:
+
+- base mode builds a zero-LoRA device set instead of uploading full host zero
+  adapters;
+- `zimage_lora_apply_device` skips zero-scale adapters;
+- the noise-refiner image sequence is computed once per step and reused for
+  cond/uncond CFG;
+- `cfg <= 1.0` skips the uncond main-stack pass;
+- final patch rows are unpatchified on device in Z-Image channel-minor order;
+- main-block inference uses `vec_modulate` and `vec_swiglu`;
+- `--trace-denoise` is available on `zimage_generate.mojo` and is off by
+  default. Trace mode synchronizes the first denoise step to print real stage
+  timings.
+
+Measured after the fused/device cleanup, but before accepted speed parity:
+
+```
+artifact=/tmp/zimage_speed_28step_fused_speed.json
+identity=1024x1024 seed=42 steps=28 cfg=3.5 dtype=bf16
+text_encode_seconds=10.36549498
+denoise_seconds=118.562242613
+denoise_seconds_per_step=4.234365807607142
+vae_decode_seconds=1.499334517
+peak_vram_mib=22137
+```
+
+Current one-step supervisor evidence after the device mod-vector cleanup:
+
+```
+artifact=/tmp/zimage_speed_1step_moddev_speed.json
+text_encode_seconds=10.645762139
+denoise_seconds_per_step=4.302052192
+vae_decode_seconds=1.487801541
+peak_vram_mib=22111
+output=/tmp/zimage_speed_1step_moddev.png
+```
+
+The device mod-vector cleanup built and ran, but did not materially improve
+speed. A traced one-step run printed:
+
+```
+adaln_mods 0.017444382s
+noise_refiner 0.396803831s
+main_cond 1.975725455s
+main_uncond 1.905335169s
+cfg_combine 0.002771174s
+scheduler_update 0.001488217s
+```
+
+The remaining speed blocker is the CFG denoise structure. OneTrainer batches
+cond/uncond when `cfg_scale > 1.0`; the current Mojo path runs the two main
+stacks serially. A previous naive batch-2 tiled-attention attempt was rejected
+because it was much slower and near the 24 GB ceiling. The next real speed
+target is a fast BF16 `Dh=128` attention path and/or a proven batched-CFG path,
+not another small host-boundary cleanup.
+
+The focused Z-Image train-readiness guard now clears the latent/text cache
+host-F32 step-math staging blocker. Cached BF16/F16 latent/text tensors are read
+through dtype-specific host lists, with F32 limited to local scalar math,
+targets, reductions, and transient upload lists.
+
+Z-Image full-finetune is still not production-supported. The
+`zimage_full_finetune_inventory_smoke` validates the current transformer
+full-weight inventory at `521` keys, and
+`zimage_full_finetune_checkpoint_smoke` saves the live-struct payload order,
+writes the tensor-name manifest, and loads the flat payload back with BF16
+storage preserved. `zimage_full_finetune_state_smoke` now binds that `521`
+tensor manifest to the TrainState optimizer sidecar order
+`param.N`/`adam_m.N`/`adam_v.N`/`__meta__`. `scripts/check_full_finetune_inventory_keys.py --strict`
+also validates the `521` inventory keys against the local sharded index and
+confirms context refiners have no AdaLN keys. The remaining full-finetune
+blockers are the LoRA-only train loop, product-loop full-finetune parity, and
+parity artifact.
 
 ### Full-F32 blocker status
 
@@ -205,9 +345,11 @@ residency with F32 limited to LoRA/Adam, reductions, and short transients.
 
 ### NEXT
 
-1. Move the sampler to a process-separated cadence hook for long trainer runs
-   if in-process 1024 sampling is needed later.
-2. Add/verify validation sampling cadence for Z-Image so the trainer can save
-   and sample like Klein.
+1. Add the external sampler/supervisor step that consumes queued
+   `serenity.zimage.sample_request.v1` manifests, verifies the emitted
+   `serenity.zimage.sample_result.v1`, records peak VRAM externally, and writes
+   the matched OneTrainer/Mojo artifact bundle.
+2. Keep validation sampling split-process for Z-Image; do not treat a queued
+   request as sampled-output, image, or speed parity.
 3. Keep expanding tensor-resident and offloaded APIs rather than reintroducing
    host-list block boundaries in production code.

@@ -24,7 +24,7 @@ All rows below cite that doc unless noted.
 | Model | Inference state | Entry / gate | Notes |
 |---|---|---|---|
 | **Z-Image (base)** | **WORKING end-to-end, native 1024²** | `pipeline/zimage_pipeline.mojo` (12 KB) | Denoise sign-convention bug RESOLVED (post-CFG negate) — `STATUS_ZIMAGE_DENOISE_DIVERGENCE.md:5`. Final-latent std 0.775 (was 3.4). 9 components each cos≥0.999. Open cleanup: hardcoded sigma table has a duplicate terminal 0.0 (`STATUS…:66,84`). |
-| **Klein9B (FLUX.2)** | **✅ coherent** | `pipeline/klein9b_pipeline_multistep_smoke.mojo`, `…_1024_smoke.mojo` | honeycomb 1024; turbo-loader byte-exact (`PORT_STATUS:Image table`). Block-streamed offload (all-resident 1024 OOMs; one-block-at-a-time clears it — `STATUS…:159`). |
+| **Klein9B (FLUX.2)** | **✅ coherent** | `pipeline/klein9b_pipeline_multistep_smoke.mojo`, `…_1024_smoke.mojo` | honeycomb 1024; turbo-loader byte-exact (`PORT_STATUS:Image table`). Block-streamed inference offload (all-resident 1024 OOMs; one-block-at-a-time clears it — `STATUS…:159`). This is image-smoke evidence only, not OneTrainer `CPU_OFFLOADED` activation/layer parity or training/offload backward parity. |
 | **Qwen-Image 512 & 1024** | **✅ coherent** | `pipeline/qwenimage_pipeline_512_multistep.mojo`, `…_1024_multistep.mojo` | unblocked by adding sdpa `(546,28,128)` comptime case (commit 840eda8). |
 | **ZImage L2P** | **✅ coherent** | `pipeline/zimage_l2p_pipeline_512_multistep.mojo` (26 KB) | 30-layer pixel-space (no VAE); matches Rust 512 oracle. H=30, head_dim=128. |
 | **Anima (MiniTrainDIT)** | **✅ coherent** | `pipeline/anima_pipeline_1024_multistep.mojo` | 28-block; latent cos 0.9948 vs Rust. |
@@ -62,9 +62,9 @@ full-DSP-parity-gated end-to-end.
   inference blocker (the inference SDPA forward is clean, cos 0.9999971).
 
 **Job A bottom line:** 10 image models + 1 video pipeline are visually coherent
-end-to-end. Z-Image and Klein9B (the two named minima) both clear the bar. Lens
-is the only image model still blocked (GPT-OSS encoder OOM). Everything else
-flagged is scaffold-by-design (edit/PiD) or excluded.
+end-to-end. Z-Image and Klein9B (the two named minima) both clear the image
+coherence bar. Lens is the only image model still blocked (GPT-OSS encoder OOM).
+Everything else flagged is scaffold-by-design (edit/PiD) or excluded.
 
 ---
 

@@ -41,6 +41,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -974,8 +975,19 @@ def group_norm_backward(
 ) raises -> GroupNormBackward:
     """Backward of group_norm (NHWC). go/x [N,H,W,C]; weight [C].
     Returns d_x [N,H,W,C], d_g [C], d_b [C] in input storage dtype."""
-    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
-        raise Error("group_norm_backward: go/x/weight dtype mismatch")
+    if x.dtype() != go.dtype():
+        raise Error("group_norm_backward: go/x dtype mismatch")
+    if x.dtype() != weight.dtype():
+        if x.dtype() != STDtype.F32:
+            raise Error("group_norm_backward: mixed weight dtype requires F32 activations")
+        var compute_weight = cast_tensor(weight, x.dtype(), ctx)
+        var mixed = group_norm_backward(go, x, compute_weight^, num_groups, eps, ctx)
+        var d_x = mixed.d_x.clone(ctx)
+        var d_g_src = mixed.d_g.clone(ctx)
+        var d_b_src = mixed.d_b.clone(ctx)
+        var d_g = cast_tensor(d_g_src^, weight.dtype(), ctx)
+        var d_b = cast_tensor(d_b_src^, weight.dtype(), ctx)
+        return GroupNormBackward(d_x^, d_g^, d_b^)
     var xshape = x.shape()
     if len(xshape) != 4:
         raise Error("group_norm_backward: x must be NHWC [N,H,W,C]")

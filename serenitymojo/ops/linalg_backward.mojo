@@ -392,7 +392,12 @@ def linear_backward(
     out_features: Int,
     ctx: DeviceContext,
 ) raises -> LinearGrads:
-    if grad_y.dtype() != x.dtype() or x.dtype() != weight.dtype():
+    var mixed_base = (
+        grad_y.dtype() == STDtype.F32
+        and x.dtype() == STDtype.F32
+        and (weight.dtype() == STDtype.BF16 or weight.dtype() == STDtype.F16)
+    )
+    if grad_y.dtype() != x.dtype() or (x.dtype() != weight.dtype() and not mixed_base):
         raise Error("linear_backward: grad_y/x/weight dtype mismatch")
     var d_x = _new_f32(M, in_features, ctx)
     var d_w = _new_f32(out_features, in_features, ctx)
@@ -404,10 +409,27 @@ def linear_backward(
     var dw = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](d_w.buf.unsafe_ptr().bitcast[Float32](), oi_rl)
 
     var dt = x.dtype().to_mojo_dtype()
-    if dt == DType.float32:
+    var wdt = weight.dtype().to_mojo_dtype()
+    if dt == DType.float32 and wdt == DType.float32:
         var gy = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](grad_y.buf.unsafe_ptr().bitcast[Float32](), mo_rl)
         var xv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), mi_rl)
         var wv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](weight.buf.unsafe_ptr().bitcast[Float32](), oi_rl)
+        matmul(ctx, dx, gy, wv, c_row_major=True)
+        matmul(ctx, dw, gy, xv, transpose_a=True, c_row_major=True)
+    elif dt == DType.float32 and wdt == DType.bfloat16:
+        var gy_cast = cast_tensor(grad_y, STDtype.BF16, ctx, False)
+        var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
+        var gy = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](gy_cast.buf.unsafe_ptr().bitcast[BFloat16](), mo_rl)
+        var xv = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](x_cast.buf.unsafe_ptr().bitcast[BFloat16](), mi_rl)
+        var wv = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](weight.buf.unsafe_ptr().bitcast[BFloat16](), oi_rl)
+        matmul(ctx, dx, gy, wv, c_row_major=True)
+        matmul(ctx, dw, gy, xv, transpose_a=True, c_row_major=True)
+    elif dt == DType.float32 and wdt == DType.float16:
+        var gy_cast = cast_tensor(grad_y, STDtype.F16, ctx, False)
+        var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
+        var gy = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](gy_cast.buf.unsafe_ptr().bitcast[Float16](), mo_rl)
+        var xv = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](x_cast.buf.unsafe_ptr().bitcast[Float16](), mi_rl)
+        var wv = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](weight.buf.unsafe_ptr().bitcast[Float16](), oi_rl)
         matmul(ctx, dx, gy, wv, c_row_major=True)
         matmul(ctx, dw, gy, xv, transpose_a=True, c_row_major=True)
     elif dt == DType.bfloat16:
@@ -445,7 +467,7 @@ def linear_backward_dx(
     out_features: Int,
     ctx: DeviceContext,
 ) raises -> Tensor:
-    if grad_y.dtype() != weight.dtype():
+    if grad_y.dtype() != weight.dtype() and grad_y.dtype() != STDtype.F32:
         raise Error("linear_backward_dx: grad_y/weight dtype mismatch")
     var d_x = _new_f32(M, in_features, ctx)
 
@@ -454,17 +476,28 @@ def linear_backward_dx(
     var oi_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_features, in_features))
     var dx = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](d_x.buf.unsafe_ptr().bitcast[Float32](), mi_rl)
 
-    var dt = grad_y.dtype().to_mojo_dtype()
-    if dt == DType.float32:
+    if weight.dtype() == STDtype.F32:
+        if grad_y.dtype() != STDtype.F32:
+            raise Error("linear_backward_dx: F32 weight requires F32 grad")
         var gy = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](grad_y.buf.unsafe_ptr().bitcast[Float32](), mo_rl)
         var wv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](weight.buf.unsafe_ptr().bitcast[Float32](), oi_rl)
         matmul(ctx, dx, gy, wv, c_row_major=True)
-    elif dt == DType.bfloat16:
-        var gy = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](grad_y.buf.unsafe_ptr().bitcast[BFloat16](), mo_rl)
+    elif weight.dtype() == STDtype.BF16:
+        var gy_cast: Tensor
+        if grad_y.dtype() == STDtype.BF16:
+            gy_cast = grad_y.clone(ctx)
+        else:
+            gy_cast = cast_tensor(grad_y, STDtype.BF16, ctx, False)
+        var gy = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](gy_cast.buf.unsafe_ptr().bitcast[BFloat16](), mo_rl)
         var wv = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](weight.buf.unsafe_ptr().bitcast[BFloat16](), oi_rl)
         matmul(ctx, dx, gy, wv, c_row_major=True)
     else:
-        var gy = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](grad_y.buf.unsafe_ptr().bitcast[Float16](), mo_rl)
+        var gy_cast: Tensor
+        if grad_y.dtype() == STDtype.F16:
+            gy_cast = grad_y.clone(ctx)
+        else:
+            gy_cast = cast_tensor(grad_y, STDtype.F16, ctx, False)
+        var gy = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](gy_cast.buf.unsafe_ptr().bitcast[Float16](), mo_rl)
         var wv = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](weight.buf.unsafe_ptr().bitcast[Float16](), oi_rl)
         matmul(ctx, dx, gy, wv, c_row_major=True)
     if grad_y.dtype() == STDtype.F32:

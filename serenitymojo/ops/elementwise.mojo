@@ -21,6 +21,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -96,8 +97,8 @@ def modulate(
     """modulate(x, scale, shift) = (1 + scale) * x + shift.
 
     x:     [..., D]   (any compute dtype; leading dims flattened to rows)
-    scale: [D]        (per-channel; same dtype as x)
-    shift: [D]        (per-channel; same dtype as x)
+    scale: [D]        (per-channel; same dtype as x, or modulation storage dtype)
+    shift: [D]        (per-channel; same dtype as x, or modulation storage dtype)
     returns [..., D]  (x's dtype; F32 math).
     """
     var xshape = x.shape()
@@ -110,8 +111,15 @@ def modulate(
         raise Error("modulate: scale must be [D]")
     if len(shshape) != 1 or shshape[0] != d:
         raise Error("modulate: shift must be [D]")
-    if x.dtype() != scale.dtype() or x.dtype() != shift.dtype():
-        raise Error("modulate: x/scale/shift dtype mismatch")
+    if x.dtype() != scale.dtype():
+        var compute_scale = cast_tensor(scale, x.dtype(), ctx)
+        if x.dtype() != shift.dtype():
+            var compute_shift = cast_tensor(shift, x.dtype(), ctx)
+            return modulate(x, compute_scale^, compute_shift^, ctx)
+        return modulate(x, compute_scale^, shift, ctx)
+    if x.dtype() != shift.dtype():
+        var compute_shift = cast_tensor(shift, x.dtype(), ctx)
+        return modulate(x, scale, compute_shift^, ctx)
     var rows = 1
     for i in range(len(xshape) - 1):
         rows *= xshape[i]
@@ -239,8 +247,8 @@ def residual_gate(
     """residual_gate(x, gate, y) = x + gate * y.
 
     x:    [..., D]   (any compute dtype)
-    gate: [D]        (per-channel; same dtype as x)
-    y:    [..., D]   (same shape/dtype as x)
+    gate: [D]        (per-channel; same dtype as x, or modulation storage dtype)
+    y:    [..., D]   (same shape as x; cast to x dtype if needed)
     returns [..., D] (x's dtype; F32 math).
     """
     var xshape = x.shape()
@@ -252,8 +260,15 @@ def residual_gate(
         raise Error("residual_gate: gate must be [D]")
     if x.numel() != y.numel():
         raise Error("residual_gate: x/y numel mismatch")
-    if x.dtype() != gate.dtype() or x.dtype() != y.dtype():
-        raise Error("residual_gate: x/gate/y dtype mismatch")
+    if x.dtype() != gate.dtype():
+        var compute_gate = cast_tensor(gate, x.dtype(), ctx)
+        if x.dtype() != y.dtype():
+            var compute_y = cast_tensor(y, x.dtype(), ctx)
+            return residual_gate(x, compute_gate^, compute_y^, ctx)
+        return residual_gate(x, compute_gate^, y, ctx)
+    if x.dtype() != y.dtype():
+        var compute_y = cast_tensor(y, x.dtype(), ctx)
+        return residual_gate(x, gate, compute_y^, ctx)
     var rows = 1
     for i in range(len(xshape) - 1):
         rows *= xshape[i]

@@ -395,3 +395,55 @@ struct Tensor(Movable):
         ctx.enqueue_copy(dst_buf=dev, src_buf=host)
         ctx.synchronize()
         return Tensor(dev^, shape^, STDtype.BF16)
+
+    def to_host_f16(self, ctx: DeviceContext) raises -> List[Float16]:
+        """Copy device data back to host as raw F16 for dtype-preserving
+        loader/layout rewrites. This mirrors `to_host_bf16` for checkpoints that
+        explicitly store F16 tensors."""
+        var n = self.numel()
+        var nbytes = self.nbytes()
+        var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+        ctx.enqueue_copy(dst_buf=host, src_buf=self.buf)
+        ctx.synchronize()
+        var out = List[Float16]()
+        var dt = self._dtype.to_mojo_dtype()
+        if dt == DType.float16:
+            var hp = host.unsafe_ptr().bitcast[Float16]()
+            for i in range(n):
+                out.append(hp[i])
+        elif dt == DType.float32:
+            var fp = host.unsafe_ptr().bitcast[Float32]()
+            for i in range(n):
+                out.append(fp[i].cast[DType.float16]())
+        else:  # bfloat16
+            var bp = host.unsafe_ptr().bitcast[BFloat16]()
+            for i in range(n):
+                out.append(bp[i].cast[DType.float32]().cast[DType.float16]())
+        return out^
+
+    @staticmethod
+    def from_host_f16(
+        values: List[Float16],
+        var shape: List[Int],
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        """Upload a host F16 list to a fresh F16 device buffer verbatim."""
+        var n = 1
+        for i in range(len(shape)):
+            n *= shape[i]
+        if n != len(values):
+            raise Error(
+                String("from_host_f16: numel(shape)=")
+                + String(n)
+                + " != len(values)="
+                + String(len(values))
+            )
+        var nbytes = n * STDtype.F16.byte_size()
+        var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+        var hp = host.unsafe_ptr().bitcast[Float16]()
+        for i in range(n):
+            hp[i] = values[i]
+        var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+        ctx.enqueue_copy(dst_buf=dev, src_buf=host)
+        ctx.synchronize()
+        return Tensor(dev^, shape^, STDtype.F16)

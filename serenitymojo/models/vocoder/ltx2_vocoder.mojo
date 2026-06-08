@@ -30,8 +30,10 @@
 #   skip     = sinc_upsample(x16, ratio=3)                # [B,2,~L48]
 #   out      = clamp(residual[:mix] + skip[:mix], -1, 1), trimmed to L16*3.
 #
-# Weights and activations stay in BF16 storage at runtime. Kernels accumulate
-# internally in F32 where needed and return to the input/storage dtype.
+# Weights load as F32 (`_load_w`) and the whole chain computes F32 — the forward
+# casts activations to F32 (bf16 compounds through 108 convs and fails spectral
+# parity), so F32 weights are REQUIRED (bf16 weights + F32 acts = conv mismatch).
+# Matches production (NAVA init_ltx_vae builds the audio VAE/vocoder in F32).
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
@@ -112,13 +114,16 @@ def _get_padding(k: Int, d: Int) -> Int:
 
 
 # ── weight loading helper ─────────────────────────────────────────────────────
-# Runtime loader: preserve BF16 checkpoint storage. Conv/STFT/Snake kernels own
-# any needed F32 internal math and store back to the tensor storage dtype.
-def _load_bf16(ref st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
+# Runtime loader: F32. `LTX2VocoderWithBWE.forward` casts activations to F32 for
+# the whole BigVGAN+BWE chain (bf16 compounds through 108 convs and fails spectral
+# parity), so the WEIGHTS must be F32 too — bf16 weights + F32 activations is a
+# conv dtype mismatch. This also matches production (NAVA's audio VAE/vocoder run
+# in F32 via init_ltx_vae). Upcasts BF16 checkpoint storage on the host.
+def _load_w(ref st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var view = from_parts(info.dtype, info.shape.copy(), bytes)
-    return Tensor.from_view_as_bf16(view, ctx)
+    return Tensor.from_view_as_f32(view, ctx)
 
 
 def _put(
@@ -147,8 +152,8 @@ def _snake_params(
 ) raises -> Tuple[Tensor, Tensor]:
     """Load act.alpha/act.beta [C], precompute (alpha_exp, inv_beta_eps) in
     [C,1,1] layout (matches ltx2_vocoder.rs:522-524)."""
-    var alpha_bf = _load_bf16(st, prefix + ".act.alpha", ctx)
-    var beta_bf = _load_bf16(st, prefix + ".act.beta", ctx)
+    var alpha_bf = _load_w(st, prefix + ".act.alpha", ctx)
+    var beta_bf = _load_w(st, prefix + ".act.beta", ctx)
     # dtype-contract: allow-f32-boundary
     # LTX2 computes SnakeBeta exp/reciprocal inside the vocoder F32 autocast block.
     var alpha = cast_tensor(alpha_bf^, STDtype.F32, ctx)
@@ -191,8 +196,8 @@ struct ActParams(Movable):
         var sh = pre[0].shape()
         var ae = reshape(pre[0], sh.copy(), ctx)
         var ibe = reshape(pre[1], sh.copy(), ctx)
-        var up = _load_bf16(st, prefix + ".upsample.filter", ctx)
-        var down = _load_bf16(st, prefix + ".downsample.lowpass.filter", ctx)
+        var up = _load_w(st, prefix + ".upsample.filter", ctx)
+        var down = _load_w(st, prefix + ".downsample.lowpass.filter", ctx)
         return ActParams(ae^, ibe^, up^, down^)
 
     def apply(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -275,9 +280,9 @@ struct VocoderWeights(Movable):
 
         # conv_pre
         _put(tensors, name_to_idx, prefix + ".conv_pre.weight",
-            _load_bf16(st, prefix + ".conv_pre.weight", ctx))
+            _load_w(st, prefix + ".conv_pre.weight", ctx))
         _put(tensors, name_to_idx, prefix + ".conv_pre.bias",
-            _load_bf16(st, prefix + ".conv_pre.bias", ctx))
+            _load_w(st, prefix + ".conv_pre.bias", ctx))
 
         # count ups
         var num_ups = 0
@@ -289,14 +294,14 @@ struct VocoderWeights(Movable):
         var channels_per_stage = List[Int]()
         for i in range(num_ups):
             var wname = prefix + ".ups." + String(i) + ".weight"
-            var w_raw = _load_bf16(st, wname, ctx)
+            var w_raw = _load_w(st, wname, ctx)
             # ConvTranspose1d weight [Cin, Cout, K]; precompute -> Conv1d layout.
             var c_out = w_raw.shape()[1]
             channels_per_stage.append(c_out)
             var w_pre = precompute_conv_transpose_weight(w_raw, 1, ctx)
             _put(tensors, name_to_idx, prefix + ".ups." + String(i) + ".preconv", w_pre^)
             _put(tensors, name_to_idx, prefix + ".ups." + String(i) + ".bias",
-                _load_bf16(st, prefix + ".ups." + String(i) + ".bias", ctx))
+                _load_w(st, prefix + ".ups." + String(i) + ".bias", ctx))
 
         var final_channels = channels_per_stage[num_ups - 1]
 
@@ -308,10 +313,10 @@ struct VocoderWeights(Movable):
                 for j in range(3):
                     var c1 = bp + ".convs1." + String(j)
                     var c2 = bp + ".convs2." + String(j)
-                    _put(tensors, name_to_idx, c1 + ".weight", _load_bf16(st, c1 + ".weight", ctx))
-                    _put(tensors, name_to_idx, c1 + ".bias", _load_bf16(st, c1 + ".bias", ctx))
-                    _put(tensors, name_to_idx, c2 + ".weight", _load_bf16(st, c2 + ".weight", ctx))
-                    _put(tensors, name_to_idx, c2 + ".bias", _load_bf16(st, c2 + ".bias", ctx))
+                    _put(tensors, name_to_idx, c1 + ".weight", _load_w(st, c1 + ".weight", ctx))
+                    _put(tensors, name_to_idx, c1 + ".bias", _load_w(st, c1 + ".bias", ctx))
+                    _put(tensors, name_to_idx, c2 + ".weight", _load_w(st, c2 + ".weight", ctx))
+                    _put(tensors, name_to_idx, c2 + ".bias", _load_w(st, c2 + ".bias", ctx))
                     _put_act(acts, act_name_to_idx, bp + ".acts1." + String(j),
                             ActParams.load(st, bp + ".acts1." + String(j), ctx))
                     _put_act(acts, act_name_to_idx, bp + ".acts2." + String(j),
@@ -323,10 +328,10 @@ struct VocoderWeights(Movable):
 
         # conv_post (bias optional)
         _put(tensors, name_to_idx, prefix + ".conv_post.weight",
-            _load_bf16(st, prefix + ".conv_post.weight", ctx))
+            _load_w(st, prefix + ".conv_post.weight", ctx))
         if (prefix + ".conv_post.bias") in st.tensors:
             _put(tensors, name_to_idx, prefix + ".conv_post.bias",
-                _load_bf16(st, prefix + ".conv_post.bias", ctx))
+                _load_w(st, prefix + ".conv_post.bias", ctx))
 
         return VocoderWeights(
             tensors^, name_to_idx^, acts^, act_name_to_idx^,
@@ -471,7 +476,7 @@ def hann_sinc_resample_filter(
         data.append(Float32(sinc * window * rolloff / Float64(ratio)))
     var fsh = List[Int]()
     fsh.append(1); fsh.append(1); fsh.append(kernel_size)
-    var filt = Tensor.from_host(data, fsh^, STDtype.BF16, ctx)
+    var filt = Tensor.from_host(data, fsh^, STDtype.F32, ctx)  # F32: convolved with F32 vocoder output
     return (filt^, pad, pad_left, pad_right)
 
 
@@ -523,8 +528,8 @@ struct LTX2VocoderWithBWE(Movable):
         var st = SafeTensors.open(path)
         var voc = VocoderWeights.load(st, String("vocoder.vocoder"), False, ctx)
         var bwe = VocoderWeights.load(st, String("vocoder.bwe_generator"), False, ctx)
-        var mel_basis = _load_bf16(st, String("vocoder.mel_stft.mel_basis"), ctx)
-        var forward_basis = _load_bf16(
+        var mel_basis = _load_w(st, String("vocoder.mel_stft.mel_basis"), ctx)
+        var forward_basis = _load_w(
             st, String("vocoder.mel_stft.stft_fn.forward_basis"), ctx
         )
         var input_sr = 16000

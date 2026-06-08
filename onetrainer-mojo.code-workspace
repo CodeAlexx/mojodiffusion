@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../onetrainer-mojo"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../OneTrainer"
+		}
+	],
+	"settings": {}
+}

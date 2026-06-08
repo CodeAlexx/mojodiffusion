@@ -71,7 +71,8 @@ new kernel here when there is no callable Mojo/MAX primitive.
 
 | Kernel | Computes | Notes |
 |---|---|---|
-| `_bf16_to_f32`, `_f32_to_bf16`, `_f16_to_f32`, `_f32_to_f16` | GPU dtype cast over a flat tensor | Used by `cast_tensor`; same-dtype path is a D2D clone. |
+| `_bf16_to_f32`, `_f32_to_bf16`, `_f16_to_f32`, `_f32_to_f16` | GPU dtype cast over a flat tensor | Used by `cast_tensor`; same-dtype path is a D2D clone. ⚠️ `_f32_to_bf16` uses Mojo native `.cast[bfloat16]()` which differs from torch RNE by ~1 BF16 quantum — for parity-sensitive / iterative-loop F32→BF16 use `ops/torch_bf16.mojo::torch_f32_to_bf16_rne` instead (compounds in sampling loops; cos-blind). |
+| `torch_bf16_rne_value` / `_torch_f32_to_bf16_rne_kernel` (`ops/torch_bf16.mojo`) | F32→BF16 **round-to-nearest-even**, matches PyTorch/CUDA `__float2bfloat16` | mathematical RNE (binade→ULP 2^(e-7)→round ties-to-even); NaN/0/subnormal fall back to native cast. Use for parity gates + any F32→BF16 feeding a model inside a denoise loop (the NAVA loop distortion was native-cast accumulation). |
 
 ## ops/fp8.mojo — FP8 E4M3 → BF16 dequant (one thread/byte, grid-stride)
 

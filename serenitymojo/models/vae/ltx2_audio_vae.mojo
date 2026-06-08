@@ -128,10 +128,15 @@ struct LTX2AudioVaeDecoderWeights(Movable):
 
     @staticmethod
     def load(
-        checkpoint_path: String, ctx: DeviceContext
+        checkpoint_path: String, ctx: DeviceContext, f32: Bool = False
     ) raises -> LTX2AudioVaeDecoderWeights:
         """Load all audio decoder weights from the LTX-2.3 single-file checkpoint.
-        Only `audio_vae.decoder.*` + `audio_vae.per_channel_statistics.*` hit GPU."""
+        Only `audio_vae.decoder.*` + `audio_vae.per_channel_statistics.*` hit GPU.
+
+        `f32=True` upcasts every weight + stat to F32 so the whole decode runs in
+        F32 — required when the production reference runs the VAE in F32 (NAVA's
+        `init_ltx_vae` builds dtype=torch.float32). Default `False` keeps the
+        BF16 path used by the LTX-2 video model."""
         var sharded = ShardedSafeTensors.open(checkpoint_path)
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
@@ -176,7 +181,7 @@ struct LTX2AudioVaeDecoderWeights(Movable):
 
         for ref nm in wanted:
             var tv = sharded.tensor_view(nm)
-            var t = Tensor.from_view(tv, ctx)
+            var t = Tensor.from_view_as_f32(tv, ctx) if f32 else Tensor.from_view(tv, ctx)
             var idx = len(weights)
             weights.append(ArcPointer(t^))
             name_to_idx[nm] = idx
@@ -193,7 +198,7 @@ struct LTX2AudioVaeDecoderWeights(Movable):
                 for ref suf in [String(".weight"), String(".bias")]:
                     var k = base + suf
                     var tv2 = sharded.tensor_view(k)
-                    var t2 = Tensor.from_view(tv2, ctx)
+                    var t2 = Tensor.from_view_as_f32(tv2, ctx) if f32 else Tensor.from_view(tv2, ctx)
                     var idx2 = len(weights)
                     weights.append(ArcPointer(t2^))
                     name_to_idx[k] = idx2
@@ -206,11 +211,11 @@ struct LTX2AudioVaeDecoderWeights(Movable):
         var std_v = sharded.tensor_view(
             String("audio_vae.per_channel_statistics.std-of-means")
         )
-        var std_t = Tensor.from_view(std_v, ctx)
+        var std_t = Tensor.from_view_as_f32(std_v, ctx) if f32 else Tensor.from_view(std_v, ctx)
         var mean_v = sharded.tensor_view(
             String("audio_vae.per_channel_statistics.mean-of-means")
         )
-        var mean_t = Tensor.from_view(mean_v, ctx)
+        var mean_t = Tensor.from_view_as_f32(mean_v, ctx) if f32 else Tensor.from_view(mean_v, ctx)
         var bsh = List[Int]()
         bsh.append(1); bsh.append(1); bsh.append(PATCHED_CH)
         var stat_std = reshape(std_t, bsh.copy(), ctx)

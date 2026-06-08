@@ -354,6 +354,10 @@ struct Qwen3Tokenizer(Movable):
     var byte_to_uni: List[Int]
     # reverse vocab for decode: id -> codepoint-key string (built lazily)
     var id_to_token: Dict[Int, String]
+    # pre-tokenizer / BPE dialect:
+    #   False -> Qwen2 split pattern, ignore_merges=False (default, unchanged)
+    #   True  -> o200k (GPT-OSS) split pattern, ignore_merges=True
+    var pre_o200k: Bool
 
     def __init__(out self, json_path: String) raises:
         self.vocab = Dict[String, Int]()
@@ -362,6 +366,25 @@ struct Qwen3Tokenizer(Movable):
         self.special_ids = List[Int]()
         self.byte_to_uni = build_byte_to_unicode()
         self.id_to_token = Dict[Int, String]()
+        self.pre_o200k = False
+
+        var text = _read_utf8_file(json_path)
+        var bytes = text.as_bytes()
+
+        self._parse_vocab(bytes)
+        self._parse_merges(bytes)
+        self._parse_added_tokens(bytes)
+
+    def __init__(out self, json_path: String, o200k: Bool) raises:
+        # o200k (GPT-OSS) variant: same byte-level BPE JSON loader, but selects
+        # the o200k pre-tokenizer split and ignore_merges=True at encode time.
+        self.vocab = Dict[String, Int]()
+        self.merge_rank = Dict[String, Int]()
+        self.special_tokens = List[String]()
+        self.special_ids = List[Int]()
+        self.byte_to_uni = build_byte_to_unicode()
+        self.id_to_token = Dict[Int, String]()
+        self.pre_o200k = o200k
 
         var text = _read_utf8_file(json_path)
         var bytes = text.as_bytes()
@@ -382,6 +405,7 @@ struct Qwen3Tokenizer(Movable):
         self.special_ids = List[Int]()
         self.byte_to_uni = build_byte_to_unicode()
         self.id_to_token = Dict[Int, String]()
+        self.pre_o200k = False
 
         var vocab_text = _read_utf8_file(vocab_json_path)
         self._parse_vocab_object(vocab_text.as_bytes())
@@ -752,6 +776,185 @@ struct Qwen3Tokenizer(Movable):
         return out^
 
     # ------------------------------------------------------------------------
+    # o200k (GPT-OSS) pre-tokenizer scanner. Replicates the regex:
+    #   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+    # | [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+    # | \p{N}{1,3}
+    # |  ?[^\s\p{L}\p{N}]+[\r\n/]*
+    # | \s*[\r\n]+
+    # | \s+(?!\S)
+    # | \s+
+    # Matched leftmost-first (fancy-regex / Perl alternation order), greedy
+    # quantifiers with backtracking on the optional prefix and the U*/D+ split.
+    # ------------------------------------------------------------------------
+    def _contraction_o200k(self, cps: List[Int], i: Int, n: Int) -> Int:
+        # (?i:'s|'t|'re|'ve|'m|'ll|'d) -> returns matched length (0/2/3)
+        if i >= n or cps[i] != 0x27:
+            return 0
+        if i + 1 >= n:
+            return 0
+        var c1 = _lower(cps[i + 1])
+        if c1 == ord("s") or c1 == ord("t") or c1 == ord("m") or c1 == ord("d"):
+            return 2
+        if i + 2 < n:
+            var c2 = _lower(cps[i + 2])
+            if c1 == ord("r") and c2 == ord("e"):
+                return 3
+            if c1 == ord("v") and c2 == ord("e"):
+                return 3
+            if c1 == ord("l") and c2 == ord("l"):
+                return 3
+        return 0
+
+    def _match_letters_o200k(self, cps: List[Int], i: Int, n: Int) -> Int:
+        # Branches 1 & 2 (letter runs). Returns match end (>i) or -1 if no match.
+        # Branch 1: P? U* D+ C?    (greedy P, greedy U*, backtrack so D+ >=1)
+        for t in range(2):
+            var take_prefix = t == 0
+            if take_prefix and not _is_prefix_char(cps[i]):
+                continue
+            var pos = i + (1 if take_prefix else 0)
+            if pos >= n:
+                continue
+            # greedy U*
+            var ue = pos
+            while ue < n and _is_upperish(cps[ue]):
+                ue += 1
+            # backtrack U* down to pos: largest u with a lowerish char (D+ start)
+            var found = -1
+            var u = ue
+            while u >= pos:
+                if u < n and _is_lowerish(cps[u]):
+                    found = u
+                    break
+                u -= 1
+            if found >= 0:
+                var de = found
+                while de < n and _is_lowerish(cps[de]):
+                    de += 1
+                return de + self._contraction_o200k(cps, de, n)
+        # Branch 2: P? U+ D* C?
+        for t in range(2):
+            var take_prefix = t == 0
+            if take_prefix and not _is_prefix_char(cps[i]):
+                continue
+            var pos = i + (1 if take_prefix else 0)
+            if pos < n and _is_upperish(cps[pos]):
+                var ue = pos
+                while ue < n and _is_upperish(cps[ue]):
+                    ue += 1
+                var de = ue
+                while de < n and _is_lowerish(cps[de]):
+                    de += 1
+                return de + self._contraction_o200k(cps, de, n)
+        return -1
+
+    def _pretokenize_o200k(self, cps: List[Int]) -> List[List[Int]]:
+        var out = List[List[Int]]()
+        var n = len(cps)
+        var i = 0
+        while i < n:
+            # 1 & 2) letter runs
+            var le = self._match_letters_o200k(cps, i, n)
+            if le > i:
+                var seg = List[Int]()
+                for m in range(i, le):
+                    seg.append(cps[m])
+                out.append(seg^)
+                i = le
+                continue
+
+            # 3) \p{N}{1,3}  (digits, runs of at most 3)
+            if is_digit(cps[i]):
+                var k = i
+                var cnt = 0
+                while k < n and is_digit(cps[k]) and cnt < 3:
+                    k += 1
+                    cnt += 1
+                var seg = List[Int]()
+                for m in range(i, k):
+                    seg.append(cps[m])
+                out.append(seg^)
+                i = k
+                continue
+
+            # 4)  ?[^\s\p{L}\p{N}]+[\r\n/]*
+            var s = i
+            if (
+                cps[s] == 0x20
+                and s + 1 < n
+                and not is_whitespace(cps[s + 1])
+                and not is_letter(cps[s + 1])
+                and not is_digit(cps[s + 1])
+            ):
+                s += 1
+            if (
+                not is_whitespace(cps[s])
+                and not is_letter(cps[s])
+                and not is_digit(cps[s])
+            ):
+                var k = s
+                while (
+                    k < n
+                    and not is_whitespace(cps[k])
+                    and not is_letter(cps[k])
+                    and not is_digit(cps[k])
+                ):
+                    k += 1
+                # trailing [\r\n/]*
+                while k < n and (is_newline(cps[k]) or cps[k] == 0x2F):
+                    k += 1
+                var seg = List[Int]()
+                for m in range(i, k):
+                    seg.append(cps[m])
+                out.append(seg^)
+                i = k
+                continue
+
+            # 5/6/7) whitespace handling (identical to Qwen2 path)
+            if is_whitespace(cps[i]):
+                var we = i
+                while we < n and is_whitespace(cps[we]):
+                    we += 1
+                var last_nl = -1
+                for m in range(i, we):
+                    if is_newline(cps[m]):
+                        last_nl = m
+                if last_nl >= 0:
+                    var end = last_nl + 1
+                    var seg = List[Int]()
+                    for m in range(i, end):
+                        seg.append(cps[m])
+                    out.append(seg^)
+                    i = end
+                    continue
+                else:
+                    if we == n:
+                        var seg = List[Int]()
+                        for m in range(i, we):
+                            seg.append(cps[m])
+                        out.append(seg^)
+                        i = we
+                        continue
+                    else:
+                        var end = we - 1
+                        if end <= i:
+                            end = i + 1
+                        var seg = List[Int]()
+                        for m in range(i, end):
+                            seg.append(cps[m])
+                        out.append(seg^)
+                        i = end
+                        continue
+
+            # Fallback: emit one codepoint.
+            var seg = List[Int]()
+            seg.append(cps[i])
+            out.append(seg^)
+            i += 1
+        return out^
+
+    # ------------------------------------------------------------------------
     # BPE over one pre-token's byte-level codepoints.
     # ------------------------------------------------------------------------
     def _bpe(self, units: List[String]) raises -> List[String]:
@@ -759,6 +962,16 @@ struct Qwen3Tokenizer(Movable):
         # string, here each representing exactly ONE unicode char). Greedily
         # merge the lowest-rank adjacent pair until no merge applies.
         var word = units.copy()
+        # ignore_merges=True (o200k / GPT-OSS): if the WHOLE byte-level pre-token
+        # is itself a vocab token, emit it directly without applying any merges.
+        if self.pre_o200k and len(word) >= 1:
+            var whole = word[0]
+            for k in range(1, len(word)):
+                whole = _merge_keys(whole, word[k])
+            if whole in self.vocab:
+                var single = List[String]()
+                single.append(whole)
+                return single^
         if len(word) < 2:
             return word^
         while True:
@@ -806,7 +1019,7 @@ struct Qwen3Tokenizer(Movable):
                 continue
             # ordinary text segment -> codepoints -> pretokenize -> bytelevel -> bpe
             var cps = _str_to_cps(seg.text)
-            var pretoks = self._pretokenize(cps)
+            var pretoks = self._pretokenize_o200k(cps) if self.pre_o200k else self._pretokenize(cps)
             for pt_idx in range(len(pretoks)):
                 ref pt = pretoks[pt_idx]
                 # byte-level expand: each codepoint -> its UTF-8 bytes -> mapped
@@ -913,6 +1126,90 @@ def _lower(cp: Int) -> Int:
     if cp >= 65 and cp <= 90:
         return cp + 32
     return cp
+
+
+# ----------------------------------------------------------------------------
+# o200k Unicode-category helpers (\p{Lu}/\p{Lt}, \p{Ll}, \p{M}, prefix class)
+# ----------------------------------------------------------------------------
+# Exact for ASCII + common Latin/Greek/Cyrillic cased letters; uncased letters
+# (CJK/Hangul/Arabic/... = \p{Lo}) and marks fall into BOTH the upper-ish and
+# lower-ish classes, matching the regex where Lm/Lo/M appear in both branches.
+@always_inline
+def _is_upper_cp(cp: Int) -> Bool:
+    # \p{Lu} | \p{Lt} approximation (cased uppercase only)
+    if cp >= 65 and cp <= 90:
+        return True
+    if cp >= 0x00C0 and cp <= 0x00DE and cp != 0x00D7:
+        return True
+    if cp >= 0x0391 and cp <= 0x03A9:  # Greek capital
+        return True
+    if cp >= 0x0400 and cp <= 0x042F:  # Cyrillic capital
+        return True
+    return False
+
+
+@always_inline
+def _is_lower_cp(cp: Int) -> Bool:
+    # \p{Ll} approximation (cased lowercase only)
+    if cp >= 97 and cp <= 122:
+        return True
+    if cp == 0x00B5:  # micro sign
+        return True
+    if cp >= 0x00DF and cp <= 0x00FF and cp != 0x00F7:
+        return True
+    if cp >= 0x03B1 and cp <= 0x03C9:  # Greek small
+        return True
+    if cp >= 0x0430 and cp <= 0x044F:  # Cyrillic small
+        return True
+    return False
+
+
+@always_inline
+def _is_mark(cp: Int) -> Bool:
+    # \p{M} approximation: common combining-mark ranges.
+    if cp >= 0x0300 and cp <= 0x036F:  # combining diacritical marks
+        return True
+    if cp >= 0x0483 and cp <= 0x0489:  # Cyrillic combining
+        return True
+    if cp >= 0x0591 and cp <= 0x05BD:  # Hebrew points
+        return True
+    if cp >= 0x0610 and cp <= 0x061A:
+        return True
+    if cp >= 0x064B and cp <= 0x065F:  # Arabic diacritics
+        return True
+    if cp == 0x0670:
+        return True
+    if cp >= 0x06D6 and cp <= 0x06DC:
+        return True
+    if cp >= 0x0900 and cp <= 0x0903:  # Devanagari signs
+        return True
+    if cp >= 0x093A and cp <= 0x094F:
+        return True
+    if cp >= 0x20D0 and cp <= 0x20FF:  # combining marks for symbols
+        return True
+    return False
+
+
+@always_inline
+def _is_upperish(cp: Int) -> Bool:
+    # \p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M} : any letter that is NOT lowercase, or a mark.
+    if _is_mark(cp):
+        return True
+    return is_letter(cp) and not _is_lower_cp(cp)
+
+
+@always_inline
+def _is_lowerish(cp: Int) -> Bool:
+    # \p{Ll}\p{Lm}\p{Lo}\p{M} : any letter that is NOT uppercase, or a mark.
+    if _is_mark(cp):
+        return True
+    return is_letter(cp) and not _is_upper_cp(cp)
+
+
+@always_inline
+def _is_prefix_char(cp: Int) -> Bool:
+    # [^\r\n\p{L}\p{N}] : not CR/LF, not a letter, not a digit.
+    return not is_newline(cp) and not is_letter(cp) and not is_digit(cp)
 
 
 def _str_to_cps(s: String) -> List[Int]:

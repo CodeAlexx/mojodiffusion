@@ -169,9 +169,9 @@ def _copy_view_bytes[
     return host^
 
 
-def _load_conv3d_qrscf_bf16[
+def _load_conv3d_qrscf[
     mut: Bool, //, origin: Origin[mut=mut]
-](tv: TensorView[origin], ctx: DeviceContext) raises -> Tensor:
+](tv: TensorView[origin], out_dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
     var sh = tv.shape.copy()
     if len(sh) != 5:
         raise Error("Wan22 VAE conv3d loader expected rank-5 OIDHW")
@@ -182,8 +182,9 @@ def _load_conv3d_qrscf_bf16[
     var kw = sh[4]
     var n = cout * cin * kd * kh * kw
     var host_in = _copy_view_bytes(tv, ctx)
-    var host_out = ctx.enqueue_create_host_buffer[DType.uint8](n * 2)
-    var outp = host_out.unsafe_ptr().bitcast[BFloat16]()
+    # Always repack into a host F32 buffer first, then materialise at out_dtype.
+    var f32_buf = List[Float32]()
+    f32_buf.resize(n, Float32(0.0))
     if tv.dtype == STDtype.F32:
         var fp = host_in.unsafe_ptr().bitcast[Float32]()
         for o in range(cout):
@@ -193,7 +194,7 @@ def _load_conv3d_qrscf_bf16[
                         for c in range(kw):
                             var src = ((((o * cin + ci) * kd + d) * kh + r) * kw + c)
                             var dst = ((((d * kh + r) * kw + c) * cin + ci) * cout + o)
-                            outp[dst] = fp[src].cast[DType.bfloat16]()
+                            f32_buf[dst] = fp[src]
     elif tv.dtype == STDtype.BF16:
         var bp = host_in.unsafe_ptr().bitcast[BFloat16]()
         for o in range(cout):
@@ -203,7 +204,7 @@ def _load_conv3d_qrscf_bf16[
                         for c in range(kw):
                             var src = ((((o * cin + ci) * kd + d) * kh + r) * kw + c)
                             var dst = ((((d * kh + r) * kw + c) * cin + ci) * cout + o)
-                            outp[dst] = bp[src]
+                            f32_buf[dst] = bp[src].cast[DType.float32]()
     elif tv.dtype == STDtype.F16:
         var hp16 = host_in.unsafe_ptr().bitcast[Float16]()
         for o in range(cout):
@@ -213,20 +214,17 @@ def _load_conv3d_qrscf_bf16[
                         for c in range(kw):
                             var src = ((((o * cin + ci) * kd + d) * kh + r) * kw + c)
                             var dst = ((((d * kh + r) * kw + c) * cin + ci) * cout + o)
-                            outp[dst] = hp16[src].cast[DType.float32]().cast[DType.bfloat16]()
+                            f32_buf[dst] = hp16[src].cast[DType.float32]()
     else:
         raise Error("Wan22 VAE conv3d loader supports F32/BF16/F16 only")
-    var dev = ctx.enqueue_create_buffer[DType.uint8](n * 2)
-    ctx.enqueue_copy(dst_buf=dev, src_buf=host_out)
-    ctx.synchronize()
     var osh = List[Int]()
     osh.append(kd); osh.append(kh); osh.append(kw); osh.append(cin); osh.append(cout)
-    return Tensor(dev^, osh^, STDtype.BF16)
+    return Tensor.from_host(f32_buf, osh^, out_dtype, ctx)
 
 
-def _load_conv2d_qrscf_bf16[
+def _load_conv2d_qrscf[
     mut: Bool, //, origin: Origin[mut=mut]
-](tv: TensorView[origin], ctx: DeviceContext) raises -> Tensor:
+](tv: TensorView[origin], out_dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
     var sh = tv.shape.copy()
     if len(sh) != 4:
         raise Error("Wan22 VAE conv2d loader expected rank-4 OIHW")
@@ -236,8 +234,9 @@ def _load_conv2d_qrscf_bf16[
     var kw = sh[3]
     var n = cout * cin * kh * kw
     var host_in = _copy_view_bytes(tv, ctx)
-    var host_out = ctx.enqueue_create_host_buffer[DType.uint8](n * 2)
-    var outp = host_out.unsafe_ptr().bitcast[BFloat16]()
+    # Always repack into a host F32 buffer first, then materialise at out_dtype.
+    var f32_buf = List[Float32]()
+    f32_buf.resize(n, Float32(0.0))
     if tv.dtype == STDtype.F32:
         var fp = host_in.unsafe_ptr().bitcast[Float32]()
         for o in range(cout):
@@ -246,7 +245,7 @@ def _load_conv2d_qrscf_bf16[
                     for c in range(kw):
                         var src = (((o * cin + ci) * kh + r) * kw + c)
                         var dst = (((r * kw + c) * cin + ci) * cout + o)
-                        outp[dst] = fp[src].cast[DType.bfloat16]()
+                        f32_buf[dst] = fp[src]
     elif tv.dtype == STDtype.BF16:
         var bp = host_in.unsafe_ptr().bitcast[BFloat16]()
         for o in range(cout):
@@ -255,7 +254,7 @@ def _load_conv2d_qrscf_bf16[
                     for c in range(kw):
                         var src = (((o * cin + ci) * kh + r) * kw + c)
                         var dst = (((r * kw + c) * cin + ci) * cout + o)
-                        outp[dst] = bp[src]
+                        f32_buf[dst] = bp[src].cast[DType.float32]()
     elif tv.dtype == STDtype.F16:
         var hp16 = host_in.unsafe_ptr().bitcast[Float16]()
         for o in range(cout):
@@ -264,15 +263,12 @@ def _load_conv2d_qrscf_bf16[
                     for c in range(kw):
                         var src = (((o * cin + ci) * kh + r) * kw + c)
                         var dst = (((r * kw + c) * cin + ci) * cout + o)
-                        outp[dst] = hp16[src].cast[DType.float32]().cast[DType.bfloat16]()
+                        f32_buf[dst] = hp16[src].cast[DType.float32]()
     else:
         raise Error("Wan22 VAE conv2d loader supports F32/BF16/F16 only")
-    var dev = ctx.enqueue_create_buffer[DType.uint8](n * 2)
-    ctx.enqueue_copy(dst_buf=dev, src_buf=host_out)
-    ctx.synchronize()
     var osh = List[Int]()
     osh.append(1); osh.append(kh); osh.append(kw); osh.append(cin); osh.append(cout)
-    return Tensor(dev^, osh^, STDtype.BF16)
+    return Tensor.from_host(f32_buf, osh^, out_dtype, ctx)
 
 
 def _dup_up3d_kernel_f32(
@@ -691,6 +687,7 @@ struct Wan22VaeImageDecoder[LH: Int, LW: Int]:
     var name_to_idx: Dict[String, Int]
     var mean: Tensor
     var inv_std: Tensor
+    var compute_dtype: STDtype
 
     def __init__(
         out self,
@@ -698,14 +695,21 @@ struct Wan22VaeImageDecoder[LH: Int, LW: Int]:
         var name_to_idx: Dict[String, Int],
         var mean: Tensor,
         var inv_std: Tensor,
+        compute_dtype: STDtype = STDtype.BF16,
     ):
         self.weights = weights^
         self.name_to_idx = name_to_idx^
         self.mean = mean^
         self.inv_std = inv_std^
+        self.compute_dtype = compute_dtype
 
     @staticmethod
-    def load(path: String, ctx: DeviceContext) raises -> Wan22VaeImageDecoder[Self.LH, Self.LW]:
+    def load(
+        path: String,
+        ctx: DeviceContext,
+        f32: Bool = False,
+    ) raises -> Wan22VaeImageDecoder[Self.LH, Self.LW]:
+        var cdtype = STDtype.F32 if f32 else STDtype.BF16
         var st = ShardedSafeTensors.open(path)
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
@@ -715,23 +719,28 @@ struct Wan22VaeImageDecoder[LH: Int, LW: Int]:
             var tv = st.tensor_view(nm)
             var t: Tensor
             if nm.endswith(".weight") and len(tv.shape) == 5:
-                t = _load_conv3d_qrscf_bf16(tv, ctx)
+                t = _load_conv3d_qrscf(tv, cdtype, ctx)
             elif _is_resample_conv2d_weight(nm):
-                t = _load_conv2d_qrscf_bf16(tv, ctx)
+                t = _load_conv2d_qrscf(tv, cdtype, ctx)
             else:
-                t = Tensor.from_view_as_bf16(tv, ctx)
+                if f32:
+                    t = Tensor.from_view_as_f32(tv, ctx)
+                else:
+                    t = Tensor.from_view_as_bf16(tv, ctx)
             var idx = len(weights)
             weights.append(ArcPointer(t^))
             name_to_idx[nm] = idx
 
         var msh = _shape5(1, 1, 1, 1, 48)
-        var mean = Tensor.from_host(_wan22_mean(), msh.copy(), STDtype.BF16, ctx)
+        var mean = Tensor.from_host(_wan22_mean(), msh.copy(), cdtype, ctx)
         var stds = _wan22_std()
         var inv = List[Float32]()
         for i in range(len(stds)):
             inv.append(Float32(1.0) / stds[i])
-        var inv_std = Tensor.from_host(inv, msh^, STDtype.BF16, ctx)
-        return Wan22VaeImageDecoder[Self.LH, Self.LW](weights^, name_to_idx^, mean^, inv_std^)
+        var inv_std = Tensor.from_host(inv, msh^, cdtype, ctx)
+        return Wan22VaeImageDecoder[Self.LH, Self.LW](
+            weights^, name_to_idx^, mean^, inv_std^, cdtype
+        )
 
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
         if name not in self.name_to_idx:
@@ -1063,8 +1072,8 @@ struct Wan22VaeImageDecoder[LH: Int, LW: Int]:
         if len(ls) != 2 or ls[0] != Self.LH * Self.LW or ls[1] != 48:
             raise Error("Wan22 decode_tokens expects [LH*LW,48]")
         var lat: Tensor
-        if latent_lc.dtype() != STDtype.BF16:
-            lat = cast_tensor(latent_lc, STDtype.BF16, ctx)
+        if latent_lc.dtype() != self.compute_dtype:
+            lat = cast_tensor(latent_lc, self.compute_dtype, ctx)
         else:
             lat = _clone(latent_lc, ctx)
         var z4 = reshape(lat, _shape4(1, Self.LH, Self.LW, 48), ctx)
@@ -1130,8 +1139,8 @@ struct Wan22VaeImageDecoder[LH: Int, LW: Int]:
         if len(ls) != 2 or ls[0] != latent_t * Self.LH * Self.LW or ls[1] != 48:
             raise Error("Wan22 decode_video_tokens expects [T*LH*LW,48]")
         var lat: Tensor
-        if latent_lc.dtype() != STDtype.BF16:
-            lat = cast_tensor(latent_lc, STDtype.BF16, ctx)
+        if latent_lc.dtype() != self.compute_dtype:
+            lat = cast_tensor(latent_lc, self.compute_dtype, ctx)
         else:
             lat = _clone(latent_lc, ctx)
 

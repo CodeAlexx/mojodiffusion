@@ -450,6 +450,196 @@ def _sdpa_math[
             qs, ks, vs, ms, scale, ctx, apply_mask, q.dtype())
 
 
+# ── head-chunked math SDPA (bit-identical to _sdpa_math, smaller peak) ───────
+# WHY: _sdpa_math_storage materializes the F32 scores for ALL heads at once:
+# [B*H, S, S] F32 = B*H*S*S*4 bytes. At B=1,H=24,S=4297 that is ~1.77 GB — the
+# single biggest transient in a Lens 1024 block. Heads are fully independent
+# (QKᵀ per head → scale+mask per head's rows → softmax per row → P@V per head),
+# so we process ONE head at a time, REUSING a single [S,S] F32 scores buffer.
+# Every kernel call is the SAME op on the SAME data as the batched path, just
+# interleaved per head; on a single stream the buffer reuse is correctly
+# serialized. The result is BIT-IDENTICAL to _sdpa_math_storage; only the scores
+# peak drops from O(B*H*S*S) to O(S*S) (~74 MB vs ~1.77 GB at S=4297).
+def _sdpa_math_storage_chunked[
+    B: Int, S: Int, H: Int, Dh: Int, dtype: DType
+](
+    qs: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    ks: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    vs: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    mask: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # [B*H*S, S]
+    scale: Float32,
+    ctx: DeviceContext,
+    apply_mask: Bool,
+    out_dt: STDtype,
+) raises -> Tensor:
+    comptime BH = B * H
+    comptime src_rows = B * S * H
+    comptime bhsd_rows = B * H * S
+
+    # ── 1) gather q/k/v BSHD -> BHSD-contiguous storage [B*H*S, Dh] ──────────
+    var q_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var k_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var v_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var bhsd_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](bhsd_rows, Dh))
+    var qd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](q_buf.unsafe_ptr(), bhsd_rl)
+    var kd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](k_buf.unsafe_ptr(), bhsd_rl)
+    var vd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](v_buf.unsafe_ptr(), bhsd_rl)
+    var ngather = B * H * S * Dh
+    var ggrid = (ngather + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](qs, qd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](ks, kd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](vs, vd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+
+    # ── single REUSED per-head F32 scores buffer [S, S] + full F32 output ────
+    var scores = ctx.enqueue_create_buffer[DType.float32](S * S)
+    var out_f32 = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var head_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, Dh))
+    var sc_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, S))
+    var qptr = q_buf.unsafe_ptr()
+    var kptr = k_buf.unsafe_ptr()
+    var vptr = v_buf.unsafe_ptr()
+    var scptr = scores.unsafe_ptr()
+    var optr = out_f32.unsafe_ptr()
+    var maskptr = mask.ptr
+
+    var nsm = S * S
+    var smgrid = (nsm + _BLOCK - 1) // _BLOCK
+    var pv_total = S * Dh
+    var pv_grid = (pv_total + _BLOCK - 1) // _BLOCK
+
+    for bh in range(BH):
+        # QKᵀ for this head -> scores[S,S] (row-major).
+        var A = LayoutTensor[dtype, _DYN2, MutAnyOrigin](qptr + bh * S * Dh, head_rl)
+        var Bt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](kptr + bh * S * Dh, head_rl)
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](scptr, sc_rl)
+        matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)
+
+        # scale (+ optional additive mask for this head's [S,S] block).
+        var sc_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](scptr, sc_rl)
+        if apply_mask:
+            var mh = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+                maskptr + bh * S * S, sc_rl
+            )
+            ctx.enqueue_function[_scale_mask[dtype], _scale_mask[dtype]](
+                sc_full, mh, scale, S, S, grid_dim=smgrid, block_dim=_BLOCK)
+        else:
+            ctx.enqueue_function[_scale_f32, _scale_f32](
+                sc_full, scale, S, S, grid_dim=smgrid, block_dim=_BLOCK)
+
+        # softmax over last dim, one block per row.
+        ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
+            sc_full, S, grid_dim=S, block_dim=_TPB)
+
+        # P @ V for this head -> out_f32[bh*S*Dh : ...].
+        comptime if dtype == DType.float32:
+            var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](scptr, sc_rl)
+            var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                vptr.bitcast[Float32]() + bh * S * Dh, head_rl
+            )
+            var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                optr + bh * S * Dh, head_rl
+            )
+            matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
+        else:
+            var Vh = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+                vptr + bh * S * Dh, head_rl
+            )
+            var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                optr + bh * S * Dh, head_rl
+            )
+            # _attn_pv_kernel with B=1,H=1: probs[S,S], v[S,Dh], dst[S,Dh].
+            ctx.enqueue_function[
+                _attn_pv_kernel[dtype], _attn_pv_kernel[dtype]
+            ](sc_full, Vh, Oh, 1, S, S, 1, Dh, grid_dim=pv_grid, block_dim=_BLOCK)
+
+    # ── scatter BHSD F32 -> BSHD output in storage dtype ─────────────────────
+    var bsz = out_dt.byte_size()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](B * S * H * Dh * bsz)
+    var out_src = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](optr, bhsd_rl)
+    var nsc = B * H * S * Dh
+    var scgrid = (nsc + _BLOCK - 1) // _BLOCK
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    comptime if dtype == DType.float32:
+        var Od = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        ctx.enqueue_function[_scatter_bhsd_to_bshd_f32, _scatter_bhsd_to_bshd_f32](
+            out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+    elif dtype == DType.bfloat16:
+        var Od = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        ctx.enqueue_function[_scatter_bhsd_to_bshd_bf16, _scatter_bhsd_to_bshd_bf16](
+            out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+    else:
+        var Od = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        ctx.enqueue_function[_scatter_bhsd_to_bshd_f16, _scatter_bhsd_to_bshd_f16](
+            out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+
+    var out_shape = List[Int]()
+    out_shape.append(B)
+    out_shape.append(S)
+    out_shape.append(H)
+    out_shape.append(Dh)
+    return Tensor(out_buf^, out_shape^, out_dt)
+
+
+def _sdpa_math_chunked[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+    apply_mask: Bool,
+) raises -> Tensor:
+    var dt = q.dtype().to_mojo_dtype()
+    comptime src_rows = B * S * H
+    comptime sm_rows = B * H * S
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    var mask_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](sm_rows, S))
+    if dt == DType.float32:
+        var qs = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var ks = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var vs = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var ms = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            mask.buf.unsafe_ptr().bitcast[Float32](), mask_rl)
+        return _sdpa_math_storage_chunked[B, S, H, Dh, DType.float32](
+            qs, ks, vs, ms, scale, ctx, apply_mask, q.dtype())
+    elif dt == DType.bfloat16:
+        var qs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var ks = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var vs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var ms = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            mask.buf.unsafe_ptr().bitcast[BFloat16](), mask_rl)
+        return _sdpa_math_storage_chunked[B, S, H, Dh, DType.bfloat16](
+            qs, ks, vs, ms, scale, ctx, apply_mask, q.dtype())
+    else:
+        var qs = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var ks = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var vs = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var ms = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            mask.buf.unsafe_ptr().bitcast[Float16](), mask_rl)
+        return _sdpa_math_storage_chunked[B, S, H, Dh, DType.float16](
+            qs, ks, vs, ms, scale, ctx, apply_mask, q.dtype())
+
+
 # ── memory-efficient (online-softmax) tiled SDPA ────────────────────────────
 # WHY: the math-mode path above materializes the full F32 scores [B*H, S, S].
 # At S=32760 that is ~68 GB → OOM, and the SDK flash path won't compile at
@@ -1243,6 +1433,46 @@ def sdpa[
         return _sdpa_flash[B, S, H, Dh](q, k, v, mask, scale, ctx)
     else:
         return _sdpa_math[B, S, H, Dh](q, k, v, mask, scale, ctx, True)
+
+
+def sdpa_chunked[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Head-chunked math SDPA — BIT-IDENTICAL output to `sdpa`, smaller peak.
+
+    Same contract as `sdpa` (full non-causal attention, additive [B,H,S,S] mask),
+    but the F32 scores slab is held for ONE head at a time ([S,S]) instead of all
+    heads ([B*H,S,S]). Use when the [B*H,S,S] F32 scores would dominate VRAM
+    (e.g. Lens 1024: H=24, S=4297 → 1.77 GB scores). Heads are independent so the
+    per-head QKᵀ/scale+mask/softmax/P@V is the exact same arithmetic as `sdpa`;
+    the result matches to the bit.
+    """
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype():
+        raise Error("sdpa_chunked: q/k/v dtype mismatch")
+    if q.dtype() != mask.dtype():
+        raise Error("sdpa_chunked: q/mask dtype mismatch")
+    var qshape = q.shape()
+    if len(qshape) != 4:
+        raise Error("sdpa_chunked: q must be rank-4 [B,S,H,Dh]")
+    if (
+        qshape[0] != B or qshape[1] != S or qshape[2] != H or qshape[3] != Dh
+    ):
+        raise Error("sdpa_chunked: q shape does not match compile-time B/S/H/Dh")
+    var mshape = mask.shape()
+    if (
+        len(mshape) != 4
+        or mshape[0] != B or mshape[1] != H
+        or mshape[2] != S or mshape[3] != S
+    ):
+        raise Error("sdpa_chunked: mask must be [B,H,S,S]")
+    return _sdpa_math_chunked[B, S, H, Dh](q, k, v, mask, scale, ctx, True)
 
 
 def sdpa_nomask[

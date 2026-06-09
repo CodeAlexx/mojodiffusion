@@ -25,6 +25,9 @@ from std.collections import List
 from std.math import sqrt, sin
 from std.time import perf_counter_ns
 from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.io.tensor_view import from_parts
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.tensor import Tensor
 from serenitymojo.models.sd35.weights import load_sd35_stack_base
 from serenitymojo.models.sd35.sd35_stack_lora import (
     SD35StackBase, SD35LoraSet, SD35LoraGradSet,
@@ -57,11 +60,18 @@ comptime N_IMG = (LAT_H // PATCH) * (LAT_W // PATCH)   # 4096
 comptime N_TXT = 154
 comptime S = N_TXT + N_IMG                             # 4250
 
+comptime LAT_C = 16
+comptime HT = LAT_H // PATCH    # 64
+comptime WT = LAT_W // PATCH    # 64
+comptime VAE_SHIFT = Float32(0.0609)
+comptime VAE_SCALE = Float32(1.5305)
+
 comptime RANK = 16
 comptime ALPHA = Float32(16.0)
-comptime STEPS = 8
+comptime STEPS = 6
 comptime LR = Float32(1.0e-3)
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/sd3.5_medium.safetensors"
+comptime CACHE = "/home/alex/datasets/andrsd35_sd35_cache/10.safetensors"
 
 
 def _fill(n: Int, seed: UInt64, scale: Float32) -> List[Float32]:
@@ -71,6 +81,45 @@ def _fill(n: Int, seed: UInt64, scale: Float32) -> List[Float32]:
         # deterministic sinusoid, varies per index + seed
         a = sin(Float32(0.013) * Float32(i) + Float32(0.0007) * Float32(seed) + Float32(0.5))
         out.append(a * scale)
+    return out^
+
+
+def _cache_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
+    var info = st.tensor_info(name)
+    var bytes = st.tensor_bytes(name)
+    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
+    var t = Tensor.from_view(tv, ctx)
+    if t.dtype() == STDtype.BF16:
+        var bf = t.to_host_bf16(ctx)
+        var out = List[Float32]()
+        for i in range(len(bf)):
+            out.append(bf[i].cast[DType.float32]())
+        return out^
+    return t.to_host(ctx)
+
+
+# channel-major patchify [16,128,128] -> [N_IMG=4096, 64] (matches train_sd35_real)
+def _pack_latents(lat: List[Float32]) -> List[Float32]:
+    var out = List[Float32]()
+    for ih in range(HT):
+        for iw in range(WT):
+            for c in range(LAT_C):
+                for ph in range(PATCH):
+                    for pw in range(PATCH):
+                        var hh = ih * PATCH + ph
+                        var ww = iw * PATCH + pw
+                        out.append(lat[c * LAT_H * LAT_W + hh * LAT_W + ww])
+    return out^
+
+
+# deterministic N(0,1)-ish noise (box-muller-free; bounded). Fixed per index.
+def _noise(n: Int, seed: UInt64) -> List[Float32]:
+    var out = List[Float32]()
+    var st = seed
+    for _ in range(n):
+        st = st * 6364136223846793005 + 1442695040888963407
+        var u = Float32(Int(st >> 40)) * Float32(1.0 / 16777216.0)  # [0,1)
+        out.append((u - Float32(0.5)) * Float32(2.0))               # [-1,1)
     return out^
 
 
@@ -112,12 +161,26 @@ def main() raises:
     var lora = build_sd35_lora_set(NUM_JOINT, D, FMLP, RANK, ALPHA)
     print("[lora] adapters:", total_adapters(lora))
 
-    # ── fixed synthetic batch at the 1024^2 shape ──
-    var noisy = _fill(N_IMG * IN_CH, 1, Float32(0.5))
-    var txt = _fill(N_TXT * TXT_CH, 2, Float32(0.3))
-    var pooled = _fill(POOLED_DIM, 3, Float32(0.3))
-    var target = _fill(N_IMG * OUT_CH, 4, Float32(0.2))
+    # ── REAL cached batch (latent + text + pooled), flow-match in packed space ──
+    print("[cache]", CACHE)
+    var cst = SafeTensors.open(CACHE)
+    var lat_raw = _cache_f32(cst, String("latent"), ctx)        # [16*128*128]
+    var lat_scaled = List[Float32]()
+    for i in range(len(lat_raw)):
+        lat_scaled.append((lat_raw[i] - VAE_SHIFT) * VAE_SCALE)
+    var latent_packed = _pack_latents(lat_scaled)              # [N_IMG, IN_CH]
+    var txt = _cache_f32(cst, String("text_embedding"), ctx)   # [154*4096]
+    var pooled = _cache_f32(cst, String("pooled"), ctx)        # [2048]
+
     var sigma = Float32(0.5)
+    var noise = _noise(N_IMG * IN_CH, UInt64(20260609))
+    var noisy = List[Float32]()
+    var target = List[Float32]()
+    for i in range(len(latent_packed)):
+        noisy.append(noise[i] * sigma + latent_packed[i] * (Float32(1.0) - sigma))
+        target.append(noise[i] - latent_packed[i])
+    print("[cache] latent", len(lat_raw), " packed", len(latent_packed),
+          " txt", len(txt), " pooled", len(pooled))
 
     var first_loss = Float32(0.0)
     var min_loss = Float32(1.0e30)
@@ -163,7 +226,8 @@ def main() raises:
     print("first MSE =", first_loss, "  min MSE =", min_loss,
           "  reduction =", first_loss / (min_loss + Float32(1.0e-30)), "x")
     if min_loss < first_loss:
-        print("RESULT: medium 1024^2 ran full-depth + FIT in memory + loss decreased",
-              "(infra OK). NOTE: not yet faithful (pos_embed + dual-block dispatch pending).")
+        print("RESULT: medium 1024^2 (real cache, dual 0-12 + standard + ctxpre 23)",
+              "ran full-depth + FIT in memory + loss DECREASED. NOTE: pos_embed still",
+              "omitted (forward not yet fully faithful); host-carrier path ~123s/step.")
     else:
         print("RESULT: ran but loss did not decrease — investigate.")

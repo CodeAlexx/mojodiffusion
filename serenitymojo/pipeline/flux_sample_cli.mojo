@@ -228,7 +228,12 @@ def encode_text(prompt: String, ctx: DeviceContext) raises -> FluxCaps:
 # ── FLUX Dev denoise loop (STEPS / GUIDANCE / SEED are comptime-fixed) ────────
 # Guidance-distilled: single DiT forward per step; guidance_vec is a MODEL
 # INPUT scalar, not a CFG multiplier.  No negative prompt is used.
-def denoise(caps: FluxCaps, ctx: DeviceContext) raises -> Tensor:
+#
+# STAGED LOADING: returns the packed latent on the HOST so that on return the DiT
+# (offloaded shared weights + loader + the GPU latent + rope) all drop, leaving a
+# clean GPU for the VAE decode stage (the 1024² decode needs a large contiguous
+# allocation; cross-stage residency + offload-churn fragmentation caused OOM).
+def denoise(caps: FluxCaps, ctx: DeviceContext) raises -> List[Float32]:
     print("[dit] loading FLUX.1-dev DiT (offloaded)")
     var model = Flux1Offloaded.load(DIT_PATH, Flux1Config.dev(), ctx)
     var rope = build_flux1_rope_tables[N_IMG, N_TXT, 24, 128](
@@ -277,7 +282,8 @@ def denoise(caps: FluxCaps, ctx: DeviceContext) raises -> Tensor:
         var dt = t_prev - t_curr
         img = add(img, mul_scalar(pred, dt, ctx), ctx)
 
-    return img^
+    # to HOST: drops the DiT-stage GPU state on return (staged loading).
+    return cast_tensor(img, STDtype.F32, ctx).to_host(ctx)
 
 
 # ── Prompt selection helpers (verbatim from qwenimage_sample_cli.mojo) ─────────
@@ -366,10 +372,17 @@ def main() raises:
     var caps = encode_text(prompt, ctx)
 
     # Denoise (STEPS/GUIDANCE/SEED are comptime-fixed; see file header).
-    var packed = denoise(caps, ctx)
+    # Returns the packed latent on HOST → the DiT stage's GPU is freed here,
+    # giving the VAE decode a clean GPU (staged loading).
+    var packed_h = denoise(caps, ctx)
 
-    # VAE decode.
+    # VAE decode (fresh GPU stage). Re-upload the host latent [1, N_IMG, 64].
     print("[vae] unpack + decode")
+    var psh = List[Int]()
+    psh.append(1)
+    psh.append(N_IMG)
+    psh.append(AE_IN_CHANNELS * 4)
+    var packed = Tensor.from_host(packed_h, psh^, STDtype.F32, ctx)
     var latent = _unpack_latent(packed, ctx)
     var vae = load_flux1_ldm_decoder[LATENT_H, LATENT_W](VAE_PATH, ctx)
     var img = vae.decode(latent, ctx)

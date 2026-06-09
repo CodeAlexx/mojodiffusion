@@ -333,3 +333,41 @@ template; `zimage/weights.mojo` already loads real block weights by key.
 - BF16 RoPE precision floor (memory `project_bf16_rope_pattern_audit`): the F32
   parity interior is the contract; the real bf16 run will sit at the bf16 floor.
 ```
+
+---
+
+## UPDATE 2026-06-09 — block LoRA-grad gate + oracle fidelity + overfit convergence (MEASURED)
+
+Three new gates run live this session, raising Z-Image to the Klein "TRAINS" bar
+**and one rung higher** (oracle fidelity to the real diffusers block now
+independently confirmed, which Klein's campaign never did):
+
+1. **Per-block LoRA d_A/d_B gate** — `models/zimage/parity/zimage_block_lora_parity.mojo`
+   (+ oracle `zimage_block_lora_oracle.py`). NextDiT main block + all 7 LoRA slots
+   (to_q/k/v/out + SwiGLU w1/w3/w2), rank 8 scale 2.0. Forward cos 0.99999, d_x
+   0.99999, trainable norm-scale + adaLN-mod grads ≥0.99999, **14 LoRA d_A/d_B all
+   cos ≥ 0.99997** (bf16 adapters). Frozen base projection grads are empty *by
+   design* (LoRA freezes base weights) — the gate checks only the still-trainable
+   norm/adaLN params + the adapters. → `VERDICT: PASS`.
+
+2. **Oracle fidelity vs REAL diffusers** — `models/zimage/parity/zimage_block_vs_diffusers.py`.
+   Drives the actual diffusers `ZImageTransformerBlock(modulation=True)` — the exact
+   class OneTrainer `ZImageModel` instantiates — at real dims (D3840/H30/Dh128/
+   F10240) in float64 and matches the oracle's hand math at **cos = 1.0
+   (max_abs ~1e-7)** on forward + d_x + all 15 weight grads (incl qk-norm/rope path
+   + adaLN modulation). LoRA delta == OneTrainer `LoRAModule.forward` (L328-329:
+   `orig + up(down(x))·alpha/rank`, A=[r,in] B=[out,r]) — code-identical. So the
+   Mojo→oracle→diffusers/OneTrainer chain is closed for block math; the per-block
+   torch oracle is now *measured*-authoritative, not asserted.
+
+3. **Multi-block overfit convergence** — `models/zimage/parity/zimage_overfit_convergence.mojo`.
+   Real stack (1 noise-refiner + 1 context-refiner + 2 main + final, S=10) through
+   fwd→MSE→bwd→clip→AdamW, 50 steps, one fixed batch. MSE driven **0.0444 → 4.7e-5
+   (945× reduction)**, no divergence (max@step≥3 = 0.007 ≪ start). → bf16 LoRA grads
+   ARE a correct descent direction. (Strict per-step monotonicity NOT required —
+   sub-1e-4 jitter is the bf16 noise floor; criterion is running-min ≥20× drop +
+   no divergence.)
+
+**Still unproven** (same caveat as the whole campaign): full-scale training at real
+dims (F=10240, all 30+4 blocks, real data/VAE/text-encoder wiring) and end-to-end
+image quality. The gates above use reduced dims (F=96, 4 blocks).

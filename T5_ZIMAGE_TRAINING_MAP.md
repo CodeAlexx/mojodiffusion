@@ -28,6 +28,20 @@ Sources read line-by-line: `zimage_dit.mojo`, `zimage_pipeline.mojo`,
 > smokes authored by prior sessions; I did NOT re-run those this session. Their
 > HAVE verdicts are code-read + smoke-inventory, not fresh runs. Re-run the
 > remaining parity smokes (esp. `sdpa_bwd_parity.mojo`) before a real T5 run.
+>
+> **UPDATE 2026-06-09 (MEASURED, live):** the composed Z-Image block backward is
+> now gated end-to-end at the LoRA-grad level and confirmed against the REAL
+> model, superseding the per-arm code-read inventory for the block path:
+>   3. `models/zimage/parity/zimage_block_lora_parity.mojo` — main block + 7 LoRA
+>      slots: 14 d_A/d_B cos≥0.99997, fwd/d_x/norm/adaLN grads ≥0.99999. PASS.
+>   4. `models/zimage/parity/zimage_block_vs_diffusers.py` — oracle math vs the
+>      ACTUAL diffusers `ZImageTransformerBlock` (OneTrainer's class), F64: fwd +
+>      d_x + all 15 weight grads (incl sdpa/rope/qk-norm/adaLN) **cos = 1.0**.
+>      A fresh live cross-check of the whole block backward — not a per-arm read.
+>   5. `models/zimage/parity/zimage_overfit_convergence.mojo` — real NR+CR+main
+>      stack overfits one batch, MSE 0.0444→4.7e-5 (945×), no divergence. PASS.
+> sdpa/rope arms are thus live-exercised inside (4) at F64 cos=1.0. A real
+> full-depth/full-dim (F=10240, 34 blocks) bf16 run is still the remaining step.
 
 ---
 

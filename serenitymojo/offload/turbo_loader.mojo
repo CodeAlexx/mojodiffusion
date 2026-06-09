@@ -630,23 +630,43 @@ struct TurboBlockLoader(Movable):
 # ─── helper: extract block prefix from a tensor name ─────────────────────────
 
 def _extract_block_prefix(name: String) -> String:
-    """Extract the two-component block prefix from a tensor name.
+    """Extract the block prefix = up to and including the first ALL-NUMERIC
+    dot-segment (the block index), inclusive of its trailing dot.
 
-    "layers.0.attn.weight"  -> "layers.0."
-    "layers.10.attn.weight" -> "layers.10."
-    Falls back to name + "." if fewer than two dots found."""
-    var dots = 0
-    var result = String("")
+    "layers.0.attn.weight"                              -> "layers.0."
+    "layers.10.attn.weight"                             -> "layers.10."
+    "model.diffusion_model.joint_blocks.0.x_block.w"    -> "model.diffusion_model.joint_blocks.0."
+    "double_blocks.3.img_attn.norm.1.weight"            -> "double_blocks.3."
+    Falls back to name + "." if no all-numeric segment is found.
+
+    NOTE: the old rule cut after the 2nd dot ("X.N." only), which mis-grouped
+    deeply-namespaced checkpoints like SD3.5 (`model.diffusion_model.joint_blocks.N.`)
+    into one giant `model.diffusion_model.` super-block — breaking per-block
+    prefetch ("no tensors for prefix") and oversizing the slab. The first-numeric
+    rule is backward-compatible with `X.N.` naming (N is the first number)."""
     var ptr = name.unsafe_ptr()
-    for i in range(name.byte_length()):
+    var n = name.byte_length()
+    var seg_start = 0
+    for i in range(n):
         var b = Int(ptr[i])
-        # Append char to result using chr().
-        result += String(chr(b))
         if b == 46:  # ord('.')
-            dots += 1
-            if dots == 2:
-                return result
-    # Fewer than 2 dots: use name + "." as the prefix.
+            if i > seg_start:
+                var allnum = True
+                for j in range(seg_start, i):
+                    var c = Int(ptr[j])
+                    if c < 48 or c > 57:  # not '0'..'9'
+                        allnum = False
+                        break
+                if allnum:
+                    var result = String("")
+                    for k in range(i + 1):
+                        result += String(chr(Int(ptr[k])))
+                    return result
+            seg_start = i + 1
+    # No all-numeric segment: fall back to name + "."
+    var result = String("")
+    for k in range(n):
+        result += String(chr(Int(ptr[k])))
     if not result.endswith("."):
         result += "."
     return result

@@ -41,6 +41,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
+from serenitymojo.ops.tensor_algebra import reshape
 from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.embeddings import t_embedder
@@ -518,11 +519,14 @@ def _x_embed(
     noisy_h: List[Float32], base: SD35StackBase,
     N_IMG: Int, IN_CH: Int, D: Int, ctx: DeviceContext,
 ) raises -> List[Float32]:
-    # x_embedder.proj is Conv2d(16,D,2,2) = linear on patch vectors [N_IMG, IN_CH]
+    # x_embedder.proj is Conv2d(16,D,2,2); the checkpoint stores it rank-4
+    # [D,16,2,2]. With stride=kernel it is a linear on patch vectors [N_IMG,64]:
+    # flatten the weight to [D, IN_CH] (row-major (c,kh,kw) == the patch layout).
     var xe_dtype = base.xe_w[].dtype()
+    var xe_w2 = reshape(base.xe_w[], [D, IN_CH], ctx)
     return linear(
         _t_as(noisy_h, [N_IMG, IN_CH], xe_dtype, ctx),
-        base.xe_w[],
+        xe_w2,
         Optional[Tensor](base.xe_b[].clone(ctx)),
         ctx,
     ).to_host(ctx)

@@ -68,6 +68,10 @@ comptime RANK = 16
 comptime ALPHA = Float32(16.0)
 comptime LR = Float32(1.0e-4)
 comptime SIGMA = Float32(0.5)
+# A valid SD3 raw VAE latent has std ~O(1-5); >LAT_STD_MAX means a corrupted
+# cache sample (measured: cache had samples with latent std 36 and 321, max 72704)
+# -> skip so one bad sample doesn't dominate training.
+comptime LAT_STD_MAX = Float32(20.0)
 comptime DEFAULT_STEPS = 6
 comptime CLIP = Float32(1.0)
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/sd3.5_medium.safetensors"
@@ -200,6 +204,8 @@ def main() raises:
     var train_start = perf_counter_ns()
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
+    var have_first = False
+    var trained = 0
     print("")
     print("step  sample              MSE          grad_norm   sec")
 
@@ -210,6 +216,20 @@ def main() raises:
         var lat_raw = _cache_f32(st, String("latent"), ctx)
         var txt = _cache_f32(st, String("text_embedding"), ctx)
         var pooled = _cache_f32(st, String("pooled"), ctx)
+
+        # latent sanity-check: reject corrupted cache samples (anomalous magnitude)
+        var lmean = Float32(0.0)
+        for i in range(len(lat_raw)):
+            lmean += lat_raw[i]
+        lmean = lmean / Float32(len(lat_raw))
+        var lss = Float32(0.0)
+        for i in range(len(lat_raw)):
+            var dd = lat_raw[i] - lmean
+            lss += dd * dd
+        var lstd = sqrt(lss / Float32(len(lat_raw)))
+        if lstd > LAT_STD_MAX:
+            print(step, " ", path, "  SKIP (latent std", lstd, ">", LAT_STD_MAX, "- corrupted cache sample)")
+            continue
 
         var lat_scaled = List[Float32]()
         for i in range(len(lat_raw)):
@@ -238,8 +258,10 @@ def main() raises:
             loss += diff * diff
             d_loss.append(inv_n * diff)
         loss = loss / Float32(nout)
-        if step == 0: first_loss = loss
+        if not have_first:
+            first_loss = loss; have_first = True
         last_loss = loss
+        trained += 1
 
         var grads = sd35_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
             d_loss, noisy.copy(), txt.copy(),
@@ -267,7 +289,7 @@ def main() raises:
     print("[save] wrote", npairs, "adapter pairs ->", OUT_LORA)
 
     print("")
-    print("first MSE =", first_loss, "  last MSE =", last_loss,
+    print("trained steps =", trained, "  first MSE =", first_loss, "  last MSE =", last_loss,
           "  total sec =", Float64(perf_counter_ns() - train_start) / 1.0e9)
     # B 0->nonzero on the WIRED slots = learning. Expected nonzero count = the
     # actually-applied LoRA slots: standard blocks 8 each, ctxpre block 5 (x*4 +

@@ -1143,3 +1143,480 @@ def sd35_joint_block_backward[
         cprb.d_input.copy(), xprb.d_input.copy(), ctx_g^, x_g^, ctx_lora^, x_lora^,
         cprb.d_qkv.copy(), xprb.d_qkv.copy()
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DUAL-ATTENTION joint block (sd3.5 blocks 0-12). Math verified byte-faithful to
+# diffusers JointTransformerBlock(use_dual_attention=True) in
+# parity/sd35_dual_block_vs_diffusers.py (cos=1.0 F64). The x stream gains:
+#   - SD35AdaLayerNormZeroX: shared ln1=LN(x), norm =modulate(ln1,scale_msa,shift_msa)
+#     (joint attn input) AND norm2=modulate(ln1,scale_msa2,shift_msa2) (attn2 input)
+#   - a SECOND self-attention attn2 on the x stream only (own qkv/proj + qk-norms),
+#     added to hidden before the MLP: x_hid += gate_msa2 * attn2(norm2)
+# Context stream is identical to the standard joint block.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+struct Attn2Weights(Copyable, Movable):
+    var wqkv: List[Float32]   # [3D, D]
+    var bqkv: List[Float32]   # [3D]
+    var wproj: List[Float32]  # [D, D]
+    var bproj: List[Float32]  # [D]
+    var q_norm: List[Float32] # [Dh]
+    var k_norm: List[Float32] # [Dh]
+
+    def __init__(
+        out self, var wqkv: List[Float32], var bqkv: List[Float32],
+        var wproj: List[Float32], var bproj: List[Float32],
+        var q_norm: List[Float32], var k_norm: List[Float32],
+    ):
+        self.wqkv = wqkv^
+        self.bqkv = bqkv^
+        self.wproj = wproj^
+        self.bproj = bproj^
+        self.q_norm = q_norm^
+        self.k_norm = k_norm^
+
+
+struct Attn2Grads(Copyable, Movable):
+    var d_wqkv: List[Float32]
+    var d_bqkv: List[Float32]
+    var d_wproj: List[Float32]
+    var d_bproj: List[Float32]
+    var d_qnorm: List[Float32]
+    var d_knorm: List[Float32]
+
+    def __init__(
+        out self, var d_wqkv: List[Float32], var d_bqkv: List[Float32],
+        var d_wproj: List[Float32], var d_bproj: List[Float32],
+        var d_qnorm: List[Float32], var d_knorm: List[Float32],
+    ):
+        self.d_wqkv = d_wqkv^
+        self.d_bqkv = d_bqkv^
+        self.d_wproj = d_wproj^
+        self.d_bproj = d_bproj^
+        self.d_qnorm = d_qnorm^
+        self.d_knorm = d_knorm^
+
+
+struct DualXSaved(Copyable, Movable):
+    var s: List[Float32]
+    var ln1: List[Float32]
+    var norm: List[Float32]
+    var q_pre: List[Float32]
+    var k_pre: List[Float32]
+    var v: List[Float32]
+    var norm2: List[Float32]
+    var a2_q_pre: List[Float32]
+    var a2_k_pre: List[Float32]
+    var a2_v: List[Float32]
+    var x_att: List[Float32]
+    var a2_att: List[Float32]
+    var x_proj: List[Float32]
+    var x_hid1: List[Float32]
+    var a2_proj: List[Float32]
+    var x_hid2: List[Float32]
+    var ln2: List[Float32]
+    var mlp_in: List[Float32]
+    var h1: List[Float32]
+    var hg: List[Float32]
+    var mlp: List[Float32]
+
+    def __init__(
+        out self,
+        var s: List[Float32], var ln1: List[Float32], var norm: List[Float32],
+        var q_pre: List[Float32], var k_pre: List[Float32], var v: List[Float32],
+        var norm2: List[Float32], var a2_q_pre: List[Float32], var a2_k_pre: List[Float32], var a2_v: List[Float32],
+        var x_att: List[Float32], var a2_att: List[Float32],
+        var x_proj: List[Float32], var x_hid1: List[Float32], var a2_proj: List[Float32], var x_hid2: List[Float32],
+        var ln2: List[Float32], var mlp_in: List[Float32], var h1: List[Float32], var hg: List[Float32], var mlp: List[Float32],
+    ):
+        self.s = s^
+        self.ln1 = ln1^
+        self.norm = norm^
+        self.q_pre = q_pre^
+        self.k_pre = k_pre^
+        self.v = v^
+        self.norm2 = norm2^
+        self.a2_q_pre = a2_q_pre^
+        self.a2_k_pre = a2_k_pre^
+        self.a2_v = a2_v^
+        self.x_att = x_att^
+        self.a2_att = a2_att^
+        self.x_proj = x_proj^
+        self.x_hid1 = x_hid1^
+        self.a2_proj = a2_proj^
+        self.x_hid2 = x_hid2^
+        self.ln2 = ln2^
+        self.mlp_in = mlp_in^
+        self.h1 = h1^
+        self.hg = hg^
+        self.mlp = mlp^
+
+
+struct DualBlockForward(Copyable, Movable):
+    var ctx_out: List[Float32]
+    var x_out: List[Float32]
+    var ctx_saved: StreamSaved
+    var x_saved: DualXSaved
+
+    def __init__(
+        out self, var ctx_out: List[Float32], var x_out: List[Float32],
+        var ctx_saved: StreamSaved, var x_saved: DualXSaved,
+    ):
+        self.ctx_out = ctx_out^
+        self.x_out = x_out^
+        self.ctx_saved = ctx_saved^
+        self.x_saved = x_saved^
+
+
+struct DualBlockGrads(Movable):
+    var d_ctx: List[Float32]
+    var d_x: List[Float32]
+    var ctx_g: StreamGrads
+    var x_g: StreamGrads
+    var a2_g: Attn2Grads
+    var d_shift_msa2: List[Float32]
+    var d_scale_msa2: List[Float32]
+    var d_gate_msa2: List[Float32]
+    var x_qkv_lora_d_a: List[Float32]
+    var x_qkv_lora_d_b: List[Float32]
+    var a2_qkv_lora_d_a: List[Float32]
+    var a2_qkv_lora_d_b: List[Float32]
+
+    def __init__(
+        out self, var d_ctx: List[Float32], var d_x: List[Float32],
+        var ctx_g: StreamGrads, var x_g: StreamGrads, var a2_g: Attn2Grads,
+        var d_shift_msa2: List[Float32], var d_scale_msa2: List[Float32], var d_gate_msa2: List[Float32],
+        var x_qkv_lora_d_a: List[Float32], var x_qkv_lora_d_b: List[Float32],
+        var a2_qkv_lora_d_a: List[Float32], var a2_qkv_lora_d_b: List[Float32],
+    ):
+        self.d_ctx = d_ctx^
+        self.d_x = d_x^
+        self.ctx_g = ctx_g^
+        self.x_g = x_g^
+        self.a2_g = a2_g^
+        self.d_shift_msa2 = d_shift_msa2^
+        self.d_scale_msa2 = d_scale_msa2^
+        self.d_gate_msa2 = d_gate_msa2^
+        self.x_qkv_lora_d_a = x_qkv_lora_d_a^
+        self.x_qkv_lora_d_b = x_qkv_lora_d_b^
+        self.a2_qkv_lora_d_a = a2_qkv_lora_d_a^
+        self.a2_qkv_lora_d_b = a2_qkv_lora_d_b^
+
+
+# split a fused [N,3D] qkv into q_pre,k_pre,v (each [N,D]); returns (q,k,v).
+def _split_qkv3(qkv: List[Float32], N: Int, D: Int) -> List[List[Float32]]:
+    var q = List[Float32](); var k = List[Float32](); var v = List[Float32]()
+    for r in range(N):
+        var base = r * 3 * D
+        for c in range(D):
+            q.append(qkv[base + c])
+        for c in range(D):
+            k.append(qkv[base + D + c])
+        for c in range(D):
+            v.append(qkv[base + 2 * D + c])
+    var out = List[List[Float32]]()
+    out.append(q^); out.append(k^); out.append(v^)
+    return out^
+
+
+def sd35_dual_joint_block_forward[
+    Bp: Int, Sp: Int, Sx: Int, Hp: Int, Dhp: Int
+](
+    context: List[Float32], x: List[Float32],
+    ctxw: StreamWeights, xw: StreamWeights, a2w: Attn2Weights,
+    ctx_mod: ModVecs, x_mod: ModVecs,
+    shift_msa2: List[Float32], scale_msa2: List[Float32], gate_msa2: List[Float32],
+    N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
+    eps: Float32, qk_eps: Float32, scale: Float32,
+    ctx: DeviceContext,
+    x_qkv_lora: Optional[LoraAdapter] = None,
+    a2_qkv_lora: Optional[LoraAdapter] = None,
+) raises -> DualBlockForward:
+    var H = Hp
+    var Dh = Dhp
+    var HDh = H * Dh
+
+    # ── pre-attention (joint) per stream ──
+    var cp = _stream_pre(context, ctxw, ctx_mod, N_CTX, D, H, Dh, eps, qk_eps, ctx)
+    var xp = _stream_pre(x, xw, x_mod, N_IMG, D, H, Dh, eps, qk_eps, ctx, None, x_qkv_lora)
+
+    # ── JOINT attention: concat ctx FIRST then x ──
+    var joint_q = List[Float32](); var joint_k = List[Float32](); var joint_v = List[Float32]()
+    for i in range(N_CTX * HDh):
+        joint_q.append(cp.q_rms[i]); joint_k.append(cp.k_rms[i]); joint_v.append(cp.v[i])
+    for i in range(N_IMG * HDh):
+        joint_q.append(xp.q_rms[i]); joint_k.append(xp.k_rms[i]); joint_v.append(xp.v[i])
+    var att_joint = _sdpa_fwd[Bp, Sp, Hp, Dhp](joint_q, joint_k, joint_v, scale, ctx)
+    var ctx_att = List[Float32](); var x_att = List[Float32]()
+    for i in range(N_CTX * HDh):
+        ctx_att.append(att_joint[i])
+    for i in range(N_IMG * HDh):
+        x_att.append(att_joint[N_CTX * HDh + i])
+
+    # ── x stream: SECOND self-attention (attn2) on norm2 = modulate(ln1, msa2) ──
+    var norm2 = _modulate_fwd(xp.ln1, scale_msa2, shift_msa2, N_IMG, D)
+    var a2qkv = _linear_fwd(norm2, a2w.wqkv, a2w.bqkv, N_IMG, D, 3 * D, ctx)
+    if a2_qkv_lora:
+        var a2d = _sd35_lora_fwd(norm2.copy(), a2_qkv_lora.value().copy(), N_IMG, ctx)
+        for i in range(len(a2qkv)):
+            a2qkv[i] = a2qkv[i] + a2d[i]
+    var a2s = _split_qkv3(a2qkv, N_IMG, D)
+    var a2_q_pre = a2s[0].copy(); var a2_k_pre = a2s[1].copy(); var a2_v = a2s[2].copy()
+    var a2_q_rms = _rms_qk_fwd(a2_q_pre, a2w.q_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var a2_k_rms = _rms_qk_fwd(a2_k_pre, a2w.k_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var a2_att = _sdpa_fwd[Bp, Sx, Hp, Dhp](a2_q_rms, a2_k_rms, a2_v, scale, ctx)  # [N_IMG,D]
+
+    # ── x stream: post (manual; attn1 residual -> attn2 residual -> MLP) ──
+    var x_proj = _linear_fwd(x_att, xw.wproj, xw.bproj, N_IMG, D, D, ctx)
+    var x_hid1 = _gated_residual_fwd(x, x_mod.gate_msa, x_proj, N_IMG, D)
+    var a2_proj = _linear_fwd(a2_att, a2w.wproj, a2w.bproj, N_IMG, D, D, ctx)
+    var x_hid2 = _gated_residual_fwd(x_hid1, gate_msa2, a2_proj, N_IMG, D)
+    var ln2 = _layer_norm_fwd(x_hid2, N_IMG, D, eps, ctx)
+    var mlp_in = _modulate_fwd(ln2, x_mod.scale_mlp, x_mod.shift_mlp, N_IMG, D)
+    var h1 = _linear_fwd(mlp_in, xw.wfc1, xw.bfc1, N_IMG, D, MLP, ctx)
+    var hg = _gelu_fwd(h1, N_IMG, MLP, ctx)
+    var mlp = _linear_fwd(hg, xw.wfc2, xw.bfc2, N_IMG, MLP, D, ctx)
+    var x_out = _gated_residual_fwd(x_hid2, x_mod.gate_mlp, mlp, N_IMG, D)
+
+    # ── context stream: post (standard) ──
+    var cpost = _stream_post(context, ctx_att, ctxw, ctx_mod, N_CTX, D, MLP, eps, ctx)
+
+    var ctx_saved = StreamSaved(
+        context.copy(), cp.ln1.copy(), cp.norm.copy(), cp.q_pre.copy(), cp.k_pre.copy(), cp.v.copy(),
+        cpost.att.copy(), cpost.attn_res.copy(), cpost.ln2.copy(), cpost.mlp_in.copy(),
+        cpost.h1.copy(), cpost.hg.copy(), cpost.proj.copy(), cpost.mlp.copy(),
+    )
+    var x_saved = DualXSaved(
+        x.copy(), xp.ln1.copy(), xp.norm.copy(), xp.q_pre.copy(), xp.k_pre.copy(), xp.v.copy(),
+        norm2^, a2_q_pre^, a2_k_pre^, a2_v^, x_att.copy(), a2_att.copy(),
+        x_proj^, x_hid1^, a2_proj^, x_hid2^, ln2^, mlp_in^, h1^, hg^, mlp^,
+    )
+    return DualBlockForward(cpost.out.copy(), x_out^, ctx_saved^, x_saved^)
+
+
+def sd35_dual_joint_block_backward[
+    Bp: Int, Sp: Int, Sx: Int, Hp: Int, Dhp: Int
+](
+    d_ctx_out: List[Float32], d_x_out: List[Float32],
+    ctxw: StreamWeights, xw: StreamWeights, a2w: Attn2Weights,
+    ctx_mod: ModVecs, x_mod: ModVecs,
+    scale_msa2: List[Float32], gate_msa2: List[Float32],
+    fwd: DualBlockForward,
+    N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
+    eps: Float32, qk_eps: Float32, scale: Float32,
+    ctx: DeviceContext,
+    x_qkv_lora: Optional[LoraAdapter] = None,
+    a2_qkv_lora: Optional[LoraAdapter] = None,
+) raises -> DualBlockGrads:
+    var H = Hp
+    var Dh = Dhp
+    var HDh = H * Dh
+    var sv = fwd.x_saved.copy()
+
+    # ═══ context stream post backward (standard) ═══
+    var cpb = _stream_post_backward(d_ctx_out, fwd.ctx_saved, ctxw, ctx_mod, N_CTX, D, MLP, eps, ctx)
+
+    # ═══ x stream post backward (manual; reverse of fwd) ═══
+    # out = gated_residual(x_hid2, gate_mlp, mlp)
+    var grb_mlp = _gated_residual_backward(d_x_out, x_mod.gate_mlp, sv.mlp, N_IMG, D)
+    var d_x_hid2 = grb_mlp.d_s.copy()
+    var d_mlp = grb_mlp.d_y.copy()
+    var d_gate_mlp = grb_mlp.d_gate.copy()
+    # mlp = linear(hg, wfc2)
+    var lb_fc2 = _linear_backward_host(d_mlp, sv.hg, xw.wfc2, N_IMG, MLP, D, ctx)
+    var d_hg = lb_fc2.d_x^.to_host(ctx)
+    var d_wfc2 = lb_fc2.d_w^.to_host(ctx)
+    var d_bfc2 = _bias_grad(d_mlp, N_IMG, D)
+    # hg = gelu(h1)
+    var d_h1 = gelu_backward(
+        Tensor.from_host(d_hg, [N_IMG, MLP], STDtype.F32, ctx),
+        Tensor.from_host(sv.h1, [N_IMG, MLP], STDtype.F32, ctx), ctx,
+    ).to_host(ctx)
+    # h1 = linear(mlp_in, wfc1)
+    var lb_fc1 = _linear_backward_host(d_h1, sv.mlp_in, xw.wfc1, N_IMG, D, MLP, ctx)
+    var d_mlp_in = lb_fc1.d_x^.to_host(ctx)
+    var d_wfc1 = lb_fc1.d_w^.to_host(ctx)
+    var d_bfc1 = _bias_grad(d_h1, N_IMG, MLP)
+    # mlp_in = modulate(ln2, scale_mlp, shift_mlp)
+    var mb_mlp = _modulate_backward_host(d_mlp_in, sv.ln2, x_mod.scale_mlp, N_IMG, D, ctx)
+    var d_ln2 = mb_mlp.d_x.copy()
+    var d_scale_mlp = mb_mlp.d_scale.copy()
+    var d_shift_mlp = mb_mlp.d_shift.copy()
+    # ln2 = layer_norm(x_hid2)
+    var d_ln2x = _layer_norm_backward_dx(d_ln2, sv.x_hid2, N_IMG, D, eps, ctx)
+    d_x_hid2 = _add_lists(d_x_hid2, d_ln2x)
+
+    # x_hid2 = gated_residual(x_hid1, gate_msa2, a2_proj)
+    var grb_a2 = _gated_residual_backward(d_x_hid2, gate_msa2, sv.a2_proj, N_IMG, D)
+    var d_x_hid1 = grb_a2.d_s.copy()
+    var d_a2_proj = grb_a2.d_y.copy()
+    var d_gate_msa2 = grb_a2.d_gate.copy()
+    # a2_proj = linear(a2_att, a2.wproj)
+    var lb_a2p = _linear_backward_host(d_a2_proj, sv.a2_att, a2w.wproj, N_IMG, D, D, ctx)
+    var d_a2_att = lb_a2p.d_x^.to_host(ctx)
+    var d_a2_wproj = lb_a2p.d_w^.to_host(ctx)
+    var d_a2_bproj = _bias_grad(d_a2_proj, N_IMG, D)
+    # a2_att = sdpa(a2q_rms, a2k_rms, a2v) -> recompute rms inputs
+    var a2_q_rms = _rms_qk_fwd(sv.a2_q_pre, a2w.q_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var a2_k_rms = _rms_qk_fwd(sv.a2_k_pre, a2w.k_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var a2sb = sdpa_backward[Bp, Sx, Hp, Dhp](
+        Tensor.from_host(a2_q_rms, [Bp, Sx, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(a2_k_rms, [Bp, Sx, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(sv.a2_v, [Bp, Sx, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(d_a2_att, [Bp, Sx, Hp, Dhp], STDtype.F32, ctx),
+        scale, ctx,
+    )
+    var a2sg = _sdpa_grads_to_host(a2sb^, ctx)
+    # a2q_rms = rms(a2_q_pre); a2k_rms = rms(a2_k_pre)
+    var rb_a2q = rms_norm_backward(
+        Tensor.from_host(a2sg.d_q, [N_IMG * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.a2_q_pre, [N_IMG * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(a2w.q_norm, [Dh], STDtype.F32, ctx), qk_eps, ctx,
+    )
+    var d_a2_q_pre = rb_a2q.d_x^.to_host(ctx)
+    var d_a2_qnorm = rb_a2q.d_g^.to_host(ctx)
+    var rb_a2k = rms_norm_backward(
+        Tensor.from_host(a2sg.d_k, [N_IMG * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.a2_k_pre, [N_IMG * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(a2w.k_norm, [Dh], STDtype.F32, ctx), qk_eps, ctx,
+    )
+    var d_a2_k_pre = rb_a2k.d_x^.to_host(ctx)
+    var d_a2_knorm = rb_a2k.d_g^.to_host(ctx)
+    # reassemble d_a2qkv [N_IMG,3D]
+    var d_a2qkv = List[Float32]()
+    for r in range(N_IMG):
+        for c in range(D):
+            d_a2qkv.append(d_a2_q_pre[r * D + c])
+        for c in range(D):
+            d_a2qkv.append(d_a2_k_pre[r * D + c])
+        for c in range(D):
+            d_a2qkv.append(a2sg.d_v[r * D + c])
+    # a2qkv = linear(norm2, a2.wqkv) [+ lora]
+    var lb_a2qkv = _linear_backward_host(d_a2qkv, sv.norm2, a2w.wqkv, N_IMG, D, 3 * D, ctx)
+    var d_norm2 = lb_a2qkv.d_x^.to_host(ctx)
+    var d_a2_wqkv = lb_a2qkv.d_w^.to_host(ctx)
+    var d_a2_bqkv = _bias_grad(d_a2qkv, N_IMG, 3 * D)
+    var a2_qkv_lora_d_a = List[Float32]()
+    var a2_qkv_lora_d_b = List[Float32]()
+    if a2_qkv_lora:
+        var lg = _sd35_lora_bwd(d_a2qkv.copy(), sv.norm2.copy(), a2_qkv_lora.value().copy(), N_IMG, ctx)
+        d_norm2 = _add_lists(d_norm2, lg.d_x.copy())
+        a2_qkv_lora_d_a = lg.d_a.copy()
+        a2_qkv_lora_d_b = lg.d_b.copy()
+    # norm2 = modulate(ln1, scale_msa2, shift_msa2)
+    var mb_msa2 = _modulate_backward_host(d_norm2, sv.ln1, scale_msa2, N_IMG, D, ctx)
+    var d_ln1_from2 = mb_msa2.d_x.copy()
+    var d_scale_msa2 = mb_msa2.d_scale.copy()
+    var d_shift_msa2 = mb_msa2.d_shift.copy()
+
+    # x_hid1 = gated_residual(x, gate_msa, x_proj)
+    var grb_a1 = _gated_residual_backward(d_x_hid1, x_mod.gate_msa, sv.x_proj, N_IMG, D)
+    var d_x_partial = grb_a1.d_s.copy()
+    var d_x_proj = grb_a1.d_y.copy()
+    var d_gate_msa = grb_a1.d_gate.copy()
+    # x_proj = linear(x_att, wproj)
+    var lb_xproj = _linear_backward_host(d_x_proj, sv.x_att, xw.wproj, N_IMG, D, D, ctx)
+    var d_x_att = lb_xproj.d_x^.to_host(ctx)
+    var d_wproj = lb_xproj.d_w^.to_host(ctx)
+    var d_bproj = _bias_grad(d_x_proj, N_IMG, D)
+
+    # ═══ joint sdpa backward (ctx d_att from cpb, x d_att from above) ═══
+    var d_att_joint = List[Float32]()
+    for i in range(N_CTX * HDh):
+        d_att_joint.append(cpb.d_att[i])
+    for i in range(N_IMG * HDh):
+        d_att_joint.append(d_x_att[i])
+    var ctx_q_rms = _rms_qk_fwd(fwd.ctx_saved.q_pre, ctxw.q_norm, N_CTX, H, Dh, qk_eps, ctx)
+    var ctx_k_rms = _rms_qk_fwd(fwd.ctx_saved.k_pre, ctxw.k_norm, N_CTX, H, Dh, qk_eps, ctx)
+    var x_q_rms = _rms_qk_fwd(sv.q_pre, xw.q_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var x_k_rms = _rms_qk_fwd(sv.k_pre, xw.k_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var jq = List[Float32](); var jk = List[Float32](); var jv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        jq.append(ctx_q_rms[i]); jk.append(ctx_k_rms[i]); jv.append(fwd.ctx_saved.v[i])
+    for i in range(N_IMG * HDh):
+        jq.append(x_q_rms[i]); jk.append(x_k_rms[i]); jv.append(sv.v[i])
+    var sb = sdpa_backward[Bp, Sp, Hp, Dhp](
+        Tensor.from_host(jq, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(jk, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(jv, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(d_att_joint, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        scale, ctx,
+    )
+    var sg = _sdpa_grads_to_host(sb^, ctx)
+    var ctx_dq = List[Float32](); var ctx_dk = List[Float32](); var ctx_dv = List[Float32]()
+    var x_dq = List[Float32](); var x_dk = List[Float32](); var x_dv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        ctx_dq.append(sg.d_q[i]); ctx_dk.append(sg.d_k[i]); ctx_dv.append(sg.d_v[i])
+    for i in range(N_IMG * HDh):
+        x_dq.append(sg.d_q[N_CTX * HDh + i]); x_dk.append(sg.d_k[N_CTX * HDh + i]); x_dv.append(sg.d_v[N_CTX * HDh + i])
+
+    # ═══ context stream pre backward (standard) ═══
+    var cprb = _stream_pre_backward(
+        ctx_dq, ctx_dk, ctx_dv, cpb.d_s, fwd.ctx_saved, ctxw, ctx_mod,
+        N_CTX, D, H, Dh, eps, qk_eps, ctx,
+    )
+
+    # ═══ x stream pre backward (manual; ln1 gets BOTH norm + norm2 paths) ═══
+    var rb_xq = rms_norm_backward(
+        Tensor.from_host(x_dq, [N_IMG * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.q_pre, [N_IMG * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(xw.q_norm, [Dh], STDtype.F32, ctx), qk_eps, ctx,
+    )
+    var d_x_q_pre = rb_xq.d_x^.to_host(ctx)
+    var d_xqnorm = rb_xq.d_g^.to_host(ctx)
+    var rb_xk = rms_norm_backward(
+        Tensor.from_host(x_dk, [N_IMG * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.k_pre, [N_IMG * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(xw.k_norm, [Dh], STDtype.F32, ctx), qk_eps, ctx,
+    )
+    var d_x_k_pre = rb_xk.d_x^.to_host(ctx)
+    var d_xknorm = rb_xk.d_g^.to_host(ctx)
+    var d_x_qkv = List[Float32]()
+    for r in range(N_IMG):
+        for c in range(D):
+            d_x_qkv.append(d_x_q_pre[r * D + c])
+        for c in range(D):
+            d_x_qkv.append(d_x_k_pre[r * D + c])
+        for c in range(D):
+            d_x_qkv.append(x_dv[r * D + c])
+    var lb_xqkv = _linear_backward_host(d_x_qkv, sv.norm, xw.wqkv, N_IMG, D, 3 * D, ctx)
+    var d_norm = lb_xqkv.d_x^.to_host(ctx)
+    var d_wqkv = lb_xqkv.d_w^.to_host(ctx)
+    var d_bqkv = _bias_grad(d_x_qkv, N_IMG, 3 * D)
+    var x_qkv_lora_d_a = List[Float32]()
+    var x_qkv_lora_d_b = List[Float32]()
+    if x_qkv_lora:
+        var lg = _sd35_lora_bwd(d_x_qkv.copy(), sv.norm.copy(), x_qkv_lora.value().copy(), N_IMG, ctx)
+        d_norm = _add_lists(d_norm, lg.d_x.copy())
+        x_qkv_lora_d_a = lg.d_a.copy()
+        x_qkv_lora_d_b = lg.d_b.copy()
+    # norm = modulate(ln1, scale_msa, shift_msa)
+    var mb_msa = _modulate_backward_host(d_norm, sv.ln1, x_mod.scale_msa, N_IMG, D, ctx)
+    var d_ln1_from1 = mb_msa.d_x.copy()
+    var d_scale_msa = mb_msa.d_scale.copy()
+    var d_shift_msa = mb_msa.d_shift.copy()
+    # ln1 = layer_norm(x): both paths
+    var d_ln1 = _add_lists(d_ln1_from1, d_ln1_from2)
+    var d_x_from_ln = _layer_norm_backward_dx(d_ln1, sv.s, N_IMG, D, eps, ctx)
+    var d_x = _add_lists(d_x_partial, d_x_from_ln)
+
+    var ctx_g = StreamGrads(
+        cprb.d_wqkv.copy(), cprb.d_bqkv.copy(), cpb.d_wproj.copy(), cpb.d_bproj.copy(),
+        cpb.d_wfc1.copy(), cpb.d_bfc1.copy(), cpb.d_wfc2.copy(), cpb.d_bfc2.copy(),
+        cprb.d_qnorm.copy(), cprb.d_knorm.copy(),
+        cprb.d_shift_msa.copy(), cprb.d_scale_msa.copy(), cpb.d_gate_msa.copy(),
+        cpb.d_shift_mlp.copy(), cpb.d_scale_mlp.copy(), cpb.d_gate_mlp.copy(),
+    )
+    var x_g = StreamGrads(
+        d_wqkv^, d_bqkv^, d_wproj^, d_bproj^, d_wfc1^, d_bfc1^, d_wfc2^, d_bfc2^,
+        d_xqnorm^, d_xknorm^,
+        d_shift_msa^, d_scale_msa^, d_gate_msa^,
+        d_shift_mlp^, d_scale_mlp^, d_gate_mlp^,
+    )
+    var a2_g = Attn2Grads(d_a2_wqkv^, d_a2_bqkv^, d_a2_wproj^, d_a2_bproj^, d_a2_qnorm^, d_a2_knorm^)
+    return DualBlockGrads(
+        cprb.d_input.copy(), d_x^, ctx_g^, x_g^, a2_g^,
+        d_shift_msa2^, d_scale_msa2^, d_gate_msa2^,
+        x_qkv_lora_d_a^, x_qkv_lora_d_b^, a2_qkv_lora_d_a^, a2_qkv_lora_d_b^,
+    )

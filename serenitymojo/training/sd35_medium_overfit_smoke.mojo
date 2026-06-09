@@ -130,7 +130,7 @@ def main() raises:
             noisy.copy(), txt.copy(), pooled.copy(), sigma,
             base, loader, lora,
             D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
-            EPS, QK_EPS, ctx, NUM_DUAL,
+            EPS, QK_EPS, ctx, NUM_DUAL, True,
         )
         var nout = len(fwd.out)
         var loss = Float32(0.0)
@@ -150,7 +150,7 @@ def main() raises:
             d_loss, noisy.copy(), txt.copy(),
             base, loader, lora, fwd,
             D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
-            EPS, QK_EPS, ctx, NUM_DUAL,
+            EPS, QK_EPS, ctx, NUM_DUAL, True,
         )
         var gn = _clip(grads, Float32(1.0))
         sd35_lora_adamw_step(lora, grads, step + 1, LR, ctx)

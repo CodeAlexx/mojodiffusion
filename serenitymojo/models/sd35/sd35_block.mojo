@@ -1620,3 +1620,247 @@ def sd35_dual_joint_block_backward[
         d_shift_msa2^, d_scale_msa2^, d_gate_msa2^,
         x_qkv_lora_d_a^, x_qkv_lora_d_b^, a2_qkv_lora_d_a^, a2_qkv_lora_d_b^,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONTEXT_PRE_ONLY joint block (sd3.5 FINAL block, e.g. medium block 23).
+# The context stream has ONLY qkv (no proj/mlp/output): it contributes K/V/Q to
+# the joint attention but its attention output is DISCARDED (no context output).
+# Its norm is AdaLayerNormContinuous: norm_ctx = (1+scale)*LN(ctx)+shift, 2-chunk
+# raw order [shift,scale] (verified via diffusers swap_scale_shift). The x stream
+# is a STANDARD joint block. Only x_out continues to the final layer.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+struct CtxPreSaved(Copyable, Movable):
+    var ctx_input: List[Float32]
+    var ctx_ln: List[Float32]
+    var ctx_norm: List[Float32]
+    var ctx_q_pre: List[Float32]
+    var ctx_k_pre: List[Float32]
+    var ctx_v: List[Float32]
+    var x_saved: StreamSaved
+
+    def __init__(
+        out self, var ctx_input: List[Float32], var ctx_ln: List[Float32], var ctx_norm: List[Float32],
+        var ctx_q_pre: List[Float32], var ctx_k_pre: List[Float32], var ctx_v: List[Float32],
+        var x_saved: StreamSaved,
+    ):
+        self.ctx_input = ctx_input^
+        self.ctx_ln = ctx_ln^
+        self.ctx_norm = ctx_norm^
+        self.ctx_q_pre = ctx_q_pre^
+        self.ctx_k_pre = ctx_k_pre^
+        self.ctx_v = ctx_v^
+        self.x_saved = x_saved^
+
+
+struct CtxPreForward(Copyable, Movable):
+    var x_out: List[Float32]
+    var saved: CtxPreSaved
+
+    def __init__(out self, var x_out: List[Float32], var saved: CtxPreSaved):
+        self.x_out = x_out^
+        self.saved = saved^
+
+
+struct CtxPreGrads(Movable):
+    var d_x: List[Float32]
+    var d_ctx: List[Float32]
+    var x_g: StreamGrads
+    var x_lora: StreamLoraGrads
+    var ctx_qkv_lora_d_a: List[Float32]
+    var ctx_qkv_lora_d_b: List[Float32]
+    var d_ctx_qnorm: List[Float32]
+    var d_ctx_knorm: List[Float32]
+
+    def __init__(
+        out self, var d_x: List[Float32], var d_ctx: List[Float32],
+        var x_g: StreamGrads, var x_lora: StreamLoraGrads,
+        var ctx_qkv_lora_d_a: List[Float32], var ctx_qkv_lora_d_b: List[Float32],
+        var d_ctx_qnorm: List[Float32], var d_ctx_knorm: List[Float32],
+    ):
+        self.d_x = d_x^
+        self.d_ctx = d_ctx^
+        self.x_g = x_g^
+        self.x_lora = x_lora^
+        self.ctx_qkv_lora_d_a = ctx_qkv_lora_d_a^
+        self.ctx_qkv_lora_d_b = ctx_qkv_lora_d_b^
+        self.d_ctx_qnorm = d_ctx_qnorm^
+        self.d_ctx_knorm = d_ctx_knorm^
+
+
+def sd35_context_preonly_forward[
+    Bp: Int, Sp: Int, Hp: Int, Dhp: Int
+](
+    context: List[Float32], x: List[Float32],
+    ctx_qkv_w: List[Float32], ctx_qkv_b: List[Float32],
+    ctx_qnorm: List[Float32], ctx_knorm: List[Float32],
+    ctx_scale: List[Float32], ctx_shift: List[Float32],
+    xw: StreamWeights, x_mod: ModVecs,
+    N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
+    eps: Float32, qk_eps: Float32, scale: Float32,
+    ctx: DeviceContext,
+    ctx_qkv_lora: Optional[LoraAdapter] = None,
+    x_qkv_lora: Optional[LoraAdapter] = None,
+    x_proj_lora: Optional[LoraAdapter] = None,
+    x_fc1_lora: Optional[LoraAdapter] = None,
+    x_fc2_lora: Optional[LoraAdapter] = None,
+) raises -> CtxPreForward:
+    var H = Hp
+    var Dh = Dhp
+    var HDh = H * Dh
+
+    # ── context pre (qkv only; AdaLayerNormContinuous: (1+scale)*LN+shift) ──
+    var ctx_ln = _layer_norm_fwd(context, N_CTX, D, eps, ctx)
+    var ctx_norm = _modulate_fwd(ctx_ln, ctx_scale, ctx_shift, N_CTX, D)
+    var ctx_qkv = _linear_fwd(ctx_norm, ctx_qkv_w, ctx_qkv_b, N_CTX, D, 3 * D, ctx)
+    if ctx_qkv_lora:
+        var ld = _sd35_lora_fwd(ctx_norm.copy(), ctx_qkv_lora.value().copy(), N_CTX, ctx)
+        for i in range(len(ctx_qkv)):
+            ctx_qkv[i] = ctx_qkv[i] + ld[i]
+    var cs = _split_qkv3(ctx_qkv, N_CTX, D)
+    var ctx_q_pre = cs[0].copy(); var ctx_k_pre = cs[1].copy(); var ctx_v = cs[2].copy()
+    var ctx_q_rms = _rms_qk_fwd(ctx_q_pre, ctx_qnorm, N_CTX, H, Dh, qk_eps, ctx)
+    var ctx_k_rms = _rms_qk_fwd(ctx_k_pre, ctx_knorm, N_CTX, H, Dh, qk_eps, ctx)
+
+    # ── x pre (standard) ──
+    var xp = _stream_pre(x, xw, x_mod, N_IMG, D, H, Dh, eps, qk_eps, ctx, None, x_qkv_lora)
+
+    # ── joint attention (ctx FIRST then x) ──
+    var jq = List[Float32](); var jk = List[Float32](); var jv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        jq.append(ctx_q_rms[i]); jk.append(ctx_k_rms[i]); jv.append(ctx_v[i])
+    for i in range(N_IMG * HDh):
+        jq.append(xp.q_rms[i]); jk.append(xp.k_rms[i]); jv.append(xp.v[i])
+    var att = _sdpa_fwd[Bp, Sp, Hp, Dhp](jq, jk, jv, scale, ctx)
+    var x_att = List[Float32]()
+    for i in range(N_IMG * HDh):
+        x_att.append(att[N_CTX * HDh + i])
+
+    # ── x post (standard); context output DISCARDED ──
+    var xpost = _stream_post(x, x_att, xw, x_mod, N_IMG, D, MLP, eps, ctx,
+                             x_proj_lora, x_fc1_lora, x_fc2_lora)
+
+    var x_saved = StreamSaved(
+        x.copy(), xp.ln1.copy(), xp.norm.copy(), xp.q_pre.copy(), xp.k_pre.copy(), xp.v.copy(),
+        xpost.att.copy(), xpost.attn_res.copy(), xpost.ln2.copy(), xpost.mlp_in.copy(),
+        xpost.h1.copy(), xpost.hg.copy(), xpost.proj.copy(), xpost.mlp.copy(),
+    )
+    var saved = CtxPreSaved(context.copy(), ctx_ln^, ctx_norm^, ctx_q_pre^, ctx_k_pre^, ctx_v^, x_saved^)
+    return CtxPreForward(xpost.out.copy(), saved^)
+
+
+def sd35_context_preonly_backward[
+    Bp: Int, Sp: Int, Hp: Int, Dhp: Int
+](
+    d_x_out: List[Float32],
+    ctx_qkv_w: List[Float32], ctx_qnorm: List[Float32], ctx_knorm: List[Float32],
+    ctx_scale: List[Float32],
+    xw: StreamWeights, x_mod: ModVecs,
+    fwd: CtxPreForward,
+    N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
+    eps: Float32, qk_eps: Float32, scale: Float32,
+    ctx: DeviceContext,
+    ctx_qkv_lora: Optional[LoraAdapter] = None,
+    x_qkv_lora: Optional[LoraAdapter] = None,
+    x_proj_lora: Optional[LoraAdapter] = None,
+    x_fc1_lora: Optional[LoraAdapter] = None,
+    x_fc2_lora: Optional[LoraAdapter] = None,
+) raises -> CtxPreGrads:
+    var H = Hp
+    var Dh = Dhp
+    var HDh = H * Dh
+    var sv = fwd.saved.copy()
+
+    # ── x post backward (standard) ──
+    var xpb = _stream_post_backward(d_x_out, sv.x_saved, xw, x_mod, N_IMG, D, MLP, eps, ctx,
+                                    x_proj_lora, x_fc1_lora, x_fc2_lora)
+
+    # ── joint sdpa backward: ctx attention output was DISCARDED -> d_ctx_att = 0 ──
+    var d_att_joint = List[Float32]()
+    for _ in range(N_CTX * HDh):
+        d_att_joint.append(Float32(0.0))
+    for i in range(N_IMG * HDh):
+        d_att_joint.append(xpb.d_att[i])
+    var ctx_q_rms = _rms_qk_fwd(sv.ctx_q_pre, ctx_qnorm, N_CTX, H, Dh, qk_eps, ctx)
+    var ctx_k_rms = _rms_qk_fwd(sv.ctx_k_pre, ctx_knorm, N_CTX, H, Dh, qk_eps, ctx)
+    var x_q_rms = _rms_qk_fwd(sv.x_saved.q_pre, xw.q_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var x_k_rms = _rms_qk_fwd(sv.x_saved.k_pre, xw.k_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var jq = List[Float32](); var jk = List[Float32](); var jv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        jq.append(ctx_q_rms[i]); jk.append(ctx_k_rms[i]); jv.append(sv.ctx_v[i])
+    for i in range(N_IMG * HDh):
+        jq.append(x_q_rms[i]); jk.append(x_k_rms[i]); jv.append(sv.x_saved.v[i])
+    var sb = sdpa_backward[Bp, Sp, Hp, Dhp](
+        Tensor.from_host(jq, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(jk, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(jv, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(d_att_joint, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        scale, ctx,
+    )
+    var sg = _sdpa_grads_to_host(sb^, ctx)
+    var ctx_dq = List[Float32](); var ctx_dk = List[Float32](); var ctx_dv = List[Float32]()
+    var x_dq = List[Float32](); var x_dk = List[Float32](); var x_dv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        ctx_dq.append(sg.d_q[i]); ctx_dk.append(sg.d_k[i]); ctx_dv.append(sg.d_v[i])
+    for i in range(N_IMG * HDh):
+        x_dq.append(sg.d_q[N_CTX * HDh + i]); x_dk.append(sg.d_k[N_CTX * HDh + i]); x_dv.append(sg.d_v[N_CTX * HDh + i])
+
+    # ── x pre backward (standard) ──
+    var xprb = _stream_pre_backward(x_dq, x_dk, x_dv, xpb.d_s, sv.x_saved, xw, x_mod,
+                                    N_IMG, D, H, Dh, eps, qk_eps, ctx, x_qkv_lora)
+
+    # ── ctx pre backward (qkv only) ──
+    var rb_cq = rms_norm_backward(
+        Tensor.from_host(ctx_dq, [N_CTX * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.ctx_q_pre, [N_CTX * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(ctx_qnorm, [Dh], STDtype.F32, ctx), qk_eps, ctx,
+    )
+    var d_ctx_q_pre = rb_cq.d_x^.to_host(ctx)
+    var d_ctx_qnorm = rb_cq.d_g^.to_host(ctx)
+    var rb_ck = rms_norm_backward(
+        Tensor.from_host(ctx_dk, [N_CTX * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.ctx_k_pre, [N_CTX * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(ctx_knorm, [Dh], STDtype.F32, ctx), qk_eps, ctx,
+    )
+    var d_ctx_k_pre = rb_ck.d_x^.to_host(ctx)
+    var d_ctx_knorm = rb_ck.d_g^.to_host(ctx)
+    var d_ctx_qkv = List[Float32]()
+    for r in range(N_CTX):
+        for c in range(D):
+            d_ctx_qkv.append(d_ctx_q_pre[r * D + c])
+        for c in range(D):
+            d_ctx_qkv.append(d_ctx_k_pre[r * D + c])
+        for c in range(D):
+            d_ctx_qkv.append(ctx_dv[r * D + c])
+    # ctx_qkv = linear(ctx_norm, ctx_qkv_w) [+lora] -> d_ctx_norm (+ lora d_A/d_B)
+    var lb_cqkv = _linear_backward_host(d_ctx_qkv, sv.ctx_norm, ctx_qkv_w, N_CTX, D, 3 * D, ctx)
+    var d_ctx_norm = lb_cqkv.d_x^.to_host(ctx)
+    var ctx_qkv_lora_d_a = List[Float32]()
+    var ctx_qkv_lora_d_b = List[Float32]()
+    if ctx_qkv_lora:
+        var lg = _sd35_lora_bwd(d_ctx_qkv.copy(), sv.ctx_norm.copy(), ctx_qkv_lora.value().copy(), N_CTX, ctx)
+        d_ctx_norm = _add_lists(d_ctx_norm, lg.d_x.copy())
+        ctx_qkv_lora_d_a = lg.d_a.copy()
+        ctx_qkv_lora_d_b = lg.d_b.copy()
+    # ctx_norm = modulate(ctx_ln, ctx_scale, ctx_shift) ; ctx_ln = LN(ctx_input)
+    var mb_c = _modulate_backward_host(d_ctx_norm, sv.ctx_ln, ctx_scale, N_CTX, D, ctx)
+    var d_context = _layer_norm_backward_dx(mb_c.d_x, sv.ctx_input, N_CTX, D, eps, ctx)
+
+    var x_g = StreamGrads(
+        xprb.d_wqkv.copy(), xprb.d_bqkv.copy(), xpb.d_wproj.copy(), xpb.d_bproj.copy(),
+        xpb.d_wfc1.copy(), xpb.d_bfc1.copy(), xpb.d_wfc2.copy(), xpb.d_bfc2.copy(),
+        xprb.d_qnorm.copy(), xprb.d_knorm.copy(),
+        xprb.d_shift_msa.copy(), xprb.d_scale_msa.copy(), xpb.d_gate_msa.copy(),
+        xpb.d_shift_mlp.copy(), xpb.d_scale_mlp.copy(), xpb.d_gate_mlp.copy(),
+    )
+    var x_lora = StreamLoraGrads(
+        xprb.qkv_lora_d_a.copy(), xprb.qkv_lora_d_b.copy(),
+        xpb.proj_lora_d_a.copy(), xpb.proj_lora_d_b.copy(),
+        xpb.fc1_lora_d_a.copy(), xpb.fc1_lora_d_b.copy(),
+        xpb.fc2_lora_d_a.copy(), xpb.fc2_lora_d_b.copy(),
+    )
+    return CtxPreGrads(
+        xprb.d_input.copy(), d_context^, x_g^, x_lora^,
+        ctx_qkv_lora_d_a^, ctx_qkv_lora_d_b^, d_ctx_qnorm^, d_ctx_knorm^,
+    )

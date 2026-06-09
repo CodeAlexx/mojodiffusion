@@ -57,6 +57,8 @@ from serenitymojo.models.sd35.sd35_block import (
     StreamSaved, sd35_joint_block_forward, sd35_joint_block_backward,
     Attn2Weights, DualBlockForward, DualXSaved,
     sd35_dual_joint_block_forward, sd35_dual_joint_block_backward,
+    CtxPreForward, CtxPreSaved,
+    sd35_context_preonly_forward, sd35_context_preonly_backward,
 )
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
@@ -478,6 +480,47 @@ def _empty_dual_fwd() -> DualBlockForward:
     return DualBlockForward(e.copy(), e.copy(), _empty_stream_saved(), _empty_dual_xsaved())
 
 
+def _empty_ctxpre_fwd() -> CtxPreForward:
+    var e = List[Float32]()
+    return CtxPreForward(e.copy(), CtxPreSaved(e.copy(), e.copy(), e.copy(), e.copy(), e.copy(), e.copy(), _empty_stream_saved()))
+
+
+# ── ctx-pre-only (final) block: context has ONLY attn.qkv + ln_q/ln_k ──────────
+def _ctx_preonly_qkv_from_block(
+    block: Block, ctx_prefix: String, ctx: DeviceContext
+) raises -> List[List[Float32]]:
+    var bp = ctx_prefix + String("attn.")
+    var out = List[List[Float32]]()
+    out.append(_block_host_f32(block, bp + String("qkv.weight"), ctx))
+    out.append(_block_host_f32(block, bp + String("qkv.bias"), ctx))
+    out.append(_block_host_f32(block, bp + String("ln_q.weight"), ctx))
+    out.append(_block_host_f32(block, bp + String("ln_k.weight"), ctx))
+    return out^
+
+
+# AdaLayerNormContinuous: silu(c)@W.T+b -> [2D] raw order [shift,scale].
+# Returns [flat_2D, scale, shift].
+def _compute_ctx_continuous_mod(
+    c: List[Float32], ada_w: List[Float32], ada_b: List[Float32],
+    D: Int, ctx: DeviceContext,
+) raises -> List[List[Float32]]:
+    var sh1 = List[Int](); sh1.append(1); sh1.append(D)
+    var c_silu = silu(_t(c.copy(), sh1^, ctx), ctx)
+    var sh2 = List[Int](); sh2.append(2 * D); sh2.append(D)
+    var sh3 = List[Int](); sh3.append(2 * D)
+    var raw = linear(
+        c_silu, _t(ada_w.copy(), sh2^, ctx),
+        Optional[Tensor](_t(ada_b.copy(), sh3^, ctx)), ctx,
+    ).to_host(ctx)
+    var shift = List[Float32](); var scale = List[Float32]()
+    for cc in range(D):
+        shift.append(raw[cc])          # chunk 0 = shift
+        scale.append(raw[D + cc])      # chunk 1 = scale
+    var out = List[List[Float32]]()
+    out.append(raw.copy()); out.append(scale^); out.append(shift^)
+    return out^
+
+
 def _compute_stream_modvecs(
     c: List[Float32], ada_w: List[Float32], ada_b: List[Float32],
     D: Int, ctx: DeviceContext,
@@ -500,22 +543,27 @@ def _compute_stream_modvecs(
 # ── Saved per-block state (for backward) ─────────────────────────────────────
 struct BlockSaved(Copyable, Movable):
     var is_dual: Bool
-    var fwd: JointBlockForward         # valid when not is_dual
+    var is_ctxpre: Bool                # context_pre_only FINAL block
+    var fwd: JointBlockForward         # valid when standard (not dual/ctxpre)
     var dual_fwd: DualBlockForward     # valid when is_dual
-    var ctx_ada_flat: List[Float32]    # [6D] frozen adaLN raw output for ctx stream
-    var x_ada_flat: List[Float32]      # [6D] std / [9D] dual — for x stream
+    var ctxpre_fwd: CtxPreForward      # valid when is_ctxpre
+    var ctx_ada_flat: List[Float32]    # [6D] std / [2D] ctxpre — ctx stream
+    var x_ada_flat: List[Float32]      # [6D] std / [9D] dual — x stream
 
     def __init__(
         out self,
-        is_dual: Bool,
+        is_dual: Bool, is_ctxpre: Bool,
         var fwd: JointBlockForward,
         var dual_fwd: DualBlockForward,
+        var ctxpre_fwd: CtxPreForward,
         var ctx_ada_flat: List[Float32],
         var x_ada_flat: List[Float32],
     ):
         self.is_dual = is_dual
+        self.is_ctxpre = is_ctxpre
         self.fwd = fwd^
         self.dual_fwd = dual_fwd^
+        self.ctxpre_fwd = ctxpre_fwd^
         self.ctx_ada_flat = ctx_ada_flat^
         self.x_ada_flat = x_ada_flat^
 
@@ -735,6 +783,7 @@ def sd35_stack_lora_forward_offload[
     eps: Float32, qk_eps: Float32,
     ctx: DeviceContext,
     num_dual: Int = 0,   # blocks [0, num_dual) are DUAL-attention (sd3.5-medium=13)
+    last_ctx_preonly: Bool = False,   # final block is context_pre_only (SD3.5)
 ) raises -> SD35StackForward:
     var depth = lora.depth
 
@@ -758,6 +807,33 @@ def sd35_stack_lora_forward_offload[
         loader.prefetch_next_with_ctx(bi, ctx)
 
         var pfx = handle.prefix + String(".")
+        var base_lora = _block_base(bi)
+
+        if last_ctx_preonly and bi == depth - 1:
+            # ── CONTEXT_PRE_ONLY final block: ctx has qkv only (no proj/mlp) ──
+            var xw = _stream_weights_from_block(handle.block, pfx + String("x_block."), D, MLP, Dh, ctx)
+            var x_ada_w = _block_host_f32(handle.block, pfx + String("x_block.adaLN_modulation.1.weight"), ctx)
+            var x_ada_b = _block_host_f32(handle.block, pfx + String("x_block.adaLN_modulation.1.bias"), ctx)
+            var x_smr = _compute_stream_modvecs(c.copy(), x_ada_w^, x_ada_b^, D, ctx)
+            var cqw = _ctx_preonly_qkv_from_block(handle.block, pfx + String("context_block."), ctx)
+            var c_ada_w = _block_host_f32(handle.block, pfx + String("context_block.adaLN_modulation.1.weight"), ctx)
+            var c_ada_b = _block_host_f32(handle.block, pfx + String("context_block.adaLN_modulation.1.bias"), ctx)
+            var cmod = _compute_ctx_continuous_mod(c.copy(), c_ada_w^, c_ada_b^, D, ctx)  # [flat2D, scale, shift]
+            var cpfwd = sd35_context_preonly_forward[1, S, H, Dh](
+                context.copy(), x.copy(), cqw[0].copy(), cqw[1].copy(), cqw[2].copy(), cqw[3].copy(),
+                cmod[1].copy(), cmod[2].copy(), xw, x_smr.mv.copy(),
+                N_CTX, N_IMG, D, MLP, eps, qk_eps, scale, ctx,
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_QKV].copy()),
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_QKV].copy()),
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_PROJ].copy()),
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_FC1].copy()),
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_FC2].copy()),
+            )
+            x = cpfwd.x_out.copy()   # context unchanged (discarded downstream)
+            blocks.append(BlockSaved(False, True, _empty_joint_fwd(), _empty_dual_fwd(), cpfwd^, cmod[0].copy(), x_smr.flat.copy()))
+            loader.mark_active_block_done(ctx)
+            continue
+
         var bwr = _joint_weights_from_block(handle.block, pfx, D, MLP, Dh, ctx)
         var w = bwr.w.copy()
         var ctx_ada_w = bwr.ctx_ada_w.copy()
@@ -769,8 +845,6 @@ def sd35_stack_lora_forward_offload[
         var ctx_smr = _compute_stream_modvecs(c.copy(), ctx_ada_w.copy(), ctx_ada_b.copy(), D, ctx)
         var ctx_ada_flat = ctx_smr.flat.copy()
         var ctx_mv = ctx_smr.mv.copy()
-
-        var base_lora = _block_base(bi)
 
         if bi < num_dual:
             # ── DUAL-attention block (SD35AdaLayerNormZeroX 9-chunk + attn2) ──
@@ -786,7 +860,7 @@ def sd35_stack_lora_forward_offload[
             )
             context = dfwd.ctx_out.copy()
             x = dfwd.x_out.copy()
-            blocks.append(BlockSaved(True, _empty_joint_fwd(), dfwd^, ctx_ada_flat^, x_ada_flat^))
+            blocks.append(BlockSaved(True, False, _empty_joint_fwd(), dfwd^, _empty_ctxpre_fwd(), ctx_ada_flat^, x_ada_flat^))
         else:
             # ── STANDARD joint block (6-chunk) ──
             var x_smr = _compute_stream_modvecs(c.copy(), x_ada_w.copy(), x_ada_b.copy(), D, ctx)
@@ -806,7 +880,7 @@ def sd35_stack_lora_forward_offload[
             )
             context = fwd.ctx_out.copy()
             x = fwd.x_out.copy()
-            blocks.append(BlockSaved(False, fwd^, _empty_dual_fwd(), ctx_ada_flat^, x_ada_flat^))
+            blocks.append(BlockSaved(False, False, fwd^, _empty_dual_fwd(), _empty_ctxpre_fwd(), ctx_ada_flat^, x_ada_flat^))
         loader.mark_active_block_done(ctx)
 
     # ── 4. final layer ──
@@ -838,6 +912,7 @@ def sd35_stack_lora_backward_offload[
     eps: Float32, qk_eps: Float32,
     ctx: DeviceContext,
     num_dual: Int = 0,   # blocks [0, num_dual) are DUAL-attention
+    last_ctx_preonly: Bool = False,
 ) raises -> SD35LoraGradSet:
     var depth = lora.depth
 
@@ -896,13 +971,52 @@ def sd35_stack_lora_backward_offload[
             loader.prefetch_with_ctx(block_idx - 1, ctx)
 
         var pfx = handle.prefix + String(".")
+        var scale = Float32(1.0) / Float32(8.0)
+        var base_lora = _block_base(bi)
+
+        if last_ctx_preonly and bi == depth - 1:
+            # ── CONTEXT_PRE_ONLY final block backward ──
+            var xw = _stream_weights_from_block(handle.block, pfx + String("x_block."), D, MLP, Dh, ctx)
+            var x_mv = _chunk6(saved.blocks[bi].x_ada_flat.copy(), D)
+            var cqw = _ctx_preonly_qkv_from_block(handle.block, pfx + String("context_block."), ctx)
+            # ctx_scale = chunk1 of the saved [2D] continuous-mod flat
+            var ctx_scale = List[Float32]()
+            for cc in range(D):
+                ctx_scale.append(saved.blocks[bi].ctx_ada_flat[D + cc])
+            var cg = sd35_context_preonly_backward[1, S, H, Dh](
+                d_x.copy(), cqw[0].copy(), cqw[2].copy(), cqw[3].copy(), ctx_scale^,
+                xw, x_mv.copy(), saved.blocks[bi].ctxpre_fwd,
+                N_CTX, N_IMG, D, MLP, eps, qk_eps, scale, ctx,
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_CTX_QKV].copy()),
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_QKV].copy()),
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_PROJ].copy()),
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_FC1].copy()),
+                Optional[LoraAdapter](lora.ad[base_lora + SLOT_X_FC2].copy()),
+            )
+            d_x = cg.d_x.copy()
+            d_ctx = cg.d_ctx.copy()
+            d_a_flat[base_lora + SLOT_CTX_QKV] = cg.ctx_qkv_lora_d_a.copy()
+            d_b_flat[base_lora + SLOT_CTX_QKV] = cg.ctx_qkv_lora_d_b.copy()
+            d_a_flat[base_lora + SLOT_X_QKV] = cg.x_lora.qkv_d_a.copy()
+            d_b_flat[base_lora + SLOT_X_QKV] = cg.x_lora.qkv_d_b.copy()
+            d_a_flat[base_lora + SLOT_X_PROJ] = cg.x_lora.proj_d_a.copy()
+            d_b_flat[base_lora + SLOT_X_PROJ] = cg.x_lora.proj_d_b.copy()
+            d_a_flat[base_lora + SLOT_X_FC1] = cg.x_lora.fc1_d_a.copy()
+            d_b_flat[base_lora + SLOT_X_FC1] = cg.x_lora.fc1_d_b.copy()
+            d_a_flat[base_lora + SLOT_X_FC2] = cg.x_lora.fc2_d_a.copy()
+            d_b_flat[base_lora + SLOT_X_FC2] = cg.x_lora.fc2_d_b.copy()
+            for s in range(SLOTS_PER_BLOCK):
+                nonfinite += _nonfinite_count(d_a_flat[base_lora + s])
+                nonfinite += _nonfinite_count(d_b_flat[base_lora + s])
+            loader.mark_active_block_done(ctx)
+            bi -= 1
+            continue
+
         var bwr = _joint_weights_from_block(handle.block, pfx, D, MLP, Dh, ctx)
         var w = bwr.w.copy()
         # adaLN weights unused in backward (modvecs rebuilt from saved flat)
 
         var ctx_mv = _chunk6(saved.blocks[bi].ctx_ada_flat.copy(), D)
-        var scale = Float32(1.0) / Float32(8.0)
-        var base_lora = _block_base(bi)
 
         if bi < num_dual:
             # ── DUAL block backward (x adaLN was 9-chunk; rebuild mv + msa2) ──

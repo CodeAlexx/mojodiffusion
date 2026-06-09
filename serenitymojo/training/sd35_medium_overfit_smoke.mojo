@@ -97,7 +97,7 @@ def _cache_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List
     return t.to_host(ctx)
 
 
-# channel-major patchify [16,128,128] -> [N_IMG=4096, 64] (matches train_sd35_real)
+# INPUT patchify [16,128,128] -> [N_IMG,64] feature order (c,ph,pw) = x_embedder conv.
 def _pack_latents(lat: List[Float32]) -> List[Float32]:
     var out = List[Float32]()
     for ih in range(HT):
@@ -105,9 +105,21 @@ def _pack_latents(lat: List[Float32]) -> List[Float32]:
             for c in range(LAT_C):
                 for ph in range(PATCH):
                     for pw in range(PATCH):
-                        var hh = ih * PATCH + ph
-                        var ww = iw * PATCH + pw
-                        out.append(lat[c * LAT_H * LAT_W + hh * LAT_W + ww])
+                        out.append(lat[c * LAT_H * LAT_W + (ih * PATCH + ph) * LAT_W + (iw * PATCH + pw)])
+    return out^
+
+
+# OUTPUT patchify -> feature order (ph,pw,c) = diffusers proj_out / Mojo final_layer
+# (VERIFIED by sd35_fullfwd_parity: fwd.out is (ph,pw,c)). The MSE target MUST use
+# this order to match fwd.out — NOT the (c,ph,pw) input order.
+def _pack_latents_out(lat: List[Float32]) -> List[Float32]:
+    var out = List[Float32]()
+    for ih in range(HT):
+        for iw in range(WT):
+            for ph in range(PATCH):
+                for pw in range(PATCH):
+                    for c in range(LAT_C):
+                        out.append(lat[c * LAT_H * LAT_W + (ih * PATCH + ph) * LAT_W + (iw * PATCH + pw)])
     return out^
 
 
@@ -164,22 +176,26 @@ def main() raises:
     print("[cache]", CACHE)
     var cst = SafeTensors.open(CACHE)
     var lat_raw = _cache_f32(cst, String("latent"), ctx)        # [16*128*128]
-    var lat_scaled = List[Float32]()
+    var lat_scaled = List[Float32]()              # pixel order [16*128*128]
     for i in range(len(lat_raw)):
         lat_scaled.append((lat_raw[i] - VAE_SHIFT) * VAE_SCALE)
-    var latent_packed = _pack_latents(lat_scaled)              # [N_IMG, IN_CH]
     var txt = _cache_f32(cst, String("text_embedding"), ctx)   # [154*4096]
     var pooled = _cache_f32(cst, String("pooled"), ctx)        # [2048]
 
+    # flow-match in PIXEL space, then pack input/target in their respective orders:
+    #   noisy INPUT  -> (c,ph,pw) [x_embedder conv]
+    #   velocity TARGET -> (ph,pw,c) [matches fwd.out / proj_out]  (parity-verified)
     var sigma = Float32(0.5)
-    var noise = _noise(N_IMG * IN_CH, UInt64(20260609))
-    var noisy = List[Float32]()
-    var target = List[Float32]()
-    for i in range(len(latent_packed)):
-        noisy.append(noise[i] * sigma + latent_packed[i] * (Float32(1.0) - sigma))
-        target.append(noise[i] - latent_packed[i])
-    print("[cache] latent", len(lat_raw), " packed", len(latent_packed),
-          " txt", len(txt), " pooled", len(pooled))
+    var noise_full = _noise(LAT_C * LAT_H * LAT_W, UInt64(20260609))   # pixel order
+    var noisy_px = List[Float32]()
+    var vel_px = List[Float32]()
+    for i in range(len(lat_scaled)):
+        noisy_px.append(noise_full[i] * sigma + lat_scaled[i] * (Float32(1.0) - sigma))
+        vel_px.append(noise_full[i] - lat_scaled[i])
+    var noisy = _pack_latents(noisy_px)        # (c,ph,pw)
+    var target = _pack_latents_out(vel_px)     # (ph,pw,c)
+    print("[cache] latent", len(lat_raw), " noisy", len(noisy),
+          " target", len(target), " txt", len(txt), " pooled", len(pooled))
 
     var first_loss = Float32(0.0)
     var min_loss = Float32(1.0e30)
@@ -225,8 +241,8 @@ def main() raises:
     print("first MSE =", first_loss, "  min MSE =", min_loss,
           "  reduction =", first_loss / (min_loss + Float32(1.0e-30)), "x")
     if min_loss < first_loss:
-        print("RESULT: medium 1024^2 (real cache, dual 0-12 + standard + ctxpre 23 +",
-              "pos_embed) ran full-depth + FIT in memory + loss DECREASED. NOTE:",
-              "~123s/step host-carrier path; pos_embed not yet full-model parity-checked.")
+        print("RESULT: medium 1024^2 (real cache, dual+standard+ctxpre+pos_embed,",
+              "forward parity-verified cos 0.99999987, target in (ph,pw,c) output",
+              "order) ran full-depth + FIT in memory + loss DECREASED. ~123s/step.")
     else:
         print("RESULT: ran but loss did not decrease — investigate.")

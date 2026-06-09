@@ -83,7 +83,7 @@ from serenitymojo.sampling.flux1_dev import (
 )
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import add, mul_scalar, reshape, permute
+from serenitymojo.ops.tensor_algebra import add, mul_scalar, reshape, permute, slice, concat
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.training.sample_prompt_config import (
     SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
@@ -110,6 +110,12 @@ comptime IMG_W2        = (WIDTH  + 15) // 16          # 64
 comptime N_IMG         = IMG_H2 * IMG_W2              # 4096
 comptime N_TXT         = 512
 comptime S             = N_IMG + N_TXT
+# VAE tiled-decode: 2x2 latent quadrants. After the offloaded DiT, the caching
+# allocator pool is at a high water mark and a single 1024² decode buffer OOMs
+# (measured: VAE-alone fits, VAE-after-DiT does not). Each tile decodes a
+# LATENT/2 quadrant (small alloc that fits the pool) → assembled output.
+comptime TILE_H        = LATENT_H // 2               # 64 @1024²
+comptime TILE_W        = LATENT_W // 2
 
 # ── Sampler constants (comptime-fixed today; see header for rationale) ────────
 comptime STEPS    = 20
@@ -168,6 +174,22 @@ def _unpack_latent(packed: Tensor, ctx: DeviceContext) raises -> Tensor:
     sp.append(LATENT_H)
     sp.append(LATENT_W)
     return reshape(tp, sp^, ctx)
+
+
+# ── tiled VAE decode (2x2 latent quadrants) — fits the post-DiT allocator pool ─
+# Decoder is instantiated at the TILE shape and reused for all 4 quadrants.
+# NOTE: tiles do not overlap and the mid-block attention is per-tile, so faint
+# seams / minor cross-tile context loss are possible (overlap+blend is the
+# quality follow-up). Memory-correct 1024² decode.
+def _tiled_decode(latent: Tensor, ctx: DeviceContext) raises -> Tensor:
+    var dec = load_flux1_ldm_decoder[TILE_H, TILE_W](VAE_PATH, ctx)
+    var tl = dec.decode(slice(slice(latent, 2, 0, TILE_H, ctx), 3, 0, TILE_W, ctx), ctx)
+    var tr = dec.decode(slice(slice(latent, 2, 0, TILE_H, ctx), 3, TILE_W, TILE_W, ctx), ctx)
+    var bl = dec.decode(slice(slice(latent, 2, TILE_H, TILE_H, ctx), 3, 0, TILE_W, ctx), ctx)
+    var br = dec.decode(slice(slice(latent, 2, TILE_H, TILE_H, ctx), 3, TILE_W, TILE_W, ctx), ctx)
+    var top = concat(3, ctx, tl, tr)   # [1,3, 8*TILE_H, 16*TILE_W]
+    var bot = concat(3, ctx, bl, br)
+    return concat(2, ctx, top, bot)    # [1,3, 16*TILE_H, 16*TILE_W]
 
 
 def _to_bf16(x: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -376,16 +398,15 @@ def main() raises:
     # giving the VAE decode a clean GPU (staged loading).
     var packed_h = denoise(caps, ctx)
 
-    # VAE decode (fresh GPU stage). Re-upload the host latent [1, N_IMG, 64].
-    print("[vae] unpack + decode")
+    # VAE decode (fresh GPU stage, TILED). Re-upload the host latent [1, N_IMG, 64].
+    print("[vae] unpack + tiled decode (2x2)")
     var psh = List[Int]()
     psh.append(1)
     psh.append(N_IMG)
     psh.append(AE_IN_CHANNELS * 4)
     var packed = Tensor.from_host(packed_h, psh^, STDtype.F32, ctx)
     var latent = _unpack_latent(packed, ctx)
-    var vae = load_flux1_ldm_decoder[LATENT_H, LATENT_W](VAE_PATH, ctx)
-    var img = vae.decode(latent, ctx)
+    var img = _tiled_decode(latent, ctx)
     var sh = img.shape()
     print("  image shape:", sh[0], sh[1], sh[2], sh[3])
 

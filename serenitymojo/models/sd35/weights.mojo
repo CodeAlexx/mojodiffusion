@@ -78,10 +78,14 @@ def load_sd35_stack_base(
     var fl_lin_w = _load_tensor(st, String("final_layer.linear.weight"), ctx)
     var fl_lin_b = _load_tensor(st, String("final_layer.linear.bias"), ctx)
 
+    # learned positional embedding [1, POS_MAX*POS_MAX, D] (center-cropped per res)
+    var pos_embed = _load_tensor(st, String("pos_embed"), ctx)
+
     return SD35StackBase(
         TArc(xe_w^), TArc(xe_b^),
         TArc(ce_w^), TArc(ce_b^),
         TArc(t_w0^), TArc(t_b0^), TArc(t_w2^), TArc(t_b2^),
         TArc(y_w0^), TArc(y_b0^), TArc(y_w2^), TArc(y_b2^),
         TArc(fl_ada_w^), TArc(fl_ada_b^), TArc(fl_lin_w^), TArc(fl_lin_b^),
+        TArc(pos_embed^),
     )

@@ -96,6 +96,8 @@ struct SD35StackBase(Copyable, Movable):
     var fl_ada_b: TArc  # [2D]
     var fl_lin_w: TArc  # [64,D]
     var fl_lin_b: TArc  # [64]
+    # learned positional embedding [1, POS_MAX*POS_MAX, D] (center-cropped per res)
+    var pos_embed: TArc
 
     def __init__(
         out self,
@@ -107,6 +109,7 @@ struct SD35StackBase(Copyable, Movable):
         var y_w2: TArc, var y_b2: TArc,
         var fl_ada_w: TArc, var fl_ada_b: TArc,
         var fl_lin_w: TArc, var fl_lin_b: TArc,
+        var pos_embed: TArc,
     ):
         self.xe_w = xe_w^
         self.xe_b = xe_b^
@@ -124,6 +127,7 @@ struct SD35StackBase(Copyable, Movable):
         self.fl_ada_b = fl_ada_b^
         self.fl_lin_w = fl_lin_w^
         self.fl_lin_b = fl_lin_b^
+        self.pos_embed = pos_embed^
 
 
 # ── LoRA slot indices (8 adapters per joint block) ────────────────────────────
@@ -680,6 +684,34 @@ def _x_embed(
     ).to_host(ctx)
 
 
+def _isqrt(n: Int) -> Int:
+    var r = 0
+    while (r + 1) * (r + 1) <= n:
+        r += 1
+    return r
+
+
+# Add the center-cropped learned pos_embed to the image tokens (SD3 PatchEmbed):
+# reshape pos_embed [POS_MAX*POS_MAX, D], crop center [HT,WT] (top/left=(MAX-H)//2),
+# flatten row-major (h,w) — matches _pack_latents' (ih,iw) token order — and add.
+def _add_pos_embed(
+    var x_proj: List[Float32], base: SD35StackBase, N_IMG: Int, D: Int, ctx: DeviceContext,
+) raises -> List[Float32]:
+    var pos = cast_tensor(base.pos_embed[], STDtype.F32, ctx).to_host(ctx)  # [MAX*MAX*D]
+    var pos_max = _isqrt(len(pos) // D)
+    var ht = _isqrt(N_IMG)
+    var wt = N_IMG // ht
+    var top = (pos_max - ht) // 2
+    var left = (pos_max - wt) // 2
+    for ih in range(ht):
+        for iw in range(wt):
+            var src = ((top + ih) * pos_max + (left + iw)) * D
+            var dst = (ih * wt + iw) * D
+            for d in range(D):
+                x_proj[dst + d] = x_proj[dst + d] + pos[src + d]
+    return x_proj^
+
+
 def _ctx_embed(
     ctx_tokens_h: List[Float32], base: SD35StackBase,
     N_CTX: Int, CTX_CH: Int, D: Int, ctx: DeviceContext,
@@ -792,8 +824,9 @@ def sd35_stack_lora_forward_offload[
     # ── 1. conditioning ──
     var c = _build_conditioning(base, sigma, pooled_h, D, TIMESTEP_DIM, POOLED_DIM, ctx)
 
-    # ── 2. input projections ──
+    # ── 2. input projections (+ learned pos_embed on image tokens) ──
     var x_proj = _x_embed(noisy_h.copy(), base, N_IMG, IN_CH, D, ctx)
+    x_proj = _add_pos_embed(x_proj^, base, N_IMG, D, ctx)
     var ctx_proj = _ctx_embed(text_h.copy(), base, N_CTX, CTX_CH, D, ctx)
 
     # ── 3. joint blocks ──

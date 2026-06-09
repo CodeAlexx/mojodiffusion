@@ -7,11 +7,10 @@
 # medium loads + FITS in 24GB + a full-depth 1024^2 step runs + the loss
 # decreases (LoRA descends). Reports peak behaviour by exit code + loss trace.
 #
-# NOT-YET-FAITHFUL (measured gaps, see HANDOFF): the current sd35_stack forward
-#   (1) omits pos_embed (x_embedder only), and
-#   (2) uses the non-dual joint block for ALL 24 blocks (blocks 0-12 are dual).
-# So this smoke de-risks INFRA/MEMORY only; faithful training needs pos_embed +
-# the dual-block dispatch wired in (dual block fwd/bwd already gate-verified).
+# FAITHFUL forward now: dual blocks 0-12 + standard 13-22 + context_pre_only 23
+# all dispatched (each gate-verified), pos_embed center-cropped + added on the
+# image tokens, real cached latent/text via flow-match. Remaining: perf
+# (~123s/step host-carrier path); pos_embed output not yet full-model parity-checked.
 #
 # Run:
 #   cd /home/alex/mojodiffusion
@@ -226,8 +225,8 @@ def main() raises:
     print("first MSE =", first_loss, "  min MSE =", min_loss,
           "  reduction =", first_loss / (min_loss + Float32(1.0e-30)), "x")
     if min_loss < first_loss:
-        print("RESULT: medium 1024^2 (real cache, dual 0-12 + standard + ctxpre 23)",
-              "ran full-depth + FIT in memory + loss DECREASED. NOTE: pos_embed still",
-              "omitted (forward not yet fully faithful); host-carrier path ~123s/step.")
+        print("RESULT: medium 1024^2 (real cache, dual 0-12 + standard + ctxpre 23 +",
+              "pos_embed) ran full-depth + FIT in memory + loss DECREASED. NOTE:",
+              "~123s/step host-carrier path; pos_embed not yet full-model parity-checked.")
     else:
         print("RESULT: ran but loss did not decrease — investigate.")

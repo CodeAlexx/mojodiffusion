@@ -41,6 +41,39 @@ inference.
 
 ## What Changed In This Pass
 
+### 2026-06-09 FLUX.1-dev: first GENUINE pure-Mojo image (T5 fp16→NaN fix)
+
+- **FLUX.1-dev now produces a real, pixel-verified 1024² image end-to-end in
+  pure Mojo** via `pipeline/flux_sample_cli.mojo` (real `ClipTokenizer` +
+  `T5Tokenizer` → CLIP-L/T5-XXL encoders → offloaded DiT → 20-step denoise →
+  tiled VAE → PNG). Prompt "a single red apple on a rustic wooden table":
+  output mean `66.3`, std `49.80`, only `0.1%` saturated, reddish channel means
+  R/G/B `87.2/63.5/48.2` (consistent with the prompt), `frac==255 ≈ 0.001`.
+- **Root cause of the long-standing all-white FLUX image (measured):** the
+  T5-XXL text encoder returned an **all-NaN** hidden state, which poisoned every
+  DiT step → all-NaN latent → blank white PNG (a blank 1024² PNG compresses to
+  identical bytes every run, which masked it as "deterministic output"). The
+  `t5xxl_fp16.safetensors` weights were loaded in **fp16**, but T5-XXL's residual
+  stream grows to tens of thousands by mid-stack and **overflows fp16
+  (max 65504)** — instrumented layer-by-layer, it hit **±inf at layer 10**, then
+  NaN at layer 11. This is the classic reason diffusers runs T5 in bf16/fp32.
+- **Fix:** `models/text_encoder/t5_encoder.mojo` `load()` now casts every T5
+  weight to **BF16** at load (range ~3e38 absorbs the large residual stream,
+  matching the port's intended "BF16 storage, F32 accumulation"). After the fix:
+  no NaN through all 24 layers; final hidden in `[-7.06, 2.39]`.
+- **VAE seam polish:** `flux_sample_cli.mojo` 1024² tiled decode upgraded from
+  non-overlapping 2×2 quadrants to a **3×3 overlapping** decode (64² latent crops
+  at stride 32 → 256px image overlap) with a separable feathered cross-fade blend
+  (`_weight_tensor`/`_xfade`/`_blend3`). Each tile stays at the proven 64² latent
+  size and tiles are decoded/freed per row, so the retained-memory peak matches
+  the working 2×2 path — a 2×2/72² overlap attempt OOM'd in the tight post-DiT
+  allocator pool (measured: `CUDA_ERROR_OUT_OF_MEMORY`).
+- **Correction to prior notes:** the earlier `flux1_first.png` all-white result
+  (and an interim "FLUX ran at 512²/1024²" claim) was NOT solely a prompt-
+  assembly placeholder issue — the fp16 T5 NaN was the dominant cause. FLUX is
+  now genuinely RUN-verified with real pixels, the first UI-dropdown model run
+  truly end-to-end.
+
 ### 2026-06-06 Klein Trainer/Sampler Update
 
 - Klein 9B LoRA product training now has bounded `CPU_OFFLOADED` smoke evidence
@@ -358,15 +391,21 @@ Remaining SDXL blockers:
 
 ## FLUX.1-dev Port Notes
 
-Current FLUX.1-dev status:
+Current FLUX.1-dev status (updated 2026-06-09 — RUN-VERIFIED):
 
+- **`pipeline/flux_sample_cli.mojo` is the working end-to-end raw-prompt path.**
+  Real `ClipTokenizer`+`T5Tokenizer` → CLIP-L pooled + T5-XXL hidden → offloaded
+  FLUX DiT (guidance-distilled, single forward/step) → 20-step Euler denoise →
+  3×3 overlap+blend tiled VAE → PNG. Pixel-verified real 1024² apple image
+  (mean 66.3 / std 49.80 / reddish RGB). See the 2026-06-09 pass entry above.
+- **T5-XXL must run in bf16, not fp16** — fp16 overflows mid-stack to NaN
+  (fixed in `t5_encoder.mojo load()`; measured ±inf at layer 10).
 - `models/dit/flux1_contract.mojo` validates the manifest, CLIP-L/T5 assets,
   FLUX DiT checkpoint, FLUX LDM VAE checkpoint, and optional cached-input
   sidecar.
-- `pipeline/flux1_pipeline_smoke.mojo` builds/runs the end-to-end path from
-  placeholder CLIP/T5 token IDs. A runtime run produced
-  `output/flux1_first.png`, but that image is all-white and should not be used
-  as a quality claim.
+- `pipeline/flux1_pipeline_smoke.mojo` (older placeholder-token smoke) produced
+  the all-white `output/flux1_first.png`; superseded by `flux_sample_cli.mojo`.
+  Its all-white output is now understood: placeholder tokens AND the fp16 T5 NaN.
 - `pipeline/flux1_pipeline_cached_smoke.mojo` uses the Rust-captured
   `flux1_inputs.safetensors` sidecar and produced a coherent 1024 PNG at
   `output/flux1_cached_inputs.png`. The current path uses `sdpa_nomask` instead
@@ -374,11 +413,17 @@ Current FLUX.1-dev status:
 
 Remaining FLUX.1-dev blockers:
 
-- tokenizer-backed CLIP/T5 prompt assembly in Mojo,
+- ✅ tokenizer-backed CLIP/T5 prompt assembly in Mojo — DONE (`flux_sample_cli`).
+- ✅ all-white image — DONE (T5 fp16→bf16 fix).
 - F32 RoPE table/math parity decision versus the current BF16 table path,
-- memory lifetime cleanup around encoder/DiT/VAE scopes,
+- memory lifetime cleanup around encoder/DiT/VAE scopes (staged loading + tiled
+  VAE are the current mitigations; a single-shot 1024² decode still OOMs the
+  post-DiT pool),
 - borrowed-bias/per-call allocation cleanup in the FLUX DiT hot path,
-- Rust/Modular parity once the raw-prompt path feeds real conditioning.
+- Rust/Modular **quality** parity (the image is plausible but not yet diffed
+  against a reference run; current evidence is "real coherent pixels", not parity),
+- FLUX LoRA overlay at inference (CLI accepts `<lora>` but ignores it today),
+- comptime-fixed steps/guidance/seed/size — wire these from the prompt JSON.
 
 ## FLUX.2/Klein 4B and 9B Port Notes
 

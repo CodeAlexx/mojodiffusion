@@ -50,6 +50,7 @@ from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.attention import sdpa
 from serenitymojo.ops.activations import gelu
 from serenitymojo.ops.tensor_algebra import add, mul, reshape, permute, gather_rows
+from serenitymojo.ops.cast import cast_tensor
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -157,7 +158,12 @@ struct T5Encoder[S: Int = 512]:
             var keep = nm.startswith("encoder.")
             if keep:
                 var tv = sharded.tensor_view(nm)
-                var t = Tensor.from_view(tv, ctx)
+                # Cast to BF16: the t5xxl_fp16 file stores weights in fp16, but
+                # T5-XXL's residual stream grows to tens of thousands by mid-stack
+                # and OVERFLOWS fp16 (max 65504) → inf → NaN (measured: residual
+                # hit ±inf at layer 10). bf16 (range ~3e38) absorbs it; matches the
+                # Rust reference's stated "BF16 storage, F32 accumulation".
+                var t = cast_tensor(Tensor.from_view(tv, ctx), STDtype.BF16, ctx)
                 var idx = len(weights)
                 weights.append(ArcPointer(t^))
                 name_to_idx[nm] = idx
@@ -165,7 +171,7 @@ struct T5Encoder[S: Int = 512]:
                     has_embed = True
             elif nm == "shared.weight":
                 var tv = sharded.tensor_view(nm)
-                var t = Tensor.from_view(tv, ctx)
+                var t = cast_tensor(Tensor.from_view(tv, ctx), STDtype.BF16, ctx)
                 shared_idx = len(weights)
                 weights.append(ArcPointer(t^))
                 name_to_idx[String("shared.weight")] = shared_idx

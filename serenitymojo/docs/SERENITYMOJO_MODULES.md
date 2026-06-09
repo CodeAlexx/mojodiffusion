@@ -482,6 +482,12 @@ This does not create a `DeviceContext`, import SD3 MMDiT math, or load tensors.
   - `pipeline/sd3_medium_vae_smoke.mojo` runs the embedded SD3 VAE decoder from
     the Medium checkpoint and writes `output/sd3_medium_vae_noise_1024.png`.
 
+### `models/sd35/{sd35_block,sd35_stack_lora}.mojo` — SD3.5 MMDiT LoRA training ✅ (block cos≈1.0 F32, fidelity cos=1.0 F64, trains 74.6×)
+Joint MMDiT block + multi-block LoRA stack for the SD3.5 trainer (8 slots/block: ctx+x × qkv/proj/fc1/fc2; base weights frozen). Math is **measured-authoritative vs the REAL diffusers `JointTransformerBlock`** (the class OneTrainer `SD3Transformer2DModel` uses), not just self-consistent.
+- `sd35_joint_block_forward[1,S,H,Dh](context, x, w: JointBlockWeights, cm, xm: ModVecs, N_CTX,N_IMG,D,MLP,eps,qk_eps,scale, ctx, Optional[List]None, 8×Optional[LoraAdapter]) -> JointBlockForward` (.ctx_out, .x_out); `sd35_joint_block_backward[...](d_ctx,d_x,...) -> JointBlockLoraGrads` (.ctx_lora/.x_lora: StreamLoraGrads with qkv/proj/fc1/fc2 d_a/d_b). Conventions: LayerNorm-no-affine eps 1e-6, qk RMSNorm eps 1e-6, modulate=(1+scale)·LN+shift, gated residual, GELU-tanh MLP, joint sdpa 1/sqrt(Dh), NO rope, context-first concat (perm-equivariant w/ diffusers' x-first).
+- `sd35_stack_lora_forward_offload/backward_offload[H,Dh,N_IMG,N_CTX,S]` + `build_sd35_lora_set` + `sd35_lora_adamw_step` + `save_sd35_lora` — full block-swap-offload stack training step (TurboPlannedLoader, real checkpoint).
+- **Parity gates** (`models/sd35/parity/`): `sd35_block_parity.mojo` (+`_oracle.py`) — joint block fwd+bwd weight/mod grads cos≈1.0 + LoRA d_A/d_B cos 0.99998; `sd35_block_vs_diffusers.py` — oracle vs real diffusers block cos=1.0 (F64) on fwd(both streams)+3 input grads+32 weight grads; `sd35_lora_all_slots_smoke.mojo` — all 8 slots finite+nonzero; `sd35_overfit_convergence.mojo` — block+8 slots overfits one batch, MSE 0.0450→6.0e-4 (74.6×).
+
 ### `models/dit/sd3_mmdit.mojo` — SD3.5 Large/Medium MMDiT pre/post-block slices ✅ runtime-smoke
 Real-weight resident MMDiT gate for SD3.5 Large and local "small" SD3.5
 Medium around the still-missing joint transformer blocks. It loads BF16 weights

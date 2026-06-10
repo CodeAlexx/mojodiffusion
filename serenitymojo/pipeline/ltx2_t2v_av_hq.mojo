@@ -2373,7 +2373,93 @@ def run_refhq(
     _refhq_save(f_names^, f_tensors^, out_dir + "/final_latents.safetensors", ctx)
     _ = _stats(String("video(final)"), v_final, ctx)
     _ = _stats(String("audio(final)"), a_final, ctx)
+
+    # ── free the DiT working set BEFORE the VAE loads (24 GB discipline, same
+    # as the staged path: the resident fp8 range (~20.5 GB) and the rank-384
+    # LoRA factor cache (~7.6 GB) must be gone before decoder weights + frame
+    # buffers allocate). Reassignment destroys the old values -> VRAM freed.
+    print("  [decode] freeing resident fp8 blocks + LoRA factor cache")
+    stream = LTX2BlockStream.open(String(CKPT_FP8))
+    lora = LoraSet.load(String(LORA_DISTILLED_PATH))
+
+    # ── DECODE VIDEO (latent [1,128,NF,NH2,NW2] -> 121 frames @ 768x512) ──
+    print("  [decode] video VAE (latent -> frames)")
+    var vae = LTX2VaeDecoderWeights.load(String(CKPT_BF16), ctx)
+    var v_final_bf16 = cast_tensor(v_final, STDtype.BF16, ctx)
+    var frames = decode_video[1, 128, REFHQ_NF, REFHQ_NH2, REFHQ_NW2](
+        vae, v_final_bf16, ctx
+    )
+    var fsh = frames.shape()
+    var n_frames_out = fsh[2]
+    print("  frames NCDHW: [", fsh[0], ",", fsh[1], ",", fsh[2], ",", fsh[3],
+          ",", fsh[4], "]")
+    _ = _stats(String("frames"), frames, ctx)
+
+    var frame_prefix = String("refhq_frame")
+    for fr in range(n_frames_out):
+        var fslice = slice(frames, 2, fr, 1, ctx)
+        var fs = fslice.shape()
+        var chw = reshape(fslice, _sh4(fs[0], fs[1], fs[3], fs[4]), ctx)
+        save_png(
+            chw, out_dir + "/" + frame_prefix + _pad3(fr) + ".png", ctx,
+            ValueRange.SIGNED,
+        )
+    print("  saved", n_frames_out, "frame PNGs ->", out_dir)
+
+    # ── DECODE AUDIO (latent [1,8,S_A,16] -> mel -> 48kHz stereo wav) ──
+    var wav_out = out_dir + "/refhq_audio.wav"
+    print("  [decode] audio VAE (latent -> mel) -> vocoder (mel -> 48kHz wav)")
+    var avae = LTX2AudioVaeDecoderWeights.load(String(CKPT_BF16), ctx)
+    var a_final_bf16 = cast_tensor(a_final, STDtype.BF16, ctx)
+    var mel = cast_tensor(decode_audio(avae, a_final_bf16, ctx), STDtype.BF16, ctx)
+    var msh = mel.shape()
+    print("  mel NCHW: [", msh[0], ",", msh[1], ",", msh[2], ",", msh[3], "] BF16 storage")
+    _ = _stats(String("mel"), mel, ctx)
+
+    var voc = LTX2VocoderWithBWE.from_file(String(CKPT_BF16), ctx)
+    var wav = voc.forward(mel, ctx)
+    var wsh = wav.shape()
+    var L = wsh[2]
+    print("  wav [", wsh[0], ",", wsh[1], ",", wsh[2], "] @", voc.output_sample_rate(), "Hz")
+
+    var wh = wav.to_host(ctx)
+    var rms = 0.0
+    var amax = 0.0
+    var bad = False
+    for i in range(len(wh)):
+        var v = Float64(wh[i])
+        if not (v == v): bad = True
+        rms += v * v
+        var av = v if v >= 0.0 else -v
+        if av > amax: amax = av
+    rms = sqrt(rms / Float64(len(wh)))
+    print("  AUDIO rms=", Float32(rms), " absmax=", Float32(amax), " finite=",
+          not bad, " nonsilent=", rms > 1.0e-4)
+
+    var inter = List[Float32]()
+    inter.resize(L * 2, Float32(0.0))
+    for ch in range(2):
+        for s in range(L):
+            inter[s * 2 + ch] = wh[ch * L + s]
+    _write_wav(wav_out, inter, voc.output_sample_rate())
+    print("  wrote wav:", wav_out)
+
+    # ── MUX (25 fps refhq profile, 3-digit frame numbers) ──
+    var mp4_out = out_dir + "/ltx2_refhq.mp4"
+    print("  [mux] ffmpeg frames + wav -> mp4")
+    var cmd = String("ffmpeg -y -framerate 25 -i ")
+    cmd += out_dir + "/" + frame_prefix + "%03d.png -i " + wav_out
+    cmd += " -c:v libx264 -pix_fmt yuv420p -af apad -c:a aac -shortest -movflags +faststart "
+    cmd += mp4_out + " >/dev/null 2>&1"
+    var rc = sys_system(cmd)
+    if rc != 0:
+        print("  [mux] WARNING: ffmpeg returned", rc, "(frames+wav still saved)")
+
     print("=== refhq DONE ===")
+    print("  mp4:", mp4_out)
+    print("  wav:", wav_out)
+    print("  frames:", out_dir + "/" + frame_prefix + "000.png ..",
+          frame_prefix + _pad3(n_frames_out - 1) + ".png")
 
 
 def _mkdir(path: String) raises:
@@ -2496,6 +2582,14 @@ def _unaudio_perm() -> List[Int]:
 
 def _pad2(n: Int) -> String:
     if n < 10:
+        return String("0") + String(n)
+    return String(n)
+
+
+def _pad3(n: Int) -> String:
+    if n < 10:
+        return String("00") + String(n)
+    if n < 100:
         return String("0") + String(n)
     return String(n)
 

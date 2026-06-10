@@ -1,0 +1,2 @@
+H2=4 W2=4 N_IMG=16 N_TXT=16 STEPS=20 guidance=3.5
+final mean=-0.000532 std=1.446588

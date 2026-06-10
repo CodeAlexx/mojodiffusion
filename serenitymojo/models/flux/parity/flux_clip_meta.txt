@@ -1,0 +1,4 @@
+prompt=a red apple on a wooden table
+S=77 eos_pos=8 pooled_shape=[1, 768]
+ids[:12]=[49406, 320, 736, 3055, 525, 320, 9057, 2175, 49407, 49407, 49407, 49407]
+mean=-0.110723 std=1.006334

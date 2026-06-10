@@ -68,6 +68,9 @@ struct StubBackend(GenBackend, Movable):
     def model_name(self) -> String:
         return String("-")
 
+    def resident_model(self) -> String:
+        return String("")  # the stub never holds device weights
+
     def start(mut self, params: JobParams) raises:
         if self.active:
             raise Error("StubBackend.start: a job is already running")
@@ -94,6 +97,11 @@ struct StubBackend(GenBackend, Movable):
         sleep(STEP_SLEEP_S)
         self.cur += 1
         r.step = self.cur
+        # preview plumbing probe: exactly ONE mid-job step carries a dummy
+        # preview payload, so the WS event JSON's optional `preview` field can
+        # be gated end-to-end without a real latent->RGB path yet.
+        if self.cur * 2 == self.params.steps:
+            r.preview = String("stub-preview-step-") + String(self.cur)
         if self.cur < self.params.steps:
             return r^
         # final step: produce the output image; gen params ride a PNG tEXt

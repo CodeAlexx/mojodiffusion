@@ -202,6 +202,11 @@ struct ZImageBackend(GenBackend, Movable):
     def model_name(self) -> String:
         return String("Z-Image")
 
+    def resident_model(self) -> String:
+        """Matches the /v1/models scan entry name for the resident checkpoint
+        (the zimage_base/ directory entry)."""
+        return String("zimage_base") if self.loaded else String("")
+
     # ── job admission ─────────────────────────────────────────────────────────
     def start(mut self, params: JobParams) raises:
         if self.active:

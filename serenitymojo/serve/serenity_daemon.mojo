@@ -50,6 +50,7 @@ from sqlite.writer import DbWriter
 from sqlite.value import Value
 
 from serenitymojo.serve.backend import GenBackend, JobParams, LoraSpec, StepResult
+from serenitymojo.serve.model_scan import ScanEntry, scan_checkpoints, scan_loras
 from serenitymojo.serve.stub_backend import StubBackend
 from serenitymojo.serve.zimage_backend import ZImageBackend
 
@@ -392,7 +393,7 @@ def _find_job(jobs: List[JobRecord], id: String) -> Int:
 
 def handle_api(
     mut jobs: List[JobRecord], mut njobs: Int, running: Int,
-    backend_name: String, model_name: String, req: Request,
+    backend_name: String, model_name: String, resident: String, req: Request,
 ) raises -> Response:
     """Route + handle one (non-WebSocket) API request."""
     var path = req.path()
@@ -402,6 +403,35 @@ def handle_api(
         o.set("status", JSONValue.from_string(String("ok")))
         o.set("backend", JSONValue.from_string(backend_name))
         o.set("model", JSONValue.from_string(model_name))
+        o.set("resident", JSONValue.from_string(resident))
+        return json_response(200, dumps(o))
+
+    if req.method == "GET" and path == "/v1/models":
+        # fresh disk scan per request (header reads only — cheap, and the
+        # list stays correct when files are added/removed while running)
+        var models = scan_checkpoints()
+        var loras = scan_loras()
+        var ma = JSONValue.new_array()
+        for i in range(len(models)):
+            var mo = JSONValue.new_object()
+            mo.set("name", JSONValue.from_string(models[i].name))
+            mo.set("path", JSONValue.from_string(models[i].path))
+            mo.set("arch", JSONValue.from_string(models[i].arch))
+            mo.set("size", JSONValue.from_int(models[i].size))
+            mo.set("loaded", JSONValue.from_bool(
+                resident != "" and models[i].name == resident
+            ))
+            ma.append(mo^)
+        var la = JSONValue.new_array()
+        for i in range(len(loras)):
+            var lo = JSONValue.new_object()
+            lo.set("name", JSONValue.from_string(loras[i].name))
+            lo.set("path", JSONValue.from_string(loras[i].path))
+            lo.set("size", JSONValue.from_int(loras[i].size))
+            la.append(lo^)
+        var o = JSONValue.new_object()
+        o.set("models", ma^)
+        o.set("loras", la^)
         return json_response(200, dumps(o))
 
     if req.method == "POST" and path == "/v1/generate":
@@ -459,7 +489,8 @@ def handle_api(
 
 def serve_request(
     mut jobs: List[JobRecord], mut njobs: Int, running: Int,
-    backend_name: String, model_name: String, reqbytes: String, fd: Int,
+    backend_name: String, model_name: String, resident: String,
+    reqbytes: String, fd: Int,
 ) raises -> Int:
     """One HTTP request -> response. Returns 0 keep-alive, 1 close, 2 upgraded
     to the /v1/progress WebSocket."""
@@ -477,7 +508,7 @@ def serve_request(
             print("WS client connected:", fd)
             return 2
         var ka = keep_alive_wanted(req)
-        var resp = handle_api(jobs, njobs, running, backend_name, model_name, req)
+        var resp = handle_api(jobs, njobs, running, backend_name, model_name, resident, req)
         resp.set_header("Server", "SerenityDaemon/0.1")
         resp.set_header("Date", http_date())
         resp.set_keep_alive(ka)
@@ -574,7 +605,7 @@ def handle_readable(
     mut ep: Epoll, mut buffers: Dict[Int, String], mut ws: Dict[Int, Bool],
     mut frag: Dict[Int, WsReassembler], mut jobs: List[JobRecord],
     mut njobs: Int, running: Int, backend_name: String, model_name: String,
-    fd: Int,
+    resident: String, fd: Int,
 ) raises:
     if fd in ws:
         handle_ws(ep, buffers, ws, frag, fd)
@@ -609,7 +640,7 @@ def handle_readable(
             break
         var reqbytes = byte_substr(acc, 0, consumed)
         acc = byte_substr(acc, consumed, acc.byte_length())
-        var code = serve_request(jobs, njobs, running, backend_name, model_name, reqbytes, fd)
+        var code = serve_request(jobs, njobs, running, backend_name, model_name, resident, reqbytes, fd)
         if code == 2:  # upgraded to the progress WebSocket
             ws[fd] = True
             frag[fd] = WsReassembler()
@@ -632,6 +663,7 @@ def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
 
     var backend_name = backend.backend_name()
     var model_name = backend.model_name()
+    var resident = backend.resident_model()
 
     var writer = DbWriter.create()
     var cols: List[String] = ["id", "created", "model", "params_json", "state", "output_path"]
@@ -672,11 +704,12 @@ def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
                 accept_new(ep, buffers, sock.fd)
             else:
                 handle_readable(ep, buffers, ws, frag, jobs, njobs, running,
-                                backend_name, model_name, fd)
+                                backend_name, model_name, resident, fd)
         if not alive:
             break
         # the serial worker runs inside the loop: one bounded step per tick
         tick_worker(backend, jobs, running, writer, ws)
+        resident = backend.resident_model()  # residency can change on any tick
 
     ep.remove(sock.fd)
     _ = sys_close(sigfd)

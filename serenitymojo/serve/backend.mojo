@@ -107,6 +107,12 @@ trait GenBackend(Movable):
     def model_name(self) -> String:
         ...
 
+    def resident_model(self) -> String:
+        """Name of the checkpoint currently resident on the device ("" = none).
+        Reported by GET /v1/health and matched against the /v1/models scan
+        for the per-model `loaded` flag."""
+        ...
+
     def start(mut self, params: JobParams) raises:
         ...
 

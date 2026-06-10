@@ -16,17 +16,22 @@
 #     keeping the encoder resident too leaves no headroom for denoise
 #     activations at S=4352. Per-job encoder reload is served from page cache.
 #
-# step() state machine: LOAD(once) → ENCODE → DENOISE×steps → DECODE → done.
-# One denoise step (CFG dual forward + Euler update) per step() call; cancel()
-# makes the next step() return cancelled and frees all per-job tensors.
+# step() state machine: LOAD(chunked, once) → ENCODE → DENOISE×steps →
+# DECODE → done. One denoise step (CFG dual forward + Euler update) per step()
+# call; the cold LOAD is split into bounded chunks (F6) and the long ENCODE /
+# DECODE ticks are announced via StepResult.phase; cancel() makes the next
+# step() return cancelled and frees all per-job tensors.
 #
-# Size support: the latent grid is comptime in the verified stack, so only the
-# specializations wired here are valid: 512x512 (HL=WL=64) and 1024x1024
-# (HL=WL=128). Other sizes fail the job with a clear error at start().
+# Size support: 512x512 ONLY this phase (HL=WL=64). 1024x1024 (HL=WL=128) is
+# wired but DISABLED at start() pending Phase-4 VRAM work: the whole-frame
+# 128-grid decode peaks over 24 GB beside the resident DiT, and the device
+# pool retains ~8 GB between jobs (skeptic F2/F3; SERENITYUI_TODO.md).
 #
-# LoRA: forward overlay only (pipeline's own load_zimage_lora_main_only_resume
-# path) — never fused. At most ONE overlay per job (the verified path loads a
-# single adapter set); missing file or >1 entries fail the job at start().
+# LoRA: forward overlay only — never fused. At most ONE overlay per job. Two
+# file formats load: the trainer resume format (load_zimage_lora_main_only_
+# resume) and the comfy/kohya export (musubi-tuner networks.lora_zimage,
+# lora_unet_layers_* keys with fused qkv → exact split, F5). Bare names
+# resolve against the scanner's loras dir (F4).
 
 from std.ffi import external_call
 from std.gpu.host import DeviceContext
@@ -46,6 +51,7 @@ from serenitymojo.models.zimage.weights import (
 )
 from serenitymojo.models.zimage.zimage_stack_lora import (
     ZImageLoraDeviceSet, load_zimage_lora_main_only_resume,
+    load_zimage_lora_main_only_comfy, zimage_lora_file_is_comfy,
     build_zimage_zero_lora_device_set, zimage_lora_set_to_device,
 )
 from serenitymojo.models.zimage.real_weights import (
@@ -60,6 +66,7 @@ from serenitymojo.pipeline.zimage_generate import (
     NUM_NR, NUM_CR, MAIN_DEPTH, RANK, ALPHA,
 )
 from serenitymojo.serve.backend import GenBackend, JobParams, StepResult
+from serenitymojo.serve.model_scan import LORAS_DIR
 
 comptime TArc = ArcPointer[Tensor]
 
@@ -70,6 +77,14 @@ comptime PHASE_DENOISE = 3
 comptime PHASE_DECODE = 4
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
+
+# F6: the cold resident-DiT load must not stall the event loop tens of seconds
+# in ONE step() — load this many DiT blocks per step() call instead (measured
+# ~1-2 s/tick at 2 blocks, the same stall class as one denoise step, which is
+# the accepted per-tick bound this phase). The remaining single-tick stalls are
+# ENCODE (per-job Qwen3-4B load+forward, tens of seconds — announced to clients
+# with phase="encoding") and DECODE (announced with phase="decoding").
+comptime LOAD_BLOCKS_PER_TICK = 2
 
 
 def _shell(cmd: String) -> Int:
@@ -148,11 +163,16 @@ struct ZImageBackend(GenBackend, Movable):
     var cap_pad_h: List[Float32]
     var vae64: List[ArcPointer[ZImageDecoder[64, 64]]]  # 0/1
     var vae128: List[ArcPointer[ZImageDecoder[128, 128]]]
+    # chunked-load state (F6): the shard set stays open across LOAD ticks and
+    # load_cursor tracks how many DiT blocks (nr|cr|main flat) are loaded.
+    var st_open: List[ArcPointer[ShardedSafeTensors]]   # 0/1
+    var load_cursor: Int
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
     var cancel_flag: Bool
     var phase: Int
+    var announced: Bool   # one "encoding"/"decoding" announce tick sent (F6)
     var cur: Int
     var params: JobParams
     var hl: Int
@@ -179,9 +199,12 @@ struct ZImageBackend(GenBackend, Movable):
         self.cap_pad_h = List[Float32]()
         self.vae64 = List[ArcPointer[ZImageDecoder[64, 64]]]()
         self.vae128 = List[ArcPointer[ZImageDecoder[128, 128]]]()
+        self.st_open = List[ArcPointer[ShardedSafeTensors]]()
+        self.load_cursor = 0
         self.active = False
         self.cancel_flag = False
         self.phase = PHASE_IDLE
+        self.announced = False
         self.cur = 0
         self.params = JobParams()
         self.hl = 0
@@ -211,15 +234,21 @@ struct ZImageBackend(GenBackend, Movable):
     def start(mut self, params: JobParams) raises:
         if self.active:
             raise Error("ZImageBackend.start: a job is already running")
-        var hl = params.height // 8
-        var wl = params.width // 8
-        if not ((hl == 64 and wl == 64) or (hl == 128 and wl == 128)):
+        # F2/F3: 1024x1024 is DISABLED this phase — the whole-frame 128-grid
+        # decode peaks over 24 GB beside the resident DiT (CUDA OOM) and the
+        # device pool retains ~8 GB between jobs; both are real VRAM work
+        # deferred to Phase 4 (see serenityUI/SERENITYUI_TODO.md, "Phase 4
+        # VRAM work"). Reject up front instead of failing mid-job.
+        if not (params.width == 512 and params.height == 512):
             raise Error(
                 String("zimage: unsupported size ") + String(params.width)
                 + "x" + String(params.height)
-                + " — the latent grid is comptime-specialized; supported:"
-                + " 512x512 and 1024x1024"
+                + " — only 512x512 is served this phase; 1024x1024 is"
+                + " disabled pending VRAM work (Phase 4: whole-frame decode"
+                + " OOM + pool retention; SERENITYUI_TODO.md)"
             )
+        var hl = params.height // 8
+        var wl = params.width // 8
         # LoRA: the verified pipeline path applies ONE forward-overlay adapter
         # set; resolve + validate up front so a bad request fails immediately.
         var lora_path = String("")
@@ -230,13 +259,22 @@ struct ZImageBackend(GenBackend, Movable):
                 " (the verified pipeline LoRA path loads a single adapter set)"
             )
         if len(params.loras) == 1:
+            # F4: bare names (as listed by GET /v1/models) resolve against the
+            # scanner's loras dir; absolute/relative paths still accepted.
             var name = params.loras[0].name
             if _path_exists(name):
                 lora_path = name.copy()
             elif _path_exists(name + ".safetensors"):
                 lora_path = name + ".safetensors"
+            elif _path_exists(String(LORAS_DIR) + "/" + name):
+                lora_path = String(LORAS_DIR) + "/" + name
+            elif _path_exists(String(LORAS_DIR) + "/" + name + ".safetensors"):
+                lora_path = String(LORAS_DIR) + "/" + name + ".safetensors"
             else:
-                raise Error(String("zimage: LoRA file not found: ") + name)
+                raise Error(
+                    String("zimage: LoRA file not found: ") + name
+                    + " (tried as a path and under " + LORAS_DIR + ")"
+                )
             lora_mult = Float32(params.loras[0].weight)
         self.params = params.copy()
         self.hl = hl
@@ -247,42 +285,69 @@ struct ZImageBackend(GenBackend, Movable):
         self.active = True
         self.cancel_flag = False
         self.cur = 0
+        self.announced = False
         self.phase = PHASE_LOAD
 
     def cancel(mut self):
         self.cancel_flag = True
 
-    # ── resident weights (DiT + both VAE grids) ──────────────────────────────
-    def _ensure_resident(mut self) raises:
+    # ── resident weights (DiT + both VAE grids), loaded in bounded chunks ────
+    def _load_chunk(mut self) raises -> Bool:
+        """F6: one bounded slice of the resident-DiT load per step() call.
+        Returns True once the DiT is fully resident. Tick 1 opens the shard
+        set + loads the aux (embedders/final/pads); every later tick loads
+        LOAD_BLOCKS_PER_TICK DiT blocks (nr -> cr -> main, flat cursor)."""
         if self.loaded:
-            return
-        _print_vram("before resident load")
-        print("[zimage] loading resident DiT weights from", TRANSFORMER)
-        var st = ShardedSafeTensors.open(String(TRANSFORMER))
-        var aux = load_zimage_real_aux(st, NUM_NR, MAIN_DEPTH, self.ctx)
-        for i in range(NUM_NR):
-            self.nr_blocks.append(
-                load_zimage_block_weights_prefixed_mixed(
-                    st, String("noise_refiner.") + String(i), self.ctx
-                )
+            return True
+        if len(self.st_open) == 0:
+            _print_vram("before resident load")
+            print("[zimage] loading resident DiT weights from", TRANSFORMER,
+                  "(chunked:", LOAD_BLOCKS_PER_TICK, "blocks/tick)")
+            self.st_open.append(
+                ArcPointer(ShardedSafeTensors.open(String(TRANSFORMER)))
             )
-        for i in range(NUM_CR):
-            self.cr_blocks.append(
-                load_zimage_block_weights_prefixed_mixed(
-                    st, String("context_refiner.") + String(i), self.ctx
-                )
+            var aux = load_zimage_real_aux(
+                self.st_open[0][], NUM_NR, MAIN_DEPTH, self.ctx
             )
-        for i in range(MAIN_DEPTH):
-            self.main_blocks.append(
-                load_zimage_block_weights_prefixed_mixed(
-                    st, String("layers.") + String(i), self.ctx
+            self.final_lin.append(TArc(aux.final_lin_w[].clone(self.ctx)))
+            self.final_lin.append(TArc(aux.final_lin_b[].clone(self.ctx)))
+            self.x_pad_h = aux.x_pad_token[].to_host(self.ctx)
+            self.cap_pad_h = aux.cap_pad_token[].to_host(self.ctx)
+            self.aux.append(ArcPointer(aux^))
+            self.load_cursor = 0
+            return False
+        var total = NUM_NR + NUM_CR + MAIN_DEPTH
+        var done = 0
+        while self.load_cursor < total and done < LOAD_BLOCKS_PER_TICK:
+            var i = self.load_cursor
+            if i < NUM_NR:
+                self.nr_blocks.append(
+                    load_zimage_block_weights_prefixed_mixed(
+                        self.st_open[0][], String("noise_refiner.") + String(i),
+                        self.ctx,
+                    )
                 )
-            )
-        self.final_lin.append(TArc(aux.final_lin_w[].clone(self.ctx)))
-        self.final_lin.append(TArc(aux.final_lin_b[].clone(self.ctx)))
-        self.x_pad_h = aux.x_pad_token[].to_host(self.ctx)
-        self.cap_pad_h = aux.cap_pad_token[].to_host(self.ctx)
-        self.aux.append(ArcPointer(aux^))
+            elif i < NUM_NR + NUM_CR:
+                self.cr_blocks.append(
+                    load_zimage_block_weights_prefixed_mixed(
+                        self.st_open[0][],
+                        String("context_refiner.") + String(i - NUM_NR),
+                        self.ctx,
+                    )
+                )
+            else:
+                self.main_blocks.append(
+                    load_zimage_block_weights_prefixed_mixed(
+                        self.st_open[0][],
+                        String("layers.") + String(i - NUM_NR - NUM_CR),
+                        self.ctx,
+                    )
+                )
+            self.load_cursor += 1
+            done += 1
+        if self.load_cursor < total:
+            return False
+        self.st_open = List[ArcPointer[ShardedSafeTensors]]()  # close the shard mmaps
         # VAE decoders are loaded lazily per grid on first decode (and then
         # stay resident): the 128-grid decode is VRAM-critical and must
         # allocate AFTER the DiT release, not before the first job.
@@ -295,6 +360,26 @@ struct ZImageBackend(GenBackend, Movable):
         print("[zimage] resident DiT block bytes:", dit_bytes,
               "(", dit_bytes // (1024 * 1024), "MiB )")
         _print_vram("after resident load")
+        return True
+
+    def _reset_partial_load(mut self):
+        """Drop a half-done chunked load (cancel/error mid-LOAD), so the next
+        job restarts the load cleanly instead of appending duplicate blocks."""
+        if self.loaded:
+            return
+        if len(self.st_open) == 0 and len(self.aux) == 0:
+            return  # load never started
+        print("[zimage] dropping partial resident load (", self.load_cursor,
+              "blocks )")
+        self.st_open = List[ArcPointer[ShardedSafeTensors]]()
+        self.load_cursor = 0
+        self.aux = List[ArcPointer[ZImageRealAux]]()
+        self.nr_blocks = List[ZImageBlockWeights]()
+        self.cr_blocks = List[ZImageBlockWeights]()
+        self.main_blocks = List[ZImageBlockWeights]()
+        self.final_lin = List[TArc]()
+        self.x_pad_h = List[Float32]()
+        self.cap_pad_h = List[Float32]()
 
     # ── per-job prep: text encode + rope + noise + sigmas + LoRA overlay ─────
     def _prepare_job(mut self) raises:
@@ -343,13 +428,24 @@ struct ZImageBackend(GenBackend, Movable):
         # LoRA forward overlay (NEVER fused) — or the zero overlay in base mode.
         self.lora_dev = List[ZImageLoraDeviceSet]()
         if self.lora_path.byte_length() > 0:
-            var lora_alpha = ALPHA * self.lora_mult
-            print("[zimage][lora] loading overlay", self.lora_path)
-            var lora = load_zimage_lora_main_only_resume(
-                NUM_NR, NUM_CR, MAIN_DEPTH, RANK, lora_alpha, D, F,
-                self.lora_path, self.ctx,
-            )
-            self.lora_dev.append(zimage_lora_set_to_device(lora, self.ctx))
+            if zimage_lora_file_is_comfy(self.lora_path):
+                # F5: comfy/kohya export (musubi-tuner networks.lora_zimage:
+                # lora_unet_layers_* keys, fused qkv) — key-rename + exact
+                # qkv split; rank/alpha come from the file.
+                print("[zimage][lora] loading comfy/kohya overlay", self.lora_path)
+                var lora = load_zimage_lora_main_only_comfy(
+                    NUM_NR, NUM_CR, MAIN_DEPTH, D, F, self.lora_mult,
+                    self.lora_path, self.ctx,
+                )
+                self.lora_dev.append(zimage_lora_set_to_device(lora, self.ctx))
+            else:
+                var lora_alpha = ALPHA * self.lora_mult
+                print("[zimage][lora] loading overlay", self.lora_path)
+                var lora = load_zimage_lora_main_only_resume(
+                    NUM_NR, NUM_CR, MAIN_DEPTH, RANK, lora_alpha, D, F,
+                    self.lora_path, self.ctx,
+                )
+                self.lora_dev.append(zimage_lora_set_to_device(lora, self.ctx))
         else:
             self.lora_dev.append(
                 build_zimage_zero_lora_device_set(NUM_NR, NUM_CR, MAIN_DEPTH, self.ctx)
@@ -432,11 +528,14 @@ struct ZImageBackend(GenBackend, Movable):
         return png_path
 
     def _clear_job(mut self):
-        """Free per-job tensors (resident weights stay)."""
+        """Free per-job tensors (resident weights stay; a PARTIAL chunked
+        load is dropped so the next job restarts it cleanly)."""
+        self._reset_partial_load()
         self.active = False
         self.phase = PHASE_IDLE
         self.cur = 0
         self.cancel_flag = False
+        self.announced = False
         self.sigmas = List[Float32]()
         self.cap_seq_cond = List[Float32]()
         self.cap_seq_uncond = List[Float32]()
@@ -459,12 +558,24 @@ struct ZImageBackend(GenBackend, Movable):
             return r^
         try:
             if self.phase == PHASE_LOAD:
-                self._ensure_resident()
-                self.phase = PHASE_ENCODE
+                # F6: bounded chunks — one shard-open+aux tick, then
+                # LOAD_BLOCKS_PER_TICK DiT blocks per tick, each a WS event
+                # with phase="loading" so clients can show the cold load.
+                if self._load_chunk():
+                    self.phase = PHASE_ENCODE
                 r.step = 0
+                r.phase = String("loading")
                 return r^
             if self.phase == PHASE_ENCODE:
+                if not self.announced:
+                    # announce BEFORE the long blocking encode tick (per-job
+                    # Qwen3-4B load+forward) so clients see what's happening.
+                    self.announced = True
+                    r.step = 0
+                    r.phase = String("encoding")
+                    return r^
                 self._prepare_job()
+                self.announced = False
                 self.phase = PHASE_DENOISE
                 r.step = 0
                 return r^
@@ -477,6 +588,12 @@ struct ZImageBackend(GenBackend, Movable):
                 r.step = self.cur
                 if self.cur >= self.params.steps:
                     self.phase = PHASE_DECODE
+                return r^
+            if not self.announced:
+                # announce BEFORE the long blocking VAE-decode tick.
+                self.announced = True
+                r.step = self.params.steps
+                r.phase = String("decoding")
                 return r^
             # PHASE_DECODE: VAE decode + PNG with serenity.genparams.v1 tEXt.
             # MEASURED (2026-06-10, 24 GB GPU): resident DiT (13.2 GiB) +

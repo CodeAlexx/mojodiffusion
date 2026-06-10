@@ -46,11 +46,14 @@ from http.websocket import (
 from json.parser import loads
 from json.serialize import dumps
 from json.value import JSONValue
+from sqlite.db import Database
 from sqlite.writer import DbWriter
 from sqlite.value import Value
 
 from serenitymojo.serve.backend import GenBackend, JobParams, LoraSpec, StepResult
-from serenitymojo.serve.model_scan import ScanEntry, scan_checkpoints, scan_loras
+from serenitymojo.serve.model_scan import (
+    ScanEntry, scan_checkpoints, scan_loras, _read_text_file,
+)
 from serenitymojo.serve.stub_backend import StubBackend
 from serenitymojo.serve.zimage_backend import ZImageBackend
 
@@ -61,6 +64,12 @@ comptime MAX_REQUEST_BYTES = 1048576  # 1 MiB
 comptime TICK_MS = 50                 # epoll wait timeout -> worker tick cadence
 comptime OUT_DIR = "output/serenity_daemon"
 comptime DB_PATH = "output/serenity_daemon/jobs.db"
+comptime DB_PARAMS_MAX = 2048         # params_json cap in the db row (F1): the
+                                      # pure-Mojo DbWriter has no overflow pages
+                                      # (one row must fit one 4096-byte page);
+                                      # the FULL params live in the PNG tEXt —
+                                      # the db row is just the gallery index.
+comptime SCAN_PNG_TMP = "/tmp/serenity_daemon_pngscan.txt"
 
 
 # ── small libc helpers ───────────────────────────────────────────────────────
@@ -195,11 +204,21 @@ def _opt_str(obj: JSONValue, key: String, dflt: String) raises -> String:
     return obj[key].as_string()
 
 
-def parse_generate(body: String, job_id: String, out_dir: String) raises -> JobParams:
-    """Validate POST /v1/generate's JSON body into JobParams (raises -> 422)."""
+def parse_generate(
+    body: String, job_id: String, out_dir: String, default_model: String
+) raises -> JobParams:
+    """Validate POST /v1/generate's JSON body into JobParams (raises -> 422;
+    a "[501]"-prefixed error -> 501). `default_model` is the serving backend's
+    name so genparams never claim "stub" on a real-model daemon (F9)."""
     var obj = loads(body)
     if not obj.is_object():
         raise Error("body must be a JSON object")
+    if obj.contains("workflow"):
+        # plan H4: graph bodies are reserved in the schema, not implemented.
+        raise Error(
+            "[501] 'workflow' (graph body) is reserved and not implemented"
+            " yet (plan H4); send flat genparams"
+        )
     var p = JobParams()
     p.job_id = job_id
     p.out_dir = out_dir
@@ -208,7 +227,7 @@ def parse_generate(body: String, job_id: String, out_dir: String) raises -> JobP
     p.prompt = obj["prompt"].as_string()
     if p.prompt == "":
         raise Error("'prompt' must be non-empty")
-    p.model = _opt_str(obj, "model", String("stub"))
+    p.model = _opt_str(obj, "model", default_model)
     p.negative = _opt_str(obj, "negative", String(""))
     p.width = _opt_int(obj, "width", 512, 16, 2048)
     p.height = _opt_int(obj, "height", 512, 16, 2048)
@@ -265,7 +284,7 @@ def job_json_value(j: JobRecord) raises -> JSONValue:
     return o^
 
 
-def event_json(j: JobRecord, preview: String) raises -> String:
+def event_json(j: JobRecord, preview: String, phase: String) raises -> String:
     var o = JSONValue.new_object()
     o.set("job_id", JSONValue.from_string(j.params.job_id))
     o.set("state", JSONValue.from_string(j.state))
@@ -278,6 +297,9 @@ def event_json(j: JobRecord, preview: String) raises -> String:
         o.set("error", JSONValue.from_string(j.error))
     if preview != "":
         o.set("preview", JSONValue.from_string(preview))
+    if phase != "":
+        # sub-state of a long non-denoise tick: loading|encoding|decoding (F6)
+        o.set("phase", JSONValue.from_string(phase))
     return dumps(o)
 
 
@@ -289,25 +311,146 @@ def broadcast(mut ws: Dict[Int, Bool], msg: String):
 
 
 # ── jobs.db (the gallery-index seam) ─────────────────────────────────────────
-def record_finished(mut writer: DbWriter, j: JobRecord) raises:
-    """Append a finished (done/failed/cancelled) job and rewrite jobs.db.
-    (The pure-Mojo DbWriter builds the whole file on save(), so 'append'
-    means insert in-memory + save — fine at gallery scale.)"""
-    var vals = List[Value]()
-    vals.append(Value.text(j.params.job_id))
-    vals.append(Value.text(j.created))
-    vals.append(Value.text(j.params.model))
-    vals.append(Value.text(j.params.params_json))
-    vals.append(Value.text(j.state))
-    vals.append(Value.text(j.output_path))
-    writer.insert("jobs", vals)
+def _db_safe_params(params_json: String) -> String:
+    """Cap params_json for the db row (F1): the DbWriter cannot overflow a
+    4096-byte page, and a >=4 KB prompt used to raise out of record_finished.
+    Truncation backs up to a UTF-8 boundary; the FULL params stay in the PNG
+    tEXt chunk (the db row is only the gallery index)."""
+    if params_json.byte_length() <= DB_PARAMS_MAX:
+        return params_json.copy()
+    var cut = DB_PARAMS_MAX
+    var b = params_json.as_bytes()
+    while cut > 0 and (b[cut] & 0xC0) == 0x80:  # don't split a codepoint
+        cut -= 1
+    return byte_substr(params_json, 0, cut) + "...truncated"
+
+
+def _terminal_state(s: String) -> Bool:
+    return (
+        s == "done" or s == "failed" or s == "cancelled" or s == "interrupted"
+    )
+
+
+def save_jobs_db(prior: List[List[String]], jobs: List[JobRecord]) raises:
+    """Rewrite jobs.db = prior-session rows (F7) + every session job that has
+    STARTED (state != queued). Writing the row at job START (state=running)
+    makes the db crash-safe: if the daemon dies hard mid-job (the SIGTERM can
+    race to an unmaskable runtime thread — see run_daemon — or SIGKILL), the
+    row survives as "running" and the NEXT startup repairs it to "interrupted"
+    (F10). The pure-Mojo DbWriter builds the whole file per save — fine at
+    gallery scale."""
+    var writer = DbWriter.create()
+    var cols: List[String] = ["id", "created", "model", "params_json", "state", "output_path"]
+    writer.create_table(
+        "jobs",
+        "CREATE TABLE jobs (id TEXT, created TEXT, model TEXT, params_json TEXT, state TEXT, output_path TEXT)",
+        cols^,
+    )
+    for i in range(len(prior)):
+        var vals = List[Value]()
+        for k in range(6):
+            vals.append(Value.text(prior[i][k]))
+        writer.insert("jobs", vals)
+    for i in range(len(jobs)):
+        if jobs[i].state == "queued":
+            continue  # never started; nothing truthful to index yet
+        var vals = List[Value]()
+        vals.append(Value.text(jobs[i].params.job_id))
+        vals.append(Value.text(jobs[i].created))
+        vals.append(Value.text(jobs[i].params.model))
+        vals.append(Value.text(_db_safe_params(jobs[i].params.params_json)))
+        vals.append(Value.text(jobs[i].state))
+        vals.append(Value.text(jobs[i].output_path))
+        writer.insert("jobs", vals)
     writer.save(DB_PATH)
+
+
+def save_jobs_db_safe(prior: List[List[String]], jobs: List[JobRecord]):
+    """F1: a jobs.db failure must NEVER kill the daemon — the db is an index,
+    the job's image + tEXt params are already on disk. Log and continue."""
+    try:
+        save_jobs_db(prior, jobs)
+    except e:
+        print("WARNING: jobs.db save failed (daemon continues):", e)
+
+
+def _job_id_num(id: String) -> Int:
+    """job-NNNN -> NNNN (0 when unparseable)."""
+    if not id.startswith("job-"):
+        return 0
+    try:
+        return Int(byte_substr(id, 4, id.byte_length()))
+    except:
+        return 0
+
+
+def load_prior_rows() -> List[List[String]]:
+    """F7: read a prior jobs.db (pure-Mojo sqlite reader) so this session's
+    full-file rewrites PRESERVE history. Non-terminal states (a hard-killed
+    session's "running" row) are repaired to "interrupted" here (F10).
+    Missing/unreadable db -> fresh start."""
+    var out = List[List[String]]()
+    try:
+        var db = Database.open(String(DB_PATH))
+        var rows = db.read_table("jobs")
+        var repaired = 0
+        for i in range(len(rows)):
+            var v = rows[i].values.copy()
+            if len(v) < 6:
+                continue
+            var cols = List[String]()
+            for k in range(6):
+                cols.append(v[k].as_text())
+            if not _terminal_state(cols[4]):
+                cols[4] = String("interrupted")
+                repaired += 1
+            out.append(cols^)
+        if len(out) > 0:
+            print("jobs.db: preloaded", len(out), "prior rows (",
+                  repaired, "repaired to interrupted )")
+    except:
+        pass  # no prior db (first run) or unreadable -> start fresh
+    return out^
+
+
+def max_prior_id(prior: List[List[String]]) -> Int:
+    var max_id = 0
+    for i in range(len(prior)):
+        var n = _job_id_num(prior[i][0])
+        if n > max_id:
+            max_id = n
+    return max_id
+
+
+def max_output_png_id() -> Int:
+    """F7 belt-and-braces: scan the output dir for job-*.png and return the
+    highest id, so output files are never overwritten even if jobs.db was
+    deleted while outputs were kept."""
+    var cmd = (
+        String("find '") + OUT_DIR + "' -maxdepth 1 -type f -name 'job-*.png'"
+        + " -printf '%f\\n' 2>/dev/null > " + SCAN_PNG_TMP
+    )
+    if _system(cmd) != 0:
+        return 0
+    var max_id = 0
+    try:
+        var text = _read_text_file(String(SCAN_PNG_TMP))
+        for line in text.split("\n"):
+            var l = String(line)
+            if not l.endswith(".png"):
+                continue
+            var n = _job_id_num(byte_substr(l, 0, l.byte_length() - 4))
+            if n > max_id:
+                max_id = n
+    except:
+        return 0
+    return max_id
 
 
 # ── the worker tick (runs INSIDE the event loop) ─────────────────────────────
 def tick_worker[B: GenBackend](
     mut backend: B, mut jobs: List[JobRecord], mut running: Int,
-    mut writer: DbWriter, mut ws: Dict[Int, Bool],
+    prior: List[List[String]], mut ws: Dict[Int, Bool],
 ) raises:
     """One unit of serial-worker progress per event-loop tick."""
     if running >= 0:
@@ -327,10 +470,10 @@ def tick_worker[B: GenBackend](
             jobs[running].error = r.error
         elif r.cancelled:
             jobs[running].state = String("cancelled")
-        broadcast(ws, event_json(jobs[running], r.preview))
+        broadcast(ws, event_json(jobs[running], r.preview, r.phase))
         if r.done or r.failed or r.cancelled:
             print("job", jobs[running].params.job_id, "->", jobs[running].state)
-            record_finished(writer, jobs[running])
+            save_jobs_db_safe(prior, jobs)
             running = -1
         return
     # idle: promote the next queued job (skipping pre-cancelled ones)
@@ -339,21 +482,25 @@ def tick_worker[B: GenBackend](
             continue
         if jobs[i].cancel_requested:
             jobs[i].state = String("cancelled")
-            broadcast(ws, event_json(jobs[i], String("")))
-            record_finished(writer, jobs[i])
+            broadcast(ws, event_json(jobs[i], String(""), String("")))
+            save_jobs_db_safe(prior, jobs)
             continue
         try:
             backend.start(jobs[i].params)
         except e:
             jobs[i].state = String("failed")
             jobs[i].error = String(e)
-            broadcast(ws, event_json(jobs[i], String("")))
-            record_finished(writer, jobs[i])
+            broadcast(ws, event_json(jobs[i], String(""), String("")))
+            save_jobs_db_safe(prior, jobs)
             continue
         jobs[i].state = String("running")
         running = i
         print("job", jobs[i].params.job_id, "-> running (", jobs[i].total, "steps )")
-        broadcast(ws, event_json(jobs[i], String("")))
+        # F10 crash-safety: persist the running row NOW, so a hard kill
+        # (SIGKILL / a TERM the runtime threads dequeue) still leaves a row
+        # the next startup repairs to "interrupted".
+        save_jobs_db_safe(prior, jobs)
+        broadcast(ws, event_json(jobs[i], String(""), String("")))
         return
 
 
@@ -439,10 +586,13 @@ def handle_api(
         var job_id = String("job-") + _pad4(njobs)
         var p: JobParams
         try:
-            p = parse_generate(req.body, job_id, String(OUT_DIR))
+            p = parse_generate(req.body, job_id, String(OUT_DIR), backend_name)
         except e:
             njobs -= 1  # id not consumed
-            return error_response(422, String(e))
+            var msg = String(e)
+            if msg.startswith("[501] "):  # reserved-feature sentinel (plan H4)
+                return error_response(501, byte_substr(msg, 6, msg.byte_length()))
+            return error_response(422, msg)
         # queue_position: jobs that will run before this one
         var ahead = 0
         if running >= 0:
@@ -665,13 +815,18 @@ def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
     var model_name = backend.model_name()
     var resident = backend.resident_model()
 
-    var writer = DbWriter.create()
-    var cols: List[String] = ["id", "created", "model", "params_json", "state", "output_path"]
-    writer.create_table(
-        "jobs",
-        "CREATE TABLE jobs (id TEXT, created TEXT, model TEXT, params_json TEXT, state TEXT, output_path TEXT)",
-        cols^,
-    )
+    # F7: carry prior history into this session's rewrites and seed the job
+    # counter past every id ever used (db rows AND output PNGs), so ids never
+    # restart at job-0001 and outputs are never overwritten across runs.
+    # (load_prior_rows also repairs a hard-killed session's "running" row to
+    # "interrupted" — F10 crash-safety.)
+    var prior = load_prior_rows()
+    var prior_max = max_prior_id(prior)
+    var png_max = max_output_png_id()
+    if png_max > prior_max:
+        prior_max = png_max
+    if len(prior) > 0:
+        save_jobs_db_safe(prior, List[JobRecord]())  # persist any repairs now
 
     var sock = listen_localhost(port)
     sock.set_nonblocking()
@@ -685,7 +840,7 @@ def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
     var ws = Dict[Int, Bool]()
     var frag = Dict[Int, WsReassembler]()
     var jobs = List[JobRecord]()
-    var njobs = 0
+    var njobs = prior_max  # next id = prior_max + 1 (F7)
     var running = -1  # index into jobs of the in-flight job; -1 = idle
     var evbuf = alloc[UInt8](EVENT_SIZE * MAX_EVENTS)
     var evp = BytePtr(unsafe_from_address=Int(evbuf))
@@ -697,7 +852,21 @@ def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
         for i in range(Int(nev)):
             var fd = Int(rd_u64(evp, i * EVENT_SIZE + 4))
             if fd == Int(sigfd):
-                print("signal received -> graceful shutdown")
+                # GRACEFUL SHUTDOWN IS BEST-EFFORT (measured 2026-06-10): the
+                # signalfd only works when the MAIN thread wins the dequeue
+                # race — the Mojo runtime spawns ~12 worker threads BEFORE
+                # main() with OPEN signal masks (sigprocmask can't reach
+                # them, and Mojo can't register a C-ABI sigaction handler),
+                # so a process-directed SIGTERM is often dequeued by a worker
+                # and default-kills us instantly or mid-cleanup. That is WHY
+                # jobs.db is written crash-safely (running row at job START,
+                # repaired to "interrupted" at next startup) instead of only
+                # on this path. SIG_IGN narrows the mid-cleanup window when
+                # we DO win the race. Deterministic graceful shutdown needs
+                # a C-shim signal handler (MOJO-libs gap, descoped).
+                _ = external_call["signal", UInt64](Int32(15), UInt64(1))  # SIGTERM -> SIG_IGN
+                _ = external_call["signal", UInt64](Int32(2), UInt64(1))   # SIGINT  -> SIG_IGN
+                print("signal received -> graceful shutdown", flush=True)
                 alive = False
                 break
             if fd == lfd:
@@ -708,13 +877,27 @@ def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
         if not alive:
             break
         # the serial worker runs inside the loop: one bounded step per tick
-        tick_worker(backend, jobs, running, writer, ws)
+        tick_worker(backend, jobs, running, prior, ws)
         resident = backend.resident_model()  # residency can change on any tick
+
+    # F10: a SIGINT/SIGTERM mid-job must leave a truthful db row — record the
+    # in-flight job as "interrupted" before exit (db failure logged, not fatal).
+    if running >= 0 and not jobs[running].is_terminal():
+        jobs[running].state = String("interrupted")
+        print("job", jobs[running].params.job_id, "-> interrupted (shutdown)",
+              flush=True)
+        try:
+            broadcast(ws, event_json(jobs[running], String(""), String("")))
+        except:
+            pass
+        save_jobs_db_safe(prior, jobs)
 
     ep.remove(sock.fd)
     _ = sys_close(sigfd)
     evbuf.free()
-    print("serenity_daemon exited cleanly")
+    # F10: stdout is block-buffered when piped to a log file; the zimage run's
+    # shutdown line was lost without an explicit flush.
+    print("serenity_daemon exited cleanly", flush=True)
 
 
 def main() raises:

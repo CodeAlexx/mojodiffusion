@@ -83,6 +83,10 @@ struct StepResult(Copyable, Movable):
     var error: String
     var output_path: String
     var preview: String    # optional inline preview (e.g. base64 PNG); "" = none
+    var phase: String      # optional sub-state for long non-denoise ticks
+                           # ("loading"|"encoding"|"decoding"); "" = plain step.
+                           # Rides the WS event as a `phase` key so clients can
+                           # show what a slow tick is doing (F6).
 
     def __init__(out self):
         self.step = 0
@@ -93,6 +97,7 @@ struct StepResult(Copyable, Movable):
         self.error = String("")
         self.output_path = String("")
         self.preview = String("")
+        self.phase = String("")
 
     def is_terminal(self) -> Bool:
         return self.done or self.failed or self.cancelled

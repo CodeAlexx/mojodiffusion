@@ -103,10 +103,11 @@ from serenitymojo.models.zimage.zimage_stack import (
     _concat_img_cap, _split_img_cap, _linear_wdev_bias, _saved_x_out,
 )
 
+from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_peft, load_lora_for_resume,
-    save_lora_train_state, load_lora_train_state,
+    save_lora_train_state, load_lora_train_state, _read_f32,
 )
 
 
@@ -1149,3 +1150,153 @@ def load_zimage_lora_main_only_state(
             template.ad[bi * ZIMAGE_SLOTS + s] = named[j].adapter.copy()
             j += 1
     return template^
+
+
+# ── COMFY/KOHYA Z-IMAGE LoRA LOAD (musubi-tuner networks.lora_zimage) ────────
+# Key shape (verified on eri2_zimage_lora_comfy.safetensors, 2026-06-10):
+#   lora_unet_layers_{i}_attention_qkv.{lora_down.weight,lora_up.weight,alpha}
+#   lora_unet_layers_{i}_attention_out.{...}
+#   lora_unet_layers_{i}_feed_forward_w{1,2,3}.{...}
+# MAIN layers only (no refiner modules exist in the format). attention qkv is
+# trained FUSED against the single-file checkpoint's layers.{i}.attention.qkv
+# [3D, D]; the un-fused pure-Mojo stack needs per-projection adapters, and the
+# split is EXACT: with up=[3D, r], down=[r, D],
+#   ΔW_qkv = up @ down  ⇒  ΔW_q = up[0:D] @ down (rows; k/v the next chunks)
+# so to_q/to_k/to_v share A=down and take the matching B row-chunk (q,k,v
+# order — the Z-Image qkv Linear is the standard q|k|v concat).
+# Per-module scale = mult * alpha/rank (kohya: missing .alpha ⇒ scale = mult).
+
+def zimage_lora_file_is_comfy(path: String) raises -> Bool:
+    """True when the file uses the comfy/kohya Z-Image export naming
+    (`lora_unet_layers_...` keys) rather than the trainer resume format."""
+    var st = SafeTensors.open(path)
+    for ref n in st.names():
+        if n.startswith("lora_unet_"):
+            return True
+    return False
+
+
+def _comfy_zero_adapter() -> LoraAdapter:
+    """Scale-0 placeholder for slots the comfy file does not cover (nr/cr
+    refiner blocks); zimage_lora_apply_device skips scale==0 adapters — the
+    same shape/scale convention build_zimage_zero_lora_device_set uses."""
+    return LoraAdapter(
+        _zeros(1), _zeros(1), 1, 1, 1, Float32(0.0),
+        _zeros(1), _zeros(1), _zeros(1), _zeros(1),
+    )
+
+
+def _comfy_scale(
+    st: SafeTensors, key: String, rank: Int, mult: Float32, ctx: DeviceContext
+) raises -> Float32:
+    var key_alpha = key + ".alpha"
+    if key_alpha not in st.tensors:
+        return mult  # kohya convention: no .alpha ⇒ alpha = rank ⇒ scale 1·mult
+    var alpha_h = _read_f32(st, key_alpha, ctx)
+    if len(alpha_h) != 1:
+        raise Error(String("zimage comfy lora: .alpha must be scalar for ") + key)
+    return mult * alpha_h[0] / Float32(rank)
+
+
+def _comfy_module_adapter(
+    st: SafeTensors, key: String, mult: Float32, in_f: Int, out_f: Int,
+    ctx: DeviceContext,
+) raises -> LoraAdapter:
+    """One un-fused comfy module → LoraAdapter. A=lora_down [r,in],
+    B=lora_up [out,r] (shape-checked against the base projection)."""
+    var key_a = key + ".lora_down.weight"
+    var key_b = key + ".lora_up.weight"
+    if key_a not in st.tensors or key_b not in st.tensors:
+        raise Error(
+            String("zimage comfy lora: missing ") + key_a + " / " + key_b
+        )
+    var a_info = st.tensor_info(key_a)
+    var b_info = st.tensor_info(key_b)
+    if len(a_info.shape) != 2 or len(b_info.shape) != 2:
+        raise Error(String("zimage comfy lora: A/B must be 2-D for ") + key)
+    var rank = a_info.shape[0]
+    if a_info.shape[1] != in_f or b_info.shape[0] != out_f or b_info.shape[1] != rank:
+        raise Error(
+            String("zimage comfy lora: shape mismatch for ") + key
+            + ": A=[" + String(a_info.shape[0]) + "," + String(a_info.shape[1])
+            + "] B=[" + String(b_info.shape[0]) + "," + String(b_info.shape[1])
+            + "] vs expected in=" + String(in_f) + " out=" + String(out_f)
+        )
+    var scale = _comfy_scale(st, key, rank, mult, ctx)
+    return LoraAdapter(
+        _read_f32(st, key_a, ctx), _read_f32(st, key_b, ctx),
+        rank, in_f, out_f, scale,
+        _zeros(rank * in_f), _zeros(rank * in_f),
+        _zeros(out_f * rank), _zeros(out_f * rank),
+    )
+
+
+def _comfy_qkv_adapters(
+    st: SafeTensors, key: String, mult: Float32, D: Int, ctx: DeviceContext,
+) raises -> List[LoraAdapter]:
+    """Split the fused attention_qkv LoRA exactly into [to_q, to_k, to_v]
+    adapters (shared A = down; B = the matching up row-chunk). Exact — no
+    approximation (see the section comment)."""
+    var key_a = key + ".lora_down.weight"
+    var key_b = key + ".lora_up.weight"
+    if key_a not in st.tensors or key_b not in st.tensors:
+        raise Error(
+            String("zimage comfy lora: missing ") + key_a + " / " + key_b
+        )
+    var a_info = st.tensor_info(key_a)
+    var b_info = st.tensor_info(key_b)
+    if len(a_info.shape) != 2 or len(b_info.shape) != 2:
+        raise Error(String("zimage comfy lora: A/B must be 2-D for ") + key)
+    var rank = a_info.shape[0]
+    if a_info.shape[1] != D or b_info.shape[0] != 3 * D or b_info.shape[1] != rank:
+        raise Error(
+            String("zimage comfy lora: fused qkv shape mismatch for ") + key
+            + ": A=[" + String(a_info.shape[0]) + "," + String(a_info.shape[1])
+            + "] B=[" + String(b_info.shape[0]) + "," + String(b_info.shape[1])
+            + "] vs expected A=[r," + String(D) + "] B=[" + String(3 * D) + ",r]"
+        )
+    var scale = _comfy_scale(st, key, rank, mult, ctx)
+    var a_h = _read_f32(st, key_a, ctx)
+    var b_h = _read_f32(st, key_b, ctx)
+    var out = List[LoraAdapter]()
+    var chunk = D * rank  # rows are [out, rank] row-major ⇒ contiguous chunks
+    for c in range(3):
+        var b_c = List[Float32]()
+        for j in range(chunk):
+            b_c.append(b_h[c * chunk + j])
+        out.append(LoraAdapter(
+            a_h.copy(), b_c^, rank, D, D, scale,
+            _zeros(rank * D), _zeros(rank * D),
+            _zeros(D * rank), _zeros(D * rank),
+        ))
+    return out^
+
+
+def load_zimage_lora_main_only_comfy(
+    num_nr: Int, num_cr: Int, num_main: Int, D: Int, F: Int,
+    mult: Float32, path: String, ctx: DeviceContext,
+) raises -> ZImageLoraSet:
+    """Load a comfy/kohya Z-Image LoRA export into the flat ZImageLoraSet
+    order (nr|cr|main × Q,K,V,O,W1,W3,W2). rank/alpha come from the FILE
+    (per module); `mult` is the request's LoRA weight. nr/cr slots get
+    scale-0 placeholders (the format carries main layers only)."""
+    var st = SafeTensors.open(path)
+    var ad = List[LoraAdapter]()
+    for _ in range((num_nr + num_cr) * ZIMAGE_SLOTS):
+        ad.append(_comfy_zero_adapter())
+    var file_rank = 0
+    for i in range(num_main):
+        var base = String("lora_unet_layers_") + String(i)
+        var qkv = _comfy_qkv_adapters(st, base + "_attention_qkv", mult, D, ctx)
+        ad.append(qkv[0].copy())   # SLOT_Q
+        ad.append(qkv[1].copy())   # SLOT_K
+        ad.append(qkv[2].copy())   # SLOT_V
+        ad.append(_comfy_module_adapter(st, base + "_attention_out", mult, D, D, ctx))    # SLOT_O
+        ad.append(_comfy_module_adapter(st, base + "_feed_forward_w1", mult, D, F, ctx))  # SLOT_W1
+        ad.append(_comfy_module_adapter(st, base + "_feed_forward_w3", mult, D, F, ctx))  # SLOT_W3
+        ad.append(_comfy_module_adapter(st, base + "_feed_forward_w2", mult, F, D, ctx))  # SLOT_W2
+        if file_rank == 0:
+            file_rank = ad[len(ad) - 1].rank
+    print("[zimage][lora] comfy load:", num_main, "main layers, rank",
+          file_rank, "(fused qkv split exactly into q/k/v)")
+    return ZImageLoraSet(ad^, num_nr, num_cr, num_main, file_rank)

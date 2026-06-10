@@ -1,0 +1,689 @@
+# serenitymojo.serve.serenity_daemon — the SerenityUI generation daemon (skeleton).
+#
+# A pure-Mojo localhost HTTP + WebSocket server (default 127.0.0.1:7801) on the
+# MOJO-libs net/http stack (single-threaded epoll event loop, the
+# examples/main.mojo pattern). Endpoints:
+#
+#   POST /v1/generate     {model,prompt,negative,width,height,steps,seed,cfg,
+#                          lora:[{name,weight}]} -> {job_id, queue_position}
+#   GET  /v1/jobs         JSON array of all jobs
+#   GET  /v1/job/<id>     one job
+#   POST /v1/cancel/<id>  cancel a queued job / signal the running one
+#   WS   /v1/progress     pushes {job_id,state,step,total,progress[,output_path,
+#                          error,preview]} on every job-state change
+#   GET  /v1/health       {status, backend, model}
+#
+# ONE worker, jobs run serially (single-GPU reality). Mojo gives no threads
+# here, so the worker runs INSIDE the event loop: each loop tick calls
+# backend.step() once (the stub sleeps ~100 ms per step inside step()), so
+# HTTP latency while a job runs is bounded by one step (~100 ms). The real
+# backend must keep step() similarly bounded — see backend.mojo.
+#
+# Every finished job (done/failed/cancelled) is appended to a pure-Mojo SQLite
+# db at output/serenity_daemon/jobs.db (the gallery-index seam).
+
+from std.ffi import external_call
+from std.memory import alloc
+from std.sys import argv
+
+from net.poll import Epoll, EPOLLIN, EPOLLET, EVENT_SIZE, EAGAIN, rd_u64
+from net.socket import Socket
+from net.signals import install_signal_fd
+from net.syscalls import (
+    BytePtr, sys_socket, sys_bind, sys_listen, sys_accept, sys_recv, sys_send,
+    sys_close, sys_fcntl, sys_setsockopt, errno, errno_str,
+    AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR,
+    MSG_NOSIGNAL, F_GETFL, F_SETFL, O_NONBLOCK,
+)
+from http.request import (
+    Request, parse_request, is_request_complete, request_consumed_len, byte_substr,
+)
+from http.response import Response, http_date
+from http.websocket import (
+    handshake_response, decode_frame, encode_text, encode_close, encode_pong,
+    WsReassembler, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING,
+)
+from json.parser import loads
+from json.serialize import dumps
+from json.value import JSONValue
+from sqlite.writer import DbWriter
+from sqlite.value import Value
+
+from serenitymojo.serve.backend import GenBackend, JobParams, LoraSpec, StepResult
+from serenitymojo.serve.stub_backend import StubBackend
+
+comptime DEFAULT_PORT = 7801
+comptime MAX_EVENTS = 64
+comptime READ_CHUNK = 65536
+comptime MAX_REQUEST_BYTES = 1048576  # 1 MiB
+comptime TICK_MS = 50                 # epoll wait timeout -> worker tick cadence
+comptime OUT_DIR = "output/serenity_daemon"
+comptime DB_PATH = "output/serenity_daemon/jobs.db"
+
+
+# ── small libc helpers ───────────────────────────────────────────────────────
+def _system(cmd: String) -> Int:
+    var n = cmd.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = cmd.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var status = Int(external_call["system", Int32](BytePtr(unsafe_from_address=Int(buf))))
+    buf.free()
+    return status
+
+
+def set_nonblocking_fd(fd: Int32):
+    var fl = sys_fcntl(fd, F_GETFL, Int32(0))
+    _ = sys_fcntl(fd, F_SETFL, fl | O_NONBLOCK)
+
+
+def listen_localhost(port: Int) raises -> Socket:
+    """Bind+listen on 127.0.0.1:port (loopback ONLY — unlike net.tcp's
+    TCPListener, which binds INADDR_ANY)."""
+    var fd = sys_socket(AF_INET, SOCK_STREAM, Int32(0))
+    if fd < 0:
+        raise Error("socket() failed: " + errno_str())
+    var s = Socket(fd)
+    s.set_reuse()
+    var addr = alloc[UInt8](16)
+    var ap = BytePtr(unsafe_from_address=Int(addr))
+    for i in range(16):
+        ap[i] = 0
+    ap[0] = 2  # sin_family = AF_INET
+    ap[2] = UInt8((port >> 8) & 0xFF)
+    ap[3] = UInt8(port & 0xFF)
+    ap[4] = 127  # sin_addr = 127.0.0.1 (network order)
+    ap[5] = 0
+    ap[6] = 0
+    ap[7] = 1
+    var brc = sys_bind(fd, ap, Int32(16))
+    addr.free()
+    if brc < 0:
+        raise Error("bind(127.0.0.1:" + String(port) + ") failed: " + errno_str())
+    if sys_listen(fd, Int32(128)) < 0:
+        raise Error("listen() failed: " + errno_str())
+    return s^
+
+
+def send_all_fd(fd: Int32, data: String):
+    var n = data.byte_length()
+    if n == 0:
+        return
+    var buf = alloc[UInt8](n)
+    var src = data.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    var p = BytePtr(unsafe_from_address=Int(buf))
+    var total = 0
+    while total < n:
+        var sent = sys_send(fd, p + total, n - total, MSG_NOSIGNAL)
+        if sent > 0:
+            total += sent
+        elif sent < 0 and errno() == EAGAIN:
+            continue
+        else:
+            break
+    buf.free()
+
+
+# ── job records ──────────────────────────────────────────────────────────────
+struct JobRecord(Copyable, Movable):
+    var params: JobParams
+    var created: String
+    var state: String        # queued | running | done | failed | cancelled
+    var progress: Int        # 0..100
+    var step: Int
+    var total: Int
+    var output_path: String
+    var error: String
+    var cancel_requested: Bool
+
+    def __init__(out self, var params: JobParams, created: String):
+        self.total = params.steps
+        self.params = params^
+        self.created = created
+        self.state = String("queued")
+        self.progress = 0
+        self.step = 0
+        self.output_path = String("")
+        self.error = String("")
+        self.cancel_requested = False
+
+    def is_terminal(self) -> Bool:
+        return self.state == "done" or self.state == "failed" or self.state == "cancelled"
+
+
+def _pad4(n: Int) -> String:
+    var s = String(n)
+    while s.byte_length() < 4:
+        s = "0" + s
+    return s
+
+
+# ── request-body parsing / validation ────────────────────────────────────────
+def _opt_int(obj: JSONValue, key: String, dflt: Int, lo: Int, hi: Int) raises -> Int:
+    if not obj.contains(key) or obj[key].is_null():
+        return dflt
+    if not obj[key].is_int():
+        raise Error("'" + key + "' must be an integer")
+    var n = obj[key].as_int()
+    if n < lo or n > hi:
+        raise Error("'" + key + "' out of range [" + String(lo) + ".." + String(hi) + "]")
+    return n
+
+
+def _opt_num(obj: JSONValue, key: String, dflt: Float64, lo: Float64, hi: Float64) raises -> Float64:
+    if not obj.contains(key) or obj[key].is_null():
+        return dflt
+    if not obj[key].is_number():
+        raise Error("'" + key + "' must be a number")
+    var v = obj[key].as_float()
+    if v < lo or v > hi:
+        raise Error("'" + key + "' out of range")
+    return v
+
+
+def _opt_str(obj: JSONValue, key: String, dflt: String) raises -> String:
+    if not obj.contains(key) or obj[key].is_null():
+        return dflt
+    if not obj[key].is_string():
+        raise Error("'" + key + "' must be a string")
+    return obj[key].as_string()
+
+
+def parse_generate(body: String, job_id: String, out_dir: String) raises -> JobParams:
+    """Validate POST /v1/generate's JSON body into JobParams (raises -> 422)."""
+    var obj = loads(body)
+    if not obj.is_object():
+        raise Error("body must be a JSON object")
+    var p = JobParams()
+    p.job_id = job_id
+    p.out_dir = out_dir
+    if not obj.contains("prompt") or not obj["prompt"].is_string():
+        raise Error("'prompt' (string) is required")
+    p.prompt = obj["prompt"].as_string()
+    if p.prompt == "":
+        raise Error("'prompt' must be non-empty")
+    p.model = _opt_str(obj, "model", String("stub"))
+    p.negative = _opt_str(obj, "negative", String(""))
+    p.width = _opt_int(obj, "width", 512, 16, 2048)
+    p.height = _opt_int(obj, "height", 512, 16, 2048)
+    p.steps = _opt_int(obj, "steps", 20, 1, 500)
+    p.seed = _opt_int(obj, "seed", 0, 0, 4294967295)
+    p.cfg = _opt_num(obj, "cfg", 4.5, 0.0, 50.0)
+    if obj.contains("lora") and not obj["lora"].is_null():
+        var arr = obj["lora"]
+        if not arr.is_array():
+            raise Error("'lora' must be an array of {name, weight}")
+        for i in range(arr.length()):
+            var ent = arr[i]
+            if not ent.is_object():
+                raise Error("'lora[" + String(i) + "]' must be an object")
+            if not ent.contains("name") or not ent["name"].is_string():
+                raise Error("'lora[" + String(i) + "].name' (string) is required")
+            var w = _opt_num(ent, "weight", 1.0, -10.0, 10.0)
+            p.loras.append(LoraSpec(ent["name"].as_string(), w))
+
+    # canonical full-param JSON: persisted to the sidecar + jobs.db
+    var o = JSONValue.new_object()
+    o.set("job_id", JSONValue.from_string(p.job_id))
+    o.set("model", JSONValue.from_string(p.model))
+    o.set("prompt", JSONValue.from_string(p.prompt))
+    o.set("negative", JSONValue.from_string(p.negative))
+    o.set("width", JSONValue.from_int(p.width))
+    o.set("height", JSONValue.from_int(p.height))
+    o.set("steps", JSONValue.from_int(p.steps))
+    o.set("seed", JSONValue.from_int(p.seed))
+    o.set("cfg", JSONValue.from_float(p.cfg))
+    var la = JSONValue.new_array()
+    for i in range(len(p.loras)):
+        var lo = JSONValue.new_object()
+        lo.set("name", JSONValue.from_string(p.loras[i].name))
+        lo.set("weight", JSONValue.from_float(p.loras[i].weight))
+        la.append(lo^)
+    o.set("lora", la^)
+    p.params_json = dumps(o)
+    return p^
+
+
+# ── JSON views of a job ──────────────────────────────────────────────────────
+def job_json_value(j: JobRecord) raises -> JSONValue:
+    var o = JSONValue.new_object()
+    o.set("id", JSONValue.from_string(j.params.job_id))
+    o.set("created", JSONValue.from_string(j.created))
+    o.set("model", JSONValue.from_string(j.params.model))
+    o.set("state", JSONValue.from_string(j.state))
+    o.set("progress", JSONValue.from_int(j.progress))
+    o.set("step", JSONValue.from_int(j.step))
+    o.set("total", JSONValue.from_int(j.total))
+    o.set("output_path", JSONValue.from_string(j.output_path))
+    o.set("error", JSONValue.from_string(j.error))
+    return o^
+
+
+def event_json(j: JobRecord, preview: String) raises -> String:
+    var o = JSONValue.new_object()
+    o.set("job_id", JSONValue.from_string(j.params.job_id))
+    o.set("state", JSONValue.from_string(j.state))
+    o.set("step", JSONValue.from_int(j.step))
+    o.set("total", JSONValue.from_int(j.total))
+    o.set("progress", JSONValue.from_int(j.progress))
+    if j.output_path != "":
+        o.set("output_path", JSONValue.from_string(j.output_path))
+    if j.error != "":
+        o.set("error", JSONValue.from_string(j.error))
+    if preview != "":
+        o.set("preview", JSONValue.from_string(preview))
+    return dumps(o)
+
+
+def broadcast(mut ws: Dict[Int, Bool], msg: String):
+    """Push one event frame to every connected /v1/progress client."""
+    var frame = encode_text(msg)
+    for e in ws.items():
+        send_all_fd(Int32(e.key), frame)
+
+
+# ── jobs.db (the gallery-index seam) ─────────────────────────────────────────
+def record_finished(mut writer: DbWriter, j: JobRecord) raises:
+    """Append a finished (done/failed/cancelled) job and rewrite jobs.db.
+    (The pure-Mojo DbWriter builds the whole file on save(), so 'append'
+    means insert in-memory + save — fine at gallery scale.)"""
+    var vals = List[Value]()
+    vals.append(Value.text(j.params.job_id))
+    vals.append(Value.text(j.created))
+    vals.append(Value.text(j.params.model))
+    vals.append(Value.text(j.params.params_json))
+    vals.append(Value.text(j.state))
+    vals.append(Value.text(j.output_path))
+    writer.insert("jobs", vals)
+    writer.save(DB_PATH)
+
+
+# ── the worker tick (runs INSIDE the event loop) ─────────────────────────────
+def tick_worker[B: GenBackend](
+    mut backend: B, mut jobs: List[JobRecord], mut running: Int,
+    mut writer: DbWriter, mut ws: Dict[Int, Bool],
+) raises:
+    """One unit of serial-worker progress per event-loop tick."""
+    if running >= 0:
+        if jobs[running].cancel_requested:
+            backend.cancel()
+        var r = backend.step()
+        jobs[running].step = r.step
+        if r.total > 0:
+            jobs[running].total = r.total
+            jobs[running].progress = (r.step * 100) // r.total
+        if r.done:
+            jobs[running].state = String("done")
+            jobs[running].progress = 100
+            jobs[running].output_path = r.output_path
+        elif r.failed:
+            jobs[running].state = String("failed")
+            jobs[running].error = r.error
+        elif r.cancelled:
+            jobs[running].state = String("cancelled")
+        broadcast(ws, event_json(jobs[running], r.preview))
+        if r.done or r.failed or r.cancelled:
+            print("job", jobs[running].params.job_id, "->", jobs[running].state)
+            record_finished(writer, jobs[running])
+            running = -1
+        return
+    # idle: promote the next queued job (skipping pre-cancelled ones)
+    for i in range(len(jobs)):
+        if jobs[i].state != "queued":
+            continue
+        if jobs[i].cancel_requested:
+            jobs[i].state = String("cancelled")
+            broadcast(ws, event_json(jobs[i], String("")))
+            record_finished(writer, jobs[i])
+            continue
+        try:
+            backend.start(jobs[i].params)
+        except e:
+            jobs[i].state = String("failed")
+            jobs[i].error = String(e)
+            broadcast(ws, event_json(jobs[i], String("")))
+            record_finished(writer, jobs[i])
+            continue
+        jobs[i].state = String("running")
+        running = i
+        print("job", jobs[i].params.job_id, "-> running (", jobs[i].total, "steps )")
+        broadcast(ws, event_json(jobs[i], String("")))
+        return
+
+
+# ── HTTP layer ───────────────────────────────────────────────────────────────
+def json_response(status: Int, body: String) -> Response:
+    var r = Response(status)
+    r.set_header("Content-Type", "application/json")
+    r.set_body(body)
+    return r^
+
+
+def error_response(status: Int, detail: String) raises -> Response:
+    var o = JSONValue.new_object()
+    o.set("detail", JSONValue.from_string(detail))
+    return json_response(status, dumps(o))
+
+
+def is_ws_upgrade(req: Request) raises -> Bool:
+    var up = String(req.header("upgrade").lower())
+    var conn = String(req.header("connection").lower())
+    return up == "websocket" and conn.find("upgrade") >= 0
+
+
+def keep_alive_wanted(req: Request) raises -> Bool:
+    var connl = String(req.header("connection").lower())
+    if req.version == "HTTP/1.1":
+        return connl != "close"
+    return connl == "keep-alive"
+
+
+def _find_job(jobs: List[JobRecord], id: String) -> Int:
+    for i in range(len(jobs)):
+        if jobs[i].params.job_id == id:
+            return i
+    return -1
+
+
+def handle_api(
+    mut jobs: List[JobRecord], mut njobs: Int, running: Int,
+    backend_name: String, model_name: String, req: Request,
+) raises -> Response:
+    """Route + handle one (non-WebSocket) API request."""
+    var path = req.path()
+
+    if req.method == "GET" and path == "/v1/health":
+        var o = JSONValue.new_object()
+        o.set("status", JSONValue.from_string(String("ok")))
+        o.set("backend", JSONValue.from_string(backend_name))
+        o.set("model", JSONValue.from_string(model_name))
+        return json_response(200, dumps(o))
+
+    if req.method == "POST" and path == "/v1/generate":
+        njobs += 1
+        var job_id = String("job-") + _pad4(njobs)
+        var p: JobParams
+        try:
+            p = parse_generate(req.body, job_id, String(OUT_DIR))
+        except e:
+            njobs -= 1  # id not consumed
+            return error_response(422, String(e))
+        # queue_position: jobs that will run before this one
+        var ahead = 0
+        if running >= 0:
+            ahead += 1
+        for i in range(len(jobs)):
+            if jobs[i].state == "queued" and not jobs[i].cancel_requested:
+                ahead += 1
+        jobs.append(JobRecord(p^, http_date()))
+        print("job", job_id, "queued (position", ahead, ")")
+        var o = JSONValue.new_object()
+        o.set("job_id", JSONValue.from_string(job_id))
+        o.set("queue_position", JSONValue.from_int(ahead))
+        return json_response(200, dumps(o))
+
+    if req.method == "GET" and path == "/v1/jobs":
+        var arr = JSONValue.new_array()
+        for i in range(len(jobs)):
+            arr.append(job_json_value(jobs[i]))
+        return json_response(200, dumps(arr))
+
+    if req.method == "GET" and path.startswith("/v1/job/"):
+        var id = byte_substr(path, 8, path.byte_length())
+        var i = _find_job(jobs, id)
+        if i < 0:
+            return error_response(404, "no such job: " + id)
+        return json_response(200, dumps(job_json_value(jobs[i])))
+
+    if req.method == "POST" and path.startswith("/v1/cancel/"):
+        var id = byte_substr(path, 11, path.byte_length())
+        var i = _find_job(jobs, id)
+        if i < 0:
+            return error_response(404, "no such job: " + id)
+        if jobs[i].is_terminal():
+            return error_response(409, "job already " + jobs[i].state)
+        jobs[i].cancel_requested = True  # tick_worker finalizes (queued or running)
+        var o = JSONValue.new_object()
+        o.set("job_id", JSONValue.from_string(id))
+        o.set("state", JSONValue.from_string(jobs[i].state))
+        o.set("cancel_requested", JSONValue.from_bool(True))
+        return json_response(200, dumps(o))
+
+    return error_response(404, "not found: " + req.method + " " + path)
+
+
+def serve_request(
+    mut jobs: List[JobRecord], mut njobs: Int, running: Int,
+    backend_name: String, model_name: String, reqbytes: String, fd: Int,
+) raises -> Int:
+    """One HTTP request -> response. Returns 0 keep-alive, 1 close, 2 upgraded
+    to the /v1/progress WebSocket."""
+    try:
+        var req = parse_request(reqbytes)
+        if is_ws_upgrade(req):
+            if req.path() != "/v1/progress":
+                send_all_fd(Int32(fd), String("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+                return 1
+            var key = req.header("sec-websocket-key")
+            if key == "":
+                send_all_fd(Int32(fd), String("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+                return 1
+            send_all_fd(Int32(fd), handshake_response(key))
+            print("WS client connected:", fd)
+            return 2
+        var ka = keep_alive_wanted(req)
+        var resp = handle_api(jobs, njobs, running, backend_name, model_name, req)
+        resp.set_header("Server", "SerenityDaemon/0.1")
+        resp.set_header("Date", http_date())
+        resp.set_keep_alive(ka)
+        print(req.method, req.target, "->", resp.status)
+        if req.method == "HEAD":
+            send_all_fd(Int32(fd), resp.serialize_head())
+        else:
+            send_all_fd(Int32(fd), resp.serialize())
+        return 0 if ka else 1
+    except e:
+        print("bad request:", e)
+        send_all_fd(Int32(fd), String("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+        return 1
+
+
+# ── connection plumbing (examples/main.mojo pattern) ─────────────────────────
+def close_conn(
+    mut ep: Epoll, mut buffers: Dict[Int, String], mut ws: Dict[Int, Bool],
+    mut frag: Dict[Int, WsReassembler], fd: Int,
+) raises:
+    ep.remove(Int32(fd))
+    _ = sys_close(Int32(fd))
+    if fd in buffers:
+        _ = buffers.pop(fd)
+    if fd in ws:
+        _ = ws.pop(fd)
+    if fd in frag:
+        _ = frag.pop(fd)
+
+
+def accept_new(mut ep: Epoll, mut buffers: Dict[Int, String], lfd: Int32) raises:
+    var null = BytePtr(unsafe_from_address=Int(0))
+    while True:
+        var cfd = sys_accept(lfd, null, null)
+        if cfd < 0:
+            break
+        set_nonblocking_fd(cfd)
+        ep.add(cfd, EPOLLIN | EPOLLET, UInt64(Int(cfd)))
+        buffers[Int(cfd)] = String("")
+
+
+def handle_ws(
+    mut ep: Epoll, mut buffers: Dict[Int, String], mut ws: Dict[Int, Bool],
+    mut frag: Dict[Int, WsReassembler], fd: Int,
+) raises:
+    """Progress sockets are server-push; from the client we only honor
+    ping (pong) and close. Text/binary input is ignored."""
+    var tmp = alloc[UInt8](READ_CHUNK)
+    var tp = BytePtr(unsafe_from_address=Int(tmp))
+    var acc = buffers[fd] if fd in buffers else String("")
+    var closed = False
+    while True:
+        var k = sys_recv(Int32(fd), tp, READ_CHUNK, Int32(0))
+        if k > 0:
+            acc += String(StringSlice(ptr=tmp, length=k))
+        elif k == 0:
+            closed = True
+            break
+        else:
+            if errno() == EAGAIN:
+                break
+            closed = True
+            break
+    tmp.free()
+
+    if fd not in frag:
+        frag[fd] = WsReassembler()
+    var r = frag[fd].copy()
+    var should_close = closed
+    while True:
+        var fr = decode_frame(acc)
+        if fr.consumed < 0:
+            break
+        acc = byte_substr(acc, fr.consumed, acc.byte_length())
+        var msg = r.push(fr)
+        if not msg.ready:
+            continue
+        if msg.opcode == OP_CLOSE:
+            send_all_fd(Int32(fd), encode_close())
+            should_close = True
+            break
+        elif msg.opcode == OP_PING:
+            send_all_fd(Int32(fd), encode_pong(msg.payload))
+        # OP_TEXT/OP_BINARY/pong: ignored (push-only channel)
+    frag[fd] = r^
+    if should_close:
+        print("WS client disconnected:", fd)
+        close_conn(ep, buffers, ws, frag, fd)
+    else:
+        buffers[fd] = acc
+
+
+def handle_readable(
+    mut ep: Epoll, mut buffers: Dict[Int, String], mut ws: Dict[Int, Bool],
+    mut frag: Dict[Int, WsReassembler], mut jobs: List[JobRecord],
+    mut njobs: Int, running: Int, backend_name: String, model_name: String,
+    fd: Int,
+) raises:
+    if fd in ws:
+        handle_ws(ep, buffers, ws, frag, fd)
+        return
+    var tmp = alloc[UInt8](READ_CHUNK)
+    var tp = BytePtr(unsafe_from_address=Int(tmp))
+    var acc = buffers[fd] if fd in buffers else String("")
+    var closed = False
+    while True:
+        var k = sys_recv(Int32(fd), tp, READ_CHUNK, Int32(0))
+        if k > 0:
+            acc += String(StringSlice(ptr=tmp, length=k))
+        elif k == 0:
+            closed = True
+            break
+        else:
+            if errno() == EAGAIN:
+                break
+            closed = True
+            break
+    tmp.free()
+
+    if acc.byte_length() > MAX_REQUEST_BYTES:
+        send_all_fd(Int32(fd), String("HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+        close_conn(ep, buffers, ws, frag, fd)
+        return
+
+    var should_close = closed
+    while is_request_complete(acc):
+        var consumed = request_consumed_len(acc)
+        if consumed < 0:
+            break
+        var reqbytes = byte_substr(acc, 0, consumed)
+        acc = byte_substr(acc, consumed, acc.byte_length())
+        var code = serve_request(jobs, njobs, running, backend_name, model_name, reqbytes, fd)
+        if code == 2:  # upgraded to the progress WebSocket
+            ws[fd] = True
+            frag[fd] = WsReassembler()
+            buffers[fd] = acc
+            if acc.byte_length() > 0:
+                handle_ws(ep, buffers, ws, frag, fd)
+            return
+        if code == 1:
+            should_close = True
+            break
+    if should_close:
+        close_conn(ep, buffers, ws, frag, fd)
+    else:
+        buffers[fd] = acc
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+def main() raises:
+    var port = DEFAULT_PORT
+    var args = argv()
+    if len(args) > 1:
+        port = Int(String(args[1]))
+
+    _ = _system(String("mkdir -p ") + OUT_DIR)
+
+    var backend = StubBackend()
+    var backend_name = backend.backend_name()
+    var model_name = backend.model_name()
+
+    var writer = DbWriter.create()
+    var cols: List[String] = ["id", "created", "model", "params_json", "state", "output_path"]
+    writer.create_table(
+        "jobs",
+        "CREATE TABLE jobs (id TEXT, created TEXT, model TEXT, params_json TEXT, state TEXT, output_path TEXT)",
+        cols^,
+    )
+
+    var sock = listen_localhost(port)
+    sock.set_nonblocking()
+    var ep = Epoll()
+    ep.add(sock.fd, EPOLLIN | EPOLLET, UInt64(Int(sock.fd)))
+    var sigfd = install_signal_fd()  # SIGINT/SIGTERM as a pollable fd
+    ep.add(sigfd, EPOLLIN, UInt64(Int(sigfd)))
+    print("serenity_daemon (backend: " + backend_name + ") on http://127.0.0.1:" + String(port))
+
+    var buffers = Dict[Int, String]()
+    var ws = Dict[Int, Bool]()
+    var frag = Dict[Int, WsReassembler]()
+    var jobs = List[JobRecord]()
+    var njobs = 0
+    var running = -1  # index into jobs of the in-flight job; -1 = idle
+    var evbuf = alloc[UInt8](EVENT_SIZE * MAX_EVENTS)
+    var evp = BytePtr(unsafe_from_address=Int(evbuf))
+    var alive = True
+
+    while alive:
+        var nev = ep.wait(evp, Int32(MAX_EVENTS), Int32(TICK_MS))
+        var lfd = Int(sock.fd)
+        for i in range(Int(nev)):
+            var fd = Int(rd_u64(evp, i * EVENT_SIZE + 4))
+            if fd == Int(sigfd):
+                print("signal received -> graceful shutdown")
+                alive = False
+                break
+            if fd == lfd:
+                accept_new(ep, buffers, sock.fd)
+            else:
+                handle_readable(ep, buffers, ws, frag, jobs, njobs, running,
+                                backend_name, model_name, fd)
+        if not alive:
+            break
+        # the serial worker runs inside the loop: one bounded step per tick
+        tick_worker(backend, jobs, running, writer, ws)
+
+    ep.remove(sock.fd)
+    _ = sys_close(sigfd)
+    evbuf.free()
+    print("serenity_daemon exited cleanly")

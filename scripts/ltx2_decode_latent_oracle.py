@@ -81,8 +81,11 @@ def main() -> None:
     from ltx_core.model.audio_vae.audio_vae import decode_audio as vae_decode_audio
 
     dumped = load_file(LATENTS)
-    video_x = dumped["video_x"]
-    audio_x = dumped.get("audio_x")
+    # accept both dump schemas: MVP (video_x/audio_x) and refhq (video/audio)
+    video_x = dumped.get("video_x", dumped.get("video"))
+    audio_x = dumped.get("audio_x", dumped.get("audio"))
+    if video_x is None:
+        raise KeyError(f"no video latent in {LATENTS}: {list(dumped)}")
     print("video_x:", tuple(video_x.shape), video_x.dtype,
           "std", video_x.float().std().item())
     if audio_x is not None:

@@ -1048,6 +1048,18 @@ struct LTX2AVBlockWeights(Movable):
         self.lora_b.append(b^)
         self.lora_scales.append(scale)
 
+    def clear_lora_factors(mut self):
+        """Detach all factorized LoRA adapters from this block.
+
+        Used by long-lived (resident) blocks when the per-stage LoRA strength
+        changes (e.g. HQ stage-1 0.25 -> stage-2 0.5): clear, then re-attach at
+        the new multiplier. Runtime-overlay only — base weights are untouched
+        (HARD RULE: LoRA is never fused)."""
+        self.lora_names.clear()
+        self.lora_a.clear()
+        self.lora_b.clear()
+        self.lora_scales.clear()
+
     def _linear_lora_delta(
         self,
         x: Tensor,
@@ -1331,6 +1343,7 @@ def ltx2_block_forward_av[
     ca_v_cos: Tensor, ca_v_sin: Tensor,
     ca_a_cos: Tensor, ca_a_sin: Tensor,
     eps: Float32, ctx: DeviceContext,
+    skip_cross_modal: Bool = False,
 ) raises -> Tuple[Tensor, Tensor, Tensor]:
     var VD = 4096
     var AD = 2048
@@ -1426,38 +1439,51 @@ def ltx2_block_forward_av[
     ahss = add(ahss, mul(a_gate_ca, a_ca_out, ctx), ctx)
 
     # ---- 3. A2V / V2A cross-modal ----
-    var norm_a2v = _rms_norm_opt(hs, weights, "audio_to_video_norm.weight", eps, ctx)
-    var norm_v2a = _rms_norm_opt(ahss, weights, "video_to_audio_norm.weight", eps, ctx)
-    var cm = _compute_cross_mod(
-        weights._w("scale_shift_table_a2v_ca_video"),
-        weights._w("scale_shift_table_a2v_ca_audio"),
-        v_ca_ss, a_ca_ss, v_ca_gate, a_ca_gate, VD, AD, ctx,
-    )
+    # `skip_cross_modal=True` mirrors the reference "mod" guidance pass that
+    # carries BOTH SKIP_A2V_CROSS_ATTN and SKIP_V2A_CROSS_ATTN perturbations
+    # (ltx-core guidance/perturbations.py + model/transformer/transformer.py:
+    # `if run_a2v and not video.cross_attn_skip_all:` / `if run_v2a and not
+    # audio.cross_attn_skip_all:` — when all samples skip, the gated
+    # cross-modal attention OUTPUT added to each stream is simply not computed,
+    # leaving hs/ahss untouched). Everything else (self-attn, text cross-attn,
+    # FFN) runs unchanged.
+    var v2a_delta: Tensor
+    if skip_cross_modal:
+        # Debug output contract: the v2a addend is exactly zero when skipped.
+        v2a_delta = mul_scalar(ahss, Float32(0.0), ctx)
+    else:
+        var norm_a2v = _rms_norm_opt(hs, weights, "audio_to_video_norm.weight", eps, ctx)
+        var norm_v2a = _rms_norm_opt(ahss, weights, "video_to_audio_norm.weight", eps, ctx)
+        var cm = _compute_cross_mod(
+            weights._w("scale_shift_table_a2v_ca_video"),
+            weights._w("scale_shift_table_a2v_ca_audio"),
+            v_ca_ss, a_ca_ss, v_ca_gate, a_ca_gate, VD, AD, ctx,
+        )
 
-    # A2V: Q=video (mod v_a2v), KV=audio (mod a_a2v), to_out->4096.
-    var mod_video_a2v = _modulate_bc(norm_a2v, cm.v_a2v_scale, cm.v_a2v_shift, ctx)
-    var mod_audio_a2v = _modulate_bc(norm_v2a, cm.a_a2v_scale, cm.a_a2v_shift, ctx)
-    var a2v_out = _av_attention[S_V, S_A, S_VPAD, 32, 64](
-        weights, "audio_to_video_attn", mod_video_a2v, mod_audio_a2v,
-        True, ca_v_cos, ca_v_sin, True, ca_a_cos, ca_a_sin, eps, ctx,
-    )
-    hs = add(hs, mul(cm.a2v_gate, a2v_out, ctx), ctx)
+        # A2V: Q=video (mod v_a2v), KV=audio (mod a_a2v), to_out->4096.
+        var mod_video_a2v = _modulate_bc(norm_a2v, cm.v_a2v_scale, cm.v_a2v_shift, ctx)
+        var mod_audio_a2v = _modulate_bc(norm_v2a, cm.a_a2v_scale, cm.a_a2v_shift, ctx)
+        var a2v_out = _av_attention[S_V, S_A, S_VPAD, 32, 64](
+            weights, "audio_to_video_attn", mod_video_a2v, mod_audio_a2v,
+            True, ca_v_cos, ca_v_sin, True, ca_a_cos, ca_a_sin, eps, ctx,
+        )
+        hs = add(hs, mul(cm.a2v_gate, a2v_out, ctx), ctx)
 
-    # V2A: Q=audio (mod a_v2a), KV=video (mod v_v2a), to_out->2048.
-    var mod_video_v2a = _modulate_bc(norm_a2v, cm.v_v2a_scale, cm.v_v2a_shift, ctx)
-    var mod_audio_v2a = _modulate_bc(norm_v2a, cm.a_v2a_scale, cm.a_v2a_shift, ctx)
-    # V2A: SQ=S_A (audio query), SKV=S_V (video KV). The square-SDPA pad target
-    # must be >= max(S_A, S_V). At the stage-2 grid S_V (3072) > S_APAD (1024),
-    # so we pad to S_VPAD (= max(S_V,N_TXT,S_A)), NOT S_APAD — using S_APAD gave a
-    # NEGATIVE pad (S_APAD - S_V) and the from_host(-4194304) crash.
-    var v2a_out = _av_attention[S_A, S_V, S_VPAD, 32, 64](
-        weights, "video_to_audio_attn", mod_audio_v2a, mod_video_v2a,
-        True, ca_a_cos, ca_a_sin, True, ca_v_cos, ca_v_sin, eps, ctx,
-    )
-    # Capture the v2a contribution (raw addend) BEFORE mutating ahss.
-    # This is a debug-only output; the math is identical to the 2-return version.
-    var v2a_delta = mul(cm.v2a_gate, v2a_out, ctx)
-    ahss = add(ahss, v2a_delta, ctx)
+        # V2A: Q=audio (mod a_v2a), KV=video (mod v_v2a), to_out->2048.
+        var mod_video_v2a = _modulate_bc(norm_a2v, cm.v_v2a_scale, cm.v_v2a_shift, ctx)
+        var mod_audio_v2a = _modulate_bc(norm_v2a, cm.a_v2a_scale, cm.a_v2a_shift, ctx)
+        # V2A: SQ=S_A (audio query), SKV=S_V (video KV). The square-SDPA pad target
+        # must be >= max(S_A, S_V). At the stage-2 grid S_V (3072) > S_APAD (1024),
+        # so we pad to S_VPAD (= max(S_V,N_TXT,S_A)), NOT S_APAD — using S_APAD gave a
+        # NEGATIVE pad (S_APAD - S_V) and the from_host(-4194304) crash.
+        var v2a_out = _av_attention[S_A, S_V, S_VPAD, 32, 64](
+            weights, "video_to_audio_attn", mod_audio_v2a, mod_video_v2a,
+            True, ca_a_cos, ca_a_sin, True, ca_v_cos, ca_v_sin, eps, ctx,
+        )
+        # Capture the v2a contribution (raw addend) BEFORE mutating ahss.
+        # This is a debug-only output; the math is identical to the 2-return version.
+        v2a_delta = mul(cm.v2a_gate, v2a_out, ctx)
+        ahss = add(ahss, v2a_delta, ctx)
 
     # ---- 4. FFN (video + audio) ----
     var mod_ff = _modulate_bc(

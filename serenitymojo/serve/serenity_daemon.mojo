@@ -51,6 +51,7 @@ from sqlite.value import Value
 
 from serenitymojo.serve.backend import GenBackend, JobParams, LoraSpec, StepResult
 from serenitymojo.serve.stub_backend import StubBackend
+from serenitymojo.serve.zimage_backend import ZImageBackend
 
 comptime DEFAULT_PORT = 7801
 comptime MAX_EVENTS = 64
@@ -626,15 +627,9 @@ def handle_readable(
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
-def main() raises:
-    var port = DEFAULT_PORT
-    var args = argv()
-    if len(args) > 1:
-        port = Int(String(args[1]))
-
+def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
     _ = _system(String("mkdir -p ") + OUT_DIR)
 
-    var backend = StubBackend()
     var backend_name = backend.backend_name()
     var model_name = backend.model_name()
 
@@ -687,3 +682,23 @@ def main() raises:
     _ = sys_close(sigfd)
     evbuf.free()
     print("serenity_daemon exited cleanly")
+
+
+def main() raises:
+    """serenity_daemon [stub|zimage] [port] — backend defaults to stub,
+    port to DEFAULT_PORT; the two args are recognized by shape in any order."""
+    var port = DEFAULT_PORT
+    var mode = String("stub")
+    var args = argv()
+    for i in range(1, len(args)):
+        var a = String(args[i])
+        if a == "stub" or a == "zimage":
+            mode = a^
+        else:
+            port = Int(a)
+    if mode == "zimage":
+        var zb = ZImageBackend()
+        run_daemon(zb, port)
+    else:
+        var sb = StubBackend()
+        run_daemon(sb, port)

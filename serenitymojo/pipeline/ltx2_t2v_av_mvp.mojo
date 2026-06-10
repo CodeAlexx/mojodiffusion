@@ -40,6 +40,7 @@
 from std.gpu.host import DeviceContext
 from std.math import sqrt, cos as fcos, sin as fsin, pow as fpow, log as flog, pi
 from std.memory import alloc, ArcPointer
+from std.time import perf_counter_ns
 from sys import argv
 
 from serenitymojo.io.ffi import (
@@ -48,6 +49,7 @@ from serenitymojo.io.ffi import (
 )
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import layer_norm
@@ -63,7 +65,7 @@ from serenitymojo.models.dit.ltx2_dit import (
 from serenitymojo.models.dit.ltx2_connector import (
     LTX2ConnectorConfig, LTX2ConnectorWeights, ltx2_connector_forward,
 )
-from serenitymojo.offload.ltx2_block_stream import LTX2BlockStream
+from serenitymojo.offload.ltx2_block_stream import LTX2BlockStream, FP8Block
 from serenitymojo.sampling.ltx2_sampling import (
     ltx2_distilled_sigmas, LTX2Scheduler,
 )
@@ -546,13 +548,16 @@ def _build_mod(
                 v_ca_gate^, a_ca_gate^, v_prompt_ts^, a_prompt_ts^)
 
 
-def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
+def run(
+    apply_lora: Bool, out_dir: String, max_steps: Int, resident_fp8: Bool
+) raises:
     var ctx = DeviceContext()
     var cfg = LTX2Config.ltx2()
     print("=== LTX-2.3 T2V+AUDIO MVP (P7) — 256x256 / 16f distilled ===")
     print("  S_V/S_A/N_TXT:", S_V, S_A, N_TXT, " blocks:", NUM_LAYERS)
     print("  LoRA:", "ON" if apply_lora else "OFF", " out_dir:", out_dir,
-          " max_steps:", max_steps)
+          " max_steps:", max_steps,
+          " residentfp8:", "ON" if resident_fp8 else "OFF")
 
     # ── open checkpoints ──
     var ck = ShardedSafeTensors.open(String(CKPT_FP8))
@@ -648,6 +653,39 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
     if stream.block_count() != NUM_LAYERS:
         raise Error("stream block_count != 48")
 
+    # ── resident-fp8 preload (OPT-IN, `residentfp8` argv mode): all 48 blocks
+    # uploaded ONCE before the denoise loop — fp8 matmul weights stay raw
+    # F8_E4M3 (1 B/param) with per-row F32 scales, boundary blocks BF16 — and
+    # every eval reuses them: ZERO H2D inside the loop (SPEED_CONTRACT clauses
+    # 1 + 5; replaces the per-eval mmap-read + dequant of every block). ──
+    var resident_blocks = List[ArcPointer[LTX2AVBlockWeights]]()
+    if resident_fp8:
+        if apply_lora:
+            raise Error(
+                "residentfp8: block LoRA path unsupported (dense add_delta_to"
+                " needs the per-stream dequant path)"
+            )
+        print("  [residentfp8] preloading all", NUM_LAYERS, "blocks resident")
+        var t_load0 = perf_counter_ns()
+        var rbytes = 0
+        for i in range(NUM_LAYERS):
+            var w: LTX2AVBlockWeights
+            if _is_boundary(i):
+                # Boundary blocks are stored BF16 (no fp8 tensors): resident BF16.
+                w = LTX2AVBlockWeights.load(String(CKPT_FP8), i, cfg, ctx)
+            else:
+                var sc = FP8Block()
+                var blk = stream.load_block_fp8_resident(i, sc, ctx)
+                w = LTX2AVBlockWeights.from_fp8_resident(blk^, sc^, cfg, ctx)
+            for ref ap in w.weights:
+                rbytes += ap[].nbytes()
+            for ref e in w.scales.items():
+                rbytes += e.value[].nbytes()
+            resident_blocks.append(ArcPointer(w^))
+        var load_s = Float64(perf_counter_ns() - t_load0) / 1.0e9
+        print("  [residentfp8] resident bytes:", rbytes, "(",
+              Float64(rbytes) / 1.0e9, "GB ) preload:", load_s, "s")
+
     # ── init noise latents ──
     print("  [noise] init video + audio latents")
     # rng-contract: mojo-native-not-pytorch-parity. LTX-2 Python uses
@@ -671,6 +709,7 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
     if max_steps > 0 and max_steps < n_steps:
         n_steps = max_steps
     for step in range(n_steps):
+        var t_step0 = perf_counter_ns()
         var sigma = sigmas[step]
         print("  --- step", step + 1, "/", sched.num_steps, " sigma=", sigma, "---")
 
@@ -686,27 +725,40 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
         # modulation (uses pre-loaded LoRA-applied global weights via gw)
         var mod = _build_mod(ck, gw, sigma, ctx)
 
-        # 48 streamed blocks: BF16 storage boundaries, FP8 middle blocks
-        # dequantized to BF16; shared kernels do F32 internal accumulation.
+        # 48 blocks: residentfp8 mode reuses the preloaded resident-fp8 blocks
+        # (zero H2D in the loop); default mode streams per-step — BF16 storage
+        # boundaries, FP8 middle blocks dequantized to BF16. Shared kernels do
+        # F32 internal accumulation either way.
         for i in range(NUM_LAYERS):
-            var w: LTX2AVBlockWeights
-            if _is_boundary(i):
-                w = LTX2AVBlockWeights.load(String(CKPT_FP8), i, cfg, ctx)
+            var outs: Tuple[Tensor, Tensor, Tensor]
+            if resident_fp8:
+                outs = ltx2_block_forward_av[S_V, S_A, N_TXT, S_VPAD, S_APAD](
+                    resident_blocks[i][], hs, ahs, enc, aenc,
+                    mod.v_temb, mod.a_temb, mod.v_ca_ss, mod.a_ca_ss,
+                    mod.v_ca_gate, mod.a_ca_gate,
+                    mod.v_prompt_ts, mod.a_prompt_ts,
+                    v_cos, v_sin, a_cos, a_sin,
+                    ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin, EPS, ctx,
+                )
             else:
-                var blk = stream.load_block_bf16(i, ctx)
-                w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx)
-            # AT-DEQUANT LoRA APPLY: add scale*(B@A) onto the BF16 dequanted
-            # block linears for THIS stream (re-applied each step; never fused).
-            if apply_lora:
-                _ = lora.apply_to_av_block(i, w, LORA_MULT, ctx)
-            var outs = ltx2_block_forward_av[S_V, S_A, N_TXT, S_VPAD, S_APAD](
-                w, hs, ahs, enc, aenc,
-                mod.v_temb, mod.a_temb, mod.v_ca_ss, mod.a_ca_ss,
-                mod.v_ca_gate, mod.a_ca_gate,
-                mod.v_prompt_ts, mod.a_prompt_ts,
-                v_cos, v_sin, a_cos, a_sin,
-                ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin, EPS, ctx,
-            )
+                var w: LTX2AVBlockWeights
+                if _is_boundary(i):
+                    w = LTX2AVBlockWeights.load(String(CKPT_FP8), i, cfg, ctx)
+                else:
+                    var blk = stream.load_block_bf16(i, ctx)
+                    w = LTX2AVBlockWeights.from_fp8_block(blk^, cfg, ctx)
+                # AT-DEQUANT LoRA APPLY: add scale*(B@A) onto the BF16 dequanted
+                # block linears for THIS stream (re-applied each step; never fused).
+                if apply_lora:
+                    _ = lora.apply_to_av_block(i, w, LORA_MULT, ctx)
+                outs = ltx2_block_forward_av[S_V, S_A, N_TXT, S_VPAD, S_APAD](
+                    w, hs, ahs, enc, aenc,
+                    mod.v_temb, mod.a_temb, mod.v_ca_ss, mod.a_ca_ss,
+                    mod.v_ca_gate, mod.a_ca_gate,
+                    mod.v_prompt_ts, mod.a_prompt_ts,
+                    v_cos, v_sin, a_cos, a_sin,
+                    ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin, EPS, ctx,
+                )
             hs = _clone(outs[0], ctx)
             ahs = _clone(outs[1], ctx)
 
@@ -732,8 +784,31 @@ def run(apply_lora: Bool, out_dir: String, max_steps: Int) raises:
         audio_x = sched.step(audio_x, a_vel, step, ctx)
         _ = _stats(String("video_x"), video_x, ctx)
         _ = _stats(String("audio_x"), audio_x, ctx)
+        print("  [time] step", step + 1, "wall_s:",
+              Float64(perf_counter_ns() - t_step0) / 1.0e9)
+
+    # Release the resident blocks BEFORE decode (frees ~20.5 GB for the VAE).
+    if resident_fp8:
+        resident_blocks.clear()
+        print("  [residentfp8] blocks released before decode")
 
     print("  [denoise] done -> decoding")
+
+    # Dump the EXACT final latents for the ltx_core decode oracle
+    # (scripts/ltx2_decode_latent_oracle.py). Torch-decoding these separates
+    # "the generated latent is bad" (loop/conditioning upstream) from
+    # "the Mojo VAE decode is bad" — the handoff §6 quality funnel step 1.
+    var dump_names = List[String]()
+    dump_names.append(String("video_x"))
+    dump_names.append(String("audio_x"))
+    var dump_tensors = List[ArcPointer[Tensor]]()
+    dump_tensors.append(ArcPointer[Tensor](video_x.clone(ctx)))
+    dump_tensors.append(ArcPointer[Tensor](audio_x.clone(ctx)))
+    save_safetensors(
+        dump_names, dump_tensors,
+        String(OUT_DIR) + String("/final_latents.safetensors"), ctx,
+    )
+    print("  [dump] final latents -> ", OUT_DIR, "/final_latents.safetensors")
 
     # ── DECODE VIDEO ──
     print("  [decode] video VAE (latent -> frames)")
@@ -822,24 +897,30 @@ def _mkdir(path: String) raises:
     _ = sys_system(cmd)
 
 
-# ── argv-driven entry: `mvp [base|lora] [out_dir] [max_steps]` ──
-#   no args            -> full MVP, LoRA OFF, default OUT_DIR (audio+mux)
-#   "lora"             -> full MVP with LoRA ON
-#   "base <dir> <n>"   -> fast video-only gen-gate run (LoRA OFF) -> <dir>
-#   "lora <dir> <n>"   -> fast video-only gen-gate run (LoRA ON)  -> <dir>
+# ── argv-driven entry: `mvp [base|lora|residentfp8] [out_dir] [max_steps]` ──
+#   no args                  -> full MVP, LoRA OFF, default OUT_DIR (audio+mux)
+#   "lora"                   -> full MVP with LoRA ON
+#   "base <dir> <n>"         -> fast video-only gen-gate run (LoRA OFF) -> <dir>
+#   "lora <dir> <n>"         -> fast video-only gen-gate run (LoRA ON)  -> <dir>
+#   "residentfp8 [<dir> <n>]" -> OPT-IN speed mode: all 48 blocks preloaded
+#       resident-fp8 ONCE (raw F8_E4M3 + per-row F32 scales; boundary BF16)
+#       and reused every eval — zero H2D in the denoise loop. LoRA OFF.
 def main() raises:
     var a = argv()
     var apply_lora = False
+    var resident_fp8 = False
     var out_dir = String(OUT_DIR)
     var max_steps = 0
     if len(a) >= 2 and String(a[1]) == "lora":
         apply_lora = True
+    if len(a) >= 2 and String(a[1]) == "residentfp8":
+        resident_fp8 = True
     if len(a) >= 3:
         out_dir = String(a[2])
     if len(a) >= 4:
         max_steps = atol(String(a[3]))
     _mkdir(out_dir)
-    run(apply_lora, out_dir, max_steps)
+    run(apply_lora, out_dir, max_steps, resident_fp8)
 
 
 # ── patchify/unpatchify permutations ──

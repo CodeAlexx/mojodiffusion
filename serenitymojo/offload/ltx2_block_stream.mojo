@@ -293,6 +293,62 @@ struct LTX2BlockStream(Movable):
             self.resident_scales.append(scales^)
             self.resident_loaded.append(loaded)
 
+    def load_block_fp8_resident(
+        self, block_idx: Int, mut scales_out: FP8Block, ctx: DeviceContext
+    ) raises -> FP8Block:
+        """RESIDENT-FP8 load: one H2D per tensor, ONCE — the caller keeps the
+        returned block alive for every subsequent eval (SPEED_CONTRACT clause 5:
+        no re-upload churn; clause 1: zero per-step host stalls in the loop).
+
+        - 2-D F8_E4M3 matmul weights upload as RAW fp8 bytes (1 B/param, NO
+          dequant). For each, a per-output-row F32 [N] scale tensor is built
+          once from the per-tensor `weight_scale` (_scale_for) and stored in
+          `scales_out` under the SAME prefix-stripped key — the exact layout
+          `ops/fp8_gemm.linear_fp8(x, w_fp8, scale_f32_per_row, ...)` consumes.
+        - Any other tensor (norms/biases/scale_shift tables, and a non-2D fp8
+          tensor should one ever appear) loads BF16 exactly as load_block_bf16.
+
+        Mirrors the proven Ideogram4 resident-fp8 pattern
+        (models/dit/ideogram4_resident.mojo): raw fp8 + scale alongside,
+        dtype-dispatched at the linear call site."""
+        var block = FP8Block()
+        var bp = self.prefix + String(block_idx) + "."
+        for ref nm in self.sharded.names():
+            if not nm.startswith(bp):
+                continue
+            # Skip scale scalars (consumed as the per-row scale fill value).
+            if (
+                nm.endswith("_scale")
+                or nm.endswith("input_scale")
+                or nm.endswith(".scale_weight")
+                or nm.endswith(".scale_input")
+            ):
+                continue
+            var canon = _substr(nm, len(bp), len(nm))
+            var tv = self.sharded.tensor_view(nm)
+            if tv.dtype == STDtype.F8_E4M3 and len(tv.shape) == 2:
+                var raw = Tensor.from_view_raw(tv, ctx)
+                var n_rows = raw.shape()[0]
+                var s = self._scale_for(nm)
+                var srow = List[Float32]()
+                for _ in range(n_rows):
+                    srow.append(s)
+                var srow_sh = List[Int]()
+                srow_sh.append(n_rows)
+                var st = Tensor.from_host(srow, srow_sh^, STDtype.F32, ctx)
+                scales_out[canon] = ArcPointer(st^)
+                block[canon] = ArcPointer(raw^)
+            elif tv.dtype == STDtype.F8_E4M3:
+                # Non-2D fp8 (not present in the LTX-2.3 checkpoint): no GEMM
+                # consumes it, so dequant to BF16 like the streamed path.
+                var scale = self._scale_for(nm)
+                var raw = Tensor.from_view_raw(tv, ctx)
+                var deq = fp8_e4m3_dequant_to_bf16(raw, scale, ctx)
+                block[canon] = ArcPointer(deq^)
+            else:
+                block[canon] = ArcPointer(Tensor.from_view_as_bf16(tv, ctx))
+        return block^
+
     def fp8_tensor_count(self, block_idx: Int) raises -> Int:
         """How many F8_E4M3 weight tensors block `block_idx` has (diagnostic)."""
         var bp = self.prefix + String(block_idx) + "."

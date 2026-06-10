@@ -48,6 +48,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.linear import linear
+from serenitymojo.ops.fp8_gemm import linear_fp8
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import gelu, sigmoid
 from serenitymojo.ops.attention import (
@@ -635,6 +636,10 @@ struct LTX2AVBlockWeights(Movable):
 
     var weights: List[ArcPointer[Tensor]]
     var name_to_idx: Dict[String, Int]
+    # Resident-fp8 mode: canonical weight name -> per-output-row F32 [N] scale
+    # tensor for every weight held as raw F8_E4M3 (see from_fp8_resident).
+    # Empty for BF16/dequant blocks.
+    var scales: Dict[String, ArcPointer[Tensor]]
     var lora_names: List[String]
     var lora_a: List[ArcPointer[Tensor]]
     var lora_b: List[ArcPointer[Tensor]]
@@ -649,6 +654,7 @@ struct LTX2AVBlockWeights(Movable):
     ):
         self.weights = weights^
         self.name_to_idx = name_to_idx^
+        self.scales = Dict[String, ArcPointer[Tensor]]()
         self.lora_names = List[String]()
         self.lora_a = List[ArcPointer[Tensor]]()
         self.lora_b = List[ArcPointer[Tensor]]()
@@ -870,6 +876,36 @@ struct LTX2AVBlockWeights(Movable):
 
         return LTX2AVBlockWeights(weights^, name_to_idx^, config)
 
+    @staticmethod
+    def from_fp8_resident(
+        var block: FP8Block,
+        var scales: FP8Block,
+        config: LTX2Config,
+        ctx: DeviceContext,
+    ) raises -> LTX2AVBlockWeights:
+        """Build a RESIDENT-fp8 AV block: matmul weights stay raw F8_E4M3 on
+        the GPU (1 B/param, uploaded once by
+        LTX2BlockStream.load_block_fp8_resident) with their per-output-row F32
+        [N] scale tensors stored alongside in `self.scales`. Every linear call
+        site dispatches on weight dtype (`_linear_b` / `linear_apply`):
+        F8_E4M3 -> ops/fp8_gemm.linear_fp8 (fused decode, no bf16 weight
+        materialization), else the vendor-BLAS `linear`. Norms/biases/tables
+        arrive BF16 and behave exactly as in from_fp8_block.
+
+        Key mapping reuses from_fp8_block verbatim. The only canonical renames
+        there are the qk-norm vectors (q_norm/k_norm -> norm_q/norm_k), which
+        are never fp8, so every scale key from the streamer already IS the
+        canonical weight name."""
+        var w = LTX2AVBlockWeights.from_fp8_block(block^, config, ctx)
+        for ref e in scales.items():
+            if e.key not in w.name_to_idx:
+                raise Error(
+                    String("from_fp8_resident: scale for unknown weight ")
+                    + e.key
+                )
+            w.scales[e.key] = e.value
+        return w^
+
     def to_f32(self, ctx: DeviceContext) raises -> LTX2AVBlockWeights:
         """Return a copy of this block with every weight cast to F32.
 
@@ -884,7 +920,15 @@ struct LTX2AVBlockWeights(Movable):
         8-block F32 stream. FP8-sourced inner weights stay at FP8 precision
         (they were dequantized to BF16 first, then upcast here) — the F32 cast
         only changes activation/accumulation precision, not the weights' value.
-        """
+
+        NOT supported on resident-fp8 blocks (raw F8_E4M3 weights have no F32
+        cast path); use the dequant (from_fp8_block) path for F32 runs."""
+        for ref wt in self.weights:
+            if wt[].dtype() == STDtype.F8_E4M3:
+                raise Error(
+                    "LTX2AV.to_f32: block holds raw F8_E4M3 weights"
+                    " (resident-fp8 mode); use the dequant path instead"
+                )
         var weights = List[ArcPointer[Tensor]]()
         for ref w in self.weights:
             weights.append(ArcPointer(cast_tensor(w[], STDtype.F32, ctx)))
@@ -908,8 +952,20 @@ struct LTX2AVBlockWeights(Movable):
         self, name: String, x: Tensor, ctx: DeviceContext
     ) raises -> Tensor:
         """Public: out = x @ W[name]ᵀ (no bias) using the resident weight. For
-        the add-math gate to evaluate base(x) and (base+delta)(x)."""
-        return linear(x, self._w(name), None, ctx)
+        the add-math gate to evaluate base(x) and (base+delta)(x). Dispatches
+        on weight dtype: raw F8_E4M3 (resident-fp8) -> fused linear_fp8."""
+        ref w = self._w(name)
+        if w.dtype() == STDtype.F8_E4M3:
+            return linear_fp8(x, w, self._scale_t(name), None, ctx)
+        return linear(x, w, None, ctx)
+
+    def _scale_t(self, name: String) raises -> ref [self.scales] Tensor:
+        """Per-output-row F32 [N] scale tensor for a resident-fp8 weight."""
+        if name not in self.scales:
+            raise Error(
+                String("LTX2AV: fp8 weight ") + name + " has no per-row scale"
+            )
+        return self.scales[name][]
 
     def _w(self, name: String) raises -> ref [self.weights] Tensor:
         if name not in self.name_to_idx:
@@ -931,6 +987,13 @@ struct LTX2AVBlockWeights(Movable):
         if name not in self.name_to_idx:
             raise Error(String("LTX2AV.add_delta_to: missing weight ") + name)
         var idx = self.name_to_idx[name]
+        if self.weights[idx][].dtype() == STDtype.F8_E4M3:
+            raise Error(
+                String("LTX2AV.add_delta_to: '") + name
+                + "' is a raw F8_E4M3 resident-fp8 weight; a DENSE LoRA delta"
+                + " needs the dequant (streamed bf16) path — use factorized"
+                + " add_lora_factor[_arc] or run without resident-fp8 mode"
+            )
         var bdims = self.weights[idx][].shape()
         var ddims = delta.shape()
         if len(bdims) != len(ddims):
@@ -1012,7 +1075,23 @@ struct LTX2AVBlockWeights(Movable):
     ) raises -> Tensor:
         ref w = self._w(w_key)
         ref b = self._w(b_key)
-        var out = linear(x, w, Optional[Tensor](self._clone(b, ctx)), ctx)
+        var out: Tensor
+        if w.dtype() == STDtype.F8_E4M3:
+            # Resident-fp8 weight: fused decode-in-kernel GEMM with the
+            # per-output-row F32 scale (no bf16 weight materialization, no
+            # per-eval dequant). x must be BF16 (linear_fp8 contract).
+            if x.dtype() != STDtype.BF16:
+                raise Error(
+                    String("LTX2AV._linear_b: fp8 weight ") + w_key
+                    + " requires BF16 activations, got " + x.dtype().name()
+                )
+            out = linear_fp8(
+                x, w, self._scale_t(w_key),
+                Optional[Tensor](self._clone(b, ctx)), ctx,
+            )
+        else:
+            out = linear(x, w, Optional[Tensor](self._clone(b, ctx)), ctx)
+        # Factorized LoRA delta path UNCHANGED (BF16 A/B side-GEMMs).
         return self._linear_lora_delta(x, w_key, out^, ctx)
 
 

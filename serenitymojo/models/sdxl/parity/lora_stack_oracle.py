@@ -197,12 +197,20 @@ def main():
             seed += 1
         lo.append(lj)
 
+    # ── ST-level proj_in / proj_out LoRA (in=C out=C), LIVE B (non-degenerate) ──
+    # diffusers Transformer2DModel proj_in/proj_out -> OneTrainer
+    # lora_unet_*_attentions_*_proj_in / proj_out. Same linear-LoRA math.
+    proj_in_A = lcg_randn(RANK * C, 7000, 0.01).reshape(RANK, C).clone().requires_grad_(True)
+    proj_in_B = lcg_randn(C * RANK, 7777, 0.05).reshape(C, RANK).clone().requires_grad_(True)
+    proj_out_A = lcg_randn(RANK * C, 7100, 0.01).reshape(RANK, C).clone().requires_grad_(True)
+    proj_out_B = lcg_randn(C * RANK, 7877, 0.05).reshape(C, RANK).clone().requires_grad_(True)
+
     # ── forward (LoRA on every projection) ──
     residual = x
     x_nchw = x.permute(0, 3, 1, 2)
     xn_nchw = F.group_norm(x_nchw, G, gn_w, gn_b, GN_EPS)
     tok = xn_nchw.permute(0, 2, 3, 1).reshape(B, N, C)
-    h = tok @ proj_in_w.T + proj_in_b
+    h = tok @ proj_in_w.T + proj_in_b + lora(tok, proj_in_A, proj_in_B)
     for j, bw in enumerate(blocks):
         lj = lo[j]
         x1n = layer_norm(h, bw["n1w"], bw["n1b"])
@@ -217,7 +225,7 @@ def main():
         ff = geglu(x3n, bw["fpw"], bw["fpb"], lj["ff_proj"]) @ bw["fow"].T + bw["fob"] \
             + lora(geglu(x3n, bw["fpw"], bw["fpb"], lj["ff_proj"]), lj["ff_out"][0], lj["ff_out"][1])
         h = h + ff
-    po = h @ proj_out_w.T + proj_out_b
+    po = h @ proj_out_w.T + proj_out_b + lora(h, proj_out_A, proj_out_B)
     po_nhwc = po.reshape(B, H, W, C)
     out = residual + po_nhwc
 
@@ -246,6 +254,12 @@ def main():
             WB("lin_b%d_%s_B" % (j, s), B_)
             WB("lref_b%d_%s_dA" % (j, s), A.grad)
             WB("lref_b%d_%s_dB" % (j, s), B_.grad)
+
+    # ── ST-level proj_in / proj_out LoRA inits + grads ──
+    WB("lin_proj_in_A", proj_in_A);   WB("lin_proj_in_B", proj_in_B)
+    WB("lin_proj_out_A", proj_out_A); WB("lin_proj_out_B", proj_out_B)
+    WB("lref_proj_in_dA", proj_in_A.grad);   WB("lref_proj_in_dB", proj_in_B.grad)
+    WB("lref_proj_out_dA", proj_out_A.grad); WB("lref_proj_out_dB", proj_out_B.grad)
 
     # ── forward output + load-bearing input grads ──
     WB("lref_out", out)

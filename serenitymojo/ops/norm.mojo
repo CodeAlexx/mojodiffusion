@@ -910,8 +910,23 @@ def group_norm(
         raise Error("group_norm: weight must be [C]")
     if len(bshape) != 1 or bshape[0] != c:
         raise Error("group_norm: bias must be [C]")
+    # Mixed checkpoint-weight path (F32 activations + BF16/F16 stored weight):
+    # locally widen weight/bias to the activation dtype, mirroring layer_norm's
+    # existing precedent (norm.mojo layer_norm) and the group_norm_backward mixed
+    # contract (norm_backward.mojo). Only the activation may be the wide F32 dtype
+    # — never silently downcast an F32 weight to a narrow activation.
     if x.dtype() != weight.dtype() or x.dtype() != bias.dtype():
-        raise Error("group_norm: x/weight/bias dtype mismatch")
+        if x.dtype() != STDtype.F32:
+            raise Error("group_norm: x/weight/bias dtype mismatch")
+        var compute_weight = (
+            cast_tensor(weight, x.dtype(), ctx) if weight.dtype() != x.dtype()
+            else weight.clone(ctx)
+        )
+        var compute_bias = (
+            cast_tensor(bias, x.dtype(), ctx) if bias.dtype() != x.dtype()
+            else bias.clone(ctx)
+        )
+        return group_norm(x, compute_weight^, compute_bias^, num_groups, eps, ctx)
 
     var dt = x.dtype().to_mojo_dtype()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())

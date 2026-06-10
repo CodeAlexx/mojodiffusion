@@ -83,7 +83,7 @@ def _loss_and_out(
     x_nhwc: Tensor, t: Tensor, y: Tensor, ctxt: Tensor,
     w: SdxlRealWeights, lora: List[SdxlLoraSet], ctx: DeviceContext,
 ) raises -> Float64:
-    var fwd = sdxl_real_forward[L](x_nhwc.clone(ctx), t, y, ctxt, w, lora, ctx)
+    var fwd = sdxl_real_forward[L, L](x_nhwc.clone(ctx), t, y, ctxt, w, lora, ctx)
     var oh = fwd.out.to_host(ctx)
     var s = 0.0
     for i in range(len(oh)):
@@ -118,10 +118,10 @@ def main() raises:
 
     # ── analytic forward+backward ──
     print("[fwd] running forward")
-    var fwd = sdxl_real_forward[L](x.clone(ctx), t, y, ctxt, w, lora, ctx)
+    var fwd = sdxl_real_forward[L, L](x.clone(ctx), t, y, ctxt, w, lora, ctx)
     var go = fwd.out.clone(ctx)   # go = out -> loss = 0.5||out||^2
     print("[bwd] running backward")
-    var grads = sdxl_real_backward[L](go, fwd.acts, w, lora, ctx)
+    var grads = sdxl_real_backward[L, L](go, fwd.acts, w, lora, ctx)
     print("[bwd] nonfinite lora grads:", grads.nonfinite)
     var dxa = grads.d_x.to_host(ctx)   # analytic d_x [1,L,L,4] flat
 

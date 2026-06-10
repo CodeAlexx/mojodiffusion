@@ -30,7 +30,7 @@ comptime GH = 64           # 1024/16
 comptime GW = 64
 comptime NIMG = GH * GW    # 4096
 comptime TOTAL = NT + NIMG # 4744
-comptime STEPS = 4
+comptime STEPS = 20       # real recipe (V4 sample_steps=20), was 4 (turbo, too few)
 comptime SEED = 0
 
 

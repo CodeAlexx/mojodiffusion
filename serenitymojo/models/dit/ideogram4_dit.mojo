@@ -213,7 +213,11 @@ def ideogram4_block[S: Int](
 
 # ── full Ideogram-4 DiT forward (inference). modeling forward 311-379. ────────
 # Loads weights from `st` (fp8->bf16), blocks loaded per-layer to bound VRAM.
-def ideogram4_forward[S: Int](
+# Returns the tensor immediately before final_layer.linear:
+#   LayerNorm(no-affine,1e-6)(h) * (1 + final_layer.adaln_modulation(silu(c)))
+# This is the frozen-trunk seam used by onetrainer-mojo's Ideogram4 final-linear
+# LoRA trainer.
+def ideogram4_forward_prefinal_hidden[S: Int](
     st: ShardedSafeTensors,
     x_in: Tensor,            # [1,L,128] bf16   (noise tokens)
     llm_in: Tensor,          # [1,L,53248] bf16 (Qwen features)
@@ -224,7 +228,6 @@ def ideogram4_forward[S: Int](
     ctx: DeviceContext,
 ) raises -> Tensor:
     var L = x_in.shape()[1]
-    var llm_dim = llm_in.shape()[2]
 
     # masks from indicator (host-built): llm=3, image=2
     var ind_h = indicator.to_host(ctx)
@@ -294,6 +297,23 @@ def ideogram4_forward[S: Int](
     var fmb = load_w_bf16(st, "final_layer.adaln_modulation.bias", ctx)
     var fscale = add_scalar(linear(silu(adaln_input, ctx), fmw, Optional[Tensor](fmb.clone(ctx)), ctx), Float32(1.0), ctx)
     var hn = mul(layer_norm_no_affine(h, Float32(1.0e-6), ctx), fscale, ctx)
+    return hn^
+
+
+def ideogram4_forward[S: Int](
+    st: ShardedSafeTensors,
+    x_in: Tensor,            # [1,L,128] bf16   (noise tokens)
+    llm_in: Tensor,          # [1,L,53248] bf16 (Qwen features)
+    t_in: Tensor,            # [1] f32
+    indicator: Tensor,       # [1,L] f32 (values 0/2/3)
+    cosf: Tensor, sinf: Tensor,   # [1,L,256] bf16
+    num_layers: Int, num_heads: Int, head_dim: Int, hidden: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var hn = ideogram4_forward_prefinal_hidden[S](
+        st, x_in, llm_in, t_in, indicator, cosf, sinf,
+        num_layers, num_heads, head_dim, hidden, ctx,
+    )
     var flw = load_w_fp8(st, "final_layer.linear.weight", ctx)
     var flb = load_w_bf16(st, "final_layer.linear.bias", ctx)
     var out = linear(hn, flw, Optional[Tensor](flb.clone(ctx)), ctx)  # [1,L,128] bf16

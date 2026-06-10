@@ -22,7 +22,7 @@
 #   /tmp/sdxl_lora_parity
 
 from std.gpu.host import DeviceContext
-from std.collections import List
+from std.collections import List, Optional
 from std.memory import alloc, ArcPointer
 from serenitymojo.parity import ParityHarness, ParityResult
 from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDONLY
@@ -192,7 +192,18 @@ def _load_lora_set(ctx: DeviceContext) raises -> SdxlLoraSet:
                 _zeros(RANK * in_f), _zeros(RANK * in_f),
                 _zeros(out_f * RANK), _zeros(out_f * RANK),
             ))
-    return SdxlLoraSet(ad^, DEPTH, RANK)
+    # ST-level proj_in / proj_out adapters (in=C out=C).
+    var pi_a = _in(String("lin_proj_in_A")); var pi_b = _in(String("lin_proj_in_B"))
+    var po_a = _in(String("lin_proj_out_A")); var po_b = _in(String("lin_proj_out_B"))
+    var proj_in_ad = Optional[LoraAdapter](LoraAdapter(
+        pi_a^, pi_b^, RANK, C, C, scale,
+        _zeros(RANK * C), _zeros(RANK * C), _zeros(C * RANK), _zeros(C * RANK),
+    ))
+    var proj_out_ad = Optional[LoraAdapter](LoraAdapter(
+        po_a^, po_b^, RANK, C, C, scale,
+        _zeros(RANK * C), _zeros(RANK * C), _zeros(C * RANK), _zeros(C * RANK),
+    ))
+    return SdxlLoraSet(ad^, DEPTH, RANK, proj_in_ad^, proj_out_ad^)
 
 
 def _check(
@@ -247,6 +258,13 @@ def main() raises:
             var pre = String("lref_") + nm
             _check(harness, nm + String("_dA"), g.d_a[flat], _in(pre + String("_dA")), allok)
             _check(harness, nm + String("_dB"), g.d_b[flat], _in(pre + String("_dB")), allok)
+
+    print("")
+    print("---- ST-level proj_in / proj_out LoRA A/B grads vs torch (NEW family) ----")
+    _check(harness, String("proj_in_dA "), g.d_proj_in_a, _in("lref_proj_in_dA"), allok)
+    _check(harness, String("proj_in_dB "), g.d_proj_in_b, _in("lref_proj_in_dB"), allok)
+    _check(harness, String("proj_out_dA"), g.d_proj_out_a, _in("lref_proj_out_dA"), allok)
+    _check(harness, String("proj_out_dB"), g.d_proj_out_b, _in("lref_proj_out_dB"), allok)
 
     print("")
     print("nonfinite_lora_grads =", g.nonfinite_lora_grads)

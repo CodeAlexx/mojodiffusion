@@ -623,8 +623,21 @@ def layer_norm_backward(
 ) raises -> LayerNormBackward:
     """Backward of layer_norm. go/x [..,D]; weight [D].
     Returns d_x, d_g, and d_b in the same storage dtype as the inputs."""
-    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
-        raise Error("layer_norm_backward: go/x/weight dtype mismatch")
+    if x.dtype() != go.dtype():
+        raise Error("layer_norm_backward: go/x dtype mismatch")
+    # Mixed checkpoint-weight path (F32 activations+grad + BF16/F16 stored weight):
+    # locally widen weight to the activation dtype, mirroring group_norm_backward.
+    if x.dtype() != weight.dtype():
+        if x.dtype() != STDtype.F32:
+            raise Error("layer_norm_backward: mixed weight dtype requires F32 activations")
+        var compute_weight = cast_tensor(weight, x.dtype(), ctx)
+        var mixed = layer_norm_backward(go, x, compute_weight^, eps, ctx)
+        var d_x = mixed.d_x.clone(ctx)
+        var d_g_src = mixed.d_g.clone(ctx)
+        var d_b_src = mixed.d_b.clone(ctx)
+        var d_g = cast_tensor(d_g_src^, weight.dtype(), ctx)
+        var d_b = cast_tensor(d_b_src^, weight.dtype(), ctx)
+        return LayerNormBackward(d_x^, d_g^, d_b^)
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
     var rows = 1

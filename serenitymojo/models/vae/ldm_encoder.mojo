@@ -64,7 +64,7 @@ from serenitymojo.ops.norm import group_norm
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.tensor_algebra import slice, concat, zeros_device
+from serenitymojo.ops.tensor_algebra import slice, concat, zeros_device, reshape, permute, sub, div
 from serenitymojo.models.vae.decoder2d import (
     ResnetBlock,
     AttnBlock,
@@ -551,3 +551,102 @@ def load_sd3_embedded_ldm_encoder[
         SD3_ENC_SHIFT,
         ctx,
     )
+
+
+# ── Ideogram-4 VAE encoder (Flux2-family / diffusers AutoencoderKL, z=32) ──────
+# Training-path encoder for ai-toolkit ideogram4.py::encode_images (455-476).
+# Mirror of load_ideogram4_vae_decoder (ldm_decoder.mojo): DIFFUSERS keys
+# (encoder.down_blocks.N.resnets.M / .downsamplers.0.conv / .mid_block.* /
+# .conv_norm_out / .conv_out), latent_ch 32, WITH quant_conv — Encoder.forward
+# applies it (ideogram4-ref autoencoder.py:201; convert_diffusers_state_dict maps
+# quant_conv.* -> encoder.quant_conv.*). The ideogram latent norm is per-128-ch
+# and applied AFTER patchify, so the struct's scalar scale/shift are no-ops
+# (1.0 / 0.0); normalization is ideogram4_normalize_latents below.
+def load_ideogram4_vae_encoder[
+    LH: Int, LW: Int
+](dir_or_file: String, ctx: DeviceContext) raises -> LdmVaeEncoder[LH, LW, 32]:
+    var st = ShardedSafeTensors.open(dir_or_file)
+    var p = String("encoder")
+    return LdmVaeEncoder[LH, LW, 32](
+        Float32(1.0), Float32(0.0), True,
+        _load_conv_weight_rscf(st, String("quant_conv.weight"), ctx),
+        _load_weight(st, String("quant_conv.bias"), ctx),
+        _load_conv_weight_rscf(st, p + ".conv_in.weight", ctx),
+        _load_weight(st, p + ".conv_in.bias", ctx),
+        # down_blocks.0 (128->128) @ 8*LH, downsample.
+        ResnetBlock[1, 8 * LH, 8 * LW, ENC_CH0, ENC_CH0].load(st, p + ".down_blocks.0.resnets.0", ctx),
+        ResnetBlock[1, 8 * LH, 8 * LW, ENC_CH0, ENC_CH0].load(st, p + ".down_blocks.0.resnets.1", ctx),
+        _load_conv_weight_rscf(st, p + ".down_blocks.0.downsamplers.0.conv.weight", ctx),
+        _load_weight(st, p + ".down_blocks.0.downsamplers.0.conv.bias", ctx),
+        # down_blocks.1 (128->256) @ 4*LH (r0 conv_shortcut), downsample.
+        ResnetBlock[1, 4 * LH, 4 * LW, ENC_CH0, ENC_CH1].load(st, p + ".down_blocks.1.resnets.0", ctx),
+        ResnetBlock[1, 4 * LH, 4 * LW, ENC_CH1, ENC_CH1].load(st, p + ".down_blocks.1.resnets.1", ctx),
+        _load_conv_weight_rscf(st, p + ".down_blocks.1.downsamplers.0.conv.weight", ctx),
+        _load_weight(st, p + ".down_blocks.1.downsamplers.0.conv.bias", ctx),
+        # down_blocks.2 (256->512) @ 2*LH (r0 conv_shortcut), downsample.
+        ResnetBlock[1, 2 * LH, 2 * LW, ENC_CH1, ENC_CH2].load(st, p + ".down_blocks.2.resnets.0", ctx),
+        ResnetBlock[1, 2 * LH, 2 * LW, ENC_CH2, ENC_CH2].load(st, p + ".down_blocks.2.resnets.1", ctx),
+        _load_conv_weight_rscf(st, p + ".down_blocks.2.downsamplers.0.conv.weight", ctx),
+        _load_weight(st, p + ".down_blocks.2.downsamplers.0.conv.bias", ctx),
+        # down_blocks.3 (512->512) @ LH, NO downsample.
+        ResnetBlock[1, LH, LW, ENC_CH2, ENC_CH2].load(st, p + ".down_blocks.3.resnets.0", ctx),
+        ResnetBlock[1, LH, LW, ENC_CH2, ENC_CH2].load(st, p + ".down_blocks.3.resnets.1", ctx),
+        # mid @ LH.
+        ResnetBlock[1, LH, LW, ENC_CH2, ENC_CH2].load(st, p + ".mid_block.resnets.0", ctx),
+        AttnBlock[1, LH, LW, ENC_CH2].load(st, p + ".mid_block.attentions.0", ctx),
+        ResnetBlock[1, LH, LW, ENC_CH2, ENC_CH2].load(st, p + ".mid_block.resnets.1", ctx),
+        # head: conv_norm_out (GroupNorm) -> silu -> conv_out (512 -> 64).
+        _load_weight(st, p + ".conv_norm_out.weight", ctx),
+        _load_weight(st, p + ".conv_norm_out.bias", ctx),
+        _load_conv_weight_rscf(st, p + ".conv_out.weight", ctx),
+        _load_weight(st, p + ".conv_out.bias", ctx),
+    )
+
+
+# Ideogram patchify (ai-toolkit src/pipeline.py:40, patch=2): deterministic VAE
+# mean NCHW [1, AE_CH, 2*GH, 2*GW] -> packed [1, 4*AE_CH, GH, GW]
+#   view(1,AE,GH,2,GW,2).permute(0,3,5,1,2,4).reshape(1,4*AE,GH,GW)
+def ideogram4_patchify_latents[
+    AE_CH: Int, GH: Int, GW: Int
+](mean_nchw: Tensor, ctx: DeviceContext) raises -> Tensor:
+    var s6 = List[Int]()
+    s6.append(1); s6.append(AE_CH); s6.append(GH); s6.append(2); s6.append(GW); s6.append(2)
+    var v = reshape(mean_nchw, s6^, ctx)
+    var perm = List[Int]()
+    perm.append(0); perm.append(3); perm.append(5); perm.append(1); perm.append(2); perm.append(4)
+    var pe = permute(v, perm, ctx)            # [1,2,2,AE_CH,GH,GW]
+    var s4 = List[Int]()
+    s4.append(1); s4.append(4 * AE_CH); s4.append(GH); s4.append(GW)
+    return reshape(pe, s4^, ctx)              # [1,4*AE_CH,GH,GW]
+
+
+# Per-128-channel latent norm (ai-toolkit encode_images:474-475):
+#   latents = (patched - shift) / scale ,  shift/scale [128] -> [1,128,1,1].
+# Done in F32 (matches the oracle's float() normalization).
+def ideogram4_normalize_latents(
+    patched: Tensor, shift_128: Tensor, scale_128: Tensor, ctx: DeviceContext
+) raises -> Tensor:
+    var c = patched.shape()[1]
+    var s4 = List[Int]()
+    s4.append(1); s4.append(c); s4.append(1); s4.append(1)
+    var s4b = s4.copy()
+    var pf = cast_tensor(patched, STDtype.F32, ctx)
+    var sh = cast_tensor(reshape(shift_128, s4^, ctx), STDtype.F32, ctx)
+    var sc = cast_tensor(reshape(scale_128, s4b^, ctx), STDtype.F32, ctx)
+    return div(sub(pf, sh, ctx), sc, ctx)
+
+
+# Full training encode: image NCHW [1,3,8*LH,8*LW] -> normalized packed latents
+# [1,128,LH/2,LW/2]. shift_128/scale_128 = get_latent_norm() (128-dim).
+def encode_ideogram4_latents[
+    LH: Int, LW: Int
+](
+    enc: LdmVaeEncoder[LH, LW, 32],
+    image_nchw: Tensor,
+    shift_128: Tensor,
+    scale_128: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var mean = enc.encode_mean(image_nchw, ctx)                  # [1,32,LH,LW]
+    var patched = ideogram4_patchify_latents[32, LH // 2, LW // 2](mean, ctx)
+    return ideogram4_normalize_latents(patched, shift_128, scale_128, ctx)

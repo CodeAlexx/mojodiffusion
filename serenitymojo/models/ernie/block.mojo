@@ -72,7 +72,7 @@ comptime TArc = ArcPointer[Tensor]
 # ── forward ops (GPU) ────────────────────────────────────────────────────────
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm
-from serenitymojo.ops.activations import gelu
+from serenitymojo.ops.activations import gelu_exact
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_halfsplit_full
 from serenitymojo.ops.attention import sdpa_nomask
@@ -81,7 +81,7 @@ from serenitymojo.ops.tensor_algebra import reshape, reshape_owned, reshape_in_p
 # ── backward arms (GPU; all pre-built + gated, reused from Klein) ─────────────
 from serenitymojo.ops.linalg_backward import linear_backward, LinearGrads
 from serenitymojo.ops.norm_backward import rms_norm_backward, RmsNormBackward
-from serenitymojo.ops.activation_backward import gelu_backward
+from serenitymojo.ops.activation_backward import gelu_exact_backward
 from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 from serenitymojo.ops.rope_struct_backward import (
@@ -296,7 +296,7 @@ def ernie_block_forward[
     var gate_pre = linear(mlp_in, w.wgate[], no_bias_g^, ctx)    # [S,F]
     var no_bias_u = Optional[Tensor](None)
     var up = linear(mlp_in, w.wup[], no_bias_u^, ctx)            # [S,F]
-    var gelu_gate = gelu(gate_pre, ctx)                          # [S,F]
+    var gelu_gate = gelu_exact(gate_pre, ctx)                    # [S,F] erf GELU (ref F.gelu)
     var activated = mul(gelu_gate, up, ctx)                      # [S,F]
     var no_bias_d = Optional[Tensor](None)
     var mlp_out = linear(activated, w.wdown[], no_bias_d^, ctx)  # [S,D]
@@ -352,8 +352,8 @@ def ernie_block_backward[
     var d_gelu_gate = mul(lb_down.d_x, saved.up[], ctx)
     var d_up = mul(lb_down.d_x, saved.gelu_gate[], ctx)
 
-    # gelu_gate = gelu(gate_pre) -> d_gate_pre = gelu_backward(d_gelu_gate, gate_pre)
-    var d_gate_pre = gelu_backward(d_gelu_gate, saved.gate_pre[], ctx)
+    # gelu_gate = gelu_exact(gate_pre) -> d_gate_pre = gelu_exact_backward(d_gelu_gate, gate_pre)
+    var d_gate_pre = gelu_exact_backward(d_gelu_gate, saved.gate_pre[], ctx)
 
     # gate_pre = linear(mlp_in, wgate) ; up = linear(mlp_in, wup)  W [F, D]
     var lb_gate = linear_backward(d_gate_pre, saved.mlp_in[], w.wgate[], S, D, F, ctx)

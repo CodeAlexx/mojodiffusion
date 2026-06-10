@@ -440,11 +440,18 @@ def _prepare_timestep(
     return _TEmb(t_cond.to_host(ctx), base_adaln.to_host(ctx))
 
 
-# ── build 3D-RoPE halfsplit tables [B*S_IMG*H, Dh/2] (per-position freqs).
-#    Mirrors stack_real_smoke / lora_step_smoke expansion. For the smoke we use
-#    a single linear position axis over the S_IMG image tokens (sufficient to
-#    exercise the rope-applied attention; the real 3D axis split is a sampler
-#    concern, not a LoRA-training-convergence one). ──────────────────────────
+# ── build REAL 3D-RoPE halfsplit tables [B*S_IMG*H, Dh/2] ────────────────────
+#    Replicates serenitymojo/models/dit/anima_dit.mojo build_anima_3d_rope (the
+#    proven inference/sampler path): Cosmos Predict2 3D split (axis-split t/h/w
+#    freqs, NTK-scaled thetas h/w=4.0, t=1.0 for the 16ch model). Grid for the
+#    cropped training latent: T=1, nH=nW=LATENT_HW//PS (square). build_anima_3d_rope
+#    yields the per-position [S_IMG, Dh/2] table; the block's rope_halfsplit
+#    consumes [B*S_IMG*H, Dh/2], so we broadcast each position over (B, H) — cos
+#    depends only on the token position. Token order ih→iw matches _patchify_in's
+#    pn = (t*nH+ih)*nW+iw (:356). The old simplified single-axis linear rope made
+#    the LoRA train against an incorrect positional encoding — verified against the
+#    OT dump by smoke/anima_train_ref_forward_replay.mojo (forward cos 0.955→0.999
+#    on switching to this 3D table).
 struct _Rope(Movable):
     var cos: Tensor
     var sin: Tensor
@@ -455,18 +462,69 @@ struct _Rope(Movable):
 
 
 def _rope_tables(s_img: Int, ctx: DeviceContext) raises -> _Rope:
-    var half = Dh // 2
+    var half_d = Dh // 2            # 64
+    var full_d = Dh                 # 128
+    var T_frames = 1
+    var nH = LATENT_HW // PS
+    var nW = LATENT_HW // PS
+
+    var dim_h = full_d // 6 * 2     # 42
+    var dim_w = dim_h               # 42
+    var dim_t = full_d - 2 * dim_h  # 44
+    var bins_t = dim_t // 2         # 22
+    var bins_h = dim_h // 2         # 21
+    var bins_w = dim_w // 2         # 21
+
+    var base_theta = Float64(10000.0)
+    var h_exp = Float64(dim_h) / (Float64(dim_h) - 2.0)
+    var w_exp = Float64(dim_w) / (Float64(dim_w) - 2.0)
+    var h_ntk = fexp(flog(Float64(4.0)) * h_exp)
+    var w_ntk = fexp(flog(Float64(4.0)) * w_exp)
+    var theta_h = Float32(base_theta * h_ntk)
+    var theta_w = Float32(base_theta * w_ntk)
+    var theta_t = Float32(base_theta)           # t_ntk = 1.0
+
+    var freqs_t = List[Float32]()
+    for i in range(bins_t):
+        var e = Float32(2 * i) / Float32(dim_t)
+        freqs_t.append(Float32(1.0) / fexp(flog(theta_t) * e))
+    var freqs_h = List[Float32]()
+    for i in range(bins_h):
+        var e = Float32(2 * i) / Float32(dim_h)
+        freqs_h.append(Float32(1.0) / fexp(flog(theta_h) * e))
+    var freqs_w = List[Float32]()
+    for i in range(bins_w):
+        var e = Float32(2 * i) / Float32(dim_w)
+        freqs_w.append(Float32(1.0) / fexp(flog(theta_w) * e))
+
+    # per-position [S_IMG, half_d] table (t→h→w order, matching _patchify_in)
+    var pos_cos = List[Float32]()
+    var pos_sin = List[Float32]()
+    for tf in range(T_frames):
+        for ih in range(nH):
+            for iw in range(nW):
+                for fi in range(bins_t):
+                    var a = Float32(tf) * freqs_t[fi]
+                    pos_cos.append(fcos(a)); pos_sin.append(fsin(a))
+                for fi in range(bins_h):
+                    var a = Float32(ih) * freqs_h[fi]
+                    pos_cos.append(fcos(a)); pos_sin.append(fsin(a))
+                for fi in range(bins_w):
+                    var a = Float32(iw) * freqs_w[fi]
+                    pos_cos.append(fcos(a)); pos_sin.append(fsin(a))
+
+    # broadcast each position over (B, H) -> [B*s_img*H, half_d]
     var cosl = List[Float32]()
     var sinl = List[Float32]()
     for _b in range(B):
         for s in range(s_img):
+            var base = s * half_d
             for _h in range(H):
-                for i in range(half):
-                    var ang = Float32(s) / (Float32(10000.0) ** (Float32(2 * i) / Float32(Dh)))
-                    cosl.append(fcos(ang))
-                    sinl.append(fsin(ang))
-    var cos = Tensor.from_host(cosl, [B * s_img * H, half], STDtype.F32, ctx)
-    var sin = Tensor.from_host(sinl, [B * s_img * H, half], STDtype.F32, ctx)
+                for i in range(half_d):
+                    cosl.append(pos_cos[base + i])
+                    sinl.append(pos_sin[base + i])
+    var cos = Tensor.from_host(cosl, [B * s_img * H, half_d], STDtype.F32, ctx)
+    var sin = Tensor.from_host(sinl, [B * s_img * H, half_d], STDtype.F32, ctx)
     return _Rope(cos^, sin^)
 
 

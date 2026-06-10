@@ -129,15 +129,36 @@ def make_lora_adapter(
 
 
 # ── the LoRA carrier: every trained adapter, flat-indexed 10×num_blocks ───────
+# Plus the TWO ST-level linear adapters (proj_in / proj_out) that wrap the depth
+# blocks (diffusers Transformer2DModel proj_in/proj_out -> OneTrainer
+# lora_unet_*_attentions_*_proj_in/proj_out). They are Optional so the existing
+# ST-attn-only callers (build_sdxl_lora_set, real-train) keep bit-identical
+# behavior: when absent, sdxl_lora_apply / sdxl_proj_lora_into_dx reduce to base.
 struct SdxlLoraSet(Copyable, Movable):
     var ad: List[LoraAdapter]   # num_blocks * SDXL_SLOTS, slot order above
     var num_blocks: Int
     var rank: Int
+    var proj_in_ad: Optional[LoraAdapter]    # ST proj_in (in=C out=C)
+    var proj_out_ad: Optional[LoraAdapter]   # ST proj_out (in=C out=C)
 
+    # ST-attn-only constructor (UNCHANGED surface; proj adapters absent).
     def __init__(out self, var ad: List[LoraAdapter], num_blocks: Int, rank: Int):
         self.ad = ad^
         self.num_blocks = num_blocks
         self.rank = rank
+        self.proj_in_ad = Optional[LoraAdapter](None)
+        self.proj_out_ad = Optional[LoraAdapter](None)
+
+    # full constructor with ST-level proj_in/proj_out adapters.
+    def __init__(
+        out self, var ad: List[LoraAdapter], num_blocks: Int, rank: Int,
+        var proj_in_ad: Optional[LoraAdapter], var proj_out_ad: Optional[LoraAdapter],
+    ):
+        self.ad = ad^
+        self.num_blocks = num_blocks
+        self.rank = rank
+        self.proj_in_ad = proj_in_ad^
+        self.proj_out_ad = proj_out_ad^
 
 
 # slot in/out shapes. C = hidden, Cctx = context dim, Cff2 = 2*Cff (GEGLU in-proj
@@ -528,9 +549,13 @@ def sdxl_st_lora_forward[
     ctx: DeviceContext,
 ) raises -> SdxlStLoraFwd:
     comptime N = H * W
+    comptime M = B * N
     var xn = group_norm(x, _d(w.gn_w, ctx), _d(w.gn_b, ctx), G, GN_EPS_ST, ctx)
     var tok = reshape(xn.clone(ctx), _sh3(B, N, C), ctx)
-    var tok_in = linear(tok, _d(w.proj_in_w, ctx), Optional[Tensor](_d(w.proj_in_b, ctx)), ctx)
+    # proj_in linear (+ optional ST proj_in LoRA on the [M,C] proj-input `tok`).
+    var tok_in_base = linear(tok, _d(w.proj_in_w, ctx), Optional[Tensor](_d(w.proj_in_b, ctx)), ctx)
+    var tok_in_2 = sdxl_lora_apply(tok_in_base, tok.clone(ctx), lora.proj_in_ad, M, C, ctx)  # [M,C]
+    var tok_in = reshape(tok_in_2, _sh3(B, N, C), ctx)
     var block_acts = List[BasicBlockLoraActs]()
     var hidden = tok_in.clone(ctx)
     comptime for j in range(depth):
@@ -541,7 +566,9 @@ def sdxl_st_lora_forward[
         hidden = res[0].clone(ctx)
         block_acts.append(res[1].copy())
     var h_final = hidden.clone(ctx)
-    var po = linear(hidden, _d(w.proj_out_w, ctx), Optional[Tensor](_d(w.proj_out_b, ctx)), ctx)
+    # proj_out linear (+ optional ST proj_out LoRA on the [M,C] proj-input `hidden`).
+    var po_base = linear(hidden, _d(w.proj_out_w, ctx), Optional[Tensor](_d(w.proj_out_b, ctx)), ctx)
+    var po = sdxl_lora_apply(po_base, hidden.clone(ctx), lora.proj_out_ad, M, C, ctx)  # [M,C]
     var po4 = reshape(po, _sh4(B, H, W, C), ctx)
     var out = add(x.clone(ctx), po4, ctx)
     var acts = SdxlStLoraActs(
@@ -556,13 +583,22 @@ struct SdxlStLoraGrads(Movable):
     var d_x: List[Float32]          # grad wrt ST input [B,H,W,C] (full chain proof)
     var d_context: List[Float32]    # grad wrt context [B,Nkv,Cctx] (summed over blocks)
     var nonfinite_lora_grads: Int
+    # ST-level proj_in/proj_out LoRA grads (empty lists when the adapter is absent).
+    var d_proj_in_a: List[Float32]
+    var d_proj_in_b: List[Float32]
+    var d_proj_out_a: List[Float32]
+    var d_proj_out_b: List[Float32]
 
     def __init__(
         out self, var d_a: List[List[Float32]], var d_b: List[List[Float32]],
         var d_x: List[Float32], var d_context: List[Float32], nonfinite_lora_grads: Int,
+        var d_proj_in_a: List[Float32], var d_proj_in_b: List[Float32],
+        var d_proj_out_a: List[Float32], var d_proj_out_b: List[Float32],
     ):
         self.d_a = d_a^; self.d_b = d_b^; self.d_x = d_x^
         self.d_context = d_context^; self.nonfinite_lora_grads = nonfinite_lora_grads
+        self.d_proj_in_a = d_proj_in_a^; self.d_proj_in_b = d_proj_in_b^
+        self.d_proj_out_a = d_proj_out_a^; self.d_proj_out_b = d_proj_out_b^
 
 
 def _nonfinite(v: List[Float32]) -> Int:
@@ -591,10 +627,21 @@ def sdxl_st_lora_backward[
         d_a_flat.append(List[Float32]())
         d_b_flat.append(List[Float32]())
 
-    # out = x + reshape(po) -> d_x_resid = go ; d_po = go
+    # proj_out/proj_in 1-slot grad scratch (extracted to the named grad fields).
+    var d_pi_a = List[List[Float32]](); var d_pi_b = List[List[Float32]]()
+    d_pi_a.append(List[Float32]()); d_pi_b.append(List[Float32]())
+    var d_po_a = List[List[Float32]](); var d_po_b = List[List[Float32]]()
+    d_po_a.append(List[Float32]()); d_po_b.append(List[Float32]())
+
+    # out = x + reshape(po) -> d_x_resid = go ; d_po = go (at proj_out OUTPUT)
     var d_po = reshape(go.clone(ctx), _sh3(B, N, C), ctx)
-    var g_po = linear_backward(d_po, _d(acts.h_final, ctx), _d(w.proj_out_w, ctx), M, C, C, ctx)
-    var d_hidden = g_po.d_x.clone(ctx)
+    var g_po = linear_backward(d_po.clone(ctx), _d(acts.h_final, ctx), _d(w.proj_out_w, ctx), M, C, C, ctx)
+    # proj_out LoRA: base d_x + LoRA d_x (proj-input = h_final); scatter d_a/d_b.
+    var d_hidden_2 = sdxl_proj_lora_into_dx(
+        d_po, _d(acts.h_final, ctx), g_po.d_x.clone(ctx),
+        lora.proj_out_ad, 0, M, C, d_po_a, d_po_b, ctx,
+    )                                                   # [M,C]
+    var d_hidden = reshape(d_hidden_2, _sh3(B, N, C), ctx)
 
     var d_context = _zeros_ctx(B, Nkv, Cctx, ctx)
     comptime for jj in range(depth):
@@ -613,8 +660,12 @@ def sdxl_st_lora_backward[
 
     # proj_in linear bwd: y=tok_in, x=tok(=reshape(xn)), W=proj_in_w[C,C]
     var tok = reshape(_d(acts.xn, ctx), _sh3(B, N, C), ctx)
-    var g_pi = linear_backward(d_hidden, tok, _d(w.proj_in_w, ctx), M, C, C, ctx)
-    var d_tok = g_pi.d_x.clone(ctx)
+    var g_pi = linear_backward(d_hidden.clone(ctx), tok.clone(ctx), _d(w.proj_in_w, ctx), M, C, C, ctx)
+    # proj_in LoRA: base d_x + LoRA d_x (proj-input = tok); scatter d_a/d_b.
+    var d_tok = sdxl_proj_lora_into_dx(
+        d_hidden, tok.clone(ctx), g_pi.d_x.clone(ctx),
+        lora.proj_in_ad, 0, M, C, d_pi_a, d_pi_b, ctx,
+    )                                                   # [M,C]
     var d_xn = reshape(d_tok, _sh4(B, H, W, C), ctx)
     var g_gn = group_norm_backward(d_xn, _d(acts.x, ctx), _d(w.gn_w, ctx), G, GN_EPS_ST, ctx)
     var d_x = add(go.clone(ctx), g_gn.d_x, ctx)         # residual + GroupNorm path
@@ -622,9 +673,12 @@ def sdxl_st_lora_backward[
     var nonfinite = 0
     for i in range(num_blocks * SDXL_SLOTS):
         nonfinite += _nonfinite(d_a_flat[i]) + _nonfinite(d_b_flat[i])
+    nonfinite += _nonfinite(d_pi_a[0]) + _nonfinite(d_pi_b[0])
+    nonfinite += _nonfinite(d_po_a[0]) + _nonfinite(d_po_b[0])
 
     return SdxlStLoraGrads(
         d_a_flat^, d_b_flat^, d_x.to_host(ctx), d_context.to_host(ctx), nonfinite,
+        d_pi_a[0].copy(), d_pi_b[0].copy(), d_po_a[0].copy(), d_po_b[0].copy(),
     )
 
 
@@ -639,6 +693,17 @@ def sdxl_lora_adamw_step(
     for i in range(n):
         var lg = LoraGrads(grads.d_a[i].copy(), grads.d_b[i].copy())
         _lora_adamw(set.ad[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
+    # ST-level proj_in/proj_out adapters (when present).
+    if set.proj_in_ad and len(grads.d_proj_in_a) > 0:
+        var pi = set.proj_in_ad.value().copy()
+        var lg_pi = LoraGrads(grads.d_proj_in_a.copy(), grads.d_proj_in_b.copy())
+        _lora_adamw(pi, lg_pi, t, lr, ctx, beta1, beta2, eps, weight_decay)
+        set.proj_in_ad = Optional[LoraAdapter](pi^)
+    if set.proj_out_ad and len(grads.d_proj_out_a) > 0:
+        var po = set.proj_out_ad.value().copy()
+        var lg_po = LoraGrads(grads.d_proj_out_a.copy(), grads.d_proj_out_b.copy())
+        _lora_adamw(po, lg_po, t, lr, ctx, beta1, beta2, eps, weight_decay)
+        set.proj_out_ad = Optional[LoraAdapter](po^)
 
 
 # -- per-block OneTrainer raw legacy prefix scheme ----------------------------
@@ -740,8 +805,9 @@ def sdxl_lora_unsupported_onetrainer_targets() -> List[String]:
     out.append("lora_unet_*_resnets_*_conv2")
     out.append("lora_unet_*_resnets_*_conv_shortcut")
     out.append("lora_unet_*_samplers_*_conv")
-    out.append("lora_unet_*_attentions_*_proj_in")
-    out.append("lora_unet_*_attentions_*_proj_out")
+    # NOTE: lora_unet_*_attentions_*_proj_in / proj_out are now IMPLEMENTED as
+    # ST-level linear LoRA in SdxlLoraSet.proj_in_ad/proj_out_ad (math gated by
+    # lora_stack_parity.mojo). They are no longer listed here.
     out.append("lora_unet_conv_norm_out")
     out.append("lora_unet_conv_out")
     out.append("lora_te1")

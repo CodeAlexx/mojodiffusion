@@ -19,7 +19,7 @@
 #
 # Mojo 1.0.0b1, NVIDIA GPU.
 
-from std.math import exp, tanh
+from std.math import exp, tanh, erf
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import global_idx
 from std.utils.index import IndexList
@@ -34,6 +34,7 @@ comptime _BLOCK = 256
 # tanh-approx GELU constants (match activations.mojo forward + gelu_backward.cu).
 comptime _GELU_C = Float32(0.7978845608028654)   # sqrt(2/pi)
 comptime _GELU_A = Float32(0.044715)
+comptime _INV_SQRT2 = Float32(0.7071067811865476)   # 1/sqrt(2) (exact-GELU)
 
 
 @always_inline
@@ -74,6 +75,16 @@ def _gelu_deriv(x: Float32) -> Float32:
     var t = tanh(arg)
     var sech2 = 1.0 - t * t
     return 0.5 * (1.0 + t) + 0.5 * x * sech2 * _GELU_C * (1.0 + 3.0 * _GELU_A * x2)
+
+
+@always_inline
+def _gelu_exact_deriv(x: Float32) -> Float32:
+    # Exact (erf) GELU: gelu(x) = 0.5*x*(1 + erf(x/sqrt2)).
+    # gelu'(x) = 0.5*(1 + erf(x/sqrt2)) + 0.5*x*sqrt(2/pi)*exp(-x^2/2).
+    # Matches torch.nn.functional.gelu(approximate="none") (ERNIE FeedForward).
+    var cdf = 0.5 * (1.0 + erf(x * _INV_SQRT2))
+    var pdf = _GELU_C * exp(-0.5 * x * x)
+    return cdf + 0.5 * x * pdf
 
 
 # ── one kernel per dtype per arm (F32 / BF16 / F16 storage; F32 interior) ─────
@@ -193,8 +204,32 @@ def _gelu_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: Layout
         o[i] = rebind[o.element_type]((gv * _gelu_deriv(xv)).cast[DType.float16]())
 
 
+# --- exact (erf) GELU backward kernels (arm 5) ---
+def _gelu_exact_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+    var i = Int(global_idx.x)
+    if i < n:
+        o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _gelu_exact_deriv(rebind[Scalar[DType.float32]](x[i])))
+
+
+def _gelu_exact_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+    var i = Int(global_idx.x)
+    if i < n:
+        var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
+        var xv = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type]((gv * _gelu_exact_deriv(xv)).cast[DType.bfloat16]())
+
+
+def _gelu_exact_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+    var i = Int(global_idx.x)
+    if i < n:
+        var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
+        var xv = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type]((gv * _gelu_exact_deriv(xv)).cast[DType.float16]())
+
+
 # ── shared dtype-dispatch runner ─────────────────────────────────────────────
-# `arm` selects which derivative: 0=relu 1=sigmoid 2=tanh 3=silu 4=gelu.
+# `arm` selects which derivative: 0=relu 1=sigmoid 2=tanh 3=silu 4=gelu(tanh)
+# 5=gelu_exact(erf).
 def _run(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:
     if grad_out.dtype() != x.dtype():
         raise Error("activation_backward: grad_out/x dtype mismatch")
@@ -217,8 +252,10 @@ def _run(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Te
             ctx.enqueue_function[_tanh_bwd_f32, _tanh_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
             ctx.enqueue_function[_silu_bwd_f32, _silu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
-        else:
+        elif arm == 4:
             ctx.enqueue_function[_gelu_bwd_f32, _gelu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            ctx.enqueue_function[_gelu_exact_bwd_f32, _gelu_exact_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
         var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
@@ -231,8 +268,10 @@ def _run(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Te
             ctx.enqueue_function[_tanh_bwd_bf16, _tanh_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
             ctx.enqueue_function[_silu_bwd_bf16, _silu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
-        else:
+        elif arm == 4:
             ctx.enqueue_function[_gelu_bwd_bf16, _gelu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            ctx.enqueue_function[_gelu_exact_bwd_bf16, _gelu_exact_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
     else:
         var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
         var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl)
@@ -245,8 +284,10 @@ def _run(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Te
             ctx.enqueue_function[_tanh_bwd_f16, _tanh_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
         elif arm == 3:
             ctx.enqueue_function[_silu_bwd_f16, _silu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
-        else:
+        elif arm == 4:
             ctx.enqueue_function[_gelu_bwd_f16, _gelu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            ctx.enqueue_function[_gelu_exact_bwd_f16, _gelu_exact_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -274,3 +315,9 @@ def silu_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Ten
 def gelu_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:
     """gelu (tanh-approx) backward: matches flame-core gelu_tanh_derivative."""
     return _run(4, grad_out, x, ctx)
+
+
+def gelu_exact_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """gelu exact (erf) backward: d_x = grad_out * gelu_exact'(x).
+    Partner of activations.gelu_exact; matches torch GELU(approximate='none')."""
+    return _run(5, grad_out, x, ctx)

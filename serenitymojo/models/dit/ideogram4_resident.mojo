@@ -15,7 +15,7 @@ from serenitymojo.ops.activations import silu, swiglu
 from serenitymojo.ops.norm import rms_norm, layer_norm_no_affine
 from serenitymojo.ops.unary import tanh_op
 from serenitymojo.ops.attention import sdpa_nomask
-from serenitymojo.ops.tensor_algebra import mul, add, add_scalar, reshape, slice, gather_rows
+from serenitymojo.ops.tensor_algebra import mul, add, add_scalar, reshape, slice, gather_rows, transpose, mul_scalar
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
 from serenitymojo.models.dit.ideogram4_dit import apply_rope_ideogram, ideogram4_embedscalar_sinusoid
@@ -23,9 +23,13 @@ from serenitymojo.models.dit.ideogram4_dit import apply_rope_ideogram, ideogram4
 
 struct Ideogram4Weights(Movable):
     var t: Dict[String, ArcPointer[Tensor]]
+    var lora_a: Dict[String, ArcPointer[Tensor]]   # base-weight-name -> A [rank,in]
+    var lora_b: Dict[String, ArcPointer[Tensor]]   # base-weight-name -> B [out,rank]
 
     fn __init__(out self, var t: Dict[String, ArcPointer[Tensor]]):
         self.t = t^
+        self.lora_a = Dict[String, ArcPointer[Tensor]]()
+        self.lora_b = Dict[String, ArcPointer[Tensor]]()
 
     @staticmethod
     def load(st: ShardedSafeTensors, ctx: DeviceContext) raises -> Ideogram4Weights:
@@ -47,6 +51,27 @@ struct Ideogram4Weights(Movable):
             raise Error("Ideogram4Weights: missing " + name)
         return self.t[name][]
 
+    # Runtime additive LoRA overlay (NEVER fused into a saved model; memory-safe —
+    # keeps the fp8 weights resident, stores only the rank-16 A/B). _lin adds
+    # B·(A·x) for any base weight that has a LoRA. Keys:
+    # diffusion_model.<base>.lora_A/B.weight ; this LoRA has alpha==rank (16/16) ⇒
+    # scale 1.0 (folded into B at this scale; add a mul if a future LoRA differs).
+    def load_lora(mut self, lora_path: String, ctx: DeviceContext) raises -> Int:
+        var lst = ShardedSafeTensors.open(lora_path)
+        var n = 0
+        for ref nm in lst.names():
+            if not nm.endswith(".lora_A.weight"):
+                continue
+            var inner = String(nm[byte=16 : nm.byte_length() - 14])   # strip "diffusion_model." + ".lora_A.weight"
+            var bw = inner + ".weight"
+            if bw not in self.t:
+                continue
+            self.lora_a[bw] = ArcPointer(Tensor.from_view(lst.tensor_view(nm), ctx))           # [rank,in] bf16
+            self.lora_b[bw] = ArcPointer(Tensor.from_view(
+                lst.tensor_view(String("diffusion_model.") + inner + ".lora_B.weight"), ctx))  # [out,rank] bf16
+            n += 1
+        return n
+
 
 # fp8 linear: dequant the RESIDENT fp8 weight -> bf16 (cheap GPU kernel, no mmap
 # re-read) then vendor-BLAS linear (fast). Faster than a hand-tiled fp8 GEMM and
@@ -54,6 +79,13 @@ struct Ideogram4Weights(Movable):
 # resident so both transformers fit + zero per-step mmap/streaming.
 def _lin(w: Ideogram4Weights, x: Tensor, name: String, bias: String, ctx: DeviceContext) raises -> Tensor:
     var wbf = fp8_e4m3_dequant_perrow_to_bf16(w.w(name), w.w(name + "_scale"), ctx)
+    # runtime LoRA overlay: out += B·(A·x)  (A [rank,in], B [out,rank], scale 1.0)
+    if name in w.lora_a:
+        var down = linear(x, w.lora_a[name][].clone(ctx), None, ctx)   # x·Aᵀ -> [..,rank]
+        var up = linear(down, w.lora_b[name][].clone(ctx), None, ctx)  # ·Bᵀ -> [..,out]
+        if len(bias) == 0:
+            return add(linear(x, wbf, None, ctx), up, ctx)
+        return add(linear(x, wbf, Optional[Tensor](w.w(bias).clone(ctx)), ctx), up, ctx)
     if len(bias) == 0:
         return linear(x, wbf, None, ctx)
     return linear(x, wbf, Optional[Tensor](w.w(bias).clone(ctx)), ctx)

@@ -521,7 +521,7 @@ def main() raises:
         var t = Tensor.from_host(t_h^, t_s^, STDtype.F32, ctx)
 
         # ── forward (NHWC) -> eps_pred NHWC [1,LH,LW,4] ──
-        var fwd = sdxl_real_forward[LATENT_HW](noisy_nhwc, t, y.clone(ctx), context.clone(ctx), w, lora, ctx)
+        var fwd = sdxl_real_forward[LATENT_HW, LATENT_HW](noisy_nhwc, t, y.clone(ctx), context.clone(ctx), w, lora, ctx)
         var pred_nhwc_h = fwd.out.to_host(ctx)   # NHWC flat [LH*LW*4]
 
         # ── target ε in NHWC order (noise is NCHW; convert index) ──
@@ -545,7 +545,7 @@ def main() raises:
         var go = Tensor.from_host(d_loss_nhwc^, _sh4(1, LATENT_HW, LATENT_HW, 4), STDtype.F32, ctx)
 
         # ── backward -> per-ST LoRA grads ──
-        var grads = sdxl_real_backward[LATENT_HW](go, fwd.acts, w, lora, ctx)
+        var grads = sdxl_real_backward[LATENT_HW, LATENT_HW](go, fwd.acts, w, lora, ctx)
 
         # ── global-norm clip(1.0) ──
         var gn_before = _clip(grads, train_cfg.max_grad_norm)

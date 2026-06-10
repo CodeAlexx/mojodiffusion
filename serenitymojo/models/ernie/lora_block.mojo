@@ -45,13 +45,13 @@ from serenitymojo.training.train_step import LoraAdapter, LoraGrads
 
 # Forward + backward ops shared with the base block (Tenet 1: nothing new here).
 from serenitymojo.ops.norm import rms_norm
-from serenitymojo.ops.activations import gelu
+from serenitymojo.ops.activations import gelu_exact
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_halfsplit_full
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.tensor_algebra import reshape_owned, reshape_in_place, mul, add, mul_scalar
 from serenitymojo.ops.norm_backward import rms_norm_backward, rms_norm_backward_dx
-from serenitymojo.ops.activation_backward import gelu_backward
+from serenitymojo.ops.activation_backward import gelu_exact_backward
 from serenitymojo.ops.attention_backward import sdpa_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward
 from serenitymojo.ops.rope_struct_backward import (
@@ -389,7 +389,7 @@ def ernie_block_lora_forward[
     var gate_pre = _t(gate_pre_h, [S, F], ctx)
     var up = _t(up_h, [S, F], ctx)
 
-    var gelu_gate = gelu(gate_pre, ctx)
+    var gelu_gate = gelu_exact(gate_pre, ctx)
     var activated = mul(gelu_gate, up, ctx)
     var activated_h = activated.to_host(ctx)                    # [S,F] (LoRA input for wdown)
 
@@ -480,7 +480,7 @@ def ernie_block_lora_forward_device_tensor[
     var gate_pre = ernie_lora_apply_device(gate_base^, mlp_in, lora.gate_proj, S, ctx)
     var up = ernie_lora_apply_device(up_base^, mlp_in, lora.up_proj, S, ctx)
 
-    var gelu_gate = gelu(gate_pre, ctx)
+    var gelu_gate = gelu_exact(gate_pre, ctx)
     var activated = mul(gelu_gate, up, ctx)
 
     var no_bias_d = Optional[Tensor](None)
@@ -590,7 +590,7 @@ def ernie_block_lora_backward[
     # activated = gelu_gate * up
     var d_gelu_gate = mul(lb_down.d_x, saved.up[], ctx)
     var d_up = mul(lb_down.d_x, saved.gelu_gate[], ctx)
-    var d_gate_pre = gelu_backward(d_gelu_gate, saved.gate_pre[], ctx)
+    var d_gate_pre = gelu_exact_backward(d_gelu_gate, saved.gate_pre[], ctx)
 
     # gate_pre = linear(mlp_in, wgate)[+LoRA]; up = linear(mlp_in, wup)[+LoRA]  W [F,D]
     var mlp_in_h = saved.mlp_in[].to_host(ctx)
@@ -769,7 +769,7 @@ def ernie_block_lora_backward_device_tensors[
 
     var d_gelu_gate = mul(pg_down.d_x, saved.up[], ctx)
     var d_up = mul(pg_down.d_x, saved.gelu_gate[], ctx)
-    var d_gate_pre = gelu_backward(d_gelu_gate, saved.gate_pre[], ctx)
+    var d_gate_pre = gelu_exact_backward(d_gelu_gate, saved.gate_pre[], ctx)
 
     var pg_gate = _proj_bwd_with_lora_device_tensors(
         d_gate_pre, saved.mlp_in[], w.wgate[], lora.gate_proj, S, D, F, ctx,

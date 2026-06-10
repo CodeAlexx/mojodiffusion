@@ -34,6 +34,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
 from serenitymojo.ops.tensor_algebra import (
     add, sub, mul_scalar, reshape, permute, slice, zeros_device,
 )
@@ -117,9 +118,9 @@ def _denoise_hires(
     print("  NavaDiTHires loaded.")
 
     # Condition: cast pos_text to BF16.
-    var pos = cast_tensor(pos_text, STDtype.BF16, ctx)
+    var pos = torch_f32_to_bf16_rne(pos_text, ctx)
     # Unconditioned: the video NEGATIVE PROMPT.
-    var neg = cast_tensor(neg_text, STDtype.BF16, ctx)
+    var neg = torch_f32_to_bf16_rne(neg_text, ctx)
 
     # F32-resident latents (updated each step).
     var lv = init_lat_vid.clone(ctx)
@@ -137,20 +138,20 @@ def _denoise_hires(
         var t_val = Float32(sigmas[i] * 1000.0)
 
         # ── Forward 1: cond (masking_modality=False) ──────────────────────────
-        var lv_b1 = cast_tensor(lv, STDtype.BF16, ctx)
-        var la_b1 = cast_tensor(la, STDtype.BF16, ctx)
+        var lv_b1 = torch_f32_to_bf16_rne(lv, ctx)
+        var la_b1 = torch_f32_to_bf16_rne(la, ctx)
         var t1 = _make_t(t_val, ctx)
         var cond = dit.forward(lv_b1, la_b1, pos, t1, ctx, masking_modality=False)
 
         # ── Forward 2: uncond (masking_modality=False) ────────────────────────
-        var lv_b2 = cast_tensor(lv, STDtype.BF16, ctx)
-        var la_b2 = cast_tensor(la, STDtype.BF16, ctx)
+        var lv_b2 = torch_f32_to_bf16_rne(lv, ctx)
+        var la_b2 = torch_f32_to_bf16_rne(la, ctx)
         var t2 = _make_t(t_val, ctx)
         var unco = dit.forward(lv_b2, la_b2, neg, t2, ctx, masking_modality=False)
 
         # ── Forward 3: masking_modality=True (cond, non-joint) ───────────────
-        var lv_b3 = cast_tensor(lv, STDtype.BF16, ctx)
-        var la_b3 = cast_tensor(la, STDtype.BF16, ctx)
+        var lv_b3 = torch_f32_to_bf16_rne(lv, ctx)
+        var la_b3 = torch_f32_to_bf16_rne(la, ctx)
         var t3 = _make_t(t_val, ctx)
         var mmask = dit.forward(lv_b3, la_b3, pos, t3, ctx, masking_modality=True)
 

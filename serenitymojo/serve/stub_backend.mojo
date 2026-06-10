@@ -88,6 +88,9 @@ struct StubBackend(GenBackend, Movable):
     def cancel(mut self):
         self.cancel_flag = True
 
+    def between_jobs_trim(mut self) raises:
+        pass  # stub holds no device memory
+
     def step(mut self) raises -> StepResult:
         var r = StepResult()
         r.total = self.params.steps

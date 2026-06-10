@@ -202,6 +202,18 @@ def scan_checkpoints() raises -> List[ScanEntry]:
             out.append(ScanEntry(
                 known_names[i].copy(), dir.copy(), known_archs[i].copy(), _dir_size(dir)
             ))
+    # known diffusers-tree checkpoints UNDER checkpoints/ (multi-shard
+    # transformer/vae subdirs — not flat .safetensors files, so the file scan
+    # above misses them). These are the resident-backend targets the daemon can
+    # switch to (model_scan.name == the backend.resident_model() string).
+    var ckpt_names: List[String] = ["qwen-image-2512"]
+    var ckpt_archs: List[String] = ["qwen-image"]
+    for i in range(len(ckpt_names)):
+        var dir = String(CHECKPOINTS_DIR) + "/" + ckpt_names[i]
+        if _dir_exists(dir):
+            out.append(ScanEntry(
+                ckpt_names[i].copy(), dir.copy(), ckpt_archs[i].copy(), _dir_size(dir)
+            ))
     return out^
 
 

@@ -56,6 +56,7 @@ from serenitymojo.serve.model_scan import (
 )
 from serenitymojo.serve.stub_backend import StubBackend
 from serenitymojo.serve.zimage_backend import ZImageBackend
+from serenitymojo.serve.dispatch_backend import DispatchBackend
 
 comptime DEFAULT_PORT = 7801
 comptime MAX_EVENTS = 64
@@ -502,6 +503,14 @@ def tick_worker[B: GenBackend](
         if r.done or r.failed or r.cancelled:
             print("job", jobs[running].params.job_id, "->", jobs[running].state)
             save_jobs_db_safe(prior, jobs)
+            # F3: reclaim this job's transient device-memory peak (per-job text
+            # encoder, decode activations) back to the OS at the job boundary,
+            # so idle VRAM tracks the resident footprint, not the high-water
+            # mark. No-op for backends that hold no reclaimable pool memory.
+            try:
+                backend.between_jobs_trim()
+            except e:
+                print("WARNING: between_jobs_trim failed (continuing):", e)
             running = -1
         return
     # idle: promote the next queued job (skipping pre-cancelled ones)
@@ -929,18 +938,29 @@ def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
 
 
 def main() raises:
-    """serenity_daemon [stub|zimage] [port] — backend defaults to stub,
-    port to DEFAULT_PORT; the two args are recognized by shape in any order."""
+    """serenity_daemon [stub|zimage|dispatch] [port] — backend defaults to
+    stub, port to DEFAULT_PORT; the two args are recognized by shape in any
+    order.
+
+    * stub      — no model, no GPU (the smoke backend).
+    * zimage    — Z-Image only (single resident backend; legacy single-model).
+    * dispatch  — multi-model residency + on-demand SWITCHING (Phase 4): the
+                  resident backend is chosen per job by `model` (zimage_base /
+                  qwen-image-2512), freeing + loading on a switch. /v1/health +
+                  /v1/models reflect the live residency."""
     var port = DEFAULT_PORT
     var mode = String("stub")
     var args = argv()
     for i in range(1, len(args)):
         var a = String(args[i])
-        if a == "stub" or a == "zimage":
+        if a == "stub" or a == "zimage" or a == "dispatch":
             mode = a^
         else:
             port = Int(a)
-    if mode == "zimage":
+    if mode == "dispatch":
+        var db = DispatchBackend()
+        run_daemon(db, port)
+    elif mode == "zimage":
         var zb = ZImageBackend()
         run_daemon(zb, port)
     else:

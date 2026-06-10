@@ -135,6 +135,44 @@ def cu_mem_get_info() raises -> CuMemInfo:
     return CuMemInfo(f, t)
 
 
+def cu_device_get_mempool(device: Int32 = 0) raises -> UInt64:
+    """The device's DEFAULT stream-ordered memory pool handle
+    (cuDeviceGetMemPool). MAX's DeviceContext caching allocator frees device
+    buffers back to THIS pool (cuMemAllocFromPoolAsync / cuMemFreeAsync), and
+    the pool keeps the bytes reserved from the OS until trimmed — this is the
+    Phase-4 F3 "~GBs never returned between jobs" retention. The handle is a
+    CUmemoryPool (an opaque pointer); we carry it as UInt64."""
+    var out = alloc[UInt64](1)
+    out[0] = 0
+    var rc = Int(external_call["cuDeviceGetMemPool", Int32](_ptr(out), device))
+    var pool = out[0]
+    out.free()
+    check_cuda(rc, String("cuDeviceGetMemPool"))
+    return pool
+
+
+def cu_mempool_trim_to(pool: UInt64, min_bytes_to_keep: Int) raises:
+    """Release reserved-but-unused pool memory back to the OS, keeping at most
+    `min_bytes_to_keep` bytes reserved (cuMemPoolTrimTo). Call this at a JOB
+    BOUNDARY (no in-flight allocations) — it only reclaims chunks with no live
+    suballocations, so live resident weights are untouched; the idle/freed
+    high-water-mark bytes are what come back. This is the F3 pool-trim hook the
+    daemon calls between jobs / on a model switch."""
+    var rc = Int(external_call["cuMemPoolTrimTo", Int32](
+        pool, UInt64(min_bytes_to_keep)
+    ))
+    check_cuda(rc, String("cuMemPoolTrimTo"))
+
+
+def cu_mempool_trim_current(min_bytes_to_keep: Int = 0) raises:
+    """Trim the current device's default pool to `min_bytes_to_keep` (default 0
+    = release everything not live). Convenience wrapper used by the daemon's
+    between-jobs / switch path."""
+    var dev = cu_device_get(0)
+    var pool = cu_device_get_mempool(dev)
+    cu_mempool_trim_to(pool, min_bytes_to_keep)
+
+
 def vmm_supported(device_ordinal: Int32 = 0) raises -> Bool:
     var dev = cu_device_get(device_ordinal)
     var supported = cu_device_get_attribute(

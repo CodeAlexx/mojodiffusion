@@ -61,6 +61,7 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
 from serenitymojo.models.zimage.real_weights import (
     ZImageRealAux, load_zimage_real_aux, build_rope, build_positions,
 )
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 from serenitymojo.ops.tensor_algebra import mul_scalar, add
 from serenitymojo.pipeline.zimage_generate import (
     encode_captions_fixed, gaussian_noise, _cast, _cap_seq_with_pad,
@@ -248,9 +249,13 @@ struct ZImageBackend(GenBackend, Movable):
             raise Error(
                 String("zimage: unsupported size ") + String(params.width)
                 + "x" + String(params.height)
-                + " — only 512x512 is served this phase; 1024x1024 is"
-                + " disabled pending VRAM work (Phase 4: whole-frame decode"
-                + " OOM + pool retention; SERENITYUI_TODO.md)"
+                + " — only 512x512 is served. A 3x3 overlap-blend tiled 1024"
+                + " decode (models/vae/zimage_tiled_decode.mojo, FLUX precedent)"
+                + " is implemented to fix the whole-frame decode OOM, but 1024"
+                + " stays gated pending GPU verification + the unresolved F3"
+                + " device-pool retention (the Mojo-runtime caching allocator pins the"
+                + " high-water mark; cuMemPoolTrimTo reclaims 0 — see Phase-4"
+                + " findings in SERENITYUI_TODO.md). Use 512x512."
             )
         var hl = params.height // 8
         var wl = params.width // 8
@@ -303,6 +308,20 @@ struct ZImageBackend(GenBackend, Movable):
 
     def cancel(mut self):
         self.cancel_flag = True
+
+    def between_jobs_trim(mut self) raises:
+        """F3: reclaim the per-job transient peak (Qwen3-4B encoder ~7.5 GB,
+        decode activations) back to the OS via cuMemPoolTrimTo. The resident
+        DiT + VAE decoders have live suballocations and are NOT reclaimed."""
+        var before = cu_mem_get_info()
+        self.ctx.synchronize()
+        cu_mempool_trim_current(0)
+        self.ctx.synchronize()
+        var after = cu_mem_get_info()
+        print("[zimage] between-jobs trim: used",
+              before.used_bytes() // (1024 * 1024), "->",
+              after.used_bytes() // (1024 * 1024), "MiB (reclaimed",
+              (before.used_bytes() - after.used_bytes()) // (1024 * 1024), "MiB)")
 
     # ── resident weights (DiT + both VAE grids), loaded in bounded chunks ────
     def _load_chunk(mut self) raises -> Bool:

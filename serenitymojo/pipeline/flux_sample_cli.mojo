@@ -13,9 +13,10 @@
 #            comptime block in this file or add a config-reader call.
 #
 #   argv[2]  LoRA safetensors path, or "-"/"base"/"" for base model.
-#            FLUX Dev LoRA support is not yet wired in this adapter; the value
-#            is ACCEPTED AND IGNORED.  When FLUX LoRA lands, thread it into the
-#            denoise loop via a LoRA overlay mechanism analogous to zimage_generate.
+#            HONORED: a Kohya/sd-scripts BFL FLUX LoRA (lora_unet_double_blocks_*)
+#            is applied as a runtime ADDITIVE overlay (W += scale·up@down) onto the
+#            offloaded DiT blocks at multiplier 1.0 (the saved checkpoint is never
+#            fused). Diffusers-format LoRAs are not yet supported (fail-loud).
 #
 #   argv[3]  sample_prompts JSON (serenity.sample_prompts.v1 schema).
 #            Read with `read_sample_prompt_config`.
@@ -27,14 +28,14 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Request fields honored vs fixed:
 #
-#   HONORED at runtime:
+#   HONORED at runtime (from the prompt JSON):
 #     • prompt    — runtime String threaded through T5 + CLIP encode path.
+#     • steps     — p.steps   (default 20 when unset/<=0)
+#     • guidance  — p.cfg     (default 3.5; guidance-distilled scalar fed to DiT)
+#     • seed      — p.seed    (0 is valid; default 42 only if JSON omits it)
 #
-#   FIXED at comptime (from flux1_pipeline_smoke.mojo conventions):
-#     • steps     = STEPS   (20)
-#     • guidance  = GUIDANCE (3.5, guidance-distilled scalar fed to DiT)
-#     • seed      = SEED    (UInt64(42))
-#     • width     = WIDTH   (1024)
+#   FIXED at comptime (bind the model/rope/tile shapes via generic params):
+#     • width     = WIDTH   (1024)  — a mismatched JSON size is rejected fail-loud
 #     • height    = HEIGHT  (1024)
 #
 #   UNUSED by the model:
@@ -83,7 +84,8 @@ from serenitymojo.sampling.flux1_dev import (
 )
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import add, mul, mul_scalar, reshape, permute, slice, concat
+from serenitymojo.ops.tensor_algebra import add, mul_scalar, reshape, permute
+from serenitymojo.pipeline.flux_tiled_decode import flux_tiled_decode
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.training.sample_prompt_config import (
     SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
@@ -117,10 +119,13 @@ comptime S             = N_IMG + N_TXT
 comptime TILE_H        = LATENT_H // 2               # 64 @1024²
 comptime TILE_W        = LATENT_W // 2
 
-# ── Sampler constants (comptime-fixed today; see header for rationale) ────────
-comptime STEPS    = 20
-comptime GUIDANCE = Float32(3.5)
-comptime SEED     = UInt64(42)
+# ── Sampler defaults (used when the prompt JSON leaves a field unset/<=0) ──────
+# steps / guidance / seed are now RUNTIME, read from the prompt JSON. width and
+# height stay comptime (they bind the model/rope/tile shapes via generic params),
+# so a non-1024² request is rejected fail-loud rather than silently ignored.
+comptime DEFAULT_STEPS    = 20
+comptime DEFAULT_GUIDANCE = Float32(3.5)
+comptime DEFAULT_SEED     = UInt64(42)
 comptime CLIP_LEN = 77
 comptime T5_LEN   = 512
 
@@ -174,80 +179,6 @@ def _unpack_latent(packed: Tensor, ctx: DeviceContext) raises -> Tensor:
     sp.append(LATENT_H)
     sp.append(LATENT_W)
     return reshape(tp, sp^, ctx)
-
-
-# ── feathered cross-fade weight (ramps 1→0 or 0→1 along `dim`), F32 ──────────
-# Shape [1,1,n,1] for a height(dim 2) blend, [1,1,1,n] for a width(dim 3) blend,
-# so it broadcasts over channels and the non-blend spatial axis.
-def _weight_tensor(n: Int, dim: Int, ascending: Bool, ctx: DeviceContext) raises -> Tensor:
-    var h = List[Float32]()
-    for i in range(n):
-        var t = (Float32(i) + 0.5) / Float32(n)
-        h.append(t if ascending else (1.0 - t))
-    var sh = List[Int]()
-    sh.append(1)
-    sh.append(1)
-    if dim == 2:
-        sh.append(n)
-        sh.append(1)
-    else:
-        sh.append(1)
-        sh.append(n)
-    return Tensor.from_host(h^, sh^, STDtype.F32, ctx)
-
-
-# ── cross-fade two equal-shaped overlap slabs along `dim` (left fades out) ────
-def _xfade(left: Tensor, right: Tensor, dim: Int, ctx: DeviceContext) raises -> Tensor:
-    var n = left.shape()[dim]
-    var wl = _weight_tensor(n, dim, False, ctx)
-    var wr = _weight_tensor(n, dim, True, ctx)
-    return add(mul(left, wl, ctx), mul(right, wr, ctx), ctx)
-
-
-# ── blend 3 equal tiles (size T along `dim`) placed at offsets 0, T/2, T ──────
-# Output size 2T: [pure t0 | xfade(t0,t1) | xfade(t1,t2) | pure t2].
-def _blend3(t0: Tensor, t1: Tensor, t2: Tensor, dim: Int, ctx: DeviceContext) raises -> Tensor:
-    var t = t0.shape()[dim]
-    var s = t // 2
-    var ov = t - s
-    var a = slice(t0, dim, 0, s, ctx)
-    var b = _xfade(slice(t0, dim, s, ov, ctx), slice(t1, dim, 0, ov, ctx), dim, ctx)
-    var c = _xfade(slice(t1, dim, ov, ov, ctx), slice(t2, dim, 0, ov, ctx), dim, ctx)
-    var d = slice(t2, dim, ov, s, ctx)
-    return concat(dim, ctx, a, b, c, d)
-
-
-# ── tiled VAE decode — 3x3 OVERLAPPING latent crops + feathered blend ────────
-# Decoder is instantiated once at the proven TILE shape (64² latent → 512² image,
-# the size that fits the post-DiT allocator pool) and reused for all 9 crops.
-# Crops sit at latent stride TILE/2 (positions 0/32/64) so adjacent image tiles
-# overlap by 256px; a separable feathered cross-fade (horizontal per row, then
-# vertical) erases the seams the non-overlapping 2x2 version could leave. Tile
-# vars are reassigned per row so prior tiles free → retained-memory peak stays
-# near the 2x2 working version (measured: 72²/2x2 OOM'd, 64² fits).
-def _tiled_decode(latent: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var dec = load_flux1_ldm_decoder[TILE_H, TILE_W](VAE_PATH, ctx)
-    var half = TILE_H // 2                          # 32 latent stride
-    # row 0 crop [0:64], blend its 3 columns
-    var r = slice(latent, 2, 0, TILE_H, ctx)
-    var a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    var b = cast_tensor(dec.decode(slice(r, 3, half, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    var c = cast_tensor(dec.decode(slice(r, 3, TILE_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    var row0 = _blend3(a, b, c, 3, ctx)
-    # row 1 crop [32:96] (reassign a/b/c → prior tiles freed)
-    r = slice(latent, 2, half, TILE_H, ctx)
-    a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    b = cast_tensor(dec.decode(slice(r, 3, half, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    c = cast_tensor(dec.decode(slice(r, 3, TILE_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    var row1 = _blend3(a, b, c, 3, ctx)
-    # row 2 crop [64:128]
-    r = slice(latent, 2, TILE_H, TILE_H, ctx)
-    a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    b = cast_tensor(dec.decode(slice(r, 3, half, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    c = cast_tensor(dec.decode(slice(r, 3, TILE_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
-    var row2 = _blend3(a, b, c, 3, ctx)
-    # vertical feathered blend of the 3 full-width rows
-    return _blend3(row0, row1, row2, 2, ctx)
 
 
 def _to_bf16(x: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -313,9 +244,19 @@ def encode_text(prompt: String, ctx: DeviceContext) raises -> FluxCaps:
 # (offloaded shared weights + loader + the GPU latent + rope) all drop, leaving a
 # clean GPU for the VAE decode stage (the 1024² decode needs a large contiguous
 # allocation; cross-stage residency + offload-churn fragmentation caused OOM).
-def denoise(caps: FluxCaps, ctx: DeviceContext) raises -> List[Float32]:
-    print("[dit] loading FLUX.1-dev DiT (offloaded)")
-    var model = Flux1Offloaded.load(DIT_PATH, Flux1Config.dev(), ctx)
+def denoise(
+    caps: FluxCaps, steps: Int, guidance: Float32, seed: UInt64,
+    lora_path: String, ctx: DeviceContext
+) raises -> List[Float32]:
+    var model: Flux1Offloaded
+    if lora_path != String(""):
+        print("[dit] loading FLUX.1-dev DiT (offloaded) + LoRA overlay:", lora_path)
+        model = Flux1Offloaded.load_with_lora(
+            DIT_PATH, Flux1Config.dev(), lora_path, Float32(1.0), ctx
+        )
+    else:
+        print("[dit] loading FLUX.1-dev DiT (offloaded)")
+        model = Flux1Offloaded.load(DIT_PATH, Flux1Config.dev(), ctx)
     var rope = build_flux1_rope_tables[N_IMG, N_TXT, 24, 128](
         IMG_H2, IMG_W2, ctx, STDtype.BF16
     )
@@ -326,15 +267,15 @@ def denoise(caps: FluxCaps, ctx: DeviceContext) raises -> List[Float32]:
     noise_shape.append(AE_IN_CHANNELS)
     noise_shape.append(LATENT_H)
     noise_shape.append(LATENT_W)
-    var noise_nchw = randn(noise_shape^, SEED, STDtype.F32, ctx)
+    var noise_nchw = randn(noise_shape^, seed, STDtype.F32, ctx)
     var img = _pack_latent(noise_nchw, ctx)
 
-    var sched = build_flux1_sigma_schedule(STEPS, N_IMG)
-    print("[denoise]", STEPS, "steps, guidance", GUIDANCE, "seed", SEED)
-    for i in range(STEPS):
+    var sched = build_flux1_sigma_schedule(steps, N_IMG)
+    print("[denoise]", steps, "steps, guidance", guidance, "seed", seed)
+    for i in range(steps):
         var t_curr = sched[i]
         var t_prev = sched[i + 1]
-        print("  step", i + 1, "/", STEPS, "t_curr", t_curr, "->", t_prev)
+        print("  step", i + 1, "/", steps, "t_curr", t_curr, "->", t_prev)
         # t_vec / guidance_vec pre-scaled by 1000 (BFL time_factor convention;
         # the foundation t_embedder does NOT apply the 1000x internally).
         var tvals = List[Float32]()
@@ -344,7 +285,7 @@ def denoise(caps: FluxCaps, ctx: DeviceContext) raises -> List[Float32]:
         var t_vec = Tensor.from_host(tvals, tsh^, STDtype.F32, ctx)
 
         var gvals = List[Float32]()
-        gvals.append(GUIDANCE * 1000.0)
+        gvals.append(guidance * 1000.0)
         var gsh = List[Int]()
         gsh.append(1)
         var g_vec = Tensor.from_host(gvals, gsh^, STDtype.F32, ctx)
@@ -382,6 +323,7 @@ def _select_prompt(sample_cfg: SamplePromptConfig, wanted: String) raises -> Sam
 def _load_prompt_json(
     path: String, wanted: String,
     mut prompt: String, mut negative: String,
+    mut steps: Int, mut guidance: Float32, mut seed: UInt64,
 ) raises:
     var sample_cfg = read_sample_prompt_config(path)
     var p = _select_prompt(sample_cfg, wanted)
@@ -389,13 +331,26 @@ def _load_prompt_json(
         raise Error("flux_sample_cli: only image prompts (frames=1) are supported")
     prompt = p.prompt.copy()
     negative = p.negative.copy()
-    # steps/cfg/seed/width/height are comptime-fixed today; log what the JSON
-    # requested so the caller knows what was ignored.
+
+    # steps / guidance / seed are now HONORED at runtime (defaults when unset/<=0).
+    steps = p.steps if p.steps > 0 else DEFAULT_STEPS
+    guidance = p.cfg if p.cfg > Float32(0.0) else DEFAULT_GUIDANCE
+    seed = p.seed                       # 0 is a valid seed; honored as-is
+
+    # width/height bind the model/rope/tile shapes via comptime generic params,
+    # so only the comptime size is buildable here. Reject a mismatched request
+    # fail-loud rather than silently render a different size than asked.
+    if p.width > 0 and (p.width != WIDTH or p.height != HEIGHT):
+        raise Error(
+            String("flux_sample_cli: this build is fixed at ")
+            + String(WIDTH) + "x" + String(HEIGHT)
+            + " but the prompt requests " + String(p.width) + "x" + String(p.height)
+            + " (rebuild with WIDTH/HEIGHT changed to render other sizes)"
+        )
     print(
-        "  [info] sample prompt requests steps=", p.steps, "guidance=", p.cfg,
-        "seed=", p.seed, "size=", p.width, "x", p.height,
-        "→ all ignored (comptime fixed); prompt honored (real CLIP+T5 tokenization),",
-        "negative discarded (FLUX Dev is guidance-distilled, no CFG).",
+        "  [info] steps=", steps, "guidance=", guidance, "seed=", seed,
+        "size=", WIDTH, "x", HEIGHT, "(honored); negative discarded",
+        "(FLUX Dev is guidance-distilled, no CFG).",
     )
 
 
@@ -423,7 +378,7 @@ def main() raises:
     var _lora_path = String("")
     if lora_raw != String("-") and lora_raw != String("base") and lora_raw != String(""):
         _lora_path = lora_raw
-        print("[lora] path provided but ignored (FLUX Dev LoRA not yet wired):", _lora_path)
+        print("[lora] Kohya-BFL LoRA overlay enabled (multiplier 1.0):", _lora_path)
 
     # argv[3]: sample prompts JSON
     var prompts_json = String(a[3])
@@ -434,10 +389,13 @@ def main() raises:
     # argv[5]: output PNG
     var out_png = String(a[5])
 
-    # Load prompt + negative from the JSON.
+    # Load prompt + negative + sampler params from the JSON.
     var prompt = String("")
     var negative = String("")
-    _load_prompt_json(prompts_json, prompt_id, prompt, negative)
+    var steps = DEFAULT_STEPS
+    var guidance = DEFAULT_GUIDANCE
+    var seed = DEFAULT_SEED
+    _load_prompt_json(prompts_json, prompt_id, prompt, negative, steps, guidance, seed)
 
     print("=== FLUX Dev sample CLI ===")
     print("  prompts:", prompts_json, " id:", prompt_id)
@@ -454,7 +412,7 @@ def main() raises:
     # Denoise (STEPS/GUIDANCE/SEED are comptime-fixed; see file header).
     # Returns the packed latent on HOST → the DiT stage's GPU is freed here,
     # giving the VAE decode a clean GPU (staged loading).
-    var packed_h = denoise(caps, ctx)
+    var packed_h = denoise(caps, steps, guidance, seed, _lora_path, ctx)
 
     # VAE decode (fresh GPU stage, TILED). Re-upload the host latent [1, N_IMG, 64].
     print("[vae] unpack + tiled decode (3x3 overlap+blend)")
@@ -464,7 +422,7 @@ def main() raises:
     psh.append(AE_IN_CHANNELS * 4)
     var packed = Tensor.from_host(packed_h, psh^, STDtype.F32, ctx)
     var latent = _unpack_latent(packed, ctx)
-    var img = _tiled_decode(latent, ctx)
+    var img = flux_tiled_decode[LATENT_H, LATENT_W](latent, VAE_PATH, ctx)
     var sh = img.shape()
     print("  image shape:", sh[0], sh[1], sh[2], sh[3])
 

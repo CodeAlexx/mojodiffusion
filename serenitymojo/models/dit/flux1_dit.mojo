@@ -59,6 +59,9 @@ from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.embeddings import t_embedder
 from serenitymojo.ops.tensor_algebra import reshape, slice, concat, add
 from serenitymojo.offload.block_loader import BlockLoader, Block, unload_block
+from serenitymojo.models.flux.flux_lora_overlay import (
+    FluxLoraOverlay, load_flux_kohya_lora,
+)
 
 
 @fieldwise_init
@@ -560,12 +563,27 @@ def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 struct Flux1Offloaded(Movable):
     var shared: Flux1DiT
     var loader: BlockLoader
+    var lora: FluxLoraOverlay   # EMPTY for base; populated by load_with_lora
 
     @staticmethod
     def load(path: String, config: Flux1Config, ctx: DeviceContext) raises -> Flux1Offloaded:
         var shared = Flux1DiT.load_shared(path, config, ctx)
         var loader = BlockLoader.open(path)
-        return Flux1Offloaded(shared^, loader^)
+        return Flux1Offloaded(shared^, loader^, FluxLoraOverlay.empty())
+
+    # Same as load(), plus an additive Kohya-BFL LoRA overlay (W += scale·up@down,
+    # added onto streamed blocks at inference; the saved checkpoint is untouched).
+    @staticmethod
+    def load_with_lora(
+        path: String, config: Flux1Config, lora_path: String,
+        multiplier: Float32, ctx: DeviceContext,
+    ) raises -> Flux1Offloaded:
+        var shared = Flux1DiT.load_shared(path, config, ctx)
+        var loader = BlockLoader.open(path)
+        var lora = load_flux_kohya_lora(
+            lora_path, config.num_double, config.num_single, multiplier, ctx
+        )
+        return Flux1Offloaded(shared^, loader^, lora^)
 
     # Build a transient Flux1DiT whose weight table includes the streamed block.
     def _block_model(self, block: Block) -> Flux1DiT:
@@ -574,6 +592,20 @@ struct Flux1Offloaded(Movable):
         for ref e in block.items():
             name_to_idx[e.key] = len(weights)
             weights.append(e.value)
+        return Flux1DiT(weights^, name_to_idx^, self.shared.config)
+
+    # LoRA-aware variant: where a streamed block weight has a matching overlay,
+    # append (base + scale·up@down) instead of the bare base weight.
+    def _block_model_lora(self, block: Block, ctx: DeviceContext) raises -> Flux1DiT:
+        var weights = self.shared.weights.copy()
+        var name_to_idx = self.shared.name_to_idx.copy()
+        for ref e in block.items():
+            name_to_idx[e.key] = len(weights)
+            if self.lora.has(e.key):
+                var ov = self.lora.overlaid(e.value[], e.key, ctx)
+                weights.append(ArcPointer(ov^))
+            else:
+                weights.append(e.value)
         return Flux1DiT(weights^, name_to_idx^, self.shared.config)
 
     # forward: img [1,N_IMG,64], txt [1,N_TXT,4096], timestep [1] (already *1000
@@ -617,7 +649,7 @@ struct Flux1Offloaded(Movable):
             var prefix = String("double_blocks.") + String(bi)
             self.loader.prefetch_block(prefix)
             var block = self.loader.load_block(prefix, ctx)
-            var bm = self._block_model(block)
+            var bm = self._block_model(block) if self.lora.count() == 0 else self._block_model_lora(block, ctx)
             var vec_silu = silu(vec, ctx)
             var img_mod = linear(
                 vec_silu,
@@ -644,7 +676,7 @@ struct Flux1Offloaded(Movable):
             var prefix = String("single_blocks.") + String(bi)
             self.loader.prefetch_block(prefix)
             var block = self.loader.load_block(prefix, ctx)
-            var bm = self._block_model(block)
+            var bm = self._block_model(block) if self.lora.count() == 0 else self._block_model_lora(block, ctx)
             var vec_silu = silu(vec, ctx)
             var single_mod = linear(
                 vec_silu,

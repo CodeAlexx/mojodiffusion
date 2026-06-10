@@ -20,6 +20,8 @@ implementation on byte-identical inputs. **All six gates pass.**
 | D-T5 | T5-XXL encoder | HF `T5EncoderModel`, real `t5xxl_fp16` | cosine | **0.99920** (no NaN) | ≥0.99 |
 | D-CLIP | CLIP-L pooled | HF `CLIPTextModel`, real `clip_l` | cosine | **0.99999** | ≥0.99 |
 | C  | Full 20-step denoise integration | BFL `Flux` × 20 Euler | cosine (final latent) | **0.99969** | ≥0.99 |
+| Seam | Tiled VAE decode (3×3 overlap+blend) vs seamless full-1024² | torch BFL-AE | PSNR / worst-row | **58.6 dB**, worst-row MAD 0.0045 (no seam spike) | report |
+| B-LoRA | DiT forward + Kohya-BFL LoRA overlay | BFL `Flux` + applied delta | cosine | **0.99937** | ≥0.99 |
 
 Conclusion: the Mojo FLUX pipeline is **numerically faithful** to BFL+HF at every
 stage. The DiT and VAE match at exact-level (>0.999 / 88 dB); the T5 fix is
@@ -96,16 +98,32 @@ pixi run mojo run -I . -Xlinker -lcuda serenitymojo/models/flux/parity/flux_deno
 
 ---
 
+## Follow-up handoff items — DONE (2026-06-09, second pass)
+
+- **Tile-seam A/B** ✅ — `flux_tiled_decode` extracted to a shared module (CLI +
+  gate run ONE code path); tiled 1024² vs seamless full-1024² torch decode =
+  **58.6 dB**, worst-row MAD 0.0045 (~1.5× global, not a seam). Effectively
+  seamless. Gate: `serenitymojo/vae/parity/flux_tiled_decode_parity.mojo`.
+- **JSON-driven sampler params** ✅ — `flux_sample_cli` now honors steps /
+  guidance / seed from the prompt JSON at runtime (defaults when unset);
+  width/height stay comptime and a mismatched size is rejected fail-loud.
+  Verified: a JSON with steps=3/cfg=2.0/seed=123 ran 3 steps with those values.
+- **FLUX LoRA at inference** ✅ — runtime ADDITIVE overlay (never fused):
+  `flux_lora_overlay.mojo` + `Flux1Offloaded.load_with_lora`. Kohya/sd-scripts
+  BFL format (`lora_unet_double_blocks_*`); 304 targets loaded; A/B image diff
+  14.9/255 mean (90% of pixels changed); and **numerically verified**: DiT
+  forward + overlay vs torch BFL+LoRA = **cos 0.99937** (gate B-LoRA). Diffusers-
+  format LoRAs are rejected fail-loud (not yet mapped).
+
 ## NOT covered / honest scope
 
-1. **Tile-seam A/B** — Gate A proves the per-tile decoder is exact (88 dB), but
-   the 3×3 overlap+blend assembly was NOT A/B'd against a single full-1024²
-   torch decode (that decode is feasible in torch; the Mojo one OOMs). Seam
-   blend remains "structurally correct, not numerically A/B'd."
-2. **Tokenizer parity** — the gates feed identical *ids* to isolate the
+1. **Tokenizer parity** — the gates feed identical *ids* to isolate the
    encoders; CLIP/T5 tokenizers are claimed bit-exact elsewhere, not re-checked
    here.
-3. **Full-resolution (4096-token) DiT** — verified at a tiny grid (the DiT is
+2. **Full-resolution (4096-token) DiT** — verified at a tiny grid (the DiT is
    resolution-agnostic, so this is sound) but not at the production 1024² grid.
-4. **FLUX LoRA at inference** — still unwired (handoff item #2).
-5. **JSON-driven sampler params** — still comptime-fixed (handoff item #3).
+3. **Diffusers-format FLUX LoRA** — the overlay supports the Kohya BFL key
+   scheme; diffusers `transformer.*.lora_A/lora_B` (q/k/v split + remap) is
+   rejected fail-loud, not yet supported.
+4. **LoRA multiplier** — fixed at 1.0 in the CLI (the overlay takes a multiplier
+   arg; not yet surfaced as a CLI/JSON field).

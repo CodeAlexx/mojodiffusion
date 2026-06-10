@@ -1902,21 +1902,24 @@ def run_staged(
 #   s{1,2}_stp{NN}_{video,audio} (SDE noises, post-_get_new_noise
 #   normalization, in consumption order). Pass "-" for production Mojo randn.
 # ════════════════════════════════════════════════════════════════════════════
-# Production target 768x512 @ 121 frames (stage-1 = half res per the reference
-# two-stage recipe). The 384x256/17f parity shapes this mode was gated at are
-# recoverable by reverting this block (parity dumps preserved under
-# output/ltx2_refhq_parity/).
+# Production target 1024x576 @ 121 frames (stage-1 = half res per the reference
+# two-stage recipe). MEASURED 2026-06-10: at 768x512 the OFFICIAL pipeline
+# produces the same soft-video/static-audio class as Mojo (audio rms 0.033 vs
+# 0.039) — the gap to the quality bar is the recipe OPERATING POINT (the HQ
+# recipe is designed for 1920x1088 final), not Mojo fidelity. Stepping up.
+# The 384x256/17f parity shapes this mode was gated at are recoverable by
+# reverting this block (parity dumps preserved under output/ltx2_refhq_parity/).
 comptime REFHQ_NUM_FRAMES = 121
 comptime REFHQ_FPS = Float64(25.0)
 comptime REFHQ_NF = 16           # (121-1)//8 + 1
-comptime REFHQ_NH1 = 8           # 256/32 (stage-1 height 512/2)
-comptime REFHQ_NW1 = 12          # 384/32 (stage-1 width 768/2)
-comptime REFHQ_S_V1 = REFHQ_NF * REFHQ_NH1 * REFHQ_NW1   # 1536
+comptime REFHQ_NH1 = 9           # 288/32 (stage-1 height 576/2)
+comptime REFHQ_NW1 = 16          # 512/32 (stage-1 width 1024/2)
+comptime REFHQ_S_V1 = REFHQ_NF * REFHQ_NH1 * REFHQ_NW1   # 2304
 comptime REFHQ_S_A = 121         # round(121/25*25)
-comptime REFHQ_NH2 = 16          # 512/32
-comptime REFHQ_NW2 = 24          # 768/32
-comptime REFHQ_S_V2 = REFHQ_NF * REFHQ_NH2 * REFHQ_NW2   # 6144
-comptime REFHQ_SPAD = 6144       # max(S_V*, N_TXT=1024, S_A)
+comptime REFHQ_NH2 = 18          # 576/32
+comptime REFHQ_NW2 = 32          # 1024/32
+comptime REFHQ_S_V2 = REFHQ_NF * REFHQ_NH2 * REFHQ_NW2   # 9216
+comptime REFHQ_SPAD = 9216       # max(S_V*, N_TXT=1024, S_A)
 comptime REFHQ_STEPS = 15
 # HQ guider params (ltx_pipelines/utils/constants.py LTX_2_3_HQ_PARAMS)
 comptime REFHQ_V_CFG = Float32(3.0)

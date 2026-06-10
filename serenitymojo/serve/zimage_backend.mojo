@@ -39,6 +39,7 @@ from std.memory import alloc, ArcPointer
 
 from image.buffer import Image
 from image.png import encode_png_with_text
+from image.transform import resize_bilinear
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -46,6 +47,9 @@ from serenitymojo.io.ffi import BytePtr
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.image.png import _quantize, ValueRange
 from serenitymojo.models.vae.zimage_decoder import ZImageDecoder
+from serenitymojo.models.vae.zimage_encoder import (
+    ZImageVaeEncoder, ZIMG_SCALING, ZIMG_SHIFT,
+)
 from serenitymojo.models.zimage.weights import (
     ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
 )
@@ -66,6 +70,7 @@ from serenitymojo.pipeline.zimage_generate import (
     NUM_NR, NUM_CR, MAIN_DEPTH, RANK, ALPHA,
 )
 from serenitymojo.serve.backend import GenBackend, JobParams, StepResult
+from serenitymojo.serve.image_io import decode_image_any, image_to_signed_nchw
 from serenitymojo.serve.model_scan import LORAS_DIR
 
 comptime TArc = ArcPointer[Tensor]
@@ -276,6 +281,14 @@ struct ZImageBackend(GenBackend, Movable):
                     + " (tried as a path and under " + LORAS_DIR + ")"
                 )
             lora_mult = Float32(params.loras[0].weight)
+        # P7 img2img: validate the init image up front (fail at admission,
+        # not mid-job). Decodability is checked at ENCODE time (decode raises
+        # a clear error that fails the job through the step() except path).
+        if params.init_image.byte_length() > 0:
+            if not _path_exists(params.init_image):
+                raise Error(
+                    String("zimage: init image not found: ") + params.init_image
+                )
         self.params = params.copy()
         self.hl = hl
         self.wl = wl
@@ -453,17 +466,75 @@ struct ZImageBackend(GenBackend, Movable):
 
         # seeded initial latent (verbatim noise math), kept BF16 at the boundary.
         var noise = gaussian_noise(16 * self.hl * self.wl, UInt64(self.params.seed))
+        self.sigmas = _build_sigmas(self.params.steps)
+        var lat_host = noise.copy()  # txt2img default: x = noise (sigma0 = 1.0)
+        if self.params.init_image.byte_length() > 0:
+            # ── P7 img2img (rectified-flow forward-noising convention) ──
+            # EXACT FORMULA (reference citations):
+            #   z      = (mu - VAE_SHIFT) * VAE_SCALE
+            #            = (encode_mean(init) - 0.1159) * 0.3611
+            #            (training/train_zimage_real.mojo:540)
+            #   sigma0 = sigmas[i0], i0 = smallest index with
+            #            sigmas[i0] <= creativity — "start the loop at the
+            #            step whose sigma ~= creativity" on the FlowMatchEuler
+            #            shift=6.0 schedule (pipeline/zimage_generate.mojo
+            #            _build_sigmas; sigmas[0]=1.0 .. sigmas[steps]=0.0)
+            #   x0     = sigma0 * noise + (1 - sigma0) * z
+            #            (training/train_zimage_real.mojo:541 —
+            #             noisy = noise*sig + lat*(1-sig))
+            #   denoise starts at step i0 (self.cur = i0); creativity 1.0
+            #   degenerates to txt2img (i0=0, x0 = noise), creativity 0.0 to
+            #   a VAE round-trip (i0=steps, no denoise).
+            var z = self._encode_init_latent()
+            if len(z) != len(lat_host):
+                raise Error("zimage img2img: init latent size mismatch")
+            var i0 = 0
+            var creat = Float32(self.params.creativity)
+            while i0 < self.params.steps and self.sigmas[i0] > creat:
+                i0 += 1
+            var sig0 = self.sigmas[i0]
+            for i in range(len(lat_host)):
+                lat_host[i] = sig0 * noise[i] + (Float32(1.0) - sig0) * z[i]
+            self.cur = i0
+            print(
+                "[zimage][img2img] creativity", self.params.creativity,
+                "-> start step", i0, "/", self.params.steps,
+                "( sigma0 =", sig0, ")",
+            )
         var nshape = [1, 16, self.hl, self.wl]
         self.latent = List[TArc]()
         self.latent.append(
-            TArc(Tensor.from_host(noise, nshape^, STDtype.BF16, self.ctx))
+            TArc(Tensor.from_host(lat_host, nshape^, STDtype.BF16, self.ctx))
         )
-        self.sigmas = _build_sigmas(self.params.steps)
         print(
             "[zimage] job", self.params.job_id, ":", self.params.steps,
             "steps, cfg", self.cfg, "seed", self.params.seed,
             "size", self.params.width, "x", self.params.height,
         )
+
+    def _encode_init_latent(mut self) raises -> List[Float32]:
+        """P7: decode the init image (MOJO-libs png/jpeg/webp), resize to the
+        job WxH (bilinear), [-1,1] RGB NCHW, encode via the Z-Image VAE
+        ENCODER (encode_mean — the verified trainer path), then rescale into
+        diffusion latent space: z = (mu - VAE_SHIFT) * VAE_SCALE
+        (training/train_zimage_real.mojo:540). The encoder is loaded per job
+        and freed on return (VRAM headroom beside the resident DiT)."""
+        var img = decode_image_any(self.params.init_image)
+        var resized = resize_bilinear(img, self.params.width, self.params.height)
+        var host = image_to_signed_nchw(resized)
+        var ishape = [1, 3, self.params.height, self.params.width]
+        var image_t = Tensor.from_host(host, ishape^, STDtype.BF16, self.ctx)
+        print("[zimage][img2img] init image", self.params.init_image,
+              "(", img.width, "x", img.height, ") -> VAE encode_mean")
+        # 512x512 only this phase (enforced in start()): the 64-latent grid.
+        var enc = ZImageVaeEncoder[64, 64].load(String(VAE_DIR), self.ctx)
+        var mu = enc.encode_mean(image_t, self.ctx)
+        var mu_h = mu.to_host(self.ctx)
+        var z = List[Float32](capacity=len(mu_h))
+        for i in range(len(mu_h)):
+            z.append((mu_h[i] - ZIMG_SHIFT) * ZIMG_SCALING)
+        _print_vram("after init-image encode (encoder freed on return)")
+        return z^
 
     # ── one denoise step (CFG dual forward + Euler), comptime grid ───────────
     def _denoise_one[HL: Int, WL: Int](mut self) raises:
@@ -580,6 +651,12 @@ struct ZImageBackend(GenBackend, Movable):
                 r.step = 0
                 return r^
             if self.phase == PHASE_DENOISE:
+                if self.cur >= self.params.steps:
+                    # img2img with creativity 0.0: i0 == steps — no denoise
+                    # steps remain (pure VAE round-trip); go straight to decode.
+                    self.phase = PHASE_DECODE
+                    r.step = self.cur
+                    return r^
                 if self.hl == 64:
                     self._denoise_one[64, 64]()
                 else:

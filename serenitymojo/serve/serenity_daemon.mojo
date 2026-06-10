@@ -228,6 +228,10 @@ def parse_generate(
     if p.prompt == "":
         raise Error("'prompt' must be non-empty")
     p.model = _opt_str(obj, "model", default_model)
+    # P9/P10: the UI resolves prompt syntax at submit; `prompt` is already the
+    # RESOLVED text and `prompt_raw` (the original, with syntax) is a
+    # passthrough field persisted for reuse-params.
+    var prompt_raw = _opt_str(obj, "prompt_raw", String(""))
     p.negative = _opt_str(obj, "negative", String(""))
     p.width = _opt_int(obj, "width", 512, 16, 2048)
     p.height = _opt_int(obj, "height", 512, 16, 2048)
@@ -243,6 +247,10 @@ def parse_generate(
     var variation_seed = _opt_int(obj, "variation_seed", 0, 0, 4294967295)
     var variation_strength = _opt_num(obj, "variation_strength", 0.0, 0.0, 1.0)
     var images = _opt_int(obj, "images", 1, 1, 64)
+    # P7 img2img: init image path + creativity (0..1). The backend decides
+    # whether/how to honor them (stub echoes; zimage does real img2img).
+    p.init_image = _opt_str(obj, "init_image", String(""))
+    p.creativity = _opt_num(obj, "creativity", 0.5, 0.0, 1.0)
     if obj.contains("lora") and not obj["lora"].is_null():
         var arr = obj["lora"]
         if not arr.is_array():
@@ -264,6 +272,7 @@ def parse_generate(
     o.set("job_id", JSONValue.from_string(p.job_id))
     o.set("model", JSONValue.from_string(p.model))
     o.set("prompt", JSONValue.from_string(p.prompt))
+    o.set("prompt_raw", JSONValue.from_string(prompt_raw))
     o.set("negative", JSONValue.from_string(p.negative))
     o.set("width", JSONValue.from_int(p.width))
     o.set("height", JSONValue.from_int(p.height))
@@ -275,6 +284,8 @@ def parse_generate(
     o.set("variation_seed", JSONValue.from_int(variation_seed))
     o.set("variation_strength", JSONValue.from_float(variation_strength))
     o.set("images", JSONValue.from_int(images))
+    o.set("init_image", JSONValue.from_string(p.init_image))
+    o.set("creativity", JSONValue.from_float(p.creativity))
     var la = JSONValue.new_array()
     for i in range(len(p.loras)):
         var lo = JSONValue.new_object()

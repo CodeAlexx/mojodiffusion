@@ -52,6 +52,9 @@ struct JobParams(Copyable, Movable):
     var steps: Int
     var seed: Int
     var cfg: Float64
+    var init_image: String   # P7 img2img: init image path ("" = txt2img)
+    var creativity: Float64  # P7: 0..1 — fraction of the sigma schedule the
+                             # denoise starts from (1.0 = pure noise/txt2img)
     var loras: List[LoraSpec]
     var params_json: String  # canonical full-request JSON (persisted verbatim)
     var out_dir: String      # where the backend writes <job_id>.png (+ sidecar)
@@ -66,6 +69,8 @@ struct JobParams(Copyable, Movable):
         self.steps = 20
         self.seed = 0
         self.cfg = 4.5
+        self.init_image = String("")
+        self.creativity = 0.5
         self.loras = List[LoraSpec]()
         self.params_json = String("")
         self.out_dir = String("")

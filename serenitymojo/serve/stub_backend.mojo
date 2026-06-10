@@ -23,12 +23,18 @@ def _render_stub_png(p: JobParams, path: String, params_json: String) raises:
     var dw = p.width - 1 if p.width > 1 else 1
     var dh = p.height - 1 if p.height > 1 else 1
     var s = p.seed if p.seed >= 0 else -p.seed
+    # P7 stub echo: an init-image job tints the gradient by creativity so the
+    # img2img params are VISIBLE end-to-end (blue plane = 255*creativity).
+    var img2img = p.init_image.byte_length() > 0
+    var tint_b = Int(p.creativity * 255.0)
     for y in range(p.height):
         for x in range(p.width):
             var r = (x * 255) // dw
             var g = (y * 255) // dh
             var stripe = ((x + y) // 16 + s) % 3
             var b = 40 + stripe * 80 + (s % 16)
+            if img2img:
+                b = tint_b
             if b > 255:
                 b = 255
             img.set(x, y, 0, UInt8(r & 0xFF))

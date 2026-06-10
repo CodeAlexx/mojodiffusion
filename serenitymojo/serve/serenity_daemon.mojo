@@ -234,6 +234,15 @@ def parse_generate(
     p.steps = _opt_int(obj, "steps", 20, 1, 500)
     p.seed = _opt_int(obj, "seed", 0, 0, 4294967295)
     p.cfg = _opt_num(obj, "cfg", 4.5, 0.0, 50.0)
+    # Phase-2 genparams passthrough (plan H1): the backend ignores these today,
+    # but they MUST survive into params_json (PNG tEXt + jobs.db) so the UI's
+    # reuse-params restores ALL fields (P15) and the UI-state JSON == the
+    # daemon-recorded JSON except server-added job_id (gate G2f).
+    var sampler = _opt_str(obj, "sampler", String(""))
+    var scheduler = _opt_str(obj, "scheduler", String(""))
+    var variation_seed = _opt_int(obj, "variation_seed", 0, 0, 4294967295)
+    var variation_strength = _opt_num(obj, "variation_strength", 0.0, 0.0, 1.0)
+    var images = _opt_int(obj, "images", 1, 1, 64)
     if obj.contains("lora") and not obj["lora"].is_null():
         var arr = obj["lora"]
         if not arr.is_array():
@@ -248,7 +257,10 @@ def parse_generate(
             p.loras.append(LoraSpec(ent["name"].as_string(), w))
 
     # canonical full-param JSON: persisted to the sidecar + jobs.db
+    # (key order mirrors the UI's serenity.genparams.v1 emitter, with the
+    # server-added job_id second after schema)
     var o = JSONValue.new_object()
+    o.set("schema", JSONValue.from_string(String("serenity.genparams.v1")))
     o.set("job_id", JSONValue.from_string(p.job_id))
     o.set("model", JSONValue.from_string(p.model))
     o.set("prompt", JSONValue.from_string(p.prompt))
@@ -258,6 +270,11 @@ def parse_generate(
     o.set("steps", JSONValue.from_int(p.steps))
     o.set("seed", JSONValue.from_int(p.seed))
     o.set("cfg", JSONValue.from_float(p.cfg))
+    o.set("sampler", JSONValue.from_string(sampler))
+    o.set("scheduler", JSONValue.from_string(scheduler))
+    o.set("variation_seed", JSONValue.from_int(variation_seed))
+    o.set("variation_strength", JSONValue.from_float(variation_strength))
+    o.set("images", JSONValue.from_int(images))
     var la = JSONValue.new_array()
     for i in range(len(p.loras)):
         var lo = JSONValue.new_object()

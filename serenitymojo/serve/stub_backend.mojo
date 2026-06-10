@@ -4,20 +4,20 @@
 # single-threaded daemon stays responsive between ticks), then renders a real
 # PNG via the MOJO-libs image lib: a seed-driven gradient with a stripe
 # overlay, saved to <out_dir>/<job_id>.png. The MOJO-libs PNG encoder has no
-# tEXt-chunk support, so the job's full param JSON goes into a sidecar
-# <out_dir>/<job_id>.json instead (see backend.mojo header).
+# tEXt-chunk support landed in MOJO-libs png (2026-06-10, PIL-gated):
+# the job's full param JSON is embedded as a serenity.genparams.v1 tEXt chunk.
 
 from std.time import sleep
 
 from image.buffer import Image
-from image.png import encode_png
+from image.png import encode_png_with_text
 
 from serenitymojo.serve.backend import GenBackend, JobParams, StepResult
 
 comptime STEP_SLEEP_S = 0.1  # simulated per-step latency
 
 
-def _render_stub_png(p: JobParams, path: String) raises:
+def _render_stub_png(p: JobParams, path: String, params_json: String) raises:
     """A deterministic seed-driven gradient + stripes — a real, decodable PNG."""
     var img = Image.new(p.width, p.height, 3)
     var dw = p.width - 1 if p.width > 1 else 1
@@ -43,7 +43,11 @@ def _render_stub_png(p: JobParams, path: String) raises:
             img.set(x, p.height - 1 - t, 0, 255)
             img.set(x, p.height - 1 - t, 1, 255)
             img.set(x, p.height - 1 - t, 2, 255)
-    encode_png(img, path)
+    var kws = List[String]()
+    var vals = List[String]()
+    kws.append(String("serenity.genparams.v1"))
+    vals.append(params_json.copy())
+    encode_png_with_text(img, path, kws, vals)
 
 
 struct StubBackend(GenBackend, Movable):
@@ -92,13 +96,12 @@ struct StubBackend(GenBackend, Movable):
         r.step = self.cur
         if self.cur < self.params.steps:
             return r^
-        # final step: produce the output image + param sidecar
+        # final step: produce the output image; gen params ride a PNG tEXt
+        # chunk (serenity.genparams.v1) — MOJO-libs png now supports tEXt
+        # (gated vs PIL 2026-06-10), so the sidecar JSON is gone.
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
-        var json_path = self.params.out_dir + "/" + self.params.job_id + ".json"
         try:
-            _render_stub_png(self.params, png_path)
-            with open(json_path, "w") as f:
-                f.write(self.params.params_json)
+            _render_stub_png(self.params, png_path, self.params.params_json)
         except e:
             self.active = False
             r.failed = True

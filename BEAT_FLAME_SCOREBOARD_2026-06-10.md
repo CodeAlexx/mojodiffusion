@@ -84,6 +84,28 @@ G-X3 PROMPT: all sidecar/prompt-blind models FULL prompt-driven (wire verified
   faithful translate + output diff.
 
 ## Log (newest first)
+- 2026-06-11 (session 4, later): **cuDNN FLASH SDPA SHIPPED AS AN OP — 35-43x
+  over math-mode, ALL gates PASS (numerics sign-off granted: "do both, I
+  approve").** flame shim port (ops/cshim/, byte-copied cudnn_sdpa{,_bwd}
+  .cpp -> libserenity_cudnn_sdpa.so) + ops/attention_flash.mojo
+  ([B,S,H,Dh] stride bridge, 128-pad + real_N masks). GATES
+  (ops/tests/sdpa_flash_parity.mojo): flash-vs-math cos >= 0.9999967,
+  max_abs <= 1 bf16 quantum; F32-referee rms flash <= 1.41x math (bar
+  1.5x); fwd+bwd klein 100.7->2.34 ms, zimage B1 62.0->1.75 ms, B2
+  125.1->3.47 ms. GOTCHA: ~/.local pip cuDNN 9.10.2 works; the
+  .venv_cache wheel's engines_precompiled is a different build and fails
+  "No valid execution plans" — keep ~/.local/...cudnn/lib on
+  LD_LIBRARY_PATH. NEXT: trainer wiring (graph OPK arm saves O+Stats;
+  klein helpers) + RE-ANCHOR; capture-compat = HYPOTHESIS until smoked.
+- 2026-06-11 (session 4, later): **P7 GROUNDWORK GATED-OFF — 24 GB wall
+  MEASURED.** B-param zimage block graph + B2 slab backward + B=2 sdpa
+  dispatch buckets (commit 2cac660, flag ZIMAGE_V2_GRAPH_B2=False). The b2
+  hand-chain baseline alone peaks 23.4/24 GB; ScratchRingAllocator is EAGER
+  (all rings in __init__) so the bwd slab double-reserves over the pool-fed
+  b2 forward -> CUDA OOM at 19 and 17 rings (peaks 23.1 GB). Unblock: flash
+  SDPA wiring (kills ~374 MB/block score buffers), then slab-route the B2
+  forward. B1 unaffected: b1match/b1match2/b2dup byte-identical with the
+  new code compiled in.
 - 2026-06-11 (session 4, mid-day): **P6 — KLEIN GRAPH BACKWARD SHIPPED,
   2.5-2.6 → 2.2-2.4 s/step.** The overnight session wrote it but died
   (disk hit 100%, 12 GB free) before running gates; verified this

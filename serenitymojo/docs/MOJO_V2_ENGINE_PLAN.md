@@ -165,7 +165,29 @@ needs the step-slab first). Step-slab: extend scratch_ring.mojo (already
 the OT StaticLayerAllocator two-cursor shape, RING_ALLOC_DESIGN.md) under
 the per-op buffers.
 
-### Phase F — kernel-time work (separate workstream, needs sign-off)
+### Phase F — kernel-time work (SIGN-OFF GRANTED 2026-06-11; flash op SHIPPED)
+**2026-06-11 (mid-day session 4): Alex approved the numerics change ("do
+both, I approve"). cuDNN v9 flash SDPA fwd+bwd SHIPPED as an op (commit
+69a398e): ops/attention_flash.mojo + ops/cshim/ shim (flame cudnn_sdpa
+.cpp byte-copies). GATES ALL PASS (ops/tests/sdpa_flash_parity.mojo):
+flash-vs-math cos >= 0.9999967 / max_abs <= 1 bf16 quantum; F32-referee
+rms flash <= 1.41x math (bar 1.5x); speed fwd+bwd 35-43x (klein
+100.7->2.34 ms, zimage B1 62.0->1.75, B2 125.1->3.47). Runtime needs
+~/.local pip cuDNN lib dir on LD_LIBRARY_PATH (the .venv_cache wheel's
+engines lib is bad — "No valid execution plans"). REMAINING: trainer
+wiring (graph OPK_SDPA_FLASH arm saving O+Stats; klein helpers) behind
+per-trainer flags + RE-ANCHOR (bit-anchors die by design, approved);
+capture-compat of cudnn execute = HYPOTHESIS until smoked.**
+
+**P7 status (same session): groundwork SHIPPED GATED-OFF (commit
+2cac660) — B-param block graph + B2 slab backward + sdpa B2 dispatch
+buckets. MEASURED BLOCKER: b2 hand-chain already peaks 23.4/24 GB;
+ScratchRingAllocator is EAGER (all rings in __init__), so the bwd slab
+double-reserves over the pool-based b2 forward -> OOM. Unblock order:
+flash SDPA wiring first (kills the ~374 MB/block score buffers), then
+slab-route the B2 forward (_v5-for-B2 + StepIO + capture). B1 gates
+with the new code compiled: b1match/b1match2/b2dup all byte-identical.**
+
 After the engine work, the wall is kernel time (Z-Image B1: GEMMs ~0.6 s,
 SDPA math-mode ~0.31-0.37 s, tensor_algebra ~0.19 s, casts ~0.07 s = 1.48 s
 busy vs OT 1.05 per sample TOTAL). SDPA bf16-flash (cuDNN FFI) needs Alex's

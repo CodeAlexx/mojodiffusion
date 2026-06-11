@@ -189,6 +189,19 @@ def sdpa_backward_dispatch(
         return SdpaGradArcs(
             arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
         )
+    # P7 batch-2 buckets (the _train_one_step_bucket_b2 instantiations:
+    # 64x64/224 -> S=1248, 64x64/256 -> S=1280; sdpa_backward[2,...] already
+    # instantiated via the b2 hand-chain).
+    if B == 2 and S == 1248 and H == 30 and Dh == 128:
+        var sb = sdpa_backward[2, 1248, 30, 128](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 2 and S == 1280 and H == 30 and Dh == 128:
+        var sb = sdpa_backward[2, 1280, 30, 128](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
     raise Error(
         String("sdpa_backward_dispatch: no comptime bucket for (B,S,H,Dh)=(")
         + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh)
@@ -465,6 +478,17 @@ def sdpa_backward_dispatch_slab(
         )
     if B == 1 and S == 320 and H == 30 and Dh == 128:
         var sb = sdpa_backward_slab[1, 320, 30, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    # P7 batch-2 buckets (see sdpa_backward_dispatch above).
+    if B == 2 and S == 1248 and H == 30 and Dh == 128:
+        var sb = sdpa_backward_slab[2, 1248, 30, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 2 and S == 1280 and H == 30 and Dh == 128:
+        var sb = sdpa_backward_slab[2, 1280, 30, 128](q, k, v, d_out, scale, ctx, slab)
         return SdpaGradArcs(
             arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
         )

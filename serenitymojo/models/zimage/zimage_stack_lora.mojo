@@ -2050,6 +2050,98 @@ def zimage_stack_lora_backward_main_device_b2[
     )
 
 
+def zimage_stack_lora_backward_main_device_b2_graph[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out0: List[Float32], d_out1: List[Float32],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_b2: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale2: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos2: Tensor, uni_sin2: Tensor,
+    saved: ZImageStackForwardB2,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> ZImageLoraGrads:
+    """P7 graph backward for the BATCH-2 step (ZIMAGE_V2_GRAPH_B2,
+    AUTOGRAD_V2_MOJO_DESIGN.md P7): byte-copy of
+    zimage_stack_lora_backward_main_device_b2 (above) with the per-block
+    recompute + hand-chain pair replaced by the SLAB graph backward at B=2
+    (zimage_block_lora_graph_backward_slab — the _v4 per-block mark/copy-out/
+    rewind discipline; the NON-slab graph path OOMs at B=2: per-slot fan-in
+    buffers + the full recompute graph exceed the pool headroom, measured
+    2026-06-11). Final-layer prologue, grads-to-host and the return are
+    UNCHANGED; old path untouched (C13)."""
+    var num_main = len(main_blocks)
+    var num_blocks = lora.num_blocks()
+
+    # d_patches [2S, out_ch]: per-sample img grads, zeros on cap rows.
+    var d_patches = d_out0.copy()
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+    for i in range(len(d_out1)):
+        d_patches.append(d_out1[i])
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+
+    var final_dx = linear_backward_dx(
+        _t(d_patches^, [2 * S, out_ch], ctx), final_lin_w, 2 * S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale2.copy(), [2, D], ctx), ctx,
+        compute_param_grads=False,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_main - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        # Per-block slab region (the _v4 discipline): mark -> recompute +
+        # backward in slab -> copy results out -> rewind.
+        var m = slab.mark()
+        var bg = zimage_block_lora_graph_backward_slab[H, Dh, S, 2](
+            d_x[], main_blocks[bi], main_mod_b2[bi], bl,
+            saved.main_x_in[bi], uni_cos2, uni_sin2, D, F, eps, ctx, slab,
+        )
+        d_x = TArc(_copy_out_of_slab(bg.d_x[], ctx))
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(TArc(_copy_out_of_slab(bg.d_a[s][], ctx)))
+            d_b_t.append(TArc(_copy_out_of_slab(bg.d_b[s][], ctx)))
+        slab.rewind(m)
+        bi -= 1
+
+    var host_grads = _zimage_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_blocks * ZIMAGE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    var empty_x = List[Float32]()
+    var empty_cap = List[Float32]()
+    var empty_nr = List[List[Float32]]()
+    var empty_main = List[List[Float32]]()
+    return ZImageLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        empty_x^, empty_cap^,
+        empty_nr^, empty_main^,
+        _zeros(D), List[Float32](),
+        nonfinite,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase P5 (AUTOGRAD_V2_MOJO_DESIGN.md C9): CUDA-graph capture surface for the
 # B=1 step. Everything a captured kernel touches lives at a FIXED address

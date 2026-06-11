@@ -82,6 +82,7 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
     zimage_stack_lora_backward_main_device_v4,
     ZImageFinalConstsDevice, zimage_final_consts_to_device,
     zimage_stack_lora_forward_main_device_b2, zimage_stack_lora_backward_main_device_b2,
+    zimage_stack_lora_backward_main_device_b2_graph,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
     save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
     zimage_lora_set_to_device_resident,
@@ -194,6 +195,23 @@ comptime ZIMAGE_V2_SLAB = True
 # other buckets run the same _v5 path uncaptured. Requires ENGINE+GRAPH+SLAB.
 # False = the P4 _v4 path, bit-equal oracle (gate-don't-delete, C13/C14).
 comptime ZIMAGE_V2_CAPTURE = True
+# P7 GRAPH backward for the BATCH-2 step (AUTOGRAD_V2_MOJO_DESIGN.md P7): the
+# B2 per-block recompute + hand-chain backward pair goes through the graph
+# engine (zimage_stack_lora_backward_main_device_b2_graph — the same swap P3
+# made for B1). Only active when ENGINE and GRAPH are also True. GATES: b2dup
+# / b1match / b1match2 + 5-step B2 losses byte-identical to the hand-chain
+# binary (C14). False = the _b2 hand-chain (gate-don't-delete, C13).
+#
+# ⚠ OFF (2026-06-11, MEASURED): does not fit 24 GB. The b2 HAND-CHAIN already
+# peaks 23.4/24 GB; ScratchRingAllocator is EAGER (all rings created in
+# __init__, scratch_ring.mojo:66), so the bwd slab (~6.4-7 GiB) double-
+# reserves on top of the pool arena the unchanged b2 fwd still grows. Fit
+# requires (a) the B2 forward slab-routed too (_v5-for-B2) AND (b) SDPA flash
+# (kills the [2*30,S,S] ~374 MB score materialization — the dominant slab
+# tenant). Re-enable after the cuDNN flash path lands. B1 gates with this
+# code compiled in: b1match/b1match2 byte-identical (verified 2026-06-11).
+comptime ZIMAGE_V2_GRAPH_B2 = False
+comptime ZIMAGE_V2_GRAPH_B2_PATH = ZIMAGE_V2_ENGINE and ZIMAGE_V2_GRAPH and ZIMAGE_V2_GRAPH_B2
 
 comptime LAT_C = 16
 comptime LAT_H = 72
@@ -1354,6 +1372,19 @@ def main() raises:
     comptime if not (ZIMAGE_V2_ENGINE and ZIMAGE_V2_GRAPH and ZIMAGE_V2_SLAB):
         slab_bytes = 4096
         slab_count = 1
+    # P7: the BATCH-2 graph backward runs through this same slab. At B=2 the
+    # per-block live set ~doubles (B1 measured 3.52 GiB) and the largest
+    # single transients (the [2*30,S,S]-class F32 SDPA score buffers,
+    # ~374 MB at S=1248) exceed a 256 MiB ring slab. VRAM is the binding
+    # constraint (the b2 HAND-CHAIN baseline already peaks 23.4/24 GB,
+    # measured 2026-06-11), so the rings are sized tight: 384 MiB x 19 =
+    # 7.125 GiB (>= the ~7.04 GiB projected 2x B1 peak; exhaustion raises
+    # fail-loud — grow count, not bytes, if it does). Runtime-sized: a config
+    # is EITHER B1 or B2 for the whole run (batch dispatch below).
+    comptime if ZIMAGE_V2_GRAPH_B2_PATH:
+        if train_cfg.batch_size == 2:
+            slab_bytes = 384 * 1024 * 1024
+            slab_count = 17
     var slab = StepSlab(ctx, slab_bytes, slab_count, 256)
     # ── P5 forward slab (contract C9): the _v5 forward's transients. Per-block
     # mark/rewind keeps the peak at one block (~1.3 GiB at S=1248 incl. the
@@ -1478,7 +1509,7 @@ def main() raises:
                         k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
                         nr_blocks, cr_blocks, main_blocks, lora, opt_state, resident_dev, n_adapters,
                         final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                        train_cfg, train_start, ctx,
+                        train_cfg, train_start, ctx, slab,
                     )
                     loss = rb2a.loss
                 elif vc <= 256:
@@ -1486,7 +1517,7 @@ def main() raises:
                         k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
                         nr_blocks, cr_blocks, main_blocks, lora, opt_state, resident_dev, n_adapters,
                         final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                        train_cfg, train_start, ctx,
+                        train_cfg, train_start, ctx, slab,
                     )
                     loss = rb2b.loss
                 else:
@@ -1747,6 +1778,7 @@ def _train_one_step_bucket_b2[
     train_cfg: TrainConfig,
     train_start_ns: UInt,
     ctx: DeviceContext,
+    mut slab: StepSlab,
 ) raises -> StepResult:
     comptime HT_B = LAT_H_B // PATCH
     comptime WT_B = LAT_W_B // PATCH
@@ -1897,12 +1929,23 @@ def _train_one_step_bucket_b2[
     var loss = Float32(sse / Float64(2 * real_nout))
     var t_loss = perf_counter_ns()
 
-    var grads = zimage_stack_lora_backward_main_device_b2[H, Dh, N_IMG_B, N_TXT_B, S_B](
-        d_loss0, d_loss1, main_blocks, main_mod_b2, lora_dev,
-        f_scale2.copy(), final_lin_w,
-        uni_cos2[], uni_sin2[], fwd,
-        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
-    )
+    var grads: ZImageLoraGrads
+    comptime if ZIMAGE_V2_GRAPH_B2_PATH:
+        # P7: per-block graph-engine backward at B=2 (drop-in for the
+        # hand-chain call below; gates = b2dup/b1match/b1match2 + anchors).
+        grads = zimage_stack_lora_backward_main_device_b2_graph[H, Dh, N_IMG_B, N_TXT_B, S_B](
+            d_loss0, d_loss1, main_blocks, main_mod_b2, lora_dev,
+            f_scale2.copy(), final_lin_w,
+            uni_cos2[], uni_sin2[], fwd,
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx, slab,
+        )
+    else:
+        grads = zimage_stack_lora_backward_main_device_b2[H, Dh, N_IMG_B, N_TXT_B, S_B](
+            d_loss0, d_loss1, main_blocks, main_mod_b2, lora_dev,
+            f_scale2.copy(), final_lin_w,
+            uni_cos2[], uni_sin2[], fwd,
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+        )
     var t_bwd = perf_counter_ns()
 
     var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)

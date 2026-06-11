@@ -28,7 +28,9 @@
 #    exact call.
 #
 # Frozen base weights (wq/wk/wv/wo/w1/w3/w2, norms, modvecs) are untracked
-# (id 0) -> null edges, contract C7. B=1 only in P3 (ROWS == S).
+# (id 0) -> null edges, contract C7. P3 was B=1 only; P7 adds the comptime B
+# param (default 1): stacked rows [B*S, D], [B, D] per-sample mod vecs, the
+# exact op set of zimage_block_lora_forward_device_tensor_batch at that B.
 #
 # Mojo 1.0.0b1, NVIDIA.
 
@@ -66,7 +68,7 @@ from serenitymojo.autograd_v2.ops_record import (
 
 
 def zimage_block_lora_graph_backward[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int, S: Int, B: Int = 1
 ](
     d_out: Tensor,
     w: ZImageBlockWeights, mv: ZImageModVecsDevice, lora: ZImageBlockLoraDevice,
@@ -77,7 +79,14 @@ def zimage_block_lora_graph_backward[
 ) raises -> ZImageBlockLoraTensorBackward:
     """Graph-engine replacement for the _v2 per-block recompute+hand-chain
     pair: record the forward, execute the backward, return the SAME struct the
-    hand-chain returns (d_x + d_a/d_b in slot order q,k,v,o,w1,w3,w2)."""
+    hand-chain returns (d_x + d_a/d_b in slot order q,k,v,o,w1,w3,w2).
+
+    P7: parameterized by B (stacked rows [B*S, D], per-sample [B, D] mod
+    vecs, sdpa_nomask[B,...] — the exact op set of zimage_block_lora_forward
+    _device_tensor_batch at that B; the batch-aware modulate/residual_gate
+    backward arms are the SAME ops the b2 hand-chain calls). B=1 default
+    keeps every P3 call site unchanged (C13)."""
+    comptime ROWS = B * S
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var g = Graph()
 
@@ -102,11 +111,11 @@ def zimage_block_lora_graph_backward[
     var xn1 = record_rms_norm_dx(g, x, w.n1, eps, ctx)
     var xn1s = record_modulate(g, xn1, mv.scale_msa, mv.zeros, 0, ctx)
 
-    var q = record_proj_lora(g, xn1s, w.wq, lora.to_q, a_ids[0], b_ids[0], S, D, D, ctx)
-    var k = record_proj_lora(g, xn1s, w.wk, lora.to_k, a_ids[1], b_ids[1], S, D, D, ctx)
-    var v_flat = record_proj_lora(g, xn1s, w.wv, lora.to_v, a_ids[2], b_ids[2], S, D, D, ctx)
+    var q = record_proj_lora(g, xn1s, w.wq, lora.to_q, a_ids[0], b_ids[0], ROWS, D, D, ctx)
+    var k = record_proj_lora(g, xn1s, w.wk, lora.to_k, a_ids[1], b_ids[1], ROWS, D, D, ctx)
+    var v_flat = record_proj_lora(g, xn1s, w.wv, lora.to_v, a_ids[2], b_ids[2], ROWS, D, D, ctx)
 
-    var shape4: List[Int] = [1, S, H, Dh]
+    var shape4: List[Int] = [B, S, H, Dh]
     var q_pre = record_reshape(g, q, shape4.copy(), ctx)
     var k_pre = record_reshape(g, k, shape4.copy(), ctx)
     var v = record_reshape(g, v_flat, shape4.copy(), ctx)
@@ -122,11 +131,11 @@ def zimage_block_lora_graph_backward[
     var q_rope = record_rope(g, q_rms, cos_arc, sin_arc, ctx)
     var k_rope = record_rope(g, k_rms, cos_arc, sin_arc, ctx)
 
-    var att = record_sdpa[1, S, H, Dh](g, q_rope, k_rope, v, scale, ctx)
-    var flat_shape: List[Int] = [S, D]
+    var att = record_sdpa[B, S, H, Dh](g, q_rope, k_rope, v, scale, ctx)
+    var flat_shape: List[Int] = [ROWS, D]
     var att_flat = record_reshape(g, att, flat_shape.copy(), ctx)
     var att_o = record_proj_lora(
-        g, att_flat, w.wo, lora.to_out, a_ids[3], b_ids[3], S, D, D, ctx
+        g, att_flat, w.wo, lora.to_out, a_ids[3], b_ids[3], ROWS, D, D, ctx
     )
 
     var attn_n2 = record_rms_norm_dx(g, att_o, w.n2, eps, ctx)
@@ -138,10 +147,10 @@ def zimage_block_lora_graph_backward[
     var xfn1 = record_rms_norm_dx(g, h, w.fn1, eps, ctx)
     var xfn1s = record_modulate(g, xfn1, mv.scale_mlp, mv.zeros, 0, ctx)
 
-    var g_pre = record_proj_lora(g, xfn1s, w.w1, lora.w1, a_ids[4], b_ids[4], S, D, F, ctx)
-    var u = record_proj_lora(g, xfn1s, w.w3, lora.w3, a_ids[5], b_ids[5], S, D, F, ctx)
+    var g_pre = record_proj_lora(g, xfn1s, w.w1, lora.w1, a_ids[4], b_ids[4], ROWS, D, F, ctx)
+    var u = record_proj_lora(g, xfn1s, w.w3, lora.w3, a_ids[5], b_ids[5], ROWS, D, F, ctx)
     var act = record_swiglu(g, g_pre, u, ctx)
-    var ff = record_proj_lora(g, act, w.w2, lora.w2, a_ids[6], b_ids[6], S, F, D, ctx)
+    var ff = record_proj_lora(g, act, w.w2, lora.w2, a_ids[6], b_ids[6], ROWS, F, D, ctx)
 
     var ff_n2 = record_rms_norm_dx(g, ff, w.fn2, eps, ctx)
     var gate_mlp_t = TArc(tanh_op(mv.gate_mlp[], ctx))
@@ -160,7 +169,7 @@ def zimage_block_lora_graph_backward[
 
 
 def zimage_block_lora_graph_backward_slab[
-    H: Int, Dh: Int, S: Int
+    H: Int, Dh: Int, S: Int, B: Int = 1
 ](
     d_out: Tensor,
     w: ZImageBlockWeights, mv: ZImageModVecsDevice, lora: ZImageBlockLoraDevice,
@@ -176,7 +185,9 @@ def zimage_block_lora_graph_backward_slab[
     grad and fan-in sum is slab-allocated via the _slab op siblings.
     record_reshape stays the non-slab function (metadata-only, zero allocs).
     The returned d_x/d_a/d_b are SLAB-RESIDENT — the caller (_v4 stack
-    backward) must copy them out of the slab BEFORE rewinding its mark."""
+    backward) must copy them out of the slab BEFORE rewinding its mark.
+    P7: B param exactly as in the non-slab variant above (B=1 default, C13)."""
+    comptime ROWS = B * S
     var scale = Float32(1.0) / sqrt(Float32(Dh))
     var g = Graph()
 
@@ -201,11 +212,11 @@ def zimage_block_lora_graph_backward_slab[
     var xn1 = record_rms_norm_dx_slab(g, x, w.n1, eps, ctx, slab)
     var xn1s = record_modulate_slab(g, xn1, mv.scale_msa, mv.zeros, 0, ctx, slab)
 
-    var q = record_proj_lora_slab(g, xn1s, w.wq, lora.to_q, a_ids[0], b_ids[0], S, D, D, ctx, slab)
-    var k = record_proj_lora_slab(g, xn1s, w.wk, lora.to_k, a_ids[1], b_ids[1], S, D, D, ctx, slab)
-    var v_flat = record_proj_lora_slab(g, xn1s, w.wv, lora.to_v, a_ids[2], b_ids[2], S, D, D, ctx, slab)
+    var q = record_proj_lora_slab(g, xn1s, w.wq, lora.to_q, a_ids[0], b_ids[0], ROWS, D, D, ctx, slab)
+    var k = record_proj_lora_slab(g, xn1s, w.wk, lora.to_k, a_ids[1], b_ids[1], ROWS, D, D, ctx, slab)
+    var v_flat = record_proj_lora_slab(g, xn1s, w.wv, lora.to_v, a_ids[2], b_ids[2], ROWS, D, D, ctx, slab)
 
-    var shape4: List[Int] = [1, S, H, Dh]
+    var shape4: List[Int] = [B, S, H, Dh]
     var q_pre = record_reshape(g, q, shape4.copy(), ctx)
     var k_pre = record_reshape(g, k, shape4.copy(), ctx)
     var v = record_reshape(g, v_flat, shape4.copy(), ctx)
@@ -220,11 +231,11 @@ def zimage_block_lora_graph_backward_slab[
     var q_rope = record_rope_slab(g, q_rms, cos_arc, sin_arc, ctx, slab)
     var k_rope = record_rope_slab(g, k_rms, cos_arc, sin_arc, ctx, slab)
 
-    var att = record_sdpa_slab[1, S, H, Dh](g, q_rope, k_rope, v, scale, ctx, slab)
-    var flat_shape: List[Int] = [S, D]
+    var att = record_sdpa_slab[B, S, H, Dh](g, q_rope, k_rope, v, scale, ctx, slab)
+    var flat_shape: List[Int] = [ROWS, D]
     var att_flat = record_reshape(g, att, flat_shape.copy(), ctx)
     var att_o = record_proj_lora_slab(
-        g, att_flat, w.wo, lora.to_out, a_ids[3], b_ids[3], S, D, D, ctx, slab
+        g, att_flat, w.wo, lora.to_out, a_ids[3], b_ids[3], ROWS, D, D, ctx, slab
     )
 
     var attn_n2 = record_rms_norm_dx_slab(g, att_o, w.n2, eps, ctx, slab)
@@ -236,10 +247,10 @@ def zimage_block_lora_graph_backward_slab[
     var xfn1 = record_rms_norm_dx_slab(g, h, w.fn1, eps, ctx, slab)
     var xfn1s = record_modulate_slab(g, xfn1, mv.scale_mlp, mv.zeros, 0, ctx, slab)
 
-    var g_pre = record_proj_lora_slab(g, xfn1s, w.w1, lora.w1, a_ids[4], b_ids[4], S, D, F, ctx, slab)
-    var u = record_proj_lora_slab(g, xfn1s, w.w3, lora.w3, a_ids[5], b_ids[5], S, D, F, ctx, slab)
+    var g_pre = record_proj_lora_slab(g, xfn1s, w.w1, lora.w1, a_ids[4], b_ids[4], ROWS, D, F, ctx, slab)
+    var u = record_proj_lora_slab(g, xfn1s, w.w3, lora.w3, a_ids[5], b_ids[5], ROWS, D, F, ctx, slab)
     var act = record_swiglu_slab(g, g_pre, u, ctx, slab)
-    var ff = record_proj_lora_slab(g, act, w.w2, lora.w2, a_ids[6], b_ids[6], S, F, D, ctx, slab)
+    var ff = record_proj_lora_slab(g, act, w.w2, lora.w2, a_ids[6], b_ids[6], ROWS, F, D, ctx, slab)
 
     var ff_n2 = record_rms_norm_dx_slab(g, ff, w.fn2, eps, ctx, slab)
     var gate_mlp_t = TArc(tanh_op_slab(mv.gate_mlp[], ctx, slab))

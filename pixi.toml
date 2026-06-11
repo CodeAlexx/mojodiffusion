@@ -6,6 +6,11 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
+# Compile the SerenityUI generation daemon (SwarmUI-replacement) against the
+# MOJO-libs stack. -lm: sinf in image/model math; -lcuda: serenitymojo/offload
+# CUDA driver API (the consumer's GPU offload, not the libs). Verified EXIT=0
+# on 2026-06-10 producing a 6.1 MB ELF.
+build-daemon = "mojo build -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/serve/serenity_daemon.mojo -o /tmp/serenity_daemon"
 
 [dependencies]
 max = ">=26.3.0,<27"

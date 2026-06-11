@@ -57,6 +57,8 @@ from serenitymojo.serve.model_scan import (
 from serenitymojo.serve.stub_backend import StubBackend
 from serenitymojo.serve.zimage_backend import ZImageBackend
 from serenitymojo.serve.dispatch_backend import DispatchBackend
+from serenitymojo.serve.process_isolated_backend import ProcessIsolatedBackend
+from serenitymojo.serve.worker import run_worker
 
 comptime DEFAULT_PORT = 7801
 comptime MAX_EVENTS = 64
@@ -952,19 +954,39 @@ def main() raises:
     * dispatch  — multi-model residency + on-demand SWITCHING (Phase 4): the
                   resident backend is chosen per job by `model` (zimage_base /
                   qwen-image-2512), freeing + loading on a switch. /v1/health +
-                  /v1/models reflect the live residency."""
+                  /v1/models reflect the live residency.
+    * isolated  — Phase 5: like dispatch, but each resident model runs in a CHILD
+                  PROCESS; a switch KILLS the child so the OS reclaims its VRAM
+                  (the only reclaim that works on this runtime). Lets zimage<->qwen
+                  switching fit in 24 GB.
+
+    Internal (fork+execv target, not user-facing):
+    * worker <kind> <fd> — run ONE backend (stub|zimage|qwenimage) over the
+                  inherited socket `fd` instead of HTTP. Spawned by `isolated`."""
+    var args = argv()
+    # Internal worker entry MUST be handled before port/mode parsing (its extra
+    # args are a kind + an fd, not a port). serenity_daemon worker <kind> <fd>.
+    if len(args) >= 2 and String(args[1]) == "worker":
+        if len(args) < 4:
+            raise Error("worker mode needs: worker <kind> <fd>")
+        var wkind = String(args[2])
+        var wfd = Int32(Int(String(args[3])))
+        run_worker(wkind, wfd)
+        return
     var port = DEFAULT_PORT
     var mode = String("stub")
-    var args = argv()
     for i in range(1, len(args)):
         var a = String(args[i])
-        if a == "stub" or a == "zimage" or a == "dispatch":
+        if a == "stub" or a == "zimage" or a == "dispatch" or a == "isolated":
             mode = a^
         else:
             port = Int(a)
     if mode == "dispatch":
         var db = DispatchBackend()
         run_daemon(db, port)
+    elif mode == "isolated":
+        var pb = ProcessIsolatedBackend()
+        run_daemon(pb, port)
     elif mode == "zimage":
         var zb = ZImageBackend()
         run_daemon(zb, port)

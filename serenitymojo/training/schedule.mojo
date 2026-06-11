@@ -569,3 +569,23 @@ def grad_accumulate(mut acc: Tensor, new_grad: Tensor, ctx: DeviceContext) raise
             _grad_accum_kernel[DType.float16], _grad_accum_kernel[DType.float16]
         ](ACC, NG, n, grid_dim=grid, block_dim=_BLK)
     ctx.synchronize()
+
+
+def sample_timestep_logit_normal_scaled(seed: UInt64, std: Float32) -> Float32:
+    """t = sigmoid(std * N(0,1)), clamped to [1/1000, 1].
+
+    The DiffSynth-Studio Ideogram-4 training-time distribution
+    (diffsynth/diffusion/flow_match.py set_timesteps_ideogram4: sigma =
+    sigmoid(mean + std*z) with mean = mu + 0.5*log(pixels/512^2); at 512px
+    mu=0 -> mean=0, std=1.5). Same RNG stream discipline as
+    sample_timestep_logit_normal above."""
+    var ks = _expand_key(seed)
+    var d = _standard_normal_at(
+        ks[0], ks[1], ks[2], ks[3], ks[4], ks[5], ks[6], ks[7], UInt64(0)
+    )
+    var t = _sigmoid64(Float64(std) * d.z)
+    if t < Float64(1.0) / Float64(1000.0):
+        t = Float64(1.0) / Float64(1000.0)
+    if t > Float64(1.0):
+        t = Float64(1.0)
+    return Float32(t)

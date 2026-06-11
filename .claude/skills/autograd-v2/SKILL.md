@@ -168,6 +168,21 @@ env $L /tmp/<klein_bin> serenitymojo/configs/klein9b.json 3 0 - nosample_profile
 # for the full verify-everything block + OneTrainer oracle commands)
 ```
 
+## cuDNN flash SDPA (ops/attention_flash.mojo, shipped 2026-06-11)
+
+Approved numerics change (35-43x over math-mode, gates in
+ops/tests/sdpa_flash_parity.mojo). Build needs extra link args
+`-Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa`
+(rebuild the .so with ops/cshim/build.sh) and runtime needs
+`~/.local/lib/python3.12/site-packages/nvidia/cudnn/lib` on
+LD_LIBRARY_PATH — the EriDiffusion/.venv_cache cuDNN wheel FAILS with
+"No valid execution plans" (bad engines lib). Trainer wiring is NOT done
+yet: flash backward needs O+Stats saved (new node kind), and bit-anchors
+must be RE-ANCHORED when it lands. ScratchRingAllocator is EAGER (all
+rings allocated in __init__) — budget VRAM accordingly; the B2 graph
+path (ZIMAGE_V2_GRAPH_B2) is gated OFF on the measured 24 GB wall until
+flash wiring + a slab-routed B2 forward land.
+
 ## Mojo hazards specific to this code (design doc §4)
 
 - ASAP destruction vs async work: tenure intermediates in Graph/slab

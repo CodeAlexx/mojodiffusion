@@ -837,7 +837,30 @@ def record_klein_dbl_joint[
     var q_rope = rope_interleaved(q, cos[], sin[], ctx)
     var k_rope = rope_interleaved(k, cos[], sin[], ctx)
     scratch.rewind(qk_mark)
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v_joint, scale, ctx)
+    # saved layout: 0 q_rope, 1 k_rope, 2 v_joint, 3 cos, 4 sin
+    # (+ flash 5..9 = bf16 q/k/v/o + stats; arm dispatches on arity)
+    var saved = List[TArc]()
+    var att: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v_joint, scale, ctx)
+        att = Tensor(ff.att.buf.copy(), ff.att.shape(), ff.att.dtype())
+        saved.append(TArc(q_rope^))
+        saved.append(TArc(k_rope^))
+        saved.append(TArc(v_joint^))
+        saved.append(cos.copy())
+        saved.append(sin.copy())
+        saved.append(ff.q_bf.copy())
+        saved.append(ff.k_bf.copy())
+        saved.append(ff.v_bf.copy())
+        saved.append(ff.o_bf.copy())
+        saved.append(ff.stats.copy())
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v_joint, scale, ctx)
+        saved.append(TArc(q_rope^))
+        saved.append(TArc(k_rope^))
+        saved.append(TArc(v_joint^))
+        saved.append(cos.copy())
+        saved.append(sin.copy())
 
     var txt_att_4d = _ta_slice(att, 1, 0, N_TXT, ctx)
     var img_att_4d = _ta_slice(att, 1, N_TXT, N_IMG, ctx)
@@ -855,13 +878,6 @@ def record_klein_dbl_joint[
     edges.append(g.edge_for(ik[].id))
     edges.append(g.edge_for(tv[].id))
     edges.append(g.edge_for(iv[].id))
-    # saved layout: 0 q_rope, 1 k_rope, 2 v_joint, 3 cos, 4 sin
-    var saved = List[TArc]()
-    saved.append(TArc(q_rope^))
-    saved.append(TArc(k_rope^))
-    saved.append(TArc(v_joint^))
-    saved.append(cos.copy())
-    saved.append(sin.copy())
     var meta: List[Int] = [N_TXT, N_IMG, D]
     var scalars: List[Float32] = [scale]
     var oids: List[Int] = [txt_att[].id, img_att[].id]

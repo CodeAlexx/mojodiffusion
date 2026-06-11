@@ -93,6 +93,12 @@ from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
+# cuDNN flash SDPA for the joint attention (approved 2026-06-11; ONE flag
+# for all Klein blocks, defined in single_block.mojo — see its header).
+from serenitymojo.models.klein.single_block import KLEIN_SDPA_FLASH
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd_f32, sdpa_flash_backward_f32,
+)
 from serenitymojo.ops.tensor_algebra import (
     reshape, reshape_owned, reshape_in_place, slice, concat, add,
 )
@@ -337,16 +343,33 @@ struct DoubleBlockSaved(Copyable, Movable):
     var v_joint: TArc  # [1,S,H,Dh]  concat v
     # cos/sin are NOT saved here — resident rope tables passed by borrow to the
     # backward (uploaded ONCE per run instead of re-saved/re-uploaded per block).
+    # Flash-SDPA saved set (Optional: only the KLEIN_SDPA_FLASH production
+    # fwd fills these; other constructor sites pass nothing).
+    var flash_q: Optional[TArc]
+    var flash_k: Optional[TArc]
+    var flash_v: Optional[TArc]
+    var flash_o: Optional[TArc]
+    var flash_stats: Optional[TArc]
 
     def __init__(
         out self, var img: StreamSaved, var txt: StreamSaved,
         var q_rope: TArc, var k_rope: TArc, var v_joint: TArc,
+        var flash_q: Optional[TArc] = None,
+        var flash_k: Optional[TArc] = None,
+        var flash_v: Optional[TArc] = None,
+        var flash_o: Optional[TArc] = None,
+        var flash_stats: Optional[TArc] = None,
     ):
         self.img = img^
         self.txt = txt^
         self.q_rope = q_rope^
         self.k_rope = k_rope^
         self.v_joint = v_joint^
+        self.flash_q = flash_q^
+        self.flash_k = flash_k^
+        self.flash_v = flash_v^
+        self.flash_o = flash_o^
+        self.flash_stats = flash_stats^
 
 
 struct DoubleBlockForward(Copyable, Movable):
@@ -1413,7 +1436,22 @@ def double_block_lora_forward_device_resident_scratch[
     var q_rope = rope_interleaved(q, cos, sin, ctx)
     var k_rope = rope_interleaved(k, cos, sin, ctx)
     scratch.rewind(qk_mark)
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att: Tensor
+    var flash_q = Optional[TArc](None)
+    var flash_k = Optional[TArc](None)
+    var flash_v = Optional[TArc](None)
+    var flash_o = Optional[TArc](None)
+    var flash_stats = Optional[TArc](None)
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        att = Tensor(ff.att.buf.copy(), ff.att.shape(), ff.att.dtype())
+        flash_q = Optional[TArc](ff.q_bf.copy())
+        flash_k = Optional[TArc](ff.k_bf.copy())
+        flash_v = Optional[TArc](ff.v_bf.copy())
+        flash_o = Optional[TArc](ff.o_bf.copy())
+        flash_stats = Optional[TArc](ff.stats.copy())
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
 
     var txt_att_4d = slice(att, 1, 0, N_TXT, ctx)
     var img_att_4d = slice(att, 1, N_TXT, N_IMG, ctx)
@@ -1428,7 +1466,8 @@ def double_block_lora_forward_device_resident_scratch[
     var img_saved = _make_saved(img_x, ip, img_att, ipost)
     var txt_saved = _make_saved(txt_x, tp, txt_att, tpost)
     var saved = DoubleBlockSaved(
-        img_saved^, txt_saved^, TArc(q_rope^), TArc(k_rope^), TArc(v^)
+        img_saved^, txt_saved^, TArc(q_rope^), TArc(k_rope^), TArc(v^),
+        flash_q^, flash_k^, flash_v^, flash_o^, flash_stats^,
     )
 
     return DoubleBlockDeviceForward(ipost.out.copy(), tpost.out.copy(), saved^)
@@ -2241,19 +2280,40 @@ def double_block_lora_backward_device_resident_scratch[
     var d_iatt_4d = reshape(ipb.d_att[], [1, N_IMG, H, Dh], ctx)
     var d_att_joint = concat2_scratch(1, ctx, scratch, d_tatt_4d, d_iatt_4d)
 
-    var sb = sdpa_backward_scratch[1, S, H, Dh](
-        saved.q_rope[], saved.k_rope[], saved.v_joint[], d_att_joint, scale, ctx, scratch,
-    )
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        if not saved.flash_stats:
+            raise Error(
+                "double_block bwd: KLEIN_SDPA_FLASH on but saved tape has"
+                " no flash stats (fwd/bwd flag mismatch)"
+            )
+        var fb = sdpa_flash_backward_f32[1, S, H, Dh](
+            saved.flash_q.value(), saved.flash_k.value(),
+            saved.flash_v.value(), saved.flash_o.value(),
+            saved.flash_stats.value(), d_att_joint, scale, ctx,
+        )
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
+    else:
+        var sb = sdpa_backward_scratch[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v_joint[], d_att_joint, scale, ctx, scratch,
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
 
-    var d_q_joint = rope_backward(sb.d_q, cos, sin, True, ctx)
-    var d_k_joint = rope_backward(sb.d_k, cos, sin, True, ctx)
+    var d_q_joint = rope_backward(d_q_sb, cos, sin, True, ctx)
+    var d_k_joint = rope_backward(d_k_sb, cos, sin, True, ctx)
 
     var d_txt_q = slice_scratch(d_q_joint, 1, 0, N_TXT, ctx, scratch)
     var d_img_q = slice_scratch(d_q_joint, 1, N_TXT, N_IMG, ctx, scratch)
     var d_txt_k = slice_scratch(d_k_joint, 1, 0, N_TXT, ctx, scratch)
     var d_img_k = slice_scratch(d_k_joint, 1, N_TXT, N_IMG, ctx, scratch)
-    var d_txt_v = slice_scratch(sb.d_v, 1, 0, N_TXT, ctx, scratch)
-    var d_img_v = slice_scratch(sb.d_v, 1, N_TXT, N_IMG, ctx, scratch)
+    var d_txt_v = slice_scratch(d_v_sb, 1, 0, N_TXT, ctx, scratch)
+    var d_img_v = slice_scratch(d_v_sb, 1, N_TXT, N_IMG, ctx, scratch)
     reshape_in_place(d_img_v, [N_IMG, D])
     reshape_in_place(d_txt_v, [N_TXT, D])
 

@@ -793,20 +793,38 @@ def apply_klein[
         var d_iatt_4d = _ta_reshape_klein(grads_in[1][], [1, N_IMG, H, Dh], ctx)
         var d_att_joint = concat2_scratch(1, ctx, scratch, d_tatt_4d, d_iatt_4d)
 
-        var sb = sdpa_backward_scratch[1, S, H, Dh](
-            node.saved[0][], node.saved[1][], node.saved[2][],
-            d_att_joint, scale, ctx, scratch,
-        )
+        var d_q_t: Tensor
+        var d_k_t: Tensor
+        var d_v_t: Tensor
+        if len(node.saved) >= 10:
+            # KLEIN_SDPA_FLASH recording (saved 5..9): the SAME flash call
+            # the hand-chain double backward makes.
+            var fb = sdpa_flash_backward_f32[1, S, H, Dh](
+                node.saved[5].copy(), node.saved[6].copy(),
+                node.saved[7].copy(), node.saved[8].copy(),
+                node.saved[9].copy(), d_att_joint, scale, ctx,
+            )
+            d_q_t = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+            d_k_t = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+            d_v_t = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
+        else:
+            var sb = sdpa_backward_scratch[1, S, H, Dh](
+                node.saved[0][], node.saved[1][], node.saved[2][],
+                d_att_joint, scale, ctx, scratch,
+            )
+            d_q_t = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+            d_k_t = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+            d_v_t = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
 
-        var d_q_joint = rope_backward(sb.d_q, node.saved[3][], node.saved[4][], True, ctx)
-        var d_k_joint = rope_backward(sb.d_k, node.saved[3][], node.saved[4][], True, ctx)
+        var d_q_joint = rope_backward(d_q_t, node.saved[3][], node.saved[4][], True, ctx)
+        var d_k_joint = rope_backward(d_k_t, node.saved[3][], node.saved[4][], True, ctx)
 
         var d_txt_q = slice_scratch(d_q_joint, 1, 0, N_TXT, ctx, scratch)
         var d_img_q = slice_scratch(d_q_joint, 1, N_TXT, N_IMG, ctx, scratch)
         var d_txt_k = slice_scratch(d_k_joint, 1, 0, N_TXT, ctx, scratch)
         var d_img_k = slice_scratch(d_k_joint, 1, N_TXT, N_IMG, ctx, scratch)
-        var d_txt_v = slice_scratch(sb.d_v, 1, 0, N_TXT, ctx, scratch)
-        var d_img_v = slice_scratch(sb.d_v, 1, N_TXT, N_IMG, ctx, scratch)
+        var d_txt_v = slice_scratch(d_v_t, 1, 0, N_TXT, ctx, scratch)
+        var d_img_v = slice_scratch(d_v_t, 1, N_TXT, N_IMG, ctx, scratch)
         _ta_reshape_in_place_klein(d_img_v, [N_IMG, D])
         _ta_reshape_in_place_klein(d_txt_v, [N_TXT, D])
 

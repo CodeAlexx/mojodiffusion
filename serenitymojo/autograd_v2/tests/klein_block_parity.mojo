@@ -212,8 +212,12 @@ def _gate_pair_tol(
     elements flip between two identical-input calls in one process; dK is
     deterministic), so bit-equality between the hand-chain and graph paths
     is impossible for dQ-derived grads BY THE KERNEL'S NATURE. Gate =
-    cosine >= 0.999999 AND max_abs <= 1e-3 (the observed flip class is
-    +-1 ulp; a wiring bug is many orders larger). Non-degeneracy guarded."""
+    cosine >= 0.99995 AND max_abs <= 1e-3. MEASURED classes 2026-06-11:
+    sgl (one fwd shared) cos 1-1e-14, max_abs 2.8e-8; dbl (each path runs
+    its OWN flash fwd+bwd) cos 0.99999x on the small-magnitude adapter
+    grads, max_abs <= 2.1e-5. A wiring bug measures cos << 0.99 (the
+    pre-fix run: 10.7M/25M bytes differing) — separation holds.
+    Non-degeneracy guarded."""
     var ah = a.to_host(ctx)
     var bh = b.to_host(ctx)
     if len(ah) != len(bh):
@@ -244,7 +248,7 @@ def _gate_pair_tol(
     var cosine = 1.0
     if denom > 0.0:
         cosine = dot / denom
-    var ok = cosine >= 0.999999 and max_abs <= 1.0e-3
+    var ok = cosine >= 0.99995 and max_abs <= 1.0e-3
     print(
         "GATE klein_parity " + name + " " + ("PASS" if ok else "FAIL")
         + " (flash-tol) cos=" + String(cosine) + " max_abs=" + String(max_abs)
@@ -325,28 +329,72 @@ def main() raises:
         D, F, EPS, norm_ones, norm_zeros, ctx, scratch,
     )
 
-    all_ok = _gate_pair(String("dbl d_img_x"), dor.img.d_x[], dgr.img.d_x[], ctx) and all_ok
-    all_ok = _gate_pair(String("dbl d_txt_x"), dor.txt.d_x[], dgr.txt.d_x[], ctx) and all_ok
+    # In flash mode the dQ-derived tensors (d_x + q/k/v adapter grads) use
+    # the value-tolerance gate (cuDNN flash bwd dQ nondeterminism, see
+    # _gate_pair_tol); out/ff grads are NOT downstream of the sdpa backward
+    # and stay bit-strict.
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_pair_tol(String("dbl d_img_x"), dor.img.d_x[], dgr.img.d_x[], ctx) and all_ok
+        all_ok = _gate_pair_tol(String("dbl d_txt_x"), dor.txt.d_x[], dgr.txt.d_x[], ctx) and all_ok
+    else:
+        all_ok = _gate_pair(String("dbl d_img_x"), dor.img.d_x[], dgr.img.d_x[], ctx) and all_ok
+        all_ok = _gate_pair(String("dbl d_txt_x"), dor.txt.d_x[], dgr.txt.d_x[], ctx) and all_ok
     # 12 adapter slots, stack order 0-5 img / 6-11 txt
     # (q,k,v,out,ff_in,ff_out each d_a+d_b).
-    all_ok = _gate_opt(String("dbl s0 img_q_d_a"), dor.img.q_d_a, dgr.img.q_d_a, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s0 img_q_d_b"), dor.img.q_d_b, dgr.img.q_d_b, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s1 img_k_d_a"), dor.img.k_d_a, dgr.img.k_d_a, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s1 img_k_d_b"), dor.img.k_d_b, dgr.img.k_d_b, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s2 img_v_d_a"), dor.img.v_d_a, dgr.img.v_d_a, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s2 img_v_d_b"), dor.img.v_d_b, dgr.img.v_d_b, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s0 img_q_d_a"), dor.img.q_d_a, dgr.img.q_d_a, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s0 img_q_d_a"), dor.img.q_d_a, dgr.img.q_d_a, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s0 img_q_d_b"), dor.img.q_d_b, dgr.img.q_d_b, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s0 img_q_d_b"), dor.img.q_d_b, dgr.img.q_d_b, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s1 img_k_d_a"), dor.img.k_d_a, dgr.img.k_d_a, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s1 img_k_d_a"), dor.img.k_d_a, dgr.img.k_d_a, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s1 img_k_d_b"), dor.img.k_d_b, dgr.img.k_d_b, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s1 img_k_d_b"), dor.img.k_d_b, dgr.img.k_d_b, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s2 img_v_d_a"), dor.img.v_d_a, dgr.img.v_d_a, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s2 img_v_d_a"), dor.img.v_d_a, dgr.img.v_d_a, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s2 img_v_d_b"), dor.img.v_d_b, dgr.img.v_d_b, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s2 img_v_d_b"), dor.img.v_d_b, dgr.img.v_d_b, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s3 img_out_d_a"), dor.img.out_d_a, dgr.img.out_d_a, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s3 img_out_d_b"), dor.img.out_d_b, dgr.img.out_d_b, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s4 img_ff_in_d_a"), dor.img.ff_in_d_a, dgr.img.ff_in_d_a, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s4 img_ff_in_d_b"), dor.img.ff_in_d_b, dgr.img.ff_in_d_b, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s5 img_ff_out_d_a"), dor.img.ff_out_d_a, dgr.img.ff_out_d_a, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s5 img_ff_out_d_b"), dor.img.ff_out_d_b, dgr.img.ff_out_d_b, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s6 txt_q_d_a"), dor.txt.q_d_a, dgr.txt.q_d_a, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s6 txt_q_d_b"), dor.txt.q_d_b, dgr.txt.q_d_b, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s7 txt_k_d_a"), dor.txt.k_d_a, dgr.txt.k_d_a, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s7 txt_k_d_b"), dor.txt.k_d_b, dgr.txt.k_d_b, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s8 txt_v_d_a"), dor.txt.v_d_a, dgr.txt.v_d_a, ctx) and all_ok
-    all_ok = _gate_opt(String("dbl s8 txt_v_d_b"), dor.txt.v_d_b, dgr.txt.v_d_b, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s6 txt_q_d_a"), dor.txt.q_d_a, dgr.txt.q_d_a, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s6 txt_q_d_a"), dor.txt.q_d_a, dgr.txt.q_d_a, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s6 txt_q_d_b"), dor.txt.q_d_b, dgr.txt.q_d_b, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s6 txt_q_d_b"), dor.txt.q_d_b, dgr.txt.q_d_b, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s7 txt_k_d_a"), dor.txt.k_d_a, dgr.txt.k_d_a, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s7 txt_k_d_a"), dor.txt.k_d_a, dgr.txt.k_d_a, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s7 txt_k_d_b"), dor.txt.k_d_b, dgr.txt.k_d_b, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s7 txt_k_d_b"), dor.txt.k_d_b, dgr.txt.k_d_b, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s8 txt_v_d_a"), dor.txt.v_d_a, dgr.txt.v_d_a, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s8 txt_v_d_a"), dor.txt.v_d_a, dgr.txt.v_d_a, ctx) and all_ok
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_opt_tol(String("dbl s8 txt_v_d_b"), dor.txt.v_d_b, dgr.txt.v_d_b, ctx) and all_ok
+    else:
+        all_ok = _gate_opt(String("dbl s8 txt_v_d_b"), dor.txt.v_d_b, dgr.txt.v_d_b, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s9 txt_out_d_a"), dor.txt.out_d_a, dgr.txt.out_d_a, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s9 txt_out_d_b"), dor.txt.out_d_b, dgr.txt.out_d_b, ctx) and all_ok
     all_ok = _gate_opt(String("dbl s10 txt_ff_in_d_a"), dor.txt.ff_in_d_a, dgr.txt.ff_in_d_a, ctx) and all_ok

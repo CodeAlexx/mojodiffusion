@@ -77,6 +77,7 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
     zimage_lora_set_to_device,
     zimage_stack_lora_forward_main_device, zimage_stack_lora_backward_main_device,
     zimage_stack_lora_forward_main_device_v2, zimage_stack_lora_backward_main_device_v2,
+    zimage_stack_lora_backward_main_device_v3,
     zimage_stack_lora_forward_main_device_b2, zimage_stack_lora_backward_main_device_b2,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
     save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
@@ -154,6 +155,13 @@ comptime PATCH = 2
 # backward. False = the previous per-block-upload path, byte-identical to the
 # 06-10 anchors (gate-don't-delete, flame Stage-6a pattern).
 comptime ZIMAGE_V2_ENGINE = True
+# v2 GRAPH backward (autograd_v2 Phase P3, AUTOGRAD_V2_MOJO_DESIGN.md): the
+# B=1 per-block backward goes through the recorded graph + dependency-counted
+# engine (zimage_stack_lora_backward_main_device_v3) instead of the hand-chain
+# _v2 per-block calls. Only active when ZIMAGE_V2_ENGINE is also True; the B2
+# path stays on its _b2 hand-chain in P3. False = _v2 hand-chain, bit-equal
+# oracle (gate-don't-delete, C13/C14).
+comptime ZIMAGE_V2_GRAPH = True
 
 comptime LAT_C = 16
 comptime LAT_H = 72
@@ -827,12 +835,22 @@ def _train_one_step_bucket[
 
     var grads: ZImageLoraGrads
     comptime if ZIMAGE_V2_ENGINE:
-        grads = zimage_stack_lora_backward_main_device_v2[H, Dh, N_IMG_B, N_TXT_B, S_B](
-            d_loss, main_blocks, mvall.value().per_block, lora_dev,
-            f_scale.copy(), final_lin_w,
-            uni_cos[], uni_sin[], fwd,
-            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
-        )
+        # P3: graph-engine backward (_v3) when ZIMAGE_V2_GRAPH; else the _v2
+        # hand-chain. Same args either way (the _v3 signature is _v2's).
+        comptime if ZIMAGE_V2_GRAPH:
+            grads = zimage_stack_lora_backward_main_device_v3[H, Dh, N_IMG_B, N_TXT_B, S_B](
+                d_loss, main_blocks, mvall.value().per_block, lora_dev,
+                f_scale.copy(), final_lin_w,
+                uni_cos[], uni_sin[], fwd,
+                D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+            )
+        else:
+            grads = zimage_stack_lora_backward_main_device_v2[H, Dh, N_IMG_B, N_TXT_B, S_B](
+                d_loss, main_blocks, mvall.value().per_block, lora_dev,
+                f_scale.copy(), final_lin_w,
+                uni_cos[], uni_sin[], fwd,
+                D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+            )
     else:
         grads = zimage_stack_lora_backward_main_device[H, Dh, N_IMG_B, N_TXT_B, S_B](
             d_loss, main_blocks, main_mod, lora_dev,

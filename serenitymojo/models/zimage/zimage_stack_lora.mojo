@@ -106,6 +106,9 @@ from serenitymojo.models.zimage.zimage_stack import (
     _concat_img_cap, _split_img_cap, _linear_wdev_bias, _saved_x_out,
 )
 
+from serenitymojo.autograd_v2.zimage_block_graph import (
+    zimage_block_lora_graph_backward,
+)
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_adamw_plain_fused import (
@@ -946,6 +949,84 @@ def zimage_stack_lora_backward_main_device_v2[
         var bg = zimage_block_lora_backward_device_tensors_batch[1, H, Dh, S](
             d_x[], main_blocks[bi], main_mod_dev[bi], bl, refwd.saved,
             uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    var host_grads = _zimage_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_blocks * ZIMAGE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    var empty_x = List[Float32]()
+    var empty_cap = List[Float32]()
+    var empty_nr = List[List[Float32]]()
+    var empty_main = List[List[Float32]]()
+    return ZImageLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        empty_x^, empty_cap^,
+        empty_nr^, empty_main^,
+        d_f_scale^, d_final_lin^,
+        nonfinite,
+    )
+
+
+def zimage_stack_lora_backward_main_device_v3[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_dev: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageLoraGrads:
+    """P3 graph backward (ZIMAGE_V2_GRAPH, AUTOGRAD_V2_MOJO_DESIGN.md P3):
+    byte-copy of _v2 with the per-block recompute + hand-chain backward pair
+    replaced by zimage_block_lora_graph_backward (forward re-recorded through
+    the autograd_v2 ops_record wrappers, engine.execute drives the backward -
+    recompute-style checkpoint, flame checkpoint.rs shape). The FINAL LAYER
+    stays hand-chain in P3 (prologue + grads-to-host + return UNCHANGED);
+    old paths untouched (C13)."""
+    var num_main = len(main_blocks)
+    var num_blocks = lora.num_blocks()
+
+    var d_patches = _concat_img_cap(d_out, _zeros(N_TXT * out_ch))
+    var final_dx = linear_backward_dx(
+        _t(d_patches, [S, out_ch], ctx), final_lin_w, S, D, out_ch, ctx,
+    )
+    var d_final_lin = List[Float32]()
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+    )
+    var d_f_scale = mbf.d_scale.to_host(ctx)
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_main - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var bg = zimage_block_lora_graph_backward[H, Dh, S](
+            d_x[], main_blocks[bi], main_mod_dev[bi], bl,
+            saved.main_x_in[bi], uni_cos, uni_sin, D, F, eps, ctx,
         )
         d_x = bg.d_x.copy()
         var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS

@@ -101,7 +101,21 @@ anchor-gate only until the gate-repair campaign (handoff §3.6).
 4. `Tensor.clone()` sync removal (Tier-2 single-stream-ordering argument;
    repo precedent in ops/attention.mojo "TIER2-SYNC-REMOVED"). Gate hard.
 
-### Phase E — graph recording + dependency-counted engine + CUDA graphs (open)
+### Phase E — graph recording + dependency-counted engine + CUDA graphs
+**P1-P3 SHIPPED 2026-06-11 (same night): serenitymojo/autograd_v2/ —
+dependency-counted engine + slot-ordered fan-in (C15) + DiT op recording;
+zimage B1 backward now runs THROUGH THE GRAPH ENGINE behind
+`ZIMAGE_V2_GRAPH` and is BIT-EXACT to the hand-chain (5-step anchors every
+digit, b1match every digit, 100-step zero-diff) at 1.8 s/step (bwd +2.3%
+engine overhead — flame measured +2.18% for theirs; the speed is P4/P5).
+Per-op gates: all bitwise on real shapes; C15 proof: arrival-order fold
+would mismatch 1,319,319/4,792,320 bf16 elements. P4 (StepSlab) + P5
+(CUDA-graph replay) next.**
+
+**JOB NUMBER ONE (maintainer, re-affirmed 2026-06-11). Full design contract
++ phase order (P0-P7): `serenitymojo/docs/AUTOGRAD_V2_MOJO_DESIGN.md` —
+clauses C1-C14 are hard constraints; implementation is against THAT doc,
+not this paragraph.** Summary below kept for orientation only.
 The structural piece (flame autograd_v2/engine.rs:184-600 — single-threaded,
 stateless, reentrant; ready-queue keyed (topological_nr, sequence_nr,
 node_id) desc; InputBuffer in-place/out-of-place accumulation;

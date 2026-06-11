@@ -527,6 +527,11 @@ def tick_worker[B: GenBackend](
         except e:
             jobs[i].state = String("failed")
             jobs[i].error = String(e)
+            # Symmetric with the step()-failure path (which prints "-> done/
+            # failed/cancelled"): a start() failure (e.g. a model-switch load
+            # that OOMs against a pinned pool — the F3 scenario) must also hit
+            # stdout, not just the job-state record. "Never suppress silently."
+            print("job", jobs[i].params.job_id, "-> failed (start):", jobs[i].error)
             broadcast(ws, event_json(jobs[i], String(""), String("")))
             save_jobs_db_safe(prior, jobs)
             continue

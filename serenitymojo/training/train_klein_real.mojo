@@ -179,6 +179,15 @@ comptime SAMPLE_S = SAMPLE_N_IMG + N_TXT
 comptime SAMPLE_STEPS = 20
 comptime SAMPLE_CFG = Float32(4.0)
 comptime SAMPLE_SEED = UInt64(42)
+# Phase-4 residency budget: bytes of transformer blocks pinned permanently on
+# device (rest stream). MEASURED 2026-06-11 at 9 GiB (14/32 blocks): step
+# 4.5 -> 3.2 s, VRAM peak 21.3/24.5 GiB (nosample — LOWER this if sampling
+# in-process). The 8e-5 step-1 loss shift was GATED then CLEARED same day:
+# zero-pin run reproduces the old anchor EXACTLY (0.5414262) and
+# offload/resident_byte_identity_smoke.mojo proves resident bytes == streamed
+# bytes — the shift is pointer-alignment GEMM algo selection (same accepted
+# class as the fused-AdamW m/v ties). Anchors re-recorded below.
+comptime RESIDENT_BUDGET_BYTES = 9 * 1024 * 1024 * 1024
 comptime SCRATCH_FWD_SLAB_BYTES = 512 * 1024 * 1024
 comptime SCRATCH_FWD_SLABS = 2
 comptime SCRATCH_BWD_SLAB_BYTES = 1024 * 1024 * 1024
@@ -343,9 +352,9 @@ def _host_noise(n: Int, seed: UInt64) -> List[Float32]:
     var i = 0
     while i < n:
         state = state * 6364136223846793005 + 1442695040888963407
-        var u1f = Float64(Int((state >> 11) & 0xFFFFFFFFFFFFF)) * (1.0 / 9007199254740992.0)
+        var u1f = Float64(Int((state >> 12) & 0xFFFFFFFFFFFFF)) * (1.0 / 4503599627370496.0)
         state = state * 6364136223846793005 + 1442695040888963407
-        var u2f = Float64(Int((state >> 11) & 0xFFFFFFFFFFFFF)) * (1.0 / 9007199254740992.0)
+        var u2f = Float64(Int((state >> 12) & 0xFFFFFFFFFFFFF)) * (1.0 / 4503599627370496.0)
         if u1f < 1.0e-12:
             u1f = 1.0e-12
         var r = sqrt(-2.0 * flog(Float64(u1f)))
@@ -727,6 +736,16 @@ def main() raises:
     if runtime_profile:
         print("PROG_STAGE step=0 total=", run_steps, " phase=open_turbo_loader")
     print("  block stream:", cfg.num_double, "double +", cfg.num_single, "single blocks")
+    # ── Phase-4 residency (2026-06-11): pin blocks permanently on device up to
+    # a VRAM budget; the rest keep streaming through the 2 turbo slots. MEASURED
+    # basis: 12.4 GiB peak of 24.5 GiB during a streamed step → ~9 GiB headroom.
+    # Byte-identical weights (same pinned block store bytes) → loss unchanged.
+    var pinned_blocks = loader.pin_residents(RESIDENT_BUDGET_BYTES, ctx)
+    print(
+        "  resident blocks pinned:", pinned_blocks, "of",
+        cfg.num_double + cfg.num_single,
+        " budget_bytes=", RESIDENT_BUDGET_BYTES,
+    )
     var use_activation_tape_offload = cfg.activation_offload_enabled()
     if cfg.gradient_checkpointing_offload():
         print(

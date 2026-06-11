@@ -60,17 +60,22 @@
 # so can_prefetch() is always True in Phase 3 — we are exercising parity, not
 # memory pressure. Phase 4 can tighten the budget and enable eviction.
 
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceBuffer, DeviceContext
+from std.memory import ArcPointer
 
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.plan import BlockPlan, DTypePolicy, OffloadConfig
 from serenitymojo.offload.planned_loader import PlannedBlockHandle
-from serenitymojo.offload.turbo_loader import TurboBlockLoader
+from serenitymojo.io.ffi import BytePtr, sys_memcpy
+from serenitymojo.offload.turbo_loader import (
+    TurboBlockLoader, _TensorRecord, _h2d_dma_copy,
+)
 from serenitymojo.offload.residency import (
     ResidencyManager,
     BudgetTracker,
     BlockState,
 )
+from serenitymojo.tensor import Tensor
 
 
 def _copy_block_plan(plan: BlockPlan) -> BlockPlan:
@@ -108,6 +113,13 @@ struct TurboPlannedLoader(Movable):
     var _step: Int          # monotonic block-visit counter for mark_visit
     var _pending_idx: Int   # block index queued by prefetch() awaiting GPU dispatch
     var _has_ctx: Bool      # whether _stored_ctx is valid
+    # ── resident set (Phase 4, 2026-06-11): blocks pinned PERMANENTLY on device
+    # in their own buffers, loaded ONCE from the pinned block store. await_block
+    # returns them with NO copy and NO slot use; prefetch is a no-op for them.
+    # Default empty = behavior identical to before; opt in via pin_residents().
+    var _res_prefixes: List[String]
+    var _res_devs: List[DeviceBuffer[DType.uint8]]
+    var _res_recs: List[List[_TensorRecord]]
 
     @staticmethod
     def open(
@@ -148,6 +160,91 @@ struct TurboPlannedLoader(Movable):
         self._step = 0
         self._pending_idx = -1
         self._has_ctx = False
+        self._res_prefixes = List[String]()
+        self._res_devs = List[DeviceBuffer[DType.uint8]]()
+        self._res_recs = List[List[_TensorRecord]]()
+
+    def _resident_slot(self, norm_prefix: String) -> Int:
+        for r in range(len(self._res_prefixes)):
+            if self._res_prefixes[r] == norm_prefix:
+                return r
+        return -1
+
+    def pin_residents(mut self, budget_bytes: Int, ctx: DeviceContext) raises -> Int:
+        """Pin plan blocks (in plan order) permanently on device until
+        `budget_bytes` is reached. Each pinned block gets its OWN device buffer,
+        H2D'd ONCE from the turbo loader's pinned block store — byte-identical
+        to the streaming path (same source bytes, same per-tensor records).
+        Returns the number of blocks pinned. One ctx.synchronize() at the end
+        fences all resident copies; afterwards await_block on a resident is a
+        pure sub-buffer-view build (no copy, no slot, no fence)."""
+        var used = 0
+        var pinned = 0
+        # Reusable PINNED staging buffer (the block_store is a 1-byte dummy
+        # when TURBO_USE_PERSISTENT_BLOCK_STORE=False — measured rc=1 when
+        # pointing cuMemcpy at it). mmap -> pinned staging -> device, like
+        # TurboBlockLoader.prefetch's non-store path, synced per block since
+        # the staging buffer is reused (one-time pinning cost).
+        var staging = ctx.enqueue_create_host_buffer[DType.uint8](
+            self._turbo.slab_capacity
+        )
+        ctx.synchronize()
+        for i in range(self._plan.count()):
+            var p = self._plan.normalized_prefix(i)
+            if self._resident_slot(p) >= 0:
+                continue
+            var prefix_idx = -1
+            for j in range(len(self._turbo.index_prefixes)):
+                if self._turbo.index_prefixes[j] == p:
+                    prefix_idx = j
+                    break
+            if prefix_idx < 0:
+                raise Error(
+                    String("pin_residents: no tensors for prefix: ") + p
+                )
+            var n_bytes = self._turbo.store_nbytes[prefix_idx]
+            if used + n_bytes > budget_bytes:
+                break  # plan-order contiguous pin; the rest keep streaming
+            # per-tensor records + mmap->staging memcpy, EXACTLY like
+            # TurboBlockLoader.prefetch's non-store path
+            var recs = List[_TensorRecord]()
+            var offset = 0
+            var start = self._turbo.index_starts[prefix_idx]
+            var end = start + self._turbo.index_lengths[prefix_idx]
+            for ni in range(start, end):
+                var nm = self._turbo.index_names[ni].copy()
+                var tv = self._turbo.sharded.tensor_view(nm)
+                var nb = tv.nbytes()
+                var sh = ArcPointer(tv.shape.copy())
+                var dst = BytePtr(
+                    unsafe_from_address=Int(staging.unsafe_ptr()) + offset
+                )
+                var src = BytePtr(
+                    unsafe_from_address=Int(tv.data.unsafe_ptr())
+                )
+                _ = sys_memcpy(dst, src, nb)
+                recs.append(_TensorRecord(nm, offset, nb, sh, tv.dtype))
+                offset += nb
+            if offset != n_bytes:
+                raise Error(
+                    String("pin_residents: record bytes ") + String(offset)
+                    + " != store bytes " + String(n_bytes) + " for " + p
+                )
+            var dev = ctx.enqueue_create_buffer[DType.uint8](n_bytes)
+            ctx.synchronize()  # materialize alloc before raw CUDA copy
+            _h2d_dma_copy(
+                UInt64(Int(dev.unsafe_ptr())),
+                staging.unsafe_ptr(),
+                n_bytes,
+                self._turbo.copy_stream,
+            )
+            ctx.synchronize()  # staging is reused next block — fence the copy
+            self._res_prefixes.append(p)
+            self._res_devs.append(dev^)
+            self._res_recs.append(recs^)
+            used += n_bytes
+            pinned += 1
+        return pinned
 
     def block_count(self) -> Int:
         return self._plan.count()
@@ -196,6 +293,8 @@ struct TurboPlannedLoader(Movable):
         """Stage block at plan index `index` immediately on the copy stream."""
         if index < 0 or index >= self._plan.count():
             return
+        if self._resident_slot(self._plan.normalized_prefix(index)) >= 0:
+            return  # permanently on device — nothing to stage
         self._advance_residency_to_prefetching(index)
         if self._pending_idx == index:
             self._pending_idx = -1
@@ -264,6 +363,21 @@ struct TurboPlannedLoader(Movable):
 
         var prefix = self._plan.prefix(index)
         var load_prefix = self._plan.normalized_prefix(index)
+
+        # ── resident fast path: no copy, no slot, no fence ───────────────────
+        var rslot = self._resident_slot(load_prefix)
+        if rslot >= 0:
+            self._dispatch_pending(ctx)  # keep lookahead for streamed blocks
+            var rblock = Block()
+            for t in range(len(self._res_recs[rslot])):
+                var rec = self._res_recs[rslot][t].copy()
+                var sub = self._res_devs[rslot].create_sub_buffer[DType.uint8](
+                    rec.offset, rec.nbytes
+                )
+                var tt = Tensor(sub^, rec.shape[].copy(), rec.dtype)
+                rblock[rec.name] = ArcPointer(tt^)
+            self._step += 1
+            return PlannedBlockHandle(index, prefix, rblock^)
 
         # Dispatch pending prefetch onto copy stream BEFORE fencing default stream.
         # This is the overlap moment: copy stream starts staging the NEXT block

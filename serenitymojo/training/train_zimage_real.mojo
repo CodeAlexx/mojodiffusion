@@ -85,6 +85,15 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
     save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
     zimage_lora_set_to_device_resident,
+    ZImageStepIO, ZImageStackForwardV5, zimage_step_io_init,
+    zimage_step_io_write_inputs, zimage_step_io_write_d_patches,
+    zimage_step_io_read_grads,
+    zimage_stack_lora_forward_main_device_v5,
+    zimage_stack_lora_backward_main_device_v5,
+)
+from serenitymojo.autograd_v2.capture import (
+    CudaGraphHandle, cuda_capture_begin, cuda_capture_end_instantiate,
+    cuda_graph_launch,
 )
 from serenitymojo.training.lora_adamw_plain_fused import (
     LoraAdamWPlainDeviceState, lora_adamw_plain_device_state_init,
@@ -98,6 +107,7 @@ from serenitymojo.models.zimage.lora_block import (
 from serenitymojo.models.zimage.real_weights import (
     ZImageRealAux, load_zimage_real_aux, build_adaln, build_block_modvecs,
     build_f_scale, build_cap_seq, build_x_seq, build_rope, build_positions,
+    build_rope_host, ZImageRopeHost,
 )
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.schedule import sample_timestep_logit_normal
@@ -175,6 +185,15 @@ comptime ZIMAGE_V2_GRAPH = True
 # B2 path are untouched in P4 (fwd slab-routing is P5 prep). False = _v3,
 # bit-equal oracle (gate-don't-delete, C13/C14).
 comptime ZIMAGE_V2_SLAB = True
+# v2 CAPTURE (autograd_v2 Phase P5, contract C9): the B=1 step is captured as
+# TWO CUDA graphs per bucket (G_fwd = the _v5 slab forward; G_bwd = the _v5
+# slab backward) and replayed with cuGraphLaunch from step 3 of each bucket
+# (step 1 warmup, step 2 capture — flame cuda_graph.rs:220-240 lifecycle).
+# Host loss/d_loss math between the graphs is UNCHANGED (C14 bit-gates).
+# Capture is keyed per bucket and implemented for the 64x64 latent buckets;
+# other buckets run the same _v5 path uncaptured. Requires ENGINE+GRAPH+SLAB.
+# False = the P4 _v4 path, bit-equal oracle (gate-don't-delete, C13/C14).
+comptime ZIMAGE_V2_CAPTURE = True
 
 comptime LAT_C = 16
 comptime LAT_H = 72
@@ -692,6 +711,30 @@ def _cache_valid_cap(cache: KleinCache, slot: Int, ctx: DeviceContext) raises ->
     return _valid_cap_from_mask(s.text_mask, ctx)
 
 
+# ── P5 capture state (contract C9; flame cuda_graph.rs:192-276 lifecycle) ────
+# One entry per (lat_h, lat_w, cap_len) bucket: the fixed-address step I/O,
+# the two instantiated CUDA graphs (fwd / bwd), the saved _v5 forward views
+# (fixed pointers — reused on replay), and the phase counter:
+#   phase 0 = warmup next (normal _v5 run; slabs + persistent buffers
+#             materialize), 1 = capture next (begin → run → end → instantiate
+#             → LAUNCH, so the capture step trains normally), >= 2 = replay
+#             (write IO, reset slab cursors, cuGraphLaunch).
+# Only the 64x64 latent buckets capture (the alina 512 cache); other buckets
+# run the same _v5 path uncaptured (printed once).
+@fieldwise_init
+struct ZImageCaptureBucket(Copyable, Movable):
+    var lat_h: Int
+    var lat_w: Int
+    var cap_len: Int
+    var enabled: Bool
+    var phase: Int
+    var io: ZImageStepIO
+    var fwd_graph: CudaGraphHandle
+    var bwd_graph: CudaGraphHandle
+    var saved: Optional[ZImageStackForwardV5]
+    var printed_unsupported: Bool
+
+
 def _train_one_step_bucket[
     LAT_H_B: Int, LAT_W_B: Int, CAP_LEN_B: Int
 ](
@@ -715,6 +758,8 @@ def _train_one_step_bucket[
     train_cfg: TrainConfig,
     train_start_ns: UInt,
     mut slab: StepSlab,
+    mut fwd_slab: StepSlab,
+    mut cap_buckets: List[ZImageCaptureBucket],
     ctx: DeviceContext,
 ) raises -> StepResult:
     comptime HT_B = LAT_H_B // PATCH
@@ -724,6 +769,19 @@ def _train_one_step_bucket[
     comptime N_IMG_B = N_IMG_REAL_B + IMG_PAD_B
     comptime N_TXT_B = CAP_LEN_B
     comptime S_B = N_IMG_B + N_TXT_B
+
+    # P5: the captured step (warmup/capture/replay per bucket). Old paths
+    # below stay compiled + reachable when the flag is off (C13).
+    comptime if (
+        ZIMAGE_V2_ENGINE and ZIMAGE_V2_GRAPH and ZIMAGE_V2_SLAB
+        and ZIMAGE_V2_CAPTURE
+    ):
+        return _train_one_step_bucket_capture[LAT_H_B, LAT_W_B, CAP_LEN_B](
+            k, run_steps, slot, step_seed, cache, aux,
+            nr_blocks, cr_blocks, main_blocks, lora, opt_state, resident_dev,
+            n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+            train_cfg, train_start_ns, slab, fwd_slab, cap_buckets, ctx,
+        )
 
     var t0 = perf_counter_ns()
 
@@ -963,6 +1021,247 @@ def _train_one_step_bucket[
     return StepResult(loss, Float32(gn_before), Float32(secs), b_absum, b_nonzero, grads.nonfinite_lora_grads)
 
 
+
+# ── P5 captured step (contract C9). Per bucket: warmup → capture → replay.
+# Prologue host math (sigma / noise / targets / embedder seqs / rope values /
+# modvecs / f_scale) is byte-identical to _train_one_step_bucket; the values
+# enter the graphs through the bucket's fixed-address ZImageStepIO. The host
+# loss + d_loss block between G_fwd and G_bwd is UNCHANGED (C14 bit-gates).
+def _train_one_step_bucket_capture[
+    LAT_H_B: Int, LAT_W_B: Int, CAP_LEN_B: Int
+](
+    k: Int,
+    run_steps: Int,
+    slot: Int,
+    step_seed: UInt64,
+    cache: KleinCache,
+    aux: ZImageRealAux,
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    mut lora: ZImageLoraSet,
+    mut opt_state: LoraAdamWPlainDeviceState,
+    resident_dev: ZImageLoraDeviceSet,
+    n_adapters: Int,
+    final_lin_w: Tensor,
+    final_lin_b: Tensor,
+    x_pad_h: List[Float32],
+    cap_pad_h: List[Float32],
+    train_cfg: TrainConfig,
+    train_start_ns: UInt,
+    mut slab: StepSlab,
+    mut fwd_slab: StepSlab,
+    mut cap_buckets: List[ZImageCaptureBucket],
+    ctx: DeviceContext,
+) raises -> StepResult:
+    comptime HT_B = LAT_H_B // PATCH
+    comptime WT_B = LAT_W_B // PATCH
+    comptime N_IMG_REAL_B = HT_B * WT_B
+    comptime IMG_PAD_B = (32 - (N_IMG_REAL_B % 32)) % 32
+    comptime N_IMG_B = N_IMG_REAL_B + IMG_PAD_B
+    comptime N_TXT_B = CAP_LEN_B
+    comptime S_B = N_IMG_B + N_TXT_B
+
+    var t0 = perf_counter_ns()
+
+    var s = cache.load(slot, ctx)
+    var lsh = s.latent.shape()
+    if lsh[1] != LAT_C or lsh[2] != LAT_H_B or lsh[3] != LAT_W_B:
+        raise Error("train_zimage_real: dispatched sample to wrong latent bucket")
+
+    var valid_cap = _valid_cap_from_mask(s.text_mask, ctx)
+    if valid_cap <= 0 or valid_cap > CAP_LEN_B:
+        raise Error("train_zimage_real: dispatched sample to wrong text bucket")
+
+    var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+    var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
+    if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
+        sigma_idx = NUM_TRAIN_TIMESTEPS - 1
+    var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+    var t_value = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
+
+    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + step_seed)
+    var latent_inputs = _build_latent_step_inputs[LAT_H_B, LAT_W_B](
+        s.latent, noise_lat, sig, ctx,
+    )
+
+    var x_t = build_x_seq(aux, latent_inputs.noisy_latent, LAT_C, LAT_H_B, LAT_W_B, PATCH, ctx)
+    for _pad in range(IMG_PAD_B):
+        for c in range(D):
+            x_t.append(x_pad_h[c])
+
+    var cap2 = _cap_tensor_from_cache[CAP_LEN_B](s.text_embedding, valid_cap, ctx)
+    var cap_seq = build_cap_seq(aux, cap2, EPS, ctx)
+    for r in range(valid_cap, CAP_LEN_B):
+        for c in range(D):
+            cap_seq[r * D + c] = cap_pad_h[c]
+
+    var pos_step = build_positions(N_IMG_B, HT_B, WT_B, CAP_LEN_B, valid_cap)
+    var x_pos = pos_step[0].copy()
+    var cap_pos = pos_step[1].copy()
+    var uni_pos = List[List[Int]]()
+    for i in range(len(x_pos)):
+        uni_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos)):
+        uni_pos.append(cap_pos[i].copy())
+    # rope tables as HOST values (build_rope_host == build_rope's math; the
+    # bytes land in the fixed IO buffers instead of fresh uploads).
+    var rx = build_rope_host(x_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2)
+    var rc = build_rope_host(cap_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2)
+    var ru = build_rope_host(uni_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2)
+
+    var adaln = build_adaln(aux, t_value, ADALN_DIM, T_SCALE, ctx)
+    var nr_mod = List[ZImageModVecs]()
+    for i in range(NUM_NR):
+        nr_mod.append(build_block_modvecs(aux.nr_mod_w[i][], aux.nr_mod_b[i][], adaln, D, ctx))
+    var main_mod = List[ZImageModVecs]()
+    for i in range(MAIN_DEPTH):
+        main_mod.append(build_block_modvecs(aux.main_mod_w[i][], aux.main_mod_b[i][], adaln, D, ctx))
+    var f_scale = build_f_scale(aux, adaln, D, ctx)
+
+    # ── per-bucket capture state (find-or-create; IO allocates ONCE) ─────────
+    var bidx = -1
+    for i in range(len(cap_buckets)):
+        if (
+            cap_buckets[i].lat_h == LAT_H_B
+            and cap_buckets[i].lat_w == LAT_W_B
+            and cap_buckets[i].cap_len == CAP_LEN_B
+        ):
+            bidx = i
+    if bidx < 0:
+        var io0 = zimage_step_io_init(
+            N_IMG_B, N_TXT_B, D, OUT_CH, NUM_NR, MAIN_DEPTH, H, Dh,
+            final_lin_b, ctx,
+        )
+        var enabled = LAT_H_B == 64 and LAT_W_B == 64
+        cap_buckets.append(ZImageCaptureBucket(
+            LAT_H_B, LAT_W_B, CAP_LEN_B, enabled, 0, io0^,
+            CudaGraphHandle(0, 0, 0), CudaGraphHandle(0, 0, 0),
+            Optional[ZImageStackForwardV5](None), False,
+        ))
+        bidx = len(cap_buckets) - 1
+    var b = cap_buckets[bidx].copy()
+    if not b.enabled and not b.printed_unsupported:
+        print("[CAPTURE] bucket unsupported, running uncaptured")
+        b.printed_unsupported = True
+
+    # ── ONE packed H2D write of every per-step input (fixed pointers) ────────
+    zimage_step_io_write_inputs(
+        b.io, x_t, cap_seq, nr_mod, main_mod, f_scale, rx, rc, ru, ctx,
+    )
+    var t_prep = perf_counter_ns()
+    var t_lora = t_prep   # resident set: no per-step LoRA upload
+
+    # ── G_fwd: warmup / capture / replay ─────────────────────────────────────
+    fwd_slab.reset()
+    if b.enabled and b.phase >= 2:
+        cuda_graph_launch(b.fwd_graph, ctx)
+    else:
+        if b.enabled and b.phase == 1:
+            cuda_capture_begin(ctx)
+        var fwd5 = zimage_stack_lora_forward_main_device_v5[
+            H, Dh, N_IMG_B, N_TXT_B, S_B
+        ](
+            nr_blocks, cr_blocks, main_blocks, resident_dev, final_lin_w,
+            b.io, D, F, OUT_CH, EPS, FINAL_EPS, ctx, fwd_slab,
+        )
+        if b.enabled and b.phase == 1:
+            b.fwd_graph = cuda_capture_end_instantiate(ctx)
+            print("[CAPTURE] fwd graph captured: nodes=", b.fwd_graph.nodes)
+            cuda_graph_launch(b.fwd_graph, ctx)
+        b.saved = Optional[ZImageStackForwardV5](fwd5^)
+    var saved5 = b.saved.value().copy()
+    var t_fwd = perf_counter_ns()
+
+    # ── host loss + d_loss (UNCHANGED math; patches read from the fixed
+    # buffer AFTER the launch — the .to_host moved out of the region) ────────
+    var patches_h = saved5.patches[].to_host(ctx)
+    var tgt_patch = latent_inputs.target_patch.copy()
+    var real_nout = len(tgt_patch)
+    var seq_nout = N_IMG_B * OUT_CH
+    var d_loss = List[Float32]()
+    var pred_vals = List[Float32]()
+    var sse = 0.0
+    var inv_n = Float32(2.0) / Float32(real_nout)
+    for i in range(real_nout):
+        var pred = -patches_h[i]
+        pred_vals.append(pred)
+        var diff = pred - tgt_patch[i]
+        sse += Float64(diff) * Float64(diff)
+        d_loss.append(-inv_n * diff)
+    for _i in range(real_nout, seq_nout):
+        d_loss.append(Float32(0.0))
+    var loss = Float32(sse / Float64(real_nout))
+    var t_loss = perf_counter_ns()
+
+    if k == 1:
+        var ps = _flat_stats(pred_vals)
+        var ts = _flat_stats(tgt_patch)
+        print("[DEBUG step=1] bucket=", LAT_H_B, "x", LAT_W_B, " cap=", CAP_LEN_B,
+              " sigma_idx=", sigma_idx, " sig=", sig,
+              " pred mean=", Float32(ps.mean), " std=", Float32(ps.std),
+              " max_abs=", ps.max_abs, " target mean=", Float32(ts.mean),
+              " std=", Float32(ts.std), " max_abs=", ts.max_abs)
+
+    zimage_step_io_write_d_patches(b.io, d_loss, ctx)
+
+    # ── G_bwd: warmup / capture / replay ─────────────────────────────────────
+    slab.reset()
+    if b.enabled and b.phase >= 2:
+        cuda_graph_launch(b.bwd_graph, ctx)
+    else:
+        if b.enabled and b.phase == 1:
+            cuda_capture_begin(ctx)
+        zimage_stack_lora_backward_main_device_v5[H, Dh, N_IMG_B, N_TXT_B, S_B](
+            main_blocks, resident_dev, final_lin_w, saved5, b.io,
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx, slab,
+        )
+        if b.enabled and b.phase == 1:
+            b.bwd_graph = cuda_capture_end_instantiate(ctx)
+            print("[CAPTURE] bwd graph captured: nodes=", b.bwd_graph.nodes)
+            cuda_graph_launch(b.bwd_graph, ctx)
+    var grads = zimage_step_io_read_grads(b.io, NUM_NR + NUM_CR + MAIN_DEPTH, ctx)
+    var t_bwd = perf_counter_ns()
+
+    if b.enabled and b.phase < 2:
+        b.phase += 1
+    cap_buckets[bidx] = b^
+
+    var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
+    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    fused_lora_adamw_plain_step_resident(
+        opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+        train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+        train_cfg.weight_decay, ctx,
+    )
+    var t_opt = perf_counter_ns()
+
+    var t1 = perf_counter_ns()
+    var secs = Float64(t1 - t0) / 1.0e9
+    var b_absum = Float32(0.0)
+    var b_nonzero = 0
+    for i in range(TRAIN_ADAPTER_START, n_adapters):
+        var bs2 = _absum(lora.ad[i].b)
+        b_absum += bs2
+        if bs2 > 0.0:
+            b_nonzero += 1
+    print_trainer_progress(
+        String("ZImage-lora"), k, run_steps, 1,
+        loss, Float64(gn_before), secs, 0.0,
+        Float64(t1 - train_start_ns) / 1.0e9,
+    )
+    if grads.nonfinite_lora_grads != 0:
+        print("[ZImage-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
+    print("[TIMING step=", k,
+          "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
+          " lora_upload=", Float32(Float64(t_lora - t_prep) / 1.0e9),
+          " fwd=", Float32(Float64(t_fwd - t_lora) / 1.0e9),
+          " loss=", Float32(Float64(t_loss - t_fwd) / 1.0e9),
+          " bwd=", Float32(Float64(t_bwd - t_loss) / 1.0e9),
+          " opt=", Float32(Float64(t_opt - t_bwd) / 1.0e9))
+    return StepResult(loss, Float32(gn_before), Float32(secs), b_absum, b_nonzero, grads.nonfinite_lora_grads)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -1056,6 +1355,20 @@ def main() raises:
         slab_bytes = 4096
         slab_count = 1
     var slab = StepSlab(ctx, slab_bytes, slab_count, 256)
+    # ── P5 forward slab (contract C9): the _v5 forward's transients. Per-block
+    # mark/rewind keeps the peak at one block (~1.3 GiB at S=1248 incl. the
+    # 187 MiB SDPA score slab); 9 x 256 MiB = 2.25 GiB covers it + ring
+    # boundary waste. Gated to one page when capture is off.
+    var fwd_slab_bytes = 256 * 1024 * 1024
+    var fwd_slab_count = 9
+    comptime if not (
+        ZIMAGE_V2_ENGINE and ZIMAGE_V2_GRAPH and ZIMAGE_V2_SLAB
+        and ZIMAGE_V2_CAPTURE
+    ):
+        fwd_slab_bytes = 4096
+        fwd_slab_count = 1
+    var fwd_slab = StepSlab(ctx, fwd_slab_bytes, fwd_slab_count, 256)
+    var cap_buckets = List[ZImageCaptureBucket]()
     # Steady-state determinism gate (P4 deliverable 4): per-step n_allocs
     # deltas for steps 3/4/5 must be IDENTICAL (the allocation sequence is
     # shape-independent: counts depend only on the recorded graph structure).
@@ -1185,14 +1498,14 @@ def main() raises:
                 var r_72_224 = _train_one_step_bucket[72, 56, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, slab, ctx,
+                    train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_72_224.loss
             elif valid_cap <= 256:
                 var r_72_256 = _train_one_step_bucket[72, 56, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, slab, ctx,
+                    train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_72_256.loss
             else:
@@ -1202,14 +1515,14 @@ def main() raises:
                 var r_88_224 = _train_one_step_bucket[88, 48, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, slab, ctx,
+                    train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_88_224.loss
             elif valid_cap <= 256:
                 var r_88_256 = _train_one_step_bucket[88, 48, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, slab, ctx,
+                    train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_88_256.loss
             else:
@@ -1221,14 +1534,14 @@ def main() raises:
                 var r_64_224 = _train_one_step_bucket[64, 64, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, slab, ctx,
+                    train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_64_224.loss
             elif valid_cap <= 256:
                 var r_64_256 = _train_one_step_bucket[64, 64, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, slab, ctx,
+                    train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_64_256.loss
             else:

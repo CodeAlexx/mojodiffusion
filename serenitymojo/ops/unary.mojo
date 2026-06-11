@@ -567,5 +567,6 @@ def tanh_op_slab(x: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Te
         ctx.enqueue_function[_tanh_kernel_f16, _tanh_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering (TIER2 precedent,
+    # ops/attention.mojo); no sync inside a captured region.
     return Tensor(out_buf^, x.shape(), x.dtype())

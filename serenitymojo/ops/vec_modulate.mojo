@@ -27,6 +27,8 @@ from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.elementwise import modulate as _scalar_modulate
+from serenitymojo.ops.elementwise import modulate_slab as _scalar_modulate_slab
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -83,6 +85,57 @@ def vec_modulate(
         rows *= xshape[i]
     var n = rows * d
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
+    var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+    var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        scale.buf.unsafe_ptr().bitcast[Float32](), v_rl
+    )
+    var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        shift.buf.unsafe_ptr().bitcast[Float32](), v_rl
+    )
+    var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+    )
+    var nchunks = n // _VW
+    var grid = (nchunks + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_vec_modulate_kernel, _vec_modulate_kernel](
+        X, S, SH, O, d, nchunks, grid_dim=grid, block_dim=_BLOCK
+    )
+    return Tensor(out_buf^, xshape.copy(), STDtype.F32)
+
+
+def vec_modulate_slab(
+    x: Tensor, scale: Tensor, shift: Tensor, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `vec_modulate` (above) — byte-identical math (same
+    kernel, same launch params); ONLY the allocation source changes
+    (autograd_v2 contracts C8/C9, Phase P5). Non-F32 inputs route to
+    modulate_slab (the dtype-preserving scalar sibling, same dispatch shape
+    as the non-slab pair)."""
+    if x.dtype() != STDtype.F32 or scale.dtype() != STDtype.F32 or shift.dtype() != STDtype.F32:
+        return _scalar_modulate_slab(x, scale, shift, ctx, slab)
+    var xshape = x.shape()
+    var d = xshape[len(xshape) - 1]
+    var sshape = scale.shape()
+    var shshape = shift.shape()
+    if len(sshape) != 1 or sshape[0] != d:
+        raise Error("vec_modulate: scale must be [D]")
+    if len(shshape) != 1 or shshape[0] != d:
+        raise Error("vec_modulate: shift must be [D]")
+    if d % _VW != 0:
+        raise Error(
+            String("vec_modulate: D must be a multiple of 4 (got ")
+            + String(d) + ") — use the scalar modulate"
+        )
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+    var n = rows * d
+    var out_buf = slab.alloc(x.nbytes())
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
     var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](

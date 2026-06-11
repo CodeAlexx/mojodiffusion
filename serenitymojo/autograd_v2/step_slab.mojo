@@ -70,6 +70,13 @@ struct StepSlab(Movable):
     def mark(mut self) -> ScratchRingMark:
         return self.ring.mark()
 
+    def reset(mut self):
+        """Rewind BOTH cursors to the slab base (host-side bookkeeping only —
+        no device work, never frees memory). P5 capture: the fwd slab is reset
+        at the top of every step so warmup/capture/replay all see the
+        identical allocation sequence from the identical base (C9)."""
+        self.ring.reset()
+
     def rewind(mut self, m: ScratchRingMark) raises:
         self.ring.rewind(m)
 

@@ -64,7 +64,7 @@
 # Mojo 1.0.0b1: def not fn; Tensor move-only; host List[Float32] carriers.
 
 from std.gpu import global_idx
-from std.gpu.host import DeviceContext, HostBuffer
+from std.gpu.host import DeviceContext, HostBuffer, DeviceBuffer
 from std.utils.index import IndexList
 from std.collections import List, Optional
 from std.memory import ArcPointer
@@ -73,13 +73,19 @@ from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.linear import linear
-from serenitymojo.ops.norm import layer_norm
+from serenitymojo.ops.linear import linear, linear_slab
+from serenitymojo.ops.norm import layer_norm, layer_norm_slab
 from serenitymojo.ops.elementwise import modulate
-from serenitymojo.ops.vec_modulate import vec_modulate
-from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx
-from serenitymojo.ops.norm_backward import layer_norm_backward, layer_norm_backward_dx
-from serenitymojo.ops.elementwise_backward import modulate_backward
+from serenitymojo.ops.vec_modulate import vec_modulate, vec_modulate_slab
+from serenitymojo.ops.linalg_backward import (
+    linear_backward, linear_backward_dx, linear_backward_dx_slab,
+)
+from serenitymojo.ops.norm_backward import (
+    layer_norm_backward, layer_norm_backward_dx, layer_norm_backward_dx_slab,
+)
+from serenitymojo.ops.elementwise_backward import (
+    modulate_backward, modulate_backward_slab,
+)
 
 from serenitymojo.models.zimage.weights import ZImageBlockWeights
 from serenitymojo.models.zimage.block import (
@@ -101,6 +107,8 @@ from serenitymojo.models.zimage.lora_block import (
     zimage_block_lora_predict_device_tensor_moddev,
     zimage_refiner_lora_forward, zimage_refiner_lora_backward,
     zimage_block_forward_device_moddev, zimage_refiner_forward_device,
+    zimage_block_forward_device_moddev_slab, zimage_refiner_forward_device_slab,
+    zimage_block_lora_forward_device_only_slab,
 )
 from serenitymojo.ops.tensor_algebra import concat
 from serenitymojo.models.zimage.zimage_stack import (
@@ -2038,5 +2046,559 @@ def zimage_stack_lora_backward_main_device_b2[
         empty_x^, empty_cap^,
         empty_nr^, empty_main^,
         _zeros(D), List[Float32](),
+        nonfinite,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase P5 (AUTOGRAD_V2_MOJO_DESIGN.md C9): CUDA-graph capture surface for the
+# B=1 step. Everything a captured kernel touches lives at a FIXED address
+# across steps:
+#   * ZImageStepIO — per-bucket persistent device buffers for every per-step
+#     INPUT (x_t, cap_seq, modvec slabs, final consts, rope tables, d_loss
+#     root) written via H2D copy from staging BEFORE the graph launch, plus
+#     the persistent OUTPUT carriers (d_f_scale, per-block d_x ping-pong, the
+#     420 adapter grads) and the forward x-chain (block inputs/outputs).
+#   * _v5 forward — the _v3 op chain routed through the _slab op variants on a
+#     SECOND StepSlab (fwd_slab, reset per step): per-block mark/rewind with
+#     the surviving x copied into the persistent chain. patches stay in a
+#     fixed slab buffer; .to_host happens AFTER the graph launch.
+#   * _v5 backward — the _v4 chain with the final-layer prologue slab-routed
+#     (d_loss enters via io.d_patches; d_f_scale reduced in-graph into a fixed
+#     buffer) and the per-block copy-outs landing in the persistent grads
+#     region instead of fresh pool buffers.
+# Same ops, same order, same values as _v3/_v4 (C14 bit-gates); only WHERE
+# tensors live moved. Old paths untouched (C13).
+# ══════════════════════════════════════════════════════════════════════════════
+
+from serenitymojo.models.zimage.real_weights import ZImageRopeHost
+
+
+struct ZImageStackForwardV5(Copyable, Movable):
+    """_v5 forward result: device-resident, fixed-address. `patches` is the
+    final projection [S, out_ch] in the fwd slab (deterministic address);
+    main_x_in are views of the persistent x-chain; x_final == x_chain[last];
+    ln_x is the fwd-slab layer_norm output the bwd prologue re-reads."""
+    var patches: TArc
+    var main_x_in: List[TArc]
+    var x_final: TArc
+    var ln_x: TArc
+
+    def __init__(
+        out self, var patches: TArc, var main_x_in: List[TArc],
+        var x_final: TArc, var ln_x: TArc,
+    ):
+        self.patches = patches^
+        self.main_x_in = main_x_in^
+        self.x_final = x_final^
+        self.ln_x = ln_x^
+
+
+struct ZImageStepIO(Copyable, Movable):
+    """Per-bucket fixed-address step I/O (contract C9 pointer stability).
+
+    ONE device input slab holds every per-step input value; views are carved
+    once at init. Per step the trainer packs host values into a pinned staging
+    buffer and issues ONE H2D copy (values change, pointers don't) — value
+    bytes identical to the _v3 builders (same pack layouts). Output carriers
+    and the forward x-chain are plain persistent device buffers."""
+    # dims
+    var n_img: Int
+    var n_txt: Int
+    var s_total: Int
+    var d_model: Int
+    var out_ch: Int
+    var num_nr: Int
+    var num_main: Int
+    var rope_half: Int
+    var n_heads: Int
+    # input slab + element offsets
+    var in_slab: TArc           # [in_total] F32 (owner)
+    var in_total: Int
+    var off_x: Int
+    var off_cap: Int
+    var off_mv_main: Int
+    var off_mv_nr: Int
+    var off_fconsts: Int
+    var off_rx: Int             # x cos | x sin (contiguous)
+    var off_rc: Int             # cap cos | cap sin
+    var off_ru: Int             # uni cos | uni sin
+    # carved views
+    var x_t: TArc               # [n_img, D] F32
+    var cap: TArc               # [n_txt, D] F32
+    var mv_main: List[ZImageModVecsDevice]
+    var mv_nr: List[ZImageModVecsDevice]
+    var ones: TArc              # [D]
+    var zeros: TArc             # [D]
+    var f_scale: TArc           # [D]
+    var rope_x_cos: TArc
+    var rope_x_sin: TArc
+    var rope_cap_cos: TArc
+    var rope_cap_sin: TArc
+    var rope_uni_cos: TArc
+    var rope_uni_sin: TArc
+    # d_loss root (separate small buffer, written after the host loss)
+    var d_patches: TArc         # [S, out_ch] F32 (cap rows stay zero)
+    # output carriers
+    var d_f_scale: TArc         # [D] F32
+    var grad_a: List[TArc]      # lazy (warmup): bwd visit order
+    var grad_b: List[TArc]
+    var grad_indices: List[Int]
+    var dx_carrier: List[TArc]  # lazy: 2 x [S, D] ping-pong
+    # forward persistents
+    var x_chain: List[TArc]     # (num_main+1) x [S, D] F32
+    var nr_ping: List[TArc]     # 2 x [n_img, D] F32
+    var cr_ping: List[TArc]     # 2 x [n_txt, D] F32
+    var final_bias: TArc        # cloned once per bucket
+
+    def __init__(
+        out self,
+        n_img: Int, n_txt: Int, s_total: Int, d_model: Int, out_ch: Int,
+        num_nr: Int, num_main: Int, rope_half: Int, n_heads: Int,
+        var in_slab: TArc, in_total: Int,
+        off_x: Int, off_cap: Int, off_mv_main: Int, off_mv_nr: Int,
+        off_fconsts: Int, off_rx: Int, off_rc: Int, off_ru: Int,
+        var x_t: TArc, var cap: TArc,
+        var mv_main: List[ZImageModVecsDevice],
+        var mv_nr: List[ZImageModVecsDevice],
+        var ones: TArc, var zeros: TArc, var f_scale: TArc,
+        var rope_x_cos: TArc, var rope_x_sin: TArc,
+        var rope_cap_cos: TArc, var rope_cap_sin: TArc,
+        var rope_uni_cos: TArc, var rope_uni_sin: TArc,
+        var d_patches: TArc, var d_f_scale: TArc,
+        var x_chain: List[TArc], var nr_ping: List[TArc],
+        var cr_ping: List[TArc], var final_bias: TArc,
+    ):
+        self.n_img = n_img
+        self.n_txt = n_txt
+        self.s_total = s_total
+        self.d_model = d_model
+        self.out_ch = out_ch
+        self.num_nr = num_nr
+        self.num_main = num_main
+        self.rope_half = rope_half
+        self.n_heads = n_heads
+        self.in_slab = in_slab^
+        self.in_total = in_total
+        self.off_x = off_x
+        self.off_cap = off_cap
+        self.off_mv_main = off_mv_main
+        self.off_mv_nr = off_mv_nr
+        self.off_fconsts = off_fconsts
+        self.off_rx = off_rx
+        self.off_rc = off_rc
+        self.off_ru = off_ru
+        self.x_t = x_t^
+        self.cap = cap^
+        self.mv_main = mv_main^
+        self.mv_nr = mv_nr^
+        self.ones = ones^
+        self.zeros = zeros^
+        self.f_scale = f_scale^
+        self.rope_x_cos = rope_x_cos^
+        self.rope_x_sin = rope_x_sin^
+        self.rope_cap_cos = rope_cap_cos^
+        self.rope_cap_sin = rope_cap_sin^
+        self.rope_uni_cos = rope_uni_cos^
+        self.rope_uni_sin = rope_uni_sin^
+        self.d_patches = d_patches^
+        self.d_f_scale = d_f_scale^
+        self.grad_a = List[TArc]()
+        self.grad_b = List[TArc]()
+        self.grad_indices = List[Int]()
+        self.dx_carrier = List[TArc]()
+        self.x_chain = x_chain^
+        self.nr_ping = nr_ping^
+        self.cr_ping = cr_ping^
+        self.final_bias = final_bias^
+
+
+def _io_view(
+    dev: DeviceBuffer[DType.uint8], off_elems: Int, var shape: List[Int]
+) raises -> TArc:
+    var n = 1
+    for i in range(len(shape)):
+        n *= shape[i]
+    return TArc(Tensor(
+        dev.create_sub_buffer[DType.uint8](off_elems * 4, n * 4),
+        shape^, STDtype.F32,
+    ))
+
+
+def _io_fresh(var shape: List[Int], ctx: DeviceContext) raises -> TArc:
+    var n = 1
+    for i in range(len(shape)):
+        n *= shape[i]
+    var buf = ctx.enqueue_create_buffer[DType.uint8](n * 4)
+    return TArc(Tensor(buf^, shape^, STDtype.F32))
+
+
+def zimage_step_io_init(
+    n_img: Int, n_txt: Int, d_model: Int, out_ch: Int,
+    num_nr: Int, num_main: Int, n_heads: Int, dh: Int,
+    final_lin_b: Tensor, ctx: DeviceContext,
+) raises -> ZImageStepIO:
+    var s_total = n_img + n_txt
+    var half = dh // 2
+    var d = d_model
+    # element offsets in the input slab (F32)
+    var off_x = 0
+    var off_cap = off_x + n_img * d
+    var off_mv_main = off_cap + n_txt * d
+    var off_mv_nr = off_mv_main + (num_main * 4 + 1) * d
+    var off_fconsts = off_mv_nr + (num_nr * 4 + 1) * d
+    var off_rx = off_fconsts + 3 * d
+    var off_rc = off_rx + 2 * (n_img * n_heads * half)
+    var off_ru = off_rc + 2 * (n_txt * n_heads * half)
+    var in_total = off_ru + 2 * (s_total * n_heads * half)
+
+    var dev = ctx.enqueue_create_buffer[DType.uint8](in_total * 4)
+
+    var x_t = _io_view(dev, off_x, [n_img, d])
+    var cap = _io_view(dev, off_cap, [n_txt, d])
+
+    # modvec views mirror zimage_modvecs_all_to_device's slab layout exactly:
+    # block-major scale_msa|gate_msa|scale_mlp|gate_mlp + shared zeros tail.
+    var mv_main = List[ZImageModVecsDevice]()
+    var mv_main_zeros = _io_view(dev, off_mv_main + num_main * 4 * d, [d])
+    for i in range(num_main):
+        var base = off_mv_main + i * 4 * d
+        mv_main.append(ZImageModVecsDevice(
+            _io_view(dev, base, [d]),
+            _io_view(dev, base + d, [d]),
+            _io_view(dev, base + 2 * d, [d]),
+            _io_view(dev, base + 3 * d, [d]),
+            mv_main_zeros.copy(),
+        ))
+    var mv_nr = List[ZImageModVecsDevice]()
+    var mv_nr_zeros = _io_view(dev, off_mv_nr + num_nr * 4 * d, [d])
+    for i in range(num_nr):
+        var base = off_mv_nr + i * 4 * d
+        mv_nr.append(ZImageModVecsDevice(
+            _io_view(dev, base, [d]),
+            _io_view(dev, base + d, [d]),
+            _io_view(dev, base + 2 * d, [d]),
+            _io_view(dev, base + 3 * d, [d]),
+            mv_nr_zeros.copy(),
+        ))
+
+    var ones = _io_view(dev, off_fconsts, [d])
+    var zeros = _io_view(dev, off_fconsts + d, [d])
+    var f_scale = _io_view(dev, off_fconsts + 2 * d, [d])
+
+    var rx_n = n_img * n_heads * half
+    var rc_n = n_txt * n_heads * half
+    var ru_n = s_total * n_heads * half
+    var rope_x_cos = _io_view(dev, off_rx, [n_img * n_heads, half])
+    var rope_x_sin = _io_view(dev, off_rx + rx_n, [n_img * n_heads, half])
+    var rope_cap_cos = _io_view(dev, off_rc, [n_txt * n_heads, half])
+    var rope_cap_sin = _io_view(dev, off_rc + rc_n, [n_txt * n_heads, half])
+    var rope_uni_cos = _io_view(dev, off_ru, [s_total * n_heads, half])
+    var rope_uni_sin = _io_view(dev, off_ru + ru_n, [s_total * n_heads, half])
+
+    var in_slab = TArc(Tensor(dev^, [in_total], STDtype.F32))
+
+    var d_patches = _io_fresh([s_total, out_ch], ctx)
+    # cap-row tail of d_patches is CONSTANT zero — write it once here (the
+    # per-step write only refreshes the n_img image rows; byte-identical to
+    # _concat_img_cap(d_out, zeros)).
+    var dp_host = ctx.enqueue_create_host_buffer[DType.uint8](s_total * out_ch * 4)
+    var dp = dp_host.unsafe_ptr().bitcast[Float32]()
+    for i in range(s_total * out_ch):
+        dp[i] = Float32(0.0)
+    ctx.enqueue_copy(dst_buf=d_patches[].buf, src_buf=dp_host)
+    ctx.synchronize()
+
+    var d_f_scale = _io_fresh([d], ctx)
+
+    var x_chain = List[TArc]()
+    for _ in range(num_main + 1):
+        x_chain.append(_io_fresh([s_total, d], ctx))
+    var nr_ping = List[TArc]()
+    for _ in range(2):
+        nr_ping.append(_io_fresh([n_img, d], ctx))
+    var cr_ping = List[TArc]()
+    for _ in range(2):
+        cr_ping.append(_io_fresh([n_txt, d], ctx))
+
+    var final_bias = TArc(final_lin_b.clone(ctx))
+
+    return ZImageStepIO(
+        n_img, n_txt, s_total, d, out_ch, num_nr, num_main, half, n_heads,
+        in_slab^, in_total,
+        off_x, off_cap, off_mv_main, off_mv_nr, off_fconsts, off_rx, off_rc,
+        off_ru,
+        x_t^, cap^, mv_main^, mv_nr^, ones^, zeros^, f_scale^,
+        rope_x_cos^, rope_x_sin^, rope_cap_cos^, rope_cap_sin^,
+        rope_uni_cos^, rope_uni_sin^,
+        d_patches^, d_f_scale^,
+        x_chain^, nr_ping^, cr_ping^, final_bias^,
+    )
+
+
+def _io_pack_list(host: HostBuffer[DType.uint8], off: Int, vals: List[Float32]):
+    var fp = host.unsafe_ptr().bitcast[Float32]()
+    for i in range(len(vals)):
+        fp[off + i] = vals[i]
+
+
+def zimage_step_io_write_inputs(
+    io: ZImageStepIO,
+    x_t: List[Float32], cap_seq: List[Float32],
+    nr_mod: List[ZImageModVecs], main_mod: List[ZImageModVecs],
+    f_scale: List[Float32],
+    rx: ZImageRopeHost, rc: ZImageRopeHost, ru: ZImageRopeHost,
+    ctx: DeviceContext,
+) raises:
+    """Pack every per-step input into ONE pinned staging buffer (layouts
+    byte-identical to the _v3 builders) and issue ONE H2D copy into the fixed
+    input slab. Sync before return (staging dies at scope end; outside the
+    captured region, so the sync is legal)."""
+    if len(x_t) != io.n_img * io.d_model or len(cap_seq) != io.n_txt * io.d_model:
+        raise Error("zimage_step_io_write_inputs: x/cap length mismatch")
+    if len(nr_mod) != io.num_nr or len(main_mod) != io.num_main:
+        raise Error("zimage_step_io_write_inputs: modvec count mismatch")
+    var d = io.d_model
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](io.in_total * 4)
+    var fp = host.unsafe_ptr().bitcast[Float32]()
+    _io_pack_list(host, io.off_x, x_t)
+    _io_pack_list(host, io.off_cap, cap_seq)
+    for i in range(io.num_main):
+        var base = io.off_mv_main + i * 4 * d
+        _io_pack_list(host, base, main_mod[i].scale_msa)
+        _io_pack_list(host, base + d, main_mod[i].gate_msa)
+        _io_pack_list(host, base + 2 * d, main_mod[i].scale_mlp)
+        _io_pack_list(host, base + 3 * d, main_mod[i].gate_mlp)
+    for c in range(d):
+        fp[io.off_mv_main + io.num_main * 4 * d + c] = Float32(0.0)
+    for i in range(io.num_nr):
+        var base = io.off_mv_nr + i * 4 * d
+        _io_pack_list(host, base, nr_mod[i].scale_msa)
+        _io_pack_list(host, base + d, nr_mod[i].gate_msa)
+        _io_pack_list(host, base + 2 * d, nr_mod[i].scale_mlp)
+        _io_pack_list(host, base + 3 * d, nr_mod[i].gate_mlp)
+    for c in range(d):
+        fp[io.off_mv_nr + io.num_nr * 4 * d + c] = Float32(0.0)
+    for c in range(d):
+        fp[io.off_fconsts + c] = Float32(1.0)
+    for c in range(d):
+        fp[io.off_fconsts + d + c] = Float32(0.0)
+    _io_pack_list(host, io.off_fconsts + 2 * d, f_scale)
+    var rx_n = io.n_img * io.n_heads * io.rope_half
+    var rc_n = io.n_txt * io.n_heads * io.rope_half
+    var ru_n = io.s_total * io.n_heads * io.rope_half
+    if len(rx.cos_vals) != rx_n or len(rc.cos_vals) != rc_n or len(ru.cos_vals) != ru_n:
+        raise Error("zimage_step_io_write_inputs: rope length mismatch")
+    _io_pack_list(host, io.off_rx, rx.cos_vals)
+    _io_pack_list(host, io.off_rx + rx_n, rx.sin_vals)
+    _io_pack_list(host, io.off_rc, rc.cos_vals)
+    _io_pack_list(host, io.off_rc + rc_n, rc.sin_vals)
+    _io_pack_list(host, io.off_ru, ru.cos_vals)
+    _io_pack_list(host, io.off_ru + ru_n, ru.sin_vals)
+    ctx.enqueue_copy(dst_buf=io.in_slab[].buf, src_buf=host)
+    ctx.synchronize()
+
+
+def zimage_step_io_write_d_patches(
+    io: ZImageStepIO, d_loss: List[Float32], ctx: DeviceContext
+) raises:
+    """Write the image-row d_loss into the fixed d_patches root (cap rows
+    were zeroed once at init — _concat_img_cap(d_out, zeros) bytes)."""
+    var n = io.n_img * io.out_ch
+    if len(d_loss) != n:
+        raise Error("zimage_step_io_write_d_patches: d_loss length mismatch")
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](n * 4)
+    var fp = host.unsafe_ptr().bitcast[Float32]()
+    for i in range(n):
+        fp[i] = d_loss[i]
+    var dst = io.d_patches[].buf.create_sub_buffer[DType.uint8](0, n * 4)
+    ctx.enqueue_copy(dst_buf=dst, src_buf=host)
+    ctx.synchronize()
+
+
+def _io_copy_out_persistent(
+    mut lst: List[TArc], pos: Int, src: Tensor, ctx: DeviceContext
+) raises:
+    """d2d copy `src` (slab-resident) into the persistent buffer at `pos`,
+    lazily creating it on the warmup step (creation order is deterministic —
+    the same fixed pointer serves capture + every replay)."""
+    if pos == len(lst):
+        var buf = ctx.enqueue_create_buffer[DType.uint8](src.nbytes())
+        lst.append(TArc(Tensor(buf^, src.shape(), src.dtype())))
+    elif pos > len(lst):
+        raise Error("zimage v5: persistent copy-out out of order")
+    ctx.enqueue_copy(dst_buf=lst[pos][].buf, src_buf=src.buf)
+
+
+def zimage_stack_lora_forward_main_device_v5[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    lora: ZImageLoraDeviceSet,
+    final_lin_w: Tensor,
+    io: ZImageStepIO,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+    mut fslab: StepSlab,
+) raises -> ZImageStackForwardV5:
+    """P5 capture-compatible forward: the _v3 op chain on the fwd StepSlab
+    with fixed-address inputs (io views) — NO from_host, NO to_host, NO sync
+    anywhere inside (C9). Per-block mark/rewind; survivors (block in/out x)
+    are d2d-copied into persistent buffers (values unchanged). The caller
+    resets `fslab` before calling (or before the graph launch on replay)."""
+    var num_nr = len(nr_blocks)
+    var num_cr = len(cr_blocks)
+    var num_main = len(main_blocks)
+
+    # ── noise refiner (frozen, modulated) on the fixed x_t ──
+    var xs = io.x_t.copy()
+    for i in range(num_nr):
+        var m = fslab.mark()
+        var out = zimage_block_forward_device_moddev_slab[H, Dh, N_IMG](
+            xs.copy(), nr_blocks[i], io.mv_nr[i],
+            io.rope_x_cos[], io.rope_x_sin[], D, F, eps, ctx, fslab,
+        )
+        ctx.enqueue_copy(dst_buf=io.nr_ping[i % 2][].buf, src_buf=out[].buf)
+        xs = io.nr_ping[i % 2].copy()
+        fslab.rewind(m)
+
+    # ── context refiner (frozen, unmodulated) on the fixed cap ──
+    var cs = io.cap.copy()
+    for i in range(num_cr):
+        var m = fslab.mark()
+        var out = zimage_refiner_forward_device_slab[H, Dh, N_TXT](
+            cs.copy(), cr_blocks[i], io.rope_cap_cos[], io.rope_cap_sin[],
+            D, F, eps, ctx, fslab,
+        )
+        ctx.enqueue_copy(dst_buf=io.cr_ping[i % 2][].buf, src_buf=out[].buf)
+        cs = io.cr_ping[i % 2].copy()
+        fslab.rewind(m)
+
+    # ── device concat img‖cap into the persistent chain head (dim-0 byte
+    # concat — the exact bytes ops.tensor_algebra.concat produces) ──
+    var img_bytes = N_IMG * D * 4
+    var cap_bytes = N_TXT * D * 4
+    var dst_img = io.x_chain[0][].buf.create_sub_buffer[DType.uint8](0, img_bytes)
+    ctx.enqueue_copy(dst_buf=dst_img, src_buf=xs[].buf)
+    var dst_cap = io.x_chain[0][].buf.create_sub_buffer[DType.uint8](
+        img_bytes, cap_bytes
+    )
+    ctx.enqueue_copy(dst_buf=dst_cap, src_buf=cs[].buf)
+
+    # ── main layers (LoRA) — chain[i] in, chain[i+1] out ──
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        main_x_in.append(io.x_chain[i].copy())
+        var m = fslab.mark()
+        var out = zimage_block_lora_forward_device_only_slab[1, H, Dh, S](
+            io.x_chain[i].copy(), main_blocks[i], io.mv_main[i], bl,
+            io.rope_uni_cos[], io.rope_uni_sin[], D, F, eps, ctx, fslab,
+        )
+        ctx.enqueue_copy(dst_buf=io.x_chain[i + 1][].buf, src_buf=out[].buf)
+        fslab.rewind(m)
+
+    # ── final layer (slab; deterministic addresses after the last rewind) ──
+    var ln_t = layer_norm_slab(
+        io.x_chain[num_main][], io.ones[], io.zeros[], final_eps, ctx, fslab,
+    )
+    var x_out_t = vec_modulate_slab(ln_t, io.f_scale[], io.zeros[], ctx, fslab)
+    var fb = Optional[Tensor](Tensor(
+        io.final_bias[].buf.copy(), io.final_bias[].shape(),
+        io.final_bias[].dtype(),
+    ))
+    var patches = linear_slab(x_out_t, final_lin_w, fb, ctx, fslab)
+
+    return ZImageStackForwardV5(
+        TArc(patches^), main_x_in^, io.x_chain[num_main].copy(), TArc(ln_t^),
+    )
+
+
+def zimage_stack_lora_backward_main_device_v5[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    main_blocks: List[ZImageBlockWeights],
+    lora: ZImageLoraDeviceSet,
+    final_lin_w: Tensor,
+    saved: ZImageStackForwardV5,
+    mut io: ZImageStepIO,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises:
+    """P5 capture-compatible backward: the _v4 chain with (a) the final-layer
+    prologue slab-routed reading the fixed io.d_patches root, (b) d_f_scale
+    reduced in-graph into the fixed io.d_f_scale buffer (read back AFTER the
+    launch with the grads batch), (c) the per-block d_x + 14 adapter-grad
+    copy-outs landing in the persistent grads region (lazy-created on the
+    warmup step). NO from_host/to_host/sync inside (C9). The caller resets
+    `slab` before calling. Grads are read via zimage_step_io_read_grads."""
+    var num_main = len(main_blocks)
+
+    # ── final-layer prologue (slab; values identical to the _v4 prologue) ──
+    var final_dx = linear_backward_dx_slab(
+        io.d_patches[], final_lin_w, S, D, out_ch, ctx, slab,
+    )
+    var mbf = modulate_backward_slab(
+        final_dx, saved.ln_x[], io.f_scale[], ctx, slab,
+    )
+    ctx.enqueue_copy(dst_buf=io.d_f_scale[].buf, src_buf=mbf.d_scale.buf)
+    var d_x_t = layer_norm_backward_dx_slab(
+        mbf.d_x, saved.x_final[], io.ones[], final_eps, ctx, slab,
+    )
+    var d_x = TArc(d_x_t^)   # slab-resident, BELOW the per-block marks
+
+    var bi = num_main - 1
+    var visit = 0
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var m = slab.mark()
+        var bg = zimage_block_lora_graph_backward_slab[H, Dh, S](
+            d_x[], main_blocks[bi], io.mv_main[bi], bl,
+            saved.main_x_in[bi], io.rope_uni_cos[], io.rope_uni_sin[],
+            D, F, eps, ctx, slab,
+        )
+        _io_copy_out_persistent(io.dx_carrier, visit % 2, bg.d_x[], ctx)
+        d_x = io.dx_carrier[visit % 2].copy()
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            var pos = visit * ZIMAGE_SLOTS + s
+            _io_copy_out_persistent(io.grad_a, pos, bg.d_a[s][], ctx)
+            _io_copy_out_persistent(io.grad_b, pos, bg.d_b[s][], ctx)
+            if pos == len(io.grad_indices):
+                io.grad_indices.append(base_idx + s)
+        slab.rewind(m)
+        visit += 1
+        bi -= 1
+
+
+def zimage_step_io_read_grads(
+    io: ZImageStepIO, num_blocks_total: Int, ctx: DeviceContext
+) raises -> ZImageLoraGrads:
+    """AFTER the bwd graph launch: batch the persistent grads region to host
+    (the SAME _zimage_tensor_grads_to_host path _v4 uses — identical staging,
+    casts and flat scatter) + read the fixed d_f_scale. Returns the _v4-shaped
+    ZImageLoraGrads (clip/AdamW/save downstream unchanged)."""
+    var host_grads = _zimage_tensor_grads_to_host(
+        io.grad_indices, io.grad_a, io.grad_b,
+        num_blocks_total * ZIMAGE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(io.grad_indices)):
+        var idx = io.grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+    var d_f_scale = io.d_f_scale[].to_host(ctx)
+    var empty_x = List[Float32]()
+    var empty_cap = List[Float32]()
+    var empty_nr = List[List[Float32]]()
+    var empty_main = List[List[Float32]]()
+    var d_final_lin = List[Float32]()
+    return ZImageLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        empty_x^, empty_cap^,
+        empty_nr^, empty_main^,
+        d_f_scale^, d_final_lin^,
         nonfinite,
     )

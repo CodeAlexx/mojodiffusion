@@ -433,7 +433,8 @@ def swiglu_backward_slab(
         ctx.enqueue_function[
             _swiglu_bwd_kernel[DType.float16], _swiglu_bwd_kernel[DType.float16]
         ](GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering (TIER2 precedent,
+    # ops/attention.mojo); no sync inside a captured region.
     var dg_t = Tensor(dg_buf^, gate.shape(), gate.dtype())
     var du_t = Tensor(du_buf^, up.shape(), up.dtype())
     return SwigluGrads(dg_t^, du_t^)

@@ -509,7 +509,8 @@ def rms_norm_backward_dx_slab(
             ](GOm, Xm, Gm, DXm, d_m, eps, grid_dim=rows_m, block_dim=_TPB)
         else:
             raise Error("rms_norm_backward_dx: unsupported mixed weight dtype")
-        ctx.synchronize()
+        # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering (TIER2
+        # precedent, ops/attention.mojo); no sync inside a captured region.
         return Tensor(dx_buf_m^, xshape_m.copy(), x.dtype())
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
@@ -558,7 +559,8 @@ def rms_norm_backward_dx_slab(
         ctx.enqueue_function[
             _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
         ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
-    ctx.synchronize()
+    # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering (TIER2 precedent,
+    # ops/attention.mojo); no sync inside a captured region.
     return Tensor(dx_buf^, xshape.copy(), x.dtype())
 
 
@@ -871,6 +873,69 @@ def layer_norm_backward_dx(
             _ln_bwd_dx_kernel[DType.float16], _ln_bwd_dx_kernel[DType.float16]
         ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
     ctx.synchronize()
+    return Tensor(dx_buf^, xshape.copy(), x.dtype())
+
+
+def layer_norm_backward_dx_slab(
+    go: Tensor, x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `layer_norm_backward_dx` (above) — byte-identical
+    math (same kernel, same launch params); ONLY the allocation source changes
+    and the trailing sync is removed (autograd_v2 contracts C8/C9, Phase P5:
+    no alloc/no sync inside a captured region; single-stream ordering — TIER2
+    precedent, ops/attention.mojo)."""
+    if x.dtype() != go.dtype() or x.dtype() != weight.dtype():
+        raise Error("layer_norm_backward_dx: go/x/weight dtype mismatch")
+    var xshape = x.shape()
+    var d = xshape[len(xshape) - 1]
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+
+    var dx_buf = slab.alloc(x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
+
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.float32], _ln_bwd_dx_kernel[DType.float32]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.bfloat16], _ln_bwd_dx_kernel[DType.bfloat16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        ctx.enqueue_function[
+            _ln_bwd_dx_kernel[DType.float16], _ln_bwd_dx_kernel[DType.float16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering; no sync inside a
+    # captured region.
     return Tensor(dx_buf^, xshape.copy(), x.dtype())
 
 

@@ -1307,7 +1307,8 @@ def gate_residual_backward_dxdy_slab(
         ctx.enqueue_function[
             _gate_dxdy_kernel[DType.float16], _gate_dxdy_kernel[DType.float16]
         ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering (TIER2 precedent,
+    # ops/attention.mojo); no sync inside a captured region.
     var dg_shape = List[Int]()
     dg_shape.append(0)
     var dx_t = Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())

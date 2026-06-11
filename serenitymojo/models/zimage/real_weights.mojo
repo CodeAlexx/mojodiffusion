@@ -256,10 +256,32 @@ def build_x_seq(
 
 # ── rope tables: 3-axis interleaved [S*H, Dh/2]. Translates zimage_dit._build_rope.
 # positions: per-token [p0,p1,p2]. axes (a0,a1,a2) sum/2 == Dh/2.
-def build_rope(
+struct ZImageRopeHost(Movable):
+    """Host-side rope table values (P5 capture: the per-step tables are
+    WRITTEN into fixed device buffers instead of freshly uploaded; the values
+    are byte-identical to build_rope's upload — same loops, same order)."""
+    var cos_vals: List[Float32]
+    var sin_vals: List[Float32]
+    var rows: Int
+    var half: Int
+
+    def __init__(
+        out self, var cos_vals: List[Float32], var sin_vals: List[Float32],
+        rows: Int, half: Int,
+    ):
+        self.cos_vals = cos_vals^
+        self.sin_vals = sin_vals^
+        self.rows = rows
+        self.half = half
+
+
+def build_rope_host(
     positions: List[List[Int]], H: Int, Dh: Int, theta: Float32,
-    a0: Int, a1: Int, a2: Int, ctx: DeviceContext,
-) raises -> Tuple[TArc, TArc]:
+    a0: Int, a1: Int, a2: Int,
+) raises -> ZImageRopeHost:
+    """The host math of build_rope (below), extracted verbatim so the P5
+    capture path can pack the values into pinned staging without a fresh
+    device allocation. build_rope delegates here — values unchanged."""
     var half = Dh // 2
     var log_theta = flog(theta)
     var axes = List[Int]()
@@ -280,8 +302,20 @@ def build_rope(
                 cos_vals.append(fcos(angles[i]))
                 sin_vals.append(fsin(angles[i]))
     var rows = len(positions) * H
-    var cos_t = TArc(Tensor.from_host(cos_vals, [rows, half], STDtype.F32, ctx))
-    var sin_t = TArc(Tensor.from_host(sin_vals, [rows, half], STDtype.F32, ctx))
+    return ZImageRopeHost(cos_vals^, sin_vals^, rows, half)
+
+
+def build_rope(
+    positions: List[List[Int]], H: Int, Dh: Int, theta: Float32,
+    a0: Int, a1: Int, a2: Int, ctx: DeviceContext,
+) raises -> Tuple[TArc, TArc]:
+    var rh = build_rope_host(positions, H, Dh, theta, a0, a1, a2)
+    var cos_t = TArc(Tensor.from_host(
+        rh.cos_vals, [rh.rows, rh.half], STDtype.F32, ctx
+    ))
+    var sin_t = TArc(Tensor.from_host(
+        rh.sin_vals, [rh.rows, rh.half], STDtype.F32, ctx
+    ))
     return (cos_t^, sin_t^)
 
 

@@ -247,7 +247,7 @@ def rms_norm_slab(
             + String(len(wshape))
         )
     if x.dtype() != weight.dtype():
-        var compute_weight = cast_tensor_slab(weight, x.dtype(), ctx, slab)
+        var compute_weight = cast_tensor_slab(weight, x.dtype(), ctx, slab, False)
         return rms_norm_slab(x, compute_weight^, eps, ctx, slab)
     var rows = 1
     for i in range(len(xshape) - 1):
@@ -545,6 +545,96 @@ def layer_norm(
             X, G, B, O, d, eps, grid_dim=rows, block_dim=_TPB
         )
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, xshape.copy(), x.dtype())
+
+
+def layer_norm_slab(
+    x: Tensor, weight: Tensor, bias: Tensor, eps: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `layer_norm` (above) — byte-identical math (same
+    kernels, same launch params); ONLY the allocation source changes
+    (autograd_v2 contracts C8/C9, Phase P5). Mixed-dtype gamma/beta cast
+    routes through cast_tensor_slab (sync-free)."""
+    var xshape = x.shape()
+    var wshape = weight.shape()
+    var bshape = bias.shape()
+    if len(xshape) < 1:
+        raise Error("layer_norm: x must have rank >= 1")
+    var d = xshape[len(xshape) - 1]
+    if len(wshape) != 1 or wshape[0] != d:
+        raise Error("layer_norm: weight must be [D] matching x last dim")
+    if len(bshape) != 1 or bshape[0] != d:
+        raise Error("layer_norm: bias must be [D] matching x last dim")
+    if x.dtype() != weight.dtype():
+        var compute_weight = cast_tensor_slab(weight, x.dtype(), ctx, slab, False)
+        if x.dtype() != bias.dtype():
+            var compute_bias = cast_tensor_slab(bias, x.dtype(), ctx, slab, False)
+            return layer_norm_slab(x, compute_weight^, compute_bias^, eps, ctx, slab)
+        return layer_norm_slab(x, compute_weight^, bias, eps, ctx, slab)
+    if x.dtype() != bias.dtype():
+        var compute_bias = cast_tensor_slab(bias, x.dtype(), ctx, slab, False)
+        return layer_norm_slab(x, weight, compute_bias^, eps, ctx, slab)
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+
+    var dt = x.dtype().to_mojo_dtype()
+    var out_buf = slab.alloc(x.nbytes())
+
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
+
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), g_rl
+        )
+        var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            bias.buf.unsafe_ptr().bitcast[Float32](), g_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[_layer_norm_kernel_f32, _layer_norm_kernel_f32](
+            X, G, B, O, d, eps, grid_dim=rows, block_dim=_TPB
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
+        )
+        var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            bias.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        ctx.enqueue_function[_layer_norm_kernel_bf16, _layer_norm_kernel_bf16](
+            X, G, B, O, d, eps, grid_dim=rows, block_dim=_TPB
+        )
+    else:  # float16
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), g_rl
+        )
+        var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            bias.buf.unsafe_ptr().bitcast[Float16](), g_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        ctx.enqueue_function[_layer_norm_kernel_f16, _layer_norm_kernel_f16](
+            X, G, B, O, d, eps, grid_dim=rows, block_dim=_TPB
+        )
+    # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering; no sync inside a
+    # captured region.
     return Tensor(out_buf^, xshape.copy(), x.dtype())
 
 

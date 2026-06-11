@@ -335,7 +335,8 @@ def modulate_backward_slab(
             param_shape = scale.shape()
         else:
             param_shape.append(0)
-    ctx.synchronize()
+    # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering (TIER2 precedent,
+    # ops/attention.mojo); no sync inside a captured region.
     return ModulateBackward(
         Tensor(dx_buf^, xshape.copy(), x.dtype()),
         Tensor(ds_buf^, param_shape.copy(), scale.dtype()),

@@ -235,13 +235,13 @@ def modulate_slab(
         if nvec != 1:
             raise Error("modulate: shift must be [B, D] when scale is [B, D]")
     if x.dtype() != scale.dtype():
-        var compute_scale = cast_tensor_slab(scale, x.dtype(), ctx, slab)
+        var compute_scale = cast_tensor_slab(scale, x.dtype(), ctx, slab, False)
         if x.dtype() != shift.dtype():
-            var compute_shift = cast_tensor_slab(shift, x.dtype(), ctx, slab)
+            var compute_shift = cast_tensor_slab(shift, x.dtype(), ctx, slab, False)
             return modulate_slab(x, compute_scale^, compute_shift^, ctx, slab)
         return modulate_slab(x, compute_scale^, shift, ctx, slab)
     if x.dtype() != shift.dtype():
-        var compute_shift = cast_tensor_slab(shift, x.dtype(), ctx, slab)
+        var compute_shift = cast_tensor_slab(shift, x.dtype(), ctx, slab, False)
         return modulate_slab(x, scale, compute_shift^, ctx, slab)
     var rows = 1
     for i in range(len(xshape) - 1):
@@ -492,13 +492,13 @@ def residual_gate_slab(
     if x.numel() != y.numel():
         raise Error("residual_gate: x/y numel mismatch")
     if x.dtype() != gate.dtype():
-        var compute_gate = cast_tensor_slab(gate, x.dtype(), ctx, slab)
+        var compute_gate = cast_tensor_slab(gate, x.dtype(), ctx, slab, False)
         if x.dtype() != y.dtype():
-            var compute_y = cast_tensor_slab(y, x.dtype(), ctx, slab)
+            var compute_y = cast_tensor_slab(y, x.dtype(), ctx, slab, False)
             return residual_gate_slab(x, compute_gate^, compute_y^, ctx, slab)
         return residual_gate_slab(x, compute_gate^, y, ctx, slab)
     if x.dtype() != y.dtype():
-        var compute_y = cast_tensor_slab(y, x.dtype(), ctx, slab)
+        var compute_y = cast_tensor_slab(y, x.dtype(), ctx, slab, False)
         return residual_gate_slab(x, gate, compute_y^, ctx, slab)
     var rows = 1
     for i in range(len(xshape) - 1):

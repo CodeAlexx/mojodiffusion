@@ -193,11 +193,13 @@ def _new_f32_slab(rows: Int, cols: Int, mut slab: StepSlab) raises -> Tensor:
 
 
 def _clone_to_slab(t: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Tensor:
-    """StepSlab variant of Tensor.clone (tensor.mojo:70) — same d2d copy +
-    sync; ONLY the allocation source changes (contract C8, Phase P4)."""
+    """StepSlab variant of Tensor.clone (tensor.mojo:70) — same d2d copy;
+    ONLY the allocation source changes (contract C8, Phase P4)."""
     var dev = slab.alloc(t.nbytes())
     ctx.enqueue_copy(dst_buf=dev, src_buf=t.buf)
-    ctx.synchronize()
+    # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering (TIER2 precedent,
+    # ops/attention.mojo); no sync allowed inside a captured region. Values
+    # unchanged — only host-visibility timing moved (bit-gates protect).
     return Tensor(dev^, t.shape(), t.dtype())
 
 
@@ -572,7 +574,7 @@ def linear_backward_dx_slab(
         matmul(ctx, dx, gy, wv, c_row_major=True)
     if grad_y.dtype() == STDtype.F32:
         return d_x^
-    return cast_tensor_slab(d_x^, grad_y.dtype(), ctx, slab)
+    return cast_tensor_slab(d_x^, grad_y.dtype(), ctx, slab, False)
 
 
 def linear_backward_dx_scratch(
@@ -867,7 +869,7 @@ def linear_backward_dw_slab(
         raise Error("linear_backward_dw: unsupported output dtype")
     if out_dtype == STDtype.F32:
         return d_w^
-    return cast_tensor_slab(d_w^, out_dtype, ctx, slab)
+    return cast_tensor_slab(d_w^, out_dtype, ctx, slab, False)
 
 
 # ── addbias backward ─────────────────────────────────────────────────────────

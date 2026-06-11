@@ -58,14 +58,16 @@ from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
 
 # Forward + backward ops shared with the base block (Tenet 1: nothing new here).
-from serenitymojo.ops.norm import rms_norm
-from serenitymojo.ops.activations import swiglu
+from serenitymojo.ops.norm import rms_norm, rms_norm_slab
+from serenitymojo.ops.activations import swiglu, swiglu_slab
 from serenitymojo.ops.vec_swiglu import vec_swiglu
-from serenitymojo.ops.elementwise import modulate, residual_gate
+from serenitymojo.ops.elementwise import (
+    modulate, residual_gate, modulate_slab, residual_gate_slab,
+)
 from serenitymojo.ops.vec_modulate import vec_modulate
-from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa_nomask
-from serenitymojo.ops.unary import tanh_op
+from serenitymojo.ops.rope import rope_interleaved, rope_interleaved_slab
+from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_slab
+from serenitymojo.ops.unary import tanh_op, tanh_op_slab
 from serenitymojo.ops.tensor_algebra import (
     reshape_owned, reshape_in_place, add, mul_scalar, add_slab, mul_scalar_slab,
 )
@@ -1965,4 +1967,209 @@ def zimage_refiner_forward_device[
 
     var ff_n2 = rms_norm(ff, w.fn2[], eps, ctx)
     var result = add(h, ff_n2, ctx)                 # PLAIN residual (no gate)
+    return TArc(result^)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase P5 (AUTOGRAD_V2_MOJO_DESIGN.md C9): StepSlab FORWARD block functions for
+# the capture-compatible _v5 step. Each is the EXACT op sequence of its non-slab
+# sibling above with every allocating op routed to its _slab variant (same
+# kernels, same order, same values — C14; only the allocation source changes,
+# the P4 precedent). NO saved tape is returned for the LoRA main block: the
+# graph backward (_v4/_v5) recomputes the block from its saved INPUT, so the
+# forward only needs the output (the batch fwd's saved tape was refcount
+# copies — zero kernels — so omitting it changes no values). NO syncs anywhere
+# in these bodies (C9: capture-safe; single-stream ordering, TIER2 precedent
+# ops/attention.mojo). Old paths untouched (C13).
+# ══════════════════════════════════════════════════════════════════════════════
+def zimage_block_lora_forward_device_only_slab[
+    B: Int, H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ZImageBlockWeights, mv: ZImageModVecsDevice, lora: ZImageBlockLoraDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """Output-only StepSlab sibling of
+    zimage_block_lora_forward_device_tensor_batch (this file): identical op
+    chain; the result is slab-resident — the caller copies it out before the
+    per-block rewind."""
+    comptime ROWS = B * S
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var xn1 = rms_norm_slab(x_arc[], w.n1[], eps, ctx, slab)
+    var xn1s = modulate_slab(xn1, mv.scale_msa[], mv.zeros[], ctx, slab)
+
+    var no_bias = Optional[Tensor](None)
+    var q_base = linear_slab(xn1s, w.wq[], no_bias^, ctx, slab)
+    var no_bias_k = Optional[Tensor](None)
+    var k_base = linear_slab(xn1s, w.wk[], no_bias_k^, ctx, slab)
+    var no_bias_v = Optional[Tensor](None)
+    var v_base = linear_slab(xn1s, w.wv[], no_bias_v^, ctx, slab)
+
+    var q = zimage_lora_apply_device_slab(q_base^, xn1s, lora.to_q, ROWS, ctx, slab)
+    var k = zimage_lora_apply_device_slab(k_base^, xn1s, lora.to_k, ROWS, ctx, slab)
+    var v_flat = zimage_lora_apply_device_slab(v_base^, xn1s, lora.to_v, ROWS, ctx, slab)
+
+    var q_pre = reshape_owned(q^, [B, S, H, Dh])
+    var k_pre = reshape_owned(k^, [B, S, H, Dh])
+    var v = reshape_owned(v_flat^, [B, S, H, Dh])
+
+    var q_rms = rms_norm_slab(q_pre, w.q_norm[], eps, ctx, slab)
+    var k_rms = rms_norm_slab(k_pre, w.k_norm[], eps, ctx, slab)
+    var q_rope = rope_interleaved_slab(q_rms, cos, sin, ctx, slab)
+    var k_rope = rope_interleaved_slab(k_rms, cos, sin, ctx, slab)
+
+    var att = sdpa_nomask_slab[B, S, H, Dh](q_rope, k_rope, v, scale, ctx, slab)
+    var att_flat = reshape_owned(att^, [ROWS, D])
+
+    var no_bias_o = Optional[Tensor](None)
+    var att_o_base = linear_slab(att_flat, w.wo[], no_bias_o^, ctx, slab)
+    var att_o = zimage_lora_apply_device_slab(
+        att_o_base^, att_flat, lora.to_out, ROWS, ctx, slab
+    )
+
+    var attn_n2 = rms_norm_slab(att_o, w.n2[], eps, ctx, slab)
+    var gate_msa_t = tanh_op_slab(mv.gate_msa[], ctx, slab)
+    var h = residual_gate_slab(x_arc[], gate_msa_t, attn_n2, ctx, slab)
+
+    var xfn1 = rms_norm_slab(h, w.fn1[], eps, ctx, slab)
+    var xfn1s = modulate_slab(xfn1, mv.scale_mlp[], mv.zeros[], ctx, slab)
+
+    var no_bias_g = Optional[Tensor](None)
+    var g_base = linear_slab(xfn1s, w.w1[], no_bias_g^, ctx, slab)
+    var no_bias_u = Optional[Tensor](None)
+    var u_base = linear_slab(xfn1s, w.w3[], no_bias_u^, ctx, slab)
+    var g_pre = zimage_lora_apply_device_slab(g_base^, xfn1s, lora.w1, ROWS, ctx, slab)
+    var u = zimage_lora_apply_device_slab(u_base^, xfn1s, lora.w3, ROWS, ctx, slab)
+
+    var act = swiglu_slab(g_pre, u, ctx, slab)
+
+    var no_bias_d = Optional[Tensor](None)
+    var ff_base = linear_slab(act, w.w2[], no_bias_d^, ctx, slab)
+    var ff = zimage_lora_apply_device_slab(ff_base^, act, lora.w2, ROWS, ctx, slab)
+
+    var ff_n2 = rms_norm_slab(ff, w.fn2[], eps, ctx, slab)
+    var gate_mlp_t = tanh_op_slab(mv.gate_mlp[], ctx, slab)
+    var result = residual_gate_slab(h, gate_mlp_t, ff_n2, ctx, slab)
+    return TArc(result^)
+
+
+def zimage_block_forward_device_moddev_slab[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ZImageBlockWeights, mv: ZImageModVecsDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab sibling of zimage_block_forward_device_moddev (frozen NR
+    block, this file): identical op chain, slab-resident output."""
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var xn1 = rms_norm_slab(x_arc[], w.n1[], eps, ctx, slab)
+    var xn1s = modulate_slab(xn1, mv.scale_msa[], mv.zeros[], ctx, slab)
+
+    var no_bias = Optional[Tensor](None)
+    var q_flat = linear_slab(xn1s, w.wq[], no_bias^, ctx, slab)
+    var no_bias_k = Optional[Tensor](None)
+    var k_flat = linear_slab(xn1s, w.wk[], no_bias_k^, ctx, slab)
+    var no_bias_v = Optional[Tensor](None)
+    var v_flat = linear_slab(xn1s, w.wv[], no_bias_v^, ctx, slab)
+
+    var q_pre = reshape_owned(q_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm_slab(q_pre, w.q_norm[], eps, ctx, slab)
+    var k_rms = rms_norm_slab(k_pre, w.k_norm[], eps, ctx, slab)
+
+    var q_rope = rope_interleaved_slab(q_rms, cos, sin, ctx, slab)
+    var k_rope = rope_interleaved_slab(k_rms, cos, sin, ctx, slab)
+
+    var att = sdpa_nomask_slab[1, S, H, Dh](q_rope, k_rope, v, scale, ctx, slab)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var no_bias_o = Optional[Tensor](None)
+    var att_o = linear_slab(att_flat, w.wo[], no_bias_o^, ctx, slab)
+
+    var attn_n2 = rms_norm_slab(att_o, w.n2[], eps, ctx, slab)
+    var gate_msa_t = tanh_op_slab(mv.gate_msa[], ctx, slab)
+    var h = residual_gate_slab(x_arc[], gate_msa_t, attn_n2, ctx, slab)
+
+    var xfn1 = rms_norm_slab(h, w.fn1[], eps, ctx, slab)
+    var xfn1s = modulate_slab(xfn1, mv.scale_mlp[], mv.zeros[], ctx, slab)
+
+    var no_bias_g = Optional[Tensor](None)
+    var g_pre = linear_slab(xfn1s, w.w1[], no_bias_g^, ctx, slab)
+    var no_bias_u = Optional[Tensor](None)
+    var u = linear_slab(xfn1s, w.w3[], no_bias_u^, ctx, slab)
+    var act = swiglu_slab(g_pre, u, ctx, slab)
+    var no_bias_d = Optional[Tensor](None)
+    var ff = linear_slab(act, w.w2[], no_bias_d^, ctx, slab)
+
+    var ff_n2 = rms_norm_slab(ff, w.fn2[], eps, ctx, slab)
+    var gate_mlp_t = tanh_op_slab(mv.gate_mlp[], ctx, slab)
+    var result = residual_gate_slab(h, gate_mlp_t, ff_n2, ctx, slab)
+    return TArc(result^)
+
+
+def zimage_refiner_forward_device_slab[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ZImageBlockWeights,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab sibling of zimage_refiner_forward_device (frozen CR block,
+    this file): identical op chain, slab-resident output."""
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var xn1 = rms_norm_slab(x_arc[], w.n1[], eps, ctx, slab)
+
+    var no_bias = Optional[Tensor](None)
+    var q_flat = linear_slab(xn1, w.wq[], no_bias^, ctx, slab)
+    var no_bias_k = Optional[Tensor](None)
+    var k_flat = linear_slab(xn1, w.wk[], no_bias_k^, ctx, slab)
+    var no_bias_v = Optional[Tensor](None)
+    var v_flat = linear_slab(xn1, w.wv[], no_bias_v^, ctx, slab)
+
+    var q_pre = reshape_owned(q_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm_slab(q_pre, w.q_norm[], eps, ctx, slab)
+    var k_rms = rms_norm_slab(k_pre, w.k_norm[], eps, ctx, slab)
+
+    var q_rope = rope_interleaved_slab(q_rms, cos, sin, ctx, slab)
+    var k_rope = rope_interleaved_slab(k_rms, cos, sin, ctx, slab)
+
+    var att = sdpa_nomask_slab[1, S, H, Dh](q_rope, k_rope, v, scale, ctx, slab)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var no_bias_o = Optional[Tensor](None)
+    var att_o = linear_slab(att_flat, w.wo[], no_bias_o^, ctx, slab)
+
+    var attn_n2 = rms_norm_slab(att_o, w.n2[], eps, ctx, slab)
+    var h = add_slab(x_arc[], attn_n2, ctx, slab)    # PLAIN residual (no gate)
+
+    var xfn1 = rms_norm_slab(h, w.fn1[], eps, ctx, slab)
+
+    var no_bias_g = Optional[Tensor](None)
+    var g_pre = linear_slab(xfn1, w.w1[], no_bias_g^, ctx, slab)
+    var no_bias_u = Optional[Tensor](None)
+    var u = linear_slab(xfn1, w.w3[], no_bias_u^, ctx, slab)
+    var act = swiglu_slab(g_pre, u, ctx, slab)
+    var no_bias_d = Optional[Tensor](None)
+    var ff = linear_slab(act, w.w2[], no_bias_d^, ctx, slab)
+
+    var ff_n2 = rms_norm_slab(ff, w.fn2[], eps, ctx, slab)
+    var result = add_slab(h, ff_n2, ctx, slab)       # PLAIN residual (no gate)
     return TArc(result^)

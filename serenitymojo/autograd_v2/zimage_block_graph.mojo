@@ -35,7 +35,7 @@
 from std.gpu.host import DeviceContext
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
-from serenitymojo.ops.unary import tanh_op
+from serenitymojo.ops.unary import tanh_op, tanh_op_slab
 from serenitymojo.models.zimage.weights import ZImageBlockWeights
 from serenitymojo.models.zimage.lora_block import (
     ZImageModVecsDevice,
@@ -44,7 +44,8 @@ from serenitymojo.models.zimage.lora_block import (
 )
 from serenitymojo.autograd_v2.node import TArc, arc_view
 from serenitymojo.autograd_v2.graph import Graph
-from serenitymojo.autograd_v2.engine import execute
+from serenitymojo.autograd_v2.engine import execute, execute_slab
+from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.autograd_v2.ops_record import (
     record_proj_lora,
     record_rms_norm_dx,
@@ -54,6 +55,13 @@ from serenitymojo.autograd_v2.ops_record import (
     record_swiglu,
     record_residual_gate,
     record_reshape,
+    record_proj_lora_slab,
+    record_rms_norm_dx_slab,
+    record_modulate_slab,
+    record_rope_slab,
+    record_sdpa_slab,
+    record_swiglu_slab,
+    record_residual_gate_slab,
 )
 
 
@@ -142,6 +150,104 @@ def zimage_block_lora_graph_backward[
     # ── engine backward from the block output, seeded with d_out ────────────
     var root_idx = g.node_of_tensor[result[].id]
     var grads = execute(g, root_idx, arc_view(d_out), ctx)
+
+    var d_a_slots = List[TArc]()
+    var d_b_slots = List[TArc]()
+    for s in range(7):
+        d_a_slots.append(grads[a_ids[s]].copy())
+        d_b_slots.append(grads[b_ids[s]].copy())
+    return ZImageBlockLoraTensorBackward(grads[x_id].copy(), d_a_slots^, d_b_slots^)
+
+
+def zimage_block_lora_graph_backward_slab[
+    H: Int, Dh: Int, S: Int
+](
+    d_out: Tensor,
+    w: ZImageBlockWeights, mv: ZImageModVecsDevice, lora: ZImageBlockLoraDevice,
+    x_in: TArc,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> ZImageBlockLoraTensorBackward:
+    """StepSlab variant of `zimage_block_lora_graph_backward` (above, Phase
+    P4 / contract C8): identical recording (same ops, same order, same C15
+    slots) and identical engine algorithm; every recompute output, backward
+    grad and fan-in sum is slab-allocated via the _slab op siblings.
+    record_reshape stays the non-slab function (metadata-only, zero allocs).
+    The returned d_x/d_a/d_b are SLAB-RESIDENT — the caller (_v4 stack
+    backward) must copy them out of the slab BEFORE rewinding its mark."""
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var g = Graph()
+
+    # Block input x: a tracked leaf whose accumulated grad is the returned
+    # d_x. Zero-copy re-box so the id stamp never mutates the shared saved arc.
+    var x_t = Tensor(x_in[].buf.copy(), x_in[].shape(), x_in[].dtype())
+    x_t.set_id(g.fresh_tensor_id())
+    var x_id = x_t.id
+    _ = g.leaf(x_id)
+    var x = TArc(x_t^)
+
+    # 14 adapter leaves, canonical slot order q,k,v,o,w1,w3,w2 (recording in
+    # this order IS the C15 slot assignment; ids are graph-local).
+    var a_ids = List[Int]()
+    var b_ids = List[Int]()
+    for _ in range(7):
+        a_ids.append(g.fresh_tensor_id())
+        b_ids.append(g.fresh_tensor_id())
+
+    # ── forward, recorded (op-for-op zimage_block_lora_forward_device_tensor_
+    # batch at B=1, lora_block.mojo:1631-1687) ────────────────────────────────
+    var xn1 = record_rms_norm_dx_slab(g, x, w.n1, eps, ctx, slab)
+    var xn1s = record_modulate_slab(g, xn1, mv.scale_msa, mv.zeros, 0, ctx, slab)
+
+    var q = record_proj_lora_slab(g, xn1s, w.wq, lora.to_q, a_ids[0], b_ids[0], S, D, D, ctx, slab)
+    var k = record_proj_lora_slab(g, xn1s, w.wk, lora.to_k, a_ids[1], b_ids[1], S, D, D, ctx, slab)
+    var v_flat = record_proj_lora_slab(g, xn1s, w.wv, lora.to_v, a_ids[2], b_ids[2], S, D, D, ctx, slab)
+
+    var shape4: List[Int] = [1, S, H, Dh]
+    var q_pre = record_reshape(g, q, shape4.copy(), ctx)
+    var k_pre = record_reshape(g, k, shape4.copy(), ctx)
+    var v = record_reshape(g, v_flat, shape4.copy(), ctx)
+
+    # per-head rms_norm ([1,S,H,Dh] with [Dh] weight - same rms_norm /
+    # rms_norm_backward_dx calls the oracle makes).
+    var q_rms = record_rms_norm_dx_slab(g, q_pre, w.q_norm, eps, ctx, slab)
+    var k_rms = record_rms_norm_dx_slab(g, k_pre, w.k_norm, eps, ctx, slab)
+
+    var cos_arc = arc_view(cos)
+    var sin_arc = arc_view(sin)
+    var q_rope = record_rope_slab(g, q_rms, cos_arc, sin_arc, ctx, slab)
+    var k_rope = record_rope_slab(g, k_rms, cos_arc, sin_arc, ctx, slab)
+
+    var att = record_sdpa_slab[1, S, H, Dh](g, q_rope, k_rope, v, scale, ctx, slab)
+    var flat_shape: List[Int] = [S, D]
+    var att_flat = record_reshape(g, att, flat_shape.copy(), ctx)
+    var att_o = record_proj_lora_slab(
+        g, att_flat, w.wo, lora.to_out, a_ids[3], b_ids[3], S, D, D, ctx, slab
+    )
+
+    var attn_n2 = record_rms_norm_dx_slab(g, att_o, w.n2, eps, ctx, slab)
+    # Frozen gate: tanh computed OUTSIDE the graph (no node); residual_gate's
+    # backward uses the saved gate_t with the gate frozen (dxdy arm).
+    var gate_msa_t = TArc(tanh_op_slab(mv.gate_msa[], ctx, slab))
+    var h = record_residual_gate_slab(g, x, gate_msa_t, attn_n2, ctx, slab)
+
+    var xfn1 = record_rms_norm_dx_slab(g, h, w.fn1, eps, ctx, slab)
+    var xfn1s = record_modulate_slab(g, xfn1, mv.scale_mlp, mv.zeros, 0, ctx, slab)
+
+    var g_pre = record_proj_lora_slab(g, xfn1s, w.w1, lora.w1, a_ids[4], b_ids[4], S, D, F, ctx, slab)
+    var u = record_proj_lora_slab(g, xfn1s, w.w3, lora.w3, a_ids[5], b_ids[5], S, D, F, ctx, slab)
+    var act = record_swiglu_slab(g, g_pre, u, ctx, slab)
+    var ff = record_proj_lora_slab(g, act, w.w2, lora.w2, a_ids[6], b_ids[6], S, F, D, ctx, slab)
+
+    var ff_n2 = record_rms_norm_dx_slab(g, ff, w.fn2, eps, ctx, slab)
+    var gate_mlp_t = TArc(tanh_op_slab(mv.gate_mlp[], ctx, slab))
+    var result = record_residual_gate_slab(g, h, gate_mlp_t, ff_n2, ctx, slab)
+
+    # ── engine backward from the block output, seeded with d_out ────────────
+    var root_idx = g.node_of_tensor[result[].id]
+    var grads = execute_slab(g, root_idx, arc_view(d_out), ctx, slab)
 
     var d_a_slots = List[TArc]()
     var d_b_slots = List[TArc]()

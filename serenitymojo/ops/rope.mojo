@@ -30,6 +30,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -386,6 +387,101 @@ def rope_interleaved(
     var dt = x.dtype().to_mojo_dtype()
     var table_dt = cos.dtype().to_mojo_dtype()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var f_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, half))
+    var total = rows * half
+    var grid = (total + _BLOCK - 1) // _BLOCK
+
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[
+            _rope_interleaved_kernel_f32, _rope_interleaved_kernel_f32
+        ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_interleaved_kernel_f32_tables[DType.bfloat16],
+                _rope_interleaved_kernel_f32_tables[DType.bfloat16],
+            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+            )
+            var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_interleaved_kernel_bf16, _rope_interleaved_kernel_bf16
+            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_interleaved_kernel_f32_tables[DType.float16],
+                _rope_interleaved_kernel_f32_tables[DType.float16],
+            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl
+            )
+            var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl
+            )
+            ctx.enqueue_function[
+                _rope_interleaved_kernel_f16, _rope_interleaved_kernel_f16
+            ](X, C, S, O, rows, half, grid_dim=grid, block_dim=_BLOCK)
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
+def rope_interleaved_slab(
+    x: Tensor, cos: Tensor, sin: Tensor, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `rope_interleaved` (this file :372) —
+    byte-identical math (same kernels, same launch params); ONLY the
+    allocation source changes (autograd_v2 contract C8, Phase P4)."""
+    var dims = _rope_common_validate(x, cos, sin)
+    var rows = dims[0]
+    var half = dims[1]
+    var d = half * 2
+    var dt = x.dtype().to_mojo_dtype()
+    var table_dt = cos.dtype().to_mojo_dtype()
+    var out_buf = slab.alloc(x.nbytes())
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var f_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, half))
     var total = rows * half

@@ -30,6 +30,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -338,9 +339,103 @@ def _binary(a: Tensor, b: Tensor, op: Int, ctx: DeviceContext) raises -> Tensor:
     return Tensor(out_buf^, plan.out_shape.copy(), a.dtype())
 
 
+def _binary_slab(
+    a: Tensor, b: Tensor, op: Int, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `_binary` (this file :257) — byte-identical math;
+    ONLY the allocation source changes (autograd_v2 contract C8, Phase P4)."""
+    if a.dtype() != b.dtype():
+        raise Error(
+            String("elementwise: a/b dtype mismatch a=")
+            + a.dtype().name()
+            + String(" shape=")
+            + _shape_debug(a.shape())
+            + String(" b=")
+            + b.dtype().name()
+            + String(" shape=")
+            + _shape_debug(b.shape())
+        )
+    var plan = _bcast_plan(a.shape(), b.shape())
+    var dt = a.dtype().to_mojo_dtype()
+    var n = plan.numel
+    var out_bytes = n * a.dtype().byte_size()
+    var out_buf = slab.alloc(out_bytes)
+    var a_n = a.numel()
+    var b_n = b.numel()
+    var o_n = n
+    var a_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](a_n))
+    var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](b_n))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](o_n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    var d = plan.out_dims
+    var asx = plan.a_str
+    var bsx = plan.b_str
+
+    if dt == DType.float32:
+        var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float32](), a_rl
+        )
+        var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[Float32](), b_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[_ew_kernel_f32, _ew_kernel_f32](
+            A, B, O,
+            d[0], d[1], d[2], d[3], d[4], d[5],
+            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+            n, op, grid_dim=grid, block_dim=_BLOCK,
+        )
+    elif dt == DType.bfloat16:
+        var A = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
+        )
+        var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[_ew_kernel_bf16, _ew_kernel_bf16](
+            A, B, O,
+            d[0], d[1], d[2], d[3], d[4], d[5],
+            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+            n, op, grid_dim=grid, block_dim=_BLOCK,
+        )
+    else:
+        var A = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float16](), a_rl
+        )
+        var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            b.buf.unsafe_ptr().bitcast[Float16](), b_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[_ew_kernel_f16, _ew_kernel_f16](
+            A, B, O,
+            d[0], d[1], d[2], d[3], d[4], d[5],
+            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+            n, op, grid_dim=grid, block_dim=_BLOCK,
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, plan.out_shape.copy(), a.dtype())
+
+
 def add(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
     """Elementwise a + b with NumPy-style broadcasting. F32 math, store dtype."""
     return _binary(a, b, _OP_ADD, ctx)
+
+
+def add_slab(
+    a: Tensor, b: Tensor, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `add` (this file :341) — same kernel via _binary_slab."""
+    return _binary_slab(a, b, _OP_ADD, ctx, slab)
 
 
 def sub(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -475,6 +570,50 @@ def _binary_scalar(
     return Tensor(out_buf^, a.shape(), a.dtype())
 
 
+def _binary_scalar_slab(
+    a: Tensor, s: Float32, op: Int, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `_binary_scalar` (this file :436) — byte-identical
+    math; ONLY the allocation source changes (contract C8, Phase P4)."""
+    var dt = a.dtype().to_mojo_dtype()
+    var n = a.numel()
+    var out_buf = slab.alloc(a.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_ews_kernel_f32, _ews_kernel_f32](
+            A, O, s, n, op, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var A = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_ews_kernel_bf16, _ews_kernel_bf16](
+            A, O, s, n, op, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var A = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            a.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_ews_kernel_f16, _ews_kernel_f16](
+            A, O, s, n, op, grid_dim=grid, block_dim=_BLOCK
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, a.shape(), a.dtype())
+
+
 def add_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:
     """Elementwise a + s (scalar)."""
     return _binary_scalar(a, s, _OP_ADD, ctx)
@@ -536,6 +675,14 @@ def sub_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:
 def mul_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:
     """Elementwise a * s (scalar)."""
     return _binary_scalar(a, s, _OP_MUL, ctx)
+
+
+def mul_scalar_slab(
+    a: Tensor, s: Float32, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `mul_scalar` (this file :536) — same kernel via
+    _binary_scalar_slab (contract C8, Phase P4)."""
+    return _binary_scalar_slab(a, s, _OP_MUL, ctx, slab)
 
 
 def div_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:

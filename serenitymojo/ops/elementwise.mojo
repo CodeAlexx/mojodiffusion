@@ -21,7 +21,8 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.cast import cast_tensor, cast_tensor_slab
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -207,6 +208,107 @@ def modulate(
     return Tensor(out_buf^, xshape.copy(), x.dtype())
 
 
+def modulate_slab(
+    x: Tensor, scale: Tensor, shift: Tensor, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `modulate` (this file :104) — byte-identical math
+    (same kernels, same launch params); ONLY the allocation source changes
+    (autograd_v2 contract C8, Phase P4)."""
+    var xshape = x.shape()
+    if len(xshape) < 1:
+        raise Error("modulate: x must have rank >= 1")
+    var d = xshape[len(xshape) - 1]
+    var sshape = scale.shape()
+    var shshape = shift.shape()
+    var nvec = 1
+    if len(sshape) == 2 and sshape[1] == d:
+        nvec = sshape[0]
+    elif len(sshape) != 1 or sshape[0] != d:
+        raise Error("modulate: scale must be [D] or [B, D]")
+    if len(shshape) == 2 and shshape[1] == d:
+        if shshape[0] != nvec:
+            raise Error("modulate: shift vec count != scale vec count")
+    elif len(shshape) != 1 or shshape[0] != d:
+        raise Error("modulate: shift must be [D] or [B, D]")
+    else:
+        if nvec != 1:
+            raise Error("modulate: shift must be [B, D] when scale is [B, D]")
+    if x.dtype() != scale.dtype():
+        var compute_scale = cast_tensor_slab(scale, x.dtype(), ctx, slab)
+        if x.dtype() != shift.dtype():
+            var compute_shift = cast_tensor_slab(shift, x.dtype(), ctx, slab)
+            return modulate_slab(x, compute_scale^, compute_shift^, ctx, slab)
+        return modulate_slab(x, compute_scale^, shift, ctx, slab)
+    if x.dtype() != shift.dtype():
+        var compute_shift = cast_tensor_slab(shift, x.dtype(), ctx, slab)
+        return modulate_slab(x, scale, compute_shift^, ctx, slab)
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+    if rows % nvec != 0:
+        raise Error("modulate: rows not divisible by scale vec count")
+    var rows_per_vec = rows // nvec
+
+    var dt = x.dtype().to_mojo_dtype()
+    var out_buf = slab.alloc(x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * d))
+    var total = rows * d
+    var grid = (total + _BLOCK - 1) // _BLOCK
+
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        )
+        var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            shift.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[_modulate_kernel_f32, _modulate_kernel_f32](
+            X, S, SH, O, rows, d, rows_per_vec, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[BFloat16](), v_rl
+        )
+        var SH = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            shift.buf.unsafe_ptr().bitcast[BFloat16](), v_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        ctx.enqueue_function[_modulate_kernel_bf16, _modulate_kernel_bf16](
+            X, S, SH, O, rows, d, rows_per_vec, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var S = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[Float16](), v_rl
+        )
+        var SH = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            shift.buf.unsafe_ptr().bitcast[Float16](), v_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        ctx.enqueue_function[_modulate_kernel_f16, _modulate_kernel_f16](
+            X, S, SH, O, rows, d, rows_per_vec, grid_dim=grid, block_dim=_BLOCK
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, xshape.copy(), x.dtype())
+
+
 # ── residual_gate ──────────────────────────────────────────────────────────
 def _resgate_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
@@ -312,6 +414,101 @@ def residual_gate(
 
     var dt = x.dtype().to_mojo_dtype()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * d))
+    var total = rows * d
+    var grid = (total + _BLOCK - 1) // _BLOCK
+
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        )
+        var Y = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            y.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[_resgate_kernel_f32, _resgate_kernel_f32](
+            X, G, Y, O, rows, d, rows_per_vec, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[BFloat16](), v_rl
+        )
+        var Y = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            y.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        ctx.enqueue_function[_resgate_kernel_bf16, _resgate_kernel_bf16](
+            X, G, Y, O, rows, d, rows_per_vec, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[Float16](), v_rl
+        )
+        var Y = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            y.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        ctx.enqueue_function[_resgate_kernel_f16, _resgate_kernel_f16](
+            X, G, Y, O, rows, d, rows_per_vec, grid_dim=grid, block_dim=_BLOCK
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, xshape.copy(), x.dtype())
+
+
+def residual_gate_slab(
+    x: Tensor, gate: Tensor, y: Tensor, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `residual_gate` (this file :274) — byte-identical
+    math (same kernels, same launch params); ONLY the allocation source
+    changes (autograd_v2 contract C8, Phase P4)."""
+    var xshape = x.shape()
+    if len(xshape) < 1:
+        raise Error("residual_gate: x must have rank >= 1")
+    var d = xshape[len(xshape) - 1]
+    var gshape = gate.shape()
+    # gate: [D] (one vec) or [B, D] (B stacked vecs, rows split evenly).
+    var nvec = 1
+    if len(gshape) == 2 and gshape[1] == d:
+        nvec = gshape[0]
+    elif len(gshape) != 1 or gshape[0] != d:
+        raise Error("residual_gate: gate must be [D] or [B, D]")
+    if x.numel() != y.numel():
+        raise Error("residual_gate: x/y numel mismatch")
+    if x.dtype() != gate.dtype():
+        var compute_gate = cast_tensor_slab(gate, x.dtype(), ctx, slab)
+        if x.dtype() != y.dtype():
+            var compute_y = cast_tensor_slab(y, x.dtype(), ctx, slab)
+            return residual_gate_slab(x, compute_gate^, compute_y^, ctx, slab)
+        return residual_gate_slab(x, compute_gate^, y, ctx, slab)
+    if x.dtype() != y.dtype():
+        var compute_y = cast_tensor_slab(y, x.dtype(), ctx, slab)
+        return residual_gate_slab(x, gate, compute_y^, ctx, slab)
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+    if rows % nvec != 0:
+        raise Error("residual_gate: rows not divisible by gate vec count")
+    var rows_per_vec = rows // nvec
+
+    var dt = x.dtype().to_mojo_dtype()
+    var out_buf = slab.alloc(x.nbytes())
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * d))
     var total = rows * d

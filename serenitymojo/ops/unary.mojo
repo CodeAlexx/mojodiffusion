@@ -26,6 +26,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -521,6 +522,49 @@ def reciprocal_op(x: Tensor, ctx: DeviceContext) raises -> Tensor:
             out_buf.unsafe_ptr().bitcast[Float16](), rl
         )
         ctx.enqueue_function[_reciprocal_kernel_f16, _reciprocal_kernel_f16](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    ctx.synchronize()
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
+def tanh_op_slab(x: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Tensor:
+    """StepSlab variant of `tanh_op` (this file :414) — byte-identical math
+    (same kernels, same launch params, same sync); ONLY the allocation source
+    changes (autograd_v2 contract C8, Phase P4)."""
+    var dt = x.dtype().to_mojo_dtype()
+    var n = x.numel()
+    var out_buf = slab.alloc(x.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_tanh_kernel_f32, _tanh_kernel_f32](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_tanh_kernel_bf16, _tanh_kernel_bf16](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_tanh_kernel_f16, _tanh_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
     ctx.synchronize()

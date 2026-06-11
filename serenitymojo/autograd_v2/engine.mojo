@@ -23,13 +23,21 @@ from std.collections import Dict
 from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import mul_scalar as _ta_mul_scalar
 from serenitymojo.ops.linalg_backward import mm_backward
-from serenitymojo.ops.norm_backward import rms_norm_backward_dx
-from serenitymojo.ops.elementwise_backward import modulate_backward
+from serenitymojo.ops.norm_backward import (
+    rms_norm_backward_dx,
+    rms_norm_backward_dx_slab,
+)
+from serenitymojo.ops.elementwise_backward import (
+    modulate_backward,
+    modulate_backward_slab,
+)
 from serenitymojo.ops.rope_struct_backward import (
     rope_backward,
     gate_residual_backward_dxdy,
+    rope_backward_slab,
+    gate_residual_backward_dxdy_slab,
 )
-from serenitymojo.ops.loss_swiglu_backward import swiglu_backward
+from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, swiglu_backward_slab
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
 from serenitymojo.autograd_v2.node import (
     Edge,
@@ -49,6 +57,7 @@ from serenitymojo.autograd_v2.node import (
     OPK_RESIDUAL_GATE_DXDY,
     OPK_RESHAPE,
     _raw_add,
+    _raw_add_slab,
     _raw_mul,
     ones_like,
     arc_view,
@@ -56,9 +65,12 @@ from serenitymojo.autograd_v2.node import (
 )
 from serenitymojo.autograd_v2.graph import Graph
 from serenitymojo.autograd_v2.input_buffer import InputBuffer
+from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.autograd_v2.ops_record import (
     proj_lora_backward,
     sdpa_backward_dispatch,
+    proj_lora_backward_slab,
+    sdpa_backward_dispatch_slab,
 )
 
 
@@ -395,6 +407,221 @@ def execute(
     # ── Invariant: every reachable node fired exactly once (the design doc's
     # dep-count exactness gate; flame's queue structure guarantees it, we
     # assert it).
+    if fired != reachable:
+        raise Error(
+            String("execute: fired=")
+            + String(fired)
+            + " != reachable="
+            + String(reachable)
+            + " (dep-count exactness violated)"
+        )
+    return result^
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# StepSlab variants (Phase P4, contract C8): apply_slab/execute_slab are
+# copies of apply/execute with every backward arm routed to its _slab sibling
+# and every fan-in/leaf accumulation through _raw_add_slab. The non-slab pair
+# above stays untouched (C13 gate-don't-delete; the P1 toy gates and the _v3
+# path keep using it).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def apply_slab(
+    node: Node, grads_in: List[TArc], ctx: DeviceContext, mut slab: StepSlab
+) raises -> List[TArc]:
+    """StepSlab variant of `apply` (this file :65) for the zimage DiT
+    vocabulary (the P3/P4 graph path). The P1 toy kinds (MUL/MATMUL/SUM) are
+    NOT slab-routed — they only run under the non-slab execute (toy gates);
+    dispatching one here is an engine bug -> raise (fail loud)."""
+    var g = grads_in[0].copy()  # every kind here is single-forward-output
+    if node.kind == OPK_ADD:
+        # d/da (a+b) = d/db (a+b) = g; share the arc (no allocation).
+        var out = List[TArc]()
+        out.append(g.copy())
+        out.append(g.copy())
+        return out^
+    elif node.kind == OPK_PROJ_LORA:
+        # saved [x, w, a, b]; meta [M, in_f, out_f, rank]; scalars [scale].
+        var lo = ZImageLoraAdapterDevice(
+            node.saved[2].copy(), node.saved[3].copy(),
+            node.saved_meta[3], node.saved_meta[1], node.saved_meta[2],
+            node.scalars[0],
+        )
+        var pg = proj_lora_backward_slab(
+            g[], node.saved[0][], node.saved[1][], lo,
+            node.saved_meta[0], node.saved_meta[1], node.saved_meta[2], ctx,
+            slab,
+        )
+        var out = List[TArc]()
+        out.append(pg.d_x.copy())
+        out.append(pg.d_a.copy())
+        out.append(pg.d_b.copy())
+        return out^
+    elif node.kind == OPK_RMS_NORM_DX:
+        var d_x = rms_norm_backward_dx_slab(
+            g[], node.saved[0][], node.saved[1][], node.scalars[0], ctx, slab
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_MODULATE:
+        var want_param = node.saved_meta[0] == 1
+        var mb = modulate_backward_slab(
+            g[], node.saved[0][], node.saved[1][], ctx, slab,
+            compute_param_grads=want_param,
+        )
+        var out = List[TArc]()
+        out.append(arc_view(mb.d_x))
+        out.append(arc_view(mb.d_scale))
+        return out^
+    elif node.kind == OPK_ROPE:
+        var d_x = rope_backward_slab(
+            g[], node.saved[0][], node.saved[1][], True, ctx, slab
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_SDPA:
+        var sb = sdpa_backward_dispatch_slab(
+            node.saved[0][], node.saved[1][], node.saved[2][], g[],
+            node.scalars[0],
+            node.saved_meta[0], node.saved_meta[1],
+            node.saved_meta[2], node.saved_meta[3], ctx, slab,
+        )
+        var out = List[TArc]()
+        out.append(sb.d_q.copy())
+        out.append(sb.d_k.copy())
+        out.append(sb.d_v.copy())
+        return out^
+    elif node.kind == OPK_SWIGLU:
+        var sg = swiglu_backward_slab(g[], node.saved[0][], node.saved[1][], ctx, slab)
+        var out = List[TArc]()
+        out.append(arc_view(sg.d_gate))
+        out.append(arc_view(sg.d_up))
+        return out^
+    elif node.kind == OPK_RESIDUAL_GATE_DXDY:
+        var grg = gate_residual_backward_dxdy_slab(g[], node.saved[0][], ctx, slab)
+        var out = List[TArc]()
+        out.append(arc_view(grg.d_x))
+        out.append(arc_view(grg.d_y))
+        return out^
+    elif node.kind == OPK_RESHAPE:
+        # Zero-kernel, zero-allocation metadata view (same as apply).
+        var back_shape = List[Int]()
+        for i in range(len(node.saved_meta)):
+            back_shape.append(node.saved_meta[i])
+        var out = List[TArc]()
+        out.append(arc_view_reshaped(g[], back_shape^))
+        return out^
+    elif node.kind == OPK_LEAF:
+        raise Error("apply_slab: OPK_LEAF is sunk by the engine, never dispatched")
+    raise Error(
+        String("apply_slab: kind ")
+        + String(node.kind)
+        + " is not slab-routed (P4 covers the zimage DiT vocabulary)"
+    )
+
+
+def execute_slab(
+    mut graph: Graph, root_node: Int, root_grad: TArc, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Dict[Int, TArc]:
+    """StepSlab variant of `execute` (this file :263) — identical engine
+    algorithm (dep-count BFS, slot-ordered buffers, ready-queue order, arity
+    checks, fired==reachable invariant); materialize/apply/leaf-merge route
+    through the slab. Returned grads are SLAB-RESIDENT views: the caller must
+    copy them out of the slab before rewinding past its mark."""
+    var n = len(graph.nodes)
+    if root_node < 0 or root_node >= n:
+        raise Error("execute: root_node out of range")
+
+    # ── Step 1: dep-count BFS over edges from the root (engine.rs:230-277).
+    var dep = List[Int]()
+    var seen = List[Bool]()
+    var in_queue = List[Bool]()
+    for _ in range(n):
+        dep.append(0)
+        seen.append(False)
+        in_queue.append(False)
+    var stack = List[Int]()
+    stack.append(root_node)
+    var reachable = 0
+    while len(stack) > 0:
+        var nid = stack.pop()
+        if seen[nid]:
+            continue
+        seen[nid] = True
+        reachable += 1
+        for i in range(len(graph.nodes[nid].edges)):
+            var child = graph.nodes[nid].edges[i].node_idx
+            if child >= 0:
+                dep[child] += 1  # engine.rs:268-270
+                stack.append(child)
+
+    # ── Step 2: per-node InputBuffers + seed the root (engine.rs:282-393).
+    var buffers = List[InputBuffer]()
+    for i in range(n):
+        buffers.append(InputBuffer(graph.nodes[i].contrib_counts, root_grad.copy()))
+
+    buffers[root_node].add(0, buffers[root_node].seed_slot(0), root_grad.copy(), ctx)
+
+    var ready = List[Int]()
+    dep[root_node] += 1
+    _dec_and_maybe_enqueue(dep, ready, in_queue, root_node)
+
+    # ── Step 3: drive the queue (engine.rs:437-570).
+    var result = Dict[Int, TArc]()
+    var fired = 0
+    while len(ready) > 0:
+        var nid = _pop_best(ready, graph)
+        fired += 1
+
+        var num_in = graph.nodes[nid].num_inputs
+        var grads_in = List[TArc]()
+        for s in range(num_in):
+            if not buffers[nid].any_present(s):
+                raise Error(
+                    String("execute: node ")
+                    + String(nid)
+                    + " fired with missing input grad in slot "
+                    + String(s)
+                )
+            grads_in.append(buffers[nid].materialize_slab(s, ctx, slab))
+
+        if graph.nodes[nid].kind == OPK_LEAF:
+            var pid = graph.nodes[nid].param_id
+            if result.__contains__(pid):
+                var old = result[pid]
+                var summed = _raw_add_slab(old[], grads_in[0][], ctx, slab)
+                result[pid] = TArc(summed^)
+            else:
+                result[pid] = grads_in[0].copy()
+            continue
+
+        var out_grads = apply_slab(graph.nodes[nid], grads_in, ctx, slab)
+
+        # Arity check: one grad per next_edge (engine.rs:509-520).
+        var n_edges = len(graph.nodes[nid].edges)
+        if len(out_grads) != n_edges:
+            raise Error(
+                String("execute: apply arity mismatch on node ")
+                + String(nid)
+                + ": expected "
+                + String(n_edges)
+                + " got "
+                + String(len(out_grads))
+            )
+
+        for s in range(n_edges):
+            var child = graph.nodes[nid].edges[s].node_idx
+            if child < 0:
+                continue  # null edge: drop the grad (engine.rs:532-535)
+            var slot = graph.nodes[nid].edges[s].input_nr
+            var cslot = graph.nodes[nid].edges[s].contrib_slot
+            buffers[child].add(slot, cslot, out_grads[s].copy(), ctx)
+            _dec_and_maybe_enqueue(dep, ready, in_queue, child)
+
     if fired != reachable:
         raise Error(
             String("execute: fired=")

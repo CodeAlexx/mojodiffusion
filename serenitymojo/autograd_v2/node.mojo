@@ -20,7 +20,9 @@ from serenitymojo.ops.tensor_algebra import (
     mul as _ta_mul,
     add_scalar as _ta_add_scalar,
     zeros_device as _ta_zeros_device,
+    add_slab as _ta_add_slab,
 )
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -158,6 +160,16 @@ def _raw_add(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
     if a.dtype() != b.dtype():
         raise Error("autograd_v2 _raw_add: dtype mismatch (C12: engine never casts)")
     return _ta_add(a, b, ctx)
+
+
+def _raw_add_slab(
+    a: Tensor, b: Tensor, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `_raw_add` (this file :157) — same add kernel via
+    ops.tensor_algebra.add_slab (contract C8, Phase P4)."""
+    if a.dtype() != b.dtype():
+        raise Error("autograd_v2 _raw_add: dtype mismatch (C12: engine never casts)")
+    return _ta_add_slab(a, b, ctx, slab)
 
 
 def _raw_mul(a: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:

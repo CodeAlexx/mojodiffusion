@@ -19,6 +19,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -409,6 +410,64 @@ def swiglu(x_gate: Tensor, x_up: Tensor, ctx: DeviceContext) raises -> Tensor:
     var dt = x_gate.dtype().to_mojo_dtype()
     var n = x_gate.numel()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x_gate.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x_gate.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var U = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x_up.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_swiglu_kernel_f32, _swiglu_kernel_f32](
+            G, U, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x_gate.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var U = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x_up.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_swiglu_kernel_bf16, _swiglu_kernel_bf16](
+            G, U, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x_gate.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var U = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x_up.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_swiglu_kernel_f16, _swiglu_kernel_f16](
+            G, U, O, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, x_gate.shape(), x_gate.dtype())
+
+
+def swiglu_slab(
+    x_gate: Tensor, x_up: Tensor, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `swiglu` (this file :403) — byte-identical math
+    (same kernels, same launch params); ONLY the allocation source changes
+    (autograd_v2 contract C8, Phase P4)."""
+    if x_gate.dtype() != x_up.dtype():
+        raise Error("swiglu: gate/up dtype mismatch")
+    if x_gate.numel() != x_up.numel():
+        raise Error("swiglu: gate/up numel mismatch")
+    var dt = x_gate.dtype().to_mojo_dtype()
+    var n = x_gate.numel()
+    var out_buf = slab.alloc(x_gate.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
     if dt == DType.float32:

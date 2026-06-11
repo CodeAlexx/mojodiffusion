@@ -79,6 +79,7 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
     zimage_stack_lora_forward_main_device_v2, zimage_stack_lora_backward_main_device_v2,
     zimage_stack_lora_forward_main_device_v3,
     zimage_stack_lora_backward_main_device_v3,
+    zimage_stack_lora_backward_main_device_v4,
     ZImageFinalConstsDevice, zimage_final_consts_to_device,
     zimage_stack_lora_forward_main_device_b2, zimage_stack_lora_backward_main_device_b2,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
@@ -128,6 +129,7 @@ from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
 )
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 # ── arch (Z-Image, from transformer config; H/Dh/D fixed comptime) ───────────
@@ -164,6 +166,15 @@ comptime ZIMAGE_V2_ENGINE = True
 # path stays on its _b2 hand-chain in P3. False = _v2 hand-chain, bit-equal
 # oracle (gate-don't-delete, C13/C14).
 comptime ZIMAGE_V2_GRAPH = True
+# v2 SLAB steady state (autograd_v2 Phase P4, contract C8): the B=1 graph
+# backward's recompute outputs / grads / fan-in sums all come from ONE
+# StepSlab (mark/rewind per block, results copied out) instead of the MAX
+# pool — identical host allocation sequence per step -> identical offsets ->
+# stable pointers (the P5 CUDA-graph capture precondition). Only active when
+# ENGINE and GRAPH are also True (_v4); the trainer's main fwd path and the
+# B2 path are untouched in P4 (fwd slab-routing is P5 prep). False = _v3,
+# bit-equal oracle (gate-don't-delete, C13/C14).
+comptime ZIMAGE_V2_SLAB = True
 
 comptime LAT_C = 16
 comptime LAT_H = 72
@@ -703,6 +714,7 @@ def _train_one_step_bucket[
     cap_pad_h: List[Float32],
     train_cfg: TrainConfig,
     train_start_ns: UInt,
+    mut slab: StepSlab,
     ctx: DeviceContext,
 ) raises -> StepResult:
     comptime HT_B = LAT_H_B // PATCH
@@ -874,12 +886,22 @@ def _train_one_step_bucket[
         # P3: graph-engine backward (_v3) when ZIMAGE_V2_GRAPH; else the _v2
         # hand-chain. Same args either way (the _v3 signature is _v2's).
         comptime if ZIMAGE_V2_GRAPH:
-            grads = zimage_stack_lora_backward_main_device_v3[H, Dh, N_IMG_B, N_TXT_B, S_B](
-                d_loss, main_blocks, mvall.value().per_block, lora_dev,
-                f_scale.copy(), final_lin_w,
-                uni_cos[], uni_sin[], fwd,
-                D, F, OUT_CH, EPS, FINAL_EPS, ctx,
-            )
+            # P4: slab-routed graph backward (_v4) when ZIMAGE_V2_SLAB; else
+            # the P3 _v3 (same graph engine, MAX-pool allocations).
+            comptime if ZIMAGE_V2_SLAB:
+                grads = zimage_stack_lora_backward_main_device_v4[H, Dh, N_IMG_B, N_TXT_B, S_B](
+                    d_loss, main_blocks, mvall.value().per_block, lora_dev,
+                    f_scale.copy(), final_lin_w,
+                    uni_cos[], uni_sin[], fwd,
+                    D, F, OUT_CH, EPS, FINAL_EPS, ctx, slab,
+                )
+            else:
+                grads = zimage_stack_lora_backward_main_device_v3[H, Dh, N_IMG_B, N_TXT_B, S_B](
+                    d_loss, main_blocks, mvall.value().per_block, lora_dev,
+                    f_scale.copy(), final_lin_w,
+                    uni_cos[], uni_sin[], fwd,
+                    D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+                )
         else:
             grads = zimage_stack_lora_backward_main_device_v2[H, Dh, N_IMG_B, N_TXT_B, S_B](
                 d_loss, main_blocks, mvall.value().per_block, lora_dev,
@@ -1017,6 +1039,29 @@ def main() raises:
 
     var ctx = DeviceContext()
 
+    # ── P4 StepSlab (contract C8): ONE slab per run, built before the loop;
+    # the B=1 graph backward (_v4) routes every per-block allocation through
+    # it (mark/rewind per block). Sized 17 x 256 MiB = 4.25 GiB: measured
+    # per-block peak is 3.52 GiB at S=1248 (printed at step 5; the whole
+    # recompute graph + backward stays live until the block's rewind), and
+    # the largest bucket (S=1312) scales the [30,S,S] F32 score slabs
+    # (~207 MB each, the largest single transients) by ~1.1x -> ~3.9 GiB
+    # worst case. Each transient fits one 256 MiB ring slab.
+    # 256-byte alignment matches MAX-pool pointers (cuBLAS kernel selection is
+    # alignment-sensitive; C14 bit-gates). When the slab path is gated OFF the
+    # slab shrinks to one 4 KiB page (the parameter still threads through).
+    var slab_bytes = 256 * 1024 * 1024
+    var slab_count = 17
+    comptime if not (ZIMAGE_V2_ENGINE and ZIMAGE_V2_GRAPH and ZIMAGE_V2_SLAB):
+        slab_bytes = 4096
+        slab_count = 1
+    var slab = StepSlab(ctx, slab_bytes, slab_count, 256)
+    # Steady-state determinism gate (P4 deliverable 4): per-step n_allocs
+    # deltas for steps 3/4/5 must be IDENTICAL (the allocation sequence is
+    # shape-independent: counts depend only on the recorded graph structure).
+    var slab_d3 = -1
+    var slab_d4 = -1
+
     # ── cache first: fail before loading the 24 GB-class model if prepare has
     # not produced the local Mojo cache yet.
     var cache = KleinCache(cache_dir)
@@ -1093,6 +1138,7 @@ def main() raises:
         if key.c != LAT_C:
             raise Error("train_zimage_real: unsupported latent channel count")
         var valid_cap = _cache_valid_cap(cache, slot, ctx)
+        var slab_allocs_before = slab.n_allocs
         var loss: Float32
         if train_cfg.batch_size == 2:
             # batch-2: two consecutive cache slots per step; both must share
@@ -1139,14 +1185,14 @@ def main() raises:
                 var r_72_224 = _train_one_step_bucket[72, 56, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, ctx,
+                    train_cfg, train_start, slab, ctx,
                 )
                 loss = r_72_224.loss
             elif valid_cap <= 256:
                 var r_72_256 = _train_one_step_bucket[72, 56, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, ctx,
+                    train_cfg, train_start, slab, ctx,
                 )
                 loss = r_72_256.loss
             else:
@@ -1156,14 +1202,14 @@ def main() raises:
                 var r_88_224 = _train_one_step_bucket[88, 48, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, ctx,
+                    train_cfg, train_start, slab, ctx,
                 )
                 loss = r_88_224.loss
             elif valid_cap <= 256:
                 var r_88_256 = _train_one_step_bucket[88, 48, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, ctx,
+                    train_cfg, train_start, slab, ctx,
                 )
                 loss = r_88_256.loss
             else:
@@ -1175,20 +1221,44 @@ def main() raises:
                 var r_64_224 = _train_one_step_bucket[64, 64, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, ctx,
+                    train_cfg, train_start, slab, ctx,
                 )
                 loss = r_64_224.loss
             elif valid_cap <= 256:
                 var r_64_256 = _train_one_step_bucket[64, 64, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
                     lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                    train_cfg, train_start, ctx,
+                    train_cfg, train_start, slab, ctx,
                 )
                 loss = r_64_256.loss
             else:
                 raise Error("train_zimage_real: caption too long for 256-token production bucket")
         else:
             raise Error("train_zimage_real: unsupported Z-Image production bucket")
+        # ── P4 steady-state assertion: identical per-step slab alloc counts
+        # across steps 3,4,5 (deterministic sequence — the P5 capture
+        # precondition). Printed once at step 5; mismatch raises.
+        comptime if ZIMAGE_V2_ENGINE and ZIMAGE_V2_GRAPH and ZIMAGE_V2_SLAB:
+            var slab_step_allocs = slab.n_allocs - slab_allocs_before
+            if slab_step_allocs > 0:
+                if k == 3:
+                    slab_d3 = slab_step_allocs
+                elif k == 4:
+                    slab_d4 = slab_step_allocs
+                elif k == 5:
+                    print(
+                        "[SLAB] n_allocs=", slab_step_allocs,
+                        " peak=", slab.peak_bytes(),
+                        " (steps 3/4/5: ", slab_d3, "/", slab_d4, "/",
+                        slab_step_allocs, ")",
+                    )
+                    if slab_step_allocs != slab_d4 or slab_step_allocs != slab_d3:
+                        raise Error(
+                            String("[SLAB] nondeterministic alloc sequence: ")
+                            + String(slab_d3) + "/" + String(slab_d4) + "/"
+                            + String(slab_step_allocs)
+                            + " (steps 3/4/5 must match)"
+                        )
         if k == start_step + 1:
             first_loss = loss
         last_loss = loss

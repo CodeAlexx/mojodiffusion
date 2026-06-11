@@ -32,20 +32,27 @@
 from std.gpu.host import DeviceContext
 from std.collections import Optional
 from serenitymojo.tensor import Tensor
-from serenitymojo.ops.linear import linear
-from serenitymojo.ops.norm import rms_norm
-from serenitymojo.ops.elementwise import modulate, residual_gate
-from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa_nomask
-from serenitymojo.ops.activations import swiglu
-from serenitymojo.ops.tensor_algebra import add
-from serenitymojo.ops.linalg_backward import linear_backward_dx
-from serenitymojo.ops.attention_backward import sdpa_backward
+from serenitymojo.ops.linear import linear, linear_slab
+from serenitymojo.ops.norm import rms_norm, rms_norm_slab
+from serenitymojo.ops.elementwise import (
+    modulate, residual_gate, modulate_slab, residual_gate_slab,
+)
+from serenitymojo.ops.rope import rope_interleaved, rope_interleaved_slab
+from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_slab
+from serenitymojo.ops.activations import swiglu, swiglu_slab
+from serenitymojo.ops.tensor_algebra import add, add_slab
+from serenitymojo.ops.linalg_backward import (
+    linear_backward_dx, linear_backward_dx_slab,
+)
+from serenitymojo.ops.attention_backward import sdpa_backward, sdpa_backward_slab
 from serenitymojo.models.zimage.lora_block import (
     ZImageLoraAdapterDevice,
     zimage_lora_apply_device,
     zimage_lora_bwd_device_resident_tensors,
+    zimage_lora_apply_device_slab,
+    zimage_lora_bwd_device_resident_tensors_slab,
 )
+from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.autograd_v2.node import (
     Edge,
     TArc,
@@ -371,4 +378,210 @@ def record_add(
     edges.append(g.edge_for(b[].id))
     var oids: List[Int] = [y.id]
     _ = g.record(OPK_ADD, edges^, List[TArc](), List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# StepSlab variants (Phase P4, contract C8): byte-identical recording — same
+# ops, same edges/saved/meta/scalars, same C15 slot assignment; ONLY the
+# forward op's allocation source changes (each runs through its _slab
+# sibling). record_reshape needs NO slab variant: it is metadata-only (zero
+# kernels, zero allocations).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def proj_lora_backward_slab(
+    d_y: Tensor, x_in: Tensor, w: Tensor,
+    lo: ZImageLoraAdapterDevice,
+    M: Int, in_f: Int, out_f: Int,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> ProjLoraGrads:
+    """StepSlab variant of `proj_lora_backward` (this file :85) — same callees
+    in the same order/fold, routed to their _slab siblings."""
+    var base_dx = linear_backward_dx_slab(d_y, w, M, in_f, out_f, ctx, slab)
+    var lg = zimage_lora_bwd_device_resident_tensors_slab(d_y, x_in, lo, M, ctx, slab)
+    var summed = add_slab(base_dx^, lg.d_x[], ctx, slab)
+    return ProjLoraGrads(TArc(summed^), lg.d_a.copy(), lg.d_b.copy())
+
+
+def sdpa_backward_dispatch_slab(
+    q: Tensor, k: Tensor, v: Tensor, d_out: Tensor, scale: Float32,
+    B: Int, S: Int, H: Int, Dh: Int,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> SdpaGradArcs:
+    """StepSlab variant of `sdpa_backward_dispatch` (this file :116) — same
+    comptime buckets, routed to sdpa_backward_slab."""
+    if B == 1 and S == 1248 and H == 30 and Dh == 128:
+        var sb = sdpa_backward_slab[1, 1248, 30, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 1 and S == 1280 and H == 30 and Dh == 128:
+        var sb = sdpa_backward_slab[1, 1280, 30, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 1 and S == 1312 and H == 30 and Dh == 128:
+        var sb = sdpa_backward_slab[1, 1312, 30, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 1 and S == 320 and H == 30 and Dh == 128:
+        var sb = sdpa_backward_slab[1, 320, 30, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    raise Error(
+        String("sdpa_backward_dispatch_slab: no comptime bucket for (B,S,H,Dh)=(")
+        + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh)
+        + ")"
+    )
+
+
+def record_proj_lora_slab(
+    mut g: Graph, x: TArc, w: TArc, lo: ZImageLoraAdapterDevice,
+    a_param_id: Int, b_param_id: Int,
+    M: Int, in_f: Int, out_f: Int,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab variant of `record_proj_lora` (this file :170)."""
+    var nb = Optional[Tensor](None)
+    var base = linear_slab(x[], w[], nb^, ctx, slab)
+    var y = zimage_lora_apply_device_slab(base^, x[], lo, M, ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    edges.append(_leaf_edge(g, a_param_id))
+    edges.append(_leaf_edge(g, b_param_id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(w.copy())
+    saved.append(lo.a.copy())
+    saved.append(lo.b.copy())
+    var meta: List[Int] = [M, in_f, out_f, lo.rank]
+    var scalars: List[Float32] = [lo.scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_PROJ_LORA, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)
+
+
+def record_rms_norm_dx_slab(
+    mut g: Graph, x: TArc, weight: TArc, eps: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab variant of `record_rms_norm_dx` (this file :202)."""
+    var y = rms_norm_slab(x[], weight[], eps, ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(weight.copy())
+    var scalars: List[Float32] = [eps]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_RMS_NORM_DX, edges^, saved^, List[Int](), scalars^, oids)
+    return TArc(y^)
+
+
+def record_modulate_slab(
+    mut g: Graph, x: TArc, scale: TArc, shift: TArc,
+    scale_param_id: Int, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab variant of `record_modulate` (this file :221)."""
+    var y = modulate_slab(x[], scale[], shift[], ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    edges.append(_leaf_edge(g, scale_param_id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(scale.copy())
+    var want_param = 0
+    if scale_param_id > 0:
+        want_param = 1
+    var meta: List[Int] = [want_param]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_MODULATE, edges^, saved^, meta^, List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_rope_slab(
+    mut g: Graph, x: TArc, cos: TArc, sin: TArc, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab variant of `record_rope` (this file :249)."""
+    var y = rope_interleaved_slab(x[], cos[], sin[], ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(cos.copy())
+    saved.append(sin.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_ROPE, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_sdpa_slab[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    mut g: Graph, q: TArc, k: TArc, v: TArc, scale: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab variant of `record_sdpa` (this file :267)."""
+    var y = sdpa_nomask_slab[B, S, H, Dh](q[], k[], v[], scale, ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(q[].id))
+    edges.append(g.edge_for(k[].id))
+    edges.append(g.edge_for(v[].id))
+    var saved = List[TArc]()
+    saved.append(q.copy())
+    saved.append(k.copy())
+    saved.append(v.copy())
+    var meta: List[Int] = [B, S, H, Dh]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_SDPA, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)
+
+
+def record_swiglu_slab(
+    mut g: Graph, gate: TArc, up: TArc, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab variant of `record_swiglu` (this file :293)."""
+    var y = swiglu_slab(gate[], up[], ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(gate[].id))
+    edges.append(g.edge_for(up[].id))
+    var saved = List[TArc]()
+    saved.append(gate.copy())
+    saved.append(up.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_SWIGLU, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_residual_gate_slab(
+    mut g: Graph, x: TArc, gate_t: TArc, y_in: TArc, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab variant of `record_residual_gate` (this file :311)."""
+    var y = residual_gate_slab(x[], gate_t[], y_in[], ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    edges.append(g.edge_for(y_in[].id))
+    var saved = List[TArc]()
+    saved.append(gate_t.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(
+        OPK_RESIDUAL_GATE_DXDY, edges^, saved^, List[Int](), List[Float32](), oids
+    )
     return TArc(y^)

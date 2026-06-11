@@ -42,6 +42,7 @@ from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -422,6 +423,101 @@ def rms_norm_backward_dx(
         rows *= xshape[i]
 
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
+
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.float32], _rms_bwd_dx_kernel[DType.float32]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.bfloat16], _rms_bwd_dx_kernel[DType.bfloat16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        ctx.enqueue_function[
+            _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
+        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+    ctx.synchronize()
+    return Tensor(dx_buf^, xshape.copy(), x.dtype())
+
+
+def rms_norm_backward_dx_slab(
+    go: Tensor, x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `rms_norm_backward_dx` (this file :373) —
+    byte-identical math (same kernels, same launch params, same sync); ONLY
+    the allocation source changes (autograd_v2 contract C8, Phase P4)."""
+    if x.dtype() != go.dtype():
+        raise Error("rms_norm_backward_dx: go/x dtype mismatch")
+    if x.dtype() != weight.dtype():
+        if x.dtype() != STDtype.F32:
+            raise Error("rms_norm_backward_dx: mixed weight dtype requires F32 activations")
+        var xshape_m = x.shape()
+        var d_m = xshape_m[len(xshape_m) - 1]
+        var rows_m = 1
+        for i in range(len(xshape_m) - 1):
+            rows_m *= xshape_m[i]
+        var dx_buf_m = slab.alloc(x.nbytes())
+        var x_rl_m = RuntimeLayout[_DYN2].row_major(IndexList[2](rows_m, d_m))
+        var g_rl_m = RuntimeLayout[_DYN1].row_major(IndexList[1](d_m))
+        var GOm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        var Xm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        var DXm = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf_m.unsafe_ptr().bitcast[Float32](), x_rl_m)
+        if weight.dtype() == STDtype.BF16:
+            var Gm = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl_m)
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.bfloat16],
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.bfloat16],
+            ](GOm, Xm, Gm, DXm, d_m, eps, grid_dim=rows_m, block_dim=_TPB)
+        elif weight.dtype() == STDtype.F16:
+            var Gm = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                weight.buf.unsafe_ptr().bitcast[Float16](), g_rl_m)
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.float16],
+                _rms_bwd_dx_kernel_mixed[DType.float32, DType.float16],
+            ](GOm, Xm, Gm, DXm, d_m, eps, grid_dim=rows_m, block_dim=_TPB)
+        else:
+            raise Error("rms_norm_backward_dx: unsupported mixed weight dtype")
+        ctx.synchronize()
+        return Tensor(dx_buf_m^, xshape_m.copy(), x.dtype())
+    var xshape = x.shape()
+    var d = xshape[len(xshape) - 1]
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+
+    var dx_buf = slab.alloc(x.nbytes())
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 

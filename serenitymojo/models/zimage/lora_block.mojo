@@ -47,8 +47,12 @@ from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.linear import linear
-from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx, linear_backward_dw
+from serenitymojo.ops.linear import linear, linear_slab
+from serenitymojo.ops.linalg_backward import (
+    linear_backward, linear_backward_dx, linear_backward_dw,
+    linear_backward_dx_slab, linear_backward_dw_slab,
+)
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 # REUSE the trainer's LoRA structs (the target authority).
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
@@ -62,7 +66,9 @@ from serenitymojo.ops.vec_modulate import vec_modulate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.unary import tanh_op
-from serenitymojo.ops.tensor_algebra import reshape_owned, reshape_in_place, add, mul_scalar
+from serenitymojo.ops.tensor_algebra import (
+    reshape_owned, reshape_in_place, add, mul_scalar, add_slab, mul_scalar_slab,
+)
 from serenitymojo.ops.norm_backward import rms_norm_backward, rms_norm_backward_dx
 from serenitymojo.ops.attention_backward import sdpa_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward
@@ -401,6 +407,23 @@ def zimage_lora_apply_device(
     return add(base_y^, contrib^, ctx)
 
 
+def zimage_lora_apply_device_slab(
+    var base_y: Tensor, x: Tensor, lo: ZImageLoraAdapterDevice,
+    M: Int, ctx: DeviceContext, mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `zimage_lora_apply_device` (this file :390) —
+    byte-identical math (same linear/mul_scalar/add calls in the same order);
+    internal ops route to their _slab siblings (autograd_v2 contract C8, P4)."""
+    if lo.scale == Float32(0.0):
+        return base_y^
+    var nb1 = Optional[Tensor](None)
+    var t = linear_slab(x, lo.a[], nb1^, ctx, slab)
+    var nb2 = Optional[Tensor](None)
+    var dy = linear_slab(t, lo.b[], nb2^, ctx, slab)
+    var contrib = mul_scalar_slab(dy, lo.scale, ctx, slab)
+    return add_slab(base_y^, contrib^, ctx, slab)
+
+
 struct _HostGradPair(Copyable, Movable):
     var d_a: List[Float32]
     var d_b: List[Float32]
@@ -495,6 +518,26 @@ def zimage_lora_bwd_device_resident_tensors(
 
     var d_x_lo = linear_backward_dx(d_t, lo.a[], M, lo.in_f, lo.rank, ctx)
     var d_a_t = linear_backward_dw(d_t, x, M, lo.in_f, lo.rank, ctx)
+
+    return ZImageLoraDeviceGradTensors(TArc(d_a_t^), TArc(d_b_t^), TArc(d_x_lo^))
+
+
+def zimage_lora_bwd_device_resident_tensors_slab(
+    d_contrib: Tensor, x: Tensor, lo: ZImageLoraAdapterDevice,
+    M: Int, ctx: DeviceContext, mut slab: StepSlab,
+) raises -> ZImageLoraDeviceGradTensors:
+    """StepSlab variant of `zimage_lora_bwd_device_resident_tensors` (this
+    file :485ff) — byte-identical math (same op calls in the same order);
+    internal ops route to their _slab siblings (autograd_v2 contract C8, P4)."""
+    var nb_t = Optional[Tensor](None)
+    var t = linear_slab(x, lo.a[], nb_t^, ctx, slab)
+    var d_dy = mul_scalar_slab(d_contrib, lo.scale, ctx, slab)
+
+    var d_t = linear_backward_dx_slab(d_dy, lo.b[], M, lo.rank, lo.out_f, ctx, slab)
+    var d_b_t = linear_backward_dw_slab(d_dy, t, M, lo.rank, lo.out_f, ctx, slab)
+
+    var d_x_lo = linear_backward_dx_slab(d_t, lo.a[], M, lo.in_f, lo.rank, ctx, slab)
+    var d_a_t = linear_backward_dw_slab(d_t, x, M, lo.in_f, lo.rank, ctx, slab)
 
     return ZImageLoraDeviceGradTensors(TArc(d_a_t^), TArc(d_b_t^), TArc(d_x_lo^))
 

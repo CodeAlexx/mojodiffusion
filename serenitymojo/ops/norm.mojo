@@ -35,7 +35,8 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.cast import cast_tensor, cast_tensor_slab
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -179,6 +180,82 @@ def rms_norm(
     var dt = x.dtype().to_mojo_dtype()
     var nbytes = x.nbytes()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
+
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float32](), g_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        ctx.enqueue_function[_rms_norm_kernel_f32, _rms_norm_kernel_f32](
+            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+        )
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
+            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+        )
+    else:  # float16
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            weight.buf.unsafe_ptr().bitcast[Float16](), g_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        ctx.enqueue_function[_rms_norm_kernel_f16, _rms_norm_kernel_f16](
+            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+        )
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+    return Tensor(out_buf^, xshape.copy(), x.dtype())
+
+
+def rms_norm_slab(
+    x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `rms_norm` (this file :151) — byte-identical math
+    (same kernels, same launch params); ONLY the allocation source changes
+    (autograd_v2 contract C8, Phase P4)."""
+    var xshape = x.shape()
+    var wshape = weight.shape()
+    if len(xshape) < 1:
+        raise Error("rms_norm: x must have rank >= 1")
+    var d = xshape[len(xshape) - 1]
+    if len(wshape) != 1 or wshape[0] != d:
+        raise Error(
+            String("rms_norm: weight must be [")
+            + String(d)
+            + "], got rank "
+            + String(len(wshape))
+        )
+    if x.dtype() != weight.dtype():
+        var compute_weight = cast_tensor_slab(weight, x.dtype(), ctx, slab)
+        return rms_norm_slab(x, compute_weight^, eps, ctx, slab)
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+
+    var dt = x.dtype().to_mojo_dtype()
+    var nbytes = x.nbytes()
+    var out_buf = slab.alloc(nbytes)
 
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))

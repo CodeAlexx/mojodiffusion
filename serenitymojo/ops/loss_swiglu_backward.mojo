@@ -39,6 +39,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -320,6 +321,73 @@ def swiglu_backward(
         raise Error("swiglu_backward: empty input")
     var dg_buf = ctx.enqueue_create_buffer[DType.uint8](gate.nbytes())
     var du_buf = ctx.enqueue_create_buffer[DType.uint8](up.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    var dt = gate.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var U = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            up.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float32](), rl)
+        var DU = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            du_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[
+            _swiglu_bwd_kernel[DType.float32], _swiglu_bwd_kernel[DType.float32]
+        ](GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var U = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            up.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var DG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var DU = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            du_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[
+            _swiglu_bwd_kernel[DType.bfloat16], _swiglu_bwd_kernel[DType.bfloat16]
+        ](GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            gate.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var U = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            up.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var DG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            dg_buf.unsafe_ptr().bitcast[Float16](), rl)
+        var DU = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            du_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[
+            _swiglu_bwd_kernel[DType.float16], _swiglu_bwd_kernel[DType.float16]
+        ](GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK)
+    ctx.synchronize()
+    var dg_t = Tensor(dg_buf^, gate.shape(), gate.dtype())
+    var du_t = Tensor(du_buf^, up.shape(), up.dtype())
+    return SwigluGrads(dg_t^, du_t^)
+
+
+def swiglu_backward_slab(
+    grad_out: Tensor, gate: Tensor, up: Tensor, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> SwigluGrads:
+    """StepSlab variant of `swiglu_backward` (this file :304) — byte-identical
+    math (same kernel, same launch params, same sync); ONLY the allocation
+    source changes (autograd_v2 contract C8, Phase P4)."""
+    if grad_out.dtype() != gate.dtype() or gate.dtype() != up.dtype():
+        raise Error("swiglu_backward: grad_out/gate/up dtype mismatch")
+    if grad_out.numel() != gate.numel() or gate.numel() != up.numel():
+        raise Error("swiglu_backward: grad_out/gate/up numel mismatch")
+    var n = gate.numel()
+    if n == 0:
+        raise Error("swiglu_backward: empty input")
+    var dg_buf = slab.alloc(gate.nbytes())
+    var du_buf = slab.alloc(up.nbytes())
     var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var grid = (n + _BLOCK - 1) // _BLOCK
     var dt = gate.dtype().to_mojo_dtype()

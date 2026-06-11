@@ -23,6 +23,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -123,6 +124,133 @@ def modulate_backward(
         param_nbytes = 0
     var ds_buf = ctx.enqueue_create_buffer[DType.uint8](param_nbytes)
     var dsh_buf = ctx.enqueue_create_buffer[DType.uint8](param_nbytes)
+
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * d))
+
+    var total = rows * d
+    var dx_grid = (total + _BLOCK - 1) // _BLOCK
+    var dt = x.dtype().to_mojo_dtype()
+    var param_shape = List[Int]()
+    var p_grid = (d + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[Float32](), v_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        ctx.enqueue_function[
+            _modulate_bwd_dx_kernel[DType.float32],
+            _modulate_bwd_dx_kernel[DType.float32],
+        ](GO, S, DX, rows, d, rows_per_vec, grid_dim=dx_grid, block_dim=_BLOCK)
+        if compute_param_grads:
+            var DS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                ds_buf.unsafe_ptr().bitcast[Float32](), v_rl)
+            var DSH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                dsh_buf.unsafe_ptr().bitcast[Float32](), v_rl)
+            ctx.enqueue_function[
+                _modulate_bwd_param_kernel[DType.float32],
+                _modulate_bwd_param_kernel[DType.float32],
+            ](GO, X, DS, DSH, rows, d, grid_dim=p_grid, block_dim=_BLOCK)
+            param_shape = scale.shape()
+        else:
+            param_shape.append(0)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[BFloat16](), v_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        ctx.enqueue_function[
+            _modulate_bwd_dx_kernel[DType.bfloat16],
+            _modulate_bwd_dx_kernel[DType.bfloat16],
+        ](GO, S, DX, rows, d, rows_per_vec, grid_dim=dx_grid, block_dim=_BLOCK)
+        if compute_param_grads:
+            var DS = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                ds_buf.unsafe_ptr().bitcast[BFloat16](), v_rl)
+            var DSH = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                dsh_buf.unsafe_ptr().bitcast[BFloat16](), v_rl)
+            ctx.enqueue_function[
+                _modulate_bwd_param_kernel[DType.bfloat16],
+                _modulate_bwd_param_kernel[DType.bfloat16],
+            ](GO, X, DS, DSH, rows, d, grid_dim=p_grid, block_dim=_BLOCK)
+            param_shape = scale.shape()
+        else:
+            param_shape.append(0)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var S = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[Float16](), v_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        ctx.enqueue_function[
+            _modulate_bwd_dx_kernel[DType.float16],
+            _modulate_bwd_dx_kernel[DType.float16],
+        ](GO, S, DX, rows, d, rows_per_vec, grid_dim=dx_grid, block_dim=_BLOCK)
+        if compute_param_grads:
+            var DS = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                ds_buf.unsafe_ptr().bitcast[Float16](), v_rl)
+            var DSH = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                dsh_buf.unsafe_ptr().bitcast[Float16](), v_rl)
+            ctx.enqueue_function[
+                _modulate_bwd_param_kernel[DType.float16],
+                _modulate_bwd_param_kernel[DType.float16],
+            ](GO, X, DS, DSH, rows, d, grid_dim=p_grid, block_dim=_BLOCK)
+            param_shape = scale.shape()
+        else:
+            param_shape.append(0)
+    ctx.synchronize()
+    return ModulateBackward(
+        Tensor(dx_buf^, xshape.copy(), x.dtype()),
+        Tensor(ds_buf^, param_shape.copy(), scale.dtype()),
+        Tensor(dsh_buf^, param_shape^, scale.dtype()),
+    )
+
+
+def modulate_backward_slab(
+    go: Tensor, x: Tensor, scale: Tensor, ctx: DeviceContext,
+    mut slab: StepSlab,
+    compute_param_grads: Bool = True,
+) raises -> ModulateBackward:
+    """StepSlab variant of `modulate_backward` (this file :89) —
+    byte-identical math (same kernels, same launch params, same sync); ONLY
+    the allocation source changes (autograd_v2 contract C8, Phase P4)."""
+    if x.dtype() != go.dtype() or x.dtype() != scale.dtype():
+        raise Error("modulate_backward: go/x/scale dtype mismatch")
+    var xshape = x.shape()
+    var d = xshape[len(xshape) - 1]
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+    var sshape = scale.shape()
+    var nvec = 1
+    if len(sshape) == 2 and sshape[1] == d:
+        nvec = sshape[0]
+        if compute_param_grads:
+            raise Error(
+                "modulate_backward: param grads unsupported for [B, D] scale"
+            )
+        if rows % nvec != 0:
+            raise Error("modulate_backward: rows not divisible by vec count")
+    elif len(sshape) != 1 or sshape[0] != d:
+        raise Error("modulate_backward: scale must be [D] or [B, D]")
+    var rows_per_vec = rows // nvec
+
+    var dx_buf = slab.alloc(x.nbytes())
+    var param_nbytes = scale.nbytes()
+    if not compute_param_grads:
+        param_nbytes = 0
+    var ds_buf = slab.alloc(param_nbytes)
+    var dsh_buf = slab.alloc(param_nbytes)
 
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * d))

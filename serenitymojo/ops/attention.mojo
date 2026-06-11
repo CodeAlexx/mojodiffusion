@@ -51,6 +51,7 @@ from linalg.matmul.vendor.blas import matmul
 from nn.attention.gpu.mha import flash_attention
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -1652,3 +1653,242 @@ def sdpa_cross_masked[
     ):
         raise Error("sdpa_cross_masked: mask must be [B,H,Sq,Skv]")
     return _sdpa_cross_tiled[B, Sq, Skv, H, Dh](q, k, v, mask, scale, ctx, True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# StepSlab variants (autograd_v2 contract C8, Phase P4): byte-identical math
+# to the originals above — same kernels, same launch params, same per-head
+# matmul loops; ONLY the allocation source changes (typed MAX buffers become
+# uint8 slab views bitcast to the same element pointers).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _sdpa_math_storage_slab[
+    B: Int, S: Int, H: Int, Dh: Int, dtype: DType
+](
+    qs: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    ks: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    vs: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    mask: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    scale: Float32,
+    ctx: DeviceContext,
+    apply_mask: Bool,
+    out_dt: STDtype,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `_sdpa_math_storage` (this file :260)."""
+    comptime BH = B * H
+    var esz = 4
+    comptime if dtype == DType.bfloat16 or dtype == DType.float16:
+        esz = 2
+
+    # ── 1) gather q/k/v BSHD -> BHSD-contiguous storage [B*H*S, Dh] ──────────
+    comptime src_rows = B * S * H
+    comptime bhsd_rows = B * H * S
+    var q_buf = slab.alloc(bhsd_rows * Dh * esz)
+    var k_buf = slab.alloc(bhsd_rows * Dh * esz)
+    var v_buf = slab.alloc(bhsd_rows * Dh * esz)
+    var bhsd_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](bhsd_rows, Dh))
+
+    var qd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+        q_buf.unsafe_ptr().bitcast[Scalar[dtype]](), bhsd_rl)
+    var kd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+        k_buf.unsafe_ptr().bitcast[Scalar[dtype]](), bhsd_rl)
+    var vd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+        v_buf.unsafe_ptr().bitcast[Scalar[dtype]](), bhsd_rl)
+    var ngather = B * H * S * Dh
+    var ggrid = (ngather + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](qs, qd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](ks, kd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](vs, vd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+
+    # ── 2) QKᵀ per head -> scores F32 [B*H, S, S] ────────────────────────────
+    var scores = slab.alloc(BH * S * S * 4)
+    var head_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, Dh))
+    var sc_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, S))
+    var qptr = q_buf.unsafe_ptr().bitcast[Scalar[dtype]]()
+    var kptr = k_buf.unsafe_ptr().bitcast[Scalar[dtype]]()
+    var scptr = scores.unsafe_ptr().bitcast[Float32]()
+    for bh in range(BH):
+        var A = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+            qptr + bh * S * Dh, head_rl
+        )
+        var Bt = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+            kptr + bh * S * Dh, head_rl
+        )
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            scptr + bh * S * S, sc_rl
+        )
+        # C[S,S] = A[S,Dh] @ Bt[S,Dh]ᵀ  (Q @ Kᵀ). c_row_major so C is row-major.
+        matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)
+
+    # ── 3) scale, optionally adding a mask over [B*H*S, S] scores ────────────
+    comptime sm_rows = BH * S
+    var sc_full_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](sm_rows, S))
+    var sc_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        scptr, sc_full_rl
+    )
+    var nsm = sm_rows * S
+    var smgrid = (nsm + _BLOCK - 1) // _BLOCK
+    if apply_mask:
+        ctx.enqueue_function[_scale_mask[dtype], _scale_mask[dtype]](
+            sc_full, mask, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
+    else:
+        ctx.enqueue_function[_scale_f32, _scale_f32](
+            sc_full, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
+
+    # ── 4) softmax over last dim (j) in place: one block per [B*H*S] row ─────
+    ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
+        sc_full, S, grid_dim=sm_rows, block_dim=_TPB)
+
+    # ── 5) P @ V per head -> out F32 BHSD [B*H, S, Dh] ───────────────────────
+    var out_f32 = slab.alloc(bhsd_rows * Dh * 4)
+    var optr = out_f32.unsafe_ptr().bitcast[Float32]()
+    comptime if dtype == DType.float32:
+        var vptr = v_buf.unsafe_ptr().bitcast[Float32]()
+        for bh in range(BH):
+            var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                scptr + bh * S * S, sc_rl
+            )
+            var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                vptr + bh * S * Dh, head_rl
+            )
+            var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                optr + bh * S * Dh, head_rl
+            )
+            matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
+    else:
+        var v_full = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
+            v_buf.unsafe_ptr().bitcast[Scalar[dtype]](), bhsd_rl
+        )
+        var o_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            optr, bhsd_rl
+        )
+        var pv_total = B * H * S * Dh
+        var pv_grid = (pv_total + _BLOCK - 1) // _BLOCK
+        ctx.enqueue_function[
+            _attn_pv_kernel[dtype], _attn_pv_kernel[dtype]
+        ](sc_full, v_full, o_full, B, S, S, H, Dh, grid_dim=pv_grid, block_dim=_BLOCK)
+
+    # ── 6) scatter BHSD F32 -> BSHD output in storage dtype ──────────────────
+    var bsz = out_dt.byte_size()
+    var out_buf = slab.alloc(B * S * H * Dh * bsz)
+    var out_src = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        optr, bhsd_rl
+    )
+    var nsc = B * H * S * Dh
+    var scgrid = (nsc + _BLOCK - 1) // _BLOCK
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    comptime if dtype == DType.float32:
+        var Od = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), src_rl
+        )
+        ctx.enqueue_function[_scatter_bhsd_to_bshd_f32, _scatter_bhsd_to_bshd_f32](
+            out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+    elif dtype == DType.bfloat16:
+        var Od = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), src_rl
+        )
+        ctx.enqueue_function[_scatter_bhsd_to_bshd_bf16, _scatter_bhsd_to_bshd_bf16](
+            out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+    else:
+        var Od = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), src_rl
+        )
+        ctx.enqueue_function[_scatter_bhsd_to_bshd_f16, _scatter_bhsd_to_bshd_f16](
+            out_src, Od, B, S, H, Dh, grid_dim=scgrid, block_dim=_BLOCK)
+    # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
+
+    var out_shape = List[Int]()
+    out_shape.append(B)
+    out_shape.append(S)
+    out_shape.append(H)
+    out_shape.append(Dh)
+    return Tensor(out_buf^, out_shape^, out_dt)
+
+
+def _sdpa_math_slab[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+    apply_mask: Bool,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `_sdpa_math` (this file :402)."""
+    var dt = q.dtype().to_mojo_dtype()
+    comptime src_rows = B * S * H
+    comptime sm_rows = B * H * S
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    var mask_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](sm_rows, S))
+    if dt == DType.float32:
+        var qs = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var ks = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var vs = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var ms = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            mask.buf.unsafe_ptr().bitcast[Float32](), mask_rl)
+        return _sdpa_math_storage_slab[B, S, H, Dh, DType.float32](
+            qs, ks, vs, ms, scale, ctx, apply_mask, q.dtype(), slab)
+    elif dt == DType.bfloat16:
+        var qs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var ks = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var vs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var ms = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            mask.buf.unsafe_ptr().bitcast[BFloat16](), mask_rl)
+        return _sdpa_math_storage_slab[B, S, H, Dh, DType.bfloat16](
+            qs, ks, vs, ms, scale, ctx, apply_mask, q.dtype(), slab)
+    else:
+        var qs = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var ks = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var vs = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var ms = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            mask.buf.unsafe_ptr().bitcast[Float16](), mask_rl)
+        return _sdpa_math_storage_slab[B, S, H, Dh, DType.float16](
+            qs, ks, vs, ms, scale, ctx, apply_mask, q.dtype(), slab)
+
+
+def sdpa_nomask_slab[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `sdpa_nomask` (this file :1479) — same math-mode
+    path via _sdpa_math_slab; ONLY the allocation source changes."""
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype():
+        raise Error("sdpa_nomask: q/k/v dtype mismatch")
+    var qshape = q.shape()
+    if len(qshape) != 4:
+        raise Error("sdpa_nomask: q must be rank-4 [B,S,H,Dh]")
+    if (
+        qshape[0] != B
+        or qshape[1] != S
+        or qshape[2] != H
+        or qshape[3] != Dh
+    ):
+        raise Error("sdpa_nomask: q shape does not match compile-time B/S/H/Dh")
+
+    return _sdpa_math_slab[B, S, H, Dh](q, k, v, q, scale, ctx, False, slab)

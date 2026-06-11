@@ -61,6 +61,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -1002,6 +1003,267 @@ def gate_residual_backward_dxdy(
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     var dy_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     var dg_buf = ctx.enqueue_create_buffer[DType.uint8](0)
+
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
+    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * cols))
+    var total = rows * cols
+    var grid = (total + _BLOCK - 1) // _BLOCK
+
+    var dt = grad_out.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var G = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var GATE = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            g.buf.unsafe_ptr().bitcast[Float32](), v_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var DY = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dy_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        ctx.enqueue_function[
+            _gate_dxdy_kernel[DType.float32], _gate_dxdy_kernel[DType.float32]
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var G = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var GATE = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            g.buf.unsafe_ptr().bitcast[BFloat16](), v_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var DY = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dy_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        ctx.enqueue_function[
+            _gate_dxdy_kernel[DType.bfloat16], _gate_dxdy_kernel[DType.bfloat16]
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var G = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var GATE = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            g.buf.unsafe_ptr().bitcast[Float16](), v_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var DY = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dy_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        ctx.enqueue_function[
+            _gate_dxdy_kernel[DType.float16], _gate_dxdy_kernel[DType.float16]
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
+    ctx.synchronize()
+    var dg_shape = List[Int]()
+    dg_shape.append(0)
+    var dx_t = Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())
+    var dy_t = Tensor(dy_buf^, grad_out.shape(), grad_out.dtype())
+    var dg_t = Tensor(dg_buf^, dg_shape^, g.dtype())
+    return GateResidualGrads(dx_t^, dg_t^, dy_t^)
+
+
+def rope_backward_slab(
+    grad_out: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    interleaved: Bool,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `rope_backward` (this file :246) — byte-identical
+    math (same kernels, same launch params); ONLY the allocation source
+    changes (autograd_v2 contract C8, Phase P4)."""
+    var dims = _rope_bwd_validate(grad_out, cos, sin)
+    var rows = dims[0]
+    var half = dims[1]
+    var d = half * 2
+
+    var dx_buf = slab.alloc(grad_out.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var f_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, half))
+    var total = rows * half
+    var grid = (total + _BLOCK - 1) // _BLOCK
+
+    var dt = grad_out.dtype().to_mojo_dtype()
+    var table_dt = cos.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var G = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel[DType.float32],
+                    _rope_bwd_interleaved_kernel[DType.float32],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel[DType.float32],
+                    _rope_bwd_halfsplit_kernel[DType.float32],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        elif table_dt == DType.bfloat16:
+            var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel_tables[DType.float32, DType.bfloat16],
+                    _rope_bwd_interleaved_kernel_tables[DType.float32, DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel_tables[DType.float32, DType.bfloat16],
+                    _rope_bwd_halfsplit_kernel_tables[DType.float32, DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel_tables[DType.float32, DType.float16],
+                    _rope_bwd_interleaved_kernel_tables[DType.float32, DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel_tables[DType.float32, DType.float16],
+                    _rope_bwd_halfsplit_kernel_tables[DType.float32, DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var G = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel_tables[DType.bfloat16, DType.float32],
+                    _rope_bwd_interleaved_kernel_tables[DType.bfloat16, DType.float32],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel_tables[DType.bfloat16, DType.float32],
+                    _rope_bwd_halfsplit_kernel_tables[DType.bfloat16, DType.float32],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        elif table_dt == DType.bfloat16:
+            var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel[DType.bfloat16],
+                    _rope_bwd_interleaved_kernel[DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel[DType.bfloat16],
+                    _rope_bwd_halfsplit_kernel[DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel_tables[DType.bfloat16, DType.float16],
+                    _rope_bwd_interleaved_kernel_tables[DType.bfloat16, DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel_tables[DType.bfloat16, DType.float16],
+                    _rope_bwd_halfsplit_kernel_tables[DType.bfloat16, DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var G = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
+        if table_dt == DType.float32:
+            var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            var S = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float32](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel_tables[DType.float16, DType.float32],
+                    _rope_bwd_interleaved_kernel_tables[DType.float16, DType.float32],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel_tables[DType.float16, DType.float32],
+                    _rope_bwd_halfsplit_kernel_tables[DType.float16, DType.float32],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        elif table_dt == DType.bfloat16:
+            var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            var S = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[BFloat16](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel_tables[DType.float16, DType.bfloat16],
+                    _rope_bwd_interleaved_kernel_tables[DType.float16, DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel_tables[DType.float16, DType.bfloat16],
+                    _rope_bwd_halfsplit_kernel_tables[DType.float16, DType.bfloat16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                cos.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            var S = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+                sin.buf.unsafe_ptr().bitcast[Float16](), f_rl)
+            if interleaved:
+                ctx.enqueue_function[
+                    _rope_bwd_interleaved_kernel[DType.float16],
+                    _rope_bwd_interleaved_kernel[DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+            else:
+                ctx.enqueue_function[
+                    _rope_bwd_halfsplit_kernel[DType.float16],
+                    _rope_bwd_halfsplit_kernel[DType.float16],
+                ](G, C, S, DX, rows, half, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())
+
+
+def gate_residual_backward_dxdy_slab(
+    grad_out: Tensor,
+    g: Tensor,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> GateResidualGrads:
+    """StepSlab variant of `gate_residual_backward_dxdy` (this file :971) —
+    byte-identical math (same kernel, same launch params, same sync); ONLY
+    the allocation source changes (autograd_v2 contract C8, Phase P4)."""
+    if grad_out.dtype() != g.dtype():
+        raise Error("gate_residual_backward_dxdy: grad_out/g dtype mismatch")
+    var gshape = grad_out.shape()
+    if len(gshape) < 1:
+        raise Error("gate_residual_backward_dxdy: grad_out must have rank >= 1")
+    var cols = gshape[len(gshape) - 1]
+    var gateshape = g.shape()
+    # g: [C] (one vec) or [B, C] (per-sample gates, rows split evenly).
+    var nvec = 1
+    if len(gateshape) == 2 and gateshape[1] == cols:
+        nvec = gateshape[0]
+    elif len(gateshape) != 1 or gateshape[0] != cols:
+        raise Error("gate_residual_backward_dxdy: g must be [C] or [B, C]")
+    var rows = 1
+    for i in range(len(gshape) - 1):
+        rows *= gshape[i]
+    if rows % nvec != 0:
+        raise Error("gate_residual_backward_dxdy: rows not divisible by vecs")
+    var rows_per_vec = rows // nvec
+
+    var dx_buf = slab.alloc(grad_out.nbytes())
+    var dy_buf = slab.alloc(grad_out.nbytes())
+    var dg_buf = slab.alloc(0)
 
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
     var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * cols))

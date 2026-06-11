@@ -19,7 +19,8 @@
 # engine.rs:305-393).
 
 from std.gpu.host import DeviceContext
-from serenitymojo.autograd_v2.node import TArc, _raw_add
+from serenitymojo.autograd_v2.node import TArc, _raw_add, _raw_add_slab
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 struct InputBuffer(Copyable, Movable):
@@ -112,6 +113,30 @@ struct InputBuffer(Copyable, Movable):
                 have = True
             else:
                 var summed = _raw_add(acc[], self.slots[input_nr][c][], ctx)
+                acc = TArc(summed^)
+        if not have:
+            raise Error(
+                String("InputBuffer.materialize: no contribution in input ")
+                + String(input_nr)
+            )
+        return acc^
+
+    def materialize_slab(
+        self, input_nr: Int, ctx: DeviceContext, mut slab: StepSlab
+    ) raises -> TArc:
+        """StepSlab variant of `materialize` (above) — same slot-ordered left
+        fold with the SAME add kernel; the fan-in sum buffers come from the
+        slab (autograd_v2 contract C8, Phase P4)."""
+        var acc = self.slots[input_nr][0].copy()  # placeholder; replaced below
+        var have = False
+        for c in range(len(self.slots[input_nr])):
+            if not self.present[input_nr][c]:
+                continue
+            if not have:
+                acc = self.slots[input_nr][c].copy()
+                have = True
+            else:
+                var summed = _raw_add_slab(acc[], self.slots[input_nr][c][], ctx, slab)
                 acc = TArc(summed^)
         if not have:
             raise Error(

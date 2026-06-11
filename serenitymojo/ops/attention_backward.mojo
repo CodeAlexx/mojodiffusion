@@ -163,6 +163,25 @@ def _scale_f32(
         )
 
 
+# ── add an additive attention mask to F32 scores in place ────────────────────
+# scores [BH*S, S] (BH = B*H); mask [H*S, S] F32 (per-head rows, broadcast
+# over B). Row r of scores maps to mask row (r // S % H) * S + (r % S).
+def _add_mask_rows_f32(
+    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    m: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    h: Int, s: Int, rows: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < rows * s:
+        var r = idx // s
+        var c = idx % s
+        var mr = (r // s % h) * s + r % s
+        x[r, c] = rebind[x.element_type](
+            rebind[Scalar[DType.float32]](x[r, c])
+            + rebind[Scalar[DType.float32]](m[mr, c])
+        )
+
+
 # ── softmax over last dim, in place on F32 scores [BH*S, S] ──────────────────
 # One block per row; shared-memory tree reductions in F32. Identical to the
 # forward's _softmax_rows_f32 (attention.mojo) — the recompute must match the
@@ -483,6 +502,139 @@ def sdpa_backward[
     var smgrid = (nsm + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_scale_f32, _scale_f32](
         attn_full, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
+    ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
+        attn_full, S, grid_dim=sm_rows, block_dim=_TPB)
+
+    # ── 3) d_v = attnᵀ @ d_out  [BH,S,Dh] ────────────────────────────────────
+    var dvf = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var dvptr = dvf.unsafe_ptr()
+    for bh in range(BH):
+        var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr + bh * S * S, sc_rl)
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](goptr + bh * S * Dh, head_qk_rl)
+        var DV = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr + bh * S * Dh, head_qk_rl)
+        # DV[S,Dh] = Pᵀ[S,S] @ GO[S,Dh]  → transpose_a (attnᵀ)
+        matmul(ctx, DV, P, GO, transpose_a=True, c_row_major=True)
+
+    # ── 4) grad_attn = d_out @ Vᵀ  [BH,S,S] (reuse a fresh scores buffer) ─────
+    var gscores = ctx.enqueue_create_buffer[DType.float32](BH * S * S)
+    var gsptr = gscores.unsafe_ptr()
+    for bh in range(BH):
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](goptr + bh * S * Dh, head_qk_rl)
+        var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](vptr + bh * S * Dh, head_qk_rl)
+        var GA = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr + bh * S * S, sc_rl)
+        matmul(ctx, GA, GO, Vh, transpose_b=True, c_row_major=True)  # d_out @ Vᵀ
+
+    # ── 5) softmax backward: grad_scores = attn*(grad_attn - rowsum(attn*grad_attn))
+    var gs_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr, sc_full_rl)
+    ctx.enqueue_function[_softmax_bwd_rows_f32, _softmax_bwd_rows_f32](
+        attn_full, gs_full, S, grid_dim=sm_rows, block_dim=_TPB)
+
+    # ── 6) d_q = (grad_scores @ K) * scale ; d_k = (grad_scoresᵀ @ Q) * scale ─
+    var dqf = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var dkf = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var dqptr = dqf.unsafe_ptr()
+    var dkptr = dkf.unsafe_ptr()
+    for bh in range(BH):
+        var DS = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr + bh * S * S, sc_rl)
+        var Kh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](kptr + bh * S * Dh, head_qk_rl)
+        var Qh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](qptr + bh * S * Dh, head_qk_rl)
+        var DQ = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr + bh * S * Dh, head_qk_rl)
+        var DK = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr + bh * S * Dh, head_qk_rl)
+        matmul(ctx, DQ, DS, Kh, transpose_b=False, c_row_major=True)  # grad_scores @ K
+        matmul(ctx, DK, DS, Qh, transpose_a=True, c_row_major=True)   # grad_scoresᵀ @ Q
+    # scale d_q and d_k by `scale`
+    var dq_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr, bhsd_rl)
+    var dk_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr, bhsd_rl)
+    var ndqk = bhsd_rows * Dh
+    var dqkgrid = (ndqk + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dq_full, scale, bhsd_rows, Dh, grid_dim=dqkgrid, block_dim=_BLOCK)
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dk_full, scale, bhsd_rows, Dh, grid_dim=dqkgrid, block_dim=_BLOCK)
+
+    # ── 7) scatter d_q,d_k,d_v BHSD F32 -> BSHD storage dtype ─────────────────
+    var dq_t = _scatter_to_tensor(dq_full, B, S, H, Dh, out_dt, src_rl, ctx)
+    var dk_t = _scatter_to_tensor(dk_full, B, S, H, Dh, out_dt, src_rl, ctx)
+    var dv_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr, bhsd_rl)
+    var dv_t = _scatter_to_tensor(dv_full, B, S, H, Dh, out_dt, src_rl, ctx)
+    return SdpaGrads(dq_t^, dk_t^, dv_t^)
+
+
+def sdpa_backward_masked[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask_f32: Tensor,
+    d_out: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaGrads:
+    """sdpa_backward SIBLING with an ADDITIVE attention mask (HiDream-O1
+    prefix-causal training, 2026-06-11). Identical decomposed recompute with
+    the mask added to scores AFTER scale, BEFORE softmax — exactly the
+    forward's order (models/dit/hidream_o1.mojo _sdpa_s). mask_f32: F32
+    [H*S, S] rows (per-head, broadcast over B; constant — no grad). bf16
+    inputs take this same F32 interior path (gathers convert) instead of the
+    rect fallback — the mask insert point only exists here."""
+    if mask_f32.dtype().to_mojo_dtype() != DType.float32:
+        raise Error("sdpa_backward_masked: mask must be F32")
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype() or q.dtype() != d_out.dtype():
+        raise Error("sdpa_backward_masked: q/k/v/d_out dtype mismatch")
+    var qshape = q.shape()
+    if len(qshape) != 4 or qshape[0] != B or qshape[1] != S or qshape[2] != H or qshape[3] != Dh:
+        raise Error("sdpa_backward_masked: q shape != compile-time [B,S,H,Dh]")
+    var out_dt = q.dtype()
+    comptime BH = B * H
+    comptime src_rows = B * S * H
+    comptime bhsd_rows = B * H * S
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    var bhsd_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](bhsd_rows, Dh))
+    var head_qk_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, Dh))
+    var sc_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](S, S))
+
+    # ── 1) gather q,k,v,d_out BSHD -> BHSD F32 [B*H*S, Dh] ───────────────────
+    var qf = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var kf = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var vf = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var gof = ctx.enqueue_create_buffer[DType.float32](bhsd_rows * Dh)
+    var qd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](qf.unsafe_ptr(), bhsd_rl)
+    var kd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](kf.unsafe_ptr(), bhsd_rl)
+    var vd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](vf.unsafe_ptr(), bhsd_rl)
+    var god = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gof.unsafe_ptr(), bhsd_rl)
+    _gather_to_f32(q, qd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(k, kd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(v, vd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(d_out, god, B, S, H, Dh, src_rl, ctx)
+
+    # ── 2) recompute attn = softmax(Q@Kᵀ * scale)  [BH,S,S] ─────────────────
+    var attn = ctx.enqueue_create_buffer[DType.float32](BH * S * S)
+    var qptr = qf.unsafe_ptr()
+    var kptr = kf.unsafe_ptr()
+    var vptr = vf.unsafe_ptr()
+    var goptr = gof.unsafe_ptr()
+    var aptr = attn.unsafe_ptr()
+    for bh in range(BH):
+        var A = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](qptr + bh * S * Dh, head_qk_rl)
+        var Bt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](kptr + bh * S * Dh, head_qk_rl)
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr + bh * S * S, sc_rl)
+        matmul(ctx, C, A, Bt, transpose_b=True, c_row_major=True)  # Q@Kᵀ
+    # scale + softmax over last dim (one block per [BH*S] row)
+    comptime sm_rows = BH * S
+    var sc_full_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](sm_rows, S))
+    var attn_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr, sc_full_rl)
+    var nsm = sm_rows * S
+    var smgrid = (nsm + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        attn_full, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
+    # additive mask (constant): scores += mask[h], the forward's exact order.
+    var mask_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](H * S, S))
+    var mask_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+        mask_f32.buf.unsafe_ptr().bitcast[Float32](), mask_rl
+    )
+    ctx.enqueue_function[_add_mask_rows_f32, _add_mask_rows_f32](
+        attn_full, mask_lt, H, S, sm_rows, grid_dim=smgrid, block_dim=_BLOCK)
     ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
         attn_full, S, grid_dim=sm_rows, block_dim=_TPB)
 

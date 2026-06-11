@@ -28,7 +28,7 @@ v1 roadmap before promising native.
 | GEMM FFN 1024x1280x5120 bf16 | 206.9 µs (64.9 TFLOP/s) | same | **TIED** |
 | SDPA [1,1024,16,64] bf16 | 1506 µs (flash path) | cuDNN ~83–160 µs (audit 05-30) | **FLAME** ~10–18× |
 | SDPA [1,1024,16,128] bf16 | 2426 µs (math fallback, sm_86 MMA ceiling) | cuDNN | **FLAME** ~15–30× |
-| Klein-9B LoRA, PER SAMPLE 512px | **2.2-2.4 s** (06-11 session 4: P6 graph backward; was 2.5-2.6 resident-set, 12.8 s on 06-06) | OneTrainer **1.49 s/sample VERIFIED 06-11** (88-step live run, 2.98 s/it @ batch 2, bf16 unquantized, 70% async layer-offload, 10.4 GiB); flame ~1.15 (May h2h ÷2 if batch-2) | **OT ~1.5-1.6×** — klein batch-2 next (biggest lever), then SDPA flash |
+| Klein-9B LoRA, PER SAMPLE 512px | **1.8 s** (06-11 session 4: flash SDPA; was 2.2-2.4 P6 graph, 12.8 s on 06-06) | OneTrainer **1.49 s/sample VERIFIED 06-11** (88-step live run, 2.98 s/it @ batch 2, bf16 unquantized, 70% async layer-offload, 10.4 GiB); flame ~1.15 (May h2h ÷2 if batch-2) | **OT ~1.21×** — klein batch-2 next, zimage flash wiring |
 | Z-Image LoRA, PER SAMPLE 512px | B1 **~1.63 s/step** (CUDA-graph replay, bit-exact); B2 3.4 s/step = 1.70 s/sample (pre-graph) | OneTrainer **~1.05 s/sample VERIFIED 06-11** (50-step live run, 2.08-2.22 s/it @ batch 2) | **OT ~1.6×** — kernel-bound now (SDPA math-mode); engine Phase D/E + flash sign-off |
 | Z-Image denoise (sampling) | 5.21 s/step (06-06; re-measured 06-11: 4.3-4.4 s/step 1024², cond+uncond 2.0 s each) | OneTrainer 2.14 s/step sampling | **OT-side** ~2× |
 | Z-Image TRAINING step | not yet re-measured (06-11) | **OneTrainer VERIFIED 06-11 live 50-step run: 2.08-2.22 s/it at batch_size=2 = ~1.05-1.1 s/SAMPLE** (alina_zimage_OTpreset_100_baseline, 512px, 15.1 GiB, losses ~0.45-0.57 smooth 0.46) | **OT** — measure ours next (ours is batch 1: compare per-sample) |
@@ -84,6 +84,18 @@ G-X3 PROMPT: all sidecar/prompt-blind models FULL prompt-driven (wire verified
   faithful translate + output diff.
 
 ## Log (newest first)
+- 2026-06-11 (session 4, evening): **KLEIN FLASH SDPA WIRED — 2.2-2.4 ->
+  1.8 s/step, gap to OT 1.49 now ~1.21x.** Single + double-joint attention
+  through cuDNN flash with F32<->bf16 boundary casts (KLEIN_SDPA_FLASH,
+  single_block.mojo; tape carries bf16 q/k/v/o + LSE stats as Optional
+  TArcs). MEASURED: flash bwd dQ is nondeterministic across calls
+  (653/6.3M bf16 flips, dK clean) -> klein_block_parity dQ-derived
+  tensors gate on value tolerance (cos>=0.99995, max_abs<=1e-3; observed
+  2.8e-8..2.1e-5), rest bit-strict — ALL PASS. Trainer (2 runs): bwd
+  1.46->1.05, fwd 0.62->0.59; losses inside the documented ~4e-4
+  variance class — 4dp anchors UNCHANGED (0.5414x/0.2154x/0.7809x).
+  Commits 59f1936 + b60d65e. NEXT: zimage graph-path flash + capture
+  smoke, then P7.
 - 2026-06-11 (session 4, later): **cuDNN FLASH SDPA SHIPPED AS AN OP — 35-43x
   over math-mode, ALL gates PASS (numerics sign-off granted: "do both, I
   approve").** flame shim port (ops/cshim/, byte-copied cudnn_sdpa{,_bwd}

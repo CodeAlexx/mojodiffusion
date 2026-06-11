@@ -29,7 +29,7 @@ v1 roadmap before promising native.
 | SDPA [1,1024,16,64] bf16 | 1506 µs (flash path) | cuDNN ~83–160 µs (audit 05-30) | **FLAME** ~10–18× |
 | SDPA [1,1024,16,128] bf16 | 2426 µs (math fallback, sm_86 MMA ceiling) | cuDNN | **FLAME** ~15–30× |
 | Klein-9B LoRA, PER SAMPLE 512px | **1.8 s** (06-11 session 4: flash SDPA; was 2.2-2.4 P6 graph, 12.8 s on 06-06) | OneTrainer **1.49 s/sample VERIFIED 06-11** (88-step live run, 2.98 s/it @ batch 2, bf16 unquantized, 70% async layer-offload, 10.4 GiB); flame ~1.15 (May h2h ÷2 if batch-2) | **OT ~1.21×** — klein batch-2 next, zimage flash wiring |
-| Z-Image LoRA, PER SAMPLE 512px | B1 **~1.63 s/step** (CUDA-graph replay, bit-exact); B2 3.4 s/step = 1.70 s/sample (pre-graph) | OneTrainer **~1.05 s/sample VERIFIED 06-11** (50-step live run, 2.08-2.22 s/it @ batch 2) | **OT ~1.6×** — kernel-bound now (SDPA math-mode); engine Phase D/E + flash sign-off |
+| Z-Image LoRA, PER SAMPLE 512px | B1 **~1.35 s/step** (06-11: flash SDPA, capture off; was 1.63 captured+math); B2 3.4 s/step = 1.70 s/sample (pre-graph) | OneTrainer **~1.05 s/sample VERIFIED 06-11** (50-step live run, 2.08-2.22 s/it @ batch 2) | **OT ~1.6×** — kernel-bound now (SDPA math-mode); engine Phase D/E + flash sign-off |
 | Z-Image denoise (sampling) | 5.21 s/step (06-06; re-measured 06-11: 4.3-4.4 s/step 1024², cond+uncond 2.0 s each) | OneTrainer 2.14 s/step sampling | **OT-side** ~2× |
 | Z-Image TRAINING step | not yet re-measured (06-11) | **OneTrainer VERIFIED 06-11 live 50-step run: 2.08-2.22 s/it at batch_size=2 = ~1.05-1.1 s/SAMPLE** (alina_zimage_OTpreset_100_baseline, 512px, 15.1 GiB, losses ~0.45-0.57 smooth 0.46) | **OT** — measure ours next (ours is batch 1: compare per-sample) |
 | Trainable models (gate-trusted) | 4–5 (Klein, Z-Image, Anima, Ernie; Chroma unproven) | EDv2 ~14 model files (e2e count UNVERIFIED) | **FLAME** |
@@ -84,6 +84,14 @@ G-X3 PROMPT: all sidecar/prompt-blind models FULL prompt-driven (wire verified
   faithful translate + output diff.
 
 ## Log (newest first)
+- 2026-06-11 (session 4, night): **ZIMAGE FLASH SDPA WIRED — step ~1.35 s
+  (bwd 1.11->0.80; beats the 1.63 captured+math path with capture OFF),
+  gap to OT 1.05 now ~1.29x.** record_sdpa_slab + OPK_SDPA arms via
+  arity dispatch; F32<->bf16 casts + 128-pad (S=1248). 4dp anchors HOLD
+  (step-1 bit-identical 0.47450438; fwd still math). Cross-run identity
+  gone by design (flash dQ): spread <=3.7e-5 -> variance-class gate.
+  FOLLOW-UPS: capture-compat flash (fixed buffers), fwd flash (~0.1s),
+  then P7 B2 (flash freed the score-buffer memory). Commit fa073bf.
 - 2026-06-11 (session 4, evening): **KLEIN FLASH SDPA WIRED — 2.2-2.4 ->
   1.8 s/step, gap to OT 1.49 now ~1.21x.** Single + double-joint attention
   through cuDNN flash with F32<->bf16 boundary casts (KLEIN_SDPA_FLASH,

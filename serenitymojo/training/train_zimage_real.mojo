@@ -77,7 +77,9 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
     zimage_lora_set_to_device,
     zimage_stack_lora_forward_main_device, zimage_stack_lora_backward_main_device,
     zimage_stack_lora_forward_main_device_v2, zimage_stack_lora_backward_main_device_v2,
+    zimage_stack_lora_forward_main_device_v3,
     zimage_stack_lora_backward_main_device_v3,
+    ZImageFinalConstsDevice, zimage_final_consts_to_device,
     zimage_stack_lora_forward_main_device_b2, zimage_stack_lora_backward_main_device_b2,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
     save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
@@ -775,6 +777,25 @@ def _train_one_step_bucket[
         mvall = Optional[ZImageModVecsAllDevice](
             zimage_modvecs_all_to_device(main_mod, D, ctx)
         )
+    # Phase D.1+D.3 (device-resident fwd under ZIMAGE_V2_GRAPH): NR modvec
+    # slab (one packed upload, same builder as mvall) + the final-layer
+    # constants (ones/zeros/f_scale one packed slab; final-bias clone) built
+    # once per STEP in the prologue. Per-RUN hoisting of ones/zeros/bias
+    # would need signature changes through main — noted for later
+    # (MOJO_V2_ENGINE_PLAN.md Phase D.3); per-step is already 2 uploads
+    # total vs 2-per-NR-block + 3 + clone per fwd call.
+    var nrall = Optional[ZImageModVecsAllDevice](None)
+    var fconsts = Optional[ZImageFinalConstsDevice](None)
+    var final_bias_dev = Optional[Tensor](None)
+    comptime if ZIMAGE_V2_ENGINE:
+        comptime if ZIMAGE_V2_GRAPH:
+            nrall = Optional[ZImageModVecsAllDevice](
+                zimage_modvecs_all_to_device(nr_mod, D, ctx)
+            )
+            fconsts = Optional[ZImageFinalConstsDevice](
+                zimage_final_consts_to_device(f_scale, D, ctx)
+            )
+            final_bias_dev = Optional[Tensor](final_lin_b.clone(ctx))
     var t_prep = perf_counter_ns()
 
     # v2 engine: resident device LoRA set (views into the persistent optimizer
@@ -788,14 +809,29 @@ def _train_one_step_bucket[
 
     var fwd: ZImageStackForward
     comptime if ZIMAGE_V2_ENGINE:
-        fwd = zimage_stack_lora_forward_main_device_v2[H, Dh, N_IMG_B, N_TXT_B, S_B](
-            x_t.copy(), cap_seq.copy(),
-            nr_blocks, nr_mod, cr_blocks, main_blocks,
-            mvall.value().per_block, lora_dev,
-            f_scale.copy(), final_lin_w, final_lin_b,
-            x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
-            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
-        )
+        # Phase D: ZIMAGE_V2_GRAPH now also means device-resident fwd (_v3:
+        # NR/CR device loops + device concat + hoisted final-layer consts);
+        # else the _v2 host-roundtrip fwd. Both bit-exact vs old (gated).
+        comptime if ZIMAGE_V2_GRAPH:
+            fwd = zimage_stack_lora_forward_main_device_v3[H, Dh, N_IMG_B, N_TXT_B, S_B](
+                x_t.copy(), cap_seq.copy(),
+                nr_blocks, nrall.value().per_block, cr_blocks, main_blocks,
+                mvall.value().per_block, lora_dev,
+                fconsts.value().ones, fconsts.value().zeros,
+                fconsts.value().f_scale, final_bias_dev,
+                final_lin_w,
+                x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
+                D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+            )
+        else:
+            fwd = zimage_stack_lora_forward_main_device_v2[H, Dh, N_IMG_B, N_TXT_B, S_B](
+                x_t.copy(), cap_seq.copy(),
+                nr_blocks, nr_mod, cr_blocks, main_blocks,
+                mvall.value().per_block, lora_dev,
+                f_scale.copy(), final_lin_w, final_lin_b,
+                x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
+                D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+            )
     else:
         fwd = zimage_stack_lora_forward_main_device[H, Dh, N_IMG_B, N_TXT_B, S_B](
             x_t.copy(), cap_seq.copy(),

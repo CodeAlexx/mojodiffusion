@@ -89,7 +89,15 @@ block-swap H2D amortizes per sample).
 ⚠ ALL three klein block/stack torch gates remain BROKEN at HEAD —
 anchor-gate only until the gate-repair campaign (handoff §3.6).
 
-### Phase D — remaining Z-Image idle (open, ordered)
+### Phase D — remaining Z-Image idle (D.1+D.3 SHIPPED 2026-06-11, bit-exact)
+D.1 NR/CR device-tensor forwards (`zimage_block_forward_device_moddev` +
+`zimage_refiner_forward_device`, in lora_block.mojo — block.mojo can't
+import ZImageModVecsDevice without a cycle) + D.3 final-layer constants as
+ONE packed slab (`zimage_final_consts_to_device`) + device img‖cap concat,
+all in `zimage_stack_lora_forward_main_device_v3` under `ZIMAGE_V2_GRAPH`.
+MEASURED: fwd 0.51 → 0.471 (−7.6%); headline 1.8 s flat (bwd-dominated
+1.19 s). GATES: 5-step + b1match every digit; 100-step byte-identical.
+D.2 (device grads) + D.4 (clone-sync) remain open, ordered below.
 1. NR/CR frozen refiners → device-tensor forward (no saved tape needed in
    the main-only backward); kills the host-list per-block round trips.
 2. Grads device-resident end-to-end: batched grad D2H stays (1 sync, feeds

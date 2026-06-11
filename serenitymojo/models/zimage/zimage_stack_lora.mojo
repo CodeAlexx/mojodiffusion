@@ -100,7 +100,9 @@ from serenitymojo.models.zimage.lora_block import (
     zimage_block_lora_predict_device_tensor,
     zimage_block_lora_predict_device_tensor_moddev,
     zimage_refiner_lora_forward, zimage_refiner_lora_backward,
+    zimage_block_forward_device_moddev, zimage_refiner_forward_device,
 )
+from serenitymojo.ops.tensor_algebra import concat
 from serenitymojo.models.zimage.zimage_stack import (
     ZImageStackForward, _zeros, _ones, _t, _add_lists,
     _concat_img_cap, _split_img_cap, _linear_wdev_bias, _saved_x_out,
@@ -889,6 +891,142 @@ def zimage_stack_lora_forward_main_device_v2[
     )
     var bias = Optional[Tensor](final_lin_b.clone(ctx))
     var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+    var parts = _split_img_cap(patches, N_IMG, N_TXT, out_ch)
+    var out = parts[0].copy()
+
+    return ZImageStackForward(
+        out^, x_seq.copy(), cap_seq.copy(),
+        nr_x_in^, cr_x_in^, main_x_in^,
+        x_arc.copy(), TArc(ln_t^),
+    )
+
+
+# ── Phase D.3: final-layer constants as ONE packed device slab ────────────────
+# Rows: [ ones | zeros | f_scale ] each [D] F32, one H2D upload (one sync) per
+# step instead of three per-call `_t()` uploads in the final layer. Views are
+# zero-copy sub-buffers; `slab` owns the allocation and MUST outlive the views
+# (scratch_ring discipline — same as ZImageModVecsAllDevice).
+struct ZImageFinalConstsDevice(Movable):
+    var slab: Tensor
+    var ones: TArc      # [D] = 1.0  (layer_norm unit gamma)
+    var zeros: TArc     # [D] = 0.0  (layer_norm beta / vec_modulate shift)
+    var f_scale: TArc   # [D] final adaLN scale (raw; vec_modulate applies 1+)
+
+    def __init__(
+        out self, var slab: Tensor,
+        var ones: TArc, var zeros: TArc, var f_scale: TArc,
+    ):
+        self.slab = slab^
+        self.ones = ones^
+        self.zeros = zeros^
+        self.f_scale = f_scale^
+
+
+def zimage_final_consts_to_device(
+    f_scale: List[Float32], D: Int, ctx: DeviceContext
+) raises -> ZImageFinalConstsDevice:
+    """Pack ones/zeros/f_scale into a single H2D upload. Values byte-identical
+    to the per-call `_t(_ones(D))/_t(_zeros(D))/_t(f_scale)` uploads."""
+    var vb = D * 4
+    var nbytes = 3 * vb
+    var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+    var fp = host.unsafe_ptr().bitcast[Float32]()
+    for c in range(D):
+        fp[c] = Float32(1.0)
+    for c in range(D):
+        fp[D + c] = Float32(0.0)
+    for c in range(D):
+        fp[2 * D + c] = f_scale[c]
+    var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    ctx.enqueue_copy(dst_buf=dev, src_buf=host)
+    ctx.synchronize()                   # the ONE final-consts upload sync
+    var ones = TArc(Tensor(
+        dev.create_sub_buffer[DType.uint8](0, vb), [D], STDtype.F32
+    ))
+    var zeros = TArc(Tensor(
+        dev.create_sub_buffer[DType.uint8](vb, vb), [D], STDtype.F32
+    ))
+    var fs = TArc(Tensor(
+        dev.create_sub_buffer[DType.uint8](2 * vb, vb), [D], STDtype.F32
+    ))
+    return ZImageFinalConstsDevice(
+        Tensor(dev^, [3, D], STDtype.F32), ones^, zeros^, fs^
+    )
+
+
+def zimage_stack_lora_forward_main_device_v3[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    x_seq: List[Float32], cap_seq: List[Float32],
+    nr_blocks: List[ZImageBlockWeights],
+    nr_mod_dev: List[ZImageModVecsDevice],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_dev: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    unit_ones: TArc, unit_zeros: TArc, f_scale_dev: TArc,
+    final_bias: Optional[Tensor],
+    final_lin_w: Tensor,
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageStackForward:
+    """Phase D.1+D.3 forward (MOJO_V2_ENGINE_PLAN.md): _v2 with the remaining
+    host round trips removed — bit-exact (C14: identical ops in identical
+    order on identical values; only WHERE tensors live / WHEN uploaded moved):
+      * NR loop on zimage_block_forward_device_moddev (device in/out, packed
+        per-NR-block device modvecs) — no per-block host List round trip.
+      * CR loop on zimage_refiner_forward_device (device in/out).
+      * x enters as ONE upload before NR; caption ONE upload before CR;
+        img‖cap concat on DEVICE (ops.tensor_algebra.concat dim 0 = D2D byte
+        concat — exact bytes of the host _concat_img_cap + upload).
+      * final layer consumes prebuilt unit_ones/unit_zeros/f_scale_dev (one
+        packed slab, zimage_final_consts_to_device) + a prebuilt final_bias
+        Optional[Tensor] (cloned once per step by the caller, passed borrowed
+        — `linear` only reads bias) instead of per-call _t()/clone.
+    Returned ZImageStackForward identical to _v2 (out host list, main_x_in,
+    x_final, ln_x; nr_x_in/cr_x_in stay empty). Old paths kept (C13).
+    NOTE final_bias is Optional[Tensor] not TArc: `linear` takes
+    Optional[Tensor] and Tensor is move-only, so a TArc arg would force a
+    per-call clone back into an Optional — the borrowed Optional is the only
+    zero-cost shape."""
+    var num_nr = len(nr_blocks)
+    var num_cr = len(cr_blocks)
+    var num_main = len(main_blocks)
+
+    var nr_x_in = List[TArc]()
+    var xs_arc = TArc(_t(x_seq, [N_IMG, D], ctx))    # the ONE x upload
+    for i in range(num_nr):
+        xs_arc = zimage_block_forward_device_moddev[H, Dh, N_IMG](
+            xs_arc.copy(), nr_blocks[i], nr_mod_dev[i],
+            x_cos, x_sin, D, F, eps, ctx,
+        )
+
+    var cr_x_in = List[TArc]()
+    var cs_arc = TArc(_t(cap_seq, [N_TXT, D], ctx))  # the ONE caption upload
+    for i in range(num_cr):
+        cs_arc = zimage_refiner_forward_device[H, Dh, N_TXT](
+            cs_arc.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
+        )
+
+    # device concat [N_IMG,D] ‖ [N_TXT,D] -> [S,D] (image first — _concat_img_cap)
+    var x_arc = TArc(concat(0, ctx, xs_arc[], cs_arc[]))
+
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        var fwd = zimage_block_lora_forward_device_tensor_batch[1, H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod_dev[i], bl,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
+
+    var ln_t = layer_norm(x_arc[], unit_ones[], unit_zeros[], final_eps, ctx)
+    var x_out_t = vec_modulate(ln_t, f_scale_dev[], unit_zeros[], ctx)
+    var patches = linear(x_out_t, final_lin_w, final_bias, ctx).to_host(ctx)
     var parts = _split_img_cap(patches, N_IMG, N_TXT, out_ch)
     var out = parts[0].copy()
 

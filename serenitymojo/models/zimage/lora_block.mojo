@@ -1792,3 +1792,134 @@ def zimage_block_lora_backward_device_tensors_batch[
     d_b_slots.append(lb_w2.d_b.copy())
 
     return ZImageBlockLoraTensorBackward(TArc(d_x_t^), d_a_slots^, d_b_slots^)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase D.1 (MOJO_V2_ENGINE_PLAN.md): FROZEN refiner blocks → device-tensor
+# forwards. These are the EXACT op sequences of block.zimage_block_forward
+# (modulated, NR) and block.zimage_refiner_forward (unmodulated, CR) with only
+# WHERE the tensors live changed: device in/out (no host-List round trip), the
+# per-call `_t()` modvec/zeros uploads replaced by ZImageModVecsDevice views
+# (same F32 bytes — packed slab, zimage_modvecs_all_to_device), and NO saved
+# tape (frozen blocks: the main-only backward never touches them) and NO
+# to_host (the caller chains device tensors). Same ops, same order, same
+# values → bit-identical (C14). Placed HERE, not block.mojo, because these
+# consume ZImageModVecsDevice and block.mojo cannot import lora_block
+# (lora_block imports block — circular). Old paths untouched (C13).
+def zimage_block_forward_device_moddev[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ZImageBlockWeights, mv: ZImageModVecsDevice,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> TArc:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    # --- attention sub-block (sandwich norm) ---
+    var xn1 = rms_norm(x_arc[], w.n1[], eps, ctx)
+    var xn1s = modulate(xn1, mv.scale_msa[], mv.zeros[], ctx)
+
+    var no_bias = Optional[Tensor](None)
+    var q_flat = linear(xn1s, w.wq[], no_bias^, ctx)            # [S,D]
+    var no_bias_k = Optional[Tensor](None)
+    var k_flat = linear(xn1s, w.wk[], no_bias_k^, ctx)
+    var no_bias_v = Optional[Tensor](None)
+    var v_flat = linear(xn1s, w.wv[], no_bias_v^, ctx)
+
+    var q_pre = reshape_owned(q_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var no_bias_o = Optional[Tensor](None)
+    var att_o = linear(att_flat, w.wo[], no_bias_o^, ctx)      # [S,D]
+
+    var attn_n2 = rms_norm(att_o, w.n2[], eps, ctx)
+    var gate_msa_t = tanh_op(mv.gate_msa[], ctx)
+    var h = residual_gate(x_arc[], gate_msa_t, attn_n2, ctx)   # x + gate*attn_n2
+
+    # --- MLP sub-block (SwiGLU, sandwich norm) ---
+    var xfn1 = rms_norm(h, w.fn1[], eps, ctx)
+    var xfn1s = modulate(xfn1, mv.scale_mlp[], mv.zeros[], ctx)
+
+    var no_bias_g = Optional[Tensor](None)
+    var g_pre = linear(xfn1s, w.w1[], no_bias_g^, ctx)         # [S,F]
+    var no_bias_u = Optional[Tensor](None)
+    var u = linear(xfn1s, w.w3[], no_bias_u^, ctx)            # [S,F]
+    var act = swiglu(g_pre, u, ctx)                            # silu(g_pre)*u
+    var no_bias_d = Optional[Tensor](None)
+    var ff = linear(act, w.w2[], no_bias_d^, ctx)             # [S,D]
+
+    var ff_n2 = rms_norm(ff, w.fn2[], eps, ctx)
+    var gate_mlp_t = tanh_op(mv.gate_mlp[], ctx)
+    var result = residual_gate(h, gate_mlp_t, ff_n2, ctx)
+    return TArc(result^)
+
+
+# UNMODULATED (context-refiner) frozen block, device in/out. Exact op sequence
+# of block.zimage_refiner_forward (plain residuals, no modulation), no saved,
+# no to_host.
+def zimage_refiner_forward_device[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ZImageBlockWeights,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> TArc:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    # --- attention sub-block (sandwich norm, NO modulation) ---
+    var xn1 = rms_norm(x_arc[], w.n1[], eps, ctx)
+
+    var no_bias = Optional[Tensor](None)
+    var q_flat = linear(xn1, w.wq[], no_bias^, ctx)
+    var no_bias_k = Optional[Tensor](None)
+    var k_flat = linear(xn1, w.wk[], no_bias_k^, ctx)
+    var no_bias_v = Optional[Tensor](None)
+    var v_flat = linear(xn1, w.wv[], no_bias_v^, ctx)
+
+    var q_pre = reshape_owned(q_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var no_bias_o = Optional[Tensor](None)
+    var att_o = linear(att_flat, w.wo[], no_bias_o^, ctx)
+
+    var attn_n2 = rms_norm(att_o, w.n2[], eps, ctx)
+    var h = add(x_arc[], attn_n2, ctx)              # PLAIN residual (no gate)
+
+    # --- MLP sub-block (SwiGLU, sandwich norm, NO modulation) ---
+    var xfn1 = rms_norm(h, w.fn1[], eps, ctx)
+
+    var no_bias_g = Optional[Tensor](None)
+    var g_pre = linear(xfn1, w.w1[], no_bias_g^, ctx)
+    var no_bias_u = Optional[Tensor](None)
+    var u = linear(xfn1, w.w3[], no_bias_u^, ctx)
+    var act = swiglu(g_pre, u, ctx)
+    var no_bias_d = Optional[Tensor](None)
+    var ff = linear(act, w.w2[], no_bias_d^, ctx)
+
+    var ff_n2 = rms_norm(ff, w.fn2[], eps, ctx)
+    var result = add(h, ff_n2, ctx)                 # PLAIN residual (no gate)
+    return TArc(result^)

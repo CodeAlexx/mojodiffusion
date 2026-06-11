@@ -247,9 +247,9 @@ def _host_noise(n: Int, seed: UInt64) -> List[Float32]:
     var i = 0
     while i < n:
         state = state * 6364136223846793005 + 1442695040888963407
-        var u1f = Float64(Int((state >> 11) & 0xFFFFFFFFFFFFF)) * (1.0 / 9007199254740992.0)
+        var u1f = Float64(Int((state >> 12) & 0xFFFFFFFFFFFFF)) * (1.0 / 4503599627370496.0)
         state = state * 6364136223846793005 + 1442695040888963407
-        var u2f = Float64(Int((state >> 11) & 0xFFFFFFFFFFFFF)) * (1.0 / 9007199254740992.0)
+        var u2f = Float64(Int((state >> 12) & 0xFFFFFFFFFFFFF)) * (1.0 / 4503599627370496.0)
         if u1f < 1.0e-12:
             u1f = 1.0e-12
         var r = sqrt(-2.0 * flog(Float64(u1f)))

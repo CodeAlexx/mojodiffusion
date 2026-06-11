@@ -29,7 +29,7 @@ v1 roadmap before promising native.
 | SDPA [1,1024,16,64] bf16 | 1506 µs (flash path) | cuDNN ~83–160 µs (audit 05-30) | **FLAME** ~10–18× |
 | SDPA [1,1024,16,128] bf16 | 2426 µs (math fallback, sm_86 MMA ceiling) | cuDNN | **FLAME** ~15–30× |
 | Klein-9B LoRA, PER SAMPLE 512px | **2.5-2.6 s** (06-11 session 3: resident-set; was 12.8 s on 06-06) | OneTrainer **1.49 s/sample VERIFIED 06-11** (88-step live run, 2.98 s/it @ batch 2, bf16 unquantized, 70% async layer-offload, 10.4 GiB); flame ~1.15 (May h2h ÷2 if batch-2) | **OT ~1.7×** — klein batch-2 next (biggest lever), then engine Phase D/E |
-| Z-Image LoRA, PER SAMPLE 512px | **1.70 s** (06-11 session 3: B2 3.4 s/step; B1 1.8 s/step — v2 engine A+C, bit-exact) | OneTrainer **~1.05 s/sample VERIFIED 06-11** (50-step live run, 2.08-2.22 s/it @ batch 2) | **OT ~1.6×** — kernel-bound now (SDPA math-mode); engine Phase D/E + flash sign-off |
+| Z-Image LoRA, PER SAMPLE 512px | B1 **~1.63 s/step** (CUDA-graph replay, bit-exact); B2 3.4 s/step = 1.70 s/sample (pre-graph) | OneTrainer **~1.05 s/sample VERIFIED 06-11** (50-step live run, 2.08-2.22 s/it @ batch 2) | **OT ~1.6×** — kernel-bound now (SDPA math-mode); engine Phase D/E + flash sign-off |
 | Z-Image denoise (sampling) | 5.21 s/step (06-06; re-measured 06-11: 4.3-4.4 s/step 1024², cond+uncond 2.0 s each) | OneTrainer 2.14 s/step sampling | **OT-side** ~2× |
 | Z-Image TRAINING step | not yet re-measured (06-11) | **OneTrainer VERIFIED 06-11 live 50-step run: 2.08-2.22 s/it at batch_size=2 = ~1.05-1.1 s/SAMPLE** (alina_zimage_OTpreset_100_baseline, 512px, 15.1 GiB, losses ~0.45-0.57 smooth 0.46) | **OT** — measure ours next (ours is batch 1: compare per-sample) |
 | Trainable models (gate-trusted) | 4–5 (Klein, Z-Image, Anima, Ernie; Chroma unproven) | EDv2 ~14 model files (e2e count UNVERIFIED) | **FLAME** |
@@ -84,6 +84,19 @@ G-X3 PROMPT: all sidecar/prompt-blind models FULL prompt-driven (wire verified
   faithful translate + output diff.
 
 ## Log (newest first)
+- 2026-06-11 (session 3, pre-dawn): **P4+P5 — STEP-SLAB + CUDA-GRAPH
+  REPLAY SHIPPED, zimage B1 1.70 → ~1.63 s/step, BIT-EXACT.** StepSlab
+  (256-B-aligned ring wrapper) routes the whole graph path — bwd allocs
+  deterministic (6180/step identical, asserted), bwd 1.19→1.11 (pointer
+  bump beats MAX pool). Capture per contract C9: ZImageStepIO fixed-
+  address per-bucket I/O (ONE packed pinned H2D/step), _v5 fwd on its own
+  slab, sync-free captured regions; warmup/capture/replay lifecycle;
+  G_fwd 5,774 + G_bwd 21,036 nodes; steps 3+ replay at 1.6 s. GATES all
+  green incl. 100-step zero-diff, independently re-verified. The v2
+  engine program is COMPLETE on zimage B1. Kernel time (~1.45 s, SDPA
+  math-mode) is now the overt floor — bf16-flash sign-off is the gate to
+  OT parity. VRAM ~21.5 GiB peak (watch for bigger buckets).
+
 - 2026-06-11 (session 3, overnight, later): **KLEIN RESIDENT-SET SHIPPED —
   2.6-2.7 → 2.5-2.6 s/step** (optim 0.18-0.20 → 0.081; per-step
   klein_lora_set_to_device upload gone). OT-semantics resident state

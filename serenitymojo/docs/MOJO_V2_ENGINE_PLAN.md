@@ -119,6 +119,15 @@ engine overhead — flame measured +2.18% for theirs; the speed is P4/P5).
 Per-op gates: all bitwise on real shapes; C15 proof: arrival-order fold
 would mismatch 1,319,319/4,792,320 bf16 elements. P4 (StepSlab) + P5
 (CUDA-graph replay) next.**
+**P4+P5 ALSO SHIPPED 2026-06-11 (commits a6724cb, cad34a7): StepSlab
+deterministic allocation (6180 allocs/step identical, bwd 1.19→1.11) and
+CUDA-graph capture/replay — the zimage B1 step now trains via TWO
+cuGraphLaunch calls (G_fwd 5,774 + G_bwd 21,036 nodes), bit-exact
+(100-step zero-diff, independently re-verified), 1.8 → 1.70 → ~1.63
+s/step. The engine program is COMPLETE on zimage B1: recording + dep-
+counted engine + step-slab + sync-elim + frozen-skip + resident-set +
+graph replay, one program. Remaining: P6 Klein graph (conductor hooks),
+P7 batch-2 unification; kernel wall (SDPA ~1.45 s busy) needs sign-off.**
 
 **JOB NUMBER ONE (maintainer, re-affirmed 2026-06-11). Full design contract
 + phase order (P0-P7): `serenitymojo/docs/AUTOGRAD_V2_MOJO_DESIGN.md` —

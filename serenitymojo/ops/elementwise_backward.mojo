@@ -108,7 +108,10 @@ def modulate_backward(
     var nvec = 1
     if len(sshape) == 2 and sshape[1] == d:
         nvec = sshape[0]
-        if compute_param_grads:
+        # [1, D] is single-vector semantics (anima passes rank-2 [1,D] with
+        # param grads — worked pre-[B,D]-extension; d_scale bytes identical
+        # to the [D] path). Only TRUE batched scales (B>1) lack param grads.
+        if compute_param_grads and nvec > 1:
             raise Error(
                 "modulate_backward: param grads unsupported for [B, D] scale"
             )
@@ -235,7 +238,10 @@ def modulate_backward_slab(
     var nvec = 1
     if len(sshape) == 2 and sshape[1] == d:
         nvec = sshape[0]
-        if compute_param_grads:
+        # [1, D] is single-vector semantics (anima passes rank-2 [1,D] with
+        # param grads — worked pre-[B,D]-extension; d_scale bytes identical
+        # to the [D] path). Only TRUE batched scales (B>1) lack param grads.
+        if compute_param_grads and nvec > 1:
             raise Error(
                 "modulate_backward: param grads unsupported for [B, D] scale"
             )

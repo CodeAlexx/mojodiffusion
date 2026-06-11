@@ -157,7 +157,7 @@ comptime OUT_CH = PATCH_VEC   # 768 — pixel velocity per patch position
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 comptime CHECKPOINT_PATH = "/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors"
-comptime CACHE_DIR = "/home/alex/mojodiffusion/output/alina_l2p_cache"
+comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/boxjana_l2p_512"  # was alina_l2p_cache (MISSING on disk, 06-11 audit)
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/alina_l2p"
 
 # Adapter slice: NR+CR blocks are allocated; only MAIN blocks are trained.

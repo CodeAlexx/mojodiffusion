@@ -104,6 +104,7 @@ from serenitymojo.training.lora_save import (
     save_lora_train_state, load_lora_train_state,
 )
 from serenitymojo.training.checkpoint import HostOffload, offload_to_host, restore_to_device
+from serenitymojo.training.lora_adamw_ot_fused import fused_lora_adamw_ot_step
 from serenitymojo.models.klein.activation_tape import KleinStackLoraOffloadedTape
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
@@ -2137,7 +2138,6 @@ def klein_lora_adamw_step(
     beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
     eps: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
 ) raises:
-    _ = ctx
     if t < 1:
         raise Error("klein_lora_adamw_step: t must be >= 1")
 
@@ -2155,20 +2155,22 @@ def klein_lora_adamw_step(
     var one_minus_beta2 = Float32(1.0) - beta2
     var seed = UInt32(t)
 
-    var nd = set.num_double * DBL_SLOTS
-    for i in range(nd):
-        _lora_adamw_precomputed(
-            set.dbl[i], grads.dbl_d_a[i], grads.dbl_d_b[i],
-            step_size, bc2_sqrt, decay, one_minus_beta1, beta2,
-            one_minus_beta2, eps, seed,
-        )
-    var ns = set.num_single * SGL_SLOTS
-    for i in range(ns):
-        _lora_adamw_precomputed(
-            set.sgl[i], grads.sgl_d_a[i], grads.sgl_d_b[i],
-            step_size, bc2_sqrt, decay, one_minus_beta1, beta2,
-            one_minus_beta2, eps, seed,
-        )
+    # GPU fused step (was a host scalar loop measured at 4.3-6.0 s/step on
+    # Klein-9B — PROG_STAGE phase=optim 2026-06-10). Gate:
+    # training/lora_adamw_ot_fused_parity.mojo — params bit-equal to the host
+    # loop, m/v within ±1 bf16 quantum at ~3e-6 (RNE midpoint ties from
+    # device-vs-host 1-ulp arithmetic). Host loop kept in
+    # models/klein/lora_adapter.mojo as the gate reference.
+    fused_lora_adamw_ot_step(
+        set.dbl, grads.dbl_d_a, grads.dbl_d_b,
+        step_size, bc2_sqrt, decay, one_minus_beta1, beta2,
+        one_minus_beta2, eps, seed, ctx,
+    )
+    fused_lora_adamw_ot_step(
+        set.sgl, grads.sgl_d_a, grads.sgl_d_b,
+        step_size, bc2_sqrt, decay, one_minus_beta1, beta2,
+        one_minus_beta2, eps, seed, ctx,
+    )
 
 
 # ── per-block prefix scheme in OneTrainer target order ───────────────────────

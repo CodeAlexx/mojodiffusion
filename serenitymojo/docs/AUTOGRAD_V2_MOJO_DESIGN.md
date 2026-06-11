@@ -198,12 +198,12 @@ clip+resident AdamW. GATES: 5-step anchors every digit + b1match/b2dup +
 100-step zero-diff (C14). Measure: step time must be ≤ hand-chain 1.8 s
 (launch pattern identical → expect ±noise; the win comes at P5/P6).
 
-**P4 — slab steady state.** All P3-path allocations through StepSlab;
+**P4 — slab steady state. [SHIPPED 2026-06-11, commit a6724cb — 6180 allocs/step deterministic, bwd 1.19→1.11, all C14 gates green]** All P3-path allocations through StepSlab;
 assert ZERO `enqueue_create_buffer` and ZERO `cuStreamSynchronize` inside
 fwd+bwd after warmup step (countable via the step's own instrumentation;
 nsys cross-check when tooling cooperates). Re-run C14 gates.
 
-**P5 — CUDA-graph capture/replay on zimage B1/B2.** FEASIBILITY MEASURED
+**P5 — CUDA-graph capture/replay on zimage B1/B2. [SHIPPED for B1 2026-06-11, commit cad34a7 — G_fwd 5,774 + G_bwd 21,036 nodes, replay from step 3, ~1.63 s/step, 100-step zero-diff; B2 = P7]** FEASIBILITY MEASURED
 2026-06-11 (tests/capture_smoke.mojo, independently re-run): capture
 through MAX DeviceContext WORKS on this box — 5-node graph via
 cuStreamBeginCapture_v2 on CUDA(ctx.stream()) (turbo_loader idiom),

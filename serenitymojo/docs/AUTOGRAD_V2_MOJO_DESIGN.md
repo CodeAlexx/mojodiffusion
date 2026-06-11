@@ -203,7 +203,14 @@ assert ZERO `enqueue_create_buffer` and ZERO `cuStreamSynchronize` inside
 fwd+bwd after warmup step (countable via the step's own instrumentation;
 nsys cross-check when tooling cooperates). Re-run C14 gates.
 
-**P5 — CUDA-graph capture/replay on zimage B1/B2.** Warmup→capture→replay;
+**P5 — CUDA-graph capture/replay on zimage B1/B2.** FEASIBILITY MEASURED
+2026-06-11 (tests/capture_smoke.mojo, independently re-run): capture
+through MAX DeviceContext WORKS on this box — 5-node graph via
+cuStreamBeginCapture_v2 on CUDA(ctx.stream()) (turbo_loader idiom),
+correct replay twice with fresh inputs through fixed pointers, enqueue
+cost 9.5 → 2.5 µs/iter (3.6×); MAX's allocator does not invalidate
+capture but allocating ops break REPLAY (per-call pointers) → P4
+fixed-buffer routing is the hard precondition, confirmed. Warmup→capture→replay;
 per-step inputs via fixed staging buffers. GATES: C14 bit-gates AND
 measured step time (target: close the remaining ~0.3 s host gap; kernels
 ~1.45 s are then the floor pending SDPA sign-off).

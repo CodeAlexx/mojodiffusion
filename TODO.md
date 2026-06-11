@@ -20,6 +20,7 @@ link). Keep the depth in the linked doc, not here. Last updated: 2026-06-11.
 | 3 | **Z-Image / L2P training** (in-Mojo prepare path) | Pending, AFTER LTX2. 51 alina samples staged at `output/alina_zimage_stage`; need prepare→cache→1-step train gate. | `TRAINING_PLAN_zimage.md` |
 | 4 | **serenity-trainer parity campaign** (model-by-model) | Per doc: Chroma/Ernie/Anima/SDXL-stage1 DONE; Qwen/Klein/SDXL-stage2 remain. (Serenity ref deleted — serenitymojo torch parity gates are the oracle.) | `../serenity-trainer/docs/TRAINING_PARITY_CAMPAIGN.md` |
 | 5 | **NAVA audio-video** (baidu MMDiT → pure Mojo) | Per doc: oracle up on fp8; chunked parity build + full sampler next. | `serenitymojo/docs/NAVA_INTAKE_PLAN.md` |
+| 6 | **Beat-flame trainer-core campaign** | HANDED OFF 2026-06-11: Klein step **10.5 → 3.3 s**, all levers gated + SHIPPED (noise fix, fused GPU AdamW, block residency — gate was blocked then CLEARED via zero-pin + byte-identity checks). Next: LoRA fused kernel (~300 ms), reshape-as-view, alloc/sync split, cuDNN-SDPA FFI. Tree UNCOMMITTED. | **`HANDOFF_2026-06-11_BEAT_FLAME_TRAINER_CORE.md`** (start here) + `BEAT_FLAME_SCOREBOARD_2026-06-10.md` |
 
 > Items 4–5 statuses are quoted from their docs/memory, not re-measured this session.
 

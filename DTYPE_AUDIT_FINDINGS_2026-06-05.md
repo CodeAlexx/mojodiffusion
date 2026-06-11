@@ -102,9 +102,13 @@ bias grad. Not a violation.
 
 1. **`models/flux/weights.mojo:31-32`** — "the block structs upload to device F32 in
    __init__…" — **stale**; `models/flux/block.mojo:243-252` uploads **BF16**. Confidence: high. (Doc-only fix.)
+   **RESOLVED (verified 2026-06-10):** comment now reads "checkpoint is BF16. Production
+   loaders keep checkpoint tensors in their stored dtype with Tensor.from_view."
 2. **`models/dit/kandinsky5_dit.mojo:202`** — "modulation weights stored F32…" —
    **inaccurate**; weight loaded via `from_view` (BF16) at `:527`, `linear()` is mixed
    GEMM. Math is F32, storage is BF16. Confidence: medium. (Doc-only fix.)
+   **RESOLVED (verified 2026-06-10):** comment now reads "weights stay in their
+   checkpoint storage dtype and are consumed by mixed GEMM."
 3. `models/sd35/sd35_block.mojo:191` "per-stream weights (host F32 lists)" — **accurate**
    (this is the training block, genuinely host-F32); listed only to distinguish from the
    BF16 inference DiT `sd3_mmdit.mojo`. No change.

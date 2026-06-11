@@ -39,9 +39,13 @@ from serenitymojo.ops.elementwise import (
 )
 from serenitymojo.ops.rope import rope_interleaved, rope_interleaved_slab
 from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_slab
-from serenitymojo.ops.attention_flash import sdpa_flash_train_fwd_f32
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd_f32, sdpa_flash_train_fwd,
+)
+from serenitymojo.models.zimage.lora_block import ZIMAGE_SDPA_FLASH
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.models.klein.single_block import KLEIN_SDPA_FLASH
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.activations import swiglu, swiglu_slab
 from serenitymojo.ops.tensor_algebra import add, add_slab
 from serenitymojo.ops.linalg_backward import (
@@ -594,17 +598,39 @@ def record_sdpa_slab[
     mut g: Graph, q: TArc, k: TArc, v: TArc, scale: Float32, ctx: DeviceContext,
     mut slab: StepSlab,
 ) raises -> TArc:
-    """StepSlab variant of `record_sdpa` (this file :267)."""
-    var y = sdpa_nomask_slab[B, S, H, Dh](q[], k[], v[], scale, ctx, slab)
+    """StepSlab variant of `record_sdpa` (this file :267).
+    ZIMAGE_SDPA_FLASH: forward runs cuDNN flash (bf16-native; pads S=1248
+    internally); saved gains [3..7] = padded q/k/v/o + stats and the arm
+    dispatches on arity (the Klein pattern). Flash allocs are POOL, not
+    slab -> capture must be off (flag doc in lora_block.mojo)."""
+    var y: Tensor
+    var saved = List[TArc]()
+    comptime if ZIMAGE_SDPA_FLASH:
+        # zimage graph SDPA runs on F32 activations (measured: the dtype
+        # check raised) -> F32<->bf16 boundary casts, the Klein pattern.
+        var q_bf = cast_tensor(q[], STDtype.BF16, ctx)
+        var k_bf = cast_tensor(k[], STDtype.BF16, ctx)
+        var v_bf = cast_tensor(v[], STDtype.BF16, ctx)
+        var ff = sdpa_flash_train_fwd[B, S, H, Dh](q_bf, k_bf, v_bf, scale, ctx)
+        y = cast_tensor(ff.o, STDtype.F32, ctx)
+        saved.append(q.copy())
+        saved.append(k.copy())
+        saved.append(v.copy())
+        saved.append(TArc(Tensor(ff.q_pad.buf.copy(), ff.q_pad.shape(), ff.q_pad.dtype())))
+        saved.append(TArc(Tensor(ff.k_pad.buf.copy(), ff.k_pad.shape(), ff.k_pad.dtype())))
+        saved.append(TArc(Tensor(ff.v_pad.buf.copy(), ff.v_pad.shape(), ff.v_pad.dtype())))
+        saved.append(TArc(Tensor(ff.o_pad.buf.copy(), ff.o_pad.shape(), ff.o_pad.dtype())))
+        saved.append(TArc(Tensor(ff.stats.buf.copy(), ff.stats.shape(), ff.stats.dtype())))
+    else:
+        y = sdpa_nomask_slab[B, S, H, Dh](q[], k[], v[], scale, ctx, slab)
+        saved.append(q.copy())
+        saved.append(k.copy())
+        saved.append(v.copy())
     y.set_id(g.fresh_tensor_id())
     var edges = List[Edge]()
     edges.append(g.edge_for(q[].id))
     edges.append(g.edge_for(k[].id))
     edges.append(g.edge_for(v[].id))
-    var saved = List[TArc]()
-    saved.append(q.copy())
-    saved.append(k.copy())
-    saved.append(v.copy())
     var meta: List[Int] = [B, S, H, Dh]
     var scalars: List[Float32] = [scale]
     var oids: List[Int] = [y.id]

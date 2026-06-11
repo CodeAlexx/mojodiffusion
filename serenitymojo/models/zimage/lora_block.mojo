@@ -67,6 +67,12 @@ from serenitymojo.ops.elementwise import (
 from serenitymojo.ops.vec_modulate import vec_modulate
 from serenitymojo.ops.rope import rope_interleaved, rope_interleaved_slab
 from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_slab
+# cuDNN flash SDPA for the zimage GRAPH backward path (approved 2026-06-11).
+# bf16-native, S=1248 padded to 1280 inside the flash wrapper. v1 scope:
+# the graph recompute+backward SDPA only (record_sdpa_slab + OPK_SDPA arm);
+# the v3 forward keeps math sdpa. CAPTURE MUST BE OFF with this on (the
+# flash wrapper allocates per call -> breaks replay; ZIMAGE_V2_CAPTURE).
+comptime ZIMAGE_SDPA_FLASH = True
 from serenitymojo.ops.unary import tanh_op, tanh_op_slab
 from serenitymojo.ops.tensor_algebra import (
     reshape_owned, reshape_in_place, add, mul_scalar, add_slab, mul_scalar_slab,

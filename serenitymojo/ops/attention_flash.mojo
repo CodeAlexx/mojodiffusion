@@ -392,3 +392,102 @@ def sdpa_flash_backward_f32[
         cast_tensor(dk_bf, STDtype.F32, ctx),
         cast_tensor(dv_bf, STDtype.F32, ctx),
     )
+
+
+# ─── zimage graph-path raw variants (bf16-native, padded shapes) ─────────────
+def sdpa_flash_backward_raw[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q_pad: TArc, k_pad: TArc, v_pad: TArc, o_pad: TArc, stats: TArc,
+    d_out: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashGrads:
+    """Padded-saved-set flash backward: pads d_out, unpads dQ/dK/dV. bf16
+    in/out (the zimage dtype contract C12). FAIL-LOUD on shim rc."""
+    comptime S_PAD = ((S + 127) // 128) * 128
+    var do_pad = _pad_seq[B, S, S_PAD](d_out, H, Dh, ctx)
+
+    var nbytes = B * S_PAD * H * Dh * 2
+    var dq_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dk_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dv_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    ctx.enqueue_memset[DType.uint8](dq_buf, 0)
+    ctx.enqueue_memset[DType.uint8](dk_buf, 0)
+    ctx.enqueue_memset[DType.uint8](dv_buf, 0)
+    var g_shape: List[Int] = [B, S_PAD, H, Dh]
+    var dq_pad = Tensor(dq_buf^, g_shape.copy(), STDtype.BF16)
+    var dk_pad = Tensor(dk_buf^, g_shape.copy(), STDtype.BF16)
+    var dv_pad = Tensor(dv_buf^, g_shape^, STDtype.BF16)
+
+    var qs = _strides_bhnd(S_PAD, H, Dh)
+    var ks = _strides_bhnd(S_PAD, H, Dh)
+    var vs = _strides_bhnd(S_PAD, H, Dh)
+    var os_ = _strides_bhnd(S_PAD, H, Dh)
+    var dos = _strides_bhnd(S_PAD, H, Dh)
+    var dqs = _strides_bhnd(S_PAD, H, Dh)
+    var dks = _strides_bhnd(S_PAD, H, Dh)
+    var dvs = _strides_bhnd(S_PAD, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bwd_bf16", Int32](
+        _dev_ptr(q_pad[]), _dev_ptr(k_pad[]), _dev_ptr(v_pad[]),
+        _dev_ptr(o_pad[]), _dev_ptr(do_pad), _dev_ptr(stats[]),
+        _dev_ptr(dq_pad), _dev_ptr(dk_pad), _dev_ptr(dv_pad),
+        Int32(B), Int32(H), Int32(S_PAD), Int32(S_PAD), Int32(Dh),
+        scale,
+        qs, ks, vs, os_, dos, dqs, dks, dvs,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0), Int32(S), Int32(S),
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    dos.free(); dqs.free(); dks.free(); dvs.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_backward_raw: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S=" + String(S) + ")"
+        )
+    var d_q = _unpad_seq[B, S, S_PAD](dq_pad, H, Dh, ctx)
+    var d_k = _unpad_seq[B, S, S_PAD](dk_pad, H, Dh, ctx)
+    var d_v = _unpad_seq[B, S, S_PAD](dv_pad, H, Dh, ctx)
+    comptime if B == 1 and S_PAD != S:
+        var dq_o = ctx.enqueue_create_buffer[DType.uint8](B * S * H * Dh * 2)
+        var dk_o = ctx.enqueue_create_buffer[DType.uint8](B * S * H * Dh * 2)
+        var dv_o = ctx.enqueue_create_buffer[DType.uint8](B * S * H * Dh * 2)
+        ctx.enqueue_copy(dst_buf=dq_o, src_buf=d_q.buf)
+        ctx.enqueue_copy(dst_buf=dk_o, src_buf=d_k.buf)
+        ctx.enqueue_copy(dst_buf=dv_o, src_buf=d_v.buf)
+        var sh: List[Int] = [B, S, H, Dh]
+        return SdpaFlashGrads(
+            Tensor(dq_o^, sh.copy(), STDtype.BF16),
+            Tensor(dk_o^, sh.copy(), STDtype.BF16),
+            Tensor(dv_o^, sh^, STDtype.BF16),
+        )
+    return SdpaFlashGrads(d_q^, d_k^, d_v^)
+
+
+def sdpa_flash_backward_dispatch(
+    q_pad: TArc, k_pad: TArc, v_pad: TArc, o_pad: TArc, stats: TArc,
+    d_out: Tensor, scale: Float32,
+    B: Int, S: Int, H: Int, Dh: Int,
+    ctx: DeviceContext,
+) raises -> SdpaFlashGrads:
+    """Runtime-dims -> comptime-bucket dispatch (the engine is
+    shape-agnostic; same table discipline as sdpa_backward_dispatch)."""
+    if B == 1 and S == 1248 and H == 30 and Dh == 128:
+        return sdpa_flash_backward_raw[1, 1248, 30, 128](
+            q_pad, k_pad, v_pad, o_pad, stats, d_out, scale, ctx)
+    if B == 1 and S == 1280 and H == 30 and Dh == 128:
+        return sdpa_flash_backward_raw[1, 1280, 30, 128](
+            q_pad, k_pad, v_pad, o_pad, stats, d_out, scale, ctx)
+    if B == 2 and S == 1248 and H == 30 and Dh == 128:
+        return sdpa_flash_backward_raw[2, 1248, 30, 128](
+            q_pad, k_pad, v_pad, o_pad, stats, d_out, scale, ctx)
+    if B == 2 and S == 1280 and H == 30 and Dh == 128:
+        return sdpa_flash_backward_raw[2, 1280, 30, 128](
+            q_pad, k_pad, v_pad, o_pad, stats, d_out, scale, ctx)
+    raise Error(
+        String("sdpa_flash_backward_dispatch: no bucket (B,S,H,Dh)=(")
+        + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh) + ")"
+    )

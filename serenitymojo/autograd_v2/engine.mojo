@@ -71,7 +71,11 @@ from serenitymojo.models.klein.double_block import (
     _stream_pre_backward_lora_resident_scratch_tensors,
     _stream_post_backward_lora_resident_scratch_tensors,
 )
-from serenitymojo.ops.attention_flash import sdpa_flash_backward_f32
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_backward_f32, sdpa_flash_backward_dispatch,
+)
+from serenitymojo.ops.cast import cast_tensor as cast_tensor_eng
+from serenitymojo.io.dtype import STDtype as STDtypeEng
 from serenitymojo.models.klein.single_block import (
     LoraDropout,
     _klein_lora_bwd_dropout_tensors,
@@ -231,6 +235,21 @@ def apply(node: Node, grads_in: List[TArc], ctx: DeviceContext) raises -> List[T
         return out^
     elif node.kind == OPK_SDPA:
         # saved [q_rope, k_rope, v]; meta [B, S, H, Dh]; scalars [scale].
+        if len(node.saved) >= 8:
+            # ZIMAGE_SDPA_FLASH recording (saved 3..7 = padded q/k/v/o+stats)
+            var g_bf = cast_tensor_eng(g[], STDtypeEng.BF16, ctx)
+            var fb = sdpa_flash_backward_dispatch(
+                node.saved[3].copy(), node.saved[4].copy(),
+                node.saved[5].copy(), node.saved[6].copy(),
+                node.saved[7].copy(), g_bf, node.scalars[0],
+                node.saved_meta[0], node.saved_meta[1],
+                node.saved_meta[2], node.saved_meta[3], ctx,
+            )
+            var outf = List[TArc]()
+            outf.append(TArc(cast_tensor_eng(fb.d_q, STDtypeEng.F32, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_k, STDtypeEng.F32, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_v, STDtypeEng.F32, ctx)))
+            return outf^
         var sb = sdpa_backward_dispatch(
             node.saved[0][], node.saved[1][], node.saved[2][], g[],
             node.scalars[0],
@@ -528,6 +547,21 @@ def apply_slab(
         out.append(TArc(d_x^))
         return out^
     elif node.kind == OPK_SDPA:
+        if len(node.saved) >= 8:
+            # ZIMAGE_SDPA_FLASH (pool allocs — capture must be off)
+            var g_bf = cast_tensor_eng(g[], STDtypeEng.BF16, ctx)
+            var fb = sdpa_flash_backward_dispatch(
+                node.saved[3].copy(), node.saved[4].copy(),
+                node.saved[5].copy(), node.saved[6].copy(),
+                node.saved[7].copy(), g_bf, node.scalars[0],
+                node.saved_meta[0], node.saved_meta[1],
+                node.saved_meta[2], node.saved_meta[3], ctx,
+            )
+            var outf = List[TArc]()
+            outf.append(TArc(cast_tensor_eng(fb.d_q, STDtypeEng.F32, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_k, STDtypeEng.F32, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_v, STDtypeEng.F32, ctx)))
+            return outf^
         var sb = sdpa_backward_dispatch_slab(
             node.saved[0][], node.saved[1][], node.saved[2][], g[],
             node.scalars[0],

@@ -194,7 +194,11 @@ comptime ZIMAGE_V2_SLAB = True
 # Capture is keyed per bucket and implemented for the 64x64 latent buckets;
 # other buckets run the same _v5 path uncaptured. Requires ENGINE+GRAPH+SLAB.
 # False = the P4 _v4 path, bit-equal oracle (gate-don't-delete, C13/C14).
-comptime ZIMAGE_V2_CAPTURE = True
+# ⚠ OFF while ZIMAGE_SDPA_FLASH is on (models/zimage/lora_block.mojo): the
+# flash wrapper allocates per call -> breaks graph REPLAY. Flash saves
+# ~0.31-0.37 s/step vs capture's ~0.07 — flash wins; capture-compat flash
+# (fixed StepIO buffers + cudnn-execute-in-capture smoke) is the follow-up.
+comptime ZIMAGE_V2_CAPTURE = False
 # P7 GRAPH backward for the BATCH-2 step (AUTOGRAD_V2_MOJO_DESIGN.md P7): the
 # B2 per-block recompute + hand-chain backward pair goes through the graph
 # engine (zimage_stack_lora_backward_main_device_b2_graph — the same swap P3

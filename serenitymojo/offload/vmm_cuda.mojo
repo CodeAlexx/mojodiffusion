@@ -137,7 +137,8 @@ def cu_mem_get_info() raises -> CuMemInfo:
 
 def cu_device_get_mempool(device: Int32 = 0) raises -> UInt64:
     """The device's DEFAULT stream-ordered memory pool handle
-    (cuDeviceGetMemPool). MAX's DeviceContext caching allocator frees device
+    (cuDeviceGetMemPool). The Mojo GPU runtime's (AsyncRT) DeviceContext
+    caching allocator frees device
     buffers back to THIS pool (cuMemAllocFromPoolAsync / cuMemFreeAsync), and
     the pool keeps the bytes reserved from the OS until trimmed — this is the
     Phase-4 F3 "~GBs never returned between jobs" retention. The handle is a

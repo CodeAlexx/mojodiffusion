@@ -135,7 +135,7 @@ trait GenBackend(Movable):
     def between_jobs_trim(mut self) raises:
         """Reclaim a finished job's transient device memory at the job boundary
         (F3 pool retention). The daemon calls this after every terminal job.
-        Single-model backends with no pool-trim need (stub / pool-managed-by-MAX)
+        Single-model backends with no pool-trim need (stub / pool-managed-by-the-Mojo-runtime)
         implement it as a no-op; the multi-model DispatchBackend trims the CUDA
         mempool here so idle VRAM tracks the resident footprint."""
         ...

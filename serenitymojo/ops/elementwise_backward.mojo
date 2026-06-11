@@ -37,14 +37,16 @@ def _modulate_bwd_dx_kernel[dtype: DType](
     dx: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     rows: Int,
     cols: Int,
+    rows_per_vec: Int,
 ):
     var idx = Int(global_idx.x)
     var total = rows * cols
     if idx < total:
         var r = idx // cols
         var c = idx % cols
+        var vo = (r // rows_per_vec) * cols
         var gov = rebind[Scalar[dtype]](go[r, c]).cast[DType.float32]()
-        var sv = rebind[Scalar[dtype]](s[c]).cast[DType.float32]()
+        var sv = rebind[Scalar[dtype]](s[vo + c]).cast[DType.float32]()
         dx[r, c] = rebind[dx.element_type]((gov * (1.0 + sv)).cast[dtype]())
 
 
@@ -98,6 +100,22 @@ def modulate_backward(
     var rows = 1
     for i in range(len(xshape) - 1):
         rows *= xshape[i]
+    # scale: [D] or [B, D] (per-sample adaLN; rows split evenly). Param grads
+    # are per-vec reductions — not implemented for B>1 (LoRA training discards
+    # them); callers must pass compute_param_grads=False.
+    var sshape = scale.shape()
+    var nvec = 1
+    if len(sshape) == 2 and sshape[1] == d:
+        nvec = sshape[0]
+        if compute_param_grads:
+            raise Error(
+                "modulate_backward: param grads unsupported for [B, D] scale"
+            )
+        if rows % nvec != 0:
+            raise Error("modulate_backward: rows not divisible by vec count")
+    elif len(sshape) != 1 or sshape[0] != d:
+        raise Error("modulate_backward: scale must be [D] or [B, D]")
+    var rows_per_vec = rows // nvec
 
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     var param_nbytes = scale.nbytes()
@@ -107,7 +125,7 @@ def modulate_backward(
     var dsh_buf = ctx.enqueue_create_buffer[DType.uint8](param_nbytes)
 
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
-    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
+    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * d))
 
     var total = rows * d
     var dx_grid = (total + _BLOCK - 1) // _BLOCK
@@ -126,7 +144,7 @@ def modulate_backward(
         ctx.enqueue_function[
             _modulate_bwd_dx_kernel[DType.float32],
             _modulate_bwd_dx_kernel[DType.float32],
-        ](GO, S, DX, rows, d, grid_dim=dx_grid, block_dim=_BLOCK)
+        ](GO, S, DX, rows, d, rows_per_vec, grid_dim=dx_grid, block_dim=_BLOCK)
         if compute_param_grads:
             var DS = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
                 ds_buf.unsafe_ptr().bitcast[Float32](), v_rl)
@@ -151,7 +169,7 @@ def modulate_backward(
         ctx.enqueue_function[
             _modulate_bwd_dx_kernel[DType.bfloat16],
             _modulate_bwd_dx_kernel[DType.bfloat16],
-        ](GO, S, DX, rows, d, grid_dim=dx_grid, block_dim=_BLOCK)
+        ](GO, S, DX, rows, d, rows_per_vec, grid_dim=dx_grid, block_dim=_BLOCK)
         if compute_param_grads:
             var DS = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
                 ds_buf.unsafe_ptr().bitcast[BFloat16](), v_rl)
@@ -176,7 +194,7 @@ def modulate_backward(
         ctx.enqueue_function[
             _modulate_bwd_dx_kernel[DType.float16],
             _modulate_bwd_dx_kernel[DType.float16],
-        ](GO, S, DX, rows, d, grid_dim=dx_grid, block_dim=_BLOCK)
+        ](GO, S, DX, rows, d, rows_per_vec, grid_dim=dx_grid, block_dim=_BLOCK)
         if compute_param_grads:
             var DS = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
                 ds_buf.unsafe_ptr().bitcast[Float16](), v_rl)

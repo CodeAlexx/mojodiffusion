@@ -45,6 +45,13 @@ from serenitymojo.scratch_ring import ScratchRingAllocator
 # REUSE the core OneTrainer-style LoRA structs (BF16 storage + SR AdamW).
 from serenitymojo.models.klein.lora_adapter import LoraAdapter, LoraGrads
 
+# Fused single-launch LoRA kernels (shared training core). Dispatchers below
+# route the hot device-resident paths there when dtypes/rank fit; the legacy
+# *_unfused chains are kept as the parity-gate reference.
+from serenitymojo.training.lora_fused_linear import (
+    lora_fused_bwd, lora_fused_fwd, lora_fused_supported,
+)
+
 
 comptime TArc = ArcPointer[Tensor]
 
@@ -141,7 +148,21 @@ def klein_lora_fwd(
 
 # Device-resident sibling of klein_lora_fwd. A/B are borrowed from a resident
 # adapter carrier, so hot forward/recompute/backward paths do not re-upload them.
+# Hot path: ONE fused kernel (training/lora_fused_linear.mojo) when x is F32
+# and A/B are BF16 rank-16 — same products as the unfused chain, accumulation
+# order differs (accepted class; gated at 8-nines vs torch oracles).
 def klein_lora_fwd_device_resident(
+    x: Tensor, lo: LoraAdapterDevice, M: Int, ctx: DeviceContext
+) raises -> Tensor:
+    if lora_fused_supported(x, lo.a[], lo.b[], lo.rank):
+        return lora_fused_fwd(
+            x, lo.a[], lo.b[], lo.rank, lo.in_f, lo.out_f, lo.scale, ctx
+        )
+    return klein_lora_fwd_device_resident_unfused(x, lo, M, ctx)
+
+
+# Legacy 2-GEMM + scalar-mul chain — parity-gate reference for the fused path.
+def klein_lora_fwd_device_resident_unfused(
     x: Tensor, lo: LoraAdapterDevice, M: Int, ctx: DeviceContext
 ) raises -> Tensor:
     var nb1 = Optional[Tensor](None)
@@ -282,7 +303,29 @@ struct KleinLoraDeviceGradTensors(Copyable, Movable):
 
 # Device-resident sibling of klein_lora_bwd. d_A/d_B still leave as host lists
 # for the existing optimizer, while the large d_x_lo tensor stays on device.
+# Hot path: 2 fused launches (training/lora_fused_linear.mojo) replacing the
+# 1 GEMM + scalar-mul + 4 GEMM + cast chain when dtypes/rank fit.
 def klein_lora_bwd_device_resident(
+    d_contrib: Tensor, x: Tensor, lo: LoraAdapterDevice,
+    M: Int, ctx: DeviceContext,
+) raises -> KleinLoraDeviceGrads:
+    if (
+        lora_fused_supported(x, lo.a[], lo.b[], lo.rank)
+        and d_contrib.dtype() == STDtype.F32
+    ):
+        var g = lora_fused_bwd(
+            d_contrib, x, lo.a[], lo.b[], lo.rank, lo.in_f, lo.out_f,
+            lo.scale, ctx,
+        )
+        var pair = _to_host_pair_f32(g.d_a[], g.d_b[], ctx)
+        return KleinLoraDeviceGrads(
+            pair.d_a.copy(), pair.d_b.copy(), g.d_x[].clone(ctx)
+        )
+    return klein_lora_bwd_device_resident_unfused(d_contrib, x, lo, M, ctx)
+
+
+# Legacy chain — parity-gate reference for the fused path.
+def klein_lora_bwd_device_resident_unfused(
     d_contrib: Tensor, x: Tensor, lo: LoraAdapterDevice,
     M: Int, ctx: DeviceContext,
 ) raises -> KleinLoraDeviceGrads:
@@ -311,8 +354,28 @@ def klein_lora_bwd_device_resident_tensors(
 
     This variant keeps d_A/d_B on device so the full Klein stack can enqueue all
     block backward work first and perform one batched D2H fence at the end of the
-    step. The legacy sibling above is kept for parity tests and smaller callers.
+    step. Hot path = 2 fused launches; unfused chain kept below for parity.
     """
+    if (
+        lora_fused_supported(x, lo.a[], lo.b[], lo.rank)
+        and d_contrib.dtype() == STDtype.F32
+    ):
+        var g = lora_fused_bwd(
+            d_contrib, x, lo.a[], lo.b[], lo.rank, lo.in_f, lo.out_f,
+            lo.scale, ctx,
+        )
+        return KleinLoraDeviceGradTensors(
+            g.d_a.copy(), g.d_b.copy(), g.d_x.copy()
+        )
+    return klein_lora_bwd_device_resident_tensors_unfused(
+        d_contrib, x, lo, M, ctx
+    )
+
+
+def klein_lora_bwd_device_resident_tensors_unfused(
+    d_contrib: Tensor, x: Tensor, lo: LoraAdapterDevice,
+    M: Int, ctx: DeviceContext,
+) raises -> KleinLoraDeviceGradTensors:
     var nb_t = Optional[Tensor](None)
     var t = linear(x, lo.a[], nb_t^, ctx)
     var d_dy = mul_scalar(d_contrib, lo.scale, ctx)

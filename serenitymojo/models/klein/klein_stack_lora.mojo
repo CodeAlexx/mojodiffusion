@@ -104,7 +104,11 @@ from serenitymojo.training.lora_save import (
     save_lora_train_state, load_lora_train_state,
 )
 from serenitymojo.training.checkpoint import HostOffload, offload_to_host, restore_to_device
-from serenitymojo.training.lora_adamw_ot_fused import fused_lora_adamw_ot_step
+from serenitymojo.training.lora_adamw_ot_fused import (
+    fused_lora_adamw_ot_step,
+    LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
+    fused_lora_adamw_ot_step_resident, lora_adamw_ot_device_state_sync_moments,
+)
 from serenitymojo.models.klein.activation_tape import KleinStackLoraOffloadedTape
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
@@ -211,6 +215,85 @@ def klein_lora_set_to_device(
     for i in range(ns):
         sgl.append(lora_adapter_to_device(set.sgl[i], ctx))
     return KleinLoraDeviceSet(dbl^, sgl^, set.num_double, set.num_single, set.rank)
+
+
+def _klein_resident_adapter(
+    lo: LoraAdapter, state: LoraAdamWOTDeviceState, idx: Int,
+) raises -> LoraAdapterDevice:
+    var n_a = len(lo.a)
+    var n_b = len(lo.b)
+    var a_off = state.elem_offset(idx, False)
+    var b_off = state.elem_offset(idx, True)
+    return LoraAdapterDevice(
+        TArc(Tensor(
+            state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+            [lo.rank, lo.in_f], STDtype.BF16,
+        )),
+        TArc(Tensor(
+            state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+            [lo.out_f, lo.rank], STDtype.BF16,
+        )),
+        lo.rank, lo.in_f, lo.out_f, lo.scale,
+    )
+
+
+def klein_lora_set_to_device_resident(
+    set: KleinLoraSet,
+    dbl_state: LoraAdamWOTDeviceState,
+    sgl_state: LoraAdamWOTDeviceState,
+    ctx: DeviceContext,
+) raises -> KleinLoraDeviceSet:
+    """v2 engine (resident-set): device LoRA set built ONCE, every adapter a
+    zero-copy sub-buffer view into the persistent OT-AdamW parameter buffers
+    (dbl/sgl). The in-place optimizer update IS the next step\'s weights; the
+    per-step klein_lora_set_to_device upload disappears. States must outlive
+    the returned set (scratch_ring view discipline)."""
+    var dbl = List[LoraAdapterDevice]()
+    var nd = set.num_double * DBL_SLOTS
+    for i in range(nd):
+        dbl.append(_klein_resident_adapter(set.dbl[i], dbl_state, i))
+    var sgl = List[LoraAdapterDevice]()
+    var ns = set.num_single * SGL_SLOTS
+    for i in range(ns):
+        sgl.append(_klein_resident_adapter(set.sgl[i], sgl_state, i))
+    return KleinLoraDeviceSet(dbl^, sgl^, set.num_double, set.num_single, set.rank)
+
+
+def klein_lora_adamw_step_resident(
+    mut dbl_state: LoraAdamWOTDeviceState,
+    mut sgl_state: LoraAdamWOTDeviceState,
+    mut set: KleinLoraSet, grads: KleinLoraGrads, t: Int, lr: Float32,
+    ctx: DeviceContext,
+    beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
+    eps: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
+) raises:
+    """klein_lora_adamw_step on the persistent device state — same scalars,
+    same kernel, same SR stream (seed, intra-segment index): bit-identical."""
+    if t < 1:
+        raise Error("klein_lora_adamw_step_resident: t must be >= 1")
+    var b1p = Float32(1.0)
+    var b2p = Float32(1.0)
+    for _ in range(t):
+        b1p *= beta1
+        b2p *= beta2
+    var bc1 = Float32(1.0) - b1p
+    var bc2 = Float32(1.0) - b2p
+    var step_size = lr / bc1
+    var bc2_sqrt = sqrt(bc2)
+    var decay = Float32(1.0) - lr * weight_decay
+    var one_minus_beta1 = Float32(1.0) - beta1
+    var one_minus_beta2 = Float32(1.0) - beta2
+    var seed = UInt32(t)
+    fused_lora_adamw_ot_step_resident(
+        dbl_state, set.dbl, grads.dbl_d_a, grads.dbl_d_b,
+        step_size, bc2_sqrt, decay, one_minus_beta1, beta2,
+        one_minus_beta2, eps, seed, ctx,
+    )
+    fused_lora_adamw_ot_step_resident(
+        sgl_state, set.sgl, grads.sgl_d_a, grads.sgl_d_b,
+        step_size, bc2_sqrt, decay, one_minus_beta1, beta2,
+        one_minus_beta2, eps, seed, ctx,
+    )
 
 
 def scale_klein_lora_set(mut set: KleinLoraSet, multiplier: Float32):

@@ -53,7 +53,7 @@ from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.scratch_ring import ScratchRingAllocator
 
 from serenitymojo.models.klein.klein_stack_lora import (
-    KleinLoraSet, KleinLoraGrads, build_klein_lora_set,
+    KleinLoraSet, KleinLoraGrads, KleinLoraDeviceSet, build_klein_lora_set,
     klein_lora_set_to_device,
     klein_stack_lora_forward, klein_stack_lora_forward_device_inputs,
     klein_stack_lora_forward_device_inputs_resident,
@@ -70,6 +70,7 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch,
     klein_lora_adamw_step, save_klein_lora, load_klein_lora_resume,
     save_klein_lora_state, load_klein_lora_state, save_klein_lora_ema,
+    klein_lora_set_to_device_resident, klein_lora_adamw_step_resident,
     DBL_SLOTS,
 )
 from serenitymojo.models.klein.weights import (
@@ -134,6 +135,18 @@ from serenitymojo.io.ffi import sys_system, sys_open, sys_close, O_RDONLY
 
 
 comptime TArc = ArcPointer[Tensor]
+
+# v2 ENGINE SWAP (maintainer mandate 2026-06-11, serenitymojo/docs/
+# MOJO_V2_ENGINE_PLAN.md): resident-set workstream — persistent device
+# OT-AdamW P/M/V whose param buffer the model's device LoRA set views
+# (no per-step set upload, no per-step P/M/V round trip). Bit-identical
+# math (same kernel, same SR stream). False = previous per-step path.
+comptime KLEIN_V2_ENGINE = True
+
+from serenitymojo.training.lora_adamw_ot_fused import (
+    LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
+    lora_adamw_ot_device_state_sync_moments,
+)
 
 
 # ── config file (binding rule 2026-05-31: arch + recipe come from the FILE) ──
@@ -898,6 +911,15 @@ def main() raises:
         board.log_text(String("events/resume"), start_step, resume_lora)
     print("  LoRA set:", len(lora.dbl), "double-slot +", len(lora.sgl), "single-slot")
 
+    # v2 engine: persistent device OT-AdamW state (dbl + sgl lists) + a
+    # resident device LoRA set viewing the live param buffers. Built ONCE
+    # after any resume; only used when KLEIN_V2_ENGINE.
+    var dbl_state = lora_adamw_ot_device_state_init(lora.dbl, ctx)
+    var sgl_state = lora_adamw_ot_device_state_init(lora.sgl, ctx)
+    var resident_lora_dev = klein_lora_set_to_device_resident(
+        lora, dbl_state, sgl_state, ctx,
+    )
+
     # ── EMA shadow params (Wave 2B item 2i; default-off => NO allocation) ─────
     # Shadow copies of every trainable LoRA A/B, host-side (LoRA params are host
     # List[BFloat16]). Updated post-AdamW with F32 math and BF16 storage. When
@@ -1099,7 +1121,11 @@ def main() raises:
         # sigma (was static sigma=0.5 — diffusers-parity localized the loss here).
         base.final_shift = mods[3].copy()
         base.final_scale = mods[4].copy()
-        var lora_dev = klein_lora_set_to_device(lora, ctx)
+        var lora_dev: KleinLoraDeviceSet
+        comptime if KLEIN_V2_ENGINE:
+            lora_dev = resident_lora_dev.copy()
+        else:
+            lora_dev = klein_lora_set_to_device(lora, ctx)
 
         # forward -> loss/d_loss -> backward. Loss math is shared between the
         # resident checkpoint-input path and the CPU_OFFLOADED activation tape
@@ -1256,9 +1282,15 @@ def main() raises:
         # lr_warmup_steps=0) returns cfg.lr for every step => baseline unchanged.
         var optimizer_step = ((k - 1) // accum_steps) + 1
         var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
-        klein_lora_adamw_step(
-            lora, g, optimizer_step, step_lr, ctx, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay
-        )
+        comptime if KLEIN_V2_ENGINE:
+            klein_lora_adamw_step_resident(
+                dbl_state, sgl_state, lora, g, optimizer_step, step_lr, ctx,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+        else:
+            klein_lora_adamw_step(
+                lora, g, optimizer_step, step_lr, ctx, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay
+            )
         # ── EMA shadow update post-AdamW (Wave 2B item 2i; default-off skip) ──
         # decay schedule returns 0.0 before update_after_step (skip). Off =>
         # shadows empty => loop body never runs => baseline unchanged.
@@ -1312,6 +1344,9 @@ def main() raises:
             print("[Klein-lora] save step=", k, " path=", ckpt, " pairs=", npairs)
             board.log_text(String("events/save"), k, ckpt)
             var state_path = _state_path_for_lora(ckpt)
+            comptime if KLEIN_V2_ENGINE:
+                lora_adamw_ot_device_state_sync_moments(dbl_state, lora.dbl, ctx)
+                lora_adamw_ot_device_state_sync_moments(sgl_state, lora.sgl, ctx)
             var nstate = save_klein_lora_state(lora, state_path, ctx)
             print("[Klein-lora] save_state step=", k, " path=", state_path, " pairs=", nstate)
             board.log_text(String("events/save_state"), k, state_path)

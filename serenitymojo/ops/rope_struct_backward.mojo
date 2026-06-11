@@ -731,19 +731,21 @@ struct GateResidualGrads(Movable):
 # d_x[r,c] = grad_out[r,c] ; d_y[r,c] = grad_out[r,c] * g[c]
 def _gate_dxdy_kernel[dtype: DType](
     g: LayoutTensor[dtype, _DYN2, MutAnyOrigin],   # grad_out [rows, cols]
-    gate: LayoutTensor[dtype, _DYN1, MutAnyOrigin], # [cols]
+    gate: LayoutTensor[dtype, _DYN1, MutAnyOrigin], # [cols] or [nvec*cols]
     dx: LayoutTensor[dtype, _DYN2, MutAnyOrigin],  # [rows, cols]
     dy: LayoutTensor[dtype, _DYN2, MutAnyOrigin],  # [rows, cols]
     rows: Int,
     cols: Int,
+    rows_per_vec: Int,
 ):
     var idx = Int(global_idx.x)
     var total = rows * cols
     if idx < total:
         var r = idx // cols
         var c = idx % cols
+        var vo = (r // rows_per_vec) * cols
         var gv = rebind[Scalar[dtype]](g[r, c]).cast[DType.float32]()
-        var gate_v = rebind[Scalar[dtype]](gate[c]).cast[DType.float32]()
+        var gate_v = rebind[Scalar[dtype]](gate[vo + c]).cast[DType.float32]()
         dx[r, c] = rebind[dx.element_type](gv.cast[dtype]())
         dy[r, c] = rebind[dy.element_type]((gv * gate_v).cast[dtype]())
 
@@ -807,13 +809,25 @@ def gate_residual_backward(
         raise Error("gate_residual_backward: grad_out must have rank >= 1")
     var cols = gshape[len(gshape) - 1]
     var gateshape = g.shape()
-    if len(gateshape) != 1 or gateshape[0] != cols:
-        raise Error("gate_residual_backward: g must be [C]")
+    # g: [C] (one vec) or [B, C] (per-sample gates; d_g reduction unsupported
+    # for B>1 — LoRA training discards it; pass compute_gate_grad=False).
+    var nvec = 1
+    if len(gateshape) == 2 and gateshape[1] == cols:
+        nvec = gateshape[0]
+        if compute_gate_grad:
+            raise Error(
+                "gate_residual_backward: d_g unsupported for [B, C] gate"
+            )
+    elif len(gateshape) != 1 or gateshape[0] != cols:
+        raise Error("gate_residual_backward: g must be [C] or [B, C]")
     if x.numel() != grad_out.numel() or y.numel() != grad_out.numel():
         raise Error("gate_residual_backward: grad_out/x/y numel mismatch")
     var rows = 1
     for i in range(len(gshape) - 1):
         rows *= gshape[i]
+    if rows % nvec != 0:
+        raise Error("gate_residual_backward: rows not divisible by vec count")
+    var rows_per_vec = rows // nvec
 
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     var dy_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
@@ -823,7 +837,7 @@ def gate_residual_backward(
     var dg_buf = ctx.enqueue_create_buffer[DType.uint8](dg_nbytes)
 
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
-    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
+    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * cols))
     var total = rows * cols
     var grid = (total + _BLOCK - 1) // _BLOCK
 
@@ -841,7 +855,7 @@ def gate_residual_backward(
             dy_buf.unsafe_ptr().bitcast[Float32](), x_rl)
         ctx.enqueue_function[
             _gate_dxdy_kernel[DType.float32], _gate_dxdy_kernel[DType.float32]
-        ](G, GATE, DX, DY, rows, cols, grid_dim=grid, block_dim=_BLOCK)
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
         if compute_gate_grad:
             var DG = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
                 dg_buf.unsafe_ptr().bitcast[Float32](), v_rl)
@@ -880,7 +894,7 @@ def gate_residual_backward(
             dy_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
         ctx.enqueue_function[
             _gate_dxdy_kernel[DType.bfloat16], _gate_dxdy_kernel[DType.bfloat16]
-        ](G, GATE, DX, DY, rows, cols, grid_dim=grid, block_dim=_BLOCK)
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
         if compute_gate_grad:
             var DG = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
                 dg_buf.unsafe_ptr().bitcast[BFloat16](), v_rl)
@@ -919,7 +933,7 @@ def gate_residual_backward(
             dy_buf.unsafe_ptr().bitcast[Float16](), x_rl)
         ctx.enqueue_function[
             _gate_dxdy_kernel[DType.float16], _gate_dxdy_kernel[DType.float16]
-        ](G, GATE, DX, DY, rows, cols, grid_dim=grid, block_dim=_BLOCK)
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
         if compute_gate_grad:
             var DG = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
                 dg_buf.unsafe_ptr().bitcast[Float16](), v_rl)
@@ -972,18 +986,25 @@ def gate_residual_backward_dxdy(
         raise Error("gate_residual_backward_dxdy: grad_out must have rank >= 1")
     var cols = gshape[len(gshape) - 1]
     var gateshape = g.shape()
-    if len(gateshape) != 1 or gateshape[0] != cols:
-        raise Error("gate_residual_backward_dxdy: g must be [C]")
+    # g: [C] (one vec) or [B, C] (per-sample gates, rows split evenly).
+    var nvec = 1
+    if len(gateshape) == 2 and gateshape[1] == cols:
+        nvec = gateshape[0]
+    elif len(gateshape) != 1 or gateshape[0] != cols:
+        raise Error("gate_residual_backward_dxdy: g must be [C] or [B, C]")
     var rows = 1
     for i in range(len(gshape) - 1):
         rows *= gshape[i]
+    if rows % nvec != 0:
+        raise Error("gate_residual_backward_dxdy: rows not divisible by vecs")
+    var rows_per_vec = rows // nvec
 
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     var dy_buf = ctx.enqueue_create_buffer[DType.uint8](grad_out.nbytes())
     var dg_buf = ctx.enqueue_create_buffer[DType.uint8](0)
 
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
-    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
+    var v_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nvec * cols))
     var total = rows * cols
     var grid = (total + _BLOCK - 1) // _BLOCK
 
@@ -999,7 +1020,7 @@ def gate_residual_backward_dxdy(
             dy_buf.unsafe_ptr().bitcast[Float32](), x_rl)
         ctx.enqueue_function[
             _gate_dxdy_kernel[DType.float32], _gate_dxdy_kernel[DType.float32]
-        ](G, GATE, DX, DY, rows, cols, grid_dim=grid, block_dim=_BLOCK)
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var G = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             grad_out.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
@@ -1011,7 +1032,7 @@ def gate_residual_backward_dxdy(
             dy_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
         ctx.enqueue_function[
             _gate_dxdy_kernel[DType.bfloat16], _gate_dxdy_kernel[DType.bfloat16]
-        ](G, GATE, DX, DY, rows, cols, grid_dim=grid, block_dim=_BLOCK)
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
     else:
         var G = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             grad_out.buf.unsafe_ptr().bitcast[Float16](), x_rl)
@@ -1023,7 +1044,7 @@ def gate_residual_backward_dxdy(
             dy_buf.unsafe_ptr().bitcast[Float16](), x_rl)
         ctx.enqueue_function[
             _gate_dxdy_kernel[DType.float16], _gate_dxdy_kernel[DType.float16]
-        ](G, GATE, DX, DY, rows, cols, grid_dim=grid, block_dim=_BLOCK)
+        ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
     ctx.synchronize()
     var dg_shape = List[Int]()
     dg_shape.append(0)

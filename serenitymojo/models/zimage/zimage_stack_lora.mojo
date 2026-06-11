@@ -94,6 +94,9 @@ from serenitymojo.models.zimage.lora_block import (
     zimage_block_lora_forward, zimage_block_lora_backward,
     zimage_block_lora_forward_device, zimage_block_lora_backward_device,
     zimage_block_lora_forward_device_tensor, zimage_block_lora_backward_device_tensors,
+    zimage_block_lora_forward_device_tensor_batch,
+    zimage_block_lora_backward_device_tensors_batch,
+    zimage_modvecs_pack2_to_device,
     zimage_block_lora_predict_device_tensor,
     zimage_block_lora_predict_device_tensor_moddev,
     zimage_refiner_lora_forward, zimage_refiner_lora_backward,
@@ -105,6 +108,12 @@ from serenitymojo.models.zimage.zimage_stack import (
 
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
+from serenitymojo.training.lora_adamw_plain_fused import (
+    fused_lora_adamw_plain_step,
+    LoraAdamWPlainDeviceState, lora_adamw_plain_device_state_init,
+    fused_lora_adamw_plain_step_resident,
+    lora_adamw_plain_device_state_sync_moments,
+)
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_peft, load_lora_for_resume,
     save_lora_train_state, load_lora_train_state, _read_f32,
@@ -285,6 +294,42 @@ def zimage_lora_set_to_device(
     var n = set.num_blocks() * ZIMAGE_SLOTS
     for i in range(n):
         ad.append(zimage_lora_adapter_to_device(set.ad[i], ctx))
+    return ZImageLoraDeviceSet(ad^, set.num_nr, set.num_cr, set.num_main, set.rank)
+
+
+def zimage_lora_set_to_device_resident(
+    set: ZImageLoraSet,
+    state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+) raises -> ZImageLoraDeviceSet:
+    """v2 engine (resident-set): build the device LoRA set ONCE, with every
+    MAIN adapter's a/b as zero-copy sub-buffer views into the persistent
+    optimizer parameter buffer `state.dev_p` — the in-place AdamW update IS
+    the next step's weights; the per-step `zimage_lora_set_to_device` upload
+    (~420 syncing from_host calls, 0.057 s/step measured) disappears.
+    NR/CR adapters (frozen in the OT baseline) upload once as before.
+    `state` must outlive the returned set (views; scratch_ring discipline)."""
+    var ad = List[ZImageLoraAdapterDevice]()
+    var n = set.num_blocks() * ZIMAGE_SLOTS
+    for i in range(n):
+        if i < state.start or i >= state.end:
+            ad.append(zimage_lora_adapter_to_device(set.ad[i], ctx))
+        else:
+            var n_a = len(set.ad[i].a)
+            var n_b = len(set.ad[i].b)
+            var a_off = state.elem_offset(i, False)
+            var b_off = state.elem_offset(i, True)
+            ad.append(ZImageLoraAdapterDevice(
+                TArc(Tensor(
+                    state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+                    [set.ad[i].rank, set.ad[i].in_f], STDtype.BF16,
+                )),
+                TArc(Tensor(
+                    state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+                    [set.ad[i].out_f, set.ad[i].rank], STDtype.BF16,
+                )),
+                set.ad[i].rank, set.ad[i].in_f, set.ad[i].out_f, set.ad[i].scale,
+            ))
     return ZImageLoraDeviceSet(ad^, set.num_nr, set.num_cr, set.num_main, set.rank)
 
 
@@ -776,6 +821,161 @@ def zimage_stack_lora_forward_main_device[
     )
 
 
+def zimage_stack_lora_forward_main_device_v2[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    x_seq: List[Float32], cap_seq: List[Float32],
+    nr_blocks: List[ZImageBlockWeights], nr_mod: List[ZImageModVecs],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_dev: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageStackForward:
+    """v2-engine B=1 forward (mandate 2026-06-11): the gated batch engine at
+    B=1 — device-resident mod-vecs (ONE packed upload per step via
+    zimage_modvecs_all_to_device) instead of per-block syncing `_t()` uploads.
+    Math is op-for-op the B=1 path; the batch block functions at B=1 run the
+    identical kernels on identical shapes (b2dup gate proved the batch path
+    reproduces the B1 trajectory exactly). Old path kept (gate-don't-delete):
+    zimage_stack_lora_forward_main_device."""
+    var num_nr = len(nr_blocks)
+    var num_cr = len(cr_blocks)
+    var num_main = len(main_blocks)
+
+    var nr_x_in = List[TArc]()
+    var xs = x_seq.copy()
+    for i in range(num_nr):
+        var fwd = zimage_block_forward[H, Dh, N_IMG](
+            xs.copy(), nr_blocks[i], nr_mod[i], x_cos, x_sin, D, F, eps, ctx,
+        )
+        xs = fwd.out.copy()
+
+    var cr_x_in = List[TArc]()
+    var cs = cap_seq.copy()
+    for i in range(num_cr):
+        var fwd = zimage_refiner_forward[H, Dh, N_TXT](
+            cs.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
+        )
+        cs = fwd.out.copy()
+
+    var x = _concat_img_cap(xs, cs)
+    var x_arc = TArc(_t(x^, [S, D], ctx))
+
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        var fwd = zimage_block_lora_forward_device_tensor_batch[1, H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod_dev[i], bl,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
+
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = vec_modulate(
+        ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+    var parts = _split_img_cap(patches, N_IMG, N_TXT, out_ch)
+    var out = parts[0].copy()
+
+    return ZImageStackForward(
+        out^, x_seq.copy(), cap_seq.copy(),
+        nr_x_in^, cr_x_in^, main_x_in^,
+        x_arc.copy(), TArc(ln_t^),
+    )
+
+
+def zimage_stack_lora_backward_main_device_v2[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_dev: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageLoraGrads:
+    """v2-engine B=1 backward: batch engine at B=1 with device mod-vecs.
+    Same recompute-then-backprop structure as backward_main_device; the
+    batch backward additionally skips frozen-gate/base-norm param grads
+    (gate_residual_backward_dxdy) — those grads were computed and DISCARDED
+    by the old path (frozen-weight skip, flame v2 workstream #4)."""
+    var num_main = len(main_blocks)
+    var num_blocks = lora.num_blocks()
+
+    var d_patches = _concat_img_cap(d_out, _zeros(N_TXT * out_ch))
+    var final_dx = linear_backward_dx(
+        _t(d_patches, [S, out_ch], ctx), final_lin_w, S, D, out_ch, ctx,
+    )
+    var d_final_lin = List[Float32]()
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+    )
+    var d_f_scale = mbf.d_scale.to_host(ctx)
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_main - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var refwd = zimage_block_lora_forward_device_tensor_batch[1, H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod_dev[bi], bl,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        var bg = zimage_block_lora_backward_device_tensors_batch[1, H, Dh, S](
+            d_x[], main_blocks[bi], main_mod_dev[bi], bl, refwd.saved,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    var host_grads = _zimage_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_blocks * ZIMAGE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    var empty_x = List[Float32]()
+    var empty_cap = List[Float32]()
+    var empty_nr = List[List[Float32]]()
+    var empty_main = List[List[Float32]]()
+    return ZImageLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        empty_x^, empty_cap^,
+        empty_nr^, empty_main^,
+        d_f_scale^, d_final_lin^,
+        nonfinite,
+    )
+
+
 def zimage_refine_x_seq[
     H: Int, Dh: Int, N_IMG: Int
 ](
@@ -1007,7 +1207,33 @@ def zimage_lora_adamw_step(
 
 
 # ── AdamW step on OneTrainer baseline trainable adapters only: main layers. ──
+# Hot path: ONE fused GPU launch with the IDENTICAL plain-AdamW math
+# (training/lora_adamw_plain_fused.mojo; gate
+# training/lora_adamw_plain_fused_parity.mojo — host vs device ±1-ulp class).
+# Host loop kept below as the gate reference.
+comptime ZIMAGE_FUSED_ADAMW = True
+
+
 def zimage_lora_adamw_step_main_only(
+    mut set: ZImageLoraSet, grads: ZImageLoraGrads, t: Int, lr: Float32,
+    ctx: DeviceContext,
+    beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
+    eps: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
+) raises:
+    var start = set.main_base() * ZIMAGE_SLOTS
+    var end = set.num_blocks() * ZIMAGE_SLOTS
+    comptime if ZIMAGE_FUSED_ADAMW:
+        fused_lora_adamw_plain_step(
+            set.ad, grads.d_a, grads.d_b, start, end,
+            t, lr, beta1, beta2, eps, weight_decay, ctx,
+        )
+    else:
+        for i in range(start, end):
+            var lg = LoraGrads(grads.d_a[i].copy(), grads.d_b[i].copy())
+            _lora_adamw(set.ad[i], lg, t, lr, ctx, beta1, beta2, eps, weight_decay)
+
+
+def zimage_lora_adamw_step_main_only_unfused(
     mut set: ZImageLoraSet, grads: ZImageLoraGrads, t: Int, lr: Float32,
     ctx: DeviceContext,
     beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
@@ -1300,3 +1526,201 @@ def load_zimage_lora_main_only_comfy(
     print("[zimage][lora] comfy load:", num_main, "main layers, rank",
           file_rank, "(fused qkv split exactly into q/k/v)")
     return ZImageLoraSet(ad^, num_nr, num_cr, num_main, file_rank)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BATCH-2 stacked-rows drivers (2026-06-11, OT-parity batch lever).
+# Two samples stacked along rows: x = [xs0|cs0|xs1|cs1] = [2S, D]. Per-sample
+# adaLN via [2, D] modvec tensors (zimage_modvecs_pack2_to_device); per-sample
+# uni rope tables are concatenated by building rope over the CONCATENATED
+# position list (positions per row → concat positions == tiled tables).
+# Refiners (frozen) run per sample through the existing host-path functions.
+# GATE: training/zimage_batch2_parity.mojo — loss_B2{s0,s1} vs
+# mean(loss_B1(s0), loss_B1(s1)) with identical draws + grad average match.
+# ══════════════════════════════════════════════════════════════════════════════
+struct ZImageStackForwardB2(Movable):
+    var out0: List[Float32]             # sample-0 [N_IMG, out_ch] host patches
+    var out1: List[Float32]             # sample-1 [N_IMG, out_ch]
+    var main_x_in: List[TArc]           # num_main x [2S, D] block inputs
+    var x_final: TArc                   # [2S, D]
+    var ln_x: TArc                      # [2S, D]
+
+    def __init__(
+        out self,
+        var out0: List[Float32], var out1: List[Float32],
+        var main_x_in: List[TArc], var x_final: TArc, var ln_x: TArc,
+    ):
+        self.out0 = out0^
+        self.out1 = out1^
+        self.main_x_in = main_x_in^
+        self.x_final = x_final^
+        self.ln_x = ln_x^
+
+
+def zimage_stack_lora_forward_main_device_b2[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    x_seq0: List[Float32], cap_seq0: List[Float32],
+    x_seq1: List[Float32], cap_seq1: List[Float32],
+    nr_blocks: List[ZImageBlockWeights],
+    nr_mod0: List[ZImageModVecs], nr_mod1: List[ZImageModVecs],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_b2: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale2: List[Float32],            # [2*D] per-sample final modulation
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos0: Tensor, cap_sin0: Tensor,
+    cap_cos1: Tensor, cap_sin1: Tensor,
+    uni_cos2: Tensor, uni_sin2: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageStackForwardB2:
+    var num_nr = len(nr_blocks)
+    var num_cr = len(cr_blocks)
+    var num_main = len(main_blocks)
+
+    # frozen refiners, per sample (same math as the B=1 driver)
+    var xs0 = x_seq0.copy()
+    var xs1 = x_seq1.copy()
+    for i in range(num_nr):
+        var f0 = zimage_block_forward[H, Dh, N_IMG](
+            xs0.copy(), nr_blocks[i], nr_mod0[i], x_cos, x_sin, D, F, eps, ctx,
+        )
+        xs0 = f0.out.copy()
+        var f1 = zimage_block_forward[H, Dh, N_IMG](
+            xs1.copy(), nr_blocks[i], nr_mod1[i], x_cos, x_sin, D, F, eps, ctx,
+        )
+        xs1 = f1.out.copy()
+    var cs0 = cap_seq0.copy()
+    var cs1 = cap_seq1.copy()
+    for i in range(num_cr):
+        var f0 = zimage_refiner_forward[H, Dh, N_TXT](
+            cs0.copy(), cr_blocks[i], cap_cos0, cap_sin0, D, F, eps, ctx,
+        )
+        cs0 = f0.out.copy()
+        var f1 = zimage_refiner_forward[H, Dh, N_TXT](
+            cs1.copy(), cr_blocks[i], cap_cos1, cap_sin1, D, F, eps, ctx,
+        )
+        cs1 = f1.out.copy()
+
+    # stacked unified sequence [2S, D]
+    var x = _concat_img_cap(xs0, cs0)
+    var x1 = _concat_img_cap(xs1, cs1)
+    for i in range(len(x1)):
+        x.append(x1[i])
+    var x_arc = TArc(_t(x^, [2 * S, D], ctx))
+
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        var fwd = zimage_block_lora_forward_device_tensor_batch[2, H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod_b2[i], bl,
+            uni_cos2, uni_sin2, D, F, eps, ctx,
+        )
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
+
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = modulate(
+        ln_t, _t(f_scale2.copy(), [2, D], ctx), _t(_zeros(2 * D), [2, D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+
+    var out0 = List[Float32]()
+    for i in range(N_IMG * out_ch):
+        out0.append(patches[i])
+    var out1 = List[Float32]()
+    var base1 = S * out_ch
+    for i in range(N_IMG * out_ch):
+        out1.append(patches[base1 + i])
+
+    return ZImageStackForwardB2(
+        out0^, out1^, main_x_in^, x_arc.copy(), TArc(ln_t^),
+    )
+
+
+def zimage_stack_lora_backward_main_device_b2[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out0: List[Float32], d_out1: List[Float32],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_b2: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale2: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos2: Tensor, uni_sin2: Tensor,
+    saved: ZImageStackForwardB2,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageLoraGrads:
+    var num_main = len(main_blocks)
+    var num_blocks = lora.num_blocks()
+
+    # d_patches [2S, out_ch]: per-sample img grads, zeros on cap rows.
+    var d_patches = d_out0.copy()
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+    for i in range(len(d_out1)):
+        d_patches.append(d_out1[i])
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+
+    var final_dx = linear_backward_dx(
+        _t(d_patches^, [2 * S, out_ch], ctx), final_lin_w, 2 * S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale2.copy(), [2, D], ctx), ctx,
+        compute_param_grads=False,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_main - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var refwd = zimage_block_lora_forward_device_tensor_batch[2, H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod_b2[bi], bl,
+            uni_cos2, uni_sin2, D, F, eps, ctx,
+        )
+        var bg = zimage_block_lora_backward_device_tensors_batch[2, H, Dh, S](
+            d_x[], main_blocks[bi], main_mod_b2[bi], bl, refwd.saved,
+            uni_cos2, uni_sin2, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    var host_grads = _zimage_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_blocks * ZIMAGE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    var empty_x = List[Float32]()
+    var empty_cap = List[Float32]()
+    var empty_nr = List[List[Float32]]()
+    var empty_main = List[List[Float32]]()
+    return ZImageLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        empty_x^, empty_cap^,
+        empty_nr^, empty_main^,
+        _zeros(D), List[Float32](),
+        nonfinite,
+    )

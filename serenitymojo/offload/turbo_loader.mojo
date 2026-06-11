@@ -41,7 +41,14 @@ from serenitymojo.offload.telemetry import OffloadTelemetry
 
 comptime TURBO_USE_DEFAULT_STREAM_COPY = False
 comptime TURBO_USE_CUDA_DMA_COPY = True
-comptime TURBO_USE_PERSISTENT_BLOCK_STORE = False
+# True since 2026-06-11 (beat-flame session 2): with False, EVERY streamed-block
+# visit does a synchronous ~580 MB host memcpy (mmap → pinned slab, turbo_loader
+# prefetch step 1) on the hot thread before the async DMA — ~20 GB/step of host
+# memcpy at Klein-9B 512px (18 streamed blocks × 2 visits). The persistent store
+# pays ONE ~10 GiB pinned alloc + populate at open() (RAM measured 62 GiB, fits)
+# and prefetch becomes pure async DMA from pinned store. Bytes are identical
+# (same mmap source, copied once) — gated by loss anchors + byte-identity smoke.
+comptime TURBO_USE_PERSISTENT_BLOCK_STORE = True
 
 
 # ─── copy kernel ──────────────────────────────────────────────────────────────

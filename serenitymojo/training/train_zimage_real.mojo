@@ -71,12 +71,25 @@ from serenitymojo.models.zimage.weights import (
 )
 from serenitymojo.models.zimage.block import ZImageModVecs
 from serenitymojo.models.zimage.lora_block import ZIMAGE_SLOTS
+from serenitymojo.models.zimage.zimage_stack import ZImageStackForward
 from serenitymojo.models.zimage.zimage_stack_lora import (
-    ZImageLoraSet, ZImageLoraGrads, build_zimage_lora_set,
+    ZImageLoraSet, ZImageLoraGrads, ZImageLoraDeviceSet, build_zimage_lora_set,
     zimage_lora_set_to_device,
     zimage_stack_lora_forward_main_device, zimage_stack_lora_backward_main_device,
+    zimage_stack_lora_forward_main_device_v2, zimage_stack_lora_backward_main_device_v2,
+    zimage_stack_lora_forward_main_device_b2, zimage_stack_lora_backward_main_device_b2,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
     save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
+    zimage_lora_set_to_device_resident,
+)
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState, lora_adamw_plain_device_state_init,
+    fused_lora_adamw_plain_step_resident,
+    lora_adamw_plain_device_state_sync_moments,
+)
+from serenitymojo.models.zimage.lora_block import (
+    ZImageModVecsDevice, zimage_modvecs_pack2_to_device,
+    ZImageModVecsAllDevice, zimage_modvecs_all_to_device,
 )
 from serenitymojo.models.zimage.real_weights import (
     ZImageRealAux, load_zimage_real_aux, build_adaln, build_block_modvecs,
@@ -135,6 +148,13 @@ comptime PATCH = 2
 # [16,72,56] -> patch2 -> 36x28=1008 real image tokens. Diffusers pads image
 # tokens to a multiple of 32, so the transformer sees 1024 image rows and loss
 # is applied only to the first 1008 rows.
+# v2 ENGINE SWAP (maintainer mandate 2026-06-11, HANDOFF_2026-06-11_OVERNIGHT
+# _OT_PARITY.md): route the B=1 step through the gated batch engine —
+# device-resident mod-vecs (ONE packed upload/step) + frozen-skip batch
+# backward. False = the previous per-block-upload path, byte-identical to the
+# 06-10 anchors (gate-don't-delete, flame Stage-6a pattern).
+comptime ZIMAGE_V2_ENGINE = True
+
 comptime LAT_C = 16
 comptime LAT_H = 72
 comptime LAT_W = 56
@@ -664,6 +684,8 @@ def _train_one_step_bucket[
     cr_blocks: List[ZImageBlockWeights],
     main_blocks: List[ZImageBlockWeights],
     mut lora: ZImageLoraSet,
+    mut opt_state: LoraAdamWPlainDeviceState,
+    resident_dev: ZImageLoraDeviceSet,
     n_adapters: Int,
     final_lin_w: Tensor,
     final_lin_b: Tensor,
@@ -738,18 +760,42 @@ def _train_one_step_bucket[
     for i in range(MAIN_DEPTH):
         main_mod.append(build_block_modvecs(aux.main_mod_w[i][], aux.main_mod_b[i][], adaln, D, ctx))
     var f_scale = build_f_scale(aux, adaln, D, ctx)
+    # v2 engine: all main-block mod-vecs land on device in ONE packed upload
+    # (the old path re-uploaded each vec per block per pass, each with a sync).
+    var mvall = Optional[ZImageModVecsAllDevice](None)
+    comptime if ZIMAGE_V2_ENGINE:
+        mvall = Optional[ZImageModVecsAllDevice](
+            zimage_modvecs_all_to_device(main_mod, D, ctx)
+        )
     var t_prep = perf_counter_ns()
 
-    var lora_dev = zimage_lora_set_to_device(lora, ctx)
+    # v2 engine: resident device LoRA set (views into the persistent optimizer
+    # param buffer) — no per-step upload. Old path rebuilds the set each step.
+    var lora_dev: ZImageLoraDeviceSet
+    comptime if ZIMAGE_V2_ENGINE:
+        lora_dev = resident_dev.copy()
+    else:
+        lora_dev = zimage_lora_set_to_device(lora, ctx)
     var t_lora = perf_counter_ns()
 
-    var fwd = zimage_stack_lora_forward_main_device[H, Dh, N_IMG_B, N_TXT_B, S_B](
-        x_t.copy(), cap_seq.copy(),
-        nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora_dev,
-        f_scale.copy(), final_lin_w, final_lin_b,
-        x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
-        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
-    )
+    var fwd: ZImageStackForward
+    comptime if ZIMAGE_V2_ENGINE:
+        fwd = zimage_stack_lora_forward_main_device_v2[H, Dh, N_IMG_B, N_TXT_B, S_B](
+            x_t.copy(), cap_seq.copy(),
+            nr_blocks, nr_mod, cr_blocks, main_blocks,
+            mvall.value().per_block, lora_dev,
+            f_scale.copy(), final_lin_w, final_lin_b,
+            x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+        )
+    else:
+        fwd = zimage_stack_lora_forward_main_device[H, Dh, N_IMG_B, N_TXT_B, S_B](
+            x_t.copy(), cap_seq.copy(),
+            nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora_dev,
+            f_scale.copy(), final_lin_w, final_lin_b,
+            x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+        )
     var t_fwd = perf_counter_ns()
 
     var tgt_patch = latent_inputs.target_patch.copy()
@@ -779,20 +825,40 @@ def _train_one_step_bucket[
               " max_abs=", ps.max_abs, " target mean=", Float32(ts.mean),
               " std=", Float32(ts.std), " max_abs=", ts.max_abs)
 
-    var grads = zimage_stack_lora_backward_main_device[H, Dh, N_IMG_B, N_TXT_B, S_B](
-        d_loss, main_blocks, main_mod, lora_dev,
-        f_scale.copy(), final_lin_w,
-        uni_cos[], uni_sin[], fwd,
-        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
-    )
+    var grads: ZImageLoraGrads
+    comptime if ZIMAGE_V2_ENGINE:
+        grads = zimage_stack_lora_backward_main_device_v2[H, Dh, N_IMG_B, N_TXT_B, S_B](
+            d_loss, main_blocks, mvall.value().per_block, lora_dev,
+            f_scale.copy(), final_lin_w,
+            uni_cos[], uni_sin[], fwd,
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+        )
+    else:
+        grads = zimage_stack_lora_backward_main_device[H, Dh, N_IMG_B, N_TXT_B, S_B](
+            d_loss, main_blocks, main_mod, lora_dev,
+            f_scale.copy(), final_lin_w,
+            uni_cos[], uni_sin[], fwd,
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+        )
     var t_bwd = perf_counter_ns()
 
     var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
     var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-    zimage_lora_adamw_step_main_only(
-        lora, grads, k, step_lr, ctx,
-        train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
-    )
+    comptime if ZIMAGE_V2_ENGINE:
+        # Resident AdamW: G up, in-place kernel on persistent P/M/V, P back to
+        # the host mirror (b_absum/save contracts unchanged). Same kernel,
+        # same values as zimage_lora_adamw_step_main_only — bit-identical
+        # expected; gated on anchors + b1match-vs-b2dup cross-path identity.
+        fused_lora_adamw_plain_step_resident(
+            opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+            train_cfg.weight_decay, ctx,
+        )
+    else:
+        zimage_lora_adamw_step_main_only(
+            lora, grads, k, step_lr, ctx,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+        )
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()
@@ -836,19 +902,37 @@ def main() raises:
     var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
 
+    def _is_gate_mode(v: String) -> Bool:
+        return (
+            v == String("b2dup") or v == String("b1match")
+            or v == String("b1match2")
+        )
+
     var run_steps = DEFAULT_RUN_STEPS
-    if len(a) > arg_base:
+    if len(a) > arg_base and not _is_gate_mode(String(a[arg_base])):
         run_steps = _parse_nonnegative_int(String(a[arg_base]))
     elif train_cfg.only_cache:
         run_steps = 0
     var start_step = 0
-    if len(a) > arg_base + 1:
+    if len(a) > arg_base + 1 and not _is_gate_mode(String(a[arg_base + 1])):
         start_step = _parse_nonnegative_int(String(a[arg_base + 1]))
     if start_step > run_steps:
         raise Error(String("start_step ") + String(start_step) + String(" > run_steps ") + String(run_steps))
     var resume_state = String("")
-    if len(a) > arg_base + 2:
+    if len(a) > arg_base + 2 and not _is_gate_mode(String(a[arg_base + 2])):
         resume_state = String(a[arg_base + 2])
+    # batch-2 trajectory gate modes (see _train_one_step_bucket_b2 header):
+    #   b2dup: B2 path with duplicated sample/seed -> must equal b1match run.
+    var b2_dup = False
+    var b1_match = False
+    var b1_match2 = False
+    for ai in range(1, len(a)):
+        if String(a[ai]) == String("b2dup"):
+            b2_dup = True
+        elif String(a[ai]) == String("b1match"):
+            b1_match = True
+        elif String(a[ai]) == String("b1match2"):
+            b1_match2 = True
 
     var transformer_dir = zimage_transformer_dir_from_train_config(train_cfg)
     var cache_dir = zimage_cache_dir_from_train_config(train_cfg)
@@ -920,6 +1004,15 @@ def main() raises:
     print("[lora] adapters:", TRAIN_ADAPTER_COUNT, "trainable main-layer adapters;",
           n_adapters, "allocated total (refiners frozen/excluded)")
 
+    # v2 engine (resident-set): persistent device P/M/V + a device LoRA set
+    # whose MAIN adapters view the optimizer's live param buffer. Built ONCE
+    # (after any resume load) — the per-step set upload + P/M/V round trips
+    # disappear. Used only when ZIMAGE_V2_ENGINE; the off path ignores both.
+    var opt_state = lora_adamw_plain_device_state_init(
+        lora.ad, TRAIN_ADAPTER_START, n_adapters, ctx,
+    )
+    var resident_dev = zimage_lora_set_to_device_resident(lora, opt_state, ctx)
+
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
     var b_absum_init = Float32(0.0)
@@ -936,23 +1029,69 @@ def main() raises:
     for k in range(start_step + 1, run_steps + 1):
         var slot = 0 if OVERFIT_PROBE else (k - 1) % cache.count()
         var step_seed = UInt64(1) if OVERFIT_PROBE else UInt64(k)
+        if b1_match:
+            slot = ((k - 1) * 2) % cache.count()
+            step_seed = UInt64(2 * k)
+        elif b1_match2:
+            slot = ((k - 1) * 2 + 1) % cache.count()
+            step_seed = UInt64(2 * k + 1)
         var key = cache.peek_key(slot, ctx)
         if key.c != LAT_C:
             raise Error("train_zimage_real: unsupported latent channel count")
         var valid_cap = _cache_valid_cap(cache, slot, ctx)
         var loss: Float32
-        if key.h == 72 and key.w == 56:
+        if train_cfg.batch_size == 2:
+            # batch-2: two consecutive cache slots per step; both must share
+            # the latent bucket; caption bucket = max of the two.
+            var slot0 = ((k - 1) * 2) % cache.count()
+            var slot1 = ((k - 1) * 2 + 1) % cache.count()
+            var seed_a = UInt64(2 * k)
+            var seed_b = UInt64(2 * k + 1)
+            if b2_dup:
+                slot1 = slot0
+                seed_b = seed_a
+            var key0 = cache.peek_key(slot0, ctx)
+            var key1 = cache.peek_key(slot1, ctx)
+            if key0.c != LAT_C or key1.c != LAT_C:
+                raise Error("train_zimage_real b2: unsupported latent channels")
+            if key0.h != key1.h or key0.w != key1.w:
+                raise Error("train_zimage_real b2: paired samples in different buckets")
+            var vc0 = _cache_valid_cap(cache, slot0, ctx)
+            var vc1 = _cache_valid_cap(cache, slot1, ctx)
+            var vc = vc0 if vc0 > vc1 else vc1
+            if key0.h == 64 and key0.w == 64:
+                if vc <= 224:
+                    var rb2a = _train_one_step_bucket_b2[64, 64, 224](
+                        k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
+                        nr_blocks, cr_blocks, main_blocks, lora, opt_state, resident_dev, n_adapters,
+                        final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                        train_cfg, train_start, ctx,
+                    )
+                    loss = rb2a.loss
+                elif vc <= 256:
+                    var rb2b = _train_one_step_bucket_b2[64, 64, 256](
+                        k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
+                        nr_blocks, cr_blocks, main_blocks, lora, opt_state, resident_dev, n_adapters,
+                        final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                        train_cfg, train_start, ctx,
+                    )
+                    loss = rb2b.loss
+                else:
+                    raise Error("train_zimage_real b2: caption too long for 256 bucket")
+            else:
+                raise Error("train_zimage_real b2: only the 64x64 bucket is wired")
+        elif key.h == 72 and key.w == 56:
             if valid_cap <= 224:
                 var r_72_224 = _train_one_step_bucket[72, 56, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, ctx,
                 )
                 loss = r_72_224.loss
             elif valid_cap <= 256:
                 var r_72_256 = _train_one_step_bucket[72, 56, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, ctx,
                 )
                 loss = r_72_256.loss
@@ -962,17 +1101,36 @@ def main() raises:
             if valid_cap <= 224:
                 var r_88_224 = _train_one_step_bucket[88, 48, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, ctx,
                 )
                 loss = r_88_224.loss
             elif valid_cap <= 256:
                 var r_88_256 = _train_one_step_bucket[88, 48, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, ctx,
                 )
                 loss = r_88_256.loss
+            else:
+                raise Error("train_zimage_real: caption too long for 256-token production bucket")
+        elif key.h == 64 and key.w == 64:
+            # square 512px bucket (OneTrainer alina_zimage_512 cache: 64x64
+            # latents) — same generic step at different comptime shape params.
+            if valid_cap <= 224:
+                var r_64_224 = _train_one_step_bucket[64, 64, 224](
+                    k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
+                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_cfg, train_start, ctx,
+                )
+                loss = r_64_224.loss
+            elif valid_cap <= 256:
+                var r_64_256 = _train_one_step_bucket[64, 64, 256](
+                    k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
+                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_cfg, train_start, ctx,
+                )
+                loss = r_64_256.loss
             else:
                 raise Error("train_zimage_real: caption too long for 256-token production bucket")
         else:
@@ -988,6 +1146,8 @@ def main() raises:
             )
             _ = save_zimage_lora_main_only(lora, save_path, ctx)
             var state_path = save_path + String(".state.safetensors")
+            comptime if ZIMAGE_V2_ENGINE:
+                lora_adamw_plain_device_state_sync_moments(opt_state, lora.ad, ctx)
             _ = save_zimage_lora_main_only_state(lora, state_path, ctx)
             saved_this_step = True
             print("[ZImage-lora] save_state step=", k, " path=", state_path)
@@ -998,6 +1158,8 @@ def main() raises:
                 )
                 _ = save_zimage_lora_main_only(lora, sample_path, ctx)
                 var sample_state = sample_path + String(".state.safetensors")
+                comptime if ZIMAGE_V2_ENGINE:
+                    lora_adamw_plain_device_state_sync_moments(opt_state, lora.ad, ctx)
                 _ = save_zimage_lora_main_only_state(lora, sample_state, ctx)
                 print("[ZImage-lora] save_before_sample step=", k, " path=", sample_state)
                 var request_path = _write_zimage_sample_request(
@@ -1037,6 +1199,8 @@ def main() raises:
         var lora_out = zimage_output_lora_path_from_train_config(train_cfg, run_steps)
         _ = save_zimage_lora_main_only(lora, lora_out, ctx)
         var state_out = lora_out + String(".state.safetensors")
+        comptime if ZIMAGE_V2_ENGINE:
+            lora_adamw_plain_device_state_sync_moments(opt_state, lora.ad, ctx)
         _ = save_zimage_lora_main_only_state(lora, state_out, ctx)
         print("[ZImage-lora] save_state step=", run_steps, " path=", state_out)
     else:
@@ -1114,3 +1278,232 @@ def _patchify_target_f32[
                         var idx = c * Hh * Ww + hh * Ww + ww
                         out.append(noise_lat[idx] - lat_flat[idx])
     return out^
+
+
+# ── BATCH-2 step (OT-parity batch lever, 2026-06-11) ─────────────────────────
+# Two samples stacked along rows [2S, D]; per-sample sigma/noise/adaLN exactly
+# like OneTrainer's per-batch-element draws. Loss = mean MSE over both samples
+# (grads naturally average through the 1/(2n) factor). GATE:
+# training/zimage_batch2_parity.mojo (B2 vs 2x B1, identical draws).
+def _train_one_step_bucket_b2[
+    LAT_H_B: Int, LAT_W_B: Int, CAP_LEN_B: Int
+](
+    k: Int,
+    run_steps: Int,
+    slot0: Int,
+    slot1: Int,
+    seed0: UInt64,
+    seed1: UInt64,
+    cache: KleinCache,
+    aux: ZImageRealAux,
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    mut lora: ZImageLoraSet,
+    mut opt_state: LoraAdamWPlainDeviceState,
+    resident_dev: ZImageLoraDeviceSet,
+    n_adapters: Int,
+    final_lin_w: Tensor,
+    final_lin_b: Tensor,
+    x_pad_h: List[Float32],
+    cap_pad_h: List[Float32],
+    train_cfg: TrainConfig,
+    train_start_ns: UInt,
+    ctx: DeviceContext,
+) raises -> StepResult:
+    comptime HT_B = LAT_H_B // PATCH
+    comptime WT_B = LAT_W_B // PATCH
+    comptime N_IMG_REAL_B = HT_B * WT_B
+    comptime IMG_PAD_B = (32 - (N_IMG_REAL_B % 32)) % 32
+    comptime N_IMG_B = N_IMG_REAL_B + IMG_PAD_B
+    comptime N_TXT_B = CAP_LEN_B
+    comptime S_B = N_IMG_B + N_TXT_B
+
+    var t0 = perf_counter_ns()
+
+    # ── per-sample data prep ──────────────────────────────────────────────────
+    var s0 = cache.load(slot0, ctx)
+    var s1 = cache.load(slot1, ctx)
+    var lsh0 = s0.latent.shape()
+    var lsh1 = s1.latent.shape()
+    if (
+        lsh0[1] != LAT_C or lsh0[2] != LAT_H_B or lsh0[3] != LAT_W_B
+        or lsh1[1] != LAT_C or lsh1[2] != LAT_H_B or lsh1[3] != LAT_W_B
+    ):
+        raise Error("train_zimage_real b2: sample in wrong latent bucket")
+    var valid_cap0 = _valid_cap_from_mask(s0.text_mask, ctx)
+    var valid_cap1 = _valid_cap_from_mask(s1.text_mask, ctx)
+    if (
+        valid_cap0 <= 0 or valid_cap0 > CAP_LEN_B
+        or valid_cap1 <= 0 or valid_cap1 > CAP_LEN_B
+    ):
+        raise Error("train_zimage_real b2: sample in wrong text bucket")
+
+    var sigma0 = sample_timestep_logit_normal(SEED_BASE + seed0, TIMESTEP_SHIFT)
+    var sigma1 = sample_timestep_logit_normal(SEED_BASE + seed1, TIMESTEP_SHIFT)
+    var sigma_idx0 = Int(sigma0 * Float32(NUM_TRAIN_TIMESTEPS))
+    var sigma_idx1 = Int(sigma1 * Float32(NUM_TRAIN_TIMESTEPS))
+    if sigma_idx0 > NUM_TRAIN_TIMESTEPS - 1:
+        sigma_idx0 = NUM_TRAIN_TIMESTEPS - 1
+    if sigma_idx1 > NUM_TRAIN_TIMESTEPS - 1:
+        sigma_idx1 = NUM_TRAIN_TIMESTEPS - 1
+    var sig0 = Float32(sigma_idx0 + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+    var sig1 = Float32(sigma_idx1 + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+    var t_value0 = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx0) / Float32(NUM_TRAIN_TIMESTEPS)
+    var t_value1 = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx1) / Float32(NUM_TRAIN_TIMESTEPS)
+
+    var noise0 = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + seed0)
+    var noise1 = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + seed1)
+    var li0 = _build_latent_step_inputs[LAT_H_B, LAT_W_B](s0.latent, noise0, sig0, ctx)
+    var li1 = _build_latent_step_inputs[LAT_H_B, LAT_W_B](s1.latent, noise1, sig1, ctx)
+
+    var x_t0 = build_x_seq(aux, li0.noisy_latent, LAT_C, LAT_H_B, LAT_W_B, PATCH, ctx)
+    var x_t1 = build_x_seq(aux, li1.noisy_latent, LAT_C, LAT_H_B, LAT_W_B, PATCH, ctx)
+    for _pad in range(IMG_PAD_B):
+        for c in range(D):
+            x_t0.append(x_pad_h[c])
+            x_t1.append(x_pad_h[c])
+
+    var cap2_0 = _cap_tensor_from_cache[CAP_LEN_B](s0.text_embedding, valid_cap0, ctx)
+    var cap2_1 = _cap_tensor_from_cache[CAP_LEN_B](s1.text_embedding, valid_cap1, ctx)
+    var cap_seq0 = build_cap_seq(aux, cap2_0, EPS, ctx)
+    var cap_seq1 = build_cap_seq(aux, cap2_1, EPS, ctx)
+    for r in range(valid_cap0, CAP_LEN_B):
+        for c in range(D):
+            cap_seq0[r * D + c] = cap_pad_h[c]
+    for r in range(valid_cap1, CAP_LEN_B):
+        for c in range(D):
+            cap_seq1[r * D + c] = cap_pad_h[c]
+
+    # positions/rope: x table shared; cap + uni tables per sample; the batched
+    # uni table = rope over the CONCATENATED per-sample position lists.
+    var pos0 = build_positions(N_IMG_B, HT_B, WT_B, CAP_LEN_B, valid_cap0)
+    var pos1 = build_positions(N_IMG_B, HT_B, WT_B, CAP_LEN_B, valid_cap1)
+    var x_pos = pos0[0].copy()
+    var cap_pos0 = pos0[1].copy()
+    var cap_pos1 = pos1[1].copy()
+    var uni2_pos = List[List[Int]]()
+    for i in range(len(x_pos)):
+        uni2_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos0)):
+        uni2_pos.append(cap_pos0[i].copy())
+    for i in range(len(x_pos)):
+        uni2_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos1)):
+        uni2_pos.append(cap_pos1[i].copy())
+    var xr = build_rope(x_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var x_cos = xr[0].copy(); var x_sin = xr[1].copy()
+    var cr0 = build_rope(cap_pos0, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cr1 = build_rope(cap_pos1, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var ur2 = build_rope(uni2_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var uni_cos2 = ur2[0].copy(); var uni_sin2 = ur2[1].copy()
+
+    # per-sample adaLN
+    var adaln0 = build_adaln(aux, t_value0, ADALN_DIM, T_SCALE, ctx)
+    var adaln1 = build_adaln(aux, t_value1, ADALN_DIM, T_SCALE, ctx)
+    var nr_mod0 = List[ZImageModVecs]()
+    var nr_mod1 = List[ZImageModVecs]()
+    for i in range(NUM_NR):
+        nr_mod0.append(build_block_modvecs(aux.nr_mod_w[i][], aux.nr_mod_b[i][], adaln0, D, ctx))
+        nr_mod1.append(build_block_modvecs(aux.nr_mod_w[i][], aux.nr_mod_b[i][], adaln1, D, ctx))
+    var main_mod_b2 = List[ZImageModVecsDevice]()
+    for i in range(MAIN_DEPTH):
+        var m0 = build_block_modvecs(aux.main_mod_w[i][], aux.main_mod_b[i][], adaln0, D, ctx)
+        var m1 = build_block_modvecs(aux.main_mod_w[i][], aux.main_mod_b[i][], adaln1, D, ctx)
+        main_mod_b2.append(zimage_modvecs_pack2_to_device(m0, m1, D, ctx))
+    var f_scale0 = build_f_scale(aux, adaln0, D, ctx)
+    var f_scale2 = f_scale0.copy()
+    var f_scale1 = build_f_scale(aux, adaln1, D, ctx)
+    for i in range(D):
+        f_scale2.append(f_scale1[i])
+    var t_prep = perf_counter_ns()
+
+    var lora_dev: ZImageLoraDeviceSet
+    comptime if ZIMAGE_V2_ENGINE:
+        lora_dev = resident_dev.copy()
+    else:
+        lora_dev = zimage_lora_set_to_device(lora, ctx)
+    var t_lora = perf_counter_ns()
+
+    var fwd = zimage_stack_lora_forward_main_device_b2[H, Dh, N_IMG_B, N_TXT_B, S_B](
+        x_t0.copy(), cap_seq0.copy(), x_t1.copy(), cap_seq1.copy(),
+        nr_blocks, nr_mod0, nr_mod1, cr_blocks, main_blocks, main_mod_b2, lora_dev,
+        f_scale2.copy(), final_lin_w, final_lin_b,
+        x_cos[], x_sin[], cr0[0][], cr0[1][], cr1[0][], cr1[1][],
+        uni_cos2[], uni_sin2[],
+        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+    )
+    var t_fwd = perf_counter_ns()
+
+    # ── batch loss: mean MSE over BOTH samples' real outputs ─────────────────
+    var tgt0 = li0.target_patch.copy()
+    var tgt1 = li1.target_patch.copy()
+    var real_nout = len(tgt0)
+    var inv_n = Float32(1.0) / Float32(real_nout)   # = 2/(2*real_nout)
+    var sse = 0.0
+    var d_loss0 = List[Float32]()
+    var d_loss1 = List[Float32]()
+    for i in range(real_nout):
+        var pred = -fwd.out0[i]
+        var diff = pred - tgt0[i]
+        sse += Float64(diff) * Float64(diff)
+        d_loss0.append(-inv_n * diff)
+    for i in range(real_nout):
+        var pred = -fwd.out1[i]
+        var diff = pred - tgt1[i]
+        sse += Float64(diff) * Float64(diff)
+        d_loss1.append(-inv_n * diff)
+    var seq_nout = len(fwd.out0)
+    for _i in range(real_nout, seq_nout):
+        d_loss0.append(Float32(0.0))
+        d_loss1.append(Float32(0.0))
+    var loss = Float32(sse / Float64(2 * real_nout))
+    var t_loss = perf_counter_ns()
+
+    var grads = zimage_stack_lora_backward_main_device_b2[H, Dh, N_IMG_B, N_TXT_B, S_B](
+        d_loss0, d_loss1, main_blocks, main_mod_b2, lora_dev,
+        f_scale2.copy(), final_lin_w,
+        uni_cos2[], uni_sin2[], fwd,
+        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+    )
+    var t_bwd = perf_counter_ns()
+
+    var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
+    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    comptime if ZIMAGE_V2_ENGINE:
+        fused_lora_adamw_plain_step_resident(
+            opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+            train_cfg.weight_decay, ctx,
+        )
+    else:
+        zimage_lora_adamw_step_main_only(
+            lora, grads, k, step_lr, ctx,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+        )
+    var t_opt = perf_counter_ns()
+
+    var t1 = perf_counter_ns()
+    var secs = Float64(t1 - t0) / 1.0e9
+    var b_absum = Float32(0.0)
+    var b_nonzero = 0
+    for i in range(TRAIN_ADAPTER_START, n_adapters):
+        var bs2 = _absum(lora.ad[i].b)
+        b_absum += bs2
+        if bs2 > 0.0:
+            b_nonzero += 1
+    print_trainer_progress(
+        String("ZImage-lora-b2"), k, run_steps, 1,
+        loss, Float64(gn_before), secs, 0.0,
+        Float64(t1 - train_start_ns) / 1.0e9,
+    )
+    if grads.nonfinite_lora_grads != 0:
+        print("[ZImage-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
+    print("[TIMING-B2 step=", k,
+          "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
+          " lora_upload=", Float32(Float64(t_lora - t_prep) / 1.0e9),
+          " fwd=", Float32(Float64(t_fwd - t_lora) / 1.0e9),
+          " loss=", Float32(Float64(t_loss - t_fwd) / 1.0e9),
+          " bwd=", Float32(Float64(t_bwd - t_loss) / 1.0e9),
+          " opt=", Float32(Float64(t_opt - t_bwd) / 1.0e9))
+    return StepResult(loss, Float32(gn_before), Float32(secs), b_absum, b_nonzero, grads.nonfinite_lora_grads)

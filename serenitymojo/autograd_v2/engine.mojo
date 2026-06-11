@@ -39,6 +39,44 @@ from serenitymojo.ops.rope_struct_backward import (
 )
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, swiglu_backward_slab
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
+
+# ── P6 Klein imports: the apply_klein arms call the Klein hand-chain's OWN
+# backward helpers / inline op sequence verbatim (file:line cited per arm).
+from serenitymojo.ops.norm_backward import layer_norm_backward_dx
+from serenitymojo.ops.linalg_backward import (
+    linear_backward_dx_scratch,
+    linear_backward_dx_split_scratch,
+)
+from serenitymojo.ops.attention_backward import sdpa_backward_scratch
+from serenitymojo.ops.tensor_algebra import (
+    add as _ta_add_klein,
+    slice as _ta_slice_klein,
+    reshape as _ta_reshape_klein,
+    reshape_owned as _ta_reshape_owned_klein,
+    reshape_in_place as _ta_reshape_in_place_klein,
+    add_in_place_f32 as _ta_add_in_place_f32_klein,
+)
+from serenitymojo.ops.tensor_algebra_scratch import (
+    concat2_scratch,
+    concat3_scratch,
+    slice_scratch,
+)
+from serenitymojo.ops.tensor_algebra import concat as _ta_concat_klein
+from serenitymojo.scratch_ring import ScratchRingAllocator
+from serenitymojo.models.klein.double_block import (
+    StreamSaved,
+    StreamWeights,
+    ModVecsDevice,
+    StreamLoraDevice,
+    _stream_pre_backward_lora_resident_scratch_tensors,
+    _stream_post_backward_lora_resident_scratch_tensors,
+)
+from serenitymojo.models.klein.single_block import (
+    LoraDropout,
+    _klein_lora_bwd_dropout_tensors,
+)
+from serenitymojo.models.klein.lora_block import LoraAdapterDevice
+from std.collections import Optional
 from serenitymojo.autograd_v2.node import (
     Edge,
     Node,
@@ -56,6 +94,12 @@ from serenitymojo.autograd_v2.node import (
     OPK_SWIGLU,
     OPK_RESIDUAL_GATE_DXDY,
     OPK_RESHAPE,
+    OPK_KLEIN_DBL_PRE,
+    OPK_KLEIN_DBL_JOINT,
+    OPK_KLEIN_DBL_POST,
+    OPK_KLEIN_SGL_IN,
+    OPK_KLEIN_SGL_SDPA,
+    OPK_KLEIN_SGL_OUT,
     _raw_add,
     _raw_add_slab,
     _raw_mul,
@@ -625,6 +669,463 @@ def execute_slab(
     if fired != reachable:
         raise Error(
             String("execute: fired=")
+            + String(fired)
+            + " != reachable="
+            + String(reachable)
+            + " (dep-count exactness violated)"
+        )
+    return result^
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P6 Klein variants (AUTOGRAD_V2_MOJO_DESIGN.md P6): apply_klein/execute_klein
+# follow the apply/execute_slab precedent above — the IDENTICAL engine
+# algorithm with (a) the Klein composite-node arms (each arm = the Klein
+# hand-chain's own backward helper / inline op sequence, file:line cited),
+# (b) a threaded ScratchRingAllocator (the Klein oracle backward runs through
+# the trainer's scratch_bwd ring; "preserve whatever the oracle does"), and
+# (c) MULTI-ROOT seeding (the double block has TWO outputs, img_out+txt_out,
+# each with its own caller grad — the engine.rs:335-393 outputs-as-descendants
+# seeding generalized to a root list: bump ALL root deps first, then
+# decrement-and-maybe-enqueue each).
+#
+# comptime [H, Dh, S]: sdpa_backward_scratch is comptime-[B,S,H,Dh]
+# specialized and Klein's S=1536 bucket is fixed by the trainer comptime, so
+# the Klein engine entry is comptime-bucketed like the trainer itself
+# (the design-doc "trainers are comptime-bucketed" hazard note); runtime
+# N_TXT/N_IMG/D/F dims ride in node.saved_meta.
+#
+# No StepSlab and no CUDA capture for Klein in P6 (scope decision: the
+# block-swap copy stream makes capture a separate workstream; the scratch
+# rings keep doing what they do).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _req_arc(o: Optional[TArc], name: String) raises -> TArc:
+    """Unwrap a grad Optional the Klein helpers ALWAYS populate when the
+    adapter is present (the record wrappers require every adapter)."""
+    if o:
+        return o.value().copy()
+    raise Error(String("apply_klein: missing LoRA grad tensor: ") + name)
+
+
+def apply_klein[
+    H: Int, Dh: Int, S: Int
+](
+    node: Node, grads_in: List[TArc], ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> List[TArc]:
+    """Kind-dispatched backward for the Klein P6 vocabulary (+ OPK_SWIGLU,
+    which the single block shares with zimage — same swiglu_backward call,
+    models/klein/single_block.mojo:1404). Non-Klein kinds raise (fail loud:
+    the Klein graphs record only these kinds)."""
+    if node.kind == OPK_KLEIN_DBL_PRE:
+        # Arm = _stream_pre_backward_lora_resident_scratch_tensors[H,Dh]
+        # (models/klein/double_block.mojo:2071-2136), compute_aux_grads=False,
+        # default (p==0) dropout — the EXACT call double_block_lora_backward_
+        # device_resident_scratch_tensors makes (:2339-2346). Unused struct
+        # fields are placeholders (refcount copies, never read by the helper:
+        # it reads sv.{x,ln1,norm,q_pre,k_pre}, w.{wqkv,q_norm,k_norm},
+        # mv.scale1, lo.{q,k,v}).
+        var N = node.saved_meta[0]
+        var D = node.saved_meta[1]
+        var rank = node.saved_meta[2]
+        var eps = node.scalars[0]
+        var ph = node.saved[0].copy()
+        var sv = StreamSaved(
+            node.saved[0].copy(), node.saved[1].copy(), node.saved[2].copy(),
+            node.saved[3].copy(), node.saved[4].copy(),
+            ph.copy(), ph.copy(), ph.copy(), ph.copy(), ph.copy(), ph.copy(),
+            ph.copy(), ph.copy(), ph.copy(), ph.copy(), ph.copy(),
+        )
+        var ph_w = node.saved[5].copy()
+        var w = StreamWeights(
+            node.saved[5].copy(), ph_w.copy(), ph_w.copy(), ph_w.copy(),
+            node.saved[6].copy(), node.saved[7].copy(),
+        )
+        var ph_v = node.saved[8].copy()
+        var mv = ModVecsDevice(
+            ph_v.copy(), node.saved[8].copy(), ph_v.copy(),
+            ph_v.copy(), ph_v.copy(), ph_v.copy(),
+        )
+        var lo = StreamLoraDevice(
+            Optional[LoraAdapterDevice](LoraAdapterDevice(
+                node.saved[10].copy(), node.saved[11].copy(),
+                rank, D, D, node.scalars[1])),
+            Optional[LoraAdapterDevice](LoraAdapterDevice(
+                node.saved[12].copy(), node.saved[13].copy(),
+                rank, D, D, node.scalars[2])),
+            Optional[LoraAdapterDevice](LoraAdapterDevice(
+                node.saved[14].copy(), node.saved[15].copy(),
+                rank, D, D, node.scalars[3])),
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+        )
+        var r = _stream_pre_backward_lora_resident_scratch_tensors[H, Dh](
+            grads_in[0][], grads_in[1][], grads_in[2][],
+            w, mv, lo, sv, N, D, eps, node.saved[9][], ctx, scratch,
+            compute_aux_grads=False,
+        )
+        var out = List[TArc]()
+        out.append(r.d_x.copy())
+        out.append(_req_arc(r.q_d_a, String("dbl q_d_a")))
+        out.append(_req_arc(r.q_d_b, String("dbl q_d_b")))
+        out.append(_req_arc(r.k_d_a, String("dbl k_d_a")))
+        out.append(_req_arc(r.k_d_b, String("dbl k_d_b")))
+        out.append(_req_arc(r.v_d_a, String("dbl v_d_a")))
+        out.append(_req_arc(r.v_d_b, String("dbl v_d_b")))
+        return out^
+    elif node.kind == OPK_KLEIN_DBL_JOINT:
+        # Arm = the oracle's joint backward block, double_block_lora_backward_
+        # device_resident_scratch_tensors (models/klein/double_block.mojo:
+        # 2319-2337): reshape per-stream d_att to 4-D, concat2_scratch (txt
+        # FIRST), sdpa_backward_scratch, rope_backward x2, slice_scratch x6
+        # (txt then img per q/k/v), reshape_in_place on the v slices.
+        # saved [q_rope, k_rope, v_joint, cos, sin]; meta [N_TXT, N_IMG, D];
+        # scalars [scale]. grads_in: 0=d_txt_att [N_TXT,D], 1=d_img_att.
+        var N_TXT = node.saved_meta[0]
+        var N_IMG = node.saved_meta[1]
+        var D = node.saved_meta[2]
+        var scale = node.scalars[0]
+        var d_tatt_4d = _ta_reshape_klein(grads_in[0][], [1, N_TXT, H, Dh], ctx)
+        var d_iatt_4d = _ta_reshape_klein(grads_in[1][], [1, N_IMG, H, Dh], ctx)
+        var d_att_joint = concat2_scratch(1, ctx, scratch, d_tatt_4d, d_iatt_4d)
+
+        var sb = sdpa_backward_scratch[1, S, H, Dh](
+            node.saved[0][], node.saved[1][], node.saved[2][],
+            d_att_joint, scale, ctx, scratch,
+        )
+
+        var d_q_joint = rope_backward(sb.d_q, node.saved[3][], node.saved[4][], True, ctx)
+        var d_k_joint = rope_backward(sb.d_k, node.saved[3][], node.saved[4][], True, ctx)
+
+        var d_txt_q = slice_scratch(d_q_joint, 1, 0, N_TXT, ctx, scratch)
+        var d_img_q = slice_scratch(d_q_joint, 1, N_TXT, N_IMG, ctx, scratch)
+        var d_txt_k = slice_scratch(d_k_joint, 1, 0, N_TXT, ctx, scratch)
+        var d_img_k = slice_scratch(d_k_joint, 1, N_TXT, N_IMG, ctx, scratch)
+        var d_txt_v = slice_scratch(sb.d_v, 1, 0, N_TXT, ctx, scratch)
+        var d_img_v = slice_scratch(sb.d_v, 1, N_TXT, N_IMG, ctx, scratch)
+        _ta_reshape_in_place_klein(d_img_v, [N_IMG, D])
+        _ta_reshape_in_place_klein(d_txt_v, [N_TXT, D])
+
+        # Edge order [tq, iq, tk, ik, tv, iv] — grads routed accordingly. The
+        # slices are SCRATCH-RESIDENT views consumed by the PRE arms before the
+        # block-level rewind (klein_block_graph rewinds AFTER execute returns),
+        # exactly the oracle's lifetime pattern.
+        var out = List[TArc]()
+        out.append(TArc(d_txt_q^))
+        out.append(TArc(d_img_q^))
+        out.append(TArc(d_txt_k^))
+        out.append(TArc(d_img_k^))
+        out.append(TArc(d_txt_v^))
+        out.append(TArc(d_img_v^))
+        return out^
+    elif node.kind == OPK_KLEIN_DBL_POST:
+        # Arm = _stream_post_backward_lora_resident_scratch_tensors
+        # (models/klein/double_block.mojo:1781-1875), compute_aux_grads=False —
+        # the EXACT call the oracle backward makes (:2310-2317). The helper
+        # reads sv.{act,gate,up,mlp_in,ln2,attn_res}, w.{wproj,wgu,wd},
+        # mv.{gate1,scale2,gate2}, lo.{out,ff_in,ff_out}; x/att ride as args.
+        var N = node.saved_meta[0]
+        var D = node.saved_meta[1]
+        var F = node.saved_meta[2]
+        var rank = node.saved_meta[3]
+        var eps = node.scalars[0]
+        var ph = node.saved[0].copy()
+        var sv = StreamSaved(
+            node.saved[0].copy(), ph.copy(), ph.copy(), ph.copy(), ph.copy(),
+            ph.copy(), ph.copy(), ph.copy(),
+            node.saved[1].copy(), node.saved[2].copy(), node.saved[3].copy(),
+            node.saved[4].copy(), ph.copy(), node.saved[5].copy(),
+            node.saved[6].copy(), node.saved[7].copy(),
+        )
+        var ph_w = node.saved[8].copy()
+        var w = StreamWeights(
+            ph_w.copy(), node.saved[8].copy(), node.saved[9].copy(),
+            node.saved[10].copy(), ph_w.copy(), ph_w.copy(),
+        )
+        var ph_v = node.saved[11].copy()
+        var mv = ModVecsDevice(
+            ph_v.copy(), ph_v.copy(), node.saved[11].copy(),
+            ph_v.copy(), node.saved[12].copy(), node.saved[13].copy(),
+        )
+        var lo = StreamLoraDevice(
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](None),
+            Optional[LoraAdapterDevice](LoraAdapterDevice(
+                node.saved[15].copy(), node.saved[16].copy(),
+                rank, D, D, node.scalars[1])),
+            Optional[LoraAdapterDevice](LoraAdapterDevice(
+                node.saved[17].copy(), node.saved[18].copy(),
+                rank, D, 2 * F, node.scalars[2])),
+            Optional[LoraAdapterDevice](LoraAdapterDevice(
+                node.saved[19].copy(), node.saved[20].copy(),
+                rank, F, D, node.scalars[3])),
+        )
+        var r = _stream_post_backward_lora_resident_scratch_tensors(
+            grads_in[0], node.saved[0], node.saved[1],
+            w, mv, lo, sv, N, D, F, eps, node.saved[14][], ctx, scratch,
+            compute_aux_grads=False,
+        )
+        var out = List[TArc]()
+        out.append(r.d_x.copy())
+        out.append(r.d_att.copy())
+        out.append(_req_arc(r.out_d_a, String("dbl out_d_a")))
+        out.append(_req_arc(r.out_d_b, String("dbl out_d_b")))
+        out.append(_req_arc(r.ff_in_d_a, String("dbl ff_in_d_a")))
+        out.append(_req_arc(r.ff_in_d_b, String("dbl ff_in_d_b")))
+        out.append(_req_arc(r.ff_out_d_a, String("dbl ff_out_d_a")))
+        out.append(_req_arc(r.ff_out_d_b, String("dbl ff_out_d_b")))
+        return out^
+    elif node.kind == OPK_KLEIN_SGL_IN:
+        # Arm = the IN segment of single_block_lora_backward_device_resident_
+        # scratch_tensors (models/klein/single_block.mojo:1414-1445),
+        # compute_aux_grads=False: rms_norm_backward_dx x2, reshape_owned,
+        # concat3_scratch(reverse=True) d_qkv, concat2_scratch d_gate_up,
+        # linear_backward_dx_split_scratch, concat d_fused,
+        # _klein_lora_bwd_dropout_tensors (p==0), add fold, modulate_backward
+        # (aux off), layer_norm_backward_dx — same ops, same order, same fold.
+        # grads_in: 0=d_q_rms [1,S,H,Dh], 1=d_k_rms, 2=d_v [S,D],
+        # 3=d_mlp_gate [S,F], 4=d_mlp_up [S,F].
+        var S_rows = node.saved_meta[0]
+        var D = node.saved_meta[1]
+        var F = node.saved_meta[2]
+        var rank = node.saved_meta[3]
+        var eps = node.scalars[0]
+        var d_q_pre_t = rms_norm_backward_dx(
+            grads_in[0][], node.saved[3][], node.saved[6][], eps, ctx
+        )
+        var d_k_pre_t = rms_norm_backward_dx(
+            grads_in[1][], node.saved[4][], node.saved[7][], eps, ctx
+        )
+        var d_q_pre_flat = _ta_reshape_owned_klein(d_q_pre_t^, [S_rows, D])
+        var d_k_pre_flat = _ta_reshape_owned_klein(d_k_pre_t^, [S_rows, D])
+        var d_qkv = concat3_scratch(
+            1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, grads_in[2][], True
+        )
+        # d_gate_up = concat of the swiglu grads (the oracle concats
+        # sgb.d_gate/sgb.d_up at :1405; here they arrive routed from the
+        # OPK_SWIGLU node — same tensors, same concat2_scratch call).
+        var d_gate_up = concat2_scratch(1, ctx, scratch, grads_in[3][], grads_in[4][])
+
+        var d_norm_t = linear_backward_dx_split_scratch(
+            d_qkv, d_gate_up, node.saved[5][], S_rows, D, 3 * D, 2 * F, ctx, scratch,
+        )
+
+        var d_fused = _ta_concat_klein(1, ctx, d_qkv, d_gate_up)
+        var lo_qkv = LoraAdapterDevice(
+            node.saved[10].copy(), node.saved[11].copy(),
+            rank, D, 3 * D + 2 * F, node.scalars[1],
+        )
+        var lg = _klein_lora_bwd_dropout_tensors(
+            d_fused, node.saved[2][], lo_qkv, S_rows, LoraDropout(), ctx
+        )
+        d_norm_t = _ta_add_klein(d_norm_t, lg.d_x[], ctx)
+
+        var mb = modulate_backward(
+            d_norm_t, node.saved[1][], node.saved[8][], ctx,
+            compute_param_grads=False,
+        )
+        var d_x_norm_t = layer_norm_backward_dx(
+            mb.d_x, node.saved[0][], node.saved[9][], eps, ctx
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_x_norm_t^))
+        out.append(lg.d_a.copy())
+        out.append(lg.d_b.copy())
+        return out^
+    elif node.kind == OPK_KLEIN_SGL_SDPA:
+        # Arm = the sdpa segment of the single oracle (models/klein/
+        # single_block.mojo:1402-1412): d_att reshaped [1,S,H,Dh] (byte view,
+        # the oracle's reshape_in_place), sdpa_backward_scratch,
+        # rope_backward x2, d_v reshaped [S,D] (the oracle's :1419
+        # reshape_in_place). saved [q_rope, k_rope, v, cos, sin].
+        var S_rows = node.saved_meta[0]
+        var D = node.saved_meta[1]
+        var scale = node.scalars[0]
+        var d_att4 = arc_view_reshaped(grads_in[0][], [1, S_rows, H, Dh])
+        var sb = sdpa_backward_scratch[1, S, H, Dh](
+            node.saved[0][], node.saved[1][], node.saved[2][],
+            d_att4[], scale, ctx, scratch,
+        )
+        var d_q_rms = rope_backward(sb.d_q, node.saved[3][], node.saved[4][], True, ctx)
+        var d_k_rms = rope_backward(sb.d_k, node.saved[3][], node.saved[4][], True, ctx)
+        _ta_reshape_in_place_klein(sb.d_v, [S_rows, D])
+        var out = List[TArc]()
+        out.append(TArc(d_q_rms^))
+        out.append(TArc(d_k_rms^))
+        out.append(arc_view(sb.d_v))
+        return out^
+    elif node.kind == OPK_KLEIN_SGL_OUT:
+        # Arm = the OUT segment of the single oracle (models/klein/
+        # single_block.mojo:1364-1400), compute_aux_grads=False:
+        # gate_residual_backward_dxdy (gate vec raw — Klein gates are NOT
+        # tanh'd), linear_backward_dx_scratch vs w2_att and w2_mlp,
+        # _klein_lora_bwd_dropout_tensors on out_in, add_in_place_f32 of the
+        # LoRA d_x column slices into d_att/d_mlp. saved [out_in, w2_att,
+        # w2_mlp, gate_vec, out_a, out_b].
+        var S_rows = node.saved_meta[0]
+        var D = node.saved_meta[1]
+        var F = node.saved_meta[2]
+        var rank = node.saved_meta[3]
+        var grg = gate_residual_backward_dxdy(grads_in[0][], node.saved[3][], ctx)
+        var d_att = linear_backward_dx_scratch(
+            grg.d_y, node.saved[1][], S_rows, D, D, ctx, scratch,
+        )
+        var d_mlp = linear_backward_dx_scratch(
+            grg.d_y, node.saved[2][], S_rows, F, D, ctx, scratch,
+        )
+        var lo_out = LoraAdapterDevice(
+            node.saved[4].copy(), node.saved[5].copy(),
+            rank, D + F, D, node.scalars[0],
+        )
+        var lg2 = _klein_lora_bwd_dropout_tensors(
+            grg.d_y, node.saved[0][], lo_out, S_rows, LoraDropout(), ctx
+        )
+        _ta_add_in_place_f32_klein(d_att, _ta_slice_klein(lg2.d_x[], 1, 0, D, ctx), ctx)
+        _ta_add_in_place_f32_klein(d_mlp, _ta_slice_klein(lg2.d_x[], 1, D, F, ctx), ctx)
+        var out = List[TArc]()
+        out.append(arc_view(grg.d_x))
+        out.append(TArc(d_att^))
+        out.append(TArc(d_mlp^))
+        out.append(lg2.d_a.copy())
+        out.append(lg2.d_b.copy())
+        return out^
+    elif node.kind == OPK_SWIGLU:
+        # Shared with zimage: swiglu_backward(g, gate, up) — the single
+        # block's exact call (models/klein/single_block.mojo:1404).
+        var sg = swiglu_backward(grads_in[0][], node.saved[0][], node.saved[1][], ctx)
+        var out = List[TArc]()
+        out.append(arc_view(sg.d_gate))
+        out.append(arc_view(sg.d_up))
+        return out^
+    elif node.kind == OPK_LEAF:
+        raise Error("apply_klein: OPK_LEAF is sunk by the engine, never dispatched")
+    raise Error(
+        String("apply_klein: kind ")
+        + String(node.kind)
+        + " is not in the Klein P6 vocabulary"
+    )
+
+
+def execute_klein[
+    H: Int, Dh: Int, S: Int
+](
+    mut graph: Graph, roots: List[Int], root_grads: List[TArc],
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> Dict[Int, TArc]:
+    """Klein variant of `execute` (this file :275) — identical engine
+    algorithm (dep-count BFS, slot-ordered buffers, ready-queue order, arity
+    checks, fired==reachable invariant) with MULTI-ROOT seeding and
+    apply_klein dispatch. Seeding follows the flame outputs-as-descendants
+    fix generalized to N roots: every root's buffer takes its caller grad in
+    the reserved seed slot, ALL root dep counts are bumped first, then each is
+    decremented-and-maybe-enqueued (engine.rs:335-393)."""
+    var n = len(graph.nodes)
+    if len(roots) == 0 or len(roots) != len(root_grads):
+        raise Error("execute_klein: roots/root_grads length mismatch or empty")
+    for i in range(len(roots)):
+        if roots[i] < 0 or roots[i] >= n:
+            raise Error("execute_klein: root node out of range")
+
+    # ── Step 1: dep-count BFS over edges from ALL roots (engine.rs:230-277).
+    var dep = List[Int]()
+    var seen = List[Bool]()
+    var in_queue = List[Bool]()
+    for _ in range(n):
+        dep.append(0)
+        seen.append(False)
+        in_queue.append(False)
+    var stack = List[Int]()
+    for i in range(len(roots)):
+        stack.append(roots[i])
+    var reachable = 0
+    while len(stack) > 0:
+        var nid = stack.pop()
+        if seen[nid]:
+            continue
+        seen[nid] = True
+        reachable += 1
+        for i in range(len(graph.nodes[nid].edges)):
+            var child = graph.nodes[nid].edges[i].node_idx
+            if child >= 0:
+                dep[child] += 1  # engine.rs:268-270
+                stack.append(child)
+
+    # ── Step 2: per-node InputBuffers + seed every root (engine.rs:282-393).
+    var buffers = List[InputBuffer]()
+    for i in range(n):
+        buffers.append(InputBuffer(graph.nodes[i].contrib_counts, root_grads[0].copy()))
+
+    for i in range(len(roots)):
+        buffers[roots[i]].add(
+            0, buffers[roots[i]].seed_slot(0), root_grads[i].copy(), ctx
+        )
+
+    var ready = List[Int]()
+    for i in range(len(roots)):
+        dep[roots[i]] += 1
+    for i in range(len(roots)):
+        _dec_and_maybe_enqueue(dep, ready, in_queue, roots[i])
+
+    # ── Step 3: drive the queue (engine.rs:437-570).
+    var result = Dict[Int, TArc]()
+    var fired = 0
+    while len(ready) > 0:
+        var nid = _pop_best(ready, graph)
+        fired += 1
+
+        var num_in = graph.nodes[nid].num_inputs
+        var grads_in = List[TArc]()
+        for s in range(num_in):
+            if not buffers[nid].any_present(s):
+                raise Error(
+                    String("execute_klein: node ")
+                    + String(nid)
+                    + " fired with missing input grad in slot "
+                    + String(s)
+                )
+            grads_in.append(buffers[nid].materialize(s, ctx))
+
+        if graph.nodes[nid].kind == OPK_LEAF:
+            var pid = graph.nodes[nid].param_id
+            if result.__contains__(pid):
+                var old = result[pid]
+                var summed = _raw_add(old[], grads_in[0][], ctx)
+                result[pid] = TArc(summed^)
+            else:
+                result[pid] = grads_in[0].copy()
+            continue
+
+        var out_grads = apply_klein[H, Dh, S](graph.nodes[nid], grads_in, ctx, scratch)
+
+        # Arity check: one grad per next_edge (engine.rs:509-520).
+        var n_edges = len(graph.nodes[nid].edges)
+        if len(out_grads) != n_edges:
+            raise Error(
+                String("execute_klein: apply arity mismatch on node ")
+                + String(nid)
+                + ": expected "
+                + String(n_edges)
+                + " got "
+                + String(len(out_grads))
+            )
+
+        for s in range(n_edges):
+            var child = graph.nodes[nid].edges[s].node_idx
+            if child < 0:
+                continue  # null edge: drop the grad (engine.rs:532-535)
+            var slot = graph.nodes[nid].edges[s].input_nr
+            var cslot = graph.nodes[nid].edges[s].contrib_slot
+            buffers[child].add(slot, cslot, out_grads[s].copy(), ctx)
+            _dec_and_maybe_enqueue(dep, ready, in_queue, child)
+
+    if fired != reachable:
+        raise Error(
+            String("execute_klein: fired=")
             + String(fired)
             + " != reachable="
             + String(reachable)

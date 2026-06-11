@@ -67,6 +67,7 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_backward_resident_moddev_rope,
     klein_stack_lora_backward_resident_moddev_rope_scratch,
     klein_stack_lora_backward_offload_turbo_moddev_rope_scratch,
+    klein_stack_lora_backward_graph,
     klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch,
     klein_lora_adamw_step, save_klein_lora, load_klein_lora_resume,
     save_klein_lora_state, load_klein_lora_state, save_klein_lora_ema,
@@ -142,6 +143,16 @@ comptime TArc = ArcPointer[Tensor]
 # (no per-step set upload, no per-step P/M/V round trip). Bit-identical
 # math (same kernel, same SR stream). False = previous per-step path.
 comptime KLEIN_V2_ENGINE = True
+# P6 GRAPH SWAP (AUTOGRAD_V2_MOJO_DESIGN.md P6): the per-block recompute +
+# hand-chain backward pair is driven by the autograd_v2 graph engine
+# (klein_stack_lora_backward_graph — same conductor loop, same scratch rings,
+# per-block mini-graphs whose arms call the hand-chain's own backward
+# helpers; SAME-PROCESS bit gate: autograd_v2/tests/klein_block_parity.mojo).
+# Only active when KLEIN_V2_ENGINE is also True, and only on the resident
+# (non-offloaded-tape) path; the CPU_OFFLOADED activation-tape path keeps the
+# hand-chain. False = previous hand-chain path (C13 gate-don't-delete).
+comptime KLEIN_V2_GRAPH = True
+comptime KLEIN_V2_GRAPH_PATH = KLEIN_V2_ENGINE and KLEIN_V2_GRAPH
 
 from serenitymojo.training.lora_adamw_ot_fused import (
     LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
@@ -1181,12 +1192,23 @@ def main() raises:
             if runtime_profile:
                 print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
             t_bwd0 = perf_counter_ns()
-            g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
-                lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
-                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
-                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
-                cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
-            )
+            comptime if KLEIN_V2_GRAPH_PATH:
+                # P6: per-block graph-engine backward (same conductor loop,
+                # same scratch ring, same arg list — drop-in for the
+                # hand-chain call below; bit gate = klein_block_parity).
+                g = klein_stack_lora_backward_graph[H, Dh, N_IMG, N_TXT, S](
+                    lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
+                    loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                )
+            else:
+                g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
+                    lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
+                    loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                )
         var t_bwd1 = perf_counter_ns()
         if runtime_profile:
             print(

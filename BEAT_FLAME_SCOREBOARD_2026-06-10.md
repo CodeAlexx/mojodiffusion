@@ -28,7 +28,7 @@ v1 roadmap before promising native.
 | GEMM FFN 1024x1280x5120 bf16 | 206.9 µs (64.9 TFLOP/s) | same | **TIED** |
 | SDPA [1,1024,16,64] bf16 | 1506 µs (flash path) | cuDNN ~83–160 µs (audit 05-30) | **FLAME** ~10–18× |
 | SDPA [1,1024,16,128] bf16 | 2426 µs (math fallback, sm_86 MMA ceiling) | cuDNN | **FLAME** ~15–30× |
-| Klein-9B LoRA, PER SAMPLE 512px | **2.5-2.6 s** (06-11 session 3: resident-set; was 12.8 s on 06-06) | OneTrainer **1.49 s/sample VERIFIED 06-11** (88-step live run, 2.98 s/it @ batch 2, bf16 unquantized, 70% async layer-offload, 10.4 GiB); flame ~1.15 (May h2h ÷2 if batch-2) | **OT ~1.7×** — klein batch-2 next (biggest lever), then engine Phase D/E |
+| Klein-9B LoRA, PER SAMPLE 512px | **2.2-2.4 s** (06-11 session 4: P6 graph backward; was 2.5-2.6 resident-set, 12.8 s on 06-06) | OneTrainer **1.49 s/sample VERIFIED 06-11** (88-step live run, 2.98 s/it @ batch 2, bf16 unquantized, 70% async layer-offload, 10.4 GiB); flame ~1.15 (May h2h ÷2 if batch-2) | **OT ~1.5-1.6×** — klein batch-2 next (biggest lever), then SDPA flash |
 | Z-Image LoRA, PER SAMPLE 512px | B1 **~1.63 s/step** (CUDA-graph replay, bit-exact); B2 3.4 s/step = 1.70 s/sample (pre-graph) | OneTrainer **~1.05 s/sample VERIFIED 06-11** (50-step live run, 2.08-2.22 s/it @ batch 2) | **OT ~1.6×** — kernel-bound now (SDPA math-mode); engine Phase D/E + flash sign-off |
 | Z-Image denoise (sampling) | 5.21 s/step (06-06; re-measured 06-11: 4.3-4.4 s/step 1024², cond+uncond 2.0 s each) | OneTrainer 2.14 s/step sampling | **OT-side** ~2× |
 | Z-Image TRAINING step | not yet re-measured (06-11) | **OneTrainer VERIFIED 06-11 live 50-step run: 2.08-2.22 s/it at batch_size=2 = ~1.05-1.1 s/SAMPLE** (alina_zimage_OTpreset_100_baseline, 512px, 15.1 GiB, losses ~0.45-0.57 smooth 0.46) | **OT** — measure ours next (ours is batch 1: compare per-sample) |
@@ -84,6 +84,23 @@ G-X3 PROMPT: all sidecar/prompt-blind models FULL prompt-driven (wire verified
   faithful translate + output diff.
 
 ## Log (newest first)
+- 2026-06-11 (session 4, mid-day): **P6 — KLEIN GRAPH BACKWARD SHIPPED,
+  2.5-2.6 → 2.2-2.4 s/step.** The overnight session wrote it but died
+  (disk hit 100%, 12 GB free) before running gates; verified this
+  session. Per-block mini-graphs (autograd_v2/klein_block_graph.mojo)
+  through the dep-counted engine; apply arms call the hand-chain's own
+  backward helpers WHOLE; klein_stack_lora_backward_graph keeps the
+  conductor loop/scratch-ring/turbo seam; flag `KLEIN_V2_GRAPH`; no
+  StepSlab/capture for Klein (scope). GATES: same-process bit gate
+  (tests/klein_block_parity, /tmp/klein_block_parity) ALL PASS — every
+  output grad + all 28 adapter slots n_mismatch=0; trainer 3-step
+  anchors 0.5414024/0.21542557/0.78082514 inside the variance class vs
+  0.5414262/0.2154109/0.78077525; save-state cadence exercised at step 3
+  (closes the Phase-K open item). Speed from a single 3-step run
+  (/tmp/train_klein_p6: bwd 1.46-1.49, fwd 0.62, optim 0.075). Disk
+  cleanup same session: 12 → 46 GB free (shipped-port parity fixtures
+  ~27 GB + ltx2/ernie outputs ~8 GB deleted). NEXT: P7 zimage B2
+  unification; Klein batch-2; SDPA flash sign-off.
 - 2026-06-11 (session 3, pre-dawn): **P4+P5 — STEP-SLAB + CUDA-GRAPH
   REPLAY SHIPPED, zimage B1 1.70 → ~1.63 s/step, BIT-EXACT.** StepSlab
   (256-B-aligned ring wrapper) routes the whole graph path — bwd allocs

@@ -45,6 +45,21 @@ comptime OPK_SDPA = 9               # sdpa_nomask[B,S,H,Dh] -> d_q,d_k,d_v
 comptime OPK_SWIGLU = 10            # silu(gate)*up -> d_gate,d_up
 comptime OPK_RESIDUAL_GATE_DXDY = 11  # o = x + gate_t*y (gate frozen)
 comptime OPK_RESHAPE = 12           # metadata-only; grad reshaped back
+# ── P6: the Klein-9B per-block vocabulary (AUTOGRAD_V2_MOJO_DESIGN.md P6).
+# Klein records at COMPOSITE granularity: each kind's backward arm calls the
+# oracle's OWN hand-chain helper / inline op sequence verbatim (models/klein/
+# double_block.mojo `_stream_{pre,post}_backward_lora_resident_scratch_tensors`,
+# single_block.mojo `single_block_lora_backward_device_resident_scratch_tensors`
+# split at its activation seams), so every >=3-way bf16/F32 fan-in fold stays
+# INSIDE the oracle code (C15 trivially satisfied at graph level - all
+# graph-level fan-ins are 2-way, where IEEE addition is commutative). Arms are
+# dispatched by engine.apply_klein (comptime [H,Dh,S] for the sdpa buckets).
+comptime OPK_KLEIN_DBL_PRE = 13     # per-stream pre: x -> (q_rms, k_rms, v) + q/k/v LoRA leaves
+comptime OPK_KLEIN_DBL_JOINT = 14   # (tq,iq,tk,ik,tv,iv) -> (txt_att, img_att): concat+rope+sdpa+slice
+comptime OPK_KLEIN_DBL_POST = 15    # (x, att) -> stream out + out/ff_in/ff_out LoRA leaves
+comptime OPK_KLEIN_SGL_IN = 16      # x -> (q_rms,k_rms,v,mlp_gate,mlp_up) + qkv LoRA leaves
+comptime OPK_KLEIN_SGL_SDPA = 17    # (q_rms,k_rms,v) -> att_flat (rope+sdpa)
+comptime OPK_KLEIN_SGL_OUT = 18     # (x, att_flat, mlp) -> block out + out LoRA leaves (lazy fwd)
 
 
 struct Edge(Copyable, Movable):

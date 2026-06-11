@@ -97,7 +97,15 @@ from serenitymojo.ops.linalg_backward import linear_backward_dx
 from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
-from serenitymojo.models.klein.lora_block import LoraAdapterDevice, lora_adapter_to_device
+from serenitymojo.models.klein.lora_block import (
+    LoraAdapterDevice, lora_adapter_to_device, _tensor_to_host_f32,
+)
+# P6 graph engine (AUTOGRAD_V2_MOJO_DESIGN.md): per-block recompute+backward
+# driven by autograd_v2 (klein_stack_lora_backward_graph below).
+from serenitymojo.autograd_v2.klein_block_graph import (
+    klein_double_block_graph_backward,
+    klein_single_block_graph_backward,
+)
 from serenitymojo.models.klein.lora_adapter import LoraAdapter, _lora_adamw_precomputed
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_onetrainer, load_lora_for_resume,
@@ -1913,6 +1921,202 @@ def klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[
         dbl_d_b[dbase + 10] = bg.txt.ff_in_d_b.copy()
         dbl_d_a[dbase + 11] = bg.txt.ff_out_d_a.copy()
         dbl_d_b[dbase + 11] = bg.txt.ff_out_d_b.copy()
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    var d_img_in = List[Float32]()
+    var d_txt_in = List[Float32]()
+    var d_img_tokens = List[Float32]()
+    var d_txt_tokens = List[Float32]()
+    if compute_input_grads:
+        var d_img_tokens_t = linear_backward_dx(
+            d_io[], base.img_in[], N_IMG, in_ch, D, ctx,
+        )
+        d_img_tokens = d_img_tokens_t.to_host(ctx)
+
+        var d_txt_tokens_t = linear_backward_dx(
+            d_to[], base.txt_in[], N_TXT, txt_ch, D, ctx,
+        )
+        d_txt_tokens = d_txt_tokens_t.to_host(ctx)
+
+    return KleinLoraGrads(
+        dbl_d_a^, dbl_d_b^, sgl_d_a^, sgl_d_b^,
+        d_img_tokens^, d_txt_tokens^,
+        d_img_mod^, d_txt_mod^, d_single_mod^,
+        d_img_in^, d_txt_in^, List[Float32](), d_final_shift^, d_final_scale^,
+    )
+
+
+def _graph_grad_to_host(
+    o: Optional[TArc], name: String, ctx: DeviceContext
+) raises -> List[Float32]:
+    """Device adapter grad -> host F32 list via the SAME conversion the
+    hand-chain path applies (lora_block.mojo _to_host_pair_f32 ->
+    _tensor_to_host_f32: F32 direct copy, else cast_tensor to F32 then copy) —
+    bit-equal host lists whenever the device tensors are bit-equal."""
+    var t = _required_tarc(o, name)
+    return _tensor_to_host_f32(t[], ctx)
+
+
+def klein_stack_lora_backward_graph[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    lora: KleinLoraDeviceSet,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
+    saved: KleinStackForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_input_grads: Bool = True,
+    compute_aux_grads: Bool = True,
+) raises -> KleinLoraGrads:
+    """P6 graph-engine variant of
+    klein_stack_lora_backward_offload_turbo_moddev_rope_scratch (above): a
+    COPY of that backward with each per-block recompute+hand-chain pair
+    swapped for the autograd_v2 per-block graph call
+    (klein_double/single_block_graph_backward). The conductor loop shape is
+    PRESERVED VERBATIM (contract C10): the same loader.await_block /
+    prefetch_with_ctx / mark_active_block_done calls bracket each block, the
+    same ScratchRingAllocator threads through, and the head (final-layer
+    backward) + tail (input-token grads) are byte-identical copies.
+
+    Restrictions (fail loud, contract C13 keeps the hand-chain reachable):
+      * compute_aux_grads must be False (the trainer's production call; the
+        graph arms are aux-off — mod-vec grads need the hand-chain path);
+      * full per-block recompute only (DBL/SGL_SAVE_TAIL == 0, the production
+        parity default — a non-empty saved tail would silently skip the graph
+        recompute, so it raises)."""
+    if compute_aux_grads:
+        raise Error(
+            "klein_stack_lora_backward_graph: compute_aux_grads=True is not"
+            " wired through the graph path (aux mod-vec grads); use the"
+            " hand-chain klein_stack_lora_backward_offload_turbo_moddev_rope_"
+            "scratch"
+        )
+    if len(saved.dbl_saved) > 0 or len(saved.sgl_saved) > 0:
+        raise Error(
+            "klein_stack_lora_backward_graph: saved-tail checkpoints present;"
+            " the graph path is full-recompute only (DBL/SGL_SAVE_TAIL == 0)"
+        )
+    var num_double = lora.num_double
+    var num_single = lora.num_single
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var d_normed_t = linear_backward_dx(
+        _t(d_out, [N_IMG, out_ch], ctx), base.final_lin[],
+        N_IMG, D, out_ch, ctx,
+    )
+
+    var mbf = modulate_backward(
+        d_normed_t, saved.ln_img_out[],
+        base.final_scale[], ctx, compute_aux_grads,
+    )
+    var d_final_scale = List[Float32]()
+    var d_final_shift = List[Float32]()
+
+    var d_img_out_t = layer_norm_backward_dx(
+        mbf.d_x, saved.img_out[],
+        norm_ones[], eps, ctx,
+    )
+
+    var d_txt_zero = zeros_device([N_TXT, D], STDtype.F32, ctx)
+    var d_x = TArc(concat(0, ctx, d_txt_zero, d_img_out_t))
+
+    var sgl_d_a = List[List[Float32]]()
+    var sgl_d_b = List[List[Float32]]()
+    for _ in range(num_single * SGL_SLOTS):
+        sgl_d_a.append(List[Float32]())
+        sgl_d_b.append(List[Float32]())
+
+    var d_single_mod = _zeros(3 * D)
+    var bi = num_single - 1
+    while bi >= 0:
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+        var w = _single_weights_from_block(handle.block, handle.prefix, D, F, ctx)
+        var sl = _sgl_lora_dev_for(lora, bi)
+        # graph engine: recompute-forward + backward in ONE call (replaces the
+        # recompute_saved + backward_device_resident_scratch pair above).
+        var bg = klein_single_block_graph_backward[H, Dh, S](
+            d_x, w, single_mod_dev, sl, saved.sgl_x_in[bi],
+            cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        d_x = bg.d_x.copy()
+        var sbase = bi * SGL_SLOTS
+        sgl_d_a[sbase + 0] = _graph_grad_to_host(bg.qkv_d_a, String("sgl qkv_d_a"), ctx)
+        sgl_d_b[sbase + 0] = _graph_grad_to_host(bg.qkv_d_b, String("sgl qkv_d_b"), ctx)
+        sgl_d_a[sbase + 1] = _graph_grad_to_host(bg.out_d_a, String("sgl out_d_a"), ctx)
+        sgl_d_b[sbase + 1] = _graph_grad_to_host(bg.out_d_b, String("sgl out_d_b"), ctx)
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    var d_txt_out = TArc(slice(d_x[], 0, 0, N_TXT, ctx))
+    var d_img_out2 = TArc(slice(d_x[], 0, N_TXT, N_IMG, ctx))
+
+    var dbl_d_a = List[List[Float32]]()
+    var dbl_d_b = List[List[Float32]]()
+    for _ in range(num_double * DBL_SLOTS):
+        dbl_d_a.append(List[Float32]())
+        dbl_d_b.append(List[Float32]())
+
+    var d_img_mod = _zeros(6 * D)
+    var d_txt_mod = _zeros(6 * D)
+    var di = num_double - 1
+    var d_io = d_img_out2.copy()
+    var d_to = d_txt_out.copy()
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var w = _double_weights_from_block(handle.block, handle.prefix, ctx)
+        var bl = _dbl_lora_dev_for(lora, di)
+        # graph engine: recompute-forward + backward in ONE call (replaces the
+        # forward_device_resident_scratch + backward_..._scratch pair above).
+        var bg = klein_double_block_graph_backward[H, Dh, N_IMG, N_TXT, S](
+            d_io, d_to, w, img_mod_dev, txt_mod_dev, bl,
+            saved.dbl_img_in[di], saved.dbl_txt_in[di],
+            cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        d_io = bg.img.d_x.copy()
+        d_to = bg.txt.d_x.copy()
+        var dbase = di * DBL_SLOTS
+        dbl_d_a[dbase + 0] = _graph_grad_to_host(bg.img.q_d_a, String("dbl q_d_a"), ctx)
+        dbl_d_b[dbase + 0] = _graph_grad_to_host(bg.img.q_d_b, String("dbl q_d_b"), ctx)
+        dbl_d_a[dbase + 1] = _graph_grad_to_host(bg.img.k_d_a, String("dbl k_d_a"), ctx)
+        dbl_d_b[dbase + 1] = _graph_grad_to_host(bg.img.k_d_b, String("dbl k_d_b"), ctx)
+        dbl_d_a[dbase + 2] = _graph_grad_to_host(bg.img.v_d_a, String("dbl v_d_a"), ctx)
+        dbl_d_b[dbase + 2] = _graph_grad_to_host(bg.img.v_d_b, String("dbl v_d_b"), ctx)
+        dbl_d_a[dbase + 3] = _graph_grad_to_host(bg.img.out_d_a, String("dbl out_d_a"), ctx)
+        dbl_d_b[dbase + 3] = _graph_grad_to_host(bg.img.out_d_b, String("dbl out_d_b"), ctx)
+        dbl_d_a[dbase + 4] = _graph_grad_to_host(bg.img.ff_in_d_a, String("dbl ff_in_d_a"), ctx)
+        dbl_d_b[dbase + 4] = _graph_grad_to_host(bg.img.ff_in_d_b, String("dbl ff_in_d_b"), ctx)
+        dbl_d_a[dbase + 5] = _graph_grad_to_host(bg.img.ff_out_d_a, String("dbl ff_out_d_a"), ctx)
+        dbl_d_b[dbase + 5] = _graph_grad_to_host(bg.img.ff_out_d_b, String("dbl ff_out_d_b"), ctx)
+        dbl_d_a[dbase + 6] = _graph_grad_to_host(bg.txt.q_d_a, String("dbl txt q_d_a"), ctx)
+        dbl_d_b[dbase + 6] = _graph_grad_to_host(bg.txt.q_d_b, String("dbl txt q_d_b"), ctx)
+        dbl_d_a[dbase + 7] = _graph_grad_to_host(bg.txt.k_d_a, String("dbl txt k_d_a"), ctx)
+        dbl_d_b[dbase + 7] = _graph_grad_to_host(bg.txt.k_d_b, String("dbl txt k_d_b"), ctx)
+        dbl_d_a[dbase + 8] = _graph_grad_to_host(bg.txt.v_d_a, String("dbl txt v_d_a"), ctx)
+        dbl_d_b[dbase + 8] = _graph_grad_to_host(bg.txt.v_d_b, String("dbl txt v_d_b"), ctx)
+        dbl_d_a[dbase + 9] = _graph_grad_to_host(bg.txt.out_d_a, String("dbl txt out_d_a"), ctx)
+        dbl_d_b[dbase + 9] = _graph_grad_to_host(bg.txt.out_d_b, String("dbl txt out_d_b"), ctx)
+        dbl_d_a[dbase + 10] = _graph_grad_to_host(bg.txt.ff_in_d_a, String("dbl txt ff_in_d_a"), ctx)
+        dbl_d_b[dbase + 10] = _graph_grad_to_host(bg.txt.ff_in_d_b, String("dbl txt ff_in_d_b"), ctx)
+        dbl_d_a[dbase + 11] = _graph_grad_to_host(bg.txt.ff_out_d_a, String("dbl txt ff_out_d_a"), ctx)
+        dbl_d_b[dbase + 11] = _graph_grad_to_host(bg.txt.ff_out_d_b, String("dbl txt ff_out_d_b"), ctx)
         loader.mark_active_block_done(ctx)
         di -= 1
 

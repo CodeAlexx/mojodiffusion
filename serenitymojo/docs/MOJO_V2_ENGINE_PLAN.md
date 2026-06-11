@@ -126,8 +126,27 @@ cuGraphLaunch calls (G_fwd 5,774 + G_bwd 21,036 nodes), bit-exact
 (100-step zero-diff, independently re-verified), 1.8 → 1.70 → ~1.63
 s/step. The engine program is COMPLETE on zimage B1: recording + dep-
 counted engine + step-slab + sync-elim + frozen-skip + resident-set +
-graph replay, one program. Remaining: P6 Klein graph (conductor hooks),
-P7 batch-2 unification; kernel wall (SDPA ~1.45 s busy) needs sign-off.**
+graph replay, one program. Remaining: P7 batch-2 unification; kernel
+wall (SDPA ~1.45 s busy) needs sign-off.**
+**P6 SHIPPED 2026-06-11 (verified mid-day after the overnight session
+died pre-gate): Klein per-block recompute+backward driven by the graph
+engine — autograd_v2/klein_block_graph.mojo (per-block mini-graphs whose
+apply arms call the hand-chain's own backward helpers WHOLE; 2-way-only
+graph fan-ins, commutativity argument per zimage P3) +
+klein_stack_lora_backward_graph (same conductor loop/scratch-ring/
+turbo-loader seam; fail-loud on aux-grads and saved-tail — graph path is
+full-recompute only) behind `KLEIN_V2_GRAPH` (gate-don't-delete). NO
+StepSlab / CUDA capture for Klein in P6 (scope decision). GATES:
+same-process bit gate autograd_v2/tests/klein_block_parity.mojo ALL PASS
+(every double/single output grad + all 28 adapter d_a/d_b slots
+n_mismatch=0 — Klein cannot be bit-gated across runs, ~4e-4
+nondeterminism, so same-process is the strongest gate it admits);
+trainer 3-step anchors 0.5414024/0.21542557/0.78082514 vs
+0.5414262/0.2154109/0.78077525 — inside the documented variance class;
+save-state cadence exercised at step 3 (the Phase-K open item). Speed:
+2.5-2.6 → **2.2-2.4 s/step** (single 3-step run; bwd 1.46-1.49, fwd
+0.62, optim 0.075). Remaining for Klein: batch-2 (handoff §2.7), torch
+gate repair, SDPA flash.**
 
 **JOB NUMBER ONE (maintainer, re-affirmed 2026-06-11). Full design contract
 + phase order (P0-P7): `serenitymojo/docs/AUTOGRAD_V2_MOJO_DESIGN.md` —

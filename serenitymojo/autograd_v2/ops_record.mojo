@@ -52,6 +52,35 @@ from serenitymojo.models.zimage.lora_block import (
     zimage_lora_apply_device_slab,
     zimage_lora_bwd_device_resident_tensors_slab,
 )
+# ── P6 Klein vocabulary (record wrappers below call the EXACT forward
+# functions the Klein stack-loop recompute calls; see each wrapper's docstring
+# for the file:line of the mirrored oracle code).
+from serenitymojo.models.klein.double_block import (
+    StreamWeights,
+    ModVecsDevice,
+    StreamLoraDevice,
+    _stream_pre_lora_resident,
+    _stream_post_lora_resident,
+)
+from serenitymojo.models.klein.single_block import (
+    SingleBlockWeights,
+    SingleModVecsDevice,
+    SingleBlockLoraDevice,
+)
+from serenitymojo.models.klein.lora_block import (
+    LoraAdapterDevice,
+    klein_lora_fwd_device_resident,
+)
+from serenitymojo.ops.linear import linear_rows, linear_rows_scratch
+from serenitymojo.ops.norm import layer_norm
+from serenitymojo.ops.tensor_algebra import (
+    slice as _ta_slice,
+    concat as _ta_concat,
+    reshape_owned as _ta_reshape_owned,
+    add_in_place_f32 as _ta_add_in_place_f32,
+)
+from serenitymojo.ops.tensor_algebra_scratch import concat2_scratch
+from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.autograd_v2.node import (
     Edge,
@@ -66,6 +95,12 @@ from serenitymojo.autograd_v2.node import (
     OPK_SWIGLU,
     OPK_RESIDUAL_GATE_DXDY,
     OPK_RESHAPE,
+    OPK_KLEIN_DBL_PRE,
+    OPK_KLEIN_DBL_JOINT,
+    OPK_KLEIN_DBL_POST,
+    OPK_KLEIN_SGL_IN,
+    OPK_KLEIN_SGL_SDPA,
+    OPK_KLEIN_SGL_OUT,
 )
 from serenitymojo.autograd_v2.graph import Graph
 
@@ -585,3 +620,463 @@ def record_residual_gate_slab(
         OPK_RESIDUAL_GATE_DXDY, edges^, saved^, List[Int](), List[Float32](), oids
     )
     return TArc(y^)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P6: Klein-9B record wrappers (AUTOGRAD_V2_MOJO_DESIGN.md P6).
+#
+# Klein records at COMPOSITE granularity (one node per oracle hand-chain
+# helper / inline activation seam) so that every >=3-way fan-in fold lives
+# INSIDE the oracle code the apply arm calls verbatim (engine.apply_klein).
+# Each wrapper's forward calls the EXACT functions the Klein stack-loop
+# recompute calls:
+#   * double block:  double_block_lora_forward_device_resident_scratch
+#     (models/klein/double_block.mojo:1389-1434) - _stream_pre_lora_resident,
+#     concat2_scratch q/k + concat v + rope (with the oracle's mark/rewind),
+#     sdpa_nomask, slice/reshape, _stream_post_lora_resident;
+#   * single block:  single_block_lora_recompute_saved_device_resident_scratch
+#     (models/klein/single_block.mojo:1037-1087) - layer_norm/modulate,
+#     linear_rows bands + linear_rows_scratch gate_up,
+#     klein_lora_fwd_device_resident qkv delta, rms_norm, rope, sdpa, swiglu,
+#     concat out_in. The single block's final w2/LoRA-out/residual output is
+#     NOT computed (the recompute oracle stops at out_in; the aux-off backward
+#     never reads the block output value) - the OPK_KLEIN_SGL_OUT node is
+#     recorded LAZILY (fresh output id, no forward tensor).
+#
+# Graph-level fan-ins (C15): ONLY 2-way (block input x <- {pre/in-chain,
+# post/out-chain residual}); 2-way folds are bit-equal under operand swap
+# (IEEE addition commutativity - the zimage P3 argument). Every >=3-way fold
+# (e.g. the pre-stream d_norm <- base + q/k/v LoRA 4-way fold,
+# double_block.mojo:2103-2117; the single d_norm <- split-GEMM + qkv LoRA
+# fold, single_block.mojo:1422-1433) is INSIDE the oracle function the apply
+# arm calls, so its fold order is the oracle's by construction.
+#
+# Adapter leaves are ALWAYS tracked here (the Klein trainer trains every
+# slot); a missing adapter raises (fail loud, contract C7 has no frozen LoRA
+# slot in this path).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _require_adapter(
+    lo: Optional[LoraAdapterDevice], name: String
+) raises -> LoraAdapterDevice:
+    if lo:
+        return lo.value().copy()
+    raise Error(String("klein record: required LoRA adapter missing: ") + name)
+
+
+def _rebox_with_id(mut g: Graph, t: TArc) raises -> TArc:
+    """Zero-copy re-box of a helper-returned arc with a fresh graph tensor id
+    (the zimage_block_graph.mojo:86 idiom): a fresh Tensor struct SHARING the
+    device buffer, so the id stamp never mutates the shared original."""
+    var y = Tensor(t[].buf.copy(), t[].shape(), t[].dtype())
+    y.set_id(g.fresh_tensor_id())
+    return TArc(y^)
+
+
+struct KleinPreRecorded(Copyable, Movable):
+    """record_klein_dbl_pre outputs (graph-tracked)."""
+
+    var q_rms: TArc
+    var k_rms: TArc
+    var v: TArc
+
+    def __init__(out self, var q_rms: TArc, var k_rms: TArc, var v: TArc):
+        self.q_rms = q_rms^
+        self.k_rms = k_rms^
+        self.v = v^
+
+
+struct KleinJointRecorded(Copyable, Movable):
+    """record_klein_dbl_joint outputs (graph-tracked)."""
+
+    var txt_att: TArc
+    var img_att: TArc
+
+    def __init__(out self, var txt_att: TArc, var img_att: TArc):
+        self.txt_att = txt_att^
+        self.img_att = img_att^
+
+
+struct KleinSglInRecorded(Copyable, Movable):
+    """record_klein_sgl_in outputs (graph-tracked)."""
+
+    var q_rms: TArc
+    var k_rms: TArc
+    var v: TArc
+    var mlp_gate: TArc
+    var mlp_up: TArc
+
+    def __init__(
+        out self, var q_rms: TArc, var k_rms: TArc, var v: TArc,
+        var mlp_gate: TArc, var mlp_up: TArc,
+    ):
+        self.q_rms = q_rms^
+        self.k_rms = k_rms^
+        self.v = v^
+        self.mlp_gate = mlp_gate^
+        self.mlp_up = mlp_up^
+
+
+def record_klein_dbl_pre[
+    H: Int, Dh: Int
+](
+    mut g: Graph, x: TArc,
+    w: StreamWeights, mv: ModVecsDevice, lo: StreamLoraDevice,
+    q_a_id: Int, q_b_id: Int, k_a_id: Int, k_b_id: Int, v_a_id: Int, v_b_id: Int,
+    N: Int, D: Int, eps: Float32,
+    norm_ones: TArc, norm_zeros: TArc,
+    ctx: DeviceContext,
+) raises -> KleinPreRecorded:
+    """Per-stream PRE: x -> (q_rms, k_rms, v) with separate q/k/v LoRA.
+    Forward = _stream_pre_lora_resident[H,Dh] (double_block.mojo:1264-1298),
+    the EXACT call double_block_lora_forward_device_resident_scratch makes
+    (:1403-1406). Backward arm (engine.apply_klein) =
+    _stream_pre_backward_lora_resident_scratch_tensors (double_block.mojo:2071
+    -2136) on the saved pieces, compute_aux_grads=False.
+    Edges: [x, q_a, q_b, k_a, k_b, v_a, v_b]; outputs 0=q_rms 1=k_rms 2=v."""
+    var q_ad = _require_adapter(lo.q, String("dbl pre q"))
+    var k_ad = _require_adapter(lo.k, String("dbl pre k"))
+    var v_ad = _require_adapter(lo.v, String("dbl pre v"))
+    if q_ad.rank != k_ad.rank or q_ad.rank != v_ad.rank:
+        raise Error("record_klein_dbl_pre: q/k/v adapter rank mismatch")
+
+    var pre = _stream_pre_lora_resident[H, Dh](
+        x, w, mv, lo, N, D, eps, norm_ones[], norm_zeros[], ctx
+    )
+
+    var q_rms = _rebox_with_id(g, pre.q_rms)
+    var k_rms = _rebox_with_id(g, pre.k_rms)
+    var v = _rebox_with_id(g, pre.v)
+
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    edges.append(_leaf_edge(g, q_a_id))
+    edges.append(_leaf_edge(g, q_b_id))
+    edges.append(_leaf_edge(g, k_a_id))
+    edges.append(_leaf_edge(g, k_b_id))
+    edges.append(_leaf_edge(g, v_a_id))
+    edges.append(_leaf_edge(g, v_b_id))
+    # saved layout (apply_klein OPK_KLEIN_DBL_PRE arm contract):
+    #   0 x, 1 ln1, 2 norm, 3 q_pre, 4 k_pre,
+    #   5 wqkv, 6 q_norm, 7 k_norm, 8 scale1, 9 norm_ones,
+    #   10 q_a, 11 q_b, 12 k_a, 13 k_b, 14 v_a, 15 v_b
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(pre.ln1.copy())
+    saved.append(pre.norm.copy())
+    saved.append(pre.q_pre.copy())
+    saved.append(pre.k_pre.copy())
+    saved.append(w.wqkv.copy())
+    saved.append(w.q_norm.copy())
+    saved.append(w.k_norm.copy())
+    saved.append(mv.scale1.copy())
+    saved.append(norm_ones.copy())
+    saved.append(q_ad.a.copy())
+    saved.append(q_ad.b.copy())
+    saved.append(k_ad.a.copy())
+    saved.append(k_ad.b.copy())
+    saved.append(v_ad.a.copy())
+    saved.append(v_ad.b.copy())
+    var meta: List[Int] = [N, D, q_ad.rank]
+    var scalars: List[Float32] = [eps, q_ad.scale, k_ad.scale, v_ad.scale]
+    var oids: List[Int] = [q_rms[].id, k_rms[].id, v[].id]
+    _ = g.record(OPK_KLEIN_DBL_PRE, edges^, saved^, meta^, scalars^, oids)
+    return KleinPreRecorded(q_rms^, k_rms^, v^)
+
+
+def record_klein_dbl_joint[
+    H: Int, Dh: Int, S: Int
+](
+    mut g: Graph,
+    tq: TArc, iq: TArc, tk: TArc, ik: TArc, tv: TArc, iv: TArc,
+    cos: TArc, sin: TArc, scale: Float32,
+    N_TXT: Int, N_IMG: Int, D: Int,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> KleinJointRecorded:
+    """Joint attention: (txt|img q/k/v) -> (txt_att, img_att). Forward is the
+    EXACT oracle sequence double_block.mojo:1408-1421 (concat2_scratch q/k with
+    the oracle's mark/rewind, plain concat v, rope_interleaved, sdpa_nomask,
+    slice + reshape_owned per stream). Backward arm = the oracle's joint
+    backward block (double_block.mojo:2319-2337): reshape, concat2_scratch,
+    sdpa_backward_scratch, rope_backward x2, slice_scratch x6,
+    reshape_in_place. Edges: [tq, iq, tk, ik, tv, iv] (the concat operand
+    order); outputs 0=txt_att 1=img_att."""
+    var qk_mark = scratch.mark()
+    var q = concat2_scratch(1, ctx, scratch, tq[], iq[])
+    var k = concat2_scratch(1, ctx, scratch, tk[], ik[])
+    var v_joint = _ta_concat(1, ctx, tv[], iv[])
+    var q_rope = rope_interleaved(q, cos[], sin[], ctx)
+    var k_rope = rope_interleaved(k, cos[], sin[], ctx)
+    scratch.rewind(qk_mark)
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v_joint, scale, ctx)
+
+    var txt_att_4d = _ta_slice(att, 1, 0, N_TXT, ctx)
+    var img_att_4d = _ta_slice(att, 1, N_TXT, N_IMG, ctx)
+    var txt_att_t = _ta_reshape_owned(txt_att_4d^, [N_TXT, D])
+    var img_att_t = _ta_reshape_owned(img_att_4d^, [N_IMG, D])
+    txt_att_t.set_id(g.fresh_tensor_id())
+    img_att_t.set_id(g.fresh_tensor_id())
+    var txt_att = TArc(txt_att_t^)
+    var img_att = TArc(img_att_t^)
+
+    var edges = List[Edge]()
+    edges.append(g.edge_for(tq[].id))
+    edges.append(g.edge_for(iq[].id))
+    edges.append(g.edge_for(tk[].id))
+    edges.append(g.edge_for(ik[].id))
+    edges.append(g.edge_for(tv[].id))
+    edges.append(g.edge_for(iv[].id))
+    # saved layout: 0 q_rope, 1 k_rope, 2 v_joint, 3 cos, 4 sin
+    var saved = List[TArc]()
+    saved.append(TArc(q_rope^))
+    saved.append(TArc(k_rope^))
+    saved.append(TArc(v_joint^))
+    saved.append(cos.copy())
+    saved.append(sin.copy())
+    var meta: List[Int] = [N_TXT, N_IMG, D]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [txt_att[].id, img_att[].id]
+    _ = g.record(OPK_KLEIN_DBL_JOINT, edges^, saved^, meta^, scalars^, oids)
+    return KleinJointRecorded(txt_att^, img_att^)
+
+
+def record_klein_dbl_post(
+    mut g: Graph, x: TArc, att: TArc,
+    w: StreamWeights, mv: ModVecsDevice, lo: StreamLoraDevice,
+    out_a_id: Int, out_b_id: Int,
+    ff_in_a_id: Int, ff_in_b_id: Int,
+    ff_out_a_id: Int, ff_out_b_id: Int,
+    N: Int, D: Int, F: Int, eps: Float32,
+    norm_ones: TArc, norm_zeros: TArc,
+    ctx: DeviceContext,
+) raises -> TArc:
+    """Per-stream POST: (x, att) -> stream out with out/ff_in/ff_out LoRA.
+    Forward = _stream_post_lora_resident (double_block.mojo:1302-1337), the
+    EXACT call double_block_lora_forward_device_resident_scratch makes
+    (:1423-1426). Backward arm =
+    _stream_post_backward_lora_resident_scratch_tensors (double_block.mojo:
+    1781-1875), compute_aux_grads=False.
+    Edges: [x, att, out_a, out_b, ff_in_a, ff_in_b, ff_out_a, ff_out_b]."""
+    var out_ad = _require_adapter(lo.out, String("dbl post out"))
+    var ff_in_ad = _require_adapter(lo.ff_in, String("dbl post ff_in"))
+    var ff_out_ad = _require_adapter(lo.ff_out, String("dbl post ff_out"))
+    if out_ad.rank != ff_in_ad.rank or out_ad.rank != ff_out_ad.rank:
+        raise Error("record_klein_dbl_post: out/ff adapter rank mismatch")
+
+    var post = _stream_post_lora_resident(
+        x, att, w, mv, lo, N, D, F, eps, norm_ones[], norm_zeros[], ctx
+    )
+    var out = _rebox_with_id(g, post.out)
+
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    edges.append(g.edge_for(att[].id))
+    edges.append(_leaf_edge(g, out_a_id))
+    edges.append(_leaf_edge(g, out_b_id))
+    edges.append(_leaf_edge(g, ff_in_a_id))
+    edges.append(_leaf_edge(g, ff_in_b_id))
+    edges.append(_leaf_edge(g, ff_out_a_id))
+    edges.append(_leaf_edge(g, ff_out_b_id))
+    # saved layout (apply_klein OPK_KLEIN_DBL_POST arm contract):
+    #   0 x, 1 att, 2 attn_res, 3 ln2, 4 mlp_in, 5 gate, 6 up, 7 act,
+    #   8 wproj, 9 wgu, 10 wd, 11 gate1, 12 scale2, 13 gate2, 14 norm_ones,
+    #   15 out_a, 16 out_b, 17 ff_in_a, 18 ff_in_b, 19 ff_out_a, 20 ff_out_b
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(att.copy())
+    saved.append(post.attn_res.copy())
+    saved.append(post.ln2.copy())
+    saved.append(post.mlp_in.copy())
+    saved.append(post.gate.copy())
+    saved.append(post.up.copy())
+    saved.append(post.act.copy())
+    saved.append(w.wproj.copy())
+    saved.append(w.wgu.copy())
+    saved.append(w.wd.copy())
+    saved.append(mv.gate1.copy())
+    saved.append(mv.scale2.copy())
+    saved.append(mv.gate2.copy())
+    saved.append(norm_ones.copy())
+    saved.append(out_ad.a.copy())
+    saved.append(out_ad.b.copy())
+    saved.append(ff_in_ad.a.copy())
+    saved.append(ff_in_ad.b.copy())
+    saved.append(ff_out_ad.a.copy())
+    saved.append(ff_out_ad.b.copy())
+    var meta: List[Int] = [N, D, F, out_ad.rank]
+    var scalars: List[Float32] = [eps, out_ad.scale, ff_in_ad.scale, ff_out_ad.scale]
+    var oids: List[Int] = [out[].id]
+    _ = g.record(OPK_KLEIN_DBL_POST, edges^, saved^, meta^, scalars^, oids)
+    return out^
+
+
+def record_klein_sgl_in(
+    mut g: Graph, x: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, lo: SingleBlockLoraDevice,
+    qkv_a_id: Int, qkv_b_id: Int,
+    S_rows: Int, D: Int, F: Int, eps: Float32, H_: Int, Dh_: Int,
+    norm_ones: TArc, norm_zeros: TArc,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> KleinSglInRecorded:
+    """Single-block IN: x -> (q_rms, k_rms, v, mlp_gate, mlp_up) with the qkv
+    LoRA. Forward mirrors single_block_lora_recompute_saved_device_resident_
+    scratch (single_block.mojo:1037-1079) op-for-op: layer_norm, modulate,
+    linear_rows q/k/v bands + linear_rows_scratch gate_up,
+    klein_lora_fwd_device_resident delta + add_in_place_f32 x4, reshape_owned,
+    rms_norm x2, gate/up slices, then the oracle's scratch rewind. Backward
+    arm = single_block_lora_backward_device_resident_scratch_tensors's IN
+    segment (single_block.mojo:1414-1445), compute_aux_grads=False.
+    Edges: [x, qkv_a, qkv_b]; outputs 0=q_rms 1=k_rms 2=v 3=mlp_gate 4=mlp_up."""
+    var qkv_ad = _require_adapter(lo.qkv, String("sgl qkv"))
+
+    var ln_t = layer_norm(x[], norm_ones[], norm_zeros[], eps, ctx)
+    var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
+
+    var scratch_mark = scratch.mark()
+    var q_pre_flat = linear_rows(norm_t, w.w1[], 0, D, ctx)
+    var k_pre_flat = linear_rows(norm_t, w.w1[], D, D, ctx)
+    var v_flat = linear_rows(norm_t, w.w1[], 2 * D, D, ctx)
+    var gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
+    # qkv LoRA delta: the SAME dispatcher the recompute oracle calls
+    # (single_block.mojo:1059; fused path currently dormant -> unfused chain).
+    var dlt = klein_lora_fwd_device_resident(norm_t, qkv_ad, S_rows, ctx)
+    _ta_add_in_place_f32(q_pre_flat, _ta_slice(dlt, 1, 0, D, ctx), ctx)
+    _ta_add_in_place_f32(k_pre_flat, _ta_slice(dlt, 1, D, D, ctx), ctx)
+    _ta_add_in_place_f32(v_flat, _ta_slice(dlt, 1, 2 * D, D, ctx), ctx)
+    _ta_add_in_place_f32(gate_up, _ta_slice(dlt, 1, 3 * D, 2 * F, ctx), ctx)
+    var q_pre = _ta_reshape_owned(q_pre_flat^, [1, S_rows, H_, Dh_])
+    var k_pre = _ta_reshape_owned(k_pre_flat^, [1, S_rows, H_, Dh_])
+    var v_t = _ta_reshape_owned(v_flat^, [1, S_rows, H_, Dh_])
+
+    var q_rms_t = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms_t = rms_norm(k_pre, w.k_norm[], eps, ctx)
+
+    # gate/up slices are fresh copies (ops.tensor_algebra.slice) so the
+    # gate_up scratch region is dead -> the oracle's rewind (:1079).
+    var mlp_gate_t = _ta_slice(gate_up, 1, 0, F, ctx)
+    var mlp_up_t = _ta_slice(gate_up, 1, F, F, ctx)
+    scratch.rewind(scratch_mark)
+
+    q_rms_t.set_id(g.fresh_tensor_id())
+    k_rms_t.set_id(g.fresh_tensor_id())
+    v_t.set_id(g.fresh_tensor_id())
+    mlp_gate_t.set_id(g.fresh_tensor_id())
+    mlp_up_t.set_id(g.fresh_tensor_id())
+    var q_rms = TArc(q_rms_t^)
+    var k_rms = TArc(k_rms_t^)
+    var v = TArc(v_t^)
+    var mlp_gate = TArc(mlp_gate_t^)
+    var mlp_up = TArc(mlp_up_t^)
+
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    edges.append(_leaf_edge(g, qkv_a_id))
+    edges.append(_leaf_edge(g, qkv_b_id))
+    # saved layout (apply_klein OPK_KLEIN_SGL_IN arm contract):
+    #   0 x, 1 ln, 2 norm, 3 q_pre, 4 k_pre,
+    #   5 w1, 6 q_norm, 7 k_norm, 8 scale_vec, 9 norm_ones, 10 qkv_a, 11 qkv_b
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(TArc(ln_t^))
+    saved.append(TArc(norm_t^))
+    saved.append(TArc(q_pre^))
+    saved.append(TArc(k_pre^))
+    saved.append(w.w1.copy())
+    saved.append(w.q_norm.copy())
+    saved.append(w.k_norm.copy())
+    saved.append(mv.scale.copy())
+    saved.append(norm_ones.copy())
+    saved.append(qkv_ad.a.copy())
+    saved.append(qkv_ad.b.copy())
+    var meta: List[Int] = [S_rows, D, F, qkv_ad.rank]
+    var scalars: List[Float32] = [eps, qkv_ad.scale]
+    var oids: List[Int] = [
+        q_rms[].id, k_rms[].id, v[].id, mlp_gate[].id, mlp_up[].id
+    ]
+    _ = g.record(OPK_KLEIN_SGL_IN, edges^, saved^, meta^, scalars^, oids)
+    return KleinSglInRecorded(q_rms^, k_rms^, v^, mlp_gate^, mlp_up^)
+
+
+def record_klein_sgl_sdpa[
+    H: Int, Dh: Int, S: Int
+](
+    mut g: Graph, q_rms: TArc, k_rms: TArc, v: TArc,
+    cos: TArc, sin: TArc, scale: Float32, D: Int,
+    ctx: DeviceContext,
+) raises -> TArc:
+    """Single-block attention core: (q_rms, k_rms, v) -> att_flat. Forward
+    mirrors single_block.mojo:1071-1074 (rope_interleaved x2, sdpa_nomask,
+    reshape_owned [S,D]). Backward arm = the oracle's sdpa segment
+    (single_block.mojo:1402-1412): reshape view, sdpa_backward_scratch,
+    rope_backward x2, d_v reshape. Edges: [q_rms, k_rms, v]."""
+    var q_rope = rope_interleaved(q_rms[], cos[], sin[], ctx)
+    var k_rope = rope_interleaved(k_rms[], cos[], sin[], ctx)
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v[], scale, ctx)
+    var att_flat = _ta_reshape_owned(att^, [S, D])
+    att_flat.set_id(g.fresh_tensor_id())
+
+    var edges = List[Edge]()
+    edges.append(g.edge_for(q_rms[].id))
+    edges.append(g.edge_for(k_rms[].id))
+    edges.append(g.edge_for(v[].id))
+    # saved layout: 0 q_rope, 1 k_rope, 2 v, 3 cos, 4 sin
+    var saved = List[TArc]()
+    saved.append(TArc(q_rope^))
+    saved.append(TArc(k_rope^))
+    saved.append(v.copy())
+    saved.append(cos.copy())
+    saved.append(sin.copy())
+    var meta: List[Int] = [S, D]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [att_flat.id]
+    _ = g.record(OPK_KLEIN_SGL_SDPA, edges^, saved^, meta^, scalars^, oids)
+    return TArc(att_flat^)
+
+
+def record_klein_sgl_out(
+    mut g: Graph, x: TArc, att_flat: TArc, mlp: TArc,
+    w: SingleBlockWeights, gate_vec: TArc, lo: SingleBlockLoraDevice,
+    out_a_id: Int, out_b_id: Int,
+    S_rows: Int, D: Int, F: Int,
+    ctx: DeviceContext,
+) raises -> Int:
+    """Single-block OUT: (x, att_flat, mlp) -> block out, with the to_out
+    LoRA. LAZY forward: out_in = concat(att_flat, mlp) (the recompute oracle's
+    last computed value, single_block.mojo:1081); the w2 projection + LoRA-out
+    delta + residual_gate output are NEVER computed - exactly like the
+    recompute oracle, because the aux-off backward
+    (gate_residual_backward_dxdy) never reads the output value. Returns the
+    block-output TENSOR ID (the engine root); no output tensor exists.
+    Backward arm = the oracle's OUT segment (single_block.mojo:1364-1400),
+    compute_aux_grads=False: gate_residual_backward_dxdy,
+    linear_backward_dx_scratch vs w2_att/w2_mlp, _klein_lora_bwd_dropout_
+    tensors on out_in, add_in_place_f32 column folds.
+    Edges: [x, att_flat, mlp, out_a, out_b]."""
+    var out_ad = _require_adapter(lo.out, String("sgl out"))
+
+    var out_in = _ta_concat(1, ctx, att_flat[], mlp[])
+
+    var out_id = g.fresh_tensor_id()
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    edges.append(g.edge_for(att_flat[].id))
+    edges.append(g.edge_for(mlp[].id))
+    edges.append(_leaf_edge(g, out_a_id))
+    edges.append(_leaf_edge(g, out_b_id))
+    # saved layout (apply_klein OPK_KLEIN_SGL_OUT arm contract):
+    #   0 out_in, 1 w2_att, 2 w2_mlp, 3 gate_vec, 4 out_a, 5 out_b
+    var saved = List[TArc]()
+    saved.append(TArc(out_in^))
+    saved.append(w.w2_att.copy())
+    saved.append(w.w2_mlp.copy())
+    saved.append(gate_vec.copy())
+    saved.append(out_ad.a.copy())
+    saved.append(out_ad.b.copy())
+    var meta: List[Int] = [S_rows, D, F, out_ad.rank]
+    var scalars: List[Float32] = [out_ad.scale]
+    var oids: List[Int] = [out_id]
+    _ = g.record(OPK_KLEIN_SGL_OUT, edges^, saved^, meta^, scalars^, oids)
+    return out_id

@@ -39,6 +39,9 @@ from serenitymojo.ops.elementwise import (
 )
 from serenitymojo.ops.rope import rope_interleaved, rope_interleaved_slab
 from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_slab
+from serenitymojo.ops.attention_flash import sdpa_flash_train_fwd_f32
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.models.klein.single_block import KLEIN_SDPA_FLASH
 from serenitymojo.ops.activations import swiglu, swiglu_slab
 from serenitymojo.ops.tensor_algebra import add, add_slab
 from serenitymojo.ops.linalg_backward import (
@@ -1038,21 +1041,39 @@ def record_klein_sgl_sdpa[
     rope_backward x2, d_v reshape. Edges: [q_rms, k_rms, v]."""
     var q_rope = rope_interleaved(q_rms[], cos[], sin[], ctx)
     var k_rope = rope_interleaved(k_rms[], cos[], sin[], ctx)
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v[], scale, ctx)
-    var att_flat = _ta_reshape_owned(att^, [S, D])
+    # saved layout: 0 q_rope, 1 k_rope, 2 v, 3 cos, 4 sin
+    # (+ flash: 5 q_bf, 6 k_bf, 7 v_bf, 8 o_bf, 9 stats — KLEIN_SDPA_FLASH,
+    # same swap as the hand-chain helper; arm dispatches on saved arity)
+    var saved = List[TArc]()
+    var att_flat: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v[], scale, ctx)
+        var af_shape: List[Int] = [S, D]
+        att_flat = Tensor(ff.att.buf.copy(), af_shape^, STDtype.F32)
+        saved.append(TArc(q_rope^))
+        saved.append(TArc(k_rope^))
+        saved.append(v.copy())
+        saved.append(cos.copy())
+        saved.append(sin.copy())
+        saved.append(ff.q_bf.copy())
+        saved.append(ff.k_bf.copy())
+        saved.append(ff.v_bf.copy())
+        saved.append(ff.o_bf.copy())
+        saved.append(ff.stats.copy())
+    else:
+        var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v[], scale, ctx)
+        att_flat = _ta_reshape_owned(att^, [S, D])
+        saved.append(TArc(q_rope^))
+        saved.append(TArc(k_rope^))
+        saved.append(v.copy())
+        saved.append(cos.copy())
+        saved.append(sin.copy())
     att_flat.set_id(g.fresh_tensor_id())
 
     var edges = List[Edge]()
     edges.append(g.edge_for(q_rms[].id))
     edges.append(g.edge_for(k_rms[].id))
     edges.append(g.edge_for(v[].id))
-    # saved layout: 0 q_rope, 1 k_rope, 2 v, 3 cos, 4 sin
-    var saved = List[TArc]()
-    saved.append(TArc(q_rope^))
-    saved.append(TArc(k_rope^))
-    saved.append(v.copy())
-    saved.append(cos.copy())
-    saved.append(sin.copy())
     var meta: List[Int] = [S, D]
     var scalars: List[Float32] = [scale]
     var oids: List[Int] = [att_flat.id]

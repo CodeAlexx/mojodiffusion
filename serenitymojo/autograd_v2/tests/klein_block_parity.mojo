@@ -35,6 +35,7 @@
 #   /tmp/klein_block_parity
 
 from std.gpu.host import DeviceContext
+from std.math import sqrt
 from std.builtin.dtype import DType
 from std.collections import Optional
 from serenitymojo.tensor import Tensor
@@ -50,6 +51,7 @@ from serenitymojo.models.klein.double_block import (
     double_block_lora_backward_device_resident_scratch_tensors,
 )
 from serenitymojo.models.klein.single_block import (
+    KLEIN_SDPA_FLASH,
     SingleBlockWeights,
     SingleModVecsDevice,
     SingleBlockLoraDevice,
@@ -201,6 +203,64 @@ def _gate_pair(
     return n_mismatch == 0
 
 
+def _gate_pair_tol(
+    name: String, a: Tensor, b: Tensor, ctx: DeviceContext
+) raises -> Bool:
+    """Value-tolerance gate for tensors downstream of the cuDNN flash dQ
+    (KLEIN_SDPA_FLASH): the flash backward's dQ accumulation is
+    NONDETERMINISTIC across calls (MEASURED 2026-06-11: 653/6.3M bf16
+    elements flip between two identical-input calls in one process; dK is
+    deterministic), so bit-equality between the hand-chain and graph paths
+    is impossible for dQ-derived grads BY THE KERNEL'S NATURE. Gate =
+    cosine >= 0.999999 AND max_abs <= 1e-3 (the observed flip class is
+    +-1 ulp; a wiring bug is many orders larger). Non-degeneracy guarded."""
+    var ah = a.to_host(ctx)
+    var bh = b.to_host(ctx)
+    if len(ah) != len(bh):
+        print("GATE klein_parity " + name + " FAIL (length mismatch)")
+        return False
+    var dot = 0.0
+    var na = 0.0
+    var nb2 = 0.0
+    var max_abs = 0.0
+    var nonzero = False
+    for i in range(len(ah)):
+        var x = Float64(ah[i])
+        var y = Float64(bh[i])
+        if x != 0.0:
+            nonzero = True
+        dot += x * y
+        na += x * x
+        nb2 += y * y
+        var d = x - y
+        if d < 0:
+            d = -d
+        if d > max_abs:
+            max_abs = d
+    if not nonzero:
+        print("GATE klein_parity " + name + " FAIL (degenerate all-zero)")
+        return False
+    var denom = sqrt(na) * sqrt(nb2)
+    var cosine = 1.0
+    if denom > 0.0:
+        cosine = dot / denom
+    var ok = cosine >= 0.999999 and max_abs <= 1.0e-3
+    print(
+        "GATE klein_parity " + name + " " + ("PASS" if ok else "FAIL")
+        + " (flash-tol) cos=" + String(cosine) + " max_abs=" + String(max_abs)
+    )
+    return ok
+
+
+def _gate_opt_tol(
+    name: String, a: Optional[TArc], b: Optional[TArc], ctx: DeviceContext
+) raises -> Bool:
+    if not a or not b:
+        print("GATE klein_parity " + name + " FAIL (missing grad Optional)")
+        return False
+    return _gate_pair_tol(name, a.value()[], b.value()[], ctx)
+
+
 def _gate_opt(
     name: String, a: Optional[TArc], b: Optional[TArc], ctx: DeviceContext
 ) raises -> Bool:
@@ -337,9 +397,18 @@ def main() raises:
         norm_ones, norm_zeros, ctx, scratch,
     )
 
-    all_ok = _gate_pair(String("sgl d_x"), sor.d_x[], sgr.d_x[], ctx) and all_ok
-    all_ok = _gate_opt(String("sgl s0 qkv_d_a"), sor.qkv_d_a, sgr.qkv_d_a, ctx) and all_ok
-    all_ok = _gate_opt(String("sgl s0 qkv_d_b"), sor.qkv_d_b, sgr.qkv_d_b, ctx) and all_ok
+    # d_x and the qkv adapter grads sit downstream of the flash dQ (the
+    # nondeterministic accumulation, see _gate_pair_tol) -> value-tolerance
+    # gate in flash mode, bit gate otherwise. out_* are NOT downstream of
+    # the SDPA backward -> always bit-strict.
+    comptime if KLEIN_SDPA_FLASH:
+        all_ok = _gate_pair_tol(String("sgl d_x"), sor.d_x[], sgr.d_x[], ctx) and all_ok
+        all_ok = _gate_opt_tol(String("sgl s0 qkv_d_a"), sor.qkv_d_a, sgr.qkv_d_a, ctx) and all_ok
+        all_ok = _gate_opt_tol(String("sgl s0 qkv_d_b"), sor.qkv_d_b, sgr.qkv_d_b, ctx) and all_ok
+    else:
+        all_ok = _gate_pair(String("sgl d_x"), sor.d_x[], sgr.d_x[], ctx) and all_ok
+        all_ok = _gate_opt(String("sgl s0 qkv_d_a"), sor.qkv_d_a, sgr.qkv_d_a, ctx) and all_ok
+        all_ok = _gate_opt(String("sgl s0 qkv_d_b"), sor.qkv_d_b, sgr.qkv_d_b, ctx) and all_ok
     all_ok = _gate_opt(String("sgl s1 out_d_a"), sor.out_d_a, sgr.out_d_a, ctx) and all_ok
     all_ok = _gate_opt(String("sgl s1 out_d_b"), sor.out_d_b, sgr.out_d_b, ctx) and all_ok
 

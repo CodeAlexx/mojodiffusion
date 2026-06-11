@@ -277,3 +277,118 @@ def sdpa_flash_backward[
             Tensor(dv_o^, sh^, STDtype.BF16),
         )
     return SdpaFlashGrads(d_q^, d_k^, d_v^)
+
+
+# ─── F32-boundary helpers (Klein: F32 activations, approved bf16 flash) ──────
+# Klein's trainer SDPA runs on F32 activations (the "9,216 F32 sgemms"
+# attribution). The approved flash path casts q/k/v -> bf16 at the SDPA
+# boundary, runs cuDNN flash, and casts O / dQ/dK/dV back to F32. ALIGNED
+# SHAPES ONLY (S % 128 == 0 — Klein S=1536; fail-loud otherwise: no padding
+# logic on this path). The bf16 q/k/v/o + stats are returned as TArcs for the
+# saved tape; the backward consumes them without re-casting.
+
+from std.memory import ArcPointer
+from serenitymojo.ops.cast import cast_tensor
+
+comptime TArc = ArcPointer[Tensor]
+
+
+struct SdpaFlashF32Fwd(Movable):
+    var att: Tensor      # [B,S,H,Dh] F32 — the math-path drop-in output
+    var q_bf: TArc
+    var k_bf: TArc
+    var v_bf: TArc
+    var o_bf: TArc
+    var stats: TArc
+
+    def __init__(
+        out self,
+        var att: Tensor, var q_bf: TArc, var k_bf: TArc, var v_bf: TArc,
+        var o_bf: TArc, var stats: TArc,
+    ):
+        self.att = att^
+        self.q_bf = q_bf^
+        self.k_bf = k_bf^
+        self.v_bf = v_bf^
+        self.o_bf = o_bf^
+        self.stats = stats^
+
+
+def sdpa_flash_train_fwd_f32[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashF32Fwd:
+    comptime if (S % 128) != 0:
+        raise Error("sdpa_flash_train_fwd_f32: S must be 128-aligned")
+    var q_bf = cast_tensor(q, STDtype.BF16, ctx)
+    var k_bf = cast_tensor(k, STDtype.BF16, ctx)
+    var v_bf = cast_tensor(v, STDtype.BF16, ctx)
+    var fwd = sdpa_flash_train_fwd[B, S, H, Dh](q_bf, k_bf, v_bf, scale, ctx)
+    var att = cast_tensor(fwd.o, STDtype.F32, ctx)
+    return SdpaFlashF32Fwd(
+        att^, TArc(q_bf^), TArc(k_bf^), TArc(v_bf^),
+        TArc(Tensor(fwd.o_pad.buf.copy(), fwd.o_pad.shape(), fwd.o_pad.dtype())),
+        TArc(Tensor(fwd.stats.buf.copy(), fwd.stats.shape(), fwd.stats.dtype())),
+    )
+
+
+def sdpa_flash_backward_f32[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q_bf: TArc, k_bf: TArc, v_bf: TArc, o_bf: TArc, stats: TArc,
+    d_att: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashGrads:
+    """Aligned-only flash backward with F32 grads in/out. d_att F32 ->
+    bf16; dQ/dK/dV bf16 -> F32 (the hand-chain consumes F32)."""
+    comptime if (S % 128) != 0:
+        raise Error("sdpa_flash_backward_f32: S must be 128-aligned")
+    var do_bf = cast_tensor(d_att, STDtype.BF16, ctx)
+
+    var nbytes = B * S * H * Dh * 2
+    var dq_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dk_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dv_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var g_shape: List[Int] = [B, S, H, Dh]
+    var dq_bf = Tensor(dq_buf^, g_shape.copy(), STDtype.BF16)
+    var dk_bf = Tensor(dk_buf^, g_shape.copy(), STDtype.BF16)
+    var dv_bf = Tensor(dv_buf^, g_shape^, STDtype.BF16)
+
+    var qs = _strides_bhnd(S, H, Dh)
+    var ks = _strides_bhnd(S, H, Dh)
+    var vs = _strides_bhnd(S, H, Dh)
+    var os_ = _strides_bhnd(S, H, Dh)
+    var dos = _strides_bhnd(S, H, Dh)
+    var dqs = _strides_bhnd(S, H, Dh)
+    var dks = _strides_bhnd(S, H, Dh)
+    var dvs = _strides_bhnd(S, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bwd_bf16", Int32](
+        _dev_ptr(q_bf[]), _dev_ptr(k_bf[]), _dev_ptr(v_bf[]),
+        _dev_ptr(o_bf[]), _dev_ptr(do_bf), _dev_ptr(stats[]),
+        _dev_ptr(dq_bf), _dev_ptr(dk_bf), _dev_ptr(dv_bf),
+        Int32(B), Int32(H), Int32(S), Int32(S), Int32(Dh),
+        scale,
+        qs, ks, vs, os_, dos, dqs, dks, dvs,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0), Int32(S), Int32(S),
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    dos.free(); dqs.free(); dks.free(); dvs.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_backward_f32: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S=" + String(S)
+            + " H=" + String(H) + " Dh=" + String(Dh) + ")"
+        )
+    return SdpaFlashGrads(
+        cast_tensor(dq_bf, STDtype.F32, ctx),
+        cast_tensor(dk_bf, STDtype.F32, ctx),
+        cast_tensor(dv_bf, STDtype.F32, ctx),
+    )

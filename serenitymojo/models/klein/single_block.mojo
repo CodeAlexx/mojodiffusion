@@ -89,6 +89,17 @@ from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
+# cuDNN flash SDPA (approved numerics change 2026-06-11, memory
+# sdpa-flash-signoff): the PRODUCTION resident-scratch recompute+backward
+# pair runs attention through cuDNN flash with F32<->bf16 boundary casts
+# (Klein S=1536 is 128-aligned — zero-copy path). Old math path stays
+# compiled in the non-flag branch + every other fwd/bwd variant (C13).
+# Anchors MOVE by design — re-anchor on flip (gate: sdpa_flash_parity).
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd_f32, sdpa_flash_backward_f32, SdpaFlashF32Fwd,
+)
+
+comptime KLEIN_SDPA_FLASH = True
 from serenitymojo.ops.tensor_algebra import (
     reshape, reshape_owned, reshape_in_place, slice, concat, add, add_in_place_f32,
     mul, mul_scalar, zeros_device,
@@ -273,6 +284,15 @@ struct SingleBlockSaved(Copyable, Movable):
     var mlp: TArc      # [S,F]      swiglu(mlp_gate, mlp_up)
     var out_in: TArc   # [S, D+F]   concat(axis=1, att_flat, mlp)
     # cos/sin are NOT saved (constant rope tables borrowed by the backward).
+    # Flash-SDPA saved set (Optional: only the KLEIN_SDPA_FLASH recompute
+    # path fills these; every other constructor site passes nothing):
+    # bf16 q_rope/k_rope/v + bf16 O + F32 LSE stats — exactly what
+    # sdpa_flash_backward_f32 consumes, no re-casting in backward.
+    var flash_q: Optional[TArc]
+    var flash_k: Optional[TArc]
+    var flash_v: Optional[TArc]
+    var flash_o: Optional[TArc]
+    var flash_stats: Optional[TArc]
 
     def __init__(
         out self,
@@ -283,6 +303,11 @@ struct SingleBlockSaved(Copyable, Movable):
         var att_flat: TArc,
         var mlp_gate: TArc, var mlp_up: TArc, var mlp: TArc,
         var out_in: TArc,
+        var flash_q: Optional[TArc] = None,
+        var flash_k: Optional[TArc] = None,
+        var flash_v: Optional[TArc] = None,
+        var flash_o: Optional[TArc] = None,
+        var flash_stats: Optional[TArc] = None,
     ):
         self.x = x^
         self.ln = ln^
@@ -299,6 +324,11 @@ struct SingleBlockSaved(Copyable, Movable):
         self.mlp_up = mlp_up^
         self.mlp = mlp^
         self.out_in = out_in^
+        self.flash_q = flash_q^
+        self.flash_k = flash_k^
+        self.flash_v = flash_v^
+        self.flash_o = flash_o^
+        self.flash_stats = flash_stats^
 
 
 struct SingleBlockForward(Movable):
@@ -1070,21 +1100,45 @@ def single_block_lora_recompute_saved_device_resident_scratch[
 
     var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
     var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
-    var att_flat = reshape_owned(att^, [S, D])
+    comptime if KLEIN_SDPA_FLASH:
+        # cuDNN flash with F32<->bf16 boundary casts; bf16 q/k/v/o + stats
+        # go to the tape for the flash backward (no recompute, no re-cast).
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        # zero-copy re-box [1,S,H,Dh] -> [S,D] (no partial move out of ff)
+        var af_shape: List[Int] = [S, D]
+        var att_flat = Tensor(ff.att.buf.copy(), af_shape^, STDtype.F32)
 
-    var mlp_gate = slice(gate_up, 1, 0, F, ctx)
-    var mlp_up = slice(gate_up, 1, F, F, ctx)
-    var mlp = swiglu(mlp_gate, mlp_up, ctx)
-    scratch.rewind(scratch_mark)
+        var mlp_gate = slice(gate_up, 1, 0, F, ctx)
+        var mlp_up = slice(gate_up, 1, F, F, ctx)
+        var mlp = swiglu(mlp_gate, mlp_up, ctx)
+        scratch.rewind(scratch_mark)
 
-    var out_in = concat(1, ctx, att_flat, mlp)
-    return SingleBlockSaved(
-        x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
-        TArc(q_rms^), TArc(k_rms^), TArc(v^),
-        TArc(q_rope^), TArc(k_rope^), TArc(att_flat^),
-        TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in^),
-    )
+        var out_in = concat(1, ctx, att_flat, mlp)
+        return SingleBlockSaved(
+            x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
+            TArc(q_rms^), TArc(k_rms^), TArc(v^),
+            TArc(q_rope^), TArc(k_rope^), TArc(att_flat^),
+            TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in^),
+            Optional[TArc](ff.q_bf.copy()), Optional[TArc](ff.k_bf.copy()),
+            Optional[TArc](ff.v_bf.copy()), Optional[TArc](ff.o_bf.copy()),
+            Optional[TArc](ff.stats.copy()),
+        )
+    else:
+        var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        var att_flat = reshape_owned(att^, [S, D])
+
+        var mlp_gate = slice(gate_up, 1, 0, F, ctx)
+        var mlp_up = slice(gate_up, 1, F, F, ctx)
+        var mlp = swiglu(mlp_gate, mlp_up, ctx)
+        scratch.rewind(scratch_mark)
+
+        var out_in = concat(1, ctx, att_flat, mlp)
+        return SingleBlockSaved(
+            x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
+            TArc(q_rms^), TArc(k_rms^), TArc(v^),
+            TArc(q_rope^), TArc(k_rope^), TArc(att_flat^),
+            TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in^),
+        )
 
 
 def single_block_lora_forward_device[
@@ -1404,20 +1458,43 @@ def single_block_lora_backward_device_resident_scratch_tensors[
     var sgb = swiglu_backward(d_mlp, saved.mlp_gate[], saved.mlp_up[], ctx)
     var d_gate_up = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
 
-    var sb = sdpa_backward_scratch[1, S, H, Dh](
-        saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx, scratch,
-    )
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        # flash backward from the tape's bf16 saved set (FAIL-LOUD if the
+        # recompute path didn't fill it — fwd/bwd flag mismatch).
+        if not saved.flash_stats:
+            raise Error(
+                "single_block bwd: KLEIN_SDPA_FLASH on but saved tape has"
+                " no flash stats (recompute/backward flag mismatch)"
+            )
+        var fb = sdpa_flash_backward_f32[1, S, H, Dh](
+            saved.flash_q.value(), saved.flash_k.value(),
+            saved.flash_v.value(), saved.flash_o.value(),
+            saved.flash_stats.value(), d_att, scale, ctx,
+        )
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
+    else:
+        var sb = sdpa_backward_scratch[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx, scratch,
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
 
-    var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
-    var d_k_rms = rope_backward(sb.d_k, cos, sin, True, ctx)
+    var d_q_rms = rope_backward(d_q_sb, cos, sin, True, ctx)
+    var d_k_rms = rope_backward(d_k_sb, cos, sin, True, ctx)
 
     var d_q_pre_t = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
     var d_k_pre_t = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
 
     var d_q_pre_flat = reshape_owned(d_q_pre_t^, [S, D])
     var d_k_pre_flat = reshape_owned(d_k_pre_t^, [S, D])
-    reshape_in_place(sb.d_v, [S, D])
-    var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, sb.d_v, True)
+    reshape_in_place(d_v_sb, [S, D])
+    var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, d_v_sb, True)
 
     var d_norm_t = linear_backward_dx_split_scratch(
         d_qkv, d_gate_up, w.w1[], S, D, 3 * D, 2 * F, ctx, scratch,

@@ -71,6 +71,7 @@ from serenitymojo.models.klein.double_block import (
     _stream_pre_backward_lora_resident_scratch_tensors,
     _stream_post_backward_lora_resident_scratch_tensors,
 )
+from serenitymojo.ops.attention_flash import sdpa_flash_backward_f32
 from serenitymojo.models.klein.single_block import (
     LoraDropout,
     _klein_lora_bwd_dropout_tensors,
@@ -946,17 +947,35 @@ def apply_klein[
         var D = node.saved_meta[1]
         var scale = node.scalars[0]
         var d_att4 = arc_view_reshaped(grads_in[0][], [1, S_rows, H, Dh])
-        var sb = sdpa_backward_scratch[1, S, H, Dh](
-            node.saved[0][], node.saved[1][], node.saved[2][],
-            d_att4[], scale, ctx, scratch,
-        )
-        var d_q_rms = rope_backward(sb.d_q, node.saved[3][], node.saved[4][], True, ctx)
-        var d_k_rms = rope_backward(sb.d_k, node.saved[3][], node.saved[4][], True, ctx)
-        _ta_reshape_in_place_klein(sb.d_v, [S_rows, D])
+        var d_q_t: Tensor
+        var d_k_t: Tensor
+        var d_v_t: Tensor
+        if len(node.saved) >= 10:
+            # KLEIN_SDPA_FLASH recording (saved 5..9 = bf16 q/k/v/o + stats):
+            # the flash backward — the SAME call the hand-chain helper makes.
+            var fb = sdpa_flash_backward_f32[1, S, H, Dh](
+                node.saved[5].copy(), node.saved[6].copy(),
+                node.saved[7].copy(), node.saved[8].copy(),
+                node.saved[9].copy(), d_att4[], scale, ctx,
+            )
+            d_q_t = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+            d_k_t = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+            d_v_t = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
+        else:
+            var sb = sdpa_backward_scratch[1, S, H, Dh](
+                node.saved[0][], node.saved[1][], node.saved[2][],
+                d_att4[], scale, ctx, scratch,
+            )
+            d_q_t = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+            d_k_t = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+            d_v_t = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+        var d_q_rms = rope_backward(d_q_t, node.saved[3][], node.saved[4][], True, ctx)
+        var d_k_rms = rope_backward(d_k_t, node.saved[3][], node.saved[4][], True, ctx)
+        _ta_reshape_in_place_klein(d_v_t, [S_rows, D])
         var out = List[TArc]()
         out.append(TArc(d_q_rms^))
         out.append(TArc(d_k_rms^))
-        out.append(arc_view(sb.d_v))
+        out.append(arc_view(d_v_t))
         return out^
     elif node.kind == OPK_KLEIN_SGL_OUT:
         # Arm = the OUT segment of the single oracle (models/klein/

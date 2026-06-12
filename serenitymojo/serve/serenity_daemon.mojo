@@ -2131,8 +2131,9 @@ def _video_readiness_doc(
         ),
     )
     ltx2.set("runner", JSONValue.from_string(String(LTX2_VIDEO_SMOKE_RUNNER)))
-    ltx2.set("mode", JSONValue.from_string(String("staged lora stream audio nonag")))
+    ltx2.set("mode", JSONValue.from_string(String("staged lora stream noaudio nonag")))
     ltx2.set("default_steps", JSONValue.from_int(1))
+    ltx2.set("default_audio_mode", JSONValue.from_string(String("noaudio")))
     ltx2.set("target_width", JSONValue.from_int(768))
     ltx2.set("target_height", JSONValue.from_int(512))
     ltx2.set("target_frame_count", JSONValue.from_int(121))
@@ -2306,6 +2307,11 @@ def _ltx2_staged_smoke_video_result(
             + "'; supported runner is ltx2_staged_dev_smoke"
         )
     var steps = _opt_int(body, "steps", 1, 1, 3)
+    var audio_mode = _opt_str(body, "audio_mode", String("noaudio"))
+    if audio_mode == "video":
+        audio_mode = String("noaudio")
+    if audio_mode != "audio" and audio_mode != "noaudio":
+        raise Error("unsupported audio_mode '" + audio_mode + "'; use audio or noaudio")
     if not _video_runner_available():
         raise Error(
             String("missing executable ") + String(LTX2_VIDEO_SMOKE_RUNNER)
@@ -2314,14 +2320,19 @@ def _ltx2_staged_smoke_video_result(
 
     var out_dir = String(OUT_DIR) + String("/") + video_id
     var log_path = out_dir + String("/ltx2_video_runner.log")
-    var mp4_path = out_dir + String("/ltx2_t2v_av_stage2_dev_smoke.mp4")
-    var wav_path = out_dir + String("/dev_audio.wav")
+    var mp4_path = out_dir + String("/ltx2_t2v_stage2_dev_smoke.mp4")
+    var wav_path = String("")
+    if audio_mode == "audio":
+        mp4_path = out_dir + String("/ltx2_t2v_av_stage2_dev_smoke.mp4")
+        wav_path = out_dir + String("/dev_audio.wav")
     var manifest_path = out_dir + String("/ltx2_video_result.json")
     _ = _system(String("mkdir -p ") + _shell_quote(out_dir))
 
     var cmd = (
         _shell_quote(String(LTX2_VIDEO_SMOKE_RUNNER))
-        + String(" staged lora stream audio nonag ")
+        + String(" staged lora stream ")
+        + audio_mode
+        + String(" nonag ")
         + _shell_quote(out_dir)
         + String(" ")
         + String(steps)
@@ -2344,7 +2355,8 @@ def _ltx2_staged_smoke_video_result(
     o.set("accepted_video_parity", JSONValue.from_bool(False))
     o.set("accepted_sampler_parity", JSONValue.from_bool(False))
     o.set("steps", JSONValue.from_int(steps))
-    o.set("mode", JSONValue.from_string(String("staged lora stream audio nonag")))
+    o.set("mode", JSONValue.from_string(String("staged lora stream ") + audio_mode + String(" nonag")))
+    o.set("audio_mode", JSONValue.from_string(audio_mode))
     o.set("exit_code", JSONValue.from_int(rc))
     o.set("out_dir", JSONValue.from_string(out_dir))
     o.set("mp4", JSONValue.from_string(mp4_path))

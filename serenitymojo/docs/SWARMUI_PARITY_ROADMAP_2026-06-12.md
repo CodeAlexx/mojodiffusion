@@ -36,20 +36,22 @@ sampler/scheduler registry, the bounded LTX2 video smoke runner, the
 model/gallery API slice, bounded Z-Image UniPC bh2, Z-Image multi-LoRA runtime
 stacking, typed linked workflow execution for the supported t2i graph, and the
 runtime UI/gallery/reuse/state contract:
-`66` checks, `66` passed, `P0=0`, `P1=0`, `P2=0`. Product P0 and tracked P1
+`68` checks, `68` passed, `P0=0`, `P1=0`, `P2=0`. Product P0 and tracked P1
 gates are ready. Full SwarmUI all-level parity is still blocked.
 
 Current high-risk runtime gaps:
 
 - Qwen full daemon generation was not run; only the masked-attention fast path
   and tiny parity gate are proven.
-- Video generation is still not accepted; `/v1/video` can launch the bounded
-  `ltx2_staged_dev_smoke` runner and `/v1/video/probe` inspects MP4 artifacts,
-  but no current daemon run has produced MP4/timing/positive-VRAM evidence.
-  The current fast-path run advances through Stage 1, the cuDNN latent
-  upsampler, and one Stage 2 refine step, then times out at
-  `[Stage2] done -> decoding at 2x resolution` with a measured external peak
-  VRAM delta of `6639 MiB`.
+- Full A/V video generation is still not accepted. `/v1/video` can launch the
+  bounded `ltx2_staged_dev_smoke` runner and `/v1/video/probe` inspects MP4
+  artifacts. Current evidence proves the video-only daemon artifact gate:
+  `output/serenity_daemon/video-0072/ltx2_t2v_stage2_dev_smoke.mp4`, `768x512`,
+  `121` frames, `5.041667s`, `24fps`, H.264, `muxing=probe_ok`,
+  `audio_behavior=video_only_no_audio_stream`, `total_wall_seconds=191.062552498`,
+  and external peak VRAM delta `9853 MiB`. Full video parity remains blocked
+  because `accepted_video_parity:false` and the audio-enabled A/V runner is not
+  accepted.
 - Ideogram4 is requested as an image backend target. Its current resident DiT
   path still contains direct `sdpa_nomask`, so it is not accepted until it is
   routed through the fast attention path and proves a daemon artifact with
@@ -221,7 +223,7 @@ Important finding:
 | Klein | Best memory/offload mechanics target. Uses `ScratchRingAllocator` and `TurboPlannedLoader`; product smokes exist in docs. Heavy. | Use after Z-Image product artifact, or if the slice is explicitly memory/offload measurement. |
 | SDXL / SD3 / Flux / Chroma / ERNIE | Useful image candidates, but several are cached-input, staged, or contract smokes rather than full SwarmUI product paths. | Promote only after Z-Image product loop proves the daemon/gallery/runtime pattern. |
 | Qwen | Too large/slow/OOM-prone for full generation in this slice. Static masked-SDPA blocker is fixed with `sdpa_qwen_keymask`; tiny op parity passes, but no full Qwen artifact was run. | Keep Qwen on bounded gates only until memory/offload evidence says a real daemon run is safe. |
-| Video / LTX2 / NAVA / Wan | Not accepted. Components exist. Daemon now has a bounded `/v1/video` LTX2 staged dev smoke runner and `/v1/video/probe` MP4 metadata reader. LTX2 product attention and latent upsampling are on cuDNN fast paths, but no daemon run has emitted accepted MP4/timing/positive-VRAM evidence. | Move the 2x VAE decode boundary off the remaining slow path, inspect the MP4/audio/probe/result manifest, add peak VRAM evidence, and keep `accepted_video_parity:false` until the artifact gate passes. |
+| Video / LTX2 / NAVA / Wan | Partially accepted for LTX2 video-only artifact wiring. Daemon `/v1/video` emits a bounded 121-frame 768x512 MP4 with probe/timing/VRAM evidence in `noaudio` mode. LTX2 product attention, latent upsampling, and video VAE decode use cuDNN fast paths. Full A/V parity is not accepted. | Move the audio VAE/vocoder/mux path off remaining slow boundaries, then prove an audio-enabled MP4/WAV probe with timings and VRAM while keeping `accepted_video_parity:false` until the A/V gate passes. |
 
 ## Milestones
 
@@ -459,18 +461,19 @@ Acceptance:
 ## Immediate Next Slice
 
 Do not implement full Qwen generation. Product P0 is ready after wiring the
-bounded video smoke gate and moving LTX2 attention plus latent upsampling to
-cuDNN fast paths, but the next video slice must complete 2x decode through the
-daemon and capture MP4 frame/duration/mux/audio, timing, and VRAM evidence. It
-is still not a full HQ parity claim.
+bounded video smoke gate and moving LTX2 attention, latent upsampling, and video
+VAE decode to cuDNN fast paths. The current daemon gate emits a real video-only
+MP4 with frame/duration/mux/timing/VRAM evidence. It is still not a full HQ or
+A/V parity claim.
 
 Next implementation slice:
 
-1. Move the LTX2 2x VAE decode boundary off its current slow path; the latest
-   fast-attention and cuDNN-upsampler run reaches
-   `[Stage2] done -> decoding at 2x resolution` and times out there.
-2. Rerun the bounded daemon-backed LTX2 video smoke and record exact
-   artifact/runtime blocker evidence if it OOMs, stalls, or fails probe.
+1. Move the LTX2 audio VAE/vocoder/mux path off remaining slow boundaries and
+   prove `audio_mode:"audio"` through the daemon with MP4/WAV probe fields,
+   timings, and VRAM.
+2. Add stage timing fields around video decode, frame PNG write, mux, audio VAE,
+   vocoder, and audio mux so future runs identify the next slow boundary without
+   relying on log-tail inference.
 3. Add the Ideogram4 image backend only after replacing its direct
    `sdpa_nomask` resident DiT attention with a fast SDPA path and proving a
    daemon artifact with metadata, timings, and VRAM.

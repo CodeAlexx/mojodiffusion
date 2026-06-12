@@ -258,7 +258,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             return http_json(
                 "POST",
                 f"{base_url}/v1/video",
-                {"runner": "ltx2_staged_dev_smoke", "steps": args.steps},
+                {
+                    "runner": "ltx2_staged_dev_smoke",
+                    "steps": args.steps,
+                    "audio_mode": args.audio_mode,
+                },
                 timeout=args.timeout + 30.0,
             )
 
@@ -358,12 +362,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     else:
         checks.append(fail("artifact", "MP4 artifact accepted", "video artifact gate did not complete", {"http_status": result_status, "result": result_body, "timed_out": timed_out, "stage": stage, "log_tail": log_tail[-4000:]}, "Video gate emits a real MP4 with frame count, duration, muxing, timings, and VRAM evidence."))
 
+    claims_video_parity = (
+        result_ready
+        and isinstance(result_body, dict)
+        and result_body.get("accepted_video_parity") is True
+    )
     blockers = [check for check in checks if not check.ok]
     report = {
         "schema": "serenity.ltx2_video_daemon_readiness.v1",
         "ready": not blockers,
         "product_wiring_ready": runner_started and bool(video_id),
-        "claims_video_parity": result_ready,
+        "claims_video_artifact_gate": result_ready,
+        "claims_video_parity": claims_video_parity,
         "known_scope": "daemon-backed LTX2 staged dev smoke; Python samples external VRAM only",
         "summary": {
             "checks": len(checks),
@@ -374,6 +384,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "stage": stage,
             "peak_gpu_memory_used_mib": peak_used,
             "peak_gpu_memory_delta_mib": peak_delta,
+            "audio_mode": args.audio_mode,
         },
         "evidence": {
             "base_url": base_url,
@@ -405,7 +416,8 @@ def print_report(report: dict[str, Any]) -> None:
         f"stage={summary['stage']}"
     )
     print("[ltx2-video] product wiring: " + ("READY" if report["product_wiring_ready"] else "BLOCKED"))
-    print("[ltx2-video] video parity: " + ("READY" if report["claims_video_parity"] else "BLOCKED"))
+    print("[ltx2-video] MP4 artifact gate: " + ("READY" if report["claims_video_artifact_gate"] else "BLOCKED"))
+    print("[ltx2-video] full video parity: " + ("READY" if report["claims_video_parity"] else "BLOCKED"))
 
 
 def main() -> int:
@@ -416,10 +428,12 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--sample-interval", type=float, default=1.0)
     parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--audio-mode", choices=("noaudio", "audio"), default="noaudio")
     parser.add_argument("--log", type=Path)
     parser.add_argument("--write-readiness", type=Path, default=DEFAULT_READINESS)
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--strict", action="store_true", help="exit 2 unless video parity is accepted")
+    parser.add_argument("--strict", action="store_true", help="exit 2 unless full video parity is accepted")
+    parser.add_argument("--strict-artifact", action="store_true", help="exit 2 unless the bounded MP4 artifact gate passes")
     args = parser.parse_args()
 
     if not args.daemon.is_file():
@@ -434,6 +448,8 @@ def main() -> int:
     else:
         print_report(report)
     if args.strict and not report["claims_video_parity"]:
+        return 2
+    if args.strict_artifact and not report["claims_video_artifact_gate"]:
         return 2
     return 0
 

@@ -120,9 +120,9 @@ struct LTX2VaeDecoderWeights(Movable):
     """Full LTX-2.3 video-VAE decoder weights: per_channel_statistics +
     conv_in + up_blocks.0..8 (Mid res_blocks + DepthToSpace convs) + conv_out.
 
-    Conv weights are permuted host-side from the checkpoint OIDHW layout
-    [Cout,Cin,kD,kH,kW] to the conv3d QRSCF layout [kD,kH,kW,Cin,Cout] at load.
-    Statistics stored NDHWC-broadcast-ready as [1,1,1,1,C]."""
+    Conv weights stay in checkpoint FCQRS/OIDHW layout [Cout,Cin,kD,kH,kW],
+    which the cuDNN conv path consumes directly. Statistics are stored
+    NDHWC-broadcast-ready as [1,1,1,1,C]."""
 
     var weights: List[ArcPointer[Tensor]]
     var name_to_idx: Dict[String, Int]
@@ -150,8 +150,9 @@ struct LTX2VaeDecoderWeights(Movable):
     ) raises -> LTX2VaeDecoderWeights:
         """Load all decoder weights from the LTX-2.3 single-file checkpoint.
         Only `vae.decoder.*` + `vae.per_channel_statistics.*` tensors hit GPU.
-        Conv weights are kept RAW (OIDHW) here and permuted to QRSCF lazily at
-        first use (see _conv3d_w) so we do not double-store."""
+        Conv weights are kept raw FCQRS/OIDHW and passed directly to cuDNN at
+        each conv site so decode does not download or transpose weights on the
+        host."""
         var sharded = ShardedSafeTensors.open(checkpoint_path)
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
@@ -219,37 +220,6 @@ struct LTX2VaeDecoderWeights(Movable):
         var idx = self.name_to_idx[name]
         return self.weights[idx][]
 
-    # PyTorch conv3d weight OIDHW [Cout,Cin,kD,kH,kW] -> QRSCF [kD,kH,kW,Cin,Cout].
-    def _conv3d_w(self, name: String, ctx: DeviceContext) raises -> Tensor:
-        ref w = self._w(name)
-        var s = w.shape()
-        if len(s) != 5:
-            raise Error(String("LTX2 VAE: conv weight not rank-5 OIDHW: ") + name)
-        var cout = s[0]
-        var cin = s[1]
-        var kd = s[2]
-        var kh = s[3]
-        var kw = s[4]
-        var host = w.to_host(ctx)  # F32, OIDHW order
-        var out = List[Float32]()
-        out.resize(cout * cin * kd * kh * kw, Float32(0.0))
-        for o in range(cout):
-            for ci in range(cin):
-                for d in range(kd):
-                    for r in range(kh):
-                        for c in range(kw):
-                            var oidhw = (
-                                (((o * cin + ci) * kd + d) * kh + r) * kw + c
-                            )
-                            var qrscf = (
-                                (((d * kh + r) * kw + c) * cin + ci) * cout + o
-                            )
-                            out[qrscf] = host[oidhw]
-        var osh = List[Int]()
-        osh.append(kd); osh.append(kh); osh.append(kw)
-        osh.append(cin); osh.append(cout)
-        return Tensor.from_host(out, osh^, w.dtype(), ctx)
-
     def _bias(self, name: String, ctx: DeviceContext) raises -> Tensor:
         ref b = self._w(name)
         var dev = ctx.enqueue_create_buffer[DType.uint8](b.nbytes())
@@ -269,7 +239,7 @@ struct LTX2VaeDecoderWeights(Movable):
     def _causal_conv3d(
         self,
         x: Tensor,
-        var w_fcqrs: Tensor,
+        w_fcqrs: Tensor,
         var bias: Tensor,
         ctx: DeviceContext,
     ) raises -> Tensor:
@@ -282,16 +252,15 @@ struct LTX2VaeDecoderWeights(Movable):
         var last = slice(x, 1, d - 1, 1, ctx)
         var x_pad = concat(1, ctx, first, x, last)
         return conv3d_fcqrs_cudnn(
-            x_pad, w_fcqrs^, Optional[Tensor](bias^),
+            x_pad, w_fcqrs, Optional[Tensor](bias^),
             1, 1, 1, 0, HALF_PAD, HALF_PAD, ctx,
         )
 
     def _conv3d_named(
         self, x: Tensor, prefix: String, ctx: DeviceContext
     ) raises -> Tensor:
-        var w = self._clone(self._w(prefix + ".weight"), ctx)
         var b = self._bias(prefix + ".bias", ctx)
-        return self._causal_conv3d(x, w^, b^, ctx)
+        return self._causal_conv3d(x, self._w(prefix + ".weight"), b^, ctx)
 
     # ── PixelNorm (RMS over channel/last dim, NO weight; ones gamma prefix) ──
     def _pixel_norm(self, x: Tensor, ch: Int, ctx: DeviceContext) raises -> Tensor:

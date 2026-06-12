@@ -101,8 +101,9 @@ Acceptance evidence:
 - 2026-06-12 current checker:
   `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=66 passed=66 p0=0 p1=0 p2=0` after implementing the LTX2 fast
-  attention route and bounded video gate. Product P0 and tracked P1 gates are ready.
+  `checks=68 passed=68 p0=0 p1=0 p2=0` after implementing the LTX2 fast
+  attention route, cuDNN upsampler/VAE decode gates, and bounded video gate.
+  Product P0 and tracked P1 gates are ready.
   Full SwarmUI all-level parity remains blocked by Qwen full generation,
   accepted video generation, advanced workflow node families, sampler breadth,
   and Z-Image speed parity. `images=N` now
@@ -237,9 +238,9 @@ Current blockers:
   readiness/status contract, exposes `/v1/video/probe?path=<mp4>` for real MP4
   metadata (`mp4`, `frame_count`, `duration`, muxing, and audio behavior), and
   `POST /v1/video` can launch the compiled bounded LTX2 staged dev runner when
-  `output/bin/ltx2_video_smoke_runner` exists. This is still not accepted video
-  generation: no current daemon run has produced a verified MP4 plus positive
-  peak VRAM evidence.
+  `output/bin/ltx2_video_smoke_runner` exists. The video-only artifact gate now
+  emits a verified MP4 plus positive peak VRAM evidence; full A/V parity remains
+  blocked because the audio-enabled runner is not accepted.
 
 Required implementation:
 
@@ -260,9 +261,10 @@ Acceptance evidence:
 - `python3 scripts/check_ltx2_dtype_contract.py --scope all` passes.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` now reports
-  `checks=66 passed=66 p0=0 p1=0 p2=0`. This keeps video parity blocked by
-  evidence while proving the bounded daemon runner route, LTX2 fast SDPA route,
-  and tracked UI/gallery/reuse/state P1 gate are wired.
+  `checks=68 passed=68 p0=0 p1=0 p2=0`. This keeps full video parity blocked
+  by evidence while proving the bounded daemon runner route, LTX2 fast SDPA
+  route, cuDNN latent upsampler, direct-FCQRS video VAE decode, and tracked
+  UI/gallery/reuse/state P1 gate are wired.
 - 2026-06-12 fast-path update: LTX2 AV attention now routes both square
   self-attention and rectangular text/cross-modal attention through the BF16
   cuDNN SDPA shim (`sdpa_flash_train_fwd` /
@@ -274,18 +276,37 @@ Acceptance evidence:
   transpose helpers and naive conv wrapper are removed from the upsampler.
   `output/bin/ltx2_upsampler_smoke` passed with spatial cosine `0.99989617`
   and temporal cosine `0.9995859`.
-- Measured daemon evidence after the LTX2 fast-path and upsampler patches:
+- 2026-06-12 VAE decode update: the LTX2 video VAE decoder keeps checkpoint
+  Conv3d weights in FCQRS/OIDHW layout and passes the resident tensors directly
+  to `conv3d_fcqrs_cudnn`; the dead host-side QRSCF transpose helper is removed.
+  The isolated target-shape smoke
+  `output/bin/ltx2_vae_decode_hq121_smoke` completed `[1,3,121,512,768]`
+  decode in `real 24.14s`.
+- Historical measured daemon evidence after the LTX2 fast-path and upsampler
+  patches:
   `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 180
   --write-readiness output/checks/ltx2_video_daemon_readiness.json` reports
   product wiring ready, positive external peak VRAM delta `6639 MiB`, and
   timeout after `[Stage2] done -> decoding at 2x resolution`. This is progress
   from the prior upsampler/VAE-load stall, but it is still not accepted video
   parity because no MP4 artifact was emitted.
+- Current measured daemon video-only evidence:
+  `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 300
+  --audio-mode noaudio --strict-artifact --write-readiness
+  output/checks/ltx2_video_daemon_readiness.json` passed. It emitted
+  `output/serenity_daemon/video-0072/ltx2_t2v_stage2_dev_smoke.mp4`, probe
+  metadata `width=768`, `height=512`, `frame_count=121`, `duration=5.041667`,
+  `fps=24.0`, `video_codec=h264`, `muxing=probe_ok`,
+  `audio_behavior=video_only_no_audio_stream`, and external peak VRAM delta
+  `9853 MiB` (`10999 MiB` peak used). The result manifest records
+  `total_wall_seconds=191.062552498`, `audio_mode:"noaudio"`,
+  `accepted_video_parity:false`, and `accepted_sampler_parity:false`.
 - `POST /v1/video` accepts only `runner:"ltx2_staged_dev_smoke"` and clamps
-  `steps` to `1..3`. It runs
-  `output/bin/ltx2_video_smoke_runner staged lora stream audio nonag
-  output/serenity_daemon/<video-id> <steps>`, writes
-  `ltx2_video_runner.log`, and writes `ltx2_video_result.json` with
+  `steps` to `1..3`. It accepts `audio_mode:"noaudio"` or `"audio"`, defaulting
+  the bounded artifact gate to video-only. It runs
+  `output/bin/ltx2_video_smoke_runner staged lora stream <audio_mode> nonag
+  output/serenity_daemon/<video-id> <steps>`, writes `ltx2_video_runner.log`,
+  and writes `ltx2_video_result.json` with
   `accepted_video_parity:false`, `accepted_sampler_parity:false`,
   `total_wall_seconds`, output paths, and MP4 probe fields when the runner
   succeeds.
@@ -295,11 +316,11 @@ Acceptance evidence:
   `output/artifacts_smoke_seq.mp4`; `/v1/video/probe?path=...` reported
   `width=16`, `height=16`, `frame_count=2`, `duration=0.5`, `fps=4`,
   `video_codec=h264`, `has_audio=false`, and `muxing=probe_ok`.
-- Remaining acceptance gap: the bounded LTX2 runner must move the 2x VAE decode
-  path off its remaining slow boundary, complete through the daemon, and emit a
-  real MP4 with frame/duration/mux/audio fields, successful exit code, timings,
-  and positive peak VRAM before SwarmUI-level video generation parity can be
-  claimed.
+- Remaining acceptance gap: the bounded LTX2 runner must accept the audio-enabled
+  A/V path with MP4 + WAV/audio stream probe fields, successful exit code,
+  timings, and positive peak VRAM before SwarmUI-level video generation parity
+  can be claimed. The current accepted artifact gate is video-only and remains
+  labeled `accepted_video_parity:false`.
 
 ## P1.1 Gallery And Reuse Params
 
@@ -447,7 +468,7 @@ Acceptance evidence:
   expected-type error.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=66 passed=66 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
+  `checks=68 passed=68 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
   Full SwarmUI all-level parity still remains blocked by Qwen full generation,
   accepted video generation, advanced workflow node families, sampler breadth,
   and Z-Image speed parity.

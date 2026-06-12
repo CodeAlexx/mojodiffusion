@@ -53,6 +53,7 @@ ATTENTION = REPO / "serenitymojo/ops/attention.mojo"
 ATTENTION_FLASH = REPO / "serenitymojo/ops/attention_flash.mojo"
 LTX2_HQ = REPO / "serenitymojo/pipeline/ltx2_t2v_av_hq.mojo"
 LTX2_UPSAMPLER = REPO / "serenitymojo/models/upsampler/ltx2_upsampler.mojo"
+LTX2_VAE_DECODER = REPO / "serenitymojo/models/vae/ltx2_vae_decoder.mojo"
 PIXI = REPO / "pixi.toml"
 LTX2_RUN_SCRIPT = REPO / "scripts/run_ltx2_hq121.sh"
 TODO_DOC = REPO / "TODO.md"
@@ -942,6 +943,30 @@ def check_video_path() -> list[Check]:
             acceptance="The LTX2 latent upsampler no longer downloads conv weights to the host for QRSCF/RSCF transposes or calls the old naive conv wrapper.",
         ),
         check_contains(
+            LTX2_VAE_DECODER,
+            category="video-fast-path",
+            label="LTX2 VAE decode uses direct cuDNN FCQRS weights",
+            needles=[
+                "conv3d_fcqrs_cudnn",
+                "passed directly to cuDNN",
+                'self._w(prefix + ".weight")',
+            ],
+            severity=P0,
+            acceptance="The LTX2 video VAE decoder keeps checkpoint FCQRS/OIDHW weights resident and passes them directly to cuDNN conv.",
+        ),
+        check_absent(
+            LTX2_VAE_DECODER,
+            category="video-fast-path",
+            label="LTX2 VAE decode avoids dead host-transpose helper",
+            needles=[
+                "def _conv3d_w",
+                "w.to_host(ctx)  # F32, OIDHW order",
+                "QRSCF lazily",
+            ],
+            severity=P0,
+            acceptance="The LTX2 video VAE decoder does not carry or call the old host-side QRSCF transpose path.",
+        ),
+        check_contains(
             LTX2_VIDEO_DAEMON_CHECK,
             category="video",
             label="bounded video checker records stage and VRAM",
@@ -949,6 +974,8 @@ def check_video_path() -> list[Check]:
                 "peak_gpu_memory_delta_mib",
                 "stage",
                 "timed_out",
+                "audio_mode",
+                "claims_video_artifact_gate",
                 "claims_video_parity",
             ],
             severity=P0,
@@ -969,6 +996,9 @@ def check_video_path() -> list[Check]:
             needles=[
                 "LTX2_VIDEO_SMOKE_RUNNER",
                 "_ltx2_staged_smoke_video_result",
+                "audio_mode",
+                "default_audio_mode",
+                "ltx2_t2v_stage2_dev_smoke.mp4",
                 "ltx2_t2v_av_stage2_dev_smoke.mp4",
                 "accepted_video_parity",
                 "total_wall_seconds",

@@ -77,3 +77,30 @@ but the per-model cost has collapsed: HiDream-O1 went survey→trained at
 Items 1-5 ≈ 4-6 weeks of sessions at today's measured velocity to reach
 "everything SimpleTuner does that matters for single-GPU LoRA/full training
 on your models", excluding multi-GPU per scope.
+
+## Appendix: multi-GPU (added on follow-up question, 2026-06-11)
+
+UNVERIFIED ON HARDWARE — this box has one GPU; everything here is design
+assessment, gated only when a second GPU exists.
+
+**Data-parallel LoRA (the high-value mode): ~1-2 weeks to a gated 2-GPU
+version.** Why it's cheap for this stack specifically:
+- LoRA grad sync is tiny (HiDream rank-32: 87M F32 ≈ 350 MB/step; klein/
+  zimage much less) — tens of ms even over PCIe, vs our 1-1.8 s steps.
+- Architecture already fits: one PROCESS per GPU (trainers are single-
+  context by design — engine contract C11 keeps DeviceContext explicit for
+  exactly this), per-rank sample-stride sharding, rank-0 fused AdamW +
+  adapter-buffer broadcast. No model surgery.
+- Only missing primitive = the collective: no Mojo NCCL; route = a thin
+  cshim (ncclAllReduce/ncclBroadcast — the cuDNN-shim pattern that shipped
+  today), or for exactly 2 GPUs cudaMemcpyPeer + a local add kernel.
+- GATE: 2-GPU run must reproduce the equivalent single-GPU batch-2 math
+  (the b2dup-style discipline).
+
+**Costlier modes, scope separately:**
+- Full-finetune DDP: grad sync = full params (GBs/step) — NCCL + comm/
+  compute overlap required; full-FT itself is still Tier-2.
+- FSDP-class sharding: weeks (param shards + per-layer gathers); only
+  needed for models that don't fit even quantized-resident.
+- Pipeline parallel: block-swap architecture maps naturally (blocks pinned
+  per GPU) but bubble management makes it research-grade.

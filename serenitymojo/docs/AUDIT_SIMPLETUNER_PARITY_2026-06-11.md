@@ -41,7 +41,7 @@ aspiration.
 |---|---|
 | 8-bit Adam (bnb parity) | scoreboard G-P4, flame has parity bins as oracle (parity_adam8bit_bnb*.rs). Fused kernel + SR discipline like the OT AdamW |
 | **Quantized-resident training (int8/fp8/nf4 base)** | THE practical gap for big models on 24G — and our 1.0 s HiDream proves the resident payoff. fp8 machinery exists (ideogram4 inference). Needs numerics sign-off per model (same process as flash). This also unlocks ai-toolkit-class speed on every 15B+ model |
-| Full-rank finetune (1–2 models first) | scaffolds exist, 0 runnable (G-T4). Needs optimizer-state offload (flame reference exists) + per-model VRAM math |
+| ~~Full-rank finetune~~ | REMOVED from SimpleTuner-parity scope (Alex, 2026-06-12): our full-FT follows the OneTrainer contract (full_finetune_contract.mojo, F32 masters/moments sidecars) — ST's full-FT is accelerate/DeepSpeed-shaped, out of scope with multi-GPU. Tracked as T2.C in TIER2_PARITY_CAMPAIGN_2026-06-11.md against the OneTrainer oracle |
 | Dynamic aspect bucketing | ours is comptime-bucketed per model (1-3 buckets); ST buckets arbitrarily. Generalize = bucket dispatch tables per trainer (zimage already dispatches 2 buckets — extend the pattern) |
 | ControlNet (1 model) | new conditioning path + zero-conv blocks; gate vs diffusers |
 | Video training (LTX2, Wan) | LTX2 trainer already a campaign item; Wan = new vertical (intake → port) |

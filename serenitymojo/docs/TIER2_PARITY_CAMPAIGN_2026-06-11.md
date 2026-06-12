@@ -14,11 +14,11 @@ serenity-trainer UI.
 |---|---|---|
 | T2.A | 8-bit Adam (bnb block-wise parity) | SHIPPED |
 | T2.B | fp8-quantized-resident base (HiDream first) | SHIPPED (default-OFF) |
-| T2.C | Full-rank finetune (1 model) | WIP — scaffolding committed UNGATED (agent died on spend limit; gates owed) |
+| T2.C | Full-rank finetune (1 model) — RE-SCOPED per Alex 2026-06-12: OneTrainer-contract item, NOT SimpleTuner parity (removed from the ST audit table; ST full-FT is accelerate/DeepSpeed-shaped = out of scope). Oracle = full_finetune_contract.mojo / OneTrainer *FineTuneSetup | WIP — gates in flight (parallel-optimizer bit-equality being fixed) |
 | T2.D | Dynamic aspect bucketing | SHIPPED + follow-up SHIPPED (comptime-generated 14-arm dispatch, landscape buckets live) |
 | T2.E | ControlNet (1 model) | GATED BLOCK (zimage; trainer data path = follow-up) |
 | T2.F | Lycoris LoCon/LoHa/Tucker/OFT | SHIPPED (verified primitives) |
-| T2.F-2 | Lycoris LoKr/BOFT/DoRA | WIP — lokr/boft save fixes committed, smokes pass, UPSTREAM GATES OWED (agent died on spend limit); dora untouched |
+| T2.F-2 | Lycoris LoKr/BOFT/DoRA | SHIPPED (verified primitives — upstream gates run; lokr x3 variants + boft + dora all BIT-EXACT upstream loads) |
 | UI | Lever delivery (ideogram4 argv bridge, hidream runner) | SHIPPED (serenity-trainer eaa88f1) |
 
 ## Oracles / references
@@ -138,15 +138,41 @@ PROVEN (anchor gate EXACT on this tree); the full-FT path itself has NO
 gate yet — VRAM math, smoke, save-format check all owed before any
 "runnable full-FT" claim.
 
-### T2.F-2 — LoKr/BOFT/DoRA (2026-06-11) WIP, upstream gates OWED
-Agent died on spend limit. Committed: lokr_adapter.mojo both-full scale
-quirk mirror (upstream lokr.py:209-211 forces scale=1 when W1+W2 both
-full — header cites lines), lokr_save.mojo + boft_save.mojo format
-rewrites (LoHa/OFT bug-class precedent). In-repo smokes PASS
-(orchestrator re-ran: lokr 3 variants + boft b2x4/b2x2, round-trips
-byte-exact) — but parity vs pip lycoris_lora + upstream load checks DO
-NOT EXIST yet for these three; dora untouched. No family claim until
-those gates run (T2.F bar).
+### T2.F-2 — LoKr/BOFT/DoRA (2026-06-11) SHIPPED, upstream gates RUN
+Predecessor committed: lokr_adapter.mojo both-full scale quirk mirror
+(upstream lokr.py:209-211 forces scale=1 when W1+W2 both full),
+lokr_save.mojo + boft_save.mojo format rewrites. THIS PASS extended the
+T2.F gate trio (gen_lycoris_family_oracle.py / lycoris_family_parity.mojo
+/ lycoris_family_load_check.py) with lokr x3 / boft / dora — same oracle
+(pip lycoris_lora 3.4.0), same bars (fwd cos>=0.99999 + norm_rel<=1e-5;
+upstream loads the Mojo file and reproduces the forward BIT-EXACT,
+max|d|=0.0). The original four families re-ran on the extended gate: ALL
+STILL PASS.
+
+| family | trainable e2e? | fwd parity vs torch | save format | gaps |
+|---|---|---|---|---|
+| LoKr | NO (algo=4 raises in train_klein_real) | PASS x3 variants (W1full+W2factored cos=1-1.7e-15 nr 3.7e-9; both-full cos=1.0 nr 1.2e-9 incl. forced-scale=1 quirk; both-factored cos=1-5.3e-15 nr 4.7e-9) | PASS — bare lokr_w1[_a/_b]/lokr_w2[_a/_b]+alpha keys == upstream, LokrModule loads all 3 BIT-EXACT | stack integration tracked follow-up; saved alpha is the USER alpha in both-full (upstream saves the forced lora_dim; harmless — every loader re-forces scale=1) |
+| BOFT | NO (algo=6 raises in train_klein_real) | PASS (b=2,nb=4,boft_m=3, all stages nontrivially permuted: cos=1-4.8e-15, nr 7.6e-8) | PASS — oft_blocks 4D [m,nb,b,b] (the a1111/comfy BOFT-vs-OFT rank discriminator, upstream algo_check verified) + blocks=-0.5*S orientation fold, ButterflyOFTModule loads BIT-EXACT | alpha==constraint semantics (0 written), like OFT |
+| DoRA | NO (algo=3 raises in train_klein_real) | PASS (cos=1-2e-15, nr 4.7e-9; FULL-forward effective-weight replacement, eps=finfo(f32).eps) | PASS after 2 FIXES — keys were PEFT lora_A/lora_B hybrid (ecosystem-unloadable); now upstream-lycoris lora_down/lora_up + dora_scale + alpha, LoConModule(wd=True) loads BIT-EXACT | oracle choice DOCUMENTED: pip lycoris LoCon(wd=True) (= comfy kohya-DoRA keys), NOT PEFT lora_magnitude_vector; stack integration follow-up |
+
+Bugs fixed this pass:
+1. dora_save.mojo KEYS: `.lora_A.weight`/`.lora_B.weight` (PEFT) →
+   `.lora_down.weight`/`.lora_up.weight` (upstream lycoris LoCon(wd=True)
+   schema; same bug class as the T2.F LoHa/OFT key fixes).
+2. dora_adapter.mojo MAGNITUDE DTYPE: m was BF16 like the low-rank legs,
+   which broke the documented identity-at-init contract by ~0.3%
+   (measured: smoke a-init max|Δ|=3.05e-3 vs the 1e-5 bar — PRE-EXISTING
+   on the committed tree, the dora smoke had never been re-run). Upstream
+   explicitly keeps dora_scale float32 even in bf16 models
+   (locon.py/lokr.py `nn.Parameter(...).float()`); m is now F32 storage
+   + F32 dora_scale on disk. dora_adapter_smoke re-run: ALL GATES PASS
+   (a-init max|Δ|=1.19e-7 = the eps).
+Also gated: LoKr is a SECOND instance of the upstream double-scale quirk
+(get_weight folds scale via make_kron; get_diff_weight multiplies again
+— oracle uses the single-scale live-forward convention, like LoHa).
+Load-check hygiene: mmap'd safetensors x inputs are .clone()d — mmap
+alignment flips torch's GEMM path (±1 ulp) and broke the bit-exact bar.
+lokr/boft/dora in-repo smokes re-run on this tree: ALL PASS.
 
 ### T2.E — ControlNet, Z-Image (2026-06-11) GATED BLOCK; trainer data path = follow-up
 SURVEY: model = zimage (most mature vertical: anchors in configs/, T2.D stager

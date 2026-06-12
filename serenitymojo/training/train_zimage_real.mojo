@@ -174,6 +174,26 @@ from serenitymojo.training.full_finetune_zimage import (
     zimage_full_ft_step, zimage_full_ft_save_checkpoint,
 )
 from serenitymojo.training.train_config import TRAIN_OPTIMIZER_ADAMW_8BIT
+# T2.E ControlNet (controlnet_layers > 0; default-off — C13: the LoRA path
+# routes around ALL of it). Control stack = the gated module
+# (models/zimage/controlnet_block.mojo, parity 46/46 + step smoke); trainer
+# composition (params/init/fwd/bwd/AdamW group/diffusers save) =
+# training/controlnet_zimage.mojo; main-loop hint-injection arms =
+# zimage_stack_lora.mojo *_cn (v2 graph backward engine).
+from serenitymojo.models.zimage.block import (
+    zimage_block_forward, zimage_refiner_forward,
+)
+from serenitymojo.models.zimage.zimage_stack_lora import (
+    zimage_stack_lora_forward_main_from_unified_cn,
+    zimage_stack_lora_backward_main_device_cn,
+)
+from serenitymojo.training.controlnet_zimage import (
+    ZImageCnParams, ZImageCnDevice, ZImageCnForwardState, ZImageCnGrads,
+    zimage_cn_places, zimage_cn_params_init_from_base,
+    zimage_cn_params_load_checkpoint, zimage_cn_upload,
+    zimage_cn_forward, zimage_cn_backward, zimage_cn_apply_step,
+    zimage_cn_save,
+)
 
 
 # ── arch (Z-Image, from transformer config; H/Dh/D fixed comptime) ───────────
@@ -364,9 +384,50 @@ def validate_zimage_full_ft_config(cfg: TrainConfig) raises:
     )
 
 
+# T2.E: the controlnet driver is its own runtime path (frozen base, control
+# group on its own host-AdamW; the compiled LoRA recipe pins below do NOT
+# apply — controlnet uses cfg.lr directly, ControlNet-LR class).
+def validate_zimage_controlnet_config(cfg: TrainConfig) raises:
+    if cfg.adapter_algo != 0:
+        raise Error("Z-Image controlnet training requires adapter_algo=0 (lora config shape, adapters unused)")
+    if cfg.checkpoint == String(""):
+        raise Error("Z-Image controlnet config must set checkpoint transformer dir")
+    if cfg.n_heads != H or cfg.head_dim != Dh or cfg.d_model != D:
+        raise Error("Z-Image controlnet config arch mismatch (heads/head_dim/d_model)")
+    if cfg.in_channels != LAT_C or cfg.joint_attention_dim != CAP_DIM:
+        raise Error("Z-Image controlnet config arch mismatch (in_channels/joint_attention_dim)")
+    if zimage_patchified_out_channels(cfg) != OUT_CH:
+        raise Error("Z-Image controlnet config arch mismatch (out_channels)")
+    if cfg.num_double != 0 or cfg.num_single != MAIN_DEPTH:
+        raise Error("Z-Image controlnet requires 0 double blocks and 30 main layers")
+    if cfg.mlp_hidden != F:
+        raise Error("Z-Image controlnet config arch mismatch (mlp_hidden)")
+    if cfg.controlnet_layers > MAIN_DEPTH:
+        raise Error("Z-Image controlnet: controlnet_layers must be <= 30")
+    if not (cfg.controlnet_scale > 0.0):
+        raise Error("Z-Image controlnet: controlnet_scale must be > 0")
+    if cfg.batch_size == 2:
+        raise Error("Z-Image controlnet v1 is batch-1 only")
+    if not (cfg.lr > Float32(0.0)) or cfg.lr > Float32(1.0e-3):
+        raise Error("Z-Image controlnet learning_rate must be in (0, 1e-3]")
+    if cfg.max_grad_norm <= Float32(0.0):
+        raise Error("Z-Image controlnet requires max_grad_norm > 0")
+    if levers_optimizer_active(cfg):
+        raise Error("Z-Image controlnet v1 uses its own AdamW group; optimizer levers are not wired")
+    validate_ot_gradient_checkpointing_policy(
+        cfg, String("Z-Image controlnet trainer"), OT_GRAD_POLICY_ON_ONLY
+    )
+
+
 def validate_zimage_train_config(cfg: TrainConfig) raises:
     if cfg.adapter_algo == 1:
+        if cfg.controlnet_layers > 0:
+            raise Error("Z-Image full-FT + controlnet is not a supported combination")
         validate_zimage_full_ft_config(cfg)
+        return
+    # T2.E ControlNet runtime path (frozen base; control group trained).
+    if cfg.controlnet_layers > 0:
+        validate_zimage_controlnet_config(cfg)
         return
     if cfg.adapter_algo != 0:
         raise Error(
@@ -421,24 +482,6 @@ def validate_zimage_train_config(cfg: TrainConfig) raises:
         raise Error("Z-Image trainer timestep_shift does not match compiled constant")
     if not _close_f32(cfg.max_grad_norm, CLIP_GRAD_NORM):
         raise Error("Z-Image trainer max_grad_norm does not match compiled constant")
-    # T2.E ControlNet (default-off 0; C13: flags-off path untouched). The
-    # control-block module is PARITY-GATED (models/zimage/controlnet_block.mojo,
-    # gate models/zimage/parity/zimage_controlnet_block_parity.mojo 46/46
-    # cos>=0.99999 vs diffusers ZImageControlNetModel; training semantics
-    # e2e-smoked in zimage_controlnet_step_smoke.mojo). The trainer DATA PATH
-    # (control-image cache channel via zimage_stage_alina/zimage_prepare + hint
-    # injection into the bf16-resident main loop + control-param optimizer) is
-    # NOT wired yet — fail loud rather than silently ignore the key (the T2.F
-    # adapter-algo precedent).
-    if cfg.controlnet_layers > 0:
-        raise Error(
-            String("Z-Image trainer: controlnet_layers=")
-            + String(cfg.controlnet_layers)
-            + String(" requested but the trainer data path is not wired yet; ")
-            + String("the gated control-block module is ")
-            + String("models/zimage/controlnet_block.mojo (see its header for ")
-            + String("the integration contract)")
-        )
     # T1.C: zimage wires the levers optimizer dispatch (training/levers.mojo
     # T1.C section), so the supported non-AdamW optimizers (ADAFACTOR /
     # SCHEDULE_FREE_ADAMW) must pass the shared ADAMW-only loop-policy check:
@@ -1781,6 +1824,465 @@ def _zimage_full_ft_main(
         print("RESULT: FAIL trains=", trains)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# T2.E ControlNet driver (controlnet_layers > 0). Separate runtime path off
+# TrainConfig — NO comptime fork of the LoRA step (C13: the default path is
+# untouched). Per step:
+#   prep (byte-identical host math to _train_one_step_bucket's prologue) ->
+#   NR/CR refinement (frozen base, host-chain — the control stack needs the
+#   unified INPUT) -> control side: patchify((ctl_lat - shift) * scale) ->
+#   control x_embedder -> pad rows = x_pad_token -> 2 control_noise_refiner
+#   blocks -> unify with refined captions -> GATED control stack -> hints ->
+#   main layers with post-layer hint injection (zero LoRA set == base forward;
+#   *_cn arms in zimage_stack_lora.mojo, v2 graph backward) -> d_hints ->
+#   control backward -> global-norm clip + host AdamW on the control group.
+# Trainable set = the FULL ZImageControlNetModel surface (control blocks incl.
+# their adaLN + projections + control x_embedder + control_noise_refiner);
+# BASE FROZEN (bit-identity gated by the driver). Save: diffusers
+# ZImageControlNetModel folder format (training/controlnet_zimage.mojo).
+# ══════════════════════════════════════════════════════════════════════════════
+def _patchify_control_host[
+    LAT_H_B: Int, LAT_W_B: Int
+](ctl: Tensor, n_img_b: Int, ctx: DeviceContext) raises -> List[Float32]:
+    """Control latent [1,16,H,W] -> normalized ((x-shift)*scale, the
+    pipeline_z_image_controlnet.py:551 normalization) -> channel-minor
+    patchify [N_IMG_REAL, p*p*C] -> pad rows repeat the last real row
+    (controlnet_z_image.py patchify :649). Host F32 carrier."""
+    var sh = ctl.shape()
+    if sh[1] != LAT_C or sh[2] != LAT_H_B or sh[3] != LAT_W_B:
+        raise Error("controlnet: control latent in wrong bucket")
+    var flat: List[Float32]
+    if ctl.dtype() == STDtype.BF16:
+        var hb = ctl.to_host_bf16(ctx)
+        flat = List[Float32](capacity=len(hb))
+        for i in range(len(hb)):
+            flat.append(hb[i].cast[DType.float32]())
+    elif ctl.dtype() == STDtype.F16:
+        var hf = ctl.to_host_f16(ctx)
+        flat = List[Float32](capacity=len(hf))
+        for i in range(len(hf)):
+            flat.append(hf[i].cast[DType.float32]())
+    else:
+        flat = ctl.to_host(ctx)
+    for i in range(len(flat)):
+        flat[i] = (flat[i] - VAE_SHIFT) * VAE_SCALE
+    var C = LAT_C
+    var p = PATCH
+    var ht = LAT_H_B // p
+    var wt = LAT_W_B // p
+    var out = List[Float32](capacity=n_img_b * p * p * C)
+    for ih in range(ht):
+        for iw in range(wt):
+            for ph in range(p):
+                for pw in range(p):
+                    for c in range(C):
+                        var hh = ih * p + ph
+                        var ww = iw * p + pw
+                        out.append(flat[c * LAT_H_B * LAT_W_B + hh * LAT_W_B + ww])
+    var row = p * p * C
+    var n_real = ht * wt
+    for _r in range(n_real, n_img_b):
+        for q in range(row):
+            out.append(out[(n_real - 1) * row + q])
+    return out^
+
+
+def _cn_step[
+    LAT_H_B: Int, LAT_W_B: Int, CAP_LEN_B: Int
+](
+    k: Int,
+    run_steps: Int,
+    slot: Int,
+    step_seed: UInt64,
+    cache: KleinCache,
+    aux: ZImageRealAux,
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    zero_dev: ZImageLoraDeviceSet,
+    mut cn_params: ZImageCnParams,
+    places: List[Int],
+    final_lin_w: Tensor,
+    final_lin_b: Tensor,
+    x_pad_h: List[Float32],
+    cap_pad_h: List[Float32],
+    train_cfg: TrainConfig,
+    train_start_ns: UInt,
+    ctx: DeviceContext,
+) raises -> StepResult:
+    comptime HT_B = LAT_H_B // PATCH
+    comptime WT_B = LAT_W_B // PATCH
+    comptime N_IMG_REAL_B = HT_B * WT_B
+    comptime IMG_PAD_B = (32 - (N_IMG_REAL_B % 32)) % 32
+    comptime N_IMG_B = N_IMG_REAL_B + IMG_PAD_B
+    comptime N_TXT_B = CAP_LEN_B
+    comptime S_B = N_IMG_B + N_TXT_B
+
+    var t0 = perf_counter_ns()
+
+    var s = cache.load(slot, ctx)
+    var lsh = s.latent.shape()
+    if lsh[1] != LAT_C or lsh[2] != LAT_H_B or lsh[3] != LAT_W_B:
+        raise Error("zimage controlnet: dispatched sample to wrong latent bucket")
+    var valid_cap = _valid_cap_from_mask(s.text_mask, ctx)
+    if valid_cap <= 0 or valid_cap > CAP_LEN_B:
+        raise Error("zimage controlnet: dispatched sample to wrong text bucket")
+
+    # prologue: byte-identical host math to _train_one_step_bucket
+    var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+    var cap_drop = caption_dropout_pick(step_seed, SEED_BASE, train_cfg.caption_dropout_prob)
+    var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
+    if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
+        sigma_idx = NUM_TRAIN_TIMESTEPS - 1
+    var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+    var t_value = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
+
+    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + step_seed)
+    var latent_inputs = _build_latent_step_inputs[LAT_H_B, LAT_W_B](
+        s.latent, noise_lat, sig, ctx,
+    )
+
+    var x_t = build_x_seq(aux, latent_inputs.noisy_latent, LAT_C, LAT_H_B, LAT_W_B, PATCH, ctx)
+    for _pad in range(IMG_PAD_B):
+        for c in range(D):
+            x_t.append(x_pad_h[c])
+
+    var cap2 = _cap_tensor_from_cache[CAP_LEN_B](s.text_embedding, valid_cap, cap_drop, ctx)
+    var cap_seq = build_cap_seq(aux, cap2, EPS, ctx)
+    for r in range(valid_cap, CAP_LEN_B):
+        for c in range(D):
+            cap_seq[r * D + c] = cap_pad_h[c]
+
+    var pos_step = build_positions(N_IMG_B, HT_B, WT_B, CAP_LEN_B, valid_cap)
+    var x_pos = pos_step[0].copy()
+    var cap_pos = pos_step[1].copy()
+    var uni_pos = List[List[Int]]()
+    for i in range(len(x_pos)):
+        uni_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos)):
+        uni_pos.append(cap_pos[i].copy())
+    var xr = build_rope(x_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var x_cos = xr[0].copy(); var x_sin = xr[1].copy()
+    var cr = build_rope(cap_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cap_cos = cr[0].copy(); var cap_sin = cr[1].copy()
+    var ur = build_rope(uni_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var uni_cos = ur[0].copy(); var uni_sin = ur[1].copy()
+
+    var adaln = build_adaln(aux, t_value, ADALN_DIM, T_SCALE, ctx)
+    var adaln_h = adaln.to_host(ctx)
+    var nr_mod = List[ZImageModVecs]()
+    for i in range(NUM_NR):
+        nr_mod.append(build_block_modvecs(aux.nr_mod_w[i][], aux.nr_mod_b[i][], adaln, D, ctx))
+    var main_mod = List[ZImageModVecs]()
+    for i in range(MAIN_DEPTH):
+        main_mod.append(build_block_modvecs(aux.main_mod_w[i][], aux.main_mod_b[i][], adaln, D, ctx))
+    var f_scale = build_f_scale(aux, adaln, D, ctx)
+    var mvall = zimage_modvecs_all_to_device(main_mod, D, ctx)
+
+    # frozen-base NR/CR refinement (host-chain — the control stack consumes
+    # the refined unified INPUT, so this runs BEFORE the main layers)
+    var xs = x_t.copy()
+    for i in range(NUM_NR):
+        var nf = zimage_block_forward[H, Dh, N_IMG_B](
+            xs.copy(), nr_blocks[i], nr_mod[i], x_cos[], x_sin[], D, F, EPS, ctx,
+        )
+        xs = nf.out.copy()
+    var cs = cap_seq.copy()
+    for i in range(NUM_CR):
+        var cf = zimage_refiner_forward[H, Dh, N_TXT_B](
+            cs.copy(), cr_blocks[i], cap_cos[], cap_sin[], D, F, EPS, ctx,
+        )
+        cs = cf.out.copy()
+    var t_prep = perf_counter_ns()
+
+    # ── control side: upload masters + control forward (GATED stack) ─────────
+    var ctl = cache.load_control(slot, ctx)
+    var ctl_patches = _patchify_control_host[LAT_H_B, LAT_W_B](ctl, N_IMG_B, ctx)
+    var cn_dev = zimage_cn_upload(cn_params, adaln, D, ctx)
+    var cnf = zimage_cn_forward[H, Dh, N_IMG_B, S_B](
+        ctl_patches, xs, cs, N_IMG_REAL_B, x_pad_h, cn_dev,
+        x_cos[], x_sin[], uni_cos[], uni_sin[], D, F, EPS, ctx,
+    )
+    var t_ctl = perf_counter_ns()
+
+    # ── main forward with post-layer hint injection (zero LoRA == base) ──────
+    var cond_scale = Float32(train_cfg.controlnet_scale)
+    var fwd = zimage_stack_lora_forward_main_from_unified_cn[
+        H, Dh, N_IMG_B, N_TXT_B, S_B
+    ](
+        xs, cs, main_blocks, mvall.per_block, zero_dev,
+        cnf.hints, places, cond_scale,
+        f_scale.copy(), final_lin_w, final_lin_b,
+        uni_cos[], uni_sin[],
+        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+    )
+    var t_fwd = perf_counter_ns()
+
+    var tgt_patch = latent_inputs.target_patch.copy()
+    var real_nout = len(tgt_patch)
+    var seq_nout = len(fwd.out)
+    var d_loss = List[Float32]()
+    var pred_vals = List[Float32]()
+    for i in range(real_nout):
+        pred_vals.append(-fwd.out[i])
+    var lg = levers_loss_grad(pred_vals, tgt_patch, sig, train_cfg)
+    var loss = lg.loss
+    for i in range(real_nout):
+        d_loss.append(-lg.d_pred[i])
+    for _i in range(real_nout, seq_nout):
+        d_loss.append(Float32(0.0))
+
+    if k == 1:
+        var ps = _flat_stats(pred_vals)
+        var ts = _flat_stats(tgt_patch)
+        print("[DEBUG step=1 controlnet] bucket=", LAT_H_B, "x", LAT_W_B, " cap=", CAP_LEN_B,
+              " sigma_idx=", sigma_idx, " sig=", sig,
+              " pred mean=", Float32(ps.mean), " std=", Float32(ps.std),
+              " max_abs=", ps.max_abs, " target mean=", Float32(ts.mean),
+              " std=", Float32(ts.std), " max_abs=", ts.max_abs)
+
+    # ── main backward (frozen base; v2 graph engine) -> per-place d_hints ─────
+    var d_hints = zimage_stack_lora_backward_main_device_cn[
+        H, Dh, N_IMG_B, N_TXT_B, S_B
+    ](
+        d_loss, main_blocks, mvall.per_block, zero_dev,
+        places, cond_scale,
+        f_scale.copy(), final_lin_w,
+        uni_cos[], uni_sin[], fwd,
+        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+    )
+    var t_bwd = perf_counter_ns()
+
+    # ── control backward + AdamW on the control group ONLY ───────────────────
+    var grads = zimage_cn_backward[H, Dh, N_IMG_B, S_B](
+        d_hints, cnf, N_IMG_REAL_B, cn_dev,
+        x_cos[], x_sin[], uni_cos[], uni_sin[], D, F, EPS, ctx,
+    )
+    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    var gn = zimage_cn_apply_step(
+        cn_params, grads, adaln_h, k, step_lr,
+        train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+        train_cfg.weight_decay, train_cfg.max_grad_norm, D,
+    )
+    var t_opt = perf_counter_ns()
+
+    var t1 = perf_counter_ns()
+    var secs = Float64(t1 - t0) / 1.0e9
+    var after_l1 = Float32(cn_params.l1(String("control_layers.0.after_proj.weight")))
+    var before_l1 = Float32(cn_params.l1(String("control_layers.0.before_proj.weight")))
+    print_trainer_progress(
+        String("ZImage-controlnet"), k, run_steps, 1,
+        loss, gn, secs, 0.0,
+        Float64(t1 - train_start_ns) / 1.0e9,
+    )
+    print("[CN step=", k, "] |after_w0|_1=", after_l1,
+          " |before_w0|_1=", before_l1, " grad_norm=", Float32(gn))
+    print("[TIMING-CN step=", k,
+          "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
+          " ctl_fwd=", Float32(Float64(t_ctl - t_prep) / 1.0e9),
+          " main_fwd=", Float32(Float64(t_fwd - t_ctl) / 1.0e9),
+          " main_bwd=", Float32(Float64(t_bwd - t_fwd) / 1.0e9),
+          " ctl_bwd+opt=", Float32(Float64(t_opt - t_bwd) / 1.0e9))
+    return StepResult(loss, Float32(gn), Float32(secs), after_l1, 0, 0)
+
+
+def _zimage_controlnet_main(
+    cfg_path: String, train_cfg: TrainConfig, run_steps: Int, start_step: Int,
+) raises:
+    if start_step != 0:
+        raise Error("zimage controlnet v1: resume (start_step != 0) is not supported; use controlnet_checkpoint")
+    var transformer_dir = zimage_transformer_dir_from_train_config(train_cfg)
+    var cache_dir = zimage_cache_dir_from_train_config(train_cfg)
+    var out_dir = train_cfg.output_model_destination.copy()
+    if out_dir == String(""):
+        out_dir = String(LORA_DIR) + String("/controlnet")
+
+    print("=== Z-Image ControlNet training (T2.E) ===")
+    print("  config:", cfg_path)
+    print("  control blocks:", train_cfg.controlnet_layers,
+          " scale:", train_cfg.controlnet_scale,
+          " checkpoint:", train_cfg.controlnet_checkpoint)
+    print("  trainable: control blocks (+adaLN) + before/after projections +")
+    print("             control x_embedder + control_noise_refiner; BASE FROZEN")
+    print("  optimizer: host AdamW control group; lr=", train_cfg.lr,
+          " wd=", train_cfg.weight_decay, " max_grad_norm=", train_cfg.max_grad_norm)
+    print("  weights:", transformer_dir)
+    print("  cache:", cache_dir)
+    print("  output controlnet dir:", out_dir)
+    print("  run_steps=", run_steps)
+
+    var ctx = DeviceContext()
+    var cache = KleinCache(cache_dir)
+    print("[cache] samples:", cache.count())
+    for i in range(cache.count()):
+        if not cache.has_control(i):
+            raise Error(
+                String("zimage controlnet: cache sample ") + String(i)
+                + String(" has no control_latent key; run zimage_prepare cn")
+            )
+    print("[cache] all samples carry control_latent")
+
+    print("[load] opening sharded transformer dir")
+    var st = ShardedSafeTensors.open(transformer_dir)
+    print("[load] aux (embedders / per-block adaLN / final layer)")
+    var aux = load_zimage_real_aux(st, NUM_NR, MAIN_DEPTH, ctx)
+    print("[load] blocks: NR + CR + MAIN (frozen)")
+    var nr_blocks = List[ZImageBlockWeights]()
+    for i in range(NUM_NR):
+        nr_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("noise_refiner.") + String(i), ctx))
+    var cr_blocks = List[ZImageBlockWeights]()
+    for i in range(NUM_CR):
+        cr_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("context_refiner.") + String(i), ctx))
+    var main_blocks = List[ZImageBlockWeights]()
+    for i in range(MAIN_DEPTH):
+        main_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("layers.") + String(i), ctx))
+    var final_lin_w = aux.final_lin_w[].clone(ctx)
+    var final_lin_b = aux.final_lin_b[].clone(ctx)
+    var x_pad_h = aux.x_pad_token[].to_host(ctx)
+    var cap_pad_h = aux.cap_pad_token[].to_host(ctx)
+
+    # Frozen LoRA set for the *_cn main fwd/bwd: PROPERLY-SHAPED rank-16
+    # adapters with B == 0 (the standard LoRA init), so the forward adds exact
+    # zeros == the base forward, and the v2 GRAPH backward (which records the
+    # LoRA ops unconditionally — unlike the full-FT hand-chain, it cannot take
+    # the [1,1] zero-placeholder set) sees real shapes. Its adapter grads are
+    # DISCARDED (nothing steps them; base + adapters frozen).
+    var frozen_lora = build_zimage_lora_set(NUM_NR, NUM_CR, MAIN_DEPTH, D, F, RANK, ALPHA)
+    var zero_dev = zimage_lora_set_to_device(frozen_lora, ctx)
+
+    var places = zimage_cn_places(train_cfg.controlnet_layers, MAIN_DEPTH)
+    var places_line = String("[cn] control_layers_places:")
+    for i in range(len(places)):
+        places_line += String(" ") + String(places[i])
+    print(places_line)
+
+    print("[cn] init control params (copy-from-base + zero projections)")
+    var cn_params = zimage_cn_params_init_from_base(st, places.copy(), NUM_NR, D, ctx)
+    if train_cfg.controlnet_checkpoint != String(""):
+        print("[cn] loading controlnet_checkpoint:", train_cfg.controlnet_checkpoint)
+        zimage_cn_params_load_checkpoint(cn_params, train_cfg.controlnet_checkpoint, ctx)
+    print("[cn] params:", len(cn_params.names), "named tensors")
+    var after0 = cn_params.l1(String("control_layers.0.after_proj.weight"))
+    print("[cn] |after_w0|_1 at init =", Float32(after0),
+          " (expect 0.0 for fresh init)")
+
+    # GATE (e2e c): frozen-base bit-identity — snapshot two sampled base
+    # tensors (first block to_q, last block w2; F32 upcast is injective on
+    # the bf16 bytes, so list equality == bit identity).
+    var base_w0 = main_blocks[0].wq[].to_host(ctx)
+    var base_w29 = main_blocks[MAIN_DEPTH - 1].w2[].to_host(ctx)
+
+    var first_loss = Float32(0.0)
+    var last_loss = Float32(0.0)
+    var after_l1_step1 = Float32(-1.0)
+    var losses_finite = True
+    var train_start = perf_counter_ns()
+    for k in range(1, run_steps + 1):
+        var slot = (k - 1) % cache.count()
+        var step_seed = UInt64(k)
+        var key = cache.peek_key(slot, ctx)
+        if key.c != LAT_C:
+            raise Error("zimage controlnet: unsupported latent channel count")
+        var valid_cap = _cache_valid_cap(cache, slot, ctx)
+        var loss: Float32
+        var r_after = Float32(0.0)
+        if key.h == 72 and key.w == 56:
+            if valid_cap <= 224:
+                var r = _cn_step[72, 56, 224](
+                    k, run_steps, slot, step_seed, cache, aux,
+                    nr_blocks, cr_blocks, main_blocks, zero_dev, cn_params, places,
+                    final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_cfg, train_start, ctx,
+                )
+                loss = r.loss
+                r_after = r.lora_b_sum
+            elif valid_cap <= 256:
+                var r2 = _cn_step[72, 56, 256](
+                    k, run_steps, slot, step_seed, cache, aux,
+                    nr_blocks, cr_blocks, main_blocks, zero_dev, cn_params, places,
+                    final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_cfg, train_start, ctx,
+                )
+                loss = r2.loss
+                r_after = r2.lora_b_sum
+            else:
+                raise Error("zimage controlnet: caption too long for 256 bucket")
+        elif key.h == 64 and key.w == 64:
+            if valid_cap <= 224:
+                var r3 = _cn_step[64, 64, 224](
+                    k, run_steps, slot, step_seed, cache, aux,
+                    nr_blocks, cr_blocks, main_blocks, zero_dev, cn_params, places,
+                    final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_cfg, train_start, ctx,
+                )
+                loss = r3.loss
+                r_after = r3.lora_b_sum
+            elif valid_cap <= 256:
+                var r4 = _cn_step[64, 64, 256](
+                    k, run_steps, slot, step_seed, cache, aux,
+                    nr_blocks, cr_blocks, main_blocks, zero_dev, cn_params, places,
+                    final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_cfg, train_start, ctx,
+                )
+                loss = r4.loss
+                r_after = r4.lora_b_sum
+            else:
+                raise Error("zimage controlnet: caption too long for 256 bucket")
+        else:
+            raise Error("zimage controlnet v1: only the 72x56 and 64x64 latent buckets are wired")
+        if not (loss == loss):
+            losses_finite = False
+        if k == 1:
+            first_loss = loss
+            after_l1_step1 = r_after
+        last_loss = loss
+
+    print("")
+    print("first_loss=", first_loss, " last_loss=", last_loss)
+
+    # ── GATES (e2e, contract (c)) ─────────────────────────────────────────────
+    var ok = True
+    if losses_finite and (last_loss == last_loss):
+        print("GATE cn loss finite: PASS (", first_loss, "->", last_loss, ")")
+    else:
+        print("GATE cn loss finite: FAIL")
+        ok = False
+    var after_final = cn_params.l1(String("control_layers.0.after_proj.weight"))
+    if after_l1_step1 > Float32(0.0) and after_final > 0.0:
+        print("GATE control params grew (|after_w0|_1 step1=", after_l1_step1,
+              " final=", Float32(after_final), "): PASS")
+    else:
+        print("GATE control params grew: FAIL (after step1=", after_l1_step1,
+              " final=", Float32(after_final), ")")
+        ok = False
+    var base_now_w0 = main_blocks[0].wq[].to_host(ctx)
+    var base_now_w29 = main_blocks[MAIN_DEPTH - 1].w2[].to_host(ctx)
+    var frozen_ok = len(base_now_w0) == len(base_w0) and len(base_now_w29) == len(base_w29)
+    if frozen_ok:
+        for i in range(len(base_w0)):
+            if base_now_w0[i] != base_w0[i]:
+                frozen_ok = False
+                break
+    if frozen_ok:
+        for i in range(len(base_w29)):
+            if base_now_w29[i] != base_w29[i]:
+                frozen_ok = False
+                break
+    if frozen_ok:
+        print("GATE frozen base BIT-IDENTICAL (sampled layers.0.to_q + layers.29.w2): PASS")
+    else:
+        print("GATE frozen base BIT-IDENTICAL: FAIL")
+        ok = False
+
+    if ok:
+        var st_path = zimage_cn_save(cn_params, out_dir, D, H, LAT_C, ctx)
+        print("[cn] saved diffusers ZImageControlNetModel checkpoint:", st_path)
+        print("RESULT: REAL Z-IMAGE CONTROLNET TRAIN OK — loss", first_loss, "->",
+              last_loss, "; control group trained, base frozen")
+    else:
+        print("RESULT: FAIL (controlnet gates above)")
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -1825,6 +2327,16 @@ def main() raises:
             print("[ZImage] only_cache requested; no train steps will run in this trainer")
             return
         _zimage_full_ft_main(cfg_path, train_cfg, run_steps, start_step)
+        return
+    # T2.E: controlnet training is its own runtime driver (validated above by
+    # validate_zimage_controlnet_config); the LoRA path below is untouched (C13).
+    if train_cfg.controlnet_layers > 0:
+        if resume_state != String("") and resume_state != String("-"):
+            raise Error("zimage controlnet: LoRA resume state does not apply; use controlnet_checkpoint")
+        if train_cfg.only_cache:
+            print("[ZImage] only_cache requested; no train steps will run in this trainer")
+            return
+        _zimage_controlnet_main(cfg_path, train_cfg, run_steps, start_step)
         return
     # batch-2 trajectory gate modes (see _train_one_step_bucket_b2 header):
     #   b2dup: B2 path with duplicated sample/seed -> must equal b1match run.

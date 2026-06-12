@@ -44,6 +44,12 @@ from serenitymojo.ops.tensor_algebra import concat
 comptime LATENT_KEY = "latent"
 comptime TEXT_KEY = "text_embedding"
 comptime MASK_KEY = "text_mask"
+# T2.E ControlNet (ADDITIVE cache key — C13: old 3-key caches load unchanged;
+# the key is only read by trainers that ask for it via load_control/has_control).
+# Same VAE latent contract as LATENT_KEY (unscaled mean encode; the trainer
+# applies the (x - shift) * scale normalization, matching diffusers
+# pipeline_z_image_controlnet.py:550-551).
+comptime CONTROL_KEY = "control_latent"
 
 
 # ── prepare: write one cache sample ───────────────────────────────────────────
@@ -78,6 +84,40 @@ def write_sample(
     tensors.append(ArcPointer[Tensor](latent.clone(ctx)))
     tensors.append(ArcPointer[Tensor](text_embedding.clone(ctx)))
     tensors.append(ArcPointer[Tensor](text_mask.clone(ctx)))
+    save_safetensors(names, tensors, out_path, ctx)
+
+
+# T2.E: write a control-conditioned cache sample (4 keys). ADDITIVE schema —
+# write_sample above is untouched; readers that don't know CONTROL_KEY ignore it.
+def write_sample_control(
+    latent: Tensor,
+    text_embedding: Tensor,
+    text_mask: Tensor,
+    control_latent: Tensor,
+    out_path: String,
+    ctx: DeviceContext,
+) raises:
+    var ls = latent.shape()
+    var ts = text_embedding.shape()
+    var cs = control_latent.shape()
+    if len(ls) != 4:
+        raise Error("write_sample_control: latent must be rank-4")
+    if len(ts) != 3:
+        raise Error("write_sample_control: text_embedding must be rank-3")
+    if len(cs) != 4:
+        raise Error("write_sample_control: control_latent must be rank-4")
+    if cs[1] != ls[1] or cs[2] != ls[2] or cs[3] != ls[3]:
+        raise Error("write_sample_control: control_latent shape must match latent")
+    var names = List[String]()
+    names.append(String(LATENT_KEY))
+    names.append(String(TEXT_KEY))
+    names.append(String(MASK_KEY))
+    names.append(String(CONTROL_KEY))
+    var tensors = List[ArcPointer[Tensor]]()
+    tensors.append(ArcPointer[Tensor](latent.clone(ctx)))
+    tensors.append(ArcPointer[Tensor](text_embedding.clone(ctx)))
+    tensors.append(ArcPointer[Tensor](text_mask.clone(ctx)))
+    tensors.append(ArcPointer[Tensor](control_latent.clone(ctx)))
     save_safetensors(names, tensors, out_path, ctx)
 
 
@@ -168,6 +208,35 @@ struct KleinCache(Movable):
         var txt = _load_tensor(st, String(TEXT_KEY), ctx)
         var mask = _load_tensor(st, String(MASK_KEY), ctx)
         return KleinSample(latent^, txt^, mask^)
+
+    def has_control(self, index: Int) raises -> Bool:
+        """T2.E: True iff sample `index` carries the additive CONTROL_KEY
+        tensor (header-only check; old 3-key caches return False)."""
+        var st = SafeTensors.open(self.files[index % len(self.files)])
+        var names = st.names()
+        for i in range(len(names)):
+            if names[i] == String(CONTROL_KEY):
+                return True
+        return False
+
+    def load_control(self, index: Int, ctx: DeviceContext) raises -> Tensor:
+        """T2.E: load sample `index`'s control latent (raises if the cache
+        sample has no control channel — trainers fail loud, never silently
+        substitute)."""
+        var path = self.files[index % len(self.files)]
+        var st = SafeTensors.open(path)
+        var names = st.names()
+        var found = False
+        for i in range(len(names)):
+            if names[i] == String(CONTROL_KEY):
+                found = True
+        if not found:
+            raise Error(
+                String("KleinCache.load_control: cache sample ") + path
+                + String(" has no '") + String(CONTROL_KEY)
+                + String("' tensor; re-run the cn prepare (zimage_prepare cn)")
+            )
+        return _load_tensor(st, String(CONTROL_KEY), ctx)
 
     def load_batch(
         self, indices: List[Int], ctx: DeviceContext

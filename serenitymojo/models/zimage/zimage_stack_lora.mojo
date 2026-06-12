@@ -111,7 +111,7 @@ from serenitymojo.models.zimage.lora_block import (
     zimage_block_forward_device_moddev_slab, zimage_refiner_forward_device_slab,
     zimage_block_lora_forward_device_only_slab,
 )
-from serenitymojo.ops.tensor_algebra import concat
+from serenitymojo.ops.tensor_algebra import concat, add
 from serenitymojo.models.zimage.zimage_stack import (
     ZImageStackForward, _zeros, _ones, _t, _add_lists,
     _concat_img_cap, _split_img_cap, _linear_wdev_bias, _saved_x_out,
@@ -2814,3 +2814,149 @@ def zimage_stack_lora_backward_main_device_fullft[
         bi -= 1
 
     return ZImageFullFTGrads(bufs_rev^, slot_offsets^, slot_numels^, num_main)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# T2.E ControlNet arms (default-off; reached ONLY from the controlnet driver in
+# train_zimage_real.mojo when controlnet_layers > 0 — C13: every function above
+# is untouched).
+#
+# Reference semantics (diffusers transformer_z_image.py:1032):
+#   unified = layer(unified)
+#   if layer_idx in controlnet_block_samples: unified = unified + samples[idx]
+# where samples[idx] = hint_idx * conditioning_scale (the scale is applied by
+# the ZImageControlNetModel output dict; here the caller passes UNSCALED hints
+# + the scale and the multiply happens at the injection site — same math).
+#
+# Backward: the injection is an ADD, so the grad arriving at the boundary
+# ABOVE main layer `p` IS the grad of (layer_p_out + scale*hint): d_hint =
+# scale * d_boundary, d_layer_out = d_boundary (the step smoke's hand math,
+# zimage_controlnet_step_smoke.mojo:354-371).
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def zimage_stack_lora_forward_main_from_unified_cn[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    xs: List[Float32], cs: List[Float32],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_dev: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    hints: List[List[Float32]], places: List[Int], cond_scale: Float32,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageStackForward:
+    """Main-layer loop + final layer of the _v2 forward, taking the ALREADY
+    NR/CR-refined image (`xs`) and caption (`cs`) sequences (the controlnet
+    driver computes those first because the control stack needs the unified
+    INPUT), with post-layer hint injection at `places`. ZImageStackForward
+    contract matches _v2/_v3: main_x_in saves each block's (post-injection)
+    input — the recompute backward below replays the same chain."""
+    if len(hints) != len(places):
+        raise Error("cn forward: hints/places length mismatch")
+    var num_main = len(main_blocks)
+    var x = _concat_img_cap(xs, cs)
+    var x_arc = TArc(_t(x^, [S, D], ctx))
+
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        var fwd = zimage_block_lora_forward_device_tensor_batch[1, H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod_dev[i], bl,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
+        for pi in range(len(places)):
+            if places[pi] == i:
+                if len(hints[pi]) != S * D:
+                    raise Error("cn forward: hint size != S*D")
+                var hs = List[Float32]()
+                for j in range(S * D):
+                    hs.append(cond_scale * hints[pi][j])
+                x_arc = TArc(add(x_arc[], _t(hs^, [S, D], ctx), ctx))
+
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = vec_modulate(
+        ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+    var parts = _split_img_cap(patches, N_IMG, N_TXT, out_ch)
+    var out = parts[0].copy()
+
+    var nr_x_in = List[TArc]()
+    var cr_x_in = List[TArc]()
+    return ZImageStackForward(
+        out^, xs.copy(), cs.copy(),
+        nr_x_in^, cr_x_in^, main_x_in^,
+        x_arc.copy(), TArc(ln_t^),
+    )
+
+
+def zimage_stack_lora_backward_main_device_cn[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_dev: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    places: List[Int], cond_scale: Float32,
+    f_scale: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> List[List[Float32]]:
+    """ControlNet-training backward through the FROZEN main stack (the v2
+    graph-engine per-block backward, the _v3 arm): the only outputs are the
+    per-place d_hints (ALREADY cond_scale-scaled — the control-stack backward
+    contract, controlnet_block.mojo:389). Base + LoRA grads are computed by
+    the per-block engine and DISCARDED (base frozen; the controlnet driver
+    runs the ZERO LoRA set so the forward is the base forward)."""
+    var num_main = len(main_blocks)
+
+    var d_patches = _concat_img_cap(d_out, _zeros(N_TXT * out_ch))
+    var final_dx = linear_backward_dx(
+        _t(d_patches, [S, out_ch], ctx), final_lin_w, S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var d_hints = List[List[Float32]]()
+    for _ in range(len(places)):
+        d_hints.append(List[Float32]())
+
+    var bi = num_main - 1
+    while bi >= 0:
+        # entering iteration bi, d_x = grad w.r.t. the boundary ABOVE layer bi
+        # (= layer bi's post-injection output) — capture the hint grad here.
+        for pi in range(len(places)):
+            if places[pi] == bi:
+                var dh = d_x[].to_host(ctx)
+                for j in range(len(dh)):
+                    dh[j] = cond_scale * dh[j]
+                d_hints[pi] = dh^
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var bg = zimage_block_lora_graph_backward[H, Dh, S](
+            d_x[], main_blocks[bi], main_mod_dev[bi], bl,
+            saved.main_x_in[bi], uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        bi -= 1
+
+    for pi in range(len(places)):
+        if len(d_hints[pi]) != S * D:
+            raise Error("cn backward: missing d_hint (place outside main depth?)")
+    return d_hints^

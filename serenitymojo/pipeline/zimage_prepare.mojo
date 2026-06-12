@@ -43,7 +43,7 @@ from serenitymojo.training.aspect_buckets import (
     ZIMAGE_T2D_LADDER_LEN, ZIMAGE_T2D_LADDER_X100,
     zimage_t2d_lat_h, zimage_t2d_lat_w,
 )
-from serenitymojo.training.klein_dataset import write_sample
+from serenitymojo.training.klein_dataset import write_sample, write_sample_control
 
 
 comptime ZROOT = "/home/alex/.serenity/models/zimage_base"
@@ -66,6 +66,15 @@ comptime CACHE_DIR = "/home/alex/mojodiffusion/output/alina_zimage_cache"
 # below is byte-identical to before (C13).
 comptime STAGE_DIR_T2D = "/home/alex/mojodiffusion/output/alina_zimage_stage_t2d"
 comptime CACHE_DIR_T2D = "/home/alex/mojodiffusion/output/alina_zimage_cache_t2d"
+# T2.E ControlNet (opt-in `cn` argv mode; default path untouched — C13):
+# consume the cn stage (zimage_stage_alina.mojo cn mode: <stem>.safetensors +
+# <stem>.control.safetensors + <stem>.txt) and write a cache whose samples
+# carry the ADDITIVE control_latent key (klein_dataset.write_sample_control).
+# Both images go through the SAME VAE encode (mean, unscaled) — the diffusers
+# ZImageControlNetPipeline VAE-encodes the control image identically
+# (pipeline_z_image_controlnet.py:550); normalization happens in the trainer.
+comptime STAGE_DIR_CN = "/home/alex/mojodiffusion/output/alina_zimage_stage_cn"
+comptime CACHE_DIR_CN = "/home/alex/mojodiffusion/output/alina_zimage_cache_cn"
 comptime IH_MAIN = 576
 comptime IW_MAIN = 448
 comptime LH_MAIN = IH_MAIN // 8
@@ -330,9 +339,91 @@ def _run_t2d(ctx: DeviceContext) raises:
     print("PASS: wrote", len(files), "Z-Image cache samples to", cache_dir)
 
 
+def _run_cn(ctx: DeviceContext) raises:
+    """T2.E prepare: cn stage -> 4-key control cache (see CACHE_DIR_CN
+    comment). Buckets: the default-path 576x448 / 704x384 pair (the alina
+    production buckets); other staged shapes fail loud."""
+    var stage_dir = String(STAGE_DIR_CN)
+    var cache_dir = String(CACHE_DIR_CN)
+    print("=== Z-Image T2.E cn prepare: stage(+control) -> control cache ===")
+    print("  stage:", stage_dir)
+    print("  cache:", cache_dir)
+    _ = sys_system(String("mkdir -p ") + stage_dir)
+    var all_files = _stage_files(stage_dir)
+    # _stage_files lists every .safetensors; keep only the MAIN image files
+    # (the control siblings end in .control.safetensors).
+    var files = List[String]()
+    for i in range(len(all_files)):
+        if not all_files[i].endswith(String(".control.safetensors")):
+            files.append(all_files[i])
+    if len(files) == 0:
+        raise Error(
+            String("zimage_prepare cn: no staged image safetensors in ")
+            + stage_dir
+            + String(". Run zimage_stage_alina cn first.")
+        )
+    _ = sys_system(String("mkdir -p ") + cache_dir)
+    _ = sys_system(String("rm -f ") + cache_dir + String("/*.safetensors"))
+
+    print("[load] ZImageVaeEncoder main", VAE_DIR)
+    var vae_main = ZImageVaeEncoder[LH_MAIN, LW_MAIN].load(String(VAE_DIR), ctx)
+    print("[load] ZImageVaeEncoder tall", VAE_DIR)
+    var vae_tall = ZImageVaeEncoder[LH_TALL, LW_TALL].load(String(VAE_DIR), ctx)
+    print("[load] Qwen3 text encoder", TEXT_ENCODER_DIR)
+    var tok = Qwen3Tokenizer(String(TOK_JSON))
+    var qenc = Qwen3Encoder.load(String(TEXT_ENCODER_DIR), Qwen3Config.zimage(), ctx)
+
+    for idx in range(len(files)):
+        var name = files[idx]
+        var stem = _drop_suffix(name, String(".safetensors").byte_length())
+        var img_path = stage_dir + String("/") + name
+        var ctl_path = stage_dir + String("/") + stem + String(".control.safetensors")
+        var cap_path = stage_dir + String("/") + stem + String(".txt")
+        var out_path = cache_dir + String("/") + stem + String(".safetensors")
+        print("-- sample", idx + 1, "/", len(files), name)
+
+        var image = _load_image(img_path, ctx)
+        var control = _load_image(ctl_path, ctx)
+        var ish = image.shape()
+        var csh = control.shape()
+        if csh[2] != ish[2] or csh[3] != ish[3]:
+            raise Error("zimage_prepare cn: control image bucket must match the training image")
+        var latent: Tensor
+        var control_latent: Tensor
+        if ish[2] == IH_MAIN and ish[3] == IW_MAIN:
+            latent = vae_main.encode_mean(image, ctx)
+            control_latent = vae_main.encode_mean(control, ctx)
+        elif ish[2] == IH_TALL and ish[3] == IW_TALL:
+            latent = vae_tall.encode_mean(image, ctx)
+            control_latent = vae_tall.encode_mean(control, ctx)
+        else:
+            raise Error("zimage_prepare cn: staged image bucket changed after validation")
+        var lsh = latent.shape()
+        if lsh[1] != 16:
+            raise Error("zimage_prepare cn: VAE latent shape wrong")
+
+        var cap = _read_caption(cap_path)
+        var valid = _real_token_count(tok, cap)
+        var ids = _tokenize_512(tok, cap)
+        var emb = qenc.encode(ids, EXTRACT_LAYER, ctx)
+        var esh = emb.shape()
+        if esh[1] != SEQ or esh[2] != HIDDEN:
+            raise Error("zimage_prepare cn: text_embedding shape wrong")
+        var mask = _mask_512(valid, ctx)
+
+        write_sample_control(latent, emb, mask, control_latent, out_path, ctx)
+        print("   tokens:", valid, " latent:", lsh[0], lsh[1], lsh[2], lsh[3],
+              " (+control_latent) wrote", out_path)
+
+    print("PASS: wrote", len(files), "Z-Image control cache samples to", cache_dir)
+
+
 def main() raises:
     var ctx = DeviceContext()
     var a = argv()
+    if len(a) >= 2 and String(a[1]) == String("cn"):
+        _run_cn(ctx)
+        return
     var t2d = len(a) >= 2 and String(a[1]) == String("t2d")
     if t2d:
         _run_t2d(ctx)

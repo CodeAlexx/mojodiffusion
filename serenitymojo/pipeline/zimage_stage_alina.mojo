@@ -68,6 +68,19 @@ comptime T2D_MEGAPIXELS = Float64(0.262144)  # 512x512 budget
 comptime T2D_ALIGN = 64  # SimpleTuner aspect_bucket_alignment default; 64 % 16 == 0
                          # satisfies the Z-Image VAE stride(8) x patch(2) constraint
 
+# ── T2.E ControlNet staging (opt-in `cn` argv mode; default run untouched —
+# C13). Stages a CONTROL image alongside each training image:
+#   <stem>.safetensors          image  [1,3,H,W] BF16 (same contract as default)
+#   <stem>.control.safetensors  control image, SAME bucket canvas
+#   <stem>.txt                  caption
+# Control source = the SAME-NAME image in an optional control dir (a "provided
+# second folder", e.g. canny/depth maps rendered offline). When no control dir
+# is given the control image IS the training image (identity control — the
+# simplest faithful conditioning for training-mechanics gates; documented in
+# TIER2_PARITY_CAMPAIGN T2.E). Both images get the SAME OneTrainer-ladder
+# bucket (chosen from the TRAINING image) so they align spatially.
+comptime STAGE_DIR_CN = "/home/alex/mojodiffusion/output/alina_zimage_stage_cn"
+
 
 def _sort_strings(mut xs: List[String]):
     for i in range(1, len(xs)):
@@ -504,9 +517,79 @@ def _stage_t2d_buckets(max_images: Int, data_dir: String, ctx: DeviceContext) ra
     print("PASS: wrote", n, "T2.D bucketed stage samples to", STAGE_DIR_T2D)
 
 
+def _stage_cn(max_images: Int, data_dir: String, control_dir: String, ctx: DeviceContext) raises:
+    """T2.E control-conditioned staging (see STAGE_DIR_CN comment above)."""
+    print("=== Z-Image T2.E cn stage: image + control image -> stage tensors ===")
+    print("  data:   ", data_dir)
+    print("  control:", control_dir, " (identity control when == data dir)")
+    print("  stage:  ", STAGE_DIR_CN)
+    _ = sys_system(String("mkdir -p ") + String(STAGE_DIR_CN))
+    _ = sys_system(String("rm -f ") + String(STAGE_DIR_CN) + String("/*.safetensors"))
+    _ = sys_system(String("rm -f ") + String(STAGE_DIR_CN) + String("/*.txt"))
+
+    var names = _image_names_in(data_dir)
+    if len(names) == 0:
+        raise Error(String("no PNG/JPEG images found in ") + data_dir)
+    var n = len(names)
+    if max_images > 0 and max_images < n:
+        n = max_images
+
+    for i in range(n):
+        var src_name = names[i]
+        var stem = _stem_for_image(src_name)
+        var src_path = data_dir + String("/") + src_name
+        var ctl_path = control_dir + String("/") + src_name
+        var cap_path = data_dir + String("/") + stem + String(".txt")
+        var out_stem = _stage_name(i)
+        var out_img = String(STAGE_DIR_CN) + String("/") + out_stem + String(".safetensors")
+        var out_ctl = String(STAGE_DIR_CN) + String("/") + out_stem + String(".control.safetensors")
+        var out_txt = String(STAGE_DIR_CN) + String("/") + out_stem + String(".txt")
+
+        print("-- stage", i + 1, "/", n, src_name)
+        var decoded = decode_image(src_path)
+        # bucket chosen from the TRAINING image; the control image is staged to
+        # the SAME canvas (spatial alignment is the ControlNet contract).
+        var bucket = _bucket_for(decoded.height, decoded.width)
+        var out_h = bucket[0]
+        var out_w = bucket[1]
+        print("   decoded:", decoded.width, "x", decoded.height, " bucket:", out_h, "x", out_w)
+        var values = _resize_center_crop_to_tensor_values(
+            decoded.rgb, decoded.width, decoded.height, out_h, out_w,
+        )
+        _save_stage_tensor(values, out_img, out_h, out_w, ctx)
+        var ctl_decoded = decode_image(ctl_path)
+        var ctl_values = _resize_center_crop_to_tensor_values(
+            ctl_decoded.rgb, ctl_decoded.width, ctl_decoded.height, out_h, out_w,
+        )
+        _save_stage_tensor(ctl_values, out_ctl, out_h, out_w, ctx)
+        var caption = _read_text(cap_path)
+        _write_text(out_txt, caption)
+        print("   wrote:", out_img, " + control sibling")
+
+    print("PASS: wrote", n, "Z-Image cn stage samples to", STAGE_DIR_CN)
+
+
 def main() raises:
     var ctx = DeviceContext()
     var a = argv()
+    if len(a) >= 2 and String(a[1]) == String("cn"):
+        # cn [max_images] [data_dir] [control_dir] — T2.E control staging.
+        var max_images_cn = 0
+        if len(a) >= 3:
+            var s = String(a[2])
+            var bs = s.as_bytes()
+            for i in range(s.byte_length()):
+                if bs[i] < 0x30 or bs[i] > 0x39:
+                    raise Error("cn max_images must be a non-negative integer")
+                max_images_cn = max_images_cn * 10 + Int(bs[i] - 0x30)
+        var data_dir_cn = String(DATA_DIR)
+        if len(a) >= 4:
+            data_dir_cn = String(a[3])
+        var control_dir_cn = data_dir_cn.copy()
+        if len(a) >= 5:
+            control_dir_cn = String(a[4])
+        _stage_cn(max_images_cn, data_dir_cn, control_dir_cn, ctx)
+        return
     if len(a) >= 2 and String(a[1]) == String("t2d"):
         # t2d [max_images] [data_dir] — data_dir override for bucket-coverage
         # smokes (landscape sources); default = the Alina set.

@@ -225,3 +225,35 @@ pattern), control x_embedder + control_noise_refiner (2 plain modulated
 blocks — zimage_block_forward as-is), hint injection in the bf16-resident
 main loop fwd+bwd (+ v2 graph arm), control-param fused-AdamW group, diffusers
 ZImageControlNetModel-format save.
+
+### T2.E follow-up — trainer data path (2026-06-11) SHIPPED
+- DATA: zimage_stage_alina `cn` argv mode (image + SAME-bucket control image;
+  control source = optional second folder, identity control when omitted —
+  simplest faithful conditioning, documented) -> zimage_prepare `cn` mode
+  (both through the SAME VAE encode, diffusers pipeline_z_image_controlnet.py
+  :550-551 semantics) -> ADDITIVE cache key `control_latent`
+  (klein_dataset.write_sample_control / load_control / has_control; old
+  3-key caches load unchanged — C13).
+- TRAINER (controlnet_layers>0, its own runtime driver — LoRA path
+  untouched): training/controlnet_zimage.mojo (named F32 master store,
+  copy-from-base init + zero projections, controlnet_checkpoint load,
+  control x_embedder + control_noise_refiner fwd/bwd, adaLN grads from the
+  RAW mod-vec grads, GLOBAL-clip + host-AdamW control group, diffusers
+  folder save) + zimage_stack_lora.mojo *_cn arms (post-layer hint injection
+  fwd; v2 GRAPH backward emitting per-place d_hints; frozen base via a
+  rank-16 B=0 LoRA set — the graph engine records LoRA ops unconditionally,
+  so the full-FT [1,1] zero-placeholder set does NOT work there).
+  places = evenly spaced [i*30//N] (0 included, the reference assert).
+- GATES (all on the integrated tree): (a) zimage_controlnet_block_parity
+  46/46 + step smoke re-run PASS; (b) C13 flags-off anchors EXACT
+  0.4745/0.5739/0.4903/0.5065/0.4750, step-1 byte 0.47450438, SLAB
+  5640/5640/5640; (c) e2e 5 real steps on the cn cache (zimage_cn_smoke.json,
+  N=2 places 0/15): loss finite 0.4726->0.5159, |after_w0|_1 1465->3638,
+  before_proj 0 at step1 / 1042 at step2 (zero-init cascade), frozen base
+  BIT-IDENTICAL (sampled layers.0.to_q + layers.29.w2); (d) saved checkpoint
+  key/shape diff vs diffusers ZImageControlNetModel: EMPTY (68/68,
+  parity/zimage_controlnet_save_keydiff.py).
+- v1 limits (documented): batch-1; 72x56 + 64x64 buckets; control group
+  host-AdamW + per-step F32 re-upload (~18 s of the ~21 s step is
+  ctl_bwd+host-opt — device-resident control AdamW is the perf follow-up);
+  control adaLN IS trained (full ZImageControlNetModel surface).

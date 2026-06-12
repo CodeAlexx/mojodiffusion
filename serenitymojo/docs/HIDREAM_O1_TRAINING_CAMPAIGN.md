@@ -72,6 +72,29 @@ DiffSynth-Studio if wiped) — `examples/hidream_o1_image/model_training/`
   mask is prefix-causal+padding — needs cuDNN bias support, separate
   decision), fp8-resident.
 
+## Addendum 2026-06-12 — P4 SHIPPED + levers + fp8 flag
+
+- **P4 UI delivery SHIPPED** (serenity-trainer eaa88f1): NEW
+  `target/serenity_hidream_live_trainer` runner via pixi
+  hidream-live-trainer-build, trailing config.json delivery carrying T1
+  levers + T2.B quantized_resident (kept "OFF"); TrainerConfigModel
+  hidream emission helpers. Gates: runner_train_config_gate 128 PASS
+  lines, bridge parser PASS.
+- **Levers fan-out** (mojodiffusion 12190f6): optional trailing argv
+  [config.json] via read_model_config; levers loss with the recipe
+  gauss-shift weight ALWAYS applied; levers optimizer;
+  configs/hidream_o1.json template. GATE: flags-off 3-step EXACT known
+  trajectory 0.05885428/0.33308488/0.5214583, B|.|1 2048→4096→5969,
+  ~1.0-1.3 s/step.
+- **T2.B fp8-quantized-resident flag (default-OFF)** (commit 3632761):
+  7 big linears fp8 E4M3 per-row resident — VRAM 18255→12315 MiB
+  (−5.8 GB), ~+10% s/step; 10-step loss cosine 0.9997 vs bf16; step-1
+  grad cosine 0.809 = fp8 numerics class (trajectory differs, loss class
+  preserved — do NOT mix-resume across the flag). Flag-off C13 anchor
+  EXACT. Promotion to default needs Alex's sample-quality eyeball.
+- Still open from the list above: sampler hookup for the step-0-vs-step-N
+  visual learning verdict; speed levers beyond ~1.0 s if wanted.
+
 ## Phase order (mojo-train-port discipline; gates before advance)
 
 P1 — **Per-block LoRA fwd+bwd** (the Klein single-block pattern: standard

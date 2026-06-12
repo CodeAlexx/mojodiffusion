@@ -33,10 +33,10 @@ v1 roadmap before promising native.
 | Z-Image denoise (sampling) | 5.21 s/step (06-06; re-measured 06-11: 4.3-4.4 s/step 1024², cond+uncond 2.0 s each) | OneTrainer 2.14 s/step sampling | **OT-side** ~2× |
 | Z-Image TRAINING step | not yet re-measured (06-11) | **OneTrainer VERIFIED 06-11 live 50-step run: 2.08-2.22 s/it at batch_size=2 = ~1.05-1.1 s/SAMPLE** (alina_zimage_OTpreset_100_baseline, 512px, 15.1 GiB, losses ~0.45-0.57 smooth 0.46) | **OT** — measure ours next (ours is batch 1: compare per-sample) |
 | Trainable models (gate-trusted) | 4–5 (Klein, Z-Image, Anima, Ernie; Chroma unproven) | EDv2 ~14 model files (e2e count UNVERIFIED) | **FLAME** |
-| Full finetune | 0/9 runnable (scaffolds only) | present | **FLAME** |
-| 8-bit Adam | absent | adam8bit_kernel.rs | **FLAME** |
+| Full finetune | **zimage full-FT v1 RUNNABLE + gated 06-12** (5.31B params = 86% surface, 67-81 s/step, device peak 15831 MiB; was 0/9) | present | **MOJO has 1** (surface→100% + resume sidecar owed) |
+| 8-bit Adam | **SHIPPED 06-11** (training/adamw8bit.mojo, bnb 0.49.2 parity 17 gates, params ≤2.4e-7) | adam8bit_kernel.rs | **TIED** (host loop; GPU-resident kernel owed) |
 | Tokenizers (CLIP/T5) | bit-exact vs HF (verified 06-10) | n/a (flame uses sidecars) | **MOJO** |
-| Adapter family in-trainer | LoRA/DoRA/BOFT/LoCon/LoHa+ | plain LoRA (+lycoris-rs sep crate) | **MOJO** |
+| Adapter family in-trainer | LoRA e2e + **LoKr e2e on klein (06-12, SimpleTuner full parity)**; LoCon/Tucker/LoHa/OFT/BOFT/DoRA verified primitives (upstream lycoris loads BIT-EXACT) | plain LoRA (+lycoris-rs sep crate) | **MOJO** |
 | UI / serving / app libs | serenityUI gen-screen P1-P16 skeptic-FIT; serve daemon; MOJO-libs | Rust UIs, no owned lib stack | **MOJO** |
 | Vendor portability | 785 files on DeviceContext; 5 cuDNN call sites; 0 inline PTX | hard CUDA lock (cudarc/cuBLASLt/cuDNN/NVRTC/.cu) | **MOJO** (unproven on AMD) |
 
@@ -51,6 +51,8 @@ G-T2 NOISE: Box-Muller divisor bug (2^53 → uniforms [0,0.5)) fixed everywhere
 G-T3 MODELS: ≥ as many gate-trusted trainable models as EDv2 has e2e-runnable
   (first: measure EDv2's real number — currently UNVERIFIED).
 G-T4 FULL-FT: full finetune runnable + replay-gated on ≥1 model (Klein).
+  **PARTIAL GREEN 06-12: zimage (not Klein) full-FT v1 runnable + gated
+  (T2.C, commit c789b6d) — 86% surface; resume sidecar owed.**
 G-P1 STEP: Klein-4B LoRA ≤ 2.34 s/step on the same GPU, parity gates green.
   Levers in measured order: d_x-only frozen backward — **VERIFIED LANDED
   2026-06-10** (ops/linalg_backward.mojo:462/508/585 dx variants exist; the
@@ -67,7 +69,9 @@ G-P2 SDPA: close the attention gap. On sm_86 this needs a real flash kernel at
 G-P3 INFER: Z-Image denoise ≤ OneTrainer 2.14 s/step (first lever: batch
   cond+uncond CFG into one forward — HYPOTHESIS, measure).
 G-P4 8BIT: 8-bit Adam ported + parity-gated vs bnb (flame has the reference
-  parity bins: parity_adam8bit_bnb*.rs).
+  parity bins: parity_adam8bit_bnb*.rs). **GREEN 06-11 (T2.A): 17-gate
+  parity vs bnb 0.49.2 dumps, codes bit-equal (bf16grad 2/2048 within ref
+  tolerance), params ≤2.4e-7; ADAMW_8BIT levers tag + UI dropdown wired.**
 G-X1 AMD: ops + block parity suites green on an AMD GPU (the .bin oracles are
   device-independent). First real portability proof — flame can never match.
 G-X2 SERVE: daemon survives model switching within 24 GB (Phase-5 process
@@ -84,6 +88,54 @@ G-X3 PROMPT: all sidecar/prompt-blind models FULL prompt-driven (wire verified
   faithful translate + output diff.
 
 ## Log (newest first)
+- 2026-06-11/12 (session 4, overnight): **TIER-2 SIMPLETUNER/OT-CONTRACT
+  CAMPAIGN SHIPPED — all phases, 4-agent pool, every gate orchestrator-
+  re-run** (ledger: TIER2_PARITY_CAMPAIGN_2026-06-11.md). New capabilities,
+  measured:
+  * **8-bit Adam (T2.A, 3632761):** host bnb AdamW8bit (block-256 absmax,
+    dynamic qmaps), 17-gate parity vs bnb 0.49.2 — codes bit-equal except
+    bf16grad 2/2048 (within ref tolerance), params ≤2.4e-7; the reader's
+    silent ADAMW_8BIT→ADAMW alias is now the real optimizer (dispatch 35/35).
+  * **fp8-quantized-resident HiDream-O1 (T2.B, default-OFF):** VRAM
+    18255→12315 MiB (−5.8 GB), ~+10% s/step; 10-step loss cosine 0.9997 vs
+    bf16 (max |rel| 7.8%); step-1 grad cosine 0.809 = fp8 numerics-class
+    record (2.65% RMS E4M3 noise over 36 blocks) — loss class preserved,
+    trajectory differs, do NOT mix-resume across the flag. Flag-off C13
+    anchor EXACT.
+  * **zimage FULL-RANK FINETUNE v1 RUNNABLE (T2.C, c789b6d, OneTrainer
+    contract):** F32 masters host + bnb 8-bit moments host + bf16-resident
+    device weights; 5.31B/6.15B params (86%); optimizer 407.8→67-81 s/step
+    (slot-parallel over 210 slots, bit-gate mismatches=0 — an FMA-contracted
+    closure re-body FAILED the bit gate and was rejected); device peak
+    15831 MiB; checkpoint 521 keys schema-diff clean. Owed: resume sidecar,
+    100% surface, GPU-resident streamed 8-bit kernel (~90% of step is host
+    optimizer).
+  * **Dynamic aspect bucketing (T2.D + follow-up):** SimpleTuner-semantics
+    ladder, assignment parity EXACT vs SimpleTuner's own MultiaspectImage
+    (80 assignments); comptime ladder == runtime generator EXACT (7
+    buckets) → 14 generated dispatch arms, landscape e2e trained; build
+    1m28s. Anchor config promoted to configs/zimage_alina_anchor.json.
+  * **zimage ControlNet e2e (T2.E, 3c30012 + f17aa20):** official diffusers
+    ZImageControlNetModel-grounded; block parity 46/46 (cos ~1-1e-11); e2e
+    5-step train on the cn cache — loss finite, |after_w0|_1 1465.7→3638.8,
+    frozen base BIT-IDENTICAL, zero-init cascade verified; save keydiff vs
+    diffusers 68/68 empty. v1: batch-1, ~21 s/step (≈18 s = ctl bwd + host
+    AdamW — device-resident control optimizer is the named follow-up).
+  * **All 7 Lycoris families verified (T2.F + F-2):** LoCon/Tucker/LoHa/OFT/
+    LoKr×3/BOFT/DoRA fwd parity vs pip lycoris_lora 3.4.0; upstream loads
+    every Mojo save BIT-EXACT (max|d|=0.0). REAL interop bugs fixed:
+    loha/oft/dora key-schema + dora F32 magnitude (bf16 broke
+    identity-at-init 3.05e-3 vs 1e-5 bar) + boft 4D oft_blocks.
+  * **LoKr e2e TRAINABLE on klein (T2.G, 7ea52ed, SimpleTuner full parity):**
+    Kronecker-carrier fold (mixed-product identity → plain-LoRA carriers,
+    zero stack changes); init_lokr_norm exact op-order port (trained e2e,
+    max|w1-1|=0.0039 @10 steps); 19-case factorization EXACT + 11-case
+    legs EXACT vs real LokrModule; 3-step training repro delta cos
+    0.9995-0.99999; upstream loads trained ckpts bit-exact; klein anchors
+    in-class. Gate-caught bug: bf16 RNE writeback bit-froze w1 → SR
+    writeback. Owed: structured-kron GPU kernels, resume/init_lora/EMA.
+  C13 throughout: zimage flags-off anchors EXACT (step-1 byte-anchor
+  0.47450438) on every integrated tree; klein flags-off in-class.
 - 2026-06-11 (session 4, night): **TIER-1 SIMPLETUNER-PARITY CAMPAIGN
   SHIPPED IN ONE EVENING — 6 phases, 9 agents (builder/bug-fixer/wirer/
   applier per phase), every gate orchestrator-re-run.** New surface:

@@ -93,4 +93,27 @@ switch — the Ideogram model only ever consumes the JSON. Pure-Mojo equivalent:
 - Latent cos 0.96 at chunk 9 = irreducible bf16+CFG(7×) accumulation (image matches, PSNR 29.7).
 - Magic prompt + diffusion both lack KV-cache / async block-swap (speed follow-ups).
 - 4K out of range (model native ≤2k; Dh=256 math-mode SDPA can't hold 4k² score matrix).
-- LoRA (Power-Lora-style additive overlay) not yet wired.
+- LoRA (Power-Lora-style additive overlay) not yet wired (inference side).
+
+## Addendum 2026-06-12 — TRAINING status (lives in serenity-trainer)
+
+The ideogram4 LoRA TRAINING vertical is in serenity-trainer
+(`Ideogram4LoRATrainer` + `Ideogram4LiveTrainer`), borrowing this port's
+encoders/VAE. Today's deltas:
+- **Real training fixed (06-11, serenity-trainer 166882f):** the prior
+  3000-step run trained on the ONE-SAMPLE parity fixture at FIXED t=0.7
+  (measured: loss ~1.3e-4, grad_norm 0.0000 — learned nothing). Now: real
+  70-sample giger cache (staged jpg+txt → Mojo VAE + Qwen3-VL 13-tap
+  prepare) + per-step t ~ logit-normal(0,1.5) per DiffSynth
+  (mojodiffusion 08056ea `sample_timestep_logit_normal_scaled`). Gate
+  green: loss 0.6-1.2 class, smooth 1.125→1.059 DECREASING, all 204
+  LoRA-B nonzero.
+- **Levers fan-out (serenity-trainer da7cbb9):** `_i4_flow_loss_and_dvel`
+  seam + adapter-mirror LeversBridge (host levers optimizer over device
+  adamw state) + EMA siblings + SF brackets. GATE: flags-off 2-step
+  1.12493/1.1416154 with byte-identical LoRA vs pre-change build (C13);
+  levers-on smoke (huber+min-snr+ADAFACTOR+EMA) moved weights, shadow
+  lags (|diff| 0.122).
+- **UI lever delivery (serenity-trainer eaa88f1):** bridge appends argv 10
+  (caption_dropout) + 11 (levers JSON, "-" sentinel); old-vs-new argv
+  equivalence EXACT (same two losses above).

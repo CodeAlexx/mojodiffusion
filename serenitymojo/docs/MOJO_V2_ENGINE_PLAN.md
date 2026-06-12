@@ -204,6 +204,22 @@ numerics sign-off (handoff §3.5). The engine alone cannot reach OT parity
 while kernel busy-time exceeds OT's whole step — flame closed this with
 cuDNN SDPA + fused kernels; same here.
 
+## Status note 2026-06-12 — engine consumers landed on top (ledger above current through flash)
+
+The flash/levers/full-FT landings of 06-11/12 ride ON the engine, no new
+engine phases: (a) levers fan-out — all four trainers (zimage/klein/hidream/
+ideogram4) dispatch loss/optimizer through `training/levers.mojo` with the
+engine paths' anchors held (klein flags-off 0.5414/0.2154/0.7810, step-3
+delta 2.2e-4 inside the ~4e-4 flash-bwd class — commit 12190f6); (b) T2.E
+zimage ControlNet trainer uses the v2 GRAPH backward for hint injection
+(per-place d_hints; gotcha recorded: the graph records LoRA ops
+UNCONDITIONALLY, so a [1,1] placeholder LoRA set blows up — frozen
+properly-shaped rank-16 B=0 set required, commit f17aa20); (c) T2.C zimage
+full-FT v1 runs its own driver (host 8-bit optimizer, NOT engine-graphed —
+GPU-resident streamed kernel is its named follow-up, c789b6d). P7 B2 remains
+GATED OFF at the 24 GB wall; flash freed the score buffers, slab-routed B2
+forward still owed. Detail: TIER2_PARITY_CAMPAIGN_2026-06-11.md.
+
 ## Files
 - serenitymojo/models/zimage/lora_block.mojo — modvec slab, batch fwd clone
   removal

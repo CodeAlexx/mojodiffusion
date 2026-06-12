@@ -39,6 +39,8 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from linalg.matmul.vendor.blas import matmul
 from serenitymojo.tensor import Tensor
+from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.autograd_v2.step_slab import StepSlab
@@ -580,12 +582,32 @@ def sdpa_backward_masked[
     rect fallback — the mask insert point only exists here."""
     if mask_f32.dtype().to_mojo_dtype() != DType.float32:
         raise Error("sdpa_backward_masked: mask must be F32")
+    # bf16/f16 inputs: cast to F32 up front (the gather helpers are F32-only
+    # — measured: "_gather_to_f32 is legacy F32-only" raise on the bf16
+    # trainer path 2026-06-11). out_dt below keeps the ORIGINAL dtype so
+    # grads scatter back to the caller's carrier.
+    var orig_dt = q.dtype()
+    var q_w: Tensor
+    var k_w: Tensor
+    var v_w: Tensor
+    var do_w: Tensor
+    if orig_dt.to_mojo_dtype() != DType.float32:
+        q_w = cast_tensor(q, STDtype.F32, ctx)
+        k_w = cast_tensor(k, STDtype.F32, ctx)
+        v_w = cast_tensor(v, STDtype.F32, ctx)
+        do_w = cast_tensor(d_out, STDtype.F32, ctx)
+    else:
+        # zero-copy re-box (Tensor is not implicitly copyable)
+        q_w = Tensor(q.buf.copy(), q.shape(), q.dtype())
+        k_w = Tensor(k.buf.copy(), k.shape(), k.dtype())
+        v_w = Tensor(v.buf.copy(), v.shape(), v.dtype())
+        do_w = Tensor(d_out.buf.copy(), d_out.shape(), d_out.dtype())
     if q.dtype() != k.dtype() or q.dtype() != v.dtype() or q.dtype() != d_out.dtype():
         raise Error("sdpa_backward_masked: q/k/v/d_out dtype mismatch")
     var qshape = q.shape()
     if len(qshape) != 4 or qshape[0] != B or qshape[1] != S or qshape[2] != H or qshape[3] != Dh:
         raise Error("sdpa_backward_masked: q shape != compile-time [B,S,H,Dh]")
-    var out_dt = q.dtype()
+    var out_dt = orig_dt
     comptime BH = B * H
     comptime src_rows = B * S * H
     comptime bhsd_rows = B * H * S
@@ -603,10 +625,10 @@ def sdpa_backward_masked[
     var kd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](kf.unsafe_ptr(), bhsd_rl)
     var vd = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](vf.unsafe_ptr(), bhsd_rl)
     var god = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gof.unsafe_ptr(), bhsd_rl)
-    _gather_to_f32(q, qd, B, S, H, Dh, src_rl, ctx)
-    _gather_to_f32(k, kd, B, S, H, Dh, src_rl, ctx)
-    _gather_to_f32(v, vd, B, S, H, Dh, src_rl, ctx)
-    _gather_to_f32(d_out, god, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(q_w, qd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(k_w, kd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(v_w, vd, B, S, H, Dh, src_rl, ctx)
+    _gather_to_f32(do_w, god, B, S, H, Dh, src_rl, ctx)
 
     # ── 2) recompute attn = softmax(Q@Kᵀ * scale)  [BH,S,S] ─────────────────
     var attn = ctx.enqueue_create_buffer[DType.float32](BH * S * S)

@@ -67,6 +67,12 @@ from serenitymojo.models.dit.hidream_o1 import (
 )
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
+from serenitymojo.training.train_step import LoraAdapter
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState,
+    lora_adamw_plain_device_state_init,
+    fused_lora_adamw_plain_step_resident,
+)
 from serenitymojo.models.dit.hidream_o1_train_block import (
     HiDreamO1BlockWeights,
     HiDreamO1BlockLora,
@@ -264,16 +270,13 @@ def main() raises:
     var dit = HiDreamO1Offloaded[S].load(String(MODEL_DIR), cfg, ctx)
     var tok = Qwen3Tokenizer(String(TOK_PATH))
 
-    # ── LoRA: host mirrors (F32) + device bf16; A lcg-kaiming, B ZERO ───────
-    var a_host = List[List[Float32]]()
-    var b_host = List[List[Float32]]()
-    var m_state = List[Float32]()
-    var v_state = List[Float32]()
-    var m_offsets = List[Int]()
-    var loras = List[HiDreamO1BlockLora]()
-    var moff = 0
+    # ── LoRA (resident-set, the zimage v2 pattern): host LoraAdapter pack ->
+    # ONE persistent device P/M/V upload; the model's adapter tensors are
+    # zero-copy sub-buffer VIEWS into state.dev_p, so the in-place fused
+    # AdamW update IS the next step's weights (no per-step re-upload; the
+    # 98 s/step host-AdamW P2 placeholder measured 2026-06-11 dies here).
+    var host_ads = List[LoraAdapter]()
     for li in range(LAYERS):
-        var ads = List[Optional[ZImageLoraAdapterDevice]]()
         for sl in range(7):
             var dims = _slot_dims(sl)
             var in_f = dims[0]
@@ -283,23 +286,60 @@ def main() raises:
             var b_h = List[Float32]()
             for _ in range(out_f * rank):
                 b_h.append(0.0)
-            var a_t = Tensor.from_host(a_h.copy(), [rank, in_f], STDtype.BF16, ctx)
-            var b_t = Tensor.from_host(b_h.copy(), [out_f, rank], STDtype.BF16, ctx)
+            var z1 = List[Float32]()
+            for _ in range(rank * in_f):
+                z1.append(0.0)
+            var z2 = List[Float32]()
+            for _ in range(rank * in_f):
+                z2.append(0.0)
+            var z3 = List[Float32]()
+            for _ in range(out_f * rank):
+                z3.append(0.0)
+            var z4 = List[Float32]()
+            for _ in range(out_f * rank):
+                z4.append(0.0)
+            host_ads.append(LoraAdapter(
+                a_h^, b_h^, rank, in_f, out_f, Float32(1.0),
+                z1^, z2^, z3^, z4^,
+            ))
+    var opt_state = lora_adamw_plain_device_state_init(host_ads, 0, len(host_ads), ctx)
+    var loras = List[HiDreamO1BlockLora]()
+    for li in range(LAYERS):
+        var ads = List[Optional[ZImageLoraAdapterDevice]]()
+        for sl in range(7):
+            var i = li * 7 + sl
+            var dims = _slot_dims(sl)
+            var n_a = rank * dims[0]
+            var n_b = dims[1] * rank
+            var a_off = opt_state.elem_offset(i, False)
+            var b_off = opt_state.elem_offset(i, True)
             ads.append(Optional[ZImageLoraAdapterDevice](ZImageLoraAdapterDevice(
-                TArc(a_t^), TArc(b_t^), rank, in_f, out_f, Float32(1.0),
+                TArc(Tensor(
+                    opt_state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+                    [rank, dims[0]], STDtype.BF16,
+                )),
+                TArc(Tensor(
+                    opt_state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+                    [dims[1], rank], STDtype.BF16,
+                )),
+                rank, dims[0], dims[1], Float32(1.0),
             )))
-            a_host.append(a_h^)
-            b_host.append(b_h^)
-            m_offsets.append(moff)
-            moff += rank * in_f + out_f * rank
         loras.append(HiDreamO1BlockLora(
             ads[0].copy(), ads[1].copy(), ads[2].copy(), ads[3].copy(),
             ads[4].copy(), ads[5].copy(), ads[6].copy(),
         ))
-    for _ in range(moff):
-        m_state.append(0.0)
-        v_state.append(0.0)
-    print("[lora] adapters:", LAYERS * 7, " params:", moff)
+    print("[lora] adapters:", LAYERS * 7, " resident params:", opt_state.total)
+
+    # ── BF16-RESIDENT blocks (measured fix, 2026-06-11): await_block re-reads
+    # + re-converts the F32 shards on EVERY visit (planned_loader.mojo:110 ->
+    # load_block_as_bf16) — 72 visits x ~845 MB = ~60 GB/step = the ~100 s.
+    # Converted ONCE, the whole kept set is ~15.2 GB bf16 -> RESIDENT fits
+    # 24 GB (the earlier OOM was the F32 30.4 GB resident load).
+    print("[load] converting 36 layers to bf16-resident (once)")
+    var resident_blocks = List[Block]()
+    for li in range(LAYERS):
+        var h0 = dit.loader.await_block(li, ctx)
+        resident_blocks.append(h0.block.copy())
 
     var imgs = ShardedSafeTensors.open(stage_dir + "/images.safetensors")
     var n_samples = 0
@@ -404,12 +444,9 @@ def main() raises:
         # ── forward stack (recompute-checkpoint: keep block INPUTS only) ─────
         var x = TArc(hidden_t^)
         var block_in = List[TArc]()
-        dit.loader.prefetch(0)
         for li in range(LAYERS):
             block_in.append(x.copy())
-            dit.loader.prefetch_next(li)
-            var handle = dit.loader.await_block(li, ctx)
-            var bwts = _block_weights(handle.block, li)
+            var bwts = _block_weights(resident_blocks[li], li)
             var f = hidream_o1_block_lora_forward[S, H, HKV, Dh](
                 x, bwts, loras[li], cos_q, sin_q, cos_k, sin_k, mask4,
                 D, F, EPS, ctx,
@@ -446,10 +483,16 @@ def main() raises:
         var d_x = TArc(rms_norm_backward_dx(d_final_normed, final_in[], norm_w[], EPS, ctx))
 
         # ── backward stack: recompute tape per block, P1 backward ────────────
+        # Grads collected per adapter index; ONE fused resident AdamW step
+        # after the loop (the zimage v2 optimizer — params update in place).
+        var g_a = List[List[Float32]]()
+        var g_b = List[List[Float32]]()
+        for _ in range(LAYERS * 7):
+            g_a.append(List[Float32]())
+            g_b.append(List[Float32]())
         var bi = LAYERS - 1
         while bi >= 0:
-            var handle_b = dit.loader.await_block(bi, ctx)
-            var bwts_b = _block_weights(handle_b.block, bi)
+            var bwts_b = _block_weights(resident_blocks[bi], bi)
             var rf = hidream_o1_block_lora_forward[S, H, HKV, Dh](
                 block_in[bi], bwts_b, loras[bi], cos_q, sin_q, cos_k, sin_k,
                 mask4, D, F, EPS, ctx,
@@ -459,35 +502,17 @@ def main() raises:
                 cos_q, sin_q, cos_k, sin_k, mask_f32, D, F, EPS, ctx,
             )
             d_x = bg.d_hidden.copy()
-            # AdamW on host mirrors + re-upload bf16 (P2 correctness path)
             for sl in range(7):
                 if not bg.d_a[sl]:
                     raise Error("train_hidream_o1: missing adapter grad")
                 var k = bi * 7 + sl
-                var dims = _slot_dims(sl)
-                var ga = bg.d_a[sl].value()[].to_host(ctx)
-                var gb = bg.d_b[sl].value()[].to_host(ctx)
-                _adamw_host(a_host[k], ga, m_state, v_state, m_offsets[k], step, lr)
-                _adamw_host(b_host[k], gb, m_state, v_state, m_offsets[k] + rank * dims[0], step, lr)
-                var a_t = Tensor.from_host(a_host[k].copy(), [rank, dims[0]], STDtype.BF16, ctx)
-                var b_t = Tensor.from_host(b_host[k].copy(), [dims[1], rank], STDtype.BF16, ctx)
-                var ad = ZImageLoraAdapterDevice(
-                    TArc(a_t^), TArc(b_t^), rank, dims[0], dims[1], Float32(1.0))
-                if sl == 0:
-                    loras[bi].q = Optional[ZImageLoraAdapterDevice](ad^)
-                elif sl == 1:
-                    loras[bi].k = Optional[ZImageLoraAdapterDevice](ad^)
-                elif sl == 2:
-                    loras[bi].v = Optional[ZImageLoraAdapterDevice](ad^)
-                elif sl == 3:
-                    loras[bi].o = Optional[ZImageLoraAdapterDevice](ad^)
-                elif sl == 4:
-                    loras[bi].gate = Optional[ZImageLoraAdapterDevice](ad^)
-                elif sl == 5:
-                    loras[bi].up = Optional[ZImageLoraAdapterDevice](ad^)
-                else:
-                    loras[bi].down = Optional[ZImageLoraAdapterDevice](ad^)
+                g_a[k] = bg.d_a[sl].value()[].to_host(ctx)
+                g_b[k] = bg.d_b[sl].value()[].to_host(ctx)
             bi -= 1
+        fused_lora_adamw_plain_step_resident(
+            opt_state, host_ads, g_a, g_b, step, lr,
+            Float32(0.9), Float32(0.999), Float32(1.0e-8), Float32(0.01), ctx,
+        )
 
         var t1 = perf_counter_ns()
         if smooth_init:
@@ -497,8 +522,8 @@ def main() raises:
             smooth_init = True
         var b_absum = Float32(0.0)
         for k in range(LAYERS * 7):
-            for i in range(len(b_host[k])):
-                var av = b_host[k][i]
+            for i in range(len(host_ads[k].b)):
+                var av = Float32(host_ads[k].b[i])
                 b_absum += av if av >= 0.0 else -av
         print(
             "[HiDreamO1-lora] step ", step, "/", steps,
@@ -517,11 +542,11 @@ def main() raises:
             var prefix = String("diffusion_model.model.language_model.layers.")
                 + String(li) + "." + _slot_name(sl)
             names.append(prefix + ".lora_A.weight")
-            tensors.append(TArc(Tensor.from_host(
-                a_host[k].copy(), [rank, dims[0]], STDtype.BF16, ctx)))
+            tensors.append(TArc(Tensor.from_host_bf16(
+                host_ads[k].a.copy(), [rank, dims[0]], ctx)))
             names.append(prefix + ".lora_B.weight")
-            tensors.append(TArc(Tensor.from_host(
-                b_host[k].copy(), [dims[1], rank], STDtype.BF16, ctx)))
+            tensors.append(TArc(Tensor.from_host_bf16(
+                host_ads[k].b.copy(), [dims[1], rank], ctx)))
     var out_path = out_dir + "/hidream_o1_lora_last.safetensors"
     save_safetensors(names, tensors, out_path, ctx)
     print("[save] ", out_path)

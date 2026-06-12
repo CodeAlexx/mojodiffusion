@@ -32,7 +32,7 @@
   "lora_alpha": 1.0,
   "timestep_shift": 1.0,
   "max_grad_norm": 1.0,
-  "max_steps": 3,
+  "max_steps": 5,
   "save_every": 0,
   "sample_every": 0,
   "optimizer": {

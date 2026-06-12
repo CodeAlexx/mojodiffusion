@@ -33,6 +33,7 @@
 #
 # Mojo 1.0.0b1.
 
+from std.algorithm import parallelize
 from std.collections import List, Dict
 from std.gpu.host import DeviceContext, HostBuffer
 from std.math import sqrt
@@ -143,6 +144,12 @@ struct FullFTStepStats(Copyable, Movable):
 # bf16 pointer with `gscale` (the global-clip factor) folded in. Per-element
 # math is a verbatim copy of adam8bit_step_bnb; ONLY the requant argmin is the
 # binary search (equivalence gated at run start).
+# @no_inline: the full-FT step calls this from a parallel closure; pinning
+# ONE compiled body guarantees the run-start equivalence gate (which calls it
+# from a plain def) exercises the same code the training loop runs. (Measured:
+# a pointer/closure re-body of this loop picked up FMA contraction and broke
+# bit-equality vs adam8bit_step_bnb at step 2 — m_absmax 1-ulp shifts.)
+@no_inline
 def _adam8bit_step_fast(
     mut p: List[Float32],
     gp: UnsafePointer[BFloat16, MutAnyOrigin],
@@ -391,31 +398,87 @@ def zimage_full_ft_step(
 ) raises -> FullFTStepStats:
     if grads.num_main != opt.num_main:
         raise Error("zimage_full_ft_step: block count mismatch")
-    var upd_l1 = 0.0
-    var upd_max = Float32(0.0)
-    var sp = opt.staging.unsafe_ptr().bitcast[BFloat16]()
+    var n_slots = opt.num_main * ZIMAGE_SLOTS
+
+    # Phase 1 — host 8-bit AdamW, PARALLEL over the 210 independent slots
+    # (disjoint masters/moment-state/grad ranges; no device interaction).
+    # Each worker calls the SAME @no_inline _adam8bit_step_fast body the
+    # run-start equivalence gate bit-compares against adam8bit_step_bnb, so
+    # the math is bit-identical to the sequential loop. (Sequential measured
+    # 384.8 s/step on 5.31B params — the v1 smoke blocker.)
+    var gaddrs = List[Int](capacity=n_slots)
+    var l1s = List[Float64](capacity=n_slots)
+    var mxs = List[Float32](capacity=n_slots)
+    var errs = List[Int](capacity=n_slots)
     for bi in range(opt.num_main):
         var bj = grads.buf_index(bi)
         for s in range(ZIMAGE_SLOTS):
             var idx = bi * ZIMAGE_SLOTS + s
-            var n = opt.slot_numels[s]
             if opt.states[idx].step != k - 1:
                 raise Error("zimage_full_ft_step: optimizer step desync")
-            var gp = (
-                grads.bufs_rev[bj].unsafe_ptr() + grads.slot_offsets[s]
-            ).bitcast[BFloat16]()
-            var st = _adam8bit_step_fast(
-                opt.masters[idx], gp, n, gscale, opt.states[idx],
-                opt.qmap_signed, opt.qmap_unsigned, k,
-                lr, beta1, beta2, eps, weight_decay,
+            gaddrs.append(
+                Int(grads.bufs_rev[bj].unsafe_ptr() + grads.slot_offsets[s])
             )
-            opt.states[idx].step = k
-            upd_l1 += st.upd_l1
-            if st.upd_max > upd_max:
-                upd_max = st.upd_max
-            # RNE bf16 write-back into the live device weight buffer.
-            for i in range(n):
-                sp[i] = BFloat16(opt.masters[idx][i])
+            l1s.append(0.0)
+            mxs.append(Float32(0.0))
+            errs.append(0)
+    var masters_p = opt.masters.unsafe_ptr()
+    var states_p = opt.states.unsafe_ptr()
+    var slotn_p = opt.slot_numels.unsafe_ptr()
+    var ga_p = gaddrs.unsafe_ptr()
+    var l1_p = l1s.unsafe_ptr()
+    var mx_p = mxs.unsafe_ptr()
+    var er_p = errs.unsafe_ptr()
+    var qsl = opt.qmap_signed.copy()
+    var qul = opt.qmap_unsigned.copy()
+
+    @parameter
+    fn _slot_worker(w: Int):
+        var s = w % ZIMAGE_SLOTS
+        var n = slotn_p[s]
+        var gp = UnsafePointer[BFloat16, MutAnyOrigin](
+            unsafe_from_address=ga_p[w]
+        )
+        try:
+            var st = _adam8bit_step_fast(
+                masters_p[w], gp, n, gscale, states_p[w],
+                qsl, qul, k, lr, beta1, beta2, eps, weight_decay,
+            )
+            states_p[w].step = k
+            l1_p[w] = st.upd_l1
+            mx_p[w] = st.upd_max
+        except:
+            er_p[w] = 1
+
+    parallelize[_slot_worker](n_slots)
+
+    var upd_l1 = 0.0
+    var upd_max = Float32(0.0)
+    for w in range(n_slots):
+        if errs[w] != 0:
+            raise Error("zimage_full_ft_step: slot optimizer step failed")
+        upd_l1 += l1s[w]
+        if mxs[w] > upd_max:
+            upd_max = mxs[w]
+
+    # Phase 2 — RNE bf16 write-back into the live device weight buffers.
+    # Sequential per slot (single DeviceContext), parallel chunked f32->bf16
+    # conversion (independent per element, bit-safe).
+    var sp = opt.staging.unsafe_ptr().bitcast[BFloat16]()
+    for bi in range(opt.num_main):
+        for s in range(ZIMAGE_SLOTS):
+            var idx = bi * ZIMAGE_SLOTS + s
+            var n = opt.slot_numels[s]
+            var mp = opt.masters[idx].unsafe_ptr()
+
+            @parameter
+            fn _conv_worker(c: Int):
+                var s0 = c * 262144
+                var e0 = min(s0 + 262144, n)
+                for i in range(s0, e0):
+                    sp[i] = BFloat16(mp[i])
+
+            parallelize[_conv_worker]((n + 262143) // 262144)
             var w_t = zimage_fullft_slot_tensor(main_blocks[bi], s)
             if w_t[].nbytes() != n * 2:
                 raise Error("zimage_full_ft_step: device weight size mismatch")

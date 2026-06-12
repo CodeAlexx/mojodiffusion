@@ -1,23 +1,32 @@
-# training/dora_save.mojo — save / reopen TRAINED DoRA adapters in the LyCORIS
-# (diffusers PEFT) key convention.
+# training/dora_save.mojo — save / reopen TRAINED DoRA adapters in the
+# UPSTREAM LyCORIS key convention (pip lycoris_lora 3.4.0, the T2.F oracle).
 #
-# Mirrors EDv2 crates/eridiffusion-core/src/lycoris.rs DoRA save
-# (lycoris.rs:787 `out.insert(format!("{full}.dora_scale"), m.clone())` — the
-# `.dora_scale` magnitude appended NEXT TO the algo's own tensors) and dora.rs
-# header §"Save format" (lycoris.rs:1131 also accepts `.magnitude_vector` as a
-# load alias). The base low-rank legs use the project PEFT LoRA convention
-# (lora_save.mojo:24-25):
+# MEASURED upstream schema (lycoris/modules/locon.py LoConModule with
+# weight_decompose=True — upstream lycoris DoRA IS LoCon(wd=True); weight_list
+# + custom_state_dict):
 #
-#       "<prefix>.lora_A.weight"   BF16 [rank, in]   (== DoRAAdapter.a / lora_down)
-#       "<prefix>.lora_B.weight"   BF16 [out, rank]  (== DoRAAdapter.b / lora_up)
-#       "<prefix>.dora_scale"      BF16 [out, 1]     (== DoRAAdapter.m magnitude)
-#       "<prefix>.alpha"           F32 [1]
+#       "<prefix>.lora_down.weight"  BF16 [rank, in]   (== DoRAAdapter.a)
+#       "<prefix>.lora_up.weight"    BF16 [out, rank]  (== DoRAAdapter.b)
+#       "<prefix>.dora_scale"        F32 [out, 1]      (== DoRAAdapter.m magnitude;
+#                                     upstream keeps dora_scale float32 even in
+#                                     bf16 models — locon.py `.float()`)
+#       "<prefix>.alpha"             F32 [1]
 #
-# ── AGENT-DEFAULT (flagged for review) ────────────────────────────────────────
-# - Key spellings: lora_A/lora_B (PEFT, matching this port's plain-LoRA save) +
-#   `.dora_scale` (lycoris.rs:787). PEFT's `.magnitude_vector` is accepted on
-#   read as an alias (dora.rs:64-65 / lycoris.rs:1131) but NOT written.
-# - magnitude saved as [out,1] (wd_on_out=true convention, dora.rs:35).
+# 2026-06-11 T2.F-2 skeptic FIX: the low-rank legs were previously keyed
+# `.lora_A.weight`/`.lora_B.weight` (PEFT spellings, citing the now-deleted EDv2
+# lycoris.rs) — a HYBRID no upstream loader consumes whole (pip lycoris wants
+# lora_down/lora_up; PEFT-DoRA wants lora_magnitude_vector, not dora_scale).
+# Same ecosystem-unloadable bug class as the T2.F LoHa/OFT key fixes. DOCUMENTED
+# CHOICE: the upstream-lycoris LoCon(wd=True) schema above — pip lycoris is the
+# only live upstream loader on this box (campaign oracle), and lora_up/lora_down
+# + dora_scale is also ComfyUI's kohya-DoRA path. Gate:
+# lycoris_family_load_check.py loads a Mojo-saved file through
+# LoConModule.make_module_from_state_dict and reproduces the forward BIT-EXACT.
+#
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# - magnitude saved as [out,1] (wd_on_out=true convention; upstream dora_scale
+#   shape). `.magnitude_vector` is accepted on read as a legacy alias but NOT
+#   written.
 # - Plain LoRA (lora_save.mojo) deliberately OMITS `.alpha`; DoRA follows the
 #   LyCORIS convention and DOES carry `.alpha` (so scale=alpha/rank reconstructs).
 #
@@ -48,6 +57,13 @@ def _bf16_2d(var values: List[BFloat16], rows: Int, cols: Int, ctx: DeviceContex
     return Tensor.from_host_bf16(values^, sh^, ctx)
 
 
+def _f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+    var sh = List[Int]()
+    sh.append(rows)
+    sh.append(cols)
+    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+
+
 def _f32_scalar(value: Float32, ctx: DeviceContext) raises -> Tensor:
     var v = List[Float32]()
     v.append(value)
@@ -64,8 +80,8 @@ def _f32_to_bf16_list(v: List[Float32]) -> List[BFloat16]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAVE: pack each DoRA adapter's lora_A/lora_B + dora_scale + alpha. Returns the
-# number of ADAPTERS written.
+# SAVE: pack each DoRA adapter's lora_down/lora_up + dora_scale + alpha. Returns
+# the number of ADAPTERS written.
 # ─────────────────────────────────────────────────────────────────────────────
 def save_dora_peft(
     adapters: List[NamedDoRA], path: String, ctx: DeviceContext
@@ -82,18 +98,18 @@ def save_dora_peft(
         var OUT = a.out_f
         var R = a.rank
         if len(a.a) != R * IN:
-            raise Error(String("save_dora_peft: lora_A numel ") + String(len(a.a)) + " != rank*in for '" + nd.prefix + "'")
+            raise Error(String("save_dora_peft: lora_down numel ") + String(len(a.a)) + " != rank*in for '" + nd.prefix + "'")
         if len(a.b) != OUT * R:
-            raise Error(String("save_dora_peft: lora_B numel ") + String(len(a.b)) + " != out*rank for '" + nd.prefix + "'")
+            raise Error(String("save_dora_peft: lora_up numel ") + String(len(a.b)) + " != out*rank for '" + nd.prefix + "'")
         if len(a.m) != OUT:
             raise Error(String("save_dora_peft: magnitude numel ") + String(len(a.m)) + " != out for '" + nd.prefix + "'")
 
-        names.append(nd.prefix + ".lora_A.weight")
+        names.append(nd.prefix + ".lora_down.weight")
         tensors.append(ArcPointer(_bf16_2d(a.a.copy(), R, IN, ctx)))
-        names.append(nd.prefix + ".lora_B.weight")
+        names.append(nd.prefix + ".lora_up.weight")
         tensors.append(ArcPointer(_bf16_2d(a.b.copy(), OUT, R, ctx)))
         names.append(nd.prefix + ".dora_scale")
-        tensors.append(ArcPointer(_bf16_2d(a.m.copy(), OUT, 1, ctx)))   # [out,1]
+        tensors.append(ArcPointer(_f32_2d(a.m.copy(), OUT, 1, ctx)))   # F32 [out,1]
         names.append(nd.prefix + ".alpha")
         tensors.append(ArcPointer(_f32_scalar(a.alpha, ctx)))
 
@@ -136,29 +152,29 @@ def _has_key(st: SafeTensors, name: String) -> Bool:
 struct DoRAReadback(Copyable, Movable):
     var a: List[BFloat16]
     var b: List[BFloat16]
-    var m: List[BFloat16]
+    var m: List[Float32]   # F32, like the adapter (upstream dora_scale is F32)
     var in_f: Int
     var out_f: Int
     var rank: Int
     var alpha: Float32
 
 
-# Reopen one module's DoRA keys from `path`. Shapes from the header: lora_A is
-# [rank,in] so rank = a.shape[0], in = a.shape[1]; lora_B is [out,rank] so
+# Reopen one module's DoRA keys from `path`. Shapes from the header: lora_down
+# is [rank,in] so rank = a.shape[0], in = a.shape[1]; lora_up is [out,rank] so
 # out = b.shape[0]. The magnitude is read from `.dora_scale`, or `.magnitude_vector`
-# as a fallback alias (dora.rs:64-65 / lycoris.rs:1131). Asserts all keys present.
+# as a fallback legacy alias. Asserts all keys present.
 def read_dora_module(prefix: String, path: String, ctx: DeviceContext) raises -> DoRAReadback:
     var st = SafeTensors.open(path)
 
-    var ia = st.tensor_info(prefix + ".lora_A.weight")
-    var ib = st.tensor_info(prefix + ".lora_B.weight")
+    var ia = st.tensor_info(prefix + ".lora_down.weight")
+    var ib = st.tensor_info(prefix + ".lora_up.weight")
 
     var R = ia.shape[0]
     var IN = ia.shape[1]
     var OUT = ib.shape[0]
 
     if ib.shape[1] != R:
-        raise Error("read_dora_module: lora_B cols != rank")
+        raise Error("read_dora_module: lora_up cols != rank")
 
     # magnitude key: prefer .dora_scale, fall back to .magnitude_vector alias.
     var mag_key = prefix + ".dora_scale"
@@ -173,9 +189,9 @@ def read_dora_module(prefix: String, path: String, ctx: DeviceContext) raises ->
     if im.shape[0] != OUT:
         raise Error("read_dora_module: magnitude first dim != out")
 
-    var a = _read_bf16(st, prefix + ".lora_A.weight", ctx)
-    var b = _read_bf16(st, prefix + ".lora_B.weight", ctx)
-    var m = _read_bf16(st, mag_key, ctx)
+    var a = _read_bf16(st, prefix + ".lora_down.weight", ctx)
+    var b = _read_bf16(st, prefix + ".lora_up.weight", ctx)
+    var m = _read_f32(st, mag_key, ctx)
     if len(m) != OUT:
         raise Error("read_dora_module: magnitude numel != out")
     var alpha_h = _read_f32(st, prefix + ".alpha", ctx)

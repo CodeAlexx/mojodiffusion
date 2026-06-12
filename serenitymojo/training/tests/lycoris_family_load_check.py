@@ -3,6 +3,8 @@
 # Run AFTER /tmp/lycoris_family_parity (the Mojo gate), which writes
 #   /tmp/mojo_locon.safetensors  /tmp/mojo_tucker.safetensors
 #   /tmp/mojo_loha.safetensors   /tmp/mojo_oft.safetensors
+#   /tmp/mojo_lokr{1,2,3}.safetensors  /tmp/mojo_boft.safetensors
+#   /tmp/mojo_dora.safetensors                           (T2.F-2 extension)
 # This script proves the Mojo-saved files are loadable by the UPSTREAM lycoris
 # loader (pip lycoris_lora 3.4.0) at VALUE level, not just key level:
 #   1. key-set check: the Mojo file's keys must equal the upstream module's
@@ -22,6 +24,8 @@ from safetensors.torch import load_file
 from lycoris.modules.locon import LoConModule
 from lycoris.modules.loha import LohaModule
 from lycoris.modules.diag_oft import DiagOFTModule
+from lycoris.modules.lokr import LokrModule
+from lycoris.modules.boft import ButterflyOFTModule
 
 COS_BAR = 0.99999
 torch.set_grad_enabled(False)  # upstream's loader wrapper runs under no_grad
@@ -119,7 +123,110 @@ m.eval()
 y = F.linear(oracle["oft.x"], m.make_weight(scale=1).float())
 check("oft", y, oracle["oft.y"])
 
+# ═══════════════════════ T2.F-2: LoKr / BOFT / DoRA ══════════════════════════
+# LoKr forward convention: get_weight folds self.scale inside make_kron;
+# get_diff_weight double-applies it (same class as the LoHa quirk) — the live
+# forward path is get_weight(shape) * scalar, which we use here.
+#
+# x inputs are .clone()d: safetensors mmap pointers can be less aligned than
+# fresh allocations, which makes F.linear pick a different GEMM path (±1 ulp)
+# and would break the BIT-EXACT bar (measured 2026-06-11: 1.5e-8 mmap vs 0.0
+# clone on identical bits).
+
+def lokr_y(m, x):
+    return F.linear(x, (m.get_weight(m.shape) * m.scalar).float())
+
+
+# ── LoKr v1: W1 full + W2 factored ───────────────────────────────────────────
+p = "lora_unet_lokr1"
+sd = load_file("/tmp/mojo_lokr1.safetensors")
+keycheck("lokr1", sd, [f"{p}.lokr_w1", f"{p}.lokr_w2_a", f"{p}.lokr_w2_b", f"{p}.alpha"])
+base = torch.nn.Linear(8, 8, bias=False)
+m = LokrModule.make_module_from_state_dict(
+    p, base,
+    sd[f"{p}.lokr_w1"].float(), None, None,
+    None, sd[f"{p}.lokr_w2_a"].float(), sd[f"{p}.lokr_w2_b"].float(),
+    None, None, float(sd[f"{p}.alpha"]), None,
+)
+assert m.use_w1 and not m.use_w2, "lokr1: upstream did not reconstruct W1full+W2factored"
+m.eval()
+check("lokr1", lokr_y(m, oracle["lokr1.x"].clone()), oracle["lokr1.y"])
+
+# ── LoKr v2: BOTH full (upstream forces scale=1 regardless of alpha) ─────────
+p = "lora_unet_lokr2"
+sd = load_file("/tmp/mojo_lokr2.safetensors")
+keycheck("lokr2", sd, [f"{p}.lokr_w1", f"{p}.lokr_w2", f"{p}.alpha"])
+base = torch.nn.Linear(8, 8, bias=False)
+m = LokrModule.make_module_from_state_dict(
+    p, base,
+    sd[f"{p}.lokr_w1"].float(), None, None,
+    sd[f"{p}.lokr_w2"].float(), None, None,
+    None, None, float(sd[f"{p}.alpha"]), None,
+)
+assert m.use_w1 and m.use_w2, "lokr2: upstream did not reconstruct both-full"
+assert float(m.scale) == 1.0, "lokr2: upstream forced-scale=1 quirk missing"
+m.eval()
+check("lokr2", lokr_y(m, oracle["lokr2.x"].clone()), oracle["lokr2.y"])
+
+# ── LoKr v3: BOTH factored (decompose_both) ──────────────────────────────────
+p = "lora_unet_lokr3"
+sd = load_file("/tmp/mojo_lokr3.safetensors")
+keycheck("lokr3", sd, [f"{p}.lokr_w1_a", f"{p}.lokr_w1_b",
+                       f"{p}.lokr_w2_a", f"{p}.lokr_w2_b", f"{p}.alpha"])
+base = torch.nn.Linear(64, 64, bias=False)
+m = LokrModule.make_module_from_state_dict(
+    p, base,
+    None, sd[f"{p}.lokr_w1_a"].float(), sd[f"{p}.lokr_w1_b"].float(),
+    None, sd[f"{p}.lokr_w2_a"].float(), sd[f"{p}.lokr_w2_b"].float(),
+    None, None, float(sd[f"{p}.alpha"]), None,
+)
+assert not m.use_w1 and not m.use_w2, "lokr3: upstream did not reconstruct both-factored"
+m.eval()
+check("lokr3", lokr_y(m, oracle["lokr3.x"].clone()), oracle["lokr3.y"])
+
+# ── BOFT ──────────────────────────────────────────────────────────────────────
+p = "lora_unet_boft_t"
+sd = load_file("/tmp/mojo_boft.safetensors")
+keycheck("boft", sd, [f"{p}.oft_blocks", f"{p}.alpha"])
+# a1111/comfy + upstream algo_check distinguish BOFT from Diag-OFT by RANK:
+# butterfly oft_blocks MUST be 4D [boft_m, num_blocks, b, b] (OFT is 3D).
+if sd[f"{p}.oft_blocks"].ndim == 4 and ButterflyOFTModule.algo_check(sd, p):
+    print(f"PASS (boft rank): oft_blocks is 4D {tuple(sd[f'{p}.oft_blocks'].shape)}"
+          " — upstream algo_check selects ButterflyOFT")
+else:
+    print(f"FAIL (boft rank): oft_blocks ndim={sd[f'{p}.oft_blocks'].ndim}, want 4")
+    ok = False
+base = torch.nn.Linear(12, 8, bias=False)
+with torch.no_grad():
+    base.weight.copy_(oracle["boft.w_base"])
+m = ButterflyOFTModule.make_module_from_state_dict(
+    p, base, sd[f"{p}.oft_blocks"].float(), None, float(sd[f"{p}.alpha"]),
+)
+assert (m.boft_m, m.block_num, m.block_size) == (3, 4, 2), "boft: shape reconstruction drifted"
+m.eval()
+check("boft", F.linear(oracle["boft.x"].clone(), m.make_weight(scale=1).float()), oracle["boft.y"])
+
+# ── DoRA (upstream lycoris DoRA == LoConModule(weight_decompose=True)) ────────
+p = "lora_unet_dora_t"
+sd = load_file("/tmp/mojo_dora.safetensors")
+keycheck("dora", sd, [f"{p}.lora_down.weight", f"{p}.lora_up.weight",
+                      f"{p}.dora_scale", f"{p}.alpha"])
+base = torch.nn.Linear(12, 16, bias=False)
+with torch.no_grad():
+    base.weight.copy_(oracle["dora.w_base"])
+m = LoConModule.make_module_from_state_dict(
+    p, base,
+    sd[f"{p}.lora_up.weight"].float(), sd[f"{p}.lora_down.weight"].float(),
+    None, float(sd[f"{p}.alpha"]), sd[f"{p}.dora_scale"].float(),
+)
+assert m.wd, "dora: upstream did not enter weight-decompose mode from the Mojo file"
+m.eval()
+# FULL forward: DoRA replaces the effective weight (get_merged_weight).
+check("dora", F.linear(oracle["dora.x"].clone(), m.get_merged_weight(multiplier=1)[0].float()),
+      oracle["dora.y"])
+
 if not ok:
     raise SystemExit("lycoris_family_load_check: FAIL (see lines above)")
 print("lycoris_family_load_check ALL GATES PASS "
-      "(upstream lycoris loads all 4 Mojo-saved files, forward cos>=0.99999)")
+      "(upstream lycoris loads all 9 Mojo-saved files "
+      "[locon/tucker/loha/oft/lokr x3/boft/dora], forward cos>=0.99999)")

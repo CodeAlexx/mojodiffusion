@@ -16,8 +16,9 @@
 # GATE (b) GRAD-FLOW: after one AdamW step (B off zero), fresh fwd+bwd, feed the
 #   3 grads into GradCoverage.measure → ASSERT coverage_pct==100 and dead==0.
 #   The DORA_BREAK_GRAD demo proves a zeroed magnitude grad is caught.
-# GATE (c) SAVE: save a DoRA adapter, reopen, assert lora_A/lora_B/dora_scale/alpha
-#   keys + shapes + byte-exact values round-trip.
+# GATE (c) SAVE: save a DoRA adapter, reopen, assert lora_down/lora_up/dora_scale/
+#   alpha keys + shapes + byte-exact values round-trip (upstream lycoris
+#   LoCon(wd=True) schema — T2.F-2 key fix, see dora_save.mojo header).
 # GATE (d) default-off + trainer AOT-build is verified by the builder out-of-band
 #   (the trainer fails loud on adapter_algo==3); see the report.
 #
@@ -251,7 +252,7 @@ def main() raises:
     var eff = dora_effective_weight(w_orig, d)
     var d_a_h = _bf16_to_f32_list(d.a)
     var d_b_h = _bf16_to_f32_list(d.b)
-    var d_m_h = _bf16_to_f32_list(d.m)
+    var d_m_h = d.m.copy()   # m is F32 storage (T2.F-2 fix; upstream dora_scale is F32)
     var wp_oracle = _oracle_wp_dora(w_orig, d_a_h, d_b_h, d_m_h, OUT, IN, R, d.scale, eps)
     var wp_mx = _max_abs_diff(eff.wp_dora, wp_oracle)
     if wp_mx > Float32(1.0e-5):
@@ -367,11 +368,11 @@ def main() raises:
         print("PASS (c): alpha round-trip =", rb.alpha)
     var a_mx = _max_abs_diff_bf16(rb.a, d.a)
     var b_mx = _max_abs_diff_bf16(rb.b, d.b)
-    var m_mx = _max_abs_diff_bf16(rb.m, d.m)
+    var m_mx = _max_abs_diff(rb.m, d.m)   # F32 magnitude
     if a_mx > Float32(1.0e-6) or b_mx > Float32(1.0e-6) or m_mx > Float32(1.0e-6):
         print("FAIL (c): values not byte-exact, A Δ=", a_mx, " B Δ=", b_mx, " m Δ=", m_mx); ok = False
     else:
-        print("PASS (c): lora_A/lora_B/dora_scale values round-trip byte-exact")
+        print("PASS (c): lora_down/lora_up/dora_scale values round-trip byte-exact")
 
     if not ok:
         raise Error("dora_adapter_smoke FAILED")

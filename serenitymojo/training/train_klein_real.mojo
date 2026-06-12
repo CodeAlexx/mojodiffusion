@@ -867,7 +867,7 @@ def main() raises:
     elif cfg.adapter_algo == 3:
         # adapter_algo==3 selects DoRA (weight-decomposed LoRA). The DoRA
         # PRIMITIVE (effective-weight fwd, 3-grad bwd over lora_down/lora_up/
-        # magnitude, AdamW) + lora_A/lora_B/.dora_scale/.alpha save convention
+        # magnitude, AdamW) + lora_down/lora_up/.dora_scale/.alpha save convention
         # ship in training/dora_adapter.mojo + training/dora_save.mojo and are
         # gated by dora_adapter_smoke.mojo (effective-weight + FD-detached-norm
         # parity + 3-grad grad-flow + save round-trip, incl. a deliberate
@@ -878,7 +878,7 @@ def main() raises:
         # follow-up. We fail loud rather than silently train the wrong thing.
         raise Error(
             "adapter_algo=3 (DoRA) selected: the DoRA adapter primitive "
-            + "(effective-weight fwd, 3-grad bwd, AdamW) + lora_A/lora_B/"
+            + "(effective-weight fwd, 3-grad bwd, AdamW) + lora_down/lora_up/"
             + ".dora_scale/.alpha save ship in training/dora_adapter.mojo + "
             + "training/dora_save.mojo and are gated by dora_adapter_smoke.mojo, "
             + "but the Klein stack is additive-LoRA-only — wiring the "

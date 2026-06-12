@@ -51,8 +51,13 @@
 # m always gets grad even at init (d_m depends on WP, not on ΔW), and A/B follow
 # the plain-LoRA zero-leaf rule (B=0 at init → d_A=0 at step 0, live at step≥1).
 #
-# BF16 trainable storage, F32 internal compute/moments. All tensors are tiny so
-# host matmul is exact and auditable after explicit BF16->F32 materialization.
+# BF16 trainable storage for A/B; the magnitude m is F32. 2026-06-11 T2.F-2 FIX:
+# m was previously BF16 like the low-rank legs, which broke the identity-at-init
+# contract by up to ~0.4% (bf16(‖W‖)/‖W‖ ≠ 1; measured: dora_adapter_smoke
+# a-init max|Δ|=3.05e-3 vs the 1e-5 bar). Upstream lycoris EXPLICITLY keeps
+# dora_scale in float32 even for bf16 models (locon.py/lokr.py:
+# `nn.Parameter(...).float()`) — mirrored here. F32 internal compute/moments.
+# All tensors are tiny so host matmul is exact and auditable.
 #
 # Mojo 0.26.x: `def` not `fn`; move-only Tensor → ArcPointer in collections;
 # multi-return via Movable struct. MIRRORS loha_adapter.mojo structure.
@@ -147,7 +152,8 @@ def _row_l2_norm(w: List[Float32], out_f: Int, in_f: Int) -> List[Float32]:
 struct DoRAAdapter(Copyable, Movable):
     var a: List[BFloat16]         # lora_down [rank,in]
     var b: List[BFloat16]         # lora_up   [out,rank]
-    var m: List[BFloat16]         # magnitude [out]  (per-output column)
+    var m: List[Float32]          # magnitude [out]  (F32 — upstream keeps
+                                  # dora_scale float32 even in bf16 models)
     var rank: Int
     var in_f: Int
     var out_f: Int
@@ -172,7 +178,7 @@ struct DoRAAdapter(Copyable, Movable):
     ):
         self.a = _f32_to_bf16_list(a)
         self.b = _f32_to_bf16_list(b)
-        self.m = _f32_to_bf16_list(m)
+        self.m = m^
         self.rank = rank
         self.in_f = in_f
         self.out_f = out_f
@@ -256,9 +262,8 @@ def dora_effective_weight(w_orig: List[Float32], d: DoRAAdapter) raises -> DoRAE
     for o in range(d.out_f):
         den.append(norm[o] + d.eps)
     var wp_dora = List[Float32]()
-    var m = _bf16_to_f32_list(d.m)
     for o in range(d.out_f):
-        var mo = m[o]
+        var mo = d.m[o]
         var deno = den[o]
         for i in range(d.in_f):
             wp_dora.append(mo * wp[o * d.in_f + i] / deno)
@@ -317,7 +322,7 @@ def dora_backward(d_y_h: List[Float32], x_h: List[Float32], w_orig: List[Float32
         d_wp.append(Float32(0.0))
     for o in range(OUT):
         var deno = eff.den[o]
-        var mo = d.m[o].cast[DType.float32]()
+        var mo = d.m[o]
         var acc = Float32(0.0)
         for i in range(IN):
             var idx = o * IN + i
@@ -376,6 +381,40 @@ def _adamw_host_list(
         p[i] = BFloat16(pv)
 
 
+# F32-param variant for the magnitude (m is F32 storage, see header fix note).
+def _adamw_host_list_f32(
+    mut p: List[Float32], g: List[Float32],
+    mut mom: List[Float32], mut vmo: List[Float32],
+    t: Int, lr: Float32, beta1: Float32, beta2: Float32,
+    eps: Float32, weight_decay: Float32,
+) raises:
+    var n = len(p)
+    if len(g) != n or len(mom) != n or len(vmo) != n:
+        raise Error("dora _adamw_host_list_f32: param/grad/m/v len mismatch")
+    if t < 1:
+        raise Error("dora _adamw_host_list_f32: t must be >= 1")
+    var b1p = Float32(1.0)
+    var b2p = Float32(1.0)
+    for _ in range(t):
+        b1p *= beta1
+        b2p *= beta2
+    var bc1 = Float32(1.0) - b1p
+    var bc2 = Float32(1.0) - b2p
+    for i in range(n):
+        var gv = g[i]
+        var mi = beta1 * mom[i] + (Float32(1.0) - beta1) * gv
+        var vi = beta2 * vmo[i] + (Float32(1.0) - beta2) * gv * gv
+        mom[i] = mi
+        vmo[i] = vi
+        var m_hat = mi / bc1
+        var v_hat = vi / bc2
+        var pv = p[i]
+        if weight_decay > 0.0:
+            pv = pv * (Float32(1.0) - lr * weight_decay)
+        pv = pv - lr * m_hat / (sqrt(v_hat) + eps)
+        p[i] = pv
+
+
 def dora_adamw(
     mut d: DoRAAdapter, g: DoRAGrads, t: Int, lr: Float32,
     beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
@@ -384,4 +423,4 @@ def dora_adamw(
     _adamw_host_list(d.a, g.d_a, d.ma, d.va, t, lr, beta1, beta2, eps, weight_decay)
     _adamw_host_list(d.b, g.d_b, d.mb, d.vb, t, lr, beta1, beta2, eps, weight_decay)
     # Magnitude m: no weight decay (a norm scalar; OT/PEFT do not decay it).
-    _adamw_host_list(d.m, g.d_m, d.mm, d.vm, t, lr, beta1, beta2, eps, Float32(0.0))
+    _adamw_host_list_f32(d.m, g.d_m, d.mm, d.vm, t, lr, beta1, beta2, eps, Float32(0.0))

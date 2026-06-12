@@ -66,7 +66,8 @@
 # loha_adapter.mojo structure.
 
 from std.collections import List
-from std.math import sqrt
+from std.math import sqrt, log as flog, cos as fcos, sin as fsin
+from serenitymojo.util.bf16_stochastic_rounding import copy_stochastic_value
 
 
 # ── factorization(dimension, factor) → (m, n) with m <= n, m*n == dimension ──
@@ -252,16 +253,23 @@ struct LoKrAdapter(Copyable, Movable):
 
 
 # Construct a fresh LoKr adapter for Linear(in,out) with split factor.
-# decompose_both (default false → W1 full); when true AND rank<max(out_l,in_m)/2,
-# W1 is factored w1a@w1b (lokr.rs:201, both legs kaiming, NO zero leg on W1).
-# W2 is factored iff rank < max(out_k,in_n)/2 (lokr.rs:202). Zero leg: full W2 →
-# zero, factored → w2b zero, so ΔW==0 at init (regardless of the W1 path).
-# Mirrors lokr.rs new_linear (use_scalar=false).
+# decompose_both (default false → W1 full); when true AND rank<max(out_l,in_m)/2
+# AND NOT full_matrix, W1 is factored w1a@w1b (upstream lokr.py:153-162, both
+# legs kaiming, NO zero leg on W1).
+# W2 is factored iff rank < max(out_k,in_n)/2 AND NOT full_matrix
+# (upstream lokr.py:164-172; full_matrix=True is the SimpleTuner shipped
+# default and forces BOTH factors full → the forced scale=1 quirk applies).
+# Zero leg: full W2 → zero, factored → w2b zero, so ΔW==0 at init (regardless
+# of the W1 path). Mirrors upstream LokrModule.__init__ (use_scalar=false).
+# The /2 comparisons are the upstream FLOAT semantics `lora_dim < max/2`,
+# spelled `2*rank < max` so odd max behaves exactly like upstream (the old
+# `rank < max//2` spelling diverged for odd max — T2.G fix 2026-06-11).
 # AGENT-DEFAULT (flagged): kaiming legs use the project centered-uniform _randn
 # (not true kaiming-uniform(a=√5)); the W2 zero leg + ΔW==0-at-init are exact.
 def new_lokr_adapter(
     in_f: Int, out_f: Int, rank: Int, alpha: Float32, factor: Int, seed: UInt64,
     decompose_both: Bool = False,
+    full_matrix: Bool = False,
 ) raises -> LoKrAdapter:
     if in_f == 0 or out_f == 0:
         raise Error("new_lokr_adapter: in/out must be > 0")
@@ -274,9 +282,10 @@ def new_lokr_adapter(
     var in_m = insplit[0]
     var in_n = insplit[1]
 
-    # ── W1 path: factored iff decompose_both AND rank < max(out_l,in_m)/2 ──
+    # ── W1 path: factored iff decompose_both AND 2*rank < max(out_l,in_m)
+    #            AND not full_matrix (upstream lokr.py:153-156) ──
     var max_w1 = out_l if out_l > in_m else in_m
-    var factorize_w1 = decompose_both and (rank < (max_w1 // 2))
+    var factorize_w1 = decompose_both and (2 * rank < max_w1) and (not full_matrix)
     var w1 = List[Float32]()
     var w1a = List[Float32]()
     var w1b = List[Float32]()
@@ -288,9 +297,9 @@ def new_lokr_adapter(
         # W1 full [out_l, in_m], kaiming-ish.
         w1 = _randn(out_l * in_m, seed + 1, 0.1)
 
-    # ── W2 path: factored iff rank < max(out_k,in_n)/2 ──
+    # ── W2 path: factored iff 2*rank < max(out_k,in_n) AND not full_matrix ──
     var max_w2 = out_k if out_k > in_n else in_n
-    var factorize_w2 = rank < (max_w2 // 2)
+    var factorize_w2 = (2 * rank < max_w2) and (not full_matrix)
     var w2 = List[Float32]()
     var w2a = List[Float32]()
     var w2b = List[Float32]()
@@ -459,11 +468,20 @@ def lokr_backward(d_y_h: List[Float32], x_h: List[Float32], lo: LoKrAdapter, M: 
 
 
 # ── AdamW one step over the live factors ─────────────────────────────────────
+# BF16 param storage takes a STOCHASTIC-ROUNDING writeback (T2.G fix
+# 2026-06-12, measured): with RNE, a parameter at magnitude ~1.0 (the
+# perturbed-init lokr_w1 = ones case) has a bf16 half-ULP of ~2e-3, so every
+# lr=4e-4 AdamW update rounds straight back — w1 was BIT-FROZEN across a
+# 10-step klein run (max|w1-1| == 0.0). The repo's fused OT LoRA-AdamW kernel
+# already writes bf16 params through an SR stream for exactly this reason;
+# this reuses the canonical util/bf16_stochastic_rounding helper
+# (deterministic per (t-derived seed ^ stream, element index)).
 def _adamw_host_list(
     mut p: List[BFloat16], g: List[Float32],
     mut mom: List[Float32], mut vmo: List[Float32],
     t: Int, lr: Float32, beta1: Float32, beta2: Float32,
     eps: Float32, weight_decay: Float32,
+    sr_stream: UInt64 = UInt64(0),
 ) raises:
     var n = len(p)
     if len(g) != n or len(mom) != n or len(vmo) != n:
@@ -477,6 +495,7 @@ def _adamw_host_list(
         b2p *= beta2
     var bc1 = Float32(1.0) - b1p
     var bc2 = Float32(1.0) - b2p
+    var sr_seed = UInt32((UInt64(t) * 2654435761 + sr_stream * 40503 + 977) & 0xFFFFFFFF)
     for i in range(n):
         var gv = g[i]
         var mi = beta1 * mom[i] + (Float32(1.0) - beta1) * gv
@@ -489,7 +508,99 @@ def _adamw_host_list(
         if weight_decay > 0.0:
             pv = pv * (Float32(1.0) - lr * weight_decay)
         pv = pv - lr * m_hat / (sqrt(v_hat) + eps)
-        p[i] = BFloat16(pv)
+        p[i] = copy_stochastic_value(pv, sr_seed, i)
+
+
+# ── SimpleTuner --init_lokr_norm: perturbed-normal LoKr init ─────────────────
+# Faithful port of SimpleTuner simpletuner/helpers/training/peft_init.py:
+#   init_lokr_network_with_perturbed_normal(lycoris, scale):
+#       lora.lokr_w1.fill_(1.0)
+#       approximate_normal_tensor(lora.org_weight, lora.lokr_w2, scale)
+# where approximate_normal_tensor does, IN THIS ORDER (peft_init.py:4-18):
+#       t = randn_like(w2)
+#       t *= org.norm() / t.norm()
+#       t *= org.std() / t.std()          # torch.std = UNBIASED (n-1)
+#       t  = t - t.mean() + org.mean()
+#       t *= scale
+# i.e. ΔW starts as TINY NOISE statistically shaped like the ORIGINAL layer
+# weight instead of exact zero. ST runs it AFTER create_lycoris (trainer.py:
+# 2757-2761), so it OVERWRITES the default zero-init.
+#
+# APPLICABILITY (measured upstream): the helper indexes lora.lokr_w1 and
+# lora.lokr_w2 directly, so it requires BOTH factors full (use_w1 and use_w2)
+# — exactly what ST's shipped full_matrix=true configs produce. On a factored
+# module the ST helper raises AttributeError; we mirror that as a loud Error.
+#
+# RNG: repo Box-Muller normal (noise_stats discipline), deterministic per
+# (seed). std/mean/norm reductions in F64.
+def lokr_perturbed_normal_init(
+    mut lo: LoKrAdapter,
+    org_norm: Float64, org_mean: Float64, org_std: Float64,
+    scale: Float64, seed: UInt64,
+) raises:
+    if lo.w1_factored or lo.w2_factored:
+        raise Error(
+            "lokr_perturbed_normal_init: requires BOTH LoKr factors full "
+            + "(full_matrix), exactly like SimpleTuner init_lokr_network_with_"
+            + "perturbed_normal (it indexes lokr_w1/lokr_w2 directly)"
+        )
+    var n = lo.out_k * lo.in_n
+    if len(lo.w2) != n:
+        raise Error("lokr_perturbed_normal_init: w2 numel mismatch")
+    # w1 <- 1.0 everywhere
+    for i in range(len(lo.w1)):
+        lo.w1[i] = BFloat16(Float32(1.0))
+    # t = randn(n)  — Box-Muller on the repo LCG stream
+    var t = List[Float64]()
+    var state = seed
+    var i = 0
+    while i < n:
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u1f = Float64(Int((state >> 12) & 0xFFFFFFFFFFFFF)) * (1.0 / 4503599627370496.0)
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u2f = Float64(Int((state >> 12) & 0xFFFFFFFFFFFFF)) * (1.0 / 4503599627370496.0)
+        if u1f < 1.0e-12:
+            u1f = 1.0e-12
+        var r = sqrt(-2.0 * flog(u1f))
+        var theta = 6.283185307179586 * u2f
+        t.append(r * fcos(theta))
+        if i + 1 < n:
+            t.append(r * fsin(theta))
+        i += 2
+    # t *= org_norm / t.norm()
+    var ss = Float64(0.0)
+    for j in range(n):
+        ss += t[j] * t[j]
+    var tnorm = sqrt(ss)
+    if tnorm <= 0.0:
+        raise Error("lokr_perturbed_normal_init: degenerate randn draw")
+    var s1 = org_norm / tnorm
+    for j in range(n):
+        t[j] *= s1
+    # t *= org_std / t.std()   (unbiased std, torch default)
+    var mean1 = Float64(0.0)
+    for j in range(n):
+        mean1 += t[j]
+    mean1 /= Float64(n)
+    var var1 = Float64(0.0)
+    for j in range(n):
+        var d = t[j] - mean1
+        var1 += d * d
+    if n > 1:
+        var1 /= Float64(n - 1)
+    var tstd = sqrt(var1)
+    if tstd <= 0.0:
+        raise Error("lokr_perturbed_normal_init: degenerate randn std")
+    var s2 = org_std / tstd
+    for j in range(n):
+        t[j] *= s2
+    # t = t - t.mean() + org_mean ; t *= scale
+    var mean2 = Float64(0.0)
+    for j in range(n):
+        mean2 += t[j]
+    mean2 /= Float64(n)
+    for j in range(n):
+        lo.w2[j] = BFloat16(Float32((t[j] - mean2 + org_mean) * scale))
 
 
 def lokr_adamw(
@@ -497,13 +608,16 @@ def lokr_adamw(
     beta1: Float32 = Float32(0.9), beta2: Float32 = Float32(0.999),
     eps: Float32 = Float32(1.0e-8), weight_decay: Float32 = Float32(0.01),
 ) raises:
+    # sr_stream folds the adapter identity (param sizes) + leg id so every leg
+    # of every adapter draws an independent deterministic SR stream.
+    var ident = UInt64(lo.in_f) * 1315423911 + UInt64(lo.out_f) * 2654435761 + UInt64(lo.rank)
     if lo.w1_factored:
-        _adamw_host_list(lo.w1a, g.d_w1a, lo.m_w1a, lo.v_w1a, t, lr, beta1, beta2, eps, weight_decay)
-        _adamw_host_list(lo.w1b, g.d_w1b, lo.m_w1b, lo.v_w1b, t, lr, beta1, beta2, eps, weight_decay)
+        _adamw_host_list(lo.w1a, g.d_w1a, lo.m_w1a, lo.v_w1a, t, lr, beta1, beta2, eps, weight_decay, ident * 8 + 1)
+        _adamw_host_list(lo.w1b, g.d_w1b, lo.m_w1b, lo.v_w1b, t, lr, beta1, beta2, eps, weight_decay, ident * 8 + 2)
     else:
-        _adamw_host_list(lo.w1, g.d_w1, lo.m_w1, lo.v_w1, t, lr, beta1, beta2, eps, weight_decay)
+        _adamw_host_list(lo.w1, g.d_w1, lo.m_w1, lo.v_w1, t, lr, beta1, beta2, eps, weight_decay, ident * 8 + 3)
     if lo.w2_factored:
-        _adamw_host_list(lo.w2a, g.d_w2a, lo.m_w2a, lo.v_w2a, t, lr, beta1, beta2, eps, weight_decay)
-        _adamw_host_list(lo.w2b, g.d_w2b, lo.m_w2b, lo.v_w2b, t, lr, beta1, beta2, eps, weight_decay)
+        _adamw_host_list(lo.w2a, g.d_w2a, lo.m_w2a, lo.v_w2a, t, lr, beta1, beta2, eps, weight_decay, ident * 8 + 4)
+        _adamw_host_list(lo.w2b, g.d_w2b, lo.m_w2b, lo.v_w2b, t, lr, beta1, beta2, eps, weight_decay, ident * 8 + 5)
     else:
-        _adamw_host_list(lo.w2, g.d_w2, lo.m_w2, lo.v_w2, t, lr, beta1, beta2, eps, weight_decay)
+        _adamw_host_list(lo.w2, g.d_w2, lo.m_w2, lo.v_w2, t, lr, beta1, beta2, eps, weight_decay, ident * 8 + 6)

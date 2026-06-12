@@ -20,6 +20,7 @@ serenity-trainer UI.
 | T2.F | Lycoris LoCon/LoHa/Tucker/OFT | SHIPPED (verified primitives) |
 | T2.F-2 | Lycoris LoKr/BOFT/DoRA | SHIPPED (verified primitives — upstream gates run; lokr x3 variants + boft + dora all BIT-EXACT upstream loads) |
 | UI | Lever delivery (ideogram4 argv bridge, hidream runner) | SHIPPED (serenity-trainer eaa88f1) |
+| T2.G | SimpleTuner-LoKr full parity (Alex directive) | SHIPPED — LoKr e2e TRAINABLE on klein (adapter_algo=4), init_lokr_norm ported exactly, parity matrix in results |
 
 ## Oracles / references
 - T2.A: EriDiffusion-v2 parity suite — crates/eridiffusion-cli/src/bin/
@@ -257,3 +258,36 @@ ZImageControlNetModel-format save.
   host-AdamW + per-step F32 re-upload (~18 s of the ~21 s step is
   ctl_bwd+host-opt — device-resident control AdamW is the perf follow-up);
   control adaLN IS trained (full ZImageControlNetModel surface).
+
+### T2.G — SimpleTuner-LoKr full parity (2026-06-12) SHIPPED
+Alex: "simpletuner has best lokr anywhere, make sure we have full parity
+there" + init_lokr_norm must-have. Parity matrix (knob-by-knob, ST cites)
+in the agent report; HAVE: algo/dim/alpha/factor(-1 auto)/apply_preset
+(3 preset classes)/module_algo_map factors/full_matrix/decompose_both/
+default zero-init/init_lokr_norm (exact op-order port of peft_init.py,
+Box-Muller, F64 reductions, both-full-only applicability)/upstream save
+keys/bypass-equivalent/grad clip. MISSING (fail-loud): init_lora
+warm-start, resume, EMA-with-lokr, validation sampling, exotic kwargs
+(rank_dropout/use_scalar/...), ST header metadata (cosmetic).
+
+ARCHITECTURE: Kronecker mixed-product identity folds every LoKr variant
+into one plain-LoRA carrier pair the existing klein stack consumes — zero
+stack/kernel changes; masters -> carriers -> stack grads chain exactly.
+
+GATES (orchestrator re-ran the suite + C13 + load check): factorization
+table EXACT 19 cases (odd-max //2 bug FIXED to upstream float semantics);
+leg/shape table EXACT 11 cases vs real LokrModule; reduced-dim 3-step
+torch+lycoris training repro delta cos 0.9995/0.99999; perturbed-init
+stats vs ST helper 0.05%; klein 10-step smokes BOTH PASS (factored
+~4.5 s/step 144 modules; full_matrix+init_lokr_norm targets=attn
+~50 s/step, w1 trains); upstream LokrModule loads trained checkpoints
+with BIT-EXACT reconstruction; klein flags-off anchors in-class
+(0.5414 exact / 0.2155 / 0.7810).
+
+BUG FOUND BY GATE: bf16 RNE writeback bit-froze w1=1.0 under the
+perturbed init (lr*update < half-ULP(1.0)) — fixed with the repo's
+canonical stochastic-rounding writeback; w1 measurably trains.
+
+FOLLOW-UPS: structured-kron GPU kernels (full_matrix at 9B full target
+set needs ~17GB dense carriers — preflight fails loud with bytes);
+LoKr resume/init_lora/EMA; step-cost optimization (4.5s vs 2.2 LoRA).

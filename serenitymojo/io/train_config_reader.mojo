@@ -1084,6 +1084,43 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             if not sc.is_string:
                 raise Error("JSON config: algo must be a string")
             cfg.adapter_algo = _adapter_algo_int(sc.s)
+        # ── T2.G LoKr knobs (SimpleTuner lycoris_config parity; algo=4 only) ──
+        elif key == "lokr_factor":
+            cfg.lokr_factor = Int(_read_scalar(cur).num)
+        elif key == "lokr_factor_attn":
+            cfg.lokr_factor_attn = Int(_read_scalar(cur).num)
+        elif key == "lokr_factor_ff":
+            cfg.lokr_factor_ff = Int(_read_scalar(cur).num)
+        elif key == "lokr_factor_single":
+            cfg.lokr_factor_single = Int(_read_scalar(cur).num)
+        elif key == "lokr_decompose_both" or key == "decompose_both":
+            cfg.lokr_decompose_both = _read_scalar(cur).num != 0.0
+        elif key == "lokr_full_matrix" or key == "full_matrix":
+            cfg.lokr_full_matrix = _read_scalar(cur).num != 0.0
+        elif key == "lokr_targets":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                if sc.s == "attn":
+                    cfg.lokr_targets = 1
+                elif sc.s == "attn+ff":
+                    cfg.lokr_targets = 2
+                elif sc.s == "all":
+                    cfg.lokr_targets = 3
+                else:
+                    raise Error(
+                        String("JSON config: unknown lokr_targets '") + sc.s
+                        + "' (expected attn|attn+ff|all)"
+                    )
+            else:
+                var n = Int(sc.num)
+                if n < 1 or n > 3:
+                    raise Error("JSON config: lokr_targets must be 1..3")
+                cfg.lokr_targets = n
+        elif key == "init_lokr_norm":
+            var v = _read_scalar(cur).num
+            if v < 0.0:
+                raise Error("JSON config: init_lokr_norm must be >= 0")
+            cfg.init_lokr_norm = v
         # ── cached-input / AV trainer contract ──
         elif key == "train_modality" or key == "ltx2_mode" or key == "modality":
             var sc = _read_scalar(cur)

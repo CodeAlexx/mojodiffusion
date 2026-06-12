@@ -164,6 +164,16 @@ from serenitymojo.training.lora_adamw_ot_fused import (
     LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
     lora_adamw_ot_device_state_sync_moments,
 )
+# T2.G LoKr e2e training (adapter_algo==4): SimpleTuner-parity LoKr masters
+# trained through the existing stack via the Kronecker carrier representation
+# (see training/lokr_stack.mojo header for the math + the ST knob mapping).
+from serenitymojo.training.lokr_stack import (
+    KleinLoKrSet, KleinLoKrGrads, build_klein_lokr_set, empty_klein_lokr_set,
+    klein_lokr_carrier_lists, lokr_carrier_total_bytes,
+    LOKR_CARRIER_MAX_DEVICE_BYTES, klein_lokr_chain_all, klein_lokr_grad_norm,
+    klein_lokr_clip_grads, klein_lokr_adamw_step, klein_lokr_trainable_l1,
+    klein_lokr_zero_leg_l1, save_klein_lokr, klein_lokr_apply_perturbed_init,
+)
 
 
 # ── config file (binding rule 2026-05-31: arch + recipe come from the FILE) ──
@@ -697,6 +707,9 @@ def main() raises:
         cfg_path = String(a[1])
     var cfg = read_model_config(cfg_path)
     validate_klein_train_config(cfg)
+    # T2.G: LoKr (adapter_algo==4) routes the adapter set through the Kronecker
+    # carrier path. Default (0) leaves every branch below byte-unchanged.
+    var lokr_active = cfg.adapter_algo == 4
     var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
     var output_lora_path = String("")
@@ -816,11 +829,14 @@ def main() raises:
     # a VRAM budget; the rest keep streaming through the 2 turbo slots. MEASURED
     # basis: 12.4 GiB peak of 24.5 GiB during a streamed step → ~9 GiB headroom.
     # Byte-identical weights (same pinned block store bytes) → loss unchanged.
-    var pinned_blocks = loader.pin_residents(RESIDENT_BUDGET_BYTES, ctx)
+    # T2.G: LoKr runs pin NOTHING — the carrier adapter set takes the VRAM
+    # headroom the pinned blocks would use (full_matrix carriers especially).
+    var resident_budget_bytes = 0 if lokr_active else RESIDENT_BUDGET_BYTES
+    var pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
     print(
         "  resident blocks pinned:", pinned_blocks, "of",
         cfg.num_double + cfg.num_single,
-        " budget_bytes=", RESIDENT_BUDGET_BYTES,
+        " budget_bytes=", resident_budget_bytes,
     )
     var use_activation_tape_offload = cfg.activation_offload_enabled()
     if cfg.gradient_checkpointing_offload():
@@ -886,23 +902,41 @@ def main() raises:
             + "follow-up. Use adapter_algo=0 (plain LoRA) for now."
         )
     elif cfg.adapter_algo == 4:
-        # adapter_algo==4 selects LyCORIS LoKr (Kronecker product delta). The
-        # LoKr PRIMITIVE (kron(W1,W2)*scale fwd, grads over all live factors —
-        # full or factored W2 per the factor/rank logic, AdamW) + lokr_w1/
-        # lokr_w2[_a/_b]/.alpha save convention ship in
-        # training/lokr_adapter.mojo + training/lokr_save.mojo and are gated by
-        # lokr_adapter_smoke.mojo (Kronecker fwd + FD parity + live-factor
-        # grad-flow + save round-trip, incl. a deliberate dead-factor abort).
-        # The Klein stack forward/backward is 2-factor A/B only — wiring the
-        # Kronecker delta through the stack is a tracked follow-up. We fail loud
-        # rather than silently train the wrong thing.
-        raise Error(
-            "adapter_algo=4 (LyCORIS LoKr) selected: the LoKr adapter primitive "
-            + "(Kronecker fwd/bwd/AdamW) + lokr_w1/lokr_w2[_a/_b]/.alpha save "
-            + "ship in training/lokr_adapter.mojo + training/lokr_save.mojo and "
-            + "are gated by lokr_adapter_smoke.mojo, but the Klein stack is "
-            + "2-factor A/B only — wiring the Kronecker delta through the stack "
-            + "is a tracked follow-up. Use adapter_algo=0 (plain LoRA) for now."
+        # adapter_algo==4: LyCORIS LoKr e2e TRAINING (T2.G 2026-06-11,
+        # SimpleTuner-parity). LoKr masters (training/lokr_adapter.mojo,
+        # upstream lycoris_lora 3.4.0 semantics: factorization(dim,factor),
+        # decompose_both/full_matrix factor selection, zero-leg or
+        # --init_lokr_norm perturbed-normal init, both-full forced-scale=1
+        # quirk) train through the EXISTING stack via the Kronecker carrier
+        # representation (training/lokr_stack.mojo header). Host AdamW on the
+        # masters; save in the upstream lycoris key convention (lokr_save).
+        # CONSTRAINTS this wave (fail loud, honest scope):
+        if cfg.grad_accum_steps > 1:
+            raise Error("adapter_algo=4 (LoKr): grad_accum_steps>1 not wired this wave")
+        if cfg.ema_enabled:
+            raise Error("adapter_algo=4 (LoKr): EMA shadows not wired this wave")
+        if levers_optimizer_active(cfg):
+            raise Error("adapter_algo=4 (LoKr): levers optimizers not wired (host AdamW only)")
+        if resume_lora != String(""):
+            raise Error("adapter_algo=4 (LoKr): resume/init_lora warm-start not wired this wave")
+        if cfg.init_lokr_norm > 0.0 and not cfg.lokr_full_matrix:
+            raise Error(
+                "adapter_algo=4 (LoKr): init_lokr_norm requires lokr_full_matrix "
+                + "(SimpleTuner's init_lokr_network_with_perturbed_normal indexes "
+                + "lokr_w1/lokr_w2 directly — full_matrix configs only)"
+            )
+        # In-process sampling loads PEFT LoRA files; the LoKr product file is
+        # lycoris-format. Sampling is disabled for LoKr runs this wave.
+        runtime_sample_enabled = False
+        print(
+            "[Klein-lokr] LoKr training: factor=", cfg.lokr_factor,
+            " (attn=", cfg.lokr_factor_attn, " ff=", cfg.lokr_factor_ff,
+            " single=", cfg.lokr_factor_single, ")",
+            " decompose_both=", cfg.lokr_decompose_both,
+            " full_matrix=", cfg.lokr_full_matrix,
+            " targets=", cfg.lokr_targets,
+            " init_lokr_norm=", cfg.init_lokr_norm,
+            " rank=", cfg.lora_rank, " alpha=", cfg.lora_alpha,
         )
     elif cfg.adapter_algo == 5:
         # adapter_algo==5 selects Diag-OFT (Orthogonal Fine-Tuning). The OFT
@@ -974,14 +1008,69 @@ def main() raises:
         board.log_text(String("events/resume"), start_step, resume_lora)
     print("  LoRA set:", len(lora.dbl), "double-slot +", len(lora.sgl), "single-slot")
 
+    # ── T2.G LoKr masters + carrier set (adapter_algo==4 only) ────────────────
+    # The plain-LoRA `lora` set built above is REPLACED by the LoKr carrier
+    # set: same KleinLoraSet type, same stack forward/backward, but every
+    # targeted slot carries the (a_c, b_c) Kronecker factorization of the LoKr
+    # delta (lokr_stack.mojo L1/L2/L3). The LoKr masters own init, optimizer
+    # state and the saved checkpoint.
+    var lokr_masters = empty_klein_lokr_set()
+    if lokr_active:
+        lokr_masters = build_klein_lokr_set(
+            cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            cfg.lora_rank, cfg.lora_alpha,
+            cfg.lokr_factor, cfg.lokr_factor_attn, cfg.lokr_factor_ff,
+            cfg.lokr_factor_single,
+            cfg.lokr_decompose_both, cfg.lokr_full_matrix, cfg.lokr_targets,
+            SEED_BASE * UInt64(53) + UInt64(11),
+        )
+        if cfg.init_lokr_norm > 0.0:
+            print("[Klein-lokr] perturbed-normal init (init_lokr_norm=", cfg.init_lokr_norm, ") — org stats pass")
+            klein_lokr_apply_perturbed_init(
+                lokr_masters, st, cfg.d_model, cfg.mlp_hidden,
+                cfg.init_lokr_norm, SEED_BASE * UInt64(97) + UInt64(3),
+            )
+        var carrier_bytes = lokr_carrier_total_bytes(lokr_masters)
+        print("[Klein-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("adapter_algo=4 (LoKr): carrier set needs ")
+                + String(carrier_bytes) + " bytes on device (> budget "
+                + String(LOKR_CARRIER_MAX_DEVICE_BYTES) + "). full_matrix or "
+                + "factor=-1 at klein-9B dims produces dense/near-dense "
+                + "carriers; use an explicit small lokr_factor, restrict "
+                + "lokr_targets, or wait for the structured-kron kernel "
+                + "follow-up."
+            )
+        var carriers = klein_lokr_carrier_lists(lokr_masters, cfg.d_model, cfg.mlp_hidden)
+        lora = KleinLoraSet(
+            carriers[0].copy(), carriers[1].copy(),
+            cfg.num_double, cfg.num_single, cfg.lora_rank,
+        )
+        print("[Klein-lokr] carrier set materialized:", len(lora.dbl), "double-slot +", len(lora.sgl), "single-slot")
+
     # v2 engine: persistent device OT-AdamW state (dbl + sgl lists) + a
     # resident device LoRA set viewing the live param buffers. Built ONCE
-    # after any resume; only used when KLEIN_V2_ENGINE.
-    var dbl_state = lora_adamw_ot_device_state_init(lora.dbl, ctx)
-    var sgl_state = lora_adamw_ot_device_state_init(lora.sgl, ctx)
-    var resident_lora_dev = klein_lora_set_to_device_resident(
-        lora, dbl_state, sgl_state, ctx,
-    )
+    # after any resume; only used when KLEIN_V2_ENGINE. The LoKr path never
+    # touches the resident OT state (host AdamW on the masters + per-step
+    # carrier re-upload), so it gets a TINY dummy state instead of allocating
+    # P/M/V for the full carrier set.
+    var dbl_state: LoraAdamWOTDeviceState
+    var sgl_state: LoraAdamWOTDeviceState
+    var resident_lora_dev: KleinLoraDeviceSet
+    if lokr_active:
+        var dummy = build_klein_lora_set(1, 1, 8, 8, 1, Float32(1.0))
+        dbl_state = lora_adamw_ot_device_state_init(dummy.dbl, ctx)
+        sgl_state = lora_adamw_ot_device_state_init(dummy.sgl, ctx)
+        resident_lora_dev = klein_lora_set_to_device_resident(
+            dummy, dbl_state, sgl_state, ctx,
+        )
+    else:
+        dbl_state = lora_adamw_ot_device_state_init(lora.dbl, ctx)
+        sgl_state = lora_adamw_ot_device_state_init(lora.sgl, ctx)
+        resident_lora_dev = klein_lora_set_to_device_resident(
+            lora, dbl_state, sgl_state, ctx,
+        )
 
     # ── T1.C levers optimizer state (default-off => lazily empty, no alloc) ──
     # One LeversOptimizerState per adapter list, mirroring klein's dbl/sgl
@@ -1195,10 +1284,15 @@ def main() raises:
         base.final_shift = mods[3].copy()
         base.final_scale = mods[4].copy()
         var lora_dev: KleinLoraDeviceSet
-        comptime if KLEIN_V2_ENGINE:
-            lora_dev = resident_lora_dev.copy()
-        else:
+        if lokr_active:
+            # LoKr: the host carrier set is re-materialized after every master
+            # AdamW step, so it is re-uploaded per step (the pre-v2 path).
             lora_dev = klein_lora_set_to_device(lora, ctx)
+        else:
+            comptime if KLEIN_V2_ENGINE:
+                lora_dev = resident_lora_dev.copy()
+            else:
+                lora_dev = klein_lora_set_to_device(lora, ctx)
 
         # forward -> loss/d_loss -> backward. Loss math is shared between the
         # resident checkpoint-input path and the CPU_OFFLOADED activation tape
@@ -1258,12 +1352,23 @@ def main() raises:
                 # P6: per-block graph-engine backward (same conductor loop,
                 # same scratch ring, same arg list — drop-in for the
                 # hand-chain call below; bit gate = klein_block_parity).
-                g = klein_stack_lora_backward_graph[H, Dh, N_IMG, N_TXT, S](
-                    lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
-                    loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
-                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
-                    cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
-                )
+                # T2.G: LoKr keeps the C13-gated hand-chain (per-step fresh
+                # carrier device sets; the graph arm is validated on the
+                # resident plain-LoRA set only).
+                if lokr_active:
+                    g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
+                        lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
+                        loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
+                        cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                        cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                    )
+                else:
+                    g = klein_stack_lora_backward_graph[H, Dh, N_IMG, N_TXT, S](
+                        lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
+                        loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
+                        cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                        cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                    )
             else:
                 g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
                     lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
@@ -1340,16 +1445,20 @@ def main() raises:
         # ── dead-adapter warn (project's #1 silent failure) ───────────────────
         # B legitimately starts at 0, so its grad can be ~0 early; warn when an
         # adapter's TOTAL |d_A|+|d_B| == 0 at step>=1 (a truly dead branch).
+        # (LoKr: untargeted slots are deliberate zero carriers — warn suppressed.)
         for i in range(nd):
-            if _abs_sum(g.dbl_d_a[i]) + _abs_sum(g.dbl_d_b[i]) == 0.0:
+            if (not lokr_active) and _abs_sum(g.dbl_d_a[i]) + _abs_sum(g.dbl_d_b[i]) == 0.0:
                 print("[Klein-lora] dead_adapter step=", k, " idx=", i, " kind=double")
         for i in range(ns):
-            if _abs_sum(g.sgl_d_a[i]) + _abs_sum(g.sgl_d_b[i]) == 0.0:
+            if (not lokr_active) and _abs_sum(g.sgl_d_a[i]) + _abs_sum(g.sgl_d_b[i]) == 0.0:
                 print("[Klein-lora] dead_adapter step=", k, " idx=", nd + i, " kind=single")
 
         # ── global-norm grad clip across ALL LoRA grads (EDv2 default-ON) ──────
+        # (LoKr clips on the MASTER grads inside its optimizer branch below —
+        # carrier grads pass through unclipped, mirroring ST clipping the
+        # actual lycoris trainables.)
         var clip_scale = Float32(1.0)
-        if grad_norm > Float64(cfg.max_grad_norm):
+        if (not lokr_active) and grad_norm > Float64(cfg.max_grad_norm):
             clip_scale = cfg.max_grad_norm / Float32(grad_norm)
             for i in range(nd):
                 _scale_inplace(g.dbl_d_a[i], clip_scale)
@@ -1378,7 +1487,39 @@ def main() raises:
         # resident step's P readback). On the non-resident path no sync is
         # needed: the next loop iteration re-uploads the host set via
         # klein_lora_set_to_device.
-        if levers_optimizer_active(cfg):
+        if lokr_active:
+            # ── T2.G LoKr optimizer path ──────────────────────────────────────
+            # 1) chain carrier grads → master grads (exact bilinear chain rule,
+            #    gated vs the upstream-parity lokr_backward in lokr_st_parity);
+            # 2) global-norm clip on the MASTERS (the actual trainables);
+            # 3) host AdamW on the masters (cfg betas/eps/wd, scheduled lr);
+            # 4) re-materialize the carriers — next step re-uploads them.
+            var mg = klein_lokr_chain_all(
+                lokr_masters, g.dbl_d_a, g.dbl_d_b, g.sgl_d_a, g.sgl_d_b
+            )
+            var mnorm = klein_lokr_grad_norm(mg)
+            grad_norm = mnorm  # logged value = master grad norm for LoKr
+            if mnorm > Float64(cfg.max_grad_norm):
+                clip_scale = cfg.max_grad_norm / Float32(mnorm)
+                klein_lokr_clip_grads(mg, clip_scale)
+            klein_lokr_adamw_step(
+                lokr_masters, mg, optimizer_step, step_lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            var carriers_k = klein_lokr_carrier_lists(
+                lokr_masters, cfg.d_model, cfg.mlp_hidden
+            )
+            lora = KleinLoraSet(
+                carriers_k[0].copy(), carriers_k[1].copy(),
+                cfg.num_double, cfg.num_single, cfg.lora_rank,
+            )
+            print(
+                "[Klein-lokr] step=", k,
+                " master_grad_norm=", Float32(mnorm),
+                " factor_l1=", klein_lokr_trainable_l1(lokr_masters),
+                " zero_leg_l1=", klein_lokr_zero_leg_l1(lokr_masters),
+            )
+        elif levers_optimizer_active(cfg):
             levers_optimizer_step_host(
                 cfg, lora.dbl, g.dbl_d_a, g.dbl_d_b, optimizer_step,
                 step_lr, 0, len(lora.dbl), lev_opt_dbl,
@@ -1454,21 +1595,30 @@ def main() raises:
             levers_optimizer_eval_for_save(cfg, lev_opt_dbl)
             levers_optimizer_eval_for_save(cfg, lev_opt_sgl)
             var ckpt = _lora_path_for_step(output_lora_path, k, cfg.max_steps)
-            var npairs = save_klein_lora(lora, ckpt, ctx)
-            print("[Klein-lora] save step=", k, " path=", ckpt, " pairs=", npairs)
-            board.log_text(String("events/save"), k, ckpt)
-            var state_path = _state_path_for_lora(ckpt)
-            comptime if KLEIN_V2_ENGINE:
-                # Levers optimizers never run the resident OT kernel, so the
-                # device M/V are stale init values — skip the pull (the saved
-                # state's AdamW moments are NOT levers state; levers resume
-                # fails loud at the first step by contract).
-                if not levers_optimizer_active(cfg):
-                    lora_adamw_ot_device_state_sync_moments(dbl_state, lora.dbl, ctx)
-                    lora_adamw_ot_device_state_sync_moments(sgl_state, lora.sgl, ctx)
-            var nstate = save_klein_lora_state(lora, state_path, ctx)
-            print("[Klein-lora] save_state step=", k, " path=", state_path, " pairs=", nstate)
-            board.log_text(String("events/save_state"), k, state_path)
+            if lokr_active:
+                # T2.G: LoKr product file in the upstream lycoris key
+                # convention (lycoris_<module>.lokr_w1[_a/_b]/lokr_w2[_a/_b]/
+                # .alpha). No optimizer-state sidecar this wave (LoKr resume
+                # is not wired — fail-loud at startup).
+                var nmods = save_klein_lokr(lokr_masters, ckpt, ctx)
+                print("[Klein-lokr] save step=", k, " path=", ckpt, " modules=", nmods)
+                board.log_text(String("events/save"), k, ckpt)
+            else:
+                var npairs = save_klein_lora(lora, ckpt, ctx)
+                print("[Klein-lora] save step=", k, " path=", ckpt, " pairs=", npairs)
+                board.log_text(String("events/save"), k, ckpt)
+                var state_path = _state_path_for_lora(ckpt)
+                comptime if KLEIN_V2_ENGINE:
+                    # Levers optimizers never run the resident OT kernel, so the
+                    # device M/V are stale init values — skip the pull (the saved
+                    # state's AdamW moments are NOT levers state; levers resume
+                    # fails loud at the first step by contract).
+                    if not levers_optimizer_active(cfg):
+                        lora_adamw_ot_device_state_sync_moments(dbl_state, lora.dbl, ctx)
+                        lora_adamw_ot_device_state_sync_moments(sgl_state, lora.sgl, ctx)
+                var nstate = save_klein_lora_state(lora, state_path, ctx)
+                print("[Klein-lora] save_state step=", k, " path=", state_path, " pairs=", nstate)
+                board.log_text(String("events/save_state"), k, state_path)
             # ── EMA shadow checkpoint (Wave 2B item 2i) ──────────────────────
             # When ema_enabled, the EMA shadow is the smoothed weight average and
             # is the checkpoint you sample/deploy from. Write it as a SIBLING file

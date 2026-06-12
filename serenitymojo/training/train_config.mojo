@@ -315,6 +315,27 @@ struct TrainConfig(Copyable, Movable):
     #   fail loud in the Klein stack until the integration wave wires them.
     var adapter_algo: Int
 
+    # ── T2.G LoKr knobs (adapter_algo==4; SimpleTuner lycoris_config parity) ──
+    # lokr_factor: upstream factorization factor (-1 = auto; ST ships 2/4/16).
+    # lokr_factor_attn/_ff/_single: per-target-class overrides (0 = inherit) —
+    #   the ST apply_preset module_algo_map {"Attention":{"factor":..}, ...}
+    #   equivalent for the klein slot classes.
+    # lokr_decompose_both: upstream decompose_both (factor W1 too when rank is
+    #   small enough). lokr_full_matrix: upstream/ST full_matrix (both factors
+    #   full; forces scale=1 upstream quirk).
+    # lokr_targets: 1=attn, 2=attn+ff (ST generic default preset), 3=all
+    #   (ST's recommended Flux2/Klein target set incl. single blocks).
+    # init_lokr_norm: ST --init_lokr_norm perturbed-normal init scale
+    #   (0 = off, the upstream zero-init default; ST docs use 1e-3).
+    var lokr_factor: Int
+    var lokr_factor_attn: Int
+    var lokr_factor_ff: Int
+    var lokr_factor_single: Int
+    var lokr_decompose_both: Bool
+    var lokr_full_matrix: Bool
+    var lokr_targets: Int
+    var init_lokr_norm: Float64
+
     # ── cached-input / AV trainer contract (default-off) ──
     # train_modality: 0=video, 1=audio-video, 2=audio.
     # lora_target_preset mirrors musubi LTX2 presets:
@@ -646,6 +667,14 @@ struct TrainConfig(Copyable, Movable):
         controlnet_layers: Int = 0,                   # T2.E (default-off)
         controlnet_scale: Float64 = 1.0,
         var controlnet_checkpoint: String = String(""),
+        lokr_factor: Int = -1,                        # T2.G (algo=4 only)
+        lokr_factor_attn: Int = 0,
+        lokr_factor_ff: Int = 0,
+        lokr_factor_single: Int = 0,
+        lokr_decompose_both: Bool = False,
+        lokr_full_matrix: Bool = False,
+        lokr_targets: Int = 3,                        # ST Flux2 recommended set
+        init_lokr_norm: Float64 = 0.0,                # 0 = upstream zero-init
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -820,6 +849,14 @@ struct TrainConfig(Copyable, Movable):
         self.controlnet_layers = controlnet_layers
         self.controlnet_scale = controlnet_scale
         self.controlnet_checkpoint = controlnet_checkpoint^
+        self.lokr_factor = lokr_factor
+        self.lokr_factor_attn = lokr_factor_attn
+        self.lokr_factor_ff = lokr_factor_ff
+        self.lokr_factor_single = lokr_factor_single
+        self.lokr_decompose_both = lokr_decompose_both
+        self.lokr_full_matrix = lokr_full_matrix
+        self.lokr_targets = lokr_targets
+        self.init_lokr_norm = init_lokr_norm
 
     def is_lora_training(self) -> Bool:
         return self.training_method == TRAINING_METHOD_LORA

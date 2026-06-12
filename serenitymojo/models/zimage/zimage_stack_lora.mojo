@@ -1852,6 +1852,99 @@ def load_zimage_lora_main_only_comfy(
     return ZImageLoraSet(ad^, num_nr, num_cr, num_main, file_rank)
 
 
+def _bf16_list_to_f32(v: List[BFloat16]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(v)):
+        out.append(v[i].cast[DType.float32]())
+    return out^
+
+
+def _merge_zimage_lora_adapter_slot(
+    sets: List[ZImageLoraSet], flat_idx: Int
+) raises -> LoraAdapter:
+    """Merge one projection's selected LoRA stack into a single adapter.
+
+    LoRA stacks are additive:
+        y = base + sum_i scale_i * (x @ A_i.T) @ B_i.T
+    The product inference path already consumes one adapter per projection, so
+    represent the same sum as rank-concatenated A and B with every scale folded
+    into the B columns, then use scale=1.0. This preserves the existing hot
+    block forward and keeps storage BF16 at the tensor boundary.
+    """
+    var in_f = 0
+    var out_f = 0
+    var total_rank = 0
+    for si in range(len(sets)):
+        var ad = sets[si].ad[flat_idx].copy()
+        if ad.scale == Float32(0.0):
+            continue
+        if in_f == 0:
+            in_f = ad.in_f
+            out_f = ad.out_f
+        elif ad.in_f != in_f or ad.out_f != out_f:
+            raise Error(
+                String("zimage multi-LoRA merge: adapter shape mismatch at slot ")
+                + String(flat_idx)
+            )
+        total_rank += ad.rank
+    if total_rank == 0:
+        return _comfy_zero_adapter()
+
+    var merged_a = List[Float32]()
+    for si in range(len(sets)):
+        var ad = sets[si].ad[flat_idx].copy()
+        if ad.scale == Float32(0.0):
+            continue
+        var a_h = _bf16_list_to_f32(ad.a)
+        for i in range(len(a_h)):
+            merged_a.append(a_h[i])
+
+    var merged_b = List[Float32]()
+    for row in range(out_f):
+        for si in range(len(sets)):
+            var ad = sets[si].ad[flat_idx].copy()
+            if ad.scale == Float32(0.0):
+                continue
+            for r in range(ad.rank):
+                merged_b.append(ad.b[row * ad.rank + r].cast[DType.float32]() * ad.scale)
+
+    return LoraAdapter(
+        merged_a^, merged_b^, total_rank, in_f, out_f, Float32(1.0),
+        _zeros(total_rank * in_f), _zeros(total_rank * in_f),
+        _zeros(out_f * total_rank), _zeros(out_f * total_rank),
+    )
+
+
+def merge_zimage_lora_sets_for_inference(
+    sets: List[ZImageLoraSet]
+) raises -> ZImageLoraSet:
+    """Pure-Mojo inference stack merge for multiple selected Z-Image LoRAs.
+
+    All sets must be for the same Z-Image block layout. File-format differences
+    are handled before this function by the existing resume/comfy loaders.
+    """
+    if len(sets) == 0:
+        raise Error("merge_zimage_lora_sets_for_inference: no LoRA sets")
+    var num_nr = sets[0].num_nr
+    var num_cr = sets[0].num_cr
+    var num_main = sets[0].num_main
+    var total_slots = (num_nr + num_cr + num_main) * ZIMAGE_SLOTS
+    for si in range(1, len(sets)):
+        if (
+            sets[si].num_nr != num_nr
+            or sets[si].num_cr != num_cr
+            or sets[si].num_main != num_main
+        ):
+            raise Error("merge_zimage_lora_sets_for_inference: block layout mismatch")
+        if len(sets[si].ad) != total_slots:
+            raise Error("merge_zimage_lora_sets_for_inference: adapter count mismatch")
+
+    var merged = List[LoraAdapter]()
+    for flat_idx in range(total_slots):
+        merged.append(_merge_zimage_lora_adapter_slot(sets, flat_idx))
+    return ZImageLoraSet(merged^, num_nr, num_cr, num_main, 0)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BATCH-2 stacked-rows drivers (2026-06-11, OT-parity batch lever).
 # Two samples stacked along rows: x = [xs0|cs0|xs1|cs1] = [2S, D]. Per-sample

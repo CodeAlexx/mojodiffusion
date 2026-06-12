@@ -275,12 +275,13 @@ def check_swarmui_audit_doc() -> list[Check]:
             category="docs",
             label="model/gallery/LoRA parity map exists",
             needles=[
-                "No accepted real multi-LoRA runtime path",
+                "Latest Z-Image multi-LoRA product smoke",
+                "rank_concat_scaled_b",
                 "Gallery thumbnails",
                 "Model search/filter/sort",
             ],
             severity=P1,
-            acceptance="Model/gallery/LoRA map names browser, gallery, and multi-LoRA blockers.",
+            acceptance="Model/gallery/LoRA map names browser, gallery, and current multi-LoRA evidence/limits.",
         ),
     ]
 

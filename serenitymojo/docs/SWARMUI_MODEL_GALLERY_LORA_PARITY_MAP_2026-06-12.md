@@ -5,7 +5,7 @@ Date: 2026-06-12
 Scope: Worker C audit of local model browser, LoRA browser/stack, gallery/reuse,
 presets/state, and metadata behavior against the current Mojo daemon/model scan
 surface. This is a utility-surface map only. It does not claim SwarmUI/ComfyUI
-UX parity, full Qwen generation, video generation, or multi-LoRA runtime parity.
+UX parity, full Qwen generation, video generation, or all-backend LoRA parity.
 
 Primary files read:
 
@@ -36,7 +36,25 @@ Result on 2026-06-12: throwaway `job-0037` completed in stub mode, `/v1/models`
 returned model cards and LoRA compatibility fields, `/v1/gallery` created a
 cached thumbnail, favorite filtering returned the item, and `DELETE
 /v1/gallery/job-0037` removed the PNG from the gallery. This is an API smoke,
-not UI parity or real multi-LoRA runtime evidence.
+not UI parity.
+
+Latest Z-Image multi-LoRA product smoke:
+
+```bash
+python3 scripts/check_zimage_daemon_product_contract.py \
+  --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-unipc-smoke \
+  --skip-multi-image-smoke --skip-variation-smoke \
+  --write-readiness output/checks/zimage_multi_lora_product_readiness.json
+```
+
+Result on 2026-06-12: PASS. Baseline `job-0044`, single-LoRA `job-0045`, and
+stacked-LoRA `job-0046` completed through the pure-Mojo Z-Image daemon. The
+stacked run used `EriZimageLora.safetensors` at `0.65` and
+`gigerRegularLora.safetensors` at `0.35`, wrote
+`output/serenity_daemon/job-0046.png`, recorded
+`lora_count:2`, `lora_merge_strategy:"rank_concat_scaled_b"`, and two resolved
+LoRA paths in the result manifest. PNG IDAT hashes differed for baseline,
+single-LoRA, and stacked-LoRA outputs.
 
 ## Parity Table
 
@@ -49,7 +67,7 @@ not UI parity or real multi-LoRA runtime evidence.
 | LoRA search/filter/sort | Search/filter LoRAs independently, sort by name/date/size/favorite/compatibility, and show only compatible choices when desired. | `/v1/models` accepts `lora_search`, `lora_filter`, and `lora_sort` independently of model query params. | Date/favorite sorting depends on future sidecar metadata; this slice supports name, size, and family order. | Query API supports LoRA search/filter/sort and checker verifies it without CUDA. |
 | LoRA weights in request state | Add each LoRA with an editable weight and persist the exact value in job metadata. | `LoraSpec` carries `name` and `weight`; `parse_generate()` accepts `lora:[{name,weight}]` with weight range `-10..10`; canonical `serenity.genparams.v1` includes the LoRA array; IPC forwards it to worker processes. | This proves request/state plumbing only, not runtime application for every backend. | A generated artifact manifest and PNG metadata preserve every selected LoRA and weight, and the backend result proves the weights were honored. |
 | Prompt LoRA tag extraction | Parse `<lora:name:weight>` prompt tags into the active LoRA stack and persist authoring metadata. | Daemon parser handles `content.startswith("lora:")`, adds missing tags to `p.loras`, and writes `prompt_syntax.lora_tags`. | Compatibility and runtime-stack limits still apply; prompt weighting metadata says conditioning weights are not applied. | Prompt parser fixture plus generation gate proves tags populate the UI stack and real backend stack consistently. |
-| Multi-LoRA stack | Stack, reorder, enable/disable, and apply multiple LoRAs with independent weights. | API and metadata can carry an array. Z-Image runtime explicitly rejects `len(params.loras) > 1`; Qwen rejects any LoRA. | No accepted real multi-LoRA runtime path in the daemon. Do not claim parity from request JSON alone. | Real daemon job with at least two compatible LoRAs succeeds, result manifest lists both, PNG metadata round-trips both weights, and visual/numeric gate proves both overlays were applied. |
+| Multi-LoRA stack | Stack, reorder, enable/disable, and apply multiple LoRAs with independent weights. | API and metadata can carry an array. Z-Image now accepts multiple loader-supported PEFT/Comfy Z-Image LoRAs, merges them as a rank-concatenated overlay with scale folded into B, and records the full stack in manifest/PNG metadata. | Z-Image runtime stack is accepted for loader-supported LoRA formats only. Qwen still rejects any LoRA, LoKr/LyCORIS Z-Image files are still not converted by the overlay path, and UI reorder/enable controls are not accepted by this API/backend slice. | Real daemon job with at least two compatible LoRAs succeeds, result manifest lists both, PNG metadata round-trips both weights, and visual/numeric gate proves both overlays were applied. |
 | LoRA compatibility warnings | Warn or block incompatible model/LoRA combinations before starting a heavy model run. | `/v1/models?model=<name>` exposes per-LoRA `compatible`, `compatibility`, `target_arch`, `compatible_models`, and `incompatible_reason`. Backend admission remains fail-loud and authoritative. | Compatibility is family-level metadata, not a proof that every adapter tensor target can be applied. | `/v1/models` exposes compatibility status/reasons and `/v1/generate` rejects incompatible selections before CUDA-heavy work. |
 | Gallery list | Persistent generated-image gallery with metadata attached to each item. | `/v1/gallery` scans `output/serenity_daemon/job-*.png`, reads `serenity.genparams.v1`, supports `search`/`q`, `filter`, `sort`, and `favorite`, and returns `schema:"serenity.gallery.v1"`, `count`, `total`, and `items`. | UI grid behavior and selection persistence are not accepted by this API-only slice. | Restart smoke lists prior images; checker verifies sort/filter/thumb markers; UI or API gate shows stable gallery ordering and selection. |
 | Gallery read/import params | Open generated or arbitrary PNG files and recover generation parameters. | `/v1/gallery/<id>` reads generated job PNGs; `/v1/gallery/read?path=<png>` reads arbitrary local PNG metadata via `read_png_text`; response includes `params_json` and parsed `params` when valid. | This is an API readback shape, not a proven UI "reuse into controls" workflow. External non-job fixture coverage still needs to be kept current. | Import a non-output PNG with `serenity.genparams.v1`, load params into controls/request JSON, generate again, and prove metadata equality except server-added fields. |
@@ -64,7 +82,9 @@ not UI parity or real multi-LoRA runtime evidence.
 
 ## Exact Current Blockers
 
-- No accepted real multi-LoRA runtime path: Z-Image is one LoRA max; Qwen is zero.
+- Multi-LoRA is accepted only for the Z-Image runtime path with loader-supported
+  PEFT/Comfy LoRAs. Qwen is still zero-LoRA, and Z-Image LoKr/LyCORIS files are
+  still not converted by the overlay path.
 - Model/LoRA browser real preview thumbnails, user notes, model favorite persistence,
   and full UI state restoration are not accepted by this API-only slice.
 - Gallery rename is not implemented.

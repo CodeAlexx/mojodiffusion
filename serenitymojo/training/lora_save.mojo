@@ -264,6 +264,18 @@ def load_lora_for_resume(
         if key_a not in st.tensors or key_b not in st.tensors:
             key_a = pfx + ".lora_down.weight"
             key_b = pfx + ".lora_up.weight"
+        if key_a not in st.tensors or key_b not in st.tensors:
+            # Some PEFT exports preserve the model-root prefix while the runtime
+            # flat prefix order is model-local.
+            var dm_pfx = String("diffusion_model.") + pfx
+            key_a = dm_pfx + ".lora_A.weight"
+            key_b = dm_pfx + ".lora_B.weight"
+            key_alpha = dm_pfx + ".alpha"
+        if key_a not in st.tensors or key_b not in st.tensors:
+            var dm_pfx = String("diffusion_model.") + pfx
+            key_a = dm_pfx + ".lora_down.weight"
+            key_b = dm_pfx + ".lora_up.weight"
+            key_alpha = dm_pfx + ".alpha"
         if key_a not in st.tensors:
             raise Error(String("load_lora_for_resume: missing ") + key_a)
         if key_b not in st.tensors:

@@ -29,8 +29,9 @@ python3 scripts/check_swarmui_product_path_contract.py --write-readiness output/
 
 Current result after adding variation noise runtime behavior, the
 sampler/scheduler registry, the bounded LTX2 video smoke runner, the
-model/gallery API slice, and bounded Z-Image UniPC bh2:
-`56` checks, `54` passed, `P0=0`, `P1=2`, `P2=0`. Product P0 is ready, but
+model/gallery API slice, bounded Z-Image UniPC bh2, and Z-Image multi-LoRA
+runtime stacking:
+`56` checks, `55` passed, `P0=0`, `P1=1`, `P2=0`. Product P0 is ready, but
 full SwarmUI all-level parity is still blocked.
 
 Current high-risk runtime gaps:
@@ -128,7 +129,7 @@ semantics are separately mapped and proven.
 Remaining product gaps:
 
 - imported-image reuse workflow into UI controls and gallery rename
-- multi-LoRA stack in real backends
+- Qwen LoRA, Z-Image LoKr/LyCORIS conversion, and UI LoRA stack controls
 - arbitrary graph execution beyond the constrained native t2i adapter
 - real video generation backend
 
@@ -331,7 +332,8 @@ Tasks:
   metadata exist; real model/LoRA preview thumbnails and user notes remain.
 - Expose search/filter endpoints. DONE 2026-06-12: `/v1/models` supports model
   and LoRA search/filter/sort plus family compatibility metadata.
-- Support multi-LoRA stack for models that can safely do it.
+- Support UI multi-LoRA stack controls and extend LoRA runtime beyond accepted
+  Z-Image PEFT/Comfy stacks when tensor-target conversion is proven.
 - Preserve the no-fused-LoRA rule unless a separate accepted merge path exists.
 
 Acceptance:

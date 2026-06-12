@@ -55,9 +55,10 @@ from serenitymojo.models.zimage.weights import (
     ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
 )
 from serenitymojo.models.zimage.zimage_stack_lora import (
-    ZImageLoraDeviceSet, load_zimage_lora_main_only_resume,
+    ZImageLoraSet, ZImageLoraDeviceSet, load_zimage_lora_main_only_resume,
     load_zimage_lora_main_only_comfy, zimage_lora_file_is_comfy,
     build_zimage_zero_lora_device_set, zimage_lora_set_to_device,
+    merge_zimage_lora_sets_for_inference,
 )
 from serenitymojo.models.zimage.real_weights import (
     ZImageRealAux, load_zimage_real_aux, build_rope, build_positions,
@@ -112,6 +113,40 @@ def _float32_list_json(vals: List[Float32]) -> String:
         out += String(vals[i])
     out += String("]")
     return out^
+
+
+def _lora_stack_json(params: JobParams, paths: List[String]) raises -> String:
+    var out = String("[")
+    for i in range(len(params.loras)):
+        if i > 0:
+            out += String(",")
+        var resolved = String("")
+        if i < len(paths):
+            resolved = paths[i].copy()
+        out += String("{")
+        out += String('"name":"') + _json_escape(params.loras[i].name) + String('",')
+        out += String('"weight":') + String(params.loras[i].weight) + String(",")
+        out += String('"resolved_path":"') + _json_escape(resolved) + String('"')
+        out += String("}")
+    out += String("]")
+    return out^
+
+
+def _resolve_zimage_lora_path(name: String) raises -> String:
+    # Bare names from /v1/models resolve against the scanner's LoRA directory;
+    # absolute/relative paths are still accepted for developer and imported use.
+    if _path_exists(name):
+        return name.copy()
+    if _path_exists(name + ".safetensors"):
+        return name + ".safetensors"
+    if _path_exists(String(LORAS_DIR) + "/" + name):
+        return String(LORAS_DIR) + "/" + name
+    if _path_exists(String(LORAS_DIR) + "/" + name + ".safetensors"):
+        return String(LORAS_DIR) + "/" + name + ".safetensors"
+    raise Error(
+        String("zimage: LoRA file not found: ") + name
+        + " (tried as a path and under " + LORAS_DIR + ")"
+    )
 
 # F6: the cold resident-DiT load must not stall the event loop tens of seconds
 # in ONE step() — load this many DiT blocks per step() call instead (measured
@@ -215,6 +250,8 @@ struct ZImageBackend(GenBackend, Movable):
     var cfg: Float32
     var lora_path: String       # resolved file ("" = base / zero overlay)
     var lora_mult: Float32
+    var lora_paths: List[String]
+    var lora_mults: List[Float32]
     var sigmas: List[Float32]
     var executed_sampler: String
     var executed_scheduler: String
@@ -264,6 +301,8 @@ struct ZImageBackend(GenBackend, Movable):
         self.cfg = Float32(0.0)
         self.lora_path = String("")
         self.lora_mult = Float32(1.0)
+        self.lora_paths = List[String]()
+        self.lora_mults = List[Float32]()
         self.sigmas = List[Float32]()
         self.executed_sampler = String("flowmatch_euler")
         self.executed_scheduler = String("simple_flowmatch")
@@ -335,33 +374,20 @@ struct ZImageBackend(GenBackend, Movable):
             )
         var hl = params.height // 8
         var wl = params.width // 8
-        # LoRA: the verified pipeline path applies ONE forward-overlay adapter
-        # set; resolve + validate up front so a bad request fails immediately.
+        # LoRA: resolve + validate the full stack up front so a bad request
+        # fails before expensive model work. Multiple adapters are merged into
+        # one rank-concat inference overlay in _prepare_job.
         var lora_path = String("")
         var lora_mult = Float32(1.0)
-        if len(params.loras) > 1:
-            raise Error(
-                "zimage: at most one LoRA overlay per job is supported"
-                " (the verified pipeline LoRA path loads a single adapter set)"
-            )
-        if len(params.loras) == 1:
-            # F4: bare names (as listed by GET /v1/models) resolve against the
-            # scanner's loras dir; absolute/relative paths still accepted.
-            var name = params.loras[0].name
-            if _path_exists(name):
-                lora_path = name.copy()
-            elif _path_exists(name + ".safetensors"):
-                lora_path = name + ".safetensors"
-            elif _path_exists(String(LORAS_DIR) + "/" + name):
-                lora_path = String(LORAS_DIR) + "/" + name
-            elif _path_exists(String(LORAS_DIR) + "/" + name + ".safetensors"):
-                lora_path = String(LORAS_DIR) + "/" + name + ".safetensors"
-            else:
-                raise Error(
-                    String("zimage: LoRA file not found: ") + name
-                    + " (tried as a path and under " + LORAS_DIR + ")"
-                )
-            lora_mult = Float32(params.loras[0].weight)
+        var lora_paths = List[String]()
+        var lora_mults = List[Float32]()
+        for li in range(len(params.loras)):
+            var resolved = _resolve_zimage_lora_path(params.loras[li].name)
+            lora_paths.append(resolved)
+            lora_mults.append(Float32(params.loras[li].weight))
+        if len(lora_paths) > 0:
+            lora_path = lora_paths[0].copy()
+            lora_mult = lora_mults[0]
         if sampler_admission.executed == "uni_pc_bh2" and params.init_image.byte_length() > 0:
             raise Error(
                 "zimage: uni_pc_bh2 img2img is not supported yet; the "
@@ -381,6 +407,8 @@ struct ZImageBackend(GenBackend, Movable):
         self.cfg = Float32(params.cfg)
         self.lora_path = lora_path^
         self.lora_mult = lora_mult
+        self.lora_paths = lora_paths^
+        self.lora_mults = lora_mults^
         self.executed_sampler = sampler_admission.executed.copy()
         self.executed_scheduler = scheduler_admission.executed.copy()
         self.denoise_start_step = 0
@@ -558,26 +586,38 @@ struct ZImageBackend(GenBackend, Movable):
         self.rope.append(ur_uncond[0].copy()); self.rope.append(ur_uncond[1].copy())
 
         # LoRA forward overlay (NEVER fused) — or the zero overlay in base mode.
+        # Multi-LoRA stacks are merged as rank-concat adapters with scales
+        # folded into B, which is mathematically equal to sum_i delta_i.
         self.lora_dev = List[ZImageLoraDeviceSet]()
-        if self.lora_path.byte_length() > 0:
-            if zimage_lora_file_is_comfy(self.lora_path):
-                # F5: comfy/kohya export (musubi-tuner networks.lora_zimage:
-                # lora_unet_layers_* keys, fused qkv) — key-rename + exact
-                # qkv split; rank/alpha come from the file.
-                print("[zimage][lora] loading comfy/kohya overlay", self.lora_path)
-                var lora = load_zimage_lora_main_only_comfy(
-                    NUM_NR, NUM_CR, MAIN_DEPTH, D, F, self.lora_mult,
-                    self.lora_path, self.ctx,
-                )
-                self.lora_dev.append(zimage_lora_set_to_device(lora, self.ctx))
+        if len(self.lora_paths) > 0:
+            var lora_sets = List[ZImageLoraSet]()
+            for li in range(len(self.lora_paths)):
+                var path = self.lora_paths[li]
+                var mult = self.lora_mults[li]
+                if zimage_lora_file_is_comfy(path):
+                    # F5: comfy/kohya export (musubi-tuner networks.lora_zimage:
+                    # lora_unet_layers_* keys, fused qkv) — key-rename + exact
+                    # qkv split; rank/alpha come from the file.
+                    print("[zimage][lora] loading comfy/kohya overlay", path)
+                    var lora = load_zimage_lora_main_only_comfy(
+                        NUM_NR, NUM_CR, MAIN_DEPTH, D, F, mult,
+                        path, self.ctx,
+                    )
+                    lora_sets.append(lora^)
+                else:
+                    var lora_alpha = ALPHA * mult
+                    print("[zimage][lora] loading overlay", path)
+                    var lora = load_zimage_lora_main_only_resume(
+                        NUM_NR, NUM_CR, MAIN_DEPTH, RANK, lora_alpha, D, F,
+                        path, self.ctx,
+                    )
+                    lora_sets.append(lora^)
+            if len(lora_sets) == 1:
+                self.lora_dev.append(zimage_lora_set_to_device(lora_sets[0], self.ctx))
             else:
-                var lora_alpha = ALPHA * self.lora_mult
-                print("[zimage][lora] loading overlay", self.lora_path)
-                var lora = load_zimage_lora_main_only_resume(
-                    NUM_NR, NUM_CR, MAIN_DEPTH, RANK, lora_alpha, D, F,
-                    self.lora_path, self.ctx,
-                )
-                self.lora_dev.append(zimage_lora_set_to_device(lora, self.ctx))
+                print("[zimage][lora] merging", len(lora_sets), "LoRA overlays")
+                var merged = merge_zimage_lora_sets_for_inference(lora_sets)
+                self.lora_dev.append(zimage_lora_set_to_device(merged, self.ctx))
         else:
             self.lora_dev.append(
                 build_zimage_zero_lora_device_set(NUM_NR, NUM_CR, MAIN_DEPTH, self.ctx)
@@ -822,6 +862,9 @@ struct ZImageBackend(GenBackend, Movable):
         content += String('    "variation_applied":') + _json_bool(self.params.variation_strength > 0.0) + String(",\n")
         content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
         content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
+        content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        content += String('    "lora_merge_strategy":"rank_concat_scaled_b",\n')
+        content += String('    "lora_stack":') + _lora_stack_json(self.params, self.lora_paths) + String(",\n")
         content += String('    "dtype":"bf16"\n')
         content += String("  },\n")
         content += String('  "mojo":{\n')
@@ -883,6 +926,10 @@ struct ZImageBackend(GenBackend, Movable):
         self.cap_seq_uncond = List[Float32]()
         self.rope = List[TArc]()
         self.lora_dev = List[ZImageLoraDeviceSet]()
+        self.lora_path = String("")
+        self.lora_mult = Float32(1.0)
+        self.lora_paths = List[String]()
+        self.lora_mults = List[Float32]()
         self.latent = List[TArc]()
         self.executed_sampler = String("flowmatch_euler")
         self.executed_scheduler = String("simple_flowmatch")

@@ -101,7 +101,7 @@ Acceptance evidence:
 - 2026-06-12 current checker:
   `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=56 passed=54 p0=0 p1=2 p2=0`. Product P0 is ready after the bounded
+  `checks=56 passed=55 p0=0 p1=1 p2=0`. Product P0 is ready after the bounded
   video smoke runner wiring, model/gallery API slice, and sampler registry
   wiring, but full SwarmUI all-level parity remains blocked. `images=N` now
   emits indexed serial jobs, variation noise has a runtime artifact gate, and
@@ -143,6 +143,19 @@ Acceptance evidence:
   `unipc_update_steps:3`, `unipc_corrector_steps:2`,
   `unipc_second_order_steps:2`, `denoise_seconds_per_step:0.32013946925`,
   `peak_vram_mib:21727.5625`, and `accepted_sampler_parity:false`.
+- 2026-06-12 Z-Image multi-LoRA runtime evidence:
+  `python3 scripts/check_zimage_daemon_product_contract.py
+  --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-unipc-smoke
+  --skip-multi-image-smoke --skip-variation-smoke --write-readiness
+  output/checks/zimage_multi_lora_product_readiness.json` passed. It emitted
+  baseline `job-0044`, single-LoRA `job-0045`, and stacked-LoRA `job-0046`.
+  `job-0046` wrote `output/serenity_daemon/job-0046.png`; the manifest records
+  `lora_count:2`, `lora_merge_strategy:"rank_concat_scaled_b"`, weights
+  `0.65` and `0.35`, resolved paths for `EriZimageLora.safetensors` and
+  `gigerRegularLora.safetensors`, `peak_vram_mib:21799.3125`, and a stacked
+  IDAT hash distinct from both the baseline and single-LoRA outputs. This
+  accepts Z-Image PEFT/Comfy LoRA stacking only; Qwen LoRA and Z-Image
+  LoKr/LyCORIS conversion remain unaccepted.
 - A daemon-driven Z-Image run emits PNG + result manifest with positive timings
   and peak VRAM.
 - The manifest states whether speed parity is accepted. It must remain false
@@ -245,7 +258,7 @@ Acceptance evidence:
 - `python3 scripts/check_ltx2_dtype_contract.py --scope all` passes.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` now reports
-  `checks=56 passed=54 p0=0 p1=2 p2=0`. This clears the product P0 blocker by
+  `checks=56 passed=55 p0=0 p1=1 p2=0`. This clears the product P0 blocker by
   wiring a bounded daemon runner, not by accepting full video parity.
 - `POST /v1/video` accepts only `runner:"ltx2_staged_dev_smoke"` and clamps
   `steps` to `1..3`. It runs
@@ -299,12 +312,16 @@ Current status:
 - `/v1/models` scans checkpoints and LoRAs from disk and detects families.
 - `/v1/models` exposes browser query params, model cards, LoRA `target_arch`,
   family compatibility metadata, and LoRA search/filter/sort.
+- Z-Image accepts multiple loader-supported PEFT/Comfy LoRAs in the daemon and
+  records the stack in manifest/PNG metadata.
 - Browser UX pieces still not accepted: real preview thumbnails/user notes/model
-  favorite persistence, UI restoration, and multi-LoRA runtime stack.
+  favorite persistence, UI restoration, stack reorder/enable controls, Qwen
+  LoRA, and Z-Image LoKr/LyCORIS conversion.
 
 Required implementation:
 
-- Add multi-LoRA stack support through UI, daemon request, and real backends.
+- Add UI multi-LoRA stack controls and extend runtime support to Qwen and
+  Z-Image LoKr/LyCORIS only when tensor-target conversion is proven.
 - Keep fail-loud incompatible model/LoRA combinations and expand compatibility
   beyond family-level metadata when tensor-target inventories are available.
 
@@ -392,7 +409,7 @@ Acceptance evidence:
   `{"detail":"unsupported workflow graph node type: NotSupported"}`.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` now reports
-  `checks=56 passed=51 p0=1 p1=4 p2=0`.
+  `checks=56 passed=55 p0=0 p1=1 p2=0`.
 
 ## Build Order
 
@@ -405,6 +422,7 @@ Acceptance evidence:
    frame/duration/muxing/audio/timing/VRAM evidence.
 4. Extend constrained workflow support into a real graph executor only when each
    node family has artifact-backed product gates.
-5. Finish model/LoRA browser and multi-LoRA stack.
+5. Finish model/LoRA browser UI stack controls, Qwen/LoKr LoRA support, and
+   compatibility beyond family-level metadata.
 6. Add advanced utility surfaces only when the backend emits real artifacts and
    result JSON.

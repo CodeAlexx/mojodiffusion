@@ -427,7 +427,8 @@ means there is no SwarmUI workflow graph parity yet.
 
 5. Finish model/LoRA browser UX and compatibility.
    - Add search, filter, thumbnails, metadata cache, model cards, family tags,
-     compatibility warnings, and multi-LoRA stack support.
+     compatibility warnings, UI stack controls, and runtime LoRA support beyond
+     the accepted Z-Image PEFT/Comfy stack path.
 
 6. Add presets/state persistence.
    - Persist last UI state.

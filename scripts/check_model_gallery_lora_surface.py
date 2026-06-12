@@ -26,6 +26,7 @@ STUB_BACKEND = REPO / "serenitymojo/serve/stub_backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
 QWEN_BACKEND = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
 PARITY_DOC = REPO / "serenitymojo/docs/SWARMUI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
+ZIMAGE_MULTI_LORA_READINESS = REPO / "output/checks/zimage_multi_lora_product_readiness.json"
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,16 @@ def read(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def has_all(text: str, needles: Iterable[str]) -> bool:
@@ -176,6 +187,32 @@ def blocked_check(
     )
 
 
+def runtime_report_check(
+    *,
+    id: str,
+    category: str,
+    feature: str,
+    accepted: bool,
+    severity: str,
+    evidence: list[str],
+    blocker: str,
+    files: Iterable[Path],
+    acceptance_gate: str,
+) -> SurfaceCheck:
+    return SurfaceCheck(
+        id=id,
+        category=category,
+        feature=feature,
+        accepted=accepted,
+        severity="PASS" if accepted else severity,
+        readiness="runtime_report_ready" if accepted else "blocked",
+        evidence=evidence,
+        blocker="" if accepted else blocker,
+        files=[rel(path) for path in files],
+        acceptance_gate=acceptance_gate,
+    )
+
+
 def absent_support_check(
     *,
     id: str,
@@ -212,6 +249,45 @@ def absent_support_check(
         files=files,
         acceptance_gate=acceptance_gate,
     )
+
+
+def zimage_multi_lora_runtime_evidence() -> tuple[bool, list[str], str]:
+    report = read_json(ZIMAGE_MULTI_LORA_READINESS)
+    if not report:
+        return False, [f"missing runtime report: {rel(ZIMAGE_MULTI_LORA_READINESS)}"], "Z-Image multi-LoRA runtime report is missing."
+    if report.get("ready") is not True:
+        blockers = report.get("blockers")
+        detail = blockers if isinstance(blockers, list) else ["report ready flag is not true"]
+        return False, [str(item) for item in detail], "Z-Image multi-LoRA runtime report is not ready."
+    smoke = report.get("multi_lora_smoke")
+    if not isinstance(smoke, dict):
+        return False, ["runtime report missing multi_lora_smoke"], "Z-Image multi-LoRA runtime smoke is absent."
+    multi = smoke.get("multi_lora")
+    single = smoke.get("single_lora")
+    if not isinstance(multi, dict) or not isinstance(single, dict):
+        return False, ["runtime report missing single/multi LoRA job evidence"], "Z-Image multi-LoRA runtime smoke is incomplete."
+    run_identity = (
+        multi.get("evidence", {})
+        .get("manifest", {})
+        .get("run_identity", {})
+    )
+    if not isinstance(run_identity, dict):
+        return False, ["multi-LoRA manifest run_identity is missing"], "Z-Image multi-LoRA manifest evidence is incomplete."
+    if run_identity.get("lora_count") != 2 or run_identity.get("lora_merge_strategy") != "rank_concat_scaled_b":
+        return False, ["multi-LoRA manifest lora_count/merge strategy mismatch"], "Z-Image multi-LoRA manifest did not prove the rank-concat stack."
+    stack = run_identity.get("lora_stack")
+    if not isinstance(stack, list) or len(stack) != 2:
+        return False, ["multi-LoRA manifest lora_stack is not length 2"], "Z-Image multi-LoRA manifest did not list both LoRAs."
+    multi_sha = str(smoke.get("multi_lora_idat_sha256") or "")
+    single_sha = str(smoke.get("single_lora_idat_sha256") or "")
+    ref_sha = str(smoke.get("reference_idat_sha256") or "")
+    if not multi_sha or multi_sha == single_sha or multi_sha == ref_sha:
+        return False, ["multi-LoRA PNG hash did not differ from baseline and single-LoRA outputs"], "Z-Image multi-LoRA output hash did not prove a changed artifact."
+    return True, [
+        f"Z-Image multi-LoRA product smoke passed: baseline {report.get('generate', {}).get('job_id')}, single {single.get('job_id')}, stack {multi.get('job_id')}.",
+        "Manifest records lora_count=2, lora_merge_strategy=rank_concat_scaled_b, and two resolved LoRA paths.",
+        "PNG IDAT hashes differ for no-LoRA, single-LoRA, and stacked-LoRA outputs.",
+    ], ""
 
 
 def checks() -> list[SurfaceCheck]:
@@ -348,20 +424,35 @@ def checks() -> list[SurfaceCheck]:
 
     zimage = read(ZIMAGE_BACKEND)
     qwen = read(QWEN_BACKEND)
+    zimage_multi_markers = has_all(
+        zimage,
+        [
+            "merge_zimage_lora_sets_for_inference",
+            "lora_paths",
+            "lora_stack",
+            "rank_concat_scaled_b",
+        ],
+    )
+    runtime_ready, runtime_evidence, runtime_blocker = zimage_multi_lora_runtime_evidence()
     multi_lora_evidence: list[str] = []
     if "at most one LoRA overlay per job is supported" in zimage:
         multi_lora_evidence.append("Z-Image admission rejects len(params.loras) > 1.")
+    elif zimage_multi_markers:
+        multi_lora_evidence.extend(runtime_evidence)
+    else:
+        multi_lora_evidence.append("Z-Image multi-LoRA merge markers are missing.")
     if "LoRA is not supported for Qwen-Image yet" in qwen:
-        multi_lora_evidence.append("Qwen-Image admission rejects any LoRA.")
+        multi_lora_evidence.append("Qwen-Image admission still rejects any LoRA; multi-LoRA acceptance is Z-Image-only.")
     out.append(
-        blocked_check(
+        runtime_report_check(
             id="multi_lora_runtime_parity",
             category="loras",
             feature="Runtime multi-LoRA stack parity",
+            accepted=zimage_multi_markers and runtime_ready and "at most one LoRA overlay per job is supported" not in zimage,
             severity="P1",
             evidence=multi_lora_evidence or ["No real multi-LoRA daemon generation evidence was found by this static checker."],
-            blocker="The API can carry a LoRA array, but current real backends do not prove multi-LoRA runtime parity.",
-            files=[ZIMAGE_BACKEND, QWEN_BACKEND],
+            blocker=runtime_blocker or "The API can carry a LoRA array, but current real backends do not prove multi-LoRA runtime parity.",
+            files=[ZIMAGE_BACKEND, QWEN_BACKEND, ZIMAGE_MULTI_LORA_READINESS],
             acceptance_gate="A real daemon job succeeds with at least two compatible LoRAs, lists both in manifest/PNG metadata, and proves both overlays were applied.",
         )
     )
@@ -520,6 +611,7 @@ def build_report() -> dict:
     accepted = [item for item in items if item.accepted]
     blocked = [item for item in items if not item.accepted]
     p1_blockers = [item for item in blocked if item.severity == "P1"]
+    multi_lora_ready = any(item.id == "multi_lora_runtime_parity" and item.accepted for item in items)
     report = {
         "schema": "serenity.model_gallery_lora_surface.v1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -534,7 +626,7 @@ def build_report() -> dict:
             "no_cuda": True,
             "static_only": True,
             "claims_ux_parity": False,
-            "claims_multi_lora_runtime_parity": False,
+            "claims_multi_lora_runtime_parity": multi_lora_ready,
         },
         "checks": [asdict(item) for item in items],
         "blockers": [
@@ -551,7 +643,7 @@ def build_report() -> dict:
         "non_claims": [
             "This checker does not inspect UI controls or SwarmUI visual behavior.",
             "This checker does not run CUDA or generate images.",
-            "This checker does not prove multi-LoRA runtime parity from request JSON.",
+            "This checker accepts multi-LoRA runtime parity only from the Z-Image product readiness report, not request JSON alone.",
             "This checker treats Qwen full generation and video generation as out of scope for this utility slice.",
         ],
     }

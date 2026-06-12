@@ -299,6 +299,90 @@ def require_number(
     return fvalue
 
 
+def read_safetensors_header(path: Path) -> dict[str, Any]:
+    with path.open("rb") as fh:
+        raw_len = fh.read(8)
+        if len(raw_len) != 8:
+            raise ValueError(f"safetensors header length missing: {path}")
+        (header_len,) = struct.unpack("<Q", raw_len)
+        raw_header = fh.read(header_len)
+    if len(raw_header) != header_len:
+        raise ValueError(f"safetensors header truncated: {path}")
+    header = json.loads(raw_header.decode("utf-8"))
+    if not isinstance(header, dict):
+        raise ValueError(f"safetensors header is not an object: {path}")
+    return header
+
+
+def zimage_lora_runtime_kind(path: Path) -> str:
+    try:
+        header = read_safetensors_header(path)
+    except Exception:
+        return ""
+    keys = {str(k) for k in header if k != "__metadata__"}
+    if any(k.startswith("lora_unet_layers_") for k in keys):
+        required = {
+            "lora_unet_layers_0_attention_qkv.lora_down.weight",
+            "lora_unet_layers_0_attention_qkv.lora_up.weight",
+            "lora_unet_layers_0_feed_forward_w2.lora_down.weight",
+            "lora_unet_layers_0_feed_forward_w2.lora_up.weight",
+        }
+        return "comfy_zimage" if required.issubset(keys) else ""
+    local_required = {
+        "layers.0.attention.to_q.lora_A.weight",
+        "layers.0.attention.to_q.lora_B.weight",
+        "layers.0.feed_forward.w2.lora_A.weight",
+        "layers.0.feed_forward.w2.lora_B.weight",
+    }
+    if local_required.issubset(keys):
+        return "peft_zimage"
+    dm_required = {f"diffusion_model.{key}" for key in local_required}
+    if dm_required.issubset(keys):
+        return "peft_diffusion_model_zimage"
+    return ""
+
+
+def select_zimage_loras(base_url: str, blockers: list[str]) -> list[dict[str, Any]]:
+    res = http_json("GET", f"{base_url}/v1/models?model=zimage_base&lora_sort=size", timeout=20.0)
+    if res.status != 200 or not isinstance(res.data, dict):
+        blockers.append(f"/v1/models could not provide LoRA candidates: HTTP {res.status}: {res.text}")
+        return []
+    raw_loras = res.data.get("loras")
+    if not isinstance(raw_loras, list):
+        blockers.append("/v1/models response missing loras array")
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in raw_loras:
+        if not isinstance(item, dict):
+            continue
+        target = str(item.get("target_arch") or item.get("arch") or "").lower()
+        compatible = item.get("compatible")
+        path = item.get("path")
+        name = item.get("name")
+        if not isinstance(path, str) or not path:
+            continue
+        runtime_kind = zimage_lora_runtime_kind(Path(path))
+        if not runtime_kind:
+            continue
+        if compatible is not True and "zimage" not in target and "z-image" not in target:
+            target = runtime_kind
+        if not isinstance(name, str) or not name:
+            name = Path(path).name
+        size = item.get("size")
+        candidates.append({
+            "name": name,
+            "path": path,
+            "size": int(size) if isinstance(size, int) else 0,
+            "target_arch": target,
+            "runtime_kind": runtime_kind,
+        })
+    candidates.sort(key=lambda x: (int(x.get("size") or 0), str(x.get("name") or "")))
+    if len(candidates) < 2:
+        blockers.append(f"need at least two compatible Z-Image LoRAs for multi-LoRA smoke, found {len(candidates)}")
+        return []
+    return candidates[:2]
+
+
 def expected_executed_sampler(request_body: dict[str, Any]) -> str:
     sampler = str(request_body.get("sampler") or "").lower().replace(" ", "_")
     if sampler in {"dpm++_2m", "dpmpp_2m"}:
@@ -422,6 +506,9 @@ def validate_completed_job(
                 "image_count",
             ):
                 require(genparams.get(key) == request_body.get(key), f"genparams {key} mismatch", blockers)
+            expected_lora = request_body.get("lora") or []
+            if expected_lora:
+                require(genparams.get("lora") == expected_lora, "genparams lora stack mismatch", blockers)
 
     manifest_path = Path(str(png_path) + ".zimage_daemon_result.json")
     manifest: dict[str, Any] = {}
@@ -471,6 +558,19 @@ def validate_completed_job(
             require(run_identity.get("variation_applied") is expected_variation, "manifest variation_applied mismatch", blockers)
             require(run_identity.get("image_index") == request_body.get("image_index", 0), "manifest image_index mismatch", blockers)
             require(run_identity.get("image_count") == request_body.get("images"), "manifest image_count mismatch", blockers)
+            expected_lora = request_body.get("lora") or []
+            require(run_identity.get("lora_count") == len(expected_lora), "manifest lora_count mismatch", blockers)
+            require(run_identity.get("lora_merge_strategy") in {"rank_concat_scaled_b", ""}, "manifest lora_merge_strategy mismatch", blockers)
+            lora_stack = run_identity.get("lora_stack")
+            require(isinstance(lora_stack, list), "manifest lora_stack must be an array", blockers)
+            if expected_lora and isinstance(lora_stack, list):
+                require(len(lora_stack) == len(expected_lora), "manifest lora_stack length mismatch", blockers)
+                for li, expected in enumerate(expected_lora):
+                    if li >= len(lora_stack) or not isinstance(lora_stack[li], dict) or not isinstance(expected, dict):
+                        continue
+                    require(lora_stack[li].get("name") == expected.get("name"), f"manifest lora_stack[{li}].name mismatch", blockers)
+                    require(lora_stack[li].get("weight") == expected.get("weight"), f"manifest lora_stack[{li}].weight mismatch", blockers)
+                    require(bool(lora_stack[li].get("resolved_path")), f"manifest lora_stack[{li}] missing resolved_path", blockers)
         if isinstance(mojo, dict):
             for key in (
                 "load_seconds",
@@ -911,6 +1011,97 @@ def run_variation_smoke(
     }, blockers
 
 
+def run_multi_lora_smoke(
+    *,
+    base_url: str,
+    ws: ProgressWebSocket | None,
+    prompt: str,
+    negative: str,
+    seed: int,
+    reference_idat_sha256: str,
+    timeout: float,
+    poll_interval: float,
+) -> tuple[dict[str, Any], list[str]]:
+    blockers: list[str] = []
+    candidates = select_zimage_loras(base_url, blockers)
+    if len(candidates) < 2:
+        return {"candidates": candidates}, blockers
+
+    single_lora = [{"name": candidates[0]["path"], "weight": 0.65}]
+    stack_lora = [
+        {"name": candidates[0]["path"], "weight": 0.65},
+        {"name": candidates[1]["path"], "weight": 0.35},
+    ]
+
+    def run_one(label: str, lora_stack: list[dict[str, Any]], seed_offset: int) -> dict[str, Any]:
+        body = {
+            "model": "zimage",
+            "prompt": prompt,
+            "negative": negative,
+            "width": 512,
+            "height": 512,
+            "steps": 1,
+            "seed": seed + seed_offset,
+            "cfg": 1.0,
+            "sampler": "euler",
+            "scheduler": "flowmatch",
+            "variation_seed": 0,
+            "variation_strength": 0.0,
+            "images": 1,
+            "image_index": 0,
+            "image_count": 1,
+            "lora": lora_stack,
+        }
+        res = http_json("POST", f"{base_url}/v1/generate", body, timeout=20.0)
+        if res.status != 200 or not isinstance(res.data, dict) or not res.data.get("job_id"):
+            raise ContractError(f"{label} generate failed HTTP {res.status}: {res.text}")
+        job_id = str(res.data["job_id"])
+        job, states, events = poll_job(base_url, job_id, ws, timeout, poll_interval)
+        evidence, completed_blockers = validate_completed_job(
+            job=job,
+            states=states,
+            events=events,
+            request_body=body,
+            base_url=base_url,
+            require_phase_events=False,
+        )
+        blockers.extend(completed_blockers)
+        return {
+            "label": label,
+            "request": body,
+            "generate": res.data,
+            "job_id": job_id,
+            "evidence": evidence,
+        }
+
+    single_report = run_one("single-lora smoke", single_lora, 500)
+    stack_report = run_one("multi-lora smoke", stack_lora, 500)
+
+    single_sha = str(single_report.get("evidence", {}).get("png", {}).get("idat_sha256") or "")
+    stack_sha = str(stack_report.get("evidence", {}).get("png", {}).get("idat_sha256") or "")
+    require(bool(single_sha), "single-LoRA PNG did not expose IDAT hash", blockers)
+    require(bool(stack_sha), "multi-LoRA PNG did not expose IDAT hash", blockers)
+    if reference_idat_sha256:
+        require(stack_sha != reference_idat_sha256, "multi-LoRA output matched the no-LoRA baseline payload", blockers)
+    require(stack_sha != single_sha, "multi-LoRA output matched the single-LoRA payload", blockers)
+
+    run_identity = stack_report.get("evidence", {}).get("manifest", {}).get("run_identity", {})
+    if isinstance(run_identity, dict):
+        require(run_identity.get("lora_count") == 2, "multi-LoRA manifest lora_count mismatch", blockers)
+        require(run_identity.get("lora_merge_strategy") == "rank_concat_scaled_b", "multi-LoRA merge strategy mismatch", blockers)
+        lora_stack = run_identity.get("lora_stack")
+        require(isinstance(lora_stack, list) and len(lora_stack) == 2, "multi-LoRA manifest missing two lora_stack entries", blockers)
+
+    return {
+        "candidates": candidates,
+        "single_lora": single_report,
+        "multi_lora": stack_report,
+        "reference_idat_sha256": reference_idat_sha256,
+        "single_lora_idat_sha256": single_sha,
+        "multi_lora_idat_sha256": stack_sha,
+    }, blockers
+
+
 def build_request(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "model": "zimage",
@@ -950,6 +1141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-unipc-smoke", action="store_true", help="Skip positive Z-Image UniPC bh2 product smoke.")
     parser.add_argument("--skip-multi-image-smoke", action="store_true", help="Skip images=2 multi-output endpoint smoke.")
     parser.add_argument("--skip-variation-smoke", action="store_true", help="Skip variation_seed/variation_strength runtime noise smoke.")
+    parser.add_argument("--skip-multi-lora-smoke", action="store_true", help="Skip real Z-Image multi-LoRA stack runtime smoke.")
     parser.add_argument("--cancel-smoke", action="store_true", help="After a completed image, submit and cancel a running Z-Image job.")
     parser.add_argument("--min-free-vram-mib", type=int, default=22000)
     parser.add_argument("--skip-vram-preflight", action="store_true")
@@ -1084,6 +1276,20 @@ def main() -> int:
             report["variation_smoke"] = variation_report
             blockers.extend(variation_blockers)
 
+        if not args.skip_multi_lora_smoke:
+            multi_lora_report, multi_lora_blockers = run_multi_lora_smoke(
+                base_url=base_url,
+                ws=ws,
+                prompt="multi LoRA stack product smoke with Z-Image flowmatch schedule",
+                negative=args.negative,
+                seed=args.seed,
+                reference_idat_sha256=str(evidence.get("png", {}).get("idat_sha256") or ""),
+                timeout=args.timeout,
+                poll_interval=args.poll_interval,
+            )
+            report["multi_lora_smoke"] = multi_lora_report
+            blockers.extend(multi_lora_blockers)
+
         if not args.skip_multi_image_smoke:
             multi_report, multi_blockers = run_multi_image_smoke(
                 base_url=base_url,
@@ -1165,6 +1371,8 @@ def main() -> int:
         print(f"  multi_image_smoke: {len(report['multi_image_smoke']['job_ids'])} outputs")
     if not args.skip_variation_smoke:
         print(f"  variation_smoke: {report['variation_smoke']['job_id']} -> changed noise/output")
+    if not args.skip_multi_lora_smoke:
+        print(f"  multi_lora_smoke: {report['multi_lora_smoke']['multi_lora']['job_id']} -> stacked LoRA changed output")
     if args.cancel_smoke:
         print(f"  cancel_smoke: {report['cancel_smoke']['job_id']} -> cancelled")
     print("  speed_parity: not accepted")

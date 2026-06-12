@@ -84,6 +84,13 @@ comptime EMA_MODE_OFF = 0
 comptime EMA_MODE_GPU = 1
 comptime EMA_MODE_CPU = 2
 
+# T1.A loss-fn selector tags (TIER1_PARITY_CAMPAIGN_2026-06-11.md). Torch
+# semantics (huber_loss / smooth_l1_loss), dispatched at runtime by
+# training/levers.mojo. LOSS_FN_MSE is the default == existing trainer math.
+comptime LOSS_FN_MSE = 0
+comptime LOSS_FN_HUBER = 1
+comptime LOSS_FN_SMOOTH_L1 = 2
+
 
 struct TrainConfig(Copyable, Movable):
     # ── identity + paths ──
@@ -217,6 +224,19 @@ struct TrainConfig(Copyable, Movable):
     var loss_mse_strength: Float32
     var loss_mae_strength: Float32
     var loss_huber_strength: Float32
+
+    # ── T1.A loss levers (default-off == the trainers' existing MSE math) ──
+    # loss_fn: LOSS_FN_MSE | LOSS_FN_HUBER | LOSS_FN_SMOOTH_L1 (torch
+    # semantics; dispatched by training/levers.mojo levers_loss_grad).
+    # min_snr_gamma_flow: SEPARATE from min_snr_gamma above — that one is the
+    # klein/EDv2 lever with divisor min(SNR,γ)/(SNR+1) (loss_weight.mojo,
+    # is_v_prediction=True); this one is the SimpleTuner ε-style
+    # min(SNR,γ)/SNR weight (ops/loss_fns.mojo min_snr_gamma_weight).
+    # 0.0 == off (the sentinel here, NOT <0 like min_snr_gamma).
+    var loss_fn: Int
+    var huber_delta: Float32
+    var smooth_l1_beta: Float32
+    var min_snr_gamma_flow: Float32
 
     # ── timestep bias (Wave 2A item 2f; default-off == identity) ──
     # 0=None 1=Later 2=Earlier 3=Range (matches timestep_bias.mojo TSB_* ints).
@@ -446,6 +466,10 @@ struct TrainConfig(Copyable, Movable):
             loss_mse_strength=Float32(1.0),  # MSE-only (default-off)
             loss_mae_strength=Float32(0.0),
             loss_huber_strength=Float32(0.0),
+            loss_fn=LOSS_FN_MSE,             # T1.A: mse (default-off)
+            huber_delta=Float32(1.0),
+            smooth_l1_beta=Float32(1.0),
+            min_snr_gamma_flow=Float32(0.0),  # 0.0 == off
             timestep_bias_strategy=0,        # None (identity, default-off)
             timestep_bias_multiplier=Float32(0.0),
             timestep_bias_range_min=Float32(0.0),
@@ -553,6 +577,8 @@ struct TrainConfig(Copyable, Movable):
         lr_scheduler: Int, lr_warmup_steps: Int, lr_min_factor: Float32, lr_cycles: Float32,
         min_snr_gamma: Float32, debiased: Bool,
         loss_mse_strength: Float32, loss_mae_strength: Float32, loss_huber_strength: Float32,
+        loss_fn: Int, huber_delta: Float32, smooth_l1_beta: Float32,
+        min_snr_gamma_flow: Float32,
         timestep_bias_strategy: Int, timestep_bias_multiplier: Float32,
         timestep_bias_range_min: Float32, timestep_bias_range_max: Float32,
         timestep_distribution: Int, timestep_noising_weight: Float32,
@@ -685,6 +711,10 @@ struct TrainConfig(Copyable, Movable):
         self.loss_mse_strength = loss_mse_strength
         self.loss_mae_strength = loss_mae_strength
         self.loss_huber_strength = loss_huber_strength
+        self.loss_fn = loss_fn
+        self.huber_delta = huber_delta
+        self.smooth_l1_beta = smooth_l1_beta
+        self.min_snr_gamma_flow = min_snr_gamma_flow
         self.timestep_bias_strategy = timestep_bias_strategy
         self.timestep_bias_multiplier = timestep_bias_multiplier
         self.timestep_bias_range_min = timestep_bias_range_min

@@ -495,6 +495,21 @@ def _lr_scheduler_int(s: String) raises -> Int:
     )
 
 
+def _loss_fn_int(s: String) raises -> Int:
+    # LOSS_FN_MSE 0 / LOSS_FN_HUBER 1 / LOSS_FN_SMOOTH_L1 2
+    # (train_config.mojo; T1.A torch-semantics loss selector).
+    if s == "mse" or s == "MSE":
+        return 0
+    elif s == "huber" or s == "HUBER":
+        return 1
+    elif s == "smooth_l1" or s == "SMOOTH_L1":
+        return 2
+    raise Error(
+        String("JSON config: unknown loss_fn '") + s
+        + "' (expected mse|huber|smooth_l1)"
+    )
+
+
 def _timestep_bias_int(s: String) raises -> Int:
     # TSB_NONE 0 / TSB_LATER 1 / TSB_EARLIER 2 / TSB_RANGE 3 (timestep_bias.mojo).
     if s == "none":
@@ -919,6 +934,18 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.loss_mae_strength = Float32(_read_scalar(cur).num)
         elif key == "loss_huber_strength" or key == "huber_strength":
             cfg.loss_huber_strength = Float32(_read_scalar(cur).num)
+        # ── T1.A: torch-semantics loss fn + flow min-SNR-γ (levers.mojo) ──
+        elif key == "loss_fn":
+            var sc = _read_scalar(cur)
+            if not sc.is_string:
+                raise Error("JSON config: loss_fn must be a string")
+            cfg.loss_fn = _loss_fn_int(sc.s)
+        elif key == "huber_delta":
+            cfg.huber_delta = Float32(_read_scalar(cur).num)
+        elif key == "smooth_l1_beta":
+            cfg.smooth_l1_beta = Float32(_read_scalar(cur).num)
+        elif key == "min_snr_gamma_flow":
+            cfg.min_snr_gamma_flow = Float32(_read_scalar(cur).num)
         # ── Wave 2A: timestep bias ──
         elif key == "timestep_bias_strategy":
             var sc = _read_scalar(cur)

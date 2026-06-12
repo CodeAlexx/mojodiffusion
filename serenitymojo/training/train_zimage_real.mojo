@@ -141,6 +141,7 @@ from serenitymojo.training.onetrainer_cache_preflight import (
     validate_onetrainer_cache_preflight_plan,
 )
 from serenitymojo.autograd_v2.step_slab import StepSlab
+from serenitymojo.training.levers import levers_loss_grad, levers_loss_active
 
 
 # ── arch (Z-Image, from transformer config; H/Dh/D fixed comptime) ───────────
@@ -245,6 +246,13 @@ comptime VAE_SCALE = Float32(0.3611)
 comptime NUM_TRAIN_TIMESTEPS = 1000
 comptime CLIP_GRAD_NORM = Float32(1.0)
 comptime SEED_BASE = UInt64(42)
+
+# T1.A loss levers (TIER1_PARITY_CAMPAIGN_2026-06-11.md): RUNTIME-dispatched
+# via training/levers.mojo levers_loss_grad off TrainConfig keys
+# loss_fn / huber_delta / smooth_l1_beta / min_snr_gamma_flow (reader:
+# io/train_config_reader.mojo). Keys absent == loss_fn=mse, γ_flow=0 ⇒
+# levers_loss_grad IS the old inline MSE (formula-identical; C13 anchors
+# unmoved). Math gated vs torch in ops/tests/loss_fns_parity.mojo.
 
 comptime TRANSFORMER_DIR = "/home/alex/.serenity/models/zimage_base/transformer"
 comptime CACHE_DIR = "/home/alex/mojodiffusion/output/alina_zimage_cache"
@@ -939,17 +947,18 @@ def _train_one_step_bucket[
     var seq_nout = len(fwd.out)
     var d_loss = List[Float32]()
     var pred_vals = List[Float32]()
-    var sse = 0.0
-    var inv_n = Float32(2.0) / Float32(real_nout)
+    # T1.A: runtime loss levers (training/levers.mojo). Default path (keys
+    # absent) is mse_loss_grad — formula-identical to the old inline block:
+    # d = pred - tgt (F32), Σ F64(d)^2 / N, d_pred = (2/N)*d; here the
+    # pred = -raw_out chain gives d_out = -d_pred (the old -inv_n*diff).
     for i in range(real_nout):
-        var pred = -fwd.out[i]
-        pred_vals.append(pred)
-        var diff = pred - tgt_patch[i]
-        sse += Float64(diff) * Float64(diff)
-        d_loss.append(-inv_n * diff)
+        pred_vals.append(-fwd.out[i])
+    var lg = levers_loss_grad(pred_vals, tgt_patch, sig, train_cfg)
+    var loss = lg.loss
+    for i in range(real_nout):
+        d_loss.append(-lg.d_pred[i])
     for _i in range(real_nout, seq_nout):
         d_loss.append(Float32(0.0))
-    var loss = Float32(sse / Float64(real_nout))
     var t_loss = perf_counter_ns()
 
     if k == 1:
@@ -1203,17 +1212,17 @@ def _train_one_step_bucket_capture[
     var seq_nout = N_IMG_B * OUT_CH
     var d_loss = List[Float32]()
     var pred_vals = List[Float32]()
-    var sse = 0.0
-    var inv_n = Float32(2.0) / Float32(real_nout)
+    # T1.A: runtime loss levers (training/levers.mojo) — host-side only; the
+    # captured graphs are untouched (d_loss still enters through StepIO).
+    # Default path == the old inline MSE, formula-identical (C13/C14).
     for i in range(real_nout):
-        var pred = -patches_h[i]
-        pred_vals.append(pred)
-        var diff = pred - tgt_patch[i]
-        sse += Float64(diff) * Float64(diff)
-        d_loss.append(-inv_n * diff)
+        pred_vals.append(-patches_h[i])
+    var lg = levers_loss_grad(pred_vals, tgt_patch, sig, train_cfg)
+    var loss = lg.loss
+    for i in range(real_nout):
+        d_loss.append(-lg.d_pred[i])
     for _i in range(real_nout, seq_nout):
         d_loss.append(Float32(0.0))
-    var loss = Float32(sse / Float64(real_nout))
     var t_loss = perf_counter_ns()
 
     if k == 1:
@@ -1912,25 +1921,51 @@ def _train_one_step_bucket_b2[
     var tgt0 = li0.target_patch.copy()
     var tgt1 = li1.target_patch.copy()
     var real_nout = len(tgt0)
-    var inv_n = Float32(1.0) / Float32(real_nout)   # = 2/(2*real_nout)
-    var sse = 0.0
     var d_loss0 = List[Float32]()
     var d_loss1 = List[Float32]()
-    for i in range(real_nout):
-        var pred = -fwd.out0[i]
-        var diff = pred - tgt0[i]
-        sse += Float64(diff) * Float64(diff)
-        d_loss0.append(-inv_n * diff)
-    for i in range(real_nout):
-        var pred = -fwd.out1[i]
-        var diff = pred - tgt1[i]
-        sse += Float64(diff) * Float64(diff)
-        d_loss1.append(-inv_n * diff)
-    var seq_nout = len(fwd.out0)
-    for _i in range(real_nout, seq_nout):
-        d_loss0.append(Float32(0.0))
-        d_loss1.append(Float32(0.0))
-    var loss = Float32(sse / Float64(2 * real_nout))
+    var loss: Float32
+    if levers_loss_active(train_cfg):
+        # T1.A at B=2: per-sample loss fn (each sample gets ITS sigma's
+        # min-SNR-γ weight, the SimpleTuner per-timestep semantics), then
+        # batch mean: loss = (L0+L1)/2 ⇒ d wrt each sample's pred = d_pred/2
+        # (reduces to the joint 2N-mean MSE below when both weights are 1).
+        var pred0 = List[Float32]()
+        var pred1 = List[Float32]()
+        for i in range(real_nout):
+            pred0.append(-fwd.out0[i])
+            pred1.append(-fwd.out1[i])
+        var lg0 = levers_loss_grad(pred0, tgt0, sig0, train_cfg)
+        var lg1 = levers_loss_grad(pred1, tgt1, sig1, train_cfg)
+        loss = Float32(0.5) * (lg0.loss + lg1.loss)
+        for i in range(real_nout):
+            d_loss0.append(Float32(-0.5) * lg0.d_pred[i])
+            d_loss1.append(Float32(-0.5) * lg1.d_pred[i])
+        var seq_nout_l = len(fwd.out0)
+        for _i in range(real_nout, seq_nout_l):
+            d_loss0.append(Float32(0.0))
+            d_loss1.append(Float32(0.0))
+    else:
+        # Default path: the LITERAL old joint 2N-mean MSE (single F64
+        # accumulator over both samples) — kept verbatim because the
+        # per-sample mean-of-means rounds differently (C13: byte-identical
+        # default anchors).
+        var inv_n = Float32(1.0) / Float32(real_nout)   # = 2/(2*real_nout)
+        var sse = 0.0
+        for i in range(real_nout):
+            var pred = -fwd.out0[i]
+            var diff = pred - tgt0[i]
+            sse += Float64(diff) * Float64(diff)
+            d_loss0.append(-inv_n * diff)
+        for i in range(real_nout):
+            var pred = -fwd.out1[i]
+            var diff = pred - tgt1[i]
+            sse += Float64(diff) * Float64(diff)
+            d_loss1.append(-inv_n * diff)
+        var seq_nout = len(fwd.out0)
+        for _i in range(real_nout, seq_nout):
+            d_loss0.append(Float32(0.0))
+            d_loss1.append(Float32(0.0))
+        loss = Float32(sse / Float64(2 * real_nout))
     var t_loss = perf_counter_ns()
 
     var grads: ZImageLoraGrads

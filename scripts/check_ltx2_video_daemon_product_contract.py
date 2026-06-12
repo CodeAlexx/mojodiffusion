@@ -318,10 +318,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     log_tail = tail_text(log_path)
     stage = infer_stage(log_tail)
     mp4_path = ""
+    wav_path = ""
     manifest_path = ""
     probe: dict[str, Any] = {}
     if isinstance(result_body, dict):
         mp4_path = str(result_body.get("mp4") or "")
+        wav_path = str(result_body.get("wav") or "")
         manifest_path = str(result_body.get("result_path") or "")
         maybe_probe = result_body.get("probe")
         if isinstance(maybe_probe, dict):
@@ -343,17 +345,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         checks.append(fail("vram", "external peak VRAM sampled", "no positive VRAM delta was observed", {"samples": samples[-5:]}, "The checker records positive external VRAM evidence for the video run."))
 
     mp4_ok = bool(mp4_path) and (REPO / mp4_path).is_file()
+    wav_ok = bool(wav_path) and (REPO / wav_path).is_file()
     probe_ok = (
         probe.get("muxing") == "probe_ok"
         and int(probe.get("frame_count") or 0) > 0
         and float(probe.get("duration") or 0.0) > 0.0
     )
+    if args.audio_mode == "audio":
+        audio_mode_ok = (
+            probe.get("has_audio") is True
+            and probe.get("audio") is True
+            and probe.get("audio_behavior") == "audio_stream_present"
+            and float(probe.get("audio_duration") or 0.0) > 0.0
+            and wav_ok
+        )
+        if audio_mode_ok:
+            checks.append(ok("audio", "A/V artifact accepted", "MP4 audio stream and WAV artifact are present", {"wav": wav_path, "probe": probe}, "Audio mode must emit an MP4 with an audio stream plus the intermediate WAV."))
+        else:
+            checks.append(fail("audio", "A/V artifact accepted", "audio-mode run did not prove audio stream plus WAV", {"wav": wav_path, "wav_exists": wav_ok, "probe": probe, "result": result_body}, "Audio mode must emit an MP4 with an audio stream plus the intermediate WAV."))
+    else:
+        audio_mode_ok = (
+            probe.get("has_audio") is False
+            and probe.get("audio") is False
+            and probe.get("audio_behavior") == "video_only_no_audio_stream"
+        )
+        if audio_mode_ok:
+            checks.append(ok("audio", "video-only artifact accepted", "MP4 correctly has no audio stream", {"probe": probe}, "No-audio mode must emit a video-only MP4 and record that behavior."))
+        else:
+            checks.append(fail("audio", "video-only artifact accepted", "noaudio run did not prove video-only muxing", {"probe": probe, "result": result_body}, "No-audio mode must emit a video-only MP4 and record that behavior."))
     result_ready = (
         result_status == 200
         and isinstance(result_body, dict)
         and result_body.get("state") == "done"
         and mp4_ok
         and probe_ok
+        and audio_mode_ok
         and peak_delta is not None
         and peak_delta > 0
     )
@@ -373,6 +399,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "ready": not blockers,
         "product_wiring_ready": runner_started and bool(video_id),
         "claims_video_artifact_gate": result_ready,
+        "claims_av_artifact_gate": result_ready and args.audio_mode == "audio",
         "claims_video_parity": claims_video_parity,
         "known_scope": "daemon-backed LTX2 staged dev smoke; Python samples external VRAM only",
         "summary": {
@@ -394,6 +421,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "runner_log": str(log_path) if log_path else "",
             "result_path": manifest_path,
             "mp4": mp4_path,
+            "wav": wav_path,
             "http_status": result_status,
             "http_text": result_text[:4000],
             "samples_tail": samples[-20:],
@@ -417,6 +445,7 @@ def print_report(report: dict[str, Any]) -> None:
     )
     print("[ltx2-video] product wiring: " + ("READY" if report["product_wiring_ready"] else "BLOCKED"))
     print("[ltx2-video] MP4 artifact gate: " + ("READY" if report["claims_video_artifact_gate"] else "BLOCKED"))
+    print("[ltx2-video] A/V artifact gate: " + ("READY" if report["claims_av_artifact_gate"] else "BLOCKED"))
     print("[ltx2-video] full video parity: " + ("READY" if report["claims_video_parity"] else "BLOCKED"))
 
 

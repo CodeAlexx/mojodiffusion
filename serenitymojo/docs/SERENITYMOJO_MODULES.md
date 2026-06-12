@@ -27,7 +27,28 @@ On-GPU tensor: a `DeviceBuffer[DType.uint8]` of raw element bytes + host `_shape
 - `struct ParityHarness`, field `cos_threshold: Float64`:
   - `__init__(out self, cos_threshold: Float64 = DEFAULT_COS_THRESHOLD)`
   - `compare_host(self, actual: List[Float32], reference: List[Float32]) raises -> ParityResult` — cos + max-abs over two host arrays (F64; all-zero pair → cos 1).
-  - `compare(self, t: Tensor, reference: List[Float32], ctx) raises -> ParityResult` — `t.to_host(ctx)` then compare.
+- `compare(self, t: Tensor, reference: List[Float32], ctx) raises -> ParityResult` — `t.to_host(ctx)` then compare.
+
+---
+
+## serve/ — product daemon and API contracts
+
+### `serve/serenity_daemon.mojo` — SerenityUI HTTP/WebSocket daemon ✅ product gates
+Pure-Mojo localhost daemon for `/v1/generate`, `/v1/jobs`, `/v1/job/<id>`,
+`/v1/progress`, `/v1/models`, `/v1/samplers`, gallery, queue reorder/remove,
+presets/state, and typed workflow execution. Model-specific generation runs
+through pluggable backend traits and process-isolated workers where needed.
+`/v1/video` routing stays here, but the video artifact contract implementation
+lives in `serve/video_api.mojo` to keep the daemon from growing into a single
+model-specific monolith.
+
+### `serve/video_api.mojo` — bounded video artifact contract ✅
+Owns `/v1/video` readiness JSON, bounded LTX2 runner result manifests, and
+`/v1/video/probe?path=<mp4>` inspection. Output stays under
+`output/serenity_daemon/<video-id>/`.
+- `video_readiness_doc(backend_name: String, model_name: String, resident: String) raises -> JSONValue` — status document with candidate video runners and explicit non-parity labels.
+- `probe_video_file(mp4_path: String) raises -> JSONValue` — `ffprobe`-backed MP4/A-V metadata (`width`, `height`, `frame_count`, `duration`, `fps`, codecs, muxing, audio behavior).
+- `ltx2_staged_smoke_video_result(body: JSONValue, video_id: String, backend_name: String, model_name: String, resident: String) raises -> JSONValue` — runs `output/bin/ltx2_video_smoke_runner`, writes `ltx2_video_result.json`, and sets artifact acceptance fields without claiming full video parity.
 
 ---
 
@@ -107,7 +128,7 @@ FP8 E4M3 → BF16 dequantization (port of flame-core `fp8_dequant.cu`). E4M3 = 1
 
 ### F32-compute dtype flags on the LTX/Wan2.2 VAEs (added 2026-06-07, NAVA — "follow the oracle dtype")
 NAVA's audio VAE + vocoder + video VAE run in **F32** in production (`init_ltx_vae`/`Wan2_2_VAE` build float32), so the Mojo decoders gained F32 paths (matching the oracle tightened parity ~18-40×):
-- `models/vae/ltx2_audio_vae.mojo` `LTX2AudioVaeDecoderWeights.load(path, ctx, f32: Bool=False)` — F32 upcasts all weights+stats (`from_view_as_f32`); default BF16 keeps the LTX-2 *video* path. Gate cos 0.99999998 (F32) vs 0.9999966 (bf16).
+- `models/vae/ltx2_audio_vae.mojo` `LTX2AudioVaeDecoderWeights.load(path, ctx, f32: Bool=False)` — F32 upcasts all weights+stats (`from_view_as_f32`); default BF16 keeps the LTX-2 *video* path. Causal Conv2d now views OIHW checkpoint weights as cuDNN FCQRS `[Cout,Cin,kh,kw,1]` and calls `conv3d_fcqrs_cudnn`, avoiding the old per-conv host OIHW→QRSCF transpose. Gate cos 0.99999998 (F32) vs 0.9999966 (bf16); current BF16 cuDNN smoke cos 0.999996 / max_abs 0.03125.
 - `models/vocoder/ltx2_vocoder.mojo` — **FIXED a latent bug**: `LTX2VocoderWithBWE.forward` casts activations to F32 (108-conv chain) but `from_file` loaded BF16 weights → `conv1d x/weight dtype mismatch` for ANY caller. Fix: load ALL vocoder weights F32 (renamed `_load_bf16`→`_load_w` via `from_view_as_f32`, 17 sites + the hann-sinc resample filter BF16→F32). Shared with the LTX-2 video pipelines (a net fix there too).
 - `models/vae/wan22_decoder.mojo` `Wan22VaeImageDecoder.load(path, ctx, f32: Bool=False)` + `compute_dtype` field — F32 conv-repack loaders `_load_conv3d_qrscf(tv, out_dtype, ctx)`/`_load_conv2d_qrscf`; the decode latent-cast follows `compute_dtype`; default BF16 keeps the Lance T2V path. Gate cos 0.99999992 (F32, max_abs 0.0025) vs 0.99998 (bf16, 0.046).
 
@@ -861,8 +882,9 @@ NHWC end-to-end (foundation conv2d + group_norm are NHWC-native). `comptime GN_G
 ### `models/vae/upsample.mojo` ✅
 - `upsample_nearest2x_nhwc(x, ctx) raises -> Tensor` — nearest 2× of NHWC `[N,H,W,C]` → `[N,2H,2W,C]`.
 
-### `models/vae/conv3d.mojo` ⏳ (Wan2.1 3D VAE; NOT on the Z-Image path)
-- `conv3d(x, weight, bias: Optional[Tensor], stride_d, stride_h, stride_w, pad_d, pad_h, pad_w, ctx) raises -> Tensor` — NDHWC input `[N,D,H,W,Cin]`, QRSCF filter `[Q,R,S,Cin,Cout]`, dilation=1, groups=1, **symmetric** padding (pad the temporal axis manually for causal conv). Launches SDK `conv3d_gpu_naive_ndhwc_qrscf` (device-kernel body) + device-resident bias-add kernel.
+### `models/vae/conv3d.mojo` ⏳ (generic 3D conv helpers; LTX2 uses cuDNN)
+- `conv3d_fcqrs_cudnn(x, weight, bias: Optional[Tensor], stride_d, stride_h, stride_w, pad_d, pad_h, pad_w, ctx) raises -> Tensor` — NDHWC input `[N,D,H,W,Cin]`, FCQRS/OIDHW filter `[Cout,Cin,Q,R,S]`, dilation=1, groups=1, **symmetric** padding. This is the LTX2 video VAE, latent upsampler, and audio-VAE causal-conv fast path; 2D weights use a singleton `S=1` view rather than a host transpose.
+- `conv3d(x, weight, bias: Optional[Tensor], stride_d, stride_h, stride_w, pad_d, pad_h, pad_w, ctx) raises -> Tensor` — legacy/generic NDHWC input `[N,D,H,W,Cin]`, QRSCF filter `[Q,R,S,Cin,Cout]`, dilation=1, groups=1, **symmetric** padding (pad the temporal axis manually for causal conv). Launches SDK `conv3d_gpu_naive_ndhwc_qrscf` (device-kernel body) + device-resident bias-add kernel.
 
 ### `models/vae/wan22_decoder_probe.mojo` ✅ metadata gate
 Wan2.2/Lance VAE checkpoint contract probe. Mmap-opens `/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors` and validates key decoder shapes without loading the checkpoint into VRAM.

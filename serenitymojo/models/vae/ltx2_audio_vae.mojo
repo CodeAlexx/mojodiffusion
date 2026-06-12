@@ -34,17 +34,17 @@
 #   * un_normalize / upsample work naturally channel-last.
 # The latent enters NCHW [B,8,T,16] and is permuted to NHWC.
 #
-# === CausalConv2d via the foundation conv3d (singleton W axis) ===
+# === CausalConv2d via cuDNN conv3d (singleton W axis) ===
 # The audio conv is 2D [B,Cin,H=T,W=F] with causality on HEIGHT (time) and a
-# SYMMETRIC zero pad on WIDTH (freq). We reuse the verified NDHWC conv3d
+# SYMMETRIC zero pad on WIDTH (freq). We reuse the verified NDHWC cuDNN conv3d
 # (models/vae/conv3d.mojo) by treating the 2D NHWC tensor [B,T,F,C] as an
 # NDHWC tensor [B, D=T, H=F, W=1, C]:
 #   * causal axis D (=time): manual ZERO top-pad of (kh-1) rows, conv pad_d=0.
 #   * symmetric axis H (=freq): conv pad_h = (kw-1)//2 each side.
 #   * singleton conv W axis: kernel s=1, pad_w=0.
-# The PyTorch weight [Cout,Cin,kh,kw] maps to the conv3d QRSCF filter
-# [Q=kh, R=kw, S=1, Cin, Cout]. ZERO pad (unlike the video VAE's replicate pad)
-# matches CausalConv2d (`F.pad` defaults to zeros).
+# The PyTorch weight [Cout,Cin,kh,kw] is already contiguous as FCQRS
+# [Cout,Cin,Q=kh,R=kw,S=1] for the cuDNN path. ZERO pad (unlike the video VAE's
+# replicate pad) matches CausalConv2d (`F.pad` defaults to zeros).
 #
 # === Upsample ===
 # nearest x2 (T and F) -> CausalConv2d -> drop FIRST time frame (x[:, 1:, :, :]
@@ -72,7 +72,7 @@ from serenitymojo.ops.tensor_algebra import (
     add,
     mul,
 )
-from serenitymojo.models.vae.conv3d import conv3d
+from serenitymojo.models.vae.conv3d import conv3d_fcqrs_cudnn
 from serenitymojo.models.vae.upsample import upsample_nearest2x_nhwc
 
 
@@ -102,8 +102,9 @@ struct LTX2AudioVaeDecoderWeights(Movable):
     """Full LTX-2.3 audio-VAE decoder weights: per_channel_statistics + conv_in
     + mid (block_1, block_2) + up.0..2 (ResnetBlocks + Upsample convs) + conv_out.
 
-    Conv weights are kept RAW (OIHW [Cout,Cin,kh,kw]) and permuted to the conv3d
-    QRSCF layout [kh,kw,1,Cin,Cout] lazily at first use (see _conv2d_w).
+    Conv weights stay in checkpoint FCQRS/OIHW layout [Cout,Cin,kh,kw] and are
+    viewed as [Cout,Cin,kh,kw,1] for the cuDNN conv path. No host transpose is
+    needed.
     Statistics stored as [1,1,PATCHED_CH] for the patched (b t (c f)) un_normalize."""
 
     var weights: List[ArcPointer[Tensor]]
@@ -242,8 +243,9 @@ struct LTX2AudioVaeDecoderWeights(Movable):
         var idx = self.name_to_idx[name]
         return self.weights[idx][]
 
-    # PyTorch conv2d weight OIHW [Cout,Cin,kh,kw] -> conv3d QRSCF [kh,kw,1,Cin,Cout].
-    def _conv2d_w(self, name: String, ctx: DeviceContext) raises -> Tensor:
+    # PyTorch conv2d weight OIHW [Cout,Cin,kh,kw] -> cuDNN FCQRS
+    # [Cout,Cin,Q=kh,R=kw,S=1]. This is a metadata-only view; no host transpose.
+    def _conv2d_w_fcqrs(self, name: String) raises -> Tensor:
         ref w = self._w(name)
         var s = w.shape()
         if len(s) != 4:
@@ -254,21 +256,10 @@ struct LTX2AudioVaeDecoderWeights(Movable):
         var cin = s[1]
         var kh = s[2]
         var kw = s[3]
-        var host = w.to_host(ctx)  # F32, OIHW order
-        var out = List[Float32]()
-        out.resize(cout * cin * kh * kw, Float32(0.0))
-        for o in range(cout):
-            for ci in range(cin):
-                for r in range(kh):
-                    for c in range(kw):
-                        var oihw = ((o * cin + ci) * kh + r) * kw + c
-                        # QRSCF [kh, kw, 1, cin, cout]; S=1 so the S index is 0.
-                        var qrscf = (((r * kw + c) * cin) + ci) * cout + o
-                        out[qrscf] = host[oihw]
         var osh = List[Int]()
-        osh.append(kh); osh.append(kw); osh.append(1)
-        osh.append(cin); osh.append(cout)
-        return Tensor.from_host(out, osh^, w.dtype(), ctx)
+        osh.append(cout); osh.append(cin); osh.append(kh); osh.append(kw)
+        osh.append(1)
+        return Tensor(w.buf.copy(), osh^, w.dtype())
 
     def _bias(self, name: String, ctx: DeviceContext) raises -> Tensor:
         ref b = self._w(name)
@@ -292,17 +283,17 @@ struct LTX2AudioVaeDecoderWeights(Movable):
         h.resize(n, Float32(0.0))
         return Tensor.from_host(h, sh.copy(), dt, ctx)
 
-    # ── CausalConv2d via conv3d (singleton W). x: NHWC [B,T,F,C]. ──────────────
+    # ── CausalConv2d via cuDNN conv3d (singleton W). x: NHWC [B,T,F,C]. ────────
     # causality on HEIGHT (=T=conv3d D): ZERO top-pad (kh-1); symmetric on freq
     # (=F=conv3d H): conv pad_h=(kw-1)//2; singleton conv W: s=1,pad_w=0.
     def _causal_conv2d_named(
         self, x: Tensor, prefix: String, ctx: DeviceContext
     ) raises -> Tensor:
-        var w_qrscf = self._conv2d_w(prefix + ".weight", ctx)
+        var w_fcqrs = self._conv2d_w_fcqrs(prefix + ".weight")
         var b = self._bias(prefix + ".bias", ctx)
-        var ws = w_qrscf.shape()  # [kh, kw, 1, cin, cout]
-        var kh = ws[0]
-        var kw = ws[1]
+        var ws = w_fcqrs.shape()  # [cout, cin, kh, kw, 1]
+        var kh = ws[2]
+        var kw = ws[3]
         var pad_t = kh - 1            # all on top (causal time)
         var pad_f = (kw - 1) // 2     # symmetric on freq
 
@@ -326,9 +317,10 @@ struct LTX2AudioVaeDecoderWeights(Movable):
             var zpad = self._zeros(zsh^, x.dtype(), ctx)
             x5 = concat(1, ctx, zpad, x5)
 
-        # conv3d: stride 1, pad_d=0 (manual), pad_h=pad_f (symmetric freq), pad_w=0.
-        var y5 = conv3d(
-            x5, w_qrscf^, Optional[Tensor](b^),
+        # cuDNN conv3d: stride 1, pad_d=0 (manual), pad_h=pad_f
+        # (symmetric freq), pad_w=0.
+        var y5 = conv3d_fcqrs_cudnn(
+            x5, w_fcqrs^, Optional[Tensor](b^),
             1, 1, 1, 0, pad_f, 0, ctx,
         )
         # y5 NDHWC [B, T_out, F_out, 1, Cout] -> NHWC [B, T_out, F_out, Cout].

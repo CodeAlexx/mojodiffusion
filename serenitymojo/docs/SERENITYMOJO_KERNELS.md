@@ -21,6 +21,7 @@
 | `linalg.matmul.vendor.blas.matmul` | ✅ yes (host launcher) | called directly (`ops/linear`, `ops/attention`, `ops/moe`) |
 | `nn.conv.conv.conv2d_gpu_naive_nhwc_rscf` | ✅ as a **device-kernel body** → `enqueue_function` | called (`ops/conv`) |
 | `nn.conv.conv.conv3d_gpu_naive_ndhwc_qrscf` | ✅ device-kernel body → `enqueue_function` | called (`models/vae/conv3d`) |
+| `nn.conv.conv.conv3d_cudnn` | ✅ host launcher through LayoutTensor | called by `conv3d_fcqrs_cudnn` for LTX2 video/audio VAE and latent upsampler fast paths |
 | `nn.attention.gpu.mha.flash_attention` (LayoutTensor overload) | ✅ but **fails to instantiate at Dh∈{128,512} on sm_86** | called for Dh==64, else hand-rolled math-mode (`ops/attention`) |
 | `nn.normalization.rms_norm_gpu` | ❌ closure + `TileTensor gamma`, `gamma.origin.mut` unresolvable | hand-rolled (`ops/norm`) |
 | `softmax_gpu` | ❌ closure/TileTensor variant | hand-rolled (`ops/softmax`, `ops/attention`) |

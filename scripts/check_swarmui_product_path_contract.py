@@ -30,6 +30,7 @@ WORKFLOW_MAP_DOC = REPO / "serenitymojo/docs/COMFY_SWARM_WORKFLOW_PARITY_MAP_202
 MODEL_GALLERY_LORA_MAP_DOC = REPO / "serenitymojo/docs/SWARMUI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
 
 DAEMON = REPO / "serenitymojo/serve/serenity_daemon.mojo"
+VIDEO_API = REPO / "serenitymojo/serve/video_api.mojo"
 MODEL_SCAN = REPO / "serenitymojo/serve/model_scan.mojo"
 PROCESS_ISOLATED = REPO / "serenitymojo/serve/process_isolated_backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
@@ -54,6 +55,7 @@ ATTENTION_FLASH = REPO / "serenitymojo/ops/attention_flash.mojo"
 LTX2_HQ = REPO / "serenitymojo/pipeline/ltx2_t2v_av_hq.mojo"
 LTX2_UPSAMPLER = REPO / "serenitymojo/models/upsampler/ltx2_upsampler.mojo"
 LTX2_VAE_DECODER = REPO / "serenitymojo/models/vae/ltx2_vae_decoder.mojo"
+LTX2_AUDIO_VAE = REPO / "serenitymojo/models/vae/ltx2_audio_vae.mojo"
 PIXI = REPO / "pixi.toml"
 LTX2_RUN_SCRIPT = REPO / "scripts/run_ltx2_hq121.sh"
 TODO_DOC = REPO / "TODO.md"
@@ -967,6 +969,30 @@ def check_video_path() -> list[Check]:
             acceptance="The LTX2 video VAE decoder does not carry or call the old host-side QRSCF transpose path.",
         ),
         check_contains(
+            LTX2_AUDIO_VAE,
+            category="video-fast-path",
+            label="LTX2 audio VAE uses cuDNN FCQRS conv",
+            needles=[
+                "conv3d_fcqrs_cudnn",
+                "def _conv2d_w_fcqrs",
+                "metadata-only view; no host transpose",
+            ],
+            severity=P0,
+            acceptance="The LTX2 audio VAE decoder keeps checkpoint OIHW weights resident and dispatches causal conv2d through the cuDNN FCQRS conv path.",
+        ),
+        check_absent(
+            LTX2_AUDIO_VAE,
+            category="video-fast-path",
+            label="LTX2 audio VAE avoids host QRSCF transpose",
+            needles=[
+                "def _conv2d_w(self",
+                "w.to_host(ctx)  # F32, OIHW order",
+                "QRSCF layout",
+            ],
+            severity=P0,
+            acceptance="The LTX2 audio VAE decoder does not download conv weights to the host for OIHW-to-QRSCF transposes.",
+        ),
+        check_contains(
             LTX2_VIDEO_DAEMON_CHECK,
             category="video",
             label="bounded video checker records stage and VRAM",
@@ -976,6 +1002,8 @@ def check_video_path() -> list[Check]:
                 "timed_out",
                 "audio_mode",
                 "claims_video_artifact_gate",
+                "claims_av_artifact_gate",
+                "audio_stream_present",
                 "claims_video_parity",
             ],
             severity=P0,
@@ -984,22 +1012,32 @@ def check_video_path() -> list[Check]:
         check_contains(
             DAEMON,
             category="video",
-            label="daemon video generation endpoint",
-            needles=["/v1/video", "mp4", "frame_count", "duration"],
+            label="daemon video routes dispatch to video API module",
+            needles=[
+                "from serenitymojo.serve.video_api import",
+                'path == "/v1/video"',
+                "video_readiness_doc",
+                "ltx2_staged_smoke_video_result",
+                "probe_video_file",
+            ],
             severity=P0,
-            acceptance="SwarmUI-level video path reports real duration, frames, muxing, and audio behavior.",
+            acceptance="The daemon owns routing while the video API module owns the artifact contract implementation.",
         ),
         check_contains(
-            DAEMON,
+            VIDEO_API,
             category="video",
-            label="bounded daemon video smoke is wired",
+            label="bounded daemon video smoke contract is wired",
             needles=[
                 "LTX2_VIDEO_SMOKE_RUNNER",
-                "_ltx2_staged_smoke_video_result",
+                "ltx2_staged_smoke_video_result",
                 "audio_mode",
                 "default_audio_mode",
+                "mp4",
+                "frame_count",
+                "duration",
                 "ltx2_t2v_stage2_dev_smoke.mp4",
                 "ltx2_t2v_av_stage2_dev_smoke.mp4",
+                "accepted_av_artifact",
                 "accepted_video_parity",
                 "total_wall_seconds",
                 "build-video-smoke",

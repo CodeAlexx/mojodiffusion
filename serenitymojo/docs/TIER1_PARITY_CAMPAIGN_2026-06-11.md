@@ -57,5 +57,35 @@ T1.F — **Validation adapter sweeps**
   list). GATES: sweep produces N outputs with the right adapters loaded
   (key check), no trainer-loop interference.
 
-## Ledger
-(updated per phase by the orchestrator after gates re-run)
+## Ledger (orchestrator, all gates re-run on the final tree)
+
+- T1.A SHIPPED (ed785c7 + ae375fe): loss fns torch-parity (rel<=8.4e-8,
+  grad cos 1.0) + modular runtime levers + zimage 3-site wiring + UI keys.
+- T1.B SHIPPED (27d6140 math BIT-EXACT + 30bf76e wiring): EMA in zimage
+  (3 paths) + hidream; sibling _ema saves; reader "EMA" + runner-emission
+  gaps found and fixed with gate coverage.
+- T1.C SHIPPED (95d136d math + 30bf76e wiring): torch.optim.Adafactor +
+  SimpleTuner AdamWScheduleFreeKahan (measured: plain warmup-AdamW —
+  dead z/Kahan, documented) at rel<=3.5e-6; levers dispatch + dev_p
+  resident sync; unsupported optimizers fail loud; dispatch gate 26/26.
+- T1.D SHIPPED (30bf76e + 458c37d): caption dropout in ALL FOUR trainers,
+  deterministic seeded schedule gated, ideogram4 llm_uncond cache path,
+  UI emission + 0.05->0.0 default fix (C13).
+- T1.E SHIPPED (30bf76e): masked loss (OneTrainer clamp == SimpleTuner
+  loss*mask at uw=0) composing with all loss fns + min-SNR; torch gates
+  incl. levers end-to-end dispatch.
+- T1.F SHIPPED (30bf76e): zimage sampler adapter sweeps (SimpleTuner
+  comparison semantics); CPU gate full PASS. GPU e2e sweep render OWED.
+- UI widgets SHIPPED (458c37d): Loss Fn / SmoothL1 Beta / Min-SNR Flow
+  rows in the LOSS panel; EMA/dropout/optimizer widgets pre-existed.
+
+FINAL-TREE GATES (orchestrator-run): zimage flag-off 5-step anchors
+EXACT; klein 1-step 0.5414; all six parity/dispatch/seam gates PASS.
+
+## Follow-ups (not Tier-1 blockers)
+- Lever fan-out: klein/hidream/ideogram4 loss+optimizer call sites
+  (one-call each; zimage = the proven reference).
+- T1.F GPU e2e sweep render; sweep UI keys (sample_sweep_loras).
+- Levers optimizer save/resume sidecar (fails loud on resume today).
+- hidream runtime TrainConfig (dropout/EMA are comptime/argv there).
+- Fused GPU adafactor/SF/EMA if they show in TIMING.

@@ -18,6 +18,7 @@
 #                               + real_N mask path)
 #   klein  B1 [1,1536,32,128]  (128-aligned -> no padding)
 #   zimage B2 [2,1248,30,128]  (batch + padding)
+#   ideogram4 fwd-only [1,{1024,1153},18,256]
 #
 # Build (note the extra cshim link args):
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
@@ -208,6 +209,71 @@ def _run_case[
     return ok
 
 
+def _run_fwd_only_case[
+    B: Int, S: Int, H: Int, Dh: Int
+](name: String, ctx: DeviceContext) raises -> Bool:
+    var n = B * S * H * Dh
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    print("=== fwd-only case ", name, " [", B, ",", S, ",", H, ",", Dh, "] ===")
+
+    var q_h = _pattern(n, 111, Float32(1.0))
+    var k_h = _pattern(n, 222, Float32(1.0))
+    var v_h = _pattern(n, 333, Float32(1.0))
+
+    var shape: List[Int] = [B, S, H, Dh]
+    var q = Tensor.from_host(q_h.copy(), shape.copy(), STDtype.BF16, ctx)
+    var k = Tensor.from_host(k_h.copy(), shape.copy(), STDtype.BF16, ctx)
+    var v = Tensor.from_host(v_h.copy(), shape.copy(), STDtype.BF16, ctx)
+
+    # F32 referee on the SAME bf16-rounded values.
+    var q32 = Tensor.from_host(q.to_host(ctx), shape.copy(), STDtype.F32, ctx)
+    var k32 = Tensor.from_host(k.to_host(ctx), shape.copy(), STDtype.F32, ctx)
+    var v32 = Tensor.from_host(v.to_host(ctx), shape.copy(), STDtype.F32, ctx)
+
+    var o_math = sdpa_nomask[B, S, H, Dh](q, k, v, scale, ctx)
+    var o_ref = sdpa_nomask[B, S, H, Dh](q32, k32, v32, scale, ctx)
+    var fwd = sdpa_flash_train_fwd[B, S, H, Dh](q, k, v, scale, ctx)
+    ctx.synchronize()
+
+    var o_math_h = o_math.to_host(ctx)
+    var o_ref_h = o_ref.to_host(ctx)
+    var o_flash_h = fwd.o.to_host(ctx)
+
+    var ok = True
+    var fm = _agree(o_flash_h, o_math_h)
+    ok = _gate_line(name, "fwd-only flash-vs-math", fm, 0.999) and ok
+    var fr = _agree(o_flash_h, o_ref_h)
+    var mr = _agree(o_math_h, o_ref_h)
+    ok = _referee_line(name, "fwd-only", fr.rms, mr.rms) and ok
+
+    # Speed (forward only): this is the production use needed by Ideogram4
+    # inference. Backward Dh=256 is deliberately not claimed here.
+    comptime ITERS = 10
+    ctx.synchronize()
+    var t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        var om = sdpa_nomask[B, S, H, Dh](q, k, v, scale, ctx)
+        _ = om^
+    ctx.synchronize()
+    var t1 = perf_counter_ns()
+    for _ in range(ITERS):
+        var ff = sdpa_flash_train_fwd[B, S, H, Dh](q, k, v, scale, ctx)
+        _ = ff^
+    ctx.synchronize()
+    var t2 = perf_counter_ns()
+    var math_ms = Float64(t1 - t0) / 1.0e6 / Float64(ITERS)
+    var flash_ms = Float64(t2 - t1) / 1.0e6 / Float64(ITERS)
+    var speedup = math_ms / flash_ms if flash_ms > 0.0 else 0.0
+    var sp_ok = flash_ms < math_ms
+    print(
+        "GATE sdpa_flash ", name, " speed fwd-only: math=", math_ms,
+        " ms  flash=", flash_ms, " ms  speedup=", speedup, "x ",
+        "PASS" if sp_ok else "FAIL (flash not faster)",
+    )
+    ok = ok and sp_ok
+    return ok
+
+
 def main() raises:
     var ctx = DeviceContext()
     print("=== sdpa_flash_parity: cuDNN flash vs math-mode + F32 referee ===")
@@ -215,6 +281,8 @@ def main() raises:
     ok = _run_case[1, 1536, 32, 128](String("klein_b1_aligned"), ctx) and ok
     ok = _run_case[1, 1248, 30, 128](String("zimage_b1_pad"), ctx) and ok
     ok = _run_case[2, 1248, 30, 128](String("zimage_b2_pad"), ctx) and ok
+    ok = _run_fwd_only_case[1, 1024, 18, 256](String("ideogram4_fwd_aligned"), ctx) and ok
+    ok = _run_fwd_only_case[1, 1153, 18, 256](String("ideogram4_fwd_pad"), ctx) and ok
     if ok:
         print("=== sdpa_flash_parity: ALL GATES PASS ===")
     else:

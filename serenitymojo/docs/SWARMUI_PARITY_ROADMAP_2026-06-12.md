@@ -75,9 +75,12 @@ Current high-risk runtime gaps:
   because `accepted_video_parity:false` and the runner labels the output
   `DEV SMOKE ONLY`.
 - Ideogram4 is requested as an image backend target. Its current resident DiT
-  path still contains direct `sdpa_nomask`, so it is not accepted until it is
-  routed through the fast attention path and proves a daemon artifact with
-  metadata, timing, and VRAM.
+  path now routes `sdpa_nomask[1,S,18,256]` through
+  `ideogram4_sdpa_product_fwd` and the cuDNN flash SDPA shim. The forward-only
+  Dh=256 gate passed for `S=1024` and padded `S=1153` with 7.7-9.1x speedup,
+  and both full DiT probes still pass fixture parity. It is still not accepted
+  as a SwarmUI backend until it proves a daemon artifact with metadata, timing,
+  and VRAM.
 - Sampler fields now reach typed `JobParams`/worker IPC, `/v1/samplers` exposes
   a SwarmUI/Comfy catalog and per-backend support matrix, and unsupported names
   fail loud before model work. Z-Image has bounded DPM++ 2M/simple-flowmatch
@@ -464,8 +467,10 @@ Purpose: repeat the proven product pattern on additional image models.
 Order:
 
 1. Klein if the goal is memory/offload mechanics and low-VRAM behavior.
-2. Ideogram4 as the requested next image target, but only after its resident
-   DiT product attention is off direct `sdpa_nomask`.
+2. Ideogram4 as the requested next image target. DONE for this slice: resident
+   and reference DiT product attention are off direct
+   `sdpa_nomask[1,S,18,256]` and pass the Dh=256 forward-only flash gate. Next
+   Ideogram4 work is the daemon backend/artifact gate.
 3. SDXL/Flux/Chroma/ERNIE if the goal is model breadth.
 4. Qwen only after a bounded low-memory plan is written and accepted.
 
@@ -522,11 +527,12 @@ Next implementation slice:
    focused smoke. Next LTX2 work is to lift the MVP raw resident-FP8 block
    pattern into staged/refhq, remove remaining hot linear/FP8 synchronizations,
    and only then compare deeper CUTLASS or cuBLASLt FP8 kernels.
-2. Add the Ideogram4 image backend only after replacing its direct
-   `sdpa_nomask[1,S,18,256]` resident DiT attention with a proven fast SDPA
-   path for real Ideogram shapes (`S=NIMG` and `S=NT+NIMG`, Dh=256), then prove
-   a daemon artifact with metadata, timings, and VRAM. Standalone Ideogram4
-   parity is not enough; there is no accepted `Ideogram4Backend` yet.
+2. Add the Ideogram4 image backend. DONE in this slice: direct
+   `sdpa_nomask[1,S,18,256]` resident/reference DiT attention is replaced with
+   a proven forward-only cuDNN flash path for Ideogram Dh=256 shapes. Next:
+   prove a daemon artifact with metadata, timings, and VRAM. Standalone
+   Ideogram4 parity is still not enough; there is no accepted
+   `Ideogram4Backend` yet.
 3. Refresh `/v1/samplers` smoke evidence, then promote the next sampler only
    with artifact/timing/VRAM evidence. Do not promote generic `uni_pc` by
    aliasing it to bh2; map its exact Comfy/Swarm semantics first.

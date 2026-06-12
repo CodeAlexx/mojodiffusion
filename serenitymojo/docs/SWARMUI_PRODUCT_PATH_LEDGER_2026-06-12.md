@@ -101,7 +101,7 @@ Acceptance evidence:
 - 2026-06-12 current checker:
   `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=71 passed=71 p0=0 p1=0 p2=0` after implementing the LTX2 fast
+  `checks=75 passed=75 p0=0 p1=0 p2=0` after implementing the LTX2 fast
   attention route, cuDNN upsampler/video-VAE/audio-VAE decode gates, bounded
   video/A-V artifact gates, and structured LTX2 runner stage timing manifests.
   Product P0 and tracked P1 gates are ready.
@@ -110,6 +110,16 @@ Acceptance evidence:
   and Z-Image speed parity. `images=N` now
   emits indexed serial jobs, variation noise has a runtime artifact gate, and
   `/v1/samplers` exposes a pure-Mojo SwarmUI/Comfy sampler support registry.
+- 2026-06-12 Ideogram4 fast-attention update: the resident and reference
+  Ideogram4 DiT attention calls now route through `ideogram4_sdpa_product_fwd`
+  instead of direct `sdpa_nomask[1,S,18,256]`. The forward-only Dh=256 cuDNN
+  flash gate in `serenitymojo/ops/tests/sdpa_flash_parity.mojo` passed with
+  `ideogram4_fwd_aligned` (`S=1024`, flash `0.5990126 ms`, math `5.4428871 ms`,
+  `9.086x`) and `ideogram4_fwd_pad` (`S=1153`, flash `0.9248282 ms`, math
+  `7.141845 ms`, `7.722x`). Full DiT fixture probes also passed after the
+  wiring: `chunk6 full DiT velocity parity` and resident fp8 DiT both reported
+  `cos=0.9995574960620331`, `max_abs=0.4228515625`, `PASS`. This clears the
+  immediate Ideogram4 slow-SDPA blocker, but not the backend/artifact gate.
   Z-Image now has bounded DPM++ 2M and UniPC bh2/simple-flowmatch wiring; true
   Comfy-style latent batch execution and the remaining generic UniPC/order-3,
   ancestral, SDE, Karras, CFG++, and advanced daemon denoise loops remain
@@ -299,7 +309,7 @@ Acceptance evidence:
 - `python3 scripts/check_ltx2_dtype_contract.py --scope all` passes.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` now reports
-  `checks=71 passed=71 p0=0 p1=0 p2=0`. This keeps full video parity blocked
+  `checks=75 passed=75 p0=0 p1=0 p2=0`. This keeps full video parity blocked
   by evidence while proving the bounded daemon runner route, LTX2 fast SDPA
   route, cuDNN latent upsampler, direct-FCQRS video VAE decode, structured
   runner timing manifest, and tracked UI/gallery/reuse/state P1 gate are wired.
@@ -556,7 +566,7 @@ Acceptance evidence:
   expected-type error.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=71 passed=71 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
+  `checks=75 passed=75 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
   Full SwarmUI all-level parity still remains blocked by Qwen full generation,
   full video parity beyond DEV-smoke artifacts, advanced workflow node families, sampler breadth,
   and Z-Image speed parity.

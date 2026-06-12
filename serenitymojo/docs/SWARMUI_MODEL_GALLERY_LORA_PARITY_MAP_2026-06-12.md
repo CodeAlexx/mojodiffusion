@@ -99,11 +99,12 @@ single-LoRA, and stacked-LoRA outputs.
 
 - Ideogram4 is requested as a real image backend. Current status: not accepted.
   The local code has `serenitymojo/models/dit/ideogram4_dit.mojo` and
-  `serenitymojo/models/dit/ideogram4_resident.mojo`, but the resident DiT path
-  still contains direct `sdpa_nomask` attention. Acceptance requires routing the
-  product denoise path through cuDNN flash or another measured fast kernel, then
-  proving a daemon artifact with dimensions, `serenity.genparams.v1`, timings,
-  positive peak VRAM, gallery/job DB entries, and fail-loud unsupported options.
+  `serenitymojo/models/dit/ideogram4_dit.mojo`; both reference and resident DiT
+  attention now route through `ideogram4_sdpa_product_fwd`, backed by the
+  Dh=256 cuDNN SDPA forward gate at S=1024 and padded S=1153. Acceptance now
+  requires wiring the daemon backend and proving an artifact with dimensions,
+  `serenity.genparams.v1`, timings, positive peak VRAM, gallery/job DB entries,
+  and fail-loud unsupported options.
 - LTX2 video is a measured video target, not an accepted backend. After the
   2026-06-12 flash-attention patch, the bounded daemon run reaches
   `[Stage1] done` and times out while loading the spatial-x2 latent upsampler
@@ -115,9 +116,10 @@ single-LoRA, and stacked-LoRA outputs.
   PEFT/Comfy LoRAs. Qwen is still zero-LoRA, and Z-Image LoKr/LyCORIS files are
   still not converted by the overlay path.
 - Image/video backends with direct product `sdpa_nomask`/`sdpa_nomask_tiled`
-  call sites are not accepted for speed parity. This includes Ideogram4 until
-  its resident path is moved to a fast attention route and measured through the
-  daemon.
+  call sites are not accepted for speed parity. Ideogram4 has cleared the
+  Dh=256 fast-attention gate, but is still not accepted until the daemon
+  product backend emits a real artifact with metadata, timings, VRAM, and
+  gallery/job evidence.
 - Model/LoRA browser real preview thumbnails, user notes, model favorite
   persistence, and full UI control restoration are not accepted by this slice.
 - UI/gallery/reuse/state tracked P1 is clear in the runtime checker:

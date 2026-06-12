@@ -14,11 +14,14 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu, swiglu
 from serenitymojo.ops.norm import rms_norm, layer_norm_no_affine
 from serenitymojo.ops.unary import tanh_op
-from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.tensor_algebra import mul, add, add_scalar, reshape, slice, gather_rows, transpose, mul_scalar
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
-from serenitymojo.models.dit.ideogram4_dit import apply_rope_ideogram, ideogram4_embedscalar_sinusoid
+from serenitymojo.models.dit.ideogram4_dit import (
+    apply_rope_ideogram,
+    ideogram4_embedscalar_sinusoid,
+    ideogram4_sdpa_product_fwd,
+)
 
 
 struct Ideogram4Weights(Movable):
@@ -115,7 +118,7 @@ def _attn_r[S: Int](
     q = apply_rope_ideogram(q, cosf, sinf, ctx)
     k = apply_rope_ideogram(k, cosf, sinf, ctx)
     var scale = Float32(1.0 / (Float32(head_dim) ** 0.5))
-    var attn = sdpa_nomask[1, S, 18, 256](q, k, v, scale, ctx)
+    var attn = ideogram4_sdpa_product_fwd[1, S, 18, 256](q, k, v, scale, ctx)
     var merged = reshape(attn, [1, L, hidden], ctx)
     return _lin(w, merged, p + "attention.o.weight", "", ctx)
 

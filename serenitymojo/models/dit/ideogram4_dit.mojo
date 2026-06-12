@@ -15,12 +15,37 @@ from serenitymojo.ops.activations import silu, swiglu
 from serenitymojo.ops.norm import rms_norm, layer_norm_no_affine
 from serenitymojo.ops.unary import tanh_op
 from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention_flash import sdpa_flash_train_fwd
 from serenitymojo.ops.tensor_algebra import mul, add, add_scalar, reshape, slice, gather_rows
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.fp8 import load_fp8_dequant
 
 comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
+comptime IDEOGRAM4_SDPA_FLASH = True
+
+
+def ideogram4_sdpa_product_fwd[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    comptime if IDEOGRAM4_SDPA_FLASH:
+        # Ideogram4 product/runtime attention is BF16 at the model boundary.
+        # Dh=256 is forward-only gated in sdpa_flash_parity; no backward claim.
+        if q.dtype() == STDtype.BF16 and k.dtype() == STDtype.BF16 and v.dtype() == STDtype.BF16:
+            var ff = sdpa_flash_train_fwd[B, S, H, Dh](q, k, v, scale, ctx)
+            return ff.o.clone(ctx)
+        var q_bf16 = cast_tensor(q, STDtype.BF16, ctx, False)
+        var k_bf16 = cast_tensor(k, STDtype.BF16, ctx, False)
+        var v_bf16 = cast_tensor(v, STDtype.BF16, ctx, False)
+        var ff = sdpa_flash_train_fwd[B, S, H, Dh](q_bf16, k_bf16, v_bf16, scale, ctx)
+        var out = ff.o.clone(ctx)
+        return cast_tensor(out, q.dtype(), ctx, False)
+    else:
+        return sdpa_nomask[B, S, H, Dh](q, k, v, scale, ctx)
 
 
 # ── weight load helpers ──────────────────────────────────────────────────────
@@ -172,7 +197,7 @@ def ideogram4_attention[S: Int](
     q = apply_rope_ideogram(q, cosf, sinf, ctx)
     k = apply_rope_ideogram(k, cosf, sinf, ctx)
     var scale = Float32(1.0 / (Float32(head_dim) ** 0.5))
-    var attn = sdpa_nomask[1, S, 18, 256](q, k, v, scale, ctx)  # [1,L,H,Dh]
+    var attn = ideogram4_sdpa_product_fwd[1, S, 18, 256](q, k, v, scale, ctx)  # [1,L,H,Dh]
     var merged = reshape(attn, [1, L, hidden], ctx)
     return linear(merged, o_w, None, ctx)
 

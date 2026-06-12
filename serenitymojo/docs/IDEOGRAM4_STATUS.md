@@ -29,7 +29,7 @@ All numbers below are MEASURED in-session (RTX 3090 Ti, 24 GB).
 | 8 | Flux2 VAE decode (z=32) | 0.99995 |
 | 9 | end-to-end sampler | image PSNR 29.7 dB vs torch (latent cos 0.96 = bf16+CFG-cancellation accumulation, visually negligible) |
 | — | fused fp8 GEMM vs dequant+BLAS | 0.99999698 |
-| — | resident fp8 DiT (dequant+cuBLAS) vs fixture | 0.99961 |
+| — | resident fp8 DiT (dequant+cuBLAS + Dh256 flash SDPA) vs fixture | 0.999557 |
 
 Probes: `models/dit/parity/chunk{1..8}_*.mojo`, `chunk6r_resident_probe.mojo`,
 `fp8gemm_probe.mojo`. Oracle generator: `models/dit/parity/ideogram4_oracle.py`
@@ -50,6 +50,12 @@ step → memory-bound (~3% GPU util). Fixes:
   steps; built ONCE and passed into `forward_r`, removing the per-forward
   `indicator.to_host` (was ~2× per step). EDv2/Klein transfer lesson
   (`/home/alex/EriDiffusion/FLAME_BLOCK_SWAP_AUDIT.md`).
+- **Dh=256 flash SDPA** (`ideogram4_sdpa_product_fwd`): resident/reference DiT
+  attention no longer calls direct `sdpa_nomask[1,S,18,256]`. The
+  forward-only cuDNN gate passed in `ops/tests/sdpa_flash_parity.mojo`:
+  `S=1024` flash `0.599 ms` vs math `5.443 ms` (`9.09x`) and padded `S=1153`
+  flash `0.925 ms` vs math `7.142 ms` (`7.72x`). Backward Dh=256 is not
+  claimed.
 - MEASURED: 4-step 1024² with the slow tiled GEMM = 8:12. Util went 3%→98% with
   resident weights. (cuBLAS-path full timing not captured — run was killed.)
 - For >2k resolutions where fp8-resident won't fit, the path is pinned + async +
@@ -68,8 +74,10 @@ switch — the Ideogram model only ever consumes the JSON. Pure-Mojo equivalent:
 
 ## Files (port surface)
 - `models/dit/ideogram4_dit.mojo` — DiT forward (streaming/reference path), block,
-  attention, rope-apply, EmbedScalar, packed builder helpers. `[S]`-parameterized.
-- `models/dit/ideogram4_resident.mojo` — resident fp8 weights + `forward_r` + masks (HOT path).
+  `ideogram4_sdpa_product_fwd` fast attention, rope-apply, EmbedScalar, packed
+  builder helpers. `[S]`-parameterized.
+- `models/dit/ideogram4_resident.mojo` — resident fp8 weights + `forward_r` +
+  masks (HOT path), reusing the shared fast attention boundary.
 - `models/dit/ideogram4_mrope.mojo` — interleaved MRoPE builder.
 - `models/text_encoder/ideogram_qwen3vl.mojo` — Qwen3-VL 13-tap encoder (adapts Qwen3Encoder).
 - `models/text_encoder/qwen3_magic.mojo` — greedy LM decode (magic prompt).
@@ -87,12 +95,13 @@ switch — the Ideogram model only ever consumes the JSON. Pure-Mojo equivalent:
 - Generate (edit prompt ids / STEPS / GH,GW in the file):
   `pixi run mojo run -I . serenitymojo/pipeline/ideogram4_generate.mojo`
 - Magic prompt: `pixi run mojo run -I . serenitymojo/pipeline/ideogram4_magic.mojo`
-- Regenerate fixtures: `OneTrainer-anima-ref/venv/bin/python models/dit/parity/ideogram4_oracle.py {A|B|C|D|P|E}` (offline; HF_HUB_OFFLINE=1)
+- Regenerate fixtures: `HF_HUB_OFFLINE=1 python3 models/dit/parity/ideogram4_oracle.py {A|B|C|D|P|E}` (dev-only torch oracle; product path stays Mojo)
 
 ## Known limits / next
 - Latent cos 0.96 at chunk 9 = irreducible bf16+CFG(7×) accumulation (image matches, PSNR 29.7).
 - Magic prompt + diffusion both lack KV-cache / async block-swap (speed follow-ups).
-- 4K out of range (model native ≤2k; Dh=256 math-mode SDPA can't hold 4k² score matrix).
+- 4K out of range (model native ≤2k; Dh=256 flash forward is gated for current
+  inference shapes, but there is no accepted 4K product path).
 - LoRA (Power-Lora-style additive overlay) not yet wired (inference side).
 
 ## Addendum 2026-06-12 — TRAINING status (lives in serenity-trainer)

@@ -49,9 +49,12 @@ ZIMAGE_GENERATE = REPO / "serenitymojo/pipeline/zimage_generate.mojo"
 ZIMAGE_LORA_BLOCK = REPO / "serenitymojo/models/zimage/lora_block.mojo"
 ZIMAGE_STACK_LORA = REPO / "serenitymojo/models/zimage/zimage_stack_lora.mojo"
 QWEN_DIT = REPO / "serenitymojo/models/dit/qwenimage_dit.mojo"
+IDEOGRAM4_DIT = REPO / "serenitymojo/models/dit/ideogram4_dit.mojo"
+IDEOGRAM4_RESIDENT = REPO / "serenitymojo/models/dit/ideogram4_resident.mojo"
 LTX2_DIT = REPO / "serenitymojo/models/dit/ltx2_dit.mojo"
 ATTENTION = REPO / "serenitymojo/ops/attention.mojo"
 ATTENTION_FLASH = REPO / "serenitymojo/ops/attention_flash.mojo"
+SDPA_FLASH_PARITY = REPO / "serenitymojo/ops/tests/sdpa_flash_parity.mojo"
 LTX2_HQ = REPO / "serenitymojo/pipeline/ltx2_t2v_av_hq.mojo"
 LTX2_UPSAMPLER = REPO / "serenitymojo/models/upsampler/ltx2_upsampler.mojo"
 LTX2_VAE_DECODER = REPO / "serenitymojo/models/vae/ltx2_vae_decoder.mojo"
@@ -834,6 +837,47 @@ def check_image_fast_path() -> list[Check]:
             needles=["var attn = sdpa["],
             severity=P0,
             acceptance="Qwen image denoise routes masked joint attention to an accepted fast path.",
+        ),
+        check_contains(
+            IDEOGRAM4_DIT,
+            category="image-fast-path",
+            label="Ideogram4 product forward has flash dispatch",
+            needles=[
+                "def ideogram4_sdpa_product_fwd",
+                "sdpa_flash_train_fwd",
+                "comptime IDEOGRAM4_SDPA_FLASH = True",
+            ],
+            severity=P0,
+            acceptance="Ideogram4 has a shared BF16 flash SDPA dispatch point for Dh=256 inference forwards.",
+        ),
+        check_absent(
+            IDEOGRAM4_DIT,
+            category="image-fast-path",
+            label="Ideogram4 reference forward avoids direct Dh256 math SDPA",
+            needles=["sdpa_nomask[1, S, 18, 256]"],
+            severity=P0,
+            acceptance="Ideogram4 reference DiT attention routes through the product fast-path wrapper.",
+        ),
+        check_absent(
+            IDEOGRAM4_RESIDENT,
+            category="image-fast-path",
+            label="Ideogram4 resident forward avoids direct Dh256 math SDPA",
+            needles=["sdpa_nomask[1, S, 18, 256]"],
+            severity=P0,
+            acceptance="Ideogram4 resident DiT attention routes through the product fast-path wrapper.",
+        ),
+        check_contains(
+            SDPA_FLASH_PARITY,
+            category="image-fast-path",
+            label="Ideogram4 Dh256 forward flash parity gate",
+            needles=[
+                "def _run_fwd_only_case",
+                "ideogram4_fwd_aligned",
+                "ideogram4_fwd_pad",
+                "Dh=256 is deliberately not claimed",
+            ],
+            severity=P0,
+            acceptance="Dh=256 flash SDPA is admitted only for forward inference with explicit parity and speed evidence.",
         ),
         check_absent(
             ZIMAGE_GENERATE,

@@ -84,6 +84,22 @@ G-X3 PROMPT: all sidecar/prompt-blind models FULL prompt-driven (wire verified
   faithful translate + output diff.
 
 ## Log (newest first)
+- 2026-06-11 (session 4, night): **TIER-1 SIMPLETUNER-PARITY CAMPAIGN
+  SHIPPED IN ONE EVENING — 6 phases, 9 agents (builder/bug-fixer/wirer/
+  applier per phase), every gate orchestrator-re-run.** New surface:
+  huber/smooth-L1/min-SNR-flow losses (torch parity rel<=8.4e-8), EMA
+  (BIT-EXACT vs SimpleTuner ema.py), torch.optim.Adafactor +
+  schedule-free AdamW (rel<=3.5e-6; SimpleTuner's SF measured to be
+  plain warmup-AdamW — dead z/Kahan, ported faithful + documented),
+  caption dropout in all 4 trainers (deterministic seeded), masked loss
+  (clamp semantics, composes with all losses), zimage validation
+  adapter sweeps (SimpleTuner comparison mode). ALL runtime-config
+  through ONE shared training/levers.mojo + UI widgets + runner JSON
+  emission (two latent UI-chain gaps found+fixed: "EMA" mode rejected
+  by reader; ema keys never emitted). C13 PROOF on the final tree:
+  zimage flag-off anchors EXACT, klein 1-step 0.5414. Commits ed785c7,
+  27d6140, 95d136d, 30bf76e (mojodiffusion) + ae375fe, 458c37d
+  (serenity-trainer). Audit basis: AUDIT_SIMPLETUNER_PARITY_2026-06-11.
 - 2026-06-11 (session 4, late): **HIDREAM-O1 TRAINING VERTICAL BUILT IN ONE
   DAY — ~1.0 s/step (ai-toolkit's claimed class), 105x from first light.**
   Per-block fwd+bwd torch-parity gated (cos>=1-4e-13, all 14 adapter

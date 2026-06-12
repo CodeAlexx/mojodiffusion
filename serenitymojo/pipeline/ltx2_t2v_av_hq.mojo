@@ -1438,11 +1438,104 @@ def run_audiosync(
 # (refined only by the video-coupled stage-2; the reference carries s1 audio
 # into stage 2 unchanged when no audio refine).
 # ════════════════════════════════════════════════════════════════════════════
+def _json_bool(v: Bool) -> String:
+    return String("true") if v else String("false")
+
+
+struct _RunnerTimings(Movable):
+    var load_globals_seconds: Float64
+    var connector_seconds: Float64
+    var rope_stage1_seconds: Float64
+    var stage1_denoise_seconds: Float64
+    var upscale_seconds: Float64
+    var stage2_rope_seconds: Float64
+    var stage2_load_globals_seconds: Float64
+    var stage2_denoise_seconds: Float64
+    var video_decode_seconds: Float64
+    var frame_png_write_seconds: Float64
+    var video_mux_seconds: Float64
+    var audio_vae_seconds: Float64
+    var vocoder_seconds: Float64
+    var wav_write_seconds: Float64
+    var audio_mux_seconds: Float64
+    var total_runner_seconds: Float64
+
+    def __init__(out self):
+        self.load_globals_seconds = 0.0
+        self.connector_seconds = 0.0
+        self.rope_stage1_seconds = 0.0
+        self.stage1_denoise_seconds = 0.0
+        self.upscale_seconds = 0.0
+        self.stage2_rope_seconds = 0.0
+        self.stage2_load_globals_seconds = 0.0
+        self.stage2_denoise_seconds = 0.0
+        self.video_decode_seconds = 0.0
+        self.frame_png_write_seconds = 0.0
+        self.video_mux_seconds = 0.0
+        self.audio_vae_seconds = 0.0
+        self.vocoder_seconds = 0.0
+        self.wav_write_seconds = 0.0
+        self.audio_mux_seconds = 0.0
+        self.total_runner_seconds = 0.0
+
+    def postprocess_seconds(self) -> Float64:
+        return (
+            self.video_decode_seconds
+            + self.frame_png_write_seconds
+            + self.video_mux_seconds
+            + self.audio_vae_seconds
+            + self.vocoder_seconds
+            + self.wav_write_seconds
+            + self.audio_mux_seconds
+        )
+
+    def write_staged(
+        self,
+        path: String,
+        include_audio: Bool,
+        max_steps: Int,
+        frame_count: Int,
+        sample_rate: Int,
+    ) raises:
+        var content = String("{\n")
+        content += String('  "schema":"serenity.ltx2_runner_timings.v1",\n')
+        content += String('  "mode":"staged",\n')
+        content += String('  "include_audio":') + _json_bool(include_audio) + String(",\n")
+        content += String('  "max_steps":') + String(max_steps) + String(",\n")
+        content += String('  "frame_count":') + String(frame_count) + String(",\n")
+        content += String('  "width":') + String(OUT_W2_STAGED) + String(",\n")
+        content += String('  "height":') + String(OUT_H2_STAGED) + String(",\n")
+        content += String('  "audio_sample_rate":') + String(sample_rate) + String(",\n")
+        content += String('  "timings":{\n')
+        content += String('    "load_globals_seconds":') + String(self.load_globals_seconds) + String(",\n")
+        content += String('    "connector_seconds":') + String(self.connector_seconds) + String(",\n")
+        content += String('    "rope_stage1_seconds":') + String(self.rope_stage1_seconds) + String(",\n")
+        content += String('    "stage1_denoise_seconds":') + String(self.stage1_denoise_seconds) + String(",\n")
+        content += String('    "upscale_seconds":') + String(self.upscale_seconds) + String(",\n")
+        content += String('    "stage2_rope_seconds":') + String(self.stage2_rope_seconds) + String(",\n")
+        content += String('    "stage2_load_globals_seconds":') + String(self.stage2_load_globals_seconds) + String(",\n")
+        content += String('    "stage2_denoise_seconds":') + String(self.stage2_denoise_seconds) + String(",\n")
+        content += String('    "video_decode_seconds":') + String(self.video_decode_seconds) + String(",\n")
+        content += String('    "frame_png_write_seconds":') + String(self.frame_png_write_seconds) + String(",\n")
+        content += String('    "video_mux_seconds":') + String(self.video_mux_seconds) + String(",\n")
+        content += String('    "audio_vae_seconds":') + String(self.audio_vae_seconds) + String(",\n")
+        content += String('    "vocoder_seconds":') + String(self.vocoder_seconds) + String(",\n")
+        content += String('    "wav_write_seconds":') + String(self.wav_write_seconds) + String(",\n")
+        content += String('    "audio_mux_seconds":') + String(self.audio_mux_seconds) + String(",\n")
+        content += String('    "postprocess_seconds":') + String(self.postprocess_seconds()) + String(",\n")
+        content += String('    "total_runner_seconds":') + String(self.total_runner_seconds) + String("\n")
+        content += String("  }\n")
+        content += String("}\n")
+        _write_text(path, content)
+
+
 def run_staged(
     apply_lora: Bool, out_dir: String, max_steps: Int, use_resident: Bool,
     include_audio: Bool, use_nag: Bool, profile_dit: Bool,
 ) raises:
     var ctx = DeviceContext()
+    var total_t0 = perf_counter()
+    var timings = _RunnerTimings()
     var cfg = LTX2Config.ltx2()
     print("=== LTX-2.3 T2V HQ *FULL STAGED* (res_2s + 2x upscale + refine) ===")
     print("  target frames:", NUM_FRAMES_STAGED, " decoded frames:",
@@ -1481,6 +1574,8 @@ def run_staged(
         )
 
     print("  [load] stage-1 globals")
+    ctx.synchronize()
+    var t0 = perf_counter()
     var gw = _load_global_weights_dict(ck, ctx)
     if apply_lora:
         var n_global = lora_stack.apply_to_globals_scaled(
@@ -1500,8 +1595,12 @@ def run_staged(
         _load_global_bf16(ck, "scale_shift_table", ctx),
         _load_global_bf16(ck, "audio_scale_shift_table", ctx),
     )
+    ctx.synchronize()
+    timings.load_globals_seconds = perf_counter() - t0
 
     print("  [connector] loading + running video/audio (BF16 storage)")
+    ctx.synchronize()
+    t0 = perf_counter()
     var v_conn = LTX2ConnectorWeights.load(
         String(CKPT_FP8), String("video_embeddings_connector"),
         LTX2ConnectorConfig.video(), ctx,
@@ -1522,6 +1621,8 @@ def run_staged(
         _ = _stats(String("nag_video_context"), nag_v, ctx)
         var nag_a = _nag_audio_placeholder(ctx)
         nag = NAGContext.defaults(nag_v^, nag_a^, False)
+    ctx.synchronize()
+    timings.connector_seconds = perf_counter() - t0
 
     var stream = LTX2BlockStream.open(String(CKPT_FP8))
     if stream.block_count() != NUM_LAYERS:
@@ -1535,6 +1636,8 @@ def run_staged(
         print("  [resident] resident storage bytes:", stream.resident_bytes())
 
     # ── Audio RoPE (sigma-independent, same both stages) ──
+    ctx.synchronize()
+    t0 = perf_counter()
     var ac = _build_audio_coords_dims(S_A_STAGED)
     var arope = _compute_rope(
         ac, 1, S_A_STAGED, AD, _mp1(), ROPE_THETA, A_HEADS, STDtype.BF16, ctx
@@ -1557,6 +1660,8 @@ def run_staged(
     )
     var v_cos1 = _clone(vrope1[0], ctx); var v_sin1 = _clone(vrope1[1], ctx)
     var ca_v_cos1 = _clone(cavrope1[0], ctx); var ca_v_sin1 = _clone(cavrope1[1], ctx)
+    ctx.synchronize()
+    timings.rope_stage1_seconds = perf_counter() - t0
 
     print("  [noise] init video + audio latents")
     # rng-contract: mojo-native-not-pytorch-parity. Runtime noise is BF16
@@ -1575,6 +1680,8 @@ def run_staged(
     if max_steps > 0 and max_steps < n1:
         n1 = max_steps
     print("  [Stage1] res_2s denoise,", n1, "steps")
+    ctx.synchronize()
+    t0 = perf_counter()
 
     for step in range(n1):
         var sigma = sigmas1[step]
@@ -1647,9 +1754,13 @@ def run_staged(
         audio_x = _denoise_from_vel(audio_x, fz1[1], RES2S_TERMINAL_SIGMA, ctx)
     _ = _stats(String("video_x(stage1)"), video_x, ctx)
     print("  [Stage1] done")
+    ctx.synchronize()
+    timings.stage1_denoise_seconds = perf_counter() - t0
 
     # ══════════════ SPATIAL UPSAMPLE (x2) ══════════════
     print("  [upscale] loading spatial-x2 LatentUpsampler + VAE per-channel stats")
+    ctx.synchronize()
+    t0 = perf_counter()
     var up_st = ShardedSafeTensors.open(String(SPATIAL_UPSCALER))
     var upsampler = LatentUpsampler(up_st, False, ctx)  # is_temporal=False
     var std_t = _load_vae_stat(String("std-of-means"), ctx)
@@ -1664,9 +1775,13 @@ def run_staged(
           ush[2], ",", ush[3], ",", ush[4], "]  (expect [1,128,",
           NF_STAGED, ",", NH2_STAGED, ",", NW2_STAGED, "])")
     _ = _stats(String("upscaled"), upscaled, ctx)
+    ctx.synchronize()
+    timings.upscale_seconds = perf_counter() - t0
 
     # ══════════════ STAGE-2 RoPE (doubled spatial grid) ══════════════
     print("  [rope] stage-2 video tables (S_V2=", S_V2_STAGED, ")")
+    ctx.synchronize()
+    t0 = perf_counter()
     var vc2 = _build_video_coords_dims(NF_STAGED, NH2_STAGED, NW2_STAGED)
     var vtc2 = _video_temporal_coords_dims(vc2, S_V2_STAGED)
     var vrope2 = _compute_rope(
@@ -1677,8 +1792,12 @@ def run_staged(
     )
     var v_cos2 = _clone(vrope2[0], ctx); var v_sin2 = _clone(vrope2[1], ctx)
     var ca_v_cos2 = _clone(cavrope2[0], ctx); var ca_v_sin2 = _clone(cavrope2[1], ctx)
+    ctx.synchronize()
+    timings.stage2_rope_seconds = perf_counter() - t0
 
     print("  [load] stage-2 globals")
+    ctx.synchronize()
+    t0 = perf_counter()
     gw = _load_global_weights_dict(ck, ctx)
     if apply_lora:
         var n_global2 = lora_stack.apply_to_globals_scaled(
@@ -1698,8 +1817,12 @@ def run_staged(
         _load_global_bf16(ck, "scale_shift_table", ctx),
         _load_global_bf16(ck, "audio_scale_shift_table", ctx),
     )
+    ctx.synchronize()
+    timings.stage2_load_globals_seconds = perf_counter() - t0
 
     # ══════════════ STAGE-2 refine (3-step res_2s) ══════════════
+    ctx.synchronize()
+    t0 = perf_counter()
     var s2sig = ltx2_stage2_distilled_sigmas()  # [0.909375, 0.725, 0.421875, 0.0]
     var s2_noise_scale = s2sig[0]
     print("  [Stage2] forward-noise upscaled @", s2_noise_scale, " then 3-step res_2s refine (joint A/V)")
@@ -1786,8 +1909,12 @@ def run_staged(
         ax2 = _denoise_from_vel(ax2, fz2[1], RES2S_TERMINAL_SIGMA, ctx)
     _ = _stats(String("vx2(stage2)"), vx2, ctx)
     print("  [Stage2] done -> decoding at 2x resolution")
+    ctx.synchronize()
+    timings.stage2_denoise_seconds = perf_counter() - t0
 
     # ══════════════ DECODE VIDEO (2x res) ══════════════
+    ctx.synchronize()
+    t0 = perf_counter()
     var vae = LTX2VaeDecoderWeights.load(String(CKPT_BF16), ctx)
     var vx2_bf16 = cast_tensor(vx2, STDtype.BF16, ctx)
     var frames = decode_video[
@@ -1798,20 +1925,34 @@ def run_staged(
     print("  frames NCDHW: [", fsh[0], ",", fsh[1], ",", fsh[2], ",", fsh[3],
           ",", fsh[4], "]")
     _ = _stats(String("frames"), frames, ctx)
+    ctx.synchronize()
+    timings.video_decode_seconds = perf_counter() - t0
 
+    ctx.synchronize()
+    t0 = perf_counter()
     for fr in range(n_frames_out):
         var fslice = slice(frames, 2, fr, 1, ctx)
         var fs = fslice.shape()
         var chw = reshape(fslice, _sh4(fs[0], fs[1], fs[3], fs[4]), ctx)
         save_png(chw, out_dir + "/" + frame_prefix + _pad2(fr) + ".png", ctx, ValueRange.SIGNED)
     print("  saved", n_frames_out, "frame PNGs ->", out_dir)
+    ctx.synchronize()
+    timings.frame_png_write_seconds = perf_counter() - t0
 
     if not include_audio:
         var mp4_video = out_dir + "/ltx2_t2v_hq2.mp4"
         if max_steps != 0:
             mp4_video = out_dir + "/ltx2_t2v_stage2_dev_smoke.mp4"
         print("  [decode] audio disabled by explicit noaudio; muxing video-only mp4")
+        ctx.synchronize()
+        t0 = perf_counter()
         _mux_video_mp4(out_dir, mp4_video, frame_prefix)
+        timings.video_mux_seconds = perf_counter() - t0
+        timings.total_runner_seconds = perf_counter() - total_t0
+        timings.write_staged(
+            out_dir + "/ltx2_runner_timings.json", include_audio, max_steps,
+            n_frames_out, 0,
+        )
         print("=== HQ STAGED VIDEO DONE ===")
         print("  mp4:", mp4_video)
         print("  frames:", n_frames_out)
@@ -1825,11 +1966,20 @@ def run_staged(
         mp4_out = out_dir + "/ltx2_t2v_av_stage2_dev_smoke.mp4"
         print("  [quality] DEV SMOKE ONLY: audio mux is tested, output is not HQ quality")
     print("  [decode] audio VAE -> vocoder")
+    ctx.synchronize()
+    t0 = perf_counter()
     var avae = LTX2AudioVaeDecoderWeights.load(String(CKPT_BF16), ctx)
     var audio_x_bf16 = cast_tensor(ax2, STDtype.BF16, ctx)
     var mel = cast_tensor(decode_audio(avae, audio_x_bf16, ctx), STDtype.BF16, ctx)
+    ctx.synchronize()
+    timings.audio_vae_seconds = perf_counter() - t0
+    ctx.synchronize()
+    t0 = perf_counter()
     var voc = LTX2VocoderWithBWE.from_file(String(CKPT_BF16), ctx)
     var wav = voc.forward(mel, ctx)
+    ctx.synchronize()
+    timings.vocoder_seconds = perf_counter() - t0
+    t0 = perf_counter()
     var wsh = wav.shape()
     var L = wsh[2]
     var wh = wav.to_host(ctx)
@@ -1839,8 +1989,16 @@ def run_staged(
         for s in range(L):
             inter[s * 2 + ch] = wh[ch * L + s]
     _write_wav(wav_out, inter, voc.output_sample_rate())
+    timings.wav_write_seconds = perf_counter() - t0
     print("  wrote wav:", wav_out)
+    t0 = perf_counter()
     _mux_mp4(out_dir, n_frames_out, wav_out, mp4_out, frame_prefix)
+    timings.audio_mux_seconds = perf_counter() - t0
+    timings.total_runner_seconds = perf_counter() - total_t0
+    timings.write_staged(
+        out_dir + "/ltx2_runner_timings.json", include_audio, max_steps,
+        n_frames_out, voc.output_sample_rate(),
+    )
     print("=== HQ STAGED DONE ===")
     print("  mp4:", mp4_out)
     print("  frames:", out_dir, "/", frame_prefix, "00.png ..  (",
@@ -2597,6 +2755,29 @@ def _pad3(n: Int) -> String:
     if n < 100:
         return String("0") + String(n)
     return String(n)
+
+
+def _write_text(path: String, text: String) raises:
+    var n = text.byte_length()
+    var buf = alloc[UInt8](n)
+    var src = text.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, Int32(0o644))
+    if fd < 0:
+        buf.free()
+        raise Error(String("write_text: cannot open ") + path)
+    var bp = BytePtr(unsafe_from_address=Int(buf))
+    var done = 0
+    while done < n:
+        var got = sys_pwrite(fd, bp + done, n - done, done)
+        if got <= 0:
+            break
+        done += got
+    _ = sys_close(fd)
+    buf.free()
+    if done != n:
+        raise Error("write_text: short write")
 
 
 # ── WAV writer (16-bit PCM LE stereo) ──

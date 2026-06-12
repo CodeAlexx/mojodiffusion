@@ -370,6 +370,7 @@ def ltx2_staged_smoke_video_result(
         mp4_path = out_dir + String("/ltx2_t2v_av_stage2_dev_smoke.mp4")
         wav_path = out_dir + String("/dev_audio.wav")
     var manifest_path = out_dir + String("/ltx2_video_result.json")
+    var runner_timing_path = out_dir + String("/ltx2_runner_timings.json")
     _ = _system(String("mkdir -p ") + _shell_quote(out_dir))
 
     var cmd = (
@@ -409,6 +410,7 @@ def ltx2_staged_smoke_video_result(
     o.set("wav", JSONValue.from_string(wav_path))
     o.set("log_path", JSONValue.from_string(log_path))
     o.set("result_path", JSONValue.from_string(manifest_path))
+    o.set("runner_timing_path", JSONValue.from_string(runner_timing_path))
     o.set("total_wall_seconds", JSONValue.from_float(wall))
     o.set(
         "note",
@@ -431,6 +433,15 @@ def ltx2_staged_smoke_video_result(
         )
         _write_text_file(manifest_path, dumps(o))
         return o^
+
+    try:
+        var timing_doc = loads(_read_text_file(runner_timing_path))
+        if timing_doc.is_object():
+            o.set("runner_timings", timing_doc.copy())
+            if timing_doc.contains("timings") and timing_doc["timings"].is_object():
+                o.set("stage_timings", timing_doc["timings"].copy())
+    except:
+        pass
 
     try:
         var probe = probe_video_file(mp4_path)

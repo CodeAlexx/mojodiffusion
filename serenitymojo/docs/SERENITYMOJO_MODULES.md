@@ -45,7 +45,10 @@ model-specific monolith.
 ### `serve/video_api.mojo` — bounded video artifact contract ✅
 Owns `/v1/video` readiness JSON, bounded LTX2 runner result manifests, and
 `/v1/video/probe?path=<mp4>` inspection. Output stays under
-`output/serenity_daemon/<video-id>/`.
+`output/serenity_daemon/<video-id>/`. Successful runner results also surface
+`runner_timings` and flattened `stage_timings` from
+`ltx2_runner_timings.json` so denoise, decode, frame-write, mux, audio VAE, and
+vocoder costs are product evidence instead of log-only hints.
 - `video_readiness_doc(backend_name: String, model_name: String, resident: String) raises -> JSONValue` — status document with candidate video runners and explicit non-parity labels.
 - `probe_video_file(mp4_path: String) raises -> JSONValue` — `ffprobe`-backed MP4/A-V metadata (`width`, `height`, `frame_count`, `duration`, `fps`, codecs, muxing, audio behavior).
 - `ltx2_staged_smoke_video_result(body: JSONValue, video_id: String, backend_name: String, model_name: String, resident: String) raises -> JSONValue` — runs `output/bin/ltx2_video_smoke_runner`, writes `ltx2_video_result.json`, and sets artifact acceptance fields without claiming full video parity.

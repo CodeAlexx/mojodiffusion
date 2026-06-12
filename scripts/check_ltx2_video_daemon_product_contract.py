@@ -320,14 +320,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     mp4_path = ""
     wav_path = ""
     manifest_path = ""
+    runner_timing_path = ""
     probe: dict[str, Any] = {}
+    stage_timings: dict[str, Any] = {}
     if isinstance(result_body, dict):
         mp4_path = str(result_body.get("mp4") or "")
         wav_path = str(result_body.get("wav") or "")
         manifest_path = str(result_body.get("result_path") or "")
+        runner_timing_path = str(result_body.get("runner_timing_path") or "")
         maybe_probe = result_body.get("probe")
         if isinstance(maybe_probe, dict):
             probe = maybe_probe
+        maybe_timings = result_body.get("stage_timings")
+        if isinstance(maybe_timings, dict):
+            stage_timings = maybe_timings
 
     baseline = next((s["gpu_memory_used_mib"] for s in samples if s.get("gpu_memory_used_mib") is not None), None)
     peak_used = max((s["gpu_memory_used_mib"] for s in samples if s.get("gpu_memory_used_mib") is not None), default=None)
@@ -373,6 +379,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             checks.append(ok("audio", "video-only artifact accepted", "MP4 correctly has no audio stream", {"probe": probe}, "No-audio mode must emit a video-only MP4 and record that behavior."))
         else:
             checks.append(fail("audio", "video-only artifact accepted", "noaudio run did not prove video-only muxing", {"probe": probe, "result": result_body}, "No-audio mode must emit a video-only MP4 and record that behavior."))
+
+    required_timing_keys = [
+        "stage1_denoise_seconds",
+        "upscale_seconds",
+        "stage2_denoise_seconds",
+        "video_decode_seconds",
+        "frame_png_write_seconds",
+        "total_runner_seconds",
+    ]
+    if args.audio_mode == "audio":
+        required_timing_keys.extend(
+            [
+                "audio_vae_seconds",
+                "vocoder_seconds",
+                "wav_write_seconds",
+                "audio_mux_seconds",
+            ]
+        )
+    else:
+        required_timing_keys.append("video_mux_seconds")
+    missing_timing = [key for key in required_timing_keys if key not in stage_timings]
+    nonpositive_timing: list[str] = []
+    for key in required_timing_keys:
+        if key not in stage_timings:
+            continue
+        try:
+            if float(stage_timings[key]) <= 0.0:
+                nonpositive_timing.append(key)
+        except Exception:
+            nonpositive_timing.append(key)
+    stage_timings_ok = not missing_timing and not nonpositive_timing
+    if stage_timings_ok:
+        checks.append(ok("timing", "runner stage timings accepted", "Mojo runner emitted positive stage timings", {"runner_timing_path": runner_timing_path, "stage_timings": stage_timings}, "Video artifacts must carry stage timings for denoise, decode, frame write, mux, and audio stages when audio is enabled."))
+    else:
+        checks.append(fail("timing", "runner stage timings accepted", "missing or non-positive runner stage timings", {"runner_timing_path": runner_timing_path, "missing": missing_timing, "nonpositive": nonpositive_timing, "stage_timings": stage_timings, "result": result_body}, "Video artifacts must carry stage timings for denoise, decode, frame write, mux, and audio stages when audio is enabled."))
     result_ready = (
         result_status == 200
         and isinstance(result_body, dict)
@@ -380,6 +421,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and mp4_ok
         and probe_ok
         and audio_mode_ok
+        and stage_timings_ok
         and peak_delta is not None
         and peak_delta > 0
     )
@@ -400,6 +442,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "product_wiring_ready": runner_started and bool(video_id),
         "claims_video_artifact_gate": result_ready,
         "claims_av_artifact_gate": result_ready and args.audio_mode == "audio",
+        "claims_stage_timing_gate": stage_timings_ok,
         "claims_video_parity": claims_video_parity,
         "known_scope": "daemon-backed LTX2 staged dev smoke; Python samples external VRAM only",
         "summary": {
@@ -420,6 +463,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "video_dir": str(video_dir) if video_dir else "",
             "runner_log": str(log_path) if log_path else "",
             "result_path": manifest_path,
+            "runner_timing_path": runner_timing_path,
             "mp4": mp4_path,
             "wav": wav_path,
             "http_status": result_status,
@@ -446,6 +490,7 @@ def print_report(report: dict[str, Any]) -> None:
     print("[ltx2-video] product wiring: " + ("READY" if report["product_wiring_ready"] else "BLOCKED"))
     print("[ltx2-video] MP4 artifact gate: " + ("READY" if report["claims_video_artifact_gate"] else "BLOCKED"))
     print("[ltx2-video] A/V artifact gate: " + ("READY" if report["claims_av_artifact_gate"] else "BLOCKED"))
+    print("[ltx2-video] stage timing gate: " + ("READY" if report["claims_stage_timing_gate"] else "BLOCKED"))
     print("[ltx2-video] full video parity: " + ("READY" if report["claims_video_parity"] else "BLOCKED"))
 
 

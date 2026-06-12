@@ -42,6 +42,11 @@ surface. Multi-image batch semantics, generic UniPC/order variants, ancestral/
 SDE/Karras execution, refiner/upscale/ControlNet, and arbitrary Comfy graph
 execution are still blockers.
 
+2026-06-12 endpoint refresh: `output/checks/samplers_endpoint_smoke.json` now
+matches the compiled `/v1/samplers` registry for Z-Image `dpmpp_2m` and
+`uni_pc_bh2` support. This is endpoint/admission evidence only; it does not
+change `accepted_sampler_parity:false`.
+
 `accepted_sampler_parity` must remain false until a real backend dispatch path
 proves the requested sampler, scheduler, seed, variation, image count, denoise,
 CFG, negative prompt, and output metadata behavior with artifacts and runtime
@@ -118,14 +123,16 @@ manifests.
 ## Minimum Acceptance Sequence
 
 1. Keep the `/v1/samplers` support matrix current per backend.
-2. Execute every accepted sampler/scheduler as the requested algorithm, or
+2. Implement exact Comfy `uni_pc` semantics separately from `uni_pc_bh2`; do
+   not alias generic `uni_pc` to bh2 until artifact evidence passes.
+3. Execute every accepted sampler/scheduler as the requested algorithm, or
    reject it before expensive model work.
-3. Thread executed sampler/scheduler, variation, image index/count, and denoise
+4. Thread executed sampler/scheduler, variation, image index/count, and denoise
    semantics into backend manifests and PNG metadata.
-4. Keep the multi-output `images > 1` daemon path covered by runtime artifact
+5. Keep the multi-output `images > 1` daemon path covered by runtime artifact
    gates and add a separate batched-latent path only if the UI exposes Comfy
    batch-size semantics.
-5. Add runtime artifact gates per backend that verify dimensions, metadata,
+6. Add runtime artifact gates per backend that verify dimensions, metadata,
    timings, VRAM, readiness label, and acceptance booleans.
-6. Only then flip `accepted_sampler_parity` for the specific model/sampler pair
+7. Only then flip `accepted_sampler_parity` for the specific model/sampler pair
    that has evidence.

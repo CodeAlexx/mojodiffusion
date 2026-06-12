@@ -10,14 +10,16 @@ is the execution order.
 
 - Product generation paths must be Mojo-native. Python is allowed for dev
   tooling, artifact inspection, parity oracles, and audits only.
+- The canonical artifact root for this repo is repo-root `output/`; daemon
+  image/video artifacts live under `output/serenity_daemon/`.
 - Do not call a smoke test production.
 - Do not run full Qwen generation until bounded memory evidence says it is safe.
   Qwen remains too large/slow/OOM-prone; bounded op/static gates are acceptable.
 - Full video parity is not accepted from smoke artifacts alone. The daemon has
   bounded LTX2 staged smoke runners and MP4 probe evidence, including an
-  audio-enabled A/V artifact, but production parity remains quarantined until a
-  non-smoke/HQ runtime claim has stage timings, quality scope, model/sampler
-  evidence, and VRAM measurements.
+  audio-enabled A/V artifact and structured runner stage timings, but
+  production parity remains quarantined until a non-smoke/HQ runtime claim has
+  quality scope, model/sampler evidence, and VRAM measurements.
 - Product image/video denoise paths are not accepted for speed parity while
   they call the old math/tiled SDPA path directly. A backend must route product
   attention through cuDNN flash or a proven model-specific fast kernel, then
@@ -34,11 +36,12 @@ python3 scripts/check_swarmui_product_path_contract.py --write-readiness output/
 ```
 
 Current result after adding variation noise runtime behavior, the
-sampler/scheduler registry, the bounded LTX2 video smoke runner, the
+sampler/scheduler registry, the bounded LTX2 video smoke runner, LTX2 runner
+stage timing manifests, the
 model/gallery API slice, bounded Z-Image UniPC bh2, Z-Image multi-LoRA runtime
 stacking, typed linked workflow execution for the supported t2i graph, the
 runtime UI/gallery/reuse/state contract, and the extracted video API module:
-`70` checks, `70` passed, `P0=0`, `P1=0`, `P2=0`. Product P0 and tracked P1
+`71` checks, `71` passed, `P0=0`, `P1=0`, `P2=0`. Product P0 and tracked P1
 gates are ready. Full SwarmUI all-level parity is still blocked.
 
 Current high-risk runtime gaps:
@@ -51,14 +54,20 @@ Current high-risk runtime gaps:
   artifact gate:
   `output/serenity_daemon/video-0072/ltx2_t2v_stage2_dev_smoke.mp4`, `768x512`,
   `121` frames, `5.041667s`, `24fps`, H.264, `muxing=probe_ok`,
-  `audio_behavior=video_only_no_audio_stream`, `total_wall_seconds=191.062552498`,
-  and external peak VRAM delta `9853 MiB`. Current evidence also proves the
+  `audio_behavior=video_only_no_audio_stream`, `total_wall_seconds=202.353546797`,
+  stage timing gate, and external peak VRAM delta `9851 MiB`. Current evidence
+  also proves the
   audio-enabled A/V artifact gate:
   `output/serenity_daemon/video-0072/ltx2_t2v_av_stage2_dev_smoke.mp4` plus
   `output/serenity_daemon/video-0072/dev_audio.wav`, `stream_count=2`,
   `audio_codec=aac`, `audio_duration=5.034`,
-  `audio_behavior=audio_stream_present`, `total_wall_seconds=197.113701579`,
-  and external peak VRAM delta `9907 MiB`. Full video parity remains blocked
+  `audio_behavior=audio_stream_present`, `total_wall_seconds=202.223939339`,
+  runner `total_runner_seconds=201.75603515000148`, and external peak VRAM
+  delta `9880 MiB`. The runner now emits `ltx2_runner_timings.json` and the
+  daemon result surfaces `stage_timings`;
+  the measured A/V bottlenecks are `stage2_denoise_seconds=89.73880778400053`,
+  `stage1_denoise_seconds=70.47008886299955`, and
+  `video_decode_seconds=24.576268509999863`. Full video parity remains blocked
   because `accepted_video_parity:false` and the runner labels the output
   `DEV SMOKE ONLY`.
 - Ideogram4 is requested as an image backend target. Its current resident DiT
@@ -236,7 +245,7 @@ Important finding:
 | Klein | Best memory/offload mechanics target. Uses `ScratchRingAllocator` and `TurboPlannedLoader`; product smokes exist in docs. Heavy. | Use after Z-Image product artifact, or if the slice is explicitly memory/offload measurement. |
 | SDXL / SD3 / Flux / Chroma / ERNIE | Useful image candidates, but several are cached-input, staged, or contract smokes rather than full SwarmUI product paths. | Promote only after Z-Image product loop proves the daemon/gallery/runtime pattern. |
 | Qwen | Too large/slow/OOM-prone for full generation in this slice. Static masked-SDPA blocker is fixed with `sdpa_qwen_keymask`; tiny op parity passes, but no full Qwen artifact was run. | Keep Qwen on bounded gates only until memory/offload evidence says a real daemon run is safe. |
-| Video / LTX2 / NAVA / Wan | Accepted only as bounded LTX2 artifact wiring, not full video parity. Daemon `/v1/video` emits bounded 121-frame 768x512 MP4s with probe/timing/VRAM evidence in both `noaudio` and `audio` modes; the audio run proves AAC stream + WAV. LTX2 product attention, latent upsampling, video VAE decode, and audio VAE decode use cuDNN fast paths. The video route implementation is now split into `serve/video_api.mojo` instead of living inside the daemon monolith. Full video parity is not accepted because this is still DEV-smoke quality. | Add stage timing fields, then promote beyond DEV smoke only with HQ/runtime/model/sampler evidence. |
+| Video / LTX2 / NAVA / Wan | Accepted only as bounded LTX2 artifact wiring, not full video parity. Daemon `/v1/video` emits bounded 121-frame 768x512 MP4s with probe/timing/VRAM evidence in both `noaudio` and `audio` modes; the audio run proves AAC stream + WAV. LTX2 product attention, latent upsampling, video VAE decode, and audio VAE decode use cuDNN fast paths. The video route implementation is now split into `serve/video_api.mojo` instead of living inside the daemon monolith. Full video parity is not accepted because this is still DEV-smoke quality. | Use the stage timing manifest to target the measured denoise bottleneck first, then promote beyond DEV smoke only with HQ/runtime/model/sampler evidence. |
 
 ## Milestones
 
@@ -481,15 +490,23 @@ evidence. They are still not full HQ/video parity claims.
 
 Next implementation slice:
 
-1. Add stage timing fields around video decode, frame PNG write, mux, audio VAE,
-   vocoder, and audio mux so future runs identify the next slow boundary without
-   relying on log-tail inference.
+1. Use the accepted LTX2 stage timing manifest to attack the measured slow
+   boundary first. Current A/V timing shows stage-2 denoise around `89.74s`,
+   stage-1 denoise around `70.47s`, and video decode around `24.58s`; profile
+   the DiT denoise path and replace the first proven slow boundary before
+   widening the video claim. The concrete LTX2 order is: stop forcing
+   `staged lora stream` for the product smoke where a faster resident path is
+   viable, lift the MVP raw resident-FP8 block pattern into staged/refhq, remove
+   hot linear/FP8 GEMM synchronizations, and only then compare deeper CUTLASS or
+   cuBLASLt FP8 kernels.
 2. Add the Ideogram4 image backend only after replacing its direct
-   `sdpa_nomask` resident DiT attention with a fast SDPA path and proving a
-   daemon artifact with metadata, timings, and VRAM.
-3. Promote the next sampler only with artifact/timing/VRAM evidence. Do not
-   promote generic `uni_pc` by aliasing it to bh2; map its exact Comfy/Swarm
-   semantics first.
+   `sdpa_nomask[1,S,18,256]` resident DiT attention with a proven fast SDPA
+   path for real Ideogram shapes (`S=NIMG` and `S=NT+NIMG`, Dh=256), then prove
+   a daemon artifact with metadata, timings, and VRAM. Standalone Ideogram4
+   parity is not enough; there is no accepted `Ideogram4Backend` yet.
+3. Refresh `/v1/samplers` smoke evidence, then promote the next sampler only
+   with artifact/timing/VRAM evidence. Do not promote generic `uni_pc` by
+   aliasing it to bh2; map its exact Comfy/Swarm semantics first.
 4. Measure the current Z-Image product bottleneck by stage with the daemon gate
    as the control artifact, then replace the measured slow path first.
 5. Keep Qwen on bounded op/static gates until memory/offload evidence says full

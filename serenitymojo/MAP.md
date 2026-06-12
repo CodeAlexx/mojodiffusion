@@ -80,7 +80,7 @@ file is "where does X live". First target: Z-Image text→image.
 | `models/text_encoder/qwen25vl_encoder.mojo` | `Qwen25VLEncoder` + `Qwen25VLConfig` (Qwen-Image text encoder). | ✅ base 512 runtime smoke / parity pending |
 | `models/text_encoder/ideogram_qwen3vl.mojo` | `load_ideogram_qwen3vl` / `encode_ideogram_taps`: Ideogram-4 Qwen3-VL text path (reuses `Qwen3Encoder`; θ=5e6, fp8 load, 13-tap concat → [1,L,53248]). | ✅ 13-tap cos 0.99998625 |
 | `serve/serenity_daemon.mojo` | localhost SerenityUI HTTP/WebSocket daemon: `/v1/generate`, jobs/progress, gallery, model browser, sampler registry, workflow, presets/state, and route dispatch for `/v1/video`. | ✅ product gates |
-| `serve/video_api.mojo` | `/v1/video` readiness/result/probe contract implementation: bounded LTX2 MP4/A-V runner wrapper, `ffprobe` metadata, artifact acceptance fields, and output manifests under `output/serenity_daemon/<video-id>/`. | ✅ bounded artifact gate |
+| `serve/video_api.mojo` | `/v1/video` readiness/result/probe contract implementation: bounded LTX2 MP4/A-V runner wrapper, `ffprobe` metadata, artifact acceptance fields, runner stage timings, and output manifests under `output/serenity_daemon/<video-id>/`. | ✅ bounded artifact gate |
 | `models/vae/zimage_decoder.mojo` | `ZImageDecoder[LH,LW]`: Z-Image AutoencoderKL decoder config. | ✅ cos 0.99998 |
 | `models/vae/klein_decoder.mojo` | `KleinVaeDecoder[LH,LW]`: FLUX.2/Klein VAE decode from packed `[1,128,LH,LW]`. | ✅ 1024 smoke |
 | `models/vae/ldm_decoder.mojo` | `LdmVaeDecoder[LH,LW,LATENT_CH]`: generic LDM AutoencoderKL decoder; factories `load_sdxl/sd15/flux1/sd3_embedded_ldm_decoder` + `load_ideogram4_vae_decoder` (AutoencoderKLFlux2, latent_ch 32, scale 1/shift 0, has_pqc). | ✅ Flux2 decode cos 0.99995 |

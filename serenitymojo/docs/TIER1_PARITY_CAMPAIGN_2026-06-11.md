@@ -11,6 +11,17 @@ the ORCHESTRATOR re-runs every gate itself (agent self-reports are never
 the gate). Reference trainer for first wiring: zimage (tightest anchors),
 then klein/hidream/ideogram4.
 
+**MODULARITY DIRECTIVE (Alex):** one shared runtime-config module
+(training/levers.mojo), each trainer wires ONE call — no per-trainer
+comptime forks.
+
+**UI WIRING DIRECTIVE (Alex):** every phase ships END-TO-END to
+serenity-trainer: (a) shared module + TrainConfig keys in serenitymojo,
+(b) trainer call sites, (c) serenity-trainer TrainerConfigModel keys ->
+trainer_ui_runner_train_config_json emission, (d) a UI-config-launched
+smoke proving the lever flips from the UI. A phase without (c)+(d) is
+NOT done.
+
 ## Phases
 
 T1.A — **Loss functions + min-SNR weighting**

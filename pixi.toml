@@ -11,7 +11,7 @@ version = "0.1.0"
 # CUDA driver API (the consumer's GPU offload, not the libs).
 # libserenity_cudnn_sdpa: Z-Image and LTX2 product fast SDPA shim.
 build-daemon = "mkdir -p output/bin && mojo build -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_daemon.mojo -o output/bin/serenity_daemon"
-build-video-smoke = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/pipeline/ltx2_t2v_av_hq.mojo -o output/bin/ltx2_video_smoke_runner"
+build-video-smoke = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -Lserenitymojo/ops/cshim/lib/cudnn_stubs -Xlinker -lcudnn -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib serenitymojo/pipeline/ltx2_t2v_av_hq.mojo -o output/bin/ltx2_video_smoke_runner"
 
 [dependencies]
 max = ">=26.3.0,<27"

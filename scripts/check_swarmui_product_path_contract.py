@@ -52,7 +52,9 @@ LTX2_DIT = REPO / "serenitymojo/models/dit/ltx2_dit.mojo"
 ATTENTION = REPO / "serenitymojo/ops/attention.mojo"
 ATTENTION_FLASH = REPO / "serenitymojo/ops/attention_flash.mojo"
 LTX2_HQ = REPO / "serenitymojo/pipeline/ltx2_t2v_av_hq.mojo"
+LTX2_UPSAMPLER = REPO / "serenitymojo/models/upsampler/ltx2_upsampler.mojo"
 PIXI = REPO / "pixi.toml"
+LTX2_RUN_SCRIPT = REPO / "scripts/run_ltx2_hq121.sh"
 TODO_DOC = REPO / "TODO.md"
 HANDOFF_DOC = REPO / "serenitymojo/docs/HANDOFF_2026-06-12.md"
 SAMPLER_HARNESS_DOC = REPO / "serenitymojo/docs/SAMPLER_PRODUCT_HARNESS_2026-06-05.md"
@@ -890,10 +892,54 @@ def check_video_path() -> list[Check]:
         check_contains(
             PIXI,
             category="video-fast-path",
-            label="video runner links cuDNN SDPA shim",
-            needles=["build-video-smoke", "-lserenity_cudnn_sdpa"],
+            label="video runner links cuDNN SDPA and conv runtimes",
+            needles=[
+                "build-video-smoke",
+                "-lserenity_cudnn_sdpa",
+                "cudnn_stubs",
+                "-lcudnn",
+                "/home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib",
+            ],
             severity=P0,
-            acceptance="The standalone LTX2 runner links the same cuDNN SDPA shim as the daemon.",
+            acceptance="The standalone LTX2 runner links the cuDNN SDPA shim and direct cuDNN runtime used by the upsampler/VAE conv path.",
+        ),
+        check_contains(
+            LTX2_RUN_SCRIPT,
+            category="video-fast-path",
+            label="manual LTX2 runner uses existing cuDNN runtime",
+            needles=[
+                "LTX2_CUDNN_LIB:=/home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib",
+                "-lserenity_cudnn_sdpa",
+                "cudnn_stubs",
+                "-lcudnn",
+            ],
+            severity=P0,
+            acceptance="The manual LTX2 run script uses an existing cuDNN runtime path and links the same fast conv/SDPA dependencies as the product build.",
+        ),
+        check_contains(
+            LTX2_UPSAMPLER,
+            category="video-fast-path",
+            label="LTX2 latent upsampler uses cuDNN FCQRS conv",
+            needles=[
+                "conv3d_fcqrs_cudnn",
+                "def _ld_conv3d_fcqrs",
+                "def _ld_conv2d_fcqrs",
+            ],
+            severity=P0,
+            acceptance="The LTX2 latent upsampler keeps checkpoint FCQRS/OIDHW weights on device and dispatches through cuDNN conv instead of the old naive conv path.",
+        ),
+        check_absent(
+            LTX2_UPSAMPLER,
+            category="video-fast-path",
+            label="LTX2 latent upsampler avoids host transpose slow path",
+            needles=[
+                "to_host(ctx)",
+                "_ld_conv3d_qrscf",
+                "_ld_conv2d_rscf",
+                "from serenitymojo.models.vae.conv3d import conv3d\n",
+            ],
+            severity=P0,
+            acceptance="The LTX2 latent upsampler no longer downloads conv weights to the host for QRSCF/RSCF transposes or calls the old naive conv wrapper.",
         ),
         check_contains(
             LTX2_VIDEO_DAEMON_CHECK,

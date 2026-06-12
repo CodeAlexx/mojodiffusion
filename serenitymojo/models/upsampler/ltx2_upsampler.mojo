@@ -44,9 +44,9 @@
 # whole (cpg, D, H, W) slab; feeding group_norm a [N, D*H*W, 1, C] NHWC view
 # reduces over exactly (D*H*W, cpg) — identical statistic (verified vs torch).
 #
-# Weights load as BF16 (BF16 on disk) and are transposed at load time:
-#   Conv3d  [Cout,Cin,Q,R,S] -> QRSCF [Q,R,S,Cin,Cout]
-#   Conv2d  [Cout,Cin,R,S]   -> RSCF  [R,S,Cin,Cout]
+# Weights load as BF16 (BF16 on disk) in checkpoint FCQRS/OIDHW layout:
+#   Conv3d  [Cout,Cin,Q,R,S]
+#   Conv2d  [Cout,Cin,R,S] -> zero-copy [Cout,Cin,1,R,S]
 #
 # GroupNorm eps = 1e-5 (torch nn.GroupNorm default).  Kernels accumulate in F32
 # and store back to the input dtype.
@@ -61,7 +61,7 @@ from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
-from serenitymojo.models.vae.conv3d import conv3d
+from serenitymojo.models.vae.conv3d import conv3d_fcqrs_cudnn
 from serenitymojo.ops.norm import group_norm
 from serenitymojo.ops.activations import silu
 
@@ -73,66 +73,40 @@ comptime _GN_EPS = Float32(1e-5)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Weight-load helpers (BF16 on disk -> BF16 device tensors, transposed to NDHWC).
+# Weight-load helpers (BF16 on disk -> BF16 device tensors).
 # ════════════════════════════════════════════════════════════════════════════
 def _ld(st: ShardedSafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
     var tv = st.tensor_view(name)
     return Tensor.from_view_as_bf16(tv, ctx)
 
 
-def _ld_conv3d_qrscf(
+def _ld_conv3d_fcqrs(
     st: ShardedSafeTensors, name: String, ctx: DeviceContext
 ) raises -> Tensor:
-    """PyTorch Conv3d weight [Cout,Cin,Q,R,S] -> QRSCF [Q,R,S,Cin,Cout]."""
+    """PyTorch Conv3d weight [Cout,Cin,Q,R,S] for the cuDNN FCQRS path."""
     var w = _ld(st, name, ctx)
     var sh = w.shape()
     if len(sh) != 5:
         raise Error(String("conv3d weight ") + name + " not rank-5")
-    var cout = sh[0]; var cin = sh[1]; var q = sh[2]; var r = sh[3]; var s = sh[4]
-    var host = w.to_host(ctx)
-    var n = q * r * s * cin * cout
-    var dst = List[Float32]()
-    for _ in range(n):
-        dst.append(0.0)
-    for o in range(cout):
-        for ci in range(cin):
-            for kq in range(q):
-                for kr in range(r):
-                    for ks in range(s):
-                        var src = ((((o * cin + ci) * q + kq) * r + kr) * s + ks)
-                        var d = ((((kq * r + kr) * s + ks) * cin + ci) * cout + o)
-                        dst[d] = host[src]
-    var os = List[Int]()
-    os.append(q); os.append(r); os.append(s); os.append(cin); os.append(cout)
-    return Tensor.from_host(dst, os^, w.dtype(), ctx)
+    return w^
 
 
-def _ld_conv2d_rscf(
+def _ld_conv2d_fcqrs(
     st: ShardedSafeTensors, name: String, ctx: DeviceContext
 ) raises -> Tensor:
-    """PyTorch Conv2d weight [Cout,Cin,R,S] -> QRSCF [1,R,S,Cin,Cout] (Q=1).
-    We run the per-frame spatial conv as a depth-1 conv3d (Q=1, stride_d=1,
-    pad_d=0), so the spatial path stays in the same conv3d/NDHWC machinery."""
+    """PyTorch Conv2d weight [Cout,Cin,R,S] -> FCQRS [Cout,Cin,1,R,S].
+
+    The depth dimension is a size-1 view inserted before R/S, so this does not
+    move bytes or transpose on the host.
+    """
     var w = _ld(st, name, ctx)
     var sh = w.shape()
     if len(sh) != 4:
         raise Error(String("conv2d weight ") + name + " not rank-4")
     var cout = sh[0]; var cin = sh[1]; var r = sh[2]; var s = sh[3]
-    var host = w.to_host(ctx)
-    var n = r * s * cin * cout
-    var dst = List[Float32]()
-    for _ in range(n):
-        dst.append(0.0)
-    for o in range(cout):
-        for ci in range(cin):
-            for kr in range(r):
-                for ks in range(s):
-                    var src = (((o * cin + ci) * r + kr) * s + ks)
-                    var d = (((kr * s + ks) * cin + ci) * cout + o)
-                    dst[d] = host[src]
     var os = List[Int]()
-    os.append(1); os.append(r); os.append(s); os.append(cin); os.append(cout)
-    return Tensor.from_host(dst, os^, w.dtype(), ctx)
+    os.append(cout); os.append(cin); os.append(1); os.append(r); os.append(s)
+    return Tensor(w.buf.copy(), os^, w.dtype())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -402,12 +376,16 @@ def _drop_first_frame(x: Tensor, ctx: DeviceContext) raises -> Tensor:
 # Conv3d (k3, pad1, stride1) convenience for NDHWC tensors.
 # ════════════════════════════════════════════════════════════════════════════
 def _conv3d_k3(x: Tensor, w: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
-    return conv3d(x, w, Optional[Tensor](_clone(b, ctx)), 1, 1, 1, 1, 1, 1, ctx)
+    return conv3d_fcqrs_cudnn(
+        x, w, Optional[Tensor](_clone(b, ctx)), 1, 1, 1, 1, 1, 1, ctx
+    )
 
 
 # Per-frame Conv2d as depth-1 conv3d (Q=1, stride_d=1, pad_d=0), spatial k3/pad1.
 def _conv2d_perframe(x: Tensor, w: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
-    return conv3d(x, w, Optional[Tensor](_clone(b, ctx)), 1, 1, 1, 0, 1, 1, ctx)
+    return conv3d_fcqrs_cudnn(
+        x, w, Optional[Tensor](_clone(b, ctx)), 1, 1, 1, 0, 1, 1, ctx
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -424,11 +402,11 @@ struct ResBlock(Movable):
     var norm2_b: Tensor
 
     def __init__(out self, st: ShardedSafeTensors, prefix: String, ctx: DeviceContext) raises:
-        self.conv1_w = _ld_conv3d_qrscf(st, prefix + ".conv1.weight", ctx)
+        self.conv1_w = _ld_conv3d_fcqrs(st, prefix + ".conv1.weight", ctx)
         self.conv1_b = _ld(st, prefix + ".conv1.bias", ctx)
         self.norm1_w = _ld(st, prefix + ".norm1.weight", ctx)
         self.norm1_b = _ld(st, prefix + ".norm1.bias", ctx)
-        self.conv2_w = _ld_conv3d_qrscf(st, prefix + ".conv2.weight", ctx)
+        self.conv2_w = _ld_conv3d_fcqrs(st, prefix + ".conv2.weight", ctx)
         self.conv2_b = _ld(st, prefix + ".conv2.bias", ctx)
         self.norm2_w = _ld(st, prefix + ".norm2.weight", ctx)
         self.norm2_b = _ld(st, prefix + ".norm2.bias", ctx)
@@ -469,7 +447,7 @@ struct LatentUpsampler(Movable):
 
     def __init__(out self, st: ShardedSafeTensors, is_temporal: Bool, ctx: DeviceContext) raises:
         self.is_temporal = is_temporal
-        self.initial_conv_w = _ld_conv3d_qrscf(st, "initial_conv.weight", ctx)
+        self.initial_conv_w = _ld_conv3d_fcqrs(st, "initial_conv.weight", ctx)
         self.initial_conv_b = _ld(st, "initial_conv.bias", ctx)
         self.initial_norm_w = _ld(st, "initial_norm.weight", ctx)
         self.initial_norm_b = _ld(st, "initial_norm.bias", ctx)
@@ -478,16 +456,16 @@ struct LatentUpsampler(Movable):
         self.res2 = ResBlock(st, "res_blocks.2", ctx)
         self.res3 = ResBlock(st, "res_blocks.3", ctx)
         if is_temporal:
-            self.up_conv_w = _ld_conv3d_qrscf(st, "upsampler.0.weight", ctx)
+            self.up_conv_w = _ld_conv3d_fcqrs(st, "upsampler.0.weight", ctx)
             self.up_conv_b = _ld(st, "upsampler.0.bias", ctx)
         else:
-            self.up_conv_w = _ld_conv2d_rscf(st, "upsampler.conv.weight", ctx)
+            self.up_conv_w = _ld_conv2d_fcqrs(st, "upsampler.conv.weight", ctx)
             self.up_conv_b = _ld(st, "upsampler.conv.bias", ctx)
         self.post0 = ResBlock(st, "post_upsample_res_blocks.0", ctx)
         self.post1 = ResBlock(st, "post_upsample_res_blocks.1", ctx)
         self.post2 = ResBlock(st, "post_upsample_res_blocks.2", ctx)
         self.post3 = ResBlock(st, "post_upsample_res_blocks.3", ctx)
-        self.final_conv_w = _ld_conv3d_qrscf(st, "final_conv.weight", ctx)
+        self.final_conv_w = _ld_conv3d_fcqrs(st, "final_conv.weight", ctx)
         self.final_conv_b = _ld(st, "final_conv.bias", ctx)
 
     def forward(self, latent_ndhwc: Tensor, ctx: DeviceContext) raises -> Tensor:

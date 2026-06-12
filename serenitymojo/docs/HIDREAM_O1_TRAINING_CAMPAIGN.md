@@ -43,6 +43,35 @@ DiffSynth-Studio if wiped) — `examples/hidream_o1_image/model_training/`
 - Weights ON DISK: `/home/alex/HiDream-O1-Image-Dev-weights`,
   `/home/alex/HiDream-O1-Image-Full-weights`.
 
+## Status (2026-06-11, end of day — P1+P2 SHIPPED, ~1.0 s/step)
+
+- **P1 SHIPPED + GATED** (commits 88d255d, 400a295, 555c078):
+  `models/dit/hidream_o1_train_block.mojo` (7-slot LoRA block fwd+bwd) +
+  new `sdpa_backward_masked` primitive. Torch-autograd parity ALL PASS
+  (out, d_hidden, 14 adapter grads, cos >= 1-4e-13; gates:
+  models/dit/tests/hidream_o1_block_parity.mojo +
+  ops/tests/sdpa_masked_backward_parity.mojo).
+- **P2 SHIPPED** (c509a40, 77b0831): `training/train_hidream_o1_real.mojo`
+  — recipe above verbatim, recompute-checkpoint backward, fused resident
+  AdamW (zimage kernel), **bf16-RESIDENT weights** (15.2 GB converted
+  once; the 30.4 GB figure is the F32 disk form — resident F32 OOMs).
+  MEASURED speed arc: 98 s/step (P2 scaffolding) -> 106 (fused AdamW
+  alone — loader dominated) -> **~1.0 s/step** (await_block was
+  re-reading + re-converting F32 shards EVERY visit, ~60 GB/step).
+  30-step gate: B|.|1 2048 -> 21,428 monotonic, LoRA saved
+  (DiffSynth-loadable keys). Runner staged:
+  serenity-trainer/target/serenity_hidream_live_trainer.
+- **P3 COLLAPSED into the trainer**: no VAE + spine-embedded tokens means
+  the stage-A images + in-trainer tokenization ARE the data path
+  (caption.<i>.txt raw captions added to the stager).
+- **P4 REMAINING**: "hidream" UI backend target (insertion points in task
+  notes: TrainerRuntimeBridge :20-24/:193/:213/:293 + TrainerConfigModel)
+  + sampler hookup for the step-0-vs-step-N visual learning verdict.
+- Speed levers beyond ~1.0 s if wanted: grads-pack (504 D2H -> 1),
+  per-sample mask/table cache, flash SDPA (S=512 IS 128-aligned but the
+  mask is prefix-causal+padding — needs cuDNN bias support, separate
+  decision), fp8-resident.
+
 ## Phase order (mojo-train-port discipline; gates before advance)
 
 P1 — **Per-block LoRA fwd+bwd** (the Klein single-block pattern: standard

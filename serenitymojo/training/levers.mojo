@@ -518,3 +518,67 @@ def levers_optimizer_train_after_save(cfg: TrainConfig, mut st: LeversOptimizerS
     if cfg.optimizer == TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW and st.initialized:
         var no_params = List[List[Float32]]()
         adamw_schedulefree_train(st.sf_ctl, no_params)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KLEIN ADDITIVE HELPER (Tier-1 fan-out 2026-06-11; bounded addition — the
+# campaign doc's "Lever fan-out" follow-up). Everything ABOVE this banner is
+# the T1.A-T1.F module as landed; ONLY this OT-state resident sync is new.
+#
+# klein's v2 engine keeps its live bf16 LoRA params in TWO OT-semantics
+# LoraAdamWOTDeviceState buffers (dbl + sgl; training/lora_adamw_ot_fused.mojo
+# :395-441) — a DIFFERENT struct from zimage's LoraAdamWPlainDeviceState: it
+# has NO [start,end) window (each state covers its WHOLE adapter list,
+# nseg == 2*len(adapters)), but the SAME flat A-then-B pack layout, and the
+# model's device LoRA views sub-buffer its dev_p (klein_stack_lora.mojo
+# _klein_resident_adapter). After the host levers step on the dbl/sgl host
+# a/b mirrors, this pushes the stepped params back into dev_p — the exact
+# inverse of the resident OT step's P readback
+# (fused_lora_adamw_ot_step_resident's host_p<-dev_p + memcpy-out,
+# lora_adamw_ot_fused.mojo). Correctness over speed: one host_p pack + one
+# H2D + sync per adapter list per step; a fused GPU path can land later
+# behind the same dispatch (same contract as levers_optimizer_sync_resident).
+# ══════════════════════════════════════════════════════════════════════════════
+from serenitymojo.training.lora_adamw_ot_fused import LoraAdamWOTDeviceState
+
+
+def levers_optimizer_sync_resident_ot(
+    mut opt_state: LoraAdamWOTDeviceState,
+    adapters: List[LoraAdapter],
+    ctx: DeviceContext,
+) raises:
+    """OT-state sibling of levers_optimizer_sync_resident: pack the
+    host-stepped bf16 a/b of the WHOLE adapter list into the pinned host_p
+    mirror (A then B per adapter, flat — the lora_adamw_ot_device_state_init
+    layout) and upload ONE H2D into the live dev_p that the device LoRA
+    views sub-buffer."""
+    if 2 * len(adapters) != opt_state.nseg:
+        raise Error(
+            String("levers_optimizer_sync_resident_ot: adapter list len ")
+            + String(len(adapters)) + String(" != state nseg/2, nseg=")
+            + String(opt_state.nseg)
+        )
+    var hp = Int(opt_state.host_p.unsafe_ptr())
+    var off = 0
+    for i in range(len(adapters)):
+        var n_a = opt_state.seg_len[2 * i]
+        var n_b = opt_state.seg_len[2 * i + 1]
+        if len(adapters[i].a) != n_a or len(adapters[i].b) != n_b:
+            raise Error(
+                String("levers_optimizer_sync_resident_ot: adapter len")
+                + String(" mismatch at ") + String(i)
+            )
+        _ = sys_memcpy(
+            BytePtr(unsafe_from_address=hp + off * 2),
+            BytePtr(unsafe_from_address=Int(adapters[i].a.unsafe_ptr())),
+            n_a * 2,
+        )
+        off += n_a
+        _ = sys_memcpy(
+            BytePtr(unsafe_from_address=hp + off * 2),
+            BytePtr(unsafe_from_address=Int(adapters[i].b.unsafe_ptr())),
+            n_b * 2,
+        )
+        off += n_b
+    ctx.enqueue_copy(dst_buf=opt_state.dev_p, src_buf=opt_state.host_p)
+    ctx.synchronize()

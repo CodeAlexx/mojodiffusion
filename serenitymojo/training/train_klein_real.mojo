@@ -90,7 +90,13 @@ from serenitymojo.training.timestep_bias import apply_bias
 from serenitymojo.training.loss_weight import (
     apply_loss_weight, combined_loss_grad_elem,
 )
-from serenitymojo.training.levers import caption_dropout_pick
+from serenitymojo.training.levers import (
+    caption_dropout_pick,
+    levers_loss_active, levers_loss_grad,
+    LeversOptimizerState, levers_optimizer_active, levers_optimizer_validate,
+    levers_optimizer_step_host, levers_optimizer_sync_resident_ot,
+    levers_optimizer_eval_for_save, levers_optimizer_train_after_save,
+)
 from serenitymojo.training.noise_modifiers import apply_noise_modifiers_host
 from serenitymojo.training.ema_schedule import ema_decay_at_step, ema_update_host
 from serenitymojo.training.grad_accum import (
@@ -124,7 +130,7 @@ from serenitymojo.sampling.klein_sampler import klein_sample
 from serenitymojo.offload.plan import build_klein_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.train_config import (
-    TrainConfig,
+    TrainConfig, TRAIN_OPTIMIZER_ADAMW,
 )
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
@@ -275,6 +281,22 @@ def _klein_loss_grad(
 ) raises -> KleinLossGrad:
     if len(pred) != len(target):
         raise Error("Klein loss: predicted/target length mismatch")
+    # ── T1.A levers loss dispatch (default-off; levers.mojo) ─────────────────
+    # PRECEDENCE DECISION (documented): when ANY levers loss lever is set
+    # (cfg.loss_fn != mse OR cfg.min_snr_gamma_flow > 0), the levers path
+    # REPLACES klein's own scheme for the run — klein's combined
+    # mse/mae/huber strengths AND its apply_loss_weight min-snr weighting
+    # (the (SNR+1)-divisor cfg.min_snr_gamma form) are IGNORED; the
+    # SimpleTuner flow form min(SNR,γ)/SNR (cfg.min_snr_gamma_flow) applies
+    # instead. A setup-time warning prints when both are set
+    # (validate_klein_train_config). Levers off (the config default) falls
+    # through to the literal klein block below UNCHANGED — C13: the 1-step
+    # anchors (0.5414x/0.2154x/0.7809x) cannot move.
+    if levers_loss_active(cfg):
+        var lev = levers_loss_grad(pred, target, sigma, cfg)
+        # .copy(): Mojo forbids moving a field out of `lev` here (partial
+        # destruction); levers-path-only host copy, ~N_OUT floats.
+        return KleinLossGrad(lev.loss, lev.d_pred.copy())
     var nout = len(pred)
     var w = apply_loss_weight(
         sigma, cfg.min_snr_gamma, cfg.debiased, True
@@ -551,11 +573,41 @@ def validate_klein_train_config(cfg: TrainConfig) raises:
         raise Error(String("Klein 9B trainer requires timestep_dim=256; parsed ") + String(cfg.timestep_dim))
     if not _close_f32(Float32(cfg.rope_theta), Float32(2000.0)):
         raise Error(String("Klein 9B trainer requires rope_theta=2000; parsed ") + String(cfg.rope_theta))
-    validate_ot_lora_adamw_loop_policy(cfg, String("Klein trainer"))
-    validate_ot_train_math_policy(cfg, String("Klein trainer"))
+    # T1 lever fan-out: klein wires the levers optimizer dispatch
+    # (training/levers.mojo T1.C), so the supported non-AdamW optimizers
+    # (ADAFACTOR / SCHEDULE_FREE_ADAMW) must pass the shared ADAMW-only
+    # loop-policy checks: levers_optimizer_validate re-asserts the supported
+    # set, then the shared policies run on a tag-neutralized copy (zimage
+    # precedent, train_zimage_real.mojo validate). Default optimizer=ADAMW
+    # keeps policy_cfg == cfg — checks byte-identical to before (C13).
+    levers_optimizer_validate(cfg, String("Klein trainer"))
+    var policy_cfg = cfg.copy()
+    if levers_optimizer_active(cfg):
+        policy_cfg.optimizer = TRAIN_OPTIMIZER_ADAMW
+    validate_ot_lora_adamw_loop_policy(policy_cfg, String("Klein trainer"))
+    validate_ot_train_math_policy(policy_cfg, String("Klein trainer"))
     validate_ot_gradient_checkpointing_policy(
         cfg, String("Klein trainer"), OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED
     )
+    # T1.A loss-lever precedence warning (decision: LEVERS WIN — see
+    # _klein_loss_grad): if a run sets BOTH klein's own combined-loss /
+    # min-snr keys AND a levers loss key, say so loudly once at setup.
+    if levers_loss_active(cfg):
+        var klein_loss_keys_set = (
+            cfg.loss_mae_strength != Float32(0.0)
+            or cfg.loss_huber_strength != Float32(0.0)
+            or cfg.loss_mse_strength != Float32(1.0)
+            or cfg.min_snr_gamma >= Float32(0.0)
+            or cfg.debiased
+        )
+        if klein_loss_keys_set:
+            print(
+                "[Klein-lora] WARNING: levers loss keys (loss_fn/",
+                "min_snr_gamma_flow) are set — they REPLACE klein's",
+                " combined mse/mae/huber strengths, min_snr_gamma",
+                " ((SNR+1) divisor) and debiased for this run; those",
+                " keys are IGNORED.",
+            )
 
 
 def klein_cache_dir_from_train_config(cfg: TrainConfig) -> String:
@@ -930,6 +982,14 @@ def main() raises:
     var resident_lora_dev = klein_lora_set_to_device_resident(
         lora, dbl_state, sgl_state, ctx,
     )
+
+    # ── T1.C levers optimizer state (default-off => lazily empty, no alloc) ──
+    # One LeversOptimizerState per adapter list, mirroring klein's dbl/sgl
+    # OT-state split; each covers its WHOLE list ([0, len)). NOTE: levers
+    # optimizer state has no save/resume sidecar — resuming a levers-optimizer
+    # run fails loud at the first step (levers.mojo RESUME contract).
+    var lev_opt_dbl = LeversOptimizerState()
+    var lev_opt_sgl = LeversOptimizerState()
 
     # ── EMA shadow params (Wave 2B item 2i; default-off => NO allocation) ─────
     # Shadow copies of every trainable LoRA A/B, host-side (LoRA params are host
@@ -1306,15 +1366,40 @@ def main() raises:
         # lr_warmup_steps=0) returns cfg.lr for every step => baseline unchanged.
         var optimizer_step = ((k - 1) // accum_steps) + 1
         var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
-        comptime if KLEIN_V2_ENGINE:
-            klein_lora_adamw_step_resident(
-                dbl_state, sgl_state, lora, g, optimizer_step, step_lr, ctx,
-                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+        # T1.C optimizer lever (default-off; C13: optimizer=ADAMW routes to the
+        # existing literal fused calls below, untouched). Active path: HOST
+        # adafactor/schedule-free step on the dbl+sgl host a/b mirrors (the
+        # mirrors are fresh — at step 1 they are the built/resumed params, and
+        # afterwards the levers writeback itself is the only writer because
+        # the resident OT kernel does not run on this branch), then — on the
+        # KLEIN_V2_ENGINE resident path — push the stepped params into the
+        # live OT dev_p buffers so the device LoRA sub-buffer views see them
+        # next step (levers_optimizer_sync_resident_ot = the inverse of the
+        # resident step's P readback). On the non-resident path no sync is
+        # needed: the next loop iteration re-uploads the host set via
+        # klein_lora_set_to_device.
+        if levers_optimizer_active(cfg):
+            levers_optimizer_step_host(
+                cfg, lora.dbl, g.dbl_d_a, g.dbl_d_b, optimizer_step,
+                step_lr, 0, len(lora.dbl), lev_opt_dbl,
             )
+            levers_optimizer_step_host(
+                cfg, lora.sgl, g.sgl_d_a, g.sgl_d_b, optimizer_step,
+                step_lr, 0, len(lora.sgl), lev_opt_sgl,
+            )
+            comptime if KLEIN_V2_ENGINE:
+                levers_optimizer_sync_resident_ot(dbl_state, lora.dbl, ctx)
+                levers_optimizer_sync_resident_ot(sgl_state, lora.sgl, ctx)
         else:
-            klein_lora_adamw_step(
-                lora, g, optimizer_step, step_lr, ctx, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay
-            )
+            comptime if KLEIN_V2_ENGINE:
+                klein_lora_adamw_step_resident(
+                    dbl_state, sgl_state, lora, g, optimizer_step, step_lr, ctx,
+                    cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                )
+            else:
+                klein_lora_adamw_step(
+                    lora, g, optimizer_step, step_lr, ctx, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay
+                )
         # ── EMA shadow update post-AdamW (Wave 2B item 2i; default-off skip) ──
         # decay schedule returns 0.0 before update_after_step (skip). Off =>
         # shadows empty => loop body never runs => baseline unchanged.
@@ -1363,14 +1448,24 @@ def main() raises:
         )
         var chunk_final_due = k == run_steps
         if save_due or sample_due or chunk_final_due:
+            # T1.C schedule-free SAVE BRACKET (levers.mojo SAVE CONTRACT):
+            # eval mode for the save + validation sample, train mode after.
+            # No-op for every other optimizer, including the default AdamW.
+            levers_optimizer_eval_for_save(cfg, lev_opt_dbl)
+            levers_optimizer_eval_for_save(cfg, lev_opt_sgl)
             var ckpt = _lora_path_for_step(output_lora_path, k, cfg.max_steps)
             var npairs = save_klein_lora(lora, ckpt, ctx)
             print("[Klein-lora] save step=", k, " path=", ckpt, " pairs=", npairs)
             board.log_text(String("events/save"), k, ckpt)
             var state_path = _state_path_for_lora(ckpt)
             comptime if KLEIN_V2_ENGINE:
-                lora_adamw_ot_device_state_sync_moments(dbl_state, lora.dbl, ctx)
-                lora_adamw_ot_device_state_sync_moments(sgl_state, lora.sgl, ctx)
+                # Levers optimizers never run the resident OT kernel, so the
+                # device M/V are stale init values — skip the pull (the saved
+                # state's AdamW moments are NOT levers state; levers resume
+                # fails loud at the first step by contract).
+                if not levers_optimizer_active(cfg):
+                    lora_adamw_ot_device_state_sync_moments(dbl_state, lora.dbl, ctx)
+                    lora_adamw_ot_device_state_sync_moments(sgl_state, lora.sgl, ctx)
             var nstate = save_klein_lora_state(lora, state_path, ctx)
             print("[Klein-lora] save_state step=", k, " path=", state_path, " pairs=", nstate)
             board.log_text(String("events/save_state"), k, state_path)
@@ -1392,6 +1487,8 @@ def main() raises:
             # not carry AdamW moments, so reloading them mid-run resets optimizer
             # state and hurts convergence. Resume checks belong to the external
             # cadence supervisor or dedicated parity smokes.
+            levers_optimizer_train_after_save(cfg, lev_opt_dbl)
+            levers_optimizer_train_after_save(cfg, lev_opt_sgl)
 
     print("")
     print("DONE: worker reached step", run_steps, "of", cfg.max_steps, "target")

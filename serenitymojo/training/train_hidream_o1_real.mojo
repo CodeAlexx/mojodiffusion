@@ -37,6 +37,38 @@
 # LoRA-B nonzero after N steps.
 #
 # Run: train_hidream_o1_real <stage_dir> <steps> [lr] [rank] [out_dir]
+#                            [ema_decay] [config.json]
+#
+# ── T1 RUNTIME CONFIG + PRECEDENCE (Tier-1 lever wiring, levers.mojo) ────────
+# Optional trailing argv [config.json] parses via io/train_config_reader.mojo
+# read_model_config (no model-dims keys required — missing keys keep
+# TrainConfig defaults). Precedence rules:
+#   * argv WINS for steps / lr / rank / out_dir when explicitly given
+#     (non-"-"); a "-" placeholder defers to the config (max_steps /
+#     learning_rate / lora_rank) when one is present, else to the compiled
+#     defaults (1e-4 / 32). CAVEAT: with a config present, a "-" argv takes
+#     the TrainConfig value even when the JSON omits the key (reader cannot
+#     distinguish absent-from-file from default; TrainConfig lora_rank
+#     default is 16, NOT this trainer's 32 — set lora_rank in the config).
+#   * config WINS for EMA when it enables it ("ema":"CPU"/"EMA"): the full
+#     SimpleTuner schedule (ema_decay cap, ema_min_decay floor,
+#     ema_update_after_step, ema_update_step_interval) replaces the argv
+#     ema_decay. A config WITHOUT ema enabled leaves the argv ema_decay
+#     lever working (every-step, floor 0 — the pre-config behavior).
+#   * config-only levers: caption_dropout_prob (comptime
+#     HIDREAM_CAPTION_DROPOUT stays the no-config fallback), T1.A loss
+#     levers (loss_fn / huber_delta / smooth_l1_beta / min_snr_gamma_flow),
+#     T1.C optimizer levers (optimizer.optimizer ADAFACTOR /
+#     SCHEDULE_FREE_ADAMW + beta1/beta2/eps/weight_decay — the default
+#     fused-AdamW path reads cfg hypers too; TrainConfig defaults equal the
+#     old literals 0.9/0.999/1e-8/0.01, so the no-config path is unchanged).
+#   * the DiffSynth gauss-shift recipe weight wt(t_id) ALWAYS applies to
+#     loss AND grad — it is the MODEL RECIPE, not a lever; the levers loss
+#     path multiplies it on top of levers_loss_grad.
+#   * no LR scheduler in this trainer: step_lr == the constant resolved lr
+#     (adafactor consumes it; schedule-free reads cfg.lr raw — the resolved
+#     lr is written back into cfg.lr so argv precedence holds there too).
+# Template: serenitymojo/configs/hidream_o1.json (all levers default-off).
 
 from std.gpu.host import DeviceContext
 from std.math import sqrt, exp, log as flog, cos as fcos, sin as fsin, pi
@@ -67,7 +99,14 @@ from serenitymojo.models.dit.hidream_o1 import (
 )
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
-from serenitymojo.training.levers import caption_dropout_pick
+from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.levers import (
+    caption_dropout_pick, levers_loss_active, levers_loss_grad,
+    LeversOptimizerState, levers_optimizer_active, levers_optimizer_step,
+    levers_optimizer_validate, levers_optimizer_eval_for_save,
+    levers_optimizer_train_after_save,
+)
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_adamw_plain_fused import (
     LoraAdamWPlainDeviceState,
@@ -105,9 +144,9 @@ comptime NOISE_SCALE = Float32(7.5)
 comptime SHIFT = Float64(3.0)
 comptime EPS = Float32(1.0e-6)
 comptime SEED = UInt64(42)
-# T1.D caption dropout probability. This trainer has no TrainConfig threaded,
-# so the lever is a comptime default-off constant for now.
-# TODO(runtime-config): thread TrainConfig and read cfg.caption_dropout_prob.
+# T1.D caption dropout probability — the NO-CONFIG fallback default. When a
+# [config.json] argv is present, cfg.caption_dropout_prob replaces this (see
+# the runtime-config precedence block in the header).
 comptime HIDREAM_CAPTION_DROPOUT = Float32(0.0)
 comptime MODEL_DIR = "/home/alex/HiDream-O1-Image-Dev-weights"
 comptime TOK_PATH = "/home/alex/HiDream-O1-Image-Dev-weights/tokenizer.json"
@@ -258,22 +297,62 @@ def _adamw_host(
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        raise Error("usage: train_hidream_o1_real <stage_dir> <steps> [lr] [rank] [out_dir] [ema_decay]")
+        raise Error(
+            "usage: train_hidream_o1_real <stage_dir> <steps> [lr] [rank]"
+            " [out_dir] [ema_decay] [config.json]"
+        )
     var stage_dir = String(args[1])
-    var steps = atol(String(args[2]))
+
+    # ── T1 runtime config (optional trailing argv; precedence in header) ─────
+    var train_cfg = TrainConfig.default()
+    var has_config = False
+    if len(args) > 7 and String(args[7]) != "-":
+        train_cfg = read_model_config(String(args[7]))
+        has_config = True
+        print("[config] ", String(args[7]))
+
+    # argv wins for steps/lr/rank/out_dir when non-"-"; "-" defers to config.
+    var steps: Int
+    if String(args[2]) == "-":
+        if not has_config or train_cfg.max_steps <= 0:
+            raise Error(
+                "train_hidream_o1: steps '-' needs a config with max_steps > 0"
+            )
+        steps = train_cfg.max_steps
+    else:
+        steps = atol(String(args[2]))
     var lr = Float32(1.0e-4)
+    if has_config:
+        lr = train_cfg.lr
     if len(args) > 3 and String(args[3]) != "-":
         lr = Float32(atof(String(args[3])))
     var rank = 32
+    if has_config:
+        rank = train_cfg.lora_rank
     if len(args) > 4 and String(args[4]) != "-":
         rank = atol(String(args[4]))
     var out_dir = String("/home/alex/mojodiffusion/output/hidream_o1_lora")
     if len(args) > 5 and String(args[5]) != "-":
         out_dir = String(args[5])
-    # T1.B EMA lever (this trainer has no TrainConfig): decay cap, 0 = off.
+    # T1.B EMA lever, argv form: decay cap, 0 = off (config EMA wins below).
     var ema_decay = Float32(0.0)
     if len(args) > 6 and String(args[6]) != "-":
         ema_decay = Float32(atof(String(args[6])))
+    # Write the EFFECTIVE recipe back into cfg so levers that read cfg
+    # directly see argv-resolved values (schedule-free consumes cfg.lr RAW —
+    # levers.mojo T1.C LR SEMANTICS).
+    train_cfg.lr = lr
+    train_cfg.lora_rank = rank
+    train_cfg.max_steps = steps
+    # T1.D: config replaces the comptime fallback when present.
+    var caption_dropout_p = HIDREAM_CAPTION_DROPOUT
+    if has_config:
+        caption_dropout_p = train_cfg.caption_dropout_prob
+    # T1.C: fail-loud lever validation (unsupported optimizer tags already
+    # failed at config load; this re-asserts for configs built in code).
+    levers_optimizer_validate(train_cfg, String("HiDream-O1 trainer"))
+    if levers_optimizer_active(train_cfg):
+        print("[optimizer] levers dispatch active, tag ", train_cfg.optimizer)
     makedirs(out_dir, exist_ok=True)
 
     var ctx = DeviceContext()
@@ -344,11 +423,32 @@ def main() raises:
     print("[lora] adapters:", LAYERS * 7, " resident params:", opt_state.total)
 
     # T1.B EMA (default-off, training/lora_ema.mojo SimpleTuner semantics):
-    # F32 shadows over the host_ads mirrors, every-step interval.
-    var ema = LoraEmaState(ema_decay, Float32(0.0), 0, 1)
-    if ema_decay > Float32(0.0):
+    # F32 shadows over the host_ads mirrors. Config wins when it enables EMA
+    # (full schedule: cap/floor/after-step/interval); else the argv ema_decay
+    # keeps the pre-config every-step form.
+    var ema_cfg_on = has_config and train_cfg.ema_enabled
+    var ema_on = ema_cfg_on or ema_decay > Float32(0.0)
+    var ema: LoraEmaState
+    if ema_cfg_on:
+        ema = LoraEmaState(
+            train_cfg.ema_decay, train_cfg.ema_min_decay,
+            train_cfg.ema_update_after_step,
+            train_cfg.ema_update_step_interval,
+        )
+    else:
+        ema = LoraEmaState(ema_decay, Float32(0.0), 0, 1)
+    if ema_on:
         _ = lora_ema_track(ema, host_ads, 0, len(host_ads))
-        print("[ema] tracking", len(host_ads), "adapters decay=", ema_decay)
+        print(
+            "[ema] tracking", len(host_ads), "adapters decay=", ema.decay,
+            " min_decay=", ema.min_decay,
+            " update_after_step=", ema.update_after_step,
+            " interval=", ema.update_interval,
+        )
+
+    # T1.C levers optimizer state (lazy; allocates nothing on the default
+    # fused-AdamW path).
+    var lev_opt = LeversOptimizerState()
 
     # ── BF16-RESIDENT blocks (measured fix, 2026-06-11): await_block re-reads
     # + re-converts the F32 shards on EVERY visit (planned_loader.mojo:110 ->
@@ -392,10 +492,11 @@ def main() raises:
         var clean_h = clean.to_host(ctx)
 
         var caption = _read_text(stage_dir + "/caption." + String(idx) + ".txt")
-        # T1.D caption dropout (comptime default-off): when the shared levers
-        # pick fires, train this step on the EMPTY caption ("" through the same
-        # template path = the uncond render).
-        if caption_dropout_pick(UInt64(step), SEED, HIDREAM_CAPTION_DROPOUT):
+        # T1.D caption dropout (default-off; config caption_dropout_prob or
+        # the comptime fallback): when the shared levers pick fires, train
+        # this step on the EMPTY caption ("" through the same template path
+        # = the uncond render).
+        if caption_dropout_pick(UInt64(step), SEED, caption_dropout_p):
             caption = String("")
         # Fit the caption into the S_TEXT bucket: halve the string until the
         # templated ids fit (build_t2i_input raises on overflow — fail-loud
@@ -488,19 +589,37 @@ def main() raises:
         # ── loss + d_out (host F32; x-prediction -> velocity chain) ──────────
         comptime NOUT = IMG_L * PATCH_VEC
         var base = S_TEXT * PATCH_VEC
-        var sse = 0.0
         var d_full = List[Float32]()
         for _ in range(base):
             d_full.append(0.0)
         var inv_sigma = Float32(1.0) / sigma
-        var dcoef = -wt * Float32(2.0) / Float32(NOUT) * inv_sigma
-        for i in range(NOUT):
-            var x_pred = out_h[base + i]
-            var v_pred = (noisy_h[i] - x_pred) * inv_sigma
-            var diff = v_pred - target_h[i]
-            sse += Float64(diff) * Float64(diff)
-            d_full.append(dcoef * diff)
-        var loss = Float32(sse / Float64(NOUT)) * wt
+        var loss: Float32
+        if levers_loss_active(train_cfg):
+            # T1.A loss levers (training/levers.mojo): huber / smooth_l1 /
+            # min-SNR-flow over (v_pred, target). The DiffSynth gauss-shift
+            # recipe weight wt ALWAYS multiplies loss AND grad on top — it is
+            # the MODEL RECIPE, not a lever. The x-prediction chain rule
+            # dv_pred/dx_pred = -1/sigma is unchanged from the legacy block.
+            var v_pred_l = List[Float32]()
+            for i in range(NOUT):
+                v_pred_l.append((noisy_h[i] - out_h[base + i]) * inv_sigma)
+            var lg = levers_loss_grad(v_pred_l, target_h, sigma, train_cfg)
+            loss = lg.loss * wt
+            var dch = -wt * inv_sigma
+            for i in range(NOUT):
+                d_full.append(dch * lg.d_pred[i])
+        else:
+            # Literal legacy block (default path, byte-identical; the levers
+            # default IS this formula but the literal code stays — C13).
+            var sse = 0.0
+            var dcoef = -wt * Float32(2.0) / Float32(NOUT) * inv_sigma
+            for i in range(NOUT):
+                var x_pred = out_h[base + i]
+                var v_pred = (noisy_h[i] - x_pred) * inv_sigma
+                var diff = v_pred - target_h[i]
+                sse += Float64(diff) * Float64(diff)
+                d_full.append(dcoef * diff)
+            loss = Float32(sse / Float64(NOUT)) * wt
         var d_out_t = Tensor.from_host(d_full^, [1, S, PATCH_VEC], STDtype.BF16, ctx)
 
         # final backward (frozen): linear dx + rms dx
@@ -534,13 +653,30 @@ def main() raises:
                 g_a[k] = bg.d_a[sl].value()[].to_host(ctx)
                 g_b[k] = bg.d_b[sl].value()[].to_host(ctx)
             bi -= 1
-        fused_lora_adamw_plain_step_resident(
-            opt_state, host_ads, g_a, g_b, step, lr,
-            Float32(0.9), Float32(0.999), Float32(1.0e-8), Float32(0.01), ctx,
-        )
-        # T1.B EMA: host_ads mirrors are FRESH here (the resident step copies
-        # updated P back, lora_adamw_plain_fused.mojo:483-502).
-        if ema_decay > Float32(0.0):
+        if levers_optimizer_active(train_cfg):
+            # T1.C optimizer lever (default-off): host adafactor /
+            # schedule-free step on the host_ads mirrors + resident dev_p
+            # sync so the device LoRA views (sub-buffers of opt_state.dev_p)
+            # see the new weights next step (levers.mojo T1.C header). No LR
+            # scheduler here: step_lr == the constant resolved lr.
+            levers_optimizer_step(
+                train_cfg, host_ads, g_a, g_b, step, lr,
+                lev_opt, opt_state, ctx,
+            )
+        else:
+            # Default fused resident AdamW. cfg hypers == the old literals
+            # 0.9/0.999/1e-8/0.01 when no config (TrainConfig defaults), so
+            # the no-config path is numerically unchanged; a config's
+            # optimizer.{beta1,beta2,eps,weight_decay} overrides.
+            fused_lora_adamw_plain_step_resident(
+                opt_state, host_ads, g_a, g_b, step, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay, ctx,
+            )
+        # T1.B EMA: host_ads mirrors are FRESH here — both optimizer paths
+        # write updated P back into them (resident: lora_adamw_plain_fused
+        # .mojo:483-502 readback; levers: host step IS the mirror).
+        if ema_on:
             ema_update(ema, host_ads, step)
 
         var t1 = perf_counter_ns()
@@ -562,6 +698,10 @@ def main() raises:
         )
 
     # ── save (DiffSynth-loadable key shape) ──────────────────────────────────
+    # T1.C schedule-free save bracket (levers.mojo SAVE CONTRACT): every
+    # weight save sits between eval_for_save / train_after_save. No-op for
+    # ADAMW / ADAFACTOR.
+    levers_optimizer_eval_for_save(train_cfg, lev_opt)
     var names = List[String]()
     var tensors = List[TArc]()
     for li in range(LAYERS):
@@ -579,7 +719,7 @@ def main() raises:
     var out_path = out_dir + "/hidream_o1_lora_last.safetensors"
     save_safetensors(names, tensors, out_path, ctx)
     print("[save] ", out_path)
-    if ema_decay > Float32(0.0):
+    if ema_on:
         # T1.B: EMA sibling — same DiffSynth key shape over the bf16-rounded
         # shadows (lora_ema.mojo copy_to cast, SimpleTuner ema.py:454).
         var ema_tensors = List[TArc]()
@@ -594,4 +734,5 @@ def main() raises:
         var ema_out = ema_path_for_lora(out_path)
         save_safetensors(names, ema_tensors, ema_out, ctx)
         print("[save] ", ema_out)
+    levers_optimizer_train_after_save(train_cfg, lev_opt)
     print("DONE: hidream-o1 reached step ", steps)

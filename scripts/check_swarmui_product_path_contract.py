@@ -39,6 +39,8 @@ ZIMAGE_DAEMON_PRODUCT_CHECK = REPO / "scripts/check_zimage_daemon_product_contra
 SAMPLER_SURFACE_CHECK = REPO / "scripts/check_swarmui_sampler_surface.py"
 WORKFLOW_NODE_SURFACE_CHECK = REPO / "scripts/check_workflow_node_surface.py"
 MODEL_GALLERY_LORA_SURFACE_CHECK = REPO / "scripts/check_model_gallery_lora_surface.py"
+UI_GALLERY_REUSE_STATE_CHECK = REPO / "scripts/check_ui_gallery_reuse_state_contract.py"
+UI_GALLERY_REUSE_STATE_READINESS = REPO / "output/checks/ui_gallery_reuse_state_readiness.json"
 SAMPLER_REGISTRY = REPO / "serenitymojo/sampling/sampler_registry.mojo"
 VARIATION_NOISE = REPO / "serenitymojo/sampling/variation_noise.mojo"
 ZIMAGE_GENERATE = REPO / "serenitymojo/pipeline/zimage_generate.mojo"
@@ -81,6 +83,16 @@ def read(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def read_json(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def check_contains(
@@ -287,7 +299,7 @@ def check_swarmui_audit_doc() -> list[Check]:
 
 
 def check_specialized_surface_blockers() -> list[Check]:
-    return [
+    checks = [
         check_contains(
             SAMPLER_SURFACE_CHECK,
             category="sampler",
@@ -487,6 +499,20 @@ def check_specialized_surface_blockers() -> list[Check]:
             severity=P1,
             acceptance="Model/gallery/LoRA surface has a static checker and blocker report.",
         ),
+        check_contains(
+            UI_GALLERY_REUSE_STATE_CHECK,
+            category="models-gallery-lora",
+            label="UI/gallery/reuse/state runtime checker exists",
+            needles=[
+                "serenity.ui_gallery_reuse_state_readiness.v1",
+                "product_api_core_ready",
+                "claims_ux_parity",
+                "gallery import",
+                "reuse provenance",
+            ],
+            severity=P1,
+            acceptance="UI/gallery/reuse/state parity has a runtime stub-daemon contract, not endpoint-marker-only proof.",
+        ),
         check_absent(
             MODEL_GALLERY_LORA_MAP_DOC,
             category="models-gallery-lora",
@@ -512,6 +538,54 @@ def check_specialized_surface_blockers() -> list[Check]:
             acceptance="Gallery supports thumbnails, favorite/star, delete/rename, sort/filter, and reuse workflows.",
         ),
     ]
+    report = read_json(UI_GALLERY_REUSE_STATE_READINESS)
+    if not report:
+        checks.append(
+            Check(
+                False,
+                P1,
+                "models-gallery-lora",
+                "UI/gallery/reuse/state runtime report",
+                f"missing report: {rel(UI_GALLERY_REUSE_STATE_READINESS)}",
+                rel(UI_GALLERY_REUSE_STATE_READINESS),
+                "Run scripts/check_ui_gallery_reuse_state_contract.py to prove API behavior and record current P1 blockers.",
+            )
+        )
+    else:
+        summary = report.get("summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        checks.append(
+            Check(
+                report.get("product_api_core_ready") is True,
+                PASS if report.get("product_api_core_ready") is True else P1,
+                "models-gallery-lora",
+                "UI/gallery/reuse/state core runtime",
+                (
+                    "runtime report "
+                    + f"checks={summary.get('checks')} passed={summary.get('passed')} "
+                    + f"p0={summary.get('p0_blockers')} p1={summary.get('p1_blockers')}"
+                ),
+                rel(UI_GALLERY_REUSE_STATE_READINESS),
+                "Stub daemon runtime proves gallery readback, reuse, state, presets, queue mutation, delete, and restart behavior.",
+            )
+        )
+        checks.append(
+            Check(
+                report.get("ready") is True and report.get("claims_ux_parity") is True,
+                PASS if report.get("ready") is True and report.get("claims_ux_parity") is True else P1,
+                "models-gallery-lora",
+                "UI/gallery/reuse/state SwarmUI UX parity",
+                (
+                    "runtime report "
+                    + f"checks={summary.get('checks')} passed={summary.get('passed')} "
+                    + f"p0={summary.get('p0_blockers')} p1={summary.get('p1_blockers')}"
+                ),
+                rel(UI_GALLERY_REUSE_STATE_READINESS),
+                "Full UI/gallery/reuse/state parity includes provenance, indexed import, rename/manual order policy, and restart-safe history.",
+            )
+        )
+    return checks
 
 
 def check_foundation(mojo_libs: Path) -> list[Check]:
@@ -675,10 +749,10 @@ def check_model_gallery_surface() -> list[Check]:
         check_contains(
             DAEMON,
             category="gallery",
-            label="gallery import/read-params endpoint",
+            label="gallery item/read-params endpoint",
             needles=["/v1/gallery", "read_png_text"],
             severity=P1,
-            acceptance="SwarmUI-style gallery can import/read existing PNG params, not only list jobs.",
+            acceptance="SwarmUI-style gallery can list generated items and read params from arbitrary PNG files; indexed import is separately gated.",
         ),
     ]
 

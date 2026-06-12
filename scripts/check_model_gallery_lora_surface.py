@@ -27,6 +27,7 @@ ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
 QWEN_BACKEND = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
 PARITY_DOC = REPO / "serenitymojo/docs/SWARMUI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
 ZIMAGE_MULTI_LORA_READINESS = REPO / "output/checks/zimage_multi_lora_product_readiness.json"
+UI_GALLERY_REUSE_STATE_READINESS = REPO / "output/checks/ui_gallery_reuse_state_readiness.json"
 
 
 @dataclass(frozen=True)
@@ -288,6 +289,71 @@ def zimage_multi_lora_runtime_evidence() -> tuple[bool, list[str], str]:
         "Manifest records lora_count=2, lora_merge_strategy=rank_concat_scaled_b, and two resolved LoRA paths.",
         "PNG IDAT hashes differ for no-LoRA, single-LoRA, and stacked-LoRA outputs.",
     ], ""
+
+
+def ui_gallery_reuse_state_runtime_checks() -> list[SurfaceCheck]:
+    report = read_json(UI_GALLERY_REUSE_STATE_READINESS)
+    if not report:
+        return [
+            runtime_report_check(
+                id="ui_gallery_reuse_state_core_runtime",
+                category="gallery",
+                feature="UI/gallery/reuse/state runtime contract",
+                accepted=False,
+                severity="P1",
+                evidence=[f"missing runtime report: {rel(UI_GALLERY_REUSE_STATE_READINESS)}"],
+                blocker="UI/gallery/reuse/state runtime contract has not been run.",
+                files=[UI_GALLERY_REUSE_STATE_READINESS],
+                acceptance_gate="The stub daemon runtime checker proves gallery readback, reuse, state, presets, queue mutation, delete, and restart behavior.",
+            )
+        ]
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    evidence = [
+        "ui/gallery/reuse/state report: "
+        + f"checks={summary.get('checks')} passed={summary.get('passed')} "
+        + f"p0={summary.get('p0_blockers')} p1={summary.get('p1_blockers')}"
+    ]
+    blockers = report.get("blockers")
+    p1_blockers: list[str] = []
+    if isinstance(blockers, dict):
+        raw = blockers.get("p1")
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    p1_blockers.append(str(item.get("label") or item.get("detail") or item))
+                else:
+                    p1_blockers.append(str(item))
+    core_ready = report.get("product_api_core_ready") is True
+    full_ready = report.get("ready") is True and report.get("claims_ux_parity") is True
+    return [
+        runtime_report_check(
+            id="ui_gallery_reuse_state_core_runtime",
+            category="gallery",
+            feature="UI/gallery/reuse/state core runtime contract",
+            accepted=core_ready,
+            severity="P1",
+            evidence=evidence,
+            blocker="UI/gallery/reuse/state core runtime contract failed.",
+            files=[UI_GALLERY_REUSE_STATE_READINESS],
+            acceptance_gate="The stub daemon runtime checker proves gallery readback, reuse, state, presets, queue mutation, delete, and restart behavior.",
+        ),
+        runtime_report_check(
+            id="ui_gallery_reuse_state_ux_parity_runtime",
+            category="gallery",
+            feature="UI/gallery/reuse/state SwarmUI UX parity",
+            accepted=full_ready,
+            severity="P1",
+            evidence=evidence,
+            blocker=(
+                "UI/gallery/reuse/state UX parity remains blocked: "
+                + (", ".join(p1_blockers) if p1_blockers else "report ready flag is not true")
+            ),
+            files=[UI_GALLERY_REUSE_STATE_READINESS],
+            acceptance_gate="Gallery/reuse/state parity includes provenance, indexed import, rename/manual order policy, and restart-safe history.",
+        ),
+    ]
 
 
 def checks() -> list[SurfaceCheck]:
@@ -556,6 +622,8 @@ def checks() -> list[SurfaceCheck]:
         )
     )
 
+    out.extend(ui_gallery_reuse_state_runtime_checks())
+
     out.append(
         support_check(
             id="jobs_db_gallery_index",
@@ -612,6 +680,7 @@ def build_report() -> dict:
     blocked = [item for item in items if not item.accepted]
     p1_blockers = [item for item in blocked if item.severity == "P1"]
     multi_lora_ready = any(item.id == "multi_lora_runtime_parity" and item.accepted for item in items)
+    ux_ready = any(item.id == "ui_gallery_reuse_state_ux_parity_runtime" and item.accepted for item in items)
     report = {
         "schema": "serenity.model_gallery_lora_surface.v1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -624,8 +693,9 @@ def build_report() -> dict:
             "p1_blockers": len(p1_blockers),
             "readiness_label": "not_ready" if blocked else "static_surface_ready",
             "no_cuda": True,
-            "static_only": True,
-            "claims_ux_parity": False,
+            "static_only": False,
+            "uses_runtime_reports": True,
+            "claims_ux_parity": ux_ready,
             "claims_multi_lora_runtime_parity": multi_lora_ready,
         },
         "checks": [asdict(item) for item in items],

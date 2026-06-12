@@ -30,10 +30,10 @@ python3 scripts/check_swarmui_product_path_contract.py --write-readiness output/
 Current result after adding variation noise runtime behavior, the
 sampler/scheduler registry, the bounded LTX2 video smoke runner, the
 model/gallery API slice, bounded Z-Image UniPC bh2, Z-Image multi-LoRA runtime
-stacking, and typed linked workflow execution for the supported t2i graph:
-`56` checks, `56` passed, `P0=0`, `P1=0`, `P2=0` for the tracked product-path
-gate. Product P0/P1/P2 is ready inside that gate, but full SwarmUI all-level
-parity is still blocked.
+stacking, typed linked workflow execution for the supported t2i graph, and the
+runtime UI/gallery/reuse/state contract:
+`59` checks, `59` passed, `P0=0`, `P1=0`, `P2=0`. Product P0 and tracked P1
+gates are ready. Full SwarmUI all-level parity is still blocked.
 
 Current high-risk runtime gaps:
 
@@ -52,6 +52,10 @@ Current high-risk runtime gaps:
   daemon artifact gate; this is not full sampler/scheduler parity.
 - `images=N` now emits serial indexed daemon jobs with seed offsets and
   metadata. True Comfy-style batched latent execution remains unimplemented.
+- UI/gallery/reuse/state has a stub-daemon runtime contract that now proves
+  reuse provenance, restart-safe job history, indexed external gallery import,
+  gallery rename/manual order, presets/state restart, favorite/delete, queue
+  mutation, and reuse generate.
 - Workflow support now keeps advanced Comfy/Swarm node families beyond the typed t2i graph as an explicit remaining blocker.
 - The accepted workflow path is a typed linked t2i graph executor for
   `CheckpointLoaderSimple`, `CLIPTextEncode`, `EmptyLatentImage`, `KSampler`,
@@ -321,16 +325,22 @@ Tasks:
 - Add gallery `search`/`filter`/`sort`, favorite state, and delete. DONE
   2026-06-12: `/v1/gallery` query params, `POST /v1/gallery/<id>/favorite`,
   and `DELETE /v1/gallery/<id>`.
-- Add reuse-params response shape that can feed the UI controls.
+- Add reuse-params response shape that can feed the UI controls. DONE
+  2026-06-12: the runtime checker posts provenance-bearing gallery params back
+  into `/v1/generate` and proves metadata round-trip.
 
 Acceptance:
 
 - Import a generated PNG and read `serenity.genparams.v1`. DONE 2026-06-12:
   `job-0004` Z-Image artifact was read by `/v1/gallery/job-0004`.
-- Import an external PNG with the same metadata key. PARTIAL 2026-06-12:
-  arbitrary-path import API exists and was smoke-tested against
-  `output/serenity_daemon/job-0004.png`; still needs an external-file fixture.
-- Reuse params into a new request.
+- Read an external PNG with the same metadata key. DONE 2026-06-12:
+  `scripts/check_ui_gallery_reuse_state_contract.py` copies a generated PNG
+  outside `output/serenity_daemon` and proves `/v1/gallery/read?path=...`.
+- Indexed external gallery import. DONE 2026-06-12:
+  `POST /v1/gallery/import` imports an external PNG into the gallery index.
+- Reuse params into a new request. DONE 2026-06-12: normalized gallery params
+  generate a second artifact and reused output metadata records source
+  provenance.
 
 ### M4 - Model And LoRA Browser
 
@@ -381,9 +391,13 @@ Tasks:
 
 Acceptance:
 
-- Product gate P1 blockers are gone. DONE 2026-06-12: queue, presets/state, and
-  prompt syntax markers pass. Prompt conditioning weights are parsed and
-  persisted but not yet applied as weighted text conditioning in model math.
+- Product gate P1 blockers are currently clear. Runtime evidence:
+  `checks=19 passed=19 p0=0 p1=0` in
+  `output/checks/ui_gallery_reuse_state_readiness.json`; queue mutation,
+  presets/state restart, gallery readback, favorites, delete, reuse generate,
+  provenance, indexed import, job history, and gallery rename/manual order pass.
+  Prompt conditioning weights are parsed and persisted but not yet applied as
+  weighted text conditioning in model math.
 - PNG metadata, presets, and request JSON use the same canonical fields.
 
 ### M6 - Expand Image Model Coverage

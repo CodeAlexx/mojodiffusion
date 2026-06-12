@@ -101,10 +101,11 @@ Acceptance evidence:
 - 2026-06-12 current checker:
   `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=56 passed=56 p0=0 p1=0 p2=0` for the tracked product-path gate.
-  Product P0/P1 is ready after the bounded video smoke runner wiring,
-  model/gallery API slice, sampler registry wiring, and typed linked t2i graph
-  executor, but full SwarmUI all-level parity remains blocked. `images=N` now
+  `checks=59 passed=59 p0=0 p1=0 p2=0` after implementing the runtime
+  UI/gallery/reuse/state contract. Product P0 and tracked P1 gates are ready.
+  Full SwarmUI all-level parity remains blocked by Qwen full generation,
+  accepted video generation, advanced workflow node families, sampler breadth,
+  and Z-Image speed parity. `images=N` now
   emits indexed serial jobs, variation noise has a runtime artifact gate, and
   `/v1/samplers` exposes a pure-Mojo SwarmUI/Comfy sampler support registry.
   Z-Image now has bounded DPM++ 2M and UniPC bh2/simple-flowmatch wiring; true
@@ -259,9 +260,9 @@ Acceptance evidence:
 - `python3 scripts/check_ltx2_dtype_contract.py --scope all` passes.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` now reports
-  `checks=56 passed=56 p0=0 p1=0 p2=0` for the tracked product-path gate. This
-  keeps video parity blocked by evidence, while proving the bounded daemon
-  runner route is wired.
+  `checks=59 passed=59 p0=0 p1=0 p2=0`. This keeps video parity blocked by
+  evidence while proving the bounded daemon runner route is wired and the
+  tracked UI/gallery/reuse/state P1 gate is closed.
 - `POST /v1/video` accepts only `runner:"ltx2_staged_dev_smoke"` and clamps
   `steps` to `1..3`. It runs
   `output/bin/ltx2_video_smoke_runner staged lora stream audio nonag
@@ -287,22 +288,26 @@ Goal: generated and imported images act like SwarmUI gallery items.
 
 Current status:
 
-- PNG tEXt metadata, `jobs.db`, gallery list/read/import endpoints, search/filter/sort,
-  lazy pure-Mojo thumbnail cache, favorite state, and delete are implemented in
-  the daemon API.
-- Full UI reuse and imported-external-file fixture coverage are not accepted in
-  this audit.
+- PNG tEXt metadata, `jobs.db`, gallery list/read endpoints, arbitrary PNG
+  metadata readback, search/filter/sort, lazy pure-Mojo thumbnail cache,
+  favorite state, delete, presets/state, reuse generate, and queue mutation are
+  runtime-proven by `scripts/check_ui_gallery_reuse_state_contract.py`.
+- Reuse provenance metadata, restart-safe job history in `/v1/jobs` and
+  `/v1/job/<id>`, indexed external PNG import, gallery rename, and manual
+  ordering are now runtime-proven by the same checker.
 
 Required implementation:
 
-- Wire gallery params back into UI controls with a restart/reuse gate.
-- Add an external PNG fixture for arbitrary-path `serenity.genparams.v1` import.
-- Add rename and persistent UI selection if required by the product UI.
+- Add preset-derived provenance metadata before claiming preset-source parity.
+- Add browser-side control restoration evidence if a frontend claim is made.
 
 Acceptance evidence:
 
 - Generate image, restart daemon/UI, gallery still shows it.
-- Import an external PNG with genparams and reuse those params into a new job.
+- Read an external PNG with genparams, reuse those params into a new job, and
+  record provenance in the new artifact metadata.
+- Indexed import, job history, and gallery ordering/rename pass the runtime
+  contract; this tracked P1 is clear.
 
 ## P1.2 Model And LoRA Browser
 
@@ -373,6 +378,12 @@ Acceptance evidence:
   `prompt_raw`, resolved `prompt`, `prompt_syntax.weighted`, `random`,
   `wildcards`, and extracted LoRA tag.
 - Queue operations have daemon/API tests.
+- 2026-06-12 runtime checker:
+  `python3 scripts/check_ui_gallery_reuse_state_contract.py --write-readiness
+  output/checks/ui_gallery_reuse_state_readiness.json` reports
+  `checks=19 passed=19 p0=0 p1=0 p2=0`; it proves reuse provenance, jobs
+  history after restart, indexed external import, gallery rename/manual order,
+  queue mutation, presets/state restart, favorites, delete, and reuse generate.
 
 ## P2 Workflow Graphs And Advanced Controls
 
@@ -417,9 +428,10 @@ Acceptance evidence:
   expected-type error.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=56 passed=56 p0=0 p1=0 p2=0` for the tracked product-path gate. Full
-  SwarmUI all-level parity remains blocked by Qwen full generation, accepted
-  video generation, advanced workflow node families, and Z-Image speed parity.
+  `checks=59 passed=59 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
+  Full SwarmUI all-level parity still remains blocked by Qwen full generation,
+  accepted video generation, advanced workflow node families, sampler breadth,
+  and Z-Image speed parity.
 
 ## Build Order
 

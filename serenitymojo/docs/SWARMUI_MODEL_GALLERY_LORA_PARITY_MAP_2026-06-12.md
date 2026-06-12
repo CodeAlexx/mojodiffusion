@@ -25,6 +25,21 @@ python3 scripts/check_model_gallery_lora_surface.py \
   --write-readiness output/checks/model_gallery_lora_surface_readiness.json
 ```
 
+Runtime UI/gallery/reuse/state contract:
+
+```bash
+python3 scripts/check_ui_gallery_reuse_state_contract.py \
+  --write-readiness output/checks/ui_gallery_reuse_state_readiness.json
+```
+
+Result on 2026-06-12: core API behavior and the tracked gallery/reuse/state UX
+contract are ready. `checks=19 passed=19 p0=0 p1=0 p2=0`. Passing runtime
+pieces: stub generation, PNG `serenity.genparams.v1`, gallery item/readback,
+external PNG read, indexed external gallery import, thumbnail cache, favorite
+search/filter, state save, preset save, provenance-bearing params reuse
+generation, queue reorder/remove, restart persistence, restart-safe jobs
+history, gallery rename/manual order, and gallery delete.
+
 Latest live API smoke:
 
 ```bash
@@ -70,14 +85,14 @@ single-LoRA, and stacked-LoRA outputs.
 | Multi-LoRA stack | Stack, reorder, enable/disable, and apply multiple LoRAs with independent weights. | API and metadata can carry an array. Z-Image now accepts multiple loader-supported PEFT/Comfy Z-Image LoRAs, merges them as a rank-concatenated overlay with scale folded into B, and records the full stack in manifest/PNG metadata. | Z-Image runtime stack is accepted for loader-supported LoRA formats only. Qwen still rejects any LoRA, LoKr/LyCORIS Z-Image files are still not converted by the overlay path, and UI reorder/enable controls are not accepted by this API/backend slice. | Real daemon job with at least two compatible LoRAs succeeds, result manifest lists both, PNG metadata round-trips both weights, and visual/numeric gate proves both overlays were applied. |
 | LoRA compatibility warnings | Warn or block incompatible model/LoRA combinations before starting a heavy model run. | `/v1/models?model=<name>` exposes per-LoRA `compatible`, `compatibility`, `target_arch`, `compatible_models`, and `incompatible_reason`. Backend admission remains fail-loud and authoritative. | Compatibility is family-level metadata, not a proof that every adapter tensor target can be applied. | `/v1/models` exposes compatibility status/reasons and `/v1/generate` rejects incompatible selections before CUDA-heavy work. |
 | Gallery list | Persistent generated-image gallery with metadata attached to each item. | `/v1/gallery` scans `output/serenity_daemon/job-*.png`, reads `serenity.genparams.v1`, supports `search`/`q`, `filter`, `sort`, and `favorite`, and returns `schema:"serenity.gallery.v1"`, `count`, `total`, and `items`. | UI grid behavior and selection persistence are not accepted by this API-only slice. | Restart smoke lists prior images; checker verifies sort/filter/thumb markers; UI or API gate shows stable gallery ordering and selection. |
-| Gallery read/import params | Open generated or arbitrary PNG files and recover generation parameters. | `/v1/gallery/<id>` reads generated job PNGs; `/v1/gallery/read?path=<png>` reads arbitrary local PNG metadata via `read_png_text`; response includes `params_json` and parsed `params` when valid. | This is an API readback shape, not a proven UI "reuse into controls" workflow. External non-job fixture coverage still needs to be kept current. | Import a non-output PNG with `serenity.genparams.v1`, load params into controls/request JSON, generate again, and prove metadata equality except server-added fields. |
+| Gallery read/import params | Open generated or arbitrary PNG files and recover generation parameters. | `/v1/gallery/<id>` reads generated job PNGs; `/v1/gallery/read?path=<png>` reads arbitrary local PNG metadata via `read_png_text`; `POST /v1/gallery/import` copies an external PNG into the indexed gallery. The runtime checker proves generated readback, external-path readback, and indexed import. | UI file-picker behavior is not accepted by this API-only slice. | Import a non-output PNG into the gallery index, load params into controls/request JSON, generate again, and prove metadata equality except server-added fields. |
 | PNG metadata | Generated PNGs carry full reusable params under a stable key. | Stub, Z-Image, and Qwen backends use `encode_png_with_text` with `serenity.genparams.v1`. Daemon gallery reads the same key. | Job DB caps params JSON, so the PNG text chunk is the authoritative full param store. | Artifact gate verifies dimensions and `serenity.genparams.v1`; readback params include model, prompt, seed, size, sampler/scheduler, LoRAs, init image, and prompt syntax metadata. |
-| Reuse params | Click a gallery image and restore all generation controls. | API returns parsed `params`; presets/state use the same canonical fields. | No accepted UI/control restoration smoke in this slice. | Gallery item readback is POSTed into `/v1/generate` or UI state, and the new job preserves the same canonical fields. |
+| Reuse params | Click a gallery image and restore all generation controls. | Runtime checker normalizes gallery endpoint params and POSTs them back to `/v1/generate`; the second artifact preserves canonical authoring fields and records `params_source`, `reused_from_gallery_id`, `reused_from_path`, and `reused_from_job_id`. | Preset-derived outputs still need preset-name/source provenance before claiming preset-source parity. | Gallery item readback is POSTed into `/v1/generate`, the new job preserves canonical fields, and output metadata records source provenance. |
 | Gallery thumbnails | Show quick thumbnails/previews without decoding full images every view. | Gallery items lazily create pure-Mojo PNG thumbnails with `decode_png`, `resize_lanczos`, and `encode_png` under `output/serenity_daemon/thumbnails`; responses expose `thumbnail_path`, `thumb_path`, and `thumbnail_state`. | Cache invalidation is simple path-based; UI rendering of the thumbnails is not accepted by this slice. | Pure-Mojo thumbnail generation/cache under output state, exposed thumbnail paths, and static checker coverage. |
-| Gallery delete/rename/favorite | Delete or rename images and favorite/star important outputs persistently. | `POST /v1/gallery/<id>/favorite` persists favorites in `output/serenity_daemon/state/gallery.json`; `DELETE /v1/gallery/<id>` removes the PNG and cached thumbnail with libc `unlink`. | Rename is not implemented. Jobs DB historical rows are not rewritten on gallery deletion. | Favorite state survives daemon restart; delete removes file/cache and gallery listing no longer returns the item. |
-| Jobs DB as gallery index | Persist job rows and output paths across daemon restarts. | `jobs.db` stores started jobs with `id`, `created`, `model`, capped `params_json`, `state`, and `output_path`; startup repairs non-terminal rows to `interrupted`. Gallery favorites live in `gallery.json`, and thumbnail cache lives under `output/serenity_daemon/thumbnails`. | It remains an index, not the full gallery metadata store; full params stay authoritative in PNG text. | DB readback plus gallery scan agree after restart, and full params are recovered from PNG text. |
-| Presets | Save/load/delete named generation parameter sets. | `/v1/presets` persists `serenity.presets.v1` under `output/serenity_daemon/state/presets.json`; supports list/get/upsert/delete. | Static markers exist; this audit did not run a UI workflow. | Restart smoke writes, reads, overwrites, deletes a preset, and generated params match preset fields. |
-| Last UI state | Restore last controls on app/daemon restart. | `/v1/state` persists `serenity.ui_state.v1` under `output/serenity_daemon/state/last_state.json`. | Static markers exist; this audit did not run a UI workflow. | Restart smoke writes state, restarts daemon, reads same state, and UI loads it before first generate. |
+| Gallery delete/rename/favorite | Delete or rename images and favorite/star important outputs persistently. | Runtime checker proves favorite persistence across daemon restart, `DELETE /v1/gallery/<id>` removes the PNG and cached thumbnail with libc `unlink`, `POST /v1/gallery/<id>/rename` persists display names, and `POST /v1/gallery/order` persists manual order metadata. | UI rendering of rename/order controls is not accepted by this API-only slice. | Favorite state survives daemon restart; delete removes file/cache; rename/manual-order policy is implemented or explicitly rejected; history behavior is documented and gated. |
+| Jobs DB as gallery index | Persist job rows and output paths across daemon restarts. | `jobs.db` stores started jobs with `id`, `created`, `model`, capped `params_json`, `state`, and `output_path`; startup repairs non-terminal rows to `interrupted`. `/v1/jobs` and `/v1/job/<id>` now expose prior rows after restart. Gallery favorites/names/order/imports live in `gallery.json`, and thumbnail cache lives under `output/serenity_daemon/thumbnails`. | Historical rows keep capped DB params; PNG text remains the authoritative full param source. | DB readback plus gallery scan agree after restart, full params are recovered from PNG text, and `/v1/jobs` exposes immutable prior rows. |
+| Presets | Save/load/delete named generation parameter sets. | `/v1/presets` persists `serenity.presets.v1` under `output/serenity_daemon/state/presets.json`; runtime checker proves preset save and restart readback. | Generated outputs do not record preset provenance. | Restart smoke writes, reads, overwrites, deletes a preset, generated params match preset fields, and preset-derived outputs record `preset_name`/source hash. |
+| Last UI state | Restore last controls on app/daemon restart. | `/v1/state` persists `serenity.ui_state.v1` under `output/serenity_daemon/state/last_state.json`; runtime checker proves restart readback. | No schema/revision/merge semantics yet. | Restart smoke writes state, restarts daemon, reads same state, and UI loads it before first generate with revision-safe behavior. |
 | Model downloader/importer | Download models from web or manage remote registries. | Out of scope per SwarmUI native-single-user parity docs. Local files are user-managed. | Not a blocker for this repo goal. | None; keep skipped unless the product scope changes. |
 
 ## Exact Current Blockers
@@ -85,9 +100,9 @@ single-LoRA, and stacked-LoRA outputs.
 - Multi-LoRA is accepted only for the Z-Image runtime path with loader-supported
   PEFT/Comfy LoRAs. Qwen is still zero-LoRA, and Z-Image LoKr/LyCORIS files are
   still not converted by the overlay path.
-- Model/LoRA browser real preview thumbnails, user notes, model favorite persistence,
-  and full UI state restoration are not accepted by this API-only slice.
-- Gallery rename is not implemented.
-- Gallery readback exists, but reuse into UI controls is not proven by this slice.
-- Presets/state markers exist, but this Worker C pass only adds a static checker;
-  it does not rerun the daemon restart smoke.
+- Model/LoRA browser real preview thumbnails, user notes, model favorite
+  persistence, and full UI control restoration are not accepted by this slice.
+- UI/gallery/reuse/state tracked P1 is clear in the runtime checker:
+  `checks=19 passed=19 p0=0 p1=0 p2=0`.
+- Presets/state restart behavior is runtime-proven, but schema/revision/merge
+  semantics and preset provenance in generated metadata are not implemented.

@@ -997,6 +997,11 @@ def parse_generate(
         lo.set("weight", JSONValue.from_float(p.loras[i].weight))
         la.append(lo^)
     o.set("lora", la^)
+    _copy_optional_string_json_field(o, obj, String("params_source"))
+    _copy_optional_string_json_field(o, obj, String("params_source_hash"))
+    _copy_optional_string_json_field(o, obj, String("reused_from_gallery_id"))
+    _copy_optional_string_json_field(o, obj, String("reused_from_path"))
+    _copy_optional_string_json_field(o, obj, String("reused_from_job_id"))
     p.params_json = dumps(o)
     return p^
 
@@ -1030,6 +1035,44 @@ def job_json_value(j: JobRecord) raises -> JSONValue:
     o.set("output_path", JSONValue.from_string(j.output_path))
     o.set("error", JSONValue.from_string(j.error))
     return o^
+
+
+def prior_job_json_value(row: List[String]) raises -> JSONValue:
+    var o = JSONValue.new_object()
+    o.set("id", JSONValue.from_string(row[0]))
+    o.set("created", JSONValue.from_string(row[1]))
+    o.set("model", JSONValue.from_string(row[2]))
+    o.set("state", JSONValue.from_string(row[4]))
+    if _terminal_state(row[4]):
+        o.set("progress", JSONValue.from_int(100))
+    else:
+        o.set("progress", JSONValue.from_int(0))
+    o.set("step", JSONValue.from_int(0))
+    o.set("total", JSONValue.from_int(0))
+    o.set("image_index", JSONValue.from_int(0))
+    o.set("image_count", JSONValue.from_int(1))
+    o.set("output_path", JSONValue.from_string(row[5]))
+    o.set("error", JSONValue.from_string(String("")))
+    o.set("params_json", JSONValue.from_string(row[3]))
+    if row[3] != "":
+        try:
+            var params = loads(row[3])
+            if params.is_object():
+                _copy_json_field_if_present(o, params, String("image_index"))
+                _copy_json_field_if_present(o, params, String("image_count"))
+                _copy_json_field_if_present(o, params, String("steps"))
+                o.set("params", params^)
+        except:
+            pass
+    o.set("history", JSONValue.from_bool(True))
+    return o^
+
+
+def _prior_row_index(prior: List[List[String]], id: String) -> Int:
+    for i in range(len(prior)):
+        if len(prior[i]) >= 6 and prior[i][0] == id:
+            return i
+    return -1
 
 
 def event_json(j: JobRecord, preview: String, phase: String) raises -> String:
@@ -1116,6 +1159,9 @@ def _gallery_state_default() raises -> JSONValue:
     var o = JSONValue.new_object()
     o.set("schema", JSONValue.from_string(String("serenity.gallery_state.v1")))
     o.set("favorites", JSONValue.new_array())
+    o.set("names", JSONValue.new_array())
+    o.set("order", JSONValue.new_array())
+    o.set("imports", JSONValue.new_array())
     return o^
 
 
@@ -1161,6 +1207,193 @@ def _set_gallery_favorite_doc(doc: JSONValue, id: String, favorite: Bool) raises
     var out = JSONValue.new_object()
     out.set("schema", JSONValue.from_string(String("serenity.gallery_state.v1")))
     out.set("favorites", out_arr^)
+    if doc.contains("names") and doc["names"].is_array():
+        out.set("names", doc["names"])
+    else:
+        out.set("names", JSONValue.new_array())
+    if doc.contains("order") and doc["order"].is_array():
+        out.set("order", doc["order"])
+    else:
+        out.set("order", JSONValue.new_array())
+    if doc.contains("imports") and doc["imports"].is_array():
+        out.set("imports", doc["imports"])
+    else:
+        out.set("imports", JSONValue.new_array())
+    return out^
+
+
+def _copy_gallery_state_arrays(mut out: JSONValue, doc: JSONValue) raises:
+    if doc.contains("favorites") and doc["favorites"].is_array():
+        out.set("favorites", doc["favorites"])
+    else:
+        out.set("favorites", JSONValue.new_array())
+    if doc.contains("names") and doc["names"].is_array():
+        out.set("names", doc["names"])
+    else:
+        out.set("names", JSONValue.new_array())
+    if doc.contains("order") and doc["order"].is_array():
+        out.set("order", doc["order"])
+    else:
+        out.set("order", JSONValue.new_array())
+    if doc.contains("imports") and doc["imports"].is_array():
+        out.set("imports", doc["imports"])
+    else:
+        out.set("imports", JSONValue.new_array())
+
+
+def _gallery_name(doc: JSONValue, id: String) raises -> String:
+    if doc.contains("names") and doc["names"].is_array():
+        var arr = doc["names"]
+        for i in range(arr.length()):
+            var ent = arr[i]
+            if (
+                ent.is_object()
+                and ent.contains("id")
+                and ent["id"].is_string()
+                and ent["id"].as_string() == id
+                and ent.contains("name")
+                and ent["name"].is_string()
+            ):
+                return ent["name"].as_string()
+    return id.copy()
+
+
+def _gallery_import_source(doc: JSONValue, id: String) raises -> String:
+    if doc.contains("imports") and doc["imports"].is_array():
+        var arr = doc["imports"]
+        for i in range(arr.length()):
+            var ent = arr[i]
+            if (
+                ent.is_object()
+                and ent.contains("id")
+                and ent["id"].is_string()
+                and ent["id"].as_string() == id
+                and ent.contains("source_path")
+                and ent["source_path"].is_string()
+            ):
+                return ent["source_path"].as_string()
+    return String("")
+
+
+def _gallery_order_index(doc: JSONValue, id: String) raises -> Int:
+    if doc.contains("order") and doc["order"].is_array():
+        var arr = doc["order"]
+        for i in range(arr.length()):
+            if arr[i].is_string() and arr[i].as_string() == id:
+                return i
+    return -1
+
+
+def _set_gallery_name_doc(doc: JSONValue, id: String, name: String) raises -> JSONValue:
+    var out_arr = JSONValue.new_array()
+    var replaced = False
+    if doc.contains("names") and doc["names"].is_array():
+        var arr = doc["names"]
+        for i in range(arr.length()):
+            var ent = arr[i]
+            if ent.is_object() and ent.contains("id") and ent["id"].is_string() and ent["id"].as_string() == id:
+                var next = JSONValue.new_object()
+                next.set("id", JSONValue.from_string(id))
+                next.set("name", JSONValue.from_string(name))
+                out_arr.append(next^)
+                replaced = True
+            else:
+                out_arr.append(ent^)
+    if not replaced:
+        var next = JSONValue.new_object()
+        next.set("id", JSONValue.from_string(id))
+        next.set("name", JSONValue.from_string(name))
+        out_arr.append(next^)
+    var out = JSONValue.new_object()
+    out.set("schema", JSONValue.from_string(String("serenity.gallery_state.v1")))
+    _copy_gallery_state_arrays(out, doc)
+    out.set("names", out_arr^)
+    return out^
+
+
+def _set_gallery_order_doc(doc: JSONValue, ids: JSONValue) raises -> JSONValue:
+    if not ids.is_array():
+        raise Error("'ids' must be an array of gallery ids")
+    var out_arr = JSONValue.new_array()
+    for i in range(ids.length()):
+        if not ids[i].is_string():
+            raise Error("'ids[" + String(i) + "]' must be a string")
+        var id = ids[i].as_string()
+        if not _safe_gallery_id(id):
+            raise Error("invalid gallery id: " + id)
+        var png_path = String(OUT_DIR) + "/" + id + ".png"
+        if not _path_exists_file(png_path):
+            raise Error("gallery item not found: " + id)
+        out_arr.append(JSONValue.from_string(id))
+    var out = JSONValue.new_object()
+    out.set("schema", JSONValue.from_string(String("serenity.gallery_state.v1")))
+    _copy_gallery_state_arrays(out, doc)
+    out.set("order", out_arr^)
+    return out^
+
+
+def _set_gallery_import_doc(doc: JSONValue, id: String, source_path: String) raises -> JSONValue:
+    var out_arr = JSONValue.new_array()
+    var replaced = False
+    if doc.contains("imports") and doc["imports"].is_array():
+        var arr = doc["imports"]
+        for i in range(arr.length()):
+            var ent = arr[i]
+            if ent.is_object() and ent.contains("id") and ent["id"].is_string() and ent["id"].as_string() == id:
+                var next = JSONValue.new_object()
+                next.set("id", JSONValue.from_string(id))
+                next.set("source_path", JSONValue.from_string(source_path))
+                out_arr.append(next^)
+                replaced = True
+            else:
+                out_arr.append(ent^)
+    if not replaced:
+        var next = JSONValue.new_object()
+        next.set("id", JSONValue.from_string(id))
+        next.set("source_path", JSONValue.from_string(source_path))
+        out_arr.append(next^)
+    var out = JSONValue.new_object()
+    out.set("schema", JSONValue.from_string(String("serenity.gallery_state.v1")))
+    _copy_gallery_state_arrays(out, doc)
+    out.set("imports", out_arr^)
+    return out^
+
+
+def _remove_gallery_item_doc(doc: JSONValue, id: String) raises -> JSONValue:
+    var fav_arr = JSONValue.new_array()
+    if doc.contains("favorites") and doc["favorites"].is_array():
+        var arr = doc["favorites"]
+        for i in range(arr.length()):
+            if arr[i].is_string() and arr[i].as_string() != id:
+                fav_arr.append(JSONValue.from_string(arr[i].as_string()))
+    var names_arr = JSONValue.new_array()
+    if doc.contains("names") and doc["names"].is_array():
+        var arr = doc["names"]
+        for i in range(arr.length()):
+            var ent = arr[i]
+            if ent.is_object() and ent.contains("id") and ent["id"].is_string() and ent["id"].as_string() == id:
+                continue
+            names_arr.append(ent^)
+    var order_arr = JSONValue.new_array()
+    if doc.contains("order") and doc["order"].is_array():
+        var arr = doc["order"]
+        for i in range(arr.length()):
+            if arr[i].is_string() and arr[i].as_string() != id:
+                order_arr.append(JSONValue.from_string(arr[i].as_string()))
+    var imports_arr = JSONValue.new_array()
+    if doc.contains("imports") and doc["imports"].is_array():
+        var arr = doc["imports"]
+        for i in range(arr.length()):
+            var ent = arr[i]
+            if ent.is_object() and ent.contains("id") and ent["id"].is_string() and ent["id"].as_string() == id:
+                continue
+            imports_arr.append(ent^)
+    var out = JSONValue.new_object()
+    out.set("schema", JSONValue.from_string(String("serenity.gallery_state.v1")))
+    out.set("favorites", fav_arr^)
+    out.set("names", names_arr^)
+    out.set("order", order_arr^)
+    out.set("imports", imports_arr^)
     return out^
 
 
@@ -1203,10 +1436,21 @@ def _copy_json_field_if_present(mut out: JSONValue, src: JSONValue, key: String)
         out.set(key, src[key])
 
 
+def _copy_optional_string_json_field(
+    mut out: JSONValue, src: JSONValue, key: String,
+) raises:
+    if not src.is_object() or not src.contains(key) or src[key].is_null():
+        return
+    if not src[key].is_string():
+        raise Error("'" + key + "' must be a string")
+    out.set(key, JSONValue.from_string(src[key].as_string()))
+
+
 def _gallery_item_from_png_state(
     id: String, path: String, favorite: Bool, ensure_thumb: Bool,
 ) raises -> JSONValue:
     var params_json = _png_genparams(path)
+    var gallery_state = _load_gallery_state()
     var thumb_path = String("")
     var thumb_state = String("not_requested")
     if ensure_thumb and id != "":
@@ -1217,9 +1461,15 @@ def _gallery_item_from_png_state(
             thumb_state = String("error: ") + String(e)
     var o = JSONValue.new_object()
     o.set("id", JSONValue.from_string(id))
+    o.set("name", JSONValue.from_string(_gallery_name(gallery_state, id)))
+    o.set("display_name", JSONValue.from_string(_gallery_name(gallery_state, id)))
     o.set("path", JSONValue.from_string(path))
     o.set("size", JSONValue.from_int(_path_size(path)))
     o.set("favorite", JSONValue.from_bool(favorite))
+    o.set("manual_order_index", JSONValue.from_int(_gallery_order_index(gallery_state, id)))
+    var imported_from = _gallery_import_source(gallery_state, id)
+    o.set("imported", JSONValue.from_bool(imported_from != ""))
+    o.set("imported_from", JSONValue.from_string(imported_from))
     o.set("thumbnail_path", JSONValue.from_string(thumb_path))
     o.set("thumb_path", JSONValue.from_string(thumb_path))
     o.set("thumbnail", JSONValue.from_string(thumb_path))
@@ -1235,6 +1485,15 @@ def _gallery_item_from_png_state(
             _copy_json_field_if_present(o, params, String("seed"))
             _copy_json_field_if_present(o, params, String("width"))
             _copy_json_field_if_present(o, params, String("height"))
+            if id != "":
+                if not params.contains("params_source"):
+                    params.set("params_source", JSONValue.from_string(String("gallery")))
+                if not params.contains("reused_from_gallery_id"):
+                    params.set("reused_from_gallery_id", JSONValue.from_string(id))
+                if not params.contains("reused_from_job_id"):
+                    params.set("reused_from_job_id", JSONValue.from_string(id))
+                if not params.contains("reused_from_path"):
+                    params.set("reused_from_path", JSONValue.from_string(path))
             o.set("params", params^)
         except e:
             o.set("params_error", JSONValue.from_string(String(e)))
@@ -1248,6 +1507,8 @@ def _gallery_item_from_png(id: String, path: String) raises -> JSONValue:
 def _gallery_error_item(id: String, path: String, err: String) raises -> JSONValue:
     var o = JSONValue.new_object()
     o.set("id", JSONValue.from_string(id))
+    o.set("name", JSONValue.from_string(id))
+    o.set("display_name", JSONValue.from_string(id))
     o.set("path", JSONValue.from_string(path))
     o.set("size", JSONValue.from_int(_path_size(path)))
     o.set("favorite", JSONValue.from_bool(False))
@@ -1333,6 +1594,15 @@ def _gallery_id_before(a: String, b: String, sort: String, state: JSONValue) rai
     var s = String(sort.lower())
     var ap = String(OUT_DIR) + "/" + a + ".png"
     var bp = String(OUT_DIR) + "/" + b + ".png"
+    if s == "manual" or s == "manual_asc" or s == "order":
+        var ai = _gallery_order_index(state, a)
+        var bi = _gallery_order_index(state, b)
+        if ai >= 0 and bi >= 0 and ai != bi:
+            return ai < bi
+        if ai >= 0 and bi < 0:
+            return True
+        if ai < 0 and bi >= 0:
+            return False
     if s == "name_asc":
         return a < b
     if s == "name_desc":
@@ -2519,6 +2789,7 @@ def _models_query_json(
 
 def handle_api(
     mut jobs: List[JobRecord], mut njobs: Int, running: Int,
+    prior: List[List[String]],
     backend_name: String, model_name: String, resident: String, req: Request,
 ) raises -> Response:
     """Route + handle one (non-WebSocket) API request."""
@@ -2668,6 +2939,69 @@ def handle_api(
         except e:
             return error_response(422, "cannot read PNG genparams: " + String(e))
 
+    if req.method == "POST" and path == "/v1/gallery/import":
+        try:
+            var body = _body_object_or_empty(req.body)
+            var source_path = _required_string_field(body, String("path"))
+            if source_path.find("\n") >= 0 or source_path.find("\r") >= 0:
+                raise Error("invalid gallery import path")
+            if not _path_exists_file(source_path):
+                return error_response(404, "gallery import source not found: " + source_path)
+            var params_json = _png_genparams(source_path)
+            if params_json == "":
+                raise Error("gallery import source has no " + String(GENPARAMS_TEXT_KEY))
+            njobs += 1
+            var id = String("job-") + _pad4(njobs)
+            var dest = String(OUT_DIR) + "/" + id + ".png"
+            var rc = _system(
+                String("cp ") + _shell_quote(source_path) + String(" ") + _shell_quote(dest)
+            )
+            if rc != 0:
+                njobs -= 1
+                raise Error("gallery import copy failed")
+            var state = _load_gallery_state()
+            var updated = _set_gallery_import_doc(state, id, source_path)
+            _save_gallery_state(updated)
+            var item = _gallery_item_from_png_state(id, dest, _gallery_favorite(updated, id), True)
+            return json_response(200, dumps(item))
+        except e:
+            return error_response(422, String(e))
+
+    if req.method == "POST" and path == "/v1/gallery/order":
+        try:
+            var body = _body_object_or_empty(req.body)
+            if not body.contains("ids"):
+                raise Error("'ids' array is required")
+            var state = _load_gallery_state()
+            var updated = _set_gallery_order_doc(state, body["ids"])
+            _save_gallery_state(updated)
+            var o = JSONValue.new_object()
+            o.set("schema", JSONValue.from_string(String("serenity.gallery_order.v1")))
+            o.set("order", updated["order"])
+            return json_response(200, dumps(o))
+        except e:
+            return error_response(422, String(e))
+
+    if req.method == "POST" and path.startswith("/v1/gallery/") and path.endswith("/rename"):
+        var id = byte_substr(path, 12, path.byte_length() - 7)
+        if not _safe_gallery_id(id):
+            return error_response(422, "invalid gallery id: " + id)
+        var png_path = String(OUT_DIR) + "/" + id + ".png"
+        if not _path_exists_file(png_path):
+            return error_response(404, "gallery item not found: " + id)
+        try:
+            var body = _body_object_or_empty(req.body)
+            var name = _required_string_field(body, String("name"))
+            var state = _load_gallery_state()
+            var updated = _set_gallery_name_doc(state, id, name)
+            _save_gallery_state(updated)
+            var item = _gallery_item_from_png_state(
+                id, png_path, _gallery_favorite(updated, id), True,
+            )
+            return json_response(200, dumps(item))
+        except e:
+            return error_response(422, String(e))
+
     if req.method == "POST" and path.startswith("/v1/gallery/") and path.endswith("/favorite"):
         var id = byte_substr(path, 12, path.byte_length() - 9)
         if not _safe_gallery_id(id):
@@ -2704,7 +3038,7 @@ def handle_api(
             thumb_deleted = _unlink_file(thumb_path)
         try:
             var state = _load_gallery_state()
-            var next = _set_gallery_favorite_doc(state, id, False)
+            var next = _remove_gallery_item_doc(state, id)
             _save_gallery_state(next)
         except:
             pass
@@ -2843,6 +3177,9 @@ def handle_api(
 
     if req.method == "GET" and path == "/v1/jobs":
         var arr = JSONValue.new_array()
+        for i in range(len(prior)):
+            if len(prior[i]) >= 6:
+                arr.append(prior_job_json_value(prior[i]))
         for i in range(len(jobs)):
             arr.append(job_json_value(jobs[i]))
         return json_response(200, dumps(arr))
@@ -2850,9 +3187,12 @@ def handle_api(
     if req.method == "GET" and path.startswith("/v1/job/"):
         var id = byte_substr(path, 8, path.byte_length())
         var i = _find_job(jobs, id)
-        if i < 0:
+        if i >= 0:
+            return json_response(200, dumps(job_json_value(jobs[i])))
+        var pi = _prior_row_index(prior, id)
+        if pi < 0:
             return error_response(404, "no such job: " + id)
-        return json_response(200, dumps(job_json_value(jobs[i])))
+        return json_response(200, dumps(prior_job_json_value(prior[pi])))
 
     if req.method == "POST" and (
         path == "/v1/reorder" or path.startswith("/v1/reorder/")
@@ -2939,6 +3279,7 @@ def handle_api(
 
 def serve_request(
     mut jobs: List[JobRecord], mut njobs: Int, running: Int,
+    prior: List[List[String]],
     backend_name: String, model_name: String, resident: String,
     reqbytes: String, fd: Int,
 ) raises -> Int:
@@ -2958,7 +3299,7 @@ def serve_request(
             print("WS client connected:", fd)
             return 2
         var ka = keep_alive_wanted(req)
-        var resp = handle_api(jobs, njobs, running, backend_name, model_name, resident, req)
+        var resp = handle_api(jobs, njobs, running, prior, backend_name, model_name, resident, req)
         resp.set_header("Server", "SerenityDaemon/0.1")
         resp.set_header("Date", http_date())
         resp.set_keep_alive(ka)
@@ -3054,8 +3395,8 @@ def handle_ws(
 def handle_readable(
     mut ep: Epoll, mut buffers: Dict[Int, String], mut ws: Dict[Int, Bool],
     mut frag: Dict[Int, WsReassembler], mut jobs: List[JobRecord],
-    mut njobs: Int, running: Int, backend_name: String, model_name: String,
-    resident: String, fd: Int,
+    mut njobs: Int, running: Int, prior: List[List[String]], backend_name: String,
+    model_name: String, resident: String, fd: Int,
 ) raises:
     if fd in ws:
         handle_ws(ep, buffers, ws, frag, fd)
@@ -3090,7 +3431,7 @@ def handle_readable(
             break
         var reqbytes = byte_substr(acc, 0, consumed)
         acc = byte_substr(acc, consumed, acc.byte_length())
-        var code = serve_request(jobs, njobs, running, backend_name, model_name, resident, reqbytes, fd)
+        var code = serve_request(jobs, njobs, running, prior, backend_name, model_name, resident, reqbytes, fd)
         if code == 2:  # upgraded to the progress WebSocket
             ws[fd] = True
             frag[fd] = WsReassembler()
@@ -3173,7 +3514,7 @@ def run_daemon[B: GenBackend](mut backend: B, port: Int) raises:
                 accept_new(ep, buffers, sock.fd)
             else:
                 handle_readable(ep, buffers, ws, frag, jobs, njobs, running,
-                                backend_name, model_name, resident, fd)
+                                prior, backend_name, model_name, resident, fd)
         if not alive:
             break
         # the serial worker runs inside the loop: one bounded step per tick

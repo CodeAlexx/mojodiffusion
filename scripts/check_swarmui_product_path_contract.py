@@ -264,11 +264,11 @@ def check_swarmui_audit_doc() -> list[Check]:
             label="Comfy/Swarm workflow parity map exists",
             needles=[
                 "not an arbitrary ComfyUI graph executor",
-                "No graph IR",
+                "typed linked graph executor",
                 "Unsupported graph nodes",
             ],
             severity=P1,
-            acceptance="Workflow map distinguishes constrained adapter support from arbitrary graph parity.",
+            acceptance="Workflow map distinguishes supported typed graph execution from arbitrary graph parity.",
         ),
         check_contains(
             MODEL_GALLERY_LORA_MAP_DOC,
@@ -469,7 +469,7 @@ def check_specialized_surface_blockers() -> list[Check]:
         check_absent(
             WORKFLOW_MAP_DOC,
             category="workflow",
-            label="arbitrary Comfy graph execution is implemented",
+            label="typed workflow graph replaces stale no-IR blocker",
             needles=["No graph IR"],
             severity=P1,
             acceptance="A typed graph IR/topological executor exists for accepted Comfy/Swarm workflows.",
@@ -898,11 +898,20 @@ def build_report(checks: list[Check]) -> dict[str, object]:
     p0 = [check for check in checks if not check.ok and check.severity == P0]
     p1 = [check for check in checks if not check.ok and check.severity == P1]
     p2 = [check for check in checks if not check.ok and check.severity == P2]
+    known_all_level_blockers = [
+        "Qwen full daemon generation remains parked until bounded VRAM/runtime evidence says it is safe.",
+        "Video generation is not accepted until a real daemon run emits MP4, frame/duration, timing, and positive-VRAM evidence.",
+        "Advanced Comfy/Swarm node families beyond the typed t2i graph remain unsupported.",
+        "Z-Image speed parity is not accepted until the denoise path has paired baseline and optimized CFG/main-stack evidence.",
+    ]
     return {
         "schema": "serenity.swarmui.product_path_readiness.v1",
         "scope": "no-CUDA static product-path gate; no generation, no image comparison",
         "product_path_p0_ready": not p0,
-        "swarmui_all_levels_ready": not p0 and not p1 and not p2,
+        "tracked_product_path_p1_ready": not p0 and not p1,
+        "tracked_product_path_ready": not p0 and not p1 and not p2,
+        "swarmui_all_levels_ready": False,
+        "known_all_level_blockers": known_all_level_blockers,
         "summary": {
             "checks": len(checks),
             "passed": sum(1 for check in checks if check.ok),
@@ -944,6 +953,10 @@ def print_text_report(report: dict[str, object]) -> None:
         print("[swarmui-product] P0 product path: READY")
     else:
         print("[swarmui-product] P0 product path: BLOCKED")
+    if report["tracked_product_path_p1_ready"]:
+        print("[swarmui-product] tracked P0/P1 product gates: READY")
+    else:
+        print("[swarmui-product] tracked P0/P1 product gates: BLOCKED")
     if report["swarmui_all_levels_ready"]:
         print("[swarmui-product] SwarmUI all-level parity: READY")
     else:

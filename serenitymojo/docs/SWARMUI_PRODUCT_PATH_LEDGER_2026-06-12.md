@@ -101,9 +101,10 @@ Acceptance evidence:
 - 2026-06-12 current checker:
   `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=56 passed=55 p0=0 p1=1 p2=0`. Product P0 is ready after the bounded
-  video smoke runner wiring, model/gallery API slice, and sampler registry
-  wiring, but full SwarmUI all-level parity remains blocked. `images=N` now
+  `checks=56 passed=56 p0=0 p1=0 p2=0` for the tracked product-path gate.
+  Product P0/P1 is ready after the bounded video smoke runner wiring,
+  model/gallery API slice, sampler registry wiring, and typed linked t2i graph
+  executor, but full SwarmUI all-level parity remains blocked. `images=N` now
   emits indexed serial jobs, variation noise has a runtime artifact gate, and
   `/v1/samplers` exposes a pure-Mojo SwarmUI/Comfy sampler support registry.
   Z-Image now has bounded DPM++ 2M and UniPC bh2/simple-flowmatch wiring; true
@@ -258,8 +259,9 @@ Acceptance evidence:
 - `python3 scripts/check_ltx2_dtype_contract.py --scope all` passes.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` now reports
-  `checks=56 passed=55 p0=0 p1=1 p2=0`. This clears the product P0 blocker by
-  wiring a bounded daemon runner, not by accepting full video parity.
+  `checks=56 passed=56 p0=0 p1=0 p2=0` for the tracked product-path gate. This
+  keeps video parity blocked by evidence, while proving the bounded daemon
+  runner route is wired.
 - `POST /v1/video` accepts only `runner:"ltx2_staged_dev_smoke"` and clamps
   `steps` to `1..3`. It runs
   `output/bin/ltx2_video_smoke_runner staged lora stream audio nonag
@@ -378,14 +380,18 @@ Goal: future SwarmUI graph parity without blocking the core local generator.
 
 Current status:
 
-- 2026-06-12 update: daemon `/v1/generate` accepts constrained workflow bodies.
-  Supported inputs are `workflow.params` / `workflow.genparams` or SerenityUI
-  native t2i node graphs using `CheckpointLoaderSimple`, `CLIPTextEncode`,
-  `EmptyLatentImage`, `KSampler`, `VAEDecode`, and `SaveImage`. The adapter maps
-  known nodes into the existing flat genparams product path.
-- Unknown graph formats or node types fail with HTTP 501 and name the
-  unsupported node. This is a fail-loud adapter, not arbitrary SwarmUI/Comfy
-  graph execution.
+- 2026-06-12 update: daemon `/v1/generate` accepts typed linked workflow graphs
+  for the supported text-to-image chain. Supported inputs are
+  `workflow.params` / `workflow.genparams` or graph bodies using
+  `CheckpointLoaderSimple`, `CLIPTextEncode`,
+  `EmptyLatentImage`, `KSampler`, `VAEDecode`, and `SaveImage`. The graph
+  executor carries MODEL/CLIP/VAE/CONDITIONING/LATENT/IMAGE placeholders,
+  validates typed edges, runs supported nodes in dependency order, and maps the
+  result into the existing flat genparams product path.
+- Unknown graph formats, unsupported node types, wrong typed links, or cyclic
+  linked graphs fail with HTTP 501 and name the unsupported feature. This is a
+  fail-loud supported-t2i graph executor, not arbitrary SwarmUI/Comfy graph
+  execution.
 - ControlNet/IP-Adapter/regional prompting/live preview/upscaler utility paths
   have partial model pieces but no accepted full product surface in this audit.
 
@@ -398,18 +404,22 @@ Required implementation:
 Acceptance evidence:
 
 - `pixi run build-daemon` passes with the workflow adapter.
-- Runtime smoke on `output/bin/serenity_daemon stub 18120`: POSTing a wrapped
-  SerenityUI native node graph from
-  `/home/alex/.cache/serenityui/klein9b_nodegraph.workflow.json` queued
-  `job-0009`, completed it, wrote `output/serenity_daemon/job-0009.png`, and
-  gallery readback showed `serenity.genparams.v1` with prompt, negative prompt,
+- Runtime smoke on `output/bin/serenity_daemon stub`: POSTing a shuffled linked
+  t2i graph queued `job-0047`, completed it, wrote
+  `output/serenity_daemon/job-0047.png`, and PNG readback showed
+  `serenity.genparams.v1` with link-driven prompt/negative prompt, model,
   width/height, steps, seed, cfg, sampler, scheduler, and creativity mapped from
-  the graph/body.
+  the typed graph. The PNG IDAT hash was
+  `65fce6eb3887ce1186d34b2a22ea8a6229c9fc308ef55ba3a9513271c196fa5e`.
 - Unsupported graph smoke returned HTTP 501:
   `{"detail":"unsupported workflow graph node type: NotSupported"}`.
+- Wrong typed link smoke returned HTTP 501 with a `workflow graph input`
+  expected-type error.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
-  output/checks/swarmui_product_path_readiness.json` now reports
-  `checks=56 passed=55 p0=0 p1=1 p2=0`.
+  output/checks/swarmui_product_path_readiness.json` reports
+  `checks=56 passed=56 p0=0 p1=0 p2=0` for the tracked product-path gate. Full
+  SwarmUI all-level parity remains blocked by Qwen full generation, accepted
+  video generation, advanced workflow node families, and Z-Image speed parity.
 
 ## Build Order
 
@@ -420,8 +430,8 @@ Acceptance evidence:
    path before accepting image speed parity.
 3. Build one daemon-backed video runner that emits a real MP4 plus
    frame/duration/muxing/audio/timing/VRAM evidence.
-4. Extend constrained workflow support into a real graph executor only when each
-   node family has artifact-backed product gates.
+4. Extend the typed t2i workflow graph into advanced node families only when
+   each node family has artifact-backed product gates.
 5. Finish model/LoRA browser UI stack controls, Qwen/LoKr LoRA support, and
    compatibility beyond family-level metadata.
 6. Add advanced utility surfaces only when the backend emits real artifacts and

@@ -255,13 +255,323 @@ def _copy_field_if_missing(
         _set_if_missing(dst, dst_key, src[src_key])
 
 
+@fieldwise_init
+struct WorkflowLink(Copyable, Movable):
+    var found: Bool
+    var node_id: Int
+    var port: String
+
+
+def _workflow_id(obj: JSONValue) raises -> Int:
+    if not obj.is_object() or not obj.contains("id"):
+        raise Error("[501] workflow graph node missing id")
+    if obj["id"].is_int():
+        return obj["id"].as_int()
+    if obj["id"].is_string():
+        try:
+            return Int(obj["id"].as_string())
+        except:
+            pass
+    raise Error("[501] workflow graph node id must be an integer")
+
+
+def _workflow_ref_node(obj: JSONValue) raises -> Int:
+    if not obj.is_object() or not obj.contains("node"):
+        raise Error("[501] workflow graph edge endpoint missing node")
+    if obj["node"].is_int():
+        return obj["node"].as_int()
+    if obj["node"].is_string():
+        try:
+            return Int(obj["node"].as_string())
+        except:
+            pass
+    raise Error("[501] workflow graph edge endpoint node must be an integer")
+
+
+def _workflow_ref_port(obj: JSONValue) raises -> String:
+    if not obj.is_object() or not obj.contains("port") or not obj["port"].is_string():
+        raise Error("[501] workflow graph edge endpoint missing port")
+    return obj["port"].as_string()
+
+
+def _workflow_find_input_link(edges: JSONValue, to_node: Int, to_port: String) raises -> WorkflowLink:
+    var out = WorkflowLink(False, -1, String(""))
+    for i in range(edges.length()):
+        var edge = edges[i]
+        if not edge.is_object() or not edge.contains("from") or not edge.contains("to"):
+            raise Error("[501] workflow graph edge must have from/to endpoints")
+        var to = edge["to"]
+        var dst_node = _workflow_ref_node(to)
+        var dst_port = _workflow_ref_port(to)
+        if dst_node == to_node and dst_port == to_port:
+            if out.found:
+                raise Error("[501] workflow graph input has multiple sources: " + to_port)
+            var src = edge["from"]
+            out = WorkflowLink(True, _workflow_ref_node(src), _workflow_ref_port(src))
+    return out^
+
+
+def _workflow_has_node_id(ids: List[Int], id: Int) -> Bool:
+    for i in range(len(ids)):
+        if ids[i] == id:
+            return True
+    return False
+
+
+def _workflow_value_index(
+    nodes: List[Int], ports: List[String], node_id: Int, port: String,
+) -> Int:
+    for i in range(len(nodes)):
+        if nodes[i] == node_id and ports[i] == port:
+            return i
+    return -1
+
+
+def _workflow_add_value(
+    mut nodes: List[Int], mut ports: List[String], mut types: List[String],
+    node_id: Int, port: String, typ: String,
+) raises:
+    if _workflow_value_index(nodes, ports, node_id, port) >= 0:
+        raise Error("[501] workflow graph duplicate output value")
+    nodes.append(node_id)
+    ports.append(port)
+    types.append(typ)
+
+
+def _workflow_require_value_type(
+    nodes: List[Int], ports: List[String], types: List[String],
+    link: WorkflowLink, expected: String, input_name: String,
+) raises:
+    var idx = _workflow_value_index(nodes, ports, link.node_id, link.port)
+    if idx < 0:
+        raise Error("[501] workflow graph unresolved input: " + input_name)
+    if types[idx] != expected:
+        raise Error(
+            "[501] workflow graph input " + input_name + " expected "
+            + expected + " from " + String(link.node_id) + ":" + link.port
+            + " but got " + types[idx]
+        )
+
+
+def _workflow_model_name(
+    nodes: List[Int], ports: List[String], names: List[String], link: WorkflowLink,
+) raises -> String:
+    for i in range(len(nodes)):
+        if nodes[i] == link.node_id and ports[i] == link.port:
+            return names[i].copy()
+    raise Error("[501] workflow graph model handle missing source")
+
+
+def _workflow_conditioning_text(
+    nodes: List[Int], ports: List[String], texts: List[String], link: WorkflowLink,
+) raises -> String:
+    for i in range(len(nodes)):
+        if nodes[i] == link.node_id and ports[i] == link.port:
+            return texts[i].copy()
+    raise Error("[501] workflow graph conditioning handle missing source")
+
+
+def _workflow_latent_index(
+    nodes: List[Int], ports: List[String], link: WorkflowLink,
+) -> Int:
+    for i in range(len(nodes)):
+        if nodes[i] == link.node_id and ports[i] == link.port:
+            return i
+    return -1
+
+
+def _workflow_set_field_if_nonnegative_int(
+    mut obj: JSONValue, fields: JSONValue, src_key: String, dst_key: String,
+) raises:
+    if not fields.is_object() or not fields.contains(src_key) or fields[src_key].is_null():
+        return
+    if not fields[src_key].is_int():
+        raise Error("[501] workflow graph field " + src_key + " must be an integer")
+    var v = fields[src_key].as_int()
+    if v >= 0:
+        _set_if_missing(obj, dst_key, JSONValue.from_int(v))
+
+
+def _apply_workflow_graph_ir(mut obj: JSONValue, wf: JSONValue) raises:
+    """Typed executor for the supported Comfy/Swarm text-to-image graph subset."""
+    if not wf.contains("nodes") or not wf["nodes"].is_array():
+        raise Error("[501] workflow graph body needs nodes or params/genparams")
+    if not wf.contains("edges") or not wf["edges"].is_array():
+        raise Error("[501] workflow graph body needs edges for typed execution")
+    var nodes_json = wf["nodes"]
+    var edges = wf["edges"]
+    var ids = List[Int]()
+    for i in range(nodes_json.length()):
+        var node = nodes_json[i]
+        if not node.is_object():
+            raise Error("[501] workflow graph node must be an object")
+        var id = _workflow_id(node)
+        if _workflow_has_node_id(ids, id):
+            raise Error("[501] workflow graph duplicate node id: " + String(id))
+        var type_id = _workflow_string(node, String("type_id"))
+        if type_id == "":
+            raise Error("[501] unsupported workflow graph format: missing type_id")
+        if not (
+            type_id == "CheckpointLoaderSimple"
+            or type_id == "CLIPTextEncode"
+            or type_id == "EmptyLatentImage"
+            or type_id == "KSampler"
+            or type_id == "VAEDecode"
+            or type_id == "SaveImage"
+        ):
+            raise Error(String("[501] unsupported workflow graph node type: ") + type_id)
+        ids.append(id)
+
+    var done = List[Bool]()
+    for _ in range(nodes_json.length()):
+        done.append(False)
+
+    var value_nodes = List[Int]()
+    var value_ports = List[String]()
+    var value_types = List[String]()
+    var model_nodes = List[Int]()
+    var model_ports = List[String]()
+    var model_names = List[String]()
+    var cond_nodes = List[Int]()
+    var cond_ports = List[String]()
+    var cond_texts = List[String]()
+    var latent_nodes = List[Int]()
+    var latent_ports = List[String]()
+    var latent_widths = List[Int]()
+    var latent_heights = List[Int]()
+    var latent_images = List[Int]()
+
+    var remaining = nodes_json.length()
+    var saw_prompt = False
+    while remaining > 0:
+        var progressed = False
+        for i in range(nodes_json.length()):
+            if done[i]:
+                continue
+            var node = nodes_json[i]
+            var node_id = _workflow_id(node)
+            var type_id = _workflow_string(node, String("type_id"))
+            var fields = JSONValue.new_object()
+            if node.contains("fields") and node["fields"].is_object():
+                fields = node["fields"]
+
+            if type_id == "CheckpointLoaderSimple":
+                var model_name = _workflow_string(fields, String("ckpt_name"))
+                if model_name != "":
+                    _set_if_missing(obj, String("model"), JSONValue.from_string(model_name))
+                else:
+                    model_name = String("")
+                _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MODEL"), String("MODEL"))
+                _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CLIP"), String("CLIP"))
+                _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("VAE"), String("VAE"))
+                model_nodes.append(node_id); model_ports.append(String("MODEL")); model_names.append(model_name)
+                done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "EmptyLatentImage":
+                var width = _opt_int(fields, "width", 512, 16, 2048)
+                var height = _opt_int(fields, "height", 512, 16, 2048)
+                var images = _opt_int(fields, "batch_size", 1, 1, 64)
+                _set_if_missing(obj, String("width"), JSONValue.from_int(width))
+                _set_if_missing(obj, String("height"), JSONValue.from_int(height))
+                _set_if_missing(obj, String("images"), JSONValue.from_int(images))
+                _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
+                latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
+                latent_widths.append(width); latent_heights.append(height); latent_images.append(images)
+                done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "CLIPTextEncode":
+                var clip_link = _workflow_find_input_link(edges, node_id, String("clip"))
+                if clip_link.found:
+                    var idx = _workflow_value_index(value_nodes, value_ports, clip_link.node_id, clip_link.port)
+                    if idx >= 0:
+                        _workflow_require_value_type(value_nodes, value_ports, value_types, clip_link, String("CLIP"), String("clip"))
+                        var text = _workflow_string(fields, String("text"))
+                        _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
+                        cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(text)
+                        done[i] = True; remaining -= 1; progressed = True
+                else:
+                    raise Error("[501] workflow graph CLIPTextEncode missing clip input")
+            elif type_id == "KSampler":
+                var model_link = _workflow_find_input_link(edges, node_id, String("model"))
+                var pos_link = _workflow_find_input_link(edges, node_id, String("positive"))
+                var neg_link = _workflow_find_input_link(edges, node_id, String("negative"))
+                var latent_link = _workflow_find_input_link(edges, node_id, String("latent_image"))
+                if not model_link.found or not pos_link.found or not neg_link.found or not latent_link.found:
+                    raise Error("[501] workflow graph KSampler missing required typed input")
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, model_link.node_id, model_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, pos_link.node_id, pos_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, neg_link.node_id, neg_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, latent_link.node_id, latent_link.port) >= 0
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, model_link, String("MODEL"), String("model"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, pos_link, String("CONDITIONING"), String("positive"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, neg_link, String("CONDITIONING"), String("negative"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, latent_link, String("LATENT"), String("latent_image"))
+                    var model_name = _workflow_model_name(model_nodes, model_ports, model_names, model_link)
+                    if model_name != "":
+                        _set_if_missing(obj, String("model"), JSONValue.from_string(model_name))
+                    var prompt = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, pos_link)
+                    _set_if_missing(obj, String("prompt"), JSONValue.from_string(prompt))
+                    saw_prompt = True
+                    var negative = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, neg_link)
+                    _set_if_missing(obj, String("negative"), JSONValue.from_string(negative))
+                    var latent_idx = _workflow_latent_index(latent_nodes, latent_ports, latent_link)
+                    if latent_idx >= 0:
+                        _set_if_missing(obj, String("width"), JSONValue.from_int(latent_widths[latent_idx]))
+                        _set_if_missing(obj, String("height"), JSONValue.from_int(latent_heights[latent_idx]))
+                        _set_if_missing(obj, String("images"), JSONValue.from_int(latent_images[latent_idx]))
+                    _copy_field_if_missing(obj, fields, String("steps"), String("steps"))
+                    _workflow_set_field_if_nonnegative_int(obj, fields, String("seed"), String("seed"))
+                    _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
+                    _copy_field_if_missing(obj, fields, String("sampler_name"), String("sampler"))
+                    _copy_field_if_missing(obj, fields, String("scheduler"), String("scheduler"))
+                    _copy_field_if_missing(obj, fields, String("denoise"), String("creativity"))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
+                    latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
+                    if latent_idx >= 0:
+                        latent_widths.append(latent_widths[latent_idx])
+                        latent_heights.append(latent_heights[latent_idx])
+                        latent_images.append(latent_images[latent_idx])
+                    else:
+                        latent_widths.append(512); latent_heights.append(512); latent_images.append(1)
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "VAEDecode":
+                var samples_link = _workflow_find_input_link(edges, node_id, String("samples"))
+                var vae_link = _workflow_find_input_link(edges, node_id, String("vae"))
+                if not samples_link.found or not vae_link.found:
+                    raise Error("[501] workflow graph VAEDecode missing required typed input")
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, samples_link.node_id, samples_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, vae_link.node_id, vae_link.port) >= 0
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, samples_link, String("LATENT"), String("samples"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, vae_link, String("VAE"), String("vae"))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "SaveImage":
+                var image_link = _workflow_find_input_link(edges, node_id, String("images"))
+                if not image_link.found:
+                    raise Error("[501] workflow graph SaveImage missing images input")
+                var idx = _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port)
+                if idx >= 0:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("images"))
+                    done[i] = True; remaining -= 1; progressed = True
+
+        if not progressed:
+            raise Error("[501] workflow graph has unresolved or cyclic typed links")
+
+    if not saw_prompt and (not obj.contains("prompt") or obj["prompt"].is_null()):
+        raise Error("[501] workflow graph did not contain a prompt node")
+
+
 def _apply_workflow_params(mut obj: JSONValue) raises:
     """Map a constrained SerenityUI native t2i workflow to flat genparams.
 
-    This is intentionally not an arbitrary graph executor. Known node types are
-    lifted into the same `/v1/generate` product path; unknown graph nodes fail
-    loudly with 501 so the UI cannot mistake partial graph parity for full
-    SwarmUI workflow parity.
+    Linked `workflow.nodes`/`workflow.edges` bodies are executed through a typed
+    graph IR for the supported t2i chain. Older field-only bodies still use the
+    compatibility lift below. Unknown graph nodes fail loudly with 501 so the UI
+    cannot mistake partial graph parity for full SwarmUI workflow parity.
     """
     if not obj.contains("workflow") or obj["workflow"].is_null():
         return
@@ -295,6 +605,9 @@ def _apply_workflow_params(mut obj: JSONValue) raises:
 
     if not wf.contains("nodes") or not wf["nodes"].is_array():
         raise Error("[501] workflow graph body needs nodes or params/genparams")
+    if wf.contains("edges") and wf["edges"].is_array():
+        _apply_workflow_graph_ir(obj, wf)
+        return
 
     var nodes = wf["nodes"]
     var saw_prompt = False

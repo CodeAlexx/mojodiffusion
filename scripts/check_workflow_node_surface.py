@@ -27,6 +27,7 @@ IMAGE_IO = REPO / "serenitymojo/serve/image_io.mojo"
 MODEL_SCAN = REPO / "serenitymojo/serve/model_scan.mojo"
 LEDGER = REPO / "serenitymojo/docs/SWARMUI_PRODUCT_PATH_LEDGER_2026-06-12.md"
 ROADMAP = REPO / "serenitymojo/docs/SWARMUI_PARITY_ROADMAP_2026-06-12.md"
+WORKFLOW_GRAPH_PRODUCT = REPO / "output/checks/workflow_graph_product_readiness.json"
 
 P0 = "P0"
 P1 = "P1"
@@ -75,6 +76,16 @@ def read(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def function_body(text: str, name: str) -> str:
@@ -206,16 +217,39 @@ def check_supported_nodes() -> list[Check]:
                 "params",
                 "genparams",
                 "nodes",
-                "This is intentionally not an arbitrary graph executor",
+                "Linked `workflow.nodes`/`workflow.edges` bodies are executed",
             ],
             severity=P0,
-            acceptance="Daemon exposes the constrained workflow adapter and documents its graph-executor limit.",
+            acceptance="Daemon exposes flat workflow passthrough plus typed linked-graph execution for supported nodes.",
         )
     )
     checks.append(
         check_body_contains(
             DAEMON,
-            "_apply_workflow_params",
+            "_apply_workflow_graph_ir",
+            category="workflow",
+            label="typed linked graph IR executor",
+            needles=[
+                "_workflow_find_input_link",
+                "_workflow_add_value",
+                "_workflow_require_value_type",
+                "edges",
+                "MODEL",
+                "CLIP",
+                "VAE",
+                "CONDITIONING",
+                "LATENT",
+                "IMAGE",
+                "unresolved or cyclic typed links",
+            ],
+            severity=P0,
+            acceptance="Supported Comfy/Swarm t2i graphs use typed handles and topological execution instead of field-only flattening.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            DAEMON,
+            "_apply_workflow_graph_ir",
             category="workflow",
             label="supported Comfy-like node markers",
             needles=SUPPORTED_NODE_TYPES,
@@ -226,7 +260,7 @@ def check_supported_nodes() -> list[Check]:
     checks.append(
         check_body_contains(
             DAEMON,
-            "_apply_workflow_params",
+            "_apply_workflow_graph_ir",
             category="workflow",
             label="supported node field mappings",
             needles=[
@@ -298,6 +332,18 @@ def check_fail_loud() -> list[Check]:
         check_contains(
             DAEMON,
             category="failure",
+            label="typed workflow graph validation fails loud",
+            needles=[
+                "[501] workflow graph body needs edges for typed execution",
+                "[501] workflow graph input ",
+                "[501] workflow graph has unresolved or cyclic typed links",
+            ],
+            severity=P0,
+            acceptance="Bad typed links and cyclic linked graphs fail before enqueue.",
+        ),
+        check_contains(
+            DAEMON,
+            category="failure",
             label="501 sentinel converted to HTTP 501",
             needles=[
                 'msg.startswith("[501] ")',
@@ -345,14 +391,15 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             ZIMAGE_BACKEND,
             category="lora",
-            label="Z-Image LoRA admission is bounded",
+            label="Z-Image LoRA admission is explicit",
             needles=[
-                "at most one LoRA overlay per job is supported",
+                "merge_zimage_lora_sets_for_inference",
+                "rank_concat_scaled_b",
                 "load_zimage_lora_main_only_comfy",
                 "load_zimage_lora_main_only_resume",
             ],
             severity=P1,
-            acceptance="Z-Image LoRA support is explicit and does not pretend multi-LoRA stack parity.",
+            acceptance="Z-Image LoRA support is explicit and bounded to proven runtime formats.",
         ),
         check_contains(
             QWEN_BACKEND,
@@ -412,6 +459,52 @@ def check_family_surfaces() -> list[Check]:
     ]
 
 
+def check_workflow_graph_product_report() -> Check:
+    report = read_json(WORKFLOW_GRAPH_PRODUCT)
+    if not report:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            f"missing report: {rel(WORKFLOW_GRAPH_PRODUCT)}",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            "A daemon product smoke posts a linked graph, emits PNG genparams, and verifies typed-link 501 failures.",
+        )
+    blockers = report.get("blockers")
+    if report.get("ready") is not True:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "report not ready: " + json.dumps(blockers),
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            "A daemon product smoke posts a linked graph, emits PNG genparams, and verifies typed-link 501 failures.",
+        )
+    job = report.get("job")
+    png = report.get("png")
+    if not isinstance(job, dict) or not isinstance(png, dict):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "report missing job/png evidence",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            "A daemon product smoke posts a linked graph, emits PNG genparams, and verifies typed-link 501 failures.",
+        )
+    return Check(
+        True,
+        PASS,
+        "workflow",
+        "typed workflow graph product smoke",
+        f"linked graph completed {job.get('id')} and wrote {png.get('path')}; unsupported and wrong-type links returned HTTP 501",
+        rel(WORKFLOW_GRAPH_PRODUCT),
+        "A daemon product smoke posts a linked graph, emits PNG genparams, and verifies typed-link 501 failures.",
+    )
+
+
 def check_docs() -> list[Check]:
     return [
         check_contains(
@@ -432,7 +525,7 @@ def check_docs() -> list[Check]:
             category="docs",
             label="ledger records constrained workflow status",
             needles=[
-                "constrained workflow bodies",
+                "typed linked workflow",
                 "CheckpointLoaderSimple",
                 "unsupported workflow graph node type",
             ],
@@ -444,7 +537,7 @@ def check_docs() -> list[Check]:
             category="docs",
             label="roadmap keeps graph gap visible",
             needles=[
-                "arbitrary graph execution beyond the constrained native t2i adapter",
+                "advanced Comfy/Swarm node families beyond the typed t2i graph",
                 "Qwen full daemon generation was not run",
                 "Video generation is still not accepted",
                 "ltx2_staged_dev_smoke",
@@ -461,6 +554,7 @@ def collect_checks() -> list[Check]:
     checks.extend(check_supported_nodes())
     checks.extend(check_fail_loud())
     checks.extend(check_family_surfaces())
+    checks.append(check_workflow_graph_product_report())
     return checks
 
 
@@ -470,10 +564,11 @@ def build_report(checks: list[Check]) -> dict[str, object]:
     p2 = [check for check in checks if not check.ok and check.severity == P2]
     return {
         "schema": "serenity.workflow_node_surface_readiness.v1",
-        "scope": "no-CUDA static source marker check; no daemon start, no graph execution, no generation",
+        "scope": "static source markers plus the latest typed workflow graph product smoke report",
         "constrained_workflow_adapter_ready": not p0,
         "arbitrary_comfy_swarm_graph_execution_ready": False,
-        "full_graph_parity_claim": "blocked",
+        "supported_t2i_graph_execution_ready": not p0 and not p1,
+        "full_graph_parity_claim": "blocked_for_advanced_node_families",
         "supported_adapter_node_types": SUPPORTED_NODE_TYPES,
         "unsupported_node_examples_expected_501": UNSUPPORTED_NODE_EXAMPLES,
         "summary": {

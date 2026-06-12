@@ -29,10 +29,11 @@ python3 scripts/check_swarmui_product_path_contract.py --write-readiness output/
 
 Current result after adding variation noise runtime behavior, the
 sampler/scheduler registry, the bounded LTX2 video smoke runner, the
-model/gallery API slice, bounded Z-Image UniPC bh2, and Z-Image multi-LoRA
-runtime stacking:
-`56` checks, `55` passed, `P0=0`, `P1=1`, `P2=0`. Product P0 is ready, but
-full SwarmUI all-level parity is still blocked.
+model/gallery API slice, bounded Z-Image UniPC bh2, Z-Image multi-LoRA runtime
+stacking, and typed linked workflow execution for the supported t2i graph:
+`56` checks, `56` passed, `P0=0`, `P1=0`, `P2=0` for the tracked product-path
+gate. Product P0/P1/P2 is ready inside that gate, but full SwarmUI all-level
+parity is still blocked.
 
 Current high-risk runtime gaps:
 
@@ -51,8 +52,11 @@ Current high-risk runtime gaps:
   daemon artifact gate; this is not full sampler/scheduler parity.
 - `images=N` now emits serial indexed daemon jobs with seed offsets and
   metadata. True Comfy-style batched latent execution remains unimplemented.
-- Workflow support is a constrained SerenityUI native t2i adapter, not a full
-  arbitrary SwarmUI/Comfy graph executor.
+- Workflow support now keeps advanced Comfy/Swarm node families beyond the typed t2i graph as an explicit remaining blocker.
+- The accepted workflow path is a typed linked t2i graph executor for
+  `CheckpointLoaderSimple`, `CLIPTextEncode`, `EmptyLatentImage`, `KSampler`,
+  `VAEDecode`, and `SaveImage`; unsupported graph families must keep failing
+  loudly.
 - Z-Image speed parity is not accepted; current evidence still needs a paired
   baseline and optimized CFG/main-stack path.
 
@@ -86,6 +90,7 @@ Current artifact evidence found in this working tree:
   - `output/serenity_daemon/job-0036.png.zimage_daemon_result.json`
   - `output/serenity_daemon/job-0040.png`
   - `output/serenity_daemon/job-0040.png.zimage_daemon_result.json`
+  - `output/serenity_daemon/job-0047.png`
 
 `job-0028` is the current 512x512, 1-step experimental artifact from the daemon
 product path, produced by the repeatable runtime gate. It proves the Z-Image
@@ -103,6 +108,12 @@ product path. It proves `requested_sampler:"uni_pc_bh2"` executes as
 `denoise_seconds_per_step:0.32013946925`, and `peak_vram_mib:21727.5625`.
 Generic `uni_pc` remains fail-loud (`job-0038`) until its exact Comfy/Swarm
 semantics are separately mapped and proven.
+
+`job-0047` is the current typed linked workflow graph smoke artifact from the
+stub daemon product path. It proves linked positive/negative conditioning, model,
+latent dimensions, sampler fields, scheduler, seed, CFG, denoise/creativity, PNG
+metadata, and fail-loud wrong-type-link/unsupported-node behavior for the
+supported t2i graph. It is not advanced Comfy/Swarm graph parity.
 
 ## What We Have
 

@@ -36,8 +36,13 @@ State in one sentence each:
 serenitymojo/
   training/                        # SHARED pipeline — written ONCE, model-agnostic. REUSE, don't fork.
     train_config.mojo              #   TrainConfig (lr, shift, rank, alpha, eps, dims) — one struct
+    levers.mojo                    #   THE runtime-config dispatch (2026-06-11) — see "Levers" section below
     train_step.mojo                #   shared LoRA step recipe + LoraAdapter/_lora_fwd/_lora_bwd/_lora_adamw
     optim.mojo schedule.mojo loop.mojo checkpoint*.mojo   # AdamW, flow-match/timestep, F32-master loop, ckpt
+    adamw8bit.mojo adafactor.mojo adamw_schedulefree.mojo  # T1.C/T2.A optimizers (parity-gated; dispatch via levers)
+    lora_ema.mojo caption_dropout.mojo loss_weight.mojo    # T1.B/T1.D levers backends
+    aspect_buckets.mojo            #   T2.D SimpleTuner-semantics bucketing (comptime 14-arm dispatch; zimage worked example)
+    full_finetune_contract.mojo full_finetune_zimage.mojo  # T2.C full-FT (OneTrainer contract; zimage RUNNABLE+gated, c789b6d)
     dit_block.mojo                 #   the PROVEN single-stream block (template for new blocks)
     klein_dataset.mojo             #   dataloader (write_sample / KleinCache / load_batch) — generalize per model
     validation_sampler.mojo lora_save.mojo   # harness: sample (L2P gate), PEFT save/resume
@@ -77,6 +82,62 @@ serenitymojo/
 - VAE decoder (and encoder if it exists); `cap_cache` for the latent/text cache.
 - The shared `training/` pipeline (step recipe, LoRA math, optim, schedule, loop, ckpt, sampler, save, config reader).
 
+## Levers — the ONE runtime-config dispatch (BINDING, Tier-1 2026-06-11)
+
+`training/levers.mojo` is the single shared runtime-config module. ALL FOUR
+trainers (zimage / klein / hidream-o1 / ideogram4) route through it; a new
+trainer MUST plug in here — **never fork a per-trainer comptime variant**
+(TIER1_PARITY_CAMPAIGN_2026-06-11.md MODULARITY DIRECTIVE). One call per
+lever at the trainer seam:
+- **Loss**: `levers_loss_grad` — MSE (default, formula-identical to the old
+  inline blocks) | Huber | SmoothL1, + min-SNR **flow** weight
+  (`min_snr_gamma_flow`; SEPARATE key from klein's v-pred `min_snr_gamma` —
+  header explains the divisor difference). Math in `ops/loss_fns.mojo`
+  (torch-gated); levers is dispatch only. `levers_loss_active()` lets a
+  site keep a literal legacy block for bit-provable defaults.
+- **Optimizer**: `levers_optimizer_active/step` — ADAMW (default) |
+  ADAFACTOR | SCHEDULE_FREE_ADAMW | ADAMW_8BIT (bnb-parity,
+  `training/adamw8bit.mojo`); unsupported tags fail loud. No save/resume
+  sidecar yet — `levers_optimizer_step` fails loud on resume.
+- **EMA** (`lora_ema.mojo`, SimpleTuner-parity BIT-EXACT, sibling `_ema`
+  saves), **caption dropout** (`caption_dropout_pick`, seeded
+  `seed_base*31+step` stream), **masked loss** (`levers_masked_*`).
+- **C13 default-off contract**: keys absent ⇒ byte-identical to the
+  pre-levers path; every wiring change re-runs the flags-off anchors.
+- **UI seam**: TrainConfig JSON keys ← serenity-trainer
+  `TrainerConfigModel` → `trainer_ui_runner_train_config_json` emission;
+  the gate is `/home/alex/serenity-trainer/smoke/runner_train_config_gate
+  .mojo` (128 checks as of eaa88f1). A lever is NOT done until the UI key
+  + runner emission + a UI-config-launched smoke exist.
+
+Anchor configs (flags-off gates): `configs/zimage_alina_anchor.json`,
+`configs/klein9b.json`, `configs/hidream_o1.json` (hidream trainer takes an
+optional trailing argv `[config.json]`; argv wins for steps/lr/rank/out_dir).
+ideogram4 (serenity-trainer) live trainer: argv 10 = caption_dropout,
+argv 11 = levers JSON ("-" sentinel).
+
+## Tier-2 features available to a training session (2026-06-11, one-liners)
+
+- **8-bit Adam** — `training/adamw8bit.mojo`, bnb 0.49.2 block-256 parity
+  (17 gates); levers tag ADAMW_8BIT.
+- **fp8-quantized-resident base** — HiDream first: `"quantized_resident":
+  "fp8_e4m3"` (default OFF). VRAM −5.8GB, ~+10% s/step; DIFFERENT-trajectory
+  numerics class — never mix-resume across the flag (see
+  `numeric-parity-testing` quantized-class gates).
+- **Aspect bucketing** — `training/aspect_buckets.mojo` (SimpleTuner-exact
+  assignment) + zimage stager/prepare opt-in t2d argv modes + comptime
+  14-arm trainer dispatch (landscape buckets live).
+- **Full-FT zimage** — OneTrainer contract (F32 masters on host + 8-bit
+  moments + bf16-resident device write-back; schema in
+  `full_finetune_contract.mojo`); `full_finetune_zimage.mojo` is WIP/
+  UNGATED — no "runnable full-FT" claims yet.
+- **zimage ControlNet** — `models/zimage/controlnet_block.mojo` gated
+  block (diffusers ZImageControlNetModel pattern); trainer data path is
+  the follow-up; `controlnet_layers>0` fails loud in train_zimage_real.
+- **Lycoris** — all 7 families (LoCon/LoHa/Tucker/OFT/LoKr/BOFT/DoRA)
+  verified primitives with upstream-bit-exact saves (oracle pip
+  lycoris_lora 3.4.0); trainer dispatch still raises = follow-up.
+
 ## Seam contracts + Mojo constraints (a design MUST respect)
 
 - **Attention dims (B,S,H,Dh) are COMPTIME** (the SDPA kernel is comptime-shaped) → the
@@ -90,6 +151,21 @@ serenitymojo/
 - **Inter-block handoff**: a block's `d_x` = the next block's `d_y` (the proven composition contract).
 - **Modulation** (AdaLN) is usually SHARED across blocks (one img_mod/single_mod feeds all
   blocks of a kind); ModVecs come from `linear(silu(t_embedder(timestep)), *_modulation.lin)`.
+- **SDPA bf16-flash (cuDNN shim, 2026-06-11)**: trainers using `ops/attention_flash.mojo`
+  link `-Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa` and need
+  LD_LIBRARY_PATH with `serenitymojo/ops/cshim/lib` + the `~/.local/lib/python3.12/
+  site-packages/nvidia/cudnn/lib` wheel dir. **Flash bwd dQ is nondeterministic
+  run-to-run** → flash-on trainer anchors are 4dp value-classes with documented wobble
+  (klein 0.5414/0.2154/0.7810 ±~4e-4; zimage 0.4745/0.5739|0.5740/0.4903/0.5065/0.4750,
+  step-1 byte-anchor 0.47450438), NOT bit gates. Details: `autograd-v2` skill +
+  `numeric-parity-testing`.
+- New gotchas (2026-06-11, beyond `mojo-port`'s list): (a) UnsafePointer params need an
+  explicit origin (`UnsafePointer[BFloat16, MutAnyOrigin]`); (b) re-bodying a gated FP
+  loop into an `@parameter` closure can change FMA contraction and break bit-equality —
+  keep gated math in ONE `@no_inline` function and parallelize AROUND it (measured in
+  `training/full_finetune_zimage.mojo`, see its header); (c) background child processes
+  die when their spawning agent session ends — the ORCHESTRATOR session launches long
+  smokes, never a sub-agent.
 
 ## Verification discipline (NON-NEGOTIABLE — the gate)
 
@@ -121,6 +197,9 @@ serenitymojo/
    model's VAE encoder only if missing (gate std≈0.96).
 7. **Wire `train.mojo`** (or a `train_<model>_real.mojo` loop): cache→flow-match target→
    stack fwd/bwd→AdamW/LoRA-adamw→log loss+grad_norm; reuse `validation_sampler` + `lora_save`.
+   Loss/optimizer/EMA/dropout/masked-loss go through `training/levers.mojo` (see the
+   Levers section — one call per lever, C13 flags-off anchors re-run, UI keys + runner
+   emission + seam gate before "done").
 8. **Real-run gate (the L2P verdict)**: loss DROPS **and a sample SHIFTS** with the LoRA —
    never loss alone.
 

@@ -15,6 +15,15 @@ for oracle dumps, static guards, and tooling only.
    - preserve model type, training method, dtype, optimizer, LR, cache/output,
      sample/save/backup, validation, EMA, masked/prior flags, checkpoint/offload
    - unsupported combinations must fail before `DeviceContext()`
+   - loss fn (MSE/Huber/SmoothL1 + min-SNR flow), optimizer dispatch (ADAMW
+     default + ADAFACTOR + SCHEDULE_FREE_ADAMW + ADAMW_8BIT), EMA, caption
+     dropout, and masked loss are runtime levers in
+     `serenitymojo/training/levers.mojo` — wire ONE call per lever, never a
+     per-trainer fork (see `mojo-train-port` Levers section); flags-off
+     anchors must stay exact (C13)
+   - TrainConfig JSON keys must round-trip from the serenity-trainer UI:
+     `TrainerConfigModel` -> `trainer_ui_runner_train_config_json` emission;
+     gate = `/home/alex/serenity-trainer/smoke/runner_train_config_gate.mojo`
 2. Cache/data path:
    - mirror OneTrainer cache fields and tensor shapes
    - preserve cached storage dtype at boundaries
@@ -37,6 +46,10 @@ for oracle dumps, static guards, and tooling only.
    - if OneTrainer registers `TrainingMethod.FINE_TUNE`, either implement real
      full-weight update/save/load/resume or add a fail-loud preflight
    - scaffolding alone must keep `full_finetune_ready=false`
+   - the OneTrainer master/weight contract is pinned in
+     `serenitymojo/training/full_finetune_contract.mojo`: F32 masters on host
+     + 8-bit moments + bf16-resident device write-back;
+     `full_finetune_zimage.mojo` is the worked example (gated + committed c789b6d: 5.31B params, slot-parallel host 8-bit AdamW, 67-81 s/step, schema-exact save)
 7. Product loop:
    - bind through shared OneTrainer loop policy
    - apply save/sample cadence from sample config
@@ -50,6 +63,10 @@ for oracle dumps, static guards, and tooling only.
 - Loss replay, backward grads, AdamW update, optimizer state, save/resume each
   have gates or explicit blockers.
 - Speed is measured as steady-state seconds/step with peak VRAM, not guessed.
+- Trainers built with flash SDPA gate against 4dp value-class anchors (flash
+  bwd dQ is nondeterministic run-to-run), not bit anchors — see
+  `numeric-parity-testing` and the `autograd-v2` skill for the current
+  klein/zimage anchor classes and the cuDNN shim link/LD_LIBRARY_PATH lines.
 
 ## Dtype Contract
 

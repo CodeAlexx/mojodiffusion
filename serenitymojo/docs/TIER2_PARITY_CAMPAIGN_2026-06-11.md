@@ -14,7 +14,7 @@ serenity-trainer UI.
 |---|---|---|
 | T2.A | 8-bit Adam (bnb block-wise parity) | SHIPPED |
 | T2.B | fp8-quantized-resident base (HiDream first) | SHIPPED (default-OFF) |
-| T2.C | Full-rank finetune (1 model) — RE-SCOPED per Alex 2026-06-12: OneTrainer-contract item, NOT SimpleTuner parity (removed from the ST audit table; ST full-FT is accelerate/DeepSpeed-shaped = out of scope). Oracle = full_finetune_contract.mojo / OneTrainer *FineTuneSetup | WIP — gates in flight (parallel-optimizer bit-equality being fixed) |
+| T2.C | Full-rank finetune (zimage) — RE-SCOPED per Alex 2026-06-12: OneTrainer-contract item, NOT SimpleTuner parity. Oracle = full_finetune_contract.mojo / OneTrainer *FineTuneSetup | SHIPPED v1 gated (c789b6d): 5.31B params, 67-81 s/step, 15.8GB device peak; follow-ups in results |
 | T2.D | Dynamic aspect bucketing | SHIPPED + follow-up SHIPPED (comptime-generated 14-arm dispatch, landscape buckets live) |
 | T2.E | ControlNet (1 model) | GATED BLOCK (zimage; trainer data path = follow-up) |
 | T2.F | Lycoris LoCon/LoHa/Tucker/OFT | SHIPPED (verified primitives) |
@@ -128,15 +128,22 @@ sentinel); NEW hidream runner target + binary + config.json delivery
 128 PASS; bridge parser PASS; ideogram4 argv old-vs-new equivalence
 EXACT (1.12493/1.1416154 both forms).
 
-### T2.C — full-rank finetune zimage (2026-06-11) WIP, UNGATED
-Agent died on spend limit mid-build. On disk (committed so the tree is
-clean, UNGATED): training/full_finetune_zimage.mojo (8-bit-AdamW-based
-full-FT step machinery; orchestrator fixed an UnsafePointer origin
-syntax error at :148 to unblock the tree), configs/zimage_full_ft_smoke
-.json, train_config/reader keys, train_zimage_real hooks. Flag-off C13
-PROVEN (anchor gate EXACT on this tree); the full-FT path itself has NO
-gate yet — VRAM math, smoke, save-format check all owed before any
-"runnable full-FT" claim.
+### T2.C — full-rank finetune zimage (2026-06-12) SHIPPED v1, gated (c789b6d)
+RUNNABLE on the OneTrainer contract: F32 masters (21.2GB host) + bnb 8-bit
+moments (10.6GB host) + bf16-resident device weights = RNE master image.
+v1 surface = 30 main blocks x 7 slots, 5.31B/6.15B params (86%).
+MEASURED: device peak 15831 MiB <= 24GB; host ~43/62GB; 67-81 s/step
+(was 407.8 serial — FP lesson: closure re-body picked up FMA contraction
+and FAILED the bit gate; fix = byte-identical @no_inline body, parallelism
+at the 210-slot level, slot-parallel bit-gate mismatches=0). GATES: run-
+start fast-requant equivalence bit-equal; 5-step smoke (upd_l1 nonzero
+every step, trained delta 170M elems); checkpoint 521 keys SOURCE-schema
+diff PASS; C13 LoRA anchors EXACT (byte-anchor 0.47450438).
+FOLLOW-UPS: surface extension to 100% (measured per-group gap list in the
+T2.C report: final linear cheapest -> adaLN/norms -> embedders ->
+refiners; host fits, predicted 49.2GB); resume sidecar (8-bit state vs
+contract's F32 moments = open design); GPU-resident streamed 8-bit
+optimizer kernel (step is ~90% host optimizer).
 
 ### T2.F-2 — LoKr/BOFT/DoRA (2026-06-11) SHIPPED, upstream gates RUN
 Predecessor committed: lokr_adapter.mojo both-full scale quirk mirror

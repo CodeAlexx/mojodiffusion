@@ -52,6 +52,10 @@ intake note and blocker list, not implementation.
    - full finetune inventory/save/load/resume if OneTrainer registers it
    - sampler components: scheduler, text conditioning, noise, VAE, image output
    - parity scripts/manifests
+   - levers wiring: loss/optimizer/EMA/dropout/masked-loss dispatch through
+     `serenitymojo/training/levers.mojo` + TrainConfig keys + serenity-trainer
+     UI runner emission (these are SHARED — count them as wiring, not as
+     surfaces to build; see `ot-mojo-training-port`)
 
 ## Required Intake Output
 

@@ -35,9 +35,11 @@ the SPEED comes from the companion pieces (slab, capture, sync-elim,
 residency) — never ship the engine without them.
 
 Status (2026-06-11, measured): **complete on zimage B1** (trains via 2
-cuGraphLaunch calls, 100-step byte-identical, ~1.63 s/step) and **shipped
-on Klein** (per-block graphs, no slab/capture — scope decision; 2.2–2.4
-s/step). Next: P7 zimage batch-2 unification, then rest-of-models.
+cuGraphLaunch calls, 100-step byte-identical, ~1.63 s/step captured) and
+**shipped on Klein** (per-block graphs, no slab/capture — scope decision).
+With flash SDPA (same day): zimage ~1.35 s/step (flash in graph backward,
+capture OFF), klein ~1.8–2.0 s/step. Next: P7 zimage batch-2 unification,
+then rest-of-models.
 
 ## File map
 
@@ -83,7 +85,11 @@ Per step, per block (recompute-style checkpoint, matching the hand-chain):
    (ops/*_backward or the block's own _stream_* helpers, called WHOLE).
 4. Grads land in the SAME flat lists feeding grad-norm/clip + the
    resident fused AdamW (`training/lora_adamw_{plain,ot}_fused.mojo` —
-   dev_p IS the next step's weights, no per-step set upload).
+   dev_p IS the next step's weights, no per-step set upload). Loss fns,
+   optimizer selection, EMA, caption dropout, masked loss are all
+   runtime-dispatched through `training/levers.mojo` (Tier-1 campaign,
+   2026-06-11) — see `mojo-train-port` for the contract; never fork a
+   per-trainer variant.
 5. Conductor seam (C10): the stack loop keeps its turbo_loader
    await_block/prefetch/mark_active_block_done calls AROUND the per-block
    graph call — the engine does not own offload.
@@ -93,11 +99,16 @@ Per step, per block (recompute-style checkpoint, matching the hand-chain):
 
 ## Contract clauses that bite daily (full text in the design doc)
 
-- **C14 — the oracle is the hand-chain, bit-level.** zimage gates =
-  5-step anchors every digit + 100-step zero-diff. Klein CANNOT be
-  bit-gated across runs (~4e-4 documented nondeterminism) → its gate is
-  SAME-PROCESS bit equality (tests/klein_block_parity.mojo) + trainer
-  anchors within the variance class.
+- **C14 — the oracle is the hand-chain, bit-level.** Engine-vs-hand-chain
+  gates stay bit-level (math-mode: zimage 5-step anchors every digit +
+  100-step zero-diff). But with flash SDPA ON, trainer anchors are
+  **4dp value-classes, NOT bit gates** — flash bwd dQ is nondeterministic
+  run-to-run (measured): zimage 0.4745/0.5739|0.5740/0.4903/0.5065/0.4750
+  (step-2 wobbles at digit 5; step-1 byte-anchor 0.47450438 every run);
+  klein 3-step 0.5414/0.2154/0.7810 within the ~4e-4 variance class around
+  0.5414262/0.2154109/0.78077525. Klein additionally gates SAME-PROCESS
+  bit equality (tests/klein_block_parity.mojo). See
+  `numeric-parity-testing` "nondeterministic-kernel trajectory gates."
 - **C15 — slot-ordered fan-in.** bf16 add is order-sensitive; fan-in
   slots are assigned at RECORDING time = the hand-chain's fold order.
   2-way fan-ins may reverse operand order (commutative, bit-equal);
@@ -160,12 +171,21 @@ rm -f serenitymojo.mojopkg && pixi run mojo build -I . -Xlinker -lm \
 env $L /tmp/klein_block_parity
 
 # Klein trainer 3-step anchor gate (variance class ~4e-4 around
-# 0.5414262 / 0.2154109 / 0.78077525; ~2.2-2.4 s/step):
+# 0.5414262 / 0.2154109 / 0.78077525; ~1.8-2.0 s/step with flash):
 env $L /tmp/<klein_bin> serenitymojo/configs/klein9b.json 3 0 - nosample_profile
 
-# zimage gates (anchors every digit, b1match/b2dup byte-identical,
+# zimage trainer anchor gate: configs/zimage_alina_anchor.json (promoted
+# from /tmp 2026-06-11) — 5-step 4dp value-class
+# 0.4745/0.5739|0.5740/0.4903/0.5065/0.4750, step-1 byte-anchor
+# 0.47450438. Math-mode engine gates stay bit-level (anchors every digit,
 # 100-step zero-diff; see HANDOFF_2026-06-11_OVERNIGHT_OT_PARITY.md §-1
 # for the full verify-everything block + OneTrainer oracle commands)
+
+# flash-linked trainer builds ADDITIONALLY need (see flash section):
+#   -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa
+# and at runtime LD_LIBRARY_PATH must ALSO carry
+#   serenitymojo/ops/cshim/lib (libserenity_cudnn_sdpa.so) and
+#   ~/.local/lib/python3.12/site-packages/nvidia/cudnn/lib
 ```
 
 ## cuDNN flash SDPA (ops/attention_flash.mojo, shipped 2026-06-11)
@@ -173,15 +193,20 @@ env $L /tmp/<klein_bin> serenitymojo/configs/klein9b.json 3 0 - nosample_profile
 Approved numerics change (35-43x over math-mode, gates in
 ops/tests/sdpa_flash_parity.mojo). Build needs extra link args
 `-Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa`
-(rebuild the .so with ops/cshim/build.sh) and runtime needs
+(rebuild the .so with ops/cshim/build.sh) and runtime needs BOTH
+`serenitymojo/ops/cshim/lib` AND
 `~/.local/lib/python3.12/site-packages/nvidia/cudnn/lib` on
 LD_LIBRARY_PATH — the EriDiffusion/.venv_cache cuDNN wheel FAILS with
 "No valid execution plans" (bad engines lib). Trainer wiring is DONE on
-klein (1.8 s/step, KLEIN_SDPA_FLASH in single_block.mojo) and zimage
-(~1.35 s/step, ZIMAGE_SDPA_FLASH in lora_block.mojo; capture OFF — flash
-allocs break replay). 4dp anchors held on both; klein gate uses
-value-tolerance for dQ-derived grads (flash bwd dQ is nondeterministic
-across calls, measured). ScratchRingAllocator is EAGER (all
+klein (~1.8 s/step, KLEIN_SDPA_FLASH in single_block.mojo, double joint +
+single) and zimage (~1.35 s/step, ZIMAGE_SDPA_FLASH in lora_block.mojo;
+capture OFF — flash allocs break replay).
+
+CRITICAL numerics: **flash bwd dQ is nondeterministic run-to-run**
+(measured) → ALL flash-on trainer anchors are 4dp value-classes with a
+documented wobble, never bit gates (the C14 bullet above carries the
+current zimage/klein numbers). klein same-process gates use
+value-tolerance for dQ-derived grads. ScratchRingAllocator is EAGER (all
 rings allocated in __init__) — budget VRAM accordingly; the B2 graph
 path (ZIMAGE_V2_GRAPH_B2) is gated OFF on the measured 24 GB wall until
 flash wiring + a slab-routed B2 forward land.
@@ -196,6 +221,17 @@ flash wiring + a slab-routed B2 forward land.
   wrappers are comptime-specialized; node payloads store runtime dims.
 - Capture: no alloc, no sync inside the captured region; per-step host
   values via fixed pre-written device buffers.
+- UnsafePointer params need an explicit origin parameter — e.g.
+  `UnsafePointer[BFloat16, MutAnyOrigin]` (a missing origin broke the
+  T2.C tree at full_finetune_zimage.mojo:148).
+- Re-bodying a gated FP loop into an `@parameter` closure can change FMA
+  contraction and break bit-equality (measured:
+  full_finetune_zimage.mojo `_adam8bit_step_fast` — 1-ulp m_absmax
+  shifts at step 2). Keep gated math in ONE `@no_inline` function and
+  parallelize AROUND it.
+- Background child processes die when their spawning agent session ends
+  — long smokes/trainer runs must be launched by the ORCHESTRATOR
+  session, never by a sub-agent.
 
 ## Discipline (binding)
 

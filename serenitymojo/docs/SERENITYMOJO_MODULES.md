@@ -48,7 +48,9 @@ Owns `/v1/video` readiness JSON, bounded LTX2 runner result manifests, and
 `output/serenity_daemon/<video-id>/`. Successful runner results also surface
 `runner_timings` and flattened `stage_timings` from
 `ltx2_runner_timings.json` so denoise, decode, frame-write, mux, audio VAE, and
-vocoder costs are product evidence instead of log-only hints.
+vocoder costs are product evidence instead of log-only hints. The bounded LTX2
+runner defaults to `weight_mode:"resident"` and keeps `weight_mode:"stream"` for
+debug comparison.
 - `video_readiness_doc(backend_name: String, model_name: String, resident: String) raises -> JSONValue` — status document with candidate video runners and explicit non-parity labels.
 - `probe_video_file(mp4_path: String) raises -> JSONValue` — `ffprobe`-backed MP4/A-V metadata (`width`, `height`, `frame_count`, `duration`, `fps`, codecs, muxing, audio behavior).
 - `ltx2_staged_smoke_video_result(body: JSONValue, video_id: String, backend_name: String, model_name: String, resident: String) raises -> JSONValue` — runs `output/bin/ltx2_video_smoke_runner`, writes `ltx2_video_result.json`, and sets artifact acceptance fields without claiming full video parity.
@@ -1143,7 +1145,7 @@ Pure-CPU PNG encoder (uncompressed STORED deflate — valid PNG, just larger). N
 
 ### Ideogram-4 perf + magic round (see docs/IDEOGRAM4_STATUS.md)
 - `models/dit/ideogram4_resident.mojo` — `Ideogram4Weights` (resident fp8 cache: `.load(st,ctx)`, `.w(name)`), `ideogram4_build_masks(indicator,ctx)->Ideogram4Masks` (hoisted constant masks), `ideogram4_forward_r[S](w,x,llm,t,masks,cos,sin,...)` (hot path; `_lin` = dequant resident fp8→bf16 then vendor cuBLAS `linear`). Resident DiT cos 0.99961 vs fixture.
-- `ops/fp8_gemm.mojo` — `linear_fp8(x,w_fp8,scale,bias,ctx)` fused tiled fp8 GEMM (cos 0.99999698 vs dequant+BLAS; reference, slower than cuBLAS, not on hot path).
+- `ops/fp8_gemm.mojo` — `linear_fp8(x,w_fp8,scale,bias,ctx)` fused tiled fp8 GEMM (cos 0.99999698 vs dequant+BLAS; reference, slower than cuBLAS, not on hot path). The no-bias path now keeps bias storage BF16 and avoids the local dummy allocation/fence; `ops/tests/fp8_gemm_smoke.mojo` passes with `--target-accelerator sm_86`.
 - `models/text_encoder/qwen3_encoder.mojo` — `+lm_logits_last(token_ids,pos,ctx)` (lm_head logits for autoregressive decode; needs checkpoint lm_head).
 - `models/text_encoder/qwen3_magic.mojo` — `generate_greedy(qwen,prompt_ids,max_new,eos,pad,maxseq,ctx)` greedy LM decode (no KV-cache yet).
 - `pipeline/ideogram4_generate.mojo` (native text→image), `pipeline/ideogram4_magic.mojo` (Qwen3-8B plain→JSON).

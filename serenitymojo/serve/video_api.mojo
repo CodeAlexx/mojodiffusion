@@ -175,8 +175,9 @@ def video_readiness_doc(
         ),
     )
     ltx2.set("runner", JSONValue.from_string(String(LTX2_VIDEO_SMOKE_RUNNER)))
-    ltx2.set("mode", JSONValue.from_string(String("staged lora stream noaudio nonag")))
+    ltx2.set("mode", JSONValue.from_string(String("staged lora resident noaudio nonag")))
     ltx2.set("default_steps", JSONValue.from_int(1))
+    ltx2.set("default_weight_mode", JSONValue.from_string(String("resident")))
     ltx2.set("default_audio_mode", JSONValue.from_string(String("noaudio")))
     ltx2.set("target_width", JSONValue.from_int(768))
     ltx2.set("target_height", JSONValue.from_int(512))
@@ -351,6 +352,9 @@ def ltx2_staged_smoke_video_result(
             + "'; supported runner is ltx2_staged_dev_smoke"
         )
     var steps = _opt_int(body, "steps", 1, 1, 3)
+    var weight_mode = _opt_str(body, "weight_mode", String("resident"))
+    if weight_mode != "resident" and weight_mode != "stream":
+        raise Error("unsupported weight_mode '" + weight_mode + "'; use resident or stream")
     var audio_mode = _opt_str(body, "audio_mode", String("noaudio"))
     if audio_mode == "video":
         audio_mode = String("noaudio")
@@ -375,7 +379,9 @@ def ltx2_staged_smoke_video_result(
 
     var cmd = (
         _shell_quote(String(LTX2_VIDEO_SMOKE_RUNNER))
-        + String(" staged lora stream ")
+        + String(" staged lora ")
+        + weight_mode
+        + String(" ")
         + audio_mode
         + String(" nonag ")
         + _shell_quote(out_dir)
@@ -402,7 +408,8 @@ def ltx2_staged_smoke_video_result(
     o.set("accepted_video_parity", JSONValue.from_bool(False))
     o.set("accepted_sampler_parity", JSONValue.from_bool(False))
     o.set("steps", JSONValue.from_int(steps))
-    o.set("mode", JSONValue.from_string(String("staged lora stream ") + audio_mode + String(" nonag")))
+    o.set("mode", JSONValue.from_string(String("staged lora ") + weight_mode + String(" ") + audio_mode + String(" nonag")))
+    o.set("weight_mode", JSONValue.from_string(weight_mode))
     o.set("audio_mode", JSONValue.from_string(audio_mode))
     o.set("exit_code", JSONValue.from_int(rc))
     o.set("out_dir", JSONValue.from_string(out_dir))

@@ -50,13 +50,17 @@ Current high-risk runtime gaps:
   and tiny parity gate are proven.
 - Full video generation is still not accepted as SwarmUI/HQ parity. `/v1/video`
   can launch the bounded `ltx2_staged_dev_smoke` runner and `/v1/video/probe`
-  inspects MP4 artifacts. Current evidence proves the video-only daemon
+  inspects MP4 artifacts. Current evidence proves the default resident
+  video-only daemon
   artifact gate:
-  `output/serenity_daemon/video-0072/ltx2_t2v_stage2_dev_smoke.mp4`, `768x512`,
+  `output/serenity_daemon/video-0074/ltx2_t2v_stage2_dev_smoke.mp4`, `768x512`,
   `121` frames, `5.041667s`, `24fps`, H.264, `muxing=probe_ok`,
-  `audio_behavior=video_only_no_audio_stream`, `total_wall_seconds=202.353546797`,
-  stage timing gate, and external peak VRAM delta `9851 MiB`. Current evidence
-  also proves the
+  `audio_behavior=video_only_no_audio_stream`,
+  `mode:"staged lora resident noaudio nonag"`,
+  `total_wall_seconds=186.882605556`, runner
+  `total_runner_seconds=186.00316528799885`, stage timing gate, and external
+  peak VRAM delta `10501 MiB` (`11490 MiB` peak used). Current evidence also
+  proves the
   audio-enabled A/V artifact gate:
   `output/serenity_daemon/video-0072/ltx2_t2v_av_stage2_dev_smoke.mp4` plus
   `output/serenity_daemon/video-0072/dev_audio.wav`, `stream_count=2`,
@@ -64,10 +68,10 @@ Current high-risk runtime gaps:
   `audio_behavior=audio_stream_present`, `total_wall_seconds=202.223939339`,
   runner `total_runner_seconds=201.75603515000148`, and external peak VRAM
   delta `9880 MiB`. The runner now emits `ltx2_runner_timings.json` and the
-  daemon result surfaces `stage_timings`;
-  the measured A/V bottlenecks are `stage2_denoise_seconds=89.73880778400053`,
-  `stage1_denoise_seconds=70.47008886299955`, and
-  `video_decode_seconds=24.576268509999863`. Full video parity remains blocked
+  daemon result surfaces `stage_timings`; the measured resident video-only
+  bottlenecks are `stage2_denoise_seconds=76.74856130400076`,
+  `stage1_denoise_seconds=57.9751922939995`, and
+  `video_decode_seconds=28.060338318000504`. Full video parity remains blocked
   because `accepted_video_parity:false` and the runner labels the output
   `DEV SMOKE ONLY`.
 - Ideogram4 is requested as an image backend target. Its current resident DiT
@@ -127,6 +131,8 @@ Current artifact evidence found in this working tree:
   - `output/serenity_daemon/job-0040.png`
   - `output/serenity_daemon/job-0040.png.zimage_daemon_result.json`
   - `output/serenity_daemon/job-0047.png`
+  - `output/serenity_daemon/job-0073.png`
+  - `output/serenity_daemon/job-0073.png.zimage_daemon_result.json`
 
 `job-0028` is the current 512x512, 1-step experimental artifact from the daemon
 product path, produced by the repeatable runtime gate. It proves the Z-Image
@@ -136,14 +142,29 @@ serial output, and running-job cancel smoke (`job-0032`). It also proves
 unsupported sampler fail-loud behavior (`job-0027`). It is not full sampler
 parity or speed parity.
 
+`job-0073` is the current 1024x1024, 1-step experimental artifact from the
+daemon product path. It proves the 1024 daemon request now uses tiled 64-latent
+VAE decode instead of the former whole-frame 128-latent decoder path, while
+preserving PNG `serenity.genparams.v1`, `jobs.db`, gallery/read endpoints,
+manifest timings, and positive VRAM evidence. Timings were
+`load_seconds=2.49144893`, `text_encode_seconds=3.132651268`,
+`denoise_seconds=2.078721406`, `vae_decode_seconds=3.266865353`,
+`total_wall_seconds=11.438153728`, and `peak_vram_mib=21497.3125`. This
+one-step output is path/resource evidence only, not quality, sampler, or speed
+parity.
+
 `job-0040` is the current bounded UniPC bh2 sampler artifact from the daemon
 product path. It proves `requested_sampler:"uni_pc_bh2"` executes as
 `executed_sampler:"uni_pc_bh2"` with `solver_type:"bh2"`, `solver_order:2`,
 `schedule_source:"zimage_build_sigmas"`, `unipc_update_steps:3`,
 `unipc_corrector_steps:2`, `unipc_second_order_steps:2`,
 `denoise_seconds_per_step:0.32013946925`, and `peak_vram_mib:21727.5625`.
-Generic `uni_pc` remains fail-loud (`job-0038`) until its exact Comfy/Swarm
-semantics are separately mapped and proven.
+Generic `uni_pc` remains blocked from runtime acceptance (`job-0038`) until its
+exact Comfy/Swarm semantics are implemented and proven. A focused Mojo semantic
+gate now pins the delta: generic `uni_pc` is `bh1`, uses
+`order=min(3,len(sigmas)-2)`, SigmaConvert, final-zero replacement, and
+initial-noise scaling; it is not an alias for the accepted `uni_pc_bh2`
+bh2/order-2 flow path.
 
 `job-0047` is the current typed linked workflow graph smoke artifact from the
 stub daemon product path. It proves linked positive/negative conditioning, model,
@@ -491,14 +512,16 @@ evidence. They are still not full HQ/video parity claims.
 Next implementation slice:
 
 1. Use the accepted LTX2 stage timing manifest to attack the measured slow
-   boundary first. Current A/V timing shows stage-2 denoise around `89.74s`,
-   stage-1 denoise around `70.47s`, and video decode around `24.58s`; profile
-   the DiT denoise path and replace the first proven slow boundary before
-   widening the video claim. The concrete LTX2 order is: stop forcing
-   `staged lora stream` for the product smoke where a faster resident path is
-   viable, lift the MVP raw resident-FP8 block pattern into staged/refhq, remove
-   hot linear/FP8 GEMM synchronizations, and only then compare deeper CUTLASS or
-   cuBLASLt FP8 kernels.
+   boundary first. Current resident video-only timing shows stage-2 denoise
+   around `76.75s`, stage-1 denoise around `57.98s`, and video decode around
+   `28.06s`; profile the DiT denoise path and replace the first proven slow
+   boundary before widening the video claim. DONE in this slice: the daemon no
+   longer forces `staged lora stream`; `POST /v1/video` defaults
+   `weight_mode:"resident"` and keeps `weight_mode:"stream"` as a debug escape
+   hatch. The first fused FP8 GEMM no-bias dummy/fence cleanup landed with a
+   focused smoke. Next LTX2 work is to lift the MVP raw resident-FP8 block
+   pattern into staged/refhq, remove remaining hot linear/FP8 synchronizations,
+   and only then compare deeper CUTLASS or cuBLASLt FP8 kernels.
 2. Add the Ideogram4 image backend only after replacing its direct
    `sdpa_nomask[1,S,18,256]` resident DiT attention with a proven fast SDPA
    path for real Ideogram shapes (`S=NIMG` and `S=NT+NIMG`, Dh=256), then prove

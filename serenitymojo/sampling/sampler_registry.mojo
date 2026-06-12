@@ -284,6 +284,20 @@ def scheduler_admission_for_backend(
     )
 
 
+def _generic_unipc_blocked_detail_json() -> String:
+    return String(
+        '{"name":"uni_pc",'
+        + '"normalized":"uni_pc",'
+        + '"status":"blocked",'
+        + '"not_alias_of":"uni_pc_bh2",'
+        + '"comfy_dispatch":"sample_unipc",'
+        + '"required_variant":"bh1",'
+        + '"required_order":"min(3,len(sigmas)-2)",'
+        + '"required_schedule":"SigmaConvert",'
+        + '"reason":"generic Comfy uni_pc has bh1/order<=3/SigmaConvert/final-zero-replacement semantics; current runtime evidence covers only uni_pc_bh2 bh2/order-2 flow semantics"}'
+    )
+
+
 def _backend_json(
     backend_name: String,
     family: String,
@@ -291,6 +305,7 @@ def _backend_json(
     executed_scheduler: String,
     supported_samplers: String,
     supported_schedulers: String,
+    blocked_samplers: String,
     reason: String,
 ) raises -> String:
     var out = String("{")
@@ -301,6 +316,7 @@ def _backend_json(
     out += String('"executed_scheduler":"') + _json_escape_local(executed_scheduler) + String('",')
     out += String('"supported_samplers":') + supported_samplers + String(",")
     out += String('"supported_schedulers":') + supported_schedulers + String(",")
+    out += String('"blocked_samplers":') + blocked_samplers + String(",")
     out += String('"unsupported_policy":"fail_loud",')
     out += String('"reason":"') + _json_escape_local(reason) + String('"}')
     return out^
@@ -352,7 +368,8 @@ def swarmui_sampler_registry_json() raises -> String:
         String("simple_flowmatch"),
         zimage_supported_samplers,
         zimage_supported_schedulers,
-        String("Z-Image daemon runs verified rectified-flow Euler/simple plus bounded DPM++ 2M and UniPC bh2/simple flow-match paths; unsupported catalog names fail loud."),
+        String("[") + _generic_unipc_blocked_detail_json() + String("]"),
+        String("Z-Image daemon runs verified rectified-flow Euler/simple plus bounded DPM++ 2M and UniPC bh2/simple flow-match paths; generic uni_pc remains blocked because Comfy maps it to bh1/order<=3/SigmaConvert semantics, not the bh2/order-2 flow path."),
     )
     out += String(",\n    ")
     out += _backend_json(
@@ -362,6 +379,7 @@ def swarmui_sampler_registry_json() raises -> String:
         String("qwen_flowmatch"),
         qwen_supported_samplers,
         qwen_supported_schedulers,
+        String("[") + _generic_unipc_blocked_detail_json() + String("]"),
         String("Qwen-Image daemon runs the verified dynamic flow-match Euler path; full Qwen generation remains separately gated."),
     )
     out += String("\n  ],\n")

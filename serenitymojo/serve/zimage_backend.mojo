@@ -7,9 +7,10 @@
 #   (rectified-flow Euler, shift=6.0 sigmas) → Z-Image VAE decode → PNG SIGNED.
 #
 # Residency model (24 GB GPU):
-#   * DiT weights (aux + nr/cr/main blocks + final linear) and BOTH VAE decoder
-#     specializations (64²- and 128²-latent) are loaded ONCE (first job) and
-#     stay resident across jobs.
+#   * DiT weights (aux + nr/cr/main blocks + final linear) and the 64²-latent
+#     VAE decoder are loaded ONCE (first job) and stay resident across jobs.
+#     1024² decode uses the proven 3x3 tiled 64²-latent decoder path instead of
+#     the OOM-prone whole-frame 128²-latent decoder.
 #   * The Qwen3-4B text encoder (~7.5 GB bf16) is loaded → used → freed PER JOB
 #     inside the ENCODE step (encode_captions_fixed frees it on return), because
 #     DiT-resident (~12 GB) + encoder + dual-forward activations does fit, but
@@ -22,10 +23,9 @@
 # DECODE ticks are announced via StepResult.phase; cancel() makes the next
 # step() return cancelled and frees all per-job tensors.
 #
-# Size support: 512x512 ONLY this phase (HL=WL=64). 1024x1024 (HL=WL=128) is
-# wired but DISABLED at start() pending Phase-4 VRAM work: the whole-frame
-# 128-grid decode peaks over 24 GB beside the resident DiT, and the device
-# pool retains ~8 GB between jobs (skeptic F2/F3; SERENITYUI_TODO.md).
+# Size support: 512x512 (HL=WL=64) and 1024x1024 (HL=WL=128). 1024 decode uses
+# the overlap-blended tiled VAE path so the daemon does not fall back to the
+# whole-frame 128-grid decoder that exceeded 24 GB beside the resident DiT.
 #
 # LoRA: forward overlay only — never fused. At most ONE overlay per job. Two
 # file formats load: the trainer resume format (load_zimage_lora_main_only_
@@ -51,6 +51,7 @@ from serenitymojo.models.vae.zimage_decoder import ZImageDecoder
 from serenitymojo.models.vae.zimage_encoder import (
     ZImageVaeEncoder, ZIMG_SCALING, ZIMG_SHIFT,
 )
+from serenitymojo.models.vae.zimage_tiled_decode import zimage_tiled_decode_with_decoder
 from serenitymojo.models.zimage.weights import (
     ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
 )
@@ -232,7 +233,6 @@ struct ZImageBackend(GenBackend, Movable):
     var x_pad_h: List[Float32]
     var cap_pad_h: List[Float32]
     var vae64: List[ArcPointer[ZImageDecoder[64, 64]]]  # 0/1
-    var vae128: List[ArcPointer[ZImageDecoder[128, 128]]]
     # chunked-load state (F6): the shard set stays open across LOAD ticks and
     # load_cursor tracks how many DiT blocks (nr|cr|main flat) are loaded.
     var st_open: List[ArcPointer[ShardedSafeTensors]]   # 0/1
@@ -287,7 +287,6 @@ struct ZImageBackend(GenBackend, Movable):
         self.x_pad_h = List[Float32]()
         self.cap_pad_h = List[Float32]()
         self.vae64 = List[ArcPointer[ZImageDecoder[64, 64]]]()
-        self.vae128 = List[ArcPointer[ZImageDecoder[128, 128]]]()
         self.st_open = List[ArcPointer[ShardedSafeTensors]]()
         self.load_cursor = 0
         self.active = False
@@ -355,22 +354,16 @@ struct ZImageBackend(GenBackend, Movable):
                 String("zimage: unsupported scheduler '") + params.scheduler
                 + String("'; ") + scheduler_admission.reason
             )
-        # F2/F3: 1024x1024 is DISABLED this phase — the whole-frame 128-grid
-        # decode peaks over 24 GB beside the resident DiT (CUDA OOM) and the
-        # device pool retains ~8 GB between jobs; both are real VRAM work
-        # deferred to Phase 4 (see serenityUI/SERENITYUI_TODO.md, "Phase 4
-        # VRAM work"). Reject up front instead of failing mid-job.
-        if not (params.width == 512 and params.height == 512):
+        # Keep the comptime dispatch explicit: only the two proven square grids
+        # are admitted. 1024 uses the tiled VAE decode in _decode_and_save.
+        if not (
+            (params.width == 512 and params.height == 512)
+            or (params.width == 1024 and params.height == 1024)
+        ):
             raise Error(
                 String("zimage: unsupported size ") + String(params.width)
                 + "x" + String(params.height)
-                + " — only 512x512 is served. A 3x3 overlap-blend tiled 1024"
-                + " decode (models/vae/zimage_tiled_decode.mojo, FLUX precedent)"
-                + " is implemented to fix the whole-frame decode OOM, but 1024"
-                + " stays gated pending GPU verification + the unresolved F3"
-                + " device-pool retention (the Mojo-runtime caching allocator pins the"
-                + " high-water mark; cuMemPoolTrimTo reclaims 0 — see Phase-4"
-                + " findings in SERENITYUI_TODO.md). Use 512x512."
+                + " — supported sizes are 512x512 and 1024x1024."
             )
         var hl = params.height // 8
         var wl = params.width // 8
@@ -903,11 +896,12 @@ struct ZImageBackend(GenBackend, Movable):
             )
             _save_rgb_png_with_text(rgb, png_path, self.params.params_json, self.ctx)
         else:
-            if len(self.vae128) == 0:
-                print("[zimage] loading VAE decoder (128-latent grid; stays resident)")
-                self.vae128.append(ArcPointer(ZImageDecoder[128, 128].load(VAE_DIR, self.ctx)))
-            var rgb = self.vae128[0][].decode(
-                _cast(lat[], STDtype.BF16, self.ctx), self.ctx
+            if len(self.vae64) == 0:
+                print("[zimage] loading VAE decoder (64-latent grid; stays resident)")
+                self.vae64.append(ArcPointer(ZImageDecoder[64, 64].load(VAE_DIR, self.ctx)))
+            print("[zimage] tiled VAE decode (128-latent grid -> 3x3 64-latent crops)")
+            var rgb = zimage_tiled_decode_with_decoder[128, 128, 64, 64](
+                _cast(lat[], STDtype.BF16, self.ctx), self.vae64[0][], self.ctx
             )
             _save_rgb_png_with_text(rgb, png_path, self.params.params_json, self.ctx)
         return png_path
@@ -1017,22 +1011,8 @@ struct ZImageBackend(GenBackend, Movable):
                 r.phase = String("decoding")
                 return r^
             # PHASE_DECODE: VAE decode + PNG with serenity.genparams.v1 tEXt.
-            # MEASURED (2026-06-10, 24 GB GPU): resident DiT (13.2 GiB) +
-            # whole-frame 1024² decode peaks at 23.6 GiB → CUDA OOM. The
-            # verified standalone pipeline always freed the DiT before its
-            # 1024² decode; mirror that for the 128-grid only: release the
-            # resident DiT, decode, and reload on the next job. 512² decode
-            # fits with the DiT resident and keeps the full residency win.
-            if self.hl == 128 and self.loaded:
-                print("[zimage] 1024x1024 decode: releasing resident DiT to fit decode (next job reloads)")
-                self.nr_blocks = List[ZImageBlockWeights]()
-                self.cr_blocks = List[ZImageBlockWeights]()
-                self.main_blocks = List[ZImageBlockWeights]()
-                self.aux = List[ArcPointer[ZImageRealAux]]()
-                self.final_lin = List[TArc]()
-                self.x_pad_h = List[Float32]()
-                self.cap_pad_h = List[Float32]()
-                self.loaded = False
+            # 1024² must use the tiled decoder; dropping the resident DiT would
+            # preserve output but destroy the daemon residency contract.
             var decode_t0 = perf_counter_ns()
             var path = self._decode_and_save()
             self.vae_decode_seconds = Float64(perf_counter_ns() - decode_t0) / 1.0e9

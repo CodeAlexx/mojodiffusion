@@ -64,14 +64,16 @@ def _blend3(t0: Tensor, t1: Tensor, t2: Tensor, dim: Int, ctx: DeviceContext) ra
 
 # ── tiled Z-Image VAE decode — 3x3 OVERLAPPING latent crops + feathered blend ─
 # latent NCHW [1,16,LATENT_H,LATENT_W] -> image NCHW [1,3,8*LATENT_H,8*LATENT_W].
-# Decoder is instantiated once at the TILE shape (LATENT/2) and reused for all 9
-# crops at latent stride TILE/2.
-def zimage_tiled_decode[
-    LATENT_H: Int, LATENT_W: Int
-](latent: Tensor, vae_dir: String, ctx: DeviceContext) raises -> Tensor:
-    comptime TILE_H = LATENT_H // 2
-    comptime TILE_W = LATENT_W // 2
-    var dec = ZImageDecoder[TILE_H, TILE_W].load(vae_dir, ctx)
+# Decoder is supplied at the TILE shape (LATENT/2) and reused for all 9 crops at
+# latent stride TILE/2. The public loader wrapper below preserves the standalone
+# call surface; daemon code can pass its resident 64-latent decoder directly.
+def zimage_tiled_decode_with_decoder[
+    LATENT_H: Int, LATENT_W: Int, TILE_H: Int, TILE_W: Int
+](
+    latent: Tensor, dec: ZImageDecoder[TILE_H, TILE_W], ctx: DeviceContext
+) raises -> Tensor:
+    comptime assert TILE_H == LATENT_H // 2, "tile height must be half latent height"
+    comptime assert TILE_W == LATENT_W // 2, "tile width must be half latent width"
     var half = TILE_H // 2                          # latent stride
     # row 0 crop [0:TILE_H], blend its 3 columns
     var r = slice(latent, 2, 0, TILE_H, ctx)
@@ -93,3 +95,14 @@ def zimage_tiled_decode[
     var row2 = _blend3(a, b, c, 3, ctx)
     # vertical feathered blend of the 3 full-width rows
     return _blend3(row0, row1, row2, 2, ctx)
+
+
+def zimage_tiled_decode[
+    LATENT_H: Int, LATENT_W: Int
+](latent: Tensor, vae_dir: String, ctx: DeviceContext) raises -> Tensor:
+    comptime TILE_H = LATENT_H // 2
+    comptime TILE_W = LATENT_W // 2
+    var dec = ZImageDecoder[TILE_H, TILE_W].load(vae_dir, ctx)
+    return zimage_tiled_decode_with_decoder[
+        LATENT_H, LATENT_W, TILE_H, TILE_W
+    ](latent, dec, ctx)

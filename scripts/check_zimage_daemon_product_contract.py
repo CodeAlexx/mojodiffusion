@@ -1156,8 +1156,8 @@ def main() -> int:
     blockers: list[str] = []
     if not args.daemon.is_file():
         raise SystemExit(f"[zimage-daemon-product] FAIL daemon binary missing: {args.daemon}; run `pixi run build-daemon`")
-    if args.width != 512 or args.height != 512:
-        raise SystemExit("[zimage-daemon-product] FAIL Z-Image daemon currently serves only 512x512")
+    if (args.width, args.height) not in {(512, 512), (1024, 1024)}:
+        raise SystemExit("[zimage-daemon-product] FAIL supported Z-Image daemon sizes are 512x512 and 1024x1024")
     if args.steps <= 0:
         raise SystemExit("[zimage-daemon-product] FAIL steps must be positive")
 

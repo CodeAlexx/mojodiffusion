@@ -27,6 +27,13 @@
 # Gauss-Jordan (linsolve). The toy-ODE scalar integration and the rhos
 # coefficient checks are exercised in sampling/parity/unipc_parity.mojo.
 #
+# Comfy generic `uni_pc` is intentionally NOT wired to this scheduler. Local
+# Comfy dispatch maps `uni_pc` to sample_unipc(default variant='bh1') and
+# `uni_pc_bh2` to sample_unipc_bh2(variant='bh2'). The generic path also uses
+# SigmaConvert, initial-noise scaling, final-zero replacement, and
+# order=min(3, len(sigmas)-2). Helpers below pin those semantics for the next
+# parity slice, but the tensor runtime remains bh2/order-2 only.
+#
 # Tensor math goes through serenitymojo.ops.tensor_algebra (mul_scalar/add/sub).
 # The small linear solve and all coefficient prep stay on host in f64. The ring
 # buffer of converted model outputs is boxed in TArc (Tensor is move-only,
@@ -35,7 +42,7 @@
 # Mojo 0.26.x. Inference-only. No autograd, no Python at runtime.
 
 from collections import List, Optional
-from std.math import exp, log
+from std.math import exp, log, sqrt
 from std.gpu.host import DeviceContext
 from memory import ArcPointer
 
@@ -69,6 +76,88 @@ def _expm1_f64(z: Float64) -> Float64:
 def alpha_from_sigma(sigma: Float64) -> Float64:
     """Flow-matching `_sigma_to_alpha_sigma_t`: alpha = 1 - sigma."""
     return 1.0 - sigma
+
+
+def comfy_generic_unipc_variant() -> String:
+    """Comfy `uni_pc` default variant from extra_samplers/uni_pc.py."""
+    return String("bh1")
+
+
+def comfy_generic_unipc_max_order() -> Int:
+    """Comfy `sample_unipc`: order = min(3, len(timesteps) - 2)."""
+    return 3
+
+
+def comfy_unipc_final_zero_replacement() -> Float64:
+    """Comfy replaces the final zero timestep with 0.001 before sampling."""
+    return 0.001
+
+
+def comfy_unipc_effective_order(timestep_count: Int) -> Int:
+    """Exact Comfy generic UniPC order formula for a prepared timestep list."""
+    var order = timestep_count - 2
+    if order > comfy_generic_unipc_max_order():
+        order = comfy_generic_unipc_max_order()
+    return order
+
+
+def build_comfy_unipc_timesteps(sigmas: List[Float64]) raises -> List[Float64]:
+    """Copy Comfy `sample_unipc` timestep prep without claiming execution.
+
+    Comfy clones the input sigmas and, when the final sigma is zero, replaces
+    only that final timestep with 0.001. Both `uni_pc` and `uni_pc_bh2` use this
+    prep before their variant-specific UniPC update.
+    """
+    if len(sigmas) < 2:
+        raise Error("build_comfy_unipc_timesteps: need at least two sigmas")
+    var out = List[Float64]()
+    for i in range(len(sigmas)):
+        out.append(sigmas[i])
+    if out[len(out) - 1] == 0.0:
+        out[len(out) - 1] = comfy_unipc_final_zero_replacement()
+    return out^
+
+
+def comfy_sigma_convert_alpha(sigma: Float64) raises -> Float64:
+    """Comfy SigmaConvert alpha: exp(0.5*log(1/(sigma^2+1)))."""
+    if sigma < 0.0:
+        raise Error("comfy_sigma_convert_alpha: sigma must be non-negative")
+    return 1.0 / sqrt((sigma * sigma) + 1.0)
+
+
+def comfy_sigma_convert_std(sigma: Float64) raises -> Float64:
+    """Comfy SigmaConvert std: sqrt(1 - alpha^2)."""
+    if sigma < 0.0:
+        raise Error("comfy_sigma_convert_std: sigma must be non-negative")
+    return sigma / sqrt((sigma * sigma) + 1.0)
+
+
+def comfy_sigma_convert_lambda(sigma: Float64) raises -> Float64:
+    """Comfy SigmaConvert lambda = log(alpha) - log(std)."""
+    if sigma <= 0.0:
+        raise Error("comfy_sigma_convert_lambda: sigma must be > 0")
+    return log(comfy_sigma_convert_alpha(sigma)) - log(comfy_sigma_convert_std(sigma))
+
+
+def comfy_unipc_initial_noise_scale(sigma0: Float64) raises -> Float64:
+    """Comfy `sample_unipc`: noise /= sqrt(1 + timesteps[0]^2)."""
+    if sigma0 < 0.0:
+        raise Error("comfy_unipc_initial_noise_scale: sigma must be non-negative")
+    return 1.0 / sqrt(1.0 + sigma0 * sigma0)
+
+
+def comfy_generic_unipc_b_h(h: Float64) -> Float64:
+    """Comfy generic `uni_pc` bh1 B_h for predict_x0=True: hh = -h."""
+    return -h
+
+
+def generic_comfy_unipc_unsupported_reason() -> String:
+    return String(
+        "generic Comfy uni_pc dispatches to sample_unipc with variant=bh1, "
+        + "order=min(3,len(sigmas)-2), SigmaConvert, initial-noise scaling, "
+        + "and final-zero replacement; it is not proven equivalent to the "
+        + "current bh2/order-2 flow UniPC runtime"
+    )
 
 
 def build_unipc_sigma_schedule(

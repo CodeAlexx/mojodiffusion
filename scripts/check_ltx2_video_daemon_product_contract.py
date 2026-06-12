@@ -261,6 +261,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 {
                     "runner": "ltx2_staged_dev_smoke",
                     "steps": args.steps,
+                    "weight_mode": args.weight_mode,
                     "audio_mode": args.audio_mode,
                 },
                 timeout=args.timeout + 30.0,
@@ -454,6 +455,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "stage": stage,
             "peak_gpu_memory_used_mib": peak_used,
             "peak_gpu_memory_delta_mib": peak_delta,
+            "weight_mode": args.weight_mode,
             "audio_mode": args.audio_mode,
         },
         "evidence": {
@@ -502,6 +504,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--sample-interval", type=float, default=1.0)
     parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--weight-mode", choices=("resident", "stream"), default="resident")
     parser.add_argument("--audio-mode", choices=("noaudio", "audio"), default="noaudio")
     parser.add_argument("--log", type=Path)
     parser.add_argument("--write-readiness", type=Path, default=DEFAULT_READINESS)

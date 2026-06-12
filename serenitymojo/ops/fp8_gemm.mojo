@@ -19,7 +19,6 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.fp8 import _fp8_e4m3_decode
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -31,7 +30,7 @@ def _linear_fp8_kernel(
     x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [M*K]
     w: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],      # [N*K] E4M3 bytes
     scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],# [N]
-    bias: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], # [N] (staged f32) or dummy
+    bias: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],# [N] BF16, ignored if !has_bias
     o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],   # [M*N]
     M: Int, N: Int, K: Int, has_bias: Int,
 ):
@@ -67,7 +66,7 @@ def _linear_fp8_kernel(
         var s = rebind[Scalar[DType.float32]](scale[col])
         var v = acc * s
         if has_bias != 0:
-            v = v + rebind[Scalar[DType.float32]](bias[col])
+            v = v + Float32(rebind[Scalar[DType.bfloat16]](bias[col]))
         o[row * N + col] = rebind[o.element_type](v.cast[DType.bfloat16]())
 
 
@@ -101,17 +100,21 @@ def linear_fp8(
     var W = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](w.buf.unsafe_ptr(), w_rl)
     var S = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](scale.buf.unsafe_ptr().bitcast[Float32](), s_rl)
 
-    # bias staged to F32 (or a 1-elem dummy when absent)
     var has_bias = 1 if bias else 0
-    var bias_f32: Tensor
+    var B: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin]
     if bias:
-        bias_f32 = cast_tensor(bias.value(), STDtype.F32, ctx)
+        if bias.value().dtype() != STDtype.BF16:
+            raise Error("linear_fp8: bias must be BF16")
+        var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](bias.value().numel()))
+        B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            bias.value().buf.unsafe_ptr().bitcast[BFloat16](), b_rl
+        )
     else:
-        var d = List[Float32]()
-        d.append(0.0)
-        bias_f32 = Tensor.from_host(d^, [1], STDtype.F32, ctx)
-    var b_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](bias_f32.numel()))
-    var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](bias_f32.buf.unsafe_ptr().bitcast[Float32](), b_rl)
+        # Reuse a caller-owned BF16 buffer as the never-read dummy. This avoids
+        # a per-call dummy allocation and fence on the no-bias hot path.
+        B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
 
     var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl)
     var grid_x = ceildiv(N, _TILE)
@@ -120,7 +123,12 @@ def linear_fp8(
         X, W, S, B, O, M, N, K, has_bias,
         grid_dim=(grid_x, grid_y), block_dim=(_TILE, _TILE),
     )
-    ctx.synchronize()
+    if has_bias != 0:
+        # Existing callers can pass a call-scoped Optional[Tensor](clone(...)).
+        # Fence only the biased path so that temporary bias storage cannot drop
+        # before the queued kernel reads it. The no-bias path has no local input
+        # buffer to keep alive; later users/readback on the same ctx synchronize.
+        ctx.synchronize()
     # output shape = x leading dims + [N]
     var os = xsh.copy()
     os[len(os) - 1] = N

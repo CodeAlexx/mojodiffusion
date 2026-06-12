@@ -150,6 +150,11 @@ Acceptance evidence:
   `unipc_update_steps:3`, `unipc_corrector_steps:2`,
   `unipc_second_order_steps:2`, `denoise_seconds_per_step:0.32013946925`,
   `peak_vram_mib:21727.5625`, and `accepted_sampler_parity:false`.
+  Generic `uni_pc` remains blocked from runtime acceptance; the focused Mojo
+  semantic gate `serenitymojo/sampling/parity/comfy_unipc_semantics_gate.mojo`
+  proves it is `bh1`, order `min(3,len(sigmas)-2)`, SigmaConvert,
+  final-zero-replacement, and initial-noise scaling, not an alias for the
+  accepted `uni_pc_bh2` bh2/order-2 flow path.
 - 2026-06-12 Z-Image multi-LoRA runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py
   --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-unipc-smoke
@@ -226,6 +231,24 @@ Acceptance evidence:
   promoted; the current focused UniPC gate targets generic `uni_pc` and proved
   fail-loud behavior as `job-0038`. `job-0032` was cancelled through
   `/v1/cancel/<id>` while running.
+- 2026-06-12 1024 tiled-decode run passed:
+  `python3 scripts/check_zimage_daemon_product_contract.py --width 1024
+  --height 1024 --steps 1 --skip-unsupported-smoke --skip-dpmpp2m-smoke
+  --skip-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke
+  --skip-multi-lora-smoke --write-readiness
+  output/checks/zimage_1024_product_readiness.json`. It emitted
+  `output/serenity_daemon/job-0073.png` plus
+  `output/serenity_daemon/job-0073.png.zimage_daemon_result.json`, with PNG
+  `serenity.genparams.v1`, gallery/read endpoints, a jobs DB row, and manifest
+  timings. The manifest records `resolution:1024x1024`,
+  `requested_sampler:"euler"`, `executed_sampler:"flowmatch_euler"`,
+  `requested_scheduler:"flowmatch"`, `executed_scheduler:"simple_flowmatch"`,
+  `load_seconds=2.49144893`, `text_encode_seconds=3.132651268`,
+  `denoise_seconds=2.078721406`, `vae_decode_seconds=3.266865353`,
+  `total_wall_seconds=11.438153728`, and `peak_vram_mib=21497.3125`.
+  This proves the daemon 1024 path uses the tiled 64-latent VAE decoder instead
+  of the former whole-frame 128-latent decoder. It is still a 1-step
+  experimental path/resource proof, not quality, sampler, or speed parity.
 - No stale source prose describes the daemon as a skeleton.
 
 ## P0.3 Video Product Path
@@ -313,23 +336,29 @@ Acceptance evidence:
   from the prior upsampler/VAE-load stall, but it is still not accepted video
   parity because no MP4 artifact was emitted.
 - Current measured daemon video-only evidence:
-  `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 300
-  --audio-mode noaudio --strict-artifact --write-readiness
-  output/checks/ltx2_video_daemon_readiness.json` passed. It emitted
-  `output/serenity_daemon/video-0072/ltx2_t2v_stage2_dev_smoke.mp4`, probe
+  `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 520
+  --weight-mode resident --audio-mode noaudio --strict-artifact --write-readiness
+  output/checks/ltx2_video_daemon_resident_readiness.json` passed. It emitted
+  `output/serenity_daemon/video-0074/ltx2_t2v_stage2_dev_smoke.mp4`, probe
   metadata `width=768`, `height=512`, `frame_count=121`, `duration=5.041667`,
   `fps=24.0`, `video_codec=h264`, `muxing=probe_ok`,
   `audio_behavior=video_only_no_audio_stream`, and external peak VRAM delta
-  `9851 MiB` (`10845 MiB` peak used). The result manifest records
-  `total_wall_seconds=202.353546797`, `audio_mode:"noaudio"`,
+  `10501 MiB` (`11490 MiB` peak used). The result manifest records
+  `mode:"staged lora resident noaudio nonag"`, `weight_mode:"resident"`,
+  `total_wall_seconds=186.882605556`, `audio_mode:"noaudio"`,
   `accepted_video_parity:false`, and `accepted_sampler_parity:false`. It also
   records `runner_timing_path`, `runner_timings`, and `stage_timings`;
   measured no-audio timings include
+  `stage1_denoise_seconds=57.9751922939995`,
+  `stage2_denoise_seconds=76.74856130400076`,
+  `video_decode_seconds=28.060338318000504`,
+  `frame_png_write_seconds=1.718876539998746`, and
+  `video_mux_seconds=1.1828436699997837`. Compared with the previous stream
+  no-audio gate (`total_wall_seconds=202.353546797`,
   `stage1_denoise_seconds=73.01245590500002`,
-  `stage2_denoise_seconds=90.72237481299999`,
-  `video_decode_seconds=24.48655445499935`,
-  `frame_png_write_seconds=1.7776024760005384`, and
-  `video_mux_seconds=0.720319357000335`.
+  `stage2_denoise_seconds=90.72237481299999`, `peak used=10845 MiB`), resident
+  mode improves the bounded wall time by about `15.5s` at about `645 MiB` higher
+  sampled peak used.
 - Current measured daemon A/V evidence:
   `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 520
   --audio-mode audio --strict-artifact --write-readiness
@@ -357,15 +386,17 @@ Acceptance evidence:
   `audio_mux_seconds=0.7538969699999143`.
 - `POST /v1/video` accepts only `runner:"ltx2_staged_dev_smoke"` and clamps
   `steps` to `1..3`. It accepts `audio_mode:"noaudio"` or `"audio"`, defaulting
-  the bounded artifact gate to video-only. It runs
-  `output/bin/ltx2_video_smoke_runner staged lora stream <audio_mode> nonag
-  output/serenity_daemon/<video-id> <steps>`, writes `ltx2_video_runner.log`,
-  and writes `ltx2_video_result.json` with
+  the bounded artifact gate to video-only. It accepts `weight_mode:"resident"`
+  or `"stream"` and now defaults to the resident warm-range path instead of
+  forcing stream mode. It runs
+  `output/bin/ltx2_video_smoke_runner staged lora <weight_mode> <audio_mode>
+  nonag output/serenity_daemon/<video-id> <steps>`, writes
+  `ltx2_video_runner.log`, and writes `ltx2_video_result.json` with
   `accepted_video_artifact`, `accepted_av_artifact`,
   `accepted_video_parity:false`, `accepted_sampler_parity:false`,
-  `total_wall_seconds`, output paths, and MP4 probe fields when the runner
-  succeeds. This logic now lives in `serenitymojo/serve/video_api.mojo`; the
-  daemon only dispatches the route.
+  `weight_mode`, `total_wall_seconds`, output paths, stage timings, and MP4
+  probe fields when the runner succeeds. This logic now lives in
+  `serenitymojo/serve/video_api.mojo`; the daemon only dispatches the route.
 - Mojo artifact probe smoke:
   `pixi run mojo run -I . -I /home/alex/MOJO-libs
   serenitymojo/components/artifacts_smoke.mojo` produced

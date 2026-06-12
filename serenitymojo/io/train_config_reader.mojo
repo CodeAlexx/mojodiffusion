@@ -49,7 +49,7 @@ from serenitymojo.training.train_config import (
     TRAIN_DTYPE_INT_W8A8, TRAIN_DTYPE_GGUF, TRAIN_DTYPE_GGUF_A8_FLOAT,
     TRAIN_DTYPE_GGUF_A8_INT,
     TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
-    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
+    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_ADAMW_8BIT,
     TRAIN_TIME_UNIT_EPOCH, TRAIN_TIME_UNIT_STEP, TRAIN_TIME_UNIT_SECOND,
     TRAIN_TIME_UNIT_MINUTE, TRAIN_TIME_UNIT_HOUR, TRAIN_TIME_UNIT_NEVER,
     TRAIN_TIME_UNIT_ALWAYS,
@@ -219,11 +219,17 @@ def _dtype_int(s: String) raises -> Int:
 def _optimizer_int(s: String) raises -> Int:
     # T1.C fail-loud contract: only the optimizers a Mojo trainer actually
     # implements parse (ADAMW default fused path; ADAFACTOR /
-    # SCHEDULE_FREE_ADAMW via training/levers.mojo levers_optimizer_step).
-    # Every other recognized tag (ADAM/CAME/LION/PRODIGY/SGD/...) is rejected
-    # AT CONFIG LOAD instead of silently training AdamW.
-    if s == "ADAMW" or s == "ADAMW_8BIT" or s == "ADAMW_ADV":
+    # SCHEDULE_FREE_ADAMW / ADAMW_8BIT via training/levers.mojo
+    # levers_optimizer_step). Every other recognized tag
+    # (ADAM/CAME/LION/PRODIGY/SGD/...) is rejected AT CONFIG LOAD instead of
+    # silently training AdamW.
+    if s == "ADAMW" or s == "ADAMW_ADV":
         return TRAIN_OPTIMIZER_ADAMW
+    elif s == "ADAMW_8BIT":
+        # T2.A: bnb block-wise 8-bit AdamW (training/adamw8bit.mojo, gated by
+        # training/tests/adamw8bit_parity.mojo vs bnb 0.49.2 dumps). Pre-T2.A
+        # this tag silently aliased to plain ADAMW.
+        return TRAIN_OPTIMIZER_ADAMW_8BIT
     elif s == "ADAFACTOR":
         return TRAIN_OPTIMIZER_ADAFACTOR
     elif s == "SCHEDULE_FREE_ADAMW":
@@ -239,11 +245,12 @@ def _optimizer_int(s: String) raises -> Int:
         raise Error(
             String("JSON config: optimizer '") + s
             + String("' is not implemented in the Mojo trainers; supported:")
-            + String(" ADAMW, ADAFACTOR, SCHEDULE_FREE_ADAMW")
+            + String(" ADAMW, ADAMW_8BIT, ADAFACTOR, SCHEDULE_FREE_ADAMW")
         )
     raise Error(
         String("JSON config: unknown Optimizer '") + s
-        + String("'; supported: ADAMW, ADAFACTOR, SCHEDULE_FREE_ADAMW")
+        + String("'; supported: ADAMW, ADAMW_8BIT, ADAFACTOR,")
+        + String(" SCHEDULE_FREE_ADAMW")
     )
 
 
@@ -795,6 +802,20 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             var sc = _read_scalar(cur)
             if sc.is_string:
                 cfg.frames = sc.s
+        elif key == "quantized_resident":
+            # T2.B quantized-resident base weights. Fail loud on unknown tags
+            # at config-load time (OneTrainer fail-fast discipline).
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                if (
+                    sc.s != String("") and sc.s != String("OFF")
+                    and sc.s != String("fp8_e4m3")
+                ):
+                    raise Error(
+                        String("train config: unsupported quantized_resident '")
+                        + sc.s + "' (supported: OFF, fp8_e4m3)"
+                    )
+                cfg.quantized_resident = sc.s
         # arch (ints)
         elif key == "inner_dim":
             cfg.d_model = Int(_read_scalar(cur).num)

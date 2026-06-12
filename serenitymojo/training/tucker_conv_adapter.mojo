@@ -19,7 +19,11 @@
 # ── SCOPE HONESTY (per task brief) ───────────────────────────────────────────
 # Conv adapters are PRIMITIVE-ONLY for Klein / Z-Image (no trained conv2d layers).
 # Built for parity-completeness with the LyCORIS Tucker path; NOT integrated into
-# the Klein/Z-Image stack. adapter_algo "locon_tucker" (8) is opt-in, fail-loud.
+# the Klein/Z-Image stack. NOTE (T2.F skeptic, 2026-06-11): there is NO
+# adapter_algo id for Tucker — io/train_config_reader.mojo rejects
+# "locon_tucker" (only lora|full|loha|dora|lokr|oft|boft exist); primitive +
+# save module only. Torch-lycoris parity + ecosystem-load gates:
+# training/tests/lycoris_family_parity.mojo + lycoris_family_load_check.py.
 #
 # ── Layout (host F32, row-major) — MATCHES ops/conv2d_backward.mojo NHWC/RSCF ──
 #   x      NHWC  [N, Hi, Wi, Cin]

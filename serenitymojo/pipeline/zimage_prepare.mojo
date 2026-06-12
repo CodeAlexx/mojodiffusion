@@ -27,6 +27,7 @@ from std.collections import List
 from std.gpu.host import DeviceContext
 from std.memory import alloc
 from std.os import listdir
+from std.sys import argv
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -47,6 +48,18 @@ comptime TEXT_ENCODER_DIR = ZROOT + "/text_encoder"
 comptime TOK_JSON = ZROOT + "/tokenizer/tokenizer.json"
 comptime STAGE_DIR = "/home/alex/mojodiffusion/output/alina_zimage_stage"
 comptime CACHE_DIR = "/home/alex/mojodiffusion/output/alina_zimage_cache"
+# T2.D dynamic aspect bucketing (opt-in `t2d` argv mode): consume the
+# GENERATED-ladder stage (zimage_stage_alina.mojo t2d mode) and write a
+# SEPARATE cache. Cache tensor schema is UNCHANGED (latent/text_embedding/
+# text_mask per-sample keyed tensors, bucket = latent shape at peek_key);
+# the stage's aspect_buckets.json manifest is copied alongside as
+# documentation. The 512-budget T2.D ladder buckets that appear in the Alina
+# set (448x576 and 384x704 canvases) are the SAME image dims as the fixed
+# OneTrainer buckets below, so the comptime VAE instantiations cover them;
+# other ladder buckets (e.g. the 512x512 square) fail loud here until their
+# ZImageVaeEncoder[LH,LW] instantiation is added.
+comptime STAGE_DIR_T2D = "/home/alex/mojodiffusion/output/alina_zimage_stage_t2d"
+comptime CACHE_DIR_T2D = "/home/alex/mojodiffusion/output/alina_zimage_cache_t2d"
 comptime IH_MAIN = 576
 comptime IW_MAIN = 448
 comptime LH_MAIN = IH_MAIN // 8
@@ -82,8 +95,8 @@ def _drop_suffix(s: String, suffix_len: Int) raises -> String:
     return String(unsafe_from_utf8=out)
 
 
-def _stage_files() raises -> List[String]:
-    var raw = listdir(String(STAGE_DIR))
+def _stage_files(stage_dir: String) raises -> List[String]:
+    var raw = listdir(stage_dir)
     var fs = List[String]()
     for i in range(len(raw)):
         if raw[i].endswith(".safetensors"):
@@ -172,20 +185,34 @@ def _mask_512(valid: Int, ctx: DeviceContext) raises -> Tensor:
 
 def main() raises:
     var ctx = DeviceContext()
-    print("=== Z-Image Alina prepare: local Mojo Qwen3 + VAE -> cache ===")
-    print("  stage:", STAGE_DIR)
-    print("  cache:", CACHE_DIR)
-    _ = sys_system(String("mkdir -p ") + String(STAGE_DIR))
-    var files = _stage_files()
+    var a = argv()
+    var t2d = len(a) >= 2 and String(a[1]) == String("t2d")
+    var stage_dir = String(STAGE_DIR_T2D) if t2d else String(STAGE_DIR)
+    var cache_dir = String(CACHE_DIR_T2D) if t2d else String(CACHE_DIR)
+    if t2d:
+        print("=== Z-Image T2.D prepare: GENERATED-bucket stage -> cache ===")
+    else:
+        print("=== Z-Image Alina prepare: local Mojo Qwen3 + VAE -> cache ===")
+    print("  stage:", stage_dir)
+    print("  cache:", cache_dir)
+    _ = sys_system(String("mkdir -p ") + stage_dir)
+    var files = _stage_files(stage_dir)
     if len(files) == 0:
         raise Error(
             String("zimage_prepare: no staged image safetensors in ")
-            + String(STAGE_DIR)
+            + stage_dir
             + String(". Raw image decode/stage must be Mojo-owned; do not use Rust or Python caches.")
         )
 
-    _ = sys_system(String("mkdir -p ") + String(CACHE_DIR))
-    _ = sys_system(String("rm -f ") + String(CACHE_DIR) + String("/*.safetensors"))
+    _ = sys_system(String("mkdir -p ") + cache_dir)
+    _ = sys_system(String("rm -f ") + cache_dir + String("/*.safetensors"))
+    if t2d:
+        # documentation manifest travels with the cache (schema v1; the
+        # trainer keys buckets off latent shapes and does not read it)
+        _ = sys_system(
+            String("cp -f ") + stage_dir + String("/aspect_buckets.json ")
+            + cache_dir + String("/aspect_buckets.json 2>/dev/null || true")
+        )
 
     print("[load] ZImageVaeEncoder main", VAE_DIR)
     var vae_main = ZImageVaeEncoder[LH_MAIN, LW_MAIN].load(String(VAE_DIR), ctx)
@@ -198,9 +225,9 @@ def main() raises:
     for idx in range(len(files)):
         var name = files[idx]
         var stem = _drop_suffix(name, String(".safetensors").byte_length())
-        var img_path = String(STAGE_DIR) + String("/") + name
-        var cap_path = String(STAGE_DIR) + String("/") + stem + String(".txt")
-        var out_path = String(CACHE_DIR) + String("/") + stem + String(".safetensors")
+        var img_path = stage_dir + String("/") + name
+        var cap_path = stage_dir + String("/") + stem + String(".txt")
+        var out_path = cache_dir + String("/") + stem + String(".safetensors")
         print("-- sample", idx + 1, "/", len(files), name)
 
         var image = _load_image(img_path, ctx)
@@ -233,4 +260,4 @@ def main() raises:
         write_sample(latent, emb, mask, out_path, ctx)
         print("   tokens:", valid, " latent:", lsh[0], lsh[1], lsh[2], lsh[3], " wrote", out_path)
 
-    print("PASS: wrote", len(files), "Z-Image cache samples to", CACHE_DIR)
+    print("PASS: wrote", len(files), "Z-Image cache samples to", cache_dir)

@@ -71,6 +71,7 @@ comptime TRAIN_OPTIMIZER_LION = 4
 comptime TRAIN_OPTIMIZER_PRODIGY = 5
 comptime TRAIN_OPTIMIZER_SGD = 6
 comptime TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW = 7
+comptime TRAIN_OPTIMIZER_ADAMW_8BIT = 8  # T2.A bnb block-wise 8-bit AdamW
 
 comptime TRAIN_TIME_UNIT_EPOCH = 0
 comptime TRAIN_TIME_UNIT_STEP = 1
@@ -362,6 +363,16 @@ struct TrainConfig(Copyable, Movable):
     var save_every: Int
     var sample_every: Int
 
+    # ── T2.B quantized-resident base weights (default-off == "") ────────────
+    # "" / "OFF" = bf16-resident (the existing path, byte-identical — C13).
+    # "fp8_e4m3" = base linears quantized ONCE at load to E4M3 bytes +
+    # per-output-row F32 scale (the parity-gated Ideogram-4 inference layout,
+    # ops/fp8.mojo + ops/fp8_quant.mojo) and dequantized to bf16 PER BLOCK
+    # right before compute; norms/embeddings/small (<1MB) tensors stay bf16.
+    # LoRA adapters + optimizer state + activations are untouched. This is a
+    # NEW numerics class — trainers gate it vs their bf16 baseline.
+    var quantized_resident: String
+
     def n_layers(self) -> Int:
         """Total block count (back-compat convenience)."""
         return self.num_double + self.num_single
@@ -616,6 +627,7 @@ struct TrainConfig(Copyable, Movable):
         normalize_masked_area_loss: Bool, masked_prior_preservation_weight: Float32,
         custom_conditioning_image: Bool,
         max_steps: Int, save_every: Int, sample_every: Int,
+        var quantized_resident: String = String(""),  # T2.B (default-off)
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -786,6 +798,7 @@ struct TrainConfig(Copyable, Movable):
         self.max_steps = max_steps
         self.save_every = save_every
         self.sample_every = sample_every
+        self.quantized_resident = quantized_resident^
 
     def is_lora_training(self) -> Bool:
         return self.training_method == TRAINING_METHOD_LORA
@@ -841,6 +854,7 @@ struct TrainConfig(Copyable, Movable):
             or v == TRAIN_OPTIMIZER_PRODIGY
             or v == TRAIN_OPTIMIZER_SGD
             or v == TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW
+            or v == TRAIN_OPTIMIZER_ADAMW_8BIT
         )
 
     def optimizer_is_adamw(self) -> Bool:

@@ -12,6 +12,10 @@
 #      train_mode (and only for SF).
 #   4. resume guard: first call at k != 1 fails loud (no state sidecar yet).
 #   5. levers_optimizer_validate rejects an unsupported tag (CAME).
+#   6. T2.A: optimizer=ADAMW_8BIT routes to the bnb block-wise 8-bit AdamW
+#      (training/adamw8bit.mojo): per-matrix Adam8bitState + the two 256-entry
+#      dynamic LUTs lazily created, params actually move, per-state step
+#      counters advance, validate passes.
 #
 # Build/run:
 #   cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && \
@@ -28,6 +32,7 @@ from serenitymojo.training.levers import (
 from serenitymojo.training.train_config import (
     TrainConfig, TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
     TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_CAME,
+    TRAIN_OPTIMIZER_ADAMW_8BIT,
 )
 from serenitymojo.training.train_step import LoraAdapter
 
@@ -207,4 +212,37 @@ def main() raises:
         raised_came = True
     _check(String("validate-rejects-came"), raised_came)
     levers_optimizer_validate(cfg, String("dispatch gate"))  # SF passes
+
+    # 6. T2.A ADAMW_8BIT routes to the bnb 8-bit AdamW; lazy state + LUTs;
+    # params move; per-state step counters advance; validate passes.
+    var cfg8 = TrainConfig.default()
+    cfg8.optimizer = TRAIN_OPTIMIZER_ADAMW_8BIT
+    _check(String("a8-active"), levers_optimizer_active(cfg8))
+    levers_optimizer_validate(cfg8, String("dispatch gate"))
+    var st_8 = LeversOptimizerState()
+    var ads_8 = _make_set()
+    var a8_before = _absum_bf16(ads_8[0].a)
+    levers_optimizer_step_host(
+        cfg8, ads_8, _make_grads(), _make_grads_b(), 1, Float32(1e-3),
+        0, 2, st_8,
+    )
+    _check(String("a8-state-created"), st_8.initialized)
+    _check(String("a8-kind"), st_8.kind == TRAIN_OPTIMIZER_ADAMW_8BIT)
+    _check(String("a8-states-2-per-adapter"), len(st_8.a8) == 4)
+    _check(
+        String("a8-no-other-states"),
+        len(st_8.ada) == 0 and len(st_8.sf) == 0,
+    )
+    _check(
+        String("a8-luts-256"),
+        len(st_8.a8_qmap_signed) == 256 and len(st_8.a8_qmap_unsigned) == 256,
+    )
+    _check(String("a8-step-counted"), st_8.a8[0].step == 1)
+    _check(String("a8-params-moved"), _absum_bf16(ads_8[0].a) != a8_before)
+    levers_optimizer_step_host(
+        cfg8, ads_8, _make_grads(), _make_grads_b(), 2, Float32(1e-3),
+        0, 2, st_8,
+    )
+    _check(String("a8-step-2"), st_8.a8[3].step == 2)
+
     print("ALL PASS — levers optimizer dispatch OK")

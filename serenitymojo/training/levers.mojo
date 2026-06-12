@@ -165,6 +165,9 @@ def levers_masked_loss_grad(
 # optimizer_parity.mojo vs /tmp/optimizer_oracle.safetensors):
 #   * training/adafactor.mojo          — torch.optim.Adafactor ("torch-adafactor")
 #   * training/adamw_schedulefree.mojo — SimpleTuner AdamWScheduleFreeKahan
+#   * training/adamw8bit.mojo          — bnb 0.49.2 block-wise 8-bit AdamW
+#     (T2.A; gated by training/tests/adamw8bit_parity.mojo vs the bnb
+#     before/after dumps — codes exact, param <= 2.4e-7, absmax bit-exact)
 #
 # DEFAULT-OFF CONTRACT (C13): levers_optimizer_active() is False for
 # cfg.optimizer == TRAIN_OPTIMIZER_ADAMW (the config default), and the trainer
@@ -180,6 +183,9 @@ def levers_masked_loss_grad(
 #     reference registers override_lr_scheduler=True (optimizer_param.py:
 #     249-259): warmup lives INSIDE the optimizer via
 #     cfg.optimizer_warmup_steps (:= args.lr_warmup_steps, :1114-1116).
+#   * ADAMW_8BIT consumes the TRAINER-SCHEDULED lr (`step_lr`) — bnb's
+#     optim.AdamW8bit is a plain torch optimizer driven by the external LR
+#     scheduler, exactly like the default AdamW path; betas/eps/wd from cfg.
 #
 # ── RESIDENT dev_p SYNC DECISION (the v2-engine seam) ────────────────────────
 # zimage's v2 engine keeps the live bf16 LoRA params in
@@ -222,9 +228,12 @@ from serenitymojo.training.adamw_schedulefree import (
     adamw_schedulefree_adjusted_lr, adamw_schedulefree_step_param,
     adamw_schedulefree_eval, adamw_schedulefree_train,
 )
+from serenitymojo.training.adamw8bit import (
+    Adam8bitState, adam8bit_create_dynamic_map, adamw8bit_step,
+)
 from serenitymojo.training.train_config import (
     TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
-    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
+    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_ADAMW_8BIT,
 )
 
 # SimpleTuner "torch-adafactor" default_settings (optimizer_param.py:153-162)
@@ -258,12 +267,14 @@ def levers_optimizer_validate(cfg: TrainConfig, trainer_name: String) raises:
                 trainer_name + String(" requires optimizer_warmup_steps >= 0")
             )
         return
+    if cfg.optimizer == TRAIN_OPTIMIZER_ADAMW_8BIT:
+        return
     raise Error(
         trainer_name
         + String(": optimizer tag ")
         + String(cfg.optimizer)
         + String(" has no levers dispatch; supported: ADAMW (default fused")
-        + String(" path), ADAFACTOR, SCHEDULE_FREE_ADAMW")
+        + String(" path), ADAMW_8BIT, ADAFACTOR, SCHEDULE_FREE_ADAMW")
     )
 
 
@@ -280,6 +291,9 @@ struct LeversOptimizerState(Movable):
     var ada: List[AdafactorState]          # ADAFACTOR: [2*(end-start)]
     var sf: List[AdamWScheduleFreeState]   # SCHEDULE_FREE: [2*(end-start)]
     var sf_ctl: AdamWScheduleFreeCtl       # SCHEDULE_FREE: optimizer-level k
+    var a8: List[Adam8bitState]            # ADAMW_8BIT: [2*(end-start)]
+    var a8_qmap_signed: List[Float32]      # ADAMW_8BIT: 256-entry m LUT
+    var a8_qmap_unsigned: List[Float32]    # ADAMW_8BIT: 256-entry v LUT
 
     def __init__(out self):
         self.initialized = False
@@ -289,6 +303,9 @@ struct LeversOptimizerState(Movable):
         self.ada = List[AdafactorState]()
         self.sf = List[AdamWScheduleFreeState]()
         self.sf_ctl = AdamWScheduleFreeCtl()
+        self.a8 = List[Adam8bitState]()
+        self.a8_qmap_signed = List[Float32]()
+        self.a8_qmap_unsigned = List[Float32]()
 
 
 def _levers_bf16_to_f32(p: List[BFloat16]) -> List[Float32]:
@@ -338,12 +355,21 @@ def _levers_optimizer_lazy_init(
         for i in range(start, end):
             st.sf.append(AdamWScheduleFreeState(len(adapters[i].a)))
             st.sf.append(AdamWScheduleFreeState(len(adapters[i].b)))
+    elif cfg.optimizer == TRAIN_OPTIMIZER_ADAMW_8BIT:
+        # bnb dynamic LUTs built once per run (bit-exact vs bnb's dumps —
+        # adamw8bit_parity.mojo); zero-init state == bnb init_state.
+        st.a8_qmap_signed = adam8bit_create_dynamic_map(True)
+        st.a8_qmap_unsigned = adam8bit_create_dynamic_map(False)
+        for i in range(start, end):
+            st.a8.append(Adam8bitState(len(adapters[i].a)))
+            st.a8.append(Adam8bitState(len(adapters[i].b)))
     else:
         raise Error(
             String("levers_optimizer_step: optimizer tag ")
             + String(cfg.optimizer)
             + String(" has no levers dispatch; supported: ADAMW (default")
-            + String(" fused path), ADAFACTOR, SCHEDULE_FREE_ADAMW")
+            + String(" fused path), ADAMW_8BIT, ADAFACTOR,")
+            + String(" SCHEDULE_FREE_ADAMW")
         )
     st.kind = cfg.optimizer
     st.start = start
@@ -432,6 +458,28 @@ def levers_optimizer_step_host(
         st.sf_ctl.end_step(
             adamw_schedulefree_adjusted_lr(k0, lr, beta2, warmup)
         )
+    elif cfg.optimizer == TRAIN_OPTIMIZER_ADAMW_8BIT:
+        # TRAINER-SCHEDULED lr (step_lr), like the default AdamW path — bnb's
+        # optim.AdamW8bit is driven by the external LR scheduler. F32 host
+        # math (the bnb kernel is f32); adamw8bit_step asserts the per-state
+        # step counter == k-1 (fail-loud resume guard, same contract as the
+        # other levers optimizers).
+        for i in range(start, end):
+            var idx = 2 * (i - start)
+            var pa = _levers_bf16_to_f32(adapters[i].a)
+            adamw8bit_step(
+                pa, d_a[i], st.a8[idx],
+                st.a8_qmap_signed, st.a8_qmap_unsigned, k,
+                step_lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            _levers_writeback_bf16(adapters[i].a, pa)
+            var pb = _levers_bf16_to_f32(adapters[i].b)
+            adamw8bit_step(
+                pb, d_b[i], st.a8[idx + 1],
+                st.a8_qmap_signed, st.a8_qmap_unsigned, k,
+                step_lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            _levers_writeback_bf16(adapters[i].b, pb)
     else:
         raise Error(
             String("levers_optimizer_step: optimizer tag ")

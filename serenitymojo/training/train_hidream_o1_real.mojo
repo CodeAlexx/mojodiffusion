@@ -37,7 +37,20 @@
 # LoRA-B nonzero after N steps.
 #
 # Run: train_hidream_o1_real <stage_dir> <steps> [lr] [rank] [out_dir]
-#                            [ema_decay] [config.json]
+#                            [ema_decay] [config.json] [grad_dump.safetensors]
+#
+# ── T2.B QUANTIZED-RESIDENT BASE (config "quantized_resident", default OFF) ──
+# "fp8_e4m3": the 7 big linears per layer are quantized ONCE at load to E4M3
+# bytes + per-output-row F32 scale (ops/fp8_quant.mojo encode; decode is the
+# parity-gated Ideogram-4 dequant, ops/fp8.mojo) and kept resident at
+# 1 byte/param (~6.9 GB saved vs bf16-resident). Each block dequants to bf16
+# right before compute (forward AND the recompute backward use the same
+# decode) and frees the bf16 copy when the block's weights struct drops.
+# Norms / small (<1MB) tensors stay bf16. LoRA adapters, optimizer state and
+# activations are bf16/F32 exactly as before. NEW NUMERICS CLASS: gated by a
+# 10-step fp8-vs-bf16 loss-trajectory cosine >= 0.999 + step-1 adapter-grad
+# cosine >= 0.999 (argv[8] grad dump). Flag OFF reproduces the 3-step anchor
+# 0.05885428/0.33308488/0.5214583 EXACTLY (C13).
 #
 # ── T1 RUNTIME CONFIG + PRECEDENCE (Tier-1 lever wiring, levers.mojo) ────────
 # Optional trailing argv [config.json] parses via io/train_config_reader.mojo
@@ -123,6 +136,10 @@ from serenitymojo.models.dit.hidream_o1_train_block import (
     hidream_o1_block_lora_forward,
     hidream_o1_block_lora_backward,
 )
+# T2.B fp8-quantized-resident base (default-off): encode = ops/fp8_quant.mojo
+# (new, RNE per-row absmax), decode = the parity-gated Ideogram-4 dequant.
+from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
+from serenitymojo.ops.fp8_quant import fp8_e4m3_rowscale, fp8_e4m3_encode_perrow
 from serenitymojo.pipeline.hidream_o1_cfg import build_t2i_input, T2ISample
 
 comptime TArc = ArcPointer[Tensor]
@@ -274,6 +291,95 @@ def _block_weights(block: Block, li: Int) raises -> HiDreamO1BlockWeights:
     )
 
 
+# ── T2.B fp8-quantized-resident helpers (default-off; flag path only) ────────
+# Quantize-ONCE-at-load: the 7 big linears of a layer become E4M3 bytes (stored
+# under the original tensor name) + per-output-row F32 scales (name +
+# "_scale") — the exact layout the parity-gated Ideogram-4 inference dequant
+# consumes. Norms / small (<1MB) tensors keep bf16 (standard practice; matches
+# how ideogram4 fp8 checkpoints leave norms/embeddings unquantized — only
+# Linear weights carry weight_scale siblings).
+comptime _FP8_MIN_BYTES = 1 << 20  # tensors under 1MB (bf16) stay bf16
+
+
+def _quantize_block_fp8(block: Block, li: Int, ctx: DeviceContext) raises -> Block:
+    """Re-key one resident layer: big 2-D linears → fp8 bytes + '_scale'; the
+    rest copied through as bf16. The input block's bf16 linears are freed when
+    the caller drops it (Arc refcount)."""
+    var p = String("model.language_model.layers.") + String(li)
+    var lin: List[String] = [
+        String(".self_attn.q_proj.weight"), String(".self_attn.k_proj.weight"),
+        String(".self_attn.v_proj.weight"), String(".self_attn.o_proj.weight"),
+        String(".mlp.gate_proj.weight"), String(".mlp.up_proj.weight"),
+        String(".mlp.down_proj.weight"),
+    ]
+    var keep: List[String] = [
+        String(".input_layernorm.weight"), String(".self_attn.q_norm.weight"),
+        String(".self_attn.k_norm.weight"),
+        String(".post_attention_layernorm.weight"),
+    ]
+    var out = Block()
+    for ref sfx in keep:
+        var full = p + sfx
+        if full not in block:
+            raise Error("train_hidream_o1: missing block weight " + full)
+        out[full] = block[full].copy()
+    for ref sfx in lin:
+        var full = p + sfx
+        if full not in block:
+            raise Error("train_hidream_o1: missing block weight " + full)
+        var t = block[full].copy()
+        var sh = t[].shape()
+        if len(sh) != 2 or t[].nbytes() < _FP8_MIN_BYTES or t[].dtype() != STDtype.BF16:
+            # <1MB / non-2D / non-bf16: keep as-is (the standard skip rule).
+            out[full] = t.copy()
+            continue
+        var scale_t = fp8_e4m3_rowscale(t[], ctx)
+        var bytes_t = fp8_e4m3_encode_perrow(t[], scale_t, ctx)
+        out[full] = ArcPointer(bytes_t^)
+        out[full + "_scale"] = ArcPointer(scale_t^)
+    return out^
+
+
+def _bw_q(block: Block, p: String, suffix: String, ctx: DeviceContext) raises -> TArc:
+    """fp8-aware weight fetch: dequantize (per-row, the gated Ideogram-4
+    decode) when a '_scale' sibling exists; otherwise pass the bf16 Arc
+    through. The dequantized bf16 tensor is OWNED by the returned TArc — it is
+    freed when the per-block weights struct drops at the end of the block."""
+    var full = p + suffix
+    if full not in block:
+        raise Error("train_hidream_o1: missing block weight " + full)
+    if (full + "_scale") in block:
+        return TArc(fp8_e4m3_dequant_perrow_to_bf16(
+            block[full][], block[full + "_scale"][], ctx,
+        ))
+    return block[full].copy()
+
+
+def _block_weights_q(
+    block: Block, li: Int, fp8_on: Bool, ctx: DeviceContext,
+) raises -> HiDreamO1BlockWeights:
+    """Dispatch: flag-off → the EXACT existing `_block_weights` path (C13);
+    flag-on → per-block dequant of the fp8-resident linears. Forward and the
+    recompute backward both go through here, so backward uses the SAME
+    dequantized weights as forward."""
+    if not fp8_on:
+        return _block_weights(block, li)
+    var p = String("model.language_model.layers.") + String(li)
+    return HiDreamO1BlockWeights(
+        _bw(block, p, ".input_layernorm.weight"),
+        _bw_q(block, p, ".self_attn.q_proj.weight", ctx),
+        _bw_q(block, p, ".self_attn.k_proj.weight", ctx),
+        _bw_q(block, p, ".self_attn.v_proj.weight", ctx),
+        _bw(block, p, ".self_attn.q_norm.weight"),
+        _bw(block, p, ".self_attn.k_norm.weight"),
+        _bw_q(block, p, ".self_attn.o_proj.weight", ctx),
+        _bw(block, p, ".post_attention_layernorm.weight"),
+        _bw_q(block, p, ".mlp.gate_proj.weight", ctx),
+        _bw_q(block, p, ".mlp.up_proj.weight", ctx),
+        _bw_q(block, p, ".mlp.down_proj.weight", ctx),
+    )
+
+
 def _adamw_host(
     mut p: List[Float32], g: List[Float32],
     mut m: List[Float32], mut v: List[Float32], m_off: Int,
@@ -299,9 +405,15 @@ def main() raises:
     if len(args) < 3:
         raise Error(
             "usage: train_hidream_o1_real <stage_dir> <steps> [lr] [rank]"
-            " [out_dir] [ema_decay] [config.json]"
+            " [out_dir] [ema_decay] [config.json] [grad_dump.safetensors]"
         )
     var stage_dir = String(args[1])
+    # Optional argv[8]: dump the step-1 adapter grads (g_a.<k>/g_b.<k>, F32)
+    # to a safetensors for offline gate comparison (T2.B grad-cosine gate).
+    # "-" / absent = off (no behavior change).
+    var grad_dump = String("")
+    if len(args) > 8 and String(args[8]) != "-":
+        grad_dump = String(args[8])
 
     # ── T1 runtime config (optional trailing argv; precedence in header) ─────
     var train_cfg = TrainConfig.default()
@@ -353,6 +465,25 @@ def main() raises:
     levers_optimizer_validate(train_cfg, String("HiDream-O1 trainer"))
     if levers_optimizer_active(train_cfg):
         print("[optimizer] levers dispatch active, tag ", train_cfg.optimizer)
+    # T2.B quantized-resident flag (config-only lever, default-off). The
+    # reader already fail-louds on unknown tags; re-assert for configs built
+    # in code (same discipline as levers_optimizer_validate).
+    var quant_tag = String("")
+    if has_config:
+        quant_tag = train_cfg.quantized_resident.copy()
+    if quant_tag == String("OFF"):
+        quant_tag = String("")
+    if quant_tag != String("") and quant_tag != String("fp8_e4m3"):
+        raise Error(
+            "train_hidream_o1: unsupported quantized_resident '" + quant_tag
+            + "' (supported: OFF, fp8_e4m3)"
+        )
+    var fp8_resident = quant_tag == String("fp8_e4m3")
+    if fp8_resident:
+        print(
+            "[quant] fp8_e4m3-resident base linears (per-row scale, quantize"
+            " once at load, dequant per block; norms stay bf16)"
+        )
     makedirs(out_dir, exist_ok=True)
 
     var ctx = DeviceContext()
@@ -455,11 +586,21 @@ def main() raises:
     # load_block_as_bf16) — 72 visits x ~845 MB = ~60 GB/step = the ~100 s.
     # Converted ONCE, the whole kept set is ~15.2 GB bf16 -> RESIDENT fits
     # 24 GB (the earlier OOM was the F32 30.4 GB resident load).
-    print("[load] converting 36 layers to bf16-resident (once)")
+    # T2.B: with fp8_resident, the bf16 block is quantized IMMEDIATELY after
+    # its one load (E4M3 bytes + per-row scales resident, 1 byte/param for the
+    # 7 big linears) and the bf16 copy drops with the handle — peak transient
+    # = one layer's bf16 alongside its fp8 form.
+    if fp8_resident:
+        print("[load] converting 36 layers to fp8_e4m3-resident (once)")
+    else:
+        print("[load] converting 36 layers to bf16-resident (once)")
     var resident_blocks = List[Block]()
     for li in range(LAYERS):
         var h0 = dit.loader.await_block(li, ctx)
-        resident_blocks.append(h0.block.copy())
+        if fp8_resident:
+            resident_blocks.append(_quantize_block_fp8(h0.block, li, ctx))
+        else:
+            resident_blocks.append(h0.block.copy())
 
     var imgs = ShardedSafeTensors.open(stage_dir + "/images.safetensors")
     var n_samples = 0
@@ -572,7 +713,9 @@ def main() raises:
         var block_in = List[TArc]()
         for li in range(LAYERS):
             block_in.append(x.copy())
-            var bwts = _block_weights(resident_blocks[li], li)
+            # T2.B: flag-off this IS _block_weights (C13); flag-on dequants
+            # the fp8-resident linears to bf16 for this block only.
+            var bwts = _block_weights_q(resident_blocks[li], li, fp8_resident, ctx)
             var f = hidream_o1_block_lora_forward[S, H, HKV, Dh](
                 x, bwts, loras[li], cos_q, sin_q, cos_k, sin_k, mask4,
                 D, F, EPS, ctx,
@@ -636,7 +779,9 @@ def main() raises:
             g_b.append(List[Float32]())
         var bi = LAYERS - 1
         while bi >= 0:
-            var bwts_b = _block_weights(resident_blocks[bi], bi)
+            # T2.B: same dispatch as forward — backward recompute uses the
+            # SAME dequantized weights forward used (deterministic decode).
+            var bwts_b = _block_weights_q(resident_blocks[bi], bi, fp8_resident, ctx)
             var rf = hidream_o1_block_lora_forward[S, H, HKV, Dh](
                 block_in[bi], bwts_b, loras[bi], cos_q, sin_q, cos_k, sin_k,
                 mask4, D, F, EPS, ctx,
@@ -653,6 +798,21 @@ def main() raises:
                 g_a[k] = bg.d_a[sl].value()[].to_host(ctx)
                 g_b[k] = bg.d_b[sl].value()[].to_host(ctx)
             bi -= 1
+        # T2.B gate instrumentation (argv[8], default-off): dump the step-1
+        # adapter grads BEFORE the optimizer touches anything, for the
+        # fp8-vs-bf16 grad-cosine comparison.
+        if step == 1 and grad_dump != String(""):
+            var gnames = List[String]()
+            var gtensors = List[TArc]()
+            for k in range(LAYERS * 7):
+                gnames.append(String("g_a.") + String(k))
+                gtensors.append(TArc(Tensor.from_host(
+                    g_a[k].copy(), [len(g_a[k])], STDtype.F32, ctx)))
+                gnames.append(String("g_b.") + String(k))
+                gtensors.append(TArc(Tensor.from_host(
+                    g_b[k].copy(), [len(g_b[k])], STDtype.F32, ctx)))
+            save_safetensors(gnames, gtensors, grad_dump, ctx)
+            print("[grad-dump] ", grad_dump)
         if levers_optimizer_active(train_cfg):
             # T1.C optimizer lever (default-off): host adafactor /
             # schedule-free step on the host_ads mirrors + resident dev_p

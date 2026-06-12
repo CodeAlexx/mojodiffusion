@@ -1614,6 +1614,14 @@ def main() raises:
         if key.c != LAT_C:
             raise Error("train_zimage_real: unsupported latent channel count")
         var valid_cap = _cache_valid_cap(cache, slot, ctx)
+        # T2.D: per-bucket dispatch logging (cache-declared bucket = the
+        # latent shape this sample carries). Print-only — the dispatched
+        # comptime bucket and all step numerics are unchanged (C13).
+        print(
+            "[bucket] step=", k, " slot=", slot,
+            " latent=", key.h, "x", key.w,
+            " cap_bucket=", 224 if valid_cap <= 224 else 256,
+        )
         var slab_allocs_before = slab.n_allocs
         var loss: Float32
         if train_cfg.batch_size == 2:

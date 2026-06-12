@@ -167,6 +167,15 @@ struct ZImageSampleRequest(Copyable, Movable):
     var output_png: String
     var result_manifest: String
     var completed_step: Int
+    # ── T1.F validation adapter sweep (SimpleTuner --validation_adapter_config
+    # analogue). OPTIONAL request fields; absent → both lists empty → current
+    # single-render behavior, byte-for-byte. When present, the sampler renders
+    # the normal trained-LoRA image first, then one extra image per sweep
+    # adapter (plus a no-adapter "base" comparison image), each with an
+    # adapter-tagged filename. sweep_strengths[i] multiplies LoRA alpha for
+    # sweep_loras[i] (SimpleTuner validation_adapter_strength); empty → all 1.0.
+    var sweep_loras: List[String]
+    var sweep_strengths: List[Float32]
 
 
 @fieldwise_init
@@ -544,6 +553,155 @@ def _write_text_file(path: String, content: String) raises:
         raise Error(String("zimage_generate: short write to ") + path)
 
 
+def _json_string_array(mut cur: _Cursor, field: String) raises -> List[String]:
+    """Parse a flat JSON array of strings (sweep_loras)."""
+    var out = List[String]()
+    cur.skip_ws()
+    if cur.peek() != 0x5B:  # '['
+        raise Error(String("zimage_generate request: ") + field + String(" must be an array"))
+    cur.advance()
+    cur.skip_ws()
+    if cur.peek() == 0x5D:  # ']' — empty array
+        cur.advance()
+        return out^
+    while True:
+        out.append(_parse_string(cur))
+        cur.skip_ws()
+        var ch = cur.peek()
+        if ch == 0x2C:  # ','
+            cur.advance()
+            continue
+        if ch == 0x5D:  # ']'
+            cur.advance()
+            break
+        raise Error(String("zimage_generate request: expected ',' or ']' in ") + field)
+    return out^
+
+
+def _json_number_array(mut cur: _Cursor, field: String) raises -> List[Float32]:
+    """Parse a flat JSON array of numbers (sweep_strengths)."""
+    var out = List[Float32]()
+    cur.skip_ws()
+    if cur.peek() != 0x5B:  # '['
+        raise Error(String("zimage_generate request: ") + field + String(" must be an array"))
+    cur.advance()
+    cur.skip_ws()
+    if cur.peek() == 0x5D:  # ']' — empty array
+        cur.advance()
+        return out^
+    while True:
+        var sc = _read_scalar(cur)
+        if sc.is_string:
+            raise Error(String("zimage_generate request: ") + field + String(" must contain numbers"))
+        out.append(Float32(sc.num))
+        cur.skip_ws()
+        var ch = cur.peek()
+        if ch == 0x2C:  # ','
+            cur.advance()
+            continue
+        if ch == 0x5D:  # ']'
+            cur.advance()
+            break
+        raise Error(String("zimage_generate request: expected ',' or ']' in ") + field)
+    return out^
+
+
+# ── T1.F sweep plan (pure CPU logic; unit-gated by zimage_sweep_request_smoke) ──
+@fieldwise_init
+struct ZImageSweepItem(Copyable, Movable):
+    """One extra validation render: which adapter, at what strength, where."""
+
+    var label: String           # adapter-stem slug ("base" = no adapter)
+    var lora_path: String       # "" → zero-LoRA base render
+    var strength: Float32       # multiplies LoRA alpha (alpha*strength)/rank
+    var output_png: String
+    var result_manifest: String
+
+
+def _adapter_label(path: String) raises -> String:
+    """basename minus extension, slugified to [a-z0-9_] (SimpleTuner _slugify
+    of _stem_from_path)."""
+    var bs = path.as_bytes()
+    var n = path.byte_length()
+    var start = 0
+    for i in range(n):
+        if bs[i] == 0x2F:  # '/'
+            start = i + 1
+    var end = n
+    for i in range(start, n):
+        if bs[i] == 0x2E:  # '.' — keep last-dot stem
+            end = i
+    if end <= start:
+        end = n
+    var out = List[UInt8]()
+    for i in range(start, end):
+        var c = bs[i]
+        if (c >= 0x30 and c <= 0x39) or (c >= 0x61 and c <= 0x7A):
+            out.append(c)
+        elif c >= 0x41 and c <= 0x5A:  # A-Z → a-z
+            out.append(c + 32)
+        else:
+            out.append(0x5F)  # '_'
+    if len(out) == 0:
+        return String("adapter")
+    return String(from_utf8=out)
+
+
+def _sweep_output_path(base_png: String, label: String) raises -> String:
+    """step{N}_sample.png + label → step{N}_sample_{label}.png."""
+    var n = base_png.byte_length()
+    var cut = n
+    if base_png.endswith(String(".png")):
+        cut = n - 4
+    var bs = base_png.as_bytes()
+    var head = List[UInt8]()
+    for i in range(cut):
+        head.append(bs[i])
+    return String(from_utf8=head) + String("_") + label + String(".png")
+
+
+def _label_in(labels: List[String], wanted: String) -> Bool:
+    for i in range(len(labels)):
+        if labels[i] == wanted:
+            return True
+    return False
+
+
+def build_zimage_sweep_plan(req: ZImageSampleRequest) raises -> List[ZImageSweepItem]:
+    """Adapter sweep render plan. Empty when the request has no sweep fields
+    (current behavior preserved). Otherwise: a no-adapter "base" comparison
+    item first (SimpleTuner comparison-mode base run), then one item per sweep
+    adapter; label collisions deduplicate with _2/_3 suffixes (SimpleTuner
+    seen_slugs)."""
+    var plan = List[ZImageSweepItem]()
+    if len(req.sweep_loras) == 0:
+        return plan^
+    var seen = List[String]()
+    var base_png = _sweep_output_path(req.output_png, String("base"))
+    plan.append(ZImageSweepItem(
+        String("base"), String(""), Float32(1.0),
+        base_png.copy(), base_png + String(".zimage_result.json"),
+    ))
+    seen.append(String("base"))
+    for i in range(len(req.sweep_loras)):
+        var label = _adapter_label(req.sweep_loras[i])
+        var candidate = label.copy()
+        var counter = 2
+        while _label_in(seen, candidate):
+            candidate = label + String("_") + String(counter)
+            counter += 1
+        seen.append(candidate.copy())
+        var strength = Float32(1.0)
+        if i < len(req.sweep_strengths):
+            strength = req.sweep_strengths[i]
+        var png = _sweep_output_path(req.output_png, candidate)
+        plan.append(ZImageSweepItem(
+            candidate^, req.sweep_loras[i].copy(), strength,
+            png.copy(), png + String(".zimage_result.json"),
+        ))
+    return plan^
+
+
 def _load_zimage_sample_request(path: String) raises -> ZImageSampleRequest:
     var bytes = _read_file_bytes(path)
     var cur = _Cursor(bytes^)
@@ -556,6 +714,8 @@ def _load_zimage_sample_request(path: String) raises -> ZImageSampleRequest:
     var output_png = String("")
     var result_manifest = String("")
     var completed_step = -1
+    var sweep_loras = List[String]()
+    var sweep_strengths = List[Float32]()
 
     cur.expect(0x7B)
     cur.skip_ws()
@@ -582,6 +742,10 @@ def _load_zimage_sample_request(path: String) raises -> ZImageSampleRequest:
             output_png = _json_string(cur, key)
         elif key == String("result_manifest"):
             result_manifest = _json_string(cur, key)
+        elif key == String("sweep_loras"):
+            sweep_loras = _json_string_array(cur, key)
+        elif key == String("sweep_strengths"):
+            sweep_strengths = _json_number_array(cur, key)
         else:
             _skip_value(cur)
         cur.skip_ws()
@@ -609,7 +773,20 @@ def _load_zimage_sample_request(path: String) raises -> ZImageSampleRequest:
     _require_file(String("request LoRA"), lora_path)
     _require_file(String("request optimizer state sidecar"), state_path)
     _require_file(String("request sample prompt JSON"), sample_file)
-    return ZImageSampleRequest(lora_path^, state_path^, sample_file^, output_png^, result_manifest^, completed_step)
+    # ── optional T1.F sweep fields ──
+    if len(sweep_strengths) > 0 and len(sweep_strengths) != len(sweep_loras):
+        raise Error(
+            "zimage_generate request: sweep_strengths length must match sweep_loras"
+        )
+    for i in range(len(sweep_strengths)):
+        if not (sweep_strengths[i] > Float32(0.0)):
+            raise Error("zimage_generate request: sweep strength must be > 0")
+    for i in range(len(sweep_loras)):
+        _require_file(String("request sweep LoRA"), sweep_loras[i])
+    return ZImageSampleRequest(
+        lora_path^, state_path^, sample_file^, output_png^, result_manifest^,
+        completed_step, sweep_loras^, sweep_strengths^,
+    )
 
 
 def _write_zimage_result_manifest(
@@ -956,6 +1133,7 @@ def main() raises:
     for arg_i in range(1, len(a)):
         if _is_trace_denoise_arg(String(a[arg_i])):
             trace_denoise = True
+    var sweep_plan = List[ZImageSweepItem]()
     if len(a) >= 2 and String(a[1]) == String("--request"):
         if len(a) < 3:
             raise Error("zimage_generate: --request requires a request JSON path")
@@ -963,6 +1141,7 @@ def main() raises:
         lora_path = req.lora_path.copy()
         out_path = req.output_png.copy()
         result_manifest = req.result_manifest.copy()
+        sweep_plan = build_zimage_sweep_plan(req)
         var wanted_req = String("")
         if len(a) >= 4 and not _is_trace_denoise_arg(String(a[3])):
             wanted_req = String(a[3])
@@ -1011,4 +1190,31 @@ def main() raises:
         lora_path, out_path, generated,
     )
     print("[manifest] saved:", result_manifest)
+    # ── T1.F validation adapter sweep: extra comparison renders, same
+    # prompt/seed/steps/cfg as the trained-LoRA render above. Each
+    # zimage_generate call loads its own LoRA overlay (or the zero overlay for
+    # "base") and frees the full stack on return — the load→render→unload cycle
+    # is the call boundary itself, so the trained-LoRA render is untouched. ──
+    for i in range(len(sweep_plan)):
+        var item = sweep_plan[i].copy()
+        print(
+            "[sweep]", i + 1, "/", len(sweep_plan),
+            " adapter=", item.label,
+            " strength=", item.strength,
+            " lora=", item.lora_path if item.lora_path != String("") else String("(base)"),
+        )
+        var sweep_events = List[ZImageEvent]()
+        var sweep_generated = zimage_generate(
+            prompt, negative,
+            steps, cfg, seed,
+            width, height, item.lora_path, item.strength, sweep_events,
+            trace_denoise, ctx,
+        )
+        save_png(sweep_generated.rgb, item.output_png, ctx, ValueRange.SIGNED)
+        print_sample_saved(String("ZImage-sweep-") + item.label, item.output_png)
+        _write_zimage_result_manifest(
+            item.result_manifest, prompt, seed, width, height, steps, cfg,
+            item.lora_path, item.output_png, sweep_generated,
+        )
+        print("[sweep] manifest saved:", item.result_manifest)
     print("[done] saved:", out_path)

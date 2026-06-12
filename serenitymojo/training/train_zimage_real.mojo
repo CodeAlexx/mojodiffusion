@@ -134,14 +134,23 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
     validate_ot_train_math_policy,
 )
 from serenitymojo.training.train_config import (
-    TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TrainConfig, GRADIENT_CHECKPOINTING_ON, TRAIN_OPTIMIZER_ADAMW,
 )
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
 )
 from serenitymojo.autograd_v2.step_slab import StepSlab
-from serenitymojo.training.levers import levers_loss_grad, levers_loss_active
+from serenitymojo.training.levers import (
+    levers_loss_grad, levers_loss_active, caption_dropout_pick,
+    LeversOptimizerState, levers_optimizer_active, levers_optimizer_step,
+    levers_optimizer_validate, levers_optimizer_eval_for_save,
+    levers_optimizer_train_after_save,
+)
+from serenitymojo.training.lora_ema import (
+    LoraEmaState, lora_ema_track, ema_begin_step, ema_apply,
+    lora_ema_adapters, ema_path_for_lora,
+)
 
 
 # ── arch (Z-Image, from transformer config; H/Dh/D fixed comptime) ───────────
@@ -344,7 +353,18 @@ def validate_zimage_train_config(cfg: TrainConfig) raises:
         raise Error("Z-Image trainer timestep_shift does not match compiled constant")
     if not _close_f32(cfg.max_grad_norm, CLIP_GRAD_NORM):
         raise Error("Z-Image trainer max_grad_norm does not match compiled constant")
-    validate_ot_train_math_policy(cfg, String("Z-Image trainer"))
+    # T1.C: zimage wires the levers optimizer dispatch (training/levers.mojo
+    # T1.C section), so the supported non-AdamW optimizers (ADAFACTOR /
+    # SCHEDULE_FREE_ADAMW) must pass the shared ADAMW-only loop-policy check:
+    # levers_optimizer_validate re-asserts the supported set (unsupported tags
+    # already failed loud at config load, _optimizer_int), then the shared
+    # policy runs on a tag-neutralized copy. Trainers that do NOT wire the
+    # levers dispatch keep the strict ADAMW-only check.
+    levers_optimizer_validate(cfg, String("Z-Image trainer"))
+    var policy_cfg = cfg.copy()
+    if levers_optimizer_active(cfg):
+        policy_cfg.optimizer = TRAIN_OPTIMIZER_ADAMW
+    validate_ot_train_math_policy(policy_cfg, String("Z-Image trainer"))
     validate_ot_gradient_checkpointing_policy(
         cfg, String("Z-Image trainer"), OT_GRAD_POLICY_ON_ONLY
     )
@@ -388,6 +408,22 @@ def zimage_should_save_before_sample(
 
 def _step_lora_path(base_path: String, step: Int) -> String:
     return ot_step_lora_path(base_path, step)
+
+
+# T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a
+# just-saved LoRA, through the SAME product writer over a shadow-substituted
+# adapter set (lora_ema.mojo lora_ema_adapters = SimpleTuner copy_to analog).
+def _save_zimage_lora_ema(
+    ema: LoraEmaState, lora: ZImageLoraSet, lora_path: String,
+    n_adapters: Int, ctx: DeviceContext,
+) raises:
+    var ema_set = lora.copy()
+    var shadow_ads = lora_ema_adapters(ema, lora.ad, TRAIN_ADAPTER_START, n_adapters, 0)
+    for i in range(len(shadow_ads)):
+        ema_set.ad[TRAIN_ADAPTER_START + i] = shadow_ads[i].copy()
+    var ema_path = ema_path_for_lora(lora_path)
+    _ = save_zimage_lora_main_only(ema_set, ema_path, ctx)
+    print("[ZImage-lora] save_ema path=", ema_path)
 
 
 def zimage_sample_request_dir() -> String:
@@ -683,15 +719,26 @@ def _build_latent_step_inputs[
     return _build_latent_step_inputs_f32[LAT_H_B, LAT_W_B](latent, noise_lat, sig, ctx)
 
 
+def _zero_cap_vals_if_dropped(mut cap_vals: List[Float32], drop: Bool):
+    # T1.D caption dropout: the uncond substitute is a ZERO caption embedding,
+    # applied by zeroing the HOST staging list before the upload. CRITICAL for
+    # P5 CUDA-graph capture: the substitution flows through the existing
+    # host-staging Tensor.from_host upload — never a device tensor swap.
+    if drop:
+        for i in range(len(cap_vals)):
+            cap_vals[i] = Float32(0.0)
+
+
 def _cap_tensor_from_cache_bf16[
     CAP_LEN_B: Int
-](text_embedding: Tensor, valid_cap: Int, ctx: DeviceContext) raises -> Tensor:
+](text_embedding: Tensor, valid_cap: Int, drop: Bool, ctx: DeviceContext) raises -> Tensor:
     var cap_bf = text_embedding.to_host_bf16(ctx)
     var cap_vals = List[Float32]()
     for r in range(CAP_LEN_B):
         var src_r = r if r < valid_cap else valid_cap - 1
         for c in range(CAP_DIM):
             cap_vals.append(cap_bf[src_r * CAP_DIM + c].cast[DType.float32]())
+    _zero_cap_vals_if_dropped(cap_vals, drop)
     return Tensor.from_host(
         cap_vals^, [CAP_LEN_B, CAP_DIM], text_embedding.dtype(), ctx,
     )
@@ -699,13 +746,14 @@ def _cap_tensor_from_cache_bf16[
 
 def _cap_tensor_from_cache_f16[
     CAP_LEN_B: Int
-](text_embedding: Tensor, valid_cap: Int, ctx: DeviceContext) raises -> Tensor:
+](text_embedding: Tensor, valid_cap: Int, drop: Bool, ctx: DeviceContext) raises -> Tensor:
     var cap_f16 = text_embedding.to_host_f16(ctx)
     var cap_vals = List[Float32]()
     for r in range(CAP_LEN_B):
         var src_r = r if r < valid_cap else valid_cap - 1
         for c in range(CAP_DIM):
             cap_vals.append(cap_f16[src_r * CAP_DIM + c].cast[DType.float32]())
+    _zero_cap_vals_if_dropped(cap_vals, drop)
     return Tensor.from_host(
         cap_vals^, [CAP_LEN_B, CAP_DIM], text_embedding.dtype(), ctx,
     )
@@ -713,13 +761,14 @@ def _cap_tensor_from_cache_f16[
 
 def _cap_tensor_from_cache_f32[
     CAP_LEN_B: Int
-](text_embedding: Tensor, valid_cap: Int, ctx: DeviceContext) raises -> Tensor:
+](text_embedding: Tensor, valid_cap: Int, drop: Bool, ctx: DeviceContext) raises -> Tensor:
     var cap_f32 = text_embedding.to_host(ctx)
     var cap_vals = List[Float32]()
     for r in range(CAP_LEN_B):
         var src_r = r if r < valid_cap else valid_cap - 1
         for c in range(CAP_DIM):
             cap_vals.append(cap_f32[src_r * CAP_DIM + c])
+    _zero_cap_vals_if_dropped(cap_vals, drop)
     return Tensor.from_host(
         cap_vals^, [CAP_LEN_B, CAP_DIM], text_embedding.dtype(), ctx,
     )
@@ -727,13 +776,13 @@ def _cap_tensor_from_cache_f32[
 
 def _cap_tensor_from_cache[
     CAP_LEN_B: Int
-](text_embedding: Tensor, valid_cap: Int, ctx: DeviceContext) raises -> Tensor:
+](text_embedding: Tensor, valid_cap: Int, drop: Bool, ctx: DeviceContext) raises -> Tensor:
     if text_embedding.dtype() == STDtype.BF16:
-        return _cap_tensor_from_cache_bf16[CAP_LEN_B](text_embedding, valid_cap, ctx)
+        return _cap_tensor_from_cache_bf16[CAP_LEN_B](text_embedding, valid_cap, drop, ctx)
     if text_embedding.dtype() == STDtype.F16:
-        return _cap_tensor_from_cache_f16[CAP_LEN_B](text_embedding, valid_cap, ctx)
+        return _cap_tensor_from_cache_f16[CAP_LEN_B](text_embedding, valid_cap, drop, ctx)
     # F32 cache tensors are already F32 at the storage boundary.
-    return _cap_tensor_from_cache_f32[CAP_LEN_B](text_embedding, valid_cap, ctx)
+    return _cap_tensor_from_cache_f32[CAP_LEN_B](text_embedding, valid_cap, drop, ctx)
 
 
 def _cache_valid_cap(cache: KleinCache, slot: Int, ctx: DeviceContext) raises -> Int:
@@ -778,7 +827,9 @@ def _train_one_step_bucket[
     cr_blocks: List[ZImageBlockWeights],
     main_blocks: List[ZImageBlockWeights],
     mut lora: ZImageLoraSet,
+    mut ema: LoraEmaState,
     mut opt_state: LoraAdamWPlainDeviceState,
+    mut lev_opt: LeversOptimizerState,
     resident_dev: ZImageLoraDeviceSet,
     n_adapters: Int,
     final_lin_w: Tensor,
@@ -808,7 +859,7 @@ def _train_one_step_bucket[
     ):
         return _train_one_step_bucket_capture[LAT_H_B, LAT_W_B, CAP_LEN_B](
             k, run_steps, slot, step_seed, cache, aux,
-            nr_blocks, cr_blocks, main_blocks, lora, opt_state, resident_dev,
+            nr_blocks, cr_blocks, main_blocks, lora, ema, opt_state, lev_opt, resident_dev,
             n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
             train_cfg, train_start_ns, slab, fwd_slab, cap_buckets, ctx,
         )
@@ -825,6 +876,9 @@ def _train_one_step_bucket[
         raise Error("train_zimage_real: dispatched sample to wrong text bucket")
 
     var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+    # T1.D caption dropout (default-off p<=0 never draws): shared levers pick,
+    # seed stream SEED_BASE*31+step_seed (distinct from sigma/noise streams).
+    var cap_drop = caption_dropout_pick(step_seed, SEED_BASE, train_cfg.caption_dropout_prob)
     var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
     if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
         sigma_idx = NUM_TRAIN_TIMESTEPS - 1
@@ -841,7 +895,7 @@ def _train_one_step_bucket[
         for c in range(D):
             x_t.append(x_pad_h[c])
 
-    var cap2 = _cap_tensor_from_cache[CAP_LEN_B](s.text_embedding, valid_cap, ctx)
+    var cap2 = _cap_tensor_from_cache[CAP_LEN_B](s.text_embedding, valid_cap, cap_drop, ctx)
     var cap_seq = build_cap_seq(aux, cap2, EPS, ctx)
     for r in range(valid_cap, CAP_LEN_B):
         for c in range(D):
@@ -1009,21 +1063,37 @@ def _train_one_step_bucket[
 
     var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
     var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-    comptime if ZIMAGE_V2_ENGINE:
-        # Resident AdamW: G up, in-place kernel on persistent P/M/V, P back to
-        # the host mirror (b_absum/save contracts unchanged). Same kernel,
-        # same values as zimage_lora_adamw_step_main_only — bit-identical
-        # expected; gated on anchors + b1match-vs-b2dup cross-path identity.
-        fused_lora_adamw_plain_step_resident(
-            opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
-            train_cfg.weight_decay, ctx,
+    if levers_optimizer_active(train_cfg):
+        # T1.C optimizer lever (default-off): host adafactor/schedule-free
+        # step on the lora.ad mirrors + resident dev_p sync so the device
+        # LoRA views see the new weights (levers.mojo T1.C section header).
+        levers_optimizer_step(
+            train_cfg, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+            lev_opt, opt_state, ctx,
         )
     else:
-        zimage_lora_adamw_step_main_only(
-            lora, grads, k, step_lr, ctx,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
-        )
+        comptime if ZIMAGE_V2_ENGINE:
+            # Resident AdamW: G up, in-place kernel on persistent P/M/V, P back to
+            # the host mirror (b_absum/save contracts unchanged). Same kernel,
+            # same values as zimage_lora_adamw_step_main_only — bit-identical
+            # expected; gated on anchors + b1match-vs-b2dup cross-path identity.
+            fused_lora_adamw_plain_step_resident(
+                opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay, ctx,
+            )
+        else:
+            zimage_lora_adamw_step_main_only(
+                lora, grads, k, step_lr, ctx,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
+    # T1.B EMA (default-off): lora.ad host mirrors are FRESH here — both
+    # optimizer paths write the updated P back into them (resident:
+    # lora_adamw_plain_fused.mojo:483-502 host_p readback + sys_memcpy into
+    # adapters[i].a/.b; host: zimage_lora_adamw_step_main_only in-place).
+    if train_cfg.ema_enabled:
+        if ema_begin_step(ema, k):
+            ema_apply(ema, lora.ad, TRAIN_ADAPTER_START, n_adapters, 0)
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()
@@ -1071,7 +1141,9 @@ def _train_one_step_bucket_capture[
     cr_blocks: List[ZImageBlockWeights],
     main_blocks: List[ZImageBlockWeights],
     mut lora: ZImageLoraSet,
+    mut ema: LoraEmaState,
     mut opt_state: LoraAdamWPlainDeviceState,
+    mut lev_opt: LeversOptimizerState,
     resident_dev: ZImageLoraDeviceSet,
     n_adapters: Int,
     final_lin_w: Tensor,
@@ -1105,6 +1177,9 @@ def _train_one_step_bucket_capture[
         raise Error("train_zimage_real: dispatched sample to wrong text bucket")
 
     var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+    # T1.D caption dropout (default-off p<=0 never draws): shared levers pick,
+    # seed stream SEED_BASE*31+step_seed (distinct from sigma/noise streams).
+    var cap_drop = caption_dropout_pick(step_seed, SEED_BASE, train_cfg.caption_dropout_prob)
     var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
     if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
         sigma_idx = NUM_TRAIN_TIMESTEPS - 1
@@ -1121,7 +1196,7 @@ def _train_one_step_bucket_capture[
         for c in range(D):
             x_t.append(x_pad_h[c])
 
-    var cap2 = _cap_tensor_from_cache[CAP_LEN_B](s.text_embedding, valid_cap, ctx)
+    var cap2 = _cap_tensor_from_cache[CAP_LEN_B](s.text_embedding, valid_cap, cap_drop, ctx)
     var cap_seq = build_cap_seq(aux, cap2, EPS, ctx)
     for r in range(valid_cap, CAP_LEN_B):
         for c in range(D):
@@ -1260,11 +1335,26 @@ def _train_one_step_bucket_capture[
 
     var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
     var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-    fused_lora_adamw_plain_step_resident(
-        opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
-        train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
-        train_cfg.weight_decay, ctx,
-    )
+    if levers_optimizer_active(train_cfg):
+        # T1.C optimizer lever (default-off): host step + resident dev_p
+        # sync, OUTSIDE the captured graphs (host-side, after replay) — the
+        # graphs only read dev_p, whose ADDRESS is stable across the sync.
+        levers_optimizer_step(
+            train_cfg, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+            lev_opt, opt_state, ctx,
+        )
+    else:
+        fused_lora_adamw_plain_step_resident(
+            opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+            train_cfg.weight_decay, ctx,
+        )
+    # T1.B EMA (default-off): host mirrors fresh — the resident step copies
+    # the updated P back into lora.ad (lora_adamw_plain_fused.mojo:483-502).
+    # OUTSIDE the captured graphs (host-side, after replay).
+    if train_cfg.ema_enabled:
+        if ema_begin_step(ema, k):
+            ema_apply(ema, lora.ad, TRAIN_ADAPTER_START, n_adapters, 0)
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()
@@ -1460,6 +1550,25 @@ def main() raises:
     print("[lora] adapters:", TRAIN_ADAPTER_COUNT, "trainable main-layer adapters;",
           n_adapters, "allocated total (refiners frozen/excluded)")
 
+    # T1.B EMA (default-off, SimpleTuner EMAModel semantics —
+    # training/lora_ema.mojo): F32 shadows over the main-trained adapter
+    # mirrors, tracked AFTER any resume load (shadow init = clone of current).
+    # ema_enabled False => no shadows allocated, per-step branch is a no-op
+    # (C13: flag-off anchors untouched).
+    var ema = LoraEmaState(
+        train_cfg.ema_decay, train_cfg.ema_min_decay,
+        train_cfg.ema_update_after_step, train_cfg.ema_update_step_interval,
+    )
+    if train_cfg.ema_enabled:
+        var ema_base = lora_ema_track(ema, lora.ad, TRAIN_ADAPTER_START, n_adapters)
+        if ema_base != 0:
+            raise Error("train_zimage_real: ema shadow base must be 0")
+        print("[ema] tracking", n_adapters - TRAIN_ADAPTER_START,
+              "adapters decay=", train_cfg.ema_decay,
+              " min_decay=", train_cfg.ema_min_decay,
+              " update_after_step=", train_cfg.ema_update_after_step,
+              " interval=", train_cfg.ema_update_step_interval)
+
     # v2 engine (resident-set): persistent device P/M/V + a device LoRA set
     # whose MAIN adapters view the optimizer's live param buffer. Built ONCE
     # (after any resume load) — the per-step set upload + P/M/V round trips
@@ -1468,6 +1577,16 @@ def main() raises:
         lora.ad, TRAIN_ADAPTER_START, n_adapters, ctx,
     )
     var resident_dev = zimage_lora_set_to_device_resident(lora, opt_state, ctx)
+
+    # T1.C optimizer levers (default-off): lazy per-run state for the
+    # adafactor / schedule-free dispatch (training/levers.mojo T1.C section).
+    # optimizer=ADAMW (the default) routes around it entirely — nothing is
+    # allocated and the literal fused AdamW calls below are untouched (C13).
+    var lev_opt = LeversOptimizerState()
+    if levers_optimizer_active(train_cfg):
+        print("[T1.C] levers optimizer active: tag=", train_cfg.optimizer,
+              " (2=ADAFACTOR, 7=SCHEDULE_FREE_ADAMW) optimizer_warmup_steps=",
+              train_cfg.optimizer_warmup_steps)
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -1520,7 +1639,7 @@ def main() raises:
                 if vc <= 224:
                     var rb2a = _train_one_step_bucket_b2[64, 64, 224](
                         k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
-                        nr_blocks, cr_blocks, main_blocks, lora, opt_state, resident_dev, n_adapters,
+                        nr_blocks, cr_blocks, main_blocks, lora, ema, opt_state, lev_opt, resident_dev, n_adapters,
                         final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                         train_cfg, train_start, ctx, slab,
                     )
@@ -1528,7 +1647,7 @@ def main() raises:
                 elif vc <= 256:
                     var rb2b = _train_one_step_bucket_b2[64, 64, 256](
                         k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
-                        nr_blocks, cr_blocks, main_blocks, lora, opt_state, resident_dev, n_adapters,
+                        nr_blocks, cr_blocks, main_blocks, lora, ema, opt_state, lev_opt, resident_dev, n_adapters,
                         final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                         train_cfg, train_start, ctx, slab,
                     )
@@ -1541,14 +1660,14 @@ def main() raises:
             if valid_cap <= 224:
                 var r_72_224 = _train_one_step_bucket[72, 56, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, ema, opt_state, lev_opt, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_72_224.loss
             elif valid_cap <= 256:
                 var r_72_256 = _train_one_step_bucket[72, 56, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, ema, opt_state, lev_opt, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_72_256.loss
@@ -1558,14 +1677,14 @@ def main() raises:
             if valid_cap <= 224:
                 var r_88_224 = _train_one_step_bucket[88, 48, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, ema, opt_state, lev_opt, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_88_224.loss
             elif valid_cap <= 256:
                 var r_88_256 = _train_one_step_bucket[88, 48, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, ema, opt_state, lev_opt, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_88_256.loss
@@ -1577,14 +1696,14 @@ def main() raises:
             if valid_cap <= 224:
                 var r_64_224 = _train_one_step_bucket[64, 64, 224](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, ema, opt_state, lev_opt, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_64_224.loss
             elif valid_cap <= 256:
                 var r_64_256 = _train_one_step_bucket[64, 64, 256](
                     k, run_steps, slot, step_seed, cache, aux, nr_blocks, cr_blocks, main_blocks,
-                    lora, opt_state, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    lora, ema, opt_state, lev_opt, resident_dev, n_adapters, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, slab, fwd_slab, cap_buckets, ctx,
                 )
                 loss = r_64_256.loss
@@ -1622,26 +1741,38 @@ def main() raises:
 
         var saved_this_step = False
         if zimage_should_save_checkpoint(train_cfg, k):
+            # T1.C schedule-free save contract: eval() before save, train()
+            # after (adamw_schedulefree.mojo header; no-op for non-SF).
+            levers_optimizer_eval_for_save(train_cfg, lev_opt)
             var save_path = _step_lora_path(
                 zimage_output_lora_path_from_train_config(train_cfg, run_steps), k
             )
             _ = save_zimage_lora_main_only(lora, save_path, ctx)
+            if train_cfg.ema_enabled:  # T1.B: EMA sibling next to every save
+                _save_zimage_lora_ema(ema, lora, save_path, n_adapters, ctx)
             var state_path = save_path + String(".state.safetensors")
             comptime if ZIMAGE_V2_ENGINE:
                 lora_adamw_plain_device_state_sync_moments(opt_state, lora.ad, ctx)
             _ = save_zimage_lora_main_only_state(lora, state_path, ctx)
+            levers_optimizer_train_after_save(train_cfg, lev_opt)
             saved_this_step = True
             print("[ZImage-lora] save_state step=", k, " path=", state_path)
         if sample_enabled and should_sample_completed_step(sample_cadence, k):
             if zimage_should_save_before_sample(sample_cadence, k, saved_this_step):
+                # T1.C schedule-free save contract (validation sampling reads
+                # the saved files; eval-bracket the save itself).
+                levers_optimizer_eval_for_save(train_cfg, lev_opt)
                 var sample_path = _step_lora_path(
                     zimage_output_lora_path_from_train_config(train_cfg, run_steps), k
                 )
                 _ = save_zimage_lora_main_only(lora, sample_path, ctx)
+                if train_cfg.ema_enabled:  # T1.B EMA sibling
+                    _save_zimage_lora_ema(ema, lora, sample_path, n_adapters, ctx)
                 var sample_state = sample_path + String(".state.safetensors")
                 comptime if ZIMAGE_V2_ENGINE:
                     lora_adamw_plain_device_state_sync_moments(opt_state, lora.ad, ctx)
                 _ = save_zimage_lora_main_only_state(lora, sample_state, ctx)
+                levers_optimizer_train_after_save(train_cfg, lev_opt)
                 print("[ZImage-lora] save_before_sample step=", k, " path=", sample_state)
                 var request_path = _write_zimage_sample_request(
                     k, sample_path, sample_state, sample_cadence.sample_definition_file_name
@@ -1677,12 +1808,18 @@ def main() raises:
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         _ = sys_system(String("mkdir -p ") + String(LORA_DIR))
+        # T1.C schedule-free save contract: eval() before the final save
+        # (the loop has ended — no train() needed, but bracket symmetrically).
+        levers_optimizer_eval_for_save(train_cfg, lev_opt)
         var lora_out = zimage_output_lora_path_from_train_config(train_cfg, run_steps)
         _ = save_zimage_lora_main_only(lora, lora_out, ctx)
+        if train_cfg.ema_enabled:  # T1.B EMA sibling
+            _save_zimage_lora_ema(ema, lora, lora_out, n_adapters, ctx)
         var state_out = lora_out + String(".state.safetensors")
         comptime if ZIMAGE_V2_ENGINE:
             lora_adamw_plain_device_state_sync_moments(opt_state, lora.ad, ctx)
         _ = save_zimage_lora_main_only_state(lora, state_out, ctx)
+        levers_optimizer_train_after_save(train_cfg, lev_opt)
         print("[ZImage-lora] save_state step=", run_steps, " path=", state_out)
     else:
         print("RESULT: FAIL trains=", trains)
@@ -1781,7 +1918,9 @@ def _train_one_step_bucket_b2[
     cr_blocks: List[ZImageBlockWeights],
     main_blocks: List[ZImageBlockWeights],
     mut lora: ZImageLoraSet,
+    mut ema: LoraEmaState,
     mut opt_state: LoraAdamWPlainDeviceState,
+    mut lev_opt: LeversOptimizerState,
     resident_dev: ZImageLoraDeviceSet,
     n_adapters: Int,
     final_lin_w: Tensor,
@@ -1823,6 +1962,10 @@ def _train_one_step_bucket_b2[
 
     var sigma0 = sample_timestep_logit_normal(SEED_BASE + seed0, TIMESTEP_SHIFT)
     var sigma1 = sample_timestep_logit_normal(SEED_BASE + seed1, TIMESTEP_SHIFT)
+    # T1.D caption dropout: B2 draws per sample with each sample's OWN step
+    # seed (2k / 2k+1), same stream derivation as the B1 path.
+    var cap_drop0 = caption_dropout_pick(seed0, SEED_BASE, train_cfg.caption_dropout_prob)
+    var cap_drop1 = caption_dropout_pick(seed1, SEED_BASE, train_cfg.caption_dropout_prob)
     var sigma_idx0 = Int(sigma0 * Float32(NUM_TRAIN_TIMESTEPS))
     var sigma_idx1 = Int(sigma1 * Float32(NUM_TRAIN_TIMESTEPS))
     if sigma_idx0 > NUM_TRAIN_TIMESTEPS - 1:
@@ -1846,8 +1989,8 @@ def _train_one_step_bucket_b2[
             x_t0.append(x_pad_h[c])
             x_t1.append(x_pad_h[c])
 
-    var cap2_0 = _cap_tensor_from_cache[CAP_LEN_B](s0.text_embedding, valid_cap0, ctx)
-    var cap2_1 = _cap_tensor_from_cache[CAP_LEN_B](s1.text_embedding, valid_cap1, ctx)
+    var cap2_0 = _cap_tensor_from_cache[CAP_LEN_B](s0.text_embedding, valid_cap0, cap_drop0, ctx)
+    var cap2_1 = _cap_tensor_from_cache[CAP_LEN_B](s1.text_embedding, valid_cap1, cap_drop1, ctx)
     var cap_seq0 = build_cap_seq(aux, cap2_0, EPS, ctx)
     var cap_seq1 = build_cap_seq(aux, cap2_1, EPS, ctx)
     for r in range(valid_cap0, CAP_LEN_B):
@@ -1989,17 +2132,32 @@ def _train_one_step_bucket_b2[
 
     var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
     var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-    comptime if ZIMAGE_V2_ENGINE:
-        fused_lora_adamw_plain_step_resident(
-            opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
-            train_cfg.weight_decay, ctx,
+    if levers_optimizer_active(train_cfg):
+        # T1.C optimizer lever (default-off): host step + resident dev_p sync
+        # (per-sample grads were already mean-combined by the B2 loss).
+        levers_optimizer_step(
+            train_cfg, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+            lev_opt, opt_state, ctx,
         )
     else:
-        zimage_lora_adamw_step_main_only(
-            lora, grads, k, step_lr, ctx,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
-        )
+        comptime if ZIMAGE_V2_ENGINE:
+            fused_lora_adamw_plain_step_resident(
+                opt_state, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay, ctx,
+            )
+        else:
+            zimage_lora_adamw_step_main_only(
+                lora, grads, k, step_lr, ctx,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
+    # T1.B EMA (default-off): lora.ad host mirrors are FRESH here — both
+    # optimizer paths write the updated P back into them (resident:
+    # lora_adamw_plain_fused.mojo:483-502 host_p readback + sys_memcpy into
+    # adapters[i].a/.b; host: zimage_lora_adamw_step_main_only in-place).
+    if train_cfg.ema_enabled:
+        if ema_begin_step(ema, k):
+            ema_apply(ema, lora.ad, TRAIN_ADAPTER_START, n_adapters, 0)
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()

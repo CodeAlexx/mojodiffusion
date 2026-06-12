@@ -195,6 +195,13 @@ struct TrainConfig(Copyable, Movable):
     var optimizer_fused: Bool
     var optimizer_fused_back_pass: Bool
     var optimizer_stochastic_rounding: Bool
+    # T1.C: schedule-free AdamW internal warmup steps (SimpleTuner
+    # optimizer_param.py:1114-1116 binds warmup_steps := args.lr_warmup_steps;
+    # consumed by training/adamw_schedulefree.mojo via the levers optimizer
+    # dispatch). 0 = no warmup (default-off). SEPARATE from lr_warmup_steps:
+    # schedule-free overrides the trainer LR scheduler (override_lr_scheduler
+    # =True), so its warmup lives inside the optimizer, not lr_for_step.
+    var optimizer_warmup_steps: Int
 
     # ── OneTrainer layer/quantization selectors ──
     var layer_filter: String
@@ -451,6 +458,7 @@ struct TrainConfig(Copyable, Movable):
             optimizer_fused=False,
             optimizer_fused_back_pass=False,
             optimizer_stochastic_rounding=True,
+            optimizer_warmup_steps=0,        # T1.C schedule-free (default-off)
             layer_filter=String(""),
             layer_filter_preset=String("full"),
             layer_filter_regex=False,
@@ -569,7 +577,7 @@ struct TrainConfig(Copyable, Movable):
         optimizer_decay_rate: Float32, optimizer_relative_step: Bool,
         optimizer_scale_parameter: Bool, optimizer_warmup_init: Bool,
         optimizer_fused: Bool, optimizer_fused_back_pass: Bool,
-        optimizer_stochastic_rounding: Bool,
+        optimizer_stochastic_rounding: Bool, optimizer_warmup_steps: Int,
         var layer_filter: String, var layer_filter_preset: String,
         layer_filter_regex: Bool, var quantization_layer_filter: String,
         var quantization_layer_filter_preset: String,
@@ -696,6 +704,7 @@ struct TrainConfig(Copyable, Movable):
         self.optimizer_fused = optimizer_fused
         self.optimizer_fused_back_pass = optimizer_fused_back_pass
         self.optimizer_stochastic_rounding = optimizer_stochastic_rounding
+        self.optimizer_warmup_steps = optimizer_warmup_steps
         self.layer_filter = layer_filter^
         self.layer_filter_preset = layer_filter_preset^
         self.layer_filter_regex = layer_filter_regex

@@ -90,7 +90,7 @@ from serenitymojo.training.timestep_bias import apply_bias
 from serenitymojo.training.loss_weight import (
     apply_loss_weight, combined_loss_grad_elem,
 )
-from serenitymojo.training.caption_dropout import should_drop_caption
+from serenitymojo.training.levers import caption_dropout_pick
 from serenitymojo.training.noise_modifiers import apply_noise_modifiers_host
 from serenitymojo.training.ema_schedule import ema_decay_at_step, ema_update_host
 from serenitymojo.training.grad_accum import (
@@ -1042,8 +1042,10 @@ def main() raises:
         # Per-step Bernoulli on the same uniform draw as the Rust StdRng path.
         # When it fires, swap the conditional text tokens for the cached uncond
         # (zero) embedding. prob<=0 never draws => baseline byte-unchanged.
+        # T1.D: routed through the shared levers caption_dropout_pick — the seed
+        # expression (SEED_BASE * 31 + k) is IDENTICAL, behavior unchanged.
         if cfg.caption_dropout_prob > Float32(0.0):
-            if should_drop_caption(SEED_BASE * UInt64(31) + UInt64(k), cfg.caption_dropout_prob):
+            if caption_dropout_pick(UInt64(k), SEED_BASE, cfg.caption_dropout_prob):
                 if not uncond_txt:
                     raise Error("caption_dropout enabled but uncond text tensor was not initialized")
                 txt_tokens_t = uncond_txt.value().copy()

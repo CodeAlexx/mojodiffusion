@@ -50,7 +50,7 @@ params (_adafactor.py:372-373). Pass eps1 <= 0 to adafactor_step_2d to get
 this default."""
 
 
-struct AdafactorState(Movable):
+struct AdafactorState(Copyable, Movable):
     """Per-parameter factored second-moment state for a 2D [rows, cols]
     matrix: row_var [rows] (mean of g^2 over cols), col_var [cols] (mean of
     g^2 over rows), and the 1-based step count. Mirrors torch state

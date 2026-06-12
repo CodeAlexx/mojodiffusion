@@ -61,7 +61,7 @@
 from std.math import sqrt
 
 
-struct AdamWScheduleFreeState(Movable):
+struct AdamWScheduleFreeState(Copyable, Movable):
     """Per-parameter state: exp_avg / exp_avg_sq / kahan_comp, all F32 zeros
     at init (reference _initialize_state, __init__.py:47-53)."""
 

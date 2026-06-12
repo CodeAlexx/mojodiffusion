@@ -67,11 +67,16 @@ from serenitymojo.models.dit.hidream_o1 import (
 )
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
+from serenitymojo.training.levers import caption_dropout_pick
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_adamw_plain_fused import (
     LoraAdamWPlainDeviceState,
     lora_adamw_plain_device_state_init,
     fused_lora_adamw_plain_step_resident,
+)
+from serenitymojo.training.lora_ema import (
+    LoraEmaState, lora_ema_track, ema_update,
+    ema_shadow_a_bf16, ema_shadow_b_bf16, ema_path_for_lora,
 )
 from serenitymojo.models.dit.hidream_o1_train_block import (
     HiDreamO1BlockWeights,
@@ -100,6 +105,10 @@ comptime NOISE_SCALE = Float32(7.5)
 comptime SHIFT = Float64(3.0)
 comptime EPS = Float32(1.0e-6)
 comptime SEED = UInt64(42)
+# T1.D caption dropout probability. This trainer has no TrainConfig threaded,
+# so the lever is a comptime default-off constant for now.
+# TODO(runtime-config): thread TrainConfig and read cfg.caption_dropout_prob.
+comptime HIDREAM_CAPTION_DROPOUT = Float32(0.0)
 comptime MODEL_DIR = "/home/alex/HiDream-O1-Image-Dev-weights"
 comptime TOK_PATH = "/home/alex/HiDream-O1-Image-Dev-weights/tokenizer.json"
 
@@ -249,7 +258,7 @@ def _adamw_host(
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        raise Error("usage: train_hidream_o1_real <stage_dir> <steps> [lr] [rank] [out_dir]")
+        raise Error("usage: train_hidream_o1_real <stage_dir> <steps> [lr] [rank] [out_dir] [ema_decay]")
     var stage_dir = String(args[1])
     var steps = atol(String(args[2]))
     var lr = Float32(1.0e-4)
@@ -261,6 +270,10 @@ def main() raises:
     var out_dir = String("/home/alex/mojodiffusion/output/hidream_o1_lora")
     if len(args) > 5 and String(args[5]) != "-":
         out_dir = String(args[5])
+    # T1.B EMA lever (this trainer has no TrainConfig): decay cap, 0 = off.
+    var ema_decay = Float32(0.0)
+    if len(args) > 6 and String(args[6]) != "-":
+        ema_decay = Float32(atof(String(args[6])))
     makedirs(out_dir, exist_ok=True)
 
     var ctx = DeviceContext()
@@ -330,6 +343,13 @@ def main() raises:
         ))
     print("[lora] adapters:", LAYERS * 7, " resident params:", opt_state.total)
 
+    # T1.B EMA (default-off, training/lora_ema.mojo SimpleTuner semantics):
+    # F32 shadows over the host_ads mirrors, every-step interval.
+    var ema = LoraEmaState(ema_decay, Float32(0.0), 0, 1)
+    if ema_decay > Float32(0.0):
+        _ = lora_ema_track(ema, host_ads, 0, len(host_ads))
+        print("[ema] tracking", len(host_ads), "adapters decay=", ema_decay)
+
     # ── BF16-RESIDENT blocks (measured fix, 2026-06-11): await_block re-reads
     # + re-converts the F32 shards on EVERY visit (planned_loader.mojo:110 ->
     # load_block_as_bf16) — 72 visits x ~845 MB = ~60 GB/step = the ~100 s.
@@ -372,6 +392,11 @@ def main() raises:
         var clean_h = clean.to_host(ctx)
 
         var caption = _read_text(stage_dir + "/caption." + String(idx) + ".txt")
+        # T1.D caption dropout (comptime default-off): when the shared levers
+        # pick fires, train this step on the EMPTY caption ("" through the same
+        # template path = the uncond render).
+        if caption_dropout_pick(UInt64(step), SEED, HIDREAM_CAPTION_DROPOUT):
+            caption = String("")
         # Fit the caption into the S_TEXT bucket: halve the string until the
         # templated ids fit (build_t2i_input raises on overflow — fail-loud
         # contract; long giger captions need ~1-2 halvings).
@@ -513,6 +538,10 @@ def main() raises:
             opt_state, host_ads, g_a, g_b, step, lr,
             Float32(0.9), Float32(0.999), Float32(1.0e-8), Float32(0.01), ctx,
         )
+        # T1.B EMA: host_ads mirrors are FRESH here (the resident step copies
+        # updated P back, lora_adamw_plain_fused.mojo:483-502).
+        if ema_decay > Float32(0.0):
+            ema_update(ema, host_ads, step)
 
         var t1 = perf_counter_ns()
         if smooth_init:
@@ -550,4 +579,19 @@ def main() raises:
     var out_path = out_dir + "/hidream_o1_lora_last.safetensors"
     save_safetensors(names, tensors, out_path, ctx)
     print("[save] ", out_path)
+    if ema_decay > Float32(0.0):
+        # T1.B: EMA sibling — same DiffSynth key shape over the bf16-rounded
+        # shadows (lora_ema.mojo copy_to cast, SimpleTuner ema.py:454).
+        var ema_tensors = List[TArc]()
+        for li in range(LAYERS):
+            for sl in range(7):
+                var k = li * 7 + sl
+                var dims = _slot_dims(sl)
+                ema_tensors.append(TArc(Tensor.from_host_bf16(
+                    ema_shadow_a_bf16(ema, k), [rank, dims[0]], ctx)))
+                ema_tensors.append(TArc(Tensor.from_host_bf16(
+                    ema_shadow_b_bf16(ema, k), [dims[1], rank], ctx)))
+        var ema_out = ema_path_for_lora(out_path)
+        save_safetensors(names, ema_tensors, ema_out, ctx)
+        print("[save] ", ema_out)
     print("DONE: hidream-o1 reached step ", steps)

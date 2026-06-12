@@ -48,9 +48,8 @@ from serenitymojo.training.train_config import (
     TRAIN_DTYPE_INT_8, TRAIN_DTYPE_NFLOAT_4, TRAIN_DTYPE_FLOAT_W8A8,
     TRAIN_DTYPE_INT_W8A8, TRAIN_DTYPE_GGUF, TRAIN_DTYPE_GGUF_A8_FLOAT,
     TRAIN_DTYPE_GGUF_A8_INT,
-    TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAM, TRAIN_OPTIMIZER_ADAFACTOR,
-    TRAIN_OPTIMIZER_CAME, TRAIN_OPTIMIZER_LION, TRAIN_OPTIMIZER_PRODIGY,
-    TRAIN_OPTIMIZER_SGD, TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
+    TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
+    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
     TRAIN_TIME_UNIT_EPOCH, TRAIN_TIME_UNIT_STEP, TRAIN_TIME_UNIT_SECOND,
     TRAIN_TIME_UNIT_MINUTE, TRAIN_TIME_UNIT_HOUR, TRAIN_TIME_UNIT_NEVER,
     TRAIN_TIME_UNIT_ALWAYS,
@@ -218,23 +217,34 @@ def _dtype_int(s: String) raises -> Int:
 
 
 def _optimizer_int(s: String) raises -> Int:
+    # T1.C fail-loud contract: only the optimizers a Mojo trainer actually
+    # implements parse (ADAMW default fused path; ADAFACTOR /
+    # SCHEDULE_FREE_ADAMW via training/levers.mojo levers_optimizer_step).
+    # Every other recognized tag (ADAM/CAME/LION/PRODIGY/SGD/...) is rejected
+    # AT CONFIG LOAD instead of silently training AdamW.
     if s == "ADAMW" or s == "ADAMW_8BIT" or s == "ADAMW_ADV":
         return TRAIN_OPTIMIZER_ADAMW
-    elif s == "ADAM" or s == "ADAM_8BIT":
-        return TRAIN_OPTIMIZER_ADAM
     elif s == "ADAFACTOR":
         return TRAIN_OPTIMIZER_ADAFACTOR
-    elif s == "CAME" or s == "CAME_8BIT":
-        return TRAIN_OPTIMIZER_CAME
-    elif s == "LION" or s == "LION_8BIT" or s == "LION_ADV":
-        return TRAIN_OPTIMIZER_LION
-    elif s == "PRODIGY" or s == "PRODIGY_PLUS_SCHEDULE_FREE" or s == "PRODIGY_ADV":
-        return TRAIN_OPTIMIZER_PRODIGY
-    elif s == "SGD" or s == "SGD_8BIT":
-        return TRAIN_OPTIMIZER_SGD
     elif s == "SCHEDULE_FREE_ADAMW":
         return TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW
-    raise Error(String("JSON config: unknown Optimizer '") + s + String("'"))
+    elif (
+        s == "ADAM" or s == "ADAM_8BIT"
+        or s == "CAME" or s == "CAME_8BIT"
+        or s == "LION" or s == "LION_8BIT" or s == "LION_ADV"
+        or s == "PRODIGY" or s == "PRODIGY_PLUS_SCHEDULE_FREE"
+        or s == "PRODIGY_ADV"
+        or s == "SGD" or s == "SGD_8BIT"
+    ):
+        raise Error(
+            String("JSON config: optimizer '") + s
+            + String("' is not implemented in the Mojo trainers; supported:")
+            + String(" ADAMW, ADAFACTOR, SCHEDULE_FREE_ADAMW")
+        )
+    raise Error(
+        String("JSON config: unknown Optimizer '") + s
+        + String("'; supported: ADAMW, ADAFACTOR, SCHEDULE_FREE_ADAMW")
+    )
 
 
 def _time_unit_int(s: String) raises -> Int:
@@ -261,6 +271,10 @@ def _ema_mode_int(s: String) raises -> Int:
     elif s == "GPU" or s == "gpu":
         return EMA_MODE_GPU
     elif s == "CPU" or s == "cpu":
+        return EMA_MODE_CPU
+    elif s == "EMA" or s == "ema":
+        # serenity-trainer UI emits "EMA" (TrainerConfigModel ema_options is
+        # OFF/EMA); the T1.B lora_ema.mojo shadows live on HOST mirrors.
         return EMA_MODE_CPU
     raise Error(String("JSON config: unknown EMAMode '") + s + String("'"))
 
@@ -297,6 +311,8 @@ def _parse_optimizer(mut cur: _Cursor, mut cfg: TrainConfig) raises:
             cfg.optimizer_scale_parameter = _read_bool(cur)
         elif field == "warmup_init":
             cfg.optimizer_warmup_init = _read_bool(cur)
+        elif field == "warmup_steps":
+            cfg.optimizer_warmup_steps = Int(_read_scalar(cur).num)
         elif field == "fused":
             cfg.optimizer_fused = _read_bool(cur)
         elif field == "fused_back_pass":
@@ -918,6 +934,10 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             cfg.lr_scheduler = _lr_scheduler_int(sc.s)
         elif key == "lr_warmup_steps" or key == "learning_rate_warmup_steps":
             cfg.lr_warmup_steps = Int(_read_scalar(cur).num)
+        elif key == "optimizer_warmup_steps":
+            # T1.C: schedule-free AdamW internal warmup (also accepted as
+            # optimizer.warmup_steps in the nested optimizer object).
+            cfg.optimizer_warmup_steps = Int(_read_scalar(cur).num)
         elif key == "lr_min_factor" or key == "learning_rate_min_factor":
             cfg.lr_min_factor = Float32(_read_scalar(cur).num)
         elif key == "lr_cycles" or key == "learning_rate_cycles":

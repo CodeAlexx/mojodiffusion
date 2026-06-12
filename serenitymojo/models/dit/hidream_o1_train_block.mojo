@@ -46,7 +46,8 @@ from serenitymojo.models.zimage.lora_block import (
     zimage_lora_apply_device,
     zimage_lora_bwd_device_resident_tensors,
 )
-from serenitymojo.models.dit.hidream_o1 import _repeat_kv, _sdpa_s
+from serenitymojo.ops.attention import sdpa
+from serenitymojo.models.dit.hidream_o1 import _repeat_kv
 
 comptime TArc = ArcPointer[Tensor]
 
@@ -228,7 +229,7 @@ def hidream_o1_block_lora_forward[
     var k_rep = TArc(_repeat_kv(k_rope[], S, HKV, n_rep, Dh, ctx))
     var v_rep = TArc(_repeat_kv(v[], S, HKV, n_rep, Dh, ctx))
 
-    var attn = _sdpa_s[S](q_rope[], k_rep[], v_rep[], mask, scale, ctx)
+    var attn = sdpa[1, S, H, Dh](q_rope[], k_rep[], v_rep[], mask, scale, ctx)
     var attn_flat_t = reshape(attn, [1, S, H * Dh], ctx)
     var attn_flat = TArc(attn_flat_t^)
 

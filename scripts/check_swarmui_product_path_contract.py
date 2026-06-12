@@ -41,15 +41,18 @@ WORKFLOW_NODE_SURFACE_CHECK = REPO / "scripts/check_workflow_node_surface.py"
 MODEL_GALLERY_LORA_SURFACE_CHECK = REPO / "scripts/check_model_gallery_lora_surface.py"
 UI_GALLERY_REUSE_STATE_CHECK = REPO / "scripts/check_ui_gallery_reuse_state_contract.py"
 UI_GALLERY_REUSE_STATE_READINESS = REPO / "output/checks/ui_gallery_reuse_state_readiness.json"
+LTX2_VIDEO_DAEMON_CHECK = REPO / "scripts/check_ltx2_video_daemon_product_contract.py"
 SAMPLER_REGISTRY = REPO / "serenitymojo/sampling/sampler_registry.mojo"
 VARIATION_NOISE = REPO / "serenitymojo/sampling/variation_noise.mojo"
 ZIMAGE_GENERATE = REPO / "serenitymojo/pipeline/zimage_generate.mojo"
 ZIMAGE_LORA_BLOCK = REPO / "serenitymojo/models/zimage/lora_block.mojo"
 ZIMAGE_STACK_LORA = REPO / "serenitymojo/models/zimage/zimage_stack_lora.mojo"
 QWEN_DIT = REPO / "serenitymojo/models/dit/qwenimage_dit.mojo"
+LTX2_DIT = REPO / "serenitymojo/models/dit/ltx2_dit.mojo"
 ATTENTION = REPO / "serenitymojo/ops/attention.mojo"
 ATTENTION_FLASH = REPO / "serenitymojo/ops/attention_flash.mojo"
 LTX2_HQ = REPO / "serenitymojo/pipeline/ltx2_t2v_av_hq.mojo"
+PIXI = REPO / "pixi.toml"
 TODO_DOC = REPO / "TODO.md"
 HANDOFF_DOC = REPO / "serenitymojo/docs/HANDOFF_2026-06-12.md"
 SAMPLER_HARNESS_DOC = REPO / "serenitymojo/docs/SAMPLER_PRODUCT_HARNESS_2026-06-05.md"
@@ -860,6 +863,52 @@ def check_video_path() -> list[Check]:
             acceptance="Video/audio random/noise generation returns BF16/F16/FP8 storage dtype unless a reference requires otherwise.",
         ),
         check_contains(
+            LTX2_DIT,
+            category="video-fast-path",
+            label="LTX2 attention has flash dispatch helpers",
+            needles=[
+                "comptime LTX2_SDPA_FLASH = True",
+                "def _ltx2_sdpa_product_fwd",
+                "def _ltx2_sdpa_product_fwd_rect",
+                "sdpa_flash_train_fwd_rect",
+            ],
+            severity=P0,
+            acceptance="LTX2 video denoise has square and rectangular BF16 cuDNN flash SDPA dispatch points.",
+        ),
+        check_absent_in_functions(
+            LTX2_DIT,
+            category="video-fast-path",
+            label="LTX2 AV denoise avoids direct slow SDPA calls",
+            function_names=[
+                "ltx2_block_forward_video_only",
+                "_av_attention",
+            ],
+            needles=["sdpa_nomask[", "sdpa_nomask_tiled[", "sdpa_cross_nomask["],
+            severity=P0,
+            acceptance="LTX2 product attention call sites route through the fast helper instead of calling math/tiled SDPA directly.",
+        ),
+        check_contains(
+            PIXI,
+            category="video-fast-path",
+            label="video runner links cuDNN SDPA shim",
+            needles=["build-video-smoke", "-lserenity_cudnn_sdpa"],
+            severity=P0,
+            acceptance="The standalone LTX2 runner links the same cuDNN SDPA shim as the daemon.",
+        ),
+        check_contains(
+            LTX2_VIDEO_DAEMON_CHECK,
+            category="video",
+            label="bounded video checker records stage and VRAM",
+            needles=[
+                "peak_gpu_memory_delta_mib",
+                "stage",
+                "timed_out",
+                "claims_video_parity",
+            ],
+            severity=P0,
+            acceptance="Video readiness checker records exact stage, timeout state, and positive external VRAM evidence without claiming parity.",
+        ),
+        check_contains(
             DAEMON,
             category="video",
             label="daemon video generation endpoint",
@@ -977,6 +1026,8 @@ def build_report(checks: list[Check]) -> dict[str, object]:
         "Video generation is not accepted until a real daemon run emits MP4, frame/duration, timing, and positive-VRAM evidence.",
         "Advanced Comfy/Swarm node families beyond the typed t2i graph remain unsupported.",
         "Z-Image speed parity is not accepted until the denoise path has paired baseline and optimized CFG/main-stack evidence.",
+        "Image/video backends with direct sdpa_nomask/sdpa_nomask_tiled product call sites are not accepted for speed parity until routed to flash or a proven model-specific fast kernel.",
+        "Ideogram4 is a requested image target, but it is not accepted until its resident DiT path is off slow SDPA and produces a daemon artifact with metadata, timing, and VRAM evidence.",
     ]
     return {
         "schema": "serenity.swarmui.product_path_readiness.v1",

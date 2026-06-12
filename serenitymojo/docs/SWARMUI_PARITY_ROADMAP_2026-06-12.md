@@ -16,6 +16,10 @@ is the execution order.
 - Current video models are not accepted. The daemon has a bounded LTX2 staged
   smoke runner and MP4 probe, but video generation remains quarantined until a
   real daemon run emits a measured MP4 artifact with VRAM evidence.
+- Product image/video denoise paths are not accepted for speed parity while
+  they call the old math/tiled SDPA path directly. A backend must route product
+  attention through cuDNN flash or a proven model-specific fast kernel, then
+  prove artifact, timing, and VRAM evidence.
 - Claims require current evidence: artifact path, dimensions, metadata, timings,
   peak VRAM, and readiness label.
 
@@ -42,6 +46,13 @@ Current high-risk runtime gaps:
 - Video generation is still not accepted; `/v1/video` can launch the bounded
   `ltx2_staged_dev_smoke` runner and `/v1/video/probe` inspects MP4 artifacts,
   but no current daemon run has produced MP4/timing/positive-VRAM evidence.
+  The current fast-path run advances past Stage 1 and times out at
+  `[upscale] loading spatial-x2 LatentUpsampler + VAE per-channel stats` with a
+  measured external peak VRAM delta of `5497 MiB`.
+- Ideogram4 is requested as an image backend target. Its current resident DiT
+  path still contains direct `sdpa_nomask`, so it is not accepted until it is
+  routed through the fast attention path and proves a daemon artifact with
+  metadata, timing, and VRAM.
 - Sampler fields now reach typed `JobParams`/worker IPC, `/v1/samplers` exposes
   a SwarmUI/Comfy catalog and per-backend support matrix, and unsupported names
   fail loud before model work. Z-Image has bounded DPM++ 2M/simple-flowmatch
@@ -407,8 +418,10 @@ Purpose: repeat the proven product pattern on additional image models.
 Order:
 
 1. Klein if the goal is memory/offload mechanics and low-VRAM behavior.
-2. SDXL/Flux/Chroma/ERNIE if the goal is model breadth.
-3. Qwen only after a bounded low-memory plan is written and accepted.
+2. Ideogram4 as the requested next image target, but only after its resident
+   DiT product attention is off direct `sdpa_nomask`.
+3. SDXL/Flux/Chroma/ERNIE if the goal is model breadth.
+4. Qwen only after a bounded low-memory plan is written and accepted.
 
 Acceptance for each model:
 
@@ -453,16 +466,22 @@ Next implementation slice:
 
 1. Execute the bounded daemon-backed LTX2 video smoke and record exact
    artifact/runtime blocker evidence if it OOMs, stalls, or fails probe.
-2. Promote the next sampler only with artifact/timing/VRAM evidence. Do not
+2. Move the post-Stage1 LTX2 upscaler/VAE load/decode boundary off its current
+   slow path; the latest fast-attention run reaches `[Stage1] done` and times
+   out while loading the spatial-x2 latent upsampler/VAE stats.
+3. Add the Ideogram4 image backend only after replacing its direct
+   `sdpa_nomask` resident DiT attention with a fast SDPA path and proving a
+   daemon artifact with metadata, timings, and VRAM.
+4. Promote the next sampler only with artifact/timing/VRAM evidence. Do not
    promote generic `uni_pc` by aliasing it to bh2; map its exact Comfy/Swarm
    semantics first.
-3. Measure the current Z-Image product bottleneck by stage with the daemon gate
+5. Measure the current Z-Image product bottleneck by stage with the daemon gate
    as the control artifact, then replace the measured slow path first.
-4. Keep Qwen on bounded op/static gates until memory/offload evidence says full
+6. Keep Qwen on bounded op/static gates until memory/offload evidence says full
    generation is safe.
-5. Keep video non-accepted until a daemon-backed runner emits MP4 frame/
+7. Keep video non-accepted until a daemon-backed runner emits MP4 frame/
    duration/muxing/audio/timing/positive-VRAM evidence.
-6. Rerun the product gate and update this roadmap.
+8. Rerun the product gate and update this roadmap.
 
 This gives us SwarmUI parity progress without pretending Qwen or video are
 production usable today.

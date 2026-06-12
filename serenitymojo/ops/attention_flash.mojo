@@ -202,6 +202,68 @@ def sdpa_flash_train_fwd[
     return SdpaFlashFwd(o^, o_pad^, q_pad^, k_pad^, v_pad^, stats^)
 
 
+def sdpa_flash_train_fwd_rect[
+    B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashFwd:
+    """cuDNN flash SDPA training forward on rectangular no-mask attention.
+
+    Q is [B,Sq,H,Dh], K/V are [B,Skv,H,Dh], output is [B,Sq,H,Dh].
+    Padding is independent for Q and KV; real lengths are passed to the shim so
+    padded rows are masked inside the cuDNN graph.
+    """
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 or v.dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_train_fwd_rect: q/k/v must be BF16")
+    comptime SQ_PAD = ((Sq + 127) // 128) * 128
+    comptime SKV_PAD = ((Skv + 127) // 128) * 128
+
+    var q_pad = _pad_seq[B, Sq, SQ_PAD](q, H, Dh, ctx)
+    var k_pad = _pad_seq[B, Skv, SKV_PAD](k, H, Dh, ctx)
+    var v_pad = _pad_seq[B, Skv, SKV_PAD](v, H, Dh, ctx)
+
+    var o_buf = ctx.enqueue_create_buffer[DType.uint8](B * SQ_PAD * H * Dh * 2)
+    ctx.enqueue_memset[DType.uint8](o_buf, 0)
+    var o_shape: List[Int] = [B, SQ_PAD, H, Dh]
+    var o_pad = Tensor(o_buf^, o_shape^, STDtype.BF16)
+
+    var stats_buf = ctx.enqueue_create_buffer[DType.uint8](B * H * SQ_PAD * 4)
+    ctx.enqueue_memset[DType.uint8](stats_buf, 0)
+    var stats_shape: List[Int] = [B, H, SQ_PAD, 1]
+    var stats = Tensor(stats_buf^, stats_shape^, STDtype.F32)
+
+    var qs = _strides_bhnd(SQ_PAD, H, Dh)
+    var ks = _strides_bhnd(SKV_PAD, H, Dh)
+    var vs = _strides_bhnd(SKV_PAD, H, Dh)
+    var os_ = _strides_bhnd(SQ_PAD, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bf16_train_fwd", Int32](
+        _dev_ptr(q_pad), _dev_ptr(k_pad), _dev_ptr(v_pad),
+        _dev_ptr(o_pad), _dev_ptr(stats),
+        Int32(B), Int32(H), Int32(SQ_PAD), Int32(SKV_PAD), Int32(Dh),
+        scale,
+        qs, ks, vs, os_,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0),              # causal = false
+        Int32(Sq), Int32(Skv), # real lengths -> padding mask
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_train_fwd_rect: shim rc=") + String(rc)
+            + " (B=" + String(B) + " Sq=" + String(Sq)
+            + " Skv=" + String(Skv) + " SQ_PAD=" + String(SQ_PAD)
+            + " SKV_PAD=" + String(SKV_PAD)
+            + " H=" + String(H) + " Dh=" + String(Dh) + ")"
+        )
+
+    var o = _unpad_seq[B, Sq, SQ_PAD](o_pad, H, Dh, ctx)
+    return SdpaFlashFwd(o^, o_pad^, q_pad^, k_pad^, v_pad^, stats^)
+
+
 def sdpa_flash_backward[
     B: Int, S: Int, H: Int, Dh: Int
 ](

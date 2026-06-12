@@ -95,11 +95,29 @@ single-LoRA, and stacked-LoRA outputs.
 | Last UI state | Restore last controls on app/daemon restart. | `/v1/state` persists `serenity.ui_state.v1` under `output/serenity_daemon/state/last_state.json`; runtime checker proves restart readback. | No schema/revision/merge semantics yet. | Restart smoke writes state, restarts daemon, reads same state, and UI loads it before first generate with revision-safe behavior. |
 | Model downloader/importer | Download models from web or manage remote registries. | Out of scope per SwarmUI native-single-user parity docs. Local files are user-managed. | Not a blocker for this repo goal. | None; keep skipped unless the product scope changes. |
 
+## Requested Model Targets
+
+- Ideogram4 is requested as a real image backend. Current status: not accepted.
+  The local code has `serenitymojo/models/dit/ideogram4_dit.mojo` and
+  `serenitymojo/models/dit/ideogram4_resident.mojo`, but the resident DiT path
+  still contains direct `sdpa_nomask` attention. Acceptance requires routing the
+  product denoise path through cuDNN flash or another measured fast kernel, then
+  proving a daemon artifact with dimensions, `serenity.genparams.v1`, timings,
+  positive peak VRAM, gallery/job DB entries, and fail-loud unsupported options.
+- LTX2 video is a measured video target, not an accepted backend. After the
+  2026-06-12 flash-attention patch, the bounded daemon run reaches
+  `[Stage1] done` and times out while loading the spatial-x2 latent upsampler
+  and VAE per-channel stats; no MP4 is accepted yet.
+
 ## Exact Current Blockers
 
 - Multi-LoRA is accepted only for the Z-Image runtime path with loader-supported
   PEFT/Comfy LoRAs. Qwen is still zero-LoRA, and Z-Image LoKr/LyCORIS files are
   still not converted by the overlay path.
+- Image/video backends with direct product `sdpa_nomask`/`sdpa_nomask_tiled`
+  call sites are not accepted for speed parity. This includes Ideogram4 until
+  its resident path is moved to a fast attention route and measured through the
+  daemon.
 - Model/LoRA browser real preview thumbnails, user notes, model favorite
   persistence, and full UI control restoration are not accepted by this slice.
 - UI/gallery/reuse/state tracked P1 is clear in the runtime checker:

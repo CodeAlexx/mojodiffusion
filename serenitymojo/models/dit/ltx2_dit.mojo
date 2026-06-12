@@ -56,6 +56,10 @@ from serenitymojo.ops.attention import (
     sdpa_nomask_tiled,
     sdpa_cross_nomask,
 )
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd,
+    sdpa_flash_train_fwd_rect,
+)
 from serenitymojo.ops.tensor_algebra import (
     reshape,
     add,
@@ -68,6 +72,62 @@ from serenitymojo.models.dit.ltx2_rope import apply_ltx2_rope
 from serenitymojo.models.dit.ltx2_nag import NAGContext
 from serenitymojo.offload.ltx2_block_stream import FP8Block
 from serenitymojo.ops.cast import cast_tensor
+
+
+comptime LTX2_SDPA_FLASH = True
+
+
+def _ltx2_sdpa_product_fwd[
+    B: Int, S: Int, H: Int, DH: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    comptime if LTX2_SDPA_FLASH:
+        # LTX2 product/runtime attention is BF16 at the model boundary. Keep
+        # FP8 resident weights in the projection path and cast only if a dev
+        # parity path feeds F32 activations into SDPA.
+        if q.dtype() == STDtype.BF16 and k.dtype() == STDtype.BF16 and v.dtype() == STDtype.BF16:
+            var ff = sdpa_flash_train_fwd[B, S, H, DH](q, k, v, scale, ctx)
+            return ff.o.clone(ctx)
+        var q_bf16 = cast_tensor(q, STDtype.BF16, ctx, False)
+        var k_bf16 = cast_tensor(k, STDtype.BF16, ctx, False)
+        var v_bf16 = cast_tensor(v, STDtype.BF16, ctx, False)
+        var ff = sdpa_flash_train_fwd[B, S, H, DH](q_bf16, k_bf16, v_bf16, scale, ctx)
+        var out = ff.o.clone(ctx)
+        return cast_tensor(out, q.dtype(), ctx, False)
+    else:
+        comptime score_mib = (B * S * S * H * 4) // (1024 * 1024)
+        comptime if score_mib >= 3584:
+            return sdpa_nomask_tiled[B, S, H, DH](q, k, v, scale, ctx)
+        else:
+            return sdpa_nomask[B, S, H, DH](q, k, v, scale, ctx)
+
+
+def _ltx2_sdpa_product_fwd_rect[
+    B: Int, SQ: Int, SKV: Int, H: Int, DH: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    comptime if LTX2_SDPA_FLASH:
+        if q.dtype() == STDtype.BF16 and k.dtype() == STDtype.BF16 and v.dtype() == STDtype.BF16:
+            var ff = sdpa_flash_train_fwd_rect[B, SQ, SKV, H, DH](
+                q, k, v, scale, ctx,
+            )
+            return ff.o.clone(ctx)
+        var q_bf16 = cast_tensor(q, STDtype.BF16, ctx, False)
+        var k_bf16 = cast_tensor(k, STDtype.BF16, ctx, False)
+        var v_bf16 = cast_tensor(v, STDtype.BF16, ctx, False)
+        var ff = sdpa_flash_train_fwd_rect[B, SQ, SKV, H, DH](
+            q_bf16, k_bf16, v_bf16, scale, ctx,
+        )
+        var out = ff.o.clone(ctx)
+        return cast_tensor(out, q.dtype(), ctx, False)
+    else:
+        return sdpa_cross_nomask[B, SQ, SKV, H, DH](q, k, v, scale, ctx)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -508,12 +568,9 @@ def ltx2_block_forward_video_only[B: Int, S: Int, N_TXT: Int](
     q4 = apply_ltx2_rope(q4, rope_cos, rope_sin, ctx)
     k4 = apply_ltx2_rope(k4, rope_cos, rope_sin, ctx)
 
-    var attn: Tensor
-    comptime score_mib = (B * S * S * 32 * 4) // (1024 * 1024)
-    comptime if score_mib >= 3584:
-        attn = sdpa_nomask_tiled[B, S, 32, 128](q4, k4, v4, scale, ctx)
-    else:
-        attn = sdpa_nomask[B, S, 32, 128](q4, k4, v4, scale, ctx)
+    var attn = _ltx2_sdpa_product_fwd[B, S, 32, 128](
+        q4, k4, v4, scale, ctx
+    )
     var attn_flat = _from_bshd(attn, S, num_heads, head_dim, ctx)  # [1, S, dim]
 
     # Per-head gate (ltx2_model.rs:858-872): gates = 2*sigmoid(to_gate_logits(
@@ -558,7 +615,7 @@ def ltx2_block_forward_video_only[B: Int, S: Int, N_TXT: Int](
     var q2_4 = _to_bshd(q2, S, num_heads, head_dim, ctx)            # [1, S, H, Dh]
     var k2_4 = _to_bshd(k2, N_TXT, num_heads, head_dim, ctx)        # [1, N_TXT, H, Dh]
     var v2_4 = _to_bshd(v2, N_TXT, num_heads, head_dim, ctx)
-    var attn2 = sdpa_cross_nomask[B, S, N_TXT, 32, 128](
+    var attn2 = _ltx2_sdpa_product_fwd_rect[B, S, N_TXT, 32, 128](
         q2_4, k2_4, v2_4, scale, ctx,
     )
     var attn2_flat = _from_bshd(attn2, S, num_heads, head_dim, ctx)  # [1, S, dim]
@@ -1283,21 +1340,17 @@ def _av_attention[SQ: Int, SKV: Int, SPAD: Int, H: Int, DH: Int](
     # online-softmax directly over Q(SQ) x KV(SKV) without square padding.
     var attn_flat: Tensor
     comptime if SQ == SKV and SQ == SPAD:
-        # Square self-attention: the additive mask is all-zeros (full attention).
-        # Use vendor-matmul SDPA while the score slab fits the explicit budget.
-        # The scalar online-softmax path is for truly huge grids such as
-        # 2x AudioSync stage-2, not for 97-frame stage-1.
-        var attn: Tensor
-        comptime score_mib = (SPAD * SPAD * H * 4) // (1024 * 1024)
-        comptime if score_mib >= 3584:
-            attn = sdpa_nomask_tiled[1, SPAD, H, DH](q4, k4, v4, scale, ctx)
-        else:
-            attn = sdpa_nomask[1, SPAD, H, DH](q4, k4, v4, scale, ctx)
+        # Square self-attention takes the cuDNN flash path when enabled.
+        var attn = _ltx2_sdpa_product_fwd[1, SPAD, H, DH](
+            q4, k4, v4, scale, ctx
+        )
         attn_flat = reshape(attn, _shape3(1, SQ, inner), ctx)
     else:
-        # Rectangular cross-attention. The old path padded Q/K/V to SPAD and
-        # built [SPAD,SPAD] masks; AudioSync-size video would OOM there.
-        var attn = sdpa_cross_nomask[1, SQ, SKV, H, DH](q4, k4, v4, scale, ctx)
+        # Rectangular text/cross-modal attention uses the rectangular cuDNN
+        # flash wrapper. The fallback remains the no-square-padding online path.
+        var attn = _ltx2_sdpa_product_fwd_rect[1, SQ, SKV, H, DH](
+            q4, k4, v4, scale, ctx
+        )
         attn_flat = reshape(attn, _shape3(1, SQ, inner), ctx)
 
     # Per-head gate: gate_logits = linear(hidden) -> [1,SQ,H]; *2sigmoid.

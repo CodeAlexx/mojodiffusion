@@ -263,6 +263,18 @@ Acceptance evidence:
   `checks=59 passed=59 p0=0 p1=0 p2=0`. This keeps video parity blocked by
   evidence while proving the bounded daemon runner route is wired and the
   tracked UI/gallery/reuse/state P1 gate is closed.
+- 2026-06-12 fast-path update: LTX2 AV attention now routes both square
+  self-attention and rectangular text/cross-modal attention through the BF16
+  cuDNN SDPA shim (`sdpa_flash_train_fwd` /
+  `sdpa_flash_train_fwd_rect`) via `_ltx2_sdpa_product_fwd*`; the standalone
+  `build-video-smoke` task links `libserenity_cudnn_sdpa`.
+- Measured daemon evidence after the LTX2 fast-path patch:
+  `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 120
+  --write-readiness output/checks/ltx2_video_daemon_readiness.json` reports
+  product wiring ready, positive external peak VRAM delta `5497 MiB`, and
+  timeout after `[Stage1] done` while loading `spatial-x2 LatentUpsampler + VAE
+  per-channel stats`. This is progress from the prior first-step stall, but it
+  is still not accepted video parity because no MP4 artifact was emitted.
 - `POST /v1/video` accepts only `runner:"ltx2_staged_dev_smoke"` and clamps
   `steps` to `1..3`. It runs
   `output/bin/ltx2_video_smoke_runner staged lora stream audio nonag
@@ -277,10 +289,11 @@ Acceptance evidence:
   `output/artifacts_smoke_seq.mp4`; `/v1/video/probe?path=...` reported
   `width=16`, `height=16`, `frame_count=2`, `duration=0.5`, `fps=4`,
   `video_codec=h264`, `has_audio=false`, and `muxing=probe_ok`.
-- Remaining acceptance gap: the bounded LTX2 runner must still be executed
-  through the daemon and emit a real MP4 with frame/duration/mux/audio fields,
-  successful exit code, timings, and positive peak VRAM before SwarmUI-level
-  video generation parity can be claimed.
+- Remaining acceptance gap: the bounded LTX2 runner must move the upscaler/VAE
+  load/decode path off the remaining slow boundary, complete through the daemon,
+  and emit a real MP4 with frame/duration/mux/audio fields, successful exit
+  code, timings, and positive peak VRAM before SwarmUI-level video generation
+  parity can be claimed.
 
 ## P1.1 Gallery And Reuse Params
 

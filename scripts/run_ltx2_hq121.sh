@@ -13,7 +13,11 @@ fi
 
 export LD_LIBRARY_PATH="$LTX2_CUDNN_LIB:${LD_LIBRARY_PATH:-}"
 
-pixi run mojo build -I . -Xlinker -lm -Xlinker -lcuda \
+pixi run mojo build -I . -I /home/alex/MOJO-libs \
+  -Xlinker -lm -Xlinker -lcuda \
+  -Xlinker -Lserenitymojo/ops/cshim/lib \
+  -Xlinker -lserenity_cudnn_sdpa \
+  -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib \
   serenitymojo/pipeline/ltx2_t2v_av_hq.mojo \
   -o "$LTX2_HQ_BIN"
 

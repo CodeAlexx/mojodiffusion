@@ -176,9 +176,12 @@ ops/tests/sdpa_flash_parity.mojo). Build needs extra link args
 (rebuild the .so with ops/cshim/build.sh) and runtime needs
 `~/.local/lib/python3.12/site-packages/nvidia/cudnn/lib` on
 LD_LIBRARY_PATH — the EriDiffusion/.venv_cache cuDNN wheel FAILS with
-"No valid execution plans" (bad engines lib). Trainer wiring is NOT done
-yet: flash backward needs O+Stats saved (new node kind), and bit-anchors
-must be RE-ANCHORED when it lands. ScratchRingAllocator is EAGER (all
+"No valid execution plans" (bad engines lib). Trainer wiring is DONE on
+klein (1.8 s/step, KLEIN_SDPA_FLASH in single_block.mojo) and zimage
+(~1.35 s/step, ZIMAGE_SDPA_FLASH in lora_block.mojo; capture OFF — flash
+allocs break replay). 4dp anchors held on both; klein gate uses
+value-tolerance for dQ-derived grads (flash bwd dQ is nondeterministic
+across calls, measured). ScratchRingAllocator is EAGER (all
 rings allocated in __init__) — budget VRAM accordingly; the B2 graph
 path (ZIMAGE_V2_GRAPH_B2) is gated OFF on the measured 24 GB wall until
 flash wiring + a slab-routed B2 forward land.

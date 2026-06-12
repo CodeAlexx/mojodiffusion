@@ -174,10 +174,19 @@ flash-vs-math cos >= 0.9999967 / max_abs <= 1 bf16 quantum; F32-referee
 rms flash <= 1.41x math (bar 1.5x); speed fwd+bwd 35-43x (klein
 100.7->2.34 ms, zimage B1 62.0->1.75, B2 125.1->3.47). Runtime needs
 ~/.local pip cuDNN lib dir on LD_LIBRARY_PATH (the .venv_cache wheel's
-engines lib is bad — "No valid execution plans"). REMAINING: trainer
-wiring (graph OPK_SDPA_FLASH arm saving O+Stats; klein helpers) behind
-per-trainer flags + RE-ANCHOR (bit-anchors die by design, approved);
-capture-compat of cudnn execute = HYPOTHESIS until smoked.**
+engines lib is bad — "No valid execution plans").
+WIRING SHIPPED SAME DAY (59f1936/b60d65e klein, fa073bf zimage): Klein
+single + double-joint through flash with F32<->bf16 boundary casts ->
+**1.8 s/step** (klein_block_parity ALL PASS; dQ-derived grads on a
+value-tolerance gate — flash bwd dQ MEASURED nondeterministic, 653/6.3M
+bf16 flips between identical calls; 4dp anchors UNCHANGED inside Klein's
+own variance). zimage graph backward through flash (record_sdpa_slab
+arity dispatch + 128-pad) -> **~1.35 s/step**, ZIMAGE_V2_CAPTURE=False
+(flash allocs break replay; flash 0.31-0.37 s >> capture 0.07 s). 4dp
+anchors HOLD; zimage cross-run bit-identity gone BY DESIGN (spread
+<=3.7e-5; variance-class gate now). REMAINING: capture-compat flash
+(fixed StepIO buffers + cudnn-in-capture smoke), fwd flash (~0.1 s),
+re-enable capture.**
 
 **P7 status (same session): groundwork SHIPPED GATED-OFF (commit
 2cac660) — B-param block graph + B2 slab backward + sdpa B2 dispatch

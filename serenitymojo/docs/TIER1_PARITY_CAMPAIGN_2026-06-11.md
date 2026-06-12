@@ -82,10 +82,30 @@ T1.F — **Validation adapter sweeps**
 FINAL-TREE GATES (orchestrator-run): zimage flag-off 5-step anchors
 EXACT; klein 1-step 0.5414; all six parity/dispatch/seam gates PASS.
 
+## Fan-out DONE (2026-06-11, mojodiffusion 12190f6 + serenity-trainer da7cbb9)
+All four trainers now dispatch through training/levers.mojo:
+- klein: levers loss in _klein_loss_grad (levers-WIN) + optimizer on
+  dbl/sgl lists (levers_optimizer_sync_resident_ot for OT-state dev_p);
+  EMA untouched (klein has its own). GATE: flags-off 3-step 0.5414 /
+  0.2154 / 0.7810 (steps 1-2 exact 4dp, step 3 delta 2.2e-4 inside the
+  ~4e-4 flash-bwd variance class), 1.9-2.0 s/step.
+- hidream-o1: trailing argv [config.json]; levers loss with gauss-shift
+  recipe weight ALWAYS applied; levers optimizer; configs/hidream_o1.json
+  template. GATE: flags-off 3-step exact 0.05885428/0.33308488/0.5214583.
+- ideogram4 (serenity-trainer): _i4_flow_loss_and_dvel seam + adapter-
+  mirror LeversBridge (device adamw doesn't match host LoraAdapter sig) +
+  EMA siblings + SF brackets; argv 10/11 = dropout/levers-json.
+  GATE: flags-off 2-step 1.12493/1.1416154 byte-identical LoRA vs
+  pre-change (C13), orchestrator re-ran post-change binary — same losses;
+  levers-on smoke (huber+min-snr+ADAFACTOR+EMA) moved weights + shadow
+  lags correctly.
+
 ## Follow-ups (not Tier-1 blockers)
-- Lever fan-out: klein/hidream/ideogram4 loss+optimizer call sites
-  (one-call each; zimage = the proven reference).
+- ideogram4 UI lever delivery: TrainerRuntimeBridge passes argv 1-9 only;
+  trainer side ready for argv 10 (dropout) / 11 (levers JSON).
 - T1.F GPU e2e sweep render; sweep UI keys (sample_sweep_loras).
 - Levers optimizer save/resume sidecar (fails loud on resume today).
-- hidream runtime TrainConfig (dropout/EMA are comptime/argv there).
+- ideogram4 FX fixture missing (gates build, can't run; real-cache smokes
+  used instead); apply_ideogram4_lora_grads returns literal 0.0 b_l1
+  (pre-existing) — lever path reports real B-L1.
 - Fused GPU adafactor/SF/EMA if they show in TIMING.

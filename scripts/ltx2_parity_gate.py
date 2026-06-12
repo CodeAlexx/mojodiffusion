@@ -400,6 +400,32 @@ GATES: tuple[Gate, ...] = (
         note="Single-resident stream/offload ceiling contract.",
     ),
     Gate(
+        "resident_fp8_loader",
+        "inference/offload",
+        "full",
+        "contract",
+        (
+            (
+                "pixi",
+                "run",
+                "mojo",
+                "build",
+                "--target-accelerator",
+                "sm_86",
+                "-I",
+                ".",
+                "serenitymojo/pipeline/ltx2_fp8_resident_smoke.mojo",
+                "-o",
+                "output/bin/ltx2_fp8_resident_smoke",
+            ),
+            ("output/bin/ltx2_fp8_resident_smoke",),
+        ),
+        note=(
+            "Resident raw-FP8 block materializes BF16 weights through the "
+            "resident-only no-sync dequant path."
+        ),
+    ),
+    Gate(
         "render_staged_hq_smoke",
         "inference/render",
         "manual-smoke",

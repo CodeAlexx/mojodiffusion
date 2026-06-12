@@ -37,6 +37,8 @@ ALL_RUNTIME_FILES = SIDECAR_FILES + (
     "serenitymojo/models/dit/ltx2_dit.mojo",
     "serenitymojo/models/vocoder/ltx2_vocoder.mojo",
     "serenitymojo/models/ltx2/weights.mojo",
+    "serenitymojo/offload/ltx2_block_stream.mojo",
+    "serenitymojo/ops/fp8.mojo",
 )
 
 ALLOW_MARKER = "dtype-contract: allow-f32-boundary"
@@ -135,6 +137,39 @@ def files_for_scope(scope: str) -> tuple[str, ...]:
     raise ValueError(scope)
 
 
+def check_resident_fp8_dequant_contract(failures: list[str]) -> None:
+    """Keep the resident-only async dequant optimization fenced to LTX2 residency."""
+    fp8_path = REPO / "serenitymojo/ops/fp8.mojo"
+    stream_path = REPO / "serenitymojo/offload/ltx2_block_stream.mojo"
+    fp8_text = fp8_path.read_text()
+    stream_text = stream_path.read_text()
+    if "def fp8_e4m3_dequant_to_bf16_no_sync" not in fp8_text:
+        failures.append(
+            "serenitymojo/ops/fp8.mojo:1: resident_fp8_no_sync: missing no-sync FP8 dequant API"
+        )
+    if "def _load_resident_block_bf16" not in stream_text:
+        failures.append(
+            "serenitymojo/offload/ltx2_block_stream.mojo:1: resident_fp8_no_sync: missing resident materializer"
+        )
+        return
+    resident_start = stream_text.find("def _load_resident_block_bf16")
+    next_def = stream_text.find("\n    def ", resident_start + 1)
+    resident_body = (
+        stream_text[resident_start:] if next_def == -1 else stream_text[resident_start:next_def]
+    )
+    if "fp8_e4m3_dequant_to_bf16_no_sync" not in resident_body:
+        failures.append(
+            "serenitymojo/offload/ltx2_block_stream.mojo:1: resident_fp8_no_sync: resident path still uses synchronized FP8 dequant"
+        )
+    streamed_start = stream_text.find("def load_block_bf16")
+    streamed_end = stream_text.find("\n    def _load_resident_block_bf16", streamed_start + 1)
+    streamed_body = stream_text[streamed_start:streamed_end]
+    if "fp8_e4m3_dequant_to_bf16_no_sync" in streamed_body:
+        failures.append(
+            "serenitymojo/offload/ltx2_block_stream.mojo:1: resident_fp8_no_sync: no-sync dequant leaked into streamed loader"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -165,6 +200,9 @@ def main() -> int:
                 failures.append(
                     f"{rel}:{line_for(text, match.start())}: {rule.name}: {rule.message}"
                 )
+
+    if args.scope == "all":
+        check_resident_fp8_dequant_contract(failures)
 
     if failures:
         print(f"LTX2 dtype/RNG contract violations (scope={args.scope}):")

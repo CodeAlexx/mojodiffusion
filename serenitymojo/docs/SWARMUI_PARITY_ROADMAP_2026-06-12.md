@@ -40,8 +40,9 @@ sampler/scheduler registry, the bounded LTX2 video smoke runner, LTX2 runner
 stage timing manifests, the
 model/gallery API slice, bounded Z-Image UniPC bh2, Z-Image multi-LoRA runtime
 stacking, typed linked workflow execution for the supported t2i graph, the
-runtime UI/gallery/reuse/state contract, and the extracted video API module:
-`71` checks, `71` passed, `P0=0`, `P1=0`, `P2=0`. Product P0 and tracked P1
+runtime UI/gallery/reuse/state contract, the extracted video API module, and
+the Ideogram4 Dh=256 fast-attention gate:
+`75` checks, `75` passed, `P0=0`, `P1=0`, `P2=0`. Product P0 and tracked P1
 gates are ready. Full SwarmUI all-level parity is still blocked.
 
 Current high-risk runtime gaps:
@@ -60,8 +61,14 @@ Current high-risk runtime gaps:
   `total_wall_seconds=186.882605556`, runner
   `total_runner_seconds=186.00316528799885`, stage timing gate, and external
   peak VRAM delta `10501 MiB` (`11490 MiB` peak used). Current evidence also
-  proves the
-  audio-enabled A/V artifact gate:
+  proves the LTX2 resident raw-FP8 loader no-sync materialization gate:
+  `output/bin/ltx2_fp8_resident_smoke` preloads block 4, reports
+  `386924928` resident bytes (`369 MiB`), sees `34` FP8 tensors, materializes
+  representative video/audio weights as BF16, and passes after a final
+  `ctx.synchronize()`. This removes the per-FP8-tensor host/device fence from
+  the resident materializer only; streamed loads keep the synchronized dequant
+  API.
+  Current evidence also proves the audio-enabled A/V artifact gate:
   `output/serenity_daemon/video-0072/ltx2_t2v_av_stage2_dev_smoke.mp4` plus
   `output/serenity_daemon/video-0072/dev_audio.wav`, `stream_count=2`,
   `audio_codec=aac`, `audio_duration=5.034`,

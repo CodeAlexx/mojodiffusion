@@ -2,6 +2,11 @@
 
 State: pure-Mojo inference WORKS end-to-end (guided HQ recipe, resident-fp8 14×,
 in-pipeline decode/mux — `refhq` mode, currently comptime'd 1024x576/121f).
+2026-06-12 speed follow-up: the staged daemon resident path now uses a
+resident-only no-sync FP8→BF16 dequant materializer for raw resident FP8 blocks;
+`output/bin/ltx2_fp8_resident_smoke` passes with block-4 `34` FP8 tensors and
+representative BF16 materialized weights. Streamed loads intentionally keep the
+synchronized dequant API.
 Trainer stage 1 (AV block backward) gated all-grads-cos-1.0. Quality gap vs the
 maintainer's bar is MEASURED to reproduce in the official pipeline at identical
 settings → recipe/conditioning, not Mojo fidelity. Full detail:

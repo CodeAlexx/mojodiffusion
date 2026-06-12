@@ -28,7 +28,10 @@ from std.gpu.host import DeviceContext
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor
-from serenitymojo.ops.fp8 import fp8_e4m3_dequant_to_bf16
+from serenitymojo.ops.fp8 import (
+    fp8_e4m3_dequant_to_bf16,
+    fp8_e4m3_dequant_to_bf16_no_sync,
+)
 
 
 # A streamed block: tensor-name (prefix-stripped) -> BF16 device Tensor.
@@ -229,9 +232,10 @@ struct LTX2BlockStream(Movable):
         """Materialize one BF16 block from GPU-resident raw storage.
 
         FP8 tensors are already on the GPU as raw bytes, so this avoids the
-        repeated host→device copy in the streamed path. Non-FP8 tensors are
-        stored resident as BF16 and reused by Arc; the caller materializes a
-        mutable BF16 block and kernels do any F32 accumulation internally."""
+        repeated host→device copy in the streamed path. The resident-only
+        dequant call also avoids a per-tensor host/device fence; later kernels
+        consume the BF16 tensors on the same DeviceContext stream. Non-FP8
+        tensors are stored resident as BF16 and reused by Arc."""
         var block = FP8Block()
         ref raw_block = self.resident_blocks[block_idx]
         ref scale_block = self.resident_scales[block_idx]
@@ -240,7 +244,7 @@ struct LTX2BlockStream(Movable):
                 var scale = Float32(1.0)
                 if e.key in scale_block:
                     scale = scale_block[e.key]
-                var deq = fp8_e4m3_dequant_to_bf16(e.value[], scale, ctx)
+                var deq = fp8_e4m3_dequant_to_bf16_no_sync(e.value[], scale, ctx)
                 block[e.key] = ArcPointer(deq^)
             else:
                 block[e.key] = e.value

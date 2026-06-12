@@ -40,7 +40,9 @@ dumps. Missing oracle dumps fail by default.
   parity against materialized `W + scale*(B@A)`.
 - DiT: AV block-0 parity and full 48-block AV velocity parity.
 - Decoders/audio: video VAE, audio VAE, BigVGAN+BWE vocoder parity.
-- Offload: 48 blocks streamed with bounded single-resident memory.
+- Offload: 48 blocks streamed with bounded single-resident memory; resident
+  raw-FP8 blocks materialize BF16 through a resident-only no-sync dequant path
+  so repeated denoise evals avoid per-FP8-tensor host/device fences.
 - Render structure: staged HQ smoke builds and runs stage-1 res2s, spatial x2
   latent upsample, bounded stage-2 refine, and high-resolution video decode.
 - Guidance integration: video-side NAG loads cached null Gemma context, projects
@@ -57,6 +59,14 @@ dumps. Missing oracle dumps fail by default.
   including tiled rectangular attention, workflow fixture, AudioSync profile,
   NAG combine, factorized LoRA math, trainer fail-closed foundation gates, and
   Musubi masked video/audio loss plus audio-reference IC parity.
+- `output/bin/fp8_dequant_smoke`: 5/5 pass after splitting the per-tensor FP8
+  wrapper; the synchronized public API remains bit-exact for all 256 E4M3 byte
+  values at several scales and for the real block-4 `attn1.to_q` torch
+  reference slice.
+- `output/bin/ltx2_fp8_resident_smoke`: pass; block 4 preloads
+  `386924928` resident bytes (`369 MiB`), exposes `34` FP8 tensors, and
+  materializes representative video/audio weights as BF16 through the
+  resident-only no-sync dequant path before a final synchronization.
 - `pixi run mojo run -I . serenitymojo/ops/sdpa_tiled_probe.mojo`: pass;
   square nomask and masked tiled SDPA both match math-mode at cos `1.0`,
   rectangular cross-attention `Sq=1536, Skv=1024, Dh=128` matches padded-mask

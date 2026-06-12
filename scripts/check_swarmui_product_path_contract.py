@@ -1207,11 +1207,11 @@ def build_report(checks: list[Check]) -> dict[str, object]:
     p2 = [check for check in checks if not check.ok and check.severity == P2]
     known_all_level_blockers = [
         "Qwen full daemon generation remains parked until bounded VRAM/runtime evidence says it is safe.",
-        "Video generation is not accepted until a real daemon run emits MP4, frame/duration, timing, and positive-VRAM evidence.",
+        "LTX2 video remains a bounded DEV-smoke backend: MP4/timing/VRAM evidence exists, but full SwarmUI/HQ video parity still needs non-smoke quality, workflow, duration, audio, and option coverage.",
         "Advanced Comfy/Swarm node families beyond the typed t2i graph remain unsupported.",
         "Z-Image speed parity is not accepted until the denoise path has paired baseline and optimized CFG/main-stack evidence.",
-        "Image/video backends with direct sdpa_nomask/sdpa_nomask_tiled product call sites are not accepted for speed parity until routed to flash or a proven model-specific fast kernel.",
-        "Ideogram4 is a requested image target, but it is not accepted until its resident DiT path is off slow SDPA and produces a daemon artifact with metadata, timing, and VRAM evidence.",
+        "Remaining image/video backends with direct sdpa_nomask/sdpa_nomask_tiled product call sites are not accepted for speed parity until routed to flash or a proven model-specific fast kernel.",
+        "Ideogram4 cleared the Dh=256 fast-attention gate, but is not accepted until a daemon backend emits an artifact with metadata, timing, VRAM, gallery, and job evidence.",
     ]
     return {
         "schema": "serenity.swarmui.product_path_readiness.v1",

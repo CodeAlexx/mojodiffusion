@@ -104,27 +104,12 @@ def _fp8_dequant_kernel(
 #   - scale: F32 per-tensor weight_scale
 #   - returns: BF16 tensor, same shape S
 # ─────────────────────────────────────────────────────────────────────────────
-def fp8_e4m3_dequant_to_bf16(
+def _fp8_e4m3_dequant_to_bf16_impl(
     x: Tensor,
     scale: Float32,
     ctx: DeviceContext,
+    sync_after_launch: Bool,
 ) raises -> Tensor:
-    """Dequantize FP8 E4M3 bytes → BF16, applying a per-tensor F32 scale. GPU-only.
-
-    out[i] = bf16(e4m3_decode(x[i]) * scale). Bit-exact with the CUDA reference
-    kernel (flame-core/src/cuda/fp8_dequant.cu) used by the LTX-2.3 FP8 stream.
-
-    Args:
-        x: U8 tensor of any shape; each byte is one float8_e4m3fn value.
-        scale: Per-tensor weight_scale (use 1.0 if the checkpoint has none).
-        ctx: DeviceContext.
-
-    Returns:
-        BF16 tensor with the SAME shape as `x`.
-
-    Raises:
-        On non-U8 dtype or empty input.
-    """
     if x.dtype() != STDtype.U8 and x.dtype() != STDtype.F8_E4M3:
         raise Error(
             String("fp8_e4m3_dequant_to_bf16: x must be U8/F8_E4M3, got ")
@@ -156,8 +141,48 @@ def fp8_e4m3_dequant_to_bf16(
         X, O, scale, n,
         grid_dim=grid, block_dim=_BLOCK,
     )
-    ctx.synchronize()
+    if sync_after_launch:
+        ctx.synchronize()
     return Tensor(out_buf^, out_shape^, STDtype.BF16)
+
+
+def fp8_e4m3_dequant_to_bf16(
+    x: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Dequantize FP8 E4M3 bytes → BF16, applying a per-tensor F32 scale. GPU-only.
+
+    out[i] = bf16(e4m3_decode(x[i]) * scale). Bit-exact with the CUDA reference
+    kernel (flame-core/src/cuda/fp8_dequant.cu) used by the LTX-2.3 FP8 stream.
+
+    Args:
+        x: U8 tensor of any shape; each byte is one float8_e4m3fn value.
+        scale: Per-tensor weight_scale (use 1.0 if the checkpoint has none).
+        ctx: DeviceContext.
+
+    Returns:
+        BF16 tensor with the SAME shape as `x`.
+
+    Raises:
+        On non-U8 dtype or empty input.
+    """
+    return _fp8_e4m3_dequant_to_bf16_impl(x, scale, ctx, True)
+
+
+def fp8_e4m3_dequant_to_bf16_no_sync(
+    x: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Enqueue FP8 E4M3 → BF16 dequant without a host/device fence.
+
+    Use only when the input tensor is already resident and the caller either
+    consumes the BF16 output on the same DeviceContext stream or synchronizes
+    before host readback. The synced wrapper above remains the default loader
+    API for streamed paths and tests.
+    """
+    return _fp8_e4m3_dequant_to_bf16_impl(x, scale, ctx, False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,5 +297,6 @@ def load_fp8_dequant(
     var s_info = st.tensor_info(scale_name)
     var s_bytes = st.tensor_bytes(scale_name)
     var s_view = from_parts(s_info.dtype, s_info.shape.copy(), s_bytes)
+    # dtype-contract: allow-f32-boundary - reference FP8 sidecar scales are F32.
     var scale = Tensor.from_view_as_f32(s_view, ctx)
     return fp8_e4m3_dequant_perrow_to_bf16(w^, scale^, ctx)

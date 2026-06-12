@@ -122,6 +122,7 @@ Common convention: each op has a `def _<op>_kernel_{f32,bf16,f16}(...)` triple (
 ### `ops/fp8.mojo` ✅ (per-row cos 0.99999878 vs torch `Fp8Linear`)
 FP8 E4M3 → BF16 dequantization (port of flame-core `fp8_dequant.cu`). E4M3 = 1 sign / 4 exp (bias 7) / 3 mantissa, no inf; decode in F32, store BF16. The Ideogram-4 vertical is serenitymojo's first fp8-weight model.
 - `fp8_e4m3_dequant_to_bf16(x: Tensor, scale: Float32, ctx) raises -> Tensor` — PER-TENSOR scalar scale: `out[i] = bf16(e4m3_decode(x[i])·scale)`, same shape as `x` (U8/F8_E4M3 input). Bit-exact with the CUDA reference (LTX-2.3 distilled-fp8 stream).
+- `fp8_e4m3_dequant_to_bf16_no_sync(x: Tensor, scale: Float32, ctx) raises -> Tensor` — same math/shape contract, but returns after enqueue without a host/device fence. Used only by the LTX2 resident raw-FP8 block materializer; streamed loaders keep the synchronized API.
 - `fp8_e4m3_dequant_perrow_to_bf16(w: Tensor, scale: Tensor, ctx) raises -> Tensor` — PER-OUTPUT-ROW scale: `w: [out,in]` F8_E4M3, `scale: [out]` F32, `out[o,i] = bf16(e4m3_decode(w[o,i])·scale[o])` (scale broadcast over `in`). Mirrors Ideogram-4 `Fp8Linear.forward` (`quantized_loading.py:197-200`).
 - `load_fp8_dequant(st: ShardedSafeTensors, weight_name: String, ctx) raises -> Tensor` — reads `<weight_name>` (F8_E4M3 `[out,in]`) + its sibling F32 per-row scale `<weight_name>_scale` (`[out]`) and returns the dequantized BF16 weight; diffusers/Ideogram `FP8_SCALE_SUFFIX` convention. Used by every Ideogram-4 Linear loader.
 

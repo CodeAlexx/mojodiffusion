@@ -369,6 +369,20 @@ Acceptance evidence:
   `stage2_denoise_seconds=90.72237481299999`, `peak used=10845 MiB`), resident
   mode improves the bounded wall time by about `15.5s` at about `645 MiB` higher
   sampled peak used.
+- Current LTX2 resident raw-FP8 loader evidence:
+  `pixi run mojo build --target-accelerator sm_86 -I .
+  serenitymojo/pipeline/ltx2_fp8_resident_smoke.mojo -o
+  output/bin/ltx2_fp8_resident_smoke` passes, and
+  `output/bin/ltx2_fp8_resident_smoke` passes outside the sandbox. It preloads
+  block 4, reports `resident bytes: 386924928 (369 MiB)`, sees
+  `fp8 tensor count: 34`, materializes representative video/audio weights as
+  BF16, then synchronizes once at the end. The resident materializer now uses
+  `fp8_e4m3_dequant_to_bf16_no_sync` to avoid a per-FP8-tensor host/device
+  fence; streamed loads keep `fp8_e4m3_dequant_to_bf16` and its synchronization.
+- `output/bin/fp8_dequant_smoke` still passes all bit-exact checks after the
+  split wrapper: all 256 E4M3 byte values at scales `1.0`, `0.5`, `2.0`, and
+  the real checkpoint scale, plus the real block-4 `attn1.to_q` slice against
+  the torch reference (`5/5`).
 - Current measured daemon A/V evidence:
   `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 520
   --audio-mode audio --strict-artifact --write-readiness

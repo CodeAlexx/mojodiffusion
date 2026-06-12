@@ -84,6 +84,19 @@ G-X3 PROMPT: all sidecar/prompt-blind models FULL prompt-driven (wire verified
   faithful translate + output diff.
 
 ## Log (newest first)
+- 2026-06-11 (session 4, late): **HIDREAM-O1 TRAINING VERTICAL BUILT IN ONE
+  DAY — ~1.0 s/step (ai-toolkit's claimed class), 105x from first light.**
+  Per-block fwd+bwd torch-parity gated (cos>=1-4e-13, all 14 adapter
+  grads; new sdpa_backward_masked primitive likewise gated); trainer =
+  full DiffSynth recipe (shift-3 uniform-t, noise*7.5, x-pred ->
+  v=(noisy-x_pred)/sigma, MSE x gauss-shift weight), recompute-checkpoint,
+  fused resident AdamW, bf16-RESIDENT 15.2 GB weights. MEASURED speed
+  arc: 98 s/step (P2 scaffolding) -> 106 (fused AdamW alone: loader
+  dominated) -> ~1.0 (bf16-resident: await_block was re-reading +
+  re-converting F32 shards EVERY visit, ~60 GB/step). 30-step run:
+  B|.|1 2048 -> 21,428 monotonic, LoRA saved DiffSynth-loadable.
+  Commits 88d255d/400a295/555c078/c509a40/77b0831. NEXT: sampler hookup
+  for visual learning verdict + UI target (P4).
 - 2026-06-11 (session 4, night): **ZIMAGE FLASH SDPA WIRED — step ~1.35 s
   (bwd 1.11->0.80; beats the 1.63 captured+math path with capture OFF),
   gap to OT 1.05 now ~1.29x.** record_sdpa_slab + OPK_SDPA arms via

@@ -1,26 +1,41 @@
-# training/boft_save.mojo — save / reopen TRAINED BOFT adapters in the LyCORIS
-# (diffusers PEFT) key convention.
+# training/boft_save.mojo — save / reopen TRAINED BOFT adapters in the
+# UPSTREAM LyCORIS key convention (pip lycoris_lora 3.4.0, the T2.F oracle).
 #
-# Mirrors EDv2 crates/eridiffusion-core/src/lycoris.rs BOFT save
-# (lycoris.rs:908-913 `out.insert(format!("{full}.oft_blocks.weight"), pt(&m.blocks))`):
+# MEASURED upstream schema (lycoris/modules/boft.py ButterflyOFTModule —
+# oft_blocks is a bare nn.Parameter, NO `.weight` suffix):
 #
-#       "<prefix>.oft_blocks.weight"  BF16 [boft_m, num_blocks, block_size, block_size]
-#       "<prefix>.alpha"              F32 [1]
+#       "<prefix>.oft_blocks"  BF16 [boft_m, num_blocks, block_size, block_size]
+#       "<prefix>.alpha"       F32 [1]   (upstream semantics: the CONSTRAINT,
+#                                         0 = unconstrained — NOT alpha/rank)
 #
-# Same `oft_blocks` suffix as Diag-OFT — the 4D shape [boft_m, nb, b, b] is what
-# disambiguates BOFT from OFT (3D [nb, b, b]) at load time (lycoris.rs:910-912,
-# the upstream `boft.py` weight_list convention). The stored tensor is the
-# per-stage per-block PRE-SKEW square S; a reopened S reconstructs Q, R, B, T
-# bit-identically.
+# 2026-06-11 T2.F-2 skeptic FIX (was `.oft_blocks.weight` + raw S, citing the
+# now-deleted EDv2 lycoris.rs): two bugs, same classes as the T2.F OFT fix —
+#  1. KEY: upstream uses NO `.weight` suffix.
+#  2. PARAMETRIZATION + ORIENTATION: upstream parametrizes the skew as
+#     Q = blocks - blocksᵀ and applies r = (I+Q)(I-Q)⁻¹ DIRECTLY to the
+#     (butterfly-permuted) rows — einsum("b i j, b j ... -> b i ...", r, W) —
+#     while the Mojo adapter uses Q = 0.5*(S - Sᵀ) and R = (I+Q)⁻¹(I-Q).
+#     NOTE the orientation DIFFERS from Diag-OFT: diag_oft.py einsums the
+#     TRANSPOSED r ("k n m, k n i -> k m i"), which is why oft_save folds
+#     blocks := +0.5*S, but boft.py applies r itself, so for the SAME rotation
+#     the BOFT on-disk tensor must be NEGATED as well:
+#       blocks := -0.5 * S      (reopen: S = -2 * blocks; *-0.5/*-2 exact in bf16)
+#     [R_mojo(Q) = (I+Q)⁻¹(I-Q) = r_upstream(-Q), measured 2026-06-11:
+#      max|d| 1.8e-7 vs 1.76 for the un-negated mapping.]
+# Gate: lycoris_family_load_check.py loads a Mojo-saved file through
+# ButterflyOFTModule.make_module_from_state_dict and reproduces the forward
+# BIT-EXACT.
 #
-# ── AGENT-DEFAULT (flagged for review) ────────────────────────────────────────
-# - Key spelling: `oft_blocks.weight` + `.alpha` (lycoris.rs:908-913). NOT
-#   `oft_diag` (the upper-triangular vector form is not used — EDv2/upstream BOFT
-#   store full blocks).
+# The 4D shape [boft_m, nb, b, b] disambiguates BOFT from OFT (3D [nb, b, b])
+# at load time (upstream algo_check: oft_blocks.ndim == 4).
+#
+# ── Notes ─────────────────────────────────────────────────────────────────────
 # - W_base (the frozen base weight) is NOT saved — model weight, not an adapter
-#   parameter (matches the ref: BOFTModule owns only `blocks`). Reader returns
-#   S + shapes + alpha; the caller re-supplies w_base on reconstruction.
-# - OFT/BOFT carry a per-module `.alpha` scalar (unlike plain LoRA).
+#   parameter (matches the ref: BOFTModule owns only `oft_blocks`). Reader
+#   returns S + shapes + alpha; the caller re-supplies w_base on reconstruction.
+# - `.alpha`: upstream BOFT reads this as the norm CONSTRAINT (like OFT), not a
+#   scale. The Mojo adapter has no constraint feature, so write alpha=0.0 for
+#   upstream-faithful files.
 #
 # Mojo 0.26.x: `def` not `fn`; move-only Tensor → ArcPointer; STDtype.F32 a value.
 
@@ -85,8 +100,13 @@ def save_boft_peft(
         if len(a.s) != MM * NB * B * B:
             raise Error(String("save_boft_peft: s numel ") + String(len(a.s)) + " != boft_m*num_blocks*b*b for '" + nk.prefix + "'")
 
-        names.append(nk.prefix + ".oft_blocks.weight")
-        tensors.append(ArcPointer(_bf16_4d(a.s.copy(), MM, NB, B, B, ctx)))
+        # Upstream parametrization + orientation: blocks := -0.5 * S (header).
+        # -0.5x is exact in bf16 (sign flip + exponent decrement).
+        var blocks = List[BFloat16]()
+        for i in range(len(a.s)):
+            blocks.append(BFloat16(Float32(-0.5) * a.s[i].cast[DType.float32]()))
+        names.append(nk.prefix + ".oft_blocks")
+        tensors.append(ArcPointer(_bf16_4d(blocks^, MM, NB, B, B, ctx)))
 
         names.append(nk.prefix + ".alpha")
         tensors.append(ArcPointer(_f32_scalar(a.alpha, ctx)))
@@ -127,11 +147,13 @@ struct BOFTReadback(Copyable, Movable):
 
 
 # Reopen one module's BOFT keys. oft_blocks [boft_m, nb, b, b] → shapes from its
-# 4D shape (4D rank is the BOFT-vs-OFT discriminator). Asserts the keys + alpha.
+# 4D shape (4D rank is the BOFT-vs-OFT discriminator). On-disk tensor is the
+# upstream-parametrized blocks; the Mojo S = -2 * blocks (see header — exact in
+# bf16). Asserts the keys + alpha.
 def read_boft_module(prefix: String, path: String, ctx: DeviceContext) raises -> BOFTReadback:
     var st = SafeTensors.open(path)
 
-    var info = st.tensor_info(prefix + ".oft_blocks.weight")
+    var info = st.tensor_info(prefix + ".oft_blocks")
     if len(info.shape) != 4:
         raise Error(String("read_boft_module: oft_blocks must be 4D [boft_m,nb,b,b], got rank ") + String(len(info.shape)))
     var MM = info.shape[0]
@@ -139,7 +161,10 @@ def read_boft_module(prefix: String, path: String, ctx: DeviceContext) raises ->
     var B = info.shape[2]
     if info.shape[3] != B:
         raise Error("read_boft_module: oft_blocks last two dims must be equal (square blocks)")
-    var s = _read_bf16(st, prefix + ".oft_blocks.weight", ctx)
+    var blocks = _read_bf16(st, prefix + ".oft_blocks", ctx)
+    var s = List[BFloat16]()
+    for i in range(len(blocks)):
+        s.append(BFloat16(Float32(-2.0) * blocks[i].cast[DType.float32]()))
 
     var alpha_h = _read_f32(st, prefix + ".alpha", ctx)
     if len(alpha_h) != 1:

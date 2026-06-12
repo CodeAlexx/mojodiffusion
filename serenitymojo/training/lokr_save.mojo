@@ -1,27 +1,33 @@
-# training/lokr_save.mojo — save / reopen TRAINED LoKr adapters in the LyCORIS
-# (diffusers PEFT) key convention.
+# training/lokr_save.mojo — save / reopen TRAINED LoKr adapters in the
+# UPSTREAM LyCORIS key convention (pip lycoris_lora 3.4.0, the T2.F oracle).
 #
-# Mirrors EDv2 crates/eridiffusion-core/src/lycoris.rs LoKr save
-# (lycoris.rs:878-893) and upstream lycoris/modules/lokr.py custom_state_dict:
+# MEASURED upstream schema (lycoris/modules/lokr.py weight_list /
+# custom_state_dict — the factors are bare nn.Parameters, so NO `.weight`
+# suffix on any LoKr key):
 #
-#       "<prefix>.lokr_w1.weight"     BF16 [out_l, in_m]       (W1 full)        OR
-#       "<prefix>.lokr_w1_a.weight"   BF16 [out_l, rank]       (W1 factored)    +
-#       "<prefix>.lokr_w1_b.weight"   BF16 [rank, in_m]
-#       "<prefix>.lokr_w2.weight"     BF16 [out_k, in_n]       (W2 full)        OR
-#       "<prefix>.lokr_w2_a.weight"   BF16 [out_k, rank]       (W2 factored)    +
-#       "<prefix>.lokr_w2_b.weight"   BF16 [rank, in_n]
-#       "<prefix>.alpha"              F32 [1]
+#       "<prefix>.lokr_w1"     BF16 [out_l, in_m]       (W1 full)        OR
+#       "<prefix>.lokr_w1_a"   BF16 [out_l, rank]       (W1 factored)    +
+#       "<prefix>.lokr_w1_b"   BF16 [rank, in_m]
+#       "<prefix>.lokr_w2"     BF16 [out_k, in_n]       (W2 full)        OR
+#       "<prefix>.lokr_w2_a"   BF16 [out_k, rank]       (W2 factored)    +
+#       "<prefix>.lokr_w2_b"   BF16 [rank, in_n]
+#       "<prefix>.alpha"       F32 [1]
+#
+# 2026-06-11 T2.F-2 skeptic FIX: keys previously carried a `.weight` suffix
+# (citing the now-deleted EDv2 lycoris.rs) — upstream uses the bare spellings
+# above, so the old files were ecosystem-unloadable (same bug class as the
+# LoHa/OFT T2.F fixes). Gate: lycoris_family_load_check.py loads a Mojo-saved
+# file through LokrModule.make_module_from_state_dict BIT-EXACT.
 #
 # Both W1-full and W1-factored (decompose_both) paths now ship. The conv-only
-# `.lokr_t2.weight` Tucker key (lycoris.rs:881-893) lives in tucker_save.mojo
-# (lora_mid), not here — this is the LINEAR LoKr path.
+# `.lokr_t2` Tucker key lives in tucker_save.mojo (lora_mid), not here — this
+# is the LINEAR LoKr path.
 #
 # Like LoHa (and unlike plain LoRA, which omits `.alpha`), the LyCORIS LoKr
 # convention DOES carry a per-module `.alpha` scalar (scale=alpha/rank).
-#
-# ── AGENT-DEFAULT (flagged) ───────────────────────────────────────────────────
-# Key spellings lokr_w1 / lokr_w2 / lokr_w2_a / lokr_w2_b + `.alpha`
-# (lycoris.rs:878-893). All written with the `.weight` suffix matching EDv2.
+# MEASURED upstream quirk (lokr.py:209-211): when BOTH W1 and W2 are full,
+# upstream forces scale=1 regardless of alpha — the saved alpha round-trips
+# but upstream ignores it in that configuration (lokr_adapter.mojo mirrors it).
 #
 # Mojo 0.26.x: `def` not `fn`; move-only Tensor → ArcPointer; STDtype.F32 a value.
 
@@ -87,14 +93,14 @@ def save_lokr_peft(
                 raise Error(String("save_lokr_peft: w1a numel mismatch for '") + nk.prefix + "'")
             if len(a.w1b) != R * IM:
                 raise Error(String("save_lokr_peft: w1b numel mismatch for '") + nk.prefix + "'")
-            names.append(nk.prefix + ".lokr_w1_a.weight")
+            names.append(nk.prefix + ".lokr_w1_a")
             tensors.append(ArcPointer(_bf16_2d(a.w1a.copy(), OL, R, ctx)))
-            names.append(nk.prefix + ".lokr_w1_b.weight")
+            names.append(nk.prefix + ".lokr_w1_b")
             tensors.append(ArcPointer(_bf16_2d(a.w1b.copy(), R, IM, ctx)))
         else:
             if len(a.w1) != OL * IM:
                 raise Error(String("save_lokr_peft: w1 numel ") + String(len(a.w1)) + " != out_l*in_m for '" + nk.prefix + "'")
-            names.append(nk.prefix + ".lokr_w1.weight")
+            names.append(nk.prefix + ".lokr_w1")
             tensors.append(ArcPointer(_bf16_2d(a.w1.copy(), OL, IM, ctx)))
 
         if a.w2_factored:
@@ -102,14 +108,14 @@ def save_lokr_peft(
                 raise Error(String("save_lokr_peft: w2a numel mismatch for '") + nk.prefix + "'")
             if len(a.w2b) != R * INn:
                 raise Error(String("save_lokr_peft: w2b numel mismatch for '") + nk.prefix + "'")
-            names.append(nk.prefix + ".lokr_w2_a.weight")
+            names.append(nk.prefix + ".lokr_w2_a")
             tensors.append(ArcPointer(_bf16_2d(a.w2a.copy(), OK, R, ctx)))
-            names.append(nk.prefix + ".lokr_w2_b.weight")
+            names.append(nk.prefix + ".lokr_w2_b")
             tensors.append(ArcPointer(_bf16_2d(a.w2b.copy(), R, INn, ctx)))
         else:
             if len(a.w2) != OK * INn:
                 raise Error(String("save_lokr_peft: w2 numel mismatch for '") + nk.prefix + "'")
-            names.append(nk.prefix + ".lokr_w2.weight")
+            names.append(nk.prefix + ".lokr_w2")
             tensors.append(ArcPointer(_bf16_2d(a.w2.copy(), OK, INn, ctx)))
 
         names.append(nk.prefix + ".alpha")
@@ -167,9 +173,9 @@ struct LoKrReadback(Copyable, Movable):
     var alpha: Float32
 
 
-# Reopen one module's LoKr keys. W1 is factored iff `.lokr_w1_a.weight` present
-# (then out_l,in_m,rank from w1a/w1b shapes); else full `.lokr_w1.weight`. W2 is
-# factored iff `.lokr_w2_a.weight` present; else full `.lokr_w2.weight`. Asserts
+# Reopen one module's LoKr keys. W1 is factored iff `.lokr_w1_a` present
+# (then out_l,in_m,rank from w1a/w1b shapes); else full `.lokr_w1`. W2 is
+# factored iff `.lokr_w2_a` present; else full `.lokr_w2`. Asserts
 # the present keys + alpha and cross-checks shapes. When BOTH are factored their
 # ranks must agree (single LoKr rank).
 def read_lokr_module(prefix: String, path: String, ctx: DeviceContext) raises -> LoKrReadback:
@@ -179,50 +185,50 @@ def read_lokr_module(prefix: String, path: String, ctx: DeviceContext) raises ->
     var w1 = List[BFloat16]()
     var w1a = List[BFloat16]()
     var w1b = List[BFloat16]()
-    var w1_factored = _has_key(st, prefix + ".lokr_w1_a.weight")
+    var w1_factored = _has_key(st, prefix + ".lokr_w1_a")
     var OL: Int
     var IM: Int
     var R1: Int = 0
     if w1_factored:
-        var i1a = st.tensor_info(prefix + ".lokr_w1_a.weight")
-        var i1b = st.tensor_info(prefix + ".lokr_w1_b.weight")
+        var i1a = st.tensor_info(prefix + ".lokr_w1_a")
+        var i1b = st.tensor_info(prefix + ".lokr_w1_b")
         OL = i1a.shape[0]
         R1 = i1a.shape[1]
         IM = i1b.shape[1]
         if i1b.shape[0] != R1:
             raise Error("read_lokr_module: w1b rows != rank")
-        w1a = _read_bf16(st, prefix + ".lokr_w1_a.weight", ctx)
-        w1b = _read_bf16(st, prefix + ".lokr_w1_b.weight", ctx)
+        w1a = _read_bf16(st, prefix + ".lokr_w1_a", ctx)
+        w1b = _read_bf16(st, prefix + ".lokr_w1_b", ctx)
     else:
-        var i1 = st.tensor_info(prefix + ".lokr_w1.weight")
+        var i1 = st.tensor_info(prefix + ".lokr_w1")
         OL = i1.shape[0]
         IM = i1.shape[1]
-        w1 = _read_bf16(st, prefix + ".lokr_w1.weight", ctx)
+        w1 = _read_bf16(st, prefix + ".lokr_w1", ctx)
 
     # ── W2 ──
     var w2 = List[BFloat16]()
     var w2a = List[BFloat16]()
     var w2b = List[BFloat16]()
-    var factored = _has_key(st, prefix + ".lokr_w2_a.weight")
+    var factored = _has_key(st, prefix + ".lokr_w2_a")
     var OK: Int
     var INn: Int
     var R: Int
     if factored:
-        var ia = st.tensor_info(prefix + ".lokr_w2_a.weight")
-        var ib = st.tensor_info(prefix + ".lokr_w2_b.weight")
+        var ia = st.tensor_info(prefix + ".lokr_w2_a")
+        var ib = st.tensor_info(prefix + ".lokr_w2_b")
         OK = ia.shape[0]
         R = ia.shape[1]
         INn = ib.shape[1]
         if ib.shape[0] != R:
             raise Error("read_lokr_module: w2b rows != rank")
-        w2a = _read_bf16(st, prefix + ".lokr_w2_a.weight", ctx)
-        w2b = _read_bf16(st, prefix + ".lokr_w2_b.weight", ctx)
+        w2a = _read_bf16(st, prefix + ".lokr_w2_a", ctx)
+        w2b = _read_bf16(st, prefix + ".lokr_w2_b", ctx)
     else:
-        var i2 = st.tensor_info(prefix + ".lokr_w2.weight")
+        var i2 = st.tensor_info(prefix + ".lokr_w2")
         OK = i2.shape[0]
         INn = i2.shape[1]
         R = 0
-        w2 = _read_bf16(st, prefix + ".lokr_w2.weight", ctx)
+        w2 = _read_bf16(st, prefix + ".lokr_w2", ctx)
 
     # Single LoKr rank: when both factored, the ranks must match.
     if w1_factored and factored and R1 != R:

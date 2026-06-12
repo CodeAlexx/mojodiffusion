@@ -2179,3 +2179,125 @@ def zimage_refiner_forward_device_slab[
     var ff_n2 = rms_norm_slab(ff, w.fn2[], eps, ctx, slab)
     var result = add_slab(h, ff_n2, ctx, slab)       # PLAIN residual (no gate)
     return TArc(result^)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# T2.C FULL-RANK FINETUNE (2026-06-11) — modulated-block backward that ALSO
+# materializes the 7 base-projection weight grads d_W = d_Yᵀ @ X (the grads the
+# LoRA path deliberately skips — "frozen base d_W ... must not be materialized
+# for Z-Image full depth" applies to the FULL-MODEL-RESIDENT case; here each
+# block's d_W set (~354 MB bf16) is transient: computed, D2H'd by the stack
+# loop, then freed before the next block — the 24 GB budget holds, measured in
+# train_zimage_real full-FT gates).
+#
+# Math: byte-identical op chain to zimage_block_lora_backward_device_tensors_
+# batch at B=1 for the d_x spine, with the LoRA branches REMOVED (full-FT has
+# no adapters; the recompute forward runs with the zero/scale-0 LoRA set so
+# the forward is the BASE forward) and one linear_backward_dw per slot added:
+#   d_Wq = d_q_preᵀ @ xn1s     d_Wk = d_k_preᵀ @ xn1s    d_Wv = d_vᵀ @ xn1s
+#   d_Wo = d_att_oᵀ @ att_flat
+#   d_W1 = d_gateᵀ @ xfn1s     d_W3 = d_upᵀ @ xfn1s      d_W2 = d_ffᵀ @ act
+# d_W returned BF16 (C12 bf16-first grads; F32 accumulation inside the GEMM).
+# ADDITIVE: no existing path is touched (C13).
+# ══════════════════════════════════════════════════════════════════════════════
+struct ZImageBlockFullFTBackward(Movable):
+    var d_x: TArc
+    var d_w: List[TArc]   # ZIMAGE_SLOTS entries, slot order Q,K,V,O,W1,W3,W2
+
+    def __init__(out self, var d_x: TArc, var d_w: List[TArc]):
+        self.d_x = d_x^
+        self.d_w = d_w^
+
+
+def zimage_block_backward_device_tensors_fullft[
+    H: Int, Dh: Int, S: Int
+](
+    d_out: Tensor,
+    w: ZImageBlockWeights, mv: ZImageModVecsDevice,
+    saved: ZImageBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageBlockFullFTBackward:
+    comptime ROWS = S
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var grg2 = gate_residual_backward_dxdy(d_out, saved.gate_mlp_t[], ctx)
+
+    var d_ff = rms_norm_backward_dx(grg2.d_y, saved.ff[], w.fn2[], eps, ctx)
+    var d_w2 = linear_backward_dw(
+        d_ff, saved.act[], ROWS, F, D, ctx, STDtype.BF16
+    )
+    var d_x_w2 = linear_backward_dx(d_ff, w.w2[], ROWS, F, D, ctx)
+
+    var sg = swiglu_backward(d_x_w2, saved.g_pre[], saved.u[], ctx)
+
+    var d_w1 = linear_backward_dw(
+        sg.d_gate, saved.xfn1s[], ROWS, D, F, ctx, STDtype.BF16
+    )
+    var d_w3 = linear_backward_dw(
+        sg.d_up, saved.xfn1s[], ROWS, D, F, ctx, STDtype.BF16
+    )
+    var d_x_w1 = linear_backward_dx(sg.d_gate, w.w1[], ROWS, D, F, ctx)
+    var d_x_w3 = linear_backward_dx(sg.d_up, w.w3[], ROWS, D, F, ctx)
+    var d_xfn1s = add(d_x_w1, d_x_w3, ctx)
+
+    var mb_mlp = modulate_backward(
+        d_xfn1s, saved.xfn1[], mv.scale_mlp[], ctx, compute_param_grads=False,
+    )
+    var d_h_norm = rms_norm_backward_dx(mb_mlp.d_x, saved.h[], w.fn1[], eps, ctx)
+    var d_h = add(grg2.d_x, d_h_norm, ctx)
+
+    var grg1 = gate_residual_backward_dxdy(d_h, saved.gate_msa_t[], ctx)
+
+    var d_att_o = rms_norm_backward_dx(grg1.d_y, saved.att_o[], w.n2[], eps, ctx)
+    var d_wo = linear_backward_dw(
+        d_att_o, saved.att_flat[], ROWS, D, D, ctx, STDtype.BF16
+    )
+    var d_x_o = linear_backward_dx(d_att_o, w.wo[], ROWS, D, D, ctx)
+
+    reshape_in_place(d_x_o, [1, S, H, Dh])
+    var sb = sdpa_backward[1, S, H, Dh](
+        saved.q_rope[], saved.k_rope[], saved.v[], d_x_o, scale, ctx
+    )
+    var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
+    var d_k_rms = rope_backward(sb.d_k, cos, sin, True, ctx)
+
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
+
+    reshape_in_place(d_q_pre, [ROWS, D])
+    reshape_in_place(d_k_pre, [ROWS, D])
+    reshape_in_place(sb.d_v, [ROWS, D])
+
+    var d_wq = linear_backward_dw(
+        d_q_pre, saved.xn1s[], ROWS, D, D, ctx, STDtype.BF16
+    )
+    var d_wk = linear_backward_dw(
+        d_k_pre, saved.xn1s[], ROWS, D, D, ctx, STDtype.BF16
+    )
+    var d_wv = linear_backward_dw(
+        sb.d_v, saved.xn1s[], ROWS, D, D, ctx, STDtype.BF16
+    )
+    var d_x_q = linear_backward_dx(d_q_pre, w.wq[], ROWS, D, D, ctx)
+    var d_x_k = linear_backward_dx(d_k_pre, w.wk[], ROWS, D, D, ctx)
+    var d_x_v = linear_backward_dx(sb.d_v, w.wv[], ROWS, D, D, ctx)
+    var d_xn1s = add(add(d_x_q, d_x_k, ctx), d_x_v, ctx)
+
+    var mb_sa = modulate_backward(
+        d_xn1s, saved.xn1[], mv.scale_msa[], ctx, compute_param_grads=False,
+    )
+    var d_x_norm = rms_norm_backward_dx(mb_sa.d_x, saved.x[], w.n1[], eps, ctx)
+
+    var d_x_t = add(grg1.d_x, d_x_norm, ctx)
+
+    var d_w_slots = List[TArc]()
+    d_w_slots.append(TArc(d_wq^))
+    d_w_slots.append(TArc(d_wk^))
+    d_w_slots.append(TArc(d_wv^))
+    d_w_slots.append(TArc(d_wo^))
+    d_w_slots.append(TArc(d_w1^))
+    d_w_slots.append(TArc(d_w3^))
+    d_w_slots.append(TArc(d_w2^))
+
+    return ZImageBlockFullFTBackward(TArc(d_x_t^), d_w_slots^)

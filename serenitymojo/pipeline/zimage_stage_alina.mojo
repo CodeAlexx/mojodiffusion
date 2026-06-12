@@ -107,14 +107,18 @@ def _stem_for_image(name: String) raises -> String:
     return _drop_suffix(name, 4)
 
 
-def _image_names() raises -> List[String]:
-    var raw = listdir(String(DATA_DIR))
+def _image_names_in(data_dir: String) raises -> List[String]:
+    var raw = listdir(data_dir)
     var xs = List[String]()
     for i in range(len(raw)):
         if _is_image_name(raw[i]):
             xs.append(raw[i])
     _sort_strings(xs)
     return xs^
+
+
+def _image_names() raises -> List[String]:
+    return _image_names_in(String(DATA_DIR))
 
 
 def _read_text(path: String) raises -> List[UInt8]:
@@ -395,15 +399,17 @@ def _save_stage_tensor(values: List[Float32], out_path: String, out_h: Int, out_
     save_safetensors(names, tensors, out_path, ctx)
 
 
-def _stage_t2d_buckets(max_images: Int, ctx: DeviceContext) raises:
+def _stage_t2d_buckets(max_images: Int, data_dir: String, ctx: DeviceContext) raises:
     """T2.D aspect-bucketed staging: GENERATED ladder + SimpleTuner-parity
     assignment (training/aspect_buckets.mojo, gated exact vs SimpleTuner in
     training/tests/aspect_buckets_parity.mojo). Writes to STAGE_DIR_T2D plus
     an aspect_buckets.json manifest documenting the ladder and the per-file
     assignment. Cache tensor schema is UNCHANGED (per-sample keyed tensors;
-    bucket membership stays shape-derived at the trainer's peek_key)."""
+    bucket membership stays shape-derived at the trainer's peek_key).
+    `data_dir` defaults to the Alina set; the optional t2d argv override
+    exists for bucket-coverage smokes (e.g. landscape sources)."""
     print("=== Z-Image T2.D stage: GENERATED aspect buckets (SimpleTuner semantics) ===")
-    print("  data: ", DATA_DIR)
+    print("  data: ", data_dir)
     print("  stage:", STAGE_DIR_T2D)
     var ladder = default_aspect_ladder()
     var buckets = generate_aspect_buckets(T2D_MEGAPIXELS, T2D_ALIGN, ladder)
@@ -419,9 +425,9 @@ def _stage_t2d_buckets(max_images: Int, ctx: DeviceContext) raises:
     _ = sys_system(String("rm -f ") + String(STAGE_DIR_T2D) + String("/*.txt"))
     _ = sys_system(String("rm -f ") + String(STAGE_DIR_T2D) + String("/aspect_buckets.json"))
 
-    var names = _image_names()
+    var names = _image_names_in(data_dir)
     if len(names) == 0:
-        raise Error(String("no PNG/JPEG images found in ") + String(DATA_DIR))
+        raise Error(String("no PNG/JPEG images found in ") + data_dir)
     var n = len(names)
     if max_images > 0 and max_images < n:
         n = max_images
@@ -446,8 +452,8 @@ def _stage_t2d_buckets(max_images: Int, ctx: DeviceContext) raises:
     for i in range(n):
         var src_name = names[i]
         var stem = _stem_for_image(src_name)
-        var src_path = String(DATA_DIR) + String("/") + src_name
-        var cap_path = String(DATA_DIR) + String("/") + stem + String(".txt")
+        var src_path = data_dir + String("/") + src_name
+        var cap_path = data_dir + String("/") + stem + String(".txt")
         var out_stem = _stage_name(i)
         var out_img = String(STAGE_DIR_T2D) + String("/") + out_stem + String(".safetensors")
         var out_txt = String(STAGE_DIR_T2D) + String("/") + out_stem + String(".txt")
@@ -502,6 +508,8 @@ def main() raises:
     var ctx = DeviceContext()
     var a = argv()
     if len(a) >= 2 and String(a[1]) == String("t2d"):
+        # t2d [max_images] [data_dir] — data_dir override for bucket-coverage
+        # smokes (landscape sources); default = the Alina set.
         var max_images = 0
         if len(a) >= 3:
             var s = String(a[2])
@@ -510,7 +518,10 @@ def main() raises:
                 if bs[i] < 0x30 or bs[i] > 0x39:
                     raise Error("t2d max_images must be a non-negative integer")
                 max_images = max_images * 10 + Int(bs[i] - 0x30)
-        _stage_t2d_buckets(max_images, ctx)
+        var data_dir = String(DATA_DIR)
+        if len(a) >= 4:
+            data_dir = String(a[3])
+        _stage_t2d_buckets(max_images, data_dir, ctx)
         return
     print("=== Z-Image Alina stage: raw PNG/JPEG -> image safetensors ===")
     print("  data: ", DATA_DIR)

@@ -350,3 +350,79 @@ def bucket_index_for_target(
         if buckets[i].width == target_w and buckets[i].height == target_h:
             return i
     return -1
+
+
+# ── comptime integer ladder (T2.D follow-up, 2026-06-11) ─────────────────────
+#
+# The Z-Image trainer dispatches each step to a COMPTIME-instantiated
+# (lat_h, lat_w, cap_len) bucket (train_zimage_real.mojo), so the bucket set
+# must be available at COMPILE time — comptime params cannot come from the
+# runtime generator above. This section derives the standard 512px / align-64
+# ladder with INTEGER-ONLY math (exact nearest-sqrt on rationals, no Float64),
+# which the comptime interpreter can evaluate.
+#
+# Derivation (matches generate_aspect_buckets for megapixels=0.262144,
+# align=64; gated EXACT in training/tests/zimage_comptime_ladder_gate.mojo):
+#   edge  = pixel_resolution(0.262144, 64) = 512;  e = edge/align = 8 units
+#   a     = aspect_x100 / 100   (the 2-decimal ladder entry, e.g. 133)
+#   w_units = round(e * sqrt(a))   = nearest_int( sqrt(64*aspect_x100 / 100) )
+#   h_units = round(e / sqrt(a))   = nearest_int( sqrt(6400 / aspect_x100) )
+#   target  = (64*w_units, 64*h_units); floor-at-multiple => units >= 1
+#   square snap: round(W/H, 2) == 1.0 <=> w_units == h_units for 64-aligned
+#   dims <= 1024 (|wu/hu - 1| >= 1/16 > 0.005 whenever wu != hu), and the
+#   snap target is the square pixel resolution 512x512.
+#   latent = target / 8  (VAE stride 8)  =>  lat = 8 * units  (64 for square).
+#
+# NOTE: the Float64 rounding in generate_aspect_buckets matters only for
+# stage-time SimpleTuner parity. The trainer needs just the (lat_h, lat_w)
+# SET; the gate proves the two derivations emit the same set for THIS ladder.
+
+comptime ZIMAGE_T2D_LADDER_LEN = 7
+# round(ratio, 2) * 100 of default_aspect_ladder(), same order:
+# 1:1, 4:3, 3:4, 16:9, 9:16, 3:2, 2:3.
+comptime ZIMAGE_T2D_LADDER_X100 = [100, 133, 75, 178, 56, 150, 67]
+# trainer caption buckets (cache mask prune + pad32), ascending dispatch order
+comptime ZIMAGE_T2D_CAP_LENS = [224, 256]
+comptime ZIMAGE_T2D_N_CAPS = 2
+
+
+def zimage_t2d_nearest_sqrt_units(p: Int, q: Int) -> Int:
+    """Nearest integer to sqrt(p/q) for p, q >= 1, ties-to-even — the exact
+    integer form of _py_round_half_even(sqrt(p/q)). m is the answer iff
+    q*(2m-1)^2 <= 4p <= q*(2m+1)^2; an exact upper tie 4p == q*(2m+1)^2 means
+    sqrt(p/q) == m + 0.5 and goes to the even neighbour. Comptime-evaluable
+    (integer while loop, no floats, non-raising)."""
+    var m = 0
+    while q * (2 * m + 1) * (2 * m + 1) < 4 * p:
+        m += 1
+    if q * (2 * m + 1) * (2 * m + 1) == 4 * p and m % 2 == 1:
+        return m + 1
+    return m
+
+
+def zimage_t2d_lat_w(aspect_x100: Int) -> Int:
+    """Latent W (= target_w / 8) of the 512px/align-64 bucket for the
+    2-decimal ladder aspect aspect_x100/100. Integer-only; comptime-evaluable."""
+    var wu = zimage_t2d_nearest_sqrt_units(64 * aspect_x100, 100)
+    if wu < 1:
+        wu = 1
+    var hu = zimage_t2d_nearest_sqrt_units(6400, aspect_x100)
+    if hu < 1:
+        hu = 1
+    if wu == hu:  # 2dp aspect key == 1.0 -> square snap to 512x512
+        return 64
+    return 8 * wu
+
+
+def zimage_t2d_lat_h(aspect_x100: Int) -> Int:
+    """Latent H (= target_h / 8) of the 512px/align-64 bucket for the
+    2-decimal ladder aspect aspect_x100/100. Integer-only; comptime-evaluable."""
+    var wu = zimage_t2d_nearest_sqrt_units(64 * aspect_x100, 100)
+    if wu < 1:
+        wu = 1
+    var hu = zimage_t2d_nearest_sqrt_units(6400, aspect_x100)
+    if hu < 1:
+        hu = 1
+    if wu == hu:  # 2dp aspect key == 1.0 -> square snap to 512x512
+        return 64
+    return 8 * hu

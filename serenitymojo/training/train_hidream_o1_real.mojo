@@ -114,6 +114,7 @@ from serenitymojo.offload.block_loader import Block
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.levers import (
     caption_dropout_pick, levers_loss_active, levers_loss_grad,
     LeversOptimizerState, levers_optimizer_active, levers_optimizer_step,
@@ -855,6 +856,15 @@ def main() raises:
             " | sigma ", sigma, " | loss ", loss, " | smooth ", smooth,
             " | B|.|1 ", b_absum,
             " | ", Float32(Float64(t1 - t0) / 1.0e9), "s/step",
+        )
+        # Shared UI progress line (the serenity-trainer TrainerRuntimeBridge
+        # progress parser shape, same as the config-driven runners). Purely
+        # additive stdout — the detail line above and all loss anchors are
+        # untouched. grad_norm: this trainer does not compute a global norm.
+        print_trainer_progress(
+            String("HiDreamO1"), step, steps, n_samples, loss,
+            0.0, Float64(t1 - t0) / 1.0e9, 0.0,
+            Float64(t1 - train_start) / 1.0e9,
         )
 
     # ── save (DiffSynth-loadable key shape) ──────────────────────────────────

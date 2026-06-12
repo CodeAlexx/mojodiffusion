@@ -373,6 +373,21 @@ struct TrainConfig(Copyable, Movable):
     # NEW numerics class — trainers gate it vs their bf16 baseline.
     var quantized_resident: String
 
+    # ── T2.E ControlNet training (default-off == 0) ─────────────────────────
+    # controlnet_layers: number of control blocks (DiT ControlNet pattern —
+    #   copies of the first N main transformer blocks + zero-init before/after
+    #   projections, per diffusers ZImageControlNetModel; see
+    #   models/zimage/controlnet_block.mojo). 0 = off (C13: the flags-off path
+    #   is byte-identical). When > 0 the trainable set is the control blocks +
+    #   projections ONLY (frozen base).
+    # controlnet_scale: conditioning_scale applied to the per-block hints at
+    #   the post-layer injection sites (diffusers consumption semantics).
+    # controlnet_checkpoint: diffusers ControlNet safetensors to resume from
+    #   ("" = fresh: control blocks copied from base, projections zero-init).
+    var controlnet_layers: Int
+    var controlnet_scale: Float64
+    var controlnet_checkpoint: String
+
     def n_layers(self) -> Int:
         """Total block count (back-compat convenience)."""
         return self.num_double + self.num_single
@@ -628,6 +643,9 @@ struct TrainConfig(Copyable, Movable):
         custom_conditioning_image: Bool,
         max_steps: Int, save_every: Int, sample_every: Int,
         var quantized_resident: String = String(""),  # T2.B (default-off)
+        controlnet_layers: Int = 0,                   # T2.E (default-off)
+        controlnet_scale: Float64 = 1.0,
+        var controlnet_checkpoint: String = String(""),
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -799,6 +817,9 @@ struct TrainConfig(Copyable, Movable):
         self.save_every = save_every
         self.sample_every = sample_every
         self.quantized_resident = quantized_resident^
+        self.controlnet_layers = controlnet_layers
+        self.controlnet_scale = controlnet_scale
+        self.controlnet_checkpoint = controlnet_checkpoint^
 
     def is_lora_training(self) -> Bool:
         return self.training_method == TRAINING_METHOD_LORA

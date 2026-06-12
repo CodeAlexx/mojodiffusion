@@ -93,6 +93,7 @@ from serenitymojo.models.zimage.block import (
     zimage_block_forward, zimage_refiner_forward,
 )
 from serenitymojo.models.zimage.lora_block import (
+    ZImageBlockFullFTBackward, zimage_block_backward_device_tensors_fullft,
     ZImageBlockLora, ZImageBlockLoraDevice, ZImageBlockLoraGrads,
     ZImageModVecsDevice, zimage_modvecs_to_device,
     ZImageLoraAdapterDevice, zimage_lora_adapter_to_device, ZIMAGE_SLOTS,
@@ -2694,3 +2695,122 @@ def zimage_step_io_read_grads(
         d_f_scale^, d_final_lin^,
         nonfinite,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# T2.C FULL-RANK FINETUNE (2026-06-11) — stack backward producing base-weight
+# grads for every MAIN-block slot projection (30 blocks x 7 slots = 5.31B
+# params). Same recompute-then-backprop conductor as _v2; per block the LoRA
+# backward is replaced by zimage_block_backward_device_tensors_fullft and the
+# 7 bf16 d_W tensors are D2H'd into ONE pinned host buffer per block, then the
+# device grads are freed before the next block (peak device overhead = one
+# block's d_W set ~354 MB — the full 10.6 GB grad set never lives on device).
+# The recompute forward runs with the ZERO LoRA device set (scale==0 -> the
+# apply is skipped -> base forward). ADDITIVE (C13): no existing path touched.
+# ══════════════════════════════════════════════════════════════════════════════
+struct ZImageFullFTGrads(Movable):
+    """Host bf16 base-weight grads for the MAIN blocks. bufs_rev[j] is the
+    pinned buffer for block (num_main-1-j) (the backward's reverse order);
+    use buf_index(bi). Within a buffer the 7 slots are contiguous in slot
+    order Q,K,V,O,W1,W3,W2 at slot_offsets (bytes) / slot_numels (elems)."""
+
+    var bufs_rev: List[HostBuffer[DType.uint8]]
+    var slot_offsets: List[Int]
+    var slot_numels: List[Int]
+    var num_main: Int
+
+    def __init__(
+        out self,
+        var bufs_rev: List[HostBuffer[DType.uint8]],
+        var slot_offsets: List[Int], var slot_numels: List[Int],
+        num_main: Int,
+    ):
+        self.bufs_rev = bufs_rev^
+        self.slot_offsets = slot_offsets^
+        self.slot_numels = slot_numels^
+        self.num_main = num_main
+
+    def buf_index(self, block_idx: Int) -> Int:
+        return self.num_main - 1 - block_idx
+
+
+def zimage_fullft_slot_numels(D: Int, F: Int) -> List[Int]:
+    """Element counts per slot, slot order Q,K,V,O,W1,W3,W2."""
+    var out = List[Int]()
+    out.append(D * D)   # Q
+    out.append(D * D)   # K
+    out.append(D * D)   # V
+    out.append(D * D)   # O
+    out.append(F * D)   # W1
+    out.append(F * D)   # W3
+    out.append(D * F)   # W2
+    return out^
+
+
+def zimage_stack_lora_backward_main_device_fullft[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_dev: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageFullFTGrads:
+    var num_main = len(main_blocks)
+
+    # ── final-layer prologue: byte-identical to _v2 ──────────────────────────
+    var d_patches = _concat_img_cap(d_out, _zeros(N_TXT * out_ch))
+    var final_dx = linear_backward_dx(
+        _t(d_patches, [S, out_ch], ctx), final_lin_w, S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    # slot layout (bf16 bytes) shared by every block buffer.
+    var slot_numels = zimage_fullft_slot_numels(D, F)
+    var slot_offsets = List[Int]()
+    var cursor = 0
+    for s in range(ZIMAGE_SLOTS):
+        slot_offsets.append(cursor)
+        cursor += slot_numels[s] * 2
+    var block_bytes = cursor
+
+    var bufs_rev = List[HostBuffer[DType.uint8]]()
+    var bi = num_main - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var refwd = zimage_block_lora_forward_device_tensor_batch[1, H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod_dev[bi], bl,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        var bg = zimage_block_backward_device_tensors_fullft[H, Dh, S](
+            d_x[], main_blocks[bi], main_mod_dev[bi], refwd.saved,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+
+        var host = ctx.enqueue_create_host_buffer[DType.uint8](block_bytes)
+        for s in range(ZIMAGE_SLOTS):
+            if bg.d_w[s][].dtype() != STDtype.BF16:
+                raise Error("fullft backward: d_w dtype must be BF16")
+            var nbytes = slot_numels[s] * 2
+            if bg.d_w[s][].nbytes() != nbytes:
+                raise Error("fullft backward: d_w slot byte-size mismatch")
+            var dst = host.create_sub_buffer[DType.uint8](slot_offsets[s], nbytes)
+            ctx.enqueue_copy(dst_buf=dst, src_buf=bg.d_w[s][].buf)
+        # device grads (bg) must stay alive until the copies complete.
+        ctx.synchronize()
+        bufs_rev.append(host)
+        bi -= 1
+
+    return ZImageFullFTGrads(bufs_rev^, slot_offsets^, slot_numels^, num_main)

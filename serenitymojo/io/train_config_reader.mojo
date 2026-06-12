@@ -816,6 +816,21 @@ def read_model_config(json_path: String) raises -> TrainConfig:
                         + sc.s + "' (supported: OFF, fp8_e4m3)"
                     )
                 cfg.quantized_resident = sc.s
+        elif key == "controlnet_layers":
+            # T2.E ControlNet training (default-off 0). Fail loud on negatives.
+            var n = Int(_read_scalar(cur).num)
+            if n < 0:
+                raise Error(
+                    String("train config: controlnet_layers must be >= 0, got ")
+                    + String(n)
+                )
+            cfg.controlnet_layers = n
+        elif key == "controlnet_scale":
+            cfg.controlnet_scale = _read_scalar(cur).num
+        elif key == "controlnet_checkpoint":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.controlnet_checkpoint = sc.s
         # arch (ints)
         elif key == "inner_dim":
             cfg.d_model = Int(_read_scalar(cur).num)

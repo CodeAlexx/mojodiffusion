@@ -230,6 +230,13 @@ struct LoKrAdapter(Copyable, Movable):
         self.in_n = in_n
         self.alpha = alpha
         self.scale = (alpha / Float32(rank)) if rank > 0 else Float32(1.0)
+        # MEASURED upstream quirk (lycoris/modules/lokr.py:209-211, T2.F-2
+        # 2026-06-11): when BOTH W1 and W2 are full (use_w1 and use_w2),
+        # upstream forces alpha = lora_dim, i.e. scale = 1 — regardless of the
+        # alpha the user passed (and regardless of the alpha in a loaded file).
+        # Mirror it exactly so the both-full forward matches upstream.
+        if (not w1_factored) and (not w2_factored):
+            self.scale = Float32(1.0)
         self.m_w1 = m_w1^
         self.v_w1 = v_w1^
         self.m_w1a = m_w1a^

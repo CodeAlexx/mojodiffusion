@@ -1,0 +1,129 @@
+# SwarmUI Sampler Parity Map - 2026-06-12
+
+Scope: sampler and scheduler product-surface parity for the Mojo runtime path in
+`/home/alex/mojodiffusion`. This is a surface audit, not runtime parity
+acceptance. Full Qwen generation and video generation were intentionally not run.
+
+SwarmUI/ComfyUI baseline sources used:
+
+- `/home/alex/SwarmUI/dlbackend/ComfyUI/comfy/samplers.py`
+- `/home/alex/SwarmUI/dlbackend/ComfyUI/nodes.py`
+- `/home/alex/SwarmUI/src/BuiltinExtensions/ComfyUIBackend/ComfyUIBackendExtension.cs`
+- `/home/alex/SwarmUI/src/BuiltinExtensions/ComfyUIBackend/WorkflowGenerator.cs`
+- `/home/alex/SwarmUI/src/BuiltinExtensions/ComfyUIBackend/ExtraNodes/SwarmComfyCommon/SwarmKSampler.py`
+- `/home/alex/SwarmUI/src/Text2Image/T2IParamTypes.cs`
+
+Mojo surface sources used:
+
+- `serenitymojo/serve/serenity_daemon.mojo`
+- `serenitymojo/serve/backend.mojo`
+- `serenitymojo/serve/zimage_backend.mojo`
+- `serenitymojo/serve/qwenimage_backend.mojo`
+- `serenitymojo/serve/dispatch_backend.mojo`
+- `serenitymojo/sampling/*.mojo`
+- `serenitymojo/docs/SAMPLER_PRODUCT_HARNESS_2026-06-05.md`
+
+## Summary
+
+The daemon currently preserves many SwarmUI/ComfyUI sampler-facing request
+fields in canonical metadata, threads the sampler-facing fields through typed
+`JobParams`/worker IPC, and can map a constrained Comfy KSampler graph into flat
+generation parameters. The production backends now fail loud for unsupported
+sampler/scheduler names and unsupported advanced surfaces instead of silently
+storing unsupported controls as metadata. Z-Image and Qwen now apply
+`variation_seed`/`variation_strength` to initial latent noise through a pure-Mojo
+Swarm-style CHW slerp helper. `serenitymojo/sampling/sampler_registry.mojo`
+now exposes a versioned SwarmUI/Comfy catalog, model-aware backend support
+matrix, default aliases, and fail-loud unsupported policy through `/v1/samplers`.
+Z-Image now has bounded DPM++ 2M and UniPC bh2 daemon denoise loops on the
+simple flow-match sigma schedule. Z-Image and Qwen still use model-specific
+flow-match schedules internally and honor only a subset of the requested
+surface. Multi-image batch semantics, generic UniPC/order variants, ancestral/
+SDE/Karras execution, refiner/upscale/ControlNet, and arbitrary Comfy graph
+execution are still blockers.
+
+`accepted_sampler_parity` must remain false until a real backend dispatch path
+proves the requested sampler, scheduler, seed, variation, image count, denoise,
+CFG, negative prompt, and output metadata behavior with artifacts and runtime
+manifests.
+
+## Parity Map
+
+| Feature | SwarmUI/Comfy expectation | Current Mojo surface | Blocker | Acceptance gate |
+| --- | --- | --- | --- | --- |
+| Sampler name catalog | Comfy `SAMPLER_NAMES` includes Euler, ancestral Euler, Heun, LMS, DPM, DPM++, DDPM, LCM, IPNDM, DEIS, res multistep, gradient estimation, ER-SDE, seeds, SA-Solver, `ddim`, `uni_pc`, and `uni_pc_bh2`. SwarmUI exposes these plus CFG++ display variants. | `sampler_registry.mojo` exposes the Comfy/Swarm catalog and `/v1/samplers` support matrix. Daemon `JobParams` carries `sampler`; Z-Image accepts `euler`/`flowmatch_euler`, bounded `dpmpp_2m`, and bounded `uni_pc_bh2` aliases on the simple flow-match schedule. Qwen still accepts only `euler`/`flowmatch_euler`. Unsupported sampler names fail loud through shared registry admission. | Registry/admission exists, and Z-Image DPM++ 2M plus UniPC bh2 are wired, but generic `uni_pc`, higher-order/order-3 UniPC variants, ancestral/SDE/CFG++/Karras/etc. names are not wired into real daemon denoise loops yet. | `/v1/generate` and constrained KSampler graph requests must validate supported sampler names, fail loud on unsupported names, execute accepted names as distinct algorithms, and runtime manifests must show the executed sampler per artifact. |
+| Scheduler name catalog | Comfy schedules include `simple`, `sgm_uniform`, `karras`, `exponential`, `ddim_uniform`, `beta`, `normal`, `linear_quadratic`, and `kl_optimal`. SwarmUI also exposes `turbo`, `align_your_steps`, `ltxv`, `ltxv-image`, and `flux2`. | `sampler_registry.mojo` includes the Comfy/Swarm scheduler catalog, backend defaults, and supported aliases. Z-Image accepts `simple`/flowmatch aliases; Qwen accepts `simple`/flowmatch/`qwen`; other names fail loud before model work. | Request scheduler discovery and admission exist, but most catalog schedulers are unsupported for daemon product backends until a model-specific schedule builder has artifact evidence. | Backend dispatcher must map scheduler names to model-compatible schedule builders or reject unsupported pairs with 4xx/501 plus metadata. |
+| KSampler request mapping | Comfy `KSampler` expects `seed`, `steps`, `cfg`, `sampler_name`, `scheduler`, positive/negative conditioning, latent image, and `denoise`. `KSamplerAdvanced` adds start/end step behavior. | `serenity_daemon.mojo` maps constrained graph nodes: `sampler_name` to `sampler`, `scheduler`, `denoise` to `creativity`, `batch_size` to `images`, and preserves flat genparams. Unknown graph nodes fail 501. | Mapping is limited to a constrained adapter; it is not arbitrary Comfy graph execution and does not prove backend execution of sampler/scheduler. | Static graph adapter tests plus daemon product smoke must prove mapped params survive into artifact metadata and unsupported nodes fail loud. Runtime parity requires backend execution evidence. |
+| CFG and negative prompt | KSampler combines positive and negative conditioning using CFG, with model-specific conventions where needed. Prompt weights and LoRA prompt tags affect conditioning in SwarmUI. | `prompt`, `negative`, `cfg`, and prompt syntax metadata are parsed. Z-Image uses its current cond-anchored CFG form with sign convention. Qwen uses Qwen scheduler/CFG helpers. Prompt weights are parsed and persisted but not proven applied to conditioning math. | CFG formulas are model-specific and not normalized behind a product sampler contract. Prompt syntax is not full conditioning parity. | Per model: negative prompt A/B artifact check, CFG=1 vs CFG>1 behavior check, prompt-weight conditioning check, and manifest fields for formula/sampler/scheduler. |
+| Img2img denoise / creativity | Comfy denoise truncates the sigma schedule when `denoise < 1.0`. SwarmUI `Init Image Creativity` is the fraction of steps run after skipping initial steps. Masks, inpaint, and image-to-image workflows are product features. | Z-Image daemon backend accepts `init_image` and maps `creativity` into a schedule start step. Qwen explicitly rejects img2img. Sampling helper files exist for refpack/inpaint, but there is no accepted daemon product path for full img2img/inpaint parity. | Denoise semantics are not generalized across backends; mask/inpaint product surface is absent; Qwen img2img blocked. | For each supported image backend: run artifact checks with known init image, denoise/creativity values 0, 0.5, 1.0, metadata, and dimensions. Unsupported backends must fail loud. |
+| Seed behavior | Swarm/Comfy seed controls noise; Swarm batch elements use deterministic seed offsets. Seed `-1` can randomize in UI. | Z-Image and Qwen use request seed for initial noise. Daemon validates unsigned seeds and stores them. `images=N` expands to serial jobs with `seed+i`; variation noise uses `variation_seed+image_index`. Stub path uses deterministic output color. | No random seed policy equivalent to SwarmUI `-1`. | Repeated same-seed requests must produce byte/comparable latent determinism per backend; multi-image requests must document and test per-image seed policy. |
+| Variation seed and strength | `SwarmKSampler` blends base noise and variation-seed noise with spherical interpolation when `var_seed_strength > 0`. | `variation_seed` and `variation_strength` are parsed, stored in canonical metadata, typed through `JobParams`/IPC, and accepted through constrained workflow params. `serenitymojo/sampling/variation_noise.mojo` implements pure-Mojo CHW slerp; Z-Image applies it before BF16 latent upload and records `variation_seed`, `variation_strength`, and `variation_applied` in its manifest. Qwen applies the same helper on the optional variation path while keeping its zero-variation GPU `randn` path unchanged. | Runtime behavior exists for image backends, but full sampler parity is still false until nontrivial sampler/scheduler algorithms have per-sampler artifact gates. | Artifact test where same base seed plus different variation seed/strength changes noise/output as expected; manifest must record applied variation mode. |
+| Images and batch size | SwarmUI has user-facing `Images` count and separate internal `Batch Size`. Comfy latent batch size can produce multiple outputs. | Daemon parses `images=N`, expands it into N serial queued jobs, offsets seeds as `seed+i`, and records `image_index`/`image_count` in `JobParams`, worker IPC, PNG metadata, job JSON, and Z-Image manifests. | Product Images count is covered by serial artifacts; true Comfy latent-batch execution is not implemented as one backend batch. | `/v1/generate images=N` must produce N artifacts, N metadata records, deterministic per-image seeds, progress/job states, and gallery entries. If separate batch-size semantics are exposed, they need a backend batch path or fail-loud gating. |
+| Hires, upscale, and refiner | SwarmUI exposes hires/upscale flows, refiner model, refiner steps/CFG, refiner sampler/scheduler, and refiner step-swap or post-apply methods. | Mojo has model/runtime primitives and Z-Image 1024/full paths under active development, but no accepted daemon refiner/upscale product surface in this sampler map. | No request schema, backend chain, artifact metadata, or acceptance smoke for hires/upscale/refiner. | Add explicit API fields, fail-loud unsupported matrix, and artifact checks proving low-res output, upscale/refiner stage, final dimensions, metadata, timings, and VRAM. |
+| Control, IP-Adapter, regional, masks | SwarmUI supports ControlNet slots, image inputs, strength, start/end fractions, masks, regional prompting, and related conditioning controls. | Some Mojo files cover inpaint/mask helpers and model-specific control experiments, but daemon sampler request surface does not expose ControlNet/IP-Adapter/regional conditioning. | No typed daemon request model, model compatibility matrix, or product runtime path for control conditioning. | API must accept validated control inputs, connect them to model conditioning, produce artifact metadata, and reject unsupported controls per backend. |
+| Output metadata and reuse | SwarmUI keeps generation parameters for reuse, gallery display, and PNG metadata. | Daemon writes canonical `serenity.genparams.v1` metadata and job/gallery state. Z-Image manifests include requested/executed sampler fields, readiness labels, timings, peak VRAM, and `accepted_sampler_parity:false`. | Metadata preservation and fail-loud admission are present, but sampler/scheduler acceptance cannot claim registry parity until distinct algorithms are executed and proven. | Every artifact must include requested and executed sampler/scheduler, denoise, seed/variation, image index/count, dimensions, timings, VRAM, backend, readiness, and acceptance booleans. |
+| Workflow graph coverage | SwarmUI emits Comfy workflows and custom Swarm nodes for samplers, schedules, refiners, previews, and advanced flows. | Daemon supports a constrained native adapter for common KSampler-like graphs and rejects unknown nodes with 501. It is not an arbitrary Comfy executor. | Advanced sampler/refiner/upscale/control graphs are not represented. | Maintain a supported-node matrix, add product tests for every accepted node/edge, and reject unknown nodes with explicit unsupported details. |
+| Model/backend mapping | SwarmUI routes sampler choices across many model families, with family-specific defaults such as Anima ER-SDE/simple, Flux2/flux2, Z-Image/simple, Qwen/simple. | `dispatch_backend.mojo` currently routes real daemon work to Z-Image and Qwen backends, with stub backends for smoke. Sampling modules exist for Klein/Flux2, SDXL, SD15, SD3, Chroma, ERNIE, Anima, and LTX2, but they are not daemon sampler products. | Klein/other model samplers are not dispatchable through the daemon product surface. | Add backend dispatch entries only when each model has artifact, timing, VRAM, metadata, and sampler/scheduler failure-mode evidence. |
+| Qwen and video quarantine | SwarmUI can generate Qwen image and video workflows through Comfy backends when resources and nodes are available. | Qwen daemon backend exists but full generation is not a safe target for this task. Video endpoints intentionally fail 501/blocked pending runtime rebuild. | Memory/runtime readiness for full Qwen is unproven here; video path is known blocked. | Do not accept Qwen full sampler parity or any video sampler parity until separate product gates produce real artifacts and resource evidence. |
+| Readiness labels | SwarmUI users expect real outputs when a control is offered. Unsupported controls should be disabled or fail clearly. | Product docs and Z-Image manifests use readiness and acceptance booleans. Static checkers can validate markers but cannot prove runtime. | Current sampler surface mixes preserved metadata with executable behavior. | UI/API must expose only supported sampler controls per model or return precise unsupported errors. Static checker plus runtime artifact gates must both pass before readiness labels change. |
+
+## Current Mapping Notes
+
+- Flat `/v1/generate` params accepted by the daemon include `prompt`,
+  `negative`, `model`, `width`, `height`, `steps`, `seed`, `cfg`, `sampler`,
+  `scheduler`, `variation_seed`, `variation_strength`, `images`, `init_image`,
+  `creativity`, and `lora`.
+- Constrained Comfy graph mapping accepts `workflow.params`,
+  `workflow.genparams`, and known nodes for checkpoint, CLIP prompt text, empty
+  latent size/batch, KSampler, VAE decode, and save image. Unknown nodes are an
+  unsupported graph, not a silent fallback.
+- `JobParams` currently carries executable fields for prompt, negative, size,
+  steps, seed, CFG, sampler, scheduler, variation seed/strength, image count,
+  init image, creativity, LoRA, metadata JSON, and output dir. Worker IPC carries
+  the same fields.
+- Z-Image backend executes its internal Euler-like flow-match schedule, bounded
+  DPM++ 2M on the same simple flow-match sigma schedule, bounded UniPC bh2
+  order-2 on the Z-Image sigma trace, and real CFG/negative/img2img subset at
+  512x512 only. It rejects unsupported sampler controls, rejects more than one
+  LoRA, records requested/executed sampler fields plus DPM++/UniPC trace fields,
+  and records sampler parity as not accepted.
+- DPM++ 2M runtime evidence exists for `job-0036`:
+  `output/serenity_daemon/job-0036.png` and
+  `output/serenity_daemon/job-0036.png.zimage_daemon_result.json`. The manifest
+  records `dpmpp_update_steps:3`, `dpmpp_second_order_steps:2`,
+  `denoise_seconds_per_step:0.3180188945`, `peak_vram_mib:21571.8125`, and
+  `accepted_sampler_parity:false`.
+- UniPC bh2 runtime evidence exists for `job-0040`:
+  `output/serenity_daemon/job-0040.png` and
+  `output/serenity_daemon/job-0040.png.zimage_daemon_result.json`, produced by
+  `python3 scripts/check_zimage_daemon_product_contract.py
+  --skip-dpmpp2m-smoke --skip-multi-image-smoke --skip-variation-smoke
+  --write-readiness output/checks/zimage_unipc_bh2_product_readiness.json`.
+  The manifest records `requested_sampler:"uni_pc_bh2"`,
+  `requested_scheduler:"flowmatch"`, `executed_sampler:"uni_pc_bh2"`,
+  `executed_scheduler:"simple_flowmatch"`, `solver_type:"bh2"`,
+  `solver_order:2`, `schedule_source:"zimage_build_sigmas"`,
+  `unipc_update_steps:3`, `unipc_corrector_steps:2`,
+  `unipc_second_order_steps:2`, `denoise_seconds_per_step:0.32013946925`,
+  `peak_vram_mib:21727.5625`, and `accepted_sampler_parity:false`.
+  The same gate proved generic `uni_pc` remains fail-loud as `job-0038`.
+- Qwen backend executes its internal Qwen schedule at 1024x1024 only. It rejects
+  unsupported sampler controls, LoRA, and img2img. Full generation is out of
+  scope for this task.
+- Stub backends are useful for API plumbing but do not count as sampler runtime
+  parity.
+
+## Minimum Acceptance Sequence
+
+1. Keep the `/v1/samplers` support matrix current per backend.
+2. Execute every accepted sampler/scheduler as the requested algorithm, or
+   reject it before expensive model work.
+3. Thread executed sampler/scheduler, variation, image index/count, and denoise
+   semantics into backend manifests and PNG metadata.
+4. Keep the multi-output `images > 1` daemon path covered by runtime artifact
+   gates and add a separate batched-latent path only if the UI exposes Comfy
+   batch-size semantics.
+5. Add runtime artifact gates per backend that verify dimensions, metadata,
+   timings, VRAM, readiness label, and acceptance booleans.
+6. Only then flip `accepted_sampler_parity` for the specific model/sampler pair
+   that has evidence.

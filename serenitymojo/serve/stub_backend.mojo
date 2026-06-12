@@ -12,7 +12,9 @@ from std.time import sleep
 from image.buffer import Image
 from image.png import encode_png_with_text
 
-from serenitymojo.serve.backend import GenBackend, JobParams, StepResult
+from serenitymojo.serve.backend import (
+    GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
+)
 
 comptime STEP_SLEEP_S = 0.1  # simulated per-step latency
 
@@ -80,6 +82,7 @@ struct StubBackend(GenBackend, Movable):
     def start(mut self, params: JobParams) raises:
         if self.active:
             raise Error("StubBackend.start: a job is already running")
+        reject_unsupported_common_runtime_params(params, String("stub"))
         self.params = params.copy()
         self.active = True
         self.cancel_flag = False

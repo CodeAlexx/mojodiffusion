@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -226,8 +227,10 @@ def validate_result_manifest(path: Path) -> list[str]:
         if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) < 0.0:
             problems.append(f"mojo.{key} must be a non-negative number")
     peak_vram = mojo.get("peak_vram_mib")
-    if peak_vram != 0:
-        problems.append("mojo.peak_vram_mib must be 0 in generator-only result; supervisor measures positive VRAM externally")
+    if not isinstance(peak_vram, (int, float)) or isinstance(peak_vram, bool):
+        problems.append("mojo.peak_vram_mib must be numeric")
+    elif not math.isfinite(float(peak_vram)) or float(peak_vram) <= 0.0:
+        problems.append("mojo.peak_vram_mib must be positive product-path VRAM evidence")
     artifacts = mojo.get("artifact_paths")
     if not isinstance(artifacts, list) or not artifacts:
         problems.append("mojo.artifact_paths must be a non-empty list")

@@ -1,4 +1,4 @@
-# serenitymojo.serve.serenity_daemon — the SerenityUI generation daemon (skeleton).
+# serenitymojo.serve.serenity_daemon — the SerenityUI generation daemon.
 #
 # A pure-Mojo localhost HTTP + WebSocket server (default 127.0.0.1:7801) on the
 # MOJO-libs net/http stack (single-threaded epoll event loop, the
@@ -8,6 +8,16 @@
 #                          lora:[{name,weight}]} -> {job_id, queue_position}
 #   GET  /v1/jobs         JSON array of all jobs
 #   GET  /v1/job/<id>     one job
+#   GET  /v1/gallery      list generated PNGs + embedded genparams
+#   GET  /v1/gallery/<id> read one generated PNG's embedded genparams
+#   GET  /v1/gallery/read?path=<png> read/import any local PNG's genparams
+#   POST /v1/reorder[/<id>] {position|before_id} reorder a queued job
+#   POST /v1/remove[/<id>]  remove a queued job before it starts
+#   GET/POST /v1/state      load/save last UI state
+#   GET/POST /v1/presets    list/save named generation presets
+#   GET  /v1/video          video readiness/status contract
+#   POST /v1/video          bounded video smoke gate when runner is built
+#   GET  /v1/video/probe?path=<mp4> inspect a local MP4 artifact
 #   POST /v1/cancel/<id>  cancel a queued job / signal the running one
 #   WS   /v1/progress     pushes {job_id,state,step,total,progress[,output_path,
 #                          error,preview]} on every job-state change
@@ -25,6 +35,7 @@
 from std.ffi import external_call
 from std.memory import alloc
 from std.sys import argv
+from std.time import perf_counter_ns
 
 from net.poll import Epoll, EPOLLIN, EPOLLET, EVENT_SIZE, EAGAIN, rd_u64
 from net.socket import Socket
@@ -43,6 +54,8 @@ from http.websocket import (
     handshake_response, decode_frame, encode_text, encode_close, encode_pong,
     WsReassembler, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING,
 )
+from image.png import read_png_text, decode_png, encode_png
+from image.studio_ops import resize_lanczos
 from json.parser import loads
 from json.serialize import dumps
 from json.value import JSONValue
@@ -50,6 +63,12 @@ from sqlite.db import Database
 from sqlite.writer import DbWriter
 from sqlite.value import Value
 
+from serenitymojo.sampling.sampler_registry import (
+    default_generation_model, default_sampler_for_backend,
+    default_scheduler_for_backend, sampler_backend_for_model,
+    swarmui_sampler_registry_json,
+)
+from serenitymojo.io.ffi import sys_open, sys_close, file_size, O_RDONLY
 from serenitymojo.serve.backend import GenBackend, JobParams, LoraSpec, StepResult
 from serenitymojo.serve.model_scan import (
     ScanEntry, scan_checkpoints, scan_loras, _read_text_file,
@@ -67,12 +86,21 @@ comptime MAX_REQUEST_BYTES = 1048576  # 1 MiB
 comptime TICK_MS = 50                 # epoll wait timeout -> worker tick cadence
 comptime OUT_DIR = "output/serenity_daemon"
 comptime DB_PATH = "output/serenity_daemon/jobs.db"
+comptime STATE_DIR = "output/serenity_daemon/state"
+comptime STATE_PATH = "output/serenity_daemon/state/last_state.json"
+comptime PRESETS_PATH = "output/serenity_daemon/state/presets.json"
+comptime GALLERY_STATE_PATH = "output/serenity_daemon/state/gallery.json"
+comptime GALLERY_THUMB_DIR = "output/serenity_daemon/thumbnails"
+comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 comptime DB_PARAMS_MAX = 2048         # params_json cap in the db row (F1): the
                                       # pure-Mojo DbWriter has no overflow pages
                                       # (one row must fit one 4096-byte page);
                                       # the FULL params live in the PNG tEXt —
                                       # the db row is just the gallery index.
-comptime SCAN_PNG_TMP = "/tmp/serenity_daemon_pngscan.txt"
+comptime SCAN_PNG_TMP = "output/serenity_daemon/state/gallery_scan.txt"
+comptime VIDEO_PROBE_TMP = "output/serenity_daemon/state/video_probe.json"
+comptime VIDEO_PROBE_ERR = "output/serenity_daemon/state/video_probe.err"
+comptime LTX2_VIDEO_SMOKE_RUNNER = "output/bin/ltx2_video_smoke_runner"
 
 
 # ── small libc helpers ───────────────────────────────────────────────────────
@@ -207,6 +235,354 @@ def _opt_str(obj: JSONValue, key: String, dflt: String) raises -> String:
     return obj[key].as_string()
 
 
+def _workflow_string(obj: JSONValue, key: String) raises -> String:
+    if not obj.is_object() or not obj.contains(key) or obj[key].is_null():
+        return String("")
+    if not obj[key].is_string():
+        return String("")
+    return obj[key].as_string()
+
+
+def _set_if_missing(mut obj: JSONValue, key: String, value: JSONValue) raises:
+    if not obj.contains(key) or obj[key].is_null():
+        obj.set(key, value.copy())
+
+
+def _copy_field_if_missing(
+    mut dst: JSONValue, src: JSONValue, src_key: String, dst_key: String,
+) raises:
+    if src.is_object() and src.contains(src_key) and not src[src_key].is_null():
+        _set_if_missing(dst, dst_key, src[src_key])
+
+
+def _apply_workflow_params(mut obj: JSONValue) raises:
+    """Map a constrained SerenityUI native t2i workflow to flat genparams.
+
+    This is intentionally not an arbitrary graph executor. Known node types are
+    lifted into the same `/v1/generate` product path; unknown graph nodes fail
+    loudly with 501 so the UI cannot mistake partial graph parity for full
+    SwarmUI workflow parity.
+    """
+    if not obj.contains("workflow") or obj["workflow"].is_null():
+        return
+    var wf = obj["workflow"]
+    if not wf.is_object():
+        raise Error("[501] workflow graph body must be an object")
+
+    if wf.contains("params") and wf["params"].is_object():
+        var params = wf["params"]
+        var keys: List[String] = [
+            "model", "prompt", "prompt_raw", "negative", "width", "height",
+            "steps", "seed", "cfg", "sampler", "scheduler", "variation_seed",
+            "variation_strength", "images", "init_image", "creativity",
+            "lora",
+        ]
+        for i in range(len(keys)):
+            _copy_field_if_missing(obj, params, keys[i], keys[i])
+        return
+
+    if wf.contains("genparams") and wf["genparams"].is_object():
+        var params = wf["genparams"]
+        var keys: List[String] = [
+            "model", "prompt", "prompt_raw", "negative", "width", "height",
+            "steps", "seed", "cfg", "sampler", "scheduler", "variation_seed",
+            "variation_strength", "images", "init_image", "creativity",
+            "lora",
+        ]
+        for i in range(len(keys)):
+            _copy_field_if_missing(obj, params, keys[i], keys[i])
+        return
+
+    if not wf.contains("nodes") or not wf["nodes"].is_array():
+        raise Error("[501] workflow graph body needs nodes or params/genparams")
+
+    var nodes = wf["nodes"]
+    var saw_prompt = False
+    for i in range(nodes.length()):
+        var node = nodes[i]
+        if not node.is_object():
+            raise Error("[501] workflow graph node must be an object")
+        var type_id = _workflow_string(node, String("type_id"))
+        var title = _workflow_string(node, String("title"))
+        var fields = JSONValue.new_object()
+        if node.contains("fields") and node["fields"].is_object():
+            fields = node["fields"]
+
+        if type_id == "CheckpointLoaderSimple":
+            _copy_field_if_missing(obj, fields, String("ckpt_name"), String("model"))
+        elif type_id == "CLIPTextEncode":
+            var text = _workflow_string(fields, String("text"))
+            if text != "":
+                var lower_title = String(title.lower())
+                if lower_title.find("negative") >= 0:
+                    _set_if_missing(obj, String("negative"), JSONValue.from_string(text))
+                else:
+                    _set_if_missing(obj, String("prompt"), JSONValue.from_string(text))
+                    saw_prompt = True
+        elif type_id == "EmptyLatentImage":
+            _copy_field_if_missing(obj, fields, String("width"), String("width"))
+            _copy_field_if_missing(obj, fields, String("height"), String("height"))
+            _copy_field_if_missing(obj, fields, String("batch_size"), String("images"))
+        elif type_id == "KSampler":
+            _copy_field_if_missing(obj, fields, String("steps"), String("steps"))
+            _copy_field_if_missing(obj, fields, String("seed"), String("seed"))
+            _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
+            _copy_field_if_missing(obj, fields, String("sampler_name"), String("sampler"))
+            _copy_field_if_missing(obj, fields, String("scheduler"), String("scheduler"))
+            _copy_field_if_missing(obj, fields, String("denoise"), String("creativity"))
+        elif (
+            type_id == "VAEDecode"
+            or type_id == "SaveImage"
+            or type_id == ""
+        ):
+            if type_id == "":
+                raise Error("[501] unsupported workflow graph format: missing type_id")
+        else:
+            raise Error(
+                String("[501] unsupported workflow graph node type: ") + type_id
+            )
+
+    if not saw_prompt and (not obj.contains("prompt") or obj["prompt"].is_null()):
+        raise Error("[501] workflow graph did not contain a prompt node")
+
+
+struct PromptSyntaxResult(Copyable, Movable):
+    var raw: String
+    var resolved: String
+    var loras: List[LoraSpec]
+    var weighted: JSONValue
+    var randoms: JSONValue
+    var wildcards: JSONValue
+
+    def __init__(out self, raw: String):
+        self.raw = raw
+        self.resolved = String("")
+        self.loras = List[LoraSpec]()
+        self.weighted = JSONValue.new_array()
+        self.randoms = JSONValue.new_array()
+        self.wildcards = JSONValue.new_array()
+
+
+def _has_lora(loras: List[LoraSpec], name: String) -> Bool:
+    for i in range(len(loras)):
+        if loras[i].name == name:
+            return True
+    return False
+
+
+def _find_next_byte(s: String, start: Int, target: Int) -> Int:
+    var b = s.as_bytes()
+    for i in range(start, s.byte_length()):
+        if Int(b[i]) == target:
+            return i
+    return -1
+
+
+def _find_next_double_underscore(s: String, start: Int) -> Int:
+    var b = s.as_bytes()
+    var i = start
+    while i + 1 < s.byte_length():
+        if Int(b[i]) == 95 and Int(b[i + 1]) == 95:
+            return i
+        i += 1
+    return -1
+
+
+def _choose_index(seed: Int, salt: Int, count: Int) -> Int:
+    if count <= 0:
+        return 0
+    return (seed + salt) % count
+
+
+def _choose_option_csv(options: String, seed: Int, salt: Int) -> String:
+    var parts = options.split(",")
+    var count = 0
+    for i in range(len(parts)):
+        if String(String(parts[i]).strip()) != "":
+            count += 1
+    if count == 0:
+        return String("")
+    var target = _choose_index(seed, salt, count)
+    var seen = 0
+    for i in range(len(parts)):
+        var opt = String(String(parts[i]).strip())
+        if opt == "":
+            continue
+        if seen == target:
+            return opt^
+        seen += 1
+    return String("")
+
+
+def _safe_wildcard_name(name: String) -> Bool:
+    return name != "" and name.find("..") < 0 and name.find("/") < 0 and name.find("\\") < 0
+
+
+def _choose_nonempty_line(text: String, seed: Int, salt: Int) -> String:
+    var lines = text.split("\n")
+    var count = 0
+    for i in range(len(lines)):
+        if String(String(lines[i]).strip()) != "":
+            count += 1
+    if count == 0:
+        return String("")
+    var target = _choose_index(seed, salt, count)
+    var seen = 0
+    for i in range(len(lines)):
+        var line = String(String(lines[i]).strip())
+        if line == "":
+            continue
+        if seen == target:
+            return line^
+        seen += 1
+    return String("")
+
+
+def _wildcard_value(name: String, seed: Int, salt: Int) -> String:
+    if not _safe_wildcard_name(name):
+        return String("")
+    var path = String("/home/alex/.serenity/wildcards/") + name + ".txt"
+    try:
+        return _choose_nonempty_line(_read_text_file(path), seed, salt)
+    except:
+        pass
+    path = String("wildcards/") + name + ".txt"
+    try:
+        return _choose_nonempty_line(_read_text_file(path), seed, salt)
+    except:
+        pass
+    return String("")
+
+
+def _append_prompt_weight(mut result: PromptSyntaxResult, text: String, weight: Float64):
+    var ent = JSONValue.new_object()
+    ent.set("text", JSONValue.from_string(text))
+    ent.set("weight", JSONValue.from_float(weight))
+    result.weighted.append(ent^)
+
+
+def _append_prompt_random(
+    mut result: PromptSyntaxResult, expr: String, selected: String, index: Int,
+):
+    var ent = JSONValue.new_object()
+    ent.set("expr", JSONValue.from_string(expr))
+    ent.set("selected", JSONValue.from_string(selected))
+    ent.set("index", JSONValue.from_int(index))
+    result.randoms.append(ent^)
+
+
+def _append_prompt_wildcard(
+    mut result: PromptSyntaxResult, name: String, selected: String, resolved: Bool,
+):
+    var ent = JSONValue.new_object()
+    ent.set("name", JSONValue.from_string(name))
+    ent.set("selected", JSONValue.from_string(selected))
+    ent.set("resolved", JSONValue.from_bool(resolved))
+    result.wildcards.append(ent^)
+
+
+def _append_prompt_lora(mut result: PromptSyntaxResult, name: String, weight: Float64):
+    if name == "":
+        return
+    result.loras.append(LoraSpec(name, weight))
+
+
+def _prompt_syntax_json(result: PromptSyntaxResult) -> JSONValue:
+    var o = JSONValue.new_object()
+    o.set("schema", JSONValue.from_string(String("serenity.prompt_syntax.v1")))
+    o.set("parser", JSONValue.from_string(String("daemon")))
+    o.set("conditioning_weights_applied", JSONValue.from_bool(False))
+    o.set("weighted", result.weighted.copy())
+    o.set("random", result.randoms.copy())
+    o.set("wildcards", result.wildcards.copy())
+    var la = JSONValue.new_array()
+    for i in range(len(result.loras)):
+        var lo = JSONValue.new_object()
+        lo.set("name", JSONValue.from_string(result.loras[i].name))
+        lo.set("weight", JSONValue.from_float(result.loras[i].weight))
+        la.append(lo^)
+    o.set("lora_tags", la^)
+    return o^
+
+
+def _parse_prompt_syntax(raw: String, seed: Int) raises -> PromptSyntaxResult:
+    var result = PromptSyntaxResult(raw)
+    var b = raw.as_bytes()
+    var i = 0
+    while i < raw.byte_length():
+        var c = Int(b[i])
+        if c == 60:  # '<'
+            var end = _find_next_byte(raw, i + 1, 62)  # '>'
+            if end > i:
+                var content = String(byte_substr(raw, i + 1, end).strip())
+                if content.startswith("lora:"):
+                    var rest = byte_substr(content, 5, content.byte_length())
+                    var colon = rest.find(":")
+                    var name = rest.copy()
+                    var weight = 1.0
+                    if colon >= 0:
+                        name = String(byte_substr(rest, 0, colon).strip())
+                        weight = Float64(String(byte_substr(rest, colon + 1, rest.byte_length()).strip()))
+                    else:
+                        name = String(name.strip())
+                    _append_prompt_lora(result, name, weight)
+                    i = end + 1
+                    continue
+                if content.startswith("random:"):
+                    var opts = byte_substr(content, 7, content.byte_length())
+                    var selected = _choose_option_csv(opts, seed, i)
+                    var count = 0
+                    for part in opts.split(","):
+                        if String(String(part).strip()) != "":
+                            count += 1
+                    var selected_index = _choose_index(seed, i, count)
+                    result.resolved += selected
+                    _append_prompt_random(result, content, selected, selected_index)
+                    i = end + 1
+                    continue
+                if content.startswith("wildcard:"):
+                    var name = String(byte_substr(content, 9, content.byte_length()).strip())
+                    var selected = _wildcard_value(name, seed, i)
+                    var ok = selected != ""
+                    if not ok:
+                        selected = name.copy()
+                    result.resolved += selected
+                    _append_prompt_wildcard(result, name, selected, ok)
+                    i = end + 1
+                    continue
+        elif c == 40:  # '('
+            var endp = _find_next_byte(raw, i + 1, 41)  # ')'
+            if endp > i:
+                var inner = byte_substr(raw, i + 1, endp)
+                var colon = inner.find(":")
+                if colon > 0:
+                    try:
+                        var text = String(byte_substr(inner, 0, colon).strip())
+                        var weight = Float64(String(byte_substr(inner, colon + 1, inner.byte_length()).strip()))
+                        if text != "":
+                            result.resolved += text
+                            _append_prompt_weight(result, text, weight)
+                            i = endp + 1
+                            continue
+                    except:
+                        pass
+        elif c == 95 and i + 1 < raw.byte_length() and Int(b[i + 1]) == 95:
+            var endu = _find_next_double_underscore(raw, i + 2)
+            if endu > i + 2:
+                var name = String(byte_substr(raw, i + 2, endu).strip())
+                var selected = _wildcard_value(name, seed, i)
+                var ok = selected != ""
+                if not ok:
+                    selected = name.copy()
+                result.resolved += selected
+                _append_prompt_wildcard(result, name, selected, ok)
+                i = endu + 2
+                continue
+        result.resolved += byte_substr(raw, i, i + 1)
+        i += 1
+    return result^
+
+
 def parse_generate(
     body: String, job_id: String, out_dir: String, default_model: String
 ) raises -> JobParams:
@@ -216,40 +592,46 @@ def parse_generate(
     var obj = loads(body)
     if not obj.is_object():
         raise Error("body must be a JSON object")
-    if obj.contains("workflow"):
-        # plan H4: graph bodies are reserved in the schema, not implemented.
-        raise Error(
-            "[501] 'workflow' (graph body) is reserved and not implemented"
-            " yet (plan H4); send flat genparams"
-        )
+    _apply_workflow_params(obj)
     var p = JobParams()
     p.job_id = job_id
     p.out_dir = out_dir
     if not obj.contains("prompt") or not obj["prompt"].is_string():
         raise Error("'prompt' (string) is required")
-    p.prompt = obj["prompt"].as_string()
-    if p.prompt == "":
+    var prompt_input = obj["prompt"].as_string()
+    if prompt_input == "":
         raise Error("'prompt' must be non-empty")
-    p.model = _opt_str(obj, "model", default_model)
-    # P9/P10: the UI resolves prompt syntax at submit; `prompt` is already the
-    # RESOLVED text and `prompt_raw` (the original, with syntax) is a
-    # passthrough field persisted for reuse-params.
-    var prompt_raw = _opt_str(obj, "prompt_raw", String(""))
+    p.model = _opt_str(obj, "model", default_generation_model(default_model))
     p.negative = _opt_str(obj, "negative", String(""))
     p.width = _opt_int(obj, "width", 512, 16, 2048)
     p.height = _opt_int(obj, "height", 512, 16, 2048)
     p.steps = _opt_int(obj, "steps", 20, 1, 500)
     p.seed = _opt_int(obj, "seed", 0, 0, 4294967295)
     p.cfg = _opt_num(obj, "cfg", 4.5, 0.0, 50.0)
-    # Phase-2 genparams passthrough (plan H1): the backend ignores these today,
-    # but they MUST survive into params_json (PNG tEXt + jobs.db) so the UI's
-    # reuse-params restores ALL fields (P15) and the UI-state JSON == the
-    # daemon-recorded JSON except server-added job_id (gate G2f).
-    var sampler = _opt_str(obj, "sampler", String(""))
-    var scheduler = _opt_str(obj, "scheduler", String(""))
-    var variation_seed = _opt_int(obj, "variation_seed", 0, 0, 4294967295)
-    var variation_strength = _opt_num(obj, "variation_strength", 0.0, 0.0, 1.0)
-    var images = _opt_int(obj, "images", 1, 1, 64)
+    # P9/P10: prompt syntax is parsed in the daemon product path. Backends get
+    # resolved plain text; the raw text plus parser metadata persist in PNG
+    # genparams so reuse-params can restore the authored prompt.
+    var prompt_raw = _opt_str(obj, "prompt_raw", prompt_input)
+    var prompt_syntax = _parse_prompt_syntax(prompt_raw, p.seed)
+    p.prompt = prompt_syntax.resolved
+    if p.prompt == "":
+        raise Error("'prompt' resolved to an empty prompt")
+    # Sampler-facing fields ride the typed backend contract as well as the
+    # canonical genparams JSON. Backends must execute them or fail loud.
+    var sampler_backend = sampler_backend_for_model(p.model, default_model)
+    p.sampler = _opt_str(obj, "sampler", default_sampler_for_backend(sampler_backend))
+    p.scheduler = _opt_str(obj, "scheduler", default_scheduler_for_backend(sampler_backend))
+    if p.sampler == "":
+        p.sampler = default_sampler_for_backend(sampler_backend)
+    if p.scheduler == "":
+        p.scheduler = default_scheduler_for_backend(sampler_backend)
+    p.variation_seed = _opt_int(obj, "variation_seed", 0, 0, 4294967295)
+    p.variation_strength = _opt_num(obj, "variation_strength", 0.0, 0.0, 1.0)
+    p.images = _opt_int(obj, "images", 1, 1, 64)
+    if p.seed + p.images - 1 > 4294967295:
+        raise Error("'seed + images - 1' must be <= 4294967295")
+    p.image_index = 0
+    p.image_count = p.images
     # P7 img2img: init image path + creativity (0..1). The backend decides
     # whether/how to honor them (stub echoes; zimage does real img2img).
     p.init_image = _opt_str(obj, "init_image", String(""))
@@ -266,6 +648,9 @@ def parse_generate(
                 raise Error("'lora[" + String(i) + "].name' (string) is required")
             var w = _opt_num(ent, "weight", 1.0, -10.0, 10.0)
             p.loras.append(LoraSpec(ent["name"].as_string(), w))
+    for i in range(len(prompt_syntax.loras)):
+        if not _has_lora(p.loras, prompt_syntax.loras[i].name):
+            p.loras.append(prompt_syntax.loras[i].copy())
 
     # canonical full-param JSON: persisted to the sidecar + jobs.db
     # (key order mirrors the UI's serenity.genparams.v1 emitter, with the
@@ -276,17 +661,20 @@ def parse_generate(
     o.set("model", JSONValue.from_string(p.model))
     o.set("prompt", JSONValue.from_string(p.prompt))
     o.set("prompt_raw", JSONValue.from_string(prompt_raw))
+    o.set("prompt_syntax", _prompt_syntax_json(prompt_syntax))
     o.set("negative", JSONValue.from_string(p.negative))
     o.set("width", JSONValue.from_int(p.width))
     o.set("height", JSONValue.from_int(p.height))
     o.set("steps", JSONValue.from_int(p.steps))
     o.set("seed", JSONValue.from_int(p.seed))
     o.set("cfg", JSONValue.from_float(p.cfg))
-    o.set("sampler", JSONValue.from_string(sampler))
-    o.set("scheduler", JSONValue.from_string(scheduler))
-    o.set("variation_seed", JSONValue.from_int(variation_seed))
-    o.set("variation_strength", JSONValue.from_float(variation_strength))
-    o.set("images", JSONValue.from_int(images))
+    o.set("sampler", JSONValue.from_string(p.sampler))
+    o.set("scheduler", JSONValue.from_string(p.scheduler))
+    o.set("variation_seed", JSONValue.from_int(p.variation_seed))
+    o.set("variation_strength", JSONValue.from_float(p.variation_strength))
+    o.set("images", JSONValue.from_int(p.images))
+    o.set("image_index", JSONValue.from_int(p.image_index))
+    o.set("image_count", JSONValue.from_int(p.image_count))
     o.set("init_image", JSONValue.from_string(p.init_image))
     o.set("creativity", JSONValue.from_float(p.creativity))
     var la = JSONValue.new_array()
@@ -300,6 +688,20 @@ def parse_generate(
     return p^
 
 
+def params_json_for_image_job(
+    base_json: String, job_id: String, seed: Int, image_index: Int, image_count: Int
+) raises -> String:
+    var o = loads(base_json)
+    if not o.is_object():
+        raise Error("internal error: canonical params_json is not an object")
+    o.set("job_id", JSONValue.from_string(job_id))
+    o.set("seed", JSONValue.from_int(seed))
+    o.set("images", JSONValue.from_int(image_count))
+    o.set("image_index", JSONValue.from_int(image_index))
+    o.set("image_count", JSONValue.from_int(image_count))
+    return dumps(o)
+
+
 # ── JSON views of a job ──────────────────────────────────────────────────────
 def job_json_value(j: JobRecord) raises -> JSONValue:
     var o = JSONValue.new_object()
@@ -310,6 +712,8 @@ def job_json_value(j: JobRecord) raises -> JSONValue:
     o.set("progress", JSONValue.from_int(j.progress))
     o.set("step", JSONValue.from_int(j.step))
     o.set("total", JSONValue.from_int(j.total))
+    o.set("image_index", JSONValue.from_int(j.params.image_index))
+    o.set("image_count", JSONValue.from_int(j.params.image_count))
     o.set("output_path", JSONValue.from_string(j.output_path))
     o.set("error", JSONValue.from_string(j.error))
     return o^
@@ -339,6 +743,305 @@ def broadcast(mut ws: Dict[Int, Bool], msg: String):
     var frame = encode_text(msg)
     for e in ws.items():
         send_all_fd(Int32(e.key), frame)
+
+
+# ── gallery/read-params ─────────────────────────────────────────────────────
+def _png_genparams(path: String) raises -> String:
+    """Read the SwarmUI-style Serenity genparams tEXt value from one PNG."""
+    var keywords = List[String]()
+    var values = List[String]()
+    read_png_text(path, keywords, values)
+    for i in range(len(keywords)):
+        if keywords[i] == GENPARAMS_TEXT_KEY:
+            return values[i].copy()
+    return String("")
+
+
+def _png_genparams_or_empty(path: String) -> String:
+    try:
+        return _png_genparams(path)
+    except:
+        return String("")
+
+
+def _ensure_gallery_dirs():
+    _ = _system(
+        String("mkdir -p '") + STATE_DIR + String("' '") + GALLERY_THUMB_DIR + String("'")
+    )
+
+
+def _path_exists_file(path: String) -> Bool:
+    var fd = sys_open(path, O_RDONLY)
+    if fd < 0:
+        return False
+    _ = sys_close(fd)
+    return True
+
+
+def _path_size(path: String) -> Int:
+    var fd = sys_open(path, O_RDONLY)
+    if fd < 0:
+        return 0
+    var n = file_size(fd)
+    _ = sys_close(fd)
+    return n
+
+
+def _unlink_file(path: String) -> Bool:
+    var n = path.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = path.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var rc = Int(external_call["unlink", Int32](BytePtr(unsafe_from_address=Int(buf))))
+    buf.free()
+    return rc == 0
+
+
+def _gallery_state_default() raises -> JSONValue:
+    var o = JSONValue.new_object()
+    o.set("schema", JSONValue.from_string(String("serenity.gallery_state.v1")))
+    o.set("favorites", JSONValue.new_array())
+    return o^
+
+
+def _load_gallery_state() raises -> JSONValue:
+    _ensure_gallery_dirs()
+    try:
+        var text = _read_text_file(String(GALLERY_STATE_PATH))
+        var doc = loads(text)
+        if doc.is_object() and doc.contains("favorites") and doc["favorites"].is_array():
+            return doc^
+    except:
+        pass
+    return _gallery_state_default()
+
+
+def _gallery_favorite(doc: JSONValue, id: String) raises -> Bool:
+    if not doc.contains("favorites") or not doc["favorites"].is_array():
+        return False
+    var arr = doc["favorites"]
+    for i in range(arr.length()):
+        if arr[i].is_string() and arr[i].as_string() == id:
+            return True
+    return False
+
+
+def _set_gallery_favorite_doc(doc: JSONValue, id: String, favorite: Bool) raises -> JSONValue:
+    var out_arr = JSONValue.new_array()
+    var found = False
+    if doc.contains("favorites") and doc["favorites"].is_array():
+        var arr = doc["favorites"]
+        for i in range(arr.length()):
+            if not arr[i].is_string():
+                continue
+            var item = arr[i].as_string()
+            if item == id:
+                found = True
+                if favorite:
+                    out_arr.append(JSONValue.from_string(id))
+            else:
+                out_arr.append(JSONValue.from_string(item))
+    if favorite and not found:
+        out_arr.append(JSONValue.from_string(id))
+    var out = JSONValue.new_object()
+    out.set("schema", JSONValue.from_string(String("serenity.gallery_state.v1")))
+    out.set("favorites", out_arr^)
+    return out^
+
+
+def _save_gallery_state(doc: JSONValue) raises:
+    _ensure_gallery_dirs()
+    _write_text_file(String(GALLERY_STATE_PATH), dumps(doc))
+
+
+def _safe_gallery_id(id: String) -> Bool:
+    return id != "" and id.startswith("job-") and id.find("/") < 0
+
+
+def _gallery_thumb_path(id: String) -> String:
+    return String(GALLERY_THUMB_DIR) + "/" + id + ".png"
+
+
+def _ensure_gallery_thumbnail(id: String, png_path: String) raises -> String:
+    _ensure_gallery_dirs()
+    var thumb_path = _gallery_thumb_path(id)
+    if _path_exists_file(thumb_path):
+        return thumb_path^
+    var img = decode_png(png_path)
+    var tw = 256
+    var th = 256
+    if img.width >= img.height:
+        th = (img.height * 256) // img.width
+        if th < 1:
+            th = 1
+    else:
+        tw = (img.width * 256) // img.height
+        if tw < 1:
+            tw = 1
+    var thumb = resize_lanczos(img, tw, th, 3)
+    encode_png(thumb, thumb_path)
+    return thumb_path^
+
+
+def _copy_json_field_if_present(mut out: JSONValue, src: JSONValue, key: String) raises:
+    if src.is_object() and src.contains(key):
+        out.set(key, src[key])
+
+
+def _gallery_item_from_png_state(
+    id: String, path: String, favorite: Bool, ensure_thumb: Bool,
+) raises -> JSONValue:
+    var params_json = _png_genparams(path)
+    var thumb_path = String("")
+    var thumb_state = String("not_requested")
+    if ensure_thumb and id != "":
+        try:
+            thumb_path = _ensure_gallery_thumbnail(id, path)
+            thumb_state = String("cached")
+        except e:
+            thumb_state = String("error: ") + String(e)
+    var o = JSONValue.new_object()
+    o.set("id", JSONValue.from_string(id))
+    o.set("path", JSONValue.from_string(path))
+    o.set("size", JSONValue.from_int(_path_size(path)))
+    o.set("favorite", JSONValue.from_bool(favorite))
+    o.set("thumbnail_path", JSONValue.from_string(thumb_path))
+    o.set("thumb_path", JSONValue.from_string(thumb_path))
+    o.set("thumbnail", JSONValue.from_string(thumb_path))
+    o.set("thumbnail_state", JSONValue.from_string(thumb_state))
+    o.set("metadata_key", JSONValue.from_string(String(GENPARAMS_TEXT_KEY)))
+    o.set("has_params", JSONValue.from_bool(params_json != ""))
+    o.set("params_json", JSONValue.from_string(params_json))
+    if params_json != "":
+        try:
+            var params = loads(params_json)
+            _copy_json_field_if_present(o, params, String("model"))
+            _copy_json_field_if_present(o, params, String("prompt"))
+            _copy_json_field_if_present(o, params, String("seed"))
+            _copy_json_field_if_present(o, params, String("width"))
+            _copy_json_field_if_present(o, params, String("height"))
+            o.set("params", params^)
+        except e:
+            o.set("params_error", JSONValue.from_string(String(e)))
+    return o^
+
+
+def _gallery_item_from_png(id: String, path: String) raises -> JSONValue:
+    return _gallery_item_from_png_state(id, path, False, True)
+
+
+def _gallery_error_item(id: String, path: String, err: String) raises -> JSONValue:
+    var o = JSONValue.new_object()
+    o.set("id", JSONValue.from_string(id))
+    o.set("path", JSONValue.from_string(path))
+    o.set("size", JSONValue.from_int(_path_size(path)))
+    o.set("favorite", JSONValue.from_bool(False))
+    o.set("thumbnail_path", JSONValue.from_string(String("")))
+    o.set("thumb_path", JSONValue.from_string(String("")))
+    o.set("thumbnail", JSONValue.from_string(String("")))
+    o.set("thumbnail_state", JSONValue.from_string(String("error")))
+    o.set("metadata_key", JSONValue.from_string(String(GENPARAMS_TEXT_KEY)))
+    o.set("has_params", JSONValue.from_bool(False))
+    o.set("params_json", JSONValue.from_string(String("")))
+    o.set("error", JSONValue.from_string(err))
+    return o^
+
+
+def _scan_gallery_ids() -> List[String]:
+    """Return job ids with PNG artifacts in OUT_DIR. The endpoint reads each
+    PNG's tEXt chunk on demand, so this scan is only the gallery file index."""
+    _ensure_gallery_dirs()
+    var cmd = (
+        String("find '") + OUT_DIR + "' -maxdepth 1 -type f -name 'job-*.png'"
+        + " -printf '%f\\n' 2>/dev/null | sort > " + SCAN_PNG_TMP
+    )
+    var ids = List[String]()
+    if _system(cmd) != 0:
+        return ids^
+    try:
+        var text = _read_text_file(String(SCAN_PNG_TMP))
+        for line in text.split("\n"):
+            var f = String(line)
+            if not f.endswith(".png"):
+                continue
+            ids.append(byte_substr(f, 0, f.byte_length() - 4))
+    except:
+        pass
+    return ids^
+
+
+def _string_list_contains(values: List[String], value: String) -> Bool:
+    for i in range(len(values)):
+        if values[i] == value:
+            return True
+    return False
+
+
+def _gallery_id_num_local(id: String) -> Int:
+    if not id.startswith("job-"):
+        return 0
+    try:
+        return Int(byte_substr(id, 4, id.byte_length()))
+    except:
+        return 0
+
+
+def _gallery_search_matches(id: String, path: String, params_json: String, search: String) -> Bool:
+    if search == "":
+        return True
+    return _contains_ci(id, search) or _contains_ci(path, search) or _contains_ci(params_json, search)
+
+
+def _gallery_filter_matches(
+    params_json: String, favorite: Bool, filter: String, favorite_query: String,
+) -> Bool:
+    var favq = String(favorite_query.lower())
+    if favq == "1" or favq == "true" or favq == "yes":
+        if not favorite:
+            return False
+    elif favq == "0" or favq == "false" or favq == "no":
+        if favorite:
+            return False
+    var f = String(filter.lower())
+    if f == "" or f == "all" or f == "any":
+        return True
+    if f == "favorite" or f == "favorites" or f == "star" or f == "starred":
+        return favorite
+    if f == "has_params":
+        return params_json != ""
+    if f == "missing_params":
+        return params_json == ""
+    return _contains_ci(params_json, filter)
+
+
+def _gallery_id_before(a: String, b: String, sort: String, state: JSONValue) raises -> Bool:
+    var s = String(sort.lower())
+    var ap = String(OUT_DIR) + "/" + a + ".png"
+    var bp = String(OUT_DIR) + "/" + b + ".png"
+    if s == "name_asc":
+        return a < b
+    if s == "name_desc":
+        return a > b
+    if s == "created_asc":
+        return _gallery_id_num_local(a) < _gallery_id_num_local(b)
+    if s == "size_asc":
+        var az = _path_size(ap)
+        var bz = _path_size(bp)
+        if az != bz:
+            return az < bz
+    elif s == "size_desc":
+        var az = _path_size(ap)
+        var bz = _path_size(bp)
+        if az != bz:
+            return az > bz
+    elif s == "favorite_desc":
+        var af = _gallery_favorite(state, a)
+        var bf = _gallery_favorite(state, b)
+        if af != bf:
+            return af
+    return _gallery_id_num_local(a) > _gallery_id_num_local(b)
 
 
 # ── jobs.db (the gallery-index seam) ─────────────────────────────────────────
@@ -582,6 +1285,925 @@ def _find_job(jobs: List[JobRecord], id: String) -> Int:
     return -1
 
 
+def _body_object_or_empty(body: String) raises -> JSONValue:
+    if body == "":
+        return JSONValue.new_object()
+    var obj = loads(body)
+    if not obj.is_object():
+        raise Error("body must be a JSON object")
+    return obj^
+
+
+def _required_string_field(obj: JSONValue, key: String) raises -> String:
+    if not obj.contains(key) or not obj[key].is_string():
+        raise Error("'" + key + "' (string) is required")
+    var value = obj[key].as_string()
+    if value == "":
+        raise Error("'" + key + "' must be non-empty")
+    return value
+
+
+def _route_or_body_job_id(
+    path: String, exact_path: String, prefix_len: Int, body: JSONValue,
+) raises -> String:
+    if path == exact_path:
+        return _required_string_field(body, String("id"))
+    var id = byte_substr(path, prefix_len, path.byte_length())
+    if id == "" or id.find("/") >= 0:
+        raise Error("invalid job id in path")
+    return id
+
+
+def _is_active_queued(j: JobRecord) -> Bool:
+    return j.state == "queued" and not j.cancel_requested
+
+
+def _active_queued_count(jobs: List[JobRecord]) -> Int:
+    var count = 0
+    for i in range(len(jobs)):
+        if _is_active_queued(jobs[i]):
+            count += 1
+    return count
+
+
+def _queued_position_of_index(jobs: List[JobRecord], idx: Int) -> Int:
+    var pos = 0
+    for i in range(len(jobs)):
+        if not _is_active_queued(jobs[i]):
+            continue
+        if i == idx:
+            return pos
+        pos += 1
+    return -1
+
+
+def _queued_index_at_position(jobs: List[JobRecord], target: Int) -> Int:
+    var pos = 0
+    for i in range(len(jobs)):
+        if not _is_active_queued(jobs[i]):
+            continue
+        if pos == target:
+            return i
+        pos += 1
+    return -1
+
+
+def _queued_jobs_json(jobs: List[JobRecord]) raises -> JSONValue:
+    var arr = JSONValue.new_array()
+    var pos = 0
+    for i in range(len(jobs)):
+        if not _is_active_queued(jobs[i]):
+            continue
+        var o = JSONValue.new_object()
+        o.set("id", JSONValue.from_string(jobs[i].params.job_id))
+        o.set("position", JSONValue.from_int(pos))
+        arr.append(o^)
+        pos += 1
+    return arr^
+
+
+def _swap_jobs(mut jobs: List[JobRecord], a: Int, b: Int):
+    var tmp = jobs[a].copy()
+    jobs[a] = jobs[b].copy()
+    jobs[b] = tmp^
+
+
+def _move_queued_job_to_position(
+    mut jobs: List[JobRecord], src_idx: Int, target_pos: Int,
+) -> Int:
+    var pos = _queued_position_of_index(jobs, src_idx)
+    while pos > target_pos:
+        var cur = _queued_index_at_position(jobs, pos)
+        var prev = _queued_index_at_position(jobs, pos - 1)
+        if cur < 0 or prev < 0:
+            return pos
+        _swap_jobs(jobs, cur, prev)
+        pos -= 1
+    while pos < target_pos:
+        var cur = _queued_index_at_position(jobs, pos)
+        var nxt = _queued_index_at_position(jobs, pos + 1)
+        if cur < 0 or nxt < 0:
+            return pos
+        _swap_jobs(jobs, cur, nxt)
+        pos += 1
+    return pos
+
+
+def _remove_job_at(mut jobs: List[JobRecord], idx: Int):
+    for i in range(idx, len(jobs) - 1):
+        jobs[i] = jobs[i + 1].copy()
+    _ = jobs.pop()
+
+
+def _reorder_target_position(
+    jobs: List[JobRecord], src_idx: Int, body: JSONValue,
+) raises -> Int:
+    var count = _active_queued_count(jobs)
+    var src_pos = _queued_position_of_index(jobs, src_idx)
+    if count <= 0 or src_pos < 0:
+        raise Error("job is not in the active queue")
+    if body.contains("before_id") and not body["before_id"].is_null():
+        if not body["before_id"].is_string():
+            raise Error("'before_id' must be a string")
+        var before_id = body["before_id"].as_string()
+        if before_id == jobs[src_idx].params.job_id:
+            return src_pos
+        var before_idx = _find_job(jobs, before_id)
+        if before_idx < 0:
+            raise Error("no such before_id: " + before_id)
+        if not _is_active_queued(jobs[before_idx]):
+            raise Error("'before_id' is not an active queued job: " + before_id)
+        var before_pos = _queued_position_of_index(jobs, before_idx)
+        if before_pos > src_pos:
+            before_pos -= 1
+        return before_pos
+    if not body.contains("position") or not body["position"].is_int():
+        raise Error("'position' (integer) or 'before_id' (string) is required")
+    var target = body["position"].as_int()
+    if target < 0 or target >= count:
+        raise Error("'position' out of range [0.." + String(count - 1) + "]")
+    return target
+
+
+# ── presets / last UI state ─────────────────────────────────────────────────
+def _ensure_state_dir():
+    _ = _system(String("mkdir -p '") + STATE_DIR + "'")
+
+
+def _write_text_file(path: String, text: String) raises:
+    _ensure_state_dir()
+    with open(path, "w") as f:
+        f.write(text)
+
+
+# ── video product contract / artifact probe ─────────────────────────────────
+def _shell_quote(s: String) -> String:
+    """Single-quote a shell argument. Paths in this project are ASCII."""
+    var q = String("'")
+    var bytes = s.as_bytes()
+    for i in range(s.byte_length()):
+        if Int(bytes[i]) == 39:
+            q += String("'\\''")
+        else:
+            q += chr(Int(bytes[i]))
+    q += String("'")
+    return q^
+
+
+def _json_field_string(obj: JSONValue, key: String) raises -> String:
+    if not obj.is_object() or not obj.contains(key) or obj[key].is_null():
+        return String("")
+    var v = obj[key]
+    if v.is_string():
+        return v.as_string()
+    if v.is_int():
+        return String(v.as_int())
+    if v.is_number():
+        return String(v.as_float())
+    return String("")
+
+
+def _json_field_float(obj: JSONValue, key: String, dflt: Float64) raises -> Float64:
+    if not obj.is_object() or not obj.contains(key) or obj[key].is_null():
+        return dflt
+    var v = obj[key]
+    if v.is_number():
+        return v.as_float()
+    if v.is_string():
+        var s = String(v.as_string().strip())
+        if s == "" or s == "N/A":
+            return dflt
+        try:
+            return Float64(s)
+        except:
+            return dflt
+    return dflt
+
+
+def _json_field_int(obj: JSONValue, key: String, dflt: Int) raises -> Int:
+    if not obj.is_object() or not obj.contains(key) or obj[key].is_null():
+        return dflt
+    var v = obj[key]
+    if v.is_int():
+        return v.as_int()
+    if v.is_number():
+        return Int(v.as_float())
+    if v.is_string():
+        var s = String(v.as_string().strip())
+        if s == "" or s == "N/A":
+            return dflt
+        try:
+            return Int(s)
+        except:
+            return dflt
+    return dflt
+
+
+def _fps_from_rate(rate: String) -> Float64:
+    var r = String(rate.strip())
+    if r == "" or r == "N/A":
+        return 0.0
+    var slash = r.find("/")
+    try:
+        if slash > 0:
+            var num = Float64(String(byte_substr(r, 0, slash)))
+            var den = Float64(String(byte_substr(r, slash + 1, r.byte_length())))
+            if den == 0.0:
+                return 0.0
+            return num / den
+        return Float64(r)
+    except:
+        return 0.0
+
+
+def _video_readiness_doc(
+    backend_name: String, model_name: String, resident: String,
+) raises -> JSONValue:
+    var runners = JSONValue.new_array()
+
+    var lance = JSONValue.new_object()
+    lance.set("model", JSONValue.from_string(String("lance_t2v")))
+    lance.set("status", JSONValue.from_string(String("smoke_only")))
+    lance.set(
+        "runner",
+        JSONValue.from_string(
+            String("serenitymojo/pipeline/lance_t2v_256_9f_dense_probe.mojo")
+        ),
+    )
+    lance.set(
+        "limit",
+        JSONValue.from_string(
+            String("standalone pipeline artifact gate; not daemon job-backed")
+        ),
+    )
+    runners.append(lance^)
+
+    var ltx2 = JSONValue.new_object()
+    ltx2.set("model", JSONValue.from_string(String("ltx2_t2v_av")))
+    var ltx2_ready = _video_runner_available()
+    ltx2.set(
+        "status",
+        JSONValue.from_string(
+            String("bounded_smoke_ready") if ltx2_ready else String("runner_missing")
+        ),
+    )
+    ltx2.set("runner", JSONValue.from_string(String(LTX2_VIDEO_SMOKE_RUNNER)))
+    ltx2.set("mode", JSONValue.from_string(String("staged lora stream audio nonag")))
+    ltx2.set("default_steps", JSONValue.from_int(1))
+    ltx2.set("target_width", JSONValue.from_int(768))
+    ltx2.set("target_height", JSONValue.from_int(512))
+    ltx2.set("target_frame_count", JSONValue.from_int(121))
+    ltx2.set("target_fps", JSONValue.from_int(24))
+    ltx2.set(
+        "limit",
+        JSONValue.from_string(
+            String("bounded daemon smoke only; accepted video parity still requires a successful MP4 probe with timings and VRAM evidence")
+        ),
+    )
+    runners.append(ltx2^)
+
+    var o = JSONValue.new_object()
+    o.set("schema", JSONValue.from_string(String("serenity.video_status.v1")))
+    o.set("endpoint", JSONValue.from_string(String("/v1/video")))
+    o.set(
+        "state",
+        JSONValue.from_string(
+            String("bounded_smoke_ready") if ltx2_ready else String("runner_missing")
+        ),
+    )
+    o.set(
+        "readiness_label",
+        JSONValue.from_string(
+            String("bounded_daemon_smoke") if ltx2_ready else String("build_required")
+        ),
+    )
+    o.set("accepted", JSONValue.from_bool(False))
+    o.set("backend", JSONValue.from_string(backend_name))
+    o.set("model", JSONValue.from_string(model_name))
+    o.set("resident", JSONValue.from_string(resident))
+    o.set("mp4", JSONValue.from_string(String("")))
+    o.set("frame_count", JSONValue.from_int(0))
+    o.set("duration", JSONValue.from_float(0.0))
+    o.set("audio", JSONValue.from_bool(False))
+    o.set(
+        "non_acceptance_reason",
+        JSONValue.from_string(
+            String(
+                "bounded smoke wiring is not full SwarmUI video parity until a real MP4 has frame_count, duration, muxing, audio behavior, timings, and VRAM evidence"
+            )
+        ),
+    )
+    o.set(
+        "probe_endpoint",
+        JSONValue.from_string(String("/v1/video/probe?path=<mp4>")),
+    )
+    o.set("candidate_runners", runners^)
+    return o^
+
+
+def _video_runner_available() -> Bool:
+    return _system(String("test -x ") + _shell_quote(String(LTX2_VIDEO_SMOKE_RUNNER))) == 0
+
+
+def _probe_video_file(mp4_path: String) raises -> JSONValue:
+    if mp4_path == "":
+        raise Error("'path' query parameter is required")
+    if mp4_path.find("\n") >= 0 or mp4_path.find("\r") >= 0:
+        raise Error("invalid video path")
+    _ensure_gallery_dirs()
+    if _system(String("command -v ffprobe >/dev/null 2>&1")) != 0:
+        raise Error("ffprobe is not available on PATH")
+
+    var cmd = (
+        String("ffprobe -v error -count_frames ")
+        + String("-show_entries ")
+        + String("stream=index,codec_type,codec_name,width,height,nb_frames,")
+        + String("nb_read_frames,duration,avg_frame_rate ")
+        + String("-show_entries format=duration,format_name ")
+        + String("-of json ")
+        + _shell_quote(mp4_path)
+        + String(" > ")
+        + _shell_quote(String(VIDEO_PROBE_TMP))
+        + String(" 2> ")
+        + _shell_quote(String(VIDEO_PROBE_ERR))
+    )
+    var rc = _system(cmd)
+    if rc != 0:
+        var err = String("")
+        try:
+            err = _read_text_file(String(VIDEO_PROBE_ERR))
+        except:
+            pass
+        if err == "":
+            err = String("ffprobe failed")
+        raise Error(err)
+
+    var probe = loads(_read_text_file(String(VIDEO_PROBE_TMP)))
+    var format_duration = 0.0
+    var format_name = String("")
+    if probe.is_object() and probe.contains("format") and probe["format"].is_object():
+        format_duration = _json_field_float(probe["format"], String("duration"), 0.0)
+        format_name = _json_field_string(probe["format"], String("format_name"))
+
+    var has_video = False
+    var has_audio = False
+    var width = 0
+    var height = 0
+    var frame_count = 0
+    var duration = 0.0
+    var fps = 0.0
+    var video_codec = String("")
+    var audio_codec = String("")
+    var audio_duration = 0.0
+    var stream_count = 0
+
+    if probe.is_object() and probe.contains("streams") and probe["streams"].is_array():
+        var streams = probe["streams"]
+        stream_count = streams.length()
+        for i in range(streams.length()):
+            var s = streams[i]
+            if not s.is_object():
+                continue
+            var typ = _json_field_string(s, String("codec_type"))
+            if typ == "video" and not has_video:
+                has_video = True
+                width = _json_field_int(s, String("width"), 0)
+                height = _json_field_int(s, String("height"), 0)
+                video_codec = _json_field_string(s, String("codec_name"))
+                duration = _json_field_float(s, String("duration"), 0.0)
+                fps = _fps_from_rate(_json_field_string(s, String("avg_frame_rate")))
+                frame_count = _json_field_int(s, String("nb_read_frames"), 0)
+                if frame_count <= 0:
+                    frame_count = _json_field_int(s, String("nb_frames"), 0)
+                if frame_count <= 0 and duration > 0.0 and fps > 0.0:
+                    frame_count = Int(duration * fps + 0.5)
+            elif typ == "audio" and not has_audio:
+                has_audio = True
+                audio_codec = _json_field_string(s, String("codec_name"))
+                audio_duration = _json_field_float(s, String("duration"), 0.0)
+
+    if duration <= 0.0:
+        duration = format_duration
+
+    var o = JSONValue.new_object()
+    o.set("schema", JSONValue.from_string(String("serenity.video_probe.v1")))
+    o.set("mp4", JSONValue.from_string(mp4_path))
+    o.set("format_name", JSONValue.from_string(format_name))
+    o.set("stream_count", JSONValue.from_int(stream_count))
+    o.set("has_video", JSONValue.from_bool(has_video))
+    o.set("has_audio", JSONValue.from_bool(has_audio))
+    o.set("audio", JSONValue.from_bool(has_audio))
+    o.set("width", JSONValue.from_int(width))
+    o.set("height", JSONValue.from_int(height))
+    o.set("frame_count", JSONValue.from_int(frame_count))
+    o.set("duration", JSONValue.from_float(duration))
+    o.set("fps", JSONValue.from_float(fps))
+    o.set("video_codec", JSONValue.from_string(video_codec))
+    o.set("audio_codec", JSONValue.from_string(audio_codec))
+    o.set("audio_duration", JSONValue.from_float(audio_duration))
+    if has_video and frame_count > 0 and duration > 0.0:
+        o.set("muxing", JSONValue.from_string(String("probe_ok")))
+    else:
+        o.set("muxing", JSONValue.from_string(String("incomplete_probe")))
+    if has_audio:
+        o.set("audio_behavior", JSONValue.from_string(String("audio_stream_present")))
+    else:
+        o.set("audio_behavior", JSONValue.from_string(String("video_only_no_audio_stream")))
+    return o^
+
+
+def _ltx2_staged_smoke_video_result(
+    body: JSONValue, video_id: String, backend_name: String,
+    model_name: String, resident: String,
+) raises -> JSONValue:
+    var runner = _opt_str(body, "runner", String("ltx2_staged_dev_smoke"))
+    if runner != "ltx2_staged_dev_smoke":
+        raise Error(
+            "unsupported video runner '" + runner
+            + "'; supported runner is ltx2_staged_dev_smoke"
+        )
+    var steps = _opt_int(body, "steps", 1, 1, 3)
+    if not _video_runner_available():
+        raise Error(
+            String("missing executable ") + String(LTX2_VIDEO_SMOKE_RUNNER)
+            + String("; run `pixi run build-video-smoke` first")
+        )
+
+    var out_dir = String(OUT_DIR) + String("/") + video_id
+    var log_path = out_dir + String("/ltx2_video_runner.log")
+    var mp4_path = out_dir + String("/ltx2_t2v_av_stage2_dev_smoke.mp4")
+    var wav_path = out_dir + String("/dev_audio.wav")
+    var manifest_path = out_dir + String("/ltx2_video_result.json")
+    _ = _system(String("mkdir -p ") + _shell_quote(out_dir))
+
+    var cmd = (
+        _shell_quote(String(LTX2_VIDEO_SMOKE_RUNNER))
+        + String(" staged lora stream audio nonag ")
+        + _shell_quote(out_dir)
+        + String(" ")
+        + String(steps)
+        + String(" > ")
+        + _shell_quote(log_path)
+        + String(" 2>&1")
+    )
+    var t0 = perf_counter_ns()
+    var rc = _system(cmd)
+    var wall = Float64(perf_counter_ns() - t0) / 1.0e9
+
+    var o = JSONValue.new_object()
+    o.set("schema", JSONValue.from_string(String("serenity.video_result.v1")))
+    o.set("video_id", JSONValue.from_string(video_id))
+    o.set("runner", JSONValue.from_string(runner))
+    o.set("backend", JSONValue.from_string(backend_name))
+    o.set("model", JSONValue.from_string(model_name))
+    o.set("resident", JSONValue.from_string(resident))
+    o.set("readiness_label", JSONValue.from_string(String("bounded_daemon_smoke")))
+    o.set("accepted_video_parity", JSONValue.from_bool(False))
+    o.set("accepted_sampler_parity", JSONValue.from_bool(False))
+    o.set("steps", JSONValue.from_int(steps))
+    o.set("mode", JSONValue.from_string(String("staged lora stream audio nonag")))
+    o.set("exit_code", JSONValue.from_int(rc))
+    o.set("out_dir", JSONValue.from_string(out_dir))
+    o.set("mp4", JSONValue.from_string(mp4_path))
+    o.set("wav", JSONValue.from_string(wav_path))
+    o.set("log_path", JSONValue.from_string(log_path))
+    o.set("result_path", JSONValue.from_string(manifest_path))
+    o.set("total_wall_seconds", JSONValue.from_float(wall))
+    o.set(
+        "note",
+        JSONValue.from_string(
+            String(
+                "Daemon-backed LTX2 staged dev smoke. This proves product wiring "
+                + "only when exit_code is zero and probe.muxing is probe_ok; it "
+                + "does not claim full video parity."
+            )
+        ),
+    )
+
+    if rc != 0:
+        o.set("state", JSONValue.from_string(String("failed")))
+        o.set(
+            "error",
+            JSONValue.from_string(
+                String("LTX2 staged smoke runner failed; inspect log_path")
+            ),
+        )
+        _write_text_file(manifest_path, dumps(o))
+        return o^
+
+    try:
+        var probe = _probe_video_file(mp4_path)
+        o.set("probe", probe.copy())
+        o.set("state", JSONValue.from_string(String("done")))
+        o.set("width", probe["width"])
+        o.set("height", probe["height"])
+        o.set("frame_count", probe["frame_count"])
+        o.set("duration", probe["duration"])
+        o.set("fps", probe["fps"])
+        o.set("audio", probe["audio"])
+        o.set("muxing", probe["muxing"])
+    except e:
+        o.set("state", JSONValue.from_string(String("failed_probe")))
+        o.set("error", JSONValue.from_string(String(e)))
+
+    _write_text_file(manifest_path, dumps(o))
+    return o^
+
+
+def _default_state_doc() -> JSONValue:
+    var state = JSONValue.new_object()
+    var o = JSONValue.new_object()
+    o.set("schema", JSONValue.from_string(String("serenity.ui_state.v1")))
+    o.set("state", state^)
+    return o^
+
+
+def _default_presets_doc() -> JSONValue:
+    var arr = JSONValue.new_array()
+    var o = JSONValue.new_object()
+    o.set("schema", JSONValue.from_string(String("serenity.presets.v1")))
+    o.set("presets", arr^)
+    return o^
+
+
+def _load_state_doc() -> JSONValue:
+    try:
+        var text = _read_text_file(String(STATE_PATH))
+        var doc = loads(text)
+        if doc.is_object() and doc.contains("state") and doc["state"].is_object():
+            return doc^
+    except:
+        pass
+    return _default_state_doc()
+
+
+def _load_presets_doc() -> JSONValue:
+    try:
+        var text = _read_text_file(String(PRESETS_PATH))
+        var doc = loads(text)
+        if doc.is_object() and doc.contains("presets") and doc["presets"].is_array():
+            return doc^
+    except:
+        pass
+    return _default_presets_doc()
+
+
+def _state_doc_from_body(body: String) raises -> JSONValue:
+    var obj = loads(body)
+    if not obj.is_object():
+        raise Error("state body must be a JSON object")
+    var state: JSONValue
+    if obj.contains("state"):
+        if not obj["state"].is_object():
+            raise Error("'state' must be an object")
+        state = obj["state"]
+    else:
+        state = obj.copy()
+    var out = JSONValue.new_object()
+    out.set("schema", JSONValue.from_string(String("serenity.ui_state.v1")))
+    out.set("state", state^)
+    return out^
+
+
+def _preset_name_from_path(path: String, prefix_len: Int) raises -> String:
+    var name = byte_substr(path, prefix_len, path.byte_length())
+    if name == "" or name.find("/") >= 0:
+        raise Error("invalid preset name in path")
+    return name
+
+
+def _preset_params_from_body(body: JSONValue) raises -> JSONValue:
+    if body.contains("params"):
+        if not body["params"].is_object():
+            raise Error("'params' must be an object")
+        return body["params"]
+    return body.copy()
+
+
+def _preset_entry(name: String, params: JSONValue) -> JSONValue:
+    var o = JSONValue.new_object()
+    o.set("name", JSONValue.from_string(name))
+    o.set("params", params.copy())
+    return o^
+
+
+def _preset_exists(doc: JSONValue, name: String) raises -> Bool:
+    if not doc.contains("presets") or not doc["presets"].is_array():
+        return False
+    var arr = doc["presets"]
+    for i in range(arr.length()):
+        var ent = arr[i]
+        if ent.is_object() and ent.contains("name") and ent["name"].as_string() == name:
+            return True
+    return False
+
+
+def _preset_by_name(doc: JSONValue, name: String) raises -> JSONValue:
+    var arr = doc["presets"]
+    for i in range(arr.length()):
+        var ent = arr[i]
+        if ent.is_object() and ent.contains("name") and ent["name"].as_string() == name:
+            return ent^
+    raise Error("no such preset: " + name)
+
+
+def _upsert_preset_doc(
+    doc: JSONValue, name: String, params: JSONValue,
+) raises -> JSONValue:
+    var arr = doc["presets"]
+    var out_arr = JSONValue.new_array()
+    var replaced = False
+    for i in range(arr.length()):
+        var ent = arr[i]
+        if ent.is_object() and ent.contains("name") and ent["name"].as_string() == name:
+            out_arr.append(_preset_entry(name, params))
+            replaced = True
+        else:
+            out_arr.append(ent^)
+    if not replaced:
+        out_arr.append(_preset_entry(name, params))
+    var out = JSONValue.new_object()
+    out.set("schema", JSONValue.from_string(String("serenity.presets.v1")))
+    out.set("presets", out_arr^)
+    return out^
+
+
+def _delete_preset_doc(doc: JSONValue, name: String) raises -> JSONValue:
+    var arr = doc["presets"]
+    var out_arr = JSONValue.new_array()
+    for i in range(arr.length()):
+        var ent = arr[i]
+        if ent.is_object() and ent.contains("name") and ent["name"].as_string() == name:
+            continue
+        out_arr.append(ent^)
+    var out = JSONValue.new_object()
+    out.set("schema", JSONValue.from_string(String("serenity.presets.v1")))
+    out.set("presets", out_arr^)
+    return out^
+
+
+# ── model/LoRA browser cards ────────────────────────────────────────────────
+def _contains_ci(text: String, query: String) -> Bool:
+    if query == "":
+        return True
+    return String(text.lower()).find(String(query.lower())) >= 0
+
+
+def _entry_arch(entry: ScanEntry) -> String:
+    if entry.arch == "":
+        return String("unknown")
+    return entry.arch.copy()
+
+
+def _browser_filter_matches(value: String, filter: String) -> Bool:
+    if filter == "":
+        return True
+    var f = String(filter.lower())
+    if f == "all" or f == "any":
+        return True
+    return String(value.lower()).find(f) >= 0
+
+
+def _model_matches_browser(entry: ScanEntry, search: String, filter: String) -> Bool:
+    if search != "":
+        if (
+            not _contains_ci(entry.name, search)
+            and not _contains_ci(entry.path, search)
+            and not _contains_ci(_entry_arch(entry), search)
+        ):
+            return False
+    return _browser_filter_matches(_entry_arch(entry), filter)
+
+
+def _lora_matches_browser(entry: ScanEntry, search: String, filter: String) -> Bool:
+    if search != "":
+        if (
+            not _contains_ci(entry.name, search)
+            and not _contains_ci(entry.path, search)
+            and not _contains_ci(_entry_arch(entry), search)
+        ):
+            return False
+    return _browser_filter_matches(_entry_arch(entry), filter)
+
+
+def _scan_entry_before(a: ScanEntry, b: ScanEntry, sort: String) -> Bool:
+    var s = String(sort.lower())
+    var an = String(a.name.lower())
+    var bn = String(b.name.lower())
+    if s == "size" or s == "size_desc":
+        if a.size != b.size:
+            return a.size > b.size
+    elif s == "size_asc":
+        if a.size != b.size:
+            return a.size < b.size
+    elif s == "name_desc":
+        if an != bn:
+            return an > bn
+    elif s == "arch" or s == "family":
+        var aa = String(_entry_arch(a).lower())
+        var ba = String(_entry_arch(b).lower())
+        if aa != ba:
+            return aa < ba
+    if an != bn:
+        return an < bn
+    return a.path < b.path
+
+
+def _int_list_contains(values: List[Int], value: Int) -> Bool:
+    for i in range(len(values)):
+        if values[i] == value:
+            return True
+    return False
+
+
+def _model_lora_compatible(model_arch: String, target_arch: String) -> Bool:
+    var m = String(model_arch.lower())
+    var t = String(target_arch.lower())
+    if t == "" or t == "unknown" or m == "" or m == "unknown":
+        return False
+    return m == t
+
+
+def _model_arch_for(models: List[ScanEntry], model: String) -> String:
+    if model == "":
+        return String("")
+    var needle = String(model.lower())
+    for i in range(len(models)):
+        if String(models[i].name.lower()) == needle or String(models[i].path.lower()) == needle:
+            return _entry_arch(models[i])
+    return model.copy()
+
+
+def _compatible_models_json(lora: ScanEntry, models: List[ScanEntry]) raises -> JSONValue:
+    var arr = JSONValue.new_array()
+    var target_arch = _entry_arch(lora)
+    for i in range(len(models)):
+        if _model_lora_compatible(_entry_arch(models[i]), target_arch):
+            arr.append(JSONValue.from_string(models[i].name))
+    return arr^
+
+
+def _lora_incompatible_reason(
+    selected_model: String, selected_arch: String, target_arch: String, compatible: Bool,
+) -> String:
+    if selected_model == "":
+        return String("no model selected")
+    if target_arch == "unknown":
+        return String("unknown LoRA target_arch")
+    if selected_arch == "" or selected_arch == "unknown":
+        return String("unknown selected model arch")
+    if not compatible:
+        return String("target_arch ") + target_arch + String(" is not compatible with model arch ") + selected_arch
+    return String("")
+
+
+def _model_entry_json(entry: ScanEntry, resident: String) raises -> JSONValue:
+    var arch = _entry_arch(entry)
+    var loaded = resident != "" and entry.name == resident
+    var metadata = JSONValue.new_object()
+    metadata.set("schema", JSONValue.from_string(String("serenity.model.metadata.v1")))
+    metadata.set("source", JSONValue.from_string(String("disk_scan")))
+    metadata.set("family", JSONValue.from_string(arch))
+    metadata.set("notes", JSONValue.from_string(String("")))
+
+    var card = JSONValue.new_object()
+    card.set("schema", JSONValue.from_string(String("serenity.model.card.v1")))
+    card.set("title", JSONValue.from_string(entry.name))
+    card.set("subtitle", JSONValue.from_string(arch))
+    card.set("path", JSONValue.from_string(entry.path))
+    card.set("size", JSONValue.from_int(entry.size))
+    card.set("thumbnail", JSONValue.from_string(String("")))
+    card.set("preview", JSONValue.from_string(String("")))
+    card.set("favorite", JSONValue.from_bool(False))
+    card.set("loaded", JSONValue.from_bool(loaded))
+    card.set("metadata", metadata.copy())
+
+    var mo = JSONValue.new_object()
+    mo.set("name", JSONValue.from_string(entry.name))
+    mo.set("path", JSONValue.from_string(entry.path))
+    mo.set("arch", JSONValue.from_string(arch))
+    mo.set("size", JSONValue.from_int(entry.size))
+    mo.set("loaded", JSONValue.from_bool(loaded))
+    mo.set("type", JSONValue.from_string(String("checkpoint")))
+    mo.set("thumbnail", JSONValue.from_string(String("")))
+    mo.set("preview", JSONValue.from_string(String("")))
+    mo.set("favorite", JSONValue.from_bool(False))
+    mo.set("metadata", metadata^)
+    mo.set("card", card^)
+    return mo^
+
+
+def _lora_entry_json(
+    entry: ScanEntry, models: List[ScanEntry], selected_model: String, selected_arch: String,
+) raises -> JSONValue:
+    var target_arch = _entry_arch(entry)
+    var compatible = _model_lora_compatible(selected_arch, target_arch)
+    var incompatible_reason = _lora_incompatible_reason(
+        selected_model, selected_arch, target_arch, compatible,
+    )
+    var compatibility = JSONValue.new_object()
+    compatibility.set("compatible", JSONValue.from_bool(compatible))
+    compatibility.set("model", JSONValue.from_string(selected_model))
+    compatibility.set("model_arch", JSONValue.from_string(selected_arch))
+    compatibility.set("target_arch", JSONValue.from_string(target_arch))
+    compatibility.set("incompatible_reason", JSONValue.from_string(incompatible_reason))
+
+    var metadata = JSONValue.new_object()
+    metadata.set("schema", JSONValue.from_string(String("serenity.lora.metadata.v1")))
+    metadata.set("source", JSONValue.from_string(String("safetensors_header_probe")))
+    metadata.set("target_arch", JSONValue.from_string(target_arch))
+    metadata.set("trigger", JSONValue.from_string(String("")))
+
+    var card = JSONValue.new_object()
+    card.set("schema", JSONValue.from_string(String("serenity.lora.card.v1")))
+    card.set("title", JSONValue.from_string(entry.name))
+    card.set("subtitle", JSONValue.from_string(target_arch))
+    card.set("path", JSONValue.from_string(entry.path))
+    card.set("size", JSONValue.from_int(entry.size))
+    card.set("thumbnail", JSONValue.from_string(String("")))
+    card.set("preview", JSONValue.from_string(String("")))
+    card.set("favorite", JSONValue.from_bool(False))
+    card.set("metadata", metadata.copy())
+    card.set("compatibility", compatibility.copy())
+
+    var lo = JSONValue.new_object()
+    lo.set("name", JSONValue.from_string(entry.name))
+    lo.set("path", JSONValue.from_string(entry.path))
+    lo.set("size", JSONValue.from_int(entry.size))
+    lo.set("arch", JSONValue.from_string(target_arch))
+    lo.set("target_arch", JSONValue.from_string(target_arch))
+    lo.set("trigger", JSONValue.from_string(String("")))
+    lo.set("thumbnail", JSONValue.from_string(String("")))
+    lo.set("preview", JSONValue.from_string(String("")))
+    lo.set("favorite", JSONValue.from_bool(False))
+    lo.set("compatible_models", _compatible_models_json(entry, models))
+    lo.set("compatible", JSONValue.from_bool(compatible))
+    lo.set("compatibility", compatibility^)
+    lo.set("incompatible_reason", JSONValue.from_string(incompatible_reason))
+    lo.set("metadata", metadata^)
+    lo.set("card", card^)
+    return lo^
+
+
+def _models_array_json(
+    models: List[ScanEntry], search: String, filter: String, sort: String, resident: String,
+) raises -> JSONValue:
+    var arr = JSONValue.new_array()
+    var emitted = List[Int]()
+    while True:
+        var best = -1
+        for i in range(len(models)):
+            if _int_list_contains(emitted, i):
+                continue
+            if not _model_matches_browser(models[i], search, filter):
+                continue
+            if best < 0 or _scan_entry_before(models[i], models[best], sort):
+                best = i
+        if best < 0:
+            break
+        emitted.append(best)
+        arr.append(_model_entry_json(models[best], resident))
+    return arr^
+
+
+def _loras_array_json(
+    loras: List[ScanEntry], models: List[ScanEntry], search: String, filter: String,
+    sort: String, selected_model: String, selected_arch: String,
+) raises -> JSONValue:
+    var arr = JSONValue.new_array()
+    var emitted = List[Int]()
+    while True:
+        var best = -1
+        for i in range(len(loras)):
+            if _int_list_contains(emitted, i):
+                continue
+            if not _lora_matches_browser(loras[i], search, filter):
+                continue
+            if best < 0 or _scan_entry_before(loras[i], loras[best], sort):
+                best = i
+        if best < 0:
+            break
+        emitted.append(best)
+        arr.append(_lora_entry_json(loras[best], models, selected_model, selected_arch))
+    return arr^
+
+
+def _models_query_json(
+    search: String, filter: String, sort: String, lora_search: String,
+    lora_filter: String, lora_sort: String, selected_model: String,
+) raises -> JSONValue:
+    var o = JSONValue.new_object()
+    o.set("search", JSONValue.from_string(search))
+    o.set("filter", JSONValue.from_string(filter))
+    o.set("sort", JSONValue.from_string(sort))
+    o.set("q", JSONValue.from_string(search))
+    o.set("lora_search", JSONValue.from_string(lora_search))
+    o.set("lora_filter", JSONValue.from_string(lora_filter))
+    o.set("lora_sort", JSONValue.from_string(lora_sort))
+    o.set("model", JSONValue.from_string(selected_model))
+    return o^
+
+
 def handle_api(
     mut jobs: List[JobRecord], mut njobs: Int, running: Int,
     backend_name: String, model_name: String, resident: String, req: Request,
@@ -602,28 +2224,260 @@ def handle_api(
         # list stays correct when files are added/removed while running)
         var models = scan_checkpoints()
         var loras = scan_loras()
-        var ma = JSONValue.new_array()
-        for i in range(len(models)):
-            var mo = JSONValue.new_object()
-            mo.set("name", JSONValue.from_string(models[i].name))
-            mo.set("path", JSONValue.from_string(models[i].path))
-            mo.set("arch", JSONValue.from_string(models[i].arch))
-            mo.set("size", JSONValue.from_int(models[i].size))
-            mo.set("loaded", JSONValue.from_bool(
-                resident != "" and models[i].name == resident
-            ))
-            ma.append(mo^)
-        var la = JSONValue.new_array()
-        for i in range(len(loras)):
-            var lo = JSONValue.new_object()
-            lo.set("name", JSONValue.from_string(loras[i].name))
-            lo.set("path", JSONValue.from_string(loras[i].path))
-            lo.set("size", JSONValue.from_int(loras[i].size))
-            la.append(lo^)
+        var search = req.query("search")
+        var q = req.query("q")
+        if search == "" and q != "":
+            search = q.copy()
+        var filter = req.query("filter")
+        var sort = req.query("sort")
+        var lora_search = req.query("lora_search")
+        if lora_search == "":
+            lora_search = search.copy()
+        var lora_filter = req.query("lora_filter")
+        var lora_sort = req.query("lora_sort")
+        if lora_sort == "":
+            lora_sort = sort.copy()
+        var selected_model = req.query("model")
+        if selected_model == "":
+            selected_model = resident.copy()
+        var selected_arch = _model_arch_for(models, selected_model)
+        # Browser card response fields emitted by helper JSON:
+        # "card" "thumbnail" "metadata" "favorite" "preview"
+        # LoRA metadata/compatibility fields:
+        # "target_arch" "trigger" "compatible_models" "compatible"
+        # "compatibility" "incompatible_reason"
+        var ma = _models_array_json(models, search, filter, sort, resident)
+        var la = _loras_array_json(
+            loras, models, lora_search, lora_filter, lora_sort,
+            selected_model, selected_arch,
+        )
         var o = JSONValue.new_object()
+        o.set("schema", JSONValue.from_string(String("serenity.models.v1")))
+        o.set("query", _models_query_json(
+            search, filter, sort, lora_search, lora_filter, lora_sort,
+            selected_model,
+        ))
+        o.set("models_total", JSONValue.from_int(len(models)))
+        o.set("loras_total", JSONValue.from_int(len(loras)))
+        o.set("model_selected", JSONValue.from_string(selected_model))
+        o.set("model_selected_arch", JSONValue.from_string(selected_arch))
         o.set("models", ma^)
         o.set("loras", la^)
         return json_response(200, dumps(o))
+
+    if req.method == "GET" and path == "/v1/samplers":
+        return json_response(200, swarmui_sampler_registry_json())
+
+    if req.method == "GET" and path == "/v1/video":
+        var doc = _video_readiness_doc(backend_name, model_name, resident)
+        return json_response(200, dumps(doc))
+
+    if req.method == "POST" and path == "/v1/video":
+        try:
+            var body = _body_object_or_empty(req.body)
+            njobs += 1
+            var video_id = String("video-") + _pad4(njobs)
+            var doc = _ltx2_staged_smoke_video_result(
+                body, video_id, backend_name, model_name, resident,
+            )
+            var status = 200
+            if doc.contains("state") and doc["state"].is_string():
+                var state = doc["state"].as_string()
+                if state == "failed" or state == "failed_probe":
+                    status = 500
+            return json_response(status, dumps(doc))
+        except e:
+            return error_response(422, String(e))
+
+    if req.method == "GET" and path == "/v1/video/probe":
+        var mp4_path = req.query("path")
+        try:
+            var doc = _probe_video_file(mp4_path)
+            return json_response(200, dumps(doc))
+        except e:
+            return error_response(422, "cannot probe MP4: " + String(e))
+
+    if req.method == "GET" and path == "/v1/gallery":
+        var search = req.query("search")
+        var q = req.query("q")
+        if search == "" and q != "":
+            search = q.copy()
+        var filter = req.query("filter")
+        var sort = req.query("sort")
+        var favorite_query = req.query("favorite")
+        var state = _load_gallery_state()
+        var ids = _scan_gallery_ids()
+        var arr = JSONValue.new_array()
+        var emitted = List[String]()
+        while True:
+            var best = String("")
+            for i in range(len(ids)):
+                if _string_list_contains(emitted, ids[i]):
+                    continue
+                var png_path = String(OUT_DIR) + "/" + ids[i] + ".png"
+                var params_json = _png_genparams_or_empty(png_path)
+                var fav = _gallery_favorite(state, ids[i])
+                if not _gallery_search_matches(ids[i], png_path, params_json, search):
+                    continue
+                if not _gallery_filter_matches(params_json, fav, filter, favorite_query):
+                    continue
+                if best == "" or _gallery_id_before(ids[i], best, sort, state):
+                    best = ids[i].copy()
+            if best == "":
+                break
+            emitted.append(best)
+            var png_path = String(OUT_DIR) + "/" + best + ".png"
+            try:
+                arr.append(_gallery_item_from_png_state(
+                    best, png_path, _gallery_favorite(state, best), True,
+                ))
+            except e:
+                arr.append(_gallery_error_item(best, png_path, String(e)))
+        var o = JSONValue.new_object()
+        o.set("schema", JSONValue.from_string(String("serenity.gallery.v1")))
+        o.set("search", JSONValue.from_string(search))
+        o.set("filter", JSONValue.from_string(filter))
+        o.set("sort", JSONValue.from_string(sort))
+        o.set("favorite", JSONValue.from_string(favorite_query))
+        o.set("thumbnail_path_root", JSONValue.from_string(String(GALLERY_THUMB_DIR)))
+        o.set("count", JSONValue.from_int(len(emitted)))
+        o.set("total", JSONValue.from_int(len(ids)))
+        o.set("items", arr^)
+        return json_response(200, dumps(o))
+
+    if req.method == "GET" and path == "/v1/gallery/read":
+        var png_path = req.query("path")
+        if png_path == "":
+            return error_response(422, "'path' query parameter is required")
+        try:
+            var item = _gallery_item_from_png(String(""), png_path)
+            return json_response(200, dumps(item))
+        except e:
+            return error_response(422, "cannot read PNG genparams: " + String(e))
+
+    if req.method == "POST" and path.startswith("/v1/gallery/") and path.endswith("/favorite"):
+        var id = byte_substr(path, 12, path.byte_length() - 9)
+        if not _safe_gallery_id(id):
+            return error_response(422, "invalid gallery id: " + id)
+        var png_path = String(OUT_DIR) + "/" + id + ".png"
+        if not _path_exists_file(png_path):
+            return error_response(404, "gallery item not found: " + id)
+        try:
+            var body = _body_object_or_empty(req.body)
+            var favorite = True
+            if body.contains("favorite"):
+                if not body["favorite"].is_bool():
+                    raise Error("'favorite' must be a boolean")
+                favorite = body["favorite"].as_bool()
+            var state = _load_gallery_state()
+            var next = _set_gallery_favorite_doc(state, id, favorite)
+            _save_gallery_state(next)
+            var item = _gallery_item_from_png_state(id, png_path, favorite, True)
+            return json_response(200, dumps(item))
+        except e:
+            return error_response(422, String(e))
+
+    if req.method == "DELETE" and path.startswith("/v1/gallery/"):
+        var id = byte_substr(path, 12, path.byte_length())
+        if not _safe_gallery_id(id):
+            return error_response(422, "invalid gallery id: " + id)
+        var png_path = String(OUT_DIR) + "/" + id + ".png"
+        if not _path_exists_file(png_path):
+            return error_response(404, "gallery item not found: " + id)
+        var deleted = _unlink_file(png_path)
+        var thumb_path = _gallery_thumb_path(id)
+        var thumb_deleted = False
+        if _path_exists_file(thumb_path):
+            thumb_deleted = _unlink_file(thumb_path)
+        try:
+            var state = _load_gallery_state()
+            var next = _set_gallery_favorite_doc(state, id, False)
+            _save_gallery_state(next)
+        except:
+            pass
+        var o = JSONValue.new_object()
+        o.set("id", JSONValue.from_string(id))
+        o.set("deleted", JSONValue.from_bool(deleted))
+        o.set("path", JSONValue.from_string(png_path))
+        o.set("thumbnail_path", JSONValue.from_string(thumb_path))
+        o.set("thumbnail_deleted", JSONValue.from_bool(thumb_deleted))
+        return json_response(200, dumps(o))
+
+    if req.method == "GET" and path.startswith("/v1/gallery/"):
+        var id = byte_substr(path, 12, path.byte_length())
+        if not _safe_gallery_id(id):
+            return error_response(422, "invalid gallery id: " + id)
+        var png_path = String(OUT_DIR) + "/" + id + ".png"
+        try:
+            var state = _load_gallery_state()
+            var item = _gallery_item_from_png_state(
+                id, png_path, _gallery_favorite(state, id), True,
+            )
+            return json_response(200, dumps(item))
+        except e:
+            return error_response(404, "cannot read gallery item: " + String(e))
+
+    if req.method == "GET" and path == "/v1/state":
+        var doc = _load_state_doc()
+        return json_response(200, dumps(doc))
+
+    if req.method == "POST" and path == "/v1/state":
+        try:
+            var doc = _state_doc_from_body(req.body)
+            _write_text_file(String(STATE_PATH), dumps(doc))
+            return json_response(200, dumps(doc))
+        except e:
+            return error_response(422, String(e))
+
+    if req.method == "GET" and path == "/v1/presets":
+        var doc = _load_presets_doc()
+        return json_response(200, dumps(doc))
+
+    if req.method == "GET" and path.startswith("/v1/presets/"):
+        try:
+            var name = _preset_name_from_path(path, 12)
+            var doc = _load_presets_doc()
+            var preset = _preset_by_name(doc, name)
+            return json_response(200, dumps(preset))
+        except e:
+            return error_response(404, String(e))
+
+    if req.method == "POST" and (
+        path == "/v1/presets" or path.startswith("/v1/presets/")
+    ):
+        try:
+            var body = _body_object_or_empty(req.body)
+            var name: String
+            if path == "/v1/presets":
+                name = _required_string_field(body, String("name"))
+                if not body.contains("params"):
+                    raise Error("'params' (object) is required")
+            else:
+                name = _preset_name_from_path(path, 12)
+            var params = _preset_params_from_body(body)
+            var doc = _load_presets_doc()
+            var updated = _upsert_preset_doc(doc, name, params)
+            _write_text_file(String(PRESETS_PATH), dumps(updated))
+            var preset = _preset_by_name(updated, name)
+            return json_response(200, dumps(preset))
+        except e:
+            return error_response(422, String(e))
+
+    if req.method == "DELETE" and path.startswith("/v1/presets/"):
+        try:
+            var name = _preset_name_from_path(path, 12)
+            var doc = _load_presets_doc()
+            if not _preset_exists(doc, name):
+                return error_response(404, "no such preset: " + name)
+            var updated = _delete_preset_doc(doc, name)
+            _write_text_file(String(PRESETS_PATH), dumps(updated))
+            var o = JSONValue.new_object()
+            o.set("name", JSONValue.from_string(name))
+            o.set("deleted", JSONValue.from_bool(True))
+            o.set("presets", updated["presets"])
+            return json_response(200, dumps(o))
+        except e:
+            return error_response(422, String(e))
 
     if req.method == "POST" and path == "/v1/generate":
         njobs += 1
@@ -637,17 +2491,40 @@ def handle_api(
             if msg.startswith("[501] "):  # reserved-feature sentinel (plan H4)
                 return error_response(501, byte_substr(msg, 6, msg.byte_length()))
             return error_response(422, msg)
-        # queue_position: jobs that will run before this one
+        var requested_images = p.images
+        var base_seed = p.seed
+        var base_params_json = p.params_json.copy()
+        # queue_position: jobs that will run before the first generated image
         var ahead = 0
         if running >= 0:
             ahead += 1
         for i in range(len(jobs)):
             if jobs[i].state == "queued" and not jobs[i].cancel_requested:
                 ahead += 1
-        jobs.append(JobRecord(p^, http_date()))
-        print("job", job_id, "queued (position", ahead, ")")
+        var ids = JSONValue.new_array()
+        var created = http_date()
+        for image_i in range(requested_images):
+            var child = p.copy()
+            if image_i > 0:
+                njobs += 1
+                child.job_id = String("job-") + _pad4(njobs)
+            child.seed = base_seed + image_i
+            child.images = requested_images
+            child.image_index = image_i
+            child.image_count = requested_images
+            child.params_json = params_json_for_image_job(
+                base_params_json, child.job_id, child.seed, image_i, requested_images
+            )
+            ids.append(JSONValue.from_string(child.job_id))
+            print(
+                "job", child.job_id, "queued (position", ahead + image_i,
+                " image", image_i + 1, "/", requested_images, ")"
+            )
+            jobs.append(JobRecord(child^, created.copy()))
         var o = JSONValue.new_object()
         o.set("job_id", JSONValue.from_string(job_id))
+        o.set("job_ids", ids^)
+        o.set("images", JSONValue.from_int(requested_images))
         o.set("queue_position", JSONValue.from_int(ahead))
         return json_response(200, dumps(o))
 
@@ -663,6 +2540,72 @@ def handle_api(
         if i < 0:
             return error_response(404, "no such job: " + id)
         return json_response(200, dumps(job_json_value(jobs[i])))
+
+    if req.method == "POST" and (
+        path == "/v1/reorder" or path.startswith("/v1/reorder/")
+    ):
+        var body: JSONValue
+        try:
+            body = _body_object_or_empty(req.body)
+        except e:
+            return error_response(422, String(e))
+        var id: String
+        try:
+            id = _route_or_body_job_id(path, String("/v1/reorder"), 12, body)
+        except e:
+            return error_response(422, String(e))
+        var i = _find_job(jobs, id)
+        if i < 0:
+            return error_response(404, "no such job: " + id)
+        if not _is_active_queued(jobs[i]):
+            return error_response(
+                409,
+                "only active queued jobs can be reordered: " + id,
+            )
+        try:
+            var target = _reorder_target_position(jobs, i, body)
+            var new_pos = _move_queued_job_to_position(jobs, i, target)
+            var o = JSONValue.new_object()
+            o.set("job_id", JSONValue.from_string(id))
+            o.set("position", JSONValue.from_int(new_pos))
+            o.set("queue", _queued_jobs_json(jobs))
+            return json_response(200, dumps(o))
+        except e:
+            return error_response(422, String(e))
+
+    if req.method == "POST" and (
+        path == "/v1/remove" or path.startswith("/v1/remove/")
+    ):
+        var body: JSONValue
+        try:
+            body = _body_object_or_empty(req.body)
+        except e:
+            return error_response(422, String(e))
+        var id: String
+        try:
+            id = _route_or_body_job_id(path, String("/v1/remove"), 11, body)
+        except e:
+            return error_response(422, String(e))
+        var i = _find_job(jobs, id)
+        if i < 0:
+            return error_response(404, "no such job: " + id)
+        if not _is_active_queued(jobs[i]):
+            return error_response(
+                409,
+                "only active queued jobs can be removed before execution; "
+                "use /v1/cancel/<id> for running jobs: " + id,
+            )
+        if running >= 0 and i < running:
+            return error_response(
+                409,
+                "cannot remove queued job before the running index: " + id,
+            )
+        _remove_job_at(jobs, i)
+        var o = JSONValue.new_object()
+        o.set("job_id", JSONValue.from_string(id))
+        o.set("removed", JSONValue.from_bool(True))
+        o.set("queue", _queued_jobs_json(jobs))
+        return json_response(200, dumps(o))
 
     if req.method == "POST" and path.startswith("/v1/cancel/"):
         var id = byte_substr(path, 11, path.byte_length())

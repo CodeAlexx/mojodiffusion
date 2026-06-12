@@ -56,14 +56,21 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.layout import patchify, unpatchify
 from serenitymojo.sampling.flow_match import Scheduler, cfg_qwen
+from serenitymojo.sampling.sampler_registry import (
+    sampler_admission_for_backend, scheduler_admission_for_backend,
+)
+from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
 from serenitymojo.pipeline.qwenimage_sample_cli import (
     QwenCaps, encode_captions_from_strings,
     QWENIMAGE_DIR, DIT_DIR, VAE_DIR,
     LH, LW, PATCH, N_IMG, N_TXT_KEPT, S_POS, S_NEG, FRAME, FH, FW,
 )
-from serenitymojo.serve.backend import GenBackend, JobParams, StepResult
+from serenitymojo.serve.backend import (
+    GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
+)
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
+
 
 comptime QPHASE_IDLE = 0
 comptime QPHASE_ENCODE = 1
@@ -173,6 +180,19 @@ struct QwenImageBackend(GenBackend, Movable):
     def start(mut self, params: JobParams) raises:
         if self.active:
             raise Error("QwenImageBackend.start: a job is already running")
+        reject_unsupported_common_runtime_params(params, String("qwenimage"))
+        var sampler_admission = sampler_admission_for_backend(String("qwenimage"), params.sampler)
+        if not sampler_admission.supported:
+            raise Error(
+                String("qwenimage: unsupported sampler '") + params.sampler
+                + String("'; ") + sampler_admission.reason
+            )
+        var scheduler_admission = scheduler_admission_for_backend(String("qwenimage"), params.scheduler)
+        if not scheduler_admission.supported:
+            raise Error(
+                String("qwenimage: unsupported scheduler '") + params.scheduler
+                + String("'; ") + scheduler_admission.reason
+            )
         # 1024x1024 only: the DiT attention shape (N_IMG/N_TXT_KEPT/S_POS/S_NEG)
         # is comptime-fixed. Reject other sizes up front (no false advertising).
         if not (params.width == 1024 and params.height == 1024):
@@ -244,7 +264,20 @@ struct QwenImageBackend(GenBackend, Movable):
         self.sched = List[ArcPointer[Scheduler]]()
         self.sched.append(ArcPointer(Scheduler.qwen(self.params.steps, Float32(N_IMG))))
         var nchw_shape = [1, 16, LH, LW]
-        var noise = randn(nchw_shape^, UInt64(self.params.seed), STDtype.BF16, self.ctx)
+        var noise = randn(nchw_shape.copy(), UInt64(self.params.seed), STDtype.BF16, self.ctx)
+        if self.params.variation_strength > 0.0:
+            var vnoise = randn(
+                nchw_shape.copy(),
+                UInt64(self.params.variation_seed + self.params.image_index),
+                STDtype.BF16,
+                self.ctx,
+            )
+            var base_h = noise.to_host(self.ctx)
+            var var_h = vnoise.to_host(self.ctx)
+            var blended = swarm_variation_noise_chw(
+                base_h, var_h, 16, LH, LW, self.params.variation_strength
+            )
+            noise = Tensor.from_host(blended, nchw_shape^, STDtype.BF16, self.ctx)
         var packed = patchify(noise, PATCH, self.ctx)
         self.latent = List[ArcPointer[Tensor]]()
         self.latent.append(ArcPointer(packed^))

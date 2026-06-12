@@ -336,6 +336,21 @@ struct UniPcMultistepScheduler(Movable):
         self._step_index = 0
         self._this_order = 0
 
+    @staticmethod
+    def from_sigmas(var sigmas: List[Float64], solver_order: Int) raises -> UniPcMultistepScheduler:
+        """Build a bh2 scheduler over an externally-owned product sigma trace.
+
+        Used by model backends whose accepted schedule is already defined
+        elsewhere, such as Z-Image's shift=6 flow-match `_build_sigmas`.
+        """
+        if len(sigmas) < 2:
+            raise Error("UniPcMultistepScheduler.from_sigmas: need at least two sigmas")
+        var out = UniPcMultistepScheduler(1000, len(sigmas) - 1, 1.0, solver_order)
+        out.num_inference_steps = len(sigmas) - 1
+        out.shift = 0.0
+        out._sigmas = sigmas^
+        return out^
+
     def sigmas(self) -> List[Float64]:
         return self._sigmas.copy()
 

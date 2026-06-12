@@ -8,9 +8,10 @@ version = "0.1.0"
 [tasks]
 # Compile the SerenityUI generation daemon (SwarmUI-replacement) against the
 # MOJO-libs stack. -lm: sinf in image/model math; -lcuda: serenitymojo/offload
-# CUDA driver API (the consumer's GPU offload, not the libs). Verified EXIT=0
-# on 2026-06-10 producing a 6.1 MB ELF.
-build-daemon = "mojo build -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/serve/serenity_daemon.mojo -o /tmp/serenity_daemon"
+# CUDA driver API (the consumer's GPU offload, not the libs).
+# libserenity_cudnn_sdpa: Z-Image product fast SDPA shim.
+build-daemon = "mkdir -p output/bin && mojo build -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_daemon.mojo -o output/bin/serenity_daemon"
+build-video-smoke = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/pipeline/ltx2_t2v_av_hq.mojo -o output/bin/ltx2_video_smoke_runner"
 
 [dependencies]
 max = ">=26.3.0,<27"

@@ -1055,8 +1055,8 @@ def validate_zimage_sample_result(
         elif require_positive_vram and float(peak_vram) <= 0.0:
             problems.append(
                 "mojo.peak_vram_mib must be positive when an explicit sample_result.v1 "
-                "manifest is consumed by --strict-speed; generator-only VRAM=0 is "
-                "request/result plumbing, not speed/VRAM readiness evidence"
+                "manifest is consumed by --strict-speed; zero VRAM is request/result "
+                "plumbing, not speed/VRAM readiness evidence"
             )
 
         artifact_value = mojo.get("artifact_paths")

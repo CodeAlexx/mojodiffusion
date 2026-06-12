@@ -123,6 +123,7 @@ def _load_w(ref st: SafeTensors, name: String, ctx: DeviceContext) raises -> Ten
     var info = st.tensor_info(name)
     var bytes = st.tensor_bytes(name)
     var view = from_parts(info.dtype, info.shape.copy(), bytes)
+    # dtype-contract: allow-f32-boundary - BigVGAN+BWE vocoder reference runs F32.
     return Tensor.from_view_as_f32(view, ctx)
 
 

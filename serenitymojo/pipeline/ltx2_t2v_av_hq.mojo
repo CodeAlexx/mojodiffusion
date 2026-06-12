@@ -2083,10 +2083,11 @@ def _refhq_unpatchify_audio(x: Tensor, s_a: Int, ctx: DeviceContext) raises -> T
 # Stage-2 forward-noise init (GaussianNoiser, all-ones mask):
 #   x = noise*scale + init*(1-scale)   computed F32, stored BF16.
 def _refhq_noise_blend(
-    init_bf16: Tensor, noise_f32: Tensor, scale: Float32, ctx: DeviceContext
+    init_bf16: Tensor, noise: Tensor, scale: Float32, ctx: DeviceContext
 ) raises -> Tensor:
     var i32 = cast_tensor(init_bf16, STDtype.F32, ctx)
-    var a = mul_scalar(noise_f32, scale, ctx)
+    var n32 = cast_tensor(noise, STDtype.F32, ctx)
+    var a = mul_scalar(n32, scale, ctx)
     var b = mul_scalar(i32, Float32(1.0) - scale, ctx)
     return cast_tensor(add(a, b, ctx), STDtype.BF16, ctx)
 
@@ -2330,9 +2331,10 @@ def run_refhq(
         s2n_a = ns.load_key_f32(String("s2init_audio"), ctx)
     else:
         # rng-contract: mojo-native-not-pytorch-parity (plain randn, like
-        # GaussianNoiser — NOT _get_new_noise-normalized).
-        s2n_v = randn(_sh3(1, REFHQ_S_V2, 128), SEED + 100, STDtype.F32, ctx)
-        s2n_a = randn(_sh3(1, REFHQ_S_A, 128), SEED + 101, STDtype.F32, ctx)
+        # GaussianNoiser — NOT _get_new_noise-normalized). Keep storage BF16 at
+        # the product boundary; _refhq_noise_blend casts internally for F32 math.
+        s2n_v = randn(_sh3(1, REFHQ_S_V2, 128), SEED + 100, STDtype.BF16, ctx)
+        s2n_a = randn(_sh3(1, REFHQ_S_A, 128), SEED + 101, STDtype.BF16, ctx)
     var vx2 = _refhq_noise_blend(up_flat_b, s2n_v, s2_scale, ctx)
     var ax2 = _refhq_noise_blend(audio_x, s2n_a, s2_scale, ctx)
     print("  [Stage2] SIMPLE res_2s, sigmas 0.909375/0.725/0.421875/0  noise_scale=", s2_scale)

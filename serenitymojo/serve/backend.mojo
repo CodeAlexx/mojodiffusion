@@ -52,6 +52,13 @@ struct JobParams(Copyable, Movable):
     var steps: Int
     var seed: Int
     var cfg: Float64
+    var sampler: String
+    var scheduler: String
+    var variation_seed: Int
+    var variation_strength: Float64
+    var images: Int       # requested output count from the UI request
+    var image_index: Int  # 0-based output index for this backend job
+    var image_count: Int  # total outputs for the original UI request
     var init_image: String   # P7 img2img: init image path ("" = txt2img)
     var creativity: Float64  # P7: 0..1 — fraction of the sigma schedule the
                              # denoise starts from (1.0 = pure noise/txt2img)
@@ -69,11 +76,36 @@ struct JobParams(Copyable, Movable):
         self.steps = 20
         self.seed = 0
         self.cfg = 4.5
+        self.sampler = String("")
+        self.scheduler = String("")
+        self.variation_seed = 0
+        self.variation_strength = 0.0
+        self.images = 1
+        self.image_index = 0
+        self.image_count = 1
         self.init_image = String("")
         self.creativity = 0.5
         self.loras = List[LoraSpec]()
         self.params_json = String("")
         self.out_dir = String("")
+
+
+def reject_unsupported_common_runtime_params(
+    params: JobParams, backend_name: String
+) raises:
+    """Validate runtime fields shared by all image backends."""
+    if params.images < 1 or params.image_count < 1:
+        raise Error(
+            backend_name + String(": image count must be positive")
+        )
+    if params.images != params.image_count:
+        raise Error(
+            backend_name + String(": images and image_count must match")
+        )
+    if params.image_index < 0 or params.image_index >= params.image_count:
+        raise Error(
+            backend_name + String(": image_index out of range for image_count")
+        )
 
 
 struct StepResult(Copyable, Movable):

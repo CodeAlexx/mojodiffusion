@@ -1310,13 +1310,13 @@ def zimage_refine_x_seq[
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
 ) raises -> List[Float32]:
-    var xs = x_seq.copy()
+    var xs_arc = TArc(_t(x_seq, [N_IMG, D], ctx))
     for i in range(len(nr_blocks)):
-        var fwd = zimage_block_forward[H, Dh, N_IMG](
-            xs.copy(), nr_blocks[i], nr_mod[i], x_cos, x_sin, D, F, eps, ctx,
+        var mv_dev = zimage_modvecs_to_device(nr_mod[i], D, ctx)
+        xs_arc = zimage_block_forward_device_moddev[H, Dh, N_IMG](
+            xs_arc.copy(), nr_blocks[i], mv_dev, x_cos, x_sin, D, F, eps, ctx,
         )
-        xs = fwd.out.copy()
-    return xs^
+    return xs_arc[].to_host(ctx)
 
 
 def zimage_stack_lora_predict_main_from_refined_device_tensor[
@@ -1361,15 +1361,14 @@ def zimage_stack_lora_predict_main_from_refined_moddev_tensor[
     var num_cr = len(cr_blocks)
     var num_main = len(main_blocks)
 
-    var cs = cap_seq.copy()
+    var cs_arc = TArc(_t(cap_seq, [N_TXT, D], ctx))
     for i in range(num_cr):
-        var fwd = zimage_refiner_forward[H, Dh, N_TXT](
-            cs.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
+        cs_arc = zimage_refiner_forward_device[H, Dh, N_TXT](
+            cs_arc.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
         )
-        cs = fwd.out.copy()
 
-    var x = _concat_img_cap(xs, cs)
-    var x_arc = TArc(_t(x^, [S, D], ctx))
+    var xs_arc = TArc(_t(xs, [N_IMG, D], ctx))
+    var x_arc = TArc(concat(0, ctx, xs_arc[], cs_arc[]))
 
     for i in range(num_main):
         var bl = _block_lora_dev_for(lora, lora.main_base() + i)

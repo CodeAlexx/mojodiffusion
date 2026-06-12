@@ -66,7 +66,7 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm, layer_norm
 from serenitymojo.ops.activations import silu, gelu
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa
+from serenitymojo.ops.attention import sdpa_qwen_keymask
 from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import (
@@ -497,7 +497,7 @@ struct QwenImageDit(Movable):
         temb: Tensor,
         pe_cos: Tensor,
         pe_sin: Tensor,
-        ref mask: Tensor,
+        real_txt_len: Int,
         ctx: DeviceContext,
     ) raises:
         comptime assert S == N_IMG + N_TXT, "S must equal N_IMG + N_TXT"
@@ -583,12 +583,14 @@ struct QwenImageDit(Movable):
         q = rope_interleaved(q, pe_cos, pe_sin, ctx)
         k = rope_interleaved(k, pe_cos, pe_sin, ctx)
 
-        # ── joint SDPA (full attention; shared zero additive mask) ──
-        # mask is the all-zeros [1,H,S,S] bias built ONCE in forward() and
-        # borrowed into every block — Rust oracle passes None (no mask); the
-        # Mojo sdpa requires a mask arg, so a constant zeros bias is the no-op
-        # equivalent. Reuses one handle to avoid a ~157 MB realloc per block.
-        var attn = sdpa[1, S, 24, 128](q, k, v, mask, scale, ctx)  # [1, S, H, Dh]
+        # ── joint attention with Qwen text-key padding mask ──
+        # Qwen lays tokens out [TXT padded to N_TXT, IMG]. The product path used
+        # to materialize [1,H,S,S] additive masks and call math SDPA; this
+        # online key-mask path preserves the same -1e4 pad-column bias without
+        # allocating a square mask or score slab.
+        var attn = sdpa_qwen_keymask[1, S, 24, 128, N_TXT](
+            q, k, v, real_txt_len, scale, ctx
+        )  # [1, S, H, Dh]
 
         # ── split txt/img, flatten heads, output projections ──
         var txt_attn = slice(attn, 1, 0, N_TXT, ctx)
@@ -643,7 +645,7 @@ struct QwenImageDit(Movable):
         temb_ref: Tensor,
         pe_cos: Tensor,
         pe_sin: Tensor,
-        ref mask: Tensor,
+        real_txt_len: Int,
         ctx: DeviceContext,
     ) raises:
         comptime assert S == N_TARGET + N_REF + N_TXT, "S must equal target + ref + text"
@@ -739,7 +741,9 @@ struct QwenImageDit(Movable):
         q = rope_interleaved(q, pe_cos, pe_sin, ctx)
         k = rope_interleaved(k, pe_cos, pe_sin, ctx)
 
-        var attn = sdpa[1, S, 24, 128](q, k, v, mask, scale, ctx)
+        var attn = sdpa_qwen_keymask[1, S, 24, 128, N_TXT](
+            q, k, v, real_txt_len, scale, ctx
+        )
         var txt_attn = slice(attn, 1, 0, N_TXT, ctx)
         var img_attn = slice(attn, 1, N_TXT, n_img, ctx)
         var txt_attn_2d = self._from_bshd(txt_attn, N_TXT, h, d, ctx)
@@ -775,58 +779,6 @@ struct QwenImageDit(Movable):
             txt_mlp, p + ".txt_mlp.net.2.weight", p + ".txt_mlp.net.2.bias", ctx
         )
         txt = add(txt, mul(txt_gate2, txt_mlp, ctx), ctx)
-
-    # All-zero additive attention mask [1, H, S, S] for full attention.
-    def _zeros_mask[S: Int](
-        self, dtype: STDtype, heads: Int, ctx: DeviceContext
-    ) raises -> Tensor:
-        var data = List[Float32]()
-        var total = heads * S * S
-        for _i in range(total):
-            data.append(Float32(0.0))
-        var sh = List[Int]()
-        sh.append(1)
-        sh.append(heads)
-        sh.append(S)
-        sh.append(S)
-        return Tensor.from_host(data, sh^, dtype, ctx)
-
-    # Padding-aware additive attention mask [1, H, S, S] for variable text len.
-    # Token layout (TXT FIRST, then IMG): positions [0..N_TXT) are text,
-    # [N_TXT..S) are image. For every query row, key columns in
-    # [real_txt_len, N_TXT) are set to -1e4 (the diffusers/PyTorch additive-bias
-    # convention that survives bf16 cast without producing softmax NaNs); all
-    # other entries are 0. This blocks attention to padded text positions while
-    # leaving the real text + full image grid untouched.
-    def _padding_mask[S: Int, N_TXT: Int](
-        self, real_txt_len: Int, dtype: STDtype, heads: Int, ctx: DeviceContext
-    ) raises -> Tensor:
-        if real_txt_len < 0 or real_txt_len > N_TXT:
-            raise Error(
-                String("_padding_mask: real_txt_len=")
-                + String(real_txt_len)
-                + " out of range [0, "
-                + String(N_TXT)
-                + "]"
-            )
-        var data = List[Float32]()
-        var total = heads * S * S
-        for _i in range(total):
-            data.append(Float32(0.0))
-        var neg_bias = Float32(-1.0e4)
-        # Only fill the pad columns; if real_txt_len == N_TXT, this loop is a no-op.
-        for hd in range(heads):
-            var head_base = hd * S * S
-            for q in range(S):
-                var row_base = head_base + q * S
-                for k in range(real_txt_len, N_TXT):
-                    data[row_base + k] = neg_bias
-        var sh = List[Int]()
-        sh.append(1)
-        sh.append(heads)
-        sh.append(S)
-        sh.append(S)
-        return Tensor.from_host(data, sh^, dtype, ctx)
 
     # ── full forward ───────────────────────────────────────────────────────────
     def forward[
@@ -896,15 +848,10 @@ struct QwenImageDit(Movable):
         var rope = build_qwenimage_rope_tables(
             frame, h_latent, w_latent, N_TXT, h, cfg, dtype, ctx
         )
-        # ── all-zeros joint-attention mask, built ONCE and shared across all
-        # 60 blocks (Rust passes None; this constant zero bias is the no-op
-        # equivalent for the mask-mandatory Mojo sdpa). Borrowed in, not moved,
-        # so the single ~157 MB device buffer is reused, not reallocated x60.
-        var mask = self._zeros_mask[S](dtype, h, ctx)
         # ── transformer blocks ── (block_forward mutates img/txt in place)
         for i in range(cfg.num_layers):
             self._block_forward[N_IMG, N_TXT, S](
-                i, img, txt, temb, rope[0], rope[1], mask, ctx
+                i, img, txt, temb, rope[0], rope[1], N_TXT, ctx
             )
 
         # ── norm_out: AdaLayerNormContinuous ──
@@ -1065,8 +1012,6 @@ struct QwenImageDitOffloaded(Movable):
         var rope = build_qwenimage_rope_tables(
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
-        var mask = self.shared._zeros_mask[S](dtype, cfg.num_heads, ctx)
-
         self.loader.config = OffloadConfig.synchronous_single()
         self.loader.prefetch(0)
         for i in range(cfg.num_layers):
@@ -1074,7 +1019,7 @@ struct QwenImageDitOffloaded(Movable):
             var handle = self.loader.await_block(i, ctx)
             var tmp = self._block_model(handle.block)
             tmp._block_forward[N_IMG, N_TXT, S](
-                i, img, txt, temb, rope[0], rope[1], mask, ctx
+                i, img, txt, temb, rope[0], rope[1], N_TXT, ctx
             )
 
         return self._finish[N_IMG](img, temb, ctx)
@@ -1112,10 +1057,6 @@ struct QwenImageDitOffloaded(Movable):
         var rope = build_qwenimage_rope_tables(
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
-        var mask = self.shared._padding_mask[S, N_TXT](
-            real_txt_len, dtype, cfg.num_heads, ctx
-        )
-
         self.loader.config = OffloadConfig.synchronous_cfg_paired()
         self.loader.prefetch(0)
         for i in range(cfg.num_layers):
@@ -1123,10 +1064,10 @@ struct QwenImageDitOffloaded(Movable):
             var handle = self.loader.await_block(i, ctx)
             var tmp = self._block_model(handle.block)
             tmp._block_forward[N_IMG, N_TXT, S](
-                i, img_pos, txt_pos, temb, rope[0], rope[1], mask, ctx
+                i, img_pos, txt_pos, temb, rope[0], rope[1], real_txt_len, ctx
             )
             tmp._block_forward[N_IMG, N_TXT, S](
-                i, img_neg, txt_neg, temb, rope[0], rope[1], mask, ctx
+                i, img_neg, txt_neg, temb, rope[0], rope[1], real_txt_len, ctx
             )
 
         var pred_pos = self._finish[N_IMG](img_pos, temb, ctx)
@@ -1176,13 +1117,6 @@ struct QwenImageDitOffloaded(Movable):
         var rope_neg = build_qwenimage_rope_tables(
             frame, h_latent, w_latent, N_TXT_NEG, cfg.num_heads, cfg, dtype, ctx
         )
-        var mask_pos = self.shared._padding_mask[S_POS, N_TXT_POS](
-            real_txt_len_pos, dtype, cfg.num_heads, ctx
-        )
-        var mask_neg = self.shared._padding_mask[S_NEG, N_TXT_NEG](
-            real_txt_len_neg, dtype, cfg.num_heads, ctx
-        )
-
         self.loader.config = OffloadConfig.synchronous_cfg_paired()
         self.loader.prefetch(0)
         for i in range(cfg.num_layers):
@@ -1190,10 +1124,10 @@ struct QwenImageDitOffloaded(Movable):
             var handle = self.loader.await_block(i, ctx)
             var tmp = self._block_model(handle.block)
             tmp._block_forward[N_IMG, N_TXT_POS, S_POS](
-                i, img_pos, txt_pos, temb, rope_pos[0], rope_pos[1], mask_pos, ctx
+                i, img_pos, txt_pos, temb, rope_pos[0], rope_pos[1], real_txt_len_pos, ctx
             )
             tmp._block_forward[N_IMG, N_TXT_NEG, S_NEG](
-                i, img_neg, txt_neg, temb, rope_neg[0], rope_neg[1], mask_neg, ctx
+                i, img_neg, txt_neg, temb, rope_neg[0], rope_neg[1], real_txt_len_neg, ctx
             )
 
         var pred_pos = self._finish[N_IMG](img_pos, temb, ctx)
@@ -1236,8 +1170,6 @@ struct QwenImageDitOffloaded(Movable):
         var rope = build_qwenimage_edit_rope_tables(
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
-        var mask = self.shared._zeros_mask[S](dtype, cfg.num_heads, ctx)
-
         self.loader.config = OffloadConfig.synchronous_cfg_paired()
         self.loader.prefetch(0)
         for i in range(cfg.num_layers):
@@ -1245,10 +1177,10 @@ struct QwenImageDitOffloaded(Movable):
             var handle = self.loader.await_block(i, ctx)
             var tmp = self._block_model(handle.block)
             tmp._block_forward_edit[N_TARGET, N_REF, N_TXT, S](
-                i, img_pos, txt_pos, temb_target, temb_ref, rope[0], rope[1], mask, ctx
+                i, img_pos, txt_pos, temb_target, temb_ref, rope[0], rope[1], N_TXT, ctx
             )
             tmp._block_forward_edit[N_TARGET, N_REF, N_TXT, S](
-                i, img_neg, txt_neg, temb_target, temb_ref, rope[0], rope[1], mask, ctx
+                i, img_neg, txt_neg, temb_target, temb_ref, rope[0], rope[1], N_TXT, ctx
             )
 
         var pred_pos_full = self._finish[N_TARGET + N_REF](img_pos, temb_target, ctx)

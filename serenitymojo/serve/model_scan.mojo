@@ -21,6 +21,10 @@
 #   time_projection.                     -> wan
 #   else                                 -> unknown
 #
+# LoRA target tags use the same bounded header read. They are metadata only for
+# browser filtering and preflight warnings; backend admission remains the
+# runtime source of truth.
+#
 # Directory listing goes through `find` into a temp file (no readdir FFI in
 # the stack); the header probe uses pread on the first min(header_len, 16 MiB)
 # bytes only.
@@ -34,7 +38,8 @@ from serenitymojo.io.ffi import BytePtr, sys_open, sys_close, sys_pread, file_si
 
 comptime CHECKPOINTS_DIR = "/home/alex/.serenity/models/checkpoints"
 comptime LORAS_DIR = "/home/alex/.serenity/models/loras"
-comptime SCAN_TMP = "/tmp/serenity_model_scan.txt"
+comptime SCAN_TMP_DIR = "output/serenity_daemon/state"
+comptime SCAN_TMP = "output/serenity_daemon/state/model_scan.txt"
 comptime HEADER_PROBE_CAP = 16 * 1024 * 1024  # bound the header read
 
 
@@ -63,6 +68,10 @@ def _shell(cmd: String) -> Int:
     return status
 
 
+def _ensure_scan_tmp_dir():
+    _ = _shell(String("mkdir -p '") + SCAN_TMP_DIR + "'")
+
+
 def _read_text_file(path: String) raises -> String:
     var fd = sys_open(path, O_RDONLY)
     if fd < 0:
@@ -89,6 +98,7 @@ def _read_text_file(path: String) raises -> String:
 def _list_safetensors(dir: String) raises -> List[ScanEntry]:
     """`find <dir> -maxdepth 1 -name '*.safetensors' -printf '%f\\t%s\\n'` into
     a temp file, parsed into (name, path, size) entries (arch left "")."""
+    _ensure_scan_tmp_dir()
     var entries = List[ScanEntry]()
     var cmd = (  # -L: follow symlinks (HF-cache links live in checkpoints/)
         String("find -L '") + dir + "' -maxdepth 1 -type f -name '*.safetensors'"
@@ -168,7 +178,35 @@ def detect_arch(header: String) -> String:
     return String("unknown")
 
 
+def detect_lora_target_arch(header: String) -> String:
+    """Best-effort target-family probe for LoRA browser cards.
+
+    This never loads tensor payloads. Ambiguous transformer LoRAs stay generic
+    unless a family-specific marker is present.
+    """
+    if header.find('"noise_refiner.') >= 0 or header.find('"context_refiner.') >= 0:
+        return String("zimage")
+    if header.find('"layers.') >= 0 and header.find(".lora_") >= 0:
+        return String("zimage")
+    if header.find("zimage") >= 0 or header.find("z_image") >= 0:
+        return String("zimage")
+    if header.find('"lora_unet_') >= 0 or header.find('"lora_te1') >= 0 or header.find('"lora_te2') >= 0:
+        return String("sdxl")
+    if header.find('"lora_transformer_distilled_guidance_layer') >= 0:
+        return String("chroma")
+    if header.find('"lora_transformer_single_transformer_blocks') >= 0 or header.find('"lora_transformer_transformer_blocks') >= 0:
+        return String("flux")
+    if header.find('"lora_transformer.') >= 0:
+        return String("flux")
+    if header.find("qwen") >= 0:
+        return String("qwen-image")
+    if header.find("ltx") >= 0:
+        return String("ltx2")
+    return String("unknown")
+
+
 def _dir_size(dir: String) -> Int:
+    _ensure_scan_tmp_dir()
     if _shell(String("du -sb '") + dir + "' 2>/dev/null | cut -f1 > " + SCAN_TMP) != 0:
         return 0
     try:
@@ -218,5 +256,16 @@ def scan_checkpoints() raises -> List[ScanEntry]:
 
 
 def scan_loras() raises -> List[ScanEntry]:
-    """loras/*.safetensors — name/path/size only (no header probe needed)."""
-    return _list_safetensors(String(LORAS_DIR))
+    """loras/*.safetensors with bounded header-probed target_arch tags."""
+    var out = List[ScanEntry]()
+    var files = _list_safetensors(String(LORAS_DIR))
+    for i in range(len(files)):
+        var target_arch = String("unknown")
+        try:
+            target_arch = detect_lora_target_arch(_header_text(files[i].path))
+        except:
+            pass  # unreadable/corrupt header -> unknown target
+        out.append(ScanEntry(
+            files[i].name.copy(), files[i].path.copy(), target_arch^, files[i].size
+        ))
+    return out^

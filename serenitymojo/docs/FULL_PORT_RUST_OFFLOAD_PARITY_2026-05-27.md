@@ -210,7 +210,10 @@ Current Mojo:
 Missing Mojo APIs/patches:
 
 1. Add handle-style event semantics before training/checkpoint integration. Rust's `await_block_handle` is a lifetime/event guard; a plain block dictionary is insufficient for turbo or recompute paths.
-2. Extend scheduler parity if UniPC is still in scope. Mojo has Flash and Full-style scheduler coverage, but no visible `UniPc` equivalent in the inspected file.
+2. Extend scheduler parity if UniPC is still in scope for HiDream. The repo now
+   has a shared `serenitymojo/sampling/unipc.mojo` bh2 scheduler and Z-Image
+   daemon evidence, but this inspected HiDream surface still needs explicit
+   model-specific wiring before it can claim UniPC parity.
 3. Keep pipeline sign/noise details explicit when wiring full generation: `t_pixeldit = 1 - step_t/1000`, velocity `(x_pred - z) / sigma`, CFG on velocity, and scheduler input `model_output = -v_guided`.
 
 ## Shared Missing Mojo API Surface

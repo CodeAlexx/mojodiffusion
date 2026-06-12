@@ -738,6 +738,75 @@ def _sdpa_online[dtype: DType, mask_dtype: DType](
         o[dst_row, d] = rebind[o.element_type]((acc[d] * inv).cast[dtype]())
 
 
+def _sdpa_qwen_keymask_online[dtype: DType](
+    q: LayoutTensor[dtype, _DYN2, MutAnyOrigin],  # [B*H*S, Dh]
+    k: LayoutTensor[dtype, _DYN2, MutAnyOrigin],  # [B*H*S, Dh]
+    v: LayoutTensor[dtype, _DYN2, MutAnyOrigin],  # [B*H*S, Dh]
+    o: LayoutTensor[dtype, _DYN2, MutAnyOrigin],  # [B*S*H, Dh]
+    scale: Float32,
+    B: Int,
+    S: Int,
+    H: Int,
+    Dh: Int,
+    n_txt: Int,
+    real_txt_len: Int,
+):
+    """Qwen joint attention with contiguous padded text key columns masked.
+
+    Token layout is [TXT padded to N_TXT, IMG]. For every query row, key columns
+    real_txt_len <= j < N_TXT receive the same -1e4 additive bias the old square
+    mask stored. No [H,S,S] mask tensor or score slab is materialized.
+    """
+    var qrow = Int(global_idx.x)
+    var total = B * H * S
+    if qrow >= total:
+        return
+    var i = qrow % S
+    var bh = qrow // S
+    var kbase = bh * S
+
+    var qreg = stack_allocation[_DH_MAX, Scalar[DType.float32]]()
+    for d in range(Dh):
+        qreg[d] = rebind[Scalar[dtype]](q[qrow, d]).cast[DType.float32]()
+
+    var acc = stack_allocation[_DH_MAX, Scalar[DType.float32]]()
+    for d in range(Dh):
+        acc[d] = 0.0
+    var m: Float32 = _NEG_BIG
+    var l: Float32 = 0.0
+
+    var jb = 0
+    while jb < S:
+        var jend = jb + _KV_BLOCK
+        if jend > S:
+            jend = S
+        var j = jb
+        while j < jend:
+            var krow = kbase + j
+            var dot: Float32 = 0.0
+            for d in range(Dh):
+                dot += qreg[d] * rebind[Scalar[dtype]](k[krow, d]).cast[DType.float32]()
+            var s = dot * scale
+            if j >= real_txt_len and j < n_txt:
+                s += Float32(-1.0e4)
+            var m_new = m if m > s else s
+            var corr = exp(m - m_new)
+            var p = exp(s - m_new)
+            l = l * corr + p
+            for d in range(Dh):
+                acc[d] = acc[d] * corr + p * rebind[Scalar[dtype]](v[krow, d]).cast[DType.float32]()
+            m = m_new
+            j += 1
+        jb = jend
+
+    var inv = 1.0 / l
+    var h = bh % H
+    var b = bh // H
+    var dst_row = (b * S + i) * H + h
+    for d in range(Dh):
+        o[dst_row, d] = rebind[o.element_type]((acc[d] * inv).cast[dtype]())
+
+
 # Driver: gather BSHD->BHSD storage, run the streaming kernel, and write BSHD
 # storage output directly. mask (if apply_mask) is typed storage in [B,H,S,S].
 def _sdpa_tiled_storage[
@@ -810,6 +879,85 @@ def _sdpa_tiled_storage[
         ](
             qd, kd, vd, od, mask, scale, B, S, H, Dh, do_mask,
             grid_dim=qgrid, block_dim=_TPB)
+
+    var out_shape = List[Int]()
+    out_shape.append(B)
+    out_shape.append(S)
+    out_shape.append(H)
+    out_shape.append(Dh)
+    return Tensor(out_buf^, out_shape^, out_dt)
+
+
+def _sdpa_qwen_keymask_storage[
+    B: Int, S: Int, H: Int, Dh: Int, N_TXT: Int, dtype: DType
+](
+    qs: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    ks: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    vs: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    real_txt_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+    out_dt: STDtype,
+) raises -> Tensor:
+    comptime if Dh > _DH_MAX:
+        raise Error("sdpa_qwen_keymask: Dh exceeds _DH_MAX (128)")
+    comptime if N_TXT > S:
+        raise Error("sdpa_qwen_keymask: N_TXT must be <= S")
+
+    comptime src_rows = B * S * H
+    comptime bhsd_rows = B * H * S
+    var q_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var k_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var v_buf = ctx.enqueue_create_buffer[dtype](bhsd_rows * Dh)
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        B * S * H * Dh * out_dt.byte_size()
+    )
+    var bhsd_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](bhsd_rows, Dh))
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    var qd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](q_buf.unsafe_ptr(), bhsd_rl)
+    var kd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](k_buf.unsafe_ptr(), bhsd_rl)
+    var vd = LayoutTensor[dtype, _DYN2, MutAnyOrigin](v_buf.unsafe_ptr(), bhsd_rl)
+    var ngather = B * H * S * Dh
+    var ggrid = (ngather + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](qs, qd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](ks, kd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _gather_bshd_to_bhsd[dtype], _gather_bshd_to_bhsd[dtype]
+    ](vs, vd, B, S, H, Dh, grid_dim=ggrid, block_dim=_BLOCK)
+
+    var rows = B * H * S
+    var row_grid = (rows + _TPB - 1) // _TPB
+    comptime if dtype == DType.float32:
+        var od = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        ctx.enqueue_function[
+            _sdpa_qwen_keymask_online[dtype],
+            _sdpa_qwen_keymask_online[dtype],
+        ](
+            qd, kd, vd, od, scale, B, S, H, Dh, N_TXT, real_txt_len,
+            grid_dim=row_grid, block_dim=_TPB)
+    elif dtype == DType.bfloat16:
+        var od = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        ctx.enqueue_function[
+            _sdpa_qwen_keymask_online[dtype],
+            _sdpa_qwen_keymask_online[dtype],
+        ](
+            qd, kd, vd, od, scale, B, S, H, Dh, N_TXT, real_txt_len,
+            grid_dim=row_grid, block_dim=_TPB)
+    else:
+        var od = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        ctx.enqueue_function[
+            _sdpa_qwen_keymask_online[dtype],
+            _sdpa_qwen_keymask_online[dtype],
+        ](
+            qd, kd, vd, od, scale, B, S, H, Dh, N_TXT, real_txt_len,
+            grid_dim=row_grid, block_dim=_TPB)
 
     var out_shape = List[Int]()
     out_shape.append(B)
@@ -1574,6 +1722,76 @@ def sdpa_nomask_tiled[
             "sdpa_nomask_tiled: q shape does not match compile-time B/S/H/Dh"
         )
     return _sdpa_tiled[B, S, H, Dh](q, k, v, q, scale, ctx, False)
+
+
+def sdpa_qwen_keymask[
+    B: Int, S: Int, H: Int, Dh: Int, N_TXT: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    real_txt_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Qwen joint attention with padded text key columns masked.
+
+    Qwen token order is TXT then IMG. `real_txt_len` keeps text columns
+    [0, real_txt_len) and masks [real_txt_len, N_TXT) with -1e4 while leaving
+    image columns [N_TXT, S) unmasked. The kernel streams K/V with online
+    softmax and does not allocate either `[B,H,S,S]` mask or F32 score slabs.
+    """
+    comptime if N_TXT > S:
+        raise Error("sdpa_qwen_keymask: N_TXT must be <= S")
+    if real_txt_len < 0 or real_txt_len > N_TXT:
+        raise Error("sdpa_qwen_keymask: real_txt_len out of range")
+    if q.dtype() != k.dtype() or q.dtype() != v.dtype():
+        raise Error("sdpa_qwen_keymask: q/k/v dtype mismatch")
+    var qshape = q.shape()
+    if len(qshape) != 4:
+        raise Error("sdpa_qwen_keymask: q must be rank-4 [B,S,H,Dh]")
+    if (
+        qshape[0] != B or qshape[1] != S or qshape[2] != H or qshape[3] != Dh
+    ):
+        raise Error(
+            "sdpa_qwen_keymask: q shape does not match compile-time B/S/H/Dh"
+        )
+    if k.shape() != qshape or v.shape() != qshape:
+        raise Error("sdpa_qwen_keymask: k/v shape mismatch")
+
+    var dt = q.dtype().to_mojo_dtype()
+    comptime src_rows = B * S * H
+    var src_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](src_rows, Dh))
+    if dt == DType.float32:
+        var qs = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var ks = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var vs = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        return _sdpa_qwen_keymask_storage[
+            B, S, H, Dh, N_TXT, DType.float32
+        ](qs, ks, vs, real_txt_len, scale, ctx, q.dtype())
+    elif dt == DType.bfloat16:
+        var qs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var ks = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var vs = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        return _sdpa_qwen_keymask_storage[
+            B, S, H, Dh, N_TXT, DType.bfloat16
+        ](qs, ks, vs, real_txt_len, scale, ctx, q.dtype())
+    else:
+        var qs = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            q.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var ks = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            k.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var vs = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            v.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        return _sdpa_qwen_keymask_storage[
+            B, S, H, Dh, N_TXT, DType.float16
+        ](qs, ks, vs, real_txt_len, scale, ctx, q.dtype())
 
 
 def sdpa_cross_nomask[

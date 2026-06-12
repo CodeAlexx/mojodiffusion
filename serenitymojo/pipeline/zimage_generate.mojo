@@ -29,8 +29,10 @@
 # overlay loaded (210 main adapters, alpha/rank=0.0625).
 #
 # Build:
-#   cd /home/alex/mojodiffusion && pixi run mojo build -I . -Xlinker -lm \
-#     serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_check
+#   cd /home/alex/mojodiffusion && pixi run mojo build -I . \
+#     serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_check \
+#     -Xlinker -lm -Xlinker -lcuda \
+#     -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa
 #
 # Runtime:
 #   /tmp/zimage_generate_check [lora_path|base] [out_png] [seed] [prompt]
@@ -190,6 +192,7 @@ struct ZImageGenerateResult(Movable):
     var text_encode_seconds: Float64
     var denoise_seconds: Float64
     var vae_decode_seconds: Float64
+    var peak_vram_mib: Float64
 
 
 # ── fixed-padded caption pair (real_caplen tracked) ──
@@ -828,14 +831,26 @@ def _write_zimage_result_manifest(
     content += String('    "denoise_seconds":') + String(result.denoise_seconds) + String(",\n")
     content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
     content += String('    "vae_decode_seconds":') + String(result.vae_decode_seconds) + String(",\n")
-    content += String('    "peak_vram_mib":0,\n')
+    content += String('    "peak_vram_mib":') + String(result.peak_vram_mib) + String(",\n")
     content += String('    "artifact_paths":["') + _json_escape(output_png) + String('","') + _json_escape(path) + String('"]\n')
     content += String("  },\n")
     content += String('  "lora_path":"') + _json_escape(lora_path) + String('",\n')
     content += String('  "output_png":"') + _json_escape(output_png) + String('",\n')
-    content += String('  "note":"Mojo-side sample result only; peak_vram_mib is not measured here and speed parity is not accepted without paired OneTrainer evidence."\n')
+    content += String('  "note":"Mojo-side sample result; peak_vram_mib is sampled in-process from the active DeviceContext and speed parity is not accepted without paired OneTrainer evidence."\n')
     content += String("}\n")
     _write_text_file(path, content)
+
+
+def _update_min_free(ctx: DeviceContext, min_free: Int) raises -> Int:
+    var mem = ctx.get_memory_info()
+    var free_now = Int(mem[0])
+    if free_now < min_free:
+        return free_now
+    return min_free
+
+
+def _peak_vram_mib(total_vram: Int, min_free: Int) -> Float64:
+    return Float64(total_vram - min_free) / 1048576.0
 
 
 # ── one prompt → templated tokens → layer-34 cap_feats [CAPLEN_MAX, HIDDEN] ──
@@ -1045,9 +1060,13 @@ def zimage_generate(
     lora_path: String, lora_multiplier: Float32,
     mut events: List[ZImageEvent], trace_denoise: Bool, ctx: DeviceContext,
 ) raises -> ZImageGenerateResult:
+    var mem0 = ctx.get_memory_info()
+    var total_vram = Int(mem0[1])
+    var min_free = Int(mem0[0])
     var encode_t0 = perf_counter_ns()
     var caps = encode_captions_fixed(prompt, negative, ctx)
     var text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
+    min_free = _update_min_free(ctx, min_free)
     # Dispatch the comptime latent grid from runtime width/height. Only the
     # verified 1024² grid is wired today; add cases as other sizes are verified.
     var hl = height // 8
@@ -1057,14 +1076,17 @@ def zimage_generate(
             caps, steps, cfg, seed, lora_path, lora_multiplier, events,
             trace_denoise, ctx,
         )
+        min_free = _update_min_free(ctx, min_free)
         print("[vae] decoding latent → RGB")
         var vae_t0 = perf_counter_ns()
         var dec = ZImageDecoder[DEFAULT_HL, DEFAULT_WL].load(VAE_DIR, ctx)
         var rgb = dec.decode(_cast(denoised.latent, STDtype.BF16, ctx), ctx)
         var vae_decode_seconds = Float64(perf_counter_ns() - vae_t0) / 1.0e9
+        min_free = _update_min_free(ctx, min_free)
         events.append(ZImageEvent(ZEVENT_DONE, steps, steps, String("done")))
         return ZImageGenerateResult(
-            rgb^, text_encode_seconds, denoised.denoise_seconds, vae_decode_seconds
+            rgb^, text_encode_seconds, denoised.denoise_seconds,
+            vae_decode_seconds, _peak_vram_mib(total_vram, min_free)
         )
     events.append(
         ZImageEvent(

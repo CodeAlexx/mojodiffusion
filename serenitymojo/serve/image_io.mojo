@@ -108,7 +108,8 @@ def _comfy_mask_value_at(img: Image, x: Int, y: Int, channel: String) raises -> 
             return 0.0
         return 1.0 - alpha
 
-    # ImageToMask is raw channel selection; it does not threshold.
+    # Low-level explicit ImageToMask file-channel extraction; it does not
+    # threshold. The graph importer enforces Comfy IMAGE tensor channel parity.
     if channel == "red" or channel == "r":
         return _image_rgb_channel_at(img, x, y, 0)
     if channel == "green" or channel == "g":
@@ -133,8 +134,9 @@ def decode_comfy_mask(path: String, channel: String) raises -> ComfyMaskImage:
     """Decode a Comfy mask source without resizing or thresholding.
 
     `channel == "load_image_mask"` mirrors LoadImage's MASK output
-    (1-alpha, or zeros without alpha). Other channels mirror ImageToMask raw
-    channel extraction.
+    (1-alpha, or zeros without alpha). Other channels are explicit raw file
+    channel extraction helpers; workflow graph lowering only admits Comfy's RGB
+    ImageToMask channels.
     """
     var img = decode_image_any(path)
     var out = List[Float32](capacity=img.width * img.height)

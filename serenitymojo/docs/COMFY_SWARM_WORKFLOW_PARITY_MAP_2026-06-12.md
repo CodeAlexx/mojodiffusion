@@ -66,9 +66,11 @@ not implemented.
 
 Current graph mask support is path/source metadata, not a graph tensor. `LoadImage`
 can expose a typed `MASK` output with source `load_image_mask`, which means the
-Comfy `LoadImage` inverted-alpha mask. Raw `ImageToMask` channels remain raw
-channel values with no thresholding, and `MaskToImage -> ImageToMask(red)` keeps
-that source metadata instead of collapsing into a bare path. `SetLatentNoiseMask`
+Comfy `LoadImage` inverted-alpha mask. `ImageToMask` red/green/blue channels
+remain raw RGB channel values with no thresholding; `ImageToMask(alpha)` fails
+loud because Comfy `LoadImage.IMAGE` is RGB-only, so alpha masks must route
+through `LoadImage.MASK`. `MaskToImage -> ImageToMask(red)` keeps that source
+metadata instead of collapsing into a bare path. `SetLatentNoiseMask`
 can propagate the mask as `mask_image` plus `lanpaint_mask_channel`, and
 `/v1/generate` plus worker IPC preserve it.
 

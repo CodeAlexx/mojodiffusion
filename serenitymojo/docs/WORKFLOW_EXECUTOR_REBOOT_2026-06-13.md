@@ -188,7 +188,9 @@ Currently accepted graph nodes:
 Do not overclaim this as full graph parity. `SetLatentNoiseMask` now carries
 path-backed mask metadata plus mask source metadata: `LoadImage` exposes a typed
 `MASK` slot with source `load_image_mask` for Comfy's inverted-alpha mask, while
-raw `ImageToMask` channels remain raw channel values with no thresholding.
+`ImageToMask` red/green/blue channels remain raw RGB values with no
+thresholding. `ImageToMask(alpha)` fails loud from graph lowering because Comfy
+`LoadImage.IMAGE` is RGB-only; use `LoadImage.MASK` for alpha-derived masks.
 `SetLatentNoiseMask` can attach that mask to a `LATENT`, and
 `KSampler`/`SamplerCustomAdvanced` can lower it into `JobParams.mask_image` plus
 `lanpaint_mask_channel`.
@@ -355,9 +357,11 @@ Current bounded contract:
 4. Comfy API prompt slot lowering maps `LoadImage` output slot 1 to typed
    `MASK` with source `load_image_mask`, matching Comfy's `LoadImage` inverted
    alpha mask.
-5. Raw `ImageToMask` channels remain raw channel values with no thresholding.
-   `MaskToImage -> ImageToMask(red)` preserves mask source metadata instead of
-   collapsing the chain into a bare path.
+5. `ImageToMask` red/green/blue channels remain raw RGB channel values with no
+   thresholding. `ImageToMask(alpha)` fails loud in the graph importer because
+   Comfy `LoadImage.IMAGE` is RGB-only; alpha-derived masks must use
+   `LoadImage.MASK`. `MaskToImage -> ImageToMask(red)` preserves mask source
+   metadata instead of collapsing the chain into a bare path.
 6. `SetLatentNoiseMask(samples: LATENT, mask: MASK) -> LATENT` propagates the
    source latent plus mask path to downstream `KSampler` or
    `SamplerCustomAdvanced`.

@@ -290,6 +290,8 @@ def run() -> dict[str, Any]:
             'or type_id == "LanPaint_MaskBlend"',
             "comfy_ui_canvas_to_typed_graph",
             "_workflow_source_meta",
+            "_workflow_imagetomask_channel",
+            "ImageToMask alpha is unsupported",
             "load_image_mask",
             "_workflow_copy_lanpaint_sampler_fields",
             'or type_id == "SamplerCustomAdvanced"',
@@ -304,7 +306,7 @@ def run() -> dict[str, Any]:
         [
             "decode_comfy_mask",
             "load_image_mask",
-            "ImageToMask is raw channel selection",
+            "Low-level explicit ImageToMask file-channel extraction",
             "resize_mask_bilinear",
             "resize_mask_nearest_exact",
             "binarize_lanpaint_denoise_mask",

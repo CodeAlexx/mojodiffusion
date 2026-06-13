@@ -551,6 +551,20 @@ def check_supported_nodes() -> list[Check]:
         )
     )
     checks.append(
+        check_contains(
+            WORKFLOW_GRAPH,
+            category="workflow",
+            label="Comfy ImageToMask channel parity guard",
+            needles=[
+                "_workflow_imagetomask_channel",
+                "ImageToMask alpha is unsupported",
+                "use LoadImage MASK",
+            ],
+            severity=P1,
+            acceptance="Graph lowering does not treat a source file alpha channel as Comfy IMAGE alpha; alpha masks must come through LoadImage MASK.",
+        )
+    )
+    checks.append(
         check_body_contains(
             WORKFLOW_GRAPH,
             "_workflow_loader_model_name",

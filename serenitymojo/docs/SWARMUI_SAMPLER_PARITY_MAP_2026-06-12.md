@@ -72,8 +72,10 @@ accept mask/inpaint, graph `LoadImage`/`VAEEncode`, or full img2img parity.
 2026-06-13 mask refresh: Z-Image now has the first bounded Comfy
 `SetLatentNoiseMask` img2img runtime slice. The graph carries mask source
 metadata, `LoadImage MASK` maps to Comfy inverted alpha via
-`load_image_mask`, raw `ImageToMask` channels remain raw/no-threshold, and the
-backend stores encoded init latent, seeded noise, and a latent preserve mask.
+`load_image_mask`, `ImageToMask` red/green/blue channels remain
+raw/no-threshold, and `ImageToMask(alpha)` fails loud from graph lowering
+because Comfy `LoadImage.IMAGE` is RGB-only. The backend stores encoded init
+latent, seeded noise, and a latent preserve mask.
 After each sampler update it reapplies the preserve region using `sigma_next`.
 Manifests record `mask_image`, `mask_channel`, `inpaint_mask_applied`,
 `inpaint_preserve_active_pixels`, and `inpaint_preserve_mean`. Full LanPaint

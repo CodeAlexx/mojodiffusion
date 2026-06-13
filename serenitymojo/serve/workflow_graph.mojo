@@ -522,6 +522,20 @@ def _workflow_source_meta(
     raise Error("[501] workflow graph handle metadata missing source")
 
 
+def _workflow_imagetomask_channel(fields: JSONValue) raises -> String:
+    var channel = _workflow_string(fields, String("channel"))
+    if channel == "":
+        channel = String("red")
+    var lower = String(channel.lower())
+    if lower == "red" or lower == "green" or lower == "blue":
+        return lower^
+    if lower == "alpha":
+        raise Error(
+            "[501] workflow graph ImageToMask alpha is unsupported on Comfy RGB IMAGE; use LoadImage MASK"
+        )
+    raise Error(String("[501] workflow graph ImageToMask unsupported channel: ") + channel)
+
+
 def _workflow_latent_index(
     nodes: List[Int], ports: List[String], link: WorkflowLink,
 ) -> Int:
@@ -1292,11 +1306,10 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 if idx >= 0:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
                     var image_path = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
+                    var requested_channel = _workflow_imagetomask_channel(fields)
                     var mask_source = _workflow_source_meta(image_nodes, image_ports, image_mask_sources, image_link)
                     if mask_source == "":
-                        mask_source = _workflow_string(fields, String("channel"))
-                        if mask_source == "":
-                            mask_source = String("red")
+                        mask_source = requested_channel
                     _set_if_missing(obj, String("lanpaint_mask_channel"), JSONValue.from_string(mask_source))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MASK"), String("MASK"))
                     mask_nodes.append(node_id); mask_ports.append(String("MASK")); mask_paths.append(image_path)

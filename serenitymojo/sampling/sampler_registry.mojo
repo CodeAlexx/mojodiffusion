@@ -305,6 +305,18 @@ def scheduler_admission_for_backend(
                 String("simple_flowmatch"),
                 String("backend executes the verified Z-Image simple flow-match schedule"),
             )
+        if normalized == "sgm_uniform":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("sgm_uniform_flowmatch"),
+                String(
+                    "backend executes the bounded Z-Image Comfy sgm_uniform "
+                    + "flow-match schedule for Euler/DPM++ paths"
+                ),
+            )
         return SamplerAdmission(
             False,
             b,
@@ -312,7 +324,7 @@ def scheduler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Z-Image currently supports the simple flow-match schedule; "
+                "Z-Image currently supports simple and bounded sgm_uniform flow-match schedules; "
                 + "normal/karras/beta/turbo/align_your_steps/flux2/ltxv remain fail-loud here"
             ),
         )
@@ -458,7 +470,7 @@ def swarmui_sampler_registry_json() raises -> String:
     var zimage_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m","dpm++ 2m","uni_pc","uni_pc_bh2"]')
     var qwen_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
     var ideogram_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
-    var zimage_supported_schedulers = String('["simple","flowmatch","flow_match"]')
+    var zimage_supported_schedulers = String('["simple","flowmatch","flow_match","sgm_uniform"]')
     var qwen_supported_schedulers = String('["simple","flowmatch","flow_match","qwen"]')
     var ideogram_supported_schedulers = String('["logitnormal","logit_normal","ideogram_logitnormal","ideogram4_logitnormal"]')
     var out = String("{\n")
@@ -478,7 +490,7 @@ def swarmui_sampler_registry_json() raises -> String:
         zimage_supported_samplers,
         zimage_supported_schedulers,
         String("[]"),
-        String("Z-Image daemon runs SwarmUI/Comfy-aligned rectified-flow Euler/simple sigmas plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 on that simple flow-match schedule. Generic uni_pc is not an alias for uni_pc_bh2."),
+        String("Z-Image daemon runs SwarmUI/Comfy-aligned rectified-flow Euler/simple sigmas, bounded Euler/DPM++ sgm_uniform sigmas, plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 on the simple flow-match schedule. Generic uni_pc is not an alias for uni_pc_bh2."),
     )
     out += String(",\n    ")
     out += _backend_json(

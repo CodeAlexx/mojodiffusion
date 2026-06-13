@@ -4,7 +4,7 @@
 # the pull-based GenBackend seam (backend.mojo). EVERY numeric convention is
 # reused from zimage_generate (its helpers are imported, NOT re-derived):
 #   tokenizer → Qwen3-4B layer-34 encode → CFG dual-forward denoise
-#   (rectified-flow Euler, Comfy simple sigmas) → Z-Image VAE decode → PNG SIGNED.
+#   (rectified-flow Euler, Comfy flow sigmas) → Z-Image VAE decode → PNG SIGNED.
 #
 # Residency model (24 GB GPU):
 #   * DiT weights (aux + nr/cr/main blocks + final linear) and the 64²-latent
@@ -68,11 +68,15 @@ from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_in
 from serenitymojo.ops.tensor_algebra import mul_scalar, add
 from serenitymojo.pipeline.zimage_generate import (
     encode_captions_fixed, gaussian_noise, _cast, _cap_seq_with_pad,
-    _unified_positions, _cfg_pred_overlay, _build_sigmas_with_shift, _path_exists,
+    _unified_positions, _cfg_pred_overlay, _path_exists,
     _json_escape, _write_text_file, _peak_vram_mib,
     TRANSFORMER, VAE_DIR,
     H, Dh, D, F, PATCH, CAPLEN_MAX, ROPE_THETA, AXIS0, AXIS1, AXIS2,
     NUM_NR, NUM_CR, MAIN_DEPTH, RANK, ALPHA,
+)
+from serenitymojo.sampling.zimage_sampler_contract import (
+    zimage_comfy_simple_sigmas_with_shift,
+    zimage_comfy_sgm_uniform_sigmas_with_shift,
 )
 from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend, scheduler_admission_for_backend,
@@ -202,7 +206,7 @@ def _build_comfy_unipc_sigmas(steps: Int, sigma_shift: Float32) raises -> List[F
     """Mirror Comfy's `DISCARD_PENULTIMATE_SIGMA_SAMPLERS` prep for uni_pc."""
     if steps < 2:
         raise Error("zimage: generic uni_pc requires at least two steps")
-    var raw = _build_sigmas_with_shift(steps + 1, sigma_shift)
+    var raw = zimage_comfy_simple_sigmas_with_shift(steps + 1, sigma_shift)
     if len(raw) < 3:
         raise Error("zimage: generic uni_pc sigma prep needs at least three sigmas")
     var drop = len(raw) - 2
@@ -213,6 +217,22 @@ def _build_comfy_unipc_sigmas(steps: Int, sigma_shift: Float32) raises -> List[F
     if len(out) != steps + 1:
         raise Error("zimage: generic uni_pc sigma prep length mismatch")
     return out^
+
+
+def _build_zimage_sigmas(
+    executed_scheduler: String, steps: Int, sigma_shift: Float32
+) raises -> List[Float32]:
+    if executed_scheduler == "sgm_uniform_flowmatch":
+        return zimage_comfy_sgm_uniform_sigmas_with_shift(steps, sigma_shift)
+    if executed_scheduler == "simple_flowmatch":
+        return zimage_comfy_simple_sigmas_with_shift(steps, sigma_shift)
+    raise Error(String("zimage: unsupported executed scheduler: ") + executed_scheduler)
+
+
+def _zimage_schedule_source(executed_scheduler: String) -> String:
+    if executed_scheduler == "sgm_uniform_flowmatch":
+        return String("zimage_comfy_sgm_uniform_sigmas")
+    return String("zimage_comfy_simple_sigmas")
 
 
 def _save_rgb_png_with_text(
@@ -294,6 +314,7 @@ struct ZImageBackend(GenBackend, Movable):
     var unipc_solver_order: Int
     var unipc_initial_noise_scale: Float32
     var unipc_final_sample_scale: Float32
+    var txt2img_initial_noise_scale: Float32
     var cap_seq_cond: List[Float32]
     var cap_seq_uncond: List[Float32]
     var rope: List[TArc]        # 12: cond x/cap/uni cos+sin, then uncond
@@ -357,6 +378,7 @@ struct ZImageBackend(GenBackend, Movable):
         self.unipc_solver_order = 0
         self.unipc_initial_noise_scale = Float32(1.0)
         self.unipc_final_sample_scale = Float32(1.0)
+        self.txt2img_initial_noise_scale = Float32(1.0)
         self.cap_seq_cond = List[Float32]()
         self.cap_seq_uncond = List[Float32]()
         self.rope = List[TArc]()
@@ -440,6 +462,19 @@ struct ZImageBackend(GenBackend, Movable):
                 "for the bounded Comfy bh1/order<=3 path"
             )
         if (
+            scheduler_admission.executed == "sgm_uniform_flowmatch"
+            and (
+                sampler_admission.executed == "uni_pc"
+                or sampler_admission.executed == "uni_pc_bh2"
+            )
+        ):
+            raise Error(
+                String("zimage: scheduler '") + params.scheduler
+                + "' is currently supported only with euler/flowmatch_euler "
+                + "and dpmpp_2m; UniPC + sgm_uniform needs separate Comfy "
+                + "artifact evidence"
+            )
+        if (
             (sampler_admission.executed == "uni_pc" or sampler_admission.executed == "uni_pc_bh2")
             and params.init_image.byte_length() > 0
         ):
@@ -489,6 +524,7 @@ struct ZImageBackend(GenBackend, Movable):
         self.unipc_solver_order = 0
         self.unipc_initial_noise_scale = Float32(1.0)
         self.unipc_final_sample_scale = Float32(1.0)
+        self.txt2img_initial_noise_scale = Float32(1.0)
         self.active = True
         self.cancel_flag = False
         self.cur = 0
@@ -716,6 +752,7 @@ struct ZImageBackend(GenBackend, Movable):
         self.unipc_solver_order = 0
         self.unipc_initial_noise_scale = Float32(1.0)
         self.unipc_final_sample_scale = Float32(1.0)
+        self.txt2img_initial_noise_scale = Float32(1.0)
         var noise = gaussian_noise(16 * self.hl * self.wl, UInt64(self.params.seed))
         if self.params.variation_strength > 0.0:
             var vnoise = gaussian_noise(
@@ -731,7 +768,8 @@ struct ZImageBackend(GenBackend, Movable):
                 self.params.steps, Float32(self.params.sigma_shift)
             )
         else:
-            self.sigmas = _build_sigmas_with_shift(
+            self.sigmas = _build_zimage_sigmas(
+                self.executed_scheduler,
                 self.params.steps, Float32(self.params.sigma_shift)
             )
         if self.executed_sampler == "uni_pc_bh2":
@@ -751,10 +789,21 @@ struct ZImageBackend(GenBackend, Movable):
             self.unipc_initial_noise_scale = sched.initial_noise_scale()
             self.unipc_final_sample_scale = sched.final_sample_scale()
             self.comfy_unipc.append(ArcPointer(sched^))
-        var lat_host = noise.copy()  # txt2img default: x = noise (sigma0 = 1.0)
+        var lat_host = noise.copy()
+        if self.params.init_image.byte_length() == 0 and len(self.sigmas) > 0:
+            # Comfy flow noise_scaling is sigma * noise + (1 - sigma) * latent.
+            # EmptyLatentImage is zero latent, so the txt2img start must honor
+            # sigma0 even when a future supported schedule starts below 1.0.
+            self.txt2img_initial_noise_scale = self.sigmas[0]
+            if self.txt2img_initial_noise_scale != Float32(1.0):
+                for i in range(len(lat_host)):
+                    lat_host[i] = lat_host[i] * self.txt2img_initial_noise_scale
         if self.executed_sampler == "uni_pc":
             for i in range(len(lat_host)):
                 lat_host[i] = lat_host[i] * self.unipc_initial_noise_scale
+            self.txt2img_initial_noise_scale = (
+                self.txt2img_initial_noise_scale * self.unipc_initial_noise_scale
+            )
         if self.params.init_image.byte_length() > 0:
             # ── P7 img2img (rectified-flow forward-noising convention) ──
             # EXACT FORMULA (reference citations):
@@ -1082,10 +1131,12 @@ struct ZImageBackend(GenBackend, Movable):
         content += String('    "steps_executed":') + String(steps_executed) + String(",\n")
         content += String('    "denoise_update_steps":') + String(steps_executed) + String(",\n")
         content += String('    "sigma_trace":') + _float32_list_json(self.sigmas) + String(",\n")
+        content += String('    "txt2img_initial_noise_scale":') + String(self.txt2img_initial_noise_scale) + String(",\n")
         content += String('    "sampler_trace":{')
+        var schedule_source = _zimage_schedule_source(self.executed_scheduler)
         if self.executed_sampler == "dpmpp_2m":
             content += String('"algorithm":"dpmpp_2m",')
-            content += String('"schedule_source":"zimage_comfy_simple_sigmas",')
+            content += String('"schedule_source":"') + _json_escape(schedule_source) + String('",')
             content += String('"history_capacity":1,')
             content += String('"history_final_len":') + String(self.dpmpp_history.len()) + String(",")
             content += String('"dpmpp_update_steps":') + String(self.dpmpp_update_steps) + String(",")
@@ -1100,7 +1151,7 @@ struct ZImageBackend(GenBackend, Movable):
             content += String('"solver_type":"bh2",')
             content += String('"solver_variant":"bh2",')
             content += String('"solver_order":2,')
-            content += String('"schedule_source":"zimage_comfy_simple_sigmas",')
+            content += String('"schedule_source":"') + _json_escape(schedule_source) + String('",')
             content += String('"unipc_update_steps":') + String(self.unipc_update_steps) + String(",")
             content += String('"unipc_corrector_steps":') + String(self.unipc_corrector_steps) + String(",")
             content += String('"unipc_second_order_steps":') + String(self.unipc_second_order_steps) + String(",")
@@ -1139,6 +1190,8 @@ struct ZImageBackend(GenBackend, Movable):
             content += String('"unipc_lower_order_nums":') + String(unipc_lower_order_nums)
         else:
             content += String('"algorithm":"flowmatch_euler",')
+            content += String('"schedule_source":"') + _json_escape(schedule_source) + String('",')
+            content += String('"initial_noise_scale":') + String(self.txt2img_initial_noise_scale) + String(",")
             content += String('"update_steps":') + String(steps_executed)
         content += String("},\n")
         content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
@@ -1247,6 +1300,7 @@ struct ZImageBackend(GenBackend, Movable):
         self.unipc_solver_order = 0
         self.unipc_initial_noise_scale = Float32(1.0)
         self.unipc_final_sample_scale = Float32(1.0)
+        self.txt2img_initial_noise_scale = Float32(1.0)
         self.job_t0_ns = 0
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0

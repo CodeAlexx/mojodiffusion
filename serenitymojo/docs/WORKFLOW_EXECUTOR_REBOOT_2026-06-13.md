@@ -60,6 +60,39 @@ cd /home/alex/mojodiffusion
 pixi run build-daemon
 ```
 
+2026-06-13 Z-Image scheduler update: current Comfy `sgm_uniform` semantics are
+now ported for the bounded Z-Image Euler/flow-match Euler and DPM++ 2M paths.
+The oracle is SwarmUI's embedded Comfy checkout:
+`normal_scheduler(sgm=True)` includes the max sigma endpoint, converts through
+`ModelSamplingDiscreteFlow.sigma`, and appends one terminal `0.0`. The Mojo
+helper records the same shifted flow values and the backend scales txt2img
+initial noise by `sigmas[0]`. `uni_pc`/`uni_pc_bh2` plus `sgm_uniform` remains
+fail-loud until that exact Comfy combo has product artifact evidence.
+
+Focused runtime evidence:
+
+```bash
+python3 scripts/check_zimage_daemon_product_contract.py \
+  --daemon output/bin/serenity_daemon \
+  --timeout 900 --steps 1 \
+  --skip-dpmpp2m-smoke --skip-generic-unipc-smoke --skip-unipc-smoke \
+  --skip-multi-image-smoke --skip-variation-smoke --skip-img2img-smoke \
+  --skip-multi-lora-smoke \
+  --write-readiness output/checks/zimage_sgm_uniform_product_readiness.json
+```
+
+Proof jobs:
+
+- `job-0357`: unsupported sampler fail-loud smoke.
+- `job-0358`: `uni_pc` + `sgm_uniform` fail-loud combo smoke.
+- `job-0359`: baseline `euler` + `flowmatch`, manifest
+  `schedule_source:"zimage_comfy_simple_sigmas"`.
+- `job-0360`: `euler` + `sgm_uniform`, manifest
+  `executed_scheduler:"sgm_uniform_flowmatch"`,
+  `sigma_trace:[1.0,0.9477647,0.85859877,0.67192113,0.0]`,
+  `txt2img_initial_noise_scale:1.0`, and
+  `schedule_source:"zimage_comfy_sgm_uniform_sigmas"`.
+
 The workflow product smoke passed after expanding the product evidence from one
 Z-Image template to the current supported SerenityFlow t2i template set, bounded
 SerenityFlow Klein edit templates, a `SetLatentNoiseMask` metadata graph, and

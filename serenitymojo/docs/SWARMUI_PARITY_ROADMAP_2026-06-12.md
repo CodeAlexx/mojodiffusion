@@ -107,7 +107,14 @@ Current high-risk runtime gaps:
   runtime evidence (`job-0036`) and bounded UniPC bh2/simple-flowmatch runtime
   evidence (`job-0040`). Generic `uni_pc` now has bounded runtime evidence
   (`job-0077`) for a distinct Z-Image bh1/order<=3 SigmaConvert code path with
-  Comfy penultimate-sigma discard. Ancestral, SDE, Karras, CFG++, and other
+  Comfy penultimate-sigma discard. Z-Image now also has bounded Comfy-current
+  `sgm_uniform` scheduler support for Euler/flow-match Euler and DPM++ 2M paths:
+  it follows current Comfy `normal_scheduler(sgm=True)` semantics with the max
+  sigma endpoint included, exactly one terminal zero appended, flow shift through
+  `ModelSamplingDiscreteFlow`, and txt2img initial noise scaled by `sigmas[0]`.
+  `uni_pc` and `uni_pc_bh2` with `sgm_uniform` still fail loud until product
+  artifact evidence exists for that exact combo, even though Comfy allows it.
+  Ancestral, SDE, Karras, CFG++, unproven UniPC scheduler combos, and other
   daemon denoise loops are still not accepted sampler parity.
 - Variation noise is implemented for image backends and proven for Z-Image by a
   daemon artifact gate; this is not full sampler/scheduler parity.
@@ -214,6 +221,15 @@ product path. It proves `requested_sampler:"uni_pc"` executes as
 `total_wall_seconds:3.872930771`, and `peak_vram_mib:21379.875`. This is
 bounded Z-Image sampler evidence only; `accepted_sampler_parity:false` remains
 correct.
+
+Current Z-Image `sgm_uniform` support is bounded to Euler/flow-match Euler and
+DPM++ 2M scheduler execution. It is documented as Comfy-current
+`normal_scheduler(sgm=True)` behavior for `ModelSamplingDiscreteFlow`: include
+the max sigma endpoint, append one terminal zero, apply flow shift through the
+model sampling conversion, and scale txt2img initial noise by `sigmas[0]`.
+`uni_pc`/`uni_pc_bh2` with `sgm_uniform` remains an intentional fail-loud product
+gate until separate artifact evidence proves that combo. This does not change
+`accepted_sampler_parity:false`.
 
 `job-0106` is the current bounded Ideogram4 daemon artifact. It proves the native
 Mojo backend can emit a `1024x1024` PNG with `serenity.genparams.v1`, gallery
@@ -342,7 +358,7 @@ Important finding:
 
 | Model/Family | Current status | Next action |
 |---|---|---|
-| Z-Image | Best first SwarmUI product target. Has product backend, metadata path, flash SDPA route, sampler manifests, multi-LoRA, variation, multi-image serial output, and bounded DPM++/UniPC artifacts. Speed parity still not accepted. | Measure and reduce the current product bottleneck, then add each remaining sampler/workflow surface only with artifact/timing/VRAM evidence. |
+| Z-Image | Best first SwarmUI product target. Has product backend, metadata path, flash SDPA route, sampler manifests, multi-LoRA, variation, multi-image serial output, bounded DPM++/UniPC artifacts, and bounded `sgm_uniform` scheduler support for Euler/DPM++ paths. Speed parity and full sampler parity are still not accepted. | Measure and reduce the current product bottleneck, then add each remaining sampler/workflow surface only with artifact/timing/VRAM evidence. Keep `uni_pc`/`uni_pc_bh2` plus `sgm_uniform` fail-loud until that exact combo has evidence. |
 | Ideogram4 | Native daemon backend exists and has bounded 1024x1024 one-step artifact `job-0106` with PNG metadata, gallery readback, sidecar manifest, timings, and positive VRAM. Bounded unsupported controls now fail loud at `/v1/generate` prequeue. It is experimental and speed/sampler/quality parity remain false. | Extend from bounded one-step smoke to full product evidence only after multi-step quality, residency/speed, feature-support decisions, and sampler-surface limits are measured. |
 | Klein | Best memory/offload mechanics target. Uses `ScratchRingAllocator` and `TurboPlannedLoader`; product smokes exist in docs. Heavy. | Use after Z-Image product artifact, or if the slice is explicitly memory/offload measurement. |
 | SDXL / SD3 / Flux / Chroma / ERNIE | Useful image candidates, but several are cached-input, staged, or contract smokes rather than full SwarmUI product paths. | Promote only after Z-Image product loop proves the daemon/gallery/runtime pattern. |
@@ -616,9 +632,11 @@ Next implementation slice:
    readback, sidecar timings, and VRAM. Next: add multi-step quality/resource
    evidence.
    Standalone Ideogram4 smoke evidence is still not accepted SwarmUI parity.
-3. Refresh `/v1/samplers` smoke evidence, then promote the next sampler only
-   with artifact/timing/VRAM evidence. Do not promote generic `uni_pc` by
-   aliasing it to bh2; map its exact Comfy/Swarm semantics first.
+3. Refresh `/v1/samplers` smoke evidence, then promote the next sampler or
+   scheduler combo only with artifact/timing/VRAM evidence. Do not promote
+   generic `uni_pc` by aliasing it to bh2; map its exact Comfy/Swarm semantics
+   first. Keep `uni_pc`/`uni_pc_bh2` with `sgm_uniform` fail-loud until product
+   artifacts prove that exact combination.
 4. Measure the current Z-Image product bottleneck by stage with the daemon gate
    as the control artifact, then replace the measured slow path first.
 5. Keep Qwen on bounded op/static gates until memory/offload evidence says full

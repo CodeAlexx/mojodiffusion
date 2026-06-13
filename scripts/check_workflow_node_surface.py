@@ -949,6 +949,32 @@ def check_family_surfaces() -> list[Check]:
         ),
         check_contains(
             ZIMAGE_BACKEND,
+            category="sampler",
+            label="Z-Image bounded Comfy sgm_uniform scheduler",
+            needles=[
+                "zimage_comfy_sgm_uniform_sigmas_with_shift",
+                "sgm_uniform_flowmatch",
+                "zimage_comfy_sgm_uniform_sigmas",
+                "txt2img_initial_noise_scale",
+                "UniPC + sgm_uniform needs separate Comfy",
+            ],
+            severity=P1,
+            acceptance="Z-Image may execute only the bounded Comfy-current sgm_uniform schedule slice for Euler/DPM++ while UniPC+sgm_uniform remains fail-loud until artifact evidence exists.",
+        ),
+        check_contains(
+            SAMPLER_REGISTRY,
+            category="sampler",
+            label="Z-Image registry exposes bounded sgm_uniform",
+            needles=[
+                "sgm_uniform_flowmatch",
+                '["simple","flowmatch","flow_match","sgm_uniform"]',
+                "bounded sgm_uniform flow-match schedules",
+            ],
+            severity=P1,
+            acceptance="Sampler discovery/admission advertises only bounded Z-Image sgm_uniform support, not full scheduler parity.",
+        ),
+        check_contains(
+            ZIMAGE_BACKEND,
             category="workflow",
             label="Z-Image rejects LanPaint sampler metadata",
             needles=[

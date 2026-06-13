@@ -24,6 +24,7 @@ comptime ZIMAGE_TRANSFORMER_INPUT_RANK = 5
 comptime ZIMAGE_TRANSFORMER_FRAME_DIM = 1
 comptime ZIMAGE_TRAIN_SHIFT_FIXED_CONFIG = 0
 comptime ZIMAGE_TRAIN_SHIFT_DYNAMIC_SCHEDULER_CONFIG = 1
+comptime ZIMAGE_COMFY_TIMESTEPS = 1000
 
 
 @fieldwise_init
@@ -184,3 +185,49 @@ def zimage_training_reconstruct_scaled_latent(
     scaled_noisy_latent: Float32, predicted_flow: Float32, sigma: Float32
 ) -> Float32:
     return scaled_noisy_latent - predicted_flow * sigma
+
+
+def zimage_shift_flow_sigma(sigma: Float32, sigma_shift: Float32) raises -> Float32:
+    if sigma_shift <= Float32(0.0):
+        raise Error("zimage: sigma_shift must be > 0")
+    return (
+        sigma_shift * sigma
+    ) / (Float32(1.0) + (sigma_shift - Float32(1.0)) * sigma)
+
+
+def zimage_comfy_simple_sigmas_with_shift(
+    steps: Int, sigma_shift: Float32
+) raises -> List[Float32]:
+    if steps <= 0:
+        raise Error("zimage: sigma schedule steps must be > 0")
+    var out = List[Float32](capacity=steps + 1)
+    var stride = Float64(ZIMAGE_COMFY_TIMESTEPS) / Float64(steps)
+    for i in range(steps):
+        # Comfy simple selects s.sigmas[int(x * ss)] from a 1000-entry
+        # descending flow table, equivalent to this 1-based timestep.
+        var timestep_index = ZIMAGE_COMFY_TIMESTEPS - Int(Float64(i) * stride)
+        var sigma = Float32(timestep_index) / Float32(ZIMAGE_COMFY_TIMESTEPS)
+        out.append(zimage_shift_flow_sigma(sigma, sigma_shift))
+    out.append(Float32(0.0))
+    return out^
+
+
+def zimage_comfy_sgm_uniform_sigmas_with_shift(
+    steps: Int, sigma_shift: Float32
+) raises -> List[Float32]:
+    if steps <= 0:
+        raise Error("zimage: sigma schedule steps must be > 0")
+    var out = List[Float32](capacity=steps + 1)
+    var sigma_min = zimage_shift_flow_sigma(
+        Float32(1.0) / Float32(ZIMAGE_COMFY_TIMESTEPS), sigma_shift
+    )
+    for i in range(steps):
+        # Current Comfy maps sgm_uniform to normal_scheduler(sgm=True):
+        # linspace(timestep(sigma_max), timestep(sigma_min), steps+1)[:-1].
+        # ModelSamplingDiscreteFlow.timestep(sigma) returns sigma for Z-Image
+        # (multiplier=1.0), so the end point is shifted sigma_min, not 0.0.
+        var frac = Float32(i) / Float32(steps)
+        var timestep = Float32(1.0) + (sigma_min - Float32(1.0)) * frac
+        out.append(zimage_shift_flow_sigma(timestep, sigma_shift))
+    out.append(Float32(0.0))
+    return out^

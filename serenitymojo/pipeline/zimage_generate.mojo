@@ -81,6 +81,9 @@ from serenitymojo.training.sample_prompt_config import (
     SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
 )
 from serenitymojo.training.progress_display import print_sample_step, print_sample_saved
+from serenitymojo.sampling.zimage_sampler_contract import (
+    zimage_comfy_simple_sigmas_with_shift,
+)
 
 
 # ── shared verified checkpoint snapshot (DiT + VAE parity used this exact one) ──
@@ -912,23 +915,7 @@ def encode_captions_fixed(
 #   ModelSamplingDiscreteFlow.set_parameters(timesteps=1000)
 #   samplers.simple_scheduler(model_sampling, steps)
 def _build_sigmas_with_shift(steps: Int, sigma_shift: Float32) raises -> List[Float32]:
-    if steps <= 0:
-        raise Error("zimage: sigma schedule steps must be > 0")
-    if sigma_shift <= Float32(0.0):
-        raise Error("zimage: sigma_shift must be > 0")
-    var out = List[Float32](capacity=steps + 1)
-    var stride = Float64(ZIMAGE_COMFY_TIMESTEPS) / Float64(steps)
-    for i in range(steps):
-        # Mirrors Python: s.sigmas[-(1 + int(x * ss))]. The selected
-        # 1-based timestep is 1000 - floor(x * ss).
-        var timestep_index = ZIMAGE_COMFY_TIMESTEPS - Int(Float64(i) * stride)
-        var t = Float32(timestep_index) / Float32(ZIMAGE_COMFY_TIMESTEPS)
-        var sigma = (
-            sigma_shift * t
-        ) / (Float32(1.0) + (sigma_shift - Float32(1.0)) * t)
-        out.append(sigma)
-    out.append(Float32(0.0))
-    return out^
+    return zimage_comfy_simple_sigmas_with_shift(steps, sigma_shift)
 
 
 def _build_sigmas(steps: Int) raises -> List[Float32]:

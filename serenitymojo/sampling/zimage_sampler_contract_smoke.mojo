@@ -9,6 +9,8 @@ from serenitymojo.sampling.zimage_sampler_contract import (
     ZIMAGE_TRAIN_SHIFT_FIXED_CONFIG,
     zimage_cfg_batch_size,
     zimage_cfg_uses_negative_prompt,
+    zimage_comfy_sgm_uniform_sigmas_with_shift,
+    zimage_comfy_simple_sigmas_with_shift,
     zimage_default_sampler_contract,
     zimage_latent_dim,
     zimage_model_timestep_from_scheduler_timestep,
@@ -21,6 +23,7 @@ from serenitymojo.sampling.zimage_sampler_contract import (
     zimage_training_flow_target,
     zimage_training_reconstruct_scaled_latent,
     zimage_training_timestep_shift_mode,
+    zimage_shift_flow_sigma,
     zimage_unscale_latent_value,
     validate_zimage_sampler_contract,
 )
@@ -98,6 +101,7 @@ def main() raises:
         "textbook cfg",
     )
     _check_close(zimage_prediction_from_transformer_sample(Float32(3.0)), Float32(-3.0), "prediction sign")
+    _check_close(zimage_shift_flow_sigma(Float32(0.75), Float32(6.0)), Float32(0.94736844), "flow shift")
 
     var noisy = zimage_noisy_latent_value(Float32(3.0), Float32(1.0), Float32(0.25))
     var target = zimage_training_flow_target(Float32(3.0), Float32(1.0))
@@ -117,6 +121,22 @@ def main() raises:
         == ZIMAGE_TRAIN_SHIFT_DYNAMIC_SCHEDULER_CONFIG,
         "dynamic train shift",
     )
+
+    var simple_sigmas = zimage_comfy_simple_sigmas_with_shift(4, Float32(6.0))
+    _check(len(simple_sigmas) == 5, "simple sigma length")
+    _check_close(simple_sigmas[0], Float32(1.0), "simple sigma[0]")
+    _check_close(simple_sigmas[1], Float32(0.94736844), "simple sigma[1]")
+    _check_close(simple_sigmas[2], Float32(0.85714287), "simple sigma[2]")
+    _check_close(simple_sigmas[3], Float32(0.66666669), "simple sigma[3]")
+    _check_close(simple_sigmas[4], Float32(0.0), "simple terminal sigma")
+
+    var sgm_sigmas = zimage_comfy_sgm_uniform_sigmas_with_shift(4, Float32(6.0))
+    _check(len(sgm_sigmas) == 5, "sgm_uniform sigma length")
+    _check_close(sgm_sigmas[0], Float32(1.0), "sgm_uniform sigma[0]")
+    _check_close(sgm_sigmas[1], Float32(0.94776470), "sgm_uniform sigma[1]")
+    _check_close(sgm_sigmas[2], Float32(0.85859871), "sgm_uniform sigma[2]")
+    _check_close(sgm_sigmas[3], Float32(0.67192119), "sgm_uniform sigma[3]")
+    _check_close(sgm_sigmas[4], Float32(0.0), "sgm_uniform terminal sigma")
 
     var bad_scheduler = zimage_default_sampler_contract()
     bad_scheduler.scheduler_class = String("EulerDiscreteScheduler")

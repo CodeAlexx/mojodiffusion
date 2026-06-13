@@ -324,17 +324,30 @@ def expected_comfy_simple_sigmas(steps: int, sigma_shift: float) -> list[float]:
     return out
 
 
-def require_comfy_simple_sigmas(
+def expected_comfy_sgm_uniform_sigmas(steps: int, sigma_shift: float) -> list[float]:
+    out: list[float] = []
+    sigma_min = (sigma_shift * (1.0 / 1000.0)) / (1.0 + (sigma_shift - 1.0) * (1.0 / 1000.0))
+    for step in range(steps):
+        # Current Comfy sgm_uniform is normal_scheduler(sgm=True):
+        # linspace(timestep(sigma_max), timestep(sigma_min), steps+1)[:-1].
+        # Z-Image ModelSamplingDiscreteFlow has multiplier=1.0, so timestep()
+        # returns sigma and the lower endpoint is shifted sigma_min.
+        frac = float(step) / float(steps)
+        t = 1.0 + (sigma_min - 1.0) * frac
+        out.append((sigma_shift * t) / (1.0 + (sigma_shift - 1.0) * t))
+    out.append(0.0)
+    return out
+
+
+def require_sigma_trace_close(
     sigma_trace: Any,
-    steps: int,
-    sigma_shift: float,
+    expected: list[float],
     label: str,
     blockers: list[str],
 ) -> None:
     require(isinstance(sigma_trace, list), f"{label} sigma_trace must be an array", blockers)
     if not isinstance(sigma_trace, list):
         return
-    expected = expected_comfy_simple_sigmas(steps, sigma_shift)
     require(len(sigma_trace) == len(expected), f"{label} sigma_trace length mismatch", blockers)
     if len(sigma_trace) != len(expected):
         return
@@ -344,6 +357,36 @@ def require_comfy_simple_sigmas(
             blockers.append(f"{label} sigma_trace[{index}] must be a finite number")
             continue
         require(abs(got - want) <= 5.0e-5, f"{label} sigma_trace[{index}] mismatch", blockers)
+
+
+def require_comfy_simple_sigmas(
+    sigma_trace: Any,
+    steps: int,
+    sigma_shift: float,
+    label: str,
+    blockers: list[str],
+) -> None:
+    require_sigma_trace_close(
+        sigma_trace,
+        expected_comfy_simple_sigmas(steps, sigma_shift),
+        label,
+        blockers,
+    )
+
+
+def require_comfy_sgm_uniform_sigmas(
+    sigma_trace: Any,
+    steps: int,
+    sigma_shift: float,
+    label: str,
+    blockers: list[str],
+) -> None:
+    require_sigma_trace_close(
+        sigma_trace,
+        expected_comfy_sgm_uniform_sigmas(steps, sigma_shift),
+        label,
+        blockers,
+    )
 
 
 def expected_denoise_start_step(sigma_trace: list[Any], steps: int, creativity: float) -> int | None:
@@ -615,7 +658,29 @@ def expected_executed_scheduler(request_body: dict[str, Any]) -> str:
     scheduler = str(request_body.get("scheduler") or "").lower()
     if scheduler in {"simple", "flowmatch", "flow_match", "simple_flowmatch", ""}:
         return "simple_flowmatch"
+    if scheduler == "sgm_uniform":
+        return "sgm_uniform_flowmatch"
     return scheduler
+
+
+def expected_schedule_source(executed_scheduler: str) -> str:
+    if executed_scheduler == "sgm_uniform_flowmatch":
+        return "zimage_comfy_sgm_uniform_sigmas"
+    return "zimage_comfy_simple_sigmas"
+
+
+def expected_txt2img_initial_noise_scale(
+    request_body: dict[str, Any],
+    sigma_trace: Any,
+    expected_sampler: str,
+) -> float:
+    if request_body.get("init_image"):
+        return 1.0
+    if isinstance(sigma_trace, list) and sigma_trace:
+        first = finite_number(sigma_trace[0])
+        if first is not None:
+            return first
+    return 1.0
 
 
 def poll_job(
@@ -792,12 +857,35 @@ def validate_completed_job(
                     "manifest Comfy simple",
                     blockers,
                 )
+            elif expected_scheduler == "sgm_uniform_flowmatch":
+                require_comfy_sgm_uniform_sigmas(
+                    run_identity.get("sigma_trace"),
+                    int(request_body.get("steps") or 0),
+                    expected_shift,
+                    "manifest Comfy sgm_uniform",
+                    blockers,
+                )
+            initial_noise_scale = finite_number(run_identity.get("txt2img_initial_noise_scale"))
+            if initial_noise_scale is None:
+                blockers.append("manifest txt2img_initial_noise_scale must be a finite number")
+            else:
+                expected_initial_noise_scale = expected_txt2img_initial_noise_scale(
+                    request_body,
+                    run_identity.get("sigma_trace"),
+                    expected_sampler,
+                )
+                require(
+                    abs(initial_noise_scale - expected_initial_noise_scale) <= 5.0e-5,
+                    "manifest txt2img_initial_noise_scale mismatch",
+                    blockers,
+                )
             require(isinstance(run_identity.get("sampler_trace"), dict), "manifest sampler_trace must be an object", blockers)
             sampler_trace = run_identity.get("sampler_trace")
+            schedule_source = expected_schedule_source(expected_scheduler)
             if expected_sampler == "dpmpp_2m" and isinstance(sampler_trace, dict):
                 require(sampler_trace.get("algorithm") == "dpmpp_2m", "DPM++ sampler_trace algorithm mismatch", blockers)
                 require(
-                    sampler_trace.get("schedule_source") == "zimage_comfy_simple_sigmas",
+                    sampler_trace.get("schedule_source") == schedule_source,
                     "DPM++ sampler_trace schedule_source mismatch",
                     blockers,
                 )
@@ -809,7 +897,7 @@ def validate_completed_job(
                 require(sampler_trace.get("algorithm") == "uni_pc_bh2", "UniPC sampler_trace algorithm mismatch", blockers)
                 require(sampler_trace.get("solver_type") == "bh2", "UniPC sampler_trace solver_type mismatch", blockers)
                 require(sampler_trace.get("solver_order") == 2, "UniPC sampler_trace solver_order mismatch", blockers)
-                require(sampler_trace.get("schedule_source") == "zimage_comfy_simple_sigmas", "UniPC sampler_trace schedule_source mismatch", blockers)
+                require(sampler_trace.get("schedule_source") == schedule_source, "UniPC sampler_trace schedule_source mismatch", blockers)
                 require(int(sampler_trace.get("unipc_update_steps") or 0) >= 1, "UniPC sampler_trace did not record update steps", blockers)
                 require(int(sampler_trace.get("unipc_corrector_steps") or 0) >= 1, "UniPC sampler_trace did not record corrector steps", blockers)
                 require(int(sampler_trace.get("unipc_second_order_steps") or 0) >= 1, "UniPC sampler_trace did not record 2nd-order updates", blockers)
@@ -829,6 +917,22 @@ def validate_completed_job(
                 require(int(sampler_trace.get("unipc_update_steps") or 0) >= 1, "generic UniPC sampler_trace did not record update steps", blockers)
                 require(int(sampler_trace.get("unipc_corrector_steps") or 0) >= 1, "generic UniPC sampler_trace did not record corrector steps", blockers)
                 require(int(sampler_trace.get("unipc_second_order_steps") or 0) >= 1, "generic UniPC sampler_trace did not record 2nd-order updates", blockers)
+            if expected_sampler == "flowmatch_euler" and isinstance(sampler_trace, dict):
+                require(sampler_trace.get("algorithm") == "flowmatch_euler", "Euler sampler_trace algorithm mismatch", blockers)
+                require(sampler_trace.get("schedule_source") == schedule_source, "Euler sampler_trace schedule_source mismatch", blockers)
+                trace_initial_noise_scale = finite_number(sampler_trace.get("initial_noise_scale"))
+                if trace_initial_noise_scale is None:
+                    blockers.append("Euler sampler_trace initial_noise_scale must be finite")
+                else:
+                    require(
+                        abs(trace_initial_noise_scale - expected_txt2img_initial_noise_scale(
+                            request_body,
+                            run_identity.get("sigma_trace"),
+                            expected_sampler,
+                        )) <= 5.0e-5,
+                        "Euler sampler_trace initial_noise_scale mismatch",
+                        blockers,
+                    )
             expected_variation = float(request_body.get("variation_strength", 0.0)) > 0.0
             require(run_identity.get("variation_seed") == request_body.get("variation_seed"), "manifest variation_seed mismatch", blockers)
             require(run_identity.get("variation_strength") == request_body.get("variation_strength"), "manifest variation_strength mismatch", blockers)
@@ -1103,6 +1207,119 @@ def run_dpmpp2m_smoke(
         "generate": res.data,
         "job_id": job_id,
         "evidence": evidence,
+    }, blockers
+
+
+def run_sgm_uniform_smoke(
+    *,
+    base_url: str,
+    ws: ProgressWebSocket | None,
+    prompt: str,
+    negative: str,
+    seed: int,
+    timeout: float,
+    poll_interval: float,
+) -> tuple[dict[str, Any], list[str]]:
+    blockers: list[str] = []
+    body = {
+        "model": "zimage",
+        "prompt": prompt,
+        "negative": negative,
+        "width": 512,
+        "height": 512,
+        "steps": 4,
+        "seed": seed,
+        "cfg": 1.0,
+        "sampler": "euler",
+        "scheduler": "sgm_uniform",
+        "sigma_shift": 6.0,
+        "variation_seed": 0,
+        "variation_strength": 0.0,
+        "images": 1,
+        "image_index": 0,
+        "image_count": 1,
+    }
+    res = http_json("POST", f"{base_url}/v1/generate", body, timeout=15.0)
+    if res.status != 200 or not isinstance(res.data, dict) or not res.data.get("job_id"):
+        raise ContractError(f"sgm_uniform generate failed HTTP {res.status}: {res.text}")
+    job_id = str(res.data["job_id"])
+    job, states, events = poll_job(base_url, job_id, ws, timeout, poll_interval)
+    evidence, completed_blockers = validate_completed_job(
+        job=job,
+        states=states,
+        events=events,
+        request_body=body,
+        base_url=base_url,
+        require_phase_events=False,
+    )
+    blockers.extend(completed_blockers)
+    run_identity = evidence.get("manifest", {}).get("run_identity", {})
+    if isinstance(run_identity, dict):
+        require(run_identity.get("executed_scheduler") == "sgm_uniform_flowmatch", "sgm_uniform smoke executed_scheduler mismatch", blockers)
+        require_comfy_sgm_uniform_sigmas(
+            run_identity.get("sigma_trace"),
+            int(body["steps"]),
+            float(body["sigma_shift"]),
+            "sgm_uniform smoke",
+            blockers,
+        )
+        trace = run_identity.get("sampler_trace")
+        require(isinstance(trace, dict), "sgm_uniform smoke missing sampler_trace", blockers)
+        if isinstance(trace, dict):
+            require(trace.get("algorithm") == "flowmatch_euler", "sgm_uniform smoke sampler_trace algorithm mismatch", blockers)
+            require(trace.get("schedule_source") == "zimage_comfy_sgm_uniform_sigmas", "sgm_uniform smoke schedule_source mismatch", blockers)
+            initial_noise_scale = finite_number(trace.get("initial_noise_scale"))
+            require(initial_noise_scale is not None and abs(initial_noise_scale - 1.0) <= 5.0e-5, "sgm_uniform smoke initial_noise_scale mismatch", blockers)
+    return {
+        "request": body,
+        "generate": res.data,
+        "job_id": job_id,
+        "evidence": evidence,
+    }, blockers
+
+
+def run_sgm_uniform_unipc_fail_loud_smoke(
+    *,
+    base_url: str,
+    ws: ProgressWebSocket | None,
+    prompt: str,
+    negative: str,
+    seed: int,
+    timeout: float,
+    poll_interval: float,
+) -> tuple[dict[str, Any], list[str]]:
+    blockers: list[str] = []
+    body = {
+        "model": "zimage",
+        "prompt": prompt,
+        "negative": negative,
+        "width": 512,
+        "height": 512,
+        "steps": 4,
+        "seed": seed,
+        "cfg": 1.0,
+        "sampler": "uni_pc",
+        "scheduler": "sgm_uniform",
+        "images": 1,
+    }
+    res = http_json("POST", f"{base_url}/v1/generate", body, timeout=10.0)
+    if res.status != 200 or not isinstance(res.data, dict) or not res.data.get("job_id"):
+        raise ContractError(f"sgm_uniform+UniPC fail-loud generate failed HTTP {res.status}: {res.text}")
+    job_id = str(res.data["job_id"])
+    job, states, events = poll_job(base_url, job_id, ws, min(45.0, timeout), poll_interval)
+    require(job.get("state") == "failed", f"sgm_uniform+UniPC job must fail, got {job.get('state')!r}", blockers)
+    err = str(job.get("error") or "")
+    require("UniPC + sgm_uniform" in err, f"sgm_uniform+UniPC failure did not explain combo gate: {err!r}", blockers)
+    require(not job.get("output_path"), "sgm_uniform+UniPC failed job must not emit output_path", blockers)
+    job_events = [event for event in events if event.get("job_id") == job_id]
+    require(any(event.get("state") == "failed" for event in job_events), "WebSocket progress missing failed event for sgm_uniform+UniPC", blockers)
+    return {
+        "job_id": job_id,
+        "request": body,
+        "generate": res.data,
+        "job": job,
+        "states": states,
+        "progress_events": job_events,
     }, blockers
 
 
@@ -1611,6 +1828,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260612)
     parser.add_argument("--cfg", type=float, default=4.0)
     parser.add_argument("--skip-unsupported-smoke", action="store_true", help="Skip unsupported sampler fail-loud endpoint smoke.")
+    parser.add_argument("--skip-sgm-uniform-smoke", action="store_true", help="Skip positive Z-Image sgm_uniform product smoke.")
+    parser.add_argument("--skip-sgm-uniform-unipc-fail-loud-smoke", action="store_true", help="Skip sgm_uniform+UniPC unsupported-combo smoke.")
     parser.add_argument("--skip-dpmpp2m-smoke", action="store_true", help="Skip positive Z-Image DPM++ 2M product smoke.")
     parser.add_argument("--skip-generic-unipc-smoke", action="store_true", help="Skip positive Z-Image generic UniPC bh1 product smoke.")
     parser.add_argument("--skip-unipc-smoke", action="store_true", help="Skip positive Z-Image UniPC bh2 product smoke.")
@@ -1704,6 +1923,19 @@ def main() -> int:
             report["unsupported_sampler_smoke"] = unsupported_report
             blockers.extend(unsupported_blockers)
 
+        if not args.skip_sgm_uniform_unipc_fail_loud_smoke:
+            sgm_unipc_report, sgm_unipc_blockers = run_sgm_uniform_unipc_fail_loud_smoke(
+                base_url=base_url,
+                ws=ws,
+                prompt="sgm_uniform UniPC request that must fail before model work",
+                negative=args.negative,
+                seed=args.seed + 95,
+                timeout=args.timeout,
+                poll_interval=args.poll_interval,
+            )
+            report["sgm_uniform_unipc_fail_loud_smoke"] = sgm_unipc_report
+            blockers.extend(sgm_unipc_blockers)
+
         gen_res = http_json("POST", f"{base_url}/v1/generate", report["request"], timeout=15.0)
         if gen_res.status != 200 or not isinstance(gen_res.data, dict) or not gen_res.data.get("job_id"):
             raise ContractError(f"/v1/generate failed HTTP {gen_res.status}: {gen_res.text}")
@@ -1719,6 +1951,19 @@ def main() -> int:
         )
         report["completed_job_evidence"] = evidence
         blockers.extend(completed_blockers)
+
+        if not args.skip_sgm_uniform_smoke:
+            sgm_uniform_report, sgm_uniform_blockers = run_sgm_uniform_smoke(
+                base_url=base_url,
+                ws=ws,
+                prompt="sgm_uniform product smoke with Z-Image flowmatch scheduler",
+                negative=args.negative,
+                seed=args.seed + 250,
+                timeout=args.timeout,
+                poll_interval=args.poll_interval,
+            )
+            report["sgm_uniform_smoke"] = sgm_uniform_report
+            blockers.extend(sgm_uniform_blockers)
 
         if not args.skip_img2img_smoke:
             init_image = str(evidence.get("png", {}).get("path") or "")
@@ -1880,6 +2125,10 @@ def main() -> int:
     print(f"  peak_vram_mib: {mojo['peak_vram_mib']:.1f}")
     if not args.skip_unsupported_smoke:
         print(f"  unsupported_sampler_smoke: {report['unsupported_sampler_smoke']['job_id']} -> failed")
+    if not args.skip_sgm_uniform_unipc_fail_loud_smoke:
+        print(f"  sgm_uniform_unipc_fail_loud_smoke: {report['sgm_uniform_unipc_fail_loud_smoke']['job_id']} -> failed")
+    if not args.skip_sgm_uniform_smoke:
+        print(f"  sgm_uniform_smoke: {report['sgm_uniform_smoke']['job_id']} -> done")
     if not args.skip_dpmpp2m_smoke:
         print(f"  dpmpp2m_smoke: {report['dpmpp2m_smoke']['job_id']} -> done")
     if not args.skip_generic_unipc_smoke:

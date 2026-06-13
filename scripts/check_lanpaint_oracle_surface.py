@@ -5,7 +5,8 @@ This is a no-heavy-model contract checker. It reads the local LanPaint Python
 nodes, representative LanPaint workflow exports, SerenityFlow's
 SetLatentNoiseMask node, and the current Mojo boundary. The goal is to preserve
 the actual oracle semantics while distinguishing the bounded Z-Image
-LanPaint_MaskBlend final-pixel slice from full LanPaint sampler runtime parity.
+LanPaint_MaskBlend final-pixel slice, including its Comfy/PyTorch `area`
+base-image resize role, from full LanPaint sampler runtime parity.
 """
 
 from __future__ import annotations
@@ -108,6 +109,55 @@ WORKFLOWS = {
         "requires_subgraph_expansion": True,
     },
 }
+
+AREA_RESIZE_ROLE = "LanPaint ImageScale(area) -> MaskBlend.image1 base/original image resize"
+
+AREA_RESIZE_ORACLE_CASES = [
+    {
+        "name": "integer_downscale_4x4_to_2x2",
+        "source_width": 4,
+        "source_height": 4,
+        "target_width": 2,
+        "target_height": 2,
+        "source": [float(v) for v in range(16)],
+        "expected": [2.5, 4.5, 10.5, 12.5],
+    },
+    {
+        "name": "adaptive_downscale_3x3_to_2x2",
+        "source_width": 3,
+        "source_height": 3,
+        "target_width": 2,
+        "target_height": 2,
+        "source": [float(v) for v in range(9)],
+        "expected": [2.0, 3.0, 5.0, 6.0],
+    },
+    {
+        "name": "area_upsample_2x2_to_4x4",
+        "source_width": 2,
+        "source_height": 2,
+        "target_width": 4,
+        "target_height": 4,
+        "source": [0.0, 1.0, 2.0, 3.0],
+        "expected": [
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            2.0,
+            2.0,
+            3.0,
+            3.0,
+            2.0,
+            2.0,
+            3.0,
+            3.0,
+        ],
+    },
+]
 
 
 def read_text(path: Path) -> str:
@@ -224,6 +274,83 @@ def contains_all(path: Path, needles: list[str]) -> tuple[dict[str, Any], list[s
     return evidence, blockers
 
 
+def forbid_all(path: Path, needles: list[str]) -> tuple[dict[str, Any], list[str]]:
+    text = read_text(path)
+    blockers: list[str] = []
+    present = [needle for needle in needles if needle in text]
+    evidence = {"path": str(path), "exists": path.exists(), "present": present}
+    for needle in present:
+        blockers.append(f"{path}: forbidden marker still present {needle!r}")
+    return evidence, blockers
+
+
+def ceil_div(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
+def area_resize_2d_scalar(
+    source: list[float],
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+) -> list[float]:
+    """Pure-Python mirror of PyTorch/Comfy interpolate(..., mode='area').
+
+    PyTorch's area path uses adaptive average pooling windows for this scalar
+    2D shape. The same index windows define the image1/base-image resize role
+    before the bounded LanPaint_MaskBlend final-pixel composite.
+    """
+
+    out: list[float] = []
+    for y in range(target_height):
+        y0 = (y * source_height) // target_height
+        y1 = ceil_div((y + 1) * source_height, target_height)
+        for x in range(target_width):
+            x0 = (x * source_width) // target_width
+            x1 = ceil_div((x + 1) * source_width, target_width)
+            total = 0.0
+            count = 0
+            for sy in range(y0, y1):
+                for sx in range(x0, x1):
+                    total += source[sy * source_width + sx]
+                    count += 1
+            out.append(total / float(count))
+    return out
+
+
+def validate_area_resize_oracle() -> tuple[dict[str, Any], list[str]]:
+    blockers: list[str] = []
+    case_evidence: dict[str, Any] = {}
+    for case in AREA_RESIZE_ORACLE_CASES:
+        actual = area_resize_2d_scalar(
+            list(case["source"]),
+            int(case["source_width"]),
+            int(case["source_height"]),
+            int(case["target_width"]),
+            int(case["target_height"]),
+        )
+        expected = list(case["expected"])
+        max_abs = max(abs(a - b) for a, b in zip(actual, expected)) if actual else 0.0
+        ok = len(actual) == len(expected) and max_abs <= 1.0e-6
+        if not ok:
+            blockers.append(f"PyTorch area resize oracle mismatch: {case['name']}")
+        case_evidence[str(case["name"])] = {
+            "source_size": [case["source_width"], case["source_height"]],
+            "target_size": [case["target_width"], case["target_height"]],
+            "expected": expected,
+            "actual": actual,
+            "max_abs_diff": max_abs,
+            "ok": ok,
+        }
+    return {
+        "role": AREA_RESIZE_ROLE,
+        "semantics": "PyTorch/Comfy interpolate(..., mode='area') adaptive average windows",
+        "cases_passed": sum(1 for case in case_evidence.values() if case.get("ok") is True),
+        "cases": case_evidence,
+    }, blockers
+
+
 def run() -> dict[str, Any]:
     blockers: list[str] = []
     workflow_evidence: dict[str, Any] = {}
@@ -231,6 +358,9 @@ def run() -> dict[str, Any]:
         evidence, case_blockers = validate_workflow(case_name, spec)
         workflow_evidence[case_name] = evidence
         blockers.extend(case_blockers)
+
+    area_resize_oracle, area_resize_blockers = validate_area_resize_oracle()
+    blockers.extend(area_resize_blockers)
 
     lanpaint_py, lanpaint_blockers = contains_all(
         LANPAINT_NODES,
@@ -318,6 +448,7 @@ def run() -> dict[str, Any]:
             "smooth_lanpaint_blend_mask",
             "load_lanpaint_pixel_blend_mask",
             "apply_lanpaint_mask_blend_signed_chw",
+            "image_area_resize_to_signed_nchw",
             "Float64(blend_overlap - 1) / 4.0",
             "image1 * (1-mask) + image2 * mask",
         ],
@@ -330,7 +461,8 @@ def run() -> dict[str, Any]:
             'reject_unsupported_lanpaint_sampler_params(params, String("zimage"))',
             "_apply_lanpaint_mask_blend",
             "LanPaint_MaskBlend requires init_image and mask_image",
-            "LanPaint_MaskBlend base image resize requires Comfy ImageScale(area) parity",
+            "decode_image_any(self.params.init_image)",
+            "image_area_resize_to_signed_nchw",
             "load_lanpaint_pixel_blend_mask",
             "apply_lanpaint_mask_blend_signed_chw",
             "lanpaint_mask_blend_applied",
@@ -342,6 +474,15 @@ def run() -> dict[str, Any]:
     )
     blockers.extend(zimage_blend_blockers)
 
+    zimage_blend_forbidden, zimage_blend_forbidden_blockers = forbid_all(
+        ZIMAGE_BACKEND,
+        [
+            "LanPaint_MaskBlend base image resize requires Comfy ImageScale(area) parity",
+            "pre-scale init_image to output size for this backend slice",
+        ],
+    )
+    blockers.extend(zimage_blend_forbidden_blockers)
+
     node_surface, node_surface_blockers = contains_all(
         NODE_SURFACE,
         [
@@ -352,6 +493,7 @@ def run() -> dict[str, Any]:
             '"MaskToImage"',
             "LanPaint canvas daemon smoke",
             "lanpaint_num_steps",
+            AREA_RESIZE_ROLE,
         ],
     )
     blockers.extend(node_surface_blockers)
@@ -386,6 +528,7 @@ def run() -> dict[str, Any]:
         "blockers": blockers,
         "oracle": {
             "lanpaint_nodes": lanpaint_py,
+            "pytorch_area_resize": area_resize_oracle,
             "serenityflow_set_latent_noise_mask": serenityflow_latent,
             "workflows": workflow_evidence,
         },
@@ -394,12 +537,13 @@ def run() -> dict[str, Any]:
             "inpaint_parity_gate": parity_gate,
             "mask_io_boundary": mask_io,
             "zimage_mask_blend_slice": zimage_blend,
+            "zimage_mask_blend_removed_size_precondition": zimage_blend_forbidden,
             "workflow_fail_loud_boundary": mojo_boundary,
             "node_surface_lanpaint_plumbing": node_surface,
             "backend_fail_loud_boundary": backend_boundary,
         },
         "non_claims": [
-            "Z-Image consumes plain SetLatentNoiseMask for img2img and has a bounded final-pixel LanPaint_MaskBlend slice; full LanPaint sampler inner-loop semantics are still fenced.",
+            "Z-Image consumes plain SetLatentNoiseMask for img2img and has a bounded final-pixel LanPaint_MaskBlend slice; the area resize contract is only for the base/original image1 role before that final composite.",
             "The current Mojo parity gate covers weight-free mask blend and one supplied-score overdamped step only; it does not prove full LanPaint_KSampler runtime parity.",
         ],
     }

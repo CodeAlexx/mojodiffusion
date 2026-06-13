@@ -122,11 +122,12 @@ The first Z-Image `SetLatentNoiseMask` img2img runtime slice is now present. The
 bounded Z-Image `LanPaint_MaskBlend` final decoded pixel slice is also present:
 it max-pools the image-space mask, Gaussian smooths it with
 `sigma=(blend_overlap-1)/4`, then composites
-`image1*(1-mask)+image2*mask`. It requires an already output-sized base image;
-Comfy `ImageScale(area)` resize parity is still fail-loud. This does not change
-the full LanPaint sampler boundary below: the sampler inner-loop remains fenced by
-`reject_unsupported_lanpaint_sampler_params(...)`, and backends without the
-Z-Image split still reject unsupported LanPaint metadata through
+`image1*(1-mask)+image2*mask`. For the LanPaint `ImageScale(area)` ->
+`MaskBlend.image1` role, the base/original image is resized to the decoded
+output size with Comfy/PyTorch `area` semantics before the blend. This does not
+change the full LanPaint sampler boundary below: the sampler inner-loop remains
+fenced by `reject_unsupported_lanpaint_sampler_params(...)`, and backends
+without the Z-Image split still reject unsupported LanPaint metadata through
 `reject_unsupported_lanpaint_params(...)`.
 
 Validation passed:
@@ -157,7 +158,9 @@ Current static gate coverage:
   `image_io.mojo` mask helpers, bounded LanPaint final-pixel blend helpers,
   LanPaint field lowering, explicit `lanpaint_*` `JobParams`/daemon/IPC fields,
   Z-Image preserve-mask application, Z-Image final decoded `LanPaint_MaskBlend`,
-  and backend fail-loud rejection for unsupported LanPaint sampler fields.
+  the LanPaint `ImageScale(area)` -> `MaskBlend.image1` base-image resize
+  oracle, and backend fail-loud rejection for unsupported LanPaint sampler
+  fields.
 - readiness checks read `output/checks/lanpaint_canvas_daemon_smoke.json` and
   expect the `job-0311` LanPaint canvas metadata smoke.
 - `inpaint_parity.mojo` passes mask-blend and LanPaint overdamped-step tensor
@@ -214,9 +217,10 @@ The visual Comfy UI canvas adapter (`looks_like_comfy_ui_canvas_graph`,
 LanPaint sampler, mask-conversion, and mask-blend nodes into flat
 `lanpaint_*`, `mask_image`, and `init_image` metadata. Full LanPaint sampler
 inner-loop semantics are still not wired into a backend. Z-Image consumes only
-the bounded final decoded `LanPaint_MaskBlend` pixel blend; Qwen, Ideogram4,
-and Klein must continue to fail loud for unsupported `lanpaint_*` runtime
-metadata.
+the bounded final decoded `LanPaint_MaskBlend` pixel blend, with Comfy/PyTorch
+`area` resize limited to the base/original `MaskBlend.image1` role; Qwen,
+Ideogram4, and Klein must continue to fail loud for unsupported `lanpaint_*`
+runtime metadata.
 `LoraLoaderModelOnly` only lowers model-side LoRA metadata into the flat request
 contract; full `LoraLoader`, CLIP-side LoRA, LoRA stacks, KJNodes utilities,
 ControlNet, IPAdapter, arbitrary custom Comfy nodes, and unsupported LanPaint
@@ -235,7 +239,8 @@ fail loud.
   `MaskToImage` are accepted graph-lowering nodes now. They carry metadata and
   path-backed image/mask handles; LanPaint sampler nodes still do not execute
   LanPaint denoise semantics in a real backend. Z-Image `LanPaint_MaskBlend` is
-  bounded to final decoded pixel compositing only, not sampler parity.
+  bounded to final decoded pixel compositing only, with area resize only for
+  the `MaskBlend.image1` base/original-image role, not sampler parity.
 - This is not accepted general Z-Image i2i parity.
 - This is not accepted Z-Image/Qwen/Klein/Ideogram inpaint parity.
 - Z-Image init-image encode code may be useful substrate for refiner/LanPaint/
@@ -393,19 +398,21 @@ Current bounded contract:
    `apply_lanpaint_mask_blend_signed_chw`. Z-Image uses the Comfy soft bilinear
    path for `SetLatentNoiseMask`; the LanPaint blend mask uses nearest-exact
    image resize, max-pool, and Gaussian smoothing with
-   `sigma=(blend_overlap-1)/4`.
+   `sigma=(blend_overlap-1)/4`; the LanPaint base/original image uses
+   Comfy/PyTorch `area` resize only for the `ImageScale(area)` ->
+   `MaskBlend.image1` role.
 10. Z-Image consumes `mask_image` for the bounded `SetLatentNoiseMask` img2img
     slice by storing encoded init latent, seeded noise, and the latent preserve
     mask, then applying the preserve blend after each sampler update using
     `sigma_next`.
 11. Z-Image consumes `lanpaint_mask_blend_overlap` only for the bounded final
-    decoded `LanPaint_MaskBlend` pixel slice: it decodes the already
-    output-sized `init_image`, loads/smooths the image-space mask, and writes
-    manifest fields
+    decoded `LanPaint_MaskBlend` pixel slice: it decodes the base/original
+    `init_image`, area-resizes it to the decoded output size when needed,
+    loads/smooths the image-space mask, and writes manifest fields
     `lanpaint_mask_blend_applied`, `lanpaint_mask_blend_overlap`, and
-    `lanpaint_mask_blend_mean`. If the base image requires Comfy
-    `ImageScale(area)` resizing, this slice fails loud instead of substituting a
-    different resize kernel.
+    `lanpaint_mask_blend_mean`. This is the narrow LanPaint
+    `ImageScale(area)` -> `MaskBlend.image1` role only, not arbitrary graph-side
+    image resize execution.
 12. Qwen, Ideogram4, and Klein still call
     `reject_unsupported_mask_image_params(...)` for mask runtime metadata.
 13. Z-Image calls `reject_unsupported_lanpaint_sampler_params(...)` for full
@@ -438,7 +445,8 @@ Current LanPaint boundary:
   semantics. Z-Image `LanPaint_MaskBlend` is accepted only as final decoded
   pixel blending: max-pool, Gaussian smooth with
   `sigma=(blend_overlap-1)/4`, then `image1*(1-mask)+image2*mask`; base-image
-  resize still waits on Comfy `ImageScale(area)` parity.
+  resize is limited to Comfy/PyTorch `area` semantics for the
+  `ImageScale(area)` -> `MaskBlend.image1` role.
 - Acceptance for real LanPaint/inpaint execution requires backend-specific
   mask-aware denoise, outpaint behavior where applicable, and parity checks
   against the Python oracle. Until then, any request that reaches a real backend

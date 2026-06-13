@@ -413,3 +413,56 @@ def image_to_signed_nchw(img: Image) raises -> List[Float32]:
             out[1 * plane + off] = Float32(px[1]) / 127.5 - 1.0
             out[2 * plane + off] = Float32(px[2]) / 127.5 - 1.0
     return out^
+
+
+def image_area_resize_to_signed_nchw(img: Image, width: Int, height: Int) raises -> List[Float32]:
+    """Comfy/PyTorch IMAGE area resize into signed [1,3,H,W] floats.
+
+    PyTorch `interpolate(..., mode="area")` uses adaptive-average regions:
+    start=floor(out_index*in/out), end=ceil((out_index+1)*in/out).
+    """
+    if width <= 0 or height <= 0:
+        raise Error("image_area_resize_to_signed_nchw: target dimensions must be positive")
+    if img.width <= 0 or img.height <= 0:
+        raise Error("image_area_resize_to_signed_nchw: source dimensions must be positive")
+    if img.width == width and img.height == height:
+        return image_to_signed_nchw(img)
+
+    var plane = width * height
+    var out = List[Float32](capacity=3 * plane)
+    for _ in range(3 * plane):
+        out.append(Float32(0.0))
+    var px: List[Int] = [0, 0, 0]
+    for oy in range(height):
+        var y0 = (oy * img.height) // height
+        var y1 = (((oy + 1) * img.height) + height - 1) // height
+        if y1 <= y0:
+            y1 = y0 + 1
+        if y1 > img.height:
+            y1 = img.height
+        for ox in range(width):
+            var x0 = (ox * img.width) // width
+            var x1 = (((ox + 1) * img.width) + width - 1) // width
+            if x1 <= x0:
+                x1 = x0 + 1
+            if x1 > img.width:
+                x1 = img.width
+            var r_acc: Float64 = 0.0
+            var g_acc: Float64 = 0.0
+            var b_acc: Float64 = 0.0
+            var count = 0
+            for sy in range(y0, y1):
+                for sx in range(x0, x1):
+                    image_rgb_at(img, sx, sy, px)
+                    r_acc += Float64(px[0])
+                    g_acc += Float64(px[1])
+                    b_acc += Float64(px[2])
+                    count += 1
+            if count <= 0:
+                raise Error("image_area_resize_to_signed_nchw: empty adaptive-average region")
+            var off = oy * width + ox
+            var inv_count = 1.0 / Float64(count)
+            out[0 * plane + off] = Float32((r_acc * inv_count) / 127.5 - 1.0)
+            out[1 * plane + off] = Float32((g_acc * inv_count) / 127.5 - 1.0)
+            out[2 * plane + off] = Float32((b_acc * inv_count) / 127.5 - 1.0)
+    return out^

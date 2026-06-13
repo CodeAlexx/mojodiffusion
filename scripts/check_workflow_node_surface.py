@@ -61,6 +61,7 @@ P0 = "P0"
 P1 = "P1"
 P2 = "P2"
 PASS = "PASS"
+LANPAINT_AREA_RESIZE_ROLE = "LanPaint ImageScale(area) -> MaskBlend.image1 base/original image resize"
 
 SUPPORTED_NODE_TYPES = [
     "CheckpointLoaderSimple",
@@ -862,6 +863,7 @@ def check_family_surfaces() -> list[Check]:
                 "smooth_lanpaint_blend_mask",
                 "load_lanpaint_pixel_blend_mask",
                 "apply_lanpaint_mask_blend_signed_chw",
+                "image_area_resize_to_signed_nchw",
                 "max-pool",
                 "Gaussian blur",
                 "Float64(blend_overlap - 1) / 4.0",
@@ -962,7 +964,8 @@ def check_family_surfaces() -> list[Check]:
             needles=[
                 "_apply_lanpaint_mask_blend",
                 "LanPaint_MaskBlend requires init_image and mask_image",
-                "LanPaint_MaskBlend base image resize requires Comfy ImageScale(area) parity",
+                "decode_image_any(self.params.init_image)",
+                "image_area_resize_to_signed_nchw",
                 "load_lanpaint_pixel_blend_mask",
                 "apply_lanpaint_mask_blend_signed_chw",
                 "lanpaint_mask_blend_applied",
@@ -972,7 +975,18 @@ def check_family_surfaces() -> list[Check]:
                 '"lanpaint_mask_blend_mean"',
             ],
             severity=P1,
-            acceptance="Z-Image may consume only the bounded LanPaint_MaskBlend final decoded image blend while full LanPaint sampler-loop fields remain rejected.",
+            acceptance="Z-Image may consume only the bounded LanPaint_MaskBlend final decoded image blend, including Comfy/PyTorch area resize of the base image1 role, while full LanPaint sampler-loop fields remain rejected.",
+        ),
+        check_not_contains(
+            ZIMAGE_BACKEND,
+            category="workflow",
+            label="Z-Image LanPaint_MaskBlend removed base-size precondition",
+            needles=[
+                "LanPaint_MaskBlend base image resize requires Comfy ImageScale(area) parity",
+                "pre-scale init_image to output size for this backend slice",
+            ],
+            severity=P1,
+            acceptance="Bounded Z-Image LanPaint_MaskBlend must no longer require init_image to already match output size when the base/original image can be resized with Comfy/PyTorch area semantics.",
         ),
         check_contains(
             QWEN_BACKEND,
@@ -1242,11 +1256,17 @@ def check_family_surfaces() -> list[Check]:
                 "smooth_lanpaint_blend_mask",
                 "load_lanpaint_pixel_blend_mask",
                 "apply_lanpaint_mask_blend_signed_chw",
+                "image_area_resize_to_signed_nchw",
+                "AREA_RESIZE_ROLE",
+                LANPAINT_AREA_RESIZE_ROLE,
+                "area_resize_2d_scalar",
+                "PyTorch/Comfy interpolate(..., mode='area')",
+                "forbid_all",
                 "reject_unsupported_lanpaint_sampler_params",
                 "non_claims",
             ],
             severity=P1,
-            acceptance="LanPaint work is pinned to local Python/Comfy oracle semantics and representative workflow exports, with only the bounded final-pixel MaskBlend slice separated from full sampler runtime parity.",
+            acceptance="LanPaint work is pinned to local Python/Comfy oracle semantics and representative workflow exports, with only the bounded final-pixel MaskBlend slice and its base-image area resize separated from full sampler runtime parity.",
         ),
         check_contains(
             LANPAINT_CANVAS_DAEMON_SMOKE_RUNNER,
@@ -1501,7 +1521,7 @@ KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE = (
 LANPAINT_ORACLE_SURFACE_ACCEPTANCE = (
     "A no-heavy checker pins representative LanPaint workflow exports, Python node semantics, "
     "SetLatentNoiseMask noise-mask behavior, Mojo mask math substrate, the bounded Z-Image "
-    "LanPaint_MaskBlend final-pixel slice, and the current fail-loud sampler boundary before "
+    "LanPaint_MaskBlend final-pixel slice including its base-image area resize role, and the current fail-loud sampler boundary before "
     "full LanPaint runtime parity is claimed."
 )
 
@@ -2153,6 +2173,11 @@ def check_lanpaint_oracle_surface_report(report_path: Path) -> Check:
             missing.append(f"{case_name}.mask_blend_overlap=9")
         if case.get("image_to_mask_channel") != "red":
             missing.append(f"{case_name}.image_to_mask_channel='red'")
+    area_resize = dict_or_empty(dict_or_empty(report.get("oracle")).get("pytorch_area_resize"))
+    if area_resize.get("role") != LANPAINT_AREA_RESIZE_ROLE:
+        missing.append("oracle.pytorch_area_resize.role")
+    if area_resize.get("cases_passed") != 3:
+        missing.append("oracle.pytorch_area_resize.cases_passed=3")
     if missing:
         return Check(
             False,
@@ -2168,7 +2193,7 @@ def check_lanpaint_oracle_surface_report(report_path: Path) -> Check:
         PASS,
         "workflow",
         "LanPaint oracle surface report",
-        "oracle workflows and Python/Comfy mask semantics are pinned; source checks pin bounded Z-Image MaskBlend markers",
+        "oracle workflows, Python/Comfy mask semantics, and PyTorch area resize cases are pinned; source checks pin bounded Z-Image MaskBlend markers",
         rel(report_path),
         LANPAINT_ORACLE_SURFACE_ACCEPTANCE,
     )

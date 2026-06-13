@@ -1,6 +1,7 @@
 from std.python import Python
 
 from serenitymojo.serve.image_io import (
+    decode_image_any,
     decode_comfy_mask,
     resize_mask_bilinear,
     resize_mask_nearest_exact,
@@ -10,6 +11,7 @@ from serenitymojo.serve.image_io import (
     load_lanpaint_latent_preserve_mask,
     load_lanpaint_pixel_blend_mask,
     apply_lanpaint_mask_blend_signed_chw,
+    image_area_resize_to_signed_nchw,
     mask_active_count,
     mask_mean,
 )
@@ -130,4 +132,10 @@ def main() raises:
         1.0e-5,
     )
     _check_close("LanPaint signed blend lane1 mask=0", blended[1], base[1], 1.0e-6)
+
+    var area_signed = image_area_resize_to_signed_nchw(decode_image_any(path), 2, 2)
+    _check_close("area signed r[0,0]", area_signed[0], Float32(-0.8039215803), 1.0e-6)
+    _check_close("area signed r[1,1]", area_signed[3], Float32(-0.3333333135), 1.0e-6)
+    _check_close("area signed g[0,0]", area_signed[4], Float32(0.8039216995), 1.0e-6)
+    _check_close("area signed b[1,0]", area_signed[9], Float32(0.2549020052), 1.0e-6)
     print("image_io_mask_smoke: pass")

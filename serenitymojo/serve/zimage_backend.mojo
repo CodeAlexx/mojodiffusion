@@ -90,7 +90,8 @@ from serenitymojo.serve.backend import (
     reject_unsupported_reference_image_params, reject_unsupported_lanpaint_sampler_params,
 )
 from serenitymojo.serve.image_io import (
-    apply_lanpaint_mask_blend_signed_chw, decode_image_any, image_to_signed_nchw,
+    apply_lanpaint_mask_blend_signed_chw, decode_image_any,
+    image_area_resize_to_signed_nchw, image_to_signed_nchw,
     load_comfy_latent_preserve_mask, load_lanpaint_pixel_blend_mask,
     mask_active_count, mask_mean,
 )
@@ -883,11 +884,7 @@ struct ZImageBackend(GenBackend, Movable):
         var width = shape[3]
         var painted = rgb.to_host(self.ctx)
         var base_img = decode_image_any(self.params.init_image)
-        if base_img.width != width or base_img.height != height:
-            raise Error(
-                "zimage: LanPaint_MaskBlend base image resize requires Comfy ImageScale(area) parity; pre-scale init_image to output size for this backend slice"
-            )
-        var base = image_to_signed_nchw(base_img)
+        var base = image_area_resize_to_signed_nchw(base_img, width, height)
         var blend_mask = load_lanpaint_pixel_blend_mask(
             self.params.mask_image,
             self.params.lanpaint_mask_channel,

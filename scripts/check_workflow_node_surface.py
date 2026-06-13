@@ -40,6 +40,8 @@ KLEIN_STACK_LORA = REPO / "serenitymojo/models/klein/klein_stack_lora.mojo"
 KLEIN_REFERENCE_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_klein_reference_daemon_smoke.py"
 KLEIN_LORA_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_klein_lora_daemon_smoke.py"
 KLEIN_LORA_REFERENCE_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_klein_lora_reference_daemon_smoke.py"
+VISUAL_HEALTH_HELPER = REPO / "scripts/visual_health.py"
+KLEIN_REAL_IMAGE_HEALTH_RUNNER = REPO / "scripts/check_klein_real_image_health.py"
 LANPAINT_ORACLE_SURFACE_RUNNER = REPO / "scripts/check_lanpaint_oracle_surface.py"
 LANPAINT_CANVAS_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_lanpaint_canvas_daemon_smoke.py"
 PIXI = REPO / "pixi.toml"
@@ -50,6 +52,7 @@ KLEIN4B_REFERENCE_DAEMON_SMOKE = REPO / "output/checks/klein4b_reference_edit_da
 KLEIN9B_REFERENCE_DAEMON_SMOKE = REPO / "output/checks/klein9b_reference_edit_daemon_smoke.json"
 KLEIN9B_LORA_DAEMON_SMOKE = REPO / "output/checks/klein9b_lora_daemon_smoke.json"
 KLEIN9B_LORA_REFERENCE_DAEMON_SMOKE = REPO / "output/checks/klein9b_lora_reference_edit_daemon_smoke.json"
+KLEIN_REAL_IMAGE_HEALTH = REPO / "output/checks/klein_real_image_health.json"
 LANPAINT_ORACLE_SURFACE = REPO / "output/checks/lanpaint_oracle_surface.json"
 LANPAINT_CANVAS_DAEMON_SMOKE = REPO / "output/checks/lanpaint_canvas_daemon_smoke.json"
 SERENITYFLOW = Path("/home/alex/serenityflow-v2/serenityflow")
@@ -1859,6 +1862,37 @@ def check_family_surfaces() -> list[Check]:
             acceptance="The real Klein 9B LoRA plus ReferenceLatent edit daemon smoke is reproducible as a checked-in product-path checker instead of only as ad hoc shell history.",
         ),
         check_contains(
+            VISUAL_HEALTH_HELPER,
+            category="workflow",
+            label="real image visual-health helper",
+            needles=[
+                "compute_visual_health",
+                "min_gray_stddev",
+                "min_edge_mean",
+                "min_edge_stddev",
+                "high-frequency noise signature",
+                "not judge aesthetics or oracle parity",
+            ],
+            severity=P1,
+            acceptance=KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE,
+        ),
+        check_contains(
+            KLEIN_REAL_IMAGE_HEALTH_RUNNER,
+            category="workflow",
+            label="Klein real image visual-health runner",
+            needles=[
+                "serenity.klein_real_image_health.v1",
+                "compute_visual_health",
+                "klein4b_reference_edit_daemon_smoke.json",
+                "klein9b_reference_edit_daemon_smoke.json",
+                "klein9b_lora_daemon_smoke.json",
+                "klein9b_lora_reference_edit_daemon_smoke.json",
+                "not pixel/latent/trajectory oracle parity",
+            ],
+            severity=P1,
+            acceptance=KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE,
+        ),
+        check_contains(
             LANPAINT_ORACLE_SURFACE_RUNNER,
             category="workflow",
             label="LanPaint oracle surface checker",
@@ -2136,6 +2170,12 @@ KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE = (
     "A real dispatch-mode daemon smoke runs SerenityFlow's Klein 9B edit-LoRA Comfy graph through "
     "graph LoRA lowering, ReferenceLatent metadata lowering, Qwen3 cap-cache precache, and the "
     "staged Klein ReferenceLatent sampler with the AI Toolkit/Comfy LoRA loaded."
+)
+
+KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE = (
+    "A no-heavy checker reads existing real Klein daemon PNG artifacts and rejects blank, flat, "
+    "stub-like, or obvious high-frequency-noise images. This is a visual-health guard only, "
+    "not aesthetic scoring or Python/Comfy pixel parity."
 )
 
 LANPAINT_ORACLE_SURFACE_ACCEPTANCE = (
@@ -2798,6 +2838,84 @@ def check_klein_lora_reference_daemon_smoke_report(smoke_path: Path) -> Check:
         ),
         rel(smoke_path),
         KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE,
+    )
+
+
+def check_klein_real_image_health_report(report_path: Path) -> Check:
+    report = read_json(report_path)
+    label = "Klein real image visual health"
+    if not report:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            label,
+            f"missing report: {rel(report_path)}",
+            rel(report_path),
+            KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE,
+        )
+    if report.get("ready") is not True:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            label,
+            "report not ready: " + json.dumps(report.get("blockers")),
+            rel(report_path),
+            KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE,
+        )
+    expected_cases = [
+        "klein4b_reference_edit",
+        "klein9b_reference_edit",
+        "klein9b_lora_txt2img",
+        "klein9b_lora_reference_edit",
+    ]
+    cases = dict_or_empty(report.get("cases"))
+    missing = []
+    details = []
+    for case_name in expected_cases:
+        case = dict_or_empty(cases.get(case_name))
+        health = dict_or_empty(case.get("visual_health"))
+        output_path = _evidence_path(case.get("output_path"))
+        if not case:
+            missing.append(f"cases.{case_name}")
+            continue
+        if case.get("ready") is not True:
+            missing.append(f"{case_name}.ready=True")
+        if health.get("ready") is not True:
+            missing.append(f"{case_name}.visual_health.ready=True")
+        if not output_path.is_file():
+            missing.append(f"{case_name}.output_path exists")
+        if not isinstance(health.get("gray_stddev"), (int, float)) or health.get("gray_stddev") < 20.0:
+            missing.append(f"{case_name}.gray_stddev>=20")
+        if not isinstance(health.get("edge_mean"), (int, float)) or health.get("edge_mean") < 8.0:
+            missing.append(f"{case_name}.edge_mean>=8")
+        if not isinstance(health.get("edge_stddev"), (int, float)) or health.get("edge_stddev") < 20.0:
+            missing.append(f"{case_name}.edge_stddev>=20")
+        if health.get("blockers") not in ([], None):
+            missing.append(f"{case_name}.visual_health.blockers=[]")
+        if health:
+            details.append(
+                f"{case_name} gray_stddev={health.get('gray_stddev')} edge_mean={health.get('edge_mean')}"
+            )
+    if missing:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            label,
+            "missing evidence: " + ", ".join(missing),
+            rel(report_path),
+            KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE,
+        )
+    return Check(
+        True,
+        PASS,
+        "workflow",
+        label,
+        "; ".join(details),
+        rel(report_path),
+        KLEIN_REAL_IMAGE_HEALTH_ACCEPTANCE,
     )
 
 
@@ -3731,6 +3849,7 @@ def collect_checks() -> list[Check]:
             KLEIN9B_LORA_REFERENCE_DAEMON_SMOKE
         )
     )
+    checks.append(check_klein_real_image_health_report(KLEIN_REAL_IMAGE_HEALTH))
     checks.append(check_lanpaint_oracle_surface_report(LANPAINT_ORACLE_SURFACE))
     checks.append(check_lanpaint_canvas_daemon_smoke_report(LANPAINT_CANVAS_DAEMON_SMOKE))
     return checks

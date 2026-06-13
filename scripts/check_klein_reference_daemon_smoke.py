@@ -22,6 +22,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from visual_health import compute_visual_health
+
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_DAEMON = REPO / "output/bin/serenity_daemon"
@@ -159,6 +161,7 @@ def validate_report(report: dict[str, Any], args: argparse.Namespace) -> list[st
     job = report.get("job")
     genparams = report.get("genparams")
     manifest = report.get("manifest")
+    visual_health = report.get("visual_health")
     require(isinstance(generate, dict) and generate.get("status") == 200, "POST /v1/generate did not return 200", blockers)
     require(isinstance(job, dict) and job.get("state") == "done", "job did not finish done", blockers)
     require(isinstance(job, dict) and job.get("step") == args.steps and job.get("total") == args.steps, "job step/total mismatch", blockers)
@@ -169,6 +172,8 @@ def validate_report(report: dict[str, Any], args: argparse.Namespace) -> list[st
     require(output_path.is_file() and output_path.stat().st_size > 100_000, "output PNG is too small to be credible", blockers)
     require(isinstance(genparams, dict), "PNG genparams missing", blockers)
     require(isinstance(manifest, dict), "Klein daemon manifest missing", blockers)
+    health_blockers = visual_health.get("blockers") if isinstance(visual_health, dict) else ["missing visual_health"]
+    require(isinstance(visual_health, dict) and visual_health.get("ready") is True, f"visual health failed: {health_blockers}", blockers)
     if isinstance(genparams, dict):
         require(genparams.get("model") == args.expected_model, "genparams model mismatch", blockers)
         require(genparams.get("width") == args.width and genparams.get("height") == args.height, "genparams resolution mismatch", blockers)
@@ -245,6 +250,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 chunks = read_png_text(out)
                 report["png_text_keys"] = sorted(k for k in chunks if not k.startswith("_"))
                 report["idat_sha256"] = chunks.get("_idat_sha256")
+                report["visual_health"] = compute_visual_health(
+                    out, expected_width=args.width, expected_height=args.height
+                )
                 report["genparams"] = json.loads(chunks.get(GENPARAMS_KEY, "{}"))
                 manifest = Path(str(out) + ".klein_daemon_result.json")
                 report["manifest_path"] = str(manifest)

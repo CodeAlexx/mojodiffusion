@@ -26,6 +26,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from visual_health import compute_visual_health
+
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_DAEMON = REPO / "output/bin/serenity_daemon"
@@ -220,6 +222,7 @@ def validate_report(report: dict[str, Any], args: argparse.Namespace) -> list[st
     manifest = dict_or_empty(report.get("manifest"))
     workflow_metadata = dict_or_empty(report.get("workflow_metadata"))
     log_markers = dict_or_empty(report.get("log_markers"))
+    visual_health = dict_or_empty(report.get("visual_health"))
     output_path = output_path_from_report(report)
 
     require(workflow_metadata.get("patched_lora_nodes") == 1, "workflow LoRA node was not patched exactly once", blockers)
@@ -239,6 +242,7 @@ def validate_report(report: dict[str, Any], args: argparse.Namespace) -> list[st
     require(isinstance(report.get("genparams"), dict), "PNG genparams missing", blockers)
     require(isinstance(report.get("manifest"), dict), "Klein daemon manifest missing", blockers)
     require(bool(report.get("idat_sha256")), "PNG IDAT hash missing", blockers)
+    require(visual_health.get("ready") is True, f"visual health failed: {visual_health.get('blockers')}", blockers)
 
     expected_genparams = {
         "schema": GENPARAMS_KEY,
@@ -318,6 +322,9 @@ def collect_artifacts(report: dict[str, Any], args: argparse.Namespace) -> None:
             "color_type": png.get("color_type"),
             "text_keys": sorted(text),
         }
+        report["visual_health"] = compute_visual_health(
+            output_path, expected_width=args.width, expected_height=args.height
+        )
         report["idat_sha256"] = png.get("idat_sha256")
         if GENPARAMS_KEY in text:
             report["genparams"] = json.loads(str(text[GENPARAMS_KEY]))

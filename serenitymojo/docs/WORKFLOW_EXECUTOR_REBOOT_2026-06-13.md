@@ -107,7 +107,7 @@ pixi run build-daemon
   duplicate SetNode names, missing GetNode setter, missing SetNode input,
   unsupported bus type, and GetNode output type mismatch.
   `output/checks/workflow_node_surface_readiness.json` records
-  `checks=123`, `passed=122`, `p0=0`, `p1=0`, `p2=0`, constrained adapter
+  `checks=126`, `passed=125`, `p0=0`, `p1=0`, `p2=0`, constrained adapter
   `READY`, and arbitrary Comfy/Swarm graph parity still `BLOCKED`.
 
 2026-06-13 primitive scalar constant/link slice:
@@ -144,7 +144,7 @@ pixi run build-daemon
   `blockers:[]`. `scalar_canvas_png` proves linked prompt text, dimensions,
   Get/Set-carried steps, seed, cfg, sampler, scheduler, KJ `FloatConstant`
   denoise rounding, and linked `SaveImage.filename_prefix`. Static readiness
-  records `checks=123`, `passed=122`, constrained adapter `READY`, arbitrary
+  records `checks=126`, `passed=125`, constrained adapter `READY`, arbitrary
   Comfy/Swarm graph parity `BLOCKED`.
 - Non-claims: no scalar math (`SimpleCalculatorKJ`, `MathExpression`,
   converters), no string runtime (`StringConcatenate`, regex/string replace),
@@ -197,7 +197,7 @@ pixi run build-daemon
   (`model:"stub"`, `steps:6`, `cfg:2.875`,
   `workflow_save_prefix:"switch-canvas"`), plus `switch_type_mismatch` HTTP 501
   for selecting a STRING into KSampler's MODEL input. Static readiness records
-  `checks=123`, `passed=122`, constrained adapter `READY`, arbitrary
+  `checks=126`, `passed=125`, constrained adapter `READY`, arbitrary
   Comfy/Swarm graph parity `BLOCKED`.
 - Non-claims: no `ComfySoftSwitchNode`, no optional missing-branch semantics, no
   AUDIO/VIDEO switch runtime, no arbitrary unselected unsupported-node escape,
@@ -778,6 +778,44 @@ invocation. It does not prove full-quality multi-step edit aesthetics, exact
 SerenityFlow trajectory parity, multi-LoRA, non-1.0 LoRA weights, CLIP-side
 LoRA, or arbitrary Comfy graph execution.
 
+## Klein Real Image Health Guard
+
+The real Klein daemon smokes now have a no-heavy visual-health gate so a
+syntactically valid PNG is not enough. This directly addresses the bad-output
+failure mode where an artifact has metadata but is blank, flat, stub-like, or
+obvious high-frequency noise.
+
+New files:
+
+- `scripts/visual_health.py`
+- `scripts/check_klein_real_image_health.py`
+
+Repeatable checker:
+
+```bash
+python3 scripts/check_klein_real_image_health.py \
+  --write-report output/checks/klein_real_image_health.json
+```
+
+Evidence in `output/checks/klein_real_image_health.json`:
+
+- `klein4b_reference_edit` / `job-0278`: `gray_stddev:29.4522`,
+  `edge_mean:16.5738`, `edge_stddev:26.2409`.
+- `klein9b_reference_edit` / `job-0279`: `gray_stddev:30.4111`,
+  `edge_mean:17.4739`, `edge_stddev:27.9342`.
+- `klein9b_lora_txt2img` / `job-0308`: `gray_stddev:59.33`,
+  `edge_mean:12.1035`, `edge_stddev:27.3667`.
+- `klein9b_lora_reference_edit` / `job-0309`: `gray_stddev:29.9814`,
+  `edge_mean:15.8863`, `edge_stddev:25.7141`.
+
+Static readiness now verifies the helper, runner, and report:
+`checks=126`, `passed=125`, `p0=0`, `p1=0`, `p2=0`.
+
+Non-claims: this is not aesthetic scoring, not pixel/latent/trajectory parity,
+and not a substitute for SerenityFlow/Comfy oracle comparison. It is only a
+floor that prevents syntactically valid but visually useless real-backend
+artifacts from being treated as ready evidence.
+
 ## Mask / Inpaint Metadata Update
 
 Current bounded contract:
@@ -1179,7 +1217,12 @@ Checks run after this bridge:
 ```bash
 python3 -m py_compile \
   scripts/check_workflow_node_surface.py \
-  scripts/check_workflow_graph_product_contract.py
+  scripts/check_workflow_graph_product_contract.py \
+  scripts/visual_health.py \
+  scripts/check_klein_real_image_health.py \
+  scripts/check_klein_reference_daemon_smoke.py \
+  scripts/check_klein_lora_daemon_smoke.py \
+  scripts/check_klein_lora_reference_daemon_smoke.py
 
 pixi run build-klein-precache
 pixi run build-klein-sampler
@@ -1200,6 +1243,9 @@ python3 scripts/check_klein_lora_daemon_smoke.py \
 
 python3 scripts/check_klein_lora_reference_daemon_smoke.py \
   --write-report output/checks/klein9b_lora_reference_edit_daemon_smoke.json
+
+python3 scripts/check_klein_real_image_health.py \
+  --write-report output/checks/klein_real_image_health.json
 
 python3 scripts/check_workflow_node_surface.py \
   --write-readiness output/checks/workflow_node_surface_readiness.json
@@ -1263,16 +1309,21 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
 
 1. Keep `scripts/check_klein_lora_daemon_smoke.py` as the heavy regression gate
    for Klein 9B single-LoRA txt2img; rerun it after backend/LoRA loader edits
-   before trusting `workflow_node_surface_readiness.json`.
+   before trusting `workflow_node_surface_readiness.json`, then refresh
+   `scripts/check_klein_real_image_health.py`.
 2. Keep `scripts/check_klein_lora_reference_daemon_smoke.py` as the heavy
    regression gate for the SerenityFlow Klein edit-LoRA graph; rerun it after
-   workflow lowering, ReferenceLatent, or LoRA loader edits.
+   workflow lowering, ReferenceLatent, or LoRA loader edits, then refresh
+   `scripts/check_klein_real_image_health.py`.
 3. Verify cancel/status behavior during a real long-running Klein sidecar job;
    the runner is pollable, but this still needs live-model evidence.
 4. Compare the real edit path against SerenityFlow's Python Comfy-compatible
    oracle: `VAEEncode` -> `ReferenceLatent` -> sampler patchify/concat,
    reference ids with `t_offset=10.0`, fixed reference tokens, and target-only
-   slice/update.
+   slice/update. The next parity gate should dump Python oracle reference VAE
+   latent, post-pack initial noise, edit ids/RoPE convention, first-step target
+   velocity, final target latent, and final PNG, then feed the same sidecars
+   into Mojo before accepting real edit image parity.
 5. Extend the no-heavy Python-oracle checker only when SerenityFlow/Comfy
    behavior changes; current guards cover normal VAE encode, ReferenceLatent as
    conditioning metadata, reference patchify/concat, `t_offset=10.0`, and text

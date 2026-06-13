@@ -778,6 +778,14 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("LanPaint_InnerPatience", JSONValue.from_int(_workflow_widget_int(widgets, 9, -1)))
     elif type_id == "LanPaint_MaskBlend":
         fields.set("blend_overlap", JSONValue.from_int(_workflow_widget_int(widgets, 0, -1)))
+    elif type_id == "ImagePadForOutpaint":
+        fields.set("left", JSONValue.from_int(_workflow_widget_int(widgets, 0, 0)))
+        fields.set("top", JSONValue.from_int(_workflow_widget_int(widgets, 1, 0)))
+        fields.set("right", JSONValue.from_int(_workflow_widget_int(widgets, 2, 0)))
+        fields.set("bottom", JSONValue.from_int(_workflow_widget_int(widgets, 3, 0)))
+        fields.set("feathering", JSONValue.from_int(_workflow_widget_int(widgets, 4, 40)))
+    elif type_id == "ThresholdMask":
+        fields.set("value", JSONValue.from_float(_workflow_widget_float(widgets, 0, 0.5)))
     elif type_id == "SaveImage":
         fields.set("filename_prefix", JSONValue.from_string(_workflow_widget_string(widgets, 0, String("ComfyUI"))))
     elif type_id == "ImageToMask":
@@ -967,6 +975,14 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "ImageScale" or typ == "ImageScaleToTotalPixels":
         if slot == 0:
             return String("IMAGE")
+    elif typ == "ImagePadForOutpaint":
+        if slot == 0:
+            return String("IMAGE")
+        if slot == 1:
+            return String("MASK")
+    elif typ == "ThresholdMask":
+        if slot == 0:
+            return String("MASK")
     elif typ == "GetImageSize":
         if slot == 0:
             return String("width")
@@ -1133,6 +1149,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "GetImageSize"
             or type_id == "ImageScale"
             or type_id == "ImageScaleToTotalPixels"
+            or type_id == "ImagePadForOutpaint"
+            or type_id == "ThresholdMask"
             or type_id == "ReferenceLatent"
             or type_id == "6007e698-2ebd-4917-84d8-299b35d7b7ab"
             or type_id == "f07d2d08-2bc5-4dd8-a9f0-f2347c6b5cca"
@@ -1365,6 +1383,22 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(mask_path)
                     image_mask_sources.append(mask_source)
                     done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "ThresholdMask":
+                var mask_link = _workflow_find_input_link(edges, node_id, String("mask"))
+                if not mask_link.found:
+                    raise Error("[501] workflow graph ThresholdMask missing mask input")
+                var idx = _workflow_value_index(value_nodes, value_ports, mask_link.node_id, mask_link.port)
+                if idx >= 0:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, mask_link, String("MASK"), String("mask"))
+                    var mask_path = _workflow_image_path(mask_nodes, mask_ports, mask_paths, mask_link)
+                    var mask_source = _workflow_source_meta(mask_nodes, mask_ports, mask_sources, mask_link)
+                    var threshold = _workflow_float(fields, String("value"), 0.5, 0.0, 1.0)
+                    _set_if_missing(obj, String("threshold_mask_value"), JSONValue.from_float(threshold))
+                    _set_if_missing(obj, String("threshold_mask_operator"), JSONValue.from_string(String("gt")))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MASK"), String("MASK"))
+                    mask_nodes.append(node_id); mask_ports.append(String("MASK")); mask_paths.append(mask_path)
+                    mask_sources.append(mask_source)
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "GetImageSize":
                 var image_link = _workflow_find_input_link(edges, node_id, String("image"))
                 if not image_link.found:
@@ -1388,6 +1422,31 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
                     image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(image_path)
                     image_mask_sources.append(mask_source)
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "ImagePadForOutpaint":
+                var image_link = _workflow_find_input_link(edges, node_id, String("image"))
+                if not image_link.found:
+                    raise Error("[501] workflow graph ImagePadForOutpaint missing image input")
+                var idx = _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port)
+                if idx >= 0:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
+                    var image_path = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
+                    var left = _opt_int(fields, "left", 0, 0, 4096)
+                    var top = _opt_int(fields, "top", 0, 0, 4096)
+                    var right = _opt_int(fields, "right", 0, 0, 4096)
+                    var bottom = _opt_int(fields, "bottom", 0, 0, 4096)
+                    var feathering = _opt_int(fields, "feathering", 40, 0, 4096)
+                    _set_if_missing(obj, String("outpaint_left"), JSONValue.from_int(left))
+                    _set_if_missing(obj, String("outpaint_top"), JSONValue.from_int(top))
+                    _set_if_missing(obj, String("outpaint_right"), JSONValue.from_int(right))
+                    _set_if_missing(obj, String("outpaint_bottom"), JSONValue.from_int(bottom))
+                    _set_if_missing(obj, String("outpaint_feathering"), JSONValue.from_int(feathering))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MASK"), String("MASK"))
+                    image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(image_path)
+                    image_mask_sources.append(String(""))
+                    mask_nodes.append(node_id); mask_ports.append(String("MASK")); mask_paths.append(image_path)
+                    mask_sources.append(String("image_pad_for_outpaint"))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "VAEEncode":
                 var pixels_link = _workflow_find_input_link(edges, node_id, String("pixels"))
@@ -1872,6 +1931,8 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "variation_seed", "variation_strength", "images", "init_image", "creativity",
             "workflow_save_prefix",
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
+            "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
+            "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
             "lanpaint_lambda", "lanpaint_step_size", "lanpaint_beta", "lanpaint_friction",
             "lanpaint_prompt_mode", "lanpaint_inpainting_mode", "lanpaint_add_noise",
@@ -1895,6 +1956,8 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "variation_seed", "variation_strength", "images", "init_image", "creativity",
             "workflow_save_prefix",
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
+            "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
+            "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
             "lanpaint_lambda", "lanpaint_step_size", "lanpaint_beta", "lanpaint_friction",
             "lanpaint_prompt_mode", "lanpaint_inpainting_mode", "lanpaint_add_noise",

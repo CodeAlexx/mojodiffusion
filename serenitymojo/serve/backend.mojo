@@ -69,6 +69,13 @@ struct JobParams(Copyable, Movable):
     # latent. Backends must either execute mask semantics or reject it loudly.
     var mask_image: String
     var lanpaint_mask_channel: String
+    var outpaint_left: Int
+    var outpaint_top: Int
+    var outpaint_right: Int
+    var outpaint_bottom: Int
+    var outpaint_feathering: Int
+    var threshold_mask_value: Float64
+    var threshold_mask_operator: String
     var lanpaint_mask_blend_overlap: Int
     var lanpaint_num_steps: Int
     var lanpaint_lambda: Float64
@@ -121,6 +128,13 @@ struct JobParams(Copyable, Movable):
         self.init_image = String("")
         self.mask_image = String("")
         self.lanpaint_mask_channel = String("")
+        self.outpaint_left = -1
+        self.outpaint_top = -1
+        self.outpaint_right = -1
+        self.outpaint_bottom = -1
+        self.outpaint_feathering = -1
+        self.threshold_mask_value = -1.0
+        self.threshold_mask_operator = String("")
         self.lanpaint_mask_blend_overlap = -1
         self.lanpaint_num_steps = -1
         self.lanpaint_lambda = -1.0
@@ -197,7 +211,14 @@ def has_lanpaint_runtime_params(params: JobParams) -> Bool:
 
 def has_lanpaint_sampler_runtime_params(params: JobParams) -> Bool:
     return (
-        params.lanpaint_num_steps >= 0
+        params.outpaint_left >= 0
+        or params.outpaint_top >= 0
+        or params.outpaint_right >= 0
+        or params.outpaint_bottom >= 0
+        or params.outpaint_feathering >= 0
+        or params.threshold_mask_value >= 0.0
+        or params.threshold_mask_operator.byte_length() > 0
+        or params.lanpaint_num_steps >= 0
         or params.lanpaint_lambda >= 0.0
         or params.lanpaint_step_size >= 0.0
         or params.lanpaint_beta >= 0.0
@@ -218,8 +239,8 @@ def has_lanpaint_sampler_runtime_params(params: JobParams) -> Bool:
 def reject_unsupported_lanpaint_sampler_params(
     params: JobParams, backend_name: String
 ) raises:
-    """Reject LanPaint sampler fields on backends that do not implement the
-    LanPaint mask-aware inner loop. LanPaint_MaskBlend can be handled as a
+    """Reject LanPaint sampler/preprocess fields on backends that do not
+    implement the mask-aware inner loop. LanPaint_MaskBlend can be handled as a
     separate final image blend by backends that opt into it."""
     if has_lanpaint_sampler_runtime_params(params):
         raise Error(

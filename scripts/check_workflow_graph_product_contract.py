@@ -345,6 +345,59 @@ def comfy_api_prompt_request() -> dict[str, Any]:
     }
 
 
+def outpaint_threshold_comfy_api_prompt_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "prompt": {
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "stub"}},
+                "2": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"clip": ["1", 1], "text": "outpaint threshold negative prompt"},
+                },
+                "3": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"clip": ["1", 1], "text": "outpaint threshold positive prompt"},
+                },
+                "4": {"class_type": "LoadImage", "inputs": {"image": "/tmp/serenity_graph_init.png"}},
+                "5": {
+                    "class_type": "ImagePadForOutpaint",
+                    "inputs": {
+                        "image": ["4", 0],
+                        "left": 16,
+                        "top": 8,
+                        "right": 16,
+                        "bottom": 8,
+                        "feathering": 0,
+                    },
+                },
+                "6": {"class_type": "VAEEncode", "inputs": {"pixels": ["5", 0], "vae": ["1", 2]}},
+                "7": {"class_type": "ThresholdMask", "inputs": {"mask": ["5", 1], "value": 0.5}},
+                "8": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["6", 0], "mask": ["7", 0]}},
+                "9": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "model": ["1", 0],
+                        "positive": ["3", 0],
+                        "negative": ["2", 0],
+                        "latent_image": ["8", 0],
+                        "steps": 4,
+                        "seed": 55678,
+                        "cfg": 2.25,
+                        "sampler_name": "euler",
+                        "scheduler": "karras",
+                        "denoise": 0.45,
+                    },
+                },
+                "10": {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["1", 2]}},
+                "11": {
+                    "class_type": "SaveImage",
+                    "inputs": {"images": ["10", 0], "filename_prefix": "outpaint-threshold-graph"},
+                },
+            }
+        }
+    }
+
+
 def serenityflow_template_request(template: Path) -> dict[str, Any]:
     return {"workflow": json.loads(template.read_text(encoding="utf-8"))}
 
@@ -591,6 +644,63 @@ def mask_workflow_request() -> dict[str, Any]:
                 {"id": 4, "type_id": "comfy/LoadImage", "fields": {"image": "/tmp/serenity_graph_init.png"}},
                 {"id": 2, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "mask negative prompt"}},
                 {"id": 3, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "mask positive prompt"}},
+                {"id": 1, "type_id": "comfy/CheckpointLoaderSimple", "fields": {"ckpt_name": "stub"}},
+            ],
+        }
+    }
+
+
+def outpaint_preprocess_workflow_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "version": 1,
+            "edges": [
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 2, "port": "clip"}},
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 3, "port": "clip"}},
+                {"from": {"node": 4, "port": "IMAGE"}, "to": {"node": 5, "port": "image"}},
+                {"from": {"node": 5, "port": "IMAGE"}, "to": {"node": 6, "port": "pixels"}},
+                {"from": {"node": 1, "port": "VAE"}, "to": {"node": 6, "port": "vae"}},
+                {"from": {"node": 5, "port": "MASK"}, "to": {"node": 7, "port": "mask"}},
+                {"from": {"node": 6, "port": "LATENT"}, "to": {"node": 8, "port": "samples"}},
+                {"from": {"node": 7, "port": "MASK"}, "to": {"node": 8, "port": "mask"}},
+                {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 9, "port": "model"}},
+                {"from": {"node": 3, "port": "CONDITIONING"}, "to": {"node": 9, "port": "positive"}},
+                {"from": {"node": 2, "port": "CONDITIONING"}, "to": {"node": 9, "port": "negative"}},
+                {"from": {"node": 8, "port": "LATENT"}, "to": {"node": 9, "port": "latent_image"}},
+                {"from": {"node": 9, "port": "LATENT"}, "to": {"node": 10, "port": "samples"}},
+                {"from": {"node": 1, "port": "VAE"}, "to": {"node": 10, "port": "vae"}},
+                {"from": {"node": 5, "port": "IMAGE"}, "to": {"node": 11, "port": "image1"}},
+                {"from": {"node": 10, "port": "IMAGE"}, "to": {"node": 11, "port": "image2"}},
+                {"from": {"node": 7, "port": "MASK"}, "to": {"node": 11, "port": "mask"}},
+                {"from": {"node": 11, "port": "IMAGE"}, "to": {"node": 12, "port": "images"}},
+            ],
+            "nodes": [
+                {"id": 12, "type_id": "comfy/SaveImage", "fields": {"filename_prefix": "outpaint-preprocess-graph"}},
+                {"id": 11, "type_id": "comfy/LanPaint_MaskBlend", "fields": {"blend_overlap": 9}},
+                {"id": 10, "type_id": "comfy/VAEDecode", "fields": {}},
+                {
+                    "id": 9,
+                    "type_id": "comfy/KSampler",
+                    "fields": {
+                        "steps": 4,
+                        "seed": 77889,
+                        "cfg": 2.5,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 0.45,
+                    },
+                },
+                {"id": 8, "type_id": "comfy/SetLatentNoiseMask", "fields": {}},
+                {"id": 7, "type_id": "comfy/ThresholdMask", "fields": {"value": 0.01}},
+                {"id": 6, "type_id": "comfy/VAEEncode", "fields": {}},
+                {
+                    "id": 5,
+                    "type_id": "comfy/ImagePadForOutpaint",
+                    "fields": {"left": 200, "top": 200, "right": 200, "bottom": 200, "feathering": 20},
+                },
+                {"id": 4, "type_id": "comfy/LoadImage", "fields": {"image": "/tmp/serenity_outpaint_source.png"}},
+                {"id": 2, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "outpaint negative prompt"}},
+                {"id": 3, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "outpaint positive prompt"}},
                 {"id": 1, "type_id": "comfy/CheckpointLoaderSimple", "fields": {"ckpt_name": "stub"}},
             ],
         }
@@ -866,6 +976,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(mask_genparams.get("workflow_node_count") == 10, "mask workflow node count missing", blockers)
                     require(mask_genparams.get("workflow_edge_count") == 13, "mask workflow edge count missing", blockers)
 
+            outpaint_status, outpaint_data, outpaint_text = http_json(
+                "POST", f"{base_url}/v1/generate", outpaint_preprocess_workflow_request()
+            )
+            report["outpaint_preprocess_generate"] = {"status": outpaint_status, "body": outpaint_data}
+            if outpaint_status != 200 or not isinstance(outpaint_data, dict) or not outpaint_data.get("job_id"):
+                blockers.append(f"outpaint preprocess workflow generate failed HTTP {outpaint_status}: {outpaint_text}")
+            else:
+                outpaint_job_id = str(outpaint_data["job_id"])
+                outpaint_job = poll_job(base_url, outpaint_job_id, args.timeout)
+                report["outpaint_preprocess_job"] = outpaint_job
+                require(outpaint_job.get("state") == "done", f"outpaint preprocess workflow job state was {outpaint_job.get('state')}", blockers)
+                outpaint_png_path = Path(str(outpaint_job.get("output_path") or ""))
+                require(outpaint_png_path.is_file(), f"outpaint preprocess workflow PNG missing: {outpaint_png_path}", blockers)
+                if outpaint_png_path.is_file():
+                    outpaint_text_chunks = read_png_text(outpaint_png_path)
+                    outpaint_genparams = json.loads(outpaint_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["outpaint_preprocess_png"] = {
+                        "path": str(outpaint_png_path),
+                        "idat_sha256": outpaint_text_chunks.get("_idat_sha256"),
+                        "genparams": outpaint_genparams,
+                    }
+                    require(outpaint_genparams.get("prompt") == "outpaint positive prompt", "outpaint positive prompt was not consumed", blockers)
+                    require(outpaint_genparams.get("negative") == "outpaint negative prompt", "outpaint negative prompt was not consumed", blockers)
+                    require(outpaint_genparams.get("init_image") == "/tmp/serenity_outpaint_source.png", "ImagePadForOutpaint image path did not flow into init_image", blockers)
+                    require(outpaint_genparams.get("mask_image") == "/tmp/serenity_outpaint_source.png", "ImagePadForOutpaint mask source did not flow into mask_image", blockers)
+                    require(outpaint_genparams.get("lanpaint_mask_channel") == "image_pad_for_outpaint", "ImagePadForOutpaint mask source token missing", blockers)
+                    require(outpaint_genparams.get("outpaint_left") == 200, "ImagePadForOutpaint left padding missing", blockers)
+                    require(outpaint_genparams.get("outpaint_top") == 200, "ImagePadForOutpaint top padding missing", blockers)
+                    require(outpaint_genparams.get("outpaint_right") == 200, "ImagePadForOutpaint right padding missing", blockers)
+                    require(outpaint_genparams.get("outpaint_bottom") == 200, "ImagePadForOutpaint bottom padding missing", blockers)
+                    require(outpaint_genparams.get("outpaint_feathering") == 20, "ImagePadForOutpaint feathering missing", blockers)
+                    require(outpaint_genparams.get("threshold_mask_value") == 0.01, "ThresholdMask value missing", blockers)
+                    require(outpaint_genparams.get("threshold_mask_operator") == "gt", "ThresholdMask strict Comfy operator missing", blockers)
+                    require(outpaint_genparams.get("lanpaint_mask_blend_overlap") == 9, "LanPaint_MaskBlend overlap missing from outpaint graph", blockers)
+                    require(outpaint_genparams.get("creativity") == 0.45, "outpaint KSampler denoise missing from creativity", blockers)
+                    require(outpaint_genparams.get("steps") == 4, "outpaint KSampler steps missing", blockers)
+                    require(outpaint_genparams.get("seed") == 77889, "outpaint KSampler seed missing", blockers)
+                    require(outpaint_genparams.get("workflow_source") == "typed_linked_graph", "outpaint workflow source missing", blockers)
+                    require(outpaint_genparams.get("workflow_save_prefix") == "outpaint-preprocess-graph", "outpaint SaveImage filename_prefix missing", blockers)
+                    require(outpaint_genparams.get("workflow_node_count") == 12, "outpaint workflow node count missing", blockers)
+                    require(outpaint_genparams.get("workflow_edge_count") == 18, "outpaint workflow edge count missing", blockers)
+
             basic_status, basic_data, basic_text = http_json("POST", f"{base_url}/v1/generate", basic_scheduler_workflow_request())
             report["basic_scheduler_generate"] = {"status": basic_status, "body": basic_data}
             if basic_status != 200 or not isinstance(basic_data, dict) or not basic_data.get("job_id"):
@@ -935,6 +1087,55 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(api_genparams.get("workflow_save_prefix") == "comfy-api", "Comfy API SaveImage filename_prefix missing", blockers)
                     require(api_genparams.get("workflow_node_count") == 7, "Comfy API workflow node count missing", blockers)
                     require(api_genparams.get("workflow_edge_count") == 9, "Comfy API workflow edge count missing", blockers)
+
+            outpaint_api_status, outpaint_api_data, outpaint_api_text = http_json(
+                "POST", f"{base_url}/v1/generate", outpaint_threshold_comfy_api_prompt_request()
+            )
+            report["outpaint_threshold_api_generate"] = {"status": outpaint_api_status, "body": outpaint_api_data}
+            if outpaint_api_status != 200 or not isinstance(outpaint_api_data, dict) or not outpaint_api_data.get("job_id"):
+                blockers.append(f"outpaint ThresholdMask Comfy API prompt generate failed HTTP {outpaint_api_status}: {outpaint_api_text}")
+            else:
+                outpaint_api_job_id = str(outpaint_api_data["job_id"])
+                outpaint_api_job = poll_job(base_url, outpaint_api_job_id, args.timeout)
+                report["outpaint_threshold_api_job"] = outpaint_api_job
+                require(
+                    outpaint_api_job.get("state") == "done",
+                    f"outpaint ThresholdMask Comfy API prompt job state was {outpaint_api_job.get('state')}",
+                    blockers,
+                )
+                outpaint_api_png_path = Path(str(outpaint_api_job.get("output_path") or ""))
+                require(outpaint_api_png_path.is_file(), f"outpaint ThresholdMask Comfy API prompt PNG missing: {outpaint_api_png_path}", blockers)
+                if outpaint_api_png_path.is_file():
+                    outpaint_api_text_chunks = read_png_text(outpaint_api_png_path)
+                    outpaint_api_genparams = json.loads(outpaint_api_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["outpaint_threshold_api_png"] = {
+                        "path": str(outpaint_api_png_path),
+                        "idat_sha256": outpaint_api_text_chunks.get("_idat_sha256"),
+                        "genparams": outpaint_api_genparams,
+                    }
+                    require(outpaint_api_genparams.get("prompt") == "outpaint threshold positive prompt", "outpaint API positive prompt was not consumed", blockers)
+                    require(outpaint_api_genparams.get("negative") == "outpaint threshold negative prompt", "outpaint API negative prompt was not consumed", blockers)
+                    require(outpaint_api_genparams.get("model") == "stub", "outpaint API model missing", blockers)
+                    require(outpaint_api_genparams.get("init_image") == "/tmp/serenity_graph_init.png", "outpaint API init_image missing", blockers)
+                    require(outpaint_api_genparams.get("mask_image") == "/tmp/serenity_graph_init.png", "outpaint API mask_image missing", blockers)
+                    require(outpaint_api_genparams.get("lanpaint_mask_channel") == "image_pad_for_outpaint", "outpaint API mask source token missing", blockers)
+                    require(outpaint_api_genparams.get("outpaint_left") == 16, "outpaint API left padding missing", blockers)
+                    require(outpaint_api_genparams.get("outpaint_top") == 8, "outpaint API top padding missing", blockers)
+                    require(outpaint_api_genparams.get("outpaint_right") == 16, "outpaint API right padding missing", blockers)
+                    require(outpaint_api_genparams.get("outpaint_bottom") == 8, "outpaint API bottom padding missing", blockers)
+                    require(outpaint_api_genparams.get("outpaint_feathering") == 0, "outpaint API feathering missing", blockers)
+                    require(outpaint_api_genparams.get("threshold_mask_value") == 0.5, "outpaint API ThresholdMask value missing", blockers)
+                    require(outpaint_api_genparams.get("threshold_mask_operator") == "gt", "outpaint API strict ThresholdMask operator missing", blockers)
+                    require(outpaint_api_genparams.get("steps") == 4, "outpaint API KSampler steps missing", blockers)
+                    require(outpaint_api_genparams.get("seed") == 55678, "outpaint API KSampler seed missing", blockers)
+                    require(outpaint_api_genparams.get("cfg") == 2.25, "outpaint API KSampler cfg missing", blockers)
+                    require(outpaint_api_genparams.get("sampler") == "euler", "outpaint API sampler missing", blockers)
+                    require(outpaint_api_genparams.get("scheduler") == "karras", "outpaint API scheduler missing", blockers)
+                    require(outpaint_api_genparams.get("creativity") == 0.45, "outpaint API denoise missing", blockers)
+                    require(outpaint_api_genparams.get("workflow_source") == "comfy_api_prompt_graph", "outpaint API workflow source missing", blockers)
+                    require(outpaint_api_genparams.get("workflow_save_prefix") == "outpaint-threshold-graph", "outpaint API SaveImage filename_prefix missing", blockers)
+                    require(outpaint_api_genparams.get("workflow_node_count") == 11, "outpaint API workflow node count missing", blockers)
+                    require(outpaint_api_genparams.get("workflow_edge_count") == 15, "outpaint API workflow edge count missing", blockers)
 
             report["serenityflow_t2i"] = {}
             for sf_name, expected in SERENITYFLOW_T2I_CASES.items():
@@ -1174,10 +1375,14 @@ def main() -> int:
     print(f"  zimage_lora_alias_png: {report['zimage_lora_alias_png']['path']}")
     print(f"  mask_job_id: {report['mask_job']['id']}")
     print(f"  mask_png: {report['mask_png']['path']}")
+    print(f"  outpaint_preprocess_job_id: {report['outpaint_preprocess_job']['id']}")
+    print(f"  outpaint_preprocess_png: {report['outpaint_preprocess_png']['path']}")
     print(f"  basic_scheduler_job_id: {report['basic_scheduler_job']['id']}")
     print(f"  basic_scheduler_png: {report['basic_scheduler_png']['path']}")
     print(f"  comfy_api_job_id: {report['comfy_api_job']['id']}")
     print(f"  comfy_api_png: {report['comfy_api_png']['path']}")
+    print(f"  outpaint_threshold_api_job_id: {report['outpaint_threshold_api_job']['id']}")
+    print(f"  outpaint_threshold_api_png: {report['outpaint_threshold_api_png']['path']}")
     for sf_name, sf_case in report["serenityflow_t2i"].items():
         print(f"  serenityflow_{sf_name}_job_id: {sf_case['job']['id']}")
         print(f"  serenityflow_{sf_name}_png: {sf_case['png']['path']}")

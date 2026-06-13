@@ -54,6 +54,13 @@ def encode_start(p: JobParams) raises -> String:
     o.set("init_image", JSONValue.from_string(p.init_image))
     o.set("mask_image", JSONValue.from_string(p.mask_image))
     o.set("lanpaint_mask_channel", JSONValue.from_string(p.lanpaint_mask_channel))
+    o.set("outpaint_left", JSONValue.from_int(p.outpaint_left))
+    o.set("outpaint_top", JSONValue.from_int(p.outpaint_top))
+    o.set("outpaint_right", JSONValue.from_int(p.outpaint_right))
+    o.set("outpaint_bottom", JSONValue.from_int(p.outpaint_bottom))
+    o.set("outpaint_feathering", JSONValue.from_int(p.outpaint_feathering))
+    o.set("threshold_mask_value", JSONValue.from_float(p.threshold_mask_value))
+    o.set("threshold_mask_operator", JSONValue.from_string(p.threshold_mask_operator))
     o.set("lanpaint_mask_blend_overlap", JSONValue.from_int(p.lanpaint_mask_blend_overlap))
     o.set("lanpaint_num_steps", JSONValue.from_int(p.lanpaint_num_steps))
     o.set("lanpaint_lambda", JSONValue.from_float(p.lanpaint_lambda))
@@ -121,6 +128,20 @@ def decode_start(obj: JSONValue) raises -> JobParams:
         p.mask_image = obj["mask_image"].as_string()
     if obj.contains("lanpaint_mask_channel") and not obj["lanpaint_mask_channel"].is_null():
         p.lanpaint_mask_channel = obj["lanpaint_mask_channel"].as_string()
+    if obj.contains("outpaint_left") and not obj["outpaint_left"].is_null():
+        p.outpaint_left = Int(obj["outpaint_left"].as_float())
+    if obj.contains("outpaint_top") and not obj["outpaint_top"].is_null():
+        p.outpaint_top = Int(obj["outpaint_top"].as_float())
+    if obj.contains("outpaint_right") and not obj["outpaint_right"].is_null():
+        p.outpaint_right = Int(obj["outpaint_right"].as_float())
+    if obj.contains("outpaint_bottom") and not obj["outpaint_bottom"].is_null():
+        p.outpaint_bottom = Int(obj["outpaint_bottom"].as_float())
+    if obj.contains("outpaint_feathering") and not obj["outpaint_feathering"].is_null():
+        p.outpaint_feathering = Int(obj["outpaint_feathering"].as_float())
+    if obj.contains("threshold_mask_value") and not obj["threshold_mask_value"].is_null():
+        p.threshold_mask_value = obj["threshold_mask_value"].as_float()
+    if obj.contains("threshold_mask_operator") and not obj["threshold_mask_operator"].is_null():
+        p.threshold_mask_operator = obj["threshold_mask_operator"].as_string()
     if obj.contains("lanpaint_mask_blend_overlap") and not obj["lanpaint_mask_blend_overlap"].is_null():
         p.lanpaint_mask_blend_overlap = Int(obj["lanpaint_mask_blend_overlap"].as_float())
     if obj.contains("lanpaint_num_steps") and not obj["lanpaint_num_steps"].is_null():

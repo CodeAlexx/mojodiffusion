@@ -224,6 +224,36 @@ fenced by `reject_unsupported_lanpaint_sampler_params(...)`, and backends
 without the Z-Image split still reject unsupported LanPaint metadata through
 `reject_unsupported_lanpaint_params(...)`.
 
+## LanPaint Outpaint Preprocessing Handoff
+
+The bounded LanPaint outpaint preprocessing slice is now implemented for graph
+and metadata plumbing: `ImagePadForOutpaint` can lower with the connected
+`ThresholdMask`, `ThresholdMask` uses the strict Comfy operator `gt`, and the
+stable mask source token is `image_pad_for_outpaint`. Product proof covers both
+the typed graph fixture (`job-0475`) and raw Comfy API import fixture
+(`job-0478`).
+
+Verification already recorded:
+
+```bash
+pixi run build-daemon
+# PASS
+
+python3 scripts/check_workflow_graph_product_contract.py \
+  --daemon output/bin/serenity_daemon \
+  --write-readiness output/checks/workflow_graph_product_readiness.json
+# PASS: job-0470..job-0486; typed outpaint job-0475; raw API outpaint job-0478
+
+python3 scripts/check_workflow_node_surface.py \
+  --write-readiness output/checks/workflow_node_surface_readiness.json
+# PASS: 89 checks; constrained adapter READY; arbitrary graph parity BLOCKED
+```
+
+Runtime boundary: full padded tensor generation and the LanPaint sampler loop
+are still blocked/fail-loud for real backends. This slice is graph/metadata
+plumbing with stub product proof, not accepted outpaint or LanPaint runtime
+parity.
+
 Validation passed:
 
 ```bash
@@ -253,8 +283,9 @@ Current static gate coverage:
   LanPaint field lowering, explicit `lanpaint_*` `JobParams`/daemon/IPC fields,
   Z-Image preserve-mask application, Z-Image final decoded `LanPaint_MaskBlend`,
   the LanPaint `ImageScale(area)` -> `MaskBlend.image1` base-image resize
-  oracle, and backend fail-loud rejection for unsupported LanPaint sampler
-  fields.
+  oracle, `ImagePadForOutpaint` + strict-`gt` `ThresholdMask` outpaint
+  preprocessing graph lowering, and backend fail-loud rejection for unsupported
+  LanPaint sampler fields.
 - readiness checks read `output/checks/lanpaint_canvas_daemon_smoke.json` and
   expect the `job-0311` LanPaint canvas metadata smoke.
 - `inpaint_parity.mojo` passes mask-blend and LanPaint overdamped-step tensor
@@ -280,7 +311,8 @@ Currently accepted graph nodes:
 - latent/image: `LoadImage`, `EmptyLatentImage`, `EmptySD3LatentImage`,
   `EmptyFlux2LatentImage`, `ImageToMask`, `MaskToImage`, `VAEEncode`,
   `SetLatentNoiseMask`, `GetImageSize`, `ImageScale`,
-  `ImageScaleToTotalPixels`, `ReferenceLatent`, `VAEDecode`
+  `ImageScaleToTotalPixels`, `ImagePadForOutpaint`, `ThresholdMask`,
+  `ReferenceLatent`, `VAEDecode`
 - embedded subgraph wrappers: `6007e698-2ebd-4917-84d8-299b35d7b7ab`,
   `f07d2d08-2bc5-4dd8-a9f0-f2347c6b5cca`
 - model/sampler/sink: `ModelSamplingAuraFlow`, `ModelSamplingSD3`,
@@ -318,8 +350,8 @@ runtime metadata.
 `LoraLoaderModelOnly` only lowers model-side LoRA metadata into the flat request
 contract; full `LoraLoader`, CLIP-side LoRA, LoRA stacks, KJNodes utilities,
 ControlNet, IPAdapter, arbitrary custom Comfy nodes, and unsupported LanPaint
-utility nodes such as `ImagePadForOutpaint` are still unsupported and should
-fail loud.
+utility nodes outside the bounded graph-lowered slice above are still
+unsupported and should fail loud.
 
 ## Important Non-Claims
 
@@ -329,12 +361,13 @@ fail loud.
   bounded img2img preserve-mask runtime path. This is not full inpaint,
   arbitrary mask tensor, or LanPaint parity.
 - `LanPaint_KSampler`, `LanPaint_KSamplerAdvanced`,
-  `LanPaint_SamplerCustomAdvanced`, `LanPaint_MaskBlend`, `ImageToMask`, and
-  `MaskToImage` are accepted graph-lowering nodes now. They carry metadata and
-  path-backed image/mask handles; LanPaint sampler nodes still do not execute
-  LanPaint denoise semantics in a real backend. Z-Image `LanPaint_MaskBlend` is
-  bounded to final decoded pixel compositing only, with area resize only for
-  the `MaskBlend.image1` base/original-image role, not sampler parity.
+  `LanPaint_SamplerCustomAdvanced`, `LanPaint_MaskBlend`, `ImageToMask`,
+  `MaskToImage`, `ImagePadForOutpaint`, and `ThresholdMask` are accepted
+  graph-lowering nodes now. They carry metadata and path-backed image/mask
+  handles; LanPaint sampler nodes still do not execute LanPaint denoise
+  semantics in a real backend. Z-Image `LanPaint_MaskBlend` is bounded to final
+  decoded pixel compositing only, with area resize only for the
+  `MaskBlend.image1` base/original-image role, not sampler parity.
 - This is not accepted general Z-Image i2i parity.
 - This is not accepted Z-Image/Qwen/Klein/Ideogram inpaint parity.
 - Z-Image init-image encode code may be useful substrate for refiner/LanPaint/
@@ -533,11 +566,14 @@ Current LanPaint boundary:
   mask blend helper and one supplied-score overdamped LanPaint step. This is a
   math substrate, not a backend integration.
 - `LanPaint_KSampler`, `LanPaint_SamplerCustomAdvanced`,
-  `LanPaint_KSamplerAdvanced`, `LanPaint_MaskBlend`, `ImageToMask`, and
-  `MaskToImage` are supported only for graph lowering and metadata propagation.
-  The sampler nodes are not accepted as real LanPaint backend execution
-  semantics. Z-Image `LanPaint_MaskBlend` is accepted only as final decoded
-  pixel blending: max-pool, Gaussian smooth with
+  `LanPaint_KSamplerAdvanced`, `LanPaint_MaskBlend`, `ImageToMask`,
+  `MaskToImage`, `ImagePadForOutpaint`, and `ThresholdMask` are supported only
+  for graph lowering and metadata propagation. `ImagePadForOutpaint` only
+  records bounded outpaint preprocessing metadata and mask source
+  `image_pad_for_outpaint`; it does not generate full padded tensors for real
+  backends. The sampler nodes are not accepted as real LanPaint backend
+  execution semantics. Z-Image `LanPaint_MaskBlend` is accepted only as final
+  decoded pixel blending: max-pool, Gaussian smooth with
   `sigma=(blend_overlap-1)/4`, then `image1*(1-mask)+image2*mask`; base-image
   resize is limited to Comfy/PyTorch `area` semantics for the
   `ImageScale(area)` -> `MaskBlend.image1` role.
@@ -559,7 +595,8 @@ LanPaint oracles found under `/home/alex/LanPaint/example_workflows`:
   `Flux.2.Dev_Inpaint.json`
 - node classes: `LanPaint_KSampler`, `LanPaint_KSamplerAdvanced`,
   `LanPaint_SamplerCustomAdvanced`, `LanPaint_MaskBlend`,
-  `SetLatentNoiseMask`, `ImagePadForOutpaint`, `ReferenceLatent`
+  `SetLatentNoiseMask`, `ImagePadForOutpaint`, `ThresholdMask`,
+  `ReferenceLatent`
 
 Klein edit oracles:
 
@@ -905,9 +942,11 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
 6. Keep text-id RoPE tied to the Python/Comfy `txt_ids_dims=[3]` convention in
    `serenityflow/bridge/sampling.py`; do not switch it based on non-Python
    sources.
-7. Next queued LanPaint slices from agent audits are bounded preprocessing for
-   `ImagePadForOutpaint` and `ThresholdMask`, not full LanPaint sampler parity.
-   Move broader LanPaint/inpaint work from metadata-only graph lowering to real
+7. The bounded `ImagePadForOutpaint` + strict-`gt` `ThresholdMask` preprocessing
+   slice is graph/metadata plumbing only, with stub proofs `job-0475` and
+   `job-0478`; full
+   padded tensor generation is still blocked/fail-loud for real backends. Move
+   broader LanPaint/inpaint work from metadata-only graph lowering to real
    runtime implementation only from SerenityFlow/LanPaint oracles:
    `LanPaint_KSampler`, `LanPaint_SamplerCustomAdvanced`,
    `LanPaint_KSamplerAdvanced`, and real sampler-loop `mask_image`/`lanpaint_*`

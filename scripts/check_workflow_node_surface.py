@@ -88,6 +88,8 @@ SUPPORTED_NODE_TYPES = [
     "GetImageSize",
     "ImageScale",
     "ImageScaleToTotalPixels",
+    "ImagePadForOutpaint",
+    "ThresholdMask",
     "ReferenceLatent",
     "6007e698-2ebd-4917-84d8-299b35d7b7ab",
     "f07d2d08-2bc5-4dd8-a9f0-f2347c6b5cca",
@@ -121,8 +123,6 @@ UNSUPPORTED_NODE_EXAMPLES = [
     "ImageUpscaleWithModel",
     "VideoCombine",
     "LanPaint_SamplerCustom",
-    "ImagePadForOutpaint",
-    "ThresholdMask",
     "TextEncodeQwenImageEdit",
     "TextEncodeQwenImageEditPlus",
     "InpaintModelConditioning",
@@ -469,6 +469,8 @@ def check_supported_nodes() -> list[Check]:
                 "LanPaint_KSamplerAdvanced",
                 "LanPaint_SamplerCustomAdvanced",
                 "LanPaint_MaskBlend",
+                "ImagePadForOutpaint",
+                "ThresholdMask",
                 "SaveImage",
                 "filename_prefix",
                 "ImageToMask",
@@ -478,6 +480,7 @@ def check_supported_nodes() -> list[Check]:
                 "LanPaint_PromptMode",
                 "LanPaint_InnerThreshold",
                 "blend_overlap",
+                "feathering",
             ],
             severity=P0,
             acceptance="Comfy UI visual widget arrays map bounded LanPaint nodes into canonical fields before typed execution.",
@@ -505,6 +508,31 @@ def check_supported_nodes() -> list[Check]:
             ],
             severity=P0,
             acceptance="Comfy/SerenityFlow LoRA loader nodes lower model-side adapters into the existing flat LoRA metadata contract and keep CLIP-side LoRA fail-loud unless the clip strength is zero.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
+            category="workflow",
+            label="LanPaint outpaint preprocessing lowering",
+            needles=[
+                "ImagePadForOutpaint",
+                "ThresholdMask",
+                "outpaint_left",
+                "outpaint_top",
+                "outpaint_right",
+                "outpaint_bottom",
+                "outpaint_feathering",
+                "threshold_mask_value",
+                "threshold_mask_operator",
+                "image_pad_for_outpaint",
+                'JSONValue.from_string(String("gt"))',
+                "workflow graph ImagePadForOutpaint missing image input",
+                "workflow graph ThresholdMask missing mask input",
+            ],
+            severity=P0,
+            acceptance="Bounded Comfy ImagePadForOutpaint and strict ThresholdMask imports preserve outpaint preprocessing metadata while full sampler/runtime parity remains fail-loud.",
         )
     )
     checks.append(
@@ -2359,6 +2387,8 @@ def check_workflow_graph_product_report() -> Check:
     png = report.get("png")
     api_job = report.get("comfy_api_job")
     api_png = report.get("comfy_api_png")
+    outpaint_threshold_api_job = report.get("outpaint_threshold_api_job")
+    outpaint_threshold_api_png = report.get("outpaint_threshold_api_png")
     img_job = report.get("img2img_job")
     img_png = report.get("img2img_png")
     lora_job = report.get("lora_job")
@@ -2367,6 +2397,8 @@ def check_workflow_graph_product_report() -> Check:
     zimage_lora_alias_png = report.get("zimage_lora_alias_png")
     mask_job = report.get("mask_job")
     mask_png = report.get("mask_png")
+    outpaint_preprocess_job = report.get("outpaint_preprocess_job")
+    outpaint_preprocess_png = report.get("outpaint_preprocess_png")
     basic_scheduler_job = report.get("basic_scheduler_job")
     basic_scheduler_png = report.get("basic_scheduler_png")
     sf_evidence = serenityflow_t2i_case(report, "zimage_t2i")
@@ -2380,6 +2412,8 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(png, dict)
         or not isinstance(api_job, dict)
         or not isinstance(api_png, dict)
+        or not isinstance(outpaint_threshold_api_job, dict)
+        or not isinstance(outpaint_threshold_api_png, dict)
         or not isinstance(img_job, dict)
         or not isinstance(img_png, dict)
         or not isinstance(lora_job, dict)
@@ -2388,6 +2422,8 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(zimage_lora_alias_png, dict)
         or not isinstance(mask_job, dict)
         or not isinstance(mask_png, dict)
+        or not isinstance(outpaint_preprocess_job, dict)
+        or not isinstance(outpaint_preprocess_png, dict)
         or not isinstance(basic_scheduler_job, dict)
         or not isinstance(basic_scheduler_png, dict)
         or not isinstance(unsupported_api, dict)
@@ -2398,7 +2434,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, outpaint ThresholdMask API import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2497,6 +2533,30 @@ def check_workflow_graph_product_report() -> Check:
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
+    outpaint_genparams = outpaint_preprocess_png.get("genparams")
+    if (
+        not isinstance(outpaint_genparams, dict)
+        or outpaint_genparams.get("init_image") != "/tmp/serenity_outpaint_source.png"
+        or outpaint_genparams.get("mask_image") != "/tmp/serenity_outpaint_source.png"
+        or outpaint_genparams.get("lanpaint_mask_channel") != "image_pad_for_outpaint"
+        or outpaint_genparams.get("outpaint_left") != 200
+        or outpaint_genparams.get("outpaint_top") != 200
+        or outpaint_genparams.get("outpaint_right") != 200
+        or outpaint_genparams.get("outpaint_bottom") != 200
+        or outpaint_genparams.get("outpaint_feathering") != 20
+        or outpaint_genparams.get("threshold_mask_value") != 0.01
+        or outpaint_genparams.get("threshold_mask_operator") != "gt"
+        or outpaint_genparams.get("lanpaint_mask_blend_overlap") != 9
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "ImagePadForOutpaint/ThresholdMask metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
     api_genparams = api_png.get("genparams")
     if (
         not isinstance(api_genparams, dict)
@@ -2508,6 +2568,33 @@ def check_workflow_graph_product_report() -> Check:
             "workflow",
             "typed workflow graph product smoke",
             "Comfy API prompt graph metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    outpaint_api_genparams = outpaint_threshold_api_png.get("genparams")
+    if (
+        not isinstance(outpaint_api_genparams, dict)
+        or outpaint_api_genparams.get("workflow_source") != "comfy_api_prompt_graph"
+        or outpaint_api_genparams.get("workflow_save_prefix") != "outpaint-threshold-graph"
+        or outpaint_api_genparams.get("init_image") != "/tmp/serenity_graph_init.png"
+        or outpaint_api_genparams.get("mask_image") != "/tmp/serenity_graph_init.png"
+        or outpaint_api_genparams.get("lanpaint_mask_channel") != "image_pad_for_outpaint"
+        or outpaint_api_genparams.get("outpaint_left") != 16
+        or outpaint_api_genparams.get("outpaint_top") != 8
+        or outpaint_api_genparams.get("outpaint_right") != 16
+        or outpaint_api_genparams.get("outpaint_bottom") != 8
+        or outpaint_api_genparams.get("outpaint_feathering") != 0
+        or outpaint_api_genparams.get("threshold_mask_value") != 0.5
+        or outpaint_api_genparams.get("threshold_mask_operator") != "gt"
+        or outpaint_api_genparams.get("workflow_node_count") != 11
+        or outpaint_api_genparams.get("workflow_edge_count") != 15
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "ImagePadForOutpaint/ThresholdMask Comfy API import metadata missing from product report",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2576,8 +2663,10 @@ def check_workflow_graph_product_report() -> Check:
         f"img2img graph completed {img_job.get('id')}; "
         f"LoRA graph completed {lora_job.get('id')}; "
         f"mask graph completed {mask_job.get('id')}; "
+        f"outpaint preprocess graph completed {outpaint_preprocess_job.get('id')}; "
         f"BasicScheduler graph completed {basic_scheduler_job.get('id')}; "
         f"Comfy API prompt completed {api_job.get('id')}; "
+        f"outpaint ThresholdMask API completed {outpaint_threshold_api_job.get('id')}; "
         "unsupported and wrong-type links returned HTTP 501"
     )
     sf_cases = report.get("serenityflow_t2i")

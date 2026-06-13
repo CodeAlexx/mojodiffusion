@@ -63,6 +63,7 @@ struct JobParams(Copyable, Movable):
     var images: Int       # requested output count from the UI request
     var image_index: Int  # 0-based output index for this backend job
     var image_count: Int  # total outputs for the original UI request
+    var workflow_save_prefix: String  # Comfy SaveImage.filename_prefix metadata
     var init_image: String   # P7 img2img: init image path ("" = txt2img)
     # Comfy SetLatentNoiseMask/Inpaint: mask image path associated with a
     # latent. Backends must either execute mask semantics or reject it loudly.
@@ -116,6 +117,7 @@ struct JobParams(Copyable, Movable):
         self.images = 1
         self.image_index = 0
         self.image_count = 1
+        self.workflow_save_prefix = String("")
         self.init_image = String("")
         self.mask_image = String("")
         self.lanpaint_mask_channel = String("")

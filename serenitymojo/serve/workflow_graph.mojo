@@ -778,6 +778,8 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("LanPaint_InnerPatience", JSONValue.from_int(_workflow_widget_int(widgets, 9, -1)))
     elif type_id == "LanPaint_MaskBlend":
         fields.set("blend_overlap", JSONValue.from_int(_workflow_widget_int(widgets, 0, -1)))
+    elif type_id == "SaveImage":
+        fields.set("filename_prefix", JSONValue.from_string(_workflow_widget_string(widgets, 0, String("ComfyUI"))))
     elif type_id == "ImageToMask":
         fields.set("channel", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
     elif type_id == "RandomNoise":
@@ -1796,6 +1798,9 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 var idx = _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port)
                 if idx >= 0:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("images"))
+                    var prefix = _workflow_string(fields, String("filename_prefix"))
+                    if prefix != "":
+                        _set_if_missing(obj, String("workflow_save_prefix"), JSONValue.from_string(prefix))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "PreviewImage":
                 var image_link = _workflow_find_input_link(edges, node_id, String("images"))
@@ -1862,6 +1867,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "steps", "seed", "cfg", "cfg_override", "cfg_override_start_percent",
             "cfg_override_end_percent", "sampler", "scheduler", "sigma_shift",
             "variation_seed", "variation_strength", "images", "init_image", "creativity",
+            "workflow_save_prefix",
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
             "lanpaint_lambda", "lanpaint_step_size", "lanpaint_beta", "lanpaint_friction",
@@ -1873,6 +1879,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
         ]
         for i in range(len(keys)):
             _copy_field_if_missing(obj, params, keys[i], keys[i])
+        _copy_field_if_missing(obj, params, String("filename_prefix"), String("workflow_save_prefix"))
         _record_workflow_execution(obj, String("flat_params_adapter"), 0, 0)
         return
 
@@ -1883,6 +1890,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "steps", "seed", "cfg", "cfg_override", "cfg_override_start_percent",
             "cfg_override_end_percent", "sampler", "scheduler", "sigma_shift",
             "variation_seed", "variation_strength", "images", "init_image", "creativity",
+            "workflow_save_prefix",
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
             "lanpaint_lambda", "lanpaint_step_size", "lanpaint_beta", "lanpaint_friction",
@@ -1894,6 +1902,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
         ]
         for i in range(len(keys)):
             _copy_field_if_missing(obj, params, keys[i], keys[i])
+        _copy_field_if_missing(obj, params, String("filename_prefix"), String("workflow_save_prefix"))
         _record_workflow_execution(obj, String("flat_genparams_adapter"), 0, 0)
         return
 

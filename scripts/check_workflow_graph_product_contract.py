@@ -664,6 +664,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(genparams.get("workflow_schema") == "serenity.workflow_graph.v1", "workflow schema missing from genparams", blockers)
                     require(genparams.get("workflow_executor") == "serenity.workflow_graph.executor.v1", "workflow executor missing from genparams", blockers)
                     require(genparams.get("workflow_source") == "typed_linked_graph", "workflow source missing from genparams", blockers)
+                    require(genparams.get("workflow_save_prefix") == "typed-graph", "SaveImage filename_prefix missing from genparams", blockers)
                     require(genparams.get("workflow_node_count") == 7, "workflow node count missing from genparams", blockers)
                     require(genparams.get("workflow_edge_count") == 9, "workflow edge count missing from genparams", blockers)
 
@@ -693,6 +694,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(img_genparams.get("steps") == 5, "img2img KSampler steps missing", blockers)
                     require(img_genparams.get("seed") == 34567, "img2img KSampler seed missing", blockers)
                     require(img_genparams.get("workflow_source") == "typed_linked_graph", "img2img workflow source missing", blockers)
+                    require(img_genparams.get("workflow_save_prefix") == "img2img-graph", "img2img SaveImage filename_prefix missing", blockers)
                     require(img_genparams.get("workflow_node_count") == 8, "img2img workflow node count missing", blockers)
                     require(img_genparams.get("workflow_edge_count") == 11, "img2img workflow edge count missing", blockers)
 
@@ -723,6 +725,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         require(loras[0].get("name") == "graph_lora.safetensors", "LoRA graph name missing", blockers)
                         require(loras[0].get("weight") == 0.8, "LoRA graph strength_model missing", blockers)
                     require(lora_genparams.get("workflow_source") == "typed_linked_graph", "LoRA workflow source missing", blockers)
+                    require(lora_genparams.get("workflow_save_prefix") == "lora-graph", "LoRA SaveImage filename_prefix missing", blockers)
                     require(lora_genparams.get("workflow_node_count") == 8, "LoRA workflow node count missing", blockers)
                     require(lora_genparams.get("workflow_edge_count") == 11, "LoRA workflow edge count missing", blockers)
 
@@ -753,6 +756,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(mask_genparams.get("steps") == 4, "mask KSampler steps missing", blockers)
                     require(mask_genparams.get("seed") == 45678, "mask KSampler seed missing", blockers)
                     require(mask_genparams.get("workflow_source") == "typed_linked_graph", "mask workflow source missing", blockers)
+                    require(mask_genparams.get("workflow_save_prefix") == "mask-graph", "mask SaveImage filename_prefix missing", blockers)
                     require(mask_genparams.get("workflow_node_count") == 10, "mask workflow node count missing", blockers)
                     require(mask_genparams.get("workflow_edge_count") == 13, "mask workflow edge count missing", blockers)
 
@@ -788,6 +792,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(basic_genparams.get("scheduler") == "simple", "BasicScheduler scheduler missing from SIGMAS metadata", blockers)
                     require(basic_genparams.get("creativity") == 0.33, "BasicScheduler denoise missing from creativity", blockers)
                     require(basic_genparams.get("workflow_source") == "typed_linked_graph", "BasicScheduler workflow source missing", blockers)
+                    require(basic_genparams.get("workflow_save_prefix") == "basic-scheduler-graph", "BasicScheduler SaveImage filename_prefix missing", blockers)
                     require(basic_genparams.get("workflow_node_count") == 10, "BasicScheduler workflow node count missing", blockers)
                     require(basic_genparams.get("workflow_edge_count") == 12, "BasicScheduler workflow edge count missing", blockers)
 
@@ -821,6 +826,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(api_genparams.get("scheduler") == "karras", "Comfy API scheduler missing", blockers)
                     require(api_genparams.get("creativity") == 0.625, "Comfy API denoise missing", blockers)
                     require(api_genparams.get("workflow_source") == "comfy_api_prompt_graph", "Comfy API workflow source missing", blockers)
+                    require(api_genparams.get("workflow_save_prefix") == "comfy-api", "Comfy API SaveImage filename_prefix missing", blockers)
                     require(api_genparams.get("workflow_node_count") == 7, "Comfy API workflow node count missing", blockers)
                     require(api_genparams.get("workflow_edge_count") == 9, "Comfy API workflow edge count missing", blockers)
 

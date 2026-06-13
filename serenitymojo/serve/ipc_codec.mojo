@@ -50,6 +50,7 @@ def encode_start(p: JobParams) raises -> String:
     o.set("images", JSONValue.from_int(p.images))
     o.set("image_index", JSONValue.from_int(p.image_index))
     o.set("image_count", JSONValue.from_int(p.image_count))
+    o.set("workflow_save_prefix", JSONValue.from_string(p.workflow_save_prefix))
     o.set("init_image", JSONValue.from_string(p.init_image))
     o.set("mask_image", JSONValue.from_string(p.mask_image))
     o.set("lanpaint_mask_channel", JSONValue.from_string(p.lanpaint_mask_channel))
@@ -113,6 +114,8 @@ def decode_start(obj: JSONValue) raises -> JobParams:
     p.images = Int(obj["images"].as_float())
     p.image_index = Int(obj["image_index"].as_float())
     p.image_count = Int(obj["image_count"].as_float())
+    if obj.contains("workflow_save_prefix") and not obj["workflow_save_prefix"].is_null():
+        p.workflow_save_prefix = obj["workflow_save_prefix"].as_string()
     p.init_image = obj["init_image"].as_string()
     if obj.contains("mask_image") and not obj["mask_image"].is_null():
         p.mask_image = obj["mask_image"].as_string()

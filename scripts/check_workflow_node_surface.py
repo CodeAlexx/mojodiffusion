@@ -468,6 +468,8 @@ def check_supported_nodes() -> list[Check]:
                 "LanPaint_KSamplerAdvanced",
                 "LanPaint_SamplerCustomAdvanced",
                 "LanPaint_MaskBlend",
+                "SaveImage",
+                "filename_prefix",
                 "ImageToMask",
                 "BasicScheduler",
                 "denoise",
@@ -618,6 +620,7 @@ def check_supported_nodes() -> list[Check]:
                 "batch_size",
                 "image",
                 "path",
+                "workflow_save_prefix",
                 "init_image",
                 "mask_image",
                 "reference_image",
@@ -686,6 +689,7 @@ def check_supported_nodes() -> list[Check]:
                 "var sampler: String",
                 "var scheduler: String",
                 "var sigma_shift: Float64",
+                "var workflow_save_prefix: String",
                 "var init_image: String",
                 "var mask_image: String",
                 "var lanpaint_mask_channel: String",
@@ -880,6 +884,17 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             DAEMON,
             category="workflow",
+            label="daemon parses SaveImage filename prefix genparams",
+            needles=[
+                'p.workflow_save_prefix = _opt_str(obj, "workflow_save_prefix", String(""))',
+                'o.set("workflow_save_prefix", JSONValue.from_string(p.workflow_save_prefix))',
+            ],
+            severity=P1,
+            acceptance="Comfy SaveImage.filename_prefix survives parse_generate and canonical PNG/job metadata as workflow_save_prefix without changing artifact naming semantics.",
+        ),
+        check_contains(
+            DAEMON,
+            category="workflow",
             label="daemon parses mask image genparams",
             needles=[
                 'p.mask_image = _opt_str(obj, "mask_image", String(""))',
@@ -902,6 +917,17 @@ def check_family_surfaces() -> list[Check]:
             ],
             severity=P1,
             acceptance="LanPaint metadata survives parse_generate and canonical PNG/job metadata.",
+        ),
+        check_contains(
+            IPC_CODEC,
+            category="workflow",
+            label="worker IPC preserves SaveImage filename prefix genparams",
+            needles=[
+                'o.set("workflow_save_prefix", JSONValue.from_string(p.workflow_save_prefix))',
+                'p.workflow_save_prefix = obj["workflow_save_prefix"].as_string()',
+            ],
+            severity=P1,
+            acceptance="Process-isolated worker IPC does not drop SaveImage filename-prefix metadata.",
         ),
         check_contains(
             IPC_CODEC,
@@ -2376,6 +2402,23 @@ def check_workflow_graph_product_report() -> Check:
             "workflow",
             "typed workflow graph product smoke",
             "LoraLoader CLIP-side unsupported report did not return HTTP 501",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    linked_genparams = png.get("genparams")
+    api_genparams = api_png.get("genparams")
+    if (
+        not isinstance(linked_genparams, dict)
+        or linked_genparams.get("workflow_save_prefix") != "typed-graph"
+        or not isinstance(api_genparams, dict)
+        or api_genparams.get("workflow_save_prefix") != "comfy-api"
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "SaveImage filename_prefix metadata missing from typed or Comfy API product report",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )

@@ -1251,6 +1251,7 @@ def parse_generate(
         raise Error("'seed + images - 1' must be <= 4294967295")
     p.image_index = 0
     p.image_count = p.images
+    p.workflow_save_prefix = _opt_str(obj, "workflow_save_prefix", String(""))
     # P7 img2img: init image path + creativity (0..1). The backend decides
     # whether/how to honor them (stub echoes; zimage does real img2img).
     p.init_image = _opt_str(obj, "init_image", String(""))
@@ -1359,6 +1360,7 @@ def parse_generate(
     o.set("images", JSONValue.from_int(p.images))
     o.set("image_index", JSONValue.from_int(p.image_index))
     o.set("image_count", JSONValue.from_int(p.image_count))
+    o.set("workflow_save_prefix", JSONValue.from_string(p.workflow_save_prefix))
     o.set("init_image", JSONValue.from_string(p.init_image))
     o.set("mask_image", JSONValue.from_string(p.mask_image))
     o.set("lanpaint_mask_channel", JSONValue.from_string(p.lanpaint_mask_channel))

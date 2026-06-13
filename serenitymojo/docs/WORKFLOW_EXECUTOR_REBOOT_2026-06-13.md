@@ -45,6 +45,8 @@ it must not pretend that ordinary img2img or txt2img is mask-aware denoise.
   `serenitymojo/models/klein/klein_stack_lora.mojo`
 - Klein Python oracle artifact producer:
   `scripts/produce_klein_reference_edit_serenityflow_oracle.py`
+- Klein Python/Mojo edit comparator:
+  `scripts/compare_klein_reference_edit_parity.py`
 - Product readiness: `output/checks/workflow_graph_product_readiness.json`
 - Klein LoRA readiness evidence:
   `output/checks/klein9b_lora_daemon_smoke.json`,
@@ -1312,6 +1314,54 @@ This smoke proves tensor-bin headers, ReferenceLatent pack/id layout, effective
 initial target tokens, and the no-claim manifest only. It is not an oracle
 parity claim because it uses a synthetic zero reference and does not run the DiT.
 
+## Klein ReferenceLatent Paired Comparator Update
+
+`scripts/compare_klein_reference_edit_parity.py` compares an oracle manifest
+against a Mojo edit dump manifest without running any model code. It reads only
+existing `KLNCAPV1` tensor-bin artifacts and PNGs.
+
+Required paired comparisons:
+
+- scheduler sigmas, timesteps, edit shift, denoise strength, and reference
+  `t_offset`
+- `python_reference_tokens` vs `mojo_reference_tokens`
+- `python_reference_combined_img_ids` vs `mojo_reference_combined_img_ids`
+- `python_initial_noise_post_pack` vs `mojo_edit_initial_noise_target_tokens`
+- `python_edit_effective_initial_target_tokens` vs
+  `mojo_edit_effective_initial_target_tokens`
+- `python_edit_combined_tokens_step0` vs `mojo_edit_combined_tokens_step0`
+- `python_edit_target_latent_trajectory` vs
+  `mojo_edit_target_latent_trajectory`
+- `python_final_packed_latent` vs `mojo_final_packed_latent`
+- `python_final_unscaled_unpatchified_latent` vs
+  `mojo_final_unscaled_unpatchified_latent`
+- `python_vae_decoded_tensor` vs `mojo_vae_decoded_tensor`
+- `python_png` vs `mojo_png`
+
+Usage:
+
+```bash
+python3 scripts/compare_klein_reference_edit_parity.py \
+  --python-manifest /path/to/klein_reference_edit_serenityflow_oracle_manifest.json \
+  --mojo-manifest /path/to/klein_reference_edit_mojo_manifest.json \
+  --write-report /path/to/klein_reference_edit_compare_report.json
+```
+
+The report sets `accepted_reference_edit_parity:true` and `parity_claimed:true`
+only when the scheduler and every required tensor/PNG comparison are present and
+within tolerance. Use `--report-only` when collecting partial reports that
+should not fail the shell.
+
+No-heavy validation:
+
+```bash
+python3 scripts/compare_klein_reference_edit_parity.py --self-test
+```
+
+The self-test creates tiny tensor-bin/PNG manifests, proves an exact pair is
+accepted, then proves deliberate tensor and scheduler mismatches are rejected.
+It does not use CUDA, Qwen, LTX2, the DiT, or the VAE.
+
 Files touched for this bridge:
 
 - `serenitymojo/serve/klein_backend.mojo`
@@ -1325,6 +1375,7 @@ Files touched for this bridge:
 - `scripts/check_klein_initial_noise_sidecar_contract.py`
 - `scripts/check_klein_sampler_parity_contract.py`
 - `scripts/produce_klein_reference_edit_serenityflow_oracle.py`
+- `scripts/compare_klein_reference_edit_parity.py`
 
 New build tasks:
 

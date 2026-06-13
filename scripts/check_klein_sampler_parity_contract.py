@@ -45,6 +45,7 @@ CONDITIONING_TEMPLATE_GUARD = REPO / "scripts/check_klein_conditioning_template_
 INITIAL_NOISE_SIDECAR_GUARD = REPO / "scripts/check_klein_initial_noise_sidecar_contract.py"
 SAMPLER_ARTIFACT_GUARD = REPO / "scripts/check_klein_sampler_artifact_manifest.py"
 SERENITYFLOW_ORACLE_PRODUCER = REPO / "scripts/produce_klein_reference_edit_serenityflow_oracle.py"
+REFERENCE_EDIT_COMPARATOR = REPO / "scripts/compare_klein_reference_edit_parity.py"
 USE_STATUS = REPO / "MOJO_TRAINER_USE_STATUS.md"
 PORT_STATUS = REPO / "OT_MOJO_PORT_REMAINING.md"
 
@@ -294,6 +295,7 @@ def gather_report() -> ContractReport:
         "initial_noise_guard": read_source(INITIAL_NOISE_SIDECAR_GUARD),
         "sampler_artifact_guard": read_source(SAMPLER_ARTIFACT_GUARD),
         "serenityflow_oracle_producer": read_source(SERENITYFLOW_ORACLE_PRODUCER),
+        "reference_edit_comparator": read_source(REFERENCE_EDIT_COMPARATOR),
         "use_status": read_source(USE_STATUS),
         "port_status": read_source(PORT_STATUS),
     }
@@ -596,6 +598,50 @@ def gather_report() -> ContractReport:
                 "unless live text loading is explicitly allowed."
             ),
             detail_missing="SerenityFlow ReferenceLatent edit oracle producer markers changed; inspect Python oracle artifact coverage manually.",
+        )
+    )
+    facts.append(
+        fact_for_needles(
+            status_if_ok="PASS",
+            status_if_missing="WARN",
+            label="Klein ReferenceLatent edit paired comparator",
+            source=sources["reference_edit_comparator"],
+            needles=(
+                "compare_klein_reference_edit_parity.py",
+                "MAGIC = 0x4B4C4E4341505631",
+                "python_reference_tokens",
+                "mojo_reference_tokens",
+                "python_reference_combined_img_ids",
+                "mojo_reference_combined_img_ids",
+                "python_initial_noise_post_pack",
+                "mojo_edit_initial_noise_target_tokens",
+                "python_edit_effective_initial_target_tokens",
+                "mojo_edit_effective_initial_target_tokens",
+                "python_edit_combined_tokens_step0",
+                "mojo_edit_combined_tokens_step0",
+                "python_edit_target_latent_trajectory",
+                "mojo_edit_target_latent_trajectory",
+                "python_final_packed_latent",
+                "mojo_final_packed_latent",
+                "python_final_unscaled_unpatchified_latent",
+                "mojo_final_unscaled_unpatchified_latent",
+                "python_vae_decoded_tensor",
+                "mojo_vae_decoded_tensor",
+                "python_png",
+                "mojo_png",
+                "accepted_reference_edit_parity",
+                "parity_claimed",
+                "compare_scheduler",
+                "scheduler.sigmas",
+                "scheduler.timesteps",
+                "scheduler.edit_shift",
+                "scheduler.edit_denoise",
+                "scheduler.reference_t_offset",
+                "scheduler_tolerance",
+                "--self-test",
+            ),
+            detail_ok="ReferenceLatent edit comparator can consume paired Python/Mojo manifests and report scheduler, tensor, and PNG parity without running heavy models.",
+            detail_missing="ReferenceLatent edit comparator markers changed; inspect paired comparison coverage manually.",
         )
     )
     facts.append(

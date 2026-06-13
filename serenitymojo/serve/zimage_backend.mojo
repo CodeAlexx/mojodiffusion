@@ -94,6 +94,7 @@ from serenitymojo.serve.backend import (
     reject_unsupported_reference_image_params,
     reject_unsupported_inpaint_conditioning_params,
     reject_unsupported_qwen_edit_conditioning_params,
+    reject_unsupported_conditioning_mask_params,
     reject_unsupported_lanpaint_sampler_params,
 )
 from serenitymojo.serve.image_io import (
@@ -430,6 +431,7 @@ struct ZImageBackend(GenBackend, Movable):
         reject_unsupported_reference_image_params(params, String("zimage"))
         reject_unsupported_inpaint_conditioning_params(params, String("zimage"))
         reject_unsupported_qwen_edit_conditioning_params(params, String("zimage"))
+        reject_unsupported_conditioning_mask_params(params, String("zimage"))
         reject_unsupported_lanpaint_sampler_params(params, String("zimage"))
         var sampler_admission = sampler_admission_for_backend(String("zimage"), params.sampler)
         if not sampler_admission.supported:

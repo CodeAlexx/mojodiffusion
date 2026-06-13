@@ -78,6 +78,12 @@ struct JobParams(Copyable, Movable):
     # Comfy/SerenityFlow TextEncodeQwenImageEdit(+Plus) attaches the source
     # image to conditioning as edit_image. This is not ordinary img2img.
     var qwen_edit_conditioning_image: String
+    # Comfy ConditioningSetMask attaches regional mask metadata to conditioning,
+    # not to a latent. Backends must implement regional conditioning or reject.
+    var conditioning_mask_image: String
+    var conditioning_mask_channel: String
+    var conditioning_mask_strength: Float64
+    var conditioning_mask_set_area_to_bounds: Bool
     var outpaint_left: Int
     var outpaint_top: Int
     var outpaint_right: Int
@@ -141,6 +147,10 @@ struct JobParams(Copyable, Movable):
         self.inpaint_conditioning_mask = String("")
         self.inpaint_conditioning_noise_mask = False
         self.qwen_edit_conditioning_image = String("")
+        self.conditioning_mask_image = String("")
+        self.conditioning_mask_channel = String("")
+        self.conditioning_mask_strength = -1.0
+        self.conditioning_mask_set_area_to_bounds = False
         self.outpaint_left = -1
         self.outpaint_top = -1
         self.outpaint_right = -1
@@ -239,6 +249,23 @@ def reject_unsupported_qwen_edit_conditioning_params(
         raise Error(
             backend_name
             + String(": Comfy TextEncodeQwenImageEdit image conditioning is not supported by this backend yet")
+        )
+
+
+def reject_unsupported_conditioning_mask_params(
+    params: JobParams, backend_name: String
+) raises:
+    """Reject ConditioningSetMask/regional-conditioning metadata on backends
+    that do not implement conditioning-side mask semantics."""
+    if (
+        params.conditioning_mask_image.byte_length() > 0
+        or params.conditioning_mask_channel.byte_length() > 0
+        or params.conditioning_mask_strength >= 0.0
+        or params.conditioning_mask_set_area_to_bounds
+    ):
+        raise Error(
+            backend_name
+            + String(": Comfy ConditioningSetMask/regional conditioning is not supported by this backend yet")
         )
 
 

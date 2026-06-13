@@ -23,6 +23,7 @@ from serenitymojo.serve.backend import (
     reject_unsupported_mask_image_params,
     reject_unsupported_inpaint_conditioning_params,
     reject_unsupported_qwen_edit_conditioning_params,
+    reject_unsupported_conditioning_mask_params,
     reject_unsupported_lanpaint_params,
 )
 from serenitymojo.serve.external_command import ExternalCommand
@@ -205,6 +206,7 @@ def _validate_klein_request(params: JobParams) raises:
     reject_unsupported_common_runtime_params(params, String("klein"))
     reject_unsupported_inpaint_conditioning_params(params, String("klein"))
     reject_unsupported_qwen_edit_conditioning_params(params, String("klein"))
+    reject_unsupported_conditioning_mask_params(params, String("klein"))
     reject_unsupported_mask_image_params(params, String("klein"))
     reject_unsupported_lanpaint_params(params, String("klein"))
     var model = _lower(params.model)

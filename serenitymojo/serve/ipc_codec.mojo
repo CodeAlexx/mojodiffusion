@@ -58,6 +58,10 @@ def encode_start(p: JobParams) raises -> String:
     o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))
     o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))
     o.set("qwen_edit_conditioning_image", JSONValue.from_string(p.qwen_edit_conditioning_image))
+    o.set("conditioning_mask_image", JSONValue.from_string(p.conditioning_mask_image))
+    o.set("conditioning_mask_channel", JSONValue.from_string(p.conditioning_mask_channel))
+    o.set("conditioning_mask_strength", JSONValue.from_float(p.conditioning_mask_strength))
+    o.set("conditioning_mask_set_area_to_bounds", JSONValue.from_bool(p.conditioning_mask_set_area_to_bounds))
     o.set("outpaint_left", JSONValue.from_int(p.outpaint_left))
     o.set("outpaint_top", JSONValue.from_int(p.outpaint_top))
     o.set("outpaint_right", JSONValue.from_int(p.outpaint_right))
@@ -140,6 +144,14 @@ def decode_start(obj: JSONValue) raises -> JobParams:
         p.inpaint_conditioning_noise_mask = obj["inpaint_conditioning_noise_mask"].as_bool()
     if obj.contains("qwen_edit_conditioning_image") and not obj["qwen_edit_conditioning_image"].is_null():
         p.qwen_edit_conditioning_image = obj["qwen_edit_conditioning_image"].as_string()
+    if obj.contains("conditioning_mask_image") and not obj["conditioning_mask_image"].is_null():
+        p.conditioning_mask_image = obj["conditioning_mask_image"].as_string()
+    if obj.contains("conditioning_mask_channel") and not obj["conditioning_mask_channel"].is_null():
+        p.conditioning_mask_channel = obj["conditioning_mask_channel"].as_string()
+    if obj.contains("conditioning_mask_strength") and not obj["conditioning_mask_strength"].is_null():
+        p.conditioning_mask_strength = obj["conditioning_mask_strength"].as_float()
+    if obj.contains("conditioning_mask_set_area_to_bounds") and not obj["conditioning_mask_set_area_to_bounds"].is_null():
+        p.conditioning_mask_set_area_to_bounds = obj["conditioning_mask_set_area_to_bounds"].as_bool()
     if obj.contains("outpaint_left") and not obj["outpaint_left"].is_null():
         p.outpaint_left = Int(obj["outpaint_left"].as_float())
     if obj.contains("outpaint_top") and not obj["outpaint_top"].is_null():

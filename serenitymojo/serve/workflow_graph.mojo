@@ -829,6 +829,9 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("feathering", JSONValue.from_int(_workflow_widget_int(widgets, 4, 40)))
     elif type_id == "ThresholdMask":
         fields.set("value", JSONValue.from_float(_workflow_widget_float(widgets, 0, 0.5)))
+    elif type_id == "ConditioningSetMask":
+        fields.set("strength", JSONValue.from_float(_workflow_widget_float(widgets, 0, 1.0)))
+        fields.set("set_cond_area", JSONValue.from_string(_workflow_widget_string(widgets, 1, String("default"))))
     elif type_id == "InpaintModelConditioning":
         fields.set("noise_mask", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, True)))
     elif type_id == "SaveImage":
@@ -1000,6 +1003,9 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
         if slot == 0:
             return String("CONDITIONING")
     elif typ == "ConditioningZeroOut":
+        if slot == 0:
+            return String("CONDITIONING")
+    elif typ == "ConditioningSetMask":
         if slot == 0:
             return String("CONDITIONING")
     elif typ == "LoadImage":
@@ -1197,6 +1203,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "TextEncodeQwenImageEdit"
             or type_id == "TextEncodeQwenImageEditPlus"
             or type_id == "ConditioningZeroOut"
+            or type_id == "ConditioningSetMask"
             or type_id == "LoadImage"
             or type_id == "ImageToMask"
             or type_id == "MaskToImage"
@@ -1405,6 +1412,33 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, cond_link, String("CONDITIONING"), String("conditioning"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
                     cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(String(""))
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "ConditioningSetMask":
+                var cond_link = _workflow_find_input_link(edges, node_id, String("conditioning"))
+                var mask_link = _workflow_find_input_link(edges, node_id, String("mask"))
+                if not cond_link.found or not mask_link.found:
+                    raise Error("[501] workflow graph ConditioningSetMask missing required typed input")
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, cond_link.node_id, cond_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, mask_link.node_id, mask_link.port) >= 0
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, cond_link, String("CONDITIONING"), String("conditioning"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, mask_link, String("MASK"), String("mask"))
+                    var text = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, cond_link)
+                    var mask_path = _workflow_image_path(mask_nodes, mask_ports, mask_paths, mask_link)
+                    var mask_source = _workflow_source_meta(mask_nodes, mask_ports, mask_sources, mask_link)
+                    var strength = _workflow_float(fields, String("strength"), 1.0, 0.0, 10.0)
+                    var set_cond_area = String(_workflow_string(fields, String("set_cond_area")).lower())
+                    var set_area_to_bounds = False
+                    if set_cond_area != "" and set_cond_area != "default":
+                        set_area_to_bounds = True
+                    _set_if_missing(obj, String("conditioning_mask_image"), JSONValue.from_string(mask_path))
+                    _set_if_missing(obj, String("conditioning_mask_channel"), JSONValue.from_string(mask_source))
+                    _set_if_missing(obj, String("conditioning_mask_strength"), JSONValue.from_float(strength))
+                    _set_if_missing(obj, String("conditioning_mask_set_area_to_bounds"), JSONValue.from_bool(set_area_to_bounds))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
+                    cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(text)
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "FluxGuidance":
                 var cond_link = _workflow_find_input_link(edges, node_id, String("conditioning"))
@@ -2060,6 +2094,8 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
             "inpaint_conditioning_image", "inpaint_conditioning_mask", "inpaint_conditioning_noise_mask",
             "qwen_edit_conditioning_image",
+            "conditioning_mask_image", "conditioning_mask_channel",
+            "conditioning_mask_strength", "conditioning_mask_set_area_to_bounds",
             "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
             "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
@@ -2087,6 +2123,8 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
             "inpaint_conditioning_image", "inpaint_conditioning_mask", "inpaint_conditioning_noise_mask",
             "qwen_edit_conditioning_image",
+            "conditioning_mask_image", "conditioning_mask_channel",
+            "conditioning_mask_strength", "conditioning_mask_set_area_to_bounds",
             "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
             "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",

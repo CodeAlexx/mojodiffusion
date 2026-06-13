@@ -494,6 +494,62 @@ def inpaint_conditioning_missing_mask_comfy_api_prompt_request() -> dict[str, An
     return request
 
 
+def conditioning_set_mask_comfy_api_prompt_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "prompt": {
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "stub"}},
+                "2": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"clip": ["1", 1], "text": "conditioning mask negative prompt"},
+                },
+                "3": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"clip": ["1", 1], "text": "conditioning mask positive prompt"},
+                },
+                "4": {"class_type": "LoadImage", "inputs": {"image": "/tmp/serenity_conditioning_mask.png"}},
+                "5": {
+                    "class_type": "ConditioningSetMask",
+                    "inputs": {
+                        "conditioning": ["3", 0],
+                        "mask": ["4", 1],
+                        "strength": 0.42,
+                        "set_cond_area": "mask bounds",
+                    },
+                },
+                "6": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+                "7": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "model": ["1", 0],
+                        "positive": ["5", 0],
+                        "negative": ["2", 0],
+                        "latent_image": ["6", 0],
+                        "steps": 4,
+                        "seed": 77891,
+                        "cfg": 3.25,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 1.0,
+                    },
+                },
+                "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["1", 2]}},
+                "9": {
+                    "class_type": "SaveImage",
+                    "inputs": {"images": ["8", 0], "filename_prefix": "conditioning-mask-graph"},
+                },
+            }
+        }
+    }
+
+
+def conditioning_set_mask_missing_mask_comfy_api_prompt_request() -> dict[str, Any]:
+    request = conditioning_set_mask_comfy_api_prompt_request()
+    prompt = request["workflow"]["prompt"]
+    del prompt["5"]["inputs"]["mask"]
+    return request
+
+
 def serenityflow_template_request(template: Path) -> dict[str, Any]:
     return {"workflow": json.loads(template.read_text(encoding="utf-8"))}
 
@@ -909,6 +965,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             require(
                 "InpaintModelConditioning missing required typed input" in missing_inpaint_text,
                 "InpaintModelConditioning missing-mask response did not name the missing typed input",
+                blockers,
+            )
+
+            missing_conditioning_mask_status, missing_conditioning_mask_data, missing_conditioning_mask_text = http_json(
+                "POST", f"{base_url}/v1/generate", conditioning_set_mask_missing_mask_comfy_api_prompt_request()
+            )
+            report["conditioning_set_mask_missing_mask"] = {
+                "status": missing_conditioning_mask_status,
+                "body": missing_conditioning_mask_data,
+            }
+            require(
+                missing_conditioning_mask_status == 501,
+                "ConditioningSetMask missing-mask graph did not return HTTP 501",
+                blockers,
+            )
+            require(
+                "ConditioningSetMask missing required typed input" in missing_conditioning_mask_text,
+                "ConditioningSetMask missing-mask response did not name the missing typed input",
                 blockers,
             )
 
@@ -1340,6 +1414,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(inpaint_genparams.get("workflow_node_count") == 8, f"{inpaint_name} workflow node count missing", blockers)
                     require(inpaint_genparams.get("workflow_edge_count") == 14, f"{inpaint_name} workflow edge count missing", blockers)
 
+            conditioning_mask_status, conditioning_mask_data, conditioning_mask_text = http_json(
+                "POST", f"{base_url}/v1/generate", conditioning_set_mask_comfy_api_prompt_request()
+            )
+            report["conditioning_set_mask_api_generate"] = {
+                "status": conditioning_mask_status,
+                "body": conditioning_mask_data,
+            }
+            if conditioning_mask_status != 200 or not isinstance(conditioning_mask_data, dict) or not conditioning_mask_data.get("job_id"):
+                blockers.append(f"ConditioningSetMask Comfy API prompt generate failed HTTP {conditioning_mask_status}: {conditioning_mask_text}")
+            else:
+                conditioning_mask_job_id = str(conditioning_mask_data["job_id"])
+                conditioning_mask_job = poll_job(base_url, conditioning_mask_job_id, args.timeout)
+                report["conditioning_set_mask_api_job"] = conditioning_mask_job
+                require(
+                    conditioning_mask_job.get("state") == "done",
+                    f"ConditioningSetMask Comfy API prompt job state was {conditioning_mask_job.get('state')}",
+                    blockers,
+                )
+                conditioning_mask_png_path = Path(str(conditioning_mask_job.get("output_path") or ""))
+                require(conditioning_mask_png_path.is_file(), f"ConditioningSetMask Comfy API prompt PNG missing: {conditioning_mask_png_path}", blockers)
+                if conditioning_mask_png_path.is_file():
+                    conditioning_mask_text_chunks = read_png_text(conditioning_mask_png_path)
+                    conditioning_mask_genparams = json.loads(conditioning_mask_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["conditioning_set_mask_api_png"] = {
+                        "path": str(conditioning_mask_png_path),
+                        "idat_sha256": conditioning_mask_text_chunks.get("_idat_sha256"),
+                        "genparams": conditioning_mask_genparams,
+                    }
+                    require(conditioning_mask_genparams.get("workflow_source") == "comfy_api_prompt_graph", "ConditioningSetMask workflow source missing", blockers)
+                    require(conditioning_mask_genparams.get("workflow_save_prefix") == "conditioning-mask-graph", "ConditioningSetMask SaveImage filename_prefix missing", blockers)
+                    require(conditioning_mask_genparams.get("prompt") == "conditioning mask positive prompt", "ConditioningSetMask positive prompt was not consumed", blockers)
+                    require(conditioning_mask_genparams.get("negative") == "conditioning mask negative prompt", "ConditioningSetMask negative prompt was not consumed", blockers)
+                    require(conditioning_mask_genparams.get("conditioning_mask_image") == "/tmp/serenity_conditioning_mask.png", "ConditioningSetMask mask image missing", blockers)
+                    require(conditioning_mask_genparams.get("conditioning_mask_channel") == "load_image_mask", "ConditioningSetMask mask source token missing", blockers)
+                    require(conditioning_mask_genparams.get("conditioning_mask_strength") == 0.42, "ConditioningSetMask strength missing", blockers)
+                    require(conditioning_mask_genparams.get("conditioning_mask_set_area_to_bounds") is True, "ConditioningSetMask mask-bounds flag missing", blockers)
+                    require(conditioning_mask_genparams.get("mask_image") == "", "ConditioningSetMask must not collapse into latent mask_image", blockers)
+                    require(conditioning_mask_genparams.get("lanpaint_mask_channel") == "", "ConditioningSetMask must not collapse into lanpaint_mask_channel", blockers)
+                    require(conditioning_mask_genparams.get("workflow_node_count") == 9, "ConditioningSetMask workflow node count missing", blockers)
+                    require(conditioning_mask_genparams.get("workflow_edge_count") == 11, "ConditioningSetMask workflow edge count missing", blockers)
+
             report["serenityflow_t2i"] = {}
             for sf_name, expected in SERENITYFLOW_T2I_CASES.items():
                 sf_request = serenityflow_template_request(expected["template"])
@@ -1646,6 +1761,8 @@ def main() -> int:
     print(f"  inpaint_conditioning_api_png: {report['inpaint_conditioning_api_png']['path']}")
     print(f"  inpaint_conditioning_no_noise_mask_api_job_id: {report['inpaint_conditioning_no_noise_mask_api_job']['id']}")
     print(f"  inpaint_conditioning_no_noise_mask_api_png: {report['inpaint_conditioning_no_noise_mask_api_png']['path']}")
+    print(f"  conditioning_set_mask_api_job_id: {report['conditioning_set_mask_api_job']['id']}")
+    print(f"  conditioning_set_mask_api_png: {report['conditioning_set_mask_api_png']['path']}")
     for sf_name, sf_case in report["serenityflow_t2i"].items():
         print(f"  serenityflow_{sf_name}_job_id: {sf_case['job']['id']}")
         print(f"  serenityflow_{sf_name}_png: {sf_case['png']['path']}")

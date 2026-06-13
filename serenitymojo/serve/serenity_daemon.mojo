@@ -1269,6 +1269,10 @@ def parse_generate(
     p.inpaint_conditioning_mask = _opt_str(obj, "inpaint_conditioning_mask", String(""))
     p.inpaint_conditioning_noise_mask = _opt_bool(obj, "inpaint_conditioning_noise_mask", False)
     p.qwen_edit_conditioning_image = _opt_str(obj, "qwen_edit_conditioning_image", String(""))
+    p.conditioning_mask_image = _opt_str(obj, "conditioning_mask_image", String(""))
+    p.conditioning_mask_channel = _opt_str(obj, "conditioning_mask_channel", String(""))
+    p.conditioning_mask_strength = _opt_num(obj, "conditioning_mask_strength", -1.0, -1.0, 10.0)
+    p.conditioning_mask_set_area_to_bounds = _opt_bool(obj, "conditioning_mask_set_area_to_bounds", False)
     p.outpaint_left = _opt_int(obj, "outpaint_left", -1, -1, 4096)
     p.outpaint_top = _opt_int(obj, "outpaint_top", -1, -1, 4096)
     p.outpaint_right = _opt_int(obj, "outpaint_right", -1, -1, 4096)
@@ -1338,6 +1342,13 @@ def parse_generate(
             raise Error("ideogram4: InpaintModelConditioning concat conditioning is not supported in this bounded slice")
         if p.qwen_edit_conditioning_image.byte_length() > 0:
             raise Error("ideogram4: TextEncodeQwenImageEdit image conditioning is not supported in this bounded slice")
+        if (
+            p.conditioning_mask_image.byte_length() > 0
+            or p.conditioning_mask_channel.byte_length() > 0
+            or p.conditioning_mask_strength >= 0.0
+            or p.conditioning_mask_set_area_to_bounds
+        ):
+            raise Error("ideogram4: ConditioningSetMask/regional conditioning is not supported in this bounded slice")
         if p.init_image.byte_length() > 0:
             raise Error("ideogram4: img2img/init image is not supported in this bounded slice")
         if p.mask_image.byte_length() > 0:
@@ -1391,6 +1402,10 @@ def parse_generate(
     o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))
     o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))
     o.set("qwen_edit_conditioning_image", JSONValue.from_string(p.qwen_edit_conditioning_image))
+    o.set("conditioning_mask_image", JSONValue.from_string(p.conditioning_mask_image))
+    o.set("conditioning_mask_channel", JSONValue.from_string(p.conditioning_mask_channel))
+    o.set("conditioning_mask_strength", JSONValue.from_float(p.conditioning_mask_strength))
+    o.set("conditioning_mask_set_area_to_bounds", JSONValue.from_bool(p.conditioning_mask_set_area_to_bounds))
     o.set("outpaint_left", JSONValue.from_int(p.outpaint_left))
     o.set("outpaint_top", JSONValue.from_int(p.outpaint_top))
     o.set("outpaint_right", JSONValue.from_int(p.outpaint_right))

@@ -349,6 +349,35 @@ Qwen-Image-Edit runtime path consumes conditioning-side `edit_image` metadata.
 This includes the current Qwen backend, which remains txt2img-only for this
 field.
 
+## ConditioningSetMask Graph-Import Handoff
+
+The current `ConditioningSetMask` slice implements bounded Comfy/SerenityFlow
+graph/API import and metadata plumbing only, not regional-conditioning runtime
+parity. The Comfy oracle attaches `mask`, `set_area_to_bounds`, and
+`mask_strength` to conditioning entries. The SerenityFlow oracle carries the
+same intent as conditioning-side `mask`, `strength`, and
+`set_area_to_bounds`.
+
+The importer now accepts `ConditioningSetMask` and records this as explicit
+request metadata:
+
+- `conditioning_mask_image`
+- `conditioning_mask_channel`
+- `conditioning_mask_strength`
+- `conditioning_mask_set_area_to_bounds`
+
+This metadata is separate from `mask_image` and `lanpaint_mask_channel`.
+`mask_image` means a latent-side preserve/inpaint mask, while
+`ConditioningSetMask` is regional conditioning metadata attached to a
+conditioning handle.
+
+Runtime boundary: real backends must continue to reject this metadata through
+`reject_unsupported_conditioning_mask_params(...)` until a backend implements
+conditioning-side regional masks. The stub backend may carry it as product-smoke
+metadata only. This bounded flat field slice does not preserve arbitrary
+multiple masked-conditioning branches; that requires a real per-conditioning
+metadata contract in the graph executor and backend.
+
 Current static gate coverage:
 
 - `arbitrary_comfy_swarm_graph_execution_ready = false`
@@ -383,7 +412,8 @@ Currently accepted graph nodes:
   `VAELoader`
 - conditioning: `CLIPTextEncode`, `CLIPTextEncodeFlux`,
   `TextEncodeQwenImageEdit`, `TextEncodeQwenImageEditPlus`,
-  `ConditioningZeroOut`, `FluxGuidance`, `InpaintModelConditioning`
+  `ConditioningZeroOut`, `ConditioningSetMask`, `FluxGuidance`,
+  `InpaintModelConditioning`
 - latent/image: `LoadImage`, `EmptyLatentImage`, `EmptySD3LatentImage`,
   `EmptyFlux2LatentImage`, `ImageToMask`, `MaskToImage`, `VAEEncode`,
   `SetLatentNoiseMask`, `GetImageSize`, `ImageScale`,
@@ -417,6 +447,9 @@ as bounded graph/API metadata plumbing. They record the source image as
 `qwen_edit_conditioning_image`, matching the Python oracle's conditioning-side
 `edit_image` metadata, and do not execute Qwen-Image-Edit runtime semantics in
 any backend.
+`ConditioningSetMask` is accepted only as bounded graph/API metadata plumbing.
+It records regional-conditioning mask metadata as `conditioning_mask_*`, not as
+latent-side `mask_image`, and no backend executes those conditioning masks yet.
 
 Z-Image consumes that mask only for the bounded img2img preserve-region slice:
 it stores the encoded init latent, seeded noise, and latent preserve mask, then
@@ -461,6 +494,11 @@ unsupported and should fail loud.
   records the Python oracle source image as conditioning-side
   `qwen_edit_conditioning_image`. It is not accepted Qwen-Image-Edit runtime
   parity.
+- `ConditioningSetMask` graph/API import records Comfy/SerenityFlow oracle
+  regional-conditioning metadata only: mask image/source, strength, and
+  `set_area_to_bounds`. It is not accepted regional-conditioning runtime parity
+  and does not preserve full multi-branch attention-couple style conditioning
+  lists.
 - This is not accepted general Z-Image i2i parity.
 - This is not accepted Z-Image/Qwen/Klein/Ideogram inpaint parity.
 - Z-Image init-image encode code may be useful substrate for refiner/LanPaint/
@@ -651,6 +689,13 @@ Current bounded contract:
     `inpaint_conditioning_image`. Real backends reject this field through
     `reject_unsupported_qwen_edit_conditioning_params(...)` until
     Qwen-Image-Edit runtime parity exists.
+16. `ConditioningSetMask` graph/API import records
+    `conditioning_mask_image`, `conditioning_mask_channel`,
+    `conditioning_mask_strength`, and
+    `conditioning_mask_set_area_to_bounds`, separate from `mask_image` and
+    `lanpaint_mask_channel`. Real backends reject these fields through
+    `reject_unsupported_conditioning_mask_params(...)` until
+    regional-conditioning runtime parity exists.
 
 This keeps unsupported inpaint/LanPaint workflows from silently degrading into
 plain img2img or txt2img while allowing the narrow Z-Image preserve-mask and
@@ -691,6 +736,11 @@ Current LanPaint boundary:
   only for bounded graph/API import and metadata propagation. They capture the
   Python oracle's conditioning-side source image as
   `qwen_edit_conditioning_image`, but no backend consumes that field yet.
+- `ConditioningSetMask` is supported only for bounded graph/API import and
+  metadata propagation. It captures conditioning-side mask/source/strength/
+  bounds metadata for the singleton flat request contract, but no backend
+  consumes those fields yet and full per-conditioning-list semantics are not
+  represented.
 - Acceptance for real LanPaint/inpaint execution requires backend-specific
   mask-aware denoise, outpaint behavior where applicable, and parity checks
   against the Python oracle. Until then, any request that reaches a real backend
@@ -1080,5 +1130,10 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
     oracle's conditioning-side `edit_image` metadata, keep it distinct from
     ordinary img2img/reference/mask paths, and compare against SerenityFlow/
     Comfy behavior.
-11. Only after temp build and checks pass, run `pixi run build-daemon` to update
+11. Implement real `ConditioningSetMask` regional-conditioning parity before
+    accepting `conditioning_mask_*` in any real backend: preserve per-conditioning
+    mask metadata, strength, and mask-bounds behavior, keep it distinct from
+    latent `SetLatentNoiseMask`, and compare against Comfy/SerenityFlow output
+    behavior.
+12. Only after temp build and checks pass, run `pixi run build-daemon` to update
    `output/bin/serenity_daemon`.

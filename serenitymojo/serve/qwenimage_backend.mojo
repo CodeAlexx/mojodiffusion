@@ -68,7 +68,8 @@ from serenitymojo.pipeline.qwenimage_sample_cli import (
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
     reject_unsupported_reference_image_params, reject_unsupported_mask_image_params,
-    reject_unsupported_inpaint_conditioning_params, reject_unsupported_lanpaint_params,
+    reject_unsupported_inpaint_conditioning_params,
+    reject_unsupported_qwen_edit_conditioning_params, reject_unsupported_lanpaint_params,
 )
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
@@ -185,6 +186,7 @@ struct QwenImageBackend(GenBackend, Movable):
         reject_unsupported_common_runtime_params(params, String("qwenimage"))
         reject_unsupported_reference_image_params(params, String("qwenimage"))
         reject_unsupported_inpaint_conditioning_params(params, String("qwenimage"))
+        reject_unsupported_qwen_edit_conditioning_params(params, String("qwenimage"))
         reject_unsupported_mask_image_params(params, String("qwenimage"))
         reject_unsupported_lanpaint_params(params, String("qwenimage"))
         var sampler_admission = sampler_admission_for_backend(String("qwenimage"), params.sampler)

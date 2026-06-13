@@ -760,7 +760,12 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("strength_model", JSONValue.from_float(_workflow_widget_float(widgets, 1, 1.0)))
         if type_id == "LoraLoader":
             fields.set("strength_clip", JSONValue.from_float(_workflow_widget_float(widgets, 2, 1.0)))
-    elif type_id == "CLIPTextEncode" or type_id == "CLIPTextEncodeFlux":
+    elif (
+        type_id == "CLIPTextEncode"
+        or type_id == "CLIPTextEncodeFlux"
+        or type_id == "TextEncodeQwenImageEdit"
+        or type_id == "TextEncodeQwenImageEditPlus"
+    ):
         fields.set("text", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
     elif type_id == "LoadImage":
         fields.set("image", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
@@ -986,7 +991,12 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "VAELoader":
         if slot == 0:
             return String("VAE")
-    elif typ == "CLIPTextEncode" or typ == "CLIPTextEncodeFlux":
+    elif (
+        typ == "CLIPTextEncode"
+        or typ == "CLIPTextEncodeFlux"
+        or typ == "TextEncodeQwenImageEdit"
+        or typ == "TextEncodeQwenImageEditPlus"
+    ):
         if slot == 0:
             return String("CONDITIONING")
     elif typ == "ConditioningZeroOut":
@@ -1184,6 +1194,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "VAELoader"
             or type_id == "CLIPTextEncode"
             or type_id == "CLIPTextEncodeFlux"
+            or type_id == "TextEncodeQwenImageEdit"
+            or type_id == "TextEncodeQwenImageEditPlus"
             or type_id == "ConditioningZeroOut"
             or type_id == "LoadImage"
             or type_id == "ImageToMask"
@@ -1366,6 +1378,24 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         done[i] = True; remaining -= 1; progressed = True
                 else:
                     raise Error("[501] workflow graph " + type_id + " missing clip input")
+            elif type_id == "TextEncodeQwenImageEdit" or type_id == "TextEncodeQwenImageEditPlus":
+                var clip_link = _workflow_find_input_link(edges, node_id, String("clip"))
+                var image_link = _workflow_find_input_link(edges, node_id, String("image"))
+                if not clip_link.found or not image_link.found:
+                    raise Error("[501] workflow graph " + type_id + " missing required typed input")
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, clip_link.node_id, clip_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port) >= 0
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, clip_link, String("CLIP"), String("clip"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
+                    var text = _workflow_conditioning_prompt_text(fields, type_id)
+                    var edit_image = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
+                    _set_if_missing(obj, String("qwen_edit_conditioning_image"), JSONValue.from_string(edit_image))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
+                    cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(text)
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "ConditioningZeroOut":
                 var cond_link = _workflow_find_input_link(edges, node_id, String("conditioning"))
                 if not cond_link.found:
@@ -2029,6 +2059,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "workflow_save_prefix",
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
             "inpaint_conditioning_image", "inpaint_conditioning_mask", "inpaint_conditioning_noise_mask",
+            "qwen_edit_conditioning_image",
             "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
             "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
@@ -2055,6 +2086,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "workflow_save_prefix",
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
             "inpaint_conditioning_image", "inpaint_conditioning_mask", "inpaint_conditioning_noise_mask",
+            "qwen_edit_conditioning_image",
             "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
             "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",

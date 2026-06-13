@@ -75,6 +75,9 @@ struct JobParams(Copyable, Movable):
     var inpaint_conditioning_image: String
     var inpaint_conditioning_mask: String
     var inpaint_conditioning_noise_mask: Bool
+    # Comfy/SerenityFlow TextEncodeQwenImageEdit(+Plus) attaches the source
+    # image to conditioning as edit_image. This is not ordinary img2img.
+    var qwen_edit_conditioning_image: String
     var outpaint_left: Int
     var outpaint_top: Int
     var outpaint_right: Int
@@ -137,6 +140,7 @@ struct JobParams(Copyable, Movable):
         self.inpaint_conditioning_image = String("")
         self.inpaint_conditioning_mask = String("")
         self.inpaint_conditioning_noise_mask = False
+        self.qwen_edit_conditioning_image = String("")
         self.outpaint_left = -1
         self.outpaint_top = -1
         self.outpaint_right = -1
@@ -223,6 +227,18 @@ def reject_unsupported_inpaint_conditioning_params(
         raise Error(
             backend_name
             + String(": Comfy InpaintModelConditioning concat conditioning is not supported by this backend yet")
+        )
+
+
+def reject_unsupported_qwen_edit_conditioning_params(
+    params: JobParams, backend_name: String
+) raises:
+    """Reject TextEncodeQwenImageEdit image-conditioning metadata on backends
+    that do not implement Qwen-Image-Edit source-image conditioning."""
+    if params.qwen_edit_conditioning_image.byte_length() > 0:
+        raise Error(
+            backend_name
+            + String(": Comfy TextEncodeQwenImageEdit image conditioning is not supported by this backend yet")
         )
 
 

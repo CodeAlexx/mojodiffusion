@@ -168,6 +168,47 @@ SERENITYFLOW_EDIT_CASES: dict[str, dict[str, Any]] = {
     },
 }
 
+SERENITYFLOW_QWEN_EDIT_CASES: dict[str, dict[str, Any]] = {
+    "qwen_edit": {
+        "template": SERENITYFLOW_WORKFLOWS / "qwen_edit.json",
+        "model": "qwen_image_edit.safetensors",
+        "prompt": "change the background to a beach",
+        "negative": "",
+        "steps": 20,
+        "seed": 42,
+        "cfg": 1,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "creativity": 0.75,
+        "sigma_shift": 3,
+        "init_image": "input.png",
+        "qwen_edit_conditioning_image": "input.png",
+        "workflow_save_prefix": "qwen_edit",
+        "workflow_node_count": 12,
+        "workflow_edge_count": 14,
+        "lora": [],
+    },
+    "qwen_edit_lora": {
+        "template": SERENITYFLOW_WORKFLOWS / "qwen_edit_lora.json",
+        "model": "qwen_image_edit.safetensors",
+        "prompt": "change the background to a beach",
+        "negative": "",
+        "steps": 20,
+        "seed": 42,
+        "cfg": 1,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "creativity": 0.75,
+        "sigma_shift": 3,
+        "init_image": "input.png",
+        "qwen_edit_conditioning_image": "input.png",
+        "workflow_save_prefix": "qwen_edit_lora",
+        "workflow_node_count": 13,
+        "workflow_edge_count": 15,
+        "lora": [{"name": "lora.safetensors", "weight": 1.0}],
+    },
+}
+
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -1417,6 +1458,62 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             blockers,
                         )
 
+            report["serenityflow_qwen_edit"] = {}
+            for sf_name, expected in SERENITYFLOW_QWEN_EDIT_CASES.items():
+                sf_request = serenityflow_template_request(expected["template"])
+                sf_status, sf_data, sf_text = http_json("POST", f"{base_url}/v1/generate", sf_request)
+                sf_case: dict[str, Any] = {
+                    "generate": {"status": sf_status, "body": sf_data},
+                    "template": str(expected["template"]),
+                }
+                report["serenityflow_qwen_edit"][sf_name] = sf_case
+                if sf_status != 200 or not isinstance(sf_data, dict) or not sf_data.get("job_id"):
+                    blockers.append(f"SerenityFlow {sf_name} generate failed HTTP {sf_status}: {sf_text}")
+                    continue
+
+                sf_job_id = str(sf_data["job_id"])
+                sf_job = poll_job(base_url, sf_job_id, args.timeout)
+                sf_case["job"] = sf_job
+                require(sf_job.get("state") == "done", f"SerenityFlow {sf_name} job state was {sf_job.get('state')}", blockers)
+                sf_png_path = Path(str(sf_job.get("output_path") or ""))
+                require(sf_png_path.is_file(), f"SerenityFlow {sf_name} PNG missing: {sf_png_path}", blockers)
+                if sf_png_path.is_file():
+                    sf_text_chunks = read_png_text(sf_png_path)
+                    sf_genparams = json.loads(sf_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    sf_case["png"] = {
+                        "path": str(sf_png_path),
+                        "idat_sha256": sf_text_chunks.get("_idat_sha256"),
+                        "genparams": sf_genparams,
+                    }
+                    require(sf_genparams.get("workflow_source") == "comfy_api_prompt_graph", f"SerenityFlow {sf_name} workflow source missing", blockers)
+                    for field in (
+                        "model",
+                        "prompt",
+                        "negative",
+                        "steps",
+                        "seed",
+                        "cfg",
+                        "sampler",
+                        "scheduler",
+                        "creativity",
+                        "sigma_shift",
+                        "init_image",
+                        "qwen_edit_conditioning_image",
+                        "workflow_save_prefix",
+                        "workflow_node_count",
+                        "workflow_edge_count",
+                    ):
+                        require(
+                            sf_genparams.get(field) == expected[field],
+                            f"SerenityFlow {sf_name} {field} missing",
+                            blockers,
+                        )
+                    expected_loras = expected["lora"]
+                    if expected_loras:
+                        require(sf_genparams.get("lora") == expected_loras, f"SerenityFlow {sf_name} LoRA metadata missing", blockers)
+                    else:
+                        require(sf_genparams.get("lora") == [], f"SerenityFlow {sf_name} unexpected LoRA metadata", blockers)
+
             ideogram_status, ideogram_data, ideogram_text = http_json(
                 "POST", f"{base_url}/v1/generate", ideogram4_visual_export_request()
             )
@@ -1553,6 +1650,9 @@ def main() -> int:
         print(f"  serenityflow_{sf_name}_job_id: {sf_case['job']['id']}")
         print(f"  serenityflow_{sf_name}_png: {sf_case['png']['path']}")
     for sf_name, sf_case in report["serenityflow_edit"].items():
+        print(f"  serenityflow_{sf_name}_job_id: {sf_case['job']['id']}")
+        print(f"  serenityflow_{sf_name}_png: {sf_case['png']['path']}")
+    for sf_name, sf_case in report["serenityflow_qwen_edit"].items():
         print(f"  serenityflow_{sf_name}_job_id: {sf_case['job']['id']}")
         print(f"  serenityflow_{sf_name}_png: {sf_case['png']['path']}")
     print(f"  ideogram4_visual_export_job_id: {report['ideogram4_visual_export_job']['id']}")

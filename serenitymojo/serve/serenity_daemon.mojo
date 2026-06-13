@@ -1268,6 +1268,7 @@ def parse_generate(
     p.inpaint_conditioning_image = _opt_str(obj, "inpaint_conditioning_image", String(""))
     p.inpaint_conditioning_mask = _opt_str(obj, "inpaint_conditioning_mask", String(""))
     p.inpaint_conditioning_noise_mask = _opt_bool(obj, "inpaint_conditioning_noise_mask", False)
+    p.qwen_edit_conditioning_image = _opt_str(obj, "qwen_edit_conditioning_image", String(""))
     p.outpaint_left = _opt_int(obj, "outpaint_left", -1, -1, 4096)
     p.outpaint_top = _opt_int(obj, "outpaint_top", -1, -1, 4096)
     p.outpaint_right = _opt_int(obj, "outpaint_right", -1, -1, 4096)
@@ -1335,6 +1336,8 @@ def parse_generate(
             raise Error("ideogram4: LoRA is not supported in this bounded slice")
         if p.inpaint_conditioning_image.byte_length() > 0 or p.inpaint_conditioning_mask.byte_length() > 0:
             raise Error("ideogram4: InpaintModelConditioning concat conditioning is not supported in this bounded slice")
+        if p.qwen_edit_conditioning_image.byte_length() > 0:
+            raise Error("ideogram4: TextEncodeQwenImageEdit image conditioning is not supported in this bounded slice")
         if p.init_image.byte_length() > 0:
             raise Error("ideogram4: img2img/init image is not supported in this bounded slice")
         if p.mask_image.byte_length() > 0:
@@ -1387,6 +1390,7 @@ def parse_generate(
     o.set("inpaint_conditioning_image", JSONValue.from_string(p.inpaint_conditioning_image))
     o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))
     o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))
+    o.set("qwen_edit_conditioning_image", JSONValue.from_string(p.qwen_edit_conditioning_image))
     o.set("outpaint_left", JSONValue.from_int(p.outpaint_left))
     o.set("outpaint_top", JSONValue.from_int(p.outpaint_top))
     o.set("outpaint_right", JSONValue.from_int(p.outpaint_right))

@@ -76,6 +76,8 @@ SUPPORTED_NODE_TYPES = [
     "VAELoader",
     "CLIPTextEncode",
     "CLIPTextEncodeFlux",
+    "TextEncodeQwenImageEdit",
+    "TextEncodeQwenImageEditPlus",
     "ConditioningZeroOut",
     "LoadImage",
     "ImageToMask",
@@ -124,8 +126,6 @@ UNSUPPORTED_NODE_EXAMPLES = [
     "ImageUpscaleWithModel",
     "VideoCombine",
     "LanPaint_SamplerCustom",
-    "TextEncodeQwenImageEdit",
-    "TextEncodeQwenImageEditPlus",
 ]
 
 
@@ -561,6 +561,24 @@ def check_supported_nodes() -> list[Check]:
             WORKFLOW_GRAPH,
             "apply_typed_workflow_graph",
             category="workflow",
+            label="Qwen edit image conditioning graph lowering",
+            needles=[
+                "TextEncodeQwenImageEdit",
+                "TextEncodeQwenImageEditPlus",
+                "qwen_edit_conditioning_image",
+                '"[501] workflow graph " + type_id + " missing required typed input"',
+                'String("CONDITIONING"), String("CONDITIONING")',
+                "_workflow_image_path(image_nodes, image_ports, image_paths, image_link)",
+            ],
+            severity=P0,
+            acceptance="SerenityFlow/Comfy Qwen edit text+image conditioning imports preserve the source image as explicit metadata instead of treating it as ordinary img2img or ReferenceLatent.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
+            category="workflow",
             label="typed linked graph IR executor",
             needles=[
                 "_workflow_find_input_link",
@@ -917,6 +935,18 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             BACKEND,
             category="workflow",
+            label="Qwen edit image conditioning runtime contract helper",
+            needles=[
+                "qwen_edit_conditioning_image",
+                "reject_unsupported_qwen_edit_conditioning_params",
+                "Comfy TextEncodeQwenImageEdit image conditioning is not supported",
+            ],
+            severity=P1,
+            acceptance="Comfy/SerenityFlow Qwen edit image-conditioning metadata is explicit and real backends fail loud until they implement the Qwen-Image-Edit source-image path.",
+        ),
+        check_contains(
+            BACKEND,
+            category="workflow",
             label="LanPaint sampler runtime contract helper",
             needles=[
                 "has_lanpaint_runtime_params",
@@ -987,6 +1017,18 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             DAEMON,
             category="workflow",
+            label="daemon parses Qwen edit image conditioning genparams",
+            needles=[
+                'p.qwen_edit_conditioning_image = _opt_str(obj, "qwen_edit_conditioning_image", String(""))',
+                'o.set("qwen_edit_conditioning_image", JSONValue.from_string(p.qwen_edit_conditioning_image))',
+                "TextEncodeQwenImageEdit image conditioning is not supported in this bounded slice",
+            ],
+            severity=P1,
+            acceptance="Qwen edit image-conditioning metadata survives parse_generate/canonical PNG metadata and Ideogram4 rejects it before generic img2img handling.",
+        ),
+        check_contains(
+            DAEMON,
+            category="workflow",
             label="daemon parses LanPaint genparams",
             needles=[
                 'p.lanpaint_num_steps = _opt_int(obj, "lanpaint_num_steps", -1, -1, 4096)',
@@ -1039,6 +1081,17 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             IPC_CODEC,
             category="workflow",
+            label="worker IPC preserves Qwen edit image conditioning genparams",
+            needles=[
+                'o.set("qwen_edit_conditioning_image", JSONValue.from_string(p.qwen_edit_conditioning_image))',
+                'p.qwen_edit_conditioning_image = obj["qwen_edit_conditioning_image"].as_string()',
+            ],
+            severity=P1,
+            acceptance="Process-isolated worker IPC does not drop Qwen edit image-conditioning metadata.",
+        ),
+        check_contains(
+            IPC_CODEC,
+            category="workflow",
             label="worker IPC preserves LanPaint genparams",
             needles=[
                 'o.set("lanpaint_num_steps", JSONValue.from_int(p.lanpaint_num_steps))',
@@ -1071,6 +1124,17 @@ def check_family_surfaces() -> list[Check]:
             ],
             severity=P1,
             acceptance="Z-Image preserve-mask img2img does not silently consume Comfy InpaintModelConditioning concat conditioning metadata.",
+        ),
+        check_contains(
+            ZIMAGE_BACKEND,
+            category="workflow",
+            label="Z-Image rejects Qwen edit image conditioning metadata",
+            needles=[
+                "reject_unsupported_qwen_edit_conditioning_params",
+                'reject_unsupported_qwen_edit_conditioning_params(params, String("zimage"))',
+            ],
+            severity=P1,
+            acceptance="Z-Image img2img does not silently consume Comfy TextEncodeQwenImageEdit source-image conditioning metadata.",
         ),
         check_contains(
             ZIMAGE_BACKEND,
@@ -1188,6 +1252,17 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             QWEN_BACKEND,
             category="workflow",
+            label="Qwen rejects Qwen edit image conditioning metadata",
+            needles=[
+                "reject_unsupported_qwen_edit_conditioning_params",
+                'reject_unsupported_qwen_edit_conditioning_params(params, String("qwenimage"))',
+            ],
+            severity=P1,
+            acceptance="Qwen-Image txt2img backend rejects Qwen-Image-Edit source-image conditioning until the edit runtime path consumes it.",
+        ),
+        check_contains(
+            QWEN_BACKEND,
+            category="workflow",
             label="Qwen rejects LanPaint metadata",
             needles=[
                 'reject_unsupported_lanpaint_params(params, String("qwenimage"))',
@@ -1229,6 +1304,17 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             IDEOGRAM4_BACKEND,
             category="workflow",
+            label="Ideogram4 rejects Qwen edit image conditioning metadata",
+            needles=[
+                "reject_unsupported_qwen_edit_conditioning_params",
+                'reject_unsupported_qwen_edit_conditioning_params(params, String("ideogram4"))',
+            ],
+            severity=P1,
+            acceptance="Ideogram4 does not silently consume Comfy TextEncodeQwenImageEdit source-image conditioning metadata.",
+        ),
+        check_contains(
+            IDEOGRAM4_BACKEND,
+            category="workflow",
             label="Ideogram4 rejects LanPaint metadata",
             needles=[
                 'reject_unsupported_lanpaint_params(params, String("ideogram4"))',
@@ -1256,6 +1342,17 @@ def check_family_surfaces() -> list[Check]:
             ],
             severity=P1,
             acceptance="Klein ReferenceLatent edit does not silently consume Comfy InpaintModelConditioning concat conditioning metadata.",
+        ),
+        check_contains(
+            KLEIN_BACKEND,
+            category="workflow",
+            label="Klein rejects Qwen edit image conditioning metadata",
+            needles=[
+                "reject_unsupported_qwen_edit_conditioning_params",
+                'reject_unsupported_qwen_edit_conditioning_params(params, String("klein"))',
+            ],
+            severity=P1,
+            acceptance="Klein ReferenceLatent edit does not silently consume Comfy TextEncodeQwenImageEdit source-image conditioning metadata.",
         ),
         check_contains(
             SAMPLER_REGISTRY,
@@ -1361,6 +1458,19 @@ def check_family_surfaces() -> list[Check]:
             ],
             severity=P1,
             acceptance="The Klein edit oracle treats ReferenceLatent as conditioning metadata, not ordinary img2img init noise.",
+        ),
+        check_contains(
+            SERENITYFLOW_CONDITIONING_NODES,
+            category="workflow",
+            label="Python oracle Qwen edit image conditioning node",
+            needles=[
+                '"TextEncodeQwenImageEditPlus"',
+                "def text_encode_qwen_image_edit_plus",
+                'n["edit_image"] = image_bchw',
+                "return (out,)",
+            ],
+            severity=P1,
+            acceptance="The Qwen edit oracle treats the source image as conditioning-side edit_image metadata, not ordinary img2img.",
         ),
         check_contains(
             SERENITYFLOW_SAMPLING,
@@ -1769,6 +1879,16 @@ def serenityflow_edit_case(report: dict[str, Any], case_name: str) -> dict[str, 
     return case
 
 
+def serenityflow_qwen_edit_case(report: dict[str, Any], case_name: str) -> dict[str, Any]:
+    cases = report.get("serenityflow_qwen_edit")
+    if not isinstance(cases, dict):
+        return {"_shape_error": "serenityflow_qwen_edit must be an object"}
+    case = cases.get(case_name)
+    if not isinstance(case, dict):
+        return {"_shape_error": f"serenityflow_qwen_edit.{case_name} must be an object"}
+    return case
+
+
 def prefixed_evidence(report: dict[str, Any], prefix: str) -> dict[str, Any]:
     direct = report.get(prefix)
     if isinstance(direct, dict):
@@ -1867,6 +1987,46 @@ def validate_klein_edit_evidence(evidence: dict[str, Any], case_name: str, model
     ]
     if missing:
         return f"SerenityFlow edit {case_name} metadata mismatch: " + ", ".join(missing)
+    return ""
+
+
+def validate_qwen_edit_evidence(evidence: dict[str, Any], case_name: str, has_lora: bool) -> str:
+    if evidence.get("_shape_error"):
+        return str(evidence["_shape_error"])
+    if not evidence_has_job_png(evidence):
+        return f"SerenityFlow Qwen edit {case_name} job/png evidence missing from product report"
+    genparams = genparams_from_evidence(evidence)
+    expected = {
+        "workflow_source": "comfy_api_prompt_graph",
+        "model": "qwen_image_edit.safetensors",
+        "prompt": "change the background to a beach",
+        "negative": "",
+        "steps": 20,
+        "seed": 42,
+        "cfg": 1,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "creativity": 0.75,
+        "sigma_shift": 3,
+        "init_image": "input.png",
+        "qwen_edit_conditioning_image": "input.png",
+        "workflow_save_prefix": "qwen_edit_lora" if has_lora else "qwen_edit",
+        "workflow_node_count": 13 if has_lora else 12,
+        "workflow_edge_count": 15 if has_lora else 14,
+    }
+    missing = [
+        f"{key}={value!r}"
+        for key, value in expected.items()
+        if not genparam_matches(genparams, key, value)
+    ]
+    loras = genparams.get("lora")
+    if has_lora:
+        if loras != [{"name": "lora.safetensors", "weight": 1.0}]:
+            missing.append("lora=[lora.safetensors:1.0]")
+    elif loras != []:
+        missing.append("lora=[]")
+    if missing:
+        return f"SerenityFlow Qwen edit {case_name} metadata mismatch: " + ", ".join(missing)
     return ""
 
 
@@ -2517,6 +2677,8 @@ def check_workflow_graph_product_report() -> Check:
     sf_evidence = serenityflow_t2i_case(report, "zimage_t2i")
     edit_klein9b_evidence = serenityflow_edit_case(report, "klein9b_edit")
     edit_klein4b_evidence = serenityflow_edit_case(report, "klein4b_edit")
+    qwen_edit_evidence = serenityflow_qwen_edit_case(report, "qwen_edit")
+    qwen_edit_lora_evidence = serenityflow_qwen_edit_case(report, "qwen_edit_lora")
     ideogram4_evidence = prefixed_evidence(report, "ideogram4_visual_export")
     unsupported_api = report.get("unsupported_comfy_api_node")
     lora_clip_unsupported = report.get("lora_clip_unsupported")
@@ -2553,7 +2715,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, outpaint ThresholdMask API import, InpaintModelConditioning API import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, outpaint ThresholdMask API import, InpaintModelConditioning API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2818,6 +2980,21 @@ def check_workflow_graph_product_report() -> Check:
                 rel(WORKFLOW_GRAPH_PRODUCT),
                 WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
             )
+    qwen_edit_errors = [
+        validate_qwen_edit_evidence(qwen_edit_evidence, "qwen_edit", False),
+        validate_qwen_edit_evidence(qwen_edit_lora_evidence, "qwen_edit_lora", True),
+    ]
+    for qwen_edit_error in qwen_edit_errors:
+        if qwen_edit_error:
+            return Check(
+                False,
+                P1,
+                "workflow",
+                "typed workflow graph product smoke",
+                qwen_edit_error,
+                rel(WORKFLOW_GRAPH_PRODUCT),
+                WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+            )
     ideogram4_error = validate_ideogram4_visual_export_evidence(ideogram4_evidence)
     if ideogram4_error:
         return Check(
@@ -2833,6 +3010,10 @@ def check_workflow_graph_product_report() -> Check:
     edit_jobs = [
         ("klein9b_edit", dict_or_empty(edit_klein9b_evidence.get("job"))),
         ("klein4b_edit", dict_or_empty(edit_klein4b_evidence.get("job"))),
+    ]
+    qwen_edit_jobs = [
+        ("qwen_edit", dict_or_empty(qwen_edit_evidence.get("job"))),
+        ("qwen_edit_lora", dict_or_empty(qwen_edit_lora_evidence.get("job"))),
     ]
     ideogram4_job = dict_or_empty(ideogram4_evidence.get("job"))
     detail = (
@@ -2870,6 +3051,13 @@ def check_workflow_graph_product_report() -> Check:
     ]
     if completed_edit_cases:
         detail += "; SerenityFlow edit completed " + ", ".join(completed_edit_cases)
+    completed_qwen_edit_cases = [
+        f"{case_name} {case_job.get('id')}"
+        for case_name, case_job in qwen_edit_jobs
+        if case_job.get("id")
+    ]
+    if completed_qwen_edit_cases:
+        detail += "; SerenityFlow Qwen edit completed " + ", ".join(completed_qwen_edit_cases)
     if ideogram4_evidence:
         detail += f"; Ideogram4 visual export completed {ideogram4_job.get('id')}"
     return Check(

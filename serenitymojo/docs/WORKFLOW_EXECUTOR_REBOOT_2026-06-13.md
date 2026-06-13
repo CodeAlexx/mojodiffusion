@@ -317,6 +317,38 @@ pixi run mojo run -I . serenitymojo/sampling/parity/img2img_refpack_parity.mojo
 pixi run mojo run -I . serenitymojo/sampling/parity/klein_reference_latent_bridge_smoke.mojo
 ```
 
+## Qwen Edit Conditioning Graph-Import Handoff
+
+The current Qwen edit slice implements bounded Comfy/SerenityFlow graph/API
+import and metadata plumbing only, not Qwen-Image-Edit runtime parity. The
+Python oracle is
+`/home/alex/serenityflow-v2/serenityflow/nodes/conditioning_extra.py`:
+`TextEncodeQwenImageEditPlus` text-encodes with CLIP, converts the source image
+from BHWC to BCHW, and stores it as conditioning-side `edit_image` metadata on
+each conditioning entry. That means this image is not ordinary img2img,
+`ReferenceLatent`, `mask_image`, or `InpaintModelConditioning` concat metadata.
+
+The importer now accepts `TextEncodeQwenImageEdit` and
+`TextEncodeQwenImageEditPlus` and records the source image as
+`qwen_edit_conditioning_image`. The daemon persists that field in
+`serenity.genparams.v1`, and worker IPC preserves it.
+
+Product proof from the latest product smoke:
+
+- `job-0524`: SerenityFlow `qwen_edit.json`, `qwen_edit_conditioning_image=input.png`,
+  12 nodes, 14 edges, no LoRA.
+- `job-0525`: SerenityFlow `qwen_edit_lora.json`,
+  `qwen_edit_conditioning_image=input.png`, 13 nodes, 15 edges,
+  `lora=[{"name":"lora.safetensors","weight":1.0}]`.
+- `job-0506`..`job-0526`: full product smoke run covering this slice.
+
+Runtime boundary: real backends must continue to reject
+`qwen_edit_conditioning_image` through
+`reject_unsupported_qwen_edit_conditioning_params(...)` until the
+Qwen-Image-Edit runtime path consumes conditioning-side `edit_image` metadata.
+This includes the current Qwen backend, which remains txt2img-only for this
+field.
+
 Current static gate coverage:
 
 - `arbitrary_comfy_swarm_graph_execution_ready = false`
@@ -349,8 +381,9 @@ Currently accepted graph nodes:
 - loaders: `CheckpointLoaderSimple`, `UNETLoader`, `DiffusionModelLoader`,
   `LoraLoaderModelOnly`, `CLIPLoader`, `DualCLIPLoader`, `TripleCLIPLoader`,
   `VAELoader`
-- conditioning: `CLIPTextEncode`, `CLIPTextEncodeFlux`, `ConditioningZeroOut`,
-  `FluxGuidance`, `InpaintModelConditioning`
+- conditioning: `CLIPTextEncode`, `CLIPTextEncodeFlux`,
+  `TextEncodeQwenImageEdit`, `TextEncodeQwenImageEditPlus`,
+  `ConditioningZeroOut`, `FluxGuidance`, `InpaintModelConditioning`
 - latent/image: `LoadImage`, `EmptyLatentImage`, `EmptySD3LatentImage`,
   `EmptyFlux2LatentImage`, `ImageToMask`, `MaskToImage`, `VAEEncode`,
   `SetLatentNoiseMask`, `GetImageSize`, `ImageScale`,
@@ -379,6 +412,11 @@ plumbing. It records the conditioning image, mask, and `noise_mask` flag, and it
 uses legacy `mask_image`/`lanpaint_mask_channel` only for the
 `noise_mask=true` preserve-mask compatibility path; it does not execute Comfy
 concat conditioning in any backend.
+`TextEncodeQwenImageEdit` and `TextEncodeQwenImageEditPlus` are accepted only
+as bounded graph/API metadata plumbing. They record the source image as
+`qwen_edit_conditioning_image`, matching the Python oracle's conditioning-side
+`edit_image` metadata, and do not execute Qwen-Image-Edit runtime semantics in
+any backend.
 
 Z-Image consumes that mask only for the bounded img2img preserve-region slice:
 it stores the encoded init latent, seeded noise, and latent preserve mask, then
@@ -419,6 +457,10 @@ unsupported and should fail loud.
 - `InpaintModelConditioning` graph/API import records Comfy oracle metadata only:
   gray-fill concat-source image, concat mask, original-pixel output latent input,
   and `noise_mask`. It is not accepted concat-conditioning runtime parity.
+- `TextEncodeQwenImageEdit`/`TextEncodeQwenImageEditPlus` graph/API import
+  records the Python oracle source image as conditioning-side
+  `qwen_edit_conditioning_image`. It is not accepted Qwen-Image-Edit runtime
+  parity.
 - This is not accepted general Z-Image i2i parity.
 - This is not accepted Z-Image/Qwen/Klein/Ideogram inpaint parity.
 - Z-Image init-image encode code may be useful substrate for refiner/LanPaint/
@@ -603,6 +645,12 @@ Current bounded contract:
     `mask_image`/`lanpaint_mask_channel` empty. Real backends reject these fields
     through `reject_unsupported_inpaint_conditioning_params(...)` until concat
     conditioning runtime parity exists.
+15. `TextEncodeQwenImageEdit` and `TextEncodeQwenImageEditPlus` graph/API import
+    records the source image as `qwen_edit_conditioning_image`, separate from
+    `init_image`, `reference_image`, `mask_image`, and
+    `inpaint_conditioning_image`. Real backends reject this field through
+    `reject_unsupported_qwen_edit_conditioning_params(...)` until
+    Qwen-Image-Edit runtime parity exists.
 
 This keeps unsupported inpaint/LanPaint workflows from silently degrading into
 plain img2img or txt2img while allowing the narrow Z-Image preserve-mask and
@@ -639,6 +687,10 @@ Current LanPaint boundary:
   metadata propagation. It captures Comfy concat-conditioning metadata and the
   `noise_mask` branch, but does not gray-fill pixels, VAE-encode concat latents,
   attach conditioning objects, or run concat conditioning inside a backend.
+- `TextEncodeQwenImageEdit` and `TextEncodeQwenImageEditPlus` are supported
+  only for bounded graph/API import and metadata propagation. They capture the
+  Python oracle's conditioning-side source image as
+  `qwen_edit_conditioning_image`, but no backend consumes that field yet.
 - Acceptance for real LanPaint/inpaint execution requires backend-specific
   mask-aware denoise, outpaint behavior where applicable, and parity checks
   against the Python oracle. Until then, any request that reaches a real backend
@@ -1023,5 +1075,10 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
    VAE-encode concat latents, attach `concat_latent_image`/`concat_mask`
    conditioning metadata to positive and negative, preserve optional latent
    `noise_mask`, and compare against Comfy/Python output behavior.
-10. Only after temp build and checks pass, run `pixi run build-daemon` to update
+10. Implement real Qwen-Image-Edit backend parity before accepting
+    `qwen_edit_conditioning_image` in any real backend: consume the Python
+    oracle's conditioning-side `edit_image` metadata, keep it distinct from
+    ordinary img2img/reference/mask paths, and compare against SerenityFlow/
+    Comfy behavior.
+11. Only after temp build and checks pass, run `pixi run build-daemon` to update
    `output/bin/serenity_daemon`.

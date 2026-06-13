@@ -44,6 +44,7 @@ CAP_CACHE_GUARD = REPO / "scripts/check_klein_cap_cache_contract.py"
 CONDITIONING_TEMPLATE_GUARD = REPO / "scripts/check_klein_conditioning_template_contract.py"
 INITIAL_NOISE_SIDECAR_GUARD = REPO / "scripts/check_klein_initial_noise_sidecar_contract.py"
 SAMPLER_ARTIFACT_GUARD = REPO / "scripts/check_klein_sampler_artifact_manifest.py"
+SERENITYFLOW_ORACLE_PRODUCER = REPO / "scripts/produce_klein_reference_edit_serenityflow_oracle.py"
 USE_STATUS = REPO / "MOJO_TRAINER_USE_STATUS.md"
 PORT_STATUS = REPO / "OT_MOJO_PORT_REMAINING.md"
 
@@ -292,6 +293,7 @@ def gather_report() -> ContractReport:
         "conditioning_guard": read_source(CONDITIONING_TEMPLATE_GUARD),
         "initial_noise_guard": read_source(INITIAL_NOISE_SIDECAR_GUARD),
         "sampler_artifact_guard": read_source(SAMPLER_ARTIFACT_GUARD),
+        "serenityflow_oracle_producer": read_source(SERENITYFLOW_ORACLE_PRODUCER),
         "use_status": read_source(USE_STATUS),
         "port_status": read_source(PORT_STATUS),
     }
@@ -548,6 +550,52 @@ def gather_report() -> ContractReport:
             ),
             detail_ok="Mojo parity dump CLI keeps txt2img replay compatible and adds bounded 512/1024 ReferenceLatent edit dump dispatch for 9B/4B heads.",
             detail_missing="ReferenceLatent edit parity dump CLI markers changed; inspect edit dump dispatch manually.",
+        )
+    )
+    facts.append(
+        fact_for_needles(
+            status_if_ok="PASS",
+            status_if_missing="WARN",
+            label="SerenityFlow Klein ReferenceLatent edit oracle producer",
+            source=sources["serenityflow_oracle_producer"],
+            needles=(
+                "produce_klein_reference_edit_serenityflow_oracle.py",
+                "MAGIC = 0x4B4C4E4341505631",
+                'struct.pack("<qqq", MAGIC',
+                "torch.float32: 11",
+                "torch.bfloat16: 8",
+                '"mode": "reference_latent_edit"',
+                '"parity_claimed": False',
+                "FlowMatchEulerReferenceEdit",
+                "python_reference_vae_latent_raw_nchw",
+                "python_reference_patchified_nchw",
+                "python_reference_tokens",
+                "python_reference_combined_img_ids",
+                "python_initial_noise_raw_nchw",
+                "python_initial_noise_patchified_nchw",
+                "python_initial_noise_post_pack",
+                "python_edit_initial_noise_target_tokens",
+                "python_edit_effective_initial_target_tokens",
+                "python_edit_combined_tokens_step0",
+                "python_edit_target_latent_trajectory",
+                "python_final_packed_latent",
+                "python_final_unscaled_unpatchified_latent",
+                "python_vae_decoded_tensor",
+                "python_png.png",
+                "reference_t_offset",
+                "edit_shift",
+                "edit_denoise",
+                "positive_text_bin",
+                "negative_text_bin",
+                "allow_live_text_encoder",
+                "Live text encoder loading is disabled",
+            ),
+            detail_ok=(
+                "Python/SerenityFlow oracle producer can emit Mojo tensor-bin "
+                "ReferenceLatent edit artifacts and requires precomputed text "
+                "unless live text loading is explicitly allowed."
+            ),
+            detail_missing="SerenityFlow ReferenceLatent edit oracle producer markers changed; inspect Python oracle artifact coverage manually.",
         )
     )
     facts.append(

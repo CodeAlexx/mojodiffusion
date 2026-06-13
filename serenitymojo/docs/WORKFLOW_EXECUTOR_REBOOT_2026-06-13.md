@@ -43,6 +43,8 @@ it must not pretend that ordinary img2img or txt2img is mask-aware denoise.
   `serenitymojo/sampling/klein_sample_cli.mojo`,
   `serenitymojo/sampling/klein_sampler.mojo`,
   `serenitymojo/models/klein/klein_stack_lora.mojo`
+- Klein Python oracle artifact producer:
+  `scripts/produce_klein_reference_edit_serenityflow_oracle.py`
 - Product readiness: `output/checks/workflow_graph_product_readiness.json`
 - Klein LoRA readiness evidence:
   `output/checks/klein9b_lora_daemon_smoke.json`,
@@ -1254,11 +1256,61 @@ Python/SerenityFlow oracle:
   `scripts/check_klein_sampler_parity_contract.py`
   - statically guard the replay dtype boundary and the edit dump artifacts.
 
-This still does not prove full edit parity. The next required slice is the
-Python/SerenityFlow oracle producer that dumps the matching raw/patchified
-reference latent, initial noise, packed target/reference tokens, combined ids,
-first-step velocity, final latent, VAE tensor, and PNG for comparison against
-the Mojo manifest above.
+This still does not prove full edit parity. The Python/SerenityFlow oracle
+producer now exists, but paired numeric comparison against a real Mojo dump is
+still required before accepting edit parity.
+
+## Klein ReferenceLatent Python Oracle Producer Update
+
+`scripts/produce_klein_reference_edit_serenityflow_oracle.py` is the
+SerenityFlow/Python artifact producer for Klein ReferenceLatent edit parity. It
+does not replace production inference. Its job is to dump source-of-truth
+artifacts in Mojo's `KLNCAPV1` tensor-bin format so the Mojo edit dump can be
+compared tensor by tensor.
+
+What it writes in no-model mode:
+
+- `python_reference_vae_latent_raw_nchw.bin` as `[1,32,H/8,W/8]`
+- `python_reference_patchified_nchw.bin` as `[1,128,H/16,W/16]`
+- `python_reference_tokens.bin` as `[N,128]`
+- `python_reference_combined_img_ids.bin` as `[2N,4]`
+- `python_initial_noise_raw_nchw.bin`
+- `python_initial_noise_patchified_nchw.bin`
+- `python_initial_noise_post_pack.bin` / `python_edit_initial_noise_target_tokens.bin`
+- `python_edit_effective_initial_target_tokens.bin`
+- `python_edit_combined_tokens_step0.bin`
+- `klein_reference_edit_serenityflow_oracle_manifest.json` with
+  `mode:"reference_latent_edit"` and `parity_claimed:false`
+
+With `--run-model`, it can additionally dump first-step model outputs/velocity,
+`python_edit_target_latent_trajectory.bin`, final packed/unpatchified latents,
+decoded VAE tensor, and `python_png.png`.
+
+Safety boundary:
+
+- Prefer `--positive-text-bin` and `--negative-text-bin` cap-cache inputs for
+  model runs. These avoid live Qwen text loading.
+- Live text loading requires explicit `--allow-live-text-encoder`; do not use it
+  casually for Klein because Qwen text loading has caused reboots.
+- LTX2 is not part of this slice and should be deferred. Z-Image, Ideogram,
+  SD 3.5 Medium, Anima, and SDXL can continue using their existing working
+  paths; do not route them through this Klein oracle.
+- The reference sidecar accepted by the Mojo edit dump is the patchified/model
+  latent `[1,128,H/16,W/16]`, not raw VAE `[1,32,H/8,W/8]`. The producer writes
+  both so comparisons happen at the correct boundary.
+
+Validation smoke used for the no-heavy artifact path:
+
+```bash
+python3 scripts/produce_klein_reference_edit_serenityflow_oracle.py \
+  --out-dir /tmp/klein_ref_oracle_smoke \
+  --synthetic-reference --width 512 --height 512 \
+  --steps 2 --seed 123 --edit-denoise 0.45 --edit-shift 2.02
+```
+
+This smoke proves tensor-bin headers, ReferenceLatent pack/id layout, effective
+initial target tokens, and the no-claim manifest only. It is not an oracle
+parity claim because it uses a synthetic zero reference and does not run the DiT.
 
 Files touched for this bridge:
 
@@ -1272,6 +1324,7 @@ Files touched for this bridge:
 - `scripts/check_workflow_node_surface.py`
 - `scripts/check_klein_initial_noise_sidecar_contract.py`
 - `scripts/check_klein_sampler_parity_contract.py`
+- `scripts/produce_klein_reference_edit_serenityflow_oracle.py`
 
 New build tasks:
 

@@ -69,6 +69,7 @@ SUPPORTED_NODE_TYPES = [
     "DiffusionModelLoader",
     "LoraLoader",
     "LoraLoaderModelOnly",
+    "ZImageLoraModelOnly",
     "CLIPLoader",
     "DualCLIPLoader",
     "TripleCLIPLoader",
@@ -491,6 +492,7 @@ def check_supported_nodes() -> list[Check]:
             needles=[
                 "LoraLoader",
                 "LoraLoaderModelOnly",
+                "ZImageLoraModelOnly",
                 "_workflow_append_lora",
                 "lora_name",
                 "strength_model",
@@ -498,6 +500,7 @@ def check_supported_nodes() -> list[Check]:
                 "CLIP_LORA_UNSUPPORTED",
                 "workflow graph LoraLoader missing clip input",
                 "workflow graph LoraLoaderModelOnly missing model input",
+                "workflow graph ZImageLoraModelOnly missing model input",
                 "_workflow_append_lora(obj, lora_name, strength)",
             ],
             severity=P0,
@@ -2360,6 +2363,8 @@ def check_workflow_graph_product_report() -> Check:
     img_png = report.get("img2img_png")
     lora_job = report.get("lora_job")
     lora_png = report.get("lora_png")
+    zimage_lora_alias_job = report.get("zimage_lora_alias_job")
+    zimage_lora_alias_png = report.get("zimage_lora_alias_png")
     mask_job = report.get("mask_job")
     mask_png = report.get("mask_png")
     basic_scheduler_job = report.get("basic_scheduler_job")
@@ -2379,6 +2384,8 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(img_png, dict)
         or not isinstance(lora_job, dict)
         or not isinstance(lora_png, dict)
+        or not isinstance(zimage_lora_alias_job, dict)
+        or not isinstance(zimage_lora_alias_png, dict)
         or not isinstance(mask_job, dict)
         or not isinstance(mask_png, dict)
         or not isinstance(basic_scheduler_job, dict)
@@ -2391,7 +2398,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, LoRA, LoRA CLIP reject, img2img, mask, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2437,6 +2444,27 @@ def check_workflow_graph_product_report() -> Check:
             "workflow",
             "typed workflow graph product smoke",
             "LoraLoader metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    z_lora_genparams = zimage_lora_alias_png.get("genparams")
+    z_lora_items = z_lora_genparams.get("lora") if isinstance(z_lora_genparams, dict) else None
+    if (
+        not isinstance(z_lora_items, list)
+        or len(z_lora_items) != 2
+        or not isinstance(z_lora_items[0], dict)
+        or not isinstance(z_lora_items[1], dict)
+        or z_lora_items[0].get("name") != "zimage_first.safetensors"
+        or z_lora_items[0].get("weight") != 0.65
+        or z_lora_items[1].get("name") != "zimage_second.safetensors"
+        or z_lora_items[1].get("weight") != 0.4
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "ZImageLoraModelOnly metadata missing from product report",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )

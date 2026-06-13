@@ -236,7 +236,7 @@ def apply_ideogram4_comfy_ui_export(mut obj: JSONValue, wf: JSONValue) raises:
             raise Error("[501] Ideogram4 Comfy export root node must be an object")
         var typ = _workflow_node_type(node)
         var mode = _workflow_node_mode(node)
-        if typ == "LoraLoader" or typ == "LoraLoaderModelOnly":
+        if typ == "LoraLoader" or typ == "LoraLoaderModelOnly" or typ == "ZImageLoraModelOnly":
             if mode != 4:
                 raise Error(
                     "[501] Ideogram4 Comfy export has active LoRA nodes, but the current Ideogram4 backend does not execute LoRA"
@@ -717,7 +717,7 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("ckpt_name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
     elif type_id == "UNETLoader" or type_id == "DiffusionModelLoader":
         fields.set("unet_name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
-    elif type_id == "LoraLoader" or type_id == "LoraLoaderModelOnly":
+    elif type_id == "LoraLoader" or type_id == "LoraLoaderModelOnly" or type_id == "ZImageLoraModelOnly":
         fields.set("lora_name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
         fields.set("strength_model", JSONValue.from_float(_workflow_widget_float(widgets, 1, 1.0)))
         if type_id == "LoraLoader":
@@ -924,7 +924,7 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "UNETLoader" or typ == "DiffusionModelLoader":
         if slot == 0:
             return String("MODEL")
-    elif typ == "LoraLoaderModelOnly":
+    elif typ == "LoraLoaderModelOnly" or typ == "ZImageLoraModelOnly":
         if slot == 0:
             return String("MODEL")
     elif typ == "LoraLoader":
@@ -1114,6 +1114,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "DiffusionModelLoader"
             or type_id == "LoraLoader"
             or type_id == "LoraLoaderModelOnly"
+            or type_id == "ZImageLoraModelOnly"
             or type_id == "CLIPLoader"
             or type_id == "DualCLIPLoader"
             or type_id == "TripleCLIPLoader"
@@ -1233,11 +1234,13 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MODEL"), String("MODEL"))
                 model_nodes.append(node_id); model_ports.append(String("MODEL")); model_names.append(model_name)
                 done[i] = True; remaining -= 1; progressed = True
-            elif type_id == "LoraLoader" or type_id == "LoraLoaderModelOnly":
+            elif type_id == "LoraLoader" or type_id == "LoraLoaderModelOnly" or type_id == "ZImageLoraModelOnly":
                 var model_link = _workflow_find_input_link(edges, node_id, String("model"))
                 if not model_link.found:
                     if type_id == "LoraLoaderModelOnly":
                         raise Error("[501] workflow graph LoraLoaderModelOnly missing model input")
+                    if type_id == "ZImageLoraModelOnly":
+                        raise Error("[501] workflow graph ZImageLoraModelOnly missing model input")
                     raise Error("[501] workflow graph " + type_id + " missing model input")
                 var clip_link = _workflow_find_input_link(edges, node_id, String("clip"))
                 if type_id == "LoraLoader" and not clip_link.found:

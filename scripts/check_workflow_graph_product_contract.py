@@ -494,6 +494,63 @@ def lora_clip_unsupported_workflow_request() -> dict[str, Any]:
     }
 
 
+def zimage_lora_model_only_workflow_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "version": 1,
+            "edges": [
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 2, "port": "clip"}},
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 3, "port": "clip"}},
+                {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 5, "port": "model"}},
+                {"from": {"node": 5, "port": "MODEL"}, "to": {"node": 6, "port": "model"}},
+                {"from": {"node": 6, "port": "MODEL"}, "to": {"node": 7, "port": "model"}},
+                {"from": {"node": 3, "port": "CONDITIONING"}, "to": {"node": 7, "port": "positive"}},
+                {"from": {"node": 2, "port": "CONDITIONING"}, "to": {"node": 7, "port": "negative"}},
+                {"from": {"node": 4, "port": "LATENT"}, "to": {"node": 7, "port": "latent_image"}},
+                {"from": {"node": 7, "port": "LATENT"}, "to": {"node": 8, "port": "samples"}},
+                {"from": {"node": 1, "port": "VAE"}, "to": {"node": 8, "port": "vae"}},
+                {"from": {"node": 8, "port": "IMAGE"}, "to": {"node": 9, "port": "images"}},
+            ],
+            "nodes": [
+                {"id": 9, "type_id": "comfy/SaveImage", "fields": {"filename_prefix": "zimage-lora-alias"}},
+                {"id": 8, "type_id": "comfy/VAEDecode", "fields": {}},
+                {
+                    "id": 7,
+                    "type_id": "comfy/KSampler",
+                    "fields": {
+                        "steps": 3,
+                        "seed": 66789,
+                        "cfg": 1.25,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 0.95,
+                    },
+                },
+                {
+                    "id": 6,
+                    "type_id": "comfy/ZImageLoraModelOnly",
+                    "fields": {
+                        "lora_name": "zimage_second.safetensors",
+                        "strength_model": 0.4,
+                    },
+                },
+                {
+                    "id": 5,
+                    "type_id": "comfy/ZImageLoraModelOnly",
+                    "fields": {
+                        "lora_name": "zimage_first.safetensors",
+                        "strength_model": 0.65,
+                    },
+                },
+                {"id": 4, "type_id": "comfy/EmptySD3LatentImage", "fields": {"width": 640, "height": 512, "batch_size": 1}},
+                {"id": 2, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "zimage alias negative prompt"}},
+                {"id": 3, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "zimage alias positive prompt"}},
+                {"id": 1, "type_id": "comfy/CheckpointLoaderSimple", "fields": {"ckpt_name": "stub"}},
+            ],
+        }
+    }
+
+
 def mask_workflow_request() -> dict[str, Any]:
     return {
         "workflow": {
@@ -728,6 +785,55 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(lora_genparams.get("workflow_save_prefix") == "lora-graph", "LoRA SaveImage filename_prefix missing", blockers)
                     require(lora_genparams.get("workflow_node_count") == 8, "LoRA workflow node count missing", blockers)
                     require(lora_genparams.get("workflow_edge_count") == 11, "LoRA workflow edge count missing", blockers)
+
+            z_lora_status, z_lora_data, z_lora_text = http_json(
+                "POST", f"{base_url}/v1/generate", zimage_lora_model_only_workflow_request()
+            )
+            report["zimage_lora_alias_generate"] = {"status": z_lora_status, "body": z_lora_data}
+            if z_lora_status != 200 or not isinstance(z_lora_data, dict) or not z_lora_data.get("job_id"):
+                blockers.append(f"ZImageLoraModelOnly workflow generate failed HTTP {z_lora_status}: {z_lora_text}")
+            else:
+                z_lora_job_id = str(z_lora_data["job_id"])
+                z_lora_job = poll_job(base_url, z_lora_job_id, args.timeout)
+                report["zimage_lora_alias_job"] = z_lora_job
+                require(
+                    z_lora_job.get("state") == "done",
+                    f"ZImageLoraModelOnly workflow job state was {z_lora_job.get('state')}",
+                    blockers,
+                )
+                z_lora_png_path = Path(str(z_lora_job.get("output_path") or ""))
+                require(z_lora_png_path.is_file(), f"ZImageLoraModelOnly workflow PNG missing: {z_lora_png_path}", blockers)
+                if z_lora_png_path.is_file():
+                    z_lora_text_chunks = read_png_text(z_lora_png_path)
+                    z_lora_genparams = json.loads(z_lora_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["zimage_lora_alias_png"] = {
+                        "path": str(z_lora_png_path),
+                        "idat_sha256": z_lora_text_chunks.get("_idat_sha256"),
+                        "genparams": z_lora_genparams,
+                    }
+                    z_loras = z_lora_genparams.get("lora")
+                    require(
+                        z_lora_genparams.get("prompt") == "zimage alias positive prompt",
+                        "ZImageLoraModelOnly positive prompt was not consumed",
+                        blockers,
+                    )
+                    require(isinstance(z_loras, list) and len(z_loras) == 2, "ZImageLoraModelOnly graph did not emit two flat lora entries", blockers)
+                    if isinstance(z_loras, list) and len(z_loras) == 2 and all(isinstance(item, dict) for item in z_loras):
+                        require(
+                            z_loras[0].get("name") == "zimage_first.safetensors"
+                            and z_loras[0].get("weight") == 0.65,
+                            "first ZImageLoraModelOnly metadata missing",
+                            blockers,
+                        )
+                        require(
+                            z_loras[1].get("name") == "zimage_second.safetensors"
+                            and z_loras[1].get("weight") == 0.4,
+                            "second ZImageLoraModelOnly metadata missing",
+                            blockers,
+                        )
+                    require(z_lora_genparams.get("workflow_save_prefix") == "zimage-lora-alias", "ZImageLoraModelOnly SaveImage filename_prefix missing", blockers)
+                    require(z_lora_genparams.get("workflow_node_count") == 9, "ZImageLoraModelOnly workflow node count missing", blockers)
+                    require(z_lora_genparams.get("workflow_edge_count") == 11, "ZImageLoraModelOnly workflow edge count missing", blockers)
 
             mask_status, mask_data, mask_text = http_json("POST", f"{base_url}/v1/generate", mask_workflow_request())
             report["mask_generate"] = {"status": mask_status, "body": mask_data}
@@ -1064,6 +1170,8 @@ def main() -> int:
     print(f"  img2img_png: {report['img2img_png']['path']}")
     print(f"  lora_job_id: {report['lora_job']['id']}")
     print(f"  lora_png: {report['lora_png']['path']}")
+    print(f"  zimage_lora_alias_job_id: {report['zimage_lora_alias_job']['id']}")
+    print(f"  zimage_lora_alias_png: {report['zimage_lora_alias_png']['path']}")
     print(f"  mask_job_id: {report['mask_job']['id']}")
     print(f"  mask_png: {report['mask_png']['path']}")
     print(f"  basic_scheduler_job_id: {report['basic_scheduler_job']['id']}")

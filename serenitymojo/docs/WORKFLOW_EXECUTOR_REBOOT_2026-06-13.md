@@ -121,6 +121,39 @@ Proof jobs:
   `sigma_parameterization:"SigmaConvert"`, and
   `schedule_source:"zimage_comfy_simple_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`.
 
+2026-06-13 pushed workflow graph commits:
+
+- `43e91f1` Add bounded Comfy LoraLoader graph lowering.
+- `fc3f6cf` Preserve Comfy SaveImage prefix metadata.
+- Current Z-Image alias slice adds bounded `ZImageLoraModelOnly` graph lowering
+  as a model-only LoRA alias used by downloaded Z-Image Comfy/OpenArt exports.
+
+Concise turn evidence:
+
+```bash
+pixi run build-daemon
+# PASS
+
+python3 scripts/check_workflow_graph_product_contract.py \
+  --daemon output/bin/serenity_daemon \
+  --write-readiness output/checks/workflow_graph_product_readiness.json \
+  --json
+# PASS: job-0410..job-0423; SaveImage filename_prefix values:
+# typed-graph, img2img-graph, lora-graph, mask-graph,
+# basic-scheduler-graph, comfy-api
+
+python3 scripts/check_workflow_node_surface.py \
+  --write-readiness output/checks/workflow_node_surface_readiness.json
+# PASS: 88 checks; constrained adapter READY; arbitrary graph parity BLOCKED
+
+python3 scripts/check_workflow_graph_product_contract.py \
+  --daemon output/bin/serenity_daemon \
+  --write-readiness output/checks/workflow_graph_product_readiness.json
+# PASS: job-0439..job-0453; zimage_lora_alias job-0442 preserves:
+# lora=[zimage_first.safetensors:0.65, zimage_second.safetensors:0.4]
+# workflow_save_prefix=zimage-lora-alias; node_count=9; edge_count=11
+```
+
 The workflow product smoke passed after expanding the product evidence from one
 Z-Image template to the current supported SerenityFlow t2i template set, bounded
 SerenityFlow Klein edit templates, a `SetLatentNoiseMask` metadata graph, and
@@ -872,12 +905,14 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
 6. Keep text-id RoPE tied to the Python/Comfy `txt_ids_dims=[3]` convention in
    `serenityflow/bridge/sampling.py`; do not switch it based on non-Python
    sources.
-7. Move the remaining LanPaint/inpaint work from metadata-only graph lowering to
-   real runtime implementation only from SerenityFlow/LanPaint oracles:
+7. Next queued LanPaint slices from agent audits are bounded preprocessing for
+   `ImagePadForOutpaint` and `ThresholdMask`, not full LanPaint sampler parity.
+   Move broader LanPaint/inpaint work from metadata-only graph lowering to real
+   runtime implementation only from SerenityFlow/LanPaint oracles:
    `LanPaint_KSampler`, `LanPaint_SamplerCustomAdvanced`,
-   `LanPaint_KSamplerAdvanced`, outpaint padding, and real sampler-loop
-   `mask_image`/`lanpaint_*` consumption in the relevant backend. The current
-   Z-Image `LanPaint_MaskBlend` work is only final decoded pixel compositing.
+   `LanPaint_KSamplerAdvanced`, and real sampler-loop `mask_image`/`lanpaint_*`
+   consumption in the relevant backend. The current Z-Image
+   `LanPaint_MaskBlend` work is only final decoded pixel compositing.
 8. Keep backend mask-aware denoise fail-loud until the lowering, runtime
    implementation, and oracle parity gates all exist; metadata plumbing alone
    is not LanPaint/inpaint parity, and final-pixel MaskBlend alone is not

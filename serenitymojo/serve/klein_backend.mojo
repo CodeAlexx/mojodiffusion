@@ -310,6 +310,7 @@ struct KleinBackend(GenBackend, Movable):
     var caps_pos: String
     var caps_neg: String
     var out_png: String
+    var edit_parity_dir: String
     var lora_path: String
     var precache_bin: String
     var sampler_bin: String
@@ -328,6 +329,7 @@ struct KleinBackend(GenBackend, Movable):
         self.caps_pos = String("")
         self.caps_neg = String("")
         self.out_png = String("")
+        self.edit_parity_dir = String("")
         self.lora_path = String("")
         self.precache_bin = String(KLEIN_PRECACHE_BIN)
         self.sampler_bin = String(KLEIN_SAMPLER_BIN)
@@ -363,6 +365,7 @@ struct KleinBackend(GenBackend, Movable):
         self.caps_pos = self.job_dir + String("/caps_pos.bin")
         self.caps_neg = self.job_dir + String("/caps_neg.bin")
         self.out_png = out_root + String("/") + params.job_id + String(".png")
+        self.edit_parity_dir = self.job_dir + String("/edit_parity")
         self.phase = KPHASE_PREPARE
         self.announced = False
         self.cancel_flag = False
@@ -386,10 +389,13 @@ struct KleinBackend(GenBackend, Movable):
         self.caps_pos = String("")
         self.caps_neg = String("")
         self.out_png = String("")
+        self.edit_parity_dir = String("")
         self.lora_path = String("")
 
     def _prepare_job_files(mut self) raises:
         _mkdir_p(self.job_dir)
+        if self.params.reference_image.byte_length() > 0 or self.params.reference_latent_count > 0:
+            _mkdir_p(self.edit_parity_dir)
         var sample_json = _sample_prompts_json(self.params, self.caps_pos, self.caps_neg)
         _write_text_file(self.sample_file, sample_json)
         _write_text_file(self.job_dir + String("/genparams.json"), self.params.params_json)
@@ -434,6 +440,8 @@ struct KleinBackend(GenBackend, Movable):
                 + _shell_quote(String(KLEIN_REFERENCE_EDIT_SHIFT))
                 + String(" ")
                 + _shell_quote(String(KLEIN_REFERENCE_T_OFFSET))
+                + String(" ")
+                + _shell_quote(self.edit_parity_dir)
             )
         return cmd^
 
@@ -463,6 +471,9 @@ struct KleinBackend(GenBackend, Movable):
             out += String('  "edit_denoise":') + String(self.params.creativity) + String(",\n")
             out += String('  "edit_shift":') + String(KLEIN_REFERENCE_EDIT_SHIFT) + String(",\n")
             out += String('  "reference_t_offset":') + String(KLEIN_REFERENCE_T_OFFSET) + String(",\n")
+            out += String('  "edit_parity_sidecar_dir":"') + _json_escape(self.edit_parity_dir) + String('",\n')
+            out += String('  "edit_parity_manifest":"') + _json_escape(self.edit_parity_dir + String("/manifest.json")) + String('",\n')
+            out += String('  "reference_vae_latent":"') + _json_escape(self.edit_parity_dir + String("/reference_vae_latent.bin")) + String('",\n')
         out += String('  "metadata_key":"serenity.genparams.v1",\n')
         out += String('  "note":"Klein daemon path ran process-separated Qwen3 cap-cache precache followed by the existing staged Klein sampler/edit runner; no placeholder image was written."\n')
         out += String("}\n")

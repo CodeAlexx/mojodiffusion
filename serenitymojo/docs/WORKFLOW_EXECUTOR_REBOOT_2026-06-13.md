@@ -1182,10 +1182,39 @@ process-separated staged bridge with pollable child commands:
    `validate_klein_cap_cache_header`.
 3. It launches `output/bin/klein_sample_cli <klein*.json> <base|lora_path>
    <sample_json> job <out_png>` for txt2img, or appends
-   `- <reference_image> <creativity> 2.02 10.0` for bounded ReferenceLatent edit,
-   through the same nonblocking fork/exec/waitpid runner.
+   `- <reference_image> <creativity> 2.02 10.0
+   <job_dir>/edit_parity` for bounded ReferenceLatent edit, through the same
+   nonblocking fork/exec/waitpid runner.
 4. It rewraps the sampler PNG with `serenity.genparams.v1` and writes
    `<out_png>.klein_daemon_result.json`.
+
+## Klein Edit Parity Sidecar Update
+
+Current change adds the first edit-specific tensor capture point to the staged
+Klein ReferenceLatent path:
+
+- `serenitymojo/sampling/klein_sample_cli.mojo`
+  - accepts optional `argv[11]` as a ReferenceLatent edit parity sidecar dir;
+  - after `_encode_reference_512` / `_encode_reference_1024`, saves the encoded
+    source-image latent to `reference_vae_latent.bin` using the raw KLNCAPV1
+    tensor-bin format;
+  - writes `manifest.json` with config path, prompt file, caps paths, reference
+    image, seed, steps, cfg, denoise, edit shift, reference `t_offset`, output
+    PNG, expected latent shape, and explicit non-claims.
+- `serenitymojo/serve/klein_backend.mojo`
+  - creates `<job_dir>/edit_parity` for ReferenceLatent jobs;
+  - passes that path to the staged sampler command;
+  - records `edit_parity_sidecar_dir`, `edit_parity_manifest`, and
+    `reference_vae_latent` in `<out_png>.klein_daemon_result.json`.
+- `scripts/check_workflow_node_surface.py`
+  - statically guards the CLI and backend markers so the capture contract stays
+    visible in no-heavy readiness.
+
+This is not full oracle parity yet. It captures the first real edit tensor
+needed for parity: the VAE-encoded ReferenceLatent source image. The next
+runtime parity slice should add edit target initial-noise replay, edit RoPE/id
+sidecars, first-step target velocity, final latent tokens, VAE decoded tensor,
+and Python/SerenityFlow comparison artifacts.
 
 Files touched for this bridge:
 

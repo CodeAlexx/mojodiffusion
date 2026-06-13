@@ -491,6 +491,43 @@ def _workflow_find_reroute_input_link(edges: JSONValue, to_node: Int) raises -> 
     return out^
 
 
+def _workflow_find_setnode_input_link(edges: JSONValue, to_node: Int) raises -> WorkflowLink:
+    var out = WorkflowLink(False, -1, String(""))
+    for i in range(edges.length()):
+        var edge = edges[i]
+        if not edge.is_object() or not edge.contains("from") or not edge.contains("to"):
+            raise Error("[501] workflow graph edge must have from/to endpoints")
+        var to = edge["to"]
+        var dst_node = _workflow_ref_node(to)
+        var dst_port = _workflow_ref_port(to)
+        var accepted = (
+            dst_port == "value"
+            or dst_port == "input"
+            or dst_port == ""
+            or dst_port == "*"
+            or dst_port == "MODEL"
+            or dst_port == "CLIP"
+            or dst_port == "VAE"
+            or dst_port == "CONDITIONING"
+            or dst_port == "IMAGE"
+            or dst_port == "MASK"
+            or dst_port == "LATENT"
+            or dst_port == "GUIDER"
+            or dst_port == "SIGMAS"
+            or dst_port == "NOISE"
+            or dst_port == "SAMPLER"
+            or dst_port == "INT"
+            or dst_port == "FLOAT"
+            or dst_port == "STRING"
+        )
+        if dst_node == to_node and accepted:
+            if out.found:
+                raise Error("[501] workflow graph SetNode input has multiple sources")
+            var src = edge["from"]
+            out = WorkflowLink(True, _workflow_ref_node(src), _workflow_ref_port(src))
+    return out^
+
+
 def _workflow_has_node_id(ids: List[Int], id: Int) -> Bool:
     for i in range(len(ids)):
         if ids[i] == id:
@@ -505,6 +542,44 @@ def _workflow_value_index(
         if nodes[i] == node_id and ports[i] == port:
             return i
     return -1
+
+
+def _workflow_string_index(values: List[String], target: String) -> Int:
+    for i in range(len(values)):
+        if values[i] == target:
+            return i
+    return -1
+
+
+def _workflow_type_accepts(declared: String, actual: String) -> Bool:
+    if declared == "" or declared == "*" or declared == actual:
+        return True
+    var wrapped = String(",") + declared + String(",")
+    var token = String(",") + actual + String(",")
+    if wrapped.find(token) >= 0:
+        return True
+    token = String(", ") + actual + String(",")
+    if wrapped.find(token) >= 0:
+        return True
+    token = String(",") + actual + String(", ")
+    return wrapped.find(token) >= 0
+
+
+def _workflow_setget_supported_type(actual: String) -> Bool:
+    return (
+        actual == "MODEL"
+        or actual == "CLIP"
+        or actual == "VAE"
+        or actual == "CONDITIONING"
+        or actual == "IMAGE"
+        or actual == "MASK"
+        or actual == "LATENT"
+        or actual == "GUIDER"
+        or actual == "SIGMAS"
+        or actual == "NOISE"
+        or actual == "SAMPLER"
+        or actual == "COND_LATENT"
+    )
 
 
 def _workflow_add_value(
@@ -597,6 +672,69 @@ def _workflow_latent_index(
     return -1
 
 
+def _workflow_copy_value_metadata(
+    source: WorkflowLink, dst_node: Int, dst_port: String, actual: String,
+    mut model_nodes: List[Int], mut model_ports: List[String], mut model_names: List[String],
+    mut cond_nodes: List[Int], mut cond_ports: List[String], mut cond_texts: List[String],
+    mut image_nodes: List[Int], mut image_ports: List[String], mut image_paths: List[String],
+    mut image_mask_sources: List[String],
+    mut mask_nodes: List[Int], mut mask_ports: List[String], mut mask_paths: List[String],
+    mut mask_sources: List[String],
+    mut latent_nodes: List[Int], mut latent_ports: List[String], mut latent_widths: List[Int],
+    mut latent_heights: List[Int], mut latent_images: List[Int],
+    mut latent_init_images: List[String], mut latent_mask_images: List[String],
+    mut noise_nodes: List[Int], mut noise_ports: List[String], mut noise_seeds: List[Int],
+    mut sampler_nodes: List[Int], mut sampler_ports: List[String], mut sampler_names: List[String],
+    mut sigmas_nodes: List[Int], mut sigmas_ports: List[String], mut sigmas_steps: List[Int],
+    mut sigmas_schedulers: List[String], mut sigmas_denoises: List[Float64],
+) raises:
+    if actual == "MODEL":
+        model_nodes.append(dst_node); model_ports.append(dst_port.copy())
+        model_names.append(_workflow_model_name(model_nodes, model_ports, model_names, source))
+    elif actual == "CONDITIONING" or actual == "COND_LATENT":
+        cond_nodes.append(dst_node); cond_ports.append(dst_port.copy())
+        cond_texts.append(_workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, source))
+    if actual == "IMAGE":
+        image_nodes.append(dst_node); image_ports.append(dst_port.copy())
+        image_paths.append(_workflow_image_path(image_nodes, image_ports, image_paths, source))
+        image_mask_sources.append(_workflow_source_meta(image_nodes, image_ports, image_mask_sources, source))
+    elif actual == "MASK":
+        mask_nodes.append(dst_node); mask_ports.append(dst_port.copy())
+        mask_paths.append(_workflow_image_path(mask_nodes, mask_ports, mask_paths, source))
+        mask_sources.append(_workflow_source_meta(mask_nodes, mask_ports, mask_sources, source))
+    if actual == "LATENT" or actual == "COND_LATENT":
+        var latent_idx = _workflow_latent_index(latent_nodes, latent_ports, source)
+        latent_nodes.append(dst_node); latent_ports.append(dst_port.copy())
+        if latent_idx >= 0:
+            latent_widths.append(latent_widths[latent_idx])
+            latent_heights.append(latent_heights[latent_idx])
+            latent_images.append(latent_images[latent_idx])
+            latent_init_images.append(latent_init_images[latent_idx])
+            latent_mask_images.append(latent_mask_images[latent_idx])
+        else:
+            latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
+            latent_init_images.append(String(""))
+            latent_mask_images.append(String(""))
+    elif actual == "NOISE":
+        for j in range(len(noise_nodes)):
+            if noise_nodes[j] == source.node_id and noise_ports[j] == source.port:
+                noise_nodes.append(dst_node); noise_ports.append(dst_port.copy()); noise_seeds.append(noise_seeds[j])
+                break
+    elif actual == "SAMPLER":
+        for j in range(len(sampler_nodes)):
+            if sampler_nodes[j] == source.node_id and sampler_ports[j] == source.port:
+                sampler_nodes.append(dst_node); sampler_ports.append(dst_port.copy()); sampler_names.append(sampler_names[j])
+                break
+    elif actual == "SIGMAS":
+        for j in range(len(sigmas_nodes)):
+            if sigmas_nodes[j] == source.node_id and sigmas_ports[j] == source.port:
+                sigmas_nodes.append(dst_node); sigmas_ports.append(dst_port.copy())
+                sigmas_steps.append(sigmas_steps[j])
+                sigmas_schedulers.append(sigmas_schedulers[j])
+                sigmas_denoises.append(sigmas_denoises[j])
+                break
+
+
 def _workflow_set_field_if_nonnegative_int(
     mut obj: JSONValue, fields: JSONValue, src_key: String, dst_key: String,
 ) raises:
@@ -628,6 +766,17 @@ def _workflow_conditioning_prompt_text(fields: JSONValue, type_id: String) raise
             return text^
         text = _workflow_string(fields, String("clip_l"))
     return text^
+
+
+def _workflow_setget_name(fields: JSONValue) raises -> String:
+    var name = _workflow_string(fields, String("name"))
+    if name == "":
+        name = _workflow_string(fields, String("variable"))
+    if name == "":
+        name = _workflow_string(fields, String("key"))
+    if name == "":
+        name = _workflow_string(fields, String("set_name"))
+    return name^
 
 
 def _workflow_copy_lanpaint_field_alias(
@@ -713,6 +862,10 @@ def _comfy_ui_output_port(nodes: JSONValue, src_id: Int, src_slot: Int) raises -
     var typ = _workflow_string(out, String("type"))
     var name = _workflow_string(out, String("name"))
     var node_type = _workflow_canonical_type_id(_workflow_node_type(node))
+    if node_type == "SetNode":
+        return String("SET")
+    if node_type == "GetNode":
+        return String("GET")
     if node_type == "Reroute":
         return String("REROUTE")
     if node_type == "InpaintModelConditioning":
@@ -757,6 +910,8 @@ def _comfy_ui_input_port(nodes: JSONValue, dst_id: Int, dst_slot: Int) raises ->
         raise Error("[501] Comfy UI canvas target input slot out of range")
     var port = _workflow_string(inputs[dst_slot], String("name"))
     var node_type = _workflow_canonical_type_id(_workflow_node_type(node))
+    if node_type == "SetNode":
+        return String("value")
     if node_type == "Reroute" and port == "":
         return String("input")
     if port == "":
@@ -857,6 +1012,8 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
     elif type_id == "ConditioningSetMask":
         fields.set("strength", JSONValue.from_float(_workflow_widget_float(widgets, 0, 1.0)))
         fields.set("set_cond_area", JSONValue.from_string(_workflow_widget_string(widgets, 1, String("default"))))
+    elif type_id == "SetNode" or type_id == "GetNode":
+        fields.set("name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
     elif type_id == "InpaintModelConditioning":
         fields.set("noise_mask", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, True)))
     elif type_id == "SaveImage":
@@ -896,6 +1053,16 @@ def comfy_ui_canvas_to_typed_graph(wf: JSONValue) raises -> JSONValue:
         if src.contains("widgets_values") and src["widgets_values"].is_array():
             widgets = src["widgets_values"]
         var fields = _comfy_ui_widget_fields(type_id, widgets)
+        if (
+            (type_id == "GetNode" or type_id == "SetNode")
+            and src.contains("outputs")
+            and src["outputs"].is_array()
+            and src["outputs"].length() > 0
+            and src["outputs"][0].is_object()
+        ):
+            var output_type = _workflow_string(src["outputs"][0], String("type"))
+            if output_type != "":
+                fields.set("output_type", JSONValue.from_string(output_type))
         var dst = JSONValue.new_object()
         dst.set("id", JSONValue.from_int(_workflow_id(src)))
         dst.set("type_id", JSONValue.from_string(type_id))
@@ -1111,6 +1278,12 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "Reroute":
         if slot == 0:
             return String("REROUTE")
+    elif typ == "SetNode":
+        if slot == 0:
+            return String("SET")
+    elif typ == "GetNode":
+        if slot == 0:
+            return String("GET")
     elif typ == "LanPaint_MaskBlend":
         if slot == 0:
             return String("IMAGE")
@@ -1236,6 +1409,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "ConditioningZeroOut"
             or type_id == "ConditioningSetMask"
             or type_id == "Reroute"
+            or type_id == "SetNode"
+            or type_id == "GetNode"
             or type_id == "LoadImage"
             or type_id == "ImageToMask"
             or type_id == "MaskToImage"
@@ -1278,6 +1453,34 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             raise Error(String("[501] unsupported workflow graph node type: ") + type_id)
         ids.append(id)
 
+    var setnode_names = List[String]()
+    for i in range(nodes_json.length()):
+        var node = nodes_json[i]
+        var type_id = _workflow_type_id(node)
+        var fields = JSONValue.new_object()
+        if node.contains("fields") and node["fields"].is_object():
+            fields = node["fields"]
+        if type_id == "SetNode":
+            var name = _workflow_setget_name(fields)
+            if name == "":
+                raise Error("[501] workflow graph SetNode missing name")
+            if _workflow_string_index(setnode_names, name) >= 0:
+                raise Error("[501] workflow graph duplicate SetNode name: " + name)
+            setnode_names.append(name)
+
+    for i in range(nodes_json.length()):
+        var node = nodes_json[i]
+        var type_id = _workflow_type_id(node)
+        if type_id == "GetNode":
+            var fields = JSONValue.new_object()
+            if node.contains("fields") and node["fields"].is_object():
+                fields = node["fields"]
+            var name = _workflow_setget_name(fields)
+            if name == "":
+                raise Error("[501] workflow graph GetNode missing name")
+            if _workflow_string_index(setnode_names, name) < 0:
+                raise Error("[501] workflow graph GetNode missing SetNode: " + name)
+
     var done = List[Bool]()
     for _ in range(nodes_json.length()):
         done.append(False)
@@ -1317,6 +1520,10 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
     var sigmas_steps = List[Int]()
     var sigmas_schedulers = List[String]()
     var sigmas_denoises = List[Float64]()
+    var setget_names = List[String]()
+    var setget_nodes = List[Int]()
+    var setget_ports = List[String]()
+    var setget_types = List[String]()
     var reference_latent_count = 0
 
     var remaining = nodes_json.length()
@@ -1484,6 +1691,57 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
                     cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(text)
                     done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "SetNode":
+                var set_link = _workflow_find_setnode_input_link(edges, node_id)
+                if not set_link.found:
+                    raise Error("[501] workflow graph SetNode missing input")
+                var value_idx = _workflow_value_index(value_nodes, value_ports, set_link.node_id, set_link.port)
+                if value_idx >= 0:
+                    var name = _workflow_setget_name(fields)
+                    var actual = value_types[value_idx].copy()
+                    if not _workflow_setget_supported_type(actual):
+                        raise Error("[501] workflow graph SetNode unsupported bus type: " + actual)
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SET"), actual.copy())
+                    _workflow_copy_value_metadata(
+                        set_link, node_id, String("SET"), actual,
+                        model_nodes, model_ports, model_names,
+                        cond_nodes, cond_ports, cond_texts,
+                        image_nodes, image_ports, image_paths, image_mask_sources,
+                        mask_nodes, mask_ports, mask_paths, mask_sources,
+                        latent_nodes, latent_ports, latent_widths, latent_heights, latent_images,
+                        latent_init_images, latent_mask_images,
+                        noise_nodes, noise_ports, noise_seeds,
+                        sampler_nodes, sampler_ports, sampler_names,
+                        sigmas_nodes, sigmas_ports, sigmas_steps, sigmas_schedulers, sigmas_denoises,
+                    )
+                    setget_names.append(name)
+                    setget_nodes.append(node_id)
+                    setget_ports.append(String("SET"))
+                    setget_types.append(actual.copy())
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "GetNode":
+                var name = _workflow_setget_name(fields)
+                var bus_idx = _workflow_string_index(setget_names, name)
+                if bus_idx >= 0:
+                    var actual = setget_types[bus_idx].copy()
+                    var declared = _workflow_string(fields, String("output_type"))
+                    if not _workflow_type_accepts(declared, actual):
+                        raise Error("[501] workflow graph GetNode output type mismatch: " + declared + " vs " + actual)
+                    var source = WorkflowLink(True, setget_nodes[bus_idx], setget_ports[bus_idx].copy())
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("GET"), actual.copy())
+                    _workflow_copy_value_metadata(
+                        source, node_id, String("GET"), actual,
+                        model_nodes, model_ports, model_names,
+                        cond_nodes, cond_ports, cond_texts,
+                        image_nodes, image_ports, image_paths, image_mask_sources,
+                        mask_nodes, mask_ports, mask_paths, mask_sources,
+                        latent_nodes, latent_ports, latent_widths, latent_heights, latent_images,
+                        latent_init_images, latent_mask_images,
+                        noise_nodes, noise_ports, noise_seeds,
+                        sampler_nodes, sampler_ports, sampler_names,
+                        sigmas_nodes, sigmas_ports, sigmas_steps, sigmas_schedulers, sigmas_denoises,
+                    )
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "Reroute":
                 var input_link = _workflow_find_reroute_input_link(edges, node_id)
                 if not input_link.found:
@@ -1491,52 +1749,19 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 var value_idx = _workflow_value_index(value_nodes, value_ports, input_link.node_id, input_link.port)
                 if value_idx >= 0:
                     var actual = value_types[value_idx].copy()
-                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("REROUTE"), actual)
-                    if actual == "MODEL":
-                        model_nodes.append(node_id); model_ports.append(String("REROUTE"))
-                        model_names.append(_workflow_model_name(model_nodes, model_ports, model_names, input_link))
-                    elif actual == "CONDITIONING" or actual == "COND_LATENT":
-                        cond_nodes.append(node_id); cond_ports.append(String("REROUTE"))
-                        cond_texts.append(_workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, input_link))
-                    if actual == "IMAGE":
-                        image_nodes.append(node_id); image_ports.append(String("REROUTE"))
-                        image_paths.append(_workflow_image_path(image_nodes, image_ports, image_paths, input_link))
-                        image_mask_sources.append(_workflow_source_meta(image_nodes, image_ports, image_mask_sources, input_link))
-                    elif actual == "MASK":
-                        mask_nodes.append(node_id); mask_ports.append(String("REROUTE"))
-                        mask_paths.append(_workflow_image_path(mask_nodes, mask_ports, mask_paths, input_link))
-                        mask_sources.append(_workflow_source_meta(mask_nodes, mask_ports, mask_sources, input_link))
-                    if actual == "LATENT" or actual == "COND_LATENT":
-                        var latent_idx = _workflow_latent_index(latent_nodes, latent_ports, input_link)
-                        latent_nodes.append(node_id); latent_ports.append(String("REROUTE"))
-                        if latent_idx >= 0:
-                            latent_widths.append(latent_widths[latent_idx])
-                            latent_heights.append(latent_heights[latent_idx])
-                            latent_images.append(latent_images[latent_idx])
-                            latent_init_images.append(latent_init_images[latent_idx])
-                            latent_mask_images.append(latent_mask_images[latent_idx])
-                        else:
-                            latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
-                            latent_init_images.append(String(""))
-                            latent_mask_images.append(String(""))
-                    elif actual == "NOISE":
-                        for j in range(len(noise_nodes)):
-                            if noise_nodes[j] == input_link.node_id and noise_ports[j] == input_link.port:
-                                noise_nodes.append(node_id); noise_ports.append(String("REROUTE")); noise_seeds.append(noise_seeds[j])
-                                break
-                    elif actual == "SAMPLER":
-                        for j in range(len(sampler_nodes)):
-                            if sampler_nodes[j] == input_link.node_id and sampler_ports[j] == input_link.port:
-                                sampler_nodes.append(node_id); sampler_ports.append(String("REROUTE")); sampler_names.append(sampler_names[j])
-                                break
-                    elif actual == "SIGMAS":
-                        for j in range(len(sigmas_nodes)):
-                            if sigmas_nodes[j] == input_link.node_id and sigmas_ports[j] == input_link.port:
-                                sigmas_nodes.append(node_id); sigmas_ports.append(String("REROUTE"))
-                                sigmas_steps.append(sigmas_steps[j])
-                                sigmas_schedulers.append(sigmas_schedulers[j])
-                                sigmas_denoises.append(sigmas_denoises[j])
-                                break
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("REROUTE"), actual.copy())
+                    _workflow_copy_value_metadata(
+                        input_link, node_id, String("REROUTE"), actual,
+                        model_nodes, model_ports, model_names,
+                        cond_nodes, cond_ports, cond_texts,
+                        image_nodes, image_ports, image_paths, image_mask_sources,
+                        mask_nodes, mask_ports, mask_paths, mask_sources,
+                        latent_nodes, latent_ports, latent_widths, latent_heights, latent_images,
+                        latent_init_images, latent_mask_images,
+                        noise_nodes, noise_ports, noise_seeds,
+                        sampler_nodes, sampler_ports, sampler_names,
+                        sigmas_nodes, sigmas_ports, sigmas_steps, sigmas_schedulers, sigmas_denoises,
+                    )
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "LoadImage":
                 var image_path = _workflow_string(fields, String("image"))

@@ -75,10 +75,37 @@ pixi run build-daemon
   accepted Reroute input sources also fail.
 - Product gates must prove both `reroute_api_*` and `reroute_canvas_*` jobs in
   `output/checks/workflow_graph_product_readiness.json`.
-- Next oracle-backed graph utility targets are `GetNode`/`SetNode` variable
-  bus resolution, scalar/text constants, UI-only drops, then static
-  `LazySwitchKJ`. Do not treat `ImageResizeKJv2`, APG/CFG/model patchers,
-  control nodes, or video nodes as no-ops without real semantics.
+- Next oracle-backed graph utility targets after the bounded Get/Set slice are
+  scalar/text constants, UI-only drops, then static `LazySwitchKJ`. Do not treat
+  `ImageResizeKJv2`, APG/CFG/model patchers, control nodes, or video nodes as
+  no-ops without real semantics.
+
+2026-06-13 GetNode/SetNode graph utility slice:
+
+- Oracle shape/source of truth: KJNodes `SetNode` and `GetNode` are
+  frontend-only virtual variable nodes. The frontend rewires by the shared
+  variable name; these nodes do not execute tensor/model transforms.
+- Mojo support is a bounded typed bus in the workflow executor/import path.
+  Canvas import canonicalizes `SetNode` input to `value`, `SetNode` output to
+  `SET`, and `GetNode` output to `GET`; executor lowering stores each named
+  `SetNode` handle and lets matching `GetNode` nodes read that typed handle.
+- The bus may carry only existing typed graph values plus side metadata for
+  MODEL, CONDITIONING, IMAGE, MASK, LATENT, NOISE, SAMPLER, and SIGMAS. It must
+  not become arbitrary KJNodes execution, scalar/text constant synthesis, or
+  generic Comfy variable runtime.
+- Fail-loud behavior is required for empty/missing names, duplicate `SetNode`
+  names, `GetNode` names with no matching `SetNode`, `SetNode` with no input,
+  and multiple accepted `SetNode` input sources.
+- Product/static proof:
+  `output/checks/workflow_graph_product_readiness.json` records
+  `getset_canvas_job` `job-0583` with `workflow_source:"comfy_ui_canvas_graph"`,
+  `workflow_save_prefix:"canvas-getset"`, prompt/negative/model/init-image
+  metadata flowing through named Get/Set handles, and HTTP 501 evidence for
+  duplicate SetNode names, missing GetNode setter, missing SetNode input,
+  unsupported bus type, and GetNode output type mismatch.
+  `output/checks/workflow_node_surface_readiness.json` records
+  `checks=120`, `passed=119`, `p0=0`, `p1=0`, `p2=0`, constrained adapter
+  `READY`, and arbitrary Comfy/Swarm graph parity still `BLOCKED`.
 
 2026-06-13 Z-Image scheduler update: current Comfy `sgm_uniform` semantics are
 now ported for the bounded Z-Image Euler/flow-match Euler, DPM++ 2M, `uni_pc`,
@@ -427,6 +454,7 @@ Current static gate coverage:
 
 Currently accepted graph nodes:
 
+- graph utilities: `Reroute`, `SetNode`, `GetNode`
 - loaders: `CheckpointLoaderSimple`, `UNETLoader`, `DiffusionModelLoader`,
   `LoraLoaderModelOnly`, `CLIPLoader`, `DualCLIPLoader`, `TripleCLIPLoader`,
   `VAELoader`
@@ -486,11 +514,16 @@ the bounded final decoded `LanPaint_MaskBlend` pixel blend, with Comfy/PyTorch
 `area` resize limited to the base/original `MaskBlend.image1` role; Qwen,
 Ideogram4, and Klein must continue to fail loud for unsupported `lanpaint_*`
 runtime metadata.
+`Reroute`, `SetNode`, and `GetNode` are accepted only as bounded graph utility
+lowering. `Reroute` passes through one typed upstream handle. `SetNode`/`GetNode`
+form a name-keyed typed bus for existing handles and their model/conditioning/
+image/mask/latent/noise/sampler/sigmas metadata; they do not execute KJNodes
+logic or synthesize new values.
 `LoraLoaderModelOnly` only lowers model-side LoRA metadata into the flat request
-contract; full `LoraLoader`, CLIP-side LoRA, LoRA stacks, KJNodes utilities,
-ControlNet, IPAdapter, arbitrary custom Comfy nodes, and unsupported LanPaint
-utility nodes outside the bounded graph-lowered slice above are still
-unsupported and should fail loud.
+contract; full `LoraLoader`, CLIP-side LoRA, LoRA stacks, KJNodes utilities
+outside the bounded `SetNode`/`GetNode` bus, ControlNet, IPAdapter, arbitrary
+custom Comfy nodes, and unsupported LanPaint utility nodes outside the bounded
+graph-lowered slice above are still unsupported and should fail loud.
 
 ## Important Non-Claims
 
@@ -519,6 +552,10 @@ unsupported and should fail loud.
   `set_area_to_bounds`. It is not accepted regional-conditioning runtime parity
   and does not preserve full multi-branch attention-couple style conditioning
   lists.
+- `SetNode`/`GetNode` support is only bounded KJNodes virtual-variable lowering:
+  named pass-through of existing typed graph handles and metadata. It is not
+  arbitrary KJNodes execution, scalar/text constant support, or general Comfy
+  graph variable parity.
 - This is not accepted general Z-Image i2i parity.
 - This is not accepted Z-Image/Qwen/Klein/Ideogram inpaint parity.
 - Z-Image init-image encode code may be useful substrate for refiner/LanPaint/
@@ -1157,3 +1194,7 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
     behavior.
 12. Only after temp build and checks pass, run `pixi run build-daemon` to update
    `output/bin/serenity_daemon`.
+13. GetNode/SetNode product/static proof is recorded in
+    `workflow_graph_product_readiness.json` and
+    `workflow_node_surface_readiness.json`; keep the slice described as bounded
+    import/executor lowering rather than accepted arbitrary KJNodes parity.

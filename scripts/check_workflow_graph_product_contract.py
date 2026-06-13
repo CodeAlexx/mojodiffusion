@@ -424,6 +424,99 @@ def reroute_missing_input_comfy_api_prompt_request() -> dict[str, Any]:
     return {"workflow": {"prompt": {"1": {"class_type": "Reroute", "inputs": {}}}}}
 
 
+def getset_duplicate_setnode_workflow_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {"id": 1, "type_id": "comfy/CheckpointLoaderSimple", "fields": {"ckpt_name": "stub"}},
+                {"id": 2, "type_id": "comfy/SetNode", "fields": {"name": "DUP"}},
+                {"id": 3, "type_id": "comfy/SetNode", "fields": {"name": "DUP"}},
+            ],
+            "edges": [
+                {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 2, "port": "value"}},
+                {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 3, "port": "value"}},
+            ],
+        }
+    }
+
+
+def getset_missing_setnode_workflow_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [{"id": 1, "type_id": "comfy/GetNode", "fields": {"name": "MISSING"}}],
+            "edges": [],
+        }
+    }
+
+
+def getset_missing_input_workflow_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [{"id": 1, "type_id": "comfy/SetNode", "fields": {"name": "EMPTY"}}],
+            "edges": [],
+        }
+    }
+
+
+def getset_unsupported_type_workflow_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {"id": 1, "type_id": "comfy/CheckpointLoaderSimple", "fields": {"ckpt_name": "stub"}},
+                {
+                    "id": 2,
+                    "type_id": "comfy/LoraLoader",
+                    "fields": {
+                        "lora_name": "unsupported_clip_lora.safetensors",
+                        "strength_model": 0.1,
+                        "strength_clip": 1.0,
+                    },
+                },
+                {"id": 3, "type_id": "comfy/SetNode", "fields": {"name": "BAD_CLIP"}},
+            ],
+            "edges": [
+                {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 2, "port": "model"}},
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 2, "port": "clip"}},
+                {"from": {"node": 2, "port": "CLIP"}, "to": {"node": 3, "port": "value"}},
+            ],
+        }
+    }
+
+
+def getset_type_mismatch_comfy_ui_canvas_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "LoadImage",
+                    "widgets_values": ["/tmp/serenity_getset_mismatch.png"],
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "IMAGE", "type": "IMAGE", "links": [1]},
+                        {"name": "MASK", "type": "MASK", "links": []},
+                    ],
+                },
+                {
+                    "id": 2,
+                    "type": "SetNode",
+                    "widgets_values": ["IMG"],
+                    "inputs": [{"name": "IMAGE", "type": "IMAGE", "link": 1}],
+                    "outputs": [{"name": "*", "type": "*", "links": []}],
+                },
+                {
+                    "id": 3,
+                    "type": "GetNode",
+                    "widgets_values": ["IMG"],
+                    "inputs": [],
+                    "outputs": [{"name": "MODEL", "type": "MODEL", "links": []}],
+                },
+            ],
+            "links": [[1, 1, 0, 2, 0, "IMAGE"]],
+        }
+    }
+
+
 def reroute_comfy_ui_canvas_request() -> dict[str, Any]:
     return {
         "workflow": {
@@ -523,6 +616,162 @@ def reroute_comfy_ui_canvas_request() -> dict[str, Any]:
                 [10, 7, 0, 8, 0, "LATENT"],
                 [11, 1, 2, 8, 1, "VAE"],
                 [12, 8, 0, 9, 0, "IMAGE"],
+            ],
+        }
+    }
+
+
+def getset_comfy_ui_canvas_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "CheckpointLoaderSimple",
+                    "widgets_values": ["stub"],
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "MODEL", "type": "MODEL", "links": [6]},
+                        {"name": "CLIP", "type": "CLIP", "links": [1, 2]},
+                        {"name": "VAE", "type": "VAE", "links": [10, 14]},
+                    ],
+                },
+                {
+                    "id": 2,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["getset canvas negative prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 1}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [5]}],
+                },
+                {
+                    "id": 3,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["getset canvas positive prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 2}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [3]}],
+                },
+                {
+                    "id": 4,
+                    "type": "SetNode",
+                    "widgets_values": ["POS"],
+                    "inputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "link": 3}],
+                    "outputs": [{"name": "*", "type": "*", "links": []}],
+                },
+                {
+                    "id": 5,
+                    "type": "GetNode",
+                    "widgets_values": ["POS"],
+                    "inputs": [],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [4]}],
+                },
+                {
+                    "id": 6,
+                    "type": "LoadImage",
+                    "widgets_values": ["/tmp/serenity_getset_image.png"],
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "IMAGE", "type": "IMAGE", "links": [8]},
+                        {"name": "MASK", "type": "MASK", "links": []},
+                    ],
+                },
+                {
+                    "id": 7,
+                    "type": "SetNode",
+                    "widgets_values": ["IMG"],
+                    "inputs": [{"name": "IMAGE", "type": "IMAGE", "link": 8}],
+                    "outputs": [{"name": "*", "type": "*", "links": []}],
+                },
+                {
+                    "id": 8,
+                    "type": "GetNode",
+                    "widgets_values": ["IMG"],
+                    "inputs": [],
+                    "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [9]}],
+                },
+                {
+                    "id": 9,
+                    "type": "VAEEncode",
+                    "widgets_values": [],
+                    "inputs": [
+                        {"name": "pixels", "type": "IMAGE", "link": 9},
+                        {"name": "vae", "type": "VAE", "link": 10},
+                    ],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [11]}],
+                },
+                {
+                    "id": 10,
+                    "type": "SetNode",
+                    "widgets_values": ["LATENT"],
+                    "inputs": [{"name": "LATENT", "type": "LATENT", "link": 11}],
+                    "outputs": [{"name": "*", "type": "*", "links": []}],
+                },
+                {
+                    "id": 11,
+                    "type": "GetNode",
+                    "widgets_values": ["LATENT"],
+                    "inputs": [],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [12]}],
+                },
+                {
+                    "id": 12,
+                    "type": "SetNode",
+                    "widgets_values": ["MODEL"],
+                    "inputs": [{"name": "MODEL", "type": "MODEL", "link": 6}],
+                    "outputs": [{"name": "*", "type": "*", "links": []}],
+                },
+                {
+                    "id": 13,
+                    "type": "GetNode",
+                    "widgets_values": ["MODEL"],
+                    "inputs": [],
+                    "outputs": [{"name": "MODEL", "type": "MODEL", "links": [7]}],
+                },
+                {
+                    "id": 14,
+                    "type": "KSampler",
+                    "widgets_values": [12321, "fixed", 5, 2.75, "euler", "simple", 0.55],
+                    "inputs": [
+                        {"name": "model", "type": "MODEL", "link": 7},
+                        {"name": "positive", "type": "CONDITIONING", "link": 4},
+                        {"name": "negative", "type": "CONDITIONING", "link": 5},
+                        {"name": "latent_image", "type": "LATENT", "link": 12},
+                    ],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [13]}],
+                },
+                {
+                    "id": 15,
+                    "type": "VAEDecode",
+                    "widgets_values": [],
+                    "inputs": [
+                        {"name": "samples", "type": "LATENT", "link": 13},
+                        {"name": "vae", "type": "VAE", "link": 14},
+                    ],
+                    "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [15]}],
+                },
+                {
+                    "id": 16,
+                    "type": "SaveImage",
+                    "widgets_values": ["canvas-getset"],
+                    "inputs": [{"name": "images", "type": "IMAGE", "link": 15}],
+                    "outputs": [],
+                },
+            ],
+            "links": [
+                [1, 1, 1, 2, 0, "CLIP"],
+                [2, 1, 1, 3, 0, "CLIP"],
+                [3, 3, 0, 4, 0, "CONDITIONING"],
+                [4, 5, 0, 14, 1, "CONDITIONING"],
+                [5, 2, 0, 14, 2, "CONDITIONING"],
+                [6, 1, 0, 12, 0, "MODEL"],
+                [7, 13, 0, 14, 0, "MODEL"],
+                [8, 6, 0, 7, 0, "IMAGE"],
+                [9, 8, 0, 9, 0, "IMAGE"],
+                [10, 1, 2, 9, 1, "VAE"],
+                [11, 9, 0, 10, 0, "LATENT"],
+                [12, 11, 0, 14, 3, "LATENT"],
+                [13, 14, 0, 15, 0, "LATENT"],
+                [14, 1, 2, 15, 1, "VAE"],
+                [15, 15, 0, 16, 0, "IMAGE"],
             ],
         }
     }
@@ -1139,6 +1388,61 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 blockers,
             )
 
+            duplicate_getset_status, duplicate_getset_data, duplicate_getset_text = http_json(
+                "POST", f"{base_url}/v1/generate", getset_duplicate_setnode_workflow_request()
+            )
+            report["getset_duplicate_setnode"] = {"status": duplicate_getset_status, "body": duplicate_getset_data}
+            require(duplicate_getset_status == 501, "duplicate SetNode graph did not return HTTP 501", blockers)
+            require(
+                "duplicate SetNode name" in duplicate_getset_text,
+                "duplicate SetNode response did not name the duplicate variable",
+                blockers,
+            )
+
+            missing_getset_status, missing_getset_data, missing_getset_text = http_json(
+                "POST", f"{base_url}/v1/generate", getset_missing_setnode_workflow_request()
+            )
+            report["getset_missing_setnode"] = {"status": missing_getset_status, "body": missing_getset_data}
+            require(missing_getset_status == 501, "GetNode missing-SetNode graph did not return HTTP 501", blockers)
+            require(
+                "GetNode missing SetNode" in missing_getset_text,
+                "GetNode missing-SetNode response did not name the missing variable",
+                blockers,
+            )
+
+            missing_getset_input_status, missing_getset_input_data, missing_getset_input_text = http_json(
+                "POST", f"{base_url}/v1/generate", getset_missing_input_workflow_request()
+            )
+            report["getset_missing_input"] = {"status": missing_getset_input_status, "body": missing_getset_input_data}
+            require(missing_getset_input_status == 501, "SetNode missing-input graph did not return HTTP 501", blockers)
+            require(
+                "SetNode missing input" in missing_getset_input_text,
+                "SetNode missing-input response did not name the missing input",
+                blockers,
+            )
+
+            unsupported_getset_status, unsupported_getset_data, unsupported_getset_text = http_json(
+                "POST", f"{base_url}/v1/generate", getset_unsupported_type_workflow_request()
+            )
+            report["getset_unsupported_type"] = {"status": unsupported_getset_status, "body": unsupported_getset_data}
+            require(unsupported_getset_status == 501, "SetNode unsupported-type graph did not return HTTP 501", blockers)
+            require(
+                "SetNode unsupported bus type" in unsupported_getset_text,
+                "SetNode unsupported-type response did not name unsupported bus type",
+                blockers,
+            )
+
+            mismatch_getset_status, mismatch_getset_data, mismatch_getset_text = http_json(
+                "POST", f"{base_url}/v1/generate", getset_type_mismatch_comfy_ui_canvas_request()
+            )
+            report["getset_type_mismatch"] = {"status": mismatch_getset_status, "body": mismatch_getset_data}
+            require(mismatch_getset_status == 501, "GetNode type-mismatch canvas graph did not return HTTP 501", blockers)
+            require(
+                "GetNode output type mismatch" in mismatch_getset_text,
+                "GetNode type-mismatch response did not name the mismatch",
+                blockers,
+            )
+
             request = linked_workflow_request()
             gen_status, gen_data, gen_text = http_json("POST", f"{base_url}/v1/generate", request)
             report["generate"] = {"status": gen_status, "body": gen_data}
@@ -1504,6 +1808,46 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(reroute_canvas_genparams.get("creativity") == 0.5, "Reroute canvas denoise missing", blockers)
                     require(reroute_canvas_genparams.get("workflow_node_count") == 9, "Reroute canvas workflow node count missing", blockers)
                     require(reroute_canvas_genparams.get("workflow_edge_count") == 12, "Reroute canvas workflow edge count missing", blockers)
+
+            getset_canvas_status, getset_canvas_data, getset_canvas_text = http_json(
+                "POST", f"{base_url}/v1/generate", getset_comfy_ui_canvas_request()
+            )
+            report["getset_canvas_generate"] = {"status": getset_canvas_status, "body": getset_canvas_data}
+            if getset_canvas_status != 200 or not isinstance(getset_canvas_data, dict) or not getset_canvas_data.get("job_id"):
+                blockers.append(f"Get/Set Comfy UI canvas generate failed HTTP {getset_canvas_status}: {getset_canvas_text}")
+            else:
+                getset_canvas_job_id = str(getset_canvas_data["job_id"])
+                getset_canvas_job = poll_job(base_url, getset_canvas_job_id, args.timeout)
+                report["getset_canvas_job"] = getset_canvas_job
+                require(getset_canvas_job.get("state") == "done", f"Get/Set Comfy UI canvas job state was {getset_canvas_job.get('state')}", blockers)
+                getset_canvas_png_path = Path(str(getset_canvas_job.get("output_path") or ""))
+                require(getset_canvas_png_path.is_file(), f"Get/Set Comfy UI canvas PNG missing: {getset_canvas_png_path}", blockers)
+                if getset_canvas_png_path.is_file():
+                    getset_canvas_text_chunks = read_png_text(getset_canvas_png_path)
+                    getset_canvas_genparams = json.loads(getset_canvas_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["getset_canvas_png"] = {
+                        "path": str(getset_canvas_png_path),
+                        "idat_sha256": getset_canvas_text_chunks.get("_idat_sha256"),
+                        "genparams": getset_canvas_genparams,
+                    }
+                    require(getset_canvas_genparams.get("workflow_source") == "comfy_ui_canvas_graph", "Get/Set canvas workflow source missing", blockers)
+                    require(getset_canvas_genparams.get("workflow_save_prefix") == "canvas-getset", "Get/Set canvas SaveImage filename_prefix missing", blockers)
+                    require(getset_canvas_genparams.get("prompt") == "getset canvas positive prompt", "Get/Set canvas positive prompt was not consumed", blockers)
+                    require(getset_canvas_genparams.get("negative") == "getset canvas negative prompt", "Get/Set canvas negative prompt was not consumed", blockers)
+                    require(getset_canvas_genparams.get("model") == "stub", "Get/Set canvas model missing", blockers)
+                    require(
+                        getset_canvas_genparams.get("init_image") == "/tmp/serenity_getset_image.png",
+                        "Get/Set canvas image path did not flow through GetNode/SetNode",
+                        blockers,
+                    )
+                    require(getset_canvas_genparams.get("steps") == 5, "Get/Set canvas KSampler steps missing", blockers)
+                    require(getset_canvas_genparams.get("seed") == 12321, "Get/Set canvas KSampler seed missing", blockers)
+                    require(getset_canvas_genparams.get("cfg") == 2.75, "Get/Set canvas KSampler cfg missing", blockers)
+                    require(getset_canvas_genparams.get("sampler") == "euler", "Get/Set canvas sampler missing", blockers)
+                    require(getset_canvas_genparams.get("scheduler") == "simple", "Get/Set canvas scheduler missing", blockers)
+                    require(getset_canvas_genparams.get("creativity") == 0.55, "Get/Set canvas denoise missing", blockers)
+                    require(getset_canvas_genparams.get("workflow_node_count") == 16, "Get/Set canvas workflow node count missing", blockers)
+                    require(getset_canvas_genparams.get("workflow_edge_count") == 15, "Get/Set canvas workflow edge count missing", blockers)
 
             outpaint_api_status, outpaint_api_data, outpaint_api_text = http_json(
                 "POST", f"{base_url}/v1/generate", outpaint_threshold_comfy_api_prompt_request()
@@ -1974,6 +2318,11 @@ def main() -> int:
     print("  unsupported_comfy_api_node: HTTP 501")
     print("  wrong_type_link: HTTP 501")
     print("  lora_clip_unsupported: HTTP 501")
+    print("  getset_duplicate_setnode: HTTP 501")
+    print("  getset_missing_setnode: HTTP 501")
+    print("  getset_missing_input: HTTP 501")
+    print("  getset_unsupported_type: HTTP 501")
+    print("  getset_type_mismatch: HTTP 501")
     print(f"  img2img_job_id: {report['img2img_job']['id']}")
     print(f"  img2img_png: {report['img2img_png']['path']}")
     print(f"  lora_job_id: {report['lora_job']['id']}")
@@ -1993,6 +2342,8 @@ def main() -> int:
     print(f"  reroute_api_png: {report['reroute_api_png']['path']}")
     print(f"  reroute_canvas_job_id: {report['reroute_canvas_job']['id']}")
     print(f"  reroute_canvas_png: {report['reroute_canvas_png']['path']}")
+    print(f"  getset_canvas_job_id: {report['getset_canvas_job']['id']}")
+    print(f"  getset_canvas_png: {report['getset_canvas_png']['path']}")
     print(f"  outpaint_threshold_api_job_id: {report['outpaint_threshold_api_job']['id']}")
     print(f"  outpaint_threshold_api_png: {report['outpaint_threshold_api_png']['path']}")
     print(f"  inpaint_conditioning_api_job_id: {report['inpaint_conditioning_api_job']['id']}")

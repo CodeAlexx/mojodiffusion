@@ -83,6 +83,8 @@ SUPPORTED_NODE_TYPES = [
     "ConditioningZeroOut",
     "ConditioningSetMask",
     "Reroute",
+    "SetNode",
+    "GetNode",
     "LoadImage",
     "ImageToMask",
     "MaskToImage",
@@ -609,16 +611,38 @@ def check_supported_nodes() -> list[Check]:
                 "_workflow_find_reroute_input_link",
                 "workflow graph Reroute missing input",
                 'String("REROUTE")',
-                "_workflow_model_name(model_nodes, model_ports, model_names, input_link)",
-                "_workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, input_link)",
-                "_workflow_image_path(image_nodes, image_ports, image_paths, input_link)",
-                "_workflow_latent_index(latent_nodes, latent_ports, input_link)",
-                "noise_seeds.append(noise_seeds[j])",
-                "sampler_names.append(sampler_names[j])",
-                "sigmas_denoises.append(sigmas_denoises[j])",
+                "_workflow_copy_value_metadata(",
+                "input_link, node_id, String(\"REROUTE\"), actual",
             ],
             severity=P0,
             acceptance="Comfy Reroute imports behave as typed pass-through handles and preserve side-table metadata instead of becoming a synthetic tensor operation.",
+        )
+    )
+    checks.append(
+        check_contains(
+            WORKFLOW_GRAPH,
+            category="workflow",
+            label="GetNode/SetNode virtual variable lowering",
+            needles=[
+                "SetNode",
+                "GetNode",
+                "_workflow_find_setnode_input_link",
+                "_workflow_setget_name",
+                "_workflow_setget_supported_type",
+                "_workflow_type_accepts",
+                "duplicate SetNode name",
+                "GetNode missing SetNode",
+                "SetNode missing input",
+                "SetNode unsupported bus type",
+                "GetNode output type mismatch",
+                'String("SET")',
+                'String("GET")',
+                "setget_names",
+                "output_type",
+                "_workflow_copy_value_metadata(",
+            ],
+            severity=P0,
+            acceptance="KJNodes Get/Set virtual variables lower as bounded typed handle pass-throughs with fail-loud ambiguity/type checks.",
         )
     )
     checks.append(
@@ -905,6 +929,11 @@ def check_fail_loud() -> list[Check]:
                 "[501] workflow graph body needs edges for typed execution",
                 "[501] workflow graph input ",
                 "[501] workflow graph has unresolved or cyclic typed links",
+                "[501] workflow graph duplicate SetNode name: ",
+                "[501] workflow graph GetNode missing SetNode: ",
+                "[501] workflow graph SetNode missing input",
+                "[501] workflow graph SetNode unsupported bus type: ",
+                "[501] workflow graph GetNode output type mismatch: ",
             ],
             severity=P0,
             acceptance="Bad typed links and cyclic linked graphs fail before enqueue.",
@@ -2852,6 +2881,8 @@ def check_workflow_graph_product_report() -> Check:
     reroute_api_png = report.get("reroute_api_png")
     reroute_canvas_job = report.get("reroute_canvas_job")
     reroute_canvas_png = report.get("reroute_canvas_png")
+    getset_canvas_job = report.get("getset_canvas_job")
+    getset_canvas_png = report.get("getset_canvas_png")
     outpaint_threshold_api_job = report.get("outpaint_threshold_api_job")
     outpaint_threshold_api_png = report.get("outpaint_threshold_api_png")
     inpaint_conditioning_api_job = report.get("inpaint_conditioning_api_job")
@@ -2881,6 +2912,11 @@ def check_workflow_graph_product_report() -> Check:
     unsupported_api = report.get("unsupported_comfy_api_node")
     lora_clip_unsupported = report.get("lora_clip_unsupported")
     reroute_missing_input = report.get("reroute_missing_input")
+    getset_duplicate_setnode = report.get("getset_duplicate_setnode")
+    getset_missing_setnode = report.get("getset_missing_setnode")
+    getset_missing_input = report.get("getset_missing_input")
+    getset_unsupported_type = report.get("getset_unsupported_type")
+    getset_type_mismatch = report.get("getset_type_mismatch")
     inpaint_conditioning_missing_mask = report.get("inpaint_conditioning_missing_mask")
     conditioning_set_mask_missing_mask = report.get("conditioning_set_mask_missing_mask")
     if (
@@ -2892,6 +2928,8 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(reroute_api_png, dict)
         or not isinstance(reroute_canvas_job, dict)
         or not isinstance(reroute_canvas_png, dict)
+        or not isinstance(getset_canvas_job, dict)
+        or not isinstance(getset_canvas_png, dict)
         or not isinstance(outpaint_threshold_api_job, dict)
         or not isinstance(outpaint_threshold_api_png, dict)
         or not isinstance(inpaint_conditioning_api_job, dict)
@@ -2915,6 +2953,11 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(unsupported_api, dict)
         or not isinstance(lora_clip_unsupported, dict)
         or not isinstance(reroute_missing_input, dict)
+        or not isinstance(getset_duplicate_setnode, dict)
+        or not isinstance(getset_missing_setnode, dict)
+        or not isinstance(getset_missing_input, dict)
+        or not isinstance(getset_unsupported_type, dict)
+        or not isinstance(getset_type_mismatch, dict)
         or not isinstance(inpaint_conditioning_missing_mask, dict)
         or not isinstance(conditioning_set_mask_missing_mask, dict)
     ):
@@ -2923,7 +2966,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, Reroute API/canvas import, outpaint ThresholdMask API import, InpaintModelConditioning API import, ConditioningSetMask API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, Reroute API/canvas import, Get/Set canvas import, outpaint ThresholdMask API import, InpaintModelConditioning API import, ConditioningSetMask API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2967,6 +3010,23 @@ def check_workflow_graph_product_report() -> Check:
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
+    for label, item in (
+        ("Get/Set duplicate SetNode", getset_duplicate_setnode),
+        ("Get/Set missing SetNode", getset_missing_setnode),
+        ("Get/Set missing SetNode input", getset_missing_input),
+        ("Get/Set unsupported bus type", getset_unsupported_type),
+        ("Get/Set output type mismatch", getset_type_mismatch),
+    ):
+        if item.get("status") != 501:
+            return Check(
+                False,
+                P1,
+                "workflow",
+                "typed workflow graph product smoke",
+                f"{label} unsupported report did not return HTTP 501",
+                rel(WORKFLOW_GRAPH_PRODUCT),
+                WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+            )
     linked_genparams = png.get("genparams")
     api_genparams = api_png.get("genparams")
     if (
@@ -3132,6 +3192,28 @@ def check_workflow_graph_product_report() -> Check:
             "workflow",
             "typed workflow graph product smoke",
             "Reroute Comfy UI canvas import metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    getset_canvas_genparams = getset_canvas_png.get("genparams")
+    if (
+        not isinstance(getset_canvas_genparams, dict)
+        or getset_canvas_genparams.get("workflow_source") != "comfy_ui_canvas_graph"
+        or getset_canvas_genparams.get("workflow_save_prefix") != "canvas-getset"
+        or getset_canvas_genparams.get("prompt") != "getset canvas positive prompt"
+        or getset_canvas_genparams.get("negative") != "getset canvas negative prompt"
+        or getset_canvas_genparams.get("model") != "stub"
+        or getset_canvas_genparams.get("init_image") != "/tmp/serenity_getset_image.png"
+        or getset_canvas_genparams.get("seed") != 12321
+        or getset_canvas_genparams.get("workflow_node_count") != 16
+        or getset_canvas_genparams.get("workflow_edge_count") != 15
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "Get/Set Comfy UI canvas import metadata missing from product report",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -3324,6 +3406,7 @@ def check_workflow_graph_product_report() -> Check:
         f"Comfy API prompt completed {api_job.get('id')}; "
         f"Reroute API completed {reroute_api_job.get('id')}; "
         f"Reroute canvas completed {reroute_canvas_job.get('id')}; "
+        f"Get/Set canvas completed {getset_canvas_job.get('id')}; "
         f"outpaint ThresholdMask API completed {outpaint_threshold_api_job.get('id')}; "
         f"InpaintModelConditioning API completed {inpaint_conditioning_api_job.get('id')}; "
         f"InpaintModelConditioning noise_mask=false API completed {inpaint_conditioning_no_noise_mask_api_job.get('id')}; "

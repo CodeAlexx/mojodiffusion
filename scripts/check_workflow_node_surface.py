@@ -118,6 +118,7 @@ SUPPORTED_NODE_TYPES = [
     "SamplerCustomAdvanced",
     "LanPaint_SamplerCustomAdvanced",
     "LanPaint_MaskBlend",
+    "ComfySwitchNode",
     "VAEDecode",
     "SaveImage",
     "PreviewImage",
@@ -710,6 +711,28 @@ def check_supported_nodes() -> list[Check]:
             ],
             severity=P0,
             acceptance="Swarm/Comfy UI-only notes are inert and PreviewImage is an optional IMAGE sink with fail-loud type checking.",
+        )
+    )
+    checks.append(
+        check_contains(
+            WORKFLOW_GRAPH,
+            category="workflow",
+            label="ComfySwitchNode static selector lowering",
+            needles=[
+                "ComfySwitchNode",
+                'fields.set("switch", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, False)))',
+                'return String("output")',
+                'elif type_id == "ComfySwitchNode"',
+                '_workflow_find_input_link(edges, node_id, String("on_false"))',
+                '_workflow_find_input_link(edges, node_id, String("on_true"))',
+                '_workflow_find_input_link(edges, node_id, String("switch"))',
+                "_workflow_scalar_bool",
+                "selected = true_link.copy()",
+                '_workflow_add_value(value_nodes, value_ports, value_types, node_id, String("output"), actual.copy())',
+                "_workflow_copy_value_metadata(",
+            ],
+            severity=P0,
+            acceptance="ComfySwitchNode mirrors Comfy's lazy boolean selector by copying only the selected branch's typed handle and metadata.",
         )
     )
     checks.append(
@@ -2954,6 +2977,8 @@ def check_workflow_graph_product_report() -> Check:
     scalar_canvas_png = report.get("scalar_canvas_png")
     ui_drop_canvas_job = report.get("ui_drop_canvas_job")
     ui_drop_canvas_png = report.get("ui_drop_canvas_png")
+    switch_canvas_job = report.get("switch_canvas_job")
+    switch_canvas_png = report.get("switch_canvas_png")
     outpaint_threshold_api_job = report.get("outpaint_threshold_api_job")
     outpaint_threshold_api_png = report.get("outpaint_threshold_api_png")
     inpaint_conditioning_api_job = report.get("inpaint_conditioning_api_job")
@@ -2990,6 +3015,7 @@ def check_workflow_graph_product_report() -> Check:
     getset_type_mismatch = report.get("getset_type_mismatch")
     scalar_type_mismatch = report.get("scalar_type_mismatch")
     preview_type_mismatch = report.get("preview_type_mismatch")
+    switch_type_mismatch = report.get("switch_type_mismatch")
     inpaint_conditioning_missing_mask = report.get("inpaint_conditioning_missing_mask")
     conditioning_set_mask_missing_mask = report.get("conditioning_set_mask_missing_mask")
     if (
@@ -3007,6 +3033,8 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(scalar_canvas_png, dict)
         or not isinstance(ui_drop_canvas_job, dict)
         or not isinstance(ui_drop_canvas_png, dict)
+        or not isinstance(switch_canvas_job, dict)
+        or not isinstance(switch_canvas_png, dict)
         or not isinstance(outpaint_threshold_api_job, dict)
         or not isinstance(outpaint_threshold_api_png, dict)
         or not isinstance(inpaint_conditioning_api_job, dict)
@@ -3037,6 +3065,7 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(getset_type_mismatch, dict)
         or not isinstance(scalar_type_mismatch, dict)
         or not isinstance(preview_type_mismatch, dict)
+        or not isinstance(switch_type_mismatch, dict)
         or not isinstance(inpaint_conditioning_missing_mask, dict)
         or not isinstance(conditioning_set_mask_missing_mask, dict)
     ):
@@ -3045,7 +3074,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, Reroute API/canvas import, Get/Set canvas import, scalar canvas import, UI/drop canvas import, outpaint ThresholdMask API import, InpaintModelConditioning API import, ConditioningSetMask API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, Reroute API/canvas import, Get/Set canvas import, scalar canvas import, UI/drop canvas import, ComfySwitchNode canvas import, outpaint ThresholdMask API import, InpaintModelConditioning API import, ConditioningSetMask API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -3097,6 +3126,7 @@ def check_workflow_graph_product_report() -> Check:
         ("Get/Set output type mismatch", getset_type_mismatch),
         ("scalar consumer type mismatch", scalar_type_mismatch),
         ("PreviewImage type mismatch", preview_type_mismatch),
+        ("ComfySwitchNode selected type mismatch", switch_type_mismatch),
     ):
         if item.get("status") != 501:
             return Check(
@@ -3356,6 +3386,35 @@ def check_workflow_graph_product_report() -> Check:
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
+    switch_genparams = switch_canvas_png.get("genparams")
+    if (
+        not isinstance(switch_genparams, dict)
+        or switch_genparams.get("workflow_source") != "comfy_ui_canvas_graph"
+        or switch_genparams.get("workflow_save_prefix") != "switch-canvas"
+        or switch_genparams.get("prompt") != "switch canvas positive prompt"
+        or switch_genparams.get("negative") != "switch canvas negative prompt"
+        or switch_genparams.get("model") != "stub"
+        or switch_genparams.get("width") != 608
+        or switch_genparams.get("height") != 512
+        or switch_genparams.get("images") != 1
+        or switch_genparams.get("steps") != 6
+        or switch_genparams.get("seed") != 97531
+        or switch_genparams.get("cfg") != 2.875
+        or switch_genparams.get("sampler") != "euler"
+        or switch_genparams.get("scheduler") != "simple"
+        or switch_genparams.get("creativity") != 0.7
+        or switch_genparams.get("workflow_node_count") != 18
+        or switch_genparams.get("workflow_edge_count") != 20
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "ComfySwitchNode selected-branch metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
     outpaint_api_genparams = outpaint_threshold_api_png.get("genparams")
     if (
         not isinstance(outpaint_api_genparams, dict)
@@ -3551,6 +3610,7 @@ def check_workflow_graph_product_report() -> Check:
         f"Get/Set canvas completed {getset_canvas_job.get('id')}; "
         f"scalar canvas completed {scalar_canvas_job.get('id')}; "
         f"UI/drop canvas completed {ui_drop_canvas_job.get('id')}; "
+        f"ComfySwitchNode canvas completed {switch_canvas_job.get('id')}; "
         f"outpaint ThresholdMask API completed {outpaint_threshold_api_job.get('id')}; "
         f"InpaintModelConditioning API completed {inpaint_conditioning_api_job.get('id')}; "
         f"InpaintModelConditioning noise_mask=false API completed {inpaint_conditioning_no_noise_mask_api_job.get('id')}; "

@@ -1111,6 +1111,198 @@ def preview_type_mismatch_comfy_ui_canvas_request() -> dict[str, Any]:
     }
 
 
+def switch_comfy_ui_canvas_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "CheckpointLoaderSimple",
+                    "widgets_values": ["stub"],
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "MODEL", "type": "MODEL", "links": [5]},
+                        {"name": "CLIP", "type": "CLIP", "links": [1, 2]},
+                        {"name": "VAE", "type": "VAE", "links": [10]},
+                    ],
+                },
+                {
+                    "id": 2,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["switch canvas negative prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 1}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [4]}],
+                },
+                {
+                    "id": 3,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["switch canvas positive prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 2}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [3]}],
+                },
+                {
+                    "id": 4,
+                    "type": "EmptyLatentImage",
+                    "widgets_values": [608, 512, 1],
+                    "inputs": [],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [7]}],
+                },
+                {
+                    "id": 5,
+                    "type": "KSampler",
+                    "widgets_values": [97531, "fixed", 99, 3.0, "euler", "simple", 0.7],
+                    "inputs": [
+                        {"name": "model", "type": "MODEL", "link": 8},
+                        {"name": "positive", "type": "CONDITIONING", "link": 3},
+                        {"name": "negative", "type": "CONDITIONING", "link": 4},
+                        {"name": "latent_image", "type": "LATENT", "link": 7},
+                        {"name": "steps", "type": "INT", "link": 16},
+                        {"name": "cfg", "type": "FLOAT", "link": 20},
+                    ],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [9]}],
+                },
+                {
+                    "id": 6,
+                    "type": "VAEDecode",
+                    "widgets_values": [],
+                    "inputs": [
+                        {"name": "samples", "type": "LATENT", "link": 9},
+                        {"name": "vae", "type": "VAE", "link": 10},
+                    ],
+                    "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [11]}],
+                },
+                {
+                    "id": 7,
+                    "type": "SaveImage",
+                    "widgets_values": ["switch-canvas"],
+                    "inputs": [{"name": "images", "type": "IMAGE", "link": 11}],
+                    "outputs": [],
+                },
+                {
+                    "id": 20,
+                    "type": "PrimitiveString",
+                    "widgets_values": ["not a model"],
+                    "inputs": [],
+                    "outputs": [{"name": "STRING", "type": "STRING", "links": [6]}],
+                },
+                {
+                    "id": 21,
+                    "type": "PrimitiveBoolean",
+                    "widgets_values": [False],
+                    "inputs": [],
+                    "outputs": [{"name": "BOOLEAN", "type": "BOOLEAN", "links": [12]}],
+                },
+                {
+                    "id": 22,
+                    "type": "ComfySwitchNode",
+                    "widgets_values": [True],
+                    "inputs": [
+                        {"name": "switch", "type": "BOOLEAN", "link": 12},
+                        {"name": "on_true", "type": "*", "link": 6},
+                        {"name": "on_false", "type": "*", "link": 5},
+                    ],
+                    "outputs": [{"name": "output", "type": "*", "links": [8]}],
+                },
+                {
+                    "id": 23,
+                    "type": "PrimitiveInt",
+                    "widgets_values": [99, "fixed"],
+                    "inputs": [],
+                    "outputs": [{"name": "INT", "type": "INT", "links": [13]}],
+                },
+                {
+                    "id": 24,
+                    "type": "PrimitiveInt",
+                    "widgets_values": [6, "fixed"],
+                    "inputs": [],
+                    "outputs": [{"name": "INT", "type": "INT", "links": [14]}],
+                },
+                {
+                    "id": 25,
+                    "type": "PrimitiveBoolean",
+                    "widgets_values": [True],
+                    "inputs": [],
+                    "outputs": [{"name": "BOOLEAN", "type": "BOOLEAN", "links": [15]}],
+                },
+                {
+                    "id": 26,
+                    "type": "ComfySwitchNode",
+                    "widgets_values": [False],
+                    "inputs": [
+                        {"name": "on_true", "type": "*", "link": 14},
+                        {"name": "switch", "type": "BOOLEAN", "link": 15},
+                        {"name": "on_false", "type": "*", "link": 13},
+                    ],
+                    "outputs": [{"name": "output", "type": "*", "links": [16]}],
+                },
+                {
+                    "id": 27,
+                    "type": "PrimitiveFloat",
+                    "widgets_values": [9.9],
+                    "inputs": [],
+                    "outputs": [{"name": "FLOAT", "type": "FLOAT", "links": [17]}],
+                },
+                {
+                    "id": 28,
+                    "type": "PrimitiveFloat",
+                    "widgets_values": [2.875],
+                    "inputs": [],
+                    "outputs": [{"name": "FLOAT", "type": "FLOAT", "links": [18]}],
+                },
+                {
+                    "id": 29,
+                    "type": "PrimitiveBoolean",
+                    "widgets_values": [True],
+                    "inputs": [],
+                    "outputs": [{"name": "BOOLEAN", "type": "BOOLEAN", "links": [19]}],
+                },
+                {
+                    "id": 30,
+                    "type": "ComfySwitchNode",
+                    "widgets_values": [False],
+                    "inputs": [
+                        {"name": "switch", "type": "BOOLEAN", "link": 19},
+                        {"name": "on_false", "type": "*", "link": 17},
+                        {"name": "on_true", "type": "*", "link": 18},
+                    ],
+                    "outputs": [{"name": "output", "type": "*", "links": [20]}],
+                },
+            ],
+            "links": [
+                [1, 1, 1, 2, 0, "CLIP"],
+                [2, 1, 1, 3, 0, "CLIP"],
+                [3, 3, 0, 5, 1, "CONDITIONING"],
+                [4, 2, 0, 5, 2, "CONDITIONING"],
+                [5, 1, 0, 22, 2, "MODEL"],
+                [6, 20, 0, 22, 1, "STRING"],
+                [7, 4, 0, 5, 3, "LATENT"],
+                [8, 22, 0, 5, 0, "*"],
+                [9, 5, 0, 6, 0, "LATENT"],
+                [10, 1, 2, 6, 1, "VAE"],
+                [11, 6, 0, 7, 0, "IMAGE"],
+                [12, 21, 0, 22, 0, "BOOLEAN"],
+                [13, 23, 0, 26, 2, "INT"],
+                [14, 24, 0, 26, 0, "INT"],
+                [15, 25, 0, 26, 1, "BOOLEAN"],
+                [16, 26, 0, 5, 4, "INT"],
+                [17, 27, 0, 30, 1, "FLOAT"],
+                [18, 28, 0, 30, 2, "FLOAT"],
+                [19, 29, 0, 30, 0, "BOOLEAN"],
+                [20, 30, 0, 5, 5, "FLOAT"],
+            ],
+        }
+    }
+
+
+def switch_type_mismatch_comfy_ui_canvas_request() -> dict[str, Any]:
+    body = switch_comfy_ui_canvas_request()
+    for node in body["workflow"]["nodes"]:
+        if node["id"] == 21:
+            node["widgets_values"] = [True]
+            break
+    return body
+
+
 def outpaint_threshold_comfy_api_prompt_request() -> dict[str, Any]:
     return {
         "workflow": {
@@ -1807,6 +1999,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 blockers,
             )
 
+            switch_mismatch_status, switch_mismatch_data, switch_mismatch_text = http_json(
+                "POST", f"{base_url}/v1/generate", switch_type_mismatch_comfy_ui_canvas_request()
+            )
+            report["switch_type_mismatch"] = {"status": switch_mismatch_status, "body": switch_mismatch_data}
+            require(switch_mismatch_status == 501, "ComfySwitchNode selected-type-mismatch canvas graph did not return HTTP 501", blockers)
+            require(
+                "input model expected MODEL" in switch_mismatch_text,
+                "ComfySwitchNode selected-type-mismatch response did not name the bad model input",
+                blockers,
+            )
+
             request = linked_workflow_request()
             gen_status, gen_data, gen_text = http_json("POST", f"{base_url}/v1/generate", request)
             report["generate"] = {"status": gen_status, "body": gen_data}
@@ -2297,6 +2500,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(ui_drop_genparams.get("workflow_node_count") == 10, "UI/drop workflow node count missing", blockers)
                     require(ui_drop_genparams.get("workflow_edge_count") == 10, "UI/drop workflow edge count missing", blockers)
 
+            switch_canvas_status, switch_canvas_data, switch_canvas_text = http_json(
+                "POST", f"{base_url}/v1/generate", switch_comfy_ui_canvas_request()
+            )
+            report["switch_canvas_generate"] = {"status": switch_canvas_status, "body": switch_canvas_data}
+            if switch_canvas_status != 200 or not isinstance(switch_canvas_data, dict) or not switch_canvas_data.get("job_id"):
+                blockers.append(f"ComfySwitchNode canvas generate failed HTTP {switch_canvas_status}: {switch_canvas_text}")
+            else:
+                switch_canvas_job_id = str(switch_canvas_data["job_id"])
+                switch_canvas_job = poll_job(base_url, switch_canvas_job_id, args.timeout)
+                report["switch_canvas_job"] = switch_canvas_job
+                require(
+                    switch_canvas_job.get("state") == "done",
+                    f"ComfySwitchNode canvas job state was {switch_canvas_job.get('state')}",
+                    blockers,
+                )
+                switch_canvas_png_path = Path(str(switch_canvas_job.get("output_path") or ""))
+                require(switch_canvas_png_path.is_file(), f"ComfySwitchNode canvas PNG missing: {switch_canvas_png_path}", blockers)
+                if switch_canvas_png_path.is_file():
+                    switch_canvas_text_chunks = read_png_text(switch_canvas_png_path)
+                    switch_canvas_genparams = json.loads(switch_canvas_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["switch_canvas_png"] = {
+                        "path": str(switch_canvas_png_path),
+                        "idat_sha256": switch_canvas_text_chunks.get("_idat_sha256"),
+                        "genparams": switch_canvas_genparams,
+                    }
+                    require(switch_canvas_genparams.get("workflow_source") == "comfy_ui_canvas_graph", "ComfySwitchNode canvas workflow source missing", blockers)
+                    require(switch_canvas_genparams.get("workflow_save_prefix") == "switch-canvas", "ComfySwitchNode SaveImage filename_prefix missing", blockers)
+                    require(switch_canvas_genparams.get("prompt") == "switch canvas positive prompt", "ComfySwitchNode positive prompt missing", blockers)
+                    require(switch_canvas_genparams.get("negative") == "switch canvas negative prompt", "ComfySwitchNode negative prompt missing", blockers)
+                    require(switch_canvas_genparams.get("model") == "stub", "ComfySwitchNode selected model branch missing", blockers)
+                    require(switch_canvas_genparams.get("width") == 608, "ComfySwitchNode latent width missing", blockers)
+                    require(switch_canvas_genparams.get("height") == 512, "ComfySwitchNode latent height missing", blockers)
+                    require(switch_canvas_genparams.get("images") == 1, "ComfySwitchNode batch size missing", blockers)
+                    require(switch_canvas_genparams.get("steps") == 6, "ComfySwitchNode selected scalar steps missing", blockers)
+                    require(switch_canvas_genparams.get("seed") == 97531, "ComfySwitchNode KSampler seed missing", blockers)
+                    require(switch_canvas_genparams.get("cfg") == 2.875, "ComfySwitchNode selected scalar cfg missing", blockers)
+                    require(switch_canvas_genparams.get("sampler") == "euler", "ComfySwitchNode KSampler sampler missing", blockers)
+                    require(switch_canvas_genparams.get("scheduler") == "simple", "ComfySwitchNode KSampler scheduler missing", blockers)
+                    require(switch_canvas_genparams.get("creativity") == 0.7, "ComfySwitchNode KSampler denoise missing", blockers)
+                    require(switch_canvas_genparams.get("workflow_node_count") == 18, "ComfySwitchNode workflow node count missing", blockers)
+                    require(switch_canvas_genparams.get("workflow_edge_count") == 20, "ComfySwitchNode workflow edge count missing", blockers)
+
             outpaint_api_status, outpaint_api_data, outpaint_api_text = http_json(
                 "POST", f"{base_url}/v1/generate", outpaint_threshold_comfy_api_prompt_request()
             )
@@ -2773,6 +3018,7 @@ def main() -> int:
     print("  getset_type_mismatch: HTTP 501")
     print("  scalar_type_mismatch: HTTP 501")
     print("  preview_type_mismatch: HTTP 501")
+    print("  switch_type_mismatch: HTTP 501")
     print(f"  img2img_job_id: {report['img2img_job']['id']}")
     print(f"  img2img_png: {report['img2img_png']['path']}")
     print(f"  lora_job_id: {report['lora_job']['id']}")
@@ -2798,6 +3044,8 @@ def main() -> int:
     print(f"  scalar_canvas_png: {report['scalar_canvas_png']['path']}")
     print(f"  ui_drop_canvas_job_id: {report['ui_drop_canvas_job']['id']}")
     print(f"  ui_drop_canvas_png: {report['ui_drop_canvas_png']['path']}")
+    print(f"  switch_canvas_job_id: {report['switch_canvas_job']['id']}")
+    print(f"  switch_canvas_png: {report['switch_canvas_png']['path']}")
     print(f"  outpaint_threshold_api_job_id: {report['outpaint_threshold_api_job']['id']}")
     print(f"  outpaint_threshold_api_png: {report['outpaint_threshold_api_png']['path']}")
     print(f"  inpaint_conditioning_api_job_id: {report['inpaint_conditioning_api_job']['id']}")

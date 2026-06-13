@@ -1245,6 +1245,8 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("cfg", JSONValue.from_float(_workflow_widget_float(widgets, 0, 4.5)))
     elif type_id == "ModelSamplingAuraFlow" or type_id == "ModelSamplingSD3":
         fields.set("shift", JSONValue.from_float(_workflow_widget_float(widgets, 0, 3.0)))
+    elif type_id == "ComfySwitchNode":
+        fields.set("switch", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, False)))
     return fields^
 
 
@@ -1506,6 +1508,9 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "GetNode":
         if slot == 0:
             return String("GET")
+    elif typ == "ComfySwitchNode":
+        if slot == 0:
+            return String("output")
     elif typ == "LanPaint_MaskBlend":
         if slot == 0:
             return String("IMAGE")
@@ -1666,6 +1671,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "SamplerCustomAdvanced"
             or type_id == "LanPaint_SamplerCustomAdvanced"
             or type_id == "LanPaint_MaskBlend"
+            or type_id == "ComfySwitchNode"
             or type_id == "VAEDecode"
             or type_id == "SaveImage"
             or type_id == "PreviewImage"
@@ -2109,6 +2115,42 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         scalar_ints, scalar_floats, scalar_strings, scalar_bools,
                     )
                     done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "ComfySwitchNode":
+                var false_link = _workflow_find_input_link(edges, node_id, String("on_false"))
+                var true_link = _workflow_find_input_link(edges, node_id, String("on_true"))
+                var switch_link = _workflow_find_input_link(edges, node_id, String("switch"))
+                if not false_link.found or not true_link.found:
+                    raise Error("[501] workflow graph ComfySwitchNode missing required typed input")
+                var ready = _workflow_optional_link_ready(value_nodes, value_ports, switch_link)
+                var switch_value = _workflow_bool(fields, String("switch"), False)
+                if ready:
+                    if switch_link.found:
+                        switch_value = _workflow_scalar_bool(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_bools,
+                            switch_link, String("switch"),
+                        )
+                    var selected = false_link.copy()
+                    if switch_value:
+                        selected = true_link.copy()
+                    var selected_idx = _workflow_value_index(value_nodes, value_ports, selected.node_id, selected.port)
+                    if selected_idx >= 0:
+                        var actual = value_types[selected_idx].copy()
+                        _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("output"), actual.copy())
+                        _workflow_copy_value_metadata(
+                            selected, node_id, String("output"), actual,
+                            model_nodes, model_ports, model_names,
+                            cond_nodes, cond_ports, cond_texts,
+                            image_nodes, image_ports, image_paths, image_mask_sources,
+                            mask_nodes, mask_ports, mask_paths, mask_sources,
+                            latent_nodes, latent_ports, latent_widths, latent_heights, latent_images,
+                            latent_init_images, latent_mask_images,
+                            noise_nodes, noise_ports, noise_seeds,
+                            sampler_nodes, sampler_ports, sampler_names,
+                            sigmas_nodes, sigmas_ports, sigmas_steps, sigmas_schedulers, sigmas_denoises,
+                            scalar_nodes, scalar_ports, scalar_types,
+                            scalar_ints, scalar_floats, scalar_strings, scalar_bools,
+                        )
+                        done[i] = True; remaining -= 1; progressed = True
             elif type_id == "LoadImage":
                 var image_path = _workflow_string(fields, String("image"))
                 if image_path == "":

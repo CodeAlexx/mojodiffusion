@@ -1218,10 +1218,47 @@ Klein ReferenceLatent path:
 
 This is not full oracle parity yet. It now captures the VAE-encoded
 ReferenceLatent source image and can replay a supplied target initial-noise
-sidecar through the edit denoise path. The next runtime parity slice should add
-edit RoPE/id sidecars, packed reference/target token dumps, first-step target
-velocity, final latent tokens, VAE decoded tensor, and Python/SerenityFlow
-comparison artifacts.
+sidecar through the edit denoise path. The next section adds Mojo-side edit
+dump artifacts; Python/SerenityFlow comparison artifacts and explicit first-step
+velocity parity are still required before claiming full edit parity.
+
+## Klein ReferenceLatent Edit Dump Update
+
+Current change adds the Mojo-side edit artifact producer needed for the paired
+Python/SerenityFlow oracle:
+
+- `serenitymojo/sampling/klein_sampler.mojo`
+  - the explicit `klein_sample_with_reference_latent_initial_noise[...]` replay
+    entry now casts supplied target noise tokens to the ReferenceLatent/model
+    token dtype before edit concat. This makes F32 Python oracle sidecars
+    runnable while the normal seeded edit path remains BF16.
+- `serenitymojo/sampling/klein_sampler_parity_dump.mojo`
+  - adds `dump_klein_reference_latent_parity_artifacts[...]`;
+  - uses the ReferenceLatent edit RoPE and `build_flux2_img2img_sigmas`;
+  - writes `mojo_reference_vae_latent.bin`, `mojo_reference_tokens.bin`,
+    `mojo_reference_combined_img_ids.bin`,
+    `mojo_edit_initial_noise_target_tokens.bin`,
+    `mojo_edit_effective_initial_target_tokens.bin`,
+    `mojo_edit_combined_tokens_step0.bin`,
+    `mojo_edit_target_latent_trajectory.bin`, final packed/unscaled latents,
+    VAE decoded tensor, PNG, and a `mode:"reference_latent_edit"` manifest;
+  - still sets `parity_claimed:false`.
+- `serenitymojo/sampling/klein_sampler_parity_dump_cli.mojo`
+  - keeps the existing txt2img replay args compatible;
+  - if a reference VAE latent path is supplied after the manifest path, dispatches
+    bounded 512/1024 ReferenceLatent edit dump specializations for both 9B and
+    4B heads;
+  - optional trailing args are denoise strength, edit shift, and reference
+    `t_offset`.
+- `scripts/check_klein_initial_noise_sidecar_contract.py` and
+  `scripts/check_klein_sampler_parity_contract.py`
+  - statically guard the replay dtype boundary and the edit dump artifacts.
+
+This still does not prove full edit parity. The next required slice is the
+Python/SerenityFlow oracle producer that dumps the matching raw/patchified
+reference latent, initial noise, packed target/reference tokens, combined ids,
+first-step velocity, final latent, VAE tensor, and PNG for comparison against
+the Mojo manifest above.
 
 Files touched for this bridge:
 

@@ -650,6 +650,10 @@ def klein_sample_with_reference_latent_initial_noise[
     var ref_tokens = _reference_latent_tokens[N_TARGET, LH, LW](
         reference_latent_nchw^, cfg.in_channels, ctx
     )
+    # Python oracle sidecars can be F32; the edit model path uses the
+    # ReferenceLatent/model token dtype for concat and denoise.
+    if x.dtype() != ref_tokens.dtype():
+        x = cast_tensor(x, ref_tokens.dtype(), ctx)
     var latent = _denoise_lora_reference_from_initial[
         H, Dh, N_TARGET, N_COMBINED, N_TXT, S, LH, LW
     ](

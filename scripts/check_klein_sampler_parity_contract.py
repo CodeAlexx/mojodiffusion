@@ -27,6 +27,8 @@ OT_FLUX2_DATALOADER = ONETRAINER / "modules/dataLoader/Flux2BaseDataLoader.py"
 
 KLEIN_SAMPLER = REPO / "serenitymojo/sampling/klein_sampler.mojo"
 KLEIN_SAMPLE_CLI = REPO / "serenitymojo/sampling/klein_sample_cli.mojo"
+KLEIN_PARITY_DUMP = REPO / "serenitymojo/sampling/klein_sampler_parity_dump.mojo"
+KLEIN_PARITY_DUMP_CLI = REPO / "serenitymojo/sampling/klein_sampler_parity_dump_cli.mojo"
 VALIDATION_SAMPLER = REPO / "serenitymojo/training/validation_sampler.mojo"
 KLEIN_TRAIN = REPO / "serenitymojo/training/train_klein_real.mojo"
 CAP_CACHE_SRC = REPO / "serenitymojo/io/cap_cache.mojo"
@@ -273,6 +275,8 @@ def gather_report() -> ContractReport:
         "ot_dataloader": read_source(OT_FLUX2_DATALOADER),
         "klein_sampler": read_source(KLEIN_SAMPLER),
         "sample_cli": read_source(KLEIN_SAMPLE_CLI),
+        "parity_dump": read_source(KLEIN_PARITY_DUMP),
+        "parity_dump_cli": read_source(KLEIN_PARITY_DUMP_CLI),
         "validation": read_source(VALIDATION_SAMPLER),
         "klein_train": read_source(KLEIN_TRAIN),
         "cap_cache_src": read_source(CAP_CACHE_SRC),
@@ -487,6 +491,63 @@ def gather_report() -> ContractReport:
             ),
             detail_ok="Standalone Klein sample CLI can combine ReferenceLatent edit replay with a supplied target post-patch/post-pack initial-noise sidecar.",
             detail_missing="ReferenceLatent edit initial-noise replay markers changed; inspect edit trajectory replay wiring manually.",
+        )
+    )
+    facts.append(
+        fact_for_needles(
+            status_if_ok="PASS",
+            status_if_missing="WARN",
+            label="ReferenceLatent edit replay dtype boundary",
+            source=sources["klein_sampler"],
+            needles=(
+                "klein_sample_with_reference_latent_initial_noise",
+                "if x.dtype() != ref_tokens.dtype():",
+                "x = cast_tensor(x, ref_tokens.dtype(), ctx)",
+            ),
+            detail_ok="ReferenceLatent edit replay casts target sidecar tokens to the reference/model token dtype before concat.",
+            detail_missing="ReferenceLatent edit replay dtype-boundary markers changed; inspect F32 oracle sidecar handling manually.",
+        )
+    )
+    facts.append(
+        fact_for_needles(
+            status_if_ok="PASS",
+            status_if_missing="WARN",
+            label="ReferenceLatent edit parity dump artifacts",
+            source=sources["parity_dump"],
+            needles=(
+                "dump_klein_reference_latent_parity_artifacts",
+                "_denoise_lora_reference_from_initial_with_trajectory",
+                "build_flux2_img2img_sigmas",
+                "prepare_combined_img_ids",
+                "mojo_reference_combined_img_ids.bin",
+                "mojo_edit_initial_noise_target_tokens.bin",
+                "mojo_edit_effective_initial_target_tokens.bin",
+                "mojo_edit_combined_tokens_step0.bin",
+                "mojo_edit_target_latent_trajectory.bin",
+                "\\\"mode\\\":\\\"reference_latent_edit\\\"",
+            ),
+            detail_ok="Mojo-side ReferenceLatent edit parity dump can emit reference tokens/ids, effective step-0 tokens, edit trajectory, VAE tensor, PNG, and a no-claim manifest.",
+            detail_missing="ReferenceLatent edit parity dump markers changed; inspect Mojo edit artifact production manually.",
+        )
+    )
+    facts.append(
+        fact_for_needles(
+            status_if_ok="PASS",
+            status_if_missing="WARN",
+            label="ReferenceLatent edit parity dump CLI",
+            source=sources["parity_dump_cli"],
+            needles=(
+                "dump_klein_reference_latent_parity_artifacts",
+                "_dump_reference_512",
+                "_dump_reference_1024",
+                "N_EDIT_IMG_512",
+                "S_EDIT_1024",
+                "reference_vae_latent.bin",
+                "denoise_strength",
+                "reference_t_offset",
+            ),
+            detail_ok="Mojo parity dump CLI keeps txt2img replay compatible and adds bounded 512/1024 ReferenceLatent edit dump dispatch for 9B/4B heads.",
+            detail_missing="ReferenceLatent edit parity dump CLI markers changed; inspect edit dump dispatch manually.",
         )
     )
     facts.append(

@@ -228,11 +228,15 @@ CHECKS: tuple[ContractCheck, ...] = (
                 ("_reference_latent_tokens[N_TARGET, LH, LW]",),
             ),
             MarkerGroup(
+                "edit concat dtype boundary",
+                ("cast_tensor(x, ref_tokens.dtype(), ctx)",),
+            ),
+            MarkerGroup(
                 "edit denoise reuse",
                 ("_denoise_lora_reference_from_initial",),
             ),
         ),
-        detail="ReferenceLatent edit replay can consume a supplied target initial-noise sidecar without changing the normal seeded edit path.",
+        detail="ReferenceLatent edit replay can consume a supplied target initial-noise sidecar and cast it to the reference/model token dtype before edit concat.",
     ),
 )
 

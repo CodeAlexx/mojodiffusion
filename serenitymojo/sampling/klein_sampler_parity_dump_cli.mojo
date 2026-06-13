@@ -4,7 +4,8 @@
 # Usage:
 #   pixi run mojo run -I . serenitymojo/sampling/klein_sampler_parity_dump_cli.mojo \
 #       [config.json] [lora.safetensors|base|-] [sample_prompts.json] [prompt_id] \
-#       [initial_noise_post_pack.bin] [artifact_dir] [manifest.json]
+#       [initial_noise_post_pack.bin] [artifact_dir] [manifest.json] \
+#       [reference_vae_latent.bin] [denoise] [edit_shift] [reference_t_offset]
 #
 # The initial-noise sidecar is required. It must be the OneTrainer-equivalent
 # post-patch/post-pack tensor accepted by klein_sample_with_initial_noise:
@@ -28,6 +29,7 @@ from serenitymojo.training.train_config import TrainConfig
 from serenitymojo.training.validation_sampler import load_caps
 from serenitymojo.sampling.klein_sampler_parity_dump import (
     dump_klein_sampler_parity_artifacts,
+    dump_klein_reference_latent_parity_artifacts,
 )
 
 
@@ -42,10 +44,14 @@ comptime LH_512 = 32
 comptime LW_512 = 32
 comptime N_IMG_512 = 1024
 comptime S_512 = N_IMG_512 + N_TXT
+comptime N_EDIT_IMG_512 = 2 * N_IMG_512
+comptime S_EDIT_512 = N_EDIT_IMG_512 + N_TXT
 comptime LH_1024 = 64
 comptime LW_1024 = 64
 comptime N_IMG_1024 = 4096
 comptime S_1024 = N_IMG_1024 + N_TXT
+comptime N_EDIT_IMG_1024 = 2 * N_IMG_1024
+comptime S_EDIT_1024 = N_EDIT_IMG_1024 + N_TXT
 
 
 def _load_pos_txt(
@@ -101,6 +107,49 @@ def _dump_512(
         raise Error(String("klein_sampler_parity_dump_cli: unsupported num_heads ") + String(cfg.n_heads))
 
 
+def _dump_reference_512(
+    cfg: TrainConfig,
+    lora_path: String,
+    prompt: SamplePrompt,
+    initial_noise_path: String,
+    reference_latent_path: String,
+    out_dir: String,
+    manifest_path: String,
+    denoise_strength: Float32,
+    edit_shift: Float32,
+    reference_t_offset: Float32,
+    ctx: DeviceContext,
+) raises:
+    var pos_txt = _load_pos_txt(cfg, prompt, ctx)
+    var neg_txt = _load_neg_txt(cfg, prompt, ctx)
+    if cfg.head_dim != Dh:
+        raise Error(String("klein_sampler_parity_dump_cli: unsupported head_dim ") + String(cfg.head_dim))
+    if cfg.n_heads == H_9B:
+        var noise9 = load_tensor_bin(initial_noise_path, ctx)
+        var ref9 = load_tensor_bin(reference_latent_path, ctx)
+        var res9 = dump_klein_reference_latent_parity_artifacts[
+            N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_9B, Dh
+        ](
+            cfg, lora_path, prompt, pos_txt, neg_txt, noise9^, initial_noise_path,
+            ref9^, reference_latent_path, out_dir, manifest_path, ctx,
+            denoise_strength, edit_shift, reference_t_offset,
+        )
+        print("[klein-edit-parity-dump-cli] wrote:", res9.manifest_path)
+    elif cfg.n_heads == H_4B:
+        var noise4 = load_tensor_bin(initial_noise_path, ctx)
+        var ref4 = load_tensor_bin(reference_latent_path, ctx)
+        var res4 = dump_klein_reference_latent_parity_artifacts[
+            N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_4B, Dh
+        ](
+            cfg, lora_path, prompt, pos_txt, neg_txt, noise4^, initial_noise_path,
+            ref4^, reference_latent_path, out_dir, manifest_path, ctx,
+            denoise_strength, edit_shift, reference_t_offset,
+        )
+        print("[klein-edit-parity-dump-cli] wrote:", res4.manifest_path)
+    else:
+        raise Error(String("klein_sampler_parity_dump_cli: unsupported num_heads ") + String(cfg.n_heads))
+
+
 def _dump_1024(
     cfg: TrainConfig,
     lora_path: String,
@@ -128,6 +177,49 @@ def _dump_1024(
             out_dir, manifest_path, ctx,
         )
         print("[klein-parity-dump-cli] wrote:", res4.manifest_path)
+    else:
+        raise Error(String("klein_sampler_parity_dump_cli: unsupported num_heads ") + String(cfg.n_heads))
+
+
+def _dump_reference_1024(
+    cfg: TrainConfig,
+    lora_path: String,
+    prompt: SamplePrompt,
+    initial_noise_path: String,
+    reference_latent_path: String,
+    out_dir: String,
+    manifest_path: String,
+    denoise_strength: Float32,
+    edit_shift: Float32,
+    reference_t_offset: Float32,
+    ctx: DeviceContext,
+) raises:
+    var pos_txt = _load_pos_txt(cfg, prompt, ctx)
+    var neg_txt = _load_neg_txt(cfg, prompt, ctx)
+    if cfg.head_dim != Dh:
+        raise Error(String("klein_sampler_parity_dump_cli: unsupported head_dim ") + String(cfg.head_dim))
+    if cfg.n_heads == H_9B:
+        var noise9 = load_tensor_bin(initial_noise_path, ctx)
+        var ref9 = load_tensor_bin(reference_latent_path, ctx)
+        var res9 = dump_klein_reference_latent_parity_artifacts[
+            N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_9B, Dh
+        ](
+            cfg, lora_path, prompt, pos_txt, neg_txt, noise9^, initial_noise_path,
+            ref9^, reference_latent_path, out_dir, manifest_path, ctx,
+            denoise_strength, edit_shift, reference_t_offset,
+        )
+        print("[klein-edit-parity-dump-cli] wrote:", res9.manifest_path)
+    elif cfg.n_heads == H_4B:
+        var noise4 = load_tensor_bin(initial_noise_path, ctx)
+        var ref4 = load_tensor_bin(reference_latent_path, ctx)
+        var res4 = dump_klein_reference_latent_parity_artifacts[
+            N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_4B, Dh
+        ](
+            cfg, lora_path, prompt, pos_txt, neg_txt, noise4^, initial_noise_path,
+            ref4^, reference_latent_path, out_dir, manifest_path, ctx,
+            denoise_strength, edit_shift, reference_t_offset,
+        )
+        print("[klein-edit-parity-dump-cli] wrote:", res4.manifest_path)
     else:
         raise Error(String("klein_sampler_parity_dump_cli: unsupported num_heads ") + String(cfg.n_heads))
 
@@ -190,6 +282,18 @@ def main() raises:
     var manifest_path = String("")
     if len(a) >= 8:
         manifest_path = String(a[7])
+    var reference_latent_path = String("")
+    if len(a) >= 9:
+        reference_latent_path = String(a[8])
+    var denoise_strength = Float32(1.0)
+    if len(a) >= 10:
+        denoise_strength = Float32(Float64(String(a[9])))
+    var edit_shift = Float32(2.02)
+    if len(a) >= 11:
+        edit_shift = Float32(Float64(String(a[10])))
+    var reference_t_offset = Float32(10.0)
+    if len(a) >= 12:
+        reference_t_offset = Float32(Float64(String(a[11])))
 
     var sample_cfg = read_sample_prompt_config(prompt_file)
     var prompt = _select_prompt(sample_cfg, prompt_id)
@@ -208,20 +312,45 @@ def main() raises:
     if lora_path != String(""):
         _require_file(String("LoRA"), lora_path)
     _require_file(String("initial-noise sidecar"), initial_noise_path)
+    if reference_latent_path != String(""):
+        _require_file(String("ReferenceLatent VAE sidecar"), reference_latent_path)
     validate_klein_cap_cache_header(prompt.caps_pos, cfg.joint_attention_dim)
     validate_klein_cap_cache_header(prompt.caps_neg, cfg.joint_attention_dim)
 
-    print("=== Klein sampler parity dump:", cfg.name, "@", String(prompt.width), "x", String(prompt.height), "===")
+    if reference_latent_path != String(""):
+        print("=== Klein ReferenceLatent edit parity dump:", cfg.name, "@", String(prompt.width), "x", String(prompt.height), "===")
+    else:
+        print("=== Klein sampler parity dump:", cfg.name, "@", String(prompt.width), "x", String(prompt.height), "===")
     print("  config:", cfg_path)
     print("  lora:", lora_path if lora_path != String("") else String("(none, base model)"))
     print("  prompts:", prompt_file, " id:", prompt.label)
     print("  initial noise:", initial_noise_path)
+    if reference_latent_path != String(""):
+        print(
+            "  reference latent:", reference_latent_path,
+            " denoise:", denoise_strength,
+            " shift:", edit_shift,
+            " t_offset:", reference_t_offset,
+        )
     print("  artifacts:", out_dir)
     if manifest_path != String(""):
         print("  manifest:", manifest_path)
 
     var ctx = DeviceContext()
-    if prompt.width == 512 and prompt.height == 512:
+    if reference_latent_path != String(""):
+        if prompt.width == 512 and prompt.height == 512:
+            _dump_reference_512(
+                cfg, lora_path, prompt, initial_noise_path, reference_latent_path,
+                out_dir, manifest_path, denoise_strength, edit_shift,
+                reference_t_offset, ctx,
+            )
+        elif prompt.width == 1024 and prompt.height == 1024:
+            _dump_reference_1024(
+                cfg, lora_path, prompt, initial_noise_path, reference_latent_path,
+                out_dir, manifest_path, denoise_strength, edit_shift,
+                reference_t_offset, ctx,
+            )
+    elif prompt.width == 512 and prompt.height == 512:
         _dump_512(cfg, lora_path, prompt, initial_noise_path, out_dir, manifest_path, ctx)
     elif prompt.width == 1024 and prompt.height == 1024:
         _dump_1024(cfg, lora_path, prompt, initial_noise_path, out_dir, manifest_path, ctx)

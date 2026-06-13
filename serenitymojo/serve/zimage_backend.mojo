@@ -87,10 +87,11 @@ from serenitymojo.sampling.unipc import (
 from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
-    reject_unsupported_reference_image_params, reject_unsupported_lanpaint_params,
+    reject_unsupported_reference_image_params, reject_unsupported_lanpaint_sampler_params,
 )
 from serenitymojo.serve.image_io import (
-    decode_image_any, image_to_signed_nchw, load_comfy_latent_preserve_mask,
+    apply_lanpaint_mask_blend_signed_chw, decode_image_any, image_to_signed_nchw,
+    load_comfy_latent_preserve_mask, load_lanpaint_pixel_blend_mask,
     mask_active_count, mask_mean,
 )
 from serenitymojo.serve.model_scan import LORAS_DIR
@@ -302,6 +303,8 @@ struct ZImageBackend(GenBackend, Movable):
     var inpaint_preserve_mask: List[Float32]
     var inpaint_preserve_active_pixels: Int
     var inpaint_preserve_mean: Float32
+    var lanpaint_mask_blend_applied: Bool
+    var lanpaint_mask_blend_mean: Float32
     var job_t0_ns: UInt
     var load_seconds: Float64
     var text_encode_seconds: Float64
@@ -363,6 +366,8 @@ struct ZImageBackend(GenBackend, Movable):
         self.inpaint_preserve_mask = List[Float32]()
         self.inpaint_preserve_active_pixels = 0
         self.inpaint_preserve_mean = 0.0
+        self.lanpaint_mask_blend_applied = False
+        self.lanpaint_mask_blend_mean = 0.0
         self.job_t0_ns = 0
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
@@ -388,7 +393,7 @@ struct ZImageBackend(GenBackend, Movable):
             raise Error("ZImageBackend.start: a job is already running")
         reject_unsupported_common_runtime_params(params, String("zimage"))
         reject_unsupported_reference_image_params(params, String("zimage"))
-        reject_unsupported_lanpaint_params(params, String("zimage"))
+        reject_unsupported_lanpaint_sampler_params(params, String("zimage"))
         var sampler_admission = sampler_admission_for_backend(String("zimage"), params.sampler)
         if not sampler_admission.supported:
             raise Error(
@@ -498,6 +503,8 @@ struct ZImageBackend(GenBackend, Movable):
         self.inpaint_preserve_mask = List[Float32]()
         self.inpaint_preserve_active_pixels = 0
         self.inpaint_preserve_mean = 0.0
+        self.lanpaint_mask_blend_applied = False
+        self.lanpaint_mask_blend_mean = 0.0
         var mem = cu_mem_get_info()
         self.total_vram_bytes = mem.total_bytes
         self.min_free_bytes = mem.free_bytes
@@ -864,6 +871,39 @@ struct ZImageBackend(GenBackend, Movable):
         var shape = [1, 16, self.hl, self.wl]
         return Tensor.from_host(host, shape^, STDtype.BF16, self.ctx)
 
+    def _apply_lanpaint_mask_blend(mut self, var rgb: Tensor) raises -> Tensor:
+        if self.params.lanpaint_mask_blend_overlap < 0:
+            return rgb^
+        if self.params.init_image.byte_length() == 0 or self.params.mask_image.byte_length() == 0:
+            raise Error("zimage: LanPaint_MaskBlend requires init_image and mask_image")
+        var shape = rgb.shape()
+        if len(shape) != 4 or shape[0] != 1 or shape[1] != 3:
+            raise Error("zimage: LanPaint_MaskBlend expected [1,3,H,W] rgb tensor")
+        var height = shape[2]
+        var width = shape[3]
+        var painted = rgb.to_host(self.ctx)
+        var base_img = decode_image_any(self.params.init_image)
+        if base_img.width != width or base_img.height != height:
+            raise Error(
+                "zimage: LanPaint_MaskBlend base image resize requires Comfy ImageScale(area) parity; pre-scale init_image to output size for this backend slice"
+            )
+        var base = image_to_signed_nchw(base_img)
+        var blend_mask = load_lanpaint_pixel_blend_mask(
+            self.params.mask_image,
+            self.params.lanpaint_mask_channel,
+            width,
+            height,
+            self.params.lanpaint_mask_blend_overlap,
+        )
+        var blended = apply_lanpaint_mask_blend_signed_chw(base, painted, blend_mask)
+        self.lanpaint_mask_blend_applied = True
+        self.lanpaint_mask_blend_mean = mask_mean(blend_mask)
+        print(
+            "[zimage][lanpaint_blend] overlap", self.params.lanpaint_mask_blend_overlap,
+            "mask_mean", self.lanpaint_mask_blend_mean,
+        )
+        return Tensor.from_host(blended, shape^, STDtype.F32, self.ctx)
+
     # ── one denoise step (CFG dual forward + Euler), comptime grid ───────────
     def _denoise_one[HL: Int, WL: Int](mut self) raises:
         comptime HT = HL // PATCH
@@ -1033,6 +1073,9 @@ struct ZImageBackend(GenBackend, Movable):
         content += String('    "inpaint_mask_applied":') + _json_bool(len(self.inpaint_preserve_mask) > 0) + String(",\n")
         content += String('    "inpaint_preserve_active_pixels":') + String(self.inpaint_preserve_active_pixels) + String(",\n")
         content += String('    "inpaint_preserve_mean":') + String(self.inpaint_preserve_mean) + String(",\n")
+        content += String('    "lanpaint_mask_blend_applied":') + _json_bool(self.lanpaint_mask_blend_applied) + String(",\n")
+        content += String('    "lanpaint_mask_blend_overlap":') + String(self.params.lanpaint_mask_blend_overlap) + String(",\n")
+        content += String('    "lanpaint_mask_blend_mean":') + String(self.lanpaint_mask_blend_mean) + String(",\n")
         content += String('    "sampler_registry_backend":"zimage",\n')
         content += String('    "requested_sampler":"') + _json_escape(self.params.sampler) + String('",\n')
         content += String('    "requested_scheduler":"') + _json_escape(self.params.scheduler) + String('",\n')
@@ -1151,6 +1194,7 @@ struct ZImageBackend(GenBackend, Movable):
             var rgb = self.vae64[0][].decode(
                 _cast(decode_latent, STDtype.BF16, self.ctx), self.ctx
             )
+            rgb = self._apply_lanpaint_mask_blend(rgb^)
             _save_rgb_png_with_text(rgb, png_path, self.params.params_json, self.ctx)
         else:
             if len(self.vae64) == 0:
@@ -1160,6 +1204,7 @@ struct ZImageBackend(GenBackend, Movable):
             var rgb = zimage_tiled_decode_with_decoder[128, 128, 64, 64](
                 _cast(decode_latent, STDtype.BF16, self.ctx), self.vae64[0][], self.ctx
             )
+            rgb = self._apply_lanpaint_mask_blend(rgb^)
             _save_rgb_png_with_text(rgb, png_path, self.params.params_json, self.ctx)
         return png_path
 
@@ -1187,6 +1232,8 @@ struct ZImageBackend(GenBackend, Movable):
         self.inpaint_preserve_mask = List[Float32]()
         self.inpaint_preserve_active_pixels = 0
         self.inpaint_preserve_mean = 0.0
+        self.lanpaint_mask_blend_applied = False
+        self.lanpaint_mask_blend_mean = 0.0
         self.executed_sampler = String("flowmatch_euler")
         self.executed_scheduler = String("simple_flowmatch")
         self.denoise_start_step = 0

@@ -841,14 +841,34 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             BACKEND,
             category="workflow",
-            label="LanPaint runtime contract helper",
+            label="LanPaint sampler runtime contract helper",
             needles=[
                 "has_lanpaint_runtime_params",
+                "has_lanpaint_sampler_runtime_params",
+                "reject_unsupported_lanpaint_sampler_params",
                 "reject_unsupported_lanpaint_params",
+                "LanPaint_MaskBlend can be handled as a",
+                "LanPaint inpaint sampler semantics are not supported",
                 "LanPaint inpaint sampler/blend semantics are not supported",
             ],
             severity=P1,
-            acceptance="LanPaint sampler/blend metadata is explicit and real backends fail loud until the LanPaint runtime loop and blend are wired.",
+            acceptance="LanPaint sampler-loop metadata is explicit and real backends fail loud unless they implement the LanPaint runtime loop; MaskBlend may be a separate final image blend only where a backend opts in.",
+        ),
+        check_contains(
+            IMAGE_IO,
+            category="workflow",
+            label="LanPaint_MaskBlend pixel helpers",
+            needles=[
+                "smooth_lanpaint_blend_mask",
+                "load_lanpaint_pixel_blend_mask",
+                "apply_lanpaint_mask_blend_signed_chw",
+                "max-pool",
+                "Gaussian blur",
+                "Float64(blend_overlap - 1) / 4.0",
+                "image1 * (1-mask) + image2 * mask",
+            ],
+            severity=P1,
+            acceptance="The bounded LanPaint_MaskBlend pixel helper follows the oracle max-pool, Gaussian smooth, and image1/image2 compositing formula.",
         ),
         check_contains(
             DAEMON,
@@ -928,12 +948,31 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             ZIMAGE_BACKEND,
             category="workflow",
-            label="Z-Image rejects LanPaint metadata",
+            label="Z-Image rejects LanPaint sampler metadata",
             needles=[
-                'reject_unsupported_lanpaint_params(params, String("zimage"))',
+                'reject_unsupported_lanpaint_sampler_params(params, String("zimage"))',
             ],
             severity=P1,
-            acceptance="Z-Image does not silently consume LanPaint sampler/blend metadata.",
+            acceptance="Z-Image keeps full LanPaint sampler-loop fields fail-loud instead of treating them as ordinary img2img controls.",
+        ),
+        check_contains(
+            ZIMAGE_BACKEND,
+            category="workflow",
+            label="Z-Image applies bounded LanPaint_MaskBlend final pixels",
+            needles=[
+                "_apply_lanpaint_mask_blend",
+                "LanPaint_MaskBlend requires init_image and mask_image",
+                "LanPaint_MaskBlend base image resize requires Comfy ImageScale(area) parity",
+                "load_lanpaint_pixel_blend_mask",
+                "apply_lanpaint_mask_blend_signed_chw",
+                "lanpaint_mask_blend_applied",
+                "lanpaint_mask_blend_mean",
+                '"lanpaint_mask_blend_applied"',
+                '"lanpaint_mask_blend_overlap"',
+                '"lanpaint_mask_blend_mean"',
+            ],
+            severity=P1,
+            acceptance="Z-Image may consume only the bounded LanPaint_MaskBlend final decoded image blend while full LanPaint sampler-loop fields remain rejected.",
         ),
         check_contains(
             QWEN_BACKEND,
@@ -963,7 +1002,7 @@ def check_family_surfaces() -> list[Check]:
                 'reject_unsupported_lanpaint_params(params, String("qwenimage"))',
             ],
             severity=P1,
-            acceptance="Qwen-Image does not silently consume LanPaint sampler/blend metadata.",
+            acceptance="Qwen-Image does not silently consume LanPaint sampler or blend metadata.",
         ),
         check_contains(
             IDEOGRAM4_BACKEND,
@@ -993,7 +1032,7 @@ def check_family_surfaces() -> list[Check]:
                 'reject_unsupported_lanpaint_params(params, String("ideogram4"))',
             ],
             severity=P1,
-            acceptance="Ideogram4 does not silently consume LanPaint sampler/blend metadata.",
+            acceptance="Ideogram4 does not silently consume LanPaint sampler or blend metadata.",
         ),
         check_contains(
             KLEIN_BACKEND,
@@ -1003,7 +1042,7 @@ def check_family_surfaces() -> list[Check]:
                 'reject_unsupported_lanpaint_params(params, String("klein"))',
             ],
             severity=P1,
-            acceptance="Klein ReferenceLatent edit does not silently consume LanPaint sampler/blend metadata.",
+            acceptance="Klein ReferenceLatent edit does not silently consume LanPaint sampler or blend metadata.",
         ),
         check_contains(
             SAMPLER_REGISTRY,
@@ -1200,10 +1239,14 @@ def check_family_surfaces() -> list[Check]:
                 "SetLatentNoiseMask",
                 "denoise_mask = (denoise_mask > 0.5).float()",
                 "latent_mask = 1 - denoise_mask",
+                "smooth_lanpaint_blend_mask",
+                "load_lanpaint_pixel_blend_mask",
+                "apply_lanpaint_mask_blend_signed_chw",
+                "reject_unsupported_lanpaint_sampler_params",
                 "non_claims",
             ],
             severity=P1,
-            acceptance="LanPaint work is pinned to local Python/Comfy oracle semantics and representative workflow exports before runtime mask-aware denoise is claimed.",
+            acceptance="LanPaint work is pinned to local Python/Comfy oracle semantics and representative workflow exports, with only the bounded final-pixel MaskBlend slice separated from full sampler runtime parity.",
         ),
         check_contains(
             LANPAINT_CANVAS_DAEMON_SMOKE_RUNNER,
@@ -1457,8 +1500,9 @@ KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE = (
 
 LANPAINT_ORACLE_SURFACE_ACCEPTANCE = (
     "A no-heavy checker pins representative LanPaint workflow exports, Python node semantics, "
-    "SetLatentNoiseMask noise-mask behavior, Mojo mask math substrate, and the current fail-loud "
-    "boundary before real mask-aware backend runtime is claimed."
+    "SetLatentNoiseMask noise-mask behavior, Mojo mask math substrate, the bounded Z-Image "
+    "LanPaint_MaskBlend final-pixel slice, and the current fail-loud sampler boundary before "
+    "full LanPaint runtime parity is claimed."
 )
 
 LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE = (
@@ -2124,7 +2168,7 @@ def check_lanpaint_oracle_surface_report(report_path: Path) -> Check:
         PASS,
         "workflow",
         "LanPaint oracle surface report",
-        "oracle workflows and Python/Comfy mask semantics are pinned",
+        "oracle workflows and Python/Comfy mask semantics are pinned; source checks pin bounded Z-Image MaskBlend markers",
         rel(report_path),
         LANPAINT_ORACLE_SURFACE_ACCEPTANCE,
     )

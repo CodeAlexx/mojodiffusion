@@ -8,6 +8,8 @@ from serenitymojo.serve.image_io import (
     comfy_mask_to_preserve_mask,
     load_comfy_latent_preserve_mask,
     load_lanpaint_latent_preserve_mask,
+    load_lanpaint_pixel_blend_mask,
+    apply_lanpaint_mask_blend_signed_chw,
     mask_active_count,
     mask_mean,
 )
@@ -105,4 +107,27 @@ def main() raises:
     var comfy_preserve = load_comfy_latent_preserve_mask(path, String("load_image_mask"), 2, 2)
     _check_close("Comfy soft preserve[0]", comfy_preserve.values[0], Float32(40.0 / 255.0), 1.0e-5)
     _check_close("Comfy soft preserve[1]", comfy_preserve.values[1], Float32(191.625 / 255.0), 1.0e-5)
+
+    var blend_mask = load_lanpaint_pixel_blend_mask(path, String("load_image_mask"), 2, 2, 1)
+    _check_close("LanPaint blend mask[0]", blend_mask.values[0], Float32(191.0 / 255.0), 1.0e-5)
+    _check_close("LanPaint blend mask[1]", blend_mask.values[1], Float32(0.0 / 255.0), 1.0e-5)
+
+    var base: List[Float32] = [
+        -1.0, -0.5, 0.5, 1.0,
+        -0.25, -0.25, 0.25, 0.25,
+        0.0, 0.25, 0.5, 0.75,
+    ]
+    var painted: List[Float32] = [
+        1.0, 0.5, -0.5, -1.0,
+        0.75, 0.75, -0.75, -0.75,
+        0.0, -0.25, -0.5, -0.75,
+    ]
+    var blended = apply_lanpaint_mask_blend_signed_chw(base, painted, blend_mask)
+    _check_close(
+        "LanPaint signed blend lane0",
+        blended[0],
+        base[0] * (1.0 - blend_mask.values[0]) + painted[0] * blend_mask.values[0],
+        1.0e-5,
+    )
+    _check_close("LanPaint signed blend lane1 mask=0", blended[1], base[1], 1.0e-6)
     print("image_io_mask_smoke: pass")

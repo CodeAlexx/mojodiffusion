@@ -189,7 +189,13 @@ def reject_unsupported_mask_image_params(
 def has_lanpaint_runtime_params(params: JobParams) -> Bool:
     return (
         params.lanpaint_mask_blend_overlap >= 0
-        or params.lanpaint_num_steps >= 0
+        or has_lanpaint_sampler_runtime_params(params)
+    )
+
+
+def has_lanpaint_sampler_runtime_params(params: JobParams) -> Bool:
+    return (
+        params.lanpaint_num_steps >= 0
         or params.lanpaint_lambda >= 0.0
         or params.lanpaint_step_size >= 0.0
         or params.lanpaint_beta >= 0.0
@@ -205,6 +211,19 @@ def has_lanpaint_runtime_params(params: JobParams) -> Bool:
         or params.lanpaint_inner_threshold >= 0.0
         or params.lanpaint_inner_patience >= 0
     )
+
+
+def reject_unsupported_lanpaint_sampler_params(
+    params: JobParams, backend_name: String
+) raises:
+    """Reject LanPaint sampler fields on backends that do not implement the
+    LanPaint mask-aware inner loop. LanPaint_MaskBlend can be handled as a
+    separate final image blend by backends that opt into it."""
+    if has_lanpaint_sampler_runtime_params(params):
+        raise Error(
+            backend_name
+            + String(": LanPaint inpaint sampler semantics are not supported by this backend yet")
+        )
 
 
 def reject_unsupported_lanpaint_params(

@@ -4,7 +4,8 @@
 This is a no-heavy-model contract checker. It reads the local LanPaint Python
 nodes, representative LanPaint workflow exports, SerenityFlow's
 SetLatentNoiseMask node, and the current Mojo boundary. The goal is to preserve
-the actual oracle semantics before implementing real mask-aware daemon runtime.
+the actual oracle semantics while distinguishing the bounded Z-Image
+LanPaint_MaskBlend final-pixel slice from full LanPaint sampler runtime parity.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ LANPAINT_NODES = Path("/home/alex/LanPaint/src/LanPaint/nodes.py")
 SERENITYFLOW_LATENT = Path("/home/alex/serenityflow-v2/serenityflow/nodes/latent.py")
 WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
 BACKEND = REPO / "serenitymojo/serve/backend.mojo"
+ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
 IMAGE_IO = REPO / "serenitymojo/serve/image_io.mojo"
 INPAINT_MOJO = REPO / "serenitymojo/sampling/inpaint.mojo"
 INPAINT_PARITY = REPO / "serenitymojo/sampling/parity/inpaint_parity.mojo"
@@ -249,6 +251,7 @@ def run() -> dict[str, Any]:
             "denoise_mask=noise_mask",
             "torch.nn.functional.max_pool2d",
             "torch.nn.functional.conv2d",
+            "sigma = (kernel_size - 1)/4",
             "image1 * (1 - mask[...,None]) + image2 * mask[...,None]",
             "\"LanPaint_KSampler\": LanPaint_KSampler",
             "\"LanPaint_SamplerCustomAdvanced\" : LanPaint_SamplerCustomAdvanced",
@@ -312,9 +315,32 @@ def run() -> dict[str, Any]:
             "binarize_lanpaint_denoise_mask",
             "load_comfy_latent_preserve_mask",
             "load_lanpaint_latent_preserve_mask",
+            "smooth_lanpaint_blend_mask",
+            "load_lanpaint_pixel_blend_mask",
+            "apply_lanpaint_mask_blend_signed_chw",
+            "Float64(blend_overlap - 1) / 4.0",
+            "image1 * (1-mask) + image2 * mask",
         ],
     )
     blockers.extend(mask_io_blockers)
+
+    zimage_blend, zimage_blend_blockers = contains_all(
+        ZIMAGE_BACKEND,
+        [
+            'reject_unsupported_lanpaint_sampler_params(params, String("zimage"))',
+            "_apply_lanpaint_mask_blend",
+            "LanPaint_MaskBlend requires init_image and mask_image",
+            "LanPaint_MaskBlend base image resize requires Comfy ImageScale(area) parity",
+            "load_lanpaint_pixel_blend_mask",
+            "apply_lanpaint_mask_blend_signed_chw",
+            "lanpaint_mask_blend_applied",
+            "lanpaint_mask_blend_mean",
+            '"lanpaint_mask_blend_applied"',
+            '"lanpaint_mask_blend_overlap"',
+            '"lanpaint_mask_blend_mean"',
+        ],
+    )
+    blockers.extend(zimage_blend_blockers)
 
     node_surface, node_surface_blockers = contains_all(
         NODE_SURFACE,
@@ -334,8 +360,11 @@ def run() -> dict[str, Any]:
         BACKEND,
         [
             "reject_unsupported_mask_image_params",
+            "reject_unsupported_lanpaint_sampler_params",
             "reject_unsupported_lanpaint_params",
             "Comfy SetLatentNoiseMask/inpaint mask conditioning is not supported",
+            "LanPaint_MaskBlend can be handled as a",
+            "LanPaint inpaint sampler semantics are not supported",
             "LanPaint inpaint sampler/blend semantics are not supported",
         ],
     )
@@ -364,13 +393,14 @@ def run() -> dict[str, Any]:
             "inpaint_math_substrate": mojo_inpaint,
             "inpaint_parity_gate": parity_gate,
             "mask_io_boundary": mask_io,
+            "zimage_mask_blend_slice": zimage_blend,
             "workflow_fail_loud_boundary": mojo_boundary,
             "node_surface_lanpaint_plumbing": node_surface,
             "backend_fail_loud_boundary": backend_boundary,
         },
         "non_claims": [
-            "Z-Image consumes plain SetLatentNoiseMask for img2img; full LanPaint sampler/blend semantics are still fenced.",
-            "The current Mojo parity gate covers weight-free mask blend and one supplied-score overdamped step only.",
+            "Z-Image consumes plain SetLatentNoiseMask for img2img and has a bounded final-pixel LanPaint_MaskBlend slice; full LanPaint sampler inner-loop semantics are still fenced.",
+            "The current Mojo parity gate covers weight-free mask blend and one supplied-score overdamped step only; it does not prove full LanPaint_KSampler runtime parity.",
         ],
     }
 

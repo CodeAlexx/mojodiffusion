@@ -11,7 +11,7 @@
 # unnecessary): PNG \x89PNG, JPEG \xFF\xD8, WebP RIFF....WEBP.
 
 from std.io.file import open
-from std.math import floor
+from std.math import exp, floor
 
 from image.buffer import Image
 from image.jpeg import decode_jpeg_bytes
@@ -257,6 +257,98 @@ def load_lanpaint_latent_preserve_mask(
     var resized = resize_mask_nearest_exact(raw, latent_width, latent_height)
     var hard = binarize_lanpaint_denoise_mask(resized)
     return comfy_mask_to_preserve_mask(hard)
+
+
+def smooth_lanpaint_blend_mask(mask: ComfyMaskImage, blend_overlap: Int) raises -> ComfyMaskImage:
+    """LanPaint_MaskBlend mask smoothing: max_pool2d then Gaussian conv2d."""
+    if blend_overlap <= 1:
+        return ComfyMaskImage(mask.width, mask.height, mask.values.copy())
+    if blend_overlap % 2 == 0:
+        raise Error("LanPaint_MaskBlend blend_overlap must be odd")
+    if mask.width <= 0 or mask.height <= 0:
+        raise Error("smooth_lanpaint_blend_mask: source dimensions must be positive")
+    var radius = blend_overlap // 2
+    var pooled = List[Float32](capacity=mask.width * mask.height)
+    for y in range(mask.height):
+        for x in range(mask.width):
+            var max_v: Float32 = 0.0
+            for ky in range(blend_overlap):
+                var sy = y + ky - radius
+                if sy < 0 or sy >= mask.height:
+                    continue
+                for kx in range(blend_overlap):
+                    var sx = x + kx - radius
+                    if sx < 0 or sx >= mask.width:
+                        continue
+                    var v = mask.values[sy * mask.width + sx]
+                    if v > max_v:
+                        max_v = v
+            pooled.append(max_v)
+
+    var sigma = Float64(blend_overlap - 1) / 4.0
+    if sigma <= 0.0:
+        return ComfyMaskImage(mask.width, mask.height, pooled^)
+    var kernel = List[Float64](capacity=blend_overlap * blend_overlap)
+    var total: Float64 = 0.0
+    for ky in range(blend_overlap):
+        var dy = Float64(ky - radius)
+        for kx in range(blend_overlap):
+            var dx = Float64(kx - radius)
+            var w = exp(-((dx * dx + dy * dy) / (2.0 * sigma * sigma)))
+            kernel.append(w)
+            total += w
+    var out = List[Float32](capacity=mask.width * mask.height)
+    for y in range(mask.height):
+        for x in range(mask.width):
+            var acc: Float64 = 0.0
+            for ky in range(blend_overlap):
+                var sy = y + ky - radius
+                if sy < 0 or sy >= mask.height:
+                    continue
+                for kx in range(blend_overlap):
+                    var sx = x + kx - radius
+                    if sx < 0 or sx >= mask.width:
+                        continue
+                    var w = kernel[ky * blend_overlap + kx] / total
+                    acc += Float64(pooled[sy * mask.width + sx]) * w
+            out.append(Float32(acc))
+    return ComfyMaskImage(mask.width, mask.height, out^)
+
+
+def load_lanpaint_pixel_blend_mask(
+    path: String, channel: String, width: Int, height: Int, blend_overlap: Int
+) raises -> ComfyMaskImage:
+    """Load the image-space mask used by LanPaint_MaskBlend.
+
+    Pipeline: Comfy source mask -> nearest-exact image resize -> max-pool ->
+    Gaussian blur. The resulting denoise mask convention is 1.0 = use image2
+    / inpainted pixels, 0.0 = use image1 / original pixels.
+    """
+    var raw = decode_comfy_mask(path, channel)
+    var resized = resize_mask_nearest_exact(raw, width, height)
+    return smooth_lanpaint_blend_mask(resized, blend_overlap)
+
+
+def apply_lanpaint_mask_blend_signed_chw(
+    base: List[Float32], painted: List[Float32], mask: ComfyMaskImage
+) raises -> List[Float32]:
+    """Apply LanPaint_MaskBlend to signed CHW RGB arrays.
+
+    Formula matches Python LanPaint_MaskBlend:
+    image1 * (1-mask) + image2 * mask.
+    """
+    var plane = mask.width * mask.height
+    if plane <= 0:
+        raise Error("apply_lanpaint_mask_blend_signed_chw: invalid mask shape")
+    if len(base) != 3 * plane or len(painted) != 3 * plane:
+        raise Error("apply_lanpaint_mask_blend_signed_chw: image/mask size mismatch")
+    var out = List[Float32](capacity=3 * plane)
+    for c in range(3):
+        var c_off = c * plane
+        for p in range(plane):
+            var m = mask.values[p]
+            out.append(base[c_off + p] * (1.0 - m) + painted[c_off + p] * m)
+    return out^
 
 
 def load_comfy_latent_preserve_mask(

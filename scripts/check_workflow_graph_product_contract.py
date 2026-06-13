@@ -984,6 +984,133 @@ def scalar_type_mismatch_workflow_request() -> dict[str, Any]:
     return body
 
 
+def ui_drop_comfy_ui_canvas_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "CheckpointLoaderSimple",
+                    "widgets_values": ["stub"],
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "MODEL", "type": "MODEL", "links": [5]},
+                        {"name": "CLIP", "type": "CLIP", "links": [1, 2]},
+                        {"name": "VAE", "type": "VAE", "links": [8]},
+                    ],
+                },
+                {
+                    "id": 2,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["ui drop negative prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 1}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [4]}],
+                },
+                {
+                    "id": 3,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["ui drop positive prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 2}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [3]}],
+                },
+                {
+                    "id": 4,
+                    "type": "EmptyLatentImage",
+                    "widgets_values": [576, 448, 1],
+                    "inputs": [],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [6]}],
+                },
+                {
+                    "id": 5,
+                    "type": "KSampler",
+                    "widgets_values": [13579, "fixed", 4, 2.25, "euler", "simple", 0.6],
+                    "inputs": [
+                        {"name": "model", "type": "MODEL", "link": 5},
+                        {"name": "positive", "type": "CONDITIONING", "link": 3},
+                        {"name": "negative", "type": "CONDITIONING", "link": 4},
+                        {"name": "latent_image", "type": "LATENT", "link": 6},
+                    ],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [7]}],
+                },
+                {
+                    "id": 6,
+                    "type": "VAEDecode",
+                    "widgets_values": [],
+                    "inputs": [
+                        {"name": "samples", "type": "LATENT", "link": 7},
+                        {"name": "vae", "type": "VAE", "link": 8},
+                    ],
+                    "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [9, 10]}],
+                },
+                {
+                    "id": 7,
+                    "type": "SaveImage",
+                    "widgets_values": ["ui-drop-canvas"],
+                    "inputs": [{"name": "images", "type": "IMAGE", "link": 9}],
+                    "outputs": [],
+                },
+                {
+                    "id": 8,
+                    "type": "PreviewImage",
+                    "widgets_values": [],
+                    "inputs": [{"name": "images", "type": "IMAGE", "link": 10}],
+                    "outputs": [],
+                },
+                {
+                    "id": 9,
+                    "type": "MarkdownNote",
+                    "widgets_values": ["# Swarm note"],
+                    "inputs": [],
+                    "outputs": [],
+                },
+                {
+                    "id": 10,
+                    "type": "Note",
+                    "widgets_values": ["plain Swarm note"],
+                    "inputs": [],
+                    "outputs": [],
+                },
+            ],
+            "links": [
+                [1, 1, 1, 2, 0, "CLIP"],
+                [2, 1, 1, 3, 0, "CLIP"],
+                [3, 3, 0, 5, 1, "CONDITIONING"],
+                [4, 2, 0, 5, 2, "CONDITIONING"],
+                [5, 1, 0, 5, 0, "MODEL"],
+                [6, 4, 0, 5, 3, "LATENT"],
+                [7, 5, 0, 6, 0, "LATENT"],
+                [8, 1, 2, 6, 1, "VAE"],
+                [9, 6, 0, 7, 0, "IMAGE"],
+                [10, 6, 0, 8, 0, "IMAGE"],
+            ],
+        }
+    }
+
+
+def preview_type_mismatch_comfy_ui_canvas_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "PrimitiveString",
+                    "widgets_values": ["not an image"],
+                    "inputs": [],
+                    "outputs": [{"name": "STRING", "type": "STRING", "links": [1]}],
+                },
+                {
+                    "id": 2,
+                    "type": "PreviewImage",
+                    "widgets_values": [],
+                    "inputs": [{"name": "images", "type": "IMAGE", "link": 1}],
+                    "outputs": [],
+                },
+            ],
+            "links": [[1, 1, 0, 2, 0, "STRING"]],
+        }
+    }
+
+
 def outpaint_threshold_comfy_api_prompt_request() -> dict[str, Any]:
     return {
         "workflow": {
@@ -1669,6 +1796,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 blockers,
             )
 
+            preview_mismatch_status, preview_mismatch_data, preview_mismatch_text = http_json(
+                "POST", f"{base_url}/v1/generate", preview_type_mismatch_comfy_ui_canvas_request()
+            )
+            report["preview_type_mismatch"] = {"status": preview_mismatch_status, "body": preview_mismatch_data}
+            require(preview_mismatch_status == 501, "PreviewImage type-mismatch canvas graph did not return HTTP 501", blockers)
+            require(
+                "input images expected IMAGE" in preview_mismatch_text,
+                "PreviewImage type-mismatch response did not name the bad images input",
+                blockers,
+            )
+
             request = linked_workflow_request()
             gen_status, gen_data, gen_text = http_json("POST", f"{base_url}/v1/generate", request)
             report["generate"] = {"status": gen_status, "body": gen_data}
@@ -2116,6 +2254,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(scalar_canvas_genparams.get("creativity") == 0.625, "scalar canvas linked KJ FloatConstant denoise missing", blockers)
                     require(scalar_canvas_genparams.get("workflow_node_count") == 20, "scalar canvas workflow node count missing", blockers)
                     require(scalar_canvas_genparams.get("workflow_edge_count") == 21, "scalar canvas workflow edge count missing", blockers)
+
+            ui_drop_status, ui_drop_data, ui_drop_text = http_json(
+                "POST", f"{base_url}/v1/generate", ui_drop_comfy_ui_canvas_request()
+            )
+            report["ui_drop_canvas_generate"] = {"status": ui_drop_status, "body": ui_drop_data}
+            if ui_drop_status != 200 or not isinstance(ui_drop_data, dict) or not ui_drop_data.get("job_id"):
+                blockers.append(f"UI/drop Comfy UI canvas generate failed HTTP {ui_drop_status}: {ui_drop_text}")
+            else:
+                ui_drop_job_id = str(ui_drop_data["job_id"])
+                ui_drop_job = poll_job(base_url, ui_drop_job_id, args.timeout)
+                report["ui_drop_canvas_job"] = ui_drop_job
+                require(
+                    ui_drop_job.get("state") == "done",
+                    f"UI/drop Comfy UI canvas job state was {ui_drop_job.get('state')}",
+                    blockers,
+                )
+                ui_drop_png_path = Path(str(ui_drop_job.get("output_path") or ""))
+                require(ui_drop_png_path.is_file(), f"UI/drop Comfy UI canvas PNG missing: {ui_drop_png_path}", blockers)
+                if ui_drop_png_path.is_file():
+                    ui_drop_text_chunks = read_png_text(ui_drop_png_path)
+                    ui_drop_genparams = json.loads(ui_drop_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["ui_drop_canvas_png"] = {
+                        "path": str(ui_drop_png_path),
+                        "idat_sha256": ui_drop_text_chunks.get("_idat_sha256"),
+                        "genparams": ui_drop_genparams,
+                    }
+                    require(ui_drop_genparams.get("workflow_source") == "comfy_ui_canvas_graph", "UI/drop canvas workflow source missing", blockers)
+                    require(ui_drop_genparams.get("workflow_save_prefix") == "ui-drop-canvas", "UI/drop SaveImage filename_prefix missing", blockers)
+                    require(ui_drop_genparams.get("prompt") == "ui drop positive prompt", "UI/drop positive prompt missing", blockers)
+                    require(ui_drop_genparams.get("negative") == "ui drop negative prompt", "UI/drop negative prompt missing", blockers)
+                    require(ui_drop_genparams.get("model") == "stub", "UI/drop model missing", blockers)
+                    require(ui_drop_genparams.get("width") == 576, "UI/drop latent width missing", blockers)
+                    require(ui_drop_genparams.get("height") == 448, "UI/drop latent height missing", blockers)
+                    require(ui_drop_genparams.get("images") == 1, "UI/drop batch size missing", blockers)
+                    require(ui_drop_genparams.get("steps") == 4, "UI/drop KSampler steps missing", blockers)
+                    require(ui_drop_genparams.get("seed") == 13579, "UI/drop KSampler seed missing", blockers)
+                    require(ui_drop_genparams.get("cfg") == 2.25, "UI/drop KSampler cfg missing", blockers)
+                    require(ui_drop_genparams.get("sampler") == "euler", "UI/drop KSampler sampler missing", blockers)
+                    require(ui_drop_genparams.get("scheduler") == "simple", "UI/drop KSampler scheduler missing", blockers)
+                    require(ui_drop_genparams.get("creativity") == 0.6, "UI/drop KSampler denoise missing", blockers)
+                    require(ui_drop_genparams.get("workflow_node_count") == 10, "UI/drop workflow node count missing", blockers)
+                    require(ui_drop_genparams.get("workflow_edge_count") == 10, "UI/drop workflow edge count missing", blockers)
 
             outpaint_api_status, outpaint_api_data, outpaint_api_text = http_json(
                 "POST", f"{base_url}/v1/generate", outpaint_threshold_comfy_api_prompt_request()
@@ -2591,6 +2771,8 @@ def main() -> int:
     print("  getset_missing_input: HTTP 501")
     print("  getset_unsupported_type: HTTP 501")
     print("  getset_type_mismatch: HTTP 501")
+    print("  scalar_type_mismatch: HTTP 501")
+    print("  preview_type_mismatch: HTTP 501")
     print(f"  img2img_job_id: {report['img2img_job']['id']}")
     print(f"  img2img_png: {report['img2img_png']['path']}")
     print(f"  lora_job_id: {report['lora_job']['id']}")
@@ -2612,6 +2794,10 @@ def main() -> int:
     print(f"  reroute_canvas_png: {report['reroute_canvas_png']['path']}")
     print(f"  getset_canvas_job_id: {report['getset_canvas_job']['id']}")
     print(f"  getset_canvas_png: {report['getset_canvas_png']['path']}")
+    print(f"  scalar_canvas_job_id: {report['scalar_canvas_job']['id']}")
+    print(f"  scalar_canvas_png: {report['scalar_canvas_png']['path']}")
+    print(f"  ui_drop_canvas_job_id: {report['ui_drop_canvas_job']['id']}")
+    print(f"  ui_drop_canvas_png: {report['ui_drop_canvas_png']['path']}")
     print(f"  outpaint_threshold_api_job_id: {report['outpaint_threshold_api_job']['id']}")
     print(f"  outpaint_threshold_api_png: {report['outpaint_threshold_api_png']['path']}")
     print(f"  inpaint_conditioning_api_job_id: {report['inpaint_conditioning_api_job']['id']}")

@@ -75,8 +75,9 @@ pixi run build-daemon
   accepted Reroute input sources also fail.
 - Product gates must prove both `reroute_api_*` and `reroute_canvas_*` jobs in
   `output/checks/workflow_graph_product_readiness.json`.
-- Next oracle-backed graph utility targets after the bounded scalar constant
-  slice are UI-only drops, then static `LazySwitchKJ`. Do not treat
+- Next oracle-backed graph utility targets after the bounded UI/drop slice are
+  static switch nodes from actual templates, currently `ComfySwitchNode` in
+  SwarmUI Qwen blueprints rather than `LazySwitchKJ`. Do not treat
   `ImageResizeKJv2`, APG/CFG/model patchers, control nodes, or video nodes as
   no-ops without real semantics.
 
@@ -99,13 +100,13 @@ pixi run build-daemon
   and multiple accepted `SetNode` input sources.
 - Product/static proof:
   `output/checks/workflow_graph_product_readiness.json` records
-  `getset_canvas_job` `job-0660` with `workflow_source:"comfy_ui_canvas_graph"`,
+  `getset_canvas_job` `job-0686` with `workflow_source:"comfy_ui_canvas_graph"`,
   `workflow_save_prefix:"canvas-getset"`, prompt/negative/model/init-image
   metadata flowing through named Get/Set handles, and HTTP 501 evidence for
   duplicate SetNode names, missing GetNode setter, missing SetNode input,
   unsupported bus type, and GetNode output type mismatch.
   `output/checks/workflow_node_surface_readiness.json` records
-  `checks=121`, `passed=120`, `p0=0`, `p1=0`, `p2=0`, constrained adapter
+  `checks=122`, `passed=121`, `p0=0`, `p1=0`, `p2=0`, constrained adapter
   `READY`, and arbitrary Comfy/Swarm graph parity still `BLOCKED`.
 
 2026-06-13 primitive scalar constant/link slice:
@@ -138,17 +139,37 @@ pixi run build-daemon
   of inventing dimensions.
 - Product/static proof:
   `workflow_graph_product_readiness.json` records linked scalar BasicScheduler
-  `job-0656`, scalar canvas `job-0661`, scalar mismatch HTTP 501, and
+  `job-0682`, scalar canvas `job-0687`, scalar mismatch HTTP 501, and
   `blockers:[]`. `scalar_canvas_png` proves linked prompt text, dimensions,
   Get/Set-carried steps, seed, cfg, sampler, scheduler, KJ `FloatConstant`
   denoise rounding, and linked `SaveImage.filename_prefix`. Static readiness
-  records `checks=121`, `passed=120`, constrained adapter `READY`, arbitrary
+  records `checks=122`, `passed=121`, constrained adapter `READY`, arbitrary
   Comfy/Swarm graph parity `BLOCKED`.
 - Non-claims: no scalar math (`SimpleCalculatorKJ`, `MathExpression`,
   converters), no string runtime (`StringConcatenate`, regex/string replace),
   no `ImageResizeKJv2`, no arbitrary rgthree/PrimitiveNode any-type behavior,
   no video/audio/custom-model patcher execution, and no hidden tensor/image
   transform semantics.
+
+2026-06-13 UI-only note/PreviewImage slice:
+
+- Oracle shape/source of truth: SwarmUI visual blueprints use `MarkdownNote` and
+  `Note` as UI-only annotations, and `PreviewImage` as a preview sink. They do
+  not alter sampler parameters or final `SaveImage` output metadata.
+- Mojo executor behavior is bounded: `MarkdownNote` and `Note` are inert active
+  nodes. `PreviewImage` may be unlinked or linked to an IMAGE value; if linked
+  to anything else it fails before enqueue via the normal typed-input checker.
+- Product/static proof:
+  `workflow_graph_product_readiness.json` records UI/drop canvas `job-0688`
+  with `workflow_source:"comfy_ui_canvas_graph"`,
+  `workflow_save_prefix:"ui-drop-canvas"`, prompt/negative/model/dimensions/
+  sampler metadata unchanged by the UI nodes, `workflow_node_count:10`,
+  `workflow_edge_count:10`, plus `preview_type_mismatch` HTTP 501 with
+  `input images expected IMAGE`. Static readiness requires both the executor
+  markers and the product report evidence.
+- Non-claims: `PreviewImage` does not create preview artifacts or gallery
+  events yet, notes do not preserve UI layout/text metadata into genparams, and
+  this does not implement switch/router utility semantics.
 
 2026-06-13 Z-Image scheduler update: current Comfy `sgm_uniform` semantics are
 now ported for the bounded Z-Image Euler/flow-match Euler, DPM++ 2M, `uni_pc`,
@@ -1148,32 +1169,33 @@ python3 scripts/check_workflow_node_surface.py \
 
 Latest product-smoke jobs against stub mode:
 
-- `job-0650`: native linked graph
-- `job-0651`: img2img metadata graph
-- `job-0652`: model-only LoRA metadata graph
-- `job-0653`: Z-Image LoRA alias metadata graph
-- `job-0654`: mask metadata graph
-- `job-0655`: outpaint preprocessing graph
-- `job-0656`: linked scalar BasicScheduler/RandomNoise graph
-- `job-0657`: Comfy API prompt graph
-- `job-0658`: Reroute Comfy API prompt graph
-- `job-0659`: Reroute Comfy UI canvas graph
-- `job-0660`: Get/Set Comfy UI canvas graph
-- `job-0661`: primitive scalar Comfy UI canvas graph
-- `job-0662`: outpaint ThresholdMask Comfy API graph
-- `job-0663`: InpaintModelConditioning API graph, `noise_mask=true`
-- `job-0664`: InpaintModelConditioning API graph, `noise_mask=false`
-- `job-0665`: ConditioningSetMask API graph
-- `job-0666`: SerenityFlow `zimage_t2i`
-- `job-0667`: SerenityFlow `qwen_image_t2i`
-- `job-0668`: SerenityFlow `klein9b_t2i`
-- `job-0669`: SerenityFlow `klein4b_t2i`
-- `job-0670`: SerenityFlow `flux2_dev_t2i`
-- `job-0671`: SerenityFlow `klein9b_edit`
-- `job-0672`: SerenityFlow `klein4b_edit`
-- `job-0673`: SerenityFlow `qwen_edit`
-- `job-0674`: SerenityFlow `qwen_edit_lora`
-- `job-0675`: Ideogram4 visual export
+- `job-0676`: native linked graph
+- `job-0677`: img2img metadata graph
+- `job-0678`: model-only LoRA metadata graph
+- `job-0679`: Z-Image LoRA alias metadata graph
+- `job-0680`: mask metadata graph
+- `job-0681`: outpaint preprocessing graph
+- `job-0682`: linked scalar BasicScheduler/RandomNoise graph
+- `job-0683`: Comfy API prompt graph
+- `job-0684`: Reroute Comfy API prompt graph
+- `job-0685`: Reroute Comfy UI canvas graph
+- `job-0686`: Get/Set Comfy UI canvas graph
+- `job-0687`: primitive scalar Comfy UI canvas graph
+- `job-0688`: UI-only Note/MarkdownNote/PreviewImage canvas graph
+- `job-0689`: outpaint ThresholdMask Comfy API graph
+- `job-0690`: InpaintModelConditioning API graph, `noise_mask=true`
+- `job-0691`: InpaintModelConditioning API graph, `noise_mask=false`
+- `job-0692`: ConditioningSetMask API graph
+- `job-0693`: SerenityFlow `zimage_t2i`
+- `job-0694`: SerenityFlow `qwen_image_t2i`
+- `job-0695`: SerenityFlow `klein9b_t2i`
+- `job-0696`: SerenityFlow `klein4b_t2i`
+- `job-0697`: SerenityFlow `flux2_dev_t2i`
+- `job-0698`: SerenityFlow `klein9b_edit`
+- `job-0699`: SerenityFlow `klein4b_edit`
+- `job-0700`: SerenityFlow `qwen_edit`
+- `job-0701`: SerenityFlow `qwen_edit_lora`
+- `job-0702`: Ideogram4 visual export
 
 Previous isolated-mode no-heavy-model admission smoke wrote
 `output/checks/klein_bridge_admission_smoke.json`, but the ReferenceLatent row
@@ -1255,6 +1277,8 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
     `workflow_node_surface_readiness.json`; keep the slice described as bounded
     import/executor lowering rather than accepted arbitrary KJNodes parity.
 14. Primitive scalar constants and linked scalar consumer plumbing are now
-    product/static proven. Next graph-utility work should move to UI-only drops
-    or static `LazySwitchKJ`; do not redo scalar constants unless a new oracle
+    product/static proven. UI-only `MarkdownNote`/`Note`/`PreviewImage` proof is
+    also now product/static covered. Next graph-utility work should move to
+    static switch/router nodes from actual fixtures, currently SwarmUI
+    `ComfySwitchNode`; do not redo scalar or UI/drop nodes unless a new oracle
     fixture shows missing node shapes.

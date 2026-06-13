@@ -181,7 +181,7 @@ Currently accepted graph nodes:
 - model/sampler/sink: `ModelSamplingAuraFlow`, `ModelSamplingSD3`,
   `DifferentialDiffusion`, `KSampler`, `LanPaint_KSampler`,
   `LanPaint_KSamplerAdvanced`, `CFGGuider`, `BasicGuider`, `Flux2Scheduler`,
-  `RandomNoise`, `KSamplerSelect`, `SamplerCustomAdvanced`,
+  `BasicScheduler`, `RandomNoise`, `KSamplerSelect`, `SamplerCustomAdvanced`,
   `LanPaint_SamplerCustomAdvanced`, `LanPaint_MaskBlend`, `SaveImage`,
   `PreviewImage`, `MarkdownNote`, `Note`
 
@@ -393,6 +393,12 @@ Current bounded contract:
 This keeps unsupported inpaint/LanPaint workflows from silently degrading into
 plain img2img or txt2img while allowing the narrow Z-Image preserve-mask slice.
 
+Generic scheduler update: `BasicScheduler -> SamplerCustomAdvanced` now carries
+Comfy scheduler, step, and denoise metadata through the `SIGMAS` handle and
+maps it into flat `scheduler`, `steps`, and `creativity` only when the connected
+sampler consumes that handle. The product smoke records this separately from
+the older Flux2Scheduler/Klein path.
+
 Current LanPaint boundary:
 
 - `scripts/check_lanpaint_oracle_surface.py` preserves the oracle shape from
@@ -432,7 +438,7 @@ Klein edit oracles:
 
 Those are the cleanest next runtime targets because the graph importer already
 recognizes `ReferenceLatent`, `VAEEncode`, `LoadImage`,
-`EmptyFlux2LatentImage`, `Flux2Scheduler`, `KSamplerSelect`, and
+`EmptyFlux2LatentImage`, `Flux2Scheduler`, `BasicScheduler`, `KSamplerSelect`, and
 `SamplerCustomAdvanced`.
 
 Runtime gap for Klein edit has moved from "no execution route" to bounded

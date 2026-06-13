@@ -493,6 +493,40 @@ def mask_workflow_request() -> dict[str, Any]:
     }
 
 
+def basic_scheduler_workflow_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "version": 1,
+            "edges": [
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 2, "port": "clip"}},
+                {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 4, "port": "model"}},
+                {"from": {"node": 2, "port": "CONDITIONING"}, "to": {"node": 4, "port": "conditioning"}},
+                {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 5, "port": "model"}},
+                {"from": {"node": 6, "port": "NOISE"}, "to": {"node": 8, "port": "noise"}},
+                {"from": {"node": 4, "port": "GUIDER"}, "to": {"node": 8, "port": "guider"}},
+                {"from": {"node": 7, "port": "SAMPLER"}, "to": {"node": 8, "port": "sampler"}},
+                {"from": {"node": 5, "port": "SIGMAS"}, "to": {"node": 8, "port": "sigmas"}},
+                {"from": {"node": 3, "port": "LATENT"}, "to": {"node": 8, "port": "latent_image"}},
+                {"from": {"node": 8, "port": "LATENT"}, "to": {"node": 9, "port": "samples"}},
+                {"from": {"node": 1, "port": "VAE"}, "to": {"node": 9, "port": "vae"}},
+                {"from": {"node": 9, "port": "IMAGE"}, "to": {"node": 10, "port": "images"}},
+            ],
+            "nodes": [
+                {"id": 10, "type_id": "comfy/SaveImage", "fields": {"filename_prefix": "basic-scheduler-graph"}},
+                {"id": 9, "type_id": "comfy/VAEDecode", "fields": {}},
+                {"id": 8, "type_id": "comfy/SamplerCustomAdvanced", "fields": {}},
+                {"id": 7, "type_id": "comfy/KSamplerSelect", "fields": {"sampler_name": "euler"}},
+                {"id": 6, "type_id": "comfy/RandomNoise", "fields": {"noise_seed": 67890}},
+                {"id": 5, "type_id": "comfy/BasicScheduler", "fields": {"scheduler": "simple", "steps": 8, "denoise": 0.33}},
+                {"id": 4, "type_id": "comfy/BasicGuider", "fields": {}},
+                {"id": 3, "type_id": "comfy/EmptySD3LatentImage", "fields": {"width": 768, "height": 512, "batch_size": 1}},
+                {"id": 2, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "basic scheduler positive prompt"}},
+                {"id": 1, "type_id": "comfy/CheckpointLoaderSimple", "fields": {"ckpt_name": "stub"}},
+            ],
+        }
+    }
+
+
 def unsupported_comfy_api_prompt_request() -> dict[str, Any]:
     return {
         "workflow": {
@@ -663,6 +697,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(mask_genparams.get("workflow_source") == "typed_linked_graph", "mask workflow source missing", blockers)
                     require(mask_genparams.get("workflow_node_count") == 10, "mask workflow node count missing", blockers)
                     require(mask_genparams.get("workflow_edge_count") == 13, "mask workflow edge count missing", blockers)
+
+            basic_status, basic_data, basic_text = http_json("POST", f"{base_url}/v1/generate", basic_scheduler_workflow_request())
+            report["basic_scheduler_generate"] = {"status": basic_status, "body": basic_data}
+            if basic_status != 200 or not isinstance(basic_data, dict) or not basic_data.get("job_id"):
+                blockers.append(f"BasicScheduler workflow generate failed HTTP {basic_status}: {basic_text}")
+            else:
+                basic_job_id = str(basic_data["job_id"])
+                basic_job = poll_job(base_url, basic_job_id, args.timeout)
+                report["basic_scheduler_job"] = basic_job
+                require(basic_job.get("state") == "done", f"BasicScheduler workflow job state was {basic_job.get('state')}", blockers)
+                basic_png_path = Path(str(basic_job.get("output_path") or ""))
+                require(basic_png_path.is_file(), f"BasicScheduler workflow PNG missing: {basic_png_path}", blockers)
+                if basic_png_path.is_file():
+                    basic_text_chunks = read_png_text(basic_png_path)
+                    basic_genparams = json.loads(basic_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["basic_scheduler_png"] = {
+                        "path": str(basic_png_path),
+                        "idat_sha256": basic_text_chunks.get("_idat_sha256"),
+                        "genparams": basic_genparams,
+                    }
+                    require(basic_genparams.get("prompt") == "basic scheduler positive prompt", "BasicScheduler prompt was not consumed", blockers)
+                    require(basic_genparams.get("model") == "stub", "BasicScheduler model did not flow through MODEL edge", blockers)
+                    require(
+                        basic_genparams.get("width") == 768 and basic_genparams.get("height") == 512,
+                        "BasicScheduler latent dimensions missing",
+                        blockers,
+                    )
+                    require(basic_genparams.get("steps") == 8, "BasicScheduler steps missing from SIGMAS metadata", blockers)
+                    require(basic_genparams.get("seed") == 67890, "BasicScheduler RandomNoise seed missing", blockers)
+                    require(basic_genparams.get("sampler") == "euler", "BasicScheduler sampler selection missing", blockers)
+                    require(basic_genparams.get("scheduler") == "simple", "BasicScheduler scheduler missing from SIGMAS metadata", blockers)
+                    require(basic_genparams.get("creativity") == 0.33, "BasicScheduler denoise missing from creativity", blockers)
+                    require(basic_genparams.get("workflow_source") == "typed_linked_graph", "BasicScheduler workflow source missing", blockers)
+                    require(basic_genparams.get("workflow_node_count") == 10, "BasicScheduler workflow node count missing", blockers)
+                    require(basic_genparams.get("workflow_edge_count") == 12, "BasicScheduler workflow edge count missing", blockers)
 
             api_status, api_data, api_text = http_json("POST", f"{base_url}/v1/generate", comfy_api_prompt_request())
             report["comfy_api_generate"] = {"status": api_status, "body": api_data}
@@ -932,6 +1001,8 @@ def main() -> int:
     print(f"  lora_png: {report['lora_png']['path']}")
     print(f"  mask_job_id: {report['mask_job']['id']}")
     print(f"  mask_png: {report['mask_png']['path']}")
+    print(f"  basic_scheduler_job_id: {report['basic_scheduler_job']['id']}")
+    print(f"  basic_scheduler_png: {report['basic_scheduler_png']['path']}")
     print(f"  comfy_api_job_id: {report['comfy_api_job']['id']}")
     print(f"  comfy_api_png: {report['comfy_api_png']['path']}")
     for sf_name, sf_case in report["serenityflow_t2i"].items():

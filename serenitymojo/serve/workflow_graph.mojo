@@ -784,6 +784,10 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("sampler_name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String("euler"))))
     elif type_id == "Flux2Scheduler":
         fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 0, 20)))
+    elif type_id == "BasicScheduler":
+        fields.set("scheduler", JSONValue.from_string(_workflow_widget_string(widgets, 0, String("simple"))))
+        fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 1, 20)))
+        fields.set("denoise", JSONValue.from_float(_workflow_widget_float(widgets, 2, 1.0)))
     elif type_id == "CFGGuider" or type_id == "FluxGuidance":
         fields.set("cfg", JSONValue.from_float(_workflow_widget_float(widgets, 0, 4.5)))
     elif type_id == "ModelSamplingAuraFlow" or type_id == "ModelSamplingSD3":
@@ -979,7 +983,7 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "BasicGuider":
         if slot == 0:
             return String("GUIDER")
-    elif typ == "Flux2Scheduler":
+    elif typ == "Flux2Scheduler" or typ == "BasicScheduler":
         if slot == 0:
             return String("SIGMAS")
     elif typ == "RandomNoise":
@@ -1131,6 +1135,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "BasicGuider"
             or type_id == "FluxGuidance"
             or type_id == "Flux2Scheduler"
+            or type_id == "BasicScheduler"
             or type_id == "RandomNoise"
             or type_id == "KSamplerSelect"
             or type_id == "SamplerCustomAdvanced"
@@ -1182,6 +1187,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
     var sigmas_nodes = List[Int]()
     var sigmas_ports = List[String]()
     var sigmas_steps = List[Int]()
+    var sigmas_schedulers = List[String]()
+    var sigmas_denoises = List[Float64]()
     var reference_latent_count = 0
 
     var remaining = nodes_json.length()
@@ -1558,11 +1565,30 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("GUIDER"), String("GUIDER"))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "Flux2Scheduler":
-                _copy_field_if_missing(obj, fields, String("steps"), String("steps"))
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SIGMAS"), String("SIGMAS"))
                 sigmas_nodes.append(node_id); sigmas_ports.append(String("SIGMAS"))
                 sigmas_steps.append(_opt_int(fields, "steps", 20, 1, 4096))
+                sigmas_schedulers.append(String("flux2"))
+                sigmas_denoises.append(1.0)
                 done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "BasicScheduler":
+                var model_link = _workflow_find_input_link(edges, node_id, String("model"))
+                if not model_link.found:
+                    raise Error("[501] workflow graph BasicScheduler missing model input")
+                var ready = _workflow_value_index(value_nodes, value_ports, model_link.node_id, model_link.port) >= 0
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, model_link, String("MODEL"), String("model"))
+                    var scheduler = _workflow_string(fields, String("scheduler"))
+                    if scheduler == "":
+                        scheduler = String("simple")
+                    var steps = _opt_int(fields, "steps", 20, 1, 4096)
+                    var denoise = _workflow_float(fields, String("denoise"), 1.0, 0.0, 1.0)
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SIGMAS"), String("SIGMAS"))
+                    sigmas_nodes.append(node_id); sigmas_ports.append(String("SIGMAS"))
+                    sigmas_steps.append(steps)
+                    sigmas_schedulers.append(scheduler)
+                    sigmas_denoises.append(denoise)
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "RandomNoise":
                 var seed = _opt_int(fields, "noise_seed", 0, 0, 4294967295)
                 _set_if_missing(obj, String("seed"), JSONValue.from_int(seed))
@@ -1667,8 +1693,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     for j in range(len(sigmas_nodes)):
                         if sigmas_nodes[j] == sigmas_link.node_id and sigmas_ports[j] == sigmas_link.port:
                             _set_if_missing(obj, String("steps"), JSONValue.from_int(sigmas_steps[j]))
-                    _set_if_missing(obj, String("scheduler"), JSONValue.from_string(String("flux2")))
-                    _set_if_missing(obj, String("creativity"), JSONValue.from_float(1.0))
+                            _set_if_missing(obj, String("scheduler"), JSONValue.from_string(sigmas_schedulers[j]))
+                            _set_if_missing(obj, String("creativity"), JSONValue.from_float(sigmas_denoises[j]))
                     if type_id == "LanPaint_SamplerCustomAdvanced":
                         _workflow_copy_lanpaint_sampler_fields(obj, fields)
                     var latent_idx = _workflow_latent_index(latent_nodes, latent_ports, latent_link)

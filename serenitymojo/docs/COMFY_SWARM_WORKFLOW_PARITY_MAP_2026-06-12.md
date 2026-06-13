@@ -53,7 +53,7 @@ The accepted linked graph node types are the current bounded allowlist:
 - model/sampler/sink: `ModelSamplingAuraFlow`, `ModelSamplingSD3`,
   `DifferentialDiffusion`, `KSampler`, `LanPaint_KSampler`,
   `LanPaint_KSamplerAdvanced`, `CFGGuider`, `BasicGuider`, `Flux2Scheduler`,
-  `RandomNoise`, `KSamplerSelect`, `SamplerCustomAdvanced`,
+  `BasicScheduler`, `RandomNoise`, `KSamplerSelect`, `SamplerCustomAdvanced`,
   `LanPaint_SamplerCustomAdvanced`, `LanPaint_MaskBlend`, `SaveImage`,
   `PreviewImage`, `MarkdownNote`, `Note`
 
@@ -63,6 +63,13 @@ bodies, accepted fields are resolved through the typed graph value store and
 then mapped into the existing flat `JobParams`/`serenity.genparams.v1` product
 path. Arbitrary node families, custom outputs, and advanced graph behaviors are
 not implemented.
+
+Generic `BasicScheduler -> SamplerCustomAdvanced` graph metadata now flows
+through `SIGMAS`: the scheduler name, step count, and denoise value are attached
+to the SIGMAS handle and consumed by the connected sampler, mapping into the
+existing flat `scheduler`, `steps`, and `creativity` runtime fields. This covers
+the core scheduler shape used by local Z-Image visual workflows without adding
+new model inference code.
 
 Current graph mask support is path/source metadata, not a graph tensor. `LoadImage`
 can expose a typed `MASK` output with source `load_image_mask`, which means the

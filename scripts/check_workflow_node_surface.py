@@ -98,6 +98,7 @@ SUPPORTED_NODE_TYPES = [
     "BasicGuider",
     "FluxGuidance",
     "Flux2Scheduler",
+    "BasicScheduler",
     "RandomNoise",
     "KSamplerSelect",
     "SamplerCustomAdvanced",
@@ -466,6 +467,8 @@ def check_supported_nodes() -> list[Check]:
                 "LanPaint_SamplerCustomAdvanced",
                 "LanPaint_MaskBlend",
                 "ImageToMask",
+                "BasicScheduler",
+                "denoise",
                 "LanPaint_NumSteps",
                 "LanPaint_PromptMode",
                 "LanPaint_InnerThreshold",
@@ -2231,6 +2234,8 @@ def check_workflow_graph_product_report() -> Check:
     lora_png = report.get("lora_png")
     mask_job = report.get("mask_job")
     mask_png = report.get("mask_png")
+    basic_scheduler_job = report.get("basic_scheduler_job")
+    basic_scheduler_png = report.get("basic_scheduler_png")
     sf_evidence = serenityflow_t2i_case(report, "zimage_t2i")
     edit_klein9b_evidence = serenityflow_edit_case(report, "klein9b_edit")
     edit_klein4b_evidence = serenityflow_edit_case(report, "klein4b_edit")
@@ -2247,6 +2252,8 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(lora_png, dict)
         or not isinstance(mask_job, dict)
         or not isinstance(mask_png, dict)
+        or not isinstance(basic_scheduler_job, dict)
+        or not isinstance(basic_scheduler_png, dict)
         or not isinstance(unsupported_api, dict)
     ):
         return Check(
@@ -2254,7 +2261,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, LoRA, img2img, mask, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, LoRA, img2img, mask, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2319,6 +2326,23 @@ def check_workflow_graph_product_report() -> Check:
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
+    basic_scheduler_genparams = basic_scheduler_png.get("genparams")
+    if (
+        not isinstance(basic_scheduler_genparams, dict)
+        or basic_scheduler_genparams.get("scheduler") != "simple"
+        or basic_scheduler_genparams.get("steps") != 8
+        or basic_scheduler_genparams.get("creativity") != 0.33
+        or basic_scheduler_genparams.get("sampler") != "euler"
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "BasicScheduler/SamplerCustomAdvanced metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
     sf_error = validate_zimage_t2i_evidence(sf_evidence)
     if sf_error:
         return Check(
@@ -2367,6 +2391,7 @@ def check_workflow_graph_product_report() -> Check:
         f"img2img graph completed {img_job.get('id')}; "
         f"LoRA graph completed {lora_job.get('id')}; "
         f"mask graph completed {mask_job.get('id')}; "
+        f"BasicScheduler graph completed {basic_scheduler_job.get('id')}; "
         f"Comfy API prompt completed {api_job.get('id')}; "
         "unsupported and wrong-type links returned HTTP 501"
     )

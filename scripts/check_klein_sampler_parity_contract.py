@@ -477,6 +477,22 @@ def gather_report() -> ContractReport:
         fact_for_needles(
             status_if_ok="PASS",
             status_if_missing="WARN",
+            label="ReferenceLatent edit accepts parity initial-noise sidecar",
+            source=sources["sample_cli"],
+            needles=(
+                "klein_sample_with_reference_latent_initial_noise",
+                "edit_initial_noise_replay",
+                "initial_noise_sidecar",
+                "load_tensor_bin(initial_noise_path, ctx)",
+            ),
+            detail_ok="Standalone Klein sample CLI can combine ReferenceLatent edit replay with a supplied target post-patch/post-pack initial-noise sidecar.",
+            detail_missing="ReferenceLatent edit initial-noise replay markers changed; inspect edit trajectory replay wiring manually.",
+        )
+    )
+    facts.append(
+        fact_for_needles(
+            status_if_ok="PASS",
+            status_if_missing="WARN",
             label="OneTrainer sampler RNG and decode path",
             source=sources["ot_sampler"],
             needles=("torch.randn", "dtype=torch.float32", "noise_scheduler.set_timesteps", "self.model.unscale_latents", "vae.decode"),

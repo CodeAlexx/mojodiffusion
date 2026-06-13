@@ -181,8 +181,8 @@ def _shape_str(shape: List[Int]) -> String:
 # [1,32,2*LH,2*LW], then patchifies/packs it before the transformer. This
 # adapter expects that OT-equivalent post-patch/post-pack tensor:
 # [1,in_ch,LH,LW] or [N_IMG,in_ch]. It preserves the sidecar dtype exactly and
-# is only used by `klein_sample_with_initial_noise`; the default product path
-# still uses `_initial_noise_tokens(... STDtype.BF16 ...)`.
+# is only used by explicit parity/replay entries; the default product path still
+# uses `_initial_noise_tokens(... STDtype.BF16 ...)`.
 def _initial_noise_tokens_from_sidecar[N_IMG: Int, LH: Int, LW: Int](
     var initial_noise: Tensor, in_ch: Int, ctx: DeviceContext
 ) raises -> Tensor:
@@ -591,6 +591,62 @@ def klein_sample_with_reference_latent[
         raise Error("klein_sample_with_reference_latent: denoise_strength must be in (0,1]")
 
     var x = _initial_noise_tokens[N_TARGET, LH, LW](cfg.in_channels, seed, ctx)
+    var ref_tokens = _reference_latent_tokens[N_TARGET, LH, LW](
+        reference_latent_nchw^, cfg.in_channels, ctx
+    )
+    var latent = _denoise_lora_reference_from_initial[
+        H, Dh, N_TARGET, N_COMBINED, N_TXT, S, LH, LW
+    ](
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^,
+        ref_tokens, denoise_strength, shift, reference_t_offset, ctx,
+        lora_multiplier,
+    )
+    var packed = tokens_to_packed_nchw[LH, LW](latent, ctx)
+    var vae = KleinVaeDecoder[LH, LW].load(cfg.vae, ctx)
+    var img = vae.decode(packed, ctx)
+    if out_png != String(""):
+        save_image(img, out_png, ctx)
+        print_sample_saved(String("Klein-edit"), out_png)
+    return img^
+
+
+# Explicit parity/debug ReferenceLatent replay entry. `initial_noise` is the
+# target post-patch/post-pack noise sidecar [1,in_ch,LH,LW] or [N_TARGET,in_ch].
+# The normal product edit path above still owns its BF16 RNG draw internally.
+def klein_sample_with_reference_latent_initial_noise[
+    N_TARGET: Int, N_COMBINED: Int, N_TXT: Int, S: Int, LH: Int, LW: Int,
+    H: Int, Dh: Int
+](
+    cfg: TrainConfig,
+    lora_path: String,
+    pos_txt: Tensor,
+    neg_txt: Tensor,
+    cfg_scale: Float32,
+    num_steps: Int,
+    var initial_noise: Tensor,
+    var reference_latent_nchw: Tensor,
+    out_png: String,
+    ctx: DeviceContext,
+    denoise_strength: Float32 = Float32(1.0),
+    shift: Float32 = Float32(2.02),
+    reference_t_offset: Float32 = Float32(10.0),
+    lora_multiplier: Float32 = Float32(1.0),
+) raises -> Tensor:
+    comptime assert N_TARGET == LH * LW, "N_TARGET must match LH*LW"
+    comptime assert N_COMBINED == 2 * N_TARGET, "ReferenceLatent edit uses target+reference image tokens"
+    comptime assert S == N_TXT + N_COMBINED, "S must be text+target+reference"
+    if cfg.n_heads != H:
+        raise Error(String("klein_sample_with_reference_latent_initial_noise: cfg.n_heads ") + String(cfg.n_heads)
+            + " != comptime H " + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("klein_sample_with_reference_latent_initial_noise: cfg.head_dim ") + String(cfg.head_dim)
+            + " != comptime Dh " + String(Dh))
+    if denoise_strength <= Float32(0.0) or denoise_strength > Float32(1.0):
+        raise Error("klein_sample_with_reference_latent_initial_noise: denoise_strength must be in (0,1]")
+
+    var x = _initial_noise_tokens_from_sidecar[N_TARGET, LH, LW](
+        initial_noise^, cfg.in_channels, ctx
+    )
     var ref_tokens = _reference_latent_tokens[N_TARGET, LH, LW](
         reference_latent_nchw^, cfg.in_channels, ctx
     )

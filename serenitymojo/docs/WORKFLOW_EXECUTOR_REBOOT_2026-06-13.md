@@ -1195,12 +1195,18 @@ Klein ReferenceLatent path:
 
 - `serenitymojo/sampling/klein_sample_cli.mojo`
   - accepts optional `argv[11]` as a ReferenceLatent edit parity sidecar dir;
+  - can now combine optional `argv[6]` target post-patch/post-pack
+    initial-noise replay with `argv[7]` ReferenceLatent source image; when both
+    are present, `klein_sample_with_reference_latent_initial_noise[...]` replays
+    the supplied target noise instead of drawing the normal seeded BF16 edit
+    noise;
   - after `_encode_reference_512` / `_encode_reference_1024`, saves the encoded
     source-image latent to `reference_vae_latent.bin` using the raw KLNCAPV1
     tensor-bin format;
   - writes `manifest.json` with config path, prompt file, caps paths, reference
     image, seed, steps, cfg, denoise, edit shift, reference `t_offset`, output
-    PNG, expected latent shape, and explicit non-claims.
+    PNG, expected latent shape, `edit_initial_noise_replay`,
+    `initial_noise_sidecar`, and explicit non-claims.
 - `serenitymojo/serve/klein_backend.mojo`
   - creates `<job_dir>/edit_parity` for ReferenceLatent jobs;
   - passes that path to the staged sampler command;
@@ -1210,11 +1216,12 @@ Klein ReferenceLatent path:
   - statically guards the CLI and backend markers so the capture contract stays
     visible in no-heavy readiness.
 
-This is not full oracle parity yet. It captures the first real edit tensor
-needed for parity: the VAE-encoded ReferenceLatent source image. The next
-runtime parity slice should add edit target initial-noise replay, edit RoPE/id
-sidecars, first-step target velocity, final latent tokens, VAE decoded tensor,
-and Python/SerenityFlow comparison artifacts.
+This is not full oracle parity yet. It now captures the VAE-encoded
+ReferenceLatent source image and can replay a supplied target initial-noise
+sidecar through the edit denoise path. The next runtime parity slice should add
+edit RoPE/id sidecars, packed reference/target token dumps, first-step target
+velocity, final latent tokens, VAE decoded tensor, and Python/SerenityFlow
+comparison artifacts.
 
 Files touched for this bridge:
 
@@ -1226,6 +1233,8 @@ Files touched for this bridge:
 - `scripts/check_klein_lora_daemon_smoke.py`
 - `scripts/check_klein_lora_reference_daemon_smoke.py`
 - `scripts/check_workflow_node_surface.py`
+- `scripts/check_klein_initial_noise_sidecar_contract.py`
+- `scripts/check_klein_sampler_parity_contract.py`
 
 New build tasks:
 

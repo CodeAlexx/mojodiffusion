@@ -212,6 +212,28 @@ CHECKS: tuple[ContractCheck, ...] = (
         ),
         detail="Production sampling still uses Mojo BF16 randn by default.",
     ),
+    ContractCheck(
+        label="ReferenceLatent edit initial-noise replay path",
+        groups=(
+            MarkerGroup(
+                "ReferenceLatent replay entry",
+                ("klein_sample_with_reference_latent_initial_noise",),
+            ),
+            MarkerGroup(
+                "sidecar target noise conversion",
+                ("_initial_noise_tokens_from_sidecar[N_TARGET, LH, LW]",),
+            ),
+            MarkerGroup(
+                "reference latent token conversion",
+                ("_reference_latent_tokens[N_TARGET, LH, LW]",),
+            ),
+            MarkerGroup(
+                "edit denoise reuse",
+                ("_denoise_lora_reference_from_initial",),
+            ),
+        ),
+        detail="ReferenceLatent edit replay can consume a supplied target initial-noise sidecar without changing the normal seeded edit path.",
+    ),
 )
 
 

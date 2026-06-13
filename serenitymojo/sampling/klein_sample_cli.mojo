@@ -11,6 +11,10 @@
 #   argv[4] prompt id/label (default first prompt)
 #   argv[5] output PNG override
 #   argv[6] optional post-patch/post-pack initial-noise tensor bin for parity replay
+#   argv[7] optional ReferenceLatent source image for bounded edit replay
+#   argv[8] optional edit denoise strength / creativity
+#   argv[9] optional edit shift
+#   argv[10] optional ReferenceLatent RoPE t_offset
 #   argv[11] optional ReferenceLatent edit parity sidecar dir
 #
 # Caps: positive + negative prompt embeddings are precomputed by the separate
@@ -36,7 +40,9 @@ from serenitymojo.training.sample_prompt_config import (
     SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
 )
 from serenitymojo.sampling.klein_sampler import (
-    klein_sample, klein_sample_with_initial_noise, klein_sample_with_reference_latent,
+    klein_sample, klein_sample_with_initial_noise,
+    klein_sample_with_reference_latent,
+    klein_sample_with_reference_latent_initial_noise,
 )
 from serenitymojo.ops.tensor_algebra import reshape
 from serenitymojo.io.ffi import (
@@ -184,9 +190,14 @@ def _shape_json(t: Tensor) -> String:
     return out^
 
 
+def _json_bool(value: Bool) -> String:
+    return String("true") if value else String("false")
+
+
 def _write_edit_parity_sidecar(
     reference_latent: Tensor,
     edit_parity_dir: String,
+    initial_noise_path: String,
     cfg_path: String,
     lora_path: String,
     prompt_file: String,
@@ -216,6 +227,8 @@ def _write_edit_parity_sidecar(
     out += String('  "reference_vae_latent_format":"KLNCAPV1 raw tensor bin",\n')
     out += String('  "reference_vae_latent_shape":') + _shape_json(reference_latent) + String(",\n")
     out += String('  "expected_reference_vae_latent_shape":[1,128,') + String(latent_h) + String(",") + String(latent_w) + String("],\n")
+    out += String('  "edit_initial_noise_replay":') + _json_bool(initial_noise_path != String("")) + String(",\n")
+    out += String('  "initial_noise_sidecar":"') + _json_escape(initial_noise_path) + String('",\n')
     out += String('  "width":') + String(width) + String(",\n")
     out += String('  "height":') + String(height) + String(",\n")
     out += String('  "latent_h":') + String(latent_h) + String(",\n")
@@ -282,23 +295,32 @@ def _sample_512(
     if cfg.head_dim != Dh:
         raise Error(String("klein_sample_cli: unsupported head_dim ") + String(cfg.head_dim))
     var has_reference = not _reference_image_empty(reference_image_path)
-    if has_reference and initial_noise_path != String(""):
-        raise Error("klein_sample_cli: reference edit and initial-noise sidecar are mutually exclusive")
     if cfg.n_heads == H_9B:
         if has_reference:
             var ref9 = _encode_reference_512(reference_image_path, cfg, ctx)
             _write_edit_parity_sidecar(
-                ref9, edit_parity_dir, cfg_path, lora_path, prompt_file, prompt,
-                out_png, reference_image_path, 512, 512, LH_512, LW_512,
-                denoise_strength, edit_shift, reference_t_offset, ctx,
+                ref9, edit_parity_dir, initial_noise_path, cfg_path, lora_path,
+                prompt_file, prompt, out_png, reference_image_path, 512, 512,
+                LH_512, LW_512, denoise_strength, edit_shift,
+                reference_t_offset, ctx,
             )
-            var _edit9 = klein_sample_with_reference_latent[
-                N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_9B, Dh
-            ](
-                cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
-                prompt.seed, ref9^, out_png, ctx, denoise_strength, edit_shift,
-                reference_t_offset,
-            )
+            if initial_noise_path != String(""):
+                var noise9e = load_tensor_bin(initial_noise_path, ctx)
+                var _edit9p = klein_sample_with_reference_latent_initial_noise[
+                    N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_9B, Dh
+                ](
+                    cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
+                    noise9e^, ref9^, out_png, ctx, denoise_strength, edit_shift,
+                    reference_t_offset,
+                )
+            else:
+                var _edit9 = klein_sample_with_reference_latent[
+                    N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_9B, Dh
+                ](
+                    cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
+                    prompt.seed, ref9^, out_png, ctx, denoise_strength, edit_shift,
+                    reference_t_offset,
+                )
         elif initial_noise_path != String(""):
             var noise9 = load_tensor_bin(initial_noise_path, ctx)
             var _img9p = klein_sample_with_initial_noise[N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_9B, Dh](
@@ -312,17 +334,28 @@ def _sample_512(
         if has_reference:
             var ref4 = _encode_reference_512(reference_image_path, cfg, ctx)
             _write_edit_parity_sidecar(
-                ref4, edit_parity_dir, cfg_path, lora_path, prompt_file, prompt,
-                out_png, reference_image_path, 512, 512, LH_512, LW_512,
-                denoise_strength, edit_shift, reference_t_offset, ctx,
+                ref4, edit_parity_dir, initial_noise_path, cfg_path, lora_path,
+                prompt_file, prompt, out_png, reference_image_path, 512, 512,
+                LH_512, LW_512, denoise_strength, edit_shift,
+                reference_t_offset, ctx,
             )
-            var _edit4 = klein_sample_with_reference_latent[
-                N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_4B, Dh
-            ](
-                cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
-                prompt.seed, ref4^, out_png, ctx, denoise_strength, edit_shift,
-                reference_t_offset,
-            )
+            if initial_noise_path != String(""):
+                var noise4e = load_tensor_bin(initial_noise_path, ctx)
+                var _edit4p = klein_sample_with_reference_latent_initial_noise[
+                    N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_4B, Dh
+                ](
+                    cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
+                    noise4e^, ref4^, out_png, ctx, denoise_strength, edit_shift,
+                    reference_t_offset,
+                )
+            else:
+                var _edit4 = klein_sample_with_reference_latent[
+                    N_IMG_512, N_EDIT_IMG_512, N_TXT, S_EDIT_512, LH_512, LW_512, H_4B, Dh
+                ](
+                    cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
+                    prompt.seed, ref4^, out_png, ctx, denoise_strength, edit_shift,
+                    reference_t_offset,
+                )
         elif initial_noise_path != String(""):
             var noise4 = load_tensor_bin(initial_noise_path, ctx)
             var _img4p = klein_sample_with_initial_noise[N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_4B, Dh](
@@ -356,23 +389,32 @@ def _sample_1024(
     if cfg.head_dim != Dh:
         raise Error(String("klein_sample_cli: unsupported head_dim ") + String(cfg.head_dim))
     var has_reference = not _reference_image_empty(reference_image_path)
-    if has_reference and initial_noise_path != String(""):
-        raise Error("klein_sample_cli: reference edit and initial-noise sidecar are mutually exclusive")
     if cfg.n_heads == H_9B:
         if has_reference:
             var ref9 = _encode_reference_1024(reference_image_path, cfg, ctx)
             _write_edit_parity_sidecar(
-                ref9, edit_parity_dir, cfg_path, lora_path, prompt_file, prompt,
-                out_png, reference_image_path, 1024, 1024, LH_1024, LW_1024,
-                denoise_strength, edit_shift, reference_t_offset, ctx,
+                ref9, edit_parity_dir, initial_noise_path, cfg_path, lora_path,
+                prompt_file, prompt, out_png, reference_image_path, 1024, 1024,
+                LH_1024, LW_1024, denoise_strength, edit_shift,
+                reference_t_offset, ctx,
             )
-            var _edit9 = klein_sample_with_reference_latent[
-                N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_9B, Dh
-            ](
-                cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
-                prompt.seed, ref9^, out_png, ctx, denoise_strength, edit_shift,
-                reference_t_offset,
-            )
+            if initial_noise_path != String(""):
+                var noise9e = load_tensor_bin(initial_noise_path, ctx)
+                var _edit9p = klein_sample_with_reference_latent_initial_noise[
+                    N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_9B, Dh
+                ](
+                    cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
+                    noise9e^, ref9^, out_png, ctx, denoise_strength, edit_shift,
+                    reference_t_offset,
+                )
+            else:
+                var _edit9 = klein_sample_with_reference_latent[
+                    N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_9B, Dh
+                ](
+                    cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
+                    prompt.seed, ref9^, out_png, ctx, denoise_strength, edit_shift,
+                    reference_t_offset,
+                )
         elif initial_noise_path != String(""):
             var noise9 = load_tensor_bin(initial_noise_path, ctx)
             var _img9p = klein_sample_with_initial_noise[N_IMG_1024, N_TXT, S_1024, LH_1024, LW_1024, H_9B, Dh](
@@ -386,17 +428,28 @@ def _sample_1024(
         if has_reference:
             var ref4 = _encode_reference_1024(reference_image_path, cfg, ctx)
             _write_edit_parity_sidecar(
-                ref4, edit_parity_dir, cfg_path, lora_path, prompt_file, prompt,
-                out_png, reference_image_path, 1024, 1024, LH_1024, LW_1024,
-                denoise_strength, edit_shift, reference_t_offset, ctx,
+                ref4, edit_parity_dir, initial_noise_path, cfg_path, lora_path,
+                prompt_file, prompt, out_png, reference_image_path, 1024, 1024,
+                LH_1024, LW_1024, denoise_strength, edit_shift,
+                reference_t_offset, ctx,
             )
-            var _edit4 = klein_sample_with_reference_latent[
-                N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_4B, Dh
-            ](
-                cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
-                prompt.seed, ref4^, out_png, ctx, denoise_strength, edit_shift,
-                reference_t_offset,
-            )
+            if initial_noise_path != String(""):
+                var noise4e = load_tensor_bin(initial_noise_path, ctx)
+                var _edit4p = klein_sample_with_reference_latent_initial_noise[
+                    N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_4B, Dh
+                ](
+                    cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
+                    noise4e^, ref4^, out_png, ctx, denoise_strength, edit_shift,
+                    reference_t_offset,
+                )
+            else:
+                var _edit4 = klein_sample_with_reference_latent[
+                    N_IMG_1024, N_EDIT_IMG_1024, N_TXT, S_EDIT_1024, LH_1024, LW_1024, H_4B, Dh
+                ](
+                    cfg, lora_path, pos_txt, neg_txt, prompt.cfg, prompt.steps,
+                    prompt.seed, ref4^, out_png, ctx, denoise_strength, edit_shift,
+                    reference_t_offset,
+                )
         elif initial_noise_path != String(""):
             var noise4 = load_tensor_bin(initial_noise_path, ctx)
             var _img4p = klein_sample_with_initial_noise[N_IMG_1024, N_TXT, S_1024, LH_1024, LW_1024, H_4B, Dh](

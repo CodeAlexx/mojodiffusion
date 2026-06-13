@@ -1692,9 +1692,13 @@ def check_family_surfaces() -> list[Check]:
             label="Klein ReferenceLatent staged sampler CLI",
             needles=[
                 "klein_sample_with_reference_latent",
+                "klein_sample_with_reference_latent_initial_noise",
                 "_encode_reference_512",
                 "_encode_reference_1024",
                 "serenity.klein_edit_parity_sidecar.v1",
+                "edit_initial_noise_replay",
+                "initial_noise_sidecar",
+                "load_tensor_bin(initial_noise_path, ctx)",
                 "save_tensor_bin(reference_latent, latent_path, ctx)",
                 "reference_vae_latent.bin",
                 "ReferenceLatent parity sidecar",
@@ -1706,7 +1710,7 @@ def check_family_surfaces() -> list[Check]:
                 "reference_t_offset",
             ],
             severity=P1,
-            acceptance="The staged Klein sampler can decode/resize a source image, VAE-encode it, save the encoded reference latent for edit parity, and dispatch 512/1024 ReferenceLatent edit specializations instead of only txt2img.",
+            acceptance="The staged Klein sampler can decode/resize a source image, VAE-encode it, save the encoded reference latent for edit parity, optionally replay a supplied target initial-noise sidecar, and dispatch 512/1024 ReferenceLatent edit specializations instead of only txt2img.",
         ),
         check_contains(
             KLEIN_STACK_LORA,

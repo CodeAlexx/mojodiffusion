@@ -21,7 +21,7 @@ from net.syscalls import sys_fork, sys_close, errno_str
 
 struct ProcessIsolatedBackend(GenBackend, Movable):
     var child_pid: Int32        # -1 = no child
-    var child_kind: String      # "" | "stub" | "zimage" | "qwenimage"
+    var child_kind: String      # "" | "stub" | "zimage" | "qwenimage" | "ideogram4" | "klein"
     var parent_fd: Int32        # -1 = none; our end of the socketpair (O_NONBLOCK)
     var reader: LineReader
     var active: Bool            # a job is in flight in the child

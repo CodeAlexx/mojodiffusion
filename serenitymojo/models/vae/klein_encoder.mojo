@@ -454,8 +454,8 @@ struct KleinVaeEncoder[IH: Int, IW: Int](Movable):
         """[1,3,IH,IW] (F32, [-1,1]) -> [1,128,IH/16,IW/16] packed latent.
 
         Deterministic posterior mean (mu = first 32 ch of conv_out), patchify,
-        then BatchNorm forward (z - mean) / sqrt(var + eps). Matches
-        KleinVaeEncoder::encode in klein_vae.rs.
+        then BatchNorm forward (z - mean) / sqrt(var + eps). Matches the
+        existing Klein inference path.
         """
         var sh = image_nchw.shape()
         if len(sh) != 4 or sh[1] != 3:

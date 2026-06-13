@@ -234,9 +234,11 @@ def mojo_markers() -> list[Marker]:
     markers: list[Marker] = []
 
     daemon = REPO / "serenitymojo/serve/serenity_daemon.mojo"
+    workflow_graph = REPO / "serenitymojo/serve/workflow_graph.mojo"
     backend = REPO / "serenitymojo/serve/backend.mojo"
     zimage = REPO / "serenitymojo/serve/zimage_backend.mojo"
     qwen = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
+    ideogram = REPO / "serenitymojo/serve/ideogram4_backend.mojo"
     sampler_registry = REPO / "serenitymojo/sampling/sampler_registry.mojo"
     variation_noise = REPO / "serenitymojo/sampling/variation_noise.mojo"
     dispatch = REPO / "serenitymojo/serve/dispatch_backend.mojo"
@@ -248,9 +250,11 @@ def mojo_markers() -> list[Marker]:
     )
 
     daemon_text = read_text(daemon)
+    workflow_graph_text = read_text(workflow_graph)
     backend_text = read_text(backend)
     zimage_text = read_text(zimage)
     qwen_text = read_text(qwen)
+    ideogram_text = read_text(ideogram)
     sampler_registry_text = read_text(sampler_registry)
     variation_noise_text = read_text(variation_noise)
     dispatch_text = read_text(dispatch)
@@ -286,11 +290,12 @@ def mojo_markers() -> list[Marker]:
         marker(
             "Workflow graph coverage",
             "Constrained KSampler adapter found",
-            daemon,
+            workflow_graph,
             has_all(
-                daemon_text,
+                workflow_graph_text,
                 [
-                    "_apply_workflow_params",
+                    "apply_workflow_params",
+                    "apply_typed_workflow_graph",
                     '"KSampler"',
                     '"sampler_name"',
                     '"denoise"',
@@ -298,7 +303,7 @@ def mojo_markers() -> list[Marker]:
                     "unsupported workflow graph node",
                 ],
             ),
-            "Daemon maps a constrained Comfy KSampler-like graph and rejects unknown nodes.",
+            "Workflow graph module maps a constrained Comfy KSampler-like graph and rejects unknown nodes.",
             "Every supported node must have product tests; unsupported nodes must remain loud failures.",
             severity="warning",
         )
@@ -348,7 +353,10 @@ def mojo_markers() -> list[Marker]:
                     '"required_variant":"bh1"',
                     '"required_schedule":"SigmaConvert"',
                     "dpmpp_2m",
+                    "uni_pc",
                     "uni_pc_bh2",
+                    "ideogram4_logitnormal_euler",
+                    "ideogram4_logitnormal",
                     "align_your_steps",
                     "ltxv-image",
                 ],
@@ -402,11 +410,16 @@ def mojo_markers() -> list[Marker]:
             has_all(
                 zimage_text,
                 [
-                    "only 512x512 is served",
-                    "len(params.loras) > 1",
+                    "supported sizes are 512x512 and 1024x1024",
+                    "len(params.loras)",
+                    "merge_zimage_lora_sets_for_inference",
                     "self.params.init_image",
                     "self.params.creativity",
-                    "_build_sigmas(self.params.steps)",
+                    "img2img_applied",
+                    "denoise_start_step",
+                    "_build_sigmas_with_shift",
+                    "self.params.sigma_shift",
+                    "zimage_comfy_simple_sigmas",
                     "self.params.seed",
                     "self.params.negative",
                     "_cfg_pred_overlay",
@@ -416,18 +429,23 @@ def mojo_markers() -> list[Marker]:
                     "executed_sampler",
                     "dpmpp_2m_step",
                     "UniPcMultistepScheduler",
+                    "ComfyUniPcMultistepScheduler",
+                    "_build_comfy_unipc_sigmas",
                     "from_sigmas",
                     "sampler_trace",
+                    "solver_variant",
+                    "sigma_parameterization",
                     "dpmpp_update_steps",
                     "dpmpp_second_order_steps",
                     "unipc_update_steps",
                     "unipc_second_order_steps",
+                    "unipc_third_order_steps",
                     "schedule_source",
                     "self.params.image_index",
                     "self.params.image_count",
                 ],
             ),
-            "Z-Image has real subset behavior, registry-backed admission, fixed Euler/simple flow-match, bounded DPM++ 2M/simple flow-match execution, and bounded UniPC bh2/simple flow-match execution.",
+            "Z-Image has real subset behavior, registry-backed admission, SwarmUI/Comfy-aligned Euler/simple flow-match sigmas with sigma_shift, bounded DPM++ 2M/simple flow-match execution, bounded generic UniPC bh1/simple flow-match execution, bounded UniPC bh2/simple flow-match execution, and bounded flat img2img/creativity artifact evidence.",
             "Accepted sampler parity needs per-sampler artifact evidence and executed sampler metadata.",
             severity="warning",
         )
@@ -459,12 +477,43 @@ def mojo_markers() -> list[Marker]:
     )
     markers.append(
         marker(
+            "Ideogram4 backend subset",
+            "Ideogram4 executes bounded logit-normal/simple Euler and rejects wider controls",
+            ideogram,
+            has_all(
+                ideogram_text,
+                [
+                    "ideogram4_logitnormal_euler",
+                    "ideogram4_logitnormal",
+                    "ideogram4_simple_flowmatch",
+                    "_build_ideogram4_simple_sigmas",
+                    "ideogram4_comfy_simple_aura_flow",
+                    "cfg_override",
+                    "sigma_shift",
+                    "accepted_sampler_parity",
+                    "accepted_speed_parity",
+                    "negative prompt is not supported",
+                    "LoRA is not supported",
+                    "init image is not supported",
+                    "creativity/denoise control is not supported",
+                    "variation noise is not supported",
+                    "cfg must be positive",
+                    "1024x1024",
+                ],
+            ),
+            "Ideogram4 has bounded native inference, a logit-normal path, and a Comfy simple AuraFlow scheduler path for the imported workflow, but accepted sampler/speed parity remains false.",
+            "Full Ideogram4 parity still needs paired Comfy artifact evidence, prompt-builder coverage, and broader request-surface coverage.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
             "Model/backend mapping",
-            "Dispatch surface is limited to Z-Image and Qwen real backends",
+            "Dispatch surface is limited to Z-Image, Qwen, and bounded Ideogram4 real backends",
             dispatch,
-            has_all(dispatch_text, ["KIND_ZIMAGE", "KIND_QWEN"])
+            has_all(dispatch_text, ["KIND_ZIMAGE", "KIND_QWEN", "KIND_IDEOGRAM4"])
             and not has_any(dispatch_text, ["KIND_KLEIN", "KIND_SDXL", "KIND_SD3"]),
-            "Daemon real dispatch currently covers Z-Image and Qwen, not Klein/SDXL/SD3/etc.",
+            "Daemon real dispatch currently covers Z-Image, Qwen, and bounded Ideogram4, not Klein/SDXL/SD3/etc.",
             "Add dispatch entries only after model-specific artifact, timing, VRAM, and sampler evidence exists.",
             severity="blocker",
         )
@@ -597,7 +646,7 @@ def surface_blockers() -> list[dict[str, str]]:
         {
             "id": "sampler_scheduler_dispatch",
             "severity": "P1",
-            "blocker": "Z-Image now has bounded DPM++ 2M and UniPC bh2/simple flow-match paths, but generic UniPC/order-3, ancestral, SDE, CFG++, Karras, and the rest of the SwarmUI/Comfy sampler catalog still lack distinct daemon denoise loops.",
+            "blocker": "Z-Image now has bounded DPM++ 2M on SwarmUI/Comfy simple flow-match, generic UniPC bh1/order<=3, and UniPC bh2/simple flow-match paths, but Karras, ancestral, SDE, CFG++, and the rest of the SwarmUI/Comfy sampler catalog still lack distinct daemon denoise loops.",
             "acceptance_gate": "Wire each accepted sampler/scheduler pair into a backend denoise loop and record requested versus executed values with artifact/timing/VRAM evidence.",
         },
         {
@@ -615,7 +664,7 @@ def surface_blockers() -> list[dict[str, str]]:
         {
             "id": "model_dispatch_coverage",
             "severity": "P1",
-            "blocker": "Sampling modules exist for Klein/Flux2, SDXL, SD15, SD3, Chroma, ERNIE, Anima, and LTX2, but real daemon dispatch is limited to Z-Image and Qwen.",
+            "blocker": "Sampling modules exist for Klein/Flux2, SDXL, SD15, SD3, Chroma, ERNIE, Anima, and LTX2, but real daemon dispatch is limited to Z-Image, Qwen, and bounded Ideogram4.",
             "acceptance_gate": "Add real dispatch only after each model has artifact, timing, VRAM, metadata, and sampler/scheduler failure-mode evidence.",
         },
         {

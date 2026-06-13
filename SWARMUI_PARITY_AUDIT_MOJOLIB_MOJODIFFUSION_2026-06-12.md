@@ -41,11 +41,14 @@ needed to build a native single-user SwarmUI-class app without turning Python in
 the product runtime.
 
 However, this is not SwarmUI parity yet. The biggest blocker is no longer just
-"missing UI controls." The product image/video generation path is not consistently
-using the newest mojodiffusion fast kernels. Image model load + denoise remains too
-slow for SwarmUI-level use, video models are broken, and the current daemon/UI path
-does not yet prove that CUDLASS/CUTLASS-class or cuDNN flash kernels are the
-generation path rather than only a trainer/parity path.
+"missing UI controls." Later same-day work added more bounded product evidence:
+the tracked product-path contract now reports `78/78`, Z-Image has measured
+daemon artifacts for generic UniPC, multi-LoRA, variation, and flat img2img,
+Ideogram4 has a bounded native daemon artifact with PNG metadata/gallery
+readback, and LTX2 has bounded video-only and audio-enabled MP4 evidence. Full
+parity remains blocked by speed/quality, Qwen full-generation safety, advanced
+workflow nodes, sampler breadth, graph-native video, and broader runtime/UX
+acceptance for newer bounded paths.
 
 ## Map Files And Source Maps
 
@@ -84,9 +87,10 @@ python3 scripts/check_swarmui_product_path_contract.py --strict
 python3 scripts/check_swarmui_product_path_contract.py --strict-all
 ```
 
-Default mode is report-only. `--strict` fails on P0 product-path blockers; at the
-time of this audit those blockers are expected because image generation is still
-not proven on the fast path and video is still broken.
+Default mode is report-only. At the original audit point `--strict` still failed
+on P0 product-path blockers. Later same-day evidence moved the tracked product
+gate to `78/78`, but `--strict-all` still represents the broader SwarmUI parity
+blockers.
 
 ## Verification Run This Pass
 
@@ -131,7 +135,9 @@ timeout 600 bash -lc 'rm -f /tmp/sdpa_flash_par && pixi run mojo build -I . \
 # ALL GATES PASS. Z-Image B1 padded fwd+bwd speedup: 34.39x; B2 padded: 35.83x.
 
 python3 scripts/check_swarmui_product_path_contract.py --write-readiness /tmp/swarmui_product_path_readiness.json
-# 33 checks, 26 passed, p0=2, p1=4, p2=1
+# Original audit-time run reported P0/P1/P2 blockers; later same-day handoff
+# evidence supersedes this with the tracked product gate at 78/78 while full
+# SwarmUI all-level parity remains blocked.
 ```
 
 Runtime daemon smoke in `stub` mode passed:
@@ -340,13 +346,14 @@ are not complete.
 
 ### Video / Audio
 
-Status: broken/not parity.
+Status: bounded DEV-smoke evidence, not parity.
 
-The user explicitly reported video models are broken. The known LTX2 HQ F32
-random-noise fallback was fixed and `scripts/check_ltx2_dtype_contract.py` now
-passes, but NAVA/LTX2 still do not have an accepted product video path. Components
-and docs are present; a daemon/API/UI path that produces and verifies real MP4
-with audio is not.
+The known LTX2 HQ F32 random-noise fallback was fixed and
+`scripts/check_ltx2_dtype_contract.py` now passes. Later same-day gates added
+bounded LTX2 daemon MP4 evidence for both video-only and audio-enabled A/V
+smokes, with frame/duration/muxing/audio/timing/VRAM fields. That is still not
+an accepted product video path: graph-native video nodes, quality/HQ coverage,
+and broader workflow behavior remain blocked.
 
 Required video gate:
 
@@ -460,8 +467,7 @@ means there is no SwarmUI workflow graph parity yet.
 
 This is an impressive Mojo stack and it is materially ahead of the June 10 docs.
 The native infrastructure is real. The missing piece for SwarmUI parity is now
-product integration and hard generation evidence, especially image/video speed and
-kernel routing. The next credible milestone is not another standalone smoke; it is
-a daemon-driven Z-Image generation that uses the fast CUDLASS/CUTLASS-class path,
-reports timings/VRAM, writes gallery metadata, and produces a real inspectable PNG
-fast enough to compare against the OneTrainer/SwarmUI baseline.
+acceptance-grade breadth and performance: Z-Image speed/quality, Qwen safe full
+generation, Ideogram4 multi-step/speed/option hardening, graph-native video
+beyond LTX2 DEV-smoke MP4s, advanced workflow node families, and
+sampler/scheduler catalog coverage backed by real daemon artifacts.

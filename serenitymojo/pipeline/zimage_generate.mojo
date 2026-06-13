@@ -17,10 +17,10 @@
 # EVERY OTHER NUMERIC CONVENTION IS BYTE-FOR-BYTE PRESERVED (see header of
 # zimage_pipeline.mojo + docs/ZIMAGE_DENOISE_SIGN_CONVENTION.md):
 #   • timestep = (1 - sigma) (DiT ×1000 internally)
-#   • CFG code-form pred_raw = vc + cfg*(vc - vu), then negate before scheduler:
-#       noise_pred = -(vc + cfg*(vc - vu))
+#   • CFG code-form pred_raw = vu + cfg*(vc - vu), then negate before scheduler:
+#       noise_pred = -(vu + cfg*(vc - vu))
 #   • Euler: x += (sigma_next - sigma) * noise_pred  (latent kept F32)
-#   • sigmas: diffusers FlowMatchEuler, shift=6.0 (hardcoded full-f32 table)
+#   • sigmas: Comfy ModelSamplingDiscreteFlow simple scheduler, shift=3.0 default
 #   • encoder: layer-34, cap fed rank-2 [caplen, 2560]
 #   • VAE: scale=0.3611, shift=0.1159 (baked in decoder); PNG SIGNED [-1,1]
 #
@@ -122,7 +122,8 @@ comptime ENC_SEQ = 512        # encoder runs at this supported sdpa seq, sliced 
 comptime CAPLEN_MAX = 256     # comptime cap buffer (multiple of 32 → cap_padded == CAPLEN_MAX)
 comptime PAD_ID = 151643      # Qwen pad token (prepare_l2p PAD_TOKEN_ID); right-pad, causal-masked
 comptime EXTRACT_LAYER = 34   # Qwen3-4B penultimate (Z-Image canonical)
-comptime SHIFT = Float32(6.0) # diffusers scheduler_config.json shift=6.0
+comptime ZIMAGE_DEFAULT_SIGMA_SHIFT = Float32(3.0) # SwarmUI/Comfy ZImage sampling_settings shift
+comptime ZIMAGE_COMFY_TIMESTEPS = 1000
 comptime PI = 6.283185307179586  # 2*pi
 
 # ── default demo config (preserves the original standalone main() image) ──
@@ -444,7 +445,10 @@ def _cfg_pred_overlay[
     if trace:
         trace_t0 = _trace_stage("noise_refiner", trace_t0, ctx)
 
-    if cfg <= Float32(1.0):
+    var cfg_delta = cfg - Float32(1.0)
+    if cfg_delta < Float32(0.0):
+        cfg_delta = -cfg_delta
+    if cfg_delta <= Float32(1.0e-6):
         var vc = _latent_velocity_overlay_from_refined[HL, WL, N_IMG, N_TXT, S](
             xs.copy(), cap_seq_cond,
             cr_blocks, main_blocks, main_mod_dev.copy(), lora,
@@ -475,7 +479,7 @@ def _cfg_pred_overlay[
         _stats("v_cond", vc, ctx)
         _stats("v_uncond", vu, ctx)
 
-    var pred = add(vc, mul_scalar(sub(vc, vu, ctx), cfg, ctx), ctx)
+    var pred = add(vu, mul_scalar(sub(vc, vu, ctx), cfg, ctx), ctx)
     if trace:
         _ = _trace_stage("cfg_combine", trace_t0, ctx)
     return mul_scalar(pred, -1.0, ctx)
@@ -902,34 +906,33 @@ def encode_captions_fixed(
     return cond^.into_pair(uncond^)  # enc + tok freed
 
 
-# ── diffusers FlowMatchEuler sigmas (shift=6.0). Returns a `steps+1`-length list.
-# For steps != 30 we build the analytic schedule (linspace 1→0 over `steps`,
-# then shift = SHIFT*s / (1 + (SHIFT-1)*s)) and append a terminal 0. For the
-# default 30-step base run we return the exact diffusers oracle table VERBATIM
-# (the same hardcoded constants the verified pipeline uses) to preserve numerics.
-def _build_sigmas(steps: Int) raises -> List[Float32]:
-    if steps == 30:
-        var s30: List[Float32] = [
-            1.000000000, 0.994082808, 0.987804890, 0.981132150,
-            0.974026024, 0.966442943, 0.958333373, 0.949640274,
-            0.940298557, 0.930232465, 0.919354916, 0.907563090,
-            0.894736826, 0.880733907, 0.865384579, 0.848484814,
-            0.829787314, 0.808988750, 0.785714269, 0.759493589,
-            0.729729772, 0.695652127, 0.656250000, 0.610169470,
-            0.555555522, 0.489795893, 0.409090906, 0.307692289,
-            0.176470578, 0.000000000, 0.000000000,
-        ]
-        return s30^
-    # Analytic FlowMatchEuler with shift, for non-default step counts. diffusers
-    # spaces the pre-shift grid by 1/(N-1) over N points then appends 0.
+# ── Comfy Z-Image simple sigmas. Returns a `steps+1`-length list.
+# Comfy path:
+#   supported_models.ZImage.sampling_settings = {multiplier: 1.0, shift: 3.0}
+#   ModelSamplingDiscreteFlow.set_parameters(timesteps=1000)
+#   samplers.simple_scheduler(model_sampling, steps)
+def _build_sigmas_with_shift(steps: Int, sigma_shift: Float32) raises -> List[Float32]:
+    if steps <= 0:
+        raise Error("zimage: sigma schedule steps must be > 0")
+    if sigma_shift <= Float32(0.0):
+        raise Error("zimage: sigma_shift must be > 0")
     var out = List[Float32](capacity=steps + 1)
-    var n = steps
-    for i in range(n):
-        var lin = Float32(1.0) - Float32(i) / Float32(n - 1) if n > 1 else Float32(1.0)
-        var sh = (SHIFT * lin) / (Float32(1.0) + (SHIFT - Float32(1.0)) * lin)
-        out.append(sh)
+    var stride = Float64(ZIMAGE_COMFY_TIMESTEPS) / Float64(steps)
+    for i in range(steps):
+        # Mirrors Python: s.sigmas[-(1 + int(x * ss))]. The selected
+        # 1-based timestep is 1000 - floor(x * ss).
+        var timestep_index = ZIMAGE_COMFY_TIMESTEPS - Int(Float64(i) * stride)
+        var t = Float32(timestep_index) / Float32(ZIMAGE_COMFY_TIMESTEPS)
+        var sigma = (
+            sigma_shift * t
+        ) / (Float32(1.0) + (sigma_shift - Float32(1.0)) * t)
+        out.append(sigma)
     out.append(Float32(0.0))
     return out^
+
+
+def _build_sigmas(steps: Int) raises -> List[Float32]:
+    return _build_sigmas_with_shift(steps, ZIMAGE_DEFAULT_SIGMA_SHIFT)
 
 
 # ── CFG denoise: dual DiT forward + diffusers CFG + scheduler sign flip ──
@@ -1009,7 +1012,7 @@ def _denoise[HL: Int, WL: Int](
     var x = Tensor.from_host(noise, nshape^, STDtype.BF16, ctx)
 
     var sigmas = _build_sigmas(steps)
-    print("[denoise]", steps, "steps, shift", SHIFT, "CFG", cfg, "seed", seed)
+    print("[denoise]", steps, "steps, shift", ZIMAGE_DEFAULT_SIGMA_SHIFT, "CFG", cfg, "seed", seed)
     var trace_stats = trace_denoise
     if trace_stats:
         _stats("init_noise", x, ctx)

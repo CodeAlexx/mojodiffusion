@@ -66,6 +66,7 @@ from sqlite.value import Value
 from serenitymojo.sampling.sampler_registry import (
     default_generation_model, default_sampler_for_backend,
     default_scheduler_for_backend, sampler_backend_for_model,
+    sampler_admission_for_backend, scheduler_admission_for_backend,
     swarmui_sampler_registry_json,
 )
 from serenitymojo.io.ffi import sys_open, sys_close, file_size, O_RDONLY
@@ -76,6 +77,7 @@ from serenitymojo.serve.model_scan import (
 from serenitymojo.serve.video_api import (
     ltx2_staged_smoke_video_result, probe_video_file, video_readiness_doc,
 )
+from serenitymojo.serve.workflow_graph import apply_workflow_params as apply_workflow_graph_params
 from serenitymojo.serve.stub_backend import StubBackend
 from serenitymojo.serve.zimage_backend import ZImageBackend
 from serenitymojo.serve.dispatch_backend import DispatchBackend
@@ -255,6 +257,276 @@ def _copy_field_if_missing(
         _set_if_missing(dst, dst_key, src[src_key])
 
 
+def _workflow_node_type(node: JSONValue) raises -> String:
+    var typ = _workflow_string(node, String("type"))
+    if typ == "":
+        typ = _workflow_string(node, String("type_id"))
+    return typ^
+
+
+def _workflow_node_mode(node: JSONValue) raises -> Int:
+    if not node.is_object() or not node.contains("mode") or node["mode"].is_null():
+        return 0
+    if node["mode"].is_int():
+        return node["mode"].as_int()
+    if node["mode"].is_number():
+        return Int(node["mode"].as_float())
+    return 0
+
+
+def _workflow_widget_string(widgets: JSONValue, idx: Int, dflt: String) raises -> String:
+    if not widgets.is_array() or idx < 0 or idx >= widgets.length() or widgets[idx].is_null():
+        return dflt
+    if widgets[idx].is_string():
+        return widgets[idx].as_string()
+    if widgets[idx].is_int():
+        return String(widgets[idx].as_int())
+    if widgets[idx].is_number():
+        return String(widgets[idx].as_float())
+    return dflt
+
+
+def _workflow_widget_int(widgets: JSONValue, idx: Int, dflt: Int) raises -> Int:
+    if not widgets.is_array() or idx < 0 or idx >= widgets.length() or widgets[idx].is_null():
+        return dflt
+    if widgets[idx].is_int():
+        return widgets[idx].as_int()
+    if widgets[idx].is_number():
+        return Int(widgets[idx].as_float())
+    if widgets[idx].is_string():
+        try:
+            return Int(widgets[idx].as_string())
+        except:
+            pass
+    return dflt
+
+
+def _workflow_widget_float(widgets: JSONValue, idx: Int, dflt: Float64) raises -> Float64:
+    if not widgets.is_array() or idx < 0 or idx >= widgets.length() or widgets[idx].is_null():
+        return dflt
+    if widgets[idx].is_number():
+        return widgets[idx].as_float()
+    if widgets[idx].is_int():
+        return Float64(widgets[idx].as_int())
+    if widgets[idx].is_string():
+        try:
+            return Float64(widgets[idx].as_string())
+        except:
+            pass
+    return dflt
+
+
+def _workflow_has_prompt_override(mut obj: JSONValue) raises -> Bool:
+    if obj.contains("prompt") and obj["prompt"].is_string() and obj["prompt"].as_string() != "":
+        return True
+    if obj.contains("prompt_raw") and obj["prompt_raw"].is_string() and obj["prompt_raw"].as_string() != "":
+        _set_if_missing(obj, String("prompt"), obj["prompt_raw"])
+        return True
+    return False
+
+
+def _workflow_set_seed_from_widget_if_missing(mut obj: JSONValue, seed: Int) raises:
+    if obj.contains("seed") and not obj["seed"].is_null():
+        return
+    if seed < 0:
+        raise Error(
+            "[501] Ideogram4 Comfy export uses randomized seed; provide top-level seed"
+        )
+    if seed > 4294967295:
+        raise Error(
+            "[501] Ideogram4 Comfy export seed exceeds the daemon uint32 seed range; provide top-level seed"
+        )
+    _set_if_missing(obj, String("seed"), JSONValue.from_int(seed))
+
+
+def _ideogram4_mode_steps(mode: String) raises -> Int:
+    if mode == "Quality":
+        return 48
+    if mode == "Default":
+        return 20
+    if mode == "Turbo":
+        return 12
+    raise Error("[501] unsupported Ideogram4 workflow mode: " + mode)
+
+
+def _looks_like_ideogram4_comfy_ui_export(wf: JSONValue) raises -> Bool:
+    if not wf.is_object() or not wf.contains("nodes") or not wf["nodes"].is_array():
+        return False
+    if not wf.contains("links") or not wf["links"].is_array():
+        return False
+    if not wf.contains("definitions") or not wf["definitions"].is_object():
+        return False
+    var defs = wf["definitions"]
+    if not defs.contains("subgraphs") or not defs["subgraphs"].is_array():
+        return False
+    var subgraphs = defs["subgraphs"]
+    for i in range(subgraphs.length()):
+        var sg = subgraphs[i]
+        var name = String(_workflow_string(sg, String("name")).lower())
+        if name.find("ideogram") >= 0:
+            return True
+    return False
+
+
+def _apply_ideogram4_comfy_ui_export(mut obj: JSONValue, wf: JSONValue) raises:
+    """Import the bounded Comfy UI Ideogram4 txt2img canvas shape.
+
+    This is intentionally not a general Comfy interpreter. The prompt-builder
+    subgraph requires external Gemma/KJ execution, so a real prompt override is
+    required and the sampler/scheduler fields are flattened only for the known
+    Ideogram4 text-to-image subgraph.
+    """
+    if not _workflow_has_prompt_override(obj):
+        raise Error(
+            "[501] Ideogram4 Comfy export uses a prompt-builder subgraph; provide top-level prompt or prompt_raw"
+        )
+
+    var root_nodes = wf["nodes"]
+    for i in range(root_nodes.length()):
+        var node = root_nodes[i]
+        if not node.is_object():
+            raise Error("[501] Ideogram4 Comfy export root node must be an object")
+        var typ = _workflow_node_type(node)
+        var mode = _workflow_node_mode(node)
+        if typ == "LoraLoaderModelOnly":
+            if mode != 4:
+                raise Error(
+                    "[501] Ideogram4 Comfy export has active LoRA nodes, but the current Ideogram4 backend does not execute LoRA"
+                )
+        elif typ == "Seed (rgthree)":
+            var widgets = JSONValue.new_array()
+            if node.contains("widgets_values") and node["widgets_values"].is_array():
+                widgets = node["widgets_values"]
+            _workflow_set_seed_from_widget_if_missing(obj, _workflow_widget_int(widgets, 0, -1))
+        elif (
+            typ == "MarkdownNote"
+            or typ == "SaveImage"
+            or typ == "ResolutionSelector"
+            or typ == "PreviewAny"
+            or typ == "Ideogram4PromptBuilderKJ"
+            or typ == "83e6e004-48ea-408e-9024-eb49c3d7dc14"
+            or typ == "f5f04613-ee09-4cd9-9ada-a880360891d4"
+        ):
+            pass
+        else:
+            if mode != 4:
+                raise Error("[501] unsupported active Ideogram4 Comfy root node: " + typ)
+
+    var defs = wf["definitions"]
+    var subgraphs = defs["subgraphs"]
+    var found = False
+    var sg_nodes = JSONValue.new_array()
+    for i in range(subgraphs.length()):
+        var sg = subgraphs[i]
+        var name = String(_workflow_string(sg, String("name")).lower())
+        if name.find("text to image") >= 0 and name.find("ideogram") >= 0:
+            if not sg.contains("nodes") or not sg["nodes"].is_array():
+                raise Error("[501] Ideogram4 Comfy export subgraph missing nodes")
+            sg_nodes = sg["nodes"]
+            found = True
+            break
+    if not found:
+        raise Error("[501] Ideogram4 Comfy export missing Text to Image (Ideogram v4) subgraph")
+
+    var saw_empty_latent = False
+    var saw_cond_model = False
+    var saw_uncond_model = False
+    var saw_clip = False
+    var saw_vae = False
+    var saw_sampler = False
+    var saw_scheduler = False
+    var saw_aura = False
+    var saw_guider = False
+    var saw_cfg_override = False
+    var saw_prompt_encode = False
+    var selected_mode = String("Default")
+
+    for i in range(sg_nodes.length()):
+        var node = sg_nodes[i]
+        if not node.is_object():
+            raise Error("[501] Ideogram4 Comfy export subgraph node must be an object")
+        var typ = _workflow_node_type(node)
+        var mode = _workflow_node_mode(node)
+        if mode == 4:
+            continue
+        var widgets = JSONValue.new_array()
+        if node.contains("widgets_values") and node["widgets_values"].is_array():
+            widgets = node["widgets_values"]
+
+        if typ == "EmptyFlux2LatentImage":
+            _set_if_missing(obj, String("width"), JSONValue.from_int(_workflow_widget_int(widgets, 0, 1024)))
+            _set_if_missing(obj, String("height"), JSONValue.from_int(_workflow_widget_int(widgets, 1, 1024)))
+            _set_if_missing(obj, String("images"), JSONValue.from_int(_workflow_widget_int(widgets, 2, 1)))
+            saw_empty_latent = True
+        elif typ == "UNETLoader":
+            var name = _workflow_widget_string(widgets, 0, String(""))
+            var lower = String(name.lower())
+            if lower.find("ideogram4_unconditional") >= 0:
+                saw_uncond_model = True
+            elif lower.find("ideogram4") >= 0:
+                saw_cond_model = True
+                _set_if_missing(obj, String("model"), JSONValue.from_string(String("ideogram-4-fp8")))
+        elif typ == "CLIPLoader":
+            var clip_name = String(_workflow_widget_string(widgets, 0, String("")).lower())
+            if clip_name.find("qwen3vl") >= 0:
+                saw_clip = True
+        elif typ == "VAELoader":
+            var vae_name = String(_workflow_widget_string(widgets, 0, String("")).lower())
+            if vae_name.find("flux2") >= 0:
+                saw_vae = True
+        elif typ == "CLIPTextEncode":
+            saw_prompt_encode = True
+        elif typ == "KSamplerSelect":
+            _set_if_missing(obj, String("sampler"), JSONValue.from_string(_workflow_widget_string(widgets, 0, String("euler"))))
+            saw_sampler = True
+        elif typ == "BasicScheduler":
+            _set_if_missing(obj, String("scheduler"), JSONValue.from_string(_workflow_widget_string(widgets, 0, String("simple"))))
+            saw_scheduler = True
+        elif typ == "ModelSamplingAuraFlow":
+            _set_if_missing(obj, String("sigma_shift"), JSONValue.from_float(_workflow_widget_float(widgets, 0, 5.0)))
+            saw_aura = True
+        elif typ == "DualModelGuider":
+            _set_if_missing(obj, String("cfg"), JSONValue.from_float(_workflow_widget_float(widgets, 0, 7.0)))
+            saw_guider = True
+        elif typ == "CFGOverride":
+            _set_if_missing(obj, String("cfg_override"), JSONValue.from_float(_workflow_widget_float(widgets, 0, 3.0)))
+            _set_if_missing(obj, String("cfg_override_start_percent"), JSONValue.from_float(_workflow_widget_float(widgets, 1, 0.7)))
+            _set_if_missing(obj, String("cfg_override_end_percent"), JSONValue.from_float(_workflow_widget_float(widgets, 2, 1.0)))
+            saw_cfg_override = True
+        elif typ == "CustomCombo":
+            selected_mode = _workflow_widget_string(widgets, 0, selected_mode)
+        elif (
+            typ == "ConditioningZeroOut"
+            or typ == "SamplerCustomAdvanced"
+            or typ == "VAEDecode"
+            or typ == "RandomNoise"
+            or typ == "PrimitiveInt"
+            or typ == "ComfyMathExpression"
+            or typ == "JsonExtractString"
+            or typ == "StringReplace"
+            or typ == "ComfyNumberConvert"
+        ):
+            pass
+        else:
+            raise Error("[501] unsupported Ideogram4 Comfy subgraph node: " + typ)
+
+    _set_if_missing(obj, String("steps"), JSONValue.from_int(_ideogram4_mode_steps(selected_mode)))
+    if not (
+        saw_empty_latent
+        and saw_cond_model
+        and saw_uncond_model
+        and saw_clip
+        and saw_vae
+        and saw_sampler
+        and saw_scheduler
+        and saw_aura
+        and saw_guider
+        and saw_cfg_override
+        and saw_prompt_encode
+    ):
+        raise Error("[501] Ideogram4 Comfy export is missing required txt2img sampler nodes")
+
+
 @fieldwise_init
 struct WorkflowLink(Copyable, Movable):
     var found: Bool
@@ -415,6 +687,8 @@ def _apply_workflow_graph_ir(mut obj: JSONValue, wf: JSONValue) raises:
             type_id == "CheckpointLoaderSimple"
             or type_id == "CLIPTextEncode"
             or type_id == "EmptyLatentImage"
+            or type_id == "EmptySD3LatentImage"
+            or type_id == "ModelSamplingAuraFlow"
             or type_id == "KSampler"
             or type_id == "VAEDecode"
             or type_id == "SaveImage"
@@ -466,7 +740,7 @@ def _apply_workflow_graph_ir(mut obj: JSONValue, wf: JSONValue) raises:
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("VAE"), String("VAE"))
                 model_nodes.append(node_id); model_ports.append(String("MODEL")); model_names.append(model_name)
                 done[i] = True; remaining -= 1; progressed = True
-            elif type_id == "EmptyLatentImage":
+            elif type_id == "EmptyLatentImage" or type_id == "EmptySD3LatentImage":
                 var width = _opt_int(fields, "width", 512, 16, 2048)
                 var height = _opt_int(fields, "height", 512, 16, 2048)
                 var images = _opt_int(fields, "batch_size", 1, 1, 64)
@@ -489,6 +763,18 @@ def _apply_workflow_graph_ir(mut obj: JSONValue, wf: JSONValue) raises:
                         done[i] = True; remaining -= 1; progressed = True
                 else:
                     raise Error("[501] workflow graph CLIPTextEncode missing clip input")
+            elif type_id == "ModelSamplingAuraFlow":
+                var model_link = _workflow_find_input_link(edges, node_id, String("model"))
+                if not model_link.found:
+                    raise Error("[501] workflow graph ModelSamplingAuraFlow missing model input")
+                var ready = _workflow_value_index(value_nodes, value_ports, model_link.node_id, model_link.port) >= 0
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, model_link, String("MODEL"), String("model"))
+                    _copy_field_if_missing(obj, fields, String("shift"), String("sigma_shift"))
+                    var model_name = _workflow_model_name(model_nodes, model_ports, model_names, model_link)
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MODEL"), String("MODEL"))
+                    model_nodes.append(node_id); model_ports.append(String("MODEL")); model_names.append(model_name)
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "KSampler":
                 var model_link = _workflow_find_input_link(edges, node_id, String("model"))
                 var pos_link = _workflow_find_input_link(edges, node_id, String("positive"))
@@ -574,17 +860,25 @@ def _apply_workflow_params(mut obj: JSONValue) raises:
     cannot mistake partial graph parity for full SwarmUI workflow parity.
     """
     if not obj.contains("workflow") or obj["workflow"].is_null():
+        if _looks_like_ideogram4_comfy_ui_export(obj):
+            var wf_copy = obj.copy()
+            _apply_ideogram4_comfy_ui_export(obj, wf_copy)
         return
     var wf = obj["workflow"]
     if not wf.is_object():
         raise Error("[501] workflow graph body must be an object")
 
+    if _looks_like_ideogram4_comfy_ui_export(wf):
+        _apply_ideogram4_comfy_ui_export(obj, wf)
+        return
+
     if wf.contains("params") and wf["params"].is_object():
         var params = wf["params"]
         var keys: List[String] = [
             "model", "prompt", "prompt_raw", "negative", "width", "height",
-            "steps", "seed", "cfg", "sampler", "scheduler", "variation_seed",
-            "variation_strength", "images", "init_image", "creativity",
+            "steps", "seed", "cfg", "cfg_override", "cfg_override_start_percent",
+            "cfg_override_end_percent", "sampler", "scheduler", "sigma_shift",
+            "variation_seed", "variation_strength", "images", "init_image", "mask_image", "creativity",
             "lora",
         ]
         for i in range(len(keys)):
@@ -595,8 +889,9 @@ def _apply_workflow_params(mut obj: JSONValue) raises:
         var params = wf["genparams"]
         var keys: List[String] = [
             "model", "prompt", "prompt_raw", "negative", "width", "height",
-            "steps", "seed", "cfg", "sampler", "scheduler", "variation_seed",
-            "variation_strength", "images", "init_image", "creativity",
+            "steps", "seed", "cfg", "cfg_override", "cfg_override_start_percent",
+            "cfg_override_end_percent", "sampler", "scheduler", "sigma_shift",
+            "variation_seed", "variation_strength", "images", "init_image", "mask_image", "creativity",
             "lora",
         ]
         for i in range(len(keys)):
@@ -632,7 +927,7 @@ def _apply_workflow_params(mut obj: JSONValue) raises:
                 else:
                     _set_if_missing(obj, String("prompt"), JSONValue.from_string(text))
                     saw_prompt = True
-        elif type_id == "EmptyLatentImage":
+        elif type_id == "EmptyLatentImage" or type_id == "EmptySD3LatentImage":
             _copy_field_if_missing(obj, fields, String("width"), String("width"))
             _copy_field_if_missing(obj, fields, String("height"), String("height"))
             _copy_field_if_missing(obj, fields, String("batch_size"), String("images"))
@@ -643,6 +938,8 @@ def _apply_workflow_params(mut obj: JSONValue) raises:
             _copy_field_if_missing(obj, fields, String("sampler_name"), String("sampler"))
             _copy_field_if_missing(obj, fields, String("scheduler"), String("scheduler"))
             _copy_field_if_missing(obj, fields, String("denoise"), String("creativity"))
+        elif type_id == "ModelSamplingAuraFlow":
+            _copy_field_if_missing(obj, fields, String("shift"), String("sigma_shift"))
         elif (
             type_id == "VAEDecode"
             or type_id == "SaveImage"
@@ -905,7 +1202,7 @@ def parse_generate(
     var obj = loads(body)
     if not obj.is_object():
         raise Error("body must be a JSON object")
-    _apply_workflow_params(obj)
+    apply_workflow_graph_params(obj)
     var p = JobParams()
     p.job_id = job_id
     p.out_dir = out_dir
@@ -915,12 +1212,22 @@ def parse_generate(
     if prompt_input == "":
         raise Error("'prompt' must be non-empty")
     p.model = _opt_str(obj, "model", default_generation_model(default_model))
+    var sampler_backend = sampler_backend_for_model(p.model, default_model)
     p.negative = _opt_str(obj, "negative", String(""))
-    p.width = _opt_int(obj, "width", 512, 16, 2048)
-    p.height = _opt_int(obj, "height", 512, 16, 2048)
+    var default_width = 512
+    var default_height = 512
+    if sampler_backend == "zimage" or sampler_backend == "ideogram4" or sampler_backend == "flux2":
+        default_width = 1024
+        default_height = 1024
+    p.width = _opt_int(obj, "width", default_width, 16, 2048)
+    p.height = _opt_int(obj, "height", default_height, 16, 2048)
     p.steps = _opt_int(obj, "steps", 20, 1, 500)
     p.seed = _opt_int(obj, "seed", 0, 0, 4294967295)
     p.cfg = _opt_num(obj, "cfg", 4.5, 0.0, 50.0)
+    p.cfg_override = _opt_num(obj, "cfg_override", -1.0, -1.0, 50.0)
+    p.cfg_override_start_percent = _opt_num(obj, "cfg_override_start_percent", 0.0, 0.0, 1.0)
+    p.cfg_override_end_percent = _opt_num(obj, "cfg_override_end_percent", 1.0, 0.0, 1.0)
+    p.sigma_shift = _opt_num(obj, "sigma_shift", 3.0, 0.000001, 100.0)
     # P9/P10: prompt syntax is parsed in the daemon product path. Backends get
     # resolved plain text; the raw text plus parser metadata persist in PNG
     # genparams so reuse-params can restore the authored prompt.
@@ -931,7 +1238,6 @@ def parse_generate(
         raise Error("'prompt' resolved to an empty prompt")
     # Sampler-facing fields ride the typed backend contract as well as the
     # canonical genparams JSON. Backends must execute them or fail loud.
-    var sampler_backend = sampler_backend_for_model(p.model, default_model)
     p.sampler = _opt_str(obj, "sampler", default_sampler_for_backend(sampler_backend))
     p.scheduler = _opt_str(obj, "scheduler", default_scheduler_for_backend(sampler_backend))
     if p.sampler == "":
@@ -948,6 +1254,27 @@ def parse_generate(
     # P7 img2img: init image path + creativity (0..1). The backend decides
     # whether/how to honor them (stub echoes; zimage does real img2img).
     p.init_image = _opt_str(obj, "init_image", String(""))
+    p.mask_image = _opt_str(obj, "mask_image", String(""))
+    p.lanpaint_mask_channel = _opt_str(obj, "lanpaint_mask_channel", String(""))
+    p.lanpaint_mask_blend_overlap = _opt_int(obj, "lanpaint_mask_blend_overlap", -1, -1, 4096)
+    p.lanpaint_num_steps = _opt_int(obj, "lanpaint_num_steps", -1, -1, 4096)
+    p.lanpaint_lambda = _opt_num(obj, "lanpaint_lambda", -1.0, -1.0, 100000.0)
+    p.lanpaint_step_size = _opt_num(obj, "lanpaint_step_size", -1.0, -1.0, 100000.0)
+    p.lanpaint_beta = _opt_num(obj, "lanpaint_beta", -1.0, -1.0, 100000.0)
+    p.lanpaint_friction = _opt_num(obj, "lanpaint_friction", -1.0, -1.0, 100000.0)
+    p.lanpaint_prompt_mode = _opt_str(obj, "lanpaint_prompt_mode", String(""))
+    p.lanpaint_inpainting_mode = _opt_str(obj, "lanpaint_inpainting_mode", String(""))
+    p.lanpaint_add_noise = _opt_str(obj, "lanpaint_add_noise", String(""))
+    p.lanpaint_noise_seed = _opt_int(obj, "lanpaint_noise_seed", -1, -1, 4294967295)
+    p.lanpaint_start_at_step = _opt_int(obj, "lanpaint_start_at_step", -1, -1, 1000000)
+    p.lanpaint_end_at_step = _opt_int(obj, "lanpaint_end_at_step", -1, -1, 1000000)
+    p.lanpaint_return_with_leftover_noise = _opt_str(obj, "lanpaint_return_with_leftover_noise", String(""))
+    p.lanpaint_early_stop = _opt_int(obj, "lanpaint_early_stop", -1, -1, 1)
+    p.lanpaint_inner_threshold = _opt_num(obj, "lanpaint_inner_threshold", -1.0, -1.0, 100000.0)
+    p.lanpaint_inner_patience = _opt_int(obj, "lanpaint_inner_patience", -1, -1, 1000000)
+    p.reference_image = _opt_str(obj, "reference_image", String(""))
+    p.reference_latent_method = _opt_str(obj, "reference_latent_method", String(""))
+    p.reference_latent_count = _opt_int(obj, "reference_latent_count", 0, 0, 64)
     p.creativity = _opt_num(obj, "creativity", 0.5, 0.0, 1.0)
     if obj.contains("lora") and not obj["lora"].is_null():
         var arr = obj["lora"]
@@ -964,6 +1291,46 @@ def parse_generate(
     for i in range(len(prompt_syntax.loras)):
         if not _has_lora(p.loras, prompt_syntax.loras[i].name):
             p.loras.append(prompt_syntax.loras[i].copy())
+    if sampler_backend == "ideogram4":
+        var sampler_admission = sampler_admission_for_backend(String("ideogram4"), p.sampler)
+        if not sampler_admission.supported:
+            raise Error(
+                String("ideogram4: unsupported sampler '") + p.sampler
+                + String("'; ") + sampler_admission.reason
+            )
+        var scheduler_admission = scheduler_admission_for_backend(String("ideogram4"), p.scheduler)
+        if not scheduler_admission.supported:
+            raise Error(
+                String("ideogram4: unsupported scheduler '") + p.scheduler
+                + String("'; ") + scheduler_admission.reason
+            )
+        if not (p.width == 1024 and p.height == 1024):
+            raise Error(
+                String("ideogram4: unsupported size ") + String(p.width)
+                + "x" + String(p.height)
+                + " -- only 1024x1024 is served by the current fixed-shape path"
+            )
+        if p.negative.byte_length() > 0:
+            raise Error("ideogram4: negative prompt is not supported in this bounded slice")
+        if len(p.loras) > 0:
+            raise Error("ideogram4: LoRA is not supported in this bounded slice")
+        if p.init_image.byte_length() > 0:
+            raise Error("ideogram4: img2img/init image is not supported in this bounded slice")
+        if p.mask_image.byte_length() > 0:
+            raise Error("ideogram4: SetLatentNoiseMask/inpaint mask is not supported in this bounded slice")
+        if p.reference_image.byte_length() > 0 or p.reference_latent_count > 0:
+            raise Error("ideogram4: ReferenceLatent/reference image conditioning is not supported in this bounded slice")
+        if p.creativity != 0.5:
+            raise Error("ideogram4: creativity/denoise control is not supported in this bounded txt2img slice")
+        if p.variation_strength > 0.0:
+            raise Error("ideogram4: variation noise is not supported in this bounded slice")
+        if p.cfg <= 0.0:
+            raise Error("ideogram4: cfg must be positive")
+        if p.cfg_override >= 0.0:
+            if p.cfg_override == 0.0:
+                raise Error("ideogram4: cfg_override must be positive when set")
+            if p.cfg_override_start_percent > p.cfg_override_end_percent:
+                raise Error("ideogram4: cfg_override_start_percent must be <= cfg_override_end_percent")
 
     # canonical full-param JSON: persisted to the sidecar + jobs.db
     # (key order mirrors the UI's serenity.genparams.v1 emitter, with the
@@ -981,14 +1348,39 @@ def parse_generate(
     o.set("steps", JSONValue.from_int(p.steps))
     o.set("seed", JSONValue.from_int(p.seed))
     o.set("cfg", JSONValue.from_float(p.cfg))
+    o.set("cfg_override", JSONValue.from_float(p.cfg_override))
+    o.set("cfg_override_start_percent", JSONValue.from_float(p.cfg_override_start_percent))
+    o.set("cfg_override_end_percent", JSONValue.from_float(p.cfg_override_end_percent))
     o.set("sampler", JSONValue.from_string(p.sampler))
     o.set("scheduler", JSONValue.from_string(p.scheduler))
+    o.set("sigma_shift", JSONValue.from_float(p.sigma_shift))
     o.set("variation_seed", JSONValue.from_int(p.variation_seed))
     o.set("variation_strength", JSONValue.from_float(p.variation_strength))
     o.set("images", JSONValue.from_int(p.images))
     o.set("image_index", JSONValue.from_int(p.image_index))
     o.set("image_count", JSONValue.from_int(p.image_count))
     o.set("init_image", JSONValue.from_string(p.init_image))
+    o.set("mask_image", JSONValue.from_string(p.mask_image))
+    o.set("lanpaint_mask_channel", JSONValue.from_string(p.lanpaint_mask_channel))
+    o.set("lanpaint_mask_blend_overlap", JSONValue.from_int(p.lanpaint_mask_blend_overlap))
+    o.set("lanpaint_num_steps", JSONValue.from_int(p.lanpaint_num_steps))
+    o.set("lanpaint_lambda", JSONValue.from_float(p.lanpaint_lambda))
+    o.set("lanpaint_step_size", JSONValue.from_float(p.lanpaint_step_size))
+    o.set("lanpaint_beta", JSONValue.from_float(p.lanpaint_beta))
+    o.set("lanpaint_friction", JSONValue.from_float(p.lanpaint_friction))
+    o.set("lanpaint_prompt_mode", JSONValue.from_string(p.lanpaint_prompt_mode))
+    o.set("lanpaint_inpainting_mode", JSONValue.from_string(p.lanpaint_inpainting_mode))
+    o.set("lanpaint_add_noise", JSONValue.from_string(p.lanpaint_add_noise))
+    o.set("lanpaint_noise_seed", JSONValue.from_int(p.lanpaint_noise_seed))
+    o.set("lanpaint_start_at_step", JSONValue.from_int(p.lanpaint_start_at_step))
+    o.set("lanpaint_end_at_step", JSONValue.from_int(p.lanpaint_end_at_step))
+    o.set("lanpaint_return_with_leftover_noise", JSONValue.from_string(p.lanpaint_return_with_leftover_noise))
+    o.set("lanpaint_early_stop", JSONValue.from_int(p.lanpaint_early_stop))
+    o.set("lanpaint_inner_threshold", JSONValue.from_float(p.lanpaint_inner_threshold))
+    o.set("lanpaint_inner_patience", JSONValue.from_int(p.lanpaint_inner_patience))
+    o.set("reference_image", JSONValue.from_string(p.reference_image))
+    o.set("reference_latent_method", JSONValue.from_string(p.reference_latent_method))
+    o.set("reference_latent_count", JSONValue.from_int(p.reference_latent_count))
     o.set("creativity", JSONValue.from_float(p.creativity))
     var la = JSONValue.new_array()
     for i in range(len(p.loras)):
@@ -1002,6 +1394,11 @@ def parse_generate(
     _copy_optional_string_json_field(o, obj, String("reused_from_gallery_id"))
     _copy_optional_string_json_field(o, obj, String("reused_from_path"))
     _copy_optional_string_json_field(o, obj, String("reused_from_job_id"))
+    _copy_optional_string_json_field(o, obj, String("workflow_schema"))
+    _copy_optional_string_json_field(o, obj, String("workflow_executor"))
+    _copy_optional_string_json_field(o, obj, String("workflow_source"))
+    _copy_json_field_if_present(o, obj, String("workflow_node_count"))
+    _copy_json_field_if_present(o, obj, String("workflow_edge_count"))
     p.params_json = dumps(o)
     return p^
 
@@ -3198,7 +3595,7 @@ def main() raises:
                   switching fit in 24 GB.
 
     Internal (fork+execv target, not user-facing):
-    * worker <kind> <fd> — run ONE backend (stub|zimage|qwenimage) over the
+    * worker <kind> <fd> — run ONE backend (stub|zimage|qwenimage|ideogram4|klein) over the
                   inherited socket `fd` instead of HTTP. Spawned by `isolated`."""
     var args = argv()
     # Internal worker entry MUST be handled before port/mode parsing (its extra

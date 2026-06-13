@@ -58,8 +58,12 @@ def _json_escape_local(s: String) raises -> String:
 
 def _backend_key(backend_name: String) -> String:
     var b = String(backend_name.lower())
+    if b == "flux2" or b == "flux-2" or b.find("klein") >= 0 or b.find("flux2") >= 0 or b.find("flux-2") >= 0:
+        return String("flux2")
     if b == "qwen" or b == "qwenimage" or b.find("qwen") >= 0:
         return String("qwenimage")
+    if b == "ideogram" or b == "ideogram4" or b.find("ideogram") >= 0:
+        return String("ideogram4")
     if (
         b == "zimage"
         or b == "z-image"
@@ -78,6 +82,10 @@ def _backend_key(backend_name: String) -> String:
 
 def sampler_backend_for_model(model_name: String, default_backend: String) -> String:
     var m = String(model_name.lower())
+    if m.find("ideogram") >= 0:
+        return String("ideogram4")
+    if m.find("klein") >= 0 or m.find("flux2") >= 0 or m.find("flux-2") >= 0:
+        return String("flux2")
     if m.find("qwen") >= 0:
         return String("qwenimage")
     if m.find("zimage") >= 0 or m.find("z-image") >= 0 or m.find("z_image") >= 0:
@@ -91,6 +99,8 @@ def default_generation_model(default_backend: String) -> String:
     var b = _backend_key(default_backend)
     if b == "qwenimage":
         return String("qwen-image-2512")
+    if b == "ideogram4":
+        return String("ideogram-4-fp8")
     if b == "zimage":
         return String("zimage_base")
     return default_backend
@@ -98,13 +108,17 @@ def default_generation_model(default_backend: String) -> String:
 
 def default_sampler_for_backend(backend_name: String) -> String:
     var b = _backend_key(backend_name)
-    if b == "zimage" or b == "qwenimage":
+    if b == "zimage" or b == "qwenimage" or b == "ideogram4":
         return String("euler")
     return String("euler")
 
 
 def default_scheduler_for_backend(backend_name: String) -> String:
     var b = _backend_key(backend_name)
+    if b == "ideogram4":
+        return String("logitnormal")
+    if b == "flux2":
+        return String("flux2")
     if b == "zimage" or b == "qwenimage":
         return String("simple")
     return String("normal")
@@ -133,6 +147,8 @@ def normalize_scheduler_name(name: String) -> String:
         return String("simple")
     if n == "qwen_flowmatch":
         return String("qwen")
+    if n == "logitnormal" or n == "logit_normal" or n == "ideogram_logitnormal" or n == "ideogram4_logitnormal":
+        return String("ideogram_logitnormal")
     return n^
 
 
@@ -178,6 +194,18 @@ def sampler_admission_for_backend(
                     + "path on the simple flow-match sigma schedule"
                 ),
             )
+        if normalized == "uni_pc":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("uni_pc"),
+                String(
+                    "backend executes the bounded Z-Image generic Comfy UniPC "
+                    + "bh1/order<=3 path on the simple flow-match sigma schedule"
+                ),
+            )
         return SamplerAdmission(
             False,
             b,
@@ -186,7 +214,7 @@ def sampler_admission_for_backend(
             String(""),
             String(
                 "Z-Image currently supports only euler/flowmatch_euler and "
-                + "bounded dpmpp_2m/uni_pc_bh2 aliases; generic UniPC, "
+                + "bounded dpmpp_2m/uni_pc/uni_pc_bh2 aliases; "
                 + "ancestral/SDE/CFG++ catalog names "
                 + "remain fail-loud until their distinct denoise loops have "
                 + "artifact evidence"
@@ -212,6 +240,41 @@ def sampler_admission_for_backend(
                 "Qwen-Image currently supports only euler/flowmatch_euler aliases; "
                 + "DPM++/UniPC/ancestral/SDE catalog names remain fail-loud until "
                 + "their distinct denoise loops have artifact evidence"
+            ),
+        )
+    if b == "ideogram4":
+        if normalized == "euler" or normalized == "flowmatch_euler":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("ideogram4_logitnormal_euler"),
+                String("backend executes the bounded Ideogram-4 logit-normal Euler path"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String(
+                "Ideogram-4 currently supports only euler/flowmatch_euler sampler "
+                + "aliases over its explicit logit-normal Euler loop; DPM++/UniPC/"
+                + "ancestral/SDE catalog names remain fail-loud until artifact evidence exists"
+            ),
+        )
+    if b == "flux2":
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String(
+                "Flux2/Klein daemon backend route exists, but sampler execution "
+                + "is blocked until the Qwen3 cap-cache/ReferenceLatent bridge "
+                + "feeds the existing Klein staged sampler"
             ),
         )
     return SamplerAdmission(
@@ -249,7 +312,7 @@ def scheduler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Z-Image currently supports only the simple flow-match schedule; "
+                "Z-Image currently supports the simple flow-match schedule; "
                 + "normal/karras/beta/turbo/align_your_steps/flux2/ltxv remain fail-loud here"
             ),
         )
@@ -274,6 +337,50 @@ def scheduler_admission_for_backend(
                 + "normal/karras/beta/turbo/align_your_steps/flux2/ltxv remain fail-loud here"
             ),
         )
+    if b == "ideogram4":
+        if normalized == "ideogram_logitnormal":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("ideogram4_logitnormal"),
+                String("backend executes the Ideogram-4 logit-normal schedule"),
+            )
+        if normalized == "simple":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("ideogram4_simple_flowmatch"),
+                String("backend executes the bounded Ideogram-4 simple AuraFlow schedule"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String(
+                "Ideogram-4 currently supports logitnormal/ideogram_logitnormal "
+                + "and the bounded simple AuraFlow scheduler; normal/karras/beta/"
+                + "turbo/align_your_steps/flux2/ltxv remain fail-loud here"
+            ),
+        )
+    if b == "flux2":
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String(
+                "Flux2/Klein scheduler metadata is imported from Swarm/Comfy, "
+                + "but the daemon backend currently admission-fails before "
+                + "executing it because cap-cache/ReferenceLatent inputs are not wired"
+            ),
+        )
     return SamplerAdmission(
         True,
         b,
@@ -284,7 +391,7 @@ def scheduler_admission_for_backend(
     )
 
 
-def _generic_unipc_blocked_detail_json() -> String:
+def _qwen_generic_unipc_blocked_detail_json() -> String:
     return String(
         '{"name":"uni_pc",'
         + '"normalized":"uni_pc",'
@@ -294,7 +401,7 @@ def _generic_unipc_blocked_detail_json() -> String:
         + '"required_variant":"bh1",'
         + '"required_order":"min(3,len(sigmas)-2)",'
         + '"required_schedule":"SigmaConvert",'
-        + '"reason":"generic Comfy uni_pc has bh1/order<=3/SigmaConvert/final-zero-replacement semantics; current runtime evidence covers only uni_pc_bh2 bh2/order-2 flow semantics"}'
+        + '"reason":"Qwen-Image has no generic Comfy uni_pc runtime evidence yet"}'
     )
 
 
@@ -348,10 +455,12 @@ def swarmui_sampler_registry_json() raises -> String:
         + '"normal","linear_quadratic","kl_optimal","turbo","align_your_steps",'
         + '"flux2","ltxv","ltxv-image","flowmatch","flow_match","qwen"]'
     )
-    var zimage_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m","dpm++ 2m","uni_pc_bh2"]')
+    var zimage_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m","dpm++ 2m","uni_pc","uni_pc_bh2"]')
     var qwen_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
+    var ideogram_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
     var zimage_supported_schedulers = String('["simple","flowmatch","flow_match"]')
     var qwen_supported_schedulers = String('["simple","flowmatch","flow_match","qwen"]')
+    var ideogram_supported_schedulers = String('["logitnormal","logit_normal","ideogram_logitnormal","ideogram4_logitnormal"]')
     var out = String("{\n")
     out += String('  "schema":"serenity.samplers.v1",\n')
     out += String('  "source":"local SwarmUI Comfy sampler catalog",\n')
@@ -368,8 +477,8 @@ def swarmui_sampler_registry_json() raises -> String:
         String("simple_flowmatch"),
         zimage_supported_samplers,
         zimage_supported_schedulers,
-        String("[") + _generic_unipc_blocked_detail_json() + String("]"),
-        String("Z-Image daemon runs verified rectified-flow Euler/simple plus bounded DPM++ 2M and UniPC bh2/simple flow-match paths; generic uni_pc remains blocked because Comfy maps it to bh1/order<=3/SigmaConvert semantics, not the bh2/order-2 flow path."),
+        String("[]"),
+        String("Z-Image daemon runs SwarmUI/Comfy-aligned rectified-flow Euler/simple sigmas plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 on that simple flow-match schedule. Generic uni_pc is not an alias for uni_pc_bh2."),
     )
     out += String(",\n    ")
     out += _backend_json(
@@ -379,8 +488,19 @@ def swarmui_sampler_registry_json() raises -> String:
         String("qwen_flowmatch"),
         qwen_supported_samplers,
         qwen_supported_schedulers,
-        String("[") + _generic_unipc_blocked_detail_json() + String("]"),
+        String("[") + _qwen_generic_unipc_blocked_detail_json() + String("]"),
         String("Qwen-Image daemon runs the verified dynamic flow-match Euler path; full Qwen generation remains separately gated."),
+    )
+    out += String(",\n    ")
+    out += _backend_json(
+        String("ideogram4"),
+        String("ideogram4"),
+        String("ideogram4_logitnormal_euler"),
+        String("ideogram4_logitnormal"),
+        ideogram_supported_samplers,
+        ideogram_supported_schedulers,
+        String("[]"),
+        String("Ideogram-4 daemon runs a bounded 1024x1024 txt2img path with explicit logit-normal Euler semantics; non-Euler sampler and broad scheduler aliases remain fail-loud."),
     )
     out += String("\n  ],\n")
     out += String('  "non_claims":[\n')

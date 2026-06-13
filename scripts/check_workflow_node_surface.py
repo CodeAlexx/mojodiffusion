@@ -13,21 +13,49 @@ import argparse
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 REPO = Path(__file__).resolve().parents[1]
 
 DOC = REPO / "serenitymojo/docs/COMFY_SWARM_WORKFLOW_PARITY_MAP_2026-06-12.md"
 DAEMON = REPO / "serenitymojo/serve/serenity_daemon.mojo"
+WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
 BACKEND = REPO / "serenitymojo/serve/backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
+IDEOGRAM4_BACKEND = REPO / "serenitymojo/serve/ideogram4_backend.mojo"
 QWEN_BACKEND = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
+KLEIN_BACKEND = REPO / "serenitymojo/serve/klein_backend.mojo"
+EXTERNAL_COMMAND = REPO / "serenitymojo/serve/external_command.mojo"
+DISPATCH_BACKEND = REPO / "serenitymojo/serve/dispatch_backend.mojo"
+WORKER = REPO / "serenitymojo/serve/worker.mojo"
+IPC_CODEC = REPO / "serenitymojo/serve/ipc_codec.mojo"
 IMAGE_IO = REPO / "serenitymojo/serve/image_io.mojo"
 MODEL_SCAN = REPO / "serenitymojo/serve/model_scan.mojo"
+SAMPLER_REGISTRY = REPO / "serenitymojo/sampling/sampler_registry.mojo"
+KLEIN_REFERENCE_BRIDGE = REPO / "serenitymojo/sampling/klein_reference_latent_bridge.mojo"
+KLEIN_REFERENCE_BRIDGE_SMOKE = REPO / "serenitymojo/sampling/parity/klein_reference_latent_bridge_smoke.mojo"
+KLEIN_SAMPLE_CLI = REPO / "serenitymojo/sampling/klein_sample_cli.mojo"
+KLEIN_STACK_LORA = REPO / "serenitymojo/models/klein/klein_stack_lora.mojo"
+KLEIN_REFERENCE_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_klein_reference_daemon_smoke.py"
+KLEIN_LORA_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_klein_lora_daemon_smoke.py"
+KLEIN_LORA_REFERENCE_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_klein_lora_reference_daemon_smoke.py"
+LANPAINT_ORACLE_SURFACE_RUNNER = REPO / "scripts/check_lanpaint_oracle_surface.py"
+LANPAINT_CANVAS_DAEMON_SMOKE_RUNNER = REPO / "scripts/check_lanpaint_canvas_daemon_smoke.py"
+PIXI = REPO / "pixi.toml"
 LEDGER = REPO / "serenitymojo/docs/SWARMUI_PRODUCT_PATH_LEDGER_2026-06-12.md"
 ROADMAP = REPO / "serenitymojo/docs/SWARMUI_PARITY_ROADMAP_2026-06-12.md"
 WORKFLOW_GRAPH_PRODUCT = REPO / "output/checks/workflow_graph_product_readiness.json"
+KLEIN4B_REFERENCE_DAEMON_SMOKE = REPO / "output/checks/klein4b_reference_edit_daemon_smoke.json"
+KLEIN9B_REFERENCE_DAEMON_SMOKE = REPO / "output/checks/klein9b_reference_edit_daemon_smoke.json"
+KLEIN9B_LORA_DAEMON_SMOKE = REPO / "output/checks/klein9b_lora_daemon_smoke.json"
+KLEIN9B_LORA_REFERENCE_DAEMON_SMOKE = REPO / "output/checks/klein9b_lora_reference_edit_daemon_smoke.json"
+LANPAINT_ORACLE_SURFACE = REPO / "output/checks/lanpaint_oracle_surface.json"
+LANPAINT_CANVAS_DAEMON_SMOKE = REPO / "output/checks/lanpaint_canvas_daemon_smoke.json"
+SERENITYFLOW = Path("/home/alex/serenityflow-v2/serenityflow")
+SERENITYFLOW_LATENT_NODES = SERENITYFLOW / "nodes/latent.py"
+SERENITYFLOW_CONDITIONING_NODES = SERENITYFLOW / "nodes/conditioning_extra.py"
+SERENITYFLOW_SAMPLING = SERENITYFLOW / "bridge/sampling.py"
 
 P0 = "P0"
 P1 = "P1"
@@ -36,21 +64,64 @@ PASS = "PASS"
 
 SUPPORTED_NODE_TYPES = [
     "CheckpointLoaderSimple",
+    "UNETLoader",
+    "DiffusionModelLoader",
+    "LoraLoaderModelOnly",
+    "CLIPLoader",
+    "DualCLIPLoader",
+    "TripleCLIPLoader",
+    "VAELoader",
     "CLIPTextEncode",
+    "CLIPTextEncodeFlux",
+    "ConditioningZeroOut",
+    "LoadImage",
+    "ImageToMask",
+    "MaskToImage",
     "EmptyLatentImage",
+    "EmptySD3LatentImage",
+    "EmptyFlux2LatentImage",
+    "VAEEncode",
+    "SetLatentNoiseMask",
+    "GetImageSize",
+    "ImageScale",
+    "ImageScaleToTotalPixels",
+    "ReferenceLatent",
+    "6007e698-2ebd-4917-84d8-299b35d7b7ab",
+    "f07d2d08-2bc5-4dd8-a9f0-f2347c6b5cca",
+    "ModelSamplingAuraFlow",
+    "ModelSamplingSD3",
+    "DifferentialDiffusion",
     "KSampler",
+    "LanPaint_KSampler",
+    "LanPaint_KSamplerAdvanced",
+    "CFGGuider",
+    "BasicGuider",
+    "FluxGuidance",
+    "Flux2Scheduler",
+    "RandomNoise",
+    "KSamplerSelect",
+    "SamplerCustomAdvanced",
+    "LanPaint_SamplerCustomAdvanced",
+    "LanPaint_MaskBlend",
     "VAEDecode",
     "SaveImage",
+    "PreviewImage",
+    "MarkdownNote",
+    "Note",
 ]
 
 UNSUPPORTED_NODE_EXAMPLES = [
     "LoraLoader",
-    "LoadImage",
-    "VAEEncode",
     "ControlNetApply",
     "IPAdapterApply",
     "ImageUpscaleWithModel",
     "VideoCombine",
+    "LanPaint_SamplerCustom",
+    "ImagePadForOutpaint",
+    "ThresholdMask",
+    "TextEncodeQwenImageEdit",
+    "TextEncodeQwenImageEditPlus",
+    "InpaintModelConditioning",
 ]
 
 
@@ -170,16 +241,43 @@ def check_body_contains(
     return Check(True, PASS, category, label, "required function markers present", rel(path), acceptance)
 
 
+def check_not_contains(
+    path: Path,
+    *,
+    category: str,
+    label: str,
+    needles: Iterable[str],
+    severity: str,
+    acceptance: str,
+) -> Check:
+    text = read(path)
+    if not text:
+        return Check(False, severity, category, label, f"missing file: {path}", rel(path), acceptance)
+    present = [needle for needle in needles if needle in text]
+    if present:
+        return Check(
+            False,
+            severity,
+            category,
+            label,
+            "forbidden markers present: " + ", ".join(repr(item) for item in present),
+            rel(path),
+            acceptance,
+        )
+    return Check(True, PASS, category, label, "forbidden markers absent", rel(path), acceptance)
+
+
 def check_unsupported_not_allowlisted() -> Check:
-    body = function_body(read(DAEMON), "_apply_workflow_params")
+    text = read(WORKFLOW_GRAPH)
+    body = function_body(text, "apply_workflow_params") + function_body(text, "apply_typed_workflow_graph")
     if not body:
         return Check(
             False,
             P0,
             "workflow",
             "unsupported node examples stay outside allowlist",
-            "missing _apply_workflow_params body",
-            rel(DAEMON),
+            "missing workflow graph adapter bodies",
+            rel(WORKFLOW_GRAPH),
             "Advanced node families are not silently accepted by the constrained adapter.",
         )
     accepted = [node for node in UNSUPPORTED_NODE_EXAMPLES if f'type_id == "{node}"' in body]
@@ -190,7 +288,7 @@ def check_unsupported_not_allowlisted() -> Check:
             "workflow",
             "unsupported node examples stay outside allowlist",
             "unexpected accepted markers: " + ", ".join(accepted),
-            rel(DAEMON),
+            rel(WORKFLOW_GRAPH),
             "Advanced node families are not silently accepted by the constrained adapter.",
         )
     return Check(
@@ -199,7 +297,7 @@ def check_unsupported_not_allowlisted() -> Check:
         "workflow",
         "unsupported node examples stay outside allowlist",
         "advanced examples are not accepted markers",
-        rel(DAEMON),
+        rel(WORKFLOW_GRAPH),
         "Advanced node families are not silently accepted by the constrained adapter.",
     )
 
@@ -209,36 +307,211 @@ def check_supported_nodes() -> list[Check]:
     checks.append(
         check_body_contains(
             DAEMON,
-            "_apply_workflow_params",
+            "parse_generate",
             category="workflow",
-            label="workflow adapter entrypoint",
+            label="daemon workflow executor entrypoint",
+            needles=[
+                "apply_workflow_graph_params",
+            ],
+            severity=P0,
+            acceptance="Daemon routes /v1/generate through the workflow graph module before JobParams validation.",
+        )
+    )
+    checks.append(
+        check_contains(
+            DAEMON,
+            category="workflow",
+            label="daemon imports workflow graph module",
+            needles=[
+                "from serenitymojo.serve.workflow_graph import apply_workflow_params as apply_workflow_graph_params",
+            ],
+            severity=P0,
+            acceptance="Workflow execution is a backend module contract, not daemon-local flat parsing.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_workflow_params",
+            category="workflow",
+            label="workflow graph adapter entrypoint",
             needles=[
                 "workflow",
                 "params",
                 "genparams",
                 "nodes",
-                "Linked `workflow.nodes`/`workflow.edges` bodies are executed",
+                "apply_typed_workflow_graph",
+                "looks_like_comfy_api_prompt_graph",
+                "apply_comfy_api_prompt_graph",
+                "looks_like_comfy_ui_canvas_graph",
+                "apply_comfy_ui_canvas_graph",
             ],
             severity=P0,
-            acceptance="Daemon exposes flat workflow passthrough plus typed linked-graph execution for supported nodes.",
+            acceptance="Graph module exposes flat workflow passthrough, Comfy API prompt import, Comfy UI visual canvas import, plus typed linked-graph execution for supported nodes.",
         )
     )
     checks.append(
         check_body_contains(
-            DAEMON,
-            "_apply_workflow_graph_ir",
+            WORKFLOW_GRAPH,
+            "apply_workflow_params",
+            category="workflow",
+            label="raw Comfy Ideogram4 export branch",
+            needles=[
+                "looks_like_ideogram4_comfy_ui_export",
+                "apply_ideogram4_comfy_ui_export",
+            ],
+            severity=P0,
+            acceptance="Raw Comfy UI Ideogram4 txt2img exports are routed to a bounded importer before the generic type_id adapter.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_ideogram4_comfy_ui_export",
+            category="workflow",
+            label="bounded Ideogram4 Comfy importer",
+            needles=[
+                "Text to Image (Ideogram v4)",
+                "EmptyFlux2LatentImage",
+                "UNETLoader",
+                "ideogram-4-fp8",
+                "KSamplerSelect",
+                "BasicScheduler",
+                "ModelSamplingAuraFlow",
+                "DualModelGuider",
+                "CFGOverride",
+                "cfg_override_start_percent",
+                "prompt-builder subgraph",
+                "_workflow_set_seed_from_widget_if_missing",
+                "active LoRA nodes",
+            ],
+            severity=P0,
+            acceptance="The Ideogram4 importer extracts the known Comfy txt2img semantics and fails loud for prompt-builder/seed/LoRA gaps.",
+        )
+    )
+    checks.append(
+        check_contains(
+            WORKFLOW_GRAPH,
+            category="workflow",
+            label="workflow graph normalizes Comfy UI node ids",
+            needles=[
+                "def _workflow_type_id",
+                'removeprefix("comfy/")',
+            ],
+            severity=P0,
+            acceptance="Frontend and imported Comfy graphs may use comfy/ type_id prefixes while the executor allowlist stays canonical.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_comfy_api_prompt_graph",
+            category="workflow",
+            label="Comfy API prompt graph adapter",
+            needles=[
+                "_comfy_api_prompt_body",
+                "_comfy_api_prompt_to_typed_graph",
+                "apply_typed_workflow_graph",
+                "comfy_api_prompt_graph",
+            ],
+            severity=P0,
+            acceptance="ComfyUI API prompt graphs lower into the typed executor instead of requiring Serenity-only nodes/edges JSON.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "_comfy_api_prompt_to_typed_graph",
+            category="workflow",
+            label="Comfy API prompt link lowering",
+            needles=[
+                "class_type",
+                "inputs",
+                "_comfy_api_input_is_link",
+                "_comfy_api_output_port",
+                "_comfy_api_link_output_slot",
+                "source_id",
+            ],
+            severity=P0,
+            acceptance="ComfyUI API links [node_id, output_index] are converted into typed graph edges.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "comfy_ui_canvas_to_typed_graph",
+            category="workflow",
+            label="Comfy UI visual canvas link lowering",
+            needles=[
+                "widgets_values",
+                "_comfy_ui_widget_fields",
+                "_comfy_ui_output_port",
+                "_comfy_ui_input_port",
+                "source output slot",
+                "target input slot",
+            ],
+            severity=P0,
+            acceptance="Comfy UI visual canvas nodes/links lower into the typed executor with widget values mapped into fields.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "_comfy_ui_widget_fields",
+            category="workflow",
+            label="Comfy UI visual widget mapping",
+            needles=[
+                "LanPaint_KSampler",
+                "LanPaint_KSamplerAdvanced",
+                "LanPaint_SamplerCustomAdvanced",
+                "LanPaint_MaskBlend",
+                "ImageToMask",
+                "LanPaint_NumSteps",
+                "LanPaint_PromptMode",
+                "LanPaint_InnerThreshold",
+                "blend_overlap",
+            ],
+            severity=P0,
+            acceptance="Comfy UI visual widget arrays map bounded LanPaint nodes into canonical fields before typed execution.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
+            category="workflow",
+            label="graph LoRA model-only lowering",
+            needles=[
+                "LoraLoaderModelOnly",
+                "_workflow_append_lora",
+                "lora_name",
+                "strength_model",
+                "workflow graph LoraLoaderModelOnly missing model input",
+                "_workflow_append_lora(obj, lora_name, strength)",
+            ],
+            severity=P0,
+            acceptance="Comfy/SerenityFlow model-only LoRA loader nodes lower into the existing flat LoRA metadata contract without replacing backend inference.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
             category="workflow",
             label="typed linked graph IR executor",
             needles=[
                 "_workflow_find_input_link",
                 "_workflow_add_value",
                 "_workflow_require_value_type",
+                "_workflow_type_id",
                 "edges",
                 "MODEL",
                 "CLIP",
                 "VAE",
                 "CONDITIONING",
+                "image_paths",
                 "LATENT",
+                "latent_init_images",
                 "IMAGE",
                 "unresolved or cyclic typed links",
             ],
@@ -248,8 +521,28 @@ def check_supported_nodes() -> list[Check]:
     )
     checks.append(
         check_body_contains(
-            DAEMON,
-            "_apply_workflow_graph_ir",
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
+            category="workflow",
+            label="bounded Klein edit typed graph markers",
+            needles=[
+                "ReferenceLatent",
+                "SamplerCustomAdvanced",
+                "GUIDER",
+                "SIGMAS",
+                "NOISE",
+                "SAMPLER",
+                "MASK",
+                "COND_LATENT",
+            ],
+            severity=P0,
+            acceptance="Bounded edit/inpaint graphs expose explicit typed handles for guider/sigmas/noise/sampler/mask/reference-latent lowering.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
             category="workflow",
             label="supported Comfy-like node markers",
             needles=SUPPORTED_NODE_TYPES,
@@ -259,18 +552,54 @@ def check_supported_nodes() -> list[Check]:
     )
     checks.append(
         check_body_contains(
-            DAEMON,
-            "_apply_workflow_graph_ir",
+            WORKFLOW_GRAPH,
+            "_workflow_loader_model_name",
+            category="workflow",
+            label="Comfy loader model-name aliases",
+            needles=[
+                "ckpt_name",
+                "unet_name",
+                "model_name",
+            ],
+            severity=P0,
+            acceptance="CheckpointLoaderSimple, UNETLoader, and DiffusionModelLoader model-name fields are normalized before execution.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "_workflow_conditioning_prompt_text",
+            category="workflow",
+            label="Comfy text-encoder prompt aliases",
+            needles=[
+                "text",
+                "CLIPTextEncodeFlux",
+                "t5xxl",
+                "clip_l",
+            ],
+            severity=P0,
+            acceptance="CLIPTextEncode and CLIPTextEncodeFlux prompt fields are normalized before execution.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
             category="workflow",
             label="supported node field mappings",
             needles=[
-                "ckpt_name",
                 "model",
-                "text",
                 "negative",
                 "width",
                 "height",
                 "batch_size",
+                "image",
+                "path",
+                "init_image",
+                "mask_image",
+                "reference_image",
+                "reference_latent_method",
+                "reference_latent_count",
                 "images",
                 "steps",
                 "seed",
@@ -278,11 +607,40 @@ def check_supported_nodes() -> list[Check]:
                 "sampler_name",
                 "sampler",
                 "scheduler",
+                "shift",
+                "sigma_shift",
                 "denoise",
                 "creativity",
             ],
             severity=P0,
             acceptance="Accepted nodes map explicit fields into flat genparams.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "_workflow_copy_lanpaint_sampler_fields",
+            category="workflow",
+            label="LanPaint canonical field mappings",
+            needles=[
+                "lanpaint_num_steps",
+                "lanpaint_lambda",
+                "lanpaint_step_size",
+                "lanpaint_beta",
+                "lanpaint_friction",
+                "lanpaint_prompt_mode",
+                "lanpaint_inpainting_mode",
+                "lanpaint_add_noise",
+                "lanpaint_noise_seed",
+                "lanpaint_start_at_step",
+                "lanpaint_end_at_step",
+                "lanpaint_return_with_leftover_noise",
+                "lanpaint_early_stop",
+                "lanpaint_inner_threshold",
+                "lanpaint_inner_patience",
+            ],
+            severity=P0,
+            acceptance="LanPaint sampler fields lower into canonical flat genparams before backend admission.",
         )
     )
     checks.append(
@@ -299,7 +657,34 @@ def check_supported_nodes() -> list[Check]:
                 "var steps: Int",
                 "var seed: Int",
                 "var cfg: Float64",
+                "var cfg_override: Float64",
+                "var cfg_override_start_percent: Float64",
+                "var cfg_override_end_percent: Float64",
+                "var sampler: String",
+                "var scheduler: String",
+                "var sigma_shift: Float64",
                 "var init_image: String",
+                "var mask_image: String",
+                "var lanpaint_mask_channel: String",
+                "var lanpaint_mask_blend_overlap: Int",
+                "var lanpaint_num_steps: Int",
+                "var lanpaint_lambda: Float64",
+                "var lanpaint_step_size: Float64",
+                "var lanpaint_beta: Float64",
+                "var lanpaint_friction: Float64",
+                "var lanpaint_prompt_mode: String",
+                "var lanpaint_inpainting_mode: String",
+                "var lanpaint_add_noise: String",
+                "var lanpaint_noise_seed: Int",
+                "var lanpaint_start_at_step: Int",
+                "var lanpaint_end_at_step: Int",
+                "var lanpaint_return_with_leftover_noise: String",
+                "var lanpaint_early_stop: Int",
+                "var lanpaint_inner_threshold: Float64",
+                "var lanpaint_inner_patience: Int",
+                "var reference_image: String",
+                "var reference_latent_method: String",
+                "var reference_latent_count: Int",
                 "var creativity: Float64",
                 "var loras: List[LoraSpec]",
                 "var params_json: String",
@@ -313,9 +698,8 @@ def check_supported_nodes() -> list[Check]:
 
 def check_fail_loud() -> list[Check]:
     return [
-        check_body_contains(
-            DAEMON,
-            "_apply_workflow_params",
+        check_contains(
+            WORKFLOW_GRAPH,
             category="failure",
             label="unsupported graph shapes fail loud",
             needles=[
@@ -330,7 +714,19 @@ def check_fail_loud() -> list[Check]:
             acceptance="Unsupported graph requests name the unsupported feature instead of silently no-oping.",
         ),
         check_contains(
-            DAEMON,
+            WORKFLOW_GRAPH,
+            category="failure",
+            label="Ideogram4 Comfy import gaps fail loud",
+            needles=[
+                "[501] Ideogram4 Comfy export uses a prompt-builder subgraph",
+                "[501] Ideogram4 Comfy export uses randomized seed",
+                "[501] Ideogram4 Comfy export has active LoRA nodes",
+            ],
+            severity=P0,
+            acceptance="Raw Ideogram4 Comfy exports fail before enqueue when prompt, seed, or LoRA semantics are not executable.",
+        ),
+        check_contains(
+            WORKFLOW_GRAPH,
             category="failure",
             label="typed workflow graph validation fails loud",
             needles=[
@@ -386,7 +782,533 @@ def check_family_surfaces() -> list[Check]:
                 "conditioning_weights_applied",
             ],
             severity=P1,
-            acceptance="Flat LoRA metadata is parsed and recorded while graph LoRA nodes remain unsupported.",
+            acceptance="Flat LoRA metadata is parsed and recorded; graph LoraLoaderModelOnly lowers into the same product contract.",
+        ),
+        check_contains(
+            WORKFLOW_GRAPH,
+            category="workflow",
+            label="workflow execution metadata",
+            needles=[
+                "WORKFLOW_GRAPH_EXECUTOR",
+                "WORKFLOW_SCHEMA",
+                "workflow_executor",
+                "workflow_source",
+                "workflow_node_count",
+                "workflow_edge_count",
+            ],
+            severity=P1,
+            acceptance="Graph execution records metadata for frontend history and artifact reuse.",
+        ),
+        check_contains(
+            BACKEND,
+            category="workflow",
+            label="ReferenceLatent runtime contract helper",
+            needles=[
+                "reject_unsupported_reference_image_params",
+                "Comfy ReferenceLatent/reference image conditioning is not supported",
+            ],
+            severity=P1,
+            acceptance="ReferenceLatent metadata is explicit and existing non-Klein backends fail loud instead of treating it as ordinary img2img.",
+        ),
+        check_contains(
+            BACKEND,
+            category="workflow",
+            label="SetLatentNoiseMask runtime contract helper",
+            needles=[
+                "reject_unsupported_mask_image_params",
+                "Comfy SetLatentNoiseMask/inpaint mask conditioning is not supported",
+            ],
+            severity=P1,
+            acceptance="Mask metadata is explicit and real backends fail loud until mask-aware denoise is wired.",
+        ),
+        check_contains(
+            BACKEND,
+            category="workflow",
+            label="LanPaint runtime contract helper",
+            needles=[
+                "has_lanpaint_runtime_params",
+                "reject_unsupported_lanpaint_params",
+                "LanPaint inpaint sampler/blend semantics are not supported",
+            ],
+            severity=P1,
+            acceptance="LanPaint sampler/blend metadata is explicit and real backends fail loud until the LanPaint runtime loop and blend are wired.",
+        ),
+        check_contains(
+            DAEMON,
+            category="workflow",
+            label="daemon parses mask image genparams",
+            needles=[
+                'p.mask_image = _opt_str(obj, "mask_image", String(""))',
+                'o.set("mask_image", JSONValue.from_string(p.mask_image))',
+            ],
+            severity=P1,
+            acceptance="SetLatentNoiseMask metadata survives parse_generate and canonical PNG/job metadata.",
+        ),
+        check_contains(
+            DAEMON,
+            category="workflow",
+            label="daemon parses LanPaint genparams",
+            needles=[
+                'p.lanpaint_num_steps = _opt_int(obj, "lanpaint_num_steps", -1, -1, 4096)',
+                'p.lanpaint_prompt_mode = _opt_str(obj, "lanpaint_prompt_mode", String(""))',
+                'p.lanpaint_mask_blend_overlap = _opt_int(obj, "lanpaint_mask_blend_overlap", -1, -1, 4096)',
+                'o.set("lanpaint_num_steps", JSONValue.from_int(p.lanpaint_num_steps))',
+                'o.set("lanpaint_prompt_mode", JSONValue.from_string(p.lanpaint_prompt_mode))',
+                'o.set("lanpaint_mask_blend_overlap", JSONValue.from_int(p.lanpaint_mask_blend_overlap))',
+            ],
+            severity=P1,
+            acceptance="LanPaint metadata survives parse_generate and canonical PNG/job metadata.",
+        ),
+        check_contains(
+            IPC_CODEC,
+            category="workflow",
+            label="worker IPC preserves mask image genparams",
+            needles=[
+                'o.set("mask_image", JSONValue.from_string(p.mask_image))',
+                'p.mask_image = obj["mask_image"].as_string()',
+            ],
+            severity=P1,
+            acceptance="Process-isolated worker IPC does not drop SetLatentNoiseMask metadata.",
+        ),
+        check_contains(
+            IPC_CODEC,
+            category="workflow",
+            label="worker IPC preserves LanPaint genparams",
+            needles=[
+                'o.set("lanpaint_num_steps", JSONValue.from_int(p.lanpaint_num_steps))',
+                'o.set("lanpaint_prompt_mode", JSONValue.from_string(p.lanpaint_prompt_mode))',
+                'o.set("lanpaint_mask_blend_overlap", JSONValue.from_int(p.lanpaint_mask_blend_overlap))',
+                'p.lanpaint_num_steps = Int(obj["lanpaint_num_steps"].as_float())',
+                'p.lanpaint_prompt_mode = obj["lanpaint_prompt_mode"].as_string()',
+                'p.lanpaint_mask_blend_overlap = Int(obj["lanpaint_mask_blend_overlap"].as_float())',
+            ],
+            severity=P1,
+            acceptance="Process-isolated worker IPC does not drop LanPaint metadata.",
+        ),
+        check_contains(
+            ZIMAGE_BACKEND,
+            category="workflow",
+            label="Z-Image rejects ReferenceLatent metadata",
+            needles=[
+                'reject_unsupported_reference_image_params(params, String("zimage"))',
+            ],
+            severity=P1,
+            acceptance="Z-Image img2img does not silently consume Comfy ReferenceLatent/Klein edit metadata.",
+        ),
+        check_contains(
+            ZIMAGE_BACKEND,
+            category="workflow",
+            label="Z-Image rejects SetLatentNoiseMask metadata",
+            needles=[
+                'reject_unsupported_mask_image_params(params, String("zimage"))',
+            ],
+            severity=P1,
+            acceptance="Z-Image img2img does not silently treat Comfy inpaint masks as ordinary img2img.",
+        ),
+        check_contains(
+            ZIMAGE_BACKEND,
+            category="workflow",
+            label="Z-Image rejects LanPaint metadata",
+            needles=[
+                'reject_unsupported_lanpaint_params(params, String("zimage"))',
+            ],
+            severity=P1,
+            acceptance="Z-Image does not silently consume LanPaint sampler/blend metadata.",
+        ),
+        check_contains(
+            QWEN_BACKEND,
+            category="workflow",
+            label="Qwen rejects ReferenceLatent metadata",
+            needles=[
+                'reject_unsupported_reference_image_params(params, String("qwenimage"))',
+            ],
+            severity=P1,
+            acceptance="Qwen-Image does not silently consume Comfy ReferenceLatent/Klein edit metadata.",
+        ),
+        check_contains(
+            QWEN_BACKEND,
+            category="workflow",
+            label="Qwen rejects SetLatentNoiseMask metadata",
+            needles=[
+                'reject_unsupported_mask_image_params(params, String("qwenimage"))',
+            ],
+            severity=P1,
+            acceptance="Qwen-Image does not silently consume Comfy inpaint mask metadata.",
+        ),
+        check_contains(
+            QWEN_BACKEND,
+            category="workflow",
+            label="Qwen rejects LanPaint metadata",
+            needles=[
+                'reject_unsupported_lanpaint_params(params, String("qwenimage"))',
+            ],
+            severity=P1,
+            acceptance="Qwen-Image does not silently consume LanPaint sampler/blend metadata.",
+        ),
+        check_contains(
+            IDEOGRAM4_BACKEND,
+            category="workflow",
+            label="Ideogram4 rejects ReferenceLatent metadata",
+            needles=[
+                'reject_unsupported_reference_image_params(params, String("ideogram4"))',
+            ],
+            severity=P1,
+            acceptance="Ideogram4 does not silently consume Comfy ReferenceLatent/Klein edit metadata.",
+        ),
+        check_contains(
+            IDEOGRAM4_BACKEND,
+            category="workflow",
+            label="Ideogram4 rejects SetLatentNoiseMask metadata",
+            needles=[
+                'reject_unsupported_mask_image_params(params, String("ideogram4"))',
+            ],
+            severity=P1,
+            acceptance="Ideogram4 does not silently consume Comfy inpaint mask metadata.",
+        ),
+        check_contains(
+            IDEOGRAM4_BACKEND,
+            category="workflow",
+            label="Ideogram4 rejects LanPaint metadata",
+            needles=[
+                'reject_unsupported_lanpaint_params(params, String("ideogram4"))',
+            ],
+            severity=P1,
+            acceptance="Ideogram4 does not silently consume LanPaint sampler/blend metadata.",
+        ),
+        check_contains(
+            KLEIN_BACKEND,
+            category="workflow",
+            label="Klein rejects LanPaint metadata",
+            needles=[
+                'reject_unsupported_lanpaint_params(params, String("klein"))',
+            ],
+            severity=P1,
+            acceptance="Klein ReferenceLatent edit does not silently consume LanPaint sampler/blend metadata.",
+        ),
+        check_contains(
+            SAMPLER_REGISTRY,
+            category="sampler",
+            label="Flux2/Klein registry remains metadata-only outside daemon bridge",
+            needles=[
+                'return String("flux2")',
+                "Flux2/Klein daemon backend route exists",
+                "cap-cache/ReferenceLatent bridge",
+            ],
+            severity=P1,
+            acceptance="Flux2/Klein workflow imports preserve Swarm/Comfy scheduler metadata while direct in-process sampler registry execution stays blocked outside the staged daemon bridge.",
+        ),
+        check_contains(
+            KLEIN_REFERENCE_BRIDGE,
+            category="workflow",
+            label="Klein ReferenceLatent bridge contract",
+            needles=[
+                "struct KleinReferenceLatentPlan",
+                "plan_klein_reference_latent_bridge",
+                "reference_latent_count",
+                "reference_latent_method",
+                "edit_sequence_tokens",
+                "build_klein_reference_combined_img_ids",
+                "build_klein_reference_combined_tokens",
+                "prepare_combined_img_ids",
+                "prepare_combined_tokens",
+            ],
+            severity=P1,
+            acceptance="Klein edit metadata has a no-heavy bridge plan for target/reference token counts and combined image ids before full sampler execution is enabled.",
+        ),
+        check_contains(
+            KLEIN_REFERENCE_BRIDGE_SMOKE,
+            category="workflow",
+            label="Klein ReferenceLatent bridge no-heavy smoke",
+            needles=[
+                "512 edit bridge",
+                "1024 edit bridge",
+                "plan_klein_reference_latent_bridge",
+                "build_klein_reference_combined_img_ids",
+                "build_klein_reference_combined_tokens",
+                "PASS: Klein ReferenceLatent bridge no-heavy gate",
+            ],
+            severity=P1,
+            acceptance="A focused smoke proves 512 and 1024 Klein edit token/id shapes without loading Qwen, Klein DiT, or the VAE.",
+        ),
+        check_contains(
+            KLEIN_SAMPLE_CLI,
+            category="workflow",
+            label="Klein ReferenceLatent staged sampler CLI",
+            needles=[
+                "klein_sample_with_reference_latent",
+                "_encode_reference_512",
+                "_encode_reference_1024",
+                "decode_image_any",
+                "resize_bilinear",
+                "KleinVaeEncoder",
+                "N_EDIT_IMG_512",
+                "S_EDIT_1024",
+                "reference_t_offset",
+            ],
+            severity=P1,
+            acceptance="The staged Klein sampler can decode/resize a source image, VAE-encode it, and dispatch 512/1024 ReferenceLatent edit specializations instead of only txt2img.",
+        ),
+        check_contains(
+            KLEIN_STACK_LORA,
+            category="lora",
+            label="Klein AI Toolkit LoRA key mapping",
+            needles=[
+                "_load_klein_flux2_double_blocks_lora",
+                "diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight",
+                "diffusion_model.single_blocks.",
+                "_check_adapter_shape",
+                "loaded Flux2/Klein double_blocks adapters",
+            ],
+            severity=P1,
+            acceptance="Klein LoRA loading recognizes AI Toolkit/Comfy Flux2-Klein double_blocks and single_blocks keys and rejects shape-incompatible files before sampling.",
+        ),
+        check_contains(
+            SERENITYFLOW_LATENT_NODES,
+            category="workflow",
+            label="Python oracle VAEEncode node",
+            needles=[
+                "@registry.register(",
+                '"VAEEncode"',
+                "def vae_encode_node",
+                "bhwc_to_bchw",
+                "latent = vae_encode(vae, image)",
+                "return (wrap_latent(latent),)",
+            ],
+            severity=P1,
+            acceptance="The Klein edit oracle starts from SerenityFlow/Comfy VAEEncode, which calls the normal VAE encoder and wraps that latent.",
+        ),
+        check_contains(
+            SERENITYFLOW_CONDITIONING_NODES,
+            category="workflow",
+            label="Python oracle ReferenceLatent node",
+            needles=[
+                '"ReferenceLatent"',
+                "def reference_latent",
+                'n["reference_latent"] = ref',
+                "return (out,)",
+            ],
+            severity=P1,
+            acceptance="The Klein edit oracle treats ReferenceLatent as conditioning metadata, not ordinary img2img init noise.",
+        ),
+        check_contains(
+            SERENITYFLOW_SAMPLING,
+            category="workflow",
+            label="Python oracle Flux2/Klein reference sampler",
+            needles=[
+                "reference_latent = cond_entry.get(\"reference_latent\")",
+                "ref_latent = reference_latent.float()",
+                "ref_latent = _patchify_flux2_latents(ref_latent)",
+                "flux_condition_tokens = _pack_flux2_latents(ref_latent.to(device))",
+                "t_offset=10.0",
+                "flux_img_ids = torch.cat([flux_img_ids, ref_img_ids], dim=0)",
+                "flux_txt_ids = _prepare_flux2_text_ids(txt_len, device, model_dtype)",
+                "txt_ids[:, 3] = torch.linspace(",
+            ],
+            severity=P1,
+            acceptance="The reference-token/id semantics are guarded against SerenityFlow's Python Comfy-compatible sampler, not a Rust oracle.",
+        ),
+        check_contains(
+            KLEIN_REFERENCE_DAEMON_SMOKE_RUNNER,
+            category="workflow",
+            label="Klein ReferenceLatent daemon smoke runner",
+            needles=[
+                "serenity.klein_reference_edit_daemon_smoke.v1",
+                "serenity_daemon dispatch",
+                "klein4b_edit.json",
+                "klein9b_edit.json",
+                "--case",
+                "DEFAULT_WORKFLOWS",
+                "reference_image",
+                "reference_latent_count",
+                "reference_latent_edit",
+                "klein_sample_cli",
+                "klein_precache_sample_prompts",
+                "workflow_source",
+                "comfy_api_prompt_graph",
+            ],
+            severity=P1,
+            acceptance="The real Klein ReferenceLatent daemon smoke is reproducible as a checked-in product-path checker instead of only as ad hoc shell history.",
+        ),
+        check_contains(
+            KLEIN_LORA_DAEMON_SMOKE_RUNNER,
+            category="lora",
+            label="Klein 9B LoRA daemon smoke runner",
+            needles=[
+                "serenity.klein9b_lora_daemon_smoke.v1",
+                "serenity_daemon dispatch",
+                "flux2_klein_9b_imperial_historical_lora.safetensors",
+                "loaded Flux2/Klein double_blocks adapters: 144",
+                "lora_count",
+                "lora_weight",
+                "GENPARAMS_KEY",
+                "read_png_info",
+                "log_markers",
+            ],
+            severity=P1,
+            acceptance="The real Klein 9B LoRA txt2img daemon smoke is reproducible as a checked-in product-path checker instead of only as ad hoc shell history.",
+        ),
+        check_contains(
+            KLEIN_LORA_REFERENCE_DAEMON_SMOKE_RUNNER,
+            category="lora",
+            label="Klein 9B LoRA ReferenceLatent daemon smoke runner",
+            needles=[
+                "serenity.klein9b_lora_reference_edit_daemon_smoke.v1",
+                "klein9b_edit_lora.json",
+                "patch_lora_workflow",
+                "workflow_edge_count",
+                "ReferenceLatent edit",
+                "sample_command_has_reference",
+                "loaded Flux2/Klein double_blocks adapters: 144",
+                "reference_latent_edit",
+                "lora_weight",
+            ],
+            severity=P1,
+            acceptance="The real Klein 9B LoRA plus ReferenceLatent edit daemon smoke is reproducible as a checked-in product-path checker instead of only as ad hoc shell history.",
+        ),
+        check_contains(
+            LANPAINT_ORACLE_SURFACE_RUNNER,
+            category="workflow",
+            label="LanPaint oracle surface checker",
+            needles=[
+                "serenity.lanpaint_oracle_surface.v1",
+                "Z_image_Inpaint.json",
+                "Qwen_Image_Inpaint.json",
+                "Flux2_Klein_inpainting.json",
+                "LanPaint_KSampler",
+                "LanPaint_SamplerCustomAdvanced",
+                "LanPaint_MaskBlend",
+                "SetLatentNoiseMask",
+                "denoise_mask = (denoise_mask > 0.5).float()",
+                "latent_mask = 1 - denoise_mask",
+                "non_claims",
+            ],
+            severity=P1,
+            acceptance="LanPaint work is pinned to local Python/Comfy oracle semantics and representative workflow exports before runtime mask-aware denoise is claimed.",
+        ),
+        check_contains(
+            LANPAINT_CANVAS_DAEMON_SMOKE_RUNNER,
+            category="workflow",
+            label="LanPaint canvas daemon smoke runner",
+            needles=[
+                "serenity.lanpaint_canvas_daemon_smoke.v1",
+                "SDXL_Inpaint.json",
+                "comfy_ui_canvas_graph",
+                "LanPaint Comfy UI canvas",
+                "lanpaint_num_steps",
+                "lanpaint_prompt_mode",
+                "lanpaint_mask_blend_overlap",
+                "mask_image",
+                "stub",
+                "No-heavy product smoke",
+            ],
+            severity=P1,
+            acceptance="A no-heavy product smoke proves visual LanPaint canvas lowering and metadata persistence through the daemon without claiming real denoise parity.",
+        ),
+        check_contains(
+            KLEIN_BACKEND,
+            category="workflow",
+            label="Flux2/Klein staged daemon bridge",
+            needles=[
+                "struct KleinBackend",
+                "from serenitymojo.serve.external_command import ExternalCommand",
+                "self.sidecar.start",
+                "self.sidecar.poll",
+                "self.sidecar.require_success",
+                "KLEIN_PRECACHE_BIN",
+                "KLEIN_SAMPLER_BIN",
+                "serenity.sample_prompts.v1",
+                "from serenitymojo.serve.model_scan import LORAS_DIR",
+                "_resolve_klein_lora_path",
+                "_klein_lora_path",
+                "_sample_prompts_json",
+                "_precache_command",
+                "_sample_command",
+                "_shell_quote(lora_arg)",
+                "validate_klein_cap_cache_header",
+                "_joint_dim_for_variant",
+                "_embed_genparams_in_png",
+                ".klein_daemon_result.json",
+                '"lora_path"',
+                "plan_klein_reference_latent_bridge",
+                "KLEIN_REFERENCE_EDIT_SHIFT",
+                "_shell_quote(self.params.reference_image)",
+                "reference_latent_edit",
+                "no placeholder image was written",
+            ],
+            severity=P1,
+            acceptance="Flux2/Klein daemon jobs stage per-job sample prompts, run Qwen3 cap-cache precache and route txt2img, single-LoRA txt2img, or bounded ReferenceLatent edit jobs to the existing staged sampler path.",
+        ),
+        check_contains(
+            EXTERNAL_COMMAND,
+            category="workflow",
+            label="daemon external command runner is pollable",
+            needles=[
+                "struct ExternalCommand",
+                "sys_fork",
+                "sys_execv",
+                "sys_waitpid",
+                "WNOHANG",
+                "proc_kill_wait",
+                "/bin/sh",
+                "def poll",
+                "def kill",
+                "def require_success",
+            ],
+            severity=P1,
+            acceptance="Long staged model commands run as pollable child processes so the daemon can keep servicing status/cancel while preserving existing shell command semantics.",
+        ),
+        check_contains(
+            PIXI,
+            category="workflow",
+            label="Flux2/Klein staged binary build tasks",
+            needles=[
+                "build-klein-precache",
+                "klein9b_precache_sample_prompts.mojo",
+                "output/bin/klein_precache_sample_prompts",
+                "build-klein-sampler",
+                "klein_sample_cli.mojo",
+                "output/bin/klein_sample_cli",
+            ],
+            severity=P1,
+            acceptance="The daemon's required Klein sidecar binaries have first-class pixi build tasks.",
+        ),
+        check_contains(
+            DISPATCH_BACKEND,
+            category="workflow",
+            label="Flux2/Klein dispatches to KleinBackend",
+            needles=[
+                "KIND_KLEIN",
+                "from serenitymojo.serve.klein_backend import KleinBackend",
+                "return KIND_KLEIN",
+                'return String("klein")',
+                "Flux2-dev remains explicitly unsupported",
+            ],
+            severity=P1,
+            acceptance="Dispatch/isolated routing recognizes Klein as its own backend kind and does not route Flux2-dev through Klein.",
+        ),
+        check_not_contains(
+            KLEIN_BACKEND,
+            category="workflow",
+            label="Flux2/Klein backend has no stub output path",
+            needles=[
+                "StubBackend",
+                "_render_stub_png",
+                "stub-preview-step",
+            ],
+            severity=P1,
+            acceptance="The Klein backend can return successful sampler outputs, but it must not depend on StubBackend or stub image generation.",
+        ),
+        check_contains(
+            WORKER,
+            category="workflow",
+            label="Flux2/Klein worker kind",
+            needles=[
+                "from serenitymojo.serve.klein_backend import KleinBackend",
+                'elif kind == "klein"',
+                "KleinBackend()",
+            ],
+            severity=P1,
+            acceptance="Process-isolated daemon workers can construct the fail-loud Klein backend contract kind.",
         ),
         check_contains(
             ZIMAGE_BACKEND,
@@ -413,6 +1335,20 @@ def check_family_surfaces() -> list[Check]:
             acceptance="Qwen unsupported families fail loud instead of silently no-oping.",
         ),
         check_contains(
+            IDEOGRAM4_BACKEND,
+            category="sampler",
+            label="Ideogram4 simple AuraFlow schedule",
+            needles=[
+                "_build_ideogram4_simple_sigmas",
+                "ideogram4_simple_flowmatch",
+                "ideogram4_comfy_simple_aura_flow",
+                "cfg_override",
+                "sigma_shift",
+            ],
+            severity=P1,
+            acceptance="Imported Ideogram4 Comfy workflows can request the bounded simple AuraFlow scheduler with CFGOverride metadata.",
+        ),
+        check_contains(
             IMAGE_IO,
             category="image",
             label="flat init-image decode formats",
@@ -428,7 +1364,7 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             ZIMAGE_BACKEND,
             category="image",
-            label="Z-Image img2img resize and VAE encode",
+            label="Z-Image init-image encode substrate",
             needles=[
                 "resize_bilinear",
                 "_encode_init_latent",
@@ -437,7 +1373,7 @@ def check_family_surfaces() -> list[Check]:
                 "start step",
             ],
             severity=P1,
-            acceptance="Z-Image flat img2img has a Mojo decode/resize/encode path.",
+            acceptance="Z-Image has Mojo decode/resize/encode substrate for bounded init-image/LanPaint/refiner experiments; this is not accepted general i2i parity.",
         ),
         check_contains(
             DAEMON,
@@ -459,6 +1395,776 @@ def check_family_surfaces() -> list[Check]:
     ]
 
 
+WORKFLOW_GRAPH_SMOKE_ACCEPTANCE = (
+    "A daemon product smoke posts linked, LoRA, img2img, mask, Comfy API prompt, SerenityFlow t2i API-prompt graphs, "
+    "bounded SerenityFlow edit graphs, and the Ideogram4 visual export, emits PNG genparams, "
+    "and verifies typed-link/unsupported-node 501 failures."
+)
+
+KLEIN_REFERENCE_DAEMON_SMOKE_ACCEPTANCE = (
+    "A real dispatch-mode daemon smoke runs a bounded Klein 4B ReferenceLatent edit through "
+    "Qwen3 cap-cache precache plus the staged Klein sampler, emits a PNG with genparams, "
+    "and writes the Klein daemon result manifest."
+)
+
+KLEIN_LORA_DAEMON_SMOKE_ACCEPTANCE = (
+    "A real dispatch-mode daemon smoke runs bounded Klein 9B LoRA txt2img through "
+    "Qwen3 cap-cache precache plus the staged Klein sampler, emits a PNG with genparams, "
+    "writes the Klein daemon result manifest, and proves the AI Toolkit/Comfy LoRA loader path."
+)
+
+KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE = (
+    "A real dispatch-mode daemon smoke runs SerenityFlow's Klein 9B edit-LoRA Comfy graph through "
+    "graph LoRA lowering, ReferenceLatent metadata lowering, Qwen3 cap-cache precache, and the "
+    "staged Klein ReferenceLatent sampler with the AI Toolkit/Comfy LoRA loaded."
+)
+
+LANPAINT_ORACLE_SURFACE_ACCEPTANCE = (
+    "A no-heavy checker pins representative LanPaint workflow exports, Python node semantics, "
+    "SetLatentNoiseMask noise-mask behavior, Mojo mask math substrate, and the current fail-loud "
+    "boundary before real mask-aware backend runtime is claimed."
+)
+
+LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE = (
+    "A no-heavy daemon product smoke posts a real LanPaint Comfy UI canvas to the stub backend, "
+    "lowers visual nodes/links through the typed graph executor, and proves mask/LanPaint metadata "
+    "survives into PNG genparams without claiming real mask-aware denoise."
+)
+
+
+def dict_or_empty(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def genparams_from_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    return dict_or_empty(dict_or_empty(evidence.get("png")).get("genparams"))
+
+
+def serenityflow_t2i_case(report: dict[str, Any], case_name: str) -> dict[str, Any]:
+    cases = report.get("serenityflow_t2i")
+    if cases is not None and not isinstance(cases, dict):
+        return {"_shape_error": "serenityflow_t2i must be an object"}
+    if isinstance(cases, dict):
+        case = cases.get(case_name)
+        if case is not None and not isinstance(case, dict):
+            return {"_shape_error": f"serenityflow_t2i.{case_name} must be an object"}
+        if isinstance(case, dict):
+            return case
+
+    legacy_prefix = f"serenityflow_{case_name}"
+    legacy = {
+        "generate": report.get(f"{legacy_prefix}_generate"),
+        "job": report.get(f"{legacy_prefix}_job"),
+        "png": report.get(f"{legacy_prefix}_png"),
+    }
+    return legacy if any(isinstance(value, dict) for value in legacy.values()) else {}
+
+
+def serenityflow_edit_case(report: dict[str, Any], case_name: str) -> dict[str, Any]:
+    cases = report.get("serenityflow_edit")
+    if not isinstance(cases, dict):
+        return {"_shape_error": "serenityflow_edit must be an object"}
+    case = cases.get(case_name)
+    if not isinstance(case, dict):
+        return {"_shape_error": f"serenityflow_edit.{case_name} must be an object"}
+    return case
+
+
+def prefixed_evidence(report: dict[str, Any], prefix: str) -> dict[str, Any]:
+    direct = report.get(prefix)
+    if isinstance(direct, dict):
+        return direct
+    if direct is not None:
+        return {"_shape_error": f"{prefix} must be an object"}
+
+    keys = [key for key in report if key.startswith(f"{prefix}_")]
+    if not keys:
+        return {}
+    return {
+        "generate": report.get(f"{prefix}_generate"),
+        "job": report.get(f"{prefix}_job"),
+        "png": report.get(f"{prefix}_png"),
+    }
+
+
+def evidence_has_job_png(evidence: dict[str, Any]) -> bool:
+    return isinstance(evidence.get("job"), dict) and isinstance(evidence.get("png"), dict)
+
+
+def genparam_matches(genparams: dict[str, Any], key: str, expected: Any) -> bool:
+    return key in genparams and genparams.get(key) == expected
+
+
+def evidence_count_matches(
+    evidence: dict[str, Any],
+    genparams: dict[str, Any],
+    workflow_key: str,
+    flat_key: str,
+    expected: int,
+) -> bool:
+    values = []
+    if workflow_key in genparams:
+        values.append(genparams.get(workflow_key))
+    if flat_key in evidence:
+        values.append(evidence.get(flat_key))
+    return bool(values) and all(value == expected for value in values)
+
+
+def validate_zimage_t2i_evidence(evidence: dict[str, Any]) -> str:
+    if evidence.get("_shape_error"):
+        return str(evidence["_shape_error"])
+    if not evidence_has_job_png(evidence):
+        return "SerenityFlow zimage_t2i job/png evidence missing from product report"
+    genparams = genparams_from_evidence(evidence)
+    expected = {
+        "workflow_source": "comfy_api_prompt_graph",
+        "model": "z_image_turbo_bf16.safetensors",
+        "prompt": "a stunning landscape photograph",
+        "negative": "",
+    }
+    missing = [
+        f"{key}={value!r}"
+        for key, value in expected.items()
+        if not genparam_matches(genparams, key, value)
+    ]
+    if missing:
+        return "SerenityFlow zimage_t2i metadata mismatch: " + ", ".join(missing)
+    if not evidence_count_matches(evidence, genparams, "workflow_node_count", "node_count", 10):
+        return "SerenityFlow zimage_t2i node count missing or mismatched"
+    if not evidence_count_matches(evidence, genparams, "workflow_edge_count", "edge_count", 10):
+        return "SerenityFlow zimage_t2i edge count missing or mismatched"
+    return ""
+
+
+def validate_klein_edit_evidence(evidence: dict[str, Any], case_name: str, model: str) -> str:
+    if evidence.get("_shape_error"):
+        return str(evidence["_shape_error"])
+    if not evidence_has_job_png(evidence):
+        return f"SerenityFlow edit {case_name} job/png evidence missing from product report"
+    genparams = genparams_from_evidence(evidence)
+    expected = {
+        "model": model,
+        "prompt": "change the dress to blue",
+        "negative": "",
+        "width": 1024,
+        "height": 1024,
+        "images": 1,
+        "steps": 35,
+        "seed": 42,
+        "cfg": 3.5,
+        "sampler": "euler",
+        "scheduler": "flux2",
+        "init_image": "input.png",
+        "reference_image": "input.png",
+        "reference_latent_method": "index",
+        "reference_latent_count": 2,
+        "workflow_node_count": 18,
+        "workflow_edge_count": 21,
+    }
+    missing = [
+        f"{key}={value!r}"
+        for key, value in expected.items()
+        if not genparam_matches(genparams, key, value)
+    ]
+    if missing:
+        return f"SerenityFlow edit {case_name} metadata mismatch: " + ", ".join(missing)
+    return ""
+
+
+def validate_ideogram4_visual_export_evidence(evidence: dict[str, Any]) -> str:
+    if not evidence:
+        return ""
+    if evidence.get("_shape_error"):
+        return str(evidence["_shape_error"])
+    if not evidence_has_job_png(evidence):
+        return "Ideogram4 visual export job/png evidence missing from product report"
+    genparams = genparams_from_evidence(evidence)
+    expected = {
+        "workflow_source": "ideogram4_comfy_ui_export",
+        "model": "ideogram-4-fp8",
+        "prompt": "a surreal streetwear collage poster with blue sky and large COMFY letters",
+        "width": 1024,
+        "height": 1024,
+        "seed": 424242,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "sigma_shift": 5,
+        "cfg": 7,
+        "workflow_node_count": 28,
+        "workflow_edge_count": 16,
+    }
+    missing = [
+        f"{key}={value!r}"
+        for key, value in expected.items()
+        if not genparam_matches(genparams, key, value)
+    ]
+    if missing:
+        return "Ideogram4 visual export metadata mismatch: " + ", ".join(missing)
+    return ""
+
+
+def _evidence_path(path_value: Any) -> Path:
+    path = Path(str(path_value or ""))
+    return path if path.is_absolute() else REPO / path
+
+
+def check_klein_reference_daemon_smoke_report(
+    smoke_path: Path, expected_variant: str, expected_model: str, expected_config: str,
+) -> Check:
+    report = read_json(smoke_path)
+    label = f"Klein {expected_variant} ReferenceLatent real daemon smoke"
+    if not report:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            label,
+            f"missing report: {rel(smoke_path)}",
+            rel(smoke_path),
+            KLEIN_REFERENCE_DAEMON_SMOKE_ACCEPTANCE,
+        )
+
+    generate = dict_or_empty(report.get("generate"))
+    job = dict_or_empty(report.get("job"))
+    genparams = dict_or_empty(report.get("genparams"))
+    manifest = dict_or_empty(report.get("manifest"))
+    output_path = _evidence_path(report.get("output_path"))
+    manifest_path = _evidence_path(report.get("manifest_path"))
+
+    missing = []
+    if generate.get("status") != 200:
+        missing.append("generate.status=200")
+    if job.get("state") != "done":
+        missing.append("job.state='done'")
+    if job.get("step") != 1 or job.get("total") != 1:
+        missing.append("job.step/total=1/1")
+    if not output_path.is_file():
+        missing.append(f"output PNG exists: {output_path}")
+    elif output_path.stat().st_size < 100_000:
+        missing.append("output PNG is nontrivial")
+    if not manifest_path.is_file():
+        missing.append(f"Klein manifest exists: {manifest_path}")
+
+    expected_genparams = {
+        "model": expected_model,
+        "prompt": "change the dress to blue",
+        "width": 512,
+        "height": 512,
+        "steps": 1,
+        "seed": 42,
+        "cfg": 3.5,
+        "sampler": "euler",
+        "scheduler": "flux2",
+        "creativity": 0.45,
+        "reference_latent_method": "index",
+        "reference_latent_count": 2,
+        "workflow_schema": "serenity.workflow_graph.v1",
+        "workflow_executor": "serenity.workflow_graph.executor.v1",
+        "workflow_source": "comfy_api_prompt_graph",
+        "workflow_node_count": 18,
+        "workflow_edge_count": 21,
+    }
+    missing.extend(
+        f"genparams.{key}={expected!r}"
+        for key, expected in expected_genparams.items()
+        if genparams.get(key) != expected
+    )
+    if not str(genparams.get("reference_image") or "").endswith("/output/serenity_daemon/job-0141.png"):
+        missing.append("genparams.reference_image=job-0141.png")
+
+    expected_manifest = {
+        "schema": "serenity.klein_daemon_result.v1",
+        "backend": "klein",
+        "variant": expected_variant,
+        "model": expected_model,
+        "config_path": expected_config,
+        "mode": "reference_latent_edit",
+        "reference_latent_count": 2,
+        "edit_denoise": 0.45,
+        "edit_shift": 2.02,
+        "reference_t_offset": 10.0,
+        "metadata_key": "serenity.genparams.v1",
+    }
+    missing.extend(
+        f"manifest.{key}={expected!r}"
+        for key, expected in expected_manifest.items()
+        if manifest.get(key) != expected
+    )
+    if not str(manifest.get("sampler_binary") or "").endswith("/output/bin/klein_sample_cli"):
+        missing.append("manifest.sampler_binary=output/bin/klein_sample_cli")
+    if not str(manifest.get("precache_binary") or "").endswith("/output/bin/klein_precache_sample_prompts"):
+        missing.append("manifest.precache_binary=output/bin/klein_precache_sample_prompts")
+
+    if missing:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            label,
+            "missing evidence: " + ", ".join(missing),
+            rel(smoke_path),
+            KLEIN_REFERENCE_DAEMON_SMOKE_ACCEPTANCE,
+        )
+
+    return Check(
+        True,
+        PASS,
+        "workflow",
+        label,
+        (
+            f"dispatch job {job.get('id')} wrote {rel(output_path)} with "
+            f"manifest mode {manifest.get('mode')}"
+        ),
+        rel(smoke_path),
+        KLEIN_REFERENCE_DAEMON_SMOKE_ACCEPTANCE,
+    )
+
+
+def check_klein_lora_daemon_smoke_report(smoke_path: Path) -> Check:
+    report = read_json(smoke_path)
+    label = "Klein 9B LoRA real daemon smoke"
+    if not report:
+        return Check(
+            False,
+            P1,
+            "lora",
+            label,
+            f"missing report: {rel(smoke_path)}",
+            rel(smoke_path),
+            KLEIN_LORA_DAEMON_SMOKE_ACCEPTANCE,
+        )
+
+    expected_lora = "/home/alex/Downloads/flux2_klein_9b_imperial_historical_lora.safetensors"
+    expected_prompt = (
+        "srx_ottoman, desert caravan approaching an ancient city, camel riders and "
+        "walking travelers in traditional robes and turbans, rocky desert road, "
+        "fortified historical city in the distance, domes and a tall minaret, warm "
+        "sunlight, dusty air, epic cinematic historical mood, highly detailed"
+    )
+    generate = dict_or_empty(report.get("generate"))
+    job = dict_or_empty(report.get("job"))
+    png = dict_or_empty(report.get("png"))
+    genparams = dict_or_empty(report.get("genparams"))
+    manifest = dict_or_empty(report.get("manifest"))
+    log_markers = dict_or_empty(report.get("log_markers"))
+    output_path = _evidence_path(report.get("output_path"))
+    manifest_path = _evidence_path(report.get("manifest_path"))
+
+    missing = []
+    if report.get("ready") is not True:
+        missing.append("report.ready=True")
+    if report.get("blockers") not in ([], None):
+        missing.append("report.blockers=[]")
+    if generate.get("status") != 200:
+        missing.append("generate.status=200")
+    if job.get("state") != "done":
+        missing.append("job.state='done'")
+    if job.get("step") != 4 or job.get("total") != 4:
+        missing.append("job.step/total=4/4")
+    if not output_path.is_file():
+        missing.append(f"output PNG exists: {output_path}")
+    elif output_path.stat().st_size < 100_000:
+        missing.append("output PNG is nontrivial")
+    if png.get("width") != 512 or png.get("height") != 512:
+        missing.append("png.width/height=512/512")
+    text_keys = png.get("text_keys")
+    if not isinstance(text_keys, list) or "serenity.genparams.v1" not in text_keys:
+        missing.append("png.text_keys includes serenity.genparams.v1")
+    if not str(report.get("idat_sha256") or ""):
+        missing.append("idat_sha256 is present")
+    if not manifest_path.is_file():
+        missing.append(f"Klein manifest exists: {manifest_path}")
+
+    expected_genparams = {
+        "schema": "serenity.genparams.v1",
+        "model": "flux2-klein-9b.safetensors",
+        "prompt": expected_prompt,
+        "prompt_raw": expected_prompt,
+        "negative": "",
+        "width": 512,
+        "height": 512,
+        "steps": 4,
+        "seed": 424242,
+        "cfg": 3.5,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "images": 1,
+        "creativity": 0.5,
+        "init_image": "",
+        "mask_image": "",
+        "reference_image": "",
+        "reference_latent_method": "",
+        "reference_latent_count": 0,
+    }
+    missing.extend(
+        f"genparams.{key}={expected!r}"
+        for key, expected in expected_genparams.items()
+        if genparams.get(key) != expected
+    )
+    loras = genparams.get("lora")
+    if not isinstance(loras, list) or len(loras) != 1:
+        missing.append("genparams.lora has one entry")
+    else:
+        lora = dict_or_empty(loras[0])
+        if lora.get("name") != expected_lora:
+            missing.append(f"genparams.lora[0].name={expected_lora!r}")
+        if lora.get("weight") != 1.0:
+            missing.append("genparams.lora[0].weight=1.0")
+
+    expected_manifest = {
+        "schema": "serenity.klein_daemon_result.v1",
+        "backend": "klein",
+        "variant": "9b",
+        "model": "flux2-klein-9b.safetensors",
+        "config_path": "/home/alex/mojodiffusion/serenitymojo/configs/klein9b.json",
+        "lora_count": 1,
+        "lora_name": expected_lora,
+        "lora_path": expected_lora,
+        "lora_weight": 1.0,
+        "metadata_key": "serenity.genparams.v1",
+    }
+    missing.extend(
+        f"manifest.{key}={expected!r}"
+        for key, expected in expected_manifest.items()
+        if manifest.get(key) != expected
+    )
+    if not str(manifest.get("sampler_binary") or "").endswith("/output/bin/klein_sample_cli"):
+        missing.append("manifest.sampler_binary=output/bin/klein_sample_cli")
+    if not str(manifest.get("precache_binary") or "").endswith("/output/bin/klein_precache_sample_prompts"):
+        missing.append("manifest.precache_binary=output/bin/klein_precache_sample_prompts")
+    if not Path(str(manifest.get("lora_path") or "")).is_file():
+        missing.append("manifest.lora_path exists on disk")
+    if not str(manifest.get("output_png") or "").endswith(output_path.name):
+        missing.append("manifest.output_png matches report output")
+    if log_markers.get("sample_command_has_lora") is not True:
+        missing.append("log_markers.sample_command_has_lora=True")
+    if log_markers.get("loaded_adapter_count") is not True:
+        missing.append("log_markers.loaded_adapter_count=True")
+    if log_markers.get("done_staged_sample") is not True:
+        missing.append("log_markers.done_staged_sample=True")
+
+    if missing:
+        return Check(
+            False,
+            P1,
+            "lora",
+            label,
+            "missing evidence: " + ", ".join(missing),
+            rel(smoke_path),
+            KLEIN_LORA_DAEMON_SMOKE_ACCEPTANCE,
+        )
+
+    return Check(
+        True,
+        PASS,
+        "lora",
+        label,
+        (
+            f"dispatch job {job.get('id')} wrote {rel(output_path)} with "
+            f"LoRA {Path(expected_lora).name}"
+        ),
+        rel(smoke_path),
+        KLEIN_LORA_DAEMON_SMOKE_ACCEPTANCE,
+    )
+
+
+def check_klein_lora_reference_daemon_smoke_report(smoke_path: Path) -> Check:
+    report = read_json(smoke_path)
+    label = "Klein 9B LoRA ReferenceLatent real daemon smoke"
+    if not report:
+        return Check(
+            False,
+            P1,
+            "lora",
+            label,
+            f"missing report: {rel(smoke_path)}",
+            rel(smoke_path),
+            KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE,
+        )
+
+    expected_lora = "/home/alex/Downloads/flux2_klein_9b_imperial_historical_lora.safetensors"
+    expected_reference = "/home/alex/mojodiffusion/output/serenity_daemon/job-0141.png"
+    generate = dict_or_empty(report.get("generate"))
+    job = dict_or_empty(report.get("job"))
+    png = dict_or_empty(report.get("png"))
+    genparams = dict_or_empty(report.get("genparams"))
+    manifest = dict_or_empty(report.get("manifest"))
+    workflow_metadata = dict_or_empty(report.get("workflow_metadata"))
+    log_markers = dict_or_empty(report.get("log_markers"))
+    output_path = _evidence_path(report.get("output_path"))
+    manifest_path = _evidence_path(report.get("manifest_path"))
+
+    missing = []
+    if report.get("ready") is not True:
+        missing.append("report.ready=True")
+    if report.get("blockers") not in ([], None):
+        missing.append("report.blockers=[]")
+    if workflow_metadata.get("workflow_path") != "/home/alex/serenityflow-v2/serenityflow/workflows/klein9b_edit_lora.json":
+        missing.append("workflow_metadata.workflow_path=klein9b_edit_lora.json")
+    if workflow_metadata.get("patched_lora_nodes") != 1:
+        missing.append("workflow_metadata.patched_lora_nodes=1")
+    if workflow_metadata.get("workflow_node_count") != 19:
+        missing.append("workflow_metadata.workflow_node_count=19")
+    if workflow_metadata.get("workflow_edge_count") != 22:
+        missing.append("workflow_metadata.workflow_edge_count=22")
+    if generate.get("status") != 200:
+        missing.append("generate.status=200")
+    if job.get("state") != "done":
+        missing.append("job.state='done'")
+    if job.get("step") != 1 or job.get("total") != 1:
+        missing.append("job.step/total=1/1")
+    if not output_path.is_file():
+        missing.append(f"output PNG exists: {output_path}")
+    elif output_path.stat().st_size < 100_000:
+        missing.append("output PNG is nontrivial")
+    if png.get("width") != 512 or png.get("height") != 512:
+        missing.append("png.width/height=512/512")
+    text_keys = png.get("text_keys")
+    if not isinstance(text_keys, list) or "serenity.genparams.v1" not in text_keys:
+        missing.append("png.text_keys includes serenity.genparams.v1")
+    if not str(report.get("idat_sha256") or ""):
+        missing.append("idat_sha256 is present")
+    if not manifest_path.is_file():
+        missing.append(f"Klein manifest exists: {manifest_path}")
+
+    expected_genparams = {
+        "schema": "serenity.genparams.v1",
+        "model": "flux2-klein-9b.safetensors",
+        "prompt": "change the dress to blue",
+        "negative": "",
+        "width": 512,
+        "height": 512,
+        "steps": 1,
+        "seed": 42,
+        "cfg": 3.5,
+        "sampler": "euler",
+        "scheduler": "flux2",
+        "creativity": 0.45,
+        "reference_image": expected_reference,
+        "reference_latent_method": "index",
+        "reference_latent_count": 2,
+        "workflow_schema": "serenity.workflow_graph.v1",
+        "workflow_executor": "serenity.workflow_graph.executor.v1",
+        "workflow_source": "comfy_api_prompt_graph",
+        "workflow_node_count": 19,
+        "workflow_edge_count": 22,
+    }
+    missing.extend(
+        f"genparams.{key}={expected!r}"
+        for key, expected in expected_genparams.items()
+        if genparams.get(key) != expected
+    )
+    loras = genparams.get("lora")
+    if not isinstance(loras, list) or len(loras) != 1:
+        missing.append("genparams.lora has one entry")
+    else:
+        lora = dict_or_empty(loras[0])
+        if lora.get("name") != expected_lora:
+            missing.append(f"genparams.lora[0].name={expected_lora!r}")
+        if lora.get("weight") != 1.0:
+            missing.append("genparams.lora[0].weight=1.0")
+
+    expected_manifest = {
+        "schema": "serenity.klein_daemon_result.v1",
+        "backend": "klein",
+        "variant": "9b",
+        "model": "flux2-klein-9b.safetensors",
+        "config_path": "/home/alex/mojodiffusion/serenitymojo/configs/klein9b.json",
+        "lora_count": 1,
+        "lora_name": expected_lora,
+        "lora_path": expected_lora,
+        "lora_weight": 1.0,
+        "mode": "reference_latent_edit",
+        "reference_image": expected_reference,
+        "reference_latent_count": 2,
+        "edit_denoise": 0.45,
+        "edit_shift": 2.02,
+        "reference_t_offset": 10.0,
+        "metadata_key": "serenity.genparams.v1",
+    }
+    missing.extend(
+        f"manifest.{key}={expected!r}"
+        for key, expected in expected_manifest.items()
+        if manifest.get(key) != expected
+    )
+    if not str(manifest.get("sampler_binary") or "").endswith("/output/bin/klein_sample_cli"):
+        missing.append("manifest.sampler_binary=output/bin/klein_sample_cli")
+    if not str(manifest.get("precache_binary") or "").endswith("/output/bin/klein_precache_sample_prompts"):
+        missing.append("manifest.precache_binary=output/bin/klein_precache_sample_prompts")
+    if not Path(str(manifest.get("lora_path") or "")).is_file():
+        missing.append("manifest.lora_path exists on disk")
+    if not str(manifest.get("output_png") or "").endswith(output_path.name):
+        missing.append("manifest.output_png matches report output")
+    if log_markers.get("sample_command_has_lora") is not True:
+        missing.append("log_markers.sample_command_has_lora=True")
+    if log_markers.get("sample_command_has_reference") is not True:
+        missing.append("log_markers.sample_command_has_reference=True")
+    if log_markers.get("loaded_adapter_count") is not True:
+        missing.append("log_markers.loaded_adapter_count=True")
+    if log_markers.get("reference_edit") is not True:
+        missing.append("log_markers.reference_edit=True")
+    if log_markers.get("done_staged_sample") is not True:
+        missing.append("log_markers.done_staged_sample=True")
+
+    if missing:
+        return Check(
+            False,
+            P1,
+            "lora",
+            label,
+            "missing evidence: " + ", ".join(missing),
+            rel(smoke_path),
+            KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE,
+        )
+
+    return Check(
+        True,
+        PASS,
+        "lora",
+        label,
+        (
+            f"dispatch job {job.get('id')} wrote {rel(output_path)} with "
+            f"ReferenceLatent edit plus LoRA {Path(expected_lora).name}"
+        ),
+        rel(smoke_path),
+        KLEIN_LORA_REFERENCE_DAEMON_SMOKE_ACCEPTANCE,
+    )
+
+
+def check_lanpaint_oracle_surface_report(report_path: Path) -> Check:
+    report = read_json(report_path)
+    if not report:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "LanPaint oracle surface report",
+            f"missing report: {rel(report_path)}",
+            rel(report_path),
+            LANPAINT_ORACLE_SURFACE_ACCEPTANCE,
+        )
+    if report.get("ready") is not True:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "LanPaint oracle surface report",
+            "report not ready: " + json.dumps(report.get("blockers")),
+            rel(report_path),
+            LANPAINT_ORACLE_SURFACE_ACCEPTANCE,
+        )
+    workflows = dict_or_empty(dict_or_empty(report.get("oracle")).get("workflows"))
+    missing = []
+    for case_name in ["zimage_inpaint", "qwen_image_inpaint", "flux2_klein_inpainting"]:
+        case = dict_or_empty(workflows.get(case_name))
+        if not case:
+            missing.append(f"oracle.workflows.{case_name}")
+            continue
+        counts = dict_or_empty(case.get("node_type_counts"))
+        if case_name == "flux2_klein_inpainting":
+            if counts.get("LanPaint_SamplerCustomAdvanced") != 1:
+                missing.append(f"{case_name}.LanPaint_SamplerCustomAdvanced=1")
+        else:
+            if counts.get("LanPaint_KSampler") != 1:
+                missing.append(f"{case_name}.LanPaint_KSampler=1")
+        if counts.get("LanPaint_MaskBlend") != 1:
+            missing.append(f"{case_name}.LanPaint_MaskBlend=1")
+        if case.get("mask_blend_overlap") != 9:
+            missing.append(f"{case_name}.mask_blend_overlap=9")
+        if case.get("image_to_mask_channel") != "red":
+            missing.append(f"{case_name}.image_to_mask_channel='red'")
+    if missing:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "LanPaint oracle surface report",
+            "missing evidence: " + ", ".join(missing),
+            rel(report_path),
+            LANPAINT_ORACLE_SURFACE_ACCEPTANCE,
+        )
+    return Check(
+        True,
+        PASS,
+        "workflow",
+        "LanPaint oracle surface report",
+        "oracle workflows and Python/Comfy mask semantics are pinned",
+        rel(report_path),
+        LANPAINT_ORACLE_SURFACE_ACCEPTANCE,
+    )
+
+
+def check_lanpaint_canvas_daemon_smoke_report(report_path: Path) -> Check:
+    report = read_json(report_path)
+    if not report:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "LanPaint canvas daemon smoke",
+            f"missing report: {rel(report_path)}",
+            rel(report_path),
+            LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
+        )
+    if report.get("ready") is not True:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "LanPaint canvas daemon smoke",
+            "report not ready: " + json.dumps(report.get("blockers")),
+            rel(report_path),
+            LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
+        )
+    job = dict_or_empty(report.get("job"))
+    png = dict_or_empty(report.get("png"))
+    genparams = dict_or_empty(png.get("genparams"))
+    expected = {
+        "workflow_source": "comfy_ui_canvas_graph",
+        "workflow_node_count": 11,
+        "workflow_edge_count": 17,
+        "model": "animagineXL40_v4Opt.safetensors",
+        "steps": 30,
+        "seed": 0,
+        "cfg": 5.0,
+        "sampler": "euler",
+        "scheduler": "karras",
+        "lanpaint_num_steps": 5,
+        "lanpaint_prompt_mode": "Image First",
+        "lanpaint_mask_blend_overlap": 9,
+    }
+    missing = [
+        f"genparams.{key}={value!r}"
+        for key, value in expected.items()
+        if genparams.get(key) != value
+    ]
+    if genparams.get("init_image") != genparams.get("mask_image"):
+        missing.append("init_image equals mask_image for SDXL LanPaint smoke")
+    if job.get("state") != "done":
+        missing.append("job.state='done'")
+    if not png.get("idat_sha256"):
+        missing.append("png.idat_sha256")
+    if missing:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "LanPaint canvas daemon smoke",
+            "missing evidence: " + ", ".join(missing),
+            rel(report_path),
+            LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
+        )
+    return Check(
+        True,
+        PASS,
+        "workflow",
+        "LanPaint canvas daemon smoke",
+        f"LanPaint canvas completed {job.get('id')} with PNG metadata",
+        rel(report_path),
+        LANPAINT_CANVAS_DAEMON_SMOKE_ACCEPTANCE,
+    )
+
+
 def check_workflow_graph_product_report() -> Check:
     report = read_json(WORKFLOW_GRAPH_PRODUCT)
     if not report:
@@ -469,7 +2175,7 @@ def check_workflow_graph_product_report() -> Check:
             "typed workflow graph product smoke",
             f"missing report: {rel(WORKFLOW_GRAPH_PRODUCT)}",
             rel(WORKFLOW_GRAPH_PRODUCT),
-            "A daemon product smoke posts a linked graph, emits PNG genparams, and verifies typed-link 501 failures.",
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
     blockers = report.get("blockers")
     if report.get("ready") is not True:
@@ -480,28 +2186,189 @@ def check_workflow_graph_product_report() -> Check:
             "typed workflow graph product smoke",
             "report not ready: " + json.dumps(blockers),
             rel(WORKFLOW_GRAPH_PRODUCT),
-            "A daemon product smoke posts a linked graph, emits PNG genparams, and verifies typed-link 501 failures.",
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
     job = report.get("job")
     png = report.get("png")
-    if not isinstance(job, dict) or not isinstance(png, dict):
+    api_job = report.get("comfy_api_job")
+    api_png = report.get("comfy_api_png")
+    img_job = report.get("img2img_job")
+    img_png = report.get("img2img_png")
+    lora_job = report.get("lora_job")
+    lora_png = report.get("lora_png")
+    mask_job = report.get("mask_job")
+    mask_png = report.get("mask_png")
+    sf_evidence = serenityflow_t2i_case(report, "zimage_t2i")
+    edit_klein9b_evidence = serenityflow_edit_case(report, "klein9b_edit")
+    edit_klein4b_evidence = serenityflow_edit_case(report, "klein4b_edit")
+    ideogram4_evidence = prefixed_evidence(report, "ideogram4_visual_export")
+    unsupported_api = report.get("unsupported_comfy_api_node")
+    if (
+        not isinstance(job, dict)
+        or not isinstance(png, dict)
+        or not isinstance(api_job, dict)
+        or not isinstance(api_png, dict)
+        or not isinstance(img_job, dict)
+        or not isinstance(img_png, dict)
+        or not isinstance(lora_job, dict)
+        or not isinstance(lora_png, dict)
+        or not isinstance(mask_job, dict)
+        or not isinstance(mask_png, dict)
+        or not isinstance(unsupported_api, dict)
+    ):
         return Check(
             False,
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing job/png evidence",
+            "report missing linked graph, Comfy API prompt, LoRA, img2img, mask, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
-            "A daemon product smoke posts a linked graph, emits PNG genparams, and verifies typed-link 501 failures.",
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
+    lora_genparams = lora_png.get("genparams")
+    lora_items = lora_genparams.get("lora") if isinstance(lora_genparams, dict) else None
+    if (
+        not isinstance(lora_items, list)
+        or len(lora_items) != 1
+        or not isinstance(lora_items[0], dict)
+        or lora_items[0].get("name") != "graph_lora.safetensors"
+        or lora_items[0].get("weight") != 0.8
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "LoraLoaderModelOnly metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    img_genparams = img_png.get("genparams")
+    if (
+        not isinstance(img_genparams, dict)
+        or img_genparams.get("init_image") != "/tmp/serenity_graph_init.png"
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "img2img LoadImage/VAEEncode metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    mask_genparams = mask_png.get("genparams")
+    if (
+        not isinstance(mask_genparams, dict)
+        or mask_genparams.get("init_image") != "/tmp/serenity_graph_init.png"
+        or mask_genparams.get("mask_image") != "/tmp/serenity_graph_mask.png"
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "SetLatentNoiseMask metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    api_genparams = api_png.get("genparams")
+    if (
+        not isinstance(api_genparams, dict)
+        or api_genparams.get("workflow_source") != "comfy_api_prompt_graph"
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "Comfy API prompt graph metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    sf_error = validate_zimage_t2i_evidence(sf_evidence)
+    if sf_error:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            sf_error,
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    edit_errors = [
+        validate_klein_edit_evidence(edit_klein9b_evidence, "klein9b_edit", "flux2-klein-9b.safetensors"),
+        validate_klein_edit_evidence(edit_klein4b_evidence, "klein4b_edit", "flux2-klein-4b.safetensors"),
+    ]
+    for edit_error in edit_errors:
+        if edit_error:
+            return Check(
+                False,
+                P1,
+                "workflow",
+                "typed workflow graph product smoke",
+                edit_error,
+                rel(WORKFLOW_GRAPH_PRODUCT),
+                WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+            )
+    ideogram4_error = validate_ideogram4_visual_export_evidence(ideogram4_evidence)
+    if ideogram4_error:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            ideogram4_error,
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    sf_job = dict_or_empty(sf_evidence.get("job"))
+    edit_jobs = [
+        ("klein9b_edit", dict_or_empty(edit_klein9b_evidence.get("job"))),
+        ("klein4b_edit", dict_or_empty(edit_klein4b_evidence.get("job"))),
+    ]
+    ideogram4_job = dict_or_empty(ideogram4_evidence.get("job"))
+    detail = (
+        f"linked graph completed {job.get('id')}; "
+        f"img2img graph completed {img_job.get('id')}; "
+        f"LoRA graph completed {lora_job.get('id')}; "
+        f"mask graph completed {mask_job.get('id')}; "
+        f"Comfy API prompt completed {api_job.get('id')}; "
+        "unsupported and wrong-type links returned HTTP 501"
+    )
+    sf_cases = report.get("serenityflow_t2i")
+    if isinstance(sf_cases, dict):
+        completed_cases = []
+        for case_name in sorted(sf_cases):
+            case = sf_cases.get(case_name)
+            if isinstance(case, dict):
+                case_job = dict_or_empty(case.get("job"))
+                if case_job.get("id"):
+                    completed_cases.append(f"{case_name} {case_job.get('id')}")
+        if completed_cases:
+            detail += "; SerenityFlow t2i completed " + ", ".join(completed_cases)
+        else:
+            detail += f"; SerenityFlow zimage_t2i completed {sf_job.get('id')}"
+    else:
+        detail += f"; SerenityFlow zimage_t2i completed {sf_job.get('id')}"
+    completed_edit_cases = [
+        f"{case_name} {case_job.get('id')}"
+        for case_name, case_job in edit_jobs
+        if case_job.get("id")
+    ]
+    if completed_edit_cases:
+        detail += "; SerenityFlow edit completed " + ", ".join(completed_edit_cases)
+    if ideogram4_evidence:
+        detail += f"; Ideogram4 visual export completed {ideogram4_job.get('id')}"
     return Check(
         True,
         PASS,
         "workflow",
         "typed workflow graph product smoke",
-        f"linked graph completed {job.get('id')} and wrote {png.get('path')}; unsupported and wrong-type links returned HTTP 501",
+        detail,
         rel(WORKFLOW_GRAPH_PRODUCT),
-        "A daemon product smoke posts a linked graph, emits PNG genparams, and verifies typed-link 501 failures.",
+        WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
     )
 
 
@@ -555,6 +2422,30 @@ def collect_checks() -> list[Check]:
     checks.extend(check_fail_loud())
     checks.extend(check_family_surfaces())
     checks.append(check_workflow_graph_product_report())
+    checks.append(
+        check_klein_reference_daemon_smoke_report(
+            KLEIN4B_REFERENCE_DAEMON_SMOKE,
+            "4b",
+            "flux2-klein-4b.safetensors",
+            "/home/alex/mojodiffusion/serenitymojo/configs/klein4b.json",
+        )
+    )
+    checks.append(
+        check_klein_reference_daemon_smoke_report(
+            KLEIN9B_REFERENCE_DAEMON_SMOKE,
+            "9b",
+            "flux2-klein-9b.safetensors",
+            "/home/alex/mojodiffusion/serenitymojo/configs/klein9b.json",
+        )
+    )
+    checks.append(check_klein_lora_daemon_smoke_report(KLEIN9B_LORA_DAEMON_SMOKE))
+    checks.append(
+        check_klein_lora_reference_daemon_smoke_report(
+            KLEIN9B_LORA_REFERENCE_DAEMON_SMOKE
+        )
+    )
+    checks.append(check_lanpaint_oracle_surface_report(LANPAINT_ORACLE_SURFACE))
+    checks.append(check_lanpaint_canvas_daemon_smoke_report(LANPAINT_CANVAS_DAEMON_SMOKE))
     return checks
 
 
@@ -564,7 +2455,7 @@ def build_report(checks: list[Check]) -> dict[str, object]:
     p2 = [check for check in checks if not check.ok and check.severity == P2]
     return {
         "schema": "serenity.workflow_node_surface_readiness.v1",
-        "scope": "static source markers plus the latest typed workflow graph product smoke report",
+        "scope": "workflow graph module markers plus the latest typed workflow graph product smoke report",
         "constrained_workflow_adapter_ready": not p0,
         "arbitrary_comfy_swarm_graph_execution_ready": False,
         "supported_t2i_graph_execution_ready": not p0 and not p1,

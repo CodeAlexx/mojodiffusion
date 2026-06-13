@@ -4,7 +4,7 @@
 # negative prompt with Qwen3-8B, writes cap-cache files, then exits so encoder
 # GPU memory is released before the trainer/sampler process starts.
 
-from sys import argv
+from std.sys import argv
 from std.gpu.host import DeviceContext
 
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
@@ -15,11 +15,14 @@ from serenitymojo.training.sample_prompt_config import read_sample_prompt_config
 
 
 comptime DEFAULT_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/klein9b_alina_samples.json"
+comptime QWEN4_DIR = (
+    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen3-4B/"
+    "snapshots/1cfa9a7208912126459214e8b04321603b3df60c"
+)
 comptime QWEN8_DIR = (
     "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen3-8B/"
     "snapshots/b968826d9c46dd6066d109eabc6255188de91218"
 )
-comptime TOK_JSON = QWEN8_DIR + "/tokenizer.json"
 comptime PAD_ID = 151643
 comptime SEQ = 512
 
@@ -71,6 +74,15 @@ def _mkdir_parent(path: String):
     _ = sys_system(String("mkdir -p ") + _dirname(path))
 
 
+def _variant_name(raw: String) raises -> String:
+    var v = String(raw.lower())
+    if v == String("") or v == String("9b") or v == String("klein9b"):
+        return String("9b")
+    if v == String("4b") or v == String("klein4b"):
+        return String("4b")
+    raise Error(String("klein precache: expected variant 9b or 4b, got ") + raw)
+
+
 def _encode_one(
     enc: Qwen3Encoder,
     tok: Qwen3Tokenizer,
@@ -96,13 +108,23 @@ def main() raises:
     var prompt_path = String(DEFAULT_PROMPTS)
     if len(args) >= 2:
         prompt_path = String(args[1])
+    var variant = String("9b")
+    if len(args) >= 3:
+        variant = _variant_name(String(args[2]))
 
-    print("=== Klein 9B validation prompt precache ===")
+    var qwen_dir = String(QWEN8_DIR)
+    var enc_cfg = Qwen3Config.klein_9b()
+    if variant == String("4b"):
+        qwen_dir = String(QWEN4_DIR)
+        enc_cfg = Qwen3Config.klein_4b()
+
+    print("=== Klein validation prompt precache ===")
+    print("[precache] variant: ", variant)
     print("[precache] prompt config: ", prompt_path)
     var cfg = read_sample_prompt_config(prompt_path)
     var ctx = DeviceContext()
-    var tok = Qwen3Tokenizer(TOK_JSON)
-    var enc = Qwen3Encoder.load(QWEN8_DIR, Qwen3Config.klein_9b(), ctx)
+    var tok = Qwen3Tokenizer(qwen_dir + String("/tokenizer.json"))
+    var enc = Qwen3Encoder.load(qwen_dir, enc_cfg, ctx)
 
     for i in range(len(cfg.prompts)):
         _encode_one(enc, tok, cfg.prompts[i], ctx)

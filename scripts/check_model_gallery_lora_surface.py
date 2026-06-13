@@ -25,6 +25,7 @@ IPC_CODEC = REPO / "serenitymojo/serve/ipc_codec.mojo"
 STUB_BACKEND = REPO / "serenitymojo/serve/stub_backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
 QWEN_BACKEND = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
+IDEOGRAM4_BACKEND = REPO / "serenitymojo/serve/ideogram4_backend.mojo"
 PARITY_DOC = REPO / "serenitymojo/docs/SWARMUI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
 ZIMAGE_MULTI_LORA_READINESS = REPO / "output/checks/zimage_multi_lora_product_readiness.json"
 UI_GALLERY_REUSE_STATE_READINESS = REPO / "output/checks/ui_gallery_reuse_state_readiness.json"
@@ -546,11 +547,12 @@ def checks() -> list[SurfaceCheck]:
                 STUB_BACKEND: ["encode_png_with_text", "serenity.genparams.v1"],
                 ZIMAGE_BACKEND: ["encode_png_with_text", "serenity.genparams.v1"],
                 QWEN_BACKEND: ["encode_png_with_text", "serenity.genparams.v1"],
+                IDEOGRAM4_BACKEND: ["encode_png_with_text", "serenity.genparams.v1"],
                 DAEMON: ["read_png_text", "GENPARAMS_TEXT_KEY", "params_json"],
             },
             severity="P1",
             acceptance_gate="Generated PNGs carry full params and gallery readback returns the same metadata key.",
-            evidence_label="Stub, Z-Image, and Qwen write PNG text; daemon reads serenity.genparams.v1.",
+            evidence_label="Stub, Z-Image, Qwen, and bounded Ideogram4 write PNG text; daemon reads serenity.genparams.v1.",
         )
     )
 

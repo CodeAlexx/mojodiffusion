@@ -6,8 +6,8 @@ blockers, or --strict-all to fail on every remaining SwarmUI-level blocker.
 
 This checker does not run CUDA, generate images, or claim parity. It makes the
 current product-path gaps machine-readable so the daemon/UI path cannot quietly
-claim SwarmUI parity while image generation still bypasses the fast runtime path
-or video remains dtype-broken.
+claim SwarmUI parity while image/video generation still lacks bounded runtime,
+artifact, timing, VRAM, and UX integration evidence.
 """
 
 from __future__ import annotations
@@ -30,11 +30,13 @@ WORKFLOW_MAP_DOC = REPO / "serenitymojo/docs/COMFY_SWARM_WORKFLOW_PARITY_MAP_202
 MODEL_GALLERY_LORA_MAP_DOC = REPO / "serenitymojo/docs/SWARMUI_MODEL_GALLERY_LORA_PARITY_MAP_2026-06-12.md"
 
 DAEMON = REPO / "serenitymojo/serve/serenity_daemon.mojo"
+WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
 VIDEO_API = REPO / "serenitymojo/serve/video_api.mojo"
 MODEL_SCAN = REPO / "serenitymojo/serve/model_scan.mojo"
 PROCESS_ISOLATED = REPO / "serenitymojo/serve/process_isolated_backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
 QWEN_BACKEND = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
+IDEOGRAM4_BACKEND = REPO / "serenitymojo/serve/ideogram4_backend.mojo"
 STUB_BACKEND = REPO / "serenitymojo/serve/stub_backend.mojo"
 ZIMAGE_DAEMON_PRODUCT_CHECK = REPO / "scripts/check_zimage_daemon_product_contract.py"
 SAMPLER_SURFACE_CHECK = REPO / "scripts/check_swarmui_sampler_surface.py"
@@ -400,6 +402,9 @@ def check_specialized_surface_blockers() -> list[Check]:
                 "scheduler_admission_for_backend",
                 "unsupported sampler",
                 "unsupported scheduler",
+                "_build_sigmas_with_shift",
+                "zimage_comfy_simple_sigmas",
+                "sigma_shift",
             ],
             severity=P0,
             acceptance="Z-Image fails loud for unsupported sampler/scheduler/image/variation settings before model work.",
@@ -417,6 +422,61 @@ def check_specialized_surface_blockers() -> list[Check]:
             ],
             severity=P0,
             acceptance="Qwen fails loud for unsupported sampler/scheduler/image/variation settings before model work.",
+        ),
+        check_contains(
+            IDEOGRAM4_BACKEND,
+            category="sampler",
+            label="Ideogram4 rejects bounded unsupported controls",
+            needles=[
+                "reject_unsupported_common_runtime_params",
+                "sampler_admission_for_backend",
+                "scheduler_admission_for_backend",
+                "negative prompt is not supported",
+                "LoRA is not supported",
+                "img2img/init image is not supported",
+                "creativity/denoise control is not supported",
+                "variation noise is not supported",
+                "unsupported size",
+                "cfg must be positive",
+                "_build_ideogram4_simple_sigmas",
+                "ideogram4_simple_flowmatch",
+                "ideogram4_comfy_simple_aura_flow",
+                "cfg_override",
+                "sigma_shift",
+            ],
+            severity=P0,
+            acceptance="Ideogram4 fails loud for bounded unsupported controls before text/DiT/VAE model work.",
+        ),
+        check_contains(
+            DAEMON,
+            category="sampler",
+            label="Ideogram4 prequeue rejects bounded unsupported controls",
+            needles=[
+                'sampler_backend == "ideogram4"',
+                "sampler_admission_for_backend",
+                "scheduler_admission_for_backend",
+                "negative prompt is not supported",
+                "LoRA is not supported",
+                "img2img/init image is not supported",
+                "creativity/denoise control is not supported",
+                "variation noise is not supported",
+            ],
+            severity=P0,
+            acceptance="Bounded Ideogram4 unsupported controls are rejected by /v1/generate before job fanout.",
+        ),
+        check_contains(
+            WORKFLOW_GRAPH,
+            category="sampler",
+            label="Ideogram4 Comfy workflow importer",
+            needles=[
+                "apply_ideogram4_comfy_ui_export",
+                "cfg_override_start_percent",
+                "ModelSamplingAuraFlow",
+                "CFGOverride",
+                "prompt-builder subgraph",
+            ],
+            severity=P0,
+            acceptance="The graph module imports the bounded Ideogram4 Comfy workflow shape before backend fanout.",
         ),
         check_contains(
             VARIATION_NOISE,
@@ -705,6 +765,8 @@ def check_daemon_surface() -> list[Check]:
                 "peak_vram_mib",
                 "unsupported_sampler_smoke",
                 "unipc_bh2_smoke",
+                "zimage_comfy_simple_sigmas",
+                "sigma_shift",
                 "multi_image_smoke",
                 "variation_smoke",
                 "executed_sampler",
@@ -756,6 +818,14 @@ def check_model_gallery_surface() -> list[Check]:
             needles=["encode_png_with_text", "serenity.genparams.v1"],
             severity=P1,
             acceptance="Second real image backend persists reusable params in PNG tEXt.",
+        ),
+        check_contains(
+            IDEOGRAM4_BACKEND,
+            category="gallery",
+            label="Ideogram4 backend writes PNG metadata",
+            needles=["encode_png_with_text", "serenity.genparams.v1"],
+            severity=P1,
+            acceptance="Bounded Ideogram4 image backend persists reusable params in PNG tEXt.",
         ),
         check_contains(
             DAEMON,
@@ -1168,13 +1238,13 @@ def check_docs_alignment() -> list[Check]:
         check_contains(
             HANDOFF_DOC,
             category="docs",
-            label="handoff states sampler fast-path work",
+            label="handoff states current bounded product evidence",
             needles=[
-                "samplers still run math-mode SDPA",
-                "switching sampler attention to flash",
+                "tracked no-CUDA product gate evidence is",
+                "Full SwarmUI parity remains",
             ],
             severity=P1,
-            acceptance="Handoff explicitly distinguishes trainer flash work from sampler/product path work.",
+            acceptance="Handoff distinguishes current bounded product evidence from a full SwarmUI parity claim.",
         ),
         check_contains(
             SAMPLER_HARNESS_DOC,
@@ -1211,7 +1281,7 @@ def build_report(checks: list[Check]) -> dict[str, object]:
         "Advanced Comfy/Swarm node families beyond the typed t2i graph remain unsupported.",
         "Z-Image speed parity is not accepted until the denoise path has paired baseline and optimized CFG/main-stack evidence.",
         "Remaining image/video backends with direct sdpa_nomask/sdpa_nomask_tiled product call sites are not accepted for speed parity until routed to flash or a proven model-specific fast kernel.",
-        "Ideogram4 cleared the Dh=256 fast-attention gate, but is not accepted until a daemon backend emits an artifact with metadata, timing, VRAM, gallery, and job evidence.",
+        "Ideogram4 has bounded artifact evidence, PNG metadata/gallery readback, a bounded fail-loud option gate, and cleared the Dh=256 fast-attention gate, but full parity still needs broader runtime, sampler, speed, quality, and UX evidence.",
     ]
     return {
         "schema": "serenity.swarmui.product_path_readiness.v1",

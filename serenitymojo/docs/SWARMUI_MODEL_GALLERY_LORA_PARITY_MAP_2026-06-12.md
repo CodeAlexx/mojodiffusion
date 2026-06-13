@@ -57,8 +57,9 @@ Latest Z-Image multi-LoRA product smoke:
 
 ```bash
 python3 scripts/check_zimage_daemon_product_contract.py \
-  --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-unipc-smoke \
-  --skip-multi-image-smoke --skip-variation-smoke \
+  --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-generic-unipc-smoke \
+  --skip-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke \
+  --skip-img2img-smoke \
   --write-readiness output/checks/zimage_multi_lora_product_readiness.json
 ```
 
@@ -86,7 +87,7 @@ single-LoRA, and stacked-LoRA outputs.
 | LoRA compatibility warnings | Warn or block incompatible model/LoRA combinations before starting a heavy model run. | `/v1/models?model=<name>` exposes per-LoRA `compatible`, `compatibility`, `target_arch`, `compatible_models`, and `incompatible_reason`. Backend admission remains fail-loud and authoritative. | Compatibility is family-level metadata, not a proof that every adapter tensor target can be applied. | `/v1/models` exposes compatibility status/reasons and `/v1/generate` rejects incompatible selections before CUDA-heavy work. |
 | Gallery list | Persistent generated-image gallery with metadata attached to each item. | `/v1/gallery` scans `output/serenity_daemon/job-*.png`, reads `serenity.genparams.v1`, supports `search`/`q`, `filter`, `sort`, and `favorite`, and returns `schema:"serenity.gallery.v1"`, `count`, `total`, and `items`. | UI grid behavior and selection persistence are not accepted by this API-only slice. | Restart smoke lists prior images; checker verifies sort/filter/thumb markers; UI or API gate shows stable gallery ordering and selection. |
 | Gallery read/import params | Open generated or arbitrary PNG files and recover generation parameters. | `/v1/gallery/<id>` reads generated job PNGs; `/v1/gallery/read?path=<png>` reads arbitrary local PNG metadata via `read_png_text`; `POST /v1/gallery/import` copies an external PNG into the indexed gallery. The runtime checker proves generated readback, external-path readback, and indexed import. | UI file-picker behavior is not accepted by this API-only slice. | Import a non-output PNG into the gallery index, load params into controls/request JSON, generate again, and prove metadata equality except server-added fields. |
-| PNG metadata | Generated PNGs carry full reusable params under a stable key. | Stub, Z-Image, and Qwen backends use `encode_png_with_text` with `serenity.genparams.v1`. Daemon gallery reads the same key. | Job DB caps params JSON, so the PNG text chunk is the authoritative full param store. | Artifact gate verifies dimensions and `serenity.genparams.v1`; readback params include model, prompt, seed, size, sampler/scheduler, LoRAs, init image, and prompt syntax metadata. |
+| PNG metadata | Generated PNGs carry full reusable params under a stable key. | Stub, Z-Image, Qwen, and bounded Ideogram4 backends use `encode_png_with_text` with `serenity.genparams.v1`. Daemon gallery reads the same key. | Job DB caps params JSON, so the PNG text chunk is the authoritative full param store. Ideogram4 metadata is proven only for the bounded one-step artifact, not full backend parity. | Artifact gate verifies dimensions and `serenity.genparams.v1`; readback params include model, prompt, seed, size, sampler/scheduler, LoRAs, init image, and prompt syntax metadata. Every promoted backend must keep the same PNG text metadata before full gallery/reuse acceptance. |
 | Reuse params | Click a gallery image and restore all generation controls. | Runtime checker normalizes gallery endpoint params and POSTs them back to `/v1/generate`; the second artifact preserves canonical authoring fields and records `params_source`, `reused_from_gallery_id`, `reused_from_path`, and `reused_from_job_id`. | Preset-derived outputs still need preset-name/source provenance before claiming preset-source parity. | Gallery item readback is POSTed into `/v1/generate`, the new job preserves canonical fields, and output metadata records source provenance. |
 | Gallery thumbnails | Show quick thumbnails/previews without decoding full images every view. | Gallery items lazily create pure-Mojo PNG thumbnails with `decode_png`, `resize_lanczos`, and `encode_png` under `output/serenity_daemon/thumbnails`; responses expose `thumbnail_path`, `thumb_path`, and `thumbnail_state`. | Cache invalidation is simple path-based; UI rendering of the thumbnails is not accepted by this slice. | Pure-Mojo thumbnail generation/cache under output state, exposed thumbnail paths, and static checker coverage. |
 | Gallery delete/rename/favorite | Delete or rename images and favorite/star important outputs persistently. | Runtime checker proves favorite persistence across daemon restart, `DELETE /v1/gallery/<id>` removes the PNG and cached thumbnail with libc `unlink`, `POST /v1/gallery/<id>/rename` persists display names, and `POST /v1/gallery/order` persists manual order metadata. | UI rendering of rename/order controls is not accepted by this API-only slice. | Favorite state survives daemon restart; delete removes file/cache; rename/manual-order policy is implemented or explicitly rejected; history behavior is documented and gated. |
@@ -97,18 +98,26 @@ single-LoRA, and stacked-LoRA outputs.
 
 ## Requested Model Targets
 
-- Ideogram4 is requested as a real image backend. Current status: not accepted.
+- Ideogram4 is requested as a real image backend. Current status: bounded
+  artifact exists, full product acceptance is still false.
   The local code has `serenitymojo/models/dit/ideogram4_dit.mojo` and
   `serenitymojo/models/dit/ideogram4_dit.mojo`; both reference and resident DiT
   attention now route through `ideogram4_sdpa_product_fwd`, backed by the
-  Dh=256 cuDNN SDPA forward gate at S=1024 and padded S=1153. Acceptance now
-  requires wiring the daemon backend and proving an artifact with dimensions,
-  `serenity.genparams.v1`, timings, positive peak VRAM, gallery/job DB entries,
-  and fail-loud unsupported options.
-- LTX2 video is a measured video target, not an accepted backend. After the
-  2026-06-12 flash-attention patch, the bounded daemon run reaches
-  `[Stage1] done` and times out while loading the spatial-x2 latent upsampler
-  and VAE per-channel stats; no MP4 is accepted yet.
+  Dh=256 cuDNN SDPA forward gate at S=1024 and padded S=1153. A bounded native
+  daemon run emitted `output/serenity_daemon/job-0106.png` plus
+  `output/serenity_daemon/job-0106.png.ideogram4_daemon_result.json` with
+  `1024x1024` dimensions, PNG `serenity.genparams.v1`, gallery readback, sidecar
+  timings, and positive peak VRAM. The fail-loud option smoke now proves HTTP
+  `422` prequeue rejection for bounded unsupported controls without new job
+  rows. Full acceptance now requires multi-step quality and resource proof plus
+  broader job/gallery reuse coverage.
+- LTX2 video is a measured video target, not an accepted backend. Current
+  bounded daemon evidence emits video-only and audio-enabled MP4 artifacts with
+  frame/duration/muxing/audio/timing/VRAM fields, and the clone-pair follow-up
+  profile reduced the staged resident no-audio runner to
+  `total_runner_seconds=171.75974076999955`. Full gallery/video parity remains
+  blocked by DEV-smoke scope, graph-native video nodes, quality/HQ coverage, and
+  broader workflow behavior.
 
 ## Exact Current Blockers
 
@@ -117,9 +126,10 @@ single-LoRA, and stacked-LoRA outputs.
   still not converted by the overlay path.
 - Image/video backends with direct product `sdpa_nomask`/`sdpa_nomask_tiled`
   call sites are not accepted for speed parity. Ideogram4 has cleared the
-  Dh=256 fast-attention gate, but is still not accepted until the daemon
-  product backend emits a real artifact with metadata, timings, VRAM, and
-  gallery/job evidence.
+  Dh=256 fast-attention gate and has bounded `job-0106` PNG metadata/gallery
+  evidence plus prequeue fail-loud option evidence. Full acceptance still
+  requires multi-step quality/resource proof and broader gallery/job reuse
+  coverage.
 - Model/LoRA browser real preview thumbnails, user notes, model favorite
   persistence, and full UI control restoration are not accepted by this slice.
 - UI/gallery/reuse/state tracked P1 is clear in the runtime checker:

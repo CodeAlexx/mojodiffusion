@@ -69,7 +69,8 @@ python3 scripts/check_swarmui_product_path_contract.py \
   --write-readiness output/checks/swarmui_product_path_readiness.json
 ```
 
-Current expected status after the Ideogram4 fast-attention slice:
+Current expected status after the LTX2 clone-pair, Z-Image generic UniPC, and
+bounded Ideogram4 daemon artifact slices:
 
 ```text
 checks=75 passed=75 p0=0 p1=0 p2=0
@@ -85,7 +86,7 @@ Meaning in plain English:
 - The remaining work is real backend depth, quality, sampler/workflow breadth,
   and runtime performance, not just more labels.
 
-## Latest Completed Slice: Ideogram4 Dh=256 Fast SDPA
+## Completed Slice: Ideogram4 Dh=256 Fast SDPA
 
 Pushed commit:
 
@@ -189,10 +190,11 @@ ParityResult(cos=0.9995574960620331, max_abs=0.4228515625, n=33280, PASS)
 
 Important non-claim:
 
-- Ideogram4 is **not** an accepted SwarmUI backend yet.
-- It still needs a daemon backend that emits a real artifact with dimensions,
-  `serenity.genparams.v1`, timing, positive peak VRAM, job DB/gallery evidence,
-  and fail-loud unsupported option behavior.
+- Ideogram4 fast SDPA by itself is **not** accepted SwarmUI backend parity.
+- A bounded daemon backend artifact now exists and the latest artifact embeds
+  reusable PNG metadata, but it is still only a one-step path/resource smoke. It
+  still needs multi-step quality/resource proof, speed/residency work, and
+  broader request-surface coverage before any full backend claim.
 
 ## Current LTX2 Slice: Resident FP8 No-Sync Dequant
 
@@ -391,22 +393,16 @@ Result:
   `ltx2_block_stream.mojo` and a pre-existing unused-assignment warning in
   `ops/fp8.mojo`.
 
-Optional but valuable if GPU time is available:
-
-```bash
-output/bin/ltx2_video_smoke_runner \
-  staged lora resident noaudio nonag profile output/ltx2_profile_after_no_sync 1
-```
-
-Then compare against the previous resident no-audio daemon evidence:
+This build was followed by the clone-pair speed slice below. The current
+representative staged resident no-audio profile is:
 
 ```text
-total_wall_seconds=186.882605556
-stage1_denoise_seconds=57.9751922939995
-stage2_denoise_seconds=76.74856130400076
-video_decode_seconds=28.060338318000504
-peak used=11490 MiB
-peak delta=10501 MiB
+output/ltx2_profile_after_clone_pair/ltx2_runner_timings.json
+total_runner_seconds=171.75974076999955
+stage1_denoise_seconds=56.413680857000145
+stage2_denoise_seconds=74.39678424900012
+video_decode_seconds=23.28128546500011
+connector_seconds=5.725665003001268
 ```
 
 If you run the daemon-level video checker, use:
@@ -421,6 +417,97 @@ python3 scripts/check_ltx2_video_daemon_product_contract.py \
 ```
 
 This is expensive, but it is the product-path gate.
+
+## Follow-Up LTX2 Slice: Block Output Clone Fence Coalescing
+
+Intent:
+
+The staged/refhq DiT loops cloned the video and audio block outputs with two
+separate `_clone(...)` calls after every transformer block. `_clone` enqueues one
+D2D copy and immediately fences with `ctx.synchronize()`, so each block paid two
+host/device fences at the output handoff. The new helper enqueues both video and
+audio D2D copies on the same stream, then fences once.
+
+Files touched by this follow-up slice:
+
+- `serenitymojo/pipeline/ltx2_t2v_av_hq.mojo`
+  - Adds `_TensorPair` and `_clone_pair(video, audio, ctx)`.
+  - Uses `_clone_pair` in staged `_model_forward_p` for both NAG and non-NAG
+    paths.
+  - Uses `_clone_pair` in `_refhq_forward_flat`.
+
+Verification:
+
+```bash
+python3 scripts/check_ltx2_dtype_contract.py --scope all
+python3 scripts/ltx2_parity_gate.py --only resident_fp8_loader --fail-fast
+python3 -m py_compile scripts/check_ltx2_dtype_contract.py scripts/check_swarmui_product_path_contract.py scripts/ltx2_parity_gate.py
+pixi run build-video-smoke
+```
+
+All passed. The build still emits the existing `len(String)` deprecation
+warnings from `ltx2_block_stream.mojo` and the existing unused-assignment warning
+in `ops/fp8.mojo`.
+
+Profile command:
+
+```bash
+/usr/bin/time -f 'elapsed=%E user=%U sys=%S maxrss=%MKB' \
+  output/bin/ltx2_video_smoke_runner staged lora resident noaudio nonag profile \
+  output/ltx2_profile_after_clone_pair 1
+```
+
+Result:
+
+```text
+elapsed=2:52.29 user=159.92 sys=5.38 maxrss=28500504KB
+```
+
+`output/ltx2_profile_after_clone_pair/ltx2_runner_timings.json`:
+
+```text
+total_runner_seconds=171.75974076999955
+stage1_denoise_seconds=56.413680857000145
+stage2_denoise_seconds=74.39678424900012
+video_decode_seconds=23.28128546500011
+connector_seconds=5.725665003001268
+```
+
+The immediately previous post-no-sync profile
+`output/ltx2_profile_after_no_sync/ltx2_runner_timings.json` was:
+
+```text
+total_runner_seconds=314.8831040389996
+stage1_denoise_seconds=124.44027067600109
+stage2_denoise_seconds=79.05193418400086
+video_decode_seconds=23.63663906399961
+connector_seconds=62.52942450699993
+```
+
+Same-profile comparison:
+
+```text
+total_runner_seconds: 314.883104 -> 171.759741 (1.833x)
+stage1_denoise_seconds: 124.440271 -> 56.413681 (2.206x)
+stage2_denoise_seconds: 79.051934 -> 74.396784 (1.063x)
+connector_seconds: 62.529425 -> 5.725665 (10.921x)
+```
+
+Artifact probe:
+
+```text
+output/ltx2_profile_after_clone_pair/ltx2_t2v_stage2_dev_smoke.mp4
+768x512, 121 frames, 5.041667s, 24fps, H.264, no audio stream
+```
+
+Interpretation:
+
+- The patch is a real speed improvement in the profiled staged resident path.
+- The remaining measured denoise bottleneck is still per-block load/materialize
+  overhead, not attention: after this patch, representative forward profile
+  lines show `load≈22s`, `lora≈0.8s`, and `block≈3.7-13.2s`.
+- This still does not accept full video parity. The artifact remains a bounded
+  `DEV SMOKE ONLY` output.
 
 ## Current LTX2 Video Evidence
 
@@ -442,20 +529,20 @@ Known evidence from the current docs/ledger:
 - `audio_behavior=video_only_no_audio_stream`
 - `mode:"staged lora resident noaudio nonag"`
 - `weight_mode:"resident"`
-- `total_wall_seconds=186.882605556`
-- `runner total_runner_seconds=186.00316528799885`
-- external peak VRAM delta `10501 MiB`
-- peak used `11490 MiB`
+- `total_wall_seconds=174.955233998`
+- runner `total_runner_seconds=174.44195223299903`
+- external peak VRAM delta `10476 MiB`
+- peak used `11226 MiB`
 - `accepted_video_parity:false`
 - `accepted_sampler_parity:false`
 
 Measured timings:
 
-- `stage1_denoise_seconds=57.9751922939995`
-- `stage2_denoise_seconds=76.74856130400076`
-- `video_decode_seconds=28.060338318000504`
-- `frame_png_write_seconds=1.718876539998746`
-- `video_mux_seconds=1.1828436699997837`
+- `stage1_denoise_seconds=57.315346847999535`
+- `stage2_denoise_seconds=75.27145183599896`
+- `video_decode_seconds=23.61521103099949`
+- `frame_png_write_seconds=1.7494108600003528`
+- `video_mux_seconds=0.6264517420004267`
 
 Prior stream no-audio comparison:
 
@@ -466,10 +553,11 @@ Prior stream no-audio comparison:
 
 Interpretation:
 
-- Resident mode already improved bounded wall time by about `15.5s` over stream.
-- The current no-sync resident dequant patch should target denoise load/fence
-  time. Do not claim a new speedup until a fresh profile or daemon run measures
-  it.
+- Resident mode plus the no-sync resident materializer and clone-pair fence
+  coalescing now improve the bounded wall time by about `27.4s` over the prior
+  stream no-audio gate.
+- This is still bounded video-smoke speed evidence, not full SwarmUI/HQ video
+  parity.
 
 Audio-enabled A/V daemon artifact:
 
@@ -528,23 +616,134 @@ Interpretation:
 - This proves a real product path and resource behavior.
 - It is not quality, sampler, or speed parity.
 
+## Current Ideogram4 Backend Evidence
+
+Bounded native Ideogram4 daemon proof:
+
+```text
+output/serenity_daemon/job-0106.png
+output/serenity_daemon/job-0106.png.ideogram4_daemon_result.json
+```
+
+Repeatable checker:
+
+```bash
+python3 scripts/check_ideogram4_daemon_product_contract.py --artifact \
+  output/serenity_daemon/job-0106.png --json
+```
+
+Known evidence:
+
+- Native `Ideogram4Backend` path exists; it does not shell out to Python.
+- PNG dimensions: `1024x1024`.
+- PNG tEXt key: `serenity.genparams.v1`.
+- Sidecar manifest schema: `serenity.ideogram4.daemon_result.v1`.
+- `readiness_label:"experimental"`.
+- `requested_sampler:"euler"`, `requested_scheduler:"logitnormal"`.
+- `executed_sampler:"ideogram4_logitnormal_euler"`,
+  `executed_scheduler:"ideogram4_logitnormal"`.
+- Fixed `1024` token text window, `prompt_tokens:15`, `lora_count:0`,
+  `variation_applied:false`.
+- `accepted_sampler_parity:false`, `accepted_speed_parity:false`.
+- The contract checker reports `bounded_artifact_ready:true` and
+  `runtime_acceptance:false`.
+- `/v1/gallery/read?path=/home/alex/mojodiffusion/output/serenity_daemon/job-0106.png`
+  returns `has_params:true`, `metadata_key:"serenity.genparams.v1"`, and
+  params matching the request.
+- PNG IDAT SHA256:
+  `95916a866934ec86df2cb18baefc392aad8d4dbabca918df7df7b759f658a215`.
+- Bounded fail-loud unsupported-option smoke:
+  `python3 scripts/check_ideogram4_daemon_product_contract.py
+  --fail-loud-smoke --write-readiness
+  output/checks/ideogram4_daemon_product_readiness.json --json`.
+  Latest run proved HTTP `422` prequeue rejection for negative prompt, LoRA,
+  prompt LoRA tag, init image, non-default creativity/denoise, variation,
+  unsupported size, unsupported sampler, unsupported scheduler, and nonpositive
+  CFG. `/v1/jobs` stayed at `126` rows, and the daemon log had
+  `expensive_markers_seen:[]` for Ideogram text/DiT/VAE load markers.
+
+Measured timings:
+
+- `load_seconds=75.44370386599999`
+- `text_encode_seconds=135.538652776`
+- `prepare_seconds=1.928370351`
+- `denoise_seconds=6.174464852`
+- `vae_decode_seconds=2.190651774`
+- `total_wall_seconds=221.428687069`
+- `peak_vram_mib=22088.6875`
+
+Known non-claims:
+
+- This is one-step smoke evidence, not 20-step quality acceptance.
+- PNG tEXt metadata and gallery readback are proven for the bounded one-step
+  artifact only.
+- Transformers are resident across denoise steps, not across jobs on the
+  24GB-class GPU.
+- Negative prompt, LoRA, init image/img2img, creativity/denoise, variation,
+  unsupported sampler/scheduler, unsupported size, and bad CFG now fail loud for
+  the bounded request set, but support for those features is still absent.
+- Speed parity, quality parity, sampler parity, and broad request-surface parity
+  remain unaccepted.
+
 ## Current Sampler / Workflow Evidence
 
 Accepted bounded sampler facts:
 
 - Z-Image DPM++ 2M/simple-flowmatch has bounded daemon artifact evidence.
 - Z-Image UniPC bh2/simple-flowmatch has bounded daemon artifact evidence.
+- Z-Image generic `uni_pc` now has bounded daemon artifact evidence. The product
+  checker emitted `output/serenity_daemon/job-0077.png` plus
+  `output/serenity_daemon/job-0077.png.zimage_daemon_result.json` from a
+  512x512 4-step `sampler:"uni_pc"`, `scheduler:"flowmatch"` smoke. The manifest
+  records `solver_type:"bh1"`, `solver_variant:"bh1"`, `solver_order:3`,
+  `sigma_parameterization:"SigmaConvert"`,
+  `schedule_source:"zimage_build_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`,
+  `unipc_update_steps:4`, `unipc_corrector_steps:3`,
+  `unipc_second_order_steps:2`, `denoise_seconds_per_step:0.29673903050000006`,
+  `peak_vram_mib:21379.875`, and `accepted_sampler_parity:false`.
+- Z-Image flat img2img/creativity now has bounded daemon artifact evidence. The
+  product checker emitted baseline `output/serenity_daemon/job-0087.png` and
+  img2img outputs `job-0088.png`, `job-0089.png`, and `job-0090.png`, reusing
+  `job-0087.png` as `init_image`. The 8-step img2img smoke records
+  `img2img_applied:true`, `denoise_start_step`, `steps_executed`,
+  `denoise_update_steps`, timings, and positive VRAM for creativity `0.0`,
+  `0.5`, and `1.0`. Current evidence:
+  `0.0 -> denoise_start_step:8, steps_executed:0`,
+  `0.5 -> denoise_start_step:6, steps_executed:1`, and
+  `1.0 -> denoise_start_step:0, steps_executed:7`; peak VRAM was
+  `21393.25 MiB`. Duplicate terminal zero sigma intervals are now treated as
+  no-op sentinels. This remains bounded flat-parameter evidence only and keeps
+  `accepted_img2img_parity:false`.
+- Latest full Z-Image daemon product gate after this scheduler-accounting patch:
+  `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900
+  --steps 1 --write-readiness output/checks/zimage_daemon_product_readiness.json`
+  passed. It covered unsupported sampler failure (`job-0091`), baseline
+  `job-0092`, img2img `job-0093` through `job-0095`, DPM++ 2M `job-0096`,
+  generic UniPC `job-0097`, UniPC bh2 `job-0098`, variation `job-0099`,
+  multi-image, and multi-LoRA `job-0101`. The latest img2img evidence keeps
+  `0.0 -> denoise_start_step:8, steps_executed:0`,
+  `0.5 -> denoise_start_step:6, steps_executed:1`, and
+  `1.0 -> denoise_start_step:0, steps_executed:7`.
 - `images=N` emits serial indexed daemon jobs with seed offsets and metadata.
 - Variation noise is implemented for image backends and proven for Z-Image by a
   daemon artifact gate.
 - `/v1/samplers` exposes a SwarmUI/Comfy catalog and backend support matrix.
+- `/v1/samplers` now includes `ideogram4` with bounded `euler`/flow-match
+  sampler aliases executing as `ideogram4_logitnormal_euler`, and only
+  `logitnormal`/`logit_normal`/`ideogram_logitnormal`/
+  `ideogram4_logitnormal` scheduler aliases.
 - Unsupported sampler names fail loud before model work.
 
 Known non-claims:
 
-- Generic `uni_pc` is not accepted by aliasing it to `uni_pc_bh2`.
-- Generic UniPC/order-3, ancestral, SDE, Karras, CFG++, and other daemon denoise
-  loops remain incomplete.
+- Generic `uni_pc` is not accepted by aliasing it to `uni_pc_bh2`; it now has a
+  distinct bounded bh1 artifact.
+- Generic `uni_pc` still does not make `accepted_sampler_parity:true`; the
+  remaining sampler catalog still needs distinct artifact/timing/VRAM evidence.
+- Ancestral, SDE, Karras, CFG++, and other daemon denoise loops remain
+  incomplete.
+- Z-Image img2img evidence does not cover graph `LoadImage`/`VAEEncode`,
+  masks, inpaint, or full quality parity.
 - True Comfy-style batched latent execution is not implemented.
 
 Workflow:
@@ -592,9 +791,14 @@ Do not mark the goal complete until these are actually done and proven:
    - Current daemon can emit bounded smoke MP4s with timings/VRAM.
    - Full SwarmUI/HQ parity still needs non-smoke quality, duration, audio,
      workflow, option coverage, and visual/audio acceptance.
-3. Ideogram4 daemon backend.
+3. Ideogram4 full backend parity.
    - Fast attention is wired.
-   - No accepted daemon backend artifact yet.
+   - A bounded native daemon artifact with PNG metadata/gallery readback exists
+     as `job-0106`.
+   - A bounded prequeue fail-loud option gate exists in
+     `output/checks/ideogram4_daemon_product_readiness.json`.
+   - Quality, sampler, speed, LoRA support, img2img support, variation support,
+     and broad request-surface parity remain unaccepted.
 4. Z-Image speed parity.
    - Product path works.
    - Paired baseline/optimized CFG/main-stack speed evidence is still needed.
@@ -616,22 +820,23 @@ Do not mark the goal complete until these are actually done and proven:
 
 ## Suggested Next Work Order
 
-Immediate continuation after the LTX2 resident no-sync slice is committed:
+Immediate continuation after the LTX2 clone-pair and img2img scheduler-accounting
+slices:
 
-1. If GPU time permits, run a fresh resident no-sync profile:
-   - `output/bin/ltx2_video_smoke_runner staged lora resident noaudio nonag profile output/ltx2_profile_after_no_sync 1`
-   - Compare `stage1_denoise`, `stage2_denoise`, total wall, and peak VRAM
-     against video-0074.
-2. Next real speed work after this slice:
-   - remove remaining hot linear/FP8 clone/sync points in LTX2 staged/refhq,
-   - profile with `nsys` only after the no-sync resident path is verified,
+1. Next real LTX2 speed work:
+   - attack remaining per-block load/materialize overhead in LTX2 staged/refhq,
+   - profile with `nsys` only after a stable clone-pair baseline is retained,
    - then decide whether CUTLASS/cuBLASLt FP8 is actually worth lifting into
      this path.
-3. Next image backend work:
-   - implement the Ideogram4 daemon backend and artifact gate.
-   - Use the same product acceptance shape as Z-Image: PNG, metadata, job DB,
-     gallery, timing, VRAM, fail-loud unsupported options.
-4. Next sampler/workflow breadth work:
+2. Next image backend work:
+   - harden Ideogram4 beyond `job-0106`: multi-step quality and resource
+     evidence, speed/residency measurement, and broader request-surface gates.
+   - Use the same product acceptance shape as Z-Image before making any full
+     backend claim: PNG metadata, job DB/gallery, timing, VRAM, and fail-loud
+     unsupported options.
+3. Next sampler/workflow breadth work:
+   - keep Z-Image img2img accounting tied to real update intervals
+     (`job-0088` through `job-0090` prove the current bounded gate),
    - promote only sampler variants with runtime artifact/timing/VRAM evidence,
    - keep unsupported Comfy/Swarm nodes fail-loud until they have typed graph
      execution and product-path tests.

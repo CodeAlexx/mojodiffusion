@@ -1,4 +1,4 @@
-# sampling/unipc.mojo — UniPC multistep predictor-corrector scheduler (bh2).
+# sampling/unipc.mojo — UniPC multistep predictor-corrector schedulers.
 #
 # Pure-Mojo port of the bh2, solver_order=2, predict_x0=true UniPC multistep
 # scheduler from the EDv2 / inference-flame reference:
@@ -27,12 +27,12 @@
 # Gauss-Jordan (linsolve). The toy-ODE scalar integration and the rhos
 # coefficient checks are exercised in sampling/parity/unipc_parity.mojo.
 #
-# Comfy generic `uni_pc` is intentionally NOT wired to this scheduler. Local
-# Comfy dispatch maps `uni_pc` to sample_unipc(default variant='bh1') and
+# Local Comfy dispatch maps `uni_pc` to sample_unipc(default variant='bh1') and
 # `uni_pc_bh2` to sample_unipc_bh2(variant='bh2'). The generic path also uses
 # SigmaConvert, initial-noise scaling, final-zero replacement, and
-# order=min(3, len(sigmas)-2). Helpers below pin those semantics for the next
-# parity slice, but the tensor runtime remains bh2/order-2 only.
+# order=min(3, len(sigmas)-2). The bh2 scheduler below remains the accepted
+# Cosmos-style order-2 flow path; ComfyUniPcMultistepScheduler is the bounded
+# generic bh1/SigmaConvert runtime for Z-Image product smokes.
 #
 # Tensor math goes through serenitymojo.ops.tensor_algebra (mul_scalar/add/sub).
 # The small linear solve and all coefficient prep stay on host in f64. The ring
@@ -157,6 +157,130 @@ def generic_comfy_unipc_unsupported_reason() -> String:
         + "order=min(3,len(sigmas)-2), SigmaConvert, initial-noise scaling, "
         + "and final-zero replacement; it is not proven equivalent to the "
         + "current bh2/order-2 flow UniPC runtime"
+    )
+
+
+struct ComfyUniPcBh1Coeffs(Movable):
+    """Scalar bh1 coefficients for generic Comfy `uni_pc`.
+
+    `sigma_t` / `sigma_s0` are SigmaConvert std values, not raw flow sigmas.
+    `rhos` is mode-specific: predictor coefficients for predictor calls and
+    corrector coefficients for corrector calls.
+    """
+
+    var b_h: Float64
+    var alpha_t: Float64
+    var sigma_t: Float64
+    var sigma_s0: Float64
+    var h_phi_1: Float64
+    var rks: List[Float64]
+    var rhos: List[Float64]
+
+    def __init__(
+        out self,
+        b_h: Float64,
+        alpha_t: Float64,
+        sigma_t: Float64,
+        sigma_s0: Float64,
+        h_phi_1: Float64,
+        var rks: List[Float64],
+        var rhos: List[Float64],
+    ):
+        self.b_h = b_h
+        self.alpha_t = alpha_t
+        self.sigma_t = sigma_t
+        self.sigma_s0 = sigma_s0
+        self.h_phi_1 = h_phi_1
+        self.rks = rks^
+        self.rhos = rhos^
+
+
+def compute_comfy_bh1_coefficients(
+    sigmas: List[Float64],
+    step_index: Int,
+    order: Int,
+    is_corrector: Bool,
+) raises -> ComfyUniPcBh1Coeffs:
+    """Coefficient prep for Comfy generic `uni_pc` (variant='bh1').
+
+    Mirrors extra_samplers/uni_pc.py `multistep_uni_pc_bh_update` for the
+    predict_x0 branch, with SigmaConvert alpha/std/lambda.
+    """
+    if order < 1 or order > 3:
+        raise Error("compute_comfy_bh1_coefficients: order must be in [1, 3]")
+    var idx_t: Int
+    var idx_s0: Int
+    if is_corrector:
+        idx_t = step_index
+        idx_s0 = step_index - 1
+    else:
+        idx_t = step_index + 1
+        idx_s0 = step_index
+    var sigma_t_raw = sigmas[idx_t]
+    var sigma_s0_raw = sigmas[idx_s0]
+    var alpha_t = comfy_sigma_convert_alpha(sigma_t_raw)
+    var sigma_t = comfy_sigma_convert_std(sigma_t_raw)
+    var sigma_s0 = comfy_sigma_convert_std(sigma_s0_raw)
+    var lambda_t = comfy_sigma_convert_lambda(sigma_t_raw)
+    var lambda_s0 = comfy_sigma_convert_lambda(sigma_s0_raw)
+    var h = lambda_t - lambda_s0
+
+    var rks = List[Float64]()
+    for i in range(1, order):
+        var si: Int
+        if is_corrector:
+            si = step_index - (i + 1)
+        else:
+            si = step_index - i
+        if si < 0:
+            si = 0
+        var lambda_si = comfy_sigma_convert_lambda(sigmas[si])
+        rks.append((lambda_si - lambda_s0) / h)
+    rks.append(1.0)
+
+    var hh = -h
+    var h_phi_1 = _expm1_f64(hh)
+    var h_phi_k = h_phi_1 / hh - 1.0
+    var factorial_i = 1.0
+    var b_h = hh
+    var b_vec = List[Float64]()
+    for i in range(1, order + 1):
+        b_vec.append(h_phi_k * factorial_i / b_h)
+        factorial_i = factorial_i * Float64(i + 1)
+        h_phi_k = h_phi_k / hh - 1.0 / factorial_i
+
+    var r_mat = List[List[Float64]]()
+    for i in range(1, order + 1):
+        var row = List[Float64]()
+        for j in range(len(rks)):
+            var p = 1.0
+            for _ in range(i - 1):
+                p = p * rks[j]
+            row.append(p)
+        r_mat.append(row^)
+
+    var rhos = List[Float64]()
+    if is_corrector:
+        if order == 1:
+            rhos.append(0.5)
+        else:
+            rhos = _linsolve_f64(r_mat, b_vec)
+    else:
+        if order == 2:
+            rhos.append(0.5)
+        elif order > 2:
+            var pred_r = List[List[Float64]]()
+            var pred_b = List[Float64]()
+            for i in range(order - 1):
+                var row = List[Float64]()
+                for j in range(order - 1):
+                    row.append(r_mat[i][j])
+                pred_r.append(row^)
+                pred_b.append(b_vec[i])
+            rhos = _linsolve_f64(pred_r, pred_b)
+
+    return ComfyUniPcBh1Coeffs(
+        b_h, alpha_t, sigma_t, sigma_s0, h_phi_1, rks^, rhos^
     )
 
 
@@ -591,6 +715,202 @@ struct UniPcMultistepScheduler(Movable):
         # Predictor.
         var prev_sample = self._predictor(sample_after, this_order, ctx)
 
+        if self._lower_order_nums < self.solver_order:
+            self._lower_order_nums += 1
+        self._step_index += 1
+        return prev_sample^
+
+
+struct ComfyUniPcMultistepScheduler(Movable):
+    """Bounded generic Comfy `uni_pc` scheduler.
+
+    This is intentionally distinct from UniPcMultistepScheduler:
+    - solver_type is bh1, not bh2,
+    - solver_order is min(3, len(timesteps)-2),
+    - schedule math uses Comfy SigmaConvert,
+    - final zero is replaced with 0.001 before sampling.
+
+    The caller supplies data-prediction model outputs (x0/denoised). For
+    Z-Image that means scaling the sampler latent into the native model
+    coordinate, running the DiT velocity prediction, then converting velocity
+    to denoised before calling step().
+    """
+
+    var num_inference_steps: Int
+    var solver_order: Int
+    var _sigmas: List[Float64]
+    var _outputs: List[Optional[TArc]]
+    var _lower_order_nums: Int
+    var _last_sample: Optional[TArc]
+    var _step_index: Int
+    var _this_order: Int
+
+    def __init__(out self, var sigmas: List[Float64]) raises:
+        if len(sigmas) < 3:
+            raise Error(
+                "ComfyUniPcMultistepScheduler: need at least two inference steps"
+            )
+        var timesteps = build_comfy_unipc_timesteps(sigmas)
+        var order = comfy_unipc_effective_order(len(timesteps))
+        if order < 1:
+            raise Error("ComfyUniPcMultistepScheduler: computed solver_order < 1")
+        if order > 3:
+            order = 3
+        self.num_inference_steps = len(timesteps) - 1
+        self.solver_order = order
+        self._sigmas = timesteps^
+        self._outputs = List[Optional[TArc]]()
+        for _ in range(order):
+            self._outputs.append(None)
+        self._lower_order_nums = 0
+        self._last_sample = None
+        self._step_index = 0
+        self._this_order = 0
+
+    @staticmethod
+    def from_sigmas(var sigmas: List[Float64]) raises -> ComfyUniPcMultistepScheduler:
+        return ComfyUniPcMultistepScheduler(sigmas^)
+
+    def sigmas(self) -> List[Float64]:
+        return self._sigmas.copy()
+
+    def step_index(self) -> Int:
+        return self._step_index
+
+    def this_order(self) -> Int:
+        return self._this_order
+
+    def lower_order_nums(self) -> Int:
+        return self._lower_order_nums
+
+    def configured_order(self) -> Int:
+        return self.solver_order
+
+    def solver_type(self) -> String:
+        return String("bh1")
+
+    def schedule_source(self) -> String:
+        return String("zimage_build_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps")
+
+    def sigma_parameterization(self) -> String:
+        return String("SigmaConvert")
+
+    def initial_noise_scale(self) raises -> Float32:
+        return Float32(comfy_unipc_initial_noise_scale(self._sigmas[0]))
+
+    def model_input_scale_for_step(self) raises -> Float32:
+        if self._step_index >= self.num_inference_steps:
+            raise Error("ComfyUniPcMultistepScheduler: step_index out of range")
+        return Float32(1.0 / comfy_sigma_convert_alpha(self._sigmas[self._step_index]))
+
+    def final_sample_scale(self) raises -> Float32:
+        return Float32(1.0 / comfy_sigma_convert_alpha(self._sigmas[len(self._sigmas) - 1]))
+
+    def _predictor(
+        self, sample: Tensor, order: Int, ctx: DeviceContext
+    ) raises -> Tensor:
+        if not self._outputs[self.solver_order - 1]:
+            raise Error("Comfy UniPC predictor: m0 is None")
+        var m0 = self._outputs[self.solver_order - 1].value()[].clone(ctx)
+        var c = compute_comfy_bh1_coefficients(
+            self._sigmas, self._step_index, order, False
+        )
+
+        var coef_x = Float32(c.sigma_t / c.sigma_s0)
+        var coef_m0 = Float32(c.alpha_t * c.h_phi_1)
+        var term_x = mul_scalar(sample, coef_x, ctx)
+        var term_m0 = mul_scalar(m0, coef_m0, ctx)
+        var x_t_ = sub(term_x, term_m0, ctx)
+        if order == 1:
+            return x_t_^
+
+        var total = mul_scalar(m0, Float32(0.0), ctx)
+        for hist in range(order - 1):
+            var slot = self.solver_order - 2 - hist
+            if slot < 0 or not self._outputs[slot]:
+                raise Error("Comfy UniPC predictor: missing history output")
+            var mh = self._outputs[slot].value()[].clone(ctx)
+            var diff = sub(mh, m0, ctx)
+            var d1 = mul_scalar(diff, Float32(1.0 / c.rks[hist]), ctx)
+            var term = mul_scalar(d1, Float32(c.rhos[hist]), ctx)
+            total = add(total, term, ctx)
+        var coef_pred = Float32(c.alpha_t * c.b_h)
+        var pred_term = mul_scalar(total, coef_pred, ctx)
+        return sub(x_t_, pred_term, ctx)
+
+    def _corrector(
+        self,
+        this_model_output: Tensor,
+        last_sample: Tensor,
+        order: Int,
+        ctx: DeviceContext,
+    ) raises -> Tensor:
+        if not self._outputs[self.solver_order - 1]:
+            raise Error("Comfy UniPC corrector: m0 is None")
+        var m0 = self._outputs[self.solver_order - 1].value()[].clone(ctx)
+        var c = compute_comfy_bh1_coefficients(
+            self._sigmas, self._step_index, order, True
+        )
+
+        var coef_x = Float32(c.sigma_t / c.sigma_s0)
+        var coef_m0 = Float32(c.alpha_t * c.h_phi_1)
+        var term_x = mul_scalar(last_sample, coef_x, ctx)
+        var term_m0 = mul_scalar(m0, coef_m0, ctx)
+        var x_t_ = sub(term_x, term_m0, ctx)
+
+        var d1_t = sub(this_model_output, m0, ctx)
+        var total = mul_scalar(d1_t, Float32(c.rhos[len(c.rhos) - 1]), ctx)
+        for hist in range(order - 1):
+            var slot = self.solver_order - 2 - hist
+            if slot < 0 or not self._outputs[slot]:
+                raise Error("Comfy UniPC corrector: missing history output")
+            var mh = self._outputs[slot].value()[].clone(ctx)
+            var diff = sub(mh, m0, ctx)
+            var d1 = mul_scalar(diff, Float32(1.0 / c.rks[hist]), ctx)
+            var term = mul_scalar(d1, Float32(c.rhos[hist]), ctx)
+            total = add(term, total, ctx)
+
+        var coef_total = Float32(c.alpha_t * c.b_h)
+        var term_total = mul_scalar(total, coef_total, ctx)
+        return sub(x_t_, term_total, ctx)
+
+    def step(
+        mut self, model_output: Tensor, sample: Tensor, ctx: DeviceContext
+    ) raises -> Tensor:
+        if self._step_index >= self.num_inference_steps:
+            raise Error("Comfy UniPC step: step_index out of range")
+
+        var use_corrector = self._step_index > 0 and self._last_sample.__bool__()
+        var mo_convert = model_output.clone(ctx)
+
+        var sample_after: Tensor
+        if use_corrector:
+            var last = self._last_sample.value()[].clone(ctx)
+            sample_after = self._corrector(
+                mo_convert, last, self._this_order, ctx
+            )
+        else:
+            sample_after = sample.clone(ctx)
+
+        for i in range(self.solver_order - 1):
+            if self._outputs[i + 1]:
+                self._outputs[i] = Optional(self._outputs[i + 1].value())
+            else:
+                self._outputs[i] = None
+        self._outputs[self.solver_order - 1] = Optional(TArc(mo_convert^))
+
+        var this_order = self.solver_order
+        var remaining = self.num_inference_steps - self._step_index
+        if remaining < this_order:
+            this_order = remaining
+        if self._lower_order_nums + 1 < this_order:
+            this_order = self._lower_order_nums + 1
+        if this_order == 0:
+            raise Error("Comfy UniPC step: computed this_order=0")
+        self._this_order = this_order
+
+        self._last_sample = Optional(TArc(sample_after.clone(ctx)))
+        var prev_sample = self._predictor(sample_after, this_order, ctx)
         if self._lower_order_nums < self.solver_order:
             self._lower_order_nums += 1
         self._step_index += 1

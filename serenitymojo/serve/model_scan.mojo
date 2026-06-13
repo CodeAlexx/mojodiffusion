@@ -14,6 +14,7 @@
 #   distilled_guidance_layer             -> chroma
 #   double_blocks.                       -> flux        (flux1-dev family)
 #   audio_vae.                           -> ltx2        (audio-video bundle)
+#   embed_image_indicator                -> ideogram4   (Ideogram-4 DiT)
 #   model.diffusion_model.joint_blocks   -> sd3         (MMDiT full ckpt)
 #   model.diffusion_model.input_blocks   -> sdxl        (UNet full ckpt)
 #   input_blocks.0.                      -> sdxl        (bare UNet export)
@@ -165,6 +166,8 @@ def detect_arch(header: String) -> String:
         return String("flux")
     if header.find('"audio_vae.') >= 0:
         return String("ltx2")
+    if header.find('"embed_image_indicator.weight"') >= 0 or header.find('"llm_cond_proj.weight"') >= 0:
+        return String("ideogram4")
     if header.find('"model.diffusion_model.joint_blocks') >= 0:
         return String("sd3")
     if header.find('"model.diffusion_model.input_blocks') >= 0:
@@ -200,6 +203,8 @@ def detect_lora_target_arch(header: String) -> String:
         return String("flux")
     if header.find("qwen") >= 0:
         return String("qwen-image")
+    if header.find("ideogram") >= 0:
+        return String("ideogram4")
     if header.find("ltx") >= 0:
         return String("ltx2")
     return String("unknown")
@@ -232,8 +237,8 @@ def scan_checkpoints() raises -> List[ScanEntry]:
             pass  # unreadable/corrupt header -> unknown
         out.append(ScanEntry(files[i].name.copy(), files[i].path.copy(), arch^, files[i].size))
     # known model directories (diffusers-style trees; arch by identity)
-    var known_names: List[String] = ["zimage_base", "anima"]
-    var known_archs: List[String] = ["zimage", "anima"]
+    var known_names: List[String] = ["zimage_base", "anima", "ideogram-4-fp8"]
+    var known_archs: List[String] = ["zimage", "anima", "ideogram4"]
     for i in range(len(known_names)):
         var dir = String("/home/alex/.serenity/models/") + known_names[i]
         if _dir_exists(dir):
@@ -244,8 +249,8 @@ def scan_checkpoints() raises -> List[ScanEntry]:
     # transformer/vae subdirs — not flat .safetensors files, so the file scan
     # above misses them). These are the resident-backend targets the daemon can
     # switch to (model_scan.name == the backend.resident_model() string).
-    var ckpt_names: List[String] = ["qwen-image-2512"]
-    var ckpt_archs: List[String] = ["qwen-image"]
+    var ckpt_names: List[String] = ["qwen-image-2512", "ideogram-4-fp8"]
+    var ckpt_archs: List[String] = ["qwen-image", "ideogram4"]
     for i in range(len(ckpt_names)):
         var dir = String(CHECKPOINTS_DIR) + "/" + ckpt_names[i]
         if _dir_exists(dir):

@@ -47,9 +47,14 @@ from serenitymojo.models.klein.weights import (
 from serenitymojo.offload.plan import build_klein_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.models.vae.klein_decoder import KleinVaeDecoder
-from serenitymojo.ops.tensor_algebra import permute, reshape, reshape_owned, add, mul_scalar
+from serenitymojo.ops.tensor_algebra import (
+    permute, reshape, reshape_owned, add, mul_scalar, concat, slice,
+)
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
-from serenitymojo.sampling.flux2_klein import build_flux2_sigma_schedule, flux2_cfg
+from serenitymojo.sampling.flux2_klein import (
+    build_flux2_sigma_schedule, build_flux2_img2img_sigmas, flux2_cfg,
+)
 from serenitymojo.sampling.base_sampler import tokens_to_packed_nchw, save_image
 from serenitymojo.training.progress_display import (
     print_sample_setup, print_sample_step, print_sample_saved,
@@ -94,6 +99,52 @@ def _rope_host[N_IMG: Int, N_TXT: Int, S: Int, H: Int]() raises -> Tuple[List[Fl
                 for i in range(16):
                     var inv_freq = fexp(-log_theta * Float32(2 * i) / Float32(32))
                     var angle = Float32(pos) * inv_freq
+                    cos_vals.append(fcos(angle))
+                    sin_vals.append(fsin(angle))
+    return (cos_vals^, sin_vals^)
+
+
+# ReferenceLatent edit RoPE. This is the bounded Klein edit convention from
+# inference-flame klein_edit_infer.rs: target/noise ids [0,row,col,0] followed
+# by reference ids [ref_t,row,col,0]. Text ids remain [0,0,0,tok].
+def _rope_host_reference[
+    N_TARGET: Int, N_COMBINED: Int, N_TXT: Int, S: Int, H: Int, LH: Int, LW: Int
+](
+    ref_t_offset: Float32
+) raises -> Tuple[List[Float32], List[Float32]]:
+    comptime assert N_TARGET == LH * LW, "N_TARGET must match LH*LW"
+    comptime assert N_COMBINED == 2 * N_TARGET, "ReferenceLatent edit uses target+reference image tokens"
+    comptime assert S == N_TXT + N_COMBINED, "S must be text+target+reference"
+
+    var cos_vals = List[Float32]()
+    var sin_vals = List[Float32]()
+    var log_theta = flog(Float32(2000.0))
+    for tok in range(S):
+        var p0 = Float32(0.0)
+        var p1 = Float32(0.0)
+        var p2 = Float32(0.0)
+        var p3 = Float32(0.0)
+        if tok >= N_TXT:
+            var idx = tok - N_TXT
+            if idx >= N_TARGET:
+                p0 = ref_t_offset
+                idx -= N_TARGET
+            p1 = Float32(idx // LW)
+            p2 = Float32(idx % LW)
+        else:
+            p3 = Float32(tok)
+        for _h in range(H):
+            for axis in range(4):
+                var pos = p0
+                if axis == 1:
+                    pos = p1
+                elif axis == 2:
+                    pos = p2
+                elif axis == 3:
+                    pos = p3
+                for i in range(16):
+                    var inv_freq = fexp(-log_theta * Float32(2 * i) / Float32(32))
+                    var angle = pos * inv_freq
                     cos_vals.append(fcos(angle))
                     sin_vals.append(fsin(angle))
     return (cos_vals^, sin_vals^)
@@ -165,6 +216,38 @@ def _initial_noise_tokens_from_sidecar[N_IMG: Int, LH: Int, LW: Int](
     )
 
 
+def _reference_latent_tokens[N_IMG: Int, LH: Int, LW: Int](
+    var reference_latent_nchw: Tensor, in_ch: Int, ctx: DeviceContext
+) raises -> Tensor:
+    var sh = reference_latent_nchw.shape()
+    if (
+        len(sh) != 4
+        or sh[0] != 1
+        or sh[1] != in_ch
+        or sh[2] != LH
+        or sh[3] != LW
+    ):
+        raise Error(
+            String("Klein ReferenceLatent encoded source shape ")
+            + _shape_str(sh)
+            + String(" is not [1,")
+            + String(in_ch)
+            + String(",")
+            + String(LH)
+            + String(",")
+            + String(LW)
+            + String("]")
+        )
+    if reference_latent_nchw.dtype() != STDtype.BF16:
+        reference_latent_nchw = cast_tensor(reference_latent_nchw^, STDtype.BF16, ctx)
+    var p = List[Int]()
+    p.append(0); p.append(2); p.append(3); p.append(1)
+    var nhwc = permute(reference_latent_nchw^, p^, ctx)
+    var out_sh = List[Int]()
+    out_sh.append(N_IMG); out_sh.append(in_ch)
+    return reshape_owned(nhwc^, out_sh^)
+
+
 # ── STAGE 2: denoise on a freshly-loaded base stack + LIVE LoRA. The stack is
 # local here, so its weights FREE on return (before the VAE loads).
 def _denoise_lora_from_initial[
@@ -199,7 +282,8 @@ def _denoise_lora_from_initial[
         )
     else:
         lora = load_klein_lora_resume(
-            cfg.num_double, cfg.num_single, cfg.lora_rank, cfg.lora_alpha, lora_path, ctx
+            cfg.num_double, cfg.num_single, cfg.lora_rank, cfg.lora_alpha,
+            lora_path, ctx, cfg.d_model, cfg.mlp_hidden
         )
     scale_klein_lora_set(lora, lora_multiplier)
     var lora_dev = klein_lora_set_to_device(lora, ctx)
@@ -279,6 +363,120 @@ def _denoise_lora[
     )
 
 
+def _denoise_lora_reference_from_initial[
+    H: Int, Dh: Int, N_TARGET: Int, N_COMBINED: Int, N_TXT: Int, S: Int,
+    LH: Int, LW: Int
+](
+    cfg: TrainConfig,
+    lora_path: String,
+    pos_txt: Tensor,
+    neg_txt: Tensor,
+    cfg_scale: Float32,
+    num_steps: Int,
+    var x: Tensor,
+    reference_tokens: Tensor,
+    denoise_strength: Float32,
+    shift: Float32,
+    reference_t_offset: Float32,
+    ctx: DeviceContext,
+    lora_multiplier: Float32 = Float32(1.0),
+) raises -> Tensor:
+    comptime assert N_TARGET == LH * LW, "N_TARGET must match LH*LW"
+    comptime assert N_COMBINED == 2 * N_TARGET, "ReferenceLatent edit uses target+reference image tokens"
+    comptime assert S == N_TXT + N_COMBINED, "S must be text+target+reference"
+
+    var st = SafeTensors.open(cfg.checkpoint)
+    var seed_ts = Tensor.from_host([Float32(500.0)], [1], STDtype.F32, ctx)
+    var seed_vec_silu = build_klein_vec_silu(st, seed_ts, cfg.timestep_dim, cfg.d_model, ctx)
+    var base = load_klein_stack_base(st, seed_vec_silu, cfg.d_model, ctx)
+    var mod_weights = load_klein_step_mod_weights(st, cfg.d_model, ctx)
+    var plan = build_klein_block_plan(cfg.num_double, cfg.num_single)
+    var loader = TurboPlannedLoader.open(
+        cfg.checkpoint, plan^, OffloadConfig.synchronous_cfg_paired(), ctx
+    )
+
+    var lora: KleinLoraSet
+    if lora_path == String(""):
+        lora = build_klein_lora_set(
+            cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            cfg.lora_rank, cfg.lora_alpha
+        )
+    else:
+        lora = load_klein_lora_resume(
+            cfg.num_double, cfg.num_single, cfg.lora_rank, cfg.lora_alpha,
+            lora_path, ctx, cfg.d_model, cfg.mlp_hidden
+        )
+    scale_klein_lora_set(lora, lora_multiplier)
+    var lora_dev = klein_lora_set_to_device(lora, ctx)
+    var rope = _rope_host_reference[N_TARGET, N_COMBINED, N_TXT, S, H, LH, LW](
+        reference_t_offset
+    )
+    var cos_dev = Tensor.from_host(rope[0].copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_dev = Tensor.from_host(rope[1].copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+
+    var txt_tokens_t = TArc(pos_txt.clone(ctx))
+    var neg_tokens_t = TArc(neg_txt.clone(ctx))
+    var sigmas = build_flux2_img2img_sigmas(num_steps, shift, denoise_strength)
+    if denoise_strength < Float32(0.9999):
+        var sigma_start = sigmas[0]
+        x = add(
+            mul_scalar(x, sigma_start, ctx),
+            mul_scalar(reference_tokens, Float32(1.0) - sigma_start, ctx),
+            ctx,
+        )
+    var scratch = ScratchRingAllocator(ctx, 512 * 1024 * 1024, 2)
+    print_sample_setup(String("Klein-edit"), cfg.name, num_steps, cfg_scale, N_TARGET, cfg.n_layers())
+
+    for i in range(num_steps):
+        scratch.reset()
+        var sigma = sigmas[i]
+        var dt = sigmas[i + 1] - sigma
+        var t_step0 = perf_counter_ns()
+        var mods = build_klein_step_mods_device_cached(
+            mod_weights, sigma, cfg.timestep_dim, cfg.d_model, ctx
+        )
+        var img_mod = mods[0].copy()
+        var txt_mod = mods[1].copy()
+        var single_mod = mods[2].copy()
+        base.final_shift = mods[3].copy()
+        base.final_scale = mods[4].copy()
+
+        var combined = concat(0, ctx, x, reference_tokens)
+        var v_dev: Tensor
+        if cfg_scale == Float32(1.0):
+            var pred_full = klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[
+                H, Dh, N_COMBINED, N_TXT, S
+            ](
+                TArc(combined^), txt_tokens_t, base,
+                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch,
+            )
+            v_dev = slice(pred_full, 0, 0, N_TARGET, ctx)
+        else:
+            var preds = klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
+                H, Dh, N_COMBINED, N_TXT, S
+            ](
+                TArc(combined^), txt_tokens_t, neg_tokens_t, base,
+                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch,
+            )
+            var pred_pos = slice(preds.pos, 0, 0, N_TARGET, ctx)
+            var pred_neg = slice(preds.neg, 0, 0, N_TARGET, ctx)
+            v_dev = flux2_cfg(pred_pos, pred_neg, cfg_scale, ctx)
+        x = add(x, mul_scalar(v_dev, dt, ctx), ctx)
+        ctx.synchronize()
+        var t_step1 = perf_counter_ns()
+        var secs = Float64(t_step1 - t_step0) / 1.0e9
+        var speed = Float64(1.0) / secs if secs > 0.0 else Float64(0.0)
+        var step = i + 1
+        if step == 1 or step == num_steps or step % SAMPLE_SCREEN_EVERY == 0:
+            print_sample_step(String("Klein-edit"), step, num_steps, sigma, secs, speed)
+
+    return x.clone(ctx)
+
+
 # ── PUBLIC: sample one Klein image, staged (stack freed before VAE). ──────────
 def klein_sample[
     N_IMG: Int, N_TXT: Int, S: Int, LH: Int, LW: Int, H: Int, Dh: Int
@@ -354,4 +552,59 @@ def klein_sample_with_initial_noise[
     if out_png != String(""):
         save_image(img, out_png, ctx)
         print_sample_saved(String("Klein-sample"), out_png)
+    return img^
+
+
+# Public ReferenceLatent edit entry. The source image must already be encoded by
+# KleinVaeEncoder into [1,128,LH,LW]. This mirrors inference-flame's edit loop:
+# concat target noise tokens with reference tokens for every forward, then slice
+# predictions back to target tokens before the Euler update and VAE decode.
+def klein_sample_with_reference_latent[
+    N_TARGET: Int, N_COMBINED: Int, N_TXT: Int, S: Int, LH: Int, LW: Int,
+    H: Int, Dh: Int
+](
+    cfg: TrainConfig,
+    lora_path: String,
+    pos_txt: Tensor,
+    neg_txt: Tensor,
+    cfg_scale: Float32,
+    num_steps: Int,
+    seed: UInt64,
+    var reference_latent_nchw: Tensor,
+    out_png: String,
+    ctx: DeviceContext,
+    denoise_strength: Float32 = Float32(1.0),
+    shift: Float32 = Float32(2.02),
+    reference_t_offset: Float32 = Float32(10.0),
+    lora_multiplier: Float32 = Float32(1.0),
+) raises -> Tensor:
+    comptime assert N_TARGET == LH * LW, "N_TARGET must match LH*LW"
+    comptime assert N_COMBINED == 2 * N_TARGET, "ReferenceLatent edit uses target+reference image tokens"
+    comptime assert S == N_TXT + N_COMBINED, "S must be text+target+reference"
+    if cfg.n_heads != H:
+        raise Error(String("klein_sample_with_reference_latent: cfg.n_heads ") + String(cfg.n_heads)
+            + " != comptime H " + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("klein_sample_with_reference_latent: cfg.head_dim ") + String(cfg.head_dim)
+            + " != comptime Dh " + String(Dh))
+    if denoise_strength <= Float32(0.0) or denoise_strength > Float32(1.0):
+        raise Error("klein_sample_with_reference_latent: denoise_strength must be in (0,1]")
+
+    var x = _initial_noise_tokens[N_TARGET, LH, LW](cfg.in_channels, seed, ctx)
+    var ref_tokens = _reference_latent_tokens[N_TARGET, LH, LW](
+        reference_latent_nchw^, cfg.in_channels, ctx
+    )
+    var latent = _denoise_lora_reference_from_initial[
+        H, Dh, N_TARGET, N_COMBINED, N_TXT, S, LH, LW
+    ](
+        cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^,
+        ref_tokens, denoise_strength, shift, reference_t_offset, ctx,
+        lora_multiplier,
+    )
+    var packed = tokens_to_packed_nchw[LH, LW](latent, ctx)
+    var vae = KleinVaeDecoder[LH, LW].load(cfg.vae, ctx)
+    var img = vae.decode(packed, ctx)
+    if out_png != String(""):
+        save_image(img, out_png, ctx)
+        print_sample_saved(String("Klein-edit"), out_png)
     return img^

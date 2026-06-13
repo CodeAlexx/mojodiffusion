@@ -456,6 +456,28 @@ def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     return Tensor(dev^, x.shape(), x.dtype())
 
 
+@fieldwise_init
+struct _TensorPair(Movable):
+    var video: Tensor
+    var audio: Tensor
+
+    def move_into(deinit self, mut video_out: Tensor, mut audio_out: Tensor):
+        video_out = self.video^
+        audio_out = self.audio^
+
+
+def _clone_pair(video: Tensor, audio: Tensor, ctx: DeviceContext) raises -> _TensorPair:
+    var v_dev = ctx.enqueue_create_buffer[DType.uint8](video.nbytes())
+    var a_dev = ctx.enqueue_create_buffer[DType.uint8](audio.nbytes())
+    ctx.enqueue_copy(dst_buf=v_dev, src_buf=video.buf)
+    ctx.enqueue_copy(dst_buf=a_dev, src_buf=audio.buf)
+    ctx.synchronize()
+    return _TensorPair(
+        Tensor(v_dev^, video.shape(), video.dtype()),
+        Tensor(a_dev^, audio.shape(), audio.dtype()),
+    )
+
+
 def _linear_b(x: Tensor, w: Tensor, b: Tensor, ctx: DeviceContext) raises -> Tensor:
     return linear(x, w, Optional[Tensor](_clone(b, ctx)), ctx)
 
@@ -933,8 +955,8 @@ def _model_forward_p[
                 ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin,
                 nag, EPS, ctx,
             )
-            hs = _clone(outs_nag[0], ctx)
-            ahs = _clone(outs_nag[1], ctx)
+            var cloned = _clone_pair(outs_nag[0], outs_nag[1], ctx)
+            cloned^.move_into(hs, ahs)
             if profile:
                 ctx.synchronize()
                 t_block += perf_counter() - t0
@@ -951,8 +973,8 @@ def _model_forward_p[
                 v_cos, v_sin, a_cos, a_sin,
                 ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin, EPS, ctx,
             )
-            hs = _clone(outs[0], ctx)
-            ahs = _clone(outs[1], ctx)
+            var cloned = _clone_pair(outs[0], outs[1], ctx)
+            cloned^.move_into(hs, ahs)
             if profile:
                 ctx.synchronize()
                 t_block += perf_counter() - t0
@@ -2196,8 +2218,8 @@ def _refhq_forward_flat[
             vr.ca_v_cos, vr.ca_v_sin, ca_a_cos, ca_a_sin, EPS, ctx,
             skip_cross_modal,
         )
-        hs = _clone(outs[0], ctx)
-        ahs = _clone(outs[1], ctx)
+        var cloned = _clone_pair(outs[0], outs[1], ctx)
+        cloned^.move_into(hs, ahs)
     if verbose_lora:
         print(
             "  [refhq] factorized LoRA attach count (48 blocks @ mult",

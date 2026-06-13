@@ -52,14 +52,43 @@ struct JobParams(Copyable, Movable):
     var steps: Int
     var seed: Int
     var cfg: Float64
+    var cfg_override: Float64
+    var cfg_override_start_percent: Float64
+    var cfg_override_end_percent: Float64
     var sampler: String
     var scheduler: String
+    var sigma_shift: Float64
     var variation_seed: Int
     var variation_strength: Float64
     var images: Int       # requested output count from the UI request
     var image_index: Int  # 0-based output index for this backend job
     var image_count: Int  # total outputs for the original UI request
     var init_image: String   # P7 img2img: init image path ("" = txt2img)
+    # Comfy SetLatentNoiseMask/Inpaint: mask image path associated with a
+    # latent. Backends must either execute mask semantics or reject it loudly.
+    var mask_image: String
+    var lanpaint_mask_channel: String
+    var lanpaint_mask_blend_overlap: Int
+    var lanpaint_num_steps: Int
+    var lanpaint_lambda: Float64
+    var lanpaint_step_size: Float64
+    var lanpaint_beta: Float64
+    var lanpaint_friction: Float64
+    var lanpaint_prompt_mode: String
+    var lanpaint_inpainting_mode: String
+    var lanpaint_add_noise: String
+    var lanpaint_noise_seed: Int
+    var lanpaint_start_at_step: Int
+    var lanpaint_end_at_step: Int
+    var lanpaint_return_with_leftover_noise: String
+    var lanpaint_early_stop: Int
+    var lanpaint_inner_threshold: Float64
+    var lanpaint_inner_patience: Int
+    # Comfy ReferenceLatent/Klein edit source image. This is not ordinary
+    # img2img denoise init; Flux2/Klein consumes it through conditioning tokens.
+    var reference_image: String
+    var reference_latent_method: String
+    var reference_latent_count: Int
     var creativity: Float64  # P7: 0..1 — fraction of the sigma schedule the
                              # denoise starts from (1.0 = pure noise/txt2img)
     var loras: List[LoraSpec]
@@ -76,14 +105,39 @@ struct JobParams(Copyable, Movable):
         self.steps = 20
         self.seed = 0
         self.cfg = 4.5
+        self.cfg_override = -1.0
+        self.cfg_override_start_percent = 0.0
+        self.cfg_override_end_percent = 1.0
         self.sampler = String("")
         self.scheduler = String("")
+        self.sigma_shift = 3.0
         self.variation_seed = 0
         self.variation_strength = 0.0
         self.images = 1
         self.image_index = 0
         self.image_count = 1
         self.init_image = String("")
+        self.mask_image = String("")
+        self.lanpaint_mask_channel = String("")
+        self.lanpaint_mask_blend_overlap = -1
+        self.lanpaint_num_steps = -1
+        self.lanpaint_lambda = -1.0
+        self.lanpaint_step_size = -1.0
+        self.lanpaint_beta = -1.0
+        self.lanpaint_friction = -1.0
+        self.lanpaint_prompt_mode = String("")
+        self.lanpaint_inpainting_mode = String("")
+        self.lanpaint_add_noise = String("")
+        self.lanpaint_noise_seed = -1
+        self.lanpaint_start_at_step = -1
+        self.lanpaint_end_at_step = -1
+        self.lanpaint_return_with_leftover_noise = String("")
+        self.lanpaint_early_stop = -1
+        self.lanpaint_inner_threshold = -1.0
+        self.lanpaint_inner_patience = -1
+        self.reference_image = String("")
+        self.reference_latent_method = String("")
+        self.reference_latent_count = 0
         self.creativity = 0.5
         self.loras = List[LoraSpec]()
         self.params_json = String("")
@@ -105,6 +159,64 @@ def reject_unsupported_common_runtime_params(
     if params.image_index < 0 or params.image_index >= params.image_count:
         raise Error(
             backend_name + String(": image_index out of range for image_count")
+        )
+
+
+def reject_unsupported_reference_image_params(
+    params: JobParams, backend_name: String
+) raises:
+    """Reject Comfy ReferenceLatent/Klein edit fields on backends that do not
+    implement reference-image conditioning."""
+    if params.reference_image.byte_length() > 0 or params.reference_latent_count > 0:
+        raise Error(
+            backend_name
+            + String(": Comfy ReferenceLatent/reference image conditioning is not supported by this backend yet")
+        )
+
+
+def reject_unsupported_mask_image_params(
+    params: JobParams, backend_name: String
+) raises:
+    """Reject Comfy SetLatentNoiseMask/inpaint fields on backends that do not
+    implement mask-aware denoise."""
+    if params.mask_image.byte_length() > 0:
+        raise Error(
+            backend_name
+            + String(": Comfy SetLatentNoiseMask/inpaint mask conditioning is not supported by this backend yet")
+        )
+
+
+def has_lanpaint_runtime_params(params: JobParams) -> Bool:
+    return (
+        params.lanpaint_mask_channel.byte_length() > 0
+        or params.lanpaint_mask_blend_overlap >= 0
+        or params.lanpaint_num_steps >= 0
+        or params.lanpaint_lambda >= 0.0
+        or params.lanpaint_step_size >= 0.0
+        or params.lanpaint_beta >= 0.0
+        or params.lanpaint_friction >= 0.0
+        or params.lanpaint_prompt_mode.byte_length() > 0
+        or params.lanpaint_inpainting_mode.byte_length() > 0
+        or params.lanpaint_add_noise.byte_length() > 0
+        or params.lanpaint_noise_seed >= 0
+        or params.lanpaint_start_at_step >= 0
+        or params.lanpaint_end_at_step >= 0
+        or params.lanpaint_return_with_leftover_noise.byte_length() > 0
+        or params.lanpaint_early_stop >= 0
+        or params.lanpaint_inner_threshold >= 0.0
+        or params.lanpaint_inner_patience >= 0
+    )
+
+
+def reject_unsupported_lanpaint_params(
+    params: JobParams, backend_name: String
+) raises:
+    """Reject LanPaint sampler/blend fields on backends that do not implement
+    the LanPaint mask-aware inner loop and final blend semantics."""
+    if has_lanpaint_runtime_params(params):
+        raise Error(
+            backend_name
+            + String(": LanPaint inpaint sampler/blend semantics are not supported by this backend yet")
         )
 
 

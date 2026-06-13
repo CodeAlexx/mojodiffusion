@@ -1,7 +1,8 @@
 # serenitymojo.serve.worker — Phase-5 child-process worker.
 #
 # Reached via `serenity_daemon worker <kind> <fd>` (fork+execv'd by the parent
-# ProcessIsolatedBackend). Runs ONE real backend (stub | zimage | qwenimage)
+# ProcessIsolatedBackend). Runs ONE real backend (stub | zimage | qwenimage |
+# ideogram4 | klein)
 # driven by newline-framed JSON over the inherited socket `fd` instead of HTTP.
 # A fresh process => fresh Mojo runtime + fresh CUDA context; the parent kills
 # this process to reclaim VRAM on a model switch. See
@@ -14,6 +15,8 @@ from serenitymojo.serve.backend import GenBackend, StepResult
 from serenitymojo.serve.stub_backend import StubBackend
 from serenitymojo.serve.zimage_backend import ZImageBackend
 from serenitymojo.serve.qwenimage_backend import QwenImageBackend
+from serenitymojo.serve.ideogram4_backend import Ideogram4Backend
+from serenitymojo.serve.klein_backend import KleinBackend
 from serenitymojo.serve.proc_ipc import LineReader, write_msg, set_nonblock
 from serenitymojo.serve.ipc_codec import (
     decode_start, encode_ev, encode_ready,
@@ -72,7 +75,8 @@ def _worker_loop[B: GenBackend](mut backend: B, fd: Int32) raises:
 
 def run_worker(kind: String, fd: Int32) raises:
     """Construct the kind's backend and serve it over `fd`. `kind` is the parent's
-    _kind_name string: "stub" (CPU) | "zimage" | "qwenimage" (GPU)."""
+    _kind_name string: "stub" (CPU) | "zimage" | "qwenimage" | "ideogram4" |
+    "klein" (GPU contract, fail-loud until cap-cache bridge is wired)."""
     if kind == "stub" or kind == "stub2":
         var b = StubBackend()      # stub2 = a 2nd distinct stub kind (CPU switch test)
         _worker_loop(b, fd)
@@ -82,5 +86,11 @@ def run_worker(kind: String, fd: Int32) raises:
     elif kind == "qwenimage":
         var b = QwenImageBackend()
         _worker_loop(b, fd)
+    elif kind == "ideogram4":
+        var b = Ideogram4Backend()
+        _worker_loop(b, fd)
+    elif kind == "klein":
+        var b = KleinBackend()
+        _worker_loop(b, fd)
     else:
-        raise Error("worker: unknown kind '" + kind + "' (want stub|zimage|qwenimage)")
+        raise Error("worker: unknown kind '" + kind + "' (want stub|zimage|qwenimage|ideogram4|klein)")

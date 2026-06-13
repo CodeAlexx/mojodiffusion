@@ -22,6 +22,12 @@
 # MODEL → KIND mapping (by the /v1/models scan `name`):
 #   "" | "zimage_base" | <anything starting "zimage">  -> Z-Image (default)
 #   "qwen-image-2512" | <anything containing "qwen">    -> Qwen-Image
+#   "ideogram-4-fp8" | <anything containing "ideogram"> -> Ideogram-4
+#   <anything containing "klein">                       -> Klein backend contract
+#                                                        adapter; fails loud until
+#                                                        cap-cache execution bridge
+#   <flux2-dev/flux-2-dev>                              -> explicit unsupported
+#                                                        (not a Klein runner)
 # An unknown model name is REJECTED at start() (fail-loud — no silent fallback
 # to a model the user didn't ask for).
 
@@ -32,10 +38,14 @@ from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_in
 from serenitymojo.serve.backend import GenBackend, JobParams, StepResult
 from serenitymojo.serve.zimage_backend import ZImageBackend
 from serenitymojo.serve.qwenimage_backend import QwenImageBackend
+from serenitymojo.serve.ideogram4_backend import Ideogram4Backend
+from serenitymojo.serve.klein_backend import KleinBackend
 
 comptime KIND_NONE = 0
 comptime KIND_ZIMAGE = 1
 comptime KIND_QWEN = 2
+comptime KIND_IDEOGRAM4 = 3
+comptime KIND_KLEIN = 4
 
 
 def _kind_for_model(model: String) raises -> Int:
@@ -45,6 +55,8 @@ def _kind_for_model(model: String) raises -> Int:
         return KIND_ZIMAGE
     if model == String("qwen-image-2512"):
         return KIND_QWEN
+    if model == String("ideogram-4-fp8"):
+        return KIND_IDEOGRAM4
     # tolerant matching for the scanner's many zimage/qwen checkpoint names
     # (z_image_base_bf16, z_image_turbo_bf16, qwen_image_fp8_e4m3fn, …) and
     # hand-typed names / arch tags. NOTE: the actual resident weights served are
@@ -52,15 +64,26 @@ def _kind_for_model(model: String) raises -> Int:
     # checkpoints aren't wired as distinct backends yet) — a variant name maps
     # to its family's resident backend so the UI's disk-scan model list works.
     var lo = model.lower()
+    if lo.find("ideogram") >= 0:
+        return KIND_IDEOGRAM4
+    if lo.find("flux2-dev") >= 0 or lo.find("flux-2-dev") >= 0 or lo.find("flux2_dev") >= 0:
+        raise Error(
+            String("flux2-dev model '") + model
+            + "' cannot run through the Klein daemon backend; Flux2-dev uses a "
+            + "different transformer/text contract and has no GenBackend product path yet"
+        )
+    if lo.find("klein") >= 0:
+        return KIND_KLEIN
     if lo.find("qwen") >= 0:
         return KIND_QWEN
     if lo.find("zimage") >= 0 or lo.find("z_image") >= 0 or lo.find("z-image") >= 0:
         return KIND_ZIMAGE
     raise Error(
         String("unknown model '") + model + "' — switchable resident models are"
-        + " Z-Image (name contains 'zimage'/'z_image'; default) and Qwen-Image"
-        + " (name contains 'qwen'); served weights are zimage_base (512x512) /"
-        + " qwen-image-2512 (1024x1024)"
+        + " Z-Image (name contains 'zimage'/'z_image'; default), Qwen-Image"
+        + " (name contains 'qwen'), and Ideogram-4 (name contains 'ideogram');"
+        + " served weights are zimage_base, qwen-image-2512, ideogram-4-fp8,"
+        + " and Klein admission-check routing; Flux2-dev remains explicitly unsupported"
     )
 
 
@@ -69,27 +92,40 @@ def _kind_name(kind: Int) -> String:
         return String("zimage")
     if kind == KIND_QWEN:
         return String("qwenimage")
+    if kind == KIND_IDEOGRAM4:
+        return String("ideogram4")
+    if kind == KIND_KLEIN:
+        return String("klein")
     return String("none")
 
 
 struct DispatchBackend(GenBackend, Movable):
     var ctx: DeviceContext
     var kind: Int                            # KIND_* of resident backend (NONE = idle)
-    var z: List[ArcPointer[ZImageBackend]]   # 0/1 (ArcPointer: backends are
-    var q: List[ArcPointer[QwenImageBackend]] # 0/1  Movable-not-Copyable, and
-                                             # List[T] needs T: Copyable — Arc is)
+    # 0/1 each. Backends are Movable-not-Copyable; ArcPointer is Copyable, so
+    # these can live in Lists.
+    var z: List[ArcPointer[ZImageBackend]]
+    var q: List[ArcPointer[QwenImageBackend]]
+    var i4: List[ArcPointer[Ideogram4Backend]]
+    var k: List[ArcPointer[KleinBackend]]
 
     def __init__(out self) raises:
         self.ctx = DeviceContext()
         self.kind = KIND_NONE
         self.z = List[ArcPointer[ZImageBackend]]()
         self.q = List[ArcPointer[QwenImageBackend]]()
+        self.i4 = List[ArcPointer[Ideogram4Backend]]()
+        self.k = List[ArcPointer[KleinBackend]]()
 
     def backend_name(self) -> String:
         if self.kind == KIND_ZIMAGE:
             return self.z[0][].backend_name()
         if self.kind == KIND_QWEN:
             return self.q[0][].backend_name()
+        if self.kind == KIND_IDEOGRAM4:
+            return self.i4[0][].backend_name()
+        if self.kind == KIND_KLEIN:
+            return self.k[0][].backend_name()
         return String("dispatch")  # idle, no backend constructed yet
 
     def model_name(self) -> String:
@@ -97,6 +133,10 @@ struct DispatchBackend(GenBackend, Movable):
             return self.z[0][].model_name()
         if self.kind == KIND_QWEN:
             return self.q[0][].model_name()
+        if self.kind == KIND_IDEOGRAM4:
+            return self.i4[0][].model_name()
+        if self.kind == KIND_KLEIN:
+            return self.k[0][].model_name()
         return String("-")
 
     def resident_model(self) -> String:
@@ -104,6 +144,10 @@ struct DispatchBackend(GenBackend, Movable):
             return self.z[0][].resident_model()
         if self.kind == KIND_QWEN:
             return self.q[0][].resident_model()
+        if self.kind == KIND_IDEOGRAM4:
+            return self.i4[0][].resident_model()
+        if self.kind == KIND_KLEIN:
+            return self.k[0][].resident_model()
         return String("")
 
     # ── free the resident backend (drop its DeviceBuffers, force the frees) ──
@@ -119,6 +163,8 @@ struct DispatchBackend(GenBackend, Movable):
         # device-side frees complete before we trim.
         self.z = List[ArcPointer[ZImageBackend]]()
         self.q = List[ArcPointer[QwenImageBackend]]()
+        self.i4 = List[ArcPointer[Ideogram4Backend]]()
+        self.k = List[ArcPointer[KleinBackend]]()
         self.kind = KIND_NONE
         self.ctx.synchronize()
         # F3 (authorized internal change, MEASURED no-op in THIS Mojo-runtime build):
@@ -157,6 +203,14 @@ struct DispatchBackend(GenBackend, Movable):
             print("[dispatch] constructing Qwen-Image backend")
             self.q = List[ArcPointer[QwenImageBackend]]()
             self.q.append(ArcPointer(QwenImageBackend()))
+        elif kind == KIND_IDEOGRAM4:
+            print("[dispatch] constructing Ideogram-4 backend")
+            self.i4 = List[ArcPointer[Ideogram4Backend]]()
+            self.i4.append(ArcPointer(Ideogram4Backend()))
+        elif kind == KIND_KLEIN:
+            print("[dispatch] constructing Flux2/Klein backend contract adapter")
+            self.k = List[ArcPointer[KleinBackend]]()
+            self.k.append(ArcPointer(KleinBackend()))
         else:
             raise Error("dispatch: invalid backend kind")
         self.kind = kind
@@ -167,14 +221,22 @@ struct DispatchBackend(GenBackend, Movable):
         self._ensure_kind(want)
         if self.kind == KIND_ZIMAGE:
             self.z[0][].start(params)
-        else:
+        elif self.kind == KIND_QWEN:
             self.q[0][].start(params)
+        elif self.kind == KIND_IDEOGRAM4:
+            self.i4[0][].start(params)
+        else:
+            self.k[0][].start(params)
 
     def step(mut self) raises -> StepResult:
         if self.kind == KIND_ZIMAGE:
             return self.z[0][].step()
         if self.kind == KIND_QWEN:
             return self.q[0][].step()
+        if self.kind == KIND_IDEOGRAM4:
+            return self.i4[0][].step()
+        if self.kind == KIND_KLEIN:
+            return self.k[0][].step()
         var r = StepResult()
         r.failed = True
         r.error = String("dispatch: no active backend")
@@ -185,6 +247,10 @@ struct DispatchBackend(GenBackend, Movable):
             self.z[0][].cancel()
         elif self.kind == KIND_QWEN:
             self.q[0][].cancel()
+        elif self.kind == KIND_IDEOGRAM4:
+            self.i4[0][].cancel()
+        elif self.kind == KIND_KLEIN:
+            self.k[0][].cancel()
 
     # ── F3 between-jobs pool trim (no switch) ──────────────────────────────────
     def between_jobs_trim(mut self) raises:

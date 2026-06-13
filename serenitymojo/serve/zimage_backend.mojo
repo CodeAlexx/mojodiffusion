@@ -4,7 +4,7 @@
 # the pull-based GenBackend seam (backend.mojo). EVERY numeric convention is
 # reused from zimage_generate (its helpers are imported, NOT re-derived):
 #   tokenizer → Qwen3-4B layer-34 encode → CFG dual-forward denoise
-#   (rectified-flow Euler, shift=6.0 sigmas) → Z-Image VAE decode → PNG SIGNED.
+#   (rectified-flow Euler, Comfy simple sigmas) → Z-Image VAE decode → PNG SIGNED.
 #
 # Residency model (24 GB GPU):
 #   * DiT weights (aux + nr/cr/main blocks + final linear) and the 64²-latent
@@ -68,7 +68,7 @@ from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_in
 from serenitymojo.ops.tensor_algebra import mul_scalar, add
 from serenitymojo.pipeline.zimage_generate import (
     encode_captions_fixed, gaussian_noise, _cast, _cap_seq_with_pad,
-    _unified_positions, _cfg_pred_overlay, _build_sigmas, _path_exists,
+    _unified_positions, _cfg_pred_overlay, _build_sigmas_with_shift, _path_exists,
     _json_escape, _write_text_file, _peak_vram_mib,
     TRANSFORMER, VAE_DIR,
     H, Dh, D, F, PATCH, CAPLEN_MAX, ROPE_THETA, AXIS0, AXIS1, AXIS2,
@@ -81,10 +81,14 @@ from serenitymojo.sampling.dpmpp_2m import (
     MultistepHistory, denoised_from_velocity, dpmpp_2m_step,
     lambda_from_sigma_f64,
 )
-from serenitymojo.sampling.unipc import UniPcMultistepScheduler
+from serenitymojo.sampling.unipc import (
+    UniPcMultistepScheduler, ComfyUniPcMultistepScheduler,
+)
 from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
+    reject_unsupported_reference_image_params, reject_unsupported_mask_image_params,
+    reject_unsupported_lanpaint_params,
 )
 from serenitymojo.serve.image_io import decode_image_any, image_to_signed_nchw
 from serenitymojo.serve.model_scan import LORAS_DIR
@@ -190,6 +194,23 @@ def _blocks_bytes(blocks: List[ZImageBlockWeights]) -> Int:
     return total
 
 
+def _build_comfy_unipc_sigmas(steps: Int, sigma_shift: Float32) raises -> List[Float32]:
+    """Mirror Comfy's `DISCARD_PENULTIMATE_SIGMA_SAMPLERS` prep for uni_pc."""
+    if steps < 2:
+        raise Error("zimage: generic uni_pc requires at least two steps")
+    var raw = _build_sigmas_with_shift(steps + 1, sigma_shift)
+    if len(raw) < 3:
+        raise Error("zimage: generic uni_pc sigma prep needs at least three sigmas")
+    var drop = len(raw) - 2
+    var out = List[Float32](capacity=steps + 1)
+    for i in range(len(raw)):
+        if i != drop:
+            out.append(raw[i])
+    if len(out) != steps + 1:
+        raise Error("zimage: generic uni_pc sigma prep length mismatch")
+    return out^
+
+
 def _save_rgb_png_with_text(
     rgb: Tensor, path: String, params_json: String, ctx: DeviceContext
 ) raises:
@@ -260,9 +281,15 @@ struct ZImageBackend(GenBackend, Movable):
     var dpmpp_update_steps: Int
     var dpmpp_second_order_steps: Int
     var unipc: List[ArcPointer[UniPcMultistepScheduler]]
+    var comfy_unipc: List[ArcPointer[ComfyUniPcMultistepScheduler]]
     var unipc_update_steps: Int
     var unipc_corrector_steps: Int
     var unipc_second_order_steps: Int
+    var unipc_third_order_steps: Int
+    var unipc_max_observed_order: Int
+    var unipc_solver_order: Int
+    var unipc_initial_noise_scale: Float32
+    var unipc_final_sample_scale: Float32
     var cap_seq_cond: List[Float32]
     var cap_seq_uncond: List[Float32]
     var rope: List[TArc]        # 12: cond x/cap/uni cos+sin, then uncond
@@ -310,9 +337,15 @@ struct ZImageBackend(GenBackend, Movable):
         self.dpmpp_update_steps = 0
         self.dpmpp_second_order_steps = 0
         self.unipc = List[ArcPointer[UniPcMultistepScheduler]]()
+        self.comfy_unipc = List[ArcPointer[ComfyUniPcMultistepScheduler]]()
         self.unipc_update_steps = 0
         self.unipc_corrector_steps = 0
         self.unipc_second_order_steps = 0
+        self.unipc_third_order_steps = 0
+        self.unipc_max_observed_order = 0
+        self.unipc_solver_order = 0
+        self.unipc_initial_noise_scale = Float32(1.0)
+        self.unipc_final_sample_scale = Float32(1.0)
         self.cap_seq_cond = List[Float32]()
         self.cap_seq_uncond = List[Float32]()
         self.rope = List[TArc]()
@@ -342,6 +375,9 @@ struct ZImageBackend(GenBackend, Movable):
         if self.active:
             raise Error("ZImageBackend.start: a job is already running")
         reject_unsupported_common_runtime_params(params, String("zimage"))
+        reject_unsupported_reference_image_params(params, String("zimage"))
+        reject_unsupported_mask_image_params(params, String("zimage"))
+        reject_unsupported_lanpaint_params(params, String("zimage"))
         var sampler_admission = sampler_admission_for_backend(String("zimage"), params.sampler)
         if not sampler_admission.supported:
             raise Error(
@@ -381,9 +417,18 @@ struct ZImageBackend(GenBackend, Movable):
         if len(lora_paths) > 0:
             lora_path = lora_paths[0].copy()
             lora_mult = lora_mults[0]
-        if sampler_admission.executed == "uni_pc_bh2" and params.init_image.byte_length() > 0:
+        if sampler_admission.executed == "uni_pc" and params.steps < 2:
             raise Error(
-                "zimage: uni_pc_bh2 img2img is not supported yet; the "
+                "zimage: generic uni_pc requires at least two inference steps "
+                "for the bounded Comfy bh1/order<=3 path"
+            )
+        if (
+            (sampler_admission.executed == "uni_pc" or sampler_admission.executed == "uni_pc_bh2")
+            and params.init_image.byte_length() > 0
+        ):
+            raise Error(
+                String("zimage: ") + sampler_admission.executed
+                + " img2img is not supported yet; the "
                 "sliced-sigma UniPC state needs separate artifact evidence"
             )
         # P7 img2img: validate the init image up front (fail at admission,
@@ -409,9 +454,15 @@ struct ZImageBackend(GenBackend, Movable):
         self.dpmpp_update_steps = 0
         self.dpmpp_second_order_steps = 0
         self.unipc = List[ArcPointer[UniPcMultistepScheduler]]()
+        self.comfy_unipc = List[ArcPointer[ComfyUniPcMultistepScheduler]]()
         self.unipc_update_steps = 0
         self.unipc_corrector_steps = 0
         self.unipc_second_order_steps = 0
+        self.unipc_third_order_steps = 0
+        self.unipc_max_observed_order = 0
+        self.unipc_solver_order = 0
+        self.unipc_initial_noise_scale = Float32(1.0)
+        self.unipc_final_sample_scale = Float32(1.0)
         self.active = True
         self.cancel_flag = False
         self.cur = 0
@@ -623,9 +674,15 @@ struct ZImageBackend(GenBackend, Movable):
         self.dpmpp_update_steps = 0
         self.dpmpp_second_order_steps = 0
         self.unipc = List[ArcPointer[UniPcMultistepScheduler]]()
+        self.comfy_unipc = List[ArcPointer[ComfyUniPcMultistepScheduler]]()
         self.unipc_update_steps = 0
         self.unipc_corrector_steps = 0
         self.unipc_second_order_steps = 0
+        self.unipc_third_order_steps = 0
+        self.unipc_max_observed_order = 0
+        self.unipc_solver_order = 0
+        self.unipc_initial_noise_scale = Float32(1.0)
+        self.unipc_final_sample_scale = Float32(1.0)
         var noise = gaussian_noise(16 * self.hl * self.wl, UInt64(self.params.seed))
         if self.params.variation_strength > 0.0:
             var vnoise = gaussian_noise(
@@ -636,7 +693,14 @@ struct ZImageBackend(GenBackend, Movable):
                 noise, vnoise, 16, self.hl, self.wl,
                 self.params.variation_strength,
             )
-        self.sigmas = _build_sigmas(self.params.steps)
+        if self.executed_sampler == "uni_pc":
+            self.sigmas = _build_comfy_unipc_sigmas(
+                self.params.steps, Float32(self.params.sigma_shift)
+            )
+        else:
+            self.sigmas = _build_sigmas_with_shift(
+                self.params.steps, Float32(self.params.sigma_shift)
+            )
         if self.executed_sampler == "uni_pc_bh2":
             var unipc_sigmas = List[Float64]()
             for si in range(len(self.sigmas)):
@@ -644,7 +708,20 @@ struct ZImageBackend(GenBackend, Movable):
             self.unipc.append(ArcPointer(
                 UniPcMultistepScheduler.from_sigmas(unipc_sigmas^, 2)
             ))
+            self.unipc_solver_order = 2
+        elif self.executed_sampler == "uni_pc":
+            var comfy_sigmas = List[Float64]()
+            for si in range(len(self.sigmas)):
+                comfy_sigmas.append(Float64(self.sigmas[si]))
+            var sched = ComfyUniPcMultistepScheduler.from_sigmas(comfy_sigmas^)
+            self.unipc_solver_order = sched.configured_order()
+            self.unipc_initial_noise_scale = sched.initial_noise_scale()
+            self.unipc_final_sample_scale = sched.final_sample_scale()
+            self.comfy_unipc.append(ArcPointer(sched^))
         var lat_host = noise.copy()  # txt2img default: x = noise (sigma0 = 1.0)
+        if self.executed_sampler == "uni_pc":
+            for i in range(len(lat_host)):
+                lat_host[i] = lat_host[i] * self.unipc_initial_noise_scale
         if self.params.init_image.byte_length() > 0:
             # ── P7 img2img (rectified-flow forward-noising convention) ──
             # EXACT FORMULA (reference citations):
@@ -672,11 +749,14 @@ struct ZImageBackend(GenBackend, Movable):
             var sig0 = self.sigmas[i0]
             for i in range(len(lat_host)):
                 lat_host[i] = sig0 * noise[i] + (Float32(1.0) - sig0) * z[i]
-            self.cur = i0
-            self.denoise_start_step = i0
+            var run_start = i0
+            while run_start < self.params.steps and not self._denoise_step_has_update(run_start):
+                run_start += 1
+            self.cur = run_start
+            self.denoise_start_step = run_start
             print(
                 "[zimage][img2img] creativity", self.params.creativity,
-                "-> start step", i0, "/", self.params.steps,
+                "-> start step", run_start, "/", self.params.steps,
                 "( sigma0 =", sig0, ")",
             )
         var nshape = [1, 16, self.hl, self.wl]
@@ -726,9 +806,21 @@ struct ZImageBackend(GenBackend, Movable):
         var i = self.cur
         var t = Float32(1.0) - self.sigmas[i]  # DiT timestep convention (= 1 - sigma)
         var x = self.latent[0].copy()
-        # pred = -(vc + cfg*(vc - vu)) — _cfg_pred_overlay applies the negation.
+        var sigma = self.sigmas[i]
+        var sigma_next = self.sigmas[i + 1]
+        var x_compute = _cast(x[], STDtype.F32, self.ctx)
+        var model_latent: Tensor
+        if self.executed_sampler == "uni_pc":
+            if len(self.comfy_unipc) == 0:
+                raise Error("zimage: generic uni_pc scheduler was not initialized")
+            var model_scale = self.comfy_unipc[0][].model_input_scale_for_step()
+            var model_scaled = mul_scalar(x_compute, model_scale, self.ctx)
+            model_latent = _cast(model_scaled, STDtype.BF16, self.ctx)
+        else:
+            model_latent = x[].clone(self.ctx)
+        # pred = -(vu + cfg*(vc - vu)) — _cfg_pred_overlay applies the negation.
         var pred = _cfg_pred_overlay[HL, WL, N_IMG, N_TXT, S](
-            x[], t, self.cfg, self.cap_seq_cond, self.cap_seq_uncond,
+            model_latent, t, self.cfg, self.cap_seq_cond, self.cap_seq_uncond,
             self.nr_blocks, self.cr_blocks, self.main_blocks, self.lora_dev[0],
             self.aux[0][], self.final_lin[0][], self.final_lin[1][], self.x_pad_h,
             self.rope[0][], self.rope[1][], self.rope[2][], self.rope[3][],
@@ -739,9 +831,6 @@ struct ZImageBackend(GenBackend, Movable):
         )
         # Euler: x += (sigma_next - sigma) * pred (latent F32 compute, BF16 carrier).
         # DPM++ 2M uses the same CFG velocity tensor converted to denoised x0.
-        var sigma = self.sigmas[i]
-        var sigma_next = self.sigmas[i + 1]
-        var x_compute = _cast(x[], STDtype.F32, self.ctx)
         var x_new: Tensor
         if self.executed_sampler == "dpmpp_2m":
             if sigma <= Float32(0.0) or sigma_next == sigma:
@@ -771,6 +860,28 @@ struct ZImageBackend(GenBackend, Movable):
                 self.unipc_update_steps += 1
                 if self.unipc[0][].this_order() >= 2:
                     self.unipc_second_order_steps += 1
+                if self.unipc[0][].this_order() > self.unipc_max_observed_order:
+                    self.unipc_max_observed_order = self.unipc[0][].this_order()
+                x_new = _cast(x_next, STDtype.BF16, self.ctx)
+        elif self.executed_sampler == "uni_pc":
+            if sigma <= Float32(0.0):
+                x_new = _cast(x_compute, STDtype.BF16, self.ctx)
+            else:
+                if len(self.comfy_unipc) == 0:
+                    raise Error("zimage: generic uni_pc scheduler was not initialized")
+                if self.comfy_unipc[0][].step_index() > 0:
+                    self.unipc_corrector_steps += 1
+                var model_compute_for_denoised = _cast(model_latent, STDtype.F32, self.ctx)
+                var denoised = denoised_from_velocity(model_compute_for_denoised, pred, sigma, self.ctx)
+                var x_next = self.comfy_unipc[0][].step(denoised, x_compute, self.ctx)
+                self.unipc_update_steps += 1
+                var observed_order = self.comfy_unipc[0][].this_order()
+                if observed_order >= 2:
+                    self.unipc_second_order_steps += 1
+                if observed_order >= 3:
+                    self.unipc_third_order_steps += 1
+                if observed_order > self.unipc_max_observed_order:
+                    self.unipc_max_observed_order = observed_order
                 x_new = _cast(x_next, STDtype.BF16, self.ctx)
         else:
             var dt = sigma_next - sigma
@@ -788,19 +899,45 @@ struct ZImageBackend(GenBackend, Movable):
         if self.min_free_bytes == 0 or mem.free_bytes < self.min_free_bytes:
             self.min_free_bytes = mem.free_bytes
 
+    def _denoise_step_has_update(self, step: Int) -> Bool:
+        if step < 0 or step >= self.params.steps:
+            return False
+        if len(self.sigmas) <= step + 1:
+            return False
+        var sigma = self.sigmas[step]
+        var sigma_next = self.sigmas[step + 1]
+        if sigma <= Float32(0.0):
+            return False
+        if sigma_next == sigma:
+            return False
+        return True
+
+    def _effective_denoise_steps(self, start_step: Int) -> Int:
+        var start = start_step
+        if start < 0:
+            start = 0
+        if start > self.params.steps:
+            start = self.params.steps
+        var count = 0
+        for i in range(start, self.params.steps):
+            if self._denoise_step_has_update(i):
+                count += 1
+        return count
+
     def _write_result_manifest(mut self, png_path: String) raises -> String:
         self._record_vram()
         var manifest_path = png_path + String(".zimage_daemon_result.json")
-        var denoise_per_step = Float64(0.0)
+        var denoise_per_requested_step = Float64(0.0)
         if self.params.steps > 0:
-            denoise_per_step = self.denoise_seconds / Float64(self.params.steps)
+            denoise_per_requested_step = self.denoise_seconds / Float64(self.params.steps)
+        var steps_executed = self._effective_denoise_steps(self.denoise_start_step)
+        var denoise_per_update_step = Float64(0.0)
+        if steps_executed > 0:
+            denoise_per_update_step = self.denoise_seconds / Float64(steps_executed)
         var total_wall_seconds = Float64(perf_counter_ns() - self.job_t0_ns) / 1.0e9
         var peak_vram_mib = Float64(0.0)
         if self.total_vram_bytes > 0 and self.min_free_bytes > 0:
             peak_vram_mib = _peak_vram_mib(self.total_vram_bytes, self.min_free_bytes)
-        var steps_executed = self.params.steps - self.denoise_start_step
-        if steps_executed < 0:
-            steps_executed = 0
         var content = String("{\n")
         content += String('  "schema":"serenity.zimage.daemon_result.v1",\n')
         content += String('  "backend":"zimage_daemon",\n')
@@ -816,6 +953,10 @@ struct ZImageBackend(GenBackend, Movable):
         content += String('    "resolution":{"width":') + String(self.params.width) + String(',"height":') + String(self.params.height) + String("},\n")
         content += String('    "steps":') + String(self.params.steps) + String(",\n")
         content += String('    "guidance":') + String(self.params.cfg) + String(",\n")
+        content += String('    "sigma_shift":') + String(self.params.sigma_shift) + String(",\n")
+        content += String('    "init_image":"') + _json_escape(self.params.init_image) + String('",\n')
+        content += String('    "creativity":') + String(self.params.creativity) + String(",\n")
+        content += String('    "img2img_applied":') + _json_bool(self.params.init_image.byte_length() > 0) + String(",\n")
         content += String('    "sampler_registry_backend":"zimage",\n')
         content += String('    "requested_sampler":"') + _json_escape(self.params.sampler) + String('",\n')
         content += String('    "requested_scheduler":"') + _json_escape(self.params.scheduler) + String('",\n')
@@ -823,10 +964,12 @@ struct ZImageBackend(GenBackend, Movable):
         content += String('    "executed_scheduler":"') + _json_escape(self.executed_scheduler) + String('",\n')
         content += String('    "denoise_start_step":') + String(self.denoise_start_step) + String(",\n")
         content += String('    "steps_executed":') + String(steps_executed) + String(",\n")
+        content += String('    "denoise_update_steps":') + String(steps_executed) + String(",\n")
         content += String('    "sigma_trace":') + _float32_list_json(self.sigmas) + String(",\n")
         content += String('    "sampler_trace":{')
         if self.executed_sampler == "dpmpp_2m":
             content += String('"algorithm":"dpmpp_2m",')
+            content += String('"schedule_source":"zimage_comfy_simple_sigmas",')
             content += String('"history_capacity":1,')
             content += String('"history_final_len":') + String(self.dpmpp_history.len()) + String(",")
             content += String('"dpmpp_update_steps":') + String(self.dpmpp_update_steps) + String(",")
@@ -839,11 +982,43 @@ struct ZImageBackend(GenBackend, Movable):
                 unipc_lower_order_nums = self.unipc[0][].lower_order_nums()
             content += String('"algorithm":"uni_pc_bh2",')
             content += String('"solver_type":"bh2",')
+            content += String('"solver_variant":"bh2",')
             content += String('"solver_order":2,')
-            content += String('"schedule_source":"zimage_build_sigmas",')
+            content += String('"schedule_source":"zimage_comfy_simple_sigmas",')
             content += String('"unipc_update_steps":') + String(self.unipc_update_steps) + String(",")
             content += String('"unipc_corrector_steps":') + String(self.unipc_corrector_steps) + String(",")
             content += String('"unipc_second_order_steps":') + String(self.unipc_second_order_steps) + String(",")
+            content += String('"unipc_third_order_steps":') + String(self.unipc_third_order_steps) + String(",")
+            content += String('"unipc_max_observed_order":') + String(self.unipc_max_observed_order) + String(",")
+            content += String('"unipc_step_index":') + String(unipc_step_index) + String(",")
+            content += String('"unipc_lower_order_nums":') + String(unipc_lower_order_nums)
+        elif self.executed_sampler == "uni_pc":
+            var unipc_step_index = 0
+            var unipc_lower_order_nums = 0
+            var configured_order = self.unipc_solver_order
+            if len(self.comfy_unipc) > 0:
+                unipc_step_index = self.comfy_unipc[0][].step_index()
+                unipc_lower_order_nums = self.comfy_unipc[0][].lower_order_nums()
+                configured_order = self.comfy_unipc[0][].configured_order()
+            content += String('"algorithm":"uni_pc",')
+            content += String('"requested_sampler":"') + _json_escape(self.params.sampler) + String('",')
+            content += String('"requested_scheduler":"') + _json_escape(self.params.scheduler) + String('",')
+            content += String('"executed_sampler":"') + _json_escape(self.executed_sampler) + String('",')
+            content += String('"executed_scheduler":"') + _json_escape(self.executed_scheduler) + String('",')
+            content += String('"solver_type":"bh1",')
+            content += String('"solver_variant":"bh1",')
+            content += String('"solver_order":') + String(configured_order) + String(",")
+            content += String('"max_supported_order":3,')
+            content += String('"sigma_parameterization":"SigmaConvert",')
+            content += String('"schedule_source":"zimage_comfy_simple_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps",')
+            content += String('"final_zero_replacement":0.001,')
+            content += String('"initial_noise_scale":') + String(self.unipc_initial_noise_scale) + String(",")
+            content += String('"final_sample_scale":') + String(self.unipc_final_sample_scale) + String(",")
+            content += String('"unipc_update_steps":') + String(self.unipc_update_steps) + String(",")
+            content += String('"unipc_corrector_steps":') + String(self.unipc_corrector_steps) + String(",")
+            content += String('"unipc_second_order_steps":') + String(self.unipc_second_order_steps) + String(",")
+            content += String('"unipc_third_order_steps":') + String(self.unipc_third_order_steps) + String(",")
+            content += String('"unipc_max_observed_order":') + String(self.unipc_max_observed_order) + String(",")
             content += String('"unipc_step_index":') + String(unipc_step_index) + String(",")
             content += String('"unipc_lower_order_nums":') + String(unipc_lower_order_nums)
         else:
@@ -864,7 +1039,8 @@ struct ZImageBackend(GenBackend, Movable):
         content += String('    "load_seconds":') + String(self.load_seconds) + String(",\n")
         content += String('    "text_encode_seconds":') + String(self.text_encode_seconds) + String(",\n")
         content += String('    "denoise_seconds":') + String(self.denoise_seconds) + String(",\n")
-        content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
+        content += String('    "denoise_seconds_per_step":') + String(denoise_per_requested_step) + String(",\n")
+        content += String('    "denoise_seconds_per_update_step":') + String(denoise_per_update_step) + String(",\n")
         content += String('    "vae_decode_seconds":') + String(self.vae_decode_seconds) + String(",\n")
         content += String('    "total_wall_seconds":') + String(total_wall_seconds) + String(",\n")
         content += String('    "peak_vram_mib":') + String(peak_vram_mib) + String(",\n")
@@ -880,6 +1056,11 @@ struct ZImageBackend(GenBackend, Movable):
     def _decode_and_save(mut self) raises -> String:
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
         var lat = self.latent[0].copy()
+        var decode_latent: Tensor
+        if self.executed_sampler == "uni_pc":
+            decode_latent = mul_scalar(lat[], self.unipc_final_sample_scale, self.ctx)
+        else:
+            decode_latent = lat[].clone(self.ctx)
         # Per-job conditioning tensors are dead weight at decode time; free
         # them BEFORE the decode allocations (the 1024² decode is VRAM-tight).
         self.rope = List[TArc]()
@@ -892,7 +1073,7 @@ struct ZImageBackend(GenBackend, Movable):
                 print("[zimage] loading VAE decoder (64-latent grid; stays resident)")
                 self.vae64.append(ArcPointer(ZImageDecoder[64, 64].load(VAE_DIR, self.ctx)))
             var rgb = self.vae64[0][].decode(
-                _cast(lat[], STDtype.BF16, self.ctx), self.ctx
+                _cast(decode_latent, STDtype.BF16, self.ctx), self.ctx
             )
             _save_rgb_png_with_text(rgb, png_path, self.params.params_json, self.ctx)
         else:
@@ -901,7 +1082,7 @@ struct ZImageBackend(GenBackend, Movable):
                 self.vae64.append(ArcPointer(ZImageDecoder[64, 64].load(VAE_DIR, self.ctx)))
             print("[zimage] tiled VAE decode (128-latent grid -> 3x3 64-latent crops)")
             var rgb = zimage_tiled_decode_with_decoder[128, 128, 64, 64](
-                _cast(lat[], STDtype.BF16, self.ctx), self.vae64[0][], self.ctx
+                _cast(decode_latent, STDtype.BF16, self.ctx), self.vae64[0][], self.ctx
             )
             _save_rgb_png_with_text(rgb, png_path, self.params.params_json, self.ctx)
         return png_path
@@ -932,9 +1113,15 @@ struct ZImageBackend(GenBackend, Movable):
         self.dpmpp_update_steps = 0
         self.dpmpp_second_order_steps = 0
         self.unipc = List[ArcPointer[UniPcMultistepScheduler]]()
+        self.comfy_unipc = List[ArcPointer[ComfyUniPcMultistepScheduler]]()
         self.unipc_update_steps = 0
         self.unipc_corrector_steps = 0
         self.unipc_second_order_steps = 0
+        self.unipc_third_order_steps = 0
+        self.unipc_max_observed_order = 0
+        self.unipc_solver_order = 0
+        self.unipc_initial_noise_scale = Float32(1.0)
+        self.unipc_final_sample_scale = Float32(1.0)
         self.job_t0_ns = 0
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
@@ -986,9 +1173,12 @@ struct ZImageBackend(GenBackend, Movable):
                 r.step = 0
                 return r^
             if self.phase == PHASE_DENOISE:
+                while self.cur < self.params.steps and not self._denoise_step_has_update(self.cur):
+                    self.cur += 1
                 if self.cur >= self.params.steps:
-                    # img2img with creativity 0.0: i0 == steps — no denoise
-                    # steps remain (pure VAE round-trip); go straight to decode.
+                    # Duplicate terminal zero sigmas are schedule bookkeeping;
+                    # they are not model updates. Decode immediately when only
+                    # no-op intervals remain.
                     self.phase = PHASE_DECODE
                     r.step = self.cur
                     return r^

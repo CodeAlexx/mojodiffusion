@@ -101,9 +101,10 @@ Acceptance evidence:
 - 2026-06-12 current checker:
   `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=75 passed=75 p0=0 p1=0 p2=0` after implementing the LTX2 fast
+  `checks=78 passed=78 p0=0 p1=0 p2=0` after implementing the LTX2 fast
   attention route, cuDNN upsampler/video-VAE/audio-VAE decode gates, bounded
-  video/A-V artifact gates, and structured LTX2 runner stage timing manifests.
+  video/A-V artifact gates, structured LTX2 runner stage timing manifests, and
+  bounded Ideogram4 PNG metadata and prequeue fail-loud option markers.
   Product P0 and tracked P1 gates are ready.
   Full SwarmUI all-level parity remains blocked by Qwen full generation,
   full video parity beyond DEV-smoke artifacts, advanced workflow node families, sampler breadth,
@@ -119,22 +120,63 @@ Acceptance evidence:
   `7.141845 ms`, `7.722x`). Full DiT fixture probes also passed after the
   wiring: `chunk6 full DiT velocity parity` and resident fp8 DiT both reported
   `cos=0.9995574960620331`, `max_abs=0.4228515625`, `PASS`. This clears the
-  immediate Ideogram4 slow-SDPA blocker, but not the backend/artifact gate.
-  Z-Image now has bounded DPM++ 2M and UniPC bh2/simple-flowmatch wiring; true
-  Comfy-style latent batch execution and the remaining generic UniPC/order-3,
-  ancestral, SDE, Karras, CFG++, and advanced daemon denoise loops remain
-  sampler/runtime gaps.
+  immediate Ideogram4 slow-SDPA blocker. The backend/artifact gate now has only
+  bounded one-step smoke evidence, not full backend parity.
+  Z-Image now has bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC
+  bh2/simple-flowmatch wiring; true Comfy-style latent batch execution and the
+  remaining ancestral, SDE, Karras, CFG++, and advanced daemon denoise loops
+  remain sampler/runtime gaps.
+- 2026-06-12 Ideogram4 bounded daemon artifact evidence:
+  `python3 scripts/check_ideogram4_daemon_product_contract.py --artifact
+  output/serenity_daemon/job-0106.png --json` passes with
+  `bounded_artifact_ready:true` and `runtime_acceptance:false`. It validates
+  `output/serenity_daemon/job-0106.png`, PNG `serenity.genparams.v1`, gallery
+  readback, plus
+  `output/serenity_daemon/job-0106.png.ideogram4_daemon_result.json`; the PNG is
+  `1024x1024`. The sidecar manifest records backend
+  `ideogram4_daemon`, model `ideogram-4-fp8`, readiness `experimental`,
+  `requested_sampler:"euler"`, `requested_scheduler:"logitnormal"`,
+  `executed_sampler:"ideogram4_logitnormal_euler"`,
+  `executed_scheduler:"ideogram4_logitnormal"`, sigma trace
+  `[0.9994472,0.00012339458]`, prompt tokens `15`, fixed text window `1024`,
+  `lora_count:0`, `variation_applied:false`,
+  `dtype:"fp8_transformer_bf16_activations_f32_latent"`,
+  `accepted_sampler_parity:false`, and `accepted_speed_parity:false`. Mojo
+  timings were `load_seconds=75.44370386599999`,
+  `text_encode_seconds=135.538652776`, `prepare_seconds=1.928370351`,
+  `denoise_seconds=6.174464852`, `vae_decode_seconds=2.190651774`,
+  `total_wall_seconds=221.428687069`, and `peak_vram_mib=22088.6875`.
+  Transformers are resident across denoise steps but not across jobs on the
+  24GB-class GPU. This is one-step path/resource evidence with PNG metadata; it
+  does not prove 20-step quality, sampler breadth, feature support for negative
+  prompts/LoRA/img2img/variation, speed parity, or full SwarmUI backend
+  acceptance.
+- 2026-06-12 Ideogram4 bounded fail-loud option smoke passed:
+  `python3 scripts/check_ideogram4_daemon_product_contract.py
+  --fail-loud-smoke --write-readiness
+  output/checks/ideogram4_daemon_product_readiness.json --json`. It proved
+  HTTP `422` prequeue rejection for negative prompt, LoRA, prompt LoRA tag, init
+  image, non-default creativity/denoise, variation, unsupported size,
+  unsupported sampler, unsupported scheduler, and nonpositive CFG. `/v1/jobs`
+  stayed at `126` rows, each request completed in under `0.001s`, and the log
+  recorded `expensive_markers_seen:[]` for Ideogram Qwen/DiT/VAE load markers.
 - `/v1/samplers` endpoint smoke saved
   `output/checks/samplers_endpoint_smoke.json`; it returned schema
   `serenity.samplers.v1`, `accepted_sampler_parity:false`, 45 catalog samplers,
-  15 catalog schedulers, and support entries for `zimage` and `qwenimage`.
+  15 catalog schedulers, and support entries for `zimage`, `qwenimage`, and
+  `ideogram4`.
   Refreshed evidence from the compiled stub daemon now shows Z-Image endpoint
   support for `euler`, `flowmatch_euler`, `flow_match_euler`, `dpmpp_2m`,
-  `dpm++ 2m`, and `uni_pc_bh2`; Qwen remains `euler`/flow-match only.
+  `dpm++ 2m`, `uni_pc`, and `uni_pc_bh2`; Qwen remains `euler`/flow-match only.
+  Ideogram4 exposes bounded `euler`/flow-match aliases that execute as
+  `ideogram4_logitnormal_euler`, with only `logitnormal`/`logit_normal`/
+  `ideogram_logitnormal`/`ideogram4_logitnormal` scheduler aliases accepted.
 - 2026-06-12 DPM++ 2M runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py
-  --skip-unsupported-smoke --skip-multi-image-smoke --skip-variation-smoke
-  --write-readiness output/checks/zimage_dpmpp2m_product_readiness.json`
+  --skip-unsupported-smoke --skip-generic-unipc-smoke --skip-unipc-smoke
+  --skip-multi-image-smoke --skip-variation-smoke --skip-img2img-smoke
+  --skip-multi-lora-smoke --write-readiness
+  output/checks/zimage_dpmpp2m_product_readiness.json`
   passed. It emitted baseline `job-0035` and DPM++ `job-0036`. `job-0036`
   wrote `output/serenity_daemon/job-0036.png` and
   `output/serenity_daemon/job-0036.png.zimage_daemon_result.json`; the manifest
@@ -147,7 +189,8 @@ Acceptance evidence:
   interval is skipped by the DPM++ branch and not counted as an update.
 - 2026-06-12 UniPC bh2 runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py
-  --skip-dpmpp2m-smoke --skip-multi-image-smoke --skip-variation-smoke
+  --skip-dpmpp2m-smoke --skip-generic-unipc-smoke --skip-multi-image-smoke
+  --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
   --write-readiness output/checks/zimage_unipc_bh2_product_readiness.json`
   passed. It emitted unsupported generic UniPC failure `job-0038`, baseline
   `job-0039`, and UniPC bh2 `job-0040`. `job-0040` wrote
@@ -160,15 +203,68 @@ Acceptance evidence:
   `unipc_update_steps:3`, `unipc_corrector_steps:2`,
   `unipc_second_order_steps:2`, `denoise_seconds_per_step:0.32013946925`,
   `peak_vram_mib:21727.5625`, and `accepted_sampler_parity:false`.
-  Generic `uni_pc` remains blocked from runtime acceptance; the focused Mojo
-  semantic gate `serenitymojo/sampling/parity/comfy_unipc_semantics_gate.mojo`
-  proves it is `bh1`, order `min(3,len(sigmas)-2)`, SigmaConvert,
-  final-zero-replacement, and initial-noise scaling, not an alias for the
-  accepted `uni_pc_bh2` bh2/order-2 flow path.
+  Generic `uni_pc` is not an alias for this accepted `uni_pc_bh2` bh2/order-2
+  flow path; the focused Mojo semantic gate
+  `serenitymojo/sampling/parity/comfy_unipc_semantics_gate.mojo` proves generic
+  `uni_pc` is `bh1`, order `min(3,len(sigmas)-2)`, SigmaConvert, Comfy
+  penultimate-sigma discard, final-zero-replacement, and initial-noise scaling.
+- 2026-06-12 Z-Image generic UniPC runtime evidence:
+  `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900 --steps
+  1 --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-unipc-smoke
+  --skip-multi-image-smoke --skip-variation-smoke --skip-img2img-smoke
+  --skip-multi-lora-smoke --write-readiness
+  output/checks/zimage_daemon_generic_unipc_readiness.json`
+  passed. It emitted bounded artifact
+  `output/serenity_daemon/job-0077.png` plus
+  `output/serenity_daemon/job-0077.png.zimage_daemon_result.json`; the manifest
+  records `requested_sampler:"uni_pc"`, `executed_sampler:"uni_pc"`,
+  `executed_scheduler:"simple_flowmatch"`, `solver_type:"bh1"`,
+  `solver_variant:"bh1"`, `solver_order:3`,
+  `sigma_parameterization:"SigmaConvert"`,
+  `schedule_source:"zimage_build_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`,
+  `steps_executed:4`, `unipc_update_steps:4`, `unipc_corrector_steps:3`,
+  `unipc_second_order_steps:2`, `denoise_seconds_per_step:0.29673903050000006`,
+  `total_wall_seconds:3.872930771`, `peak_vram_mib:21379.875`, and
+  `accepted_sampler_parity:false`.
+- 2026-06-12 Z-Image img2img/creativity runtime evidence:
+  `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900
+  --steps 1 --skip-unsupported-smoke --skip-dpmpp2m-smoke
+  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
+  --skip-variation-smoke --skip-multi-lora-smoke --write-readiness
+  output/checks/zimage_img2img_creativity_readiness.json` passed after
+  `pixi run build-daemon`. It emitted baseline
+  `output/serenity_daemon/job-0087.png` plus img2img artifacts
+  `job-0088.png`, `job-0089.png`, and `job-0090.png`, reusing `job-0087.png`
+  as `init_image`. The checker validates PNG `serenity.genparams.v1`, sidecar
+  manifests, `init_image`, `creativity`, `img2img_applied:true`,
+  `denoise_start_step`, `steps_executed`, `denoise_update_steps`,
+  sigma-derived start semantics, timings, and positive VRAM. Evidence:
+  creativity `0.0` -> start step `8`, `steps_executed:0`,
+  `total_wall_seconds=3.164280578`; creativity `0.5` -> start step `6`,
+  `steps_executed:1`, `total_wall_seconds=3.527565501`; creativity `1.0` ->
+  start step `0`, `steps_executed:7`, `total_wall_seconds=5.312134054`.
+  Peak VRAM was `21393.25 MiB`, and the
+  report keeps `accepted_img2img_parity:false`, `accepted_sampler_parity:false`,
+  and `accepted_speed_parity:false`. This is bounded flat-parameter Z-Image
+  img2img evidence, not mask/inpaint, graph `LoadImage`/`VAEEncode`, full
+  denoise semantics, or quality parity.
+- Latest full Z-Image daemon product gate after terminal-zero scheduler
+  accounting:
+  `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900
+  --steps 1 --write-readiness output/checks/zimage_daemon_product_readiness.json`
+  passed. It covered unsupported sampler failure (`job-0091`), baseline
+  `job-0092`, img2img jobs `job-0093` through `job-0095`, DPM++ 2M `job-0096`,
+  generic UniPC `job-0097`, UniPC bh2 `job-0098`, variation `job-0099`,
+  multi-image, and multi-LoRA `job-0101`. The latest img2img manifest evidence
+  records `0.0 -> denoise_start_step:8, steps_executed:0`,
+  `0.5 -> denoise_start_step:6, steps_executed:1`, and
+  `1.0 -> denoise_start_step:0, steps_executed:7`, with
+  `accepted_img2img_parity:false` and `accepted_speed_parity:false`.
 - 2026-06-12 Z-Image multi-LoRA runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py
-  --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-unipc-smoke
-  --skip-multi-image-smoke --skip-variation-smoke --write-readiness
+  --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-generic-unipc-smoke
+  --skip-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke
+  --skip-img2img-smoke --write-readiness
   output/checks/zimage_multi_lora_product_readiness.json` passed. It emitted
   baseline `job-0044`, single-LoRA `job-0045`, and stacked-LoRA `job-0046`.
   `job-0046` wrote `output/serenity_daemon/job-0046.png`; the manifest records
@@ -195,6 +291,12 @@ Current status:
 - Real Z-Image daemon generation now has current GPU evidence. Full Qwen
   daemon generation was not run because Qwen remains too large/slow/OOM-risky
   for this slice.
+- Z-Image flat `init_image`/`creativity` now has bounded runtime artifact
+  evidence through the daemon. Full image-node/mask/inpaint graph parity remains
+  unaccepted.
+- Ideogram4 now has a native daemon backend with a bounded one-step 1024x1024
+  artifact and sidecar manifest. It is still experimental and does not prove
+  full metadata, sampler, speed, or quality parity.
 - Stub mode currently links CUDA and the cuDNN SDPA cshim because real backends
   are imported.
 
@@ -244,8 +346,9 @@ Acceptance evidence:
 - 2026-06-12 1024 tiled-decode run passed:
   `python3 scripts/check_zimage_daemon_product_contract.py --width 1024
   --height 1024 --steps 1 --skip-unsupported-smoke --skip-dpmpp2m-smoke
-  --skip-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke
-  --skip-multi-lora-smoke --write-readiness
+  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
+  --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
+  --write-readiness
   output/checks/zimage_1024_product_readiness.json`. It emitted
   `output/serenity_daemon/job-0073.png` plus
   `output/serenity_daemon/job-0073.png.zimage_daemon_result.json`, with PNG
@@ -259,6 +362,30 @@ Acceptance evidence:
   This proves the daemon 1024 path uses the tiled 64-latent VAE decoder instead
   of the former whole-frame 128-latent decoder. It is still a 1-step
   experimental path/resource proof, not quality, sampler, or speed parity.
+- 2026-06-12 Ideogram4 bounded daemon run passed:
+  `python3 scripts/check_ideogram4_daemon_product_contract.py --artifact
+  output/serenity_daemon/job-0106.png --json`. It validated
+  `output/serenity_daemon/job-0106.png`, embedded PNG
+  `serenity.genparams.v1`, `/v1/gallery/read` params readback, and the sidecar
+  manifest `output/serenity_daemon/job-0106.png.ideogram4_daemon_result.json`,
+  with `1024x1024` dimensions, `readiness_label:"experimental"`,
+  `executed_sampler:"ideogram4_logitnormal_euler"`,
+  `executed_scheduler:"ideogram4_logitnormal"`, fixed `1024` token text window,
+  positive timings, and `peak_vram_mib=22088.6875`. The checker intentionally
+  reports `runtime_acceptance:false`; this smoke does not accept quality,
+  sampler, or speed parity.
+- 2026-06-12 Z-Image img2img/creativity run passed:
+  `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900
+  --steps 1 --skip-unsupported-smoke --skip-dpmpp2m-smoke
+  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
+  --skip-variation-smoke --skip-multi-lora-smoke --write-readiness
+  output/checks/zimage_img2img_creativity_readiness.json`. It validated
+  baseline `job-0087` and img2img jobs `job-0088` through `job-0090` at
+  creativity `0.0`, `0.5`, and `1.0` with 8-step img2img settings. The manifest
+  records `init_image`, `creativity`, `img2img_applied:true`,
+  `denoise_start_step`, `steps_executed`, `denoise_update_steps`, timings, and
+  `peak_vram_mib`.
+  Acceptance remains bounded: `accepted_img2img_parity:false`.
 - No stale source prose describes the daemon as a skeleton.
 
 ## P0.3 Video Product Path
@@ -309,7 +436,7 @@ Acceptance evidence:
 - `python3 scripts/check_ltx2_dtype_contract.py --scope all` passes.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` now reports
-  `checks=75 passed=75 p0=0 p1=0 p2=0`. This keeps full video parity blocked
+  `checks=78 passed=78 p0=0 p1=0 p2=0`. This keeps full video parity blocked
   by evidence while proving the bounded daemon runner route, LTX2 fast SDPA
   route, cuDNN latent upsampler, direct-FCQRS video VAE decode, structured
   runner timing manifest, and tracked UI/gallery/reuse/state P1 gate are wired.
@@ -342,9 +469,9 @@ Acceptance evidence:
   `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 180
   --write-readiness output/checks/ltx2_video_daemon_readiness.json` reports
   product wiring ready, positive external peak VRAM delta `6639 MiB`, and
-  timeout after `[Stage2] done -> decoding at 2x resolution`. This is progress
-  from the prior upsampler/VAE-load stall, but it is still not accepted video
-  parity because no MP4 artifact was emitted.
+  timeout after `[Stage2] done -> decoding at 2x resolution`. This historical
+  run moved past the prior upsampler/VAE-load stall but stopped before MP4
+  artifact emission, so it was not accepted video parity.
 - Current measured daemon video-only evidence:
   `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 520
   --weight-mode resident --audio-mode noaudio --strict-artifact --write-readiness
@@ -353,21 +480,22 @@ Acceptance evidence:
   metadata `width=768`, `height=512`, `frame_count=121`, `duration=5.041667`,
   `fps=24.0`, `video_codec=h264`, `muxing=probe_ok`,
   `audio_behavior=video_only_no_audio_stream`, and external peak VRAM delta
-  `10501 MiB` (`11490 MiB` peak used). The result manifest records
+  `10476 MiB` (`11226 MiB` peak used). The result manifest records
   `mode:"staged lora resident noaudio nonag"`, `weight_mode:"resident"`,
-  `total_wall_seconds=186.882605556`, `audio_mode:"noaudio"`,
+  `total_wall_seconds=174.955233998`, `audio_mode:"noaudio"`,
   `accepted_video_parity:false`, and `accepted_sampler_parity:false`. It also
   records `runner_timing_path`, `runner_timings`, and `stage_timings`;
   measured no-audio timings include
-  `stage1_denoise_seconds=57.9751922939995`,
-  `stage2_denoise_seconds=76.74856130400076`,
-  `video_decode_seconds=28.060338318000504`,
-  `frame_png_write_seconds=1.718876539998746`, and
-  `video_mux_seconds=1.1828436699997837`. Compared with the previous stream
+  `stage1_denoise_seconds=57.315346847999535`,
+  `stage2_denoise_seconds=75.27145183599896`,
+  `video_decode_seconds=23.61521103099949`,
+  `frame_png_write_seconds=1.7494108600003528`, and
+  `video_mux_seconds=0.6264517420004267`. Compared with the previous stream
   no-audio gate (`total_wall_seconds=202.353546797`,
   `stage1_denoise_seconds=73.01245590500002`,
   `stage2_denoise_seconds=90.72237481299999`, `peak used=10845 MiB`), resident
-  mode improves the bounded wall time by about `15.5s` at about `645 MiB` higher
+  mode plus the no-sync resident materializer and clone-pair fence coalescing
+  improves the bounded wall time by about `27.4s` at about `381 MiB` higher
   sampled peak used.
 - Current LTX2 resident raw-FP8 loader evidence:
   `pixi run mojo build --target-accelerator sm_86 -I .
@@ -383,6 +511,20 @@ Acceptance evidence:
   split wrapper: all 256 E4M3 byte values at scales `1.0`, `0.5`, `2.0`, and
   the real checkpoint scale, plus the real block-4 `attn1.to_q` slice against
   the torch reference (`5/5`).
+- Current LTX2 clone-pair profile evidence:
+  `pixi run build-video-smoke` passes after coalescing staged/refhq paired
+  video/audio block-output clones into one same-stream fence. The profile command
+  `output/bin/ltx2_video_smoke_runner staged lora resident noaudio nonag profile
+  output/ltx2_profile_after_clone_pair 1` emitted
+  `output/ltx2_profile_after_clone_pair/ltx2_t2v_stage2_dev_smoke.mp4`
+  (`768x512`, `121` frames, `5.041667s`, H.264, no audio stream) and
+  `ltx2_runner_timings.json` with `total_runner_seconds=171.75974076999955`,
+  `stage1_denoise_seconds=56.413680857000145`,
+  `stage2_denoise_seconds=74.39678424900012`, and
+  `video_decode_seconds=23.28128546500011`. Compared with the immediately
+  previous post-no-sync profile (`total_runner_seconds=314.8831040389996`), this
+  is a `1.833x` same-profile runner-speed improvement. This is speed evidence
+  for the bounded staged runner, not full video parity.
 - Current measured daemon A/V evidence:
   `python3 scripts/check_ltx2_video_daemon_product_contract.py --timeout 520
   --audio-mode audio --strict-artifact --write-readiness
@@ -580,20 +722,23 @@ Acceptance evidence:
   expected-type error.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=75 passed=75 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
+  `checks=78 passed=78 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
   Full SwarmUI all-level parity still remains blocked by Qwen full generation,
   full video parity beyond DEV-smoke artifacts, advanced workflow node families, sampler breadth,
   and Z-Image speed parity.
 
 ## Build Order
 
-1. Add daemon real-backend image product smokes with artifact/timing/VRAM
-   readback for Z-Image and only bounded Qwen gates until memory evidence says a
-   full Qwen run is safe.
+1. Harden the bounded real-backend image smokes into acceptance-grade paths:
+   Z-Image still needs speed/quality parity, Ideogram4 needs multi-step proof
+   and broader request-surface coverage beyond the bounded PNG metadata/gallery
+   and fail-loud option smokes, and Qwen remains bounded until memory evidence
+   says a full run is safe.
 2. Replace Z-Image's two serial CFG main-stack passes with a measured faster
    path before accepting image speed parity.
-3. Build one daemon-backed video runner that emits a real MP4 plus
-   frame/duration/muxing/audio/timing/VRAM evidence.
+3. Promote the bounded LTX2 daemon video runner beyond DEV-smoke by adding
+   graph-native request coverage, quality/HQ acceptance evidence, and stable
+   video/audio metadata gates.
 4. Extend the typed t2i workflow graph into advanced node families only when
    each node family has artifact-backed product gates.
 5. Finish model/LoRA browser UI stack controls, Qwen/LoKr LoRA support, and

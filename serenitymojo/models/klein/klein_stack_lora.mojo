@@ -52,6 +52,7 @@ from std.memory import ArcPointer
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
@@ -109,7 +110,7 @@ from serenitymojo.autograd_v2.klein_block_graph import (
 from serenitymojo.models.klein.lora_adapter import LoraAdapter, _lora_adamw_precomputed
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_onetrainer, load_lora_for_resume,
-    save_lora_train_state, load_lora_train_state,
+    save_lora_train_state, load_lora_train_state, _read_f32,
 )
 from serenitymojo.training.checkpoint import HostOffload, offload_to_host, restore_to_device
 from serenitymojo.training.lora_adamw_ot_fused import (
@@ -2510,6 +2511,246 @@ def klein_lora_prefixes(num_double: Int, num_single: Int) -> List[String]:
     return out^
 
 
+def _zero_f32(n: Int) -> List[Float32]:
+    var out = List[Float32]()
+    for _ in range(n):
+        out.append(Float32(0.0))
+    return out^
+
+
+def _slice_row_major(
+    values: List[Float32], row_start: Int, row_count: Int, cols: Int
+) raises -> List[Float32]:
+    if row_start < 0 or row_count < 0 or cols <= 0:
+        raise Error("klein LoRA row slice: invalid shape")
+    var start = row_start * cols
+    var end = start + row_count * cols
+    if end > len(values):
+        raise Error("klein LoRA row slice: range exceeds tensor data")
+    var out = List[Float32]()
+    for i in range(start, end):
+        out.append(values[i])
+    return out^
+
+
+def _read_lora_adapter_pair(
+    st: SafeTensors, prefix: String, default_scale: Float32, ctx: DeviceContext
+) raises -> LoraAdapter:
+    var key_a = prefix + String(".lora_A.weight")
+    var key_b = prefix + String(".lora_B.weight")
+    if key_a not in st.tensors:
+        raise Error(String("load_klein_flux2_lora: missing ") + key_a)
+    if key_b not in st.tensors:
+        raise Error(String("load_klein_flux2_lora: missing ") + key_b)
+
+    var a_info = st.tensor_info(key_a)
+    var b_info = st.tensor_info(key_b)
+    if len(a_info.shape) != 2 or len(b_info.shape) != 2:
+        raise Error(String("load_klein_flux2_lora: A/B must be 2-D for ") + prefix)
+    var rank = a_info.shape[0]
+    var in_f = a_info.shape[1]
+    var out_f = b_info.shape[0]
+    if b_info.shape[1] != rank:
+        raise Error(
+            String("load_klein_flux2_lora: B.shape[1]=") + String(b_info.shape[1])
+            + String(" != rank ") + String(rank) + String(" for '") + prefix + String("'")
+        )
+
+    var adapter_scale = default_scale
+    var key_alpha = prefix + String(".alpha")
+    if key_alpha in st.tensors:
+        var alpha_h = _read_f32(st, key_alpha, ctx)
+        if len(alpha_h) != 1:
+            raise Error(String("load_klein_flux2_lora: .alpha must have one value for ") + prefix)
+        adapter_scale = alpha_h[0] / Float32(rank)
+
+    return LoraAdapter(
+        _read_f32(st, key_a, ctx),
+        _read_f32(st, key_b, ctx),
+        rank,
+        in_f,
+        out_f,
+        adapter_scale,
+        _zero_f32(rank * in_f),
+        _zero_f32(rank * in_f),
+        _zero_f32(out_f * rank),
+        _zero_f32(out_f * rank),
+    )
+
+
+def _read_lora_adapter_row_range(
+    st: SafeTensors, prefix: String, row_start: Int, row_count: Int,
+    default_scale: Float32, ctx: DeviceContext,
+) raises -> LoraAdapter:
+    var key_a = prefix + String(".lora_A.weight")
+    var key_b = prefix + String(".lora_B.weight")
+    if key_a not in st.tensors:
+        raise Error(String("load_klein_flux2_lora: missing ") + key_a)
+    if key_b not in st.tensors:
+        raise Error(String("load_klein_flux2_lora: missing ") + key_b)
+
+    var a_info = st.tensor_info(key_a)
+    var b_info = st.tensor_info(key_b)
+    if len(a_info.shape) != 2 or len(b_info.shape) != 2:
+        raise Error(String("load_klein_flux2_lora: A/B must be 2-D for ") + prefix)
+    var rank = a_info.shape[0]
+    var in_f = a_info.shape[1]
+    var out_f = b_info.shape[0]
+    if b_info.shape[1] != rank:
+        raise Error(
+            String("load_klein_flux2_lora: B.shape[1]=") + String(b_info.shape[1])
+            + String(" != rank ") + String(rank) + String(" for '") + prefix + String("'")
+        )
+    if out_f < row_start + row_count:
+        raise Error(
+            String("load_klein_flux2_lora: row range exceeds B rows for ")
+            + prefix
+        )
+
+    var adapter_scale = default_scale
+    var key_alpha = prefix + String(".alpha")
+    if key_alpha in st.tensors:
+        var alpha_h = _read_f32(st, key_alpha, ctx)
+        if len(alpha_h) != 1:
+            raise Error(String("load_klein_flux2_lora: .alpha must have one value for ") + prefix)
+        adapter_scale = alpha_h[0] / Float32(rank)
+
+    var a = _read_f32(st, key_a, ctx)
+    var b = _slice_row_major(_read_f32(st, key_b, ctx), row_start, row_count, rank)
+    return LoraAdapter(
+        a^,
+        b^,
+        rank,
+        in_f,
+        row_count,
+        adapter_scale,
+        _zero_f32(rank * in_f),
+        _zero_f32(rank * in_f),
+        _zero_f32(row_count * rank),
+        _zero_f32(row_count * rank),
+    )
+
+
+def _check_adapter_shape(
+    ad: LoraAdapter, in_f: Int, out_f: Int, label: String
+) raises:
+    if ad.in_f != in_f or ad.out_f != out_f:
+        raise Error(
+            String("load_klein_flux2_lora: shape mismatch for ")
+            + label
+            + String(" got in=") + String(ad.in_f)
+            + String(" out=") + String(ad.out_f)
+            + String(" expected in=") + String(in_f)
+            + String(" out=") + String(out_f)
+        )
+
+
+def _has_lora_pair(st: SafeTensors, prefix: String) -> Bool:
+    return (
+        prefix + String(".lora_A.weight") in st.tensors
+        and prefix + String(".lora_B.weight") in st.tensors
+    )
+
+
+def _load_klein_flux2_double_blocks_lora(
+    var st: SafeTensors,
+    num_double: Int, num_single: Int, rank: Int, alpha: Float32,
+    D: Int, F: Int, ctx: DeviceContext,
+) raises -> KleinLoraSet:
+    # AI Toolkit / Comfy Flux2-Klein exports use model-weight keys directly:
+    # diffusion_model.double_blocks.{i}.img_attn.qkv/proj and *_mlp.{0,2}.
+    # The live Klein sampler wants per-slot q/k/v/out/ff_in/ff_out adapters.
+    var set = build_klein_lora_set(num_double, num_single, D, F, rank, alpha)
+    var default_scale = alpha / Float32(rank)
+    var mapped = 0
+    for bi in range(num_double):
+        var base = bi * DBL_SLOTS
+        var dp = String("diffusion_model.double_blocks.") + String(bi) + String(".")
+
+        var p = dp + String("img_attn.qkv")
+        if _has_lora_pair(st, p):
+            var ad0 = _read_lora_adapter_row_range(st, p, 0, D, default_scale, ctx)
+            _check_adapter_shape(ad0, D, D, p)
+            set.dbl[base + 0] = ad0^
+            var ad1 = _read_lora_adapter_row_range(st, p, D, D, default_scale, ctx)
+            _check_adapter_shape(ad1, D, D, p)
+            set.dbl[base + 1] = ad1^
+            var ad2 = _read_lora_adapter_row_range(st, p, 2 * D, D, default_scale, ctx)
+            _check_adapter_shape(ad2, D, D, p)
+            set.dbl[base + 2] = ad2^
+            mapped += 3
+        p = dp + String("img_attn.proj")
+        if _has_lora_pair(st, p):
+            var ad = _read_lora_adapter_pair(st, p, default_scale, ctx)
+            _check_adapter_shape(ad, D, D, p)
+            set.dbl[base + 3] = ad^
+            mapped += 1
+        p = dp + String("img_mlp.0")
+        if _has_lora_pair(st, p):
+            var ad = _read_lora_adapter_pair(st, p, default_scale, ctx)
+            _check_adapter_shape(ad, D, 2 * F, p)
+            set.dbl[base + 4] = ad^
+            mapped += 1
+        p = dp + String("img_mlp.2")
+        if _has_lora_pair(st, p):
+            var ad = _read_lora_adapter_pair(st, p, default_scale, ctx)
+            _check_adapter_shape(ad, F, D, p)
+            set.dbl[base + 5] = ad^
+            mapped += 1
+
+        p = dp + String("txt_attn.qkv")
+        if _has_lora_pair(st, p):
+            var ad0 = _read_lora_adapter_row_range(st, p, 0, D, default_scale, ctx)
+            _check_adapter_shape(ad0, D, D, p)
+            set.dbl[base + 6] = ad0^
+            var ad1 = _read_lora_adapter_row_range(st, p, D, D, default_scale, ctx)
+            _check_adapter_shape(ad1, D, D, p)
+            set.dbl[base + 7] = ad1^
+            var ad2 = _read_lora_adapter_row_range(st, p, 2 * D, D, default_scale, ctx)
+            _check_adapter_shape(ad2, D, D, p)
+            set.dbl[base + 8] = ad2^
+            mapped += 3
+        p = dp + String("txt_attn.proj")
+        if _has_lora_pair(st, p):
+            var ad = _read_lora_adapter_pair(st, p, default_scale, ctx)
+            _check_adapter_shape(ad, D, D, p)
+            set.dbl[base + 9] = ad^
+            mapped += 1
+        p = dp + String("txt_mlp.0")
+        if _has_lora_pair(st, p):
+            var ad = _read_lora_adapter_pair(st, p, default_scale, ctx)
+            _check_adapter_shape(ad, D, 2 * F, p)
+            set.dbl[base + 10] = ad^
+            mapped += 1
+        p = dp + String("txt_mlp.2")
+        if _has_lora_pair(st, p):
+            var ad = _read_lora_adapter_pair(st, p, default_scale, ctx)
+            _check_adapter_shape(ad, F, D, p)
+            set.dbl[base + 11] = ad^
+            mapped += 1
+
+    for bi in range(num_single):
+        var base = bi * SGL_SLOTS
+        var sp = String("diffusion_model.single_blocks.") + String(bi) + String(".")
+        var p = sp + String("linear1")
+        if _has_lora_pair(st, p):
+            var ad = _read_lora_adapter_pair(st, p, default_scale, ctx)
+            _check_adapter_shape(ad, D, 3 * D + 2 * F, p)
+            set.sgl[base + 0] = ad^
+            mapped += 1
+        p = sp + String("linear2")
+        if _has_lora_pair(st, p):
+            var ad = _read_lora_adapter_pair(st, p, default_scale, ctx)
+            _check_adapter_shape(ad, D + F, D, p)
+            set.sgl[base + 1] = ad^
+            mapped += 1
+
+    if mapped == 0:
+        raise Error("load_klein_flux2_lora: no Flux2/Klein LoRA pairs mapped")
+    print("[klein][lora] loaded Flux2/Klein double_blocks adapters:", mapped)
+    return set^
+
+
 # ── SAVE every adapter as a OneTrainer raw LoRA safetensors ──────────────────
 # Returns the number of (A,B) pairs written (== total adapters). The train-state
 # saver below stays PEFT-like plus AdamW moments; this product LoRA file is for
@@ -2587,7 +2828,16 @@ def save_klein_lora_state(set: KleinLoraSet, path: String, ctx: DeviceContext) r
 def load_klein_lora_resume(
     num_double: Int, num_single: Int, rank: Int, alpha: Float32,
     path: String, ctx: DeviceContext,
+    D: Int = 4096, F: Int = 12288,
 ) raises -> KleinLoraSet:
+    var st = SafeTensors.open(path)
+    if (
+        String("diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight")
+        in st.tensors
+    ):
+        return _load_klein_flux2_double_blocks_lora(
+            st^, num_double, num_single, rank, alpha, D, F, ctx,
+        )
     var prefixes = klein_lora_prefixes(num_double, num_single)
     var scale = alpha / Float32(rank)
     var named = load_lora_for_resume(prefixes, scale, path, ctx)   # flat order

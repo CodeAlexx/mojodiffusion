@@ -6,7 +6,10 @@ in-pipeline decode/mux — `refhq` mode, currently comptime'd 1024x576/121f).
 resident-only no-sync FP8→BF16 dequant materializer for raw resident FP8 blocks;
 `output/bin/ltx2_fp8_resident_smoke` passes with block-4 `34` FP8 tensors and
 representative BF16 materialized weights. Streamed loads intentionally keep the
-synchronized dequant API.
+synchronized dequant API. A second speed follow-up coalesces the staged/refhq
+paired video/audio block-output clones into one fence; the profiled resident
+no-audio gate improved from `total_runner_seconds=314.8831040389996` to
+`171.75974076999955` while still producing a 768x512, 121-frame DEV-smoke MP4.
 Trainer stage 1 (AV block backward) gated all-grads-cos-1.0. Quality gap vs the
 maintainer's bar is MEASURED to reproduce in the official pipeline at identical
 settings → recipe/conditioning, not Mojo fidelity. Full detail:

@@ -41,7 +41,8 @@ stage timing manifests, the
 model/gallery API slice, bounded Z-Image UniPC bh2, Z-Image multi-LoRA runtime
 stacking, typed linked workflow execution for the supported t2i graph, the
 runtime UI/gallery/reuse/state contract, the extracted video API module, and
-the Ideogram4 Dh=256 fast-attention gate:
+the Ideogram4 Dh=256 fast-attention gate, LTX2 clone-pair fence coalescing,
+Z-Image generic UniPC, and the bounded Ideogram4 daemon artifact gate:
 `75` checks, `75` passed, `P0=0`, `P1=0`, `P2=0`. Product P0 and tracked P1
 gates are ready. Full SwarmUI all-level parity is still blocked.
 
@@ -49,7 +50,7 @@ Current high-risk runtime gaps:
 
 - Qwen full daemon generation was not run; only the masked-attention fast path
   and tiny parity gate are proven.
-- Full video generation is still not accepted as SwarmUI/HQ parity. `/v1/video`
+- Video generation is still not accepted as SwarmUI/HQ parity. `/v1/video`
   can launch the bounded `ltx2_staged_dev_smoke` runner and `/v1/video/probe`
   inspects MP4 artifacts. Current evidence proves the default resident
   video-only daemon
@@ -58,16 +59,21 @@ Current high-risk runtime gaps:
   `121` frames, `5.041667s`, `24fps`, H.264, `muxing=probe_ok`,
   `audio_behavior=video_only_no_audio_stream`,
   `mode:"staged lora resident noaudio nonag"`,
-  `total_wall_seconds=186.882605556`, runner
-  `total_runner_seconds=186.00316528799885`, stage timing gate, and external
-  peak VRAM delta `10501 MiB` (`11490 MiB` peak used). Current evidence also
+  `total_wall_seconds=174.955233998`, runner
+  `total_runner_seconds=174.44195223299903`, stage timing gate, and external
+  peak VRAM delta `10476 MiB` (`11226 MiB` peak used). Current evidence also
   proves the LTX2 resident raw-FP8 loader no-sync materialization gate:
   `output/bin/ltx2_fp8_resident_smoke` preloads block 4, reports
   `386924928` resident bytes (`369 MiB`), sees `34` FP8 tensors, materializes
   representative video/audio weights as BF16, and passes after a final
   `ctx.synchronize()`. This removes the per-FP8-tensor host/device fence from
   the resident materializer only; streamed loads keep the synchronized dequant
-  API.
+  API. The staged/refhq loops now also coalesce the paired video/audio block
+  output clones into one same-stream fence. The profiled resident no-audio gate
+  improved from `total_runner_seconds=314.8831040389996` before the clone-pair
+  patch to `171.75974076999955`, with `stage1_denoise_seconds` improving from
+  `124.44027067600109` to `56.413680857000145` and `stage2_denoise_seconds`
+  from `79.05193418400086` to `74.39678424900012`.
   Current evidence also proves the audio-enabled A/V artifact gate:
   `output/serenity_daemon/video-0072/ltx2_t2v_av_stage2_dev_smoke.mp4` plus
   `output/serenity_daemon/video-0072/dev_audio.wav`, `stream_count=2`,
@@ -76,26 +82,40 @@ Current high-risk runtime gaps:
   runner `total_runner_seconds=201.75603515000148`, and external peak VRAM
   delta `9880 MiB`. The runner now emits `ltx2_runner_timings.json` and the
   daemon result surfaces `stage_timings`; the measured resident video-only
-  bottlenecks are `stage2_denoise_seconds=76.74856130400076`,
-  `stage1_denoise_seconds=57.9751922939995`, and
-  `video_decode_seconds=28.060338318000504`. Full video parity remains blocked
+  bottlenecks are `stage2_denoise_seconds=75.27145183599896`,
+  `stage1_denoise_seconds=57.315346847999535`, and
+  `video_decode_seconds=23.61521103099949`. Full video parity remains blocked
   because `accepted_video_parity:false` and the runner labels the output
   `DEV SMOKE ONLY`.
 - Ideogram4 is requested as an image backend target. Its current resident DiT
   path now routes `sdpa_nomask[1,S,18,256]` through
   `ideogram4_sdpa_product_fwd` and the cuDNN flash SDPA shim. The forward-only
   Dh=256 gate passed for `S=1024` and padded `S=1153` with 7.7-9.1x speedup,
-  and both full DiT probes still pass fixture parity. It is still not accepted
-  as a SwarmUI backend until it proves a daemon artifact with metadata, timing,
-  and VRAM.
+  and both full DiT probes still pass fixture parity. A native daemon backend
+  now emits bounded 1024x1024 one-step artifact `job-0106` with PNG
+  `serenity.genparams.v1`, gallery readback, a sidecar manifest, timings, and
+  positive VRAM, but it is still not accepted as full SwarmUI backend parity:
+  the checker reports `runtime_acceptance:false`, `accepted_sampler_parity:false`,
+  and `accepted_speed_parity:false`. A bounded fail-loud smoke now proves
+  negative prompt, LoRA, init image, non-default creativity/denoise, variation,
+  unsupported size, unsupported sampler/scheduler, and bad CFG reject before
+  queue fanout or expensive model work. 20-step quality, feature support for
+  those controls, sampler breadth, and speed parity remain unproven.
 - Sampler fields now reach typed `JobParams`/worker IPC, `/v1/samplers` exposes
   a SwarmUI/Comfy catalog and per-backend support matrix, and unsupported names
   fail loud before model work. Z-Image has bounded DPM++ 2M/simple-flowmatch
   runtime evidence (`job-0036`) and bounded UniPC bh2/simple-flowmatch runtime
-  evidence (`job-0040`), but generic UniPC/order-3, ancestral, SDE, Karras,
-  CFG++, and other daemon denoise loops are still not accepted sampler parity.
+  evidence (`job-0040`). Generic `uni_pc` now has bounded runtime evidence
+  (`job-0077`) for a distinct Z-Image bh1/order<=3 SigmaConvert code path with
+  Comfy penultimate-sigma discard. Ancestral, SDE, Karras, CFG++, and other
+  daemon denoise loops are still not accepted sampler parity.
 - Variation noise is implemented for image backends and proven for Z-Image by a
   daemon artifact gate; this is not full sampler/scheduler parity.
+- Z-Image flat `init_image`/`creativity` now has a bounded daemon artifact gate
+  (`job-0088` through `job-0090`) that records `img2img_applied:true`,
+  denoise start/update semantics, timings, and positive VRAM. Full image-node,
+  mask/inpaint, graph `LoadImage`/`VAEEncode`, and quality parity remain
+  unaccepted.
 - `images=N` now emits serial indexed daemon jobs with seed offsets and
   metadata. True Comfy-style batched latent execution remains unimplemented.
 - UI/gallery/reuse/state has a stub-daemon runtime contract that now proves
@@ -143,6 +163,19 @@ Current artifact evidence found in this working tree:
   - `output/serenity_daemon/job-0047.png`
   - `output/serenity_daemon/job-0073.png`
   - `output/serenity_daemon/job-0073.png.zimage_daemon_result.json`
+  - `output/serenity_daemon/job-0077.png`
+  - `output/serenity_daemon/job-0077.png.zimage_daemon_result.json`
+  - `output/serenity_daemon/job-0087.png`
+  - `output/serenity_daemon/job-0087.png.zimage_daemon_result.json`
+  - `output/serenity_daemon/job-0088.png`
+  - `output/serenity_daemon/job-0088.png.zimage_daemon_result.json`
+  - `output/serenity_daemon/job-0089.png`
+  - `output/serenity_daemon/job-0089.png.zimage_daemon_result.json`
+  - `output/serenity_daemon/job-0090.png`
+  - `output/serenity_daemon/job-0090.png.zimage_daemon_result.json`
+- Real Ideogram4 daemon product proof:
+  - `output/serenity_daemon/job-0106.png`
+  - `output/serenity_daemon/job-0106.png.ideogram4_daemon_result.json`
 
 `job-0028` is the current 512x512, 1-step experimental artifact from the daemon
 product path, produced by the repeatable runtime gate. It proves the Z-Image
@@ -169,12 +202,49 @@ product path. It proves `requested_sampler:"uni_pc_bh2"` executes as
 `schedule_source:"zimage_build_sigmas"`, `unipc_update_steps:3`,
 `unipc_corrector_steps:2`, `unipc_second_order_steps:2`,
 `denoise_seconds_per_step:0.32013946925`, and `peak_vram_mib:21727.5625`.
-Generic `uni_pc` remains blocked from runtime acceptance (`job-0038`) until its
-exact Comfy/Swarm semantics are implemented and proven. A focused Mojo semantic
-gate now pins the delta: generic `uni_pc` is `bh1`, uses
-`order=min(3,len(sigmas)-2)`, SigmaConvert, final-zero replacement, and
-initial-noise scaling; it is not an alias for the accepted `uni_pc_bh2`
-bh2/order-2 flow path.
+
+`job-0077` is the current bounded generic UniPC sampler artifact from the daemon
+product path. It proves `requested_sampler:"uni_pc"` executes as
+`executed_sampler:"uni_pc"` with `executed_scheduler:"simple_flowmatch"`,
+`solver_type:"bh1"`, `solver_variant:"bh1"`, `solver_order:3`,
+`sigma_parameterization:"SigmaConvert"`,
+`schedule_source:"zimage_build_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`,
+`steps_executed:4`, `unipc_update_steps:4`, `unipc_corrector_steps:3`,
+`unipc_second_order_steps:2`, `denoise_seconds_per_step:0.29673903050000006`,
+`total_wall_seconds:3.872930771`, and `peak_vram_mib:21379.875`. This is
+bounded Z-Image sampler evidence only; `accepted_sampler_parity:false` remains
+correct.
+
+`job-0106` is the current bounded Ideogram4 daemon artifact. It proves the native
+Mojo backend can emit a `1024x1024` PNG with `serenity.genparams.v1`, gallery
+readback, and a sidecar manifest through `ideogram4_logitnormal_euler` with
+`readiness_label:"experimental"`, `accepted_sampler_parity:false`,
+`accepted_speed_parity:false`, `load_seconds=75.44370386599999`,
+`text_encode_seconds=135.538652776`, `denoise_seconds=6.174464852`,
+`vae_decode_seconds=2.190651774`, `total_wall_seconds=221.428687069`, and
+`peak_vram_mib=22088.6875`. This is one-step path/resource evidence only. It
+does not prove quality, sampler breadth, or speed parity.
+
+The current bounded Ideogram4 fail-loud option smoke writes
+`output/checks/ideogram4_daemon_product_readiness.json`. It proves unsupported
+negative prompt, LoRA, prompt LoRA tag, init image, non-default
+creativity/denoise, variation, size, sampler, scheduler, and CFG requests return
+HTTP `422` before queue fanout, without new job rows or Ideogram text/DiT/VAE
+load markers. This proves rejection behavior only, not feature support.
+
+`job-0087` through `job-0090` are the current bounded Z-Image img2img/creativity
+artifacts. The focused gate reuses `job-0087.png` as `init_image` and validates
+three 8-step img2img jobs: `job-0088` with creativity `0.0`
+(`denoise_start_step:8`, `steps_executed:0`,
+`total_wall_seconds=3.164280578`), `job-0089` with creativity `0.5`
+(`denoise_start_step:6`, `steps_executed:1`,
+`total_wall_seconds=3.527565501`), and `job-0090` with creativity `1.0`
+(`denoise_start_step:0`, `steps_executed:7`,
+`total_wall_seconds=5.312134054`). Duplicate terminal zero sigma intervals are
+now treated as no-op sentinels, not denoise updates. Peak VRAM was
+`21393.25 MiB`. This proves
+bounded flat-parameter Z-Image img2img plumbing and manifest evidence only;
+`accepted_img2img_parity:false` remains correct.
 
 `job-0047` is the current typed linked workflow graph smoke artifact from the
 stub daemon product path. It proves linked positive/negative conditioning, model,
@@ -272,7 +342,8 @@ Important finding:
 
 | Model/Family | Current status | Next action |
 |---|---|---|
-| Z-Image | Best first SwarmUI product target. Has product backend, metadata path, flash SDPA route, sampler manifests. Speed parity still not accepted. | Make daemon-driven real Z-Image generation produce PNG + manifest with dimensions, timings, peak VRAM, progress/cancel, and readiness label. |
+| Z-Image | Best first SwarmUI product target. Has product backend, metadata path, flash SDPA route, sampler manifests, multi-LoRA, variation, multi-image serial output, and bounded DPM++/UniPC artifacts. Speed parity still not accepted. | Measure and reduce the current product bottleneck, then add each remaining sampler/workflow surface only with artifact/timing/VRAM evidence. |
+| Ideogram4 | Native daemon backend exists and has bounded 1024x1024 one-step artifact `job-0106` with PNG metadata, gallery readback, sidecar manifest, timings, and positive VRAM. Bounded unsupported controls now fail loud at `/v1/generate` prequeue. It is experimental and speed/sampler/quality parity remain false. | Extend from bounded one-step smoke to full product evidence only after multi-step quality, residency/speed, feature-support decisions, and sampler-surface limits are measured. |
 | Klein | Best memory/offload mechanics target. Uses `ScratchRingAllocator` and `TurboPlannedLoader`; product smokes exist in docs. Heavy. | Use after Z-Image product artifact, or if the slice is explicitly memory/offload measurement. |
 | SDXL / SD3 / Flux / Chroma / ERNIE | Useful image candidates, but several are cached-input, staged, or contract smokes rather than full SwarmUI product paths. | Promote only after Z-Image product loop proves the daemon/gallery/runtime pattern. |
 | Qwen | Too large/slow/OOM-prone for full generation in this slice. Static masked-SDPA blocker is fixed with `sdpa_qwen_keymask`; tiny op parity passes, but no full Qwen artifact was run. | Keep Qwen on bounded gates only until memory/offload evidence says a real daemon run is safe. |
@@ -348,9 +419,10 @@ python3 scripts/check_zimage_daemon_product_contract.py --cancel-smoke \
 
 This starts the compiled Mojo daemon in `zimage` mode, submits a bounded
 512x512 job through `/v1/generate`, listens to `/v1/progress`, validates PNG
-metadata, `jobs.db`, gallery/read endpoints, manifest timings/VRAM, and then
-checks running-job cancel behavior. Passing this gate still does not accept
-sampler or speed parity.
+metadata, `jobs.db`, gallery/read endpoints, manifest timings/VRAM, default
+sampler smokes, variation/multi-image/multi-LoRA coverage, bounded
+img2img/creativity coverage, and then checks running-job cancel behavior.
+Passing this gate still does not accept sampler, img2img, or speed parity.
 
 ### M2 - Z-Image Runtime Speed/Memory Work
 
@@ -476,8 +548,10 @@ Order:
 1. Klein if the goal is memory/offload mechanics and low-VRAM behavior.
 2. Ideogram4 as the requested next image target. DONE for this slice: resident
    and reference DiT product attention are off direct
-   `sdpa_nomask[1,S,18,256]` and pass the Dh=256 forward-only flash gate. Next
-   Ideogram4 work is the daemon backend/artifact gate.
+   `sdpa_nomask[1,S,18,256]`, the Dh=256 forward-only flash gate passes, and a
+   bounded native daemon artifact with PNG metadata exists as `job-0106`. Next
+   Ideogram4 work is full product hardening: 20-step quality/resource proof and
+   speed/residency work beyond the bounded fail-loud option gate.
 3. SDXL/Flux/Chroma/ERNIE if the goal is model breadth.
 4. Qwen only after a bounded low-memory plan is written and accepted.
 
@@ -530,16 +604,18 @@ Next implementation slice:
    boundary before widening the video claim. DONE in this slice: the daemon no
    longer forces `staged lora stream`; `POST /v1/video` defaults
    `weight_mode:"resident"` and keeps `weight_mode:"stream"` as a debug escape
-   hatch. The first fused FP8 GEMM no-bias dummy/fence cleanup landed with a
-   focused smoke. Next LTX2 work is to lift the MVP raw resident-FP8 block
-   pattern into staged/refhq, remove remaining hot linear/FP8 synchronizations,
-   and only then compare deeper CUTLASS or cuBLASLt FP8 kernels.
+   hatch. The resident FP8 no-sync materializer and staged/refhq block-output
+   clone-pair fence coalescing both landed with focused gates and a profiled MP4
+   artifact. Next LTX2 work is to remove remaining hot per-block
+   load/materialization and biased-linear synchronization points before comparing
+   deeper CUTLASS or cuBLASLt FP8 kernels.
 2. Add the Ideogram4 image backend. DONE in this slice: direct
    `sdpa_nomask[1,S,18,256]` resident/reference DiT attention is replaced with
-   a proven forward-only cuDNN flash path for Ideogram Dh=256 shapes. Next:
-   prove a daemon artifact with metadata, timings, and VRAM. Standalone
-   Ideogram4 parity is still not enough; there is no accepted
-   `Ideogram4Backend` yet.
+   a proven forward-only cuDNN flash path for Ideogram Dh=256 shapes, and a
+   bounded native daemon backend emitted `job-0106` with PNG metadata, gallery
+   readback, sidecar timings, and VRAM. Next: add multi-step quality/resource
+   evidence.
+   Standalone Ideogram4 smoke evidence is still not accepted SwarmUI parity.
 3. Refresh `/v1/samplers` smoke evidence, then promote the next sampler only
    with artifact/timing/VRAM evidence. Do not promote generic `uni_pc` by
    aliasing it to bh2; map its exact Comfy/Swarm semantics first.

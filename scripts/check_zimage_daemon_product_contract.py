@@ -39,6 +39,8 @@ SCHEMA = "serenity.zimage.daemon_product_smoke.v1"
 GENPARAMS_KEY = "serenity.genparams.v1"
 MANIFEST_SCHEMA = "serenity.zimage.daemon_result.v1"
 TERMINAL_STATES = {"done", "failed", "cancelled", "interrupted"}
+IMG2IMG_CREATIVITY_VALUES = (0.0, 0.5, 1.0)
+IMG2IMG_STEPS = 8
 
 
 class ContractError(RuntimeError):
@@ -299,6 +301,221 @@ def require_number(
     return fvalue
 
 
+def finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    fvalue = float(value)
+    return fvalue if math.isfinite(fvalue) else None
+
+
+def expected_sigma_shift(request_body: dict[str, Any]) -> float:
+    shift = finite_number(request_body.get("sigma_shift"))
+    return shift if shift is not None else 3.0
+
+
+def expected_comfy_simple_sigmas(steps: int, sigma_shift: float) -> list[float]:
+    out: list[float] = []
+    stride = 1000.0 / float(steps)
+    for step in range(steps):
+        timestep_index = 1000 - int(float(step) * stride)
+        t = float(timestep_index) / 1000.0
+        out.append((sigma_shift * t) / (1.0 + (sigma_shift - 1.0) * t))
+    out.append(0.0)
+    return out
+
+
+def require_comfy_simple_sigmas(
+    sigma_trace: Any,
+    steps: int,
+    sigma_shift: float,
+    label: str,
+    blockers: list[str],
+) -> None:
+    require(isinstance(sigma_trace, list), f"{label} sigma_trace must be an array", blockers)
+    if not isinstance(sigma_trace, list):
+        return
+    expected = expected_comfy_simple_sigmas(steps, sigma_shift)
+    require(len(sigma_trace) == len(expected), f"{label} sigma_trace length mismatch", blockers)
+    if len(sigma_trace) != len(expected):
+        return
+    for index, want in enumerate(expected):
+        got = finite_number(sigma_trace[index])
+        if got is None:
+            blockers.append(f"{label} sigma_trace[{index}] must be a finite number")
+            continue
+        require(abs(got - want) <= 5.0e-5, f"{label} sigma_trace[{index}] mismatch", blockers)
+
+
+def expected_denoise_start_step(sigma_trace: list[Any], steps: int, creativity: float) -> int | None:
+    if steps < 0 or len(sigma_trace) < steps + 1:
+        return None
+    start_step = 0
+    while start_step < steps:
+        sigma = finite_number(sigma_trace[start_step])
+        if sigma is None:
+            return None
+        if sigma <= creativity + 1.0e-6:
+            break
+        start_step += 1
+    if finite_number(sigma_trace[start_step]) is None:
+        return None
+    while start_step < steps and not sigma_step_has_update(sigma_trace, start_step):
+        start_step += 1
+    return start_step
+
+
+def sigma_step_has_update(sigma_trace: list[Any], step: int) -> bool:
+    if step < 0 or len(sigma_trace) <= step + 1:
+        return False
+    sigma = finite_number(sigma_trace[step])
+    sigma_next = finite_number(sigma_trace[step + 1])
+    if sigma is None or sigma_next is None:
+        return False
+    if sigma <= 0.0:
+        return False
+    if sigma_next == sigma:
+        return False
+    return True
+
+
+def expected_denoise_update_steps(sigma_trace: list[Any], steps: int, start_step: int) -> int | None:
+    if steps < 0 or start_step < 0 or start_step > steps or len(sigma_trace) < steps + 1:
+        return None
+    count = 0
+    for step in range(start_step, steps):
+        if sigma_step_has_update(sigma_trace, step):
+            count += 1
+    return count
+
+
+def validate_img2img_manifest(
+    *,
+    evidence: dict[str, Any],
+    request_body: dict[str, Any],
+    blockers: list[str],
+) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "request_init_image": request_body.get("init_image"),
+        "request_creativity": request_body.get("creativity"),
+        "request_steps": request_body.get("steps"),
+        "manifest_has_init_image": False,
+        "manifest_has_creativity": False,
+        "manifest_has_denoise_start_step": False,
+        "manifest_has_steps_executed": False,
+    }
+    manifest = evidence.get("manifest")
+    if not isinstance(manifest, dict):
+        blockers.append("img2img_manifest_missing: result manifest was not available for img2img artifact validation")
+        return details
+    run_identity = manifest.get("run_identity")
+    if not isinstance(run_identity, dict):
+        blockers.append("img2img_manifest_missing_run_identity: manifest did not expose run_identity")
+        return details
+
+    expected_init = str(request_body.get("init_image") or "")
+    creativity = finite_number(request_body.get("creativity"))
+    steps = int(request_body.get("steps") or 0)
+
+    if "init_image" in run_identity:
+        details["manifest_has_init_image"] = True
+        require(run_identity.get("init_image") == expected_init, "manifest img2img init_image mismatch", blockers)
+    else:
+        blockers.append("img2img_manifest_missing_init_image: manifest run_identity did not record init_image")
+
+    if "creativity" in run_identity:
+        details["manifest_has_creativity"] = True
+        recorded_creativity = finite_number(run_identity.get("creativity"))
+        if creativity is None or recorded_creativity is None:
+            blockers.append("manifest img2img creativity must be a finite number")
+        else:
+            require(abs(recorded_creativity - creativity) <= 1.0e-6, "manifest img2img creativity mismatch", blockers)
+    else:
+        blockers.append("img2img_manifest_missing_creativity: manifest run_identity did not record creativity")
+
+    require(run_identity.get("img2img_applied") is True, "manifest img2img_applied must be true for init_image smoke", blockers)
+
+    denoise_start_raw = run_identity.get("denoise_start_step")
+    denoise_start: int | None = None
+    if "denoise_start_step" in run_identity:
+        details["manifest_has_denoise_start_step"] = True
+        if isinstance(denoise_start_raw, int) and not isinstance(denoise_start_raw, bool):
+            denoise_start = denoise_start_raw
+            require(0 <= denoise_start <= steps, "manifest img2img denoise_start_step out of range", blockers)
+        else:
+            blockers.append("manifest img2img denoise_start_step must be an integer")
+    else:
+        blockers.append("img2img_manifest_missing_denoise_start_step: manifest did not record denoise_start_step")
+
+    steps_executed_raw = run_identity.get("steps_executed")
+    steps_executed: int | None = None
+    if "steps_executed" in run_identity:
+        details["manifest_has_steps_executed"] = True
+        if isinstance(steps_executed_raw, int) and not isinstance(steps_executed_raw, bool):
+            steps_executed = steps_executed_raw
+            require(0 <= steps_executed <= steps, "manifest img2img steps_executed out of range", blockers)
+        else:
+            blockers.append("manifest img2img steps_executed must be an integer")
+    else:
+        blockers.append("img2img_manifest_missing_steps_executed: manifest did not record steps_executed")
+
+    sigma_trace = run_identity.get("sigma_trace")
+    if isinstance(sigma_trace, list) and creativity is not None:
+        expected_start = expected_denoise_start_step(sigma_trace, steps, creativity)
+        details["expected_denoise_start_step"] = expected_start
+        if expected_start is None:
+            blockers.append("manifest img2img sigma_trace cannot derive denoise_start_step")
+        else:
+            expected_steps_executed = expected_denoise_update_steps(sigma_trace, steps, expected_start)
+            if expected_steps_executed is None:
+                blockers.append("manifest img2img sigma_trace cannot derive update step count")
+                expected_steps_executed = 0
+            details["expected_steps_executed"] = expected_steps_executed
+            if denoise_start is not None:
+                require(
+                    denoise_start == expected_start,
+                    (
+                        "manifest img2img denoise_start_step mismatch "
+                        f"for creativity {creativity}: expected {expected_start}, got {denoise_start}"
+                    ),
+                    blockers,
+                )
+            if steps_executed is not None:
+                require(
+                    steps_executed == expected_steps_executed,
+                    (
+                        "manifest img2img steps_executed mismatch "
+                        f"for creativity {creativity}: expected {expected_steps_executed}, got {steps_executed}"
+                    ),
+                        blockers,
+                    )
+                update_steps_alias = run_identity.get("denoise_update_steps")
+                if isinstance(update_steps_alias, int) and not isinstance(update_steps_alias, bool):
+                    require(
+                        update_steps_alias == expected_steps_executed,
+                        "manifest img2img denoise_update_steps mismatch",
+                        blockers,
+                    )
+                else:
+                    blockers.append("img2img_manifest_missing_denoise_update_steps")
+            sampler_trace = run_identity.get("sampler_trace")
+            if isinstance(sampler_trace, dict):
+                update_steps_raw = sampler_trace.get("update_steps")
+                if isinstance(update_steps_raw, int) and not isinstance(update_steps_raw, bool):
+                    require(
+                        update_steps_raw == expected_steps_executed,
+                        "manifest img2img sampler_trace.update_steps mismatch",
+                        blockers,
+                    )
+                else:
+                    blockers.append("img2img_manifest_missing_sampler_trace.update_steps")
+            else:
+                blockers.append("img2img_manifest_missing_sampler_trace: manifest run_identity did not record sampler_trace")
+    else:
+        blockers.append("img2img_manifest_missing_sigma_trace: manifest run_identity did not record sigma_trace")
+
+    return details
+
+
 def read_safetensors_header(path: Path) -> dict[str, Any]:
     with path.open("rb") as fh:
         raw_len = fh.read(8)
@@ -387,6 +604,8 @@ def expected_executed_sampler(request_body: dict[str, Any]) -> str:
     sampler = str(request_body.get("sampler") or "").lower().replace(" ", "_")
     if sampler in {"dpm++_2m", "dpmpp_2m"}:
         return "dpmpp_2m"
+    if sampler in {"uni_pc", "uni-pc", "unipc"}:
+        return "uni_pc"
     if sampler in {"uni-pc_bh2", "unipc_bh2", "uni_pc_bh2"}:
         return "uni_pc_bh2"
     return "flowmatch_euler"
@@ -506,6 +725,17 @@ def validate_completed_job(
                 "image_count",
             ):
                 require(genparams.get(key) == request_body.get(key), f"genparams {key} mismatch", blockers)
+            for key in ("init_image", "creativity"):
+                if key in request_body:
+                    require(genparams.get(key) == request_body.get(key), f"genparams {key} mismatch", blockers)
+            genparams_shift = finite_number(genparams.get("sigma_shift"))
+            require(genparams_shift is not None, "genparams sigma_shift must be a finite number", blockers)
+            if genparams_shift is not None:
+                require(
+                    abs(genparams_shift - expected_sigma_shift(request_body)) <= 1.0e-6,
+                    "genparams sigma_shift mismatch",
+                    blockers,
+                )
             expected_lora = request_body.get("lora") or []
             if expected_lora:
                 require(genparams.get("lora") == expected_lora, "genparams lora stack mismatch", blockers)
@@ -522,12 +752,30 @@ def validate_completed_job(
         require(manifest.get("readiness_label") == "experimental", "manifest readiness_label must be experimental", blockers)
         require(manifest.get("accepted_sampler_parity") is False, "manifest must not accept sampler parity", blockers)
         require(manifest.get("accepted_speed_parity") is False, "manifest must not accept speed parity", blockers)
+        if "accepted_img2img_parity" in manifest:
+            require(manifest.get("accepted_img2img_parity") is False, "manifest must not accept img2img parity", blockers)
         run_identity = manifest.get("run_identity")
         mojo = manifest.get("mojo")
         require(isinstance(run_identity, dict), "manifest run_identity must be an object", blockers)
         require(isinstance(mojo, dict), "manifest mojo must be an object", blockers)
         if isinstance(run_identity, dict):
             require(run_identity.get("job_id") == job.get("id"), "manifest run_identity.job_id mismatch", blockers)
+            require(run_identity.get("prompt") == request_body.get("prompt"), "manifest prompt mismatch", blockers)
+            require(run_identity.get("negative") == request_body.get("negative", ""), "manifest negative mismatch", blockers)
+            require(run_identity.get("seed") == request_body.get("seed"), "manifest seed mismatch", blockers)
+            require(run_identity.get("steps") == request_body.get("steps"), "manifest steps mismatch", blockers)
+            guidance = finite_number(run_identity.get("guidance"))
+            request_cfg = finite_number(request_body.get("cfg"))
+            if guidance is None or request_cfg is None:
+                blockers.append("manifest guidance/cfg must be finite numbers")
+            else:
+                require(abs(guidance - request_cfg) <= 1.0e-6, "manifest guidance/cfg mismatch", blockers)
+            expected_shift = expected_sigma_shift(request_body)
+            manifest_shift = finite_number(run_identity.get("sigma_shift"))
+            if manifest_shift is None:
+                blockers.append("manifest sigma_shift must be a finite number")
+            else:
+                require(abs(manifest_shift - expected_shift) <= 1.0e-6, "manifest sigma_shift mismatch", blockers)
             require(run_identity.get("dtype") == "bf16", "manifest dtype must be bf16", blockers)
             require(run_identity.get("requested_sampler") == request_body.get("sampler"), "manifest requested_sampler mismatch", blockers)
             require(run_identity.get("requested_scheduler") == request_body.get("scheduler"), "manifest requested_scheduler mismatch", blockers)
@@ -536,10 +784,23 @@ def validate_completed_job(
             require(run_identity.get("executed_sampler") == expected_sampler, "manifest executed_sampler mismatch", blockers)
             require(run_identity.get("executed_scheduler") == expected_scheduler, "manifest executed_scheduler mismatch", blockers)
             require(isinstance(run_identity.get("sigma_trace"), list), "manifest sigma_trace must be an array", blockers)
+            if expected_scheduler == "simple_flowmatch":
+                require_comfy_simple_sigmas(
+                    run_identity.get("sigma_trace"),
+                    int(request_body.get("steps") or 0),
+                    expected_shift,
+                    "manifest Comfy simple",
+                    blockers,
+                )
             require(isinstance(run_identity.get("sampler_trace"), dict), "manifest sampler_trace must be an object", blockers)
             sampler_trace = run_identity.get("sampler_trace")
             if expected_sampler == "dpmpp_2m" and isinstance(sampler_trace, dict):
                 require(sampler_trace.get("algorithm") == "dpmpp_2m", "DPM++ sampler_trace algorithm mismatch", blockers)
+                require(
+                    sampler_trace.get("schedule_source") == "zimage_comfy_simple_sigmas",
+                    "DPM++ sampler_trace schedule_source mismatch",
+                    blockers,
+                )
                 require(sampler_trace.get("history_capacity") == 1, "DPM++ sampler_trace history_capacity mismatch", blockers)
                 require(int(sampler_trace.get("history_final_len") or 0) >= 1, "DPM++ sampler_trace did not record history", blockers)
                 require(int(sampler_trace.get("dpmpp_update_steps") or 0) >= 1, "DPM++ sampler_trace did not record update steps", blockers)
@@ -548,10 +809,26 @@ def validate_completed_job(
                 require(sampler_trace.get("algorithm") == "uni_pc_bh2", "UniPC sampler_trace algorithm mismatch", blockers)
                 require(sampler_trace.get("solver_type") == "bh2", "UniPC sampler_trace solver_type mismatch", blockers)
                 require(sampler_trace.get("solver_order") == 2, "UniPC sampler_trace solver_order mismatch", blockers)
-                require(sampler_trace.get("schedule_source") == "zimage_build_sigmas", "UniPC sampler_trace schedule_source mismatch", blockers)
+                require(sampler_trace.get("schedule_source") == "zimage_comfy_simple_sigmas", "UniPC sampler_trace schedule_source mismatch", blockers)
                 require(int(sampler_trace.get("unipc_update_steps") or 0) >= 1, "UniPC sampler_trace did not record update steps", blockers)
                 require(int(sampler_trace.get("unipc_corrector_steps") or 0) >= 1, "UniPC sampler_trace did not record corrector steps", blockers)
                 require(int(sampler_trace.get("unipc_second_order_steps") or 0) >= 1, "UniPC sampler_trace did not record 2nd-order updates", blockers)
+            if expected_sampler == "uni_pc" and isinstance(sampler_trace, dict):
+                require(sampler_trace.get("algorithm") == "uni_pc", "generic UniPC sampler_trace algorithm mismatch", blockers)
+                require(sampler_trace.get("requested_sampler") == request_body.get("sampler"), "generic UniPC sampler_trace requested_sampler mismatch", blockers)
+                require(sampler_trace.get("requested_scheduler") == request_body.get("scheduler"), "generic UniPC sampler_trace requested_scheduler mismatch", blockers)
+                require(sampler_trace.get("executed_sampler") == "uni_pc", "generic UniPC sampler_trace executed_sampler mismatch", blockers)
+                require(sampler_trace.get("executed_scheduler") == "simple_flowmatch", "generic UniPC sampler_trace executed_scheduler mismatch", blockers)
+                require(sampler_trace.get("solver_type") == "bh1", "generic UniPC sampler_trace solver_type mismatch", blockers)
+                require(sampler_trace.get("solver_variant") == "bh1", "generic UniPC sampler_trace solver_variant mismatch", blockers)
+                require(sampler_trace.get("solver_order") == 3, "generic UniPC sampler_trace solver_order mismatch for 4-step smoke", blockers)
+                require(sampler_trace.get("sigma_parameterization") == "SigmaConvert", "generic UniPC sampler_trace sigma_parameterization mismatch", blockers)
+                require(sampler_trace.get("schedule_source") == "zimage_comfy_simple_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps", "generic UniPC sampler_trace schedule_source mismatch", blockers)
+                require(float(sampler_trace.get("initial_noise_scale") or 0.0) > 0.0, "generic UniPC sampler_trace missing initial_noise_scale", blockers)
+                require(float(sampler_trace.get("final_sample_scale") or 0.0) > 0.0, "generic UniPC sampler_trace missing final_sample_scale", blockers)
+                require(int(sampler_trace.get("unipc_update_steps") or 0) >= 1, "generic UniPC sampler_trace did not record update steps", blockers)
+                require(int(sampler_trace.get("unipc_corrector_steps") or 0) >= 1, "generic UniPC sampler_trace did not record corrector steps", blockers)
+                require(int(sampler_trace.get("unipc_second_order_steps") or 0) >= 1, "generic UniPC sampler_trace did not record 2nd-order updates", blockers)
             expected_variation = float(request_body.get("variation_strength", 0.0)) > 0.0
             require(run_identity.get("variation_seed") == request_body.get("variation_seed"), "manifest variation_seed mismatch", blockers)
             require(run_identity.get("variation_strength") == request_body.get("variation_strength"), "manifest variation_strength mismatch", blockers)
@@ -572,15 +849,30 @@ def validate_completed_job(
                     require(lora_stack[li].get("weight") == expected.get("weight"), f"manifest lora_stack[{li}].weight mismatch", blockers)
                     require(bool(lora_stack[li].get("resolved_path")), f"manifest lora_stack[{li}] missing resolved_path", blockers)
         if isinstance(mojo, dict):
+            denoise_update_steps = None
+            if isinstance(run_identity, dict):
+                raw_update_steps = run_identity.get("denoise_update_steps")
+                if isinstance(raw_update_steps, int) and not isinstance(raw_update_steps, bool):
+                    denoise_update_steps = raw_update_steps
+            img2img_no_denoise = bool(request_body.get("init_image")) and denoise_update_steps == 0
             for key in (
                 "load_seconds",
                 "text_encode_seconds",
                 "denoise_seconds",
                 "denoise_seconds_per_step",
+                "denoise_seconds_per_update_step",
                 "vae_decode_seconds",
                 "total_wall_seconds",
             ):
-                require_number(mojo, key, blockers, positive=(key != "load_seconds"))
+                allow_zero = key == "load_seconds" or (
+                    img2img_no_denoise
+                    and key in {
+                        "denoise_seconds",
+                        "denoise_seconds_per_step",
+                        "denoise_seconds_per_update_step",
+                    }
+                )
+                require_number(mojo, key, blockers, positive=not allow_zero)
             require_number(mojo, "peak_vram_mib", blockers, positive=True)
 
     row: dict[str, Any] = {}
@@ -729,7 +1021,7 @@ def run_unsupported_sampler_smoke(
         "steps": 1,
         "seed": seed,
         "cfg": 1.0,
-        "sampler": "uni_pc",
+        "sampler": "dpmpp_3m_sde",
         "scheduler": "flowmatch",
         "images": 1,
     }
@@ -741,7 +1033,7 @@ def run_unsupported_sampler_smoke(
     require(job.get("state") == "failed", f"unsupported sampler job must fail, got {job.get('state')!r}", blockers)
     err = str(job.get("error") or "")
     require("unsupported sampler" in err, f"unsupported sampler failure did not name sampler support: {err!r}", blockers)
-    require("uni_pc" in err, f"unsupported sampler failure did not echo requested sampler: {err!r}", blockers)
+    require("dpmpp_3m_sde" in err, f"unsupported sampler failure did not echo requested sampler: {err!r}", blockers)
     require(not job.get("output_path"), "unsupported sampler job must not emit output_path", blockers)
     job_events = [event for event in events if event.get("job_id") == job_id]
     require(any(event.get("state") == "failed" for event in job_events), "WebSocket progress missing failed event for unsupported sampler", blockers)
@@ -814,6 +1106,37 @@ def run_dpmpp2m_smoke(
     }, blockers
 
 
+def require_descending_sigma_trace(run_identity: dict[str, Any], label: str, blockers: list[str]) -> None:
+    sigma_trace = run_identity.get("sigma_trace")
+    require(isinstance(sigma_trace, list), f"{label} sigma_trace must be an array", blockers)
+    if not isinstance(sigma_trace, list):
+        return
+    sigmas: list[float] = []
+    for item in sigma_trace:
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            value = float(item)
+            if math.isfinite(value):
+                sigmas.append(value)
+            else:
+                blockers.append(f"{label} sigma_trace contains non-finite value: {item!r}")
+        else:
+            blockers.append(f"{label} sigma_trace contains non-numeric value: {item!r}")
+    if not sigmas:
+        return
+    require(abs(sigmas[-1]) <= 1.0e-7, f"{label} sigma_trace terminal value must be zero", blockers)
+    positive = [value for value in sigmas[:-1] if value > 0.0]
+    require(len(positive) >= 2, f"{label} sigma_trace must contain at least two positive sigmas", blockers)
+    if len(positive) < 2:
+        return
+    require(positive[0] > positive[-1], f"{label} sigma_trace must descend across positive sigmas", blockers)
+    for index in range(1, len(positive)):
+        require(
+            positive[index] <= positive[index - 1] + 1.0e-6,
+            f"{label} sigma_trace positive sigmas must be monotonic at index {index}",
+            blockers,
+        )
+
+
 def run_unipc_bh2_smoke(
     *,
     base_url: str,
@@ -865,10 +1188,75 @@ def run_unipc_bh2_smoke(
         if isinstance(trace, dict):
             require(trace.get("solver_type") == "bh2", "UniPC smoke solver_type mismatch", blockers)
             require(trace.get("solver_order") == 2, "UniPC smoke solver_order mismatch", blockers)
-            require(trace.get("schedule_source") == "zimage_build_sigmas", "UniPC smoke schedule_source mismatch", blockers)
+            require(trace.get("schedule_source") == "zimage_comfy_simple_sigmas", "UniPC smoke schedule_source mismatch", blockers)
             require(int(trace.get("unipc_update_steps") or 0) >= 1, "UniPC smoke did not record update steps", blockers)
             require(int(trace.get("unipc_corrector_steps") or 0) >= 1, "UniPC smoke did not record corrector steps", blockers)
             require(int(trace.get("unipc_second_order_steps") or 0) >= 1, "UniPC smoke did not use second-order updates", blockers)
+    return {
+        "request": body,
+        "generate": res.data,
+        "job_id": job_id,
+        "evidence": evidence,
+    }, blockers
+
+
+def run_generic_unipc_smoke(
+    *,
+    base_url: str,
+    ws: ProgressWebSocket | None,
+    prompt: str,
+    negative: str,
+    seed: int,
+    timeout: float,
+    poll_interval: float,
+) -> tuple[dict[str, Any], list[str]]:
+    blockers: list[str] = []
+    body = {
+        "model": "zimage",
+        "prompt": prompt,
+        "negative": negative,
+        "width": 512,
+        "height": 512,
+        "steps": 4,
+        "seed": seed,
+        "cfg": 1.0,
+        "sampler": "uni_pc",
+        "scheduler": "flowmatch",
+        "variation_seed": 0,
+        "variation_strength": 0.0,
+        "images": 1,
+        "image_index": 0,
+        "image_count": 1,
+    }
+    res = http_json("POST", f"{base_url}/v1/generate", body, timeout=15.0)
+    if res.status != 200 or not isinstance(res.data, dict) or not res.data.get("job_id"):
+        raise ContractError(f"generic UniPC generate failed HTTP {res.status}: {res.text}")
+    job_id = str(res.data["job_id"])
+    job, states, events = poll_job(base_url, job_id, ws, timeout, poll_interval)
+    evidence, completed_blockers = validate_completed_job(
+        job=job,
+        states=states,
+        events=events,
+        request_body=body,
+        base_url=base_url,
+        require_phase_events=False,
+    )
+    blockers.extend(completed_blockers)
+    run_identity = evidence.get("manifest", {}).get("run_identity", {})
+    if isinstance(run_identity, dict):
+        require(run_identity.get("executed_sampler") == "uni_pc", "generic UniPC smoke executed_sampler mismatch", blockers)
+        require(run_identity.get("executed_scheduler") == "simple_flowmatch", "generic UniPC smoke executed_scheduler mismatch", blockers)
+        trace = run_identity.get("sampler_trace")
+        require(isinstance(trace, dict), "generic UniPC smoke missing sampler_trace", blockers)
+        if isinstance(trace, dict):
+            require(trace.get("solver_type") == "bh1", "generic UniPC smoke solver_type mismatch", blockers)
+            require(trace.get("solver_variant") == "bh1", "generic UniPC smoke solver_variant mismatch", blockers)
+            require(trace.get("solver_order") == 3, "generic UniPC smoke solver_order mismatch", blockers)
+            require(trace.get("sigma_parameterization") == "SigmaConvert", "generic UniPC smoke sigma_parameterization mismatch", blockers)
+            require(trace.get("schedule_source") == "zimage_comfy_simple_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps", "generic UniPC smoke schedule_source mismatch", blockers)
+            require(int(trace.get("unipc_update_steps") or 0) >= 1, "generic UniPC smoke did not record update steps", blockers)
+            require(int(trace.get("unipc_corrector_steps") or 0) >= 1, "generic UniPC smoke did not record corrector steps", blockers)
+            require(int(trace.get("unipc_second_order_steps") or 0) >= 1, "generic UniPC smoke did not use second-order updates", blockers)
     return {
         "request": body,
         "generate": res.data,
@@ -1011,6 +1399,91 @@ def run_variation_smoke(
     }, blockers
 
 
+def run_img2img_creativity_smoke(
+    *,
+    base_url: str,
+    ws: ProgressWebSocket | None,
+    prompt: str,
+    negative: str,
+    seed: int,
+    init_image: str,
+    creativity_values: tuple[float, ...],
+    timeout: float,
+    poll_interval: float,
+) -> tuple[dict[str, Any], list[str]]:
+    blockers: list[str] = []
+    init_path = Path(init_image)
+    require(init_path.is_file(), f"img2img init_image artifact missing: {init_image}", blockers)
+    if blockers:
+        return {
+            "init_image": init_image,
+            "creativity_values": list(creativity_values),
+            "items": [],
+        }, blockers
+
+    items: list[dict[str, Any]] = []
+    for index, creativity in enumerate(creativity_values):
+        body = {
+            "model": "zimage",
+            "prompt": prompt,
+            "negative": negative,
+            "width": 512,
+            "height": 512,
+            "steps": IMG2IMG_STEPS,
+            "seed": seed + index,
+            "cfg": 1.0,
+            "sampler": "euler",
+            "scheduler": "flowmatch",
+            "variation_seed": 0,
+            "variation_strength": 0.0,
+            "images": 1,
+            "image_index": 0,
+            "image_count": 1,
+            "init_image": init_image,
+            "creativity": creativity,
+        }
+        res = http_json("POST", f"{base_url}/v1/generate", body, timeout=20.0)
+        if res.status != 200 or not isinstance(res.data, dict) or not res.data.get("job_id"):
+            raise ContractError(f"img2img creativity={creativity} generate failed HTTP {res.status}: {res.text}")
+        job_id = str(res.data["job_id"])
+        job, states, events = poll_job(base_url, job_id, ws, timeout, poll_interval)
+        evidence, completed_blockers = validate_completed_job(
+            job=job,
+            states=states,
+            events=events,
+            request_body=body,
+            base_url=base_url,
+            require_phase_events=False,
+        )
+        blockers.extend(completed_blockers)
+        png_path = str(evidence.get("png", {}).get("path") or "")
+        require(bool(png_path), "img2img smoke did not record output PNG path", blockers)
+        require(png_path != init_image, "img2img smoke output path must not overwrite init_image", blockers)
+        idat_sha = str(evidence.get("png", {}).get("idat_sha256") or "")
+        require(bool(idat_sha), "img2img PNG did not expose IDAT hash", blockers)
+        manifest_checks = validate_img2img_manifest(
+            evidence=evidence,
+            request_body=body,
+            blockers=blockers,
+        )
+        items.append({
+            "creativity": creativity,
+            "request": body,
+            "generate": res.data,
+            "job_id": job_id,
+            "evidence": evidence,
+            "manifest_img2img_checks": manifest_checks,
+            "idat_sha256": idat_sha,
+        })
+
+    return {
+        "init_image": init_image,
+        "creativity_values": list(creativity_values),
+        "steps": IMG2IMG_STEPS,
+        "items": items,
+    }, blockers
+
+
 def run_multi_lora_smoke(
     *,
     base_url: str,
@@ -1114,6 +1587,7 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         "cfg": args.cfg,
         "sampler": "euler",
         "scheduler": "flowmatch",
+        "sigma_shift": 3.0,
         "variation_seed": 0,
         "variation_strength": 0.0,
         "images": 1,
@@ -1131,16 +1605,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-interval", type=float, default=0.25)
     parser.add_argument("--prompt", default="a precise product path smoke image of a red cube on a clean gray table")
     parser.add_argument("--negative", default="")
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20260612)
-    parser.add_argument("--cfg", type=float, default=1.0)
+    parser.add_argument("--cfg", type=float, default=4.0)
     parser.add_argument("--skip-unsupported-smoke", action="store_true", help="Skip unsupported sampler fail-loud endpoint smoke.")
     parser.add_argument("--skip-dpmpp2m-smoke", action="store_true", help="Skip positive Z-Image DPM++ 2M product smoke.")
+    parser.add_argument("--skip-generic-unipc-smoke", action="store_true", help="Skip positive Z-Image generic UniPC bh1 product smoke.")
     parser.add_argument("--skip-unipc-smoke", action="store_true", help="Skip positive Z-Image UniPC bh2 product smoke.")
     parser.add_argument("--skip-multi-image-smoke", action="store_true", help="Skip images=2 multi-output endpoint smoke.")
     parser.add_argument("--skip-variation-smoke", action="store_true", help="Skip variation_seed/variation_strength runtime noise smoke.")
+    parser.add_argument("--skip-img2img-smoke", action="store_true", help="Skip Z-Image init_image/creativity img2img artifact smoke.")
     parser.add_argument("--skip-multi-lora-smoke", action="store_true", help="Skip real Z-Image multi-LoRA stack runtime smoke.")
     parser.add_argument("--cancel-smoke", action="store_true", help="After a completed image, submit and cancel a running Z-Image job.")
     parser.add_argument("--min-free-vram-mib", type=int, default=22000)
@@ -1197,6 +1673,14 @@ def main() -> int:
         "log_path": str(log_path),
         "vram_preflight": pre_vram,
         "request": build_request(args),
+        "accepted_sampler_parity": False,
+        "accepted_speed_parity": False,
+        "accepted_img2img_parity": False,
+        "img2img_creativity_smoke_plan": {
+            "skipped": args.skip_img2img_smoke,
+            "creativity_values": list(IMG2IMG_CREATIVITY_VALUES),
+            "steps": IMG2IMG_STEPS,
+        },
     }
 
     try:
@@ -1236,6 +1720,26 @@ def main() -> int:
         report["completed_job_evidence"] = evidence
         blockers.extend(completed_blockers)
 
+        if not args.skip_img2img_smoke:
+            init_image = str(evidence.get("png", {}).get("path") or "")
+            report["img2img_creativity_smoke_plan"]["init_image"] = init_image
+            if not init_image or not Path(init_image).is_file():
+                blockers.append("img2img_smoke_missing_init_artifact: completed Z-Image PNG is not available for init_image")
+            else:
+                img2img_report, img2img_blockers = run_img2img_creativity_smoke(
+                    base_url=base_url,
+                    ws=ws,
+                    prompt="img2img creativity artifact smoke reusing a generated Z-Image PNG",
+                    negative=args.negative,
+                    seed=args.seed + 600,
+                    init_image=init_image,
+                    creativity_values=IMG2IMG_CREATIVITY_VALUES,
+                    timeout=args.timeout,
+                    poll_interval=args.poll_interval,
+                )
+                report["img2img_creativity_smoke"] = img2img_report
+                blockers.extend(img2img_blockers)
+
         if not args.skip_dpmpp2m_smoke:
             dpmpp_report, dpmpp_blockers = run_dpmpp2m_smoke(
                 base_url=base_url,
@@ -1248,6 +1752,19 @@ def main() -> int:
             )
             report["dpmpp2m_smoke"] = dpmpp_report
             blockers.extend(dpmpp_blockers)
+
+        if not args.skip_generic_unipc_smoke:
+            generic_unipc_report, generic_unipc_blockers = run_generic_unipc_smoke(
+                base_url=base_url,
+                ws=ws,
+                prompt="generic UniPC bh1 product smoke with Z-Image flowmatch schedule",
+                negative=args.negative,
+                seed=args.seed + 350,
+                timeout=args.timeout,
+                poll_interval=args.poll_interval,
+            )
+            report["generic_unipc_smoke"] = generic_unipc_report
+            blockers.extend(generic_unipc_blockers)
 
         if not args.skip_unipc_smoke:
             unipc_report, unipc_blockers = run_unipc_bh2_smoke(
@@ -1365,12 +1882,16 @@ def main() -> int:
         print(f"  unsupported_sampler_smoke: {report['unsupported_sampler_smoke']['job_id']} -> failed")
     if not args.skip_dpmpp2m_smoke:
         print(f"  dpmpp2m_smoke: {report['dpmpp2m_smoke']['job_id']} -> done")
+    if not args.skip_generic_unipc_smoke:
+        print(f"  generic_unipc_smoke: {report['generic_unipc_smoke']['job_id']} -> done")
     if not args.skip_unipc_smoke:
         print(f"  unipc_bh2_smoke: {report['unipc_bh2_smoke']['job_id']} -> done")
     if not args.skip_multi_image_smoke:
         print(f"  multi_image_smoke: {len(report['multi_image_smoke']['job_ids'])} outputs")
     if not args.skip_variation_smoke:
         print(f"  variation_smoke: {report['variation_smoke']['job_id']} -> changed noise/output")
+    if not args.skip_img2img_smoke:
+        print(f"  img2img_creativity_smoke: {len(report['img2img_creativity_smoke']['items'])} creativity values")
     if not args.skip_multi_lora_smoke:
         print(f"  multi_lora_smoke: {report['multi_lora_smoke']['multi_lora']['job_id']} -> stacked LoRA changed output")
     if args.cancel_smoke:

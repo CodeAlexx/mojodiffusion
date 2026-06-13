@@ -471,6 +471,26 @@ def _workflow_find_input_link(edges: JSONValue, to_node: Int, to_port: String) r
     return out^
 
 
+def _workflow_find_reroute_input_link(edges: JSONValue, to_node: Int) raises -> WorkflowLink:
+    var out = WorkflowLink(False, -1, String(""))
+    for i in range(edges.length()):
+        var edge = edges[i]
+        if not edge.is_object() or not edge.contains("from") or not edge.contains("to"):
+            raise Error("[501] workflow graph edge must have from/to endpoints")
+        var to = edge["to"]
+        var dst_node = _workflow_ref_node(to)
+        var dst_port = _workflow_ref_port(to)
+        if (
+            dst_node == to_node
+            and (dst_port == "input" or dst_port == "" or dst_port == "*" or dst_port == "reroute")
+        ):
+            if out.found:
+                raise Error("[501] workflow graph Reroute input has multiple sources")
+            var src = edge["from"]
+            out = WorkflowLink(True, _workflow_ref_node(src), _workflow_ref_port(src))
+    return out^
+
+
 def _workflow_has_node_id(ids: List[Int], id: Int) -> Bool:
     for i in range(len(ids)):
         if ids[i] == id:
@@ -693,6 +713,8 @@ def _comfy_ui_output_port(nodes: JSONValue, src_id: Int, src_slot: Int) raises -
     var typ = _workflow_string(out, String("type"))
     var name = _workflow_string(out, String("name"))
     var node_type = _workflow_canonical_type_id(_workflow_node_type(node))
+    if node_type == "Reroute":
+        return String("REROUTE")
     if node_type == "InpaintModelConditioning":
         if name == "positive" or name == "negative":
             return name^
@@ -734,6 +756,9 @@ def _comfy_ui_input_port(nodes: JSONValue, dst_id: Int, dst_slot: Int) raises ->
     if dst_slot < 0 or dst_slot >= inputs.length():
         raise Error("[501] Comfy UI canvas target input slot out of range")
     var port = _workflow_string(inputs[dst_slot], String("name"))
+    var node_type = _workflow_canonical_type_id(_workflow_node_type(node))
+    if node_type == "Reroute" and port == "":
+        return String("input")
     if port == "":
         raise Error("[501] Comfy UI canvas target input missing name")
     return port^
@@ -1083,6 +1108,9 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "SamplerCustomAdvanced" or typ == "LanPaint_SamplerCustomAdvanced":
         if slot == 0 or slot == 1:
             return String("LATENT")
+    elif typ == "Reroute":
+        if slot == 0:
+            return String("REROUTE")
     elif typ == "LanPaint_MaskBlend":
         if slot == 0:
             return String("IMAGE")
@@ -1129,7 +1157,10 @@ def _comfy_api_prompt_to_typed_graph(graph: JSONValue) raises -> JSONValue:
                 from_ref.set("node", JSONValue.from_int(source_id))
                 from_ref.set("port", JSONValue.from_string(_comfy_api_output_port(graph, source_id, source_slot)))
                 to_ref.set("node", JSONValue.from_int(node_id))
-                to_ref.set("port", JSONValue.from_string(input_name))
+                var to_port = input_name.copy()
+                if typ == "Reroute" and to_port == "":
+                    to_port = String("input")
+                to_ref.set("port", JSONValue.from_string(to_port))
                 edge.set("from", from_ref.copy())
                 edge.set("to", to_ref.copy())
                 edges.append(edge.copy())
@@ -1204,6 +1235,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "TextEncodeQwenImageEditPlus"
             or type_id == "ConditioningZeroOut"
             or type_id == "ConditioningSetMask"
+            or type_id == "Reroute"
             or type_id == "LoadImage"
             or type_id == "ImageToMask"
             or type_id == "MaskToImage"
@@ -1451,6 +1483,60 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
                     cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(text)
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "Reroute":
+                var input_link = _workflow_find_reroute_input_link(edges, node_id)
+                if not input_link.found:
+                    raise Error("[501] workflow graph Reroute missing input")
+                var value_idx = _workflow_value_index(value_nodes, value_ports, input_link.node_id, input_link.port)
+                if value_idx >= 0:
+                    var actual = value_types[value_idx].copy()
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("REROUTE"), actual)
+                    if actual == "MODEL":
+                        model_nodes.append(node_id); model_ports.append(String("REROUTE"))
+                        model_names.append(_workflow_model_name(model_nodes, model_ports, model_names, input_link))
+                    elif actual == "CONDITIONING" or actual == "COND_LATENT":
+                        cond_nodes.append(node_id); cond_ports.append(String("REROUTE"))
+                        cond_texts.append(_workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, input_link))
+                    if actual == "IMAGE":
+                        image_nodes.append(node_id); image_ports.append(String("REROUTE"))
+                        image_paths.append(_workflow_image_path(image_nodes, image_ports, image_paths, input_link))
+                        image_mask_sources.append(_workflow_source_meta(image_nodes, image_ports, image_mask_sources, input_link))
+                    elif actual == "MASK":
+                        mask_nodes.append(node_id); mask_ports.append(String("REROUTE"))
+                        mask_paths.append(_workflow_image_path(mask_nodes, mask_ports, mask_paths, input_link))
+                        mask_sources.append(_workflow_source_meta(mask_nodes, mask_ports, mask_sources, input_link))
+                    if actual == "LATENT" or actual == "COND_LATENT":
+                        var latent_idx = _workflow_latent_index(latent_nodes, latent_ports, input_link)
+                        latent_nodes.append(node_id); latent_ports.append(String("REROUTE"))
+                        if latent_idx >= 0:
+                            latent_widths.append(latent_widths[latent_idx])
+                            latent_heights.append(latent_heights[latent_idx])
+                            latent_images.append(latent_images[latent_idx])
+                            latent_init_images.append(latent_init_images[latent_idx])
+                            latent_mask_images.append(latent_mask_images[latent_idx])
+                        else:
+                            latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
+                            latent_init_images.append(String(""))
+                            latent_mask_images.append(String(""))
+                    elif actual == "NOISE":
+                        for j in range(len(noise_nodes)):
+                            if noise_nodes[j] == input_link.node_id and noise_ports[j] == input_link.port:
+                                noise_nodes.append(node_id); noise_ports.append(String("REROUTE")); noise_seeds.append(noise_seeds[j])
+                                break
+                    elif actual == "SAMPLER":
+                        for j in range(len(sampler_nodes)):
+                            if sampler_nodes[j] == input_link.node_id and sampler_ports[j] == input_link.port:
+                                sampler_nodes.append(node_id); sampler_ports.append(String("REROUTE")); sampler_names.append(sampler_names[j])
+                                break
+                    elif actual == "SIGMAS":
+                        for j in range(len(sigmas_nodes)):
+                            if sigmas_nodes[j] == input_link.node_id and sigmas_ports[j] == input_link.port:
+                                sigmas_nodes.append(node_id); sigmas_ports.append(String("REROUTE"))
+                                sigmas_steps.append(sigmas_steps[j])
+                                sigmas_schedulers.append(sigmas_schedulers[j])
+                                sigmas_denoises.append(sigmas_denoises[j])
+                                break
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "LoadImage":
                 var image_path = _workflow_string(fields, String("image"))

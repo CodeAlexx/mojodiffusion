@@ -82,6 +82,7 @@ SUPPORTED_NODE_TYPES = [
     "TextEncodeQwenImageEditPlus",
     "ConditioningZeroOut",
     "ConditioningSetMask",
+    "Reroute",
     "LoadImage",
     "ImageToMask",
     "MaskToImage",
@@ -595,6 +596,57 @@ def check_supported_nodes() -> list[Check]:
             ],
             severity=P0,
             acceptance="Comfy ConditioningSetMask imports preserve conditioning-side regional mask metadata without collapsing it into latent mask_image.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
+            category="workflow",
+            label="Reroute graph pass-through lowering",
+            needles=[
+                "Reroute",
+                "_workflow_find_reroute_input_link",
+                "workflow graph Reroute missing input",
+                'String("REROUTE")',
+                "_workflow_model_name(model_nodes, model_ports, model_names, input_link)",
+                "_workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, input_link)",
+                "_workflow_image_path(image_nodes, image_ports, image_paths, input_link)",
+                "_workflow_latent_index(latent_nodes, latent_ports, input_link)",
+                "noise_seeds.append(noise_seeds[j])",
+                "sampler_names.append(sampler_names[j])",
+                "sigmas_denoises.append(sigmas_denoises[j])",
+            ],
+            severity=P0,
+            acceptance="Comfy Reroute imports behave as typed pass-through handles and preserve side-table metadata instead of becoming a synthetic tensor operation.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "_comfy_ui_output_port",
+            category="workflow",
+            label="Comfy UI blank-port Reroute import",
+            needles=[
+                'node_type == "Reroute"',
+                'return String("REROUTE")',
+            ],
+            severity=P0,
+            acceptance="Visual Comfy Reroute nodes with blank output names lower to a stable typed REROUTE port.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "_comfy_ui_input_port",
+            category="workflow",
+            label="Comfy UI blank-input Reroute import",
+            needles=[
+                'node_type == "Reroute" and port == ""',
+                'return String("input")',
+            ],
+            severity=P0,
+            acceptance="Visual Comfy Reroute nodes with blank input names lower to a stable input port.",
         )
     )
     checks.append(
@@ -2796,6 +2848,10 @@ def check_workflow_graph_product_report() -> Check:
     png = report.get("png")
     api_job = report.get("comfy_api_job")
     api_png = report.get("comfy_api_png")
+    reroute_api_job = report.get("reroute_api_job")
+    reroute_api_png = report.get("reroute_api_png")
+    reroute_canvas_job = report.get("reroute_canvas_job")
+    reroute_canvas_png = report.get("reroute_canvas_png")
     outpaint_threshold_api_job = report.get("outpaint_threshold_api_job")
     outpaint_threshold_api_png = report.get("outpaint_threshold_api_png")
     inpaint_conditioning_api_job = report.get("inpaint_conditioning_api_job")
@@ -2824,6 +2880,7 @@ def check_workflow_graph_product_report() -> Check:
     ideogram4_evidence = prefixed_evidence(report, "ideogram4_visual_export")
     unsupported_api = report.get("unsupported_comfy_api_node")
     lora_clip_unsupported = report.get("lora_clip_unsupported")
+    reroute_missing_input = report.get("reroute_missing_input")
     inpaint_conditioning_missing_mask = report.get("inpaint_conditioning_missing_mask")
     conditioning_set_mask_missing_mask = report.get("conditioning_set_mask_missing_mask")
     if (
@@ -2831,6 +2888,10 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(png, dict)
         or not isinstance(api_job, dict)
         or not isinstance(api_png, dict)
+        or not isinstance(reroute_api_job, dict)
+        or not isinstance(reroute_api_png, dict)
+        or not isinstance(reroute_canvas_job, dict)
+        or not isinstance(reroute_canvas_png, dict)
         or not isinstance(outpaint_threshold_api_job, dict)
         or not isinstance(outpaint_threshold_api_png, dict)
         or not isinstance(inpaint_conditioning_api_job, dict)
@@ -2853,6 +2914,7 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(basic_scheduler_png, dict)
         or not isinstance(unsupported_api, dict)
         or not isinstance(lora_clip_unsupported, dict)
+        or not isinstance(reroute_missing_input, dict)
         or not isinstance(inpaint_conditioning_missing_mask, dict)
         or not isinstance(conditioning_set_mask_missing_mask, dict)
     ):
@@ -2861,7 +2923,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, outpaint ThresholdMask API import, InpaintModelConditioning API import, ConditioningSetMask API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, Reroute API/canvas import, outpaint ThresholdMask API import, InpaintModelConditioning API import, ConditioningSetMask API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2892,6 +2954,16 @@ def check_workflow_graph_product_report() -> Check:
             "workflow",
             "typed workflow graph product smoke",
             "ConditioningSetMask missing-mask unsupported report did not return HTTP 501",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    if reroute_missing_input.get("status") != 501:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "Reroute missing-input unsupported report did not return HTTP 501",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -3015,6 +3087,51 @@ def check_workflow_graph_product_report() -> Check:
             "workflow",
             "typed workflow graph product smoke",
             "Comfy API prompt graph metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    reroute_api_genparams = reroute_api_png.get("genparams")
+    if (
+        not isinstance(reroute_api_genparams, dict)
+        or reroute_api_genparams.get("workflow_source") != "comfy_api_prompt_graph"
+        or reroute_api_genparams.get("workflow_save_prefix") != "reroute-api"
+        or reroute_api_genparams.get("prompt") != "reroute api positive prompt"
+        or reroute_api_genparams.get("negative") != "reroute api negative prompt"
+        or reroute_api_genparams.get("model") != "stub"
+        or reroute_api_genparams.get("width") != 832
+        or reroute_api_genparams.get("height") != 512
+        or reroute_api_genparams.get("seed") != 88901
+        or reroute_api_genparams.get("workflow_node_count") != 11
+        or reroute_api_genparams.get("workflow_edge_count") != 13
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "Reroute Comfy API import metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    reroute_canvas_genparams = reroute_canvas_png.get("genparams")
+    if (
+        not isinstance(reroute_canvas_genparams, dict)
+        or reroute_canvas_genparams.get("workflow_source") != "comfy_ui_canvas_graph"
+        or reroute_canvas_genparams.get("workflow_save_prefix") != "canvas-reroute"
+        or reroute_canvas_genparams.get("prompt") != "reroute canvas positive prompt"
+        or reroute_canvas_genparams.get("negative") != "reroute canvas negative prompt"
+        or reroute_canvas_genparams.get("model") != "stub"
+        or reroute_canvas_genparams.get("init_image") != "/tmp/serenity_canvas_reroute.png"
+        or reroute_canvas_genparams.get("seed") != 99012
+        or reroute_canvas_genparams.get("workflow_node_count") != 9
+        or reroute_canvas_genparams.get("workflow_edge_count") != 12
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "Reroute Comfy UI canvas import metadata missing from product report",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -3205,6 +3322,8 @@ def check_workflow_graph_product_report() -> Check:
         f"outpaint preprocess graph completed {outpaint_preprocess_job.get('id')}; "
         f"BasicScheduler graph completed {basic_scheduler_job.get('id')}; "
         f"Comfy API prompt completed {api_job.get('id')}; "
+        f"Reroute API completed {reroute_api_job.get('id')}; "
+        f"Reroute canvas completed {reroute_canvas_job.get('id')}; "
         f"outpaint ThresholdMask API completed {outpaint_threshold_api_job.get('id')}; "
         f"InpaintModelConditioning API completed {inpaint_conditioning_api_job.get('id')}; "
         f"InpaintModelConditioning noise_mask=false API completed {inpaint_conditioning_no_noise_mask_api_job.get('id')}; "

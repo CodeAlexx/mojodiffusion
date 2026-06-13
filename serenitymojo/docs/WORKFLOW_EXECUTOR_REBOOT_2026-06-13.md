@@ -60,6 +60,26 @@ cd /home/alex/mojodiffusion
 pixi run build-daemon
 ```
 
+2026-06-13 Reroute graph utility slice:
+
+- Oracle shape: downloaded ZImage Comfy UI exports use active `Reroute` nodes
+  with blank input/output names, input type `*`, and resolved output types such
+  as `MODEL` or `IMAGE`.
+- Mojo importer support now canonicalizes those blank visual ports to stable
+  `input` / `REROUTE` ports for Comfy UI canvas imports, and maps Comfy API
+  `Reroute` output slot 0 to `REROUTE`.
+- Mojo executor support is bounded pass-through only. It copies the upstream
+  typed handle plus side metadata for MODEL, CONDITIONING, IMAGE, MASK, LATENT,
+  NOISE, SAMPLER, and SIGMAS. It does not execute tensor/model transforms.
+- Fail-loud behavior: active Reroute without an input returns HTTP 501; multiple
+  accepted Reroute input sources also fail.
+- Product gates must prove both `reroute_api_*` and `reroute_canvas_*` jobs in
+  `output/checks/workflow_graph_product_readiness.json`.
+- Next oracle-backed graph utility targets are `GetNode`/`SetNode` variable
+  bus resolution, scalar/text constants, UI-only drops, then static
+  `LazySwitchKJ`. Do not treat `ImageResizeKJv2`, APG/CFG/model patchers,
+  control nodes, or video nodes as no-ops without real semantics.
+
 2026-06-13 Z-Image scheduler update: current Comfy `sgm_uniform` semantics are
 now ported for the bounded Z-Image Euler/flow-match Euler, DPM++ 2M, `uni_pc`,
 and `uni_pc_bh2` paths.

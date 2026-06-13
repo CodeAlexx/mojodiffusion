@@ -386,6 +386,148 @@ def comfy_api_prompt_request() -> dict[str, Any]:
     }
 
 
+def reroute_comfy_api_prompt_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "prompt": {
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "stub"}},
+                "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "reroute api negative prompt"}},
+                "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "reroute api positive prompt"}},
+                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 832, "height": 512, "batch_size": 1}},
+                "20": {"class_type": "Reroute", "inputs": {"": ["1", 0]}},
+                "21": {"class_type": "Reroute", "inputs": {"": ["3", 0]}},
+                "22": {"class_type": "Reroute", "inputs": {"input": ["2", 0]}},
+                "23": {"class_type": "Reroute", "inputs": {"": ["4", 0]}},
+                "5": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "model": ["20", 0],
+                        "positive": ["21", 0],
+                        "negative": ["22", 0],
+                        "latent_image": ["23", 0],
+                        "steps": 5,
+                        "seed": 88901,
+                        "cfg": 3.75,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 0.875,
+                    },
+                },
+                "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+                "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "reroute-api"}},
+            }
+        }
+    }
+
+
+def reroute_missing_input_comfy_api_prompt_request() -> dict[str, Any]:
+    return {"workflow": {"prompt": {"1": {"class_type": "Reroute", "inputs": {}}}}}
+
+
+def reroute_comfy_ui_canvas_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "CheckpointLoaderSimple",
+                    "widgets_values": ["stub"],
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "MODEL", "type": "MODEL", "links": [6]},
+                        {"name": "CLIP", "type": "CLIP", "links": [1, 2]},
+                        {"name": "VAE", "type": "VAE", "links": [5, 11]},
+                    ],
+                },
+                {
+                    "id": 2,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["reroute canvas negative prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 1}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [8]}],
+                },
+                {
+                    "id": 3,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["reroute canvas positive prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 2}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [7]}],
+                },
+                {
+                    "id": 4,
+                    "type": "LoadImage",
+                    "widgets_values": ["/tmp/serenity_canvas_reroute.png"],
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "IMAGE", "type": "IMAGE", "links": [3]},
+                        {"name": "MASK", "type": "MASK", "links": []},
+                    ],
+                },
+                {
+                    "id": 5,
+                    "type": "Reroute",
+                    "inputs": [{"name": "", "type": "*", "link": 3}],
+                    "outputs": [{"name": "", "type": "IMAGE", "links": [4]}],
+                    "properties": {"showOutputText": False, "horizontal": False},
+                },
+                {
+                    "id": 6,
+                    "type": "VAEEncode",
+                    "widgets_values": [],
+                    "inputs": [
+                        {"name": "pixels", "type": "IMAGE", "link": 4},
+                        {"name": "vae", "type": "VAE", "link": 5},
+                    ],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [9]}],
+                },
+                {
+                    "id": 7,
+                    "type": "KSampler",
+                    "widgets_values": [99012, "fixed", 5, 2.5, "euler", "simple", 0.5],
+                    "inputs": [
+                        {"name": "model", "type": "MODEL", "link": 6},
+                        {"name": "positive", "type": "CONDITIONING", "link": 7},
+                        {"name": "negative", "type": "CONDITIONING", "link": 8},
+                        {"name": "latent_image", "type": "LATENT", "link": 9},
+                    ],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [10]}],
+                },
+                {
+                    "id": 8,
+                    "type": "VAEDecode",
+                    "widgets_values": [],
+                    "inputs": [
+                        {"name": "samples", "type": "LATENT", "link": 10},
+                        {"name": "vae", "type": "VAE", "link": 11},
+                    ],
+                    "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [12]}],
+                },
+                {
+                    "id": 9,
+                    "type": "SaveImage",
+                    "widgets_values": ["canvas-reroute"],
+                    "inputs": [{"name": "images", "type": "IMAGE", "link": 12}],
+                    "outputs": [],
+                },
+            ],
+            "links": [
+                [1, 1, 1, 2, 0, "CLIP"],
+                [2, 1, 1, 3, 0, "CLIP"],
+                [3, 4, 0, 5, 0, "IMAGE"],
+                [4, 5, 0, 6, 0, "IMAGE"],
+                [5, 1, 2, 6, 1, "VAE"],
+                [6, 1, 0, 7, 0, "MODEL"],
+                [7, 3, 0, 7, 1, "CONDITIONING"],
+                [8, 2, 0, 7, 2, "CONDITIONING"],
+                [9, 6, 0, 7, 3, "LATENT"],
+                [10, 7, 0, 8, 0, "LATENT"],
+                [11, 1, 2, 8, 1, "VAE"],
+                [12, 8, 0, 9, 0, "IMAGE"],
+            ],
+        }
+    }
+
+
 def outpaint_threshold_comfy_api_prompt_request() -> dict[str, Any]:
     return {
         "workflow": {
@@ -986,6 +1128,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 blockers,
             )
 
+            missing_reroute_status, missing_reroute_data, missing_reroute_text = http_json(
+                "POST", f"{base_url}/v1/generate", reroute_missing_input_comfy_api_prompt_request()
+            )
+            report["reroute_missing_input"] = {"status": missing_reroute_status, "body": missing_reroute_data}
+            require(missing_reroute_status == 501, "Reroute missing-input graph did not return HTTP 501", blockers)
+            require(
+                "Reroute missing input" in missing_reroute_text,
+                "Reroute missing-input response did not name the missing input",
+                blockers,
+            )
+
             request = linked_workflow_request()
             gen_status, gen_data, gen_text = http_json("POST", f"{base_url}/v1/generate", request)
             report["generate"] = {"status": gen_status, "body": gen_data}
@@ -1271,6 +1424,86 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(api_genparams.get("workflow_save_prefix") == "comfy-api", "Comfy API SaveImage filename_prefix missing", blockers)
                     require(api_genparams.get("workflow_node_count") == 7, "Comfy API workflow node count missing", blockers)
                     require(api_genparams.get("workflow_edge_count") == 9, "Comfy API workflow edge count missing", blockers)
+
+            reroute_api_status, reroute_api_data, reroute_api_text = http_json(
+                "POST", f"{base_url}/v1/generate", reroute_comfy_api_prompt_request()
+            )
+            report["reroute_api_generate"] = {"status": reroute_api_status, "body": reroute_api_data}
+            if reroute_api_status != 200 or not isinstance(reroute_api_data, dict) or not reroute_api_data.get("job_id"):
+                blockers.append(f"Reroute Comfy API prompt generate failed HTTP {reroute_api_status}: {reroute_api_text}")
+            else:
+                reroute_api_job_id = str(reroute_api_data["job_id"])
+                reroute_api_job = poll_job(base_url, reroute_api_job_id, args.timeout)
+                report["reroute_api_job"] = reroute_api_job
+                require(reroute_api_job.get("state") == "done", f"Reroute Comfy API prompt job state was {reroute_api_job.get('state')}", blockers)
+                reroute_api_png_path = Path(str(reroute_api_job.get("output_path") or ""))
+                require(reroute_api_png_path.is_file(), f"Reroute Comfy API prompt PNG missing: {reroute_api_png_path}", blockers)
+                if reroute_api_png_path.is_file():
+                    reroute_api_text_chunks = read_png_text(reroute_api_png_path)
+                    reroute_api_genparams = json.loads(reroute_api_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["reroute_api_png"] = {
+                        "path": str(reroute_api_png_path),
+                        "idat_sha256": reroute_api_text_chunks.get("_idat_sha256"),
+                        "genparams": reroute_api_genparams,
+                    }
+                    require(reroute_api_genparams.get("workflow_source") == "comfy_api_prompt_graph", "Reroute API workflow source missing", blockers)
+                    require(reroute_api_genparams.get("workflow_save_prefix") == "reroute-api", "Reroute API SaveImage filename_prefix missing", blockers)
+                    require(reroute_api_genparams.get("prompt") == "reroute api positive prompt", "Reroute API positive prompt was not consumed", blockers)
+                    require(reroute_api_genparams.get("negative") == "reroute api negative prompt", "Reroute API negative prompt was not consumed", blockers)
+                    require(reroute_api_genparams.get("model") == "stub", "Reroute API model did not flow through Reroute", blockers)
+                    require(
+                        reroute_api_genparams.get("width") == 832 and reroute_api_genparams.get("height") == 512,
+                        "Reroute API latent dimensions did not flow through Reroute",
+                        blockers,
+                    )
+                    require(reroute_api_genparams.get("steps") == 5, "Reroute API KSampler steps missing", blockers)
+                    require(reroute_api_genparams.get("seed") == 88901, "Reroute API KSampler seed missing", blockers)
+                    require(reroute_api_genparams.get("cfg") == 3.75, "Reroute API KSampler cfg missing", blockers)
+                    require(reroute_api_genparams.get("sampler") == "euler", "Reroute API sampler missing", blockers)
+                    require(reroute_api_genparams.get("scheduler") == "simple", "Reroute API scheduler missing", blockers)
+                    require(reroute_api_genparams.get("creativity") == 0.875, "Reroute API denoise missing", blockers)
+                    require(reroute_api_genparams.get("workflow_node_count") == 11, "Reroute API workflow node count missing", blockers)
+                    require(reroute_api_genparams.get("workflow_edge_count") == 13, "Reroute API workflow edge count missing", blockers)
+
+            reroute_canvas_status, reroute_canvas_data, reroute_canvas_text = http_json(
+                "POST", f"{base_url}/v1/generate", reroute_comfy_ui_canvas_request()
+            )
+            report["reroute_canvas_generate"] = {"status": reroute_canvas_status, "body": reroute_canvas_data}
+            if reroute_canvas_status != 200 or not isinstance(reroute_canvas_data, dict) or not reroute_canvas_data.get("job_id"):
+                blockers.append(f"Reroute Comfy UI canvas generate failed HTTP {reroute_canvas_status}: {reroute_canvas_text}")
+            else:
+                reroute_canvas_job_id = str(reroute_canvas_data["job_id"])
+                reroute_canvas_job = poll_job(base_url, reroute_canvas_job_id, args.timeout)
+                report["reroute_canvas_job"] = reroute_canvas_job
+                require(reroute_canvas_job.get("state") == "done", f"Reroute Comfy UI canvas job state was {reroute_canvas_job.get('state')}", blockers)
+                reroute_canvas_png_path = Path(str(reroute_canvas_job.get("output_path") or ""))
+                require(reroute_canvas_png_path.is_file(), f"Reroute Comfy UI canvas PNG missing: {reroute_canvas_png_path}", blockers)
+                if reroute_canvas_png_path.is_file():
+                    reroute_canvas_text_chunks = read_png_text(reroute_canvas_png_path)
+                    reroute_canvas_genparams = json.loads(reroute_canvas_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["reroute_canvas_png"] = {
+                        "path": str(reroute_canvas_png_path),
+                        "idat_sha256": reroute_canvas_text_chunks.get("_idat_sha256"),
+                        "genparams": reroute_canvas_genparams,
+                    }
+                    require(reroute_canvas_genparams.get("workflow_source") == "comfy_ui_canvas_graph", "Reroute canvas workflow source missing", blockers)
+                    require(reroute_canvas_genparams.get("workflow_save_prefix") == "canvas-reroute", "Reroute canvas SaveImage filename_prefix missing", blockers)
+                    require(reroute_canvas_genparams.get("prompt") == "reroute canvas positive prompt", "Reroute canvas positive prompt was not consumed", blockers)
+                    require(reroute_canvas_genparams.get("negative") == "reroute canvas negative prompt", "Reroute canvas negative prompt was not consumed", blockers)
+                    require(reroute_canvas_genparams.get("model") == "stub", "Reroute canvas model missing", blockers)
+                    require(
+                        reroute_canvas_genparams.get("init_image") == "/tmp/serenity_canvas_reroute.png",
+                        "Reroute canvas image path did not flow through blank-port Reroute",
+                        blockers,
+                    )
+                    require(reroute_canvas_genparams.get("steps") == 5, "Reroute canvas KSampler steps missing", blockers)
+                    require(reroute_canvas_genparams.get("seed") == 99012, "Reroute canvas KSampler seed missing", blockers)
+                    require(reroute_canvas_genparams.get("cfg") == 2.5, "Reroute canvas KSampler cfg missing", blockers)
+                    require(reroute_canvas_genparams.get("sampler") == "euler", "Reroute canvas sampler missing", blockers)
+                    require(reroute_canvas_genparams.get("scheduler") == "simple", "Reroute canvas scheduler missing", blockers)
+                    require(reroute_canvas_genparams.get("creativity") == 0.5, "Reroute canvas denoise missing", blockers)
+                    require(reroute_canvas_genparams.get("workflow_node_count") == 9, "Reroute canvas workflow node count missing", blockers)
+                    require(reroute_canvas_genparams.get("workflow_edge_count") == 12, "Reroute canvas workflow edge count missing", blockers)
 
             outpaint_api_status, outpaint_api_data, outpaint_api_text = http_json(
                 "POST", f"{base_url}/v1/generate", outpaint_threshold_comfy_api_prompt_request()
@@ -1755,6 +1988,11 @@ def main() -> int:
     print(f"  basic_scheduler_png: {report['basic_scheduler_png']['path']}")
     print(f"  comfy_api_job_id: {report['comfy_api_job']['id']}")
     print(f"  comfy_api_png: {report['comfy_api_png']['path']}")
+    print("  reroute_missing_input: HTTP 501")
+    print(f"  reroute_api_job_id: {report['reroute_api_job']['id']}")
+    print(f"  reroute_api_png: {report['reroute_api_png']['path']}")
+    print(f"  reroute_canvas_job_id: {report['reroute_canvas_job']['id']}")
+    print(f"  reroute_canvas_png: {report['reroute_canvas_png']['path']}")
     print(f"  outpaint_threshold_api_job_id: {report['outpaint_threshold_api_job']['id']}")
     print(f"  outpaint_threshold_api_png: {report['outpaint_threshold_api_png']['path']}")
     print(f"  inpaint_conditioning_api_job_id: {report['inpaint_conditioning_api_job']['id']}")

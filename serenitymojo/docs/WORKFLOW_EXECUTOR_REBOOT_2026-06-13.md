@@ -75,8 +75,8 @@ pixi run build-daemon
   accepted Reroute input sources also fail.
 - Product gates must prove both `reroute_api_*` and `reroute_canvas_*` jobs in
   `output/checks/workflow_graph_product_readiness.json`.
-- Next oracle-backed graph utility targets after the bounded Get/Set slice are
-  scalar/text constants, UI-only drops, then static `LazySwitchKJ`. Do not treat
+- Next oracle-backed graph utility targets after the bounded scalar constant
+  slice are UI-only drops, then static `LazySwitchKJ`. Do not treat
   `ImageResizeKJv2`, APG/CFG/model patchers, control nodes, or video nodes as
   no-ops without real semantics.
 
@@ -89,23 +89,66 @@ pixi run build-daemon
   Canvas import canonicalizes `SetNode` input to `value`, `SetNode` output to
   `SET`, and `GetNode` output to `GET`; executor lowering stores each named
   `SetNode` handle and lets matching `GetNode` nodes read that typed handle.
-- The bus may carry only existing typed graph values plus side metadata for
-  MODEL, CONDITIONING, IMAGE, MASK, LATENT, NOISE, SAMPLER, and SIGMAS. It must
-  not become arbitrary KJNodes execution, scalar/text constant synthesis, or
-  generic Comfy variable runtime.
+- The bus may carry existing typed graph values plus side metadata for MODEL,
+  CONDITIONING, IMAGE, MASK, LATENT, NOISE, SAMPLER, and SIGMAS. It may also
+  carry bounded primitive scalar values after the scalar constant slice: INT,
+  FLOAT, STRING, and BOOLEAN. It must not become arbitrary KJNodes execution,
+  scalar math, string runtime, or generic Comfy variable runtime.
 - Fail-loud behavior is required for empty/missing names, duplicate `SetNode`
   names, `GetNode` names with no matching `SetNode`, `SetNode` with no input,
   and multiple accepted `SetNode` input sources.
 - Product/static proof:
   `output/checks/workflow_graph_product_readiness.json` records
-  `getset_canvas_job` `job-0583` with `workflow_source:"comfy_ui_canvas_graph"`,
+  `getset_canvas_job` `job-0660` with `workflow_source:"comfy_ui_canvas_graph"`,
   `workflow_save_prefix:"canvas-getset"`, prompt/negative/model/init-image
   metadata flowing through named Get/Set handles, and HTTP 501 evidence for
   duplicate SetNode names, missing GetNode setter, missing SetNode input,
   unsupported bus type, and GetNode output type mismatch.
   `output/checks/workflow_node_surface_readiness.json` records
-  `checks=120`, `passed=119`, `p0=0`, `p1=0`, `p2=0`, constrained adapter
+  `checks=121`, `passed=120`, `p0=0`, `p1=0`, `p2=0`, constrained adapter
   `READY`, and arbitrary Comfy/Swarm graph parity still `BLOCKED`.
+
+2026-06-13 primitive scalar constant/link slice:
+
+- Oracle shape/source of truth: Comfy core primitive nodes return their input
+  widget value directly (`PrimitiveInt`, `PrimitiveFloat`, `PrimitiveString`,
+  `PrimitiveStringMultiline`, `PrimitiveBoolean`). KJNodes constants do the same
+  for `INTConstant`, `FloatConstant`, `StringConstant`,
+  `StringConstantMultiline`, and `BOOLConstant`; `FloatConstant` rounds to six
+  decimals. Local downloaded workflows also use `PrimitiveNode` as a wildcard
+  scalar source when the visual output declares `INT`, `FLOAT`, or `STRING`.
+- Mojo importer support now normalizes scalar visual/API outputs to stable
+  scalar ports (`INT`, `FLOAT`, `STRING`, `BOOLEAN`) instead of UI labels such
+  as `value` or `int`. Canvas widget extraction records primitive scalar fields
+  and visual `output_type` where needed for `PrimitiveNode`.
+- Mojo executor support is bounded scalar-value plumbing only. It stores scalar
+  side metadata for INT/FLOAT/STRING/BOOLEAN, copies that metadata through
+  `Reroute` and `SetNode`/`GetNode`, and consumes linked scalar values for
+  already-supported fields: `CLIPTextEncode.text`, Qwen edit text,
+  `EmptyLatent*` width/height/batch_size, `KSampler` seed/steps/cfg/
+  sampler_name/scheduler/denoise, `CFGGuider.cfg`, `Flux2Scheduler.steps`,
+  `BasicScheduler` scheduler/steps/denoise, `RandomNoise.noise_seed`,
+  `SaveImage.filename_prefix`, and validation-only `ImageScale.width/height`.
+- Fail-loud behavior: scalar consumers reject type mismatches before enqueue.
+  KJ `StringConstantMultiline(strip_newlines=True)` fails if the strip/newline
+  transform would alter the string; that belongs to the later string-runtime
+  slice.
+  `GetImageSize` still only emits typed INT handles; if a graph consumes those
+  as numeric scalar values before image dimensions are known, it fails instead
+  of inventing dimensions.
+- Product/static proof:
+  `workflow_graph_product_readiness.json` records linked scalar BasicScheduler
+  `job-0656`, scalar canvas `job-0661`, scalar mismatch HTTP 501, and
+  `blockers:[]`. `scalar_canvas_png` proves linked prompt text, dimensions,
+  Get/Set-carried steps, seed, cfg, sampler, scheduler, KJ `FloatConstant`
+  denoise rounding, and linked `SaveImage.filename_prefix`. Static readiness
+  records `checks=121`, `passed=120`, constrained adapter `READY`, arbitrary
+  Comfy/Swarm graph parity `BLOCKED`.
+- Non-claims: no scalar math (`SimpleCalculatorKJ`, `MathExpression`,
+  converters), no string runtime (`StringConcatenate`, regex/string replace),
+  no `ImageResizeKJv2`, no arbitrary rgthree/PrimitiveNode any-type behavior,
+  no video/audio/custom-model patcher execution, and no hidden tensor/image
+  transform semantics.
 
 2026-06-13 Z-Image scheduler update: current Comfy `sgm_uniform` semantics are
 now ported for the bounded Z-Image Euler/flow-match Euler, DPM++ 2M, `uni_pc`,
@@ -1105,19 +1148,32 @@ python3 scripts/check_workflow_node_surface.py \
 
 Latest product-smoke jobs against stub mode:
 
-- `job-0293`: native linked graph
-- `job-0294`: img2img metadata graph
-- `job-0295`: model-only LoRA metadata graph
-- `job-0296`: mask metadata graph
-- `job-0297`: Comfy API prompt graph
-- `job-0298`: SerenityFlow `zimage_t2i`
-- `job-0299`: SerenityFlow `qwen_image_t2i`
-- `job-0300`: SerenityFlow `klein9b_t2i`
-- `job-0301`: SerenityFlow `klein4b_t2i`
-- `job-0302`: SerenityFlow `flux2_dev_t2i`
-- `job-0303`: SerenityFlow `klein9b_edit`
-- `job-0304`: SerenityFlow `klein4b_edit`
-- `job-0305`: Ideogram4 visual export
+- `job-0650`: native linked graph
+- `job-0651`: img2img metadata graph
+- `job-0652`: model-only LoRA metadata graph
+- `job-0653`: Z-Image LoRA alias metadata graph
+- `job-0654`: mask metadata graph
+- `job-0655`: outpaint preprocessing graph
+- `job-0656`: linked scalar BasicScheduler/RandomNoise graph
+- `job-0657`: Comfy API prompt graph
+- `job-0658`: Reroute Comfy API prompt graph
+- `job-0659`: Reroute Comfy UI canvas graph
+- `job-0660`: Get/Set Comfy UI canvas graph
+- `job-0661`: primitive scalar Comfy UI canvas graph
+- `job-0662`: outpaint ThresholdMask Comfy API graph
+- `job-0663`: InpaintModelConditioning API graph, `noise_mask=true`
+- `job-0664`: InpaintModelConditioning API graph, `noise_mask=false`
+- `job-0665`: ConditioningSetMask API graph
+- `job-0666`: SerenityFlow `zimage_t2i`
+- `job-0667`: SerenityFlow `qwen_image_t2i`
+- `job-0668`: SerenityFlow `klein9b_t2i`
+- `job-0669`: SerenityFlow `klein4b_t2i`
+- `job-0670`: SerenityFlow `flux2_dev_t2i`
+- `job-0671`: SerenityFlow `klein9b_edit`
+- `job-0672`: SerenityFlow `klein4b_edit`
+- `job-0673`: SerenityFlow `qwen_edit`
+- `job-0674`: SerenityFlow `qwen_edit_lora`
+- `job-0675`: Ideogram4 visual export
 
 Previous isolated-mode no-heavy-model admission smoke wrote
 `output/checks/klein_bridge_admission_smoke.json`, but the ReferenceLatent row
@@ -1198,3 +1254,7 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
     `workflow_graph_product_readiness.json` and
     `workflow_node_surface_readiness.json`; keep the slice described as bounded
     import/executor lowering rather than accepted arbitrary KJNodes parity.
+14. Primitive scalar constants and linked scalar consumer plumbing are now
+    product/static proven. Next graph-utility work should move to UI-only drops
+    or static `LazySwitchKJ`; do not redo scalar constants unless a new oracle
+    fixture shows missing node shapes.

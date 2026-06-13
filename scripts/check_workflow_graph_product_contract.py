@@ -777,6 +777,213 @@ def getset_comfy_ui_canvas_request() -> dict[str, Any]:
     }
 
 
+def scalar_comfy_ui_canvas_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "CheckpointLoaderSimple",
+                    "widgets_values": ["stub"],
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "MODEL", "type": "MODEL", "links": [7]},
+                        {"name": "CLIP", "type": "CLIP", "links": [1, 2]},
+                        {"name": "VAE", "type": "VAE", "links": [19]},
+                    ],
+                },
+                {
+                    "id": 2,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["scalar canvas negative prompt"],
+                    "inputs": [{"name": "clip", "type": "CLIP", "link": 1}],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [9]}],
+                },
+                {
+                    "id": 3,
+                    "type": "CLIPTextEncode",
+                    "widgets_values": ["wrong positive prompt"],
+                    "inputs": [
+                        {"name": "clip", "type": "CLIP", "link": 2},
+                        {"name": "text", "type": "STRING", "link": 3},
+                    ],
+                    "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [8]}],
+                },
+                {
+                    "id": 4,
+                    "type": "EmptyLatentImage",
+                    "widgets_values": [512, 512, 4],
+                    "inputs": [
+                        {"name": "width", "type": "INT", "link": 4},
+                        {"name": "height", "type": "INT", "link": 5},
+                        {"name": "batch_size", "type": "INT", "link": 6},
+                    ],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [10]}],
+                },
+                {
+                    "id": 5,
+                    "type": "KSampler",
+                    "widgets_values": [11111, "fixed", 99, 9.9, "wrong", "wrong", 0.99],
+                    "inputs": [
+                        {"name": "model", "type": "MODEL", "link": 7},
+                        {"name": "positive", "type": "CONDITIONING", "link": 8},
+                        {"name": "negative", "type": "CONDITIONING", "link": 9},
+                        {"name": "latent_image", "type": "LATENT", "link": 10},
+                        {"name": "seed", "type": "INT", "link": 11},
+                        {"name": "steps", "type": "INT", "link": 13},
+                        {"name": "cfg", "type": "FLOAT", "link": 14},
+                        {"name": "sampler_name", "type": "STRING", "link": 15},
+                        {"name": "scheduler", "type": "STRING", "link": 16},
+                        {"name": "denoise", "type": "FLOAT", "link": 17},
+                    ],
+                    "outputs": [{"name": "LATENT", "type": "LATENT", "links": [18]}],
+                },
+                {
+                    "id": 6,
+                    "type": "VAEDecode",
+                    "widgets_values": [],
+                    "inputs": [
+                        {"name": "samples", "type": "LATENT", "link": 18},
+                        {"name": "vae", "type": "VAE", "link": 19},
+                    ],
+                    "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [20]}],
+                },
+                {
+                    "id": 7,
+                    "type": "SaveImage",
+                    "widgets_values": ["wrong-prefix"],
+                    "inputs": [
+                        {"name": "images", "type": "IMAGE", "link": 20},
+                        {"name": "filename_prefix", "type": "STRING", "link": 21},
+                    ],
+                    "outputs": [],
+                },
+                {
+                    "id": 20,
+                    "type": "PrimitiveString",
+                    "widgets_values": ["scalar linked positive prompt"],
+                    "inputs": [],
+                    "outputs": [{"name": "STRING", "type": "STRING", "links": [3]}],
+                },
+                {
+                    "id": 21,
+                    "type": "PrimitiveInt",
+                    "widgets_values": [672, "fixed"],
+                    "inputs": [],
+                    "outputs": [{"name": "INT", "type": "INT", "links": [4]}],
+                },
+                {
+                    "id": 22,
+                    "type": "PrimitiveInt",
+                    "widgets_values": [544, "fixed"],
+                    "inputs": [],
+                    "outputs": [{"name": "INT", "type": "INT", "links": [5]}],
+                },
+                {
+                    "id": 23,
+                    "type": "PrimitiveInt",
+                    "widgets_values": [1, "fixed"],
+                    "inputs": [],
+                    "outputs": [{"name": "INT", "type": "INT", "links": [6]}],
+                },
+                {
+                    "id": 24,
+                    "type": "INTConstant",
+                    "widgets_values": [6],
+                    "inputs": [],
+                    "outputs": [{"name": "value", "type": "INT", "links": [12]}],
+                },
+                {
+                    "id": 25,
+                    "type": "SetNode",
+                    "widgets_values": ["SCALAR_STEPS"],
+                    "inputs": [{"name": "INT", "type": "INT", "link": 12}],
+                    "outputs": [{"name": "*", "type": "*", "links": []}],
+                },
+                {
+                    "id": 26,
+                    "type": "GetNode",
+                    "widgets_values": ["SCALAR_STEPS"],
+                    "inputs": [],
+                    "outputs": [{"name": "INT", "type": "INT", "links": [13]}],
+                },
+                {
+                    "id": 27,
+                    "type": "PrimitiveInt",
+                    "widgets_values": [24680, "fixed"],
+                    "inputs": [],
+                    "outputs": [{"name": "INT", "type": "INT", "links": [11]}],
+                },
+                {
+                    "id": 28,
+                    "type": "PrimitiveFloat",
+                    "widgets_values": [2.125],
+                    "inputs": [],
+                    "outputs": [{"name": "FLOAT", "type": "FLOAT", "links": [14]}],
+                },
+                {
+                    "id": 29,
+                    "type": "FloatConstant",
+                    "widgets_values": [0.6250004],
+                    "inputs": [],
+                    "outputs": [{"name": "value", "type": "FLOAT", "links": [17]}],
+                },
+                {
+                    "id": 30,
+                    "type": "PrimitiveString",
+                    "widgets_values": ["euler"],
+                    "inputs": [],
+                    "outputs": [{"name": "STRING", "type": "STRING", "links": [15]}],
+                },
+                {
+                    "id": 31,
+                    "type": "PrimitiveString",
+                    "widgets_values": ["simple"],
+                    "inputs": [],
+                    "outputs": [{"name": "STRING", "type": "STRING", "links": [16]}],
+                },
+                {
+                    "id": 32,
+                    "type": "StringConstant",
+                    "widgets_values": ["scalar-canvas-prefix"],
+                    "inputs": [],
+                    "outputs": [{"name": "STRING", "type": "STRING", "links": [21]}],
+                },
+            ],
+            "links": [
+                [1, 1, 1, 2, 0, "CLIP"],
+                [2, 1, 1, 3, 0, "CLIP"],
+                [3, 20, 0, 3, 1, "STRING"],
+                [4, 21, 0, 4, 0, "INT"],
+                [5, 22, 0, 4, 1, "INT"],
+                [6, 23, 0, 4, 2, "INT"],
+                [7, 1, 0, 5, 0, "MODEL"],
+                [8, 3, 0, 5, 1, "CONDITIONING"],
+                [9, 2, 0, 5, 2, "CONDITIONING"],
+                [10, 4, 0, 5, 3, "LATENT"],
+                [11, 27, 0, 5, 4, "INT"],
+                [12, 24, 0, 25, 0, "INT"],
+                [13, 26, 0, 5, 5, "INT"],
+                [14, 28, 0, 5, 6, "FLOAT"],
+                [15, 30, 0, 5, 7, "STRING"],
+                [16, 31, 0, 5, 8, "STRING"],
+                [17, 29, 0, 5, 9, "FLOAT"],
+                [18, 5, 0, 6, 0, "LATENT"],
+                [19, 1, 2, 6, 1, "VAE"],
+                [20, 6, 0, 7, 0, "IMAGE"],
+                [21, 32, 0, 7, 1, "STRING"],
+            ],
+        }
+    }
+
+
+def scalar_type_mismatch_workflow_request() -> dict[str, Any]:
+    body = linked_workflow_request()
+    body["workflow"]["nodes"].append({"id": 20, "type_id": "comfy/PrimitiveString", "fields": {"value": "not steps"}})
+    body["workflow"]["edges"].append({"from": {"node": 20, "port": "STRING"}, "to": {"node": 5, "port": "steps"}})
+    return body
+
+
 def outpaint_threshold_comfy_api_prompt_request() -> dict[str, Any]:
     return {
         "workflow": {
@@ -1267,14 +1474,22 @@ def basic_scheduler_workflow_request() -> dict[str, Any]:
                 {"from": {"node": 8, "port": "LATENT"}, "to": {"node": 9, "port": "samples"}},
                 {"from": {"node": 1, "port": "VAE"}, "to": {"node": 9, "port": "vae"}},
                 {"from": {"node": 9, "port": "IMAGE"}, "to": {"node": 10, "port": "images"}},
+                {"from": {"node": 11, "port": "INT"}, "to": {"node": 6, "port": "noise_seed"}},
+                {"from": {"node": 12, "port": "STRING"}, "to": {"node": 5, "port": "scheduler"}},
+                {"from": {"node": 13, "port": "INT"}, "to": {"node": 5, "port": "steps"}},
+                {"from": {"node": 14, "port": "FLOAT"}, "to": {"node": 5, "port": "denoise"}},
             ],
             "nodes": [
                 {"id": 10, "type_id": "comfy/SaveImage", "fields": {"filename_prefix": "basic-scheduler-graph"}},
                 {"id": 9, "type_id": "comfy/VAEDecode", "fields": {}},
                 {"id": 8, "type_id": "comfy/SamplerCustomAdvanced", "fields": {}},
                 {"id": 7, "type_id": "comfy/KSamplerSelect", "fields": {"sampler_name": "euler"}},
-                {"id": 6, "type_id": "comfy/RandomNoise", "fields": {"noise_seed": 67890}},
-                {"id": 5, "type_id": "comfy/BasicScheduler", "fields": {"scheduler": "simple", "steps": 8, "denoise": 0.33}},
+                {"id": 14, "type_id": "comfy/PrimitiveFloat", "fields": {"value": 0.33}},
+                {"id": 13, "type_id": "comfy/PrimitiveInt", "fields": {"value": 8}},
+                {"id": 12, "type_id": "comfy/PrimitiveString", "fields": {"value": "simple"}},
+                {"id": 11, "type_id": "comfy/INTConstant", "fields": {"value": 67890}},
+                {"id": 6, "type_id": "comfy/RandomNoise", "fields": {"noise_seed": 11111}},
+                {"id": 5, "type_id": "comfy/BasicScheduler", "fields": {"scheduler": "wrong", "steps": 99, "denoise": 0.99}},
                 {"id": 4, "type_id": "comfy/BasicGuider", "fields": {}},
                 {"id": 3, "type_id": "comfy/EmptySD3LatentImage", "fields": {"width": 768, "height": 512, "batch_size": 1}},
                 {"id": 2, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "basic scheduler positive prompt"}},
@@ -1440,6 +1655,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             require(
                 "GetNode output type mismatch" in mismatch_getset_text,
                 "GetNode type-mismatch response did not name the mismatch",
+                blockers,
+            )
+
+            scalar_mismatch_status, scalar_mismatch_data, scalar_mismatch_text = http_json(
+                "POST", f"{base_url}/v1/generate", scalar_type_mismatch_workflow_request()
+            )
+            report["scalar_type_mismatch"] = {"status": scalar_mismatch_status, "body": scalar_mismatch_data}
+            require(scalar_mismatch_status == 501, "scalar type-mismatch graph did not return HTTP 501", blockers)
+            require(
+                "input steps expected INT" in scalar_mismatch_text,
+                "scalar type-mismatch response did not name the bad KSampler input",
                 blockers,
             )
 
@@ -1692,8 +1918,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(basic_genparams.get("creativity") == 0.33, "BasicScheduler denoise missing from creativity", blockers)
                     require(basic_genparams.get("workflow_source") == "typed_linked_graph", "BasicScheduler workflow source missing", blockers)
                     require(basic_genparams.get("workflow_save_prefix") == "basic-scheduler-graph", "BasicScheduler SaveImage filename_prefix missing", blockers)
-                    require(basic_genparams.get("workflow_node_count") == 10, "BasicScheduler workflow node count missing", blockers)
-                    require(basic_genparams.get("workflow_edge_count") == 12, "BasicScheduler workflow edge count missing", blockers)
+                    require(basic_genparams.get("workflow_node_count") == 14, "BasicScheduler workflow node count missing", blockers)
+                    require(basic_genparams.get("workflow_edge_count") == 16, "BasicScheduler workflow edge count missing", blockers)
 
             api_status, api_data, api_text = http_json("POST", f"{base_url}/v1/generate", comfy_api_prompt_request())
             report["comfy_api_generate"] = {"status": api_status, "body": api_data}
@@ -1848,6 +2074,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(getset_canvas_genparams.get("creativity") == 0.55, "Get/Set canvas denoise missing", blockers)
                     require(getset_canvas_genparams.get("workflow_node_count") == 16, "Get/Set canvas workflow node count missing", blockers)
                     require(getset_canvas_genparams.get("workflow_edge_count") == 15, "Get/Set canvas workflow edge count missing", blockers)
+
+            scalar_canvas_status, scalar_canvas_data, scalar_canvas_text = http_json(
+                "POST", f"{base_url}/v1/generate", scalar_comfy_ui_canvas_request()
+            )
+            report["scalar_canvas_generate"] = {"status": scalar_canvas_status, "body": scalar_canvas_data}
+            if scalar_canvas_status != 200 or not isinstance(scalar_canvas_data, dict) or not scalar_canvas_data.get("job_id"):
+                blockers.append(f"scalar Comfy UI canvas generate failed HTTP {scalar_canvas_status}: {scalar_canvas_text}")
+            else:
+                scalar_canvas_job_id = str(scalar_canvas_data["job_id"])
+                scalar_canvas_job = poll_job(base_url, scalar_canvas_job_id, args.timeout)
+                report["scalar_canvas_job"] = scalar_canvas_job
+                require(
+                    scalar_canvas_job.get("state") == "done",
+                    f"scalar Comfy UI canvas job state was {scalar_canvas_job.get('state')}",
+                    blockers,
+                )
+                scalar_canvas_png_path = Path(str(scalar_canvas_job.get("output_path") or ""))
+                require(scalar_canvas_png_path.is_file(), f"scalar Comfy UI canvas PNG missing: {scalar_canvas_png_path}", blockers)
+                if scalar_canvas_png_path.is_file():
+                    scalar_canvas_text_chunks = read_png_text(scalar_canvas_png_path)
+                    scalar_canvas_genparams = json.loads(scalar_canvas_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report["scalar_canvas_png"] = {
+                        "path": str(scalar_canvas_png_path),
+                        "idat_sha256": scalar_canvas_text_chunks.get("_idat_sha256"),
+                        "genparams": scalar_canvas_genparams,
+                    }
+                    require(scalar_canvas_genparams.get("workflow_source") == "comfy_ui_canvas_graph", "scalar canvas workflow source missing", blockers)
+                    require(scalar_canvas_genparams.get("workflow_save_prefix") == "scalar-canvas-prefix", "scalar canvas linked SaveImage filename_prefix missing", blockers)
+                    require(scalar_canvas_genparams.get("prompt") == "scalar linked positive prompt", "scalar canvas linked prompt text missing", blockers)
+                    require(scalar_canvas_genparams.get("negative") == "scalar canvas negative prompt", "scalar canvas negative prompt missing", blockers)
+                    require(scalar_canvas_genparams.get("model") == "stub", "scalar canvas model missing", blockers)
+                    require(scalar_canvas_genparams.get("width") == 672, "scalar canvas linked width missing", blockers)
+                    require(scalar_canvas_genparams.get("height") == 544, "scalar canvas linked height missing", blockers)
+                    require(scalar_canvas_genparams.get("images") == 1, "scalar canvas linked batch size missing", blockers)
+                    require(scalar_canvas_genparams.get("steps") == 6, "scalar canvas linked Get/Set steps missing", blockers)
+                    require(scalar_canvas_genparams.get("seed") == 24680, "scalar canvas linked KSampler seed missing", blockers)
+                    require(scalar_canvas_genparams.get("cfg") == 2.125, "scalar canvas linked KSampler cfg missing", blockers)
+                    require(scalar_canvas_genparams.get("sampler") == "euler", "scalar canvas linked KSampler sampler missing", blockers)
+                    require(scalar_canvas_genparams.get("scheduler") == "simple", "scalar canvas linked KSampler scheduler missing", blockers)
+                    require(scalar_canvas_genparams.get("creativity") == 0.625, "scalar canvas linked KJ FloatConstant denoise missing", blockers)
+                    require(scalar_canvas_genparams.get("workflow_node_count") == 20, "scalar canvas workflow node count missing", blockers)
+                    require(scalar_canvas_genparams.get("workflow_edge_count") == 21, "scalar canvas workflow edge count missing", blockers)
 
             outpaint_api_status, outpaint_api_data, outpaint_api_text = http_json(
                 "POST", f"{base_url}/v1/generate", outpaint_threshold_comfy_api_prompt_request()

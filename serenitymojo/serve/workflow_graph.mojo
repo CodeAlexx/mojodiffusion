@@ -43,6 +43,73 @@ def _workflow_type_id(node: JSONValue) raises -> String:
     return _workflow_canonical_type_id(_workflow_string(node, String("type_id")))
 
 
+def _workflow_is_int_scalar_node(type_id: String) -> Bool:
+    return type_id == "PrimitiveInt" or type_id == "INTConstant" or type_id == "easy int" or type_id == "SeedNode"
+
+
+def _workflow_is_float_scalar_node(type_id: String) -> Bool:
+    return type_id == "PrimitiveFloat" or type_id == "FloatConstant" or type_id == "easy float"
+
+
+def _workflow_is_string_scalar_node(type_id: String) -> Bool:
+    return (
+        type_id == "PrimitiveString"
+        or type_id == "PrimitiveStringMultiline"
+        or type_id == "StringConstant"
+        or type_id == "StringConstantMultiline"
+        or type_id == "easy string"
+    )
+
+
+def _workflow_is_bool_scalar_node(type_id: String) -> Bool:
+    return type_id == "PrimitiveBoolean" or type_id == "BOOLConstant"
+
+
+def _workflow_is_scalar_node(type_id: String) -> Bool:
+    return (
+        _workflow_is_int_scalar_node(type_id)
+        or _workflow_is_float_scalar_node(type_id)
+        or _workflow_is_string_scalar_node(type_id)
+        or _workflow_is_bool_scalar_node(type_id)
+        or type_id == "PrimitiveNode"
+    )
+
+
+def _workflow_json_scalar_type(value: JSONValue) -> String:
+    if value.is_bool():
+        return String("BOOLEAN")
+    if value.is_int():
+        return String("INT")
+    if value.is_number():
+        return String("FLOAT")
+    if value.is_string():
+        return String("STRING")
+    return String("")
+
+
+def _workflow_scalar_output_type(type_id: String, fields: JSONValue) raises -> String:
+    if _workflow_is_int_scalar_node(type_id):
+        return String("INT")
+    if _workflow_is_float_scalar_node(type_id):
+        return String("FLOAT")
+    if _workflow_is_string_scalar_node(type_id):
+        return String("STRING")
+    if _workflow_is_bool_scalar_node(type_id):
+        return String("BOOLEAN")
+    if type_id == "PrimitiveNode":
+        var declared = _workflow_string(fields, String("output_type"))
+        if declared == "":
+            if fields.contains("value"):
+                declared = _workflow_json_scalar_type(fields["value"])
+            elif fields.contains("text"):
+                declared = _workflow_json_scalar_type(fields["text"])
+            elif fields.contains("string"):
+                declared = _workflow_json_scalar_type(fields["string"])
+        if declared == "INT" or declared == "FLOAT" or declared == "STRING" or declared == "BOOLEAN":
+            return declared^
+    return String("")
+
+
 def _set_if_missing(mut obj: JSONValue, key: String, value: JSONValue) raises:
     if not obj.contains(key) or obj[key].is_null():
         obj.set(key, value.copy())
@@ -75,6 +142,35 @@ def _workflow_float(
     if n < lo or n > hi:
         raise Error("[501] workflow graph field " + key + " out of range")
     return n
+
+
+def _workflow_int(
+    obj: JSONValue, key: String, dflt: Int, lo: Int, hi: Int,
+) raises -> Int:
+    if not obj.is_object() or not obj.contains(key) or obj[key].is_null():
+        return dflt
+    var n: Int
+    if obj[key].is_int():
+        n = obj[key].as_int()
+    elif obj[key].is_number():
+        n = Int(obj[key].as_float())
+    elif obj[key].is_string():
+        try:
+            n = Int(obj[key].as_string())
+        except:
+            raise Error("[501] workflow graph field " + key + " must be an integer")
+    else:
+        raise Error("[501] workflow graph field " + key + " must be an integer")
+    if n < lo or n > hi:
+        raise Error("[501] workflow graph field " + key + " out of range")
+    return n
+
+
+def _workflow_round6(v: Float64) -> Float64:
+    var scaled = v * 1000000.0
+    if scaled >= 0.0:
+        return Float64(Int(scaled + 0.5)) / 1000000.0
+    return Float64(Int(scaled - 0.5)) / 1000000.0
 
 
 def _workflow_append_lora(mut obj: JSONValue, name: String, weight: Float64) raises:
@@ -519,6 +615,7 @@ def _workflow_find_setnode_input_link(edges: JSONValue, to_node: Int) raises -> 
             or dst_port == "INT"
             or dst_port == "FLOAT"
             or dst_port == "STRING"
+            or dst_port == "BOOLEAN"
         )
         if dst_node == to_node and accepted:
             if out.found:
@@ -579,6 +676,10 @@ def _workflow_setget_supported_type(actual: String) -> Bool:
         or actual == "NOISE"
         or actual == "SAMPLER"
         or actual == "COND_LATENT"
+        or actual == "INT"
+        or actual == "FLOAT"
+        or actual == "STRING"
+        or actual == "BOOLEAN"
     )
 
 
@@ -591,6 +692,81 @@ def _workflow_add_value(
     nodes.append(node_id)
     ports.append(port)
     types.append(typ)
+
+
+def _workflow_add_scalar(
+    mut nodes: List[Int], mut ports: List[String], mut types: List[String],
+    mut ints: List[Int], mut floats: List[Float64], mut strings: List[String],
+    mut bools: List[Bool],
+    node_id: Int, port: String, typ: String, int_value: Int, float_value: Float64,
+    string_value: String, bool_value: Bool,
+) raises:
+    if _workflow_value_index(nodes, ports, node_id, port) >= 0:
+        raise Error("[501] workflow graph duplicate scalar metadata")
+    nodes.append(node_id)
+    ports.append(port.copy())
+    types.append(typ.copy())
+    ints.append(int_value)
+    floats.append(float_value)
+    strings.append(string_value.copy())
+    bools.append(bool_value)
+
+
+def _workflow_require_scalar_type(
+    nodes: List[Int], ports: List[String], types: List[String],
+    link: WorkflowLink, expected: String, input_name: String,
+) raises -> Int:
+    var idx = _workflow_value_index(nodes, ports, link.node_id, link.port)
+    if idx < 0:
+        raise Error("[501] workflow graph scalar metadata missing source: " + input_name)
+    var actual = types[idx]
+    if actual != expected:
+        raise Error(
+            "[501] workflow graph input " + input_name + " expected "
+            + expected + " from " + String(link.node_id) + ":" + link.port
+            + " but got " + actual
+        )
+    return idx
+
+
+def _workflow_scalar_int(
+    nodes: List[Int], ports: List[String], types: List[String], ints: List[Int],
+    link: WorkflowLink, input_name: String,
+) raises -> Int:
+    var idx = _workflow_require_scalar_type(nodes, ports, types, link, String("INT"), input_name)
+    return ints[idx]
+
+
+def _workflow_scalar_float(
+    nodes: List[Int], ports: List[String], types: List[String], floats: List[Float64],
+    link: WorkflowLink, input_name: String,
+) raises -> Float64:
+    var idx = _workflow_require_scalar_type(nodes, ports, types, link, String("FLOAT"), input_name)
+    return floats[idx]
+
+
+def _workflow_scalar_string(
+    nodes: List[Int], ports: List[String], types: List[String], strings: List[String],
+    link: WorkflowLink, input_name: String,
+) raises -> String:
+    var idx = _workflow_require_scalar_type(nodes, ports, types, link, String("STRING"), input_name)
+    return strings[idx].copy()
+
+
+def _workflow_scalar_bool(
+    nodes: List[Int], ports: List[String], types: List[String], bools: List[Bool],
+    link: WorkflowLink, input_name: String,
+) raises -> Bool:
+    var idx = _workflow_require_scalar_type(nodes, ports, types, link, String("BOOLEAN"), input_name)
+    return bools[idx]
+
+
+def _workflow_optional_link_ready(
+    nodes: List[Int], ports: List[String], link: WorkflowLink,
+) -> Bool:
+    if not link.found:
+        return True
+    return _workflow_value_index(nodes, ports, link.node_id, link.port) >= 0
 
 
 def _workflow_require_value_type(
@@ -687,6 +863,9 @@ def _workflow_copy_value_metadata(
     mut sampler_nodes: List[Int], mut sampler_ports: List[String], mut sampler_names: List[String],
     mut sigmas_nodes: List[Int], mut sigmas_ports: List[String], mut sigmas_steps: List[Int],
     mut sigmas_schedulers: List[String], mut sigmas_denoises: List[Float64],
+    mut scalar_nodes: List[Int], mut scalar_ports: List[String], mut scalar_types: List[String],
+    mut scalar_ints: List[Int], mut scalar_floats: List[Float64], mut scalar_strings: List[String],
+    mut scalar_bools: List[Bool],
 ) raises:
     if actual == "MODEL":
         model_nodes.append(dst_node); model_ports.append(dst_port.copy())
@@ -733,6 +912,20 @@ def _workflow_copy_value_metadata(
                 sigmas_schedulers.append(sigmas_schedulers[j])
                 sigmas_denoises.append(sigmas_denoises[j])
                 break
+    elif actual == "INT" or actual == "FLOAT" or actual == "STRING" or actual == "BOOLEAN":
+        var scalar_idx = _workflow_value_index(scalar_nodes, scalar_ports, source.node_id, source.port)
+        if scalar_idx < 0:
+            raise Error("[501] workflow graph scalar metadata missing source")
+        var int_value = scalar_ints[scalar_idx]
+        var float_value = scalar_floats[scalar_idx]
+        var string_value = scalar_strings[scalar_idx].copy()
+        var bool_value = scalar_bools[scalar_idx]
+        _workflow_add_scalar(
+            scalar_nodes, scalar_ports, scalar_types,
+            scalar_ints, scalar_floats, scalar_strings, scalar_bools,
+            dst_node, dst_port, actual,
+            int_value, float_value, string_value, bool_value,
+        )
 
 
 def _workflow_set_field_if_nonnegative_int(
@@ -868,6 +1061,9 @@ def _comfy_ui_output_port(nodes: JSONValue, src_id: Int, src_slot: Int) raises -
         return String("GET")
     if node_type == "Reroute":
         return String("REROUTE")
+    if _workflow_is_scalar_node(node_type):
+        if typ == "INT" or typ == "FLOAT" or typ == "STRING" or typ == "BOOLEAN":
+            return typ^
     if node_type == "InpaintModelConditioning":
         if name == "positive" or name == "negative":
             return name^
@@ -1014,6 +1210,21 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("set_cond_area", JSONValue.from_string(_workflow_widget_string(widgets, 1, String("default"))))
     elif type_id == "SetNode" or type_id == "GetNode":
         fields.set("name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
+    elif _workflow_is_int_scalar_node(type_id):
+        fields.set("value", JSONValue.from_int(_workflow_widget_int(widgets, 0, 0)))
+    elif _workflow_is_float_scalar_node(type_id):
+        fields.set("value", JSONValue.from_float(_workflow_widget_float(widgets, 0, 0.0)))
+    elif type_id == "StringConstant" or type_id == "StringConstantMultiline":
+        fields.set("string", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
+        if type_id == "StringConstantMultiline":
+            fields.set("strip_newlines", JSONValue.from_bool(_workflow_widget_bool(widgets, 1, True)))
+    elif _workflow_is_string_scalar_node(type_id):
+        fields.set("value", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
+    elif _workflow_is_bool_scalar_node(type_id):
+        fields.set("value", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, False)))
+    elif type_id == "PrimitiveNode":
+        if widgets.is_array() and widgets.length() > 0:
+            fields.set("value", widgets[0].copy())
     elif type_id == "InpaintModelConditioning":
         fields.set("noise_mask", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, True)))
     elif type_id == "SaveImage":
@@ -1054,7 +1265,7 @@ def comfy_ui_canvas_to_typed_graph(wf: JSONValue) raises -> JSONValue:
             widgets = src["widgets_values"]
         var fields = _comfy_ui_widget_fields(type_id, widgets)
         if (
-            (type_id == "GetNode" or type_id == "SetNode")
+            (type_id == "GetNode" or type_id == "SetNode" or _workflow_is_scalar_node(type_id))
             and src.contains("outputs")
             and src["outputs"].is_array()
             and src["outputs"].length() > 0
@@ -1162,6 +1373,17 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
         raise Error("[501] Comfy API prompt link references missing node: " + key)
     var node = graph[key]
     var typ = _workflow_canonical_type_id(_workflow_string(node, String("class_type")))
+    if _workflow_is_scalar_node(typ):
+        if slot == 0:
+            if typ == "PrimitiveNode" and node.contains("inputs") and node["inputs"].is_object():
+                var primitive_type = _workflow_scalar_output_type(typ, node["inputs"])
+                if primitive_type != "":
+                    return primitive_type^
+            else:
+                var empty_fields = JSONValue.new_object()
+                var scalar_type = _workflow_scalar_output_type(typ, empty_fields)
+                if scalar_type != "":
+                    return scalar_type^
     if typ == "CheckpointLoaderSimple":
         if slot == 0:
             return String("MODEL")
@@ -1449,6 +1671,21 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "PreviewImage"
             or type_id == "MarkdownNote"
             or type_id == "Note"
+            or type_id == "PrimitiveInt"
+            or type_id == "PrimitiveFloat"
+            or type_id == "PrimitiveString"
+            or type_id == "PrimitiveStringMultiline"
+            or type_id == "PrimitiveBoolean"
+            or type_id == "PrimitiveNode"
+            or type_id == "INTConstant"
+            or type_id == "FloatConstant"
+            or type_id == "StringConstant"
+            or type_id == "StringConstantMultiline"
+            or type_id == "BOOLConstant"
+            or type_id == "SeedNode"
+            or type_id == "easy int"
+            or type_id == "easy float"
+            or type_id == "easy string"
         ):
             raise Error(String("[501] unsupported workflow graph node type: ") + type_id)
         ids.append(id)
@@ -1520,6 +1757,13 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
     var sigmas_steps = List[Int]()
     var sigmas_schedulers = List[String]()
     var sigmas_denoises = List[Float64]()
+    var scalar_nodes = List[Int]()
+    var scalar_ports = List[String]()
+    var scalar_types = List[String]()
+    var scalar_ints = List[Int]()
+    var scalar_floats = List[Float64]()
+    var scalar_strings = List[String]()
+    var scalar_bools = List[Bool]()
     var setget_names = List[String]()
     var setget_nodes = List[Int]()
     var setget_ports = List[String]()
@@ -1599,26 +1843,115 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             elif type_id == "VAELoader":
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("VAE"), String("VAE"))
                 done[i] = True; remaining -= 1; progressed = True
-            elif type_id == "EmptyLatentImage" or type_id == "EmptySD3LatentImage" or type_id == "EmptyFlux2LatentImage":
-                var width = _opt_int(fields, "width", 512, 16, 2048)
-                var height = _opt_int(fields, "height", 512, 16, 2048)
-                var images = _opt_int(fields, "batch_size", 1, 1, 64)
-                _set_if_missing(obj, String("width"), JSONValue.from_int(width))
-                _set_if_missing(obj, String("height"), JSONValue.from_int(height))
-                _set_if_missing(obj, String("images"), JSONValue.from_int(images))
-                _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
-                latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
-                latent_widths.append(width); latent_heights.append(height); latent_images.append(images)
-                latent_init_images.append(String(""))
-                latent_mask_images.append(String(""))
+            elif _workflow_is_scalar_node(type_id):
+                var scalar_type = _workflow_scalar_output_type(type_id, fields)
+                if scalar_type == "":
+                    raise Error("[501] workflow graph primitive scalar missing supported output type")
+                var int_value = 0
+                var float_value = 0.0
+                var string_value = String("")
+                var bool_value = False
+                if scalar_type == "INT":
+                    if fields.contains("value"):
+                        int_value = _workflow_int(fields, String("value"), 0, -9223372036854775807, 9223372036854775807)
+                    elif fields.contains("seed"):
+                        int_value = _workflow_int(fields, String("seed"), 0, -9223372036854775807, 9223372036854775807)
+                    else:
+                        int_value = 0
+                    float_value = Float64(int_value)
+                elif scalar_type == "FLOAT":
+                    if fields.contains("value"):
+                        float_value = _workflow_float(fields, String("value"), 0.0, -1.0e308, 1.0e308)
+                    else:
+                        float_value = 0.0
+                    if type_id == "FloatConstant":
+                        float_value = _workflow_round6(float_value)
+                    int_value = Int(float_value)
+                elif scalar_type == "STRING":
+                    string_value = _workflow_string(fields, String("value"))
+                    if string_value == "":
+                        string_value = _workflow_string(fields, String("text"))
+                    if string_value == "":
+                        string_value = _workflow_string(fields, String("string"))
+                    if type_id == "StringConstantMultiline" and _workflow_bool(fields, String("strip_newlines"), True):
+                        if (
+                            string_value.find(String("\n")) >= 0
+                            or string_value.find(String("\r")) >= 0
+                            or string_value.startswith(String(" "))
+                            or string_value.startswith(String("\t"))
+                            or string_value.endswith(String(" "))
+                            or string_value.endswith(String("\t"))
+                        ):
+                            raise Error("[501] workflow graph StringConstantMultiline strip_newlines transform is unsupported")
+                elif scalar_type == "BOOLEAN":
+                    bool_value = _workflow_bool(fields, String("value"), False)
+                    int_value = 1 if bool_value else 0
+                    float_value = Float64(int_value)
+                _workflow_add_value(value_nodes, value_ports, value_types, node_id, scalar_type.copy(), scalar_type.copy())
+                _workflow_add_scalar(
+                    scalar_nodes, scalar_ports, scalar_types,
+                    scalar_ints, scalar_floats, scalar_strings, scalar_bools,
+                    node_id, scalar_type, scalar_type,
+                    int_value, float_value, string_value, bool_value,
+                )
                 done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "EmptyLatentImage" or type_id == "EmptySD3LatentImage" or type_id == "EmptyFlux2LatentImage":
+                var width_link = _workflow_find_input_link(edges, node_id, String("width"))
+                var height_link = _workflow_find_input_link(edges, node_id, String("height"))
+                var batch_link = _workflow_find_input_link(edges, node_id, String("batch_size"))
+                var ready = (
+                    _workflow_optional_link_ready(value_nodes, value_ports, width_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, height_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, batch_link)
+                )
+                if ready:
+                    var width = _opt_int(fields, "width", 512, 16, 2048)
+                    var height = _opt_int(fields, "height", 512, 16, 2048)
+                    var images = _opt_int(fields, "batch_size", 1, 1, 64)
+                    if width_link.found:
+                        width = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            width_link, String("width"),
+                        )
+                    if height_link.found:
+                        height = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            height_link, String("height"),
+                        )
+                    if batch_link.found:
+                        images = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            batch_link, String("batch_size"),
+                        )
+                    if width < 16 or width > 2048 or height < 16 or height > 2048:
+                        raise Error("[501] workflow graph EmptyLatentImage scalar dimensions out of range")
+                    if images < 1 or images > 64:
+                        raise Error("[501] workflow graph EmptyLatentImage scalar batch_size out of range")
+                    _set_if_missing(obj, String("width"), JSONValue.from_int(width))
+                    _set_if_missing(obj, String("height"), JSONValue.from_int(height))
+                    _set_if_missing(obj, String("images"), JSONValue.from_int(images))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
+                    latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
+                    latent_widths.append(width); latent_heights.append(height); latent_images.append(images)
+                    latent_init_images.append(String(""))
+                    latent_mask_images.append(String(""))
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "CLIPTextEncode" or type_id == "CLIPTextEncodeFlux":
                 var clip_link = _workflow_find_input_link(edges, node_id, String("clip"))
+                var text_link = _workflow_find_input_link(edges, node_id, String("text"))
                 if clip_link.found:
-                    var idx = _workflow_value_index(value_nodes, value_ports, clip_link.node_id, clip_link.port)
-                    if idx >= 0:
+                    var ready = (
+                        _workflow_value_index(value_nodes, value_ports, clip_link.node_id, clip_link.port) >= 0
+                        and _workflow_optional_link_ready(value_nodes, value_ports, text_link)
+                    )
+                    if ready:
                         _workflow_require_value_type(value_nodes, value_ports, value_types, clip_link, String("CLIP"), String("clip"))
                         var text = _workflow_conditioning_prompt_text(fields, type_id)
+                        if text_link.found:
+                            text = _workflow_scalar_string(
+                                scalar_nodes, scalar_ports, scalar_types, scalar_strings,
+                                text_link, String("text"),
+                            )
                         _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
                         cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(text)
                         done[i] = True; remaining -= 1; progressed = True
@@ -1627,16 +1960,23 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             elif type_id == "TextEncodeQwenImageEdit" or type_id == "TextEncodeQwenImageEditPlus":
                 var clip_link = _workflow_find_input_link(edges, node_id, String("clip"))
                 var image_link = _workflow_find_input_link(edges, node_id, String("image"))
+                var text_link = _workflow_find_input_link(edges, node_id, String("text"))
                 if not clip_link.found or not image_link.found:
                     raise Error("[501] workflow graph " + type_id + " missing required typed input")
                 var ready = (
                     _workflow_value_index(value_nodes, value_ports, clip_link.node_id, clip_link.port) >= 0
                     and _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port) >= 0
+                    and _workflow_optional_link_ready(value_nodes, value_ports, text_link)
                 )
                 if ready:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, clip_link, String("CLIP"), String("clip"))
                     _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
                     var text = _workflow_conditioning_prompt_text(fields, type_id)
+                    if text_link.found:
+                        text = _workflow_scalar_string(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_strings,
+                            text_link, String("text"),
+                        )
                     var edit_image = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
                     _set_if_missing(obj, String("qwen_edit_conditioning_image"), JSONValue.from_string(edit_image))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
@@ -1713,6 +2053,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         noise_nodes, noise_ports, noise_seeds,
                         sampler_nodes, sampler_ports, sampler_names,
                         sigmas_nodes, sigmas_ports, sigmas_steps, sigmas_schedulers, sigmas_denoises,
+                        scalar_nodes, scalar_ports, scalar_types,
+                        scalar_ints, scalar_floats, scalar_strings, scalar_bools,
                     )
                     setget_names.append(name)
                     setget_nodes.append(node_id)
@@ -1740,6 +2082,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         noise_nodes, noise_ports, noise_seeds,
                         sampler_nodes, sampler_ports, sampler_names,
                         sigmas_nodes, sigmas_ports, sigmas_steps, sigmas_schedulers, sigmas_denoises,
+                        scalar_nodes, scalar_ports, scalar_types,
+                        scalar_ints, scalar_floats, scalar_strings, scalar_bools,
                     )
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "Reroute":
@@ -1761,6 +2105,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         noise_nodes, noise_ports, noise_seeds,
                         sampler_nodes, sampler_ports, sampler_names,
                         sigmas_nodes, sigmas_ports, sigmas_steps, sigmas_schedulers, sigmas_denoises,
+                        scalar_nodes, scalar_ports, scalar_types,
+                        scalar_ints, scalar_floats, scalar_strings, scalar_bools,
                     )
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "LoadImage":
@@ -1837,9 +2183,29 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 var image_link = _workflow_find_input_link(edges, node_id, String("image"))
                 if not image_link.found:
                     raise Error("[501] workflow graph " + type_id + " missing image input")
-                var idx = _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port)
-                if idx >= 0:
+                var width_link = _workflow_find_input_link(edges, node_id, String("width"))
+                var height_link = _workflow_find_input_link(edges, node_id, String("height"))
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port) >= 0
+                    and _workflow_optional_link_ready(value_nodes, value_ports, width_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, height_link)
+                )
+                if ready:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
+                    if width_link.found:
+                        var width = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            width_link, String("width"),
+                        )
+                        if width < 1 or width > 8192:
+                            raise Error("[501] workflow graph ImageScale scalar width out of range")
+                    if height_link.found:
+                        var height = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            height_link, String("height"),
+                        )
+                        if height < 1 or height > 8192:
+                            raise Error("[501] workflow graph ImageScale scalar height out of range")
                     var image_path = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
                     var mask_source = _workflow_source_meta(image_nodes, image_ports, image_mask_sources, image_link)
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
@@ -2083,12 +2449,14 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 var model_link = _workflow_find_input_link(edges, node_id, String("model"))
                 var pos_link = _workflow_find_input_link(edges, node_id, String("positive"))
                 var neg_link = _workflow_find_input_link(edges, node_id, String("negative"))
+                var cfg_link = _workflow_find_input_link(edges, node_id, String("cfg"))
                 if not model_link.found or not pos_link.found or not neg_link.found:
                     raise Error("[501] workflow graph CFGGuider missing required typed input")
                 var ready = (
                     _workflow_value_index(value_nodes, value_ports, model_link.node_id, model_link.port) >= 0
                     and _workflow_value_index(value_nodes, value_ports, pos_link.node_id, pos_link.port) >= 0
                     and _workflow_value_index(value_nodes, value_ports, neg_link.node_id, neg_link.port) >= 0
+                    and _workflow_optional_link_ready(value_nodes, value_ports, cfg_link)
                 )
                 if ready:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, model_link, String("MODEL"), String("model"))
@@ -2102,7 +2470,18 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     saw_prompt = True
                     var negative = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, neg_link)
                     _set_if_missing(obj, String("negative"), JSONValue.from_string(negative))
-                    _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
+                    if cfg_link.found:
+                        _set_if_missing(
+                            obj, String("cfg"),
+                            JSONValue.from_float(
+                                _workflow_scalar_float(
+                                    scalar_nodes, scalar_ports, scalar_types, scalar_floats,
+                                    cfg_link, String("cfg"),
+                                )
+                            ),
+                        )
+                    else:
+                        _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("GUIDER"), String("GUIDER"))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "BasicGuider":
@@ -2126,17 +2505,36 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("GUIDER"), String("GUIDER"))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "Flux2Scheduler":
-                _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SIGMAS"), String("SIGMAS"))
-                sigmas_nodes.append(node_id); sigmas_ports.append(String("SIGMAS"))
-                sigmas_steps.append(_opt_int(fields, "steps", 20, 1, 4096))
-                sigmas_schedulers.append(String("flux2"))
-                sigmas_denoises.append(1.0)
-                done[i] = True; remaining -= 1; progressed = True
+                var steps_link = _workflow_find_input_link(edges, node_id, String("steps"))
+                var ready = _workflow_optional_link_ready(value_nodes, value_ports, steps_link)
+                if ready:
+                    var steps = _opt_int(fields, "steps", 20, 1, 4096)
+                    if steps_link.found:
+                        steps = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            steps_link, String("steps"),
+                        )
+                    if steps < 1 or steps > 4096:
+                        raise Error("[501] workflow graph Flux2Scheduler scalar steps out of range")
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SIGMAS"), String("SIGMAS"))
+                    sigmas_nodes.append(node_id); sigmas_ports.append(String("SIGMAS"))
+                    sigmas_steps.append(steps)
+                    sigmas_schedulers.append(String("flux2"))
+                    sigmas_denoises.append(1.0)
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "BasicScheduler":
                 var model_link = _workflow_find_input_link(edges, node_id, String("model"))
                 if not model_link.found:
                     raise Error("[501] workflow graph BasicScheduler missing model input")
-                var ready = _workflow_value_index(value_nodes, value_ports, model_link.node_id, model_link.port) >= 0
+                var scheduler_link = _workflow_find_input_link(edges, node_id, String("scheduler"))
+                var steps_link = _workflow_find_input_link(edges, node_id, String("steps"))
+                var denoise_link = _workflow_find_input_link(edges, node_id, String("denoise"))
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, model_link.node_id, model_link.port) >= 0
+                    and _workflow_optional_link_ready(value_nodes, value_ports, scheduler_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, steps_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, denoise_link)
+                )
                 if ready:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, model_link, String("MODEL"), String("model"))
                     var scheduler = _workflow_string(fields, String("scheduler"))
@@ -2144,6 +2542,25 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         scheduler = String("simple")
                     var steps = _opt_int(fields, "steps", 20, 1, 4096)
                     var denoise = _workflow_float(fields, String("denoise"), 1.0, 0.0, 1.0)
+                    if scheduler_link.found:
+                        scheduler = _workflow_scalar_string(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_strings,
+                            scheduler_link, String("scheduler"),
+                        )
+                    if steps_link.found:
+                        steps = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            steps_link, String("steps"),
+                        )
+                    if denoise_link.found:
+                        denoise = _workflow_scalar_float(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_floats,
+                            denoise_link, String("denoise"),
+                        )
+                    if steps < 1 or steps > 4096:
+                        raise Error("[501] workflow graph BasicScheduler scalar steps out of range")
+                    if denoise < 0.0 or denoise > 1.0:
+                        raise Error("[501] workflow graph BasicScheduler scalar denoise out of range")
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SIGMAS"), String("SIGMAS"))
                     sigmas_nodes.append(node_id); sigmas_ports.append(String("SIGMAS"))
                     sigmas_steps.append(steps)
@@ -2151,11 +2568,21 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     sigmas_denoises.append(denoise)
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "RandomNoise":
-                var seed = _opt_int(fields, "noise_seed", 0, 0, 4294967295)
-                _set_if_missing(obj, String("seed"), JSONValue.from_int(seed))
-                _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("NOISE"), String("NOISE"))
-                noise_nodes.append(node_id); noise_ports.append(String("NOISE")); noise_seeds.append(seed)
-                done[i] = True; remaining -= 1; progressed = True
+                var seed_link = _workflow_find_input_link(edges, node_id, String("noise_seed"))
+                var ready = _workflow_optional_link_ready(value_nodes, value_ports, seed_link)
+                if ready:
+                    var seed = _opt_int(fields, "noise_seed", 0, 0, 4294967295)
+                    if seed_link.found:
+                        seed = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            seed_link, String("noise_seed"),
+                        )
+                    if seed < 0 or seed > 4294967295:
+                        raise Error("[501] workflow graph RandomNoise scalar noise_seed out of range")
+                    _set_if_missing(obj, String("seed"), JSONValue.from_int(seed))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("NOISE"), String("NOISE"))
+                    noise_nodes.append(node_id); noise_ports.append(String("NOISE")); noise_seeds.append(seed)
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "KSamplerSelect":
                 var sampler_name = _workflow_string(fields, String("sampler_name"))
                 if sampler_name == "":
@@ -2171,6 +2598,12 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 var pos_link = _workflow_find_input_link(edges, node_id, String("positive"))
                 var neg_link = _workflow_find_input_link(edges, node_id, String("negative"))
                 var latent_link = _workflow_find_input_link(edges, node_id, String("latent_image"))
+                var seed_link = _workflow_find_input_link(edges, node_id, String("seed"))
+                var steps_link = _workflow_find_input_link(edges, node_id, String("steps"))
+                var cfg_link = _workflow_find_input_link(edges, node_id, String("cfg"))
+                var sampler_name_link = _workflow_find_input_link(edges, node_id, String("sampler_name"))
+                var scheduler_link = _workflow_find_input_link(edges, node_id, String("scheduler"))
+                var denoise_link = _workflow_find_input_link(edges, node_id, String("denoise"))
                 if not model_link.found or not pos_link.found or not neg_link.found or not latent_link.found:
                     raise Error("[501] workflow graph " + type_id + " missing required typed input")
                 var ready = (
@@ -2178,6 +2611,12 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     and _workflow_value_index(value_nodes, value_ports, pos_link.node_id, pos_link.port) >= 0
                     and _workflow_value_index(value_nodes, value_ports, neg_link.node_id, neg_link.port) >= 0
                     and _workflow_value_index(value_nodes, value_ports, latent_link.node_id, latent_link.port) >= 0
+                    and _workflow_optional_link_ready(value_nodes, value_ports, seed_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, steps_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, cfg_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, sampler_name_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, scheduler_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, denoise_link)
                 )
                 if ready:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, model_link, String("MODEL"), String("model"))
@@ -2203,12 +2642,71 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                             _set_if_missing(obj, String("init_image"), JSONValue.from_string(latent_init_images[latent_idx]))
                         if latent_mask_images[latent_idx] != "":
                             _set_if_missing(obj, String("mask_image"), JSONValue.from_string(latent_mask_images[latent_idx]))
-                    _copy_field_if_missing(obj, fields, String("steps"), String("steps"))
-                    _workflow_set_field_if_nonnegative_int(obj, fields, String("seed"), String("seed"))
-                    _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
-                    _copy_field_if_missing(obj, fields, String("sampler_name"), String("sampler"))
-                    _copy_field_if_missing(obj, fields, String("scheduler"), String("scheduler"))
-                    _copy_field_if_missing(obj, fields, String("denoise"), String("creativity"))
+                    if steps_link.found:
+                        var steps = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            steps_link, String("steps"),
+                        )
+                        if steps < 1 or steps > 4096:
+                            raise Error("[501] workflow graph KSampler scalar steps out of range")
+                        _set_if_missing(obj, String("steps"), JSONValue.from_int(steps))
+                    else:
+                        _copy_field_if_missing(obj, fields, String("steps"), String("steps"))
+                    if seed_link.found:
+                        var seed = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            seed_link, String("seed"),
+                        )
+                        if seed >= 0:
+                            _set_if_missing(obj, String("seed"), JSONValue.from_int(seed))
+                    else:
+                        _workflow_set_field_if_nonnegative_int(obj, fields, String("seed"), String("seed"))
+                    if cfg_link.found:
+                        _set_if_missing(
+                            obj, String("cfg"),
+                            JSONValue.from_float(
+                                _workflow_scalar_float(
+                                    scalar_nodes, scalar_ports, scalar_types, scalar_floats,
+                                    cfg_link, String("cfg"),
+                                )
+                            ),
+                        )
+                    else:
+                        _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
+                    if sampler_name_link.found:
+                        _set_if_missing(
+                            obj, String("sampler"),
+                            JSONValue.from_string(
+                                _workflow_scalar_string(
+                                    scalar_nodes, scalar_ports, scalar_types, scalar_strings,
+                                    sampler_name_link, String("sampler_name"),
+                                )
+                            ),
+                        )
+                    else:
+                        _copy_field_if_missing(obj, fields, String("sampler_name"), String("sampler"))
+                    if scheduler_link.found:
+                        _set_if_missing(
+                            obj, String("scheduler"),
+                            JSONValue.from_string(
+                                _workflow_scalar_string(
+                                    scalar_nodes, scalar_ports, scalar_types, scalar_strings,
+                                    scheduler_link, String("scheduler"),
+                                )
+                            ),
+                        )
+                    else:
+                        _copy_field_if_missing(obj, fields, String("scheduler"), String("scheduler"))
+                    if denoise_link.found:
+                        var denoise = _workflow_scalar_float(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_floats,
+                            denoise_link, String("denoise"),
+                        )
+                        if denoise < 0.0 or denoise > 1.0:
+                            raise Error("[501] workflow graph KSampler scalar denoise out of range")
+                        _set_if_missing(obj, String("creativity"), JSONValue.from_float(denoise))
+                    else:
+                        _copy_field_if_missing(obj, fields, String("denoise"), String("creativity"))
                     if type_id == "LanPaint_KSampler" or type_id == "LanPaint_KSamplerAdvanced":
                         _workflow_copy_lanpaint_sampler_fields(obj, fields)
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
@@ -2327,12 +2825,21 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "SaveImage":
                 var image_link = _workflow_find_input_link(edges, node_id, String("images"))
+                var prefix_link = _workflow_find_input_link(edges, node_id, String("filename_prefix"))
                 if not image_link.found:
                     raise Error("[501] workflow graph SaveImage missing images input")
-                var idx = _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port)
-                if idx >= 0:
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port) >= 0
+                    and _workflow_optional_link_ready(value_nodes, value_ports, prefix_link)
+                )
+                if ready:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("images"))
                     var prefix = _workflow_string(fields, String("filename_prefix"))
+                    if prefix_link.found:
+                        prefix = _workflow_scalar_string(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_strings,
+                            prefix_link, String("filename_prefix"),
+                        )
                     if prefix != "":
                         _set_if_missing(obj, String("workflow_save_prefix"), JSONValue.from_string(prefix))
                     done[i] = True; remaining -= 1; progressed = True

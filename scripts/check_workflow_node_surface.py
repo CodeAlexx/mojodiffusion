@@ -123,6 +123,21 @@ SUPPORTED_NODE_TYPES = [
     "PreviewImage",
     "MarkdownNote",
     "Note",
+    "PrimitiveInt",
+    "PrimitiveFloat",
+    "PrimitiveString",
+    "PrimitiveStringMultiline",
+    "PrimitiveBoolean",
+    "PrimitiveNode",
+    "INTConstant",
+    "FloatConstant",
+    "StringConstant",
+    "StringConstantMultiline",
+    "BOOLConstant",
+    "SeedNode",
+    "easy int",
+    "easy float",
+    "easy string",
 ]
 
 UNSUPPORTED_NODE_EXAMPLES = [
@@ -643,6 +658,40 @@ def check_supported_nodes() -> list[Check]:
             ],
             severity=P0,
             acceptance="KJNodes Get/Set virtual variables lower as bounded typed handle pass-throughs with fail-loud ambiguity/type checks.",
+        )
+    )
+    checks.append(
+        check_contains(
+            WORKFLOW_GRAPH,
+            category="workflow",
+            label="primitive scalar constant lowering",
+            needles=[
+                "PrimitiveInt",
+                "PrimitiveFloat",
+                "PrimitiveString",
+                "PrimitiveStringMultiline",
+                "PrimitiveBoolean",
+                "INTConstant",
+                "FloatConstant",
+                "StringConstant",
+                "StringConstantMultiline",
+                "BOOLConstant",
+                "PrimitiveNode",
+                "_workflow_is_scalar_node",
+                "_workflow_add_scalar",
+                "_workflow_scalar_int",
+                "_workflow_scalar_float",
+                "_workflow_scalar_string",
+                "_workflow_require_scalar_type",
+                "scalar_nodes",
+                "scalar_ports",
+                "scalar_types",
+                "workflow graph scalar metadata missing source",
+                "StringConstantMultiline strip_newlines transform is unsupported",
+                "[501] workflow graph input ",
+            ],
+            severity=P0,
+            acceptance="Comfy core/KJ primitive scalar constants lower as first-class INT/FLOAT/STRING/BOOLEAN values and bad scalar consumers fail before enqueue.",
         )
     )
     checks.append(
@@ -2883,6 +2932,8 @@ def check_workflow_graph_product_report() -> Check:
     reroute_canvas_png = report.get("reroute_canvas_png")
     getset_canvas_job = report.get("getset_canvas_job")
     getset_canvas_png = report.get("getset_canvas_png")
+    scalar_canvas_job = report.get("scalar_canvas_job")
+    scalar_canvas_png = report.get("scalar_canvas_png")
     outpaint_threshold_api_job = report.get("outpaint_threshold_api_job")
     outpaint_threshold_api_png = report.get("outpaint_threshold_api_png")
     inpaint_conditioning_api_job = report.get("inpaint_conditioning_api_job")
@@ -2917,6 +2968,7 @@ def check_workflow_graph_product_report() -> Check:
     getset_missing_input = report.get("getset_missing_input")
     getset_unsupported_type = report.get("getset_unsupported_type")
     getset_type_mismatch = report.get("getset_type_mismatch")
+    scalar_type_mismatch = report.get("scalar_type_mismatch")
     inpaint_conditioning_missing_mask = report.get("inpaint_conditioning_missing_mask")
     conditioning_set_mask_missing_mask = report.get("conditioning_set_mask_missing_mask")
     if (
@@ -2930,6 +2982,8 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(reroute_canvas_png, dict)
         or not isinstance(getset_canvas_job, dict)
         or not isinstance(getset_canvas_png, dict)
+        or not isinstance(scalar_canvas_job, dict)
+        or not isinstance(scalar_canvas_png, dict)
         or not isinstance(outpaint_threshold_api_job, dict)
         or not isinstance(outpaint_threshold_api_png, dict)
         or not isinstance(inpaint_conditioning_api_job, dict)
@@ -2958,6 +3012,7 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(getset_missing_input, dict)
         or not isinstance(getset_unsupported_type, dict)
         or not isinstance(getset_type_mismatch, dict)
+        or not isinstance(scalar_type_mismatch, dict)
         or not isinstance(inpaint_conditioning_missing_mask, dict)
         or not isinstance(conditioning_set_mask_missing_mask, dict)
     ):
@@ -2966,7 +3021,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, Reroute API/canvas import, Get/Set canvas import, outpaint ThresholdMask API import, InpaintModelConditioning API import, ConditioningSetMask API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, Reroute API/canvas import, Get/Set canvas import, scalar canvas import, outpaint ThresholdMask API import, InpaintModelConditioning API import, ConditioningSetMask API import, Qwen edit import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -3016,6 +3071,7 @@ def check_workflow_graph_product_report() -> Check:
         ("Get/Set missing SetNode input", getset_missing_input),
         ("Get/Set unsupported bus type", getset_unsupported_type),
         ("Get/Set output type mismatch", getset_type_mismatch),
+        ("scalar consumer type mismatch", scalar_type_mismatch),
     ):
         if item.get("status") != 501:
             return Check(
@@ -3217,6 +3273,35 @@ def check_workflow_graph_product_report() -> Check:
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
+    scalar_canvas_genparams = scalar_canvas_png.get("genparams")
+    if (
+        not isinstance(scalar_canvas_genparams, dict)
+        or scalar_canvas_genparams.get("workflow_source") != "comfy_ui_canvas_graph"
+        or scalar_canvas_genparams.get("workflow_save_prefix") != "scalar-canvas-prefix"
+        or scalar_canvas_genparams.get("prompt") != "scalar linked positive prompt"
+        or scalar_canvas_genparams.get("negative") != "scalar canvas negative prompt"
+        or scalar_canvas_genparams.get("model") != "stub"
+        or scalar_canvas_genparams.get("width") != 672
+        or scalar_canvas_genparams.get("height") != 544
+        or scalar_canvas_genparams.get("images") != 1
+        or scalar_canvas_genparams.get("steps") != 6
+        or scalar_canvas_genparams.get("seed") != 24680
+        or scalar_canvas_genparams.get("cfg") != 2.125
+        or scalar_canvas_genparams.get("sampler") != "euler"
+        or scalar_canvas_genparams.get("scheduler") != "simple"
+        or scalar_canvas_genparams.get("creativity") != 0.625
+        or scalar_canvas_genparams.get("workflow_node_count") != 20
+        or scalar_canvas_genparams.get("workflow_edge_count") != 21
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "scalar Comfy UI canvas primitive/link metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
     outpaint_api_genparams = outpaint_threshold_api_png.get("genparams")
     if (
         not isinstance(outpaint_api_genparams, dict)
@@ -3324,6 +3409,9 @@ def check_workflow_graph_product_report() -> Check:
         or basic_scheduler_genparams.get("steps") != 8
         or basic_scheduler_genparams.get("creativity") != 0.33
         or basic_scheduler_genparams.get("sampler") != "euler"
+        or basic_scheduler_genparams.get("seed") != 67890
+        or basic_scheduler_genparams.get("workflow_node_count") != 14
+        or basic_scheduler_genparams.get("workflow_edge_count") != 16
     ):
         return Check(
             False,
@@ -3407,6 +3495,7 @@ def check_workflow_graph_product_report() -> Check:
         f"Reroute API completed {reroute_api_job.get('id')}; "
         f"Reroute canvas completed {reroute_canvas_job.get('id')}; "
         f"Get/Set canvas completed {getset_canvas_job.get('id')}; "
+        f"scalar canvas completed {scalar_canvas_job.get('id')}; "
         f"outpaint ThresholdMask API completed {outpaint_threshold_api_job.get('id')}; "
         f"InpaintModelConditioning API completed {inpaint_conditioning_api_job.get('id')}; "
         f"InpaintModelConditioning noise_mask=false API completed {inpaint_conditioning_no_noise_mask_api_job.get('id')}; "

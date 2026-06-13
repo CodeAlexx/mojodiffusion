@@ -79,7 +79,7 @@ def _workflow_float(
 
 def _workflow_append_lora(mut obj: JSONValue, name: String, weight: Float64) raises:
     if name == "":
-        raise Error("[501] workflow graph LoraLoaderModelOnly missing lora_name")
+        raise Error("[501] workflow graph LoRA loader missing lora_name")
     if weight == 0.0:
         return
     var arr = JSONValue.new_array()
@@ -236,7 +236,7 @@ def apply_ideogram4_comfy_ui_export(mut obj: JSONValue, wf: JSONValue) raises:
             raise Error("[501] Ideogram4 Comfy export root node must be an object")
         var typ = _workflow_node_type(node)
         var mode = _workflow_node_mode(node)
-        if typ == "LoraLoaderModelOnly":
+        if typ == "LoraLoader" or typ == "LoraLoaderModelOnly":
             if mode != 4:
                 raise Error(
                     "[501] Ideogram4 Comfy export has active LoRA nodes, but the current Ideogram4 backend does not execute LoRA"
@@ -717,9 +717,11 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("ckpt_name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
     elif type_id == "UNETLoader" or type_id == "DiffusionModelLoader":
         fields.set("unet_name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
-    elif type_id == "LoraLoaderModelOnly":
+    elif type_id == "LoraLoader" or type_id == "LoraLoaderModelOnly":
         fields.set("lora_name", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
         fields.set("strength_model", JSONValue.from_float(_workflow_widget_float(widgets, 1, 1.0)))
+        if type_id == "LoraLoader":
+            fields.set("strength_clip", JSONValue.from_float(_workflow_widget_float(widgets, 2, 1.0)))
     elif type_id == "CLIPTextEncode" or type_id == "CLIPTextEncodeFlux":
         fields.set("text", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
     elif type_id == "LoadImage":
@@ -923,6 +925,11 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "LoraLoaderModelOnly":
         if slot == 0:
             return String("MODEL")
+    elif typ == "LoraLoader":
+        if slot == 0:
+            return String("MODEL")
+        if slot == 1:
+            return String("CLIP")
     elif typ == "CLIPLoader" or typ == "DualCLIPLoader" or typ == "TripleCLIPLoader":
         if slot == 0:
             return String("CLIP")
@@ -1103,6 +1110,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             type_id == "CheckpointLoaderSimple"
             or type_id == "UNETLoader"
             or type_id == "DiffusionModelLoader"
+            or type_id == "LoraLoader"
             or type_id == "LoraLoaderModelOnly"
             or type_id == "CLIPLoader"
             or type_id == "DualCLIPLoader"
@@ -1223,21 +1231,38 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MODEL"), String("MODEL"))
                 model_nodes.append(node_id); model_ports.append(String("MODEL")); model_names.append(model_name)
                 done[i] = True; remaining -= 1; progressed = True
-            elif type_id == "LoraLoaderModelOnly":
+            elif type_id == "LoraLoader" or type_id == "LoraLoaderModelOnly":
                 var model_link = _workflow_find_input_link(edges, node_id, String("model"))
                 if not model_link.found:
-                    raise Error("[501] workflow graph LoraLoaderModelOnly missing model input")
+                    if type_id == "LoraLoaderModelOnly":
+                        raise Error("[501] workflow graph LoraLoaderModelOnly missing model input")
+                    raise Error("[501] workflow graph " + type_id + " missing model input")
+                var clip_link = _workflow_find_input_link(edges, node_id, String("clip"))
+                if type_id == "LoraLoader" and not clip_link.found:
+                    raise Error("[501] workflow graph LoraLoader missing clip input")
                 var ready = _workflow_value_index(value_nodes, value_ports, model_link.node_id, model_link.port) >= 0
+                if type_id == "LoraLoader":
+                    ready = ready and _workflow_value_index(value_nodes, value_ports, clip_link.node_id, clip_link.port) >= 0
                 if ready:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, model_link, String("MODEL"), String("model"))
+                    if type_id == "LoraLoader":
+                        _workflow_require_value_type(value_nodes, value_ports, value_types, clip_link, String("CLIP"), String("clip"))
                     var model_name = _workflow_model_name(model_nodes, model_ports, model_names, model_link)
                     if model_name != "":
                         _set_if_missing(obj, String("model"), JSONValue.from_string(model_name))
                     var lora_name = _workflow_string(fields, String("lora_name"))
                     var strength = _workflow_float(fields, String("strength_model"), 1.0, -10.0, 10.0)
+                    var strength_clip = 0.0
+                    if type_id == "LoraLoader":
+                        strength_clip = _workflow_float(fields, String("strength_clip"), 1.0, -10.0, 10.0)
                     _workflow_append_lora(obj, lora_name, strength)
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MODEL"), String("MODEL"))
                     model_nodes.append(node_id); model_ports.append(String("MODEL")); model_names.append(model_name)
+                    if type_id == "LoraLoader":
+                        if strength_clip == 0.0:
+                            _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CLIP"), String("CLIP"))
+                        else:
+                            _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CLIP"), String("CLIP_LORA_UNSUPPORTED"))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "CLIPLoader" or type_id == "DualCLIPLoader" or type_id == "TripleCLIPLoader":
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CLIP"), String("CLIP"))

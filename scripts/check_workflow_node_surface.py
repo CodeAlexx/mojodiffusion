@@ -67,6 +67,7 @@ SUPPORTED_NODE_TYPES = [
     "CheckpointLoaderSimple",
     "UNETLoader",
     "DiffusionModelLoader",
+    "LoraLoader",
     "LoraLoaderModelOnly",
     "CLIPLoader",
     "DualCLIPLoader",
@@ -113,7 +114,7 @@ SUPPORTED_NODE_TYPES = [
 ]
 
 UNSUPPORTED_NODE_EXAMPLES = [
-    "LoraLoader",
+    "LoraLoaderStack",
     "ControlNetApply",
     "IPAdapterApply",
     "ImageUpscaleWithModel",
@@ -484,17 +485,21 @@ def check_supported_nodes() -> list[Check]:
             WORKFLOW_GRAPH,
             "apply_typed_workflow_graph",
             category="workflow",
-            label="graph LoRA model-only lowering",
+            label="graph LoRA loader lowering",
             needles=[
+                "LoraLoader",
                 "LoraLoaderModelOnly",
                 "_workflow_append_lora",
                 "lora_name",
                 "strength_model",
+                "strength_clip",
+                "CLIP_LORA_UNSUPPORTED",
+                "workflow graph LoraLoader missing clip input",
                 "workflow graph LoraLoaderModelOnly missing model input",
                 "_workflow_append_lora(obj, lora_name, strength)",
             ],
             severity=P0,
-            acceptance="Comfy/SerenityFlow model-only LoRA loader nodes lower into the existing flat LoRA metadata contract without replacing backend inference.",
+            acceptance="Comfy/SerenityFlow LoRA loader nodes lower model-side adapters into the existing flat LoRA metadata contract and keep CLIP-side LoRA fail-loud unless the clip strength is zero.",
         )
     )
     checks.append(
@@ -800,7 +805,7 @@ def check_family_surfaces() -> list[Check]:
                 "conditioning_weights_applied",
             ],
             severity=P1,
-            acceptance="Flat LoRA metadata is parsed and recorded; graph LoraLoaderModelOnly lowers into the same product contract.",
+            acceptance="Flat LoRA metadata is parsed and recorded; graph LoraLoader/LoraLoaderModelOnly lower model-side adapters into the same product contract.",
         ),
         check_contains(
             WORKFLOW_GRAPH,
@@ -2338,6 +2343,7 @@ def check_workflow_graph_product_report() -> Check:
     edit_klein4b_evidence = serenityflow_edit_case(report, "klein4b_edit")
     ideogram4_evidence = prefixed_evidence(report, "ideogram4_visual_export")
     unsupported_api = report.get("unsupported_comfy_api_node")
+    lora_clip_unsupported = report.get("lora_clip_unsupported")
     if (
         not isinstance(job, dict)
         or not isinstance(png, dict)
@@ -2352,13 +2358,24 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(basic_scheduler_job, dict)
         or not isinstance(basic_scheduler_png, dict)
         or not isinstance(unsupported_api, dict)
+        or not isinstance(lora_clip_unsupported, dict)
     ):
         return Check(
             False,
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, LoRA, img2img, mask, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, LoRA, LoRA CLIP reject, img2img, mask, BasicScheduler, or unsupported-node evidence",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    if lora_clip_unsupported.get("status") != 501:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "LoraLoader CLIP-side unsupported report did not return HTTP 501",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2376,7 +2393,7 @@ def check_workflow_graph_product_report() -> Check:
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "LoraLoaderModelOnly metadata missing from product report",
+            "LoraLoader metadata missing from product report",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )

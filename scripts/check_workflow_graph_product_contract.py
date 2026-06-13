@@ -407,6 +407,7 @@ def lora_workflow_request() -> dict[str, Any]:
                 {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 2, "port": "clip"}},
                 {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 3, "port": "clip"}},
                 {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 5, "port": "model"}},
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 5, "port": "clip"}},
                 {"from": {"node": 5, "port": "MODEL"}, "to": {"node": 6, "port": "model"}},
                 {"from": {"node": 3, "port": "CONDITIONING"}, "to": {"node": 6, "port": "positive"}},
                 {"from": {"node": 2, "port": "CONDITIONING"}, "to": {"node": 6, "port": "negative"}},
@@ -432,15 +433,61 @@ def lora_workflow_request() -> dict[str, Any]:
                 },
                 {
                     "id": 5,
-                    "type_id": "comfy/LoraLoaderModelOnly",
+                    "type_id": "comfy/LoraLoader",
                     "fields": {
                         "lora_name": "graph_lora.safetensors",
                         "strength_model": 0.8,
+                        "strength_clip": 0.0,
                     },
                 },
                 {"id": 4, "type_id": "comfy/EmptyLatentImage", "fields": {"width": 576, "height": 512, "batch_size": 1}},
                 {"id": 2, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "lora negative prompt"}},
                 {"id": 3, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "lora positive prompt"}},
+                {"id": 1, "type_id": "comfy/CheckpointLoaderSimple", "fields": {"ckpt_name": "stub"}},
+            ],
+        }
+    }
+
+
+def lora_clip_unsupported_workflow_request() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "version": 1,
+            "edges": [
+                {"from": {"node": 1, "port": "MODEL"}, "to": {"node": 5, "port": "model"}},
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 5, "port": "clip"}},
+                {"from": {"node": 5, "port": "MODEL"}, "to": {"node": 6, "port": "model"}},
+                {"from": {"node": 5, "port": "CLIP"}, "to": {"node": 3, "port": "clip"}},
+                {"from": {"node": 1, "port": "CLIP"}, "to": {"node": 2, "port": "clip"}},
+                {"from": {"node": 3, "port": "CONDITIONING"}, "to": {"node": 6, "port": "positive"}},
+                {"from": {"node": 2, "port": "CONDITIONING"}, "to": {"node": 6, "port": "negative"}},
+                {"from": {"node": 4, "port": "LATENT"}, "to": {"node": 6, "port": "latent_image"}},
+            ],
+            "nodes": [
+                {
+                    "id": 6,
+                    "type_id": "comfy/KSampler",
+                    "fields": {
+                        "steps": 3,
+                        "seed": 56789,
+                        "cfg": 2.0,
+                        "sampler_name": "euler",
+                        "scheduler": "karras",
+                        "denoise": 1.0,
+                    },
+                },
+                {
+                    "id": 5,
+                    "type_id": "comfy/LoraLoader",
+                    "fields": {
+                        "lora_name": "clip_lora.safetensors",
+                        "strength_model": 0.8,
+                        "strength_clip": 1.0,
+                    },
+                },
+                {"id": 4, "type_id": "comfy/EmptyLatentImage", "fields": {"width": 576, "height": 512, "batch_size": 1}},
+                {"id": 2, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "clip lora negative prompt"}},
+                {"id": 3, "type_id": "comfy/CLIPTextEncode", "fields": {"text": "clip lora positive prompt"}},
                 {"id": 1, "type_id": "comfy/CheckpointLoaderSimple", "fields": {"ckpt_name": "stub"}},
             ],
         }
@@ -570,6 +617,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             require(wrong_status == 501, "wrong typed link did not return HTTP 501", blockers)
             require("expected CONDITIONING" in wrong_text, "wrong typed link response did not name expected type", blockers)
 
+            lora_clip_status, lora_clip_data, lora_clip_text = http_json(
+                "POST", f"{base_url}/v1/generate", lora_clip_unsupported_workflow_request()
+            )
+            report["lora_clip_unsupported"] = {"status": lora_clip_status, "body": lora_clip_data}
+            require(lora_clip_status == 501, "LoraLoader CLIP-side graph did not return HTTP 501", blockers)
+            require(
+                "CLIP_LORA_UNSUPPORTED" in lora_clip_text,
+                "LoraLoader CLIP-side graph response did not name unsupported CLIP LoRA semantics",
+                blockers,
+            )
+
             unsupported_api_status, unsupported_api_data, unsupported_api_text = http_json(
                 "POST", f"{base_url}/v1/generate", unsupported_comfy_api_prompt_request()
             )
@@ -666,7 +724,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         require(loras[0].get("weight") == 0.8, "LoRA graph strength_model missing", blockers)
                     require(lora_genparams.get("workflow_source") == "typed_linked_graph", "LoRA workflow source missing", blockers)
                     require(lora_genparams.get("workflow_node_count") == 8, "LoRA workflow node count missing", blockers)
-                    require(lora_genparams.get("workflow_edge_count") == 10, "LoRA workflow edge count missing", blockers)
+                    require(lora_genparams.get("workflow_edge_count") == 11, "LoRA workflow edge count missing", blockers)
 
             mask_status, mask_data, mask_text = http_json("POST", f"{base_url}/v1/generate", mask_workflow_request())
             report["mask_generate"] = {"status": mask_status, "body": mask_data}
@@ -995,6 +1053,7 @@ def main() -> int:
     print("  unsupported_node: HTTP 501")
     print("  unsupported_comfy_api_node: HTTP 501")
     print("  wrong_type_link: HTTP 501")
+    print("  lora_clip_unsupported: HTTP 501")
     print(f"  img2img_job_id: {report['img2img_job']['id']}")
     print(f"  img2img_png: {report['img2img_png']['path']}")
     print(f"  lora_job_id: {report['lora_job']['id']}")

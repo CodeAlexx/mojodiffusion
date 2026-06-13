@@ -52,7 +52,7 @@ from serenitymojo.sampling.sampler_registry import (
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
     reject_unsupported_reference_image_params, reject_unsupported_mask_image_params,
-    reject_unsupported_lanpaint_params,
+    reject_unsupported_inpaint_conditioning_params, reject_unsupported_lanpaint_params,
 )
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 
@@ -359,6 +359,7 @@ struct Ideogram4Backend(GenBackend, Movable):
             raise Error("Ideogram4Backend.start: a job is already running")
         reject_unsupported_common_runtime_params(params, String("ideogram4"))
         reject_unsupported_reference_image_params(params, String("ideogram4"))
+        reject_unsupported_inpaint_conditioning_params(params, String("ideogram4"))
         reject_unsupported_mask_image_params(params, String("ideogram4"))
         reject_unsupported_lanpaint_params(params, String("ideogram4"))
         var sampler_admission = sampler_admission_for_backend(String("ideogram4"), params.sampler)

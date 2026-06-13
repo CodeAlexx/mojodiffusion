@@ -90,6 +90,7 @@ SUPPORTED_NODE_TYPES = [
     "ImageScaleToTotalPixels",
     "ImagePadForOutpaint",
     "ThresholdMask",
+    "InpaintModelConditioning",
     "ReferenceLatent",
     "6007e698-2ebd-4917-84d8-299b35d7b7ab",
     "f07d2d08-2bc5-4dd8-a9f0-f2347c6b5cca",
@@ -125,7 +126,6 @@ UNSUPPORTED_NODE_EXAMPLES = [
     "LanPaint_SamplerCustom",
     "TextEncodeQwenImageEdit",
     "TextEncodeQwenImageEditPlus",
-    "InpaintModelConditioning",
 ]
 
 
@@ -540,6 +540,27 @@ def check_supported_nodes() -> list[Check]:
             WORKFLOW_GRAPH,
             "apply_typed_workflow_graph",
             category="workflow",
+            label="InpaintModelConditioning graph lowering",
+            needles=[
+                "InpaintModelConditioning",
+                "inpaint_conditioning_image",
+                "inpaint_conditioning_mask",
+                "inpaint_conditioning_noise_mask",
+                "workflow graph InpaintModelConditioning missing required typed input",
+                'String("positive"), String("CONDITIONING")',
+                'String("negative"), String("CONDITIONING")',
+                'String("LATENT"), String("LATENT")',
+                "concat conditioning",
+            ],
+            severity=P0,
+            acceptance="Comfy InpaintModelConditioning imports preserve its conditioning-side concat metadata and do not collapse the node into plain SetLatentNoiseMask runtime parity.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "apply_typed_workflow_graph",
+            category="workflow",
             label="typed linked graph IR executor",
             needles=[
                 "_workflow_find_input_link",
@@ -882,6 +903,20 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             BACKEND,
             category="workflow",
+            label="InpaintModelConditioning runtime contract helper",
+            needles=[
+                "inpaint_conditioning_image",
+                "inpaint_conditioning_mask",
+                "inpaint_conditioning_noise_mask",
+                "reject_unsupported_inpaint_conditioning_params",
+                "Comfy InpaintModelConditioning concat conditioning is not supported",
+            ],
+            severity=P1,
+            acceptance="Comfy InpaintModelConditioning concat_latent_image/concat_mask metadata is explicit and real backends fail loud until they implement the conditioning path.",
+        ),
+        check_contains(
+            BACKEND,
+            category="workflow",
             label="LanPaint sampler runtime contract helper",
             needles=[
                 "has_lanpaint_runtime_params",
@@ -937,6 +972,21 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             DAEMON,
             category="workflow",
+            label="daemon parses InpaintModelConditioning genparams",
+            needles=[
+                'p.inpaint_conditioning_image = _opt_str(obj, "inpaint_conditioning_image", String(""))',
+                'p.inpaint_conditioning_mask = _opt_str(obj, "inpaint_conditioning_mask", String(""))',
+                'p.inpaint_conditioning_noise_mask = _opt_bool(obj, "inpaint_conditioning_noise_mask", False)',
+                'o.set("inpaint_conditioning_image", JSONValue.from_string(p.inpaint_conditioning_image))',
+                'o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))',
+                'o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))',
+            ],
+            severity=P1,
+            acceptance="InpaintModelConditioning metadata survives parse_generate and canonical PNG/job metadata.",
+        ),
+        check_contains(
+            DAEMON,
+            category="workflow",
             label="daemon parses LanPaint genparams",
             needles=[
                 'p.lanpaint_num_steps = _opt_int(obj, "lanpaint_num_steps", -1, -1, 4096)',
@@ -974,6 +1024,21 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             IPC_CODEC,
             category="workflow",
+            label="worker IPC preserves InpaintModelConditioning genparams",
+            needles=[
+                'o.set("inpaint_conditioning_image", JSONValue.from_string(p.inpaint_conditioning_image))',
+                'o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))',
+                'o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))',
+                'p.inpaint_conditioning_image = obj["inpaint_conditioning_image"].as_string()',
+                'p.inpaint_conditioning_mask = obj["inpaint_conditioning_mask"].as_string()',
+                'p.inpaint_conditioning_noise_mask = obj["inpaint_conditioning_noise_mask"].as_bool()',
+            ],
+            severity=P1,
+            acceptance="Process-isolated worker IPC does not drop InpaintModelConditioning metadata.",
+        ),
+        check_contains(
+            IPC_CODEC,
+            category="workflow",
             label="worker IPC preserves LanPaint genparams",
             needles=[
                 'o.set("lanpaint_num_steps", JSONValue.from_int(p.lanpaint_num_steps))',
@@ -995,6 +1060,17 @@ def check_family_surfaces() -> list[Check]:
             ],
             severity=P1,
             acceptance="Z-Image img2img does not silently consume Comfy ReferenceLatent/Klein edit metadata.",
+        ),
+        check_contains(
+            ZIMAGE_BACKEND,
+            category="workflow",
+            label="Z-Image rejects InpaintModelConditioning metadata",
+            needles=[
+                "reject_unsupported_inpaint_conditioning_params",
+                'reject_unsupported_inpaint_conditioning_params(params, String("zimage"))',
+            ],
+            severity=P1,
+            acceptance="Z-Image preserve-mask img2img does not silently consume Comfy InpaintModelConditioning concat conditioning metadata.",
         ),
         check_contains(
             ZIMAGE_BACKEND,
@@ -1101,6 +1177,17 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             QWEN_BACKEND,
             category="workflow",
+            label="Qwen rejects InpaintModelConditioning metadata",
+            needles=[
+                "reject_unsupported_inpaint_conditioning_params",
+                'reject_unsupported_inpaint_conditioning_params(params, String("qwenimage"))',
+            ],
+            severity=P1,
+            acceptance="Qwen-Image does not silently consume Comfy InpaintModelConditioning concat conditioning metadata.",
+        ),
+        check_contains(
+            QWEN_BACKEND,
+            category="workflow",
             label="Qwen rejects LanPaint metadata",
             needles=[
                 'reject_unsupported_lanpaint_params(params, String("qwenimage"))',
@@ -1131,6 +1218,17 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             IDEOGRAM4_BACKEND,
             category="workflow",
+            label="Ideogram4 rejects InpaintModelConditioning metadata",
+            needles=[
+                "reject_unsupported_inpaint_conditioning_params",
+                'reject_unsupported_inpaint_conditioning_params(params, String("ideogram4"))',
+            ],
+            severity=P1,
+            acceptance="Ideogram4 does not silently consume Comfy InpaintModelConditioning concat conditioning metadata.",
+        ),
+        check_contains(
+            IDEOGRAM4_BACKEND,
+            category="workflow",
             label="Ideogram4 rejects LanPaint metadata",
             needles=[
                 'reject_unsupported_lanpaint_params(params, String("ideogram4"))',
@@ -1147,6 +1245,17 @@ def check_family_surfaces() -> list[Check]:
             ],
             severity=P1,
             acceptance="Klein ReferenceLatent edit does not silently consume LanPaint sampler or blend metadata.",
+        ),
+        check_contains(
+            KLEIN_BACKEND,
+            category="workflow",
+            label="Klein rejects InpaintModelConditioning metadata",
+            needles=[
+                "reject_unsupported_inpaint_conditioning_params",
+                'reject_unsupported_inpaint_conditioning_params(params, String("klein"))',
+            ],
+            severity=P1,
+            acceptance="Klein ReferenceLatent edit does not silently consume Comfy InpaintModelConditioning concat conditioning metadata.",
         ),
         check_contains(
             SAMPLER_REGISTRY,
@@ -2389,6 +2498,10 @@ def check_workflow_graph_product_report() -> Check:
     api_png = report.get("comfy_api_png")
     outpaint_threshold_api_job = report.get("outpaint_threshold_api_job")
     outpaint_threshold_api_png = report.get("outpaint_threshold_api_png")
+    inpaint_conditioning_api_job = report.get("inpaint_conditioning_api_job")
+    inpaint_conditioning_api_png = report.get("inpaint_conditioning_api_png")
+    inpaint_conditioning_no_noise_mask_api_job = report.get("inpaint_conditioning_no_noise_mask_api_job")
+    inpaint_conditioning_no_noise_mask_api_png = report.get("inpaint_conditioning_no_noise_mask_api_png")
     img_job = report.get("img2img_job")
     img_png = report.get("img2img_png")
     lora_job = report.get("lora_job")
@@ -2407,6 +2520,7 @@ def check_workflow_graph_product_report() -> Check:
     ideogram4_evidence = prefixed_evidence(report, "ideogram4_visual_export")
     unsupported_api = report.get("unsupported_comfy_api_node")
     lora_clip_unsupported = report.get("lora_clip_unsupported")
+    inpaint_conditioning_missing_mask = report.get("inpaint_conditioning_missing_mask")
     if (
         not isinstance(job, dict)
         or not isinstance(png, dict)
@@ -2414,6 +2528,10 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(api_png, dict)
         or not isinstance(outpaint_threshold_api_job, dict)
         or not isinstance(outpaint_threshold_api_png, dict)
+        or not isinstance(inpaint_conditioning_api_job, dict)
+        or not isinstance(inpaint_conditioning_api_png, dict)
+        or not isinstance(inpaint_conditioning_no_noise_mask_api_job, dict)
+        or not isinstance(inpaint_conditioning_no_noise_mask_api_png, dict)
         or not isinstance(img_job, dict)
         or not isinstance(img_png, dict)
         or not isinstance(lora_job, dict)
@@ -2428,13 +2546,14 @@ def check_workflow_graph_product_report() -> Check:
         or not isinstance(basic_scheduler_png, dict)
         or not isinstance(unsupported_api, dict)
         or not isinstance(lora_clip_unsupported, dict)
+        or not isinstance(inpaint_conditioning_missing_mask, dict)
     ):
         return Check(
             False,
             P1,
             "workflow",
             "typed workflow graph product smoke",
-            "report missing linked graph, Comfy API prompt, outpaint ThresholdMask API import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
+            "report missing linked graph, Comfy API prompt, outpaint ThresholdMask API import, InpaintModelConditioning API import, LoRA, ZImageLoraModelOnly, LoRA CLIP reject, img2img, mask, outpaint preprocessing, BasicScheduler, or unsupported-node evidence",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2445,6 +2564,16 @@ def check_workflow_graph_product_report() -> Check:
             "workflow",
             "typed workflow graph product smoke",
             "LoraLoader CLIP-side unsupported report did not return HTTP 501",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    if inpaint_conditioning_missing_mask.get("status") != 501:
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "InpaintModelConditioning missing-mask unsupported report did not return HTTP 501",
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
@@ -2598,6 +2727,54 @@ def check_workflow_graph_product_report() -> Check:
             rel(WORKFLOW_GRAPH_PRODUCT),
             WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
         )
+    inpaint_genparams = inpaint_conditioning_api_png.get("genparams")
+    if (
+        not isinstance(inpaint_genparams, dict)
+        or inpaint_genparams.get("workflow_source") != "comfy_api_prompt_graph"
+        or inpaint_genparams.get("workflow_save_prefix") != "inpaint-conditioning-graph"
+        or inpaint_genparams.get("prompt") != "inpaint conditioning positive prompt"
+        or inpaint_genparams.get("negative") != "inpaint conditioning negative prompt"
+        or inpaint_genparams.get("init_image") != "/tmp/serenity_inpaint_conditioning.png"
+        or inpaint_genparams.get("mask_image") != "/tmp/serenity_inpaint_conditioning.png"
+        or inpaint_genparams.get("lanpaint_mask_channel") != "load_image_mask"
+        or inpaint_genparams.get("inpaint_conditioning_image") != "/tmp/serenity_inpaint_conditioning.png"
+        or inpaint_genparams.get("inpaint_conditioning_mask") != "/tmp/serenity_inpaint_conditioning.png"
+        or inpaint_genparams.get("inpaint_conditioning_noise_mask") is not True
+        or inpaint_genparams.get("workflow_node_count") != 8
+        or inpaint_genparams.get("workflow_edge_count") != 14
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "InpaintModelConditioning default-noise-mask Comfy API import metadata missing from product report",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
+    inpaint_no_noise_genparams = inpaint_conditioning_no_noise_mask_api_png.get("genparams")
+    if (
+        not isinstance(inpaint_no_noise_genparams, dict)
+        or inpaint_no_noise_genparams.get("workflow_source") != "comfy_api_prompt_graph"
+        or inpaint_no_noise_genparams.get("workflow_save_prefix") != "inpaint-conditioning-no-noise-mask"
+        or inpaint_no_noise_genparams.get("init_image") != "/tmp/serenity_inpaint_conditioning.png"
+        or inpaint_no_noise_genparams.get("mask_image") != ""
+        or inpaint_no_noise_genparams.get("lanpaint_mask_channel") != ""
+        or inpaint_no_noise_genparams.get("inpaint_conditioning_image") != "/tmp/serenity_inpaint_conditioning.png"
+        or inpaint_no_noise_genparams.get("inpaint_conditioning_mask") != "/tmp/serenity_inpaint_conditioning.png"
+        or inpaint_no_noise_genparams.get("inpaint_conditioning_noise_mask") is not False
+        or inpaint_no_noise_genparams.get("workflow_node_count") != 8
+        or inpaint_no_noise_genparams.get("workflow_edge_count") != 14
+    ):
+        return Check(
+            False,
+            P1,
+            "workflow",
+            "typed workflow graph product smoke",
+            "InpaintModelConditioning noise_mask=false Comfy API import metadata missing or collapsed into mask_image",
+            rel(WORKFLOW_GRAPH_PRODUCT),
+            WORKFLOW_GRAPH_SMOKE_ACCEPTANCE,
+        )
     basic_scheduler_genparams = basic_scheduler_png.get("genparams")
     if (
         not isinstance(basic_scheduler_genparams, dict)
@@ -2667,6 +2844,8 @@ def check_workflow_graph_product_report() -> Check:
         f"BasicScheduler graph completed {basic_scheduler_job.get('id')}; "
         f"Comfy API prompt completed {api_job.get('id')}; "
         f"outpaint ThresholdMask API completed {outpaint_threshold_api_job.get('id')}; "
+        f"InpaintModelConditioning API completed {inpaint_conditioning_api_job.get('id')}; "
+        f"InpaintModelConditioning noise_mask=false API completed {inpaint_conditioning_no_noise_mask_api_job.get('id')}; "
         "unsupported and wrong-type links returned HTTP 501"
     )
     sf_cases = report.get("serenityflow_t2i")

@@ -69,6 +69,12 @@ struct JobParams(Copyable, Movable):
     # latent. Backends must either execute mask semantics or reject it loudly.
     var mask_image: String
     var lanpaint_mask_channel: String
+    # Comfy InpaintModelConditioning carries concat_latent_image/concat_mask on
+    # conditioning, which is richer than SetLatentNoiseMask. Backends must
+    # implement that conditioning path or reject it loudly.
+    var inpaint_conditioning_image: String
+    var inpaint_conditioning_mask: String
+    var inpaint_conditioning_noise_mask: Bool
     var outpaint_left: Int
     var outpaint_top: Int
     var outpaint_right: Int
@@ -128,6 +134,9 @@ struct JobParams(Copyable, Movable):
         self.init_image = String("")
         self.mask_image = String("")
         self.lanpaint_mask_channel = String("")
+        self.inpaint_conditioning_image = String("")
+        self.inpaint_conditioning_mask = String("")
+        self.inpaint_conditioning_noise_mask = False
         self.outpaint_left = -1
         self.outpaint_top = -1
         self.outpaint_right = -1
@@ -199,6 +208,21 @@ def reject_unsupported_mask_image_params(
         raise Error(
             backend_name
             + String(": Comfy SetLatentNoiseMask/inpaint mask conditioning is not supported by this backend yet")
+        )
+
+
+def reject_unsupported_inpaint_conditioning_params(
+    params: JobParams, backend_name: String
+) raises:
+    """Reject Comfy InpaintModelConditioning fields on backends that do not
+    implement concat_latent_image/concat_mask conditioning."""
+    if (
+        params.inpaint_conditioning_image.byte_length() > 0
+        or params.inpaint_conditioning_mask.byte_length() > 0
+    ):
+        raise Error(
+            backend_name
+            + String(": Comfy InpaintModelConditioning concat conditioning is not supported by this backend yet")
         )
 
 

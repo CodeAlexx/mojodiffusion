@@ -237,6 +237,14 @@ def _opt_str(obj: JSONValue, key: String, dflt: String) raises -> String:
     return obj[key].as_string()
 
 
+def _opt_bool(obj: JSONValue, key: String, dflt: Bool) raises -> Bool:
+    if not obj.contains(key) or obj[key].is_null():
+        return dflt
+    if not obj[key].is_bool():
+        raise Error("'" + key + "' must be a boolean")
+    return obj[key].as_bool()
+
+
 def _workflow_string(obj: JSONValue, key: String) raises -> String:
     if not obj.is_object() or not obj.contains(key) or obj[key].is_null():
         return String("")
@@ -1257,6 +1265,9 @@ def parse_generate(
     p.init_image = _opt_str(obj, "init_image", String(""))
     p.mask_image = _opt_str(obj, "mask_image", String(""))
     p.lanpaint_mask_channel = _opt_str(obj, "lanpaint_mask_channel", String(""))
+    p.inpaint_conditioning_image = _opt_str(obj, "inpaint_conditioning_image", String(""))
+    p.inpaint_conditioning_mask = _opt_str(obj, "inpaint_conditioning_mask", String(""))
+    p.inpaint_conditioning_noise_mask = _opt_bool(obj, "inpaint_conditioning_noise_mask", False)
     p.outpaint_left = _opt_int(obj, "outpaint_left", -1, -1, 4096)
     p.outpaint_top = _opt_int(obj, "outpaint_top", -1, -1, 4096)
     p.outpaint_right = _opt_int(obj, "outpaint_right", -1, -1, 4096)
@@ -1322,6 +1333,8 @@ def parse_generate(
             raise Error("ideogram4: negative prompt is not supported in this bounded slice")
         if len(p.loras) > 0:
             raise Error("ideogram4: LoRA is not supported in this bounded slice")
+        if p.inpaint_conditioning_image.byte_length() > 0 or p.inpaint_conditioning_mask.byte_length() > 0:
+            raise Error("ideogram4: InpaintModelConditioning concat conditioning is not supported in this bounded slice")
         if p.init_image.byte_length() > 0:
             raise Error("ideogram4: img2img/init image is not supported in this bounded slice")
         if p.mask_image.byte_length() > 0:
@@ -1371,6 +1384,9 @@ def parse_generate(
     o.set("init_image", JSONValue.from_string(p.init_image))
     o.set("mask_image", JSONValue.from_string(p.mask_image))
     o.set("lanpaint_mask_channel", JSONValue.from_string(p.lanpaint_mask_channel))
+    o.set("inpaint_conditioning_image", JSONValue.from_string(p.inpaint_conditioning_image))
+    o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))
+    o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))
     o.set("outpaint_left", JSONValue.from_int(p.outpaint_left))
     o.set("outpaint_top", JSONValue.from_int(p.outpaint_top))
     o.set("outpaint_right", JSONValue.from_int(p.outpaint_right))

@@ -54,6 +54,9 @@ def encode_start(p: JobParams) raises -> String:
     o.set("init_image", JSONValue.from_string(p.init_image))
     o.set("mask_image", JSONValue.from_string(p.mask_image))
     o.set("lanpaint_mask_channel", JSONValue.from_string(p.lanpaint_mask_channel))
+    o.set("inpaint_conditioning_image", JSONValue.from_string(p.inpaint_conditioning_image))
+    o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))
+    o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))
     o.set("outpaint_left", JSONValue.from_int(p.outpaint_left))
     o.set("outpaint_top", JSONValue.from_int(p.outpaint_top))
     o.set("outpaint_right", JSONValue.from_int(p.outpaint_right))
@@ -128,6 +131,12 @@ def decode_start(obj: JSONValue) raises -> JobParams:
         p.mask_image = obj["mask_image"].as_string()
     if obj.contains("lanpaint_mask_channel") and not obj["lanpaint_mask_channel"].is_null():
         p.lanpaint_mask_channel = obj["lanpaint_mask_channel"].as_string()
+    if obj.contains("inpaint_conditioning_image") and not obj["inpaint_conditioning_image"].is_null():
+        p.inpaint_conditioning_image = obj["inpaint_conditioning_image"].as_string()
+    if obj.contains("inpaint_conditioning_mask") and not obj["inpaint_conditioning_mask"].is_null():
+        p.inpaint_conditioning_mask = obj["inpaint_conditioning_mask"].as_string()
+    if obj.contains("inpaint_conditioning_noise_mask") and not obj["inpaint_conditioning_noise_mask"].is_null():
+        p.inpaint_conditioning_noise_mask = obj["inpaint_conditioning_noise_mask"].as_bool()
     if obj.contains("outpaint_left") and not obj["outpaint_left"].is_null():
         p.outpaint_left = Int(obj["outpaint_left"].as_float())
     if obj.contains("outpaint_top") and not obj["outpaint_top"].is_null():

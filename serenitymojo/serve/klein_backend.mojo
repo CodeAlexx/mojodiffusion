@@ -20,7 +20,9 @@ from serenitymojo.io.ffi import (
 )
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
-    reject_unsupported_mask_image_params, reject_unsupported_lanpaint_params,
+    reject_unsupported_mask_image_params,
+    reject_unsupported_inpaint_conditioning_params,
+    reject_unsupported_lanpaint_params,
 )
 from serenitymojo.serve.external_command import ExternalCommand
 from serenitymojo.serve.image_io import decode_image_any
@@ -200,6 +202,7 @@ def _joint_dim_for_variant(variant: String) -> Int:
 
 def _validate_klein_request(params: JobParams) raises:
     reject_unsupported_common_runtime_params(params, String("klein"))
+    reject_unsupported_inpaint_conditioning_params(params, String("klein"))
     reject_unsupported_mask_image_params(params, String("klein"))
     reject_unsupported_lanpaint_params(params, String("klein"))
     var model = _lower(params.model)

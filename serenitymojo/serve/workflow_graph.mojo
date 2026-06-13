@@ -164,6 +164,38 @@ def _workflow_widget_float(widgets: JSONValue, idx: Int, dflt: Float64) raises -
     return dflt
 
 
+def _workflow_widget_bool(widgets: JSONValue, idx: Int, dflt: Bool) raises -> Bool:
+    if not widgets.is_array() or idx < 0 or idx >= widgets.length() or widgets[idx].is_null():
+        return dflt
+    if widgets[idx].is_bool():
+        return widgets[idx].as_bool()
+    if widgets[idx].is_int():
+        return widgets[idx].as_int() != 0
+    if widgets[idx].is_string():
+        var lower = String(widgets[idx].as_string().lower())
+        if lower == "true" or lower == "yes" or lower == "1":
+            return True
+        if lower == "false" or lower == "no" or lower == "0":
+            return False
+    return dflt
+
+
+def _workflow_bool(obj: JSONValue, key: String, dflt: Bool) raises -> Bool:
+    if not obj.is_object() or not obj.contains(key) or obj[key].is_null():
+        return dflt
+    if obj[key].is_bool():
+        return obj[key].as_bool()
+    if obj[key].is_int():
+        return obj[key].as_int() != 0
+    if obj[key].is_string():
+        var lower = String(obj[key].as_string().lower())
+        if lower == "true" or lower == "yes" or lower == "1":
+            return True
+        if lower == "false" or lower == "no" or lower == "0":
+            return False
+    raise Error("[501] workflow graph field " + key + " must be a boolean")
+
+
 def _workflow_has_prompt_override(mut obj: JSONValue) raises -> Bool:
     if obj.contains("prompt") and obj["prompt"].is_string() and obj["prompt"].as_string() != "":
         return True
@@ -660,6 +692,12 @@ def _comfy_ui_output_port(nodes: JSONValue, src_id: Int, src_slot: Int) raises -
     var out = outputs[src_slot]
     var typ = _workflow_string(out, String("type"))
     var name = _workflow_string(out, String("name"))
+    var node_type = _workflow_canonical_type_id(_workflow_node_type(node))
+    if node_type == "InpaintModelConditioning":
+        if name == "positive" or name == "negative":
+            return name^
+        if typ == "LATENT" or name == "latent":
+            return String("LATENT")
     if name == "CONDITIONING_1":
         return name^
     if typ == "INT":
@@ -786,6 +824,8 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("feathering", JSONValue.from_int(_workflow_widget_int(widgets, 4, 40)))
     elif type_id == "ThresholdMask":
         fields.set("value", JSONValue.from_float(_workflow_widget_float(widgets, 0, 0.5)))
+    elif type_id == "InpaintModelConditioning":
+        fields.set("noise_mask", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, True)))
     elif type_id == "SaveImage":
         fields.set("filename_prefix", JSONValue.from_string(_workflow_widget_string(widgets, 0, String("ComfyUI"))))
     elif type_id == "ImageToMask":
@@ -983,6 +1023,13 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "ThresholdMask":
         if slot == 0:
             return String("MASK")
+    elif typ == "InpaintModelConditioning":
+        if slot == 0:
+            return String("positive")
+        if slot == 1:
+            return String("negative")
+        if slot == 2:
+            return String("LATENT")
     elif typ == "GetImageSize":
         if slot == 0:
             return String("width")
@@ -1151,6 +1198,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "ImageScaleToTotalPixels"
             or type_id == "ImagePadForOutpaint"
             or type_id == "ThresholdMask"
+            or type_id == "InpaintModelConditioning"
             or type_id == "ReferenceLatent"
             or type_id == "6007e698-2ebd-4917-84d8-299b35d7b7ab"
             or type_id == "f07d2d08-2bc5-4dd8-a9f0-f2347c6b5cca"
@@ -1496,6 +1544,55 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
                         latent_init_images.append(String(""))
                         latent_mask_images.append(mask_path)
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "InpaintModelConditioning":
+                var pos_link = _workflow_find_input_link(edges, node_id, String("positive"))
+                var neg_link = _workflow_find_input_link(edges, node_id, String("negative"))
+                var vae_link = _workflow_find_input_link(edges, node_id, String("vae"))
+                var pixels_link = _workflow_find_input_link(edges, node_id, String("pixels"))
+                var mask_link = _workflow_find_input_link(edges, node_id, String("mask"))
+                if not pos_link.found or not neg_link.found or not vae_link.found or not pixels_link.found or not mask_link.found:
+                    raise Error("[501] workflow graph InpaintModelConditioning missing required typed input")
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, pos_link.node_id, pos_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, neg_link.node_id, neg_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, vae_link.node_id, vae_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, pixels_link.node_id, pixels_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, mask_link.node_id, mask_link.port) >= 0
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, pos_link, String("CONDITIONING"), String("positive"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, neg_link, String("CONDITIONING"), String("negative"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, vae_link, String("VAE"), String("vae"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, pixels_link, String("IMAGE"), String("pixels"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, mask_link, String("MASK"), String("mask"))
+                    var positive_text = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, pos_link)
+                    var negative_text = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, neg_link)
+                    var image_path = _workflow_image_path(image_nodes, image_ports, image_paths, pixels_link)
+                    var mask_path = _workflow_image_path(mask_nodes, mask_ports, mask_paths, mask_link)
+                    var mask_source = _workflow_source_meta(mask_nodes, mask_ports, mask_sources, mask_link)
+                    var noise_mask = _workflow_bool(fields, String("noise_mask"), True)
+                    # Comfy also attaches concat conditioning metadata; real
+                    # backends must implement that path before accepting it.
+                    _set_if_missing(obj, String("init_image"), JSONValue.from_string(image_path))
+                    _set_if_missing(obj, String("inpaint_conditioning_image"), JSONValue.from_string(image_path))
+                    _set_if_missing(obj, String("inpaint_conditioning_mask"), JSONValue.from_string(mask_path))
+                    _set_if_missing(obj, String("inpaint_conditioning_noise_mask"), JSONValue.from_bool(noise_mask))
+                    if noise_mask:
+                        _set_if_missing(obj, String("mask_image"), JSONValue.from_string(mask_path))
+                        _set_if_missing(obj, String("lanpaint_mask_channel"), JSONValue.from_string(mask_source))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("positive"), String("CONDITIONING"))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("negative"), String("CONDITIONING"))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
+                    cond_nodes.append(node_id); cond_ports.append(String("positive")); cond_texts.append(positive_text)
+                    cond_nodes.append(node_id); cond_ports.append(String("negative")); cond_texts.append(negative_text)
+                    latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
+                    latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
+                    latent_init_images.append(image_path)
+                    if noise_mask:
+                        latent_mask_images.append(mask_path)
+                    else:
+                        latent_mask_images.append(String(""))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "f07d2d08-2bc5-4dd8-a9f0-f2347c6b5cca":
                 var vae_link = _workflow_find_input_link(edges, node_id, String("vae"))
@@ -1931,6 +2028,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "variation_seed", "variation_strength", "images", "init_image", "creativity",
             "workflow_save_prefix",
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
+            "inpaint_conditioning_image", "inpaint_conditioning_mask", "inpaint_conditioning_noise_mask",
             "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
             "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
@@ -1956,6 +2054,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
             "variation_seed", "variation_strength", "images", "init_image", "creativity",
             "workflow_save_prefix",
             "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
+            "inpaint_conditioning_image", "inpaint_conditioning_mask", "inpaint_conditioning_noise_mask",
             "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
             "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
             "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",

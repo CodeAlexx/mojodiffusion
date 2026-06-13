@@ -398,6 +398,61 @@ def outpaint_threshold_comfy_api_prompt_request() -> dict[str, Any]:
     }
 
 
+def inpaint_conditioning_comfy_api_prompt_request(noise_mask: bool = True) -> dict[str, Any]:
+    inputs: dict[str, Any] = {
+        "positive": ["3", 0],
+        "negative": ["2", 0],
+        "vae": ["1", 2],
+        "pixels": ["4", 0],
+        "mask": ["4", 1],
+    }
+    if not noise_mask:
+        inputs["noise_mask"] = False
+    prefix = "inpaint-conditioning-graph" if noise_mask else "inpaint-conditioning-no-noise-mask"
+    seed = 66789 if noise_mask else 66790
+    return {
+        "workflow": {
+            "prompt": {
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "stub"}},
+                "2": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"clip": ["1", 1], "text": "inpaint conditioning negative prompt"},
+                },
+                "3": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"clip": ["1", 1], "text": "inpaint conditioning positive prompt"},
+                },
+                "4": {"class_type": "LoadImage", "inputs": {"image": "/tmp/serenity_inpaint_conditioning.png"}},
+                "5": {"class_type": "InpaintModelConditioning", "inputs": inputs},
+                "6": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "model": ["1", 0],
+                        "positive": ["5", 0],
+                        "negative": ["5", 1],
+                        "latent_image": ["5", 2],
+                        "steps": 4,
+                        "seed": seed,
+                        "cfg": 2.75,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 0.6,
+                    },
+                },
+                "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+                "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": prefix}},
+            }
+        }
+    }
+
+
+def inpaint_conditioning_missing_mask_comfy_api_prompt_request() -> dict[str, Any]:
+    request = inpaint_conditioning_comfy_api_prompt_request()
+    prompt = request["workflow"]["prompt"]
+    del prompt["5"]["inputs"]["mask"]
+    return request
+
+
 def serenityflow_template_request(template: Path) -> dict[str, Any]:
     return {"workflow": json.loads(template.read_text(encoding="utf-8"))}
 
@@ -802,6 +857,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             require(unsupported_api_status == 501, "unsupported Comfy API graph node did not return HTTP 501", blockers)
             require("ControlNetApply" in unsupported_api_text, "unsupported Comfy API response did not name ControlNetApply", blockers)
 
+            missing_inpaint_status, missing_inpaint_data, missing_inpaint_text = http_json(
+                "POST", f"{base_url}/v1/generate", inpaint_conditioning_missing_mask_comfy_api_prompt_request()
+            )
+            report["inpaint_conditioning_missing_mask"] = {
+                "status": missing_inpaint_status,
+                "body": missing_inpaint_data,
+            }
+            require(missing_inpaint_status == 501, "InpaintModelConditioning missing-mask graph did not return HTTP 501", blockers)
+            require(
+                "InpaintModelConditioning missing required typed input" in missing_inpaint_text,
+                "InpaintModelConditioning missing-mask response did not name the missing typed input",
+                blockers,
+            )
+
             request = linked_workflow_request()
             gen_status, gen_data, gen_text = http_json("POST", f"{base_url}/v1/generate", request)
             report["generate"] = {"status": gen_status, "body": gen_data}
@@ -1137,6 +1206,99 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     require(outpaint_api_genparams.get("workflow_node_count") == 11, "outpaint API workflow node count missing", blockers)
                     require(outpaint_api_genparams.get("workflow_edge_count") == 15, "outpaint API workflow edge count missing", blockers)
 
+            for inpaint_name, inpaint_noise_mask in (
+                ("inpaint_conditioning_api", True),
+                ("inpaint_conditioning_no_noise_mask_api", False),
+            ):
+                inpaint_status, inpaint_data, inpaint_text = http_json(
+                    "POST",
+                    f"{base_url}/v1/generate",
+                    inpaint_conditioning_comfy_api_prompt_request(inpaint_noise_mask),
+                )
+                report[f"{inpaint_name}_generate"] = {"status": inpaint_status, "body": inpaint_data}
+                if inpaint_status != 200 or not isinstance(inpaint_data, dict) or not inpaint_data.get("job_id"):
+                    blockers.append(f"{inpaint_name} generate failed HTTP {inpaint_status}: {inpaint_text}")
+                    continue
+                inpaint_job_id = str(inpaint_data["job_id"])
+                inpaint_job = poll_job(base_url, inpaint_job_id, args.timeout)
+                report[f"{inpaint_name}_job"] = inpaint_job
+                require(inpaint_job.get("state") == "done", f"{inpaint_name} job state was {inpaint_job.get('state')}", blockers)
+                inpaint_png_path = Path(str(inpaint_job.get("output_path") or ""))
+                require(inpaint_png_path.is_file(), f"{inpaint_name} PNG missing: {inpaint_png_path}", blockers)
+                if inpaint_png_path.is_file():
+                    inpaint_text_chunks = read_png_text(inpaint_png_path)
+                    inpaint_genparams = json.loads(inpaint_text_chunks.get(GENPARAMS_KEY, "{}"))
+                    report[f"{inpaint_name}_png"] = {
+                        "path": str(inpaint_png_path),
+                        "idat_sha256": inpaint_text_chunks.get("_idat_sha256"),
+                        "genparams": inpaint_genparams,
+                    }
+                    require(
+                        inpaint_genparams.get("prompt") == "inpaint conditioning positive prompt",
+                        f"{inpaint_name} positive prompt was not consumed",
+                        blockers,
+                    )
+                    require(
+                        inpaint_genparams.get("negative") == "inpaint conditioning negative prompt",
+                        f"{inpaint_name} negative prompt was not consumed",
+                        blockers,
+                    )
+                    require(inpaint_genparams.get("model") == "stub", f"{inpaint_name} model missing", blockers)
+                    require(
+                        inpaint_genparams.get("init_image") == "/tmp/serenity_inpaint_conditioning.png",
+                        f"{inpaint_name} init image missing",
+                        blockers,
+                    )
+                    require(
+                        inpaint_genparams.get("inpaint_conditioning_image") == "/tmp/serenity_inpaint_conditioning.png",
+                        f"{inpaint_name} conditioning image missing",
+                        blockers,
+                    )
+                    require(
+                        inpaint_genparams.get("inpaint_conditioning_mask") == "/tmp/serenity_inpaint_conditioning.png",
+                        f"{inpaint_name} conditioning mask missing",
+                        blockers,
+                    )
+                    require(
+                        inpaint_genparams.get("inpaint_conditioning_noise_mask") is inpaint_noise_mask,
+                        f"{inpaint_name} noise_mask metadata missing",
+                        blockers,
+                    )
+                    if inpaint_noise_mask:
+                        require(
+                            inpaint_genparams.get("mask_image") == "/tmp/serenity_inpaint_conditioning.png",
+                            f"{inpaint_name} latent noise mask image missing",
+                            blockers,
+                        )
+                        require(
+                            inpaint_genparams.get("lanpaint_mask_channel") == "load_image_mask",
+                            f"{inpaint_name} mask source missing",
+                            blockers,
+                        )
+                        require(
+                            inpaint_genparams.get("workflow_save_prefix") == "inpaint-conditioning-graph",
+                            f"{inpaint_name} SaveImage filename_prefix missing",
+                            blockers,
+                        )
+                        require(inpaint_genparams.get("seed") == 66789, f"{inpaint_name} seed missing", blockers)
+                    else:
+                        require(inpaint_genparams.get("mask_image") == "", f"{inpaint_name} must not set latent mask_image when noise_mask=false", blockers)
+                        require(inpaint_genparams.get("lanpaint_mask_channel") == "", f"{inpaint_name} must not set mask channel when noise_mask=false", blockers)
+                        require(
+                            inpaint_genparams.get("workflow_save_prefix") == "inpaint-conditioning-no-noise-mask",
+                            f"{inpaint_name} SaveImage filename_prefix missing",
+                            blockers,
+                        )
+                        require(inpaint_genparams.get("seed") == 66790, f"{inpaint_name} seed missing", blockers)
+                    require(inpaint_genparams.get("steps") == 4, f"{inpaint_name} KSampler steps missing", blockers)
+                    require(inpaint_genparams.get("cfg") == 2.75, f"{inpaint_name} KSampler cfg missing", blockers)
+                    require(inpaint_genparams.get("sampler") == "euler", f"{inpaint_name} sampler missing", blockers)
+                    require(inpaint_genparams.get("scheduler") == "simple", f"{inpaint_name} scheduler missing", blockers)
+                    require(inpaint_genparams.get("creativity") == 0.6, f"{inpaint_name} denoise missing", blockers)
+                    require(inpaint_genparams.get("workflow_source") == "comfy_api_prompt_graph", f"{inpaint_name} workflow source missing", blockers)
+                    require(inpaint_genparams.get("workflow_node_count") == 8, f"{inpaint_name} workflow node count missing", blockers)
+                    require(inpaint_genparams.get("workflow_edge_count") == 14, f"{inpaint_name} workflow edge count missing", blockers)
+
             report["serenityflow_t2i"] = {}
             for sf_name, expected in SERENITYFLOW_T2I_CASES.items():
                 sf_request = serenityflow_template_request(expected["template"])
@@ -1383,6 +1545,10 @@ def main() -> int:
     print(f"  comfy_api_png: {report['comfy_api_png']['path']}")
     print(f"  outpaint_threshold_api_job_id: {report['outpaint_threshold_api_job']['id']}")
     print(f"  outpaint_threshold_api_png: {report['outpaint_threshold_api_png']['path']}")
+    print(f"  inpaint_conditioning_api_job_id: {report['inpaint_conditioning_api_job']['id']}")
+    print(f"  inpaint_conditioning_api_png: {report['inpaint_conditioning_api_png']['path']}")
+    print(f"  inpaint_conditioning_no_noise_mask_api_job_id: {report['inpaint_conditioning_no_noise_mask_api_job']['id']}")
+    print(f"  inpaint_conditioning_no_noise_mask_api_png: {report['inpaint_conditioning_no_noise_mask_api_png']['path']}")
     for sf_name, sf_case in report["serenityflow_t2i"].items():
         print(f"  serenityflow_{sf_name}_job_id: {sf_case['job']['id']}")
         print(f"  serenityflow_{sf_name}_png: {sf_case['png']['path']}")

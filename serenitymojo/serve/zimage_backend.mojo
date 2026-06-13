@@ -91,7 +91,9 @@ from serenitymojo.sampling.unipc import (
 from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
-    reject_unsupported_reference_image_params, reject_unsupported_lanpaint_sampler_params,
+    reject_unsupported_reference_image_params,
+    reject_unsupported_inpaint_conditioning_params,
+    reject_unsupported_lanpaint_sampler_params,
 )
 from serenitymojo.serve.image_io import (
     apply_lanpaint_mask_blend_signed_chw, decode_image_any,
@@ -425,6 +427,7 @@ struct ZImageBackend(GenBackend, Movable):
             raise Error("ZImageBackend.start: a job is already running")
         reject_unsupported_common_runtime_params(params, String("zimage"))
         reject_unsupported_reference_image_params(params, String("zimage"))
+        reject_unsupported_inpaint_conditioning_params(params, String("zimage"))
         reject_unsupported_lanpaint_sampler_params(params, String("zimage"))
         var sampler_admission = sampler_admission_for_backend(String("zimage"), params.sampler)
         if not sampler_admission.supported:

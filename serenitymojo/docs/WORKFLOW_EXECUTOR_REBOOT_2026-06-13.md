@@ -254,6 +254,49 @@ are still blocked/fail-loud for real backends. This slice is graph/metadata
 plumbing with stub product proof, not accepted outpaint or LanPaint runtime
 parity.
 
+## InpaintModelConditioning Graph-Import Handoff
+
+The current `InpaintModelConditioning` slice implements bounded Comfy graph/API
+import and metadata plumbing only, not runtime parity. The Comfy oracle node
+gray-fills masked pixels, VAE-encodes that image as the concat latent, separately
+VAE-encodes the original pixels as the output latent, optionally stores latent
+`noise_mask`, and attaches `concat_latent_image` plus `concat_mask`
+conditioning metadata to both positive and negative conditioning.
+
+The importer preserves the `noise_mask=true` versus `noise_mask=false`
+distinction. With `noise_mask=true`, it maps mask metadata through
+`mask_image`/`lanpaint_mask_channel` for the legacy preserve-mask path. With
+`noise_mask=false`, those legacy fields stay empty, but the graph still records
+`inpaint_conditioning_image`, `inpaint_conditioning_mask`, and
+`inpaint_conditioning_noise_mask`.
+
+Product proof:
+
+- `job-0496`: `InpaintModelConditioning` API import with `noise_mask=true`.
+- `job-0497`: `InpaintModelConditioning` API import with `noise_mask=false`.
+- `job-0487`..`job-0505`: full product smoke run covering this slice.
+
+Build note: `pixi run build-daemon` hit exit 137 twice on the full build. A
+low-memory manual build succeeded with:
+
+```bash
+mkdir -p output/bin
+pixi run mojo build --num-threads 1 --no-optimization \
+  -I . -I /home/alex/MOJO-libs \
+  -Xlinker -lm -Xlinker -lcuda \
+  -Xlinker -Lserenitymojo/ops/cshim/lib \
+  -Xlinker -lserenity_cudnn_sdpa \
+  -Xlinker -rpath \
+  -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib \
+  serenitymojo/serve/serenity_daemon.mojo \
+  -o output/bin/serenity_daemon
+```
+
+Runtime boundary: real backends must continue to reject
+`InpaintModelConditioning` metadata via
+`reject_unsupported_inpaint_conditioning_params(...)` until concat conditioning
+runtime parity is implemented.
+
 Validation passed:
 
 ```bash
@@ -307,7 +350,7 @@ Currently accepted graph nodes:
   `LoraLoaderModelOnly`, `CLIPLoader`, `DualCLIPLoader`, `TripleCLIPLoader`,
   `VAELoader`
 - conditioning: `CLIPTextEncode`, `CLIPTextEncodeFlux`, `ConditioningZeroOut`,
-  `FluxGuidance`
+  `FluxGuidance`, `InpaintModelConditioning`
 - latent/image: `LoadImage`, `EmptyLatentImage`, `EmptySD3LatentImage`,
   `EmptyFlux2LatentImage`, `ImageToMask`, `MaskToImage`, `VAEEncode`,
   `SetLatentNoiseMask`, `GetImageSize`, `ImageScale`,
@@ -331,6 +374,11 @@ thresholding. `ImageToMask(alpha)` fails loud from graph lowering because Comfy
 `SetLatentNoiseMask` can attach that mask to a `LATENT`, and
 `KSampler`/`SamplerCustomAdvanced` can lower it into `JobParams.mask_image` plus
 `lanpaint_mask_channel`.
+`InpaintModelConditioning` is accepted only as bounded graph/API metadata
+plumbing. It records the conditioning image, mask, and `noise_mask` flag, and it
+uses legacy `mask_image`/`lanpaint_mask_channel` only for the
+`noise_mask=true` preserve-mask compatibility path; it does not execute Comfy
+concat conditioning in any backend.
 
 Z-Image consumes that mask only for the bounded img2img preserve-region slice:
 it stores the encoded init latent, seeded noise, and latent preserve mask, then
@@ -368,6 +416,9 @@ unsupported and should fail loud.
   semantics in a real backend. Z-Image `LanPaint_MaskBlend` is bounded to final
   decoded pixel compositing only, with area resize only for the
   `MaskBlend.image1` base/original-image role, not sampler parity.
+- `InpaintModelConditioning` graph/API import records Comfy oracle metadata only:
+  gray-fill concat-source image, concat mask, original-pixel output latent input,
+  and `noise_mask`. It is not accepted concat-conditioning runtime parity.
 - This is not accepted general Z-Image i2i parity.
 - This is not accepted Z-Image/Qwen/Klein/Ideogram inpaint parity.
 - Z-Image init-image encode code may be useful substrate for refiner/LanPaint/
@@ -545,6 +596,13 @@ Current bounded contract:
 13. Z-Image calls `reject_unsupported_lanpaint_sampler_params(...)` for full
     LanPaint sampler-loop fields. Qwen, Ideogram4, and Klein call
     `reject_unsupported_lanpaint_params(...)` for unsupported LanPaint metadata.
+14. `InpaintModelConditioning` graph/API import records
+    `inpaint_conditioning_image`, `inpaint_conditioning_mask`, and
+    `inpaint_conditioning_noise_mask`. `noise_mask=true` additionally feeds the
+    legacy preserve-mask metadata path; `noise_mask=false` leaves
+    `mask_image`/`lanpaint_mask_channel` empty. Real backends reject these fields
+    through `reject_unsupported_inpaint_conditioning_params(...)` until concat
+    conditioning runtime parity exists.
 
 This keeps unsupported inpaint/LanPaint workflows from silently degrading into
 plain img2img or txt2img while allowing the narrow Z-Image preserve-mask and
@@ -577,13 +635,17 @@ Current LanPaint boundary:
   `sigma=(blend_overlap-1)/4`, then `image1*(1-mask)+image2*mask`; base-image
   resize is limited to Comfy/PyTorch `area` semantics for the
   `ImageScale(area)` -> `MaskBlend.image1` role.
+- `InpaintModelConditioning` is supported only for bounded graph/API import and
+  metadata propagation. It captures Comfy concat-conditioning metadata and the
+  `noise_mask` branch, but does not gray-fill pixels, VAE-encode concat latents,
+  attach conditioning objects, or run concat conditioning inside a backend.
 - Acceptance for real LanPaint/inpaint execution requires backend-specific
   mask-aware denoise, outpaint behavior where applicable, and parity checks
   against the Python oracle. Until then, any request that reaches a real backend
-  with LanPaint sampler runtime metadata must fail loud; the Z-Image
-  `SetLatentNoiseMask` path is only a preserve-mask img2img slice and the
-  Z-Image `LanPaint_MaskBlend` path is only final-pixel compositing, not
-  `LanPaint_KSampler` runtime parity.
+  with LanPaint sampler runtime metadata or `InpaintModelConditioning` concat
+  metadata must fail loud; the Z-Image `SetLatentNoiseMask` path is only a
+  preserve-mask img2img slice and the Z-Image `LanPaint_MaskBlend` path is only
+  final-pixel compositing, not `LanPaint_KSampler` runtime parity.
 
 ## Oracle Search Findings
 
@@ -956,5 +1018,10 @@ no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
    implementation, and oracle parity gates all exist; metadata plumbing alone
    is not LanPaint/inpaint parity, and final-pixel MaskBlend alone is not
    `LanPaint_KSampler` runtime parity.
-9. Only after temp build and checks pass, run `pixi run build-daemon` to update
+9. Implement real `InpaintModelConditioning` backend parity from the Python
+   oracle before accepting it in any real backend: gray-fill the masked image,
+   VAE-encode concat latents, attach `concat_latent_image`/`concat_mask`
+   conditioning metadata to positive and negative, preserve optional latent
+   `noise_mask`, and compare against Comfy/Python output behavior.
+10. Only after temp build and checks pass, run `pixi run build-daemon` to update
    `output/bin/serenity_daemon`.

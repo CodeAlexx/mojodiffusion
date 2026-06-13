@@ -6,8 +6,8 @@ claim, not an accepted inpaint/LanPaint parity claim, and not an accepted video
 parity claim. Product runtime remains Mojo-native; Python is used only for this
 audit/checker.
 
-Current verdict: the daemon has flat `/v1/generate` support plus a typed linked
-graph executor for the supported image chain. It accepts
+Current verdict: the daemon has flat `/v1/generate` support plus a typed linked graph executor
+for the supported image chain. It accepts
 `CheckpointLoaderSimple -> CLIPTextEncode -> EmptyLatentImage -> KSampler ->
 VAEDecode -> SaveImage` style workflows, carries typed MODEL/CLIP/VAE/
 CONDITIONING/LATENT/IMAGE values, carries a path-backed MASK value for

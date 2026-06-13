@@ -61,13 +61,16 @@ pixi run build-daemon
 ```
 
 2026-06-13 Z-Image scheduler update: current Comfy `sgm_uniform` semantics are
-now ported for the bounded Z-Image Euler/flow-match Euler and DPM++ 2M paths.
+now ported for the bounded Z-Image Euler/flow-match Euler, DPM++ 2M, `uni_pc`,
+and `uni_pc_bh2` paths.
 The oracle is SwarmUI's embedded Comfy checkout:
 `normal_scheduler(sgm=True)` includes the max sigma endpoint, converts through
 `ModelSamplingDiscreteFlow.sigma`, and appends one terminal `0.0`. The Mojo
 helper records the same shifted flow values and the backend scales txt2img
-initial noise by `sigmas[0]`. `uni_pc`/`uni_pc_bh2` plus `sgm_uniform` remains
-fail-loud until that exact Comfy combo has product artifact evidence.
+initial noise by `sigmas[0]`. Comfy puts both `uni_pc` and `uni_pc_bh2` through
+`DISCARD_PENULTIMATE_SIGMA_SAMPLERS` schedule prep before SigmaConvert UniPC
+math, so the Z-Image port now uses that same wording for both variants while
+leaving accepted sampler parity false.
 
 Focused runtime evidence:
 
@@ -78,13 +81,14 @@ python3 scripts/check_zimage_daemon_product_contract.py \
   --skip-dpmpp2m-smoke --skip-generic-unipc-smoke --skip-unipc-smoke \
   --skip-multi-image-smoke --skip-variation-smoke --skip-img2img-smoke \
   --skip-multi-lora-smoke \
-  --write-readiness output/checks/zimage_sgm_uniform_product_readiness.json
+  --write-readiness output/checks/zimage_unipc_sgm_uniform_product_readiness.json
 ```
 
 Proof jobs:
 
 - `job-0357`: unsupported sampler fail-loud smoke.
-- `job-0358`: `uni_pc` + `sgm_uniform` fail-loud combo smoke.
+- `job-0358`: historical `uni_pc` + `sgm_uniform` rejection smoke,
+  superseded by the bounded UniPC `sgm_uniform` port wording above.
 - `job-0359`: baseline `euler` + `flowmatch`, manifest
   `schedule_source:"zimage_comfy_simple_sigmas"`.
 - `job-0360`: `euler` + `sgm_uniform`, manifest
@@ -92,6 +96,30 @@ Proof jobs:
   `sigma_trace:[1.0,0.9477647,0.85859877,0.67192113,0.0]`,
   `txt2img_initial_noise_scale:1.0`, and
   `schedule_source:"zimage_comfy_sgm_uniform_sigmas"`.
+- `job-0361`: unsupported sampler fail-loud smoke from the current focused
+  UniPC `sgm_uniform` gate.
+- `job-0362`: baseline `euler` + `flowmatch` artifact from the current focused
+  gate.
+- `job-0363`: `euler` + `sgm_uniform` artifact from the current focused gate.
+- `job-0364`: `uni_pc` + `sgm_uniform`, manifest
+  `executed_scheduler:"sgm_uniform_flowmatch"`,
+  `sigma_trace:[1.0,0.96028626,0.90089285,0.8023738,0.0]`,
+  `txt2img_initial_noise_scale:0.70710677`,
+  `solver_variant:"bh1"`, `sigma_parameterization:"SigmaConvert"`,
+  and
+  `schedule_source:"zimage_comfy_sgm_uniform_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`.
+- `job-0365`: `uni_pc_bh2` + `sgm_uniform`, same prepared sigma trace and
+  initial/final scaling as `job-0364`, with `solver_variant:"bh2"` and
+  `sigma_parameterization:"SigmaConvert"`.
+- `job-0366`: focused baseline artifact for the rebuilt bh2 simple-flowmatch
+  gate.
+- `job-0367`: `uni_pc_bh2` + `flowmatch`, manifest
+  `executed_scheduler:"simple_flowmatch"`,
+  `sigma_trace:[1.0,0.923077,0.8181818,0.6666667,0.0]`,
+  `txt2img_initial_noise_scale:0.70710677`,
+  `solver_variant:"bh2"`, `solver_order:3`,
+  `sigma_parameterization:"SigmaConvert"`, and
+  `schedule_source:"zimage_comfy_simple_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`.
 
 The workflow product smoke passed after expanding the product evidence from one
 Z-Image template to the current supported SerenityFlow t2i template set, bounded

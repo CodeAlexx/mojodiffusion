@@ -202,11 +202,13 @@ def _blocks_bytes(blocks: List[ZImageBlockWeights]) -> Int:
     return total
 
 
-def _build_comfy_unipc_sigmas(steps: Int, sigma_shift: Float32) raises -> List[Float32]:
+def _build_comfy_unipc_sigmas(
+    executed_scheduler: String, steps: Int, sigma_shift: Float32
+) raises -> List[Float32]:
     """Mirror Comfy's `DISCARD_PENULTIMATE_SIGMA_SAMPLERS` prep for uni_pc."""
     if steps < 2:
         raise Error("zimage: generic uni_pc requires at least two steps")
-    var raw = zimage_comfy_simple_sigmas_with_shift(steps + 1, sigma_shift)
+    var raw = _build_zimage_sigmas(executed_scheduler, steps + 1, sigma_shift)
     if len(raw) < 3:
         raise Error("zimage: generic uni_pc sigma prep needs at least three sigmas")
     var drop = len(raw) - 2
@@ -233,6 +235,13 @@ def _zimage_schedule_source(executed_scheduler: String) -> String:
     if executed_scheduler == "sgm_uniform_flowmatch":
         return String("zimage_comfy_sgm_uniform_sigmas")
     return String("zimage_comfy_simple_sigmas")
+
+
+def _zimage_comfy_unipc_schedule_source(executed_scheduler: String) -> String:
+    return (
+        _zimage_schedule_source(executed_scheduler)
+        + String("+comfy_discard_penultimate+comfy_unipc_timesteps")
+    )
 
 
 def _save_rgb_png_with_text(
@@ -460,19 +469,6 @@ struct ZImageBackend(GenBackend, Movable):
             raise Error(
                 "zimage: generic uni_pc requires at least two inference steps "
                 "for the bounded Comfy bh1/order<=3 path"
-            )
-        if (
-            scheduler_admission.executed == "sgm_uniform_flowmatch"
-            and (
-                sampler_admission.executed == "uni_pc"
-                or sampler_admission.executed == "uni_pc_bh2"
-            )
-        ):
-            raise Error(
-                String("zimage: scheduler '") + params.scheduler
-                + "' is currently supported only with euler/flowmatch_euler "
-                + "and dpmpp_2m; UniPC + sgm_uniform needs separate Comfy "
-                + "artifact evidence"
             )
         if (
             (sampler_admission.executed == "uni_pc" or sampler_admission.executed == "uni_pc_bh2")
@@ -763,8 +759,9 @@ struct ZImageBackend(GenBackend, Movable):
                 noise, vnoise, 16, self.hl, self.wl,
                 self.params.variation_strength,
             )
-        if self.executed_sampler == "uni_pc":
+        if self.executed_sampler == "uni_pc" or self.executed_sampler == "uni_pc_bh2":
             self.sigmas = _build_comfy_unipc_sigmas(
+                self.executed_scheduler,
                 self.params.steps, Float32(self.params.sigma_shift)
             )
         else:
@@ -772,19 +769,15 @@ struct ZImageBackend(GenBackend, Movable):
                 self.executed_scheduler,
                 self.params.steps, Float32(self.params.sigma_shift)
             )
-        if self.executed_sampler == "uni_pc_bh2":
-            var unipc_sigmas = List[Float64]()
-            for si in range(len(self.sigmas)):
-                unipc_sigmas.append(Float64(self.sigmas[si]))
-            self.unipc.append(ArcPointer(
-                UniPcMultistepScheduler.from_sigmas(unipc_sigmas^, 2)
-            ))
-            self.unipc_solver_order = 2
-        elif self.executed_sampler == "uni_pc":
+        if self.executed_sampler == "uni_pc" or self.executed_sampler == "uni_pc_bh2":
             var comfy_sigmas = List[Float64]()
             for si in range(len(self.sigmas)):
                 comfy_sigmas.append(Float64(self.sigmas[si]))
-            var sched = ComfyUniPcMultistepScheduler.from_sigmas(comfy_sigmas^)
+            var sched: ComfyUniPcMultistepScheduler
+            if self.executed_sampler == "uni_pc_bh2":
+                sched = ComfyUniPcMultistepScheduler.from_sigmas_bh2(comfy_sigmas^)
+            else:
+                sched = ComfyUniPcMultistepScheduler.from_sigmas(comfy_sigmas^)
             self.unipc_solver_order = sched.configured_order()
             self.unipc_initial_noise_scale = sched.initial_noise_scale()
             self.unipc_final_sample_scale = sched.final_sample_scale()
@@ -798,7 +791,7 @@ struct ZImageBackend(GenBackend, Movable):
             if self.txt2img_initial_noise_scale != Float32(1.0):
                 for i in range(len(lat_host)):
                     lat_host[i] = lat_host[i] * self.txt2img_initial_noise_scale
-        if self.executed_sampler == "uni_pc":
+        if self.executed_sampler == "uni_pc" or self.executed_sampler == "uni_pc_bh2":
             for i in range(len(lat_host)):
                 lat_host[i] = lat_host[i] * self.unipc_initial_noise_scale
             self.txt2img_initial_noise_scale = (
@@ -966,9 +959,9 @@ struct ZImageBackend(GenBackend, Movable):
         var sigma_next = self.sigmas[i + 1]
         var x_compute = _cast(x[], STDtype.F32, self.ctx)
         var model_latent: Tensor
-        if self.executed_sampler == "uni_pc":
+        if self.executed_sampler == "uni_pc" or self.executed_sampler == "uni_pc_bh2":
             if len(self.comfy_unipc) == 0:
-                raise Error("zimage: generic uni_pc scheduler was not initialized")
+                raise Error("zimage: Comfy UniPC scheduler was not initialized")
             var model_scale = self.comfy_unipc[0][].model_input_scale_for_step()
             var model_scaled = mul_scalar(x_compute, model_scale, self.ctx)
             model_latent = _cast(model_scaled, STDtype.BF16, self.ctx)
@@ -1004,27 +997,12 @@ struct ZImageBackend(GenBackend, Movable):
                 )
                 self.dpmpp_update_steps += 1
                 x_new = _cast(x_next, STDtype.BF16, self.ctx)
-        elif self.executed_sampler == "uni_pc_bh2":
-            if sigma <= Float32(0.0) or sigma_next == sigma:
-                x_new = _cast(x_compute, STDtype.BF16, self.ctx)
-            else:
-                if len(self.unipc) == 0:
-                    raise Error("zimage: uni_pc_bh2 scheduler was not initialized")
-                if self.unipc[0][].step_index() > 0:
-                    self.unipc_corrector_steps += 1
-                var x_next = self.unipc[0][].step(pred, x_compute, self.ctx)
-                self.unipc_update_steps += 1
-                if self.unipc[0][].this_order() >= 2:
-                    self.unipc_second_order_steps += 1
-                if self.unipc[0][].this_order() > self.unipc_max_observed_order:
-                    self.unipc_max_observed_order = self.unipc[0][].this_order()
-                x_new = _cast(x_next, STDtype.BF16, self.ctx)
-        elif self.executed_sampler == "uni_pc":
+        elif self.executed_sampler == "uni_pc" or self.executed_sampler == "uni_pc_bh2":
             if sigma <= Float32(0.0):
                 x_new = _cast(x_compute, STDtype.BF16, self.ctx)
             else:
                 if len(self.comfy_unipc) == 0:
-                    raise Error("zimage: generic uni_pc scheduler was not initialized")
+                    raise Error("zimage: Comfy UniPC scheduler was not initialized")
                 if self.comfy_unipc[0][].step_index() > 0:
                     self.unipc_corrector_steps += 1
                 var model_compute_for_denoised = _cast(model_latent, STDtype.F32, self.ctx)
@@ -1144,14 +1122,25 @@ struct ZImageBackend(GenBackend, Movable):
         elif self.executed_sampler == "uni_pc_bh2":
             var unipc_step_index = 0
             var unipc_lower_order_nums = 0
-            if len(self.unipc) > 0:
-                unipc_step_index = self.unipc[0][].step_index()
-                unipc_lower_order_nums = self.unipc[0][].lower_order_nums()
+            var configured_order = self.unipc_solver_order
+            if len(self.comfy_unipc) > 0:
+                unipc_step_index = self.comfy_unipc[0][].step_index()
+                unipc_lower_order_nums = self.comfy_unipc[0][].lower_order_nums()
+                configured_order = self.comfy_unipc[0][].configured_order()
             content += String('"algorithm":"uni_pc_bh2",')
+            content += String('"requested_sampler":"') + _json_escape(self.params.sampler) + String('",')
+            content += String('"requested_scheduler":"') + _json_escape(self.params.scheduler) + String('",')
+            content += String('"executed_sampler":"') + _json_escape(self.executed_sampler) + String('",')
+            content += String('"executed_scheduler":"') + _json_escape(self.executed_scheduler) + String('",')
             content += String('"solver_type":"bh2",')
             content += String('"solver_variant":"bh2",')
-            content += String('"solver_order":2,')
-            content += String('"schedule_source":"') + _json_escape(schedule_source) + String('",')
+            content += String('"solver_order":') + String(configured_order) + String(",")
+            content += String('"max_supported_order":3,')
+            content += String('"sigma_parameterization":"SigmaConvert",')
+            content += String('"schedule_source":"') + _json_escape(_zimage_comfy_unipc_schedule_source(self.executed_scheduler)) + String('",')
+            content += String('"final_zero_replacement":0.001,')
+            content += String('"initial_noise_scale":') + String(self.unipc_initial_noise_scale) + String(",")
+            content += String('"final_sample_scale":') + String(self.unipc_final_sample_scale) + String(",")
             content += String('"unipc_update_steps":') + String(self.unipc_update_steps) + String(",")
             content += String('"unipc_corrector_steps":') + String(self.unipc_corrector_steps) + String(",")
             content += String('"unipc_second_order_steps":') + String(self.unipc_second_order_steps) + String(",")
@@ -1177,7 +1166,7 @@ struct ZImageBackend(GenBackend, Movable):
             content += String('"solver_order":') + String(configured_order) + String(",")
             content += String('"max_supported_order":3,')
             content += String('"sigma_parameterization":"SigmaConvert",')
-            content += String('"schedule_source":"zimage_comfy_simple_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps",')
+            content += String('"schedule_source":"') + _json_escape(_zimage_comfy_unipc_schedule_source(self.executed_scheduler)) + String('",')
             content += String('"final_zero_replacement":0.001,')
             content += String('"initial_noise_scale":') + String(self.unipc_initial_noise_scale) + String(",")
             content += String('"final_sample_scale":') + String(self.unipc_final_sample_scale) + String(",")
@@ -1226,7 +1215,7 @@ struct ZImageBackend(GenBackend, Movable):
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
         var lat = self.latent[0].copy()
         var decode_latent: Tensor
-        if self.executed_sampler == "uni_pc":
+        if self.executed_sampler == "uni_pc" or self.executed_sampler == "uni_pc_bh2":
             decode_latent = mul_scalar(lat[], self.unipc_final_sample_scale, self.ctx)
         else:
             decode_latent = lat[].clone(self.ctx)

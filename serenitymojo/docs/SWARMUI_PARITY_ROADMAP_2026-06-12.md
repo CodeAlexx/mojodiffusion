@@ -104,16 +104,21 @@ Current high-risk runtime gaps:
 - Sampler fields now reach typed `JobParams`/worker IPC, `/v1/samplers` exposes
   a SwarmUI/Comfy catalog and per-backend support matrix, and unsupported names
   fail loud before model work. Z-Image has bounded DPM++ 2M/simple-flowmatch
-  runtime evidence (`job-0036`) and bounded UniPC bh2/simple-flowmatch runtime
-  evidence (`job-0040`). Generic `uni_pc` now has bounded runtime evidence
+  runtime evidence (`job-0036`) and current bounded UniPC bh2/simple-flowmatch
+  runtime evidence (`job-0367`). Generic `uni_pc` now has bounded runtime evidence
   (`job-0077`) for a distinct Z-Image bh1/order<=3 SigmaConvert code path with
   Comfy penultimate-sigma discard. Z-Image now also has bounded Comfy-current
-  `sgm_uniform` scheduler support for Euler/flow-match Euler and DPM++ 2M paths:
+  `sgm_uniform` scheduler support for Euler/flow-match Euler, DPM++ 2M, and
+  both UniPC paths:
   it follows current Comfy `normal_scheduler(sgm=True)` semantics with the max
   sigma endpoint included, exactly one terminal zero appended, flow shift through
   `ModelSamplingDiscreteFlow`, and txt2img initial noise scaled by `sigmas[0]`.
-  `uni_pc` and `uni_pc_bh2` with `sgm_uniform` still fail loud until product
-  artifact evidence exists for that exact combo, even though Comfy allows it.
+  Comfy puts both `uni_pc` and `uni_pc_bh2` through
+  `DISCARD_PENULTIMATE_SIGMA_SAMPLERS` schedule prep before SigmaConvert UniPC
+  math, and this port now uses that wording for both variants. The focused
+  product gate emitted generic `uni_pc` + `sgm_uniform` as `job-0364` and
+  `uni_pc_bh2` + `sgm_uniform` as `job-0365`. This remains bounded support, not
+  accepted sampler parity.
   Ancestral, SDE, Karras, CFG++, unproven UniPC scheduler combos, and other
   daemon denoise loops are still not accepted sampler parity.
 - Variation noise is implemented for image backends and proven for Z-Image by a
@@ -165,8 +170,8 @@ Current artifact evidence found in this working tree:
   - `output/serenity_daemon/job-0031.png.zimage_daemon_result.json`
   - `output/serenity_daemon/job-0036.png`
   - `output/serenity_daemon/job-0036.png.zimage_daemon_result.json`
-  - `output/serenity_daemon/job-0040.png`
-  - `output/serenity_daemon/job-0040.png.zimage_daemon_result.json`
+  - `output/serenity_daemon/job-0367.png`
+  - `output/serenity_daemon/job-0367.png.zimage_daemon_result.json`
   - `output/serenity_daemon/job-0047.png`
   - `output/serenity_daemon/job-0073.png`
   - `output/serenity_daemon/job-0073.png.zimage_daemon_result.json`
@@ -203,12 +208,15 @@ manifest timings, and positive VRAM evidence. Timings were
 one-step output is path/resource evidence only, not quality, sampler, or speed
 parity.
 
-`job-0040` is the current bounded UniPC bh2 sampler artifact from the daemon
+`job-0367` is the current bounded UniPC bh2 sampler artifact from the daemon
 product path. It proves `requested_sampler:"uni_pc_bh2"` executes as
-`executed_sampler:"uni_pc_bh2"` with `solver_type:"bh2"`, `solver_order:2`,
-`schedule_source:"zimage_build_sigmas"`, `unipc_update_steps:3`,
-`unipc_corrector_steps:2`, `unipc_second_order_steps:2`,
-`denoise_seconds_per_step:0.32013946925`, and `peak_vram_mib:21727.5625`.
+`executed_sampler:"uni_pc_bh2"` with `executed_scheduler:"simple_flowmatch"`,
+`solver_type:"bh2"`, `solver_variant:"bh2"`, `solver_order:3`,
+`sigma_parameterization:"SigmaConvert"`,
+`schedule_source:"zimage_comfy_simple_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`,
+`txt2img_initial_noise_scale:0.70710677`, `unipc_update_steps:4`,
+`unipc_corrector_steps:3`, `unipc_second_order_steps:2`, and
+`peak_vram_mib:21485.2`.
 
 `job-0077` is the current bounded generic UniPC sampler artifact from the daemon
 product path. It proves `requested_sampler:"uni_pc"` executes as
@@ -222,13 +230,16 @@ product path. It proves `requested_sampler:"uni_pc"` executes as
 bounded Z-Image sampler evidence only; `accepted_sampler_parity:false` remains
 correct.
 
-Current Z-Image `sgm_uniform` support is bounded to Euler/flow-match Euler and
-DPM++ 2M scheduler execution. It is documented as Comfy-current
+Current Z-Image `sgm_uniform` support covers Euler/flow-match Euler, DPM++ 2M,
+`uni_pc`, and `uni_pc_bh2` scheduler execution. It is documented as Comfy-current
 `normal_scheduler(sgm=True)` behavior for `ModelSamplingDiscreteFlow`: include
 the max sigma endpoint, append one terminal zero, apply flow shift through the
 model sampling conversion, and scale txt2img initial noise by `sigmas[0]`.
-`uni_pc`/`uni_pc_bh2` with `sgm_uniform` remains an intentional fail-loud product
-gate until separate artifact evidence proves that combo. This does not change
+For `uni_pc` and `uni_pc_bh2`, Comfy applies
+`DISCARD_PENULTIMATE_SIGMA_SAMPLERS` schedule prep before SigmaConvert UniPC
+math, and this port mirrors that wording for both variants. Current focused
+evidence is `job-0364` for generic `uni_pc` + `sgm_uniform` and `job-0365` for
+`uni_pc_bh2` + `sgm_uniform`. This does not change
 `accepted_sampler_parity:false`.
 
 `job-0106` is the current bounded Ideogram4 daemon artifact. It proves the native
@@ -358,7 +369,7 @@ Important finding:
 
 | Model/Family | Current status | Next action |
 |---|---|---|
-| Z-Image | Best first SwarmUI product target. Has product backend, metadata path, flash SDPA route, sampler manifests, multi-LoRA, variation, multi-image serial output, bounded DPM++/UniPC artifacts, and bounded `sgm_uniform` scheduler support for Euler/DPM++ paths. Speed parity and full sampler parity are still not accepted. | Measure and reduce the current product bottleneck, then add each remaining sampler/workflow surface only with artifact/timing/VRAM evidence. Keep `uni_pc`/`uni_pc_bh2` plus `sgm_uniform` fail-loud until that exact combo has evidence. |
+| Z-Image | Best first SwarmUI product target. Has product backend, metadata path, flash SDPA route, sampler manifests, multi-LoRA, variation, multi-image serial output, bounded DPM++/UniPC artifacts, and bounded `sgm_uniform` scheduler support for Euler/DPM++/UniPC paths, including `job-0364`/`job-0365` UniPC evidence. Speed parity and full sampler parity are still not accepted. | Measure and reduce the current product bottleneck, then add each remaining sampler/workflow surface only with artifact/timing/VRAM evidence. Keep accepted sampler parity false until the remaining catalog algorithms/schedulers have their own artifact evidence; do not flip parity from catalog allowance alone. |
 | Ideogram4 | Native daemon backend exists and has bounded 1024x1024 one-step artifact `job-0106` with PNG metadata, gallery readback, sidecar manifest, timings, and positive VRAM. Bounded unsupported controls now fail loud at `/v1/generate` prequeue. It is experimental and speed/sampler/quality parity remain false. | Extend from bounded one-step smoke to full product evidence only after multi-step quality, residency/speed, feature-support decisions, and sampler-surface limits are measured. |
 | Klein | Best memory/offload mechanics target. Uses `ScratchRingAllocator` and `TurboPlannedLoader`; product smokes exist in docs. Heavy. | Use after Z-Image product artifact, or if the slice is explicitly memory/offload measurement. |
 | SDXL / SD3 / Flux / Chroma / ERNIE | Useful image candidates, but several are cached-input, staged, or contract smokes rather than full SwarmUI product paths. | Promote only after Z-Image product loop proves the daemon/gallery/runtime pattern. |
@@ -635,8 +646,9 @@ Next implementation slice:
 3. Refresh `/v1/samplers` smoke evidence, then promote the next sampler or
    scheduler combo only with artifact/timing/VRAM evidence. Do not promote
    generic `uni_pc` by aliasing it to bh2; map its exact Comfy/Swarm semantics
-   first. Keep `uni_pc`/`uni_pc_bh2` with `sgm_uniform` fail-loud until product
-   artifacts prove that exact combination.
+   first. `uni_pc`/`uni_pc_bh2` with `sgm_uniform` now has bounded product
+   artifacts, but accepted sampler parity remains false until the wider catalog
+   is implemented and proven.
 4. Measure the current Z-Image product bottleneck by stage with the daemon gate
    as the control artifact, then replace the measured slow path first.
 5. Keep Qwen on bounded op/static gates until memory/offload evidence says full

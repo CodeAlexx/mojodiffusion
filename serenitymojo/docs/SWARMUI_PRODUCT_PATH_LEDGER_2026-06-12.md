@@ -171,6 +171,29 @@ Acceptance evidence:
   Ideogram4 exposes bounded `euler`/flow-match aliases that execute as
   `ideogram4_logitnormal_euler`, with only `logitnormal`/`logit_normal`/
   `ideogram_logitnormal`/`ideogram4_logitnormal` scheduler aliases accepted.
+  Current Z-Image `sgm_uniform` wording covers Euler/flow-match Euler, DPM++ 2M,
+  `uni_pc`, and `uni_pc_bh2`: the Comfy oracle applies
+  `DISCARD_PENULTIMATE_SIGMA_SAMPLERS` prep for both UniPC names before
+  SigmaConvert math. This is bounded support and leaves
+  `accepted_sampler_parity:false`.
+- 2026-06-13 Z-Image UniPC `sgm_uniform` runtime evidence:
+  `python3 scripts/check_zimage_daemon_product_contract.py --daemon
+  output/bin/serenity_daemon --timeout 900 --steps 1 --skip-dpmpp2m-smoke
+  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
+  --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
+  --write-readiness output/checks/zimage_unipc_sgm_uniform_product_readiness.json`
+  passed. It emitted unsupported sampler `job-0361`, baseline `job-0362`,
+  Euler `sgm_uniform` `job-0363`, generic UniPC `sgm_uniform` `job-0364`, and
+  UniPC bh2 `sgm_uniform` `job-0365`. `job-0364` and `job-0365` both record
+  `executed_scheduler:"sgm_uniform_flowmatch"`,
+  `sigma_trace:[1.0,0.96028626,0.90089285,0.8023738,0.0]`,
+  `txt2img_initial_noise_scale:0.70710677`,
+  `sigma_parameterization:"SigmaConvert"`,
+  `schedule_source:"zimage_comfy_sgm_uniform_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`,
+  `unipc_update_steps:4`, `unipc_corrector_steps:3`, and
+  `unipc_second_order_steps:2`. `job-0364` records `solver_variant:"bh1"` and
+  `job-0365` records `solver_variant:"bh2"`. The readiness report is ready with
+  no blockers, and still leaves `accepted_sampler_parity:false`.
 - 2026-06-12 DPM++ 2M runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py
   --skip-unsupported-smoke --skip-generic-unipc-smoke --skip-unipc-smoke
@@ -187,24 +210,29 @@ Acceptance evidence:
   `denoise_seconds_per_step:0.3180188945`, `peak_vram_mib:21571.8125`, and
   `accepted_sampler_parity:false`. The duplicate terminal `0.0 -> 0.0` sigma
   interval is skipped by the DPM++ branch and not counted as an update.
-- 2026-06-12 UniPC bh2 runtime evidence:
+- 2026-06-13 UniPC bh2 runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py
+  --daemon output/bin/serenity_daemon --timeout 900 --steps 1
+  --skip-unsupported-smoke --skip-sgm-uniform-smoke
+  --skip-sgm-uniform-unipc-smoke --skip-sgm-uniform-unipc-bh2-smoke
   --skip-dpmpp2m-smoke --skip-generic-unipc-smoke --skip-multi-image-smoke
   --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
-  --write-readiness output/checks/zimage_unipc_bh2_product_readiness.json`
-  passed. It emitted unsupported generic UniPC failure `job-0038`, baseline
-  `job-0039`, and UniPC bh2 `job-0040`. `job-0040` wrote
-  `output/serenity_daemon/job-0040.png` and
-  `output/serenity_daemon/job-0040.png.zimage_daemon_result.json`; the manifest
+  --write-readiness output/checks/zimage_unipc_bh2_comfy_product_readiness.json`
+  passed after moving bh2 onto the Comfy SigmaConvert/discard-prep path. It
+  emitted baseline `job-0366` and UniPC bh2 `job-0367`. `job-0367` wrote
+  `output/serenity_daemon/job-0367.png` and
+  `output/serenity_daemon/job-0367.png.zimage_daemon_result.json`; the manifest
   records `requested_sampler:"uni_pc_bh2"`,
   `requested_scheduler:"flowmatch"`, `executed_sampler:"uni_pc_bh2"`,
   `executed_scheduler:"simple_flowmatch"`, `solver_type:"bh2"`,
-  `solver_order:2`, `schedule_source:"zimage_build_sigmas"`,
-  `unipc_update_steps:3`, `unipc_corrector_steps:2`,
-  `unipc_second_order_steps:2`, `denoise_seconds_per_step:0.32013946925`,
-  `peak_vram_mib:21727.5625`, and `accepted_sampler_parity:false`.
-  Generic `uni_pc` is not an alias for this accepted `uni_pc_bh2` bh2/order-2
-  flow path; the focused Mojo semantic gate
+  `solver_variant:"bh2"`, `solver_order:3`,
+  `sigma_parameterization:"SigmaConvert"`,
+  `schedule_source:"zimage_comfy_simple_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps"`,
+  `txt2img_initial_noise_scale:0.70710677`, `unipc_update_steps:4`,
+  `unipc_corrector_steps:3`, `unipc_second_order_steps:2`,
+  `peak_vram_mib:21485.2`, and `accepted_sampler_parity:false`.
+  Generic `uni_pc` is not an alias for this accepted `uni_pc_bh2` bh2 variant;
+  the focused Mojo semantic gate
   `serenitymojo/sampling/parity/comfy_unipc_semantics_gate.mojo` proves generic
   `uni_pc` is `bh1`, order `min(3,len(sigmas)-2)`, SigmaConvert, Comfy
   penultimate-sigma discard, final-zero-replacement, and initial-noise scaling.

@@ -432,10 +432,11 @@ def mojo_markers() -> list[Marker]:
                     "UniPcMultistepScheduler",
                     "ComfyUniPcMultistepScheduler",
                     "_build_comfy_unipc_sigmas",
+                    "DISCARD_PENULTIMATE_SIGMA_SAMPLERS",
                     "from_sigmas",
                     "sampler_trace",
                     "solver_variant",
-                    "sigma_parameterization",
+                    "SigmaConvert",
                     "dpmpp_update_steps",
                     "dpmpp_second_order_steps",
                     "unipc_update_steps",
@@ -446,7 +447,7 @@ def mojo_markers() -> list[Marker]:
                     "self.params.image_count",
                 ],
             ),
-            "Z-Image has real subset behavior, registry-backed admission, SwarmUI/Comfy-aligned Euler/simple flow-match sigmas with sigma_shift, bounded DPM++ 2M/simple flow-match execution, bounded generic UniPC bh1/simple flow-match execution, bounded UniPC bh2/simple flow-match execution, and bounded flat img2img/creativity artifact evidence.",
+            "Z-Image has real subset behavior, registry-backed admission, SwarmUI/Comfy-aligned Euler/simple and sgm_uniform flow-match sigmas with sigma_shift, bounded DPM++ 2M execution, bounded generic UniPC bh1/order<=3 execution, bounded UniPC bh2 execution, Comfy DISCARD_PENULTIMATE sigma prep plus SigmaConvert wording for UniPC schedules, and bounded flat img2img/creativity artifact evidence.",
             "Accepted sampler parity needs per-sampler artifact evidence and executed sampler metadata.",
             severity="warning",
         )
@@ -647,7 +648,7 @@ def surface_blockers() -> list[dict[str, str]]:
         {
             "id": "sampler_scheduler_dispatch",
             "severity": "P1",
-            "blocker": "Z-Image now has bounded DPM++ 2M on SwarmUI/Comfy simple flow-match, generic UniPC bh1/order<=3, and UniPC bh2/simple flow-match paths, but Karras, ancestral, SDE, CFG++, and the rest of the SwarmUI/Comfy sampler catalog still lack distinct daemon denoise loops.",
+            "blocker": "Z-Image now has bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 paths on admitted simple and sgm_uniform flow-match schedules, but Karras, ancestral, SDE, CFG++, and the rest of the SwarmUI/Comfy sampler catalog still lack distinct daemon denoise loops.",
             "acceptance_gate": "Wire each accepted sampler/scheduler pair into a backend denoise loop and record requested versus executed values with artifact/timing/VRAM evidence.",
         },
         {

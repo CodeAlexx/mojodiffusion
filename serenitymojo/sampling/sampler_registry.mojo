@@ -190,8 +190,8 @@ def sampler_admission_for_backend(
                 normalized,
                 String("uni_pc_bh2"),
                 String(
-                    "backend executes the bounded Z-Image UniPC bh2/order-2 "
-                    + "path on the simple flow-match sigma schedule"
+                    "backend executes the bounded Z-Image Comfy UniPC bh2/"
+                    + "order<=3 path over simple or sgm_uniform flow-match sigmas"
                 ),
             )
         if normalized == "uni_pc":
@@ -314,7 +314,7 @@ def scheduler_admission_for_backend(
                 String("sgm_uniform_flowmatch"),
                 String(
                     "backend executes the bounded Z-Image Comfy sgm_uniform "
-                    + "flow-match schedule for Euler/DPM++ paths"
+                    + "flow-match schedule for Euler/DPM++/both UniPC variants"
                 ),
             )
         return SamplerAdmission(
@@ -490,7 +490,7 @@ def swarmui_sampler_registry_json() raises -> String:
         zimage_supported_samplers,
         zimage_supported_schedulers,
         String("[]"),
-        String("Z-Image daemon runs SwarmUI/Comfy-aligned rectified-flow Euler/simple sigmas, bounded Euler/DPM++ sgm_uniform sigmas, plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 on the simple flow-match schedule. Generic uni_pc is not an alias for uni_pc_bh2."),
+        String("Z-Image daemon runs SwarmUI/Comfy-aligned rectified-flow Euler/simple sigmas, bounded Euler/DPM++/both-UniPC sgm_uniform sigmas, plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2/order<=3 over Comfy SigmaConvert. Generic uni_pc is not an alias for uni_pc_bh2."),
     )
     out += String(",\n    ")
     out += _backend_json(

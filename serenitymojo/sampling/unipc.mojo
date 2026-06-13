@@ -160,12 +160,13 @@ def generic_comfy_unipc_unsupported_reason() -> String:
     )
 
 
-struct ComfyUniPcBh1Coeffs(Movable):
-    """Scalar bh1 coefficients for generic Comfy `uni_pc`.
+struct ComfyUniPcCoeffs(Movable):
+    """Scalar bh coefficients for Comfy `uni_pc`/`uni_pc_bh2`.
 
     `sigma_t` / `sigma_s0` are SigmaConvert std values, not raw flow sigmas.
     `rhos` is mode-specific: predictor coefficients for predictor calls and
-    corrector coefficients for corrector calls.
+    corrector coefficients for corrector calls. `b_h` is variant-specific:
+    `bh1` uses `hh`; `bh2` uses `expm1(hh)`.
     """
 
     var b_h: Float64
@@ -195,19 +196,20 @@ struct ComfyUniPcBh1Coeffs(Movable):
         self.rhos = rhos^
 
 
-def compute_comfy_bh1_coefficients(
+def compute_comfy_bh_coefficients(
     sigmas: List[Float64],
     step_index: Int,
     order: Int,
     is_corrector: Bool,
-) raises -> ComfyUniPcBh1Coeffs:
-    """Coefficient prep for Comfy generic `uni_pc` (variant='bh1').
+    variant: String,
+) raises -> ComfyUniPcCoeffs:
+    """Coefficient prep for Comfy `sample_unipc` bh variants.
 
     Mirrors extra_samplers/uni_pc.py `multistep_uni_pc_bh_update` for the
     predict_x0 branch, with SigmaConvert alpha/std/lambda.
     """
     if order < 1 or order > 3:
-        raise Error("compute_comfy_bh1_coefficients: order must be in [1, 3]")
+        raise Error("compute_comfy_bh_coefficients: order must be in [1, 3]")
     var idx_t: Int
     var idx_s0: Int
     if is_corrector:
@@ -243,6 +245,10 @@ def compute_comfy_bh1_coefficients(
     var h_phi_k = h_phi_1 / hh - 1.0
     var factorial_i = 1.0
     var b_h = hh
+    if variant == "bh2":
+        b_h = h_phi_1
+    elif variant != "bh1":
+        raise Error("compute_comfy_bh_coefficients: variant must be bh1 or bh2")
     var b_vec = List[Float64]()
     for i in range(1, order + 1):
         b_vec.append(h_phi_k * factorial_i / b_h)
@@ -279,7 +285,7 @@ def compute_comfy_bh1_coefficients(
                 pred_b.append(b_vec[i])
             rhos = _linsolve_f64(pred_r, pred_b)
 
-    return ComfyUniPcBh1Coeffs(
+    return ComfyUniPcCoeffs(
         b_h, alpha_t, sigma_t, sigma_s0, h_phi_1, rks^, rhos^
     )
 
@@ -722,10 +728,10 @@ struct UniPcMultistepScheduler(Movable):
 
 
 struct ComfyUniPcMultistepScheduler(Movable):
-    """Bounded generic Comfy `uni_pc` scheduler.
+    """Bounded Comfy `uni_pc` / `uni_pc_bh2` scheduler.
 
     This is intentionally distinct from UniPcMultistepScheduler:
-    - solver_type is bh1, not bh2,
+    - solver_type is Comfy bh1/bh2 over SigmaConvert, not Cosmos flow bh2,
     - solver_order is min(3, len(timesteps)-2),
     - schedule math uses Comfy SigmaConvert,
     - final zero is replaced with 0.001 before sampling.
@@ -744,8 +750,11 @@ struct ComfyUniPcMultistepScheduler(Movable):
     var _last_sample: Optional[TArc]
     var _step_index: Int
     var _this_order: Int
+    var _variant: String
 
-    def __init__(out self, var sigmas: List[Float64]) raises:
+    def __init__(out self, var sigmas: List[Float64], variant: String) raises:
+        if variant != "bh1" and variant != "bh2":
+            raise Error("ComfyUniPcMultistepScheduler: variant must be bh1 or bh2")
         if len(sigmas) < 3:
             raise Error(
                 "ComfyUniPcMultistepScheduler: need at least two inference steps"
@@ -766,10 +775,15 @@ struct ComfyUniPcMultistepScheduler(Movable):
         self._last_sample = None
         self._step_index = 0
         self._this_order = 0
+        self._variant = variant.copy()
 
     @staticmethod
     def from_sigmas(var sigmas: List[Float64]) raises -> ComfyUniPcMultistepScheduler:
-        return ComfyUniPcMultistepScheduler(sigmas^)
+        return ComfyUniPcMultistepScheduler(sigmas^, String("bh1"))
+
+    @staticmethod
+    def from_sigmas_bh2(var sigmas: List[Float64]) raises -> ComfyUniPcMultistepScheduler:
+        return ComfyUniPcMultistepScheduler(sigmas^, String("bh2"))
 
     def sigmas(self) -> List[Float64]:
         return self._sigmas.copy()
@@ -787,7 +801,7 @@ struct ComfyUniPcMultistepScheduler(Movable):
         return self.solver_order
 
     def solver_type(self) -> String:
-        return String("bh1")
+        return self._variant.copy()
 
     def schedule_source(self) -> String:
         return String("zimage_build_sigmas+comfy_discard_penultimate+comfy_unipc_timesteps")
@@ -812,8 +826,8 @@ struct ComfyUniPcMultistepScheduler(Movable):
         if not self._outputs[self.solver_order - 1]:
             raise Error("Comfy UniPC predictor: m0 is None")
         var m0 = self._outputs[self.solver_order - 1].value()[].clone(ctx)
-        var c = compute_comfy_bh1_coefficients(
-            self._sigmas, self._step_index, order, False
+        var c = compute_comfy_bh_coefficients(
+            self._sigmas, self._step_index, order, False, self._variant
         )
 
         var coef_x = Float32(c.sigma_t / c.sigma_s0)
@@ -848,8 +862,8 @@ struct ComfyUniPcMultistepScheduler(Movable):
         if not self._outputs[self.solver_order - 1]:
             raise Error("Comfy UniPC corrector: m0 is None")
         var m0 = self._outputs[self.solver_order - 1].value()[].clone(ctx)
-        var c = compute_comfy_bh1_coefficients(
-            self._sigmas, self._step_index, order, True
+        var c = compute_comfy_bh_coefficients(
+            self._sigmas, self._step_index, order, True, self._variant
         )
 
         var coef_x = Float32(c.sigma_t / c.sigma_s0)

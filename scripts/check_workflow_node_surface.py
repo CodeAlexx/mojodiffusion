@@ -898,12 +898,15 @@ def check_family_surfaces() -> list[Check]:
         check_contains(
             ZIMAGE_BACKEND,
             category="workflow",
-            label="Z-Image rejects SetLatentNoiseMask metadata",
+            label="Z-Image runs SetLatentNoiseMask img2img slice",
             needles=[
-                'reject_unsupported_mask_image_params(params, String("zimage"))',
+                "load_comfy_latent_preserve_mask",
+                "_apply_inpaint_preserve_mask",
+                "SetLatentNoiseMask requires an init_image/VAEEncode latent",
+                '"inpaint_mask_applied"',
             ],
             severity=P1,
-            acceptance="Z-Image img2img does not silently treat Comfy inpaint masks as ordinary img2img.",
+            acceptance="Z-Image no longer treats Comfy inpaint masks as metadata only; it validates a mask source and constrains known latent regions after sampler updates.",
         ),
         check_contains(
             ZIMAGE_BACKEND,
@@ -1360,6 +1363,22 @@ def check_family_surfaces() -> list[Check]:
             ],
             severity=P1,
             acceptance="Flat img2img path can decode common local image formats without Python.",
+        ),
+        check_contains(
+            IMAGE_IO,
+            category="image",
+            label="Comfy/LanPaint mask decode substrate",
+            needles=[
+                "decode_comfy_mask",
+                "load_image_mask",
+                "resize_mask_bilinear",
+                "resize_mask_nearest_exact",
+                "binarize_lanpaint_denoise_mask",
+                "load_comfy_latent_preserve_mask",
+                "load_lanpaint_latent_preserve_mask",
+            ],
+            severity=P1,
+            acceptance="Mask-conditioned runtime can extract Comfy LoadImage/ImageToMask masks and prepare both Comfy soft and LanPaint hard latent preserve masks.",
         ),
         check_contains(
             ZIMAGE_BACKEND,

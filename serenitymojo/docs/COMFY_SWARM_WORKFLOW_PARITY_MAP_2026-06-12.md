@@ -11,11 +11,13 @@ graph executor for the supported image chain. It accepts
 `CheckpointLoaderSimple -> CLIPTextEncode -> EmptyLatentImage -> KSampler ->
 VAEDecode -> SaveImage` style workflows, carries typed MODEL/CLIP/VAE/
 CONDITIONING/LATENT/IMAGE values, carries a path-backed MASK value for
-`SetLatentNoiseMask`, lowers selected LanPaint visual-canvas nodes into
-explicit metadata, and validates graph edges before enqueue. It is not an
-arbitrary ComfyUI graph executor. Unsupported graph nodes must fail loudly with
-HTTP 501 instead of being ignored or silently flattened. In exact checker terms:
-not an arbitrary ComfyUI graph executor.
+`SetLatentNoiseMask` with source metadata, lowers selected LanPaint visual-canvas
+nodes into explicit metadata, and validates graph edges before enqueue. Z-Image
+now consumes that mask for the first bounded `SetLatentNoiseMask` img2img
+preserve-region runtime slice. It is not an arbitrary ComfyUI graph executor.
+Unsupported graph nodes must fail loudly with HTTP 501 instead of being ignored
+or silently flattened. In exact checker terms: not an arbitrary ComfyUI graph
+executor.
 
 Primary source files:
 
@@ -62,29 +64,41 @@ then mapped into the existing flat `JobParams`/`serenity.genparams.v1` product
 path. Arbitrary node families, custom outputs, and advanced graph behaviors are
 not implemented.
 
-Current mask support is metadata plumbing only. `LoadImage` can expose a typed
-`MASK` output, `SetLatentNoiseMask` can propagate that mask path as
-`mask_image`, and `/v1/generate` plus worker IPC preserve it. Current LanPaint
-support is also metadata plumbing only: visual Comfy UI canvas graphs lower
-selected LanPaint sampler/blend/mask-conversion nodes into path-backed
-image/mask handles and canonical `lanpaint_*` fields. Z-Image, Qwen,
-Ideogram4, and Klein must still reject `mask_image` and `lanpaint_*` runtime
-metadata until each backend has real mask-aware denoise/blend execution and
-oracle parity evidence.
+Current graph mask support is path/source metadata, not a graph tensor. `LoadImage`
+can expose a typed `MASK` output with source `load_image_mask`, which means the
+Comfy `LoadImage` inverted-alpha mask. Raw `ImageToMask` channels remain raw
+channel values with no thresholding, and `MaskToImage -> ImageToMask(red)` keeps
+that source metadata instead of collapsing into a bare path. `SetLatentNoiseMask`
+can propagate the mask as `mask_image` plus `lanpaint_mask_channel`, and
+`/v1/generate` plus worker IPC preserve it.
+
+Z-Image consumes that metadata only for the bounded img2img preserve-region slice:
+it decodes the Comfy mask, resizes it to latent shape with the standard Comfy
+bilinear mask path, converts it to a latent preserve mask, stores the encoded
+init latent plus seeded noise, and reapplies the preserve region after every
+sampler update using `sigma_next`. Result metadata records `mask_image`,
+`mask_channel`, `inpaint_mask_applied`, `inpaint_preserve_active_pixels`, and
+`inpaint_preserve_mean`.
+
+Current LanPaint support remains metadata plumbing only: visual Comfy UI canvas
+graphs lower selected LanPaint sampler/blend/mask-conversion nodes into
+path-backed image/mask handles and canonical `lanpaint_*` fields. Full LanPaint
+sampler inner-loop and blend semantics remain rejected by
+`reject_unsupported_lanpaint_params(...)`.
 
 ## Node Surface Table
 
 | Node family | Comfy/SwarmUI expectation | Current Mojo support | Blocker | Acceptance gate |
 |---|---|---|---|---|
-| Workflow envelope / graph executor | Accept Comfy-style workflow JSON, execute nodes by links in graph order, carry typed MODEL/CLIP/VAE/LATENT/IMAGE/MASK/CONDITIONING values. | `/v1/generate` accepts flat JSON, `workflow.params`, `workflow.genparams`, Comfy API prompt objects, Comfy UI visual canvas graphs, and linked `workflow.nodes`/`workflow.edges` for the supported image chain. `looks_like_comfy_ui_canvas_graph`, `comfy_ui_canvas_to_typed_graph`, and `apply_comfy_ui_canvas_graph` lower visual nodes/links into the typed executor. The graph executor validates typed inputs and runs nodes in dependency order before flattening to `JobParams`; MASK is currently path metadata, not a mask tensor. | Advanced Comfy/Swarm node families, custom node classes beyond the bounded allowlist, graph-side utility outputs, and full graph API parity are not represented. | Static gate proves supported markers and 501 paths; runtime graph gates submit linked shuffled fixtures, a Comfy API prompt fixture, and a LanPaint Comfy UI canvas fixture, verify typed edges drive prompt/negative/model/latent/image/mask/LanPaint metadata, and reject unsupported/wrong-typed links. |
+| Workflow envelope / graph executor | Accept Comfy-style workflow JSON, execute nodes by links in graph order, carry typed MODEL/CLIP/VAE/LATENT/IMAGE/MASK/CONDITIONING values. | `/v1/generate` accepts flat JSON, `workflow.params`, `workflow.genparams`, Comfy API prompt objects, Comfy UI visual canvas graphs, and linked `workflow.nodes`/`workflow.edges` for the supported image chain. `looks_like_comfy_ui_canvas_graph`, `comfy_ui_canvas_to_typed_graph`, and `apply_comfy_ui_canvas_graph` lower visual nodes/links into the typed executor. The graph executor validates typed inputs and runs nodes in dependency order before flattening to `JobParams`; MASK is currently path/source metadata, not a graph tensor. | Advanced Comfy/Swarm node families, custom node classes beyond the bounded allowlist, graph-side utility outputs, and full graph API parity are not represented. | Static gate proves supported markers and 501 paths; runtime graph gates submit linked shuffled fixtures, a Comfy API prompt fixture, and a LanPaint Comfy UI canvas fixture, verify typed edges drive prompt/negative/model/latent/image/mask/LanPaint metadata, and reject unsupported/wrong-typed links. |
 | Checkpoint / CLIP / VAE loader nodes | `CheckpointLoaderSimple` returns MODEL, CLIP, and VAE handles; separate `CLIPLoader`, `DualCLIPLoader`, `VAELoader` nodes can override components. | `CheckpointLoaderSimple.fields.ckpt_name` emits typed MODEL/CLIP/VAE placeholders and maps MODEL to flat `model`. `/v1/models` scans checkpoints and LoRAs with arch tags. Text encoders and VAEs are internal to the selected backend. | No separated CLIP/VAE override nodes, no graph-selectable resident component split, and only Z-Image, Qwen, bounded Ideogram4, and Klein daemon backends are routed today. | Loader nodes create typed resident handles or fail 501 before CUDA for unsupported component splits; `/v1/models` reports compatibility per model/backend. |
 | Text encode | `CLIPTextEncode` consumes a CLIP handle and emits conditioning. Positive/negative prompts are link-driven, and prompt weights affect conditioning. | `CLIPTextEncode` now requires a typed CLIP link and emits CONDITIONING text. `KSampler` consumes positive and negative CONDITIONING by link, so prompt polarity is not inferred from node title. Prompt syntax metadata is recorded, but `conditioning_weights_applied=false`. | Weighted spans are still not applied to model conditioning math. Advanced conditioning combine/region nodes are unsupported. | Positive and negative text encode nodes emit typed conditioning handles; prompt weighting either changes conditioning or is rejected/labelled per request. |
 | Empty latent / batch | `EmptyLatentImage` emits a LATENT tensor with width, height, and batch size. Batch size produces multiple images or a batched denoise. | `EmptyLatentImage` emits a typed LATENT placeholder with width/height/images. `batch_size` maps to `images`, and the daemon serializes `images=N` into indexed output jobs with seed offsets. | True Comfy latent-batch execution inside one backend call is not implemented. | `images > 1` emits indexed artifacts/gallery rows through the product queue. Separate latent batch semantics need a backend batch path or fail-loud gating. |
 | Sampler nodes | `KSampler` consumes MODEL, conditioning, and LATENT; sampler/scheduler names select real algorithms; denoise controls txt2img/img2img strength. | `KSampler` requires typed MODEL, positive CONDITIONING, negative CONDITIONING, and LATENT inputs. It maps `steps`, `seed`, `cfg`, `sampler_name`, `scheduler`, and `denoise` into product params. VAEEncode-derived latents carry `LoadImage` into flat `init_image`. Z-Image has bounded Euler, DPM++ 2M, generic UniPC, UniPC bh2, and flat/img2img creativity artifact evidence; unsupported sampler/scheduler pairs fail loud through the shared registry. | Ancestral/SDE/Karras/CFG++ and many catalog names are not accepted runtime algorithms. Graph img2img currently maps metadata into the existing flat backend path, not a full Comfy latent tensor executor. | Unsupported sampler/scheduler names fail before enqueue, or a real sampler registry maps names to measured Mojo samplers with artifact/timing evidence. |
 | VAE decode / SaveImage | `VAEDecode` consumes LATENT plus VAE and emits IMAGE; `SaveImage` consumes IMAGE and honors save options such as prefix/path. | `VAEDecode` requires typed LATENT and VAE inputs and emits typed IMAGE. `SaveImage` requires IMAGE. Real backends still decode internally and write PNG with `serenity.genparams.v1`. | SaveImage prefix/path behavior and graph-selected VAE decode implementation are not independent product nodes. | Decode and save nodes consume typed graph values; SaveImage options are reflected in output paths and metadata, or unsupported options fail 501. |
 | LoRA loader / stack | `LoraLoader`, LoRA stack nodes, and prompt LoRA tags apply one or more adapters to the model/CLIP with per-adapter weights and compatibility checks. | Flat `lora: [{name, weight}]` is parsed. `<lora:name:weight>` prompt tags are extracted. `/v1/models` scans LoRA files. `LoraLoaderModelOnly` lowers into the same flat metadata. Z-Image has explicit multi-LoRA runtime stacking for proven PEFT/Comfy formats. Klein 9B has bounded single-LoRA txt2img support for AI Toolkit/Comfy Flux2-Klein keys at weight `1.0`; `scripts/check_klein_lora_daemon_smoke.py` proved txt2img through the daemon as `job-0308`, and `scripts/check_klein_lora_reference_daemon_smoke.py` proved SerenityFlow's `klein9b_edit_lora.json` graph lowers `LoraLoaderModelOnly` plus `ReferenceLatent` into one real edit sampler invocation as `job-0309`. Qwen and Ideogram4 reject LoRA. | Full `LoraLoader` CLIP-side semantics, LoRA stacks, non-1.0 Klein weights, Klein multi-LoRA, LoKr, and unproven formats remain rejected. | LoRA graph nodes are supported with compatibility metadata, multi-adapter behavior where the backend can prove it, and fail-loud rejection where it cannot. |
-| Image load / resize / img2img | `LoadImage`, resize/crop nodes, `VAEEncode`, img2img, mask and inpaint nodes work as graph nodes. | Flat `init_image` and `creativity` are accepted. `LoadImage` now emits typed IMAGE and MASK handles; `ImageToMask`, `MaskToImage`, `GetImageSize`, `ImageScale`, and `ImageScaleToTotalPixels` lower as path-backed metadata operations; `VAEEncode` converts IMAGE+VAE into a LATENT handle carrying `init_image`; `SetLatentNoiseMask` can attach a mask path to that LATENT; and `KSampler.denoise` maps to `creativity`. Z-Image validates the path, decodes PNG/JPEG/WebP through MOJO-libs, resizes bilinear to the job size, VAE-encodes, and starts denoise at the creativity sigma. Runtime smokes prove graph `LoadImage -> VAEEncode -> KSampler`, `LoadImage -> SetLatentNoiseMask -> KSampler`, and the LanPaint SDXL visual canvas metadata path reach PNG genparams. Qwen and Ideogram4 reject img2img. | Resize/crop and mask conversion are path/metadata passthrough only, MASK is path metadata only, inpaint is not backend-executed, and true graph-side image/mask tensor transforms are still absent. Graph img2img currently uses metadata handles to route into the existing backend `init_image` path. | Image nodes decode/resize into typed graph values, `VAEEncode` feeds sampler latents, mask/inpaint behavior is proven by artifact gates, and unsupported backends reject before CUDA. |
-| Mask / inpaint / LanPaint | `SetLatentNoiseMask`, `ImageToMask`, `MaskToImage`, LanPaint sampler nodes, mask blend, and outpaint padding alter denoise and final compositing. | `JobParams.mask_image`, explicit `lanpaint_*` fields, `/v1/generate` genparams, and worker IPC preserve mask and LanPaint metadata. `SetLatentNoiseMask(samples: LATENT, mask: MASK) -> LATENT` lowers that path for downstream samplers. `LanPaint_KSampler`, `LanPaint_KSamplerAdvanced`, `LanPaint_SamplerCustomAdvanced`, and `LanPaint_MaskBlend` are accepted graph-lowering nodes that copy sampler/blend widgets into canonical metadata; they do not execute the LanPaint inner loop or final blend. `serenitymojo/sampling/inpaint.mojo` has a mask-blend helper and one supplied-score LanPaint overdamped step with synthetic parity coverage. | No real backend consumes `mask_image` or `lanpaint_*` runtime metadata. `ImagePadForOutpaint`, `ThresholdMask`, `LanPaint_SamplerCustom`, and model-specific edit text encoders remain unsupported/fail-loud. | Backend-specific mask-aware denoise, LanPaint inner-loop/blend/outpaint behavior, and parity checks against the LanPaint/SerenityFlow Python oracle must pass before any real backend accepts `mask_image` or `lanpaint_*` runtime metadata. Until then, real backends fail loud through `reject_unsupported_mask_image_params(...)` and `reject_unsupported_lanpaint_params(...)`. |
+| Image load / resize / img2img | `LoadImage`, resize/crop nodes, `VAEEncode`, img2img, mask and inpaint nodes work as graph nodes. | Flat `init_image` and `creativity` are accepted. `LoadImage` now emits typed IMAGE and MASK handles; `ImageToMask`, `MaskToImage`, `GetImageSize`, `ImageScale`, and `ImageScaleToTotalPixels` lower as path-backed metadata operations with mask source metadata; `VAEEncode` converts IMAGE+VAE into a LATENT handle carrying `init_image`; `SetLatentNoiseMask` can attach a mask path/source to that LATENT; and `KSampler.denoise` maps to `creativity`. Z-Image validates the init path, decodes PNG/JPEG/WebP through MOJO-libs, resizes bilinear to the job size, VAE-encodes, starts denoise at the creativity sigma, and for `SetLatentNoiseMask` img2img applies preserve-region blending after each sampler update using `sigma_next`. Runtime smokes prove graph `LoadImage -> VAEEncode -> KSampler`, `LoadImage -> SetLatentNoiseMask -> KSampler`, and the LanPaint SDXL visual canvas metadata path reach PNG genparams. Qwen and Ideogram4 reject img2img. | Resize/crop and most mask conversion remain path/metadata passthrough; true graph-side image/mask tensor transforms are still absent. Graph img2img currently uses metadata handles to route into the existing backend `init_image` path, with only the bounded Z-Image preserve-mask runtime slice consuming `mask_image`. | Image nodes decode/resize into typed graph values, `VAEEncode` feeds sampler latents, bounded Z-Image preserve-mask behavior remains covered by helper/static gates, and unsupported backends reject before CUDA. |
+| Mask / inpaint / LanPaint | `SetLatentNoiseMask`, `ImageToMask`, `MaskToImage`, LanPaint sampler nodes, mask blend, and outpaint padding alter denoise and final compositing. | `JobParams.mask_image`, explicit `lanpaint_*` fields, `/v1/generate` genparams, and worker IPC preserve mask and LanPaint metadata. `SetLatentNoiseMask(samples: LATENT, mask: MASK) -> LATENT` lowers mask path/source metadata for downstream samplers. Z-Image consumes that path for the bounded img2img preserve-mask slice using `decode_comfy_mask`, `resize_mask_bilinear`, and `load_comfy_latent_preserve_mask`; manifests record `mask_image`, `mask_channel`, `inpaint_mask_applied`, `inpaint_preserve_active_pixels`, and `inpaint_preserve_mean`. `resize_mask_nearest_exact`, `binarize_lanpaint_denoise_mask`, and `load_lanpaint_latent_preserve_mask` pin the LanPaint hard-mask preparation substrate for the later full LanPaint path. `LanPaint_KSampler`, `LanPaint_KSamplerAdvanced`, `LanPaint_SamplerCustomAdvanced`, and `LanPaint_MaskBlend` are accepted graph-lowering nodes that copy sampler/blend widgets into canonical metadata; they do not execute the LanPaint inner loop or final blend. `serenitymojo/sampling/inpaint.mojo` has a mask-blend helper and one supplied-score LanPaint overdamped step with synthetic parity coverage. | Full LanPaint sampler/blend/outpaint semantics are not backend-executed. Qwen, Ideogram4, and Klein still reject `mask_image`; Z-Image still rejects unsupported `lanpaint_*` runtime metadata. `ImagePadForOutpaint`, `ThresholdMask`, `LanPaint_SamplerCustom`, and model-specific edit text encoders remain unsupported/fail-loud. | Backend-specific LanPaint inner-loop/blend/outpaint behavior and parity checks against the LanPaint/SerenityFlow Python oracle must pass before any real backend accepts `lanpaint_*` runtime metadata. Until then, real backends fail loud through `reject_unsupported_lanpaint_params(...)`; non-Z-Image mask runtime controls fail loud through `reject_unsupported_mask_image_params(...)`. |
 | Upscale utility nodes | `UpscaleModelLoader`, `ImageUpscaleWithModel`, tiled upscale, and postprocess utility workflows emit real upscaled artifacts. | LTX2 upsampler and Flux/tiling primitives exist elsewhere, but no accepted daemon workflow node or utility endpoint was found. | No product endpoint, no node markers, no artifact/timing/VRAM evidence. | Daemon/UI utility path emits real before/after artifacts with dimensions, timings, VRAM when GPU is used, and metadata. |
 | Control / IP-adapter / regional | ControlNet, IP-Adapter, regional prompting, and conditioning-combine nodes alter generation through model-specific adapters. | `ReferenceLatent` has a bounded Klein edit path, but ControlNet, IP-Adapter, and regional prompting have no accepted daemon graph surface. Some model/parity pieces exist outside the product daemon path, but they are not workflow parity. | No product node family for ControlNet/IPAdapter/regional conditioning, no typed CONTROL value, no per-model compatibility matrix, no artifact evidence. | Each node family has a backend-specific Mojo path, preflight compatibility, and measured artifacts; otherwise node requests fail 501. |
 | Video nodes | Video loaders, image sequence nodes, video sampler nodes, `VideoCombine`, and VHS-style nodes emit MP4s with frame/duration/audio metadata. | `/v1/video` exposes a bounded LTX2 staged dev smoke runner when `output/bin/ltx2_video_smoke_runner` is built, records `accepted_video_parity:false`, and `/v1/video/probe` can inspect MP4 artifacts. Current daemon evidence proves both video-only and audio-enabled A/V smoke artifacts with frame/duration/audio/muxing/VRAM fields, and the runner now emits `ltx2_runner_timings.json` surfaced as daemon `stage_timings`. | This is still a bounded DEV-smoke runner, not a graph-native video node family or full SwarmUI video parity. Qwen/video remain non-production targets for this slice. | A video backend emits MP4 plus frame count, duration, resolution, muxing, audio behavior, timings, peak VRAM, and readiness label. |
@@ -94,9 +108,11 @@ oracle parity evidence.
 
 - No arbitrary ComfyUI graph executor beyond the bounded typed linked image
   chain.
-- No tensor-backed MASK value: current MASK support is path-backed metadata only.
-  LanPaint graph nodes lower metadata only. No advanced typed graph values for
-  CONTROL, UPSCALE_MODEL, IMAGE batches, refiner handles, or video frames.
+- No tensor-backed graph MASK value: current MASK support is path/source metadata.
+  Z-Image consumes it only for the bounded `SetLatentNoiseMask` img2img
+  preserve-mask slice. LanPaint graph nodes lower metadata only. No advanced
+  typed graph values for CONTROL, UPSCALE_MODEL, IMAGE batches, refiner handles,
+  or video frames.
 - No separate CLIP/VAE loader override nodes.
 - `batch_size` maps to serial `images=N` outputs, not true Comfy latent-batch execution.
 - Many `sampler` and `scheduler` catalog names are still unsupported runtime algorithms.
@@ -105,15 +121,15 @@ oracle parity evidence.
 - Graph `LoadImage -> VAEEncode -> KSampler` now maps `init_image`/denoise into
   the existing backend path, but resize/crop and true graph-side image/mask
   tensor transforms remain unsupported.
-- `SetLatentNoiseMask` can carry `mask_image`, but no backend accepts it for
-  real mask-aware denoise. Z-Image, Qwen, Ideogram4, and Klein must fail loud
-  until their inpaint paths are implemented and parity-checked.
+- `SetLatentNoiseMask` can carry `mask_image` plus source/channel metadata.
+  Z-Image consumes it only for bounded img2img preserve-region blending; Qwen,
+  Ideogram4, and Klein still fail loud for mask runtime metadata.
 - `LanPaint_KSampler`, `LanPaint_KSamplerAdvanced`,
   `LanPaint_SamplerCustomAdvanced`, `LanPaint_MaskBlend`, `ImageToMask`, and
   `MaskToImage` are accepted for graph lowering only; they do not execute real
   LanPaint inpaint or blend semantics in a backend.
-- Real backends Z-Image, Qwen, Ideogram4, and Klein reject `lanpaint_*`
-  metadata through `reject_unsupported_lanpaint_params(...)`.
+- Real backends Z-Image, Qwen, Ideogram4, and Klein reject unsupported
+  `lanpaint_*` metadata through `reject_unsupported_lanpaint_params(...)`.
 - Upscale, ControlNet, IP-Adapter, outpaint padding, unsupported LanPaint
   utility nodes, and regional prompting nodes are missing from the accepted
   product daemon graph surface.
@@ -143,7 +159,15 @@ python3 scripts/check_lanpaint_oracle_surface.py \
 ```
 
 That checker preserves the Python oracle and fail-loud boundary. It does not
-prove image quality, full LanPaint parity, or backend mask-aware denoise.
+prove image quality, full LanPaint parity, or general backend inpaint parity; the
+only documented runtime scope here is the bounded Z-Image `SetLatentNoiseMask`
+img2img slice.
+
+Shared mask helper smoke:
+
+```bash
+pixi run mojo run -I . -I /home/alex/MOJO-libs serenitymojo/serve/image_io_mask_smoke.mojo
+```
 
 LanPaint visual canvas lowering has a separate no-heavy product smoke:
 

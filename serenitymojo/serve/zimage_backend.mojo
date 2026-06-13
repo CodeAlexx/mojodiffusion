@@ -87,10 +87,12 @@ from serenitymojo.sampling.unipc import (
 from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
-    reject_unsupported_reference_image_params, reject_unsupported_mask_image_params,
-    reject_unsupported_lanpaint_params,
+    reject_unsupported_reference_image_params, reject_unsupported_lanpaint_params,
 )
-from serenitymojo.serve.image_io import decode_image_any, image_to_signed_nchw
+from serenitymojo.serve.image_io import (
+    decode_image_any, image_to_signed_nchw, load_comfy_latent_preserve_mask,
+    mask_active_count, mask_mean,
+)
 from serenitymojo.serve.model_scan import LORAS_DIR
 
 comptime TArc = ArcPointer[Tensor]
@@ -295,6 +297,11 @@ struct ZImageBackend(GenBackend, Movable):
     var rope: List[TArc]        # 12: cond x/cap/uni cos+sin, then uncond
     var lora_dev: List[ZImageLoraDeviceSet]  # 0/1
     var latent: List[TArc]      # 0/1
+    var inpaint_base_latent: List[Float32]
+    var inpaint_noise: List[Float32]
+    var inpaint_preserve_mask: List[Float32]
+    var inpaint_preserve_active_pixels: Int
+    var inpaint_preserve_mean: Float32
     var job_t0_ns: UInt
     var load_seconds: Float64
     var text_encode_seconds: Float64
@@ -351,6 +358,11 @@ struct ZImageBackend(GenBackend, Movable):
         self.rope = List[TArc]()
         self.lora_dev = List[ZImageLoraDeviceSet]()
         self.latent = List[TArc]()
+        self.inpaint_base_latent = List[Float32]()
+        self.inpaint_noise = List[Float32]()
+        self.inpaint_preserve_mask = List[Float32]()
+        self.inpaint_preserve_active_pixels = 0
+        self.inpaint_preserve_mean = 0.0
         self.job_t0_ns = 0
         self.load_seconds = 0.0
         self.text_encode_seconds = 0.0
@@ -376,7 +388,6 @@ struct ZImageBackend(GenBackend, Movable):
             raise Error("ZImageBackend.start: a job is already running")
         reject_unsupported_common_runtime_params(params, String("zimage"))
         reject_unsupported_reference_image_params(params, String("zimage"))
-        reject_unsupported_mask_image_params(params, String("zimage"))
         reject_unsupported_lanpaint_params(params, String("zimage"))
         var sampler_admission = sampler_admission_for_backend(String("zimage"), params.sampler)
         if not sampler_admission.supported:
@@ -439,6 +450,15 @@ struct ZImageBackend(GenBackend, Movable):
                 raise Error(
                     String("zimage: init image not found: ") + params.init_image
                 )
+        if params.mask_image.byte_length() > 0:
+            if params.init_image.byte_length() == 0:
+                raise Error(
+                    "zimage: SetLatentNoiseMask requires an init_image/VAEEncode latent"
+                )
+            if not _path_exists(params.mask_image):
+                raise Error(
+                    String("zimage: mask image not found: ") + params.mask_image
+                )
         self.params = params.copy()
         self.hl = hl
         self.wl = wl
@@ -473,6 +493,11 @@ struct ZImageBackend(GenBackend, Movable):
         self.text_encode_seconds = 0.0
         self.denoise_seconds = 0.0
         self.vae_decode_seconds = 0.0
+        self.inpaint_base_latent = List[Float32]()
+        self.inpaint_noise = List[Float32]()
+        self.inpaint_preserve_mask = List[Float32]()
+        self.inpaint_preserve_active_pixels = 0
+        self.inpaint_preserve_mean = 0.0
         var mem = cu_mem_get_info()
         self.total_vram_bytes = mem.total_bytes
         self.min_free_bytes = mem.free_bytes
@@ -742,6 +767,27 @@ struct ZImageBackend(GenBackend, Movable):
             var z = self._encode_init_latent()
             if len(z) != len(lat_host):
                 raise Error("zimage img2img: init latent size mismatch")
+            if self.params.mask_image.byte_length() > 0:
+                var preserve = load_comfy_latent_preserve_mask(
+                    self.params.mask_image,
+                    self.params.lanpaint_mask_channel,
+                    self.wl,
+                    self.hl,
+                )
+                if len(preserve.values) != self.hl * self.wl:
+                    raise Error("zimage inpaint: latent preserve mask size mismatch")
+                self.inpaint_base_latent = z.copy()
+                self.inpaint_noise = noise.copy()
+                self.inpaint_preserve_mask = preserve.values.copy()
+                self.inpaint_preserve_active_pixels = mask_active_count(preserve)
+                self.inpaint_preserve_mean = mask_mean(preserve)
+                print(
+                    "[zimage][inpaint] mask", self.params.mask_image,
+                    "channel", self.params.lanpaint_mask_channel,
+                    "-> preserve pixels", self.inpaint_preserve_active_pixels,
+                    "/", self.hl * self.wl,
+                    "(mean", self.inpaint_preserve_mean, ")",
+                )
             var i0 = 0
             var creat = Float32(self.params.creativity)
             while i0 < self.params.steps and self.sigmas[i0] > creat:
@@ -793,6 +839,30 @@ struct ZImageBackend(GenBackend, Movable):
             z.append((mu_h[i] - ZIMG_SHIFT) * ZIMG_SCALING)
         _print_vram("after init-image encode (encoder freed on return)")
         return z^
+
+    def _apply_inpaint_preserve_mask(mut self, var x_new: Tensor, sigma_next: Float32) raises -> Tensor:
+        if len(self.inpaint_preserve_mask) == 0:
+            return x_new^
+        var plane = self.hl * self.wl
+        if plane <= 0 or len(self.inpaint_preserve_mask) != plane:
+            raise Error("zimage inpaint: invalid preserve mask shape")
+        if len(self.inpaint_base_latent) != 16 * plane or len(self.inpaint_noise) != 16 * plane:
+            raise Error("zimage inpaint: invalid base latent/noise shape")
+
+        var host = x_new.to_host(self.ctx)
+        if len(host) != 16 * plane:
+            raise Error("zimage inpaint: update latent size mismatch")
+        var inv_sigma = Float32(1.0) - sigma_next
+        for c in range(16):
+            var c_off = c * plane
+            for p in range(plane):
+                var m = self.inpaint_preserve_mask[p]
+                if m != 0.0:
+                    var idx = c_off + p
+                    var base = sigma_next * self.inpaint_noise[idx] + inv_sigma * self.inpaint_base_latent[idx]
+                    host[idx] = m * base + (Float32(1.0) - m) * host[idx]
+        var shape = [1, 16, self.hl, self.wl]
+        return Tensor.from_host(host, shape^, STDtype.BF16, self.ctx)
 
     # ── one denoise step (CFG dual forward + Euler), comptime grid ───────────
     def _denoise_one[HL: Int, WL: Int](mut self) raises:
@@ -889,6 +959,7 @@ struct ZImageBackend(GenBackend, Movable):
                 add(x_compute, mul_scalar(pred, dt, self.ctx), self.ctx),
                 STDtype.BF16, self.ctx,
             )
+        x_new = self._apply_inpaint_preserve_mask(x_new^, sigma_next)
         self.latent = List[TArc]()
         self.latent.append(TArc(x_new^))
 
@@ -955,8 +1026,13 @@ struct ZImageBackend(GenBackend, Movable):
         content += String('    "guidance":') + String(self.params.cfg) + String(",\n")
         content += String('    "sigma_shift":') + String(self.params.sigma_shift) + String(",\n")
         content += String('    "init_image":"') + _json_escape(self.params.init_image) + String('",\n')
+        content += String('    "mask_image":"') + _json_escape(self.params.mask_image) + String('",\n')
+        content += String('    "mask_channel":"') + _json_escape(self.params.lanpaint_mask_channel) + String('",\n')
         content += String('    "creativity":') + String(self.params.creativity) + String(",\n")
         content += String('    "img2img_applied":') + _json_bool(self.params.init_image.byte_length() > 0) + String(",\n")
+        content += String('    "inpaint_mask_applied":') + _json_bool(len(self.inpaint_preserve_mask) > 0) + String(",\n")
+        content += String('    "inpaint_preserve_active_pixels":') + String(self.inpaint_preserve_active_pixels) + String(",\n")
+        content += String('    "inpaint_preserve_mean":') + String(self.inpaint_preserve_mean) + String(",\n")
         content += String('    "sampler_registry_backend":"zimage",\n')
         content += String('    "requested_sampler":"') + _json_escape(self.params.sampler) + String('",\n')
         content += String('    "requested_scheduler":"') + _json_escape(self.params.scheduler) + String('",\n')
@@ -1106,6 +1182,11 @@ struct ZImageBackend(GenBackend, Movable):
         self.lora_paths = List[String]()
         self.lora_mults = List[Float32]()
         self.latent = List[TArc]()
+        self.inpaint_base_latent = List[Float32]()
+        self.inpaint_noise = List[Float32]()
+        self.inpaint_preserve_mask = List[Float32]()
+        self.inpaint_preserve_active_pixels = 0
+        self.inpaint_preserve_mean = 0.0
         self.executed_sampler = String("flowmatch_euler")
         self.executed_scheduler = String("simple_flowmatch")
         self.denoise_start_step = 0

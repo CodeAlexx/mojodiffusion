@@ -188,8 +188,7 @@ def reject_unsupported_mask_image_params(
 
 def has_lanpaint_runtime_params(params: JobParams) -> Bool:
     return (
-        params.lanpaint_mask_channel.byte_length() > 0
-        or params.lanpaint_mask_blend_overlap >= 0
+        params.lanpaint_mask_blend_overlap >= 0
         or params.lanpaint_num_steps >= 0
         or params.lanpaint_lambda >= 0.0
         or params.lanpaint_step_size >= 0.0

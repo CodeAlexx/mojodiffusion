@@ -36,6 +36,7 @@ it must not pretend that ordinary img2img or txt2img is mask-aware denoise.
 - LanPaint canvas product smoke: `scripts/check_lanpaint_canvas_daemon_smoke.py`
 - Shared backend contract: `serenitymojo/serve/backend.mojo`
 - Worker IPC contract: `serenitymojo/serve/ipc_codec.mojo`
+- Image/mask I/O helpers: `serenitymojo/serve/image_io.mojo`
 - Mask math substrate: `serenitymojo/sampling/inpaint.mojo`
 - Klein daemon bridge: `serenitymojo/serve/klein_backend.mojo`
 - Klein staged sampler and LoRA loader:
@@ -117,6 +118,19 @@ typed lowering, daemon parse, PNG genparams, and readiness JSON carry
 it does not prove real mask-aware denoise, mask blend execution, inpaint image
 quality, or full LanPaint parity.
 
+The first Z-Image `SetLatentNoiseMask` img2img runtime slice is now present. It
+does not change the LanPaint boundary below: full LanPaint sampler inner-loop and
+blend semantics remain fenced by `reject_unsupported_lanpaint_params(...)`.
+
+Validation passed:
+
+```bash
+pixi run mojo run -I . -I /home/alex/MOJO-libs serenitymojo/serve/image_io_mask_smoke.mojo
+pixi run build-daemon
+python3 scripts/check_lanpaint_oracle_surface.py --write-report output/checks/lanpaint_oracle_surface.json
+python3 scripts/check_workflow_node_surface.py --write-readiness output/checks/workflow_node_surface_readiness.json
+```
+
 Static surface gate command:
 
 ```bash
@@ -132,9 +146,10 @@ Current static gate coverage:
 
 - `arbitrary_comfy_swarm_graph_execution_ready = false`
 - source checks cover the Comfy API prompt adapter, Comfy UI visual canvas
-  adapter, bounded typed image graph allowlist, LanPaint field lowering,
-  explicit `lanpaint_*` `JobParams`/daemon/IPC fields, and backend fail-loud
-  rejection through `reject_unsupported_lanpaint_params(...)`.
+  adapter, bounded typed image graph allowlist, mask source metadata,
+  `image_io.mojo` mask helpers, LanPaint field lowering, explicit `lanpaint_*`
+  `JobParams`/daemon/IPC fields, Z-Image preserve-mask application, and
+  backend fail-loud rejection through `reject_unsupported_lanpaint_params(...)`.
 - readiness checks read `output/checks/lanpaint_canvas_daemon_smoke.json` and
   expect the `job-0311` LanPaint canvas metadata smoke.
 - `inpaint_parity.mojo` passes mask-blend and LanPaint overdamped-step tensor
@@ -170,17 +185,27 @@ Currently accepted graph nodes:
   `LanPaint_SamplerCustomAdvanced`, `LanPaint_MaskBlend`, `SaveImage`,
   `PreviewImage`, `MarkdownNote`, `Note`
 
-Do not overclaim this as full graph parity. `SetLatentNoiseMask` currently
-carries path-backed mask metadata only: `LoadImage` can expose a typed `MASK`
-slot, `SetLatentNoiseMask` can attach that mask path to a `LATENT`, and
-`KSampler`/`SamplerCustomAdvanced` can lower it into `JobParams.mask_image`.
+Do not overclaim this as full graph parity. `SetLatentNoiseMask` now carries
+path-backed mask metadata plus mask source metadata: `LoadImage` exposes a typed
+`MASK` slot with source `load_image_mask` for Comfy's inverted-alpha mask, while
+raw `ImageToMask` channels remain raw channel values with no thresholding.
+`SetLatentNoiseMask` can attach that mask to a `LATENT`, and
+`KSampler`/`SamplerCustomAdvanced` can lower it into `JobParams.mask_image` plus
+`lanpaint_mask_channel`.
+
+Z-Image consumes that mask only for the bounded img2img preserve-region slice:
+it stores the encoded init latent, seeded noise, and latent preserve mask, then
+applies preserve-region blending after every sampler update using `sigma_next`.
+Result metadata records `mask_image`, `mask_channel`, `inpaint_mask_applied`,
+`inpaint_preserve_active_pixels`, and `inpaint_preserve_mean`.
+
 The visual Comfy UI canvas adapter (`looks_like_comfy_ui_canvas_graph`,
 `comfy_ui_canvas_to_typed_graph`, `apply_comfy_ui_canvas_graph`) can lower
 LanPaint sampler, mask-conversion, and mask-blend nodes into flat
-`lanpaint_*`, `mask_image`, and `init_image` metadata. Real mask-aware denoise
-and LanPaint blend execution are not wired into Z-Image, Qwen, Ideogram4, or
-Klein yet; those backends now fail loud when `mask_image` or `lanpaint_*`
-runtime metadata is set.
+`lanpaint_*`, `mask_image`, and `init_image` metadata. Full LanPaint sampler
+inner-loop and blend semantics are still not wired into a backend; Z-Image,
+Qwen, Ideogram4, and Klein must continue to fail loud for unsupported
+`lanpaint_*` runtime metadata.
 `LoraLoaderModelOnly` only lowers model-side LoRA metadata into the flat request
 contract; full `LoraLoader`, CLIP-side LoRA, LoRA stacks, KJNodes utilities,
 ControlNet, IPAdapter, arbitrary custom Comfy nodes, and unsupported LanPaint
@@ -191,13 +216,14 @@ fail loud.
 
 - Z-Image plain t2i template import works through stub product smoke.
 - `LoadImage/VAEEncode` metadata plumbing works under stub.
-- `SetLatentNoiseMask` metadata plumbing works under stub and records
-  `mask_image`, but no real backend consumes that mask yet.
+- `SetLatentNoiseMask` metadata plumbing works under stub and Z-Image has a
+  bounded img2img preserve-mask runtime path. This is not full inpaint,
+  arbitrary mask tensor, or LanPaint parity.
 - `LanPaint_KSampler`, `LanPaint_KSamplerAdvanced`,
   `LanPaint_SamplerCustomAdvanced`, `LanPaint_MaskBlend`, `ImageToMask`, and
-  `MaskToImage` are accepted graph-lowering nodes now. They only carry metadata
-  and path-backed image/mask handles; they do not execute LanPaint denoise or
-  blend semantics in a real backend.
+  `MaskToImage` are accepted graph-lowering nodes now. They carry metadata and
+  path-backed image/mask handles; LanPaint sampler/blend nodes still do not
+  execute LanPaint denoise or blend semantics in a real backend.
 - This is not accepted general Z-Image i2i parity.
 - This is not accepted Z-Image/Qwen/Klein/Ideogram inpaint parity.
 - Z-Image init-image encode code may be useful substrate for refiner/LanPaint/
@@ -327,27 +353,41 @@ Current bounded contract:
    `serenity.genparams.v1`.
 3. Worker IPC encodes/decodes `mask_image`.
 4. Comfy API prompt slot lowering maps `LoadImage` output slot 1 to typed
-   `MASK`.
-5. `SetLatentNoiseMask(samples: LATENT, mask: MASK) -> LATENT` propagates the
+   `MASK` with source `load_image_mask`, matching Comfy's `LoadImage` inverted
+   alpha mask.
+5. Raw `ImageToMask` channels remain raw channel values with no thresholding.
+   `MaskToImage -> ImageToMask(red)` preserves mask source metadata instead of
+   collapsing the chain into a bare path.
+6. `SetLatentNoiseMask(samples: LATENT, mask: MASK) -> LATENT` propagates the
    source latent plus mask path to downstream `KSampler` or
    `SamplerCustomAdvanced`.
-6. Comfy UI visual canvas lowering maps widgets and links through
+7. Comfy UI visual canvas lowering maps widgets and links through
    `comfy_ui_canvas_to_typed_graph`, including `ImageToMask`, `MaskToImage`,
    `LanPaint_KSampler`, `LanPaint_KSamplerAdvanced`,
    `LanPaint_SamplerCustomAdvanced`, and `LanPaint_MaskBlend`.
-7. `JobParams`, daemon genparams, and worker IPC carry explicit `lanpaint_*`
+8. `JobParams`, daemon genparams, and worker IPC carry explicit `lanpaint_*`
    fields: mask channel/blend overlap, LanPaint step count, lambda, step size,
    beta, friction, prompt/inpainting modes, add-noise controls, step bounds,
    leftover-noise behavior, early stop, inner threshold, and inner patience.
-8. Z-Image, Qwen, Ideogram4, and Klein call
-   `reject_unsupported_mask_image_params(...)` until they implement real
-   mask-aware denoise.
-9. Z-Image, Qwen, Ideogram4, and Klein call
-   `reject_unsupported_lanpaint_params(...)` until they implement real LanPaint
-   mask-aware inner-loop and final blend semantics.
+9. Shared mask helpers in `serenitymojo/serve/image_io.mojo` are
+   `decode_comfy_mask`, `resize_mask_bilinear`,
+   `load_comfy_latent_preserve_mask`, `resize_mask_nearest_exact`,
+   `binarize_lanpaint_denoise_mask`, and
+   `load_lanpaint_latent_preserve_mask`. Z-Image uses the Comfy soft bilinear
+   path; the hard nearest helpers are LanPaint substrate for later full
+   LanPaint runtime work.
+10. Z-Image consumes `mask_image` for the bounded `SetLatentNoiseMask` img2img
+    slice by storing encoded init latent, seeded noise, and the latent preserve
+    mask, then applying the preserve blend after each sampler update using
+    `sigma_next`.
+11. Qwen, Ideogram4, and Klein still call
+    `reject_unsupported_mask_image_params(...)` for mask runtime metadata.
+12. Z-Image, Qwen, Ideogram4, and Klein call
+    `reject_unsupported_lanpaint_params(...)` until they implement real LanPaint
+    mask-aware inner-loop and final blend semantics.
 
-This prevents inpaint workflows from silently degrading into plain img2img or
-txt2img.
+This keeps unsupported inpaint/LanPaint workflows from silently degrading into
+plain img2img or txt2img while allowing the narrow Z-Image preserve-mask slice.
 
 Current LanPaint boundary:
 
@@ -361,11 +401,13 @@ Current LanPaint boundary:
 - `LanPaint_KSampler`, `LanPaint_SamplerCustomAdvanced`,
   `LanPaint_KSamplerAdvanced`, `LanPaint_MaskBlend`, `ImageToMask`, and
   `MaskToImage` are supported only for graph lowering and metadata propagation.
-  They are not accepted as real backend execution semantics.
+  They are not accepted as real LanPaint backend execution semantics.
 - Acceptance for real LanPaint/inpaint execution requires backend-specific
   mask-aware denoise, mask blend/outpaint behavior where applicable, and parity
   checks against the Python oracle. Until then, any request that reaches a real
-  backend with `mask_image` or `lanpaint_*` runtime metadata must fail loud.
+  backend with `lanpaint_*` runtime metadata must fail loud; the Z-Image
+  `SetLatentNoiseMask` path is only a preserve-mask img2img slice, not LanPaint
+  sampler or blend parity.
 
 ## Oracle Search Findings
 

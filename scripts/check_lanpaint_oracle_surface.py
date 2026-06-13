@@ -21,6 +21,7 @@ LANPAINT_NODES = Path("/home/alex/LanPaint/src/LanPaint/nodes.py")
 SERENITYFLOW_LATENT = Path("/home/alex/serenityflow-v2/serenityflow/nodes/latent.py")
 WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
 BACKEND = REPO / "serenitymojo/serve/backend.mojo"
+IMAGE_IO = REPO / "serenitymojo/serve/image_io.mojo"
 INPAINT_MOJO = REPO / "serenitymojo/sampling/inpaint.mojo"
 INPAINT_PARITY = REPO / "serenitymojo/sampling/parity/inpaint_parity.mojo"
 NODE_SURFACE = REPO / "scripts/check_workflow_node_surface.py"
@@ -288,6 +289,8 @@ def run() -> dict[str, Any]:
             'or type_id == "LanPaint_SamplerCustomAdvanced"',
             'or type_id == "LanPaint_MaskBlend"',
             "comfy_ui_canvas_to_typed_graph",
+            "_workflow_source_meta",
+            "load_image_mask",
             "_workflow_copy_lanpaint_sampler_fields",
             'or type_id == "SamplerCustomAdvanced"',
             '_set_if_missing(obj, String("mask_image")',
@@ -295,6 +298,21 @@ def run() -> dict[str, Any]:
         ],
     )
     blockers.extend(mojo_boundary_blockers)
+
+    mask_io, mask_io_blockers = contains_all(
+        IMAGE_IO,
+        [
+            "decode_comfy_mask",
+            "load_image_mask",
+            "ImageToMask is raw channel selection",
+            "resize_mask_bilinear",
+            "resize_mask_nearest_exact",
+            "binarize_lanpaint_denoise_mask",
+            "load_comfy_latent_preserve_mask",
+            "load_lanpaint_latent_preserve_mask",
+        ],
+    )
+    blockers.extend(mask_io_blockers)
 
     node_surface, node_surface_blockers = contains_all(
         NODE_SURFACE,
@@ -343,13 +361,13 @@ def run() -> dict[str, Any]:
         "mojo": {
             "inpaint_math_substrate": mojo_inpaint,
             "inpaint_parity_gate": parity_gate,
+            "mask_io_boundary": mask_io,
             "workflow_fail_loud_boundary": mojo_boundary,
             "node_surface_lanpaint_plumbing": node_surface,
             "backend_fail_loud_boundary": backend_boundary,
         },
         "non_claims": [
-            "No real backend consumes mask_image yet.",
-            "LanPaint graph lowering carries metadata only; it is not real mask-aware denoise.",
+            "Z-Image consumes plain SetLatentNoiseMask for img2img; full LanPaint sampler/blend semantics are still fenced.",
             "The current Mojo parity gate covers weight-free mask blend and one supplied-score overdamped step only.",
         ],
     }

@@ -513,6 +513,15 @@ def _workflow_image_path(
     raise Error("[501] workflow graph image handle missing source")
 
 
+def _workflow_source_meta(
+    nodes: List[Int], ports: List[String], metas: List[String], link: WorkflowLink,
+) raises -> String:
+    for i in range(len(nodes)):
+        if nodes[i] == link.node_id and ports[i] == link.port:
+            return metas[i].copy()
+    raise Error("[501] workflow graph handle metadata missing source")
+
+
 def _workflow_latent_index(
     nodes: List[Int], ports: List[String], link: WorkflowLink,
 ) -> Int:
@@ -1138,9 +1147,11 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
     var image_nodes = List[Int]()
     var image_ports = List[String]()
     var image_paths = List[String]()
+    var image_mask_sources = List[String]()
     var mask_nodes = List[Int]()
     var mask_ports = List[String]()
     var mask_paths = List[String]()
+    var mask_sources = List[String]()
     var latent_nodes = List[Int]()
     var latent_ports = List[String]()
     var latent_widths = List[Int]()
@@ -1269,7 +1280,9 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MASK"), String("MASK"))
                 image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(image_path)
+                image_mask_sources.append(String(""))
                 mask_nodes.append(node_id); mask_ports.append(String("MASK")); mask_paths.append(image_path)
+                mask_sources.append(String("load_image_mask"))
                 done[i] = True; remaining -= 1; progressed = True
             elif type_id == "ImageToMask":
                 var image_link = _workflow_find_input_link(edges, node_id, String("image"))
@@ -1279,9 +1292,15 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 if idx >= 0:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
                     var image_path = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
-                    _copy_field_if_missing(obj, fields, String("channel"), String("lanpaint_mask_channel"))
+                    var mask_source = _workflow_source_meta(image_nodes, image_ports, image_mask_sources, image_link)
+                    if mask_source == "":
+                        mask_source = _workflow_string(fields, String("channel"))
+                        if mask_source == "":
+                            mask_source = String("red")
+                    _set_if_missing(obj, String("lanpaint_mask_channel"), JSONValue.from_string(mask_source))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MASK"), String("MASK"))
                     mask_nodes.append(node_id); mask_ports.append(String("MASK")); mask_paths.append(image_path)
+                    mask_sources.append(mask_source)
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "MaskToImage":
                 var mask_link = _workflow_find_input_link(edges, node_id, String("mask"))
@@ -1291,8 +1310,10 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 if idx >= 0:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, mask_link, String("MASK"), String("mask"))
                     var mask_path = _workflow_image_path(mask_nodes, mask_ports, mask_paths, mask_link)
+                    var mask_source = _workflow_source_meta(mask_nodes, mask_ports, mask_sources, mask_link)
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
                     image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(mask_path)
+                    image_mask_sources.append(mask_source)
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "GetImageSize":
                 var image_link = _workflow_find_input_link(edges, node_id, String("image"))
@@ -1313,8 +1334,10 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 if idx >= 0:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
                     var image_path = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
+                    var mask_source = _workflow_source_meta(image_nodes, image_ports, image_mask_sources, image_link)
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
                     image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(image_path)
+                    image_mask_sources.append(mask_source)
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "VAEEncode":
                 var pixels_link = _workflow_find_input_link(edges, node_id, String("pixels"))
@@ -1349,7 +1372,9 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, mask_link, String("MASK"), String("mask"))
                     var latent_idx = _workflow_latent_index(latent_nodes, latent_ports, samples_link)
                     var mask_path = _workflow_image_path(mask_nodes, mask_ports, mask_paths, mask_link)
+                    var mask_source = _workflow_source_meta(mask_nodes, mask_ports, mask_sources, mask_link)
                     _set_if_missing(obj, String("mask_image"), JSONValue.from_string(mask_path))
+                    _set_if_missing(obj, String("lanpaint_mask_channel"), JSONValue.from_string(mask_source))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
                     latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
                     if latent_idx >= 0:
@@ -1380,8 +1405,10 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, mask_link, String("MASK"), String("mask"))
                     var init_path = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
                     var mask_path = _workflow_image_path(mask_nodes, mask_ports, mask_paths, mask_link)
+                    var mask_source = _workflow_source_meta(mask_nodes, mask_ports, mask_sources, mask_link)
                     _set_if_missing(obj, String("init_image"), JSONValue.from_string(init_path))
                     _set_if_missing(obj, String("mask_image"), JSONValue.from_string(mask_path))
+                    _set_if_missing(obj, String("lanpaint_mask_channel"), JSONValue.from_string(mask_source))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MASK"), String("MASK"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
@@ -1390,7 +1417,9 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     latent_init_images.append(init_path)
                     latent_mask_images.append(mask_path)
                     mask_nodes.append(node_id); mask_ports.append(String("MASK")); mask_paths.append(mask_path)
+                    mask_sources.append(mask_source)
                     image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(init_path)
+                    image_mask_sources.append(String(""))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "ReferenceLatent":
                 var cond_link = _workflow_find_input_link(edges, node_id, String("conditioning"))
@@ -1672,10 +1701,13 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     if image_path == "":
                         image_path = _workflow_image_path(image_nodes, image_ports, image_paths, image1_link)
                     var mask_path = _workflow_image_path(mask_nodes, mask_ports, mask_paths, mask_link)
+                    var mask_source = _workflow_source_meta(mask_nodes, mask_ports, mask_sources, mask_link)
                     _set_if_missing(obj, String("mask_image"), JSONValue.from_string(mask_path))
+                    _set_if_missing(obj, String("lanpaint_mask_channel"), JSONValue.from_string(mask_source))
                     _copy_field_if_missing(obj, fields, String("blend_overlap"), String("lanpaint_mask_blend_overlap"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
                     image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(image_path)
+                    image_mask_sources.append(String(""))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "VAEDecode":
                 var samples_link = _workflow_find_input_link(edges, node_id, String("samples"))
@@ -1691,6 +1723,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, vae_link, String("VAE"), String("vae"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
                     image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(String(""))
+                    image_mask_sources.append(String(""))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "SaveImage":
                 var image_link = _workflow_find_input_link(edges, node_id, String("images"))

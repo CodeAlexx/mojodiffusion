@@ -26,6 +26,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # read the daemon's jobs.db (SQLite) for /v1/jobs history. bundled = no system dep;
 # the on-disk schema is the contract, not the library (plan §8).
 rusqlite = { version = "0.32", features = ["bundled"] }
+# RFC1123 timestamps for JobRecord.created (matches the daemon's http_date format).
+httpdate = "1"
 # internal
 serenity-wire = { path = "crates/wire" }
 serenity-ipc = { path = "crates/ipc" }

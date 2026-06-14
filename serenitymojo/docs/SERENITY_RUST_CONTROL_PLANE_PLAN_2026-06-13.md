@@ -297,15 +297,30 @@ Run the Rust server `serenity-server --worker output/bin/serenity_worker_stub --
   `JobRecord`s; the Rust registry evicts terminal jobs and tracks no per-job
   `created/state/step/total`. That write-side (R-DB-1/2) is the next piece.
 
-### REMAINING — the R-DB write-side + 1 endpoint
-The write-side is now the long pole: the Rust server must track current-session
-`JobRecord`s (created/state/progress/step/total/output_path/error) through the job
-lifecycle and persist them to `jobs.db` (the daemon's schema). That unblocks, together:
-- **current-session jobs** in `GET /v1/jobs` (append `job_json_value` after the prior rows),
-- **`/v1/reorder`** (@3315) + **`/v1/remove`** (@3347) — operate on QUEUED current jobs,
-- **`/v1/gallery/import`** (@3059) — allocates a new `job-{counter}` id.
-Then the last endpoint:
-- **`/v1/video`** (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
+- **`/v1/video`** (`crates/server/src/video.rs`) — GET readiness (`serenity.video_status.v1`),
+  POST bounded LTX2 staged smoke, GET `/v1/video/probe` (ffprobe → `serenity.video_probe.v1`).
+  VERIFIED: GET readiness byte-identical (identity normalized); POST validation strings
+  byte-confirmed vs the (flaky) oracle + match source. ⚠ POST spawns the real GPU runner
+  when built — don't run the smoke case in tests.
+- **`/v1/jobs` CURRENT-session jobs (write-side, live)** (`main.rs` JobRecord layer) —
+  the Rust now tracks a `JobRecord` per job (created=RFC1123, model, state, progress, step,
+  total, image_index/count, output_path, error), flipped queued→running→done/failed/cancelled
+  by the worker-driver as events flow, and APPENDS them after the prior rows in `GET /v1/jobs`
+  (+ `GET /v1/job/:id` checks current first). Job ids are now the daemon's **`job-XXXX`**
+  scheme (counter based at `max_prior_id`), so generated `job-XXXX.png` show in the gallery
+  and ids never collide with prior rows. **VERIFIED: the generate→progress→WS core still
+  works (job-0001 produced an image, WS done); `/v1/jobs` shows live jobs with the exact
+  `job_json_value` shape + values; two jobs appear in order.** (Current jobs can't byte-match
+  the oracle — `created` timestamps differ — so this is shape+value verified, not byte.)
+
+### ENDPOINT SURFACE COMPLETE (12/12). Remaining write-side hardening:
+- **jobs.db persistence (R-DB-1/2)** — write session JobRecords back to `jobs.db` (the
+  daemon schema) on state transitions so they survive a restart as prior rows. Needs the
+  per-row `params_json` (read from the output PNG's genparams at done-time).
+- **`/v1/reorder`** (@3315) + **`/v1/remove`** (@3347) — reorder/cancel QUEUED jobs. Needs
+  the driver to pull from the shared JobBook in order (a queue refactor) rather than the
+  current arrival-order mpsc; do carefully (touches the verified core).
+- **`/v1/gallery/import`** (@3059) — copy a PNG in as a new `job-{counter}` id. (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
   GET-one @3049-3182). Scans `OUT_DIR/*.png` for embedded `serenity.genparams.v1` tEXt +
   favorites/order state (`<out_dir>/state/gallery.json`). LARGE. Schema `serenity.gallery.v1`.
 - **`/v1/jobs`** (handler @3295) + `/v1/reorder` (@3315) + `/v1/remove` (@3347). Returns the

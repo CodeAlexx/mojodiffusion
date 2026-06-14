@@ -28,9 +28,45 @@ fn terminal_state(s: &str) -> bool {
     s == "done" || s == "failed" || s == "cancelled" || s == "interrupted"
 }
 
+/// A current-session job record (the daemon's `JobRecord`, emitted-fields view).
+#[derive(Clone)]
+pub struct JobRecord {
+    pub id: String,
+    pub created: String,
+    pub model: String,
+    pub state: String, // queued | running | done | failed | cancelled
+    pub progress: i64,
+    pub step: i64,
+    pub total: i64,
+    pub image_index: i64,
+    pub image_count: i64,
+    pub output_path: String,
+    pub error: String,
+}
+
+/// `job_json_value`: a current-session JobRecord → JSON (the daemon's shape; note
+/// current jobs carry NO params_json/params/history — those are prior-row only).
+pub fn job_json_value(r: &JobRecord) -> Value {
+    json!({
+        "id": r.id, "created": r.created, "model": r.model, "state": r.state,
+        "progress": r.progress, "step": r.step, "total": r.total,
+        "image_index": r.image_index, "image_count": r.image_count,
+        "output_path": r.output_path, "error": r.error,
+    })
+}
+
+fn job_id_num(id: &str) -> i64 {
+    id.strip_prefix("job-").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0)
+}
+
+/// `max_prior_id`: highest job number among prior rows (the new-id counter base, F7).
+pub fn max_prior_id(prior: &[[String; 6]]) -> i64 {
+    prior.iter().map(|r| job_id_num(&r[0])).max().unwrap_or(0)
+}
+
 /// `load_prior_rows`: jobs.db `jobs` rows in insertion order, non-terminal repaired
 /// to "interrupted". Missing/unreadable db → empty (fresh start), like the daemon.
-fn load_prior_rows(db_path: &Path) -> Vec<[String; 6]> {
+pub fn load_prior_rows(db_path: &Path) -> Vec<[String; 6]> {
     let mut out = Vec::new();
     let conn = match rusqlite::Connection::open_with_flags(
         db_path,
@@ -97,10 +133,15 @@ fn prior_job_json_value(row: &[String; 6]) -> Value {
     Value::Object(o)
 }
 
-/// GET /v1/jobs — prior (jobs.db history) rows. Current-session records: see SCOPE.
+/// GET /v1/jobs — prior (jobs.db history) rows THEN current-session JobRecords,
+/// matching the daemon (prior loaded once at startup + the live `jobs` list).
 pub async fn get_jobs(State(st): State<AppState>) -> Response {
-    let db = st.out_dir.join("jobs.db");
-    let arr: Vec<Value> = load_prior_rows(&db).iter().map(prior_job_json_value).collect();
+    let mut arr: Vec<Value> = st.prior.iter().map(prior_job_json_value).collect();
+    if let Ok(jobs) = st.jobs.lock() {
+        for r in jobs.iter() {
+            arr.push(job_json_value(r));
+        }
+    }
     (
         [(CONTENT_TYPE, "application/json")],
         serde_json::to_string(&Value::Array(arr)).unwrap_or_else(|_| String::from("[]")),
@@ -108,17 +149,22 @@ pub async fn get_jobs(State(st): State<AppState>) -> Response {
         .into_response()
 }
 
-/// GET /v1/job/:id — one job by id (prior rows; current-session: see SCOPE).
+/// GET /v1/job/:id — current-session job FIRST (the daemon checks `jobs` then prior).
 pub async fn get_job_one(State(st): State<AppState>, axum::extract::Path(id): axum::extract::Path<String>) -> Response {
-    let db = st.out_dir.join("jobs.db");
-    for row in load_prior_rows(&db) {
-        if row[0] == id {
-            return (
-                [(CONTENT_TYPE, "application/json")],
-                serde_json::to_string(&prior_job_json_value(&row)).unwrap_or_else(|_| String::from("{}")),
-            )
-                .into_response();
+    let ok = |v: Value| -> Response {
+        (
+            [(CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&v).unwrap_or_else(|_| String::from("{}")),
+        )
+            .into_response()
+    };
+    if let Ok(jobs) = st.jobs.lock() {
+        if let Some(r) = jobs.iter().find(|r| r.id == id) {
+            return ok(job_json_value(r));
         }
+    }
+    if let Some(row) = st.prior.iter().find(|r| r[0] == id) {
+        return ok(prior_job_json_value(row));
     }
     (
         StatusCode::NOT_FOUND,

@@ -857,6 +857,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
+ "httpdate",
  "image",
  "rusqlite",
  "serde",

@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -174,6 +174,10 @@ struct AppState {
     next_id: Arc<AtomicU64>,
     /// Server-configured output directory written into every JobParams.out_dir.
     out_dir: PathBuf,
+    /// Prior jobs.db rows loaded ONCE at startup (history half of /v1/jobs).
+    prior: Arc<Vec<[String; 6]>>,
+    /// Current-session JobRecords (live half of /v1/jobs), ordered by enqueue.
+    jobs: Arc<Mutex<Vec<jobs::JobRecord>>>,
 }
 
 // ── request body ────────────────────────────────────────────────────────────--
@@ -305,12 +309,51 @@ fn parse_args() -> (PathBuf, u16, PathBuf, Vec<String>) {
 /// that arrive while one is running are buffered in `pending` and run next. If the
 /// worker peer-closes mid-job it fails that job and respawns the worker LAZILY
 /// rather than tearing the server down.
+/// Update the current-session JobRecord with `id` in place (no-op if absent).
+fn update_record(
+    jobs: &Arc<Mutex<Vec<jobs::JobRecord>>>,
+    id: &str,
+    f: impl FnOnce(&mut jobs::JobRecord),
+) {
+    if let Ok(mut v) = jobs.lock() {
+        if let Some(r) = v.iter_mut().find(|r| r.id == id) {
+            f(r);
+        }
+    }
+}
+
+/// Apply a WorkerEvent to the matching JobRecord (state/step/progress/output/error).
+fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobRecord>>>, id: &str, ev: &WorkerEvent) {
+    match ev {
+        WorkerEvent::Progress { step, total, .. } => update_record(jobs, id, |r| {
+            r.state = "running".to_string();
+            r.step = *step;
+            if *total > 0 {
+                r.total = *total;
+                r.progress = step * 100 / total;
+            }
+        }),
+        WorkerEvent::Done { output_path } => update_record(jobs, id, |r| {
+            r.state = "done".to_string();
+            r.progress = 100;
+            r.output_path = output_path.clone();
+        }),
+        WorkerEvent::Failed { error } => update_record(jobs, id, |r| {
+            r.state = "failed".to_string();
+            r.error = error.clone();
+        }),
+        WorkerEvent::Cancelled => update_record(jobs, id, |r| r.state = "cancelled".to_string()),
+        WorkerEvent::Ready => {}
+    }
+}
+
 fn run_worker_driver(
     worker_bin: PathBuf,
     worker_args: Vec<String>,
     ctl: std::sync::mpsc::Receiver<DriverCtl>,
     registry: Registry,
     in_flight: Arc<Mutex<Option<String>>>,
+    jobs: Arc<Mutex<Vec<jobs::JobRecord>>>,
 ) {
     // `handle` is Option so we can drop a dead worker and respawn lazily on the next
     // job (mirrors process_isolated_backend: a peer-close fails the job, the next
@@ -355,9 +398,11 @@ fn run_worker_driver(
                 Ok(h) => handle = Some(h),
                 Err(e) => {
                     tracing::error!(%job_id, "worker respawn failed: {e:#}");
-                    channel.publish(WorkerEvent::Failed {
+                    let ev = WorkerEvent::Failed {
                         error: format!("worker unavailable (respawn failed): {e}"),
-                    });
+                    };
+                    apply_event_to_record(&jobs, &job_id, &ev);
+                    channel.publish(ev);
                     schedule_evict(&registry, &job_id);
                     continue;
                 }
@@ -367,12 +412,13 @@ fn run_worker_driver(
 
         tracing::info!(%job_id, "starting job");
         set_in_flight(&in_flight, Some(job_id.clone()));
+        update_record(&jobs, &job_id, |r| r.state = "running".to_string());
 
         if let Err(e) = h.send_start(&job.params) {
             tracing::error!(%job_id, "send_start failed: {e:#}");
-            channel.publish(WorkerEvent::Failed {
-                error: format!("send_start failed: {e}"),
-            });
+            let ev = WorkerEvent::Failed { error: format!("send_start failed: {e}") };
+            apply_event_to_record(&jobs, &job_id, &ev);
+            channel.publish(ev);
             set_in_flight(&in_flight, None);
             schedule_evict(&registry, &job_id);
             // send_start failing usually means the worker is dead; drop it so the
@@ -385,7 +431,7 @@ fn run_worker_driver(
 
         // Poll until terminal OR the worker peer-closes, servicing `ctl` each tick so
         // a cancel for THIS job reaches the worker promptly (and stray jobs buffer).
-        let outcome = drive_one_job(h, &channel, &job_id, &ctl, &mut pending);
+        let outcome = drive_one_job(h, &channel, &job_id, &ctl, &mut pending, &jobs);
         set_in_flight(&in_flight, None);
         schedule_evict(&registry, &job_id);
 
@@ -490,6 +536,7 @@ fn drive_one_job(
     job_id: &str,
     ctl: &std::sync::mpsc::Receiver<DriverCtl>,
     pending: &mut std::collections::VecDeque<Box<QueuedJob>>,
+    jobs: &Arc<Mutex<Vec<jobs::JobRecord>>>,
 ) -> JobOutcome {
     loop {
         // 1. Service any pending control messages WITHOUT blocking.
@@ -520,6 +567,7 @@ fn drive_one_job(
         match handle.next_event_poll() {
             Ok(EventPoll::Event(ev)) => {
                 let terminal = ev.is_terminal();
+                apply_event_to_record(jobs, job_id, &ev);
                 channel.publish(ev);
                 if terminal {
                     return JobOutcome::Terminal;
@@ -529,15 +577,17 @@ fn drive_one_job(
                 std::thread::sleep(POLL_INTERVAL);
             }
             Ok(EventPoll::PeerClosed) => {
-                channel.publish(WorkerEvent::Failed {
+                let ev = WorkerEvent::Failed {
                     error: "worker process exited unexpectedly".to_string(),
-                });
+                };
+                apply_event_to_record(jobs, job_id, &ev);
+                channel.publish(ev);
                 return JobOutcome::PeerClosed;
             }
             Err(e) => {
-                channel.publish(WorkerEvent::Failed {
-                    error: format!("worker IPC error: {e}"),
-                });
+                let ev = WorkerEvent::Failed { error: format!("worker IPC error: {e}") };
+                apply_event_to_record(jobs, job_id, &ev);
+                channel.publish(ev);
                 return JobOutcome::IpcError;
             }
         }
@@ -615,13 +665,11 @@ async fn post_generate(
         }
     };
 
-    // Unique job_id: monotonic counter + a SystemTime millis suffix (no rand).
-    let n = st.next_id.fetch_add(1, Ordering::Relaxed);
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let job_id = format!("job_{millis}_{n}");
+    // job-XXXX id (the daemon's scheme, so gallery `job-*.png` + jobs.db stay
+    // coherent). next_id was initialized to max_prior_id, so the first new job is
+    // max_prior_id+1 and never collides with a prior row.
+    let n = st.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let job_id = format!("job-{n:04}");
 
     // default() then override the provided fields.
     let mut params = JobParams::default();
@@ -669,6 +717,24 @@ async fn post_generate(
         params.loras = v;
     }
     params.out_dir = st.out_dir.to_string_lossy().into_owned();
+
+    // Track a current-session JobRecord (queued) so /v1/jobs shows it live. The
+    // driver flips it running -> done/failed/cancelled as worker events flow.
+    if let Ok(mut jobs) = st.jobs.lock() {
+        jobs.push(jobs::JobRecord {
+            id: job_id.clone(),
+            created: httpdate::fmt_http_date(SystemTime::now()),
+            model: params.model.clone(),
+            state: "queued".to_string(),
+            progress: 0,
+            step: 0,
+            total: params.steps,
+            image_index: 0,
+            image_count: params.images.max(1),
+            output_path: String::new(),
+            error: String::new(),
+        });
+    }
 
     // Register the per-job channel (history + broadcast) BEFORE enqueueing so a fast
     // WS subscriber can attach before any event is produced — and so the HISTORY
@@ -1161,6 +1227,13 @@ async fn main() -> anyhow::Result<()> {
         "serenity-server starting"
     );
 
+    // Load prior jobs.db rows ONCE (history half of /v1/jobs) + base the new-id
+    // counter at max_prior_id so generated ids never collide with a prior row (F7).
+    let prior = Arc::new(jobs::load_prior_rows(&out_dir.join("jobs.db")));
+    let next_id = Arc::new(AtomicU64::new(jobs::max_prior_id(&prior) as u64));
+    let job_book: Arc<Mutex<Vec<jobs::JobRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    tracing::info!(prior_rows = prior.len(), next_id_base = next_id.load(Ordering::Relaxed), "jobs.db loaded");
+
     // 2. Worker-driver thread (owns WorkerHandle; handshake waits for Ready). It
     //    receives both jobs and cancels over one control channel so cancel runs on
     //    the thread that owns the handle.
@@ -1171,9 +1244,10 @@ async fn main() -> anyhow::Result<()> {
         let registry = registry.clone();
         let in_flight = in_flight.clone();
         let worker_bin = worker_bin.clone();
+        let job_book = job_book.clone();
         std::thread::Builder::new()
             .name("worker-driver".into())
-            .spawn(move || run_worker_driver(worker_bin, worker_args, ctl_rx, registry, in_flight))
+            .spawn(move || run_worker_driver(worker_bin, worker_args, ctl_rx, registry, in_flight, job_book))
             .map_err(|e| anyhow::anyhow!("spawn worker-driver thread: {e}"))?;
     }
 
@@ -1181,8 +1255,10 @@ async fn main() -> anyhow::Result<()> {
         ctl: ctl_tx,
         registry,
         in_flight,
-        next_id: Arc::new(AtomicU64::new(0)),
+        next_id,
         out_dir,
+        prior,
+        jobs: job_book,
     };
 
     // 3. Router.

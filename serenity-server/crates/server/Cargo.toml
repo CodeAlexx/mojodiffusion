@@ -21,3 +21,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 image.workspace = true
 rusqlite.workspace = true
+httpdate.workspace = true

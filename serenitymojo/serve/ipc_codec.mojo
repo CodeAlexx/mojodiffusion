@@ -58,6 +58,8 @@ def encode_start(p: JobParams) raises -> String:
     o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))
     o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))
     o.set("qwen_edit_conditioning_image", JSONValue.from_string(p.qwen_edit_conditioning_image))
+    o.set("sample_caps_pos", JSONValue.from_string(p.sample_caps_pos))
+    o.set("sample_caps_neg", JSONValue.from_string(p.sample_caps_neg))
     o.set("conditioning_mask_image", JSONValue.from_string(p.conditioning_mask_image))
     o.set("conditioning_mask_channel", JSONValue.from_string(p.conditioning_mask_channel))
     o.set("conditioning_mask_strength", JSONValue.from_float(p.conditioning_mask_strength))
@@ -144,6 +146,10 @@ def decode_start(obj: JSONValue) raises -> JobParams:
         p.inpaint_conditioning_noise_mask = obj["inpaint_conditioning_noise_mask"].as_bool()
     if obj.contains("qwen_edit_conditioning_image") and not obj["qwen_edit_conditioning_image"].is_null():
         p.qwen_edit_conditioning_image = obj["qwen_edit_conditioning_image"].as_string()
+    if obj.contains("sample_caps_pos") and not obj["sample_caps_pos"].is_null():
+        p.sample_caps_pos = obj["sample_caps_pos"].as_string()
+    if obj.contains("sample_caps_neg") and not obj["sample_caps_neg"].is_null():
+        p.sample_caps_neg = obj["sample_caps_neg"].as_string()
     if obj.contains("conditioning_mask_image") and not obj["conditioning_mask_image"].is_null():
         p.conditioning_mask_image = obj["conditioning_mask_image"].as_string()
     if obj.contains("conditioning_mask_channel") and not obj["conditioning_mask_channel"].is_null():

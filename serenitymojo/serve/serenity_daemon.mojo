@@ -1224,14 +1224,31 @@ def parse_generate(
     p.negative = _opt_str(obj, "negative", String(""))
     var default_width = 512
     var default_height = 512
-    if sampler_backend == "zimage" or sampler_backend == "ideogram4" or sampler_backend == "flux2":
+    if (
+        sampler_backend == "zimage"
+        or sampler_backend == "ideogram4"
+        or sampler_backend == "flux2"
+        or sampler_backend == "sdxl"
+        or sampler_backend == "anima"
+        or sampler_backend == "sd3"
+        or sampler_backend == "disabled"
+    ):
         default_width = 1024
         default_height = 1024
     p.width = _opt_int(obj, "width", default_width, 16, 2048)
     p.height = _opt_int(obj, "height", default_height, 16, 2048)
-    p.steps = _opt_int(obj, "steps", 20, 1, 500)
-    p.seed = _opt_int(obj, "seed", 0, 0, 4294967295)
-    p.cfg = _opt_num(obj, "cfg", 4.5, 0.0, 50.0)
+    var default_steps = 20
+    if sampler_backend == "sdxl" or sampler_backend == "anima":
+        default_steps = 30
+    var default_seed = 0
+    if sampler_backend == "sdxl":
+        default_seed = 42
+    var default_cfg = 4.5
+    if sampler_backend == "sdxl":
+        default_cfg = 7.5
+    p.steps = _opt_int(obj, "steps", default_steps, 1, 500)
+    p.seed = _opt_int(obj, "seed", default_seed, 0, 4294967295)
+    p.cfg = _opt_num(obj, "cfg", default_cfg, 0.0, 50.0)
     p.cfg_override = _opt_num(obj, "cfg_override", -1.0, -1.0, 50.0)
     p.cfg_override_start_percent = _opt_num(obj, "cfg_override_start_percent", 0.0, 0.0, 1.0)
     p.cfg_override_end_percent = _opt_num(obj, "cfg_override_end_percent", 1.0, 0.0, 1.0)
@@ -1269,6 +1286,16 @@ def parse_generate(
     p.inpaint_conditioning_mask = _opt_str(obj, "inpaint_conditioning_mask", String(""))
     p.inpaint_conditioning_noise_mask = _opt_bool(obj, "inpaint_conditioning_noise_mask", False)
     p.qwen_edit_conditioning_image = _opt_str(obj, "qwen_edit_conditioning_image", String(""))
+    p.sample_caps_pos = _opt_str(obj, "sample_caps_pos", String(""))
+    if p.sample_caps_pos == String(""):
+        p.sample_caps_pos = _opt_str(obj, "caps_pos", String(""))
+    if p.sample_caps_pos == String(""):
+        p.sample_caps_pos = _opt_str(obj, "caps_positive", String(""))
+    p.sample_caps_neg = _opt_str(obj, "sample_caps_neg", String(""))
+    if p.sample_caps_neg == String(""):
+        p.sample_caps_neg = _opt_str(obj, "caps_neg", String(""))
+    if p.sample_caps_neg == String(""):
+        p.sample_caps_neg = _opt_str(obj, "caps_negative", String(""))
     p.conditioning_mask_image = _opt_str(obj, "conditioning_mask_image", String(""))
     p.conditioning_mask_channel = _opt_str(obj, "conditioning_mask_channel", String(""))
     p.conditioning_mask_strength = _opt_num(obj, "conditioning_mask_strength", -1.0, -1.0, 10.0)
@@ -1402,6 +1429,8 @@ def parse_generate(
     o.set("inpaint_conditioning_mask", JSONValue.from_string(p.inpaint_conditioning_mask))
     o.set("inpaint_conditioning_noise_mask", JSONValue.from_bool(p.inpaint_conditioning_noise_mask))
     o.set("qwen_edit_conditioning_image", JSONValue.from_string(p.qwen_edit_conditioning_image))
+    o.set("sample_caps_pos", JSONValue.from_string(p.sample_caps_pos))
+    o.set("sample_caps_neg", JSONValue.from_string(p.sample_caps_neg))
     o.set("conditioning_mask_image", JSONValue.from_string(p.conditioning_mask_image))
     o.set("conditioning_mask_channel", JSONValue.from_string(p.conditioning_mask_channel))
     o.set("conditioning_mask_strength", JSONValue.from_float(p.conditioning_mask_strength))

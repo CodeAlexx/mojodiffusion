@@ -22,7 +22,17 @@ from net.syscalls import (
     errno, errno_str,
     F_GETFL, F_SETFL, O_NONBLOCK, MSG_NOSIGNAL,
 )
-from http.request import byte_substr  # Mojo String has no slice operator
+# byte_substr was imported from http.request — that dragged the ENTIRE HTTP module
+# into every worker build for one string helper. Inlined here to keep workers pure.
+def byte_substr(s: String, start: Int, end: Int) -> String:
+    """Byte substring s[start:end). Mojo String has no slice operator, so view the
+    backing bytes and copy out the range."""
+    var n = end - start
+    if n <= 0:
+        return String("")
+    var sp = s.as_bytes()
+    var base = BytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
+    return String(StringSlice(ptr=base, length=n))
 
 # ── constants (Linux x86-64 ABI) ─────────────────────────────────────────────
 comptime AF_UNIX: Int32 = 1

@@ -469,15 +469,32 @@ struct Qwen3Encoder:
 
     @staticmethod
     def load(
-        dir: String, config: Qwen3Config, ctx: DeviceContext
+        dir: String, config: Qwen3Config, ctx: DeviceContext, max_layer: Int = -1
     ) raises -> Qwen3Encoder:
-        """Load all 398 tensors from a sharded text_encoder dir into GPU
-        Tensors via ShardedSafeTensors + Tensor.from_view (H2D copy)."""
+        """Load tensors from a sharded text_encoder dir into GPU Tensors
+        (ShardedSafeTensors + Tensor.from_view, H2D copy). When `max_layer >= 0`
+        (P2), SKIP weights an extract-at-max_layer encode never executes —
+        `lm_head.weight` and transformer layers with index > max_layer — saving
+        ~1 GB. The forward MUST stop at max_layer (encode() passes extract_layer
+        as stop_at), or it would `_w()`-miss the skipped layer."""
         var sharded = ShardedSafeTensors.open(dir)
         var weights = List[ArcPointer[Tensor]]()
         var name_to_idx = Dict[String, Int]()
         # Deterministic order is irrelevant; we look up by name.
         for ref nm in sharded.names():
+            if max_layer >= 0:
+                if nm == "lm_head.weight":
+                    continue
+                var lp = String("model.layers.")
+                if nm.find(lp) == 0:
+                    var nb = nm.as_bytes()
+                    var ci = len(lp)
+                    var li = 0
+                    while ci < len(nb) and Int(nb[ci]) >= 48 and Int(nb[ci]) <= 57:
+                        li = li * 10 + (Int(nb[ci]) - 48)
+                        ci += 1
+                    if li > max_layer:
+                        continue
             var tv = sharded.tensor_view(nm)
             var t = Tensor.from_view(tv, ctx)
             var idx = len(weights)
@@ -679,7 +696,7 @@ struct Qwen3Encoder:
 
     # ── full forward ──────────────────────────────────────────────────────────
     def encode_layer_states(
-        self, token_ids: List[Int], ctx: DeviceContext
+        self, token_ids: List[Int], ctx: DeviceContext, stop_at: Int = -1
     ) raises -> List[ArcPointer[Tensor]]:
         """Run all layers, returning hidden states AFTER each layer (index i =
         output of layer i), PRE-final-norm. Index 0..num_layers-1. The caller
@@ -724,7 +741,10 @@ struct Qwen3Encoder:
 
         var hidden = self._embed(token_ids, ctx)
         var states = List[ArcPointer[Tensor]]()
-        for i in range(cfg.num_layers):
+        # P2: stop at the extract layer — running later layers can't change an
+        # earlier state, and they'd `_w()`-miss the layers load(max_layer) skipped.
+        var n_run = cfg.num_layers if stop_at < 0 else (stop_at + 1)
+        for i in range(n_run):
             hidden = self._layer(
                 i, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx
             )
@@ -738,7 +758,7 @@ struct Qwen3Encoder:
         """Return the hidden state after `extract_layer` (PRE-final-norm),
         shape [1, seq, hidden]. For Z-Image last_hidden_state, call with
         extract_layer = num_layers-1 then apply final_norm() separately."""
-        var states = self.encode_layer_states(token_ids, ctx)
+        var states = self.encode_layer_states(token_ids, ctx, extract_layer)
         if extract_layer < 0 or extract_layer >= len(states):
             raise Error("encode: extract_layer out of range")
         return _clone(states[extract_layer][], ctx)

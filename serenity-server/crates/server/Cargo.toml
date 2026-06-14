@@ -1,0 +1,21 @@
+[package]
+name = "serenity-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "serenity-server"
+path = "src/main.rs"
+
+[dependencies]
+serenity-wire.workspace = true
+serenity-ipc.workspace = true
+serenity-graph.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

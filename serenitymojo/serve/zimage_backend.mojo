@@ -74,6 +74,7 @@ from serenitymojo.pipeline.zimage_generate import (
     H, Dh, D, F, PATCH, CAPLEN_MAX, ROPE_THETA, AXIS0, AXIS1, AXIS2,
     NUM_NR, NUM_CR, MAIN_DEPTH, RANK, ALPHA,
 )
+from serenitymojo.serve.zimage_encode_subprocess import encode_captions_subprocess
 from serenitymojo.sampling.zimage_sampler_contract import (
     zimage_comfy_simple_sigmas_with_shift,
     zimage_comfy_sgm_uniform_sigmas_with_shift,
@@ -330,6 +331,16 @@ struct ZImageBackend(GenBackend, Movable):
     var txt2img_initial_noise_scale: Float32
     var cap_seq_cond: List[Float32]
     var cap_seq_uncond: List[Float32]
+    # P1 conditioning cache (key = last prompt+negative). The encoded text
+    # conditioning is size-independent, so a same-prompt job reuses it and SKIPS the
+    # 7.5 GB Qwen3 encoder load+forward entirely (ComfyUI CLIPTextEncode IsChanged).
+    var cap_cache_valid: Bool
+    var cap_cache_prompt: String
+    var cap_cache_negative: String
+    var cap_cache_seq_cond: List[Float32]
+    var cap_cache_seq_uncond: List[Float32]
+    var cap_cache_real_cond: Int
+    var cap_cache_real_uncond: Int
     var rope: List[TArc]        # 12: cond x/cap/uni cos+sin, then uncond
     var lora_dev: List[ZImageLoraDeviceSet]  # 0/1
     var latent: List[TArc]      # 0/1
@@ -394,6 +405,13 @@ struct ZImageBackend(GenBackend, Movable):
         self.txt2img_initial_noise_scale = Float32(1.0)
         self.cap_seq_cond = List[Float32]()
         self.cap_seq_uncond = List[Float32]()
+        self.cap_cache_valid = False
+        self.cap_cache_prompt = String("")
+        self.cap_cache_negative = String("")
+        self.cap_cache_seq_cond = List[Float32]()
+        self.cap_cache_seq_uncond = List[Float32]()
+        self.cap_cache_real_cond = 0
+        self.cap_cache_real_uncond = 0
         self.rope = List[TArc]()
         self.lora_dev = List[ZImageLoraDeviceSet]()
         self.latent = List[TArc]()
@@ -659,17 +677,58 @@ struct ZImageBackend(GenBackend, Movable):
 
     # ── per-job prep: text encode + rope + noise + sigmas + LoRA overlay ─────
     def _prepare_job(mut self) raises:
-        # Qwen3-4B is loaded, used, and freed inside encode_captions_fixed.
-        var caps = encode_captions_fixed(
-            self.params.prompt, self.params.negative, self.ctx
-        )
-        _print_vram("after text encode (encoder freed)")
-        self.cap_seq_cond = _cap_seq_with_pad(
-            self.aux[0][], caps.cond, caps.real_cond, self.cap_pad_h, self.ctx
-        )
-        self.cap_seq_uncond = _cap_seq_with_pad(
-            self.aux[0][], caps.uncond, caps.real_uncond, self.cap_pad_h, self.ctx
-        )
+        # P1 conditioning cache: the encoded text conditioning (cap_seq + real token
+        # counts) is size-independent, so an identical (prompt, negative) reuses it and
+        # SKIPS the 7.5 GB Qwen3 encoder load+forward (ComfyUI CLIPTextEncode IsChanged).
+        var real_cond: Int
+        var real_uncond: Int
+        if (
+            self.cap_cache_valid
+            and self.cap_cache_prompt == self.params.prompt
+            and self.cap_cache_negative == self.params.negative
+        ):
+            print("[zimage] conditioning cache HIT (prompt unchanged) — skipping text encode")
+            self.cap_seq_cond = self.cap_cache_seq_cond.copy()
+            self.cap_seq_uncond = self.cap_cache_seq_uncond.copy()
+            real_cond = self.cap_cache_real_cond
+            real_uncond = self.cap_cache_real_uncond
+        else:
+            # P4: run the ~7.5 GB Qwen3-4B encoder in a fork+execv CHILD process so
+            # its VRAM is reclaimed by process death (in-process it gets stuck in
+            # this worker's CUDA pool, fragmented around the resident DiT — trim
+            # reclaims ~0, MEASURED). Falls back to in-process encode on any host
+            # that does not route `encode-child` or on subprocess failure.
+            #
+            # Headroom for the child: the child is a SEPARATE process with its own
+            # CUDA pool, so on the shared 24 GB card its ~10 GB peak SUMS with this
+            # parent's resident footprint. Once this process's pool has grown past
+            # the bare DiT (DiT 13 GB + retained VAE/denoise blocks that
+            # cuMemPoolTrim canNOT return — MEASURED reclaimed 0, even after freeing
+            # the VAE: the freed blocks are fragmented in the same segment as the
+            # live DiT), free VRAM drops below the child's need. encode_captions_-
+            # subprocess therefore runs a PRE-FLIGHT free-VRAM guard and goes
+            # straight to in-process when the child won't fit — no doomed fork, no
+            # transient >24 GB spike. Full reliability needs more VRAM or P5.
+            var caps = encode_captions_subprocess(
+                self.params.prompt, self.params.negative, self.ctx
+            )
+            _print_vram("after text encode (encoder child reaped)")
+            self.cap_seq_cond = _cap_seq_with_pad(
+                self.aux[0][], caps.cond, caps.real_cond, self.cap_pad_h, self.ctx
+            )
+            self.cap_seq_uncond = _cap_seq_with_pad(
+                self.aux[0][], caps.uncond, caps.real_uncond, self.cap_pad_h, self.ctx
+            )
+            real_cond = caps.real_cond
+            real_uncond = caps.real_uncond
+            # Populate the cache so the next same-prompt job skips the encoder.
+            self.cap_cache_seq_cond = self.cap_seq_cond.copy()
+            self.cap_cache_seq_uncond = self.cap_seq_uncond.copy()
+            self.cap_cache_real_cond = real_cond
+            self.cap_cache_real_uncond = real_uncond
+            self.cap_cache_prompt = self.params.prompt.copy()
+            self.cap_cache_negative = self.params.negative.copy()
+            self.cap_cache_valid = True
 
         var ht = self.hl // PATCH
         var wt = self.wl // PATCH
@@ -679,7 +738,7 @@ struct ZImageBackend(GenBackend, Movable):
 
         # rope tables: cond then uncond, each x/cap/uni cos+sin (== _denoise).
         self.rope = List[TArc]()
-        var pos_cond = build_positions(n_img, ht, wt, CAPLEN_MAX, caps.real_cond)
+        var pos_cond = build_positions(n_img, ht, wt, CAPLEN_MAX, real_cond)
         var x_pos_cond = pos_cond[0].copy()
         var cap_pos_cond = pos_cond[1].copy()
         var uni_pos_cond = _unified_positions(x_pos_cond, cap_pos_cond)
@@ -690,7 +749,7 @@ struct ZImageBackend(GenBackend, Movable):
         var ur_cond = build_rope(uni_pos_cond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, self.ctx)
         self.rope.append(ur_cond[0].copy()); self.rope.append(ur_cond[1].copy())
 
-        var pos_uncond = build_positions(n_img, ht, wt, CAPLEN_MAX, caps.real_uncond)
+        var pos_uncond = build_positions(n_img, ht, wt, CAPLEN_MAX, real_uncond)
         var x_pos_uncond = pos_uncond[0].copy()
         var cap_pos_uncond = pos_uncond[1].copy()
         var uni_pos_uncond = _unified_positions(x_pos_uncond, cap_pos_uncond)

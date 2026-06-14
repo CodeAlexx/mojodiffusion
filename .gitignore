@@ -28,6 +28,9 @@ serenitymojo.zip
 # Generated probe/sample images
 *.png
 
+# Rust control-plane build artifacts (1.1 GB; regenerate with `cargo build`)
+serenity-server/target/
+
 # Agent scratch (not source)
 .claude/agent-memory/
 

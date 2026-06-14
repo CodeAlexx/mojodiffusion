@@ -2,7 +2,7 @@
 #
 # Reached via `serenity_daemon worker <kind> <fd>` (fork+execv'd by the parent
 # ProcessIsolatedBackend). Runs ONE real backend (stub | zimage | qwenimage |
-# ideogram4 | klein)
+# ideogram4 | klein | sdxl | anima)
 # driven by newline-framed JSON over the inherited socket `fd` instead of HTTP.
 # A fresh process => fresh Mojo runtime + fresh CUDA context; the parent kills
 # this process to reclaim VRAM on a model switch. See
@@ -17,6 +17,7 @@ from serenitymojo.serve.zimage_backend import ZImageBackend
 from serenitymojo.serve.qwenimage_backend import QwenImageBackend
 from serenitymojo.serve.ideogram4_backend import Ideogram4Backend
 from serenitymojo.serve.klein_backend import KleinBackend
+from serenitymojo.serve.sample_cli_backend import SampleCliBackend
 from serenitymojo.serve.proc_ipc import LineReader, write_msg, set_nonblock
 from serenitymojo.serve.ipc_codec import (
     decode_start, encode_ev, encode_ready,
@@ -70,13 +71,21 @@ def _worker_loop[B: GenBackend](mut backend: B, fd: Int32) raises:
             var terminal = r.is_terminal()
             write_msg(fd, encode_ev(r))
             if terminal:
+                # Reclaim the per-job transient VRAM (e.g. Z-Image's ~7.5 GB Qwen3
+                # encoder + decode activations) back to the OS — mirrors the daemon
+                # job loop (serenity_daemon.mojo:2276). Without it, worker-mode parks
+                # at the per-job VRAM peak instead of the resident baseline.
+                try:
+                    backend.between_jobs_trim()
+                except e:
+                    print("[worker] between_jobs_trim failed (continuing):", e)
                 break
 
 
 def run_worker(kind: String, fd: Int32) raises:
     """Construct the kind's backend and serve it over `fd`. `kind` is the parent's
     _kind_name string: "stub" (CPU) | "zimage" | "qwenimage" | "ideogram4" |
-    "klein" (GPU contract, fail-loud until cap-cache bridge is wired)."""
+    "klein" | "sdxl" | "anima"."""
     if kind == "stub" or kind == "stub2":
         var b = StubBackend()      # stub2 = a 2nd distinct stub kind (CPU switch test)
         _worker_loop(b, fd)
@@ -92,5 +101,11 @@ def run_worker(kind: String, fd: Int32) raises:
     elif kind == "klein":
         var b = KleinBackend()
         _worker_loop(b, fd)
+    elif kind == "sdxl":
+        var b = SampleCliBackend(String("sdxl"))
+        _worker_loop(b, fd)
+    elif kind == "anima":
+        var b = SampleCliBackend(String("anima"))
+        _worker_loop(b, fd)
     else:
-        raise Error("worker: unknown kind '" + kind + "' (want stub|zimage|qwenimage|ideogram4|klein)")
+        raise Error("worker: unknown kind '" + kind + "' (want stub|zimage|qwenimage|ideogram4|klein|sdxl|anima)")

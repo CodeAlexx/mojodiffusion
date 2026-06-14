@@ -901,7 +901,9 @@ def encode_captions_fixed(
     prompt: String, negative: String, ctx: DeviceContext
 ) raises -> CapFeatsFixed:
     var tok = Qwen3Tokenizer(TOK_JSON)
-    var enc = Qwen3Encoder.load(TEXT_ENCODER, Qwen3Config.zimage(), ctx)
+    # P2: load only weights the extract-at-EXTRACT_LAYER encode uses (skips
+    # layers > EXTRACT_LAYER + lm_head, ~1 GB) — the forward stops at EXTRACT_LAYER.
+    var enc = Qwen3Encoder.load(TEXT_ENCODER, Qwen3Config.zimage(), ctx, max_layer=EXTRACT_LAYER)
     print("[text] encoding cond + uncond at fixed CAPLEN_MAX=", CAPLEN_MAX, "layer", EXTRACT_LAYER)
     var cond = _encode_text_fixed(tok, enc, prompt, ctx)
     var uncond = _encode_text_fixed(tok, enc, negative, ctx)

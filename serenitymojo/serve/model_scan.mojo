@@ -20,6 +20,9 @@
 #   input_blocks.0.                      -> sdxl        (bare UNet export)
 #   txt_norm.                            -> qwen-image
 #   time_projection.                     -> wan
+#   filename/directory fallback          -> metadata tags for disabled known
+#                                            families (wan2.2, hidream,
+#                                            sensenova, zimage-l2p, etc.)
 #   else                                 -> unknown
 #
 # LoRA target tags use the same bounded header read. They are metadata only for
@@ -33,9 +36,19 @@
 from std.ffi import external_call
 from std.memory import alloc
 
-from http.request import byte_substr
-
 from serenitymojo.io.ffi import BytePtr, sys_open, sys_close, sys_pread, file_size, O_RDONLY
+
+
+# byte_substr was imported from http.request — an HTTP module pulled into a model
+# scan for one string helper. Inlined (model_scan already has BytePtr) to keep it pure.
+def byte_substr(s: String, start: Int, end: Int) -> String:
+    """Byte substring s[start:end). Mojo String has no slice operator."""
+    var n = end - start
+    if n <= 0:
+        return String("")
+    var sp = s.as_bytes()
+    var base = BytePtr(unsafe_from_address=Int(sp.unsafe_ptr()) + start)
+    return String(StringSlice(ptr=base, length=n))
 
 comptime CHECKPOINTS_DIR = "/home/alex/.serenity/models/checkpoints"
 comptime LORAS_DIR = "/home/alex/.serenity/models/loras"
@@ -181,6 +194,33 @@ def detect_arch(header: String) -> String:
     return String("unknown")
 
 
+def detect_arch_from_name(name: String) -> String:
+    """Filename/directory metadata fallback. This is scan-only; runtime
+    admission remains in dispatch_backend and can still disable execution."""
+    var lo = name.lower()
+    if lo.find("wan2.2") >= 0 or lo.find("wan 2.2") >= 0 or lo.find("wan-2.2") >= 0 or lo.find("wan_2_2") >= 0 or lo.find("wan22") >= 0:
+        return String("wan2.2")
+    if lo.find("zimage_l2p") >= 0 or lo.find("z-image-l2p") >= 0 or lo.find("z_image_l2p") >= 0 or lo.find("l2p") >= 0:
+        return String("zimage-l2p")
+    if lo.find("hidream") >= 0 or lo.find("hi-dream") >= 0 or lo.find("hi_dream") >= 0:
+        return String("hidream")
+    if lo.find("sensenova") >= 0 or lo.find("sense_nova") >= 0 or lo.find("sense-nova") >= 0:
+        return String("sensenova")
+    if lo.find("qwen") >= 0:
+        return String("qwen-image")
+    if lo.find("sd3") >= 0 or lo.find("sd35") >= 0:
+        return String("sd3")
+    if lo.find("sdxl") >= 0 or lo.find("stable-diffusion-xl") >= 0 or lo.find("animagine") >= 0:
+        return String("sdxl")
+    if lo.find("flux2") >= 0 or lo.find("flux-2") >= 0 or lo.find("flux_2") >= 0:
+        return String("flux-2")
+    if lo.find("flux1") >= 0 or lo.find("flux-1") >= 0 or lo.find("flux_1") >= 0 or lo.find("flux-dev") >= 0:
+        return String("flux")
+    if lo.find("ltx") >= 0:
+        return String("ltx2")
+    return String("unknown")
+
+
 def detect_lora_target_arch(header: String) -> String:
     """Best-effort target-family probe for LoRA browser cards.
 
@@ -230,9 +270,11 @@ def scan_checkpoints() raises -> List[ScanEntry]:
     var out = List[ScanEntry]()
     var files = _list_safetensors(String(CHECKPOINTS_DIR))
     for i in range(len(files)):
-        var arch = String("unknown")
+        var arch = detect_arch_from_name(files[i].name)
         try:
-            arch = detect_arch(_header_text(files[i].path))
+            var header_arch = detect_arch(_header_text(files[i].path))
+            if arch == String("unknown"):
+                arch = header_arch
         except:
             pass  # unreadable/corrupt header -> unknown
         out.append(ScanEntry(files[i].name.copy(), files[i].path.copy(), arch^, files[i].size))
@@ -265,9 +307,11 @@ def scan_loras() raises -> List[ScanEntry]:
     var out = List[ScanEntry]()
     var files = _list_safetensors(String(LORAS_DIR))
     for i in range(len(files)):
-        var target_arch = String("unknown")
+        var target_arch = detect_arch_from_name(files[i].name)
         try:
-            target_arch = detect_lora_target_arch(_header_text(files[i].path))
+            var header_arch = detect_lora_target_arch(_header_text(files[i].path))
+            if target_arch == String("unknown"):
+                target_arch = header_arch
         except:
             pass  # unreadable/corrupt header -> unknown target
         out.append(ScanEntry(

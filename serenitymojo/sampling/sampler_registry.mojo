@@ -58,6 +58,12 @@ def _json_escape_local(s: String) raises -> String:
 
 def _backend_key(backend_name: String) -> String:
     var b = String(backend_name.lower())
+    if b == "sdxl" or b.find("sdxl") >= 0 or b.find("stable-diffusion-xl") >= 0 or b.find("animagine") >= 0:
+        return String("sdxl")
+    if b == "anima" or b.find("anima") >= 0:
+        return String("anima")
+    if b == "sd3" or b == "sd35" or b.find("sd3") >= 0 or b.find("sd35") >= 0:
+        return String("sd3")
     if b == "flux2" or b == "flux-2" or b.find("klein") >= 0 or b.find("flux2") >= 0 or b.find("flux-2") >= 0:
         return String("flux2")
     if b == "qwen" or b == "qwenimage" or b.find("qwen") >= 0:
@@ -82,8 +88,38 @@ def _backend_key(backend_name: String) -> String:
 
 def sampler_backend_for_model(model_name: String, default_backend: String) -> String:
     var m = String(model_name.lower())
+    if (
+        m.find("wan2.2") >= 0
+        or m.find("wan 2.2") >= 0
+        or m.find("wan-2.2") >= 0
+        or m.find("wan_2_2") >= 0
+        or m.find("wan22") >= 0
+        or m.find("hidream") >= 0
+        or m.find("hi-dream") >= 0
+        or m.find("hi_dream") >= 0
+        or m.find("sensenova") >= 0
+        or m.find("sense_nova") >= 0
+        or m.find("sense-nova") >= 0
+        or m.find("zimage_l2p") >= 0
+        or m.find("z-image-l2p") >= 0
+        or m.find("z_image_l2p") >= 0
+        or m.find("l2p") >= 0
+        or m.find("flux1") >= 0
+        or m.find("flux-1") >= 0
+        or m.find("flux_1") >= 0
+        or m.find("ltx") >= 0
+    ):
+        return String("disabled")
     if m.find("ideogram") >= 0:
         return String("ideogram4")
+    if m.find("sdxl") >= 0 or m.find("stable-diffusion-xl") >= 0 or m.find("animagine") >= 0:
+        return String("sdxl")
+    if m.find("anima") >= 0:
+        return String("anima")
+    if m.find("sd3") >= 0 or m.find("sd35") >= 0:
+        return String("sd3")
+    if m.find("flux2-dev") >= 0 or m.find("flux-2-dev") >= 0 or m.find("flux2_dev") >= 0:
+        return String("disabled")
     if m.find("klein") >= 0 or m.find("flux2") >= 0 or m.find("flux-2") >= 0:
         return String("flux2")
     if m.find("qwen") >= 0:
@@ -101,6 +137,10 @@ def default_generation_model(default_backend: String) -> String:
         return String("qwen-image-2512")
     if b == "ideogram4":
         return String("ideogram-4-fp8")
+    if b == "sdxl":
+        return String("sdxl")
+    if b == "anima":
+        return String("anima")
     if b == "zimage":
         return String("zimage_base")
     return default_backend
@@ -108,7 +148,7 @@ def default_generation_model(default_backend: String) -> String:
 
 def default_sampler_for_backend(backend_name: String) -> String:
     var b = _backend_key(backend_name)
-    if b == "zimage" or b == "qwenimage" or b == "ideogram4":
+    if b == "zimage" or b == "qwenimage" or b == "ideogram4" or b == "sdxl" or b == "anima" or b == "sd3" or b == "disabled":
         return String("euler")
     return String("euler")
 
@@ -119,6 +159,10 @@ def default_scheduler_for_backend(backend_name: String) -> String:
         return String("logitnormal")
     if b == "flux2":
         return String("flux2")
+    if b == "sdxl" or b == "anima":
+        return String("normal")
+    if b == "sd3":
+        return String("normal")
     if b == "zimage" or b == "qwenimage":
         return String("simple")
     return String("normal")
@@ -221,26 +265,13 @@ def sampler_admission_for_backend(
             ),
         )
     if b == "qwenimage":
-        if normalized == "euler" or normalized == "flowmatch_euler":
-            return SamplerAdmission(
-                True,
-                b,
-                requested,
-                normalized,
-                String("flowmatch_euler"),
-                String("backend executes the verified Qwen flow-match Euler path"),
-            )
         return SamplerAdmission(
             False,
             b,
             requested,
             normalized,
             String(""),
-            String(
-                "Qwen-Image currently supports only euler/flowmatch_euler aliases; "
-                + "DPM++/UniPC/ancestral/SDE catalog names remain fail-loud until "
-                + "their distinct denoise loops have artifact evidence"
-            ),
+            String("Qwen/Qwen-Image/Qwen-Edit is metadata-only in this slice and must not execute until memory/offload work is ready"),
         )
     if b == "ideogram4":
         if normalized == "euler" or normalized == "flowmatch_euler":
@@ -264,6 +295,46 @@ def sampler_admission_for_backend(
                 + "ancestral/SDE catalog names remain fail-loud until artifact evidence exists"
             ),
         )
+    if b == "sdxl":
+        if normalized == "euler":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("sdxl_euler_fixed_cli"),
+                String("existing SDXL sample CLI executes the fixed 1024x1024 30-step Euler path"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String(
+                "SDXL daemon route currently admits only Comfy euler over normal scheduler through the existing sample CLI; DPM++/UniPC/ancestral/SDE/flowmatch aliases remain fail-loud"
+            ),
+        )
+    if b == "anima":
+        if normalized == "euler":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("anima_euler_fixed_cli"),
+                String("existing Anima sample CLI executes the fixed 1024x1024 30-step Euler path"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String(
+                "Anima daemon route currently admits only euler through the existing sample CLI; other Comfy sampler catalog names remain fail-loud"
+            ),
+        )
     if b == "flux2":
         return SamplerAdmission(
             False,
@@ -276,6 +347,15 @@ def sampler_admission_for_backend(
                 + "is blocked until the Qwen3 cap-cache/ReferenceLatent bridge "
                 + "feeds the existing Klein staged sampler"
             ),
+        )
+    if b == "disabled":
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String("model family is known but execution is disabled for this slice"),
         )
     return SamplerAdmission(
         True,
@@ -329,25 +409,13 @@ def scheduler_admission_for_backend(
             ),
         )
     if b == "qwenimage":
-        if normalized == "simple" or normalized == "qwen":
-            return SamplerAdmission(
-                True,
-                b,
-                requested,
-                normalized,
-                String("qwen_flowmatch"),
-                String("backend executes the verified Qwen dynamic flow-match schedule"),
-            )
         return SamplerAdmission(
             False,
             b,
             requested,
             normalized,
             String(""),
-            String(
-                "Qwen-Image currently supports only simple/qwen flow-match scheduler aliases; "
-                + "normal/karras/beta/turbo/align_your_steps/flux2/ltxv remain fail-loud here"
-            ),
+            String("Qwen/Qwen-Image/Qwen-Edit scheduler metadata is recognized but execution is disabled in this slice"),
         )
     if b == "ideogram4":
         if normalized == "ideogram_logitnormal":
@@ -380,6 +448,42 @@ def scheduler_admission_for_backend(
                 + "turbo/align_your_steps/flux2/ltxv remain fail-loud here"
             ),
         )
+    if b == "sdxl":
+        if normalized == "normal":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("sdxl_normal_fixed_cli"),
+                String("existing SDXL sample CLI executes its fixed normal Euler schedule"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String("SDXL sample CLI route currently admits only normal scheduler metadata"),
+        )
+    if b == "anima":
+        if normalized == "normal":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("anima_normal_fixed_cli"),
+                String("existing Anima sample CLI executes its fixed normal Euler schedule"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String("Anima sample CLI route currently admits only normal scheduler metadata"),
+        )
     if b == "flux2":
         return SamplerAdmission(
             False,
@@ -392,6 +496,15 @@ def scheduler_admission_for_backend(
                 + "but the daemon backend currently admission-fails before "
                 + "executing it because cap-cache/ReferenceLatent inputs are not wired"
             ),
+        )
+    if b == "disabled":
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String("model family is known but scheduler execution is disabled for this slice"),
         )
     return SamplerAdmission(
         True,
@@ -468,11 +581,15 @@ def swarmui_sampler_registry_json() raises -> String:
         + '"flux2","ltxv","ltxv-image","flowmatch","flow_match","qwen"]'
     )
     var zimage_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m","dpm++ 2m","uni_pc","uni_pc_bh2"]')
-    var qwen_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
+    var qwen_supported_samplers = String("[]")
     var ideogram_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
+    var sdxl_supported_samplers = String('["euler"]')
+    var anima_supported_samplers = String('["euler"]')
     var zimage_supported_schedulers = String('["simple","flowmatch","flow_match","sgm_uniform"]')
-    var qwen_supported_schedulers = String('["simple","flowmatch","flow_match","qwen"]')
+    var qwen_supported_schedulers = String("[]")
     var ideogram_supported_schedulers = String('["logitnormal","logit_normal","ideogram_logitnormal","ideogram4_logitnormal"]')
+    var sdxl_supported_schedulers = String('["normal"]')
+    var anima_supported_schedulers = String('["normal"]')
     var out = String("{\n")
     out += String('  "schema":"serenity.samplers.v1",\n')
     out += String('  "source":"local SwarmUI Comfy sampler catalog",\n')
@@ -496,12 +613,12 @@ def swarmui_sampler_registry_json() raises -> String:
     out += _backend_json(
         String("qwenimage"),
         String("qwenimage"),
-        String("flowmatch_euler"),
-        String("qwen_flowmatch"),
+        String(""),
+        String(""),
         qwen_supported_samplers,
         qwen_supported_schedulers,
         String("[") + _qwen_generic_unipc_blocked_detail_json() + String("]"),
-        String("Qwen-Image daemon runs the verified dynamic flow-match Euler path; full Qwen generation remains separately gated."),
+        String("Qwen/Qwen-Image/Qwen-Edit is known to the scanner/import stack but execution is disabled in this slice until memory/offload work is ready."),
     )
     out += String(",\n    ")
     out += _backend_json(
@@ -513,6 +630,28 @@ def swarmui_sampler_registry_json() raises -> String:
         ideogram_supported_schedulers,
         String("[]"),
         String("Ideogram-4 daemon runs a bounded 1024x1024 txt2img path with explicit logit-normal Euler semantics; non-Euler sampler and broad scheduler aliases remain fail-loud."),
+    )
+    out += String(",\n    ")
+    out += _backend_json(
+        String("sdxl"),
+        String("sdxl"),
+        String("sdxl_euler_fixed_cli"),
+        String("sdxl_normal_fixed_cli"),
+        sdxl_supported_samplers,
+        sdxl_supported_schedulers,
+        String("[]"),
+        String("SDXL daemon route delegates to the existing Mojo SDXL sample CLI: fixed 1024x1024, 30 steps, cfg 7.5, seed 42, pre-encoded caps_pos sidecar required. This is a bounded route, not full Comfy sampler parity."),
+    )
+    out += String(",\n    ")
+    out += _backend_json(
+        String("anima"),
+        String("anima"),
+        String("anima_euler_fixed_cli"),
+        String("anima_normal_fixed_cli"),
+        anima_supported_samplers,
+        anima_supported_schedulers,
+        String("[]"),
+        String("Anima daemon route delegates to the existing Mojo Anima sample CLI: fixed 1024x1024, 30 steps, cfg 4.5, pre-encoded caps_pos/caps_neg sidecars required. This is a bounded route, not full Comfy sampler parity."),
     )
     out += String("\n  ],\n")
     out += String('  "non_claims":[\n')

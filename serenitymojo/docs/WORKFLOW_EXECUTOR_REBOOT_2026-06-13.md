@@ -1484,6 +1484,54 @@ aesthetics, and matched speed/VRAM evidence are still missing.
 blockers: missing configured sample caps, no accepted seeded trajectory parity,
 no accepted VAE/final-PNG parity, and no matched speed/VRAM evidence.
 
+## SDXL/Anima Sample CLI Backend Handoff
+
+Current backend plumbing slice: `SampleCliBackend` is a daemon wrapper around
+the existing SDXL and Anima Mojo sample CLIs. It is not new inference math and
+does not claim full Comfy/Swarm parity. Treat it as bounded txt2img
+CLI-backed plumbing.
+
+The sidecar contract is part of the runtime boundary:
+
+- SDXL and Anima requests require `sample_caps_pos`/`sample_caps_neg` sidecar
+  plumbing.
+- Anima requires both positive and negative sidecars.
+- SDXL requires `sample_caps_pos`; that one sidecar contains both cond and
+  uncond tensors for the existing SDXL sample CLI.
+
+The dispatch/worker/process-isolated route now recognizes `sdxl` and `anima`
+kinds and constructs `SampleCliBackend` for those kinds. Keep those paths
+process-isolated and CLI-backed; do not inline model/runtime work into the
+daemon while this slice is still just plumbing.
+
+Metadata-known but execution-disabled kinds remain disabled until the memory
+and offload work is ready. Do not run them from this slice:
+
+- Qwen
+- Qwen edit
+- SD3 Large
+- Flux 1 Dev
+- Flux 2 Dev
+- Z-Image L2P
+- HiDream
+- SenseNova
+- Wan 2.2
+- LTX/LTX2
+
+Static guard:
+
+```bash
+python3 scripts/check_allowed_daemon_cli_backends.py
+```
+
+Build tasks for this slice:
+
+```bash
+pixi run build-sdxl-cli
+pixi run build-anima-cli
+pixi run build-daemon
+```
+
 ## Next Work
 
 1. Keep `scripts/check_klein_lora_daemon_smoke.py` as the heavy regression gate

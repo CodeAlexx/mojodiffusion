@@ -21,11 +21,15 @@
 #
 # MODEL → KIND mapping (by the /v1/models scan `name`):
 #   "" | "zimage_base" | <anything starting "zimage">  -> Z-Image (default)
-#   "qwen-image-2512" | <anything containing "qwen">    -> Qwen-Image
+#   "qwen-image-2512" | <anything containing "qwen">    -> known, execution disabled
 #   "ideogram-4-fp8" | <anything containing "ideogram"> -> Ideogram-4
 #   <anything containing "klein">                       -> Klein backend contract
 #                                                        adapter; fails loud until
 #                                                        cap-cache execution bridge
+#   <anything containing "sdxl">                        -> existing SDXL sample CLI
+#                                                        wrapper
+#   <anything containing "anima">                       -> existing Anima sample CLI
+#                                                        wrapper
 #   <flux2-dev/flux-2-dev>                              -> explicit unsupported
 #                                                        (not a Klein runner)
 # An unknown model name is REJECTED at start() (fail-loud — no silent fallback
@@ -40,12 +44,42 @@ from serenitymojo.serve.zimage_backend import ZImageBackend
 from serenitymojo.serve.qwenimage_backend import QwenImageBackend
 from serenitymojo.serve.ideogram4_backend import Ideogram4Backend
 from serenitymojo.serve.klein_backend import KleinBackend
+from serenitymojo.serve.sample_cli_backend import SampleCliBackend
 
 comptime KIND_NONE = 0
 comptime KIND_ZIMAGE = 1
 comptime KIND_QWEN = 2
 comptime KIND_IDEOGRAM4 = 3
 comptime KIND_KLEIN = 4
+comptime KIND_SDXL = 5
+comptime KIND_ANIMA = 6
+
+
+def _known_disabled_model_reason(model: String) -> String:
+    var lo = model.lower()
+    if lo.find("qwen") >= 0:
+        return String("Qwen/Qwen-Image/Qwen-Edit execution is disabled for this slice; it may be scanned/imported as metadata only")
+    if lo.find("sd3") >= 0 or lo.find("sd35") >= 0 or lo.find("sd_3") >= 0 or lo.find("stable-diffusion-3") >= 0:
+        return String("SD3/SD3.5 execution is metadata-only here; do not run SD3 Large, and SD3.5 Medium needs a medium-specific daemon CLI before execution")
+    if lo.find("flux1") >= 0 or lo.find("flux-1") >= 0 or lo.find("flux_1") >= 0 or lo.find("flux2-dev") >= 0 or lo.find("flux-2-dev") >= 0 or lo.find("flux2_dev") >= 0:
+        return String("Flux 1 Dev / Flux 2 Dev execution is disabled for this slice")
+    if lo.find("zimage_l2p") >= 0 or lo.find("z-image-l2p") >= 0 or lo.find("z_image_l2p") >= 0 or lo.find("l2p") >= 0:
+        return String("Z-Image L2P execution is disabled for this slice")
+    if lo.find("hidream") >= 0 or lo.find("hi-dream") >= 0 or lo.find("hi_dream") >= 0:
+        return String("HiDream execution is disabled for this slice")
+    if lo.find("sensenova") >= 0 or lo.find("sense_nova") >= 0 or lo.find("sense-nova") >= 0:
+        return String("SenseNova execution is disabled for this slice")
+    if lo.find("ltx") >= 0:
+        return String("LTX/LTX2 execution is disabled for this slice")
+    if (
+        lo.find("wan2.2") >= 0
+        or lo.find("wan 2.2") >= 0
+        or lo.find("wan-2.2") >= 0
+        or lo.find("wan_2_2") >= 0
+        or lo.find("wan22") >= 0
+    ):
+        return String("Wan 2.2 execution is disabled until the memory/offload work is ready")
+    return String("")
 
 
 def _kind_for_model(model: String) raises -> Int:
@@ -53,8 +87,6 @@ def _kind_for_model(model: String) raises -> Int:
     (the default first backend). Unknown -> raise (fail-loud)."""
     if model == String("") or model == String("zimage_base"):
         return KIND_ZIMAGE
-    if model == String("qwen-image-2512"):
-        return KIND_QWEN
     if model == String("ideogram-4-fp8"):
         return KIND_IDEOGRAM4
     # tolerant matching for the scanner's many zimage/qwen checkpoint names
@@ -66,16 +98,18 @@ def _kind_for_model(model: String) raises -> Int:
     var lo = model.lower()
     if lo.find("ideogram") >= 0:
         return KIND_IDEOGRAM4
-    if lo.find("flux2-dev") >= 0 or lo.find("flux-2-dev") >= 0 or lo.find("flux2_dev") >= 0:
+    var disabled_reason = _known_disabled_model_reason(model)
+    if disabled_reason.byte_length() > 0:
         raise Error(
-            String("flux2-dev model '") + model
-            + "' cannot run through the Klein daemon backend; Flux2-dev uses a "
-            + "different transformer/text contract and has no GenBackend product path yet"
+            String("known model '") + model + String("' is not runnable by this daemon slice: ")
+            + disabled_reason
         )
     if lo.find("klein") >= 0:
         return KIND_KLEIN
-    if lo.find("qwen") >= 0:
-        return KIND_QWEN
+    if lo.find("sdxl") >= 0 or lo.find("stable-diffusion-xl") >= 0 or lo.find("animagine") >= 0:
+        return KIND_SDXL
+    if lo.find("anima") >= 0:
+        return KIND_ANIMA
     if lo.find("zimage") >= 0 or lo.find("z_image") >= 0 or lo.find("z-image") >= 0:
         return KIND_ZIMAGE
     raise Error(
@@ -83,7 +117,8 @@ def _kind_for_model(model: String) raises -> Int:
         + " Z-Image (name contains 'zimage'/'z_image'; default), Qwen-Image"
         + " (name contains 'qwen'), and Ideogram-4 (name contains 'ideogram');"
         + " served weights are zimage_base, qwen-image-2512, ideogram-4-fp8,"
-        + " and Klein admission-check routing; Flux2-dev remains explicitly unsupported"
+        + " Klein admission-check routing, and existing SDXL/Anima sample CLI"
+        + " wrappers; Flux2-dev remains explicitly unsupported"
     )
 
 
@@ -96,6 +131,10 @@ def _kind_name(kind: Int) -> String:
         return String("ideogram4")
     if kind == KIND_KLEIN:
         return String("klein")
+    if kind == KIND_SDXL:
+        return String("sdxl")
+    if kind == KIND_ANIMA:
+        return String("anima")
     return String("none")
 
 
@@ -108,6 +147,8 @@ struct DispatchBackend(GenBackend, Movable):
     var q: List[ArcPointer[QwenImageBackend]]
     var i4: List[ArcPointer[Ideogram4Backend]]
     var k: List[ArcPointer[KleinBackend]]
+    var sx: List[ArcPointer[SampleCliBackend]]
+    var an: List[ArcPointer[SampleCliBackend]]
 
     def __init__(out self) raises:
         self.ctx = DeviceContext()
@@ -116,6 +157,8 @@ struct DispatchBackend(GenBackend, Movable):
         self.q = List[ArcPointer[QwenImageBackend]]()
         self.i4 = List[ArcPointer[Ideogram4Backend]]()
         self.k = List[ArcPointer[KleinBackend]]()
+        self.sx = List[ArcPointer[SampleCliBackend]]()
+        self.an = List[ArcPointer[SampleCliBackend]]()
 
     def backend_name(self) -> String:
         if self.kind == KIND_ZIMAGE:
@@ -126,6 +169,10 @@ struct DispatchBackend(GenBackend, Movable):
             return self.i4[0][].backend_name()
         if self.kind == KIND_KLEIN:
             return self.k[0][].backend_name()
+        if self.kind == KIND_SDXL:
+            return self.sx[0][].backend_name()
+        if self.kind == KIND_ANIMA:
+            return self.an[0][].backend_name()
         return String("dispatch")  # idle, no backend constructed yet
 
     def model_name(self) -> String:
@@ -137,6 +184,10 @@ struct DispatchBackend(GenBackend, Movable):
             return self.i4[0][].model_name()
         if self.kind == KIND_KLEIN:
             return self.k[0][].model_name()
+        if self.kind == KIND_SDXL:
+            return self.sx[0][].model_name()
+        if self.kind == KIND_ANIMA:
+            return self.an[0][].model_name()
         return String("-")
 
     def resident_model(self) -> String:
@@ -148,6 +199,10 @@ struct DispatchBackend(GenBackend, Movable):
             return self.i4[0][].resident_model()
         if self.kind == KIND_KLEIN:
             return self.k[0][].resident_model()
+        if self.kind == KIND_SDXL:
+            return self.sx[0][].resident_model()
+        if self.kind == KIND_ANIMA:
+            return self.an[0][].resident_model()
         return String("")
 
     # ── free the resident backend (drop its DeviceBuffers, force the frees) ──
@@ -165,6 +220,8 @@ struct DispatchBackend(GenBackend, Movable):
         self.q = List[ArcPointer[QwenImageBackend]]()
         self.i4 = List[ArcPointer[Ideogram4Backend]]()
         self.k = List[ArcPointer[KleinBackend]]()
+        self.sx = List[ArcPointer[SampleCliBackend]]()
+        self.an = List[ArcPointer[SampleCliBackend]]()
         self.kind = KIND_NONE
         self.ctx.synchronize()
         # F3 (authorized internal change, MEASURED no-op in THIS Mojo-runtime build):
@@ -211,6 +268,14 @@ struct DispatchBackend(GenBackend, Movable):
             print("[dispatch] constructing Flux2/Klein backend contract adapter")
             self.k = List[ArcPointer[KleinBackend]]()
             self.k.append(ArcPointer(KleinBackend()))
+        elif kind == KIND_SDXL:
+            print("[dispatch] constructing SDXL sample CLI backend")
+            self.sx = List[ArcPointer[SampleCliBackend]]()
+            self.sx.append(ArcPointer(SampleCliBackend(String("sdxl"))))
+        elif kind == KIND_ANIMA:
+            print("[dispatch] constructing Anima sample CLI backend")
+            self.an = List[ArcPointer[SampleCliBackend]]()
+            self.an.append(ArcPointer(SampleCliBackend(String("anima"))))
         else:
             raise Error("dispatch: invalid backend kind")
         self.kind = kind
@@ -225,8 +290,12 @@ struct DispatchBackend(GenBackend, Movable):
             self.q[0][].start(params)
         elif self.kind == KIND_IDEOGRAM4:
             self.i4[0][].start(params)
-        else:
+        elif self.kind == KIND_KLEIN:
             self.k[0][].start(params)
+        elif self.kind == KIND_SDXL:
+            self.sx[0][].start(params)
+        else:
+            self.an[0][].start(params)
 
     def step(mut self) raises -> StepResult:
         if self.kind == KIND_ZIMAGE:
@@ -237,6 +306,10 @@ struct DispatchBackend(GenBackend, Movable):
             return self.i4[0][].step()
         if self.kind == KIND_KLEIN:
             return self.k[0][].step()
+        if self.kind == KIND_SDXL:
+            return self.sx[0][].step()
+        if self.kind == KIND_ANIMA:
+            return self.an[0][].step()
         var r = StepResult()
         r.failed = True
         r.error = String("dispatch: no active backend")
@@ -251,6 +324,10 @@ struct DispatchBackend(GenBackend, Movable):
             self.i4[0][].cancel()
         elif self.kind == KIND_KLEIN:
             self.k[0][].cancel()
+        elif self.kind == KIND_SDXL:
+            self.sx[0][].cancel()
+        elif self.kind == KIND_ANIMA:
+            self.an[0][].cancel()
 
     # ── F3 between-jobs pool trim (no switch) ──────────────────────────────────
     def between_jobs_trim(mut self) raises:

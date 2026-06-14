@@ -78,6 +78,11 @@ struct JobParams(Copyable, Movable):
     # Comfy/SerenityFlow TextEncodeQwenImageEdit(+Plus) attaches the source
     # image to conditioning as edit_image. This is not ordinary img2img.
     var qwen_edit_conditioning_image: String
+    # Existing sample CLIs for SDXL/Anima consume pre-encoded text conditioning
+    # sidecars from serenity.sample_prompts.v1 caps.{positive,negative}; raw
+    # runtime text encoding is not available in those Mojo paths yet.
+    var sample_caps_pos: String
+    var sample_caps_neg: String
     # Comfy ConditioningSetMask attaches regional mask metadata to conditioning,
     # not to a latent. Backends must implement regional conditioning or reject.
     var conditioning_mask_image: String
@@ -147,6 +152,8 @@ struct JobParams(Copyable, Movable):
         self.inpaint_conditioning_mask = String("")
         self.inpaint_conditioning_noise_mask = False
         self.qwen_edit_conditioning_image = String("")
+        self.sample_caps_pos = String("")
+        self.sample_caps_neg = String("")
         self.conditioning_mask_image = String("")
         self.conditioning_mask_channel = String("")
         self.conditioning_mask_strength = -1.0

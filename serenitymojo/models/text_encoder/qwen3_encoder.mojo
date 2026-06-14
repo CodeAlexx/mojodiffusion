@@ -887,6 +887,8 @@ def _sdpa_dispatch(
             return sdpa[1, 512, 32, 128](q, k, v, mask, scale, ctx)
         if seq == 1024:
             return sdpa[1, 1024, 32, 128](q, k, v, mask, scale, ctx)
+        if seq == 2048:
+            return sdpa[1, 2048, 32, 128](q, k, v, mask, scale, ctx)
     # Qwen3-0.6B (Anima text path): H=16, Dh=128.
     if h == 16 and dh == 128:
         if seq == 8:

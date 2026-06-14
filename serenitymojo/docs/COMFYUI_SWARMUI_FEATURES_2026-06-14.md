@@ -182,4 +182,29 @@ User wants both, with **Qwen3-VL-8B** (vision). The repo already has a pure-Mojo
 (`pipeline/ideogram4_magic.mojo`, Qwen3-8B local). Qwen3-VL-8B (Abliterated-Caption-it) weights are
 on disk but the VISION TOWER is NOT ported — that's a real model port (the long pole). The bbox
 editor is a new SerenityUI canvas. These are multi-session.
-## Phase 4 — ComfyUI node-dispatch completeness  ⏳ (executor + capped worker rebuild)
+## Session 2 (2026-06-14, takeover) — magic-prompt JSON fix + full gap survey
+
+**Magic-prompt JSON-fidelity fix** (the documented "through the prompt node" drift):
+`pipeline/ideogram4_magic.mojo` `magic_expand()` now normalizes the Qwen3-8B output to
+CANONICAL minified JSON via new `_normalize_caption` / `_strip_trailing_commas` /
+`_byte_substr` (code-fence strip → first `{`..last `}` slice → trailing-comma removal →
+`loads()`→`minify()`, fail-loud on unparseable).
+- VERIFIED (measured): standalone unit harness **7/7 PASS** — trailing commas (obj + nested
+  array), code fence, preamble/suffix prose, comma/brace **inside strings preserved**, KEY
+  ORDER preserved (not sorted), pretty→minified collapse.
+- Compile fixes to the left-behind WIP: missing `BytePtr` import; `String(raw.strip())`.
+- Added a **seq=2048 SDPA dispatch** (`qwen3_encoder`, H=32/Dh=128) + raised greedy budget
+  to 1700 new / 2048 cache (the schema overflows 1024). seq=2048 runtime-exercised OK.
+- ⏳ OPEN: e2e greedy of the FULL schema still doesn't emit a closing `}` within 1700
+  tokens (caption length / EOS termination) → normalization correctly fail-louds. Needs a
+  larger seq (4096) + EOS/length handling, or a concise-schema system prompt. The
+  normalization (the actual fidelity fix) is done & verified.
+
+**Full ComfyUI/SwarmUI gap survey (2 agents):**
+- `GAP_COMFYUI_NODES_2026-06-14.md` — ~70 missing/partial nodes; ~12 lower cleanly to flat
+  params (SamplerCustom + named samplers/schedulers = biggest clean win).
+- `GAP_SWARMUI_FRONTEND_2026-06-14.md` — ~50 missing/partial FE features; quick wins = wire
+  dead advanced-sampling knobs, finish live-preview, multi-axis grid; long poles =
+  ControlNet/IP-Adapter, mask-paint canvas.
+- NOTE: the live **Rust** lowering is AHEAD of the **Mojo** `serenity_lower` oracle (Phase-4
+  nodes) — the oracle is synced in lockstep (campaign updates it after each phase).

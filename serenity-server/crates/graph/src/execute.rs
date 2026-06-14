@@ -603,6 +603,49 @@ fn exec_node(
             Ok(Fire::Done)
         }
         "ConditioningSetMask" => exec_conditioning_set_mask(node, links, store, out),
+        "ConditioningConcat" => {
+            // Comfy ConditioningConcat(conditioning_to, conditioning_from): the two
+            // tensors are concatenated along the token axis. In this text-only
+            // conditioning model a CONDITIONING handle carries prompt text, so the
+            // faithful flat lowering is to join the two prompts: "to, from".
+            let to_link = links.input(id, "conditioning_to");
+            let from_link = links.input(id, "conditioning_from");
+            if !to_link.found || !from_link.found {
+                return Err(GraphError::unsupported(
+                    "workflow graph ConditioningConcat missing required typed input",
+                )
+                .with_node(id));
+            }
+            if !(ready(store, &to_link) && ready(store, &from_link)) {
+                return Ok(Fire::NotReady);
+            }
+            require_value_type(store, &to_link, "CONDITIONING", "conditioning_to")?;
+            require_value_type(store, &from_link, "CONDITIONING", "conditioning_from")?;
+            let to_text = cond_text_of(store, &to_link)?;
+            let from_text = cond_text_of(store, &from_link)?;
+            let text = if to_text.is_empty() {
+                from_text
+            } else if from_text.is_empty() {
+                to_text
+            } else {
+                format!("{to_text}, {from_text}")
+            };
+            add_value(store, id, "CONDITIONING", ValuePayload::Cond { text })?;
+            Ok(Fire::Done)
+        }
+        "ConditioningCombine" | "ConditioningAverage" => {
+            // Comfy ConditioningCombine batches both conditionings; ConditioningAverage
+            // blends them by `conditioning_to_strength`. Neither is representable in a
+            // single text prompt WITHOUT silently dropping the second conditioning (and
+            // the blend weight) — which would render a subtly wrong image. Fail loud
+            // instead; use ConditioningConcat to JOIN two prompts into one.
+            Err(GraphError::unsupported(format!(
+                "workflow graph {t} cannot be lowered to a single text prompt \
+                 (it would silently drop the second conditioning / blend weight); \
+                 use ConditioningConcat to join prompts"
+            ))
+            .with_node(id))
+        }
         "FluxGuidance" => {
             let cond_link = links.input(id, "conditioning");
             if !cond_link.found {
@@ -637,7 +680,8 @@ fn exec_node(
             add_value(store, id, "MODEL", ValuePayload::Model { name: model_name })?;
             Ok(Fire::Done)
         }
-        "KSampler" | "LanPaint_KSampler" | "LanPaint_KSamplerAdvanced" => {
+        "KSampler" | "KSamplerAdvanced" | "LanPaint_KSampler"
+        | "LanPaint_KSamplerAdvanced" => {
             exec_ksampler(node, links, store, out, saw_prompt)
         }
         "KSamplerSelect" => {

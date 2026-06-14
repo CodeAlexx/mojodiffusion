@@ -150,11 +150,17 @@ fn exec_ksampler(
     let id = node.id;
     let t = node.type_id.as_str();
     let fields = &node.fields;
+    let advanced = t == "KSamplerAdvanced";
     let model_link = links.input(id, "model");
     let pos_link = links.input(id, "positive");
     let neg_link = links.input(id, "negative");
     let latent_link = links.input(id, "latent_image");
-    let seed_link = links.input(id, "seed");
+    // KSamplerAdvanced seeds from `noise_seed`; KSampler from `seed`. Resolve the
+    // seed input link from whichever field the node carries.
+    let seed_link = {
+        let l = links.input(id, "noise_seed");
+        if advanced && l.found { l } else { links.input(id, "seed") }
+    };
     let steps_link = links.input(id, "steps");
     let cfg_link = links.input(id, "cfg");
     let sampler_name_link = links.input(id, "sampler_name");
@@ -210,6 +216,9 @@ fn exec_ksampler(
         }
     }
 
+    // Track the resolved step count so KSamplerAdvanced can derive `creativity`
+    // from its `start_at_step`/`steps` denoise window.
+    let mut resolved_steps: Option<i64> = None;
     if steps_link.found {
         let steps = scalar_int_of(store, &steps_link, "steps")?;
         if !(1..=4096).contains(&steps) {
@@ -219,14 +228,26 @@ fn exec_ksampler(
             .with_node(id));
         }
         set_if_missing(out, "steps", json!(steps));
+        resolved_steps = Some(steps);
     } else {
         copy_field_if_missing(out, fields, "steps", "steps");
+        if let Some(n) = fields.as_object().and_then(|o| o.get("steps")).and_then(JsonValue::as_i64) {
+            resolved_steps = Some(n);
+        }
     }
 
     if seed_link.found {
-        let seed = scalar_int_of(store, &seed_link, "seed")?;
+        let seed_name = if advanced { "noise_seed" } else { "seed" };
+        let seed = scalar_int_of(store, &seed_link, seed_name)?;
         if seed >= 0 {
             set_if_missing(out, "seed", json!(seed));
+        }
+    } else if advanced {
+        // KSamplerAdvanced names the seed `noise_seed`; fall back to `seed`.
+        if fields.as_object().and_then(|o| o.get("noise_seed")).map(|v| !v.is_null()).unwrap_or(false) {
+            set_field_if_nonneg_int(out, fields, "noise_seed", "seed")?;
+        } else {
+            set_field_if_nonneg_int(out, fields, "seed", "seed")?;
         }
     } else {
         set_field_if_nonneg_int(out, fields, "seed", "seed")?;
@@ -253,7 +274,46 @@ fn exec_ksampler(
         copy_field_if_missing(out, fields, "scheduler", "scheduler");
     }
 
-    if denoise_link.found {
+    if advanced {
+        // KSamplerAdvanced has no `denoise` field. Its denoise window is the
+        // [start_at_step, end_at_step] slice of the `steps` schedule, with
+        // `add_noise` toggling whether the latent is re-noised at the start.
+        // zimage's flat model only represents the START of the window
+        // (creativity = denoise start). An early `end_at_step`
+        // (return_with_leftover_noise) or `add_noise="disable"` (continue an
+        // existing latent without re-noising) CANNOT be faithfully lowered — so
+        // fail loud rather than silently emit a full-txt2img creativity and
+        // render the wrong image.
+        let steps = resolved_steps.filter(|&s| s > 0).unwrap_or(0);
+        let add_noise = wf_string(fields, "add_noise").to_lowercase();
+        if add_noise == "disable" {
+            return Err(GraphError::unsupported(
+                "workflow graph KSamplerAdvanced add_noise=disable (continue without \
+                 re-noising) is not representable in the zimage flat denoise model",
+            )
+            .with_node(id));
+        }
+        // Default end_at_step to a large sentinel (Comfy's "run to the end"); only
+        // an explicit early end is rejected.
+        let end_at_step = opt_int(fields, "end_at_step", 1_000_000, 0, 10_000_000)?;
+        if steps > 0 && end_at_step < steps {
+            return Err(GraphError::unsupported(
+                "workflow graph KSamplerAdvanced early end_at_step \
+                 (return_with_leftover_noise) is not representable in the zimage \
+                 flat denoise model",
+            )
+            .with_node(id));
+        }
+        let start_at_step = opt_int(fields, "start_at_step", 0, 0, 4096)?;
+        let creativity = if steps > 0 {
+            let raw = 1.0 - (start_at_step as f64) / (steps as f64);
+            raw.clamp(0.0, 1.0)
+        } else {
+            // No usable step count: fall back to full denoise.
+            1.0
+        };
+        set_if_missing(out, "creativity", json!(creativity));
+    } else if denoise_link.found {
         let d = scalar_float_of(store, &denoise_link, "denoise")?;
         if !(0.0..=1.0).contains(&d) {
             return Err(GraphError::unsupported(

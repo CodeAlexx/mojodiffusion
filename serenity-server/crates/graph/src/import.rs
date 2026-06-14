@@ -313,6 +313,9 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
         | "TextEncodeQwenImageEditPlus" => (slot == 0).then_some("CONDITIONING"),
         "ConditioningZeroOut" => (slot == 0).then_some("CONDITIONING"),
         "ConditioningSetMask" => (slot == 0).then_some("CONDITIONING"),
+        "ConditioningCombine" | "ConditioningConcat" | "ConditioningAverage" => {
+            (slot == 0).then_some("CONDITIONING")
+        }
         "LoadImage" => match slot {
             0 => Some("IMAGE"),
             1 => Some("MASK"),
@@ -349,9 +352,8 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
         "ModelSamplingAuraFlow" | "ModelSamplingSD3" | "DifferentialDiffusion" => {
             (slot == 0).then_some("MODEL")
         }
-        "KSampler" | "LanPaint_KSampler" | "LanPaint_KSamplerAdvanced" => {
-            (slot == 0).then_some("LATENT")
-        }
+        "KSampler" | "KSamplerAdvanced" | "LanPaint_KSampler"
+        | "LanPaint_KSamplerAdvanced" => (slot == 0).then_some("LATENT"),
         "CFGGuider" => (slot == 0).then_some("GUIDER"),
         "BasicGuider" => (slot == 0).then_some("GUIDER"),
         "Flux2Scheduler" | "BasicScheduler" => (slot == 0).then_some("SIGMAS"),
@@ -827,6 +829,21 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             fields.insert("sampler_name".into(), json!(widget_string(widgets, 4, "euler")));
             fields.insert("scheduler".into(), json!(widget_string(widgets, 5, "simple")));
             fields.insert("denoise".into(), json!(widget_float(widgets, 6, 1.0)));
+        }
+        "KSamplerAdvanced" => {
+            fields.insert("add_noise".into(), json!(widget_string(widgets, 0, "enable")));
+            fields.insert("noise_seed".into(), json!(widget_int(widgets, 1, -1)));
+            fields.insert("seed".into(), json!(widget_int(widgets, 1, -1)));
+            fields.insert("steps".into(), json!(widget_int(widgets, 3, 20)));
+            fields.insert("cfg".into(), json!(widget_float(widgets, 4, 4.5)));
+            fields.insert("sampler_name".into(), json!(widget_string(widgets, 5, "euler")));
+            fields.insert("scheduler".into(), json!(widget_string(widgets, 6, "simple")));
+            fields.insert("start_at_step".into(), json!(widget_int(widgets, 7, 0)));
+            fields.insert("end_at_step".into(), json!(widget_int(widgets, 8, 10000)));
+            fields.insert(
+                "return_with_leftover_noise".into(),
+                json!(widget_string(widgets, 9, "disable")),
+            );
         }
         "LanPaint_KSampler" => {
             fields.insert("seed".into(), json!(widget_int(widgets, 0, -1)));

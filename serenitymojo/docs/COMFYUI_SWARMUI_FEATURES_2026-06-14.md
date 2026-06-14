@@ -109,5 +109,42 @@ The zimage worker already executes mask-based denoise (`SetLatentNoiseMask`,
   `lanpaint_mask_channel`, a masked-denoise job (init + red-channel mask + creativity 0.85)
   completes. ALL PASS.
 
-## Phase 4 — ComfyUI node-dispatch completeness  ⏳ next (executor + capped worker rebuild)
+## Phase 4 — ComfyUI node-dispatch completeness  ✅ DONE & VERIFIED (2026-06-14)
+
+KEY FINDING: the live lowering is **Rust** (`serenity-server/crates/graph`), not the Mojo
+`workflow_graph.mojo` (that is the parity ORACLE). Nodes that lower to existing flat params
+need NO worker rebuild — the worker runs flat params, only the server's graph→params lowering
+changes. (So Phase 4 was Rust-only, contrary to the original plan's "capped worker rebuild".)
+
+Added to the Rust graph crate (`nodes.rs` allowlist + `import.rs` ports/widgets + `execute.rs`
+dispatch + `execute_handlers.rs`):
+- **KSamplerAdvanced** — maps to the same flat params as KSampler, but seeds from `noise_seed`
+  and derives `creativity = clamp(1 - start_at_step/steps)` (start_at_step=0 → full txt2img).
+- **ConditioningConcat** — joins the two input prompt texts (`"to, from"`).
+- **ConditioningCombine / ConditioningAverage** — FAIL-LOUD 501: batching / weighted-blend
+  can't be lowered to a single text prompt without silently dropping the second conditioning
+  (chose a clear 501 over a silently-wrong image; use Concat to join).
+- KSamplerAdvanced FAIL-LOUD 501 on `add_noise=disable` or early `end_at_step`
+  (return-with-leftover-noise) — not representable in the zimage flat denoise model.
+
+**Team:** builder/bug-fixer/skeptic; build green, 18/18 graph tests pass. The bug-fixer
+correctly flagged that the Rust lowering is now AHEAD of the Mojo oracle (which 501s on these
+nodes) and refused to fabricate a fake parity ref — so the Mojo `serenity_lower` oracle should
+gain these nodes if strict Rust↔Mojo lockstep is required (follow-up). Skeptic's fail-loud
+recommendations were applied.
+
+**Verified (measured, live server):**
+- KSamplerAdvanced workflow → lowered (`seed` from noise_seed, `creativity` 1.0 from
+  start_at_step 0) → ran on zimage → a real serene-mountain-lake image (job-0859/0860).
+  (Caught a test bug first: a top-level `prompt` override beats the workflow's CLIPTextEncode
+  via `set_if_missing` — omit it so the graph's prompt wins.)
+- ConditioningConcat workflow → joined prompt "a red vintage car, on a snowy mountain road"
+  → real image (job-0861).
+- Fail-loud confirmed: add_noise=disable / end_at_step<steps / ConditioningCombine all return
+  clear `[501]` messages.
+
+---
+
+ALL FOUR PHASES DONE & VERIFIED. Verification images:
+github.com/CodeAlexx/samples/tree/main/comfyui_swarmui_2026-06-14
 ## Phase 4 — ComfyUI node-dispatch completeness  ⏳ (executor + capped worker rebuild)

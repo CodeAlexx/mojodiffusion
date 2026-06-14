@@ -21,8 +21,199 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Map, Value};
+use serenity_wire::JobParams;
 
 use crate::AppState;
+
+/// A current-session job in the shared JobBook (the daemon's `jobs` list): the
+/// emitted `record`, the `params` the driver needs to send_start, and the queued
+/// cancel flag. The driver promotes the FIRST active-queued entry (daemon model).
+pub struct JobEntry {
+    pub record: JobRecord,
+    pub params: JobParams,
+    pub cancel_requested: bool,
+}
+
+impl JobEntry {
+    /// `_is_active_queued`: a job eligible to run / be reordered / be removed.
+    pub fn is_active_queued(&self) -> bool {
+        self.record.state == "queued" && !self.cancel_requested
+    }
+}
+
+// ── queue helpers (faithful ports; queue-position = index among active-queued) ──
+
+pub fn find_job(jobs: &[JobEntry], id: &str) -> Option<usize> {
+    jobs.iter().position(|e| e.record.id == id)
+}
+
+fn active_queued_count(jobs: &[JobEntry]) -> usize {
+    jobs.iter().filter(|e| e.is_active_queued()).count()
+}
+
+fn queued_position_of_index(jobs: &[JobEntry], idx: usize) -> i64 {
+    let mut pos = 0i64;
+    for (i, e) in jobs.iter().enumerate() {
+        if !e.is_active_queued() {
+            continue;
+        }
+        if i == idx {
+            return pos;
+        }
+        pos += 1;
+    }
+    -1
+}
+
+fn queued_index_at_position(jobs: &[JobEntry], target: i64) -> i64 {
+    let mut pos = 0i64;
+    for (i, e) in jobs.iter().enumerate() {
+        if !e.is_active_queued() {
+            continue;
+        }
+        if pos == target {
+            return i as i64;
+        }
+        pos += 1;
+    }
+    -1
+}
+
+/// `_queued_jobs_json`: [{id, position}, …] over the active-queued jobs.
+fn queued_jobs_json(jobs: &[JobEntry]) -> Value {
+    let mut arr = Vec::new();
+    let mut pos = 0i64;
+    for e in jobs.iter() {
+        if !e.is_active_queued() {
+            continue;
+        }
+        arr.push(json!({ "id": e.record.id, "position": pos }));
+        pos += 1;
+    }
+    Value::Array(arr)
+}
+
+/// `_move_queued_job_to_position`: adjacent swaps to slot src into target_pos.
+fn move_queued_job_to_position(jobs: &mut [JobEntry], src_idx: usize, target_pos: i64) -> i64 {
+    let mut pos = queued_position_of_index(jobs, src_idx);
+    while pos > target_pos {
+        let cur = queued_index_at_position(jobs, pos);
+        let prev = queued_index_at_position(jobs, pos - 1);
+        if cur < 0 || prev < 0 {
+            return pos;
+        }
+        jobs.swap(cur as usize, prev as usize);
+        pos -= 1;
+    }
+    while pos < target_pos {
+        let cur = queued_index_at_position(jobs, pos);
+        let nxt = queued_index_at_position(jobs, pos + 1);
+        if cur < 0 || nxt < 0 {
+            return pos;
+        }
+        jobs.swap(cur as usize, nxt as usize);
+        pos += 1;
+    }
+    pos
+}
+
+/// `_reorder_target_position`: resolve `before_id` or `position` to a queue index.
+fn reorder_target_position(jobs: &[JobEntry], src_idx: usize, body: &Value) -> Result<i64, String> {
+    let count = active_queued_count(jobs) as i64;
+    let src_pos = queued_position_of_index(jobs, src_idx);
+    if count <= 0 || src_pos < 0 {
+        return Err("job is not in the active queue".into());
+    }
+    if let Some(b) = body.get("before_id").filter(|v| !v.is_null()) {
+        let before_id = b.as_str().ok_or("'before_id' must be a string")?;
+        if before_id == jobs[src_idx].record.id {
+            return Ok(src_pos);
+        }
+        let before_idx = find_job(jobs, before_id).ok_or_else(|| format!("no such before_id: {before_id}"))?;
+        if !jobs[before_idx].is_active_queued() {
+            return Err(format!("'before_id' is not an active queued job: {before_id}"));
+        }
+        let mut before_pos = queued_position_of_index(jobs, before_idx);
+        if before_pos > src_pos {
+            before_pos -= 1;
+        }
+        return Ok(before_pos);
+    }
+    match body.get("position").and_then(|v| v.as_i64()) {
+        Some(t) if t >= 0 && t < count => Ok(t),
+        Some(_) => Err(format!("'position' out of range [0..{}]", count - 1)),
+        None => Err("'position' (integer) or 'before_id' (string) is required".into()),
+    }
+}
+
+fn jobs_json_resp(status: StatusCode, doc: &Value) -> Response {
+    (
+        status,
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::to_string(doc).unwrap_or_else(|_| String::from("{}")),
+    )
+        .into_response()
+}
+fn jobs_err(status: StatusCode, detail: &str) -> Response {
+    jobs_json_resp(status, &json!({ "detail": detail }))
+}
+
+fn body_object(body: &str) -> Value {
+    serde_json::from_str::<Value>(body).ok().filter(|v| v.is_object()).unwrap_or_else(|| json!({}))
+}
+
+/// POST /v1/reorder — move an active-queued job to a new position (by `position`
+/// or `before_id`). Returns {job_id, position, queue}.
+pub async fn post_reorder(State(st): State<AppState>, body: String) -> Response {
+    let b = body_object(&body);
+    let id = match b.get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return jobs_err(StatusCode::UNPROCESSABLE_ENTITY, "'id' (string) is required"),
+    };
+    let mut jobs = match st.jobs.lock() {
+        Ok(j) => j,
+        Err(_) => return jobs_err(StatusCode::INTERNAL_SERVER_ERROR, "job book poisoned"),
+    };
+    let i = match find_job(&jobs, &id) {
+        Some(i) => i,
+        None => return jobs_err(StatusCode::NOT_FOUND, &format!("no such job: {id}")),
+    };
+    if !jobs[i].is_active_queued() {
+        return jobs_err(StatusCode::CONFLICT, &format!("only active queued jobs can be reordered: {id}"));
+    }
+    let target = match reorder_target_position(&jobs, i, &b) {
+        Ok(t) => t,
+        Err(e) => return jobs_err(StatusCode::UNPROCESSABLE_ENTITY, &e),
+    };
+    let new_pos = move_queued_job_to_position(&mut jobs, i, target);
+    jobs_json_resp(StatusCode::OK, &json!({ "job_id": id, "position": new_pos, "queue": queued_jobs_json(&jobs) }))
+}
+
+/// POST /v1/remove — remove an active-queued job before it starts.
+/// Returns {job_id, removed, queue}.
+pub async fn post_remove(State(st): State<AppState>, body: String) -> Response {
+    let b = body_object(&body);
+    let id = match b.get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return jobs_err(StatusCode::UNPROCESSABLE_ENTITY, "'id' (string) is required"),
+    };
+    let mut jobs = match st.jobs.lock() {
+        Ok(j) => j,
+        Err(_) => return jobs_err(StatusCode::INTERNAL_SERVER_ERROR, "job book poisoned"),
+    };
+    let i = match find_job(&jobs, &id) {
+        Some(i) => i,
+        None => return jobs_err(StatusCode::NOT_FOUND, &format!("no such job: {id}")),
+    };
+    if !jobs[i].is_active_queued() {
+        return jobs_err(
+            StatusCode::CONFLICT,
+            &format!("only active queued jobs can be removed before execution; use /v1/cancel/<id> for running jobs: {id}"),
+        );
+    }
+    jobs.remove(i);
+    jobs_json_resp(StatusCode::OK, &json!({ "job_id": id, "removed": true, "queue": queued_jobs_json(&jobs) }))
+}
 
 fn terminal_state(s: &str) -> bool {
     s == "done" || s == "failed" || s == "cancelled" || s == "interrupted"
@@ -64,7 +255,7 @@ pub fn db_safe_params(s: &str) -> String {
 
 /// `save_jobs_db`: rewrite jobs.db = prior rows + session jobs that have STARTED
 /// (state != queued), in the daemon's `jobs` schema. Crash-safe full rewrite.
-pub fn save_jobs_db(prior: &[[String; 6]], jobs: &[JobRecord], db_path: &Path) {
+pub fn save_jobs_db(prior: &[[String; 6]], jobs: &[JobEntry], db_path: &Path) {
     let _ = (|| -> rusqlite::Result<()> {
         let conn = rusqlite::Connection::open(db_path)?;
         conn.execute_batch(
@@ -77,7 +268,8 @@ pub fn save_jobs_db(prior: &[[String; 6]], jobs: &[JobRecord], db_path: &Path) {
             for r in prior {
                 stmt.execute(rusqlite::params![r[0], r[1], r[2], r[3], r[4], r[5]])?;
             }
-            for j in jobs {
+            for e in jobs {
+                let j = &e.record;
                 if j.state == "queued" {
                     continue; // never started — nothing truthful to index yet
                 }
@@ -184,8 +376,8 @@ fn prior_job_json_value(row: &[String; 6]) -> Value {
 pub async fn get_jobs(State(st): State<AppState>) -> Response {
     let mut arr: Vec<Value> = st.prior.iter().map(prior_job_json_value).collect();
     if let Ok(jobs) = st.jobs.lock() {
-        for r in jobs.iter() {
-            arr.push(job_json_value(r));
+        for e in jobs.iter() {
+            arr.push(job_json_value(&e.record));
         }
     }
     (
@@ -205,8 +397,8 @@ pub async fn get_job_one(State(st): State<AppState>, axum::extract::Path(id): ax
             .into_response()
     };
     if let Ok(jobs) = st.jobs.lock() {
-        if let Some(r) = jobs.iter().find(|r| r.id == id) {
-            return ok(job_json_value(r));
+        if let Some(e) = jobs.iter().find(|e| e.record.id == id) {
+            return ok(job_json_value(&e.record));
         }
     }
     if let Some(row) = st.prior.iter().find(|r| r[0] == id) {
@@ -260,5 +452,38 @@ mod tests {
         assert!(terminal_state("interrupted"));
         assert!(!terminal_state("running"));
         assert!(!terminal_state("queued"));
+    }
+
+    fn entry(id: &str, state: &str) -> JobEntry {
+        JobEntry {
+            record: JobRecord {
+                id: id.into(), created: "c".into(), model: "m".into(), state: state.into(),
+                progress: 0, step: 0, total: 0, image_index: 0, image_count: 1,
+                output_path: String::new(), error: String::new(), params_json: String::new(),
+            },
+            params: JobParams::default(),
+            cancel_requested: false,
+        }
+    }
+
+    #[test]
+    fn queue_math_and_reorder() {
+        // a running job + 3 queued; queue positions count only the active-queued.
+        let mut v = vec![entry("r", "running"), entry("a", "queued"), entry("b", "queued"), entry("c", "queued")];
+        assert_eq!(active_queued_count(&v), 3);
+        assert_eq!(serde_json::to_string(&queued_jobs_json(&v)).unwrap(),
+            r#"[{"id":"a","position":0},{"id":"b","position":1},{"id":"c","position":2}]"#);
+        // move c (queue-pos 2) to the front (pos 0): order becomes c,a,b
+        let src = find_job(&v, "c").unwrap();
+        let pos = move_queued_job_to_position(&mut v, src, 0);
+        assert_eq!(pos, 0);
+        assert_eq!(serde_json::to_string(&queued_jobs_json(&v)).unwrap(),
+            r#"[{"id":"c","position":0},{"id":"a","position":1},{"id":"b","position":2}]"#);
+        // reorder target by before_id: move b before c
+        let src = find_job(&v, "b").unwrap();
+        assert_eq!(reorder_target_position(&v, src, &json!({"before_id":"c"})).unwrap(), 0);
+        // by position, out of range
+        assert!(reorder_target_position(&v, src, &json!({"position": 9})).is_err());
+        assert!(reorder_target_position(&v, src, &json!({})).is_err());
     }
 }

@@ -74,13 +74,6 @@ const BACKEND_NAME: &str = "isolated-rust";
 
 // ── shared state ──────────────────────────────────────────────────────────────
 
-/// A job handed to the worker-driver thread: the full JobParams plus the shared
-/// channel (history + broadcast) every event for this job is fanned out on.
-struct QueuedJob {
-    params: JobParams,
-    channel: Arc<JobChannel>,
-}
-
 /// Per-job event channel: a live `broadcast` sender AND a replayable HISTORY of
 /// every event fanned out so far. The driver appends to `history` (and broadcasts)
 /// under the SAME lock used by a connecting WS client to snapshot+subscribe, so no
@@ -155,8 +148,8 @@ type Registry = Arc<Mutex<HashMap<String, Arc<JobChannel>>>>;
 /// the `WorkerHandle`). Cancel must run on the driver thread, not a handler.
 /// `Job` is boxed so the two variants stay close in size (JobParams is large).
 enum DriverCtl {
-    /// A new job to run (single-GPU contract: one in flight at a time).
-    Job(Box<QueuedJob>),
+    /// A new job was pushed to the JobBook — wake the driver to promote it.
+    Wake,
     /// Cancel the job with this id IF it is the one currently in flight.
     Cancel(String),
 }
@@ -176,8 +169,10 @@ struct AppState {
     out_dir: PathBuf,
     /// Prior jobs.db rows loaded ONCE at startup (history half of /v1/jobs).
     prior: Arc<Vec<[String; 6]>>,
-    /// Current-session JobRecords (live half of /v1/jobs), ordered by enqueue.
-    jobs: Arc<Mutex<Vec<jobs::JobRecord>>>,
+    /// Current-session JobBook (live half of /v1/jobs + the serial queue), ordered by
+    /// enqueue; the driver promotes the first active-queued entry. /v1/reorder + /v1/remove
+    /// mutate it.
+    jobs: Arc<Mutex<Vec<jobs::JobEntry>>>,
 }
 
 // ── request body ────────────────────────────────────────────────────────────--
@@ -311,19 +306,19 @@ fn parse_args() -> (PathBuf, u16, PathBuf, Vec<String>) {
 /// rather than tearing the server down.
 /// Update the current-session JobRecord with `id` in place (no-op if absent).
 fn update_record(
-    jobs: &Arc<Mutex<Vec<jobs::JobRecord>>>,
+    jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
     id: &str,
     f: impl FnOnce(&mut jobs::JobRecord),
 ) {
     if let Ok(mut v) = jobs.lock() {
-        if let Some(r) = v.iter_mut().find(|r| r.id == id) {
-            f(r);
+        if let Some(e) = v.iter_mut().find(|e| e.record.id == id) {
+            f(&mut e.record);
         }
     }
 }
 
 /// Apply a WorkerEvent to the matching JobRecord (state/step/progress/output/error).
-fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobRecord>>>, id: &str, ev: &WorkerEvent) {
+fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>, id: &str, ev: &WorkerEvent) {
     match ev {
         WorkerEvent::Progress { step, total, .. } => update_record(jobs, id, |r| {
             r.state = "running".to_string();
@@ -359,7 +354,7 @@ fn run_worker_driver(
     ctl: std::sync::mpsc::Receiver<DriverCtl>,
     registry: Registry,
     in_flight: Arc<Mutex<Option<String>>>,
-    jobs: Arc<Mutex<Vec<jobs::JobRecord>>>,
+    jobs: Arc<Mutex<Vec<jobs::JobEntry>>>,
     prior: Arc<Vec<[String; 6]>>,
     db_path: PathBuf,
 ) {
@@ -376,18 +371,27 @@ fn run_worker_driver(
         }
     };
 
-    // Jobs that arrived while another was in flight (single-GPU: run them in order).
-    let mut pending: std::collections::VecDeque<Box<QueuedJob>> =
-        std::collections::VecDeque::new();
-
     loop {
-        // Pick the next job to run: a buffered one first, else block on the channel.
-        let job = match pending.pop_front() {
-            Some(j) => j,
+        // Promote the FIRST active-queued job from the shared JobBook (the daemon's
+        // tick_worker model — so /v1/reorder + /v1/remove, which mutate the book, take
+        // effect on the very next promotion). Marking it `running` under the lock makes
+        // promotion atomic. When nothing is queued, block on `ctl` for a Wake (a new job
+        // was enqueued) or a Cancel (ignored while idle), then re-scan.
+        let promoted = match jobs.lock() {
+            Ok(mut book) => match book.iter().position(|e| e.record.state == "queued") {
+                Some(i) => {
+                    book[i].record.state = "running".to_string();
+                    Some((book[i].record.id.clone(), book[i].params.clone()))
+                }
+                None => None,
+            },
+            Err(_) => None,
+        };
+        let (job_id, params) = match promoted {
+            Some(x) => x,
             None => match ctl.recv() {
-                Ok(DriverCtl::Job(j)) => j,
+                Ok(DriverCtl::Wake) => continue,
                 Ok(DriverCtl::Cancel(target)) => {
-                    // Cancel arriving while idle: nothing is in flight to cancel.
                     tracing::info!(job = %target, "cancel ignored: not in flight (idle)");
                     continue;
                 }
@@ -395,9 +399,16 @@ fn run_worker_driver(
             },
         };
 
-        let job = *job; // unbox once; QueuedJob owns its params + channel now.
-        let job_id = job.params.job_id.clone();
-        let channel = job.channel;
+        // The per-job channel was registered in the registry by post_generate BEFORE the
+        // JobEntry became promotable, so it is present here.
+        let channel = match registry.lock().ok().and_then(|m| m.get(&job_id).cloned()) {
+            Some(c) => c,
+            None => {
+                tracing::warn!(%job_id, "no channel for promoted job (evicted?); skipping");
+                update_record(&jobs, &job_id, |r| r.state = "failed".to_string());
+                continue;
+            }
+        };
 
         // Lazily (re)spawn if we have no live worker (first job, or after a prior
         // peer-close).
@@ -420,9 +431,8 @@ fn run_worker_driver(
 
         tracing::info!(%job_id, "starting job");
         set_in_flight(&in_flight, Some(job_id.clone()));
-        update_record(&jobs, &job_id, |r| r.state = "running".to_string());
 
-        if let Err(e) = h.send_start(&job.params) {
+        if let Err(e) = h.send_start(&params) {
             tracing::error!(%job_id, "send_start failed: {e:#}");
             let ev = WorkerEvent::Failed { error: format!("send_start failed: {e}") };
             apply_event_to_record(&jobs, &job_id, &ev);
@@ -439,7 +449,7 @@ fn run_worker_driver(
 
         // Poll until terminal OR the worker peer-closes, servicing `ctl` each tick so
         // a cancel for THIS job reaches the worker promptly (and stray jobs buffer).
-        let outcome = drive_one_job(h, &channel, &job_id, &ctl, &mut pending, &jobs);
+        let outcome = drive_one_job(h, &channel, &job_id, &ctl, &jobs);
         set_in_flight(&in_flight, None);
         schedule_evict(&registry, &job_id);
         // Persist the jobs.db after this job's terminal so session history survives a
@@ -548,8 +558,7 @@ fn drive_one_job(
     channel: &Arc<JobChannel>,
     job_id: &str,
     ctl: &std::sync::mpsc::Receiver<DriverCtl>,
-    pending: &mut std::collections::VecDeque<Box<QueuedJob>>,
-    jobs: &Arc<Mutex<Vec<jobs::JobRecord>>>,
+    jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
 ) -> JobOutcome {
     loop {
         // 1. Service any pending control messages WITHOUT blocking.
@@ -565,10 +574,9 @@ fn drive_one_job(
                         tracing::info!(job = %target, "cancel ignored: not the in-flight job");
                     }
                 }
-                Ok(DriverCtl::Job(j)) => {
-                    // Another job arrived while one is in flight — queue it.
-                    pending.push_back(j);
-                }
+                // A Wake (new job enqueued) while one is in flight: nothing to do now —
+                // it'll be promoted from the JobBook after this job finishes.
+                Ok(DriverCtl::Wake) => {}
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     return JobOutcome::ChannelClosed;
@@ -731,28 +739,10 @@ async fn post_generate(
     }
     params.out_dir = st.out_dir.to_string_lossy().into_owned();
 
-    // Track a current-session JobRecord (queued) so /v1/jobs shows it live. The
-    // driver flips it running -> done/failed/cancelled as worker events flow.
-    if let Ok(mut jobs) = st.jobs.lock() {
-        jobs.push(jobs::JobRecord {
-            id: job_id.clone(),
-            created: httpdate::fmt_http_date(SystemTime::now()),
-            model: params.model.clone(),
-            state: "queued".to_string(),
-            progress: 0,
-            step: 0,
-            total: params.steps,
-            image_index: 0,
-            image_count: params.images.max(1),
-            output_path: String::new(),
-            error: String::new(),
-            params_json: String::new(),
-        });
-    }
-
-    // Register the per-job channel (history + broadcast) BEFORE enqueueing so a fast
-    // WS subscriber can attach before any event is produced — and so the HISTORY
-    // exists to replay even if the whole job finishes before the client connects.
+    // Register the per-job channel (history + broadcast) BEFORE the JobEntry becomes
+    // promotable, so the driver (which looks the channel up by id) finds it and a fast
+    // WS subscriber can attach before any event is produced — the HISTORY replays even
+    // if the whole job finishes before the client connects.
     let channel = JobChannel::new();
     {
         let mut map = match st.registry.lock() {
@@ -765,18 +755,48 @@ async fn post_generate(
                     .into_response();
             }
         };
-        map.insert(job_id.clone(), channel.clone());
+        map.insert(job_id.clone(), channel);
     }
 
-    // Enqueue to the worker-driver thread.
-    if st
-        .ctl
-        .send(DriverCtl::Job(Box::new(QueuedJob { params, channel })))
-        .is_err()
+    // Push the JobEntry (queued) to the shared JobBook. The driver promotes the FIRST
+    // active-queued entry; /v1/jobs shows it live; /v1/reorder + /v1/remove mutate it.
     {
-        // Driver thread is gone — pull the registry entry back out.
+        let record = jobs::JobRecord {
+            id: job_id.clone(),
+            created: httpdate::fmt_http_date(SystemTime::now()),
+            model: params.model.clone(),
+            state: "queued".to_string(),
+            progress: 0,
+            step: 0,
+            total: params.steps,
+            image_index: 0,
+            image_count: params.images.max(1),
+            output_path: String::new(),
+            error: String::new(),
+            params_json: String::new(),
+        };
+        match st.jobs.lock() {
+            Ok(mut book) => book.push(jobs::JobEntry { record, params, cancel_requested: false }),
+            Err(_) => {
+                if let Ok(mut map) = st.registry.lock() {
+                    map.remove(&job_id);
+                }
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "job book poisoned"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Wake the driver to promote the new job.
+    if st.ctl.send(DriverCtl::Wake).is_err() {
         if let Ok(mut map) = st.registry.lock() {
             map.remove(&job_id);
+        }
+        if let Ok(mut book) = st.jobs.lock() {
+            book.retain(|e| e.record.id != job_id);
         }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1245,7 +1265,7 @@ async fn main() -> anyhow::Result<()> {
     // counter at max_prior_id so generated ids never collide with a prior row (F7).
     let prior = Arc::new(jobs::load_prior_rows(&out_dir.join("jobs.db")));
     let next_id = Arc::new(AtomicU64::new(jobs::max_prior_id(&prior) as u64));
-    let job_book: Arc<Mutex<Vec<jobs::JobRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let job_book: Arc<Mutex<Vec<jobs::JobEntry>>> = Arc::new(Mutex::new(Vec::new()));
     tracing::info!(prior_rows = prior.len(), next_id_base = next_id.load(Ordering::Relaxed), "jobs.db loaded");
 
     // 2. Worker-driver thread (owns WorkerHandle; handshake waits for Ready). It
@@ -1289,6 +1309,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(models::get_models))
         .route("/v1/jobs", get(jobs::get_jobs))
         .route("/v1/job/:id", get(jobs::get_job_one))
+        .route("/v1/reorder", post(jobs::post_reorder))
+        .route("/v1/remove", post(jobs::post_remove))
         .route("/v1/video", get(video::get_video).post(video::post_video))
         .route("/v1/video/probe", get(video::get_video_probe))
         .route("/v1/gallery", get(gallery::get_gallery))

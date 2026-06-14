@@ -19,3 +19,4 @@ tokio.workspace = true
 axum.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+image.workspace = true

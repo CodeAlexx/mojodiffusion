@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# PNG decode/encode + lanczos resize for /v1/gallery thumbnails (png only — lean).
+image = { version = "0.25", default-features = false, features = ["png"] }
 # internal
 serenity-wire = { path = "crates/wire" }
 serenity-ipc = { path = "crates/ipc" }

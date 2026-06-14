@@ -265,10 +265,24 @@ Run the Rust server `serenity-server --worker output/bin/serenity_worker_stub --
   (it matches the committed source); a flip to header-first is 1 line.** 3 unit tests
   lock the probes + precedence.
 
-### REMAINING (3 endpoints — daemon handler line refs in `serenity_daemon.mojo`)
+- **`/v1/gallery` READ PATH** (`crates/server/src/gallery.rs`) — `GET /v1/gallery`,
+  `/v1/gallery/:id`, `/v1/gallery/read`. PNG `tEXt` parser (CRC-verified, `serenity.
+  genparams.v1`), gallery state (favorites/names/order/imports), item builder, scan,
+  search/filter/all-8-sorts, and 256px lanczos thumbnail generation (`image` crate,
+  skip-if-cached). **VERIFIED logic byte-identical vs the oracle: 14/14 GET variants
+  + 6/6 sub-routes** (real fixture PNGs, favorites/names/order state exercised), path
+  prefix normalized. 3 unit tests (crc32 KAT, id/safe-id, filter semantics).
+  ⚠ **Same path-representation convention as everything else:** the Rust uses its
+  absolute canonicalized out_dir for `path`/`thumbnail_path*`/`thumbnail_path_root`;
+  the daemon used the relative literal `output/serenity_daemon`. Logic identical;
+  absolute is more robust. REMAINING for gallery: the MUTATION sub-routes (POST
+  import/order/:id/rename/:id/favorite, DELETE /:id) — state mutators
+  (`_set_gallery_*_doc`/`_remove_gallery_item_doc`, already read; @3059-3168).
+
+### REMAINING (gallery mutations + 2 endpoints — daemon handler line refs in `serenity_daemon.mojo`)
 Ordered by value × tractability. Each is independent → good builder/skeptic team work,
 but byte-exactness is the risk — DIFF EVERY ONE against the oracle before committing.
-- **`/v1/gallery`** (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
+- **`/v1/gallery` mutations** (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
   GET-one @3049-3182). Scans `OUT_DIR/*.png` for embedded `serenity.genparams.v1` tEXt +
   favorites/order state (`<out_dir>/state/gallery.json`). LARGE. Schema `serenity.gallery.v1`.
 - **`/v1/jobs`** (handler @3295) + `/v1/reorder` (@3315) + `/v1/remove` (@3347). Returns the

@@ -946,13 +946,24 @@ struct ZImageBackend(GenBackend, Movable):
         var image_t = Tensor.from_host(host, ishape^, STDtype.BF16, self.ctx)
         print("[zimage][img2img] init image", self.params.init_image,
               "(", img.width, "x", img.height, ") -> VAE encode_mean")
-        # 512x512 only this phase (enforced in start()): the 64-latent grid.
-        var enc = ZImageVaeEncoder[64, 64].load(String(VAE_DIR), self.ctx)
-        var mu = enc.encode_mean(image_t, self.ctx)
-        var mu_h = mu.to_host(self.ctx)
-        var z = List[Float32](capacity=len(mu_h))
-        for i in range(len(mu_h)):
-            z.append((mu_h[i] - ZIMG_SHIFT) * ZIMG_SCALING)
+        # The VAE encoder grid must match the init resolution: 64-latent for
+        # 512x512, 128-latent for 1024x1024 (both are start()-admitted sizes —
+        # the 128 path lets hires-fix run its img2img refine pass at 1024).
+        var z = List[Float32]()
+        if self.params.width == 1024 and self.params.height == 1024:
+            var enc = ZImageVaeEncoder[128, 128].load(String(VAE_DIR), self.ctx)
+            var mu = enc.encode_mean(image_t, self.ctx)
+            var mu_h = mu.to_host(self.ctx)
+            z = List[Float32](capacity=len(mu_h))
+            for i in range(len(mu_h)):
+                z.append((mu_h[i] - ZIMG_SHIFT) * ZIMG_SCALING)
+        else:
+            var enc = ZImageVaeEncoder[64, 64].load(String(VAE_DIR), self.ctx)
+            var mu = enc.encode_mean(image_t, self.ctx)
+            var mu_h = mu.to_host(self.ctx)
+            z = List[Float32](capacity=len(mu_h))
+            for i in range(len(mu_h)):
+                z.append((mu_h[i] - ZIMG_SHIFT) * ZIMG_SCALING)
         _print_vram("after init-image encode (encoder freed on return)")
         return z^
 

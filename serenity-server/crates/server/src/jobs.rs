@@ -32,6 +32,12 @@ pub struct JobEntry {
     pub record: JobRecord,
     pub params: JobParams,
     pub cancel_requested: bool,
+    /// Hires-fix control-plane state (NOT part of the frozen worker wire). When
+    /// `hires_scale > 1.0`, the driver runs the job as two worker passes: a base
+    /// pass, then an img2img refine pass at `scale*res` with `hires_denoise`
+    /// creativity. Default `1.0 / 0.0` = single pass (no hires).
+    pub hires_scale: f64,
+    pub hires_denoise: f64,
 }
 
 impl JobEntry {
@@ -463,6 +469,8 @@ mod tests {
             },
             params: JobParams::default(),
             cancel_requested: false,
+            hires_scale: 1.0,
+            hires_denoise: 0.0,
         }
     }
 

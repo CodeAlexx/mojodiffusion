@@ -222,6 +222,23 @@ struct GenerateRequest {
     /// Lowered LoRA overlays — `lower_request` writes the `lora` array.
     #[serde(default, rename = "lora")]
     loras: Option<Vec<LoraSpec>>,
+    // ── img2img / inpaint passthrough (JobParams already carries these) ──
+    /// img2img init latent source (a decodable image path). Empty = txt2img.
+    #[serde(default)]
+    init_image: Option<String>,
+    /// SetLatentNoiseMask source (requires `init_image`); empty = no mask.
+    #[serde(default)]
+    mask_image: Option<String>,
+    /// Which channel of `mask_image` is the mask (alpha|red|green|blue|luminance).
+    #[serde(default)]
+    lanpaint_mask_channel: Option<String>,
+    // ── hires-fix (control-plane only; NOT forwarded to the worker wire) ──
+    /// >1.0 enables a second img2img refine pass at `scale*resolution`.
+    #[serde(default)]
+    hires_scale: Option<f64>,
+    /// Creativity (denoise) of the hires refine pass; lower = closer to base.
+    #[serde(default)]
+    hires_denoise: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,13 +401,18 @@ fn run_worker_driver(
             Ok(mut book) => match book.iter().position(|e| e.record.state == "queued") {
                 Some(i) => {
                     book[i].record.state = "running".to_string();
-                    Some((book[i].record.id.clone(), book[i].params.clone()))
+                    Some((
+                        book[i].record.id.clone(),
+                        book[i].params.clone(),
+                        book[i].hires_scale,
+                        book[i].hires_denoise,
+                    ))
                 }
                 None => None,
             },
             Err(_) => None,
         };
-        let (job_id, params) = match promoted {
+        let (job_id, params, hires_scale, hires_denoise) = match promoted {
             Some(x) => x,
             None => match ctl.recv() {
                 Ok(DriverCtl::Wake) => continue,
@@ -452,7 +474,15 @@ fn run_worker_driver(
 
         // Poll until terminal OR the worker peer-closes, servicing `ctl` each tick so
         // a cancel for THIS job reaches the worker promptly (and stray jobs buffer).
-        let outcome = drive_one_job(h, &channel, &job_id, &ctl, &jobs);
+        // Hires-fix runs the job as TWO worker passes under one job_id (base pass +
+        // an upscaled img2img refine); a single-pass job takes the plain driver.
+        let outcome = if hires_scale > 1.0 {
+            drive_hires_two_pass(
+                h, &channel, &job_id, &ctl, &jobs, &params, hires_scale, hires_denoise,
+            )
+        } else {
+            drive_one_job(h, &channel, &job_id, &ctl, &jobs)
+        };
         set_in_flight(&in_flight, None);
         schedule_evict(&registry, &job_id);
         // Persist the jobs.db after this job's terminal so session history survives a
@@ -618,6 +648,174 @@ fn drive_one_job(
     }
 }
 
+/// Outcome of one worker pass (used by the hires 2-pass orchestrator).
+enum PassResult {
+    /// Worker emitted Done; carries the output_path. The terminal Done was
+    /// published to the channel iff `publish_done` was true.
+    Done(String),
+    /// Failed or Cancelled — already applied to the record and published.
+    Terminal,
+    PeerClosed,
+    IpcError,
+    ChannelClosed,
+}
+
+/// Drive the worker for ONE pass. Identical to `drive_one_job` except the terminal
+/// `Done` is intercepted: its `output_path` is returned, and it is published as the
+/// job's terminal only when `publish_done` is true. For the base pass of a hires
+/// job we pass `false` so the record stays `running` until the refine pass finishes.
+fn drive_one_pass(
+    handle: &mut WorkerHandle,
+    channel: &Arc<JobChannel>,
+    job_id: &str,
+    ctl: &std::sync::mpsc::Receiver<DriverCtl>,
+    jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
+    publish_done: bool,
+) -> PassResult {
+    loop {
+        loop {
+            match ctl.try_recv() {
+                Ok(DriverCtl::Cancel(target)) => {
+                    if target == job_id {
+                        match handle.send_cancel() {
+                            Ok(()) => tracing::info!(job = %job_id, "cancel forwarded to worker"),
+                            Err(e) => tracing::warn!(job = %job_id, "send_cancel failed: {e:#}"),
+                        }
+                    }
+                }
+                Ok(DriverCtl::Wake) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return PassResult::ChannelClosed;
+                }
+            }
+        }
+        match handle.next_event_poll() {
+            Ok(EventPoll::Event(ev)) => {
+                if let WorkerEvent::Done { output_path } = &ev {
+                    let path = output_path.clone();
+                    if publish_done {
+                        apply_event_to_record(jobs, job_id, &ev);
+                        channel.publish(ev);
+                    }
+                    return PassResult::Done(path);
+                }
+                let terminal = ev.is_terminal();
+                apply_event_to_record(jobs, job_id, &ev);
+                channel.publish(ev);
+                if terminal {
+                    return PassResult::Terminal;
+                }
+            }
+            Ok(EventPoll::Idle) => std::thread::sleep(POLL_INTERVAL),
+            Ok(EventPoll::PeerClosed) => {
+                let ev = WorkerEvent::Failed {
+                    error: "worker process exited unexpectedly".to_string(),
+                };
+                apply_event_to_record(jobs, job_id, &ev);
+                channel.publish(ev);
+                return PassResult::PeerClosed;
+            }
+            Err(e) => {
+                let ev = WorkerEvent::Failed { error: format!("worker IPC error: {e}") };
+                apply_event_to_record(jobs, job_id, &ev);
+                channel.publish(ev);
+                return PassResult::IpcError;
+            }
+        }
+    }
+}
+
+/// Hires-fix: base pass → upscale the base PNG to `scale*resolution` → img2img
+/// refine pass at that resolution with `denoise` creativity. Both passes run on the
+/// same resident worker under one `job_id`; only the refine pass publishes the
+/// terminal Done, so the client sees a single job whose final image is the refine.
+fn drive_hires_two_pass(
+    handle: &mut WorkerHandle,
+    channel: &Arc<JobChannel>,
+    job_id: &str,
+    ctl: &std::sync::mpsc::Receiver<DriverCtl>,
+    jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
+    base_params: &JobParams,
+    scale: f64,
+    denoise: f64,
+) -> JobOutcome {
+    let base_path = match drive_one_pass(handle, channel, job_id, ctl, jobs, false) {
+        PassResult::Done(p) => p,
+        PassResult::Terminal => return JobOutcome::Terminal,
+        PassResult::PeerClosed => return JobOutcome::PeerClosed,
+        PassResult::IpcError => return JobOutcome::IpcError,
+        PassResult::ChannelClosed => return JobOutcome::ChannelClosed,
+    };
+
+    // The worker's img2img VAE encoder only supports the 512 and 1024 latent
+    // grids, and zimage start() admits only 512x512 / 1024x1024 (square). So snap
+    // the refine target to the nearest supported square size: scale that lands at
+    // >=768 px refines at 1024, otherwise at 512. This keeps every hires job on a
+    // valid encoder grid (no >1024 alloc, no unsupported-grid fail) regardless of
+    // the requested scale.
+    let raw = ((base_params.width.max(base_params.height) as f64) * scale).round() as i64;
+    let target = if raw >= 768 { 1024 } else { 512 };
+    let sw = target;
+    let sh = target;
+    let hires_src = match upscale_png(&base_path, sw as u32, sh as u32) {
+        Ok(p) => p,
+        Err(e) => {
+            let ev = WorkerEvent::Failed { error: format!("hires upscale failed: {e}") };
+            apply_event_to_record(jobs, job_id, &ev);
+            channel.publish(ev);
+            return JobOutcome::Terminal;
+        }
+    };
+
+    // Refine pass = img2img from the upscaled base. Cloning base_params (which has no
+    // hires state — that lives on the JobEntry) means no recursion.
+    let mut p2 = base_params.clone();
+    p2.init_image = hires_src.clone();
+    p2.creativity = denoise;
+    p2.width = sw;
+    p2.height = sh;
+    tracing::info!(%job_id, base_w = base_params.width, hires_w = sw, "hires refine pass");
+    if let Err(e) = handle.send_start(&p2) {
+        let _ = std::fs::remove_file(&hires_src);
+        let ev = WorkerEvent::Failed { error: format!("hires pass-2 send_start failed: {e}") };
+        apply_event_to_record(jobs, job_id, &ev);
+        channel.publish(ev);
+        return JobOutcome::PeerClosed;
+    }
+    let outcome = match drive_one_pass(handle, channel, job_id, ctl, jobs, true) {
+        PassResult::Done(_) | PassResult::Terminal => JobOutcome::Terminal,
+        PassResult::PeerClosed => JobOutcome::PeerClosed,
+        PassResult::IpcError => JobOutcome::IpcError,
+        PassResult::ChannelClosed => JobOutcome::ChannelClosed,
+    };
+    // The upscaled init was only needed to seed the refine pass; drop it so it
+    // neither accumulates on disk nor lingers as a stray file in out_dir.
+    let _ = std::fs::remove_file(&hires_src);
+    outcome
+}
+
+/// Upscale a PNG to `w x h` (Lanczos3) and write it beside the source with a
+/// `hires_src_` prefix. The prefix matters: the gallery scanner only picks up
+/// files matching `job-*.png`, so `hires_src_job-XXXX.png` is invisible to it
+/// (no phantom gallery item). The caller deletes it after the refine pass. Uses
+/// the `image` crate (already a server dep for gallery thumbnails).
+fn upscale_png(src: &str, w: u32, h: u32) -> Result<String, String> {
+    let img = image::open(src).map_err(|e| e.to_string())?;
+    let resized = img.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
+    let p = std::path::Path::new(src);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("hires");
+    let dst = match p.parent() {
+        Some(dir) => dir.join(format!("hires_src_{stem}.png")),
+        None => std::path::PathBuf::from(format!("hires_src_{stem}.png")),
+    };
+    let dst = dst.to_string_lossy().into_owned();
+    resized
+        .save_with_format(&dst, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(dst)
+}
+
 /// Record the current in-flight job id (None when idle).
 fn set_in_flight(in_flight: &Arc<Mutex<Option<String>>>, v: Option<String>) {
     if let Ok(mut g) = in_flight.lock() {
@@ -745,6 +943,28 @@ async fn post_generate(
     if let Some(v) = req.loras {
         params.loras = v;
     }
+    // img2img / inpaint passthrough — without these the worker silently runs
+    // txt2img even when the request carried an init/mask (measured 2026-06-14).
+    if let Some(v) = req.init_image {
+        params.init_image = v;
+    }
+    if let Some(v) = req.mask_image {
+        params.mask_image = v;
+    }
+    if let Some(v) = req.lanpaint_mask_channel {
+        params.lanpaint_mask_channel = v;
+    }
+    // Hires-fix lives on the JobEntry (control plane), never in the worker wire.
+    // Clamp hard: an unbounded scale would drive a multi-TB image-crate alloc on
+    // the driver thread (OOM kills the desktop, per CLAUDE.md); NaN -> disabled.
+    let hires_scale = match req.hires_scale {
+        Some(v) if v.is_finite() => v.clamp(1.0, 4.0),
+        _ => 1.0,
+    };
+    let hires_denoise = match req.hires_denoise {
+        Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
+        _ => 0.4,
+    };
     params.out_dir = st.out_dir.to_string_lossy().into_owned();
 
     // Build the genparams the worker embeds in the PNG tEXt: the lowered request +
@@ -796,7 +1016,13 @@ async fn post_generate(
             params_json: String::new(),
         };
         match st.jobs.lock() {
-            Ok(mut book) => book.push(jobs::JobEntry { record, params, cancel_requested: false }),
+            Ok(mut book) => book.push(jobs::JobEntry {
+                record,
+                params,
+                cancel_requested: false,
+                hires_scale,
+                hires_denoise,
+            }),
             Err(_) => {
                 if let Ok(mut map) = st.registry.lock() {
                     map.remove(&job_id);

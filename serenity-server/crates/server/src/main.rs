@@ -676,6 +676,11 @@ async fn post_generate(
         }
     }
 
+    // Keep the (lowered) request as the genparams body the worker embeds as the PNG's
+    // serenity.genparams.v1 tEXt chunk — that's what /v1/gallery + SerenityUI's
+    // "reuse params" read back. We inject schema + the server job_id below.
+    let genparams_value = req_value.clone();
+
     // The request is now flat (either it always was, or lower_request flattened it).
     // Deserialize the flat shape; a malformed core (missing model/prompt) is a 400.
     let req: GenerateRequest = match serde_json::from_value(req_value) {
@@ -741,6 +746,18 @@ async fn post_generate(
         params.loras = v;
     }
     params.out_dir = st.out_dir.to_string_lossy().into_owned();
+
+    // Build the genparams the worker embeds in the PNG tEXt: the lowered request +
+    // schema + the server-assigned job_id (the UI's "reuse params" round-trips this,
+    // and /v1/jobs/gallery read it back). Without it the worker embeds an empty chunk.
+    {
+        let mut gp = genparams_value;
+        if let Some(obj) = gp.as_object_mut() {
+            obj.entry("schema").or_insert(json!("serenity.genparams.v1"));
+            obj.insert("job_id".into(), json!(job_id));
+            params.params_json = serde_json::to_string(&gp).unwrap_or_default();
+        }
+    }
 
     // Register the per-job channel (history + broadcast) BEFORE the JobEntry becomes
     // promotable, so the driver (which looks the channel up by id) finds it and a fast

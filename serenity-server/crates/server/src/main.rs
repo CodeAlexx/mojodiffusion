@@ -173,6 +173,9 @@ struct AppState {
     /// enqueue; the driver promotes the first active-queued entry. /v1/reorder + /v1/remove
     /// mutate it.
     jobs: Arc<Mutex<Vec<jobs::JobEntry>>>,
+    /// Backend identity for /v1/health (the worker kind: "zimage"/"stub"/… — derived from
+    /// --kind or the worker binary name). Cosmetic for the bridge (it gates on status only).
+    backend_name: String,
 }
 
 // ── request body ────────────────────────────────────────────────────────────--
@@ -851,6 +854,57 @@ async fn post_cancel(
         .into_response()
 }
 
+/// POST /v1/cancel/:id — the PATH form SerenityUI's per-job cancel uses (daemon_cancel).
+/// Matches the daemon: 404 unknown, 409 already-terminal, else 200
+/// {job_id, state, cancel_requested:true} where `state` is the pre-cancel state. A QUEUED
+/// job is finalized to cancelled right here (so the driver's `state=="queued"` promote
+/// skips it); a RUNNING job's cancel is forwarded to the worker, which emits Cancelled.
+async fn post_cancel_path(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let djson = |status: StatusCode, v: serde_json::Value| -> Response {
+        (
+            status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&v).unwrap_or_else(|_| String::from("{}")),
+        )
+            .into_response()
+    };
+    // Classify under the JobBook lock; finalize a queued cancel, mark a running cancel.
+    let prev_state = {
+        let mut book = match st.jobs.lock() {
+            Ok(b) => b,
+            Err(_) => return djson(StatusCode::INTERNAL_SERVER_ERROR, json!({"detail": "job book poisoned"})),
+        };
+        match book.iter_mut().find(|e| e.record.id == id) {
+            None => return djson(StatusCode::NOT_FOUND, json!({"detail": format!("no such job: {id}")})),
+            Some(e) => {
+                let s = e.record.state.clone();
+                if s == "done" || s == "failed" || s == "cancelled" {
+                    return djson(StatusCode::CONFLICT, json!({"detail": format!("job already {s}")}));
+                }
+                e.cancel_requested = true;
+                if s == "queued" {
+                    e.record.state = "cancelled".to_string(); // the driver won't promote it now
+                }
+                s
+            }
+        }
+    };
+    if prev_state == "queued" {
+        // finalize: notify any WS subscriber, evict the channel after grace, persist.
+        if let Some(ch) = st.registry.lock().ok().and_then(|m| m.get(&id).cloned()) {
+            ch.publish(WorkerEvent::Cancelled);
+        }
+        schedule_evict(&st.registry, &id);
+        if let Ok(b) = st.jobs.lock() {
+            jobs::save_jobs_db(&st.prior, &b, &st.out_dir.join("jobs.db"));
+        }
+    } else {
+        // running: hand the cancel to the driver thread (owns the WorkerHandle).
+        let _ = st.ctl.send(DriverCtl::Cancel(id.clone()));
+    }
+    djson(StatusCode::OK, json!({ "job_id": id, "state": prev_state, "cancel_requested": true }))
+}
+
 /// GET /v1/progress?job=<id> — upgrade to WebSocket, REPLAY all buffered events for
 /// this job, THEN stream live ones until a terminal event, then close.
 ///
@@ -969,9 +1023,16 @@ async fn handle_progress_socket(
     let _ = socket.close().await;
 }
 
-/// GET /v1/health — {"backend":"isolated-rust","ok":true}.
-async fn get_health() -> Json<serde_json::Value> {
-    Json(json!({ "backend": BACKEND_NAME, "ok": true }))
+/// GET /v1/health — the daemon's shape `{status,backend,model,resident}` so SerenityUI's
+/// daemon bridge (`ok = status=="ok"`) treats the Rust server as the live daemon on :7801
+/// and routes generate/jobs/cancel here instead of falling back to per-job CLI spawn.
+async fn get_health(State(st): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "status": "ok",
+        "backend": st.backend_name,
+        "model": "-",
+        "resident": "",
+    }))
 }
 
 /// `/v1/samplers` body — the daemon's static SwarmUI/Comfy sampler catalog
@@ -1251,6 +1312,17 @@ async fn main() -> anyhow::Result<()> {
 
     // 1. CLI.
     let (worker_bin, port, out_dir, worker_args) = parse_args();
+    // Backend identity for /v1/health: the --kind, else the worker binary name with the
+    // "serenity_worker_" prefix stripped (e.g. .../serenity_worker_zimage -> "zimage").
+    let backend_name = if worker_args.len() >= 2 && worker_args[0] == "worker" {
+        worker_args[1].clone()
+    } else {
+        worker_bin
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.strip_prefix("serenity_worker_").unwrap_or(s).to_string())
+            .unwrap_or_else(|| BACKEND_NAME.to_string())
+    };
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| anyhow::anyhow!("create out_dir {}: {e}", out_dir.display()))?;
     let out_dir = std::fs::canonicalize(&out_dir).unwrap_or(out_dir);
@@ -1297,12 +1369,14 @@ async fn main() -> anyhow::Result<()> {
         out_dir,
         prior,
         jobs: job_book,
+        backend_name,
     };
 
     // 3. Router.
     let app = Router::new()
         .route("/v1/generate", post(post_generate))
         .route("/v1/cancel", post(post_cancel))
+        .route("/v1/cancel/:id", post(post_cancel_path))
         .route("/v1/progress", get(ws_progress))
         .route("/v1/health", get(get_health))
         .route("/v1/samplers", get(get_samplers))

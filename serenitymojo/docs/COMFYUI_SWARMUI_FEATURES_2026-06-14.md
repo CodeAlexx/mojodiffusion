@@ -147,4 +147,39 @@ recommendations were applied.
 
 ALL FOUR PHASES DONE & VERIFIED. Verification images:
 github.com/CodeAlexx/samples/tree/main/comfyui_swarmui_2026-06-14
+
+---
+
+## Follow-on: Ideogram4 KJ workflow (the "kj nodes") — worker DONE & VERIFIED (2026-06-14)
+
+User goal: make the ideogram4 Comfy export (with `Ideogram4PromptBuilderKJ`) run end-to-end.
+Findings + work:
+- The KJ export ALREADY lowers via the live Rust path (`apply_ideogram4_comfy_ui_export`,
+  import.rs:543) — KJ builder + ResolutionSelector + the RES4LYF UUID nodes (ClownsharKSampler,
+  Dual Model CFG Guider) are inert UI nodes; the prompt comes from the top level. No 501.
+- The only missing piece was the ideogram4 SERVING worker. Added a standalone
+  `serenitymojo/serve/serenity_worker_ideogram4.mojo` (mirrors serenity_worker_zimage, swaps in
+  `Ideogram4Backend`) + pixi `build-worker-ideogram4-raw` (capped, outer systemd scope). Launch:
+  `serenity-server --worker output/bin/serenity_worker_ideogram4` (NO --kind — standalone takes
+  just <fd>). Single-worker server, so it's a separate instance from the zimage one.
+- VERIFIED PARAMS (measured): the backend defaults are **cfg 7.0** + scheduler
+  **ideogram4_logitnormal** + **48 steps** (ideogram4_backend.mojo:330,340). cfg 1.0/simple →
+  garbage; correct params → coherent image. The model tokenizes the RAW JSON caption string
+  (ideogram4_backend.mojo:480) — so prompt serialization must be byte-exact.
+- VERIFIED (measured): structured JSON caption → real sailboat image (job-0865). Byte-exact
+  passthrough CONFIRMED (sent==worker-received, 837 bytes). A benign golden-retriever prompt hit
+  the model's safety-filter false-positive (documented behavior, gray "Image blocked" screen).
+
+### JSON-fidelity finding (web-researched + measured)
+The image varies "through the prompt node" because ideogram4 tokenizes the raw string. The
+trailing-comma/2-space JSON is NOT the KJ Prompt Builder (its source uses json.dumps or 4-space
+pretty — never trailing commas) — it's the **LLM/QwenVL expansion** emitting sloppy JSON. The
+serenity transport is byte-exact (verified). FIX for the magic-prompt to build: normalize the
+LLM output (parse tolerantly → re-serialize canonically `separators=(",",":")`, ensure_ascii=False).
+
+### Remaining (large): magic-prompt + bbox builder
+User wants both, with **Qwen3-VL-8B** (vision). The repo already has a pure-Mojo TEXT magic-prompt
+(`pipeline/ideogram4_magic.mojo`, Qwen3-8B local). Qwen3-VL-8B (Abliterated-Caption-it) weights are
+on disk but the VISION TOWER is NOT ported — that's a real model port (the long pole). The bbox
+editor is a new SerenityUI canvas. These are multi-session.
 ## Phase 4 — ComfyUI node-dispatch completeness  ⏳ (executor + capped worker rebuild)

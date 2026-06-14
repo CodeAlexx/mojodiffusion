@@ -89,5 +89,25 @@ grid also produced. `cargo build` clean.
 
 GUI grid section (axis dropdown + values field + Generate-Grid button) = the remaining
 exposure step (the feature is API-complete and measured).
-## Phase 3 — Inpaint UI panel               ⏳ (backend already executes mask denoise)
+## Phase 3 — Inpaint UI panel               ✅ DONE & VERIFIED (2026-06-14)
+
+The zimage worker already executes mask-based denoise (`SetLatentNoiseMask`,
+`load_comfy_latent_preserve_mask` → `inpaint_preserve_mask`); the server forwards
+`mask_image`/`lanpaint_mask_channel` (wired in the Phase 1 prereq). Phase 3 = the UI.
+
+- `GenParams` gained `mask_image` + `mask_channel` (serialized under keys `mask_image`
+  and `lanpaint_mask_channel`), mirroring the `init_image` pattern (store mirror + commit).
+- `_section_inpaint` (serenityUI): mask-path field + Validate + a channel combobox
+  (`load_image_mask|red|green|blue|alpha|luminance`) + the "needs Init image; white =
+  regenerate" hint, modeled on `_section_init_image`. Reuses the shared creativity slider.
+
+**Verified (measured):**
+- curl: a forest init + a white-center mask + prompt "a bright red barn" → the **center
+  regenerated to a red barn while the forest edges were preserved** (mask convention:
+  white = regenerate). Server log: `preserve pixels 3072/4096`.
+- UI path: `--selftest` inpaint assertion — genparams carry `mask_image` +
+  `lanpaint_mask_channel`, a masked-denoise job (init + red-channel mask + creativity 0.85)
+  completes. ALL PASS.
+
+## Phase 4 — ComfyUI node-dispatch completeness  ⏳ next (executor + capped worker rebuild)
 ## Phase 4 — ComfyUI node-dispatch completeness  ⏳ (executor + capped worker rebuild)

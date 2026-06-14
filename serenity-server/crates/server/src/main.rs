@@ -1193,7 +1193,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(models::get_models))
         .route("/v1/gallery", get(gallery::get_gallery))
         .route("/v1/gallery/read", get(gallery::get_gallery_read))
-        .route("/v1/gallery/:id", get(gallery::get_gallery_one))
+        .route("/v1/gallery/order", post(gallery::post_order))
+        .route("/v1/gallery/:id", get(gallery::get_gallery_one).delete(gallery::delete_item))
+        .route("/v1/gallery/:id/rename", post(gallery::post_rename))
+        .route("/v1/gallery/:id/favorite", post(gallery::post_favorite))
         .route("/v1/state", get(get_state).post(post_state))
         .route("/v1/presets", get(get_presets).post(post_presets_root))
         .route(

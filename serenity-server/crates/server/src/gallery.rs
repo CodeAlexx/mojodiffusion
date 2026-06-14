@@ -473,6 +473,195 @@ pub async fn get_gallery_one(State(st): State<AppState>, AxPath(id): AxPath<Stri
     }
 }
 
+// ── state mutators (sub-routes) ─────────────────────────────────────────────────
+
+fn state_arr(doc: &Value, key: &str) -> Value {
+    doc.get(key).filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([]))
+}
+
+fn save_gallery_state(out: &Path, doc: &Value) -> std::io::Result<()> {
+    std::fs::create_dir_all(out.join("state"))?;
+    let _ = std::fs::create_dir_all(thumb_dir(out));
+    std::fs::write(state_file(out), serde_json::to_string(doc).unwrap())
+}
+
+/// `_set_gallery_favorite_doc` — rebuild favorites, preserve names/order/imports.
+fn set_favorite_doc(doc: &Value, id: &str, favorite: bool) -> Value {
+    let mut favs = Vec::new();
+    let mut found = false;
+    if let Some(arr) = doc.get("favorites").and_then(|f| f.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                if s == id {
+                    found = true;
+                    if favorite {
+                        favs.push(json!(id));
+                    }
+                } else {
+                    favs.push(json!(s));
+                }
+            }
+        }
+    }
+    if favorite && !found {
+        favs.push(json!(id));
+    }
+    json!({ "schema": "serenity.gallery_state.v1", "favorites": favs,
+        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") })
+}
+
+/// `_set_gallery_name_doc` — upsert {id,name} in names, preserve the rest.
+fn set_name_doc(doc: &Value, id: &str, name: &str) -> Value {
+    let mut names = Vec::new();
+    let mut replaced = false;
+    if let Some(arr) = doc.get("names").and_then(|n| n.as_array()) {
+        for ent in arr {
+            if ent.get("id").and_then(|v| v.as_str()) == Some(id) {
+                names.push(json!({ "id": id, "name": name }));
+                replaced = true;
+            } else {
+                names.push(ent.clone());
+            }
+        }
+    }
+    if !replaced {
+        names.push(json!({ "id": id, "name": name }));
+    }
+    json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": names, "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") })
+}
+
+/// `_set_gallery_order_doc` — validate each id (safe + png exists), set order.
+fn set_order_doc(out: &Path, doc: &Value, ids: &Value) -> Result<Value, String> {
+    let arr = ids.as_array().ok_or("'ids' must be an array of gallery ids")?;
+    let mut order = Vec::new();
+    for (i, v) in arr.iter().enumerate() {
+        let id = v.as_str().ok_or_else(|| format!("'ids[{i}]' must be a string"))?;
+        if !safe_gallery_id(id) {
+            return Err(format!("invalid gallery id: {id}"));
+        }
+        if !Path::new(&png_path(out, id)).exists() {
+            return Err(format!("gallery item not found: {id}"));
+        }
+        order.push(json!(id));
+    }
+    Ok(json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": state_arr(doc, "names"), "order": order, "imports": state_arr(doc, "imports") }))
+}
+
+/// `_remove_gallery_item_doc` — drop `id` from every array.
+fn remove_item_doc(doc: &Value, id: &str) -> Value {
+    let strip_strs = |key: &str| -> Vec<Value> {
+        doc.get(key).and_then(|a| a.as_array())
+            .map(|a| a.iter().filter(|v| v.as_str() != Some(id)).cloned().collect())
+            .unwrap_or_default()
+    };
+    let strip_objs = |key: &str| -> Vec<Value> {
+        doc.get(key).and_then(|a| a.as_array())
+            .map(|a| a.iter().filter(|e| e.get("id").and_then(|v| v.as_str()) != Some(id)).cloned().collect())
+            .unwrap_or_default()
+    };
+    json!({ "schema": "serenity.gallery_state.v1", "favorites": strip_strs("favorites"),
+        "names": strip_objs("names"), "order": strip_strs("order"), "imports": strip_objs("imports") })
+}
+
+fn required_string(body: &Value, key: &str) -> Result<String, String> {
+    match body.get(key).and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        Some(_) => Err(format!("'{key}' must be non-empty")),
+        None => Err(format!("'{key}' (string) is required")),
+    }
+}
+
+fn body_object(body: &str) -> Value {
+    serde_json::from_str::<Value>(body).ok().filter(|v| v.is_object()).unwrap_or_else(|| json!({}))
+}
+
+/// POST /v1/gallery/:id/favorite — set/clear favorite, return the item.
+pub async fn post_favorite(State(st): State<AppState>, AxPath(id): AxPath<String>, body: String) -> Response {
+    let out = st.out_dir.as_path();
+    if !safe_gallery_id(&id) {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("invalid gallery id: {id}"));
+    }
+    let p = png_path(out, &id);
+    if !Path::new(&p).exists() {
+        return err_detail(StatusCode::NOT_FOUND, &format!("gallery item not found: {id}"));
+    }
+    let b = body_object(&body);
+    let favorite = match b.get("favorite") {
+        None => true,
+        Some(v) if v.is_boolean() => v.as_bool().unwrap(),
+        Some(_) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "'favorite' must be a boolean"),
+    };
+    let next = set_favorite_doc(&load_gallery_state(out), &id, favorite);
+    if save_gallery_state(out, &next).is_err() {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
+    }
+    json_compact(StatusCode::OK, &item_from_png_state(out, &next, &id, &p, favorite, true))
+}
+
+/// POST /v1/gallery/:id/rename — set display name, return the item.
+pub async fn post_rename(State(st): State<AppState>, AxPath(id): AxPath<String>, body: String) -> Response {
+    let out = st.out_dir.as_path();
+    if !safe_gallery_id(&id) {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("invalid gallery id: {id}"));
+    }
+    let p = png_path(out, &id);
+    if !Path::new(&p).exists() {
+        return err_detail(StatusCode::NOT_FOUND, &format!("gallery item not found: {id}"));
+    }
+    let name = match required_string(&body_object(&body), "name") {
+        Ok(n) => n,
+        Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
+    };
+    let next = set_name_doc(&load_gallery_state(out), &id, &name);
+    if save_gallery_state(out, &next).is_err() {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
+    }
+    json_compact(StatusCode::OK, &item_from_png_state(out, &next, &id, &p, gallery_favorite(&next, &id), true))
+}
+
+/// POST /v1/gallery/order — set the manual order; returns {schema, order}.
+pub async fn post_order(State(st): State<AppState>, body: String) -> Response {
+    let out = st.out_dir.as_path();
+    let b = body_object(&body);
+    let ids = match b.get("ids") {
+        Some(v) => v.clone(),
+        None => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "'ids' array is required"),
+    };
+    let next = match set_order_doc(out, &load_gallery_state(out), &ids) {
+        Ok(d) => d,
+        Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
+    };
+    if save_gallery_state(out, &next).is_err() {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
+    }
+    json_compact(StatusCode::OK, &json!({ "schema": "serenity.gallery_order.v1", "order": next.get("order").cloned().unwrap_or(json!([])) }))
+}
+
+/// DELETE /v1/gallery/:id — unlink the PNG (+ thumb) and drop it from state.
+pub async fn delete_item(State(st): State<AppState>, AxPath(id): AxPath<String>) -> Response {
+    let out = st.out_dir.as_path();
+    if !safe_gallery_id(&id) {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("invalid gallery id: {id}"));
+    }
+    let p = png_path(out, &id);
+    if !Path::new(&p).exists() {
+        return err_detail(StatusCode::NOT_FOUND, &format!("gallery item not found: {id}"));
+    }
+    let deleted = std::fs::remove_file(&p).is_ok();
+    let tp = thumb_path(out, &id);
+    let mut thumb_deleted = false;
+    if Path::new(&tp).exists() {
+        thumb_deleted = std::fs::remove_file(&tp).is_ok();
+    }
+    let next = remove_item_doc(&load_gallery_state(out), &id);
+    let _ = save_gallery_state(out, &next);
+    json_compact(StatusCode::OK, &json!({
+        "id": id, "deleted": deleted, "path": p, "thumbnail_path": tp, "thumbnail_deleted": thumb_deleted,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

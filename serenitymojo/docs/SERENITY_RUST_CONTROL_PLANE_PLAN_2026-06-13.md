@@ -279,10 +279,19 @@ Run the Rust server `serenity-server --worker output/bin/serenity_worker_stub --
   import/order/:id/rename/:id/favorite, DELETE /:id) — state mutators
   (`_set_gallery_*_doc`/`_remove_gallery_item_doc`, already read; @3059-3168).
 
-### REMAINING (gallery mutations + 2 endpoints — daemon handler line refs in `serenity_daemon.mojo`)
+- **`/v1/gallery` MUTATIONS** (`crates/server/src/gallery.rs`) — POST `/v1/gallery/order`,
+  POST `/v1/gallery/:id/rename`, POST `/v1/gallery/:id/favorite`, DELETE `/v1/gallery/:id`.
+  Faithful ports of `_set_gallery_{favorite,name,order}_doc` / `_remove_gallery_item_doc`
+  (order/key-preserving). **VERIFIED 16/16 mutation cases byte-identical vs the oracle**
+  (favorite set/clear/non-bool, rename success/empty/missing/invalid-id, order
+  success/missing/bad-id/non-string, favorite-missing 404, delete success/again-404, GET
+  state after each) AND the **persisted gallery.json byte-identical** between both servers.
+
+### REMAINING (import + 2 endpoints — daemon handler line refs in `serenity_daemon.mojo`)
 Ordered by value × tractability. Each is independent → good builder/skeptic team work,
 but byte-exactness is the risk — DIFF EVERY ONE against the oracle before committing.
-- **`/v1/gallery` mutations** (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
+- **`/v1/gallery/import`** (@3059) — COUNTER-COUPLED (allocates a new `job-{njobs}` id),
+  so pair it with `/v1/jobs` (both depend on the shared job counter / DB state). (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
   GET-one @3049-3182). Scans `OUT_DIR/*.png` for embedded `serenity.genparams.v1` tEXt +
   favorites/order state (`<out_dir>/state/gallery.json`). LARGE. Schema `serenity.gallery.v1`.
 - **`/v1/jobs`** (handler @3295) + `/v1/reorder` (@3315) + `/v1/remove` (@3347). Returns the

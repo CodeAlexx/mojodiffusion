@@ -20,11 +20,23 @@ Build `build-lower-cli-safe`: CLEAN. VERIFIED (main-loop, measured): the real
 early `end_at_step=4 < steps=8` → `[501] ... early end_at_step ... not representable` (rc 1).
 Skeptic PASS (real binary vs Rust `execute_handlers.rs`/`execute.rs`, fixture + 9 derived graphs).
 
-## Phase 1 — SamplerCustom ecosystem  ⏳ NEXT
-SamplerCustom (single-output sibling of SamplerCustomAdvanced) + named SAMPLER nodes
-(EulerAncestral/DPMPP_2M_SDE/3M_SDE/LMS…) + named SIGMAS schedulers (Karras/Exponential/SDTurbo)
-→ flat `sampler`/`scheduler`/`steps`. Rust lowering **+ Mojo oracle**.
-## Phase 2 — Image/mask utility nodes  ⏳
+## Phase 1 — SamplerCustom ecosystem  ✅ DONE & VERIFIED (2026-06-14)
+Added SamplerCustom + 4 named SAMPLER nodes + 4 named SIGMAS schedulers to BOTH the Rust
+lowering and the Mojo oracle (lockstep helper tables `util.rs` ↔ `workflow_graph.mojo`).
+- **SamplerCustom** lowers cleanly (passes through inner KSamplerSelect/BasicScheduler) — the real win.
+- The 4 named samplers (euler_ancestral/dpmpp_2m_sde/3m_sde/lms) + 4 named schedulers
+  (karras/exponential/polyexponential/turbo) all map to names OUTSIDE the zimage worker's
+  supported lists → each **FAIL-LOUDs `[501]`** (never silently substituted). Honest: these add
+  clear errors, not new generation, until the worker gains those samplers.
+- Worker supported (`sampling/sampler_registry.mojo`): samplers euler/flowmatch_euler/dpmpp_2m/uni_pc/uni_pc_bh2;
+  schedulers simple/flowmatch/sgm_uniform.
+Builds: cargo (serenity-server 19, serenity-graph 8+11+2 incl. 3 new) ALL PASS; Mojo
+`build-lower-cli-safe` CLEAN. New `crates/graph/examples/lower.rs` = Rust parity harness.
+VERIFIED (main-loop, measured): `cargo test -p serenity-graph` (3 new pass); Mojo `serenity_lower`
+on a SamplerCustom(euler/simple) graph → `sampler:euler/scheduler:simple/steps:8/seed:42/cfg:1.5/creativity:1.0` (rc0).
+Cross-oracle (agents): Rust `lower` example vs Mojo `serenity_lower` byte-identical on SamplerCustom.
+
+## Phase 2 — Image/mask utility nodes  ⏳ NEXT
 ImageScaleBy / ImageResizeKJ / GetImageSizeAndCount(KJ); LoadImageOutput / LoadImageMask.
 ## Phase 3 — FE advanced-sampling wiring + multi-axis grid  ⏳
 Wire the dead `_section_advanced` knobs (clip-skip/sigma min-max/eta/restart/VAE) end-to-end

@@ -43,6 +43,82 @@ def _workflow_type_id(node: JSONValue) raises -> String:
     return _workflow_canonical_type_id(_workflow_string(node, String("type_id")))
 
 
+# --- SamplerCustom ecosystem: named SAMPLER / SIGMAS node tables ---------------
+#
+# ComfyUI exposes per-algorithm SAMPLER producers (SamplerEulerAncestral, ...)
+# and per-schedule SIGMAS producers (KarrasScheduler, ...). Each carries its
+# sampler/scheduler NAME implicitly in the node TYPE, so an unsupported one is a
+# definite error (unlike KSamplerSelect, where the user types a free string).
+# These lower to the SAME flat sampler=/scheduler= path, GATED on the worker's
+# supported list — an unsupported name fails loud [501] (never substituted).
+
+
+def _workflow_named_sampler_name(type_id: String) -> String:
+    """Map a named-SAMPLER node type to its Comfy sampler catalog name (or "")."""
+    if type_id == "SamplerEulerAncestral":
+        return String("euler_ancestral")
+    if type_id == "SamplerDPMPP_2M_SDE":
+        return String("dpmpp_2m_sde")
+    if type_id == "SamplerDPMPP_3M_SDE":
+        return String("dpmpp_3m_sde")
+    if type_id == "SamplerLMS":
+        return String("lms")
+    return String("")
+
+
+def _workflow_is_named_sampler_node(type_id: String) -> Bool:
+    return _workflow_named_sampler_name(type_id) != ""
+
+
+def _workflow_named_scheduler_name(type_id: String) -> String:
+    """Map a named-SIGMAS node type to its Comfy scheduler catalog name (or "")."""
+    if type_id == "KarrasScheduler":
+        return String("karras")
+    if type_id == "ExponentialScheduler":
+        return String("exponential")
+    if type_id == "PolyexponentialScheduler":
+        return String("polyexponential")
+    if type_id == "SDTurboScheduler":
+        return String("turbo")
+    return String("")
+
+
+def _workflow_is_named_scheduler_node(type_id: String) -> Bool:
+    return _workflow_named_scheduler_name(type_id) != ""
+
+
+def _workflow_worker_supports_sampler(name: String) -> Bool:
+    """Gate against the zimage worker's supported sampler list.
+
+    Mirrors sampler_registry.swarmui_sampler_registry_json zimage_supported_samplers
+    /home/alex/mojodiffusion/serenitymojo/sampling/sampler_registry.mojo.
+    """
+    var n = String(name.lower())
+    return (
+        n == "euler"
+        or n == "flowmatch_euler"
+        or n == "flow_match_euler"
+        or n == "dpmpp_2m"
+        or n == "dpm++ 2m"
+        or n == "uni_pc"
+        or n == "uni_pc_bh2"
+    )
+
+
+def _workflow_worker_supports_scheduler(name: String) -> Bool:
+    """Gate against the zimage worker's supported scheduler list.
+
+    Mirrors sampler_registry.swarmui_sampler_registry_json zimage_supported_schedulers.
+    """
+    var n = String(name.lower())
+    return (
+        n == "simple"
+        or n == "flowmatch"
+        or n == "flow_match"
+        or n == "sgm_uniform"
+    )
+
+
 def _workflow_is_int_scalar_node(type_id: String) -> Bool:
     return type_id == "PrimitiveInt" or type_id == "INTConstant" or type_id == "easy int" or type_id == "SeedNode"
 
@@ -1252,6 +1328,25 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("scheduler", JSONValue.from_string(_workflow_widget_string(widgets, 0, String("simple"))))
         fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 1, 20)))
         fields.set("denoise", JSONValue.from_float(_workflow_widget_float(widgets, 2, 1.0)))
+    elif (
+        type_id == "KarrasScheduler"
+        or type_id == "ExponentialScheduler"
+        or type_id == "PolyexponentialScheduler"
+    ):
+        # Comfy widget order: [steps, sigma_max, sigma_min, rho?]. Only steps has
+        # a flat slot; the sigma_max/min/rho shape params have no flat
+        # representation (the scheduler name itself gates fail-loud below).
+        fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 0, 20)))
+    elif type_id == "SDTurboScheduler":
+        # Comfy widget order: [steps, denoise].
+        fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 0, 20)))
+        fields.set("denoise", JSONValue.from_float(_workflow_widget_float(widgets, 1, 1.0)))
+    elif type_id == "SamplerCustom":
+        # Comfy widget order: [add_noise(bool), noise_seed(int),
+        # control_after_generate, cfg(float)].
+        fields.set("add_noise", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, True)))
+        fields.set("noise_seed", JSONValue.from_int(_workflow_widget_int(widgets, 1, -1)))
+        fields.set("cfg", JSONValue.from_float(_workflow_widget_float(widgets, 3, 4.5)))
     elif type_id == "CFGGuider" or type_id == "FluxGuidance":
         fields.set("cfg", JSONValue.from_float(_workflow_widget_float(widgets, 0, 4.5)))
     elif type_id == "ModelSamplingAuraFlow" or type_id == "ModelSamplingSD3":
@@ -1504,13 +1599,22 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "Flux2Scheduler" or typ == "BasicScheduler":
         if slot == 0:
             return String("SIGMAS")
+    elif _workflow_is_named_scheduler_node(typ):
+        if slot == 0:
+            return String("SIGMAS")
     elif typ == "RandomNoise":
         if slot == 0:
             return String("NOISE")
     elif typ == "KSamplerSelect":
         if slot == 0:
             return String("SAMPLER")
+    elif _workflow_is_named_sampler_node(typ):
+        if slot == 0:
+            return String("SAMPLER")
     elif typ == "SamplerCustomAdvanced" or typ == "LanPaint_SamplerCustomAdvanced":
+        if slot == 0 or slot == 1:
+            return String("LATENT")
+    elif typ == "SamplerCustom":
         if slot == 0 or slot == 1:
             return String("LATENT")
     elif typ == "Reroute":
@@ -1686,6 +1790,15 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "BasicScheduler"
             or type_id == "RandomNoise"
             or type_id == "KSamplerSelect"
+            or type_id == "SamplerEulerAncestral"
+            or type_id == "SamplerDPMPP_2M_SDE"
+            or type_id == "SamplerDPMPP_3M_SDE"
+            or type_id == "SamplerLMS"
+            or type_id == "KarrasScheduler"
+            or type_id == "ExponentialScheduler"
+            or type_id == "PolyexponentialScheduler"
+            or type_id == "SDTurboScheduler"
+            or type_id == "SamplerCustom"
             or type_id == "SamplerCustomAdvanced"
             or type_id == "LanPaint_SamplerCustomAdvanced"
             or type_id == "LanPaint_MaskBlend"
@@ -2692,6 +2805,53 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SAMPLER"), String("SAMPLER"))
                 sampler_nodes.append(node_id); sampler_ports.append(String("SAMPLER")); sampler_names.append(sampler_name)
                 done[i] = True; remaining -= 1; progressed = True
+            elif _workflow_is_named_sampler_node(type_id):
+                # Named SAMPLER producer: the sampler name is the node TYPE. Gate
+                # against the worker's supported list; an unsupported name fails
+                # loud rather than substituting a different sampler.
+                var named_sampler = _workflow_named_sampler_name(type_id)
+                if not _workflow_worker_supports_sampler(named_sampler):
+                    raise Error(
+                        "[501] workflow graph " + type_id + " lowers to unsupported sampler '"
+                        + named_sampler + "'; the worker supports only "
+                        + "euler/flowmatch_euler/dpmpp_2m/uni_pc/uni_pc_bh2"
+                    )
+                _set_if_missing(obj, String("sampler"), JSONValue.from_string(named_sampler))
+                _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SAMPLER"), String("SAMPLER"))
+                sampler_nodes.append(node_id); sampler_ports.append(String("SAMPLER")); sampler_names.append(named_sampler)
+                done[i] = True; remaining -= 1; progressed = True
+            elif _workflow_is_named_scheduler_node(type_id):
+                # Named SIGMAS producer: the scheduler name is the node TYPE. Like
+                # BasicScheduler, lowers to scheduler= + steps (+ denoise for
+                # SDTurboScheduler). Gate against the worker's supported list; an
+                # unsupported name fails loud rather than substituting.
+                var named_scheduler = _workflow_named_scheduler_name(type_id)
+                if not _workflow_worker_supports_scheduler(named_scheduler):
+                    raise Error(
+                        "[501] workflow graph " + type_id + " lowers to unsupported scheduler '"
+                        + named_scheduler + "'; the worker supports only "
+                        + "simple/flowmatch/flow_match/sgm_uniform"
+                    )
+                var named_steps_link = _workflow_find_input_link(edges, node_id, String("steps"))
+                var named_sched_ready = _workflow_optional_link_ready(value_nodes, value_ports, named_steps_link)
+                if named_sched_ready:
+                    var named_steps = _opt_int(fields, "steps", 20, 1, 4096)
+                    if named_steps_link.found:
+                        named_steps = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            named_steps_link, String("steps"),
+                        )
+                    if named_steps < 1 or named_steps > 4096:
+                        raise Error("[501] workflow graph " + type_id + " scalar steps out of range")
+                    var named_denoise = 1.0
+                    if type_id == "SDTurboScheduler":
+                        named_denoise = _workflow_float(fields, String("denoise"), 1.0, 0.0, 1.0)
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SIGMAS"), String("SIGMAS"))
+                    sigmas_nodes.append(node_id); sigmas_ports.append(String("SIGMAS"))
+                    sigmas_steps.append(named_steps)
+                    sigmas_schedulers.append(named_scheduler)
+                    sigmas_denoises.append(named_denoise)
+                    done[i] = True; remaining -= 1; progressed = True
             elif type_id == "KSampler" or type_id == "KSamplerAdvanced" or type_id == "LanPaint_KSampler" or type_id == "LanPaint_KSamplerAdvanced":
                 var advanced = type_id == "KSamplerAdvanced"
                 var model_link = _workflow_find_input_link(edges, node_id, String("model"))
@@ -2932,6 +3092,87 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         latent_images.append(latent_images[latent_idx])
                         latent_init_images.append(latent_init_images[latent_idx])
                         latent_mask_images.append(latent_mask_images[latent_idx])
+                    else:
+                        latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
+                        latent_init_images.append(String(""))
+                        latent_mask_images.append(String(""))
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "SamplerCustom":
+                # Single-output sibling of SamplerCustomAdvanced. Unlike the
+                # Advanced node it has NO noise/guider input ports — it builds CFG
+                # guidance and noise itself from its model/positive/negative inputs
+                # and add_noise/noise_seed/cfg widgets, then samples with the
+                # SAMPLER + SIGMAS inputs. Reuses the SAME flat
+                # sampler/scheduler/steps/seed/cfg path.
+                var sc_model_link = _workflow_find_input_link(edges, node_id, String("model"))
+                var sc_pos_link = _workflow_find_input_link(edges, node_id, String("positive"))
+                var sc_neg_link = _workflow_find_input_link(edges, node_id, String("negative"))
+                var sc_sampler_link = _workflow_find_input_link(edges, node_id, String("sampler"))
+                var sc_sigmas_link = _workflow_find_input_link(edges, node_id, String("sigmas"))
+                var sc_latent_link = _workflow_find_input_link(edges, node_id, String("latent_image"))
+                if (
+                    not sc_model_link.found
+                    or not sc_pos_link.found
+                    or not sc_neg_link.found
+                    or not sc_sampler_link.found
+                    or not sc_sigmas_link.found
+                    or not sc_latent_link.found
+                ):
+                    raise Error("[501] workflow graph SamplerCustom missing required typed input")
+                var sc_ready = (
+                    _workflow_value_index(value_nodes, value_ports, sc_model_link.node_id, sc_model_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, sc_pos_link.node_id, sc_pos_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, sc_neg_link.node_id, sc_neg_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, sc_sampler_link.node_id, sc_sampler_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, sc_sigmas_link.node_id, sc_sigmas_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, sc_latent_link.node_id, sc_latent_link.port) >= 0
+                )
+                if sc_ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, sc_model_link, String("MODEL"), String("model"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, sc_pos_link, String("CONDITIONING"), String("positive"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, sc_neg_link, String("CONDITIONING"), String("negative"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, sc_sampler_link, String("SAMPLER"), String("sampler"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, sc_sigmas_link, String("SIGMAS"), String("sigmas"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, sc_latent_link, String("LATENT"), String("latent_image"))
+                    var sc_model_name = _workflow_model_name(model_nodes, model_ports, model_names, sc_model_link)
+                    if sc_model_name != "":
+                        _set_if_missing(obj, String("model"), JSONValue.from_string(sc_model_name))
+                    var sc_prompt = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, sc_pos_link)
+                    _set_if_missing(obj, String("prompt"), JSONValue.from_string(sc_prompt))
+                    saw_prompt = True
+                    var sc_negative = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, sc_neg_link)
+                    _set_if_missing(obj, String("negative"), JSONValue.from_string(sc_negative))
+                    # cfg/seed come from the node's own widgets (SamplerCustom has
+                    # no CFGGuider/RandomNoise inputs).
+                    _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
+                    _workflow_set_field_if_nonnegative_int(obj, fields, String("noise_seed"), String("seed"))
+                    for j in range(len(sampler_nodes)):
+                        if sampler_nodes[j] == sc_sampler_link.node_id and sampler_ports[j] == sc_sampler_link.port:
+                            _set_if_missing(obj, String("sampler"), JSONValue.from_string(sampler_names[j]))
+                    for j in range(len(sigmas_nodes)):
+                        if sigmas_nodes[j] == sc_sigmas_link.node_id and sigmas_ports[j] == sc_sigmas_link.port:
+                            _set_if_missing(obj, String("steps"), JSONValue.from_int(sigmas_steps[j]))
+                            _set_if_missing(obj, String("scheduler"), JSONValue.from_string(sigmas_schedulers[j]))
+                            _set_if_missing(obj, String("creativity"), JSONValue.from_float(sigmas_denoises[j]))
+                    var sc_latent_idx = _workflow_latent_index(latent_nodes, latent_ports, sc_latent_link)
+                    if sc_latent_idx >= 0:
+                        if latent_widths[sc_latent_idx] > 0:
+                            _set_if_missing(obj, String("width"), JSONValue.from_int(latent_widths[sc_latent_idx]))
+                        if latent_heights[sc_latent_idx] > 0:
+                            _set_if_missing(obj, String("height"), JSONValue.from_int(latent_heights[sc_latent_idx]))
+                        _set_if_missing(obj, String("images"), JSONValue.from_int(latent_images[sc_latent_idx]))
+                        if latent_init_images[sc_latent_idx] != "":
+                            _set_if_missing(obj, String("init_image"), JSONValue.from_string(latent_init_images[sc_latent_idx]))
+                        if latent_mask_images[sc_latent_idx] != "":
+                            _set_if_missing(obj, String("mask_image"), JSONValue.from_string(latent_mask_images[sc_latent_idx]))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
+                    latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
+                    if sc_latent_idx >= 0:
+                        latent_widths.append(latent_widths[sc_latent_idx])
+                        latent_heights.append(latent_heights[sc_latent_idx])
+                        latent_images.append(latent_images[sc_latent_idx])
+                        latent_init_images.append(latent_init_images[sc_latent_idx])
+                        latent_mask_images.append(latent_mask_images[sc_latent_idx])
                     else:
                         latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
                         latent_init_images.append(String(""))

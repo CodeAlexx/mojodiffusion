@@ -696,6 +696,24 @@ fn exec_node(
             add_value(store, id, "SAMPLER", ValuePayload::Sampler { name: sampler_name })?;
             Ok(Fire::Done)
         }
+        _ if crate::is_named_sampler_node(t) => {
+            // Named SAMPLER producer: the sampler name is the node TYPE. Gate
+            // against the worker's supported list; an unsupported name fails loud
+            // rather than substituting a different sampler.
+            let named = crate::named_sampler_name(t).to_string();
+            if !crate::worker_supports_sampler(&named) {
+                return Err(GraphError::unsupported(format!(
+                    "workflow graph {t} lowers to unsupported sampler '{named}'; \
+                     the worker supports only euler/flowmatch_euler/dpmpp_2m/uni_pc/uni_pc_bh2"
+                ))
+                .with_node(id));
+            }
+            set_if_missing(out, "sampler", json!(named));
+            add_value(store, id, "SAMPLER", ValuePayload::Sampler { name: named })?;
+            Ok(Fire::Done)
+        }
+        _ if crate::is_named_scheduler_node(t) => exec_named_scheduler(node, links, store),
+        "SamplerCustom" => exec_sampler_custom(node, links, store, out, saw_prompt),
         "RandomNoise" => {
             let seed_link = links.input(id, "noise_seed");
             if !optional_ready(store, &seed_link) {

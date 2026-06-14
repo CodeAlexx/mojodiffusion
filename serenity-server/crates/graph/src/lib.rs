@@ -40,7 +40,9 @@ pub use import::{
 };
 pub use nodes::{is_allowed_type, parse_typed_graph as parse_typed_graph_impl};
 pub use util::{
-    canonical_type_id, is_scalar_node, scalar_output_type,
+    canonical_type_id, is_named_sampler_node, is_named_scheduler_node, is_scalar_node,
+    named_sampler_name, named_scheduler_name, scalar_output_type, worker_supports_sampler,
+    worker_supports_scheduler,
 };
 
 /// Schema marker written into the lowered request (Mojo `WORKFLOW_SCHEMA`).

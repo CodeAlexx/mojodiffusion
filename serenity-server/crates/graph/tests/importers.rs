@@ -280,6 +280,86 @@ fn comfy_switch_lazy_only_selected_branch_required() {
     assert_eq!(req["workflow_source"].as_str(), Some("typed_linked_graph"));
 }
 
+// --- SamplerCustom ecosystem (ComfyUI-parity Phase 1) --------------------------
+
+/// SamplerCustom — the single-output sibling of SamplerCustomAdvanced — lowers
+/// through the SAME flat sampler/scheduler/steps/seed/cfg path. The cfg/seed come
+/// from the node's own widgets (it has no CFGGuider/RandomNoise inputs); the
+/// sampler name comes from a KSamplerSelect(euler) and the schedule from a
+/// BasicScheduler(simple). Verified byte-identical to the Mojo oracle.
+#[test]
+fn sampler_custom_lowers_to_flat_params() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a red fox in snow"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "blurry, ugly"}},
+        "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 768, "height": 512, "batch_size": 1}},
+        "5": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "6": {"class_type": "BasicScheduler", "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": 24, "denoise": 1.0}},
+        "7": {"class_type": "SamplerCustom", "inputs": {"add_noise": true, "noise_seed": 12345, "cfg": 6.5, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "sampler": ["5", 0], "sigmas": ["6", 0], "latent_image": ["4", 0]}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["1", 2]}},
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": "sctest"}}
+    }});
+    lower_request(&mut req).expect("SamplerCustom must lower cleanly");
+    assert_eq!(req["sampler"].as_str(), Some("euler"));
+    assert_eq!(req["scheduler"].as_str(), Some("simple"));
+    assert_eq!(req["steps"].as_i64(), Some(24));
+    assert_eq!(req["seed"].as_i64(), Some(12345));
+    assert_eq!(req["cfg"].as_f64(), Some(6.5));
+    assert_eq!(req["creativity"].as_f64(), Some(1.0));
+    assert_eq!(req["prompt"].as_str(), Some("a red fox in snow"));
+    assert_eq!(req["negative"].as_str(), Some("blurry, ugly"));
+    assert_eq!(req["width"].as_i64(), Some(768));
+    assert_eq!(req["height"].as_i64(), Some(512));
+}
+
+/// A named SAMPLER node (SamplerEulerAncestral → euler_ancestral) is NOT in the
+/// zimage worker's supported list, so the lowering fails loud [501] rather than
+/// silently substituting a different sampler.
+#[test]
+fn named_sampler_unsupported_is_rejected_loud() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a red fox"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "ugly"}},
+        "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 768, "height": 512, "batch_size": 1}},
+        "5": {"class_type": "SamplerEulerAncestral", "inputs": {"eta": 1.0, "s_noise": 1.0}},
+        "6": {"class_type": "BasicScheduler", "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": 24, "denoise": 1.0}},
+        "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": 777}},
+        "11": {"class_type": "CFGGuider", "inputs": {"model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "cfg": 7.0}},
+        "7": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["10", 0], "guider": ["11", 0], "sampler": ["5", 0], "sigmas": ["6", 0], "latent_image": ["4", 0]}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["1", 2]}},
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": "sctest"}}
+    }});
+    let err = lower_request(&mut req).expect_err("unsupported named sampler must 501");
+    let msg = format!("{err}");
+    assert!(msg.contains("euler_ancestral"), "msg = {msg}");
+    assert!(msg.contains("unsupported sampler"), "msg = {msg}");
+}
+
+/// A named SIGMAS scheduler node (KarrasScheduler → karras) is NOT in the zimage
+/// worker's supported list, so the lowering fails loud [501].
+#[test]
+fn named_scheduler_unsupported_is_rejected_loud() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a red fox"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "ugly"}},
+        "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 768, "height": 512, "batch_size": 1}},
+        "5": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+        "6": {"class_type": "KarrasScheduler", "inputs": {"steps": 24, "sigma_max": 14.6, "sigma_min": 0.03, "rho": 7.0}},
+        "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": 777}},
+        "11": {"class_type": "CFGGuider", "inputs": {"model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "cfg": 7.0}},
+        "7": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["10", 0], "guider": ["11", 0], "sampler": ["5", 0], "sigmas": ["6", 0], "latent_image": ["4", 0]}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["1", 2]}},
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": "sctest"}}
+    }});
+    let err = lower_request(&mut req).expect_err("unsupported named scheduler must 501");
+    let msg = format!("{err}");
+    assert!(msg.contains("karras"), "msg = {msg}");
+    assert!(msg.contains("unsupported scheduler"), "msg = {msg}");
+}
+
 /// A bypassed (mode==4) node is also dropped (the original behavior, kept).
 #[test]
 fn canvas_mode4_bypass_node_is_dropped() {

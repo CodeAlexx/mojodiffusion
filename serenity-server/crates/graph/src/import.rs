@@ -357,8 +357,11 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
         "CFGGuider" => (slot == 0).then_some("GUIDER"),
         "BasicGuider" => (slot == 0).then_some("GUIDER"),
         "Flux2Scheduler" | "BasicScheduler" => (slot == 0).then_some("SIGMAS"),
+        _ if crate::is_named_scheduler_node(&typ) => (slot == 0).then_some("SIGMAS"),
         "RandomNoise" => (slot == 0).then_some("NOISE"),
         "KSamplerSelect" => (slot == 0).then_some("SAMPLER"),
+        _ if crate::is_named_sampler_node(&typ) => (slot == 0).then_some("SAMPLER"),
+        "SamplerCustom" => (slot == 0 || slot == 1).then_some("LATENT"),
         "SamplerCustomAdvanced" | "LanPaint_SamplerCustomAdvanced" => {
             (slot == 0 || slot == 1).then_some("LATENT")
         }
@@ -963,6 +966,24 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             fields.insert("scheduler".into(), json!(widget_string(widgets, 0, "simple")));
             fields.insert("steps".into(), json!(widget_int(widgets, 1, 20)));
             fields.insert("denoise".into(), json!(widget_float(widgets, 2, 1.0)));
+        }
+        "KarrasScheduler" | "ExponentialScheduler" | "PolyexponentialScheduler" => {
+            // Comfy widget order: [steps, sigma_max, sigma_min, rho?]. Only steps
+            // has a flat slot; the sigma_max/min/rho shape params have no flat
+            // representation (the scheduler name itself gates fail-loud).
+            fields.insert("steps".into(), json!(widget_int(widgets, 0, 20)));
+        }
+        "SDTurboScheduler" => {
+            // Comfy widget order: [steps, denoise].
+            fields.insert("steps".into(), json!(widget_int(widgets, 0, 20)));
+            fields.insert("denoise".into(), json!(widget_float(widgets, 1, 1.0)));
+        }
+        "SamplerCustom" => {
+            // Comfy widget order: [add_noise(bool), noise_seed(int),
+            // control_after_generate, cfg(float)].
+            fields.insert("add_noise".into(), json!(widget_bool(widgets, 0, true)));
+            fields.insert("noise_seed".into(), json!(widget_int(widgets, 1, -1)));
+            fields.insert("cfg".into(), json!(widget_float(widgets, 3, 4.5)));
         }
         "CFGGuider" | "FluxGuidance" => {
             fields.insert("cfg".into(), json!(widget_float(widgets, 0, 4.5)));

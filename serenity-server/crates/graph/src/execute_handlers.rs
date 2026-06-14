@@ -605,6 +605,157 @@ fn exec_sampler_custom_advanced(
     Ok(Fire::Done)
 }
 
+// --- Named SIGMAS scheduler nodes (Karras/Exponential/Polyexp/SDTurbo) ----------
+
+/// Named SIGMAS producer: the scheduler name is the node TYPE. Like
+/// BasicScheduler, lowers to scheduler= + steps (+ denoise for SDTurboScheduler).
+/// Gated on the worker's supported list — an unsupported name fails loud.
+fn exec_named_scheduler(
+    node: &WorkflowNode,
+    links: &LinkMap,
+    store: &mut ValueStore,
+) -> GraphResult<Fire> {
+    let id = node.id;
+    let t = node.type_id.as_str();
+    let fields = &node.fields;
+    let scheduler = crate::named_scheduler_name(t).to_string();
+    if !crate::worker_supports_scheduler(&scheduler) {
+        return Err(GraphError::unsupported(format!(
+            "workflow graph {t} lowers to unsupported scheduler '{scheduler}'; \
+             the worker supports only simple/flowmatch/flow_match/sgm_uniform"
+        ))
+        .with_node(id));
+    }
+    let steps_link = links.input(id, "steps");
+    if !optional_ready(store, &steps_link) {
+        return Ok(Fire::NotReady);
+    }
+    let mut steps = opt_int(fields, "steps", 20, 1, 4096)?;
+    if steps_link.found {
+        steps = scalar_int_of(store, &steps_link, "steps")?;
+    }
+    if !(1..=4096).contains(&steps) {
+        return Err(GraphError::unsupported(format!(
+            "workflow graph {t} scalar steps out of range"
+        ))
+        .with_node(id));
+    }
+    let denoise = if t == "SDTurboScheduler" {
+        wf_float(fields, "denoise", 1.0, 0.0, 1.0)?
+    } else {
+        1.0
+    };
+    add_value(
+        store,
+        id,
+        "SIGMAS",
+        ValuePayload::Sigmas { steps, scheduler, denoise },
+    )?;
+    Ok(Fire::Done)
+}
+
+// --- SamplerCustom (single-output sibling of SamplerCustomAdvanced) -------------
+
+/// Single-output sibling of SamplerCustomAdvanced. Unlike the Advanced node it
+/// has NO noise/guider input ports — it builds CFG guidance and noise itself
+/// from its model/positive/negative inputs and add_noise/noise_seed/cfg widgets,
+/// then samples with the SAMPLER + SIGMAS inputs. Reuses the SAME flat
+/// sampler/scheduler/steps/seed/cfg path.
+fn exec_sampler_custom(
+    node: &WorkflowNode,
+    links: &LinkMap,
+    store: &mut ValueStore,
+    out: &mut JsonValue,
+    saw_prompt: &mut bool,
+) -> GraphResult<Fire> {
+    let id = node.id;
+    let fields = &node.fields;
+    let model_link = links.input(id, "model");
+    let pos_link = links.input(id, "positive");
+    let neg_link = links.input(id, "negative");
+    let sampler_link = links.input(id, "sampler");
+    let sigmas_link = links.input(id, "sigmas");
+    let latent_link = links.input(id, "latent_image");
+    if !model_link.found
+        || !pos_link.found
+        || !neg_link.found
+        || !sampler_link.found
+        || !sigmas_link.found
+        || !latent_link.found
+    {
+        return Err(GraphError::unsupported(
+            "workflow graph SamplerCustom missing required typed input",
+        )
+        .with_node(id));
+    }
+    if !(ready(store, &model_link)
+        && ready(store, &pos_link)
+        && ready(store, &neg_link)
+        && ready(store, &sampler_link)
+        && ready(store, &sigmas_link)
+        && ready(store, &latent_link))
+    {
+        return Ok(Fire::NotReady);
+    }
+    require_value_type(store, &model_link, "MODEL", "model")?;
+    require_value_type(store, &pos_link, "CONDITIONING", "positive")?;
+    require_value_type(store, &neg_link, "CONDITIONING", "negative")?;
+    require_value_type(store, &sampler_link, "SAMPLER", "sampler")?;
+    require_value_type(store, &sigmas_link, "SIGMAS", "sigmas")?;
+    require_value_type(store, &latent_link, "LATENT", "latent_image")?;
+
+    let model_name = model_name_of(store, &model_link)?;
+    if !model_name.is_empty() {
+        set_if_missing(out, "model", json!(model_name));
+    }
+    let prompt = cond_text_of(store, &pos_link)?;
+    set_if_missing(out, "prompt", json!(prompt));
+    *saw_prompt = true;
+    let negative = cond_text_of(store, &neg_link)?;
+    set_if_missing(out, "negative", json!(negative));
+
+    // cfg/seed come from the node's own widgets (SamplerCustom has no
+    // CFGGuider/RandomNoise inputs).
+    copy_field_if_missing(out, fields, "cfg", "cfg");
+    set_field_if_nonneg_int(out, fields, "noise_seed", "seed")?;
+
+    if let Some(ValuePayload::Sampler { name }) =
+        store.get(sampler_link.node_id, &sampler_link.port).map(|v| &v.payload)
+    {
+        set_if_missing(out, "sampler", json!(name));
+    }
+    if let Some(ValuePayload::Sigmas { steps, scheduler, denoise }) =
+        store.get(sigmas_link.node_id, &sigmas_link.port).map(|v| &v.payload)
+    {
+        set_if_missing(out, "steps", json!(*steps));
+        set_if_missing(out, "scheduler", json!(scheduler));
+        set_if_missing(out, "creativity", json!(*denoise));
+    }
+
+    let geom = latent_geom_of(store, &latent_link);
+    if let Some(g) = &geom {
+        if g.width > 0 {
+            set_if_missing(out, "width", json!(g.width));
+        }
+        if g.height > 0 {
+            set_if_missing(out, "height", json!(g.height));
+        }
+        set_if_missing(out, "images", json!(g.batch));
+        if !g.init_image.is_empty() {
+            set_if_missing(out, "init_image", json!(g.init_image));
+        }
+        if !g.mask_image.is_empty() {
+            set_if_missing(out, "mask_image", json!(g.mask_image));
+        }
+    }
+    let payload = match &geom {
+        Some(g) => latent_payload_from(g),
+        None => ValuePayload::Latent { width: 0, height: 0, batch: 1, init_image: None, mask_image: None },
+    };
+    add_value(store, id, "LATENT", payload)?;
+    Ok(Fire::Done)
+}
+
 // --- ImageToMask (Mojo 2167) ---------------------------------------------------
 
 fn exec_image_to_mask(

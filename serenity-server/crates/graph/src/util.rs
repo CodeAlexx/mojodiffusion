@@ -53,6 +53,62 @@ pub fn is_scalar_node(t: &str) -> bool {
         || t == "PrimitiveNode"
 }
 
+// --- SamplerCustom ecosystem: named SAMPLER / SIGMAS node tables ----------------
+//
+// `_workflow_named_sampler_name` / `_workflow_named_scheduler_name` and the
+// worker-supported gates in workflow_graph.mojo. Each named node carries its
+// sampler/scheduler NAME in the node TYPE, so an unsupported one is a definite
+// error and fails loud [501] (never substituted).
+
+/// Map a named-SAMPLER node type to its Comfy sampler catalog name (or `""`).
+pub fn named_sampler_name(type_id: &str) -> &'static str {
+    match type_id {
+        "SamplerEulerAncestral" => "euler_ancestral",
+        "SamplerDPMPP_2M_SDE" => "dpmpp_2m_sde",
+        "SamplerDPMPP_3M_SDE" => "dpmpp_3m_sde",
+        "SamplerLMS" => "lms",
+        _ => "",
+    }
+}
+
+pub fn is_named_sampler_node(type_id: &str) -> bool {
+    !named_sampler_name(type_id).is_empty()
+}
+
+/// Map a named-SIGMAS node type to its Comfy scheduler catalog name (or `""`).
+pub fn named_scheduler_name(type_id: &str) -> &'static str {
+    match type_id {
+        "KarrasScheduler" => "karras",
+        "ExponentialScheduler" => "exponential",
+        "PolyexponentialScheduler" => "polyexponential",
+        "SDTurboScheduler" => "turbo",
+        _ => "",
+    }
+}
+
+pub fn is_named_scheduler_node(type_id: &str) -> bool {
+    !named_scheduler_name(type_id).is_empty()
+}
+
+/// Gate against the zimage worker's supported sampler list. Mirrors
+/// sampler_registry.swarmui_sampler_registry_json `zimage_supported_samplers`.
+pub fn worker_supports_sampler(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "euler" | "flowmatch_euler" | "flow_match_euler" | "dpmpp_2m" | "dpm++ 2m"
+            | "uni_pc" | "uni_pc_bh2"
+    )
+}
+
+/// Gate against the zimage worker's supported scheduler list. Mirrors
+/// sampler_registry.swarmui_sampler_registry_json `zimage_supported_schedulers`.
+pub fn worker_supports_scheduler(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "simple" | "flowmatch" | "flow_match" | "sgm_uniform"
+    )
+}
+
 /// `_workflow_json_scalar_type` (Mojo 78).
 pub fn json_scalar_type(v: &JsonValue) -> &'static str {
     if v.is_boolean() {

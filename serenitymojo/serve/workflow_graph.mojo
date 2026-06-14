@@ -1156,6 +1156,17 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         fields.set("sampler_name", JSONValue.from_string(_workflow_widget_string(widgets, 4, String("euler"))))
         fields.set("scheduler", JSONValue.from_string(_workflow_widget_string(widgets, 5, String("simple"))))
         fields.set("denoise", JSONValue.from_float(_workflow_widget_float(widgets, 6, 1.0)))
+    elif type_id == "KSamplerAdvanced":
+        fields.set("add_noise", JSONValue.from_string(_workflow_widget_string(widgets, 0, String("enable"))))
+        fields.set("noise_seed", JSONValue.from_int(_workflow_widget_int(widgets, 1, -1)))
+        fields.set("seed", JSONValue.from_int(_workflow_widget_int(widgets, 1, -1)))
+        fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 3, 20)))
+        fields.set("cfg", JSONValue.from_float(_workflow_widget_float(widgets, 4, 4.5)))
+        fields.set("sampler_name", JSONValue.from_string(_workflow_widget_string(widgets, 5, String("euler"))))
+        fields.set("scheduler", JSONValue.from_string(_workflow_widget_string(widgets, 6, String("simple"))))
+        fields.set("start_at_step", JSONValue.from_int(_workflow_widget_int(widgets, 7, 0)))
+        fields.set("end_at_step", JSONValue.from_int(_workflow_widget_int(widgets, 8, 10000)))
+        fields.set("return_with_leftover_noise", JSONValue.from_string(_workflow_widget_string(widgets, 9, String("disable"))))
     elif type_id == "LanPaint_KSampler":
         fields.set("seed", JSONValue.from_int(_workflow_widget_int(widgets, 0, -1)))
         fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 2, 20)))
@@ -1424,6 +1435,9 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "ConditioningSetMask":
         if slot == 0:
             return String("CONDITIONING")
+    elif typ == "ConditioningConcat" or typ == "ConditioningCombine" or typ == "ConditioningAverage":
+        if slot == 0:
+            return String("CONDITIONING")
     elif typ == "LoadImage":
         if slot == 0:
             return String("IMAGE")
@@ -1478,7 +1492,7 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "ModelSamplingAuraFlow" or typ == "ModelSamplingSD3" or typ == "DifferentialDiffusion":
         if slot == 0:
             return String("MODEL")
-    elif typ == "KSampler" or typ == "LanPaint_KSampler" or typ == "LanPaint_KSamplerAdvanced":
+    elif typ == "KSampler" or typ == "KSamplerAdvanced" or typ == "LanPaint_KSampler" or typ == "LanPaint_KSamplerAdvanced":
         if slot == 0:
             return String("LATENT")
     elif typ == "CFGGuider":
@@ -1635,6 +1649,9 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "TextEncodeQwenImageEditPlus"
             or type_id == "ConditioningZeroOut"
             or type_id == "ConditioningSetMask"
+            or type_id == "ConditioningConcat"
+            or type_id == "ConditioningCombine"
+            or type_id == "ConditioningAverage"
             or type_id == "Reroute"
             or type_id == "SetNode"
             or type_id == "GetNode"
@@ -1659,6 +1676,7 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "ModelSamplingSD3"
             or type_id == "DifferentialDiffusion"
             or type_id == "KSampler"
+            or type_id == "KSamplerAdvanced"
             or type_id == "LanPaint_KSampler"
             or type_id == "LanPaint_KSamplerAdvanced"
             or type_id == "CFGGuider"
@@ -2025,6 +2043,45 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
                     cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(text)
                     done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "ConditioningConcat":
+                # Comfy ConditioningConcat(conditioning_to, conditioning_from): the two
+                # tensors are concatenated along the token axis. In this text-only
+                # conditioning model a CONDITIONING handle carries prompt text, so the
+                # faithful flat lowering is to join the two prompts: "to, from".
+                var to_link = _workflow_find_input_link(edges, node_id, String("conditioning_to"))
+                var from_link = _workflow_find_input_link(edges, node_id, String("conditioning_from"))
+                if not to_link.found or not from_link.found:
+                    raise Error("[501] workflow graph ConditioningConcat missing required typed input")
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, to_link.node_id, to_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, from_link.node_id, from_link.port) >= 0
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, to_link, String("CONDITIONING"), String("conditioning_to"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, from_link, String("CONDITIONING"), String("conditioning_from"))
+                    var to_text = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, to_link)
+                    var from_text = _workflow_conditioning_text(cond_nodes, cond_ports, cond_texts, from_link)
+                    var text: String
+                    if to_text == "":
+                        text = from_text^
+                    elif from_text == "":
+                        text = to_text^
+                    else:
+                        text = to_text + String(", ") + from_text
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("CONDITIONING"), String("CONDITIONING"))
+                    cond_nodes.append(node_id); cond_ports.append(String("CONDITIONING")); cond_texts.append(text)
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "ConditioningCombine" or type_id == "ConditioningAverage":
+                # Comfy ConditioningCombine batches both conditionings; ConditioningAverage
+                # blends them by `conditioning_to_strength`. Neither is representable in a
+                # single text prompt WITHOUT silently dropping the second conditioning (and
+                # the blend weight) — which would render a subtly wrong image. Fail loud
+                # instead; use ConditioningConcat to JOIN two prompts into one.
+                raise Error(
+                    "[501] workflow graph " + type_id + " cannot be lowered to a single"
+                    " text prompt (it would silently drop the second conditioning / blend"
+                    " weight); use ConditioningConcat to join prompts"
+                )
             elif type_id == "FluxGuidance":
                 var cond_link = _workflow_find_input_link(edges, node_id, String("conditioning"))
                 if not cond_link.found:
@@ -2635,12 +2692,19 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("SAMPLER"), String("SAMPLER"))
                 sampler_nodes.append(node_id); sampler_ports.append(String("SAMPLER")); sampler_names.append(sampler_name)
                 done[i] = True; remaining -= 1; progressed = True
-            elif type_id == "KSampler" or type_id == "LanPaint_KSampler" or type_id == "LanPaint_KSamplerAdvanced":
+            elif type_id == "KSampler" or type_id == "KSamplerAdvanced" or type_id == "LanPaint_KSampler" or type_id == "LanPaint_KSamplerAdvanced":
+                var advanced = type_id == "KSamplerAdvanced"
                 var model_link = _workflow_find_input_link(edges, node_id, String("model"))
                 var pos_link = _workflow_find_input_link(edges, node_id, String("positive"))
                 var neg_link = _workflow_find_input_link(edges, node_id, String("negative"))
                 var latent_link = _workflow_find_input_link(edges, node_id, String("latent_image"))
+                # KSamplerAdvanced seeds from `noise_seed`; KSampler from `seed`.
+                # Resolve the seed input link from whichever field the node carries.
                 var seed_link = _workflow_find_input_link(edges, node_id, String("seed"))
+                if advanced:
+                    var noise_seed_link = _workflow_find_input_link(edges, node_id, String("noise_seed"))
+                    if noise_seed_link.found:
+                        seed_link = noise_seed_link^
                 var steps_link = _workflow_find_input_link(edges, node_id, String("steps"))
                 var cfg_link = _workflow_find_input_link(edges, node_id, String("cfg"))
                 var sampler_name_link = _workflow_find_input_link(edges, node_id, String("sampler_name"))
@@ -2684,6 +2748,10 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                             _set_if_missing(obj, String("init_image"), JSONValue.from_string(latent_init_images[latent_idx]))
                         if latent_mask_images[latent_idx] != "":
                             _set_if_missing(obj, String("mask_image"), JSONValue.from_string(latent_mask_images[latent_idx]))
+                    # Track the resolved step count so KSamplerAdvanced can derive
+                    # `creativity` from its `start_at_step`/`steps` denoise window.
+                    # 0 == no usable step count.
+                    var resolved_steps = 0
                     if steps_link.found:
                         var steps = _workflow_scalar_int(
                             scalar_nodes, scalar_ports, scalar_types, scalar_ints,
@@ -2692,15 +2760,27 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         if steps < 1 or steps > 4096:
                             raise Error("[501] workflow graph KSampler scalar steps out of range")
                         _set_if_missing(obj, String("steps"), JSONValue.from_int(steps))
+                        resolved_steps = steps
                     else:
                         _copy_field_if_missing(obj, fields, String("steps"), String("steps"))
+                        if fields.is_object() and fields.contains("steps") and fields["steps"].is_int():
+                            resolved_steps = fields["steps"].as_int()
                     if seed_link.found:
+                        var seed_name = String("seed")
+                        if advanced:
+                            seed_name = String("noise_seed")
                         var seed = _workflow_scalar_int(
                             scalar_nodes, scalar_ports, scalar_types, scalar_ints,
-                            seed_link, String("seed"),
+                            seed_link, seed_name,
                         )
                         if seed >= 0:
                             _set_if_missing(obj, String("seed"), JSONValue.from_int(seed))
+                    elif advanced:
+                        # KSamplerAdvanced names the seed `noise_seed`; fall back to `seed`.
+                        if fields.is_object() and fields.contains("noise_seed") and not fields["noise_seed"].is_null():
+                            _workflow_set_field_if_nonnegative_int(obj, fields, String("noise_seed"), String("seed"))
+                        else:
+                            _workflow_set_field_if_nonnegative_int(obj, fields, String("seed"), String("seed"))
                     else:
                         _workflow_set_field_if_nonnegative_int(obj, fields, String("seed"), String("seed"))
                     if cfg_link.found:
@@ -2739,7 +2819,42 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         )
                     else:
                         _copy_field_if_missing(obj, fields, String("scheduler"), String("scheduler"))
-                    if denoise_link.found:
+                    if advanced:
+                        # KSamplerAdvanced has no `denoise` field. Its denoise window is
+                        # the [start_at_step, end_at_step] slice of the `steps` schedule,
+                        # with `add_noise` toggling whether the latent is re-noised at the
+                        # start. zimage's flat model only represents the START of the
+                        # window (creativity = denoise start). An early `end_at_step`
+                        # (return_with_leftover_noise) or `add_noise="disable"` (continue
+                        # an existing latent without re-noising) CANNOT be faithfully
+                        # lowered — so fail loud rather than silently emit a full-txt2img
+                        # creativity and render the wrong image.
+                        var adv_steps = 0
+                        if resolved_steps > 0:
+                            adv_steps = resolved_steps
+                        var add_noise = String(_workflow_string(fields, String("add_noise")).lower())
+                        if add_noise == "disable":
+                            raise Error(
+                                "[501] workflow graph KSamplerAdvanced add_noise=disable"
+                                " (continue without re-noising) is not representable in the"
+                                " zimage flat denoise model"
+                            )
+                        # Default end_at_step to a large sentinel (Comfy's "run to the
+                        # end"); only an explicit early end is rejected.
+                        var end_at_step = _opt_int(fields, "end_at_step", 1000000, 0, 10000000)
+                        if adv_steps > 0 and end_at_step < adv_steps:
+                            raise Error(
+                                "[501] workflow graph KSamplerAdvanced early end_at_step"
+                                " (return_with_leftover_noise) is not representable in the"
+                                " zimage flat denoise model"
+                            )
+                        var start_at_step = _opt_int(fields, "start_at_step", 0, 0, 4096)
+                        var creativity = 1.0
+                        if adv_steps > 0:
+                            var raw = 1.0 - Float64(start_at_step) / Float64(adv_steps)
+                            creativity = raw.clamp(0.0, 1.0)
+                        _set_if_missing(obj, String("creativity"), JSONValue.from_float(creativity))
+                    elif denoise_link.found:
                         var denoise = _workflow_scalar_float(
                             scalar_nodes, scalar_ports, scalar_types, scalar_floats,
                             denoise_link, String("denoise"),

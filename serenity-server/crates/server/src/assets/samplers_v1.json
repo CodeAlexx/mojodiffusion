@@ -1,0 +1,19 @@
+{
+  "schema":"serenity.samplers.v1",
+  "source":"local SwarmUI Comfy sampler catalog",
+  "accepted_sampler_parity":false,
+  "catalog":{
+    "samplers":["euler","euler_cfg_pp","euler_ancestral","euler_ancestral_cfg_pp","heun","heunpp2","exp_heun_2_x0","exp_heun_2_x0_sde","dpm_2","dpm_2_ancestral","lms","dpm_fast","dpm_adaptive","dpmpp_2s_ancestral","dpmpp_2s_ancestral_cfg_pp","dpmpp_sde","dpmpp_sde_gpu","dpmpp_2m","dpmpp_2m_cfg_pp","dpmpp_2m_sde","dpmpp_2m_sde_gpu","dpmpp_2m_sde_heun","dpmpp_2m_sde_heun_gpu","dpmpp_3m_sde","dpmpp_3m_sde_gpu","ddpm","lcm","ipndm","ipndm_v","deis","res_multistep","res_multistep_cfg_pp","res_multistep_ancestral","res_multistep_ancestral_cfg_pp","gradient_estimation","gradient_estimation_cfg_pp","er_sde","seeds_2","seeds_3","sa_solver","sa_solver_pece","ddim","uni_pc","uni_pc_bh2","flowmatch_euler"],
+    "schedulers":["simple","sgm_uniform","karras","exponential","ddim_uniform","beta","normal","linear_quadratic","kl_optimal","turbo","align_your_steps","flux2","ltxv","ltxv-image","flowmatch","flow_match","qwen"]
+  },
+  "backends":[
+    {"backend":"zimage","model_family":"zimage","accepted_sampler_parity":false,"executed_sampler":"flowmatch_euler","executed_scheduler":"simple_flowmatch","supported_samplers":["euler","flowmatch_euler","flow_match_euler","dpmpp_2m","dpm++ 2m","uni_pc","uni_pc_bh2"],"supported_schedulers":["simple","flowmatch","flow_match","sgm_uniform"],"blocked_samplers":[],"unsupported_policy":"fail_loud","reason":"Z-Image daemon runs SwarmUI/Comfy-aligned rectified-flow Euler/simple sigmas, bounded Euler/DPM++/both-UniPC sgm_uniform sigmas, plus bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2/order<=3 over Comfy SigmaConvert. Generic uni_pc is not an alias for uni_pc_bh2."},
+    {"backend":"qwenimage","model_family":"qwenimage","accepted_sampler_parity":false,"executed_sampler":"flowmatch_euler","executed_scheduler":"qwen_flowmatch","supported_samplers":["euler","flowmatch_euler","flow_match_euler"],"supported_schedulers":["simple","flowmatch","flow_match","qwen"],"blocked_samplers":[{"name":"uni_pc","normalized":"uni_pc","status":"blocked","not_alias_of":"uni_pc_bh2","comfy_dispatch":"sample_unipc","required_variant":"bh1","required_order":"min(3,len(sigmas)-2)","required_schedule":"SigmaConvert","reason":"Qwen-Image has no generic Comfy uni_pc runtime evidence yet"}],"unsupported_policy":"fail_loud","reason":"Qwen-Image daemon runs the verified dynamic flow-match Euler path; full Qwen generation remains separately gated."},
+    {"backend":"ideogram4","model_family":"ideogram4","accepted_sampler_parity":false,"executed_sampler":"ideogram4_logitnormal_euler","executed_scheduler":"ideogram4_logitnormal","supported_samplers":["euler","flowmatch_euler","flow_match_euler"],"supported_schedulers":["logitnormal","logit_normal","ideogram_logitnormal","ideogram4_logitnormal"],"blocked_samplers":[],"unsupported_policy":"fail_loud","reason":"Ideogram-4 daemon runs a bounded 1024x1024 txt2img path with explicit logit-normal Euler semantics; non-Euler sampler and broad scheduler aliases remain fail-loud."}
+  ],
+  "non_claims":[
+    "The registry is a product admission/discovery surface, not proof that every catalog sampler executes.",
+    "Per-algorithm sampler parity still requires real artifacts, requested/executed metadata, timings, and peak VRAM.",
+    "Unsupported sampler/scheduler names must fail loud per backend."
+  ]
+}

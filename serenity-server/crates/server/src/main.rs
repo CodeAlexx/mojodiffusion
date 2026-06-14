@@ -869,6 +869,22 @@ async fn get_health() -> Json<serde_json::Value> {
     Json(json!({ "backend": BACKEND_NAME, "ok": true }))
 }
 
+/// `/v1/samplers` body — the daemon's static SwarmUI/Comfy sampler catalog
+/// (`swarmui_sampler_registry_json()`), captured byte-for-byte as a versioned
+/// asset so the Rust surface is parity-identical. It is pinned data, not logic,
+/// so embedding the exact bytes IS the faithful port (verified by oracle diff vs
+/// `serenity_daemon stub`).
+const SAMPLERS_V1: &str = include_str!("assets/samplers_v1.json");
+
+/// GET /v1/samplers — the pinned sampler catalog, byte-identical to the daemon.
+async fn get_samplers() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        SAMPLERS_V1,
+    )
+        .into_response()
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -917,6 +933,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/cancel", post(post_cancel))
         .route("/v1/progress", get(ws_progress))
         .route("/v1/health", get(get_health))
+        .route("/v1/samplers", get(get_samplers))
         .with_state(state);
 
     // 4. Serve on 127.0.0.1:<port>.

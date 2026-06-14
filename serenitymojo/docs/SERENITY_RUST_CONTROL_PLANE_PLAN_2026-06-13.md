@@ -320,7 +320,9 @@ Run the Rust server `serenity-server --worker output/bin/serenity_worker_stub --
 - **`/v1/reorder`** (@3315) + **`/v1/remove`** (@3347) — reorder/cancel QUEUED jobs. Needs
   the driver to pull from the shared JobBook in order (a queue refactor) rather than the
   current arrival-order mpsc; do carefully (touches the verified core).
-- **`/v1/gallery/import`** (@3059) — copy a PNG in as a new `job-{counter}` id. (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
+- **`/v1/gallery/import`** — DONE (`gallery::post_import`): copy a genparams PNG in as a new
+  `job-XXXX` id (shared counter), record the import, return the gallery item. VERIFIED
+  byte-identical vs the oracle (both -> job-0001) + 422/404 error cases. GALLERY COMPLETE. (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
   GET-one @3049-3182). Scans `OUT_DIR/*.png` for embedded `serenity.genparams.v1` tEXt +
   favorites/order state (`<out_dir>/state/gallery.json`). LARGE. Schema `serenity.gallery.v1`.
 - **`/v1/jobs`** (handler @3295) + `/v1/reorder` (@3315) + `/v1/remove` (@3347). Returns the

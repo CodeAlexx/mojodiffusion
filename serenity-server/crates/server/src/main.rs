@@ -1275,6 +1275,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/video/probe", get(video::get_video_probe))
         .route("/v1/gallery", get(gallery::get_gallery))
         .route("/v1/gallery/read", get(gallery::get_gallery_read))
+        .route("/v1/gallery/import", post(gallery::post_import))
         .route("/v1/gallery/order", post(gallery::post_order))
         .route("/v1/gallery/:id", get(gallery::get_gallery_one).delete(gallery::delete_item))
         .route("/v1/gallery/:id/rename", post(gallery::post_rename))

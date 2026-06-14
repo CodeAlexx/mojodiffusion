@@ -565,6 +565,27 @@ fn remove_item_doc(doc: &Value, id: &str) -> Value {
         "names": strip_objs("names"), "order": strip_strs("order"), "imports": strip_objs("imports") })
 }
 
+/// `_set_gallery_import_doc` — upsert {id, source_path} in imports, preserve the rest.
+fn set_import_doc(doc: &Value, id: &str, source_path: &str) -> Value {
+    let mut imports = Vec::new();
+    let mut replaced = false;
+    if let Some(arr) = doc.get("imports").and_then(|n| n.as_array()) {
+        for ent in arr {
+            if ent.get("id").and_then(|v| v.as_str()) == Some(id) {
+                imports.push(json!({ "id": id, "source_path": source_path }));
+                replaced = true;
+            } else {
+                imports.push(ent.clone());
+            }
+        }
+    }
+    if !replaced {
+        imports.push(json!({ "id": id, "source_path": source_path }));
+    }
+    json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": imports })
+}
+
 fn required_string(body: &Value, key: &str) -> Result<String, String> {
     match body.get(key).and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => Ok(s.to_string()),
@@ -637,6 +658,38 @@ pub async fn post_order(State(st): State<AppState>, body: String) -> Response {
         return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
     }
     json_compact(StatusCode::OK, &json!({ "schema": "serenity.gallery_order.v1", "order": next.get("order").cloned().unwrap_or(json!([])) }))
+}
+
+/// POST /v1/gallery/import — copy a local PNG (with genparams) in as a new job-XXXX
+/// gallery item, recording the import source. Uses the shared job counter.
+pub async fn post_import(State(st): State<AppState>, body: String) -> Response {
+    let out = st.out_dir.as_path();
+    let b = body_object(&body);
+    let source = match required_string(&b, "path") {
+        Ok(s) => s,
+        Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
+    };
+    if source.contains('\n') || source.contains('\r') {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "invalid gallery import path");
+    }
+    if !Path::new(&source).is_file() {
+        return err_detail(StatusCode::NOT_FOUND, &format!("gallery import source not found: {source}"));
+    }
+    // must carry the genparams tEXt (else nothing to import)
+    match png_genparams(&source) {
+        Ok(p) if !p.is_empty() => {}
+        Ok(_) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("gallery import source has no {GENPARAMS_TEXT_KEY}")),
+        Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
+    }
+    let n = st.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let id = format!("job-{n:04}");
+    let dest = png_path(out, &id);
+    if std::fs::copy(&source, &dest).is_err() {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "gallery import copy failed");
+    }
+    let next = set_import_doc(&load_gallery_state(out), &id, &source);
+    let _ = save_gallery_state(out, &next);
+    json_compact(StatusCode::OK, &item_from_png_state(out, &next, &id, &dest, gallery_favorite(&next, &id), true))
 }
 
 /// DELETE /v1/gallery/:id — unlink the PNG (+ thumb) and drop it from state.

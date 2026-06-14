@@ -333,11 +333,17 @@ fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobRecord>>>, id: &str, ev: 
                 r.progress = step * 100 / total;
             }
         }),
-        WorkerEvent::Done { output_path } => update_record(jobs, id, |r| {
-            r.state = "done".to_string();
-            r.progress = 100;
-            r.output_path = output_path.clone();
-        }),
+        WorkerEvent::Done { output_path } => {
+            // the worker has written the genparams tEXt into the PNG; capture it for
+            // the jobs.db row (so the persisted history carries params, like the daemon).
+            let pj = gallery::png_genparams_or_empty(output_path);
+            update_record(jobs, id, |r| {
+                r.state = "done".to_string();
+                r.progress = 100;
+                r.output_path = output_path.clone();
+                r.params_json = pj;
+            })
+        }
         WorkerEvent::Failed { error } => update_record(jobs, id, |r| {
             r.state = "failed".to_string();
             r.error = error.clone();
@@ -354,6 +360,8 @@ fn run_worker_driver(
     registry: Registry,
     in_flight: Arc<Mutex<Option<String>>>,
     jobs: Arc<Mutex<Vec<jobs::JobRecord>>>,
+    prior: Arc<Vec<[String; 6]>>,
+    db_path: PathBuf,
 ) {
     // `handle` is Option so we can drop a dead worker and respawn lazily on the next
     // job (mirrors process_isolated_backend: a peer-close fails the job, the next
@@ -434,6 +442,11 @@ fn run_worker_driver(
         let outcome = drive_one_job(h, &channel, &job_id, &ctl, &mut pending, &jobs);
         set_in_flight(&in_flight, None);
         schedule_evict(&registry, &job_id);
+        // Persist the jobs.db after this job's terminal so session history survives a
+        // restart (rewrite = prior rows + started session jobs; the daemon's F7/F10 model).
+        if let Ok(j) = jobs.lock() {
+            jobs::save_jobs_db(&prior, &j, &db_path);
+        }
 
         match outcome {
             JobOutcome::Terminal => {
@@ -733,6 +746,7 @@ async fn post_generate(
             image_count: params.images.max(1),
             output_path: String::new(),
             error: String::new(),
+            params_json: String::new(),
         });
     }
 
@@ -1245,9 +1259,13 @@ async fn main() -> anyhow::Result<()> {
         let in_flight = in_flight.clone();
         let worker_bin = worker_bin.clone();
         let job_book = job_book.clone();
+        let prior_c = prior.clone();
+        let db_path = out_dir.join("jobs.db");
         std::thread::Builder::new()
             .name("worker-driver".into())
-            .spawn(move || run_worker_driver(worker_bin, worker_args, ctl_rx, registry, in_flight, job_book))
+            .spawn(move || {
+                run_worker_driver(worker_bin, worker_args, ctl_rx, registry, in_flight, job_book, prior_c, db_path)
+            })
             .map_err(|e| anyhow::anyhow!("spawn worker-driver thread: {e}"))?;
     }
 

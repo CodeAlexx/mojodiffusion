@@ -42,6 +42,52 @@ pub struct JobRecord {
     pub image_count: i64,
     pub output_path: String,
     pub error: String,
+    /// genparams JSON for the jobs.db row (read from the output PNG at done-time);
+    /// empty until terminal. NOT emitted by job_json_value (current-row shape).
+    pub params_json: String,
+}
+
+const DB_PARAMS_MAX: usize = 2048;
+
+/// `_db_safe_params`: cap params_json for a db row at a UTF-8 boundary (F1).
+pub fn db_safe_params(s: &str) -> String {
+    if s.len() <= DB_PARAMS_MAX {
+        return s.to_string();
+    }
+    let mut cut = DB_PARAMS_MAX;
+    let b = s.as_bytes();
+    while cut > 0 && (b[cut] & 0xC0) == 0x80 {
+        cut -= 1;
+    }
+    format!("{}...truncated", &s[..cut])
+}
+
+/// `save_jobs_db`: rewrite jobs.db = prior rows + session jobs that have STARTED
+/// (state != queued), in the daemon's `jobs` schema. Crash-safe full rewrite.
+pub fn save_jobs_db(prior: &[[String; 6]], jobs: &[JobRecord], db_path: &Path) {
+    let _ = (|| -> rusqlite::Result<()> {
+        let conn = rusqlite::Connection::open(db_path)?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS jobs;\
+             CREATE TABLE jobs (id TEXT, created TEXT, model TEXT, params_json TEXT, state TEXT, output_path TEXT);",
+        )?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT INTO jobs VALUES (?1,?2,?3,?4,?5,?6)")?;
+            for r in prior {
+                stmt.execute(rusqlite::params![r[0], r[1], r[2], r[3], r[4], r[5]])?;
+            }
+            for j in jobs {
+                if j.state == "queued" {
+                    continue; // never started — nothing truthful to index yet
+                }
+                stmt.execute(rusqlite::params![
+                    j.id, j.created, j.model, db_safe_params(&j.params_json), j.state, j.output_path
+                ])?;
+            }
+        }
+        tx.commit()
+    })();
 }
 
 /// `job_json_value`: a current-session JobRecord → JSON (the daemon's shape; note

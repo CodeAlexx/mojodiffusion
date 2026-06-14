@@ -100,7 +100,7 @@ fn png_genparams(path: &str) -> Result<String, String> {
         .unwrap_or_default())
 }
 
-fn png_genparams_or_empty(path: &str) -> String {
+pub fn png_genparams_or_empty(path: &str) -> String {
     png_genparams(path).unwrap_or_default()
 }
 

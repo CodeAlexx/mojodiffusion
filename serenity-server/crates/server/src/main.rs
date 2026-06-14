@@ -53,6 +53,8 @@ use serenity_graph::lower_request;
 use serenity_ipc::{spawn_worker, EventPoll, WorkerHandle};
 use serenity_wire::{JobParams, LoraSpec, WorkerEvent};
 
+mod models;
+
 /// How many buffered events a slow WS subscriber may lag before it's dropped.
 const BROADCAST_CAP: usize = 256;
 /// Worker-driver poll cadence while a job is in flight (~15-20ms requested).
@@ -1187,6 +1189,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/progress", get(ws_progress))
         .route("/v1/health", get(get_health))
         .route("/v1/samplers", get(get_samplers))
+        .route("/v1/models", get(models::get_models))
         .route("/v1/state", get(get_state).post(post_state))
         .route("/v1/presets", get(get_presets).post(post_presets_root))
         .route(

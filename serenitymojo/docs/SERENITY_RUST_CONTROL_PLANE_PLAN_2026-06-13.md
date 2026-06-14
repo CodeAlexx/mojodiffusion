@@ -249,15 +249,25 @@ Run the Rust server `serenity-server --worker output/bin/serenity_worker_stub --
 - **`/v1/state` + `/v1/presets`** (bbbd6e2) — file-backed under `<out_dir>/state/`.
   12/12 byte-parity: GET defaults, POST+GET state (wrapped + raw body),
   preset upsert/replace/get-one/delete, 404/422 shapes. 2 unit tests lock the shapes.
+- **`/v1/models`** (`crates/server/src/models.rs`) — full disk-scan browser
+  (`serenity.models.v1`): native fs for file sizes, `du -sb` shelled for the ~5 known
+  dirs, exact arch probes + card builders + selection-sort + compatibility. **VERIFIED
+  structural+order parity IDENTICAL vs the oracle across 8 query variants** (default,
+  size/name_desc/size_asc/arch sorts, search, filter, lora_filter, model selection) —
+  same 43 models / 98 loras, card key order, sizes, paths, sort, filter, compatibility.
+  ⚠ **ONE intentional divergence — arch-tag VALUES:** the port follows HEAD's
+  name-precedence scan order (`detect_arch_from_name` → header fallback, the DOCUMENTED
+  "disabled-family name tag" feature: flux-2-klein→`flux-2`, wan2.2→`wan2.2`,
+  qwen-vl→`qwen-image`). The **stale Jun-13 oracle binary predates this** and tags
+  header-first (`flux-2/klein`, `wan`, `unknown`). A daemon rebuilt from HEAD agrees with
+  the Rust; the Python gates (at HEAD) should too. The arch diff cascades only into
+  `sort=arch` order + `compatible_models`. **USER: confirm name-precedence is intended
+  (it matches the committed source); a flip to header-first is 1 line.** 3 unit tests
+  lock the probes + precedence.
 
-### REMAINING (4 endpoints — daemon handler line refs in `serenity_daemon.mojo`)
+### REMAINING (3 endpoints — daemon handler line refs in `serenity_daemon.mojo`)
 Ordered by value × tractability. Each is independent → good builder/skeptic team work,
 but byte-exactness is the risk — DIFF EVERY ONE against the oracle before committing.
-- **`/v1/models`** (handler @2923; helpers `scan_checkpoints`/`scan_loras`/
-  `_models_array_json`/`_loras_array_json`/`_model_arch_for` + compatibility). LARGE
-  (~135 KB output: model+lora cards, arch detection, compatibility, query echo). Highest
-  value (UI model browser). HIGH byte-exact risk — eyeball recommended for arch/compat
-  fields. Schema `serenity.models.v1`.
 - **`/v1/gallery`** (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
   GET-one @3049-3182). Scans `OUT_DIR/*.png` for embedded `serenity.genparams.v1` tEXt +
   favorites/order state (`<out_dir>/state/gallery.json`). LARGE. Schema `serenity.gallery.v1`.

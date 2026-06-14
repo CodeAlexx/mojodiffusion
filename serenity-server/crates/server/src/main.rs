@@ -56,6 +56,7 @@ use serenity_wire::{JobParams, LoraSpec, WorkerEvent};
 mod gallery;
 mod jobs;
 mod models;
+mod video;
 
 /// How many buffered events a slow WS subscriber may lag before it's dropped.
 const BROADCAST_CAP: usize = 256;
@@ -1194,6 +1195,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(models::get_models))
         .route("/v1/jobs", get(jobs::get_jobs))
         .route("/v1/job/:id", get(jobs::get_job_one))
+        .route("/v1/video", get(video::get_video).post(video::post_video))
+        .route("/v1/video/probe", get(video::get_video_probe))
         .route("/v1/gallery", get(gallery::get_gallery))
         .route("/v1/gallery/read", get(gallery::get_gallery_read))
         .route("/v1/gallery/order", post(gallery::post_order))

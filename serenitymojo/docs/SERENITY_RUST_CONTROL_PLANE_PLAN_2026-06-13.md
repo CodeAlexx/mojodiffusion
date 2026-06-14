@@ -217,3 +217,60 @@ Adopted v1: per-node error attribution (S), validate-before-run (S), topological
 (M), job-level output cache (M), lazy switch branch (S), mute-mode honoring (S).
 Deferred v2: node-level output caching + dirty-subtree re-exec (L), partial/output-driven
 execution (L) — require per-output tensor handles our flatten model lacks.
+
+---
+
+## Phase-B execution log (2026-06-14) — endpoint surface port
+
+**Status:** Phase A DONE (proven seam, graph executor 23/23 byte-parity, `cargo test
+--workspace` green). Phase B IN PROGRESS — the `/v1/*` surface is being ported endpoint
+by endpoint, each gated by a **daemon oracle byte-diff**.
+
+### The verification harness (THE method — reuse it for every remaining endpoint)
+The Mojo daemon binary `output/bin/serenity_daemon` already exists, so it is the live
+oracle (no OOM rebuild). Stand it up with **no GPU**:
+`serenity_daemon stub <port>` (run it from a CLEAN cwd, e.g. `/tmp/oracle_cwd`, so its
+`output/serenity_daemon/state/*` + `jobs.db` start empty for deterministic compares).
+Run the Rust server `serenity-server --worker output/bin/serenity_worker_stub --out-dir
+<clean> --port <port>`. Then `curl` the same endpoint on both and `diff` the bytes.
+- Serialization parity is FREE: the daemon's `dumps()` is compact + insertion-ordered,
+  and serde_json in `server` inherits `preserve_order` via Cargo feature-unification
+  (the `graph` crate enables it), so `serde_json::to_string` emits identical bytes.
+- Error bodies are `{"detail": <msg>}` (daemon `error_response`); the static
+  `/v1/samplers` body is `swarmui_sampler_registry_json()` (pretty 2-space), everything
+  else is compact `dumps()`.
+- ⚠ The daemon-stub oracle is FLAKY (crashes after a handful of requests — exactly the
+  instability we're replacing). Keep diff sweeps SHORT; restart the oracle between
+  batches. Diff scripts: `/tmp/ns_diff.sh`, `/tmp/ns_diff2.sh`. Refs: `/tmp/ns_ref/*.json`.
+
+### DONE (committed, byte-parity verified)
+- **`/v1/samplers`** (aea9ace) — static catalog served as a versioned asset
+  `crates/server/src/assets/samplers_v1.json`. Byte-identical (sha 504b5cc7…, 3434 B).
+- **`/v1/state` + `/v1/presets`** (bbbd6e2) — file-backed under `<out_dir>/state/`.
+  12/12 byte-parity: GET defaults, POST+GET state (wrapped + raw body),
+  preset upsert/replace/get-one/delete, 404/422 shapes. 2 unit tests lock the shapes.
+
+### REMAINING (4 endpoints — daemon handler line refs in `serenity_daemon.mojo`)
+Ordered by value × tractability. Each is independent → good builder/skeptic team work,
+but byte-exactness is the risk — DIFF EVERY ONE against the oracle before committing.
+- **`/v1/models`** (handler @2923; helpers `scan_checkpoints`/`scan_loras`/
+  `_models_array_json`/`_loras_array_json`/`_model_arch_for` + compatibility). LARGE
+  (~135 KB output: model+lora cards, arch detection, compatibility, query echo). Highest
+  value (UI model browser). HIGH byte-exact risk — eyeball recommended for arch/compat
+  fields. Schema `serenity.models.v1`.
+- **`/v1/gallery`** (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
+  GET-one @3049-3182). Scans `OUT_DIR/*.png` for embedded `serenity.genparams.v1` tEXt +
+  favorites/order state (`<out_dir>/state/gallery.json`). LARGE. Schema `serenity.gallery.v1`.
+- **`/v1/jobs`** (handler @3295) + `/v1/reorder` (@3315) + `/v1/remove` (@3347). Returns the
+  JobRecord array from the jobs DB (R-DB). NOT a pure same-input→same-output diff — depends
+  on accumulated job state; needs the Rust job model extended to the daemon's JobRecord
+  field set first. MEDIUM-HIGH.
+- **`/v1/video`** (GET readiness @2972, POST smoke @2976, probe @2993). `video_readiness_doc`
+  is mostly a fixed readiness contract; POST drives the LTX2 smoke runner (not built).
+  LOW priority. MEDIUM.
+
+Also still open for Phase-B completion: admission preflight (R-ADM-1/2), one error enum
+(R-ERR-1), DB eviction (R-DB), real in-flight cancel (R-IPC-3), and the
+`graph/src/lib.rs:481` `todo!()` bodies. `/v1/health` currently returns the Rust identity
+`{"backend":"isolated-rust","ok":true}` — the daemon shape is `{"status","backend","model",
+"resident"}`; reconcile when wiring SerenityUI (Phase C).

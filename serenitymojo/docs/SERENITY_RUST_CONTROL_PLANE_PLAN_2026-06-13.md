@@ -313,13 +313,24 @@ Run the Rust server `serenity-server --worker output/bin/serenity_worker_stub --
   `job_json_value` shape + values; two jobs appear in order.** (Current jobs can't byte-match
   the oracle — `created` timestamps differ — so this is shape+value verified, not byte.)
 
-### ENDPOINT SURFACE COMPLETE (12/12). Remaining write-side hardening:
-- **jobs.db persistence (R-DB-1/2)** — write session JobRecords back to `jobs.db` (the
-  daemon schema) on state transitions so they survive a restart as prior rows. Needs the
-  per-row `params_json` (read from the output PNG's genparams at done-time).
-- **`/v1/reorder`** (@3315) + **`/v1/remove`** (@3347) — reorder/cancel QUEUED jobs. Needs
-  the driver to pull from the shared JobBook in order (a queue refactor) rather than the
-  current arrival-order mpsc; do carefully (touches the verified core).
+### ENDPOINT SURFACE COMPLETE (12/12). Write-side status:
+- **jobs.db persistence (R-DB-1/2)** — DONE (`jobs::save_jobs_db`, commit 68584a9). The
+  driver rewrites jobs.db after each terminal (prior rows + started session jobs, daemon
+  schema, rusqlite; params_json from the output PNG genparams, capped 2048). VERIFIED:
+  restart → jobs reload as prior history rows + the id counter continues (job-0003).
+- **`/v1/reorder`** (@3315) + **`/v1/remove`** (@3347) — THE ONLY REMAINING ITEM. Manage
+  QUEUED jobs (reorder the pending queue / cancel a queued job before it starts; both 404
+  unknown, 409 if not active-queued; reorder returns `{job_id,position,queue}`, remove
+  returns the removed shape; daemon helpers `_reorder_target_position`/`_move_queued_job_
+  to_position`/`_remove_job_at`/`_is_active_queued`/`_queued_jobs_json`). **Design (do with
+  the user available):** refactor the worker-driver to promote the FIRST active-queued job
+  from the shared `AppState.jobs` JobBook (the daemon's `tick_worker` model @2284) instead
+  of popping the arrival-order mpsc — then post_generate just pushes the JobRecord + sends a
+  Wake; reorder/remove mutate the JobBook directly. This is a core-driver queue refactor:
+  it touches the VERIFIED generate→progress→WS path AND is hard to verify meaningfully with
+  a fast worker (jobs barely sit queued), so it was deferred rather than rushed unattended.
+  Re-verify with the ws_verify harness (generate path intact) + a slow-worker reorder/remove
+  test before committing.
 - **`/v1/gallery/import`** — DONE (`gallery::post_import`): copy a genparams PNG in as a new
   `job-XXXX` id (shared counter), record the import, return the gallery item. VERIFIED
   byte-identical vs the oracle (both -> job-0001) + 422/404 error cases. GALLERY COMPLETE. (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/

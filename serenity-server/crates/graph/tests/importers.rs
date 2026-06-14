@@ -373,3 +373,156 @@ fn canvas_mode4_bypass_node_is_dropped() {
     assert_eq!(typed["nodes"].as_array().unwrap().len(), 7);
     assert_eq!(typed["edges"].as_array().unwrap().len(), 9);
 }
+
+// --- image/mask utility nodes (ComfyUI-parity Phase 2) -------------------------
+
+/// LoadImageMask is an alias of LoadImage: its MASK output (slot 1) resolves to
+/// the mask_image param exactly like LoadImage's MASK output. Here a
+/// SetLatentNoiseMask consumes the LoadImageMask MASK so the mask_image is
+/// written into the flat params, proving the alias resolves through.
+#[test]
+fn load_image_mask_alias_resolves_mask() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a cabin"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "blurry"}},
+        "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 768, "height": 512, "batch_size": 1}},
+        "10": {"class_type": "LoadImageMask", "inputs": {"image": "mymask.png"}},
+        "11": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["4", 0], "mask": ["10", 1]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 9, "steps": 20, "cfg": 5.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["11", 0]}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "lim"}}
+    }});
+    lower_request(&mut req).expect("LoadImageMask alias must lower cleanly");
+    assert_eq!(req["mask_image"].as_str(), Some("mymask.png"));
+    assert_eq!(req["prompt"].as_str(), Some("a cabin"));
+    assert_eq!(req["workflow_source"].as_str(), Some("comfy_api_prompt_graph"));
+}
+
+/// LoadImageOutput is an alias of LoadImage: its IMAGE output (slot 0) resolves to
+/// the init_image param through a VAEEncode → KSampler img2img chain.
+#[test]
+fn load_image_output_alias_resolves_init_image() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a city"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "ugly"}},
+        "10": {"class_type": "LoadImageOutput", "inputs": {"image": "input.png"}},
+        "11": {"class_type": "VAEEncode", "inputs": {"pixels": ["10", 0], "vae": ["1", 2]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 3, "steps": 18, "cfg": 4.5, "sampler_name": "euler", "scheduler": "simple", "denoise": 0.6, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["11", 0]}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "loo"}}
+    }});
+    lower_request(&mut req).expect("LoadImageOutput alias must lower cleanly");
+    assert_eq!(req["init_image"].as_str(), Some("input.png"));
+    assert_eq!(req["creativity"].as_f64(), Some(0.6));
+    assert_eq!(req["prompt"].as_str(), Some("a city"));
+}
+
+/// GetImageSizeAndCount (KJ) is an alias of GetImageSize plus a leading IMAGE
+/// passthrough (slot 0) and a count (slot 3). The IMAGE passthrough must carry
+/// the source path through to a VAEEncode → KSampler init_image; the size INT
+/// outputs are placeholders in the flat single-image model.
+#[test]
+fn get_image_size_and_count_passthrough_lowers() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a forest"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "blur"}},
+        "10": {"class_type": "LoadImage", "inputs": {"image": "src.png"}},
+        // GetImageSizeAndCount passes the image through on slot 0.
+        "11": {"class_type": "GetImageSizeAndCount", "inputs": {"image": ["10", 0]}},
+        "12": {"class_type": "VAEEncode", "inputs": {"pixels": ["11", 0], "vae": ["1", 2]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 1, "steps": 20, "cfg": 5.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 0.7, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["12", 0]}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "gisc"}}
+    }});
+    lower_request(&mut req).expect("GetImageSizeAndCount passthrough must lower");
+    assert_eq!(req["init_image"].as_str(), Some("src.png"));
+    assert_eq!(req["prompt"].as_str(), Some("a forest"));
+}
+
+/// ImageResizeKJ with explicit nonzero width/height (keep_proportion=false, no
+/// get_image_size input) resolves the explicit dims into the flat width/height
+/// and passes the IMAGE handle through to a VAEEncode → KSampler chain.
+#[test]
+fn image_resize_kj_explicit_dims_resolve() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a lake"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "noise"}},
+        "10": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}},
+        "11": {"class_type": "ImageResizeKJ", "inputs": {"image": ["10", 0], "width": 1024, "height": 1024, "keep_proportion": false, "divisible_by": 2}},
+        "12": {"class_type": "VAEEncode", "inputs": {"pixels": ["11", 0], "vae": ["1", 2]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 2, "steps": 20, "cfg": 5.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 0.5, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["12", 0]}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "irkj"}}
+    }});
+    lower_request(&mut req).expect("ImageResizeKJ explicit dims must lower");
+    assert_eq!(req["width"].as_i64(), Some(1024));
+    assert_eq!(req["height"].as_i64(), Some(1024));
+    assert_eq!(req["init_image"].as_str(), Some("photo.png"));
+}
+
+/// ImageResizeKJ with keep_proportion=true derives a dimension from the
+/// un-knowable source aspect → fail loud [501] (never silently emit a wrong size).
+#[test]
+fn image_resize_kj_keep_proportion_is_rejected_loud() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a lake"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "noise"}},
+        "10": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}},
+        "11": {"class_type": "ImageResizeKJ", "inputs": {"image": ["10", 0], "width": 1024, "height": 0, "keep_proportion": true, "divisible_by": 2}},
+        "12": {"class_type": "VAEEncode", "inputs": {"pixels": ["11", 0], "vae": ["1", 2]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 2, "steps": 20, "cfg": 5.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 0.5, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["12", 0]}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "irkj"}}
+    }});
+    let err = lower_request(&mut req).expect_err("keep_proportion must 501");
+    let msg = format!("{err}");
+    assert!(msg.contains("keep_proportion"), "msg = {msg}");
+    assert!(msg.contains("not resolvable"), "msg = {msg}");
+}
+
+/// ImageResizeKJ with a zero target dimension means "keep the source dim", which
+/// is not resolvable in the flat single-image model → fail loud [501].
+#[test]
+fn image_resize_kj_zero_dim_is_rejected_loud() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a lake"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "noise"}},
+        "10": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}},
+        "11": {"class_type": "ImageResizeKJ", "inputs": {"image": ["10", 0], "width": 0, "height": 768, "keep_proportion": false, "divisible_by": 2}},
+        "12": {"class_type": "VAEEncode", "inputs": {"pixels": ["11", 0], "vae": ["1", 2]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 2, "steps": 20, "cfg": 5.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 0.5, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["12", 0]}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "irkj"}}
+    }});
+    let err = lower_request(&mut req).expect_err("zero dim must 501");
+    let msg = format!("{err}");
+    assert!(msg.contains("keeps the source dimension"), "msg = {msg}");
+}
+
+/// ImageScaleBy multiplies the un-knowable source dims by scale_by, which cannot
+/// be represented in the flat single-image model → fail loud [501] (the honest
+/// choice; never silently emit a wrong size).
+#[test]
+fn image_scale_by_is_rejected_loud() {
+    let mut req = json!({"workflow": {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "zimage_base"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a lake"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "noise"}},
+        "10": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}},
+        "11": {"class_type": "ImageScaleBy", "inputs": {"image": ["10", 0], "upscale_method": "lanczos", "scale_by": 2.0}},
+        "12": {"class_type": "VAEEncode", "inputs": {"pixels": ["11", 0], "vae": ["1", 2]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 2, "steps": 20, "cfg": 5.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 0.5, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["12", 0]}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "isb"}}
+    }});
+    let err = lower_request(&mut req).expect_err("ImageScaleBy must 501");
+    let msg = format!("{err}");
+    assert!(msg.contains("ImageScaleBy"), "msg = {msg}");
+    assert!(msg.contains("not resolvable"), "msg = {msg}");
+}

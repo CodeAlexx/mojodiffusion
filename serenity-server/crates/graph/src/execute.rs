@@ -740,15 +740,18 @@ fn exec_node(
         "SamplerCustomAdvanced" | "LanPaint_SamplerCustomAdvanced" => {
             exec_sampler_custom_advanced(node, links, store, out)
         }
-        "LoadImage" => {
+        "LoadImage" | "LoadImageOutput" | "LoadImageMask" => {
+            // LoadImageOutput / LoadImageMask are aliases of LoadImage: they load
+            // an image file and expose both IMAGE and MASK outputs that resolve to
+            // init_image / mask_image downstream. Same path-resolution + handles.
             let mut image_path = wf_string(fields, "image");
             if image_path.is_empty() {
                 image_path = wf_string(fields, "path");
             }
             if image_path.is_empty() {
-                return Err(GraphError::unsupported(
-                    "workflow graph LoadImage missing image path",
-                )
+                return Err(GraphError::unsupported(format!(
+                    "workflow graph {t} missing image path"
+                ))
                 .with_node(id));
             }
             add_value(
@@ -771,24 +774,47 @@ fn exec_node(
         "ImageToMask" => exec_image_to_mask(node, links, store, out),
         "MaskToImage" => exec_mask_to_image(node, links, store),
         "ThresholdMask" => exec_threshold_mask(node, links, store, out),
-        "GetImageSize" => {
+        "GetImageSize" | "GetImageSizeAndCount" => {
+            // GetImageSizeAndCount (KJ) is GetImageSize plus a leading IMAGE
+            // passthrough output and a `count` (batch) output. In the flat
+            // single-image model the width/height are not resolvable (LoadImage
+            // carries no dims), so the INT outputs are placeholders; the count is
+            // the constant single-image batch of 1.
+            let and_count = t == "GetImageSizeAndCount";
             let image_link = links.input(id, "image");
             if !image_link.found {
-                return Err(GraphError::unsupported(
-                    "workflow graph GetImageSize missing image input",
-                )
+                return Err(GraphError::unsupported(format!(
+                    "workflow graph {t} missing image input"
+                ))
                 .with_node(id));
             }
             if !ready(store, &image_link) {
                 return Ok(Fire::NotReady);
             }
             require_value_type(store, &image_link, "IMAGE", "image")?;
+            if and_count {
+                // Slot 0 is the unmodified IMAGE passthrough.
+                let image_path = image_path_of(store, &image_link)?;
+                let mask_source = image_mask_source_of(store, &image_link)?;
+                add_value(
+                    store,
+                    id,
+                    "IMAGE",
+                    ValuePayload::Image { path: image_path, mask_source: opt_nonempty(&mask_source) },
+                )?;
+            }
             add_value(store, id, "width", ValuePayload::ScalarInt(0))?;
             add_value(store, id, "height", ValuePayload::ScalarInt(0))?;
-            add_value(store, id, "batch_size", ValuePayload::ScalarInt(0))?;
+            // GetImageSize: batch_size placeholder 0 (parity with the existing
+            // handler). GetImageSizeAndCount: the count is the constant 1 of the
+            // single-image model.
+            let batch = if and_count { 1 } else { 0 };
+            add_value(store, id, "batch_size", ValuePayload::ScalarInt(batch))?;
             Ok(Fire::Done)
         }
         "ImageScale" | "ImageScaleToTotalPixels" => exec_image_scale(node, links, store),
+        "ImageScaleBy" => exec_image_scale_by(node, links, store),
+        "ImageResizeKJ" => exec_image_resize_kj(node, links, store, out),
         "ImagePadForOutpaint" => exec_image_pad(node, links, store, out),
         "VAEEncode" => exec_vae_encode(node, links, store),
         "SetLatentNoiseMask" => exec_set_latent_noise_mask(node, links, store, out),

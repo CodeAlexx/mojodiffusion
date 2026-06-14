@@ -316,7 +316,7 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
         "ConditioningCombine" | "ConditioningConcat" | "ConditioningAverage" => {
             (slot == 0).then_some("CONDITIONING")
         }
-        "LoadImage" => match slot {
+        "LoadImage" | "LoadImageOutput" | "LoadImageMask" => match slot {
             0 => Some("IMAGE"),
             1 => Some("MASK"),
             _ => None,
@@ -328,7 +328,16 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
         }
         "VAEEncode" => (slot == 0).then_some("LATENT"),
         "SetLatentNoiseMask" => (slot == 0).then_some("LATENT"),
-        "ImageScale" | "ImageScaleToTotalPixels" => (slot == 0).then_some("IMAGE"),
+        "ImageScale" | "ImageScaleToTotalPixels" | "ImageScaleBy" => {
+            (slot == 0).then_some("IMAGE")
+        }
+        // ImageResizeKJ (KJ): outputs (IMAGE, width, height).
+        "ImageResizeKJ" => match slot {
+            0 => Some("IMAGE"),
+            1 => Some("width"),
+            2 => Some("height"),
+            _ => None,
+        },
         "ImagePadForOutpaint" => match slot {
             0 => Some("IMAGE"),
             1 => Some("MASK"),
@@ -345,6 +354,16 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
             0 => Some("width"),
             1 => Some("height"),
             2 => Some("batch_size"),
+            _ => None,
+        },
+        // GetImageSizeAndCount (KJ): outputs (image, width, height, count).
+        // The leading IMAGE passthrough shifts width/height to slots 1/2 and adds
+        // a 4th `count` slot (constant 1 in the single-image model).
+        "GetImageSizeAndCount" => match slot {
+            0 => Some("IMAGE"),
+            1 => Some("width"),
+            2 => Some("height"),
+            3 => Some("batch_size"),
             _ => None,
         },
         "ReferenceLatent" => (slot == 0).then_some("CONDITIONING"),
@@ -817,8 +836,22 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
         | "TextEncodeQwenImageEditPlus" => {
             fields.insert("text".into(), json!(widget_string(widgets, 0, "")));
         }
-        "LoadImage" => {
+        "LoadImage" | "LoadImageOutput" | "LoadImageMask" => {
             fields.insert("image".into(), json!(widget_string(widgets, 0, "")));
+        }
+        "ImageScaleBy" => {
+            // Comfy widget order: [upscale_method(combo), scale_by(float)].
+            fields.insert("scale_by".into(), json!(widget_float(widgets, 1, 1.0)));
+        }
+        "ImageResizeKJ" => {
+            // KJ widget order: [width, height, upscale_method, keep_proportion,
+            // divisible_by]. The width/height widgets carry the explicit target
+            // dims; keep_proportion/divisible_by gate fail-loud in the executor
+            // (they require the un-knowable source dims to compute the result).
+            fields.insert("width".into(), json!(widget_int(widgets, 0, 512)));
+            fields.insert("height".into(), json!(widget_int(widgets, 1, 512)));
+            fields.insert("keep_proportion".into(), json!(widget_bool(widgets, 3, false)));
+            fields.insert("divisible_by".into(), json!(widget_int(widgets, 4, 2)));
         }
         "EmptyLatentImage" | "EmptySD3LatentImage" | "EmptyFlux2LatentImage" => {
             fields.insert("width".into(), json!(widget_int(widgets, 0, 512)));

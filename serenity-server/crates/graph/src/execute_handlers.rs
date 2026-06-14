@@ -912,6 +912,141 @@ fn exec_image_scale(
     Ok(Fire::Done)
 }
 
+// --- ImageScaleBy (ComfyUI built-in) -------------------------------------------
+
+/// ImageScaleBy multiplies the SOURCE image dims by the `scale_by` widget
+/// (`out_w = round(src_w * scale_by)`). In the flat single-image model the source
+/// image dims are NOT resolvable (LoadImage carries only a path, never dims), so
+/// the scaled output dims cannot be represented on a worker-supported grid. Fail
+/// loud [501] — never silently emit a wrong size. (This mirrors the Rust/Mojo
+/// fail-loud choice for nodes whose output is not representable in the flat
+/// single-pass model.) The `scale_by` widget is range-validated first so the
+/// error is precise rather than a generic parse failure.
+fn exec_image_scale_by(
+    node: &WorkflowNode,
+    links: &LinkMap,
+    store: &mut ValueStore,
+) -> GraphResult<Fire> {
+    let id = node.id;
+    let fields = &node.fields;
+    let image_link = links.input(id, "image");
+    if !image_link.found {
+        return Err(GraphError::unsupported(
+            "workflow graph ImageScaleBy missing image input",
+        )
+        .with_node(id));
+    }
+    if !ready(store, &image_link) {
+        return Ok(Fire::NotReady);
+    }
+    require_value_type(store, &image_link, "IMAGE", "image")?;
+    // Validate scale_by (ComfyUI range [0.01, 8.0]) so the 501 is specific.
+    let _scale_by = wf_float(fields, "scale_by", 1.0, 0.01, 8.0)?;
+    Err(GraphError::unsupported(
+        "workflow graph ImageScaleBy scales the source image dims by scale_by, but \
+         the source image dimensions are not resolvable in the flat single-image \
+         model (LoadImage carries no dims); use ImageResizeKJ with explicit \
+         width/height, or an EmptyLatentImage, to set a worker-supported size",
+    )
+    .with_node(id))
+}
+
+// --- ImageResizeKJ (KJ) --------------------------------------------------------
+
+/// ImageResizeKJ resizes an image to EXPLICIT `width`/`height` widgets. Unlike
+/// ImageScaleBy, the target dims are knowable — but only when the resize is a
+/// plain explicit resize: `keep_proportion=false`, both width AND height nonzero,
+/// and no `get_image_size` IMAGE input (all three of those make the output dims
+/// depend on the un-knowable source dims). In the representable case we resolve
+/// the explicit width/height into the flat params (range-validated like the
+/// ImageScale scalar path), pass the IMAGE handle through, and emit width/height
+/// INT outputs (slots 1/2). Otherwise fail loud [501].
+fn exec_image_resize_kj(
+    node: &WorkflowNode,
+    links: &LinkMap,
+    store: &mut ValueStore,
+    out: &mut JsonValue,
+) -> GraphResult<Fire> {
+    let id = node.id;
+    let fields = &node.fields;
+    let image_link = links.input(id, "image");
+    if !image_link.found {
+        return Err(GraphError::unsupported(
+            "workflow graph ImageResizeKJ missing image input",
+        )
+        .with_node(id));
+    }
+    // The width/height widgets may also arrive over typed links.
+    let width_link = links.input(id, "width");
+    let height_link = links.input(id, "height");
+    // A connected `get_image_size` IMAGE input makes the output dims copy that
+    // image's (un-knowable) dims — not representable.
+    let get_size_link = links.input(id, "get_image_size");
+    if !(ready(store, &image_link)
+        && optional_ready(store, &width_link)
+        && optional_ready(store, &height_link)
+        && optional_ready(store, &get_size_link))
+    {
+        return Ok(Fire::NotReady);
+    }
+    require_value_type(store, &image_link, "IMAGE", "image")?;
+    if get_size_link.found {
+        return Err(GraphError::unsupported(
+            "workflow graph ImageResizeKJ get_image_size input copies the source \
+             image dims, which are not resolvable in the flat single-image model",
+        )
+        .with_node(id));
+    }
+    // keep_proportion derives one dim from the source aspect → not representable.
+    if wf_bool(fields, "keep_proportion", false)? {
+        return Err(GraphError::unsupported(
+            "workflow graph ImageResizeKJ keep_proportion=true derives a dimension \
+             from the source image aspect, which is not resolvable in the flat \
+             single-image model; set explicit width and height instead",
+        )
+        .with_node(id));
+    }
+    // Resolve the explicit width/height (link overrides widget).
+    let mut width = opt_int(fields, "width", 512, 0, 8192)?;
+    let mut height = opt_int(fields, "height", 512, 0, 8192)?;
+    if width_link.found {
+        width = scalar_int_of(store, &width_link, "width")?;
+    }
+    if height_link.found {
+        height = scalar_int_of(store, &height_link, "height")?;
+    }
+    // A zero dim means "keep the source dim" (ComfyUI semantics) → not knowable.
+    if width == 0 || height == 0 {
+        return Err(GraphError::unsupported(
+            "workflow graph ImageResizeKJ width/height of 0 keeps the source \
+             dimension, which is not resolvable in the flat single-image model; \
+             set explicit nonzero width and height",
+        )
+        .with_node(id));
+    }
+    if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
+        return Err(GraphError::unsupported(
+            "workflow graph ImageResizeKJ width/height out of range",
+        )
+        .with_node(id));
+    }
+    // Explicit resize: resolve into the flat params (first-writer-wins).
+    set_if_missing(out, "width", json!(width));
+    set_if_missing(out, "height", json!(height));
+    let image_path = image_path_of(store, &image_link)?;
+    let mask_source = image_mask_source_of(store, &image_link)?;
+    add_value(
+        store,
+        id,
+        "IMAGE",
+        ValuePayload::Image { path: image_path, mask_source: opt_nonempty(&mask_source) },
+    )?;
+    // Resolved width/height INT outputs (slots 1/2 of the KJ node).
+    add_value(store, id, "width", ValuePayload::ScalarInt(width))?;
+    add_value(store, id, "height", ValuePayload::ScalarInt(height))?;
+    Ok(Fire::Done)
+}
+
 // --- ImagePadForOutpaint (Mojo 2257) -------------------------------------------
 
 fn exec_image_pad(

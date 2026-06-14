@@ -1219,8 +1219,20 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         or type_id == "TextEncodeQwenImageEditPlus"
     ):
         fields.set("text", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
-    elif type_id == "LoadImage":
+    elif type_id == "LoadImage" or type_id == "LoadImageOutput" or type_id == "LoadImageMask":
         fields.set("image", JSONValue.from_string(_workflow_widget_string(widgets, 0, String(""))))
+    elif type_id == "ImageScaleBy":
+        # Comfy widget order: [upscale_method(combo), scale_by(float)].
+        fields.set("scale_by", JSONValue.from_float(_workflow_widget_float(widgets, 1, 1.0)))
+    elif type_id == "ImageResizeKJ":
+        # KJ widget order: [width, height, upscale_method, keep_proportion,
+        # divisible_by]. width/height carry the explicit target dims;
+        # keep_proportion/divisible_by gate fail-loud in the executor (they need
+        # the un-knowable source dims to compute the result).
+        fields.set("width", JSONValue.from_int(_workflow_widget_int(widgets, 0, 512)))
+        fields.set("height", JSONValue.from_int(_workflow_widget_int(widgets, 1, 512)))
+        fields.set("keep_proportion", JSONValue.from_bool(_workflow_widget_bool(widgets, 3, False)))
+        fields.set("divisible_by", JSONValue.from_int(_workflow_widget_int(widgets, 4, 2)))
     elif type_id == "EmptyLatentImage" or type_id == "EmptySD3LatentImage" or type_id == "EmptyFlux2LatentImage":
         fields.set("width", JSONValue.from_int(_workflow_widget_int(widgets, 0, 512)))
         fields.set("height", JSONValue.from_int(_workflow_widget_int(widgets, 1, 512)))
@@ -1533,7 +1545,7 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "ConditioningConcat" or typ == "ConditioningCombine" or typ == "ConditioningAverage":
         if slot == 0:
             return String("CONDITIONING")
-    elif typ == "LoadImage":
+    elif typ == "LoadImage" or typ == "LoadImageOutput" or typ == "LoadImageMask":
         if slot == 0:
             return String("IMAGE")
         if slot == 1:
@@ -1553,9 +1565,17 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "SetLatentNoiseMask":
         if slot == 0:
             return String("LATENT")
-    elif typ == "ImageScale" or typ == "ImageScaleToTotalPixels":
+    elif typ == "ImageScale" or typ == "ImageScaleToTotalPixels" or typ == "ImageScaleBy":
         if slot == 0:
             return String("IMAGE")
+    elif typ == "ImageResizeKJ":
+        # ImageResizeKJ (KJ): outputs (IMAGE, width, height).
+        if slot == 0:
+            return String("IMAGE")
+        if slot == 1:
+            return String("width")
+        if slot == 2:
+            return String("height")
     elif typ == "ImagePadForOutpaint":
         if slot == 0:
             return String("IMAGE")
@@ -1577,6 +1597,18 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
         if slot == 1:
             return String("height")
         if slot == 2:
+            return String("batch_size")
+    elif typ == "GetImageSizeAndCount":
+        # GetImageSizeAndCount (KJ): outputs (image, width, height, count). The
+        # leading IMAGE passthrough shifts width/height to slots 1/2 and adds a
+        # 4th `count` slot (constant 1 in the single-image model).
+        if slot == 0:
+            return String("IMAGE")
+        if slot == 1:
+            return String("width")
+        if slot == 2:
+            return String("height")
+        if slot == 3:
             return String("batch_size")
     elif typ == "ReferenceLatent":
         if slot == 0:
@@ -1760,6 +1792,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "SetNode"
             or type_id == "GetNode"
             or type_id == "LoadImage"
+            or type_id == "LoadImageOutput"
+            or type_id == "LoadImageMask"
             or type_id == "ImageToMask"
             or type_id == "MaskToImage"
             or type_id == "EmptyLatentImage"
@@ -1768,8 +1802,11 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "VAEEncode"
             or type_id == "SetLatentNoiseMask"
             or type_id == "GetImageSize"
+            or type_id == "GetImageSizeAndCount"
             or type_id == "ImageScale"
             or type_id == "ImageScaleToTotalPixels"
+            or type_id == "ImageScaleBy"
+            or type_id == "ImageResizeKJ"
             or type_id == "ImagePadForOutpaint"
             or type_id == "ThresholdMask"
             or type_id == "InpaintModelConditioning"
@@ -2321,12 +2358,15 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                             scalar_ints, scalar_floats, scalar_strings, scalar_bools,
                         )
                         done[i] = True; remaining -= 1; progressed = True
-            elif type_id == "LoadImage":
+            elif type_id == "LoadImage" or type_id == "LoadImageOutput" or type_id == "LoadImageMask":
+                # LoadImageOutput / LoadImageMask are aliases of LoadImage: they
+                # load an image file and expose both IMAGE and MASK outputs that
+                # resolve to init_image / mask_image downstream.
                 var image_path = _workflow_string(fields, String("image"))
                 if image_path == "":
                     image_path = _workflow_string(fields, String("path"))
                 if image_path == "":
-                    raise Error("[501] workflow graph LoadImage missing image path")
+                    raise Error("[501] workflow graph " + type_id + " missing image path")
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
                 _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("MASK"), String("MASK"))
                 image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(image_path)
@@ -2380,16 +2420,113 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     mask_nodes.append(node_id); mask_ports.append(String("MASK")); mask_paths.append(mask_path)
                     mask_sources.append(mask_source)
                     done[i] = True; remaining -= 1; progressed = True
-            elif type_id == "GetImageSize":
+            elif type_id == "GetImageSize" or type_id == "GetImageSizeAndCount":
+                # GetImageSizeAndCount (KJ) is GetImageSize plus a leading IMAGE
+                # passthrough output and a `count` (batch) output. In the flat
+                # single-image model the width/height are not resolvable (LoadImage
+                # carries no dims), so the INT outputs are placeholders; the count
+                # is the constant single-image batch of 1.
+                var and_count = type_id == "GetImageSizeAndCount"
                 var image_link = _workflow_find_input_link(edges, node_id, String("image"))
                 if not image_link.found:
-                    raise Error("[501] workflow graph GetImageSize missing image input")
+                    raise Error("[501] workflow graph " + type_id + " missing image input")
                 var idx = _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port)
                 if idx >= 0:
                     _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
+                    if and_count:
+                        # Slot 0 is the unmodified IMAGE passthrough.
+                        var image_path = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
+                        var mask_source = _workflow_source_meta(image_nodes, image_ports, image_mask_sources, image_link)
+                        _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
+                        image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(image_path)
+                        image_mask_sources.append(mask_source)
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("width"), String("INT"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("height"), String("INT"))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("batch_size"), String("INT"))
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "ImageScaleBy":
+                # ImageScaleBy multiplies the SOURCE image dims by `scale_by`
+                # (out_w = round(src_w * scale_by)). In the flat single-image model
+                # the source image dims are NOT resolvable (LoadImage carries only a
+                # path, never dims), so the scaled output dims cannot be represented
+                # on a worker-supported grid. Fail loud [501] — never silently emit
+                # a wrong size. The scale_by widget is range-validated first so the
+                # error is precise.
+                var image_link = _workflow_find_input_link(edges, node_id, String("image"))
+                if not image_link.found:
+                    raise Error("[501] workflow graph ImageScaleBy missing image input")
+                var idx = _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port)
+                if idx >= 0:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
+                    var _scale_by = _workflow_float(fields, String("scale_by"), 1.0, 0.01, 8.0)
+                    raise Error("[501] workflow graph ImageScaleBy scales the source image dims by scale_by, but the source image dimensions are not resolvable in the flat single-image model (LoadImage carries no dims); use ImageResizeKJ with explicit width/height, or an EmptyLatentImage, to set a worker-supported size")
+            elif type_id == "ImageResizeKJ":
+                # ImageResizeKJ resizes an image to EXPLICIT width/height widgets.
+                # Unlike ImageScaleBy the target dims are knowable — but only when
+                # the resize is a plain explicit resize: keep_proportion=false, both
+                # width AND height nonzero, and no get_image_size IMAGE input (all
+                # three make the output dims depend on the un-knowable source dims).
+                # In the representable case we resolve the explicit width/height into
+                # the flat params (range-validated like the ImageScale scalar path),
+                # pass the IMAGE handle through, and emit width/height INT outputs
+                # (slots 1/2). Otherwise fail loud [501].
+                var image_link = _workflow_find_input_link(edges, node_id, String("image"))
+                if not image_link.found:
+                    raise Error("[501] workflow graph ImageResizeKJ missing image input")
+                var width_link = _workflow_find_input_link(edges, node_id, String("width"))
+                var height_link = _workflow_find_input_link(edges, node_id, String("height"))
+                var get_size_link = _workflow_find_input_link(edges, node_id, String("get_image_size"))
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, image_link.node_id, image_link.port) >= 0
+                    and _workflow_optional_link_ready(value_nodes, value_ports, width_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, height_link)
+                    and _workflow_optional_link_ready(value_nodes, value_ports, get_size_link)
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, image_link, String("IMAGE"), String("image"))
+                    if get_size_link.found:
+                        raise Error("[501] workflow graph ImageResizeKJ get_image_size input copies the source image dims, which are not resolvable in the flat single-image model")
+                    if _workflow_bool(fields, String("keep_proportion"), False):
+                        raise Error("[501] workflow graph ImageResizeKJ keep_proportion=true derives a dimension from the source image aspect, which is not resolvable in the flat single-image model; set explicit width and height instead")
+                    var width = _opt_int(fields, "width", 512, 0, 8192)
+                    var height = _opt_int(fields, "height", 512, 0, 8192)
+                    if width_link.found:
+                        width = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            width_link, String("width"),
+                        )
+                    if height_link.found:
+                        height = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            height_link, String("height"),
+                        )
+                    if width == 0 or height == 0:
+                        raise Error("[501] workflow graph ImageResizeKJ width/height of 0 keeps the source dimension, which is not resolvable in the flat single-image model; set explicit nonzero width and height")
+                    if width < 1 or width > 8192 or height < 1 or height > 8192:
+                        raise Error("[501] workflow graph ImageResizeKJ width/height out of range")
+                    _set_if_missing(obj, String("width"), JSONValue.from_int(width))
+                    _set_if_missing(obj, String("height"), JSONValue.from_int(height))
+                    var image_path = _workflow_image_path(image_nodes, image_ports, image_paths, image_link)
+                    var mask_source = _workflow_source_meta(image_nodes, image_ports, image_mask_sources, image_link)
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("IMAGE"), String("IMAGE"))
+                    image_nodes.append(node_id); image_ports.append(String("IMAGE")); image_paths.append(image_path)
+                    image_mask_sources.append(mask_source)
+                    # Resolved width/height INT outputs (slots 1/2) carry concrete
+                    # values (the explicit target dims), readable downstream.
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("width"), String("INT"))
+                    _workflow_add_scalar(
+                        scalar_nodes, scalar_ports, scalar_types,
+                        scalar_ints, scalar_floats, scalar_strings, scalar_bools,
+                        node_id, String("width"), String("INT"),
+                        width, Float64(width), String(""), False,
+                    )
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("height"), String("INT"))
+                    _workflow_add_scalar(
+                        scalar_nodes, scalar_ports, scalar_types,
+                        scalar_ints, scalar_floats, scalar_strings, scalar_bools,
+                        node_id, String("height"), String("INT"),
+                        height, Float64(height), String(""), False,
+                    )
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "ImageScale" or type_id == "ImageScaleToTotalPixels":
                 var image_link = _workflow_find_input_link(edges, node_id, String("image"))

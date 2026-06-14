@@ -36,8 +36,22 @@ VERIFIED (main-loop, measured): `cargo test -p serenity-graph` (3 new pass); Moj
 on a SamplerCustom(euler/simple) graph → `sampler:euler/scheduler:simple/steps:8/seed:42/cfg:1.5/creativity:1.0` (rc0).
 Cross-oracle (agents): Rust `lower` example vs Mojo `serenity_lower` byte-identical on SamplerCustom.
 
-## Phase 2 — Image/mask utility nodes  ⏳ NEXT
-ImageScaleBy / ImageResizeKJ / GetImageSizeAndCount(KJ); LoadImageOutput / LoadImageMask.
+## Phase 2 — Image/mask utility nodes  ✅ DONE & VERIFIED (2026-06-14)
+Added 6 nodes to Rust lowering + Mojo oracle (lockstep):
+- **LoadImageOutput → init_image, LoadImageMask → mask_image** (LoadImage aliases) — clean.
+- **GetImageSizeAndCount → GetImageSize** alias (IMAGE passthrough + count=1) — clean.
+- **ImageScaleBy → `[501]` fail-loud** always (source dims unknowable in the flat single-pass model).
+- **ImageResizeKJ** → explicit width/height resolve; `[501]` fail-loud on keep_proportion / zero dim /
+  source-derived dims. (Followed the existing ImageScale convention: no grid-snap; range-validate + passthrough.)
+Builds: cargo (serenity-server 19, serenity-graph 8+18+2 incl. **7 new**) ALL PASS; Mojo `build-lower-cli-safe` CLEAN.
+VERIFIED (main-loop, measured): `cargo test -p serenity-graph` (7 new pass); Mojo baseline fixture still
+lowers clean (rc0, no regression). Cross-oracle byte-identical (both agents ran both binaries; full-object
+diff: 4 positive byte-match, 3 fail-loud `[501]` identical bodies).
+
+## Phase 3 — FE advanced-sampling wiring + multi-axis grid  ⏳ NEXT
+Wire the dead `_section_advanced` knobs (clip-skip/sigma min-max/eta/restart/VAE) end-to-end
+(GenParams→wire→server→worker, honor-or-warn honestly); X/Y/Z multi-axis grid. (No graph-lowering, so
+no oracle sync this phase.)
 ## Phase 3 — FE advanced-sampling wiring + multi-axis grid  ⏳
 Wire the dead `_section_advanced` knobs (clip-skip/sigma min-max/eta/restart/VAE) end-to-end
 (GenParams→wire→worker); X/Y/Z multi-axis grid.

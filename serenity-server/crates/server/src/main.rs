@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -885,7 +885,260 @@ async fn get_samplers() -> Response {
         .into_response()
 }
 
+// ── /v1/state + /v1/presets — file-backed UI state & named presets ──────────────
+// Faithful ports of serenity_daemon.mojo's handlers (_load_state_doc /
+// _load_presets_doc / _state_doc_from_body / _upsert_preset_doc / _delete_preset_doc).
+// JSON is emitted via serde_json::to_string which, with the workspace-unified
+// `preserve_order` feature, produces compact insertion-ordered bytes == the daemon's
+// `dumps()`. Error bodies match the daemon's `{"detail": <msg>}` shape. State files
+// live under <out_dir>/state/ (== the daemon's output/serenity_daemon/state/ when
+// run with that out-dir), so UI state carries across the daemon→Rust cutover.
+
+/// Serialize `doc` as compact JSON with content-type application/json.
+fn json_compact(status: StatusCode, doc: &serde_json::Value) -> Response {
+    let body = serde_json::to_string(doc).unwrap_or_else(|_| String::from("{}"));
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+/// Daemon-shape error: `{"detail": <msg>}`.
+fn error_detail(status: StatusCode, detail: &str) -> Response {
+    json_compact(status, &json!({ "detail": detail }))
+}
+
+fn state_path(out_dir: &std::path::Path) -> PathBuf {
+    out_dir.join("state").join("last_state.json")
+}
+fn presets_path(out_dir: &std::path::Path) -> PathBuf {
+    out_dir.join("state").join("presets.json")
+}
+
+/// `_load_state_doc`: a valid persisted state, else the default empty doc.
+fn load_state_doc(out_dir: &std::path::Path) -> serde_json::Value {
+    std::fs::read_to_string(state_path(out_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|d| d.is_object() && d.get("state").map_or(false, |s| s.is_object()))
+        .unwrap_or_else(|| json!({ "schema": "serenity.ui_state.v1", "state": {} }))
+}
+
+/// `_load_presets_doc`: a valid persisted presets doc, else the default empty doc.
+fn load_presets_doc(out_dir: &std::path::Path) -> serde_json::Value {
+    std::fs::read_to_string(presets_path(out_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|d| d.is_object() && d.get("presets").map_or(false, |p| p.is_array()))
+        .unwrap_or_else(|| json!({ "schema": "serenity.presets.v1", "presets": [] }))
+}
+
+/// GET /v1/state.
+async fn get_state(State(st): State<AppState>) -> Response {
+    json_compact(StatusCode::OK, &load_state_doc(&st.out_dir))
+}
+
+/// POST /v1/state — `_state_doc_from_body` then persist; returns the stored doc.
+async fn post_state(State(st): State<AppState>, body: String) -> Response {
+    let obj: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "state body must be a JSON object"),
+    };
+    if !obj.is_object() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "state body must be a JSON object");
+    }
+    let state = match obj.get("state") {
+        Some(s) if s.is_object() => s.clone(),
+        Some(_) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'state' must be an object"),
+        None => obj.clone(),
+    };
+    let doc = json!({ "schema": "serenity.ui_state.v1", "state": state });
+    let dir = st.out_dir.join("state");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot create state dir");
+    }
+    if std::fs::write(state_path(&st.out_dir), serde_json::to_string(&doc).unwrap()).is_err() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist state");
+    }
+    json_compact(StatusCode::OK, &doc)
+}
+
+/// `params` = body["params"] (must be object) else the whole body.
+fn preset_params_from_body(body: &serde_json::Value) -> Result<serde_json::Value, &'static str> {
+    match body.get("params") {
+        Some(p) if p.is_object() => Ok(p.clone()),
+        Some(_) => Err("'params' must be an object"),
+        None => Ok(body.clone()),
+    }
+}
+
+fn preset_entry(name: &str, params: serde_json::Value) -> serde_json::Value {
+    json!({ "name": name, "params": params })
+}
+
+fn preset_by_name(doc: &serde_json::Value, name: &str) -> Option<serde_json::Value> {
+    doc.get("presets")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(name))
+        .cloned()
+}
+
+/// `_upsert_preset_doc`: replace-or-append the named preset, preserving order.
+fn upsert_preset_doc(doc: &serde_json::Value, name: &str, params: serde_json::Value) -> serde_json::Value {
+    let mut out = Vec::new();
+    let mut replaced = false;
+    if let Some(arr) = doc.get("presets").and_then(|p| p.as_array()) {
+        for ent in arr {
+            if ent.get("name").and_then(|n| n.as_str()) == Some(name) {
+                out.push(preset_entry(name, params.clone()));
+                replaced = true;
+            } else {
+                out.push(ent.clone());
+            }
+        }
+    }
+    if !replaced {
+        out.push(preset_entry(name, params));
+    }
+    json!({ "schema": "serenity.presets.v1", "presets": out })
+}
+
+/// GET /v1/presets — the full presets doc.
+async fn get_presets(State(st): State<AppState>) -> Response {
+    json_compact(StatusCode::OK, &load_presets_doc(&st.out_dir))
+}
+
+/// GET /v1/presets/:name — one preset, 404 if absent.
+async fn get_preset_one(State(st): State<AppState>, Path(name): Path<String>) -> Response {
+    match preset_by_name(&load_presets_doc(&st.out_dir), &name) {
+        Some(p) => json_compact(StatusCode::OK, &p),
+        None => error_detail(StatusCode::NOT_FOUND, &format!("no such preset: {name}")),
+    }
+}
+
+fn upsert_and_save(out_dir: &std::path::Path, name: &str, params: serde_json::Value) -> Response {
+    let doc = load_presets_doc(out_dir);
+    let updated = upsert_preset_doc(&doc, name, params);
+    let dir = out_dir.join("state");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot create state dir");
+    }
+    if std::fs::write(presets_path(out_dir), serde_json::to_string(&updated).unwrap()).is_err() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist presets");
+    }
+    // daemon returns the upserted preset entry
+    match preset_by_name(&updated, name) {
+        Some(p) => json_compact(StatusCode::OK, &p),
+        None => error_detail(StatusCode::UNPROCESSABLE_ENTITY, "preset upsert failed"),
+    }
+}
+
+/// POST /v1/presets — body carries `name` (required) + `params`.
+async fn post_presets_root(State(st): State<AppState>, body: String) -> Response {
+    let obj: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "preset body must be a JSON object"),
+    };
+    let name = match obj.get("name").and_then(|n| n.as_str()) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'name' (string) is required"),
+    };
+    if obj.get("params").is_none() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'params' (object) is required");
+    }
+    let params = match preset_params_from_body(&obj) {
+        Ok(p) => p,
+        Err(e) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, e),
+    };
+    upsert_and_save(&st.out_dir, &name, params)
+}
+
+/// POST /v1/presets/:name — name from path, params from body.
+async fn post_preset_named(State(st): State<AppState>, Path(name): Path<String>, body: String) -> Response {
+    if name.is_empty() || name.contains('/') {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "invalid preset name in path");
+    }
+    let obj: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let params = match preset_params_from_body(&obj) {
+        Ok(p) => p,
+        Err(e) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, e),
+    };
+    upsert_and_save(&st.out_dir, &name, params)
+}
+
+/// DELETE /v1/presets/:name — `_delete_preset_doc`; 404 if absent.
+async fn delete_preset(State(st): State<AppState>, Path(name): Path<String>) -> Response {
+    let doc = load_presets_doc(&st.out_dir);
+    if preset_by_name(&doc, &name).is_none() {
+        return error_detail(StatusCode::NOT_FOUND, &format!("no such preset: {name}"));
+    }
+    let kept: Vec<serde_json::Value> = doc
+        .get("presets")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|e| e.get("name").and_then(|n| n.as_str()) != Some(name.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let updated = json!({ "schema": "serenity.presets.v1", "presets": kept });
+    let dir = st.out_dir.join("state");
+    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::write(presets_path(&st.out_dir), serde_json::to_string(&updated).unwrap()).is_err() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist presets");
+    }
+    json_compact(
+        StatusCode::OK,
+        &json!({ "name": name, "deleted": true, "presets": updated.get("presets").cloned().unwrap_or(json!([])) }),
+    )
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    // Locks the daemon-parity shapes (verified byte-identical vs `serenity_daemon
+    // stub` via the oracle-diff harness): preset entry = {name,params}, upsert
+    // replaces in place + preserves order, presets doc = {schema,presets}.
+    #[test]
+    fn preset_upsert_and_replace_shape() {
+        let empty = json!({ "schema": "serenity.presets.v1", "presets": [] });
+        let one = upsert_preset_doc(&empty, "a", json!({ "cfg": 4.5 }));
+        assert_eq!(
+            serde_json::to_string(&one).unwrap(),
+            r#"{"schema":"serenity.presets.v1","presets":[{"name":"a","params":{"cfg":4.5}}]}"#
+        );
+        // replace-in-place keeps the single entry, updates params
+        let replaced = upsert_preset_doc(&one, "a", json!({ "cfg": 9.9 }));
+        assert_eq!(
+            serde_json::to_string(&replaced).unwrap(),
+            r#"{"schema":"serenity.presets.v1","presets":[{"name":"a","params":{"cfg":9.9}}]}"#
+        );
+        // append second preserves order
+        let two = upsert_preset_doc(&replaced, "b", json!({ "x": 1 }));
+        assert!(serde_json::to_string(&two)
+            .unwrap()
+            .contains(r#""presets":[{"name":"a","params":{"cfg":9.9}},{"name":"b","params":{"x":1}}]"#));
+        assert!(preset_by_name(&two, "a").is_some());
+        assert!(preset_by_name(&two, "zzz").is_none());
+    }
+
+    #[test]
+    fn preset_params_default_to_whole_body() {
+        // no "params" key -> the whole body is the params (daemon _preset_params_from_body)
+        let body = json!({ "cfg": 3.0, "steps": 8 });
+        assert_eq!(preset_params_from_body(&body).unwrap(), body);
+        // "params" present but not object -> error
+        assert!(preset_params_from_body(&json!({ "params": 5 })).is_err());
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -934,6 +1187,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/progress", get(ws_progress))
         .route("/v1/health", get(get_health))
         .route("/v1/samplers", get(get_samplers))
+        .route("/v1/state", get(get_state).post(post_state))
+        .route("/v1/presets", get(get_presets).post(post_presets_root))
+        .route(
+            "/v1/presets/:name",
+            get(get_preset_one).post(post_preset_named).delete(delete_preset),
+        )
         .with_state(state);
 
     // 4. Serve on 127.0.0.1:<port>.

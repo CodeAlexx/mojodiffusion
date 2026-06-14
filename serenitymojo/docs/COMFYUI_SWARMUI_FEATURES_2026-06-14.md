@@ -62,6 +62,32 @@ major — `hires_scale` unbounded (OOM). Plus the encoder-grid snap (found by my
 
 ---
 
-## Phase 2 — Grid / XYZ-plot generator     ⏳ next
+## Phase 2 — Grid / XYZ-plot generator     ✅ server DONE & VERIFIED (2026-06-14)
+
+**`POST /v1/grid`** (new `crates/server/src/grid.rs`): sweep one axis
+(`seed|cfg|steps|sampler|scheduler`) across N values (≤16), run one zimage job per
+value, composite the cells into a single labeled grid PNG.
+- Enqueue replicates `post_generate` exactly (new job_id via `next_id.fetch_add`,
+  register a `JobChannel`, push a queued `JobEntry`, `DriverCtl::Wake`); cells ride the
+  normal driver path and interleave safely with other jobs.
+- Wait loop polls `st.jobs` records keyed on the SPECIFIC cell ids; the `st.jobs` mutex
+  is never held across the `tokio::sleep` await. Budget = 180s × cells (capped 1h).
+- Composite via the `image` crate (320px cells, dark bg) + a self-contained 5×7 bitmap
+  font for the `axis=value` label band. A failed/missing cell → placeholder tile (never
+  aborts the grid). Saved as `<out_dir>/grid-NNNN.png`.
+- `main.rs`: `mod grid;` + `.route("/v1/grid", post(grid::post_grid))`; widened a few
+  crate items to `pub(crate)`.
+
+**Skeptic:** no blocker/major (independently verified: no lock-across-await, no channel
+leak, keys on specific ids, inputs clamped to 16, graceful per-cell degradation,
+bounds-checked font, atomic ids). Applied the timeout-scaling fix; nits (spawn_blocking,
+redundant Vec) noted.
+
+**Verified (measured):** `cfg=[1,3,5,7]` → `grid-0841.png` = a 2×2 grid of lighthouses
+labeled `cfg=1.0/3.0/5.0/7.0`, cells visibly distinct across the sweep; `seed=[10,20]`
+grid also produced. `cargo build` clean.
+
+GUI grid section (axis dropdown + values field + Generate-Grid button) = the remaining
+exposure step (the feature is API-complete and measured).
 ## Phase 3 — Inpaint UI panel               ⏳ (backend already executes mask denoise)
 ## Phase 4 — ComfyUI node-dispatch completeness  ⏳ (executor + capped worker rebuild)

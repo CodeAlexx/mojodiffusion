@@ -54,6 +54,7 @@ use serenity_ipc::{spawn_worker, EventPoll, WorkerHandle};
 use serenity_wire::{JobParams, LoraSpec, WorkerEvent};
 
 mod gallery;
+mod grid;
 mod jobs;
 mod models;
 mod video;
@@ -78,7 +79,7 @@ const BACKEND_NAME: &str = "isolated-rust";
 /// every event fanned out so far. The driver appends to `history` (and broadcasts)
 /// under the SAME lock used by a connecting WS client to snapshot+subscribe, so no
 /// frame can leak through the snapshot→subscribe gap (the WS subscribe-race fix).
-struct JobChannel {
+pub(crate) struct JobChannel {
     /// Live fan-out for events that arrive AFTER a subscriber attaches.
     tx: tokio::sync::broadcast::Sender<WorkerEvent>,
     /// Append-only history + terminal marker, guarded so subscribe is atomic w.r.t.
@@ -95,7 +96,7 @@ struct JobChannelInner {
 }
 
 impl JobChannel {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         let (tx, _rx) = tokio::sync::broadcast::channel::<WorkerEvent>(BROADCAST_CAP);
         Arc::new(JobChannel {
             tx,
@@ -147,7 +148,7 @@ type Registry = Arc<Mutex<HashMap<String, Arc<JobChannel>>>>;
 /// Control messages the HTTP layer sends to the worker-driver thread (which owns
 /// the `WorkerHandle`). Cancel must run on the driver thread, not a handler.
 /// `Job` is boxed so the two variants stay close in size (JobParams is large).
-enum DriverCtl {
+pub(crate) enum DriverCtl {
     /// A new job was pushed to the JobBook — wake the driver to promote it.
     Wake,
     /// Cancel the job with this id IF it is the one currently in flight.
@@ -155,27 +156,27 @@ enum DriverCtl {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     /// Control channel to the worker-driver thread (jobs + cancels).
-    ctl: std::sync::mpsc::Sender<DriverCtl>,
+    pub(crate) ctl: std::sync::mpsc::Sender<DriverCtl>,
     /// job_id -> JobChannel (history + live broadcast), for WS subscription/replay.
-    registry: Registry,
+    pub(crate) registry: Registry,
     /// The job currently in flight (driver writes; cancel handler reads to decide
     /// 200-accepted vs 404-not-in-flight without blocking the driver thread).
-    in_flight: Arc<Mutex<Option<String>>>,
+    pub(crate) in_flight: Arc<Mutex<Option<String>>>,
     /// Monotonic counter feeding job_id generation (no rand).
-    next_id: Arc<AtomicU64>,
+    pub(crate) next_id: Arc<AtomicU64>,
     /// Server-configured output directory written into every JobParams.out_dir.
-    out_dir: PathBuf,
+    pub(crate) out_dir: PathBuf,
     /// Prior jobs.db rows loaded ONCE at startup (history half of /v1/jobs).
-    prior: Arc<Vec<[String; 6]>>,
+    pub(crate) prior: Arc<Vec<[String; 6]>>,
     /// Current-session JobBook (live half of /v1/jobs + the serial queue), ordered by
     /// enqueue; the driver promotes the first active-queued entry. /v1/reorder + /v1/remove
     /// mutate it.
-    jobs: Arc<Mutex<Vec<jobs::JobEntry>>>,
+    pub(crate) jobs: Arc<Mutex<Vec<jobs::JobEntry>>>,
     /// Backend identity for /v1/health (the worker kind: "zimage"/"stub"/… — derived from
     /// --kind or the worker binary name). Cosmetic for the bridge (it gates on status only).
-    backend_name: String,
+    pub(crate) backend_name: String,
 }
 
 // ── request body ────────────────────────────────────────────────────────────--
@@ -1618,6 +1619,7 @@ async fn main() -> anyhow::Result<()> {
     // 3. Router.
     let app = Router::new()
         .route("/v1/generate", post(post_generate))
+        .route("/v1/grid", post(grid::post_grid))
         .route("/v1/cancel", post(post_cancel))
         .route("/v1/cancel/:id", post(post_cancel_path))
         .route("/v1/progress", get(ws_progress))

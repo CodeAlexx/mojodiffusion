@@ -287,11 +287,25 @@ Run the Rust server `serenity-server --worker output/bin/serenity_worker_stub --
   success/missing/bad-id/non-string, favorite-missing 404, delete success/again-404, GET
   state after each) AND the **persisted gallery.json byte-identical** between both servers.
 
-### REMAINING (import + 2 endpoints — daemon handler line refs in `serenity_daemon.mojo`)
-Ordered by value × tractability. Each is independent → good builder/skeptic team work,
-but byte-exactness is the risk — DIFF EVERY ONE against the oracle before committing.
-- **`/v1/gallery/import`** (@3059) — COUNTER-COUPLED (allocates a new `job-{njobs}` id),
-  so pair it with `/v1/jobs` (both depend on the shared job counter / DB state). (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
+- **`/v1/jobs` HISTORY (prior rows)** (`crates/server/src/jobs.rs`) — `GET /v1/jobs`,
+  `GET /v1/job/:id`. Reads the daemon's `jobs.db` (SQLite `jobs` table) via **rusqlite**
+  (bundled), repairs non-terminal→`interrupted` (F10), emits `prior_job_json_value`
+  (incl. params-derived image_index/image_count/steps + `params` + `history:true`).
+  **VERIFIED byte-identical vs the oracle reading the same db: `/v1/jobs` = 781 records,
+  2,464,261 bytes, sha 211aab56… ; `/v1/job/:id` exact + 404.** 3 unit tests.
+  ⚠ SCOPE — history only. The daemon's `/v1/jobs` also appends CURRENT-session
+  `JobRecord`s; the Rust registry evicts terminal jobs and tracks no per-job
+  `created/state/step/total`. That write-side (R-DB-1/2) is the next piece.
+
+### REMAINING — the R-DB write-side + 1 endpoint
+The write-side is now the long pole: the Rust server must track current-session
+`JobRecord`s (created/state/progress/step/total/output_path/error) through the job
+lifecycle and persist them to `jobs.db` (the daemon's schema). That unblocks, together:
+- **current-session jobs** in `GET /v1/jobs` (append `job_json_value` after the prior rows),
+- **`/v1/reorder`** (@3315) + **`/v1/remove`** (@3347) — operate on QUEUED current jobs,
+- **`/v1/gallery/import`** (@3059) — allocates a new `job-{counter}` id.
+Then the last endpoint:
+- **`/v1/video`** (handler @3001; + sub-routes read/import/order/rename/favorite/DELETE/
   GET-one @3049-3182). Scans `OUT_DIR/*.png` for embedded `serenity.genparams.v1` tEXt +
   favorites/order state (`<out_dir>/state/gallery.json`). LARGE. Schema `serenity.gallery.v1`.
 - **`/v1/jobs`** (handler @3295) + `/v1/reorder` (@3315) + `/v1/remove` (@3347). Returns the

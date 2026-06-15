@@ -10,12 +10,28 @@ version = "0.1.0"
 # MOJO-libs stack. -lm: sinf in image/model math; -lcuda: serenitymojo/offload
 # CUDA driver API (the consumer's GPU offload, not the libs).
 # libserenity_cudnn_sdpa: Z-Image and LTX2 product fast SDPA shim.
-build-daemon = "mkdir -p output/bin && mojo build -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_daemon.mojo -o output/bin/serenity_daemon"
-# Memory-safe daemon build: caps compiler at 4 threads (default -j 0 = all 12 →
-# >60 GB peak → OOM-killed your GNOME session, 2026-06-13) and runs inside a
-# MemoryMax cgroup scope so any blowup kills only the build, not the desktop.
-# Prefer this over build-daemon for iterative work. Tune via MEM_MAX=... env.
-build-daemon-safe = "mkdir -p output/bin && bash scripts/mem_safe.sh mojo build -j 4 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_daemon.mojo -o output/bin/serenity_daemon"
+#
+# ============================================================================
+# CRITICAL BUILD-MEMORY FINDING (MEASURED 2026-06-14) — read docs/MOJO_BUILD_O3_OOM_FINDING_2026-06-14.md
+# The ~48-60 GB compile OOM that has been blamed on "the monolith" / "too many
+# threads" / "the whole graph executor" is actually driven by **`-O3`, Mojo's
+# DEFAULT `mojo build` optimization level** (aggressive whole-program IPO/inlining
+# over the 322k-LOC import tree). It is NOT thread count and NOT the file size.
+# MEASURED on the zimage worker, single-thread, identical flags otherwise:
+#     -O3 (default) = 48 GB  -> OOM-loops, kills the GNOME session via oomd
+#     -O2           =  2.0 GB / 85 s   (24x less RAM, fully optimized)
+#     -O1           =  2.0 GB / 91 s
+#     -O0           =  5.0 GB / 150 s  (36 MB bloated, no DCE)
+# FIX: every heavy `mojo build` now passes `--optimization-level 2`. The
+# mem_safe.sh caps + -j throttling below are now BACKSTOP only, not the fix.
+# OPEN: -O2 binary is build+link verified; -O2-vs-O3 *runtime* parity not yet
+# measured — confirm with an e2e worker smoke before treating -O2 as final.
+# ============================================================================
+build-daemon = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_daemon.mojo -o output/bin/serenity_daemon"
+# Daemon build with -O2 (the real OOM fix) PLUS the mem_safe.sh cgroup cap as a
+# belt-and-suspenders backstop. -j 4 kept as secondary throttle. With -O2 this
+# now builds in a few GB, not 60 GB — the 2026-06-13 GNOME-session kill was -O3.
+build-daemon-safe = "mkdir -p output/bin && bash scripts/mem_safe.sh mojo build --optimization-level 2 -j 4 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_daemon.mojo -o output/bin/serenity_daemon"
 # Phase-A Rust-control-plane: minimal STANDALONE stub worker binary. Imports only
 # stub_backend + IPC codec — NO server, NO graph executor, NO GPU/MAX — so it must
 # build tiny (the test that small per-kind workers escape the 57GB monolith OOM).
@@ -26,26 +42,25 @@ build-worker-stub-safe = "mkdir -p output/bin && MEM_MAX=28G MEM_HIGH=24G SWAP_M
 # so the Mojo lowering can be captured as the reference for the Rust executor port.
 # Builds tiny like the stub worker; capped scope as backstop.
 build-lower-cli-safe = "mkdir -p output/bin && MEM_MAX=28G MEM_HIGH=24G SWAP_MAX=2G bash scripts/mem_safe.sh mojo build --num-threads 1 --no-optimization -I . -I /home/alex/MOJO-libs -Xlinker -lm serenitymojo/serve/serenity_lower_cli.mojo -o output/bin/serenity_lower"
-# Optimized per-kind Z-Image worker for the Rust control plane. OPTIMIZED (no
-# --no-optimization) for runtime speed, but --num-threads 1 (the morning OOM was
-# -j0 = 12 threads × full -O on the monolith → ~60 GB). Hard 46 GB cap with
-# SWAP DISABLED (MemorySwapMax=0): if it overshoots it is cgroup-OOM-killed in its
-# own scope (build dies alone) instead of swap-thrashing → PSI → oomd killing the
-# GNOME session (the 2026-06-13 failure mode). GPU link flags mirror build-daemon.
-build-worker-zimage-safe = "mkdir -p output/bin && MEM_MAX=46G MEM_HIGH=46G SWAP_MAX=0 bash scripts/mem_safe.sh mojo build --num-threads 1 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_zimage.mojo -o output/bin/serenity_worker_zimage"
+# Per-kind Z-Image worker for the Rust control plane. The REAL OOM fix is
+# `--optimization-level 2`: MEASURED 48 GB (-O3 default) -> 2.0 GB (-O2) for this
+# exact binary. The 12 GB cap below is now a backstop, not the mechanism — with
+# -O2 the build needs ~2 GB so it never approaches it. (History: the 2026-06-13
+# GNOME kill was -O3, NOT -j0/monolith as the old comment claimed.)
+build-worker-zimage-safe = "mkdir -p output/bin && MEM_MAX=12G MEM_HIGH=12G SWAP_MAX=0 bash scripts/mem_safe.sh mojo build --optimization-level 2 --num-threads 1 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_zimage.mojo -o output/bin/serenity_worker_zimage"
 # RAW (no mem_safe) optimized zimage worker build — the CALLER wraps `pixi run
 # build-worker-zimage-raw` in an OUTER `systemd-run --user --scope` (the cap that
 # actually engages; mem_safe nested inside pixi did NOT). -j4 balances speed vs peak;
 # the outer scope's MemoryMax + MemorySwapMax=0 is the real desktop protection.
-build-worker-zimage-raw = "mkdir -p output/bin && mojo build --num-threads 4 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_zimage.mojo -o output/bin/serenity_worker_zimage"
+build-worker-zimage-raw = "mkdir -p output/bin && mojo build --optimization-level 2 --num-threads 4 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_zimage.mojo -o output/bin/serenity_worker_zimage"
 # RAW (no mem_safe) optimized ideogram4 worker build — same outer-systemd-scope
 # contract as build-worker-zimage-raw (CALLER wraps it in a MemoryMax scope).
-build-worker-ideogram4-raw = "mkdir -p output/bin && mojo build --num-threads 4 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_ideogram4.mojo -o output/bin/serenity_worker_ideogram4"
+build-worker-ideogram4-raw = "mkdir -p output/bin && mojo build --optimization-level 2 --num-threads 4 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_ideogram4.mojo -o output/bin/serenity_worker_ideogram4"
 build-klein-precache = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/pipeline/klein9b_precache_sample_prompts.mojo -o output/bin/klein_precache_sample_prompts"
 build-klein-sampler = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/sampling/klein_sample_cli.mojo -o output/bin/klein_sample_cli"
 build-sdxl-cli = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/pipeline/sdxl_sample_cli.mojo -o output/bin/sdxl_sample_cli"
 build-anima-cli = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/pipeline/anima_serenity_cli.mojo -o output/bin/anima_serenity_cli"
-build-video-smoke = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -Lserenitymojo/ops/cshim/lib/cudnn_stubs -Xlinker -lcudnn -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib serenitymojo/pipeline/ltx2_t2v_av_hq.mojo -o output/bin/ltx2_video_smoke_runner"
+build-video-smoke = "mkdir -p output/bin && mojo build --optimization-level 2 --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -Lserenitymojo/ops/cshim/lib/cudnn_stubs -Xlinker -lcudnn -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib serenitymojo/pipeline/ltx2_t2v_av_hq.mojo -o output/bin/ltx2_video_smoke_runner"
 
 [dependencies]
 max = ">=26.3.0,<27"

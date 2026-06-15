@@ -10,7 +10,6 @@
 
   var TABS = [
     { id: "generate", label: "Generate", icon: "✦" },
-    { id: "ideogram", label: "Ideogram", icon: "📐" },
     { id: "workflows", label: "Workflows", icon: "⌗" },
     { id: "models", label: "Models", icon: "▦" },
     { id: "queue", label: "Queue", icon: "≣" },
@@ -54,9 +53,9 @@
       // overlay + per-view containers (generate has no view -> overlay hidden)
       var overlay = document.createElement("div"); overlay.id = "wf-overlay";
       var views = {};
-      ["workflows", "ideogram", "models", "queue", "settings"].forEach(function (id) {
+      ["workflows", "models", "queue", "settings"].forEach(function (id) {
         var v = document.createElement("div"); v.className = "view"; v.id = "view-" + id;
-        if (id !== "workflows" && id !== "ideogram") {
+        if (id !== "workflows") {
           var pad = document.createElement("div"); pad.className = "view-pad";
           pad.innerHTML = "<h2 style='color:var(--text);margin:0 0 8px'>" + id[0].toUpperCase() + id.slice(1) + "</h2>" +
             "<p>This panel is a placeholder. Generate + Workflows are the live tabs.</p>";

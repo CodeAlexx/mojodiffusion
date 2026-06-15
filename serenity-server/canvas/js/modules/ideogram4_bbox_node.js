@@ -120,10 +120,12 @@
       node.setAttr("data", d);
 
       // frame rect: aspect-fit width/height into the body's frame area
-      var bodyW = BODY.w, fx = BODY.pad, fy = BODY.top + 4;
+      var _nd0 = node.getAttr("nd") || {};
+      var curW = _nd0.w || BODY.w, curH = _nd0.h || BODY.h;
+      var fx = BODY.pad, fy = BODY.top + 4;
       function frameGeom() {
         var aw = parseInt(d.width, 10) || 1024, ah = parseInt(d.height, 10) || 1024;
-        var availW = bodyW - 2 * BODY.pad, availH = BODY.frameH;
+        var availW = curW - 2 * BODY.pad, availH = curH - BODY.top - 4 - BODY.pad;
         var s = Math.min(availW / aw, availH / ah);
         var fw = aw * s, fh = ah * s;
         return { x: fx + (availW - fw) / 2, y: fy + (availH - fh) / 2, w: fw, h: fh };
@@ -218,6 +220,7 @@
         rebuild: function () { rebuildAll(); },
         select: function (id) { selectBox(id); },
         getFrame: f,
+        resize: function (w, h) { curW = w; curH = h; rebuildAll(); },   // node resize -> reflow frame + boxes
       });
 
       function rebuildAll() {
@@ -241,46 +244,59 @@
       }
 
       // ---- drag-to-draw a NEW bbox on the surface ----
+      // The in-progress rect is listening:false and the draw is tracked on the STAGE
+      // (+ a one-shot window mouseup) so neither the growing rect nor an existing box
+      // can steal the move/up events — the draw always tracks the cursor and finishes,
+      // so you can draw box after box and each stays put once released.
+      var _drawMove = null, _drawUp = null;
+      function endDrawListeners() {
+        var st = group.getStage();
+        if (st) { st.off("mousemove.bboxdraw"); st.off("mouseup.bboxdraw"); }
+        if (_drawUp) window.removeEventListener("mouseup", _drawUp);
+        _drawMove = _drawUp = null;
+      }
+      function pointerInFrame() {
+        var p = group.getRelativePointerPosition(), g = f();
+        return { x: clamp(p.x, g.x, g.x + g.w), y: clamp(p.y, g.y, g.y + g.h) };
+      }
       surface.on("mousedown", function (e) {
         e.cancelBubble = true;            // never pan the stage / drag the node
+        if (drawing) endDrawListeners();  // safety: clear any stuck draw
         selectNodeViaInfra();             // selecting the node mounts the props editor
-        // pointer in group-local space
-        var grp = group.getRelativePointerPosition();
-        var g = f();
-        var x0 = clamp(grp.x, g.x, g.x + g.w), y0 = clamp(grp.y, g.y, g.y + g.h);
+        var p0 = pointerInFrame();
         var color = PALETTE[(d.nextId - 1) % PALETTE.length];
-        var r = new Konva.Rect({ x: x0, y: y0, width: 1, height: 1, stroke: color, strokeWidth: 2, fill: color + "22" });
+        var r = new Konva.Rect({ x: p0.x, y: p0.y, width: 1, height: 1, stroke: color, strokeWidth: 2, fill: color + "22", listening: false });
         bodyLayer.add(r);
         tr.nodes([]); tr.moveToTop();
-        drawing = { rect: r, x0: x0, y0: y0, color: color };
+        drawing = { rect: r, x0: p0.x, y0: p0.y, color: color };
+        _drawMove = function () {
+          if (!drawing) return;
+          var p = pointerInFrame();
+          drawing.rect.setAttrs({
+            x: Math.min(p.x, drawing.x0), y: Math.min(p.y, drawing.y0),
+            width: Math.abs(p.x - drawing.x0), height: Math.abs(p.y - drawing.y0),
+          });
+          bodyLayer.getLayer() && bodyLayer.getLayer().batchDraw();
+        };
+        _drawUp = function () { finishDraw(); };
+        var st = group.getStage();
+        if (st) { st.on("mousemove.bboxdraw", _drawMove); st.on("mouseup.bboxdraw", _drawUp); }
+        window.addEventListener("mouseup", _drawUp);   // fallback if released off-canvas
         bodyLayer.getLayer() && bodyLayer.getLayer().batchDraw();
       });
-      surface.on("mousemove", function (e) {
-        if (!drawing) return;
-        e.cancelBubble = true;
-        var grp = group.getRelativePointerPosition();
-        var g = f();
-        var px = clamp(grp.x, g.x, g.x + g.w), py = clamp(grp.y, g.y, g.y + g.h);
-        drawing.rect.setAttrs({
-          x: Math.min(px, drawing.x0), y: Math.min(py, drawing.y0),
-          width: Math.abs(px - drawing.x0), height: Math.abs(py - drawing.y0),
-        });
-        bodyLayer.getLayer() && bodyLayer.getLayer().batchDraw();
-      });
-      function finishDraw(e) {
-        if (!drawing) return;
-        if (e) e.cancelBubble = true;
+      function finishDraw() {
+        if (!drawing) { endDrawListeners(); return; }
+        endDrawListeners();
         var r = drawing.rect, color = drawing.color; drawing = null;
         if (r.width() < 6 || r.height() < 6) { r.destroy(); bodyLayer.getLayer() && bodyLayer.getLayer().batchDraw(); return; }
-        r.destroy(); // re-create through the normalized element store for consistency
+        var g = f();
         var id = d.nextId++;
         var it = { id: id, type: "obj", desc: "", text: "", color: color, x: 0, y: 0, w: 0, h: 0 };
-        // seed normalized geometry from the drawn rect
-        var g = f();
         it.x = clamp((r.x() - g.x) / g.w, 0, 1);
         it.y = clamp((r.y() - g.y) / g.h, 0, 1);
         it.w = clamp((r.width()) / g.w, 0, 1 - it.x);
         it.h = clamp((r.height()) / g.h, 0, 1 - it.y);
+        r.destroy();  // re-create through the normalized element store for consistency
         d.elements.push(it);
         node.setAttr("data", d);
         attachBox(it);
@@ -288,7 +304,6 @@
         selectBox(id);
         renderPropsIfActive(node, ctx);
       }
-      surface.on("mouseup", finishDraw);
 
       // initial paint
       rebuildAll();
@@ -431,6 +446,10 @@
       color: "#7a3a8a",
       w: BODY.w,
       h: BODY.h,
+      resizable: true,
+      minW: 240,
+      minH: 220,
+      onResize: function (node, w, h) { var api = node.getAttr("_bboxApi"); if (api && api.resize) api.resize(w, h); },
       ins: [],
       outs: ["CAPTION"],
       category: "Ideogram-4",

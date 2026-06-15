@@ -115,6 +115,10 @@
           data: def.data || null,
           menu: def.menu !== false,          // show in Add-Node menu unless explicitly hidden
           category: def.category || "Nodes", // menu grouping
+          resizable: !!def.resizable,        // opt-in bottom-right resize grip
+          minW: def.minW || 220,
+          minH: def.minH || 180,
+          onResize: typeof def.onResize === "function" ? def.onResize : null,
         };
       }
 
@@ -317,18 +321,49 @@
           c.on("mouseup", function (e) { e.cancelBubble = true; finishDrag(g, "in", i); });
           g.add(c);
         });
+        var outPortEls = [];
         def.outs.forEach(function (label, i) {
-          g.add(new Konva.Text({ text: label, x: w - 12 - label.length * 6, y: 28 + i * 16, fontSize: 10, fill: "#aab", listening: false }));
+          var lbl = new Konva.Text({ text: label, x: w - 12 - label.length * 6, y: 28 + i * 16, fontSize: 10, fill: "#aab", listening: false });
+          g.add(lbl);
           var c = new Konva.Circle({ x: w, y: 34 + i * 16, radius: 5, fill: "#ffcc6c", stroke: "#fff", strokeWidth: 1 });
           c.setAttr("port", { node: g, kind: "out", i: i });
           c.on("mousedown", function (e) { e.cancelBubble = true; startDrag(g, "out", i); });
           g.add(c);
+          outPortEls.push({ circle: c, label: lbl });
         });
 
         // custom interactive body — painted AFTER ports so it sits on top of the frame
         if (hasBody) {
           try { def.body(g, g, ctx); }
           catch (e) { console.error("[workflows] body() failed for", def.typeId, e); }
+        }
+
+        // optional resize grip (bottom-right) for nodes that opt in via def.resizable.
+        // Painted LAST so it sits above the body and stays clickable; drags on the STAGE
+        // (so leaving the grip mid-resize doesn't break it) and calls def.onResize so the
+        // body reflows. Boxes inside the bbox node are normalized, so they re-fit.
+        if (def.resizable) {
+          var grip = new Konva.Rect({ x: w - 16, y: h - 16, width: 13, height: 13, fill: def.color, opacity: 0.85, cornerRadius: 2, stroke: "#fff", strokeWidth: 1 });
+          grip.on("mouseenter", function () { stage.container().style.cursor = "nwse-resize"; });
+          grip.on("mouseleave", function () { stage.container().style.cursor = "default"; });
+          grip.on("mousedown", function (e) {
+            e.cancelBubble = true;
+            function onMove() {
+              var p = stage.getRelativePointerPosition();
+              var nw = Math.max(def.minW || 220, Math.round(p.x - g.x()));
+              var nh = Math.max(def.minH || 180, Math.round(p.y - g.y()));
+              var nd = g.getAttr("nd"); nd.w = nw; nd.h = nh; g.setAttr("nd", nd);
+              frameRect.setAttrs({ width: nw, height: nh });
+              titleBar.setAttrs({ width: nw });
+              grip.position({ x: nw - 16, y: nh - 16 });
+              outPortEls.forEach(function (pe) { pe.circle.x(nw); pe.label.x(nw - 12 - pe.label.text().length * 6); });
+              if (typeof def.onResize === "function") { try { def.onResize(g, nw, nh); } catch (_) {} }
+              redrawWires(); nodeLayer.batchDraw();
+            }
+            function onUp() { stage.off("mousemove.wfresize"); stage.off("mouseup.wfresize"); stage.container().style.cursor = "default"; }
+            stage.on("mousemove.wfresize", onMove); stage.on("mouseup.wfresize", onUp);
+          });
+          g.add(grip);
         }
 
         g.on("dragmove", redrawWires);   // port-only nodes (group draggable) redraw wires

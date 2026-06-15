@@ -31,15 +31,36 @@ half; the backend half is per-model porting work.
 | **sensenova** | ✅ real Qwen3 (hardcoded prompt) | ❌ | ✅ 512² | fetch weight shards + JobParams.prompt + new backend + worker | L |
 | **ms-lens** | ❌ zeroed GPT-OSS features | ❌ | ✅ | port GPT-OSS encoder (hardest) + sample_cli + backend + worker | L |
 
-## Done this session
-- **qwen** server-wired + admission opened + measured (17f3e22). Real encode confirmed;
-  offload too slow on 24 GB to gate the final image.
+## FINAL MEASURED RESULTS (this session)
 
-## Recommended order (practical render value first)
-1. **SDXL** — small + fast; only needs CLIP-L/G runtime encode in a new backend. ← in progress
-2. **Flux-dev** — real encode already exists; wrap it in a backend.
-3. **SenseNova** — real encode exists; fetch weights + un-hardcode the prompt.
-4. SD3.5 → Anima → Klein → MS-Lens (each needs encode work of increasing depth).
+**RENDERING end-to-end via serenity-server (verified PNGs):**
+- **SDXL** (d60360d) — real CLIP-L/G encode + 30 steps + TILED VAE decode (new
+  sdxl_tiled_decode.mojo fixed the monolithic 1024² OOM). Apple render verified.
+- **Flux-dev** (ec9ebb7) — real CLIP-L + T5-XXL encode + block-streamed DiT + tiled decode. Fox verified.
+- **SD3.5 Large** (528865f) — real CLIP-L+G+T5 encode + 38-block streamed MMDiT + embedded VAE
+  (monolithic decode fits, peak 21.6 GB). Fox verified.
+- **Anima** (5dc13a8) — real Qwen3+T5 encode (qwen 17 / t5 23 tokens) + DiT + wan21 VAE. Fox verified.
+
+**Wired but not UI-practical / blocked (committed honestly):**
+- **qwen** (17f3e22) — real Qwen2.5-VL encode + denoise run, but offloaded 54 GB DiT is
+  impractically slow on 24 GB (>17 min/img). Needs offload-perf.
+- **klein** (bff63cb) — real inline Qwen3 encode + all 20 steps run (~9.8 s/step) THEN
+  monolithic 1024² decode OOMs. Fix: tile klein_sample's VAE decode.
+- **sensenova** (bff63cb) — compiles, real Qwen3 encode, pixel-space decode; WEIGHT SHARDS
+  ABSENT (~/.serenity/models/sensenova_u1/). Fetch weights to gate.
+- **ms-lens** (bff63cb) — compiles (after a tuple-copy fix), real GptOssEncoder encode;
+  not gated, skeptic flagged likely-OOM on the 1024² decode (probably needs tiled decode).
+
+**Pattern proven:** new model = copy qwenimage/sdxl backend → runtime encode + denoise + VAE
+(TILE the 1024² decode) → serenity_worker_<m> → pixi -O2 target → main.rs dispatch →
+admission → render-gate. Six backends were agent-built (builder/bugfixer/skeptic swarm);
+4 render, the orchestrator did the -O2 builds + GPU render-gates.
+
+## Next (per blocker)
+1. **klein** tiled decode (port sdxl_tiled_decode to KleinVaeDecoder) — closest to rendering.
+2. **ms-lens** render-gate + tiled decode if it OOMs.
+3. **sensenova** fetch weight shards, then gate.
+4. **qwen** offload-perf (block-stream like flux instead of full offload) to make it UI-practical.
 
 Build rule: **never bare `mojo build`** (-O3 OOMs the desktop). Always `pixi run
 build-worker-*-raw` (-O2). Render-gate every model with a real PNG before claiming it works.

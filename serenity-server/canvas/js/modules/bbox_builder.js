@@ -13,8 +13,7 @@
   function injectCSS() {
     if (document.getElementById("style-bboxBuilder")) return;
     var css = [
-      "#bbox-panel{position:absolute;inset:0;display:none;background:var(--bg);z-index:4}",
-      "#bbox-panel.show{display:grid;grid-template-columns:280px 1fr 260px;grid-template-rows:1fr auto}",
+      "#bbox-panel{position:absolute;inset:0;display:grid;grid-template-columns:280px 1fr 260px;grid-template-rows:1fr auto;background:var(--bg);z-index:1}",
       "#bbox-left{grid-row:1/3;border-right:1px solid var(--line);padding:10px;overflow-y:auto;background:var(--panel)}",
       "#bbox-stagewrap{position:relative;overflow:hidden;background:#0e0f15}",
       "#bbox-stage{position:absolute;inset:0}",
@@ -44,8 +43,8 @@
     init: function (ctx) {
       injectCSS();
       var Konva = ctx.Konva, bus = ctx.bus, api = ctx.api, set = ctx.set, get = ctx.get;
-      var host = document.getElementById("view-workflows");
-      if (!host) { console.warn("[bboxBuilder] no #view-workflows"); return; }
+      var host = document.getElementById("view-ideogram");
+      if (!host) { console.warn("[bboxBuilder] no #view-ideogram"); return; }
 
       // ---- panel scaffold ----
       var panel = el("div"); panel.id = "bbox-panel";
@@ -134,7 +133,7 @@
           addElem(r);
         });
         window.addEventListener("keydown", function (e) {
-          if (panel.classList.contains("show") && (e.key === "Delete" || e.key === "Backspace") && selId != null
+          if (host.classList.contains("show") && (e.key === "Delete" || e.key === "Backspace") && selId != null
               && document.activeElement && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") {
             removeElem(selId);
           }
@@ -247,22 +246,16 @@
           .catch(function (e) { genBtn.disabled = false; genBtn.textContent = "▶ Generate (failed)"; console.warn(e); });
       });
 
-      // ---- toolbar toggle (added to the workflow #wf-bar) ----
-      function addToggle() {
-        var bar = document.getElementById("wf-bar");
-        if (!bar || document.getElementById("bbox-toggle")) return;
-        var b = el("button", "btn wf-b", "📐 Bbox Builder"); b.id = "bbox-toggle";
-        b.addEventListener("click", function () {
-          var on = !panel.classList.contains("show");
-          panel.classList.toggle("show", on);
-          b.classList.toggle("btn-primary", on);
-          if (on) { build(); setTimeout(function () { if (stage) { stage.size({ width: stageHost.clientWidth, height: stageHost.clientHeight }); drawFrame(); } rebuildList(); }, 30); }
-        });
-        // insert after the Add Node button
-        bar.appendChild(b);
+      // ---- the Ideogram tab IS this builder (no toggle; the panel fills the view) ----
+      function activate() {
+        build();
+        setTimeout(function () {
+          if (stage) { stage.size({ width: stageHost.clientWidth, height: stageHost.clientHeight }); drawFrame(); }
+          rebuildList();
+        }, 30);
       }
-      bus.on("nav:tab", function (t) { if (t === "workflows") addToggle(); });
-      addToggle();
+      bus.on("nav:tab", function (t) { if (t === "ideogram") activate(); });
+      if (host.classList.contains("show")) activate();   // already on this tab at init
       wIn.addEventListener("change", function () { if (built) drawFrame(); });
       hIn.addEventListener("change", function () { if (built) drawFrame(); });
       console.info("[bboxBuilder] ready");

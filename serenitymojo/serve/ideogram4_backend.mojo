@@ -779,6 +779,11 @@ struct Ideogram4Backend(GenBackend, Movable):
                 var encode_t0 = perf_counter_ns()
                 self._encode()
                 self.text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
+                # CRITICAL (24GB fit): _encode frees the ~8GB Qwen encoder by scope, but the
+                # CUDA mempool CACHES it. Trim NOW so the 17.4GB cond+uncond fp8 transformers
+                # have room — without this, cached-encoder(8) + transformers(17.4) = ~25.6GB
+                # OOMs on the 2nd transformer (measured: stall at ~22GB/0% util on a 24GB GPU).
+                cu_mempool_trim_current(0)
                 self._record_vram()
                 self.announced = False
                 self.phase = IPHASE_LOAD

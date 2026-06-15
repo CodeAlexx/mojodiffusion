@@ -1,54 +1,99 @@
-/* api.js — SHARED CONTRACT. The ComfyUI HTTP/WS client. Owned by scaffold.
-   Maps to the measured ComfyUI API the canvas drives. serenity-server will speak
-   these (ComfyUI-API-compat, Tier A/B); until then calls may 404 — modules must
-   degrade gracefully (show empty/placeholder, never crash the app).
-   Base is same-origin by default; override with ?api=http://host:port. */
+/* api.js — SHARED CONTRACT. Adapter from the canvas's ComfyUI-shaped calls to
+   serenity-server's PROVEN /v1/* API (POST /v1/generate -> worker -> PNG, verified).
+   Keeps the ComfyUI method names generate_ws/gallery already use, and translates:
+     submitPrompt -> POST /v1/generate (body built from Serenity.state.params)
+     connectWS    -> WS /v1/progress?job=<id>, {ev:...} -> ComfyUI-shaped messages
+     viewUrl      -> /out/<filename>   (served by serenity-server)
+   Same-origin by default (serenity-server serves this canvas); ?api= overrides. */
 (function () {
   "use strict";
   window.Serenity = window.Serenity || {};
-  const BASE = new URLSearchParams(location.search).get('api') || '';
-  const j = async (r) => { if (!r.ok) throw new Error(r.status + ' ' + r.url); return r.json(); };
+  var BASE = new URLSearchParams(location.search).get('api') || '';
+  var j = function (r) { if (!r.ok) throw new Error(r.status + ' ' + r.url); return r.json(); };
+  var lastJobId = null;
 
-  const api = {
+  function baseName(p) { return String(p || '').split('/').pop(); }
+
+  function generateBody() {
+    var p = (window.Serenity.state && window.Serenity.state.params) || {};
+    return {
+      model: p.model && p.model.indexOf('—') < 0 ? p.model : 'z-image',
+      prompt: p.prompt || '',
+      negative: p.negative || '',
+      width: p.width || 1024,
+      height: p.height || 1024,
+      steps: p.steps || 8,
+      cfg: p.cfg != null ? p.cfg : 1.5,
+      seed: p.seed != null ? p.seed : -1,
+      sampler: p.sampler || 'euler',
+      scheduler: p.scheduler || 'simple',
+      images: p.images || 1,
+      clip_skip: p.clip_skip || 0,
+      eta: p.eta != null ? p.eta : -1,
+      sigma_min: p.sigma_min != null ? p.sigma_min : -1,
+      sigma_max: p.sigma_max != null ? p.sigma_max : -1,
+      restart_sampling: !!p.restart_sampling,
+      vae: p.vae || '',
+    };
+  }
+
+  var api = {
     base: BASE,
-    // submit a ComfyUI workflow graph -> {prompt_id}
-    submitPrompt: (graph, clientId) =>
-      fetch(BASE + '/prompt', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: graph, client_id: clientId }) }).then(j),
-    interrupt: () => fetch(BASE + '/interrupt', { method: 'POST' }),
-    history: (id) => fetch(BASE + '/history' + (id ? '/' + id : '')).then(j),
-    objectInfo: (cls) => fetch(BASE + '/object_info' + (cls ? '/' + cls : '')).then(j),
-    systemStats: () => fetch(BASE + '/system_stats').then(j),
-    models: () => fetch(BASE + '/models').then(j),
-    loras: () => fetch(BASE + '/models/loras').then(j),
-    embeddings: () => fetch(BASE + '/embeddings').then(j),
-    // image url for <img>/Konva.Image
-    viewUrl: (filename, type = 'output', subfolder = '') =>
-      BASE + '/view?filename=' + encodeURIComponent(filename) + '&type=' + type + '&subfolder=' + encodeURIComponent(subfolder),
-    uploadImage: (blob, name = 'image.png') => { const f = new FormData(); f.append('image', blob, name);
-      return fetch(BASE + '/upload/image', { method: 'POST', body: f }).then(j); },
-    uploadMask: (blob, originalRef, name = 'mask.png') => { const f = new FormData();
-      f.append('image', blob, name); if (originalRef) f.append('original_ref', JSON.stringify(originalRef));
-      return fetch(BASE + '/upload/mask', { method: 'POST', body: f }).then(j); },
-    // controlnet preprocessors + SAM masking (Tier B)
-    preprocess: (method, payload) =>
-      fetch(BASE + '/canvas/preprocess/' + method, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload) }).then(j),
-    sam: (kind, payload) =>   // kind: 'text'|'points'|'exemplar'|'video'
-      fetch(BASE + '/canvas/sam3/' + kind, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload) }).then(j),
-    // websocket: progress + executing + b64 preview frames. cb({type,data})
-    connectWS(clientId, cb) {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = (BASE ? BASE.replace(/^http/, 'ws') : proto + '//' + location.host) + '/ws?clientId=' + clientId;
-      let ws;
-      try { ws = new WebSocket(url); } catch (e) { console.warn('[ws]', e); return { close() {} }; }
-      ws.binaryType = 'arraybuffer';
-      ws.onmessage = (ev) => {
-        if (typeof ev.data === 'string') { try { cb(JSON.parse(ev.data)); } catch (_) {} }
-        else cb({ type: 'preview', data: ev.data });   // binary preview frame
+    // ComfyUI shape kept; ignores the assembled graph and submits the proven /v1/generate body
+    submitPrompt: function (_graph, _clientId) {
+      return fetch(BASE + '/v1/generate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(generateBody()),
+      }).then(j).then(function (res) {
+        lastJobId = res && (res.job_id || res.id || res.prompt_id);
+        return { prompt_id: lastJobId, job_id: lastJobId };
+      });
+    },
+    interrupt: function () {
+      return fetch(BASE + '/v1/cancel', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job: lastJobId }),
+      });
+    },
+    // serenity result image, served by serenity-server's /out/* route
+    viewUrl: function (filename) { return BASE + '/out/' + encodeURIComponent(baseName(filename)); },
+    // best-effort; paramRail/topbar degrade gracefully if these reject
+    models: function () { return fetch(BASE + '/v1/models').then(j); },
+    systemStats: function () { return fetch(BASE + '/v1/health').then(j); },
+    objectInfo: function () { return Promise.reject(new Error('objectInfo n/a (using fallbacks)')); },
+    loras: function () { return Promise.resolve([]); },
+    embeddings: function () { return Promise.resolve([]); },
+    history: function () { return Promise.resolve({}); },
+    // Tier B (not wired yet) — reject so canvas degrades
+    uploadImage: function () { return Promise.reject(new Error('upload n/a')); },
+    uploadMask: function () { return Promise.reject(new Error('mask upload n/a')); },
+    preprocess: function () { return Promise.reject(new Error('preprocess n/a')); },
+    sam: function () { return Promise.reject(new Error('sam n/a')); },
+
+    // WS: translate serenity {ev:...} -> the ComfyUI-shaped messages generate_ws expects
+    connectWS: function (_clientId, cb) {
+      var job = lastJobId;
+      var wsBase = BASE ? BASE.replace(/^http/, 'ws') : ((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host);
+      var url = wsBase + '/v1/progress' + (job ? ('?job=' + encodeURIComponent(job)) : '');
+      var ws;
+      try { ws = new WebSocket(url); } catch (e) { console.warn('[api] ws open failed', e); return { close: function () {} }; }
+      ws.onmessage = function (ev) {
+        var m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+        var which = (m.ev || '').toLowerCase();
+        if (which === 'progress') {
+          cb({ type: 'progress', data: { value: m.step || 0, max: m.total || 0, prompt_id: job } });
+        } else if (which === 'done') {
+          var fn = baseName(m.output_path);
+          cb({ type: 'executed', data: { prompt_id: job, output: { images: [{ filename: fn, type: 'output', subfolder: '' }] } } });
+          cb({ type: 'executing', data: { node: null, prompt_id: job } });
+        } else if (which === 'failed') {
+          cb({ type: 'execution_error', data: { prompt_id: job, error: m.error || 'failed' } });
+        } else if (which === 'cancelled') {
+          cb({ type: 'executing', data: { node: null, prompt_id: job } });
+        }
+        // 'ready' -> ignore
       };
-      ws.onerror = (e) => console.warn('[ws] error', e);
+      ws.onerror = function (e) { console.warn('[api] ws error', e); };
       return ws;
     },
   };

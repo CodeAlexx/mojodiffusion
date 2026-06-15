@@ -1192,6 +1192,58 @@ async fn post_cancel_path(State(st): State<AppState>, Path(id): Path<String>) ->
 /// client that connects AFTER a fast job already finished still gets the full
 /// history (incl. the terminal Done) replayed, because the entry is retained for a
 /// grace window past terminal.
+// ---- Serenity Studio static frontend + browser-fetchable result images ----
+const CANVAS_DIR: &str = "/home/alex/mojodiffusion/serenity-server/canvas";
+
+fn static_content_type(p: &std::path::Path) -> &'static str {
+    match p.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+fn serve_static_file(base: &std::path::Path, rel: &str) -> Response {
+    if rel.contains("..") {
+        return (StatusCode::BAD_REQUEST, "bad path").into_response();
+    }
+    let mut p = base.to_path_buf();
+    for seg in rel.split('/').filter(|s| !s.is_empty()) {
+        p.push(seg);
+    }
+    match std::fs::read(&p) {
+        Ok(bytes) => {
+            ([(axum::http::header::CONTENT_TYPE, static_content_type(&p))], bytes).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// Fallback: serve the Konva frontend (index.html + js/css/lib) from CANVAS_DIR.
+async fn serve_canvas(uri: axum::http::Uri) -> Response {
+    let path = uri.path();
+    let rel = if path == "/" || path.is_empty() {
+        "index.html"
+    } else {
+        path.trim_start_matches('/')
+    };
+    serve_static_file(std::path::Path::new(CANVAS_DIR), rel)
+}
+
+/// Serve a result image (out_dir/<path>) so the browser can display it.
+async fn serve_out(
+    State(st): State<AppState>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response {
+    serve_static_file(st.out_dir.as_path(), &path)
+}
+
 async fn ws_progress(
     State(st): State<AppState>,
     Query(q): Query<ProgressQuery>,
@@ -1680,6 +1732,9 @@ async fn main() -> anyhow::Result<()> {
             "/v1/presets/:name",
             get(get_preset_one).post(post_preset_named).delete(delete_preset),
         )
+        // --- Serenity Studio Konva frontend (static) + browser-fetchable result images ---
+        .route("/out/*path", get(serve_out))
+        .fallback(serve_canvas)
         .with_state(state);
 
     // 4. Serve on 127.0.0.1:<port>.

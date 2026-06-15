@@ -18,10 +18,15 @@
       "#wf-bar .wf-b{font-size:12px;padding:6px 10px}",
       "#wf-canvas{flex:1;position:relative;overflow:hidden;",
       "  background-color:#11131a;background-image:linear-gradient(#1c2030 1px,transparent 1px),linear-gradient(90deg,#1c2030 1px,transparent 1px);background-size:24px 24px}",
+      "#wf-stage{position:absolute;inset:0}",
       "#wf-menu{position:absolute;z-index:5;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:4px;display:none;min-width:170px}",
       "#wf-menu.show{display:block}",
       "#wf-menu button{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--text);padding:7px 10px;border-radius:5px;cursor:pointer;font-size:12px}",
       "#wf-menu button:hover{background:var(--accent2);color:#fff}",
+      "#wf-bar .wf-prompt{flex:1;min-width:120px}",
+      "#wf-bar .wf-model{cursor:pointer}",
+      "#wf-result{position:absolute;top:12px;right:12px;z-index:6;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:6px}",
+      "#wf-result .wf-result-img{display:block;max-width:280px;max-height:280px;border-radius:6px}",
     ].join("\n");
     var st = document.createElement("style"); st.id = "style-workflows"; st.textContent = css;
     document.head.appendChild(st);
@@ -40,23 +45,29 @@
   S.register("workflows", {
     init: function (ctx) {
       injectCSS();
-      var Konva = ctx.Konva, bus = ctx.bus;
+      var Konva = ctx.Konva, bus = ctx.bus, api = ctx.api, set = ctx.set, get = ctx.get;
       var host = document.getElementById("view-workflows");
       if (!host) { console.warn("[workflows] #view-workflows not found"); return; }
 
       // ---- toolbar ----
       var bar = el("div"); bar.id = "wf-bar";
       var name = el("input", "wf-name"); name.value = "Untitled Workflow";
+      var modelSel = el("select", "wf-b wf-model");
+      [["Z-Image (base)", "z-image"], ["Ideogram4", "ideogram4"]].forEach(function (o) {
+        var op = el("option", null, o[0]); op.value = o[1]; modelSel.appendChild(op);
+      });
       var add = el("button", "btn wf-b", "+ Add Node");
-      var sp = el("div", "wf-sp");
+      var promptIn = el("input", "wf-prompt"); promptIn.placeholder = "Prompt for this workflow…";
       var tpl = el("button", "btn wf-b", "Templates");
       var load = el("button", "btn wf-b", "Load");
       var save = el("button", "btn wf-b", "Save");
       var queue = el("button", "btn btn-primary wf-b", "▶ Queue");
-      [name, add, sp, tpl, load, save, queue].forEach(function (n) { bar.appendChild(n); });
+      [name, modelSel, add, promptIn, tpl, load, save, queue].forEach(function (n) { bar.appendChild(n); });
 
       var cv = el("div"); cv.id = "wf-canvas";
+      var stageHost = el("div"); stageHost.id = "wf-stage";  // Konva owns (and wipes) THIS
       var menu = el("div"); menu.id = "wf-menu";
+      cv.appendChild(stageHost);   // keep menu/result panel as cv siblings, not inside Konva's container
       cv.appendChild(menu);
       host.appendChild(bar); host.appendChild(cv);
 
@@ -78,7 +89,7 @@
       function build() {
         if (built) return;
         var w = cv.clientWidth || 1200, h = cv.clientHeight || 700;
-        stage = new Konva.Stage({ container: cv, width: w, height: h, draggable: true });
+        stage = new Konva.Stage({ container: stageHost, width: w, height: h, draggable: true });
         wireLayer = new Konva.Layer(); nodeLayer = new Konva.Layer();
         stage.add(wireLayer); stage.add(nodeLayer);
         // zoom on wheel (around pointer)
@@ -171,10 +182,43 @@
         redrawWires(); nodeLayer.batchDraw();
       }
 
+      // result preview panel (top-right of the canvas)
+      var resPanel = el("div"); resPanel.id = "wf-result"; resPanel.style.display = "none"; cv.appendChild(resPanel);
+      function showResult(url) {
+        resPanel.innerHTML = "";
+        var img = new Image(); img.className = "wf-result-img"; img.src = url;
+        resPanel.appendChild(img); resPanel.style.display = "block";
+      }
+      // robust display: any finished result (this workflow OR elsewhere) shows here
+      bus.on("result:ready", function (p) { if (p && p.url) showResult(p.url); });
+      // Queue -> run the workflow via the PROVEN /v1/generate path. The server swaps
+      // the worker binary by model (z-image <-> ideogram4), so picking Ideogram4 here
+      // routes to serenity_worker_ideogram4.
       queue.addEventListener("click", function () {
-        // v1: workflow execution wires to /prompt later; for now just acknowledge.
-        queue.textContent = "▶ Queued (exec TODO)"; setTimeout(function () { queue.textContent = "▶ Queue"; }, 1500);
-        console.info("[workflows] Queue clicked — graph has", nodes.length, "nodes,", wires.length, "wires");
+        set("params.model", modelSel.value);
+        if (promptIn.value.trim()) set("params.prompt", promptIn.value);
+        queue.disabled = true; queue.textContent = "▶ …";
+        api.connectWS(ctx.clientId, function (msg) {
+          if (!msg) return;
+          if (msg.type === "progress") {
+            var d = msg.data || {}; queue.textContent = "▶ " + (d.value || 0) + "/" + (d.max || 0);
+          } else if (msg.type === "executed") {
+            var imgs = (msg.data && msg.data.output && msg.data.output.images) || [];
+            if (imgs[0]) {
+              var url = api.viewUrl(imgs[0].filename);
+              showResult(url);
+              bus.emit("result:ready", { url: url, filename: imgs[0].filename, params: {} });
+            }
+          } else if (msg.type === "executing" && msg.data && msg.data.node === null) {
+            queue.disabled = false; queue.textContent = "▶ Queue";
+          } else if (msg.type === "execution_error") {
+            queue.disabled = false; queue.textContent = "▶ Queue (error)";
+            console.error("[workflows] exec error", msg.data);
+          }
+        });
+        api.submitPrompt(null, ctx.clientId)
+          .then(function (res) { console.info("[workflows] queued", res && res.job_id, "model=", modelSel.value); })
+          .catch(function (e) { queue.disabled = false; queue.textContent = "▶ Queue (failed)"; console.warn("[workflows] submit failed", e); });
       });
       [tpl, load, save].forEach(function (b) { b.addEventListener("click", function () { console.info("[workflows]", b.textContent, "(TODO)"); }); });
 

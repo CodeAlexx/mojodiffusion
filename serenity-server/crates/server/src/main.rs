@@ -383,6 +383,28 @@ fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>, id: &str, ev: &
     }
 }
 
+fn kind_from_bin(bin: &std::path::Path) -> String {
+    let name = bin.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if name.contains("ideogram") { "ideogram4".to_string() }
+    else if name.contains("stub") { "stub".to_string() }
+    else { "zimage".to_string() }
+}
+
+/// Map a request's model -> (kind, worker binary in the same dir). One GPU = one
+/// resident model, so the driver swaps the worker binary when the kind changes.
+fn worker_for_model(cur_bin: &std::path::Path, model: &str) -> (String, PathBuf) {
+    let dir = cur_bin
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("output/bin"));
+    let m = model.to_lowercase();
+    if m.contains("ideogram") {
+        ("ideogram4".to_string(), dir.join("serenity_worker_ideogram4"))
+    } else {
+        ("zimage".to_string(), dir.join("serenity_worker_zimage"))
+    }
+}
+
 fn run_worker_driver(
     worker_bin: PathBuf,
     worker_args: Vec<String>,
@@ -393,6 +415,10 @@ fn run_worker_driver(
     prior: Arc<Vec<[String; 6]>>,
     db_path: PathBuf,
 ) {
+    // worker_bin/current_kind are mutable so the driver can SWAP the worker binary
+    // when a job needs a different model (one GPU = one resident model at a time).
+    let mut worker_bin = worker_bin;
+    let mut current_kind = kind_from_bin(&worker_bin);
     // `handle` is Option so we can drop a dead worker and respawn lazily on the next
     // job (mirrors process_isolated_backend: a peer-close fails the job, the next
     // start() respawns). It starts None and is brought up on first need / handshake.
@@ -449,6 +475,22 @@ fn run_worker_driver(
                 continue;
             }
         };
+
+        // Per-job model -> worker SWAP (single GPU: one resident model at a time).
+        // The CPU 'stub' worker serves everything, so never swap it out.
+        if current_kind != "stub" {
+            let (want_kind, want_bin) = worker_for_model(&worker_bin, &params.model);
+            if want_kind != current_kind && want_bin.exists() {
+                tracing::info!(%job_id, from = %current_kind, to = %want_kind, "swapping worker for model");
+                if let Some(mut h) = handle.take() {
+                    h.kill(); // SIGKILL + wait -> process dies -> GPU driver reclaims its VRAM
+                }
+                // brief settle so the GPU fully releases before the next model loads
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                worker_bin = want_bin;
+                current_kind = want_kind;
+            }
+        }
 
         // Lazily (re)spawn if we have no live worker (first job, or after a prior
         // peer-close).

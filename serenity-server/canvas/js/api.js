@@ -31,6 +31,10 @@
       sigma_min: p.sigma_min != null ? p.sigma_min : -1,
       sigma_max: p.sigma_max != null ? p.sigma_max : -1,
       restart_sampling: !!p.restart_sampling, vae: p.vae || '',
+      sigma_shift: p.sigma_shift != null ? p.sigma_shift : 3.0,
+      cfg_override: p.cfg_override != null ? p.cfg_override : -1,
+      cfg_override_start_percent: p.cfg_override_start_percent != null ? p.cfg_override_start_percent : 0.0,
+      cfg_override_end_percent: p.cfg_override_end_percent != null ? p.cfg_override_end_percent : 1.0,
     };
   }
 

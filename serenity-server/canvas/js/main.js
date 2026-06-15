@@ -3,7 +3,7 @@
 (function () {
   "use strict";
   const S = window.Serenity;
-  const EXPECTED = ["topbar","paramRail","promptBar","canvasCore","bbox","layers","toolsBrush","controlnet","sam","generateWS","gallery","resultView","navShell","workflows"];
+  const EXPECTED = ["topbar","paramRail","promptBar","canvasCore","bbox","layers","toolsBrush","controlnet","sam","generateWS","gallery","resultView","navShell","workflows","bboxBuilder"];
 
   function boot() {
     const ctx = {

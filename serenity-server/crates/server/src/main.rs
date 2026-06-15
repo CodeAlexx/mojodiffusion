@@ -215,6 +215,12 @@ struct GenerateRequest {
     #[serde(default)]
     sigma_shift: Option<f64>,
     #[serde(default)]
+    cfg_override: Option<f64>,
+    #[serde(default)]
+    cfg_override_start_percent: Option<f64>,
+    #[serde(default)]
+    cfg_override_end_percent: Option<f64>,
+    #[serde(default)]
     images: Option<i64>,
     #[serde(default)]
     creativity: Option<f64>,
@@ -987,6 +993,15 @@ async fn post_generate(
     // Workflow-lowered extras (only present after lower_request).
     if let Some(v) = req.sigma_shift {
         params.sigma_shift = v;
+    }
+    if let Some(v) = req.cfg_override {
+        params.cfg_override = v;
+    }
+    if let Some(v) = req.cfg_override_start_percent {
+        params.cfg_override_start_percent = v;
+    }
+    if let Some(v) = req.cfg_override_end_percent {
+        params.cfg_override_end_percent = v;
     }
     if let Some(v) = req.images {
         params.images = v;

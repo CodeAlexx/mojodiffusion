@@ -164,6 +164,35 @@ def _ideogram4_flow_percent_to_sigma(percent: Float64, sigma_shift: Float64) -> 
     return _ideogram4_flow_sigma(1.0 - percent, sigma_shift)
 
 
+def _extend_intermediate_sigmas(
+    sigmas: List[Float32], steps: Int, start_at: Float32, end_at: Float32
+) raises -> List[Float32]:
+    # Faithful port of ComfyUI ExtendIntermediateSigmas (linear spacing), as used
+    # by the KJ Ideogram-4 unconditional recipe: ExtendIntermediateSigmas(steps=2,
+    # start_at_sigma=1, end_at_sigma=0.98, 'linear'). For each adjacent sigma pair
+    # whose CURRENT sigma is in [end_at, start_at], insert linspace(0,1,steps+1)[1:-1]
+    # interpolation points. This refines the first high-noise steps where the
+    # AuraFlow trajectory commits to image-vs-safety-block.
+    var out = List[Float32]()
+    var n = len(sigmas)
+    if n == 0:
+        return out^
+    # computed_spacing = linspace(0, 1, steps+1)[1:-1] with the linear interpolator
+    # (identity): values k/steps for k in 1..steps-1.
+    var spacing = List[Float32]()
+    for k in range(1, steps):
+        spacing.append(Float32(Float64(k) / Float64(steps)))
+    for i in range(n - 1):
+        var cur = sigmas[i]
+        var nxt = sigmas[i + 1]
+        out.append(cur)
+        if cur >= end_at and cur <= start_at:
+            for k in range(len(spacing)):
+                out.append(cur + spacing[k] * (nxt - cur))
+    out.append(sigmas[n - 1])
+    return out^
+
+
 def _write_text_file(path: String, content: String) raises:
     var fd = sys_open(path, O_CREAT | O_WRONLY | O_TRUNC, Int32(0o644))
     if fd < 0:
@@ -550,6 +579,15 @@ struct Ideogram4Backend(GenBackend, Movable):
             self.sigma_trace = _build_ideogram4_simple_sigmas(
                 self.params.steps, self.params.sigma_shift
             )
+            # KJ Ideogram-4 unconditional recipe inserts ExtendIntermediateSigmas
+            # between the BasicScheduler and the sampler. Replicate it on the KJ
+            # path (cfg_override set) so the early high-noise trajectory matches
+            # ComfyUI; bump the loop's step count to the extended length.
+            if self.params.cfg_override >= 0.0:
+                self.sigma_trace = _extend_intermediate_sigmas(
+                    self.sigma_trace, 2, Float32(1.0), Float32(0.98)
+                )
+                self.params.steps = len(self.sigma_trace) - 1
         else:
             self.intervals = make_step_intervals(self.params.steps)
             var mean = ideogram4_schedule_mean(1024, 1024, 0.0)

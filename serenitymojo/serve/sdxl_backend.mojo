@@ -60,6 +60,7 @@ from serenitymojo.tokenizer.clip_tokenizer import ClipTokenizer
 from serenitymojo.models.text_encoder.clip_encoder import ClipEncoder, ClipConfig
 from serenitymojo.models.dit.sdxl_unet import SDXLUNet
 from serenitymojo.models.vae.ldm_decoder import load_sdxl_ldm_decoder
+from serenitymojo.models.vae.sdxl_tiled_decode import sdxl_tiled_decode
 from serenitymojo.registry.checkpoints import default_manifest_by_id
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
@@ -501,10 +502,9 @@ struct SdxlBackend(GenBackend, Movable):
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
-        print("[sdxl] loading VAE decoder + decode")
+        print("[sdxl] tiled VAE decode (3x3 overlap) + save")
         var manifest = default_manifest_by_id(String("sdxl"))
-        var vae = load_sdxl_ldm_decoder[LH, LW](manifest.vae_path, self.ctx)
-        var img = vae.decode(latent, self.ctx)
+        var img = sdxl_tiled_decode[LH, LW](latent, manifest.vae_path, self.ctx)
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
         return png_path
 

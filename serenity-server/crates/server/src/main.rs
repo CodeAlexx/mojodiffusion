@@ -393,6 +393,7 @@ fn kind_from_bin(bin: &std::path::Path) -> String {
     let name = bin.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if name.contains("ideogram") { "ideogram4".to_string() }
     else if name.contains("qwen") { "qwenimage".to_string() }
+    else if name.contains("sdxl") { "sdxl".to_string() }
     else if name.contains("stub") { "stub".to_string() }
     else { "zimage".to_string() }
 }
@@ -409,6 +410,8 @@ fn worker_for_model(cur_bin: &std::path::Path, model: &str) -> (String, PathBuf)
         ("ideogram4".to_string(), dir.join("serenity_worker_ideogram4"))
     } else if m.contains("qwen") {
         ("qwenimage".to_string(), dir.join("serenity_worker_qwenimage"))
+    } else if m.contains("sdxl") {
+        ("sdxl".to_string(), dir.join("serenity_worker_sdxl"))
     } else {
         ("zimage".to_string(), dir.join("serenity_worker_zimage"))
     }

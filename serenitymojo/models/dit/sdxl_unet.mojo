@@ -193,10 +193,14 @@ def _bcast_add_channel(x: Tensor, b: Tensor, rows: Int, c: Int, ctx: DeviceConte
 
 
 # ── SDXLUNet ──────────────────────────────────────────────────────────────────
-struct SDXLUNet[LH: Int, LW: Int]:
+struct SDXLUNet[LH: Int, LW: Int](Movable):
     """All-resident SDXL UNet. Owns every weight (ArcPointer; Tensor is
     Movable-not-Copyable). Conv weights are converted to RSCF at load. comptime
-    (LH, LW) = latent spatial size; SDXL 1024² -> [128,128]."""
+    (LH, LW) = latent spatial size; SDXL 1024² -> [128,128].
+
+    Movable so it can be held in `List[ArcPointer[SDXLUNet[LH,LW]]]` for resident
+    caching in serve/sdxl_backend.mojo (matches QwenImageDitOffloaded(Movable));
+    all fields are already movable so the synthesized __moveinit__ is valid."""
 
     var weights: List[ArcPointer[Tensor]]
     var name_to_idx: Dict[String, Int]

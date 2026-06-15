@@ -394,6 +394,12 @@ fn kind_from_bin(bin: &std::path::Path) -> String {
     if name.contains("ideogram") { "ideogram4".to_string() }
     else if name.contains("qwen") { "qwenimage".to_string() }
     else if name.contains("sdxl") { "sdxl".to_string() }
+    else if name.contains("klein") { "flux2".to_string() }
+    else if name.contains("sd3") { "sd3".to_string() }
+    else if name.contains("sensenova") { "sensenova".to_string() }
+    else if name.contains("anima") { "anima".to_string() }
+    else if name.contains("lens") { "lens".to_string() }
+    else if name.contains("flux") { "flux".to_string() }
     else if name.contains("stub") { "stub".to_string() }
     else { "zimage".to_string() }
 }
@@ -412,6 +418,18 @@ fn worker_for_model(cur_bin: &std::path::Path, model: &str) -> (String, PathBuf)
         ("qwenimage".to_string(), dir.join("serenity_worker_qwenimage"))
     } else if m.contains("sdxl") {
         ("sdxl".to_string(), dir.join("serenity_worker_sdxl"))
+    } else if m.contains("klein") || m.contains("flux2") {
+        ("flux2".to_string(), dir.join("serenity_worker_klein"))
+    } else if m.contains("sd3") || m.contains("sd35") {
+        ("sd3".to_string(), dir.join("serenity_worker_sd3"))
+    } else if m.contains("sensenova") {
+        ("sensenova".to_string(), dir.join("serenity_worker_sensenova"))
+    } else if m.contains("anima") {
+        ("anima".to_string(), dir.join("serenity_worker_anima"))
+    } else if m.contains("lens") {
+        ("lens".to_string(), dir.join("serenity_worker_lens"))
+    } else if m.contains("flux") {
+        ("flux".to_string(), dir.join("serenity_worker_flux"))
     } else {
         ("zimage".to_string(), dir.join("serenity_worker_zimage"))
     }

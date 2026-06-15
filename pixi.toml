@@ -56,6 +56,10 @@ build-worker-zimage-raw = "mkdir -p output/bin && mojo build --optimization-leve
 # RAW (no mem_safe) optimized ideogram4 worker build — same outer-systemd-scope
 # contract as build-worker-zimage-raw (CALLER wraps it in a MemoryMax scope).
 build-worker-ideogram4-raw = "mkdir -p output/bin && mojo build --optimization-level 2 --num-threads 4 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_ideogram4.mojo -o output/bin/serenity_worker_ideogram4"
+
+# RAW (no mem_safe) optimized Qwen-Image worker build — same outer-systemd-scope
+# contract as build-worker-zimage-raw (CALLER wraps it in a MemoryMax scope).
+build-worker-qwenimage-raw = "mkdir -p output/bin && mojo build --optimization-level 2 --num-threads 4 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib serenitymojo/serve/serenity_worker_qwenimage.mojo -o output/bin/serenity_worker_qwenimage"
 build-klein-precache = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/pipeline/klein9b_precache_sample_prompts.mojo -o output/bin/klein_precache_sample_prompts"
 build-klein-sampler = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/sampling/klein_sample_cli.mojo -o output/bin/klein_sample_cli"
 build-sdxl-cli = "mkdir -p output/bin && mojo build --target-accelerator sm_86 -I . -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda serenitymojo/pipeline/sdxl_sample_cli.mojo -o output/bin/sdxl_sample_cli"

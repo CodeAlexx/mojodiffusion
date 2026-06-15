@@ -265,13 +265,25 @@ def sampler_admission_for_backend(
             ),
         )
     if b == "qwenimage":
+        if normalized == "euler" or normalized == "flowmatch_euler":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("qwenimage_flowmatch_euler"),
+                String("backend executes the Qwen-Image flow-match Euler denoise loop (offloaded DiT)"),
+            )
         return SamplerAdmission(
             False,
             b,
             requested,
             normalized,
             String(""),
-            String("Qwen/Qwen-Image/Qwen-Edit is metadata-only in this slice and must not execute until memory/offload work is ready"),
+            String(
+                "Qwen-Image currently supports only euler/flowmatch_euler over its "
+                + "flow-match denoise loop; other catalog samplers remain fail-loud"
+            ),
         )
     if b == "ideogram4":
         if normalized == "euler" or normalized == "flowmatch_euler":
@@ -409,13 +421,25 @@ def scheduler_admission_for_backend(
             ),
         )
     if b == "qwenimage":
+        if normalized == "simple":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("qwenimage_simple"),
+                String("backend executes the Qwen-Image simple flow-match schedule"),
+            )
         return SamplerAdmission(
             False,
             b,
             requested,
             normalized,
             String(""),
-            String("Qwen/Qwen-Image/Qwen-Edit scheduler metadata is recognized but execution is disabled in this slice"),
+            String(
+                "Qwen-Image currently supports only the simple flow-match schedule; "
+                + "other catalog schedulers remain fail-loud"
+            ),
         )
     if b == "ideogram4":
         if normalized == "ideogram_logitnormal":

@@ -3,7 +3,7 @@
 (function () {
   "use strict";
   const S = window.Serenity;
-  const EXPECTED = ["topbar","paramRail","canvasCore","bbox","layers","toolsBrush","controlnet","sam","generateWS","gallery"];
+  const EXPECTED = ["topbar","paramRail","promptBar","canvasCore","bbox","layers","toolsBrush","controlnet","sam","generateWS","gallery"];
 
   function boot() {
     const ctx = {
@@ -13,6 +13,7 @@
         topbar: document.getElementById('topbar'),
         tooldock: document.getElementById('tooldock'),
         paramRail: document.getElementById('param-rail'),
+        promptBar: document.getElementById('prompt-bar'),
         canvasHost: document.getElementById('canvas-host'),
         canvasToolbar: document.getElementById('canvas-toolbar'),
         konvaStage: document.getElementById('konva-stage'),

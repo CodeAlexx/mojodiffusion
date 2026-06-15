@@ -145,28 +145,18 @@
         advBtn.classList.toggle("on", !!v);
       });
 
-      // ===================== PROMPTS =====================
-      var prompt = el("textarea", {
-        class: "pr-prompt", placeholder: "Describe what to generate…", rows: 3,
+      // ===================== Filter parameters (SwarmUI) =====================
+      // prompt + negative now live in the bottom prompt bar (prompt_bar.js).
+      var filterBox = el("input", { type: "text", class: "pr-filter", placeholder: "Filter parameters…" });
+      filterBox.addEventListener("input", function () {
+        var q = filterBox.value.trim().toLowerCase();
+        root.querySelectorAll(".pr-section").forEach(function (sec) {
+          if (sec.classList.contains("pr-keep")) return;
+          var t = (sec.textContent || "").toLowerCase();
+          sec.style.display = (!q || t.indexOf(q) >= 0) ? "" : "none";
+        });
       });
-      prompt.value = get("params.prompt") || "";
-      prompt.addEventListener("input", function () { set("params.prompt", prompt.value); });
-
-      var neg = el("textarea", {
-        class: "pr-neg", placeholder: "What to avoid…", rows: 2,
-      });
-      neg.value = get("params.negative") || "";
-      neg.addEventListener("input", function () { set("params.negative", neg.value); });
-
-      var negGroup = el("details", { class: "group pr-section" }, [
-        el("summary", { text: "Negative prompt" }),
-        el("div", { class: "pr-body" }, [neg]),
-      ]);
-
-      root.appendChild(el("div", { class: "pr-section" }, [
-        el("label", { class: "pr-lbl", text: "Prompt" }), prompt,
-      ]));
-      root.appendChild(negGroup);
+      root.appendChild(el("div", { class: "pr-section pr-keep" }, [filterBox]));
 
       // ===================== ASPECT + RESOLUTION =====================
       var aspectSel = el("select");
@@ -416,9 +406,31 @@
       ]);
       root.appendChild(refGroup);
 
-      // ===================== GENERATE button (rendered here; generateWS binds behavior) =====================
-      var genBtn = el("button", { id: "btn-generate", class: "btn btn-primary", type: "button", text: "Generate" });
-      root.appendChild(el("div", { class: "pr-section pr-gen" }, [genBtn]));
+      // ===================== Display Advanced Options? (SwarmUI checkbox) =====================
+      var advChk = el("input", { type: "checkbox" });
+      advChk.checked = !!get("ui.advanced");
+      advChk.addEventListener("change", function () { set("ui.advanced", advChk.checked); });
+      bus.on("change:ui.advanced", function (v) { advChk.checked = !!v; });
+      root.appendChild(el("div", { class: "pr-section pr-keep" }, [
+        el("label", { class: "row", style: "min-width:0;color:var(--text);cursor:pointer" },
+          [advChk, el("span", { text: " Display Advanced Options?" })]),
+      ]));
+
+      // ===================== Model selector (SwarmUI: bottom of rail) =====================
+      var modelSel = el("select", { class: "pr-model" });
+      fillSelect(modelSel, ["— select model —"], get("params.model") || null);
+      modelSel.addEventListener("change", function () { set("params.model", modelSel.value); });
+      bus.on("change:params.model", function (v) { if (v != null && modelSel.value !== v) modelSel.value = v; });
+      root.appendChild(el("div", { class: "pr-section pr-keep" }, [
+        el("label", { class: "pr-lbl", text: "Model" }), modelSel,
+      ]));
+      if (api && typeof api.models === "function") {
+        Promise.resolve().then(function () { return api.models(); }).then(function (list) {
+          var names = normalizeList(list);
+          if (names && names.length) fillSelect(modelSel, ["— select model —"].concat(names), get("params.model"));
+        }).catch(function () {});
+      }
+      // Generate button now lives in the bottom prompt bar (prompt_bar.js -> #btn-generate).
 
       // -----------------------------------------------------------------
       // Populate sampler/scheduler/lora/refiner-model lists from the API.

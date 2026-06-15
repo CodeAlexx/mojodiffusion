@@ -54,15 +54,37 @@ def _workflow_type_id(node: JSONValue) raises -> String:
 
 
 def _workflow_named_sampler_name(type_id: String) -> String:
-    """Map a named-SAMPLER node type to its Comfy sampler catalog name (or "")."""
+    """Map a named-SAMPLER node type to its Comfy sampler catalog name (or "").
+
+    Names are the exact comfy.samplers catalog strings each
+    nodes_custom_sampler.py class passes to KSAMPLER/sampler_object. Only
+    SamplerEuler (-> "euler") is in the worker's supported list; the rest gate
+    fail-loud [501] (see _workflow_worker_supports_sampler).
+    """
+    if type_id == "SamplerEuler":
+        return String("euler")
     if type_id == "SamplerEulerAncestral":
         return String("euler_ancestral")
+    if type_id == "SamplerEulerAncestralCFGPP":
+        return String("euler_ancestral_cfg_pp")
     if type_id == "SamplerDPMPP_2M_SDE":
         return String("dpmpp_2m_sde")
     if type_id == "SamplerDPMPP_3M_SDE":
         return String("dpmpp_3m_sde")
+    if type_id == "SamplerDPMPP_SDE":
+        return String("dpmpp_sde")
+    if type_id == "SamplerDPMPP_2S_Ancestral":
+        return String("dpmpp_2s_ancestral")
+    if type_id == "SamplerDPMAdaptative":
+        return String("dpm_adaptive")
     if type_id == "SamplerLMS":
         return String("lms")
+    if type_id == "SamplerER_SDE":
+        return String("er_sde")
+    if type_id == "SamplerSASolver":
+        return String("sa_solver")
+    if type_id == "SamplerSEEDS2":
+        return String("seeds_2")
     return String("")
 
 
@@ -71,7 +93,14 @@ def _workflow_is_named_sampler_node(type_id: String) -> Bool:
 
 
 def _workflow_named_scheduler_name(type_id: String) -> String:
-    """Map a named-SIGMAS node type to its Comfy scheduler catalog name (or "")."""
+    """Map a named-SIGMAS node type to its Comfy scheduler catalog name (or "").
+
+    vp/laplace/polyexponential/turbo are not SCHEDULER_NAMES combo entries (they
+    are produced by their own get_sigmas_* functions), but the node TYPE still
+    names the schedule, so we carry that name and let the worker gate decide:
+    none of these is in the worker's supported list, so they fail-loud [501]
+    (beta IS a combo name but still absent from the worker).
+    """
     if type_id == "KarrasScheduler":
         return String("karras")
     if type_id == "ExponentialScheduler":
@@ -80,6 +109,12 @@ def _workflow_named_scheduler_name(type_id: String) -> String:
         return String("polyexponential")
     if type_id == "SDTurboScheduler":
         return String("turbo")
+    if type_id == "VPScheduler":
+        return String("vp")
+    if type_id == "BetaSamplingScheduler":
+        return String("beta")
+    if type_id == "LaplaceScheduler":
+        return String("laplace")
     return String("")
 
 
@@ -1326,6 +1361,13 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
             fields.set("value", widgets[0].copy())
     elif type_id == "InpaintModelConditioning":
         fields.set("noise_mask", JSONValue.from_bool(_workflow_widget_bool(widgets, 0, True)))
+    elif type_id == "VAEEncodeForInpaint":
+        # Comfy widget order: [grow_mask_by(int)]. Carried for parity but the
+        # flat model has no mask-grow control; the handler aliases to inpaint_*.
+        fields.set("grow_mask_by", JSONValue.from_int(_workflow_widget_int(widgets, 0, 6)))
+    elif type_id == "RepeatLatentBatch":
+        # Comfy widget order: [amount(int)] — the batch-repeat count.
+        fields.set("amount", JSONValue.from_int(_workflow_widget_int(widgets, 0, 1)))
     elif type_id == "SaveImage":
         fields.set("filename_prefix", JSONValue.from_string(_workflow_widget_string(widgets, 0, String("ComfyUI"))))
     elif type_id == "ImageToMask":
@@ -1344,10 +1386,16 @@ def _comfy_ui_widget_fields(type_id: String, widgets: JSONValue) raises -> JSONV
         type_id == "KarrasScheduler"
         or type_id == "ExponentialScheduler"
         or type_id == "PolyexponentialScheduler"
+        or type_id == "VPScheduler"
+        or type_id == "LaplaceScheduler"
     ):
-        # Comfy widget order: [steps, sigma_max, sigma_min, rho?]. Only steps has
-        # a flat slot; the sigma_max/min/rho shape params have no flat
-        # representation (the scheduler name itself gates fail-loud below).
+        # Comfy widget order: [steps, <shape params: sigma_max/min/rho or
+        # beta_d/beta_min/eps_s or mu/sigma>]. Only steps has a flat slot; the
+        # shape params have no flat representation (the scheduler name itself
+        # gates fail-loud below — none of these is worker-supported).
+        fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 0, 20)))
+    elif type_id == "BetaSamplingScheduler":
+        # Comfy widget order: [steps, alpha, beta]. Only steps is flat.
         fields.set("steps", JSONValue.from_int(_workflow_widget_int(widgets, 0, 20)))
     elif type_id == "SDTurboScheduler":
         # Comfy widget order: [steps, denoise].
@@ -1559,7 +1607,7 @@ def _comfy_api_output_port(graph: JSONValue, src_id: Int, slot: Int) raises -> S
     elif typ == "EmptyLatentImage" or typ == "EmptySD3LatentImage" or typ == "EmptyFlux2LatentImage":
         if slot == 0:
             return String("LATENT")
-    elif typ == "VAEEncode":
+    elif typ == "VAEEncode" or typ == "VAEEncodeForInpaint" or typ == "RepeatLatentBatch":
         if slot == 0:
             return String("LATENT")
     elif typ == "SetLatentNoiseMask":
@@ -1800,6 +1848,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "EmptySD3LatentImage"
             or type_id == "EmptyFlux2LatentImage"
             or type_id == "VAEEncode"
+            or type_id == "VAEEncodeForInpaint"
+            or type_id == "RepeatLatentBatch"
             or type_id == "SetLatentNoiseMask"
             or type_id == "GetImageSize"
             or type_id == "GetImageSizeAndCount"
@@ -1827,14 +1877,25 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             or type_id == "BasicScheduler"
             or type_id == "RandomNoise"
             or type_id == "KSamplerSelect"
+            or type_id == "SamplerEuler"
             or type_id == "SamplerEulerAncestral"
+            or type_id == "SamplerEulerAncestralCFGPP"
             or type_id == "SamplerDPMPP_2M_SDE"
             or type_id == "SamplerDPMPP_3M_SDE"
+            or type_id == "SamplerDPMPP_SDE"
+            or type_id == "SamplerDPMPP_2S_Ancestral"
+            or type_id == "SamplerDPMAdaptative"
             or type_id == "SamplerLMS"
+            or type_id == "SamplerER_SDE"
+            or type_id == "SamplerSASolver"
+            or type_id == "SamplerSEEDS2"
             or type_id == "KarrasScheduler"
             or type_id == "ExponentialScheduler"
             or type_id == "PolyexponentialScheduler"
             or type_id == "SDTurboScheduler"
+            or type_id == "VPScheduler"
+            or type_id == "BetaSamplingScheduler"
+            or type_id == "LaplaceScheduler"
             or type_id == "SamplerCustom"
             or type_id == "SamplerCustomAdvanced"
             or type_id == "LanPaint_SamplerCustomAdvanced"
@@ -2604,6 +2665,88 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
                     latent_init_images.append(init_path)
                     latent_mask_images.append(String(""))
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "VAEEncodeForInpaint":
+                # Encode pixels to a LATENT + attach the inpaint mask. Same flat
+                # effect as InpaintModelConditioning's mask half (aliases to
+                # inpaint_* params); no conditioning here. grow_mask_by has no flat
+                # representation and is read only to validate range.
+                var pixels_link = _workflow_find_input_link(edges, node_id, String("pixels"))
+                var vae_link = _workflow_find_input_link(edges, node_id, String("vae"))
+                var mask_link = _workflow_find_input_link(edges, node_id, String("mask"))
+                if not pixels_link.found or not vae_link.found or not mask_link.found:
+                    raise Error("[501] workflow graph VAEEncodeForInpaint missing required typed input")
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, pixels_link.node_id, pixels_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, vae_link.node_id, vae_link.port) >= 0
+                    and _workflow_value_index(value_nodes, value_ports, mask_link.node_id, mask_link.port) >= 0
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, pixels_link, String("IMAGE"), String("pixels"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, vae_link, String("VAE"), String("vae"))
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, mask_link, String("MASK"), String("mask"))
+                    # grow_mask_by: read only for range validation; no flat key carries it.
+                    _ = _opt_int(fields, "grow_mask_by", 6, 0, 64)
+                    var init_path = _workflow_image_path(image_nodes, image_ports, image_paths, pixels_link)
+                    var mask_path = _workflow_image_path(mask_nodes, mask_ports, mask_paths, mask_link)
+                    var mask_source = _workflow_source_meta(mask_nodes, mask_ports, mask_sources, mask_link)
+                    _set_if_missing(obj, String("init_image"), JSONValue.from_string(init_path))
+                    _set_if_missing(obj, String("mask_image"), JSONValue.from_string(mask_path))
+                    _set_if_missing(obj, String("lanpaint_mask_channel"), JSONValue.from_string(mask_source))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
+                    latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
+                    latent_widths.append(0); latent_heights.append(0); latent_images.append(1)
+                    latent_init_images.append(init_path)
+                    latent_mask_images.append(mask_path)
+                    done[i] = True; remaining -= 1; progressed = True
+            elif type_id == "RepeatLatentBatch":
+                # Duplicate a LATENT batch `amount` times (Comfy: samples.repeat).
+                # In the flat model the batch count is the `images` key, so the new
+                # batch = source batch * amount. Geometry/init/mask carry through.
+                var samples_link = _workflow_find_input_link(edges, node_id, String("samples"))
+                var amount_link = _workflow_find_input_link(edges, node_id, String("amount"))
+                if not samples_link.found:
+                    raise Error("[501] workflow graph RepeatLatentBatch missing required typed input")
+                var ready = (
+                    _workflow_value_index(value_nodes, value_ports, samples_link.node_id, samples_link.port) >= 0
+                    and _workflow_optional_link_ready(value_nodes, value_ports, amount_link)
+                )
+                if ready:
+                    _workflow_require_value_type(value_nodes, value_ports, value_types, samples_link, String("LATENT"), String("samples"))
+                    var amount = _opt_int(fields, "amount", 1, 1, 64)
+                    if amount_link.found:
+                        amount = _workflow_scalar_int(
+                            scalar_nodes, scalar_ports, scalar_types, scalar_ints,
+                            amount_link, String("amount"),
+                        )
+                    if amount < 1 or amount > 64:
+                        raise Error("[501] workflow graph RepeatLatentBatch scalar amount out of range")
+                    var latent_idx = _workflow_latent_index(latent_nodes, latent_ports, samples_link)
+                    var src_batch = 1
+                    if latent_idx >= 0:
+                        src_batch = latent_images[latent_idx]
+                    var new_batch = src_batch * amount
+                    if new_batch < 1 or new_batch > 64:
+                        raise Error("[501] workflow graph RepeatLatentBatch repeated batch out of range")
+                    # RepeatLatentBatch is an explicit batch transform: unlike the
+                    # geometry pass-throughs it must OVERRIDE any `images` an upstream
+                    # EmptyLatentImage already wrote (the first-writer-wins
+                    # _set_if_missing convention would otherwise leave the node
+                    # silently ineffective). The LATENT payload batch is the source
+                    # of truth carried to the sampler.
+                    obj.set(String("images"), JSONValue.from_int(new_batch))
+                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
+                    latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
+                    if latent_idx >= 0:
+                        latent_widths.append(latent_widths[latent_idx])
+                        latent_heights.append(latent_heights[latent_idx])
+                        latent_images.append(new_batch)
+                        latent_init_images.append(latent_init_images[latent_idx])
+                        latent_mask_images.append(latent_mask_images[latent_idx])
+                    else:
+                        latent_widths.append(0); latent_heights.append(0); latent_images.append(new_batch)
+                        latent_init_images.append(String(""))
+                        latent_mask_images.append(String(""))
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "SetLatentNoiseMask":
                 var samples_link = _workflow_find_input_link(edges, node_id, String("samples"))

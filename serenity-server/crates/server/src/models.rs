@@ -27,12 +27,35 @@ use serde_json::{json, Value};
 const CHECKPOINTS_DIR: &str = "/home/alex/.serenity/models/checkpoints";
 const LORAS_DIR: &str = "/home/alex/.serenity/models/loras";
 const HEADER_PROBE_CAP: u64 = 16 * 1024 * 1024;
+/// Cap on an inlined sidecar preview image (encoded as a `data:` URI). Sidecar
+/// previews are meant to be small thumbnails; oversize files are skipped rather
+/// than bloating the /v1/models JSON. 2 MiB raw → ~2.7 MiB base64.
+const PREVIEW_INLINE_CAP: u64 = 2 * 1024 * 1024;
+
+/// Sidecar metadata distilled from a `<model>.json` / `.civitai.info` next to a
+/// checkpoint or LoRA. All fields are "" when absent. ADD-only on the wire.
+#[derive(Default, Clone)]
+struct Sidecar {
+    /// data: URI for an adjacent preview image ("" if none / too large).
+    preview: String,
+    /// human description (Civitai `description` / generic `description`/`notes`).
+    description: String,
+    /// trigger / activation words (Civitai `trainedWords` joined, or `trigger`).
+    trigger: String,
+    /// base-model / arch hint from the sidecar (only used to fill `unknown`).
+    arch_hint: String,
+}
 
 struct ScanEntry {
     name: String,
     path: String,
     arch: String,
     size: i64,
+    /// Subdir of the entry RELATIVE to its scan root ("" = top level). Lets the
+    /// browser show a folder tree without guessing the root from the abs path.
+    folder: String,
+    /// Distilled sidecar preview/metadata (empty `Sidecar::default()` if none).
+    sidecar: Sidecar,
 }
 
 // ── arch detection (exact substring probes from model_scan.mojo) ────────────────
@@ -149,6 +172,213 @@ fn header_text(path: &str) -> String {
     .unwrap_or_default()
 }
 
+// ── sidecar preview + metadata (ADD-only browser fields) ─────────────────────────
+
+/// Minimal standard-alphabet base64 (RFC 4648, padded). Self-contained so this
+/// crate gains no new dependency — matches the file's other shell-free helpers.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+        let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+        out.push(TBL[b0 >> 2] as char);
+        out.push(TBL[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        out.push(if chunk.len() > 1 { TBL[((b1 & 0x0f) << 2) | (b2 >> 6)] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TBL[b2 & 0x3f] as char } else { '=' });
+    }
+    out
+}
+
+/// MIME type for a preview image by extension (lowercased), "" if unsupported.
+fn image_mime(ext_lower: &str) -> &'static str {
+    match ext_lower {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "",
+    }
+}
+
+/// Read a small image file and return a `data:` URI, or "" (missing / too big /
+/// unsupported ext). The browser's `thumbUrl` consumes `data:` URIs directly, so
+/// no extra server route is needed to surface the preview.
+fn preview_data_uri(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let mime = image_mime(&ext);
+    if mime.is_empty() {
+        return String::new();
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => m,
+        _ => return String::new(),
+    };
+    if meta.len() == 0 || meta.len() > PREVIEW_INLINE_CAP {
+        return String::new();
+    }
+    match std::fs::read(path) {
+        Ok(bytes) if !bytes.is_empty() => format!("data:{};base64,{}", mime, base64_encode(&bytes)),
+        _ => String::new(),
+    }
+}
+
+/// First adjacent preview image for a model whose file path is `model_path`
+/// (full path incl. `.safetensors`). Probes the common SwarmUI/Civitai sidecar
+/// names in priority order: `<model>.preview.<ext>`, `<model>.<ext>`. Returns a
+/// `data:` URI or "".
+fn find_sidecar_preview(model_path: &str) -> String {
+    let p = Path::new(model_path);
+    let parent = p.parent().unwrap_or_else(|| Path::new("."));
+    let stem = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.strip_suffix(".safetensors").unwrap_or(n).to_string())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return String::new();
+    }
+    const EXTS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+    // `<model>.preview.<ext>` first (explicit), then bare `<model>.<ext>`.
+    for suffix in [".preview", ""] {
+        for ext in EXTS {
+            let cand = parent.join(format!("{stem}{suffix}.{ext}"));
+            let uri = preview_data_uri(&cand);
+            if !uri.is_empty() {
+                return uri;
+            }
+        }
+    }
+    String::new()
+}
+
+/// First in-dir preview for a diffusers-tree model directory `dir`. Probes the
+/// conventional cover names. Returns a `data:` URI or "".
+fn find_dir_preview(dir: &str) -> String {
+    let base = Path::new(dir);
+    const NAMES: [&str; 8] = [
+        "preview.png", "preview.jpg", "cover.png", "cover.jpg", "teaser.jpg", "teaser.png",
+        "thumbnail.png", "thumbnail.jpg",
+    ];
+    for n in NAMES {
+        let uri = preview_data_uri(&base.join(n));
+        if !uri.is_empty() {
+            return uri;
+        }
+    }
+    String::new()
+}
+
+/// Pull a string field by any of several keys from a JSON object (first hit).
+fn json_str_any(obj: &Value, keys: &[&str]) -> String {
+    for k in keys {
+        if let Some(s) = obj.get(*k).and_then(|v| v.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Parse a sidecar JSON value into description/trigger/arch hints. Handles both
+/// the flat generic `{description, trigger|activation text, baseModel|arch}` and
+/// the Civitai `.civitai.info` shape (`trainedWords:[…]`, `model.description`,
+/// `baseModel`).
+fn parse_sidecar_json(v: &Value) -> Sidecar {
+    let mut description = json_str_any(v, &["description", "notes", "about"]);
+    if description.is_empty() {
+        // Civitai nests the human description under `model.description`.
+        if let Some(m) = v.get("model") {
+            description = json_str_any(m, &["description", "notes"]);
+        }
+    }
+    let mut trigger = json_str_any(
+        v,
+        &["trigger", "trigger_words", "triggerWords", "activation text", "activation_text"],
+    );
+    if trigger.is_empty() {
+        if let Some(arr) = v.get("trainedWords").and_then(|x| x.as_array()) {
+            let words: Vec<String> = arr
+                .iter()
+                .filter_map(|w| w.as_str())
+                .map(|w| w.trim().to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
+            trigger = words.join(", ");
+        }
+    }
+    let arch_hint = json_str_any(v, &["arch", "architecture", "baseModel", "base_model"]);
+    Sidecar { preview: String::new(), description, trigger, arch_hint }
+}
+
+/// Read the first existing sidecar metadata JSON for a model file path, returning
+/// the distilled fields (preview is filled separately). Probes `<model>.json`,
+/// `<model>.civitai.info`, `<model>.cm-info.json` in that order.
+fn read_sidecar_metadata(model_path: &str) -> Sidecar {
+    let p = Path::new(model_path);
+    let parent = p.parent().unwrap_or_else(|| Path::new("."));
+    let stem = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.strip_suffix(".safetensors").unwrap_or(n).to_string())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return Sidecar::default();
+    }
+    for fname in [format!("{stem}.json"), format!("{stem}.civitai.info"), format!("{stem}.cm-info.json")] {
+        let cand = parent.join(&fname);
+        if let Ok(text) = std::fs::read_to_string(&cand) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                return parse_sidecar_json(&v);
+            }
+        }
+    }
+    Sidecar::default()
+}
+
+/// Build the full sidecar bundle (preview + metadata) for a `.safetensors` file.
+fn sidecar_for_file(model_path: &str) -> Sidecar {
+    let mut s = read_sidecar_metadata(model_path);
+    s.preview = find_sidecar_preview(model_path);
+    s
+}
+
+/// Build the sidecar bundle for a diffusers-tree model DIR (preview only; an
+/// adjacent `<dir>.json` is also honored for description/trigger if present).
+fn sidecar_for_dir(dir: &str) -> Sidecar {
+    let mut s = Sidecar::default();
+    // optional `<dir>.json` next to the directory (same convention as files).
+    let djson = format!("{dir}.json");
+    if let Ok(text) = std::fs::read_to_string(&djson) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            s = parse_sidecar_json(&v);
+        }
+    }
+    s.preview = find_dir_preview(dir);
+    s
+}
+
+/// Subdir of `path` relative to scan `root` ("" when `path` is a direct child of
+/// `root` or `root` is not a prefix). E.g. root=…/checkpoints,
+/// path=…/checkpoints/ltx-video/x.safetensors → "ltx-video".
+fn folder_relative_to(path: &str, root: &str) -> String {
+    let rest = match path.strip_prefix(root).and_then(|r| r.strip_prefix('/')) {
+        Some(r) => r,
+        None => return String::new(),
+    };
+    match rest.rfind('/') {
+        Some(i) => rest[..i].to_string(),
+        None => String::new(),
+    }
+}
+
 // ── scanners ────────────────────────────────────────────────────────────────────
 
 /// `find -L <dir> -maxdepth 1 -type f -name '*.safetensors'` — symlinks followed,
@@ -175,6 +405,8 @@ fn list_safetensors(dir: &str) -> Vec<ScanEntry> {
             path: format!("{dir}/{fname}"),
             arch: String::new(),
             size: meta.len() as i64,
+            folder: String::new(), // top-level scan: filled by caller if nested
+            sidecar: Sidecar::default(),
         });
     }
     out
@@ -207,6 +439,12 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
             arch = detect_arch(&header_text(&e.path)).to_string();
         }
         e.arch = arch;
+        e.folder = folder_relative_to(&e.path, CHECKPOINTS_DIR);
+        e.sidecar = sidecar_for_file(&e.path);
+        // sidecar may rescue an unknown arch (only when it offers a hint).
+        if e.arch == "unknown" && !e.sidecar.arch_hint.is_empty() {
+            e.arch = e.sidecar.arch_hint.clone();
+        }
         out.push(e);
     }
     // known diffusers-tree DIRS (arch by identity), size via du -sb.
@@ -218,7 +456,14 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
         let dir = format!("/home/alex/.serenity/models/{name}");
         if dir_exists(&dir) {
             let size = du_sb(&dir);
-            out.push(ScanEntry { name: name.to_string(), path: dir, arch: arch.to_string(), size });
+            out.push(ScanEntry {
+                name: name.to_string(),
+                path: dir.clone(),
+                arch: arch.to_string(),
+                size,
+                folder: folder_relative_to(&dir, "/home/alex/.serenity/models"),
+                sidecar: sidecar_for_dir(&dir),
+            });
         }
     }
     // known multi-shard checkpoint subdirs under checkpoints/.
@@ -226,7 +471,14 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
         let dir = format!("{CHECKPOINTS_DIR}/{name}");
         if dir_exists(&dir) {
             let size = du_sb(&dir);
-            out.push(ScanEntry { name: name.to_string(), path: dir, arch: arch.to_string(), size });
+            out.push(ScanEntry {
+                name: name.to_string(),
+                path: dir.clone(),
+                arch: arch.to_string(),
+                size,
+                folder: folder_relative_to(&dir, CHECKPOINTS_DIR),
+                sidecar: sidecar_for_dir(&dir),
+            });
         }
     }
     out
@@ -240,6 +492,11 @@ fn scan_loras() -> Vec<ScanEntry> {
             target = detect_lora_target_arch(&header_text(&e.path)).to_string();
         }
         e.arch = target;
+        e.folder = folder_relative_to(&e.path, LORAS_DIR);
+        e.sidecar = sidecar_for_file(&e.path);
+        if e.arch == "unknown" && !e.sidecar.arch_hint.is_empty() {
+            e.arch = e.sidecar.arch_hint.clone();
+        }
         out.push(e);
     }
     out
@@ -353,20 +610,24 @@ fn lora_incompatible_reason(selected_model: &str, selected_arch: &str, target_ar
 fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
     let arch = entry_arch(e);
     let loaded = !resident.is_empty() && e.name == resident;
+    let preview = e.sidecar.preview.clone();
     let metadata = json!({
         "schema": "serenity.model.metadata.v1",
         "source": "disk_scan",
         "family": arch,
-        "notes": "",
+        "notes": e.sidecar.description,        // ADD: from <model>.json/.civitai.info
+        "description": e.sidecar.description,  // ADD: alias for clarity
+        "trigger": e.sidecar.trigger,          // ADD: sidecar trigger words (if any)
     });
     let card = json!({
         "schema": "serenity.model.card.v1",
         "title": e.name,
         "subtitle": arch,
         "path": e.path,
+        "folder": e.folder,                    // ADD: subdir under scan root ("" = top)
         "size": e.size,
         "thumbnail": "",
-        "preview": "",
+        "preview": preview,                    // ADD: data: URI if a sidecar exists
         "favorite": false,
         "loaded": loaded,
         "metadata": metadata,
@@ -374,12 +635,14 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
     json!({
         "name": e.name,
         "path": e.path,
+        "folder": e.folder,                    // ADD: subdir under scan root ("" = top)
         "arch": arch,
         "size": e.size,
         "loaded": loaded,
         "type": "checkpoint",
         "thumbnail": "",
-        "preview": "",
+        "preview": preview,                    // ADD: data: URI if a sidecar exists
+        "trigger": e.sidecar.trigger,          // ADD: sidecar trigger words (if any)
         "favorite": false,
         "metadata": metadata,
         "card": card,
@@ -397,20 +660,25 @@ fn lora_entry_json(e: &ScanEntry, models: &[ScanEntry], selected_model: &str, se
         "target_arch": target,
         "incompatible_reason": reason,
     });
+    let preview = e.sidecar.preview.clone();
+    let trigger = e.sidecar.trigger.clone();
     let metadata = json!({
         "schema": "serenity.lora.metadata.v1",
         "source": "safetensors_header_probe",
         "target_arch": target,
-        "trigger": "",
+        "trigger": trigger,                    // ADD: from <lora>.json/.civitai.info
+        "notes": e.sidecar.description,        // ADD: sidecar description (if any)
+        "description": e.sidecar.description,  // ADD: alias for clarity
     });
     let card = json!({
         "schema": "serenity.lora.card.v1",
         "title": e.name,
         "subtitle": target,
         "path": e.path,
+        "folder": e.folder,                    // ADD: subdir under scan root ("" = top)
         "size": e.size,
         "thumbnail": "",
-        "preview": "",
+        "preview": preview,                    // ADD: data: URI if a sidecar exists
         "favorite": false,
         "metadata": metadata,
         "compatibility": compatibility,
@@ -418,12 +686,13 @@ fn lora_entry_json(e: &ScanEntry, models: &[ScanEntry], selected_model: &str, se
     json!({
         "name": e.name,
         "path": e.path,
+        "folder": e.folder,                    // ADD: subdir under scan root ("" = top)
         "size": e.size,
         "arch": target,
         "target_arch": target,
-        "trigger": "",
+        "trigger": trigger,                    // populated from sidecar (was always "")
         "thumbnail": "",
-        "preview": "",
+        "preview": preview,                    // ADD: data: URI if a sidecar exists
         "favorite": false,
         "compatible_models": compatible_models_json(e, models),
         "compatible": compatible,
@@ -548,5 +817,101 @@ mod tests {
             lora_incompatible_reason("m", "flux", "sdxl", false),
             "target_arch sdxl is not compatible with model arch flux"
         );
+    }
+
+    // ── sidecar / preview / folder additions ─────────────────────────────────
+
+    #[test]
+    fn base64_matches_rfc4648() {
+        // standard vectors (incl. all three padding cases)
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // a byte with the high bits set, exercising the + / chars region
+        assert_eq!(base64_encode(&[0xff, 0xff, 0xff]), "////");
+        assert_eq!(base64_encode(&[0xfb]), "+w==");
+    }
+
+    #[test]
+    fn folder_relative_strips_root_and_basename() {
+        let root = "/home/alex/.serenity/models/checkpoints";
+        // direct child → no folder
+        assert_eq!(folder_relative_to(&format!("{root}/x.safetensors"), root), "");
+        // one subdir
+        assert_eq!(folder_relative_to(&format!("{root}/ltx-video/x.safetensors"), root), "ltx-video");
+        // nested subdir
+        assert_eq!(folder_relative_to(&format!("{root}/a/b/x.safetensors"), root), "a/b");
+        // path not under root → ""
+        assert_eq!(folder_relative_to("/other/x.safetensors", root), "");
+    }
+
+    #[test]
+    fn image_mime_known_exts() {
+        assert_eq!(image_mime("png"), "image/png");
+        assert_eq!(image_mime("jpg"), "image/jpeg");
+        assert_eq!(image_mime("jpeg"), "image/jpeg");
+        assert_eq!(image_mime("webp"), "image/webp");
+        assert_eq!(image_mime("txt"), "");
+    }
+
+    #[test]
+    fn sidecar_json_flat_and_civitai() {
+        // flat generic shape
+        let flat = serde_json::json!({
+            "description": "a portrait lora",
+            "trigger": "ohwx person",
+            "baseModel": "sdxl"
+        });
+        let s = parse_sidecar_json(&flat);
+        assert_eq!(s.description, "a portrait lora");
+        assert_eq!(s.trigger, "ohwx person");
+        assert_eq!(s.arch_hint, "sdxl");
+
+        // Civitai .civitai.info shape (trainedWords[], nested model.description)
+        let civ = serde_json::json!({
+            "trainedWords": ["ohwx", " person "],
+            "baseModel": "SDXL 1.0",
+            "model": { "description": "civitai desc" }
+        });
+        let c = parse_sidecar_json(&civ);
+        assert_eq!(c.description, "civitai desc");
+        assert_eq!(c.trigger, "ohwx, person");
+        assert_eq!(c.arch_hint, "SDXL 1.0");
+
+        // empty object → all empty (no panic)
+        let e = parse_sidecar_json(&serde_json::json!({}));
+        assert!(e.description.is_empty() && e.trigger.is_empty() && e.arch_hint.is_empty());
+    }
+
+    #[test]
+    fn preview_data_uri_roundtrip_tmpfile() {
+        // a tiny valid-enough PNG payload (bytes are arbitrary; we only encode)
+        let dir = std::env::temp_dir().join(format!("serenity_mb_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let png = dir.join("m.preview.png");
+        std::fs::write(&png, [0x89u8, b'P', b'N', b'G', 1, 2, 3]).unwrap();
+        let uri = preview_data_uri(&png);
+        assert!(uri.starts_with("data:image/png;base64,"), "got: {uri}");
+        assert_eq!(&uri["data:image/png;base64,".len()..], base64_encode(&[0x89, b'P', b'N', b'G', 1, 2, 3]));
+
+        // unsupported ext → ""
+        let txt = dir.join("m.txt");
+        std::fs::write(&txt, b"hi").unwrap();
+        assert_eq!(preview_data_uri(&txt), "");
+
+        // missing file → ""
+        assert_eq!(preview_data_uri(&dir.join("nope.png")), "");
+
+        // find_sidecar_preview prefers <model>.preview.png for a model file path
+        let model = dir.join("m.safetensors");
+        std::fs::write(&model, b"x").unwrap();
+        let found = find_sidecar_preview(model.to_str().unwrap());
+        assert_eq!(found, uri);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

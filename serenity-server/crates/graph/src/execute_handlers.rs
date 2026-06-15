@@ -1131,6 +1131,132 @@ fn exec_vae_encode(
     Ok(Fire::Done)
 }
 
+// --- VAEEncodeForInpaint (ComfyUI built-in) ------------------------------------
+
+/// VAEEncodeForInpaint encodes `pixels` to a LATENT and attaches the inpaint
+/// `mask` (grown by `grow_mask_by` in ComfyUI). In the flat single-pass model
+/// this is the same effect as InpaintModelConditioning's mask half — it aliases
+/// to the inpaint_* params + mask_image. There is no conditioning here (the cond
+/// stays whatever the prompt/CLIPTextEncode supplies), so only the image/mask
+/// keys are set. `grow_mask_by` has no flat representation and is ignored (the
+/// worker grows the inpaint mask internally); it is read only to validate range.
+fn exec_vae_encode_for_inpaint(
+    node: &WorkflowNode,
+    links: &LinkMap,
+    store: &mut ValueStore,
+    out: &mut JsonValue,
+) -> GraphResult<Fire> {
+    let id = node.id;
+    let fields = &node.fields;
+    let pixels_link = links.input(id, "pixels");
+    let vae_link = links.input(id, "vae");
+    let mask_link = links.input(id, "mask");
+    if !pixels_link.found || !vae_link.found || !mask_link.found {
+        return Err(GraphError::unsupported(
+            "workflow graph VAEEncodeForInpaint missing required typed input",
+        )
+        .with_node(id));
+    }
+    if !(ready(store, &pixels_link) && ready(store, &vae_link) && ready(store, &mask_link)) {
+        return Ok(Fire::NotReady);
+    }
+    require_value_type(store, &pixels_link, "IMAGE", "pixels")?;
+    require_value_type(store, &vae_link, "VAE", "vae")?;
+    require_value_type(store, &mask_link, "MASK", "mask")?;
+    // grow_mask_by: read only for range validation; no flat key carries it.
+    let _grow = opt_int(fields, "grow_mask_by", 6, 0, 64)?;
+    let init_path = image_path_of(store, &pixels_link)?;
+    let mask_path = image_path_of(store, &mask_link)?;
+    let mask_source = mask_source_of(store, &mask_link)?;
+    set_if_missing(out, "init_image", json!(init_path));
+    set_if_missing(out, "mask_image", json!(mask_path));
+    set_if_missing(out, "lanpaint_mask_channel", json!(mask_source));
+    add_value(
+        store,
+        id,
+        "LATENT",
+        ValuePayload::Latent {
+            width: 0,
+            height: 0,
+            batch: 1,
+            init_image: opt_nonempty(&init_path),
+            mask_image: opt_nonempty(&mask_path),
+        },
+    )?;
+    Ok(Fire::Done)
+}
+
+// --- RepeatLatentBatch (ComfyUI built-in) --------------------------------------
+
+/// RepeatLatentBatch duplicates a LATENT batch `amount` times (Comfy:
+/// `samples.repeat(amount, 1, 1, 1)`). In the flat model the batch count is the
+/// `images` key, so the new batch = source batch * amount. Geometry/init/mask
+/// carry through unchanged.
+fn exec_repeat_latent_batch(
+    node: &WorkflowNode,
+    links: &LinkMap,
+    store: &mut ValueStore,
+    out: &mut JsonValue,
+) -> GraphResult<Fire> {
+    let id = node.id;
+    let fields = &node.fields;
+    let samples_link = links.input(id, "samples");
+    let amount_link = links.input(id, "amount");
+    if !samples_link.found {
+        return Err(GraphError::unsupported(
+            "workflow graph RepeatLatentBatch missing required typed input",
+        )
+        .with_node(id));
+    }
+    if !(ready(store, &samples_link) && optional_ready(store, &amount_link)) {
+        return Ok(Fire::NotReady);
+    }
+    require_value_type(store, &samples_link, "LATENT", "samples")?;
+    let mut amount = opt_int(fields, "amount", 1, 1, 64)?;
+    if amount_link.found {
+        amount = scalar_int_of(store, &amount_link, "amount")?;
+    }
+    if !(1..=64).contains(&amount) {
+        return Err(GraphError::unsupported(
+            "workflow graph RepeatLatentBatch scalar amount out of range",
+        )
+        .with_node(id));
+    }
+    let geom = latent_geom_of(store, &samples_link);
+    let (width, height, src_batch, init_image, mask_image) = match geom {
+        Some(g) => (g.width, g.height, g.batch, g.init_image, g.mask_image),
+        None => (0, 0, 1, String::new(), String::new()),
+    };
+    let new_batch = src_batch.saturating_mul(amount);
+    if !(1..=64).contains(&new_batch) {
+        return Err(GraphError::unsupported(
+            "workflow graph RepeatLatentBatch repeated batch out of range",
+        )
+        .with_node(id));
+    }
+    // RepeatLatentBatch is an explicit batch transform: unlike the geometry
+    // pass-throughs it must OVERRIDE any `images` an upstream EmptyLatentImage
+    // already wrote (the first-writer-wins `set_if_missing` convention would
+    // otherwise leave the node silently ineffective on the flat output). The
+    // LATENT payload batch below is the source of truth carried to the sampler.
+    out.as_object_mut()
+        .expect("out is an object")
+        .insert("images".to_string(), json!(new_batch));
+    add_value(
+        store,
+        id,
+        "LATENT",
+        ValuePayload::Latent {
+            width,
+            height,
+            batch: new_batch,
+            init_image: opt_nonempty(&init_image),
+            mask_image: opt_nonempty(&mask_image),
+        },
+    )?;
+    Ok(Fire::Done)
+}
+
 // --- SetLatentNoiseMask (Mojo 2301) --------------------------------------------
 
 fn exec_set_latent_noise_mask(

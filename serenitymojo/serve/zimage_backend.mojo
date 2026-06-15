@@ -39,7 +39,7 @@ from std.memory import alloc, ArcPointer
 from std.time import perf_counter_ns
 
 from image.buffer import Image
-from image.png import encode_png_with_text
+from image.png import encode_png_with_text, encode_png_bytes
 from image.transform import resize_bilinear
 
 from serenitymojo.tensor import Tensor
@@ -174,6 +174,55 @@ def _resolve_zimage_lora_path(name: String) raises -> String:
 # ENCODE (per-job Qwen3-4B load+forward, tens of seconds — announced to clients
 # with phase="encoding") and DECODE (announced with phase="decoding").
 comptime LOAD_BLOCKS_PER_TICK = 2
+
+# Phase-4 live preview: emit a cheap intermediate thumbnail every Nth EXECUTED
+# denoise step (not every step — a preview is a host read + 16->3 projection +
+# PNG encode + base64, and must stay well under one denoise tick). The last
+# executed step is always previewed so the live frame matches the about-to-be-
+# decoded latent right up to the VAE handoff. 256px max edge keeps the encode
+# trivially cheap (a 512² job's latent is already 64² = 16x smaller than the
+# decoded image; we decimate further to <=256 on the long edge).
+comptime PREVIEW_EVERY_STEPS = 4
+comptime PREVIEW_MAX_EDGE = 256
+
+# Base64 alphabet (RFC 4648, standard) used to inline-encode the preview PNG
+# bytes into the StepResult.preview data-URL the frontend live_preview.js
+# decodes. Kept local so the preview path adds no new module dependency.
+comptime _B64_ALPHABET = String(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+)
+
+
+def _base64_encode(data: List[UInt8]) -> String:
+    """Standard base64 (with '=' padding) of a raw byte buffer → ASCII String.
+    Used only for the tiny intermediate preview PNG, so simplicity > speed."""
+    var alpha = _B64_ALPHABET.as_bytes()
+    var out = String("")
+    var n = len(data)
+    var i = 0
+    while i + 3 <= n:
+        var b0 = Int(data[i])
+        var b1 = Int(data[i + 1])
+        var b2 = Int(data[i + 2])
+        out += chr(Int(alpha[(b0 >> 2) & 0x3F]))
+        out += chr(Int(alpha[((b0 << 4) | (b1 >> 4)) & 0x3F]))
+        out += chr(Int(alpha[((b1 << 2) | (b2 >> 6)) & 0x3F]))
+        out += chr(Int(alpha[b2 & 0x3F]))
+        i += 3
+    var rem = n - i
+    if rem == 1:
+        var b0 = Int(data[i])
+        out += chr(Int(alpha[(b0 >> 2) & 0x3F]))
+        out += chr(Int(alpha[(b0 << 4) & 0x3F]))
+        out += String("==")
+    elif rem == 2:
+        var b0 = Int(data[i])
+        var b1 = Int(data[i + 1])
+        out += chr(Int(alpha[(b0 >> 2) & 0x3F]))
+        out += chr(Int(alpha[((b0 << 4) | (b1 >> 4)) & 0x3F]))
+        out += chr(Int(alpha[(b1 << 2) & 0x3F]))
+        out += String("=")
+    return out^
 
 
 def _shell(cmd: String) -> Int:
@@ -1122,6 +1171,128 @@ struct ZImageBackend(GenBackend, Movable):
         if self.min_free_bytes == 0 or mem.free_bytes < self.min_free_bytes:
             self.min_free_bytes = mem.free_bytes
 
+    # ── Phase-4 live preview: cheap intermediate latent → RGB thumbnail ───────
+    def _latent_preview_data_url(mut self) raises -> String:
+        """Project the CURRENT 16-channel latent ([1,16,hl,wl]) to a small RGB
+        thumbnail and return it as a `data:image/png;base64,...` URL — the exact
+        shape live_preview.js's decodeToUrl() returns as-is.
+
+        This is a FAST approximation, NOT a VAE decode: it reads the latent to
+        host (BF16->F32 upcast, ~64²..128² * 16 floats), applies a fixed 16->3
+        linear projection (ComfyUI `latent_rgb_factors` style), decimates to a
+        <=256px thumbnail, per-frame min/max contrast-stretches each RGB channel
+        so the frame is always visible regardless of latent scale, then PNG +
+        base64 encodes. Cost is bounded well under one denoise tick. On any
+        failure it returns "" (the worker simply omits the preview that tick).
+        """
+        if len(self.latent) == 0:
+            return String("")
+        # Fixed 16->3 projection. Z-Image has no published latent_rgb_factors we
+        # can read here, so this is a deterministic, well-conditioned projection
+        # (a few channels carry luma, the rest add chroma variation) followed by
+        # a per-frame contrast stretch — the goal is a recognizable progress
+        # thumbnail, not VAE-accurate color. Tuned only to never collapse to a
+        # flat frame: each output channel mixes a distinct subset of latents.
+        comptime CH = 16
+        # red, green, blue mixing weights per latent channel (built as explicit
+        # List[Float32] appends — no list-literal type inference). Each output
+        # channel leans on a distinct latent so the frame never collapses flat.
+        var rw = List[Float32]()
+        rw.append(0.40); rw.append(0.10); rw.append(-0.20); rw.append(0.15)
+        rw.append(0.25); rw.append(-0.10); rw.append(0.05); rw.append(0.20)
+        rw.append(-0.15); rw.append(0.10); rw.append(0.05); rw.append(-0.05)
+        rw.append(0.15); rw.append(0.10); rw.append(-0.10); rw.append(0.05)
+        var gw = List[Float32]()
+        gw.append(0.10); gw.append(0.40); gw.append(0.15); gw.append(-0.20)
+        gw.append(-0.10); gw.append(0.25); gw.append(0.20); gw.append(-0.05)
+        gw.append(0.10); gw.append(-0.15); gw.append(-0.05); gw.append(0.15)
+        gw.append(0.05); gw.append(-0.10); gw.append(0.10); gw.append(0.05)
+        var bw = List[Float32]()
+        bw.append(-0.20); bw.append(0.15); bw.append(0.40); bw.append(0.10)
+        bw.append(0.05); bw.append(0.20); bw.append(-0.10); bw.append(0.25)
+        bw.append(0.15); bw.append(0.10); bw.append(-0.15); bw.append(0.05)
+        bw.append(-0.10); bw.append(0.05); bw.append(0.10); bw.append(-0.05)
+
+        var host = self.latent[0][].to_host(self.ctx)  # F32, len = 16*hl*wl
+        var plane = self.hl * self.wl
+        if plane <= 0 or len(host) != CH * plane:
+            return String("")
+
+        # Decimate the latent grid to a <=PREVIEW_MAX_EDGE thumbnail with an
+        # integer stride (nearest sample) — no interpolation needed for a preview.
+        var long_edge = self.hl if self.hl >= self.wl else self.wl
+        var stride = 1
+        while (long_edge // stride) > PREVIEW_MAX_EDGE:
+            stride += 1
+        var out_h = (self.hl + stride - 1) // stride
+        var out_w = (self.wl + stride - 1) // stride
+        if out_h <= 0 or out_w <= 0:
+            return String("")
+
+        var npix = out_h * out_w
+        var rch = List[Float32](capacity=npix)
+        var gch = List[Float32](capacity=npix)
+        var bch = List[Float32](capacity=npix)
+        var rmin = Float32(1.0e30); var rmax = Float32(-1.0e30)
+        var gmin = Float32(1.0e30); var gmax = Float32(-1.0e30)
+        var bmin = Float32(1.0e30); var bmax = Float32(-1.0e30)
+        for oy in range(out_h):
+            var ly = oy * stride
+            if ly >= self.hl:
+                ly = self.hl - 1
+            for ox in range(out_w):
+                var lx = ox * stride
+                if lx >= self.wl:
+                    lx = self.wl - 1
+                var pidx = ly * self.wl + lx
+                var rv = Float32(0.0)
+                var gv = Float32(0.0)
+                var bv = Float32(0.0)
+                for c in range(CH):
+                    var v = host[c * plane + pidx]
+                    rv += rw[c] * v
+                    gv += gw[c] * v
+                    bv += bw[c] * v
+                rch.append(rv); gch.append(gv); bch.append(bv)
+                if rv < rmin: rmin = rv
+                if rv > rmax: rmax = rv
+                if gv < gmin: gmin = gv
+                if gv > gmax: gmax = gv
+                if bv < bmin: bmin = bv
+                if bv > bmax: bmax = bv
+
+        # Per-channel contrast stretch to [0,255]; guard a flat (min==max) frame.
+        var rspan = rmax - rmin
+        var gspan = gmax - gmin
+        var bspan = bmax - bmin
+        if rspan <= Float32(1.0e-6): rspan = Float32(1.0)
+        if gspan <= Float32(1.0e-6): gspan = Float32(1.0)
+        if bspan <= Float32(1.0e-6): bspan = Float32(1.0)
+
+        var img = Image.new(out_w, out_h, 3)
+        for oy in range(out_h):
+            var row = oy * out_w
+            for ox in range(out_w):
+                var k = row + ox
+                var r8 = (rch[k] - rmin) / rspan * Float32(255.0)
+                var g8 = (gch[k] - gmin) / gspan * Float32(255.0)
+                var b8 = (bch[k] - bmin) / bspan * Float32(255.0)
+                img.set(ox, oy, 0, UInt8(Int(r8.clamp(Float32(0.0), Float32(255.0)) + Float32(0.5))))
+                img.set(ox, oy, 1, UInt8(Int(g8.clamp(Float32(0.0), Float32(255.0)) + Float32(0.5))))
+                img.set(ox, oy, 2, UInt8(Int(b8.clamp(Float32(0.0), Float32(255.0)) + Float32(0.5))))
+
+        var png = encode_png_bytes(img)
+        return String("data:image/png;base64,") + _base64_encode(png)
+
+    def _should_emit_preview(self, executed_step_1based: Int) -> Bool:
+        """True every PREVIEW_EVERY_STEPS executed steps, and always on the last
+        executed step (so the final live frame matches the decoded latent)."""
+        if executed_step_1based <= 0:
+            return False
+        if executed_step_1based >= self.params.steps:
+            return True
+        return (executed_step_1based % PREVIEW_EVERY_STEPS) == 0
+
     def _denoise_step_has_update(self, step: Int) -> Bool:
         if step < 0 or step >= self.params.steps:
             return False
@@ -1449,6 +1620,15 @@ struct ZImageBackend(GenBackend, Movable):
                 r.step = self.cur
                 if self.cur >= self.params.steps:
                     self.phase = PHASE_DECODE
+                # Phase-4 live preview: emit a cheap intermediate thumbnail on
+                # the cadence steps. NEVER fatal — a preview-build failure must
+                # not abort the job, so swallow it and just omit this frame.
+                if self._should_emit_preview(self.cur):
+                    try:
+                        r.preview = self._latent_preview_data_url()
+                    except e:
+                        print("[zimage][preview] skipped (", String(e), ")")
+                        r.preview = String("")
                 return r^
             if not self.announced:
                 # announce BEFORE the long blocking VAE-decode tick.

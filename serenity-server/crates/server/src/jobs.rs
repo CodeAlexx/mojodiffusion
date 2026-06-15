@@ -259,28 +259,68 @@ pub fn db_safe_params(s: &str) -> String {
     format!("{}...truncated", &s[..cut])
 }
 
+/// `derive_metadata_json`: a compact, queryable `serenity.gallery_meta.v1` summary
+/// derived from a row's params_json (model/seed/dims/sampler/steps/cfg flattened +
+/// the parsed params). Empty in → empty out. Stored in the additive `metadata_json`
+/// db column so the gallery lightbox + external tooling can query it without
+/// re-parsing the PNG. NOTE: derived, never authoritative — params_json is the
+/// source of truth (kept for back-compat).
+pub fn derive_metadata_json(id: &str, model: &str, state: &str, output_path: &str, params_json: &str) -> String {
+    let params = if params_json.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str::<Value>(params_json).ok().filter(|v| v.is_object()).unwrap_or(Value::Null)
+    };
+    let pick = |k: &str| -> Value { params.get(k).cloned().unwrap_or(Value::Null) };
+    let blob = json!({
+        "schema": "serenity.gallery_meta.v1",
+        "id": id,
+        "model": model,
+        "state": state,
+        "output_path": output_path,
+        "has_params": !params_json.is_empty(),
+        "params": params,
+        "seed": pick("seed"),
+        "prompt": pick("prompt"),
+        "negative": pick("negative"),
+        "width": pick("width"),
+        "height": pick("height"),
+        "steps": pick("steps"),
+        "cfg": pick("cfg"),
+        "sampler": pick("sampler"),
+        "scheduler": pick("scheduler"),
+    });
+    serde_json::to_string(&blob).unwrap_or_default()
+}
+
 /// `save_jobs_db`: rewrite jobs.db = prior rows + session jobs that have STARTED
-/// (state != queued), in the daemon's `jobs` schema. Crash-safe full rewrite.
+/// (state != queued), in the daemon's `jobs` schema PLUS an additive `metadata_json`
+/// column (a derived `serenity.gallery_meta.v1` blob; ignored by older readers that
+/// SELECT only the 6 base columns). Crash-safe full rewrite.
 pub fn save_jobs_db(prior: &[[String; 6]], jobs: &[JobEntry], db_path: &Path) {
     let _ = (|| -> rusqlite::Result<()> {
         let conn = rusqlite::Connection::open(db_path)?;
         conn.execute_batch(
             "DROP TABLE IF EXISTS jobs;\
-             CREATE TABLE jobs (id TEXT, created TEXT, model TEXT, params_json TEXT, state TEXT, output_path TEXT);",
+             CREATE TABLE jobs (id TEXT, created TEXT, model TEXT, params_json TEXT, state TEXT, output_path TEXT, metadata_json TEXT);",
         )?;
         let tx = conn.unchecked_transaction()?;
         {
-            let mut stmt = tx.prepare("INSERT INTO jobs VALUES (?1,?2,?3,?4,?5,?6)")?;
+            let mut stmt = tx.prepare("INSERT INTO jobs VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
             for r in prior {
-                stmt.execute(rusqlite::params![r[0], r[1], r[2], r[3], r[4], r[5]])?;
+                // r is the 6-col in-memory contract; derive the 7th from its params.
+                let meta = derive_metadata_json(&r[0], &r[2], &r[4], &r[5], &r[3]);
+                stmt.execute(rusqlite::params![r[0], r[1], r[2], r[3], r[4], r[5], meta])?;
             }
             for e in jobs {
                 let j = &e.record;
                 if j.state == "queued" {
                     continue; // never started — nothing truthful to index yet
                 }
+                let pj = db_safe_params(&j.params_json);
+                let meta = derive_metadata_json(&j.id, &j.model, &j.state, &j.output_path, &pj);
                 stmt.execute(rusqlite::params![
-                    j.id, j.created, j.model, db_safe_params(&j.params_json), j.state, j.output_path
+                    j.id, j.created, j.model, pj, j.state, j.output_path, meta
                 ])?;
             }
         }
@@ -290,13 +330,31 @@ pub fn save_jobs_db(prior: &[[String; 6]], jobs: &[JobEntry], db_path: &Path) {
 
 /// `job_json_value`: a current-session JobRecord → JSON (the daemon's shape; note
 /// current jobs carry NO params_json/params/history — those are prior-row only).
+/// A `done` record additionally carries the derived `metadata` blob (its
+/// params_json is populated at Done-time from the output PNG), so a live lightbox
+/// gets the same queryable metadata as history without waiting for persistence.
 pub fn job_json_value(r: &JobRecord) -> Value {
-    json!({
-        "id": r.id, "created": r.created, "model": r.model, "state": r.state,
-        "progress": r.progress, "step": r.step, "total": r.total,
-        "image_index": r.image_index, "image_count": r.image_count,
-        "output_path": r.output_path, "error": r.error,
-    })
+    let mut o = Map::new();
+    o.insert("id".into(), json!(r.id));
+    o.insert("created".into(), json!(r.created));
+    o.insert("model".into(), json!(r.model));
+    o.insert("state".into(), json!(r.state));
+    o.insert("progress".into(), json!(r.progress));
+    o.insert("step".into(), json!(r.step));
+    o.insert("total".into(), json!(r.total));
+    o.insert("image_index".into(), json!(r.image_index));
+    o.insert("image_count".into(), json!(r.image_count));
+    o.insert("output_path".into(), json!(r.output_path));
+    o.insert("error".into(), json!(r.error));
+    // Additive: a metadata blob once the record has params (done-time). Older
+    // consumers ignore the extra key; the daemon's base shape is unchanged above.
+    if !r.params_json.is_empty() {
+        let meta = derive_metadata_json(&r.id, &r.model, &r.state, &r.output_path, &r.params_json);
+        if let Ok(v) = serde_json::from_str::<Value>(&meta) {
+            o.insert("metadata".into(), v);
+        }
+    }
+    Value::Object(o)
 }
 
 fn job_id_num(id: &str) -> i64 {
@@ -372,6 +430,12 @@ fn prior_job_json_value(row: &[String; 6]) -> Value {
                 o.insert("params".into(), params);
             }
         }
+    }
+    // Additive: the derived metadata blob for the lightbox (queryable, single obj).
+    // Derived from the row's params_json (cols: id=0, model=2, state=4, output=5).
+    let meta = derive_metadata_json(&row[0], &row[2], &row[4], &row[5], &row[3]);
+    if let Ok(v) = serde_json::from_str::<Value>(&meta) {
+        o.insert("metadata".into(), v);
     }
     o.insert("history".into(), json!(true));
     Value::Object(o)
@@ -493,5 +557,81 @@ mod tests {
         // by position, out of range
         assert!(reorder_target_position(&v, src, &json!({"position": 9})).is_err());
         assert!(reorder_target_position(&v, src, &json!({})).is_err());
+    }
+
+    #[test]
+    fn derive_metadata_shape() {
+        let m = derive_metadata_json(
+            "job-0042", "zimage", "done", "out/job-0042.png",
+            r#"{"seed":7,"width":768,"height":1024,"sampler":"euler"}"#,
+        );
+        let v: Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(v.get("schema").unwrap(), "serenity.gallery_meta.v1");
+        assert_eq!(v.get("id").unwrap(), "job-0042");
+        assert_eq!(v.get("model").unwrap(), "zimage");
+        assert_eq!(v.get("has_params").unwrap(), true);
+        assert_eq!(v.get("seed").unwrap(), 7);
+        assert_eq!(v.get("width").unwrap(), 768);
+        assert_eq!(v.get("sampler").unwrap(), "euler");
+        // params is the full parsed object
+        assert_eq!(v.get("params").and_then(|p| p.get("height")).unwrap(), 1024);
+        // absent fields are null, not missing
+        assert!(v.get("cfg").unwrap().is_null());
+    }
+
+    #[test]
+    fn derive_metadata_empty_params() {
+        let m = derive_metadata_json("job-1", "m", "interrupted", "", "");
+        let v: Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(v.get("has_params").unwrap(), false);
+        assert!(v.get("params").unwrap().is_null());
+        assert!(v.get("seed").unwrap().is_null());
+    }
+
+    #[test]
+    fn jobs_db_additive_column_roundtrip() {
+        // write the 7-col db, then read it back with the LEGACY 6-col SELECT
+        // (load_prior_rows) to prove the extra column is backward-compatible.
+        let mut db = std::env::temp_dir();
+        db.push(format!("serenity_jobs_test_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let prior = vec![[
+            "job-0001".to_string(),
+            "Fri, 12 Jun 2026 08:43:17 GMT".to_string(),
+            "zimage".to_string(),
+            r#"{"seed":9,"width":512}"#.to_string(),
+            "done".to_string(),
+            "out/job-0001.png".to_string(),
+        ]];
+        save_jobs_db(&prior, &[], &db);
+        // legacy 6-col read still works (ignores metadata_json)
+        let rows = load_prior_rows(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "job-0001");
+        assert_eq!(rows[0][4], "done");
+        // the additive column is actually present + carries the derived blob
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let meta: String = conn
+            .query_row("SELECT metadata_json FROM jobs WHERE id='job-0001'", [], |r| r.get(0))
+            .unwrap();
+        let v: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(v.get("schema").unwrap(), "serenity.gallery_meta.v1");
+        assert_eq!(v.get("seed").unwrap(), 9);
+        drop(conn);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn job_json_value_metadata_when_done() {
+        // a record with params_json (done-time) carries a metadata blob
+        let mut r = entry("job-0005", "done").record;
+        r.params_json = r#"{"seed":3,"model":"zimage"}"#.to_string();
+        let v = job_json_value(&r);
+        assert_eq!(v.get("state").unwrap(), "done");
+        assert!(v.get("metadata").is_some());
+        assert_eq!(v.get("metadata").unwrap().get("seed").unwrap(), 3);
+        // a queued record (no params) has no metadata key (base daemon shape)
+        let q = job_json_value(&entry("job-0006", "queued").record);
+        assert!(q.get("metadata").is_none());
     }
 }

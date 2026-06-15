@@ -61,12 +61,24 @@ pub fn is_scalar_node(t: &str) -> bool {
 // error and fails loud [501] (never substituted).
 
 /// Map a named-SAMPLER node type to its Comfy sampler catalog name (or `""`).
+/// Names are the exact `comfy.samplers` catalog strings each
+/// `nodes_custom_sampler.py` class passes to `KSAMPLER`/`sampler_object`. Only
+/// `SamplerEuler` (-> "euler") is in the worker's supported list; the rest gate
+/// fail-loud [501] in the executor (see `worker_supports_sampler`).
 pub fn named_sampler_name(type_id: &str) -> &'static str {
     match type_id {
+        "SamplerEuler" => "euler",
         "SamplerEulerAncestral" => "euler_ancestral",
+        "SamplerEulerAncestralCFGPP" => "euler_ancestral_cfg_pp",
         "SamplerDPMPP_2M_SDE" => "dpmpp_2m_sde",
         "SamplerDPMPP_3M_SDE" => "dpmpp_3m_sde",
+        "SamplerDPMPP_SDE" => "dpmpp_sde",
+        "SamplerDPMPP_2S_Ancestral" => "dpmpp_2s_ancestral",
+        "SamplerDPMAdaptative" => "dpm_adaptive",
         "SamplerLMS" => "lms",
+        "SamplerER_SDE" => "er_sde",
+        "SamplerSASolver" => "sa_solver",
+        "SamplerSEEDS2" => "seeds_2",
         _ => "",
     }
 }
@@ -76,12 +88,20 @@ pub fn is_named_sampler_node(type_id: &str) -> bool {
 }
 
 /// Map a named-SIGMAS node type to its Comfy scheduler catalog name (or `""`).
+/// `vp`/`laplace`/`polyexponential`/`turbo` are not `SCHEDULER_NAMES` combo
+/// entries (they are produced by their own `get_sigmas_*` functions), but the
+/// node TYPE still names the schedule, so we carry that name and let the worker
+/// gate decide: none of these are in the worker's supported list, so they
+/// fail-loud [501] (`beta` IS a combo name but still absent from the worker).
 pub fn named_scheduler_name(type_id: &str) -> &'static str {
     match type_id {
         "KarrasScheduler" => "karras",
         "ExponentialScheduler" => "exponential",
         "PolyexponentialScheduler" => "polyexponential",
         "SDTurboScheduler" => "turbo",
+        "VPScheduler" => "vp",
+        "BetaSamplingScheduler" => "beta",
+        "LaplaceScheduler" => "laplace",
         _ => "",
     }
 }

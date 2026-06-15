@@ -181,6 +181,150 @@ fn gallery_order_index(state: &Value, id: &str) -> i64 {
     -1
 }
 
+// ── output-path template (SwarmUI OutpathBuilder parity, §7) ─────────────────────
+//
+// SwarmUI lets the output filename follow a template like `[model]-[seed]-[date]`
+// instead of the fixed `job-NNNN`. The REAL on-disk PNG is still `job-NNNN.png`
+// (the worker owns the write + the gallery scan keys on `job-*.png`), so the
+// template resolves a *display / suggested-output* name surfaced on every item as
+// `output_name` (for the lightbox + a future "save as" / download). The template is
+// stored in gallery state under `output_path_template`; an empty/absent template is
+// the back-compat default (`output_name` == the job id).
+
+/// The configured template, or "" (== current `job-NNNN` naming) when unset.
+fn gallery_output_template(state: &Value) -> String {
+    state
+        .get("output_path_template")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Replace any character a filename should not carry (path separators, control,
+/// shell/Windows-reserved) with `_`; collapse whitespace runs to a single `_`.
+/// Keeps the result a single path component (never empty → "_").
+fn sanitize_filename_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_us = false;
+    for ch in s.chars() {
+        let bad = ch.is_control()
+            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            || ch.is_whitespace();
+        if bad {
+            if !last_us {
+                out.push('_');
+                last_us = true;
+            }
+        } else {
+            out.push(ch);
+            last_us = false;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "_".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Look up a `[token]` substitution from the parsed params (falls back to the
+/// genparams JSON for flat fields). `[date]`/`[time]` come from the PNG mtime so
+/// the name is stable across re-reads (not "now"). Unknown tokens → `None`
+/// (left verbatim in the template).
+fn template_token_value(token: &str, id: &str, params: &Value, png: &str) -> Option<String> {
+    // mtime-derived date/time (UTC, stable): YYYYMMDD / HHMMSS via httpdate round-trip
+    let mtime_parts = || -> Option<(String, String)> {
+        let m = std::fs::metadata(png).ok()?;
+        let t = m.modified().ok()?;
+        // httpdate gives "Fri, 12 Jun 2026 08:43:17 GMT"; reformat to compact fields.
+        let s = httpdate::fmt_http_date(t);
+        let p: Vec<&str> = s.split_whitespace().collect();
+        if p.len() < 5 {
+            return None;
+        }
+        let day = format!("{:0>2}", p[1]);
+        let mon = match p[2] {
+            "Jan" => "01", "Feb" => "02", "Mar" => "03", "Apr" => "04",
+            "May" => "05", "Jun" => "06", "Jul" => "07", "Aug" => "08",
+            "Sep" => "09", "Oct" => "10", "Nov" => "11", "Dec" => "12",
+            _ => "00",
+        };
+        let year = p[3];
+        let date = format!("{year}{mon}{day}");
+        let time = p[4].replace(':', "");
+        Some((date, time))
+    };
+    let pget = |k: &str| -> Option<String> {
+        params.get(k).map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+    };
+    match token {
+        "id" => Some(id.to_string()),
+        "model" => pget("model"),
+        "prompt" => pget("prompt"),
+        "negative" | "negativeprompt" => pget("negative"),
+        "seed" => pget("seed"),
+        "width" => pget("width"),
+        "height" => pget("height"),
+        "steps" => pget("steps"),
+        "cfg" | "cfgscale" => pget("cfg"),
+        "sampler" => pget("sampler"),
+        "scheduler" => pget("scheduler"),
+        "date" => mtime_parts().map(|(d, _)| d),
+        "time" => mtime_parts().map(|(_, t)| t),
+        _ => None,
+    }
+}
+
+/// Expand `[token]` placeholders in `template`. A known token is sanitized and
+/// substituted; an unknown token is left verbatim. An empty template → `id`
+/// (back-compat). Whole result is a single sanitized filename stem (no extension).
+fn resolve_output_template(template: &str, id: &str, params: &Value, png: &str) -> String {
+    if template.trim().is_empty() {
+        return id.to_string();
+    }
+    let mut out = String::with_capacity(template.len() + 16);
+    let bytes = template.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            // `[`/`]` are single ASCII bytes (never appear mid-codepoint in UTF-8),
+            // so these byte indices always land on char boundaries.
+            if let Some(close_rel) = template[i + 1..].find(']') {
+                let close = i + 1 + close_rel;
+                let token = &template[i + 1..close];
+                let key = token.to_lowercase();
+                match template_token_value(&key, id, params, png) {
+                    Some(val) => out.push_str(&sanitize_filename_component(&val)),
+                    None => {
+                        // unknown token: keep verbatim, brackets and all
+                        out.push('[');
+                        out.push_str(token);
+                        out.push(']');
+                    }
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        // literal run: copy this char's `[` (if unmatched) plus up to the NEXT `[`.
+        // Search from i+1 so a lone/unmatched `[` at i still makes progress (no
+        // infinite loop). UTF-8 safe: `[` is ASCII, `i..next` is a char-boundary slice.
+        let next = template[i + 1..].find('[').map(|d| i + 1 + d).unwrap_or(bytes.len());
+        out.push_str(&template[i..next]);
+        i = next;
+    }
+    let stem = sanitize_filename_component(&out);
+    if stem.is_empty() || stem == "_" {
+        id.to_string()
+    } else {
+        stem
+    }
+}
+
 // ── thumbnails (decode → 256px lanczos → encode; skip if cached) ─────────────────
 
 fn ensure_thumbnail(out: &Path, id: &str, png: &str) -> Result<String, String> {
@@ -317,6 +461,31 @@ fn item_from_png_state(out: &Path, state: &Value, id: &str, path: &str, favorite
     let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
     let name = gallery_name(state, id);
     let imported_from = gallery_import_source(state, id);
+    // Parse params once: feeds the template resolver, the params view, and the
+    // metadata blob. Keep the serde error text (the original `params_error` did).
+    let parsed_result: Option<Result<Value, String>> = if params_json.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str::<Value>(&params_json).map_err(|e| e.to_string()))
+    };
+    // any successfully-parsed value (the original inserted `params` for any Ok,
+    // object or not); token/metadata lookups simply no-op on non-objects.
+    let parsed_params: Option<Value> = match &parsed_result {
+        Some(Ok(v)) => Some(v.clone()),
+        _ => None,
+    };
+    let params_for_tokens = match &parsed_params {
+        Some(v) if v.is_object() => v.clone(),
+        _ => json!({}),
+    };
+    // Resolve the SwarmUI-style output filename (display/suggested name); the
+    // real PNG on disk is still job-NNNN.png. Empty template → the id (back-compat).
+    let template = gallery_output_template(state);
+    let output_name = if id.is_empty() {
+        String::new()
+    } else {
+        resolve_output_template(&template, id, &params_for_tokens, path)
+    };
     let mut o = serde_json::Map::new();
     o.insert("id".into(), json!(id));
     o.insert("name".into(), json!(name));
@@ -327,6 +496,8 @@ fn item_from_png_state(out: &Path, state: &Value, id: &str, path: &str, favorite
     o.insert("manual_order_index".into(), json!(gallery_order_index(state, id)));
     o.insert("imported".into(), json!(!imported_from.is_empty()));
     o.insert("imported_from".into(), json!(imported_from));
+    o.insert("output_name".into(), json!(output_name));
+    o.insert("output_template".into(), json!(template));
     o.insert("thumbnail_path".into(), json!(thumb));
     o.insert("thumb_path".into(), json!(thumb));
     o.insert("thumbnail".into(), json!(thumb));
@@ -334,30 +505,83 @@ fn item_from_png_state(out: &Path, state: &Value, id: &str, path: &str, favorite
     o.insert("metadata_key".into(), json!(GENPARAMS_TEXT_KEY));
     o.insert("has_params".into(), json!(!params_json.is_empty()));
     o.insert("params_json".into(), json!(params_json));
-    if !params_json.is_empty() {
-        match serde_json::from_str::<Value>(&params_json) {
-            Ok(mut params) => {
-                for k in ["model", "prompt", "seed", "width", "height"] {
-                    if let Some(v) = params.get(k) {
-                        o.insert(k.into(), v.clone());
-                    }
-                }
-                if !id.is_empty() {
-                    if let Some(m) = params.as_object_mut() {
-                        m.entry("params_source").or_insert(json!("gallery"));
-                        m.entry("reused_from_gallery_id").or_insert(json!(id));
-                        m.entry("reused_from_job_id").or_insert(json!(id));
-                        m.entry("reused_from_path").or_insert(json!(path));
-                    }
-                }
-                o.insert("params".into(), params);
-            }
-            Err(e) => {
-                o.insert("params_error".into(), json!(e.to_string()));
+    if let Some(mut params) = parsed_params {
+        for k in ["model", "prompt", "seed", "width", "height"] {
+            if let Some(v) = params.get(k) {
+                o.insert(k.into(), v.clone());
             }
         }
+        if !id.is_empty() {
+            if let Some(m) = params.as_object_mut() {
+                m.entry("params_source").or_insert(json!("gallery"));
+                m.entry("reused_from_gallery_id").or_insert(json!(id));
+                m.entry("reused_from_job_id").or_insert(json!(id));
+                m.entry("reused_from_path").or_insert(json!(path));
+            }
+        }
+        o.insert("params".into(), params);
+    } else if let Some(Err(e)) = &parsed_result {
+        // non-empty but a hard parse error — keep the serde message (faithful;
+        // the original `params_error` carried e.to_string()).
+        o.insert("params_error".into(), json!(e.as_str()));
     }
+    // Structured metadata blob: a single object the lightbox can render + the
+    // server can index. Carries the saved params (when present) + the file/gallery
+    // facts; always present so a consumer never branches on missing keys.
+    o.insert("metadata".into(), gallery_metadata_blob(state, id, path, &output_name, &params_json, size, favorite, &thumb, &thumb_state));
     Value::Object(o)
+}
+
+/// `serenity.gallery_meta.v1` — the queryable metadata blob for one item. Always
+/// an object; `params` is the parsed genparams (or null when absent/unparseable).
+fn gallery_metadata_blob(
+    state: &Value,
+    id: &str,
+    path: &str,
+    output_name: &str,
+    params_json: &str,
+    size: i64,
+    favorite: bool,
+    thumb: &str,
+    thumb_state: &str,
+) -> Value {
+    let params = if params_json.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str::<Value>(params_json).ok().filter(|v| v.is_object()).unwrap_or(Value::Null)
+    };
+    let pick = |k: &str| -> Value {
+        params.get(k).cloned().unwrap_or(Value::Null)
+    };
+    let imported_from = gallery_import_source(state, id);
+    json!({
+        "schema": "serenity.gallery_meta.v1",
+        "id": id,
+        "name": gallery_name(state, id),
+        "output_name": output_name,
+        "path": path,
+        "size": size,
+        "favorite": favorite,
+        "manual_order_index": gallery_order_index(state, id),
+        "imported": !imported_from.is_empty(),
+        "imported_from": imported_from,
+        "thumbnail_path": thumb,
+        "thumbnail_state": thumb_state,
+        "metadata_key": GENPARAMS_TEXT_KEY,
+        "has_params": !params_json.is_empty(),
+        "params": params,
+        // flattened common fields for cheap lightbox queries (null when absent)
+        "model": pick("model"),
+        "prompt": pick("prompt"),
+        "negative": pick("negative"),
+        "seed": pick("seed"),
+        "width": pick("width"),
+        "height": pick("height"),
+        "steps": pick("steps"),
+        "cfg": pick("cfg"),
+        "sampler": pick("sampler"),
+        "scheduler": pick("scheduler"),
+    })
 }
 
 fn error_item(path: &str, id: &str, err: &str) -> Value {
@@ -479,6 +703,22 @@ fn state_arr(doc: &Value, key: &str) -> Value {
     doc.get(key).filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([]))
 }
 
+/// Carry the additive `output_path_template` (a string) from `old` onto `rebuilt`.
+/// The `set_*_doc` helpers reconstruct the gallery-state object from a fixed key
+/// set, which would otherwise drop this field; this re-injects it (only when the
+/// old doc actually carried a non-empty template, so back-compat docs stay clean).
+fn preserve_template(old: &Value, rebuilt: Value) -> Value {
+    let mut rebuilt = rebuilt;
+    if let Some(t) = old.get("output_path_template").and_then(|v| v.as_str()) {
+        if !t.is_empty() {
+            if let Some(m) = rebuilt.as_object_mut() {
+                m.insert("output_path_template".into(), json!(t));
+            }
+        }
+    }
+    rebuilt
+}
+
 fn save_gallery_state(out: &Path, doc: &Value) -> std::io::Result<()> {
     std::fs::create_dir_all(out.join("state"))?;
     let _ = std::fs::create_dir_all(thumb_dir(out));
@@ -506,8 +746,8 @@ fn set_favorite_doc(doc: &Value, id: &str, favorite: bool) -> Value {
     if favorite && !found {
         favs.push(json!(id));
     }
-    json!({ "schema": "serenity.gallery_state.v1", "favorites": favs,
-        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") })
+    preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": favs,
+        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") }))
 }
 
 /// `_set_gallery_name_doc` — upsert {id,name} in names, preserve the rest.
@@ -527,8 +767,8 @@ fn set_name_doc(doc: &Value, id: &str, name: &str) -> Value {
     if !replaced {
         names.push(json!({ "id": id, "name": name }));
     }
-    json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
-        "names": names, "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") })
+    preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": names, "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") }))
 }
 
 /// `_set_gallery_order_doc` — validate each id (safe + png exists), set order.
@@ -545,8 +785,8 @@ fn set_order_doc(out: &Path, doc: &Value, ids: &Value) -> Result<Value, String> 
         }
         order.push(json!(id));
     }
-    Ok(json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
-        "names": state_arr(doc, "names"), "order": order, "imports": state_arr(doc, "imports") }))
+    Ok(preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": state_arr(doc, "names"), "order": order, "imports": state_arr(doc, "imports") })))
 }
 
 /// `_remove_gallery_item_doc` — drop `id` from every array.
@@ -561,8 +801,8 @@ fn remove_item_doc(doc: &Value, id: &str) -> Value {
             .map(|a| a.iter().filter(|e| e.get("id").and_then(|v| v.as_str()) != Some(id)).cloned().collect())
             .unwrap_or_default()
     };
-    json!({ "schema": "serenity.gallery_state.v1", "favorites": strip_strs("favorites"),
-        "names": strip_objs("names"), "order": strip_strs("order"), "imports": strip_objs("imports") })
+    preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": strip_strs("favorites"),
+        "names": strip_objs("names"), "order": strip_strs("order"), "imports": strip_objs("imports") }))
 }
 
 /// `_set_gallery_import_doc` — upsert {id, source_path} in imports, preserve the rest.
@@ -582,8 +822,8 @@ fn set_import_doc(doc: &Value, id: &str, source_path: &str) -> Value {
     if !replaced {
         imports.push(json!({ "id": id, "source_path": source_path }));
     }
-    json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
-        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": imports })
+    preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": imports }))
 }
 
 fn required_string(body: &Value, key: &str) -> Result<String, String> {
@@ -715,6 +955,109 @@ pub async fn delete_item(State(st): State<AppState>, AxPath(id): AxPath<String>)
     }))
 }
 
+// ── output-path template config (SwarmUI OutpathBuilder, §7) ─────────────────────
+
+/// `_set_gallery_template_doc` — set `output_path_template`, preserve the rest. An
+/// empty/whitespace template removes the field (== back to `job-NNNN` naming).
+// Only reached from post_output_template (route-wiring pending in main.rs) + the
+// unit test; `allow(dead_code)` keeps a plain `cargo build` warning-clean.
+#[allow(dead_code)]
+fn set_template_doc(doc: &Value, template: &str) -> Value {
+    let mut next = json!({
+        "schema": "serenity.gallery_state.v1",
+        "favorites": state_arr(doc, "favorites"),
+        "names": state_arr(doc, "names"),
+        "order": state_arr(doc, "order"),
+        "imports": state_arr(doc, "imports"),
+    });
+    if !template.trim().is_empty() {
+        if let Some(m) = next.as_object_mut() {
+            m.insert("output_path_template".into(), json!(template));
+        }
+    }
+    next
+}
+
+/// The known `[token]`s a template may use (for the UI helper / docs).
+// Consumed only by the (route-wiring-pending) output-template handlers.
+#[allow(dead_code)]
+const OUTPUT_TEMPLATE_TOKENS: &[&str] = &[
+    "id", "model", "prompt", "negative", "seed", "width", "height",
+    "steps", "cfg", "sampler", "scheduler", "date", "time",
+];
+
+/// GET /v1/gallery/output-template — current template + the token vocabulary, and
+/// (when `?id=job-XXXX` or `?path=` is given) a resolved preview against that item.
+// Route-wiring lives in main.rs (owned by another track); `allow(dead_code)` keeps
+// the build warning-clean until that row is added. The core feature (template
+// resolution + `output_name`/`metadata` emission) already flows through the wired
+// list/one/read handlers regardless of this config endpoint.
+#[allow(dead_code)]
+pub async fn get_output_template(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let out = st.out_dir.as_path();
+    let state = load_gallery_state(out);
+    let template = gallery_output_template(&state);
+    let mut doc = json!({
+        "schema": "serenity.gallery_output_template.v1",
+        "output_path_template": template,
+        "tokens": OUTPUT_TEMPLATE_TOKENS,
+        "default_naming": "job-NNNN (when template is empty)",
+    });
+    // optional preview against a concrete item
+    let id = q.get("id").cloned().unwrap_or_default();
+    let path = q.get("path").cloned().unwrap_or_default();
+    let (pid, ppath) = if !id.is_empty() && safe_gallery_id(&id) {
+        (id.clone(), png_path(out, &id))
+    } else if !path.is_empty() {
+        (String::new(), path)
+    } else {
+        (String::new(), String::new())
+    };
+    if !ppath.is_empty() {
+        let params = serde_json::from_str::<Value>(&png_genparams_or_empty(&ppath))
+            .ok()
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| json!({}));
+        let preview_id: &str = if pid.is_empty() { "job-0000" } else { pid.as_str() };
+        let preview = resolve_output_template(&template, preview_id, &params, &ppath);
+        if let Some(m) = doc.as_object_mut() {
+            m.insert("preview".into(), json!(preview));
+            m.insert("preview_filename".into(), json!(format!("{preview}.png")));
+        }
+    }
+    json_compact(StatusCode::OK, &doc)
+}
+
+/// POST /v1/gallery/output-template — set the output-path template. Body
+/// `{"template":"[model]-[seed]-[date]"}` (empty/missing clears it → default
+/// naming). Returns the stored template + token vocabulary.
+// Route-wiring lives in main.rs (another track); see get_output_template above.
+#[allow(dead_code)]
+pub async fn post_output_template(State(st): State<AppState>, body: String) -> Response {
+    let out = st.out_dir.as_path();
+    let b = body_object(&body);
+    // accept either "template" or "output_path_template"; both optional (empty=clear)
+    let template = b
+        .get("template")
+        .or_else(|| b.get("output_path_template"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // length guard: a runaway template would bloat gallery.json + every item name.
+    if template.len() > 512 {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "'template' too long (max 512 chars)");
+    }
+    let next = set_template_doc(&load_gallery_state(out), &template);
+    if save_gallery_state(out, &next).is_err() {
+        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
+    }
+    json_compact(StatusCode::OK, &json!({
+        "schema": "serenity.gallery_output_template.v1",
+        "output_path_template": gallery_output_template(&next),
+        "tokens": OUTPUT_TEMPLATE_TOKENS,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,5 +1090,87 @@ mod tests {
         // favorite query gate
         assert!(!filter_matches("x", false, "", "true"));
         assert!(filter_matches("x", true, "", "true"));
+    }
+
+    #[test]
+    fn sanitize_component() {
+        assert_eq!(sanitize_filename_component("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(sanitize_filename_component("  spaced  out  "), "spaced_out");
+        assert_eq!(sanitize_filename_component("////"), "_");
+        assert_eq!(sanitize_filename_component("ok-name_1.2"), "ok-name_1.2");
+    }
+
+    #[test]
+    fn template_empty_is_back_compat() {
+        // empty / whitespace template → the job id (current naming), no file touch
+        let p = json!({"model":"zimage","seed":42});
+        assert_eq!(resolve_output_template("", "job-0007", &p, "/nope.png"), "job-0007");
+        assert_eq!(resolve_output_template("   ", "job-0007", &p, "/nope.png"), "job-0007");
+    }
+
+    #[test]
+    fn template_expands_known_tokens() {
+        // model/seed/prompt come from params; no file access needed for these
+        let p = json!({"model":"Z Image/Turbo","seed":1234,"prompt":"a red car"});
+        // spaces in the model + prompt are sanitized to underscores
+        let r = resolve_output_template("[model]-[seed]-[prompt]", "job-0001", &p, "/nope.png");
+        assert_eq!(r, "Z_Image_Turbo-1234-a_red_car");
+        // numeric seed rendered without quotes
+        assert_eq!(resolve_output_template("[seed]", "job-0001", &p, "/nope.png"), "1234");
+        // [id] token
+        assert_eq!(resolve_output_template("img_[id]", "job-0042", &p, "/nope.png"), "img_job-0042");
+    }
+
+    #[test]
+    fn template_unknown_token_verbatim() {
+        let p = json!({"model":"m"});
+        // an unknown token is left bracketed; a missing param token (no model key)
+        // is also left verbatim
+        let r = resolve_output_template("[model]_[nope]", "job-0001", &p, "/nope.png");
+        assert_eq!(r, "m_[nope]");
+        let r2 = resolve_output_template("[seed]x", "job-0001", &json!({}), "/nope.png");
+        // seed absent → token kept verbatim, sanitizer turns '[seed]x' into '[seed]x'
+        assert_eq!(r2, "[seed]x");
+    }
+
+    #[test]
+    fn template_date_token_missing_file_left_verbatim() {
+        // [date]/[time] read the PNG mtime; a nonexistent file → token kept verbatim
+        let p = json!({"model":"m"});
+        let r = resolve_output_template("[model]-[date]", "job-0001", &p, "/definitely/not/here.png");
+        assert_eq!(r, "m-[date]");
+    }
+
+    #[test]
+    fn template_preserved_across_state_mutations() {
+        // a doc with a template survives every set_*_doc rebuild
+        let doc = json!({
+            "schema": "serenity.gallery_state.v1",
+            "favorites": ["job-0001"], "names": [], "order": [], "imports": [],
+            "output_path_template": "[model]-[seed]",
+        });
+        let after_fav = set_favorite_doc(&doc, "job-0002", true);
+        assert_eq!(gallery_output_template(&after_fav), "[model]-[seed]");
+        let after_name = set_name_doc(&doc, "job-0001", "hero");
+        assert_eq!(gallery_output_template(&after_name), "[model]-[seed]");
+        let after_rm = remove_item_doc(&doc, "job-0001");
+        assert_eq!(gallery_output_template(&after_rm), "[model]-[seed]");
+        let after_imp = set_import_doc(&doc, "job-0003", "/src.png");
+        assert_eq!(gallery_output_template(&after_imp), "[model]-[seed]");
+        // a doc WITHOUT a template stays clean (field not injected)
+        let bare = gallery_state_default();
+        let after = set_favorite_doc(&bare, "job-0001", true);
+        assert!(after.get("output_path_template").is_none());
+    }
+
+    #[test]
+    fn set_template_doc_set_and_clear() {
+        let bare = gallery_state_default();
+        let set = set_template_doc(&bare, "[seed]");
+        assert_eq!(gallery_output_template(&set), "[seed]");
+        // clearing (empty) removes the field
+        let cleared = set_template_doc(&set, "");
+        assert!(cleared.get("output_path_template").is_none());
+        assert_eq!(gallery_output_template(&cleared), "");
     }
 }

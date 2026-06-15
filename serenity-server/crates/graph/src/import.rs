@@ -326,7 +326,9 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
         "EmptyLatentImage" | "EmptySD3LatentImage" | "EmptyFlux2LatentImage" => {
             (slot == 0).then_some("LATENT")
         }
-        "VAEEncode" => (slot == 0).then_some("LATENT"),
+        "VAEEncode" | "VAEEncodeForInpaint" | "RepeatLatentBatch" => {
+            (slot == 0).then_some("LATENT")
+        }
         "SetLatentNoiseMask" => (slot == 0).then_some("LATENT"),
         "ImageScale" | "ImageScaleToTotalPixels" | "ImageScaleBy" => {
             (slot == 0).then_some("IMAGE")
@@ -977,6 +979,15 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
         "InpaintModelConditioning" => {
             fields.insert("noise_mask".into(), json!(widget_bool(widgets, 0, true)));
         }
+        "VAEEncodeForInpaint" => {
+            // Comfy widget order: [grow_mask_by(int)]. Carried for parity but the
+            // flat model has no mask-grow control; the handler aliases to inpaint_*.
+            fields.insert("grow_mask_by".into(), json!(widget_int(widgets, 0, 6)));
+        }
+        "RepeatLatentBatch" => {
+            // Comfy widget order: [amount(int)] — the batch-repeat count.
+            fields.insert("amount".into(), json!(widget_int(widgets, 0, 1)));
+        }
         "SaveImage" => {
             fields.insert(
                 "filename_prefix".into(),
@@ -1000,10 +1011,16 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             fields.insert("steps".into(), json!(widget_int(widgets, 1, 20)));
             fields.insert("denoise".into(), json!(widget_float(widgets, 2, 1.0)));
         }
-        "KarrasScheduler" | "ExponentialScheduler" | "PolyexponentialScheduler" => {
-            // Comfy widget order: [steps, sigma_max, sigma_min, rho?]. Only steps
-            // has a flat slot; the sigma_max/min/rho shape params have no flat
-            // representation (the scheduler name itself gates fail-loud).
+        "KarrasScheduler" | "ExponentialScheduler" | "PolyexponentialScheduler"
+        | "VPScheduler" | "LaplaceScheduler" => {
+            // Comfy widget order: [steps, <shape params: sigma_max/min/rho or
+            // beta_d/beta_min/eps_s or mu/sigma>]. Only steps has a flat slot; the
+            // shape params have no flat representation (the scheduler name itself
+            // gates fail-loud for every one of these — none is worker-supported).
+            fields.insert("steps".into(), json!(widget_int(widgets, 0, 20)));
+        }
+        "BetaSamplingScheduler" => {
+            // Comfy widget order: [steps, alpha, beta]. Only steps is flat.
             fields.insert("steps".into(), json!(widget_int(widgets, 0, 20)));
         }
         "SDTurboScheduler" => {

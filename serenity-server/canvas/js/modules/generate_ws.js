@@ -92,6 +92,13 @@
         submitting = true;
         setBusy(true);
         try {
+          // Phase 6 — deliver the painted mask / init image to the server BEFORE
+          // submit. The worker's inpaint/img2img path is PATH-based: it reads the
+          // init_image / mask_image flat params as filesystem paths. We upload the
+          // PNG(s) here and stash the returned absolute path into state.params so
+          // generateBody() forwards them. (No-op when nothing is painted/dropped.)
+          await prepareMaskAndInit();
+
           const graph = await assembleGraph();
           console.info("[generateWS] assembled ComfyUI graph:", graph);
 
@@ -312,6 +319,75 @@
         };
 
         return g;
+      }
+
+      // ===== Phase 6: path-based mask/init delivery (flat-param submit) =======
+      // The actual submit (api.submitPrompt -> /v1/generate) sends FLAT params read
+      // from state.params, not the assembled graph. The worker's inpaint/img2img
+      // path needs init_image / mask_image as on-disk PATHS. So before submit we:
+      //   1. upload the init/raster layer (if any) -> set params.init_image = path
+      //   2. upload the painted mask (layer or params.mask_data) -> params.mask_image
+      // Each upload returns {name, path, url}; we keep the absolute `path`.
+      async function prepareMaskAndInit() {
+        const layers = Array.isArray(get("layers")) ? get("layers") : [];
+
+        // --- init / raster image (img2img source) ----------------------------
+        const rasterLayer = layers.find(
+          (l) => l && (l.type === "raster" || l.type === "reference") &&
+                 l.visible !== false && hasPixels(l)
+        );
+        let initPath = null;
+        if (rasterLayer) {
+          initPath = rasterLayer.uploadedPath ||
+            await uploadLayerForPath(rasterLayer, "init", api.uploadImage);
+          if (initPath) {
+            rasterLayer.uploadedPath = initPath;
+            set("params.init_image", initPath);
+          }
+        }
+
+        // --- mask (inpaint) --------------------------------------------------
+        const maskLayer = layers.find(
+          (l) => l && l.type === "mask" && l.visible !== false && hasPixels(l)
+        );
+        let maskBlob = null, maskName = "mask";
+        if (maskLayer) {
+          maskBlob = await layerToBlob(maskLayer);
+          maskName = (maskLayer.name || "mask").replace(/\s+/g, "_");
+        } else {
+          // no layer, but the mask-paint module may have stashed a base64 PNG
+          const b64 = get("params.mask_data");
+          if (typeof b64 === "string" && b64.length) maskBlob = b64; // api.toBase64 passes strings through
+        }
+        if (maskBlob) {
+          try {
+            const res = await api.uploadMask(maskBlob, null, maskName + ".png");
+            const maskPath = res && (res.path || res.name || res.filename);
+            if (maskPath) {
+              if (maskLayer) maskLayer.uploadedPath = maskPath;
+              set("params.mask_image", maskPath);
+              // the worker keys masked regen on the luminance channel by default
+              if (!get("params.lanpaint_mask_channel"))
+                set("params.lanpaint_mask_channel", get("params.mask_channel") || "luminance");
+            }
+          } catch (e) {
+            console.warn("[generateWS] mask upload failed:", e);
+          }
+        }
+      }
+
+      // Upload a layer's pixels via `uploader` and return the on-disk path (or null).
+      async function uploadLayerForPath(layer, kind, uploader) {
+        const blob = await layerToBlob(layer);
+        if (!blob) return null;
+        try {
+          const name = (layer.name || kind || "layer").replace(/\s+/g, "_") + ".png";
+          const res = await uploader(blob, name);
+          return (res && (res.path || res.name || res.filename)) || null;
+        } catch (e) {
+          console.warn("[generateWS] upload failed for layer", layer && layer.id, e);
+          return null;
+        }
       }
 
       // ===== layer image / mask upload helpers ===============================

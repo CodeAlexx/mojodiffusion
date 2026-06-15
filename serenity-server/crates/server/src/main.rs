@@ -1468,6 +1468,133 @@ async fn get_samplers() -> Response {
         .into_response()
 }
 
+// ── /upload/image + /upload/mask — land a PNG on disk for the worker's path-based
+//    img2img / inpaint flow (init_image / mask_image are FILESYSTEM PATHS to the
+//    worker, never inline bytes). The Konva canvas paints a mask / drops an init
+//    image in-browser and POSTs it here as base64 (or a `data:` URL); we decode it,
+//    write `<out_dir>/uploads/<name>.png`, and return its absolute path. The path is
+//    also browser-fetchable at `/out/uploads/<name>.png` (served by serve_out), so
+//    the UI can preview the saved upload. No new crate dep: base64 is decoded with a
+//    small self-contained decoder (the codebase already hand-rolls crc32 in gallery).
+
+/// Decode standard base64 (RFC 4648, `+`/`/` alphabet) ignoring whitespace and a
+/// trailing `data:...;base64,` prefix. Returns None on an invalid character.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    // strip a data-URL prefix if present (e.g. "data:image/png;base64,AAAA")
+    let s = match input.find("base64,") {
+        Some(i) => &input[i + "base64,".len()..],
+        None => input,
+    };
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val(c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Reduce a client-suggested name to a safe `[A-Za-z0-9._-]` stem (no path
+/// traversal, no separators); empty -> a fallback so we always have a target.
+fn safe_upload_stem(name: &str, fallback: &str) -> String {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let cleaned: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim_matches('.').trim_matches('_');
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.chars().take(96).collect()
+    }
+}
+
+/// Shared body for /upload/image and /upload/mask: `{name?, data}` where `data` is
+/// base64 (optionally a `data:` URL). Writes `<out_dir>/uploads/<stem>-<n>.png` and
+/// returns `{name, path, url}` (path is the absolute on-disk path the worker reads).
+fn handle_upload(st: &AppState, body: &str, fallback_stem: &str) -> Response {
+    let b: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) if v.is_object() => v,
+        _ => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "upload body must be a JSON object"),
+    };
+    // accept the payload under any of the names the canvas / ComfyUI conventions use
+    let data = b
+        .get("data")
+        .or_else(|| b.get("image"))
+        .or_else(|| b.get("mask"))
+        .or_else(|| b.get("dataURL"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if data.is_empty() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'data' (base64 PNG) is required");
+    }
+    let bytes = match base64_decode(data) {
+        Some(b) if !b.is_empty() => b,
+        _ => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'data' is not valid base64"),
+    };
+    let req_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let stem = safe_upload_stem(req_name, fallback_stem);
+
+    let dir = st.out_dir.join("uploads");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot create uploads dir");
+    }
+    // unique per upload so a re-painted mask never collides with a cached file
+    let n = st.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let fname = format!("{stem}-{n:04}.png");
+    let dest = dir.join(&fname);
+    if std::fs::write(&dest, &bytes).is_err() {
+        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot write upload");
+    }
+    let path = dest.to_string_lossy().into_owned();
+    json_compact(
+        StatusCode::OK,
+        &json!({
+            "name": fname,
+            "path": path,
+            "url": format!("/out/uploads/{fname}"),
+        }),
+    )
+}
+
+/// POST /upload/image — land an init image (img2img source) on disk. Returns
+/// `{name, path, url}`; the canvas puts `path` into the `init_image` flat param.
+async fn post_upload_image(State(st): State<AppState>, body: String) -> Response {
+    handle_upload(&st, &body, "init")
+}
+
+/// POST /upload/mask — land a painted inpaint mask on disk. Returns `{name, path,
+/// url}`; the canvas puts `path` into the `mask_image` flat param.
+async fn post_upload_mask(State(st): State<AppState>, body: String) -> Response {
+    handle_upload(&st, &body, "mask")
+}
+
 // ── /v1/state + /v1/presets — file-backed UI state & named presets ──────────────
 // Faithful ports of serenity_daemon.mojo's handlers (_load_state_doc /
 // _load_presets_doc / _state_doc_from_body / _upsert_preset_doc / _delete_preset_doc).
@@ -1798,6 +1925,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/progress", get(ws_progress))
         .route("/v1/health", get(get_health))
         .route("/v1/samplers", get(get_samplers))
+        // Phase 6 — mask/image upload seam: land a PNG on disk so the worker's
+        // path-based img2img/inpaint flow (init_image/mask_image) can read it.
+        .route("/upload/image", post(post_upload_image))
+        .route("/upload/mask", post(post_upload_mask))
         .route("/v1/models", get(models::get_models))
         .route("/v1/jobs", get(jobs::get_jobs))
         .route("/v1/job/:id", get(jobs::get_job_one))

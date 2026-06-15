@@ -43,6 +43,11 @@
       loras: p.loras, refiner: p.refiner,
       hires_scale: p.hires_scale, hires_denoise: p.hires_denoise,
       mask_data: p.mask_data, mask_channel: p.mask_channel, mask_mime: p.mask_mime,
+      // Path-based inpaint/img2img: the worker reads init_image/mask_image as
+      // FILESYSTEM PATHS. generate_ws uploads the painted mask / init layer via
+      // api.uploadMask / api.uploadImage and stashes the returned path here.
+      init_image: p.init_image, mask_image: p.mask_image,
+      lanpaint_mask_channel: p.lanpaint_mask_channel,
       outpaint: p.outpaint, outpaint_enabled: p.outpaint_enabled,
       refiner_model: p.refiner_model, refiner_steps: p.refiner_steps,
       refiner_cfg: p.refiner_cfg, refiner_method: p.refiner_method,
@@ -52,6 +57,36 @@
   }
 
   function closeProgressWS() { try { if (activeWS) activeWS.close(); } catch (_) {} activeWS = null; }
+
+  // Read a Blob (or already-string base64/dataURL) as base64 (no data: prefix).
+  function toBase64(blobOrStr) {
+    if (typeof blobOrStr === 'string') {
+      var s = blobOrStr;
+      var i = s.indexOf('base64,');
+      return Promise.resolve(i >= 0 ? s.slice(i + 7) : s);
+    }
+    if (!(blobOrStr instanceof Blob)) return Promise.reject(new Error('upload: need a Blob'));
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () {
+        var r = String(fr.result || '');
+        var i = r.indexOf('base64,');
+        resolve(i >= 0 ? r.slice(i + 7) : r);
+      };
+      fr.onerror = function () { reject(fr.error || new Error('FileReader failed')); };
+      fr.readAsDataURL(blobOrStr);
+    });
+  }
+
+  // POST a base64 PNG to an upload endpoint; resolve to {name, path, url}.
+  function postUpload(endpoint, blobOrStr, name) {
+    return toBase64(blobOrStr).then(function (b64) {
+      return fetch(BASE + endpoint, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name || 'layer.png', data: b64 }),
+      }).then(j);
+    });
+  }
 
   // Open the job-keyed progress WS and translate {ev:...} -> ComfyUI-shaped cb calls.
   function openProgressWS(job, cb) {
@@ -106,8 +141,15 @@
     loras: function () { return Promise.resolve([]); },
     embeddings: function () { return Promise.resolve([]); },
     history: function () { return Promise.resolve({}); },
-    uploadImage: function () { return Promise.reject(new Error('upload n/a')); },
-    uploadMask: function () { return Promise.reject(new Error('mask upload n/a')); },
+    // uploadImage(blob, name) -> {name, path, url}. `path` is the worker-readable
+    // absolute path; generate_ws stashes it into params.init_image.
+    uploadImage: function (blob, name) { return postUpload('/upload/image', blob, name); },
+    // uploadMask(blob, ref, name) -> {name, path, url}. `ref` (the base raster) is
+    // accepted for ComfyUI-call-shape compatibility but unused: the worker's inpaint
+    // path composites init_image+mask_image by path, so only the mask PNG is sent.
+    uploadMask: function (blob, ref, name) {
+      return postUpload('/upload/mask', blob, typeof ref === 'string' ? ref : name);
+    },
     preprocess: function () { return Promise.reject(new Error('preprocess n/a')); },
     sam: function () { return Promise.reject(new Error('sam n/a')); },
 

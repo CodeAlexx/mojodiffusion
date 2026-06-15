@@ -817,6 +817,8 @@ fn exec_node(
         "ImageResizeKJ" => exec_image_resize_kj(node, links, store, out),
         "ImagePadForOutpaint" => exec_image_pad(node, links, store, out),
         "VAEEncode" => exec_vae_encode(node, links, store),
+        "VAEEncodeForInpaint" => exec_vae_encode_for_inpaint(node, links, store, out),
+        "RepeatLatentBatch" => exec_repeat_latent_batch(node, links, store, out),
         "SetLatentNoiseMask" => exec_set_latent_noise_mask(node, links, store, out),
         "InpaintModelConditioning" => exec_inpaint_model_conditioning(node, links, store, out),
         "f07d2d08-2bc5-4dd8-a9f0-f2347c6b5cca" => exec_lanpaint_preproc(node, links, store, out),

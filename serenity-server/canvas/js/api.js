@@ -101,7 +101,7 @@
       var m; try { m = JSON.parse(ev.data); } catch (_) { return; }
       var which = (m.ev || '').toLowerCase();
       if (which === 'progress') {
-        cb({ type: 'progress', data: { value: m.step || 0, max: m.total || 0, prompt_id: job } });
+        cb({ type: 'progress', data: { value: m.step || 0, max: m.total || 0, phase: m.phase || '', prompt_id: job } });
       } else if (which === 'done') {
         var fn = baseName(m.output_path);
         cb({ type: 'executed', data: { prompt_id: job, output: { images: [{ filename: fn, type: 'output', subfolder: '' }] } } });

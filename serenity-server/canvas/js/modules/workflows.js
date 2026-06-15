@@ -58,6 +58,8 @@
       "#wf-bar .wf-model{cursor:pointer}",
       "#wf-result{position:absolute;top:12px;right:12px;z-index:6;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:6px}",
       "#wf-result .wf-result-img{display:block;max-width:280px;max-height:280px;border-radius:6px}",
+      "#wf-status{position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:8;background:var(--accent2);color:#fff;",
+      "  border-radius:20px;padding:8px 18px;font-size:13px;font-weight:600;box-shadow:0 4px 14px rgba(0,0,0,.45);pointer-events:none}",
       // docked right-side properties panel (inside #wf-canvas)
       "#wf-props{position:absolute;top:0;right:0;bottom:0;width:300px;z-index:7;background:var(--panel);border-left:1px solid var(--line);",
       "  padding:12px;overflow-y:auto;display:none;box-shadow:-6px 0 16px rgba(0,0,0,.35)}",
@@ -145,7 +147,7 @@
       var tpl = el("button", "btn wf-b", "Templates");
       var load = el("button", "btn wf-b", "Load");
       var save = el("button", "btn wf-b", "Save");
-      var queue = el("button", "btn btn-primary wf-b", "▶ Queue");
+      var queue = el("button", "btn btn-primary wf-b", "▶ Generate");
       [name, modelSel, add, promptIn, tpl, load, save, queue].forEach(function (n) { bar.appendChild(n); });
 
       var cv = el("div"); cv.id = "wf-canvas";
@@ -486,6 +488,12 @@
         if (!patch || typeof patch !== "object") return;
         Object.keys(patch).forEach(function (k) { set("params." + k, patch[k]); });
       }
+      // prominent generation-status overlay (phase + progress) over the canvas
+      var wfStatus = el("div"); wfStatus.id = "wf-status"; wfStatus.style.display = "none"; cv.appendChild(wfStatus);
+      var PHASE_LABEL = { encoding: "Encoding prompt…", loading: "Loading model…", decoding: "Decoding image…", sampling: "Sampling…", prepare: "Preparing…" };
+      function setStatus(txt) { if (!txt) { wfStatus.style.display = "none"; return; } wfStatus.textContent = txt; wfStatus.style.display = "block"; }
+      function endRun(label) { queue.disabled = false; queue.textContent = "▶ Generate" + (label || ""); }
+
       queue.addEventListener("click", function () {
         var lowered = null;
         if (typeof S.wfLower === "function") {
@@ -500,10 +508,14 @@
           if (promptIn.value.trim()) set("params.prompt", promptIn.value);
         }
         queue.disabled = true; queue.textContent = "▶ …";
+        setStatus("⏳ Starting…");
         api.connectWS(ctx.clientId, function (msg) {
           if (!msg) return;
           if (msg.type === "progress") {
-            var d = msg.data || {}; queue.textContent = "▶ " + (d.value || 0) + "/" + (d.max || 0);
+            var d = msg.data || {}, ph = (d.phase || "").toLowerCase();
+            var txt = PHASE_LABEL[ph] || (d.max ? ("Step " + (d.value || 0) + " / " + d.max) : "Working…");
+            setStatus("⏳ " + txt);
+            queue.textContent = "▶ " + (ph || ((d.value || 0) + "/" + (d.max || 0)));
           } else if (msg.type === "executed") {
             var imgs = (msg.data && msg.data.output && msg.data.output.images) || [];
             if (imgs[0]) {
@@ -511,16 +523,17 @@
               showResult(url);
               bus.emit("result:ready", { url: url, filename: imgs[0].filename, params: {} });
             }
+            setStatus("✓ Done"); setTimeout(function () { setStatus(""); }, 1500);
           } else if (msg.type === "executing" && msg.data && msg.data.node === null) {
-            queue.disabled = false; queue.textContent = "▶ Queue";
+            endRun("");
           } else if (msg.type === "execution_error") {
-            queue.disabled = false; queue.textContent = "▶ Queue (error)";
+            endRun(" (error)"); setStatus("⚠ Failed: " + ((msg.data && msg.data.error) || "see console"));
             console.error("[workflows] exec error", msg.data);
           }
         });
         api.submitPrompt(null, ctx.clientId)
-          .then(function (res) { console.info("[workflows] queued", res && res.job_id); })
-          .catch(function (e) { queue.disabled = false; queue.textContent = "▶ Queue (failed)"; console.warn("[workflows] submit failed", e); });
+          .then(function (res) { console.info("[workflows] generate", res && res.job_id); })
+          .catch(function (e) { endRun(" (failed)"); setStatus("⚠ Submit failed"); console.warn("[workflows] submit failed", e); });
       });
       [tpl, load, save].forEach(function (b) { b.addEventListener("click", function () { console.info("[workflows]", b.textContent, "(TODO)"); }); });
 

@@ -1218,9 +1218,14 @@ fn serve_static_file(base: &std::path::Path, rel: &str) -> Response {
         p.push(seg);
     }
     match std::fs::read(&p) {
-        Ok(bytes) => {
-            ([(axum::http::header::CONTENT_TYPE, static_content_type(&p))], bytes).into_response()
-        }
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, static_content_type(&p)),
+                (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            ],
+            bytes,
+        )
+            .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }

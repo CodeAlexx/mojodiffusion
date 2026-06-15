@@ -341,6 +341,71 @@
       return i;
     }
 
+    // ── Generate from idea (LLM prompt generator) ───────────────────────────
+    // Expand a short idea into the full caption (fields + bbox regions) via the
+    // Settings-selected GGUF LLM (/v1/magic_prompt -> ephemeral llama-server).
+    (function buildGen() {
+      var gl = el("label", null, "✨ Generate from idea (LLM)");
+      gl.style.fontWeight = "600"; panelEl.appendChild(gl);
+      var ideaIn = el("textarea");
+      ideaIn.setAttribute("placeholder", "Plain words — e.g. 'a red fox in a snowy pine valley at dawn'");
+      ideaIn.value = d._idea || "";
+      ideaIn.addEventListener("input", function () { d._idea = ideaIn.value; node.setAttr("data", d); });
+      panelEl.appendChild(ideaIn);
+      var row = el("div"); row.style.display = "flex"; row.style.alignItems = "center"; row.style.gap = "8px"; row.style.margin = "4px 0 10px";
+      var btn = el("button", null, "Generate caption");
+      btn.style.cursor = "pointer";
+      var stat = el("span"); stat.style.fontSize = "11px"; stat.style.color = "var(--muted)";
+      row.appendChild(btn); row.appendChild(stat); panelEl.appendChild(row);
+
+      function aspectFromWH(w, h) {
+        w = parseInt(w, 10) || 1024; h = parseInt(h, 10) || 1024;
+        function gcd(a, b) { return b ? gcd(b, a % b) : a; }
+        var g = gcd(w, h) || 1; return (w / g) + ":" + (h / g);
+      }
+      function importCaption(cap) {
+        if (cap.high_level_description) d.high_level_description = String(cap.high_level_description);
+        var cd = cap.compositional_deconstruction || {};
+        if (cd.background != null) d.background = String(cd.background);
+        var sd = cap.style_description || {};
+        if (sd.aesthetics) d.aesthetics = String(sd.aesthetics);
+        if (sd.lighting) d.lighting = String(sd.lighting);
+        if (sd.medium) d.medium = String(sd.medium);
+        var pal = ["#6c8cff", "#ff8c42", "#42d6a4", "#ff5d8f", "#c7f542", "#9b5de5"];
+        var els = Array.isArray(cd.elements) ? cd.elements : [];
+        d.elements = els.map(function (e, i) {
+          var b = Array.isArray(e.bbox) ? e.bbox : [0, 0, 1000, 1000];   // [ymin,xmin,ymax,xmax] 0-1000
+          function cl(v) { return Math.max(0, Math.min(1, v / 1000)); }
+          var x = cl(+b[1] || 0), y = cl(+b[0] || 0);
+          var w2 = cl((+b[3] || 0) - (+b[1] || 0)), h2 = cl((+b[2] || 0) - (+b[0] || 0));
+          var col = (Array.isArray(e.color_palette) && e.color_palette[0]) || pal[i % pal.length];
+          return { id: i + 1, type: e.type === "text" ? "text" : "obj", desc: String(e.desc || ""),
+                   text: e.text || "", color: col, x: x, y: y, w: Math.max(0.02, w2), h: Math.max(0.02, h2) };
+        });
+        d.nextId = d.elements.length + 1; d.selId = null;
+        node.setAttr("data", d);
+      }
+      btn.addEventListener("click", function () {
+        var idea = (ideaIn.value || "").trim();
+        if (!idea) { stat.textContent = "enter an idea first"; return; }
+        d._idea = idea; node.setAttr("data", d);
+        var model = ""; try { model = JSON.parse(localStorage.getItem("serenity.promptgen.llm") || '""'); } catch (_) {}
+        var aspect = aspectFromWH(d.width, d.height);
+        btn.disabled = true; stat.textContent = "generating… (~15-40s)";
+        fetch("/v1/magic_prompt", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ idea: idea, aspect: aspect, model: model }) })
+          .then(function (r) { return r.json(); })
+          .then(function (j) {
+            if (j.error) throw new Error(j.error);
+            var cap; try { cap = JSON.parse(j.caption); } catch (e) { throw new Error("LLM returned non-JSON"); }
+            importCaption(cap); refreshCaption(node);
+            var api = node.getAttr("_bboxApi"); if (api && api.rebuild) api.rebuild();
+            props(node, panelEl, ctx);   // re-render fields + element list with imported values
+          })
+          .catch(function (e) { stat.textContent = "failed: " + e.message; btn.disabled = false; });
+      });
+    })();
+
     fieldInput("High level description", "high_level_description", "one-sentence overview, starts with the subject", true);
     fieldInput("Background (required)", "background", "scene background", true);
     fieldInput("Aesthetics", "aesthetics", "e.g. cinematic, moody");

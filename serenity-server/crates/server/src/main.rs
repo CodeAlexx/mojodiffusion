@@ -56,6 +56,7 @@ use serenity_wire::{JobParams, LoraSpec, WorkerEvent};
 mod gallery;
 mod grid;
 mod jobs;
+mod magic;
 mod models;
 mod video;
 
@@ -1930,6 +1931,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/upload/image", post(post_upload_image))
         .route("/upload/mask", post(post_upload_mask))
         .route("/v1/models", get(models::get_models))
+        .route("/v1/llms", get(magic::get_llms))
+        .route("/v1/magic_prompt", post(magic::post_magic_prompt))
         .route("/v1/jobs", get(jobs::get_jobs))
         .route("/v1/job/:id", get(jobs::get_job_one))
         .route("/v1/reorder", post(jobs::post_reorder))

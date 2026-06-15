@@ -201,6 +201,42 @@
         // broadcast the persisted value once so prompt modules can pick it up on boot
         bus.emit("settings:autocomplete", autoSel.value);
 
+        // ---- Prompt generator (LLM) ----
+        // Which local GGUF LLM expands a short idea into the Ideogram-4 structured
+        // caption (the "Generate from idea" button on the Ideogram4 bbox node).
+        // Persisted to 'serenity.promptgen.llm' (the gguf PATH); the node reads it.
+        var cLLM = el("div", "st-card");
+        cLLM.appendChild(el("h3", null, "Prompt generator (LLM)"));
+        cLLM.appendChild(el("p", "st-hint", "Local GGUF model that turns a short idea into the Ideogram-4 bbox caption. Runs on demand via an ephemeral llama-server (GPU, freed after). Abliterated models won't refuse."));
+        var rLLM = el("div", "st-row");
+        rLLM.appendChild(el("label", null, "Model"));
+        var llmSel = el("select");
+        llmSel.appendChild(function () { var o = el("option", null, "(loading…)"); o.value = ""; return o; }());
+        rLLM.appendChild(llmSel);
+        cLLM.appendChild(rLLM);
+        pane.appendChild(cLLM);
+        var LLM_KEY = "serenity.promptgen.llm";
+        fetch("/v1/llms").then(function (r) { return r.json(); }).then(function (j) {
+          var list = (j && j.llms) || [];
+          llmSel.innerHTML = "";
+          if (!list.length) { var o = el("option", null, "(no GGUF models found)"); o.value = ""; llmSel.appendChild(o); return; }
+          var saved = readJSON(LLM_KEY, "");
+          // default to a Qwen3 if present (abliterated prompt-gen), else first
+          var def = list.find(function (m) { return /qwen3/i.test(m.name); }) || list[0];
+          list.forEach(function (m) {
+            var o = el("option", null, m.name); o.value = m.path; llmSel.appendChild(o);
+          });
+          llmSel.value = (saved && list.some(function (m) { return m.path === saved; })) ? saved : def.path;
+          writeJSON(LLM_KEY, llmSel.value);
+        }).catch(function () {
+          llmSel.innerHTML = ""; var o = el("option", null, "(server unavailable)"); o.value = ""; llmSel.appendChild(o);
+        });
+        llmSel.addEventListener("change", function () {
+          writeJSON(LLM_KEY, llmSel.value);
+          bus.emit("settings:promptgen", llmSel.value);
+          showToast("Prompt LLM: " + (llmSel.options[llmSel.selectedIndex] || {}).text);
+        });
+
         // ---- Generation defaults ----
         var cDef = el("div", "st-card");
         cDef.appendChild(el("h3", null, "Generation defaults"));

@@ -3,7 +3,8 @@
 (function () {
   "use strict";
   const S = window.Serenity;
-  const EXPECTED = ["topbar","paramRail","promptBar","canvasCore","bbox","layers","toolsBrush","controlnet","sam","generateWS","gallery","resultView","navShell","workflows","bboxBuilder"];
+  const EXPECTED = ["topbar","paramRail","advancedSampling","promptBar","canvasCore","bbox","layers","toolsBrush","controlnet","sam","generateWS","gallery","resultView","navShell","workflows","bboxBuilder",
+    "gridXyz","maskPaint","promptSyntax","modelBrowser","galleryPro","livePreview","presetsBrowser","settingsTabs","refinerUpscale"];
 
   function boot() {
     const ctx = {

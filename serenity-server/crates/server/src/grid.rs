@@ -57,6 +57,10 @@ use serenity_wire::JobParams;
 
 // ── tunables ────────────────────────────────────────────────────────────────────
 
+/// Human-readable list of accepted axis names (kept in sync with `Axis::parse`).
+const AXIS_NAMES: &str =
+    "seed, cfg, steps, sampler, scheduler, model, prompt, negative, width, height, resolution, lora";
+
 /// Max number of values on ANY single axis (X, Y, or Z).
 const MAX_VALUES: usize = 16;
 /// Max number of TOTAL cells (|X|*|Y|*|Z|) across the whole cartesian product.
@@ -232,8 +236,12 @@ fn text_px_width(s: &str) -> u32 {
 
 // ── request parsing ───────────────────────────────────────────────────────────────
 
-/// The five swept axes. Numeric axes consume JSON numbers; string axes consume JSON
-/// strings.
+/// The swept axes. Numeric axes consume JSON numbers (or numeric strings after range
+/// expansion); string axes consume JSON strings. Beyond the original five
+/// (seed/cfg/steps/sampler/scheduler) we sweep model/prompt/negative/width/height,
+/// `resolution` (a "WxH" string that sets BOTH width and height), and `lora` (a
+/// "name:weight" or "name" string that REPLACES the cell's LoRA stack with one overlay;
+/// "none" / "" clears it).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Axis {
     Seed,
@@ -241,6 +249,13 @@ enum Axis {
     Steps,
     Sampler,
     Scheduler,
+    Model,
+    Prompt,
+    Negative,
+    Width,
+    Height,
+    Resolution,
+    Lora,
 }
 
 impl Axis {
@@ -251,6 +266,13 @@ impl Axis {
             "steps" => Some(Axis::Steps),
             "sampler" => Some(Axis::Sampler),
             "scheduler" => Some(Axis::Scheduler),
+            "model" => Some(Axis::Model),
+            "prompt" => Some(Axis::Prompt),
+            "negative" => Some(Axis::Negative),
+            "width" => Some(Axis::Width),
+            "height" => Some(Axis::Height),
+            "resolution" | "res" => Some(Axis::Resolution),
+            "lora" => Some(Axis::Lora),
             _ => None,
         }
     }
@@ -261,10 +283,19 @@ impl Axis {
             Axis::Steps => "steps",
             Axis::Sampler => "sampler",
             Axis::Scheduler => "scheduler",
+            Axis::Model => "model",
+            Axis::Prompt => "prompt",
+            Axis::Negative => "negative",
+            Axis::Width => "width",
+            Axis::Height => "height",
+            Axis::Resolution => "resolution",
+            Axis::Lora => "lora",
         }
     }
+    /// Numeric axes (consume JSON numbers / numeric strings). The string axes
+    /// (sampler/scheduler/model/prompt/negative/resolution/lora) consume JSON strings.
     fn is_numeric(self) -> bool {
-        matches!(self, Axis::Seed | Axis::Cfg | Axis::Steps)
+        matches!(self, Axis::Seed | Axis::Cfg | Axis::Steps | Axis::Width | Axis::Height)
     }
 }
 
@@ -345,6 +376,26 @@ fn base_params(st: &AppState, req: &Value) -> Result<JobParams, String> {
     if let Some(v) = opt_str(req, "vae") {
         p.vae = v;
     }
+    // LoRA stack: forward any base `lora` array so cells NOT swept on the lora axis
+    // inherit the user's overlay set. Accept the wire shape [{"name":..,"weight":..}]
+    // (key "lora" per encode_start) or the alias "loras". A lora AXIS later REPLACES
+    // this with its single overlay; other cells keep it.
+    if let Some(arr) = req
+        .get("lora")
+        .or_else(|| req.get("loras"))
+        .and_then(|v| v.as_array())
+    {
+        let mut specs = Vec::with_capacity(arr.len());
+        for it in arr {
+            let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let weight = it.get("weight").and_then(|x| x.as_f64()).unwrap_or(1.0);
+            specs.push(serenity_wire::LoraSpec { name, weight });
+        }
+        p.loras = specs;
+    }
     // One image per cell — the grid IS the multi-image layout.
     p.images = 1;
     // out_dir: explicit request override else the server-configured out_dir.
@@ -383,7 +434,120 @@ fn apply_axis(p: &mut JobParams, axis: Axis, value: &Value) -> Result<String, St
             p.scheduler = s.to_string();
             Ok(s.to_string())
         }
+        Axis::Model => {
+            let s = value.as_str().ok_or("model values must be strings")?;
+            p.model = s.to_string();
+            Ok(s.to_string())
+        }
+        Axis::Prompt => {
+            let s = value.as_str().ok_or("prompt values must be strings")?;
+            p.prompt = s.to_string();
+            // Long prompts make unreadable per-cell labels; trim for the label only.
+            Ok(label_ellipsis(s))
+        }
+        Axis::Negative => {
+            let s = value.as_str().ok_or("negative values must be strings")?;
+            p.negative = s.to_string();
+            Ok(label_ellipsis(s))
+        }
+        Axis::Width => {
+            let n = value.as_i64().ok_or("width values must be integers")?;
+            p.width = n;
+            Ok(n.to_string())
+        }
+        Axis::Height => {
+            let n = value.as_i64().ok_or("height values must be integers")?;
+            p.height = n;
+            Ok(n.to_string())
+        }
+        Axis::Resolution => {
+            // "WxH" (also accepts "W*H" / "W,H" / "WXH"). Sets BOTH width and height.
+            let s = value.as_str().ok_or("resolution values must be strings (\"WxH\")")?;
+            let (w, h) = parse_resolution(s)
+                .ok_or_else(|| format!("resolution '{s}' must be \"WxH\" (e.g. \"1024x768\")"))?;
+            p.width = w;
+            p.height = h;
+            Ok(format!("{w}x{h}"))
+        }
+        Axis::Lora => {
+            // "name:weight" or "name" (weight defaults 1.0); "none"/""/"-" clears the
+            // stack. REPLACES the inherited LoRA stack with this single overlay so each
+            // cell isolates exactly one LoRA (SwarmUI's <lora:..> axis behavior).
+            let s = value.as_str().ok_or("lora values must be strings (\"name:weight\")")?;
+            let trimmed = s.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || trimmed == "-" {
+                p.loras.clear();
+                Ok("none".to_string())
+            } else {
+                let (name, weight) = parse_lora(trimmed);
+                p.loras = vec![serenity_wire::LoraSpec { name: name.clone(), weight }];
+                // label: bare lora file stem + weight when not 1.0.
+                let stem = lora_stem(&name);
+                if (weight - 1.0).abs() < 1e-9 {
+                    Ok(stem)
+                } else {
+                    Ok(format!("{stem}:{}", fmt_num(weight)))
+                }
+            }
+        }
     }
+}
+
+/// Trim a long string to a readable per-cell label (≤24 chars, ellipsized). Used for
+/// the prompt/negative axes whose values can be paragraphs.
+fn label_ellipsis(s: &str) -> String {
+    let s = s.trim();
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= 24 {
+        s.to_string()
+    } else {
+        let head: String = chars[..21].iter().collect();
+        format!("{head}...")
+    }
+}
+
+/// Parse a "WxH" resolution string. Accepts x/X/*/, as the separator and tolerates
+/// surrounding whitespace. Returns (width, height) when both are positive integers.
+fn parse_resolution(s: &str) -> Option<(i64, i64)> {
+    let lower = s.trim().to_ascii_lowercase();
+    let parts: Vec<&str> = lower
+        .split(['x', '*', ','])
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let w: i64 = parts[0].parse().ok()?;
+    let h: i64 = parts[1].parse().ok()?;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// Split a "name:weight" LoRA spec into (name, weight). A bare "name" defaults weight to
+/// 1.0. The weight is the part after the LAST ':' IF it parses as a float (so a path with
+/// a drive-letter-like colon, or a name containing ':', isn't mis-split).
+fn parse_lora(s: &str) -> (String, f64) {
+    if let Some(idx) = s.rfind(':') {
+        let (name, w) = s.split_at(idx);
+        let wstr = &w[1..];
+        if let Ok(weight) = wstr.trim().parse::<f64>() {
+            return (name.trim().to_string(), weight);
+        }
+    }
+    (s.trim().to_string(), 1.0)
+}
+
+/// File stem of a LoRA name for a compact label (drop any dir + the .safetensors ext).
+fn lora_stem(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base.strip_suffix(".safetensors")
+        .or_else(|| base.strip_suffix(".ckpt"))
+        .or_else(|| base.strip_suffix(".pt"))
+        .unwrap_or(base)
+        .to_string()
 }
 
 /// Format an f64 for a cfg label: integral values as "N.0", else a trimmed decimal.
@@ -396,6 +560,184 @@ fn fmt_num(n: f64) -> String {
         let s = s.trim_end_matches('0');
         let s = s.trim_end_matches('.');
         s.to_string()
+    }
+}
+
+// ── value-list normalization (range expansion + "||"/"," delimiters) ─────────────-
+
+/// Split a raw `<prefix>_values` JSON value into a list of typed `Value`s, applying
+/// SwarmUI-style sugar when the field is given as a STRING (rather than an explicit
+/// JSON array):
+///   - delimiter: `||` if present, else `,`  (so values may themselves contain commas
+///     by switching to `||`, e.g. prompts);
+///   - per-entry range expansion `a,b,..,c` → arithmetic sequence (only for numeric
+///     axes; the `b` term sets the step, defaulting to ±1);
+///   - `SKIP:<value>` entries are dropped from the produced list.
+/// A JSON ARRAY is passed through verbatim (numeric axes get numbers, string axes get
+/// strings — the existing type-check still runs downstream). For numeric axes, numeric
+/// STRING entries ("3", "1.5") are coerced to JSON numbers so the downstream type-check
+/// passes.
+/// Returns Err with a message keyed by `values_key` on a malformed string entry.
+fn normalize_values(raw: &Value, axis: Axis, values_key: &str) -> Result<Vec<Value>, String> {
+    // Explicit JSON array: pass through, but coerce numeric-string entries for numeric
+    // axes (so a JSON array like ["3","5"] on a numeric axis still works).
+    if let Some(arr) = raw.as_array() {
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            if axis.is_numeric() {
+                if let Some(s) = v.as_str() {
+                    out.push(coerce_numeric_token(s, axis, values_key)?);
+                    continue;
+                }
+            }
+            out.push(v.clone());
+        }
+        return Ok(out);
+    }
+    // String form: split, range-expand, SKIP-filter.
+    let s = raw
+        .as_str()
+        .ok_or_else(|| format!("'{values_key}' must be an array or a delimited string"))?;
+    let delim_dbl = s.contains("||");
+    let raw_entries: Vec<String> = if delim_dbl {
+        s.split("||").map(|t| t.trim().to_string()).collect()
+    } else {
+        s.split(',').map(|t| t.trim().to_string()).collect()
+    };
+
+    // For the COMMA delimiter on a numeric axis, an embedded ".." range ("1,2,..,10")
+    // spreads across multiple comma tokens, so process the comma-joined string as one
+    // unit. With "||" each entry is independent and may itself carry a "a,b,..,c" range.
+    let mut out: Vec<Value> = Vec::new();
+    if !delim_dbl && axis.is_numeric() {
+        // Re-join (we split on ',') and run the whole thing through the range expander,
+        // which understands the ".." sentinel between comma tokens.
+        expand_numeric_csv(s, axis, values_key, &mut out)?;
+        return Ok(out);
+    }
+    for entry in raw_entries {
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(rest) = entry.strip_prefix("SKIP:") {
+            let _ = rest; // explicit skip marker → drop
+            continue;
+        }
+        if axis.is_numeric() {
+            // an entry may itself be a "a,b,..,c" comma range (only reachable under "||")
+            if entry.contains("..") || entry.contains(',') {
+                expand_numeric_csv(&entry, axis, values_key, &mut out)?;
+            } else {
+                out.push(coerce_numeric_token(&entry, axis, values_key)?);
+            }
+        } else {
+            out.push(Value::String(entry));
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("'{values_key}' produced no values after expansion"));
+    }
+    Ok(out)
+}
+
+/// Coerce a single token to a numeric JSON `Value` for a numeric axis (i64 for
+/// seed/steps/width/height, f64 for cfg). Errors on a non-numeric token.
+fn coerce_numeric_token(tok: &str, axis: Axis, values_key: &str) -> Result<Value, String> {
+    let t = tok.trim();
+    if matches!(axis, Axis::Cfg) {
+        let n: f64 = t
+            .parse()
+            .map_err(|_| format!("'{values_key}' entry '{t}' must be a number"))?;
+        Ok(json!(n))
+    } else {
+        let n: i64 = t
+            .parse()
+            .map_err(|_| format!("'{values_key}' entry '{t}' must be an integer"))?;
+        Ok(json!(n))
+    }
+}
+
+/// Expand a comma-separated numeric spec with optional `..` range sentinels into JSON
+/// numbers, appended to `out`. Supported forms (mirrors SwarmUI's grid syntax):
+///   "1,2,3"           → 1, 2, 3
+///   "1,..,5"          → 1, 2, 3, 4, 5            (step inferred ±1 from direction)
+///   "1,3,..,9"        → 1, 3, 5, 7, 9            (step = 3-1 = 2)
+///   "10,..,1"         → 10, 9, ... 1             (descending, step -1)
+///   "0,SKIP:2,..,8"   → not supported inside a range; SKIP only as a standalone entry
+/// Caps the generated count at MAX_VALUES so a runaway range can't blow the axis cap.
+fn expand_numeric_csv(spec: &str, axis: Axis, values_key: &str, out: &mut Vec<Value>) -> Result<(), String> {
+    let toks: Vec<&str> = spec.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    let is_float = matches!(axis, Axis::Cfg);
+    let mut i = 0usize;
+    while i < toks.len() {
+        let tok = toks[i];
+        if tok == ".." {
+            // A range sentinel needs a value BEFORE (already pushed) and AFTER it.
+            let prev_val = out
+                .last()
+                .ok_or_else(|| format!("'{values_key}': '..' range needs a value before it"))?;
+            let end_tok = toks
+                .get(i + 1)
+                .ok_or_else(|| format!("'{values_key}': '..' range needs a value after it"))?;
+            // start = last pushed; step = inferred from the gap between the last TWO
+            // pushed values (if any), else ±1 toward the end.
+            let start = json_to_f64(prev_val);
+            let end: f64 = end_tok
+                .parse()
+                .map_err(|_| format!("'{values_key}': range end '{end_tok}' is not a number"))?;
+            // step: difference of the last two emitted values, else unit toward end.
+            let step = if out.len() >= 2 {
+                let a = json_to_f64(&out[out.len() - 2]);
+                let b = json_to_f64(&out[out.len() - 1]);
+                let d = b - a;
+                if d == 0.0 { if end >= start { 1.0 } else { -1.0 } } else { d }
+            } else if end >= start {
+                1.0
+            } else {
+                -1.0
+            };
+            if step == 0.0 {
+                return Err(format!("'{values_key}': range step resolved to 0"));
+            }
+            // generate (start+step .. end), inclusive of end (within an epsilon).
+            let mut cur = start + step;
+            let mut guard = 0usize;
+            let going_up = step > 0.0;
+            while (going_up && cur <= end + 1e-9) || (!going_up && cur >= end - 1e-9) {
+                push_num(out, cur, is_float);
+                cur += step;
+                guard += 1;
+                if out.len() > MAX_VALUES || guard > MAX_VALUES + 4 {
+                    return Err(format!(
+                        "'{values_key}' range expands past the {MAX_VALUES}-value cap"
+                    ));
+                }
+            }
+            i += 2; // consumed ".." and the end token
+        } else {
+            out.push(coerce_numeric_token(tok, axis, values_key)?);
+            i += 1;
+        }
+        if out.len() > MAX_VALUES {
+            return Err(format!(
+                "'{values_key}' has too many entries (max {MAX_VALUES})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_to_f64(v: &Value) -> f64 {
+    v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)).unwrap_or(0.0)
+}
+
+/// Push a numeric value as the right JSON type (i64 for integer axes, f64 for cfg),
+/// rounding integer axes to the nearest integer to absorb float-accumulation drift.
+fn push_num(out: &mut Vec<Value>, v: f64, is_float: bool) {
+    if is_float {
+        out.push(json!(v));
+    } else {
+        out.push(json!(v.round() as i64));
     }
 }
 
@@ -426,14 +768,15 @@ fn parse_axis_spec(req: &Value, prefix: &str) -> Result<Option<AxisSpec>, String
         None => return Ok(None),
     };
     let axis = Axis::parse(&axis_str).ok_or_else(|| {
-        format!("'{axis_key}' must be one of: seed, cfg, steps, sampler, scheduler")
+        format!("'{axis_key}' must be one of: {AXIS_NAMES}")
     })?;
     let values_key = format!("{prefix}_values");
-    let values = req
+    let raw = req
         .get(&values_key)
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| format!("'{values_key}' (array) is required when '{axis_key}' is set"))?
-        .clone();
+        .ok_or_else(|| format!("'{values_key}' (array or delimited string) is required when '{axis_key}' is set"))?;
+    // Accept BOTH an explicit JSON array AND a SwarmUI-style delimited string
+    // ("1,2,..,10" / "a || b || c" / "SKIP:..").
+    let values = normalize_values(raw, axis, &values_key)?;
     if values.is_empty() {
         return Err(format!("'{values_key}' must not be empty"));
     }
@@ -507,6 +850,8 @@ fn enqueue_cell(st: &AppState, mut params: JobParams) -> Result<String, String> 
         "sigma_max": params.sigma_max,
         "restart_sampling": params.restart_sampling,
         "vae": params.vae,
+        // LoRA overlays (so a lora-axis cell round-trips in /v1/gallery reuse-params).
+        "loras": params.loras.iter().map(|l| json!({"name": l.name, "weight": l.weight})).collect::<Vec<_>>(),
     });
     params.params_json = serde_json::to_string(&gp).unwrap_or_default();
 
@@ -764,12 +1109,11 @@ fn collect_specs(req: &Value) -> Result<Vec<AxisSpec>, String> {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "'axis' (string) is required".to_string())?;
         let axis = Axis::parse(&axis_str)
-            .ok_or_else(|| "'axis' must be one of: seed, cfg, steps, sampler, scheduler".to_string())?;
-        let values = req
+            .ok_or_else(|| format!("'axis' must be one of: {AXIS_NAMES}"))?;
+        let raw = req
             .get("values")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "'values' (array) is required".to_string())?
-            .clone();
+            .ok_or_else(|| "'values' (array or delimited string) is required".to_string())?;
+        let values = normalize_values(raw, axis, "values")?;
         if values.is_empty() {
             return Err("'values' must not be empty".into());
         }
@@ -1219,6 +1563,127 @@ mod tests {
         let req = json!({ "model": "m", "prompt": "p" });
         let e = collect_specs(&req).unwrap_err();
         assert!(e.contains("at least one axis"), "got: {e}");
+    }
+
+    #[test]
+    fn parse_resolution_forms() {
+        assert_eq!(parse_resolution("1024x768"), Some((1024, 768)));
+        assert_eq!(parse_resolution(" 1024 X 768 "), Some((1024, 768)));
+        assert_eq!(parse_resolution("512*512"), Some((512, 512)));
+        assert_eq!(parse_resolution("1280,720"), Some((1280, 720)));
+        assert_eq!(parse_resolution("nope"), None);
+        assert_eq!(parse_resolution("1024"), None);
+        assert_eq!(parse_resolution("0x10"), None);
+    }
+
+    #[test]
+    fn parse_lora_split() {
+        assert_eq!(parse_lora("style.safetensors:0.8"), ("style.safetensors".into(), 0.8));
+        assert_eq!(parse_lora("style"), ("style".into(), 1.0));
+        // trailing non-float after ':' is treated as part of the name
+        assert_eq!(parse_lora("a:b"), ("a:b".into(), 1.0));
+        assert_eq!(lora_stem("loras/foo.safetensors"), "foo");
+        assert_eq!(lora_stem("bar.ckpt"), "bar");
+    }
+
+    #[test]
+    fn apply_axis_new_axes() {
+        let mut p = JobParams::default();
+        assert_eq!(apply_axis(&mut p, Axis::Model, &json!("z-image")).unwrap(), "z-image");
+        assert_eq!(p.model, "z-image");
+        assert_eq!(apply_axis(&mut p, Axis::Width, &json!(768)).unwrap(), "768");
+        assert_eq!(p.width, 768);
+        assert_eq!(apply_axis(&mut p, Axis::Resolution, &json!("1024x576")).unwrap(), "1024x576");
+        assert_eq!((p.width, p.height), (1024, 576));
+        // lora replace + clear
+        assert_eq!(apply_axis(&mut p, Axis::Lora, &json!("foo.safetensors:0.5")).unwrap(), "foo:0.5");
+        assert_eq!(p.loras.len(), 1);
+        assert_eq!(p.loras[0].weight, 0.5);
+        assert_eq!(apply_axis(&mut p, Axis::Lora, &json!("none")).unwrap(), "none");
+        assert!(p.loras.is_empty());
+        // long prompt -> ellipsized label, full text on params
+        let long = "a very very long prompt that exceeds twenty four characters easily";
+        let lbl = apply_axis(&mut p, Axis::Prompt, &json!(long)).unwrap();
+        assert!(lbl.ends_with("..."));
+        assert!(lbl.chars().count() <= 24);
+        assert_eq!(p.prompt, long);
+    }
+
+    #[test]
+    fn normalize_values_range_csv() {
+        // "1,..,5" -> 1,2,3,4,5
+        let v = normalize_values(&json!("1,..,5"), Axis::Steps, "x_values").unwrap();
+        assert_eq!(v, vec![json!(1), json!(2), json!(3), json!(4), json!(5)]);
+        // stepped "1,3,..,9" -> 1,3,5,7,9
+        let v = normalize_values(&json!("1,3,..,9"), Axis::Steps, "x_values").unwrap();
+        assert_eq!(v, vec![json!(1), json!(3), json!(5), json!(7), json!(9)]);
+        // descending "10,..,7"
+        let v = normalize_values(&json!("10,..,7"), Axis::Seed, "x_values").unwrap();
+        assert_eq!(v, vec![json!(10), json!(9), json!(8), json!(7)]);
+        // plain csv numeric
+        let v = normalize_values(&json!("3,5,7"), Axis::Cfg, "x_values").unwrap();
+        assert_eq!(v, vec![json!(3.0), json!(5.0), json!(7.0)]);
+    }
+
+    #[test]
+    fn normalize_values_double_pipe_strings() {
+        // "||" delimiter for string axes whose values contain commas (prompts)
+        let v = normalize_values(
+            &json!("a cat, sitting || a dog, running"),
+            Axis::Prompt,
+            "x_values",
+        )
+        .unwrap();
+        assert_eq!(v, vec![json!("a cat, sitting"), json!("a dog, running")]);
+        // SKIP: drops an entry
+        let v = normalize_values(&json!("euler || SKIP:dpmpp || heun"), Axis::Sampler, "x_values").unwrap();
+        assert_eq!(v, vec![json!("euler"), json!("heun")]);
+    }
+
+    #[test]
+    fn normalize_values_array_coerces_numeric_strings() {
+        // numeric axis given a JSON array of numeric STRINGS -> coerced to numbers
+        let v = normalize_values(&json!(["3", "5"]), Axis::Steps, "x_values").unwrap();
+        assert_eq!(v, vec![json!(3), json!(5)]);
+        // float axis
+        let v = normalize_values(&json!(["1.5", "2.5"]), Axis::Cfg, "x_values").unwrap();
+        assert_eq!(v, vec![json!(1.5), json!(2.5)]);
+    }
+
+    #[test]
+    fn normalize_values_range_cap() {
+        // a huge range must error rather than blow the axis cap
+        let e = normalize_values(&json!("1,..,1000"), Axis::Seed, "x_values").unwrap_err();
+        assert!(e.contains("cap") || e.contains("too many"), "got: {e}");
+    }
+
+    #[test]
+    fn collect_specs_string_form_xyz() {
+        // X = resolution (string axis, "||"), Y = steps via range csv
+        let req = json!({
+            "x_axis": "resolution", "x_values": "1024x1024 || 768x1024",
+            "y_axis": "steps", "y_values": "8,..,11",
+            "model": "z-image", "prompt": "p",
+        });
+        let specs = collect_specs(&req).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].axis, Axis::Resolution);
+        assert_eq!(specs[0].values.len(), 2);
+        assert_eq!(specs[1].axis, Axis::Steps);
+        assert_eq!(specs[1].values, vec![json!(8), json!(9), json!(10), json!(11)]);
+        assert_eq!(specs[1].labels, vec!["8", "9", "10", "11"]);
+    }
+
+    #[test]
+    fn collect_specs_lora_axis_labels() {
+        let req = json!({
+            "x_axis": "lora",
+            "x_values": "none || styleA.safetensors:0.8 || styleB.safetensors",
+            "model": "z-image", "prompt": "p",
+        });
+        let specs = collect_specs(&req).unwrap();
+        assert_eq!(specs[0].axis, Axis::Lora);
+        assert_eq!(specs[0].labels, vec!["none", "styleA:0.8", "styleB"]);
     }
 
     /// The five advanced-sampling knobs are read from the flat grid request by the

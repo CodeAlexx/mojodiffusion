@@ -35,6 +35,19 @@
       cfg_override: p.cfg_override != null ? p.cfg_override : -1,
       cfg_override_start_percent: p.cfg_override_start_percent != null ? p.cfg_override_start_percent : 0.0,
       cfg_override_end_percent: p.cfg_override_end_percent != null ? p.cfg_override_end_percent : 1.0,
+      // SwarmUI-parity fields from the 10 canvas modules. undefined values are
+      // dropped by JSON.stringify, and the Rust GenerateRequest ignores unknown
+      // keys, so forwarding is harmless where the backend doesn't model it yet.
+      batch_size: p.batch_size, end_steps_early_pct: p.end_steps_early_pct,
+      no_seed_increment: p.no_seed_increment, denoise: p.denoise,
+      loras: p.loras, refiner: p.refiner,
+      hires_scale: p.hires_scale, hires_denoise: p.hires_denoise,
+      mask_data: p.mask_data, mask_channel: p.mask_channel, mask_mime: p.mask_mime,
+      outpaint: p.outpaint, outpaint_enabled: p.outpaint_enabled,
+      refiner_model: p.refiner_model, refiner_steps: p.refiner_steps,
+      refiner_cfg: p.refiner_cfg, refiner_method: p.refiner_method,
+      refiner_control: p.refiner_control, refiner_tiling: p.refiner_tiling,
+      upscaler: p.upscaler, upscaler_model: p.upscaler_model, upscale_by: p.upscale_by,
     };
   }
 

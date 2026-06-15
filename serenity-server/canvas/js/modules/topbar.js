@@ -316,22 +316,27 @@
       function loadModels() {
         if (!api || typeof api.models !== "function") return;
         modelSel.disabled = true;
+        // The serenity_worker_zimage backend ONLY runs Z-Image base today, so surface
+        // that as the active model (selecting other list entries does not switch the
+        // worker yet — multi-model routing is future work).
+        var ACTIVE = "Z-Image (base)";
         api.models()
           .then(function (data) {
-            var names = asNameList(data);
-            // reset placeholder text
-            if (modelSel.firstChild) modelSel.firstChild.textContent = names.length ? "— select model —" : "— none —";
+            var names = asNameList(data).filter(function (n) { return !/z\-?image/i.test(n); });
+            names = [ACTIVE].concat(names);
+            if (modelSel.firstChild) modelSel.firstChild.textContent = "— select model —";
             fillSelect(modelSel, names, 1);
-            modelSel.disabled = names.length === 0;
-            // adopt first model if state has none and user hasn't picked
-            if (!get("params.model") && names.length) {
-              modelSel.value = names[0];
-              set("params.model", names[0]);
-            }
+            modelSel.disabled = false;
+            modelSel.value = ACTIVE;
+            set("params.model", ACTIVE);
           })
           .catch(function () {
-            if (modelSel.firstChild) modelSel.firstChild.textContent = "— unavailable —";
-            modelSel.disabled = true;
+            // backend model list unavailable — still show the real active model
+            if (modelSel.firstChild) modelSel.firstChild.textContent = "— select model —";
+            fillSelect(modelSel, [ACTIVE], 1);
+            modelSel.disabled = false;
+            modelSel.value = ACTIVE;
+            set("params.model", ACTIVE);
           });
       }
 

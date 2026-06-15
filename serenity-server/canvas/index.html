@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Serenity Studio</title>
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <!-- Layout grid: topbar / [tooldock | param-rail(LEFT) | canvas | layers(RIGHT)] / gallery -->
+  <div id="app">
+    <header id="topbar"></header>
+    <nav    id="tooldock"></nav>
+    <aside  id="param-rail"></aside>     <!-- LEFT param rail (SwarmUI controls) -->
+    <main   id="canvas-host">
+      <div id="canvas-toolbar"></div>    <!-- contextual toolbar over the stage -->
+      <div id="konva-stage"></div>       <!-- Konva mounts here -->
+      <div id="canvas-statusbar"></div>
+    </main>
+    <aside  id="layers-panel"></aside>   <!-- RIGHT layers panel (InvokeAI) -->
+    <footer id="gallery"></footer>
+    <div id="queue-strip"></div>
+  </div>
+
+  <!-- vendor -->
+  <script src="js/lib/konva.js"></script>
+  <!-- shared contract -->
+  <script src="js/state.js"></script>
+  <script src="js/api.js"></script>
+  <!-- modules (one file per team; registered into window.Serenity.modules) -->
+  <script src="js/modules/topbar.js"></script>
+  <script src="js/modules/param_rail.js"></script>
+  <script src="js/modules/canvas_core.js"></script>
+  <script src="js/modules/bbox.js"></script>
+  <script src="js/modules/layers.js"></script>
+  <script src="js/modules/tools_brush.js"></script>
+  <script src="js/modules/controlnet.js"></script>
+  <script src="js/modules/sam.js"></script>
+  <script src="js/modules/generate_ws.js"></script>
+  <script src="js/modules/gallery.js"></script>
+  <!-- boot -->
+  <script src="js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+/* Serenity Studio — layout skeleton. Design B, param rail on the LEFT.
+   Grid: topbar (full) / [tooldock 48 | param-rail 320 | canvas 1fr | layers 300] / gallery (full).
+   Teams style their own module's internals; this file owns ONLY the app grid + theme tokens.
+   (param_rail team may append rail-internal styles; layers team layer-panel styles; etc.
+    Keep additions scoped under your module's root id to avoid collisions.) */
+:root {
+  --bg:#15171c; --panel:#1c1f26; --panel2:#23262f; --line:#2c303a;
+  --text:#e6e8ee; --muted:#8b90a0; --accent:#6c8cff; --accent2:#4a5bd6;
+  --ok:#46c46a; --warn:#e0b341; --danger:#e0556b; --radius:8px;
+}
+[data-theme="light"]{ --bg:#f4f5f8; --panel:#fff; --panel2:#eef0f5; --line:#dcdfe7; --text:#1a1d24; --muted:#5a6172; }
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+  font:13px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
+#app{
+  display:grid;height:100vh;
+  grid-template-columns:48px 320px 1fr 300px;
+  grid-template-rows:48px 1fr 120px;
+  grid-template-areas:
+    "topbar topbar topbar topbar"
+    "tooldock param canvas layers"
+    "gallery gallery gallery gallery";
+}
+#topbar{grid-area:topbar;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;padding:0 12px}
+#tooldock{grid-area:tooldock;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 0}
+#param-rail{grid-area:param;background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding:10px}
+#canvas-host{grid-area:canvas;position:relative;background:var(--bg);overflow:hidden}
+#canvas-toolbar{position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:5;display:flex;gap:6px;background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);padding:4px 8px}
+#konva-stage{position:absolute;inset:0}
+#canvas-statusbar{position:absolute;bottom:8px;left:8px;z-index:5;color:var(--muted);font-size:11px}
+#layers-panel{grid-area:layers;background:var(--panel);border-left:1px solid var(--line);overflow-y:auto;padding:10px}
+#gallery{grid-area:gallery;background:var(--panel);border-top:1px solid var(--line);display:flex;align-items:center;gap:8px;padding:8px;overflow-x:auto}
+#queue-strip{position:fixed;right:12px;bottom:128px;z-index:20}
+/* shared control primitives teams can reuse */
+.btn{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn-primary{background:var(--accent2);border-color:var(--accent);color:#fff;font-weight:600}
+.group{border:1px solid var(--line);border-radius:var(--radius);margin-bottom:8px}
+.group>summary{cursor:pointer;padding:8px;font-weight:600;user-select:none}
+.row{display:flex;align-items:center;gap:8px;margin:6px 0}
+.row label{color:var(--muted);min-width:64px}
+input[type=range]{flex:1;accent-color:var(--accent)}
+input,select,textarea{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:5px}
+textarea{width:100%;resize:vertical}

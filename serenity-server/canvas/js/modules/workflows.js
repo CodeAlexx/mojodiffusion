@@ -509,6 +509,16 @@
         }
         queue.disabled = true; queue.textContent = "▶ …";
         setStatus("⏳ Starting…");
+        var shown = false, poll = null;
+        function stopPoll() { if (poll) { clearInterval(poll); poll = null; } }
+        // idempotent result display — fired by the WS 'done' OR the fallback poll,
+        // whichever lands first, so a dropped/missed WS event never loses the image.
+        function show(url, fname) {
+          if (shown) return; shown = true; stopPoll();
+          showResult(url);
+          bus.emit("result:ready", { url: url, filename: fname || url, params: {} });
+          endRun(""); setStatus("✓ Done"); setTimeout(function () { setStatus(""); }, 1500);
+        }
         api.connectWS(ctx.clientId, function (msg) {
           if (!msg) return;
           if (msg.type === "progress") {
@@ -518,22 +528,31 @@
             queue.textContent = "▶ " + (ph || ((d.value || 0) + "/" + (d.max || 0)));
           } else if (msg.type === "executed") {
             var imgs = (msg.data && msg.data.output && msg.data.output.images) || [];
-            if (imgs[0]) {
-              var url = api.viewUrl(imgs[0].filename);
-              showResult(url);
-              bus.emit("result:ready", { url: url, filename: imgs[0].filename, params: {} });
-            }
-            setStatus("✓ Done"); setTimeout(function () { setStatus(""); }, 1500);
+            if (imgs[0]) show(api.viewUrl(imgs[0].filename), imgs[0].filename);
           } else if (msg.type === "executing" && msg.data && msg.data.node === null) {
-            endRun("");
+            if (!shown) endRun("");
           } else if (msg.type === "execution_error") {
-            endRun(" (error)"); setStatus("⚠ Failed: " + ((msg.data && msg.data.error) || "see console"));
+            stopPoll(); endRun(" (error)"); setStatus("⚠ Failed: " + ((msg.data && msg.data.error) || "see console"));
             console.error("[workflows] exec error", msg.data);
           }
         });
         api.submitPrompt(null, ctx.clientId)
-          .then(function (res) { console.info("[workflows] generate", res && res.job_id); })
-          .catch(function (e) { endRun(" (failed)"); setStatus("⚠ Submit failed"); console.warn("[workflows] submit failed", e); });
+          .then(function (res) {
+            var jid = res && (res.job_id || res.prompt_id);
+            console.info("[workflows] generate", jid);
+            // FALLBACK: the worker writes out_dir/<job_id>.png -> /out/<job_id>.png. Poll it
+            // so the image shows even if the progress WS missed the 'done' event.
+            if (jid) {
+              var url = api.viewUrl(jid + ".png"), tries = 0;
+              poll = setInterval(function () {
+                if (shown || tries++ > 400) { stopPoll(); return; }
+                fetch(url, { method: "HEAD", cache: "no-store" })
+                  .then(function (r) { if (r.ok) show(url, jid + ".png"); })
+                  .catch(function () {});
+              }, 2500);
+            }
+          })
+          .catch(function (e) { stopPoll(); endRun(" (failed)"); setStatus("⚠ Submit failed"); console.warn("[workflows] submit failed", e); });
       });
       [tpl, load, save].forEach(function (b) { b.addEventListener("click", function () { console.info("[workflows]", b.textContent, "(TODO)"); }); });
 

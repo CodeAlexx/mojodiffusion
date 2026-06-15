@@ -240,6 +240,20 @@ struct GenerateRequest {
     /// Creativity (denoise) of the hires refine pass; lower = closer to base.
     #[serde(default)]
     hires_denoise: Option<f64>,
+    // ── advanced-sampling knobs (UI _section_advanced). Forwarded to the worker
+    //    wire so it can HONOR what it supports and warn-loud on what it can't. ──
+    #[serde(default)]
+    clip_skip: Option<i64>,
+    #[serde(default)]
+    eta: Option<f64>,
+    #[serde(default)]
+    sigma_min: Option<f64>,
+    #[serde(default)]
+    sigma_max: Option<f64>,
+    #[serde(default)]
+    restart_sampling: Option<bool>,
+    #[serde(default)]
+    vae: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -954,6 +968,27 @@ async fn post_generate(
     }
     if let Some(v) = req.lanpaint_mask_channel {
         params.lanpaint_mask_channel = v;
+    }
+    // Advanced-sampling knobs — forwarded to the worker wire verbatim. The worker
+    // decides per-knob whether it can honor it; unsupported ones produce a one-line
+    // warning on the worker (never a silent drop). See zimage_backend warn helper.
+    if let Some(v) = req.clip_skip {
+        params.clip_skip = v;
+    }
+    if let Some(v) = req.eta {
+        params.eta = v;
+    }
+    if let Some(v) = req.sigma_min {
+        params.sigma_min = v;
+    }
+    if let Some(v) = req.sigma_max {
+        params.sigma_max = v;
+    }
+    if let Some(v) = req.restart_sampling {
+        params.restart_sampling = v;
+    }
+    if let Some(v) = req.vae {
+        params.vae = v;
     }
     // Hires-fix lives on the JobEntry (control plane), never in the worker wire.
     // Clamp hard: an unbounded scale would drive a multi-TB image-crate alloc on

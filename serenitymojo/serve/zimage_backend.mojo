@@ -97,6 +97,7 @@ from serenitymojo.serve.backend import (
     reject_unsupported_qwen_edit_conditioning_params,
     reject_unsupported_conditioning_mask_params,
     reject_unsupported_lanpaint_sampler_params,
+    warn_unsupported_advanced_sampling_params,
 )
 from serenitymojo.serve.image_io import (
     apply_lanpaint_mask_blend_signed_chw, decode_image_any,
@@ -451,6 +452,16 @@ struct ZImageBackend(GenBackend, Movable):
         reject_unsupported_qwen_edit_conditioning_params(params, String("zimage"))
         reject_unsupported_conditioning_mask_params(params, String("zimage"))
         reject_unsupported_lanpaint_sampler_params(params, String("zimage"))
+        # Advanced-sampling knobs: the zimage spine encodes Qwen3-4B layer-34
+        # (no CLIP layer to skip), builds its sigma schedule from the fixed
+        # zimage_comfy_* tables (no eta / sigma_min / sigma_max / restart hook),
+        # and decodes the resident VAE_DIR VAE (no override). It can honor NONE
+        # of these — warn-loud (one line each) rather than silently drop, so the
+        # forwarded value never misleads the user into thinking it took effect.
+        var zimage_honored_advanced = List[String]()  # zimage honors none yet
+        warn_unsupported_advanced_sampling_params(
+            params, String("zimage"), zimage_honored_advanced
+        )
         var sampler_admission = sampler_admission_for_backend(String("zimage"), params.sampler)
         if not sampler_admission.supported:
             raise Error(

@@ -117,6 +117,16 @@ struct JobParams(Copyable, Movable):
     var reference_image: String
     var reference_latent_method: String
     var reference_latent_count: Int
+    # ── advanced-sampling knobs (UI _section_advanced). Plumbed end-to-end so a
+    #    backend can HONOR what it supports and warn-loud on what it cannot —
+    #    NEVER silently dropped. "Unset" sentinels: clip_skip 0 / eta+sigma -1.0 /
+    #    restart_sampling False / vae "". ──
+    var clip_skip: Int
+    var eta: Float64
+    var sigma_min: Float64
+    var sigma_max: Float64
+    var restart_sampling: Bool
+    var vae: String
     var creativity: Float64  # P7: 0..1 — fraction of the sigma schedule the
                              # denoise starts from (1.0 = pure noise/txt2img)
     var loras: List[LoraSpec]
@@ -184,6 +194,12 @@ struct JobParams(Copyable, Movable):
         self.reference_image = String("")
         self.reference_latent_method = String("")
         self.reference_latent_count = 0
+        self.clip_skip = 0
+        self.eta = -1.0
+        self.sigma_min = -1.0
+        self.sigma_max = -1.0
+        self.restart_sampling = False
+        self.vae = String("")
         self.creativity = 0.5
         self.loras = List[LoraSpec]()
         self.params_json = String("")
@@ -333,6 +349,52 @@ def reject_unsupported_lanpaint_params(
             backend_name
             + String(": LanPaint inpaint sampler/blend semantics are not supported by this backend yet")
         )
+
+
+def advanced_sampling_params_set(params: JobParams) -> List[String]:
+    """Return the names of the advanced-sampling knobs that the request actually
+    SET to a non-default value. Used by backends to warn-loud (never silently
+    drop) about any of these they cannot honor. "Set" means: clip_skip > 0,
+    eta/sigma_min/sigma_max >= 0.0, restart_sampling True, vae non-empty."""
+    var names = List[String]()
+    if params.clip_skip > 0:
+        names.append(String("clip_skip"))
+    if params.eta >= 0.0:
+        names.append(String("eta"))
+    if params.sigma_min >= 0.0:
+        names.append(String("sigma_min"))
+    if params.sigma_max >= 0.0:
+        names.append(String("sigma_max"))
+    if params.restart_sampling:
+        names.append(String("restart_sampling"))
+    if params.vae.byte_length() > 0:
+        names.append(String("vae"))
+    return names^
+
+
+def warn_unsupported_advanced_sampling_params(
+    params: JobParams, backend_name: String, honored: List[String]
+):
+    """Print a one-line warning for each advanced-sampling knob the request SET
+    that this backend cannot honor (i.e. not in `honored`). NEVER raises and
+    NEVER silently drops — every set-but-unsupported knob gets a `[<backend>]
+    WARN: ...` line on stdout so the user sees what was ignored and why. Knobs in
+    `honored` are skipped (the backend applies those itself)."""
+    var requested = advanced_sampling_params_set(params)
+    for i in range(len(requested)):
+        var name = requested[i]
+        var is_honored = False
+        for j in range(len(honored)):
+            if honored[j] == name:
+                is_honored = True
+                break
+        if not is_honored:
+            print(
+                String("[") + backend_name + String("] WARN: advanced-sampling '")
+                + name
+                + String("' is set but NOT supported by this backend — ignored ")
+                + String("(value forwarded but has no effect).")
+            )
 
 
 struct StepResult(Copyable, Movable):

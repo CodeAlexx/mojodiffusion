@@ -95,6 +95,16 @@ pub struct JobParams {
     pub reference_latent_method: String,
     pub reference_latent_count: i64,
     pub creativity: f64,
+    // ── advanced-sampling knobs (UI _section_advanced). Plumbed end-to-end so
+    //    the worker can HONOR what it supports and warn-loud on what it can't —
+    //    NEVER silently dropped. Defaults = "unset" sentinels (clip_skip 0 / the
+    //    sigma/eta -1.0 / restart_sampling false / vae ""). ──
+    pub clip_skip: i64,
+    pub eta: f64,
+    pub sigma_min: f64,
+    pub sigma_max: f64,
+    pub restart_sampling: bool,
+    pub vae: String,
     pub out_dir: String,
     pub params_json: String,
     /// Serialized under the key `lora` (matches encode_start), not `loras`.
@@ -167,6 +177,13 @@ impl Default for JobParams {
             reference_latent_method: String::new(),
             reference_latent_count: 0,
             creativity: 0.5,
+            // advanced-sampling "unset" sentinels (mirror backend.mojo).
+            clip_skip: 0,
+            eta: -1.0,
+            sigma_min: -1.0,
+            sigma_max: -1.0,
+            restart_sampling: false,
+            vae: String::new(),
             out_dir: String::new(),
             params_json: String::new(),
             loras: Vec::new(),
@@ -264,5 +281,32 @@ mod tests {
     #[test]
     fn cancel_line_matches_mojo() {
         assert_eq!(CANCEL_LINE, r#"{"cmd":"cancel"}"#);
+    }
+
+    #[test]
+    fn advanced_sampling_knobs_default_and_serialize() {
+        let p = JobParams::default();
+        // "unset" sentinels.
+        assert_eq!(p.clip_skip, 0);
+        assert_eq!(p.eta, -1.0);
+        assert_eq!(p.sigma_min, -1.0);
+        assert_eq!(p.sigma_max, -1.0);
+        assert!(!p.restart_sampling);
+        assert_eq!(p.vae, "");
+        // they ride the start line by name (lockstep with ipc_codec.mojo).
+        let mut q = JobParams::default();
+        q.clip_skip = 2;
+        q.eta = 0.3;
+        q.sigma_min = 0.03;
+        q.sigma_max = 14.6;
+        q.restart_sampling = true;
+        q.vae = "sdxl_vae.safetensors".into();
+        let v: serde_json::Value = serde_json::from_str(&q.to_start_line()).unwrap();
+        assert_eq!(v["clip_skip"], 2);
+        assert_eq!(v["eta"], 0.3);
+        assert_eq!(v["sigma_min"], 0.03);
+        assert_eq!(v["sigma_max"], 14.6);
+        assert_eq!(v["restart_sampling"], true);
+        assert_eq!(v["vae"], "sdxl_vae.safetensors");
     }
 }

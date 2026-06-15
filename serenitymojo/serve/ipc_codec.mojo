@@ -90,6 +90,12 @@ def encode_start(p: JobParams) raises -> String:
     o.set("reference_image", JSONValue.from_string(p.reference_image))
     o.set("reference_latent_method", JSONValue.from_string(p.reference_latent_method))
     o.set("reference_latent_count", JSONValue.from_int(p.reference_latent_count))
+    o.set("clip_skip", JSONValue.from_int(p.clip_skip))
+    o.set("eta", JSONValue.from_float(p.eta))
+    o.set("sigma_min", JSONValue.from_float(p.sigma_min))
+    o.set("sigma_max", JSONValue.from_float(p.sigma_max))
+    o.set("restart_sampling", JSONValue.from_bool(p.restart_sampling))
+    o.set("vae", JSONValue.from_string(p.vae))
     o.set("creativity", JSONValue.from_float(p.creativity))
     o.set("out_dir", JSONValue.from_string(p.out_dir))
     o.set("params_json", JSONValue.from_string(p.params_json))
@@ -210,6 +216,18 @@ def decode_start(obj: JSONValue) raises -> JobParams:
         p.reference_latent_method = obj["reference_latent_method"].as_string()
     if obj.contains("reference_latent_count") and not obj["reference_latent_count"].is_null():
         p.reference_latent_count = Int(obj["reference_latent_count"].as_float())
+    if obj.contains("clip_skip") and not obj["clip_skip"].is_null():
+        p.clip_skip = Int(obj["clip_skip"].as_float())
+    if obj.contains("eta") and not obj["eta"].is_null():
+        p.eta = obj["eta"].as_float()
+    if obj.contains("sigma_min") and not obj["sigma_min"].is_null():
+        p.sigma_min = obj["sigma_min"].as_float()
+    if obj.contains("sigma_max") and not obj["sigma_max"].is_null():
+        p.sigma_max = obj["sigma_max"].as_float()
+    if obj.contains("restart_sampling") and not obj["restart_sampling"].is_null():
+        p.restart_sampling = obj["restart_sampling"].as_bool()
+    if obj.contains("vae") and not obj["vae"].is_null():
+        p.vae = obj["vae"].as_string()
     p.creativity = obj["creativity"].as_float()
     p.out_dir = obj["out_dir"].as_string()
     p.params_json = obj["params_json"].as_string()

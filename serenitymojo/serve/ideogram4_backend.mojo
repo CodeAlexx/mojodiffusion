@@ -7,7 +7,9 @@
 #   latent denorm -> Ideogram VAE decode.
 #
 # Current product limits are intentionally narrow and fail-loud:
-#   * txt2img only, 1024x1024 only
+#   * txt2img only; a SMALL comptime bucket set of sizes (1024x1024, 1280x768,
+#     768x1280) — each a distinct compile-time latent grid [GH,GW] (patch 16),
+#     dispatched in start(); any other size is rejected fail-loud
 #   * no negative prompt, LoRA, init image, variation, or non-Ideogram schedulers
 #   * fixed 1024 token text window so the DiT sequence is compile-time static
 #
@@ -69,6 +71,10 @@ comptime LATENT_NORM = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/
 comptime IMG_OFFSET = 65536
 comptime PAD_ID = 151643
 comptime TEXT_TOKENS = 1024
+# Default bucket = 1024x1024 latent grid (GH=GW=64). The per-resolution work is
+# now factored onto comptime [GH, GW] (see IdeoBucket / the _*_b[GH,GW] helpers);
+# these module constants are the 1024x1024 specialization the original path used
+# and stay bit-identical to that path.
 comptime GH = 64
 comptime GW = 64
 comptime NIMG = GH * GW
@@ -81,6 +87,22 @@ comptime LAYERS = 34
 comptime LATENT_DIM = 128
 comptime VAE_H = 2 * GH
 comptime VAE_W = 2 * GW
+
+# ── Resolution buckets (comptime [GH, GW] dispatch) ──────────────────────────
+# patch == 16 image px per latent-grid cell (verified vs the 1024 path: the latent
+# grid is GH x GW, each cell unpacks 2x2 (reshape [1,GH,GW,2,2,32] -> permute ->
+# [1,32,2*GH,2*GW]) and the VAE upsamples x8, so pixels = 16*GH by 16*GW).
+# Bucket set (all /16, ~1 MP): 1024x1024, 1280x768, 768x1280.
+comptime BUCKET_SQUARE = 0   # 1024 x 1024 -> GH=64, GW=64
+comptime BUCKET_LANDSCAPE = 1  # 1280(W) x 768(H) -> GH=48, GW=80
+comptime BUCKET_PORTRAIT = 2   # 768(W) x 1280(H) -> GH=80, GW=48
+
+# Landscape 1280x768: width 1280/16 = 80 (GW), height 768/16 = 48 (GH).
+comptime GH_L = 48
+comptime GW_L = 80
+# Portrait 768x1280: width 768/16 = 48 (GW), height 1280/16 = 80 (GH).
+comptime GH_P = 80
+comptime GW_P = 48
 
 comptime IPHASE_IDLE = 0
 comptime IPHASE_ENCODE = 1
@@ -255,8 +277,13 @@ def _render_chat_prompt(prompt: String) -> String:
     )
 
 
-def _build_fixed_inputs(ctx: DeviceContext) raises -> List[TArc]:
-    """Fixed 1024 text-token window + 4096 image tokens for 1024x1024."""
+def _build_fixed_inputs[GH_: Int, GW_: Int](ctx: DeviceContext) raises -> List[TArc]:
+    """Fixed 1024 text-token window + GH_*GW_ image tokens for the bucket.
+
+    GH_=GW_=64 reproduces the original fixed 1024x1024 layout bit-for-bit.
+    """
+    comptime NIMG_ = GH_ * GW_
+    comptime TOTAL_ = TEXT_TOKENS + NIMG_
     var pos = List[Float32]()
     var ind = List[Float32]()
     var npos = List[Float32]()
@@ -266,8 +293,8 @@ def _build_fixed_inputs(ctx: DeviceContext) raises -> List[TArc]:
         pos.append(Float32(l))
         pos.append(Float32(l))
         ind.append(3.0)  # LLM_TOKEN_INDICATOR
-    for h in range(GH):
-        for w in range(GW):
+    for h in range(GH_):
+        for w in range(GW_):
             var t0 = Float32(IMG_OFFSET)
             var hh = Float32(IMG_OFFSET + h)
             var ww = Float32(IMG_OFFSET + w)
@@ -280,10 +307,10 @@ def _build_fixed_inputs(ctx: DeviceContext) raises -> List[TArc]:
             ind.append(2.0)   # OUTPUT_IMAGE_INDICATOR
             nind.append(2.0)
     var out = List[TArc]()
-    out.append(TArc(Tensor.from_host(pos^, [1, TOTAL, 3], STDtype.F32, ctx)))
-    out.append(TArc(Tensor.from_host(ind^, [1, TOTAL], STDtype.F32, ctx)))
-    out.append(TArc(Tensor.from_host(npos^, [1, NIMG, 3], STDtype.F32, ctx)))
-    out.append(TArc(Tensor.from_host(nind^, [1, NIMG], STDtype.F32, ctx)))
+    out.append(TArc(Tensor.from_host(pos^, [1, TOTAL_, 3], STDtype.F32, ctx)))
+    out.append(TArc(Tensor.from_host(ind^, [1, TOTAL_], STDtype.F32, ctx)))
+    out.append(TArc(Tensor.from_host(npos^, [1, NIMG_, 3], STDtype.F32, ctx)))
+    out.append(TArc(Tensor.from_host(nind^, [1, NIMG_], STDtype.F32, ctx)))
     return out^
 
 
@@ -298,6 +325,24 @@ struct Ideogram4RopeSet(Movable):
         self.uncond = uncond^
 
 
+def _tiny_bf16(ctx: DeviceContext) raises -> Tensor:
+    """[1,1,1] BF16 zero — placeholder for unbuilt per-bucket static slots."""
+    var z = List[Float32]()
+    z.append(0.0)
+    return Tensor.from_host(z^, [1, 1, 1], STDtype.BF16, ctx)
+
+
+def _empty_masks(ctx: DeviceContext) raises -> Ideogram4Masks:
+    var ids = List[Int]()
+    return Ideogram4Masks(_tiny_bf16(ctx), _tiny_bf16(ctx), ids^)
+
+
+def _empty_ropeset(ctx: DeviceContext) raises -> Ideogram4RopeSet:
+    return Ideogram4RopeSet(
+        (_tiny_bf16(ctx), _tiny_bf16(ctx)), (_tiny_bf16(ctx), _tiny_bf16(ctx))
+    )
+
+
 struct Ideogram4Backend(GenBackend, Movable):
     var ctx: DeviceContext
 
@@ -307,8 +352,10 @@ struct Ideogram4Backend(GenBackend, Movable):
     var cond: List[ArcPointer[Ideogram4Weights]]
     var uncond: List[ArcPointer[Ideogram4Weights]]
 
-    # Static 1024x1024 sequence helpers, safe to retain across jobs.
-    var static_ready: Bool
+    # Static per-bucket sequence helpers, safe to retain across jobs. Each of the
+    # three lists holds one entry per resolution bucket (index == bucket id), built
+    # lazily by _ensure_static_b on first use of that bucket and reused after.
+    var static_ready: List[Bool]
     var cond_masks: List[ArcPointer[Ideogram4Masks]]
     var uncond_masks: List[ArcPointer[Ideogram4Masks]]
     var ropes: List[ArcPointer[Ideogram4RopeSet]]
@@ -316,6 +363,7 @@ struct Ideogram4Backend(GenBackend, Movable):
     # Per-job state.
     var active: Bool
     var cancel_flag: Bool
+    var bucket: Int   # BUCKET_SQUARE | BUCKET_LANDSCAPE | BUCKET_PORTRAIT
     var phase: Int
     var announced: Bool
     var cur: Int
@@ -341,17 +389,27 @@ struct Ideogram4Backend(GenBackend, Movable):
     var min_free_bytes: Int
 
     def __init__(out self) raises:
-        self.ctx = DeviceContext()
+        var ctx = DeviceContext()
+        self.ctx = ctx
         self.loaded = False
         self.load_stage = 0
         self.cond = List[ArcPointer[Ideogram4Weights]]()
         self.uncond = List[ArcPointer[Ideogram4Weights]]()
-        self.static_ready = False
-        self.cond_masks = List[ArcPointer[Ideogram4Masks]]()
-        self.uncond_masks = List[ArcPointer[Ideogram4Masks]]()
-        self.ropes = List[ArcPointer[Ideogram4RopeSet]]()
+        # 3 per-bucket static caches (square / landscape / portrait), built lazily.
+        self.static_ready = [False, False, False]
+        var cms = List[ArcPointer[Ideogram4Masks]]()
+        var ums = List[ArcPointer[Ideogram4Masks]]()
+        var rps = List[ArcPointer[Ideogram4RopeSet]]()
+        for _ in range(3):
+            cms.append(ArcPointer(_empty_masks(ctx)))
+            ums.append(ArcPointer(_empty_masks(ctx)))
+            rps.append(ArcPointer(_empty_ropeset(ctx)))
+        self.cond_masks = cms^
+        self.uncond_masks = ums^
+        self.ropes = rps^
         self.active = False
         self.cancel_flag = False
+        self.bucket = BUCKET_SQUARE
         self.phase = IPHASE_IDLE
         self.announced = False
         self.cur = 0
@@ -407,11 +465,20 @@ struct Ideogram4Backend(GenBackend, Movable):
                 String("ideogram4: unsupported scheduler '") + params.scheduler
                 + String("'; ") + scheduler_admission.reason
             )
-        if not (params.width == 1024 and params.height == 1024):
+        # Comptime bucket dispatch: map (width, height) to one of the three fixed
+        # latent grids. Fail-loud on any other size (never silently substitute).
+        var bucket: Int
+        if params.width == 1024 and params.height == 1024:
+            bucket = BUCKET_SQUARE
+        elif params.width == 1280 and params.height == 768:
+            bucket = BUCKET_LANDSCAPE
+        elif params.width == 768 and params.height == 1280:
+            bucket = BUCKET_PORTRAIT
+        else:
             raise Error(
                 String("ideogram4: unsupported size ") + String(params.width)
                 + "x" + String(params.height)
-                + " -- only 1024x1024 is served by the current fixed-shape path"
+                + " -- supported sizes: 1024x1024, 1280x768, 768x1280"
             )
         if params.negative.byte_length() > 0:
             raise Error("ideogram4: negative prompt is not supported in this bounded slice")
@@ -437,6 +504,7 @@ struct Ideogram4Backend(GenBackend, Movable):
         # while the cond/uncond transformers are still resident.
         self._free_transformers()
         self.params = params.copy()
+        self.bucket = bucket
         self.cfg = Float32(params.cfg)
         self.executed_sampler = sampler_admission.executed.copy()
         self.executed_scheduler = scheduler_admission.executed.copy()
@@ -484,11 +552,14 @@ struct Ideogram4Backend(GenBackend, Movable):
         self.loaded = False
         self.load_stage = 0
 
-    def _ensure_static(mut self) raises:
-        if self.static_ready:
+    def _ensure_static_b[GH_: Int, GW_: Int](mut self, idx: Int) raises:
+        if self.static_ready[idx]:
             return
-        print("[ideogram4] building fixed 1024x1024 masks and MRoPE")
-        var inp = _build_fixed_inputs(self.ctx)
+        print("[ideogram4] building fixed masks and MRoPE for grid",
+              GH_, "x", GW_, "(", 16 * GW_, "x", 16 * GH_, "px )")
+        var inp = _build_fixed_inputs[GH_, GW_](self.ctx)
+        # mrope_section is the per-axis HEAD_DIM band split (24+20+20 over the
+        # head_dim halving), independent of resolution — unchanged for all buckets.
         var sec = [24, 20, 20]
         var cs = build_ideogram4_mrope(
             inp[0][], HEAD_DIM, sec, Float32(5000000.0), self.ctx, STDtype.BF16
@@ -496,13 +567,18 @@ struct Ideogram4Backend(GenBackend, Movable):
         var ncs = build_ideogram4_mrope(
             inp[2][], HEAD_DIM, sec, Float32(5000000.0), self.ctx, STDtype.BF16
         )
-        self.ropes = List[ArcPointer[Ideogram4RopeSet]]()
-        self.ropes.append(ArcPointer(Ideogram4RopeSet(cs^, ncs^)))
-        self.cond_masks = List[ArcPointer[Ideogram4Masks]]()
-        self.uncond_masks = List[ArcPointer[Ideogram4Masks]]()
-        self.cond_masks.append(ArcPointer(ideogram4_build_masks(inp[1][], self.ctx)))
-        self.uncond_masks.append(ArcPointer(ideogram4_build_masks(inp[3][], self.ctx)))
-        self.static_ready = True
+        self.ropes[idx] = ArcPointer(Ideogram4RopeSet(cs^, ncs^))
+        self.cond_masks[idx] = ArcPointer(ideogram4_build_masks(inp[1][], self.ctx))
+        self.uncond_masks[idx] = ArcPointer(ideogram4_build_masks(inp[3][], self.ctx))
+        self.static_ready[idx] = True
+
+    def _ensure_static(mut self) raises:
+        if self.bucket == BUCKET_LANDSCAPE:
+            self._ensure_static_b[GH_L, GW_L](BUCKET_LANDSCAPE)
+        elif self.bucket == BUCKET_PORTRAIT:
+            self._ensure_static_b[GH_P, GW_P](BUCKET_PORTRAIT)
+        else:
+            self._ensure_static_b[GH, GW](BUCKET_SQUARE)
 
     def _encode(mut self) raises:
         var tok = Qwen3Tokenizer(String(TOK_JSON))
@@ -544,22 +620,23 @@ struct Ideogram4Backend(GenBackend, Movable):
             return True
         return True
 
-    def _prepare_job(mut self) raises:
+    def _prepare_job_b[GH_: Int, GW_: Int](mut self) raises:
+        comptime NIMG_ = GH_ * GW_
         if len(self.text_features) == 0:
             raise Error("ideogram4: missing text features")
         self._ensure_static()
 
-        var zllm = _zero_host(NIMG * LLM_DIM)
-        var img_zeros = Tensor.from_host(zllm^, [1, NIMG, LLM_DIM], STDtype.BF16, self.ctx)
+        var zllm = _zero_host(NIMG_ * LLM_DIM)
+        var img_zeros = Tensor.from_host(zllm^, [1, NIMG_, LLM_DIM], STDtype.BF16, self.ctx)
         var llm_full = concat(1, self.ctx, self.text_features[0][], img_zeros)
         self.llm = List[TArc]()
         self.llm.append(TArc(llm_full^))
         self.text_features = List[TArc]()
 
-        var nllm = _zero_host(NIMG * LLM_DIM)
+        var nllm = _zero_host(NIMG_ * LLM_DIM)
         self.neg_llm = List[TArc]()
         self.neg_llm.append(TArc(
-            Tensor.from_host(nllm^, [1, NIMG, LLM_DIM], STDtype.BF16, self.ctx)
+            Tensor.from_host(nllm^, [1, NIMG_, LLM_DIM], STDtype.BF16, self.ctx)
         ))
 
         var zpad = _zero_host(TEXT_TOKENS * LATENT_DIM)
@@ -570,7 +647,7 @@ struct Ideogram4Backend(GenBackend, Movable):
 
         self.latent = List[TArc]()
         self.latent.append(TArc(
-            randn([1, NIMG, LATENT_DIM], UInt64(self.params.seed), STDtype.F32, self.ctx)
+            randn([1, NIMG_, LATENT_DIM], UInt64(self.params.seed), STDtype.F32, self.ctx)
         ))
 
         self.sigma_trace = List[Float32]()
@@ -590,7 +667,10 @@ struct Ideogram4Backend(GenBackend, Movable):
                 self.params.steps = len(self.sigma_trace) - 1
         else:
             self.intervals = make_step_intervals(self.params.steps)
-            var mean = ideogram4_schedule_mean(1024, 1024, 0.0)
+            # logit-normal schedule mean is resolution-aware (num_px term); the 16px
+            # patch makes pixels = 16*GW_ by 16*GH_. The square bucket gives exactly
+            # ideogram4_schedule_mean(1024,1024,0.0) as before.
+            var mean = ideogram4_schedule_mean(16 * GH_, 16 * GW_, 0.0)
             for i in range(len(self.intervals)):
                 self.sigma_trace.append(
                     ideogram4_logitnormal(Float64(self.intervals[i]), mean, 1.5)
@@ -601,6 +681,14 @@ struct Ideogram4Backend(GenBackend, Movable):
             "shift", self.params.sigma_shift, "seed", self.params.seed,
             "size", self.params.width, "x", self.params.height,
         )
+
+    def _prepare_job(mut self) raises:
+        if self.bucket == BUCKET_LANDSCAPE:
+            self._prepare_job_b[GH_L, GW_L]()
+        elif self.bucket == BUCKET_PORTRAIT:
+            self._prepare_job_b[GH_P, GW_P]()
+        else:
+            self._prepare_job_b[GH, GW]()
 
     def _cfg_for_sigma(self, sigma: Float32) -> Float32:
         if self.params.cfg_override < 0.0:
@@ -615,7 +703,9 @@ struct Ideogram4Backend(GenBackend, Movable):
             return Float32(self.params.cfg_override)
         return self.cfg
 
-    def _denoise_one(mut self) raises:
+    def _denoise_one_b[GH_: Int, GW_: Int](mut self, idx: Int) raises:
+        comptime NIMG_ = GH_ * GW_
+        comptime TOTAL_ = TEXT_TOKENS + NIMG_
         var t_val: Float32
         var s_val: Float32
         if self.executed_scheduler == "ideogram4_simple_flowmatch":
@@ -635,17 +725,17 @@ struct Ideogram4Backend(GenBackend, Movable):
             STDtype.BF16,
             self.ctx,
         )
-        var cout = ideogram4_forward_r[TOTAL](
-            self.cond[0][], pos_z, self.llm[0][], t, self.cond_masks[0][],
-            self.ropes[0][].cond[0], self.ropes[0][].cond[1],
+        var cout = ideogram4_forward_r[TOTAL_](
+            self.cond[0][], pos_z, self.llm[0][], t, self.cond_masks[idx][],
+            self.ropes[idx][].cond[0], self.ropes[idx][].cond[1],
             LAYERS, HEADS, HEAD_DIM, HIDDEN, self.ctx,
         )
-        var pos_v = slice(cout, 1, TEXT_TOKENS, NIMG, self.ctx)
+        var pos_v = slice(cout, 1, TEXT_TOKENS, NIMG_, self.ctx)
         var t2 = Tensor.from_host([t_val], [1], STDtype.F32, self.ctx)
         var z_bf = cast_tensor(self.latent[0][], STDtype.BF16, self.ctx)
-        var nout = ideogram4_forward_r[NIMG](
-            self.uncond[0][], z_bf, self.neg_llm[0][], t2, self.uncond_masks[0][],
-            self.ropes[0][].uncond[0], self.ropes[0][].uncond[1],
+        var nout = ideogram4_forward_r[NIMG_](
+            self.uncond[0][], z_bf, self.neg_llm[0][], t2, self.uncond_masks[idx][],
+            self.ropes[idx][].uncond[0], self.ropes[idx][].uncond[1],
             LAYERS, HEADS, HEAD_DIM, HIDDEN, self.ctx,
         )
         var v = add(
@@ -661,6 +751,14 @@ struct Ideogram4Backend(GenBackend, Movable):
         self.latent = List[TArc]()
         self.latent.append(TArc(z_new^))
         print("  [ideogram4] step", self.cur, "t", t_val, "s", s_val, "cfg", step_cfg)
+
+    def _denoise_one(mut self) raises:
+        if self.bucket == BUCKET_LANDSCAPE:
+            self._denoise_one_b[GH_L, GW_L](BUCKET_LANDSCAPE)
+        elif self.bucket == BUCKET_PORTRAIT:
+            self._denoise_one_b[GH_P, GW_P](BUCKET_PORTRAIT)
+        else:
+            self._denoise_one_b[GH, GW](BUCKET_SQUARE)
 
     def _record_vram(mut self) raises:
         var mem = cu_mem_get_info()
@@ -741,7 +839,9 @@ struct Ideogram4Backend(GenBackend, Movable):
         _write_text_file(manifest_path, content)
         return manifest_path
 
-    def _decode_and_save(mut self) raises -> String:
+    def _decode_and_save_b[GH_: Int, GW_: Int](mut self) raises -> String:
+        comptime VAE_H_ = 2 * GH_
+        comptime VAE_W_ = 2 * GW_
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
         self.llm = List[TArc]()
         self.neg_llm = List[TArc]()
@@ -759,19 +859,28 @@ struct Ideogram4Backend(GenBackend, Movable):
         var scale = reshape(Tensor.from_view(ln.tensor_view("latent_scale"), self.ctx), [1, 1, LATENT_DIM], self.ctx)
         var shift = reshape(Tensor.from_view(ln.tensor_view("latent_shift"), self.ctx), [1, 1, LATENT_DIM], self.ctx)
         var zd = add(mul(self.latent[0][], scale, self.ctx), shift, self.ctx)
-        var z6 = reshape(zd, [1, GH, GW, 2, 2, 32], self.ctx)
+        var z6 = reshape(zd, [1, GH_, GW_, 2, 2, 32], self.ctx)
         var zp = permute(z6, [0, 5, 1, 3, 2, 4], self.ctx)
-        var latent = reshape(zp, [1, 32, VAE_H, VAE_W], self.ctx)
+        var latent = reshape(zp, [1, 32, VAE_H_, VAE_W_], self.ctx)
         self.latent = List[TArc]()
         print("[ideogram4] loading VAE decoder + decode")
-        var dec = load_ideogram4_vae_decoder[VAE_H, VAE_W](String(VAE), self.ctx)
+        var dec = load_ideogram4_vae_decoder[VAE_H_, VAE_W_](String(VAE), self.ctx)
         var img = dec.decode(cast_tensor(latent, STDtype.BF16, self.ctx), self.ctx)
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
         return png_path
 
+    def _decode_and_save(mut self) raises -> String:
+        if self.bucket == BUCKET_LANDSCAPE:
+            return self._decode_and_save_b[GH_L, GW_L]()
+        elif self.bucket == BUCKET_PORTRAIT:
+            return self._decode_and_save_b[GH_P, GW_P]()
+        else:
+            return self._decode_and_save_b[GH, GW]()
+
     def _clear_job(mut self):
         self._free_transformers()
         self.active = False
+        self.bucket = BUCKET_SQUARE
         self.phase = IPHASE_IDLE
         self.announced = False
         self.cancel_flag = False

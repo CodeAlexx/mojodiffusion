@@ -65,6 +65,7 @@ from serenitymojo.pipeline.qwenimage_sample_cli import (
     QWENIMAGE_DIR, DIT_DIR, VAE_DIR,
     LH, LW, PATCH, N_IMG, N_TXT_KEPT, S_POS, S_NEG, FRAME, FH, FW,
 )
+from serenitymojo.serve.qwenimage_encode_subprocess import encode_captions_subprocess
 from serenitymojo.serve.backend import (
     GenBackend, JobParams, StepResult, reject_unsupported_common_runtime_params,
     reject_unsupported_reference_image_params, reject_unsupported_mask_image_params,
@@ -250,11 +251,18 @@ struct QwenImageBackend(GenBackend, Movable):
 
     # ── per-job prep ───────────────────────────────────────────────────────────
     def _encode(mut self) raises:
-        """Qwen2.5-VL encode (loaded + freed inside encode_captions_from_strings)."""
-        var caps = encode_captions_from_strings(
+        """Qwen2.5-VL encode. Run the ~16 GB encoder in a fork+execv CHILD process
+        so its VRAM is reclaimed by process death (in-process it gets stuck in this
+        worker's CUDA pool, fragmented around the resident DiT offloader buffers —
+        cu_mempool_trim reclaims ~0, MEASURED, leaving ~2 GB headroom so the block
+        prefetch can't overlap). The produced caps are byte-identical to the
+        in-process path (raw-byte cap_cache round-trip). Falls back to in-process
+        encode on any host that does not route `encode-child` or on subprocess
+        failure (see serve/qwenimage_encode_subprocess.mojo)."""
+        var caps = encode_captions_subprocess(
             self.params.prompt, self.params.negative, self.ctx
         )
-        _print_vram("after text encode (encoder freed)")
+        _print_vram("after text encode (encoder child reaped)")
         self.caps = List[ArcPointer[QwenCaps]]()
         self.caps.append(ArcPointer(caps^))
 

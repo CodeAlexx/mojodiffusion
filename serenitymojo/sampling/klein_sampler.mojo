@@ -47,6 +47,7 @@ from serenitymojo.models.klein.weights import (
 from serenitymojo.offload.plan import build_klein_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.models.vae.klein_decoder import KleinVaeDecoder
+from serenitymojo.models.vae.klein_tiled_decode import klein_tiled_decode
 from serenitymojo.ops.tensor_algebra import (
     permute, reshape, reshape_owned, add, mul_scalar, concat, slice,
 )
@@ -506,9 +507,14 @@ def klein_sample[
     )
 
     # STAGE 3 — VAE decode (loaded only now that the DiT stack is gone).
+    # TILED decode: the monolithic KleinVaeDecoder[LH,LW].decode of the 1024²
+    # packed latent peaks past 24 GB (MEASURED: all steps run, then
+    # CUDA_OUT_OF_MEMORY at decode, peak ~22 GB). klein_tiled_decode loads a
+    # half-size KleinVaeDecoder[LH//2,LW//2] and decodes 3x3 overlapping packed
+    # quadrants at latent stride TILE/2, feathered-blended (flux2-family packed
+    # precedent: flux_tiled_decode). Same [1,3,16*LH,16*LW] output, fits 24 GB.
     var packed = tokens_to_packed_nchw[LH, LW](latent, ctx)
-    var vae = KleinVaeDecoder[LH, LW].load(cfg.vae, ctx)
-    var img = vae.decode(packed, ctx)
+    var img = klein_tiled_decode[LH, LW](packed, cfg.vae, ctx)
     if out_png != String(""):
         save_image(img, out_png, ctx)
         print_sample_saved(String("Klein-sample"), out_png)

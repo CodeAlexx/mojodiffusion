@@ -119,7 +119,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.random import randn
-from serenitymojo.ops.tensor_algebra import concat, slice as t_slice
+from serenitymojo.ops.tensor_algebra import concat, slice as t_slice, reshape, permute
 from serenitymojo.offload.block_loader import BlockLoader
 
 # Reuse the VERIFIED Lens pipeline stages verbatim (imported, never re-derived).
@@ -127,8 +127,14 @@ from serenitymojo.pipeline.lens_pipeline_1024_multistep import (
     LensResident, LensRopeTables, build_lens_rope_tables,
     lens_forward, cfg_norm_rescale_pair, vae_decode,
     N_TXT, DIM, ENC_HIDDEN, TXT_NORM_EPS,
-    N_IMG, IN_CH,
+    N_IMG, IN_CH, LH, LW, FLUX2_VAE_PATH,
 )
+# TILED FLUX.2 (Klein) VAE decode — the MEMORY RISK (D) mitigation. The
+# monolithic 1024² Klein decode OOMs a 24 GB card at the post-DiT high water
+# mark; this decodes 9 overlapping LATENT/2 quadrants + feathers the seams so the
+# retained peak stays near the single-tile working set. See
+# models/vae/lens_tiled_decode.mojo.
+from serenitymojo.models.vae.lens_tiled_decode import lens_tiled_decode
 from serenitymojo.sampling.lens_flowmatch import (
     LensFlowMatchScheduler, lens_euler_step,
 )
@@ -548,9 +554,11 @@ struct LensBackend(GenBackend, Movable):
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
         var latent = self.latent[0][].clone(self.ctx)
         # Per-job conditioning + scheduler are dead weight at decode; free them and
-        # trim the mempool BEFORE the (monolithic, memory-heavy) Flux2 VAE decode.
+        # trim the mempool BEFORE the (memory-heavy) Flux2 VAE decode. The decode is
+        # now TILED (3x3 overlapping LATENT/2 crops) so the full 1024² frame is never
+        # allocated at once — the trim + tiling together address MEMORY RISK (D).
         # The resident DiT non-block weights stay (small); the streamed block
-        # buffers are already freed by lens_forward. See MEMORY RISK (D).
+        # buffers are already freed by lens_forward.
         self.txt_cond = List[ArcPointer[Tensor]]()
         self.txt_uncond = List[ArcPointer[Tensor]]()
         self.sched = List[ArcPointer[LensFlowMatchScheduler]]()
@@ -558,8 +566,17 @@ struct LensBackend(GenBackend, Movable):
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
-        print("[lens] FLUX.2 VAE decode (monolithic) + save  — see MEMORY RISK (D)")
-        var img = vae_decode(latent, self.ctx)  # [1,3,1024,1024]
+        print("[lens] FLUX.2 (Klein) VAE TILED decode + save  — MEMORY RISK (D) mitigated")
+        # Reproduce vae_decode's pack step ([1,N_IMG,IN_CH] BF16 -> packed NCHW
+        # [1,128,LH,LW]) then decode via the 3x3 overlapping tiled path so the
+        # 1024² Klein decode never allocs the full frame at once. lens_tiled_decode
+        # loads the flux2-vae at the TILE shape (LH/2) and reuses it for all 9
+        # crops; blend math is identical to vae_decode's pixels at the tile seams.
+        var nhwc = reshape(latent, [1, LH, LW, IN_CH], self.ctx)
+        var nchw = permute(nhwc, [0, 3, 1, 2], self.ctx)  # [1,128,LH,LW]
+        var img = lens_tiled_decode[LH, LW](
+            nchw, String(FLUX2_VAE_PATH), self.ctx
+        )  # [1,3,1024,1024]
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
         return png_path
 

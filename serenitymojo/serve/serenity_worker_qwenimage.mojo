@@ -28,6 +28,7 @@ from serenitymojo.serve.backend import StepResult
 from serenitymojo.serve.qwenimage_backend import QwenImageBackend
 from serenitymojo.serve.proc_ipc import LineReader, write_msg, set_nonblock
 from serenitymojo.serve.ipc_codec import decode_start, encode_ev, encode_ready
+from serenitymojo.serve.qwenimage_encode_subprocess import encode_child_run
 
 comptime WORKER_IDLE_SLEEP_S = 0.02  # poll cadence while waiting for a command
 
@@ -87,8 +88,19 @@ def _qwenimage_worker_loop(mut backend: QwenImageBackend, fd: Int32) raises:
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: serenity_worker_qwenimage <fd>")
+        print("usage: serenity_worker_qwenimage <fd> | serenity_worker_qwenimage encode-child <prefix> <prompt> <negative>")
         return
+    # encoder-in-a-child-process. The parent qwenimage worker fork+execv's THIS
+    # same binary as `encode-child` so the ~16 GB Qwen2.5-VL encoder runs in a
+    # separate process whose death reclaims the encoder VRAM (the resident DiT
+    # offloader stays in the parent). See serve/qwenimage_encode_subprocess.mojo.
+    # Routed BEFORE the fd parse because Int("encode-child") would raise.
+    if String(args[1]) == "encode-child":
+        if len(args) < 5:
+            print("usage: serenity_worker_qwenimage encode-child <prefix> <prompt> <negative>")
+            return
+        encode_child_run(String(args[2]), String(args[3]), String(args[4]))
+        return                            # process exits → encoder VRAM reclaimed
     var fd = Int32(Int(String(args[1])))
     var b = QwenImageBackend()
     _qwenimage_worker_loop(b, fd)

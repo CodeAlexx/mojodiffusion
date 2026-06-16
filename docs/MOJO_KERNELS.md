@@ -9,6 +9,13 @@ translation of the Rust kernel catalog.
 All file references are relative to `/home/alex/mojodiffusion/serenitymojo/`.
 Mojo 1.0.0b1, NVIDIA GPU.
 
+> **GPU device-math gotcha (2026-06-15):** `std.math.atan2` does NOT lower on the
+> device — a kernel using it dies at `ptxas fatal : Unresolved extern function
+> 'atan2f'`. Use the pure-arithmetic `_atan2` in
+> `docs/MOJO_GPU_DEVICE_MATH_GOTCHAS.md`. (`sin/cos/exp/log/sqrt` DO lower.)
+> Cross-project Mojo NLE-port findings (engine+GPU+UI in one binary, owning-struct
+> re-deref bite, per-unit fix taxonomy, NLE oracles): `docs/MOJO_NLE_PORT_FINDINGS.md`.
+
 > **TENET 4.** Every cos number below is tagged **MEASURED-by-prior-lead** —
 > from `HANDOFF_2026-05-30_MOJO_TRAINING_PORT_MASTER.md` §2 (lead re-ran on a
 > clean serial build). They were NOT re-run while writing this doc;

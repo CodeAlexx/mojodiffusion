@@ -38,13 +38,16 @@ The same `output_location` block is attached to `/v1/job/:id`, `/v1/jobs`,
 
 Current admitted image workers are Z-Image, Ideogram4, SDXL, Anima, SD3,
 Flux.1-dev, Klein/Flux2, and SenseNova-U1. SenseNova is intentionally bounded
-to 512x512 txt2img, no negative prompt, no LoRA, no img2img/inpaint/masks, no
-VAE override, and no variation noise; it dispatches to
-`serenity_worker_sensenova`. The installed worker was rebuilt through the
+to shape-dispatched 512x512 and 1024x1024 txt2img, no negative prompt, no LoRA,
+no img2img/inpaint/masks, no VAE override, and no variation noise; it dispatches
+to `serenity_worker_sensenova`. The installed worker was rebuilt through the
 capped `build-worker-sensenova-raw` path and writes
-`<png>.sensenova_daemon_result.json` on completion. Microsoft Lens still has a
-compiled worker but remains blocked from `/v1/generate` until its
-render/OOM/parity gate is accepted.
+`<png>.sensenova_daemon_result.json` on completion. Current 1024 evidence:
+`output/run_serenity_ui/job-0037.png`, SenseNova-U1, workflow route `image`,
+30 steps, seed `2026061730`, valid 1024x1024 RGB PNG, visual-health pass, and
+both server and worker manifests present. Microsoft Lens still has a compiled
+worker but remains blocked from `/v1/generate` until its render/OOM/parity gate
+is accepted.
 
 `POST /v1/preflight` accepts the same flat or workflow-shaped request body as
 `/v1/generate`, runs the same production prequeue gate, and returns

@@ -580,13 +580,25 @@ report is
   worker.
 
 SenseNova-U1 is now admitted by the Rust `/v1/generate` prequeue gate for
-512x512 txt2img only. It dispatches to `output/bin/serenity_worker_sensenova`,
-uses `/home/alex/.serenity/models/sensenova_u1`, rejects negative prompts,
-LoRA, img2img/inpaint/masks, VAE overrides, variation noise, hires, and
-non-512 sizes before enqueue. The source worker now writes
+shape-dispatched 512x512 and 1024x1024 txt2img. It dispatches to
+`output/bin/serenity_worker_sensenova`, uses
+`/home/alex/.serenity/models/sensenova_u1`, rejects negative prompts, LoRA,
+img2img/inpaint/masks, VAE overrides, variation noise, hires, and non-admitted
+sizes before enqueue. The source worker now writes
 `<png>.sensenova_daemon_result.json` plus the PNG `serenity.genparams.v1` tEXt
 chunk, and the installed worker was rebuilt through the capped
-`build-worker-sensenova-raw` path. Live browser/workflow evidence:
+`build-worker-sensenova-raw` path. Live workflow/product evidence:
+
+- `output/run_serenity_ui/job-0037.png`: SenseNova-U1 `sensenova-u1`,
+  workflow-lowered route `image` from `flat_params_adapter`, 1024x1024,
+  30 steps, `cfg:4`, `scheduler:"simple"`, seed `2026061730`. Visually
+  inspected as a coherent photo-like image of a woman carrying a miniature
+  landscape on her back. The server visual-health gate measured
+  `avg_stddev:52.07`, `luminance_range:249.0`, `edge_energy:3.293`, and
+  `color_bins:712`. Both server and `sensenova` worker result manifests are
+  present. Worker sidecar timings recorded `total_wall_seconds:2267.463`,
+  `denoise_seconds:2065.749`, `denoise_seconds_per_step:68.858`,
+  `text_encode_seconds:200.716`, and `peak_vram_mib:4559.75`.
 
 - `output/run_serenity_ui/job-0034.png`: SenseNova-U1 `sensenova-u1`,
   browser Generate button, 512x512, 12 steps, `cfg:4`, `scheduler:"simple"`,

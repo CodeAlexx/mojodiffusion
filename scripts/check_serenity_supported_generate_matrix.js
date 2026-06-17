@@ -145,13 +145,13 @@ const CASES = [
     model: "sensenova-u1",
     width: 1024,
     height: 1024,
-    steps: 12,
+    steps: 30,
     cfg: 4,
     scheduler: "simple",
-    seed: 2026061668,
+    seed: 2026061730,
     negative: "",
     requireWorkerResultManifest: true,
-    prompt: "richly rendered surreal painterly portrait, a woman bent under a heavy load carrying a miniature landscape on her back, coherent face and hands, moody directional light, detailed brush texture, centered subject, no text, no watermark",
+    prompt: "high quality cinematic photo, a woman bent under a heavy load carrying a miniature landscape on her back, coherent face and hands, moody directional light, realistic fabric, detailed terrain, centered subject, no text, no watermark",
   },
 ];
 

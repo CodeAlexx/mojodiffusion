@@ -262,6 +262,45 @@ def _l2_ratio_lastdim(
     return Tensor.from_host(ratio_h, ratio_shape^, cond.dtype(), ctx)
 
 
+def build_boogu_timesteps(num_steps: Int, seq_len: Float32 = 4096.0) raises -> List[Float32]:
+    """Boogu-Image static v1 time-shift schedule.
+
+    Mirrors `scheduling_flow_match_euler_discrete_time_shifting.set_timesteps`
+    with do_shift=True, dynamic_time_shift=False, time_shift_version='v1',
+    seq_len=4096:
+      t   = linspace(0,1,N+1)[:-1]          (ASCENDING, t_i = i/N)
+      mu  = lin(seq_len)                    (line through (256,0.5),(4096,1.15) => mu=1.15)
+      t1  = clip(1-t, 1e-8, 1-1e-8)
+      y   = exp(mu) / (exp(mu) + (1/t1 - 1))   (sigma=1 => power is identity)
+      shifted = 1 - y
+    Returns N+1 values: the N shifted timesteps + a trailing 1.0 (matching the
+    scheduler's `_timesteps = cat([t, ones(1)])`). Feed via `Scheduler.boogu`;
+    the reused Euler step `x + v*(t[i+1]-t[i])` has dt>0 (t ascends 0->1),
+    matching Boogu's `prev = sample + (t_next-t)*model_output`. The per-step
+    model timestep is `t[i]` (the DiT scales by timestep_scale=1000 internally).
+    """
+    if num_steps <= 0:
+        raise Error("build_boogu_timesteps: num_steps must be > 0")
+    var m = Float32((1.15 - 0.5) / (4096.0 - 256.0))   # lin slope
+    var b = Float32(0.5) - m * Float32(256.0)
+    var mu = m * seq_len + b                            # = 1.15 at seq_len=4096
+    var num = exp(mu)
+    var out = List[Float32]()
+    var n_f = Float32(num_steps)
+    var eps = Float32(1.0e-8)
+    for i in range(num_steps):
+        var t = Float32(i) / n_f
+        var t1 = 1.0 - t
+        if t1 < eps:
+            t1 = eps
+        if t1 > 1.0 - eps:
+            t1 = 1.0 - eps
+        var y = num / (num + (1.0 / t1 - 1.0))
+        out.append(1.0 - y)
+    out.append(1.0)   # trailing 1.0
+    return out^
+
+
 struct Scheduler(Movable):
     """Flow-matching (rectified-flow Euler) scheduler for Z-Image inference.
 
@@ -300,6 +339,15 @@ struct Scheduler(Movable):
         Default `num_steps` for Qwen-Image is 50."""
         var sigmas = build_qwen_sigma_schedule(num_steps, seq_len)
         return Scheduler(sigmas^, num_steps, qwen_mu(seq_len))
+
+    @staticmethod
+    def boogu(num_steps: Int) raises -> Scheduler:
+        """Boogu-Image scheduler (static v1 time-shift, seq_len=4096). Reuses the
+        Euler `step()` verbatim; the schedule table ASCENDS 0->1 so dt>0, matching
+        Boogu's `prev = sample + (t_next-t)*model_output`. Pipeline default
+        num_steps = 50 (Base). Per-step model timestep = `timesteps()[i]`."""
+        var ts = build_boogu_timesteps(num_steps)
+        return Scheduler(ts^, num_steps, 1.15)
 
     def sigmas(self) -> List[Float32]:
         """The sigma schedule (num_steps + 1 values, 1.0 -> 0.0), copied out."""

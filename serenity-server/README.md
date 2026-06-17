@@ -39,11 +39,12 @@ The same `output_location` block is attached to `/v1/job/:id`, `/v1/jobs`,
 Current admitted image workers are Z-Image, Ideogram4, SDXL, Anima, SD3,
 Klein/Flux2, and SenseNova-U1. Generic Flux.1-dev is blocked from
 `/v1/generate` after the real browser workflow gate reached the Flux worker at
-1024x1024/20 steps and failed with CUDA OOM at 15/20 on 2026-06-17. Chroma is
-also blocked because the current Mojo path requires pre-encoded T5 sidecars and
-has no production-admitted Rust-server worker route. Both remain visible through
-blocked capability profiles so the UI/API fail loudly instead of falling back to
-another image model. SenseNova is intentionally bounded to shape-dispatched
+1024x1024/20 steps and failed with CUDA OOM at 6/20 on 2026-06-17 after the
+worker reached about 22.3 GiB VRAM. Chroma is also blocked because the current
+Mojo path requires pre-encoded T5 sidecars and has no production-admitted
+Rust-server worker route. Both remain visible through blocked capability
+profiles so the UI/API fail loudly instead of falling back to another image
+model. SenseNova is intentionally bounded to shape-dispatched
 512x512 and 1024x1024 txt2img, no negative prompt, no LoRA,
 no img2img/inpaint/masks, no VAE override, and no variation noise; it dispatches
 to `serenity_worker_sensenova`. The installed worker was rebuilt through the
@@ -247,9 +248,12 @@ SERENITY_MATRIX_REPORT=output/checks/serenity_supported_generate_matrix_latest.j
 node scripts/check_serenity_supported_generate_matrix.js
 ```
 
-It clicks the browser Generate button for Z-Image, SDXL, and Klein/Flux2, then
-checks `/v1/job/:id/result` for visual-health pass, dimensions, result manifests,
-and worker manifests where the installed worker emits them. Latest matrix
+It clicks the browser Generate button for every live admitted text-to-image
+backend exposed by `/v1/capabilities`, then checks `/v1/job/:id/result` for
+visual-health pass, dimensions, result manifests, and worker manifests where
+the installed worker emits them. The latest checked-in matrix report covers
+Z-Image, SDXL, and Klein/Flux2; rerun it after admission changes so it covers
+the current admitted set. Latest matrix
 evidence:
 
 - `job-0019`: Z-Image `z_image_base_bf16`, 1024x1024, 16 steps,

@@ -545,7 +545,7 @@ def server_capabilities_report_ready(path: Path) -> bool:
     if not isinstance(backends, list):
         return False
     found = {entry.get("backend"): entry for entry in backends if isinstance(entry, dict)}
-    for backend in ("zimage", "ideogram4", "sdxl", "anima", "sd3", "flux", "flux2"):
+    for backend in ("zimage", "ideogram4", "sdxl", "anima", "sd3", "flux2", "sensenova"):
         entry = found.get(backend)
         if not isinstance(entry, dict):
             return False
@@ -568,17 +568,25 @@ def server_capabilities_report_ready(path: Path) -> bool:
     if not isinstance(z_sched, list) or "sgm_uniform" not in z_sched or "karras" in z_sched:
         return False
     ideogram_features = found["ideogram4"].get("features")
-    flux_features = found["flux"].get("features")
-    if not isinstance(ideogram_features, dict) or not isinstance(flux_features, dict):
+    if not isinstance(ideogram_features, dict):
         return False
     if ideogram_features.get("bbox_prompt_json", {}).get("supported") is not True:
         return False
-    if flux_features.get("lora", {}).get("max_count") != 1:
+    blocked = body.get("blocked_families")
+    if not isinstance(blocked, list):
+        return False
+    flux_block = next(
+        (entry for entry in blocked if isinstance(entry, dict) and entry.get("backend") == "flux"),
+        None,
+    )
+    if not isinstance(flux_block, dict) or flux_block.get("production_status") != "blocked":
+        return False
+    if "6/20" not in str(flux_block.get("reason") or ""):
         return False
     return True
 
 
-def server_sd3_flux_worker_report_ready(path: Path) -> bool:
+def server_sd3_worker_and_flux_block_report_ready(path: Path) -> bool:
     report = read_json(path)
     summary = report.get("summary")
     if not isinstance(summary, dict) or summary.get("exit_ok") is not True:
@@ -594,15 +602,21 @@ def server_sd3_flux_worker_report_ready(path: Path) -> bool:
     if not isinstance(backends, list):
         return False
 
-    expected = {
-        "sd3": ("sd3_flowmatch_euler", "sd3_simple_flowmatch"),
-        "flux": ("flux_flowmatch_euler", "flux_simple_flowmatch"),
-    }
+    expected = {"sd3": ("sd3_flowmatch_euler", "sd3_simple_flowmatch")}
     seen: set[str] = set()
+    flux_blocked = False
     for entry in backends:
         if not isinstance(entry, dict):
             return False
         backend = str(entry.get("backend") or "")
+        if backend == "flux":
+            flux_blocked = (
+                entry.get("production_status") == "blocked"
+                and entry.get("supported_samplers") == []
+                and entry.get("supported_schedulers") == []
+                and "6/20" in str(entry.get("reason") or "")
+            )
+            continue
         if backend not in expected:
             continue
         want_sampler, want_scheduler = expected[backend]
@@ -629,22 +643,22 @@ def server_sd3_flux_worker_report_ready(path: Path) -> bool:
             return False
         seen.add(backend)
 
-    if seen != set(expected):
+    if seen != set(expected) or not flux_blocked:
         return False
 
     prequeue = report.get("prequeue_rejections")
     if not isinstance(prequeue, list):
         return False
     for item in prequeue:
-        if not isinstance(item, dict) or item.get("case") != "flux_negative":
+        if not isinstance(item, dict) or item.get("case") != "flux_blocked":
             continue
         error = str(item.get("error") or "")
         return (
             item.get("ok") is True
             and item.get("http_status") == 400
             and item.get("job_count_before") == item.get("job_count_after")
-            and "flux" in error
-            and "negative prompt" in error
+            and "Flux.1-dev" in error
+            and "6/20" in error
         )
     return False
 
@@ -1340,15 +1354,15 @@ def mojo_markers() -> list[Marker]:
                     '"backend": "sd3"',
                     '"backend": "flux"',
                     '"executed_sampler": "sd3_flowmatch_euler"',
-                    '"executed_sampler": "flux_flowmatch_euler"',
+                    '"production_status": "blocked"',
                 ],
             )
             and sd3_backend.is_file()
             and flux_backend.is_file()
             and sd3_worker.is_file()
             and flux_worker.is_file()
-            and server_sd3_flux_worker_report_ready(server_prequeue_report),
-            "Rust control plane admits SD3/Flux through per-kind process workers, artifact manifests, and sampler inventory while the standalone Mojo dispatch remains intentionally lighter.",
+            and server_sd3_worker_and_flux_block_report_ready(server_prequeue_report),
+            "Rust control plane admits SD3 through a per-kind process worker and keeps Flux.1-dev visible but blocked until the real memory gate passes.",
             "Run scripts/check_serenity_server_t2i_product_gate.py --all-admitted --strict-production and require manifest-backed artifacts, timings, VRAM, and metadata for every admitted family before accepting full model coverage.",
             severity="warning",
         )

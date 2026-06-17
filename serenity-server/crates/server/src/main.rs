@@ -2450,14 +2450,13 @@ async fn get_health(State(st): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-/// `/v1/samplers` body — the daemon's static SwarmUI/Comfy sampler catalog
-/// (`swarmui_sampler_registry_json()`), captured byte-for-byte as a versioned
-/// asset so the Rust surface is parity-identical. It is pinned data, not logic,
-/// so embedding the exact bytes IS the faithful port (verified by oracle diff vs
-/// `serenity_daemon stub`).
+/// `/v1/samplers` body — pinned SwarmUI/Comfy sampler inventory plus current
+/// Rust product admission overlays. The catalog keeps known backend identities
+/// visible, but blocked families must expose empty supported sampler/scheduler
+/// lists so it cannot contradict `/v1/capabilities`.
 const SAMPLERS_V1: &str = include_str!("assets/samplers_v1.json");
 
-/// GET /v1/samplers — the pinned sampler catalog, byte-identical to the daemon.
+/// GET /v1/samplers — the pinned sampler catalog/admission document.
 async fn get_samplers() -> Response {
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -3390,6 +3389,14 @@ mod endpoint_tests {
                 "missing sampler backend {expected}"
             );
         }
+        let flux = backends
+            .iter()
+            .find(|entry| entry["backend"].as_str() == Some("flux"))
+            .expect("missing flux sampler backend");
+        assert_eq!(flux["production_status"], "blocked");
+        assert!(flux["supported_samplers"].as_array().unwrap().is_empty());
+        assert!(flux["supported_schedulers"].as_array().unwrap().is_empty());
+        assert!(flux["reason"].as_str().unwrap_or("").contains("6/20"));
     }
 
     #[test]

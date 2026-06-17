@@ -281,10 +281,11 @@ flat-grid rejection.
   advertised and is rejected before enqueue.
 - Ideogram4: `1024x1024`, bbox `prompt_json` admitted, negative prompt and LoRA
   rejected, scheduler subset `ideogram_logitnormal`, `simple`.
-- SDXL, Anima, SD3, Flux: bounded `1024x1024` routes with backend-specific
+- SDXL, Anima, and SD3: bounded `1024x1024` routes with backend-specific
   sampler/scheduler subsets. SDXL aliases include `sdxl`, `sd_xl`, `sd-xl`,
-  `sd xl`, `stable-diffusion-xl`, and `animagine`. Flux admits at most one LoRA
-  and rejects negative prompts.
+  `sd xl`, `stable-diffusion-xl`, and `animagine`. Generic Flux.1-dev is known
+  to the registry but is blocked from `/v1/generate` until its 1024x1024/20-step
+  memory gate passes.
 - Qwen, Z-Image L2P, and video execution remain blocked or routed elsewhere
   until separate product gates pass. Flux2/Klein has a bounded workflow-IR image
   route that can generate through the Rust server, but it still lacks strict
@@ -577,7 +578,8 @@ server `output_root` that `/v1/generate` will use for the submitted request.
 
 The supported text-to-image matrix gate is
 `scripts/check_serenity_supported_generate_matrix.js`. It runs the browser gate
-sequentially for every `/v1/capabilities` backend admitted for text-to-image.
+sequentially for every live `/v1/capabilities` backend admitted for
+text-to-image.
 The default case set is filtered by the live capabilities response; explicitly
 selecting a blocked case with `SERENITY_MATRIX_CASES` fails before generation.
 Current admitted families are Z-Image, Ideogram4, SDXL, Anima, SD3,
@@ -592,7 +594,8 @@ now also requires
 `/v1/job/:id/result.output_location.inside_root:true` and the matching server
 sidecar `output.location.inside_root:true`, so a generated image outside
 `output/run_serenity_ui` cannot be accepted as product UI evidence. The latest
-report is
+checked-in matrix report is partial relative to the current admitted set and
+must be rerun after admission changes; it is
 `output/checks/serenity_supported_generate_matrix_latest.json` with schema
 `serenity.supported_generate_matrix.v1`. It passed on 2026-06-16 with:
 

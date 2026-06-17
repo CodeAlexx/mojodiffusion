@@ -902,6 +902,10 @@ Limits:
 
 - Superseded by the next section: SD3/Flux live strict gates and the
   all-admitted Rust-server gate have now passed for the bounded product path.
+- Current correction, 2026-06-17: the historical Flux lowmem artifact gate is no
+  longer sufficient for admission. The real 1024x1024/20-step browser workflow
+  gate failed with CUDA OOM at 6/20, so Flux.1-dev is currently blocked from
+  `/v1/generate` until the memory gate passes.
 
 ## 2026-06-16 All-Admitted Rust-Server Artifact Gate
 

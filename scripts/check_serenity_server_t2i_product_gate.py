@@ -37,7 +37,7 @@ DEFAULT_REPORT = REPO / "output/checks/serenity_server_t2i_product_gate.json"
 GENPARAMS_KEY = "serenity.genparams.v1"
 TERMINAL_STATES = {"done", "failed", "cancelled", "interrupted"}
 
-ALL_ADMITTED = ["zimage", "sdxl", "anima", "sd3", "flux", "ideogram4", "flux2"]
+ALL_ADMITTED = ["zimage", "sdxl", "anima", "sd3", "ideogram4", "flux2", "sensenova"]
 
 
 class GateError(RuntimeError):
@@ -156,6 +156,21 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "steps": 1,
             "seed": 26061608,
             "cfg": 3.5,
+            "sampler": "euler",
+            "scheduler": "simple",
+        },
+    },
+    "sensenova": {
+        "timeout_seconds": 3600.0,
+        "request": {
+            "model": "sensenova-u1",
+            "prompt": "serenity server product gate sensenova, clean photo portrait",
+            "negative": "",
+            "width": 1024,
+            "height": 1024,
+            "steps": 30,
+            "seed": 26061609,
+            "cfg": 4.0,
             "sampler": "euler",
             "scheduler": "simple",
         },
@@ -397,9 +412,9 @@ def prequeue_rejection_cases() -> list[dict[str, Any]]:
             "expected_parts": ["Flux2", "Klein", "admitted only"],
         },
         {
-            "case": "flux_negative",
-            "body": {**base, "model": "flux", "negative": "unsupported negative"},
-            "expected_parts": ["flux", "negative"],
+            "case": "flux_blocked",
+            "body": {**base, "model": "flux"},
+            "expected_parts": ["Flux.1-dev", "CUDA OOM", "6/20"],
         },
         {
             "case": "ideogram_bad_size",
@@ -1433,11 +1448,17 @@ def capability_coverage(capabilities: Any, samplers: Any, expected_backends: lis
     if _feature(ideogram, "negative_prompt").get("supported") is not False:
         failures.append("ideogram4 capability does not disable negative_prompt")
 
-    flux = cap_backends.get("flux", {})
-    if _feature(flux, "lora").get("max_count") != 1:
-        failures.append("flux capability does not cap LoRA overlays at one")
-    if _feature(flux, "negative_prompt").get("supported") is not False:
-        failures.append("flux capability does not disable negative_prompt")
+    blocked = capabilities.get("blocked_families") if isinstance(capabilities, dict) else []
+    blocked_by_backend = {
+        str(item.get("backend") or ""): item
+        for item in blocked
+        if isinstance(item, dict)
+    } if isinstance(blocked, list) else {}
+    flux_block = blocked_by_backend.get("flux", {})
+    if flux_block.get("production_status") != "blocked":
+        failures.append("flux blocked_families entry is missing or not blocked")
+    if "6/20" not in str(flux_block.get("reason") or ""):
+        failures.append("flux blocked reason does not record the current 6/20 OOM gate")
 
     flux2 = cap_backends.get("flux2", {})
     if _feature(flux2, "lora").get("max_count") != 1:

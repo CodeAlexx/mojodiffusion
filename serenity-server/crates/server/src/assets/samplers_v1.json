@@ -188,22 +188,15 @@
     {
       "backend": "flux",
       "model_family": "flux",
+      "production_status": "blocked",
       "accepted_sampler_parity": false,
-      "executed_sampler": "flux_flowmatch_euler",
-      "executed_scheduler": "flux_simple_flowmatch",
-      "supported_samplers": [
-        "euler",
-        "flowmatch_euler",
-        "flow_match_euler"
-      ],
-      "supported_schedulers": [
-        "simple",
-        "flowmatch",
-        "flow_match"
-      ],
+      "executed_sampler": "",
+      "executed_scheduler": "",
+      "supported_samplers": [],
+      "supported_schedulers": [],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "Flux worker admits the bounded 1024x1024 Euler/simple flow-match route; negative prompt, image-conditioning, and multiple LoRAs remain fail-loud."
+      "reason": "Flux.1-dev reached the Rust-server browser workflow worker at 1024x1024/20 steps but failed with CUDA OOM at 6/20 on 2026-06-17 after the worker reached about 22.3 GiB VRAM; keep blocked until the real worker memory gate passes."
     },
     {
       "backend": "flux2",

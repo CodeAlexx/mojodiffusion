@@ -1262,6 +1262,75 @@ def run_dpmpp2m_smoke(
     }, blockers
 
 
+def run_dpmpp2m_sgm_uniform_smoke(
+    *,
+    base_url: str,
+    ws: ProgressWebSocket | None,
+    prompt: str,
+    negative: str,
+    seed: int,
+    timeout: float,
+    poll_interval: float,
+) -> tuple[dict[str, Any], list[str]]:
+    blockers: list[str] = []
+    body = {
+        "model": "zimage",
+        "prompt": prompt,
+        "negative": negative,
+        "width": 512,
+        "height": 512,
+        "steps": 4,
+        "seed": seed,
+        "cfg": 1.0,
+        "sampler": "dpmpp_2m",
+        "scheduler": "sgm_uniform",
+        "sigma_shift": 6.0,
+        "variation_seed": 0,
+        "variation_strength": 0.0,
+        "images": 1,
+        "image_index": 0,
+        "image_count": 1,
+    }
+    res = http_json("POST", f"{base_url}/v1/generate", body, timeout=15.0)
+    if res.status != 200 or not isinstance(res.data, dict) or not res.data.get("job_id"):
+        raise ContractError(f"DPM++ 2M sgm_uniform generate failed HTTP {res.status}: {res.text}")
+    job_id = str(res.data["job_id"])
+    job, states, events = poll_job(base_url, job_id, ws, timeout, poll_interval)
+    evidence, completed_blockers = validate_completed_job(
+        job=job,
+        states=states,
+        events=events,
+        request_body=body,
+        base_url=base_url,
+        require_phase_events=False,
+    )
+    blockers.extend(completed_blockers)
+    run_identity = evidence.get("manifest", {}).get("run_identity", {})
+    if isinstance(run_identity, dict):
+        require(run_identity.get("executed_sampler") == "dpmpp_2m", "DPM++ 2M sgm_uniform smoke executed_sampler mismatch", blockers)
+        require(run_identity.get("executed_scheduler") == "sgm_uniform_flowmatch", "DPM++ 2M sgm_uniform smoke executed_scheduler mismatch", blockers)
+        require_comfy_sgm_uniform_sigmas(
+            run_identity.get("sigma_trace"),
+            int(body["steps"]),
+            float(body["sigma_shift"]),
+            "DPM++ 2M sgm_uniform smoke",
+            blockers,
+        )
+        trace = run_identity.get("sampler_trace")
+        require(isinstance(trace, dict), "DPM++ 2M sgm_uniform smoke missing sampler_trace", blockers)
+        if isinstance(trace, dict):
+            require(trace.get("algorithm") == "dpmpp_2m", "DPM++ 2M sgm_uniform smoke sampler_trace algorithm mismatch", blockers)
+            require(trace.get("schedule_source") == "zimage_comfy_sgm_uniform_sigmas", "DPM++ 2M sgm_uniform smoke schedule_source mismatch", blockers)
+            require(int(trace.get("dpmpp_update_steps") or 0) >= 1, "DPM++ 2M sgm_uniform smoke did not record update steps", blockers)
+            require(int(trace.get("dpmpp_second_order_steps") or 0) >= 1, "DPM++ 2M sgm_uniform smoke did not use second-order history", blockers)
+    return {
+        "request": body,
+        "generate": res.data,
+        "job_id": job_id,
+        "evidence": evidence,
+    }, blockers
+
+
 def run_sgm_uniform_smoke(
     *,
     base_url: str,
@@ -1996,6 +2065,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-sgm-uniform-unipc-bh2-smoke", action="store_true", help="Skip positive Z-Image UniPC bh2 + sgm_uniform product smoke.")
     parser.add_argument("--skip-sgm-uniform-unipc-fail-loud-smoke", action="store_true", dest="skip_sgm_uniform_unipc_bh2_smoke", help=argparse.SUPPRESS)
     parser.add_argument("--skip-dpmpp2m-smoke", action="store_true", help="Skip positive Z-Image DPM++ 2M product smoke.")
+    parser.add_argument("--skip-dpmpp2m-sgm-uniform-smoke", action="store_true", help="Skip positive Z-Image DPM++ 2M + sgm_uniform product smoke.")
     parser.add_argument("--skip-generic-unipc-smoke", action="store_true", help="Skip positive Z-Image generic UniPC bh1 product smoke.")
     parser.add_argument("--skip-unipc-smoke", action="store_true", help="Skip positive Z-Image UniPC bh2 product smoke.")
     parser.add_argument("--skip-multi-image-smoke", action="store_true", help="Skip images=2 multi-output endpoint smoke.")
@@ -2142,6 +2212,19 @@ def main() -> int:
             )
             report["sgm_uniform_unipc_bh2_smoke"] = sgm_unipc_bh2_report
             blockers.extend(sgm_unipc_bh2_blockers)
+
+        if not args.skip_dpmpp2m_sgm_uniform_smoke:
+            dpmpp_sgm_report, dpmpp_sgm_blockers = run_dpmpp2m_sgm_uniform_smoke(
+                base_url=base_url,
+                ws=ws,
+                prompt="DPM++ 2M product smoke with Z-Image sgm_uniform schedule",
+                negative=args.negative,
+                seed=args.seed + 310,
+                timeout=args.timeout,
+                poll_interval=args.poll_interval,
+            )
+            report["dpmpp2m_sgm_uniform_smoke"] = dpmpp_sgm_report
+            blockers.extend(dpmpp_sgm_blockers)
 
         if not args.skip_img2img_smoke:
             init_image = str(evidence.get("png", {}).get("path") or "")
@@ -2309,6 +2392,8 @@ def main() -> int:
         print(f"  sgm_uniform_unipc_smoke: {report['sgm_uniform_unipc_smoke']['job_id']} -> done")
     if not args.skip_sgm_uniform_unipc_bh2_smoke:
         print(f"  sgm_uniform_unipc_bh2_smoke: {report['sgm_uniform_unipc_bh2_smoke']['job_id']} -> done")
+    if not args.skip_dpmpp2m_sgm_uniform_smoke:
+        print(f"  dpmpp2m_sgm_uniform_smoke: {report['dpmpp2m_sgm_uniform_smoke']['job_id']} -> done")
     if not args.skip_dpmpp2m_smoke:
         print(f"  dpmpp2m_smoke: {report['dpmpp2m_smoke']['job_id']} -> done")
     if not args.skip_generic_unipc_smoke:

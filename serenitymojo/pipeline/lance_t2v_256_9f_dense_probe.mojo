@@ -34,7 +34,7 @@ from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 
 comptime MODEL_DIR = "/home/alex/.serenity/models/lance/Lance_3B_Video"
 comptime TOK_JSON = "/home/alex/.serenity/models/lance/Lance_3B_Video/tokenizer.json"
-comptime VAE_PATH = "/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors"
+comptime VAE_PATH = "/home/alex/.serenity/models/vaes/wan2.2_vae.safetensors"
 comptime PROMPT = "fairy"
 comptime LATENT_T = 3
 comptime LATENT_H = 16

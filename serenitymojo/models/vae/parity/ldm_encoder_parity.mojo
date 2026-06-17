@@ -23,7 +23,7 @@ from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDO
 from serenitymojo.models.vae.ldm_encoder import load_sdxl_ldm_encoder
 
 
-comptime SDXL_VAE = "/home/alex/madebyollin_sdxl-vae-fp16-fix/sdxl_vae.safetensors"
+comptime SDXL_VAE = "/home/alex/.serenity/models/vaes/OfficialStableDiffusion/sdxl_vae.safetensors"
 comptime PARITY_DIR = "/home/alex/mojodiffusion/serenitymojo/models/vae/parity"
 
 

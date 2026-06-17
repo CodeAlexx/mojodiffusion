@@ -102,8 +102,12 @@ struct OffloadConfig(Copyable, Movable, ImplicitlyCopyable):
     var branch_schedule: BranchSchedule
 
     @staticmethod
-    def synchronous_single() -> OffloadConfig:
+    def single_pass() -> OffloadConfig:
         return OffloadConfig(1, 1, DTypePolicy.preserve(), BranchSchedule.single())
+
+    @staticmethod
+    def synchronous_single() -> OffloadConfig:
+        return OffloadConfig.single_pass()
 
     @staticmethod
     def synchronous_cfg_paired() -> OffloadConfig:

@@ -12,7 +12,7 @@ from serenitymojo.models.vae.wan22_decoder import Wan22VaeImageDecoder
 from serenitymojo.ops.random import randn
 
 
-comptime VAE_PATH = "/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors"
+comptime VAE_PATH = "/home/alex/.serenity/models/vaes/wan2.2_vae.safetensors"
 comptime LH = 1
 comptime LW = 1
 comptime LT = 3

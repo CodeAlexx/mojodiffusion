@@ -709,25 +709,27 @@ struct Klein9BOffloaded(Movable):
             ctx,
         )
 
-        self.loader.config = OffloadConfig.synchronous_single()
-        self.loader.prefetch(0)
+        self.loader.config = OffloadConfig.single_pass()
+        self.loader.prefetch_with_ctx(0, ctx)
         for bi in range(cfg.num_double):
-            self.loader.prefetch_next(bi)
             var handle = self.loader.await_block(bi, ctx)
+            self.loader.prefetch_next_with_ctx(bi, ctx)
             var x = self._run_double[N_IMG, N_TXT, S](
                 handle.block, handle.prefix, img, txt, img_mod, txt_mod, cos, sin, ctx
             )
             txt = slice(x, 1, 0, N_TXT, ctx)
             img = slice(x, 1, N_TXT, N_IMG, ctx)
+            self.loader.mark_active_block_done(ctx)
 
         var x = concat(1, ctx, txt, img)
         for bi in range(cfg.num_single):
             var block_idx = cfg.num_double + bi
-            self.loader.prefetch_next(block_idx)
             var handle = self.loader.await_block(block_idx, ctx)
+            self.loader.prefetch_next_with_ctx(block_idx, ctx)
             x = self._run_single[S](
                 handle.block, handle.prefix, x, single_mod, cos, sin, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         var img_out = slice(x, 1, N_TXT, N_IMG, ctx)
         var final_mod = linear(
@@ -803,10 +805,10 @@ struct Klein9BOffloaded(Movable):
         )
 
         self.loader.config = OffloadConfig.synchronous_cfg_paired()
-        self.loader.prefetch(0)
+        self.loader.prefetch_with_ctx(0, ctx)
         for bi in range(cfg.num_double):
-            self.loader.prefetch_next(bi)
             var handle = self.loader.await_block(bi, ctx)
+            self.loader.prefetch_next_with_ctx(bi, ctx)
             var x_pos = self._run_double[N_IMG, N_TXT, S](
                 handle.block,
                 handle.prefix,
@@ -833,19 +835,21 @@ struct Klein9BOffloaded(Movable):
             img_pos = slice(x_pos, 1, N_TXT, N_IMG, ctx)
             txt_neg = slice(x_neg, 1, 0, N_TXT, ctx)
             img_neg = slice(x_neg, 1, N_TXT, N_IMG, ctx)
+            self.loader.mark_active_block_done(ctx)
 
         var x_pos = concat(1, ctx, txt_pos, img_pos)
         var x_neg = concat(1, ctx, txt_neg, img_neg)
         for bi in range(cfg.num_single):
             var block_idx = cfg.num_double + bi
-            self.loader.prefetch_next(block_idx)
             var handle = self.loader.await_block(block_idx, ctx)
+            self.loader.prefetch_next_with_ctx(block_idx, ctx)
             x_pos = self._run_single[S](
                 handle.block, handle.prefix, x_pos, single_mod, cos, sin, ctx
             )
             x_neg = self._run_single[S](
                 handle.block, handle.prefix, x_neg, single_mod, cos, sin, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         var img_out_pos = slice(x_pos, 1, N_TXT, N_IMG, ctx)
         var img_out_neg = slice(x_neg, 1, N_TXT, N_IMG, ctx)
@@ -886,10 +890,20 @@ struct Klein9BOffloadedTurbo(Movable):
 
     @staticmethod
     def load(path: String, ctx: DeviceContext) raises -> Klein9BOffloadedTurbo:
+        return Klein9BOffloadedTurbo.load_with_copy_mode(path, ctx, False)
+
+    @staticmethod
+    def load_with_copy_mode(
+        path: String, ctx: DeviceContext, use_default_stream_copy: Bool
+    ) raises -> Klein9BOffloadedTurbo:
         var shared = Klein9BDiT.load_shared(path, ctx)
         var plan = build_klein9b_block_plan()
-        var loader = TurboPlannedLoader.open(
-            path, plan^, OffloadConfig.synchronous_single(), ctx
+        var loader = TurboPlannedLoader.open_with_copy_mode(
+            path,
+            plan^,
+            OffloadConfig.single_pass(),
+            ctx,
+            use_default_stream_copy,
         )
         return Klein9BOffloadedTurbo(shared^, loader^)
 
@@ -977,24 +991,27 @@ struct Klein9BOffloadedTurbo(Movable):
             ctx,
         )
 
-        self.loader.prefetch(0)
+        self.loader.set_config(OffloadConfig.single_pass())
+        self.loader.prefetch_with_ctx(0, ctx)
         for bi in range(cfg.num_double):
-            self.loader.prefetch_next(bi)
             var handle = self.loader.await_block(bi, ctx)
+            self.loader.prefetch_next_with_ctx(bi, ctx)
             var x = self._run_double[N_IMG, N_TXT, S](
                 handle.block, handle.prefix, img, txt, img_mod, txt_mod, cos, sin, ctx
             )
             txt = slice(x, 1, 0, N_TXT, ctx)
             img = slice(x, 1, N_TXT, N_IMG, ctx)
+            self.loader.mark_active_block_done(ctx)
 
         var x = concat(1, ctx, txt, img)
         for bi in range(cfg.num_single):
             var block_idx = cfg.num_double + bi
-            self.loader.prefetch_next(block_idx)
             var handle = self.loader.await_block(block_idx, ctx)
+            self.loader.prefetch_next_with_ctx(block_idx, ctx)
             x = self._run_single[S](
                 handle.block, handle.prefix, x, single_mod, cos, sin, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         var img_out = slice(x, 1, N_TXT, N_IMG, ctx)
         var final_mod = linear(
@@ -1068,10 +1085,11 @@ struct Klein9BOffloadedTurbo(Movable):
             ctx,
         )
 
-        self.loader.prefetch(0)
+        self.loader.set_config(OffloadConfig.synchronous_cfg_paired())
+        self.loader.prefetch_with_ctx(0, ctx)
         for bi in range(cfg.num_double):
-            self.loader.prefetch_next(bi)
             var handle = self.loader.await_block(bi, ctx)
+            self.loader.prefetch_next_with_ctx(bi, ctx)
             var x_pos = self._run_double[N_IMG, N_TXT, S](
                 handle.block,
                 handle.prefix,
@@ -1098,19 +1116,21 @@ struct Klein9BOffloadedTurbo(Movable):
             img_pos = slice(x_pos, 1, N_TXT, N_IMG, ctx)
             txt_neg = slice(x_neg, 1, 0, N_TXT, ctx)
             img_neg = slice(x_neg, 1, N_TXT, N_IMG, ctx)
+            self.loader.mark_active_block_done(ctx)
 
         var x_pos = concat(1, ctx, txt_pos, img_pos)
         var x_neg = concat(1, ctx, txt_neg, img_neg)
         for bi in range(cfg.num_single):
             var block_idx = cfg.num_double + bi
-            self.loader.prefetch_next(block_idx)
             var handle = self.loader.await_block(block_idx, ctx)
+            self.loader.prefetch_next_with_ctx(block_idx, ctx)
             x_pos = self._run_single[S](
                 handle.block, handle.prefix, x_pos, single_mod, cos, sin, ctx
             )
             x_neg = self._run_single[S](
                 handle.block, handle.prefix, x_neg, single_mod, cos, sin, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         var img_out_pos = slice(x_pos, 1, N_TXT, N_IMG, ctx)
         var img_out_neg = slice(x_neg, 1, N_TXT, N_IMG, ctx)

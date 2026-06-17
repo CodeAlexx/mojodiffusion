@@ -53,6 +53,602 @@ def has_any(text: str, needles: Iterable[str]) -> bool:
     return any(needle in text for needle in needles)
 
 
+def read_json(path: Path) -> dict[str, object]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def dict_or_empty(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def positive_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0.0
+
+
+def evidence_path(value: object) -> Path:
+    path = Path(str(value or ""))
+    return path if path.is_absolute() else REPO / path
+
+
+def klein_report_ready(path: Path, expected_model: str, *, expected_mode: str = "") -> bool:
+    report = read_json(path)
+    if report.get("ready") is not True:
+        return False
+    if report.get("blockers") not in ([], None):
+        return False
+    output_path = evidence_path(report.get("output_path"))
+    manifest_path = evidence_path(report.get("manifest_path"))
+    if not output_path.is_file() or output_path.stat().st_size < 100_000:
+        return False
+    if not manifest_path.is_file():
+        return False
+    genparams = dict_or_empty(report.get("genparams"))
+    manifest = dict_or_empty(report.get("manifest"))
+    visual_health = dict_or_empty(report.get("visual_health"))
+    if genparams.get("model") != expected_model:
+        return False
+    if manifest.get("schema") != "serenity.klein_daemon_result.v1":
+        return False
+    if manifest.get("backend") != "klein":
+        return False
+    if manifest.get("model") != expected_model:
+        return False
+    if expected_mode and manifest.get("mode") != expected_mode:
+        return False
+    return visual_health.get("ready") is True
+
+
+def zimage_conditioning_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    if report.get("ready") is not True:
+        return False
+    if report.get("blockers") not in ([], None):
+        return False
+    if report.get("accepted_conditioning_parity") is not False:
+        return False
+    hashes = report.get("idat_sha256")
+    if not isinstance(hashes, dict):
+        return False
+    required = (
+        "cfg_low_empty_negative",
+        "cfg_high_empty_negative",
+        "cfg_high_with_negative",
+    )
+    values = [str(hashes.get(label) or "") for label in required]
+    if any(not value for value in values) or len(set(values)) != len(values):
+        return False
+    cases = report.get("cases")
+    if not isinstance(cases, dict):
+        return False
+    for label in required:
+        case = dict_or_empty(cases.get(label))
+        evidence = dict_or_empty(case.get("evidence"))
+        png = dict_or_empty(evidence.get("png"))
+        manifest = dict_or_empty(evidence.get("manifest"))
+        run_identity = dict_or_empty(manifest.get("run_identity"))
+        visual_health = dict_or_empty(case.get("visual_health"))
+        png_path = evidence_path(png.get("path"))
+        if not png_path.is_file() or visual_health.get("ready") is not True:
+            return False
+        if run_identity.get("executed_sampler") != "flowmatch_euler":
+            return False
+        if run_identity.get("executed_scheduler") != "simple_flowmatch":
+            return False
+    return True
+
+
+def server_conditioning_report_ready(
+    path: Path,
+    model: str,
+    *,
+    schema: str,
+    executed_sampler: str,
+    executed_scheduler: str,
+    width: int,
+    height: int,
+) -> bool:
+    report = read_json(path)
+    summary = dict_or_empty(report.get("summary"))
+    if summary.get("exit_ok") is not True:
+        return False
+    if summary.get("accepted_conditioning_parity") is not False:
+        return False
+    if summary.get("accepted_sampler_parity") is not False:
+        return False
+    ready_models = summary.get("ready_models")
+    if not isinstance(ready_models, list) or model not in ready_models:
+        return False
+    models = dict_or_empty(report.get("models"))
+    model_report = dict_or_empty(models.get(model))
+    if model_report.get("ready") is not True:
+        return False
+    if model_report.get("blockers") not in ([], None):
+        return False
+    if model_report.get("accepted_conditioning_parity") is not False:
+        return False
+    if model_report.get("accepted_sampler_parity") is not False:
+        return False
+    hashes = model_report.get("idat_sha256")
+    if not isinstance(hashes, dict):
+        return False
+    required = (
+        "cfg_low_empty_negative",
+        "cfg_high_empty_negative",
+        "cfg_high_with_negative",
+    )
+    values = [str(hashes.get(label) or "") for label in required]
+    if any(not value for value in values) or len(set(values)) != len(values):
+        return False
+    cases = model_report.get("cases")
+    if not isinstance(cases, dict):
+        return False
+    for label in required:
+        case = dict_or_empty(cases.get(label))
+        if case.get("ok") is not True or case.get("blockers") not in ([], None):
+            return False
+        request = dict_or_empty(case.get("request"))
+        job = dict_or_empty(case.get("job"))
+        png = dict_or_empty(job.get("png"))
+        manifest = dict_or_empty(case.get("manifest"))
+        run_identity = dict_or_empty(manifest.get("run_identity"))
+        mojo = dict_or_empty(manifest.get("mojo"))
+        png_path = evidence_path(job.get("output_path"))
+        manifest_path = evidence_path(job.get("manifest_path"))
+        if not png_path.is_file() or not manifest_path.is_file():
+            return False
+        if png.get("width") != width or png.get("height") != height:
+            return False
+        if png.get("genparams_present") is not True:
+            return False
+        if manifest.get("schema") != schema:
+            return False
+        if manifest.get("accepted_sampler_parity") is not False:
+            return False
+        if manifest.get("accepted_speed_parity") is not False:
+            return False
+        if run_identity.get("prompt") != request.get("prompt"):
+            return False
+        if run_identity.get("negative") != request.get("negative"):
+            return False
+        if run_identity.get("requested_sampler") != request.get("sampler"):
+            return False
+        if run_identity.get("requested_scheduler") != request.get("scheduler"):
+            return False
+        if run_identity.get("executed_sampler") != executed_sampler:
+            return False
+        if run_identity.get("executed_scheduler") != executed_scheduler:
+            return False
+        if not positive_number(mojo.get("peak_vram_mib")):
+            return False
+        if not positive_number(mojo.get("total_wall_seconds")):
+            return False
+    return True
+
+
+def zimage_dpmpp2m_sgm_uniform_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    if report.get("ready") is not True:
+        return False
+    if report.get("blockers") not in ([], None):
+        return False
+    if report.get("accepted_sampler_parity") is not False:
+        return False
+    smoke = dict_or_empty(report.get("dpmpp2m_sgm_uniform_smoke"))
+    request = dict_or_empty(smoke.get("request"))
+    evidence = dict_or_empty(smoke.get("evidence"))
+    png = dict_or_empty(evidence.get("png"))
+    manifest = dict_or_empty(evidence.get("manifest"))
+    run_identity = dict_or_empty(manifest.get("run_identity"))
+    mojo = dict_or_empty(manifest.get("mojo"))
+    trace = dict_or_empty(run_identity.get("sampler_trace"))
+    png_path = evidence_path(png.get("path"))
+    sigma_trace = run_identity.get("sigma_trace")
+    if not png_path.is_file():
+        return False
+    if request.get("sampler") != "dpmpp_2m" or request.get("scheduler") != "sgm_uniform":
+        return False
+    if png.get("width") != 512 or png.get("height") != 512:
+        return False
+    if run_identity.get("requested_sampler") != "dpmpp_2m":
+        return False
+    if run_identity.get("requested_scheduler") != "sgm_uniform":
+        return False
+    if run_identity.get("executed_sampler") != "dpmpp_2m":
+        return False
+    if run_identity.get("executed_scheduler") != "sgm_uniform_flowmatch":
+        return False
+    if not isinstance(sigma_trace, list) or len(sigma_trace) != 5:
+        return False
+    if trace.get("algorithm") != "dpmpp_2m":
+        return False
+    if trace.get("schedule_source") != "zimage_comfy_sgm_uniform_sigmas":
+        return False
+    if int(trace.get("dpmpp_update_steps") or 0) < 1:
+        return False
+    if int(trace.get("dpmpp_second_order_steps") or 0) < 1:
+        return False
+    if not positive_number(mojo.get("peak_vram_mib")):
+        return False
+    return positive_number(mojo.get("denoise_seconds_per_step"))
+
+
+def weighted_prompt_fail_loud_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    if report.get("ready") is not True:
+        return False
+    if report.get("blockers") not in ([], None):
+        return False
+    if report.get("accepted_prompt_weight_parity") is not False:
+        return False
+    if report.get("accepted_conditioning_parity") is not False:
+        return False
+    if report.get("fail_loud_prompt_weight_gate") is not True:
+        return False
+    if report.get("prequeue_rejection") is not True:
+        return False
+    if report.get("job_count_unchanged") is not True:
+        return False
+    response = dict_or_empty(report.get("response"))
+    if response.get("http_status") != 422:
+        return False
+    error = str(response.get("error") or response.get("text") or "")
+    return (
+        "weighted prompt syntax is not supported" in error
+        and "conditioning_weights_applied=false" in error
+    )
+
+
+def latent_batch_fail_loud_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    if report.get("ready") is not True:
+        return False
+    if report.get("blockers") not in ([], None):
+        return False
+    if report.get("accepted_latent_batch_parity") is not False:
+        return False
+    if report.get("flat_images_serial_fanout_only") is not True:
+        return False
+    if report.get("prequeue_rejection") is not True:
+        return False
+    if report.get("job_count_unchanged") is not True:
+        return False
+    cases = report.get("cases")
+    if not isinstance(cases, list) or len(cases) < 2:
+        return False
+    seen: set[str] = set()
+    for item in cases:
+        if not isinstance(item, dict):
+            return False
+        case_id = str(item.get("case") or "")
+        error = str(item.get("error") or "")
+        if item.get("http_status") != 501:
+            return False
+        if "latent-batch execution" not in error:
+            return False
+        if case_id == "empty_latent_batch_size" and "EmptyLatentImage" not in error:
+            return False
+        if case_id == "repeat_latent_batch" and "RepeatLatentBatch" not in error:
+            return False
+        seen.add(case_id)
+    return {"empty_latent_batch_size", "repeat_latent_batch"}.issubset(seen)
+
+
+def disabled_model_fail_loud_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    if report.get("ready") is not True:
+        return False
+    if report.get("blockers") not in ([], None):
+        return False
+    if report.get("accepted_disabled_family_runtime") is not False:
+        return False
+    if report.get("prequeue_rejection") is not True:
+        return False
+    if report.get("job_count_unchanged") is not True:
+        return False
+    cases = report.get("cases")
+    if not isinstance(cases, list) or len(cases) < 2:
+        return False
+    seen: set[str] = set()
+    for item in cases:
+        if not isinstance(item, dict):
+            return False
+        case_id = str(item.get("case") or "")
+        error = str(item.get("error") or "")
+        if item.get("http_status") != 501:
+            return False
+        if "not runnable" not in error:
+            return False
+        if case_id == "qwen_image" and "metadata/preflight-only" not in error:
+            return False
+        seen.add(case_id)
+    return {"qwen_image", "ltx2_video"}.issubset(seen)
+
+
+def server_qwen_prequeue_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    summary = report.get("summary")
+    if not isinstance(summary, dict) or summary.get("exit_ok") is not True:
+        return False
+    prequeue = report.get("prequeue_rejections")
+    if not isinstance(prequeue, list):
+        return False
+    qwen_seen = False
+    for item in prequeue:
+        if not isinstance(item, dict):
+            return False
+        if item.get("case") != "qwen_disabled":
+            continue
+        error = str(item.get("error") or "")
+        if item.get("ok") is not True:
+            return False
+        if item.get("http_status") != 400:
+            return False
+        if item.get("job_count_before") != item.get("job_count_after"):
+            return False
+        if "Qwen" not in error or "metadata/preflight-only" not in error:
+            return False
+        qwen_seen = True
+    if not qwen_seen:
+        return False
+    samplers = report.get("samplers")
+    if not isinstance(samplers, dict) or samplers.get("http_status") != 200:
+        return False
+    body = samplers.get("body")
+    if not isinstance(body, dict):
+        return False
+    backends = body.get("backends")
+    if not isinstance(backends, list):
+        return False
+    for entry in backends:
+        if not isinstance(entry, dict) or entry.get("backend") != "qwenimage":
+            continue
+        return (
+            entry.get("supported_samplers") == []
+            and entry.get("supported_schedulers") == []
+            and entry.get("executed_sampler") == ""
+            and entry.get("executed_scheduler") == ""
+            and "metadata/preflight-only" in str(entry.get("reason") or "")
+        )
+    return False
+
+
+def server_zimage_karras_prequeue_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    summary = report.get("summary")
+    if not isinstance(summary, dict) or summary.get("exit_ok") is not True:
+        return False
+    prequeue = report.get("prequeue_rejections")
+    if not isinstance(prequeue, list):
+        return False
+    case_seen = False
+    for item in prequeue:
+        if not isinstance(item, dict):
+            return False
+        if item.get("case") != "zimage_karras_scheduler":
+            continue
+        error = str(item.get("error") or "")
+        if item.get("ok") is not True:
+            return False
+        if item.get("http_status") != 400:
+            return False
+        if item.get("job_count_before") != item.get("job_count_after"):
+            return False
+        for part in ("zimage", "unsupported scheduler", "karras"):
+            if part not in error.lower():
+                return False
+        case_seen = True
+    if not case_seen:
+        return False
+
+    samplers = report.get("samplers")
+    if not isinstance(samplers, dict) or samplers.get("http_status") != 200:
+        return False
+    body = samplers.get("body")
+    if not isinstance(body, dict):
+        return False
+    backends = body.get("backends")
+    if not isinstance(backends, list):
+        return False
+    for entry in backends:
+        if not isinstance(entry, dict) or entry.get("backend") != "zimage":
+            continue
+        schedulers = entry.get("supported_schedulers")
+        return (
+            isinstance(schedulers, list)
+            and "sgm_uniform" in schedulers
+            and "karras" not in schedulers
+            and entry.get("unsupported_policy") == "fail_loud"
+            and entry.get("accepted_sampler_parity") is False
+        )
+    return False
+
+
+def server_capabilities_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    summary = report.get("summary")
+    if not isinstance(summary, dict) or summary.get("exit_ok") is not True:
+        return False
+    if summary.get("failed_capability_cases") not in ([], None):
+        return False
+    if summary.get("failed_preflight_capability_profile_cases") not in ([], None):
+        return False
+    capabilities = report.get("capabilities")
+    if not isinstance(capabilities, dict) or capabilities.get("http_status") != 200:
+        return False
+    coverage = capabilities.get("coverage")
+    if not isinstance(coverage, dict) or coverage.get("ok") is not True:
+        return False
+    if summary.get("failed_capability_rejection_cases") not in ([], None):
+        return False
+    preflight_profiles = report.get("preflight_capability_profiles")
+    if not isinstance(preflight_profiles, list) or len(preflight_profiles) < 6:
+        return False
+    profile_cases = {str(item.get("case") or ""): item for item in preflight_profiles if isinstance(item, dict)}
+    for case_name, backend, status in (
+        ("zimage_admitted_profile", "zimage", "admitted"),
+        ("qwen_blocked_profile", "qwenimage", "metadata/preflight-only"),
+        ("klein9b_admitted_profile", "flux2", "admitted"),
+        ("klein4b_blocked_profile", "flux2", "blocked"),
+        ("ideogram_negative_prompt_profile", "ideogram4", "admitted"),
+        ("zimage_raw_controlnet_profile", "zimage", "admitted"),
+        ("zimage_workflow_unsupported_node_profile", "zimage", "admitted"),
+    ):
+        item = profile_cases.get(case_name)
+        if not isinstance(item, dict) or item.get("ok") is not True:
+            return False
+        if case_name == "zimage_workflow_unsupported_node_profile":
+            if item.get("http_status") != 501 or item.get("rejection_stage") != "workflow_lowering":
+                return False
+        profile = item.get("capability_profile")
+        if not isinstance(profile, dict):
+            return False
+        if profile.get("schema") != "serenity.capability_profile.v1":
+            return False
+        if profile.get("backend") != backend or profile.get("production_status") != status:
+            return False
+    capability_rejections = report.get("capability_rejections")
+    if not isinstance(capability_rejections, list) or len(capability_rejections) < 30:
+        return False
+    rejection_cases = {str(item.get("case") or ""): item for item in capability_rejections if isinstance(item, dict)}
+    for case_name in (
+        "zimage_image_to_image_disabled",
+        "zimage_controlnet_disabled",
+        "zimage_bbox_prompt_json_disabled",
+        "sdxl_vae_override_disabled",
+        "ideogram4_negative_prompt_disabled",
+        "flux_multi_lora_disabled",
+    ):
+        item = rejection_cases.get(case_name)
+        if not isinstance(item, dict) or item.get("ok") is not True:
+            return False
+        if item.get("job_count_before") != item.get("job_count_after"):
+            return False
+    body = capabilities.get("body")
+    if not isinstance(body, dict):
+        return False
+    if body.get("schema") != "serenity.capabilities.v1":
+        return False
+    global_limits = body.get("global_limits")
+    if not isinstance(global_limits, dict):
+        return False
+    if global_limits.get("txt2img_only") is not True:
+        return False
+    if global_limits.get("image_to_image") is not False:
+        return False
+    if global_limits.get("runtime_dependency_on_external_repos") is not False:
+        return False
+    backends = body.get("backends")
+    if not isinstance(backends, list):
+        return False
+    found = {entry.get("backend"): entry for entry in backends if isinstance(entry, dict)}
+    for backend in ("zimage", "ideogram4", "sdxl", "anima", "sd3", "flux", "flux2"):
+        entry = found.get(backend)
+        if not isinstance(entry, dict):
+            return False
+        features = entry.get("features")
+        if not isinstance(features, dict):
+            return False
+        for name in ("image_to_image", "inpaint", "image_conditioning", "vae_override", "outpaint"):
+            feature = features.get(name)
+            if (
+                not isinstance(feature, dict)
+                or feature.get("supported") is not False
+                or feature.get("policy") != "fail_loud"
+            ):
+                return False
+    zimage = found["zimage"]
+    z_samplers = zimage.get("samplers")
+    if not isinstance(z_samplers, dict):
+        return False
+    z_sched = z_samplers.get("supported_schedulers")
+    if not isinstance(z_sched, list) or "sgm_uniform" not in z_sched or "karras" in z_sched:
+        return False
+    ideogram_features = found["ideogram4"].get("features")
+    flux_features = found["flux"].get("features")
+    if not isinstance(ideogram_features, dict) or not isinstance(flux_features, dict):
+        return False
+    if ideogram_features.get("bbox_prompt_json", {}).get("supported") is not True:
+        return False
+    if flux_features.get("lora", {}).get("max_count") != 1:
+        return False
+    return True
+
+
+def server_sd3_flux_worker_report_ready(path: Path) -> bool:
+    report = read_json(path)
+    summary = report.get("summary")
+    if not isinstance(summary, dict) or summary.get("exit_ok") is not True:
+        return False
+
+    samplers = report.get("samplers")
+    if not isinstance(samplers, dict) or samplers.get("http_status") != 200:
+        return False
+    body = samplers.get("body")
+    if not isinstance(body, dict):
+        return False
+    backends = body.get("backends")
+    if not isinstance(backends, list):
+        return False
+
+    expected = {
+        "sd3": ("sd3_flowmatch_euler", "sd3_simple_flowmatch"),
+        "flux": ("flux_flowmatch_euler", "flux_simple_flowmatch"),
+    }
+    seen: set[str] = set()
+    for entry in backends:
+        if not isinstance(entry, dict):
+            return False
+        backend = str(entry.get("backend") or "")
+        if backend not in expected:
+            continue
+        want_sampler, want_scheduler = expected[backend]
+        supported_samplers = entry.get("supported_samplers")
+        supported_schedulers = entry.get("supported_schedulers")
+        reason = str(entry.get("reason") or "")
+        if not isinstance(supported_samplers, list) or not isinstance(
+            supported_schedulers, list
+        ):
+            return False
+        if entry.get("accepted_sampler_parity") is not False:
+            return False
+        if entry.get("unsupported_policy") != "fail_loud":
+            return False
+        if entry.get("executed_sampler") != want_sampler:
+            return False
+        if entry.get("executed_scheduler") != want_scheduler:
+            return False
+        if "euler" not in supported_samplers or "flowmatch_euler" not in supported_samplers:
+            return False
+        if "simple" not in supported_schedulers:
+            return False
+        if "bounded 1024x1024" not in reason:
+            return False
+        seen.add(backend)
+
+    if seen != set(expected):
+        return False
+
+    prequeue = report.get("prequeue_rejections")
+    if not isinstance(prequeue, list):
+        return False
+    for item in prequeue:
+        if not isinstance(item, dict) or item.get("case") != "flux_negative":
+            continue
+        error = str(item.get("error") or "")
+        return (
+            item.get("ok") is True
+            and item.get("http_status") == 400
+            and item.get("job_count_before") == item.get("job_count_after")
+            and "flux" in error
+            and "negative prompt" in error
+        )
+    return False
+
+
 def marker(
     feature: str,
     label: str,
@@ -239,15 +835,32 @@ def mojo_markers() -> list[Marker]:
     zimage = REPO / "serenitymojo/serve/zimage_backend.mojo"
     qwen = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
     ideogram = REPO / "serenitymojo/serve/ideogram4_backend.mojo"
+    klein = REPO / "serenitymojo/serve/klein_backend.mojo"
     sampler_registry = REPO / "serenitymojo/sampling/sampler_registry.mojo"
     variation_noise = REPO / "serenitymojo/sampling/variation_noise.mojo"
     dispatch = REPO / "serenitymojo/serve/dispatch_backend.mojo"
+    sd3_backend = REPO / "serenitymojo/serve/sd3_backend.mojo"
+    flux_backend = REPO / "serenitymojo/serve/flux_backend.mojo"
+    sd3_worker = REPO / "serenitymojo/serve/serenity_worker_sd3.mojo"
+    flux_worker = REPO / "serenitymojo/serve/serenity_worker_flux.mojo"
     stub = REPO / "serenitymojo/serve/stub_backend.mojo"
     harness = REPO / "serenitymojo/sampling/product_sampler_harness.mojo"
     harness_doc = REPO / "serenitymojo/docs/SAMPLER_PRODUCT_HARNESS_2026-06-05.md"
     parity_doc = (
         REPO / "serenitymojo/docs/SWARMUI_SAMPLER_PARITY_MAP_2026-06-12.md"
     )
+    server_main = REPO / "serenity-server/crates/server/src/main.rs"
+    server_capabilities = REPO / "serenity-server/crates/server/src/capabilities.rs"
+    samplers_asset = REPO / "serenity-server/crates/server/src/assets/samplers_v1.json"
+    zimage_conditioning_report = REPO / "output/checks/zimage_conditioning_readiness.json"
+    sdxl_conditioning_report = REPO / "output/checks/sdxl_conditioning_gate.json"
+    sd3_conditioning_report = REPO / "output/checks/sd3_conditioning_gate.json"
+    anima_conditioning_report = REPO / "output/checks/anima_conditioning_gate.json"
+    weighted_prompt_report = REPO / "output/checks/weighted_prompt_fail_loud.json"
+    latent_batch_report = REPO / "output/checks/latent_batch_fail_loud.json"
+    disabled_model_report = REPO / "output/checks/disabled_model_fail_loud.json"
+    server_prequeue_report = REPO / "output/checks/serenity_server_t2i_product_gate_prequeue_latest.json"
+    zimage_dpmpp2m_sgm_report = REPO / "output/checks/zimage_dpmpp2m_sgm_uniform_readiness.json"
 
     daemon_text = read_text(daemon)
     workflow_graph_text = read_text(workflow_graph)
@@ -255,9 +868,13 @@ def mojo_markers() -> list[Marker]:
     zimage_text = read_text(zimage)
     qwen_text = read_text(qwen)
     ideogram_text = read_text(ideogram)
+    klein_text = read_text(klein)
     sampler_registry_text = read_text(sampler_registry)
     variation_noise_text = read_text(variation_noise)
     dispatch_text = read_text(dispatch)
+    server_main_text = read_text(server_main)
+    server_capabilities_text = read_text(server_capabilities)
+    samplers_asset_text = read_text(samplers_asset)
     stub_text = read_text(stub)
     harness_text = read_text(harness)
     harness_doc_text = read_text(harness_doc)
@@ -377,6 +994,17 @@ def mojo_markers() -> list[Marker]:
     )
     markers.append(
         marker(
+            "Supported feature foundation",
+            "Rust server exposes a shared /v1/capabilities product contract",
+            server_prequeue_report,
+            server_capabilities_report_ready(server_prequeue_report),
+            "The Rust-server product gate fetches /v1/capabilities and verifies admitted backends, dimensions, sampler/scheduler subsets, disabled img2img/inpaint/image-conditioning/VAE/refiner/upscale/control features, Ideogram bbox prompt JSON, and fail-loud policy.",
+            "Keep UI controls and /v1/preflight wired to the same capability contract before broadening admitted features.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
             "Variation seed and strength",
             "Swarm-style variation noise is wired into image backends",
             variation_noise,
@@ -397,7 +1025,7 @@ def mojo_markers() -> list[Marker]:
                     "variation_strength > 0.0",
                 ],
             ),
-            "Z-Image and Qwen apply variation_seed/variation_strength to initial latent noise; Z-Image also records variation_applied in its manifest.",
+            "Z-Image applies variation_seed/variation_strength to initial latent noise and records variation_applied in its manifest; Qwen variation helper wiring remains metadata/preflight-only, not product-admitted generation.",
             "Runtime acceptance still requires artifact evidence that variation changes the output payload.",
             severity="warning",
         )
@@ -454,8 +1082,30 @@ def mojo_markers() -> list[Marker]:
     )
     markers.append(
         marker(
+            "Z-Image backend subset",
+            "Z-Image DPM++ 2M executes on sgm_uniform",
+            zimage_dpmpp2m_sgm_report,
+            zimage_dpmpp2m_sgm_uniform_report_ready(zimage_dpmpp2m_sgm_report),
+            "Z-Image DPM++ 2M has a dedicated daemon artifact for the admitted sgm_uniform flow-match schedule, with Comfy sigma-source metadata, DPM++ update trace, timing, and VRAM evidence.",
+            "Keep sampler parity blocked until every exposed sampler/scheduler pair has comparable artifact evidence or fails loud.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Z-Image backend subset",
+            "Z-Image Karras scheduler fails loud before enqueue",
+            server_prequeue_report,
+            server_zimage_karras_prequeue_report_ready(server_prequeue_report),
+            "The Rust-server product gate rejects a Z-Image Karras scheduler request before job fanout and /v1/samplers keeps Karras out of Z-Image supported_schedulers.",
+            "Keep sampler parity blocked until Karras has a real Z-Image scheduler builder and artifact/timing/VRAM evidence.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
             "Qwen backend subset",
-            "Qwen executes seed/CFG/negative subset and rejects img2img/LoRA",
+            "Qwen helper code remains quarantined from product admission",
             qwen,
             has_all(
                 qwen_text,
@@ -472,8 +1122,138 @@ def mojo_markers() -> list[Marker]:
                     "unsupported sampler",
                 ],
             ),
-            "Qwen has a model-specific schedule and registry-backed sampler/scheduler admission.",
-            "Full Qwen generation remains out of scope until separate product gates pass.",
+            "Qwen helper code still has the model-specific schedule, CFG, negative prompt, and local fail-loud checks, but registry/server admission keeps generation metadata/preflight-only.",
+            "Do not treat helper-code presence as Qwen product readiness until separate artifact, timing, VRAM, quality, and workflow gates pass.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Conditioning parity evidence",
+            "Z-Image CFG and negative prompt affect output payload",
+            zimage_conditioning_report,
+            zimage_conditioning_report_ready(zimage_conditioning_report),
+            "Z-Image same-seed artifact smoke proves CFG and negative-prompt changes alter the PNG payload while preserving manifest metadata.",
+            "Keep conditioning parity blocked for prompt weights and unproven model families until each has artifact evidence.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Conditioning parity evidence",
+            "SDXL CFG and negative prompt affect Rust-server output payload",
+            sdxl_conditioning_report,
+            server_conditioning_report_ready(
+                sdxl_conditioning_report,
+                "sdxl",
+                schema="serenity.sdxl.daemon_result.v1",
+                executed_sampler="sdxl_euler",
+                executed_scheduler="normal",
+                width=1024,
+                height=1024,
+            ),
+            "SDXL same-seed Rust-server artifact gate proves CFG and negative-prompt changes alter the PNG payload while preserving manifest timing, VRAM, and sampler metadata.",
+            "Keep conditioning parity blocked for prompt weights and model families that still lack artifact evidence.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Conditioning parity evidence",
+            "SD3 CFG and negative prompt affect Rust-server output payload",
+            sd3_conditioning_report,
+            server_conditioning_report_ready(
+                sd3_conditioning_report,
+                "sd3",
+                schema="serenity.sd3.daemon_result.v1",
+                executed_sampler="sd3_flowmatch_euler",
+                executed_scheduler="sd3_simple_flowmatch",
+                width=1024,
+                height=1024,
+            ),
+            "SD3 same-seed Rust-server artifact gate proves CFG and negative-prompt changes alter the PNG payload while preserving manifest timing, VRAM, sampler metadata, and 5x5 low-memory VAE decode metadata.",
+            "Keep conditioning parity blocked for prompt weights and model families that still lack artifact evidence.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Conditioning parity evidence",
+            "Anima CFG and negative prompt affect Rust-server output payload",
+            anima_conditioning_report,
+            server_conditioning_report_ready(
+                anima_conditioning_report,
+                "anima",
+                schema="serenity.anima.daemon_result.v1",
+                executed_sampler="anima_euler",
+                executed_scheduler="normal",
+                width=1024,
+                height=1024,
+            ),
+            "Anima same-seed Rust-server artifact gate proves CFG and negative-prompt changes alter the PNG payload while preserving manifest timing, VRAM, and sampler metadata.",
+            "Keep conditioning parity blocked for prompt-weight math and broad prompt-weight syntax parity.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Conditioning parity evidence",
+            "Weighted prompt syntax fails loud before enqueue",
+            weighted_prompt_report,
+            weighted_prompt_fail_loud_report_ready(weighted_prompt_report)
+            and has_all(
+                daemon_text,
+                [
+                    "_reject_unapplied_prompt_weights",
+                    "weighted prompt syntax is not supported",
+                    "conditioning_weights_applied=false",
+                ],
+            ),
+            "Weighted prompt syntax is rejected with HTTP 422 before job fanout while prompt-syntax metadata still records conditioning_weights_applied=false.",
+            "Do not accept prompt-weight parity until conditioning-weight math has artifact evidence; until then, weighted syntax must remain a prequeue fail-loud path.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Images and latent batch",
+            "Comfy latent batch syntax fails loud before enqueue",
+            latent_batch_report,
+            latent_batch_fail_loud_report_ready(latent_batch_report)
+            and has_all(
+                workflow_graph_text,
+                [
+                    "EmptyLatentImage batch_size>1",
+                    "RepeatLatentBatch requires real Comfy",
+                    "latent-batch execution",
+                    "flat images=N",
+                    "product fanout",
+                ],
+            ),
+            "Workflow graph EmptyLatentImage.batch_size>1 and RepeatLatentBatch are rejected with HTTP 501 before job fanout; flat images=N remains the serial output path.",
+            "Do not accept Comfy latent-batch parity until a backend denoises real batched latents in one execution path.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Qwen and video quarantine",
+            "Disabled model families fail loud before enqueue",
+            disabled_model_report,
+            disabled_model_fail_loud_report_ready(disabled_model_report)
+            and server_qwen_prequeue_report_ready(server_prequeue_report)
+            and has_all(
+                daemon_text + sampler_registry_text + dispatch_text,
+                [
+                    'sampler_backend == "disabled"',
+                    "metadata/preflight-only",
+                    "m.find(\"qwen\")",
+                    "Qwen/Qwen-Image/Qwen-Edit execution is disabled",
+                    "LTX/LTX2 execution is disabled",
+                ],
+            ),
+            "Mojo daemon rejects Qwen/LTX-style known-disabled models with HTTP 501 before job fanout, and the Rust server rejects Qwen prequeue while publishing Qwen inventory as sampler-less metadata.",
+            "Keep Qwen/video parity blocked until separate artifact, timing, VRAM, quality, and workflow gates pass.",
             severity="warning",
         )
     )
@@ -511,13 +1291,109 @@ def mojo_markers() -> list[Marker]:
     markers.append(
         marker(
             "Model/backend mapping",
-            "Dispatch surface is limited to Z-Image, Qwen, and bounded Ideogram4 real backends",
+            "Standalone dispatch has bounded real routes and loud disabled families",
             dispatch,
-            has_all(dispatch_text, ["KIND_ZIMAGE", "KIND_QWEN", "KIND_IDEOGRAM4"])
-            and not has_any(dispatch_text, ["KIND_KLEIN", "KIND_SDXL", "KIND_SD3"]),
-            "Daemon real dispatch currently covers Z-Image, Qwen, and bounded Ideogram4, not Klein/SDXL/SD3/etc.",
-            "Add dispatch entries only after model-specific artifact, timing, VRAM, and sampler evidence exists.",
-            severity="blocker",
+            has_all(
+                dispatch_text,
+                [
+                    "KIND_ZIMAGE",
+                    "KIND_IDEOGRAM4",
+                    "KIND_KLEIN",
+                    "KIND_SDXL",
+                    "KIND_ANIMA",
+                    "KleinBackend",
+                    "SampleCliBackend(String(\"sdxl\"))",
+                    "SampleCliBackend(String(\"anima\"))",
+                    "_known_disabled_model_reason",
+                    "Qwen/Qwen-Image/Qwen-Edit execution is disabled",
+                    "SD3/SD3.5 execution is metadata-only",
+                    "LTX/LTX2 execution is disabled",
+                ],
+            ),
+            "Standalone Mojo dispatch includes bounded Z-Image, Ideogram4, Flux2/Klein, SDXL CLI, and Anima CLI routes, while keeping heavyweight SD3/Flux1 worker stacks out of the monolithic dispatch path.",
+            "Only widen standalone dispatch after model-specific artifact, timing, VRAM, build-memory, and sampler evidence exists.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Model/backend mapping",
+            "Rust server maps SD3 and Flux to per-kind Mojo workers",
+            server_capabilities,
+            has_all(
+                server_main_text + server_capabilities_text,
+                [
+                    "ModelFamily::Sd3",
+                    "ModelFamily::Flux",
+                    "serenity_worker_sd3",
+                    "serenity_worker_flux",
+                    'production_entry: "serenitymojo/serve/sd3_backend.mojo"',
+                    'production_entry: "serenitymojo/serve/flux_backend.mojo"',
+                    "fn reject_negative",
+                    "negative prompt is not supported by this production route",
+                    "worker_dispatch_uses_admitted_model_family_classifier",
+                ],
+            )
+            and has_all(
+                samplers_asset_text,
+                [
+                    '"backend": "sd3"',
+                    '"backend": "flux"',
+                    '"executed_sampler": "sd3_flowmatch_euler"',
+                    '"executed_sampler": "flux_flowmatch_euler"',
+                ],
+            )
+            and sd3_backend.is_file()
+            and flux_backend.is_file()
+            and sd3_worker.is_file()
+            and flux_worker.is_file()
+            and server_sd3_flux_worker_report_ready(server_prequeue_report),
+            "Rust control plane admits SD3/Flux through per-kind process workers, artifact manifests, and sampler inventory while the standalone Mojo dispatch remains intentionally lighter.",
+            "Run scripts/check_serenity_server_t2i_product_gate.py --all-admitted --strict-production and require manifest-backed artifacts, timings, VRAM, and metadata for every admitted family before accepting full model coverage.",
+            severity="warning",
+        )
+    )
+    markers.append(
+        marker(
+            "Flux2/Klein backend subset",
+            "Klein staged daemon route has real artifact evidence",
+            klein,
+            has_all(
+                klein_text,
+                [
+                    "KleinBackend",
+                    "process-separated Qwen3 cap-cache precache",
+                    "KLEIN_PRECACHE_BIN",
+                    "KLEIN_SAMPLER_BIN",
+                    "unsupported sampler",
+                    "unsupported scheduler",
+                    "reference_latent_count",
+                    "encode_png_with_text",
+                    "serenity.genparams.v1",
+                ],
+            )
+            and klein_report_ready(
+                REPO / "output/checks/klein9b_lora_daemon_smoke.json",
+                "flux2-klein-9b.safetensors",
+            )
+            and klein_report_ready(
+                REPO / "output/checks/klein4b_reference_edit_daemon_smoke.json",
+                "flux2-klein-4b.safetensors",
+                expected_mode="reference_latent_edit",
+            )
+            and klein_report_ready(
+                REPO / "output/checks/klein9b_reference_edit_daemon_smoke.json",
+                "flux2-klein-9b.safetensors",
+                expected_mode="reference_latent_edit",
+            )
+            and klein_report_ready(
+                REPO / "output/checks/klein9b_lora_reference_edit_daemon_smoke.json",
+                "flux2-klein-9b.safetensors",
+                expected_mode="reference_latent_edit",
+            ),
+            "Klein has bounded daemon artifacts for 9B LoRA txt2img, 4B ReferenceLatent, 9B ReferenceLatent, and 9B LoRA ReferenceLatent.",
+            "Keep Flux2/Klein marked bounded until sampler/scheduler, timing, VRAM, and CLI limits are accepted per route.",
+            severity="warning",
         )
     )
     markers.append(
@@ -533,7 +1409,7 @@ def mojo_markers() -> list[Marker]:
                 ],
             )
             and has_all(
-                stub_text + zimage_text + qwen_text,
+                stub_text + zimage_text + qwen_text + klein_text,
                 [
                     "encode_png_with_text",
                     "serenity.genparams.v1",
@@ -648,13 +1524,13 @@ def surface_blockers() -> list[dict[str, str]]:
         {
             "id": "sampler_scheduler_dispatch",
             "severity": "P1",
-            "blocker": "Z-Image now has bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 paths on admitted simple and sgm_uniform flow-match schedules, but Karras, ancestral, SDE, CFG++, and the rest of the SwarmUI/Comfy sampler catalog still lack distinct daemon denoise loops.",
+            "blocker": "Z-Image now has bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC bh2 paths on admitted simple and sgm_uniform flow-match schedules, including dedicated DPM++ 2M + sgm_uniform artifact evidence, but Karras, ancestral, SDE, CFG++, and the rest of the SwarmUI/Comfy sampler catalog still lack distinct daemon denoise loops.",
             "acceptance_gate": "Wire each accepted sampler/scheduler pair into a backend denoise loop and record requested versus executed values with artifact/timing/VRAM evidence.",
         },
         {
             "id": "latent_batch_execution",
             "severity": "P1",
-            "blocker": "images=N is expanded into indexed serial daemon jobs, but Comfy-style batched latent execution is not implemented as a single backend batch.",
+            "blocker": "Flat images=N is expanded into indexed serial daemon jobs, and Comfy workflow latent-batch syntax now fails loud before enqueue instead of being treated as serial images. True Comfy-style batched latent execution is still not implemented as a single backend batch.",
             "acceptance_gate": "If the UI exposes Comfy batch-size semantics separately from Images count, add a batched latent path or fail loud per backend.",
         },
         {
@@ -666,19 +1542,19 @@ def surface_blockers() -> list[dict[str, str]]:
         {
             "id": "model_dispatch_coverage",
             "severity": "P1",
-            "blocker": "Sampling modules exist for Klein/Flux2, SDXL, SD15, SD3, Chroma, ERNIE, Anima, and LTX2, but real daemon dispatch is limited to Z-Image, Qwen, and bounded Ideogram4.",
-            "acceptance_gate": "Add real dispatch only after each model has artifact, timing, VRAM, metadata, and sampler/scheduler failure-mode evidence.",
+            "blocker": "Standalone Mojo dispatch covers bounded Z-Image, Ideogram4, Flux2/Klein staged artifacts, and fixed SDXL/Anima sample-CLI wrappers. The Rust control plane also maps SD3/SD3.5 and Flux1-dev to per-kind Mojo workers with sampler inventory and fail-loud prequeue checks. A strict all-admitted Rust-server gate now has manifest-backed artifact, timing, and VRAM evidence for zimage, sdxl, anima, sd3, flux, and ideogram4, but SD15, Chroma, ERNIE, full LTX2/video, HiDream, SenseNova, full Qwen, and wider sampler variants remain missing or explicitly disabled.",
+            "acceptance_gate": "Add or accept model routes only after each admitted model has manifest-backed artifact, timing, VRAM, metadata, sampler/scheduler, and failure-mode evidence.",
         },
         {
             "id": "conditioning_parity",
             "severity": "P1",
-            "blocker": "Negative prompt and CFG are model-specific and prompt weights are parsed/persisted but not proven applied to conditioning math.",
+            "blocker": "Z-Image, SDXL, SD3, and Anima now have bounded artifact evidence that CFG and negative-prompt changes affect output payloads, and weighted prompt syntax now fails loud before enqueue instead of being persisted as a silent no-op. Prompt-weight conditioning math is still missing; Flux and Ideogram intentionally do not accept negative prompts in the current bounded production routes.",
             "acceptance_gate": "Per model, prove negative prompt, CFG scale, and weighted prompt behavior with artifact and metadata checks.",
         },
         {
             "id": "qwen_video_quarantine",
             "severity": "P0",
-            "blocker": "Full Qwen generation and video generation are not accepted targets for this sampler task.",
+            "blocker": "Full Qwen generation and video generation are not accepted sampler targets. Qwen/LTX-style disabled model requests now fail before enqueue instead of becoming accepted jobs, while video remains bounded DEV-smoke evidence only.",
             "acceptance_gate": "Keep Qwen full-generation and video sampler parity blocked until separate product gates provide real artifacts and resource evidence.",
         },
     ]

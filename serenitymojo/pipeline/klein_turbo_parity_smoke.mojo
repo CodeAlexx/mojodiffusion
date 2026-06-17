@@ -12,7 +12,7 @@
 # OVERLAP (report only):
 #   The async copy path is confirmed active by:
 #     - TurboBlockLoader.async_enabled() == True
-#     - Copy kernel is dispatched on explicit copy_stream (not default stream)
+#     - H2D staging is dispatched on explicit copy_stream (not default stream)
 #     - DeviceEvent fence handshake is present (enqueue_wait_for)
 #   No wall-clock timer is available in MAX 26.3 (confirmed in Phase 0).
 #   We do NOT fake a speedup number.
@@ -25,6 +25,7 @@
 #
 # BUILD:
 #   pixi run mojo build -I . -Xlinker -lm \
+#     -Xlinker -lcuda \
 #     serenitymojo/pipeline/klein_turbo_parity_smoke.mojo \
 #     -o /tmp/klein_turbo_parity && /tmp/klein_turbo_parity
 
@@ -261,10 +262,9 @@ def main() raises:
     print("=== OVERLAP REPORT ===")
     print()
     print("[overlap] TurboBlockLoader.async_enabled():", turbo_model.loader._turbo.async_enabled())
-    print("[overlap] Async mechanism: GPU copy kernel on explicit copy_stream.")
-    print("          - prefetch(): CPU memcpy → pinned host slab, then")
-    print("            dispatch _h2d_copy_kernel on copy_stream,")
-    print("            record event on copy_stream.")
+    print("[overlap] Async mechanism: H2D staging on explicit copy_stream.")
+    print("          - prefetch_with_ctx(): dispatches the configured copy backend")
+    print("            on copy_stream and records the slot event there.")
     print("          - await_block(): ctx.stream().enqueue_wait_for(ev)")
     print("            → default stream fences, ensuring copy is done.")
     print("[overlap] Wall-clock timer: NOT AVAILABLE in MAX 26.3 (confirmed Phase 0).")

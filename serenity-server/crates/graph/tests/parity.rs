@@ -53,6 +53,10 @@ fn scalar_eq(a: &JsonValue, b: &JsonValue) -> bool {
     }
 }
 
+fn rust_only_lowering_key(k: &str) -> bool {
+    matches!(k, "workflow_route_kind" | "workflow_plan")
+}
+
 struct RefCase {
     name: String,
     request_path: PathBuf,
@@ -85,12 +89,10 @@ fn collect_cases() -> Vec<RefCase> {
 /// Lower one request and diff every top-level scalar key (except `workflow`)
 /// against the reference. Returns Ok(()) on full parity, or Err(diff report).
 fn check_case(case: &RefCase) -> Result<(), String> {
-    let req_bytes = fs::read(&case.request_path)
-        .map_err(|e| format!("read request: {e}"))?;
+    let req_bytes = fs::read(&case.request_path).map_err(|e| format!("read request: {e}"))?;
     let mut req: JsonValue =
         serde_json::from_slice(&req_bytes).map_err(|e| format!("parse request: {e}"))?;
-    let ref_bytes = fs::read(&case.lowered_path)
-        .map_err(|e| format!("read lowered ref: {e}"))?;
+    let ref_bytes = fs::read(&case.lowered_path).map_err(|e| format!("read lowered ref: {e}"))?;
     let want: JsonValue =
         serde_json::from_slice(&ref_bytes).map_err(|e| format!("parse lowered ref: {e}"))?;
 
@@ -124,8 +126,13 @@ fn check_case(case: &RefCase) -> Result<(), String> {
         if k == "workflow" {
             continue;
         }
+        if rust_only_lowering_key(k) {
+            continue;
+        }
         if !want_obj.contains_key(k) {
-            diffs.push(format!("  key '{k}': EXTRA in lowered (got {got_v}, absent in ref)"));
+            diffs.push(format!(
+                "  key '{k}': EXTRA in lowered (got {got_v}, absent in ref)"
+            ));
         }
     }
 
@@ -190,11 +197,14 @@ fn flux2_dev_t2i_lora_is_rejected_loud() {
         eprintln!("skip: reject fixture absent");
         return;
     }
-    let mut req: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    let mut req: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
     let err = serenity_graph::lower_request(&mut req).expect_err("must raise");
     println!("flux2_dev_t2i_lora rejection: {err}");
     // The Mojo oracle raised [501]; the audit splits unsupported(501)/badreq(422).
     // A CLIP_LORA_UNSUPPORTED type mismatch is a 422 in the structured-error model.
-    assert!(matches!(err.http_status(), 501 | 422), "status {}", err.http_status());
+    assert!(
+        matches!(err.http_status(), 501 | 422),
+        "status {}",
+        err.http_status()
+    );
 }

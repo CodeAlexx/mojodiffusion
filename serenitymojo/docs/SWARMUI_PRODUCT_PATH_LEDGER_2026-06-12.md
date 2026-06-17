@@ -13,6 +13,7 @@ Source acceptance docs:
 - `/home/alex/serenityUI/SWARMUI_GAP_AUDIT_2026-06-10.md`
 - `/home/alex/serenityUI/GENSCREEN_PARITY_PLAN.md`
 - `/home/alex/serenityUI/SERENITYUI_TODO.md`
+- `serenitymojo/docs/SUPPORTED_FEATURE_FOUNDATION_2026-06-16.md`
 
 No-CUDA gate:
 
@@ -46,6 +47,51 @@ A feature is accepted only when the product path has current evidence:
 For video, also require frame count, duration, resolution, muxing, and audio
 behavior verification.
 
+2026-06-16 foundation update: feature admission for the Rust `/v1/generate`
+route is now centralized in `GET /v1/capabilities` with schema
+`serenity.capabilities.v1`. The endpoint and shared prequeue guard now live in
+`serenity-server/crates/server/src/capabilities.rs`, not as more growth in
+`main.rs`. The same tables gate `/v1/preflight` and `/v1/generate`, and they
+record admitted dimensions, sampler/scheduler subsets, negative-prompt support,
+LoRA limits, Ideogram bbox prompt JSON, and disabled features. The current route
+remains txt2img-only: image-to-image, inpaint, image conditioning, VAE override,
+hires two-pass, refiner, upscale, outpaint, ControlNet, and video are
+`supported:false` with `policy:"fail_loud"`.
+
+The no-CUDA product gate now also derives fail-loud cases from the live
+capability payload. The current
+`output/checks/serenity_server_t2i_product_gate_prequeue_latest.json` report has
+88 generated `capability_rejections` and no
+`failed_capability_rejection_cases`, covering disabled fields such as
+image-to-image, ControlNet, VAE override, bbox `prompt_json` on non-Ideogram
+models, Ideogram negative prompts, Flux multi-LoRA, workflow-lowered image
+conditioning fields, and workflow-lowered outpaint/LanPaint fields.
+
+`/v1/preflight` now also returns a per-request `capability_profile` with schema
+`serenity.capability_profile.v1`. The no-CUDA report records six green profile
+cases: Z-Image admitted, Qwen metadata/preflight-only, Klein/Flux2 blocked,
+Ideogram negative-prompt rejection with an admitted profile, and Z-Image raw
+ControlNet rejection with an admitted profile, plus Z-Image workflow
+unsupported-node rejection with an admitted profile and
+`rejection_stage:"workflow_lowering"`. This keeps tools from guessing which
+feature matrix applied to a rejected request.
+
+Canvas-side admission now consumes the same capability contract through
+`serenity-server/canvas/js/api.js`. The adapter caches `/v1/capabilities`,
+emits `capabilities:loaded`, and exposes shared feature helpers used by the
+param rail, prompt bar, refiner/upscale panel, and gallery actions. The browser
+still submits txt2img sentinel values for disabled surfaces; image-to-image and
+upscale gallery actions stay hidden until the server capability payload and flat
+submit body are both widened.
+
+Workflow-derived disabled fields now hit the same front-door Rust guard after
+graph lowering. Active `init_image`, `mask_image`, `conditioning_mask_image`,
+`inpaint_conditioning_image`, `reference_image`, `outpaint_left`,
+`threshold_mask_value`, and LanPaint metadata return HTTP 400 before job
+creation. The current no-CUDA report includes passing
+`*_image_conditioning_disabled` and `*_outpaint_lowered_fields_disabled` cases
+with unchanged `/v1/jobs` counts.
+
 ## P0.1 Image Fast Path
 
 Goal: image generation must use the newest mojodiffusion runtime kernels in the
@@ -57,8 +103,9 @@ Current blockers:
   It routes through `sdpa_qwen_keymask`, an online-softmax key-mask path that
   preserves Qwen's middle-of-sequence text padding semantics without allocating
   `[B,H,S,S]` masks or F32 score slabs. This is statically and op-parity gated;
-  full Qwen generation was not run because Qwen remains too large/slow/OOM-risky
-  for this slice.
+  full Qwen generation is not admitted in this slice; current Rust and Mojo
+  product gates keep Qwen metadata/preflight-only until separate artifact,
+  timing, VRAM, quality, and sampler evidence passes.
 - Z-Image source routing now uses the cuDNN flash helper for no-saved inference
   forwards and has current daemon artifact/timing/VRAM evidence. Speed and full
   sampler parity are still not accepted.
@@ -123,7 +170,10 @@ Acceptance evidence:
   immediate Ideogram4 slow-SDPA blocker. The backend/artifact gate now has only
   bounded one-step smoke evidence, not full backend parity.
   Z-Image now has bounded DPM++ 2M, generic UniPC bh1/order<=3, and UniPC
-  bh2/simple-flowmatch wiring; true Comfy-style latent batch execution and the
+  bh2 wiring on admitted simple and `sgm_uniform` schedules, including
+  dedicated DPM++ 2M + `sgm_uniform` artifact evidence; true Comfy-style latent
+  batch execution remains unimplemented and now fails loud for
+  `Empty*LatentImage.batch_size>1` and `RepeatLatentBatch` before enqueue. The
   remaining ancestral, SDE, Karras, CFG++, and advanced daemon denoise loops
   remain sampler/runtime gaps.
 - 2026-06-12 Ideogram4 bounded daemon artifact evidence:
@@ -160,6 +210,21 @@ Acceptance evidence:
   unsupported sampler, unsupported scheduler, and nonpositive CFG. `/v1/jobs`
   stayed at `126` rows, each request completed in under `0.001s`, and the log
   recorded `expensive_markers_seen:[]` for Ideogram Qwen/DiT/VAE load markers.
+- 2026-06-16 Ideogram4 structured prompt update: `/v1/generate` now normalizes
+  top-level `prompt_json` for the Ideogram backend before generic prompt syntax
+  handling. Strings are used directly; JSON object/array values are serialized
+  into `prompt` and `prompt_raw`, preserving
+  `compositional_deconstruction.elements[*].bbox` arrays for the model. The
+  Rust server now mirrors the same normalization for `/v1/preflight` and
+  `/v1/generate`, and admits the bounded Ideogram `simple` scheduler before
+  enqueue. The bounded workflow importer accepts the same `prompt_json` override
+  for raw Ideogram Comfy exports and still fails loud on prompt-builder subgraphs
+  unless a top-level prompt override is supplied. The static guards are
+  `python3 scripts/check_ideogram4_daemon_product_contract.py`,
+  `cargo test -p serenity-server -p serenity-graph`, and
+  `python3 scripts/check_workflow_node_surface.py`.
+  No new Ideogram PNG was generated in this update, so runtime acceptance still
+  rests on the older one-step artifact and remains `experimental`.
 - `/v1/samplers` endpoint smoke saved
   `output/checks/samplers_endpoint_smoke.json`; it returned schema
   `serenity.samplers.v1`, `accepted_sampler_parity:false`, 45 catalog samplers,
@@ -167,10 +232,14 @@ Acceptance evidence:
   `ideogram4`.
   Refreshed evidence from the compiled stub daemon now shows Z-Image endpoint
   support for `euler`, `flowmatch_euler`, `flow_match_euler`, `dpmpp_2m`,
-  `dpm++ 2m`, `uni_pc`, and `uni_pc_bh2`; Qwen remains `euler`/flow-match only.
+  `dpm++ 2m`, `uni_pc`, and `uni_pc_bh2`; Qwen remains inventory-only with no
+  admitted sampler or scheduler.
   Ideogram4 exposes bounded `euler`/flow-match aliases that execute as
-  `ideogram4_logitnormal_euler`, with only `logitnormal`/`logit_normal`/
-  `ideogram_logitnormal`/`ideogram4_logitnormal` scheduler aliases accepted.
+  `ideogram4_logitnormal_euler`, with `logitnormal`/`logit_normal`/
+  `ideogram_logitnormal`/`ideogram4_logitnormal` scheduler aliases executing as
+  `ideogram4_logitnormal` and `simple`/`flowmatch`/`flow_match`/
+  `simple_flowmatch` scheduler aliases executing as the bounded
+  `ideogram4_simple_flowmatch` path.
   Current Z-Image `sgm_uniform` wording covers Euler/flow-match Euler, DPM++ 2M,
   `uni_pc`, and `uni_pc_bh2`: the Comfy oracle applies
   `DISCARD_PENULTIMATE_SIGMA_SAMPLERS` prep for both UniPC names before
@@ -179,7 +248,8 @@ Acceptance evidence:
 - 2026-06-13 Z-Image UniPC `sgm_uniform` runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py --daemon
   output/bin/serenity_daemon --timeout 900 --steps 1 --skip-dpmpp2m-smoke
-  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
+  --skip-dpmpp2m-sgm-uniform-smoke --skip-generic-unipc-smoke
+  --skip-unipc-smoke --skip-multi-image-smoke
   --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
   --write-readiness output/checks/zimage_unipc_sgm_uniform_product_readiness.json`
   passed. It emitted unsupported sampler `job-0361`, baseline `job-0362`,
@@ -194,11 +264,40 @@ Acceptance evidence:
   `unipc_second_order_steps:2`. `job-0364` records `solver_variant:"bh1"` and
   `job-0365` records `solver_variant:"bh2"`. The readiness report is ready with
   no blockers, and still leaves `accepted_sampler_parity:false`.
+- 2026-06-16 Z-Image DPM++ 2M `sgm_uniform` runtime evidence:
+  `python3 scripts/check_zimage_daemon_product_contract.py --daemon
+  output/bin/serenity_daemon --timeout 900 --width 512 --height 512 --steps 1
+  --cfg 1.0 --min-free-vram-mib 21000 --skip-unsupported-smoke
+  --skip-sgm-uniform-smoke --skip-sgm-uniform-unipc-smoke
+  --skip-sgm-uniform-unipc-bh2-smoke --skip-dpmpp2m-smoke
+  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
+  --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
+  --write-readiness output/checks/zimage_dpmpp2m_sgm_uniform_readiness.json`
+  passed. It emitted baseline `job-0879` and DPM++ 2M `sgm_uniform`
+  `job-0880`. `job-0880` wrote `output/serenity_daemon/job-0880.png` and
+  `output/serenity_daemon/job-0880.png.zimage_daemon_result.json`; the manifest
+  records `requested_sampler:"dpmpp_2m"`,
+  `requested_scheduler:"sgm_uniform"`, `executed_sampler:"dpmpp_2m"`,
+  `executed_scheduler:"sgm_uniform_flowmatch"`,
+  `sigma_trace:[1.0,0.9477647,0.85859877,0.67192113,0.0]`,
+  `schedule_source:"zimage_comfy_sgm_uniform_sigmas"`,
+  `dpmpp_update_steps:4`, `dpmpp_second_order_steps:3`,
+  `denoise_seconds_per_step:0.31631403375`, `peak_vram_mib:22239.0625`, and
+  `accepted_sampler_parity:false`.
+- 2026-06-16 Z-Image `karras` fail-loud evidence:
+  `output/checks/serenity_server_t2i_product_gate_prequeue_latest.json`
+  includes `zimage_karras_scheduler`. The Rust server rejects
+  `scheduler:"karras"` before job fanout with HTTP 400, keeps job count
+  unchanged, and `/v1/samplers` omits `karras` from Z-Image
+  `supported_schedulers`. This is not Karras runtime support; it prevents a
+  silent unsupported scheduler path until a real scheduler builder and
+  artifact/timing/VRAM gate exist.
 - 2026-06-12 DPM++ 2M runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py
-  --skip-unsupported-smoke --skip-generic-unipc-smoke --skip-unipc-smoke
-  --skip-multi-image-smoke --skip-variation-smoke --skip-img2img-smoke
-  --skip-multi-lora-smoke --write-readiness
+  --skip-unsupported-smoke --skip-dpmpp2m-sgm-uniform-smoke
+  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
+  --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
+  --write-readiness
   output/checks/zimage_dpmpp2m_product_readiness.json`
   passed. It emitted baseline `job-0035` and DPM++ `job-0036`. `job-0036`
   wrote `output/serenity_daemon/job-0036.png` and
@@ -215,8 +314,9 @@ Acceptance evidence:
   --daemon output/bin/serenity_daemon --timeout 900 --steps 1
   --skip-unsupported-smoke --skip-sgm-uniform-smoke
   --skip-sgm-uniform-unipc-smoke --skip-sgm-uniform-unipc-bh2-smoke
-  --skip-dpmpp2m-smoke --skip-generic-unipc-smoke --skip-multi-image-smoke
-  --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
+  --skip-dpmpp2m-smoke --skip-dpmpp2m-sgm-uniform-smoke
+  --skip-generic-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke
+  --skip-img2img-smoke --skip-multi-lora-smoke
   --write-readiness output/checks/zimage_unipc_bh2_comfy_product_readiness.json`
   passed after moving bh2 onto the Comfy SigmaConvert/discard-prep path. It
   emitted baseline `job-0366` and UniPC bh2 `job-0367`. `job-0367` wrote
@@ -238,7 +338,8 @@ Acceptance evidence:
   penultimate-sigma discard, final-zero-replacement, and initial-noise scaling.
 - 2026-06-12 Z-Image generic UniPC runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900 --steps
-  1 --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-unipc-smoke
+  1 --skip-unsupported-smoke --skip-dpmpp2m-smoke
+  --skip-dpmpp2m-sgm-uniform-smoke --skip-unipc-smoke
   --skip-multi-image-smoke --skip-variation-smoke --skip-img2img-smoke
   --skip-multi-lora-smoke --write-readiness
   output/checks/zimage_daemon_generic_unipc_readiness.json`
@@ -257,8 +358,9 @@ Acceptance evidence:
 - 2026-06-12 Z-Image img2img/creativity runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900
   --steps 1 --skip-unsupported-smoke --skip-dpmpp2m-smoke
-  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
-  --skip-variation-smoke --skip-multi-lora-smoke --write-readiness
+  --skip-dpmpp2m-sgm-uniform-smoke --skip-generic-unipc-smoke
+  --skip-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke
+  --skip-multi-lora-smoke --write-readiness
   output/checks/zimage_img2img_creativity_readiness.json` passed after
   `pixi run build-daemon`. It emitted baseline
   `output/serenity_daemon/job-0087.png` plus img2img artifacts
@@ -279,7 +381,8 @@ Acceptance evidence:
 - Latest full Z-Image daemon product gate after terminal-zero scheduler
   accounting:
   `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900
-  --steps 1 --write-readiness output/checks/zimage_daemon_product_readiness.json`
+  --steps 1 --skip-dpmpp2m-sgm-uniform-smoke
+  --write-readiness output/checks/zimage_daemon_product_readiness.json`
   passed. It covered unsupported sampler failure (`job-0091`), baseline
   `job-0092`, img2img jobs `job-0093` through `job-0095`, DPM++ 2M `job-0096`,
   generic UniPC `job-0097`, UniPC bh2 `job-0098`, variation `job-0099`,
@@ -290,7 +393,8 @@ Acceptance evidence:
   `accepted_img2img_parity:false` and `accepted_speed_parity:false`.
 - 2026-06-12 Z-Image multi-LoRA runtime evidence:
   `python3 scripts/check_zimage_daemon_product_contract.py
-  --skip-unsupported-smoke --skip-dpmpp2m-smoke --skip-generic-unipc-smoke
+  --skip-unsupported-smoke --skip-dpmpp2m-smoke
+  --skip-dpmpp2m-sgm-uniform-smoke --skip-generic-unipc-smoke
   --skip-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke
   --skip-img2img-smoke --write-readiness
   output/checks/zimage_multi_lora_product_readiness.json` passed. It emitted
@@ -316,9 +420,9 @@ Current status:
 - The daemon exposes `/v1/generate`, `/v1/jobs`, `/v1/job/<id>`,
   `/v1/cancel/<id>`, `/v1/models`, `/v1/health`, and WebSocket progress.
 - Stub generation was smoke-tested with PNG metadata and `jobs.db` readback.
-- Real Z-Image daemon generation now has current GPU evidence. Full Qwen
-  daemon generation was not run because Qwen remains too large/slow/OOM-risky
-  for this slice.
+- Real Z-Image daemon generation now has current GPU evidence. Full Qwen daemon
+  generation is explicitly metadata/preflight-only in this slice and is rejected
+  before enqueue until separate product gates pass.
 - Z-Image flat `init_image`/`creativity` now has bounded runtime artifact
   evidence through the daemon. Full image-node/mask/inpaint graph parity remains
   unaccepted.
@@ -333,7 +437,9 @@ Required implementation:
 - Add a standard daemon smoke command or script that builds with the exact link
   flags and exercises health, model scan, generate, jobs, PNG metadata, and DB
   readback.
-- Add real-backend smoke mode for Z-Image and Qwen with bounded settings.
+- Add real-backend smoke mode for admitted image routes only. Qwen remains
+  metadata/preflight-only until a separate artifact, timing, VRAM, and sampler
+  gate admits it.
 - Exercise WebSocket progress and cancel against a real backend.
 - Keep process isolation as the default path for model switching after GPU VRAM
   reclaim is proven.
@@ -349,8 +455,9 @@ Acceptance evidence:
   `/v1/progress`, submits a bounded 512x512 Z-Image job through
   `/v1/generate`, validates the PNG `serenity.genparams.v1`, `jobs.db`,
   gallery/read endpoints, manifest timings, positive `peak_vram_mib`,
-  unsupported-sampler fail-loud behavior, variation noise output change,
-  multi-image serial output, and a running-job cancel smoke.
+  unsupported-sampler fail-loud behavior, DPM++ 2M on simple and `sgm_uniform`
+  schedules, variation noise output change, multi-image serial output, and a
+  running-job cancel smoke.
 - 2026-06-12 current run passed: `job-0028` emitted
   `output/serenity_daemon/job-0028.png` plus
   `output/serenity_daemon/job-0028.png.zimage_daemon_result.json`; timings were
@@ -374,8 +481,9 @@ Acceptance evidence:
 - 2026-06-12 1024 tiled-decode run passed:
   `python3 scripts/check_zimage_daemon_product_contract.py --width 1024
   --height 1024 --steps 1 --skip-unsupported-smoke --skip-dpmpp2m-smoke
-  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
-  --skip-variation-smoke --skip-img2img-smoke --skip-multi-lora-smoke
+  --skip-dpmpp2m-sgm-uniform-smoke --skip-generic-unipc-smoke
+  --skip-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke
+  --skip-img2img-smoke --skip-multi-lora-smoke
   --write-readiness
   output/checks/zimage_1024_product_readiness.json`. It emitted
   `output/serenity_daemon/job-0073.png` plus
@@ -405,8 +513,9 @@ Acceptance evidence:
 - 2026-06-12 Z-Image img2img/creativity run passed:
   `python3 scripts/check_zimage_daemon_product_contract.py --timeout 900
   --steps 1 --skip-unsupported-smoke --skip-dpmpp2m-smoke
-  --skip-generic-unipc-smoke --skip-unipc-smoke --skip-multi-image-smoke
-  --skip-variation-smoke --skip-multi-lora-smoke --write-readiness
+  --skip-dpmpp2m-sgm-uniform-smoke --skip-generic-unipc-smoke
+  --skip-unipc-smoke --skip-multi-image-smoke --skip-variation-smoke
+  --skip-multi-lora-smoke --write-readiness
   output/checks/zimage_img2img_creativity_readiness.json`. It validated
   baseline `job-0087` and img2img jobs `job-0088` through `job-0090` at
   creativity `0.0`, `0.5`, and `1.0` with 8-step img2img settings. The manifest
@@ -750,18 +859,252 @@ Acceptance evidence:
   expected-type error.
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
-  `checks=78 passed=78 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
-  Full SwarmUI all-level parity still remains blocked by Qwen full generation,
-  full video parity beyond DEV-smoke artifacts, advanced workflow node families, sampler breadth,
+  `checks=90 passed=90 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
+  Full SwarmUI all-level parity still remains blocked by Qwen full generation
+  (now explicitly metadata/preflight-only), full video parity beyond DEV-smoke
+  artifacts, advanced workflow node families, sampler breadth,
   and Z-Image speed parity.
+
+## 2026-06-16 Worker Result Sidecars for Admitted Image Workers
+
+Current status:
+
+- `serenitymojo/serve/product_manifest.mojo` provides local Mojo helpers for
+  result-sidecar JSON escaping, peak VRAM calculation, and text-file writes.
+- SDXL, Anima, SD3, and Flux worker backends now emit backend result manifests
+  with schema, readiness label, requested/executed sampler and scheduler, phase
+  timings, peak VRAM, output paths, and non-acceptance booleans.
+- SDXL, Anima, SD3, and Flux also keep `serenity.genparams.v1` PNG metadata
+  markers in the static product-path contract. Anima was moved from plain PNG
+  save to `encode_png_with_text`.
+- Optimized patched workers were built into `output/bin/serenity_worker_sdxl`,
+  `output/bin/serenity_worker_anima`, `output/bin/serenity_worker_sd3`, and
+  `output/bin/serenity_worker_flux`.
+
+Runtime evidence:
+
+- SDXL strict Rust-server gate:
+  `output/checks/sdxl_manifest_gate.json`.
+  The PNG is `1024x1024`, carries `serenity.genparams.v1`, and has sidecar
+  schema `serenity.sdxl.daemon_result.v1` with
+  `peak_vram_mib=12345.0625`, `total_wall_seconds=212.088807925`,
+  `denoise_seconds=32.122987534`, and
+  `vae_decode_seconds=72.143815548`.
+- Anima strict Rust-server gate with optimized worker:
+  `output/checks/anima_manifest_gate_o2.json`.
+  The PNG is `1024x1024`, carries `serenity.genparams.v1`, and has sidecar
+  schema `serenity.anima.daemon_result.v1` with
+  `peak_vram_mib=11147.3125`, `total_wall_seconds=93.019964106`,
+  `denoise_seconds=2.231944518`, and
+  `vae_decode_seconds=88.135556873`.
+
+Limits:
+
+- Superseded by the next section: SD3/Flux live strict gates and the
+  all-admitted Rust-server gate have now passed for the bounded product path.
+
+## 2026-06-16 All-Admitted Rust-Server Artifact Gate
+
+The previous SD3/Flux live-gate gap is closed for the bounded Rust-server
+product path.
+
+Runtime evidence:
+
+- SD3 strict gate:
+  `output/checks/sd3_manifest_gate_lowmem.json`.
+  The PNG is `1024x1024`, carries `serenity.genparams.v1`, and has sidecar
+  schema `serenity.sd3.daemon_result.v1`. The sidecar records
+  `released_resident_mmdit_before_vae:true`,
+  `vae_decode_tile_grid:"5x5_lowmem"`, `peak_vram_mib=18799.25`,
+  `total_wall_seconds=97.526130155`, `denoise_seconds=59.260229214`, and
+  `vae_decode_seconds=3.263787052`.
+- Flux strict gate:
+  `output/checks/flux_manifest_gate_lowmem.json`.
+  The PNG is `1024x1024`, carries `serenity.genparams.v1`, and has sidecar
+  schema `serenity.flux.daemon_result.v1`. The sidecar records
+  `released_resident_dit_before_unpack:true`,
+  `vae_decode_tile_grid:"5x5_lowmem"`, `peak_vram_mib=18179.0625`,
+  `total_wall_seconds=18.618336994`, `denoise_seconds=12.392615909`, and
+  `vae_decode_seconds=3.719806555`.
+- All-admitted strict gate:
+  `output/checks/all_admitted_manifest_gate_lowmem.json`.
+  The gate produced manifest-backed artifacts for `zimage`, `sdxl`, `anima`,
+  `sd3`, `flux`, and `ideogram4`; `artifact_only`, `failed_models`,
+  `failed_prequeue_cases`, and `failed_sampler_cases` were empty.
+
+All-admitted metrics:
+
+| Model | Artifact | Schema | Size | Peak VRAM MiB | Total wall seconds |
+| --- | --- | --- | --- | ---: | ---: |
+| ZImage | `output/checks/all_admitted_manifest_gate_lowmem/job-0005.png` | `serenity.zimage.daemon_result.v1` | `512x512` | `22249.3125` | `115.225474649` |
+| SDXL | `output/checks/all_admitted_manifest_gate_lowmem/job-0006.png` | `serenity.sdxl.daemon_result.v1` | `1024x1024` | `12327.25` | `26.981791022` |
+| Anima | `output/checks/all_admitted_manifest_gate_lowmem/job-0007.png` | `serenity.anima.daemon_result.v1` | `1024x1024` | `10519.3125` | `109.493639988` |
+| SD3 | `output/checks/all_admitted_manifest_gate_lowmem/job-0008.png` | `serenity.sd3.daemon_result.v1` | `1024x1024` | `18809.3125` | `25.678156276` |
+| Flux | `output/checks/all_admitted_manifest_gate_lowmem/job-0009.png` | `serenity.flux.daemon_result.v1` | `1024x1024` | `22081.25` | `87.31288534` |
+| Ideogram4 | `output/checks/all_admitted_manifest_gate_lowmem/job-0010.png` | `serenity.ideogram4.daemon_result.v1` | `1024x1024` | `22225.3125` | `272.823248619` |
+
+Static readiness was refreshed after the runtime gates:
+
+- `output/checks/swarmui_product_path_readiness.json`: `90/90`, P0/P1/P2
+  blockers at `0`.
+- `output/checks/swarmui_sampler_surface_readiness.json`: `37/37` markers,
+  with six broad surface blockers remaining.
+
+Limits:
+
+- This is accepted bounded artifact evidence for the currently admitted
+  Rust-server image families. It is not accepted full SwarmUI all-level parity.
+- The sidecars still record `accepted_sampler_parity:false` and
+  `accepted_speed_parity:false` where applicable.
+- Qwen full generation, SD15, Chroma, ERNIE, full video, advanced workflow
+  surfaces, and broader sampler variants remain blocked or explicitly disabled.
+
+## 2026-06-16 SDXL Conditioning Artifact Gate
+
+New reusable checker:
+
+- `scripts/check_serenity_server_conditioning_gate.py`
+  - Launches the Rust server and submits same-seed low-CFG, high-CFG, and
+    high-CFG-with-negative jobs through `/v1/preflight` and `/v1/generate`.
+  - Requires PNG `serenity.genparams.v1`, timing/VRAM sidecars, manifest
+    conditioning fields, and distinct IDAT hashes.
+  - Keeps `accepted_conditioning_parity:false` and
+    `accepted_sampler_parity:false`; this is bounded artifact evidence, not full
+    conditioning parity.
+
+Runtime evidence:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_serenity_server_conditioning_gate.py --models sdxl --server-bin serenity-server/target/debug/serenity-server --worker-bin output/bin/serenity_worker_zimage --out-dir output/checks/sdxl_conditioning_gate --write-report output/checks/sdxl_conditioning_gate.json --timeout-per-case 1800 --poll-interval 2
+```
+
+Results:
+
+- Report: `output/checks/sdxl_conditioning_gate.json`.
+- Artifacts:
+  - `output/checks/sdxl_conditioning_gate/job-0001.png`
+    (`cfg=1.0`, empty negative).
+  - `output/checks/sdxl_conditioning_gate/job-0002.png`
+    (`cfg=5.0`, empty negative).
+  - `output/checks/sdxl_conditioning_gate/job-0003.png`
+    (`cfg=5.0`, negative `red cube, red object, ceramic cube`).
+- All three artifacts are `1024x1024`, carry `serenity.genparams.v1`, and have
+  `serenity.sdxl.daemon_result.v1` sidecars with requested/executed sampler
+  metadata, timings, and peak VRAM.
+- IDAT hashes are distinct:
+  - low CFG: `127a0b99bf2b0d3e6e981adb5cc4d362e4c2636efab2ff7bd10e3ad24dd0a0b5`
+  - high CFG: `4509c2b8e1291f01ebbe6bf3f466dd1d71a2de8399845962558c0dc88c106180`
+  - high CFG + negative:
+    `2de36eb412c5cc412a2c8d04a0e9eeb57c914001895eaeb438d2adc23303dd28`
+- Timings/VRAM:
+  - `job-0001`: `total_wall_seconds=65.714914246`,
+    `denoise_seconds=2.248967759`, `vae_decode_seconds=4.418024194`,
+    `peak_vram_mib=14626.75`.
+  - `job-0002`: `total_wall_seconds=10.118343411`,
+    `denoise_seconds=2.134382905`, `vae_decode_seconds=3.812047414`,
+    `peak_vram_mib=14626.8125`.
+  - `job-0003`: `total_wall_seconds=10.136425081`,
+    `denoise_seconds=2.134803262`, `vae_decode_seconds=3.828932893`,
+    `peak_vram_mib=14621.625`.
+
+The sampler surface checker now tracks this report and refreshes to `38/38`
+markers. The conditioning blocker remains because prompt-weight math and
+per-model negative/CFG evidence for the remaining admitted families are not
+complete.
+
+## 2026-06-16 SD3 Conditioning Artifact Gate
+
+Runtime evidence:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_serenity_server_conditioning_gate.py --models sd3 --server-bin serenity-server/target/debug/serenity-server --worker-bin output/bin/serenity_worker_zimage --out-dir output/checks/sd3_conditioning_gate --write-report output/checks/sd3_conditioning_gate.json --timeout-per-case 1800 --poll-interval 2
+```
+
+Results:
+
+- Report: `output/checks/sd3_conditioning_gate.json`.
+- Artifacts:
+  - `output/checks/sd3_conditioning_gate/job-0001.png`
+    (`cfg=1.0`, empty negative).
+  - `output/checks/sd3_conditioning_gate/job-0002.png`
+    (`cfg=4.5`, empty negative).
+  - `output/checks/sd3_conditioning_gate/job-0003.png`
+    (`cfg=4.5`, negative `red cube, red object, ceramic cube`).
+- All three artifacts are `1024x1024`, carry `serenity.genparams.v1`, and have
+  `serenity.sd3.daemon_result.v1` sidecars with requested/executed sampler
+  metadata, timings, peak VRAM, and `vae_decode_tile_grid:"5x5_lowmem"`.
+- IDAT hashes are distinct:
+  - low CFG: `4ac45e63fcd3556b23519f1ddc70d451486abe8bf1223e934a4280f6725dbdf2`
+  - high CFG: `43ddbf8aca9320a3d9e5cd439aac418990180910795a7d658b5645727cace83c`
+  - high CFG + negative:
+    `b74e307ecda6f26af9c7060d079ef244f890f78443d93d456d3d1572056f4b25`
+- Timings/VRAM:
+  - `job-0001`: `total_wall_seconds=145.002977806`,
+    `denoise_seconds=59.192672489`, `vae_decode_seconds=3.179079135`,
+    `peak_vram_mib=19091.75`.
+  - `job-0002`: `total_wall_seconds=23.027163543`,
+    `denoise_seconds=17.439111197`, `vae_decode_seconds=2.894952377`,
+    `peak_vram_mib=19091.75`.
+  - `job-0003`: `total_wall_seconds=22.699221252`,
+    `denoise_seconds=17.222514973`, `vae_decode_seconds=2.757718454`,
+    `peak_vram_mib=19079.0`.
+
+The sampler surface checker now tracks both SDXL and SD3 conditioning reports
+and refreshes to `39/39` markers. The conditioning blocker remains because
+prompt-weight math and per-model negative/CFG evidence for the remaining
+admitted families are not complete.
+
+## 2026-06-16 Anima Conditioning Artifact Gate
+
+Runtime evidence:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_serenity_server_conditioning_gate.py --models anima --server-bin serenity-server/target/debug/serenity-server --worker-bin output/bin/serenity_worker_zimage --out-dir output/checks/anima_conditioning_gate --write-report output/checks/anima_conditioning_gate.json --timeout-per-case 1800 --poll-interval 2
+```
+
+Results:
+
+- Report: `output/checks/anima_conditioning_gate.json`.
+- Artifacts:
+  - `output/checks/anima_conditioning_gate/job-0001.png`
+    (`cfg=1.0`, empty negative).
+  - `output/checks/anima_conditioning_gate/job-0002.png`
+    (`cfg=4.5`, empty negative).
+  - `output/checks/anima_conditioning_gate/job-0003.png`
+    (`cfg=4.5`, negative `red cube, red object, ceramic cube`).
+- All three artifacts are `1024x1024`, carry `serenity.genparams.v1`, and have
+  `serenity.anima.daemon_result.v1` sidecars with requested/executed sampler
+  metadata, timings, and peak VRAM.
+- IDAT hashes are distinct:
+  - low CFG: `8b4db45968cce27e7fe99927ef1af4d52d955b681cef68d2f9b3fd1d50c8afa4`
+  - high CFG: `2ee6e3264d15fb177066d27ad29081e986442be342dbed63faf0e37ba70c71fa`
+  - high CFG + negative:
+    `7fec4d642f9a127ced2e894474da9d570cd954f7f4fd89f89b8c1917f35404b9`
+- Timings/VRAM:
+  - `job-0001`: `total_wall_seconds=102.882308372`,
+    `denoise_seconds=2.060830602`, `vae_decode_seconds=82.225633783`,
+    `peak_vram_mib=10633.3125`.
+  - `job-0002`: `total_wall_seconds=86.731115867`,
+    `denoise_seconds=2.138339561`, `vae_decode_seconds=82.530627286`,
+    `peak_vram_mib=10598.3125`.
+  - `job-0003`: `total_wall_seconds=88.064855635`,
+    `denoise_seconds=2.134478508`, `vae_decode_seconds=83.785780459`,
+    `peak_vram_mib=12132.4375`.
+
+The sampler surface checker now tracks Z-Image, SDXL, SD3, and Anima
+conditioning reports and refreshes to `40/40` markers. The conditioning blocker
+remains because prompt-weight math is still rejected/fail-loud rather than
+implemented, and Flux/Ideogram intentionally do not accept negative prompts in
+their current bounded production routes.
 
 ## Build Order
 
 1. Harden the bounded real-backend image smokes into acceptance-grade paths:
    Z-Image still needs speed/quality parity, Ideogram4 needs multi-step proof
    and broader request-surface coverage beyond the bounded PNG metadata/gallery
-   and fail-loud option smokes, and Qwen remains bounded until memory evidence
-   says a full run is safe.
+   and fail-loud option smokes, and Qwen remains metadata/preflight-only until
+   memory, artifact, timing, VRAM, quality, and sampler evidence says a full run
+   is safe.
 2. Replace Z-Image's two serial CFG main-stack passes with a measured faster
    path before accepting image speed parity.
 3. Promote the bounded LTX2 daemon video runner beyond DEV-smoke by adding

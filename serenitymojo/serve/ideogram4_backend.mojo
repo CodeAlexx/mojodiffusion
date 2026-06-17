@@ -7,9 +7,9 @@
 #   latent denorm -> Ideogram VAE decode.
 #
 # Current product limits are intentionally narrow and fail-loud:
-#   * txt2img only; a SMALL comptime bucket set of sizes (1024x1024, 1280x768,
-#     768x1280) — each a distinct compile-time latent grid [GH,GW] (patch 16),
-#     dispatched in start(); any other size is rejected fail-loud
+#   * txt2img only; production dispatch admits 1024x1024 only. Non-square
+#     bucket constants remain below for the PAD-mask/tiled-decode repair, but
+#     start() rejects them until real artifacts prove the route.
 #   * no negative prompt, LoRA, init image, variation, or non-Ideogram schedulers
 #   * fixed 1024 token text window so the DiT sequence is compile-time static
 #
@@ -38,7 +38,7 @@ from serenitymojo.models.dit.ideogram4_resident import (
 from serenitymojo.models.text_encoder.ideogram_qwen3vl import (
     load_ideogram_qwen3vl, encode_ideogram_taps,
 )
-from serenitymojo.models.vae.ldm_decoder import load_ideogram4_vae_decoder
+from serenitymojo.models.vae.ideogram4_tiled_decode import ideogram4_tiled_decode
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
@@ -92,7 +92,8 @@ comptime VAE_W = 2 * GW
 # patch == 16 image px per latent-grid cell (verified vs the 1024 path: the latent
 # grid is GH x GW, each cell unpacks 2x2 (reshape [1,GH,GW,2,2,32] -> permute ->
 # [1,32,2*GH,2*GW]) and the VAE upsamples x8, so pixels = 16*GH by 16*GW).
-# Bucket set (all /16, ~1 MP): 1024x1024, 1280x768, 768x1280.
+# Production bucket set: 1024x1024 only. The non-square IDs remain compiled-in
+# scaffolding for the known PAD-mask/tiled-decode repair and are not dispatched.
 comptime BUCKET_SQUARE = 0   # 1024 x 1024 -> GH=64, GW=64
 comptime BUCKET_LANDSCAPE = 1  # 1280(W) x 768(H) -> GH=48, GW=80
 comptime BUCKET_PORTRAIT = 2   # 768(W) x 1280(H) -> GH=80, GW=48
@@ -465,20 +466,17 @@ struct Ideogram4Backend(GenBackend, Movable):
                 String("ideogram4: unsupported scheduler '") + params.scheduler
                 + String("'; ") + scheduler_admission.reason
             )
-        # Comptime bucket dispatch: map (width, height) to one of the three fixed
-        # latent grids. Fail-loud on any other size (never silently substitute).
+        # Production gate: non-square buckets currently blank due PAD-token
+        # attention pollution; keep them fail-loud until the mask/tiled-decode
+        # fix is verified with real artifacts.
         var bucket: Int
         if params.width == 1024 and params.height == 1024:
             bucket = BUCKET_SQUARE
-        elif params.width == 1280 and params.height == 768:
-            bucket = BUCKET_LANDSCAPE
-        elif params.width == 768 and params.height == 1280:
-            bucket = BUCKET_PORTRAIT
         else:
             raise Error(
                 String("ideogram4: unsupported size ") + String(params.width)
                 + "x" + String(params.height)
-                + " -- supported sizes: 1024x1024, 1280x768, 768x1280"
+                + " -- supported production size: 1024x1024"
             )
         if params.negative.byte_length() > 0:
             raise Error("ideogram4: negative prompt is not supported in this bounded slice")
@@ -862,10 +860,22 @@ struct Ideogram4Backend(GenBackend, Movable):
         var z6 = reshape(zd, [1, GH_, GW_, 2, 2, 32], self.ctx)
         var zp = permute(z6, [0, 5, 1, 3, 2, 4], self.ctx)
         var latent = reshape(zp, [1, 32, VAE_H_, VAE_W_], self.ctx)
+        var latent_bf = cast_tensor(latent, STDtype.BF16, self.ctx)
         self.latent = List[TArc]()
-        print("[ideogram4] loading VAE decoder + decode")
-        var dec = load_ideogram4_vae_decoder[VAE_H_, VAE_W_](String(VAE), self.ctx)
-        var img = dec.decode(cast_tensor(latent, STDtype.BF16, self.ctx), self.ctx)
+        # Release whole-frame unpatch/denorm temporaries before VAE load. The
+        # tiled decoder only needs the BF16 latent crop source.
+        zd = _tiny_bf16(self.ctx)
+        z6 = _tiny_bf16(self.ctx)
+        zp = _tiny_bf16(self.ctx)
+        latent = _tiny_bf16(self.ctx)
+        self.ctx.synchronize()
+        try:
+            cu_mempool_trim_current(0)
+        except:
+            pass
+        self.ctx.synchronize()
+        print("[ideogram4] loading tiled VAE decoder + decode")
+        var img = ideogram4_tiled_decode[VAE_H_, VAE_W_](latent_bf, String(VAE), self.ctx)
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
         return png_path
 

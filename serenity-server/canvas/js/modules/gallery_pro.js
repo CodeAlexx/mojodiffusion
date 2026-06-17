@@ -8,7 +8,8 @@
        (serenity.genparams.v1 tEXt) via the backend /v1/gallery API (or the
        'result:ready' payload's params) and renders a key/value table + raw JSON.
      - RIGHT-CLICK per-image context menu on gallery thumbs AND in the lightbox:
-         Regenerate · Reuse params · Reuse seed · Send to img2img · Upscale · Delete.
+         Regenerate · Reuse params · Reuse seed · Send to img2img · Upscale ·
+         Download · Delete.
      - MULTI-SELECT (ctrl/cmd/shift-click thumbnails) + a floating batch bar:
          Download selected (zip-free, sequential blob downloads) · Delete selected ·
          Clear selection.
@@ -23,8 +24,9 @@
    Coordinates with the existing 'gallery' module via the shared bus:
      - listens 'gallery:select' (thumb clicked) -> open lightbox
      - listens 'result:ready' -> remember newest result (for lightbox default)
-     - emits  'generate:request' (regenerate), 'params:restored', 'preview:load'
-     - reaches the 'layers' module (soft) for send-to-img2img; falls back to bus.
+     - emits  'generate:request' (regenerate), 'params:restored', 'preview:load'.
+     - img2img/upscale actions create layer workflow state; preflight decides
+       whether the resulting graph is admitted.
 */
 (function () {
   "use strict";
@@ -362,47 +364,53 @@
       // layer with pixels). Reaches the 'layers' module if present, else pushes to
       // state.layers directly + emits layers:changed.
       function sendToImg2img(it) {
-        if (!it.url) { flash('No image url'); return; }
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => {
-          const layerOpts = {
-            type: 'raster', name: 'img2img: ' + (it.filename || it.id || 'result'),
-            imageEl: img, src: it.url, visible: true, opacity: 1,
+        return new Promise((resolve) => {
+          if (!it || !it.url) { flash('No image url'); resolve(false); return; }
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => {
+            const layerOpts = {
+              type: 'raster', name: 'img2img: ' + (it.filename || it.id || 'result'),
+              imageEl: img, src: it.url, visible: true, opacity: 1,
+            };
+            const layersMod = window.Serenity.modules && window.Serenity.modules.layers;
+            let added = false;
+            // prefer a public add API if the layers module exposes one
+            if (layersMod && typeof layersMod.addLayer === 'function') {
+              try { layersMod.addLayer('raster', layerOpts); added = true; } catch (_) {}
+            }
+            if (!added) {
+              try {
+                if (!Array.isArray(state.layers)) state.layers = [];
+                const layer = Object.assign({ id: 'gp-' + Date.now().toString(36) }, layerOpts);
+                state.layers.unshift(layer);
+                set('activeLayerId', layer.id);
+                bus.emit('layers:changed', state.layers.slice());
+                added = true;
+              } catch (e) { console.warn('[galleryPro] sendToImg2img layer add failed', e); }
+            }
+            if (!added) { flash('Could not create img2img layer'); resolve(false); return; }
+            // also reuse the source params (prompt/model) so the run is coherent
+            if (it.params) reuseParams(it);
+            // default a sensible img2img denoise if it's still full-strength
+            const cur = Number(get('params.denoise'));
+            if (!Number.isFinite(cur) || cur >= 0.999) set('params.denoise', 0.65);
+            bus.emit('preview:load', { url: it.url, filename: it.filename });
+            bus.emit('img2img:source', { url: it.url, filename: it.filename, params: it.params || null });
+            flash('Sent to img2img (denoise ' + (get('params.denoise')) + ')');
+            resolve(true);
           };
-          const layersMod = window.Serenity.modules && window.Serenity.modules.layers;
-          let added = false;
-          // prefer a public add API if the layers module exposes one
-          if (layersMod && typeof layersMod.addLayer === 'function') {
-            try { layersMod.addLayer('raster', layerOpts); added = true; } catch (_) {}
-          }
-          if (!added) {
-            try {
-              if (!Array.isArray(state.layers)) state.layers = [];
-              const layer = Object.assign({ id: 'gp-' + Date.now().toString(36) }, layerOpts);
-              state.layers.unshift(layer);
-              set('activeLayerId', layer.id);
-              bus.emit('layers:changed', state.layers.slice());
-            } catch (e) { console.warn('[galleryPro] sendToImg2img layer add failed', e); }
-          }
-          // default a sensible img2img denoise if it's still full-strength
-          const cur = Number(get('params.denoise'));
-          if (!Number.isFinite(cur) || cur >= 0.999) set('params.denoise', 0.65);
-          // also reuse the source params (prompt/model) so the run is coherent
-          if (it.params) reuseParams(it);
-          bus.emit('preview:load', { url: it.url, filename: it.filename });
-          bus.emit('img2img:source', { url: it.url, filename: it.filename, params: it.params || null });
-          flash('Sent to img2img (denoise ' + (get('params.denoise')) + ')');
-        };
-        img.onerror = () => flash('Could not load image for img2img');
-        img.src = it.url;
+          img.onerror = () => { flash('Could not load image for img2img'); resolve(false); };
+          img.src = it.url;
+        });
       }
 
       // Upscale: SwarmUI's upscale == regenerate at higher res from this image as init.
       // We send-to-img2img, double W/H (clamped), and set a light denoise so detail is
       // added rather than the image replaced, then request generation.
-      function upscale(it) {
-        sendToImg2img(it);
+      async function upscale(it) {
+        const ok = await sendToImg2img(it);
+        if (!ok) return;
         const p = it.params || {};
         const w = clampDim((Number(p.width) || Number(get('params.width')) || 1024) * 2);
         const h = clampDim((Number(p.height) || Number(get('params.height')) || 1024) * 2);

@@ -94,9 +94,9 @@ fn stub_seam_runs_one_job_to_done() {
                 last_step = *step;
                 println!("[seam] progress {step}/{total}");
             }
-            WorkerEvent::Done { .. }
-            | WorkerEvent::Failed { .. }
-            | WorkerEvent::Cancelled => break ev,
+            WorkerEvent::Done { .. } | WorkerEvent::Failed { .. } | WorkerEvent::Cancelled => {
+                break ev
+            }
         }
     };
 

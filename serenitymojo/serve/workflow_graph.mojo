@@ -7,6 +7,7 @@
 # execution remains in the model backends; this module owns graph semantics,
 # typed handles, fail-loud unsupported nodes, and import adapters.
 
+from json.serialize import dumps
 from json.value import JSONValue
 
 
@@ -41,6 +42,64 @@ def _workflow_canonical_type_id(var type_id: String) -> String:
 
 def _workflow_type_id(node: JSONValue) raises -> String:
     return _workflow_canonical_type_id(_workflow_string(node, String("type_id")))
+
+
+def _workflow_is_denoise_node(type_id: String) -> Bool:
+    return (
+        type_id == "KSampler"
+        or type_id == "KSamplerAdvanced"
+        or type_id == "LanPaint_KSampler"
+        or type_id == "LanPaint_KSamplerAdvanced"
+        or type_id == "SamplerCustom"
+        or type_id == "SamplerCustomAdvanced"
+        or type_id == "LanPaint_SamplerCustomAdvanced"
+    )
+
+
+def _workflow_reject_multi_output_topology(nodes_json: JSONValue) raises:
+    """The current product executor lowers to one flat JobParams object.
+
+    Multi-denoise or multi-SaveImage Comfy graphs need real per-node tensor
+    outputs. Until that exists, fail loud instead of accepting the graph and
+    silently using whichever sampler/save-prefix writes first.
+    """
+    var denoise_count = 0
+    var first_denoise = -1
+    var second_denoise = -1
+    var save_count = 0
+    var first_save = -1
+    var second_save = -1
+    for i in range(nodes_json.length()):
+        var node = nodes_json[i]
+        var node_id = _workflow_id(node)
+        var type_id = _workflow_type_id(node)
+        if _workflow_is_denoise_node(type_id):
+            denoise_count += 1
+            if first_denoise < 0:
+                first_denoise = node_id
+            elif second_denoise < 0:
+                second_denoise = node_id
+        if type_id == "SaveImage":
+            save_count += 1
+            if first_save < 0:
+                first_save = node_id
+            elif second_save < 0:
+                second_save = node_id
+
+    if denoise_count > 1:
+        raise Error(
+            "[501] workflow graph has multiple sampler/output branches; "
+            + "flat single-job execution supports one sampler node "
+            + "(first=" + String(first_denoise)
+            + ", second=" + String(second_denoise) + ")"
+        )
+    if save_count > 1:
+        raise Error(
+            "[501] workflow graph has multiple SaveImage outputs; "
+            + "flat single-job execution supports one SaveImage node "
+            + "(first=" + String(first_save)
+            + ", second=" + String(second_save) + ")"
+        )
 
 
 # --- SamplerCustom ecosystem: named SAMPLER / SIGMAS node tables ---------------
@@ -409,6 +468,19 @@ def _workflow_has_prompt_override(mut obj: JSONValue) raises -> Bool:
     if obj.contains("prompt_raw") and obj["prompt_raw"].is_string() and obj["prompt_raw"].as_string() != "":
         _set_if_missing(obj, String("prompt"), obj["prompt_raw"])
         return True
+    if obj.contains("prompt_json") and not obj["prompt_json"].is_null():
+        var raw = String("")
+        if obj["prompt_json"].is_string():
+            raw = obj["prompt_json"].as_string()
+        elif obj["prompt_json"].is_object() or obj["prompt_json"].is_array():
+            raw = dumps(obj["prompt_json"])
+        else:
+            raise Error("[501] Ideogram4 Comfy export prompt_json must be a string or JSON object/array")
+        if raw == "":
+            raise Error("[501] Ideogram4 Comfy export prompt_json must be non-empty")
+        _set_if_missing(obj, String("prompt"), JSONValue.from_string(raw))
+        _set_if_missing(obj, String("prompt_raw"), JSONValue.from_string(raw))
+        return True
     return False
 
 
@@ -465,7 +537,7 @@ def apply_ideogram4_comfy_ui_export(mut obj: JSONValue, wf: JSONValue) raises:
     """
     if not _workflow_has_prompt_override(obj):
         raise Error(
-            "[501] Ideogram4 Comfy export uses a prompt-builder subgraph; provide top-level prompt or prompt_raw"
+            "[501] Ideogram4 Comfy export uses a prompt-builder subgraph; provide top-level prompt, prompt_raw, or prompt_json"
         )
 
     var root_nodes = wf["nodes"]
@@ -541,9 +613,16 @@ def apply_ideogram4_comfy_ui_export(mut obj: JSONValue, wf: JSONValue) raises:
             widgets = node["widgets_values"]
 
         if typ == "EmptyFlux2LatentImage":
+            var batch = _workflow_widget_int(widgets, 2, 1)
+            if batch != 1:
+                raise Error(
+                    "[501] workflow graph EmptyFlux2LatentImage batch_size>1 "
+                    + "requires real Comfy latent-batch execution; use flat images=N "
+                    + "for serial product fanout"
+                )
             _set_if_missing(obj, String("width"), JSONValue.from_int(_workflow_widget_int(widgets, 0, 1024)))
             _set_if_missing(obj, String("height"), JSONValue.from_int(_workflow_widget_int(widgets, 1, 1024)))
-            _set_if_missing(obj, String("images"), JSONValue.from_int(_workflow_widget_int(widgets, 2, 1)))
+            _set_if_missing(obj, String("images"), JSONValue.from_int(1))
             saw_empty_latent = True
         elif typ == "UNETLoader":
             var name = _workflow_widget_string(widgets, 0, String(""))
@@ -1925,6 +2004,8 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
             raise Error(String("[501] unsupported workflow graph node type: ") + type_id)
         ids.append(id)
 
+    _workflow_reject_multi_output_topology(nodes_json)
+
     var setnode_names = List[String]()
     for i in range(nodes_json.length()):
         var node = nodes_json[i]
@@ -2162,12 +2243,18 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         raise Error("[501] workflow graph EmptyLatentImage scalar dimensions out of range")
                     if images < 1 or images > 64:
                         raise Error("[501] workflow graph EmptyLatentImage scalar batch_size out of range")
+                    if images != 1:
+                        raise Error(
+                            "[501] workflow graph EmptyLatentImage batch_size>1 "
+                            + "requires real Comfy latent-batch execution; use flat images=N "
+                            + "for serial product fanout"
+                        )
                     _set_if_missing(obj, String("width"), JSONValue.from_int(width))
                     _set_if_missing(obj, String("height"), JSONValue.from_int(height))
-                    _set_if_missing(obj, String("images"), JSONValue.from_int(images))
+                    _set_if_missing(obj, String("images"), JSONValue.from_int(1))
                     _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
                     latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
-                    latent_widths.append(width); latent_heights.append(height); latent_images.append(images)
+                    latent_widths.append(width); latent_heights.append(height); latent_images.append(1)
                     latent_init_images.append(String(""))
                     latent_mask_images.append(String(""))
                     done[i] = True; remaining -= 1; progressed = True
@@ -2700,9 +2787,9 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                     latent_mask_images.append(mask_path)
                     done[i] = True; remaining -= 1; progressed = True
             elif type_id == "RepeatLatentBatch":
-                # Duplicate a LATENT batch `amount` times (Comfy: samples.repeat).
-                # In the flat model the batch count is the `images` key, so the new
-                # batch = source batch * amount. Geometry/init/mask carry through.
+                # RepeatLatentBatch mutates a Comfy latent tensor batch. The
+                # daemon's flat `images=N` is serial fanout, not latent-batch
+                # execution, so fail loud until a real batched latent path exists.
                 var samples_link = _workflow_find_input_link(edges, node_id, String("samples"))
                 var amount_link = _workflow_find_input_link(edges, node_id, String("amount"))
                 if not samples_link.found:
@@ -2721,33 +2808,11 @@ def apply_typed_workflow_graph(mut obj: JSONValue, wf: JSONValue) raises:
                         )
                     if amount < 1 or amount > 64:
                         raise Error("[501] workflow graph RepeatLatentBatch scalar amount out of range")
-                    var latent_idx = _workflow_latent_index(latent_nodes, latent_ports, samples_link)
-                    var src_batch = 1
-                    if latent_idx >= 0:
-                        src_batch = latent_images[latent_idx]
-                    var new_batch = src_batch * amount
-                    if new_batch < 1 or new_batch > 64:
-                        raise Error("[501] workflow graph RepeatLatentBatch repeated batch out of range")
-                    # RepeatLatentBatch is an explicit batch transform: unlike the
-                    # geometry pass-throughs it must OVERRIDE any `images` an upstream
-                    # EmptyLatentImage already wrote (the first-writer-wins
-                    # _set_if_missing convention would otherwise leave the node
-                    # silently ineffective). The LATENT payload batch is the source
-                    # of truth carried to the sampler.
-                    obj.set(String("images"), JSONValue.from_int(new_batch))
-                    _workflow_add_value(value_nodes, value_ports, value_types, node_id, String("LATENT"), String("LATENT"))
-                    latent_nodes.append(node_id); latent_ports.append(String("LATENT"))
-                    if latent_idx >= 0:
-                        latent_widths.append(latent_widths[latent_idx])
-                        latent_heights.append(latent_heights[latent_idx])
-                        latent_images.append(new_batch)
-                        latent_init_images.append(latent_init_images[latent_idx])
-                        latent_mask_images.append(latent_mask_images[latent_idx])
-                    else:
-                        latent_widths.append(0); latent_heights.append(0); latent_images.append(new_batch)
-                        latent_init_images.append(String(""))
-                        latent_mask_images.append(String(""))
-                    done[i] = True; remaining -= 1; progressed = True
+                    raise Error(
+                        "[501] workflow graph RepeatLatentBatch requires real Comfy "
+                        + "latent-batch execution; use flat images=N for serial "
+                        + "product fanout"
+                    )
             elif type_id == "SetLatentNoiseMask":
                 var samples_link = _workflow_find_input_link(edges, node_id, String("samples"))
                 var mask_link = _workflow_find_input_link(edges, node_id, String("mask"))
@@ -3582,7 +3647,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
     if wf.contains("params") and wf["params"].is_object():
         var params = wf["params"]
         var keys: List[String] = [
-            "model", "prompt", "prompt_raw", "negative", "width", "height",
+            "model", "prompt", "prompt_raw", "prompt_json", "negative", "width", "height",
             "steps", "seed", "cfg", "cfg_override", "cfg_override_start_percent",
             "cfg_override_end_percent", "sampler", "scheduler", "sigma_shift",
             "variation_seed", "variation_strength", "images", "init_image", "creativity",
@@ -3613,7 +3678,7 @@ def apply_workflow_params(mut obj: JSONValue) raises:
     if wf.contains("genparams") and wf["genparams"].is_object():
         var params = wf["genparams"]
         var keys: List[String] = [
-            "model", "prompt", "prompt_raw", "negative", "width", "height",
+            "model", "prompt", "prompt_raw", "prompt_json", "negative", "width", "height",
             "steps", "seed", "cfg", "cfg_override", "cfg_override_start_percent",
             "cfg_override_end_percent", "sampler", "scheduler", "sigma_shift",
             "variation_seed", "variation_strength", "images", "init_image", "creativity",
@@ -3647,54 +3712,4 @@ def apply_workflow_params(mut obj: JSONValue) raises:
         apply_typed_workflow_graph(obj, wf)
         return
 
-    var nodes = wf["nodes"]
-    var saw_prompt = False
-    for i in range(nodes.length()):
-        var node = nodes[i]
-        if not node.is_object():
-            raise Error("[501] workflow graph node must be an object")
-        var type_id = _workflow_type_id(node)
-        var title = _workflow_string(node, String("title"))
-        var fields = JSONValue.new_object()
-        if node.contains("fields") and node["fields"].is_object():
-            fields = node["fields"]
-
-        if type_id == "CheckpointLoaderSimple":
-            _copy_field_if_missing(obj, fields, String("ckpt_name"), String("model"))
-        elif type_id == "CLIPTextEncode":
-            var text = _workflow_string(fields, String("text"))
-            if text != "":
-                var lower_title = String(title.lower())
-                if lower_title.find("negative") >= 0:
-                    _set_if_missing(obj, String("negative"), JSONValue.from_string(text))
-                else:
-                    _set_if_missing(obj, String("prompt"), JSONValue.from_string(text))
-                    saw_prompt = True
-        elif type_id == "EmptyLatentImage" or type_id == "EmptySD3LatentImage":
-            _copy_field_if_missing(obj, fields, String("width"), String("width"))
-            _copy_field_if_missing(obj, fields, String("height"), String("height"))
-            _copy_field_if_missing(obj, fields, String("batch_size"), String("images"))
-        elif type_id == "KSampler":
-            _copy_field_if_missing(obj, fields, String("steps"), String("steps"))
-            _copy_field_if_missing(obj, fields, String("seed"), String("seed"))
-            _copy_field_if_missing(obj, fields, String("cfg"), String("cfg"))
-            _copy_field_if_missing(obj, fields, String("sampler_name"), String("sampler"))
-            _copy_field_if_missing(obj, fields, String("scheduler"), String("scheduler"))
-            _copy_field_if_missing(obj, fields, String("denoise"), String("creativity"))
-        elif type_id == "ModelSamplingAuraFlow":
-            _copy_field_if_missing(obj, fields, String("shift"), String("sigma_shift"))
-        elif (
-            type_id == "VAEDecode"
-            or type_id == "SaveImage"
-            or type_id == ""
-        ):
-            if type_id == "":
-                raise Error("[501] unsupported workflow graph format: missing type_id")
-        else:
-            raise Error(
-                String("[501] unsupported workflow graph node type: ") + type_id
-            )
-
-    if not saw_prompt and (not obj.contains("prompt") or obj["prompt"].is_null()):
-        raise Error("[501] workflow graph did not contain a prompt node")
-    _record_workflow_execution(obj, String("field_only_graph_adapter"), nodes.length(), 0)
+    raise Error("[501] workflow graph body needs edges for typed execution")

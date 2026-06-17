@@ -19,7 +19,7 @@ from serenitymojo.models.vae.ldm_encoder import (
 )
 
 
-comptime SDXL_VAE = "/home/alex/madebyollin_sdxl-vae-fp16-fix/sdxl_vae.safetensors"
+comptime SDXL_VAE = "/home/alex/.serenity/models/vaes/OfficialStableDiffusion/sdxl_vae.safetensors"
 
 
 def _stats(name: String, t: Tensor, ctx: DeviceContext) raises:

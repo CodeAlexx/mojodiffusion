@@ -46,7 +46,7 @@
 #
 # ──────────────────────────────────────────────────────────────────────────────
 # Generate path: REAL, not a stub.
-#   Calls encode_captions_from_strings → denoise → unpatchify → QwenImageVaeDecoder.
+#   Calls encode_captions_from_strings → denoise → unpatchify → tiled Qwen VAE decode.
 #   The only change vs the standalone runner is that the prompt/negative pair
 #   comes from the sample_prompts JSON rather than the PROMPT/NEGATIVE comptime.
 #
@@ -73,7 +73,7 @@ from serenitymojo.models.text_encoder.qwen25vl_encoder import (
     Qwen25VLConfig,
 )
 from serenitymojo.models.dit.qwenimage_dit import QwenImageDitOffloaded
-from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder
+from serenitymojo.models.vae.qwenimage_tiled_decode import qwenimage_tiled_decode
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.layout import patchify, unpatchify
@@ -329,11 +329,10 @@ def main() raises:
     var tokens = denoise(caps, ctx)
 
     # VAE decode.
-    print("[vae] unpack + decode")
+    print("[vae] unpack + tiled decode")
     var latent = unpatchify(tokens, 16, LH, LW, PATCH, ctx)
     latent = cast_tensor(latent, STDtype.BF16, ctx)
-    var vae = QwenImageVaeDecoder[LH, LW].load(VAE_DIR, ctx)
-    var img = vae.decode(latent, ctx)
+    var img = qwenimage_tiled_decode[LH, LW](latent, VAE_DIR, ctx)
     var sh = img.shape()
     print("  image shape:", sh[0], sh[1], sh[2], sh[3])
 

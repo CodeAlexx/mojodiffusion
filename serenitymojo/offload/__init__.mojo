@@ -16,5 +16,9 @@
 #   turbo_slots   — metadata-only two-slot backend skeleton; no async/VMM yet.
 #   residency     — Phase 2: BlockState FSM, ResidencyEntry, BudgetTracker,
 #                   ResidencyManager (eviction/prefetch scheduling brain).
+#   vmm_cuda      — CUDA VMM/event/stream/memory-info driver FFI.
+#   vmm_slab      — reserved VA slab + region map/unmap/refcount primitive.
+#   vmm_manager   — model/block owner over VMM slab regions; no external repo
+#                   dependency and not yet wired into TurboBlockLoader.
 #   turbo_planned_loader — Phase 3: TurboPlannedLoader — plan-aware async
 #                   wrapper exposing the PlannedBlockLoader call surface.

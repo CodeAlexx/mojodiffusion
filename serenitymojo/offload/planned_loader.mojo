@@ -80,6 +80,9 @@ struct PlannedBlockLoader(Movable):
     def branch_visits(self) -> Int:
         return self.plan.branch_visits(self.config)
 
+    def set_config(mut self, config: OffloadConfig):
+        self.config = config
+
     def pinned_bytes(self) -> Int:
         return 0
 

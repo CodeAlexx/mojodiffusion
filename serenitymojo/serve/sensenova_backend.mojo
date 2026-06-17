@@ -36,10 +36,11 @@
 #     phase="decoding") → done. cancel() makes the next step() return cancelled
 #   and frees all per-job tensors.
 #
-# Size support: 512x512 ONLY (geometry is comptime-fixed here: L_TOKENS=256,
-# TEXT_LEN=320 cap; the model derives SDPA shapes from runtime tensor shapes but
-# the comptime struct tags are pinned to this resolution). steps/cfg/seed ARE
-# honored at runtime (the denoise loop reads params.steps/cfg/seed).
+# Size support: shape-dispatched 512x512 and 1024x1024. The model can carry
+# runtime width/height through patchify, RoPE, and noise-scale math, but its
+# gen-path SDPA shape is still a comptime specialization. This worker therefore
+# dispatches to concrete SenseNovaU1[L_TOKENS,TEXT_LEN] variants instead of
+# pretending one compiled shape handles every resolution.
 #
 # Sampler/scheduler: SenseNova-U1 runs its OWN fixed flow-match Euler schedule
 # (the exponential time-shift schedule built inside the denoise loop), not a
@@ -61,11 +62,15 @@
 from std.ffi import external_call
 from std.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
+from std.time import perf_counter_ns
+
+from image.buffer import Image
+from image.png import encode_png_with_text
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import BytePtr
-from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.image.png import _quantize, ValueRange
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
@@ -84,6 +89,9 @@ from serenitymojo.serve.backend import (
     reject_unsupported_conditioning_mask_params, reject_unsupported_lanpaint_params,
     warn_unsupported_advanced_sampling_params,
 )
+from serenitymojo.serve.product_manifest import (
+    json_bool, json_escape, peak_vram_mib, write_text_file,
+)
 
 
 # ── verified model + tokenizer paths (match sensenova_u1_gen_real.mojo) ──
@@ -92,25 +100,22 @@ comptime VOCAB_JSON = "/home/alex/.serenity/models/sensenova_u1/vocab.json"
 comptime MERGES_TXT = "/home/alex/.serenity/models/sensenova_u1/merges.txt"
 comptime ADDED_TOKENS_JSON = "/home/alex/.serenity/models/sensenova_u1/added_tokens.json"
 
-# ── geometry (512x512, matching sensenova_u1_gen_smoke's coherence geometry) ──
-comptime WIDTH = 512
-comptime HEIGHT = 512
+# ── geometry shared by all admitted SenseNova specializations ────────────────
 comptime PATCH = 16
 comptime MERGE = 2
-comptime GRID_H = HEIGHT // PATCH        # 32
-comptime GRID_W = WIDTH // PATCH         # 32
-comptime TOKEN_H = GRID_H // MERGE       # 16
-comptime TOKEN_W = GRID_W // MERGE       # 16
-comptime L_TOKENS = TOKEN_H * TOKEN_W    # 256
 # TEXT_LEN is a struct-tag upper bound (the model dimensions attention from the
 # runtime token count); pinned to the gen_real conservative cap. The exact cond/
 # uncond prefix lengths are printed, never asserted.
 comptime TEXT_LEN = 320
 comptime FM_OUT = (PATCH * MERGE) * (PATCH * MERGE) * 3  # 3072
+comptime SSHAPE_NONE = 0
+comptime SSHAPE_512 = 512
+comptime SSHAPE_1024 = 1024
 
 comptime DEFAULT_CFG = Float32(4.0)
 comptime TIMESTEP_SHIFT = Float32(3.0)
 comptime T_EPS = Float32(0.05)
+comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
 
 # The real system message conditioning the gen prefix (sensenova_u1_gen.rs:27-46;
 # copied verbatim from sensenova_u1_gen_real.mojo).
@@ -160,6 +165,34 @@ def _print_vram(tag: String):
         String("echo -n '[sensenova][vram] ") + tag
         + ": ' && nvidia-smi --query-gpu=memory.used --format=csv,noheader"
     )
+
+
+def _save_rgb_png_with_text(
+    rgb: Tensor, path: String, params_json: String, ctx: DeviceContext
+) raises:
+    """[1,3,H,W] UNIT float tensor -> 8-bit RGB PNG with genparams tEXt."""
+    var shape = rgb.shape()
+    if len(shape) != 4 or shape[0] != 1 or shape[1] != 3:
+        raise Error("sensenova_backend: expected [1,3,H,W] rgb tensor")
+    var height = shape[2]
+    var width = shape[3]
+    var host = rgb.to_host(ctx)
+    var plane = height * width
+    if len(host) != 3 * plane:
+        raise Error("sensenova_backend: rgb to_host size mismatch")
+    var img = Image.new(width, height, 3)
+    for y in range(height):
+        var row = y * width
+        for x in range(width):
+            var off = row + x
+            img.set(x, y, 0, _quantize(host[0 * plane + off], ValueRange.UNIT))
+            img.set(x, y, 1, _quantize(host[1 * plane + off], ValueRange.UNIT))
+            img.set(x, y, 2, _quantize(host[2 * plane + off], ValueRange.UNIT))
+    var kws = List[String]()
+    var vals = List[String]()
+    kws.append(String(GENPARAMS_TEXT_KEY))
+    vals.append(params_json.copy())
+    encode_png_with_text(img, path, kws, vals)
 
 
 # ── patchify / unpatchify (verbatim from sensenova_u1_gen_real.mojo) ─────────
@@ -265,12 +298,20 @@ struct SensenovaCaps(Movable):
         self.uncond = uncond^
 
 
-struct SensenovaBackend(GenBackend, Movable):
+struct SensenovaBackendShape[
+    WIDTH_: Int,
+    HEIGHT_: Int,
+    GRID_H_: Int,
+    GRID_W_: Int,
+    TOKEN_H_: Int,
+    TOKEN_W_: Int,
+    L_TOKENS_: Int,
+](GenBackend, Movable):
     var ctx: DeviceContext
 
     # ── resident across jobs (model handle, loaded once on first job) ──
     var loaded: Bool
-    var model: List[ArcPointer[SenseNovaU1[L_TOKENS, TEXT_LEN]]]  # 0/1
+    var model: List[ArcPointer[SenseNovaU1[Self.L_TOKENS_, TEXT_LEN]]]  # 0/1
 
     # ── per-job state (cleared on done/failed/cancelled) ──
     var active: Bool
@@ -285,11 +326,19 @@ struct SensenovaBackend(GenBackend, Movable):
     var caps: List[ArcPointer[SensenovaCaps]]   # 0/1 (cond + uncond KV caches)
     var img: List[ArcPointer[Tensor]]           # 0/1 ([1,3,H,W] BF16 image)
     var tsched: List[Float32]                   # NUM_STEPS+1 timestep grid
+    var job_t0_ns: UInt
+    var load_seconds: Float64
+    var text_encode_seconds: Float64
+    var prepare_seconds: Float64
+    var denoise_seconds: Float64
+    var decode_seconds: Float64
+    var total_vram_bytes: Int
+    var min_free_bytes: Int
 
     def __init__(out self) raises:
         self.ctx = DeviceContext()
         self.loaded = False
-        self.model = List[ArcPointer[SenseNovaU1[L_TOKENS, TEXT_LEN]]]()
+        self.model = List[ArcPointer[SenseNovaU1[Self.L_TOKENS_, TEXT_LEN]]]()
         self.active = False
         self.cancel_flag = False
         self.phase = SPHASE_IDLE
@@ -302,6 +351,14 @@ struct SensenovaBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[SensenovaCaps]]()
         self.img = List[ArcPointer[Tensor]]()
         self.tsched = List[Float32]()
+        self.job_t0_ns = UInt(0)
+        self.load_seconds = 0.0
+        self.text_encode_seconds = 0.0
+        self.prepare_seconds = 0.0
+        self.denoise_seconds = 0.0
+        self.decode_seconds = 0.0
+        self.total_vram_bytes = 0
+        self.min_free_bytes = 0
 
     def backend_name(self) -> String:
         return String("sensenova")
@@ -318,7 +375,7 @@ struct SensenovaBackend(GenBackend, Movable):
     # ── job admission ─────────────────────────────────────────────────────────
     def start(mut self, params: JobParams) raises:
         if self.active:
-            raise Error("SensenovaBackend.start: a job is already running")
+            raise Error("SensenovaBackendShape.start: a job is already running")
         reject_unsupported_common_runtime_params(params, String("sensenova"))
         reject_unsupported_reference_image_params(params, String("sensenova"))
         reject_unsupported_inpaint_conditioning_params(params, String("sensenova"))
@@ -326,16 +383,14 @@ struct SensenovaBackend(GenBackend, Movable):
         reject_unsupported_conditioning_mask_params(params, String("sensenova"))
         reject_unsupported_mask_image_params(params, String("sensenova"))
         reject_unsupported_lanpaint_params(params, String("sensenova"))
-        # 512x512 only: the geometry comptime tags (L_TOKENS=256, TEXT_LEN=320)
-        # are pinned to this resolution. Reject other sizes up front (no false
-        # advertising) — a resolution change needs a recompiled specialization.
-        if not (params.width == 512 and params.height == 512):
+        # The outer SensenovaBackend dispatches on requested size. Keep an inner
+        # guard so a caller cannot accidentally run tensors through the wrong
+        # compiled SDPA specialization.
+        if not (params.width == Self.WIDTH_ and params.height == Self.HEIGHT_):
             raise Error(
-                String("sensenova: unsupported size ") + String(params.width)
+                String("sensenova: internal shape mismatch, request ") + String(params.width)
                 + "x" + String(params.height)
-                + " — only 512x512 is served (the SenseNova-U1 geometry tags"
-                + " L_TOKENS=256/TEXT_LEN=320 are comptime-fixed; resolution"
-                + " changes need a recompiled specialization)"
+                + " was routed to " + String(Self.WIDTH_) + "x" + String(Self.HEIGHT_)
             )
         if len(params.loras) > 0:
             raise Error(
@@ -346,6 +401,14 @@ struct SensenovaBackend(GenBackend, Movable):
             raise Error(
                 "sensenova: img2img is not supported for SenseNova-U1 yet;"
                 " submit without an init image"
+            )
+        if params.negative.byte_length() > 0:
+            raise Error(
+                "sensenova: negative prompt is not supported by this production route"
+            )
+        if params.variation_strength > 0.0:
+            raise Error(
+                "sensenova: variation noise is not supported by this production route"
             )
         # SenseNova-U1 runs its own fixed flow-match Euler schedule (the
         # exponential time-shift schedule) — sampler/scheduler are not selectable
@@ -360,6 +423,16 @@ struct SensenovaBackend(GenBackend, Movable):
         self.cur = 0
         self.announced = False
         self.phase = SPHASE_LOAD
+        self.job_t0_ns = perf_counter_ns()
+        self.load_seconds = 0.0
+        self.text_encode_seconds = 0.0
+        self.prepare_seconds = 0.0
+        self.denoise_seconds = 0.0
+        self.decode_seconds = 0.0
+        var mem = cu_mem_get_info()
+        self.total_vram_bytes = mem.total_bytes
+        self.min_free_bytes = mem.free_bytes
+        self._record_vram()
 
     def cancel(mut self):
         self.cancel_flag = True
@@ -379,6 +452,73 @@ struct SensenovaBackend(GenBackend, Movable):
               after.used_bytes() // (1024 * 1024), "MiB (reclaimed",
               (before.used_bytes() - after.used_bytes()) // (1024 * 1024), "MiB)")
 
+    def _record_vram(mut self) raises:
+        var mem = cu_mem_get_info()
+        if self.total_vram_bytes == 0:
+            self.total_vram_bytes = mem.total_bytes
+        if self.min_free_bytes == 0 or mem.free_bytes < self.min_free_bytes:
+            self.min_free_bytes = mem.free_bytes
+
+    def _write_result_manifest(mut self, png_path: String) raises -> String:
+        self._record_vram()
+        var manifest_path = png_path + String(".sensenova_daemon_result.json")
+        var denoise_per_step = Float64(0.0)
+        if self.params.steps > 0:
+            denoise_per_step = self.denoise_seconds / Float64(self.params.steps)
+        var total_wall_seconds = Float64(perf_counter_ns() - self.job_t0_ns) / 1.0e9
+        var peak_mib = Float64(0.0)
+        if self.total_vram_bytes > 0 and self.min_free_bytes > 0:
+            peak_mib = peak_vram_mib(self.total_vram_bytes, self.min_free_bytes)
+
+        var content = String("{\n")
+        content += String('  "schema":"serenity.sensenova.daemon_result.v1",\n')
+        content += String('  "backend":"sensenova_daemon",\n')
+        content += String('  "model":"sensenova-u1",\n')
+        content += String('  "readiness_label":"experimental",\n')
+        content += String('  "accepted_sampler_parity":false,\n')
+        content += String('  "accepted_speed_parity":false,\n')
+        content += String('  "run_identity":{\n')
+        content += String('    "job_id":"') + json_escape(self.params.job_id) + String('",\n')
+        content += String('    "prompt":"') + json_escape(self.params.prompt) + String('",\n')
+        content += String('    "negative":"') + json_escape(self.params.negative) + String('",\n')
+        content += String('    "negative_prompt_used":false,\n')
+        content += String('    "seed":') + String(self.params.seed) + String(",\n")
+        content += String('    "resolution":{"width":') + String(self.params.width) + String(',"height":') + String(self.params.height) + String("},\n")
+        content += String('    "steps":') + String(self.params.steps) + String(",\n")
+        content += String('    "guidance":') + String(self.params.cfg) + String(",\n")
+        content += String('    "sampler_registry_backend":"sensenova",\n')
+        content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
+        content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
+        content += String('    "executed_sampler":"sensenova_flowmatch_euler",\n')
+        content += String('    "executed_scheduler":"sensenova_exponential_time_shift",\n')
+        content += String('    "schedule_source":"sensenova_u1_builtin",\n')
+        content += String('    "pixel_space_decode":true,\n')
+        content += String('    "vae_used":false,\n')
+        content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
+        content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
+        content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
+        content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
+        content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
+        content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        content += String('    "dtype":"bf16_pixel_space_f32_save"\n')
+        content += String("  },\n")
+        content += String('  "mojo":{\n')
+        content += String('    "load_seconds":') + String(self.load_seconds) + String(",\n")
+        content += String('    "text_encode_seconds":') + String(self.text_encode_seconds) + String(",\n")
+        content += String('    "prepare_seconds":') + String(self.prepare_seconds) + String(",\n")
+        content += String('    "denoise_seconds":') + String(self.denoise_seconds) + String(",\n")
+        content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
+        content += String('    "decode_seconds":') + String(self.decode_seconds) + String(",\n")
+        content += String('    "total_wall_seconds":') + String(total_wall_seconds) + String(",\n")
+        content += String('    "peak_vram_mib":') + String(peak_mib) + String(",\n")
+        content += String('    "artifact_paths":["') + json_escape(png_path) + String('","') + json_escape(manifest_path) + String('"]\n')
+        content += String("  },\n")
+        content += String('  "output_png":"') + json_escape(png_path) + String('",\n')
+        content += String('  "note":"Rust-server Mojo worker product-path result; SenseNova-U1 uses shape-specialized pixel-space flow dispatch for admitted resolutions. Sampler, speed, and visual quality remain unaccepted until paired baseline evidence exists."\n')
+        content += String("}\n")
+        write_text_file(manifest_path, content)
+        return manifest_path
+
     # ── per-job prep ───────────────────────────────────────────────────────────
     def _load_model(mut self) raises:
         """Load the SenseNovaU1 handle (once; stays resident). FAILS LOUD here if
@@ -387,11 +527,11 @@ struct SensenovaBackend(GenBackend, Movable):
         if self.loaded:
             return
         _print_vram("before SenseNova-U1 load")
-        print("[sensenova] loading SenseNovaU1[", L_TOKENS, ",", TEXT_LEN,
+        print("[sensenova] loading SenseNovaU1[", Self.L_TOKENS_, ",", TEXT_LEN,
               "] from", WEIGHTS_DIR)
-        self.model = List[ArcPointer[SenseNovaU1[L_TOKENS, TEXT_LEN]]]()
+        self.model = List[ArcPointer[SenseNovaU1[Self.L_TOKENS_, TEXT_LEN]]]()
         self.model.append(
-            ArcPointer(SenseNovaU1[L_TOKENS, TEXT_LEN].load(WEIGHTS_DIR, self.ctx))
+            ArcPointer(SenseNovaU1[Self.L_TOKENS_, TEXT_LEN].load(WEIGHTS_DIR, self.ctx))
         )
         self.loaded = True
         _print_vram("after SenseNova-U1 load (resident)")
@@ -431,13 +571,13 @@ struct SensenovaBackend(GenBackend, Movable):
     def _prepare_job(mut self) raises:
         """Resolution noise scale + seeded scaled initial image + timestep grid
         (honors steps + seed)."""
-        self.noise_scale = self.model[0][].compute_noise_scale(GRID_H, GRID_W)
+        self.noise_scale = self.model[0][].compute_noise_scale(Self.GRID_H_, Self.GRID_W_)
         self.s_norm = self.noise_scale / self.model[0][].config.noise_scale_max
         print("[sensenova] noise_scale=", self.noise_scale, " s_norm=", self.s_norm)
 
         var noise_sh = List[Int]()
         noise_sh.append(1); noise_sh.append(3)
-        noise_sh.append(HEIGHT); noise_sh.append(WIDTH)
+        noise_sh.append(Self.HEIGHT_); noise_sh.append(Self.WIDTH_)
         var img = randn(noise_sh^, UInt64(self.params.seed), STDtype.BF16, self.ctx)
         img = mul_scalar(img, self.noise_scale, self.ctx)
         self.img = List[ArcPointer[Tensor]]()
@@ -469,36 +609,36 @@ struct SensenovaBackend(GenBackend, Movable):
         var pixel_flat = _reshape_pixel(pixel_values, self.ctx)      # [gh*gw,768]
 
         var image_embeds = self.model[0][].extract_feature_gen(
-            pixel_flat, GRID_H, GRID_W, self.ctx
+            pixel_flat, Self.GRID_H_, Self.GRID_W_, self.ctx
         )
         var t_vec = List[Float32]()
-        for _ in range(L_TOKENS):
+        for _ in range(Self.L_TOKENS_):
             t_vec.append(t)
         var t_sh = List[Int]()
-        t_sh.append(L_TOKENS)
+        t_sh.append(Self.L_TOKENS_)
         var t_tensor = Tensor.from_host(t_vec, t_sh^, STDtype.F32, self.ctx)
         var t_emb = self.model[0][].time_or_scale_embed(t_tensor, "timestep", self.ctx)
-        var t_emb3 = _reshape3(t_emb, 1, L_TOKENS, cfg.hidden_size, self.ctx)
+        var t_emb3 = _reshape3(t_emb, 1, Self.L_TOKENS_, cfg.hidden_size, self.ctx)
 
         var s_vec = List[Float32]()
-        for _ in range(L_TOKENS):
+        for _ in range(Self.L_TOKENS_):
             s_vec.append(self.s_norm)
         var s_sh = List[Int]()
-        s_sh.append(L_TOKENS)
+        s_sh.append(Self.L_TOKENS_)
         var s_tensor = Tensor.from_host(s_vec, s_sh^, STDtype.F32, self.ctx)
         var s_emb = self.model[0][].time_or_scale_embed(s_tensor, "noise", self.ctx)
-        var s_emb3 = _reshape3(s_emb, 1, L_TOKENS, cfg.hidden_size, self.ctx)
+        var s_emb3 = _reshape3(s_emb, 1, Self.L_TOKENS_, cfg.hidden_size, self.ctx)
 
         var additive = add(t_emb3, s_emb3, self.ctx)
         image_embeds = add(image_embeds, additive, self.ctx)
 
         var h_cond = self.model[0][].forward_gen(
             image_embeds, self.caps[0][].cond.next_t_index,
-            TOKEN_H, TOKEN_W, self.caps[0][].cond, self.ctx
+            Self.TOKEN_H_, Self.TOKEN_W_, self.caps[0][].cond, self.ctx
         )
         var h_uncond = self.model[0][].forward_gen(
             image_embeds, self.caps[0][].uncond.next_t_index,
-            TOKEN_H, TOKEN_W, self.caps[0][].uncond, self.ctx
+            Self.TOKEN_H_, Self.TOKEN_W_, self.caps[0][].uncond, self.ctx
         )
         var x_cond = self.model[0][].fm_head_forward(h_cond, self.ctx)    # [1,L,3072]
         var x_uncond = self.model[0][].fm_head_forward(h_uncond, self.ctx)
@@ -514,7 +654,7 @@ struct SensenovaBackend(GenBackend, Movable):
         var v = add(v_uncond, mul_scalar(v_diff, self.cfg, self.ctx), self.ctx)
 
         var z_next = add(z, mul_scalar(v, t_next - t, self.ctx), self.ctx)
-        var img_next = _unpatchify(z_next, PATCH * MERGE, HEIGHT, WIDTH, self.ctx)
+        var img_next = _unpatchify(z_next, PATCH * MERGE, Self.HEIGHT_, Self.WIDTH_, self.ctx)
         self.img = List[ArcPointer[Tensor]]()
         self.img.append(ArcPointer(img_next^))
         print("[sensenova] step", step + 1, "/", self.params.steps,
@@ -532,7 +672,7 @@ struct SensenovaBackend(GenBackend, Movable):
             mul_scalar(img, Float32(0.5), self.ctx), Float32(0.5), self.ctx
         )
         var final_f32 = cast_tensor(final_img, STDtype.F32, self.ctx)
-        save_png(final_f32, png_path, self.ctx, ValueRange.UNIT)
+        _save_rgb_png_with_text(final_f32, png_path, self.params.params_json, self.ctx)
         print("[sensenova] saved ->", png_path)
         return png_path
 
@@ -561,6 +701,7 @@ struct SensenovaBackend(GenBackend, Movable):
             return r^
         try:
             if self.phase == SPHASE_LOAD:
+                var load_t0 = perf_counter_ns()
                 if not self.loaded:
                     if not self.announced:
                         self.announced = True
@@ -568,7 +709,9 @@ struct SensenovaBackend(GenBackend, Movable):
                         r.phase = String("loading")
                         return r^
                     self._load_model()
-                    self.announced = False
+                self.load_seconds += Float64(perf_counter_ns() - load_t0) / 1.0e9
+                self._record_vram()
+                self.announced = False
                 self.phase = SPHASE_ENCODE
                 r.step = 0
                 return r^
@@ -580,14 +723,23 @@ struct SensenovaBackend(GenBackend, Movable):
                     r.step = 0
                     r.phase = String("encoding")
                     return r^
+                var encode_t0 = perf_counter_ns()
                 self._encode()
+                self.text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
+                self._record_vram()
+                var prep_t0 = perf_counter_ns()
                 self._prepare_job()
+                self.prepare_seconds = Float64(perf_counter_ns() - prep_t0) / 1.0e9
+                self._record_vram()
                 self.announced = False
                 self.phase = SPHASE_DENOISE
                 r.step = 0
                 return r^
             if self.phase == SPHASE_DENOISE:
+                var denoise_t0 = perf_counter_ns()
                 self._denoise_one()
+                self.denoise_seconds += Float64(perf_counter_ns() - denoise_t0) / 1.0e9
+                self._record_vram()
                 self.cur += 1
                 r.step = self.cur
                 if self.cur >= self.params.steps:
@@ -599,7 +751,12 @@ struct SensenovaBackend(GenBackend, Movable):
                 r.step = self.params.steps
                 r.phase = String("decoding")
                 return r^
+            var decode_t0 = perf_counter_ns()
             var path = self._decode_and_save()
+            self.decode_seconds = Float64(perf_counter_ns() - decode_t0) / 1.0e9
+            self._record_vram()
+            var manifest = self._write_result_manifest(path)
+            print("[sensenova][manifest] saved:", manifest)
             r.step = self.params.steps
             self._clear_job()
             r.done = True
@@ -610,3 +767,125 @@ struct SensenovaBackend(GenBackend, Movable):
             r.failed = True
             r.error = String(e)
             return r^
+
+
+struct SensenovaBackend(GenBackend, Movable):
+    """Public worker backend. Routes request dimensions to concrete compiled
+    SenseNova-U1 image-token shapes and keeps only one shape resident."""
+
+    var ctx: DeviceContext
+    var shape: Int
+    var b512: List[
+        ArcPointer[SensenovaBackendShape[512, 512, 32, 32, 16, 16, 256]]
+    ]
+    var b1024: List[
+        ArcPointer[SensenovaBackendShape[1024, 1024, 64, 64, 32, 32, 1024]]
+    ]
+
+    def __init__(out self) raises:
+        self.ctx = DeviceContext()
+        self.shape = SSHAPE_NONE
+        self.b512 = List[
+            ArcPointer[SensenovaBackendShape[512, 512, 32, 32, 16, 16, 256]]
+        ]()
+        self.b1024 = List[
+            ArcPointer[SensenovaBackendShape[1024, 1024, 64, 64, 32, 32, 1024]]
+        ]()
+
+    def backend_name(self) -> String:
+        return String("sensenova")
+
+    def model_name(self) -> String:
+        return String("SenseNova-U1")
+
+    def resident_model(self) -> String:
+        if self.shape == SSHAPE_512 and len(self.b512) > 0:
+            return self.b512[0][].resident_model()
+        if self.shape == SSHAPE_1024 and len(self.b1024) > 0:
+            return self.b1024[0][].resident_model()
+        return String("")
+
+    def _drop_resident_shape(mut self) raises:
+        if self.shape == SSHAPE_NONE:
+            return
+        print("[sensenova] dropping resident shape", self.shape, "before shape switch")
+        self.b512 = List[
+            ArcPointer[SensenovaBackendShape[512, 512, 32, 32, 16, 16, 256]]
+        ]()
+        self.b1024 = List[
+            ArcPointer[SensenovaBackendShape[1024, 1024, 64, 64, 32, 32, 1024]]
+        ]()
+        self.shape = SSHAPE_NONE
+        self.ctx.synchronize()
+        try:
+            cu_mempool_trim_current(0)
+        except e:
+            print("[sensenova] WARNING: shape-switch pool trim failed (continuing):", e)
+        self.ctx.synchronize()
+
+    def _ensure_shape(mut self, want: Int) raises:
+        if self.shape == want:
+            return
+        self._drop_resident_shape()
+        if want == SSHAPE_512:
+            print("[sensenova] constructing 512x512 shape backend")
+            self.b512 = List[
+                ArcPointer[SensenovaBackendShape[512, 512, 32, 32, 16, 16, 256]]
+            ]()
+            self.b512.append(ArcPointer(
+                SensenovaBackendShape[512, 512, 32, 32, 16, 16, 256]()
+            ))
+        elif want == SSHAPE_1024:
+            print("[sensenova] constructing 1024x1024 shape backend")
+            self.b1024 = List[
+                ArcPointer[SensenovaBackendShape[1024, 1024, 64, 64, 32, 32, 1024]]
+            ]()
+            self.b1024.append(ArcPointer(
+                SensenovaBackendShape[1024, 1024, 64, 64, 32, 32, 1024]()
+            ))
+        else:
+            raise Error("sensenova: invalid shape dispatch")
+        self.shape = want
+
+    def _shape_for_params(self, params: JobParams) raises -> Int:
+        if params.width == 512 and params.height == 512:
+            return SSHAPE_512
+        if params.width == 1024 and params.height == 1024:
+            return SSHAPE_1024
+        raise Error(
+            String("sensenova: unsupported size ") + String(params.width)
+            + "x" + String(params.height)
+            + " -- admitted product shapes are 512x512 and 1024x1024; add a"
+            + " SenseNovaBackendShape specialization before exposing another"
+            + " workflow resolution"
+        )
+
+    def start(mut self, params: JobParams) raises:
+        var want = self._shape_for_params(params)
+        self._ensure_shape(want)
+        if self.shape == SSHAPE_512:
+            self.b512[0][].start(params)
+        else:
+            self.b1024[0][].start(params)
+
+    def step(mut self) raises -> StepResult:
+        if self.shape == SSHAPE_512:
+            return self.b512[0][].step()
+        if self.shape == SSHAPE_1024:
+            return self.b1024[0][].step()
+        var r = StepResult()
+        r.failed = True
+        r.error = String("sensenova: no active shape backend")
+        return r^
+
+    def cancel(mut self):
+        if self.shape == SSHAPE_512:
+            self.b512[0][].cancel()
+        elif self.shape == SSHAPE_1024:
+            self.b1024[0][].cancel()
+
+    def between_jobs_trim(mut self) raises:
+        if self.shape == SSHAPE_512:
+            self.b512[0][].between_jobs_trim()
+        elif self.shape == SSHAPE_1024:
+            self.b1024[0][].between_jobs_trim()

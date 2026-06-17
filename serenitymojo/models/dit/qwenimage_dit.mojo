@@ -1012,15 +1012,16 @@ struct QwenImageDitOffloaded(Movable):
         var rope = build_qwenimage_rope_tables(
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
-        self.loader.config = OffloadConfig.synchronous_single()
-        self.loader.prefetch(0)
+        self.loader.config = OffloadConfig.single_pass()
+        self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
-            self.loader.prefetch_next(i)
             var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
             var tmp = self._block_model(handle.block)
             tmp._block_forward[N_IMG, N_TXT, S](
                 i, img, txt, temb, rope[0], rope[1], N_TXT, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         return self._finish[N_IMG](img, temb, ctx)
 
@@ -1058,10 +1059,10 @@ struct QwenImageDitOffloaded(Movable):
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
         self.loader.config = OffloadConfig.synchronous_cfg_paired()
-        self.loader.prefetch(0)
+        self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
-            self.loader.prefetch_next(i)
             var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
             var tmp = self._block_model(handle.block)
             tmp._block_forward[N_IMG, N_TXT, S](
                 i, img_pos, txt_pos, temb, rope[0], rope[1], real_txt_len, ctx
@@ -1069,6 +1070,7 @@ struct QwenImageDitOffloaded(Movable):
             tmp._block_forward[N_IMG, N_TXT, S](
                 i, img_neg, txt_neg, temb, rope[0], rope[1], real_txt_len, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         var pred_pos = self._finish[N_IMG](img_pos, temb, ctx)
         var pred_neg = self._finish[N_IMG](img_neg, temb, ctx)
@@ -1118,10 +1120,10 @@ struct QwenImageDitOffloaded(Movable):
             frame, h_latent, w_latent, N_TXT_NEG, cfg.num_heads, cfg, dtype, ctx
         )
         self.loader.config = OffloadConfig.synchronous_cfg_paired()
-        self.loader.prefetch(0)
+        self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
-            self.loader.prefetch_next(i)
             var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
             var tmp = self._block_model(handle.block)
             tmp._block_forward[N_IMG, N_TXT_POS, S_POS](
                 i, img_pos, txt_pos, temb, rope_pos[0], rope_pos[1], real_txt_len_pos, ctx
@@ -1129,6 +1131,7 @@ struct QwenImageDitOffloaded(Movable):
             tmp._block_forward[N_IMG, N_TXT_NEG, S_NEG](
                 i, img_neg, txt_neg, temb, rope_neg[0], rope_neg[1], real_txt_len_neg, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         var pred_pos = self._finish[N_IMG](img_pos, temb, ctx)
         var pred_neg = self._finish[N_IMG](img_neg, temb, ctx)
@@ -1171,10 +1174,10 @@ struct QwenImageDitOffloaded(Movable):
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
         self.loader.config = OffloadConfig.synchronous_cfg_paired()
-        self.loader.prefetch(0)
+        self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
-            self.loader.prefetch_next(i)
             var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
             var tmp = self._block_model(handle.block)
             tmp._block_forward_edit[N_TARGET, N_REF, N_TXT, S](
                 i, img_pos, txt_pos, temb_target, temb_ref, rope[0], rope[1], N_TXT, ctx
@@ -1182,6 +1185,7 @@ struct QwenImageDitOffloaded(Movable):
             tmp._block_forward_edit[N_TARGET, N_REF, N_TXT, S](
                 i, img_neg, txt_neg, temb_target, temb_ref, rope[0], rope[1], N_TXT, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         var pred_pos_full = self._finish[N_TARGET + N_REF](img_pos, temb_target, ctx)
         var pred_neg_full = self._finish[N_TARGET + N_REF](img_neg, temb_target, ctx)

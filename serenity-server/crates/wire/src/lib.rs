@@ -202,8 +202,11 @@ impl JobParams {
             #[serde(flatten)]
             params: &'a JobParams,
         }
-        serde_json::to_string(&StartCmd { cmd: "start", params: self })
-            .expect("JobParams always serializes")
+        serde_json::to_string(&StartCmd {
+            cmd: "start",
+            params: self,
+        })
+        .expect("JobParams always serializes")
     }
 }
 
@@ -239,7 +242,10 @@ impl WorkerEvent {
         serde_json::from_str(line)
     }
     pub fn is_terminal(&self) -> bool {
-        matches!(self, WorkerEvent::Done { .. } | WorkerEvent::Failed { .. } | WorkerEvent::Cancelled)
+        matches!(
+            self,
+            WorkerEvent::Done { .. } | WorkerEvent::Failed { .. } | WorkerEvent::Cancelled
+        )
     }
 }
 
@@ -268,14 +274,30 @@ mod tests {
 
     #[test]
     fn parse_events() {
-        assert_eq!(WorkerEvent::parse(r#"{"ev":"ready"}"#).unwrap(), WorkerEvent::Ready);
+        assert_eq!(
+            WorkerEvent::parse(r#"{"ev":"ready"}"#).unwrap(),
+            WorkerEvent::Ready
+        );
         assert_eq!(
             WorkerEvent::parse(r#"{"ev":"done","output_path":"/tmp/j1.png"}"#).unwrap(),
-            WorkerEvent::Done { output_path: "/tmp/j1.png".into() }
+            WorkerEvent::Done {
+                output_path: "/tmp/j1.png".into()
+            }
         );
-        let p = WorkerEvent::parse(r#"{"ev":"progress","step":3,"total":20,"phase":"","preview":""}"#).unwrap();
-        assert!(matches!(p, WorkerEvent::Progress { step: 3, total: 20, .. }));
-        assert!(WorkerEvent::parse(r#"{"ev":"failed","error":"boom"}"#).unwrap().is_terminal());
+        let p =
+            WorkerEvent::parse(r#"{"ev":"progress","step":3,"total":20,"phase":"","preview":""}"#)
+                .unwrap();
+        assert!(matches!(
+            p,
+            WorkerEvent::Progress {
+                step: 3,
+                total: 20,
+                ..
+            }
+        ));
+        assert!(WorkerEvent::parse(r#"{"ev":"failed","error":"boom"}"#)
+            .unwrap()
+            .is_terminal());
     }
 
     #[test]

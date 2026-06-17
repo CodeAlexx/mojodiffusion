@@ -71,7 +71,9 @@ fn detect_arch(header: &str) -> &'static str {
         "flux"
     } else if header.contains("\"audio_vae.") {
         "ltx2"
-    } else if header.contains("\"embed_image_indicator.weight\"") || header.contains("\"llm_cond_proj.weight\"") {
+    } else if header.contains("\"embed_image_indicator.weight\"")
+        || header.contains("\"llm_cond_proj.weight\"")
+    {
         "ideogram4"
     } else if header.contains("\"model.diffusion_model.joint_blocks") {
         "sd3"
@@ -103,7 +105,13 @@ fn detect_arch_from_name(name: &str) -> &'static str {
         "qwen-image"
     } else if c("sd3") || c("sd35") {
         "sd3"
-    } else if c("sdxl") || c("stable-diffusion-xl") || c("animagine") {
+    } else if c("sdxl")
+        || c("sd_xl")
+        || c("sd-xl")
+        || c("sd xl")
+        || c("stable-diffusion-xl")
+        || c("animagine")
+    {
         "sdxl"
     } else if c("flux2") || c("flux-2") || c("flux_2") {
         "flux-2"
@@ -123,7 +131,10 @@ fn detect_lora_target_arch(header: &str) -> &'static str {
         "zimage"
     } else if header.contains("zimage") || header.contains("z_image") {
         "zimage"
-    } else if header.contains("\"lora_unet_") || header.contains("\"lora_te1") || header.contains("\"lora_te2") {
+    } else if header.contains("\"lora_unet_")
+        || header.contains("\"lora_te1")
+        || header.contains("\"lora_te2")
+    {
         "sdxl"
     } else if header.contains("\"lora_transformer_distilled_guidance_layer") {
         "chroma"
@@ -185,8 +196,16 @@ fn base64_encode(bytes: &[u8]) -> String {
         let b2 = *chunk.get(2).unwrap_or(&0) as usize;
         out.push(TBL[b0 >> 2] as char);
         out.push(TBL[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 { TBL[((b1 & 0x0f) << 2) | (b2 >> 6)] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TBL[b2 & 0x3f] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TBL[((b1 & 0x0f) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TBL[b2 & 0x3f] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -262,8 +281,14 @@ fn find_sidecar_preview(model_path: &str) -> String {
 fn find_dir_preview(dir: &str) -> String {
     let base = Path::new(dir);
     const NAMES: [&str; 8] = [
-        "preview.png", "preview.jpg", "cover.png", "cover.jpg", "teaser.jpg", "teaser.png",
-        "thumbnail.png", "thumbnail.jpg",
+        "preview.png",
+        "preview.jpg",
+        "cover.png",
+        "cover.jpg",
+        "teaser.jpg",
+        "teaser.png",
+        "thumbnail.png",
+        "thumbnail.jpg",
     ];
     for n in NAMES {
         let uri = preview_data_uri(&base.join(n));
@@ -301,7 +326,13 @@ fn parse_sidecar_json(v: &Value) -> Sidecar {
     }
     let mut trigger = json_str_any(
         v,
-        &["trigger", "trigger_words", "triggerWords", "activation text", "activation_text"],
+        &[
+            "trigger",
+            "trigger_words",
+            "triggerWords",
+            "activation text",
+            "activation_text",
+        ],
     );
     if trigger.is_empty() {
         if let Some(arr) = v.get("trainedWords").and_then(|x| x.as_array()) {
@@ -315,7 +346,12 @@ fn parse_sidecar_json(v: &Value) -> Sidecar {
         }
     }
     let arch_hint = json_str_any(v, &["arch", "architecture", "baseModel", "base_model"]);
-    Sidecar { preview: String::new(), description, trigger, arch_hint }
+    Sidecar {
+        preview: String::new(),
+        description,
+        trigger,
+        arch_hint,
+    }
 }
 
 /// Read the first existing sidecar metadata JSON for a model file path, returning
@@ -332,7 +368,11 @@ fn read_sidecar_metadata(model_path: &str) -> Sidecar {
     if stem.is_empty() {
         return Sidecar::default();
     }
-    for fname in [format!("{stem}.json"), format!("{stem}.civitai.info"), format!("{stem}.cm-info.json")] {
+    for fname in [
+        format!("{stem}.json"),
+        format!("{stem}.civitai.info"),
+        format!("{stem}.cm-info.json"),
+    ] {
         let cand = parent.join(&fname);
         if let Ok(text) = std::fs::read_to_string(&cand) {
             if let Ok(v) = serde_json::from_str::<Value>(&text) {
@@ -467,7 +507,10 @@ fn scan_checkpoints() -> Vec<ScanEntry> {
         }
     }
     // known multi-shard checkpoint subdirs under checkpoints/.
-    for (name, arch) in [("qwen-image-2512", "qwen-image"), ("ideogram-4-fp8", "ideogram4")] {
+    for (name, arch) in [
+        ("qwen-image-2512", "qwen-image"),
+        ("ideogram-4-fp8", "ideogram4"),
+    ] {
         let dir = format!("{CHECKPOINTS_DIR}/{name}");
         if dir_exists(&dir) {
             let size = du_sb(&dir);
@@ -547,7 +590,9 @@ fn scan_entry_cmp(a: &ScanEntry, b: &ScanEntry, sort: &str) -> std::cmp::Orderin
         "size" | "size_desc" => b.size.cmp(&a.size),
         "size_asc" => a.size.cmp(&b.size),
         "name_desc" => bn.cmp(&an),
-        "arch" | "family" => entry_arch(a).to_lowercase().cmp(&entry_arch(b).to_lowercase()),
+        "arch" | "family" => entry_arch(a)
+            .to_lowercase()
+            .cmp(&entry_arch(b).to_lowercase()),
         _ => Ordering::Equal,
     };
     if primary != Ordering::Equal {
@@ -591,7 +636,12 @@ fn compatible_models_json(lora: &ScanEntry, models: &[ScanEntry]) -> Value {
     Value::Array(names)
 }
 
-fn lora_incompatible_reason(selected_model: &str, selected_arch: &str, target_arch: &str, compatible: bool) -> String {
+fn lora_incompatible_reason(
+    selected_model: &str,
+    selected_arch: &str,
+    target_arch: &str,
+    compatible: bool,
+) -> String {
     if selected_model.is_empty() {
         "no model selected".to_string()
     } else if target_arch == "unknown" {
@@ -649,7 +699,12 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
     })
 }
 
-fn lora_entry_json(e: &ScanEntry, models: &[ScanEntry], selected_model: &str, selected_arch: &str) -> Value {
+fn lora_entry_json(
+    e: &ScanEntry,
+    models: &[ScanEntry],
+    selected_model: &str,
+    selected_arch: &str,
+) -> Value {
     let target = entry_arch(e);
     let compatible = model_lora_compatible(selected_arch, &target);
     let reason = lora_incompatible_reason(selected_model, selected_arch, &target, compatible);
@@ -703,7 +758,13 @@ fn lora_entry_json(e: &ScanEntry, models: &[ScanEntry], selected_model: &str, se
     })
 }
 
-fn sorted_filtered<F>(entries: &[ScanEntry], search: &str, filter: &str, sort: &str, build: F) -> Value
+fn sorted_filtered<F>(
+    entries: &[ScanEntry],
+    search: &str,
+    filter: &str,
+    sort: &str,
+    build: F,
+) -> Value
 where
     F: Fn(&ScanEntry) -> Value,
 {
@@ -756,7 +817,9 @@ pub async fn get_models(Query(q): Query<HashMap<String, String>>) -> Response {
         "lora_sort": lora_sort,
         "model": selected_model,
     });
-    let models_json = sorted_filtered(&models, &search, &filter, &sort, |e| model_entry_json(e, resident));
+    let models_json = sorted_filtered(&models, &search, &filter, &sort, |e| {
+        model_entry_json(e, resident)
+    });
     let loras_json = sorted_filtered(&loras, &lora_search, &lora_filter, &lora_sort, |e| {
         lora_entry_json(e, &models, &selected_model, &selected_arch)
     });
@@ -792,8 +855,15 @@ mod tests {
     #[test]
     fn arch_name_precedence_known_families() {
         assert_eq!(detect_arch_from_name("flux-2-klein-base-9b"), "flux-2");
-        assert_eq!(detect_arch_from_name("wan2.2_t2v_low_noise_14b_fp16"), "wan2.2");
-        assert_eq!(detect_arch_from_name("qwen_2.5_vl_7b_fp8_scaled"), "qwen-image");
+        assert_eq!(detect_arch_from_name("sd_xl_base_1.0"), "sdxl");
+        assert_eq!(
+            detect_arch_from_name("wan2.2_t2v_low_noise_14b_fp16"),
+            "wan2.2"
+        );
+        assert_eq!(
+            detect_arch_from_name("qwen_2.5_vl_7b_fp8_scaled"),
+            "qwen-image"
+        );
         assert_eq!(detect_arch_from_name("ltx-2.3-22b-dev"), "ltx2");
         assert_eq!(detect_arch_from_name("some-random-checkpoint"), "unknown");
     }
@@ -801,7 +871,10 @@ mod tests {
     #[test]
     fn arch_header_probes() {
         assert_eq!(detect_arch("...\"noise_refiner.x\": ..."), "zimage");
-        assert_eq!(detect_arch("...\"double_stream_modulation_img\": ..."), "flux-2/klein");
+        assert_eq!(
+            detect_arch("...\"double_stream_modulation_img\": ..."),
+            "flux-2/klein"
+        );
         assert_eq!(detect_arch("...\"time_projection.\": ..."), "wan");
         assert_eq!(detect_arch("{}"), "unknown");
         assert_eq!(detect_lora_target_arch("...\"lora_unet_x\": ..."), "sdxl");
@@ -812,7 +885,10 @@ mod tests {
         assert!(model_lora_compatible("sdxl", "sdxl"));
         assert!(!model_lora_compatible("sdxl", "flux"));
         assert!(!model_lora_compatible("unknown", "sdxl"));
-        assert_eq!(lora_incompatible_reason("", "", "sdxl", false), "no model selected");
+        assert_eq!(
+            lora_incompatible_reason("", "", "sdxl", false),
+            "no model selected"
+        );
         assert_eq!(
             lora_incompatible_reason("m", "flux", "sdxl", false),
             "target_arch sdxl is not compatible with model arch flux"
@@ -840,11 +916,20 @@ mod tests {
     fn folder_relative_strips_root_and_basename() {
         let root = "/home/alex/.serenity/models/checkpoints";
         // direct child → no folder
-        assert_eq!(folder_relative_to(&format!("{root}/x.safetensors"), root), "");
+        assert_eq!(
+            folder_relative_to(&format!("{root}/x.safetensors"), root),
+            ""
+        );
         // one subdir
-        assert_eq!(folder_relative_to(&format!("{root}/ltx-video/x.safetensors"), root), "ltx-video");
+        assert_eq!(
+            folder_relative_to(&format!("{root}/ltx-video/x.safetensors"), root),
+            "ltx-video"
+        );
         // nested subdir
-        assert_eq!(folder_relative_to(&format!("{root}/a/b/x.safetensors"), root), "a/b");
+        assert_eq!(
+            folder_relative_to(&format!("{root}/a/b/x.safetensors"), root),
+            "a/b"
+        );
         // path not under root → ""
         assert_eq!(folder_relative_to("/other/x.safetensors", root), "");
     }
@@ -896,7 +981,10 @@ mod tests {
         std::fs::write(&png, [0x89u8, b'P', b'N', b'G', 1, 2, 3]).unwrap();
         let uri = preview_data_uri(&png);
         assert!(uri.starts_with("data:image/png;base64,"), "got: {uri}");
-        assert_eq!(&uri["data:image/png;base64,".len()..], base64_encode(&[0x89, b'P', b'N', b'G', 1, 2, 3]));
+        assert_eq!(
+            &uri["data:image/png;base64,".len()..],
+            base64_encode(&[0x89, b'P', b'N', b'G', 1, 2, 3])
+        );
 
         // unsupported ext → ""
         let txt = dir.join("m.txt");

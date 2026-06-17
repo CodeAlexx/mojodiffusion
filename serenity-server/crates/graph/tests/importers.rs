@@ -26,6 +26,58 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value as JsonValue};
 use serenity_graph::{comfy_ui_canvas_to_typed_body, lower_request};
 
+#[test]
+fn flat_params_adapter_preserves_prompt_json_and_loras_alias() {
+    let mut req = json!({
+        "workflow": {
+            "params": {
+                "model": "ideogram4",
+                "prompt_json": {
+                    "caption": "bbox prompt",
+                    "objects": [{"label": "package", "bbox": [128, 192, 768, 832]}]
+                },
+                "negative": "",
+                "width": 1024,
+                "height": 1024,
+                "steps": 20,
+                "seed": 26061790,
+                "cfg": 7.0,
+                "sampler": "euler",
+                "scheduler": "ideogram_logitnormal",
+                "clip_skip": 2,
+                "eta": 0.25,
+                "sigma_min": 0.03,
+                "sigma_max": 14.6,
+                "restart_sampling": true,
+                "vae": "Automatic",
+                "loras": [{"name": "adapter.safetensors", "weight": 0.7}],
+                "filename_prefix": "bbox_workflow"
+            }
+        }
+    });
+    lower_request(&mut req).expect("flat workflow params must lower");
+    assert_eq!(req["model"].as_str(), Some("ideogram4"));
+    assert_eq!(req["workflow_source"].as_str(), Some("flat_params_adapter"));
+    assert_eq!(req["workflow_route_kind"].as_str(), Some("image"));
+    assert_eq!(req["workflow_plan"]["route_kind"].as_str(), Some("image"));
+    assert_eq!(req["workflow_save_prefix"].as_str(), Some("bbox_workflow"));
+    assert_eq!(req["clip_skip"].as_i64(), Some(2));
+    assert_eq!(req["eta"].as_f64(), Some(0.25));
+    assert_eq!(req["sigma_min"].as_f64(), Some(0.03));
+    assert_eq!(req["sigma_max"].as_f64(), Some(14.6));
+    assert_eq!(req["restart_sampling"].as_bool(), Some(true));
+    assert_eq!(req["vae"].as_str(), Some("Automatic"));
+    assert_eq!(
+        req["prompt_json"]["objects"][0]["bbox"][0].as_i64(),
+        Some(128)
+    );
+    assert_eq!(req["lora"][0]["name"].as_str(), Some("adapter.safetensors"));
+    assert!(
+        req.get("loras").is_none(),
+        "UI alias must not duplicate canonical lora field"
+    );
+}
+
 fn refs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/refs")
@@ -43,6 +95,10 @@ fn scalar_eq(a: &JsonValue, b: &JsonValue) -> bool {
         },
         _ => a == b,
     }
+}
+
+fn rust_only_lowering_key(k: &str) -> bool {
+    matches!(k, "workflow_route_kind" | "workflow_plan")
 }
 
 /// Lower `<name>.request.json` and diff every non-`workflow` top-level key
@@ -79,11 +135,18 @@ fn check_ref(name: &str) {
         if k == "workflow" {
             continue;
         }
+        if rust_only_lowering_key(k) {
+            continue;
+        }
         if !want.contains_key(k) {
             diffs.push(format!("  key '{k}': EXTRA (got {got_v}, absent in ref)"));
         }
     }
-    assert!(diffs.is_empty(), "{name} parity failed:\n{}", diffs.join("\n"));
+    assert!(
+        diffs.is_empty(),
+        "{name} parity failed:\n{}",
+        diffs.join("\n")
+    );
 }
 
 #[test]
@@ -99,6 +162,121 @@ fn ideogram4_export_v4_parity() {
 #[test]
 fn comfy_canvas_min_t2i_parity() {
     check_ref("comfy_canvas__min_t2i");
+}
+
+#[test]
+fn comfy_canvas_min_t2i_records_image_route_plan() {
+    let dir = refs_dir();
+    let mut req: JsonValue = serde_json::from_slice(
+        &fs::read(dir.join("comfy_canvas__min_t2i.request.json")).expect("read request"),
+    )
+    .expect("parse request");
+    lower_request(&mut req).expect("canvas lowers");
+    assert_eq!(req["workflow_route_kind"].as_str(), Some("image"));
+    let terminals = req["workflow_plan"]["terminal_nodes"].as_array().unwrap();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0]["type"].as_str(), Some("SaveImage"));
+    assert_eq!(terminals[0]["kind"].as_str(), Some("image"));
+}
+
+#[test]
+fn ltx_no_vae_video_workflow_records_video_route_plan() {
+    let mut req = json!({
+        "workflow": {
+            "1": {
+                "class_type": "LTXVLoader",
+                "inputs": {
+                    "checkpoint_path": "ltx-2.3-22b-dev.safetensors",
+                    "gemma_path": "gemma-3-12b-it",
+                    "dtype": "bfloat16"
+                }
+            },
+            "2": {
+                "class_type": "LTXVSampler",
+                "inputs": {
+                    "ltxv_model": ["1", 0],
+                    "prompt": "cinematic foggy forest",
+                    "negative_prompt": "blurry",
+                    "width": 768,
+                    "height": 512,
+                    "num_frames": 97,
+                    "steps": 25,
+                    "cfg": 3.0,
+                    "seed": 42,
+                    "frame_rate": 24,
+                    "mode": "dev"
+                }
+            },
+            "3": {
+                "class_type": "SaveVideo",
+                "inputs": {
+                    "video": ["2", 1],
+                    "filename_prefix": "ltx23_t2v",
+                    "fps": 24,
+                    "format": "mp4"
+                }
+            }
+        }
+    });
+    lower_request(&mut req).expect("LTX no-VAE video graph lowers");
+    assert_eq!(
+        req["workflow_source"].as_str(),
+        Some("comfy_api_prompt_graph")
+    );
+    assert_eq!(req["workflow_route_kind"].as_str(), Some("video"));
+    assert_eq!(req["model"].as_str(), Some("ltx-2.3-22b-dev.safetensors"));
+    assert_eq!(req["prompt"].as_str(), Some("cinematic foggy forest"));
+    assert_eq!(req["num_frames"].as_i64(), Some(97));
+    assert_eq!(req["workflow_plan"]["route_kind"].as_str(), Some("video"));
+    let terminals = req["workflow_plan"]["terminal_nodes"].as_array().unwrap();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0]["type"].as_str(), Some("SaveVideo"));
+    assert_eq!(terminals[0]["input_type"].as_str(), Some("VIDEO"));
+}
+
+#[test]
+fn ltx_audio_video_workflow_records_audio_video_route_plan() {
+    let mut req = json!({
+        "workflow": {
+            "1": {
+                "class_type": "LTXVLoader",
+                "inputs": {"checkpoint_path": "ltx-2.3-22b-dev.safetensors"}
+            },
+            "2": {
+                "class_type": "LoadAudio",
+                "inputs": {"audio": "input.mp3"}
+            },
+            "3": {
+                "class_type": "LTXVSampler",
+                "inputs": {
+                    "ltxv_model": ["1", 0],
+                    "audio": ["2", 0],
+                    "prompt": "motion synchronized to audio",
+                    "width": 768,
+                    "height": 512,
+                    "num_frames": 97,
+                    "steps": 20,
+                    "cfg": 3.0,
+                    "seed": 42,
+                    "frame_rate": 24
+                }
+            },
+            "4": {
+                "class_type": "SaveVideo",
+                "inputs": {"video": ["3", 1], "filename_prefix": "ltx23_a2v", "fps": 24}
+            },
+            "5": {
+                "class_type": "SaveAudioOpus",
+                "inputs": {"audio": ["3", 2], "filename_prefix": "ltx23_a2v"}
+            }
+        }
+    });
+    lower_request(&mut req).expect("LTX audio/video graph lowers");
+    assert_eq!(req["workflow_route_kind"].as_str(), Some("audio_video"));
+    let terminals = req["workflow_plan"]["terminal_nodes"].as_array().unwrap();
+    assert_eq!(terminals.len(), 2);
+    assert_eq!(terminals[0]["type"].as_str(), Some("SaveVideo"));
+    assert_eq!(terminals[1]["type"].as_str(), Some("SaveAudioOpus"));
 }
 
 /// The Ideogram4 export with a randomized Seed (rgthree) widget and NO top-level
@@ -134,6 +312,39 @@ fn ideogram4_export_missing_prompt_is_rejected_loud() {
     o.remove("prompt_raw");
     let err = lower_request(&mut req).expect_err("must raise without a prompt override");
     assert_eq!(err.http_status(), 501, "got {}", err);
+}
+
+#[test]
+fn ideogram4_export_accepts_prompt_json_bbox_override() {
+    let dir = refs_dir();
+    let mut req: JsonValue = serde_json::from_slice(
+        &fs::read(dir.join("ideogram4__basic_txt2img_v3.request.json")).expect("read request"),
+    )
+    .expect("parse");
+    let o = req.as_object_mut().unwrap();
+    o.remove("prompt");
+    o.remove("prompt_raw");
+    o.insert(
+        "prompt_json".to_string(),
+        json!({
+            "caption": "place the logo inside the marked package face",
+            "objects": [
+                {"label": "package", "bbox": [128, 192, 768, 832]}
+            ]
+        }),
+    );
+
+    lower_request(&mut req).unwrap_or_else(|e| panic!("prompt_json override must lower: {e}"));
+    let prompt = req["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("\"caption\""),
+        "prompt_json lost caption: {prompt}"
+    );
+    assert!(
+        prompt.contains("\"bbox\""),
+        "prompt_json lost bbox: {prompt}"
+    );
+    assert_eq!(req["prompt_raw"].as_str(), Some(prompt));
 }
 
 // ---------------------------------------------------------------------------
@@ -179,15 +390,15 @@ fn canvas_t2i(extra_nodes: Vec<JsonValue>, extra_links: Vec<JsonValue>) -> JsonV
     ];
     nodes.extend(extra_nodes);
     let mut links = vec![
-        json!([10,1,0,5,0,"MODEL"]),
-        json!([11,1,1,2,0,"CLIP"]),
-        json!([12,1,1,3,0,"CLIP"]),
-        json!([13,1,2,6,1,"VAE"]),
-        json!([14,2,0,5,1,"CONDITIONING"]),
-        json!([15,3,0,5,2,"CONDITIONING"]),
-        json!([16,4,0,5,3,"LATENT"]),
-        json!([17,5,0,6,0,"LATENT"]),
-        json!([18,6,0,7,0,"IMAGE"]),
+        json!([10, 1, 0, 5, 0, "MODEL"]),
+        json!([11, 1, 1, 2, 0, "CLIP"]),
+        json!([12, 1, 1, 3, 0, "CLIP"]),
+        json!([13, 1, 2, 6, 1, "VAE"]),
+        json!([14, 2, 0, 5, 1, "CONDITIONING"]),
+        json!([15, 3, 0, 5, 2, "CONDITIONING"]),
+        json!([16, 4, 0, 5, 3, "LATENT"]),
+        json!([17, 5, 0, 6, 0, "LATENT"]),
+        json!([18, 6, 0, 7, 0, "IMAGE"]),
     ];
     links.extend(extra_links);
     json!({"nodes": nodes, "links": links, "version": 0.4})
@@ -203,7 +414,7 @@ fn canvas_mode2_mute_node_is_dropped() {
         "inputs":[{"name":"clip","type":"CLIP","link":19}],
         "outputs":[{"name":"CONDITIONING","type":"CONDITIONING","links":[]}],
         "widgets_values":["MUTED dead prompt"]});
-    let extra_link = json!([19,1,1,8,0,"CLIP"]);
+    let extra_link = json!([19, 1, 1, 8, 0, "CLIP"]);
     let wf = canvas_t2i(vec![muted], vec![extra_link]);
 
     let typed = comfy_ui_canvas_to_typed_body(&wf).expect("typed body builds");
@@ -218,8 +429,9 @@ fn canvas_mode2_mute_node_is_dropped() {
     );
     assert_eq!(edges.len(), 9, "link touching muted node must be dropped");
     assert!(
-        edges.iter().all(|e| e["from"]["node"].as_i64() != Some(8)
-            && e["to"]["node"].as_i64() != Some(8)),
+        edges
+            .iter()
+            .all(|e| e["from"]["node"].as_i64() != Some(8) && e["to"]["node"].as_i64() != Some(8)),
         "no edge may reference the muted node"
     );
 
@@ -367,7 +579,7 @@ fn canvas_mode4_bypass_node_is_dropped() {
         "inputs":[{"name":"clip","type":"CLIP","link":21}],
         "outputs":[{"name":"CONDITIONING","type":"CONDITIONING","links":[]}],
         "widgets_values":["bypassed"]});
-    let extra_link = json!([21,1,1,9,0,"CLIP"]);
+    let extra_link = json!([21, 1, 1, 9, 0, "CLIP"]);
     let wf = canvas_t2i(vec![bypassed], vec![extra_link]);
     let typed = comfy_ui_canvas_to_typed_body(&wf).expect("typed body builds");
     assert_eq!(typed["nodes"].as_array().unwrap().len(), 7);
@@ -396,7 +608,10 @@ fn load_image_mask_alias_resolves_mask() {
     lower_request(&mut req).expect("LoadImageMask alias must lower cleanly");
     assert_eq!(req["mask_image"].as_str(), Some("mymask.png"));
     assert_eq!(req["prompt"].as_str(), Some("a cabin"));
-    assert_eq!(req["workflow_source"].as_str(), Some("comfy_api_prompt_graph"));
+    assert_eq!(
+        req["workflow_source"].as_str(),
+        Some("comfy_api_prompt_graph")
+    );
 }
 
 /// LoadImageOutput is an alias of LoadImage: its IMAGE output (slot 0) resolves to

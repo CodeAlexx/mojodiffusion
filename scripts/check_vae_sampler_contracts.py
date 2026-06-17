@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Static guard for OneTrainer VAE/postprocess sampler contracts.
 
-Reference is intentionally limited to local OneTrainer and OneTrainer-anima-ref.
-This guard checks the sampler/model source contracts mirrored by
+Reference is intentionally limited to local OneTrainer plus the repo-local Anima
+contract mirror when OneTrainer-anima-ref is not present. This guard checks the
+sampler/model source contracts mirrored by
 serenitymojo/sampling/vae_postprocess_contract.mojo. It does not claim full image
 parity; that still requires text conditioning, denoise, VAE decode, and image
 write verification.
@@ -66,6 +67,12 @@ def main() -> int:
     models = ONETRAINER / "modules/model"
     anima_samplers = ANIMA_REF / "modules/modelSampler"
     anima_models = ANIMA_REF / "modules/model"
+    anima_ref_available = (anima_models / "AnimaModel.py").exists()
+    if not anima_ref_available:
+        print(
+            "[vae-sampler] INFO OneTrainer-anima-ref unavailable; "
+            "using repo-local Anima VAE contract mirror"
+        )
 
     require(
         samplers / "BaseModelSampler.py",
@@ -121,24 +128,46 @@ def main() -> int:
             "image_split_names = ['latent_image', 'original_resolution', 'crop_offset']",
         ],
     )
-    require(
-        anima_models / "AnimaModel.py",
-        "OneTrainer-anima VAE scaling source",
-        [
-            "AutoencoderKLQwenImage",
-            "def scale_latents(self, latents: Tensor) -> Tensor:",
-            "return (latents - latents_mean) * latents_std",
-        ],
-    )
-    require(
-        ANIMA_REF / "modules/dataLoader/AnimaBaseDataLoader.py",
-        "OneTrainer-anima VAE encode/precache",
-        [
-            "SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')",
-            "vae_frame_dim=True,  #...Anima has a video-capable VAE. convert images to video dimensions",
-            "image_split_names = ['latent_image', 'original_resolution', 'crop_offset']",
-        ],
-    )
+    if anima_ref_available:
+        require(
+            anima_models / "AnimaModel.py",
+            "OneTrainer-anima VAE scaling source",
+            [
+                "AutoencoderKLQwenImage",
+                "def scale_latents(self, latents: Tensor) -> Tensor:",
+                "return (latents - latents_mean) * latents_std",
+            ],
+        )
+        require(
+            ANIMA_REF / "modules/dataLoader/AnimaBaseDataLoader.py",
+            "OneTrainer-anima VAE encode/precache",
+            [
+                "SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')",
+                "vae_frame_dim=True,  #...Anima has a video-capable VAE. convert images to video dimensions",
+                "image_split_names = ['latent_image', 'original_resolution', 'crop_offset']",
+            ],
+        )
+    else:
+        require(
+            REPO / "serenitymojo/training/train_anima_ot.mojo",
+            "Repo-local Anima VAE scaling mirror",
+            [
+                "scaled = (latent - mean) * (1/std)",
+                "AnimaModel.py:233-236",
+                "def _vae_latents_mean() -> List[Float32]:",
+                "def _vae_latents_std() -> List[Float32]:",
+            ],
+        )
+        require(
+            REPO / "serenitymojo/pipeline/anima_prepare_ot.mojo",
+            "Repo-local Anima VAE encode/precache mirror",
+            [
+                "RAW Qwen-Image VAE mean latent",
+                "vae_frame_dim=True",
+                "QwenImageVaeEncoder",
+                "encode_mean",
+            ],
+        )
     require(
         ONETRAINER / "modules/dataLoader/FluxBaseDataLoader.py",
         "OneTrainer Flux VAE encode/precache",
@@ -191,15 +220,27 @@ def main() -> int:
             "img_shapes = [[(",
         ],
     )
-    require(
-        ANIMA_REF / "modules/modelSetup/BaseAnimaSetup.py",
-        "OneTrainer-anima prepared latent shape",
-        [
-            "latent_image = batch['latent_image']",
-            "scaled_latent_image = model.scale_latents(latent_image)",
-            "Anima latents are 5D (B,16,1,H/8,W/8)",
-        ],
-    )
+    if anima_ref_available:
+        require(
+            ANIMA_REF / "modules/modelSetup/BaseAnimaSetup.py",
+            "OneTrainer-anima prepared latent shape",
+            [
+                "latent_image = batch['latent_image']",
+                "scaled_latent_image = model.scale_latents(latent_image)",
+                "Anima latents are 5D (B,16,1,H/8,W/8)",
+            ],
+        )
+    else:
+        require(
+            REPO / "serenitymojo/training/train_anima_ot.mojo",
+            "Repo-local Anima prepared latent mirror",
+            [
+                "context_cond",
+                "comptime S_TXT = 512",
+                "scale_latents per-channel BEFORE flow",
+                "scaled_bthwc",
+            ],
+        )
     require(
         ONETRAINER / "modules/modelSetup/BaseStableDiffusionSetup.py",
         "OneTrainer SDXL prepared latent scale",
@@ -302,28 +343,50 @@ def main() -> int:
             "height=self.quantize_resolution(sample_config.height, 64)",
         ],
     )
-    require(
-        anima_models / "AnimaModel.py",
-        "OneTrainer-anima Qwen-image VAE scaling",
-        [
-            "AutoencoderKLQwenImage",
-            "latents_mean = torch.tensor(self.vae.config.latents_mean",
-            "latents_std = 1.0 / torch.tensor(self.vae.config.latents_std",
-            "return latents / latents_std + latents_mean",
-        ],
-    )
-    require(
-        anima_samplers / "AnimaSampler.py",
-        "OneTrainer-anima decode/postprocess",
-        [
-            "VaeImageProcessor(vae_scale_factor=8)",
-            "size=(1, num_latent_channels, 1, height // vae_scale_factor, width // vae_scale_factor)",
-            "latents = self.model.unscale_latents(latent_image)",
-            "image = vae.decode(latents, return_dict=False)[0][:, :, 0]",
-            "self.image_processor.postprocess(image, output_type='pil', do_denormalize=do_denormalize)",
-            "height=self.quantize_resolution(sample_config.height, 64)",
-        ],
-    )
+    if anima_ref_available:
+        require(
+            anima_models / "AnimaModel.py",
+            "OneTrainer-anima Qwen-image VAE scaling",
+            [
+                "AutoencoderKLQwenImage",
+                "latents_mean = torch.tensor(self.vae.config.latents_mean",
+                "latents_std = 1.0 / torch.tensor(self.vae.config.latents_std",
+                "return latents / latents_std + latents_mean",
+            ],
+        )
+        require(
+            anima_samplers / "AnimaSampler.py",
+            "OneTrainer-anima decode/postprocess",
+            [
+                "VaeImageProcessor(vae_scale_factor=8)",
+                "size=(1, num_latent_channels, 1, height // vae_scale_factor, width // vae_scale_factor)",
+                "latents = self.model.unscale_latents(latent_image)",
+                "image = vae.decode(latents, return_dict=False)[0][:, :, 0]",
+                "self.image_processor.postprocess(image, output_type='pil', do_denormalize=do_denormalize)",
+                "height=self.quantize_resolution(sample_config.height, 64)",
+            ],
+        )
+    else:
+        require(
+            REPO / "serenitymojo/pipeline/anima_decode_cli.mojo",
+            "Repo-local Anima Qwen-image VAE unscale/decode mirror",
+            [
+                "wan21_image_tiled_decode does",
+                "z/inv_std + mean, matching OneTrainer AnimaModel.unscale_latents",
+                "wan21_image_tiled_decode[ANIMA_LATENT_H, ANIMA_LATENT_W]",
+                "ANIMA_LATENT_CHANNELS",
+                "ValueRange.SIGNED",
+            ],
+        )
+        require(
+            REPO / "serenitymojo/training/train_anima_ot.mojo",
+            "Repo-local Anima decode/postprocess mirror",
+            [
+                "dec.decode_wan21_keys(lat, ctx)",
+                "save_png(rgb, out_png, ctx, ValueRange.SIGNED)",
+                "VAE_FILE = \"/home/alex/.serenity/models/anima/split_files/vae/qwen_image_vae.safetensors\"",
+            ],
+        )
     require(
         models / "FluxModel.py",
         "OneTrainer Flux pack/unpack",

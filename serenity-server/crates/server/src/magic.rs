@@ -42,7 +42,10 @@ pub async fn get_llms(State(_st): State<AppState>) -> Response {
         }
     }
     out.sort_by(|a, b| {
-        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
     });
     Json(json!({ "llms": out })).into_response()
 }

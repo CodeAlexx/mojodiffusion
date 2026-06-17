@@ -51,7 +51,7 @@ from serenitymojo.models.text_encoder.qwen25vl_encoder import (
 )
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.dit.qwenimage_dit import QwenImageDitOffloaded
-from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder
+from serenitymojo.models.vae.qwenimage_tiled_decode import qwenimage_tiled_decode
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.layout import patchify, unpatchify
@@ -330,9 +330,8 @@ struct QwenImageBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[QwenCaps]]()
         self.sched = List[ArcPointer[Scheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
-        print("[qwenimage] loading VAE decoder + decode")
-        var vae = QwenImageVaeDecoder[LH, LW].load(VAE_DIR, self.ctx)
-        var img = vae.decode(latent, self.ctx)
+        print("[qwenimage] tiled VAE decode (3x3 overlap) + save")
+        var img = qwenimage_tiled_decode[LH, LW](latent, VAE_DIR, self.ctx)
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
         return png_path
 

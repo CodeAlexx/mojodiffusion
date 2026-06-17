@@ -734,7 +734,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
                 shared[nm] = ArcPointer(t^)
         var plan = build_sensenova_u1_block_plan()
         var loader = PlannedBlockLoader(
-            raw_loader^, plan^, OffloadConfig.synchronous_single()
+            raw_loader^, plan^, OffloadConfig.single_pass()
         )
         return SenseNovaU1[Self.L_TOKENS, Self.TEXT_LEN](
             SenseNovaU1Config.sensenova_u1_8b(), shared^, loader^
@@ -882,15 +882,16 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
         var k_layers = List[ArcPointer[Tensor]]()
         var v_layers = List[ArcPointer[Tensor]]()
         var total = cfg.num_layers
-        self.loader.config = OffloadConfig.synchronous_single()
-        self.loader.prefetch(0)
+        self.loader.config = OffloadConfig.single_pass()
+        self.loader.prefetch_with_ctx(0, ctx)
         for i in range(total):
-            self.loader.prefetch_next(i)
             var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
             hidden = self._und_layer(
                 handle.block, i, hidden, cos_t, sin_t, cos_t_kv, sin_t_kv, mask,
                 k_layers, v_layers, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         # final BASE norm (computed for fidelity; consumed only by think-mode).
         ref final_w = self._shared("language_model.model.norm.weight")
@@ -1069,11 +1070,11 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
 
         var hidden = _clone(image_embeds, ctx)
         var total = cfg.num_layers
-        self.loader.config = OffloadConfig.synchronous_single()
-        self.loader.prefetch(0)
+        self.loader.config = OffloadConfig.single_pass()
+        self.loader.prefetch_with_ctx(0, ctx)
         for i in range(total):
-            self.loader.prefetch_next(i)
             var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
             ref pk = cache.k_layers[i][]
             ref pv = cache.v_layers[i][]
             hidden = self._gen_layer(
@@ -1082,6 +1083,7 @@ struct SenseNovaU1[L_TOKENS: Int, TEXT_LEN: Int](Movable):
                 cos_t_kv, sin_t_kv, cos_h_kv, sin_h_kv, cos_w_kv, sin_w_kv,
                 pk, pv, ctx,
             )
+            self.loader.mark_active_block_done(ctx)
 
         # final GEN norm.
         ref final_w = self._shared("language_model.model.norm_mot_gen.weight")

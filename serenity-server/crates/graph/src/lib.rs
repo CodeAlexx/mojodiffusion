@@ -169,6 +169,10 @@ pub enum ValuePayload {
     Model { name: String },
     /// `CLIP` handle — text-encoder handle (no payload beyond identity).
     Clip,
+    /// `CLIP_VISION` handle.
+    ClipVision,
+    /// `CLIP_VISION_OUTPUT` handle.
+    ClipVisionOutput,
     /// `VAE` handle.
     Vae,
     /// `CONDITIONING` handle — carries the encoded prompt text.
@@ -191,6 +195,10 @@ pub enum ValuePayload {
         init_image: Option<String>,
         mask_image: Option<String>,
     },
+    /// `VIDEO` handle — carries an optional source/result path when one exists.
+    Video { path: String },
+    /// `AUDIO` handle — carries an optional source/result path when one exists.
+    Audio { path: String },
     /// `NOISE` handle — carries the noise seed.
     Noise { seed: i64 },
     /// `SAMPLER` handle — carries the sampler name (euler, …).
@@ -221,11 +229,15 @@ impl ValuePayload {
         match self {
             ValuePayload::Model { .. } => "MODEL",
             ValuePayload::Clip => "CLIP",
+            ValuePayload::ClipVision => "CLIP_VISION",
+            ValuePayload::ClipVisionOutput => "CLIP_VISION_OUTPUT",
             ValuePayload::Vae => "VAE",
             ValuePayload::Cond { .. } => "CONDITIONING",
             ValuePayload::Image { .. } => "IMAGE",
             ValuePayload::Mask { .. } => "MASK",
             ValuePayload::Latent { .. } => "LATENT",
+            ValuePayload::Video { .. } => "VIDEO",
+            ValuePayload::Audio { .. } => "AUDIO",
             ValuePayload::Noise { .. } => "NOISE",
             ValuePayload::Sampler { .. } => "SAMPLER",
             ValuePayload::Sigmas { .. } => "SIGMAS",
@@ -351,7 +363,12 @@ impl ValueStore {
     /// `(node_id, port)` (the Mojo "same port in both `cond_*` and `latent_*`
     /// lists" case — only ReferenceLatent). The `payload` must be a
     /// [`ValuePayload::Latent`].
-    pub fn insert_latent_geom(&mut self, node_id: i64, port: impl Into<String>, payload: ValuePayload) {
+    pub fn insert_latent_geom(
+        &mut self,
+        node_id: i64,
+        port: impl Into<String>,
+        payload: ValuePayload,
+    ) {
         self.latent_geom.insert((node_id, port.into()), payload);
     }
 
@@ -491,10 +508,7 @@ pub fn lower_request(req: &mut JsonValue) -> Result<(), GraphError> {
     // looks like an importable graph (Mojo 2919-2929). The t2i corpus always
     // wraps the graph under `workflow`, so for the no-workflow path we only
     // attempt the importer adapters and otherwise no-op.
-    let has_workflow = req
-        .get("workflow")
-        .map(|w| !w.is_null())
-        .unwrap_or(false);
+    let has_workflow = req.get("workflow").map(|w| !w.is_null()).unwrap_or(false);
 
     if !has_workflow {
         let snapshot = req.clone();
@@ -515,7 +529,9 @@ pub fn lower_request(req: &mut JsonValue) -> Result<(), GraphError> {
 
     let wf = req["workflow"].clone();
     if !wf.is_object() {
-        return Err(GraphError::unsupported("workflow graph body must be an object"));
+        return Err(GraphError::unsupported(
+            "workflow graph body must be an object",
+        ));
     }
 
     match detect_body_kind(&wf)? {
@@ -552,15 +568,15 @@ pub fn lower_request(req: &mut JsonValue) -> Result<(), GraphError> {
 fn lower_comfy_api_prompt(req: &mut JsonValue, wf: &JsonValue) -> Result<(), GraphError> {
     let graph_body = comfy_api_prompt_body(wf);
     if !import::looks_like_comfy_api_prompt_graph(&graph_body) {
-        return Err(GraphError::unsupported("unsupported Comfy API prompt graph"));
+        return Err(GraphError::unsupported(
+            "unsupported Comfy API prompt graph",
+        ));
     }
     // Mojo 1583-1584: a top-level `prompt` OBJECT is cleared so the graph fills it.
-    if req
-        .get("prompt")
-        .map(JsonValue::is_object)
-        .unwrap_or(false)
-    {
-        req.as_object_mut().unwrap().insert("prompt".to_string(), JsonValue::Null);
+    if req.get("prompt").map(JsonValue::is_object).unwrap_or(false) {
+        req.as_object_mut()
+            .unwrap()
+            .insert("prompt".to_string(), JsonValue::Null);
     }
     let typed = comfy_api_prompt_to_typed_body(&graph_body)?;
     let graph = parse_typed_graph(&typed)?;
@@ -600,13 +616,15 @@ fn lower_comfy_ui_canvas(req: &mut JsonValue, wf: &JsonValue) -> Result<(), Grap
 
 /// Flat `params`/`genparams` passthrough adapter (Mojo 2946-3006): copy a fixed
 /// allowlist of keys onto the request when missing, plus `filename_prefix` ->
-/// `workflow_save_prefix`, and record the adapter source.
+/// `workflow_save_prefix`, UI `loras` -> canonical wire `lora`, and record the
+/// adapter source.
 fn lower_flat(req: &mut JsonValue, wf: &JsonValue, key: &str, source: &str) {
     let params = wf.get(key).cloned().unwrap_or(JsonValue::Null);
     for k in FLAT_PARAM_KEYS {
         copy_flat_field(req, &params, k, k);
     }
     copy_flat_field(req, &params, "filename_prefix", "workflow_save_prefix");
+    copy_flat_field(req, &params, "loras", "lora");
     record_workflow_execution(req, source, 0, 0);
 }
 
@@ -623,13 +641,66 @@ fn copy_flat_field(req: &mut JsonValue, src: &JsonValue, src_key: &str, dst_key:
 }
 
 /// `_record_workflow_execution` (Mojo 194): stamp schema/executor/source/counts.
-pub(crate) fn record_workflow_execution(req: &mut JsonValue, source: &str, node_count: usize, edge_count: usize) {
+pub(crate) fn record_workflow_execution(
+    req: &mut JsonValue,
+    source: &str,
+    node_count: usize,
+    edge_count: usize,
+) {
+    let route = workflow_route_kind(req);
     let o = req.as_object_mut().expect("request is an object");
     o.insert("workflow_schema".to_string(), json!(WORKFLOW_SCHEMA));
-    o.insert("workflow_executor".to_string(), json!(WORKFLOW_GRAPH_EXECUTOR));
+    o.insert(
+        "workflow_executor".to_string(),
+        json!(WORKFLOW_GRAPH_EXECUTOR),
+    );
     o.insert("workflow_source".to_string(), json!(source));
     o.insert("workflow_node_count".to_string(), json!(node_count as i64));
     o.insert("workflow_edge_count".to_string(), json!(edge_count as i64));
+    o.insert("workflow_route_kind".to_string(), json!(route.clone()));
+    let plan = o
+        .entry("workflow_plan".to_string())
+        .or_insert_with(|| json!({ "terminal_nodes": [] }));
+    if let Some(plan_obj) = plan.as_object_mut() {
+        plan_obj.insert("schema".to_string(), json!("serenity.workflow_plan.v1"));
+        plan_obj.insert("route_kind".to_string(), json!(route));
+        plan_obj.insert("source".to_string(), json!(source));
+        plan_obj.insert("node_count".to_string(), json!(node_count as i64));
+        plan_obj.insert("edge_count".to_string(), json!(edge_count as i64));
+        if !plan_obj
+            .get("terminal_nodes")
+            .map(JsonValue::is_array)
+            .unwrap_or(false)
+        {
+            plan_obj.insert("terminal_nodes".to_string(), json!([]));
+        }
+    }
+}
+
+fn workflow_route_kind(req: &JsonValue) -> String {
+    if let Some(route) = req
+        .get("workflow_route_kind")
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return route.to_string();
+    }
+    if req.get("num_frames").is_some()
+        || req.get("frame_count").is_some()
+        || req.get("frame_rate").is_some()
+        || req.get("video").is_some()
+    {
+        return "video".to_string();
+    }
+    if req.get("model").is_some()
+        && (req.get("prompt").is_some()
+            || req.get("prompt_raw").is_some()
+            || req.get("prompt_json").is_some())
+        && (req.get("width").is_some() || req.get("height").is_some())
+    {
+        return "image".to_string();
+    }
+    "unknown".to_string()
 }
 
 /// Parse a raw `{nodes, edges}` workflow body into a validated [`TypedGraph`].
@@ -685,7 +756,9 @@ mod tests {
             WorkflowValue::new(
                 6,
                 "CONDITIONING",
-                ValuePayload::Cond { text: "a cat".into() },
+                ValuePayload::Cond {
+                    text: "a cat".into(),
+                },
             ),
         ];
         for v in &cases {
@@ -770,7 +843,9 @@ mod tests {
             node_id: 7,
             port: "CONDITIONING".into(),
             typ: "COND_LATENT".into(),
-            payload: ValuePayload::Cond { text: "a cat".into() },
+            payload: ValuePayload::Cond {
+                text: "a cat".into(),
+            },
         });
         // The copied geometry lives in the side-table on the SAME key.
         store.insert_latent_geom(
@@ -792,7 +867,9 @@ mod tests {
 
         // The side-table resolves the copied init_image geometry.
         match store.get_latent_geom(7, "CONDITIONING") {
-            Some(ValuePayload::Latent { init_image, width, .. }) => {
+            Some(ValuePayload::Latent {
+                init_image, width, ..
+            }) => {
                 assert_eq!(init_image.as_deref(), Some("input.png"));
                 assert_eq!(*width, 1024);
             }
@@ -875,8 +952,14 @@ mod tests {
     fn extended_named_sampler_catalog_and_gate() {
         assert_eq!(named_sampler_name("SamplerEuler"), "euler");
         assert_eq!(named_sampler_name("SamplerDPMPP_SDE"), "dpmpp_sde");
-        assert_eq!(named_sampler_name("SamplerDPMPP_2S_Ancestral"), "dpmpp_2s_ancestral");
-        assert_eq!(named_sampler_name("SamplerEulerAncestralCFGPP"), "euler_ancestral_cfg_pp");
+        assert_eq!(
+            named_sampler_name("SamplerDPMPP_2S_Ancestral"),
+            "dpmpp_2s_ancestral"
+        );
+        assert_eq!(
+            named_sampler_name("SamplerEulerAncestralCFGPP"),
+            "euler_ancestral_cfg_pp"
+        );
         assert_eq!(named_sampler_name("SamplerDPMAdaptative"), "dpm_adaptive");
         assert_eq!(named_sampler_name("SamplerER_SDE"), "er_sde");
         assert_eq!(named_sampler_name("SamplerSASolver"), "sa_solver");
@@ -947,35 +1030,33 @@ mod tests {
         assert!(err.to_string().contains("vp"), "got: {err}");
     }
 
-    /// RepeatLatentBatch multiplies the source latent batch by `amount` and
-    /// writes the result to the flat `images` key.
+    /// EmptyLatentImage batch_size lowers into route metadata. Whether a backend
+    /// can execute `images>1` is a route capability decision, not an IR parse
+    /// decision.
     #[test]
-    #[ignore = "fixture incomplete: lower_typed requires a prompt-carrying sampler (saw_prompt); the node lowering itself is verified in Rust+Mojo lockstep + the fail-loud sibling tests. TODO: complete-graph fixture helper."]
-    fn repeat_latent_batch_multiplies_images() {
+    fn empty_latent_batch_size_lowers_as_images_metadata() {
         let out = lower_typed(json!({
             "nodes": [
                 { "id": 1, "type_id": "EmptyLatentImage",
-                  "fields": { "width": 512, "height": 512, "batch_size": 2 } },
-                { "id": 2, "type_id": "RepeatLatentBatch", "fields": { "amount": 3 } }
+                  "fields": { "width": 512, "height": 512, "batch_size": 2 } }
             ],
-            "edges": [
-                { "from": { "node": 1, "port": "LATENT" },
-                  "to": { "node": 2, "port": "samples" } }
-            ]
+            "edges": []
         }))
-        .expect("RepeatLatentBatch should lower clean");
-        // 2 (source batch) * 3 (amount) = 6.
-        assert_eq!(out.get("images").and_then(|v| v.as_i64()), Some(6));
+        .expect("latent batch metadata lowers");
+        assert_eq!(out["width"], 512);
+        assert_eq!(out["height"], 512);
+        assert_eq!(out["images"], 2);
     }
 
-    /// RepeatLatentBatch whose repeated batch exceeds the cap fails loud.
+    /// RepeatLatentBatch fails loud instead of pretending serial images=N is a
+    /// Comfy latent batch.
     #[test]
-    fn repeat_latent_batch_over_cap_fails_loud() {
+    fn repeat_latent_batch_fails_loud() {
         let err = lower_typed(json!({
             "nodes": [
                 { "id": 1, "type_id": "EmptyLatentImage",
-                  "fields": { "width": 512, "height": 512, "batch_size": 16 } },
-                { "id": 2, "type_id": "RepeatLatentBatch", "fields": { "amount": 8 } }
+                  "fields": { "width": 512, "height": 512, "batch_size": 1 } },
+                { "id": 2, "type_id": "RepeatLatentBatch", "fields": { "amount": 2 } }
             ],
             "edges": [
                 { "from": { "node": 1, "port": "LATENT" },
@@ -985,6 +1066,71 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.http_status(), 501);
         assert!(err.to_string().contains("RepeatLatentBatch"), "got: {err}");
+        assert!(
+            err.to_string().contains("latent-batch execution"),
+            "got: {err}"
+        );
+    }
+
+    /// RepeatLatentBatch scalar validation still runs before the unsupported
+    /// latent-batch gate, so malformed scalar input is a 422 bad request.
+    #[test]
+    fn repeat_latent_batch_amount_over_cap_is_bad_request() {
+        let err = lower_typed(json!({
+            "nodes": [
+                { "id": 1, "type_id": "EmptyLatentImage",
+                  "fields": { "width": 512, "height": 512, "batch_size": 1 } },
+                { "id": 2, "type_id": "RepeatLatentBatch", "fields": { "amount": 65 } }
+            ],
+            "edges": [
+                { "from": { "node": 1, "port": "LATENT" },
+                  "to": { "node": 2, "port": "samples" } }
+            ]
+        }))
+        .unwrap_err();
+        assert_eq!(err.http_status(), 422);
+        assert!(
+            err.to_string().contains("'amount' out of range [1..64]"),
+            "got: {err}"
+        );
+    }
+
+    /// Refine/Upscale is a workflow-authored intent node. It lowers to the flat
+    /// disabled-surface metadata that the Rust server capability gate rejects
+    /// with workflow context, instead of being hidden or cleared by the browser.
+    #[test]
+    fn serenity_refiner_upscale_intent_lowers_to_capability_surface() {
+        let out = lower_typed(json!({
+            "nodes": [
+                { "id": 1, "type_id": "SerenityRefinerUpscaleIntent",
+                  "fields": {
+                    "enabled": true,
+                    "refiner_model": "sdxl-refiner",
+                    "refiner_method": "postapply",
+                    "refiner_steps": 12,
+                    "refiner_cfg": 5.5,
+                    "refiner_control": 0.35,
+                    "refiner_tiling": true,
+                    "upscaler_model": "4x",
+                    "upscale_by": 2.0,
+                    "hires_scale": 2.0,
+                    "hires_denoise": 0.35
+                  } }
+            ],
+            "edges": []
+        }))
+        .expect("refiner/upscale intent should lower as metadata");
+        assert_eq!(out["hires_scale"], 2.0);
+        assert_eq!(out["hires_denoise"], 0.35);
+        assert_eq!(out["refiner_model"], "sdxl-refiner");
+        assert_eq!(out["refiner_steps"], 12);
+        assert_eq!(out["refiner_cfg"], 5.5);
+        assert_eq!(out["refiner_control"], 0.35);
+        assert_eq!(out["refiner_tiling"], true);
+        assert_eq!(out["upscaler_model"], "4x");
+        assert_eq!(out["upscale_by"], 2.0);
+        assert_eq!(out["refiner"]["enabled"], true);
+        assert_eq!(out["upscaler"]["factor"], 2.0);
     }
 
     /// VAEEncodeForInpaint aliases the pixels/mask onto the inpaint flat keys.
@@ -1009,7 +1155,13 @@ mod tests {
             ]
         }))
         .expect("VAEEncodeForInpaint should lower clean");
-        assert_eq!(out.get("init_image").and_then(|v| v.as_str()), Some("src.png"));
-        assert_eq!(out.get("mask_image").and_then(|v| v.as_str()), Some("m.png"));
+        assert_eq!(
+            out.get("init_image").and_then(|v| v.as_str()),
+            Some("src.png")
+        );
+        assert_eq!(
+            out.get("mask_image").and_then(|v| v.as_str()),
+            Some("m.png")
+        );
     }
 }

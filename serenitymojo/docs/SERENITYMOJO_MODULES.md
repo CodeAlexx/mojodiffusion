@@ -38,9 +38,26 @@ Pure-Mojo localhost daemon for `/v1/generate`, `/v1/jobs`, `/v1/job/<id>`,
 `/v1/progress`, `/v1/models`, `/v1/samplers`, gallery, queue reorder/remove,
 presets/state, and typed workflow execution. Model-specific generation runs
 through pluggable backend traits and process-isolated workers where needed.
+Workflow lowering is owned by `serve/workflow_graph.mojo`; the daemon imports
+`apply_workflow_params` from that module and no longer carries a second local
+graph executor. Ideogram-4 request parsing normalizes `prompt_json` before
+generic prompt syntax handling, preserving structured JSON captions and
+`elements[*].bbox` arrays in `prompt`/`prompt_raw`.
 `/v1/video` routing stays here, but the video artifact contract implementation
 lives in `serve/video_api.mojo` to keep the daemon from growing into a single
 model-specific monolith.
+
+### `serve/workflow_graph.mojo` — bounded Comfy/Swarm graph adapter ✅ static/product gates
+Typed graph adapter/executor for supported image workflows. It accepts flat
+workflow params/genparams, bounded Comfy API prompt objects, Comfy UI visual
+canvas graphs, and linked `workflow.nodes`/`workflow.edges` bodies for the
+supported image chain, then lowers them into the existing `JobParams` product
+path. It carries MODEL/CLIP/VAE/CONDITIONING/LATENT/IMAGE plus path-backed MASK
+metadata, selected scalar values, bounded Reroute/GetNode/SetNode/Preview/Note
+utility semantics, and explicit fail-loud 501 behavior for unsupported graph
+shapes. Ideogram-4 exports may supply top-level `prompt_json`; object/array
+values are serialized with JSON `dumps` and prompt-builder subgraphs still fail
+loud unless a top-level prompt override is present.
 
 ### `serve/video_api.mojo` — bounded video artifact contract ✅
 Owns `/v1/video` readiness JSON, bounded LTX2 runner result manifests, and
@@ -234,6 +251,8 @@ memory; it describes block order, branch scheduling, dtype policy, and lookahead
 - `DTypePolicy`: preserve or force BF16.
 - `BranchSchedule`: single or CFG-paired; `branch_count()`.
 - `OffloadConfig`: slot count, lookahead, dtype policy, branch schedule.
+  Includes `single_pass()` for non-CFG paths and `synchronous_cfg_paired()` for
+  paired CFG block residency.
 - `BlockRecord`: prefix, kind, tensor/byte count hints.
 - `BlockPlan`: ordered records, normalized prefixes, count, branch visits,
   lookahead prefetch index, total hint accounting.
@@ -253,10 +272,34 @@ site uses block indices and model plans instead of raw string prefixes.
 - `count()`, `block_count()`, `branch_visits()`, `prefetch_index(i)`.
 - `pinned_bytes() -> Int` — returns 0 for the synchronous block-stream backend.
 - `prefetch(i)`, `prefetch_next(i)` — plan-indexed warmup.
+- `prefetch_with_ctx(i, ctx)`, `prefetch_next_with_ctx(i, ctx)`,
+  `mark_active_block_done(ctx)` — overlap-compatible call surface shared with
+  `TurboPlannedLoader`; synchronous backend treats the context/fence calls as
+  page-cache warmup/no-op completion markers.
 - `await_block(i, ctx) raises -> PlannedBlockHandle` — loads the planned block
   with preserve/BF16 dtype policy and records stats.
+- `snapshot_stats() -> PlannedOffloadStats` — report prefetch/load/branch/block
+  counters.
 - `planned_loader_smoke.mojo` verifies the metadata/stats path without opening
   checkpoints or loading tensors.
+
+### `offload/turbo_loader.mojo` — async double-buffer block loader ✅ source/static gated
+Packed host-block loader with two persistent GPU slabs, a copy stream, copy
+events, and compute-done slot fences. It opens safetensors once, packs matching
+block tensors into host records, dispatches one H2D copy per block into a slot,
+and returns `Block` tensors over that active slot. `open_with_copy_mode(...,
+use_default_stream_copy=True)` is measurement-only for the timed gate ablation.
+Current evidence proves source contract and parity support, not a production
+speed win.
+
+### `offload/turbo_planned_loader.mojo` — plan-aware Turbo wrapper ✅ static/parity gated
+Drop-in `PlannedBlockLoader` call-surface over `TurboBlockLoader`.
+`prefetch_with_ctx -> await_block -> prefetch_next_with_ctx ->
+mark_active_block_done` is the required hot-loop shape for overlap. It wires a
+`ResidencyManager` for block state/budget accounting, supports permanently
+pinned resident blocks for selected prefixes, and guards raw-copy use through
+`_assert_raw_copy_dtype_safe` so force-BF16 cannot silently raw-copy non-BF16
+checkpoint weights. Timed speed evidence is still open.
 
 ### `offload/turbo_slots.mojo` — two-slot turbo backend contract ✅ metadata-smoke
 Metadata-only skeleton for the future packed/pinned/async turbo backend. It
@@ -275,6 +318,30 @@ views, or VMM memory yet.
 - `turbo_slots_smoke.mojo` verifies staging, prepared promotion, non-active
   slot reuse, prefetch hits, planned pinned bytes, metadata eviction, and stale
   handle retirement.
+
+### `offload/residency.mojo` — Stagehand-style residency state ✅ smoke/static gated
+Local block residency and budget state machine: unloaded/host-staged/
+prefetching/GPU-ready/active/evicted states, per-block metadata, high/low-water
+budget tracking, prefetch-target selection, visit ordering, and eviction
+ordering. It is wired into `TurboPlannedLoader` with a large budget today; real
+memory-pressure eviction remains a future timed-product feature.
+
+### `offload/vmm_cuda.mojo`, `vmm_slab.mojo`, `vmm_manager.mojo` — local VMM substrate ✅ smoke
+Mojo-owned CUDA VMM primitive port. `vmm_cuda` owns driver FFI for allocation
+granularity, VA reserve/map/unmap/release, streams/events, and memory info.
+`VmmSlabAllocator` reserves a virtual-address slab and defines block regions
+with map/unmap/refcount/evict/destroy operations. `VmmModelHandle` maps one
+model's block sizes to slab regions, tracks populated state, resident bytes,
+refcounts, last-touch order, and explicit destroy; `VmmModelManager` registers
+handles. This internalizes the useful SFv2/Rust Turbo model-handle shape without
+calling outside repos. It is not wired as a Turbo hot-path backend yet, and no
+2.2x speed or VRAM reduction is claimed until the timed GPU gate records
+wall-clock, peak VRAM, and output parity.
+
+### `offload/telemetry.mojo` — offload event counters ⏳
+Small counters for prefetch, await, cache-hit, bytes, and elapsed fields used by
+the offload experiments. Product acceptance still requires measured runtime
+reports, not these counters alone.
 
 ---
 
@@ -621,7 +688,8 @@ the captured Rust cached-input sidecar when requested. This does not create a
 
 ### `models/dit/ernie_contract.mojo` — ERNIE-Image metadata contract ✅ header-smoke
 Header-only guard for Baidu ERNIE-Image 8B. It validates the registered
-`ernie_image` manifest, the local `/home/alex/models/ERNIE-Image` snapshot,
+`ernie_image` manifest, the local `/home/alex/.serenity/models/ernie_image`
+snapshot,
 2-shard ERNIE DiT headers, Mistral3B text encoder headers, tokenizer/scheduler
 assets, Klein VAE headers, and the fixed-shift FlowMatch schedule. It does not
 create a `DeviceContext` or load model tensors to GPU.

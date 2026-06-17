@@ -189,7 +189,7 @@
         return [c1000(y), c1000(x), c1000(y + h), c1000(x + w)];
       }
 
-      function buildCaption() {
+      function buildCaptionObject() {
         var cap = {};
         if (hld.value.trim()) cap.high_level_description = hld.value.trim();
         var sd = { aesthetics: aes.value, lighting: lig.value };
@@ -204,7 +204,11 @@
           return e;
         });
         cap.compositional_deconstruction = { background: bg.value.trim(), elements: elements };
-        return JSON.stringify(cap);  // minified, key order preserved
+        return cap;
+      }
+
+      function buildCaption() {
+        return JSON.stringify(buildCaptionObject());  // minified, key order preserved
       }
 
       // ---- bottom: generate ----
@@ -217,9 +221,13 @@
       bus.on("result:ready", function (p) { if (p && p.url) showResult(p.url); });
 
       genBtn.addEventListener("click", function () {
-        var caption = buildCaption();
+        var promptJson = buildCaptionObject();
+        var caption = JSON.stringify(promptJson);
         capPreview.textContent = caption;
         set("params.prompt", caption);
+        set("params.prompt_raw", caption);
+        set("params.prompt_json", promptJson);
+        set("params.negative", "");
         set("params.model", "ideogram4");
         // VERIFIED Ideogram-4 path (the one that renders, PSNR 29.7dB vs torch in
         // pipeline/ideogram4_generate.mojo): logit-normal schedule + dual cond/uncond
@@ -234,6 +242,20 @@
         set("params.steps", 20);
         set("params.width", parseInt(wIn.value, 10) || 1024);
         set("params.height", parseInt(hIn.value, 10) || 1024);
+        var params = {
+          model: "ideogram4",
+          prompt: caption,
+          prompt_raw: caption,
+          prompt_json: promptJson,
+          negative: "",
+          scheduler: "ideogram_logitnormal",
+          sampler: "euler",
+          cfg: 7.0,
+          cfg_override: -1,
+          steps: 20,
+          width: parseInt(wIn.value, 10) || 1024,
+          height: parseInt(hIn.value, 10) || 1024,
+        };
         genBtn.disabled = true; genBtn.textContent = "▶ …";
         api.connectWS(ctx.clientId, function (m) {
           if (!m) return;
@@ -242,7 +264,7 @@
           else if (m.type === "executing" && m.data && m.data.node === null) { genBtn.disabled = false; genBtn.textContent = "▶ Generate (Ideogram4)"; }
           else if (m.type === "execution_error") { genBtn.disabled = false; genBtn.textContent = "▶ Generate (error)"; console.error("[bboxBuilder]", m.data); }
         });
-        api.submitPrompt(null, ctx.clientId).then(function (r) { console.info("[bboxBuilder] queued", r && r.job_id); })
+        api.submitPrompt({ params: params }, ctx.clientId).then(function (r) { console.info("[bboxBuilder] queued", r && r.job_id); })
           .catch(function (e) { genBtn.disabled = false; genBtn.textContent = "▶ Generate (failed)"; console.warn(e); });
       });
 

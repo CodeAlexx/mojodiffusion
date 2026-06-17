@@ -66,6 +66,7 @@ from std.memory import ArcPointer
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.plan import BlockPlan, DTypePolicy, OffloadConfig
 from serenitymojo.offload.planned_loader import PlannedBlockHandle
+from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.ffi import BytePtr, sys_memcpy
 from serenitymojo.offload.turbo_loader import (
     TurboBlockLoader, _TensorRecord, _h2d_dma_copy,
@@ -128,13 +129,28 @@ struct TurboPlannedLoader(Movable):
         config: OffloadConfig,
         ctx: DeviceContext,
     ) raises -> TurboPlannedLoader:
+        return TurboPlannedLoader.open_with_copy_mode(dir, plan^, config, ctx, False)
+
+    @staticmethod
+    def open_with_copy_mode(
+        dir: String,
+        var plan: BlockPlan,
+        config: OffloadConfig,
+        ctx: DeviceContext,
+        use_default_stream_copy: Bool,
+    ) raises -> TurboPlannedLoader:
         """Open model directory and pre-allocate async resources.
 
         Constructs TurboBlockLoader (sizes slabs to the largest block),
         a ResidencyManager (one entry per plan block), and a BudgetTracker
         with a generously large limit so no eviction occurs in Phase 3.
+
+        `use_default_stream_copy=True` is a measurement-only ablation for the
+        P0 timed gate; production callers should use `open`.
         """
-        var turbo = TurboBlockLoader.open(dir, ctx)
+        var turbo = TurboBlockLoader.open_with_copy_mode(
+            dir, ctx, use_default_stream_copy
+        )
         # Generous budget: 128 GB virtual limit — no eviction pressure in P3.
         var budget = BudgetTracker(
             128 * 1024 * 1024 * 1024,  # high watermark: 128 GB
@@ -190,6 +206,7 @@ struct TurboPlannedLoader(Movable):
         )
         ctx.synchronize()
         for i in range(self._plan.count()):
+            self._assert_raw_copy_dtype_safe(i)
             var p = self._plan.normalized_prefix(i)
             if self._resident_slot(p) >= 0:
                 continue
@@ -255,6 +272,9 @@ struct TurboPlannedLoader(Movable):
     def branch_visits(self) -> Int:
         return self._plan.branch_visits(self._config)
 
+    def set_config(mut self, config: OffloadConfig):
+        self._config = config
+
     def prefetch_index(self, index: Int) -> Int:
         return self._plan.prefetch_index(index, self._config)
 
@@ -293,6 +313,7 @@ struct TurboPlannedLoader(Movable):
         """Stage block at plan index `index` immediately on the copy stream."""
         if index < 0 or index >= self._plan.count():
             return
+        self._assert_raw_copy_dtype_safe(index)
         if self._resident_slot(self._plan.normalized_prefix(index)) >= 0:
             return  # permanently on device — nothing to stage
         self._advance_residency_to_prefetching(index)
@@ -348,21 +369,14 @@ struct TurboPlannedLoader(Movable):
           3. Advance residency to GPU_READY, acquire/release refcount.
           4. Wrap Block in PlannedBlockHandle — same handle type Klein uses.
 
-        DTYPE SAFETY: Klein9B weights are BF16 on disk. Raw turbo copy (no
-        dtype conversion) produces byte-identical blocks to the sync path.
-        The guard below raises loudly if force_bf16 is set on a loader whose
-        checkpoint stores non-BF16 weights, preventing silent corruption.
+        DTYPE SAFETY: raw turbo copy does not convert bytes. If force_bf16 is
+        active, the block must already be BF16 on disk; otherwise synchronous
+        PlannedBlockLoader.load_block_as_bf16 or a future converting Turbo
+        staging path is required.
         """
-        # DTYPE GUARD: documented in module header. Klein9B: safe (BF16 on disk).
-        # For future models with force_bf16 + non-BF16 on-disk weights, this
-        # guard catches the misconfiguration rather than silently corrupting.
-        if self._config.dtype_policy == DTypePolicy.force_bf16():
-            # Phase 3 assertion: caller is responsible for ensuring on-disk
-            # dtype matches BF16. See module header for extension guidance.
-            pass  # Klein9B: BF16 on disk confirmed — raw copy is correct.
-
         var prefix = self._plan.prefix(index)
         var load_prefix = self._plan.normalized_prefix(index)
+        self._assert_raw_copy_dtype_safe(index)
 
         # ── resident fast path: no copy, no slot, no fence ───────────────────
         var rslot = self._resident_slot(load_prefix)
@@ -406,3 +420,28 @@ struct TurboPlannedLoader(Movable):
         self._residency.release(index)
 
         return PlannedBlockHandle(index, prefix, block^)
+
+    def _assert_raw_copy_dtype_safe(self, index: Int) raises:
+        """Fail before raw Turbo H2D copy would reinterpret non-BF16 bytes.
+
+        PlannedBlockLoader can honor force_bf16 by converting each tensor before
+        H2D. TurboBlockLoader intentionally copies packed block bytes as-is, so
+        force_bf16 is safe only when the checkpoint tensors are already BF16.
+        """
+        if self._config.dtype_policy != DTypePolicy.force_bf16():
+            return
+        if index < 0 or index >= self._plan.count():
+            return
+        var load_prefix = self._plan.normalized_prefix(index)
+        for ref nm in self._turbo.sharded.names():
+            if nm.startswith(load_prefix):
+                var tv = self._turbo.sharded.tensor_view(nm)
+                if tv.dtype != STDtype.BF16:
+                    raise Error(
+                        String("TurboPlannedLoader: force_bf16 requires BF16 ")
+                        + String("on-disk tensors for raw Turbo copy; ")
+                        + nm + String(" is ") + tv.dtype.name()
+                        + String(" in block ") + load_prefix
+                        + String(". Use PlannedBlockLoader.load_block_as_bf16 ")
+                        + String("or add a converting Turbo staging path.")
+                    )

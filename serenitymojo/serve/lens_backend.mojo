@@ -23,20 +23,14 @@
 # UNCERTAINTIES / DEVIATIONS / RISKS — read before trusting this backend
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# (A) encode_is_real = TRUE, but the GPT-OSS ENCODER ITSELF IS UNVERIFIED + has a
-#     KNOWN OPEN RUNTIME BUG. models/text_encoder/gpt_oss_encoder.mojo compiles
-#     and links, but its PARITY GATE (parity/PARITY_GATE_GPTOSS_2026-06-03.md) is
-#     BLOCKED: it never produced a single Mojo number because layer-0 MoE aborts
-#     with `gated_scatter_add: expert_out and accum must be F32` — `_moe` passes a
-#     BF16 `down_out` (line ~952) into gated_scatter_add, which hard-requires F32.
-#     The fix is ONE line in gpt_oss_encoder.mojo (`down_out = cast_tensor(down_out,
-#     STDtype.F32, ctx)` before the scatter) but that file is OUTSIDE this model's
-#     two NEW files, so I did NOT touch it. CONSEQUENCE: this backend's _encode()
-#     WILL RAISE at runtime (caught → StepResult.failed, fail-loud) until that
-#     one-line F32 cast lands in gpt_oss_encoder._moe. No silent fallback, no
-#     zeroed text — the real encoder runs or the job fails. After the cast lands,
-#     the encoder is still PARITY-UNVERIFIED vs the HF oracle; a green parity gate
-#     is required before trusting the pixels.
+# (A) encode_is_real = TRUE, but the GPT-OSS ENCODER ITSELF IS STILL
+#     PARITY-UNVERIFIED. The earlier layer-0 MoE abort caused by feeding BF16
+#     `down_out` directly into gated_scatter_add has been fixed in
+#     models/text_encoder/gpt_oss_encoder.mojo by casting that expert output to
+#     F32 for the internal scatter accumulation while keeping the layer boundary
+#     BF16. No silent fallback, no zeroed text: the real encoder runs or the job
+#     fails. A green GPT-OSS parity gate is still required before trusting Lens
+#     pixels as production quality.
 #
 # (B) TEXT-SEQUENCE-LENGTH DEVIATION from the reference (lens_infer.rs). The
 #     reference uses max_text_len=512, trims DEFAULT_TXT_OFFSET=97, and feeds the
@@ -312,9 +306,8 @@ def _build_text_cond_from_captures(
 
 # ── real GPT-OSS encode of ONE prompt → [1, N_TXT, DIM] text conditioning ─────
 # render chat → tokenize → GptOssEncoder.encode([5,11,17,23]) → offset-trim 97 →
-# fit to N_TXT → build_text_cond. This is the REAL encode (UNCERTAINTY (A): the
-# encoder has an open F32-cast bug and is parity-unverified; this WILL raise until
-# that one-line fix lands in gpt_oss_encoder._moe).
+# fit to N_TXT → build_text_cond. This is the REAL encode. GPT-OSS now has the
+# internal F32 scatter cast, but parity remains unaccepted.
 def _encode_one_prompt(
     resident: LensResident,
     tok: Qwen3Tokenizer,
@@ -469,9 +462,10 @@ struct LensBackend(GenBackend, Movable):
         weights (txt_norm/txt_in) — loaded here first if not yet resident, since
         the resident set is cheap (~tens of MB) vs the encoder + DiT.
 
-        UNCERTAINTY (A): GptOssEncoder._moe has an open BF16→F32 cast bug; this
-        WILL raise until that one-line fix lands. The raise propagates to step()'s
-        except → StepResult.failed (fail-loud, no zeroed-text fallback)."""
+        UNCERTAINTY (A): GptOssEncoder._moe now casts expert down projections to
+        F32 for gated scatter accumulation, but GPT-OSS parity is still
+        unaccepted. Any runtime failure still propagates to step()'s except →
+        StepResult.failed (fail-loud, no zeroed-text fallback)."""
         if not self.loaded:
             self._load_model()  # resident weights + RoPE tables (needed by encode)
         _print_vram("before GPT-OSS encode")

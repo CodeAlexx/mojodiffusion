@@ -39,7 +39,6 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.telemetry import OffloadTelemetry
 
-comptime TURBO_USE_DEFAULT_STREAM_COPY = False
 comptime TURBO_USE_CUDA_DMA_COPY = True
 # True since 2026-06-11 (beat-flame session 2): with False, EVERY streamed-block
 # visit does a synchronous ~580 MB host memcpy (mmap → pinned slab, turbo_loader
@@ -102,6 +101,22 @@ def _h2d_dma_copy(
     var cuda_stream = CUDA(stream)
     var rc = Int(_cu_memcpy_htod_async(
         dst_device_ptr, src_host_ptr, nbytes, cuda_stream,
+    ))
+    if rc != 0:
+        raise Error(
+            String("TurboBlockLoader: cuMemcpyHtoDAsync_v2 failed rc=")
+            + String(rc)
+        )
+
+
+def _h2d_dma_copy_raw_stream(
+    dst_device_ptr: UInt64,
+    src_host_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    nbytes: Int,
+    stream: CUstream,
+) raises:
+    var rc = Int(_cu_memcpy_htod_async(
+        dst_device_ptr, src_host_ptr, nbytes, stream,
     ))
     if rc != 0:
         raise Error(
@@ -202,13 +217,25 @@ struct TurboBlockLoader(Movable):
 
     var slab_capacity: Int  # max block bytes; both slabs are this size
     var telemetry: OffloadTelemetry
+    var use_default_stream_copy: Bool
 
     @staticmethod
     def open(dir: String, ctx: DeviceContext) raises -> TurboBlockLoader:
+        return TurboBlockLoader.open_with_copy_mode(dir, ctx, False)
+
+    @staticmethod
+    def open_with_copy_mode(
+        dir: String, ctx: DeviceContext, use_default_stream_copy: Bool
+    ) raises -> TurboBlockLoader:
         """Open the model directory and pre-allocate two-slot async resources.
 
         Scans all tensor names to measure max block byte count, then allocates
-        two pinned host + device slab pairs sized to that maximum."""
+        two pinned host + device slab pairs sized to that maximum.
+
+        `use_default_stream_copy=True` is a measurement-only ablation: it forces
+        H2D staging through the default stream so a timed gate can compare it
+        against the production copy-stream path without editing this file.
+        """
         var sharded = ShardedSafeTensors.open(dir)
 
         # Pass 1: compute max bytes across all blocks.
@@ -307,6 +334,7 @@ struct TurboBlockLoader(Movable):
             prefixes^, index_starts^, index_lengths^, index_names^,
             store_offsets^, store_nbytes^,
             max_bytes,
+            use_default_stream_copy,
         )
 
     def __init__(
@@ -329,6 +357,7 @@ struct TurboBlockLoader(Movable):
         var store_offsets: List[Int],
         var store_nbytes: List[Int],
         slab_capacity: Int,
+        use_default_stream_copy: Bool,
     ):
         self.sharded = sharded^
         self.host0 = host0^
@@ -360,6 +389,7 @@ struct TurboBlockLoader(Movable):
         self.active_slot = 0
         self.slab_capacity = slab_capacity
         self.telemetry = OffloadTelemetry(String("TurboBlockLoader"))
+        self.use_default_stream_copy = use_default_stream_copy
 
     def _norm(self, prefix: String) -> String:
         """Normalize block prefix to dot-terminated form (mirrors BlockLoader)."""
@@ -460,12 +490,13 @@ struct TurboBlockLoader(Movable):
             self.compute_recorded1 = False
 
         if slot == 0:
-            comptime if TURBO_USE_DEFAULT_STREAM_COPY:
-                var src_sub = self.block_store.create_sub_buffer[DType.uint8](
-                    self.store_offsets[prefix_idx], n_bytes
+            if self.use_default_stream_copy:
+                _h2d_dma_copy_raw_stream(
+                    UInt64(Int(self.dev0.unsafe_ptr())),
+                    src_ptr,
+                    n_bytes,
+                    CUDA(ctx.stream()),
                 )
-                var dst_sub = self.dev0.create_sub_buffer[DType.uint8](0, n_bytes)
-                ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
                 ctx.stream().record_event(self.ev0)
             else:
                 comptime if TURBO_USE_CUDA_DMA_COPY:
@@ -497,12 +528,13 @@ struct TurboBlockLoader(Movable):
             self.used0 = offset
             self.recs0 = new_recs^
         else:
-            comptime if TURBO_USE_DEFAULT_STREAM_COPY:
-                var src_sub = self.block_store.create_sub_buffer[DType.uint8](
-                    self.store_offsets[prefix_idx], n_bytes
+            if self.use_default_stream_copy:
+                _h2d_dma_copy_raw_stream(
+                    UInt64(Int(self.dev1.unsafe_ptr())),
+                    src_ptr,
+                    n_bytes,
+                    CUDA(ctx.stream()),
                 )
-                var dst_sub = self.dev1.create_sub_buffer[DType.uint8](0, n_bytes)
-                ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
                 ctx.stream().record_event(self.ev1)
             else:
                 comptime if TURBO_USE_CUDA_DMA_COPY:
@@ -624,7 +656,12 @@ struct TurboBlockLoader(Movable):
             self.compute_recorded1 = True
 
     def async_enabled(self) -> Bool:
-        return True
+        return not self.use_default_stream_copy
+
+    def copy_mode(self) -> String:
+        if self.use_default_stream_copy:
+            return String("default_stream")
+        return String("copy_stream")
 
     def slab_bytes(self) -> Int:
         """Total bytes allocated across both slots (pinned host + device each)."""

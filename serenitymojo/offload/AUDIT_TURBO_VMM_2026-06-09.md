@@ -10,24 +10,49 @@ confirmed on-GPU before being treated as fact (Tenet 4).
 
 ---
 
+## 2026-06-16 update - adoption and parity
+
+This audit is a historical read-only snapshot. In the current tree, Findings 1
+and 2 have been structurally addressed for the planned-loader inference/model
+loops:
+
+- `Klein9BOffloaded`, `Klein9BOffloadedTurbo`, HiDream, QwenImage, SenseNova,
+  and Lance now use `prefetch_with_ctx -> await_block -> prefetch_next_with_ctx
+  -> block math -> mark_active_block_done`.
+- `scripts/check_planned_loader_overlap_contract.py` passes and rejects legacy
+  `.prefetch(` / `.prefetch_next(` use under model/pipeline/sampling/training
+  roots.
+- `klein_turbo_parity_smoke` passed on GPU: all 32 blocks, `cosine=1.0`,
+  `max_abs_diff=0.0`, byte-exact sync-vs-turbo output.
+- `vmm_manager.mojo` and `vmm_manager_smoke.mojo` now internalize the model/block
+  VMM handle layer in Mojodiffusion. The smoke passed on GPU and proved local
+  region ownership, refcount, populated-state clearing on eviction, and explicit
+  destroy. It is not wired into `TurboBlockLoader` yet.
+
+Do not read the older Finding 1/2 text below as current code state. The open
+production gap is still timing and memory measurement: no copy-stream versus
+default-stream wall-clock or peak-VRAM comparison has been recorded, so this is
+not yet evidence for a speedup. Outside SFv2/Rust trees are lineage only; future
+runtime gates should use Mojodiffusion-owned files.
+
+---
+
 ## 1. Inventory — what exists in `serenitymojo/offload/`
 
 | Component | File | Status (structural) |
 |---|---|---|
 | CUDA VMM driver FFI (`cuMemAddressReserve/Create/Map/SetAccess`, events) | `vmm_cuda.mojo` | Complete FFI surface. |
-| VMM slab allocator (reserve VA, define regions, `ensure_resident`/refcount/`evict`/`destroy`) | `vmm_slab.mojo` | Implemented. **Wired into nothing** — no `VmmSlabAllocator` reference outside `vmm_slab*` (grep). |
+| VMM slab allocator (reserve VA, define regions, `ensure_resident`/refcount/`evict`/`destroy`) | `vmm_slab.mojo` | Implemented and used by `vmm_manager.mojo`; not yet wired into `TurboBlockLoader`. |
+| VMM model/block owner | `vmm_manager.mojo` | Implemented: block regions, populated state, resident bytes, refcounts, release/evict/destroy. |
 | Async double-buffer weight loader | `turbo_loader.mojo` (`TurboBlockLoader`) | Implemented: 2 pinned-host + 2 device slabs, `cuMemcpyHtoDAsync_v2` on an explicit copy stream, H2D-done + compute-done events. |
 | Plan-aware async wrapper | `turbo_planned_loader.mojo` (`TurboPlannedLoader`) | Implemented; exposes both the legacy `prefetch`/`prefetch_next` (no ctx) and the fixed `prefetch_with_ctx`/`prefetch_next_with_ctx` + `mark_active_block_done`. |
 | Synchronous backend | `block_loader.mojo` | Baseline. |
 | Residency / budget / eviction | `residency.mojo`, `plan.mojo` | Wired but **idle** on the turbo path: budget set to 128 GB hi / 64 GB lo so `can_prefetch()` is always true and no eviction runs (`turbo_planned_loader.mojo:127-130`). |
 
-**Adoption split (grep, this session):**
-- The fixed overlap contract (`prefetch_with_ctx` + `mark_active_block_done`) is
-  adopted by the **training** stacks: `chroma/qwenimage/sd35/flux/klein/wan22/ltx2
-  _stack_lora.mojo`.
-- The Klein **inference** path (`Klein9BOffloadedTurbo`, `klein_dit.mojo`, driven by
-  `klein9b_pipeline_multistep_turbo.mojo:149,172`) does **not** call either — it uses
-  the legacy pattern only.
+**Historical adoption split from the original audit:** training stacks had the
+fixed overlap contract, while Klein inference still used the legacy no-context
+prefetch pattern. This is no longer current as of the 2026-06-16 update above.
+Use `scripts/check_planned_loader_overlap_contract.py` for current enforcement.
 
 ---
 
@@ -107,13 +132,14 @@ the fix in Finding 1 without also adding the fence). Must be verified on-GPU.
 ## 4. FINDING 3 — the VMM slab allocator is parked (dead code)
 
 `vmm_cuda.mojo` + `vmm_slab.mojo` implement a real reserved-VA slab with on-demand
-physical mapping, refcount, and eviction. **Nothing references `VmmSlabAllocator`**
-outside its own smoke (grep empty). The design doc’s backend progression ends at a
+physical mapping, refcount, and eviction. As of 2026-06-16, `vmm_manager.mojo`
+adds a local model/block owner over the slab and `vmm_manager_smoke.mojo` proves
+the primitive on GPU. The design doc’s backend progression still ends at a
 `TurboVmmBackend` (“reserved virtual address slab + smaller physical pool +
 event-gated slot reuse”, `docs/FULL_PORT_OFFLOAD_TURBO_2026-05-27.md:196-217,
-292-310`), but `turbo_loader` instead uses two **fixed, full-size** device slabs
-(`:279-282`). So the VMM layer is built but never became a `TurboBlockLoader`
-backend.
+292-310`), but `turbo_loader` still uses two **fixed, full-size** device slabs
+(`:279-282`). So the VMM layer now has a local handle API, but it has not become
+a `TurboBlockLoader` backend.
 
 Note: for a strict *double-buffer* loader, VMM would not reduce device VRAM below
 ~`2 × max_block_bytes` anyway — the VMM payoff is a *residency cache* (many blocks

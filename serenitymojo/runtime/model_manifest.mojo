@@ -91,10 +91,7 @@ struct ModelManifest(Movable):
 
 
 def zimage_default_manifest() -> ModelManifest:
-    var zroot = String(
-        "/home/alex/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image/"
-        "snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021"
-    )
+    var zroot = String("/home/alex/.serenity/models/zimage_base")
     return ModelManifest(
         String("zimage"),
         ModelFamily.text_to_image(),
@@ -273,7 +270,7 @@ def lance_t2v_default_manifest() -> ModelManifest:
         String("/home/alex/.serenity/models/lance/Lance_3B_Video/tokenizer.json"),
         String("/home/alex/.serenity/models/lance/Lance_3B_Video"),
         String("/home/alex/.serenity/models/lance/Lance_3B_Video/model.safetensors"),
-        String("/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors"),
+        String("/home/alex/.serenity/models/vaes/wan2.2_vae.safetensors"),
         256,
         256,
         9,
@@ -319,10 +316,10 @@ def sdxl_default_manifest() -> ModelManifest:
         ModelFamily.text_to_image(),
         String("sdxl-base-1024-bf16"),
         String("sdxl_1024"),
-        String("/home/alex/EriDiffusion/Models"),
+        String("/home/alex/.serenity/models"),
         String("/home/alex/.serenity/models/text_encoders/clip_l.tokenizer.json"),
         String("/home/alex/.serenity/models/text_encoders"),
-        String("/home/alex/EriDiffusion/Models/checkpoints/sdxl_unet_bf16.safetensors"),
+        String("/home/alex/.serenity/models/checkpoints/sdxl_unet_bf16.safetensors"),
         String("/home/alex/.serenity/models/vaes/OfficialStableDiffusion/sdxl_vae.safetensors"),
         1024,
         1024,
@@ -421,7 +418,7 @@ def sensenova_u1_default_manifest() -> ModelManifest:
 
 
 def hidream_o1_dev_default_manifest() -> ModelManifest:
-    var root = String("/home/alex/HiDream-O1-Image-Dev-weights")
+    var root = String("/home/alex/.serenity/models/hidream_o1_dev")
     return ModelManifest(
         String("hidream_o1"),
         ModelFamily.text_to_image(),
@@ -527,7 +524,7 @@ def zimage_l2p_default_manifest() -> ModelManifest:
 
 
 def ernie_image_default_manifest() -> ModelManifest:
-    var root = String("/home/alex/models/ERNIE-Image")
+    var root = String("/home/alex/.serenity/models/ernie_image")
     return ModelManifest(
         String("ernie_image"),
         ModelFamily.text_to_image(),

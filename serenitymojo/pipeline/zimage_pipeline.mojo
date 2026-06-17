@@ -42,10 +42,7 @@ def _cast(t: Tensor, dt: STDtype, ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(hh, t.shape(), dt, ctx)
 
 # ── shared verified checkpoint (DiT + VAE parity used this exact snapshot) ──
-comptime ZROOT = (
-    "/home/alex/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image/"
-    "snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021"
-)
+comptime ZROOT = "/home/alex/.serenity/models/zimage_base"
 comptime TRANSFORMER = ZROOT + "/transformer"
 comptime TEXT_ENCODER = ZROOT + "/text_encoder"
 comptime VAE_DIR = ZROOT + "/vae"

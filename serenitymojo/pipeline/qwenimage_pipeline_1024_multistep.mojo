@@ -27,7 +27,7 @@ from serenitymojo.models.text_encoder.qwen25vl_encoder import (
     Qwen25VLConfig,
 )
 from serenitymojo.models.dit.qwenimage_dit import QwenImageDitOffloaded
-from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder
+from serenitymojo.models.vae.qwenimage_tiled_decode import qwenimage_tiled_decode
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.layout import patchify, unpatchify
@@ -234,11 +234,10 @@ def main() raises:
     print("=== Qwen-Image 512x512 multistep runner ===")
     var caps = encode_captions(ctx)
     var tokens = denoise(caps, ctx)
-    print("[vae] unpack + decode")
+    print("[vae] unpack + tiled decode")
     var latent = unpatchify(tokens, 16, LH, LW, PATCH, ctx)
     latent = cast_tensor(latent, STDtype.BF16, ctx)
-    var vae = QwenImageVaeDecoder[LH, LW].load(VAE_DIR, ctx)
-    var img = vae.decode(latent, ctx)
+    var img = qwenimage_tiled_decode[LH, LW](latent, VAE_DIR, ctx)
     var sh = img.shape()
     print("  image shape:", sh[0], sh[1], sh[2], sh[3])
     _stats("image", img, ctx)

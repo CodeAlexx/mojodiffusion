@@ -43,7 +43,11 @@ fn runner_available() -> bool {
 
 fn readiness_doc() -> Value {
     let ready = runner_available();
-    let state = if ready { "bounded_smoke_ready" } else { "runner_missing" };
+    let state = if ready {
+        "bounded_smoke_ready"
+    } else {
+        "runner_missing"
+    };
     let runners = json!([
         {
             "model": "lance_t2v",
@@ -92,33 +96,56 @@ pub async fn get_video() -> Response {
 
 /// POST /v1/video — bounded LTX2 staged smoke (requires the runner to be built).
 pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
-    let b: Value = serde_json::from_str::<Value>(&body).ok().filter(|v| v.is_object()).unwrap_or_else(|| json!({}));
+    let b: Value = serde_json::from_str::<Value>(&body)
+        .ok()
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}));
     let s = |k: &str, d: &str| b.get(k).and_then(|v| v.as_str()).unwrap_or(d).to_string();
     let runner = s("runner", "ltx2_staged_dev_smoke");
     if runner != "ltx2_staged_dev_smoke" {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("unsupported video runner '{runner}'; supported runner is ltx2_staged_dev_smoke"));
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!(
+                "unsupported video runner '{runner}'; supported runner is ltx2_staged_dev_smoke"
+            ),
+        );
     }
     let steps = b.get("steps").and_then(|v| v.as_i64()).unwrap_or(1);
     if !(1..=3).contains(&steps) {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "'steps' out of range [1..3]");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "'steps' out of range [1..3]",
+        );
     }
     let weight_mode = s("weight_mode", "resident");
     if weight_mode != "resident" && weight_mode != "stream" {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("unsupported weight_mode '{weight_mode}'; use resident or stream"));
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("unsupported weight_mode '{weight_mode}'; use resident or stream"),
+        );
     }
     let mut audio_mode = s("audio_mode", "noaudio");
     if audio_mode == "video" {
         audio_mode = "noaudio".to_string();
     }
     if audio_mode != "audio" && audio_mode != "noaudio" {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("unsupported audio_mode '{audio_mode}'; use audio or noaudio"));
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("unsupported audio_mode '{audio_mode}'; use audio or noaudio"),
+        );
     }
     if !runner_available() {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("missing executable {RUNNER}; run `pixi run build-video-smoke` first"));
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("missing executable {RUNNER}; run `pixi run build-video-smoke` first"),
+        );
     }
     // Runner present: run the bounded staged smoke (timing is non-deterministic, so
     // this path is not byte-verifiable). video_id from the shared counter.
-    let n = st.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let n = st
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
     let video_id = format!("video-{n:04}");
     let out_dir = st.out_dir.join(&video_id);
     let _ = std::fs::create_dir_all(&out_dir);
@@ -131,7 +158,15 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     let log_path = out_dir.join("ltx2_video_runner.log");
     let t0 = std::time::Instant::now();
     let rc = std::process::Command::new(RUNNER)
-        .args(["staged", "lora", &weight_mode, &audio_mode, "nonag", &out_dir.to_string_lossy(), &steps.to_string()])
+        .args([
+            "staged",
+            "lora",
+            &weight_mode,
+            &audio_mode,
+            "nonag",
+            &out_dir.to_string_lossy(),
+            &steps.to_string(),
+        ])
         .output()
         .map(|o| o.status.code().unwrap_or(-1))
         .unwrap_or(-1);
@@ -154,7 +189,10 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
     if rc != 0 {
         if let Some(m) = o.as_object_mut() {
             m.insert("state".into(), json!("failed"));
-            m.insert("error".into(), json!("LTX2 staged smoke runner failed; inspect log_path"));
+            m.insert(
+                "error".into(),
+                json!("LTX2 staged smoke runner failed; inspect log_path"),
+            );
         }
         return json_resp(StatusCode::INTERNAL_SERVER_ERROR, &o);
     }
@@ -164,7 +202,10 @@ pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
 fn fps_from_rate(rate: &str) -> f64 {
     // "num/den"
     if let Some((n, d)) = rate.split_once('/') {
-        let (n, d) = (n.parse::<f64>().unwrap_or(0.0), d.parse::<f64>().unwrap_or(0.0));
+        let (n, d) = (
+            n.parse::<f64>().unwrap_or(0.0),
+            d.parse::<f64>().unwrap_or(0.0),
+        );
         if d != 0.0 {
             return n / d;
         }
@@ -176,13 +217,27 @@ fn fps_from_rate(rate: &str) -> f64 {
 pub async fn get_video_probe(Query(q): Query<HashMap<String, String>>) -> Response {
     let mp4 = q.get("path").cloned().unwrap_or_default();
     if mp4.is_empty() {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "'path' query parameter is required");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "'path' query parameter is required",
+        );
     }
     if mp4.contains('\n') || mp4.contains('\r') {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot probe MP4: invalid video path");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot probe MP4: invalid video path",
+        );
     }
-    if std::process::Command::new("sh").args(["-c", "command -v ffprobe >/dev/null 2>&1"]).status().map(|s| !s.success()).unwrap_or(true) {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot probe MP4: ffprobe is not available on PATH");
+    if std::process::Command::new("sh")
+        .args(["-c", "command -v ffprobe >/dev/null 2>&1"])
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot probe MP4: ffprobe is not available on PATH",
+        );
     }
     let out = std::process::Command::new("ffprobe")
         .args([
@@ -193,13 +248,42 @@ pub async fn get_video_probe(Query(q): Query<HashMap<String, String>>) -> Respon
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o.stdout,
-        Ok(o) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("cannot probe MP4: {}", String::from_utf8_lossy(&o.stderr).trim())),
-        Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("cannot probe MP4: {e}")),
+        Ok(o) => {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "cannot probe MP4: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            )
+        }
+        Err(e) => {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("cannot probe MP4: {e}"),
+            )
+        }
     };
     let probe: Value = serde_json::from_slice(&out).unwrap_or_else(|_| json!({}));
     let fstr = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let ffloat = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| x.as_f64())).unwrap_or(0.0);
-    let fint = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64())).unwrap_or(0);
+    let ffloat = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(|x| {
+                x.as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| x.as_f64())
+            })
+            .unwrap_or(0.0)
+    };
+    let fint = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(|x| {
+                x.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| x.as_i64())
+            })
+            .unwrap_or(0)
+    };
     let (mut fmt_dur, mut fmt_name) = (0.0, String::new());
     if let Some(f) = probe.get("format") {
         fmt_dur = ffloat(f, "duration");
@@ -215,20 +299,31 @@ pub async fn get_video_probe(Query(q): Query<HashMap<String, String>>) -> Respon
             match fstr(s, "codec_type").as_str() {
                 "video" if !has_video => {
                     has_video = true;
-                    w = fint(s, "width"); h = fint(s, "height"); vcodec = fstr(s, "codec_name");
-                    dur = ffloat(s, "duration"); fps = fps_from_rate(&fstr(s, "avg_frame_rate"));
+                    w = fint(s, "width");
+                    h = fint(s, "height");
+                    vcodec = fstr(s, "codec_name");
+                    dur = ffloat(s, "duration");
+                    fps = fps_from_rate(&fstr(s, "avg_frame_rate"));
                     frames = fint(s, "nb_read_frames");
-                    if frames <= 0 { frames = fint(s, "nb_frames"); }
-                    if frames <= 0 && dur > 0.0 && fps > 0.0 { frames = (dur * fps + 0.5) as i64; }
+                    if frames <= 0 {
+                        frames = fint(s, "nb_frames");
+                    }
+                    if frames <= 0 && dur > 0.0 && fps > 0.0 {
+                        frames = (dur * fps + 0.5) as i64;
+                    }
                 }
                 "audio" if !has_audio => {
-                    has_audio = true; acodec = fstr(s, "codec_name"); adur = ffloat(s, "duration");
+                    has_audio = true;
+                    acodec = fstr(s, "codec_name");
+                    adur = ffloat(s, "duration");
                 }
                 _ => {}
             }
         }
     }
-    if dur <= 0.0 { dur = fmt_dur; }
+    if dur <= 0.0 {
+        dur = fmt_dur;
+    }
     let doc = json!({
         "schema": "serenity.video_probe.v1", "mp4": mp4, "format_name": fmt_name,
         "stream_count": stream_count, "has_video": has_video, "has_audio": has_audio, "audio": has_audio,

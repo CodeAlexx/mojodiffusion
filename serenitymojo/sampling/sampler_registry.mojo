@@ -66,6 +66,8 @@ def _backend_key(backend_name: String) -> String:
         return String("sd3")
     if b == "flux2" or b == "flux-2" or b.find("klein") >= 0 or b.find("flux2") >= 0 or b.find("flux-2") >= 0:
         return String("flux2")
+    if b == "flux" or b == "flux1" or b == "flux-1" or b == "flux_1" or b.find("flux") >= 0:
+        return String("flux")
     if b == "qwen" or b == "qwenimage" or b.find("qwen") >= 0:
         return String("qwenimage")
     if b == "ideogram" or b == "ideogram4" or b.find("ideogram") >= 0:
@@ -104,10 +106,8 @@ def sampler_backend_for_model(model_name: String, default_backend: String) -> St
         or m.find("z-image-l2p") >= 0
         or m.find("z_image_l2p") >= 0
         or m.find("l2p") >= 0
-        or m.find("flux1") >= 0
-        or m.find("flux-1") >= 0
-        or m.find("flux_1") >= 0
         or m.find("ltx") >= 0
+        or m.find("qwen") >= 0
     ):
         return String("disabled")
     if m.find("ideogram") >= 0:
@@ -122,8 +122,8 @@ def sampler_backend_for_model(model_name: String, default_backend: String) -> St
         return String("disabled")
     if m.find("klein") >= 0 or m.find("flux2") >= 0 or m.find("flux-2") >= 0:
         return String("flux2")
-    if m.find("qwen") >= 0:
-        return String("qwenimage")
+    if m.find("flux") >= 0:
+        return String("flux")
     if m.find("zimage") >= 0 or m.find("z-image") >= 0 or m.find("z_image") >= 0:
         return String("zimage")
     if m == "" or m == "dispatch" or m == "isolated":
@@ -141,6 +141,10 @@ def default_generation_model(default_backend: String) -> String:
         return String("sdxl")
     if b == "anima":
         return String("anima")
+    if b == "sd3":
+        return String("sd3.5-large")
+    if b == "flux":
+        return String("flux-dev")
     if b == "zimage":
         return String("zimage_base")
     return default_backend
@@ -148,7 +152,7 @@ def default_generation_model(default_backend: String) -> String:
 
 def default_sampler_for_backend(backend_name: String) -> String:
     var b = _backend_key(backend_name)
-    if b == "zimage" or b == "qwenimage" or b == "ideogram4" or b == "sdxl" or b == "anima" or b == "sd3" or b == "disabled":
+    if b == "zimage" or b == "qwenimage" or b == "ideogram4" or b == "sdxl" or b == "anima" or b == "sd3" or b == "flux" or b == "disabled":
         return String("euler")
     return String("euler")
 
@@ -161,8 +165,8 @@ def default_scheduler_for_backend(backend_name: String) -> String:
         return String("flux2")
     if b == "sdxl" or b == "anima":
         return String("normal")
-    if b == "sd3":
-        return String("normal")
+    if b == "sd3" or b == "flux":
+        return String("simple")
     if b == "zimage" or b == "qwenimage":
         return String("simple")
     return String("normal")
@@ -190,7 +194,7 @@ def normalize_scheduler_name(name: String) -> String:
     if n == "flow_match" or n == "flowmatch" or n == "simple_flowmatch":
         return String("simple")
     if n == "qwen_flowmatch":
-        return String("qwen")
+        return String("simple")
     if n == "logitnormal" or n == "logit_normal" or n == "ideogram_logitnormal" or n == "ideogram4_logitnormal":
         return String("ideogram_logitnormal")
     return n^
@@ -265,15 +269,6 @@ def sampler_admission_for_backend(
             ),
         )
     if b == "qwenimage":
-        if normalized == "euler" or normalized == "flowmatch_euler":
-            return SamplerAdmission(
-                True,
-                b,
-                requested,
-                normalized,
-                String("qwenimage_flowmatch_euler"),
-                String("backend executes the Qwen-Image flow-match Euler denoise loop (offloaded DiT)"),
-            )
         return SamplerAdmission(
             False,
             b,
@@ -281,8 +276,9 @@ def sampler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Qwen-Image currently supports only euler/flowmatch_euler over its "
-                + "flow-match denoise loop; other catalog samplers remain fail-loud"
+                "Qwen-Image is metadata/preflight-only in this product slice; "
+                + "no sampler is admitted until artifact, timing, VRAM, and "
+                + "sampler evidence passes"
             ),
         )
     if b == "ideogram4":
@@ -345,6 +341,46 @@ def sampler_admission_for_backend(
             String(""),
             String(
                 "Anima daemon route currently admits only euler through the existing sample CLI; other Comfy sampler catalog names remain fail-loud"
+            ),
+        )
+    if b == "sd3":
+        if normalized == "euler" or normalized == "flowmatch_euler":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("sd3_flowmatch_euler"),
+                String("existing SD3.5 Mojo worker executes the bounded 1024x1024 Euler/simple flow-match path"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String(
+                "SD3.5 currently supports only euler/flowmatch_euler over the simple flow-match schedule; other Comfy sampler catalog names remain fail-loud"
+            ),
+        )
+    if b == "flux":
+        if normalized == "euler" or normalized == "flowmatch_euler":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("flux_flowmatch_euler"),
+                String("existing Flux Mojo worker executes the bounded 1024x1024 Euler/simple flow-match path"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String(
+                "Flux currently supports only euler/flowmatch_euler over the simple flow-match schedule; other Comfy sampler catalog names remain fail-loud"
             ),
         )
     if b == "flux2":
@@ -421,15 +457,6 @@ def scheduler_admission_for_backend(
             ),
         )
     if b == "qwenimage":
-        if normalized == "simple":
-            return SamplerAdmission(
-                True,
-                b,
-                requested,
-                normalized,
-                String("qwenimage_simple"),
-                String("backend executes the Qwen-Image simple flow-match schedule"),
-            )
         return SamplerAdmission(
             False,
             b,
@@ -437,8 +464,9 @@ def scheduler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Qwen-Image currently supports only the simple flow-match schedule; "
-                + "other catalog schedulers remain fail-loud"
+                "Qwen-Image is metadata/preflight-only in this product slice; "
+                + "no scheduler is admitted until artifact, timing, VRAM, and "
+                + "sampler evidence passes"
             ),
         )
     if b == "ideogram4":
@@ -458,7 +486,7 @@ def scheduler_admission_for_backend(
                 requested,
                 normalized,
                 String("ideogram4_simple_flowmatch"),
-                String("backend executes the bounded Ideogram-4 simple AuraFlow schedule"),
+                String("backend executes the bounded Comfy simple AuraFlow schedule"),
             )
         return SamplerAdmission(
             False,
@@ -467,9 +495,9 @@ def scheduler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Ideogram-4 currently supports logitnormal/ideogram_logitnormal "
-                + "and the bounded simple AuraFlow scheduler; normal/karras/beta/"
-                + "turbo/align_your_steps/flux2/ltxv remain fail-loud here"
+                "Ideogram-4 currently supports only logitnormal/ideogram_logitnormal "
+                + "and simple/flowmatch scheduler aliases in the production route; "
+                + "normal/karras/beta/turbo/align_your_steps/flux2/ltxv remain fail-loud here"
             ),
         )
     if b == "sdxl":
@@ -507,6 +535,42 @@ def scheduler_admission_for_backend(
             normalized,
             String(""),
             String("Anima sample CLI route currently admits only normal scheduler metadata"),
+        )
+    if b == "sd3":
+        if normalized == "simple":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("sd3_simple_flowmatch"),
+                String("existing SD3.5 Mojo worker executes its simple flow-match schedule"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String("SD3.5 currently admits only the simple flow-match scheduler"),
+        )
+    if b == "flux":
+        if normalized == "simple":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("flux_simple_flowmatch"),
+                String("existing Flux Mojo worker executes its simple flow-match schedule"),
+            )
+        return SamplerAdmission(
+            False,
+            b,
+            requested,
+            normalized,
+            String(""),
+            String("Flux currently admits only the simple flow-match scheduler"),
         )
     if b == "flux2":
         return SamplerAdmission(
@@ -609,11 +673,15 @@ def swarmui_sampler_registry_json() raises -> String:
     var ideogram_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
     var sdxl_supported_samplers = String('["euler"]')
     var anima_supported_samplers = String('["euler"]')
+    var sd3_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
+    var flux_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
     var zimage_supported_schedulers = String('["simple","flowmatch","flow_match","sgm_uniform"]')
     var qwen_supported_schedulers = String("[]")
-    var ideogram_supported_schedulers = String('["logitnormal","logit_normal","ideogram_logitnormal","ideogram4_logitnormal"]')
+    var ideogram_supported_schedulers = String('["logitnormal","logit_normal","ideogram_logitnormal","ideogram4_logitnormal","simple","flowmatch","flow_match","simple_flowmatch"]')
     var sdxl_supported_schedulers = String('["normal"]')
     var anima_supported_schedulers = String('["normal"]')
+    var sd3_supported_schedulers = String('["simple","flowmatch","flow_match"]')
+    var flux_supported_schedulers = String('["simple","flowmatch","flow_match"]')
     var out = String("{\n")
     out += String('  "schema":"serenity.samplers.v1",\n')
     out += String('  "source":"local SwarmUI Comfy sampler catalog",\n')
@@ -641,8 +709,8 @@ def swarmui_sampler_registry_json() raises -> String:
         String(""),
         qwen_supported_samplers,
         qwen_supported_schedulers,
-        String("[") + _qwen_generic_unipc_blocked_detail_json() + String("]"),
-        String("Qwen/Qwen-Image/Qwen-Edit is known to the scanner/import stack but execution is disabled in this slice until memory/offload work is ready."),
+        String("[]"),
+        String("Qwen-Image is metadata/preflight-only in this product slice; generation is rejected before enqueue until artifact, timing, VRAM, and sampler gates pass."),
     )
     out += String(",\n    ")
     out += _backend_json(
@@ -676,6 +744,28 @@ def swarmui_sampler_registry_json() raises -> String:
         anima_supported_schedulers,
         String("[]"),
         String("Anima daemon route delegates to the existing Mojo Anima sample CLI: fixed 1024x1024, 30 steps, cfg 4.5, pre-encoded caps_pos/caps_neg sidecars required. This is a bounded route, not full Comfy sampler parity."),
+    )
+    out += String(",\n    ")
+    out += _backend_json(
+        String("sd3"),
+        String("sd3"),
+        String("sd3_flowmatch_euler"),
+        String("sd3_simple_flowmatch"),
+        sd3_supported_samplers,
+        sd3_supported_schedulers,
+        String("[]"),
+        String("SD3.5 worker admits the bounded 1024x1024 Euler/simple flow-match route backed by the streamed MMDiT and embedded VAE path. LoRA and image-conditioning remain fail-loud."),
+    )
+    out += String(",\n    ")
+    out += _backend_json(
+        String("flux"),
+        String("flux"),
+        String("flux_flowmatch_euler"),
+        String("flux_simple_flowmatch"),
+        flux_supported_samplers,
+        flux_supported_schedulers,
+        String("[]"),
+        String("Flux worker admits the bounded 1024x1024 Euler/simple flow-match route; negative prompt, image-conditioning, and multiple LoRAs remain fail-loud."),
     )
     out += String("\n  ],\n")
     out += String('  "non_claims":[\n')

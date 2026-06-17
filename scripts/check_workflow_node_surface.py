@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 DOC = REPO / "serenitymojo/docs/COMFY_SWARM_WORKFLOW_PARITY_MAP_2026-06-12.md"
 DAEMON = REPO / "serenitymojo/serve/serenity_daemon.mojo"
+VIDEO_API = REPO / "serenitymojo/serve/video_api.mojo"
 WORKFLOW_GRAPH = REPO / "serenitymojo/serve/workflow_graph.mojo"
 BACKEND = REPO / "serenitymojo/serve/backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
@@ -359,6 +360,53 @@ def check_supported_nodes() -> list[Check]:
         )
     )
     checks.append(
+        check_not_contains(
+            DAEMON,
+            category="workflow",
+            label="daemon has no duplicate workflow executor",
+            needles=[
+                "def _apply_workflow_params",
+                "def _apply_workflow_graph_ir",
+                "def _apply_ideogram4_comfy_ui_export",
+                "struct WorkflowLink",
+            ],
+            severity=P0,
+            acceptance="The daemon cannot drift from the workflow_graph module by carrying a second graph executor.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            DAEMON,
+            "parse_generate",
+            category="workflow",
+            label="Ideogram4 structured JSON prompt bypass",
+            needles=[
+                'sampler_backend == "ideogram4"',
+                "_normalize_ideogram4_structured_prompt(obj)",
+                "_looks_like_ideogram4_structured_prompt(prompt_raw)",
+                "prompt_syntax.resolved = prompt_raw.copy()",
+            ],
+            severity=P0,
+            acceptance="Ideogram4 structured JSON captions, including bbox layout prompts, reach the backend without generic prompt-syntax rewriting.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            DAEMON,
+            "_normalize_ideogram4_structured_prompt",
+            category="workflow",
+            label="Ideogram4 prompt_json normalizer",
+            needles=[
+                "prompt_json",
+                "Bounding boxes stay inside",
+                "_set_ideogram_prompt_field(obj, String(\"prompt\"), raw, source)",
+                "_set_ideogram_prompt_field(obj, String(\"prompt_raw\"), raw, source)",
+            ],
+            severity=P0,
+            acceptance="Ideogram4 prompt_json objects/arrays are serialized into the authored prompt string and preserved in prompt_raw.",
+        )
+    )
+    checks.append(
         check_body_contains(
             WORKFLOW_GRAPH,
             "apply_workflow_params",
@@ -377,6 +425,22 @@ def check_supported_nodes() -> list[Check]:
             ],
             severity=P0,
             acceptance="Graph module exposes flat workflow passthrough, Comfy API prompt import, Comfy UI visual canvas import, plus typed linked-graph execution for supported nodes.",
+        )
+    )
+    checks.append(
+        check_body_contains(
+            WORKFLOW_GRAPH,
+            "_workflow_has_prompt_override",
+            category="workflow",
+            label="Ideogram4 workflow prompt_json override",
+            needles=[
+                "prompt_json",
+                "dumps(obj[\"prompt_json\"])",
+                "Ideogram4 Comfy export prompt_json must be a string or JSON object/array",
+                "_set_if_missing(obj, String(\"prompt_raw\"), JSONValue.from_string(raw))",
+            ],
+            severity=P0,
+            acceptance="Raw Ideogram4 Comfy exports can provide structured JSON/bbox captions through prompt_json before the bounded importer runs.",
         )
     )
     checks.append(
@@ -1022,6 +1086,10 @@ def check_fail_loud() -> list[Check]:
                 "[501] workflow graph body needs edges for typed execution",
                 "[501] workflow graph input ",
                 "[501] workflow graph has unresolved or cyclic typed links",
+                "def _workflow_reject_multi_output_topology",
+                "_workflow_reject_multi_output_topology(nodes_json)",
+                "[501] workflow graph has multiple sampler/output branches",
+                "[501] workflow graph has multiple SaveImage outputs",
                 "[501] workflow graph duplicate SetNode name: ",
                 "[501] workflow graph GetNode missing SetNode: ",
                 "[501] workflow graph SetNode missing input",
@@ -1030,6 +1098,16 @@ def check_fail_loud() -> list[Check]:
             ],
             severity=P0,
             acceptance="Bad typed links and cyclic linked graphs fail before enqueue.",
+        ),
+        check_not_contains(
+            WORKFLOW_GRAPH,
+            category="failure",
+            label="field-only graph fallback removed",
+            needles=[
+                "field_only_graph_adapter",
+            ],
+            severity=P0,
+            acceptance="Node graphs without typed edges fail loudly instead of guessing graph semantics from node fields.",
         ),
         check_contains(
             DAEMON,
@@ -2139,13 +2217,13 @@ def check_family_surfaces() -> list[Check]:
             acceptance="Z-Image has Mojo decode/resize/encode substrate for bounded init-image/LanPaint/refiner experiments; this is not accepted general i2i parity.",
         ),
         check_contains(
-            DAEMON,
+            VIDEO_API,
             category="video",
             label="video has bounded daemon smoke contract",
             needles=[
                 "/v1/video",
                 "LTX2_VIDEO_SMOKE_RUNNER",
-                "_ltx2_staged_smoke_video_result",
+                "ltx2_staged_smoke_video_result",
                 "ltx2_t2v_av_stage2_dev_smoke.mp4",
                 "frame_count",
                 "duration",
@@ -2448,34 +2526,50 @@ def check_klein_reference_daemon_smoke_report(
     job = dict_or_empty(report.get("job"))
     genparams = dict_or_empty(report.get("genparams"))
     manifest = dict_or_empty(report.get("manifest"))
+    request = dict_or_empty(report.get("request"))
     output_path = _evidence_path(report.get("output_path"))
     manifest_path = _evidence_path(report.get("manifest_path"))
+    expected_steps = request.get("steps") if isinstance(request.get("steps"), int) else 1
+    expected_creativity = (
+        request.get("creativity") if isinstance(request.get("creativity"), (int, float)) else 0.45
+    )
+    expected_reference = str(request.get("reference_image") or genparams.get("reference_image") or "")
+    expected_reference_path = _evidence_path(expected_reference)
 
     missing = []
+    if report.get("ready") is not True:
+        missing.append("report.ready=True")
+    if report.get("blockers") not in ([], None):
+        missing.append("report.blockers=[]")
     if generate.get("status") != 200:
         missing.append("generate.status=200")
     if job.get("state") != "done":
         missing.append("job.state='done'")
-    if job.get("step") != 1 or job.get("total") != 1:
-        missing.append("job.step/total=1/1")
+    if job.get("step") != expected_steps or job.get("total") != expected_steps:
+        missing.append(f"job.step/total={expected_steps}/{expected_steps}")
     if not output_path.is_file():
         missing.append(f"output PNG exists: {output_path}")
     elif output_path.stat().st_size < 100_000:
         missing.append("output PNG is nontrivial")
     if not manifest_path.is_file():
         missing.append(f"Klein manifest exists: {manifest_path}")
+    if not expected_reference:
+        missing.append("request.reference_image is nonempty")
+    elif not expected_reference_path.is_file():
+        missing.append(f"reference image exists: {expected_reference_path}")
 
     expected_genparams = {
         "model": expected_model,
         "prompt": "change the dress to blue",
         "width": 512,
         "height": 512,
-        "steps": 1,
+        "steps": expected_steps,
         "seed": 42,
         "cfg": 3.5,
         "sampler": "euler",
         "scheduler": "flux2",
-        "creativity": 0.45,
+        "creativity": expected_creativity,
+        "reference_image": expected_reference,
         "reference_latent_method": "index",
         "reference_latent_count": 2,
         "workflow_schema": "serenity.workflow_graph.v1",
@@ -2489,8 +2583,6 @@ def check_klein_reference_daemon_smoke_report(
         for key, expected in expected_genparams.items()
         if genparams.get(key) != expected
     )
-    if not str(genparams.get("reference_image") or "").endswith("/output/serenity_daemon/job-0141.png"):
-        missing.append("genparams.reference_image=job-0141.png")
 
     expected_manifest = {
         "schema": "serenity.klein_daemon_result.v1",
@@ -2499,8 +2591,9 @@ def check_klein_reference_daemon_smoke_report(
         "model": expected_model,
         "config_path": expected_config,
         "mode": "reference_latent_edit",
+        "reference_image": expected_reference,
         "reference_latent_count": 2,
-        "edit_denoise": 0.45,
+        "edit_denoise": expected_creativity,
         "edit_shift": 2.02,
         "reference_t_offset": 10.0,
         "metadata_key": "serenity.genparams.v1",
@@ -2703,7 +2796,6 @@ def check_klein_lora_reference_daemon_smoke_report(smoke_path: Path) -> Check:
         )
 
     expected_lora = "/home/alex/Downloads/flux2_klein_9b_imperial_historical_lora.safetensors"
-    expected_reference = "/home/alex/mojodiffusion/output/serenity_daemon/job-0141.png"
     generate = dict_or_empty(report.get("generate"))
     job = dict_or_empty(report.get("job"))
     png = dict_or_empty(report.get("png"))
@@ -2711,8 +2803,15 @@ def check_klein_lora_reference_daemon_smoke_report(smoke_path: Path) -> Check:
     manifest = dict_or_empty(report.get("manifest"))
     workflow_metadata = dict_or_empty(report.get("workflow_metadata"))
     log_markers = dict_or_empty(report.get("log_markers"))
+    request = dict_or_empty(report.get("request"))
     output_path = _evidence_path(report.get("output_path"))
     manifest_path = _evidence_path(report.get("manifest_path"))
+    expected_steps = request.get("steps") if isinstance(request.get("steps"), int) else 1
+    expected_creativity = (
+        request.get("creativity") if isinstance(request.get("creativity"), (int, float)) else 0.45
+    )
+    expected_reference = str(request.get("reference_image") or genparams.get("reference_image") or "")
+    expected_reference_path = _evidence_path(expected_reference)
 
     missing = []
     if report.get("ready") is not True:
@@ -2731,8 +2830,8 @@ def check_klein_lora_reference_daemon_smoke_report(smoke_path: Path) -> Check:
         missing.append("generate.status=200")
     if job.get("state") != "done":
         missing.append("job.state='done'")
-    if job.get("step") != 1 or job.get("total") != 1:
-        missing.append("job.step/total=1/1")
+    if job.get("step") != expected_steps or job.get("total") != expected_steps:
+        missing.append(f"job.step/total={expected_steps}/{expected_steps}")
     if not output_path.is_file():
         missing.append(f"output PNG exists: {output_path}")
     elif output_path.stat().st_size < 100_000:
@@ -2746,6 +2845,10 @@ def check_klein_lora_reference_daemon_smoke_report(smoke_path: Path) -> Check:
         missing.append("idat_sha256 is present")
     if not manifest_path.is_file():
         missing.append(f"Klein manifest exists: {manifest_path}")
+    if not expected_reference:
+        missing.append("request.reference_image is nonempty")
+    elif not expected_reference_path.is_file():
+        missing.append(f"reference image exists: {expected_reference_path}")
 
     expected_genparams = {
         "schema": "serenity.genparams.v1",
@@ -2754,12 +2857,12 @@ def check_klein_lora_reference_daemon_smoke_report(smoke_path: Path) -> Check:
         "negative": "",
         "width": 512,
         "height": 512,
-        "steps": 1,
+        "steps": expected_steps,
         "seed": 42,
         "cfg": 3.5,
         "sampler": "euler",
         "scheduler": "flux2",
-        "creativity": 0.45,
+        "creativity": expected_creativity,
         "reference_image": expected_reference,
         "reference_latent_method": "index",
         "reference_latent_count": 2,
@@ -2797,7 +2900,7 @@ def check_klein_lora_reference_daemon_smoke_report(smoke_path: Path) -> Check:
         "mode": "reference_latent_edit",
         "reference_image": expected_reference,
         "reference_latent_count": 2,
-        "edit_denoise": 0.45,
+        "edit_denoise": expected_creativity,
         "edit_shift": 2.02,
         "reference_t_offset": 10.0,
         "metadata_key": "serenity.genparams.v1",
@@ -3746,9 +3849,13 @@ def check_workflow_graph_product_report() -> Check:
         "unsupported and wrong-type links returned HTTP 501"
     )
     sf_cases = report.get("serenityflow_t2i")
+    ignored_qwen_historical = False
     if isinstance(sf_cases, dict):
         completed_cases = []
         for case_name in sorted(sf_cases):
+            if "qwen" in case_name.lower():
+                ignored_qwen_historical = True
+                continue
             case = sf_cases.get(case_name)
             if isinstance(case, dict):
                 case_job = dict_or_empty(case.get("job"))
@@ -3773,7 +3880,9 @@ def check_workflow_graph_product_report() -> Check:
         if case_job.get("id")
     ]
     if completed_qwen_edit_cases:
-        detail += "; SerenityFlow Qwen edit completed " + ", ".join(completed_qwen_edit_cases)
+        ignored_qwen_historical = True
+    if ignored_qwen_historical:
+        detail += "; historical Qwen/Qwen-edit workflow entries ignored while Qwen is metadata/preflight-only"
     if ideogram4_evidence:
         detail += f"; Ideogram4 visual export completed {ideogram4_job.get('id')}"
     return Check(

@@ -1,7 +1,7 @@
 {
   "model_type": "qwenimage",
-  "checkpoint": "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer",
-  "vae": "/home/alex/.serenity/models/vaes/qwenimage-vae.safetensors",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer",
+  "vae": "/home/alex/.serenity/models/checkpoints/qwen-image-2512/vae",
   "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/qwenimage_samples.json",
 
   "inner_dim": 3072,

@@ -35,7 +35,8 @@
 //! NEVER run `mojo build` / `pixi run build-*` (OOM-kills the desktop).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -47,18 +48,31 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 
 use serenity_graph::lower_request;
 use serenity_ipc::{spawn_worker, EventPoll, WorkerHandle};
 use serenity_wire::{JobParams, LoraSpec, WorkerEvent};
 
+mod block_profiles;
+mod capabilities;
 mod gallery;
 mod grid;
 mod jobs;
 mod magic;
 mod models;
+mod result_manifest;
 mod video;
+
+use capabilities::{
+    capability_profile_for_model, generate_capabilities_v1, has_text, has_vae_override,
+    json_prompt_to_string, model_family, normalize_ideogram4_prompt_json, normalize_sampler_name,
+    normalize_scheduler_name, raw_surface_generate_error_report, raw_surface_preflight_report,
+    reject_disabled_raw_surfaces, reject_unsupported_workflow_route, requested_sampler,
+    requested_scheduler, validate_generate_prequeue, workflow_feature_generate_error_report,
+    workflow_feature_preflight_report, workflow_generate_error_report, workflow_preflight_report,
+    workflow_route_generate_error_report, workflow_route_preflight_report, ModelFamily,
+};
 
 /// How many buffered events a slow WS subscriber may lag before it's dropped.
 const BROADCAST_CAP: usize = 256;
@@ -195,7 +209,12 @@ pub(crate) struct AppState {
 #[derive(Debug, Deserialize)]
 struct GenerateRequest {
     model: String,
-    prompt: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    prompt_raw: Option<String>,
+    #[serde(default)]
+    prompt_json: Option<JsonValue>,
     #[serde(default)]
     negative: Option<String>,
     #[serde(default)]
@@ -228,7 +247,7 @@ struct GenerateRequest {
     #[serde(default)]
     workflow_save_prefix: Option<String>,
     /// Lowered LoRA overlays — `lower_request` writes the `lora` array.
-    #[serde(default, rename = "lora")]
+    #[serde(default, rename = "lora", alias = "loras")]
     loras: Option<Vec<LoraSpec>>,
     // ── img2img / inpaint passthrough (JobParams already carries these) ──
     /// img2img init latent source (a decodable image path). Empty = txt2img.
@@ -263,6 +282,694 @@ struct GenerateRequest {
     vae: Option<String>,
 }
 
+fn local_block_profile(model: &str) -> serde_json::Value {
+    block_profiles::local_block_profile(model)
+}
+
+#[derive(Debug, Copy, Clone)]
+enum ArtifactKind {
+    File,
+    Directory,
+}
+
+impl ArtifactKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ArtifactKind::File => "file",
+            ArtifactKind::Directory => "directory",
+        }
+    }
+
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        match self {
+            ArtifactKind::File => metadata.is_file(),
+            ArtifactKind::Directory => metadata.is_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactSpec {
+    label: String,
+    path: String,
+    kind: ArtifactKind,
+}
+
+struct LocalArtifactManifest {
+    profile: &'static str,
+    family: &'static str,
+    root: &'static str,
+    production_entry: &'static str,
+    specs: Vec<ArtifactSpec>,
+}
+
+fn artifact_file(label: impl Into<String>, path: impl Into<String>) -> ArtifactSpec {
+    ArtifactSpec {
+        label: label.into(),
+        path: path.into(),
+        kind: ArtifactKind::File,
+    }
+}
+
+fn artifact_dir(label: impl Into<String>, path: impl Into<String>) -> ArtifactSpec {
+    ArtifactSpec {
+        label: label.into(),
+        path: path.into(),
+        kind: ArtifactKind::Directory,
+    }
+}
+
+fn push_safetensor_shards(
+    specs: &mut Vec<ArtifactSpec>,
+    label_prefix: &str,
+    dir: &str,
+    stem: &str,
+    count: usize,
+) {
+    for i in 1..=count {
+        specs.push(artifact_file(
+            format!("{label_prefix} shard {i:05}"),
+            format!("{dir}/{stem}-{i:05}-of-{count:05}.safetensors"),
+        ));
+    }
+}
+
+fn local_artifact_manifest(model: &str) -> Option<LocalArtifactManifest> {
+    let m = model.trim().to_ascii_lowercase();
+
+    if m.contains("qwen") && !m.contains("edit") {
+        let root = "/home/alex/.serenity/models/checkpoints/qwen-image-2512";
+        let transformer = format!("{root}/transformer");
+        let text_encoder = format!("{root}/text_encoder");
+        let tokenizer = format!("{root}/tokenizer");
+        let vae = format!("{root}/vae");
+        let mut specs = vec![
+            artifact_file("model index", format!("{root}/model_index.json")),
+            artifact_file(
+                "scheduler config",
+                format!("{root}/scheduler/scheduler_config.json"),
+            ),
+            artifact_file("transformer config", format!("{transformer}/config.json")),
+            artifact_file(
+                "transformer shard index",
+                format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
+            ),
+        ];
+        push_safetensor_shards(
+            &mut specs,
+            "transformer",
+            &transformer,
+            "diffusion_pytorch_model",
+            9,
+        );
+        specs.extend([
+            artifact_file("text encoder config", format!("{text_encoder}/config.json")),
+            artifact_file(
+                "text encoder shard index",
+                format!("{text_encoder}/model.safetensors.index.json"),
+            ),
+        ]);
+        push_safetensor_shards(&mut specs, "text encoder", &text_encoder, "model", 4);
+        specs.extend([
+            artifact_file("tokenizer json", format!("{tokenizer}/tokenizer.json")),
+            artifact_file(
+                "tokenizer config",
+                format!("{tokenizer}/tokenizer_config.json"),
+            ),
+            artifact_file("chat template", format!("{tokenizer}/chat_template.jinja")),
+            artifact_file("VAE config", format!("{vae}/config.json")),
+            artifact_file(
+                "VAE weights",
+                format!("{vae}/diffusion_pytorch_model.safetensors"),
+            ),
+        ]);
+        return Some(LocalArtifactManifest {
+            profile: "qwen_image_2512",
+            family: "qwenimage",
+            root,
+            production_entry: "serenitymojo/serve/qwenimage_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("zimage") || m.contains("z-image") || m.contains("z_image") {
+        let root = "/home/alex/.serenity/models/zimage_base";
+        let transformer = format!("{root}/transformer");
+        let text_encoder = format!("{root}/text_encoder");
+        let tokenizer = format!("{root}/tokenizer");
+        let vae = format!("{root}/vae");
+        let mut specs = vec![
+            artifact_file("model index", format!("{root}/model_index.json")),
+            artifact_file(
+                "scheduler config",
+                format!("{root}/scheduler/scheduler_config.json"),
+            ),
+            artifact_file("transformer config", format!("{transformer}/config.json")),
+            artifact_file(
+                "transformer shard index",
+                format!("{transformer}/diffusion_pytorch_model.safetensors.index.json"),
+            ),
+        ];
+        push_safetensor_shards(
+            &mut specs,
+            "transformer",
+            &transformer,
+            "diffusion_pytorch_model",
+            2,
+        );
+        specs.extend([
+            artifact_file("text encoder config", format!("{text_encoder}/config.json")),
+            artifact_file(
+                "text encoder shard index",
+                format!("{text_encoder}/model.safetensors.index.json"),
+            ),
+        ]);
+        push_safetensor_shards(&mut specs, "text encoder", &text_encoder, "model", 3);
+        specs.extend([
+            artifact_file("tokenizer json", format!("{tokenizer}/tokenizer.json")),
+            artifact_file("tokenizer vocab", format!("{tokenizer}/vocab.json")),
+            artifact_file("tokenizer merges", format!("{tokenizer}/merges.txt")),
+            artifact_file("VAE config", format!("{vae}/config.json")),
+            artifact_file(
+                "VAE weights",
+                format!("{vae}/diffusion_pytorch_model.safetensors"),
+            ),
+        ]);
+        return Some(LocalArtifactManifest {
+            profile: "zimage_base",
+            family: "zimage",
+            root,
+            production_entry: "serenitymojo/serve/zimage_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("ideogram") {
+        let root = "/home/alex/.serenity/models/ideogram-4-fp8";
+        let specs = vec![
+            artifact_file("model index", format!("{root}/model_index.json")),
+            artifact_file("scheduler config", format!("{root}/scheduler/scheduler_config.json")),
+            artifact_file("conditional transformer config", format!("{root}/transformer/config.json")),
+            artifact_file(
+                "conditional transformer weights",
+                format!("{root}/transformer/diffusion_pytorch_model.safetensors"),
+            ),
+            artifact_file(
+                "unconditional transformer config",
+                format!("{root}/unconditional_transformer/config.json"),
+            ),
+            artifact_file(
+                "unconditional transformer weights",
+                format!(
+                    "{root}/unconditional_transformer/diffusion_pytorch_model.safetensors"
+                ),
+            ),
+            artifact_file("text encoder config", format!("{root}/text_encoder/config.json")),
+            artifact_file(
+                "text encoder weights",
+                format!("{root}/text_encoder/model.safetensors"),
+            ),
+            artifact_file("tokenizer json", format!("{root}/tokenizer/tokenizer.json")),
+            artifact_file(
+                "tokenizer chat template",
+                format!("{root}/tokenizer/chat_template.jinja"),
+            ),
+            artifact_file("VAE config", format!("{root}/vae/config.json")),
+            artifact_file(
+                "VAE weights",
+                format!("{root}/vae/diffusion_pytorch_model.safetensors"),
+            ),
+            artifact_file(
+                "latent norm parity tensor",
+                "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/ideogram4_fx_latentnorm.safetensors",
+            ),
+        ];
+        return Some(LocalArtifactManifest {
+            profile: "ideogram4_fp8",
+            family: "ideogram4",
+            root,
+            production_entry: "serenitymojo/serve/ideogram4_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("sdxl")
+        || m.contains("sd_xl")
+        || m.contains("sd-xl")
+        || m.contains("sd xl")
+        || m.contains("stable-diffusion-xl")
+        || m.contains("animagine")
+    {
+        let text = "/home/alex/.serenity/models/text_encoders";
+        let specs = vec![
+            artifact_file(
+                "UNet checkpoint",
+                "/home/alex/.serenity/models/checkpoints/sdxl_unet_bf16.safetensors",
+            ),
+            artifact_file(
+                "VAE weights",
+                "/home/alex/.serenity/models/vaes/OfficialStableDiffusion/sdxl_vae.safetensors",
+            ),
+            artifact_file("CLIP-L weights", format!("{text}/clip_l.safetensors")),
+            artifact_file("CLIP-G weights", format!("{text}/clip_g.safetensors")),
+            artifact_file("CLIP-L tokenizer", format!("{text}/clip_l.tokenizer.json")),
+            artifact_file("CLIP-G tokenizer", format!("{text}/clip_g.tokenizer.json")),
+        ];
+        return Some(LocalArtifactManifest {
+            profile: "sdxl_1024",
+            family: "sdxl",
+            root: "/home/alex/.serenity/models",
+            production_entry: "serenitymojo/serve/sdxl_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("anima") {
+        let root = "/home/alex/.serenity/models/anima";
+        let text = "/home/alex/.serenity/models/text_encoders";
+        let specs = vec![
+            artifact_dir("Anima root", root),
+            artifact_file(
+                "Anima DiT",
+                format!("{root}/split_files/diffusion_models/anima-base-v1.0.safetensors"),
+            ),
+            artifact_file(
+                "Qwen3 text encoder",
+                format!("{root}/split_files/text_encoders/qwen_3_06b_base.safetensors"),
+            ),
+            artifact_file(
+                "Qwen-Image VAE",
+                format!("{root}/split_files/vae/qwen_image_vae.safetensors"),
+            ),
+            artifact_file(
+                "Qwen tokenizer",
+                "/home/alex/.serenity/models/checkpoints/qwen-image-2512/tokenizer/tokenizer.json",
+            ),
+            artifact_file("T5 tokenizer", format!("{text}/t5xxl_fp16.tokenizer.json")),
+        ];
+        return Some(LocalArtifactManifest {
+            profile: "anima_1024",
+            family: "anima",
+            root,
+            production_entry: "serenitymojo/serve/anima_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("sd3") || m.contains("sd35") || m.contains("sd3.5") {
+        let text = "/home/alex/.serenity/models/text_encoders";
+        let specs = vec![
+            artifact_file(
+                "SD3.5 Large checkpoint",
+                "/home/alex/.serenity/models/checkpoints/sd3.5_large.safetensors",
+            ),
+            artifact_file("CLIP-L weights", format!("{text}/clip_l.safetensors")),
+            artifact_file("CLIP-G weights", format!("{text}/clip_g.safetensors")),
+            artifact_file("T5-XXL weights", format!("{text}/t5xxl_fp16.safetensors")),
+            artifact_file("CLIP-L tokenizer", format!("{text}/clip_l.tokenizer.json")),
+            artifact_file("CLIP-G tokenizer", format!("{text}/clip_g.tokenizer.json")),
+            artifact_file("T5 tokenizer", format!("{text}/t5xxl_fp16.tokenizer.json")),
+        ];
+        return Some(LocalArtifactManifest {
+            profile: "sd3_5_large_1024",
+            family: "sd3",
+            root: "/home/alex/.serenity/models",
+            production_entry: "serenitymojo/serve/sd3_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("flux2") || m.contains("flux-2") || m.contains("flux_2") || m.contains("klein") {
+        let specs = vec![
+            artifact_file(
+                "Klein/Flux2 checkpoint",
+                "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors",
+            ),
+            artifact_file(
+                "Flux2 VAE",
+                "/home/alex/.serenity/models/vaes/flux2-vae.safetensors",
+            ),
+            artifact_file(
+                "Qwen3-8B tokenizer",
+                "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218/tokenizer.json",
+            ),
+        ];
+        return Some(LocalArtifactManifest {
+            profile: "klein9b_flux2",
+            family: "flux2",
+            root: "/home/alex/.serenity/models",
+            production_entry: "serenitymojo/serve/klein_runtime_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("flux") {
+        let text = "/home/alex/.serenity/models/text_encoders";
+        let specs = vec![
+            artifact_file(
+                "FLUX.1-dev checkpoint",
+                "/home/alex/.serenity/models/checkpoints/flux1-dev.safetensors",
+            ),
+            artifact_file(
+                "Flux VAE",
+                "/home/alex/.serenity/models/vaes/ae.safetensors",
+            ),
+            artifact_file("CLIP-L weights", format!("{text}/clip_l.safetensors")),
+            artifact_file("T5-XXL weights", format!("{text}/t5xxl_fp16.safetensors")),
+            artifact_file("CLIP-L tokenizer", format!("{text}/clip_l.tokenizer.json")),
+            artifact_file("T5 tokenizer", format!("{text}/t5xxl_fp16.tokenizer.json")),
+        ];
+        return Some(LocalArtifactManifest {
+            profile: "flux1_dev_1024",
+            family: "flux",
+            root: "/home/alex/.serenity/models",
+            production_entry: "serenitymojo/serve/flux_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("sensenova") || m.contains("sense_nova") || m.contains("sense-nova") {
+        let root = "/home/alex/.serenity/models/sensenova_u1";
+        let mut specs = vec![
+            artifact_file("SenseNova config", format!("{root}/config.json")),
+            artifact_file(
+                "SenseNova shard index",
+                format!("{root}/model.safetensors.index.json"),
+            ),
+            artifact_file("SenseNova vocab", format!("{root}/vocab.json")),
+            artifact_file("SenseNova merges", format!("{root}/merges.txt")),
+            artifact_file(
+                "SenseNova added tokens",
+                format!("{root}/added_tokens.json"),
+            ),
+        ];
+        push_safetensor_shards(&mut specs, "SenseNova", root, "model", 8);
+        return Some(LocalArtifactManifest {
+            profile: "sensenova_u1",
+            family: "sensenova",
+            root,
+            production_entry: "serenitymojo/serve/sensenova_backend.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("hidream") || m.contains("hi-dream") || m.contains("hi_dream") {
+        let root = "/home/alex/.serenity/models/hidream_o1_dev";
+        let mut specs = vec![
+            artifact_file("HiDream config", format!("{root}/config.json")),
+            artifact_file(
+                "HiDream shard index",
+                format!("{root}/model.safetensors.index.json"),
+            ),
+            artifact_file("HiDream tokenizer", format!("{root}/tokenizer.json")),
+        ];
+        push_safetensor_shards(&mut specs, "HiDream", root, "model", 8);
+        return Some(LocalArtifactManifest {
+            profile: "hidream_o1_dev",
+            family: "hidream",
+            root,
+            production_entry: "serenitymojo/pipeline/hidream_o1_smoke.mojo",
+            specs,
+        });
+    }
+
+    if m.contains("lance") {
+        let root = "/home/alex/.serenity/models/lance/Lance_3B_Video";
+        let specs = vec![
+            artifact_file("Lance model", format!("{root}/model.safetensors")),
+            artifact_file("Lance tokenizer", format!("{root}/tokenizer.json")),
+            artifact_file(
+                "Wan2.2 VAE",
+                "/home/alex/.serenity/models/vaes/wan2.2_vae.safetensors",
+            ),
+        ];
+        return Some(LocalArtifactManifest {
+            profile: "lance_t2v",
+            family: "lance",
+            root,
+            production_entry: "serenitymojo/pipeline/lance_t2v_pipeline.mojo",
+            specs,
+        });
+    }
+
+    None
+}
+
+fn actual_artifact_kind(metadata: &fs::Metadata) -> &'static str {
+    if metadata.is_file() {
+        "file"
+    } else if metadata.is_dir() {
+        "directory"
+    } else if metadata.file_type().is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    }
+}
+
+fn local_artifact_report(model: &str) -> serde_json::Value {
+    let Some(manifest) = local_artifact_manifest(model) else {
+        return json!({
+            "schema": "serenity.artifacts.local.v1",
+            "known_model": false,
+            "profile": "unknown",
+            "family": "unknown",
+            "root": "",
+            "production_entry": "",
+            "ready": false,
+            "checked_count": 0,
+            "present_count": 0,
+            "missing_count": 0,
+            "wrong_kind_count": 0,
+            "file_size_bytes_present": 0u64,
+            "missing": [],
+            "wrong_kind": [],
+            "entries": [],
+            "storage_policy": {
+                "model_artifacts_may_live_outside_repo": true,
+                "runtime_dependency_on_external_repos": false,
+                "external_reference_trees": ["none"],
+            },
+        });
+    };
+
+    let mut entries = Vec::new();
+    let mut missing = Vec::new();
+    let mut wrong_kind = Vec::new();
+    let mut present_count = 0usize;
+    let mut file_size_bytes_present = 0u64;
+
+    for spec in manifest.specs.iter() {
+        match fs::metadata(FsPath::new(&spec.path)) {
+            Ok(metadata) => {
+                let actual_kind = actual_artifact_kind(&metadata);
+                let kind_ok = spec.kind.matches(&metadata);
+                if kind_ok {
+                    present_count += 1;
+                    if metadata.is_file() {
+                        file_size_bytes_present =
+                            file_size_bytes_present.saturating_add(metadata.len());
+                    }
+                } else {
+                    wrong_kind.push(json!({
+                        "label": spec.label,
+                        "path": spec.path,
+                        "expected_kind": spec.kind.as_str(),
+                        "actual_kind": actual_kind,
+                    }));
+                }
+                entries.push(json!({
+                    "label": spec.label,
+                    "path": spec.path,
+                    "expected_kind": spec.kind.as_str(),
+                    "present": kind_ok,
+                    "actual_kind": actual_kind,
+                    "size_bytes": if metadata.is_file() {
+                        json!(metadata.len())
+                    } else {
+                        serde_json::Value::Null
+                    },
+                }));
+            }
+            Err(err) => {
+                missing.push(json!({
+                    "label": spec.label,
+                    "path": spec.path,
+                    "error": err.to_string(),
+                }));
+                entries.push(json!({
+                    "label": spec.label,
+                    "path": spec.path,
+                    "expected_kind": spec.kind.as_str(),
+                    "present": false,
+                    "actual_kind": "missing",
+                    "size_bytes": serde_json::Value::Null,
+                    "error": err.to_string(),
+                }));
+            }
+        }
+    }
+
+    let checked_count = entries.len();
+    let missing_count = missing.len();
+    let wrong_kind_count = wrong_kind.len();
+    let ready = missing_count == 0 && wrong_kind_count == 0;
+
+    json!({
+        "schema": "serenity.artifacts.local.v1",
+        "known_model": true,
+        "profile": manifest.profile,
+        "family": manifest.family,
+        "root": manifest.root,
+        "production_entry": manifest.production_entry,
+        "ready": ready,
+        "checked_count": checked_count,
+        "present_count": present_count,
+        "missing_count": missing_count,
+        "wrong_kind_count": wrong_kind_count,
+        "file_size_bytes_present": file_size_bytes_present,
+        "missing": missing,
+        "wrong_kind": wrong_kind,
+        "entries": entries,
+        "storage_policy": {
+            "model_artifacts_may_live_outside_repo": true,
+            "runtime_dependency_on_external_repos": false,
+            "external_reference_trees": ["none"],
+        },
+    })
+}
+
+fn local_artifact_gate_error(report: &serde_json::Value, backend: &str) -> Option<String> {
+    if report.get("known_model").and_then(|v| v.as_bool()) != Some(true) {
+        return Some(format!(
+            "{backend}: no local artifact manifest is registered for this model"
+        ));
+    }
+    if report.get("ready").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+
+    let mut details = Vec::new();
+    if let Some(items) = report.get("missing").and_then(|v| v.as_array()) {
+        for item in items.iter().take(4) {
+            let label = item
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("artifact");
+            let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            details.push(format!("missing {label}: {path}"));
+        }
+    }
+    if let Some(items) = report.get("wrong_kind").and_then(|v| v.as_array()) {
+        for item in items.iter().take(2) {
+            let label = item
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("artifact");
+            let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            details.push(format!("wrong kind for {label}: {path}"));
+        }
+    }
+    if details.is_empty() {
+        details.push("local artifact check did not pass".to_string());
+    }
+    Some(format!("{backend}: {}", details.join("; ")))
+}
+
+fn validate_generate_runtime_ready(
+    params: &JobParams,
+    hires_scale: f64,
+) -> Result<ModelFamily, String> {
+    let family = validate_generate_prequeue(params, hires_scale)?;
+    let artifact_report = local_artifact_report(&params.model);
+    if let Some(error) = local_artifact_gate_error(&artifact_report, family.backend_key()) {
+        return Err(error);
+    }
+    Ok(family)
+}
+
+fn generate_preflight_report(params: &JobParams, hires_scale: f64) -> serde_json::Value {
+    let validation = validate_generate_prequeue(params, hires_scale);
+    let artifact_profile = local_artifact_report(&params.model);
+    let (admitted, family, error) = match validation {
+        Ok(family) => match local_artifact_gate_error(&artifact_profile, family.backend_key()) {
+            Some(error) => (false, Some(family), error),
+            None => (true, Some(family), String::new()),
+        },
+        Err(error) => (false, None, error),
+    };
+    let backend = family.map(ModelFamily::backend_key).unwrap_or("");
+    let sampler = family
+        .map(|f| requested_sampler(params, f))
+        .unwrap_or_else(|| normalize_sampler_name(&params.sampler));
+    let scheduler = family
+        .map(|f| requested_scheduler(params, f))
+        .unwrap_or_else(|| normalize_scheduler_name(&params.scheduler));
+
+    json!({
+        "schema": "serenity.generate.preflight.v1",
+        "admitted": admitted,
+        "error": error,
+        "model": params.model,
+        "backend": backend,
+        "output_root": {
+            "root_kind": "ui_workflow_gallery",
+            "root": params.out_dir,
+            "artifact_pattern": "job-XXXX.png",
+            "result_sidecar_suffix": ".serenity_server_result.json",
+        },
+        "same_gate_as_generate": true,
+        "production_gate": "validate_generate_prequeue",
+        "request": {
+            "width": params.width,
+            "height": params.height,
+            "steps": params.steps,
+            "cfg": params.cfg,
+            "sampler": sampler,
+            "scheduler": scheduler,
+            "images": params.images,
+            "hires_scale": hires_scale,
+            "has_lora": !params.loras.is_empty(),
+            "has_negative": has_text(&params.negative),
+            "has_init_image": has_text(&params.init_image),
+            "has_mask_image": has_text(&params.mask_image),
+            "has_vae_override": has_vae_override(&params.vae),
+            "vae": params.vae,
+        },
+        "block_profile": local_block_profile(&params.model),
+        "artifact_profile": artifact_profile,
+        "capability_profile": capability_profile_for_model(&params.model),
+        "limits": {
+            "one_image_per_job": true,
+            "txt2img_only": true,
+            "hires_two_pass": false,
+            "vae_override": false,
+            "runtime_dependency_on_external_repos": false,
+            "capabilities_route": "/v1/capabilities",
+        },
+    })
+}
+
+pub(crate) fn generate_prequeue_error_report(
+    params: &JobParams,
+    hires_scale: f64,
+) -> serde_json::Value {
+    let mut report = generate_preflight_report(params, hires_scale);
+    if let Some(map) = report.as_object_mut() {
+        map.insert("schema".to_string(), json!("serenity.generate.error.v1"));
+        map.insert("same_gate_as_preflight".to_string(), json!(true));
+        map.insert("enqueue_blocked".to_string(), json!(true));
+    }
+    report
+}
+
+pub(crate) fn validate_generate_prequeue_for_enqueue(
+    params: &JobParams,
+    hires_scale: f64,
+) -> Result<(), String> {
+    validate_generate_runtime_ready(params, hires_scale).map(|_| ())
+}
+
 #[derive(Debug, Deserialize)]
 struct ProgressQuery {
     job: String,
@@ -274,19 +981,173 @@ struct CancelRequest {
     job: String,
 }
 
+fn params_from_generate_request(
+    req: GenerateRequest,
+    job_id: &str,
+    out_dir: &str,
+) -> (JobParams, f64, f64) {
+    let mut params = JobParams::default();
+    params.job_id = job_id.to_string();
+    params.model = req.model;
+    if let Some(v) = req.prompt_json {
+        params.prompt = json_prompt_to_string(&v, "prompt_json").unwrap_or_default();
+    } else if let Some(v) = req.prompt {
+        params.prompt = v;
+    } else if let Some(v) = req.prompt_raw {
+        params.prompt = v;
+    }
+    if let Some(v) = req.negative {
+        params.negative = v;
+    }
+    if let Some(v) = req.width {
+        params.width = v;
+    }
+    if let Some(v) = req.height {
+        params.height = v;
+    }
+    if let Some(v) = req.steps {
+        params.steps = v;
+    }
+    if let Some(v) = req.seed {
+        params.seed = v;
+    }
+    if let Some(v) = req.sampler {
+        params.sampler = v;
+    }
+    if let Some(v) = req.scheduler {
+        params.scheduler = v;
+    }
+    if let Some(v) = req.cfg {
+        params.cfg = v;
+    }
+    if let Some(v) = req.sigma_shift {
+        params.sigma_shift = v;
+    }
+    if let Some(v) = req.cfg_override {
+        params.cfg_override = v;
+    }
+    if let Some(v) = req.cfg_override_start_percent {
+        params.cfg_override_start_percent = v;
+    }
+    if let Some(v) = req.cfg_override_end_percent {
+        params.cfg_override_end_percent = v;
+    }
+    if let Some(v) = req.images {
+        params.images = v;
+    }
+    if let Some(v) = req.creativity {
+        params.creativity = v;
+    }
+    if let Some(v) = req.workflow_save_prefix {
+        params.workflow_save_prefix = v;
+    }
+    if let Some(v) = req.loras {
+        params.loras = v;
+    }
+    if let Some(v) = req.init_image {
+        params.init_image = v;
+    }
+    if let Some(v) = req.mask_image {
+        params.mask_image = v;
+    }
+    if let Some(v) = req.lanpaint_mask_channel {
+        params.lanpaint_mask_channel = v;
+    }
+    if let Some(v) = req.clip_skip {
+        params.clip_skip = v;
+    }
+    if let Some(v) = req.eta {
+        params.eta = v;
+    }
+    if let Some(v) = req.sigma_min {
+        params.sigma_min = v;
+    }
+    if let Some(v) = req.sigma_max {
+        params.sigma_max = v;
+    }
+    if let Some(v) = req.restart_sampling {
+        params.restart_sampling = v;
+    }
+    if let Some(v) = req.vae {
+        params.vae = v;
+    }
+    let hires_scale = match req.hires_scale {
+        Some(v) if v.is_finite() => v.clamp(1.0, 4.0),
+        _ => 1.0,
+    };
+    let hires_denoise = match req.hires_denoise {
+        Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
+        _ => 0.4,
+    };
+    params.out_dir = out_dir.to_string();
+    (params, hires_scale, hires_denoise)
+}
+
 // ── CLI ─────────────────────────────────────────────────────────────────────--
 
-/// CLI: --worker <path> [--kind <k>] [--port 7801] [--out-dir DIR]
+#[derive(Debug, Clone)]
+struct CliConfig {
+    worker: PathBuf,
+    port: u16,
+    out_dir: PathBuf,
+    worker_args: Vec<String>,
+    backend_name: String,
+}
+
+fn backend_name_from_worker_bin(worker: &std::path::Path) -> String {
+    worker
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.strip_prefix("serenity_worker_").unwrap_or(s).to_string())
+        .unwrap_or_else(|| BACKEND_NAME.to_string())
+}
+
+fn make_cli_config(
+    worker: PathBuf,
+    port: u16,
+    out_dir: PathBuf,
+    kind: Option<String>,
+    daemon_worker_kind: Option<String>,
+) -> CliConfig {
+    let worker_args = daemon_worker_kind
+        .as_ref()
+        .map(|k| vec!["worker".to_string(), k.clone()])
+        .unwrap_or_default();
+    let backend_name = kind
+        .or_else(|| daemon_worker_kind.clone())
+        .unwrap_or_else(|| backend_name_from_worker_bin(&worker));
+    CliConfig {
+        worker,
+        port,
+        out_dir,
+        worker_args,
+        backend_name,
+    }
+}
+
+fn default_out_dir() -> PathBuf {
+    std::env::var_os("SERENITY_OUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../output/run_serenity_ui"
+            ))
+        })
+}
+
+/// CLI: --worker <path> [--kind <name>] [--port 7801] [--out-dir DIR]
 ///
-/// `--kind <k>` makes the worker spawn as `<worker> worker <k> <fd>` (the daemon's
-/// internal worker entry, e.g. `serenity_daemon worker zimage <fd>`). Without it,
-/// the worker is spawned as `<worker> <fd>` (the standalone stub takes only the fd).
-fn parse_args() -> (PathBuf, u16, PathBuf, Vec<String>) {
-    let mut worker =
-        PathBuf::from("/home/alex/mojodiffusion/output/bin/serenity_worker_stub");
+/// Standalone Mojo workers in this repo are spawned as `<worker> <fd>`.
+/// `--kind <name>` only overrides the backend identity reported by `/v1/health`.
+/// The legacy monolith entry `serenity_daemon worker <kind> <fd>` is still
+/// available with `--daemon-worker-kind <kind>`.
+fn parse_args() -> CliConfig {
+    let mut worker = PathBuf::from("/home/alex/mojodiffusion/output/bin/serenity_worker_stub");
     let mut port: u16 = 7801;
-    let mut out_dir = PathBuf::from("./serenity_out");
+    let mut out_dir = default_out_dir();
     let mut kind: Option<String> = None;
+    let mut daemon_worker_kind: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -299,6 +1160,11 @@ fn parse_args() -> (PathBuf, u16, PathBuf, Vec<String>) {
             "--kind" => {
                 if let Some(v) = args.next() {
                     kind = Some(v);
+                }
+            }
+            "--daemon-worker-kind" => {
+                if let Some(v) = args.next() {
+                    daemon_worker_kind = Some(v);
                 }
             }
             "--port" => {
@@ -316,7 +1182,7 @@ fn parse_args() -> (PathBuf, u16, PathBuf, Vec<String>) {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "serenity-server --worker <path> [--kind <k>] [--port {port}] [--out-dir {}]",
+                    "serenity-server --worker <path> [--kind <name>] [--daemon-worker-kind <k>] [--port {port}] [--out-dir {}]",
                     out_dir.display()
                 );
                 std::process::exit(0);
@@ -326,13 +1192,7 @@ fn parse_args() -> (PathBuf, u16, PathBuf, Vec<String>) {
             }
         }
     }
-    // The daemon worker entry takes `worker <kind> <fd>`; the standalone stub takes
-    // just `<fd>`. --kind <k> => prepend ["worker", k]; absent => no pre-args.
-    let worker_args = match kind {
-        Some(k) => vec!["worker".to_string(), k],
-        None => Vec::new(),
-    };
-    (worker, port, out_dir, worker_args)
+    make_cli_config(worker, port, out_dir, kind, daemon_worker_kind)
 }
 
 // ── worker-driver thread ──────────────────────────────────────────────────────
@@ -359,6 +1219,21 @@ fn update_record(
     }
 }
 
+fn update_done_record_for_manifest(
+    jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>,
+    id: &str,
+    output_path: &str,
+    params_json: String,
+) -> Option<(jobs::JobRecord, JobParams)> {
+    let mut v = jobs.lock().ok()?;
+    let e = v.iter_mut().find(|e| e.record.id == id)?;
+    e.record.state = "done".to_string();
+    e.record.progress = 100;
+    e.record.output_path = output_path.to_string();
+    e.record.params_json = params_json;
+    Some((e.record.clone(), e.params.clone()))
+}
+
 /// Apply a WorkerEvent to the matching JobRecord (state/step/progress/output/error).
 fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>, id: &str, ev: &WorkerEvent) {
     match ev {
@@ -374,12 +1249,18 @@ fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>, id: &str, ev: &
             // the worker has written the genparams tEXt into the PNG; capture it for
             // the jobs.db row (so the persisted history carries params, like the daemon).
             let pj = gallery::png_genparams_or_empty(output_path);
-            update_record(jobs, id, |r| {
-                r.state = "done".to_string();
-                r.progress = 100;
-                r.output_path = output_path.clone();
-                r.params_json = pj;
-            })
+            if let Some((record, params)) =
+                update_done_record_for_manifest(jobs, id, output_path, pj)
+            {
+                match result_manifest::write_server_result_manifest(&record, &params) {
+                    Ok(path) => {
+                        tracing::info!(%id, manifest = %path, "server result manifest written")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%id, output = %output_path, "server result manifest failed: {error}")
+                    }
+                }
+            }
         }
         WorkerEvent::Failed { error } => update_record(jobs, id, |r| {
             r.state = "failed".to_string();
@@ -392,48 +1273,49 @@ fn apply_event_to_record(jobs: &Arc<Mutex<Vec<jobs::JobEntry>>>, id: &str, ev: &
 
 fn kind_from_bin(bin: &std::path::Path) -> String {
     let name = bin.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if name.contains("ideogram") { "ideogram4".to_string() }
-    else if name.contains("qwen") { "qwenimage".to_string() }
-    else if name.contains("sdxl") { "sdxl".to_string() }
-    else if name.contains("klein") { "flux2".to_string() }
-    else if name.contains("sd3") { "sd3".to_string() }
-    else if name.contains("sensenova") { "sensenova".to_string() }
-    else if name.contains("anima") { "anima".to_string() }
-    else if name.contains("lens") { "lens".to_string() }
-    else if name.contains("flux") { "flux".to_string() }
-    else if name.contains("stub") { "stub".to_string() }
-    else { "zimage".to_string() }
+    if name.contains("ideogram") {
+        "ideogram4".to_string()
+    } else if name.contains("qwen") {
+        "qwenimage".to_string()
+    } else if name.contains("sdxl")
+        || name.contains("sd_xl")
+        || name.contains("sd-xl")
+        || name.contains("sd xl")
+    {
+        "sdxl".to_string()
+    } else if name.contains("klein") {
+        "flux2".to_string()
+    } else if name.contains("sd3") {
+        "sd3".to_string()
+    } else if name.contains("sensenova") {
+        "sensenova".to_string()
+    } else if name.contains("anima") {
+        "anima".to_string()
+    } else if name.contains("lens") {
+        "lens".to_string()
+    } else if name.contains("flux") {
+        "flux".to_string()
+    } else if name.contains("stub") {
+        "stub".to_string()
+    } else {
+        "zimage".to_string()
+    }
 }
 
 /// Map a request's model -> (kind, worker binary in the same dir). One GPU = one
 /// resident model, so the driver swaps the worker binary when the kind changes.
-fn worker_for_model(cur_bin: &std::path::Path, model: &str) -> (String, PathBuf) {
+/// This intentionally delegates to `model_family` so prequeue admission and
+/// worker dispatch cannot drift to different model-family classifiers.
+fn worker_for_model(cur_bin: &std::path::Path, model: &str) -> Result<(String, PathBuf), String> {
     let dir = cur_bin
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("output/bin"));
-    let m = model.to_lowercase();
-    if m.contains("ideogram") {
-        ("ideogram4".to_string(), dir.join("serenity_worker_ideogram4"))
-    } else if m.contains("qwen") {
-        ("qwenimage".to_string(), dir.join("serenity_worker_qwenimage"))
-    } else if m.contains("sdxl") {
-        ("sdxl".to_string(), dir.join("serenity_worker_sdxl"))
-    } else if m.contains("klein") || m.contains("flux2") {
-        ("flux2".to_string(), dir.join("serenity_worker_klein"))
-    } else if m.contains("sd3") || m.contains("sd35") {
-        ("sd3".to_string(), dir.join("serenity_worker_sd3"))
-    } else if m.contains("sensenova") {
-        ("sensenova".to_string(), dir.join("serenity_worker_sensenova"))
-    } else if m.contains("anima") {
-        ("anima".to_string(), dir.join("serenity_worker_anima"))
-    } else if m.contains("lens") {
-        ("lens".to_string(), dir.join("serenity_worker_lens"))
-    } else if m.contains("flux") {
-        ("flux".to_string(), dir.join("serenity_worker_flux"))
-    } else {
-        ("zimage".to_string(), dir.join("serenity_worker_zimage"))
-    }
+    let family = model_family(model)?;
+    Ok((
+        family.backend_key().to_string(),
+        dir.join(family.worker_binary_name()),
+    ))
 }
 
 fn run_worker_driver(
@@ -510,8 +1392,30 @@ fn run_worker_driver(
         // Per-job model -> worker SWAP (single GPU: one resident model at a time).
         // The CPU 'stub' worker serves everything, so never swap it out.
         if current_kind != "stub" {
-            let (want_kind, want_bin) = worker_for_model(&worker_bin, &params.model);
-            if want_kind != current_kind && want_bin.exists() {
+            let (want_kind, want_bin) = match worker_for_model(&worker_bin, &params.model) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    tracing::error!(%job_id, model = %params.model, "model dispatch rejected: {error}");
+                    let ev = WorkerEvent::Failed { error };
+                    apply_event_to_record(&jobs, &job_id, &ev);
+                    channel.publish(ev);
+                    schedule_evict(&registry, &job_id);
+                    continue;
+                }
+            };
+            if want_kind != current_kind {
+                if !want_bin.exists() {
+                    let error = format!(
+                        "worker binary unavailable for backend '{want_kind}': {}",
+                        want_bin.display()
+                    );
+                    tracing::error!(%job_id, model = %params.model, "model dispatch rejected: {error}");
+                    let ev = WorkerEvent::Failed { error };
+                    apply_event_to_record(&jobs, &job_id, &ev);
+                    channel.publish(ev);
+                    schedule_evict(&registry, &job_id);
+                    continue;
+                }
                 tracing::info!(%job_id, from = %current_kind, to = %want_kind, "swapping worker for model");
                 if let Some(mut h) = handle.take() {
                     h.kill(); // SIGKILL + wait -> process dies -> GPU driver reclaims its VRAM
@@ -547,7 +1451,9 @@ fn run_worker_driver(
 
         if let Err(e) = h.send_start(&params) {
             tracing::error!(%job_id, "send_start failed: {e:#}");
-            let ev = WorkerEvent::Failed { error: format!("send_start failed: {e}") };
+            let ev = WorkerEvent::Failed {
+                error: format!("send_start failed: {e}"),
+            };
             apply_event_to_record(&jobs, &job_id, &ev);
             channel.publish(ev);
             set_in_flight(&in_flight, None);
@@ -566,7 +1472,14 @@ fn run_worker_driver(
         // an upscaled img2img refine); a single-pass job takes the plain driver.
         let outcome = if hires_scale > 1.0 {
             drive_hires_two_pass(
-                h, &channel, &job_id, &ctl, &jobs, &params, hires_scale, hires_denoise,
+                h,
+                &channel,
+                &job_id,
+                &ctl,
+                &jobs,
+                &params,
+                hires_scale,
+                hires_denoise,
             )
         } else {
             drive_one_job(h, &channel, &job_id, &ctl, &jobs)
@@ -727,7 +1640,9 @@ fn drive_one_job(
                 return JobOutcome::PeerClosed;
             }
             Err(e) => {
-                let ev = WorkerEvent::Failed { error: format!("worker IPC error: {e}") };
+                let ev = WorkerEvent::Failed {
+                    error: format!("worker IPC error: {e}"),
+                };
                 apply_event_to_record(jobs, job_id, &ev);
                 channel.publish(ev);
                 return JobOutcome::IpcError;
@@ -805,7 +1720,9 @@ fn drive_one_pass(
                 return PassResult::PeerClosed;
             }
             Err(e) => {
-                let ev = WorkerEvent::Failed { error: format!("worker IPC error: {e}") };
+                let ev = WorkerEvent::Failed {
+                    error: format!("worker IPC error: {e}"),
+                };
                 apply_event_to_record(jobs, job_id, &ev);
                 channel.publish(ev);
                 return PassResult::IpcError;
@@ -849,7 +1766,9 @@ fn drive_hires_two_pass(
     let hires_src = match upscale_png(&base_path, sw as u32, sh as u32) {
         Ok(p) => p,
         Err(e) => {
-            let ev = WorkerEvent::Failed { error: format!("hires upscale failed: {e}") };
+            let ev = WorkerEvent::Failed {
+                error: format!("hires upscale failed: {e}"),
+            };
             apply_event_to_record(jobs, job_id, &ev);
             channel.publish(ev);
             return JobOutcome::Terminal;
@@ -866,7 +1785,9 @@ fn drive_hires_two_pass(
     tracing::info!(%job_id, base_w = base_params.width, hires_w = sw, "hires refine pass");
     if let Err(e) = handle.send_start(&p2) {
         let _ = std::fs::remove_file(&hires_src);
-        let ev = WorkerEvent::Failed { error: format!("hires pass-2 send_start failed: {e}") };
+        let ev = WorkerEvent::Failed {
+            error: format!("hires pass-2 send_start failed: {e}"),
+        };
         apply_event_to_record(jobs, job_id, &ev);
         channel.publish(ev);
         return JobOutcome::PeerClosed;
@@ -924,16 +1845,107 @@ fn schedule_evict(registry: &Registry, job_id: &str) {
     });
 }
 
+fn attach_workflow_route_metadata(report: &mut JsonValue, req: &JsonValue) {
+    let Some(map) = report.as_object_mut() else {
+        return;
+    };
+    if let Some(route) = req.get("workflow_route_kind") {
+        map.insert("workflow_route_kind".to_string(), route.clone());
+    }
+    if let Some(plan) = req.get("workflow_plan") {
+        map.insert("workflow_plan".to_string(), plan.clone());
+    }
+}
+
 // ── handlers ──────────────────────────────────────────────────────────────────
+
+/// POST /v1/preflight — run the same production prequeue gate as /v1/generate,
+/// but do not allocate a job id, register a channel, or enqueue work. The response
+/// also exposes the local Mojodiffusion block/offload profile for the requested
+/// model family so the UI can show a real memory/block tool without depending on
+/// SFv2, EriDiffusion, or Serenity Python.
+async fn post_preflight(
+    State(st): State<AppState>,
+    Json(mut req_value): Json<serde_json::Value>,
+) -> Response {
+    let has_workflow = req_value
+        .get("workflow")
+        .map(|w| !w.is_null())
+        .unwrap_or(false);
+    if has_workflow {
+        if let Err(err) = lower_request(&mut req_value) {
+            let status =
+                StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::NOT_IMPLEMENTED);
+            return (
+                status,
+                Json(workflow_preflight_report(err.to_string(), &req_value)),
+            )
+                .into_response();
+        }
+    }
+    if has_workflow {
+        if let Err(error) = reject_unsupported_workflow_route(&req_value) {
+            return (
+                StatusCode::OK,
+                Json(workflow_route_preflight_report(error, &req_value)),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) = reject_disabled_raw_surfaces(&req_value) {
+        if has_workflow {
+            return (
+                StatusCode::OK,
+                Json(workflow_feature_preflight_report(error, &req_value)),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::OK,
+            Json(raw_surface_preflight_report(error, &req_value)),
+        )
+            .into_response();
+    }
+    if let Err(error) = normalize_ideogram4_prompt_json(&mut req_value) {
+        return (
+            StatusCode::OK,
+            Json(raw_surface_preflight_report(error, &req_value)),
+        )
+            .into_response();
+    }
+
+    let req: GenerateRequest = match serde_json::from_value(req_value.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "schema": "serenity.generate.preflight.v1",
+                    "admitted": false,
+                    "error": format!("invalid request body: {e}"),
+                    "same_gate_as_generate": true,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let out_dir = st.out_dir.to_string_lossy().into_owned();
+    let (params, hires_scale, _) = params_from_generate_request(req, "preflight", &out_dir);
+    let mut report = generate_preflight_report(&params, hires_scale);
+    if has_workflow {
+        attach_workflow_route_metadata(&mut report, &req_value);
+    }
+    (StatusCode::OK, Json(report)).into_response()
+}
 
 /// POST /v1/generate — accept the RAW request JSON so a Comfy/Swarm `workflow`
 /// graph survives. If the body carries a `workflow` key, lower it through the
 /// serenity-graph executor FIRST (flattening the graph into the flat keys the rest
 /// of this handler reads); a lowering error is surfaced with its own HTTP status
-/// (501 unsupported / 422 bad request) and the message as the body — NOT a 500 and
-/// NOT a silent fallback to txt2img. On success (or for a body without `workflow`),
-/// build JobParams (default + overrides + job_id + out_dir), register a broadcast
-/// channel, enqueue, return {"job_id":...}.
+/// (501 unsupported / 422 bad request) and a machine-readable error envelope —
+/// NOT a 500 and NOT a silent fallback to txt2img. On success (or for a body
+/// without `workflow`), build JobParams (default + overrides + job_id + out_dir),
+/// register a broadcast channel, enqueue, return {"job_id":...}.
 async fn post_generate(
     State(st): State<AppState>,
     Json(mut req_value): Json<serde_json::Value>,
@@ -950,16 +1962,48 @@ async fn post_generate(
         .unwrap_or(false);
     if has_workflow {
         if let Err(err) = lower_request(&mut req_value) {
-            let status = StatusCode::from_u16(err.http_status())
-                .unwrap_or(StatusCode::NOT_IMPLEMENTED);
+            let status =
+                StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::NOT_IMPLEMENTED);
             tracing::warn!(
                 status = err.http_status(),
                 "workflow lowering rejected: {err}"
             );
-            // Body is the GraphError message (mirrors the Mojo daemon's text body);
-            // do NOT 500.
-            return (status, err.to_string()).into_response();
+            return (
+                status,
+                Json(workflow_generate_error_report(err.to_string(), &req_value)),
+            )
+                .into_response();
         }
+    }
+    if has_workflow {
+        if let Err(error) = reject_unsupported_workflow_route(&req_value) {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(workflow_route_generate_error_report(error, &req_value)),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) = reject_disabled_raw_surfaces(&req_value) {
+        if has_workflow {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(workflow_feature_generate_error_report(error, &req_value)),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(raw_surface_generate_error_report(error, &req_value)),
+        )
+            .into_response();
+    }
+    if let Err(error) = normalize_ideogram4_prompt_json(&mut req_value) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(raw_surface_generate_error_report(error, &req_value)),
+        )
+            .into_response();
     }
 
     // Keep the (lowered) request as the genparams body the worker embeds as the PNG's
@@ -986,104 +2030,19 @@ async fn post_generate(
     let n = st.next_id.fetch_add(1, Ordering::Relaxed) + 1;
     let job_id = format!("job-{n:04}");
 
-    // default() then override the provided fields.
-    let mut params = JobParams::default();
-    params.job_id = job_id.clone();
-    params.model = req.model;
-    params.prompt = req.prompt;
-    if let Some(v) = req.negative {
-        params.negative = v;
+    // default() then override the provided fields. The same builder is used by
+    // /v1/preflight so the reported gate cannot drift from enqueue behavior.
+    let out_dir = st.out_dir.to_string_lossy().into_owned();
+    let (mut params, hires_scale, hires_denoise) =
+        params_from_generate_request(req, &job_id, &out_dir);
+
+    if validate_generate_runtime_ready(&params, hires_scale).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(generate_prequeue_error_report(&params, hires_scale)),
+        )
+            .into_response();
     }
-    if let Some(v) = req.width {
-        params.width = v;
-    }
-    if let Some(v) = req.height {
-        params.height = v;
-    }
-    if let Some(v) = req.steps {
-        params.steps = v;
-    }
-    if let Some(v) = req.seed {
-        params.seed = v;
-    }
-    if let Some(v) = req.sampler {
-        params.sampler = v;
-    }
-    if let Some(v) = req.scheduler {
-        params.scheduler = v;
-    }
-    if let Some(v) = req.cfg {
-        params.cfg = v;
-    }
-    // Workflow-lowered extras (only present after lower_request).
-    if let Some(v) = req.sigma_shift {
-        params.sigma_shift = v;
-    }
-    if let Some(v) = req.cfg_override {
-        params.cfg_override = v;
-    }
-    if let Some(v) = req.cfg_override_start_percent {
-        params.cfg_override_start_percent = v;
-    }
-    if let Some(v) = req.cfg_override_end_percent {
-        params.cfg_override_end_percent = v;
-    }
-    if let Some(v) = req.images {
-        params.images = v;
-    }
-    if let Some(v) = req.creativity {
-        params.creativity = v;
-    }
-    if let Some(v) = req.workflow_save_prefix {
-        params.workflow_save_prefix = v;
-    }
-    if let Some(v) = req.loras {
-        params.loras = v;
-    }
-    // img2img / inpaint passthrough — without these the worker silently runs
-    // txt2img even when the request carried an init/mask (measured 2026-06-14).
-    if let Some(v) = req.init_image {
-        params.init_image = v;
-    }
-    if let Some(v) = req.mask_image {
-        params.mask_image = v;
-    }
-    if let Some(v) = req.lanpaint_mask_channel {
-        params.lanpaint_mask_channel = v;
-    }
-    // Advanced-sampling knobs — forwarded to the worker wire verbatim. The worker
-    // decides per-knob whether it can honor it; unsupported ones produce a one-line
-    // warning on the worker (never a silent drop). See zimage_backend warn helper.
-    if let Some(v) = req.clip_skip {
-        params.clip_skip = v;
-    }
-    if let Some(v) = req.eta {
-        params.eta = v;
-    }
-    if let Some(v) = req.sigma_min {
-        params.sigma_min = v;
-    }
-    if let Some(v) = req.sigma_max {
-        params.sigma_max = v;
-    }
-    if let Some(v) = req.restart_sampling {
-        params.restart_sampling = v;
-    }
-    if let Some(v) = req.vae {
-        params.vae = v;
-    }
-    // Hires-fix lives on the JobEntry (control plane), never in the worker wire.
-    // Clamp hard: an unbounded scale would drive a multi-TB image-crate alloc on
-    // the driver thread (OOM kills the desktop, per CLAUDE.md); NaN -> disabled.
-    let hires_scale = match req.hires_scale {
-        Some(v) if v.is_finite() => v.clamp(1.0, 4.0),
-        _ => 1.0,
-    };
-    let hires_denoise = match req.hires_denoise {
-        Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
-        _ => 0.4,
-    };
-    params.out_dir = st.out_dir.to_string_lossy().into_owned();
 
     // Build the genparams the worker embeds in the PNG tEXt: the lowered request +
     // schema + the server-assigned job_id (the UI's "reuse params" round-trips this,
@@ -1091,7 +2050,8 @@ async fn post_generate(
     {
         let mut gp = genparams_value;
         if let Some(obj) = gp.as_object_mut() {
-            obj.entry("schema").or_insert(json!("serenity.genparams.v1"));
+            obj.entry("schema")
+                .or_insert(json!("serenity.genparams.v1"));
             obj.insert("job_id".into(), json!(job_id));
             params.params_json = serde_json::to_string(&gp).unwrap_or_default();
         }
@@ -1175,10 +2135,7 @@ async fn post_generate(
 /// POST /v1/cancel — body `{"job":<id>}`. Sends a cancel to the worker IF this job
 /// is the one currently in flight: 200 `{accepted:true}` when accepted, 404 when the
 /// job is unknown or not in flight (single-GPU: only the in-flight job is cancelable).
-async fn post_cancel(
-    State(st): State<AppState>,
-    Json(req): Json<CancelRequest>,
-) -> Response {
+async fn post_cancel(State(st): State<AppState>, Json(req): Json<CancelRequest>) -> Response {
     let cur = match st.in_flight.lock() {
         Ok(g) => g.clone(),
         Err(_) => {
@@ -1233,14 +2190,27 @@ async fn post_cancel_path(State(st): State<AppState>, Path(id): Path<String>) ->
     let prev_state = {
         let mut book = match st.jobs.lock() {
             Ok(b) => b,
-            Err(_) => return djson(StatusCode::INTERNAL_SERVER_ERROR, json!({"detail": "job book poisoned"})),
+            Err(_) => {
+                return djson(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"detail": "job book poisoned"}),
+                )
+            }
         };
         match book.iter_mut().find(|e| e.record.id == id) {
-            None => return djson(StatusCode::NOT_FOUND, json!({"detail": format!("no such job: {id}")})),
+            None => {
+                return djson(
+                    StatusCode::NOT_FOUND,
+                    json!({"detail": format!("no such job: {id}")}),
+                )
+            }
             Some(e) => {
                 let s = e.record.state.clone();
                 if s == "done" || s == "failed" || s == "cancelled" {
-                    return djson(StatusCode::CONFLICT, json!({"detail": format!("job already {s}")}));
+                    return djson(
+                        StatusCode::CONFLICT,
+                        json!({"detail": format!("job already {s}")}),
+                    );
                 }
                 e.cancel_requested = true;
                 if s == "queued" {
@@ -1263,7 +2233,10 @@ async fn post_cancel_path(State(st): State<AppState>, Path(id): Path<String>) ->
         // running: hand the cancel to the driver thread (owns the WorkerHandle).
         let _ = st.ctl.send(DriverCtl::Cancel(id.clone()));
     }
-    djson(StatusCode::OK, json!({ "job_id": id, "state": prev_state, "cancel_requested": true }))
+    djson(
+        StatusCode::OK,
+        json!({ "job_id": id, "state": prev_state, "cancel_requested": true }),
+    )
 }
 
 /// GET /v1/progress?job=<id> — upgrade to WebSocket, REPLAY all buffered events for
@@ -1303,7 +2276,10 @@ fn serve_static_file(base: &std::path::Path, rel: &str) -> Response {
         Ok(bytes) => (
             [
                 (axum::http::header::CONTENT_TYPE, static_content_type(&p)),
-                (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "no-store, must-revalidate",
+                ),
             ],
             bytes,
         )
@@ -1469,6 +2445,13 @@ async fn get_samplers() -> Response {
         .into_response()
 }
 
+/// GET /v1/capabilities — Rust-owned product admission map. This is broader than
+/// `/v1/samplers`: it records supported dimensions and feature-level admission so
+/// the UI and checkers do not have to infer product support model-by-model.
+async fn get_capabilities() -> Json<serde_json::Value> {
+    Json(generate_capabilities_v1())
+}
+
 // ── /upload/image + /upload/mask — land a PNG on disk for the worker's path-based
 //    img2img / inpaint flow (init_image / mask_image are FILESYSTEM PATHS to the
 //    worker, never inline bytes). The Konva canvas paints a mask / drops an init
@@ -1526,7 +2509,13 @@ fn safe_upload_stem(name: &str, fallback: &str) -> String {
         .unwrap_or("");
     let cleaned: String = stem
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let trimmed = cleaned.trim_matches('.').trim_matches('_');
     if trimmed.is_empty() {
@@ -1542,7 +2531,12 @@ fn safe_upload_stem(name: &str, fallback: &str) -> String {
 fn handle_upload(st: &AppState, body: &str, fallback_stem: &str) -> Response {
     let b: serde_json::Value = match serde_json::from_str::<serde_json::Value>(body) {
         Ok(v) if v.is_object() => v,
-        _ => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "upload body must be a JSON object"),
+        _ => {
+            return error_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "upload body must be a JSON object",
+            )
+        }
     };
     // accept the payload under any of the names the canvas / ComfyUI conventions use
     let data = b
@@ -1553,18 +2547,29 @@ fn handle_upload(st: &AppState, body: &str, fallback_stem: &str) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if data.is_empty() {
-        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'data' (base64 PNG) is required");
+        return error_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "'data' (base64 PNG) is required",
+        );
     }
     let bytes = match base64_decode(data) {
         Some(b) if !b.is_empty() => b,
-        _ => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'data' is not valid base64"),
+        _ => {
+            return error_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "'data' is not valid base64",
+            )
+        }
     };
     let req_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let stem = safe_upload_stem(req_name, fallback_stem);
 
     let dir = st.out_dir.join("uploads");
     if std::fs::create_dir_all(&dir).is_err() {
-        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot create uploads dir");
+        return error_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot create uploads dir",
+        );
     }
     // unique per upload so a re-painted mask never collides with a cached file
     let n = st.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1655,14 +2660,27 @@ async fn get_state(State(st): State<AppState>) -> Response {
 async fn post_state(State(st): State<AppState>, body: String) -> Response {
     let obj: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(_) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "state body must be a JSON object"),
+        Err(_) => {
+            return error_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "state body must be a JSON object",
+            )
+        }
     };
     if !obj.is_object() {
-        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "state body must be a JSON object");
+        return error_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "state body must be a JSON object",
+        );
     }
     let state = match obj.get("state") {
         Some(s) if s.is_object() => s.clone(),
-        Some(_) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'state' must be an object"),
+        Some(_) => {
+            return error_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "'state' must be an object",
+            )
+        }
         None => obj.clone(),
     };
     let doc = json!({ "schema": "serenity.ui_state.v1", "state": state });
@@ -1670,7 +2688,12 @@ async fn post_state(State(st): State<AppState>, body: String) -> Response {
     if std::fs::create_dir_all(&dir).is_err() {
         return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot create state dir");
     }
-    if std::fs::write(state_path(&st.out_dir), serde_json::to_string(&doc).unwrap()).is_err() {
+    if std::fs::write(
+        state_path(&st.out_dir),
+        serde_json::to_string(&doc).unwrap(),
+    )
+    .is_err()
+    {
         return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist state");
     }
     json_compact(StatusCode::OK, &doc)
@@ -1698,7 +2721,11 @@ fn preset_by_name(doc: &serde_json::Value, name: &str) -> Option<serde_json::Val
 }
 
 /// `_upsert_preset_doc`: replace-or-append the named preset, preserving order.
-fn upsert_preset_doc(doc: &serde_json::Value, name: &str, params: serde_json::Value) -> serde_json::Value {
+fn upsert_preset_doc(
+    doc: &serde_json::Value,
+    name: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
     let mut out = Vec::new();
     let mut replaced = false;
     if let Some(arr) = doc.get("presets").and_then(|p| p.as_array()) {
@@ -1737,7 +2764,12 @@ fn upsert_and_save(out_dir: &std::path::Path, name: &str, params: serde_json::Va
     if std::fs::create_dir_all(&dir).is_err() {
         return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot create state dir");
     }
-    if std::fs::write(presets_path(out_dir), serde_json::to_string(&updated).unwrap()).is_err() {
+    if std::fs::write(
+        presets_path(out_dir),
+        serde_json::to_string(&updated).unwrap(),
+    )
+    .is_err()
+    {
         return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist presets");
     }
     // daemon returns the upserted preset entry
@@ -1751,14 +2783,27 @@ fn upsert_and_save(out_dir: &std::path::Path, name: &str, params: serde_json::Va
 async fn post_presets_root(State(st): State<AppState>, body: String) -> Response {
     let obj: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(_) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "preset body must be a JSON object"),
+        Err(_) => {
+            return error_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "preset body must be a JSON object",
+            )
+        }
     };
     let name = match obj.get("name").and_then(|n| n.as_str()) {
         Some(n) if !n.is_empty() => n.to_string(),
-        _ => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'name' (string) is required"),
+        _ => {
+            return error_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "'name' (string) is required",
+            )
+        }
     };
     if obj.get("params").is_none() {
-        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "'params' (object) is required");
+        return error_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "'params' (object) is required",
+        );
     }
     let params = match preset_params_from_body(&obj) {
         Ok(p) => p,
@@ -1768,12 +2813,19 @@ async fn post_presets_root(State(st): State<AppState>, body: String) -> Response
 }
 
 /// POST /v1/presets/:name — name from path, params from body.
-async fn post_preset_named(State(st): State<AppState>, Path(name): Path<String>, body: String) -> Response {
+async fn post_preset_named(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    body: String,
+) -> Response {
     if name.is_empty() || name.contains('/') {
-        return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "invalid preset name in path");
+        return error_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid preset name in path",
+        );
     }
-    let obj: serde_json::Value =
-        serde_json::from_str(&body).unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let obj: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let params = match preset_params_from_body(&obj) {
         Ok(p) => p,
         Err(e) => return error_detail(StatusCode::UNPROCESSABLE_ENTITY, e),
@@ -1800,7 +2852,12 @@ async fn delete_preset(State(st): State<AppState>, Path(name): Path<String>) -> 
     let updated = json!({ "schema": "serenity.presets.v1", "presets": kept });
     let dir = st.out_dir.join("state");
     let _ = std::fs::create_dir_all(&dir);
-    if std::fs::write(presets_path(&st.out_dir), serde_json::to_string(&updated).unwrap()).is_err() {
+    if std::fs::write(
+        presets_path(&st.out_dir),
+        serde_json::to_string(&updated).unwrap(),
+    )
+    .is_err()
+    {
         return error_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist presets");
     }
     json_compact(
@@ -1814,6 +2871,572 @@ async fn delete_preset(State(st): State<AppState>, Path(name): Path<String>) -> 
 #[cfg(test)]
 mod endpoint_tests {
     use super::*;
+
+    fn valid_t2i_params(model: &str) -> JobParams {
+        let mut params = JobParams::default();
+        params.model = model.to_string();
+        params.prompt = "a production gate test prompt".to_string();
+        let normalized = model.to_ascii_lowercase();
+        if normalized.contains("klein") {
+            params.width = 512;
+            params.height = 512;
+        } else {
+            params.width = 1024;
+            params.height = 1024;
+        }
+        params.steps = 2;
+        params
+    }
+
+    #[test]
+    fn cli_kind_is_display_only_for_standalone_workers() {
+        let cfg = make_cli_config(
+            PathBuf::from("/tmp/serenity_worker_stub"),
+            7801,
+            PathBuf::from("/tmp/out"),
+            Some("stub".to_string()),
+            None,
+        );
+        assert_eq!(cfg.backend_name, "stub");
+        assert!(
+            cfg.worker_args.is_empty(),
+            "--kind must not be forwarded to standalone fd-only workers"
+        );
+    }
+
+    #[test]
+    fn cli_daemon_worker_kind_keeps_legacy_monolith_argv() {
+        let cfg = make_cli_config(
+            PathBuf::from("/tmp/serenity_daemon"),
+            7801,
+            PathBuf::from("/tmp/out"),
+            None,
+            Some("zimage".to_string()),
+        );
+        assert_eq!(cfg.backend_name, "zimage");
+        assert_eq!(
+            cfg.worker_args,
+            vec!["worker".to_string(), "zimage".to_string()]
+        );
+    }
+
+    #[test]
+    fn cli_derives_backend_from_standalone_worker_binary() {
+        let cfg = make_cli_config(
+            PathBuf::from("/tmp/serenity_worker_qwenimage"),
+            7801,
+            PathBuf::from("/tmp/out"),
+            None,
+            None,
+        );
+        assert_eq!(cfg.backend_name, "qwenimage");
+        assert!(cfg.worker_args.is_empty());
+    }
+
+    #[test]
+    fn worker_dispatch_uses_admitted_model_family_classifier() {
+        let current = PathBuf::from("/tmp/serenity-bin/serenity_worker_zimage");
+        let cases = [
+            ("zimage", "zimage", "serenity_worker_zimage"),
+            ("ideogram4", "ideogram4", "serenity_worker_ideogram4"),
+            ("sdxl", "sdxl", "serenity_worker_sdxl"),
+            ("sd_xl_base_1.0", "sdxl", "serenity_worker_sdxl"),
+            ("anima", "anima", "serenity_worker_anima"),
+            ("sd3.5-large", "sd3", "serenity_worker_sd3"),
+            ("flux-dev", "flux", "serenity_worker_flux"),
+            ("klein-9b", "flux2", "serenity_worker_klein"),
+            ("sensenova-u1", "sensenova", "serenity_worker_sensenova"),
+        ];
+
+        for (model, want_kind, want_bin) in cases {
+            let (kind, bin) = worker_for_model(&current, model).unwrap();
+            assert_eq!(kind, want_kind, "model={model}");
+            assert_eq!(bin, PathBuf::from("/tmp/serenity-bin").join(want_bin));
+        }
+    }
+
+    #[test]
+    fn worker_dispatch_rejects_blocked_model_families() {
+        let current = PathBuf::from("/tmp/serenity-bin/serenity_worker_zimage");
+        for model in [
+            "qwen-image",
+            "qwen-image-edit",
+            "klein-4b",
+            "flux2-dev",
+            "microsoft-lens",
+        ] {
+            assert!(
+                worker_for_model(&current, model).is_err(),
+                "blocked model must not dispatch: {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_request_accepts_loras_alias_from_canvas() {
+        let req: GenerateRequest = serde_json::from_value(json!({
+            "model": "zimage",
+            "prompt": "test",
+            "loras": [{"name": "adapter.safetensors", "weight": 0.7}]
+        }))
+        .unwrap();
+        let loras = req.loras.unwrap();
+        assert_eq!(loras.len(), 1);
+        assert_eq!(loras[0].name, "adapter.safetensors");
+        assert_eq!(loras[0].weight, 0.7);
+    }
+
+    #[test]
+    fn generate_request_accepts_ideogram_prompt_json_bbox_and_logitnormal_scheduler() {
+        let mut req_value = json!({
+            "model": "ideogram4",
+            "prompt_json": {
+                "caption": "a product label locked to the marked package face",
+                "objects": [
+                    {"label": "package", "bbox": [128, 192, 768, 832]}
+                ]
+            },
+            "width": 1024,
+            "height": 1024,
+            "steps": 12,
+            "seed": 7,
+            "sampler": "euler",
+            "scheduler": "ideogram_logitnormal",
+            "creativity": 0.5
+        });
+
+        normalize_ideogram4_prompt_json(&mut req_value).unwrap();
+        let prompt = req_value["prompt"].as_str().unwrap().to_string();
+        assert!(
+            prompt.contains("\"caption\""),
+            "prompt_json lost caption: {prompt}"
+        );
+        assert!(
+            prompt.contains("\"bbox\""),
+            "prompt_json lost bbox: {prompt}"
+        );
+        assert_eq!(req_value["prompt_raw"].as_str(), Some(prompt.as_str()));
+
+        let req: GenerateRequest = serde_json::from_value(req_value).unwrap();
+        let (params, hires_scale, _) =
+            params_from_generate_request(req, "job-ideogram-json", "/tmp/out");
+        assert_eq!(params.prompt, prompt);
+        assert_eq!(params.scheduler, "ideogram_logitnormal");
+        assert_eq!(
+            validate_generate_prequeue(&params, hires_scale).unwrap(),
+            ModelFamily::Ideogram4
+        );
+    }
+
+    #[test]
+    fn production_validator_admits_docs_verified_t2i_families() {
+        let cases = [
+            ("zimage", ModelFamily::ZImage),
+            ("ideogram4", ModelFamily::Ideogram4),
+            ("sdxl", ModelFamily::Sdxl),
+            ("sd_xl_base_1.0", ModelFamily::Sdxl),
+            ("anima", ModelFamily::Anima),
+            ("sd3.5-large", ModelFamily::Sd3),
+            ("flux-dev", ModelFamily::Flux),
+            ("klein-9b", ModelFamily::Flux2),
+            ("sensenova-u1", ModelFamily::Sensenova),
+        ];
+
+        for (model, family) in cases {
+            let params = valid_t2i_params(model);
+            assert_eq!(validate_generate_prequeue(&params, 1.0).unwrap(), family);
+        }
+    }
+
+    #[test]
+    fn production_validator_blocks_unadmitted_or_out_of_scope_features() {
+        let mut params = valid_t2i_params("klein-4b");
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("Klein/Flux2"));
+
+        params = valid_t2i_params("klein-9b");
+        params.width = 1024;
+        params.height = 1024;
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("admitted product shapes"));
+
+        params = valid_t2i_params("zimage");
+        params.width = 256;
+        params.height = 256;
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("admitted product shapes"));
+
+        params = valid_t2i_params("klein-9b");
+        params.width = 256;
+        params.height = 256;
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("admitted product shapes"));
+
+        params = valid_t2i_params("sensenova-u1");
+        params.width = 512;
+        params.height = 512;
+        assert_eq!(
+            validate_generate_prequeue(&params, 1.0).unwrap(),
+            ModelFamily::Sensenova
+        );
+
+        params = valid_t2i_params("sensenova-u1");
+        params.width = 1536;
+        params.height = 1536;
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("admitted product shapes"));
+
+        params = valid_t2i_params("sensenova-u1");
+        params.negative = "low quality".to_string();
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("negative prompt"));
+
+        params = valid_t2i_params("klein-9b");
+        params.negative = "low quality".to_string();
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("negative prompt"));
+
+        params = valid_t2i_params("ideogram4");
+        params.width = 1280;
+        params.height = 768;
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("admitted product shapes"));
+
+        params = valid_t2i_params("qwen-image");
+        params.loras.push(LoraSpec {
+            name: "adapter.safetensors".to_string(),
+            weight: 1.0,
+        });
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("metadata/preflight-only"));
+
+        params = valid_t2i_params("flux-dev");
+        params.negative = "low quality".to_string();
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("negative prompt"));
+
+        params = valid_t2i_params("zimage");
+        params.init_image = "/tmp/init.png".to_string();
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("image-to-image"));
+
+        params = valid_t2i_params("zimage");
+        params.vae = "sdxl_vae.safetensors".to_string();
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("VAE override"));
+
+        params = valid_t2i_params("zimage");
+        assert!(validate_generate_prequeue(&params, 2.0)
+            .unwrap_err()
+            .contains("hires two-pass"));
+    }
+
+    #[test]
+    fn preflight_report_blocks_qwen_but_exposes_block_budget() {
+        let mut params = valid_t2i_params("qwen-image");
+        params.out_dir = "/tmp/serenity_product_gallery".to_string();
+        let report = generate_preflight_report(&params, 1.0);
+        assert_eq!(report["schema"], "serenity.generate.preflight.v1");
+        assert_eq!(report["admitted"], false);
+        assert_eq!(report["same_gate_as_generate"], true);
+        assert_eq!(report["backend"], "");
+        assert_eq!(report["output_root"]["root_kind"], "ui_workflow_gallery");
+        assert_eq!(report["output_root"]["root"], "/tmp/serenity_product_gallery");
+        assert_eq!(report["output_root"]["artifact_pattern"], "job-XXXX.png");
+        assert_eq!(
+            report["capability_profile"]["schema"],
+            "serenity.capability_profile.v1"
+        );
+        assert_eq!(report["capability_profile"]["backend"], "qwenimage");
+        assert_eq!(
+            report["capability_profile"]["production_status"],
+            "metadata/preflight-only"
+        );
+        assert_eq!(
+            report["capability_profile"]["features"]["text_to_image"]["supported"],
+            false
+        );
+        assert!(report["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("metadata/preflight-only"));
+        assert_eq!(report["block_profile"]["block_count"], 60);
+        assert_eq!(report["block_profile"]["tensor_count_hint"], 1920);
+        assert_eq!(
+            report["block_profile"]["byte_count_hint_total"],
+            40779755520i64
+        );
+        assert_eq!(report["block_profile"]["vmm_handle_available"], true);
+        assert_eq!(
+            report["artifact_profile"]["schema"],
+            "serenity.artifacts.local.v1"
+        );
+        assert_eq!(report["artifact_profile"]["known_model"], true);
+        assert_eq!(report["artifact_profile"]["ready"], true);
+        assert_eq!(report["artifact_profile"]["family"], "qwenimage");
+        assert_eq!(report["request"]["has_vae_override"], false);
+        assert_eq!(report["limits"]["vae_override"], false);
+        assert_eq!(
+            report["artifact_profile"]["storage_policy"]["runtime_dependency_on_external_repos"],
+            false
+        );
+        assert_eq!(
+            report["limits"]["runtime_dependency_on_external_repos"],
+            false
+        );
+    }
+
+    #[test]
+    fn preflight_report_blocks_concrete_vae_override_before_enqueue() {
+        let mut params = valid_t2i_params("zimage");
+        params.vae = "OfficialStableDiffusion/sdxl_vae.safetensors".to_string();
+        let report = generate_preflight_report(&params, 1.0);
+        assert_eq!(report["admitted"], false);
+        assert_eq!(report["capability_profile"]["backend"], "zimage");
+        assert_eq!(
+            report["capability_profile"]["features"]["vae_override"]["supported"],
+            false
+        );
+        assert_eq!(report["request"]["has_vae_override"], true);
+        assert_eq!(
+            report["request"]["vae"],
+            "OfficialStableDiffusion/sdxl_vae.safetensors"
+        );
+        assert!(report["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("VAE override"));
+
+        params.vae = "Automatic".to_string();
+        assert_eq!(
+            validate_generate_prequeue(&params, 1.0).unwrap(),
+            ModelFamily::ZImage
+        );
+    }
+
+    #[test]
+    fn preflight_report_admits_bounded_klein_and_keeps_local_block_profile() {
+        let params = valid_t2i_params("klein-9b");
+        let report = generate_preflight_report(&params, 1.0);
+        assert_eq!(report["admitted"], true);
+        assert_eq!(report["backend"], "flux2");
+        assert_eq!(report["capability_profile"]["backend"], "flux2");
+        assert_eq!(
+            report["capability_profile"]["production_status"],
+            "admitted"
+        );
+        assert_eq!(
+            report["capability_profile"]["features"]["text_to_image"]["supported"],
+            true
+        );
+        assert_eq!(
+            report["capability_profile"]["features"]["negative_prompt"]["supported"],
+            false
+        );
+        assert_eq!(
+            report["capability_profile"]["features"]["lora"]["supported"],
+            true
+        );
+        assert_eq!(report["block_profile"]["profile"], "klein9b_flux2_dit");
+        assert_eq!(report["block_profile"]["block_count"], 32);
+        assert_eq!(report["block_profile"]["block_kinds"]["double_stream"], 8);
+        assert_eq!(report["block_profile"]["block_kinds"]["single_stream"], 24);
+        assert_eq!(report["block_profile"]["vmm_handle_available"], true);
+        assert_eq!(report["artifact_profile"]["family"], "flux2");
+        assert_eq!(
+            report["artifact_profile"]["storage_policy"]["runtime_dependency_on_external_repos"],
+            false
+        );
+    }
+
+    #[test]
+    fn preflight_report_admits_sensenova_with_local_artifacts() {
+        let params = valid_t2i_params("sensenova-u1");
+        let report = generate_preflight_report(&params, 1.0);
+        assert_eq!(report["admitted"], true);
+        assert_eq!(report["backend"], "sensenova");
+        assert_eq!(report["capability_profile"]["backend"], "sensenova");
+        assert_eq!(
+            report["capability_profile"]["production_status"],
+            "admitted"
+        );
+        assert_eq!(
+            report["capability_profile"]["features"]["text_to_image"]["supported"],
+            true
+        );
+        assert_eq!(
+            report["capability_profile"]["features"]["negative_prompt"]["supported"],
+            false
+        );
+        assert_eq!(report["block_profile"]["profile"], "sensenova_u1");
+        assert_eq!(report["block_profile"]["block_count"], 42);
+        assert_eq!(report["artifact_profile"]["family"], "sensenova");
+        assert_eq!(report["artifact_profile"]["ready"], true);
+        assert_eq!(report["request"]["width"], 1024);
+        assert_eq!(report["request"]["height"], 1024);
+        assert_eq!(
+            report["capability_profile"]["limits"]["resolution"]["mode"],
+            "shape_dispatch"
+        );
+    }
+
+    #[test]
+    fn static_sampler_registry_advertises_inventory_and_admitted_families() {
+        let doc: serde_json::Value = serde_json::from_str(SAMPLERS_V1).unwrap();
+        let backends = doc["backends"].as_array().unwrap();
+        let names: std::collections::HashSet<&str> = backends
+            .iter()
+            .filter_map(|entry| entry["backend"].as_str())
+            .collect();
+        for expected in [
+            "zimage",
+            "qwenimage",
+            "ideogram4",
+            "sdxl",
+            "anima",
+            "sd3",
+            "flux",
+            "flux2",
+        ] {
+            assert!(
+                names.contains(expected),
+                "missing sampler backend {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_contract_covers_admitted_features_and_fail_loud_limits() {
+        let doc = generate_capabilities_v1();
+        assert_eq!(doc["schema"], "serenity.capabilities.v1");
+        assert_eq!(doc["same_gate_as_generate"], true);
+        assert_eq!(
+            doc["output_contract"]["root_kind"],
+            "ui_workflow_gallery"
+        );
+        assert_eq!(
+            doc["output_contract"]["default_relative_root"],
+            "output/run_serenity_ui"
+        );
+        assert_eq!(
+            doc["output_contract"]["location_field"],
+            "output_location"
+        );
+        assert_eq!(doc["global_limits"]["txt2img_only"], true);
+        assert_eq!(doc["global_limits"]["image_to_image"], false);
+        assert_eq!(
+            doc["global_limits"]["runtime_dependency_on_external_repos"],
+            false
+        );
+
+        let backends = doc["backends"].as_array().unwrap();
+        let backend = |name: &str| -> &serde_json::Value {
+            backends
+                .iter()
+                .find(|entry| entry["backend"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("missing backend capability: {name}"))
+        };
+
+        for name in [
+            "zimage",
+            "ideogram4",
+            "sdxl",
+            "anima",
+            "sd3",
+            "flux",
+            "flux2",
+            "sensenova",
+        ] {
+            let entry = backend(name);
+            assert_eq!(entry["production_status"], "admitted");
+            assert_eq!(entry["features"]["text_to_image"]["supported"], true);
+            assert_eq!(entry["features"]["image_to_image"]["supported"], false);
+            assert_eq!(entry["features"]["image_to_image"]["policy"], "fail_loud");
+            assert_eq!(entry["features"]["outpaint"]["supported"], false);
+            assert_eq!(entry["features"]["outpaint"]["policy"], "fail_loud");
+            assert_eq!(entry["features"]["vae_override"]["supported"], false);
+            assert_eq!(entry["samplers"]["unsupported_policy"], "fail_loud");
+        }
+
+        let zimage = backend("zimage");
+        assert_eq!(zimage["features"]["negative_prompt"]["supported"], true);
+        assert_eq!(zimage["features"]["lora"]["supported"], true);
+        assert!(zimage["samplers"]["supported_schedulers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("sgm_uniform")));
+        assert!(!zimage["samplers"]["supported_schedulers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("karras")));
+
+        let ideogram = backend("ideogram4");
+        assert_eq!(ideogram["features"]["bbox_prompt_json"]["supported"], true);
+        assert_eq!(ideogram["features"]["negative_prompt"]["supported"], false);
+
+        let flux = backend("flux");
+        assert_eq!(flux["features"]["lora"]["max_count"], 1);
+        assert_eq!(flux["features"]["multi_lora"]["supported"], false);
+        assert_eq!(flux["features"]["negative_prompt"]["supported"], false);
+
+        let flux2 = backend("flux2");
+        assert_eq!(flux2["worker_binary"], "serenity_worker_klein");
+        assert_eq!(flux2["limits"]["sizes"][0]["width"], 512);
+        assert_eq!(flux2["features"]["lora"]["max_count"], 1);
+        assert_eq!(flux2["features"]["negative_prompt"]["supported"], false);
+
+        let sensenova = backend("sensenova");
+        assert_eq!(
+            sensenova["worker_binary"],
+            "serenity_worker_sensenova"
+        );
+        assert_eq!(sensenova["limits"]["sizes"][0]["width"], 512);
+        assert_eq!(sensenova["limits"]["sizes"][0]["height"], 512);
+        assert_eq!(sensenova["limits"]["sizes"][1]["width"], 1024);
+        assert_eq!(sensenova["limits"]["sizes"][1]["height"], 1024);
+        assert_eq!(sensenova["limits"]["resolution"]["mode"], "shape_dispatch");
+        assert_eq!(sensenova["features"]["lora"]["supported"], false);
+        assert_eq!(
+            sensenova["features"]["negative_prompt"]["supported"],
+            false
+        );
+
+        let zimage_profile = capability_profile_for_model("z-image");
+        assert_eq!(zimage_profile["schema"], "serenity.capability_profile.v1");
+        assert_eq!(zimage_profile["backend"], "zimage");
+        assert_eq!(zimage_profile["production_status"], "admitted");
+        assert_eq!(
+            zimage_profile["features"]["negative_prompt"]["supported"],
+            true
+        );
+
+        let qwen_profile = capability_profile_for_model("qwen-image");
+        assert_eq!(qwen_profile["schema"], "serenity.capability_profile.v1");
+        assert_eq!(qwen_profile["backend"], "qwenimage");
+        assert_eq!(qwen_profile["production_status"], "metadata/preflight-only");
+        assert_eq!(
+            qwen_profile["features"]["text_to_image"]["supported"],
+            false
+        );
+        assert_eq!(
+            qwen_profile["features"]["image_to_image"]["policy"],
+            "fail_loud"
+        );
+    }
 
     // Locks the daemon-parity shapes (verified byte-identical vs `serenity_daemon
     // stub` via the oracle-diff harness): preset entry = {name,params}, upsert
@@ -1834,9 +3457,9 @@ mod endpoint_tests {
         );
         // append second preserves order
         let two = upsert_preset_doc(&replaced, "b", json!({ "x": 1 }));
-        assert!(serde_json::to_string(&two)
-            .unwrap()
-            .contains(r#""presets":[{"name":"a","params":{"cfg":9.9}},{"name":"b","params":{"x":1}}]"#));
+        assert!(serde_json::to_string(&two).unwrap().contains(
+            r#""presets":[{"name":"a","params":{"cfg":9.9}},{"name":"b","params":{"x":1}}]"#
+        ));
         assert!(preset_by_name(&two, "a").is_some());
         assert!(preset_by_name(&two, "zzz").is_none());
     }
@@ -1856,18 +3479,12 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     // 1. CLI.
-    let (worker_bin, port, out_dir, worker_args) = parse_args();
-    // Backend identity for /v1/health: the --kind, else the worker binary name with the
-    // "serenity_worker_" prefix stripped (e.g. .../serenity_worker_zimage -> "zimage").
-    let backend_name = if worker_args.len() >= 2 && worker_args[0] == "worker" {
-        worker_args[1].clone()
-    } else {
-        worker_bin
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.strip_prefix("serenity_worker_").unwrap_or(s).to_string())
-            .unwrap_or_else(|| BACKEND_NAME.to_string())
-    };
+    let cli = parse_args();
+    let worker_bin = cli.worker;
+    let port = cli.port;
+    let out_dir = cli.out_dir;
+    let worker_args = cli.worker_args;
+    let backend_name = cli.backend_name;
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| anyhow::anyhow!("create out_dir {}: {e}", out_dir.display()))?;
     let out_dir = std::fs::canonicalize(&out_dir).unwrap_or(out_dir);
@@ -1883,7 +3500,11 @@ async fn main() -> anyhow::Result<()> {
     let prior = Arc::new(jobs::load_prior_rows(&out_dir.join("jobs.db")));
     let next_id = Arc::new(AtomicU64::new(jobs::max_prior_id(&prior) as u64));
     let job_book: Arc<Mutex<Vec<jobs::JobEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    tracing::info!(prior_rows = prior.len(), next_id_base = next_id.load(Ordering::Relaxed), "jobs.db loaded");
+    tracing::info!(
+        prior_rows = prior.len(),
+        next_id_base = next_id.load(Ordering::Relaxed),
+        "jobs.db loaded"
+    );
 
     // 2. Worker-driver thread (owns WorkerHandle; handshake waits for Ready). It
     //    receives both jobs and cancels over one control channel so cancel runs on
@@ -1901,7 +3522,16 @@ async fn main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("worker-driver".into())
             .spawn(move || {
-                run_worker_driver(worker_bin, worker_args, ctl_rx, registry, in_flight, job_book, prior_c, db_path)
+                run_worker_driver(
+                    worker_bin,
+                    worker_args,
+                    ctl_rx,
+                    registry,
+                    in_flight,
+                    job_book,
+                    prior_c,
+                    db_path,
+                )
             })
             .map_err(|e| anyhow::anyhow!("spawn worker-driver thread: {e}"))?;
     }
@@ -1919,6 +3549,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Router.
     let app = Router::new()
+        .route("/v1/preflight", post(post_preflight))
         .route("/v1/generate", post(post_generate))
         .route("/v1/grid", post(grid::post_grid))
         .route("/v1/cancel", post(post_cancel))
@@ -1926,6 +3557,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/progress", get(ws_progress))
         .route("/v1/health", get(get_health))
         .route("/v1/samplers", get(get_samplers))
+        .route("/v1/capabilities", get(get_capabilities))
         // Phase 6 — mask/image upload seam: land a PNG on disk so the worker's
         // path-based img2img/inpaint flow (init_image/mask_image) can read it.
         .route("/upload/image", post(post_upload_image))
@@ -1935,6 +3567,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/magic_prompt", post(magic::post_magic_prompt))
         .route("/v1/jobs", get(jobs::get_jobs))
         .route("/v1/job/:id", get(jobs::get_job_one))
+        .route("/v1/job/:id/result", get(result_manifest::get_job_result))
         .route("/v1/reorder", post(jobs::post_reorder))
         .route("/v1/remove", post(jobs::post_remove))
         .route("/v1/video", get(video::get_video).post(video::post_video))
@@ -1943,14 +3576,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/gallery/read", get(gallery::get_gallery_read))
         .route("/v1/gallery/import", post(gallery::post_import))
         .route("/v1/gallery/order", post(gallery::post_order))
-        .route("/v1/gallery/:id", get(gallery::get_gallery_one).delete(gallery::delete_item))
+        .route(
+            "/v1/gallery/:id",
+            get(gallery::get_gallery_one).delete(gallery::delete_item),
+        )
         .route("/v1/gallery/:id/rename", post(gallery::post_rename))
         .route("/v1/gallery/:id/favorite", post(gallery::post_favorite))
         .route("/v1/state", get(get_state).post(post_state))
         .route("/v1/presets", get(get_presets).post(post_presets_root))
         .route(
             "/v1/presets/:name",
-            get(get_preset_one).post(post_preset_named).delete(delete_preset),
+            get(get_preset_one)
+                .post(post_preset_named)
+                .delete(delete_preset),
         )
         // --- Serenity Studio Konva frontend (static) + browser-fetchable result images ---
         .route("/out/*path", get(serve_out))

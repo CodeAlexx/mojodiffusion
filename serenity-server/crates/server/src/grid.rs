@@ -9,7 +9,8 @@
 //! image PER Z-PAGE (X across, Y down). Single Z (or no Z) is one page.
 //!
 //! CONTRACT
-//!   request  (flat JSON, like /v1/generate, plus grid keys):
+//!   request  (flat JSON, or an image workflow that lowers like /v1/generate,
+//!             plus grid keys):
 //!     LEGACY single-axis (still accepted):
 //!       { "axis": "seed"|"cfg"|"steps"|"sampler"|"scheduler",
 //!         "values": [ ... ], ...generate fields... }
@@ -17,9 +18,13 @@
 //!       { "x_axis": "<axis>", "x_values": [ ... ],
 //!         "y_axis"?: "<axis>", "y_values"?: [ ... ],
 //!         "z_axis"?: "<axis>", "z_values"?: [ ... ],
-//!         "model": "...", "prompt": "...",   // + the usual flat generate fields
+//!         "model": "...", "prompt": "...",   // + the usual generate fields
 //!         "negative"?, "width"?, "height"?, "steps"?, "seed"?,
 //!         "sampler"?, "scheduler"?, "cfg"?, "out_dir"? }
+//!     WORKFLOW grid requests first lower through serenity-graph. Only image
+//!     workflow routes are accepted by this image-grid compositor; non-image or
+//!     unsupported workflow routes return the same structured generate error as
+//!     `/v1/generate` before any cell is enqueued.
 //!     Numeric axes (seed/cfg/steps) consume JSON numbers; string axes
 //!     (sampler/scheduler) consume JSON strings. The SAME axis may not be used
 //!     on two dimensions. Total cells = |X|*|Y|*|Z| is capped at MAX_CELLS.
@@ -51,8 +56,18 @@ use axum::Json;
 use image::{ImageFormat, Rgb, RgbImage};
 use serde_json::{json, Value};
 
+use crate::capabilities::{
+    json_prompt_to_string, normalize_ideogram4_prompt_json, raw_surface_generate_error_report,
+    reject_disabled_raw_surfaces, reject_unsupported_workflow_route,
+    workflow_feature_generate_error_report, workflow_generate_error_report,
+    workflow_route_generate_error_report,
+};
 use crate::jobs;
-use crate::{AppState, DriverCtl, JobChannel};
+use crate::{
+    generate_prequeue_error_report, validate_generate_prequeue_for_enqueue, AppState, DriverCtl,
+    JobChannel,
+};
+use serenity_graph::lower_request;
 use serenity_wire::JobParams;
 
 // ── tunables ────────────────────────────────────────────────────────────────────
@@ -95,6 +110,44 @@ fn err_detail(status: StatusCode, detail: &str) -> Response {
     json_compact(status, &json!({ "detail": detail }))
 }
 
+fn has_workflow(req: &Value) -> bool {
+    req.get("workflow").map(|w| !w.is_null()).unwrap_or(false)
+}
+
+fn attach_grid_error_context(mut report: Value) -> Value {
+    if let Some(obj) = report.as_object_mut() {
+        obj.insert(
+            "grid".into(),
+            json!({
+                "endpoint": "/v1/grid",
+                "one_generate_job_per_cell": true,
+            }),
+        );
+    }
+    report
+}
+
+fn lower_workflow_for_grid(req: &mut Value) -> Result<bool, (StatusCode, Value)> {
+    if !has_workflow(req) {
+        return Ok(false);
+    }
+    let original = req.clone();
+    if let Err(err) = lower_request(req) {
+        if req.is_null() {
+            *req = original.clone();
+        }
+        let status = StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::NOT_IMPLEMENTED);
+        let report =
+            attach_grid_error_context(workflow_generate_error_report(err.to_string(), &original));
+        return Err((status, report));
+    }
+    if let Err(error) = reject_unsupported_workflow_route(req) {
+        let report = attach_grid_error_context(workflow_route_generate_error_report(error, req));
+        return Err((StatusCode::NOT_IMPLEMENTED, report));
+    }
+    Ok(true)
+}
+
 // ── minimal 5x7 bitmap font ──────────────────────────────────────────────────────
 //
 // A self-contained 5-wide × 7-tall glyph table for the printable ASCII subset the
@@ -110,87 +163,217 @@ const GLYPH_H: u32 = 7;
 const GLYPH_GAP: u32 = 1; // 1px between glyphs
 
 const UNKNOWN: Glyph = [
-    0b11111,
-    0b10001,
-    0b10001,
-    0b10001,
-    0b10001,
-    0b10001,
-    0b11111,
+    0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111,
 ];
 
 /// Map a printable ASCII char to its 5x7 glyph (UNKNOWN box otherwise).
 fn glyph_for(c: char) -> Glyph {
     match c {
         ' ' => [0; 7],
-        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        '2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
-        '3' => [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
-        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
-        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
-        'D' => [0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100],
-        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
-        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
-        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
-        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-        'a' => [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
-        'b' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b11110],
-        'c' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10000, 0b10001, 0b01110],
-        'd' => [0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10001, 0b01111],
-        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110],
-        'f' => [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
-        'g' => [0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
-        'h' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
-        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'j' => [0b00010, 0b00000, 0b00110, 0b00010, 0b00010, 0b10010, 0b01100],
-        'k' => [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010],
-        'l' => [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'm' => [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101],
-        'n' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
-        'o' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
-        'p' => [0b00000, 0b10110, 0b11001, 0b10001, 0b11110, 0b10000, 0b10000],
-        'q' => [0b00000, 0b01101, 0b10011, 0b10001, 0b01111, 0b00001, 0b00001],
-        'r' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
-        's' => [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
-        't' => [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
-        'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
-        'v' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-        'w' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010],
-        'x' => [0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001],
-        'y' => [0b00000, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
-        'z' => [0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111],
-        '=' => [0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000],
-        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
-        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
-        '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000],
-        ':' => [0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000],
-        '_' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111,
+        ],
+        '3' => [
+            0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ],
+        '6' => [
+            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
+        ],
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ],
+        'D' => [
+            0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        'a' => [
+            0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111,
+        ],
+        'b' => [
+            0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b11110,
+        ],
+        'c' => [
+            0b00000, 0b00000, 0b01110, 0b10001, 0b10000, 0b10001, 0b01110,
+        ],
+        'd' => [
+            0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10001, 0b01111,
+        ],
+        'e' => [
+            0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110,
+        ],
+        'f' => [
+            0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000,
+        ],
+        'g' => [
+            0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110,
+        ],
+        'h' => [
+            0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001,
+        ],
+        'i' => [
+            0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        'j' => [
+            0b00010, 0b00000, 0b00110, 0b00010, 0b00010, 0b10010, 0b01100,
+        ],
+        'k' => [
+            0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010,
+        ],
+        'l' => [
+            0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        'm' => [
+            0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101,
+        ],
+        'n' => [
+            0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001,
+        ],
+        'o' => [
+            0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'p' => [
+            0b00000, 0b10110, 0b11001, 0b10001, 0b11110, 0b10000, 0b10000,
+        ],
+        'q' => [
+            0b00000, 0b01101, 0b10011, 0b10001, 0b01111, 0b00001, 0b00001,
+        ],
+        'r' => [
+            0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000,
+        ],
+        's' => [
+            0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110,
+        ],
+        't' => [
+            0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110,
+        ],
+        'u' => [
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101,
+        ],
+        'v' => [
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'w' => [
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010,
+        ],
+        'x' => [
+            0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001,
+        ],
+        'y' => [
+            0b00000, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110,
+        ],
+        'z' => [
+            0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '=' => [
+            0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        '+' => [
+            0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000,
+        ],
+        ':' => [
+            0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000,
+        ],
+        '_' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111,
+        ],
         _ => UNKNOWN,
     }
 }
@@ -295,7 +478,10 @@ impl Axis {
     /// Numeric axes (consume JSON numbers / numeric strings). The string axes
     /// (sampler/scheduler/model/prompt/negative/resolution/lora) consume JSON strings.
     fn is_numeric(self) -> bool {
-        matches!(self, Axis::Seed | Axis::Cfg | Axis::Steps | Axis::Width | Axis::Height)
+        matches!(
+            self,
+            Axis::Seed | Axis::Cfg | Axis::Steps | Axis::Width | Axis::Height
+        )
     }
 }
 
@@ -320,7 +506,13 @@ fn base_params(st: &AppState, req: &Value) -> Result<JobParams, String> {
     if model.is_empty() {
         return Err("'model' (string) is required".into());
     }
-    let prompt = opt_str(req, "prompt").unwrap_or_default();
+    let prompt = opt_str(req, "prompt")
+        .or_else(|| opt_str(req, "prompt_raw"))
+        .or_else(|| {
+            req.get("prompt_json")
+                .and_then(|v| json_prompt_to_string(v, "prompt_json").ok())
+        })
+        .unwrap_or_default();
     if prompt.is_empty() {
         return Err("'prompt' (string) is required".into());
     }
@@ -352,12 +544,10 @@ fn base_params(st: &AppState, req: &Value) -> Result<JobParams, String> {
         p.cfg = v;
     }
     // Advanced-sampling knobs (clip_skip/eta/sigma_min/sigma_max/restart_sampling/
-    // vae): a swept grid must honor the SAME advanced config the user set for a
-    // plain Generate, so lift them onto every cell's base params (the per-cell axis
-    // value then overrides only its own field). The worker HONORS what it supports
-    // and warns-loud on the rest (honor-or-warn); missing keys keep JobParams'
-    // "unset" sentinels (clip_skip 0 / eta+sigma -1.0 / restart_sampling false /
-    // vae "").
+    // vae): a swept grid must honor the same advanced config the user set for a
+    // plain Generate, so lift them onto every cell's base params. The shared
+    // production gate then admits only wired knobs; concrete VAE overrides are
+    // rejected before enqueue because current backends use baked manifest VAEs.
     if let Some(v) = opt_i64(req, "clip_skip") {
         p.clip_skip = v;
     }
@@ -387,7 +577,11 @@ fn base_params(st: &AppState, req: &Value) -> Result<JobParams, String> {
     {
         let mut specs = Vec::with_capacity(arr.len());
         for it in arr {
-            let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let name = it
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if name.is_empty() {
                 continue;
             }
@@ -399,7 +593,8 @@ fn base_params(st: &AppState, req: &Value) -> Result<JobParams, String> {
     // One image per cell — the grid IS the multi-image layout.
     p.images = 1;
     // out_dir: explicit request override else the server-configured out_dir.
-    p.out_dir = opt_str(req, "out_dir").unwrap_or_else(|| st.out_dir.to_string_lossy().into_owned());
+    p.out_dir =
+        opt_str(req, "out_dir").unwrap_or_else(|| st.out_dir.to_string_lossy().into_owned());
     Ok(p)
 }
 
@@ -462,7 +657,9 @@ fn apply_axis(p: &mut JobParams, axis: Axis, value: &Value) -> Result<String, St
         }
         Axis::Resolution => {
             // "WxH" (also accepts "W*H" / "W,H" / "WXH"). Sets BOTH width and height.
-            let s = value.as_str().ok_or("resolution values must be strings (\"WxH\")")?;
+            let s = value
+                .as_str()
+                .ok_or("resolution values must be strings (\"WxH\")")?;
             let (w, h) = parse_resolution(s)
                 .ok_or_else(|| format!("resolution '{s}' must be \"WxH\" (e.g. \"1024x768\")"))?;
             p.width = w;
@@ -473,14 +670,19 @@ fn apply_axis(p: &mut JobParams, axis: Axis, value: &Value) -> Result<String, St
             // "name:weight" or "name" (weight defaults 1.0); "none"/""/"-" clears the
             // stack. REPLACES the inherited LoRA stack with this single overlay so each
             // cell isolates exactly one LoRA (SwarmUI's <lora:..> axis behavior).
-            let s = value.as_str().ok_or("lora values must be strings (\"name:weight\")")?;
+            let s = value
+                .as_str()
+                .ok_or("lora values must be strings (\"name:weight\")")?;
             let trimmed = s.trim();
             if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || trimmed == "-" {
                 p.loras.clear();
                 Ok("none".to_string())
             } else {
                 let (name, weight) = parse_lora(trimmed);
-                p.loras = vec![serenity_wire::LoraSpec { name: name.clone(), weight }];
+                p.loras = vec![serenity_wire::LoraSpec {
+                    name: name.clone(),
+                    weight,
+                }];
                 // label: bare lora file stem + weight when not 1.0.
                 let stem = lora_stem(&name);
                 if (weight - 1.0).abs() < 1e-9 {
@@ -665,8 +867,17 @@ fn coerce_numeric_token(tok: &str, axis: Axis, values_key: &str) -> Result<Value
 ///   "10,..,1"         → 10, 9, ... 1             (descending, step -1)
 ///   "0,SKIP:2,..,8"   → not supported inside a range; SKIP only as a standalone entry
 /// Caps the generated count at MAX_VALUES so a runaway range can't blow the axis cap.
-fn expand_numeric_csv(spec: &str, axis: Axis, values_key: &str, out: &mut Vec<Value>) -> Result<(), String> {
-    let toks: Vec<&str> = spec.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+fn expand_numeric_csv(
+    spec: &str,
+    axis: Axis,
+    values_key: &str,
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
+    let toks: Vec<&str> = spec
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
     let is_float = matches!(axis, Axis::Cfg);
     let mut i = 0usize;
     while i < toks.len() {
@@ -690,7 +901,15 @@ fn expand_numeric_csv(spec: &str, axis: Axis, values_key: &str, out: &mut Vec<Va
                 let a = json_to_f64(&out[out.len() - 2]);
                 let b = json_to_f64(&out[out.len() - 1]);
                 let d = b - a;
-                if d == 0.0 { if end >= start { 1.0 } else { -1.0 } } else { d }
+                if d == 0.0 {
+                    if end >= start {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                } else {
+                    d
+                }
             } else if end >= start {
                 1.0
             } else {
@@ -728,7 +947,9 @@ fn expand_numeric_csv(spec: &str, axis: Axis, values_key: &str, out: &mut Vec<Va
 }
 
 fn json_to_f64(v: &Value) -> f64 {
-    v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)).unwrap_or(0.0)
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|n| n as f64))
+        .unwrap_or(0.0)
 }
 
 /// Push a numeric value as the right JSON type (i64 for integer axes, f64 for cfg),
@@ -767,13 +988,12 @@ fn parse_axis_spec(req: &Value, prefix: &str) -> Result<Option<AxisSpec>, String
         Some(_) => return Err(format!("'{axis_key}' must not be empty")),
         None => return Ok(None),
     };
-    let axis = Axis::parse(&axis_str).ok_or_else(|| {
-        format!("'{axis_key}' must be one of: {AXIS_NAMES}")
-    })?;
+    let axis = Axis::parse(&axis_str)
+        .ok_or_else(|| format!("'{axis_key}' must be one of: {AXIS_NAMES}"))?;
     let values_key = format!("{prefix}_values");
-    let raw = req
-        .get(&values_key)
-        .ok_or_else(|| format!("'{values_key}' (array or delimited string) is required when '{axis_key}' is set"))?;
+    let raw = req.get(&values_key).ok_or_else(|| {
+        format!("'{values_key}' (array or delimited string) is required when '{axis_key}' is set")
+    })?;
     // Accept BOTH an explicit JSON array AND a SwarmUI-style delimited string
     // ("1,2,..,10" / "a || b || c" / "SKIP:..").
     let values = normalize_values(raw, axis, &values_key)?;
@@ -791,9 +1011,17 @@ fn parse_axis_spec(req: &Value, prefix: &str) -> Result<Option<AxisSpec>, String
     let mut labels = Vec::with_capacity(values.len());
     let mut throwaway = JobParams::default();
     for (i, v) in values.iter().enumerate() {
-        let ok = if axis.is_numeric() { v.is_number() } else { v.is_string() };
+        let ok = if axis.is_numeric() {
+            v.is_number()
+        } else {
+            v.is_string()
+        };
         if !ok {
-            let want = if axis.is_numeric() { "number" } else { "string" };
+            let want = if axis.is_numeric() {
+                "number"
+            } else {
+                "string"
+            };
             return Err(format!(
                 "'{values_key}[{i}]' must be a {want} for axis '{}'",
                 axis.as_str()
@@ -801,7 +1029,11 @@ fn parse_axis_spec(req: &Value, prefix: &str) -> Result<Option<AxisSpec>, String
         }
         labels.push(apply_axis(&mut throwaway, axis, v)?);
     }
-    Ok(Some(AxisSpec { axis, values, labels }))
+    Ok(Some(AxisSpec {
+        axis,
+        values,
+        labels,
+    }))
 }
 
 // ── enqueue (replicates post_generate's register→push→wake) ─────────────────────-
@@ -811,11 +1043,19 @@ fn parse_axis_spec(req: &Value, prefix: &str) -> Result<Option<AxisSpec>, String
 /// z-outer / y-middle / x-inner, so a cell's (xi, yi, zi) coords are implied by its
 /// linear position — see the compositing loop.
 struct Cell {
-    value: String,    // X-dimension label (back-compat alias of x_label)
+    value: String, // X-dimension label (back-compat alias of x_label)
     x_label: String,
-    y_label: String,  // "" when there is no Y axis
-    z_label: String,  // "" when there is no Z axis
+    y_label: String, // "" when there is no Y axis
+    z_label: String, // "" when there is no Z axis
     job_id: String,
+}
+
+struct PendingCell {
+    value: String,
+    x_label: String,
+    y_label: String,
+    z_label: String,
+    params: JobParams,
 }
 
 /// Enqueue one cell job. Mirrors post_generate: take a new job-XXXX id off next_id,
@@ -860,7 +1100,10 @@ fn enqueue_cell(st: &AppState, mut params: JobParams) -> Result<String, String> 
     //    post_generate).
     let channel = JobChannel::new();
     {
-        let mut map = st.registry.lock().map_err(|_| "registry poisoned".to_string())?;
+        let mut map = st
+            .registry
+            .lock()
+            .map_err(|_| "registry poisoned".to_string())?;
         map.insert(job_id.clone(), channel);
     }
 
@@ -924,14 +1167,17 @@ fn is_terminal(state: &str) -> bool {
 fn snapshot_states(st: &AppState, ids: &[String]) -> Vec<(String, String)> {
     let book = match st.jobs.lock() {
         Ok(b) => b,
-        Err(_) => return ids.iter().map(|_| ("failed".to_string(), String::new())).collect(),
+        Err(_) => {
+            return ids
+                .iter()
+                .map(|_| ("failed".to_string(), String::new()))
+                .collect()
+        }
     };
     ids.iter()
-        .map(|id| {
-            match book.iter().find(|e| e.record.id == *id) {
-                Some(e) => (e.record.state.clone(), e.record.output_path.clone()),
-                None => ("missing".to_string(), String::new()),
-            }
+        .map(|id| match book.iter().find(|e| e.record.id == *id) {
+            Some(e) => (e.record.state.clone(), e.record.output_path.clone()),
+            None => ("missing".to_string(), String::new()),
         })
         .collect()
 }
@@ -976,7 +1222,11 @@ fn draw_cell(canvas: &mut RgbImage, x0: u32, y0: u32, cell: &CompCell) {
         }
     }
     if !drew_image {
-        let fill = if cell.src.is_some() { PLACEHOLDER_BG } else { CELL_BG };
+        let fill = if cell.src.is_some() {
+            PLACEHOLDER_BG
+        } else {
+            CELL_BG
+        };
         fill_rect(canvas, x0, y0, CELL, CELL, fill);
         let marker = "no image";
         let tw = text_px_width(marker);
@@ -1025,8 +1275,16 @@ fn render_page(
     // than one row / column respectively; a single-axis page (1 row) draws neither.
     let has_row_header = rows > 1 && y_labels.len() > 1;
     let has_col_header = cols > 1 && x_labels.len() > 1;
-    let row_gutter = if has_row_header { ROW_HEADER_W + PAD } else { 0 };
-    let title_h = if page_title.is_empty() { 0 } else { HEADER_BAND + PAD };
+    let row_gutter = if has_row_header {
+        ROW_HEADER_W + PAD
+    } else {
+        0
+    };
+    let title_h = if page_title.is_empty() {
+        0
+    } else {
+        HEADER_BAND + PAD
+    };
     let col_header_h = if has_col_header { HEADER_BAND + PAD } else { 0 };
 
     let cell_total_h = CELL + LABEL_BAND;
@@ -1039,7 +1297,14 @@ fn render_page(
 
     // Page title (Z label / axis name) spanning the full width.
     if title_h > 0 {
-        draw_band_centered(&mut canvas, PAD, PAD, img_w - 2 * PAD, HEADER_BAND, page_title);
+        draw_band_centered(
+            &mut canvas,
+            PAD,
+            PAD,
+            img_w - 2 * PAD,
+            HEADER_BAND,
+            page_title,
+        );
     }
     let grid_x0 = PAD + row_gutter;
     let grid_y0 = PAD + title_h + col_header_h;
@@ -1108,8 +1373,8 @@ fn collect_specs(req: &Value) -> Result<Vec<AxisSpec>, String> {
         let axis_str = opt_str(req, "axis")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "'axis' (string) is required".to_string())?;
-        let axis = Axis::parse(&axis_str)
-            .ok_or_else(|| format!("'axis' must be one of: {AXIS_NAMES}"))?;
+        let axis =
+            Axis::parse(&axis_str).ok_or_else(|| format!("'axis' must be one of: {AXIS_NAMES}"))?;
         let raw = req
             .get("values")
             .ok_or_else(|| "'values' (array or delimited string) is required".to_string())?;
@@ -1126,21 +1391,38 @@ fn collect_specs(req: &Value) -> Result<Vec<AxisSpec>, String> {
         let mut labels = Vec::with_capacity(values.len());
         let mut throwaway = JobParams::default();
         for (i, v) in values.iter().enumerate() {
-            let ok = if axis.is_numeric() { v.is_number() } else { v.is_string() };
+            let ok = if axis.is_numeric() {
+                v.is_number()
+            } else {
+                v.is_string()
+            };
             if !ok {
-                let want = if axis.is_numeric() { "number" } else { "string" };
-                return Err(format!("'values[{i}]' must be a {want} for axis '{}'", axis.as_str()));
+                let want = if axis.is_numeric() {
+                    "number"
+                } else {
+                    "string"
+                };
+                return Err(format!(
+                    "'values[{i}]' must be a {want} for axis '{}'",
+                    axis.as_str()
+                ));
             }
             labels.push(apply_axis(&mut throwaway, axis, v)?);
         }
-        specs.push(AxisSpec { axis, values, labels });
+        specs.push(AxisSpec {
+            axis,
+            values,
+            labels,
+        });
     }
 
     // New x_/y_/z_ form. X may also have been supplied via the legacy keys above; if
     // BOTH legacy `axis` and `x_axis` are present, that's a conflict.
     if let Some(xs) = parse_axis_spec(req, "x")? {
         if !specs.is_empty() {
-            return Err("provide either legacy 'axis'/'values' OR 'x_axis'/'x_values', not both".into());
+            return Err(
+                "provide either legacy 'axis'/'values' OR 'x_axis'/'x_values', not both".into(),
+            );
         }
         specs.push(xs);
     }
@@ -1182,7 +1464,26 @@ fn collect_specs(req: &Value) -> Result<Vec<AxisSpec>, String> {
 /// POST /v1/grid — sweep up to 3 axes (X/Y/Z), enqueue one cell job per cartesian
 /// product entry, wait for all to finish, composite one labelled 2-D grid PNG per
 /// Z-page. See the module contract.
-pub async fn post_grid(State(st): State<AppState>, Json(req): Json<Value>) -> Response {
+pub async fn post_grid(State(st): State<AppState>, Json(mut req): Json<Value>) -> Response {
+    let had_workflow = match lower_workflow_for_grid(&mut req) {
+        Ok(v) => v,
+        Err((status, report)) => return json_compact(status, &report),
+    };
+    if let Err(error) = reject_disabled_raw_surfaces(&req) {
+        let report = if had_workflow {
+            workflow_feature_generate_error_report(error, &req)
+        } else {
+            raw_surface_generate_error_report(error, &req)
+        };
+        return json_compact(StatusCode::BAD_REQUEST, &attach_grid_error_context(report));
+    }
+    if let Err(error) = normalize_ideogram4_prompt_json(&mut req) {
+        return json_compact(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &attach_grid_error_context(raw_surface_generate_error_report(error, &req)),
+        );
+    }
+
     // 1. resolve the grid dimensions (legacy single-axis OR x_/y_/z_).
     let specs = match collect_specs(&req) {
         Ok(s) => s,
@@ -1202,10 +1503,9 @@ pub async fn post_grid(State(st): State<AppState>, Json(req): Json<Value>) -> Re
         Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
     };
 
-    // 3. enqueue one cell per cartesian product entry. Iteration order is
-    //    z-outer / y-middle / x-inner so each Z-page's cells are contiguous and
-    //    laid out row-major (y down, x across).
-    let mut cells: Vec<Cell> = Vec::with_capacity(nx * ny * nz);
+    // 3. Build and production-validate every cell before enqueueing anything.
+    //    A later bad axis value should not leave an earlier partial grid running.
+    let mut pending_cells: Vec<PendingCell> = Vec::with_capacity(nx * ny * nz);
     for zi in 0..nz {
         for yi in 0..ny {
             for xi in 0..nx {
@@ -1233,26 +1533,70 @@ pub async fn post_grid(State(st): State<AppState>, Json(req): Json<Value>) -> Re
                 } else {
                     String::new()
                 };
-                let job_id = match enqueue_cell(&st, p) {
-                    Ok(id) => id,
-                    // A driver/lock failure mid-enqueue: surface it (partial jobs already
-                    // queued will still run; we report the failure rather than hang).
-                    Err(e) => return err_detail(StatusCode::SERVICE_UNAVAILABLE, &e),
-                };
-                cells.push(Cell {
+                if let Err(e) = validate_generate_prequeue_for_enqueue(&p, 1.0) {
+                    let mut label = format!("x={x_label}");
+                    if !y_label.is_empty() {
+                        label.push_str(&format!(", y={y_label}"));
+                    }
+                    if !z_label.is_empty() {
+                        label.push_str(&format!(", z={z_label}"));
+                    }
+                    let mut report = generate_prequeue_error_report(&p, 1.0);
+                    if let Some(obj) = report.as_object_mut() {
+                        obj.insert(
+                            "error".into(),
+                            json!(format!("grid cell rejected ({label}): {e}")),
+                        );
+                        obj.insert("rejection_stage".into(), json!("grid_cell_prequeue"));
+                        obj.insert(
+                            "grid".into(),
+                            json!({
+                                "endpoint": "/v1/grid",
+                                "one_generate_job_per_cell": true,
+                                "cell": {
+                                    "x": x_label,
+                                    "y": y_label,
+                                    "z": z_label,
+                                },
+                            }),
+                        );
+                    }
+                    return json_compact(StatusCode::BAD_REQUEST, &report);
+                }
+                pending_cells.push(PendingCell {
                     value: x_label.clone(),
                     x_label,
                     y_label,
                     z_label,
-                    job_id,
+                    params: p,
                 });
             }
         }
     }
 
+    // 4. enqueue one cell per cartesian product entry. Iteration order is
+    //    z-outer / y-middle / x-inner so each Z-page's cells are contiguous and
+    //    laid out row-major (y down, x across).
+    let mut cells: Vec<Cell> = Vec::with_capacity(pending_cells.len());
+    for pending in pending_cells {
+        let job_id = match enqueue_cell(&st, pending.params) {
+            Ok(id) => id,
+            // A driver/lock failure mid-enqueue: surface it (partial jobs already
+            // queued will still run; we report the failure rather than hang).
+            Err(e) => return err_detail(StatusCode::SERVICE_UNAVAILABLE, &e),
+        };
+        cells.push(Cell {
+            value: pending.value,
+            x_label: pending.x_label,
+            y_label: pending.y_label,
+            z_label: pending.z_label,
+            job_id,
+        });
+    }
+
     let ids: Vec<String> = cells.iter().map(|c| c.job_id.clone()).collect();
 
-    // 4. wait for ALL cell jobs to reach a terminal state. CRITICAL: snapshot under a
+    // 5. wait for ALL cell jobs to reach a terminal state. CRITICAL: snapshot under a
     //    short lock, RELEASE it, then sleep — never hold st.jobs across the await.
     let start = Instant::now();
     let budget = (GRID_PER_CELL_TIMEOUT * ids.len() as u32).min(GRID_TIMEOUT_MAX);
@@ -1260,7 +1604,9 @@ pub async fn post_grid(State(st): State<AppState>, Json(req): Json<Value>) -> Re
     let timed_out;
     loop {
         last_snapshot = snapshot_states(&st, &ids);
-        let all_terminal = last_snapshot.iter().all(|(s, _)| is_terminal(s) || s == "missing");
+        let all_terminal = last_snapshot
+            .iter()
+            .all(|(s, _)| is_terminal(s) || s == "missing");
         if all_terminal {
             timed_out = false;
             break;
@@ -1276,7 +1622,9 @@ pub async fn post_grid(State(st): State<AppState>, Json(req): Json<Value>) -> Re
     //    (y down, x across). A done cell with a readable output_path renders its
     //    image; a failed/missing/empty-path cell renders a placeholder.
     let x_labels: Vec<String> = x.labels.clone();
-    let y_labels: Vec<String> = y.map(|s| s.labels.clone()).unwrap_or_else(|| vec![String::new()]);
+    let y_labels: Vec<String> = y
+        .map(|s| s.labels.clone())
+        .unwrap_or_else(|| vec![String::new()]);
 
     // grid id off the same counter as jobs (so grid-NNNN never collides with a future job).
     let gn = st.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1316,7 +1664,11 @@ pub async fn post_grid(State(st): State<AppState>, Json(req): Json<Value>) -> Re
         } else {
             String::new()
         };
-        let page_id = if nz > 1 { format!("{grid_id}-z{zi:02}") } else { grid_id.clone() };
+        let page_id = if nz > 1 {
+            format!("{grid_id}-z{zi:02}")
+        } else {
+            grid_id.clone()
+        };
         let path = match render_page(
             st.out_dir.as_path(),
             &page_id,
@@ -1426,7 +1778,10 @@ mod tests {
         assert_eq!(p.seed, 42);
         assert_eq!(apply_axis(&mut p, Axis::Steps, &json!(8)).unwrap(), "8");
         assert_eq!(p.steps, 8);
-        assert_eq!(apply_axis(&mut p, Axis::Sampler, &json!("euler")).unwrap(), "euler");
+        assert_eq!(
+            apply_axis(&mut p, Axis::Sampler, &json!("euler")).unwrap(),
+            "euler"
+        );
         assert_eq!(p.sampler, "euler");
         // wrong JSON type for axis -> Err
         assert!(apply_axis(&mut p, Axis::Cfg, &json!("nope")).is_err());
@@ -1440,9 +1795,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("grid_test_a_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cells = vec![
-            CompCell { label: "cfg=3.0".into(), src: None },
-            CompCell { label: "cfg=5.0".into(), src: Some("/no/such/file.png".into()) },
-            CompCell { label: "cfg=7.0".into(), src: None },
+            CompCell {
+                label: "cfg=3.0".into(),
+                src: None,
+            },
+            CompCell {
+                label: "cfg=5.0".into(),
+                src: Some("/no/such/file.png".into()),
+            },
+            CompCell {
+                label: "cfg=7.0".into(),
+                src: None,
+            },
         ];
         let x_labels = vec!["3.0".to_string(), "5.0".to_string(), "7.0".to_string()];
         let y_labels = vec![String::new()];
@@ -1465,14 +1829,36 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("grid_test_b_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cells = vec![
-            CompCell { label: "3.0|10".into(), src: None },
-            CompCell { label: "5.0|10".into(), src: None },
-            CompCell { label: "3.0|20".into(), src: None },
-            CompCell { label: "5.0|20".into(), src: None },
+            CompCell {
+                label: "3.0|10".into(),
+                src: None,
+            },
+            CompCell {
+                label: "5.0|10".into(),
+                src: None,
+            },
+            CompCell {
+                label: "3.0|20".into(),
+                src: None,
+            },
+            CompCell {
+                label: "5.0|20".into(),
+                src: None,
+            },
         ];
         let x_labels = vec!["3.0".to_string(), "5.0".to_string()];
         let y_labels = vec!["10".to_string(), "20".to_string()];
-        let p = render_page(&dir, "grid-page-b", &cells, 2, 2, &x_labels, &y_labels, "X:cfg  Y:steps").unwrap();
+        let p = render_page(
+            &dir,
+            "grid-page-b",
+            &cells,
+            2,
+            2,
+            &x_labels,
+            &y_labels,
+            "X:cfg  Y:steps",
+        )
+        .unwrap();
         let img = image::open(&p).unwrap();
         let title_h = HEADER_BAND + PAD;
         let col_header_h = HEADER_BAND + PAD;
@@ -1506,7 +1892,7 @@ mod tests {
         assert_eq!(specs[0].axis, Axis::Cfg); // X
         assert_eq!(specs[1].axis, Axis::Steps); // Y
         assert_eq!(specs[2].axis, Axis::Seed); // Z
-        // total product 2*3*2 = 12 (under MAX_CELLS).
+                                               // total product 2*3*2 = 12 (under MAX_CELLS).
         let total: usize = specs.iter().map(|s| s.values.len()).product();
         assert_eq!(total, 12);
     }
@@ -1578,7 +1964,10 @@ mod tests {
 
     #[test]
     fn parse_lora_split() {
-        assert_eq!(parse_lora("style.safetensors:0.8"), ("style.safetensors".into(), 0.8));
+        assert_eq!(
+            parse_lora("style.safetensors:0.8"),
+            ("style.safetensors".into(), 0.8)
+        );
         assert_eq!(parse_lora("style"), ("style".into(), 1.0));
         // trailing non-float after ':' is treated as part of the name
         assert_eq!(parse_lora("a:b"), ("a:b".into(), 1.0));
@@ -1589,17 +1978,29 @@ mod tests {
     #[test]
     fn apply_axis_new_axes() {
         let mut p = JobParams::default();
-        assert_eq!(apply_axis(&mut p, Axis::Model, &json!("z-image")).unwrap(), "z-image");
+        assert_eq!(
+            apply_axis(&mut p, Axis::Model, &json!("z-image")).unwrap(),
+            "z-image"
+        );
         assert_eq!(p.model, "z-image");
         assert_eq!(apply_axis(&mut p, Axis::Width, &json!(768)).unwrap(), "768");
         assert_eq!(p.width, 768);
-        assert_eq!(apply_axis(&mut p, Axis::Resolution, &json!("1024x576")).unwrap(), "1024x576");
+        assert_eq!(
+            apply_axis(&mut p, Axis::Resolution, &json!("1024x576")).unwrap(),
+            "1024x576"
+        );
         assert_eq!((p.width, p.height), (1024, 576));
         // lora replace + clear
-        assert_eq!(apply_axis(&mut p, Axis::Lora, &json!("foo.safetensors:0.5")).unwrap(), "foo:0.5");
+        assert_eq!(
+            apply_axis(&mut p, Axis::Lora, &json!("foo.safetensors:0.5")).unwrap(),
+            "foo:0.5"
+        );
         assert_eq!(p.loras.len(), 1);
         assert_eq!(p.loras[0].weight, 0.5);
-        assert_eq!(apply_axis(&mut p, Axis::Lora, &json!("none")).unwrap(), "none");
+        assert_eq!(
+            apply_axis(&mut p, Axis::Lora, &json!("none")).unwrap(),
+            "none"
+        );
         assert!(p.loras.is_empty());
         // long prompt -> ellipsized label, full text on params
         let long = "a very very long prompt that exceeds twenty four characters easily";
@@ -1636,7 +2037,12 @@ mod tests {
         .unwrap();
         assert_eq!(v, vec![json!("a cat, sitting"), json!("a dog, running")]);
         // SKIP: drops an entry
-        let v = normalize_values(&json!("euler || SKIP:dpmpp || heun"), Axis::Sampler, "x_values").unwrap();
+        let v = normalize_values(
+            &json!("euler || SKIP:dpmpp || heun"),
+            Axis::Sampler,
+            "x_values",
+        )
+        .unwrap();
         assert_eq!(v, vec![json!("euler"), json!("heun")]);
     }
 
@@ -1670,8 +2076,97 @@ mod tests {
         assert_eq!(specs[0].axis, Axis::Resolution);
         assert_eq!(specs[0].values.len(), 2);
         assert_eq!(specs[1].axis, Axis::Steps);
-        assert_eq!(specs[1].values, vec![json!(8), json!(9), json!(10), json!(11)]);
+        assert_eq!(
+            specs[1].values,
+            vec![json!(8), json!(9), json!(10), json!(11)]
+        );
         assert_eq!(specs[1].labels, vec!["8", "9", "10", "11"]);
+    }
+
+    #[test]
+    fn grid_workflow_lowering_rejects_unsupported_graph_before_flat_bypass() {
+        let mut req = json!({
+            "model": "zimage",
+            "prompt": "flat fields must not bypass workflow",
+            "width": 1024,
+            "height": 1024,
+            "steps": 1,
+            "sampler": "euler",
+            "scheduler": "simple",
+            "axis": "seed",
+            "values": [42],
+            "workflow": {
+                "nodes": [
+                    {"id": 1, "type_id": "UnsupportedComfyNode", "fields": {}}
+                ],
+                "edges": []
+            }
+        });
+        let (status, report) = lower_workflow_for_grid(&mut req).unwrap_err();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(report["schema"], "serenity.generate.error.v1");
+        assert_eq!(report["rejection_stage"], "workflow_lowering");
+        assert_eq!(report["enqueue_blocked"], true);
+        assert_eq!(report["grid"]["endpoint"], "/v1/grid");
+        assert!(
+            req.is_object(),
+            "lowering error must not destroy request context"
+        );
+    }
+
+    #[test]
+    fn grid_workflow_flat_params_adapter_lowers_to_image_route() {
+        let mut req = json!({
+            "axis": "seed",
+            "values": [1, 2],
+            "workflow": {
+                "params": {
+                    "model": "zimage",
+                    "prompt": "workflow params grid",
+                    "width": 1024,
+                    "height": 1024,
+                    "steps": 1,
+                    "sampler": "euler",
+                    "scheduler": "simple"
+                }
+            }
+        });
+        assert_eq!(lower_workflow_for_grid(&mut req).unwrap(), true);
+        assert_eq!(req["model"], "zimage");
+        assert_eq!(req["prompt"], "workflow params grid");
+        assert_eq!(req["workflow_route_kind"], "image");
+        assert_eq!(req["workflow_plan"]["route_kind"], "image");
+        assert_eq!(collect_specs(&req).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn grid_workflow_disabled_surface_reports_workflow_capability() {
+        let mut req = json!({
+            "axis": "seed",
+            "values": [1],
+            "workflow": {
+                "params": {
+                    "model": "zimage",
+                    "prompt": "workflow params grid img2img",
+                    "width": 1024,
+                    "height": 1024,
+                    "steps": 1,
+                    "sampler": "euler",
+                    "scheduler": "simple",
+                    "init_image": "/tmp/init.png"
+                }
+            }
+        });
+        assert_eq!(lower_workflow_for_grid(&mut req).unwrap(), true);
+        let err = reject_disabled_raw_surfaces(&req).unwrap_err();
+        let report = attach_grid_error_context(workflow_feature_generate_error_report(err, &req));
+        assert_eq!(report["schema"], "serenity.generate.error.v1");
+        assert_eq!(report["rejection_stage"], "workflow_capability");
+        assert_eq!(report["workflow_route_kind"], "image");
+        assert_eq!(report["workflow_plan"]["route_kind"], "image");
+        assert_eq!(report["workflow_plan"]["source"], "flat_params_adapter");
+        assert_eq!(report["grid"]["endpoint"], "/v1/grid");
+        assert_eq!(report["enqueue_blocked"], true);
     }
 
     #[test]
@@ -1704,8 +2199,14 @@ mod tests {
         assert_eq!(opt_f64(&req, "eta"), Some(0.3));
         assert_eq!(opt_f64(&req, "sigma_min"), Some(0.03));
         assert_eq!(opt_f64(&req, "sigma_max"), Some(14.6));
-        assert_eq!(req.get("restart_sampling").and_then(|x| x.as_bool()), Some(true));
-        assert_eq!(opt_str(&req, "vae").as_deref(), Some("sdxl_vae.safetensors"));
+        assert_eq!(
+            req.get("restart_sampling").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            opt_str(&req, "vae").as_deref(),
+            Some("sdxl_vae.safetensors")
+        );
         // absent knobs => None (base_params then keeps the JobParams sentinels)
         let bare = json!({ "model": "m", "prompt": "p" });
         assert_eq!(opt_i64(&bare, "clip_skip"), None);

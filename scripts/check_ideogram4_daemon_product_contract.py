@@ -40,6 +40,7 @@ EXPENSIVE_LOG_MARKERS = (
     "[ideogram4] loading conditional fp8 transformer",
     "[ideogram4] loading unconditional fp8 transformer",
     "[ideogram4] loading VAE decoder + decode",
+    "[ideogram4] loading tiled VAE decoder + decode",
 )
 
 
@@ -287,7 +288,12 @@ def check_static(blockers: list[str]) -> dict[str, Any]:
     require("struct Ideogram4Backend(GenBackend, Movable)" in backend, "backend struct missing", blockers)
     require("load_ideogram_qwen3vl" in backend and "encode_ideogram_taps" in backend, "backend must use native Qwen3-VL text encode", blockers)
     require("Ideogram4Weights.load" in backend and "ideogram4_forward_r" in backend, "backend must use native resident Ideogram DiT forward", blockers)
-    require("load_ideogram4_vae_decoder" in backend and "encode_png_with_text" in backend, "backend must decode and save PNG metadata natively", blockers)
+    require(
+        ("load_ideogram4_vae_decoder" in backend or "ideogram4_tiled_decode" in backend)
+        and "encode_png_with_text" in backend,
+        "backend must decode and save PNG metadata natively",
+        blockers,
+    )
     require(GENPARAMS_KEY in backend, "backend must embed serenity.genparams.v1 PNG metadata", blockers)
     require("external_call[\"system\"" not in backend and "sys_execv" not in backend, "backend must not shell out or exec a subprocess wrapper", blockers)
     require(
@@ -306,6 +312,14 @@ def check_static(blockers: list[str]) -> dict[str, Any]:
         and "scheduler_admission_for_backend" in daemon
         and "creativity/denoise control is not supported" in daemon,
         "daemon must prequeue-reject bounded Ideogram4 unsupported controls",
+        blockers,
+    )
+    require(
+        "_normalize_ideogram4_structured_prompt" in daemon
+        and "prompt_json" in daemon
+        and "_looks_like_ideogram4_structured_prompt" in daemon
+        and "prompt_syntax.resolved = prompt_raw.copy()" in daemon,
+        "daemon must preserve Ideogram4 structured JSON/bbox prompts without generic prompt rewriting",
         blockers,
     )
     require(MANIFEST_SCHEMA in backend, "manifest schema missing from backend", blockers)
@@ -331,6 +345,13 @@ def check_static(blockers: list[str]) -> dict[str, Any]:
         and "CFGOverride" in workflow_graph
         and "prompt-builder subgraph" in workflow_graph,
         "workflow graph module missing bounded Ideogram4 Comfy workflow importer",
+        blockers,
+    )
+    require(
+        "prompt_json" in workflow_graph
+        and 'dumps(obj["prompt_json"])' in workflow_graph
+        and "Ideogram4 Comfy export prompt_json must be a string or JSON object/array" in workflow_graph,
+        "workflow graph module must accept structured Ideogram prompt_json overrides",
         blockers,
     )
     require(

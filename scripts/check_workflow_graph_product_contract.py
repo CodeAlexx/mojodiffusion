@@ -1833,6 +1833,45 @@ def require(condition: bool, msg: str, blockers: list[str]) -> None:
         blockers.append(msg)
 
 
+def require_generate_workflow_error(
+    label: str,
+    status: int,
+    data: Any,
+    text: str,
+    expected_text: str,
+    blockers: list[str],
+) -> None:
+    require(status == 501, f"{label} did not return HTTP 501", blockers)
+    require(expected_text in text, f"{label} response did not name {expected_text}", blockers)
+    if not isinstance(data, dict):
+        return
+    require(
+        data.get("schema") == "serenity.generate.error.v1",
+        f"{label} response schema was not serenity.generate.error.v1",
+        blockers,
+    )
+    require(data.get("admitted") is False, f"{label} response did not set admitted=false", blockers)
+    require(
+        data.get("rejection_stage") == "workflow_lowering",
+        f"{label} response did not mark workflow_lowering",
+        blockers,
+    )
+    require(
+        data.get("same_gate_as_preflight") is True,
+        f"{label} response did not mark same_gate_as_preflight",
+        blockers,
+    )
+    require(data.get("enqueue_blocked") is True, f"{label} response did not block enqueue", blockers)
+    profile = data.get("capability_profile")
+    require(isinstance(profile, dict), f"{label} response missing capability_profile", blockers)
+    if isinstance(profile, dict):
+        require(
+            profile.get("schema") == "serenity.capability_profile.v1",
+            f"{label} capability_profile schema mismatch",
+            blockers,
+        )
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     blockers: list[str] = []
     port = args.port if args.port else find_free_port()
@@ -1853,22 +1892,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
             unsupported_status, unsupported_data, unsupported_text = http_json("POST", f"{base_url}/v1/generate", unsupported_workflow_request())
             report["unsupported_node"] = {"status": unsupported_status, "body": unsupported_data}
-            require(unsupported_status == 501, "unsupported graph node did not return HTTP 501", blockers)
-            require("ControlNetApply" in unsupported_text, "unsupported graph response did not name ControlNetApply", blockers)
+            require_generate_workflow_error(
+                "unsupported graph node",
+                unsupported_status,
+                unsupported_data,
+                unsupported_text,
+                "ControlNetApply",
+                blockers,
+            )
 
             wrong_status, wrong_data, wrong_text = http_json("POST", f"{base_url}/v1/generate", wrong_type_workflow_request())
             report["wrong_type_link"] = {"status": wrong_status, "body": wrong_data}
-            require(wrong_status == 501, "wrong typed link did not return HTTP 501", blockers)
-            require("expected CONDITIONING" in wrong_text, "wrong typed link response did not name expected type", blockers)
+            require_generate_workflow_error(
+                "wrong typed link",
+                wrong_status,
+                wrong_data,
+                wrong_text,
+                "expected CONDITIONING",
+                blockers,
+            )
 
             lora_clip_status, lora_clip_data, lora_clip_text = http_json(
                 "POST", f"{base_url}/v1/generate", lora_clip_unsupported_workflow_request()
             )
             report["lora_clip_unsupported"] = {"status": lora_clip_status, "body": lora_clip_data}
-            require(lora_clip_status == 501, "LoraLoader CLIP-side graph did not return HTTP 501", blockers)
-            require(
-                "CLIP_LORA_UNSUPPORTED" in lora_clip_text,
-                "LoraLoader CLIP-side graph response did not name unsupported CLIP LoRA semantics",
+            require_generate_workflow_error(
+                "LoraLoader CLIP-side graph",
+                lora_clip_status,
+                lora_clip_data,
+                lora_clip_text,
+                "CLIP_LORA_UNSUPPORTED",
                 blockers,
             )
 
@@ -1876,8 +1929,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "POST", f"{base_url}/v1/generate", unsupported_comfy_api_prompt_request()
             )
             report["unsupported_comfy_api_node"] = {"status": unsupported_api_status, "body": unsupported_api_data}
-            require(unsupported_api_status == 501, "unsupported Comfy API graph node did not return HTTP 501", blockers)
-            require("ControlNetApply" in unsupported_api_text, "unsupported Comfy API response did not name ControlNetApply", blockers)
+            require_generate_workflow_error(
+                "unsupported Comfy API graph node",
+                unsupported_api_status,
+                unsupported_api_data,
+                unsupported_api_text,
+                "ControlNetApply",
+                blockers,
+            )
 
             missing_inpaint_status, missing_inpaint_data, missing_inpaint_text = http_json(
                 "POST", f"{base_url}/v1/generate", inpaint_conditioning_missing_mask_comfy_api_prompt_request()

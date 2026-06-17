@@ -10,7 +10,7 @@
 from serenitymojo.io.safetensors import SafeTensors
 
 
-comptime WAN22_VAE_PATH = "/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors"
+comptime WAN22_VAE_PATH = "/home/alex/.serenity/models/vaes/wan2.2_vae.safetensors"
 
 
 def _shape_to_string(shape: List[Int]) -> String:

@@ -129,7 +129,9 @@ Current high-risk runtime gaps:
   mask/inpaint, graph `LoadImage`/`VAEEncode`, and quality parity remain
   unaccepted.
 - `images=N` now emits serial indexed daemon jobs with seed offsets and
-  metadata. True Comfy-style batched latent execution remains unimplemented.
+  metadata. True Comfy-style batched latent execution remains unimplemented;
+  `Empty*LatentImage.batch_size>1` and `RepeatLatentBatch` fail loud before
+  enqueue instead of being treated as serial images.
 - UI/gallery/reuse/state has a stub-daemon runtime contract that now proves
   reuse provenance, restart-safe job history, indexed external gallery import,
   gallery rename/manual order, presets/state restart, favorite/delete, queue

@@ -490,8 +490,31 @@
         // ---- model tools (honest placeholders) ----
         var cTools = el("div", "st-card");
         cTools.appendChild(el("h3", null, "Model tools"));
-        cTools.appendChild(el("p", "st-hint", "Power-user conversions SwarmUI offers. These require backend endpoints the serenity server does not expose yet — the buttons report status rather than failing silently."));
+        cTools.appendChild(el("p", "st-hint", "Checks use the same prequeue gate as generation and report the local Mojodiffusion block profile."));
         var tActions = el("div", "st-actions");
+        var pfOut = el("div", "st-logs", "(not checked)");
+        var pfBtn = el("button", "btn", "Check current model");
+        pfBtn.addEventListener("click", function () {
+          if (!api || typeof api.preflight !== "function") { showToast("Preflight endpoint unavailable"); return; }
+          pfOut.textContent = "checking...";
+          api.preflight().then(function (r) {
+            var bp = (r && r.block_profile) || {};
+            var blocks = bp.block_count != null ? String(bp.block_count) : "n/a";
+            var backend = (r && (r.backend || bp.family)) || "unknown";
+            var verdict = r && r.admitted ? "admitted" : "blocked";
+            var msg = verdict + " | " + backend + " | blocks " + blocks;
+            if (r && r.error) msg += "\n" + r.error;
+            if (bp.source) msg += "\nsource: " + bp.source;
+            pfOut.textContent = msg;
+            showToast(verdict + ": " + backend);
+            console.info("[settingsTabs] preflight", r);
+          }).catch(function (e) {
+            var msg = e && e.message ? e.message : String(e || "preflight failed");
+            pfOut.textContent = msg;
+            showToast("Preflight failed: " + msg);
+          });
+        });
+        tActions.appendChild(pfBtn);
         [
           ["Pickle → safetensors", "Conversion needs a /v1/convert endpoint (not served yet)."],
           ["Download model", "Model downloader needs a /v1/download endpoint (not served yet)."],
@@ -503,6 +526,7 @@
           tActions.appendChild(b);
         });
         cTools.appendChild(tActions);
+        cTools.appendChild(pfOut);
         pane.appendChild(cTools);
       }
 

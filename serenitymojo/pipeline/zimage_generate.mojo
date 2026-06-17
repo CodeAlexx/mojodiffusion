@@ -87,10 +87,7 @@ from serenitymojo.sampling.zimage_sampler_contract import (
 
 
 # ── shared verified checkpoint snapshot (DiT + VAE parity used this exact one) ──
-comptime ZROOT = (
-    "/home/alex/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image/"
-    "snapshots/04cc4abb7c5069926f75c9bfde9ef43d49423021"
-)
+comptime ZROOT = "/home/alex/.serenity/models/zimage_base"
 comptime TRANSFORMER = "/home/alex/.serenity/models/zimage_base/transformer"
 comptime TEXT_ENCODER = ZROOT + "/text_encoder"
 comptime VAE_DIR = ZROOT + "/vae"

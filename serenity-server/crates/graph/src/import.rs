@@ -14,13 +14,11 @@
 use serde_json::{json, Map, Value as JsonValue};
 
 use crate::util::{
-    is_bool_scalar_node, is_float_scalar_node, is_int_scalar_node, is_scalar_node as util_is_scalar,
-    is_string_scalar_node, json_intish, node_id, node_mode, node_type, widget_bool, widget_float,
-    widget_int, widget_string, wf_string,
+    is_bool_scalar_node, is_float_scalar_node, is_int_scalar_node,
+    is_scalar_node as util_is_scalar, is_string_scalar_node, json_intish, node_id, node_mode,
+    node_type, wf_string, widget_bool, widget_float, widget_int, widget_string,
 };
-use crate::{
-    canonical_type_id, scalar_output_type, GraphError, GraphResult,
-};
+use crate::{canonical_type_id, scalar_output_type, GraphError, GraphResult};
 
 /// The detected request-body kind (mirrors the dispatch order in
 /// `apply_workflow_params`, Mojo 2934-3011).
@@ -38,26 +36,76 @@ pub enum BodyKind {
 /// Flat keys copied verbatim from a `params`/`genparams` object onto the
 /// request (Mojo 2948-2970 / 2979-3001).
 pub const FLAT_PARAM_KEYS: &[&str] = &[
-    "model", "prompt", "prompt_raw", "negative", "width", "height",
-    "steps", "seed", "cfg", "cfg_override", "cfg_override_start_percent",
-    "cfg_override_end_percent", "sampler", "scheduler", "sigma_shift",
-    "variation_seed", "variation_strength", "images", "init_image", "creativity",
+    "model",
+    "prompt",
+    "prompt_raw",
+    "prompt_json",
+    "negative",
+    "width",
+    "height",
+    "steps",
+    "seed",
+    "cfg",
+    "cfg_override",
+    "cfg_override_start_percent",
+    "cfg_override_end_percent",
+    "sampler",
+    "scheduler",
+    "sigma_shift",
+    "variation_seed",
+    "variation_strength",
+    "images",
+    "clip_skip",
+    "eta",
+    "sigma_min",
+    "sigma_max",
+    "restart_sampling",
+    "vae",
+    "init_image",
+    "creativity",
     "workflow_save_prefix",
-    "mask_image", "reference_image", "reference_latent_method", "reference_latent_count",
-    "inpaint_conditioning_image", "inpaint_conditioning_mask", "inpaint_conditioning_noise_mask",
+    "mask_image",
+    "reference_image",
+    "reference_latent_method",
+    "reference_latent_count",
+    "inpaint_conditioning_image",
+    "inpaint_conditioning_mask",
+    "inpaint_conditioning_noise_mask",
     "qwen_edit_conditioning_image",
-    "sample_caps_pos", "sample_caps_neg", "caps_pos", "caps_neg",
-    "caps_positive", "caps_negative",
-    "conditioning_mask_image", "conditioning_mask_channel",
-    "conditioning_mask_strength", "conditioning_mask_set_area_to_bounds",
-    "outpaint_left", "outpaint_top", "outpaint_right", "outpaint_bottom",
-    "outpaint_feathering", "threshold_mask_value", "threshold_mask_operator",
-    "lanpaint_mask_channel", "lanpaint_mask_blend_overlap", "lanpaint_num_steps",
-    "lanpaint_lambda", "lanpaint_step_size", "lanpaint_beta", "lanpaint_friction",
-    "lanpaint_prompt_mode", "lanpaint_inpainting_mode", "lanpaint_add_noise",
-    "lanpaint_noise_seed", "lanpaint_start_at_step", "lanpaint_end_at_step",
-    "lanpaint_return_with_leftover_noise", "lanpaint_early_stop",
-    "lanpaint_inner_threshold", "lanpaint_inner_patience",
+    "sample_caps_pos",
+    "sample_caps_neg",
+    "caps_pos",
+    "caps_neg",
+    "caps_positive",
+    "caps_negative",
+    "conditioning_mask_image",
+    "conditioning_mask_channel",
+    "conditioning_mask_strength",
+    "conditioning_mask_set_area_to_bounds",
+    "outpaint_left",
+    "outpaint_top",
+    "outpaint_right",
+    "outpaint_bottom",
+    "outpaint_feathering",
+    "threshold_mask_value",
+    "threshold_mask_operator",
+    "lanpaint_mask_channel",
+    "lanpaint_mask_blend_overlap",
+    "lanpaint_num_steps",
+    "lanpaint_lambda",
+    "lanpaint_step_size",
+    "lanpaint_beta",
+    "lanpaint_friction",
+    "lanpaint_prompt_mode",
+    "lanpaint_inpainting_mode",
+    "lanpaint_add_noise",
+    "lanpaint_noise_seed",
+    "lanpaint_start_at_step",
+    "lanpaint_end_at_step",
+    "lanpaint_return_with_leftover_noise",
+    "lanpaint_early_stop",
+    "lanpaint_inner_threshold",
+    "lanpaint_inner_patience",
     "lora",
 ];
 
@@ -136,10 +184,18 @@ pub fn looks_like_comfy_api_prompt_graph(wf: &JsonValue) -> bool {
             Some(n) => n,
             None => return false,
         };
-        if !node.get("class_type").map(JsonValue::is_string).unwrap_or(false) {
+        if !node
+            .get("class_type")
+            .map(JsonValue::is_string)
+            .unwrap_or(false)
+        {
             return false;
         }
-        if !node.get("inputs").map(JsonValue::is_object).unwrap_or(false) {
+        if !node
+            .get("inputs")
+            .map(JsonValue::is_object)
+            .unwrap_or(false)
+        {
             return false;
         }
     }
@@ -194,7 +250,11 @@ pub fn detect_body_kind(wf: &JsonValue) -> GraphResult<BodyKind> {
     if wf.get("params").map(JsonValue::is_object).unwrap_or(false) {
         return Ok(BodyKind::FlatParams);
     }
-    if wf.get("genparams").map(JsonValue::is_object).unwrap_or(false) {
+    if wf
+        .get("genparams")
+        .map(JsonValue::is_object)
+        .unwrap_or(false)
+    {
         return Ok(BodyKind::FlatGenparams);
     }
     // A `nodes` body without `edges` is the legacy nodes-only fallback that the
@@ -267,13 +327,15 @@ fn input_is_link(v: &JsonValue) -> bool {
 /// node produces on the given output slot.
 fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphResult<String> {
     let key = src_id.to_string();
-    let node = graph
-        .get(&key)
-        .ok_or_else(|| GraphError::unsupported(format!(
+    let node = graph.get(&key).ok_or_else(|| {
+        GraphError::unsupported(format!(
             "Comfy API prompt link references missing node: {key}"
-        )))?;
+        ))
+    })?;
     let typ = canonical_type_id(
-        node.get("class_type").and_then(JsonValue::as_str).unwrap_or(""),
+        node.get("class_type")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(""),
     );
 
     if crate::is_scalar_node(&typ) && slot == 0 {
@@ -300,7 +362,7 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
             2 => Some("VAE"),
             _ => None,
         },
-        "UNETLoader" | "DiffusionModelLoader" => (slot == 0).then_some("MODEL"),
+        "UNETLoader" | "DiffusionModelLoader" | "LTXVLoader" => (slot == 0).then_some("MODEL"),
         "LoraLoaderModelOnly" | "ZImageLoraModelOnly" => (slot == 0).then_some("MODEL"),
         "LoraLoader" => match slot {
             0 => Some("MODEL"),
@@ -308,8 +370,12 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
             _ => None,
         },
         "CLIPLoader" | "DualCLIPLoader" | "TripleCLIPLoader" => (slot == 0).then_some("CLIP"),
+        "CLIPVisionLoader" => (slot == 0).then_some("CLIP_VISION"),
+        "CLIPVisionEncode" => (slot == 0).then_some("CLIP_VISION_OUTPUT"),
         "VAELoader" => (slot == 0).then_some("VAE"),
-        "CLIPTextEncode" | "CLIPTextEncodeFlux" | "TextEncodeQwenImageEdit"
+        "CLIPTextEncode"
+        | "CLIPTextEncodeFlux"
+        | "TextEncodeQwenImageEdit"
         | "TextEncodeQwenImageEditPlus" => (slot == 0).then_some("CONDITIONING"),
         "ConditioningZeroOut" => (slot == 0).then_some("CONDITIONING"),
         "ConditioningSetMask" => (slot == 0).then_some("CONDITIONING"),
@@ -321,18 +387,24 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
             1 => Some("MASK"),
             _ => None,
         },
+        "LoadAudio" => (slot == 0).then_some("AUDIO"),
         "ImageToMask" => (slot == 0).then_some("MASK"),
         "MaskToImage" => (slot == 0).then_some("IMAGE"),
-        "EmptyLatentImage" | "EmptySD3LatentImage" | "EmptyFlux2LatentImage" => {
-            (slot == 0).then_some("LATENT")
-        }
+        "EmptyLatentImage"
+        | "EmptySD3LatentImage"
+        | "EmptyFlux2LatentImage"
+        | "EmptyHunyuanLatentVideo" => (slot == 0).then_some("LATENT"),
+        "WanImageToVideo" => match slot {
+            0 => Some("CONDITIONING"),
+            1 => Some("CONDITIONING"),
+            2 => Some("LATENT"),
+            _ => None,
+        },
         "VAEEncode" | "VAEEncodeForInpaint" | "RepeatLatentBatch" => {
             (slot == 0).then_some("LATENT")
         }
         "SetLatentNoiseMask" => (slot == 0).then_some("LATENT"),
-        "ImageScale" | "ImageScaleToTotalPixels" | "ImageScaleBy" => {
-            (slot == 0).then_some("IMAGE")
-        }
+        "ImageScale" | "ImageScaleToTotalPixels" | "ImageScaleBy" => (slot == 0).then_some("IMAGE"),
         // ImageResizeKJ (KJ): outputs (IMAGE, width, height).
         "ImageResizeKJ" => match slot {
             0 => Some("IMAGE"),
@@ -373,8 +445,15 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
         "ModelSamplingAuraFlow" | "ModelSamplingSD3" | "DifferentialDiffusion" => {
             (slot == 0).then_some("MODEL")
         }
-        "KSampler" | "KSamplerAdvanced" | "LanPaint_KSampler"
-        | "LanPaint_KSamplerAdvanced" => (slot == 0).then_some("LATENT"),
+        "KSampler" | "KSamplerAdvanced" | "LanPaint_KSampler" | "LanPaint_KSamplerAdvanced" => {
+            (slot == 0).then_some("LATENT")
+        }
+        "LTXVSampler" => match slot {
+            0 => Some("LATENT"),
+            1 => Some("VIDEO"),
+            2 => Some("AUDIO"),
+            _ => None,
+        },
         "CFGGuider" => (slot == 0).then_some("GUIDER"),
         "BasicGuider" => (slot == 0).then_some("GUIDER"),
         "Flux2Scheduler" | "BasicScheduler" => (slot == 0).then_some("SIGMAS"),
@@ -392,9 +471,9 @@ fn output_port(graph: &Map<String, JsonValue>, src_id: i64, slot: i64) -> GraphR
         "ComfySwitchNode" => (slot == 0).then_some("output"),
         "LanPaint_MaskBlend" => (slot == 0).then_some("IMAGE"),
         "VAEDecode" => (slot == 0).then_some("IMAGE"),
-        "SaveImage" => {
+        "SaveImage" | "SaveVideo" | "SaveAudioOpus" => {
             return Err(GraphError::unsupported(
-                "Comfy API prompt SaveImage has no supported output slot",
+                "Comfy API prompt terminal save node has no supported output slot",
             ))
         }
         _ => {
@@ -425,20 +504,22 @@ pub fn comfy_api_prompt_to_typed_body(graph: &JsonValue) -> GraphResult<JsonValu
     let mut edges = Vec::new();
 
     for (key, src) in graph_obj {
-        let node_id = key.parse::<i64>().map_err(|_| {
-            GraphError::unsupported("Comfy API prompt node id must be an integer")
-        })?;
+        let node_id = key
+            .parse::<i64>()
+            .map_err(|_| GraphError::unsupported("Comfy API prompt node id must be an integer"))?;
         let src = src
             .as_object()
             .ok_or_else(|| GraphError::unsupported("Comfy API prompt node must be an object"))?;
         let typ = canonical_type_id(
-            src.get("class_type").and_then(JsonValue::as_str).unwrap_or(""),
+            src.get("class_type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(""),
         );
         if typ.is_empty() {
-            return Err(GraphError::unsupported(
-                "Comfy API prompt node missing class_type",
-            )
-            .with_node(node_id));
+            return Err(
+                GraphError::unsupported("Comfy API prompt node missing class_type")
+                    .with_node(node_id),
+            );
         }
         let inputs = src
             .get("inputs")
@@ -492,33 +573,60 @@ fn set_if_missing(obj: &mut JsonValue, key: &str, value: JsonValue) {
     }
 }
 
+fn prompt_json_to_string(value: &JsonValue) -> GraphResult<String> {
+    if let Some(s) = value.as_str() {
+        return Ok(s.to_string());
+    }
+    if value.is_object() || value.is_array() {
+        return serde_json::to_string(value).map_err(|e| {
+            GraphError::unsupported(format!(
+                "Ideogram4 Comfy export prompt_json could not be serialized: {e}"
+            ))
+        });
+    }
+    Err(GraphError::unsupported(
+        "Ideogram4 Comfy export prompt_json must be a string or JSON object/array",
+    ))
+}
+
 /// `_workflow_has_prompt_override` (Mojo 295): a non-empty top-level `prompt`
 /// satisfies the gate; a non-empty `prompt_raw` is copied into `prompt` (if
-/// missing) and also satisfies it.
-fn has_prompt_override(obj: &mut JsonValue) -> bool {
+/// missing) and also satisfies it. `prompt_json` is an Ideogram-specific
+/// extension: string values are used directly, and JSON object/array values are
+/// serialized into the authored prompt string so bbox captions survive lowering.
+fn has_prompt_override(obj: &mut JsonValue) -> GraphResult<bool> {
+    if let Some(value) = obj.get("prompt_json").filter(|v| !v.is_null()) {
+        let raw = prompt_json_to_string(value)?;
+        if raw.is_empty() {
+            return Err(GraphError::unsupported(
+                "Ideogram4 Comfy export prompt_json must be non-empty",
+            ));
+        }
+        let raw_val = JsonValue::String(raw);
+        let o = obj.as_object_mut().expect("request is an object");
+        o.insert("prompt".to_string(), raw_val.clone());
+        o.insert("prompt_raw".to_string(), raw_val);
+        return Ok(true);
+    }
     if let Some(s) = obj.get("prompt").and_then(JsonValue::as_str) {
         if !s.is_empty() {
-            return true;
+            return Ok(true);
         }
     }
     if let Some(raw) = obj.get("prompt_raw").and_then(JsonValue::as_str) {
         if !raw.is_empty() {
             let raw_val = obj["prompt_raw"].clone();
             set_if_missing(obj, "prompt", raw_val);
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// `_workflow_set_seed_from_widget_if_missing` (Mojo 304): keep an existing
 /// top-level seed; otherwise require a valid uint32 seed from the widget.
 fn set_seed_from_widget_if_missing(obj: &mut JsonValue, seed: i64) -> GraphResult<()> {
-    if obj
-        .get("seed")
-        .map(|v| !v.is_null())
-        .unwrap_or(false)
-    {
+    if obj.get("seed").map(|v| !v.is_null()).unwrap_or(false) {
         return Ok(());
     }
     if seed < 0 {
@@ -565,9 +673,9 @@ fn node_widgets(node: &JsonValue) -> JsonValue {
 /// execution metadata. Requires a top-level prompt override (the prompt-builder
 /// subgraph needs external Gemma/KJ execution).
 pub fn apply_ideogram4_comfy_ui_export(obj: &mut JsonValue, wf: &JsonValue) -> GraphResult<()> {
-    if !has_prompt_override(obj) {
+    if !has_prompt_override(obj)? {
         return Err(GraphError::unsupported(
-            "Ideogram4 Comfy export uses a prompt-builder subgraph; provide top-level prompt or prompt_raw",
+            "Ideogram4 Comfy export uses a prompt-builder subgraph; provide top-level prompt, prompt_raw, or prompt_json",
         ));
     }
 
@@ -689,12 +797,18 @@ pub fn apply_ideogram4_comfy_ui_export(obj: &mut JsonValue, wf: &JsonValue) -> G
                 }
             }
             "CLIPLoader" => {
-                if widget_string(&widgets, 0, "").to_lowercase().contains("qwen3vl") {
+                if widget_string(&widgets, 0, "")
+                    .to_lowercase()
+                    .contains("qwen3vl")
+                {
                     saw_clip = true;
                 }
             }
             "VAELoader" => {
-                if widget_string(&widgets, 0, "").to_lowercase().contains("flux2") {
+                if widget_string(&widgets, 0, "")
+                    .to_lowercase()
+                    .contains("flux2")
+                {
                     saw_vae = true;
                 }
             }
@@ -702,11 +816,7 @@ pub fn apply_ideogram4_comfy_ui_export(obj: &mut JsonValue, wf: &JsonValue) -> G
                 saw_prompt_encode = true;
             }
             "KSamplerSelect" => {
-                set_if_missing(
-                    obj,
-                    "sampler",
-                    json!(widget_string(&widgets, 0, "euler")),
-                );
+                set_if_missing(obj, "sampler", json!(widget_string(&widgets, 0, "euler")));
                 saw_sampler = true;
             }
             "BasicScheduler" => {
@@ -742,8 +852,14 @@ pub fn apply_ideogram4_comfy_ui_export(obj: &mut JsonValue, wf: &JsonValue) -> G
             "CustomCombo" => {
                 selected_mode = widget_string(&widgets, 0, &selected_mode);
             }
-            "ConditioningZeroOut" | "SamplerCustomAdvanced" | "VAEDecode" | "RandomNoise"
-            | "PrimitiveInt" | "ComfyMathExpression" | "JsonExtractString" | "StringReplace"
+            "ConditioningZeroOut"
+            | "SamplerCustomAdvanced"
+            | "VAEDecode"
+            | "RandomNoise"
+            | "PrimitiveInt"
+            | "ComfyMathExpression"
+            | "JsonExtractString"
+            | "StringReplace"
             | "ComfyNumberConvert" => {
                 // Allowed inert/auxiliary subgraph node.
             }
@@ -778,12 +894,7 @@ pub fn apply_ideogram4_comfy_ui_export(obj: &mut JsonValue, wf: &JsonValue) -> G
         .and_then(JsonValue::as_array)
         .map(|a| a.len())
         .unwrap_or(0);
-    crate::record_workflow_execution(
-        obj,
-        "ideogram4_comfy_ui_export",
-        sg_nodes.len(),
-        edge_count,
-    );
+    crate::record_workflow_execution(obj, "ideogram4_comfy_ui_export", sg_nodes.len(), edge_count);
     Ok(())
 }
 
@@ -829,12 +940,17 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
         }
         "LoraLoader" | "LoraLoaderModelOnly" | "ZImageLoraModelOnly" => {
             fields.insert("lora_name".into(), json!(widget_string(widgets, 0, "")));
-            fields.insert("strength_model".into(), json!(widget_float(widgets, 1, 1.0)));
+            fields.insert(
+                "strength_model".into(),
+                json!(widget_float(widgets, 1, 1.0)),
+            );
             if type_id == "LoraLoader" {
                 fields.insert("strength_clip".into(), json!(widget_float(widgets, 2, 1.0)));
             }
         }
-        "CLIPTextEncode" | "CLIPTextEncodeFlux" | "TextEncodeQwenImageEdit"
+        "CLIPTextEncode"
+        | "CLIPTextEncodeFlux"
+        | "TextEncodeQwenImageEdit"
         | "TextEncodeQwenImageEditPlus" => {
             fields.insert("text".into(), json!(widget_string(widgets, 0, "")));
         }
@@ -852,7 +968,10 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             // (they require the un-knowable source dims to compute the result).
             fields.insert("width".into(), json!(widget_int(widgets, 0, 512)));
             fields.insert("height".into(), json!(widget_int(widgets, 1, 512)));
-            fields.insert("keep_proportion".into(), json!(widget_bool(widgets, 3, false)));
+            fields.insert(
+                "keep_proportion".into(),
+                json!(widget_bool(widgets, 3, false)),
+            );
             fields.insert("divisible_by".into(), json!(widget_int(widgets, 4, 2)));
         }
         "EmptyLatentImage" | "EmptySD3LatentImage" | "EmptyFlux2LatentImage" => {
@@ -864,18 +983,33 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             fields.insert("seed".into(), json!(widget_int(widgets, 0, -1)));
             fields.insert("steps".into(), json!(widget_int(widgets, 2, 20)));
             fields.insert("cfg".into(), json!(widget_float(widgets, 3, 4.5)));
-            fields.insert("sampler_name".into(), json!(widget_string(widgets, 4, "euler")));
-            fields.insert("scheduler".into(), json!(widget_string(widgets, 5, "simple")));
+            fields.insert(
+                "sampler_name".into(),
+                json!(widget_string(widgets, 4, "euler")),
+            );
+            fields.insert(
+                "scheduler".into(),
+                json!(widget_string(widgets, 5, "simple")),
+            );
             fields.insert("denoise".into(), json!(widget_float(widgets, 6, 1.0)));
         }
         "KSamplerAdvanced" => {
-            fields.insert("add_noise".into(), json!(widget_string(widgets, 0, "enable")));
+            fields.insert(
+                "add_noise".into(),
+                json!(widget_string(widgets, 0, "enable")),
+            );
             fields.insert("noise_seed".into(), json!(widget_int(widgets, 1, -1)));
             fields.insert("seed".into(), json!(widget_int(widgets, 1, -1)));
             fields.insert("steps".into(), json!(widget_int(widgets, 3, 20)));
             fields.insert("cfg".into(), json!(widget_float(widgets, 4, 4.5)));
-            fields.insert("sampler_name".into(), json!(widget_string(widgets, 5, "euler")));
-            fields.insert("scheduler".into(), json!(widget_string(widgets, 6, "simple")));
+            fields.insert(
+                "sampler_name".into(),
+                json!(widget_string(widgets, 5, "euler")),
+            );
+            fields.insert(
+                "scheduler".into(),
+                json!(widget_string(widgets, 6, "simple")),
+            );
             fields.insert("start_at_step".into(), json!(widget_int(widgets, 7, 0)));
             fields.insert("end_at_step".into(), json!(widget_int(widgets, 8, 10000)));
             fields.insert(
@@ -887,11 +1021,23 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             fields.insert("seed".into(), json!(widget_int(widgets, 0, -1)));
             fields.insert("steps".into(), json!(widget_int(widgets, 2, 20)));
             fields.insert("cfg".into(), json!(widget_float(widgets, 3, 4.5)));
-            fields.insert("sampler_name".into(), json!(widget_string(widgets, 4, "euler")));
-            fields.insert("scheduler".into(), json!(widget_string(widgets, 5, "simple")));
+            fields.insert(
+                "sampler_name".into(),
+                json!(widget_string(widgets, 4, "euler")),
+            );
+            fields.insert(
+                "scheduler".into(),
+                json!(widget_string(widgets, 5, "simple")),
+            );
             fields.insert("denoise".into(), json!(widget_float(widgets, 6, 1.0)));
-            fields.insert("LanPaint_NumSteps".into(), json!(widget_int(widgets, 7, -1)));
-            fields.insert("LanPaint_PromptMode".into(), json!(widget_string(widgets, 8, "")));
+            fields.insert(
+                "LanPaint_NumSteps".into(),
+                json!(widget_int(widgets, 7, -1)),
+            );
+            fields.insert(
+                "LanPaint_PromptMode".into(),
+                json!(widget_string(widgets, 8, "")),
+            );
             fields.insert("Inpainting_mode".into(), json!(lanpaint_mode(widgets, 10)));
         }
         "LanPaint_KSamplerAdvanced" => {
@@ -900,33 +1046,87 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             fields.insert("seed".into(), json!(widget_int(widgets, 1, -1)));
             fields.insert("steps".into(), json!(widget_int(widgets, 3, 20)));
             fields.insert("cfg".into(), json!(widget_float(widgets, 4, 4.5)));
-            fields.insert("sampler_name".into(), json!(widget_string(widgets, 5, "euler")));
-            fields.insert("scheduler".into(), json!(widget_string(widgets, 6, "simple")));
+            fields.insert(
+                "sampler_name".into(),
+                json!(widget_string(widgets, 5, "euler")),
+            );
+            fields.insert(
+                "scheduler".into(),
+                json!(widget_string(widgets, 6, "simple")),
+            );
             fields.insert("start_at_step".into(), json!(widget_int(widgets, 7, -1)));
             fields.insert("end_at_step".into(), json!(widget_int(widgets, 8, -1)));
             fields.insert(
                 "return_with_leftover_noise".into(),
                 json!(widget_string(widgets, 9, "")),
             );
-            fields.insert("LanPaint_NumSteps".into(), json!(widget_int(widgets, 10, -1)));
-            fields.insert("LanPaint_Lambda".into(), json!(widget_float(widgets, 11, -1.0)));
-            fields.insert("LanPaint_StepSize".into(), json!(widget_float(widgets, 12, -1.0)));
-            fields.insert("LanPaint_Beta".into(), json!(widget_float(widgets, 13, -1.0)));
-            fields.insert("LanPaint_Friction".into(), json!(widget_float(widgets, 14, -1.0)));
-            fields.insert("LanPaint_PromptMode".into(), json!(widget_string(widgets, 15, "")));
-            fields.insert("LanPaint_EarlyStop".into(), json!(widget_int(widgets, 16, -1)));
+            fields.insert(
+                "LanPaint_NumSteps".into(),
+                json!(widget_int(widgets, 10, -1)),
+            );
+            fields.insert(
+                "LanPaint_Lambda".into(),
+                json!(widget_float(widgets, 11, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_StepSize".into(),
+                json!(widget_float(widgets, 12, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_Beta".into(),
+                json!(widget_float(widgets, 13, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_Friction".into(),
+                json!(widget_float(widgets, 14, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_PromptMode".into(),
+                json!(widget_string(widgets, 15, "")),
+            );
+            fields.insert(
+                "LanPaint_EarlyStop".into(),
+                json!(widget_int(widgets, 16, -1)),
+            );
             fields.insert("Inpainting_mode".into(), json!(lanpaint_mode(widgets, 18)));
         }
         "LanPaint_SamplerCustomAdvanced" => {
-            fields.insert("LanPaint_NumSteps".into(), json!(widget_int(widgets, 0, -1)));
-            fields.insert("LanPaint_Lambda".into(), json!(widget_float(widgets, 1, -1.0)));
-            fields.insert("LanPaint_StepSize".into(), json!(widget_float(widgets, 2, -1.0)));
-            fields.insert("LanPaint_Beta".into(), json!(widget_float(widgets, 3, -1.0)));
-            fields.insert("LanPaint_Friction".into(), json!(widget_float(widgets, 4, -1.0)));
-            fields.insert("LanPaint_PromptMode".into(), json!(widget_string(widgets, 5, "")));
-            fields.insert("LanPaint_EarlyStop".into(), json!(widget_int(widgets, 6, -1)));
-            fields.insert("LanPaint_InnerThreshold".into(), json!(widget_float(widgets, 8, -1.0)));
-            fields.insert("LanPaint_InnerPatience".into(), json!(widget_int(widgets, 9, -1)));
+            fields.insert(
+                "LanPaint_NumSteps".into(),
+                json!(widget_int(widgets, 0, -1)),
+            );
+            fields.insert(
+                "LanPaint_Lambda".into(),
+                json!(widget_float(widgets, 1, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_StepSize".into(),
+                json!(widget_float(widgets, 2, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_Beta".into(),
+                json!(widget_float(widgets, 3, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_Friction".into(),
+                json!(widget_float(widgets, 4, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_PromptMode".into(),
+                json!(widget_string(widgets, 5, "")),
+            );
+            fields.insert(
+                "LanPaint_EarlyStop".into(),
+                json!(widget_int(widgets, 6, -1)),
+            );
+            fields.insert(
+                "LanPaint_InnerThreshold".into(),
+                json!(widget_float(widgets, 8, -1.0)),
+            );
+            fields.insert(
+                "LanPaint_InnerPatience".into(),
+                json!(widget_int(widgets, 9, -1)),
+            );
         }
         "LanPaint_MaskBlend" => {
             fields.insert("blend_overlap".into(), json!(widget_int(widgets, 0, -1)));
@@ -960,7 +1160,10 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
         "StringConstant" | "StringConstantMultiline" => {
             fields.insert("string".into(), json!(widget_string(widgets, 0, "")));
             if type_id == "StringConstantMultiline" {
-                fields.insert("strip_newlines".into(), json!(widget_bool(widgets, 1, true)));
+                fields.insert(
+                    "strip_newlines".into(),
+                    json!(widget_bool(widgets, 1, true)),
+                );
             }
         }
         _ if is_string_scalar_node(type_id) => {
@@ -1001,18 +1204,27 @@ fn comfy_ui_widget_fields(type_id: &str, widgets: &JsonValue) -> JsonValue {
             fields.insert("noise_seed".into(), json!(widget_int(widgets, 0, -1)));
         }
         "KSamplerSelect" => {
-            fields.insert("sampler_name".into(), json!(widget_string(widgets, 0, "euler")));
+            fields.insert(
+                "sampler_name".into(),
+                json!(widget_string(widgets, 0, "euler")),
+            );
         }
         "Flux2Scheduler" => {
             fields.insert("steps".into(), json!(widget_int(widgets, 0, 20)));
         }
         "BasicScheduler" => {
-            fields.insert("scheduler".into(), json!(widget_string(widgets, 0, "simple")));
+            fields.insert(
+                "scheduler".into(),
+                json!(widget_string(widgets, 0, "simple")),
+            );
             fields.insert("steps".into(), json!(widget_int(widgets, 1, 20)));
             fields.insert("denoise".into(), json!(widget_float(widgets, 2, 1.0)));
         }
-        "KarrasScheduler" | "ExponentialScheduler" | "PolyexponentialScheduler"
-        | "VPScheduler" | "LaplaceScheduler" => {
+        "KarrasScheduler"
+        | "ExponentialScheduler"
+        | "PolyexponentialScheduler"
+        | "VPScheduler"
+        | "LaplaceScheduler" => {
             // Comfy widget order: [steps, <shape params: sigma_max/min/rho or
             // beta_d/beta_min/eps_s or mu/sigma>]. Only steps has a flat slot; the
             // shape params have no flat representation (the scheduler name itself

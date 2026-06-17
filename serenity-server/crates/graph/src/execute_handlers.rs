@@ -46,7 +46,150 @@ fn opt_nonempty(s: &str) -> Option<String> {
     }
 }
 
-// --- EmptyLatentImage / EmptySD3 / EmptyFlux2 (Mojo 1904) ----------------------
+fn exec_ltxv_sampler(
+    node: &WorkflowNode,
+    links: &LinkMap,
+    store: &mut ValueStore,
+    out: &mut JsonValue,
+) -> GraphResult<Fire> {
+    let id = node.id;
+    let fields = &node.fields;
+    let mut model_link = links.input(id, "ltxv_model");
+    if !model_link.found {
+        model_link = links.input(id, "model");
+    }
+    let audio_link = links.input(id, "audio");
+    if !model_link.found {
+        return Err(GraphError::unsupported(
+            "workflow graph LTXVSampler missing ltxv_model input",
+        )
+        .with_node(id));
+    }
+    if !(ready(store, &model_link) && optional_ready(store, &audio_link)) {
+        return Ok(Fire::NotReady);
+    }
+    require_value_type(store, &model_link, "MODEL", "ltxv_model")?;
+    if audio_link.found {
+        require_value_type(store, &audio_link, "AUDIO", "audio")?;
+    }
+    let model_name = model_name_of(store, &model_link)?;
+    if !model_name.is_empty() {
+        set_if_missing(out, "model", json!(model_name));
+    }
+    let prompt = wf_string(fields, "prompt");
+    if !prompt.is_empty() {
+        set_if_missing(out, "prompt", json!(prompt));
+    }
+    let negative = wf_string(fields, "negative_prompt");
+    if !negative.is_empty() {
+        set_if_missing(out, "negative", json!(negative));
+    }
+    let width = opt_int(fields, "width", 768, 16, 4096)?;
+    let height = opt_int(fields, "height", 512, 16, 4096)?;
+    let frames = opt_int(fields, "num_frames", 97, 1, 4096)?;
+    let steps = opt_int(fields, "steps", 25, 1, 1000)?;
+    let seed = opt_int(fields, "seed", 0, 0, 4294967295)?;
+    let fps = opt_int(fields, "frame_rate", 24, 1, 240)?;
+    let cfg = wf_float(fields, "cfg", 3.0, 0.0, 100.0)?;
+    set_if_missing(out, "width", json!(width));
+    set_if_missing(out, "height", json!(height));
+    set_if_missing(out, "num_frames", json!(frames));
+    set_if_missing(out, "frame_count", json!(frames));
+    set_if_missing(out, "steps", json!(steps));
+    set_if_missing(out, "seed", json!(seed));
+    set_if_missing(out, "cfg", json!(cfg));
+    set_if_missing(out, "fps", json!(fps));
+    set_if_missing(out, "frame_rate", json!(fps));
+    copy_field_if_missing(out, fields, "mode", "video_mode");
+    copy_field_if_missing(out, fields, "stg_scale", "stg_scale");
+    copy_field_if_missing(out, fields, "audio_start_time", "audio_start_time");
+    copy_field_if_missing(out, fields, "audio_duration", "audio_duration");
+    add_value(
+        store,
+        id,
+        "LATENT",
+        ValuePayload::Latent {
+            width,
+            height,
+            batch: 1,
+            init_image: None,
+            mask_image: None,
+        },
+    )?;
+    add_value(store, id, "VIDEO", ValuePayload::Video { path: String::new() })?;
+    add_value(store, id, "AUDIO", ValuePayload::Audio { path: String::new() })?;
+    Ok(Fire::Done)
+}
+
+fn exec_wan_image_to_video(
+    node: &WorkflowNode,
+    links: &LinkMap,
+    store: &mut ValueStore,
+    out: &mut JsonValue,
+) -> GraphResult<Fire> {
+    let id = node.id;
+    let fields = &node.fields;
+    let positive_link = links.input(id, "positive");
+    let vae_link = links.input(id, "vae");
+    let image_link = links.input(id, "image");
+    let clip_vision_link = links.input(id, "clip_vision_output");
+    if !positive_link.found || !vae_link.found || !image_link.found {
+        return Err(GraphError::unsupported(
+            "workflow graph WanImageToVideo missing required typed input",
+        )
+        .with_node(id));
+    }
+    if !(ready(store, &positive_link)
+        && ready(store, &vae_link)
+        && ready(store, &image_link)
+        && optional_ready(store, &clip_vision_link))
+    {
+        return Ok(Fire::NotReady);
+    }
+    require_value_type(store, &positive_link, "CONDITIONING", "positive")?;
+    require_value_type(store, &vae_link, "VAE", "vae")?;
+    require_value_type(store, &image_link, "IMAGE", "image")?;
+    if clip_vision_link.found {
+        require_value_type(
+            store,
+            &clip_vision_link,
+            "CLIP_VISION_OUTPUT",
+            "clip_vision_output",
+        )?;
+    }
+    let width = opt_int(fields, "width", 832, 16, 4096)?;
+    let height = opt_int(fields, "height", 480, 16, 4096)?;
+    let frames = opt_int(fields, "length", 81, 1, 4096)?;
+    let image_path = image_path_of(store, &image_link)?;
+    set_if_missing(out, "width", json!(width));
+    set_if_missing(out, "height", json!(height));
+    set_if_missing(out, "num_frames", json!(frames));
+    set_if_missing(out, "frame_count", json!(frames));
+    set_if_missing(out, "video_conditioning_image", json!(image_path.clone()));
+    add_value(
+        store,
+        id,
+        "CONDITIONING",
+        ValuePayload::Cond {
+            text: cond_text_of(store, &positive_link)?,
+        },
+    )?;
+    add_value(
+        store,
+        id,
+        "LATENT",
+        ValuePayload::Latent {
+            width,
+            height,
+            batch: 1,
+            init_image: opt_nonempty(&image_path),
+            mask_image: None,
+        },
+    )?;
+    Ok(Fire::Done)
+}
+
+// --- EmptyLatentImage / EmptySD3 / EmptyFlux2 / video latent (Mojo 1904) -------
 
 fn exec_empty_latent(
     node: &WorkflowNode,
@@ -59,9 +202,11 @@ fn exec_empty_latent(
     let width_link = links.input(id, "width");
     let height_link = links.input(id, "height");
     let batch_link = links.input(id, "batch_size");
+    let length_link = links.input(id, "length");
     if !(optional_ready(store, &width_link)
         && optional_ready(store, &height_link)
-        && optional_ready(store, &batch_link))
+        && optional_ready(store, &batch_link)
+        && optional_ready(store, &length_link))
     {
         return Ok(Fire::NotReady);
     }
@@ -76,6 +221,20 @@ fn exec_empty_latent(
     }
     if batch_link.found {
         images = scalar_int_of(store, &batch_link, "batch_size")?;
+    }
+    if node.type_id == "EmptyHunyuanLatentVideo" {
+        let mut frames = opt_int(fields, "length", 1, 1, 4096)?;
+        if length_link.found {
+            frames = scalar_int_of(store, &length_link, "length")?;
+        }
+        if !(1..=4096).contains(&frames) {
+            return Err(GraphError::unsupported(
+                "workflow graph EmptyHunyuanLatentVideo length out of range",
+            )
+            .with_node(id));
+        }
+        set_if_missing(out, "num_frames", json!(frames));
+        set_if_missing(out, "frame_count", json!(frames));
     }
     if !(16..=2048).contains(&width) || !(16..=2048).contains(&height) {
         return Err(GraphError::unsupported(
@@ -96,7 +255,13 @@ fn exec_empty_latent(
         store,
         id,
         "LATENT",
-        ValuePayload::Latent { width, height, batch: images, init_image: None, mask_image: None },
+        ValuePayload::Latent {
+            width,
+            height,
+            batch: images,
+            init_image: None,
+            mask_image: None,
+        },
     )?;
     Ok(Fire::Done)
 }
@@ -1188,15 +1353,14 @@ fn exec_vae_encode_for_inpaint(
 
 // --- RepeatLatentBatch (ComfyUI built-in) --------------------------------------
 
-/// RepeatLatentBatch duplicates a LATENT batch `amount` times (Comfy:
-/// `samples.repeat(amount, 1, 1, 1)`). In the flat model the batch count is the
-/// `images` key, so the new batch = source batch * amount. Geometry/init/mask
-/// carry through unchanged.
+/// RepeatLatentBatch mutates a Comfy latent tensor batch. The flat daemon
+/// `images=N` key is serial fanout, not latent-batch execution, so this node
+/// must fail loud until a real batched latent path exists.
 fn exec_repeat_latent_batch(
     node: &WorkflowNode,
     links: &LinkMap,
     store: &mut ValueStore,
-    out: &mut JsonValue,
+    _out: &mut JsonValue,
 ) -> GraphResult<Fire> {
     let id = node.id;
     let fields = &node.fields;
@@ -1222,39 +1386,10 @@ fn exec_repeat_latent_batch(
         )
         .with_node(id));
     }
-    let geom = latent_geom_of(store, &samples_link);
-    let (width, height, src_batch, init_image, mask_image) = match geom {
-        Some(g) => (g.width, g.height, g.batch, g.init_image, g.mask_image),
-        None => (0, 0, 1, String::new(), String::new()),
-    };
-    let new_batch = src_batch.saturating_mul(amount);
-    if !(1..=64).contains(&new_batch) {
-        return Err(GraphError::unsupported(
-            "workflow graph RepeatLatentBatch repeated batch out of range",
-        )
-        .with_node(id));
-    }
-    // RepeatLatentBatch is an explicit batch transform: unlike the geometry
-    // pass-throughs it must OVERRIDE any `images` an upstream EmptyLatentImage
-    // already wrote (the first-writer-wins `set_if_missing` convention would
-    // otherwise leave the node silently ineffective on the flat output). The
-    // LATENT payload batch below is the source of truth carried to the sampler.
-    out.as_object_mut()
-        .expect("out is an object")
-        .insert("images".to_string(), json!(new_batch));
-    add_value(
-        store,
-        id,
-        "LATENT",
-        ValuePayload::Latent {
-            width,
-            height,
-            batch: new_batch,
-            init_image: opt_nonempty(&init_image),
-            mask_image: opt_nonempty(&mask_image),
-        },
-    )?;
-    Ok(Fire::Done)
+    Err(GraphError::unsupported(
+        "workflow graph RepeatLatentBatch requires real Comfy latent-batch execution; use flat images=N for serial product fanout",
+    )
+    .with_node(id))
 }
 
 // --- SetLatentNoiseMask (Mojo 2301) --------------------------------------------

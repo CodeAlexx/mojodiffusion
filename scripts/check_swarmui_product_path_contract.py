@@ -37,8 +37,15 @@ PROCESS_ISOLATED = REPO / "serenitymojo/serve/process_isolated_backend.mojo"
 ZIMAGE_BACKEND = REPO / "serenitymojo/serve/zimage_backend.mojo"
 QWEN_BACKEND = REPO / "serenitymojo/serve/qwenimage_backend.mojo"
 IDEOGRAM4_BACKEND = REPO / "serenitymojo/serve/ideogram4_backend.mojo"
+SDXL_BACKEND = REPO / "serenitymojo/serve/sdxl_backend.mojo"
+ANIMA_BACKEND = REPO / "serenitymojo/serve/anima_backend.mojo"
+SD3_BACKEND = REPO / "serenitymojo/serve/sd3_backend.mojo"
+FLUX_BACKEND = REPO / "serenitymojo/serve/flux_backend.mojo"
+PRODUCT_MANIFEST = REPO / "serenitymojo/serve/product_manifest.mojo"
 STUB_BACKEND = REPO / "serenitymojo/serve/stub_backend.mojo"
 ZIMAGE_DAEMON_PRODUCT_CHECK = REPO / "scripts/check_zimage_daemon_product_contract.py"
+MOJO_WEIGHT_SOURCE_CHECK = REPO / "scripts/check_mojo_inference_weight_sources.py"
+RUST_BLOCK_PROFILE_CHECK = REPO / "serenitymojo/offload/check_rust_block_profile_contract.py"
 SAMPLER_SURFACE_CHECK = REPO / "scripts/check_swarmui_sampler_surface.py"
 WORKFLOW_NODE_SURFACE_CHECK = REPO / "scripts/check_workflow_node_surface.py"
 MODEL_GALLERY_LORA_SURFACE_CHECK = REPO / "scripts/check_model_gallery_lora_surface.py"
@@ -277,11 +284,11 @@ def check_swarmui_audit_doc() -> list[Check]:
             label="SwarmUI sampler parity map exists",
             needles=[
                 "`accepted_sampler_parity` must remain false",
-                "Z-Image and Qwen now apply",
+                "Qwen generation is metadata/preflight-only",
                 "`/v1/samplers` support matrix",
             ],
             severity=P0,
-            acceptance="Sampler map names current sampler/scheduler blockers and implemented variation behavior.",
+            acceptance="Sampler map names current sampler/scheduler blockers, implemented variation behavior, and Qwen preflight-only status.",
         ),
         check_contains(
             WORKFLOW_MAP_DOC,
@@ -413,7 +420,7 @@ def check_specialized_surface_blockers() -> list[Check]:
         check_contains(
             QWEN_BACKEND,
             category="sampler",
-            label="Qwen rejects unsupported sampler controls",
+            label="Qwen helper retains local unsupported-control guards",
             needles=[
                 "reject_unsupported_common_runtime_params",
                 "sampler_admission_for_backend",
@@ -422,7 +429,7 @@ def check_specialized_surface_blockers() -> list[Check]:
                 "unsupported scheduler",
             ],
             severity=P0,
-            acceptance="Qwen fails loud for unsupported sampler/scheduler/image/variation settings before model work.",
+            acceptance="Qwen helper code remains fail-loud locally, but product admission still rejects Qwen before enqueue.",
         ),
         check_contains(
             IDEOGRAM4_BACKEND,
@@ -507,14 +514,14 @@ def check_specialized_surface_blockers() -> list[Check]:
         check_contains(
             QWEN_BACKEND,
             category="sampler",
-            label="Qwen applies variation noise",
+            label="Qwen helper keeps variation-noise wiring",
             needles=[
                 "swarm_variation_noise_chw",
                 "self.params.variation_seed + self.params.image_index",
                 "variation_strength > 0.0",
             ],
             severity=P0,
-            acceptance="Qwen variation_seed/variation_strength affect initial latent noise instead of silently no-oping.",
+            acceptance="Qwen variation wiring is preserved as helper inventory, not accepted product-generation evidence.",
         ),
         check_absent(
             SAMPLER_MAP_DOC,
@@ -777,6 +784,111 @@ def check_daemon_surface() -> list[Check]:
             severity=P0,
             acceptance="Real Z-Image daemon generation has a repeatable artifact/timing/VRAM gate.",
         ),
+        check_contains(
+            PRODUCT_MANIFEST,
+            category="daemon",
+            label="shared worker result manifest writer",
+            needles=["json_escape", "json_bool", "peak_vram_mib", "write_text_file", "sys_pwrite"],
+            severity=P0,
+            acceptance="Per-kind Mojo workers can write local JSON result sidecars without Python or external repos.",
+        ),
+        check_contains(
+            SDXL_BACKEND,
+            category="daemon",
+            label="SDXL worker emits product result manifest",
+            needles=[
+                "serenity.sdxl.daemon_result.v1",
+                "_write_result_manifest",
+                "total_wall_seconds",
+                "peak_vram_mib",
+                "requested_sampler",
+                "executed_sampler",
+                "write_text_file",
+            ],
+            severity=P0,
+            acceptance="SDXL server-worker generation can produce manifest-backed timing/VRAM evidence instead of PNG-only evidence.",
+        ),
+        check_contains(
+            ANIMA_BACKEND,
+            category="daemon",
+            label="Anima worker emits product result manifest",
+            needles=[
+                "serenity.anima.daemon_result.v1",
+                "_write_result_manifest",
+                "total_wall_seconds",
+                "peak_vram_mib",
+                "requested_sampler",
+                "executed_sampler",
+                "write_text_file",
+            ],
+            severity=P0,
+            acceptance="Anima server-worker generation can produce manifest-backed timing/VRAM evidence instead of PNG-only evidence.",
+        ),
+        check_contains(
+            SD3_BACKEND,
+            category="daemon",
+            label="SD3 worker emits product result manifest",
+            needles=[
+                "serenity.sd3.daemon_result.v1",
+                "_write_result_manifest",
+                "total_wall_seconds",
+                "peak_vram_mib",
+                "requested_sampler",
+                "executed_sampler",
+                "write_text_file",
+            ],
+            severity=P0,
+            acceptance="SD3 server-worker generation can produce manifest-backed timing/VRAM evidence instead of PNG-only evidence.",
+        ),
+        check_contains(
+            FLUX_BACKEND,
+            category="daemon",
+            label="Flux worker emits product result manifest",
+            needles=[
+                "serenity.flux.daemon_result.v1",
+                "_write_result_manifest",
+                "total_wall_seconds",
+                "peak_vram_mib",
+                "requested_sampler",
+                "executed_sampler",
+                "write_text_file",
+            ],
+            severity=P0,
+            acceptance="Flux server-worker generation can produce manifest-backed timing/VRAM evidence instead of PNG-only evidence.",
+        ),
+        check_contains(
+            MOJO_WEIGHT_SOURCE_CHECK,
+            category="daemon",
+            label="Mojo inference weight source contract",
+            needles=[
+                "serenity.mojo_inference_weight_sources.v1",
+                "accepted_runtime_dependency_on_external_repos",
+                "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer",
+                "BANNED_RUNTIME_ROOTS",
+                "/home/alex/EriDiffusion",
+                "/home/alex/SerenityFlow",
+                "/home/alex/SwarmUI",
+                "/home/alex/ComfyUI",
+            ],
+            severity=P0,
+            acceptance="Production Mojo/Rust inference weight paths are pinned to local model artifacts and cannot quietly reintroduce old implementation repo dependencies.",
+        ),
+        check_contains(
+            RUST_BLOCK_PROFILE_CHECK,
+            category="daemon",
+            label="Rust block/memory profile contract",
+            needles=[
+                "serenity.rust_block_profiles.v1",
+                "serenitymojo/offload/check_rust_block_profile_contract.py",
+                "serenity-server/crates/server/src/block_profiles.rs",
+                "serenitymojo/offload/plan.mojo",
+                "serenitymojo/offload/vmm_manager.mojo",
+                "runtime_dependency_on_external_repos",
+                "BANNED_RUNTIME_ROOTS",
+            ],
+            severity=P0,
+            acceptance="Rust preflight block/memory reporting is locally gated against Mojo offload plans and cannot depend on outside implementation repos.",
+        ),
     ]
 
 
@@ -817,10 +929,10 @@ def check_model_gallery_surface() -> list[Check]:
         check_contains(
             QWEN_BACKEND,
             category="gallery",
-            label="Qwen backend writes PNG metadata",
+            label="Qwen helper keeps PNG metadata writer",
             needles=["encode_png_with_text", "serenity.genparams.v1"],
             severity=P1,
-            acceptance="Second real image backend persists reusable params in PNG tEXt.",
+            acceptance="Qwen metadata writing remains available in helper code, but Qwen product generation is preflight-only.",
         ),
         check_contains(
             IDEOGRAM4_BACKEND,
@@ -829,6 +941,38 @@ def check_model_gallery_surface() -> list[Check]:
             needles=["encode_png_with_text", "serenity.genparams.v1"],
             severity=P1,
             acceptance="Bounded Ideogram4 image backend persists reusable params in PNG tEXt.",
+        ),
+        check_contains(
+            SDXL_BACKEND,
+            category="gallery",
+            label="SDXL backend writes PNG metadata",
+            needles=["encode_png_with_text", "serenity.genparams.v1"],
+            severity=P1,
+            acceptance="SDXL server-worker images persist reusable params in PNG tEXt.",
+        ),
+        check_contains(
+            ANIMA_BACKEND,
+            category="gallery",
+            label="Anima backend writes PNG metadata",
+            needles=["encode_png_with_text", "serenity.genparams.v1"],
+            severity=P1,
+            acceptance="Anima server-worker images persist reusable params in PNG tEXt.",
+        ),
+        check_contains(
+            SD3_BACKEND,
+            category="gallery",
+            label="SD3 backend writes PNG metadata",
+            needles=["encode_png_with_text", "serenity.genparams.v1"],
+            severity=P1,
+            acceptance="SD3 server-worker images persist reusable params in PNG tEXt.",
+        ),
+        check_contains(
+            FLUX_BACKEND,
+            category="gallery",
+            label="Flux backend writes PNG metadata",
+            needles=["encode_png_with_text", "serenity.genparams.v1"],
+            severity=P1,
+            acceptance="Flux server-worker images persist reusable params in PNG tEXt.",
         ),
         check_contains(
             DAEMON,

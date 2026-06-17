@@ -23,7 +23,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Map, Value};
 use serenity_wire::JobParams;
 
-use crate::AppState;
+use crate::{result_manifest, AppState};
 
 /// A current-session job in the shared JobBook (the daemon's `jobs` list): the
 /// emitted `record`, the `params` the driver needs to send_start, and the queued
@@ -135,9 +135,12 @@ fn reorder_target_position(jobs: &[JobEntry], src_idx: usize, body: &Value) -> R
         if before_id == jobs[src_idx].record.id {
             return Ok(src_pos);
         }
-        let before_idx = find_job(jobs, before_id).ok_or_else(|| format!("no such before_id: {before_id}"))?;
+        let before_idx =
+            find_job(jobs, before_id).ok_or_else(|| format!("no such before_id: {before_id}"))?;
         if !jobs[before_idx].is_active_queued() {
-            return Err(format!("'before_id' is not an active queued job: {before_id}"));
+            return Err(format!(
+                "'before_id' is not an active queued job: {before_id}"
+            ));
         }
         let mut before_pos = queued_position_of_index(jobs, before_idx);
         if before_pos > src_pos {
@@ -165,7 +168,10 @@ fn jobs_err(status: StatusCode, detail: &str) -> Response {
 }
 
 fn body_object(body: &str) -> Value {
-    serde_json::from_str::<Value>(body).ok().filter(|v| v.is_object()).unwrap_or_else(|| json!({}))
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}))
 }
 
 /// POST /v1/reorder — move an active-queued job to a new position (by `position`
@@ -174,7 +180,12 @@ pub async fn post_reorder(State(st): State<AppState>, body: String) -> Response 
     let b = body_object(&body);
     let id = match b.get("id").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return jobs_err(StatusCode::UNPROCESSABLE_ENTITY, "'id' (string) is required"),
+        _ => {
+            return jobs_err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "'id' (string) is required",
+            )
+        }
     };
     let mut jobs = match st.jobs.lock() {
         Ok(j) => j,
@@ -185,14 +196,20 @@ pub async fn post_reorder(State(st): State<AppState>, body: String) -> Response 
         None => return jobs_err(StatusCode::NOT_FOUND, &format!("no such job: {id}")),
     };
     if !jobs[i].is_active_queued() {
-        return jobs_err(StatusCode::CONFLICT, &format!("only active queued jobs can be reordered: {id}"));
+        return jobs_err(
+            StatusCode::CONFLICT,
+            &format!("only active queued jobs can be reordered: {id}"),
+        );
     }
     let target = match reorder_target_position(&jobs, i, &b) {
         Ok(t) => t,
         Err(e) => return jobs_err(StatusCode::UNPROCESSABLE_ENTITY, &e),
     };
     let new_pos = move_queued_job_to_position(&mut jobs, i, target);
-    jobs_json_resp(StatusCode::OK, &json!({ "job_id": id, "position": new_pos, "queue": queued_jobs_json(&jobs) }))
+    jobs_json_resp(
+        StatusCode::OK,
+        &json!({ "job_id": id, "position": new_pos, "queue": queued_jobs_json(&jobs) }),
+    )
 }
 
 /// POST /v1/remove — remove an active-queued job before it starts.
@@ -201,7 +218,12 @@ pub async fn post_remove(State(st): State<AppState>, body: String) -> Response {
     let b = body_object(&body);
     let id = match b.get("id").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return jobs_err(StatusCode::UNPROCESSABLE_ENTITY, "'id' (string) is required"),
+        _ => {
+            return jobs_err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "'id' (string) is required",
+            )
+        }
     };
     let mut jobs = match st.jobs.lock() {
         Ok(j) => j,
@@ -218,7 +240,10 @@ pub async fn post_remove(State(st): State<AppState>, body: String) -> Response {
         );
     }
     jobs.remove(i);
-    jobs_json_resp(StatusCode::OK, &json!({ "job_id": id, "removed": true, "queue": queued_jobs_json(&jobs) }))
+    jobs_json_resp(
+        StatusCode::OK,
+        &json!({ "job_id": id, "removed": true, "queue": queued_jobs_json(&jobs) }),
+    )
 }
 
 fn terminal_state(s: &str) -> bool {
@@ -265,11 +290,20 @@ pub fn db_safe_params(s: &str) -> String {
 /// db column so the gallery lightbox + external tooling can query it without
 /// re-parsing the PNG. NOTE: derived, never authoritative — params_json is the
 /// source of truth (kept for back-compat).
-pub fn derive_metadata_json(id: &str, model: &str, state: &str, output_path: &str, params_json: &str) -> String {
+pub fn derive_metadata_json(
+    id: &str,
+    model: &str,
+    state: &str,
+    output_path: &str,
+    params_json: &str,
+) -> String {
     let params = if params_json.is_empty() {
         Value::Null
     } else {
-        serde_json::from_str::<Value>(params_json).ok().filter(|v| v.is_object()).unwrap_or(Value::Null)
+        serde_json::from_str::<Value>(params_json)
+            .ok()
+            .filter(|v| v.is_object())
+            .unwrap_or(Value::Null)
     };
     let pick = |k: &str| -> Value { params.get(k).cloned().unwrap_or(Value::Null) };
     let blob = json!({
@@ -278,6 +312,7 @@ pub fn derive_metadata_json(id: &str, model: &str, state: &str, output_path: &st
         "model": model,
         "state": state,
         "output_path": output_path,
+        "result_manifests": result_manifest::manifest_refs_for_output(output_path),
         "has_params": !params_json.is_empty(),
         "params": params,
         "seed": pick("seed"),
@@ -320,7 +355,13 @@ pub fn save_jobs_db(prior: &[[String; 6]], jobs: &[JobEntry], db_path: &Path) {
                 let pj = db_safe_params(&j.params_json);
                 let meta = derive_metadata_json(&j.id, &j.model, &j.state, &j.output_path, &pj);
                 stmt.execute(rusqlite::params![
-                    j.id, j.created, j.model, pj, j.state, j.output_path, meta
+                    j.id,
+                    j.created,
+                    j.model,
+                    pj,
+                    j.state,
+                    j.output_path,
+                    meta
                 ])?;
             }
         }
@@ -346,6 +387,10 @@ pub fn job_json_value(r: &JobRecord) -> Value {
     o.insert("image_count".into(), json!(r.image_count));
     o.insert("output_path".into(), json!(r.output_path));
     o.insert("error".into(), json!(r.error));
+    o.insert(
+        "result_manifests".into(),
+        result_manifest::manifest_refs_for_output(&r.output_path),
+    );
     // Additive: a metadata blob once the record has params (done-time). Older
     // consumers ignore the extra key; the daemon's base shape is unchanged above.
     if !r.params_json.is_empty() {
@@ -357,8 +402,38 @@ pub fn job_json_value(r: &JobRecord) -> Value {
     Value::Object(o)
 }
 
+fn attach_visual_health(mut v: Value, output_path: &str, params_json: &str) -> Value {
+    if output_path.is_empty() {
+        return v;
+    }
+    let visual_health = result_manifest::visual_health_for_params_json(output_path, params_json);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("visual_health".into(), visual_health.clone());
+        if let Some(meta) = o.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.insert("visual_health".into(), visual_health);
+        }
+    }
+    v
+}
+
+fn attach_output_location(mut v: Value, output_path: &str, output_root: &Path) -> Value {
+    if output_path.is_empty() {
+        return v;
+    }
+    let output_location = result_manifest::output_location_for_root(output_path, Some(output_root));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("output_location".into(), output_location.clone());
+        if let Some(meta) = o.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.insert("output_location".into(), output_location);
+        }
+    }
+    v
+}
+
 fn job_id_num(id: &str) -> i64 {
-    id.strip_prefix("job-").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0)
+    id.strip_prefix("job-")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
 }
 
 /// `max_prior_id`: highest job number among prior rows (the new-id counter base, F7).
@@ -377,7 +452,9 @@ pub fn load_prior_rows(db_path: &Path) -> Vec<[String; 6]> {
         Ok(c) => c,
         Err(_) => return out,
     };
-    let mut stmt = match conn.prepare("SELECT id, created, model, params_json, state, output_path FROM jobs") {
+    let mut stmt = match conn
+        .prepare("SELECT id, created, model, params_json, state, output_path FROM jobs")
+    {
         Ok(s) => s,
         Err(_) => return out,
     };
@@ -410,7 +487,10 @@ fn prior_job_json_value(row: &[String; 6]) -> Value {
     o.insert("created".into(), json!(row[1]));
     o.insert("model".into(), json!(row[2]));
     o.insert("state".into(), json!(row[4]));
-    o.insert("progress".into(), json!(if terminal_state(&row[4]) { 100 } else { 0 }));
+    o.insert(
+        "progress".into(),
+        json!(if terminal_state(&row[4]) { 100 } else { 0 }),
+    );
     o.insert("step".into(), json!(0));
     o.insert("total".into(), json!(0));
     o.insert("image_index".into(), json!(0));
@@ -418,6 +498,10 @@ fn prior_job_json_value(row: &[String; 6]) -> Value {
     o.insert("output_path".into(), json!(row[5]));
     o.insert("error".into(), json!(""));
     o.insert("params_json".into(), json!(row[3]));
+    o.insert(
+        "result_manifests".into(),
+        result_manifest::manifest_refs_for_output(&row[5]),
+    );
     if !row[3].is_empty() {
         if let Ok(params) = serde_json::from_str::<Value>(&row[3]) {
             if params.is_object() {
@@ -444,10 +528,19 @@ fn prior_job_json_value(row: &[String; 6]) -> Value {
 /// GET /v1/jobs — prior (jobs.db history) rows THEN current-session JobRecords,
 /// matching the daemon (prior loaded once at startup + the live `jobs` list).
 pub async fn get_jobs(State(st): State<AppState>) -> Response {
-    let mut arr: Vec<Value> = st.prior.iter().map(prior_job_json_value).collect();
+    let out = st.out_dir.as_path();
+    let mut arr: Vec<Value> = st
+        .prior
+        .iter()
+        .map(|row| attach_output_location(prior_job_json_value(row), &row[5], out))
+        .collect();
     if let Ok(jobs) = st.jobs.lock() {
         for e in jobs.iter() {
-            arr.push(job_json_value(&e.record));
+            arr.push(attach_output_location(
+                job_json_value(&e.record),
+                &e.record.output_path,
+                out,
+            ));
         }
     }
     (
@@ -458,7 +551,10 @@ pub async fn get_jobs(State(st): State<AppState>) -> Response {
 }
 
 /// GET /v1/job/:id — current-session job FIRST (the daemon checks `jobs` then prior).
-pub async fn get_job_one(State(st): State<AppState>, axum::extract::Path(id): axum::extract::Path<String>) -> Response {
+pub async fn get_job_one(
+    State(st): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
     let ok = |v: Value| -> Response {
         (
             [(CONTENT_TYPE, "application/json")],
@@ -468,11 +564,23 @@ pub async fn get_job_one(State(st): State<AppState>, axum::extract::Path(id): ax
     };
     if let Ok(jobs) = st.jobs.lock() {
         if let Some(e) = jobs.iter().find(|e| e.record.id == id) {
-            return ok(job_json_value(&e.record));
+            return ok(attach_output_location(
+                attach_visual_health(
+                    job_json_value(&e.record),
+                    &e.record.output_path,
+                    &e.record.params_json,
+                ),
+                &e.record.output_path,
+                st.out_dir.as_path(),
+            ));
         }
     }
     if let Some(row) = st.prior.iter().find(|r| r[0] == id) {
-        return ok(prior_job_json_value(row));
+        return ok(attach_output_location(
+            attach_visual_health(prior_job_json_value(row), &row[5], &row[3]),
+            &row[5],
+            st.out_dir.as_path(),
+        ));
     }
     (
         StatusCode::NOT_FOUND,
@@ -501,6 +609,10 @@ mod tests {
         let s = serde_json::to_string(&v).unwrap();
         // key order + repaired/derived fields
         assert!(s.starts_with(r#"{"id":"job-0042","created":"Fri, 12 Jun 2026 08:43:17 GMT","model":"stub","state":"done","progress":100,"step":0,"total":0,"image_index":1,"image_count":2,"output_path":"out/job-0042.png","error":"","params_json":"#));
+        assert_eq!(
+            v["result_manifests"]["server_result_manifest"]["present"],
+            false
+        );
         assert!(s.contains(r#""steps":8,"params":{"#));
         assert!(s.ends_with(r#""history":true}"#));
     }
@@ -508,7 +620,12 @@ mod tests {
     #[test]
     fn non_terminal_repaired_to_interrupted() {
         let v = prior_job_json_value(&[
-            "job-1".into(), "c".into(), "m".into(), "".into(), "interrupted".into(), "".into(),
+            "job-1".into(),
+            "c".into(),
+            "m".into(),
+            "".into(),
+            "interrupted".into(),
+            "".into(),
         ]);
         assert_eq!(v.get("state").unwrap(), "interrupted");
         assert_eq!(v.get("progress").unwrap(), 100);
@@ -527,9 +644,18 @@ mod tests {
     fn entry(id: &str, state: &str) -> JobEntry {
         JobEntry {
             record: JobRecord {
-                id: id.into(), created: "c".into(), model: "m".into(), state: state.into(),
-                progress: 0, step: 0, total: 0, image_index: 0, image_count: 1,
-                output_path: String::new(), error: String::new(), params_json: String::new(),
+                id: id.into(),
+                created: "c".into(),
+                model: "m".into(),
+                state: state.into(),
+                progress: 0,
+                step: 0,
+                total: 0,
+                image_index: 0,
+                image_count: 1,
+                output_path: String::new(),
+                error: String::new(),
+                params_json: String::new(),
             },
             params: JobParams::default(),
             cancel_requested: false,
@@ -541,19 +667,31 @@ mod tests {
     #[test]
     fn queue_math_and_reorder() {
         // a running job + 3 queued; queue positions count only the active-queued.
-        let mut v = vec![entry("r", "running"), entry("a", "queued"), entry("b", "queued"), entry("c", "queued")];
+        let mut v = vec![
+            entry("r", "running"),
+            entry("a", "queued"),
+            entry("b", "queued"),
+            entry("c", "queued"),
+        ];
         assert_eq!(active_queued_count(&v), 3);
-        assert_eq!(serde_json::to_string(&queued_jobs_json(&v)).unwrap(),
-            r#"[{"id":"a","position":0},{"id":"b","position":1},{"id":"c","position":2}]"#);
+        assert_eq!(
+            serde_json::to_string(&queued_jobs_json(&v)).unwrap(),
+            r#"[{"id":"a","position":0},{"id":"b","position":1},{"id":"c","position":2}]"#
+        );
         // move c (queue-pos 2) to the front (pos 0): order becomes c,a,b
         let src = find_job(&v, "c").unwrap();
         let pos = move_queued_job_to_position(&mut v, src, 0);
         assert_eq!(pos, 0);
-        assert_eq!(serde_json::to_string(&queued_jobs_json(&v)).unwrap(),
-            r#"[{"id":"c","position":0},{"id":"a","position":1},{"id":"b","position":2}]"#);
+        assert_eq!(
+            serde_json::to_string(&queued_jobs_json(&v)).unwrap(),
+            r#"[{"id":"c","position":0},{"id":"a","position":1},{"id":"b","position":2}]"#
+        );
         // reorder target by before_id: move b before c
         let src = find_job(&v, "b").unwrap();
-        assert_eq!(reorder_target_position(&v, src, &json!({"before_id":"c"})).unwrap(), 0);
+        assert_eq!(
+            reorder_target_position(&v, src, &json!({"before_id":"c"})).unwrap(),
+            0
+        );
         // by position, out of range
         assert!(reorder_target_position(&v, src, &json!({"position": 9})).is_err());
         assert!(reorder_target_position(&v, src, &json!({})).is_err());
@@ -562,7 +700,10 @@ mod tests {
     #[test]
     fn derive_metadata_shape() {
         let m = derive_metadata_json(
-            "job-0042", "zimage", "done", "out/job-0042.png",
+            "job-0042",
+            "zimage",
+            "done",
+            "out/job-0042.png",
             r#"{"seed":7,"width":768,"height":1024,"sampler":"euler"}"#,
         );
         let v: Value = serde_json::from_str(&m).unwrap();
@@ -573,6 +714,14 @@ mod tests {
         assert_eq!(v.get("seed").unwrap(), 7);
         assert_eq!(v.get("width").unwrap(), 768);
         assert_eq!(v.get("sampler").unwrap(), "euler");
+        assert_eq!(
+            v["result_manifests"]["server_result_manifest"]["present"],
+            false
+        );
+        assert_eq!(
+            v["result_manifests"]["worker_result_manifest"]["present"],
+            false
+        );
         // params is the full parsed object
         assert_eq!(v.get("params").and_then(|p| p.get("height")).unwrap(), 1024);
         // absent fields are null, not missing
@@ -586,6 +735,10 @@ mod tests {
         assert_eq!(v.get("has_params").unwrap(), false);
         assert!(v.get("params").unwrap().is_null());
         assert!(v.get("seed").unwrap().is_null());
+        assert_eq!(
+            v["result_manifests"]["server_result_manifest"]["present"],
+            false
+        );
     }
 
     #[test]
@@ -612,7 +765,11 @@ mod tests {
         // the additive column is actually present + carries the derived blob
         let conn = rusqlite::Connection::open(&db).unwrap();
         let meta: String = conn
-            .query_row("SELECT metadata_json FROM jobs WHERE id='job-0001'", [], |r| r.get(0))
+            .query_row(
+                "SELECT metadata_json FROM jobs WHERE id='job-0001'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let v: Value = serde_json::from_str(&meta).unwrap();
         assert_eq!(v.get("schema").unwrap(), "serenity.gallery_meta.v1");
@@ -630,8 +787,77 @@ mod tests {
         assert_eq!(v.get("state").unwrap(), "done");
         assert!(v.get("metadata").is_some());
         assert_eq!(v.get("metadata").unwrap().get("seed").unwrap(), 3);
+        assert_eq!(
+            v["result_manifests"]["server_result_manifest"]["present"],
+            false
+        );
         // a queued record (no params) has no metadata key (base daemon shape)
         let q = job_json_value(&entry("job-0006", "queued").record);
         assert!(q.get("metadata").is_none());
+        assert_eq!(
+            q["result_manifests"]["worker_result_manifest"]["present"],
+            false
+        );
+    }
+
+    #[test]
+    fn single_job_visual_health_is_attached_without_polluting_lists() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "serenity_jobs_visual_health_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("job-0090.png");
+        let mut img = image::RgbImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgb([
+                        ((x * 4) % 256) as u8,
+                        ((y * 4) % 256) as u8,
+                        (((x + y) * 3) % 256) as u8,
+                    ]),
+                );
+            }
+        }
+        img.save(&png).unwrap();
+        let mut r = entry("job-0090", "done").record;
+        r.output_path = png.to_string_lossy().into_owned();
+        r.params_json = r#"{"width":64,"height":64}"#.to_string();
+
+        let listed = job_json_value(&r);
+        assert!(listed.get("visual_health").is_none());
+
+        let single = attach_visual_health(listed, &r.output_path, &r.params_json);
+        assert_eq!(single["visual_health"]["status"], "pass");
+        assert_eq!(single["metadata"]["visual_health"]["status"], "pass");
+        let located = attach_output_location(single.clone(), &r.output_path, &dir);
+        assert_eq!(located["output_location"]["root_kind"], "ui_workflow_gallery");
+        assert_eq!(located["output_location"]["inside_root"], true);
+        assert_eq!(located["output_location"]["relative_path"], "job-0090.png");
+        assert_eq!(
+            located["metadata"]["output_location"]["inside_root"],
+            true
+        );
+
+        let wrong_dims =
+            attach_visual_health(single, &r.output_path, r#"{"width":512,"height":512}"#);
+        assert_eq!(wrong_dims["visual_health"]["status"], "fail");
+        assert!(wrong_dims["visual_health"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("wrong_dimensions")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -940,6 +940,9 @@ struct GptOssEncoder:
             dn_bias_e = _reshape(dn_bias_e, [hidden], ctx)
             var down_out = linear(act, down_w, None, ctx)
             down_out = _add_row_bias(down_out, dn_bias_e, ctx)
+            # Gated scatter accumulates in F32; keep this as an internal compute
+            # cast and return BF16 at the layer boundary through `accum`.
+            down_out = cast_tensor(down_out, STDtype.F32, ctx)
 
             # Weighted scatter-add into accum: accum[tok_rows[r]] +=
             #   down_out[r] * gating[slot]. Use the foundation gated_scatter_add

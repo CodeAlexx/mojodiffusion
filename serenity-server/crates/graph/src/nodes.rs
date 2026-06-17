@@ -18,12 +18,15 @@ pub fn is_allowed_type(t: &str) -> bool {
         "CheckpointLoaderSimple"
             | "UNETLoader"
             | "DiffusionModelLoader"
+            | "LTXVLoader"
             | "LoraLoader"
             | "LoraLoaderModelOnly"
             | "ZImageLoraModelOnly"
             | "CLIPLoader"
             | "DualCLIPLoader"
             | "TripleCLIPLoader"
+            | "CLIPVisionLoader"
+            | "CLIPVisionEncode"
             | "VAELoader"
             | "CLIPTextEncode"
             | "CLIPTextEncodeFlux"
@@ -37,11 +40,14 @@ pub fn is_allowed_type(t: &str) -> bool {
             | "LoadImage"
             | "LoadImageOutput"
             | "LoadImageMask"
+            | "LoadAudio"
             | "ImageToMask"
             | "MaskToImage"
             | "EmptyLatentImage"
             | "EmptySD3LatentImage"
             | "EmptyFlux2LatentImage"
+            | "EmptyHunyuanLatentVideo"
+            | "WanImageToVideo"
             | "VAEEncode"
             | "VAEEncodeForInpaint"
             | "RepeatLatentBatch"
@@ -63,11 +69,13 @@ pub fn is_allowed_type(t: &str) -> bool {
             | "DifferentialDiffusion"
             | "KSampler"
             | "KSamplerAdvanced"
+            | "LTXVSampler"
             | "LanPaint_KSampler"
             | "LanPaint_KSamplerAdvanced"
             | "ConditioningCombine"
             | "ConditioningConcat"
             | "ConditioningAverage"
+            | "SerenityRefinerUpscaleIntent"
             | "CFGGuider"
             | "BasicGuider"
             | "FluxGuidance"
@@ -101,6 +109,8 @@ pub fn is_allowed_type(t: &str) -> bool {
             | "ComfySwitchNode"
             | "VAEDecode"
             | "SaveImage"
+            | "SaveVideo"
+            | "SaveAudioOpus"
             | "PreviewImage"
             | "MarkdownNote"
             | "Note"
@@ -207,14 +217,16 @@ pub fn parse_typed_graph(body: &JsonValue) -> GraphResult<TypedGraph> {
     let mut seen_ids: HashSet<i64> = HashSet::new();
     for node in nodes_json {
         if !node.is_object() {
-            return Err(GraphError::unsupported("workflow graph node must be an object"));
+            return Err(GraphError::unsupported(
+                "workflow graph node must be an object",
+            ));
         }
         let id = node_id(node)?;
         if !seen_ids.insert(id) {
-            return Err(GraphError::unsupported(format!(
-                "workflow graph duplicate node id: {id}"
-            ))
-            .with_node(id));
+            return Err(
+                GraphError::unsupported(format!("workflow graph duplicate node id: {id}"))
+                    .with_node(id),
+            );
         }
         let type_id = node_type_id(node);
         if type_id.is_empty() {
@@ -235,12 +247,18 @@ pub fn parse_typed_graph(body: &JsonValue) -> GraphResult<TypedGraph> {
             .filter(|v| v.is_object())
             .cloned()
             .unwrap_or_else(|| JsonValue::Object(Default::default()));
-        nodes.push(WorkflowNode { id, type_id, fields });
+        nodes.push(WorkflowNode {
+            id,
+            type_id,
+            fields,
+        });
     }
 
     let mut edges = Vec::with_capacity(edges_json.len());
     for edge in edges_json {
-        let eo = edge.as_object().filter(|o| o.contains_key("from") && o.contains_key("to"));
+        let eo = edge
+            .as_object()
+            .filter(|o| o.contains_key("from") && o.contains_key("to"));
         let eo = eo.ok_or_else(|| {
             GraphError::unsupported("workflow graph edge must have from/to endpoints")
         })?;
@@ -264,8 +282,10 @@ pub fn parse_typed_graph(body: &JsonValue) -> GraphResult<TypedGraph> {
         if node.type_id == "SetNode" {
             let name = setget_name(&node.fields);
             if name.is_empty() {
-                return Err(GraphError::unsupported("workflow graph SetNode missing name")
-                    .with_node(node.id));
+                return Err(
+                    GraphError::unsupported("workflow graph SetNode missing name")
+                        .with_node(node.id),
+                );
             }
             if setnode_names.iter().any(|n| n == &name) {
                 return Err(GraphError::unsupported(format!(
@@ -281,8 +301,10 @@ pub fn parse_typed_graph(body: &JsonValue) -> GraphResult<TypedGraph> {
         if node.type_id == "GetNode" {
             let name = setget_name(&node.fields);
             if name.is_empty() {
-                return Err(GraphError::unsupported("workflow graph GetNode missing name")
-                    .with_node(node.id));
+                return Err(
+                    GraphError::unsupported("workflow graph GetNode missing name")
+                        .with_node(node.id),
+                );
             }
             if !setnode_names.iter().any(|n| n == &name) {
                 return Err(GraphError::unsupported(format!(

@@ -26,7 +26,7 @@ from serenitymojo.io.ffi import sys_open, sys_close, sys_pread, file_size, O_RDO
 from serenitymojo.models.vae.wan22_vae_encoder import Wan22VaeImageEncoder
 
 
-comptime WAN22_VAE = "/home/alex/.serenity/models/lance/Wan2.2_VAE.safetensors"
+comptime WAN22_VAE = "/home/alex/.serenity/models/vaes/wan2.2_vae.safetensors"
 comptime PARITY_DIR = "/home/alex/mojodiffusion/serenitymojo/models/vae/parity"
 
 

@@ -131,8 +131,9 @@ pixi run build-daemon
   side metadata for INT/FLOAT/STRING/BOOLEAN, copies that metadata through
   `Reroute` and `SetNode`/`GetNode`, and consumes linked scalar values for
   already-supported fields: `CLIPTextEncode.text`, Qwen edit text,
-  `EmptyLatent*` width/height/batch_size, `KSampler` seed/steps/cfg/
-  sampler_name/scheduler/denoise, `CFGGuider.cfg`, `Flux2Scheduler.steps`,
+  `EmptyLatent*` width/height plus `batch_size=1` only,
+  `KSampler` seed/steps/cfg/sampler_name/scheduler/denoise,
+  `CFGGuider.cfg`, `Flux2Scheduler.steps`,
   `BasicScheduler` scheduler/steps/denoise, `RandomNoise.noise_seed`,
   `SaveImage.filename_prefix`, and validation-only `ImageScale.width/height`.
 - Fail-loud behavior: scalar consumers reject type mismatches before enqueue.
@@ -238,6 +239,35 @@ Proof jobs:
   superseded by the bounded UniPC `sgm_uniform` port wording above.
 - `job-0359`: baseline `euler` + `flowmatch`, manifest
   `schedule_source:"zimage_comfy_simple_sigmas"`.
+
+2026-06-16 one-unit executor and Ideogram structured prompt update:
+
+- The daemon no longer carries its own duplicate workflow executor helpers.
+  `serenity_daemon.mojo` imports and calls
+  `serenitymojo.serve.workflow_graph.apply_workflow_params`, so graph lowering,
+  typed execution, and Comfy/Swarm fail-loud behavior have one owner.
+- The workflow static checker now rejects daemon-local executor drift markers:
+  `_apply_workflow_params`, `_apply_workflow_graph_ir`,
+  `_apply_ideogram4_comfy_ui_export`, and `WorkflowLink`.
+- Ideogram-4 accepts structured prompt input through top-level `prompt_json`.
+  A string is used directly; a JSON object/array is serialized into `prompt` and
+  `prompt_raw`. This preserves authored
+  `compositional_deconstruction.elements[*].bbox` arrays instead of letting the
+  generic prompt syntax path flatten them.
+- Bounded Ideogram Comfy exports may also provide top-level `prompt_json`.
+  Prompt-builder subgraphs still fail loud unless a top-level prompt override is
+  supplied; this is not arbitrary prompt-builder graph execution.
+- The Rust control plane mirrors this boundary: `/v1/preflight` and
+  `/v1/generate` normalize Ideogram `prompt_json` before shared prequeue
+  admission, and `serenity-graph` accepts the same `prompt_json` override while
+  lowering bounded Ideogram Comfy exports.
+- `scripts/check_workflow_graph_topology_contract.py`,
+  `scripts/check_ideogram4_daemon_product_contract.py`, and
+  `scripts/check_workflow_node_surface.py` passed after the Mojo update.
+  `cargo test -p serenity-server -p serenity-graph` now also passes the Rust
+  server/importer contract. The node surface checker still reports all-level
+  Comfy/Swarm parity blocked because stale Klein runtime PNG evidence paths are
+  missing and arbitrary workflow execution remains out of scope.
 - `job-0360`: `euler` + `sgm_uniform`, manifest
   `executed_scheduler:"sgm_uniform_flowmatch"`,
   `sigma_trace:[1.0,0.9477647,0.85859877,0.67192113,0.0]`,

@@ -34,6 +34,58 @@ fn set_if_missing(out: &mut JsonValue, key: &str, value: JsonValue) {
     }
 }
 
+fn merge_route_kind(existing: &str, new_kind: &str) -> String {
+    match (existing, new_kind) {
+        ("", kind) | ("unknown", kind) => kind.to_string(),
+        (kind, "") | (kind, "unknown") => kind.to_string(),
+        (a, b) if a == b => a.to_string(),
+        ("video", "audio") | ("audio", "video") | ("audio_video", _) | (_, "audio_video") => {
+            "audio_video".to_string()
+        }
+        ("image", "video") | ("video", "image") => "video".to_string(),
+        _ => "mixed".to_string(),
+    }
+}
+
+fn mark_workflow_terminal(
+    out: &mut JsonValue,
+    kind: &str,
+    node_id: i64,
+    type_id: &str,
+    input_type: &str,
+    filename_prefix: &str,
+) {
+    let o = out.as_object_mut().expect("out is an object");
+    let existing = o
+        .get("workflow_route_kind")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("unknown");
+    let route = merge_route_kind(existing, kind);
+    o.insert("workflow_route_kind".to_string(), json!(route.clone()));
+    let plan = o
+        .entry("workflow_plan".to_string())
+        .or_insert_with(|| json!({ "schema": "serenity.workflow_plan.v1", "terminal_nodes": [] }));
+    if let Some(plan_obj) = plan.as_object_mut() {
+        plan_obj.insert("schema".to_string(), json!("serenity.workflow_plan.v1"));
+        plan_obj.insert("route_kind".to_string(), json!(route));
+        let terminals = plan_obj
+            .entry("terminal_nodes".to_string())
+            .or_insert_with(|| json!([]));
+        if !terminals.is_array() {
+            *terminals = json!([]);
+        }
+        if let Some(arr) = terminals.as_array_mut() {
+            arr.push(json!({
+                "node_id": node_id,
+                "type": type_id,
+                "kind": kind,
+                "input_type": input_type,
+                "filename_prefix": filename_prefix,
+            }));
+        }
+    }
+}
+
 /// `_copy_field_if_missing` (Mojo 118): copy `src[src_key]` → `dst[dst_key]` when
 /// source present/non-null and dst missing.
 fn copy_field_if_missing(out: &mut JsonValue, src: &JsonValue, src_key: &str, dst_key: &str) {
@@ -64,6 +116,57 @@ fn set_field_if_nonneg_int(
         set_if_missing(out, dst_key, json!(n));
     }
     Ok(())
+}
+
+fn exec_refiner_upscale_intent(fields: &JsonValue, out: &mut JsonValue) -> GraphResult<Fire> {
+    let enabled = wf_bool(fields, "enabled", true)?;
+    let factor = wf_float(fields, "upscale_by", 1.0, 1.0, 8.0)?;
+    let hires_scale = wf_float(fields, "hires_scale", factor, 1.0, 8.0)?;
+    let control = wf_float(fields, "refiner_control", 0.4, 0.0, 1.0)?;
+    let hires_denoise = wf_float(fields, "hires_denoise", control, 0.0, 1.0)?;
+    let steps = opt_int(fields, "refiner_steps", 0, 0, 4096)?;
+    let cfg = wf_float(fields, "refiner_cfg", -1.0, -1.0, 100.0)?;
+    let refiner_model = wf_string(fields, "refiner_model");
+    let refiner_method = wf_string(fields, "refiner_method");
+    let upscaler_model = wf_string(fields, "upscaler_model");
+    let tiling = wf_bool(fields, "refiner_tiling", false)?;
+
+    if enabled {
+        set_if_missing(
+            out,
+            "refiner",
+            json!({
+                "enabled": true,
+                "model": refiner_model,
+                "control": control,
+                "method": refiner_method,
+                "steps": steps,
+                "cfg": cfg,
+                "tiling": tiling,
+            }),
+        );
+    }
+    if enabled && factor > 1.0 {
+        set_if_missing(
+            out,
+            "upscaler",
+            json!({
+                "model": upscaler_model,
+                "factor": factor,
+            }),
+        );
+    }
+    set_if_missing(out, "refiner_model", json!(refiner_model));
+    set_if_missing(out, "refiner_method", json!(refiner_method));
+    set_if_missing(out, "refiner_steps", json!(steps));
+    set_if_missing(out, "refiner_cfg", json!(cfg));
+    set_if_missing(out, "refiner_control", json!(control));
+    set_if_missing(out, "refiner_tiling", json!(tiling));
+    set_if_missing(out, "upscaler_model", json!(upscaler_model));
+    set_if_missing(out, "upscale_by", json!(factor));
+    set_if_missing(out, "hires_scale", json!(hires_scale));
+    set_if_missing(out, "hires_denoise", json!(hires_denoise));
+    Ok(Fire::Done)
 }
 
 /// `_workflow_append_lora` (Mojo 176): append `{name, weight}` to `out["lora"]`,
@@ -184,9 +287,25 @@ impl LinkMap {
             for (port, link) in targets {
                 let accepted = matches!(
                     port.as_str(),
-                    "value" | "input" | "" | "*" | "MODEL" | "CLIP" | "VAE" | "CONDITIONING"
-                        | "IMAGE" | "MASK" | "LATENT" | "GUIDER" | "SIGMAS" | "NOISE" | "SAMPLER"
-                        | "INT" | "FLOAT" | "STRING" | "BOOLEAN"
+                    "value"
+                        | "input"
+                        | ""
+                        | "*"
+                        | "MODEL"
+                        | "CLIP"
+                        | "VAE"
+                        | "CONDITIONING"
+                        | "IMAGE"
+                        | "MASK"
+                        | "LATENT"
+                        | "GUIDER"
+                        | "SIGMAS"
+                        | "NOISE"
+                        | "SAMPLER"
+                        | "INT"
+                        | "FLOAT"
+                        | "STRING"
+                        | "BOOLEAN"
                 );
                 if accepted {
                     if out.found {
@@ -235,8 +354,10 @@ fn require_value_type(
 fn model_name_of(store: &ValueStore, link: &WorkflowLink) -> GraphResult<String> {
     match store.get(link.node_id, &link.port).map(|v| &v.payload) {
         Some(ValuePayload::Model { name }) => Ok(name.clone()),
-        _ => Err(GraphError::bad_request("workflow graph model handle missing source")
-            .with_node(link.node_id)),
+        _ => Err(
+            GraphError::bad_request("workflow graph model handle missing source")
+                .with_node(link.node_id),
+        ),
     }
 }
 
@@ -254,26 +375,36 @@ fn image_path_of(store: &ValueStore, link: &WorkflowLink) -> GraphResult<String>
     match store.get(link.node_id, &link.port).map(|v| &v.payload) {
         Some(ValuePayload::Image { path, .. }) => Ok(path.clone()),
         Some(ValuePayload::Mask { path, .. }) => Ok(path.clone()),
-        _ => Err(GraphError::bad_request("workflow graph image handle missing source")
-            .with_node(link.node_id)),
+        _ => Err(
+            GraphError::bad_request("workflow graph image handle missing source")
+                .with_node(link.node_id),
+        ),
     }
 }
 
 fn image_mask_source_of(store: &ValueStore, link: &WorkflowLink) -> GraphResult<String> {
     match store.get(link.node_id, &link.port).map(|v| &v.payload) {
-        Some(ValuePayload::Image { mask_source, .. }) => Ok(mask_source.clone().unwrap_or_default()),
+        Some(ValuePayload::Image { mask_source, .. }) => {
+            Ok(mask_source.clone().unwrap_or_default())
+        }
         Some(ValuePayload::Mask { source, .. }) => Ok(source.clone().unwrap_or_default()),
-        _ => Err(GraphError::bad_request("workflow graph handle metadata missing source")
-            .with_node(link.node_id)),
+        _ => Err(
+            GraphError::bad_request("workflow graph handle metadata missing source")
+                .with_node(link.node_id),
+        ),
     }
 }
 
 fn mask_source_of(store: &ValueStore, link: &WorkflowLink) -> GraphResult<String> {
     match store.get(link.node_id, &link.port).map(|v| &v.payload) {
         Some(ValuePayload::Mask { source, .. }) => Ok(source.clone().unwrap_or_default()),
-        Some(ValuePayload::Image { mask_source, .. }) => Ok(mask_source.clone().unwrap_or_default()),
-        _ => Err(GraphError::bad_request("workflow graph handle metadata missing source")
-            .with_node(link.node_id)),
+        Some(ValuePayload::Image { mask_source, .. }) => {
+            Ok(mask_source.clone().unwrap_or_default())
+        }
+        _ => Err(
+            GraphError::bad_request("workflow graph handle metadata missing source")
+                .with_node(link.node_id),
+        ),
     }
 }
 
@@ -395,16 +526,6 @@ pub fn execute_typed_graph(graph: &TypedGraph, out: &mut JsonValue) -> GraphResu
         }
     }
 
-    let prompt_missing = out
-        .as_object()
-        .and_then(|o| o.get("prompt"))
-        .map(JsonValue::is_null)
-        .unwrap_or(true);
-    if !saw_prompt && prompt_missing {
-        return Err(GraphError::unsupported(
-            "workflow graph did not contain a prompt node",
-        ));
-    }
     if reference_latent_count > 0 {
         set_if_missing(out, "reference_latent_count", json!(reference_latent_count));
     }
@@ -413,10 +534,16 @@ pub fn execute_typed_graph(graph: &TypedGraph, out: &mut JsonValue) -> GraphResu
 
 /// Insert a produced value; duplicate output on (node, port) is a 422
 /// (Mojo `_workflow_add_value`).
-fn add_value(store: &mut ValueStore, node_id: i64, port: &str, payload: ValuePayload) -> GraphResult<()> {
+fn add_value(
+    store: &mut ValueStore,
+    node_id: i64,
+    port: &str,
+    payload: ValuePayload,
+) -> GraphResult<()> {
     if store.contains(node_id, port) {
-        return Err(GraphError::bad_request("workflow graph duplicate output value")
-            .with_node(node_id));
+        return Err(
+            GraphError::bad_request("workflow graph duplicate output value").with_node(node_id),
+        );
     }
     store.insert(WorkflowValue::new(node_id, port, payload));
     Ok(())
@@ -432,8 +559,9 @@ fn add_value_typed(
     payload: ValuePayload,
 ) -> GraphResult<()> {
     if store.contains(node_id, port) {
-        return Err(GraphError::bad_request("workflow graph duplicate output value")
-            .with_node(node_id));
+        return Err(
+            GraphError::bad_request("workflow graph duplicate output value").with_node(node_id),
+        );
     }
     store.insert(WorkflowValue {
         node_id,
@@ -474,7 +602,7 @@ fn exec_node(
             add_value(store, id, "VAE", ValuePayload::Vae)?;
             Ok(Fire::Done)
         }
-        "UNETLoader" | "DiffusionModelLoader" => {
+        "UNETLoader" | "DiffusionModelLoader" | "LTXVLoader" => {
             let model_name = loader_model_name(fields);
             if !model_name.is_empty() {
                 set_if_missing(out, "model", json!(model_name));
@@ -524,7 +652,13 @@ fn exec_node(
                 if strength_clip == 0.0 {
                     add_value(store, id, "CLIP", ValuePayload::Clip)?;
                 } else {
-                    add_value_typed(store, id, "CLIP", "CLIP_LORA_UNSUPPORTED", ValuePayload::Clip)?;
+                    add_value_typed(
+                        store,
+                        id,
+                        "CLIP",
+                        "CLIP_LORA_UNSUPPORTED",
+                        ValuePayload::Clip,
+                    )?;
                 }
             }
             Ok(Fire::Done)
@@ -533,13 +667,40 @@ fn exec_node(
             add_value(store, id, "CLIP", ValuePayload::Clip)?;
             Ok(Fire::Done)
         }
+        "CLIPVisionLoader" => {
+            add_value(store, id, "CLIP_VISION", ValuePayload::ClipVision)?;
+            Ok(Fire::Done)
+        }
+        "CLIPVisionEncode" => {
+            let clip_link = links.input(id, "clip_vision");
+            let image_link = links.input(id, "image");
+            if !clip_link.found || !image_link.found {
+                return Err(GraphError::unsupported(
+                    "workflow graph CLIPVisionEncode missing required typed input",
+                )
+                .with_node(id));
+            }
+            if !(ready(store, &clip_link) && ready(store, &image_link)) {
+                return Ok(Fire::NotReady);
+            }
+            require_value_type(store, &clip_link, "CLIP_VISION", "clip_vision")?;
+            require_value_type(store, &image_link, "IMAGE", "image")?;
+            add_value(
+                store,
+                id,
+                "CLIP_VISION_OUTPUT",
+                ValuePayload::ClipVisionOutput,
+            )?;
+            Ok(Fire::Done)
+        }
         "VAELoader" => {
             add_value(store, id, "VAE", ValuePayload::Vae)?;
             Ok(Fire::Done)
         }
-        "EmptyLatentImage" | "EmptySD3LatentImage" | "EmptyFlux2LatentImage" => {
-            exec_empty_latent(node, links, store, out)
-        }
+        "EmptyLatentImage"
+        | "EmptySD3LatentImage"
+        | "EmptyFlux2LatentImage"
+        | "EmptyHunyuanLatentVideo" => exec_empty_latent(node, links, store, out),
         "CLIPTextEncode" | "CLIPTextEncodeFlux" => {
             let clip_link = links.input(id, "clip");
             let text_link = links.input(id, "text");
@@ -599,7 +760,14 @@ fn exec_node(
                 return Ok(Fire::NotReady);
             }
             require_value_type(store, &cond_link, "CONDITIONING", "conditioning")?;
-            add_value(store, id, "CONDITIONING", ValuePayload::Cond { text: String::new() })?;
+            add_value(
+                store,
+                id,
+                "CONDITIONING",
+                ValuePayload::Cond {
+                    text: String::new(),
+                },
+            )?;
             Ok(Fire::Done)
         }
         "ConditioningSetMask" => exec_conditioning_set_mask(node, links, store, out),
@@ -680,10 +848,11 @@ fn exec_node(
             add_value(store, id, "MODEL", ValuePayload::Model { name: model_name })?;
             Ok(Fire::Done)
         }
-        "KSampler" | "KSamplerAdvanced" | "LanPaint_KSampler"
-        | "LanPaint_KSamplerAdvanced" => {
+        "KSampler" | "KSamplerAdvanced" | "LanPaint_KSampler" | "LanPaint_KSamplerAdvanced" => {
             exec_ksampler(node, links, store, out, saw_prompt)
         }
+        "SerenityRefinerUpscaleIntent" => exec_refiner_upscale_intent(fields, out),
+        "LTXVSampler" => exec_ltxv_sampler(node, links, store, out),
         "KSamplerSelect" => {
             let mut sampler_name = wf_string(fields, "sampler_name");
             if sampler_name.is_empty() {
@@ -693,7 +862,12 @@ fn exec_node(
                 sampler_name = "euler".to_string();
             }
             set_if_missing(out, "sampler", json!(sampler_name));
-            add_value(store, id, "SAMPLER", ValuePayload::Sampler { name: sampler_name })?;
+            add_value(
+                store,
+                id,
+                "SAMPLER",
+                ValuePayload::Sampler { name: sampler_name },
+            )?;
             Ok(Fire::Done)
         }
         _ if crate::is_named_sampler_node(t) => {
@@ -758,7 +932,10 @@ fn exec_node(
                 store,
                 id,
                 "IMAGE",
-                ValuePayload::Image { path: image_path.clone(), mask_source: None },
+                ValuePayload::Image {
+                    path: image_path.clone(),
+                    mask_source: None,
+                },
             )?;
             add_value(
                 store,
@@ -769,6 +946,20 @@ fn exec_node(
                     source: Some("load_image_mask".to_string()),
                 },
             )?;
+            Ok(Fire::Done)
+        }
+        "LoadAudio" => {
+            let mut audio_path = wf_string(fields, "audio");
+            if audio_path.is_empty() {
+                audio_path = wf_string(fields, "path");
+            }
+            if audio_path.is_empty() {
+                return Err(
+                    GraphError::unsupported("workflow graph LoadAudio missing audio path")
+                        .with_node(id),
+                );
+            }
+            add_value(store, id, "AUDIO", ValuePayload::Audio { path: audio_path })?;
             Ok(Fire::Done)
         }
         "ImageToMask" => exec_image_to_mask(node, links, store, out),
@@ -800,7 +991,10 @@ fn exec_node(
                     store,
                     id,
                     "IMAGE",
-                    ValuePayload::Image { path: image_path, mask_source: opt_nonempty(&mask_source) },
+                    ValuePayload::Image {
+                        path: image_path,
+                        mask_source: opt_nonempty(&mask_source),
+                    },
                 )?;
             }
             add_value(store, id, "width", ValuePayload::ScalarInt(0))?;
@@ -816,6 +1010,7 @@ fn exec_node(
         "ImageScaleBy" => exec_image_scale_by(node, links, store),
         "ImageResizeKJ" => exec_image_resize_kj(node, links, store, out),
         "ImagePadForOutpaint" => exec_image_pad(node, links, store, out),
+        "WanImageToVideo" => exec_wan_image_to_video(node, links, store, out),
         "VAEEncode" => exec_vae_encode(node, links, store),
         "VAEEncodeForInpaint" => exec_vae_encode_for_inpaint(node, links, store, out),
         "RepeatLatentBatch" => exec_repeat_latent_batch(node, links, store, out),
@@ -849,7 +1044,10 @@ fn exec_node(
                 store,
                 id,
                 "IMAGE",
-                ValuePayload::Image { path: String::new(), mask_source: None },
+                ValuePayload::Image {
+                    path: String::new(),
+                    mask_source: None,
+                },
             )?;
             Ok(Fire::Done)
         }
@@ -873,6 +1071,66 @@ fn exec_node(
             if !prefix.is_empty() {
                 set_if_missing(out, "workflow_save_prefix", json!(prefix));
             }
+            mark_workflow_terminal(out, "image", id, t, "IMAGE", &prefix);
+            Ok(Fire::Done)
+        }
+        "SaveVideo" => {
+            let mut video_link = links.input(id, "video");
+            let input_port = if video_link.found { "video" } else { "images" };
+            if !video_link.found {
+                video_link = links.input(id, "images");
+            }
+            let prefix_link = links.input(id, "filename_prefix");
+            if !video_link.found {
+                return Err(GraphError::unsupported(
+                    "workflow graph SaveVideo missing video/images input",
+                )
+                .with_node(id));
+            }
+            if !(ready(store, &video_link) && optional_ready(store, &prefix_link)) {
+                return Ok(Fire::NotReady);
+            }
+            let input_type = store
+                .get(video_link.node_id, &video_link.port)
+                .map(|v| v.typ.clone())
+                .unwrap_or_default();
+            if input_type != "VIDEO" && input_type != "IMAGE" {
+                return Err(GraphError::bad_request(format!(
+                    "workflow graph SaveVideo input {input_port} expected VIDEO or IMAGE but got {input_type}"
+                ))
+                .with_node(video_link.node_id));
+            }
+            let mut prefix = wf_string(fields, "filename_prefix");
+            if prefix_link.found {
+                prefix = scalar_string_of(store, &prefix_link, "filename_prefix")?;
+            }
+            if !prefix.is_empty() {
+                set_if_missing(out, "workflow_save_prefix", json!(prefix));
+            }
+            let fps = opt_int(fields, "fps", 24, 1, 240)?;
+            set_if_missing(out, "fps", json!(fps));
+            set_if_missing(out, "frame_rate", json!(fps));
+            mark_workflow_terminal(out, "video", id, t, &input_type, &prefix);
+            Ok(Fire::Done)
+        }
+        "SaveAudioOpus" => {
+            let audio_link = links.input(id, "audio");
+            let prefix_link = links.input(id, "filename_prefix");
+            if !audio_link.found {
+                return Err(GraphError::unsupported(
+                    "workflow graph SaveAudioOpus missing audio input",
+                )
+                .with_node(id));
+            }
+            if !(ready(store, &audio_link) && optional_ready(store, &prefix_link)) {
+                return Ok(Fire::NotReady);
+            }
+            require_value_type(store, &audio_link, "AUDIO", "audio")?;
+            let mut prefix = wf_string(fields, "filename_prefix");
+            if prefix_link.found {
+                prefix = scalar_string_of(store, &prefix_link, "filename_prefix")?;
+            }
+            mark_workflow_terminal(out, "audio", id, t, "AUDIO", &prefix);
             Ok(Fire::Done)
         }
         "PreviewImage" => {
@@ -912,9 +1170,17 @@ fn exec_scalar(node: &WorkflowNode, store: &mut ValueStore) -> GraphResult<Fire>
     }
     let payload = match scalar_type.as_str() {
         "INT" => {
-            let i = if fields.as_object().map(|o| o.contains_key("value")).unwrap_or(false) {
+            let i = if fields
+                .as_object()
+                .map(|o| o.contains_key("value"))
+                .unwrap_or(false)
+            {
                 wf_int(fields, "value", 0)?
-            } else if fields.as_object().map(|o| o.contains_key("seed")).unwrap_or(false) {
+            } else if fields
+                .as_object()
+                .map(|o| o.contains_key("seed"))
+                .unwrap_or(false)
+            {
                 wf_int(fields, "seed", 0)?
             } else {
                 0
@@ -922,7 +1188,11 @@ fn exec_scalar(node: &WorkflowNode, store: &mut ValueStore) -> GraphResult<Fire>
             ValuePayload::ScalarInt(i)
         }
         "FLOAT" => {
-            let mut f = if fields.as_object().map(|o| o.contains_key("value")).unwrap_or(false) {
+            let mut f = if fields
+                .as_object()
+                .map(|o| o.contains_key("value"))
+                .unwrap_or(false)
+            {
                 wf_float(fields, "value", 0.0, -1.0e308, 1.0e308)?
             } else {
                 0.0

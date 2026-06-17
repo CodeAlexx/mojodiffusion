@@ -1,34 +1,7 @@
-/* refiner_upscale.js — module 'refinerUpscale'. SwarmUI "Refine / Upscale" group
-   (GAP §4). A self-contained <details> panel appended to the LEFT param rail
-   (#param-rail) below the rest of the controls. Two sub-sections:
-
-     • Refiner   — refiner model + control% + method (PostApply | StepSwap) +
-                   refiner steps + refiner CFG
-     • Upscale   — upscaler model + upscale factor (+ tiling toggle)
-
-   WHAT'S ACTUALLY WIRED vs DISPLAY-ONLY (verified against
-   serenity-server/crates/server/src/main.rs GenerateReq, 2026-06-15):
-     ✓ WIRED (real, via the existing hires-fix 2-pass path):
-         - Upscale factor   -> params.hires_scale   (>1.0 enables the 2nd refine pass)
-         - Refiner control% -> params.hires_denoise (creativity of the refine pass;
-                               SwarmUI "control percent" = how much the refiner changes
-                               the base, which is exactly the hires denoise)
-     ⚠ DISPLAY-ONLY (no worker support yet — the backend hires path re-runs the SAME
-       model with a Lanczos3 upscale; it has no separate refiner checkpoint, no neural
-       upscaler model, and no PostApply/StepSwap method):
-         - Refiner model    -> params.refiner_model
-         - Refiner method   -> params.refiner_method  (postapply|stepswap)
-         - Refiner steps    -> params.refiner_steps
-         - Refiner CFG      -> params.refiner_cfg
-         - Upscaler model   -> params.upscaler_model
-         - Refiner tiling   -> params.refiner_tiling
-       These are set on state.params.* (the orchestrator forwards them); they are
-       clearly badged "display-only" in the UI so users aren't misled. We ALSO mirror
-       the whole thing into the structured params.refiner / params.upscaler objects.
-
-   Owns ONLY this file. Talks to the app via state/get/set/bus/api. Degrades
-   gracefully when api.models() 404s (model dropdowns fall back to "(same as base)").
-   Matches the dark theme (var(--*)) and the param_rail .group/details look. */
+/* refiner_upscale.js — module 'refinerUpscale'. SwarmUI "Refine / Upscale" group.
+   This panel authors workflow intent. Generate turns active settings into a
+   SerenityRefinerUpscaleIntent graph node; Rust workflow lowering/preflight
+   decides whether that graph is production-admitted. */
 (function () {
   "use strict";
   var S = window.Serenity;
@@ -36,8 +9,7 @@
 
   var ROOT_ID = "param-rail";
 
-  // refiner control method (SwarmUI: PostApply runs refiner after base; StepSwap
-  // swaps to the refiner model partway through the same sampling loop).
+  // refiner control method retained for workflow admission.
   var METHODS = [
     { v: "postapply", label: "PostApply (refine after base)" },
     { v: "stepswap", label: "StepSwap (swap model mid-sample)" },
@@ -139,7 +111,8 @@
       var root = (ctx.dom && ctx.dom.paramRail) || document.getElementById(ROOT_ID);
       if (!root) { console.warn("[refinerUpscale] mount not found:", ROOT_ID); return; }
 
-      // ---- read any pre-existing structured state so we re-hydrate on re-init ----
+      // ---- read any pre-existing structured state so the disabled panel renders
+      //      consistently before clearing stale state. ----
       var ref0 = get("params.refiner") || {};
       var up0 = get("params.upscaler") || {};
 
@@ -235,7 +208,7 @@
           model: upModel, factor: factor,
         } : null);
 
-        // --- flat display-only fields (orchestrator forwards these) ---
+        // --- flat mirrors used by workflow graph assembly and preset restore ---
         set("params.refiner_model", enabled ? refModel : "");
         set("params.refiner_method", enabled ? method : "");
         set("params.refiner_steps", enabled ? steps : 0);
@@ -245,9 +218,9 @@
         set("params.upscaler_model", (enabled && factor > 1.0) ? upModel : "");
         set("params.upscale_by", (enabled && factor > 1.0) ? factor : 1.0);
 
-        // --- REAL backend fields (the only ones the worker honors today) ---
-        // hires_scale > 1.0 turns on the 2nd refine pass; control% drives the
-        // refine denoise. When the refiner is off OR factor is 1×, send 1.0 (no pass).
+        // --- workflow intent fields ---
+        // Generate reads these into SerenityRefinerUpscaleIntent. The Rust
+        // capability gate rejects them until a real two-pass executor is admitted.
         if (enabled && factor > 1.0) {
           set("params.hires_scale", factor);
           set("params.hires_denoise", control);
@@ -279,11 +252,11 @@
       // ===================== BUILD THE PANEL =====================
       refInner = el("div", {}, [
         // refiner model + control %
-        el("label", { class: "ru-lbl" }, ["Refiner model", badge("disp", "display-only")]),
+        el("label", { class: "ru-lbl" }, ["Refiner model", badge("wired", "workflow")]),
         refModelSel,
-        el("label", { class: "ru-lbl" }, ["Control %", ctlVal, badge("wired", "wired")]),
+        el("label", { class: "ru-lbl" }, ["Control %", ctlVal, badge("wired", "workflow")]),
         ctlRange,
-        el("div", { class: "ru-hint", text: "Control % drives the refine-pass denoise (→ hires_denoise)." }),
+        el("div", { class: "ru-hint", text: "Workflow preflight decides whether this graph is admitted." }),
         // method
         el("label", { class: "ru-lbl" }, ["Method", badge("disp", "display-only")]),
         methodSel,
@@ -304,11 +277,11 @@
 
       upInner = el("div", { class: "ru-sub" }, [
         el("p", { class: "ru-sub-h", text: "Upscale" }),
-        el("label", { class: "ru-lbl" }, ["Upscaler model", badge("disp", "display-only")]),
+        el("label", { class: "ru-lbl" }, ["Upscaler model", badge("wired", "workflow")]),
         upModelSel,
-        el("label", { class: "ru-lbl" }, ["Upscale factor", badge("wired", "wired")]),
+        el("label", { class: "ru-lbl" }, ["Upscale factor", badge("wired", "workflow")]),
         factorSel,
-        el("div", { class: "ru-hint", text: "Factor >1× enables the 2-pass hires refine (→ hires_scale). Backend upscale = Lanczos3." }),
+        el("div", { class: "ru-hint", text: "Unsupported two-pass graphs fail at Rust workflow preflight before enqueue." }),
       ]);
 
       var body = el("div", { class: "ru-body" }, [

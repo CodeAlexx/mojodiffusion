@@ -132,28 +132,37 @@ Output:
 
 ## Current Wrapper Contract
 
-Model loops should migrate from raw string prefixes to this shape:
+Model loops should migrate from raw string prefixes to this explicit-context
+shape:
 
-This module is a pure-Mojo port/proving layer for the Rust stack's new
-speed/functionality work. Rust remains the behavior and performance reference,
-but the Mojo side should own a native implementation rather than calling through
-Rust or Python.
+This module is a pure-Mojo port/proving layer for the remembered Stagehand/Turbo
+work. SFv2, EriDiffusion, Rust Turbo, and Serenity Python are lineage only now:
+the product path and verification gates should use Mojodiffusion-owned Mojo
+files, not calls into outside repos.
 
 ```mojo
 var plan = build_klein9b_block_plan()
 var offload = PlannedBlockLoader.open(model_dir, plan^, OffloadConfig.synchronous_cfg_paired())
-offload.prefetch(0)
+offload.prefetch_with_ctx(0, ctx)
 for i in range(offload.count()):
-    offload.prefetch_next(i)
     var handle = offload.await_block(i, ctx)
+    offload.prefetch_next_with_ctx(i, ctx)
     # run all branches that need this block while handle.block is resident
+    offload.mark_active_block_done(ctx)
     # dropping handle releases the ArcPointer tensors and frees the block VRAM
 ```
 
-The wrapper still uses the existing synchronous backend. It is a public API
-stabilization step, not the turbo backend. The production invariant remains:
-weights loaded by `await_block` are GPU tensors, and CPU is not used for model
-math in inference.
+For the synchronous backend, `prefetch_with_ctx`/`prefetch_next_with_ctx` are
+compatibility wrappers around page-cache warmup and `mark_active_block_done` is
+a no-op. For the turbo backend, they dispatch the copy stream before block math
+and arm the compute-done fence after block math. The production invariant
+remains: weights loaded by `await_block` are GPU tensors, and CPU is not used
+for model math in inference.
+
+2026-06-16 status: this loop contract is now adopted in the Klein sync/turbo
+inference paths plus HiDream, QwenImage, SenseNova, and Lance model loops.
+`scripts/check_planned_loader_overlap_contract.py` rejects the old no-context
+prefetch shape under the hot model roots.
 
 ## Current Sites To Migrate
 
@@ -238,11 +247,12 @@ before `load_block`, so overlap is limited.
 Use this pattern:
 
 ```mojo
-offloader.prefetch_block(0)
+offloader.prefetch_with_ctx(0, ctx)
 for i in range(block_count):
-    offloader.prefetch_block(i + 1)
     handle = offloader.await_block(i, ctx)
+    offloader.prefetch_next_with_ctx(i, ctx)
     run_block(handle)
+    offloader.mark_active_block_done(ctx)
     # drop handle after kernels are queued
 ```
 
@@ -253,9 +263,10 @@ only after ownership and memory budgets are stable.
 ### 2026-05-31 Klein Trainer Finding
 
 The first real Klein 9B LoRA training run proved that "turbo exists" is not the
-same thing as "turbo overlaps." `TurboPlannedLoader.prefetch/prefetch_next`
-currently records a single pending index because the public `PlannedBlockLoader`
-surface has no `DeviceContext` at prefetch time. In a loop shaped like:
+same thing as "turbo overlaps." Historically, `TurboPlannedLoader.prefetch` /
+`prefetch_next` recorded a single pending index because the public
+`PlannedBlockLoader` surface had no `DeviceContext` at prefetch time. In a loop
+shaped like:
 
 ```mojo
 loader.prefetch(0)
@@ -271,10 +282,11 @@ synchronous stage for block `0`. That keeps correctness but loses the intended
 copy/compute overlap, and in the 9B trainer it showed up as roughly `46s/step`
 after the OOM and cache-shape fixes.
 
-Preferred shared fix: add an explicit-context prefetch path on
-`TurboPlannedLoader` (for example `prefetch_with_ctx(index, ctx)` and
-`prefetch_next_with_ctx(index, ctx)`) that immediately dispatches the copy stream
-and clears any matching pending index. Hot model loops should then use:
+Preferred shared fix, now adopted by the hot inference/model loops as of
+2026-06-16: use the explicit-context prefetch path on `TurboPlannedLoader`
+(`prefetch_with_ctx(index, ctx)` and `prefetch_next_with_ctx(index, ctx)`) that
+immediately dispatches the copy stream and clears any matching pending index.
+Hot model loops should use:
 
 ```mojo
 loader.prefetch_with_ctx(0, ctx)
@@ -291,7 +303,8 @@ all be able to use the same overlap contract.
 
 ## VMM / Turbo Feasibility
 
-Rust turbo in `/home/alex/EriDiffusion/inference-flame/src/turbo` depends on:
+The useful Turbo contract, now tracked locally in
+`serenitymojo/offload/STAGEHAND_TURBO_SOURCE_MAP_2026-06-16.md`, depends on:
 
 - CUDA VMM support detection
 - reserved virtual address slab plus smaller physical pool
@@ -306,8 +319,11 @@ Port VMM only after Mojo has or we add:
 - safe non-owning tensor/device-buffer view API
 - RAII `BlockHandle` drop semantics tied to stream events
 
-Until then, keep the public API backend-neutral and implement packed/pinned
-double buffering first.
+2026-06-16 status: `vmm_cuda.mojo`, `vmm_slab.mojo`, and `vmm_manager.mojo`
+provide the local CUDA VMM, slab, and model/block handle primitives.
+`vmm_manager_smoke.mojo` passed on GPU. The missing pieces are packed host-block
+population into VMM regions, non-owning tensor views over VMM pointers,
+compute-event fencing for VMM eviction, and a timed local gate.
 
 ## Compile-Testable Without Heavy GPU Inference
 

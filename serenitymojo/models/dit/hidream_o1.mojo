@@ -954,13 +954,14 @@ struct HiDreamO1Offloaded[S: Int](Movable):
         var mask = Tensor.from_host(mask_data, mask_sh^, dtype, ctx)
 
         self.loader.config = OffloadConfig.bf16_single()
-        self.loader.prefetch(0)
+        self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
-            self.loader.prefetch_next(i)
             var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
             hidden = self._layer(
                 handle.block, i, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         hidden = rms_norm(
             hidden, self._w(String("model.language_model.norm.weight")),
@@ -1028,13 +1029,14 @@ struct HiDreamO1Offloaded[S: Int](Movable):
         var mask = Tensor.from_host(mask_data, mask_sh^, dtype, ctx)
 
         self.loader.config = OffloadConfig.bf16_single()
-        self.loader.prefetch(0)
+        self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
-            self.loader.prefetch_next(i)
             var handle = self.loader.await_block(i, ctx)
+            self.loader.prefetch_next_with_ctx(i, ctx)
             hidden = self._layer(
                 handle.block, i, hidden, cos_q, sin_q, cos_k, sin_k, mask, ctx
             )
+            self.loader.mark_active_block_done(ctx)
 
         hidden = rms_norm(
             hidden, self._w(String("model.language_model.norm.weight")),

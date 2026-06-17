@@ -16,6 +16,34 @@ All numbers below are MEASURED in-session (RTX 3090 Ti, 24 GB).
 - VAE: AutoencoderKLFlux2 (z=32, ch_mult 128/256/512/512).
 - Scheduler: logit-normal (ndtri/expit), res-aware mean, Euler `z+=v·(s−t)`.
 
+## Daemon/API prompt contract
+
+Ideogram-4 prompt quality depends on preserving the authored structured JSON
+caption, including `compositional_deconstruction.elements[*].bbox` arrays. The
+daemon now treats `prompt_json` as a first-class Ideogram-4 input: a string is
+used directly, and a JSON object/array is serialized into the prompt string and
+mirrored to `prompt_raw` before generic prompt-syntax rewriting runs. Structured
+caption-looking prompt strings also bypass the generic `<lora:...>` and prompt
+weight rewriting path so bounding boxes and schema keys are not flattened into
+ordinary controls.
+
+The Rust control plane mirrors this contract for both `/v1/preflight` and
+`/v1/generate`: Ideogram `prompt_json` is normalized into `prompt` and
+`prompt_raw` before deserializing the request into `JobParams` and before the
+shared prequeue gate. The workflow importer accepts the same top-level
+`prompt_json` override for bounded Ideogram Comfy exports. Raw prompt-builder
+subgraphs still fail loud unless the request supplies `prompt`, `prompt_raw`, or
+`prompt_json` at the top level; the importer does not execute an arbitrary
+prompt-construction graph.
+
+Scheduler admission now accepts both the original logit-normal aliases and the
+bounded Comfy simple/AuraFlow aliases. `logitnormal` executes as
+`ideogram4_logitnormal`; `simple`/`flowmatch` execute as
+`ideogram4_simple_flowmatch`. The static/product contract check accepts either
+executed scheduler in result manifests, but current full-quality evidence is
+still the earlier bounded one-step PNG; no new Ideogram JSON/bbox runtime image
+was generated for the 2026-06-16 prompt-contract update.
+
 ## Component parity (cos vs torch oracle, gate ≥0.999) — ALL PASS
 | chunk | what | cos |
 |---|---|---|
@@ -100,6 +128,17 @@ switch — the Ideogram model only ever consumes the JSON. Pure-Mojo equivalent:
 ## Known limits / next
 - Latent cos 0.96 at chunk 9 = irreducible bf16+CFG(7×) accumulation (image matches, PSNR 29.7).
 - Magic prompt + diffusion both lack KV-cache / async block-swap (speed follow-ups).
+- Visual production quality is not accepted. On 2026-06-16, three current
+  Rust-server/worker `/v1/generate` runs preserved Ideogram `prompt_json` and
+  produced 1024x1024 PNGs with manifests, but visual inspection found two
+  simple-scheduler outputs were abstract texture fields rather than the requested
+  subject, and the logit-normal retry produced an explicit safety-filter
+  placeholder. Treat the current product route as JSON/metadata/runtime evidence,
+  not as trustworthy user-facing Ideogram image quality.
+- Structured JSON/bbox prompt preservation is statically guarded in the daemon,
+  Rust server, and workflow importer, but needs a fresh runtime PNG sidecar
+  proving authored `prompt_json` round-trips through `/v1/generate` for
+  production acceptance.
 - 4K out of range (model native ≤2k; Dh=256 flash forward is gated for current
   inference shapes, but there is no accepted 4K product path).
 - LoRA (Power-Lora-style additive overlay) not yet wired (inference side).

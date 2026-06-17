@@ -8,7 +8,8 @@
  *      (checkpoint/clip/vae loaders, CLIPTextEncode pos+neg, KSampler, EmptyLatentImage
  *       from bbox dims, LoRA chain, ControlNetApply per control layer,
  *       SetLatentNoiseMask per mask layer, SaveImage).
- *  - Upload init image / mask via api.uploadImage / api.uploadMask when layers exist.
+ *  - Upload layer pixels only when the workflow graph contains image/mask/control
+ *    nodes; the Rust workflow lowerer and capability gate decide admission.
  *  - POST via api.submitPrompt; open api.connectWS.
  *  - On 'progress': update state.progress + a progress bar in #queue-strip.
  *  - On binary 'preview': draw the frame into the stage overlay.
@@ -92,13 +93,6 @@
         submitting = true;
         setBusy(true);
         try {
-          // Phase 6 — deliver the painted mask / init image to the server BEFORE
-          // submit. The worker's inpaint/img2img path is PATH-based: it reads the
-          // init_image / mask_image flat params as filesystem paths. We upload the
-          // PNG(s) here and stash the returned absolute path into state.params so
-          // generateBody() forwards them. (No-op when nothing is painted/dropped.)
-          await prepareMaskAndInit();
-
           const graph = await assembleGraph();
           console.info("[generateWS] assembled ComfyUI graph:", graph);
 
@@ -109,6 +103,37 @@
           try {
             res = await api.submitPrompt(graph, clientId);
           } catch (e) {
+            if (e && e.name === "PreflightBlocked") {
+              console.warn("[generateWS] preflight blocked:", e.preflight || e);
+              console.info("[generateWS] graph that was blocked before enqueue:\n" +
+                JSON.stringify(graph, null, 2));
+              ui.setStatus(e.message || "preflight blocked");
+              bus.emit("generate:preflight_blocked", {
+                error: e.message || String(e),
+                preflight: e.preflight || null,
+                graph,
+              });
+              setProgress({ running: false, step: 0, total: 0, jobId: null });
+              closeWS();
+              return;
+            }
+            if (e && e.name === "GenerateRejected") {
+              const response = e.generateError || e.response || null;
+              console.warn("[generateWS] generate rejected before enqueue:", response || e);
+              console.info("[generateWS] graph rejected by /v1/generate:\n" +
+                JSON.stringify(graph, null, 2));
+              const stage = response && response.rejection_stage ? " · " + response.rejection_stage : "";
+              ui.setStatus("generate blocked: " + (e.message || "request rejected") + stage);
+              bus.emit("generate:rejected", {
+                error: e.message || String(e),
+                status: e.status || 0,
+                response,
+                graph,
+              });
+              setProgress({ running: false, step: 0, total: 0, jobId: null });
+              closeWS();
+              return;
+            }
             // backend not up yet (404 / network) — degrade gracefully
             console.warn("[generateWS] submitPrompt failed (backend not ready?):", e);
             console.info("[generateWS] graph that WOULD have been submitted:\n" +
@@ -139,6 +164,19 @@
       async function assembleGraph() {
         const p = readParams();
         const layers = Array.isArray(get("layers")) ? get("layers") : [];
+        const modelName = api && typeof api.normalizeModelName === "function"
+          ? api.normalizeModelName(p.model)
+          : (p.model || "z-image");
+        const backendName = api && typeof api.backendForModelName === "function"
+          ? api.backendForModelName(modelName)
+          : "";
+
+        // Ideogram4's production route is not the generic CLIPTextEncode graph:
+        // its prompt contract is the structured prompt_json/bbox payload. Submit
+        // the raw workflow params path so api.generateBody preserves prompt_json.
+        if (backendName === "ideogram4" && p.prompt_json != null) {
+          return null;
+        }
 
         const g = {};
         let nid = 0;
@@ -148,7 +186,7 @@
         const ckptId = id();
         g[ckptId] = {
           class_type: "CheckpointLoaderSimple",
-          inputs: { ckpt_name: p.model || "model.safetensors" },
+          inputs: { ckpt_name: modelName || "z-image" },
         };
         // MODEL / CLIP / VAE source slots — may be rebound by loaders below.
         let modelSlot = [ckptId, 0];
@@ -202,7 +240,7 @@
           const cnName = cl.controlnet || cl.model || cl.cnModel;
           if (!cnName) continue;
           // upload the (preprocessed) control image if we have pixels for it
-          let imgRef = cl.uploadedName || null;
+          let imgRef = cl.uploadedPath || cl.uploadedName || null;
           if (!imgRef) imgRef = await maybeUploadLayerImage(cl, "control");
           if (!imgRef) continue;
 
@@ -237,7 +275,7 @@
         let denoise = num(p.denoise, 1.0);
 
         if (rasterLayer) {
-          let initRef = rasterLayer.uploadedName || null;
+          let initRef = rasterLayer.uploadedPath || rasterLayer.uploadedName || null;
           if (!initRef) initRef = await maybeUploadLayerImage(rasterLayer, "init");
           if (initRef) {
             const loadInitId = id();
@@ -272,7 +310,7 @@
           (l) => l && l.type === "mask" && l.visible !== false
         );
         for (const ml of maskLayers) {
-          let maskRef = ml.uploadedName || null;
+          let maskRef = ml.uploadedPath || ml.uploadedName || null;
           if (!maskRef) maskRef = await maybeUploadLayerMask(ml, rasterLayer);
           if (!maskRef) continue;
           const loadMaskId = id();
@@ -317,90 +355,28 @@
           class_type: "SaveImage",
           inputs: { images: [decId, 0], filename_prefix: "serenity" },
         };
+        if (hasRefinerUpscaleIntent(p)) {
+          const ruId = id();
+          g[ruId] = {
+            class_type: "SerenityRefinerUpscaleIntent",
+            inputs: refinerUpscaleIntentInputs(p),
+          };
+        }
 
         return g;
       }
 
-      // ===== Phase 6: path-based mask/init delivery (flat-param submit) =======
-      // The actual submit (api.submitPrompt -> /v1/generate) sends FLAT params read
-      // from state.params, not the assembled graph. The worker's inpaint/img2img
-      // path needs init_image / mask_image as on-disk PATHS. So before submit we:
-      //   1. upload the init/raster layer (if any) -> set params.init_image = path
-      //   2. upload the painted mask (layer or params.mask_data) -> params.mask_image
-      // Each upload returns {name, path, url}; we keep the absolute `path`.
-      async function prepareMaskAndInit() {
-        const layers = Array.isArray(get("layers")) ? get("layers") : [];
-
-        // --- init / raster image (img2img source) ----------------------------
-        const rasterLayer = layers.find(
-          (l) => l && (l.type === "raster" || l.type === "reference") &&
-                 l.visible !== false && hasPixels(l)
-        );
-        let initPath = null;
-        if (rasterLayer) {
-          initPath = rasterLayer.uploadedPath ||
-            await uploadLayerForPath(rasterLayer, "init", api.uploadImage);
-          if (initPath) {
-            rasterLayer.uploadedPath = initPath;
-            set("params.init_image", initPath);
-          }
-        }
-
-        // --- mask (inpaint) --------------------------------------------------
-        const maskLayer = layers.find(
-          (l) => l && l.type === "mask" && l.visible !== false && hasPixels(l)
-        );
-        let maskBlob = null, maskName = "mask";
-        if (maskLayer) {
-          maskBlob = await layerToBlob(maskLayer);
-          maskName = (maskLayer.name || "mask").replace(/\s+/g, "_");
-        } else {
-          // no layer, but the mask-paint module may have stashed a base64 PNG
-          const b64 = get("params.mask_data");
-          if (typeof b64 === "string" && b64.length) maskBlob = b64; // api.toBase64 passes strings through
-        }
-        if (maskBlob) {
-          try {
-            const res = await api.uploadMask(maskBlob, null, maskName + ".png");
-            const maskPath = res && (res.path || res.name || res.filename);
-            if (maskPath) {
-              if (maskLayer) maskLayer.uploadedPath = maskPath;
-              set("params.mask_image", maskPath);
-              // the worker keys masked regen on the luminance channel by default
-              if (!get("params.lanpaint_mask_channel"))
-                set("params.lanpaint_mask_channel", get("params.mask_channel") || "luminance");
-            }
-          } catch (e) {
-            console.warn("[generateWS] mask upload failed:", e);
-          }
-        }
-      }
-
-      // Upload a layer's pixels via `uploader` and return the on-disk path (or null).
-      async function uploadLayerForPath(layer, kind, uploader) {
-        const blob = await layerToBlob(layer);
-        if (!blob) return null;
-        try {
-          const name = (layer.name || kind || "layer").replace(/\s+/g, "_") + ".png";
-          const res = await uploader(blob, name);
-          return (res && (res.path || res.name || res.filename)) || null;
-        } catch (e) {
-          console.warn("[generateWS] upload failed for layer", layer && layer.id, e);
-          return null;
-        }
-      }
-
       // ===== layer image / mask upload helpers ===============================
-      // Returns an uploaded filename (string) usable by LoadImage, or null.
+      // Returns an uploaded on-disk path usable by the Rust workflow lowerer, or null.
       async function maybeUploadLayerImage(layer, kind) {
         const blob = await layerToBlob(layer);
         if (!blob) return null;
         try {
           const name = (layer.name || kind || "layer").replace(/\s+/g, "_") + ".png";
           const res = await api.uploadImage(blob, name);
-          const ref = (res && (res.name || res.filename)) || name;
-          // remember so we don't re-upload an identical layer next run
-          layer.uploadedName = ref;
+          const ref = (res && (res.path || res.name || res.filename)) || name;
+          layer.uploadedPath = ref;
+          layer.uploadedName = (res && (res.name || res.filename)) || name;
           return ref;
         } catch (e) {
           console.warn("[generateWS] uploadImage failed for layer", layer && layer.id, e);
@@ -418,8 +394,9 @@
             ? { filename: rasterLayer.uploadedName, type: "input", subfolder: "" }
             : null;
           const res = await api.uploadMask(blob, ref, name);
-          const out = (res && (res.name || res.filename)) || name;
-          layer.uploadedName = out;
+          const out = (res && (res.path || res.name || res.filename)) || name;
+          layer.uploadedPath = out;
+          layer.uploadedName = (res && (res.name || res.filename)) || name;
           return out;
         } catch (e) {
           console.warn("[generateWS] uploadMask failed for layer", layer && layer.id, e);
@@ -724,9 +701,56 @@
         return out;
       }
 
+      function meaningfulObject(v) {
+        return !!(v && typeof v === "object" && Object.keys(v).length > 0);
+      }
+      function hasRefinerUpscaleIntent(p) {
+        const ref = meaningfulObject(p.refiner) ? p.refiner : null;
+        const up = meaningfulObject(p.upscaler) ? p.upscaler : null;
+        return !!(
+          ref ||
+          up ||
+          num(p.hires_scale, 1.0) > 1.0 ||
+          num(p.upscale_by, 1.0) > 1.0 ||
+          hasText(p.refiner_model) ||
+          hasText(p.refiner_method) ||
+          num(p.refiner_steps, 0) > 0 ||
+          num(p.refiner_cfg, -1) >= 0 ||
+          num(p.refiner_control, -1) >= 0 ||
+          !!p.refiner_tiling ||
+          hasText(p.upscaler_model)
+        );
+      }
+      function refinerUpscaleIntentInputs(p) {
+        const ref = meaningfulObject(p.refiner) ? p.refiner : {};
+        const up = meaningfulObject(p.upscaler) ? p.upscaler : {};
+        const factor = num(
+          up.factor != null ? up.factor : (p.upscale_by != null ? p.upscale_by : p.hires_scale),
+          1.0
+        );
+        const control = num(
+          ref.control != null ? ref.control : (p.refiner_control != null ? p.refiner_control : p.hires_denoise),
+          0.4
+        );
+        return {
+          enabled: ref.enabled !== false,
+          refiner_model: ref.model || p.refiner_model || "",
+          refiner_method: ref.method || p.refiner_method || "postapply",
+          refiner_steps: num(ref.steps != null ? ref.steps : p.refiner_steps, 0),
+          refiner_cfg: num(ref.cfg != null ? ref.cfg : p.refiner_cfg, -1),
+          refiner_control: control,
+          refiner_tiling: !!(ref.tiling != null ? ref.tiling : p.refiner_tiling),
+          upscaler_model: up.model || p.upscaler_model || "",
+          upscale_by: factor,
+          hires_scale: num(p.hires_scale, factor),
+          hires_denoise: num(p.hires_denoise, control),
+        };
+      }
+
       // ===== small utils ======================================================
       function readDimsSafe() { return readDims(readParams()); }
       function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+      function hasText(v) { return typeof v === "string" && v.trim().length > 0; }
       function clampDim(v) { v = Math.round(v / 8) * 8; return Math.max(64, Math.min(8192, v)); }
       function resolveSeed(seed) {
         const s = num(seed, -1);
@@ -735,7 +759,7 @@
       }
       function hasPixels(l) {
         return !!(l && (l.blob || l.dataURL || l.src || l.konvaNode || l.node ||
-          l.group || l.image || l.canvas || l.imageEl || l.uploadedName));
+          l.group || l.image || l.canvas || l.imageEl || l.uploadedPath || l.uploadedName));
       }
       function shortId(s) { return String(s).slice(0, 8); }
 

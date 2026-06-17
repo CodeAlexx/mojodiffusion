@@ -20,6 +20,7 @@ def _check(name: String, got: Int, expected: Int) raises:
 def main() raises:
     var klein = build_klein9b_block_plan()
     var lance = build_lance_t2v_block_plan()
+    var single = OffloadConfig.single_pass()
     var cfg = OffloadConfig.synchronous_cfg_paired()
     var bf16 = OffloadConfig.bf16_cfg_paired()
     var bf16_single = OffloadConfig.bf16_single()
@@ -29,6 +30,7 @@ def main() raises:
     _check(String("zero load calls"), stats.load_calls, 0)
     _check(String("klein blocks"), klein.count(), 32)
     _check(String("klein cfg branch visits"), klein.branch_visits(cfg), 64)
+    _check(String("klein single branch visits"), klein.branch_visits(single), 32)
     _check(String("klein first lookahead"), klein.prefetch_index(0, cfg), 1)
     _check(String("klein last lookahead"), klein.prefetch_index(klein.count() - 1, cfg), -1)
     _check(String("lance bf16 branch visits"), lance.branch_visits(bf16), 72)

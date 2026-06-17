@@ -523,7 +523,7 @@ struct LanceT2VOffloaded[S: Int](Movable):
         var shared = LanceWeights.load_shared(dir, ctx)
         var plan = build_lance_t2v_block_plan()
         var loader = PlannedBlockLoader.open(
-            dir, plan^, OffloadConfig.synchronous_single()
+            dir, plan^, OffloadConfig.single_pass()
         )
         return LanceT2VOffloaded[Self.S](shared^, loader^)
 
@@ -590,11 +590,11 @@ struct LanceT2VOffloaded[S: Int](Movable):
         var layers = max_layers
         if layers <= 0 or layers > cfg.num_layers:
             layers = cfg.num_layers
-        self.loader.config = OffloadConfig.synchronous_single()
-        self.loader.prefetch(0)
+        self.loader.config = OffloadConfig.single_pass()
+        self.loader.prefetch_with_ctx(0, ctx)
         for li in range(layers):
-            self.loader.prefetch_next(li)
             var handle = self.loader.await_block(li, ctx)
+            self.loader.prefetch_next_with_ctx(li, ctx)
             var bw = self._block_weights(handle.block)
             hidden = bw._layer[Self.S](
                 li,
@@ -608,6 +608,7 @@ struct LanceT2VOffloaded[S: Int](Movable):
                 mask,
                 ctx,
             )
+            self.loader.mark_active_block_done(ctx)
 
         var norm_all = rms_norm(
             hidden,

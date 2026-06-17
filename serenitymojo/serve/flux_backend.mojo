@@ -26,11 +26,10 @@
 #   * The CLIP-L (~250 MB) + T5-XXL (~9.5 GB F16) encoders are loaded → used →
 #     freed PER JOB inside the ENCODE step (encode_text does the load+free).
 #   * The FLUX VAE (~330 MB) is loaded PER JOB inside the TILED DECODE step.
-#   * Before the 1024² VAE decode, the resident DiT offloader handle + rope are
-#     FREED and the mempool TRIMMED (MEASURED on SDXL: a 1024² VAE decode OOMs a
-#     24 GB card when the denoiser stays resident; flux_sample_cli's staged-
-#     loading note records the same FLUX behaviour). self.loaded is reset so the
-#     NEXT job reloads the DiT in the LOAD phase — same pattern as sdxl_backend.
+#   * Before unpack + 1024² VAE decode, the resident DiT offloader handle + rope
+#     are FREED and the mempool TRIMMED (MEASURED on SDXL/Flux gates: VAE decode
+#     OOMs a 24 GB card when the denoiser/offloader high-water is still present).
+#     self.loaded is reset so the NEXT job reloads the DiT in the LOAD phase.
 #
 # step() state machine: ENCODE (per-job, blocking — announced phase="encoding")
 #   → LOAD (DiT offloader + rope, announced phase="loading") → DENOISE×steps
@@ -54,6 +53,7 @@ from std.collections import Optional
 from std.ffi import external_call
 from std.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
+from std.time import perf_counter_ns
 
 from image.buffer import Image
 from image.png import encode_png_with_text
@@ -75,7 +75,7 @@ from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend, scheduler_admission_for_backend,
 )
 from serenitymojo.sampling.variation_noise import swarm_variation_noise_chw
-from serenitymojo.pipeline.flux_tiled_decode import flux_tiled_decode
+from serenitymojo.pipeline.flux_tiled_decode import flux_tiled_decode_5x5_lowmem
 from serenitymojo.pipeline.flux_sample_cli import (
     FluxCaps, encode_text, _pack_latent, _unpack_latent,
     DIT_PATH, VAE_PATH,
@@ -90,6 +90,9 @@ from serenitymojo.serve.backend import (
     reject_unsupported_qwen_edit_conditioning_params,
     reject_unsupported_conditioning_mask_params, reject_unsupported_lanpaint_params,
     warn_unsupported_advanced_sampling_params,
+)
+from serenitymojo.serve.product_manifest import (
+    json_bool, json_escape, peak_vram_mib, write_text_file,
 )
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
@@ -152,6 +155,11 @@ def _save_rgb_png_with_text(
     encode_png_with_text(img, path, kws, vals)
 
 
+def _unpack_flux_packed_latent(packed: Tensor, ctx: DeviceContext) raises -> Tensor:
+    var latent_f32 = cast_tensor(packed, STDtype.F32, ctx)
+    return _unpack_latent(latent_f32, ctx)
+
+
 # Single LoRA only (one additive overlay through load_with_lora). Returns the
 # selected LoRA path ("" = base). Mirrors the CLI's single argv[2] LoRA slot.
 def _select_lora_path(loras: List[LoraSpec]) -> String:
@@ -185,6 +193,14 @@ struct FluxBackend(GenBackend, Movable):
     var caps: List[ArcPointer[FluxCaps]]   # 0/1
     var sched: List[Float32]               # flow-match sigma table (steps+1)
     var latent: List[ArcPointer[Tensor]]   # 0/1 (packed [1,N_IMG,64] BF16-castable)
+    var job_t0_ns: UInt
+    var load_seconds: Float64
+    var text_encode_seconds: Float64
+    var prepare_seconds: Float64
+    var denoise_seconds: Float64
+    var vae_decode_seconds: Float64
+    var total_vram_bytes: Int
+    var min_free_bytes: Int
 
     def __init__(out self) raises:
         self.ctx = DeviceContext()
@@ -203,6 +219,14 @@ struct FluxBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[FluxCaps]]()
         self.sched = List[Float32]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.job_t0_ns = UInt(0)
+        self.load_seconds = 0.0
+        self.text_encode_seconds = 0.0
+        self.prepare_seconds = 0.0
+        self.denoise_seconds = 0.0
+        self.vae_decode_seconds = 0.0
+        self.total_vram_bytes = 0
+        self.min_free_bytes = 0
 
     def backend_name(self) -> String:
         return String("flux")
@@ -269,6 +293,16 @@ struct FluxBackend(GenBackend, Movable):
         self.cur = 0
         self.announced = False
         self.phase = FPHASE_ENCODE
+        self.job_t0_ns = perf_counter_ns()
+        self.load_seconds = 0.0
+        self.text_encode_seconds = 0.0
+        self.prepare_seconds = 0.0
+        self.denoise_seconds = 0.0
+        self.vae_decode_seconds = 0.0
+        var mem = cu_mem_get_info()
+        self.total_vram_bytes = mem.total_bytes
+        self.min_free_bytes = mem.free_bytes
+        self._record_vram()
 
     def cancel(mut self):
         self.cancel_flag = True
@@ -288,6 +322,74 @@ struct FluxBackend(GenBackend, Movable):
               after.used_bytes() // (1024 * 1024), "MiB (reclaimed",
               (before.used_bytes() - after.used_bytes()) // (1024 * 1024), "MiB)")
 
+    def _record_vram(mut self) raises:
+        var mem = cu_mem_get_info()
+        if self.total_vram_bytes == 0:
+            self.total_vram_bytes = mem.total_bytes
+        if self.min_free_bytes == 0 or mem.free_bytes < self.min_free_bytes:
+            self.min_free_bytes = mem.free_bytes
+
+    def _write_result_manifest(mut self, png_path: String) raises -> String:
+        self._record_vram()
+        var manifest_path = png_path + String(".flux_daemon_result.json")
+        var denoise_per_step = Float64(0.0)
+        if self.params.steps > 0:
+            denoise_per_step = self.denoise_seconds / Float64(self.params.steps)
+        var total_wall_seconds = Float64(perf_counter_ns() - self.job_t0_ns) / 1.0e9
+        var peak_mib = Float64(0.0)
+        if self.total_vram_bytes > 0 and self.min_free_bytes > 0:
+            peak_mib = peak_vram_mib(self.total_vram_bytes, self.min_free_bytes)
+
+        var content = String("{\n")
+        content += String('  "schema":"serenity.flux.daemon_result.v1",\n')
+        content += String('  "backend":"flux_daemon",\n')
+        content += String('  "model":"flux1-dev",\n')
+        content += String('  "readiness_label":"experimental",\n')
+        content += String('  "accepted_sampler_parity":false,\n')
+        content += String('  "accepted_speed_parity":false,\n')
+        content += String('  "run_identity":{\n')
+        content += String('    "job_id":"') + json_escape(self.params.job_id) + String('",\n')
+        content += String('    "prompt":"') + json_escape(self.params.prompt) + String('",\n')
+        content += String('    "negative":"') + json_escape(self.params.negative) + String('",\n')
+        content += String('    "negative_prompt_used":false,\n')
+        content += String('    "seed":') + String(self.params.seed) + String(",\n")
+        content += String('    "resolution":{"width":') + String(self.params.width) + String(',"height":') + String(self.params.height) + String("},\n")
+        content += String('    "steps":') + String(self.params.steps) + String(",\n")
+        content += String('    "guidance":') + String(self.params.cfg) + String(",\n")
+        content += String('    "sampler_registry_backend":"flux",\n')
+        content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
+        content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
+        content += String('    "executed_sampler":"flux_flowmatch_euler",\n')
+        content += String('    "executed_scheduler":"flux_simple_flowmatch",\n')
+        content += String('    "schedule_source":"flux1_dev_flowmatch",\n')
+        content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
+        content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
+        content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
+        content += String('    "released_resident_dit_before_unpack":true,\n')
+        content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
+        content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
+        content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        content += String('    "loaded_lora":"') + json_escape(self.loaded_lora) + String('",\n')
+        content += String('    "vae_decode_tile_grid":"5x5_lowmem",\n')
+        content += String('    "dtype":"bf16_dit_f32_latent"\n')
+        content += String("  },\n")
+        content += String('  "mojo":{\n')
+        content += String('    "load_seconds":') + String(self.load_seconds) + String(",\n")
+        content += String('    "text_encode_seconds":') + String(self.text_encode_seconds) + String(",\n")
+        content += String('    "prepare_seconds":') + String(self.prepare_seconds) + String(",\n")
+        content += String('    "denoise_seconds":') + String(self.denoise_seconds) + String(",\n")
+        content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
+        content += String('    "vae_decode_seconds":') + String(self.vae_decode_seconds) + String(",\n")
+        content += String('    "total_wall_seconds":') + String(total_wall_seconds) + String(",\n")
+        content += String('    "peak_vram_mib":') + String(peak_mib) + String(",\n")
+        content += String('    "artifact_paths":["') + json_escape(png_path) + String('","') + json_escape(manifest_path) + String('"]\n')
+        content += String("  },\n")
+        content += String('  "output_png":"') + json_escape(png_path) + String('",\n')
+        content += String('  "note":"Rust-server Mojo worker product-path result; FLUX.1-dev uses guidance-distilled single-forward denoise and process-local offload. Speed parity remains unaccepted until paired baseline evidence exists."\n')
+        content += String("}\n")
+        write_text_file(manifest_path, content)
+        return manifest_path
+
     # ── per-job prep ───────────────────────────────────────────────────────────
     def _encode(mut self) raises:
         """Real CLIP-L pooled + T5-XXL hidden encode of params.prompt (encoders
@@ -302,6 +404,8 @@ struct FluxBackend(GenBackend, Movable):
     def _free_dit(mut self):
         """Drop the resident DiT offloader handle + rope tables and reset the
         residency flags (so the next LOAD reloads)."""
+        if self.loaded:
+            print("[flux] releasing resident FLUX DiT offloader + rope before VAE decode")
         self.model = List[ArcPointer[Flux1Offloaded]]()
         self.rope_cos = List[ArcPointer[Tensor]]()
         self.rope_sin = List[ArcPointer[Tensor]]()
@@ -409,25 +513,20 @@ struct FluxBackend(GenBackend, Movable):
     # ── final decode + PNG(tEXt) ──────────────────────────────────────────────
     def _decode_and_save(mut self) raises -> String:
         var png_path = self.params.out_dir + "/" + self.params.job_id + ".png"
-        # Unpack the packed latent [1,N_IMG,64] -> NCHW [1,16,LATENT_H,LATENT_W]
-        # (F32) BEFORE freeing the DiT, while the latent is still on device.
-        var latent_f32 = cast_tensor(self.latent[0][], STDtype.F32, self.ctx)
-        var latent = _unpack_latent(latent_f32, self.ctx)
-        # Per-job conditioning is dead weight at decode; free before the decoder.
+        # Keep only a tiny packed-latent clone, then release the offloaded DiT
+        # before unpack + VAE decode to lower allocator high-water on 24 GB cards.
+        var packed = self.latent[0][].clone(self.ctx)
         self.caps = List[ArcPointer[FluxCaps]]()
         self.sched = List[Float32]()
         self.latent = List[ArcPointer[Tensor]]()
-        # MEASURED (SDXL) + flux_sample_cli staged-loading note: the 1024² FLUX
-        # VAE decode activations OOM a 24 GB card if the offloaded DiT stays put
-        # (the offloader's pool is at a high-water mark). Free the DiT + rope +
-        # trim the mempool before decoding; the next job reloads it in LOAD
-        # (self.loaded=False).
         self._free_dit()
         self.ctx.synchronize()
         cu_mempool_trim_current(0)
         self.ctx.synchronize()
-        print("[flux] tiled VAE decode (3x3 overlap+blend) + save")
-        var img = flux_tiled_decode[LATENT_H, LATENT_W](latent, String(VAE_PATH), self.ctx)
+        _print_vram("after resident release before VAE")
+        var latent = _unpack_flux_packed_latent(packed, self.ctx)
+        print("[flux] tiled VAE decode (5x5 lowmem overlap+blend) + save")
+        var img = flux_tiled_decode_5x5_lowmem[LATENT_H, LATENT_W](latent, String(VAE_PATH), self.ctx)
         _save_rgb_png_with_text(img, png_path, self.params.params_json, self.ctx)
         return png_path
 
@@ -463,12 +562,16 @@ struct FluxBackend(GenBackend, Movable):
                     r.step = 0
                     r.phase = String("encoding")
                     return r^
+                var encode_t0 = perf_counter_ns()
                 self._encode()
+                self.text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
+                self._record_vram()
                 self.announced = False
                 self.phase = FPHASE_LOAD
                 r.step = 0
                 return r^
             if self.phase == FPHASE_LOAD:
+                var load_t0 = perf_counter_ns()
                 if not self.loaded:
                     if not self.announced:
                         self.announced = True
@@ -476,13 +579,20 @@ struct FluxBackend(GenBackend, Movable):
                         r.phase = String("loading")
                         return r^
                     self._load_model()
-                    self.announced = False
+                self.load_seconds += Float64(perf_counter_ns() - load_t0) / 1.0e9
+                self.announced = False
+                var prep_t0 = perf_counter_ns()
                 self._prepare_job()
+                self.prepare_seconds += Float64(perf_counter_ns() - prep_t0) / 1.0e9
+                self._record_vram()
                 self.phase = FPHASE_DENOISE
                 r.step = 0
                 return r^
             if self.phase == FPHASE_DENOISE:
+                var denoise_t0 = perf_counter_ns()
                 self._denoise_one()
+                self.denoise_seconds += Float64(perf_counter_ns() - denoise_t0) / 1.0e9
+                self._record_vram()
                 self.cur += 1
                 r.step = self.cur
                 if self.cur >= self.params.steps:
@@ -494,7 +604,12 @@ struct FluxBackend(GenBackend, Movable):
                 r.step = self.params.steps
                 r.phase = String("decoding")
                 return r^
+            var decode_t0 = perf_counter_ns()
             var path = self._decode_and_save()
+            self.vae_decode_seconds = Float64(perf_counter_ns() - decode_t0) / 1.0e9
+            self._record_vram()
+            var manifest = self._write_result_manifest(path)
+            print("[flux][manifest] saved:", manifest)
             r.step = self.params.steps
             self._clear_job()
             r.done = True

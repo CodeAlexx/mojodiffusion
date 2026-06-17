@@ -56,6 +56,7 @@
 
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
+from std.time import perf_counter_ns
 
 from image.png import encode_png_with_text
 
@@ -79,6 +80,9 @@ from serenitymojo.serve.backend import (
     reject_unsupported_conditioning_mask_params,
     reject_unsupported_lanpaint_params,
     warn_unsupported_advanced_sampling_params,
+)
+from serenitymojo.serve.product_manifest import (
+    json_bool, json_escape, peak_vram_mib, write_text_file,
 )
 
 
@@ -246,6 +250,11 @@ struct KleinRuntimeBackend(GenBackend, Movable):
     var cfg: List[ArcPointer[TrainConfig]]   # 0/1 (per-job, loaded at admission)
     var lora_path: String
     var out_png: String
+    var job_t0_ns: Int
+    var encode_seconds: Float64
+    var sample_decode_seconds: Float64
+    var total_vram_bytes: Int
+    var min_free_bytes: Int
     # encoded conditioning, produced in ENCODE, consumed in SAMPLE.
     # pos/neg are [N_TXT, joint] (already reshaped for klein_sample).
     var pos_txt: List[ArcPointer[Tensor]]    # 0/1
@@ -263,6 +272,11 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.cfg = List[ArcPointer[TrainConfig]]()
         self.lora_path = String("")
         self.out_png = String("")
+        self.job_t0_ns = 0
+        self.encode_seconds = 0.0
+        self.sample_decode_seconds = 0.0
+        self.total_vram_bytes = 0
+        self.min_free_bytes = 0
         self.pos_txt = List[ArcPointer[Tensor]]()
         self.neg_txt = List[ArcPointer[Tensor]]()
 
@@ -385,6 +399,13 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.cancel_flag = False
         self.announced = False
         self.phase = KRPHASE_ENCODE
+        self.job_t0_ns = perf_counter_ns()
+        self.encode_seconds = 0.0
+        self.sample_decode_seconds = 0.0
+        var mem = cu_mem_get_info()
+        self.total_vram_bytes = mem.total_bytes
+        self.min_free_bytes = mem.free_bytes
+        self._record_vram()
 
     def cancel(mut self):
         self.cancel_flag = True
@@ -402,6 +423,13 @@ struct KleinRuntimeBackend(GenBackend, Movable):
               before.used_bytes() // (1024 * 1024), "->",
               after.used_bytes() // (1024 * 1024), "MiB (reclaimed",
               (before.used_bytes() - after.used_bytes()) // (1024 * 1024), "MiB)")
+
+    def _record_vram(mut self) raises:
+        var mem = cu_mem_get_info()
+        if self.total_vram_bytes == 0:
+            self.total_vram_bytes = mem.total_bytes
+        if self.min_free_bytes == 0 or mem.free_bytes < self.min_free_bytes:
+            self.min_free_bytes = mem.free_bytes
 
     def _clear_job(mut self):
         self.active = False
@@ -421,6 +449,8 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         encoder drops at scope exit (freed before the Klein DiT loads in SAMPLE).
         Mirrors klein9b_precache_sample_prompts._encode_one, but the embeddings
         land in device Tensors (kept in ArcPointers), not cap-cache .bin files."""
+        var t0 = perf_counter_ns()
+        self._record_vram()
         var joint = self.cfg[0][].joint_attention_dim
         var qwen_dir = _qwen_dir_for_variant(self.variant)
         var qwen_cfg = _qwen_cfg_for_variant(self.variant)
@@ -448,10 +478,70 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.pos_txt.append(ArcPointer(pos2^))
         self.neg_txt.append(ArcPointer(neg2^))
         # tok/enc drop here (Movable-not-Copyable -> Qwen3 encoder weights freed).
+        self.encode_seconds = Float64(perf_counter_ns() - t0) / 1.0e9
+        self._record_vram()
         print("[klein_runtime] Qwen3 encode done; encoder freed before DiT load")
+
+    def _write_result_manifest(mut self, png_path: String) raises -> String:
+        self._record_vram()
+        var manifest_path = png_path + String(".klein_daemon_result.json")
+        var sample_per_step = Float64(0.0)
+        if self.params.steps > 0:
+            sample_per_step = self.sample_decode_seconds / Float64(self.params.steps)
+        var total_wall_seconds = Float64(perf_counter_ns() - self.job_t0_ns) / 1.0e9
+        var peak_mib = Float64(0.0)
+        if self.total_vram_bytes > 0 and self.min_free_bytes > 0:
+            peak_mib = peak_vram_mib(self.total_vram_bytes, self.min_free_bytes)
+
+        var content = String("{\n")
+        content += String('  "schema":"serenity.klein_daemon_result.v1",\n')
+        content += String('  "backend":"klein_runtime",\n')
+        content += String('  "model":"klein",\n')
+        content += String('  "readiness_label":"experimental",\n')
+        content += String('  "accepted_sampler_parity":false,\n')
+        content += String('  "accepted_speed_parity":false,\n')
+        content += String('  "run_identity":{\n')
+        content += String('    "job_id":"') + json_escape(self.params.job_id) + String('",\n')
+        content += String('    "prompt":"') + json_escape(self.params.prompt) + String('",\n')
+        content += String('    "negative":"') + json_escape(self.params.negative) + String('",\n')
+        content += String('    "seed":') + String(self.params.seed) + String(",\n")
+        content += String('    "resolution":{"width":') + String(self.params.width) + String(',"height":') + String(self.params.height) + String("},\n")
+        content += String('    "steps":') + String(self.params.steps) + String(",\n")
+        content += String('    "guidance":') + String(self.params.cfg) + String(",\n")
+        content += String('    "sampler_registry_backend":"flux2",\n')
+        content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
+        content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
+        content += String('    "executed_sampler":"klein_euler",\n')
+        content += String('    "executed_scheduler":"simple",\n')
+        content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
+        content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
+        content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
+        content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
+        content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
+        content += String('    "variant":"') + json_escape(self.variant) + String('",\n')
+        content += String('    "config_path":"') + json_escape(self.config_path) + String('",\n')
+        content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        content += String('    "lora_path":"') + json_escape(self.lora_path) + String('",\n')
+        content += String('    "dtype":"bf16_klein_runtime"\n')
+        content += String("  },\n")
+        content += String('  "mojo":{\n')
+        content += String('    "text_encode_seconds":') + String(self.encode_seconds) + String(",\n")
+        content += String('    "sample_decode_seconds":') + String(self.sample_decode_seconds) + String(",\n")
+        content += String('    "sample_decode_seconds_per_step":') + String(sample_per_step) + String(",\n")
+        content += String('    "total_wall_seconds":') + String(total_wall_seconds) + String(",\n")
+        content += String('    "peak_vram_mib":') + String(peak_mib) + String(",\n")
+        content += String('    "artifact_paths":["') + json_escape(png_path) + String('","') + json_escape(manifest_path) + String('"]\n')
+        content += String("  },\n")
+        content += String('  "output_png":"') + json_escape(png_path) + String('",\n')
+        content += String('  "note":"Rust-server Mojo Klein runtime product-path result; timing and VRAM are measured in the worker process. Sampler and speed parity remain unaccepted until paired baseline evidence exists."\n')
+        content += String("}\n")
+        write_text_file(manifest_path, content)
+        return manifest_path
 
     # ── denoise + VAE decode + save (one long blocking tick) ──────────────────
     def _sample_and_save(mut self) raises -> String:
+        var t0 = perf_counter_ns()
+        self._record_vram()
         var cfg_scale = Float32(self.params.cfg)
         var seed = UInt64(self.params.seed)
         var steps = self.params.steps
@@ -484,6 +574,10 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         if not _path_exists(self.out_png):
             raise Error(String("klein_runtime: sampler did not produce ") + self.out_png)
         _embed_genparams_in_png(self.out_png, self.params.params_json)
+        self.sample_decode_seconds = Float64(perf_counter_ns() - t0) / 1.0e9
+        self._record_vram()
+        var manifest = self._write_result_manifest(self.out_png)
+        print("[klein_runtime][manifest] saved:", manifest)
         return self.out_png.copy()
 
     # ── the pull-based tick ───────────────────────────────────────────────────

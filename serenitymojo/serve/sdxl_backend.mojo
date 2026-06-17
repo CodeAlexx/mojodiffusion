@@ -45,6 +45,7 @@ from std.collections import Optional
 from std.ffi import external_call
 from std.gpu.host import DeviceContext
 from std.memory import alloc, ArcPointer
+from std.time import perf_counter_ns
 
 from image.buffer import Image
 from image.png import encode_png_with_text
@@ -84,6 +85,9 @@ from serenitymojo.serve.backend import (
     reject_unsupported_qwen_edit_conditioning_params,
     reject_unsupported_conditioning_mask_params, reject_unsupported_lanpaint_params,
     warn_unsupported_advanced_sampling_params,
+)
+from serenitymojo.serve.product_manifest import (
+    json_bool, json_escape, peak_vram_mib, write_text_file,
 )
 
 
@@ -270,6 +274,14 @@ struct SdxlBackend(GenBackend, Movable):
     var caps: List[ArcPointer[SdxlCaps]]            # 0/1
     var sched: List[ArcPointer[SDXLEulerScheduler]] # 0/1
     var latent: List[ArcPointer[Tensor]]            # 0/1 ([1,4,LH,LW] F32)
+    var job_t0_ns: UInt
+    var load_seconds: Float64
+    var text_encode_seconds: Float64
+    var prepare_seconds: Float64
+    var denoise_seconds: Float64
+    var vae_decode_seconds: Float64
+    var total_vram_bytes: Int
+    var min_free_bytes: Int
 
     def __init__(out self) raises:
         self.ctx = DeviceContext()
@@ -285,6 +297,14 @@ struct SdxlBackend(GenBackend, Movable):
         self.caps = List[ArcPointer[SdxlCaps]]()
         self.sched = List[ArcPointer[SDXLEulerScheduler]]()
         self.latent = List[ArcPointer[Tensor]]()
+        self.job_t0_ns = UInt(0)
+        self.load_seconds = 0.0
+        self.text_encode_seconds = 0.0
+        self.prepare_seconds = 0.0
+        self.denoise_seconds = 0.0
+        self.vae_decode_seconds = 0.0
+        self.total_vram_bytes = 0
+        self.min_free_bytes = 0
 
     def backend_name(self) -> String:
         return String("sdxl")
@@ -294,10 +314,8 @@ struct SdxlBackend(GenBackend, Movable):
 
     def resident_model(self) -> String:
         """Best-effort match to a /v1/models scan entry for the resident UNet
-        (the flat sdxl_unet_bf16.safetensors checkpoint). NOTE: the UNet lives
-        under /home/alex/EriDiffusion/Models/checkpoints/, not the daemon's
-        scanned checkpoints dir, so the scan may not list it — the dispatch is
-        wired by the orchestrator regardless."""
+        (the flat .serenity/models/checkpoints/sdxl_unet_bf16.safetensors
+        checkpoint)."""
         return String("sdxl_unet_bf16.safetensors") if self.loaded else String("")
 
     # ── job admission ─────────────────────────────────────────────────────────
@@ -351,6 +369,16 @@ struct SdxlBackend(GenBackend, Movable):
         self.cur = 0
         self.announced = False
         self.phase = SPHASE_ENCODE
+        self.job_t0_ns = perf_counter_ns()
+        self.load_seconds = 0.0
+        self.text_encode_seconds = 0.0
+        self.prepare_seconds = 0.0
+        self.denoise_seconds = 0.0
+        self.vae_decode_seconds = 0.0
+        var mem = cu_mem_get_info()
+        self.total_vram_bytes = mem.total_bytes
+        self.min_free_bytes = mem.free_bytes
+        self._record_vram()
 
     def cancel(mut self):
         self.cancel_flag = True
@@ -369,6 +397,69 @@ struct SdxlBackend(GenBackend, Movable):
               before.used_bytes() // (1024 * 1024), "->",
               after.used_bytes() // (1024 * 1024), "MiB (reclaimed",
               (before.used_bytes() - after.used_bytes()) // (1024 * 1024), "MiB)")
+
+    def _record_vram(mut self) raises:
+        var mem = cu_mem_get_info()
+        if self.total_vram_bytes == 0:
+            self.total_vram_bytes = mem.total_bytes
+        if self.min_free_bytes == 0 or mem.free_bytes < self.min_free_bytes:
+            self.min_free_bytes = mem.free_bytes
+
+    def _write_result_manifest(mut self, png_path: String) raises -> String:
+        self._record_vram()
+        var manifest_path = png_path + String(".sdxl_daemon_result.json")
+        var denoise_per_step = Float64(0.0)
+        if self.params.steps > 0:
+            denoise_per_step = self.denoise_seconds / Float64(self.params.steps)
+        var total_wall_seconds = Float64(perf_counter_ns() - self.job_t0_ns) / 1.0e9
+        var peak_mib = Float64(0.0)
+        if self.total_vram_bytes > 0 and self.min_free_bytes > 0:
+            peak_mib = peak_vram_mib(self.total_vram_bytes, self.min_free_bytes)
+
+        var content = String("{\n")
+        content += String('  "schema":"serenity.sdxl.daemon_result.v1",\n')
+        content += String('  "backend":"sdxl_daemon",\n')
+        content += String('  "model":"sdxl",\n')
+        content += String('  "readiness_label":"experimental",\n')
+        content += String('  "accepted_sampler_parity":false,\n')
+        content += String('  "accepted_speed_parity":false,\n')
+        content += String('  "run_identity":{\n')
+        content += String('    "job_id":"') + json_escape(self.params.job_id) + String('",\n')
+        content += String('    "prompt":"') + json_escape(self.params.prompt) + String('",\n')
+        content += String('    "negative":"') + json_escape(self.params.negative) + String('",\n')
+        content += String('    "seed":') + String(self.params.seed) + String(",\n")
+        content += String('    "resolution":{"width":') + String(self.params.width) + String(',"height":') + String(self.params.height) + String("},\n")
+        content += String('    "steps":') + String(self.params.steps) + String(",\n")
+        content += String('    "guidance":') + String(self.params.cfg) + String(",\n")
+        content += String('    "sampler_registry_backend":"sdxl",\n')
+        content += String('    "requested_sampler":"') + json_escape(self.params.sampler) + String('",\n')
+        content += String('    "requested_scheduler":"') + json_escape(self.params.scheduler) + String('",\n')
+        content += String('    "executed_sampler":"sdxl_euler",\n')
+        content += String('    "executed_scheduler":"normal",\n')
+        content += String('    "variation_seed":') + String(self.params.variation_seed) + String(",\n")
+        content += String('    "variation_strength":') + String(self.params.variation_strength) + String(",\n")
+        content += String('    "variation_applied":') + json_bool(self.params.variation_strength > 0.0) + String(",\n")
+        content += String('    "image_index":') + String(self.params.image_index) + String(",\n")
+        content += String('    "image_count":') + String(self.params.image_count) + String(",\n")
+        content += String('    "lora_count":') + String(len(self.params.loras)) + String(",\n")
+        content += String('    "dtype":"bf16_unet_f32_latent"\n')
+        content += String("  },\n")
+        content += String('  "mojo":{\n')
+        content += String('    "load_seconds":') + String(self.load_seconds) + String(",\n")
+        content += String('    "text_encode_seconds":') + String(self.text_encode_seconds) + String(",\n")
+        content += String('    "prepare_seconds":') + String(self.prepare_seconds) + String(",\n")
+        content += String('    "denoise_seconds":') + String(self.denoise_seconds) + String(",\n")
+        content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
+        content += String('    "vae_decode_seconds":') + String(self.vae_decode_seconds) + String(",\n")
+        content += String('    "total_wall_seconds":') + String(total_wall_seconds) + String(",\n")
+        content += String('    "peak_vram_mib":') + String(peak_mib) + String(",\n")
+        content += String('    "artifact_paths":["') + json_escape(png_path) + String('","') + json_escape(manifest_path) + String('"]\n')
+        content += String("  },\n")
+        content += String('  "output_png":"') + json_escape(png_path) + String('",\n')
+        content += String('  "note":"Rust-server Mojo worker product-path result; timing and VRAM are measured in the backend process. Speed parity remains unaccepted until paired baseline evidence exists."\n')
+        content += String("}\n")
+        write_text_file(manifest_path, content)
+        return manifest_path
 
     # ── per-job prep ───────────────────────────────────────────────────────────
     def _encode(mut self) raises:
@@ -540,12 +631,16 @@ struct SdxlBackend(GenBackend, Movable):
                     r.step = 0
                     r.phase = String("encoding")
                     return r^
+                var encode_t0 = perf_counter_ns()
                 self._encode()
+                self.text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
+                self._record_vram()
                 self.announced = False
                 self.phase = SPHASE_LOAD
                 r.step = 0
                 return r^
             if self.phase == SPHASE_LOAD:
+                var load_t0 = perf_counter_ns()
                 if not self.loaded:
                     if not self.announced:
                         self.announced = True
@@ -553,13 +648,20 @@ struct SdxlBackend(GenBackend, Movable):
                         r.phase = String("loading")
                         return r^
                     self._load_model()
-                    self.announced = False
+                self.load_seconds += Float64(perf_counter_ns() - load_t0) / 1.0e9
+                self.announced = False
+                var prep_t0 = perf_counter_ns()
                 self._prepare_job()
+                self.prepare_seconds += Float64(perf_counter_ns() - prep_t0) / 1.0e9
+                self._record_vram()
                 self.phase = SPHASE_DENOISE
                 r.step = 0
                 return r^
             if self.phase == SPHASE_DENOISE:
+                var denoise_t0 = perf_counter_ns()
                 self._denoise_one()
+                self.denoise_seconds += Float64(perf_counter_ns() - denoise_t0) / 1.0e9
+                self._record_vram()
                 self.cur += 1
                 r.step = self.cur
                 if self.cur >= self.params.steps:
@@ -571,7 +673,12 @@ struct SdxlBackend(GenBackend, Movable):
                 r.step = self.params.steps
                 r.phase = String("decoding")
                 return r^
+            var decode_t0 = perf_counter_ns()
             var path = self._decode_and_save()
+            self.vae_decode_seconds = Float64(perf_counter_ns() - decode_t0) / 1.0e9
+            self._record_vram()
+            var manifest = self._write_result_manifest(path)
+            print("[sdxl][manifest] saved:", manifest)
             r.step = self.params.steps
             self._clear_job()
             r.done = True

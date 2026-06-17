@@ -306,7 +306,9 @@
       // ── base-params summary, refreshed when opening ─────────────────────────
       function refreshBase() {
         var p = (state && state.params) || {};
-        var model = (p.model && String(p.model).indexOf("—") < 0) ? p.model : "z-image";
+        var model = (S.api && typeof S.api.normalizeModelName === "function")
+          ? S.api.normalizeModelName(p.model)
+          : ((p.model && String(p.model).indexOf("—") < 0) ? p.model : "z-image");
         var loraTxt = (Array.isArray(p.loras) && p.loras.length)
           ? p.loras.map(function (l) { return (l.name || "") + (l.weight != null && l.weight !== 1 ? ":" + l.weight : ""); }).join(", ")
           : "none";
@@ -325,9 +327,11 @@
       // ── build the /v1/grid request body from state.params + the axis rows ───
       function buildGridBody() {
         var p = (state && state.params) || {};
-        var model = (p.model && String(p.model).indexOf("—") < 0) ? p.model : "z-image";
-        var body = {
-          // base generate fields (server's base_params reads these flat keys)
+        var model = (S.api && typeof S.api.normalizeModelName === "function")
+          ? S.api.normalizeModelName(p.model)
+          : ((p.model && String(p.model).indexOf("—") < 0) ? p.model : "z-image");
+        var params = {
+          // base generate fields (server lowers workflow.params before base_params)
           model: model,
           prompt: p.prompt || "",
           negative: p.negative || "",
@@ -347,8 +351,16 @@
           vae: p.vae || "",
         };
         if (Array.isArray(p.loras) && p.loras.length) {
-          body.lora = p.loras.map(function (l) { return { name: l.name, weight: l.weight != null ? l.weight : 1.0 }; });
+          params.loras = p.loras.map(function (l) { return { name: l.name, weight: l.weight != null ? l.weight : 1.0 }; });
         }
+        if (S.promptSyntax && typeof S.promptSyntax.resolveParamsForSubmit === "function") {
+          var resolved = S.promptSyntax.resolveParamsForSubmit(params, { emitEvents: true });
+          params = (resolved && resolved.params) || params;
+        }
+        var body = {
+          workflow: { params: params },
+          workflow_client: "serenity.canvas.grid_xyz",
+        };
         // axes: send the RAW value string per dim — the server normalize_values does the
         // range/`||`/SKIP expansion (single source of truth). X is required.
         var dims = ["x", "y", "z"];

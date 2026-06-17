@@ -7,7 +7,7 @@
 #      NO timestep*1000 scaling, dt = sigma_next - sigma (negative).
 #      x = x + dt * pred   (direct-velocity Euler)
 #   4. Parity gate: compare Mojo latent vs Rust oracle (cosine + max-abs-diff).
-#   5. Decode via QwenImageVaeDecoder and save PNG.
+#   5. Decode via tiled Wan/Qwen image VAE and save PNG.
 #
 # Build:
 #   pixi run mojo build -I . -Xlinker -lm \
@@ -36,7 +36,7 @@ from serenitymojo.models.dit.anima_contract import (
     anima_default_rust_latent_path,
 )
 from serenitymojo.models.dit.anima_dit import AnimaDiT
-from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder
+from serenitymojo.models.vae.qwenimage_tiled_decode import wan21_image_tiled_decode
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, sub, reshape, permute
@@ -293,17 +293,16 @@ def main() raises:
         print("  PARITY WARN: cos =", cos_sim, "< 0.999 — diverged from Rust oracle")
 
     # ── Stage 6: VAE decode and save PNG ─────────────────────────────────────
-    print("\n--- Stage 6: VAE decode ---")
+    print("\n--- Stage 6: tiled VAE decode ---")
     var latent_bf16 = cast_tensor(x, STDtype.BF16, ctx)
     # Convert [1, T, H, W, 16] -> [1, 16, H, W] for VAE input
     var vae_input = _latent_to_vae_input(latent_bf16, ctx)
     print("  VAE input shape:", vae_input.shape()[0], vae_input.shape()[1],
           vae_input.shape()[2], vae_input.shape()[3])
 
-    var vae = QwenImageVaeDecoder[LH, LW].load_wan21_keys(
-        String(ANIMA_VAE_PATH), ctx
+    var image = wan21_image_tiled_decode[LH, LW](
+        vae_input, String(ANIMA_VAE_PATH), ctx
     )
-    var image = vae.decode_wan21_keys(vae_input, ctx)
     print("  decoded:", image.shape()[2], "x", image.shape()[3])
     var _out_p = String(OUT_PNG)
     if len(_a) > 2:

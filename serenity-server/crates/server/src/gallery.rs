@@ -22,7 +22,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
-use crate::AppState;
+use crate::{result_manifest, AppState};
 
 const GENPARAMS_TEXT_KEY: &str = "serenity.genparams.v1";
 
@@ -60,16 +60,23 @@ fn png_text_pairs(path: &str) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     let mut pos = 8usize;
     while pos + 8 <= data.len() {
-        let clen = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let clen =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         let ctype_off = pos + 4;
         let ctype = &data[ctype_off..ctype_off + 4];
         let dstart = pos + 8;
         if dstart + clen + 4 > data.len() {
-            return Err(format!("png: chunk overruns file: {}", String::from_utf8_lossy(ctype)));
+            return Err(format!(
+                "png: chunk overruns file: {}",
+                String::from_utf8_lossy(ctype)
+            ));
         }
         if ctype == b"tEXt" {
             let stored = u32::from_be_bytes([
-                data[dstart + clen], data[dstart + clen + 1], data[dstart + clen + 2], data[dstart + clen + 3],
+                data[dstart + clen],
+                data[dstart + clen + 1],
+                data[dstart + clen + 2],
+                data[dstart + clen + 3],
             ]);
             let calc = crc32(&data[ctype_off..ctype_off + 4 + clen]);
             if stored != calc {
@@ -113,7 +120,10 @@ fn thumb_dir(out: &Path) -> std::path::PathBuf {
     out.join("thumbnails")
 }
 fn thumb_path(out: &Path, id: &str) -> String {
-    thumb_dir(out).join(format!("{id}.png")).to_string_lossy().into_owned()
+    thumb_dir(out)
+        .join(format!("{id}.png"))
+        .to_string_lossy()
+        .into_owned()
 }
 fn png_path(out: &Path, id: &str) -> String {
     out.join(format!("{id}.png")).to_string_lossy().into_owned()
@@ -139,9 +149,10 @@ fn load_gallery_state(out: &Path) -> Value {
 }
 
 fn gallery_favorite(state: &Value, id: &str) -> bool {
-    state.get("favorites").and_then(|f| f.as_array()).map_or(false, |a| {
-        a.iter().any(|v| v.as_str() == Some(id))
-    })
+    state
+        .get("favorites")
+        .and_then(|f| f.as_array())
+        .map_or(false, |a| a.iter().any(|v| v.as_str() == Some(id)))
 }
 
 fn gallery_name(state: &Value, id: &str) -> String {
@@ -245,9 +256,18 @@ fn template_token_value(token: &str, id: &str, params: &Value, png: &str) -> Opt
         }
         let day = format!("{:0>2}", p[1]);
         let mon = match p[2] {
-            "Jan" => "01", "Feb" => "02", "Mar" => "03", "Apr" => "04",
-            "May" => "05", "Jun" => "06", "Jul" => "07", "Aug" => "08",
-            "Sep" => "09", "Oct" => "10", "Nov" => "11", "Dec" => "12",
+            "Jan" => "01",
+            "Feb" => "02",
+            "Mar" => "03",
+            "Apr" => "04",
+            "May" => "05",
+            "Jun" => "06",
+            "Jul" => "07",
+            "Aug" => "08",
+            "Sep" => "09",
+            "Oct" => "10",
+            "Nov" => "11",
+            "Dec" => "12",
             _ => "00",
         };
         let year = p[3];
@@ -313,7 +333,10 @@ fn resolve_output_template(template: &str, id: &str, params: &Value, png: &str) 
         // literal run: copy this char's `[` (if unmatched) plus up to the NEXT `[`.
         // Search from i+1 so a lone/unmatched `[` at i still makes progress (no
         // infinite loop). UTF-8 safe: `[` is ASCII, `i..next` is a char-boundary slice.
-        let next = template[i + 1..].find('[').map(|d| i + 1 + d).unwrap_or(bytes.len());
+        let next = template[i + 1..]
+            .find('[')
+            .map(|d| i + 1 + d)
+            .unwrap_or(bytes.len());
         out.push_str(&template[i..next]);
         i = next;
     }
@@ -345,7 +368,9 @@ fn ensure_thumbnail(out: &Path, id: &str, png: &str) -> Result<String, String> {
         tw = tw.max(1);
     }
     let thumb = img.resize_exact(tw, th, image::imageops::FilterType::Lanczos3);
-    thumb.save_with_format(&tp, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    thumb
+        .save_with_format(&tp, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
     Ok(tps)
 }
 
@@ -372,7 +397,10 @@ fn contains_ci(text: &str, q: &str) -> bool {
 }
 
 fn search_matches(id: &str, path: &str, params_json: &str, search: &str) -> bool {
-    search.is_empty() || contains_ci(id, search) || contains_ci(path, search) || contains_ci(params_json, search)
+    search.is_empty()
+        || contains_ci(id, search)
+        || contains_ci(path, search)
+        || contains_ci(params_json, search)
 }
 
 fn filter_matches(params_json: &str, favorite: bool, filter: &str, favorite_query: &str) -> bool {
@@ -400,7 +428,9 @@ fn filter_matches(params_json: &str, favorite: bool, filter: &str, favorite_quer
 }
 
 fn id_num(id: &str) -> i64 {
-    id.strip_prefix("job-").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0)
+    id.strip_prefix("job-")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
 }
 
 /// Precomputed per-candidate facts for sort/filter (params, favorite, size, order).
@@ -445,7 +475,14 @@ fn id_before_cmp(a: &Cand, b: &Cand, sort: &str) -> std::cmp::Ordering {
 
 // ── item builder ──────────────────────────────────────────────────────────────────
 
-fn item_from_png_state(out: &Path, state: &Value, id: &str, path: &str, favorite: bool, ensure_thumb: bool) -> Value {
+fn item_from_png_state(
+    out: &Path,
+    state: &Value,
+    id: &str,
+    path: &str,
+    favorite: bool,
+    ensure_thumb: bool,
+) -> Value {
     let params_json = png_genparams_or_empty(path);
     let mut thumb = String::new();
     let mut thumb_state = "not_requested".to_string();
@@ -493,7 +530,10 @@ fn item_from_png_state(out: &Path, state: &Value, id: &str, path: &str, favorite
     o.insert("path".into(), json!(path));
     o.insert("size".into(), json!(size));
     o.insert("favorite".into(), json!(favorite));
-    o.insert("manual_order_index".into(), json!(gallery_order_index(state, id)));
+    o.insert(
+        "manual_order_index".into(),
+        json!(gallery_order_index(state, id)),
+    );
     o.insert("imported".into(), json!(!imported_from.is_empty()));
     o.insert("imported_from".into(), json!(imported_from));
     o.insert("output_name".into(), json!(output_name));
@@ -503,6 +543,10 @@ fn item_from_png_state(out: &Path, state: &Value, id: &str, path: &str, favorite
     o.insert("thumbnail".into(), json!(thumb));
     o.insert("thumbnail_state".into(), json!(thumb_state));
     o.insert("metadata_key".into(), json!(GENPARAMS_TEXT_KEY));
+    let output_location = result_manifest::output_location_for_root(path, Some(out));
+    o.insert("output_location".into(), output_location.clone());
+    let result_manifests = result_manifest::manifest_refs_for_output(path);
+    o.insert("result_manifests".into(), result_manifests.clone());
     o.insert("has_params".into(), json!(!params_json.is_empty()));
     o.insert("params_json".into(), json!(params_json));
     if let Some(mut params) = parsed_params {
@@ -528,8 +572,37 @@ fn item_from_png_state(out: &Path, state: &Value, id: &str, path: &str, favorite
     // Structured metadata blob: a single object the lightbox can render + the
     // server can index. Carries the saved params (when present) + the file/gallery
     // facts; always present so a consumer never branches on missing keys.
-    o.insert("metadata".into(), gallery_metadata_blob(state, id, path, &output_name, &params_json, size, favorite, &thumb, &thumb_state));
+    o.insert(
+        "metadata".into(),
+        gallery_metadata_blob(
+            state,
+            id,
+            path,
+            &output_name,
+            &params_json,
+            size,
+            favorite,
+            &thumb,
+            &thumb_state,
+            &output_location,
+        ),
+    );
     Value::Object(o)
+}
+
+fn gallery_item_with_visual_health(mut item: Value, path: &str) -> Value {
+    let params_json = item
+        .get("params_json")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let visual_health = result_manifest::visual_health_for_params_json(path, params_json);
+    if let Some(o) = item.as_object_mut() {
+        o.insert("visual_health".into(), visual_health.clone());
+        if let Some(meta) = o.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.insert("visual_health".into(), visual_health);
+        }
+    }
+    item
 }
 
 /// `serenity.gallery_meta.v1` — the queryable metadata blob for one item. Always
@@ -544,15 +617,17 @@ fn gallery_metadata_blob(
     favorite: bool,
     thumb: &str,
     thumb_state: &str,
+    output_location: &Value,
 ) -> Value {
     let params = if params_json.is_empty() {
         Value::Null
     } else {
-        serde_json::from_str::<Value>(params_json).ok().filter(|v| v.is_object()).unwrap_or(Value::Null)
+        serde_json::from_str::<Value>(params_json)
+            .ok()
+            .filter(|v| v.is_object())
+            .unwrap_or(Value::Null)
     };
-    let pick = |k: &str| -> Value {
-        params.get(k).cloned().unwrap_or(Value::Null)
-    };
+    let pick = |k: &str| -> Value { params.get(k).cloned().unwrap_or(Value::Null) };
     let imported_from = gallery_import_source(state, id);
     json!({
         "schema": "serenity.gallery_meta.v1",
@@ -560,7 +635,9 @@ fn gallery_metadata_blob(
         "name": gallery_name(state, id),
         "output_name": output_name,
         "path": path,
+        "output_location": output_location,
         "size": size,
+        "result_manifests": result_manifest::manifest_refs_for_output(path),
         "favorite": favorite,
         "manual_order_index": gallery_order_index(state, id),
         "imported": !imported_from.is_empty(),
@@ -614,7 +691,10 @@ fn err_detail(status: StatusCode, detail: &str) -> Response {
 // ── handlers ──────────────────────────────────────────────────────────────────────
 
 /// GET /v1/gallery — list job PNGs + embedded genparams (`serenity.gallery.v1`).
-pub async fn get_gallery(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+pub async fn get_gallery(
+    State(st): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let out = st.out_dir.as_path();
     let g = |k: &str| q.get(k).cloned().unwrap_or_default();
     let mut search = g("search");
@@ -641,7 +721,12 @@ pub async fn get_gallery(State(st): State<AppState>, Query(q): Query<HashMap<Str
             continue;
         }
         let size = std::fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0);
-        cands.push(Cand { id: id.clone(), favorite: fav, size, order_index: gallery_order_index(&state, id) });
+        cands.push(Cand {
+            id: id.clone(),
+            favorite: fav,
+            size,
+            order_index: gallery_order_index(&state, id),
+        });
     }
     cands.sort_by(|a, b| id_before_cmp(a, b, &sort));
 
@@ -672,35 +757,67 @@ pub async fn get_gallery(State(st): State<AppState>, Query(q): Query<HashMap<Str
 }
 
 /// GET /v1/gallery/read?path=<png> — read any local PNG's genparams as an item.
-pub async fn get_gallery_read(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+pub async fn get_gallery_read(
+    State(st): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let png = q.get("path").cloned().unwrap_or_default();
     if png.is_empty() {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "'path' query parameter is required");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "'path' query parameter is required",
+        );
     }
     match png_genparams(&png) {
-        Ok(_) => json_compact(StatusCode::OK, &item_from_png_state(st.out_dir.as_path(), &load_gallery_state(st.out_dir.as_path()), "", &png, false, true)),
-        Err(e) => err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("cannot read PNG genparams: {e}")),
+        Ok(_) => {
+            let item = item_from_png_state(
+                st.out_dir.as_path(),
+                &load_gallery_state(st.out_dir.as_path()),
+                "",
+                &png,
+                false,
+                true,
+            );
+            json_compact(StatusCode::OK, &gallery_item_with_visual_health(item, &png))
+        }
+        Err(e) => err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("cannot read PNG genparams: {e}"),
+        ),
     }
 }
 
 /// GET /v1/gallery/:id — one gallery item by job id.
 pub async fn get_gallery_one(State(st): State<AppState>, AxPath(id): AxPath<String>) -> Response {
     if !safe_gallery_id(&id) {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("invalid gallery id: {id}"));
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("invalid gallery id: {id}"),
+        );
     }
     let out = st.out_dir.as_path();
     let p = png_path(out, &id);
     let state = load_gallery_state(out);
     match png_genparams(&p) {
-        Ok(_) => json_compact(StatusCode::OK, &item_from_png_state(out, &state, &id, &p, gallery_favorite(&state, &id), true)),
-        Err(e) => err_detail(StatusCode::NOT_FOUND, &format!("cannot read gallery item: {e}")),
+        Ok(_) => {
+            let item =
+                item_from_png_state(out, &state, &id, &p, gallery_favorite(&state, &id), true);
+            json_compact(StatusCode::OK, &gallery_item_with_visual_health(item, &p))
+        }
+        Err(e) => err_detail(
+            StatusCode::NOT_FOUND,
+            &format!("cannot read gallery item: {e}"),
+        ),
     }
 }
 
 // ── state mutators (sub-routes) ─────────────────────────────────────────────────
 
 fn state_arr(doc: &Value, key: &str) -> Value {
-    doc.get(key).filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([]))
+    doc.get(key)
+        .filter(|v| v.is_array())
+        .cloned()
+        .unwrap_or_else(|| json!([]))
 }
 
 /// Carry the additive `output_path_template` (a string) from `old` onto `rebuilt`.
@@ -746,8 +863,11 @@ fn set_favorite_doc(doc: &Value, id: &str, favorite: bool) -> Value {
     if favorite && !found {
         favs.push(json!(id));
     }
-    preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": favs,
-        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") }))
+    preserve_template(
+        doc,
+        json!({ "schema": "serenity.gallery_state.v1", "favorites": favs,
+        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") }),
+    )
 }
 
 /// `_set_gallery_name_doc` — upsert {id,name} in names, preserve the rest.
@@ -767,16 +887,23 @@ fn set_name_doc(doc: &Value, id: &str, name: &str) -> Value {
     if !replaced {
         names.push(json!({ "id": id, "name": name }));
     }
-    preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
-        "names": names, "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") }))
+    preserve_template(
+        doc,
+        json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": names, "order": state_arr(doc, "order"), "imports": state_arr(doc, "imports") }),
+    )
 }
 
 /// `_set_gallery_order_doc` — validate each id (safe + png exists), set order.
 fn set_order_doc(out: &Path, doc: &Value, ids: &Value) -> Result<Value, String> {
-    let arr = ids.as_array().ok_or("'ids' must be an array of gallery ids")?;
+    let arr = ids
+        .as_array()
+        .ok_or("'ids' must be an array of gallery ids")?;
     let mut order = Vec::new();
     for (i, v) in arr.iter().enumerate() {
-        let id = v.as_str().ok_or_else(|| format!("'ids[{i}]' must be a string"))?;
+        let id = v
+            .as_str()
+            .ok_or_else(|| format!("'ids[{i}]' must be a string"))?;
         if !safe_gallery_id(id) {
             return Err(format!("invalid gallery id: {id}"));
         }
@@ -785,24 +912,42 @@ fn set_order_doc(out: &Path, doc: &Value, ids: &Value) -> Result<Value, String> 
         }
         order.push(json!(id));
     }
-    Ok(preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
-        "names": state_arr(doc, "names"), "order": order, "imports": state_arr(doc, "imports") })))
+    Ok(preserve_template(
+        doc,
+        json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": state_arr(doc, "names"), "order": order, "imports": state_arr(doc, "imports") }),
+    ))
 }
 
 /// `_remove_gallery_item_doc` — drop `id` from every array.
 fn remove_item_doc(doc: &Value, id: &str) -> Value {
     let strip_strs = |key: &str| -> Vec<Value> {
-        doc.get(key).and_then(|a| a.as_array())
-            .map(|a| a.iter().filter(|v| v.as_str() != Some(id)).cloned().collect())
+        doc.get(key)
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|v| v.as_str() != Some(id))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let strip_objs = |key: &str| -> Vec<Value> {
-        doc.get(key).and_then(|a| a.as_array())
-            .map(|a| a.iter().filter(|e| e.get("id").and_then(|v| v.as_str()) != Some(id)).cloned().collect())
+        doc.get(key)
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|e| e.get("id").and_then(|v| v.as_str()) != Some(id))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     };
-    preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": strip_strs("favorites"),
-        "names": strip_objs("names"), "order": strip_strs("order"), "imports": strip_objs("imports") }))
+    preserve_template(
+        doc,
+        json!({ "schema": "serenity.gallery_state.v1", "favorites": strip_strs("favorites"),
+        "names": strip_objs("names"), "order": strip_strs("order"), "imports": strip_objs("imports") }),
+    )
 }
 
 /// `_set_gallery_import_doc` — upsert {id, source_path} in imports, preserve the rest.
@@ -822,8 +967,11 @@ fn set_import_doc(doc: &Value, id: &str, source_path: &str) -> Value {
     if !replaced {
         imports.push(json!({ "id": id, "source_path": source_path }));
     }
-    preserve_template(doc, json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
-        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": imports }))
+    preserve_template(
+        doc,
+        json!({ "schema": "serenity.gallery_state.v1", "favorites": state_arr(doc, "favorites"),
+        "names": state_arr(doc, "names"), "order": state_arr(doc, "order"), "imports": imports }),
+    )
 }
 
 fn required_string(body: &Value, key: &str) -> Result<String, String> {
@@ -835,41 +983,73 @@ fn required_string(body: &Value, key: &str) -> Result<String, String> {
 }
 
 fn body_object(body: &str) -> Value {
-    serde_json::from_str::<Value>(body).ok().filter(|v| v.is_object()).unwrap_or_else(|| json!({}))
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}))
 }
 
 /// POST /v1/gallery/:id/favorite — set/clear favorite, return the item.
-pub async fn post_favorite(State(st): State<AppState>, AxPath(id): AxPath<String>, body: String) -> Response {
+pub async fn post_favorite(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+    body: String,
+) -> Response {
     let out = st.out_dir.as_path();
     if !safe_gallery_id(&id) {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("invalid gallery id: {id}"));
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("invalid gallery id: {id}"),
+        );
     }
     let p = png_path(out, &id);
     if !Path::new(&p).exists() {
-        return err_detail(StatusCode::NOT_FOUND, &format!("gallery item not found: {id}"));
+        return err_detail(
+            StatusCode::NOT_FOUND,
+            &format!("gallery item not found: {id}"),
+        );
     }
     let b = body_object(&body);
     let favorite = match b.get("favorite") {
         None => true,
         Some(v) if v.is_boolean() => v.as_bool().unwrap(),
-        Some(_) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "'favorite' must be a boolean"),
+        Some(_) => {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "'favorite' must be a boolean",
+            )
+        }
     };
     let next = set_favorite_doc(&load_gallery_state(out), &id, favorite);
     if save_gallery_state(out, &next).is_err() {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot persist gallery state",
+        );
     }
-    json_compact(StatusCode::OK, &item_from_png_state(out, &next, &id, &p, favorite, true))
+    let item = item_from_png_state(out, &next, &id, &p, favorite, true);
+    json_compact(StatusCode::OK, &gallery_item_with_visual_health(item, &p))
 }
 
 /// POST /v1/gallery/:id/rename — set display name, return the item.
-pub async fn post_rename(State(st): State<AppState>, AxPath(id): AxPath<String>, body: String) -> Response {
+pub async fn post_rename(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+    body: String,
+) -> Response {
     let out = st.out_dir.as_path();
     if !safe_gallery_id(&id) {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("invalid gallery id: {id}"));
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("invalid gallery id: {id}"),
+        );
     }
     let p = png_path(out, &id);
     if !Path::new(&p).exists() {
-        return err_detail(StatusCode::NOT_FOUND, &format!("gallery item not found: {id}"));
+        return err_detail(
+            StatusCode::NOT_FOUND,
+            &format!("gallery item not found: {id}"),
+        );
     }
     let name = match required_string(&body_object(&body), "name") {
         Ok(n) => n,
@@ -877,9 +1057,13 @@ pub async fn post_rename(State(st): State<AppState>, AxPath(id): AxPath<String>,
     };
     let next = set_name_doc(&load_gallery_state(out), &id, &name);
     if save_gallery_state(out, &next).is_err() {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot persist gallery state",
+        );
     }
-    json_compact(StatusCode::OK, &item_from_png_state(out, &next, &id, &p, gallery_favorite(&next, &id), true))
+    let item = item_from_png_state(out, &next, &id, &p, gallery_favorite(&next, &id), true);
+    json_compact(StatusCode::OK, &gallery_item_with_visual_health(item, &p))
 }
 
 /// POST /v1/gallery/order — set the manual order; returns {schema, order}.
@@ -895,9 +1079,15 @@ pub async fn post_order(State(st): State<AppState>, body: String) -> Response {
         Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
     };
     if save_gallery_state(out, &next).is_err() {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot persist gallery state",
+        );
     }
-    json_compact(StatusCode::OK, &json!({ "schema": "serenity.gallery_order.v1", "order": next.get("order").cloned().unwrap_or(json!([])) }))
+    json_compact(
+        StatusCode::OK,
+        &json!({ "schema": "serenity.gallery_order.v1", "order": next.get("order").cloned().unwrap_or(json!([])) }),
+    )
 }
 
 /// POST /v1/gallery/import — copy a local PNG (with genparams) in as a new job-XXXX
@@ -910,37 +1100,64 @@ pub async fn post_import(State(st): State<AppState>, body: String) -> Response {
         Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
     };
     if source.contains('\n') || source.contains('\r') {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "invalid gallery import path");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid gallery import path",
+        );
     }
     if !Path::new(&source).is_file() {
-        return err_detail(StatusCode::NOT_FOUND, &format!("gallery import source not found: {source}"));
+        return err_detail(
+            StatusCode::NOT_FOUND,
+            &format!("gallery import source not found: {source}"),
+        );
     }
     // must carry the genparams tEXt (else nothing to import)
     match png_genparams(&source) {
         Ok(p) if !p.is_empty() => {}
-        Ok(_) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("gallery import source has no {GENPARAMS_TEXT_KEY}")),
+        Ok(_) => {
+            return err_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("gallery import source has no {GENPARAMS_TEXT_KEY}"),
+            )
+        }
         Err(e) => return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &e),
     }
-    let n = st.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let n = st
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
     let id = format!("job-{n:04}");
     let dest = png_path(out, &id);
     if std::fs::copy(&source, &dest).is_err() {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "gallery import copy failed");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "gallery import copy failed",
+        );
     }
     let next = set_import_doc(&load_gallery_state(out), &id, &source);
     let _ = save_gallery_state(out, &next);
-    json_compact(StatusCode::OK, &item_from_png_state(out, &next, &id, &dest, gallery_favorite(&next, &id), true))
+    let item = item_from_png_state(out, &next, &id, &dest, gallery_favorite(&next, &id), true);
+    json_compact(
+        StatusCode::OK,
+        &gallery_item_with_visual_health(item, &dest),
+    )
 }
 
 /// DELETE /v1/gallery/:id — unlink the PNG (+ thumb) and drop it from state.
 pub async fn delete_item(State(st): State<AppState>, AxPath(id): AxPath<String>) -> Response {
     let out = st.out_dir.as_path();
     if !safe_gallery_id(&id) {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, &format!("invalid gallery id: {id}"));
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("invalid gallery id: {id}"),
+        );
     }
     let p = png_path(out, &id);
     if !Path::new(&p).exists() {
-        return err_detail(StatusCode::NOT_FOUND, &format!("gallery item not found: {id}"));
+        return err_detail(
+            StatusCode::NOT_FOUND,
+            &format!("gallery item not found: {id}"),
+        );
     }
     let deleted = std::fs::remove_file(&p).is_ok();
     let tp = thumb_path(out, &id);
@@ -950,9 +1167,12 @@ pub async fn delete_item(State(st): State<AppState>, AxPath(id): AxPath<String>)
     }
     let next = remove_item_doc(&load_gallery_state(out), &id);
     let _ = save_gallery_state(out, &next);
-    json_compact(StatusCode::OK, &json!({
-        "id": id, "deleted": deleted, "path": p, "thumbnail_path": tp, "thumbnail_deleted": thumb_deleted,
-    }))
+    json_compact(
+        StatusCode::OK,
+        &json!({
+            "id": id, "deleted": deleted, "path": p, "thumbnail_path": tp, "thumbnail_deleted": thumb_deleted,
+        }),
+    )
 }
 
 // ── output-path template config (SwarmUI OutpathBuilder, §7) ─────────────────────
@@ -982,8 +1202,19 @@ fn set_template_doc(doc: &Value, template: &str) -> Value {
 // Consumed only by the (route-wiring-pending) output-template handlers.
 #[allow(dead_code)]
 const OUTPUT_TEMPLATE_TOKENS: &[&str] = &[
-    "id", "model", "prompt", "negative", "seed", "width", "height",
-    "steps", "cfg", "sampler", "scheduler", "date", "time",
+    "id",
+    "model",
+    "prompt",
+    "negative",
+    "seed",
+    "width",
+    "height",
+    "steps",
+    "cfg",
+    "sampler",
+    "scheduler",
+    "date",
+    "time",
 ];
 
 /// GET /v1/gallery/output-template — current template + the token vocabulary, and
@@ -993,7 +1224,10 @@ const OUTPUT_TEMPLATE_TOKENS: &[&str] = &[
 // resolution + `output_name`/`metadata` emission) already flows through the wired
 // list/one/read handlers regardless of this config endpoint.
 #[allow(dead_code)]
-pub async fn get_output_template(State(st): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+pub async fn get_output_template(
+    State(st): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let out = st.out_dir.as_path();
     let state = load_gallery_state(out);
     let template = gallery_output_template(&state);
@@ -1018,7 +1252,11 @@ pub async fn get_output_template(State(st): State<AppState>, Query(q): Query<Has
             .ok()
             .filter(|v| v.is_object())
             .unwrap_or_else(|| json!({}));
-        let preview_id: &str = if pid.is_empty() { "job-0000" } else { pid.as_str() };
+        let preview_id: &str = if pid.is_empty() {
+            "job-0000"
+        } else {
+            pid.as_str()
+        };
         let preview = resolve_output_template(&template, preview_id, &params, &ppath);
         if let Some(m) = doc.as_object_mut() {
             m.insert("preview".into(), json!(preview));
@@ -1045,17 +1283,26 @@ pub async fn post_output_template(State(st): State<AppState>, body: String) -> R
         .to_string();
     // length guard: a runaway template would bloat gallery.json + every item name.
     if template.len() > 512 {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "'template' too long (max 512 chars)");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "'template' too long (max 512 chars)",
+        );
     }
     let next = set_template_doc(&load_gallery_state(out), &template);
     if save_gallery_state(out, &next).is_err() {
-        return err_detail(StatusCode::UNPROCESSABLE_ENTITY, "cannot persist gallery state");
+        return err_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot persist gallery state",
+        );
     }
-    json_compact(StatusCode::OK, &json!({
-        "schema": "serenity.gallery_output_template.v1",
-        "output_path_template": gallery_output_template(&next),
-        "tokens": OUTPUT_TEMPLATE_TOKENS,
-    }))
+    json_compact(
+        StatusCode::OK,
+        &json!({
+            "schema": "serenity.gallery_output_template.v1",
+            "output_path_template": gallery_output_template(&next),
+            "tokens": OUTPUT_TEMPLATE_TOKENS,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -1104,8 +1351,14 @@ mod tests {
     fn template_empty_is_back_compat() {
         // empty / whitespace template → the job id (current naming), no file touch
         let p = json!({"model":"zimage","seed":42});
-        assert_eq!(resolve_output_template("", "job-0007", &p, "/nope.png"), "job-0007");
-        assert_eq!(resolve_output_template("   ", "job-0007", &p, "/nope.png"), "job-0007");
+        assert_eq!(
+            resolve_output_template("", "job-0007", &p, "/nope.png"),
+            "job-0007"
+        );
+        assert_eq!(
+            resolve_output_template("   ", "job-0007", &p, "/nope.png"),
+            "job-0007"
+        );
     }
 
     #[test]
@@ -1116,9 +1369,15 @@ mod tests {
         let r = resolve_output_template("[model]-[seed]-[prompt]", "job-0001", &p, "/nope.png");
         assert_eq!(r, "Z_Image_Turbo-1234-a_red_car");
         // numeric seed rendered without quotes
-        assert_eq!(resolve_output_template("[seed]", "job-0001", &p, "/nope.png"), "1234");
+        assert_eq!(
+            resolve_output_template("[seed]", "job-0001", &p, "/nope.png"),
+            "1234"
+        );
         // [id] token
-        assert_eq!(resolve_output_template("img_[id]", "job-0042", &p, "/nope.png"), "img_job-0042");
+        assert_eq!(
+            resolve_output_template("img_[id]", "job-0042", &p, "/nope.png"),
+            "img_job-0042"
+        );
     }
 
     #[test]
@@ -1137,7 +1396,8 @@ mod tests {
     fn template_date_token_missing_file_left_verbatim() {
         // [date]/[time] read the PNG mtime; a nonexistent file → token kept verbatim
         let p = json!({"model":"m"});
-        let r = resolve_output_template("[model]-[date]", "job-0001", &p, "/definitely/not/here.png");
+        let r =
+            resolve_output_template("[model]-[date]", "job-0001", &p, "/definitely/not/here.png");
         assert_eq!(r, "m-[date]");
     }
 
@@ -1161,6 +1421,96 @@ mod tests {
         let bare = gallery_state_default();
         let after = set_favorite_doc(&bare, "job-0001", true);
         assert!(after.get("output_path_template").is_none());
+    }
+
+    #[test]
+    fn gallery_item_metadata_exposes_result_manifests() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "serenity_gallery_manifest_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("job-0001.png");
+        image::RgbImage::from_pixel(1, 1, image::Rgb([1, 2, 3]))
+            .save(&png)
+            .unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let server_path = format!("{path}.serenity_server_result.json");
+        let worker_path = format!("{path}.zimage_daemon_result.json");
+        std::fs::write(&server_path, "{}").unwrap();
+        std::fs::write(&worker_path, "{}").unwrap();
+
+        let item = item_from_png_state(
+            &dir,
+            &gallery_state_default(),
+            "job-0001",
+            &path,
+            false,
+            false,
+        );
+        assert_eq!(
+            item["result_manifests"]["server_result_manifest"]["present"],
+            true
+        );
+        assert_eq!(item["output_location"]["root_kind"], "ui_workflow_gallery");
+        assert_eq!(item["output_location"]["inside_root"], true);
+        assert_eq!(item["output_location"]["relative_path"], "job-0001.png");
+        assert_eq!(item["metadata"]["output_location"]["inside_root"], true);
+        assert_eq!(
+            item["metadata"]["result_manifests"]["worker_result_manifest"]["path"],
+            worker_path
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gallery_single_item_visual_health_is_additive() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "serenity_gallery_visual_health_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("job-0002.png");
+        let mut img = image::RgbImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgb([
+                        ((x * 4) % 256) as u8,
+                        ((y * 4) % 256) as u8,
+                        (((x + y) * 3) % 256) as u8,
+                    ]),
+                );
+            }
+        }
+        img.save(&png).unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let listed = item_from_png_state(
+            &dir,
+            &gallery_state_default(),
+            "job-0002",
+            &path,
+            false,
+            false,
+        );
+        assert!(listed.get("visual_health").is_none());
+
+        let single = gallery_item_with_visual_health(listed, &path);
+        assert_eq!(single["visual_health"]["status"], "pass");
+        assert_eq!(single["metadata"]["visual_health"]["status"], "pass");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

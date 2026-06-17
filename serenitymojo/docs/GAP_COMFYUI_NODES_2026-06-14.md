@@ -83,7 +83,7 @@ primitives, and the ideogram4 KJ canvas export) are omitted.
 | LatentComposite | Overlay one latent on another | no | absent | no (single-latent flat model) | L |
 | LatentBlend | Interpolate two latents | no | absent | no | L |
 | LatentFromBatch | Slice a latent batch | no | absent | no | M |
-| RepeatLatentBatch | Duplicate a latent batch | no | absent | partial (could bump `images`) | S |
+| RepeatLatentBatch | Duplicate a latent batch | no | fail-loud in workflow graph | no; flat `images=N` is serial fanout, not latent-batch execution | S |
 | LatentRotate / LatentFlip / LatentCrop | Geometric latent transforms | no | absent | no | M |
 
 ## Sampling
@@ -195,9 +195,10 @@ lowering change, exactly like the Phase-4 additions):
    LoadImage→MASK + ImageToMask path. Both unblock img2img/inpaint round-trips from gallery
    images with no new worker capability. (S)
 
-Honorable mention (clean but lower frequency): **RepeatLatentBatch** → `images`,
-**VAEEncodeForInpaint** → inpaint_* alias, **DisableNoise** (only useful once add_noise=disable
-is handled, currently 501).
+Honorable mention (clean but lower frequency): **VAEEncodeForInpaint** -> inpaint_* alias
+and **DisableNoise** (only useful once add_noise=disable is handled, currently 501).
+**RepeatLatentBatch** is intentionally not a flat `images` alias; it must stay fail-loud
+until real latent-batch execution exists.
 
 ---
 

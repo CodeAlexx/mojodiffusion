@@ -5,14 +5,13 @@
 #   anima_decode_cli <latent.safetensors> <out.png>
 #
 # Reads a SCALED latent [1,16,128,128] BF16/F32 (key `latent`, the schema
-# anima_sample_cli writes) and decodes it through the Qwen-Image (wan21-keys) VAE
+# anima_sample_cli writes) and decodes it through the tiled Qwen/Wan image VAE
 # to a 1024x1024 PNG ([-1,1] SIGNED range). The Mojo decoder internally applies
 # z/inv_std + mean, matching OneTrainer AnimaModel.unscale_latents before
 # diffusers VAE decode. Mirrors anima_vae_latent_smoke.mojo, but takes the latent
 # path + out path as args. A FRESH DeviceContext with NO DiT resident — the
-# 1024 3D-conv upsample decode is multi-GiB and OOMs 24 GiB if it
-# shares the process with the sampler's (freed-but-pooled) DiT allocations, so the
-# decode runs in its own process.
+# 1024 3D-conv upsample decode is multi-GiB, so this uses 3x3 overlapping
+# half-latent tiles and runs in its own process.
 #
 # Build:
 #   cd /home/alex/mojodiffusion
@@ -33,7 +32,7 @@ from serenitymojo.ops.tensor_algebra import reshape
 
 # Qwen-Image VAE per-channel latent normalization (config.json latents_mean/std,
 # z_dim=16). Standard sampler/trainer latents are already in OneTrainer SCALED
-# space. Do not pre-unscale them here: QwenImageVaeDecoder.decode_wan21_keys does
+# space. Do not pre-unscale them here: wan21_image_tiled_decode does
 # z/inv_std + mean internally. The helper below is retained only for explicit
 # debugging of non-standard latents.
 def _lat_mean() -> List[Float32]:
@@ -58,7 +57,7 @@ def _mean_abs16(v: List[Float32]) -> Float32:
 from serenitymojo.models.dit.anima_contract import (
     ANIMA_LATENT_H, ANIMA_LATENT_W, ANIMA_LATENT_CHANNELS, ANIMA_VAE_PATH,
 )
-from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder
+from serenitymojo.models.vae.qwenimage_tiled_decode import wan21_image_tiled_decode
 from serenitymojo.image.png import save_png, ValueRange
 
 
@@ -69,12 +68,12 @@ def main() raises:
     var latent_path = String(args[1])
     var out_png = String(args[2])
     # OPTIONAL 3rd arg "unscale" is debug-only and normally wrong for Anima
-    # trainer/sampler latents, because decode_wan21_keys already performs the
-    # scaled->raw unnormalize internally.
+    # trainer/sampler latents, because the tiled Wan21 decode already performs
+    # the scaled->raw unnormalize internally.
     var do_unscale = (len(args) > 3 and String(args[3]) == String("unscale"))
 
     var ctx = DeviceContext()
-    print("=== Anima VAE decode CLI ===")
+    print("=== Anima tiled VAE decode CLI ===")
     print("  latent:", latent_path)
     print("  out   :", out_png, " unscale=", do_unscale)
 
@@ -104,10 +103,9 @@ def main() raises:
     else:
         lat = cast_tensor(lat4, STDtype.BF16, ctx)
 
-    var dec = QwenImageVaeDecoder[ANIMA_LATENT_H, ANIMA_LATENT_W].load_wan21_keys(
-        String(ANIMA_VAE_PATH), ctx
-    )
-    var rgb = dec.decode_wan21_keys(lat, ctx)   # NCHW [1,3,1024,1024], [-1,1]
+    var rgb = wan21_image_tiled_decode[ANIMA_LATENT_H, ANIMA_LATENT_W](
+        lat, String(ANIMA_VAE_PATH), ctx
+    )  # NCHW [1,3,1024,1024], [-1,1]
     print("  decoded RGB:", rgb.shape()[2], "x", rgb.shape()[3])
     save_png(rgb, out_png, ctx, ValueRange.SIGNED)
     print("IMAGE SAVED:", out_png)

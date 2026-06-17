@@ -8,7 +8,10 @@ use crate::{GraphError, GraphResult};
 
 /// `_workflow_canonical_type_id` (Mojo 36): strip a leading `comfy/` namespace.
 pub fn canonical_type_id(type_id: &str) -> String {
-    type_id.strip_prefix("comfy/").unwrap_or(type_id).to_string()
+    type_id
+        .strip_prefix("comfy/")
+        .unwrap_or(type_id)
+        .to_string()
 }
 
 /// `_workflow_string` (Mojo 28): string field or `""` (non-strings → "").
@@ -115,8 +118,13 @@ pub fn is_named_scheduler_node(type_id: &str) -> bool {
 pub fn worker_supports_sampler(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
-        "euler" | "flowmatch_euler" | "flow_match_euler" | "dpmpp_2m" | "dpm++ 2m"
-            | "uni_pc" | "uni_pc_bh2"
+        "euler"
+            | "flowmatch_euler"
+            | "flow_match_euler"
+            | "dpmpp_2m"
+            | "dpm++ 2m"
+            | "uni_pc"
+            | "uni_pc_bh2"
     )
 }
 
@@ -441,6 +449,9 @@ pub fn loader_model_name(fields: &JsonValue) -> String {
     }
     if name.is_empty() {
         name = wf_string(fields, "model_name");
+    }
+    if name.is_empty() {
+        name = wf_string(fields, "checkpoint_path");
     }
     name
 }

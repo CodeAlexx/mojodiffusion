@@ -28,10 +28,9 @@
      data,             // OPTIONAL: initial per-node data object (deep-ish-cloned per node).
    }
 
-   Queue: if typeof Serenity.wfLower === 'function', Queue calls Serenity.wfLower(graph())
-   and merges the returned params-patch object into state.params before submitting via the
-   PROVEN /v1/generate path (api.submitPrompt reads Serenity.state.params). If wfLower is
-   absent / returns falsy, Queue keeps the existing model+prompt behavior. */
+   Queue: built-in nodes compile to a Comfy API prompt graph and submit through
+   the Rust workflow IR. Legacy wfLower adapters submit as a workflow params
+   adapter instead of bypassing the workflow envelope. */
 (function () {
   "use strict";
   var S = window.Serenity;
@@ -427,6 +426,156 @@
         return { nodes: nodeList, wires: wireList };
       }
 
+      function paramsSnapshot() {
+        var p = get("params") || {};
+        return {
+          width: Number(p.width) || 1024,
+          height: Number(p.height) || 1024,
+          steps: Number(p.steps) || 8,
+          seed: Number(p.seed != null ? p.seed : -1),
+          cfg: Number(p.cfg != null ? p.cfg : 1.5),
+          sampler: p.sampler || "euler",
+          scheduler: p.scheduler || "simple",
+        };
+      }
+
+      function compileNodeInputs(type, p, modelValue, promptValue) {
+        if (type === "Load Checkpoint") return { ckpt_name: modelValue || "z-image" };
+        if (type === "CLIP Text Encode") return { text: "" };
+        if (type === "Empty Latent") {
+          return {
+            width: Math.max(64, Math.round((p.width || 1024) / 8) * 8),
+            height: Math.max(64, Math.round((p.height || 1024) / 8) * 8),
+            batch_size: 1,
+          };
+        }
+        if (type === "KSampler") {
+          return {
+            seed: Number.isFinite(p.seed) ? p.seed : -1,
+            steps: Math.max(1, Math.round(p.steps || 8)),
+            cfg: Number.isFinite(p.cfg) ? p.cfg : 1.5,
+            sampler_name: p.sampler || "euler",
+            scheduler: p.scheduler || "simple",
+            denoise: 1.0,
+          };
+        }
+        if (type === "Save Image") {
+          return { filename_prefix: (name.value || "workflow").replace(/[^\w.-]+/g, "_") || "workflow" };
+        }
+        return {};
+      }
+
+      function comfyClass(type) {
+        if (type === "Load Checkpoint") return "CheckpointLoaderSimple";
+        if (type === "CLIP Text Encode") return "CLIPTextEncode";
+        if (type === "Empty Latent") return "EmptyLatentImage";
+        if (type === "KSampler") return "KSampler";
+        if (type === "VAE Decode") return "VAEDecode";
+        if (type === "Save Image") return "SaveImage";
+        return "";
+      }
+
+      function inputName(type, index) {
+        var map = {
+          "CLIP Text Encode": ["clip"],
+          "KSampler": ["model", "positive", "negative", "latent_image"],
+          "VAE Decode": ["samples", "vae"],
+          "Save Image": ["images"],
+        };
+        return map[type] ? map[type][index] : null;
+      }
+
+      function typeOfGroup(g) { return g && g.getAttr ? g.getAttr("wfType") : ""; }
+
+      function nodeIdFor(group, ids) {
+        return ids.indexOf(group) + 1;
+      }
+
+      function compileToComfyPrompt(uiGraph) {
+        uiGraph = uiGraph || graph();
+        var p = paramsSnapshot();
+        var modelValue = modelSel.value || get("params.model") || "z-image";
+        var promptValue = promptIn.value.trim() || get("params.prompt") || "";
+        var negativeValue = get("params.negative") || "";
+        var groups = nodes.slice();
+        var out = {};
+        groups.forEach(function (g, idx) {
+          var type = typeOfGroup(g);
+          var cls = comfyClass(type);
+          if (!cls) return;
+          out[String(idx + 1)] = {
+            class_type: cls,
+            inputs: compileNodeInputs(type, p, modelValue, promptValue),
+          };
+        });
+
+        wires.forEach(function (wd) {
+          var fromId = nodeIdFor(wd.from, groups);
+          var toId = nodeIdFor(wd.to, groups);
+          if (fromId <= 0 || toId <= 0 || !out[String(fromId)] || !out[String(toId)]) return;
+          var nameIn = inputName(typeOfGroup(wd.to), wd.toI);
+          if (!nameIn) return;
+          out[String(toId)].inputs[nameIn] = [String(fromId), wd.fromI];
+        });
+
+        Object.keys(out).forEach(function (id) {
+          var node = out[id];
+          if (node.class_type !== "CLIPTextEncode") return;
+          var usedAsPositive = false, usedAsNegative = false;
+          Object.keys(out).forEach(function (kid) {
+            var k = out[kid];
+            if (!k || k.class_type !== "KSampler") return;
+            var pos = k.inputs.positive, neg = k.inputs.negative;
+            if (Array.isArray(pos) && pos[0] === id) usedAsPositive = true;
+            if (Array.isArray(neg) && neg[0] === id) usedAsNegative = true;
+          });
+          node.inputs.text = usedAsNegative && !usedAsPositive ? negativeValue : promptValue;
+        });
+
+        var nextId = Object.keys(out).reduce(function (m, k) {
+          var n = parseInt(k, 10);
+          return isFinite(n) && n > m ? n : m;
+        }, 0) + 1;
+        Object.keys(out).forEach(function (id) {
+          var node = out[id];
+          if (!node || node.class_type !== "KSampler") return;
+          if (!node.inputs.positive) {
+            throw new Error("KSampler is missing positive conditioning");
+          }
+          if (!node.inputs.negative) {
+            var zid = String(nextId++);
+            out[zid] = {
+              class_type: "ConditioningZeroOut",
+              inputs: { conditioning: node.inputs.positive },
+            };
+            node.inputs.negative = [zid, 0];
+          }
+        });
+
+        validateComfyPrompt(out);
+        return out;
+      }
+
+      function validateComfyPrompt(out) {
+        var hasSave = false;
+        Object.keys(out).forEach(function (id) {
+          var node = out[id], inputs = node.inputs || {};
+          if (node.class_type === "KSampler") {
+            ["model", "positive", "negative", "latent_image"].forEach(function (k) {
+              if (!inputs[k]) throw new Error("KSampler is missing " + k);
+            });
+          } else if (node.class_type === "VAEDecode") {
+            ["samples", "vae"].forEach(function (k) {
+              if (!inputs[k]) throw new Error("VAEDecode is missing " + k);
+            });
+          } else if (node.class_type === "SaveImage") {
+            hasSave = true;
+            if (!inputs.images) throw new Error("SaveImage is missing images");
+          }
+        });
+        if (!hasSave) throw new Error("workflow needs a SaveImage terminal");
+      }
+
       // ============================================================
       // register the existing 6 built-in node types (no regression)
       // ============================================================
@@ -464,6 +613,7 @@
       S.workflows = {
         register: register,
         graph: function () { if (!built) build(); return graph(); },
+        compile: function () { if (!built) build(); return compileToComfyPrompt(graph()); },
         addNodeByType: function (typeId, x, y) { if (!built) build(); return addNodeByType(typeId, x, y); },
       };
 
@@ -478,11 +628,10 @@
       bus.on("result:ready", function (p) { if (p && p.url) showResult(p.url); });
 
       // ============================================================
-      // Queue -> run via the PROVEN /v1/generate path.
-      //   - If Serenity.wfLower is defined, call it with graph(); it returns a params
-      //     patch (object) which we merge into state.params before submit. A node (e.g.
-      //     the Ideogram-4 bbox node) thus drives the exact render recipe + prompt.
-      //   - Otherwise keep the existing model+prompt toolbar behavior.
+      // Queue -> run through the Rust workflow IR.
+      //   - Legacy wfLower adapters submit as {params:...} under `workflow`, so they
+      //     still pass through lower_request instead of the flat fallback.
+      //   - Built-in nodes compile to a Comfy API prompt graph.
       // ============================================================
       function applyParamsPatch(patch) {
         if (!patch || typeof patch !== "object") return;
@@ -503,9 +652,19 @@
         if (lowered && typeof lowered === "object") {
           applyParamsPatch(lowered);
         } else {
-          // legacy behavior: toolbar model + prompt
           set("params.model", modelSel.value);
           if (promptIn.value.trim()) set("params.prompt", promptIn.value);
+        }
+        var submitGraph;
+        try {
+          submitGraph = lowered && typeof lowered === "object"
+            ? { params: lowered }
+            : compileToComfyPrompt(graph());
+        } catch (e) {
+          endRun(" (failed)");
+          setStatus("⚠ " + (e && e.message ? e.message : e));
+          console.warn("[workflows] compile failed", e);
+          return;
         }
         queue.disabled = true; queue.textContent = "▶ …";
         setStatus("⏳ Starting…");
@@ -536,7 +695,7 @@
             console.error("[workflows] exec error", msg.data);
           }
         });
-        api.submitPrompt(null, ctx.clientId)
+        api.submitPrompt(submitGraph, ctx.clientId)
           .then(function (res) {
             var jid = res && (res.job_id || res.prompt_id);
             console.info("[workflows] generate", jid);

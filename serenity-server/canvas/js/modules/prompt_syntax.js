@@ -23,9 +23,11 @@
    state.params.prompt + .negative, resolve them against the concrete seed, write the
    resolved text back into state.params.{prompt,negative}, stash the originals in
    state.params.{prompt_raw,negative_raw}, MERGE extracted LoRAs into state.params.loras
-   (UI stack wins on name conflict), then defer to the original submitPrompt. After the
-   POST resolves we RESTORE the raw prompt into state.params so the editor keeps showing
-   what the user typed (and the next run re-resolves with a fresh seed).
+   (UI stack wins on name conflict), patch any Comfy workflow graph passed to
+   submitPrompt with the resolved prompt/seed/LoRA chain, then defer to the original
+   submitPrompt. After the POST resolves we RESTORE the raw prompt into state.params
+   so the editor keeps showing what the user typed (and the next run re-resolves with
+   a fresh seed).
 
    Malformed syntax is NEVER fatal: the broken span passes through verbatim and a
    human-readable note is surfaced via bus 'promptSyntax:notes' (and console).
@@ -458,6 +460,192 @@
     return r;
   }
 
+  function isComfyPromptGraph(graph) {
+    return !!(graph && typeof graph === "object" && !Array.isArray(graph));
+  }
+
+  function graphNode(graph, slot) {
+    if (!Array.isArray(slot) || slot.length < 1) return null;
+    return graph[String(slot[0])] || null;
+  }
+
+  function nodeInputs(node) {
+    if (!node || typeof node !== "object") return null;
+    if (!node.inputs || typeof node.inputs !== "object") node.inputs = {};
+    return node.inputs;
+  }
+
+  function findFirstNode(graph, classType) {
+    if (!isComfyPromptGraph(graph)) return null;
+    var keys = Object.keys(graph);
+    keys.sort(function (a, b) { return Number(a) - Number(b); });
+    for (var i = 0; i < keys.length; i++) {
+      var n = graph[keys[i]];
+      if (n && n.class_type === classType) return { id: keys[i], node: n };
+    }
+    return null;
+  }
+
+  function nextNodeId(graph) {
+    var maxId = 0;
+    Object.keys(graph || {}).forEach(function (k) {
+      var n = parseInt(k, 10);
+      if (isFinite(n) && n > maxId) maxId = n;
+    });
+    return maxId + 1;
+  }
+
+  function patchClipText(node, text) {
+    var inputs = nodeInputs(node);
+    if (!inputs) return;
+    inputs.text = text;
+  }
+
+  function loraWeight(l, key, fallback) {
+    if (!l || typeof l !== "object") return fallback;
+    var v = l[key];
+    if (v == null && key === "strength_model") v = l.weight;
+    if (v == null && key === "strength_clip") v = l.weight_clip != null ? l.weight_clip : l.weight;
+    var n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function mergePromptLoras(existingValue, promptLoras) {
+    var out = Array.isArray(existingValue) ? existingValue.slice() : [];
+    var byName = {};
+    out.forEach(function (l) { if (l && l.name) byName[l.name] = true; });
+    (promptLoras || []).forEach(function (l) {
+      if (l && l.name && !byName[l.name]) {
+        out.push(l);
+        byName[l.name] = true;
+      }
+    });
+    return out;
+  }
+
+  function resolveParamsForSubmit(params, bus, opts) {
+    opts = opts || {};
+    params = params && typeof params === "object" ? params : {};
+    var rawPos = params.prompt || "";
+    var rawNeg = params.negative || "";
+    var seed = Number(params.seed);
+    if (!Number.isFinite(seed) || seed < 0) {
+      seed = Math.floor(Math.random() * 0xffffffff);
+    }
+
+    var rPos = resolvePrompt(rawPos, seed);
+    var rNeg = resolvePrompt(rawNeg, seed ^ 0x5bd1e995);
+    var notes = rPos.notes.concat(rNeg.notes);
+    if (opts.emitEvents !== false && notes.length && bus && typeof bus.emit === "function") {
+      console.info("[promptSyntax] notes:", notes.join("; "));
+      bus.emit("promptSyntax:notes", notes);
+    }
+
+    var promptLoras = rPos.loras.concat(rNeg.loras);
+    var existingLoras = Array.isArray(params.loras)
+      ? params.loras.slice()
+      : (Array.isArray(params.lora) ? params.lora.slice() : []);
+    var lorasForParams = mergePromptLoras(existingLoras, promptLoras);
+
+    params.prompt_raw = rawPos;
+    params.negative_raw = rawNeg;
+    params.prompt = rPos.resolved;
+    if (Object.prototype.hasOwnProperty.call(params, "negative") || rNeg.resolved) {
+      params.negative = rNeg.resolved;
+    }
+    params.seed = seed;
+    if (lorasForParams.length) {
+      var key = Array.isArray(params.lora) ? "lora" : "loras";
+      params[key] = lorasForParams;
+    }
+
+    if (opts.emitEvents !== false && bus && typeof bus.emit === "function") {
+      bus.emit("promptSyntax:resolved", {
+        seed: seed, prompt: rPos.resolved, negative: rNeg.resolved,
+        loras: promptLoras, notes: notes,
+      });
+    }
+    return {
+      params: params,
+      seed: seed,
+      rPos: rPos,
+      rNeg: rNeg,
+      promptLoras: promptLoras,
+      lorasForParams: lorasForParams,
+      notes: notes,
+      rawPrompt: rawPos,
+      rawNegative: rawNeg,
+    };
+  }
+
+  function patchWorkflowParamsForSubmit(graph, rPos, rNeg, seed, promptLoras) {
+    var lorasForParams = arguments.length > 5 ? arguments[5] : promptLoras;
+    if (!graph || typeof graph !== "object" || Array.isArray(graph)) return false;
+    var params = graph.params;
+    if (!params || typeof params !== "object" || Array.isArray(params)) return false;
+    var hasPromptJson = Object.prototype.hasOwnProperty.call(params, "prompt_json") && params.prompt_json != null;
+    if (!hasPromptJson || Object.prototype.hasOwnProperty.call(params, "prompt") || rPos.resolved) {
+      params.prompt = rPos.resolved;
+    }
+    if (Object.prototype.hasOwnProperty.call(params, "negative") || rNeg.resolved) {
+      params.negative = rNeg.resolved;
+    }
+    params.seed = seed;
+    if (lorasForParams && lorasForParams.length) {
+      var key = Array.isArray(params.lora) ? "lora" : "loras";
+      params[key] = mergePromptLoras(params[key], lorasForParams);
+    }
+    return true;
+  }
+
+  function patchWorkflowGraphForSubmit(graph, rPos, rNeg, seed, promptLoras) {
+    var lorasForParams = arguments.length > 5 ? arguments[5] : promptLoras;
+    if (patchWorkflowParamsForSubmit(graph, rPos, rNeg, seed, promptLoras, lorasForParams)) return graph;
+    if (!isComfyPromptGraph(graph)) return graph;
+    var samplerRef = findFirstNode(graph, "KSampler");
+    if (!samplerRef) samplerRef = findFirstNode(graph, "KSamplerAdvanced");
+    if (!samplerRef) return graph;
+
+    var samplerInputs = nodeInputs(samplerRef.node);
+    var posNode = graphNode(graph, samplerInputs.positive);
+    var negNode = graphNode(graph, samplerInputs.negative);
+    if (posNode && posNode.class_type === "CLIPTextEncode") patchClipText(posNode, rPos.resolved);
+    if (negNode && negNode.class_type === "CLIPTextEncode") patchClipText(negNode, rNeg.resolved);
+
+    if (samplerRef.node.class_type === "KSamplerAdvanced") samplerInputs.noise_seed = seed;
+    else samplerInputs.seed = seed;
+
+    if (promptLoras && promptLoras.length) {
+      var modelSlot = samplerInputs.model;
+      var clipSlot = null;
+      if (posNode && posNode.inputs) clipSlot = posNode.inputs.clip;
+      if (!clipSlot && negNode && negNode.inputs) clipSlot = negNode.inputs.clip;
+      if (Array.isArray(modelSlot) && Array.isArray(clipSlot)) {
+        var nextId = nextNodeId(graph);
+        promptLoras.forEach(function (l) {
+          if (!l || !l.name) return;
+          var lid = String(nextId++);
+          graph[lid] = {
+            class_type: "LoraLoader",
+            inputs: {
+              model: modelSlot,
+              clip: clipSlot,
+              lora_name: l.name,
+              strength_model: loraWeight(l, "strength_model", 1.0),
+              strength_clip: loraWeight(l, "strength_clip", 1.0),
+            },
+          };
+          modelSlot = [lid, 0];
+          clipSlot = [lid, 1];
+        });
+        samplerInputs.model = modelSlot;
+        if (posNode && posNode.inputs) posNode.inputs.clip = clipSlot;
+        if (negNode && negNode.inputs) negNode.inputs.clip = clipSlot;
+      }
+    }
+    return graph;
+  }
+
   // ---------------------------------------------------------------------------
   // submit-time resolver: wraps Serenity.api.submitPrompt (in our module only).
   // ---------------------------------------------------------------------------
@@ -470,44 +658,31 @@
     api.submitPrompt = function (graph, clientId) {
       var rawPos = get("params.prompt") || "";
       var rawNeg = get("params.negative") || "";
-      // concrete seed: -1 means "random per run"; pick a real one so resolution is
-      // deterministic w.r.t. what we send, and write it back so the worker uses it too.
-      var seed = Number(get("params.seed"));
-      if (!Number.isFinite(seed) || seed < 0) {
-        seed = Math.floor(Math.random() * 0xffffffff);
-      }
-
-      var rPos = resolvePrompt(rawPos, seed);
-      var rNeg = resolvePrompt(rawNeg, seed ^ 0x5bd1e995);
-
-      var notes = rPos.notes.concat(rNeg.notes);
-      if (notes.length) {
-        console.info("[promptSyntax] notes:", notes.join("; "));
-        bus.emit("promptSyntax:notes", notes);
-      }
-
-      // merge prompt LoRAs into the UI stack; UI stack WINS on name conflict.
-      var promptLoras = rPos.loras.concat(rNeg.loras);
-      if (promptLoras.length) {
-        var existing = Array.isArray(get("params.loras")) ? get("params.loras").slice() : [];
-        var byName = {};
-        existing.forEach(function (l) { if (l && l.name) byName[l.name] = true; });
-        promptLoras.forEach(function (l) { if (!byName[l.name]) { existing.push(l); byName[l.name] = true; } });
-        set("params.loras", existing);
-      }
+      var existingLoras = Array.isArray(get("params.loras")) ? get("params.loras").slice() : [];
+      var resolved = resolveParamsForSubmit({
+        prompt: rawPos,
+        negative: rawNeg,
+        seed: get("params.seed"),
+        loras: existingLoras,
+      }, bus, { emitEvents: true });
+      if (resolved.promptLoras.length) set("params.loras", resolved.lorasForParams);
 
       // stash raw + write resolved so api.generateBody picks up the resolved text.
       set("params.prompt_raw", rawPos);
       set("params.negative_raw", rawNeg);
-      if (rPos.hadSyntax || rPos.resolved !== rawPos) set("params.prompt", rPos.resolved);
-      if (rNeg.hadSyntax || rNeg.resolved !== rawNeg) set("params.negative", rNeg.resolved);
+      if (resolved.rPos.hadSyntax || resolved.rPos.resolved !== rawPos) set("params.prompt", resolved.rPos.resolved);
+      if (resolved.rNeg.hadSyntax || resolved.rNeg.resolved !== rawNeg) set("params.negative", resolved.rNeg.resolved);
       // pin the concrete seed we resolved against (so wildcards/randoms match the gen)
-      set("params.seed", seed);
+      set("params.seed", resolved.seed);
 
-      bus.emit("promptSyntax:resolved", {
-        seed: seed, prompt: rPos.resolved, negative: rNeg.resolved,
-        loras: promptLoras, notes: notes,
-      });
+      patchWorkflowGraphForSubmit(
+        graph,
+        resolved.rPos,
+        resolved.rNeg,
+        resolved.seed,
+        resolved.promptLoras,
+        resolved.lorasForParams,
+      );
 
       var restore = function () {
         // put the human-typed prompt back so the editor isn't clobbered; the next
@@ -811,6 +986,7 @@
       // and to resolve/preview a prompt without submitting.
       S.promptSyntax = {
         resolve: function (prompt, seed) { return resolvePrompt(prompt, seed == null ? 0 : seed); },
+        resolveParamsForSubmit: function (params, opts) { return resolveParamsForSubmit(params, ctx.bus, opts || {}); },
         openWildcardManager: function () { mgr.open(); },
         getWildcards: function () { return wildcards; },
         refreshLoras: ac.refreshLoras,

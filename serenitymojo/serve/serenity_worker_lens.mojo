@@ -25,12 +25,10 @@
 #   child->parent : {"ev":"ready"} | progress | done | failed | cancelled
 #
 # NOTE (carried from lens_backend.mojo): the REAL text encode depends on
-# models/text_encoder/gpt_oss_encoder.mojo, whose parity gate is BLOCKED by an
-# open BF16→F32 cast bug in _moe (gated_scatter_add requires F32). Until that
-# one-line fix lands, the FIRST job will fail-loud at the encode tick with
-# "gated_scatter_add: expert_out and accum must be F32" (surfaced as a `failed`
-# event, not a silent zeroed-text fallback). The worker loop itself is unaffected
-# and stays alive for the next command.
+# models/text_encoder/gpt_oss_encoder.mojo. The earlier BF16->F32 MoE scatter
+# crash has been fixed there, but GPT-OSS parity is still unaccepted, so Lens
+# must stay fail-loud and experimentally gated until its render/OOM/parity
+# evidence exists.
 
 from std.sys import argv
 from std.time import sleep

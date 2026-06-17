@@ -117,6 +117,14 @@ status while returning `serenity.generate.error.v1` with `admitted:false`,
 `rejection_stage:"workflow_lowering"`, and the selected `capability_profile`
 when a top-level model is present.
 
+Workflow-lowered image routes that fail after lowering, including blocked model
+families, unsupported dimensions/samplers, missing artifacts, or disabled
+feature fields, keep `workflow_route_kind` and `workflow_plan` in both
+`/v1/preflight` and `/v1/generate` responses and use
+`rejection_stage:"workflow_capability"`. This distinguishes "the graph lowered
+to an image route but the product surface rejected it" from graph-lowering and
+route-dispatch failures.
+
 `/v1/grid` is not a separate capability surface. It expands to one generate job
 per cell, so direct grid requests use the same guards before any cell is
 enqueued. If the request includes `workflow`, grid first lowers it through the
@@ -254,6 +262,11 @@ When the disabled field was produced by workflow lowering, the report keeps the
 workflow route context and uses `rejection_stage:"workflow_capability"` so the
 caller can distinguish "graph lowered correctly, feature not admitted" from
 `workflow_lowering` and `workflow_route` failures.
+The same workflow-capability stage is used for workflow-lowered blocked models,
+unsupported product shapes/samplers, and artifact/prequeue failures; for
+example, a Comfy-style `CheckpointLoaderSimple` graph selecting `flux1-dev`
+lowers to an image route and then fails with backend `flux`,
+`production_status:"blocked"`, and the Flux 1024 OOM gate reason.
 Direct `/v1/grid` posts use the same no-enqueue contract. If a grid workflow
 lowers into a disabled surface, Grid now uses the same `workflow_capability`
 stage and preserves `workflow_plan` instead of collapsing the error into a raw

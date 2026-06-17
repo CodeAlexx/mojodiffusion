@@ -72,9 +72,12 @@ is accepted.
 enqueue with `serenity.generate.error.v1`. The body preserves the top-level
 `error` string for simple clients and adds `same_gate_as_preflight:true`,
 `enqueue_blocked:true`, `capability_profile`, and `rejection_stage` for workflow
-lowering failures. Unsupported graph nodes still return HTTP 501; raw disabled
-features and post-parse prequeue failures return HTTP 400 unless their parser
-stage has a more specific status.
+failures. Unsupported graph nodes still return HTTP 501. If a workflow lowers to
+an image route but fails model admission, size/sampler policy, artifact gates, or
+disabled feature policy, the response keeps `workflow_plan` and marks
+`rejection_stage:"workflow_capability"` instead of collapsing into a flat
+request error. Raw disabled features and post-parse prequeue failures return
+HTTP 400 unless their parser stage has a more specific status.
 
 Workflow bodies are lowered through the Rust graph IR before the image job shape
 is built. The lowered request carries `workflow_route_kind` and

@@ -1857,6 +1857,23 @@ fn attach_workflow_route_metadata(report: &mut JsonValue, req: &JsonValue) {
     }
 }
 
+fn attach_workflow_capability_metadata(report: &mut JsonValue, req: &JsonValue) {
+    let Some(map) = report.as_object_mut() else {
+        return;
+    };
+    map.insert(
+        "production_gate".to_string(),
+        json!("workflow_lowering_then_validate_generate_prequeue"),
+    );
+    map.insert("rejection_stage".to_string(), json!("workflow_capability"));
+    if let Some(route) = req.get("workflow_route_kind") {
+        map.insert("workflow_route_kind".to_string(), route.clone());
+    }
+    if let Some(plan) = req.get("workflow_plan") {
+        map.insert("workflow_plan".to_string(), plan.clone());
+    }
+}
+
 // ── handlers ──────────────────────────────────────────────────────────────────
 
 /// POST /v1/preflight — run the same production prequeue gate as /v1/generate,
@@ -1933,7 +1950,11 @@ async fn post_preflight(
     let (params, hires_scale, _) = params_from_generate_request(req, "preflight", &out_dir);
     let mut report = generate_preflight_report(&params, hires_scale);
     if has_workflow {
-        attach_workflow_route_metadata(&mut report, &req_value);
+        if report.get("admitted").and_then(JsonValue::as_bool) == Some(false) {
+            attach_workflow_capability_metadata(&mut report, &req_value);
+        } else {
+            attach_workflow_route_metadata(&mut report, &req_value);
+        }
     }
     (StatusCode::OK, Json(report)).into_response()
 }
@@ -2037,11 +2058,11 @@ async fn post_generate(
         params_from_generate_request(req, &job_id, &out_dir);
 
     if validate_generate_runtime_ready(&params, hires_scale).is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(generate_prequeue_error_report(&params, hires_scale)),
-        )
-            .into_response();
+        let mut report = generate_prequeue_error_report(&params, hires_scale);
+        if has_workflow {
+            attach_workflow_capability_metadata(&mut report, &genparams_value);
+        }
+        return (StatusCode::BAD_REQUEST, Json(report)).into_response();
     }
 
     // Build the genparams the worker embeds in the PNG tEXt: the lowered request +
@@ -3231,6 +3252,53 @@ mod endpoint_tests {
             validate_generate_prequeue(&params, 1.0).unwrap(),
             ModelFamily::ZImage
         );
+    }
+
+    #[test]
+    fn workflow_lifted_prequeue_rejections_keep_route_context() {
+        let mut params = valid_t2i_params("flux-dev");
+        params.width = 1024;
+        params.height = 1024;
+        params.steps = 20;
+        let lowered_workflow = json!({
+            "model": "flux-dev",
+            "prompt": "workflow blocked flux",
+            "workflow_route_kind": "image",
+            "workflow_plan": {
+                "schema": "serenity.workflow_plan.v1",
+                "route_kind": "image",
+                "source": "comfy_api_prompt_graph",
+                "terminal_nodes": [{"node_id": 9, "type": "SaveImage", "kind": "image"}]
+            }
+        });
+
+        let mut preflight = generate_preflight_report(&params, 1.0);
+        attach_workflow_capability_metadata(&mut preflight, &lowered_workflow);
+        assert_eq!(preflight["schema"], "serenity.generate.preflight.v1");
+        assert_eq!(preflight["admitted"], false);
+        assert_eq!(preflight["rejection_stage"], "workflow_capability");
+        assert_eq!(preflight["workflow_route_kind"], "image");
+        assert_eq!(
+            preflight["workflow_plan"]["source"],
+            "comfy_api_prompt_graph"
+        );
+        assert_eq!(preflight["capability_profile"]["backend"], "flux");
+        assert_eq!(
+            preflight["capability_profile"]["production_status"],
+            "blocked"
+        );
+
+        let mut generate = generate_prequeue_error_report(&params, 1.0);
+        attach_workflow_capability_metadata(&mut generate, &lowered_workflow);
+        assert_eq!(generate["schema"], "serenity.generate.error.v1");
+        assert_eq!(generate["same_gate_as_preflight"], true);
+        assert_eq!(generate["enqueue_blocked"], true);
+        assert_eq!(generate["rejection_stage"], "workflow_capability");
+        assert_eq!(generate["workflow_plan"]["route_kind"], "image");
+        assert!(generate["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CUDA OOM at 15/20 steps"));
     }
 
     #[test]

@@ -37,8 +37,14 @@ The same `output_location` block is attached to `/v1/job/:id`, `/v1/jobs`,
 `/v1/gallery/:id`, and each `/v1/gallery` item when an output path exists.
 
 Current admitted image workers are Z-Image, Ideogram4, SDXL, Anima, SD3,
-Flux.1-dev, Klein/Flux2, and SenseNova-U1. SenseNova is intentionally bounded
-to shape-dispatched 512x512 and 1024x1024 txt2img, no negative prompt, no LoRA,
+Klein/Flux2, and SenseNova-U1. Generic Flux.1-dev is blocked from
+`/v1/generate` after the real browser workflow gate reached the Flux worker at
+1024x1024/20 steps and failed with CUDA OOM at 15/20 on 2026-06-17. Chroma is
+also blocked because the current Mojo path requires pre-encoded T5 sidecars and
+has no production-admitted Rust-server worker route. Both remain visible through
+blocked capability profiles so the UI/API fail loudly instead of falling back to
+another image model. SenseNova is intentionally bounded to shape-dispatched
+512x512 and 1024x1024 txt2img, no negative prompt, no LoRA,
 no img2img/inpaint/masks, no VAE override, and no variation noise; it dispatches
 to `serenity_worker_sensenova`. The installed worker was rebuilt through the
 capped `build-worker-sensenova-raw` path and writes
@@ -112,8 +118,10 @@ Rust classifier. When a request needs a different backend worker, the driver
 swaps to the matching `serenity_worker_<family>` binary. If that target binary is
 missing, the job fails loudly instead of running on the previous resident model.
 The classifier accepts common production aliases, including `flux-2`/`klein`
-for the bounded Klein 9B `flux2` route and `sdxl`/`sd_xl`/`sd-xl`/`sd xl` for
-SDXL. The browser adapter uses the same backend mapping and `/v1/capabilities`
+for the bounded Klein 9B `flux2` route, `chroma` for the blocked Chroma route,
+generic `flux` for the blocked Flux.1-dev route, and
+`sdxl`/`sd_xl`/`sd-xl`/`sd xl` for SDXL. The browser adapter uses the same
+backend mapping and `/v1/capabilities`
 defaults before it enforces model limits, so model selection adjusts
 width/height, steps, CFG, sampler, and scheduler before the workflow graph is
 submitted. Current SenseNova browser defaults are 1024x1024, 30 steps,

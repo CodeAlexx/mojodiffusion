@@ -563,8 +563,16 @@ server `output_root` that `/v1/generate` will use for the submitted request.
 
 The supported text-to-image matrix gate is
 `scripts/check_serenity_supported_generate_matrix.js`. It runs the browser gate
-sequentially for every `/v1/capabilities` backend admitted for text-to-image:
-Z-Image, Ideogram4, SDXL, Anima, SD3, Flux.1-dev, Klein/Flux2, and SenseNova.
+sequentially for every `/v1/capabilities` backend admitted for text-to-image.
+The default case set is filtered by the live capabilities response; explicitly
+selecting a blocked case with `SERENITY_MATRIX_CASES` fails before generation.
+Current admitted families are Z-Image, Ideogram4, SDXL, Anima, SD3,
+Klein/Flux2, and SenseNova. Generic Flux.1-dev is no longer in the admitted
+matrix: a 2026-06-17 browser workflow run reached `serenity_worker_flux` at
+1024x1024/20 steps and failed with CUDA OOM at 15/20. Chroma is also blocked
+because the current Mojo sampler path requires pre-encoded T5 sidecars and has
+no production-admitted Rust-server worker route. Both families must stay
+fail-loud until their real product gates pass.
 It then verifies the product result endpoint for each generated job. The matrix
 now also requires
 `/v1/job/:id/result.output_location.inside_root:true` and the matching server

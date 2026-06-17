@@ -382,6 +382,7 @@ async function main() {
       await Serenity.api.capabilities(true);
       const apiBackendKlein = Serenity.api.backendForModelName("flux-2-klein-base-9b_fp8_e4m3fn");
       const apiBackendSdxl = Serenity.api.backendForModelName("sd_xl_base_1.0");
+      const apiBackendChroma = Serenity.api.backendForModelName("chroma1_hd_bf16");
       const apiBackendSensenova = Serenity.api.backendForModelName("sensenova-u1");
 
       Serenity.set("params.width", 1024);
@@ -394,6 +395,20 @@ async function main() {
         backend: apiBackendKlein,
         width: Serenity.get("params.width"),
         height: Serenity.get("params.height"),
+        scheduler: Serenity.get("params.scheduler"),
+      };
+
+      Serenity.set("params.width", 512);
+      Serenity.set("params.height", 512);
+      Serenity.set("params.steps", 8);
+      Serenity.set("params.scheduler", "normal");
+      Serenity.set("params.model", "chroma1_hd_bf16");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const chroma = {
+        backend: apiBackendChroma,
+        width: Serenity.get("params.width"),
+        height: Serenity.get("params.height"),
+        steps: Serenity.get("params.steps"),
         scheduler: Serenity.get("params.scheduler"),
       };
 
@@ -420,7 +435,7 @@ async function main() {
         height: Serenity.get("params.height"),
         scheduler: Serenity.get("params.scheduler"),
       };
-      return { klein, sensenova, sdxl };
+      return { klein, chroma, sensenova, sdxl };
     });
     assert(
       capabilityState.klein.backend === "flux2",
@@ -433,6 +448,22 @@ async function main() {
     assert(
       capabilityState.klein.scheduler === "simple",
       `Klein scheduler should remain simple: ${JSON.stringify(capabilityState.klein)}`,
+    );
+    assert(
+      capabilityState.chroma.backend === "chroma",
+      `Chroma model was not classified as chroma: ${JSON.stringify(capabilityState)}`,
+    );
+    assert(
+      capabilityState.chroma.width === 1024 && capabilityState.chroma.height === 1024,
+      `Chroma fallback defaults did not stay on its own 1024x1024 blocked route: ${JSON.stringify(capabilityState.chroma)}`,
+    );
+    assert(
+      capabilityState.chroma.steps === 30,
+      `Chroma fallback defaults did not select 30 steps: ${JSON.stringify(capabilityState.chroma)}`,
+    );
+    assert(
+      capabilityState.chroma.scheduler === "simple",
+      `Chroma scheduler should normalize to simple: ${JSON.stringify(capabilityState.chroma)}`,
     );
     assert(
       capabilityState.sensenova.backend === "sensenova",

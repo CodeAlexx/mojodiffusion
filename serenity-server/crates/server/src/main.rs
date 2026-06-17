@@ -2943,7 +2943,6 @@ mod endpoint_tests {
             ("sd_xl_base_1.0", "sdxl", "serenity_worker_sdxl"),
             ("anima", "anima", "serenity_worker_anima"),
             ("sd3.5-large", "sd3", "serenity_worker_sd3"),
-            ("flux-dev", "flux", "serenity_worker_flux"),
             ("klein-9b", "flux2", "serenity_worker_klein"),
             ("sensenova-u1", "sensenova", "serenity_worker_sensenova"),
         ];
@@ -2963,6 +2962,8 @@ mod endpoint_tests {
             "qwen-image-edit",
             "klein-4b",
             "flux2-dev",
+            "flux-dev",
+            "chroma1_hd_bf16",
             "microsoft-lens",
         ] {
             assert!(
@@ -3037,7 +3038,6 @@ mod endpoint_tests {
             ("sd_xl_base_1.0", ModelFamily::Sdxl),
             ("anima", ModelFamily::Anima),
             ("sd3.5-large", ModelFamily::Sd3),
-            ("flux-dev", ModelFamily::Flux),
             ("klein-9b", ModelFamily::Flux2),
             ("sensenova-u1", ModelFamily::Sensenova),
         ];
@@ -3061,6 +3061,16 @@ mod endpoint_tests {
         assert!(validate_generate_prequeue(&params, 1.0)
             .unwrap_err()
             .contains("admitted product shapes"));
+
+        params = valid_t2i_params("chroma1_hd_bf16");
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("pre-encoded T5 sidecars"));
+
+        params = valid_t2i_params("flux-dev");
+        assert!(validate_generate_prequeue(&params, 1.0)
+            .unwrap_err()
+            .contains("CUDA OOM at 15/20 steps"));
 
         params = valid_t2i_params("zimage");
         params.width = 256;
@@ -3119,12 +3129,6 @@ mod endpoint_tests {
             .unwrap_err()
             .contains("metadata/preflight-only"));
 
-        params = valid_t2i_params("flux-dev");
-        params.negative = "low quality".to_string();
-        assert!(validate_generate_prequeue(&params, 1.0)
-            .unwrap_err()
-            .contains("negative prompt"));
-
         params = valid_t2i_params("zimage");
         params.init_image = "/tmp/init.png".to_string();
         assert!(validate_generate_prequeue(&params, 1.0)
@@ -3153,7 +3157,10 @@ mod endpoint_tests {
         assert_eq!(report["same_gate_as_generate"], true);
         assert_eq!(report["backend"], "");
         assert_eq!(report["output_root"]["root_kind"], "ui_workflow_gallery");
-        assert_eq!(report["output_root"]["root"], "/tmp/serenity_product_gallery");
+        assert_eq!(
+            report["output_root"]["root"],
+            "/tmp/serenity_product_gallery"
+        );
         assert_eq!(report["output_root"]["artifact_pattern"], "job-XXXX.png");
         assert_eq!(
             report["capability_profile"]["schema"],
@@ -3322,18 +3329,12 @@ mod endpoint_tests {
         let doc = generate_capabilities_v1();
         assert_eq!(doc["schema"], "serenity.capabilities.v1");
         assert_eq!(doc["same_gate_as_generate"], true);
-        assert_eq!(
-            doc["output_contract"]["root_kind"],
-            "ui_workflow_gallery"
-        );
+        assert_eq!(doc["output_contract"]["root_kind"], "ui_workflow_gallery");
         assert_eq!(
             doc["output_contract"]["default_relative_root"],
             "output/run_serenity_ui"
         );
-        assert_eq!(
-            doc["output_contract"]["location_field"],
-            "output_location"
-        );
+        assert_eq!(doc["output_contract"]["location_field"], "output_location");
         assert_eq!(doc["global_limits"]["txt2img_only"], true);
         assert_eq!(doc["global_limits"]["image_to_image"], false);
         assert_eq!(
@@ -3355,7 +3356,6 @@ mod endpoint_tests {
             "sdxl",
             "anima",
             "sd3",
-            "flux",
             "flux2",
             "sensenova",
         ] {
@@ -3388,11 +3388,6 @@ mod endpoint_tests {
         assert_eq!(ideogram["features"]["bbox_prompt_json"]["supported"], true);
         assert_eq!(ideogram["features"]["negative_prompt"]["supported"], false);
 
-        let flux = backend("flux");
-        assert_eq!(flux["features"]["lora"]["max_count"], 1);
-        assert_eq!(flux["features"]["multi_lora"]["supported"], false);
-        assert_eq!(flux["features"]["negative_prompt"]["supported"], false);
-
         let flux2 = backend("flux2");
         assert_eq!(flux2["worker_binary"], "serenity_worker_klein");
         assert_eq!(flux2["defaults"]["width"], 512);
@@ -3403,10 +3398,7 @@ mod endpoint_tests {
         assert_eq!(flux2["features"]["negative_prompt"]["supported"], false);
 
         let sensenova = backend("sensenova");
-        assert_eq!(
-            sensenova["worker_binary"],
-            "serenity_worker_sensenova"
-        );
+        assert_eq!(sensenova["worker_binary"], "serenity_worker_sensenova");
         assert_eq!(sensenova["defaults"]["width"], 1024);
         assert_eq!(sensenova["defaults"]["height"], 1024);
         assert_eq!(sensenova["defaults"]["steps"], 30);
@@ -3418,10 +3410,7 @@ mod endpoint_tests {
         assert_eq!(sensenova["limits"]["sizes"][1]["height"], 1024);
         assert_eq!(sensenova["limits"]["resolution"]["mode"], "shape_dispatch");
         assert_eq!(sensenova["features"]["lora"]["supported"], false);
-        assert_eq!(
-            sensenova["features"]["negative_prompt"]["supported"],
-            false
-        );
+        assert_eq!(sensenova["features"]["negative_prompt"]["supported"], false);
 
         let zimage_profile = capability_profile_for_model("z-image");
         assert_eq!(zimage_profile["schema"], "serenity.capability_profile.v1");
@@ -3444,6 +3433,19 @@ mod endpoint_tests {
             qwen_profile["features"]["image_to_image"]["policy"],
             "fail_loud"
         );
+
+        let flux_profile = capability_profile_for_model("flux1-dev");
+        assert_eq!(flux_profile["schema"], "serenity.capability_profile.v1");
+        assert_eq!(flux_profile["backend"], "flux");
+        assert_eq!(flux_profile["production_status"], "blocked");
+        assert_eq!(
+            flux_profile["features"]["text_to_image"]["supported"],
+            false
+        );
+        assert!(flux_profile["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CUDA OOM at 15/20 steps"));
     }
 
     // Locks the daemon-parity shapes (verified byte-identical vs `serenity_daemon

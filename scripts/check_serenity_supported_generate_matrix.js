@@ -162,8 +162,9 @@ function firstExisting(candidates) {
   return "";
 }
 
-function selectedCases() {
-  if (!CASE_FILTER.size) return CASES;
+function selectedCases(admittedBackends) {
+  const admitted = new Set(admittedBackends || []);
+  if (!CASE_FILTER.size) return CASES.filter((c) => admitted.has(c.backend));
   return CASES.filter((c) => CASE_FILTER.has(c.id) || CASE_FILTER.has(c.model));
 }
 
@@ -318,12 +319,18 @@ async function admittedTextToImageBackends() {
 }
 
 async function main() {
-  const cases = selectedCases();
-  if (!cases.length) throw new Error(`no selected cases match SERENITY_MATRIX_CASES=${process.env.SERENITY_MATRIX_CASES || ""}`);
   const admittedBackends = await admittedTextToImageBackends();
+  const cases = selectedCases(admittedBackends);
+  if (!cases.length) throw new Error(`no selected cases match SERENITY_MATRIX_CASES=${process.env.SERENITY_MATRIX_CASES || ""}`);
+  const explicitFilter = CASE_FILTER.size > 0;
+  if (explicitFilter) {
+    const blocked = cases.filter((c) => admittedBackends.indexOf(c.backend) < 0);
+    if (blocked.length) {
+      throw new Error(`selected cases are not admitted text-to-image backends: ${blocked.map((c) => `${c.id}(${c.backend})`).join(", ")}`);
+    }
+  }
   const selectedBackends = new Set(cases.map((c) => c.backend));
   const missing = admittedBackends.filter((backend) => !selectedBackends.has(backend));
-  const explicitFilter = CASE_FILTER.size > 0;
   if (missing.length && !explicitFilter) {
     throw new Error(`matrix missing admitted text-to-image backend cases: ${missing.join(", ")}`);
   }

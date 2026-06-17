@@ -48,6 +48,8 @@ struct BlockedModelInfo {
     reason: &'static str,
 }
 
+const FLUX1_BLOCK_REASON: &str = "Flux.1-dev reached the Rust-server workflow worker at 1024x1024/20 steps but failed the browser generation gate with CUDA OOM at 15/20 steps on 2026-06-17; keep blocked until the real worker memory gate passes";
+
 fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
     let m = normalized_model;
     if m.contains("qwen") && m.contains("edit") {
@@ -88,6 +90,25 @@ fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
             backend: "flux2",
             production_status: "blocked",
             reason: "Flux2 generation is admitted only for the bounded Klein 9B txt2img route; generic Flux2 model names remain blocked",
+        });
+    }
+    if m.contains("flux")
+        && !m.contains("klein")
+        && !m.contains("flux2")
+        && !m.contains("flux-2")
+        && !m.contains("flux_2")
+    {
+        return Some(BlockedModelInfo {
+            backend: "flux",
+            production_status: "blocked",
+            reason: FLUX1_BLOCK_REASON,
+        });
+    }
+    if m.contains("chroma") {
+        return Some(BlockedModelInfo {
+            backend: "chroma",
+            production_status: "blocked",
+            reason: "Chroma has Mojo sampler/runtime pieces, but the current path requires pre-encoded T5 sidecars and no Rust-server worker is production-admitted yet",
         });
     }
     if m.contains("lens") || m.contains("microsoft_lens") || m.contains("microsoft-lens") {
@@ -357,10 +378,9 @@ fn supported_schedulers_for_family(family: ModelFamily) -> &'static [&'static st
         ModelFamily::ZImage => SCHEDULERS_ZIMAGE,
         ModelFamily::Ideogram4 => SCHEDULERS_IDEOGRAM4,
         ModelFamily::Sdxl | ModelFamily::Anima => SCHEDULERS_NORMAL,
-        ModelFamily::Sd3
-        | ModelFamily::Flux
-        | ModelFamily::Flux2
-        | ModelFamily::Sensenova => SCHEDULERS_SIMPLE,
+        ModelFamily::Sd3 | ModelFamily::Flux | ModelFamily::Flux2 | ModelFamily::Sensenova => {
+            SCHEDULERS_SIMPLE
+        }
     }
 }
 
@@ -1291,7 +1311,6 @@ pub(crate) fn generate_capabilities_v1() -> JsonValue {
         ModelFamily::Sdxl,
         ModelFamily::Anima,
         ModelFamily::Sd3,
-        ModelFamily::Flux,
         ModelFamily::Flux2,
         ModelFamily::Sensenova,
     ];
@@ -1336,6 +1355,18 @@ pub(crate) fn generate_capabilities_v1() -> JsonValue {
                 "production_status": "blocked",
                 "policy": "fail_loud",
                 "reason": "Z-Image L2P has runtime pieces but no production serenity-server worker route yet."
+            },
+            {
+                "backend": "flux",
+                "production_status": "blocked",
+                "policy": "fail_loud",
+                "reason": FLUX1_BLOCK_REASON
+            },
+            {
+                "backend": "chroma",
+                "production_status": "blocked",
+                "policy": "fail_loud",
+                "reason": "Chroma is not admitted until the Rust server has a real worker path with live text conditioning or an explicitly sidecar-scoped UI/API contract."
             },
             {
                 "backend": "video",

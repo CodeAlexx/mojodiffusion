@@ -39,6 +39,7 @@
     sd3: [[1024, 1024]],
     flux: [[1024, 1024]],
     flux2: [[512, 512]],
+    chroma: [[1024, 1024]],
     sensenova: [[1024, 1024], [512, 512]],
   };
   var FALLBACK_DEFAULTS = {
@@ -50,6 +51,7 @@
     sd3: { width: 1024, height: 1024, steps: 28, cfg: 4.5, sampler: "euler", scheduler: "simple" },
     flux: { width: 1024, height: 1024, steps: 20, cfg: 4.0, sampler: "euler", scheduler: "simple" },
     flux2: { width: 512, height: 512, steps: 4, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    chroma: { width: 1024, height: 1024, steps: 30, cfg: 3.5, sampler: "euler", scheduler: "simple" },
     sensenova: { width: 1024, height: 1024, steps: 30, cfg: 4.0, sampler: "euler", scheduler: "simple" },
   };
 
@@ -65,6 +67,7 @@
     if (m.indexOf("sd3") >= 0 || m.indexOf("sd35") >= 0 || m.indexOf("sd3.5") >= 0) return "sd3";
     if (m.indexOf("flux2") >= 0 || m.indexOf("flux-2") >= 0 || m.indexOf("flux_2") >= 0 || m.indexOf("klein") >= 0) return "flux2";
     if (m.indexOf("flux") >= 0) return "flux";
+    if (m.indexOf("chroma") >= 0) return "chroma";
     if (m.indexOf("sensenova") >= 0 || m.indexOf("sense_nova") >= 0 || m.indexOf("sense-nova") >= 0) return "sensenova";
     if (m.indexOf("zimage") >= 0 || m.indexOf("z-image") >= 0 || m.indexOf("z_image") >= 0) return "zimage";
     return "zimage";

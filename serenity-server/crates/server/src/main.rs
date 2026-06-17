@@ -3091,7 +3091,7 @@ mod endpoint_tests {
         params = valid_t2i_params("flux-dev");
         assert!(validate_generate_prequeue(&params, 1.0)
             .unwrap_err()
-            .contains("CUDA OOM at 15/20 steps"));
+            .contains("CUDA OOM at 6/20"));
 
         params = valid_t2i_params("zimage");
         params.width = 256;
@@ -3298,7 +3298,7 @@ mod endpoint_tests {
         assert!(generate["error"]
             .as_str()
             .unwrap_or("")
-            .contains("CUDA OOM at 15/20 steps"));
+            .contains("CUDA OOM at 6/20"));
     }
 
     #[test]
@@ -3513,7 +3513,7 @@ mod endpoint_tests {
         assert!(flux_profile["reason"]
             .as_str()
             .unwrap_or("")
-            .contains("CUDA OOM at 15/20 steps"));
+            .contains("CUDA OOM at 6/20"));
     }
 
     // Locks the daemon-parity shapes (verified byte-identical vs `serenity_daemon

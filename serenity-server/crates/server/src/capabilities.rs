@@ -48,7 +48,7 @@ struct BlockedModelInfo {
     reason: &'static str,
 }
 
-const FLUX1_BLOCK_REASON: &str = "Flux.1-dev reached the Rust-server workflow worker at 1024x1024/20 steps but failed the browser generation gate with CUDA OOM at 15/20 steps on 2026-06-17; keep blocked until the real worker memory gate passes";
+const FLUX1_BLOCK_REASON: &str = "Flux.1-dev reached the Rust-server browser workflow worker at 1024x1024/20 steps but failed with CUDA OOM at 6/20 on 2026-06-17 after the worker reached about 22.3 GiB VRAM; keep blocked until the real worker memory gate passes";
 
 fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
     let m = normalized_model;

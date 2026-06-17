@@ -839,13 +839,13 @@ mod tests {
         assert_eq!(single["visual_health"]["status"], "pass");
         assert_eq!(single["metadata"]["visual_health"]["status"], "pass");
         let located = attach_output_location(single.clone(), &r.output_path, &dir);
-        assert_eq!(located["output_location"]["root_kind"], "ui_workflow_gallery");
+        assert_eq!(
+            located["output_location"]["root_kind"],
+            "ui_workflow_gallery"
+        );
         assert_eq!(located["output_location"]["inside_root"], true);
         assert_eq!(located["output_location"]["relative_path"], "job-0090.png");
-        assert_eq!(
-            located["metadata"]["output_location"]["inside_root"],
-            true
-        );
+        assert_eq!(located["metadata"]["output_location"]["inside_root"], true);
 
         let wrong_dims =
             attach_visual_health(single, &r.output_path, r#"{"width":512,"height":512}"#);

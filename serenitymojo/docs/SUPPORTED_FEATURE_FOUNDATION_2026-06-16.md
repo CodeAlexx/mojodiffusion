@@ -266,7 +266,8 @@ The same workflow-capability stage is used for workflow-lowered blocked models,
 unsupported product shapes/samplers, and artifact/prequeue failures; for
 example, a Comfy-style `CheckpointLoaderSimple` graph selecting `flux1-dev`
 lowers to an image route and then fails with backend `flux`,
-`production_status:"blocked"`, and the Flux 1024 OOM gate reason.
+`production_status:"blocked"`, and the current Flux 1024x1024/20-step OOM gate
+reason.
 Direct `/v1/grid` posts use the same no-enqueue contract. If a grid workflow
 lowers into a disabled surface, Grid now uses the same `workflow_capability`
 stage and preserves `workflow_plan` instead of collapsing the error into a raw
@@ -580,12 +581,12 @@ sequentially for every `/v1/capabilities` backend admitted for text-to-image.
 The default case set is filtered by the live capabilities response; explicitly
 selecting a blocked case with `SERENITY_MATRIX_CASES` fails before generation.
 Current admitted families are Z-Image, Ideogram4, SDXL, Anima, SD3,
-Klein/Flux2, and SenseNova. Generic Flux.1-dev is no longer in the admitted
-matrix: a 2026-06-17 browser workflow run reached `serenity_worker_flux` at
-1024x1024/20 steps and failed with CUDA OOM at 15/20. Chroma is also blocked
-because the current Mojo sampler path requires pre-encoded T5 sidecars and has
-no production-admitted Rust-server worker route. Both families must stay
-fail-loud until their real product gates pass.
+Klein/Flux2, and SenseNova. Generic Flux.1-dev is blocked: a 2026-06-17 browser
+workflow run reached `serenity_worker_flux` at 1024x1024/20 steps and failed
+with CUDA OOM at 6/20 after the worker reached about 22.3 GiB VRAM. Chroma is
+also blocked because the current Mojo sampler path requires pre-encoded T5
+sidecars and has no production-admitted Rust-server worker route. Both families
+must stay fail-loud until their real product gates pass.
 It then verifies the product result endpoint for each generated job. The matrix
 now also requires
 `/v1/job/:id/result.output_location.inside_root:true` and the matching server

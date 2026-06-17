@@ -51,8 +51,11 @@ API_REQUIRED = (
     "function capabilities(force)",
     "capabilities: capabilities",
     "function backendForModelName(model)",
+    "function defaultsForBackend(backend)",
+    "function defaultsForModel(model)",
     "m.indexOf(\"flux2\") >= 0 || m.indexOf(\"flux-2\") >= 0",
     "m.indexOf(\"flux_2\") >= 0 || m.indexOf(\"klein\") >= 0) return \"flux2\"",
+    "m.indexOf(\"sensenova\") >= 0 || m.indexOf(\"sense_nova\") >= 0",
     "m.indexOf(\"sdxl\") >= 0 || m.indexOf(\"sd_xl\") >= 0",
     "m.indexOf(\"sd-xl\") >= 0 || m.indexOf(\"sd xl\") >= 0",
     "function normalizeModelName(model)",
@@ -60,7 +63,7 @@ API_REQUIRED = (
     "function featureSupportedForModel(model, featureName, fallback)",
     "function anyFeatureSupportedForModel(model, featureNames, fallback)",
     "prompt_raw: p.prompt_raw || '', negative_raw: p.negative_raw || ''",
-    "denoise: 1.0",
+    "denoise: p.denoise != null ? p.denoise : 1.0",
     "refiner: null",
     "hires_scale: 1.0, hires_denoise: 0.4",
     "init_image: '', mask_image: ''",
@@ -73,7 +76,6 @@ API_REQUIRED = (
 )
 
 API_FORBIDDEN = (
-    "denoise: p.denoise",
     "hires_scale: p.hires_scale",
     "hires_denoise: p.hires_denoise",
     "init_image: p.init_image",
@@ -146,8 +148,14 @@ PARAM_RAIL_REQUIRED = (
     "api.capabilityForBackend(backend)",
     'bus.on("capabilities:loaded", applyModelCaps)',
     "capSamplers && capSamplers.supported_samplers",
+    "function capabilityDefaults(backend)",
+    "function admittedDefaultSize(backend, sizes)",
+    "function applyCapabilityDefaults(backend, backendChanged)",
     "flux2: [[512, 512]]",
+    "sensenova: [[1024, 1024], [512, 512]]",
+    "sensenova: { width: 1024, height: 1024, steps: 30",
     "m.indexOf(\"flux2\") >= 0 || m.indexOf(\"flux-2\") >= 0 || m.indexOf(\"flux_2\") >= 0 || m.indexOf(\"klein\") >= 0) return \"flux2\"",
+    "m.indexOf(\"sensenova\") >= 0 || m.indexOf(\"sense_nova\") >= 0 || m.indexOf(\"sense-nova\") >= 0) return \"sensenova\"",
     "m.indexOf(\"sdxl\") >= 0 || m.indexOf(\"sd_xl\") >= 0 || m.indexOf(\"sd-xl\") >= 0 || m.indexOf(\"sd xl\") >= 0",
 )
 
@@ -241,6 +249,9 @@ PROMPT_SYNTAX_REQUIRED = (
 
 WORKFLOWS_REQUIRED = (
     "function compileToComfyPrompt(uiGraph)",
+    "function workflowDefaults(modelValue)",
+    "api.defaultsForModel(modelValue)",
+    "steps: Number(p.steps) || defaults.steps",
     "class_type: \"ConditioningZeroOut\"",
     "function validateComfyPrompt(out)",
     "if (!hasSave) throw new Error(\"workflow needs a SaveImage terminal\")",

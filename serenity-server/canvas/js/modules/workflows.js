@@ -426,16 +426,24 @@
         return { nodes: nodeList, wires: wireList };
       }
 
-      function paramsSnapshot() {
+      function workflowDefaults(modelValue) {
+        if (api && typeof api.defaultsForModel === "function") {
+          return api.defaultsForModel(modelValue);
+        }
+        return { width: 1024, height: 1024, steps: 20, cfg: 4.0, sampler: "euler", scheduler: "simple" };
+      }
+
+      function paramsSnapshot(modelValue) {
         var p = get("params") || {};
+        var defaults = workflowDefaults(modelValue || p.model);
         return {
-          width: Number(p.width) || 1024,
-          height: Number(p.height) || 1024,
-          steps: Number(p.steps) || 8,
+          width: Number(p.width) || defaults.width,
+          height: Number(p.height) || defaults.height,
+          steps: Number(p.steps) || defaults.steps,
           seed: Number(p.seed != null ? p.seed : -1),
-          cfg: Number(p.cfg != null ? p.cfg : 1.5),
-          sampler: p.sampler || "euler",
-          scheduler: p.scheduler || "simple",
+          cfg: Number(p.cfg != null ? p.cfg : defaults.cfg),
+          sampler: p.sampler || defaults.sampler,
+          scheduler: p.scheduler || defaults.scheduler,
         };
       }
 
@@ -452,8 +460,8 @@
         if (type === "KSampler") {
           return {
             seed: Number.isFinite(p.seed) ? p.seed : -1,
-            steps: Math.max(1, Math.round(p.steps || 8)),
-            cfg: Number.isFinite(p.cfg) ? p.cfg : 1.5,
+            steps: Math.max(1, Math.round(p.steps || 20)),
+            cfg: Number.isFinite(p.cfg) ? p.cfg : 4.0,
             sampler_name: p.sampler || "euler",
             scheduler: p.scheduler || "simple",
             denoise: 1.0,
@@ -493,8 +501,8 @@
 
       function compileToComfyPrompt(uiGraph) {
         uiGraph = uiGraph || graph();
-        var p = paramsSnapshot();
         var modelValue = modelSel.value || get("params.model") || "z-image";
+        var p = paramsSnapshot(modelValue);
         var promptValue = promptIn.value.trim() || get("params.prompt") || "";
         var negativeValue = get("params.negative") || "";
         var groups = nodes.slice();

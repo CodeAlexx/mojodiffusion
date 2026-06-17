@@ -218,6 +218,33 @@ fn default_scheduler_for_family(family: ModelFamily) -> &'static str {
     }
 }
 
+fn default_size_for_family(family: ModelFamily) -> (i64, i64) {
+    match family {
+        ModelFamily::Flux2 => (512, 512),
+        _ => (1024, 1024),
+    }
+}
+
+fn default_steps_for_family(family: ModelFamily) -> i64 {
+    match family {
+        ModelFamily::ZImage => 16,
+        ModelFamily::Ideogram4 => 20,
+        ModelFamily::Sdxl | ModelFamily::Anima | ModelFamily::Flux => 20,
+        ModelFamily::Sd3 => 28,
+        ModelFamily::Flux2 => 4,
+        ModelFamily::Sensenova => 30,
+    }
+}
+
+fn default_cfg_for_family(family: ModelFamily) -> f64 {
+    match family {
+        ModelFamily::ZImage => 5.0,
+        ModelFamily::Ideogram4 | ModelFamily::Sdxl => 7.0,
+        ModelFamily::Anima | ModelFamily::Sd3 => 4.5,
+        ModelFamily::Flux | ModelFamily::Flux2 | ModelFamily::Sensenova => 4.0,
+    }
+}
+
 const ZIMAGE_SIZES: &[(i64, i64)] = &[(512, 512), (1024, 1024)];
 const KLEIN_SIZES: &[(i64, i64)] = &[(512, 512)];
 const SENSENOVA_SIZES: &[(i64, i64)] = &[(512, 512), (1024, 1024)];
@@ -1122,6 +1149,7 @@ fn multi_lora_feature_for_family(family: ModelFamily) -> JsonValue {
 }
 
 fn capability_for_family(family: ModelFamily) -> JsonValue {
+    let (default_width, default_height) = default_size_for_family(family);
     let negative_prompt = if supports_negative_prompt(family) {
         admitted_feature()
     } else {
@@ -1143,6 +1171,10 @@ fn capability_for_family(family: ModelFamily) -> JsonValue {
         "production_status": "admitted",
         "worker_binary": family.worker_binary_name(),
         "defaults": {
+            "width": default_width,
+            "height": default_height,
+            "steps": default_steps_for_family(family),
+            "cfg": default_cfg_for_family(family),
             "sampler": default_sampler_for_family(family),
             "scheduler": default_scheduler_for_family(family),
         },

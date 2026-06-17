@@ -91,7 +91,7 @@ worker-specific sidecar exists, the manifest still writes and includes
 The contract lists each admitted image backend with:
 
 - production status and worker binary
-- default sampler/scheduler
+- default width, height, steps, CFG, sampler, and scheduler
 - admitted image sizes
 - supported sampler/scheduler subsets
 - feature support for text-to-image, CFG, negative prompts, bbox prompt JSON,
@@ -131,15 +131,18 @@ return the same schema with `rejection_stage:"grid_cell_prequeue"` and
 The browser route also uses this contract through
 `serenity-server/canvas/js/api.js`. The API adapter caches
 `/v1/capabilities`, emits `capabilities:loaded`, and exposes shared helpers for
-model-to-backend mapping and feature support checks. UI modules must consume
-those helpers rather than walking the payload independently.
+model-to-backend mapping, default generation settings, and feature support
+checks. UI modules must consume those helpers rather than walking the payload
+independently.
 
 Current consumers:
 
-- `param_rail.js`: sampler/scheduler subsets, production sizes, and LoRA limits.
-  Model aliases are normalized before control defaults are enforced. This is
-  required for `flux-2`/`klein` to receive `flux2` 512x512 limits and for
-  `sd_xl_base_1.0` to receive SDXL's `normal` scheduler and 1024x1024 limit.
+- `param_rail.js`: capability defaults, sampler/scheduler subsets, production
+  sizes, and LoRA limits. Model aliases are normalized before control defaults
+  are enforced. This is required for `flux-2`/`klein` to receive `flux2`
+  512x512 limits, for `sd_xl_base_1.0` to receive SDXL's `normal` scheduler and
+  1024x1024 limit, and for `sensenova-u1` to select 1024x1024, 30 steps,
+  `cfg:4`, and `scheduler:"simple"` instead of stale browser fallbacks.
 - `prompt_bar.js`: negative-prompt availability.
 - `refiner_upscale.js`: workflow-intent refiner/upscale/hires controls.
 - `gallery_pro.js`: workflow-state img2img/upscale actions.
@@ -179,6 +182,8 @@ Current consumers:
   adapters stay inside the workflow envelope as `{params: ...}` instead of
   bypassing the graph lowerer; the Rust adapter preserves Ideogram
   `prompt_json`/bbox payloads and maps UI `loras` to canonical wire `lora`.
+  Runtime-created workflow graphs use the same capability-backed defaults for
+  missing width, height, steps, CFG, sampler, and scheduler values.
 - `ideogram4_nodes.js`: the active Ideogram bbox workflow lowerer emits
   structured `prompt_json`, `prompt_raw`, and an explicit empty negative prompt
   through `workflow.params`. The old standalone bbox builder has the same
@@ -411,8 +416,9 @@ the same workflow body.
 Regression gates added/updated:
 
 - `scripts/check_canvas_browser_controls.js` verifies browser capability
-  normalization for Klein (`flux2`, 512x512, `simple`) and
-  `sd_xl_base_1.0` (`sdxl`, 1024x1024, `normal`).
+  normalization for Klein (`flux2`, 512x512, `simple`), SenseNova
+  (`sensenova`, 1024x1024, 30 steps, `simple`), and `sd_xl_base_1.0`
+  (`sdxl`, 1024x1024, `normal`).
 - `scripts/check_canvas_preflight_submit_contract.py` pins the browser alias
   markers and workflow-only submit contract.
 - Rust tests cover `sd_xl_base_1.0` in worker dispatch and prequeue admission.

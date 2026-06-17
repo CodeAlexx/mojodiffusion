@@ -49,6 +49,18 @@
     return String(name || "").trim().toLowerCase();
   }
 
+  var FALLBACK_DEFAULTS = {
+    zimage: { width: 1024, height: 1024, steps: 16, cfg: 5.0, sampler: "euler", scheduler: "simple" },
+    qwenimage: { width: 1024, height: 1024, steps: 20, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    ideogram4: { width: 1024, height: 1024, steps: 20, cfg: 7.0, sampler: "euler", scheduler: "ideogram_logitnormal" },
+    sdxl: { width: 1024, height: 1024, steps: 20, cfg: 7.0, sampler: "euler", scheduler: "normal" },
+    anima: { width: 1024, height: 1024, steps: 20, cfg: 4.5, sampler: "euler", scheduler: "normal" },
+    sd3: { width: 1024, height: 1024, steps: 28, cfg: 4.5, sampler: "euler", scheduler: "simple" },
+    flux: { width: 1024, height: 1024, steps: 20, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    flux2: { width: 512, height: 512, steps: 4, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    sensenova: { width: 1024, height: 1024, steps: 30, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+  };
+
   function backendForModelName(model) {
     var m = String(model || "").toLowerCase();
     if (m.indexOf("ideogram") >= 0) return "ideogram4";
@@ -61,6 +73,8 @@
     if (m.indexOf("flux2") >= 0 || m.indexOf("flux-2") >= 0 ||
         m.indexOf("flux_2") >= 0 || m.indexOf("klein") >= 0) return "flux2";
     if (m.indexOf("flux") >= 0) return "flux";
+    if (m.indexOf("sensenova") >= 0 || m.indexOf("sense_nova") >= 0 ||
+        m.indexOf("sense-nova") >= 0) return "sensenova";
     if (m.indexOf("zimage") >= 0 || m.indexOf("z-image") >= 0 || m.indexOf("z_image") >= 0) {
       return "zimage";
     }
@@ -110,6 +124,35 @@
     return capabilityForBackend(backendForModelName(model));
   }
 
+  function intValue(value, fallback) {
+    var n = parseInt(value, 10);
+    return n > 0 ? n : fallback;
+  }
+
+  function numberValue(value, fallback) {
+    var n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function defaultsForBackend(backend) {
+    var key = normalizeBackendName(backend) || "zimage";
+    var fallback = FALLBACK_DEFAULTS[key] || FALLBACK_DEFAULTS.zimage;
+    var cap = capabilityForBackend(key);
+    var defaults = (cap && cap.defaults) || {};
+    return {
+      width: intValue(defaults.width, fallback.width),
+      height: intValue(defaults.height, fallback.height),
+      steps: intValue(defaults.steps, fallback.steps),
+      cfg: numberValue(defaults.cfg, fallback.cfg),
+      sampler: defaults.sampler || fallback.sampler,
+      scheduler: defaults.scheduler || fallback.scheduler,
+    };
+  }
+
+  function defaultsForModel(model) {
+    return defaultsForBackend(backendForModelName(model));
+  }
+
   function featureForModel(model, featureName) {
     var cap = capabilityForModel(model);
     return cap && cap.features ? cap.features[featureName] || null : null;
@@ -137,15 +180,16 @@
 
   function generateBody() {
     var p = (window.Serenity.state && window.Serenity.state.params) || {};
+    var defaults = defaultsForModel(p.model);
     return {
       model: normalizeModelName(p.model),
       prompt: p.prompt || '', negative: p.negative || '',
       prompt_raw: p.prompt_raw || '', negative_raw: p.negative_raw || '',
       prompt_json: p.prompt_json != null ? p.prompt_json : undefined,
-      width: p.width || 1024, height: p.height || 1024,
-      steps: p.steps || 8, cfg: p.cfg != null ? p.cfg : 1.5,
+      width: p.width || defaults.width, height: p.height || defaults.height,
+      steps: p.steps || defaults.steps, cfg: p.cfg != null ? p.cfg : defaults.cfg,
       seed: p.seed != null ? p.seed : -1,
-      sampler: p.sampler || 'euler', scheduler: p.scheduler || 'simple',
+      sampler: p.sampler || defaults.sampler, scheduler: p.scheduler || defaults.scheduler,
       images: p.images || 1, clip_skip: p.clip_skip || 0,
       eta: p.eta != null ? p.eta : -1,
       sigma_min: p.sigma_min != null ? p.sigma_min : -1,
@@ -315,6 +359,8 @@
     samplers: function () { return fetch(BASE + '/v1/samplers').then(j); },
     capabilities: capabilities,
     backendForModelName: backendForModelName,
+    defaultsForBackend: defaultsForBackend,
+    defaultsForModel: defaultsForModel,
     normalizeModelName: normalizeModelName,
     capabilityForBackend: capabilityForBackend,
     capabilityForModel: capabilityForModel,

@@ -141,6 +141,10 @@
     var x = parseInt(v, 10);
     return isFinite(x) && x > 0 ? x : dflt;
   }
+  function promptJsonFromCaption(caption) {
+    try { return JSON.parse(caption); }
+    catch (_) { return caption; }
+  }
 
   // wfLower: called by workflows.js Queue with graph(). Returns the params patch merged
   // into Serenity.state.params before the PROVEN /v1/generate submit, or null to fall
@@ -168,6 +172,9 @@
     return {
       model: "ideogram4",
       prompt: caption,
+      prompt_raw: caption,
+      prompt_json: promptJsonFromCaption(caption),
+      negative: "",
       scheduler: "ideogram_logitnormal",
       cfg: 7.0,
       cfg_override: -1,

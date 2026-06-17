@@ -3395,6 +3395,9 @@ mod endpoint_tests {
 
         let flux2 = backend("flux2");
         assert_eq!(flux2["worker_binary"], "serenity_worker_klein");
+        assert_eq!(flux2["defaults"]["width"], 512);
+        assert_eq!(flux2["defaults"]["height"], 512);
+        assert_eq!(flux2["defaults"]["steps"], 4);
         assert_eq!(flux2["limits"]["sizes"][0]["width"], 512);
         assert_eq!(flux2["features"]["lora"]["max_count"], 1);
         assert_eq!(flux2["features"]["negative_prompt"]["supported"], false);
@@ -3404,6 +3407,11 @@ mod endpoint_tests {
             sensenova["worker_binary"],
             "serenity_worker_sensenova"
         );
+        assert_eq!(sensenova["defaults"]["width"], 1024);
+        assert_eq!(sensenova["defaults"]["height"], 1024);
+        assert_eq!(sensenova["defaults"]["steps"], 30);
+        assert_eq!(sensenova["defaults"]["cfg"], 4.0);
+        assert_eq!(sensenova["defaults"]["scheduler"], "simple");
         assert_eq!(sensenova["limits"]["sizes"][0]["width"], 512);
         assert_eq!(sensenova["limits"]["sizes"][0]["height"], 512);
         assert_eq!(sensenova["limits"]["sizes"][1]["width"], 1024);

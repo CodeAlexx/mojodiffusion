@@ -113,9 +113,11 @@ swaps to the matching `serenity_worker_<family>` binary. If that target binary i
 missing, the job fails loudly instead of running on the previous resident model.
 The classifier accepts common production aliases, including `flux-2`/`klein`
 for the bounded Klein 9B `flux2` route and `sdxl`/`sd_xl`/`sd-xl`/`sd xl` for
-SDXL. The browser adapter uses the same backend mapping before it enforces model
-limits, so model selection adjusts width/height and scheduler before the
-workflow graph is submitted.
+SDXL. The browser adapter uses the same backend mapping and `/v1/capabilities`
+defaults before it enforces model limits, so model selection adjusts
+width/height, steps, CFG, sampler, and scheduler before the workflow graph is
+submitted. Current SenseNova browser defaults are 1024x1024, 30 steps,
+`cfg:4`, `scheduler:"simple"`.
 
 Ideogram-4 requests may provide `prompt`, `prompt_raw`, or `prompt_json`.
 For `prompt_json`, string values are used directly and JSON object/array values

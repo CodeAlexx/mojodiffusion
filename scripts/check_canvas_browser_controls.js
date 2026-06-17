@@ -382,6 +382,7 @@ async function main() {
       await Serenity.api.capabilities(true);
       const apiBackendKlein = Serenity.api.backendForModelName("flux-2-klein-base-9b_fp8_e4m3fn");
       const apiBackendSdxl = Serenity.api.backendForModelName("sd_xl_base_1.0");
+      const apiBackendSensenova = Serenity.api.backendForModelName("sensenova-u1");
 
       Serenity.set("params.width", 1024);
       Serenity.set("params.height", 1024);
@@ -396,6 +397,20 @@ async function main() {
         scheduler: Serenity.get("params.scheduler"),
       };
 
+      Serenity.set("params.width", 512);
+      Serenity.set("params.height", 512);
+      Serenity.set("params.steps", 8);
+      Serenity.set("params.scheduler", "normal");
+      Serenity.set("params.model", "sensenova-u1");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const sensenova = {
+        backend: apiBackendSensenova,
+        width: Serenity.get("params.width"),
+        height: Serenity.get("params.height"),
+        steps: Serenity.get("params.steps"),
+        scheduler: Serenity.get("params.scheduler"),
+      };
+
       Serenity.set("params.scheduler", "simple");
       Serenity.set("params.model", "sd_xl_base_1.0");
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -405,7 +420,7 @@ async function main() {
         height: Serenity.get("params.height"),
         scheduler: Serenity.get("params.scheduler"),
       };
-      return { klein, sdxl };
+      return { klein, sensenova, sdxl };
     });
     assert(
       capabilityState.klein.backend === "flux2",
@@ -418,6 +433,22 @@ async function main() {
     assert(
       capabilityState.klein.scheduler === "simple",
       `Klein scheduler should remain simple: ${JSON.stringify(capabilityState.klein)}`,
+    );
+    assert(
+      capabilityState.sensenova.backend === "sensenova",
+      `SenseNova model was not classified as sensenova: ${JSON.stringify(capabilityState)}`,
+    );
+    assert(
+      capabilityState.sensenova.width === 1024 && capabilityState.sensenova.height === 1024,
+      `SenseNova capability defaults did not select 1024x1024: ${JSON.stringify(capabilityState.sensenova)}`,
+    );
+    assert(
+      capabilityState.sensenova.steps === 30,
+      `SenseNova capability defaults did not select 30 steps: ${JSON.stringify(capabilityState.sensenova)}`,
+    );
+    assert(
+      capabilityState.sensenova.scheduler === "simple",
+      `SenseNova scheduler should normalize to simple: ${JSON.stringify(capabilityState.sensenova)}`,
     );
     assert(
       capabilityState.sdxl.backend === "sdxl",

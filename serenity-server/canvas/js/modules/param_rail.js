@@ -39,6 +39,18 @@
     sd3: [[1024, 1024]],
     flux: [[1024, 1024]],
     flux2: [[512, 512]],
+    sensenova: [[1024, 1024], [512, 512]],
+  };
+  var FALLBACK_DEFAULTS = {
+    zimage: { width: 1024, height: 1024, steps: 16, cfg: 5.0, sampler: "euler", scheduler: "simple" },
+    qwenimage: { width: 1024, height: 1024, steps: 20, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    ideogram4: { width: 1024, height: 1024, steps: 20, cfg: 7.0, sampler: "euler", scheduler: "ideogram_logitnormal" },
+    sdxl: { width: 1024, height: 1024, steps: 20, cfg: 7.0, sampler: "euler", scheduler: "normal" },
+    anima: { width: 1024, height: 1024, steps: 20, cfg: 4.5, sampler: "euler", scheduler: "normal" },
+    sd3: { width: 1024, height: 1024, steps: 28, cfg: 4.5, sampler: "euler", scheduler: "simple" },
+    flux: { width: 1024, height: 1024, steps: 20, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    flux2: { width: 512, height: 512, steps: 4, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    sensenova: { width: 1024, height: 1024, steps: 30, cfg: 4.0, sampler: "euler", scheduler: "simple" },
   };
 
   function backendForModelName(model) {
@@ -53,6 +65,7 @@
     if (m.indexOf("sd3") >= 0 || m.indexOf("sd35") >= 0 || m.indexOf("sd3.5") >= 0) return "sd3";
     if (m.indexOf("flux2") >= 0 || m.indexOf("flux-2") >= 0 || m.indexOf("flux_2") >= 0 || m.indexOf("klein") >= 0) return "flux2";
     if (m.indexOf("flux") >= 0) return "flux";
+    if (m.indexOf("sensenova") >= 0 || m.indexOf("sense_nova") >= 0 || m.indexOf("sense-nova") >= 0) return "sensenova";
     if (m.indexOf("zimage") >= 0 || m.indexOf("z-image") >= 0 || m.indexOf("z_image") >= 0) return "zimage";
     return "zimage";
   }
@@ -247,7 +260,7 @@
         return el("div", { class: "pr-section" }, [lbl, rng]);
       }
 
-      root.appendChild(slider({ path: "params.steps", label: "Steps", min: 1, max: 100, step: 1, def: 8 }));
+      root.appendChild(slider({ path: "params.steps", label: "Steps", min: 1, max: 100, step: 1, def: 20 }));
       root.appendChild(slider({ path: "params.cfg", label: "CFG", min: 0, max: 30, step: 0.1, def: 1.5, dec: 1 }));
 
       // ===================== SEED (+ random / lock) =====================
@@ -498,6 +511,44 @@
         }
         return null;
       }
+      function positiveInt(value, fallback) {
+        var n = parseInt(value, 10);
+        return n > 0 ? n : fallback;
+      }
+      function finiteNumber(value, fallback) {
+        var n = Number(value);
+        return Number.isFinite(n) ? n : fallback;
+      }
+      function fallbackDefaults(backend) {
+        var raw = FALLBACK_DEFAULTS[backend] || FALLBACK_DEFAULTS.zimage;
+        return {
+          width: raw.width,
+          height: raw.height,
+          steps: raw.steps,
+          cfg: raw.cfg,
+          sampler: raw.sampler,
+          scheduler: raw.scheduler,
+        };
+      }
+      function capabilityDefaults(backend) {
+        if (api && typeof api.defaultsForBackend === "function") {
+          return api.defaultsForBackend(backend);
+        }
+        var out = fallbackDefaults(backend);
+        var entry = capabilityBackendEntry(backend);
+        var raw = (entry && entry.defaults) || {};
+        out.width = positiveInt(raw.width, out.width);
+        out.height = positiveInt(raw.height, out.height);
+        out.steps = positiveInt(raw.steps, out.steps);
+        out.cfg = finiteNumber(raw.cfg, out.cfg);
+        out.sampler = raw.sampler || out.sampler;
+        out.scheduler = raw.scheduler || out.scheduler;
+        return out;
+      }
+      function capabilityResolution(backend) {
+        var entry = capabilityBackendEntry(backend);
+        return (entry && entry.limits && entry.limits.resolution) || null;
+      }
       function capabilitySizes(backend) {
         var entry = capabilityBackendEntry(backend);
         var raw = entry && entry.limits && entry.limits.sizes;
@@ -508,6 +559,16 @@
           if (sizes.length) return sizes;
         }
         return PRODUCTION_SIZES[backend] || PRODUCTION_SIZES.zimage;
+      }
+      function sizeAllowed(sizes, w, h) {
+        return sizes.some(function (s) { return s[0] === w && s[1] === h; });
+      }
+      function admittedDefaultSize(backend, sizes) {
+        var defaults = capabilityDefaults(backend);
+        if (sizeAllowed(sizes, defaults.width, defaults.height)) {
+          return [defaults.width, defaults.height];
+        }
+        return sizes[0] || [defaults.width, defaults.height];
       }
       function loraLimitForBackend(backend) {
         var entry = capabilityBackendEntry(backend);
@@ -532,18 +593,25 @@
         }
       }
       function currentBackend() { return backendForModelName(get("params.model")); }
-      function enforceProductionSize() {
-        var backend = currentBackend();
+      function aspectOptionsForBackend(backend) {
+        var policy = capabilityResolution(backend);
+        return policy && policy.square_only === false ? ASPECTS : SQUARE_ASPECTS;
+      }
+      function enforceProductionSize(backend, preferDefault) {
+        backend = backend || currentBackend();
         var sizes = capabilitySizes(backend);
         var w = parseInt(get("params.width") || wIn.value || 1024, 10);
         var h = parseInt(get("params.height") || hIn.value || 1024, 10);
-        var ok = sizes.some(function (s) { return s[0] === w && s[1] === h; });
-        fillSelect(aspectSel, SQUARE_ASPECTS, "1:1");
-        if (get("params.aspect") !== "1:1") set("params.aspect", "1:1");
-        if (!ok) {
-          w = sizes[0][0]; h = sizes[0][1];
-          wIn.value = w; hIn.value = h;
-          set("params.width", w); set("params.height", h);
+        var aspects = aspectOptionsForBackend(backend);
+        var squareOnly = aspects === SQUARE_ASPECTS;
+        fillSelect(aspectSel, aspects, squareOnly ? "1:1" : (get("params.aspect") || "1:1"));
+        if (squareOnly && get("params.aspect") !== "1:1") set("params.aspect", "1:1");
+        var target = preferDefault || !sizeAllowed(sizes, w, h)
+          ? admittedDefaultSize(backend, sizes)
+          : [w, h];
+        if (w !== target[0] || h !== target[1]) {
+          wIn.value = target[0]; hIn.value = target[1];
+          set("params.width", target[0]); set("params.height", target[1]);
         }
       }
       function enforceLoraCaps(backend) {
@@ -561,29 +629,63 @@
         readLoras();
         if (hint) hint.textContent = limit === 1 ? "This model admits one LoRA overlay." : (loraNames.length > 1 ? (loraNames.length - 1) + " LoRA(s) available." : "No LoRAs loaded — backend list unavailable.");
       }
+      var lastAppliedBackend = null;
+      var lastAppliedStepsDefault = 20;
+      var lastAppliedCfgDefault = 1.5;
+      function applyCapabilityDefaults(backend, backendChanged) {
+        var defaults = capabilityDefaults(backend);
+        var curSteps = parseInt(get("params.steps"), 10);
+        if (
+          backendChanged &&
+          (!curSteps || curSteps === lastAppliedStepsDefault || curSteps <= 8 ||
+            (backend === "sensenova" && curSteps < defaults.steps))
+        ) {
+          set("params.steps", defaults.steps);
+          lastAppliedStepsDefault = defaults.steps;
+        }
+        var curCfg = Number(get("params.cfg"));
+        if (backendChanged && (!Number.isFinite(curCfg) || curCfg === lastAppliedCfgDefault || curCfg === 1.5)) {
+          set("params.cfg", defaults.cfg);
+          lastAppliedCfgDefault = defaults.cfg;
+        }
+        if (backendChanged) {
+          var sizes = capabilitySizes(backend);
+          var target = admittedDefaultSize(backend, sizes);
+          set("params.sampler", defaults.sampler);
+          set("params.scheduler", defaults.scheduler);
+          set("params.width", target[0]);
+          set("params.height", target[1]);
+          wIn.value = target[0];
+          hIn.value = target[1];
+        }
+      }
       function applyModelCaps() {
         var backend = currentBackend();
+        var backendChanged = backend !== lastAppliedBackend;
         var entry = registryBackendEntry(backend);
         var cap = capabilityBackendEntry(backend);
         var capSamplers = cap && cap.samplers;
+        var defaults = capabilityDefaults(backend);
+        applyCapabilityDefaults(backend, backendChanged);
         chooseSelect(
           samplerSel,
           "params.sampler",
           (capSamplers && capSamplers.supported_samplers) || (entry && entry.supported_samplers),
-          FALLBACK_SAMPLERS[0]
+          defaults.sampler || FALLBACK_SAMPLERS[0]
         );
         chooseSelect(
           schedSel,
           "params.scheduler",
           (capSamplers && capSamplers.supported_schedulers) || (entry && entry.supported_schedulers),
-          FALLBACK_SCHEDULERS[0]
+          defaults.scheduler || FALLBACK_SCHEDULERS[0]
         );
-        enforceProductionSize();
+        enforceProductionSize(backend, backendChanged);
         enforceLoraCaps(backend);
         set("params.controlnet", null);
         set("params.refiner", null);
         set("params.hires_scale", 1.0);
         set("params.hires_denoise", 0.4);
+        lastAppliedBackend = backend;
       }
       function loadCapabilityInfo() {
         if (api && typeof api.capabilities === "function") {

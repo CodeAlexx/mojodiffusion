@@ -43,6 +43,7 @@
 from std.gpu.host import DeviceContext
 from std.memory import alloc
 from std.math import sqrt
+from std.time import perf_counter_ns
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -91,7 +92,7 @@ comptime FINAL_LATENT_BIN = DUMP + "c8_final_latent_1024_mojo.bin"
 comptime OUT_PNG = "/home/alex/mojodiffusion/output/boogu_t2i_1024_mojo.png"
 
 comptime INSTRUCTION: StaticString = (
-    "A painterly retro-futurist portrait of a female android samurai, three-quarter body, standing against a pale embossed-metal wall. She wears a sleek gunmetal-silver mechanical helmet with a glowing amber-tinted wraparound visor covering her eyes, a small kite-shaped emblem etched into the lens, and a braided orange silk tassel ornament dangling from one side. Her soft feminine face and lips are visible below the visor, expression calm. She is dressed in a fusion of traditional Japanese garb and exposed cybernetics: a dark charcoal leather kimono robe with fine gold filigree dragon and floral motifs, cinched by a bright orange knotted obi sash, with flowing orange hakama beneath. Her arms and one exposed thigh are chrome robotic prosthetics with brass and copper circular joints, articulated mechanical fingers, and engraved silver armor plating. She raises one hand holding a small white ceramic teacup bearing an orange stylized-sun logo, thin wisps of steam curling upward. Muted desaturated palette of black, brass, gunmetal, and burnt orange. Soft airbrushed 1980s Japanese sci-fi illustration style, high detail, concept art. The figure and the embossed-metal wall fill the entire square frame, extending to every edge."
+    "A butterfly drawn to the flame, oblivious to its impending demise, reveling in the fleeting warmth and mesmerizing light. Doesn’t it remind you of humans chasing their joys? Their passions?  True joy, extreme joy—they burn brightest before fading to ash. An ephemeral bliss that sears like a brand upon the soul, leaving scars that pulse with phantom elation. It consumes utterly, devouring the boundaries between pleasure and pain until one can no longer tell them apart. That precipice, that razor’s edge, is where humans seem to crave dancing the closest—tempted by the abyss, exhilarated by the fall.  Sink they do, again and again, into depths of rapture, drowning in their own euphoria, only to emerge gasping and forever changed. Changed because joy demands tribute, insists on sacrifice.  Cinematic photographic style, symbolic composition: a single butterfly in mid-flight, wings translucent and iridescent, drawn irresistibly toward a flickering flame that casts golden-orange light across its delicate form. The background is a soft gradient of dark twilight sky, with faint silhouettes of distant trees or ruins to imply a forgotten world. The flame is not destructive but radiant, glowing with inner warmth, its light illuminating the butterfly’s fragile beauty. The scene is emotionally charged, with a tone of melancholic awe, capturing the moment of surrender to ephemeral ecstasy. The butterfly’s body is slightly blurred, suggesting motion and inevitability, while the flame pulses with life, yet holds the promise of consumption. The image evokes the human soul’s longing for transcendent joy, its vulnerability, and the cost of surrender. The butterfly and the glowing flame fill the entire square frame, the scene extending to every edge."
 )
 
 # Demo res 256x256 -> latent [1,16,32,32], h_tok=w_tok=16.
@@ -111,9 +112,9 @@ comptime SEED: UInt64 = 0
 
 # Caption lengths (comptime: BooguDiT.forward needs CAP_LEN at compile time).
 # Verified against the real Qwen3-VL processor:
-#   cond  = SYSTEM_PROMPT_4_T2I + INSTRUCTION  => 298 tokens (android samurai).
+#   cond  = SYSTEM_PROMPT_4_T2I + INSTRUCTION  => 385 tokens (butterfly/flame, 8B-enhanced).
 #   uncond= SYSTEM_PROMPT_DROP  + ""           => 66 tokens.
-comptime CAP_LEN_COND = 298
+comptime CAP_LEN_COND = 385
 comptime CAP_LEN_UNCOND = 66
 
 
@@ -238,6 +239,7 @@ def _denoise(
 
     var dit = BooguDiT.load(String(TF_DIR), ctx)
 
+    var t_loop0 = perf_counter_ns()
     for i in range(NUM_STEPS):
         # Per-step model timestep as a [1] F32 tensor (the DiT scales by
         # timestep_scale=1000 internally).
@@ -274,7 +276,12 @@ def _denoise(
             var lh = latent.to_host(ctx)
             print("  step ", i, " t=", ts[i], " latent.std=", _std_f32(lh))
 
-    var final_h = latent.to_host(ctx)
+    var final_h = latent.to_host(ctx)   # syncs all enqueued denoise work
+    var loop_s = Float64(perf_counter_ns() - t_loop0) / 1.0e9
+    print(
+        "  denoise:", loop_s, "s for", NUM_STEPS, "steps =",
+        loop_s / Float64(NUM_STEPS), "s/step (each step = 2 CFG forwards)",
+    )
     # dit drops here -> DiT VRAM freed before return.
     return final_h^
 

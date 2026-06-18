@@ -19,7 +19,8 @@
 # CFG (pipeline_boogu.py text_guidance_scale>1 branch; c8 ref line 99):
 #   pc = DiT(cond); pu = DiT(uncond);  model_pred = pc + (cfg-1)*(pc-pu)
 #   latent = scheduler.step(latent, model_pred, i)              # Euler, dt>0
-# After loop: VAE.decode(latent) -> [1,3,256,256] -> PNG (clamp[-1,1] => SIGNED).
+# After loop: TILED VAE decode (9x LAT/2 crops + feathered blend) -> [1,3,1024,1024]
+#   -> PNG (clamp[-1,1] => SIGNED). Monolithic 1024 decode OOMs; tiling fits 24GB.
 #
 # VRAM staging (24GB GPU; encoder ~16GB, DiT ~20GB can't co-reside): each big
 # model is loaded + consumed inside its OWN helper `def`, returning only host
@@ -57,7 +58,7 @@ from serenitymojo.io.ffi import (
     O_CREAT,
     O_TRUNC,
 )
-from serenitymojo.ops.tensor_algebra import sub, add, mul_scalar
+from serenitymojo.ops.tensor_algebra import sub, add, mul_scalar, slice
 from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
@@ -74,6 +75,7 @@ from serenitymojo.models.text_encoder.boogu_qwen3vl import (
 from serenitymojo.models.dit.boogu_dit import BooguDiT
 from serenitymojo.sampling.flow_match import Scheduler
 from serenitymojo.models.vae.zimage_decoder import ZImageDecoder
+from serenitymojo.models.vae.ideogram4_tiled_decode import _blend3
 from serenitymojo.image.png import save_png, ValueRange
 
 
@@ -89,7 +91,7 @@ comptime FINAL_LATENT_BIN = DUMP + "c8_final_latent_1024_mojo.bin"
 comptime OUT_PNG = "/home/alex/mojodiffusion/output/boogu_t2i_1024_mojo.png"
 
 comptime INSTRUCTION: StaticString = (
-    "Abstract realism and expressionism style, dark-toned muted palette with subtle tonal variations, pronounced painterly texture with visible brushstrokes and layered paint traces emulating the physical process of multi-layered painting. The figure and the smoky background together fill the entire square frame, extending all the way to every edge. Depth is created through varying densities of brushwork. Diffused lighting casts a cool, mysterious atmosphere. Free, gestural brushstrokes convey movement and dynamism. Full-body close-up: she kneels with one leg forward, torso twisting, hands sliding down the outside of her thighs. Platinum hair fans outward in airy, weightless strands. She wears an open lattice of stiff paper bars, arranged like a ribcage reimagined as art, the bars flexing with her motion, widening, narrowing, bending in smooth arcs without creasing, as if the armor breathes with her. Sections of her waist and hips glow through the openings, surrounded by shifting geometry. The background erupts in smoky layers of ruby, ink-blue, and almond-white that bleed off all four edges, bending as though reacting to her twist. Dynamic, dramatic."
+    "A painterly retro-futurist portrait of a female android samurai, three-quarter body, standing against a pale embossed-metal wall. She wears a sleek gunmetal-silver mechanical helmet with a glowing amber-tinted wraparound visor covering her eyes, a small kite-shaped emblem etched into the lens, and a braided orange silk tassel ornament dangling from one side. Her soft feminine face and lips are visible below the visor, expression calm. She is dressed in a fusion of traditional Japanese garb and exposed cybernetics: a dark charcoal leather kimono robe with fine gold filigree dragon and floral motifs, cinched by a bright orange knotted obi sash, with flowing orange hakama beneath. Her arms and one exposed thigh are chrome robotic prosthetics with brass and copper circular joints, articulated mechanical fingers, and engraved silver armor plating. She raises one hand holding a small white ceramic teacup bearing an orange stylized-sun logo, thin wisps of steam curling upward. Muted desaturated palette of black, brass, gunmetal, and burnt orange. Soft airbrushed 1980s Japanese sci-fi illustration style, high detail, concept art. The figure and the embossed-metal wall fill the entire square frame, extending to every edge."
 )
 
 # Demo res 256x256 -> latent [1,16,32,32], h_tok=w_tok=16.
@@ -98,15 +100,20 @@ comptime LAT_H = 128   # 1024x1024 image -> latent 128x128 (VAE 8x)
 comptime LAT_W = 128
 comptime H_TOK = 64    # LAT/patch_size(2) -> 64x64 token grid -> 4096 img tokens
 comptime W_TOK = 64
+# VAE tiled decode: 9 overlapping TILE=LAT/2 crops -> blend (monolithic 1024 decode OOMs).
+comptime TILE_H = LAT_H // 2   # 64
+comptime TILE_W = LAT_W // 2   # 64
+comptime HALF_H = TILE_H // 2  # 32
+comptime HALF_W = TILE_W // 2  # 32
 comptime NUM_STEPS = 20
 comptime CFG_SCALE = Float32(4.0)
 comptime SEED: UInt64 = 0
 
 # Caption lengths (comptime: BooguDiT.forward needs CAP_LEN at compile time).
 # Verified against the real Qwen3-VL processor:
-#   cond  = SYSTEM_PROMPT_4_T2I + INSTRUCTION  => 267 tokens (first prompt, full-bleed variant).
+#   cond  = SYSTEM_PROMPT_4_T2I + INSTRUCTION  => 298 tokens (android samurai).
 #   uncond= SYSTEM_PROMPT_DROP  + ""           => 66 tokens.
-comptime CAP_LEN_COND = 267
+comptime CAP_LEN_COND = 298
 comptime CAP_LEN_UNCOND = 66
 
 
@@ -279,12 +286,31 @@ def _denoise(
 # final latent. (NOTE: load_flux1_ldm_decoder uses LDM-format keys which are NOT in
 # this diffusers checkpoint — see report.)
 def _decode_and_save(final_h: List[Float32], ctx: DeviceContext) raises:
-    print("[c8] stage3: VAE decode + PNG…")
+    print("[c8] stage3: TILED VAE decode + PNG…")
     var latent = Tensor.from_host(
         final_h, [1, LAT_C, LAT_H, LAT_W], STDtype.F32, ctx
     )
-    var vae = ZImageDecoder[LAT_H, LAT_W].load(String(VAE_DIR), ctx)
-    var img = vae.decode(latent, ctx)  # [1,3,256,256] F32 (NCHW)
+    # Tiled decode: a TILE-shaped (LAT/2) decoder over 9 overlapping crops (rows &
+    # cols at 0/HALF/TILE) -> feathered 3x3 blend in image space. Each tile is the
+    # size that fits 24GB; the monolithic LAT-sized decode OOMs at 1024 (conv im2col
+    # @1024^2 + mid-attn @ (LAT/2)^2 positions). _blend3 reused from ideogram4_tiled_decode.
+    var dec = ZImageDecoder[TILE_H, TILE_W].load(String(VAE_DIR), ctx)
+    var r = slice(latent, 2, 0, TILE_H, ctx)
+    var a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var b = cast_tensor(dec.decode(slice(r, 3, HALF_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var c = cast_tensor(dec.decode(slice(r, 3, TILE_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var row0 = _blend3(a, b, c, 3, ctx)
+    r = slice(latent, 2, HALF_H, TILE_H, ctx)
+    a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    b = cast_tensor(dec.decode(slice(r, 3, HALF_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    c = cast_tensor(dec.decode(slice(r, 3, TILE_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var row1 = _blend3(a, b, c, 3, ctx)
+    r = slice(latent, 2, TILE_H, TILE_H, ctx)
+    a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    b = cast_tensor(dec.decode(slice(r, 3, HALF_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    c = cast_tensor(dec.decode(slice(r, 3, TILE_W, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var row2 = _blend3(a, b, c, 3, ctx)
+    var img = _blend3(row0, row1, row2, 2, ctx)  # [1,3,8*LAT_H,8*LAT_W] F32
     var ish = img.shape()
     print("  decoded image shape [", ish[0], ",", ish[1], ",", ish[2], ",", ish[3], "]")
     var img_h = img.to_host(ctx)

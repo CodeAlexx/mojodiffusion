@@ -1,7 +1,7 @@
 # pipeline/ideogram4_generate.mojo — Ideogram-4 NATIVE text->image (no fixtures).
 # Full pure-Mojo path: hardcoded prompt token ids -> native Qwen3-VL 13-tap ->
 # native packed inputs -> native randn noise -> CFG denoise (cond+uncond,
-# logit-normal V4_QUALITY_48 preset) -> latent denorm -> Ideogram unpatch ->
+# logit-normal V4_DEFAULT_20 preset) -> latent denorm -> Ideogram unpatch ->
 # Flux2 VAE decode -> PNG. Reuses every parity-verified component.
 from std.gpu.host import DeviceContext
 from std.memory import ArcPointer
@@ -103,7 +103,7 @@ def main() raises:
         zpad_h.append(0.0)
     var text_zpad = Tensor.from_host(zpad_h^, [1, NT, 128], STDtype.F32, ctx)
 
-    # V4_TURBO_12: mu=0.5, std=1.75; guidance loop-index order [3.0]*1+[7.0]*11.
+    # V4_DEFAULT_20: mu=0.0 (res-adjusted mean), std=1.75; guidance [3.0]*2+[7.0]*18.
     var mean = ideogram4_schedule_mean(1024, 1024, 0.0)
     var si = make_step_intervals(STEPS)
 

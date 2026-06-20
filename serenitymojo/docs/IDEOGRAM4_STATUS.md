@@ -141,7 +141,8 @@ switch — the Ideogram model only ever consumes the JSON. Pure-Mojo equivalent:
   production acceptance.
 - 4K out of range (model native ≤2k; Dh=256 flash forward is gated for current
   inference shapes, but there is no accepted 4K product path).
-- LoRA (Power-Lora-style additive overlay) not yet wired (inference side).
+- LoRA inference WIRED (see Addendum 2026-06-20): `pipeline/ideogram4_generate_lora.mojo`
+  + `Ideogram4Weights.load_lora` (additive overlay on the resident cond transformer).
 
 ## Addendum 2026-06-12 — TRAINING status (lives in serenity-trainer)
 
@@ -165,3 +166,32 @@ encoders/VAE. Today's deltas:
 - **UI lever delivery (serenity-trainer eaa88f1):** bridge appends argv 10
   (caption_dropout) + 11 (levers JSON, "-" sentinel); old-vs-new argv
   equivalence EXACT (same two losses above).
+
+## Addendum 2026-06-20 — LoRA inference WIRED + inference quality fix
+
+**LoRA inference (`pipeline/ideogram4_generate_lora.mojo`):** `Ideogram4Weights.load_lora`
+reads ai-toolkit keys `diffusion_model.layers.N.<module>.lora_A/B.weight` (6 targets
+incl. adaln_modulation = 204 adapters, 34×6), applied as an additive overlay on the
+resident cond transformer (LoRA never fused). Proven end-to-end with a real giger LoRA
+trained in the RUST trainer (EriDiffusion-v2 `train_ideogram`, 1000 steps, full 70-image
+gigerver3 cache, loss 0.927→0.815): the LoRA imparts the learned Giger biomechanical style
+even on a prompt with the style-words ("gigerver3"/"H.R. Giger"/"biomechanical") REMOVED —
+same seed, base = generic smooth demon, +lora = learned texture (style from LoRA, not prompt).
+
+**Inference NOISE STD fix (this commit):** the sampler used logit-normal **std=1.5** on a
+20-step run, but 1.5 is the **48-step V4_QUALITY** preset's std; the 20-step **V4_DEFAULT_20**
+preset uses **std=1.75** (V4_TURBO_12 also 1.75; per inference-flame `scheduler.rs`
+SamplerParameters — the Rust path). Using the wrong-preset std softened output ("rust did
+better"). Fixed in all 3 inference paths:
+- `pipeline/ideogram4_generate.mojo`, `ideogram4_generate_lora.mojo`: std 1.5→1.75,
+  guidance polish `step<3`→`step<2` (build_gw [(3.0,2),(7.0,18)]). STEPS=20 fixed.
+- `serve/ideogram4_backend.mojo`: preset-aware `std = 1.75 if steps<=20 else 1.5` (server
+  runs variable step counts).
+MEASURED: same prompt+seed+LoRA, std=1.75 renders visibly SHARPER (crisper biomech texture).
+A *photographic* prompt (snow-leopard, `medium=photograph`) through the fixed path renders
+sharp/photorealistic — on par with the Rust snowleopard. The giger demon's painterly look is
+PROMPT-driven (`medium=painting`), not an inference bug. Daemon build 0 errors.
+
+**F16 LoRA save (flame-core 493b27f, in EriDiffusion-v2):** `save_tensors_safetensors`
+hardcoded dtype="F32" → F16/BF16 LoRAs saved at 2× size; now dtype-aware. `train_ideogram`
+LoRA now F16 105MB (was 211MB), matching the ai-toolkit reference size.

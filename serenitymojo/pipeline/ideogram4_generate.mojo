@@ -108,9 +108,12 @@ def main() raises:
     var si = make_step_intervals(STEPS)
 
     for step in range(STEPS - 1, -1, -1):
-        var t_val = ideogram4_logitnormal(Float64(si[step + 1]), mean, 1.5)
-        var s_val = ideogram4_logitnormal(Float64(si[step]), mean, 1.5)
-        var gw = Float32(3.0) if step < 3 else Float32(7.0)
+        # V4_DEFAULT_20 preset (sampler_configs.py / inference-flame scheduler.rs):
+        # std=1.75 (NOT the 48-step QUALITY preset's 1.5), guidance = 2 polish
+        # steps at 3.0 then 7.0. The std/polish mismatch was softening output.
+        var t_val = ideogram4_logitnormal(Float64(si[step + 1]), mean, 1.75)
+        var s_val = ideogram4_logitnormal(Float64(si[step]), mean, 1.75)
+        var gw = Float32(3.0) if step < 2 else Float32(7.0)
         var t = Tensor.from_host([t_val], [1], STDtype.F32, ctx)
         var pos_z = cast_tensor(concat(1, ctx, text_zpad, z), STDtype.BF16, ctx)
         var cout = ideogram4_forward_r[TOTAL](cond_w, pos_z, llm, t, cond_masks, cs[0], cs[1], 34, 18, 256, 4608, ctx)

@@ -669,9 +669,13 @@ struct Ideogram4Backend(GenBackend, Movable):
             # patch makes pixels = 16*GW_ by 16*GH_. The square bucket gives exactly
             # ideogram4_schedule_mean(1024,1024,0.0) as before.
             var mean = ideogram4_schedule_mean(16 * GH_, 16 * GW_, 0.0)
+            # preset logit-normal std: V4_DEFAULT_20 / V4_TURBO_12 use 1.75;
+            # only the 48-step V4_QUALITY preset uses 1.5. Using 1.5 on a <=20-step
+            # run is the wrong preset and softens output (inference-flame scheduler.rs).
+            var lstd = Float64(1.75) if self.params.steps <= 20 else Float64(1.5)
             for i in range(len(self.intervals)):
                 self.sigma_trace.append(
-                    ideogram4_logitnormal(Float64(self.intervals[i]), mean, 1.5)
+                    ideogram4_logitnormal(Float64(self.intervals[i]), mean, lstd)
                 )
         print(
             "[ideogram4] job", self.params.job_id, ":", self.params.steps,

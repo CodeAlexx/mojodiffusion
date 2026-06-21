@@ -10,6 +10,34 @@ scripts should use this contract before exposing or accepting a feature.
 This is not a parity claim. It is the shared admission layer that says what is
 currently supported and what must fail before enqueue.
 
+## Canvas Queue and Progress Contract
+
+The browser Generate surface must treat progress as part of the product
+contract, not as a best-effort console trace:
+
+- `#gen-queue` is created visible in idle state after a hard refresh.
+- Idle and terminal states remain visible so the user can see whether the app is
+  ready, done, failed, or cancelled.
+- Stop and the progress bar are visible only while the job is running or being
+  submitted.
+- `generate_ws.js` opens the normal job WebSocket path and also reconciles the
+  active job through `/v1/jobs`. If the terminal WebSocket event is missed, the
+  `/v1/jobs` terminal state must unlock Generate and emit the result.
+- Queue/progress layout is clamped to the viewport. Long step/status text must
+  truncate inside the widget instead of pushing controls off screen.
+- Browser tests must assert hard-refresh visibility, terminal unlock, queue
+  still visible, Stop hidden after terminal state, and at least one `/v1/jobs`
+  reconciliation poll.
+
+Live evidence from 2026-06-17:
+
+- `job-0057` and `job-0058` were submitted through the browser Generate button
+  on the running Rust server at `127.0.0.1:8787`.
+- Both jobs used the workflow path, reached `done`, reported `16/16` steps, and
+  wrote 1024x1024 RGB Z-Image PNGs under `output/run_serenity_ui/`.
+- The queue strip remained visible and bounded during submit, terminal state,
+  and post-terminal idle.
+
 ## Contract
 
 - Endpoint: `GET /v1/capabilities`
@@ -431,7 +459,8 @@ the same workflow body.
 Regression gates added/updated:
 
 - `scripts/check_canvas_browser_controls.js` verifies browser capability
-  normalization for Klein (`flux2`, 512x512, `simple`), SenseNova
+  normalization for Klein (`flux2`, 1024x1024 default with 512x512 also
+  admitted, `simple`), SenseNova
   (`sensenova`, 1024x1024, 30 steps, `simple`), and `sd_xl_base_1.0`
   (`sdxl`, 1024x1024, `normal`).
 - `scripts/check_canvas_preflight_submit_contract.py` pins the browser alias

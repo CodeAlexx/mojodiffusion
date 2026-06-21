@@ -1,7 +1,7 @@
 //! serenity-server — Phase-A Rust control plane.
 //!
 //! GOAL (Phase A exit): a Rust HTTP/WS server that accepts a generate request,
-//! drives the UNCHANGED Mojo `output/bin/serenity_worker_stub` over serenity-ipc,
+//! drives the already-built Mojo workers under `output/bin/` over serenity-ipc,
 //! streams progress over WebSocket, and reports the produced PNG path — proving the
 //! Rust->Mojo seam end-to-end with zero GPU.
 //!
@@ -31,7 +31,10 @@
 //! queue, steps the worker, and fans each WorkerEvent to subscribers (tokio
 //! broadcast keyed by job_id). The async axum handlers only enqueue + subscribe.
 //!
-//! Build: `cargo build` (safe). Run: `serenity-server --worker output/bin/serenity_worker_stub`.
+//! Build: `cargo build` (safe). Product launch should start from a real worker,
+//! e.g. `serenity-server --worker output/bin/serenity_worker_zimage`. The stub is
+//! only for IPC/control-plane tests and must not emit placeholder images for real
+//! model requests.
 //! NEVER run `mojo build` / `pixi run build-*` (OOM-kills the desktop).
 
 use std::collections::HashMap;
@@ -1229,6 +1232,8 @@ fn update_done_record_for_manifest(
     let e = v.iter_mut().find(|e| e.record.id == id)?;
     e.record.state = "done".to_string();
     e.record.progress = 100;
+    e.record.step = e.params.steps;
+    e.record.total = e.params.steps;
     e.record.output_path = output_path.to_string();
     e.record.params_json = params_json;
     Some((e.record.clone(), e.params.clone()))
@@ -1390,41 +1395,40 @@ fn run_worker_driver(
         };
 
         // Per-job model -> worker SWAP (single GPU: one resident model at a time).
-        // The CPU 'stub' worker serves everything, so never swap it out.
-        if current_kind != "stub" {
-            let (want_kind, want_bin) = match worker_for_model(&worker_bin, &params.model) {
-                Ok(worker) => worker,
-                Err(error) => {
-                    tracing::error!(%job_id, model = %params.model, "model dispatch rejected: {error}");
-                    let ev = WorkerEvent::Failed { error };
-                    apply_event_to_record(&jobs, &job_id, &ev);
-                    channel.publish(ev);
-                    schedule_evict(&registry, &job_id);
-                    continue;
-                }
-            };
-            if want_kind != current_kind {
-                if !want_bin.exists() {
-                    let error = format!(
-                        "worker binary unavailable for backend '{want_kind}': {}",
-                        want_bin.display()
-                    );
-                    tracing::error!(%job_id, model = %params.model, "model dispatch rejected: {error}");
-                    let ev = WorkerEvent::Failed { error };
-                    apply_event_to_record(&jobs, &job_id, &ev);
-                    channel.publish(ev);
-                    schedule_evict(&registry, &job_id);
-                    continue;
-                }
-                tracing::info!(%job_id, from = %current_kind, to = %want_kind, "swapping worker for model");
-                if let Some(mut h) = handle.take() {
-                    h.kill(); // SIGKILL + wait -> process dies -> GPU driver reclaims its VRAM
-                }
-                // brief settle so the GPU fully releases before the next model loads
-                std::thread::sleep(std::time::Duration::from_millis(800));
-                worker_bin = want_bin;
-                current_kind = want_kind;
+        // Even when the server was launched with the CPU stub, real model requests
+        // must switch to the real worker instead of emitting placeholder PNGs.
+        let (want_kind, want_bin) = match worker_for_model(&worker_bin, &params.model) {
+            Ok(worker) => worker,
+            Err(error) => {
+                tracing::error!(%job_id, model = %params.model, "model dispatch rejected: {error}");
+                let ev = WorkerEvent::Failed { error };
+                apply_event_to_record(&jobs, &job_id, &ev);
+                channel.publish(ev);
+                schedule_evict(&registry, &job_id);
+                continue;
             }
+        };
+        if want_kind != current_kind {
+            if !want_bin.exists() {
+                let error = format!(
+                    "worker binary unavailable for backend '{want_kind}': {}",
+                    want_bin.display()
+                );
+                tracing::error!(%job_id, model = %params.model, "model dispatch rejected: {error}");
+                let ev = WorkerEvent::Failed { error };
+                apply_event_to_record(&jobs, &job_id, &ev);
+                channel.publish(ev);
+                schedule_evict(&registry, &job_id);
+                continue;
+            }
+            tracing::info!(%job_id, from = %current_kind, to = %want_kind, "swapping worker for model");
+            if let Some(mut h) = handle.take() {
+                h.kill(); // SIGKILL + wait -> process dies -> GPU driver reclaims its VRAM
+            }
+            // brief settle so the GPU fully releases before the next model loads
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            worker_bin = want_bin;
+            current_kind = want_kind;
         }
 
         // Lazily (re)spawn if we have no live worker (first job, or after a prior
@@ -3076,8 +3080,8 @@ mod endpoint_tests {
             .contains("Klein/Flux2"));
 
         params = valid_t2i_params("klein-9b");
-        params.width = 1024;
-        params.height = 1024;
+        params.width = 768;
+        params.height = 768;
         assert!(validate_generate_prequeue(&params, 1.0)
             .unwrap_err()
             .contains("admitted product shapes"));
@@ -3465,10 +3469,17 @@ mod endpoint_tests {
 
         let flux2 = backend("flux2");
         assert_eq!(flux2["worker_binary"], "serenity_worker_klein");
-        assert_eq!(flux2["defaults"]["width"], 512);
-        assert_eq!(flux2["defaults"]["height"], 512);
+        assert_eq!(flux2["defaults"]["width"], 1024);
+        assert_eq!(flux2["defaults"]["height"], 1024);
         assert_eq!(flux2["defaults"]["steps"], 4);
-        assert_eq!(flux2["limits"]["sizes"][0]["width"], 512);
+        assert_eq!(flux2["limits"]["resolution"]["mode"], "shape_dispatch");
+        let flux2_sizes = flux2["limits"]["sizes"].as_array().unwrap();
+        assert!(flux2_sizes
+            .iter()
+            .any(|shape| shape["width"] == 1024 && shape["height"] == 1024));
+        assert!(flux2_sizes
+            .iter()
+            .any(|shape| shape["width"] == 512 && shape["height"] == 512));
         assert_eq!(flux2["features"]["lora"]["max_count"], 1);
         assert_eq!(flux2["features"]["negative_prompt"]["supported"], false);
 

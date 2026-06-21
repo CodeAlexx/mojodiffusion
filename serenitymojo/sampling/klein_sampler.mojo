@@ -60,9 +60,22 @@ from serenitymojo.sampling.base_sampler import tokens_to_packed_nchw, save_image
 from serenitymojo.training.progress_display import (
     print_sample_setup, print_sample_step, print_sample_saved,
 )
+from serenitymojo.serve.backend import StepResult
+from serenitymojo.serve.ipc_codec import encode_ev
+from serenitymojo.serve.proc_ipc import write_msg
 
 comptime TArc = ArcPointer[Tensor]
 comptime SAMPLE_SCREEN_EVERY = 5
+
+
+def _emit_server_progress(progress_fd: Int32, step: Int, total: Int) raises:
+    if progress_fd < 0:
+        return
+    var r = StepResult()
+    r.step = step
+    r.total = total
+    r.phase = String("sampling")
+    write_msg(progress_fd, encode_ev(r))
 
 
 # Klein rope host tables [S*H*(Dh//2)] — the layout klein_stack_lora_forward
@@ -263,6 +276,7 @@ def _denoise_lora_from_initial[
     var x: Tensor,              # [N_IMG, in_ch] initial latent/noise tokens
     ctx: DeviceContext,
     lora_multiplier: Float32 = Float32(1.0),
+    progress_fd: Int32 = Int32(-1),
 ) raises -> Tensor:
     var st = SafeTensors.open(cfg.checkpoint)
     var seed_ts = Tensor.from_host([Float32(500.0)], [1], STDtype.F32, ctx)
@@ -338,6 +352,11 @@ def _denoise_lora_from_initial[
         var secs = Float64(t_step1 - t_step0) / 1.0e9
         var speed = Float64(1.0) / secs if secs > 0.0 else Float64(0.0)
         var step = i + 1
+        if progress_fd >= 0:
+            try:
+                _emit_server_progress(progress_fd, step, num_steps)
+            except e:
+                print("[Klein-sample] progress IPC skipped:", String(e))
         if step == 1 or step == num_steps or step % SAMPLE_SCREEN_EVERY == 0:
             print_sample_step(String("Klein-sample"), step, num_steps, sigma, secs, speed)
 
@@ -356,11 +375,12 @@ def _denoise_lora[
     seed: UInt64,
     ctx: DeviceContext,
     lora_multiplier: Float32 = Float32(1.0),
+    progress_fd: Int32 = Int32(-1),
 ) raises -> Tensor:
     var x = _initial_noise_tokens[N_IMG, LH, LW](cfg.in_channels, seed, ctx)
     return _denoise_lora_from_initial[H, Dh, N_IMG, N_TXT, S, LH, LW](
         cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^, ctx,
-        lora_multiplier,
+        lora_multiplier, progress_fd,
     )
 
 
@@ -492,6 +512,7 @@ def klein_sample[
     out_png: String,
     ctx: DeviceContext,
     lora_multiplier: Float32 = Float32(1.0),
+    progress_fd: Int32 = Int32(-1),
 ) raises -> Tensor:
     if cfg.n_heads != H:
         raise Error(String("klein_sample: cfg.n_heads ") + String(cfg.n_heads)
@@ -503,7 +524,7 @@ def klein_sample[
     # STAGE 2 — denoise; the base stack + LoRA free when this returns.
     var latent = _denoise_lora[H, Dh, N_IMG, N_TXT, S, LH, LW](
         cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, seed, ctx,
-        lora_multiplier,
+        lora_multiplier, progress_fd,
     )
 
     # STAGE 3 — VAE decode (loaded only now that the DiT stack is gone).
@@ -537,6 +558,7 @@ def klein_sample_with_initial_noise[
     out_png: String,
     ctx: DeviceContext,
     lora_multiplier: Float32 = Float32(1.0),
+    progress_fd: Int32 = Int32(-1),
 ) raises -> Tensor:
     if cfg.n_heads != H:
         raise Error(String("klein_sample_with_initial_noise: cfg.n_heads ") + String(cfg.n_heads)
@@ -550,7 +572,7 @@ def klein_sample_with_initial_noise[
     )
     var latent = _denoise_lora_from_initial[H, Dh, N_IMG, N_TXT, S, LH, LW](
         cfg, lora_path, pos_txt, neg_txt, cfg_scale, num_steps, x^, ctx,
-        lora_multiplier,
+        lora_multiplier, progress_fd,
     )
     var packed = tokens_to_packed_nchw[LH, LW](latent, ctx)
     var vae = KleinVaeDecoder[LH, LW].load(cfg.vae, ctx)

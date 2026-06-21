@@ -500,10 +500,10 @@
   color:var(--danger);border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer}
 #queue-strip #gallery-queue .gal-queue-stop:hover{border-color:var(--danger)}
 #queue-strip #gallery-queue .gal-queue-row{display:flex;align-items:center;gap:6px;
-  font-size:11px;color:var(--muted);padding:2px 0}
+  font-size:11px;color:var(--muted);padding:2px 0;min-width:0}
 #queue-strip #gallery-queue .gal-queue-running .gal-queue-dot{color:var(--ok)}
 #queue-strip #gallery-queue .gal-queue-pending .gal-queue-dot{color:var(--muted)}
-#queue-strip #gallery-queue .gal-queue-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#queue-strip #gallery-queue .gal-queue-label{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 `;
         document.head.appendChild(s);
       }

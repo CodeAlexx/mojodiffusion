@@ -151,8 +151,8 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
             "model": "klein-9b",
             "prompt": "serenity server product gate klein flux2, clean desert caravan scene",
             "negative": "",
-            "width": 512,
-            "height": 512,
+            "width": 1024,
+            "height": 1024,
             "steps": 1,
             "seed": 26061608,
             "cfg": 3.5,
@@ -1468,6 +1468,8 @@ def capability_coverage(capabilities: Any, samplers: Any, expected_backends: lis
     flux2_sizes = flux2.get("limits", {}).get("sizes") if isinstance(flux2.get("limits"), dict) else []
     if not any(isinstance(item, dict) and item.get("width") == 512 and item.get("height") == 512 for item in flux2_sizes):
         failures.append("flux2 capability does not advertise the bounded 512x512 route")
+    if not any(isinstance(item, dict) and item.get("width") == 1024 and item.get("height") == 1024 for item in flux2_sizes):
+        failures.append("flux2 capability does not advertise the bounded 1024x1024 route")
 
     return {
         "ok": not failures,

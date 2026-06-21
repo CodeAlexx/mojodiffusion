@@ -38,7 +38,7 @@
     anima: [[1024, 1024]],
     sd3: [[1024, 1024]],
     flux: [[1024, 1024]],
-    flux2: [[512, 512]],
+    flux2: [[1024, 1024], [512, 512]],
     chroma: [[1024, 1024]],
     sensenova: [[1024, 1024], [512, 512]],
   };
@@ -50,7 +50,7 @@
     anima: { width: 1024, height: 1024, steps: 20, cfg: 4.5, sampler: "euler", scheduler: "normal" },
     sd3: { width: 1024, height: 1024, steps: 28, cfg: 4.5, sampler: "euler", scheduler: "simple" },
     flux: { width: 1024, height: 1024, steps: 20, cfg: 4.0, sampler: "euler", scheduler: "simple" },
-    flux2: { width: 512, height: 512, steps: 4, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    flux2: { width: 1024, height: 1024, steps: 4, cfg: 4.0, sampler: "euler", scheduler: "simple" },
     chroma: { width: 1024, height: 1024, steps: 30, cfg: 3.5, sampler: "euler", scheduler: "simple" },
     sensenova: { width: 1024, height: 1024, steps: 30, cfg: 4.0, sampler: "euler", scheduler: "simple" },
   };
@@ -224,10 +224,10 @@
         if (aspectSel.value !== "custom") aspectSel.value = "custom";
       }
       wIn.addEventListener("change", function () {
-        var v = clampInt(wIn.value, 64, 8192, 1024); wIn.value = v; set("params.width", v); dimsChanged(); enforceProductionSize();
+        var v = clampInt(wIn.value, 64, 8192, 1024); wIn.value = v; set("params.width", v); dimsChanged();
       });
       hIn.addEventListener("change", function () {
-        var v = clampInt(hIn.value, 64, 8192, 1024); hIn.value = v; set("params.height", v); dimsChanged(); enforceProductionSize();
+        var v = clampInt(hIn.value, 64, 8192, 1024); hIn.value = v; set("params.height", v); dimsChanged();
       });
 
       root.appendChild(el("div", { class: "pr-section" }, [
@@ -609,9 +609,8 @@
         var squareOnly = aspects === SQUARE_ASPECTS;
         fillSelect(aspectSel, aspects, squareOnly ? "1:1" : (get("params.aspect") || "1:1"));
         if (squareOnly && get("params.aspect") !== "1:1") set("params.aspect", "1:1");
-        var target = preferDefault || !sizeAllowed(sizes, w, h)
-          ? admittedDefaultSize(backend, sizes)
-          : [w, h];
+        if (!preferDefault) return;
+        var target = admittedDefaultSize(backend, sizes);
         if (w !== target[0] || h !== target[1]) {
           wIn.value = target[0]; hIn.value = target[1];
           set("params.width", target[0]); set("params.height", target[1]);

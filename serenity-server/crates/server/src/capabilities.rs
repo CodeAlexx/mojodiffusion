@@ -239,11 +239,8 @@ fn default_scheduler_for_family(family: ModelFamily) -> &'static str {
     }
 }
 
-fn default_size_for_family(family: ModelFamily) -> (i64, i64) {
-    match family {
-        ModelFamily::Flux2 => (512, 512),
-        _ => (1024, 1024),
-    }
+fn default_size_for_family(_family: ModelFamily) -> (i64, i64) {
+    (1024, 1024)
 }
 
 fn default_steps_for_family(family: ModelFamily) -> i64 {
@@ -267,7 +264,7 @@ fn default_cfg_for_family(family: ModelFamily) -> f64 {
 }
 
 const ZIMAGE_SIZES: &[(i64, i64)] = &[(512, 512), (1024, 1024)];
-const KLEIN_SIZES: &[(i64, i64)] = &[(512, 512)];
+const KLEIN_SIZES: &[(i64, i64)] = &[(1024, 1024), (512, 512)];
 const SENSENOVA_SIZES: &[(i64, i64)] = &[(512, 512), (1024, 1024)];
 const SIZE_1024: &[(i64, i64)] = &[(1024, 1024)];
 const SAMPLERS_EULER: &[&str] = &["euler"];
@@ -327,15 +324,15 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             note: "current product worker has one admitted shape; add worker shape dispatch before exposing more sizes",
         },
         ModelFamily::Flux2 => ResolutionPolicy {
-            mode: "single_product_shape",
+            mode: "shape_dispatch",
             min_width: 512,
-            max_width: 512,
+            max_width: 1024,
             min_height: 512,
-            max_height: 512,
+            max_height: 1024,
             multiple: 512,
             square_only: true,
             admitted_shapes,
-            note: "current Klein product worker has one admitted shape; add worker shape dispatch before exposing more sizes",
+            note: "current Klein product worker dispatches compiled 512 and 1024 square shapes",
         },
         ModelFamily::Sensenova => ResolutionPolicy {
             mode: "shape_dispatch",

@@ -44,11 +44,17 @@ worker reached about 22.3 GiB VRAM. Chroma is also blocked because the current
 Mojo path requires pre-encoded T5 sidecars and has no production-admitted
 Rust-server worker route. Both remain visible through blocked capability
 profiles so the UI/API fail loudly instead of falling back to another image
-model. SenseNova is intentionally bounded to shape-dispatched
-512x512 and 1024x1024 txt2img, no negative prompt, no LoRA,
-no img2img/inpaint/masks, no VAE override, and no variation noise; it dispatches
-to `serenity_worker_sensenova`. The installed worker was rebuilt through the
-capped `build-worker-sensenova-raw` path and writes
+model. Klein/Flux2 is intentionally bounded to shape-dispatched 512x512 and
+1024x1024 txt2img through `serenity_worker_klein`; the Mojo runtime has concrete
+comptime branches for both shapes, so the Rust capability contract must expose
+both instead of clamping the Generate rail to 512 only. The browser rail keeps
+manual width/height edits intact and lets `/v1/preflight`/`/v1/generate` decide
+admission, so valid shapes run and invalid shapes fail loudly instead of being
+silently rewritten. SenseNova is intentionally bounded to shape-dispatched
+512x512 and 1024x1024 txt2img, no negative prompt, no LoRA, no
+img2img/inpaint/masks, no VAE override, and no variation noise; it dispatches to
+`serenity_worker_sensenova`. The installed worker was rebuilt through the capped
+`build-worker-sensenova-raw` path and writes
 `<png>.sensenova_daemon_result.json` on completion. Current 1024 evidence:
 `output/run_serenity_ui/job-0037.png`, SenseNova-U1, workflow route `image`,
 30 steps, seed `2026061730`, valid 1024x1024 RGB PNG, visual-health pass, and
@@ -227,10 +233,16 @@ Current Generate-screen evidence from 2026-06-16:
   `flux-2-klein-base-9b_fp8_e4m3fn`, browser Generate button,
   `serenity.canvas.generate_ws` workflow graph, 512x512, 4 steps,
   `scheduler:"simple"`, seed `2026061642`. Visually inspected as a coherent
-  portrait. Current limits: Klein progress stays at `0/4` until completion, and
-  the installed worker still lacks a worker-side result manifest until the
-  capped Mojo worker build picks up the new `klein_runtime_backend.mojo`
-  sidecar source.
+  portrait. Current remaining limit: Klein progress stays at `0/4` until
+  completion. The current runtime is shape-dispatched for 512x512 and 1024x1024;
+  512 evidence remains listed here as older matrix evidence, not as a resolution
+  ceiling.
+- `output/run_serenity_ui/job-0050.png`: Klein 9B/Flux2 `klein-9b`,
+  direct Rust `/v1/generate` product route, 1024x1024, 30 steps, `cfg:3.5`,
+  `scheduler:"simple"`, seed `2026061701`. Valid 1024x1024 RGB PNG, visually
+  inspected as a red glass cube on a dark studio surface. Server result manifest
+  present at `job-0050.png.serenity_server_result.json`; worker-side Klein
+  manifest is still missing.
 
 The real-image regression gate is
 `scripts/check_serenity_browser_generate_valid_image.js`; it clicks the browser
@@ -281,6 +293,8 @@ The API result document exposes the same signal at `/v1/job/:id/result` as
   `luminance_range:245.667`, `edge_energy:3.263`, `color_bins:314`.
 - `job-0013`: 512x512 Klein, `avg_stddev:25.769`,
   `luminance_range:217.667`, `edge_energy:3.032`, `color_bins:441`.
+- `job-0050`: 1024x1024 Klein, `avg_stddev:40.479`,
+  `luminance_range:253.0`, `edge_energy:4.145`, `color_bins:606`.
 
 Block/offload profile metadata lives in Rust at
 `crates/server/src/block_profiles.rs`. The profile contract deliberately marks
@@ -303,8 +317,11 @@ production control-plane behavior should land in this Rust server first.
 ## Run (once implemented)
 ```
 cargo build
-./target/debug/serenity-server --worker ../output/bin/serenity_worker_stub --out-dir ../output/run_serenity_ui
-# Optional: add `--kind stub` to override the `/v1/health` backend label only.
+./target/debug/serenity-server --worker ../output/bin/serenity_worker_zimage --out-dir ../output/run_serenity_ui
+# Use a real worker for product/UI launch. `serenity_worker_stub` is only for
+# IPC/control-plane tests; the Rust driver will swap a stub-launched server to
+# the real per-model worker before any admitted generation job.
+# Optional: add `--kind <backend>` to override the `/v1/health` backend label only.
 # The standalone Mojo workers are fd-only: `serenity_worker_* <fd>`.
 # Legacy monolith worker mode is explicit: `--daemon-worker-kind zimage`.
 # then:

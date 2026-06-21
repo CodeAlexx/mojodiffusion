@@ -281,6 +281,7 @@ async function main() {
     const preflightBodies = [];
     const generateBodies = [];
     const gridBodies = [];
+    let jobPollCount = 0;
     let rejectNextGenerate = false;
     await page.route("**/v1/preflight", async (route) => {
       preflightBodies.push(parsePostJson(route.request()));
@@ -325,6 +326,23 @@ async function main() {
         body: JSON.stringify({ job_id: "job-browser-smoke" }),
       });
     });
+    await page.route("**/v1/jobs", async (route) => {
+      jobPollCount += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([{
+          id: "job-browser-smoke",
+          model: "z-image",
+          state: "done",
+          progress: 100,
+          step: 26,
+          total: 26,
+          output_path: path.join(outDir, "job-browser-smoke.png"),
+          error: "",
+        }]),
+      });
+    });
     await page.route("**/v1/grid", async (route) => {
       gridBodies.push(parsePostJson(route.request()));
       await route.fulfill({
@@ -344,6 +362,13 @@ async function main() {
         body: TINY_PNG,
       });
     });
+    await page.route("**/out/job-browser-smoke.png", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "image/png",
+        body: TINY_PNG,
+      });
+    });
 
     await page.goto(baseUrl, { waitUntil: "commit", timeout: 10000 });
     await page.waitForSelector("#btn-generate", { state: "attached", timeout: 10000 });
@@ -353,6 +378,28 @@ async function main() {
         Serenity.modules && Serenity.modules.generateWS && Serenity.workflows &&
         Serenity.ideogram4Nodes;
     });
+    const initialQueueState = await page.evaluate(() => {
+      const q = document.querySelector("#gen-queue");
+      const st = document.querySelector("#gen-queue .gen-status");
+      const stop = document.querySelector("#gen-queue .gen-interrupt");
+      const bar = document.querySelector("#gen-queue .gen-bar");
+      return {
+        exists: !!q,
+        hidden: !!(q && q.classList.contains("gen-hidden")),
+        idle: !!(q && q.classList.contains("gen-idle")),
+        display: q ? getComputedStyle(q).display : "",
+        stopDisplay: stop ? getComputedStyle(stop).display : "",
+        barDisplay: bar ? getComputedStyle(bar).display : "",
+        status: st ? st.textContent : "",
+      };
+    });
+    assert(initialQueueState.exists, "generate queue strip was not created");
+    assert(initialQueueState.hidden === false, "generate queue strip is hidden after page load");
+    assert(initialQueueState.display !== "none", "generate queue strip display:none after page load");
+    assert(initialQueueState.idle === true, "generate queue strip did not start in idle state");
+    assert(initialQueueState.stopDisplay === "none", "generate queue idle state showed Stop");
+    assert(initialQueueState.barDisplay === "none", "generate queue idle state showed progress bar");
+    assert(initialQueueState.status === "idle", `generate queue strip idle status changed: ${initialQueueState.status}`);
     const refinerPanelState = await page.evaluate(() => {
       const panel = Array.from(document.querySelectorAll("#param-rail details"))
         .find((el) => ((el.querySelector("summary") || {}).textContent || "").trim() === "Refine / Upscale");
@@ -435,15 +482,31 @@ async function main() {
         height: Serenity.get("params.height"),
         scheduler: Serenity.get("params.scheduler"),
       };
-      return { klein, chroma, sensenova, sdxl };
+
+      Serenity.set("params.model", "flux-2-klein-base-9b_fp8_e4m3fn");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const resolutionInputs = Array.from(document.querySelectorAll("#param-rail .pr-grid2 input[type='number']"));
+      if (resolutionInputs.length < 2) throw new Error("resolution inputs not found");
+      resolutionInputs[0].value = "768";
+      resolutionInputs[0].dispatchEvent(new Event("change", { bubbles: true }));
+      resolutionInputs[1].value = "768";
+      resolutionInputs[1].dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const manualKlein = {
+        width: Serenity.get("params.width"),
+        height: Serenity.get("params.height"),
+        inputWidth: parseInt(resolutionInputs[0].value, 10),
+        inputHeight: parseInt(resolutionInputs[1].value, 10),
+      };
+      return { klein, chroma, sensenova, sdxl, manualKlein };
     });
     assert(
       capabilityState.klein.backend === "flux2",
       `Klein model was not classified as flux2: ${JSON.stringify(capabilityState)}`,
     );
     assert(
-      capabilityState.klein.width === 512 && capabilityState.klein.height === 512,
-      `Klein capability limits did not clamp to 512x512: ${JSON.stringify(capabilityState.klein)}`,
+      capabilityState.klein.width === 1024 && capabilityState.klein.height === 1024,
+      `Klein capability limits did not admit 1024x1024: ${JSON.stringify(capabilityState.klein)}`,
     );
     assert(
       capabilityState.klein.scheduler === "simple",
@@ -492,6 +555,11 @@ async function main() {
     assert(
       capabilityState.sdxl.scheduler === "normal",
       `SDXL capability scheduler did not normalize to normal: ${JSON.stringify(capabilityState.sdxl)}`,
+    );
+    assert(
+      capabilityState.manualKlein.width === 768 && capabilityState.manualKlein.height === 768 &&
+        capabilityState.manualKlein.inputWidth === 768 && capabilityState.manualKlein.inputHeight === 768,
+      `manual Klein dimensions were silently rewritten instead of left for server preflight: ${JSON.stringify(capabilityState.manualKlein)}`,
     );
 
     await page.evaluate(() => {
@@ -572,6 +640,10 @@ async function main() {
       Serenity.set("params.refiner", { enabled: true, model: "stale-refiner" });
     });
     rejectNextGenerate = true;
+    await page.evaluate(() => {
+      window.__canvasBrowserSmoke.origConnectWS = Serenity.api.connectWS;
+      Serenity.api.connectWS = function () { return { close: function () {} }; };
+    });
     await page.locator("#btn-generate").click();
     await waitUntil(
       () => preflightBodies.length >= 1 && generateBodies.length >= 1,
@@ -840,6 +912,59 @@ async function main() {
     assertPromptSyntaxPatchedWorkflow(generateBodies[1], "sanitized generate");
     const badGenerate = forbiddenForwardedKeys(generateBodies[1]);
     assert(badGenerate.length === 0, `generate forwarded disabled fields: ${badGenerate.join(", ")}`);
+    try {
+      await waitUntil(
+        async () => {
+          const state = await page.evaluate(() => ({
+            running: Serenity.get("progress.running"),
+            jobId: Serenity.get("progress.jobId"),
+            buttonDisabled: !!(document.querySelector("#btn-generate") &&
+              document.querySelector("#btn-generate").disabled),
+            queueHidden: !!(document.querySelector("#gen-queue") &&
+              document.querySelector("#gen-queue").classList.contains("gen-hidden")),
+            queueIdle: !!(document.querySelector("#gen-queue") &&
+              document.querySelector("#gen-queue").classList.contains("gen-idle")),
+            stopDisplay: document.querySelector("#gen-queue .gen-interrupt")
+              ? getComputedStyle(document.querySelector("#gen-queue .gen-interrupt")).display : "",
+            barDisplay: document.querySelector("#gen-queue .gen-bar")
+              ? getComputedStyle(document.querySelector("#gen-queue .gen-bar")).display : "",
+            status: document.querySelector("#gen-queue .gen-status") &&
+              document.querySelector("#gen-queue .gen-status").textContent,
+          }));
+          return state.running === false && state.buttonDisabled === false &&
+            state.queueHidden === false && state.queueIdle === true &&
+            state.stopDisplay === "none" && state.barDisplay === "none" &&
+            state.status === "done";
+        },
+        6000,
+        "generate unlock after /v1/jobs terminal reconcile",
+      );
+    } catch (err) {
+      const diag = await page.evaluate(() => ({
+        running: Serenity.get("progress.running"),
+        jobId: Serenity.get("progress.jobId"),
+        buttonDisabled: !!(document.querySelector("#btn-generate") &&
+          document.querySelector("#btn-generate").disabled),
+        queueHidden: !!(document.querySelector("#gen-queue") &&
+          document.querySelector("#gen-queue").classList.contains("gen-hidden")),
+        queueIdle: !!(document.querySelector("#gen-queue") &&
+          document.querySelector("#gen-queue").classList.contains("gen-idle")),
+        stopDisplay: document.querySelector("#gen-queue .gen-interrupt")
+          ? getComputedStyle(document.querySelector("#gen-queue .gen-interrupt")).display : "",
+        barDisplay: document.querySelector("#gen-queue .gen-bar")
+          ? getComputedStyle(document.querySelector("#gen-queue .gen-bar")).display : "",
+        status: document.querySelector("#gen-queue .gen-status") &&
+          document.querySelector("#gen-queue .gen-status").textContent,
+      }));
+      throw new Error(`${err.message}; poll=${jobPollCount}; diagnostic=${JSON.stringify(diag)}`);
+    }
+    assert(jobPollCount > 0, "generate reconciler did not poll /v1/jobs");
+    await page.evaluate(() => {
+      if (window.__canvasBrowserSmoke.origConnectWS) {
+        Serenity.api.connectWS = window.__canvasBrowserSmoke.origConnectWS;
+        delete window.__canvasBrowserSmoke.origConnectWS;
+      }
+    });
 
     await page.evaluate(() => {
       Serenity.set("params.init_image", "/tmp/stale-init.png");
@@ -1015,6 +1140,7 @@ async function main() {
       base_url: baseUrl,
       health,
       generate_body_keys: Object.keys(generateBodies[0]).sort(),
+      job_poll_count: jobPollCount,
       workflow_tab_body_keys: Object.keys(workflowGenerate).sort(),
       ideogram_workflow_body_keys: Object.keys(ideogramGenerate).sort(),
       grid_body_keys: Object.keys(gridBodies[0]).sort(),

@@ -122,6 +122,14 @@ GENERATE_WS_REQUIRED = (
     "class_type: \"SerenityRefinerUpscaleIntent\"",
     "function hasRefinerUpscaleIntent(p)",
     "function refinerUpscaleIntentInputs(p)",
+    "function startJobReconciler(jobId)",
+    "function reconcileJob(jobId)",
+    "fetch((api.base || \"\") + \"/v1/jobs\"",
+    "state === \"done\"",
+    "finishJob()",
+    "root.className = \"gen-idle\"",
+    "root.classList.remove(\"gen-hidden\")",
+    "#gen-queue.gen-idle .gen-interrupt{display:none}",
 )
 
 GENERATE_WS_FORBIDDEN = (
@@ -152,7 +160,7 @@ PARAM_RAIL_REQUIRED = (
     "function capabilityDefaults(backend)",
     "function admittedDefaultSize(backend, sizes)",
     "function applyCapabilityDefaults(backend, backendChanged)",
-    "flux2: [[512, 512]]",
+    "flux2: [[1024, 1024], [512, 512]]",
     "chroma: [[1024, 1024]]",
     "chroma: { width: 1024, height: 1024, steps: 30",
     "sensenova: [[1024, 1024], [512, 512]]",
@@ -295,7 +303,9 @@ BBOX_BUILDER_FORBIDDEN = (
 )
 
 CANVAS_CSS_REQUIRED = (
-    "#queue-strip{position:fixed;right:12px;bottom:236px;z-index:20}",
+    "#queue-strip{position:fixed;right:12px;bottom:236px;z-index:20;",
+    "max-width:calc(100vw - 24px);",
+    "max-height:calc(100vh - 260px);overflow:hidden",
 )
 
 

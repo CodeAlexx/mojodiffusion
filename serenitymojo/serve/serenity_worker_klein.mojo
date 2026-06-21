@@ -94,4 +94,5 @@ def main() raises:
         return
     var fd = Int32(Int(String(args[1])))
     var b = KleinRuntimeBackend()
+    b.set_progress_fd(fd)
     _klein_worker_loop(b, fd)

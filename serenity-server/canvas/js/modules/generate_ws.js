@@ -62,6 +62,8 @@
       let wsHandle = null;    // the object connectWS returned (ws or {close})
       let currentPromptId = null;
       let submitting = false;
+      let reconcileTimer = null;
+      let terminalHideTimer = null;
 
       // ---- find + bind the Generate button (rendered by paramRail) -----------
       let boundBtn = null;
@@ -147,6 +149,7 @@
           currentPromptId = (res && (res.prompt_id || res.promptId)) || null;
           const total = Number(get("params.steps")) || 0;
           setProgress({ running: true, step: 0, total, jobId: currentPromptId });
+          startJobReconciler(currentPromptId);
           ui.setStatus("queued" + (currentPromptId ? " · " + shortId(currentPromptId) : ""));
           bus.emit("generate:submitted", { promptId: currentPromptId, graph });
         } catch (e) {
@@ -500,15 +503,7 @@
         const imgs = out.images || [];
         for (const im of imgs) {
           if (!im || !im.filename) continue;
-          const url = api.viewUrl(im.filename, im.type || "output", im.subfolder || "");
-          bus.emit("result:ready", {
-            url,
-            filename: im.filename,
-            type: im.type || "output",
-            subfolder: im.subfolder || "",
-            promptId: currentPromptId,
-            params: readParams(),
-          });
+          emitResult(im.filename, im.type || "output", im.subfolder || "", currentPromptId);
           ui.setStatus("done");
         }
       }
@@ -549,7 +544,9 @@
       }
 
       function finishJob() {
-        setProgress({ running: false, step: 0, total: 0, jobId: null });
+        stopJobReconciler();
+        setProgress({ running: false, step: 0, total: 0, jobId: null }, true);
+        holdTerminalStatus();
         // clear the live preview shortly after; the final result is the gallery's job
         clearPreview();
         closeWS();
@@ -642,20 +639,93 @@
       }
 
       // ===== state.progress helpers ==========================================
-      function setProgress(pr) {
+      function setProgress(pr, keepVisible) {
+        if (pr.running || submitting) clearTerminalHold();
         set("progress.running", !!pr.running);
         set("progress.step", num(pr.step, 0));
         set("progress.total", num(pr.total, 0));
         set("progress.jobId", pr.jobId != null ? pr.jobId : null);
-        ui.setVisible(!!pr.running || submitting);
+        ui.setVisible(!!pr.running || submitting || !!keepVisible, !!pr.running || submitting);
       }
 
       function setBusy(b) {
+        if (b) clearTerminalHold();
         if (boundBtn) {
           boundBtn.disabled = !!b;
           boundBtn.classList.toggle("is-busy", !!b);
         }
-        ui.setVisible(b || get("progress.running"));
+        ui.setVisible(true, b || get("progress.running"));
+      }
+
+      function holdTerminalStatus() {
+        clearTerminalHold();
+        ui.setVisible(true, false);
+        terminalHideTimer = setTimeout(() => {
+          terminalHideTimer = null;
+          if (!get("progress.running") && !submitting) ui.setVisible(false, false);
+        }, 5000);
+      }
+      function clearTerminalHold() {
+        if (terminalHideTimer) clearTimeout(terminalHideTimer);
+        terminalHideTimer = null;
+      }
+
+      function startJobReconciler(jobId) {
+        stopJobReconciler();
+        if (!jobId) return;
+        reconcileTimer = setInterval(() => reconcileJob(jobId), 2000);
+      }
+      function stopJobReconciler() {
+        if (reconcileTimer) clearInterval(reconcileTimer);
+        reconcileTimer = null;
+      }
+      async function reconcileJob(jobId) {
+        if (!jobId || currentPromptId !== jobId) { stopJobReconciler(); return; }
+        try {
+          const jobs = await fetchJobs();
+          const job = Array.isArray(jobs) ? jobs.find((j) => j && j.id === jobId) : null;
+          if (!job || currentPromptId !== jobId) return;
+          const state = String(job.state || "").toLowerCase();
+          const step = num(job.step, get("progress.step") || 0);
+          const total = num(job.total, get("progress.total") || 0);
+          if (state === "queued" || state === "running") {
+            setProgress({ running: true, step, total, jobId });
+            ui.setBar(total ? step / total : 0);
+            ui.setStatus(total ? ("step " + step + "/" + total) : state);
+            return;
+          }
+          if (state === "done") {
+            if (job.output_path) emitResult(baseName(job.output_path), "output", "", jobId);
+            ui.setBar(1);
+            ui.setStatus("done");
+            finishJob();
+          } else if (state === "failed") {
+            ui.setStatus("execution error");
+            finishJob();
+          } else if (state === "cancelled") {
+            ui.setStatus("cancelled");
+            finishJob();
+          }
+        } catch (e) {
+          console.warn("[generateWS] job reconcile failed:", e);
+        }
+      }
+      function fetchJobs() {
+        return fetch((api.base || "") + "/v1/jobs", { cache: "no-store" }).then((r) => {
+          if (!r.ok) throw new Error("jobs HTTP " + r.status);
+          return r.json();
+        });
+      }
+      function emitResult(filename, type, subfolder, promptId) {
+        const url = api.viewUrl(filename, type || "output", subfolder || "");
+        bus.emit("result:ready", {
+          url,
+          filename,
+          type: type || "output",
+          subfolder: subfolder || "",
+          promptId,
+          params: readParams(),
+        });
       }
 
       // ===== interrupt ========================================================
@@ -762,6 +832,9 @@
           l.group || l.image || l.canvas || l.imageEl || l.uploadedPath || l.uploadedName));
       }
       function shortId(s) { return String(s).slice(0, 8); }
+      function baseName(path) {
+        return String(path || "").split(/[\\/]/).pop();
+      }
 
       function dataURLToBlob(dataURL) {
         try {
@@ -807,7 +880,7 @@
       function buildQueueStrip(mount) {
         const root = document.createElement("div");
         root.id = "gen-queue";
-        root.className = "gen-hidden";
+        root.className = "gen-idle";
 
         const bar = document.createElement("div");
         bar.className = "gen-bar";
@@ -850,7 +923,11 @@
           setQueue(n) {
             queue.textContent = (n && n > 0) ? ("· " + n + " queued") : "";
           },
-          setVisible(v) { root.classList.toggle("gen-hidden", !v); },
+          setVisible(v, running) {
+            root.classList.remove("gen-hidden");
+            root.classList.toggle("gen-active", !!running);
+            root.classList.toggle("gen-idle", !running);
+          },
           onInterrupt(fn) { stopBtn.addEventListener("click", fn); },
         };
       }
@@ -859,16 +936,18 @@
       function injectCSS() {
         if (document.getElementById("style-" + NAME)) return;
         const css = `
-#gen-queue{min-width:220px;background:var(--panel2);border:1px solid var(--line);
+#gen-queue{min-width:220px;max-width:min(340px,calc(100vw - 24px));background:var(--panel2);border:1px solid var(--line);
   border-radius:var(--radius);padding:8px 10px;box-shadow:0 6px 18px rgba(0,0,0,.35);
   font:12px/1.3 system-ui,sans-serif;color:var(--text)}
 #gen-queue.gen-hidden{display:none}
-#gen-queue .gen-meta{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-#gen-queue .gen-status{flex:1;color:var(--muted);white-space:nowrap;overflow:hidden;
+#gen-queue.gen-idle .gen-interrupt{display:none}
+#gen-queue.gen-idle .gen-bar{display:none}
+#gen-queue .gen-meta{display:flex;align-items:center;gap:8px;margin-bottom:6px;min-width:0}
+#gen-queue .gen-status{flex:1 1 auto;min-width:0;color:var(--muted);white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis}
-#gen-queue .gen-queue-count{color:var(--muted);font-size:11px}
+#gen-queue .gen-queue-count{flex:0 1 auto;min-width:0;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #gen-queue .gen-interrupt{background:var(--danger);border:1px solid var(--danger);
-  color:#fff;border-radius:6px;padding:3px 8px;cursor:pointer;font-weight:600;font-size:11px}
+  color:#fff;border-radius:6px;padding:3px 8px;cursor:pointer;font-weight:600;font-size:11px;flex:0 0 auto}
 #gen-queue .gen-interrupt:hover{filter:brightness(1.1)}
 #gen-queue .gen-bar{height:6px;background:var(--line);border-radius:4px;overflow:hidden}
 #gen-queue .gen-bar-fill{height:100%;width:0%;background:linear-gradient(90deg,

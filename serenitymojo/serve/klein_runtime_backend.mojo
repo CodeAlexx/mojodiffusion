@@ -33,14 +33,14 @@
 #     resident_model() reports "" and between_jobs_trim is a no-op — there is no
 #     persistent device handle to trim.
 #
-# step() state machine (pull-based, bounded announce ticks + ONE long blocking
-# tick per heavy stage — same shape as klein_backend.mojo's external-process
-# state machine, but the heavy work is in-process):
+# step() state machine (pull-based announce ticks; the sampler loop emits
+# machine-readable progress events for every denoise step over the worker IPC fd):
 #   ENCODE  : announce phase="encoding" -> next tick runs the (blocking) Qwen3
 #             encode of prompt+negative.
-#   SAMPLE  : announce phase="sampling" -> next tick runs the (blocking) full
-#             klein_sample denoise + VAE decode + PNG save, then re-embeds the
-#             serenity.genparams.v1 tEXt chunk and returns done.
+#   SAMPLE  : announce phase="sampling" -> next tick runs klein_sample denoise +
+#             VAE decode + PNG save. During denoise the sampler writes
+#             {"ev":"progress","step":N,...} lines on the same IPC socket, then
+#             the backend re-embeds serenity.genparams.v1 and returns done.
 # cancel() flips a flag; the next step() returns cancelled and frees per-job
 # state. (klein_sample is a single blocking call — cancellation is honored at
 # the tick boundaries, not mid-denoise, matching the staged backend.)
@@ -250,11 +250,12 @@ struct KleinRuntimeBackend(GenBackend, Movable):
     var cfg: List[ArcPointer[TrainConfig]]   # 0/1 (per-job, loaded at admission)
     var lora_path: String
     var out_png: String
-    var job_t0_ns: Int
+    var job_t0_ns: UInt
     var encode_seconds: Float64
     var sample_decode_seconds: Float64
     var total_vram_bytes: Int
     var min_free_bytes: Int
+    var progress_fd: Int32
     # encoded conditioning, produced in ENCODE, consumed in SAMPLE.
     # pos/neg are [N_TXT, joint] (already reshaped for klein_sample).
     var pos_txt: List[ArcPointer[Tensor]]    # 0/1
@@ -272,11 +273,12 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         self.cfg = List[ArcPointer[TrainConfig]]()
         self.lora_path = String("")
         self.out_png = String("")
-        self.job_t0_ns = 0
+        self.job_t0_ns = UInt(0)
         self.encode_seconds = 0.0
         self.sample_decode_seconds = 0.0
         self.total_vram_bytes = 0
         self.min_free_bytes = 0
+        self.progress_fd = Int32(-1)
         self.pos_txt = List[ArcPointer[Tensor]]()
         self.neg_txt = List[ArcPointer[Tensor]]()
 
@@ -293,6 +295,9 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         # each job and freed before the VAE; the encoder is freed per job. So no
         # persistent checkpoint is "loaded" between jobs.
         return String("")
+
+    def set_progress_fd(mut self, fd: Int32):
+        self.progress_fd = fd
 
     # ── job admission ─────────────────────────────────────────────────────────
     def start(mut self, params: JobParams) raises:
@@ -552,23 +557,23 @@ struct KleinRuntimeBackend(GenBackend, Movable):
             if self.variant == String("9b"):
                 var _img = klein_sample[N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_9B, Dh](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                    seed, self.out_png, self.ctx,
+                    seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
                 )
             else:
                 var _img = klein_sample[N_IMG_512, N_TXT, S_512, LH_512, LW_512, H_4B, Dh](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                    seed, self.out_png, self.ctx,
+                    seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
                 )
         else:
             if self.variant == String("9b"):
                 var _img = klein_sample[N_IMG_1024, N_TXT, S_1024, LH_1024, LW_1024, H_9B, Dh](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                    seed, self.out_png, self.ctx,
+                    seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
                 )
             else:
                 var _img = klein_sample[N_IMG_1024, N_TXT, S_1024, LH_1024, LW_1024, H_4B, Dh](
                     self.cfg[0][], self.lora_path, pos, neg, cfg_scale, steps,
-                    seed, self.out_png, self.ctx,
+                    seed, self.out_png, self.ctx, progress_fd=self.progress_fd,
                 )
 
         if not _path_exists(self.out_png):
@@ -576,7 +581,8 @@ struct KleinRuntimeBackend(GenBackend, Movable):
         _embed_genparams_in_png(self.out_png, self.params.params_json)
         self.sample_decode_seconds = Float64(perf_counter_ns() - t0) / 1.0e9
         self._record_vram()
-        var manifest = self._write_result_manifest(self.out_png)
+        var out_path = self.out_png.copy()
+        var manifest = self._write_result_manifest(out_path)
         print("[klein_runtime][manifest] saved:", manifest)
         return self.out_png.copy()
 

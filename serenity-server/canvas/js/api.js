@@ -57,7 +57,7 @@
     anima: { width: 1024, height: 1024, steps: 20, cfg: 4.5, sampler: "euler", scheduler: "normal" },
     sd3: { width: 1024, height: 1024, steps: 28, cfg: 4.5, sampler: "euler", scheduler: "simple" },
     flux: { width: 1024, height: 1024, steps: 20, cfg: 4.0, sampler: "euler", scheduler: "simple" },
-    flux2: { width: 512, height: 512, steps: 4, cfg: 4.0, sampler: "euler", scheduler: "simple" },
+    flux2: { width: 1024, height: 1024, steps: 4, cfg: 4.0, sampler: "euler", scheduler: "simple" },
     chroma: { width: 1024, height: 1024, steps: 30, cfg: 3.5, sampler: "euler", scheduler: "simple" },
     sensenova: { width: 1024, height: 1024, steps: 30, cfg: 4.0, sampler: "euler", scheduler: "simple" },
   };

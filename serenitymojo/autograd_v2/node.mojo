@@ -60,6 +60,12 @@ comptime OPK_KLEIN_DBL_POST = 15    # (x, att) -> stream out + out/ff_in/ff_out 
 comptime OPK_KLEIN_SGL_IN = 16      # x -> (q_rms,k_rms,v,mlp_gate,mlp_up) + qkv LoRA leaves
 comptime OPK_KLEIN_SGL_SDPA = 17    # (q_rms,k_rms,v) -> att_flat (rope+sdpa)
 comptime OPK_KLEIN_SGL_OUT = 18     # (x, att_flat, mlp) -> block out + out LoRA leaves (lazy fwd)
+# P7 ideogram4 single-stream block, COARSE (Stage 1, ideogram4_block_graph.mojo).
+# ONE composite kind/block: apply arm reboxes saved weights/adapters, recomputes the
+# forward, calls the WHOLE ideogram4_block_lora_backward oracle (models/ideogram4/
+# block.mojo) -- bit-identical to the hand-chain. saved=[x,adaln,cos,sin,13 weights,
+# 12 lora a/b]; saved_meta=[rank]; scalars=[alpha]. Edges(14): x,adaln, a/b per slot.
+comptime OPK_IDEOGRAM4_BLOCK = 19
 
 
 struct Edge(Copyable, Movable):

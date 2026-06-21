@@ -1167,3 +1167,74 @@ def record_klein_sgl_out(
     var oids: List[Int] = [out_id]
     _ = g.record(OPK_KLEIN_SGL_OUT, edges^, saved^, meta^, scalars^, oids)
     return out_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P7 ideogram4 COARSE record (Stage 1). Records the block forward as ONE composite
+# node: runs the fwd to produce the block output (acts discarded — apply recomputes,
+# the hand-chain stack-backward discipline), saves the recompute inputs
+# [x,adaln,cos,sin, 13 weights (Ideogram4BlockWeights field order), 12 lora a/b],
+# and edges x,adaln,a/b-per-slot to the 14 leaves. apply_ideogram4 unpacks by index.
+# ─────────────────────────────────────────────────────────────────────────────
+from std.memory import ArcPointer as _ArcPtrR
+from serenitymojo.models.ideogram4.block import (
+    ideogram4_block_lora_forward as _i4r_fwd,
+    Ideogram4BlockWeights as _I4Wr,
+)
+from serenitymojo.models.ideogram4.lora_module import LoraAdapter as _I4LoraR
+from serenitymojo.autograd_v2.node import (
+    OPK_IDEOGRAM4_BLOCK as _OPK_I4R, arc_view as _i4r_arc, Edge as _EdgeI4R,
+)
+
+comptime _I4rLArc = _ArcPtrR[_I4LoraR]
+
+
+def record_ideogram4_block[
+    S: Int, Hidden: Int, Heads: Int, Dh: Int, FF: Int, Adaln: Int,
+](
+    mut g: Graph,
+    x: TArc, adaln: TArc, cosf: TArc, sinf: TArc,
+    w: _I4Wr, loras: List[_I4rLArc],
+    x_id: Int, adaln_id: Int, a_ids: List[Int], b_ids: List[Int],
+    ctx: DeviceContext,
+) raises -> TArc:
+    var rb = _i4r_fwd[S, Hidden, Heads, Dh, FF, Adaln](
+        x[], adaln[], cosf[], sinf[], w, loras, ctx
+    )
+    var out_t = Tensor(rb.out.buf.copy(), rb.out.shape(), rb.out.dtype())
+    out_t.set_id(g.fresh_tensor_id())
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(adaln.copy())
+    saved.append(cosf.copy())
+    saved.append(sinf.copy())
+    saved.append(_i4r_arc(w.adaln_w))
+    saved.append(_i4r_arc(w.adaln_b))
+    saved.append(_i4r_arc(w.attn_norm1))
+    saved.append(_i4r_arc(w.attn_norm2))
+    saved.append(_i4r_arc(w.ffn_norm1))
+    saved.append(_i4r_arc(w.ffn_norm2))
+    saved.append(_i4r_arc(w.qkv_w))
+    saved.append(_i4r_arc(w.o_w))
+    saved.append(_i4r_arc(w.norm_q))
+    saved.append(_i4r_arc(w.norm_k))
+    saved.append(_i4r_arc(w.w1))
+    saved.append(_i4r_arc(w.w2))
+    saved.append(_i4r_arc(w.w3))
+    for slot in range(6):
+        saved.append(_i4r_arc(loras[slot][].a))
+        saved.append(_i4r_arc(loras[slot][].b))
+    var edges = List[_EdgeI4R]()
+    edges.append(g.edge_for(x_id))
+    edges.append(g.edge_for(adaln_id))
+    for slot in range(6):
+        edges.append(g.edge_for(a_ids[slot]))
+        edges.append(g.edge_for(b_ids[slot]))
+    var meta = List[Int]()
+    meta.append(loras[0][].rank)
+    var scal = List[Float32]()
+    scal.append(loras[0][].alpha)
+    var out_ids = List[Int]()
+    out_ids.append(out_t.id)
+    _ = g.record(_OPK_I4R, edges^, saved^, meta^, scal^, out_ids)
+    return TArc(out_t^)

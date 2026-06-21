@@ -1203,3 +1203,153 @@ def execute_klein[
             + " (dep-count exactness violated)"
         )
     return result^
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P7 ideogram4 COARSE block adapter (Stage 1, ideogram4_block_graph.mojo).
+# apply_ideogram4 dispatches the single composite kind OPK_IDEOGRAM4_BLOCK by
+# reboxing the saved weights/adapters, recomputing the forward, and calling the
+# WHOLE ideogram4_block_lora_backward oracle (serenitymojo/models/ideogram4/
+# block.mojo) — bit-identical to the hand-chain stack backward by construction.
+# execute_ideogram4 is execute_klein's engine VERBATIM with the ideogram4 dispatch
+# and comptime block dims. saved=[x,adaln,cos,sin, 13 weights (struct field order),
+# 12 lora a/b]; saved_meta=[rank]; scalars=[alpha]; edges(14)=x,adaln,a/b per slot.
+from std.memory import ArcPointer as _ArcPtr
+from serenitymojo.models.ideogram4.block import (
+    ideogram4_block_lora_forward as _i4_fwd,
+    ideogram4_block_lora_backward as _i4_bwd,
+    Ideogram4BlockWeights as _I4W,
+)
+from serenitymojo.models.ideogram4.lora_module import LoraAdapter as _I4Lora
+from serenitymojo.autograd_v2.node import OPK_IDEOGRAM4_BLOCK, arc_view as _i4_arc_view
+
+comptime _I4LArc = _ArcPtr[_I4Lora]
+
+
+def _rebox_i4(t: TArc) raises -> Tensor:
+    return Tensor(t[].buf.copy(), t[].shape(), t[].dtype())
+
+
+def apply_ideogram4[
+    S: Int, Hidden: Int, Heads: Int, Dh: Int, FF: Int, Adaln: Int,
+](
+    node: Node, grads_in: List[TArc], ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> List[TArc]:
+    if node.kind != OPK_IDEOGRAM4_BLOCK:
+        raise Error("apply_ideogram4: unexpected node kind")
+    var rank = node.saved_meta[0]
+    var alpha = node.scalars[0]
+    var w = _I4W(
+        _rebox_i4(node.saved[4]), _rebox_i4(node.saved[5]), _rebox_i4(node.saved[6]),
+        _rebox_i4(node.saved[7]), _rebox_i4(node.saved[8]), _rebox_i4(node.saved[9]),
+        _rebox_i4(node.saved[10]), _rebox_i4(node.saved[11]), _rebox_i4(node.saved[12]),
+        _rebox_i4(node.saved[13]), _rebox_i4(node.saved[14]), _rebox_i4(node.saved[15]),
+        _rebox_i4(node.saved[16]),
+    )
+    var loras = List[_I4LArc]()
+    for slot in range(6):
+        loras.append(_I4LArc(_I4Lora(
+            _rebox_i4(node.saved[17 + slot * 2]),
+            _rebox_i4(node.saved[17 + slot * 2 + 1]),
+            rank, alpha,
+        )))
+    var rb = _i4_fwd[S, Hidden, Heads, Dh, FF, Adaln](
+        node.saved[0][], node.saved[1][], node.saved[2][], node.saved[3][], w, loras, ctx
+    )
+    var bb = _i4_bwd[S, Hidden, Heads, Dh, FF, Adaln](
+        grads_in[0][], rb.acts^, node.saved[2][], node.saved[3][], w, loras, ctx
+    )
+    var out = List[TArc]()
+    out.append(_i4_arc_view(bb.d_x))
+    out.append(_i4_arc_view(bb.d_adaln_input))
+    for slot in range(6):
+        out.append(bb.lora_grads.d_a[slot].copy())
+        out.append(bb.lora_grads.d_b[slot].copy())
+    return out^
+
+
+def execute_ideogram4[
+    S: Int, Hidden: Int, Heads: Int, Dh: Int, FF: Int, Adaln: Int,
+](
+    mut graph: Graph, roots: List[Int], root_grads: List[TArc],
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> Dict[Int, TArc]:
+    """execute_klein VERBATIM (dep-count BFS, slot-ordered buffers, ready-queue
+    order, fired==reachable) with the ideogram4 apply dispatch + comptime dims."""
+    var n = len(graph.nodes)
+    if len(roots) == 0 or len(roots) != len(root_grads):
+        raise Error("execute_ideogram4: roots/root_grads length mismatch or empty")
+    for i in range(len(roots)):
+        if roots[i] < 0 or roots[i] >= n:
+            raise Error("execute_ideogram4: root node out of range")
+    var dep = List[Int]()
+    var seen = List[Bool]()
+    var in_queue = List[Bool]()
+    for _ in range(n):
+        dep.append(0)
+        seen.append(False)
+        in_queue.append(False)
+    var stack = List[Int]()
+    for i in range(len(roots)):
+        stack.append(roots[i])
+    var reachable = 0
+    while len(stack) > 0:
+        var nid = stack.pop()
+        if seen[nid]:
+            continue
+        seen[nid] = True
+        reachable += 1
+        for i in range(len(graph.nodes[nid].edges)):
+            var child = graph.nodes[nid].edges[i].node_idx
+            if child >= 0:
+                dep[child] += 1
+                stack.append(child)
+    var buffers = List[InputBuffer]()
+    for i in range(n):
+        buffers.append(InputBuffer(graph.nodes[i].contrib_counts, root_grads[0].copy()))
+    for i in range(len(roots)):
+        buffers[roots[i]].add(0, buffers[roots[i]].seed_slot(0), root_grads[i].copy(), ctx)
+    var ready = List[Int]()
+    for i in range(len(roots)):
+        dep[roots[i]] += 1
+    for i in range(len(roots)):
+        _dec_and_maybe_enqueue(dep, ready, in_queue, roots[i])
+    var result = Dict[Int, TArc]()
+    var fired = 0
+    while len(ready) > 0:
+        var nid = _pop_best(ready, graph)
+        fired += 1
+        var num_in = graph.nodes[nid].num_inputs
+        var grads_in = List[TArc]()
+        for s in range(num_in):
+            if not buffers[nid].any_present(s):
+                raise Error(String("execute_ideogram4: node ") + String(nid) + " missing grad slot " + String(s))
+            grads_in.append(buffers[nid].materialize(s, ctx))
+        if graph.nodes[nid].kind == OPK_LEAF:
+            var pid = graph.nodes[nid].param_id
+            if result.__contains__(pid):
+                var old = result[pid]
+                var summed = _raw_add(old[], grads_in[0][], ctx)
+                result[pid] = TArc(summed^)
+            else:
+                result[pid] = grads_in[0].copy()
+            continue
+        var out_grads = apply_ideogram4[S, Hidden, Heads, Dh, FF, Adaln](
+            graph.nodes[nid], grads_in, ctx, scratch
+        )
+        var n_edges = len(graph.nodes[nid].edges)
+        if len(out_grads) != n_edges:
+            raise Error(String("execute_ideogram4: apply arity mismatch node ") + String(nid))
+        for s in range(n_edges):
+            var child = graph.nodes[nid].edges[s].node_idx
+            if child < 0:
+                continue
+            var slot = graph.nodes[nid].edges[s].input_nr
+            var cslot = graph.nodes[nid].edges[s].contrib_slot
+            buffers[child].add(slot, cslot, out_grads[s].copy(), ctx)
+            _dec_and_maybe_enqueue(dep, ready, in_queue, child)
+    if fired != reachable:
+        raise Error(String("execute_ideogram4: fired=") + String(fired) + " != reachable=" + String(reachable))
+    return result^

@@ -47,6 +47,7 @@ from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
+comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
 comptime _TPB = 256
 comptime _NEG_BIG = Float32(-3.0e38)
@@ -737,6 +738,32 @@ def sdpa_backward_masked[
 #   d_k        = (grad_scoresᵀ @ Q) · scale                 [BH, Skv, Dh]
 # All interior math F32; BF16/F16 only at the gather/scatter storage boundary.
 # Non-causal, no mask grad (mask is additive bias / zero for diffusion paths).
+
+# bf16->F32 elementwise cast (1D) for the cuBLAS-matmul SDPA backward path.
+fn _cast_bwd_kernel[dtype: DType](
+    src: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var val = rebind[Scalar[dtype]](src[i]).cast[DType.float32]()
+        dst[i] = rebind[dst.element_type](val)
+
+
+def _cast_bwd_f32[dtype: DType](
+    src_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dst_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int, ctx: DeviceContext,
+) raises:
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var S = LayoutTensor[dtype, _DYN1, MutAnyOrigin](src_ptr, rl)
+    var D = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](dst_ptr, rl)
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_cast_bwd_kernel[dtype], _cast_bwd_kernel[dtype]](
+        S, D, n, grid_dim=grid, block_dim=_BLOCK)
+
+
 def _sdpa_backward_rect_storage[
     B: Int, Sq: Int, Skv: Int, H: Int, Dh: Int, dtype: DType
 ](
@@ -824,13 +851,22 @@ def _sdpa_backward_rect_storage[
     var dv_full_k = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         dvptr, kv_bhsd_rl
     )
-    var dvgrid = (kv_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _dv_from_attn_go_kernel[dtype], _dv_from_attn_go_kernel[dtype]
-    ](
-        attn_full, go_full, dv_full_k, B, Sq, Skv, H, Dh,
-        grid_dim=dvgrid, block_dim=_BLOCK,
-    )
+    # F32 copies of go/k/q for cuBLAS matmuls (ULP-safe; bf16 upcasts exactly).
+    var go_f32 = ctx.enqueue_create_buffer[DType.float32](q_bhsd_rows * Dh)
+    var k_f32 = ctx.enqueue_create_buffer[DType.float32](kv_bhsd_rows * Dh)
+    var q_f32 = ctx.enqueue_create_buffer[DType.float32](q_bhsd_rows * Dh)
+    _cast_bwd_f32[dtype](goptr, go_f32.unsafe_ptr(), q_bhsd_rows * Dh, ctx)
+    _cast_bwd_f32[dtype](kptr, k_f32.unsafe_ptr(), kv_bhsd_rows * Dh, ctx)
+    _cast_bwd_f32[dtype](qptr, q_f32.unsafe_ptr(), q_bhsd_rows * Dh, ctx)
+    var go_f32ptr = go_f32.unsafe_ptr()
+    var k_f32ptr = k_f32.unsafe_ptr()
+    var q_f32ptr = q_f32.unsafe_ptr()
+    # dV = attnᵀ @ go  (cuBLAS matmul; was naive _dv_from_attn_go_kernel)
+    for bh in range(BH):
+        var Pdv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr + bh * Sq * Skv, sc_rl)
+        var GOdv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](go_f32ptr + bh * Sq * Dh, q_head_rl)
+        var DV = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr + bh * Skv * Dh, kv_head_rl)
+        matmul(ctx, DV, Pdv, GOdv, transpose_a=True, c_row_major=True)
 
     var gscores = ctx.enqueue_create_buffer[DType.float32](BH * Sq * Skv)
     var gsptr = gscores.unsafe_ptr()
@@ -838,14 +874,12 @@ def _sdpa_backward_rect_storage[
     var ga_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         gsptr, sc_full_rl
     )
-    var gagrid = (BH * Sq * Skv + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _grad_attn_from_go_v_kernel[dtype],
-        _grad_attn_from_go_v_kernel[dtype],
-    ](
-        go_full, v_full, ga_full, B, Sq, Skv, H, Dh,
-        grid_dim=gagrid, block_dim=_BLOCK,
-    )
+    # dP = go @ vᵀ  (bf16 cuBLAS matmul; was naive _grad_attn_from_go_v_kernel)
+    for bh in range(BH):
+        var GOdp = LayoutTensor[dtype, _DYN2, MutAnyOrigin](goptr + bh * Sq * Dh, q_head_rl)
+        var Vdp = LayoutTensor[dtype, _DYN2, MutAnyOrigin](vptr + bh * Skv * Dh, kv_head_rl)
+        var GAdp = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr + bh * Sq * Skv, sc_rl)
+        matmul(ctx, GAdp, GOdp, Vdp, transpose_b=True, c_row_major=True)
 
     var gs_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         gsptr, sc_full_rl
@@ -865,20 +899,22 @@ def _sdpa_backward_rect_storage[
     var dk_full_k = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         dkptr, kv_bhsd_rl
     )
-    var dqgrid = (q_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK
-    var dkgrid = (kv_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _dq_from_scores_k_kernel[dtype], _dq_from_scores_k_kernel[dtype]
-    ](
-        gs_full, k_full, dq_full_k, scale, B, Sq, Skv, H, Dh,
-        grid_dim=dqgrid, block_dim=_BLOCK,
-    )
-    ctx.enqueue_function[
-        _dk_from_scores_q_kernel[dtype], _dk_from_scores_q_kernel[dtype]
-    ](
-        gs_full, q_full, dk_full_k, scale, B, Sq, Skv, H, Dh,
-        grid_dim=dkgrid, block_dim=_BLOCK,
-    )
+    # dQ = gscores @ k ; dK = gscoresᵀ @ q  (cuBLAS matmul; cast k,q->F32; was naive)
+    for bh in range(BH):
+        var DS = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr + bh * Sq * Skv, sc_rl)
+        var Kdq = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](k_f32ptr + bh * Skv * Dh, kv_head_rl)
+        var Qdk = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](q_f32ptr + bh * Sq * Dh, q_head_rl)
+        var DQ = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr + bh * Sq * Dh, q_head_rl)
+        var DK = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr + bh * Skv * Dh, kv_head_rl)
+        matmul(ctx, DQ, DS, Kdq, transpose_b=False, c_row_major=True)
+        matmul(ctx, DK, DS, Qdk, transpose_a=True, c_row_major=True)
+    # scale d_q,d_k by `scale` (the naive kernels folded it in)
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dq_full_k, scale, q_bhsd_rows, Dh,
+        grid_dim=(q_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK, block_dim=_BLOCK)
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dk_full_k, scale, kv_bhsd_rows, Dh,
+        grid_dim=(kv_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK, block_dim=_BLOCK)
 
     var dq_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr, q_bhsd_rl)
     var dk_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr, kv_bhsd_rl)
@@ -1368,13 +1404,21 @@ def _sdpa_backward_rect_storage_slab[
     var dv_full_k = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         dvptr, kv_bhsd_rl
     )
-    var dvgrid = (kv_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _dv_from_attn_go_kernel[dtype], _dv_from_attn_go_kernel[dtype]
-    ](
-        attn_full, go_full, dv_full_k, B, Sq, Skv, H, Dh,
-        grid_dim=dvgrid, block_dim=_BLOCK,
-    )
+    # F32 copies of go/k/q (slab) for cuBLAS matmuls (ULP-safe).
+    var go_f32 = slab.alloc(q_bhsd_rows * Dh * 4)
+    var k_f32 = slab.alloc(kv_bhsd_rows * Dh * 4)
+    var q_f32 = slab.alloc(q_bhsd_rows * Dh * 4)
+    var go_f32ptr = go_f32.unsafe_ptr().bitcast[Float32]()
+    var k_f32ptr = k_f32.unsafe_ptr().bitcast[Float32]()
+    var q_f32ptr = q_f32.unsafe_ptr().bitcast[Float32]()
+    _cast_bwd_f32[dtype](goptr, go_f32ptr, q_bhsd_rows * Dh, ctx)
+    _cast_bwd_f32[dtype](kptr, k_f32ptr, kv_bhsd_rows * Dh, ctx)
+    _cast_bwd_f32[dtype](qptr, q_f32ptr, q_bhsd_rows * Dh, ctx)
+    for bh in range(BH):
+        var Pdv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](aptr + bh * Sq * Skv, sc_rl)
+        var GOdv = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](go_f32ptr + bh * Sq * Dh, q_head_rl)
+        var DV = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr + bh * Skv * Dh, kv_head_rl)
+        matmul(ctx, DV, Pdv, GOdv, transpose_a=True, c_row_major=True)
 
     var gscores = slab.alloc(BH * Sq * Skv * 4)
     var gsptr = gscores.unsafe_ptr().bitcast[Float32]()
@@ -1382,14 +1426,11 @@ def _sdpa_backward_rect_storage_slab[
     var ga_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         gsptr, sc_full_rl
     )
-    var gagrid = (BH * Sq * Skv + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _grad_attn_from_go_v_kernel[dtype],
-        _grad_attn_from_go_v_kernel[dtype],
-    ](
-        go_full, v_full, ga_full, B, Sq, Skv, H, Dh,
-        grid_dim=gagrid, block_dim=_BLOCK,
-    )
+    for bh in range(BH):
+        var GOdp = LayoutTensor[dtype, _DYN2, MutAnyOrigin](goptr + bh * Sq * Dh, q_head_rl)
+        var Vdp = LayoutTensor[dtype, _DYN2, MutAnyOrigin](vptr + bh * Skv * Dh, kv_head_rl)
+        var GAdp = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr + bh * Sq * Skv, sc_rl)
+        matmul(ctx, GAdp, GOdp, Vdp, transpose_b=True, c_row_major=True)
 
     var gs_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         gsptr, sc_full_rl
@@ -1409,20 +1450,20 @@ def _sdpa_backward_rect_storage_slab[
     var dk_full_k = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         dkptr, kv_bhsd_rl
     )
-    var dqgrid = (q_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK
-    var dkgrid = (kv_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK
-    ctx.enqueue_function[
-        _dq_from_scores_k_kernel[dtype], _dq_from_scores_k_kernel[dtype]
-    ](
-        gs_full, k_full, dq_full_k, scale, B, Sq, Skv, H, Dh,
-        grid_dim=dqgrid, block_dim=_BLOCK,
-    )
-    ctx.enqueue_function[
-        _dk_from_scores_q_kernel[dtype], _dk_from_scores_q_kernel[dtype]
-    ](
-        gs_full, q_full, dk_full_k, scale, B, Sq, Skv, H, Dh,
-        grid_dim=dkgrid, block_dim=_BLOCK,
-    )
+    for bh in range(BH):
+        var DS = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](gsptr + bh * Sq * Skv, sc_rl)
+        var Kdq = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](k_f32ptr + bh * Skv * Dh, kv_head_rl)
+        var Qdk = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](q_f32ptr + bh * Sq * Dh, q_head_rl)
+        var DQ = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr + bh * Sq * Dh, q_head_rl)
+        var DK = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr + bh * Skv * Dh, kv_head_rl)
+        matmul(ctx, DQ, DS, Kdq, transpose_b=False, c_row_major=True)
+        matmul(ctx, DK, DS, Qdk, transpose_a=True, c_row_major=True)
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dq_full_k, scale, q_bhsd_rows, Dh,
+        grid_dim=(q_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK, block_dim=_BLOCK)
+    ctx.enqueue_function[_scale_f32, _scale_f32](
+        dk_full_k, scale, kv_bhsd_rows, Dh,
+        grid_dim=(kv_bhsd_rows * Dh + _BLOCK - 1) // _BLOCK, block_dim=_BLOCK)
 
     var dq_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dqptr, q_bhsd_rl)
     var dk_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dkptr, kv_bhsd_rl)

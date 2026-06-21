@@ -55,6 +55,7 @@ from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
+comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
 comptime _TPB = 256
 comptime _NEG_BIG = Float32(-3.0e38)
@@ -255,6 +256,76 @@ def _attn_pv_kernel[dtype: DType](
         dst[qrow, d] = rebind[dst.element_type](acc)
 
 
+# bf16->f32 elementwise cast (1D) for the matmul P@V path.
+fn _cast_buf_to_f32[dtype: DType](
+    src: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        var val = rebind[Scalar[dtype]](src[i]).cast[DType.float32]()
+        dst[i] = rebind[dst.element_type](val)
+
+
+# P @ V via cuBLAS matmul (flame bmm_bf16_fp32acc analogue): cast V->F32 (exact
+# upcast), then per-head F32 matmul P[Sq,Skv] @ V[Skv,Dh] -> O[Sq,Dh]. Math-identical
+# to _attn_pv_kernel (same F32 P x F32(V) products, F32 accum) but tensor-cores/tiled
+# instead of one thread per output looping Skv. probs=F32 scores, v=dtype.
+def _attn_pv_matmul[dtype: DType](
+    scores_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    v_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    out_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    BH: Int, Sq: Int, Skv: Int, Dh: Int,
+    ctx: DeviceContext,
+) raises:
+    var nv = BH * Skv * Dh
+    var vf32 = ctx.enqueue_create_buffer[DType.float32](nv)
+    var v_rl1 = RuntimeLayout[_DYN1].row_major(IndexList[1](nv))
+    var V1 = LayoutTensor[dtype, _DYN1, MutAnyOrigin](v_ptr, v_rl1)
+    var Vf1 = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](vf32.unsafe_ptr(), v_rl1)
+    var cgrid = (nv + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_cast_buf_to_f32[dtype], _cast_buf_to_f32[dtype]](
+        V1, Vf1, nv, grid_dim=cgrid, block_dim=_BLOCK)
+    var p_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Sq, Skv))
+    var v_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Skv, Dh))
+    var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Sq, Dh))
+    var vf32ptr = vf32.unsafe_ptr()
+    for bh in range(BH):
+        var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](scores_ptr + bh * Sq * Skv, p_rl)
+        var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](vf32ptr + bh * Skv * Dh, v_rl)
+        var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](out_ptr + bh * Sq * Dh, o_rl)
+        matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
+
+
+# slab variant of _attn_pv_matmul: V->F32 scratch comes from the StepSlab (C8).
+def _attn_pv_matmul_slab[dtype: DType](
+    scores_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    v_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    out_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    BH: Int, Sq: Int, Skv: Int, Dh: Int,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises:
+    var nv = BH * Skv * Dh
+    var vf32buf = slab.alloc(nv * 4)
+    var vf32ptr = vf32buf.unsafe_ptr().bitcast[Float32]()
+    var v_rl1 = RuntimeLayout[_DYN1].row_major(IndexList[1](nv))
+    var V1 = LayoutTensor[dtype, _DYN1, MutAnyOrigin](v_ptr, v_rl1)
+    var Vf1 = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](vf32ptr, v_rl1)
+    var cgrid = (nv + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_cast_buf_to_f32[dtype], _cast_buf_to_f32[dtype]](
+        V1, Vf1, nv, grid_dim=cgrid, block_dim=_BLOCK)
+    var p_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Sq, Skv))
+    var v_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Skv, Dh))
+    var o_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](Sq, Dh))
+    for bh in range(BH):
+        var P = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](scores_ptr + bh * Sq * Skv, p_rl)
+        var Vh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](vf32ptr + bh * Skv * Dh, v_rl)
+        var Oh = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](out_ptr + bh * Sq * Dh, o_rl)
+        matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
+
+
 # ── math-mode SDPA (any Dh) ─────────────────────────────────────────────────
 # q,k,v: BSHD [B,S,H,Dh] (storage dtype). mask: [B,H,S,S] (storage dtype).
 # Returns BSHD [B,S,H,Dh] in q's dtype. Scores/softmax/GEMM accumulators are F32.
@@ -351,17 +422,9 @@ def _sdpa_math_storage[
             )
             matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
     else:
-        var v_full = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
-            v_buf.unsafe_ptr(), bhsd_rl
-        )
-        var o_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            optr, bhsd_rl
-        )
-        var pv_total = B * H * S * Dh
-        var pv_grid = (pv_total + _BLOCK - 1) // _BLOCK
-        ctx.enqueue_function[
-            _attn_pv_kernel[dtype], _attn_pv_kernel[dtype]
-        ](sc_full, v_full, o_full, B, S, S, H, Dh, grid_dim=pv_grid, block_dim=_BLOCK)
+        # FAST P@V: cuBLAS matmul (was naive _attn_pv_kernel; measured 6.8-9.3ms
+        # of the 8.6ms SDPA -> matmul). Math-identical (F32 P x F32(V), F32 accum).
+        _attn_pv_matmul[dtype](scptr, v_buf.unsafe_ptr(), optr, BH, S, S, Dh, ctx)
 
     # ── 6) scatter BHSD F32 -> BSHD output in storage dtype ──────────────────
     var bsz = out_dt.byte_size()
@@ -1982,17 +2045,11 @@ def _sdpa_math_storage_slab[
             )
             matmul(ctx, Oh, P, Vh, transpose_b=False, c_row_major=True)
     else:
-        var v_full = LayoutTensor[dtype, _DYN2, MutAnyOrigin](
-            v_buf.unsafe_ptr().bitcast[Scalar[dtype]](), bhsd_rl
+        # FAST P@V (slab): cuBLAS matmul, V->F32 scratch from the slab.
+        _attn_pv_matmul_slab[dtype](
+            scptr, v_buf.unsafe_ptr().bitcast[Scalar[dtype]](), optr,
+            B * H, S, S, Dh, ctx, slab,
         )
-        var o_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            optr, bhsd_rl
-        )
-        var pv_total = B * H * S * Dh
-        var pv_grid = (pv_total + _BLOCK - 1) // _BLOCK
-        ctx.enqueue_function[
-            _attn_pv_kernel[dtype], _attn_pv_kernel[dtype]
-        ](sc_full, v_full, o_full, B, S, S, H, Dh, grid_dim=pv_grid, block_dim=_BLOCK)
 
     # ── 6) scatter BHSD F32 -> BSHD output in storage dtype ──────────────────
     var bsz = out_dt.byte_size()

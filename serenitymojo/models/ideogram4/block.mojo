@@ -78,6 +78,38 @@ from serenitymojo.models.ideogram4.config import (
     IDEOGRAM4_NUM_LAYERS,
 )
 
+# ── autograd_v2 capture path (contract C8): StepSlab + scratch-routed twins ───
+# Purely additive — the *_slab functions below mirror the hand-chained oracle
+# above op-for-op, with every allocation routed through the step slab (and
+# slice/concat through the scratch ring). The originals stay unchanged.
+from serenitymojo.autograd_v2.step_slab import StepSlab
+from serenitymojo.scratch_ring import ScratchRingAllocator
+from serenitymojo.ops.linear import linear_slab
+from serenitymojo.ops.norm import rms_norm_slab
+from serenitymojo.ops.attention import sdpa_nomask_slab
+from serenitymojo.ops.activations import swiglu_slab
+from serenitymojo.ops.unary import tanh_op_slab
+from serenitymojo.ops.activation_backward import tanh_backward_slab
+from serenitymojo.ops.tensor_algebra import (
+    add_slab,
+    add_scalar_slab,
+    mul_slab,
+    mul_scalar_slab,
+    reshape_slab,
+)
+from serenitymojo.ops.tensor_algebra_scratch import (
+    concat3_scratch,
+    slice_scratch,
+)
+from serenitymojo.ops.cast import cast_tensor_slab
+from serenitymojo.ops.linalg_backward import linear_backward_slab, linear_backward_dx_slab
+from serenitymojo.ops.norm_backward import rms_norm_backward_dx_slab
+from serenitymojo.ops.attention_backward import sdpa_backward_slab
+from serenitymojo.ops.loss_swiglu_backward import swiglu_backward_slab
+from serenitymojo.ops.shape_backward import broadcast_backward_slab
+from serenitymojo.ops.rope_struct_backward import rope_halfsplit_full_backward_slab
+from serenitymojo.models.dit.ideogram4_dit import apply_rope_ideogram_slab
+
 
 comptime TArc = ArcPointer[Tensor]
 comptime LArc = ArcPointer[LoraAdapter]
@@ -937,3 +969,361 @@ def _shape5(a: Int, b: Int, c: Int, d: Int, e: Int) -> List[Int]:
     s.append(d)
     s.append(e)
     return s^
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# autograd_v2 capture path (contract C8): StepSlab + scratch-routed DUPLICATES.
+#
+# These are byte-for-byte twins of the hand-chained oracle functions above, with
+# every allocating op routed through the step slab (and slice/concat through the
+# scratch ring). They are PURELY ADDITIVE — the originals stay as the verified
+# oracle. Same signatures + `mut slab: StepSlab, mut scratch: ScratchRingAllocator`
+# appended after `ctx`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _clone_slab(
+    x: Tensor, ctx: DeviceContext, mut slab: StepSlab, mut scratch: ScratchRingAllocator
+) raises -> Tensor:
+    return cast_tensor_slab(x, x.dtype(), ctx, slab)
+
+
+def _expand_rope_table_slab[Heads: Int, Dh: Int](
+    table: Tensor, seq_len: Int, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    var t4 = reshape_slab(table, _shape4(1, seq_len, 1, Dh), ctx, slab)
+    var ones = add_scalar_slab(
+        zeros_device(_shape4(1, seq_len, Heads, Dh), table.dtype(), ctx),
+        Float32(1.0),
+        ctx,
+        slab,
+    )
+    return mul_slab(ones, t4, ctx, slab)
+
+
+def _lora_linear_fwd_slab(
+    x: Tensor, base_w: Tensor, ad: LoraAdapter, bias: Optional[Tensor],
+    ctx: DeviceContext, mut slab: StepSlab, mut scratch: ScratchRingAllocator,
+) raises -> _LoraFwd:
+    var base = linear_slab(x, base_w, bias, ctx, slab)
+    var down = linear_slab(x, ad.a, None, ctx, slab)
+    var up = linear_slab(down, ad.b, None, ctx, slab)
+    var y = add_slab(base, mul_scalar_slab(up, ad.scale(), ctx, slab), ctx, slab)
+    return _LoraFwd(y^, down^)
+
+
+def _lora_linear_bwd_slab(
+    d_y: Tensor,
+    x: Tensor,
+    down: Tensor,
+    base_w: Tensor,
+    ad: LoraAdapter,
+    M: Int,
+    in_f: Int,
+    out_f: Int,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+    mut scratch: ScratchRingAllocator,
+) raises -> _LoraBwd:
+    var dx_base = linear_backward_dx_slab(d_y, base_w, M, in_f, out_f, ctx, slab)
+    var dy_s = mul_scalar_slab(d_y, ad.scale(), ctx, slab)
+    var up_g = linear_backward_slab(dy_s, down, ad.b, M, ad.rank, out_f, ctx, slab)
+    var down_g = linear_backward_slab(up_g.d_x, x, ad.a, M, in_f, ad.rank, ctx, slab)
+    var d_x = add_slab(dx_base, down_g.d_x, ctx, slab)
+    return _LoraBwd(
+        d_x^,
+        _clone_slab(down_g.d_w, ctx, slab, scratch),
+        _clone_slab(up_g.d_w, ctx, slab, scratch),
+    )
+
+
+def ideogram4_block_lora_forward_slab[
+    S: Int, Hidden: Int, Heads: Int, Dh: Int, FF: Int, Adaln: Int,
+](
+    x: Tensor,
+    adaln_input: Tensor,
+    cosf: Tensor,
+    sinf: Tensor,
+    w: Ideogram4BlockWeights,
+    loras: List[LArc],
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+    mut scratch: ScratchRingAllocator,
+) raises -> Ideogram4BlockOut:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var mf = _lora_linear_fwd_slab(
+        adaln_input,
+        w.adaln_w,
+        loras[I4_SLOT_ADALN][],
+        Optional[Tensor](cast_tensor_slab(w.adaln_b, w.adaln_b.dtype(), ctx, slab)),
+        ctx,
+        slab,
+        scratch,
+    )
+    var mod = _clone_slab(mf.y, ctx, slab, scratch)
+    var mod_axis = len(mod.shape()) - 1
+    var scale_msa = add_scalar_slab(slice_scratch(mod, mod_axis, 0 * Hidden, Hidden, ctx, scratch), Float32(1.0), ctx, slab)
+    var gate_msa_raw = slice_scratch(mod, mod_axis, 1 * Hidden, Hidden, ctx, scratch)
+    var gate_msa = tanh_op_slab(gate_msa_raw, ctx, slab)
+    var scale_mlp = add_scalar_slab(slice_scratch(mod, mod_axis, 2 * Hidden, Hidden, ctx, scratch), Float32(1.0), ctx, slab)
+    var gate_mlp_raw = slice_scratch(mod, mod_axis, 3 * Hidden, Hidden, ctx, scratch)
+    var gate_mlp = tanh_op_slab(gate_mlp_raw, ctx, slab)
+    var down_adaln = _clone_slab(mf.down, ctx, slab, scratch)
+
+    var an1 = rms_norm_slab(x, w.attn_norm1, I4_EPS, ctx, slab)
+    var attn_in = mul_slab(an1, scale_msa, ctx, slab)
+
+    var qkvf = _lora_linear_fwd_slab(attn_in, w.qkv_w, loras[I4_SLOT_QKV][], None, ctx, slab, scratch)
+    var qkv5 = reshape_slab(qkvf.y, _shape5(1, S, 3, Heads, Dh), ctx, slab)
+    var q = reshape_slab(slice_scratch(qkv5, 2, 0, 1, ctx, scratch), _shape4(1, S, Heads, Dh), ctx, slab)
+    var k = reshape_slab(slice_scratch(qkv5, 2, 1, 1, ctx, scratch), _shape4(1, S, Heads, Dh), ctx, slab)
+    var v = reshape_slab(slice_scratch(qkv5, 2, 2, 1, ctx, scratch), _shape4(1, S, Heads, Dh), ctx, slab)
+    var q_norm = rms_norm_slab(q, w.norm_q, I4_EPS, ctx, slab)
+    var k_norm = rms_norm_slab(k, w.norm_k, I4_EPS, ctx, slab)
+    var q_rope = apply_rope_ideogram_slab(q_norm, cosf, sinf, ctx, slab)
+    var k_rope = apply_rope_ideogram_slab(k_norm, cosf, sinf, ctx, slab)
+    var attn4: Tensor
+    var _flash_q: Optional[TArc] = None
+    var _flash_k: Optional[TArc] = None
+    var _flash_v: Optional[TArc] = None
+    var _flash_o: Optional[TArc] = None
+    var _flash_stats: Optional[TArc] = None
+    comptime if IDEOGRAM4_SDPA_FLASH:
+        # cuDNN flash: bf16 q/k/v/o + F32 stats go to the tape for the flash
+        # backward (no recompute, no re-cast). att is the F32 [1,S,H,Dh] drop-in.
+        # Flash path is NOT slab-routed (and the flag is False so it's elided).
+        var ff = sdpa_flash_train_fwd_f32[1, S, Heads, Dh](
+            q_rope, k_rope, v, scale, ctx
+        )
+        # flash _f32 returns F32 att; ideogram4's block is BF16 end-to-end
+        # (math sdpa_nomask returns BF16) -> cast to match the downstream.
+        attn4 = cast_tensor_slab(ff.att, STDtype.BF16, ctx, slab)
+        _flash_q = Optional[TArc](ff.q_bf)
+        _flash_k = Optional[TArc](ff.k_bf)
+        _flash_v = Optional[TArc](ff.v_bf)
+        _flash_o = Optional[TArc](ff.o_bf)
+        _flash_stats = Optional[TArc](ff.stats)
+    else:
+        attn4 = sdpa_nomask_slab[1, S, Heads, Dh](q_rope, k_rope, v, scale, ctx, slab)
+    var attn_flat = reshape_slab(attn4, _shape2(S, Hidden), ctx, slab)
+
+    var of = _lora_linear_fwd_slab(attn_flat, w.o_w, loras[I4_SLOT_O][], None, ctx, slab, scratch)
+    var attn_out = _clone_slab(of.y, ctx, slab, scratch)
+    var attn_n2 = rms_norm_slab(attn_out, w.attn_norm2, I4_EPS, ctx, slab)
+    var x_mid = add_slab(x, mul_slab(gate_msa, attn_n2, ctx, slab), ctx, slab)
+
+    var fn1 = rms_norm_slab(x_mid, w.ffn_norm1, I4_EPS, ctx, slab)
+    var mlp_in = mul_slab(fn1, scale_mlp, ctx, slab)
+    var w1f = _lora_linear_fwd_slab(mlp_in, w.w1, loras[I4_SLOT_W1][], None, ctx, slab, scratch)
+    var ff_g = _clone_slab(w1f.y, ctx, slab, scratch)
+    var w3f = _lora_linear_fwd_slab(mlp_in, w.w3, loras[I4_SLOT_W3][], None, ctx, slab, scratch)
+    var ff_u = _clone_slab(w3f.y, ctx, slab, scratch)
+    var ff_act = swiglu_slab(ff_g, ff_u, ctx, slab)
+    var w2f = _lora_linear_fwd_slab(ff_act, w.w2, loras[I4_SLOT_W2][], None, ctx, slab, scratch)
+    var ff_out = _clone_slab(w2f.y, ctx, slab, scratch)
+    var ff_n2 = rms_norm_slab(ff_out, w.ffn_norm2, I4_EPS, ctx, slab)
+    var out = add_slab(x_mid, mul_slab(gate_mlp, ff_n2, ctx, slab), ctx, slab)
+
+    var acts = Ideogram4BlockActs(
+        _clone_slab(x, ctx, slab, scratch),
+        _clone_slab(adaln_input, ctx, slab, scratch),
+        scale_msa^,
+        gate_msa_raw^,
+        scale_mlp^,
+        gate_mlp_raw^,
+        gate_msa^,
+        gate_mlp^,
+        an1^,
+        _clone_slab(attn_in, ctx, slab, scratch),
+        q^,
+        k^,
+        q_norm^,
+        k_norm^,
+        q_rope^,
+        k_rope^,
+        _clone_slab(v, ctx, slab, scratch),
+        attn_flat^,
+        _clone_slab(attn_out, ctx, slab, scratch),
+        attn_n2^,
+        _clone_slab(x_mid, ctx, slab, scratch),
+        fn1^,
+        _clone_slab(mlp_in, ctx, slab, scratch),
+        ff_g^,
+        ff_u^,
+        _clone_slab(ff_act, ctx, slab, scratch),
+        _clone_slab(ff_out, ctx, slab, scratch),
+        ff_n2^,
+        _clone_slab(qkvf.down, ctx, slab, scratch),
+        _clone_slab(of.down, ctx, slab, scratch),
+        _clone_slab(w1f.down, ctx, slab, scratch),
+        _clone_slab(w2f.down, ctx, slab, scratch),
+        _clone_slab(w3f.down, ctx, slab, scratch),
+        down_adaln^,
+        _flash_q^,
+        _flash_k^,
+        _flash_v^,
+        _flash_o^,
+        _flash_stats^,
+    )
+    return Ideogram4BlockOut(out^, acts^)
+
+
+def ideogram4_block_lora_backward_slab[
+    S: Int, Hidden: Int, Heads: Int, Dh: Int, FF: Int, Adaln: Int,
+](
+    d_out: Tensor,
+    acts: Ideogram4BlockActs,
+    cosf: Tensor,
+    sinf: Tensor,
+    w: Ideogram4BlockWeights,
+    loras: List[LArc],
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+    mut scratch: ScratchRingAllocator,
+) raises -> Ideogram4BlockBwd:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var d_a = List[TArc]()
+    var d_b = List[TArc]()
+    for _ in range(I4_SLOTS_PER_BLOCK):
+        d_a.append(TArc(zeros_device(_shape1(1), STDtype.BF16, ctx)))
+        d_b.append(TArc(zeros_device(_shape1(1), STDtype.BF16, ctx)))
+
+    # out = x_mid + gate_mlp * ff_n2
+    var d_x_mid = _clone_slab(d_out, ctx, slab, scratch)
+    var d_ff_n2 = mul_slab(d_out, acts.gate_mlp, ctx, slab)
+    var d_gate_mlp = broadcast_backward_slab(
+        mul_slab(d_out, acts.ff_n2, ctx, slab), acts.gate_mlp.shape(), ctx, slab
+    )
+    var d_ff_out = rms_norm_backward_dx_slab(d_ff_n2, acts.ff_out, w.ffn_norm2, I4_EPS, ctx, slab)
+
+    var w2b = _lora_linear_bwd_slab(
+        d_ff_out, acts.ff_act, acts.down_w2, w.w2, loras[I4_SLOT_W2][],
+        S, FF, Hidden, ctx, slab, scratch,
+    )
+    d_a[I4_SLOT_W2] = TArc(_clone_slab(w2b.d_a, ctx, slab, scratch))
+    d_b[I4_SLOT_W2] = TArc(_clone_slab(w2b.d_b, ctx, slab, scratch))
+
+    var sg = swiglu_backward_slab(w2b.d_x, acts.ff_g, acts.ff_u, ctx, slab)
+    var w1b = _lora_linear_bwd_slab(
+        sg.d_gate, acts.mlp_in, acts.down_w1, w.w1, loras[I4_SLOT_W1][],
+        S, Hidden, FF, ctx, slab, scratch,
+    )
+    d_a[I4_SLOT_W1] = TArc(_clone_slab(w1b.d_a, ctx, slab, scratch))
+    d_b[I4_SLOT_W1] = TArc(_clone_slab(w1b.d_b, ctx, slab, scratch))
+
+    var w3b = _lora_linear_bwd_slab(
+        sg.d_up, acts.mlp_in, acts.down_w3, w.w3, loras[I4_SLOT_W3][],
+        S, Hidden, FF, ctx, slab, scratch,
+    )
+    d_a[I4_SLOT_W3] = TArc(_clone_slab(w3b.d_a, ctx, slab, scratch))
+    d_b[I4_SLOT_W3] = TArc(_clone_slab(w3b.d_b, ctx, slab, scratch))
+
+    var d_mlp_in = add_slab(w1b.d_x, w3b.d_x, ctx, slab)
+    var d_scale_mlp = broadcast_backward_slab(
+        mul_slab(d_mlp_in, acts.fn1, ctx, slab), acts.mod_scale_mlp.shape(), ctx, slab
+    )
+    var d_fn1 = mul_slab(d_mlp_in, acts.mod_scale_mlp, ctx, slab)
+    d_x_mid = add_slab(
+        d_x_mid,
+        rms_norm_backward_dx_slab(d_fn1, acts.x_mid, w.ffn_norm1, I4_EPS, ctx, slab),
+        ctx,
+        slab,
+    )
+
+    # x_mid = x + gate_msa * attn_n2
+    var d_x = _clone_slab(d_x_mid, ctx, slab, scratch)
+    var d_attn_n2 = mul_slab(d_x_mid, acts.gate_msa, ctx, slab)
+    var d_gate_msa = broadcast_backward_slab(
+        mul_slab(d_x_mid, acts.attn_n2, ctx, slab), acts.gate_msa.shape(), ctx, slab
+    )
+    var d_attn_out = rms_norm_backward_dx_slab(
+        d_attn_n2, acts.attn_out, w.attn_norm2, I4_EPS, ctx, slab
+    )
+
+    var ob = _lora_linear_bwd_slab(
+        d_attn_out, acts.attn_flat, acts.down_o, w.o_w, loras[I4_SLOT_O][],
+        S, Hidden, Hidden, ctx, slab, scratch,
+    )
+    d_a[I4_SLOT_O] = TArc(_clone_slab(ob.d_a, ctx, slab, scratch))
+    d_b[I4_SLOT_O] = TArc(_clone_slab(ob.d_b, ctx, slab, scratch))
+
+    var d_attn4 = reshape_slab(ob.d_x, _shape4(1, S, Heads, Dh), ctx, slab)
+    var sd_d_q: Tensor
+    var sd_d_k: Tensor
+    var sd_d_v: Tensor
+    comptime if IDEOGRAM4_SDPA_FLASH:
+        if not acts.flash_stats:
+            raise Error(
+                "ideogram4 block bwd: IDEOGRAM4_SDPA_FLASH on but the tape has"
+                " no flash set (fwd/bwd flag mismatch)"
+            )
+        # Flash path is NOT slab-routed (and the flag is False so it's elided).
+        var fb = sdpa_flash_backward_f32[1, S, Heads, Dh](
+            acts.flash_q.value(), acts.flash_k.value(), acts.flash_v.value(),
+            acts.flash_o.value(), acts.flash_stats.value(), d_attn4, scale, ctx,
+        )
+        # flash _f32 returns F32 grads; the math path's grads are BF16 -> cast
+        # to match the downstream rope/rms backward (also avoids a partial move).
+        sd_d_q = cast_tensor_slab(fb.d_q, STDtype.BF16, ctx, slab)
+        sd_d_k = cast_tensor_slab(fb.d_k, STDtype.BF16, ctx, slab)
+        sd_d_v = cast_tensor_slab(fb.d_v, STDtype.BF16, ctx, slab)
+    else:
+        var sd = sdpa_backward_slab[1, S, Heads, Dh](
+            acts.q_rope, acts.k_rope, acts.v_bshd, d_attn4, scale, ctx, slab
+        )
+        sd_d_q = Tensor(sd.d_q.buf.copy(), sd.d_q.shape(), sd.d_q.dtype())
+        sd_d_k = Tensor(sd.d_k.buf.copy(), sd.d_k.shape(), sd.d_k.dtype())
+        sd_d_v = Tensor(sd.d_v.buf.copy(), sd.d_v.shape(), sd.d_v.dtype())
+    var cos_full = _expand_rope_table_slab[Heads, Dh](cosf, S, ctx, slab)
+    var sin_full = _expand_rope_table_slab[Heads, Dh](sinf, S, ctx, slab)
+    var d_q_norm = rope_halfsplit_full_backward_slab(sd_d_q, cos_full, sin_full, ctx, slab)
+    var d_k_norm = rope_halfsplit_full_backward_slab(sd_d_k, cos_full, sin_full, ctx, slab)
+
+    var d_q_raw = rms_norm_backward_dx_slab(d_q_norm, acts.q_raw, w.norm_q, I4_EPS, ctx, slab)
+    var d_k_raw = rms_norm_backward_dx_slab(d_k_norm, acts.k_raw, w.norm_k, I4_EPS, ctx, slab)
+    var d_q = reshape_slab(d_q_raw, _shape2(S, Hidden), ctx, slab)
+    var d_k = reshape_slab(d_k_raw, _shape2(S, Hidden), ctx, slab)
+    var d_v = reshape_slab(sd_d_v, _shape2(S, Hidden), ctx, slab)
+    var d_qkv = concat3_scratch(1, ctx, scratch, d_q, d_k, d_v)
+
+    var qkvb = _lora_linear_bwd_slab(
+        d_qkv, acts.attn_in, acts.down_qkv, w.qkv_w, loras[I4_SLOT_QKV][],
+        S, Hidden, 3 * Hidden, ctx, slab, scratch,
+    )
+    d_a[I4_SLOT_QKV] = TArc(_clone_slab(qkvb.d_a, ctx, slab, scratch))
+    d_b[I4_SLOT_QKV] = TArc(_clone_slab(qkvb.d_b, ctx, slab, scratch))
+
+    var d_scale_msa = broadcast_backward_slab(
+        mul_slab(qkvb.d_x, acts.an1, ctx, slab), acts.mod_scale_msa.shape(), ctx, slab
+    )
+    var d_an1 = mul_slab(qkvb.d_x, acts.mod_scale_msa, ctx, slab)
+    d_x = add_slab(
+        d_x,
+        rms_norm_backward_dx_slab(d_an1, acts.x_in, w.attn_norm1, I4_EPS, ctx, slab),
+        ctx,
+        slab,
+    )
+
+    # d_mod chunks: scale chunks are identity; gate chunks pass tanh backward.
+    var d_gate_msa_raw = tanh_backward_slab(d_gate_msa, acts.mod_gate_msa_raw, ctx, slab)
+    var d_gate_mlp_raw = tanh_backward_slab(d_gate_mlp, acts.mod_gate_mlp_raw, ctx, slab)
+    var d_mod_axis = len(d_scale_msa.shape()) - 1
+    # NOTE (contract C8 GAP): this is a 4-tensor concat; tensor_algebra_scratch
+    # only ships concat2_scratch/concat3_scratch — there is NO concat4_scratch.
+    # Left on the non-scratch `concat` (same math, just not scratch-routed) until
+    # a 4-way scratch variant exists. Flagged in the handoff.
+    var d_mod = concat(
+        d_mod_axis, ctx, d_scale_msa, d_gate_msa_raw, d_scale_mlp, d_gate_mlp_raw
+    )
+    var adalnb = _lora_linear_bwd_slab(
+        d_mod, acts.adaln_input, acts.down_adaln, w.adaln_w,
+        loras[I4_SLOT_ADALN][], 1, Adaln, 4 * Hidden, ctx, slab, scratch,
+    )
+    d_a[I4_SLOT_ADALN] = TArc(_clone_slab(adalnb.d_a, ctx, slab, scratch))
+    d_b[I4_SLOT_ADALN] = TArc(_clone_slab(adalnb.d_b, ctx, slab, scratch))
+
+    return Ideogram4BlockBwd(
+        d_x^, _clone_slab(adalnb.d_x, ctx, slab, scratch), Ideogram4BlockLoraGrads(d_a^, d_b^)
+    )

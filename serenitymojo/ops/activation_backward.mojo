@@ -27,6 +27,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -291,6 +292,71 @@ def _run(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Te
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
+# ── slab variant (autograd_v2 capture path, contract C8) ─────────────────────
+# BYTE-IDENTICAL to `_run` except the output buffer comes from `slab.alloc`
+# instead of `ctx.enqueue_create_buffer[DType.uint8]`. Used by the CUDA-graph
+# capture path so the activation-backward output lives in the step slab.
+def _run_slab(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Tensor:
+    if grad_out.dtype() != x.dtype():
+        raise Error("activation_backward: grad_out/x dtype mismatch")
+    if grad_out.numel() != x.numel():
+        raise Error("activation_backward: grad_out/x numel mismatch")
+    var dt = x.dtype().to_mojo_dtype()
+    var n = x.numel()
+    var out_buf = slab.alloc(x.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        if arm == 0:
+            ctx.enqueue_function[_relu_bwd_f32, _relu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 1:
+            ctx.enqueue_function[_sigmoid_bwd_f32, _sigmoid_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 2:
+            ctx.enqueue_function[_tanh_bwd_f32, _tanh_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 3:
+            ctx.enqueue_function[_silu_bwd_f32, _silu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 4:
+            ctx.enqueue_function[_gelu_bwd_f32, _gelu_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            ctx.enqueue_function[_gelu_exact_bwd_f32, _gelu_exact_bwd_f32](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        if arm == 0:
+            ctx.enqueue_function[_relu_bwd_bf16, _relu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 1:
+            ctx.enqueue_function[_sigmoid_bwd_bf16, _sigmoid_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 2:
+            ctx.enqueue_function[_tanh_bwd_bf16, _tanh_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 3:
+            ctx.enqueue_function[_silu_bwd_bf16, _silu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 4:
+            ctx.enqueue_function[_gelu_bwd_bf16, _gelu_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            ctx.enqueue_function[_gelu_exact_bwd_bf16, _gelu_exact_bwd_bf16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        if arm == 0:
+            ctx.enqueue_function[_relu_bwd_f16, _relu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 1:
+            ctx.enqueue_function[_sigmoid_bwd_f16, _sigmoid_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 2:
+            ctx.enqueue_function[_tanh_bwd_f16, _tanh_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 3:
+            ctx.enqueue_function[_silu_bwd_f16, _silu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        elif arm == 4:
+            ctx.enqueue_function[_gelu_bwd_f16, _gelu_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+        else:
+            ctx.enqueue_function[_gelu_exact_bwd_f16, _gelu_exact_bwd_f16](G, X, O, n, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
 # ── public entry points: d_x = grad_out * f'(x) ──────────────────────────────
 def relu_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:
     """relu backward: d_x = grad_out * (1 if x>0 else 0)."""
@@ -305,6 +371,11 @@ def sigmoid_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> 
 def tanh_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:
     """tanh backward: d_x = grad_out * (1 - tanh(x)^2)."""
     return _run(2, grad_out, x, ctx)
+
+
+def tanh_backward_slab(grad_out: Tensor, x: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Tensor:
+    """tanh backward (slab variant, autograd_v2 capture path C8): output from slab.alloc."""
+    return _run_slab(2, grad_out, x, ctx, slab)
 
 
 def silu_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:

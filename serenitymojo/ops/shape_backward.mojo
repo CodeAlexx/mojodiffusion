@@ -51,6 +51,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.ops.tensor_algebra import (
     reshape as _ta_reshape,
     permute as _ta_permute,
@@ -449,6 +450,92 @@ def broadcast_backward(
         acc *= odims[i]
     var n_in = _numel(in_shape)
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](
+        n_in * grad_out.dtype().byte_size()
+    )
+    var n_out = grad_out.numel()
+    var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_out))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_in))
+    var grid = (n_in + _BLOCK - 1) // _BLOCK
+    var dt = grad_out.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var g = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float32](), g_rl)
+        var o = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl)
+        ctx.enqueue_function[
+            _broadcast_sum_k[DType.float32], _broadcast_sum_k[DType.float32]
+        ](
+            g, o,
+            idims[0], idims[1], idims[2], idims[3], idims[4], idims[5],
+            odims[0], odims[1], odims[2], odims[3], odims[4], odims[5],
+            ostr[0], ostr[1], ostr[2], ostr[3], ostr[4], ostr[5],
+            n_in, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var g = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
+        var o = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl)
+        ctx.enqueue_function[
+            _broadcast_sum_k[DType.bfloat16], _broadcast_sum_k[DType.bfloat16]
+        ](
+            g, o,
+            idims[0], idims[1], idims[2], idims[3], idims[4], idims[5],
+            odims[0], odims[1], odims[2], odims[3], odims[4], odims[5],
+            ostr[0], ostr[1], ostr[2], ostr[3], ostr[4], ostr[5],
+            n_in, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var g = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            grad_out.buf.unsafe_ptr().bitcast[Float16](), g_rl)
+        var o = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl)
+        ctx.enqueue_function[
+            _broadcast_sum_k[DType.float16], _broadcast_sum_k[DType.float16]
+        ](
+            g, o,
+            idims[0], idims[1], idims[2], idims[3], idims[4], idims[5],
+            odims[0], odims[1], odims[2], odims[3], odims[4], odims[5],
+            ostr[0], ostr[1], ostr[2], ostr[3], ostr[4], ostr[5],
+            n_in, grid_dim=grid, block_dim=_BLOCK)
+    var sh = List[Int]()
+    for i in range(len(in_shape)):
+        sh.append(in_shape[i])
+    return Tensor(out_buf^, sh^, grad_out.dtype())
+
+
+# ── StepSlab variant for the autograd_v2 capture path (contract C8) ────────────
+# Byte-identical to `broadcast_backward` except the output buffer comes from
+# `slab.alloc(nbytes)` instead of `ctx.enqueue_create_buffer[DType.uint8](nbytes)`.
+def broadcast_backward_slab(
+    grad_out: Tensor, in_shape: List[Int], ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """d_x = sum d_y over the dims that were broadcast (NumPy right-aligned)."""
+    var osh = grad_out.shape()
+    var orank = len(osh)
+    var irank = len(in_shape)
+    if orank > _MAXRANK:
+        raise Error(String("broadcast_backward: out rank > ") + String(_MAXRANK))
+    if irank > orank:
+        raise Error("broadcast_backward: in rank > out rank")
+    var idims = IndexList[_MAXRANK]()
+    var odims = IndexList[_MAXRANK]()
+    for i in range(_MAXRANK):
+        idims[i] = 1
+        odims[i] = 1
+    for i in range(irank):
+        idims[_MAXRANK - irank + i] = in_shape[i]
+    for i in range(orank):
+        odims[_MAXRANK - orank + i] = osh[i]
+    for i in range(_MAXRANK):
+        if idims[i] != 1 and idims[i] != odims[i]:
+            raise Error("broadcast_backward: incompatible dim (not 1, not equal)")
+    var ostr = IndexList[_MAXRANK]()
+    var acc = 1
+    for ii in range(_MAXRANK):
+        var i = _MAXRANK - 1 - ii
+        ostr[i] = acc
+        acc *= odims[i]
+    var n_in = _numel(in_shape)
+    var out_buf = slab.alloc(
         n_in * grad_out.dtype().byte_size()
     )
     var n_out = grad_out.numel()

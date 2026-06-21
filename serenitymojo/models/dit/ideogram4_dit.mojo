@@ -19,6 +19,7 @@ from serenitymojo.ops.attention_flash import sdpa_flash_train_fwd
 from serenitymojo.ops.tensor_algebra import mul, add, add_scalar, reshape, slice, gather_rows
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.fp8 import load_fp8_dequant
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
@@ -162,6 +163,29 @@ def apply_rope_ideogram(x: Tensor, cosf: Tensor, sinf: Tensor, ctx: DeviceContex
     var half = Dh // 2
     var n = x.numel()
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * STDtype.BF16.byte_size())
+    var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var c_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](L * Dh))
+    var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+    var C = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](cosf.buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
+    var S = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](sinf.buf.unsafe_ptr().bitcast[BFloat16](), c_rl)
+    var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_rope_kernel[DType.bfloat16], _rope_kernel[DType.bfloat16]](
+        X, C, S, O, L, H, Dh, half, n, grid_dim=grid, block_dim=_BLOCK)
+    # No synchronize: single-stream ordering; this rope output feeds SDPA on the
+    # same stream. Per-call sync here drained the pipeline 2x/layer (q,k).
+    var os = sh.copy()
+    return Tensor(out_buf^, os^, STDtype.BF16)
+
+
+def apply_rope_ideogram_slab(x: Tensor, cosf: Tensor, sinf: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Tensor:
+    """StepSlab (contract C8) variant of `apply_rope_ideogram`: byte-identical
+    except the output buffer comes from the step slab instead of the MAX pool."""
+    var sh = x.shape()
+    var L = sh[1]; var H = sh[2]; var Dh = sh[3]
+    var half = Dh // 2
+    var n = x.numel()
+    var out_buf = slab.alloc(n * STDtype.BF16.byte_size())
     var x_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
     var c_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](L * Dh))
     var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)

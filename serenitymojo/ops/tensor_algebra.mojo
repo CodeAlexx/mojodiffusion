@@ -685,6 +685,50 @@ def mul_scalar_slab(
     return _binary_scalar_slab(a, s, _OP_MUL, ctx, slab)
 
 
+def mul_slab(
+    a: Tensor, b: Tensor, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `mul` (this file :446) — byte-identical math via
+    _binary_slab; only the allocation source changes (contract C8, Phase P4)."""
+    return _binary_slab(a, b, _OP_MUL, ctx, slab)
+
+
+def add_scalar_slab(
+    a: Tensor, s: Float32, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `add_scalar` (this file :617) via _binary_scalar_slab."""
+    return _binary_scalar_slab(a, s, _OP_ADD, ctx, slab)
+
+
+def zeros_device_slab(
+    var shape: List[Int], dtype: STDtype, ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `zeros_device` (this file :693) — same zero-fill, only
+    the buffer comes from the slab (contract C8, Phase P4)."""
+    var n = 1
+    for i in range(len(shape)):
+        n *= shape[i]
+    var out_buf = slab.alloc(n * dtype.byte_size())
+    out_buf.enqueue_fill(UInt8(0))
+    return Tensor(out_buf^, shape^, dtype)
+
+
+def reshape_slab(
+    x: Tensor, var new_shape: List[Int], ctx: DeviceContext, mut slab: StepSlab
+) raises -> Tensor:
+    """StepSlab variant of `reshape` (this file :710) — same D2D byte copy, slab
+    buffer (contract C8, Phase P4). Prefer reshape_owned (metadata-only, no alloc)
+    where the source is no longer needed."""
+    var n = 1
+    for i in range(len(new_shape)):
+        n *= new_shape[i]
+    if n != x.numel():
+        raise Error(String("reshape_slab: numel mismatch ") + String(n) + " != " + String(x.numel()))
+    var dev = slab.alloc(x.nbytes())
+    ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
+    return Tensor(dev^, new_shape^, x.dtype())
+
+
 def div_scalar(a: Tensor, s: Float32, ctx: DeviceContext) raises -> Tensor:
     """Elementwise a / s (scalar)."""
     return _binary_scalar(a, s, _OP_DIV, ctx)

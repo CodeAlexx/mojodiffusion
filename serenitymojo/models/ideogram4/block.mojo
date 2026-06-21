@@ -98,6 +98,7 @@ from serenitymojo.ops.tensor_algebra import (
     reshape_slab,
 )
 from serenitymojo.ops.tensor_algebra_scratch import (
+    concat2_scratch,
     concat3_scratch,
     slice_scratch,
 )
@@ -1310,13 +1311,12 @@ def ideogram4_block_lora_backward_slab[
     var d_gate_msa_raw = tanh_backward_slab(d_gate_msa, acts.mod_gate_msa_raw, ctx, slab)
     var d_gate_mlp_raw = tanh_backward_slab(d_gate_mlp, acts.mod_gate_mlp_raw, ctx, slab)
     var d_mod_axis = len(d_scale_msa.shape()) - 1
-    # NOTE (contract C8 GAP): this is a 4-tensor concat; tensor_algebra_scratch
-    # only ships concat2_scratch/concat3_scratch — there is NO concat4_scratch.
-    # Left on the non-scratch `concat` (same math, just not scratch-routed) until
-    # a 4-way scratch variant exists. Flagged in the handoff.
-    var d_mod = concat(
-        d_mod_axis, ctx, d_scale_msa, d_gate_msa_raw, d_scale_mlp, d_gate_mlp_raw
-    )
+    # 4-way concat as chained concat2_scratch (no concat4_scratch exists). Byte-
+    # identical layout [scale_msa;gate_msa;scale_mlp;gate_mlp]; fully scratch-routed
+    # for capture (contract C8).
+    var d_mod_lo = concat2_scratch(d_mod_axis, ctx, scratch, d_scale_msa, d_gate_msa_raw)
+    var d_mod_hi = concat2_scratch(d_mod_axis, ctx, scratch, d_scale_mlp, d_gate_mlp_raw)
+    var d_mod = concat2_scratch(d_mod_axis, ctx, scratch, d_mod_lo, d_mod_hi)
     var adalnb = _lora_linear_bwd_slab(
         d_mod, acts.adaln_input, acts.down_adaln, w.adaln_w,
         loras[I4_SLOT_ADALN][], 1, Adaln, 4 * Hidden, ctx, slab, scratch,

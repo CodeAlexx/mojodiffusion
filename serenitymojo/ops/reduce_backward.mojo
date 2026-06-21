@@ -252,7 +252,7 @@ def _elementwise_bwd[
                 _log_bwd_k[DType.float16], _log_bwd_k[DType.float16]
             ](g, xt, o, n, grid_dim=grid, block_dim=_BLOCK)
 
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var sh = List[Int]()
     sh.append(n)
     return Tensor(out_buf^, sh^, x.dtype())
@@ -336,7 +336,7 @@ def softmax_backward(
             _softmax_bwd_rows_k[DType.float16],
             _softmax_bwd_rows_k[DType.float16],
         ](sm, g, o, cols, grid_dim=rows, block_dim=_TPB)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var os = List[Int]()
     os.append(rows); os.append(cols)
     return Tensor(out_buf^, os^, softmax_out.dtype())
@@ -402,7 +402,7 @@ def logsoftmax_backward(
             _logsoftmax_bwd_rows_k[DType.float16],
             _logsoftmax_bwd_rows_k[DType.float16],
         ](l, g, o, cols, grid_dim=rows, block_dim=_TPB)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var os = List[Int]()
     os.append(rows); os.append(cols)
     return Tensor(out_buf^, os^, logsoftmax_out.dtype())
@@ -437,7 +437,7 @@ def _broadcast_bwd(
         ctx.enqueue_function[
             _broadcast_scalar_k[DType.float16], _broadcast_scalar_k[DType.float16]
         ](o, grad_scalar, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var sh = List[Int]()
     for i in range(len(in_shape)):
         sh.append(in_shape[i])

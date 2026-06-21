@@ -375,7 +375,7 @@ def conv2d_backward[
         ctx.enqueue_function[
             _conv2d_db_kernel[DType.float16], _conv2d_db_kernel[DType.float16]
         ](gv, dbv, N, Ho, Wo, Cout, grid_dim=db_grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     # ── wrap outputs ─────────────────────────────────────────────────────────
     var dx_shape = List[Int]()

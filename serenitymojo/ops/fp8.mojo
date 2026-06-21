@@ -272,7 +272,7 @@ def fp8_e4m3_dequant_perrow_to_bf16(
     ctx.enqueue_function[_fp8_dequant_perrow_kernel, _fp8_dequant_perrow_kernel](
         X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
     )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, out_shape^, STDtype.BF16)
 
 

@@ -149,7 +149,7 @@ def sin_op(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_sin_kernel_f16, _sin_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -224,7 +224,7 @@ def exp_op(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_exp_kernel_f16, _exp_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -299,7 +299,7 @@ def sqrt_op(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_sqrt_kernel_f16, _sqrt_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -374,7 +374,7 @@ def rsqrt_op(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_rsqrt_kernel_f16, _rsqrt_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -449,7 +449,7 @@ def tanh_op(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_tanh_kernel_f16, _tanh_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
@@ -524,7 +524,7 @@ def reciprocal_op(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_reciprocal_kernel_f16, _reciprocal_kernel_f16](
             X, O, n, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 

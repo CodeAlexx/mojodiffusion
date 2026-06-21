@@ -63,9 +63,16 @@ def _f32_to_f16(
 
 
 def cast_tensor(
-    x: Tensor, dtype: STDtype, ctx: DeviceContext, synchronize: Bool = True
+    x: Tensor, dtype: STDtype, ctx: DeviceContext, synchronize: Bool = False
 ) raises -> Tensor:
-    """Materialized GPU dtype cast. Supports F32<->BF16/F16 plus no-op clone."""
+    """Materialized GPU dtype cast. Supports F32<->BF16/F16 plus no-op clone.
+
+    Default is async (synchronize=False): single-stream ordering guarantees the
+    cast/copy completes before any later same-stream read; host reads sync at
+    .to_host(). The old default-True synced per call — and the no-op (same-dtype)
+    path's D2D copy+sync was the dominant per-step host stall (defensive casts on
+    already-correct-dtype tensors). Pass synchronize=True only at a real host
+    boundary."""
     if x.dtype() == dtype:
         var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
         ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
@@ -174,7 +181,7 @@ def cast_tensor(
 
 def cast_tensor_slab(
     x: Tensor, dtype: STDtype, ctx: DeviceContext, mut slab: StepSlab,
-    synchronize: Bool = True,
+    synchronize: Bool = False,
 ) raises -> Tensor:
     """StepSlab variant of `cast_tensor` (this file :64) — byte-identical math
     (same kernels, same launch params); ONLY the allocation source changes

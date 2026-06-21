@@ -174,7 +174,7 @@ def patchify(x: Tensor, patch: Int, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_patchify_kernel_f16, _patchify_kernel_f16](
             X, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, L, F], x.dtype())
 
 
@@ -323,7 +323,7 @@ def unpatchify(
         ctx.enqueue_function[_unpatchify_kernel_f16, _unpatchify_kernel_f16](
             S, O, B, C, H, W, p, GH, GW, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, C, H, W], seq.dtype())
 
 
@@ -448,5 +448,5 @@ def deinterleave_pair(
         ctx.enqueue_function[_deinterleave_kernel_f16, _deinterleave_kernel_f16](
             X, EV, OD, rows, K, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return (Tensor(ev_buf^, out_shape.copy(), x.dtype()), Tensor(od_buf^, out_shape^, x.dtype()))

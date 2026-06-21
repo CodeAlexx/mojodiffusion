@@ -77,7 +77,11 @@ struct Tensor(Movable):
         var nbytes = self.nbytes()
         var dev = ctx.enqueue_create_buffer[DType.uint8](nbytes)
         ctx.enqueue_copy(dst_buf=dev, src_buf=self.buf)
-        ctx.synchronize()
+        # No synchronize: single-stream ordering guarantees this D2D copy
+        # completes before any later same-stream read of `dev`; the host only
+        # needs to sync at a `.to_host()` boundary. The old per-clone sync drained
+        # the GPU pipeline once per saved activation in the train tape, blocking
+        # host/GPU overlap (host-bound trainer). (TIER2-SYNC-REMOVED precedent.)
         return Tensor(dev^, self._shape.copy(), self._dtype, 0)
 
     # ── Metadata ──────────────────────────────────────────────────────────────

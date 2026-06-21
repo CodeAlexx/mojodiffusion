@@ -164,7 +164,7 @@ def timestep_embedding(
             _timestep_embed_kernel[DType.float16],
             _timestep_embed_kernel[DType.float16],
         ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var out_shape = List[Int]()
     out_shape.append(n)
     out_shape.append(dim)
@@ -235,7 +235,7 @@ def timestep_embedding_sin_first(
             _timestep_embed_kernel_sin_first[DType.float16],
             _timestep_embed_kernel_sin_first[DType.float16],
         ](T, O, n, dim, half, neg_ln_mp, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var out_shape = List[Int]()
     out_shape.append(n)
     out_shape.append(dim)
@@ -363,7 +363,7 @@ def build_rope_tables(
             _rope_tables_kernel[DType.float16],
             _rope_tables_kernel[DType.float16],
         ](P, C, S, rows, half, theta, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var cos_shape = List[Int]()
     cos_shape.append(rows)

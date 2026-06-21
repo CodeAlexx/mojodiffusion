@@ -366,7 +366,7 @@ def swiglu_backward(
         ctx.enqueue_function[
             _swiglu_bwd_kernel[DType.float16], _swiglu_bwd_kernel[DType.float16]
         ](GO, G, U, DG, DU, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var dg_t = Tensor(dg_buf^, gate.shape(), gate.dtype())
     var du_t = Tensor(du_buf^, up.shape(), up.dtype())
     return SwigluGrads(dg_t^, du_t^)

@@ -1341,6 +1341,49 @@ def _shape_dtype_fast_path(dt: STDtype) -> Bool:
     return dt == STDtype.F32 or dt == STDtype.BF16 or dt == STDtype.F16
 
 
+# Byte-wise strided scatter/gather kernels for the GENERAL concat/slice path
+# (any rank, any dim, any dtype). They replace the old per-outer-slice
+# `enqueue_copy` loops, which issued `outer` D2D copies per call — a 100k+ launch
+# storm on the non-fast-path (rank>2 / dim!=1, e.g. every bf16 transformer
+# concat) that left the GPU mostly idle. A byte carrier needs no dtype
+# specialization and reproduces the old element->element mapping exactly
+# (byte-identical output). One launch per input (concat) / per call (slice).
+def _concat_scatter_bytes_kernel(
+    src: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    block_bytes: Int,
+    out_stride_bytes: Int,
+    dst_base_bytes: Int,
+    nbytes: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < nbytes:
+        var oslice = idx // block_bytes
+        var boff = idx % block_bytes
+        dst[oslice * out_stride_bytes + dst_base_bytes + boff] = rebind[
+            dst.element_type
+        ](rebind[Scalar[DType.uint8]](src[idx]))
+
+
+def _slice_gather_bytes_kernel(
+    src: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    dst: LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin],
+    block_bytes: Int,
+    in_stride_bytes: Int,
+    src_base_bytes: Int,
+    nbytes: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < nbytes:
+        var oslice = idx // block_bytes
+        var boff = idx % block_bytes
+        dst[idx] = rebind[dst.element_type](
+            rebind[Scalar[DType.uint8]](
+                src[oslice * in_stride_bytes + src_base_bytes + boff]
+            )
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # concat — concatenate tensors along `dim`. All inputs must share rank, dtype,
 # and every dim except `dim`. We compute outer = prod(dims before `dim`), inner
@@ -1400,23 +1443,34 @@ def concat(dim: Int, ctx: DeviceContext, *tensors: Tensor) raises -> Tensor:
         inner *= base[ax]
     var out_n = outer * sum_dim * inner
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](out_n * bsz)
-    # For each outer slice, copy each input's (in_dim*inner) block into the
-    # output's running offset. D2D sub-buffer copies via create_sub_buffer.
-    var out_dim_stride = sum_dim * inner  # elements per outer slice in output
+    # ONE strided scatter kernel per input (was: `outer` D2D sub-buffer copies
+    # PER input). See _concat_scatter_bytes_kernel — byte-identical mapping.
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_n * bsz))
+    var out_lt = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr(), out_rl
+    )
+    var out_stride_bytes = sum_dim * inner * bsz  # bytes per outer slice (output)
     var col_off = 0  # running offset along the concat dim (in elements)
     for t in range(len(tensors)):
         var in_dim = tensors[t].shape()[dim]
-        var blk = in_dim * inner  # elements per outer slice for this input
-        for oslice in range(outer):
-            var src_elem = oslice * blk
-            var dst_elem = oslice * out_dim_stride + col_off * inner
-            var src_sub = tensors[t].buf.create_sub_buffer[DType.uint8](
-                src_elem * bsz, blk * bsz
-            )
-            var dst_sub = out_buf.create_sub_buffer[DType.uint8](
-                dst_elem * bsz, blk * bsz
-            )
-            ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
+        var nbytes = outer * in_dim * inner * bsz
+        var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nbytes))
+        var src_lt = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+            tensors[t].buf.unsafe_ptr(), src_rl
+        )
+        var grid = (nbytes + _BLOCK - 1) // _BLOCK
+        ctx.enqueue_function[
+            _concat_scatter_bytes_kernel, _concat_scatter_bytes_kernel
+        ](
+            src_lt,
+            out_lt,
+            in_dim * inner * bsz,
+            out_stride_bytes,
+            col_off * inner * bsz,
+            nbytes,
+            grid_dim=grid,
+            block_dim=_BLOCK,
+        )
         col_off += in_dim
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, oshape^, dt)
@@ -1462,16 +1516,28 @@ def slice(
         return _slice_dim1_rank2_kerneled(x, start, length, ctx)
     var blk = length * inner  # elements per outer slice in output
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](outer * blk * bsz)
-    for oslice in range(outer):
-        var src_elem = oslice * (in_dim * inner) + start * inner
-        var dst_elem = oslice * blk
-        var src_sub = x.buf.create_sub_buffer[DType.uint8](
-            src_elem * bsz, blk * bsz
-        )
-        var dst_sub = out_buf.create_sub_buffer[DType.uint8](
-            dst_elem * bsz, blk * bsz
-        )
-        ctx.enqueue_copy(dst_buf=dst_sub, src_buf=src_sub)
+    # ONE strided gather kernel (was: `outer` D2D sub-buffer copies). See
+    # _slice_gather_bytes_kernel — byte-identical to the old element mapping.
+    var nbytes = outer * blk * bsz
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](x.nbytes()))
+    var src_lt = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        x.buf.unsafe_ptr(), src_rl
+    )
+    var dst_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nbytes))
+    var dst_lt = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        out_buf.unsafe_ptr(), dst_rl
+    )
+    var grid = (nbytes + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[_slice_gather_bytes_kernel, _slice_gather_bytes_kernel](
+        src_lt,
+        dst_lt,
+        blk * bsz,
+        in_dim * inner * bsz,
+        start * inner * bsz,
+        nbytes,
+        grid_dim=grid,
+        block_dim=_BLOCK,
+    )
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, oshape^, x.dtype())
 
@@ -1602,5 +1668,5 @@ def gather_rows(
         ctx.enqueue_function[_gather_kernel_f16, _gather_kernel_f16](
             T, IDS, O, N, D, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [N, D], table.dtype())

@@ -128,7 +128,7 @@ def linear_fp8(
         # Fence only the biased path so that temporary bias storage cannot drop
         # before the queued kernel reads it. The no-bias path has no local input
         # buffer to keep alive; later users/readback on the same ctx synchronize.
-        ctx.synchronize()
+        # sync removed (single-stream ordering; was kernel-trailing host stall)
     # output shape = x leading dims + [N]
     var os = xsh.copy()
     os[len(os) - 1] = N

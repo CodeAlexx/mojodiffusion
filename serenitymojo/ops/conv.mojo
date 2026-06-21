@@ -148,7 +148,7 @@ def conv2d_im2col[
             stride_h, stride_w, pad_h, pad_w,
             grid_dim=grid, block_dim=_BLOCK,
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var col = Tensor(col_buf^, [M, K], x.dtype())          # [M, K]
     var w2 = transpose(reshape(weight, [K, Cout], ctx), 0, 1, ctx)  # [Cout, K]
@@ -342,7 +342,7 @@ def conv2d[
             X, F, O, stride, dilation, padding, 1,
             grid_dim=(gx, gy, N), block_dim=(_CONV_BS, _CONV_BS),
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     # Optional bias add (per-output-channel, broadcast over N,Ho,Wo).
     if bias:
@@ -386,7 +386,7 @@ def conv2d[
             ctx.enqueue_function[_bias_add_kernel_f16, _bias_add_kernel_f16](
                 O2, B, rows, Cout, grid_dim=grid, block_dim=_BLOCK
             )
-        ctx.synchronize()
+        # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var out_shape = List[Int]()
     out_shape.append(N)

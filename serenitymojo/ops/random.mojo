@@ -287,5 +287,5 @@ def randn(var shape: List[Int], seed: UInt64, dtype: STDtype, ctx: DeviceContext
         ctx.enqueue_function[_randn_kernel_f16, _randn_kernel_f16](
             O, n, seed, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, shape^, dtype)

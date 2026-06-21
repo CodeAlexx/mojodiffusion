@@ -105,7 +105,8 @@ def ideogram4_embedscalar_sinusoid(
     var grid = (n + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_embedscalar_sinusoid_kernel, _embedscalar_sinusoid_kernel](
         T, O, dim, half, lsf, Float32(10000.0), n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # No synchronize: single-stream ordering; downstream same-stream reads see
+    # the result, host syncs only at .to_host(). (was a per-op pipeline drain)
     var out_shape = [N, dim]
     return Tensor(out_buf^, out_shape^, STDtype.BF16)
 
@@ -170,7 +171,8 @@ def apply_rope_ideogram(x: Tensor, cosf: Tensor, sinf: Tensor, ctx: DeviceContex
     var grid = (n + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_rope_kernel[DType.bfloat16], _rope_kernel[DType.bfloat16]](
         X, C, S, O, L, H, Dh, half, n, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # No synchronize: single-stream ordering; this rope output feeds SDPA on the
+    # same stream. Per-call sync here drained the pipeline 2x/layer (q,k).
     var os = sh.copy()
     return Tensor(out_buf^, os^, STDtype.BF16)
 

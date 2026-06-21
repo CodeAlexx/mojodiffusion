@@ -200,7 +200,7 @@ def build_multiaxis_rope_tables(
             _multiaxis_rope_kernel[DType.float16],
             _multiaxis_rope_kernel[DType.float16],
         ](P, A, C, S, rows, half, num_axes, theta, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var cos_shape = List[Int]()
     cos_shape.append(rows)
@@ -375,7 +375,7 @@ def build_multiaxis_rope_tables_per_axis(
             _multiaxis_rope_kernel_per_axis[DType.float16],
             _multiaxis_rope_kernel_per_axis[DType.float16],
         ](P, A, TH, C, S, rows, half, num_axes, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var cos_shape = List[Int]()
     cos_shape.append(rows)

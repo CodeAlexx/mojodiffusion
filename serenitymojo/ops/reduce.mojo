@@ -331,7 +331,7 @@ def _reduce_impl(
             )
         else:
             raise Error("reduce: F16 input supports only F16 or F32 output")
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     # keep metadata buffers alive until the kernel has run.
     _ = ks_buf^
     _ = kst_buf^

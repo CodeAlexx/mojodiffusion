@@ -325,7 +325,7 @@ def conv1d(
                 stride, pad, dilation, groups, has_bias,
                 grid_dim=grid, block_dim=_BLOCK,
             )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var out_shape = List[Int]()
     out_shape.append(B)
@@ -444,7 +444,7 @@ def zero_insert1d(x: Tensor, stride: Int, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_zero_insert_kernel_f16, _zero_insert_kernel_f16](
             X, O, BC, L, Lo, stride, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var out_shape = List[Int]()
     out_shape.append(B)
@@ -570,7 +570,7 @@ def replicate_pad1d(
         ctx.enqueue_function[_replicate_pad_kernel_f16, _replicate_pad_kernel_f16](
             X, O, BC, L, Lo, left, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var out_shape = List[Int]()
     out_shape.append(B)

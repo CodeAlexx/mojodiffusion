@@ -235,5 +235,5 @@ def softmax_lastdim(x: Tensor, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_softmax_kernel_f16, _softmax_kernel_f16](
             X, O, d, grid_dim=rows, block_dim=_TPB
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, xshape.copy(), x.dtype())

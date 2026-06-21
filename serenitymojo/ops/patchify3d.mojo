@@ -223,7 +223,7 @@ def patchify3d(
             X, O, C, F, H, W, patch_f, patch_h, patch_w, FO, HO, WO,
             grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var out_shape = List[Int]()
     out_shape.append(L)
     out_shape.append(PD)
@@ -397,7 +397,7 @@ def unpatchify3d(
             S, O, C, frames, height, width, patch_f, patch_h, patch_w, FO, HO, WO,
             grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var out_shape = List[Int]()
     out_shape.append(C)
     out_shape.append(frames)

@@ -175,7 +175,7 @@ def fp8_e4m3_rowscale(w: Tensor, ctx: DeviceContext) raises -> Tensor:
     ctx.enqueue_function[_rowscale_kernel, _rowscale_kernel](
         X, S, cols, rows, grid_dim=grid, block_dim=_BLOCK,
     )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var s_shape: List[Int] = [rows]
     return Tensor(out_buf^, s_shape^, STDtype.F32)
 
@@ -236,5 +236,5 @@ def fp8_e4m3_encode_perrow(
     ctx.enqueue_function[_encode_perrow_kernel, _encode_perrow_kernel](
         X, S, O, cols, n, grid_dim=grid, block_dim=_BLOCK,
     )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, w.shape(), STDtype.F8_E4M3)

@@ -962,7 +962,7 @@ def gate_residual_backward(
             dg_shape.append(cols)
         else:
             dg_shape.append(0)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var dx_t = Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())
     var dy_t = Tensor(dy_buf^, grad_out.shape(), grad_out.dtype())
     var dg_t = Tensor(dg_buf^, dg_shape^, g.dtype())
@@ -1046,7 +1046,7 @@ def gate_residual_backward_dxdy(
         ctx.enqueue_function[
             _gate_dxdy_kernel[DType.float16], _gate_dxdy_kernel[DType.float16]
         ](G, GATE, DX, DY, rows, cols, rows_per_vec, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var dg_shape = List[Int]()
     dg_shape.append(0)
     var dx_t = Tensor(dx_buf^, grad_out.shape(), grad_out.dtype())

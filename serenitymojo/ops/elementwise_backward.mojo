@@ -211,7 +211,7 @@ def modulate_backward(
             param_shape = scale.shape()
         else:
             param_shape.append(0)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return ModulateBackward(
         Tensor(dx_buf^, xshape.copy(), x.dtype()),
         Tensor(ds_buf^, param_shape.copy(), scale.dtype()),

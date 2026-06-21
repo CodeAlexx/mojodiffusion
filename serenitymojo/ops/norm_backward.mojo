@@ -294,7 +294,7 @@ def rms_norm_backward(
             ](GOm, Xm, DGm, rows_m, d_m, eps, grid_dim=dg_grid_m, block_dim=_BLOCK)
         else:
             raise Error("rms_norm_backward: unsupported mixed weight dtype")
-        ctx.synchronize()
+        # sync removed (single-stream ordering; was kernel-trailing host stall)
         return RmsNormBackward(
             Tensor(dx_buf_m^, xshape_m.copy(), x.dtype()),
             Tensor(dg_buf_m^, weight.shape().copy(), weight.dtype()),
@@ -364,7 +364,7 @@ def rms_norm_backward(
         ctx.enqueue_function[
             _rms_bwd_dg_kernel[DType.float16], _rms_bwd_dg_kernel[DType.float16]
         ](GO, X, DG, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return RmsNormBackward(
         Tensor(dx_buf^, xshape.copy(), x.dtype()),
         Tensor(dg_buf^, weight.shape().copy(), weight.dtype()),
@@ -414,7 +414,7 @@ def rms_norm_backward_dx(
             ](GOm, Xm, Gm, DXm, d_m, eps, grid_dim=rows_m, block_dim=_TPB)
         else:
             raise Error("rms_norm_backward_dx: unsupported mixed weight dtype")
-        ctx.synchronize()
+        # sync removed (single-stream ordering; was kernel-trailing host stall)
         return Tensor(dx_buf_m^, xshape_m.copy(), x.dtype())
     var xshape = x.shape()
     var d = xshape[len(xshape) - 1]
@@ -463,7 +463,7 @@ def rms_norm_backward_dx(
         ctx.enqueue_function[
             _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
         ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(dx_buf^, xshape.copy(), x.dtype())
 
 
@@ -808,7 +808,7 @@ def layer_norm_backward(
         ctx.enqueue_function[
             _ln_bwd_param_kernel[DType.float16], _ln_bwd_param_kernel[DType.float16]
         ](GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return LayerNormBackward(
         Tensor(dx_buf^, xshape.copy(), x.dtype()),
         Tensor(dg_buf^, weight.shape().copy(), weight.dtype()),
@@ -872,7 +872,7 @@ def layer_norm_backward_dx(
         ctx.enqueue_function[
             _ln_bwd_dx_kernel[DType.float16], _ln_bwd_dx_kernel[DType.float16]
         ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(dx_buf^, xshape.copy(), x.dtype())
 
 
@@ -1259,7 +1259,7 @@ def group_norm_backward(
             GO, X, DG, DB, n, hw, c, num_groups, eps,
             grid_dim=c_grid, block_dim=_BLOCK,
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return GroupNormBackward(
         Tensor(dx_buf^, xshape.copy(), x.dtype()),
         Tensor(dg_buf^, weight.shape().copy(), weight.dtype()),

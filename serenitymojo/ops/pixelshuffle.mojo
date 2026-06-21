@@ -216,7 +216,7 @@ def depth_to_space_3d(
             X, O, B, C, F, H, W, p1, p2, p3, FOk, drop,
             grid_dim=grid, block_dim=_BLOCK,
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, C, FOk, HO, WO], x.dtype())
 
 
@@ -359,7 +359,7 @@ def pixel_unshuffle(x: Tensor, r: Int, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_unshuffle_kernel_f16, _unshuffle_kernel_f16](
             X, O, B, C, H, W, r, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, Co, Ho, Wo], x.dtype())
 
 
@@ -497,7 +497,7 @@ def pixel_shuffle(x: Tensor, r: Int, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_shuffle_kernel_f16, _shuffle_kernel_f16](
             X, O, B, C, H, W, r, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, C, Ho, Wo], x.dtype())
 
 
@@ -671,7 +671,7 @@ def space_to_depth_3d(
             X, O, B, C, F2, H2, W2, p1, p2, p3, Fi, Hi, Wi,
             grid_dim=grid, block_dim=_BLOCK,
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, Ctot, F2, H2, W2], x.dtype())
 
 
@@ -822,5 +822,5 @@ def patchify_3d(x: Tensor, p: Int, ctx: DeviceContext) raises -> Tensor:
         ctx.enqueue_function[_patch_kernel_f16, _patch_kernel_f16](
             X, O, B, C, T, Hp, Wp, p, Hi, Wi, grid_dim=grid, block_dim=_BLOCK
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, [B, Cout, T, Hp, Wp], x.dtype())

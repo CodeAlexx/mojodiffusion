@@ -251,5 +251,5 @@ def mxfp4_dequant_to_bf16(
         B, S, O, rows_total,
         grid_dim=grid, block_dim=_BLOCK,
     )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, out_shape^, STDtype.BF16)

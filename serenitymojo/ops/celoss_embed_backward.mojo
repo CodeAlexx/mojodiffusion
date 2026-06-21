@@ -176,7 +176,7 @@ def cross_entropy_backward(
         ctx.enqueue_function[
             _ce_bwd_rows_k[DType.float16], _ce_bwd_rows_k[DType.float16]
         ](LG, TG, O, C, Float32(1.0) / Float32(N), grid_dim=N, block_dim=_TPB)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var os = [N, C]
     return Tensor(out_buf^, os^, logits.dtype())
 
@@ -255,7 +255,7 @@ def nll_backward(
         ctx.enqueue_function[
             _nll_bwd_k[DType.float16], _nll_bwd_k[DType.float16]
         ](TG, O, C, Float32(-1.0) / Float32(N), grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var os = [N, C]
     return Tensor(out_buf^, os^, log_probs.dtype())
 
@@ -324,7 +324,7 @@ def bce_backward(
         ctx.enqueue_function[
             _bce_bwd_k[DType.float16], _bce_bwd_k[DType.float16]
         ](P, T, O, n, Float32(1.0) / Float32(n), grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(out_buf^, pred.shape(), pred.dtype())
 
 
@@ -413,6 +413,6 @@ def embedding_backward(
         ctx.enqueue_function[
             _embedding_bwd_k[DType.float16], _embedding_bwd_k[DType.float16]
         ](G, IDS, O, Ni, D, num_embeddings, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var os = [num_embeddings, D]
     return Tensor(out_buf^, os^, grad_out.dtype())

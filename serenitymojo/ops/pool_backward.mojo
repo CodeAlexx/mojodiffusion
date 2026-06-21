@@ -261,7 +261,7 @@ def maxpool2d_backward[
             N, Hi, Wi, C, Kh, Kw, Sh, Sw, Ho, Wo,
             grid_dim=grid, block_dim=_BLOCK,
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var dx_shape = List[Int]()
     dx_shape.append(N); dx_shape.append(Hi); dx_shape.append(Wi); dx_shape.append(C)
@@ -353,7 +353,7 @@ def upsample_nearest2d_backward[
             N, in_h, in_w, C, scale, Ho, Wo,
             grid_dim=grid, block_dim=_BLOCK,
         )
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var dx_shape = List[Int]()
     dx_shape.append(N); dx_shape.append(in_h); dx_shape.append(in_w); dx_shape.append(C)

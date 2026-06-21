@@ -98,7 +98,7 @@ def repeat_kv_f32(
             _repeat_kv_fwd_kernel[DType.float16],
             _repeat_kv_fwd_kernel[DType.float16],
         ](SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var sh = [1, s, h, dh]
     return Tensor(out_buf^, sh^, x.dtype())
 
@@ -180,6 +180,6 @@ def repeat_kv_backward(
             _repeat_kv_bwd_kernel[DType.float16],
             _repeat_kv_bwd_kernel[DType.float16],
         ](DDST, DSRC, s, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
-    ctx.synchronize()
+    # sync removed (single-stream ordering; was kernel-trailing host stall)
     var sh = [1, s, h_kv, dh]
     return Tensor(out_buf^, sh^, d_dst.dtype())

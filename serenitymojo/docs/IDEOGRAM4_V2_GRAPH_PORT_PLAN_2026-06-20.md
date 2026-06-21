@@ -1,4 +1,14 @@
 # Ideogram4 → autograd_v2 (graph + capture) port plan (2026-06-20)
+>> **STATUS 2026-06-21 — SUPERSEDED on the speed thesis; see IDEOGRAM4_SESSION_HANDOFF_2026-06-21.md.**
+>> The premise below ("host-op-construction bound, capture is the only lever") was an
+>> UNVERIFIED estimate and was REFUTED by measurement: capture works but yields only ~5%
+>> (the block is GPU-BOUND). The real speed lever was KERNEL QUALITY — naive SDPA fwd/bwd
+>> kernels → cuBLAS matmul gave 2.1× (5.43→2.56 s/step, commits 6781403/864a884). The
+>> autograd_v2 port (Stages 0-2) below IS built + bit-gated and correct (block migrate /
+>> engine adapter / slab block), just not the speedup. SEPARATELY there is an OPEN training
+>> LOSS bug (≈1.1 vs torch 0.96) localized to the training forward — see the handoff + memory
+>> project-ideogram4-loss-too-high. Read the handoff first.
+
 
 Grounded in: AUTOGRAD_V2_MOJO_DESIGN.md (C1–C15), MOJO_V2_ENGINE_PLAN.md (phase
 ledger), and the read-in-full Klein precedent autograd_v2/klein_block_graph.mojo.

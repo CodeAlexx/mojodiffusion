@@ -67,6 +67,10 @@ from serenitymojo.models.sdxl.lora_block import SDXL_SLOTS
 from serenitymojo.training.train_step import LoraGrads, _lora_adamw
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.sdxl_sample_resident import (
+    sdxl_sample_resident, sdxl_decode_latent_to_png,
+)
+from serenitymojo.registry.checkpoints import default_manifest_by_id
 from serenitymojo.training.sample_prompt_config import (
     SampleCadence, read_sample_cadence_config,
     validate_step_sample_cadence, should_sample_completed_step,
@@ -89,6 +93,7 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
 )
+from serenitymojo.training.caption_dropout import should_drop_caption
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -99,14 +104,25 @@ from serenitymojo.training.onetrainer_cache_preflight import (
 comptime CCTX = 2048
 comptime NKV = 77
 comptime ADM = 2816
+# SDXL context = concat(CLIP-L / TE1 [.,768], CLIP-G / TE2 [.,1280]) along the
+# feature axis (StableDiffusionXLModel.combine_text_encoder_output). The OT
+# per-text-encoder caption dropout zeros these sub-ranges independently.
+comptime TE1_CTX = 768          # TE1 (CLIP-L) feature channels [0:768)
+comptime TE2_CTX = 1280         # TE2 (CLIP-G) feature channels [768:2048)
+comptime POOLED_DIM = 1280      # pooled (TE2) -> y[0:1280)
 
 # ── resolution knob (latent spatial; 64 = 512px). Default small for the smoke. ──
 comptime LATENT_HW = 16
 
 # ── recipe (train_sdxl.rs preset) ─────────────────────────────────────────────
 comptime RANK = 16
-comptime ALPHA = Float32(16.0)
-comptime LR = Float32(1.0e-4)
+# OneTrainer "#sdxl 1.0 LoRA" preset does NOT set lora_alpha -> OT default 1.0
+# (TrainConfig.py:1144); OT scale = alpha/rank (LoRAModule.py:329) = 1/16 = 0.0625.
+comptime ALPHA = Float32(1.0)
+# OneTrainer "#sdxl 1.0 LoRA" preset learning_rate (3e-4). The optimizer step
+# reads train_cfg.lr (via ot_lr_for_optimizer_step) — this comptime is only the
+# arch/recipe bookkeeping constant the config guard checks against.
+comptime LR = Float32(3.0e-4)
 comptime BETA_START = Float64(0.00085)
 comptime BETA_END = Float64(0.012)
 comptime NUM_TRAIN_TIMESTEPS = 1000
@@ -114,6 +130,17 @@ comptime CLIP = Float32(1.0)
 comptime FIXED_SMOKE = True
 comptime FIXED_T_IDX = 500
 comptime SEED_BASE = UInt64(42)
+
+# ── sample-during-training (v1; sdxl_sample_resident) ─────────────────────────
+# When cadence fires, run an eps-pred Euler CFG denoise on the FROZEN UNet weights
+# + the LIVE per-ST LoRA at the trainer's comptime LATENT_HW, SDXL-VAE-decode, and
+# write <LORA_DIR>/samples/step_<N>.png. Geometry is the trainer's LATENT_HW
+# (LATENT_HW=16 -> 128px sample; 64 -> 512px). Conditioning v1 reuses the cached
+# caption's context/y as COND, zeros as UNCOND. See sdxl_sample_resident.mojo
+# header for the why + the drop-in real-encode path.
+comptime SAMPLE_STEPS = 30
+comptime SAMPLE_CFG = Float32(7.5)
+comptime SAMPLE_SEED = UInt64(12345)
 
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/sdxl_unet_bf16.safetensors"
 comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_sdxl_512_smoke"
@@ -165,8 +192,13 @@ def validate_sdxl_train_config(cfg: TrainConfig) raises:
         )
     if not _close_f32(cfg.lora_alpha, ALPHA):
         raise Error("SDXL trainer lora_alpha does not match compiled constant")
-    if not _close_f32(cfg.lr, LR, Float32(1.0e-9)):
-        raise Error("SDXL trainer learning_rate does not match compiled constant")
+    # Learning rate is config-driven (OneTrainer treats it as a pure preset
+    # value): the optimizer step uses cfg.lr via ot_lr_for_optimizer_step, so we
+    # only require lr > 0 here rather than pinning it to the compiled LR. The OT
+    # "#sdxl 1.0 LoRA" preset sets 3e-4 (the compiled default); other valid LoRA
+    # runs (e.g. a different lr in a sibling config) must NOT be rejected.
+    if cfg.lr <= Float32(0.0):
+        raise Error("SDXL trainer requires learning_rate > 0")
     if not _close_f32(cfg.max_grad_norm, CLIP):
         raise Error("SDXL trainer max_grad_norm does not match compiled constant")
     validate_ot_lora_adamw_loop_policy(cfg, String("SDXL trainer"))
@@ -358,6 +390,39 @@ def _host_f32_for_step_math(t: Tensor, ctx: DeviceContext) raises -> List[Float3
     return t.to_host(ctx)
 
 
+# ── _sdxl_run_sample — one sample-during-training image ──────────────────────
+#   cond cond    : the cached caption's context [1,77,2048] + y [1,2816] (v1; the
+#                  SAME tensors the train step built — see header).
+#   uncond cond  : zeros (built inside sdxl_sample_resident; CFG empty prompt).
+#   init noise   : gaussian [4*LATENT_HW*LATENT_HW] NCHW, seed = SAMPLE_SEED + step
+#                  (the trainer's _host_noise convention).
+#   denoise      : sdxl_sample_resident (frozen base UNet + live per-ST LoRA).
+#   decode+write : sdxl_decode_latent_to_png -> <samples_dir>/step_<N>.png.
+# Fail-loud: any raise propagates (no silent skip), matching the trainer's
+# fail-loud cadence contract.
+def _sdxl_run_sample(
+    w: SdxlRealWeights,
+    lora: List[SdxlLoraSet],
+    context: Tensor,    # [1,77,2048] cached caption COND context
+    y: Tensor,          # [1,2816] cached caption COND ADM vector
+    vae_path: String,
+    samples_dir: String,
+    step: Int,
+    ctx: DeviceContext,
+) raises:
+    var n_lat = 4 * LATENT_HW * LATENT_HW
+    var init_noise = _host_noise(n_lat, SAMPLE_SEED + UInt64(step))
+
+    var latent = sdxl_sample_resident[LATENT_HW, LATENT_HW](
+        w, lora, context.clone(ctx), y.clone(ctx), init_noise^,
+        SAMPLE_STEPS, SAMPLE_CFG, ctx,
+    )
+
+    var out_path = samples_dir + String("/step_") + String(step) + String(".png")
+    sdxl_decode_latent_to_png[LATENT_HW, LATENT_HW](latent, vae_path, out_path, ctx)
+    print("[SDXL-lora] sample step=", step, " -> ", out_path)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -477,15 +542,46 @@ def main() raises:
     if len(y_h) != ADM:
         raise Error(String("ADM y length ") + String(len(y_h)) + " != 2816")
     var ys = List[Int](); ys.append(1); ys.append(ADM)
+    # Retain a host copy of y so a TE2 caption-dropout step can rebuild y with the
+    # pooled (TE2) sub-vector y[0:POOLED_DIM] zeroed (OT zeros pooled on TE2 drop).
+    var y_h_keep = y_h.copy()
     var y = Tensor.from_host(y_h^, ys^, STDtype.F32, ctx)
 
     # ── context = text_embedding [1,77,2048] ──
     # Keep the frozen text cache tensor in its stored dtype at the train-loop
     # boundary. Mixed linear/attention ops widen internally where needed.
+    var context_ctx_len = text_emb_cache.shape()[1]
     var context = text_emb_cache^
+    # Host-F32 copy used ONLY to rebuild a dropped context when OT per-encoder
+    # caption dropout fires (kept here so the default-off path never rebuilds).
+    var context_f32 = _host_f32_for_step_math(context, ctx)
+
+    # ── OT per-text-encoder caption dropout (default-off; see header) ──────────
+    var te1_drop_p = train_cfg.text_encoder_dropout_prob
+    var te2_drop_p = train_cfg.text_encoder_2_dropout_prob
+    var caption_dropout_on = (te1_drop_p > Float32(0.0)) or (te2_drop_p > Float32(0.0))
+    if caption_dropout_on:
+        print("  caption_dropout (OT SDXL): te1_p=", te1_drop_p,
+              " te2_p=", te2_drop_p,
+              " (TE1 zeros ctx[0:768]; TE2 zeros ctx[768:2048]+pooled)")
+
+    # sample-during-training output dir + VAE path (created/resolved up front so a
+    # cadence fire just denoises + decodes + writes). VAE = the registered SDXL VAE
+    # (loaded fresh per sample inside sdxl_decode_latent_to_png — zero resident cost
+    # between samples). Conditioning reuses (context, y) as COND; see
+    # sdxl_sample_resident.mojo header for the v1 conditioning decision.
+    var samples_dir = String(LORA_DIR) + String("/samples")
+    var sdxl_manifest = default_manifest_by_id(String("sdxl"))
+    var sample_vae_path = sdxl_manifest.vae_path.copy()
+    if sample_enabled:
+        makedirs(samples_dir, exist_ok=True)
+        print("[cadence] sample-during-training WIRED -> ", samples_dir,
+              " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG,
+              " latent=", LATENT_HW, "x", LATENT_HW, " -> ", LATENT_HW * 8, "px)")
+        print("[cadence] sample VAE:", sample_vae_path)
 
     if sample_enabled and should_sample_completed_step(sample_cadence, 0):
-        print("[cadence] step 0 sample due; SDXL validation sampler is not wired in this bounded loop")
+        print("[cadence] step 0 sample due (fires after the first completed step in this bounded loop)")
     var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
     print("[cadence] next sample completed_step=", next_sample)
 
@@ -520,8 +616,46 @@ def main() raises:
         var t_s = List[Int](); t_s.append(1)
         var t = Tensor.from_host(t_h^, t_s^, STDtype.F32, ctx)
 
+        # ── OT per-text-encoder caption dropout (independent TE1/TE2 Bernoulli) ──
+        # TE1 drop zeros context channels [0:TE1_CTX); TE2 drop zeros context
+        # channels [TE1_CTX:CCTX) AND pooled y[0:POOLED_DIM). Two independent draws
+        # from distinct per-step seeds (OT draws TE1 then TE2 off the same stream).
+        # Default-off (both p==0): no draw, reuse the dtype-preserved tensors —
+        # byte-identical to the pre-dropout path.
+        var step_context = context.clone(ctx)
+        var step_y = y.clone(ctx)
+        if caption_dropout_on:
+            var drop_te1 = should_drop_caption(
+                SEED_BASE * UInt64(2654435761) + UInt64(k), te1_drop_p
+            )
+            var drop_te2 = should_drop_caption(
+                SEED_BASE * UInt64(40503) + UInt64(k), te2_drop_p
+            )
+            if drop_te1 or drop_te2:
+                var cd = context_f32.copy()
+                for n in range(context_ctx_len):
+                    var base = n * CCTX
+                    if drop_te1:
+                        for c in range(TE1_CTX):
+                            cd[base + c] = Float32(0.0)
+                    if drop_te2:
+                        for c in range(TE1_CTX, CCTX):
+                            cd[base + c] = Float32(0.0)
+                var cshape = List[Int]()
+                cshape.append(1); cshape.append(context_ctx_len); cshape.append(CCTX)
+                step_context = Tensor.from_host(cd^, cshape^, STDtype.F32, ctx)
+                if drop_te2:
+                    var yd = y_h_keep.copy()
+                    for c in range(POOLED_DIM):
+                        yd[c] = Float32(0.0)
+                    var yshape = List[Int](); yshape.append(1); yshape.append(ADM)
+                    step_y = Tensor.from_host(yd^, yshape^, STDtype.F32, ctx)
+                if FIXED_SMOKE or k == 1:
+                    print("PROG_STAGE step=", k, " phase=caption_dropout te1=",
+                          (1 if drop_te1 else 0), " te2=", (1 if drop_te2 else 0))
+
         # ── forward (NHWC) -> eps_pred NHWC [1,LH,LW,4] ──
-        var fwd = sdxl_real_forward[LATENT_HW, LATENT_HW](noisy_nhwc, t, y.clone(ctx), context.clone(ctx), w, lora, ctx)
+        var fwd = sdxl_real_forward[LATENT_HW, LATENT_HW](noisy_nhwc, t, step_y^, step_context^, w, lora, ctx)
         var pred_nhwc_h = fwd.out.to_host(ctx)   # NHWC flat [LH*LW*4]
 
         # ── target ε in NHWC order (noise is NCHW; convert index) ──
@@ -597,7 +731,12 @@ def main() raises:
             print(
                 "[cadence] sample due at completed_step=", k,
                 " sample_file=", sample_cadence.sample_definition_file_name,
-                " (sampler not wired in this bounded loop)",
+            )
+            # Denoise the FROZEN UNet + the LIVE per-ST LoRA at LATENT_HW, decode,
+            # write <LORA_DIR>/samples/step_<k>.png. v1 conditioning reuses the
+            # cached caption's (context, y) as COND, zeros as UNCOND.
+            _sdxl_run_sample(
+                w, lora, context, y, sample_vae_path, samples_dir, k, ctx,
             )
 
     print("")
@@ -623,7 +762,7 @@ def main() raises:
         print("RESULT: FAIL trains=", trains)
 
 
-from std.os import listdir
+from std.os import listdir, makedirs
 def _list_safetensors(dir: String) raises -> List[String]:
     var raw = listdir(dir)
     var fs = List[String]()

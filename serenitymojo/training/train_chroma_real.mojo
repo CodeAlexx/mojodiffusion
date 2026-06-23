@@ -52,7 +52,7 @@ from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 from std.time import perf_counter_ns
-from std.os import listdir
+from std.os import listdir, makedirs
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -61,6 +61,7 @@ from serenitymojo.io.tensor_view import from_parts
 
 from serenitymojo.models.chroma.weights import load_chroma_stack_base
 from serenitymojo.models.chroma.chroma_stack_lora import (
+    ChromaStackBase,
     chroma_stack_lora_forward_offload, chroma_stack_lora_backward_offload,
     save_chroma_lora, save_chroma_lora_state,
 )
@@ -101,6 +102,9 @@ from serenitymojo.training.train_config import (
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
+)
+from serenitymojo.training.chroma_sample_resident import (
+    chroma_sample_resident, chroma_decode_latent_to_png,
 )
 
 
@@ -147,6 +151,22 @@ comptime CACHE_DIR = "/home/alex/datasets/boxjana_chroma_edv2_512"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/chroma_boxjana"
 comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/chroma.json"
 comptime DEFAULT_RUN_STEPS = 5
+
+# ── sample-during-training (v1; chroma_sample_resident) ──────────────────────
+# When the existing SampleCadence fires (should_sample_completed_step), denoise a
+# sample from the CURRENT frozen base + streamed blocks + LIVE LoRA, decode with
+# the FLUX VAE, and write <LORA_DIR>/samples/step_<N>.png. Geometry is the
+# trainer's 512px latent (LAT_H=LAT_W=64 -> 8x VAE -> 512x512 image).
+#   SAMPLE_STEPS / SAMPLE_CFG : denoise loop length + CFG (sampler defaults 30/4.0
+#                               — chroma_sample_cli.mojo NUM_STEPS/GUIDANCE).
+#   SAMPLE_SEED               : base RNG seed for the t=1 packed init noise.
+# v1 CONDITIONING (flagged): no in-tree T5 tokenizer, so the COND text is the
+#   CURRENT step's cached caption T5 embeds (the loop's txt_tokens); UNCOND is a
+#   zero vector. See chroma_sample_resident.mojo header for the why + drop-in path.
+comptime SAMPLE_STEPS = 30
+comptime SAMPLE_CFG = Float32(4.0)
+comptime SAMPLE_SEED = UInt64(0xC4_303A_5A91)
+comptime SAMPLE_VAE_PATH = "/home/alex/.serenity/models/vaes/ae.safetensors"
 
 
 def _is_nonnegative_int(s: String) -> Bool:
@@ -391,6 +411,57 @@ def _pooled_modulation_tensor(
     return approx.approximator_forward(approx_in, ctx)   # [1, MOD_INDEX, D] BF16
 
 
+# ── deterministic host gaussian PACKED init noise [N_IMG*IN_CH] ──────────────
+# Reuses the same Box-Muller PCG as the train loop's _host_noise (so the sample's
+# t=1 latent is drawn the same way the training noise is). seed makes it
+# deterministic per sampled step.
+def _sample_init_noise(seed: UInt64) -> List[Float32]:
+    return _host_noise(N_IMG * IN_CH, seed)
+
+
+# ── _chroma_run_sample — one sample-during-training image ────────────────────
+#   cond text    : the current step's cached caption T5 embeds (v1; see header).
+#   uncond text  : a zeroed [N_TXT*TXT_CH] vector (CFG empty cond).
+#   init noise   : packed gaussian [N_IMG*IN_CH], seed = SAMPLE_SEED + step.
+#   denoise      : chroma_sample_resident (frozen base + streamed blocks + live
+#                  LoRA + frozen approximator).
+#   decode+write : chroma_decode_latent_to_png -> <samples_dir>/step_<N>.png.
+# Fail-loud: any raise propagates (no silent skip), matching the trainer's
+# fail-loud cadence contract.
+def _chroma_run_sample(
+    base: ChromaStackBase,
+    approx: ChromaDitCache,
+    mut loader: TurboPlannedLoader,
+    lora: FluxLoraSet,
+    cond_txt: List[Float32],     # [N_TXT*TXT_CH] — the step's cached caption embeds
+    cos: List[Float32],
+    sin: List[Float32],
+    samples_dir: String,
+    step: Int,
+    ctx: DeviceContext,
+) raises:
+    # UNCOND: zeroed text features (same dtype/shape as cond_txt).
+    var uncond_txt = List[Float32]()
+    for _ in range(N_TXT * TXT_CH):
+        uncond_txt.append(Float32(0.0))
+
+    var init_noise = _sample_init_noise(SAMPLE_SEED + UInt64(step))
+
+    var latent = chroma_sample_resident[H, Dh, N_IMG, N_TXT, S](
+        base, approx, loader, lora,
+        cond_txt.copy(), uncond_txt^, init_noise^,
+        cos.copy(), sin.copy(),
+        SAMPLE_STEPS, SAMPLE_CFG, MOD_INDEX,
+        D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+    )
+
+    var out_path = samples_dir + String("/step_") + String(step) + String(".png")
+    chroma_decode_latent_to_png[LAT_C, LAT_H, LAT_W, HT, WT, PATCH, N_IMG, IN_CH](
+        latent, String(SAMPLE_VAE_PATH), out_path, ctx,
+    )
+    print("[Chroma-lora] sample step=", step, " -> ", out_path)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -482,8 +553,14 @@ def main() raises:
         b_absum_init += _absum(lora.ad[i].b)
     print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
 
+    # samples dir for sample-during-training PNGs (created once if enabled).
+    var samples_dir = String(LORA_DIR) + String("/samples")
+    if sample_enabled:
+        makedirs(samples_dir, exist_ok=True)
+        print("[cadence] sample-during-training WIRED -> ", samples_dir,
+              " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG, ")")
     if sample_enabled and should_sample_completed_step(sample_cadence, 0):
-        print("[cadence] step 0 sample due; Chroma validation sampler is not wired in this bounded loop")
+        print("[cadence] step 0 sample due (fires after the first completed step in this bounded loop)")
     var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
     print("[cadence] next sample completed_step=", next_sample)
 
@@ -611,10 +688,16 @@ def main() raises:
                 var sample_state = sample_path + String(".state.safetensors")
                 _ = save_chroma_lora_state(lora, sample_state, ctx)
                 print("[Chroma-lora] save_before_sample step=", k, " path=", sample_state)
+            # Sample from the CURRENT frozen base + streamed blocks + LIVE LoRA.
+            # v1 conditioning: this step's cached caption T5 embeds (txt_tokens)
+            # as COND, zeros as UNCOND. See chroma_sample_resident.mojo header.
             print(
                 "[cadence] sample due at completed_step=", k,
                 " sample_file=", sample_cadence.sample_definition_file_name,
-                " (sampler not wired in this bounded loop)",
+            )
+            _chroma_run_sample(
+                base, approx, loader, lora, txt_tokens.copy(),
+                cos.copy(), sin.copy(), samples_dir, k, ctx,
             )
 
     print("")

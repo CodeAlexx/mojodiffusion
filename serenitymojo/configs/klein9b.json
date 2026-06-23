@@ -16,7 +16,9 @@
   "timestep_dim": 256,
   "rope_theta": 2000,
 
-  "learning_rate": 4e-4,
+  "learning_rate": 3e-5,
+  "learning_rate_scheduler": "constant",
+  "learning_rate_warmup_steps": 100,
   "lora_rank": 16,
   "lora_alpha": 16,
   "timestep_shift": 1.0,
@@ -25,5 +27,5 @@
   "save_every": 500,
   "sample_every": 500,
 
-  "optimizer": { "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
+  "optimizer": { "optimizer": "ADAMW", "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
 }

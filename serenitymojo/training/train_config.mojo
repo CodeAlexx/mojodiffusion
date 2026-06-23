@@ -267,6 +267,18 @@ struct TrainConfig(Copyable, Movable):
     # never draws and never drops => baseline byte-unchanged.
     var caption_dropout_prob: Float32
 
+    # ── SDXL per-text-encoder caption dropout (OneTrainer parity) ──
+    # OneTrainer BaseStableDiffusionXLSetup.predict passes
+    # text_encoder.dropout_probability and text_encoder_2.dropout_probability
+    # INDEPENDENTLY to encode_text. TE1 dropout zeros the TE1 portion of the
+    # context (channels [0:768]); TE2 dropout zeros the TE2 portion of the
+    # context (channels [768:2048]) AND the pooled vector (StableDiffusionXLModel
+    # encode_text :273-284). Read from the text_encoder/text_encoder_2 config
+    # objects' "dropout_probability" key. OneTrainer default = 0.0 (inert), so the
+    # default keeps the path present but non-firing — byte-unchanged baseline.
+    var text_encoder_dropout_prob: Float32
+    var text_encoder_2_dropout_prob: Float32
+
     # ── noise modifiers (Wave 2B item 2e; ALL default-off) ──
     # offset_noise_weight<=0 OR offset_noise_prob<=0 => no offset noise.
     # input_perturbation<=0 => no input perturbation. multires_iterations==0 OR
@@ -533,6 +545,8 @@ struct TrainConfig(Copyable, Movable):
             timestep_noising_weight=Float32(0.0),
             timestep_noising_bias=Float32(0.0),
             caption_dropout_prob=Float32(0.0),   # never drop (default-off)
+            text_encoder_dropout_prob=Float32(0.0),   # OT TE1 dropout (default-off)
+            text_encoder_2_dropout_prob=Float32(0.0),  # OT TE2 dropout (default-off)
             offset_noise_weight=Float32(0.0),    # no offset noise (default-off)
             offset_noise_prob=Float32(0.0),
             input_perturbation=Float32(0.0),     # no input perturbation (default-off)
@@ -675,6 +689,8 @@ struct TrainConfig(Copyable, Movable):
         lokr_full_matrix: Bool = False,
         lokr_targets: Int = 3,                        # ST Flux2 recommended set
         init_lokr_norm: Float64 = 0.0,                # 0 = upstream zero-init
+        text_encoder_dropout_prob: Float32 = Float32(0.0),    # OT SDXL TE1 dropout
+        text_encoder_2_dropout_prob: Float32 = Float32(0.0),  # OT SDXL TE2 dropout
     ):
         self.name = name^
         self.checkpoint = checkpoint^
@@ -791,6 +807,8 @@ struct TrainConfig(Copyable, Movable):
         self.timestep_noising_weight = timestep_noising_weight
         self.timestep_noising_bias = timestep_noising_bias
         self.caption_dropout_prob = caption_dropout_prob
+        self.text_encoder_dropout_prob = text_encoder_dropout_prob
+        self.text_encoder_2_dropout_prob = text_encoder_2_dropout_prob
         self.offset_noise_weight = offset_noise_weight
         self.offset_noise_prob = offset_noise_prob
         self.input_perturbation = input_perturbation

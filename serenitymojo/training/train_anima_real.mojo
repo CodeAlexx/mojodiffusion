@@ -98,6 +98,10 @@ from serenitymojo.training.sample_prompt_config import (
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
 )
+from serenitymojo.training.anima_sample_streamed import (
+    anima_sample_streamed, anima_decode_latent_to_png,
+)
+from std.os import makedirs
 from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_ONLY,
     ot_cache_dir_from_train_config,
@@ -149,6 +153,15 @@ comptime S_IMG = (LATENT_HW // PS) * (LATENT_HW // PS)
 # training schedule (random sigmoid sigma per step) runs when this is False.
 comptime FIXED_SIGMA_SMOKE = True
 comptime FIXED_SIGMA = Float32(0.5)
+
+# ── sample-during-training defaults ───────────────────────────────────────────
+# Linear sigma 1->0 Euler, CFG, direct-velocity — same convention as the proven
+# 1024 inference sampler (anima_sample_cli). Steps are LOWER than the 30-step
+# inference default because each sample runs 2x the FULL streamed 28-block forward
+# (cond+uncond) at the trainer's grid; a preview wants speed, not perfection. Bump
+# ANIMA_NUM_STEPS for a sharper preview at the cost of sample wall-time.
+comptime ANIMA_NUM_STEPS = 16          # preview Euler steps (inference uses 30)
+comptime ANIMA_CFG_SCALE = Float32(4.5)  # CFG scale (anima_contract CFG_SCALE_X10/10)
 
 # ── Data paths ────────────────────────────────────────────────────────────────
 # Cached latents (prepare_anima schema): latent [1,16,H',W'] BF16, + text fields.
@@ -265,6 +278,24 @@ def anima_state_path_for_lora(lora_path: String) -> String:
 
 def _step_lora_path(base_path: String, completed_step: Int) -> String:
     return ot_step_lora_path(base_path, completed_step)
+
+
+# samples dir = "<parent of lora_out>/samples". lora_out is a .safetensors file
+# path; we take everything up to (not including) the last '/' and append
+# "/samples". If lora_out has no directory component, samples land in "samples".
+# Built byte-by-byte (no String slicing — the repo has no slice precedent).
+def _samples_dir_for_lora(lora_out: String) raises -> String:
+    var bs = lora_out.as_bytes()
+    var slash = -1
+    for i in range(lora_out.byte_length()):
+        if bs[i] == 0x2F:   # '/'
+            slash = i
+    if slash < 0:
+        return String("samples")
+    var parent = String("")
+    for i in range(slash):
+        parent += chr(Int(bs[i]))
+    return parent + String("/samples")
 
 
 # ── deterministic host gaussian noise (Box-Muller on a PCG stream) ────────────
@@ -612,9 +643,15 @@ def main() raises:
         " sample_file=", sample_cadence.sample_definition_file_name,
         " enabled=", sample_enabled,
     )
+    # samples dir: sibling "samples/" of the output LoRA file (e.g.
+    # output/anima_lora_smoke.safetensors -> output/samples/). Sample PNGs land at
+    # <samples_dir>/step_<N>.png on each cadence fire.
+    var samples_dir = _samples_dir_for_lora(lora_out)
     if sample_enabled:
         var next_sample = next_sample_completed_step(sample_cadence, 0, cfg.max_steps)
-        print("[cadence] Anima validation sampler is not wired in this training path; next configured sample step=", next_sample)
+        makedirs(samples_dir, exist_ok=True)
+        print("[cadence] Anima sampling-in-training ENABLED -> ", samples_dir,
+              "; next configured sample step=", next_sample)
 
     # ── open the real DiT checkpoint (streamed per-block) ──
     print("checkpoint:", cfg.checkpoint)
@@ -671,6 +708,14 @@ def main() raises:
         raise Error("context numel " + String(ctx_n) + " != B*S_TXT*JOINT="
                     + String(B * S_TXT * JOINT))
     print("context [B,", S_TXT, JOINT, "] loaded (frozen cross-attn input)")
+
+    # uncond context for sampling CFG: zeroed [B*S_TXT*JOINT] (empty-prompt cond,
+    # matching anima_sample_cli's zero-context fallback). Built once; only consumed
+    # when a sample fires.
+    var context_uncond = List[Float32]()
+    context_uncond.reserve(B * S_TXT * JOINT)
+    for _ in range(B * S_TXT * JOINT):
+        context_uncond.append(Float32(0.0))
 
     # ── 3D RoPE tables for this image grid ──
     # cos/sin are borrowed (read) by the streamed fwd/bwd — no copy needed.
@@ -805,11 +850,26 @@ def main() raises:
                 var pre_sample_state = anima_state_path_for_lora(pre_sample_path)
                 _ = save_anima_lora_state(lora, pre_sample_state, ctx)
                 print("[checkpoint] saved before sample step=", completed_step, " state=", pre_sample_state)
+            # ── sample-during-training: denoise from the CURRENT streamed base +
+            #    live host LoRA, decode, write <samples_dir>/step_<N>.png. The
+            #    forward reuses anima_stack_lora_forward_streamed (the SAME fn the
+            #    train loop calls) with the live base/st/lora/ropes; conditioning
+            #    v1 = the cached frozen `context` (cond) + zeroed uncond (CFG). ──
             print(
                 "[cadence] sample due at completed_step=", completed_step,
                 " sample_file=", sample_cadence.sample_definition_file_name,
-                " (Anima validation sampler not wired in this training path)",
             )
+            var sample_t0 = perf_counter_ns()
+            var sample_seed = SEED * UInt64(1099087573) + UInt64(completed_step)
+            var sample_latent = anima_sample_streamed[H, Dh, S_IMG, S_TXT, LATENT_HW](
+                base, st, lora, ropes.cos, ropes.sin,
+                context.copy(), context_uncond.copy(),
+                ANIMA_NUM_STEPS, ANIMA_CFG_SCALE, sample_seed, ctx,
+            )
+            var sample_png = samples_dir + String("/step_") + String(completed_step) + String(".png")
+            anima_decode_latent_to_png[LATENT_HW](sample_latent, sample_png, ctx)
+            var sample_secs = Float64(perf_counter_ns() - sample_t0) / 1.0e9
+            print("[cadence] sample written:", sample_png, " (", sample_secs, "s)")
 
     var t1 = perf_counter_ns()
     var secs = Float64(t1 - t0) / 1.0e9

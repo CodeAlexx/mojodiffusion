@@ -408,6 +408,16 @@ def _set_part_train(mut cfg: TrainConfig, part: String, value: Bool):
         cfg.vae_train = value
 
 
+def _set_part_dropout(mut cfg: TrainConfig, part: String, value: Float32):
+    # OneTrainer per-text-encoder caption dropout (text_encoder.dropout_probability
+    # / text_encoder_2.dropout_probability). Only the two CLIP encoders carry it
+    # in the SDXL preset; other parts ignore the key.
+    if part == "text_encoder":
+        cfg.text_encoder_dropout_prob = value
+    elif part == "text_encoder_2":
+        cfg.text_encoder_2_dropout_prob = value
+
+
 def _set_part_dtype(mut cfg: TrainConfig, part: String, value: Int):
     if part == "unet":
         cfg.unet_weight_dtype = value
@@ -442,6 +452,8 @@ def _parse_model_part(mut cur: _Cursor, mut cfg: TrainConfig, part: String) rais
             _set_part_train(cfg, part, _read_bool(cur))
         elif field == "weight_dtype":
             _set_part_dtype(cfg, part, _dtype_int(_read_string_required(cur, part + String(".weight_dtype"))))
+        elif field == "dropout_probability":
+            _set_part_dropout(cfg, part, Float32(_read_scalar(cur).num))
         else:
             _skip_value(cur)
         cur.skip_ws()

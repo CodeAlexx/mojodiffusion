@@ -10,12 +10,20 @@
 #   noisy   = (1-sigma)*clean + sigma*noise        [pixel patch space]
 #   model_t = 1 - sigma                            [the DiT t-embed input]
 #   x_pred  = DiT(...)                             [O1 is X-PREDICTION]
-#   v_pred  = (noisy - x_pred) / sigma
+#   v_pred  = (noisy - x_pred) / sigma_floored
 #   target  = noise - clean
-#   loss    = MSE(v_pred, target) * w(t_id);  dL/dx_pred = -w*(2/N)*diff/sigma
-#   w(i)    : y=exp(-2*((t_i-500)/1000)^2); y-=min(y); w = y*(1000/sum(y))
-#   LoRA    : rank 32 default, alpha=rank (scale 1.0), lr 1e-4, slots
-#             q/k/v/o/gate/up/down on all 36 layers.
+#   loss    = MSE(v_pred, target);  dL/dx_pred = -(2/N)*diff/sigma_floored
+#   (ai-toolkit recipe: PLAIN MSE, no per-timestep weight. The DiffSynth
+#    gauss-shift weight w(i)=norm(exp(-2*((t-500)/1000)^2)-min) is OFF by
+#    default — flip APPLY_GAUSS_SHIFT_WEIGHT to restore it.)
+#   sigma_floored = max(sigma, 0.002994012087583542)  [shift-3 prod floor]
+#   LoRA    : rank 32 default, alpha=rank (scale 1.0), lr 1e-4. ai-toolkit
+#             wraps EVERY transformer Linear → 257 adapters: 252 block
+#             (q/k/v/o/gate/up/down × 36 layers) + 5 RESIDENT HEAD
+#             (x_embedder.proj1, x_embedder.proj2, t_embedder1.mlp.0,
+#             t_embedder1.mlp.2, final_layer2.linear).
+#   noise_scale = 8.0 (ai-toolkit DEFAULT_NOISE_SCALE), grad clip @ 1.0,
+#   optimizer = AdamW (eps 1e-6, the bitsandbytes AdamW8bit O1 default).
 #
 # DATA: stage-A dir (scripts/ideogram4_stage_images.py): images.safetensors
 # (image.<i> [1,3,512,512] F32 [-1,1]) + caption.<i>.txt (RAW captions — the
@@ -49,8 +57,12 @@
 # Norms / small (<1MB) tensors stay bf16. LoRA adapters, optimizer state and
 # activations are bf16/F32 exactly as before. NEW NUMERICS CLASS: gated by a
 # 10-step fp8-vs-bf16 loss-trajectory cosine >= 0.999 + step-1 adapter-grad
-# cosine >= 0.999 (argv[8] grad dump). Flag OFF reproduces the 3-step anchor
-# 0.05885428/0.33308488/0.5214583 EXACTLY (C13).
+# cosine >= 0.999 (argv[8] grad dump). NOTE: the old 3-step anchor
+# 0.05885428/0.33308488/0.5214583 was under the DiffSynth recipe (gauss-shift
+# weight ON + noise_scale 7.5 + no head adapters); the ai-toolkit recipe here
+# (plain MSE, noise_scale 8.0, grad clip, 257 adapters) produces a NEW
+# trajectory — re-anchor against an ai-toolkit/torch dump (a fresh anchor is
+# part of this fix's gate, NOT the old one).
 #
 # ── T1 RUNTIME CONFIG + PRECEDENCE (Tier-1 lever wiring, levers.mojo) ────────
 # Optional trailing argv [config.json] parses via io/train_config_reader.mojo
@@ -75,9 +87,9 @@
 #     SCHEDULE_FREE_ADAMW + beta1/beta2/eps/weight_decay — the default
 #     fused-AdamW path reads cfg hypers too; TrainConfig defaults equal the
 #     old literals 0.9/0.999/1e-8/0.01, so the no-config path is unchanged).
-#   * the DiffSynth gauss-shift recipe weight wt(t_id) ALWAYS applies to
-#     loss AND grad — it is the MODEL RECIPE, not a lever; the levers loss
-#     path multiplies it on top of levers_loss_grad.
+#   * ai-toolkit uses PLAIN MSE — the DiffSynth gauss-shift weight wt(t_id)
+#     is OFF by default (comptime APPLY_GAUSS_SHIFT_WEIGHT=False, wt==1.0).
+#     When opted in, wt multiplies loss AND grad (on top of levers_loss_grad).
 #   * no LR scheduler in this trainer: step_lr == the constant resolved lr
 #     (adafactor consumes it; schedule-free reads cfg.lr raw — the resolved
 #     lr is written back into cfg.lr so argv precedence holds there too).
@@ -96,11 +108,20 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.linalg_backward import linear_backward_dx
+from serenitymojo.ops.linear import linear
+from serenitymojo.ops.linalg_backward import linear_backward_dx, linear_backward_dw
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.norm_backward import rms_norm_backward_dx
 from serenitymojo.ops.layout import patchify
-from serenitymojo.ops.tensor_algebra import concat, slice as ta_slice
+from serenitymojo.ops.tensor_algebra import concat, slice as ta_slice, add as ta_add
+from serenitymojo.ops.activations import silu
+from serenitymojo.ops.activation_backward import silu_backward
+from serenitymojo.ops.embeddings import timestep_embedding
+# Resident-head LoRA apply/backward reuse the model-agnostic zimage delta math.
+from serenitymojo.models.zimage.lora_block import (
+    zimage_lora_apply_device,
+    zimage_lora_bwd_device_resident_tensors,
+)
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.dit.hidream_o1 import (
     HiDreamO1Config,
@@ -158,14 +179,32 @@ comptime F = 12288
 comptime LAYERS = 36
 comptime PATCH = 32
 comptime PATCH_VEC = 3072         # 32*32*3
-comptime NOISE_SCALE = Float32(7.5)
+# ai-toolkit pipeline.DEFAULT_NOISE_SCALE = 8.0 (noise is scaled by this BEFORE
+# add_noise: noisy = (1-sigma)*clean + sigma*(noise*noise_scale)).
+comptime NOISE_SCALE = Float32(8.0)
 comptime SHIFT = Float64(3.0)
 comptime EPS = Float32(1.0e-6)
 comptime SEED = UInt64(42)
+# ai-toolkit global-norm gradient clip @ 1.0 (BaseSDTrainProcess clips grads
+# before the optimizer step). Mirrors the chroma/flux/anima trainers.
+comptime CLIP_GRAD_NORM = Float32(1.0)
+# ai-toolkit pipeline.T_EPS = 0.001 → shift-3 production sigma floor. The
+# smallest training sigma (i=999) is shift(1 - 999/1000) = 3*0.001/(1+2*0.001)
+# = 0.002994012087583542. linspace starting at 1.0 - 999/1000 = 0.001 is the
+# PRE-SHIFT value; the Rust port documents the 0.001 floor as a previous bug —
+# the shifted floor below is what production uses.
+comptime SIGMA_FLOOR = Float32(0.002994012087583542)
 # T1.D caption dropout probability — the NO-CONFIG fallback default. When a
 # [config.json] argv is present, cfg.caption_dropout_prob replaces this (see
 # the runtime-config precedence block in the header).
 comptime HIDREAM_CAPTION_DROPOUT = Float32(0.0)
+# ai-toolkit recipe: PLAIN MSE loss, NO per-timestep weight. The DiffSynth
+# gauss-shift weight wt(t_id) is OFF by default to match ai-toolkit (its
+# SDTrainer only weights timesteps when linear_timesteps / timestep_type
+# "weighted" is configured; hidream_o1 uses neither — see SDTrainer.py:831-851,
+# default loss = F.mse_loss(...).mean()). Flip to True ONLY to reproduce the
+# old DiffSynth-weighted 3-step anchor 0.05885428/0.33308488/0.5214583 (C13).
+comptime APPLY_GAUSS_SHIFT_WEIGHT = False
 comptime MODEL_DIR = "/home/alex/HiDream-O1-Image-Dev-weights"
 comptime TOK_PATH = "/home/alex/HiDream-O1-Image-Dev-weights/tokenizer.json"
 
@@ -190,6 +229,59 @@ def _slot_name(slot: Int) raises -> String:
         String("mlp.gate_proj"), String("mlp.up_proj"), String("mlp.down_proj"),
     ]
     return names[slot].copy()
+
+
+# ── RESIDENT-HEAD LoRA (ai-toolkit wraps EVERY Linear in the transformer, so
+# the 5 resident-head linears get adapters too: 252 block + 5 head = 257). The
+# heads, in fixed order [0..4]:
+#   0 x_embedder.proj1      in=PATCH_VEC(3072) out=1024  (no bias)
+#   1 x_embedder.proj2      in=1024           out=D(4096) (bias)
+#   2 t_embedder1.mlp.0     in=256            out=D(4096) (bias)
+#   3 t_embedder1.mlp.2     in=D(4096)        out=D(4096) (bias)
+#   4 final_layer2.linear   in=D(4096)        out=PATCH_VEC(3072) (bias)
+comptime N_HEADS = 5
+comptime XEMB_MID = 1024          # x_embedder.proj1 output / proj2 input
+
+
+def _head_dims(h: Int) raises -> List[Int]:
+    """[in_f, out_f] for head 0..4 (see the table above)."""
+    if h == 0:
+        return [PATCH_VEC, XEMB_MID]
+    if h == 1:
+        return [XEMB_MID, D]
+    if h == 2:
+        return [256, D]
+    if h == 3:
+        return [D, D]
+    return [D, PATCH_VEC]
+
+
+def _head_base_key(h: Int) raises -> String:
+    """The base-weight key in dit.shared for head 0..4 (weight tensor)."""
+    if h == 0:
+        return String("model.x_embedder.proj1.weight")
+    if h == 1:
+        return String("model.x_embedder.proj2.weight")
+    if h == 2:
+        return String("model.t_embedder1.mlp.0.weight")
+    if h == 3:
+        return String("model.t_embedder1.mlp.2.weight")
+    return String("model.final_layer2.linear.weight")
+
+
+def _head_save_name(h: Int) raises -> String:
+    """The LoRA module path (ai-toolkit diffusion_model.* shape) for head
+    0..4, sans the .lora_A/.lora_B suffix."""
+    # ai-toolkit convert_lora_weights_before_save strips ".model." (transformer.->
+    # diffusion_model. then .model.->.), so the saved key has NO ".model." segment.
+    var names: List[String] = [
+        String("diffusion_model.x_embedder.proj1"),
+        String("diffusion_model.x_embedder.proj2"),
+        String("diffusion_model.t_embedder1.mlp.0"),
+        String("diffusion_model.t_embedder1.mlp.2"),
+        String("diffusion_model.final_layer2.linear"),
+    ]
+    return names[h].copy()
 
 
 def _lcg_pattern(n: Int, seed: UInt64, amp: Float32) -> List[Float32]:
@@ -401,6 +493,50 @@ def _adamw_host(
         p[i] = Float32(Float64(p[i]) - Float64(lr) * (upd + 0.01 * Float64(p[i])))
 
 
+def _global_grad_norm(g_a: List[List[Float32]], g_b: List[List[Float32]]) -> Float64:
+    """L2 norm over the FLATTENED concat of every adapter grad (the ai-toolkit /
+    torch clip_grad_norm_ convention: one norm across all trainable params)."""
+    var sq = Float64(0.0)
+    for k in range(len(g_a)):
+        for i in range(len(g_a[k])):
+            sq += Float64(g_a[k][i]) * Float64(g_a[k][i])
+    for k in range(len(g_b)):
+        for i in range(len(g_b[k])):
+            sq += Float64(g_b[k][i]) * Float64(g_b[k][i])
+    return sqrt(sq)
+
+
+def _scale_grads(mut g_a: List[List[Float32]], mut g_b: List[List[Float32]], s: Float32):
+    for k in range(len(g_a)):
+        for i in range(len(g_a[k])):
+            g_a[k][i] = g_a[k][i] * s
+    for k in range(len(g_b)):
+        for i in range(len(g_b[k])):
+            g_b[k][i] = g_b[k][i] * s
+
+
+def _clip_grads_all(
+    mut g_a: List[List[Float32]], mut g_b: List[List[Float32]],
+    mut hg_a: List[List[Float32]], mut hg_b: List[List[Float32]],
+    max_norm: Float32,
+) -> Float64:
+    """ai-toolkit global grad-norm clip @ max_norm over ALL trainable params
+    (chroma/flux _clip pattern, extended to the block + head adapter grads):
+    one norm across both sets, then if ||g|| > max_norm scale every grad by
+    max_norm/||g||. Returns the pre-clip norm. No-op when already under the cap
+    or zero. A uniform scale leaves grad-cosine gates invariant."""
+    var sq = _global_grad_norm(g_a, g_b)
+    var sq2 = _global_grad_norm(hg_a, hg_b)
+    # _global_grad_norm returns sqrt(sum sq); recombine the two sums of squares.
+    var gn = sqrt(sq * sq + sq2 * sq2)
+    if gn <= Float64(max_norm) or gn == 0.0:
+        return gn
+    var s = Float32(Float64(max_norm) / gn)
+    _scale_grads(g_a, g_b, s)
+    _scale_grads(hg_a, hg_b, s)
+    return gn
+
+
 def main() raises:
     var args = argv()
     if len(args) < 3:
@@ -457,7 +593,13 @@ def main() raises:
     train_cfg.lr = lr
     train_cfg.lora_rank = rank
     train_cfg.max_steps = steps
-    # T1.D: config replaces the comptime fallback when present.
+    # ai-toolkit O1 default optimizer = bitsandbytes AdamW8bit, eps 1e-6 (not
+    # the 1e-8 the generic TrainConfig default carries). With NO config the
+    # generic default leaks 1e-8 in, so override it here; a config's
+    # optimizer.eps still wins (the user set it explicitly). max_grad_norm
+    # already defaults to 1.0 (== ai-toolkit clip), so leave it.
+    if not has_config:
+        train_cfg.eps = Float32(1.0e-6)
     var caption_dropout_p = HIDREAM_CAPTION_DROPOUT
     if has_config:
         caption_dropout_p = train_cfg.caption_dropout_prob
@@ -554,6 +696,59 @@ def main() raises:
         ))
     print("[lora] adapters:", LAYERS * 7, " resident params:", opt_state.total)
 
+    # ── RESIDENT-HEAD LoRA (the +5 that make the count 257; ai-toolkit wraps
+    # every transformer Linear, heads included). Own host pack + own fused
+    # AdamW resident state + own device views — the 252-block machinery above
+    # is untouched. B init = ZERO (lora_B starts at 0 = no-op delta, the
+    # ai-toolkit/zimage convention), A init = the same LCG pattern.
+    var head_ads = List[LoraAdapter]()
+    for h in range(N_HEADS):
+        var hd = _head_dims(h)
+        var in_f = hd[0]
+        var out_f = hd[1]
+        var amp = Float32(1.0) / sqrt(Float32(in_f))
+        var a_h = _lcg_pattern(rank * in_f, UInt64(10_000 + h + 1), amp)
+        var b_h = List[Float32]()
+        for _ in range(out_f * rank):
+            b_h.append(0.0)
+        var hz1 = List[Float32]()
+        for _ in range(rank * in_f):
+            hz1.append(0.0)
+        var hz2 = List[Float32]()
+        for _ in range(rank * in_f):
+            hz2.append(0.0)
+        var hz3 = List[Float32]()
+        for _ in range(out_f * rank):
+            hz3.append(0.0)
+        var hz4 = List[Float32]()
+        for _ in range(out_f * rank):
+            hz4.append(0.0)
+        head_ads.append(LoraAdapter(
+            a_h^, b_h^, rank, in_f, out_f, Float32(1.0),
+            hz1^, hz2^, hz3^, hz4^,
+        ))
+    var head_opt = lora_adamw_plain_device_state_init(head_ads, 0, len(head_ads), ctx)
+    var head_loras = List[ZImageLoraAdapterDevice]()
+    for h in range(N_HEADS):
+        var hd = _head_dims(h)
+        var n_a = rank * hd[0]
+        var n_b = hd[1] * rank
+        var a_off = head_opt.elem_offset(h, False)
+        var b_off = head_opt.elem_offset(h, True)
+        head_loras.append(ZImageLoraAdapterDevice(
+            TArc(Tensor(
+                head_opt.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+                [rank, hd[0]], STDtype.BF16,
+            )),
+            TArc(Tensor(
+                head_opt.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+                [hd[1], rank], STDtype.BF16,
+            )),
+            rank, hd[0], hd[1], Float32(1.0),
+        ))
+    print("[lora] +head adapters:", N_HEADS, " total adapters:",
+          LAYERS * 7 + N_HEADS, " head resident params:", head_opt.total)
+
     # T1.B EMA (default-off, training/lora_ema.mojo SimpleTuner semantics):
     # F32 shadows over the host_ads mirrors. Config wins when it enables EMA
     # (full schedule: cap/floor/after-step/interval); else the argv ema_decay
@@ -621,6 +816,18 @@ def main() raises:
     var norm_w = dit.shared[String("model.language_model.norm.weight")].copy()
     var final_w = dit.shared[String("model.final_layer2.linear.weight")].copy()
 
+    # Resident-head base weights/biases (fetched once; the inline LoRA-applied
+    # head forward/backward below replaces the frozen dit._patch_embed/
+    # _t_embed/_final_layer so the 5 head adapters can train).
+    var xe_w1 = dit.shared[String("model.x_embedder.proj1.weight")].copy()
+    var xe_w2 = dit.shared[String("model.x_embedder.proj2.weight")].copy()
+    var xe_b2 = dit.shared[String("model.x_embedder.proj2.bias")].copy()
+    var te_w0 = dit.shared[String("model.t_embedder1.mlp.0.weight")].copy()
+    var te_b0 = dit.shared[String("model.t_embedder1.mlp.0.bias")].copy()
+    var te_w2 = dit.shared[String("model.t_embedder1.mlp.2.weight")].copy()
+    var te_b2 = dit.shared[String("model.t_embedder1.mlp.2.bias")].copy()
+    var fl_b = dit.shared[String("model.final_layer2.linear.bias")].copy()
+
     var smooth = Float32(0.0)
     var smooth_init = False
     for step in range(1, steps + 1):
@@ -668,7 +875,11 @@ def main() raises:
         st = st * 6364136223846793005 + 1442695040888963407
         var t_id = Int((st >> 33) % UInt64(1000))
         var sigma = sw.sigmas[t_id]
-        var wt = sw.weights[t_id]
+        # ai-toolkit = plain MSE, no per-timestep weight: wt == 1.0 by default.
+        # (APPLY_GAUSS_SHIFT_WEIGHT True restores the old DiffSynth recipe.)
+        var wt = Float32(1.0)
+        if APPLY_GAUSS_SHIFT_WEIGHT:
+            wt = sw.weights[t_id]
         var noise = _gauss(IMG_L * PATCH_VEC, SEED * UInt64(7919) + UInt64(step))
         var noisy_h = List[Float32]()
         var target_h = List[Float32]()
@@ -678,16 +889,40 @@ def main() raises:
             target_h.append(nz - clean_h[i])
         var noisy = Tensor.from_host(noisy_h.copy(), [1, IMG_L, PATCH_VEC], STDtype.BF16, ctx)
 
-        # ── embed (frozen): text + t-embed scatter + patch embed + concat ────
+        # ── embed: text (frozen) + t-embed (LoRA heads 2,3) + patch embed
+        # (LoRA heads 0,1) + concat. The 3 head forwards are INLINE here (not
+        # dit._t_embed/_patch_embed/_final_layer) so the resident-head LoRA
+        # delta applies and the per-head inputs are captured for backward. The
+        # base math is op-for-op the frozen helpers (hidream_o1.mojo:498-533).
         var text_emb = dit._embed(samp.text_ids, ctx)
         var model_t = Float32(1.0) - sigma
-        var t_emb = dit._t_embed(model_t, ctx)
+
+        # head 2/3: TimestepEmbedder — sinusoid(t*1000) -> mlp.0(+LoRA2) ->
+        # SiLU -> mlp.2(+LoRA3). freq_c / te_h0_out / te_silu captured for bwd.
+        var te_dtype = te_w0[].dtype()
+        var te_t_host: List[Float32] = [model_t * Float32(1000.0)]
+        var te_t = Tensor.from_host(te_t_host^, [1], STDtype.F32, ctx)
+        var freq_c = timestep_embedding(
+            te_t, cfg.timestep_freq_dim, ctx, Float32(10000.0), te_dtype
+        )                                                      # [1, 256]
+        var te_h0 = linear(freq_c, te_w0[], Optional[Tensor](te_b0[].clone(ctx)), ctx)
+        te_h0 = zimage_lora_apply_device(te_h0^, freq_c, head_loras[2], 1, ctx)  # [1,D]
+        var te_silu = silu(te_h0, ctx)                         # [1, D]
+        var t_emb = linear(te_silu, te_w2[], Optional[Tensor](te_b2[].clone(ctx)), ctx)
+        t_emb = zimage_lora_apply_device(t_emb^, te_silu, head_loras[3], 1, ctx)  # [1,D]
+
         var tms_idx = -1
         for i in range(len(samp.text_ids)):
             if samp.text_ids[i] == cfg.tms_token_id:
                 tms_idx = i
         var text_emb_t = _scatter_row(text_emb, t_emb, tms_idx, len(samp.text_ids), D, ctx)
-        var patch_emb = dit._patch_embed(noisy, ctx)
+
+        # head 0/1: BottleneckPatchEmbed — proj1(no bias,+LoRA0) -> proj2(bias,
+        # +LoRA1). noisy / pe_h1 captured for bwd.
+        var pe_h1 = linear(noisy, xe_w1[], None, ctx)  # [1,IMG_L,1024]
+        pe_h1 = zimage_lora_apply_device(pe_h1^, noisy, head_loras[0], IMG_L, ctx)
+        var patch_emb = linear(pe_h1, xe_w2[], Optional[Tensor](xe_b2[].clone(ctx)), ctx)
+        patch_emb = zimage_lora_apply_device(patch_emb^, pe_h1, head_loras[1], IMG_L, ctx)  # [1,IMG_L,D]
         var hidden_t = concat(1, ctx, text_emb_t, patch_emb)
 
         # mrope tables + mask (per step; host)
@@ -724,10 +959,12 @@ def main() raises:
             x = f.out.copy()
             # f.saved drops here — recompute rebuilds it in the bwd loop.
 
-        # final norm + final linear
+        # final norm + final linear (head 4 LoRA). final_normed captured for
+        # the head-4 backward; INLINE (not dit._final_layer) for the delta.
         var final_in = x.copy()
         var final_normed = rms_norm(final_in[], norm_w[], EPS, ctx)
-        var out_full = dit._final_layer(final_normed, ctx)     # [1,S,3072]
+        var out_full = linear(final_normed, final_w[], Optional[Tensor](fl_b[].clone(ctx)), ctx)
+        out_full = zimage_lora_apply_device(out_full^, final_normed, head_loras[4], S, ctx)  # [1,S,3072]
         var out_h = out_full.to_host(ctx)
 
         # ── loss + d_out (host F32; x-prediction -> velocity chain) ──────────
@@ -736,18 +973,23 @@ def main() raises:
         var d_full = List[Float32]()
         for _ in range(base):
             d_full.append(0.0)
-        var inv_sigma = Float32(1.0) / sigma
+        # ai-toolkit floors sigma before the velocity divide (pipeline
+        # sigma.clamp_min(T_EPS)); the shift-3 production floor is
+        # SIGMA_FLOOR (== the schedule's own min at i=999, so a no-op for the
+        # current schedule but explicit and matching the reference clamp).
+        var sigma_div = sigma if sigma > SIGMA_FLOOR else SIGMA_FLOOR
+        var inv_sigma = Float32(1.0) / sigma_div
         var loss: Float32
         if levers_loss_active(train_cfg):
             # T1.A loss levers (training/levers.mojo): huber / smooth_l1 /
-            # min-SNR-flow over (v_pred, target). The DiffSynth gauss-shift
-            # recipe weight wt ALWAYS multiplies loss AND grad on top — it is
-            # the MODEL RECIPE, not a lever. The x-prediction chain rule
-            # dv_pred/dx_pred = -1/sigma is unchanged from the legacy block.
+            # min-SNR-flow over (v_pred, target). wt == 1.0 by default
+            # (ai-toolkit plain MSE); only the opt-in APPLY_GAUSS_SHIFT_WEIGHT
+            # restores the DiffSynth per-timestep weight on loss AND grad. The
+            # x-prediction chain rule dv_pred/dx_pred = -1/sigma is unchanged.
             var v_pred_l = List[Float32]()
             for i in range(NOUT):
                 v_pred_l.append((noisy_h[i] - out_h[base + i]) * inv_sigma)
-            var lg = levers_loss_grad(v_pred_l, target_h, sigma, train_cfg)
+            var lg = levers_loss_grad(v_pred_l, target_h, sigma_div, train_cfg)
             loss = lg.loss * wt
             var dch = -wt * inv_sigma
             for i in range(NOUT):
@@ -766,8 +1008,21 @@ def main() raises:
             loss = Float32(sse / Float64(NOUT)) * wt
         var d_out_t = Tensor.from_host(d_full^, [1, S, PATCH_VEC], STDtype.BF16, ctx)
 
-        # final backward (frozen): linear dx + rms dx
-        var d_final_normed = linear_backward_dx(d_out_t, final_w[], S, D, PATCH_VEC, ctx)
+        # head-grad collectors (5 resident heads, filled below).
+        var head_g_a = List[List[Float32]]()
+        var head_g_b = List[List[Float32]]()
+        for _ in range(N_HEADS):
+            head_g_a.append(List[Float32]())
+            head_g_b.append(List[Float32]())
+
+        # final backward: head-4 LoRA grad + dx through BOTH base and LoRA.
+        var h4 = zimage_lora_bwd_device_resident_tensors(
+            d_out_t, final_normed, head_loras[4], S, ctx,
+        )
+        head_g_a[4] = h4.d_a[].to_host(ctx)
+        head_g_b[4] = h4.d_b[].to_host(ctx)
+        var d_final_base = linear_backward_dx(d_out_t, final_w[], S, D, PATCH_VEC, ctx)
+        var d_final_normed = ta_add(d_final_base, h4.d_x[], ctx)
         var d_x = TArc(rms_norm_backward_dx(d_final_normed, final_in[], norm_w[], EPS, ctx))
 
         # ── backward stack: recompute tape per block, P1 backward ────────────
@@ -799,6 +1054,55 @@ def main() raises:
                 g_a[k] = bg.d_a[sl].value()[].to_host(ctx)
                 g_b[k] = bg.d_b[sl].value()[].to_host(ctx)
             bi -= 1
+
+        # ── resident-head backward (heads 0,1,2,3). d_x now = grad wrt hidden_t
+        # [1,S,D] = concat(text_emb_t [S_TEXT], patch_emb [IMG_L]). The image
+        # rows feed proj2/proj1; the tms row feeds the timestep MLP. (Head 4
+        # already done before the loop.)
+        var d_patch_emb = ta_slice(d_x[], 1, S_TEXT, IMG_L, ctx)   # [1, IMG_L, D]
+        # head 1 (proj2): grad wrt proj2 out = d_patch_emb; input = pe_h1.
+        var h1g = zimage_lora_bwd_device_resident_tensors(
+            d_patch_emb, pe_h1, head_loras[1], IMG_L, ctx,
+        )
+        head_g_a[1] = h1g.d_a[].to_host(ctx)
+        head_g_b[1] = h1g.d_b[].to_host(ctx)
+        # dx wrt pe_h1 through BOTH base proj2 and its LoRA.
+        var d_pe_h1_base = linear_backward_dx(d_patch_emb, xe_w2[], IMG_L, XEMB_MID, D, ctx)
+        var d_pe_h1 = ta_add(d_pe_h1_base, h1g.d_x[], ctx)         # [IMG_L, 1024]
+        # head 0 (proj1): grad wrt proj1 out = d_pe_h1; input = noisy (data, no
+        # further upstream needed).
+        var h0g = zimage_lora_bwd_device_resident_tensors(
+            d_pe_h1, noisy, head_loras[0], IMG_L, ctx,
+        )
+        head_g_a[0] = h0g.d_a[].to_host(ctx)
+        head_g_b[0] = h0g.d_b[].to_host(ctx)
+
+        # timestep MLP: the tms-row grad feeds mlp.2 -> SiLU -> mlp.0.
+        var d_t_emb = ta_slice(d_x[], 1, tms_idx, 1, ctx)         # [1, 1, D]
+        # head 3 (mlp.2): grad wrt mlp.2 out = d_t_emb; input = te_silu.
+        var h3g = zimage_lora_bwd_device_resident_tensors(
+            d_t_emb, te_silu, head_loras[3], 1, ctx,
+        )
+        head_g_a[3] = h3g.d_a[].to_host(ctx)
+        head_g_b[3] = h3g.d_b[].to_host(ctx)
+        var d_te_silu_base = linear_backward_dx(d_t_emb, te_w2[], 1, D, D, ctx)
+        var d_te_silu = ta_add(d_te_silu_base, h3g.d_x[], ctx)    # [1, D]
+        # SiLU backward (te_h0 = pre-silu mlp.0 output incl. its LoRA).
+        var d_te_h0 = silu_backward(d_te_silu, te_h0, ctx)        # [1, D]
+        # head 2 (mlp.0): grad wrt mlp.0 out = d_te_h0; input = freq_c (frozen
+        # sinusoid, no further upstream).
+        var h2g = zimage_lora_bwd_device_resident_tensors(
+            d_te_h0, freq_c, head_loras[2], 1, ctx,
+        )
+        head_g_a[2] = h2g.d_a[].to_host(ctx)
+        head_g_b[2] = h2g.d_b[].to_host(ctx)
+
+        # ai-toolkit global grad-norm clip @ 1.0 over ALL 257 adapters' grads
+        # (block 252 + head 5), then each optimizer steps its own set.
+        var grad_norm = _clip_grads_all(
+            g_a, g_b, head_g_a, head_g_b, CLIP_GRAD_NORM,
+        )
+
         # T2.B gate instrumentation (argv[8], default-off): dump the step-1
         # adapter grads BEFORE the optimizer touches anything, for the
         # fp8-vs-bf16 grad-cosine comparison.
@@ -812,6 +1116,13 @@ def main() raises:
                 gnames.append(String("g_b.") + String(k))
                 gtensors.append(TArc(Tensor.from_host(
                     g_b[k].copy(), [len(g_b[k])], STDtype.F32, ctx)))
+            for h in range(N_HEADS):
+                gnames.append(String("g_a.head.") + String(h))
+                gtensors.append(TArc(Tensor.from_host(
+                    head_g_a[h].copy(), [len(head_g_a[h])], STDtype.F32, ctx)))
+                gnames.append(String("g_b.head.") + String(h))
+                gtensors.append(TArc(Tensor.from_host(
+                    head_g_b[h].copy(), [len(head_g_b[h])], STDtype.F32, ctx)))
             save_safetensors(gnames, gtensors, grad_dump, ctx)
             print("[grad-dump] ", grad_dump)
         if levers_optimizer_active(train_cfg):
@@ -834,9 +1145,18 @@ def main() raises:
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay, ctx,
             )
+        # Resident-head adapters always step with plain fused AdamW (same
+        # hypers — bitsandbytes AdamW8bit-equivalent eps). The levers optimizer
+        # dispatch above is the block-adapter lever; heads keep the default.
+        fused_lora_adamw_plain_step_resident(
+            head_opt, head_ads, head_g_a, head_g_b, step, lr,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+            train_cfg.weight_decay, ctx,
+        )
         # T1.B EMA: host_ads mirrors are FRESH here — both optimizer paths
         # write updated P back into them (resident: lora_adamw_plain_fused
-        # .mojo:483-502 readback; levers: host step IS the mirror).
+        # .mojo:483-502 readback; levers: host step IS the mirror). Heads are
+        # NOT EMA-tracked (the EMA lever covers the block adapters only).
         if ema_on:
             ema_update(ema, host_ads, step)
 
@@ -854,16 +1174,17 @@ def main() raises:
         print(
             "[HiDreamO1-lora] step ", step, "/", steps,
             " | sigma ", sigma, " | loss ", loss, " | smooth ", smooth,
+            " | gnorm ", grad_norm,
             " | B|.|1 ", b_absum,
             " | ", Float32(Float64(t1 - t0) / 1.0e9), "s/step",
         )
         # Shared UI progress line (the serenity-trainer TrainerRuntimeBridge
         # progress parser shape, same as the config-driven runners). Purely
         # additive stdout — the detail line above and all loss anchors are
-        # untouched. grad_norm: this trainer does not compute a global norm.
+        # untouched. grad_norm = the pre-clip global norm (ai-toolkit clip).
         print_trainer_progress(
             String("HiDreamO1"), step, steps, n_samples, loss,
-            0.0, Float64(t1 - t0) / 1.0e9, 0.0,
+            grad_norm, Float64(t1 - t0) / 1.0e9, 0.0,
             Float64(t1 - train_start) / 1.0e9,
         )
 
@@ -872,13 +1193,15 @@ def main() raises:
     # weight save sits between eval_for_save / train_after_save. No-op for
     # ADAMW / ADAFACTOR.
     levers_optimizer_eval_for_save(train_cfg, lev_opt)
+    # `names` stays BLOCK-ONLY so the EMA save (block adapters only) can reuse
+    # it; the main save appends the 5 head keys to a combined list.
     var names = List[String]()
     var tensors = List[TArc]()
     for li in range(LAYERS):
         for sl in range(7):
             var k = li * 7 + sl
             var dims = _slot_dims(sl)
-            var prefix = String("diffusion_model.model.language_model.layers.")
+            var prefix = String("diffusion_model.language_model.layers.")
                 + String(li) + "." + _slot_name(sl)
             names.append(prefix + ".lora_A.weight")
             tensors.append(TArc(Tensor.from_host_bf16(
@@ -886,9 +1209,23 @@ def main() raises:
             names.append(prefix + ".lora_B.weight")
             tensors.append(TArc(Tensor.from_host_bf16(
                 host_ads[k].b.copy(), [dims[1], rank], ctx)))
+    # Combined main-save lists (block 252 + head 5 = 257 adapters).
+    var all_names = names.copy()
+    var all_tensors = List[TArc]()
+    for i in range(len(tensors)):
+        all_tensors.append(tensors[i].copy())
+    for h in range(N_HEADS):
+        var hd = _head_dims(h)
+        var hpref = _head_save_name(h)
+        all_names.append(hpref + ".lora_A.weight")
+        all_tensors.append(TArc(Tensor.from_host_bf16(
+            head_ads[h].a.copy(), [rank, hd[0]], ctx)))
+        all_names.append(hpref + ".lora_B.weight")
+        all_tensors.append(TArc(Tensor.from_host_bf16(
+            head_ads[h].b.copy(), [hd[1], rank], ctx)))
     var out_path = out_dir + "/hidream_o1_lora_last.safetensors"
-    save_safetensors(names, tensors, out_path, ctx)
-    print("[save] ", out_path)
+    save_safetensors(all_names, all_tensors, out_path, ctx)
+    print("[save] ", out_path, " (", len(all_names) // 2, " adapters)")
     if ema_on:
         # T1.B: EMA sibling — same DiffSynth key shape over the bf16-rounded
         # shadows (lora_ema.mojo copy_to cast, SimpleTuner ema.py:454).

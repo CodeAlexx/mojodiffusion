@@ -159,6 +159,14 @@ def _cache_dims(st: SafeTensors, name: String) raises -> List[Int]:
     return out^
 
 
+def _cache_has(st: SafeTensors, name: String) -> Bool:
+    var ns = st.names()
+    for i in range(len(ns)):
+        if ns[i] == name:
+            return True
+    return False
+
+
 # ── list cache files (sorted, like the Rust trainer cache_files.sort()) ───────
 from std.os import listdir
 def _list_cache(dir: String) raises -> List[String]:
@@ -666,13 +674,13 @@ def main() raises:
     print("  LoRA adapters:", n_adapters, " (7 slots x", NUM_LAYERS, "layers)")
     print("  LoRA-B |.|_1 at init =", _lora_b_abs_sum(lora), " (expect 0.0)")
 
-    # ── RoPE tables for the real seq (image-first/text-second 3-axis half-split) ──
-    # text_len_real for axis-0 offset: use N_TXT (the comptime trim) — every real
-    # token is within [0,N_TXT). build_ernie_rope_tables requires real in (0,N_TXT].
-    var rope = build_ernie_rope_tables[N_IMG, N_TXT, H, Dh](
-        IMG_H, IMG_W, N_TXT, ctx, STDtype.BF16
-    )
-    print("  RoPE tables built: cos/sin [S*H, Dh] = [", S * H, ",", Dh, "]")
+    # ── RoPE tables (image-first/text-second 3-axis half-split) ──
+    # OneTrainer's image RoPE axis-0 position == the per-sample TEXT real length
+    # (transformer_ernie_image.py:388 image_ids axis-0 = text_lens). So the table
+    # is rebuilt PER SAMPLE inside the loop with text_len_real = real_len read from
+    # the cache (NOT the fixed N_TXT). build_ernie_rope_tables requires real in
+    # (0, N_TXT]. (Was: built once with N_TXT — a divergence from OneTrainer.)
+    print("  RoPE tables: per-sample, cos/sin [S*H, Dh] = [", S * H, ",", Dh, "]")
 
     var cache_files = _list_cache(cache_dir)
     if len(cache_files) == 0:
@@ -702,6 +710,26 @@ def main() raises:
         var img_tokens = _latent_to_img_tokens(latent)                     # [N_IMG, IN_CH]
         var txt_tokens = _text_to_txt_tokens(text, t_cache)                # [N_TXT, TEXT_IN]
 
+        # ── per-sample real TEXT length (pre-pad token count). OneTrainer trims
+        # text to text_lengths.max() and MASKS padded text in attention; the cache
+        # stores this real_len. Rows [real_len, N_TXT) are nonzero Mistral PAD
+        # embeddings that must NOT attend. Drives both the attention text-pad mask
+        # AND the image RoPE axis-0 position (transformer_ernie_image.py:388-401).
+        var real_len = N_TXT
+        if _cache_has(cs, String("text_real_len")):
+            var rl_t = _read_cache_tensor(cs, String("text_real_len"), ctx)
+            var rl_h = rl_t.to_host(ctx)
+            real_len = Int(rl_h[0])
+        if real_len < 1:
+            real_len = 1
+        if real_len > N_TXT:
+            real_len = N_TXT
+
+        # ── RoPE tables for THIS sample (image axis-0 position = real_len) ──
+        var rope = build_ernie_rope_tables[N_IMG, N_TXT, H, Dh](
+            IMG_H, IMG_W, real_len, ctx, STDtype.BF16
+        )
+
         # ── sigma + flow-match noise/target (F32; train_ernie.rs:904-949) ──
         var sigma_draw = _sample_sigma_idx(rng_state)
         var sigma_idx = sigma_draw[0]
@@ -730,6 +758,7 @@ def main() raises:
             noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
             f_scale.copy(), f_shift.copy(), rope[0], rope[1],
             D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+            real_len,
         )
         var pred = fwd.out.copy()                          # [N_IMG, OUT_CH]
 
@@ -749,6 +778,7 @@ def main() raises:
             d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
             f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd,
             D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+            real_len,
         )
 
         # ── global-norm clip then AdamW on every adapter ──

@@ -1517,6 +1517,80 @@ def zimage_stack_lora_backward_main_device[
     )
 
 
+# ── L2P no-final backward: feed d_x[S,D] DIRECTLY into the main-block chain ────
+# Z-Image L2P (ai-toolkit z_image_l2p_model.py) has NO final layer-norm /
+# modulate / linear on the image tokens — the last DiT block output IS the
+# feature map handed to the local_decoder. So the L2P trainer computes the
+# feature-map gradient itself (via the local_decoder backward) and feeds it here
+# as `d_x_full` [S,D] (image-token grads in rows [0,N_IMG), caption rows zero).
+# This is a byte-copy of zimage_stack_lora_backward_main_device with the
+# linear/modulate/layernorm PROLOGUE removed (no final layer to backprop). The
+# block-chain body is IDENTICAL (recompute per block + hand-chain backward), so
+# the LoRA grads are produced by the SAME proven kernels. f_scale/final_lin are
+# absent. (Old paths untouched — additive, C13.)
+def zimage_stack_lora_backward_main_device_nofinal[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_x_full: List[Float32],            # [S, D] grad at the last-block output
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    lora: ZImageLoraDeviceSet,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageLoraGrads:
+    var num_main = len(main_blocks)
+    var num_blocks = lora.num_blocks()
+
+    # No final layer: d_x enters directly as the grad at x_final [S,D].
+    var d_x = TArc(_t(d_x_full.copy(), [S, D], ctx))
+
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_main - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var refwd = zimage_block_lora_forward_device_tensor[H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod[bi], bl,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        var bg = zimage_block_lora_backward_device_tensors[H, Dh, S](
+            d_x[], main_blocks[bi], main_mod[bi], bl, refwd.saved,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    var host_grads = _zimage_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_blocks * ZIMAGE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    var empty_x = List[Float32]()
+    var empty_cap = List[Float32]()
+    var empty_nr = List[List[Float32]]()
+    var empty_main = List[List[Float32]]()
+    var empty_fs = List[Float32]()
+    var empty_fl = List[Float32]()
+    return ZImageLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        empty_x^, empty_cap^,
+        empty_nr^, empty_main^,
+        empty_fs^, empty_fl^,
+        nonfinite,
+    )
+
+
 # ── AdamW step on EVERY adapter (reuses the proven per-adapter _lora_adamw) ───
 def zimage_lora_adamw_step(
     mut set: ZImageLoraSet, grads: ZImageLoraGrads, t: Int, lr: Float32,

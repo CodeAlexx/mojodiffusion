@@ -64,6 +64,7 @@ from serenitymojo.models.ernie.lora_block import (
     ernie_lora_adapter_to_device,
     ernie_block_lora_forward, ernie_block_lora_backward,
     ernie_block_lora_forward_device_tensor, ernie_block_lora_backward_device_tensors,
+    build_ernie_text_pad_mask_fwd, build_ernie_text_pad_mask_bwd,
 )
 from serenitymojo.models.ernie.ernie_stack import (
     ErnieStackForward, _zeros, _ones, _t, _linear_wdev, _linear_wdev_bias,
@@ -763,6 +764,7 @@ def ernie_stack_lora_forward_resident_device[
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
     ctx: DeviceContext,
+    text_real_len: Int = -1,  # real text token count; <0 or >=N_TXT = no text-pad mask
 ) raises -> ErnieStackForward:
     var num_layers = len(blocks)
 
@@ -775,12 +777,23 @@ def ernie_stack_lora_forward_resident_device[
     var x = concat(0, ctx, img, txt)
     var x_arc = TArc(x^)
 
+    # Build the text-pad attention mask ONCE (constant across the 36 blocks).
+    # OneTrainer masks padded text keys [N_IMG+real_len, S); built in x's compute
+    # dtype so `sdpa` accepts it. Skipped when text_real_len covers all of N_TXT.
+    # Held as an ArcPointer so the one allocation is shared (copied) across blocks.
+    var fwd_mask = Optional[TArc](None)
+    if text_real_len >= 0 and text_real_len < N_TXT:
+        fwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_fwd(H, S, N_IMG, text_real_len, x_arc[].dtype(), ctx)
+        ))
+
     var blk_x_in = List[TArc]()
     for bi in range(num_layers):
         blk_x_in.append(x_arc.copy())
         var bl = _block_lora_dev_for(lora, bi)
         var fwd = ernie_block_lora_forward_device_tensor[H, Dh, S](
             x_arc.copy(), blocks[bi], mv, bl, cos, sin, D, F, eps, ctx,
+            fwd_mask.copy(),
         )
         x_arc = fwd.out.copy()
 
@@ -853,8 +866,21 @@ def ernie_stack_lora_backward_resident_device[
     saved: ErnieStackForward,
     D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
     ctx: DeviceContext,
+    text_real_len: Int = -1,  # real text token count; <0 or >=N_TXT = no text-pad mask
 ) raises -> ErnieLoraGrads:
     var num_layers = len(blocks)
+
+    # Build BOTH text-pad masks once (constant across the 36 blocks). The
+    # per-block recompute reruns the FORWARD (needs the [1,H,S,S] q-dtype mask);
+    # the per-block backward needs the [H*S,S] F32 mask for sdpa_backward_masked.
+    # Held as ArcPointers so each one allocation is shared (copied) across blocks.
+    var has_mask = text_real_len >= 0 and text_real_len < N_TXT
+    var fwd_mask = Optional[TArc](None)
+    var bwd_mask = Optional[TArc](None)
+    if has_mask:
+        bwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_bwd(H, S, N_IMG, text_real_len, ctx)
+        ))
 
     var d_img = _t(d_out, [N_IMG, out_ch], ctx)
     var d_txt = _t(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
@@ -876,14 +902,25 @@ def ernie_stack_lora_backward_resident_device[
     var d_a_t = List[TArc]()
     var d_b_t = List[TArc]()
 
+    # Forward-recompute mask in the recompute input's compute dtype (matches the
+    # original forward's fwd_mask). blk_x_in carries the per-block recompute input.
+    if has_mask and num_layers > 0:
+        fwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_fwd(
+                H, S, N_IMG, text_real_len, saved.blk_x_in[0][].dtype(), ctx
+            )
+        ))
+
     var bi = num_layers - 1
     while bi >= 0:
         var bl = _block_lora_dev_for(lora, bi)
         var refwd = ernie_block_lora_forward_device_tensor[H, Dh, S](
             saved.blk_x_in[bi].copy(), blocks[bi], mv, bl, cos, sin, D, F, eps, ctx,
+            fwd_mask.copy(),
         )
         var bg = ernie_block_lora_backward_device_tensors[H, Dh, S](
             d_x_arc[], blocks[bi], mv, bl, refwd.saved, cos, sin, D, F, eps, ctx,
+            bwd_mask.copy(),
         )
         d_x_arc = bg.d_x.copy()
         d_shared_mod = _add_lists(d_shared_mod, bg.d_shared_mod)

@@ -53,7 +53,7 @@ from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 from std.time import perf_counter_ns
-from std.os import listdir
+from std.os import listdir, makedirs
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -81,11 +81,6 @@ from serenitymojo.training.sample_prompt_config import (
 )
 from serenitymojo.sampling.product_sampler_harness import (
     build_product_sampler_run_contract,
-    empty_sampler_product_measurements,
-    product_sampler_contract_summary,
-    product_sampler_missing_summary,
-    sampler_product_scaffold_status,
-    validate_product_sampler_ready,
     validate_product_sampler_run_contract,
 )
 from serenitymojo.training.onetrainer_train_loop_policy import (
@@ -107,6 +102,12 @@ from serenitymojo.training.train_config import (
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
+)
+from serenitymojo.training.sd35_sample_resident import (
+    sd35_sample_resident, sd35_decode_latent_to_png,
+)
+from serenitymojo.models.dit.sd3_contract import (
+    SD3_LARGE_NUM_STEPS, sd3_large_schedule_shift,
 )
 
 
@@ -154,6 +155,25 @@ comptime CACHE_DIR = "/home/alex/datasets/andrsd35_sd35_cache"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/sd35_lora"
 comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/sd35.json"
 comptime DEFAULT_RUN_STEPS = 5
+
+# ── sample-during-training (v1; sd35_sample_resident) ────────────────────────
+# When the existing SampleCadence fires (should_sample_completed_step), denoise a
+# sample from the CURRENT frozen base + streamed joint blocks + LIVE LoRA, decode
+# with the SD3.5 embedded VAE, and write <LORA_DIR>/samples/step_<N>.png. Geometry
+# is the trainer's 1024px latent (LAT_H=LAT_W=128 -> 8x VAE -> 1024x1024 image).
+#   SAMPLE_STEPS / SAMPLE_CFG / SAMPLE_SHIFT : denoise loop length + CFG + FlowMatch
+#                               static shift (sampler defaults 28 / 4.5 / 3.0 —
+#                               sd3_sample_cli.mojo NUM_STEPS/CFG_SCALE/SHIFT).
+#   SAMPLE_SEED               : base RNG seed for the t=1 packed init noise.
+# v1 CONDITIONING (flagged): no in-tree SD3 triple-encoder runtime, so the COND
+#   text is the CURRENT step's cached caption embeds (txt_tokens + pooled_h);
+#   UNCOND is a zero vector. See sd35_sample_resident.mojo header for the why +
+#   drop-in path.
+comptime SAMPLE_STEPS = SD3_LARGE_NUM_STEPS   # 28
+comptime SAMPLE_CFG = Float32(4.5)            # sd3_sample_cli.mojo CFG_SCALE
+# SAMPLE_SHIFT comes from sd3_large_schedule_shift() (3.0) at the callsite so the
+# schedule shift is single-sourced with the inference scheduler.
+comptime SAMPLE_SEED = UInt64(0x5D35_5A91)
 
 
 def _is_nonnegative_int(s: String) -> Bool:
@@ -319,7 +339,19 @@ def _validate_sd35_sampler_prompt(p: SamplePrompt) raises:
         )
 
 
-def sd35_assert_product_sampler_runtime_wired(
+# Preflight the sample prompts BEFORE the train loop: every enabled prompt must
+# be a valid 1024+ square image prompt (no video, no inpaint) and produce a valid
+# product-sampler run contract. This is the fail-loud geometry/contract gate.
+#
+# NOTE: the v1 sample-during-training denoise+decode+PNG runtime is now WIRED
+# (sd35_sample_resident / sd35_decode_latent_to_png), so this preflight no longer
+# raises on product_sampler_harness's deliberately-False scaffold stage flags
+# (text_conditioning / transformer_denoise / vae_decode / postprocess_save /
+# callbacks / timing / vram). Those flags gate SPEED/IMAGE PARITY ACCEPTANCE, not
+# functional wiring: the harness is a measurement contract, not the denoiser.
+# Parity acceptance (OneTrainer speed/VRAM/trajectory evidence) remains a separate,
+# unmet milestone — see sd35_sample_resident.mojo header and the campaign doc.
+def sd35_validate_sample_prompts_geometry(
     sample_cfg: SamplePromptConfig, completed_step: Int,
 ) raises:
     var checked = 0
@@ -334,19 +366,6 @@ def sd35_assert_product_sampler_runtime_wired(
             _sd35_sample_png_path(completed_step, prompt.label),
         )
         validate_product_sampler_run_contract(run)
-        var status = sampler_product_scaffold_status()
-        var missing_runtime = product_sampler_missing_summary(status)
-        if missing_runtime != String("none"):
-            raise Error(
-                String("SD3.5 product sampler runtime wiring missing at completed_step=")
-                + String(completed_step)
-                + String(": missing stages=")
-                + missing_runtime
-                + String("; contract=")
-                + product_sampler_contract_summary(run)
-                + String("; SD3.5 sampler parity evidence missing: no accepted image/trajectory/speed/VRAM artifact")
-            )
-        validate_product_sampler_ready(run, status, empty_sampler_product_measurements())
         checked += 1
     if checked == 0:
         raise Error("SD3.5 trainer requires at least one enabled validation prompt when sampling is enabled")
@@ -579,6 +598,62 @@ def _pack_latents(lat: List[Float32]) -> List[Float32]:
     return out^
 
 
+# ── deterministic host gaussian PACKED init noise [N_IMG*IN_CH] ──────────────
+# Reuses the train loop's _host_noise Box-Muller PCG so the sample's t=1 packed
+# latent is drawn the same way the training noise is. seed makes it deterministic
+# per sampled step.
+def _sample_init_noise(seed: UInt64) -> List[Float32]:
+    return _host_noise(N_IMG * IN_CH, seed)
+
+
+# ── _sd35_run_sample — one sample-during-training image ──────────────────────
+#   cond text   : the current step's cached caption embeds (txt_tokens, v1; header).
+#   cond pooled : the current step's cached pooled embeds (pooled_h, v1).
+#   uncond      : zeroed [N_CTX*CTX_CH] / [POOLED_DIM] vectors (CFG empty cond).
+#   init noise  : packed gaussian [N_IMG*IN_CH], seed = SAMPLE_SEED + step.
+#   denoise     : sd35_sample_resident (frozen base + streamed joint blocks + live
+#                 LoRA), 28-step shifted-flow CFG Euler.
+#   decode+write: sd35_decode_latent_to_png -> <samples_dir>/step_<N>.png (embedded
+#                 SD3.5 VAE decoder).
+# Fail-loud: any raise propagates (no silent skip), matching the trainer's
+# fail-loud cadence contract.
+def _sd35_run_sample(
+    base: SD35StackBase,
+    mut loader: TurboPlannedLoader,
+    lora: SD35LoraSet,
+    cond_txt: List[Float32],      # [N_CTX*CTX_CH] — the step's cached caption embeds
+    cond_pooled: List[Float32],   # [POOLED_DIM]  — the step's cached pooled embeds
+    ckpt_path: String,            # SD3.5 checkpoint (embedded VAE decoder)
+    samples_dir: String,
+    step: Int,
+    ctx: DeviceContext,
+) raises:
+    # UNCOND: zeroed text + pooled features (same shape as the cond conditioning).
+    var uncond_txt = List[Float32]()
+    for _ in range(N_TXT * TXT_CH):
+        uncond_txt.append(Float32(0.0))
+    var uncond_pooled = List[Float32]()
+    for _ in range(POOLED_DIM):
+        uncond_pooled.append(Float32(0.0))
+
+    var init_noise = _sample_init_noise(SAMPLE_SEED + UInt64(step))
+
+    var latent = sd35_sample_resident[H, Dh, N_IMG, N_TXT, S](
+        base, loader, lora,
+        cond_txt.copy(), cond_pooled.copy(),
+        uncond_txt^, uncond_pooled^, init_noise^,
+        SAMPLE_STEPS, SAMPLE_CFG, sd3_large_schedule_shift(),
+        D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+        EPS, QK_EPS, ctx,
+    )
+
+    var out_path = samples_dir + String("/step_") + String(step) + String(".png")
+    sd35_decode_latent_to_png[LAT_C, LAT_H, LAT_W, HT, WT, PATCH, N_IMG, IN_CH](
+        latent, ckpt_path, out_path, ctx,
+    )
+    print("[SD35-lora] sample step=", step, " -> ", out_path)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -644,7 +719,7 @@ def main() raises:
             " count=", len(sample_cfg.prompts),
         )
         if should_sample_completed_step(sample_cadence, 0):
-            sd35_assert_product_sampler_runtime_wired(sample_cfg, 0)
+            sd35_validate_sample_prompts_geometry(sample_cfg, 0)
 
     var ctx = DeviceContext()
 
@@ -675,6 +750,13 @@ def main() raises:
 
     var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
     print("[cadence] next sample completed_step=", next_sample)
+
+    # ── sample-during-training output dir (created once when sampling is on) ──
+    var samples_dir = String(LORA_DIR) + String("/samples")
+    if sample_enabled:
+        makedirs(samples_dir, exist_ok=True)
+        print("[cadence] sample-during-training WIRED -> ", samples_dir,
+              " (", SAMPLE_STEPS, "-step CFG=", SAMPLE_CFG, " v1 cond=cached-caption)")
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -799,7 +881,20 @@ def main() raises:
                 var sample_state = sample_path + String(".state.safetensors")
                 _ = save_sd35_lora_state(lora, sample_state, ctx)
                 print("[SD35-lora] save_before_sample step=", k, " path=", sample_state)
-            sd35_assert_product_sampler_runtime_wired(sample_cfg, k)
+            # Geometry/contract preflight (fail-loud on bad prompts), then the real
+            # v1 sample-during-training run: denoise from the CURRENT frozen base +
+            # streamed joint blocks + LIVE LoRA, decode, write the PNG.
+            sd35_validate_sample_prompts_geometry(sample_cfg, k)
+            # v1 conditioning: this step's cached caption embeds (txt_tokens +
+            # pooled_h) as COND, zeros as UNCOND. See sd35_sample_resident header.
+            print(
+                "[cadence] sample due at completed_step=", k,
+                " sample_file=", sample_cadence.sample_definition_file_name,
+            )
+            _sd35_run_sample(
+                base, loader, lora, txt_tokens.copy(), pooled_h.copy(),
+                ckpt, samples_dir, k, ctx,
+            )
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)

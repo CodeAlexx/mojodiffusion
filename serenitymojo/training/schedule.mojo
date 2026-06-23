@@ -280,6 +280,62 @@ def sample_timestep_logit_normal(seed: UInt64, shift: Float32) -> Float32:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# T6.1b — DISCRETE timestep sampling (OneTrainer Qwen path).
+#
+# Mirrors OneTrainer's ModelSetupNoiseMixin._get_timestep_discrete LOGIT_NORMAL
+# branch + ModelSetupFlowMatchingMixin._add_noise_discrete EXACTLY for the qwen
+# LoRA 24GB preset defaults:
+#   - num_train_timesteps = 1000 (qwen scheduler_config.json).
+#   - min_noising_strength=0, max_noising_strength=1 -> min_t=0, num_t=1000.
+#   - LOGIT_NORMAL with noising_weight=0 (scale=1.0), noising_bias=0 (bias=0)
+#     -> continuous timestep = sigmoid(N(0,1)) * 1000.
+#   - shift remap: t = num_t*shift*t / ((shift-1)*t + num_t); with shift=1.0
+#     (preset/scheduler default) this is the identity.
+#   - .int() truncates -> idx in [0, 999].
+# The trainer then derives, per _add_noise_discrete:
+#   sigma          = (idx + 1) / 1000        (noise/latent blend coefficient)
+#   model_timestep = idx / 1000              (transformer timestep input,
+#                                             diffusers scales *1000 internally)
+# This struct returns all three so the train loop matches OneTrainer bit-for-bit
+# at the timestep level (RNG stream excepted; distribution-level parity gated).
+@fieldwise_init
+struct DiscreteTimestep(Copyable, Movable):
+    var idx: Int           # truncated integer timestep index in [0, num_t-1]
+    var sigma: Float32     # (idx+1)/num_train_timesteps — blend coefficient
+    var model_t: Float32   # idx/num_train_timesteps — transformer timestep input
+
+
+def sample_timestep_discrete_qwen(
+    seed: UInt64, shift: Float32, num_train_timesteps: Int = 1000
+) -> DiscreteTimestep:
+    """OneTrainer-faithful discrete timestep for the Qwen LoRA preset.
+
+    idx = int(sigmoid(N(0,1)) * num_t * shift / ((shift-1)*(sigmoid(N)*num_t) + num_t)).
+    With shift=1.0 the shift factor is identity, so idx = int(sigmoid(N) * num_t).
+    Returns (idx, sigma=(idx+1)/num_t, model_t=idx/num_t)."""
+    var ks = _expand_key(seed)
+    var d = _standard_normal_at(
+        ks[0], ks[1], ks[2], ks[3], ks[4], ks[5], ks[6], ks[7], UInt64(0)
+    )
+    var num_t = Float64(num_train_timesteps)
+    # continuous timestep before shift = sigmoid(N)*num_t (min_t=0, num_timestep=num_t).
+    var cont = _sigmoid64(d.z) * num_t
+    var shift64 = Float64(shift)
+    # OneTrainer shift remap (identity when shift==1):
+    #   t = num_t * shift * t / ((shift-1)*t + num_t)
+    var shifted = num_t * shift64 * cont / ((shift64 - Float64(1.0)) * cont + num_t)
+    # .int() truncates toward zero (sigmoid in (0,1) -> shifted in (0, num_t)).
+    var idx = Int(shifted)
+    if idx < 0:
+        idx = 0
+    if idx >= num_train_timesteps:
+        idx = num_train_timesteps - 1
+    var sigma = Float32(Float64(idx + 1) / num_t)
+    var model_t = Float32(Float64(idx) / num_t)
+    return DiscreteTimestep(idx, sigma, model_t)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Wave 2A item 2g — selectable Uniform + Sigmoid timestep distributions.
 #
 # The production default stays sample_timestep_logit_normal (logit-normal +

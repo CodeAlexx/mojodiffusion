@@ -119,7 +119,13 @@ comptime ALPHA = Float32(1.0)
 # ── fixed-caption + encoder constants ──
 comptime HIDDEN = 2560
 comptime ENC_SEQ = 512        # encoder runs at this supported sdpa seq, sliced to CAPLEN_MAX
-comptime CAPLEN_MAX = 256     # comptime cap buffer (multiple of 32 → cap_padded == CAPLEN_MAX)
+comptime CAPLEN_MAX = 256     # comptime cap buffer (mult of 32). build_positions now
+                              # follows OneTrainer/diffusers exactly: caption rows
+                              # [0,cap_padded) get sequential RoPE positions (cap_padded =
+                              # real_caplen rounded up to 32) and the image offset is
+                              # cap_padded+1, NOT CAPLEN_MAX+1. When real_caplen rounds to
+                              # CAPLEN_MAX (the verified-parity prompts) cap_padded==CAPLEN_MAX
+                              # so positions are unchanged; shorter prompts now match diffusers.
 comptime PAD_ID = 151643      # Qwen pad token (prepare_l2p PAD_TOKEN_ID); right-pad, causal-masked
 comptime EXTRACT_LAYER = 34   # Qwen3-4B penultimate (Z-Image canonical)
 comptime ZIMAGE_DEFAULT_SIGMA_SHIFT = Float32(3.0) # SwarmUI/Comfy ZImage sampling_settings shift

@@ -22,15 +22,22 @@
 #   5. noisy = noise*sigma + latent_packed*(1-sigma)      (train_flux.rs:797-799)
 #      target = noise - latent_packed   (rectified-flow)  (train_flux.rs:802)
 #   6. flux_stack_lora_forward_offload(noisy_img_tokens, t5_txt_tokens,
-#        timestep=t_model*1000, guidance=3.5*1000, vector=clip_pool) -> pred [N_IMG,64]
+#        timestep=t_model*1000, guidance=GUIDANCE*1000, vector=clip_pool) -> pred [N_IMG,64]
 #   7. loss = MSE(pred, target); d_loss = (2/N)(pred - target)
 #   8. flux_stack_lora_backward_offload -> LoRA grads; global-norm clip(1.0)
 #   9. flux_lora_adamw_step; print shared progress display
 #
-# Recipe scalars (train_flux.rs OneTrainer Flux preset):
-#   lr=1e-4, rank=16, alpha=16.0, timestep_shift=1.0 (identity),
-#   guidance=3.5, clip_grad_norm=1.0, SHIFT=0.1159, SCALE=0.3611,
-#   NUM_TRAIN_TIMESTEPS=1000.
+# Recipe scalars (OneTrainer "#flux LoRA.json" preset + config defaults — verified
+# against /home/alex/OneTrainer 2026-06-22):
+#   lr=3e-4 (preset learning_rate), rank=16 (config default lora_rank),
+#   alpha=1.0 (config default lora_alpha; preset does NOT override),
+#   lr_warmup_steps=200 (config default; preset unset), lr_scheduler=CONSTANT,
+#   timestep_shift=1.0 (config default; dynamic_timestep_shifting=false),
+#   guidance=1.0 (config default transformer.guidance_scale; preset unset),
+#   clip_grad_norm=1.0, betas=(0.9,0.999) eps=1e-8 weight_decay=1e-2 (ADAMW
+#   default), SHIFT=0.1159, SCALE=0.3611, NUM_TRAIN_TIMESTEPS=1000.
+# NOTE: OT preset resolution=768 (latent 96x96); this trainer is comptime-baked
+# at 512px (latent 64x64). See the resolution-mismatch FLAG in the build request.
 #
 # MEMORY: the flux1-dev transformer is 11.9B params (47.6 GB F32 resident) — does
 # NOT fit a 3090. The OFFLOAD path streams one block at a time
@@ -65,9 +72,13 @@ from serenitymojo.io.tensor_view import from_parts
 
 from serenitymojo.models.flux.weights import load_flux_stack_base
 from serenitymojo.models.flux.flux_stack_lora import (
-    FluxLoraSet, FluxLoraGradSet, build_flux_lora_set,
+    FluxLoraSet, FluxLoraGradSet, FluxStackLoraSet, build_flux_lora_set,
+    build_flux_stack_lora_set, total_stack_adapters,
     flux_stack_lora_forward_offload, flux_stack_lora_backward_offload,
-    flux_lora_adamw_step, save_flux_lora, save_flux_lora_state, total_adapters,
+    flux_stack_lora_forward_offload_full, flux_stack_lora_backward_offload_full,
+    flux_lora_adamw_step, flux_stack_lora_adamw_step,
+    save_flux_lora, save_flux_lora_state,
+    save_flux_lora_combined, save_flux_lora_state_combined, total_adapters,
 )
 from serenitymojo.models.flux.lora_block import DBL_STREAM_SLOTS, SGL_SLOTS
 from serenitymojo.models.dit.flux1_dit import build_flux1_rope_tables
@@ -103,6 +114,10 @@ from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
 )
+from serenitymojo.training.flux_sample_resident import (
+    flux_sample_offload, flux_decode_packed_to_png,
+)
+from std.os import makedirs
 
 
 # ── arch (flux1-dev; H/Dh/D fixed comptime, verified vs the checkpoint) ──────
@@ -131,12 +146,12 @@ comptime N_IMG = HT * WT       # 1024
 comptime N_TXT = 512           # T5 padded length (BFL convention)
 comptime S = N_TXT + N_IMG     # 1536
 
-# ── recipe (train_flux.rs OneTrainer Flux preset) ────────────────────────────
+# ── recipe (OneTrainer "#flux LoRA.json" preset + config defaults) ───────────
 comptime RANK = 16
-comptime ALPHA = Float32(16.0)
-comptime LR = Float32(1.0e-4)
+comptime ALPHA = Float32(1.0)          # OT config default lora_alpha (preset unset)
+comptime LR = Float32(3.0e-4)          # OT preset learning_rate 0.0003
 comptime TIMESTEP_SHIFT = Float32(1.0)
-comptime GUIDANCE = Float32(3.5)
+comptime GUIDANCE = Float32(1.0)       # OT config default guidance_scale (preset unset)
 comptime VAE_SHIFT = Float32(0.1159)
 comptime VAE_SCALE = Float32(0.3611)
 comptime NUM_TRAIN_TIMESTEPS = 1000
@@ -152,6 +167,15 @@ comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_flux_51
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/alina_flux"
 comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/flux.json"
 comptime DEFAULT_RUN_STEPS = 5
+
+# ── sample-during-training (v1) ───────────────────────────────────────────────
+# VAE for the sample decode (FLUX ae). The unpack uses the VAE in-channel count
+# LAT_C (16); the packed patch dim is LAT_C*4 == IN_CH (64). HT/WT (32) are the
+# patchified half-grid (IMG_H2/IMG_W2 in the inference CLI). Sample defaults match
+# the gated inference CLI (steps 20, guidance == the trainer's GUIDANCE).
+comptime VAE_PATH = "/home/alex/.serenity/models/vaes/ae.safetensors"
+comptime SAMPLE_STEPS = 20
+comptime SAMPLE_SEED = UInt64(0xF10A_5A91)
 
 
 def _is_nonnegative_int(s: String) -> Bool:
@@ -313,6 +337,13 @@ def _global_norm(grads: FluxLoraGradSet) -> Float64:
             ss += Float64(grads.d_a[i][j]) * Float64(grads.d_a[i][j])
         for j in range(len(grads.d_b[i])):
             ss += Float64(grads.d_b[i][j]) * Float64(grads.d_b[i][j])
+    # stack-level LoRA grads share the SAME global clip norm (OT clips ALL trained
+    # params together). Empty when stack-level LoRA disabled.
+    for i in range(len(grads.st_d_a)):
+        for j in range(len(grads.st_d_a[i])):
+            ss += Float64(grads.st_d_a[i][j]) * Float64(grads.st_d_a[i][j])
+        for j in range(len(grads.st_d_b[i])):
+            ss += Float64(grads.st_d_b[i][j]) * Float64(grads.st_d_b[i][j])
     return sqrt(ss)
 
 
@@ -326,6 +357,11 @@ def _clip(mut grads: FluxLoraGradSet, max_norm: Float32) -> Float64:
             grads.d_a[i][j] = grads.d_a[i][j] * s
         for j in range(len(grads.d_b[i])):
             grads.d_b[i][j] = grads.d_b[i][j] * s
+    for i in range(len(grads.st_d_a)):
+        for j in range(len(grads.st_d_a[i])):
+            grads.st_d_a[i][j] = grads.st_d_a[i][j] * s
+        for j in range(len(grads.st_d_b[i])):
+            grads.st_d_b[i][j] = grads.st_d_b[i][j] * s
     return gn
 
 
@@ -417,6 +453,13 @@ def main() raises:
     var cache_dir = flux_cache_dir_from_train_config(train_cfg)
     var sample_cadence = flux_sample_cadence_from_train_config(cfg_path, train_cfg)
     var sample_enabled = flux_sampling_enabled(sample_cadence)
+    # sample-during-training output dir (<lora_dir>/samples). Created up front so a
+    # step-0 / early sample has somewhere to write. Sampling reuses the SAME cached
+    # conditioning (txt_tokens + clip_pool) the current step already loaded — see
+    # flux_sample_resident.mojo header (v1 conditioning).
+    var samples_dir = String(LORA_DIR) + String("/samples")
+    if sample_enabled:
+        makedirs(samples_dir, exist_ok=True)
 
     print("=== Flux (flux1-dev) REAL LoRA training loop (block-swap offload) ===")
     print("  config:", cfg_path)
@@ -464,11 +507,22 @@ def main() raises:
     print("[load] flux 3-axis rope tables built (S*H x Dh/2)")
 
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
+    # OneTrainer "#flux LoRA.json" default (empty layer_filter) LoRAs EVERY
+    # transformer Linear: the block-projection adapters (build_flux_lora_set) AND
+    # the stack-level adapters (build_flux_stack_lora_set: per-block modulation
+    # linears + the embedder / input-projection / final linears). Both B=0 at init.
     var lora = build_flux_lora_set(NUM_DOUBLE, NUM_SINGLE, D, FMLP, RANK, ALPHA)
     var n_adapters = total_adapters(lora)
-    print("[lora] adapters:", n_adapters,
+    var stack_lora = build_flux_stack_lora_set(
+        NUM_DOUBLE, NUM_SINGLE, D, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, True, RANK, ALPHA
+    )
+    var n_stack = total_stack_adapters(stack_lora)
+    print("[lora] block adapters:", n_adapters,
           " (", DBL_STREAM_SLOTS * 2, "x", NUM_DOUBLE, "double +",
           SGL_SLOTS, "x", NUM_SINGLE, "single)")
+    print("[lora] stack adapters:", n_stack,
+          " (per-block mod.lin + embedders + input-proj + final = full OT default)")
+    print("[lora] TOTAL trained LoRA modules:", n_adapters + n_stack)
 
     # ── cache ────────────────────────────────────────────────────────────────
     var files = _list_cache(cache_dir)
@@ -485,7 +539,11 @@ def main() raises:
     var guidance = Optional[List[Float32]](guidance_list^)
 
     if sample_enabled and should_sample_completed_step(sample_cadence, 0):
-        print("[cadence] step 0 sample due; Flux validation sampler is not wired in this bounded loop")
+        # step-0 sample (untrained LoRA == identity) is skipped: the in-loop
+        # sampler conditions on the CURRENT step's cached caption embeds, which
+        # are only loaded once the loop starts. First real sample fires at the
+        # first completed step that hits the cadence (see the in-loop callsite).
+        print("[cadence] step-0 sample skipped (untrained LoRA); first sample at next cadence step")
     var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
     print("[cadence] next sample completed_step=", next_sample)
 
@@ -549,9 +607,11 @@ def main() raises:
             target.append(noise[i] - latent_packed[i])
 
         # ── forward (offload, full depth) -> velocity [N_IMG, OUT_CH] ──
-        var fwd = flux_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+        # _full path applies BOTH block-projection LoRA (`lora`) and stack-level
+        # LoRA (`stack_lora`) — the complete OneTrainer default surface.
+        var fwd = flux_stack_lora_forward_offload_full[H, Dh, N_IMG, N_TXT, S](
             noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
-            base, loader, lora, cos.copy(), sin.copy(),
+            base, loader, lora, stack_lora, cos.copy(), sin.copy(),
             D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
         )
 
@@ -570,19 +630,26 @@ def main() raises:
         last_loss = loss
 
         # ── backward (offload, full depth) ──
-        var grads = flux_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+        # `clip_pool` (CLIP-pooled) is the text_embedder lin1 input, needed for
+        # that adapter's d_a in the stack-level backward.
+        var grads = flux_stack_lora_backward_offload_full[H, Dh, N_IMG, N_TXT, S](
             d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
-            cos.copy(), sin.copy(), fwd,
+            stack_lora, clip_pool.copy(), cos.copy(), sin.copy(), fwd,
             D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
         )
 
-        # ── grad norm + configured clip ──
+        # ── grad norm + configured clip (block + stack grads, one global norm) ──
         var gn_before = _clip(grads, train_cfg.max_grad_norm)
 
-        # ── AdamW ──
+        # ── AdamW (block adapters, then stack adapters) ──
         var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
         flux_lora_adamw_step(
             lora, grads, k, step_lr, ctx,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+            train_cfg.weight_decay,
+        )
+        flux_stack_lora_adamw_step(
+            stack_lora, grads, k, step_lr, ctx,
             train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
             train_cfg.weight_decay,
         )
@@ -609,9 +676,9 @@ def main() raises:
             var save_path = _step_lora_path(
                 flux_output_lora_path_from_train_config(train_cfg, run_steps), k
             )
-            _ = save_flux_lora(lora, save_path, ctx)
+            _ = save_flux_lora_combined(lora, stack_lora, save_path, ctx)
             var state_path = save_path + String(".state.safetensors")
-            _ = save_flux_lora_state(lora, state_path, ctx)
+            _ = save_flux_lora_state_combined(lora, stack_lora, state_path, ctx)
             saved_this_step = True
             print("[Flux-lora] save_state step=", k, " path=", state_path)
         if sample_enabled and should_sample_completed_step(sample_cadence, k):
@@ -619,30 +686,66 @@ def main() raises:
                 var sample_path = _step_lora_path(
                     flux_output_lora_path_from_train_config(train_cfg, run_steps), k
                 )
-                _ = save_flux_lora(lora, sample_path, ctx)
+                _ = save_flux_lora_combined(lora, stack_lora, sample_path, ctx)
                 var sample_state = sample_path + String(".state.safetensors")
-                _ = save_flux_lora_state(lora, sample_state, ctx)
+                _ = save_flux_lora_state_combined(lora, stack_lora, sample_state, ctx)
                 print("[Flux-lora] save_before_sample step=", k, " path=", sample_state)
+            # ── sample-during-training (v1; guidance-distilled, single-fwd Euler) ─
+            # Denoise from the CURRENT frozen base + streamed blocks + live LoRA,
+            # conditioned on THIS step's cached caption embeds (txt_tokens +
+            # clip_pool — the v1 conditioning, see flux_sample_resident.mojo).
+            # WARNING: each sample re-streams all 57 blocks SAMPLE_STEPS times via
+            # the same `loader`; rare cadence only. Fail-loud — any raise aborts.
             print(
                 "[cadence] sample due at completed_step=", k,
                 " sample_file=", sample_cadence.sample_definition_file_name,
-                " (sampler not wired in this bounded loop)",
+                " — denoising", SAMPLE_STEPS, "steps (re-streams blocks)",
             )
+            var sample_packed = flux_sample_offload[
+                H, Dh, N_IMG, N_TXT, S, IN_CH, OUT_CH
+            ](
+                base, loader, lora,
+                txt_tokens.copy(), clip_pool.copy(), cos.copy(), sin.copy(),
+                GUIDANCE, SAMPLE_STEPS, SAMPLE_SEED + UInt64(k),
+                D, FMLP, TXT_CH, T_DIM, VEC_DIM, EPS, ctx,
+            )
+            var sample_png = (
+                samples_dir + String("/step_") + String(k) + String(".png")
+            )
+            flux_decode_packed_to_png[
+                N_IMG, HT, WT, LAT_H, LAT_W, LAT_C
+            ](sample_packed, String(VAE_PATH), sample_png, ctx)
+            print("[Flux-lora] sample step=", k, " -> ", sample_png)
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
     var b_absum_final = Float32(0.0)
     for i in range(n_adapters):
         b_absum_final += _absum(lora.ad[i].b)
-    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
+    # stack-level LoRA-B growth (per OT default, these must also train).
+    var stack_b_final = Float32(0.0)
+    for slot in range(len(stack_lora.level)):
+        if stack_lora.level[slot]:
+            stack_b_final += _absum(stack_lora.level[slot].value().b)
+    for i in range(len(stack_lora.dbl_img_mod)):
+        if stack_lora.dbl_img_mod[i]:
+            stack_b_final += _absum(stack_lora.dbl_img_mod[i].value().b)
+        if stack_lora.dbl_txt_mod[i]:
+            stack_b_final += _absum(stack_lora.dbl_txt_mod[i].value().b)
+    for i in range(len(stack_lora.sgl_mod)):
+        if stack_lora.sgl_mod[i]:
+            stack_b_final += _absum(stack_lora.sgl_mod[i].value().b)
+    print("[lora] stack LoRA-B |.|_1 final =", stack_b_final, " (expect > 0 — trained)")
+    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0) and (stack_b_final > 0.0)
     if trains and (last_loss == last_loss):
-        print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
+        print("RESULT: REAL run OK — block LoRA-B grew 0 ->", b_absum_final,
+              "; stack LoRA-B ->", stack_b_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         var lora_out = flux_output_lora_path_from_train_config(train_cfg, run_steps)
-        _ = save_flux_lora(lora, lora_out, ctx)
+        _ = save_flux_lora_combined(lora, stack_lora, lora_out, ctx)
         var state_out = lora_out + String(".state.safetensors")
-        _ = save_flux_lora_state(lora, state_out, ctx)
+        _ = save_flux_lora_state_combined(lora, stack_lora, state_out, ctx)
         print("[Flux-lora] save_state step=", run_steps, " path=", state_out)
     else:
         print("RESULT: FAIL trains=", trains)

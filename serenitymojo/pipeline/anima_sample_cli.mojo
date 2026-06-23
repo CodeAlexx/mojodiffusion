@@ -346,7 +346,7 @@ def _zero_b_set(set: AnimaLoraSet) -> AnimaLoraSet:
     for i in range(len(set.ad)):
         var src = set.ad[i].copy()
         for j in range(len(src.b)):
-            src.b[j] = Float32(0.0)
+            src.b[j] = BFloat16(0.0)
         ad.append(src^)
     return AnimaLoraSet(ad^, set.num_blocks, set.rank)
 
@@ -498,7 +498,7 @@ def _load_and_denoise(
         var babs = Float32(0.0)
         for i in range(len(lora.ad)):
             for j in range(len(lora.ad[i].b)):
-                var x = lora.ad[i].b[j]
+                var x = Float32(lora.ad[i].b[j])
                 babs += x if x >= 0.0 else -x
         print("  LoRA overlay loaded:", len(lora.ad), "adapters  |B|_1 =", babs,
               " scale=alpha/rank=", ALPHA / Float32(RANK))

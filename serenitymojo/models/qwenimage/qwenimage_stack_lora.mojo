@@ -24,6 +24,7 @@
 from std.gpu.host import DeviceContext
 from std.collections import List, Optional
 from std.memory import ArcPointer
+from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.cast import cast_tensor
@@ -82,9 +83,17 @@ def make_lora_adapter(
     rank: Int, alpha: Float32, in_f: Int, out_f: Int, seed: UInt64
 ) -> LoraAdapter:
     var scale = alpha / Float32(rank)
+    # OneTrainer LoRAModule init (modules/module/LoRAModule.py:314-316):
+    #   lora_down (A): nn.init.kaiming_uniform_(weight, a=sqrt(5))
+    #   lora_up   (B): nn.init.zeros_  (PEFT identity at init)
+    # For an nn.Linear(in_f, rank) weight [rank, in_f], kaiming_uniform(a=sqrt5)
+    # gives gain=sqrt(2/6)=1/sqrt(3), std=gain/sqrt(fan_in)=1/sqrt(3*in_f), and
+    # bound=sqrt(3)*std=1/sqrt(in_f). _randn(n, seed, s) = uniform[-s/2, s/2), so
+    # passing s = 2/sqrt(in_f) yields uniform[-1/sqrt(in_f), +1/sqrt(in_f)).
+    var kaiming_uniform_width = Float32(2.0) / sqrt(Float32(in_f))
     return LoraAdapter(
-        _randn(rank * in_f, seed, 0.01),   # A small randn
-        _zeros(out_f * rank),              # B = 0 (PEFT identity at init)
+        _randn(rank * in_f, seed, kaiming_uniform_width),   # A: kaiming_uniform(a=sqrt5)
+        _zeros(out_f * rank),                               # B = 0 (PEFT identity at init)
         rank, in_f, out_f, scale,
         _zeros(rank * in_f), _zeros(rank * in_f),
         _zeros(out_f * rank), _zeros(out_f * rank),

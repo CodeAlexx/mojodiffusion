@@ -320,23 +320,61 @@ def build_rope(
 
 
 # ── rope positions for img / cap / unified ───────────────────────────────────
-# cap tokens: real rows (i+1,0,0), pad rows (0,0,0). image tokens:
-# (cap_padded+1, ih, iw), followed by image pad rows (0,0,0). unified = img ++ cap.
+# OneTrainer scheme (transformer_z_image.py patchify_and_embed + _pad_with_ids,
+# basic/non-omni mode), matched EXACTLY:
+#   * The caption that reaches the transformer is the VALID-length caption
+#     (encode_text strips padding via the attention mask), padded to the next
+#     multiple of SEQ_MULTI_OF=32 with the last real row repeated (cap_padded).
+#   * _pad_with_ids builds the caption positions from
+#         create_coordinate_grid(size=(cap_padded,1,1), start=(1,0,0))
+#     i.e. EVERY row in [0,cap_padded) — including the rows in [valid_cap,
+#     cap_padded) that hold the last-row-repeat pad feats — gets a SEQUENTIAL
+#     axis-0 position (i+1,0,0). There is NO interior (0,0,0) caption pad.
+#     (The extra (0,0,0) pad-position rows _pad_with_ids appends are sliced off
+#     by cap_seqlens=len(cap_feats)=cap_padded in _build_unified_sequence, so
+#     they never reach RoPE.)
+#   * The image block starts at axis-0 position cap_padded+1
+#         _pad_with_ids(img_patches, (F_t,H_t,W_t), start=(cap_len+1,0,0))
+#     where cap_len is the PADDED caption length (total_len). Image rows beyond
+#     the real H_t*W_t patches are the image's own pad-to-32 rows at (0,0,0).
+#   * Basic-mode unified order is [x, cap] (img ++ cap) — matched below.
+#
+# This builder runs inside a FIXED comptime bucket cap_len (224 or 256). For a
+# sample whose cap_padded == cap_len (valid_cap in (cap_len-32, cap_len]) the
+# scheme below is byte-exact OneTrainer. For a SHORTER caption in the same
+# bucket (cap_padded < cap_len) the rows [cap_padded, cap_len) are OneTrainer's
+# BATCH-PADDING rows, which OneTrainer attention-MASKS out of the unified
+# sequence. The current Mojo stack forward has no per-token attention mask, so
+# those extra rows still attend; positionally they are left at (0,0,0) here, but
+# EXACT parity for cap_padded < cap_len additionally needs the forward to mask
+# rows [cap_padded, cap_len). That masking is a kernel-level change (out of
+# scope for this builder) and is the remaining known gap for short captions.
 def build_positions(
     n_img: Int, ht: Int, wt: Int, cap_len: Int, valid_cap: Int
 ) -> Tuple[List[List[Int]], List[List[Int]]]:
     var real_cap = valid_cap
     if real_cap < 0 or real_cap > cap_len:
         real_cap = cap_len
+    # cap_padded = valid_cap rounded up to the next multiple of 32 (== OneTrainer
+    # SEQ_MULTI_OF), clamped to the compiled bucket length.
+    var cap_padded = ((real_cap + 31) // 32) * 32
+    if cap_padded > cap_len:
+        cap_padded = cap_len
     var cap_pos = List[List[Int]]()
     for i in range(cap_len):
         var pl = List[Int]()
-        if i < real_cap:
+        if i < cap_padded:
+            # OneTrainer: sequential (i+1,0,0) for the WHOLE padded caption block,
+            # including the last-row-repeat rows in [valid_cap, cap_padded).
             pl.append(i + 1); pl.append(0); pl.append(0)
         else:
+            # Rows [cap_padded, cap_len): OneTrainer batch-padding (masked out
+            # there). Positioned (0,0,0); see header note on the masking gap.
             pl.append(0); pl.append(0); pl.append(0)
         cap_pos.append(pl^)
-    var x0 = cap_len + 1
+    # OneTrainer image offset = cap_len+1 where cap_len is the PADDED caption
+    # length (cap_padded), NOT the compiled bucket length.
+    var x0 = cap_padded + 1
     var x_pos = List[List[Int]]()
     for ih in range(ht):
         for iw in range(wt):

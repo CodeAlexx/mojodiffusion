@@ -17,12 +17,16 @@
 #   - Flow-match recipe (qwenimage.rs:1093-1099):
 #       x_t = (1 - sigma)*latent + sigma*noise   (note: opposite sign to Flux)
 #       target = noise - latent
-#   - Timestep: sigmoid(N(0,1)) then apply_qwen_shift (shift=3.0 from config).
+#   - Timestep: OneTrainer DISCRETE (BaseQwenSetup + ModelSetupNoiseMixin
+#       _get_timestep_discrete + ModelSetupFlowMatchingMixin _add_noise_discrete):
+#       idx = int(sigmoid(N(0,1)) * 1000 * shift_remap);  shift=1.0 -> identity.
+#       sigma = (idx+1)/1000  (blend);  model_t = idx/1000  (transformer input).
 #   - out_ch = 64 (latent channels; proj_out [64,D]; target [N_IMG, 64]).
 #   - ROPE: 3-axis interleaved, axes=(16,56,56), theta=10000.
 #
-# Recipe (configs/qwenimage.json): lr=1e-4, rank=16, alpha=16,
-#   timestep_shift=3.0, clip_grad_norm=1.0.
+# Recipe (configs/qwenimage.json, matching OneTrainer "#qwen LoRA 24GB" preset):
+#   lr=3e-4, rank=16, alpha=1.0 (scale=1/16), timestep_shift=1.0,
+#   lr_warmup_steps=200 (constant scheduler), clip_grad_norm=1.0.
 #
 # MEMORY: 60 * ~648 MB BF16/FP8 blocks + resident base (~tiny) + LoRA + optimizer.
 # Block-swap streams one block at a time. A fixed-sigma smoke mode confirms
@@ -53,7 +57,7 @@ from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 from std.time import perf_counter_ns
-from std.os import listdir
+from std.os import listdir, makedirs
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -78,10 +82,15 @@ from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
 from serenitymojo.models.dit.qwenimage_dit import (
     QwenImageConfig, build_qwenimage_rope_tables,
 )
+from serenitymojo.training.qwenimage_sample_resident import (
+    qwenimage_sample_resident, qwenimage_decode_packed_to_png,
+)
 from serenitymojo.offload.qwenimage_plan import build_qwenimage_offload_plan
 from serenitymojo.offload.plan import OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
-from serenitymojo.training.schedule import sample_timestep_logit_normal
+from serenitymojo.training.schedule import (
+    sample_timestep_discrete_qwen, DiscreteTimestep,
+)
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
@@ -144,6 +153,26 @@ comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/qwenima
 comptime DEFAULT_RUN_STEPS = 5
 comptime DEFAULT_CACHE_DIR = "/home/alex/datasets/qwenimage_cache_512"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/qwenimage_lora"
+
+# ── sample-during-training (v1; qwenimage_sample_resident) ────────────────────
+# SAMPLE_STEPS / SAMPLE_CFG : denoise loop length + true-CFG scale (sampler
+#   defaults 30 / 4.0, matching qwenimage_sample_cli.mojo STEPS/CFG).
+# SAMPLE_SEED : base RNG seed for the t=1 packed init noise (per-step deterministic).
+# DEFAULT_VAE_DIR : fallback Qwen VAE dir if train_cfg.vae is empty (the config's
+#   "vae" field is the source of truth; see configs/qwenimage.json).
+# Conditioning v1 = the step's cached caption embeds (COND) + zeros (UNCOND); the
+#   trainer has no in-tree Qwen2.5-VL encoder to encode an arbitrary sample prompt.
+comptime SAMPLE_STEPS = 30
+comptime SAMPLE_CFG = Float32(4.0)
+comptime SAMPLE_SEED = UInt64(0xC4_303A_5A91)
+comptime DEFAULT_VAE_DIR = "/home/alex/.serenity/models/checkpoints/qwen-image-2512/vae"
+
+# ── VAE latent geometry for the 512px bucket (patch=2) ────────────────────────
+# unpatchify needs (channels, height, width, patch). The trainer's packed latent
+# is [N_IMG=1024, IN_CH=64]; IN_CH = LAT_C(16) * patch(2) * patch(2). The VAE input
+# is [1, 16, LAT_H*2, LAT_W*2] = [1,16,64,64] -> tiled-decode -> [1,3,512,512].
+comptime SAMPLE_LAT_C = 16              # VAE latent channels (out_channels)
+comptime SAMPLE_PATCH = 2               # patch_size (config.json)
 
 
 def _is_nonnegative_int(s: String) -> Bool:
@@ -392,6 +421,56 @@ def _build_silu_temb(
 #  for training stores the pack_latents output, not the raw VAE latent.)
 
 
+# ── _qwen_run_sample — one sample-during-training image ───────────────────────
+#   cond text    : the current step's cached caption embeds (v1; see header of
+#                  qwenimage_sample_resident.mojo).
+#   uncond text  : a zeroed [N_TXT*TXT_CH] vector (true-CFG empty cond).
+#   init noise   : packed gaussian [N_IMG*IN_CH], seed = SAMPLE_SEED + step (the
+#                  same Box-Muller PCG the train loop draws noise with).
+#   denoise      : qwenimage_sample_resident (frozen base + streamed blocks + live
+#                  LoRA; true-CFG flow-match Euler).
+#   decode+write : qwenimage_decode_packed_to_png -> <samples_dir>/step_<N>.png.
+# Fail-loud: any raise propagates (no silent skip), matching the trainer's
+# fail-loud cadence contract.
+def _qwen_run_sample(
+    base: QwenOffloadBase,
+    mut loader: TurboPlannedLoader,
+    lora: QwenLoraSet,
+    cond_txt: List[Float32],     # [N_TXT*TXT_CH] — the step's cached caption embeds
+    cos_h: List[Float32],
+    sin_h: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
+    vae_dir: String,
+    samples_dir: String,
+    step: Int,
+    ctx: DeviceContext,
+) raises:
+    # UNCOND: zeroed text features (same dtype/shape as cond_txt).
+    var uncond_txt = List[Float32]()
+    for _ in range(Int(N_TXT) * Int(TXT_CH)):
+        uncond_txt.append(Float32(0.0))
+
+    var init_noise = _host_noise(Int(N_IMG) * Int(IN_CH), SAMPLE_SEED + UInt64(step))
+
+    var latent = qwenimage_sample_resident[H, Dh, N_IMG, N_TXT, S](
+        base, loader, lora,
+        cond_txt.copy(), uncond_txt^, init_noise^,
+        cos_h.copy(), sin_h.copy(),
+        norm_out_w, norm_out_b,
+        SAMPLE_STEPS, SAMPLE_CFG,
+        Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), Int(TIMESTEP_DIM),
+        EPS, ctx,
+    )
+
+    var out_path = samples_dir + String("/step_") + String(step) + String(".png")
+    qwenimage_decode_packed_to_png[
+        N_IMG, ROPE_H, ROPE_W, SAMPLE_LAT_C, SAMPLE_PATCH, IN_CH
+    ](
+        latent, vae_dir, out_path, ctx,
+    )
+    print("[QwenImage-lora] sample step=", step, " -> ", out_path)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -447,7 +526,7 @@ def main() raises:
     print("  cache:", cache_dir)
 
     if should_sample_completed_step(sample_cadence, 0):
-        print("[cadence] step 0 sample due; Qwen validation sampler is not wired in this bounded loop")
+        print("[cadence] step 0 sample due; fires after the first completed step (sampler is wired)")
     var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
     print("[cadence] next sample completed_step=", next_sample)
     if train_cfg.only_cache:
@@ -536,6 +615,18 @@ def main() raises:
         b_absum_init += _absum(lora.dbl[i].b)
     print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
 
+    # ── sample-during-training setup ─────────────────────────────────────────
+    # Sampling is WIRED (see _qwen_run_sample): denoise the CURRENT base + streamed
+    # blocks + LIVE LoRA -> Qwen VAE tiled-decode -> <LORA_DIR>/samples/step_<N>.png.
+    # Conditioning v1 = the firing step's cached caption embeds (COND) + zeros (UNCOND).
+    var sample_vae_dir = String(DEFAULT_VAE_DIR)
+    if train_cfg.vae != String(""):
+        sample_vae_dir = train_cfg.vae.copy()
+    var samples_dir = String(LORA_DIR) + String("/samples")
+    makedirs(samples_dir, exist_ok=True)
+    print("[cadence] sample-during-training WIRED -> ", samples_dir,
+          " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG, " vae=", sample_vae_dir, ")")
+
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
@@ -543,13 +634,28 @@ def main() raises:
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
 
-        # ── timestep ──
+        # ── timestep (OneTrainer DISCRETE: idx -> sigma & model_t) ──
+        # OneTrainer discretizes: idx = int(sigmoid(N)*1000*shift_remap); then
+        #   sigma   = (idx+1)/1000  (noise/latent blend, _add_noise_discrete)
+        #   model_t = idx/1000      (transformer timestep input; *1000 internally)
+        # The blend coefficient (sigma) and the embedding input (model_t) DIFFER
+        # by one quantum — this is the divergence being fixed.
         var sigma: Float32
+        var model_t: Float32
         var step_seed = UInt64(1) if FIXED_SIGMA_SMOKE else UInt64(k)
         if FIXED_SIGMA_SMOKE:
-            sigma = FIXED_SIGMA_VAL
+            # discretize the fixed smoke sigma the same way (0.5 -> idx=499):
+            var smoke_idx = Int(FIXED_SIGMA_VAL * Float32(1000.0))
+            if smoke_idx >= 1000:
+                smoke_idx = 999
+            sigma = Float32(Float64(smoke_idx + 1) / 1000.0)
+            model_t = Float32(Float64(smoke_idx) / 1000.0)
         else:
-            sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, train_cfg.timestep_shift)
+            var dts = sample_timestep_discrete_qwen(
+                SEED_BASE + step_seed, train_cfg.timestep_shift, 1000
+            )
+            sigma = dts.sigma
+            model_t = dts.model_t
 
         # ── load / synthesize tokens ──
         var img_tokens = List[Float32]()   # [N_IMG, IN_CH]
@@ -562,8 +668,9 @@ def main() raises:
             var latent_h = latent_cache.to_host_bf16(ctx)
             for i in range(len(latent_h)):
                 img_tokens.append(latent_h[i].cast[DType.float32]())
-            # txt embed may be stored as "t5_embed" or "txt_embed"
-            var txt_cache = _load_cache_preserving_dtype(cst, String("txt_embed"), ctx)
+            # txt embed cache key = "text_embedding" (the OT/producer key; matches
+            # ernie/anima/sd35 producers). Latent key "latent" already matches.
+            var txt_cache = _load_cache_preserving_dtype(cst, String("text_embedding"), ctx)
             var txt_flat = txt_cache.to_host_bf16(ctx)
             var txt_seq = len(txt_flat) // Int(TXT_CH)
             for r in range(Int(N_TXT)):
@@ -590,8 +697,10 @@ def main() raises:
             target.append(noise[i] - img_tokens[i])
 
         # ── silu_temb_h: frozen time_text_embed output [1, D] ──
+        # Use model_t (= idx/1000), the OneTrainer transformer timestep input,
+        # NOT sigma (= (idx+1)/1000, the blend coefficient).
         var silu_temb_h = _build_silu_temb(
-            sigma,
+            model_t,
             te_lin1_w, te_lin1_b, te_lin2_w, te_lin2_b,
             ctx,
         )
@@ -668,8 +777,22 @@ def main() raises:
             print(
                 "[cadence] sample due at completed_step=", k,
                 " sample_file=", sample_cadence.sample_definition_file_name,
-                " (Qwen validation sampler not wired in this bounded trainer)",
             )
+            # Sample from the CURRENT frozen base + streamed blocks + LIVE LoRA.
+            # v1 conditioning: this step's cached caption embeds (txt_tokens) as
+            # COND, zeros as UNCOND (see qwenimage_sample_resident.mojo header).
+            # Skip if there is no real cache — synthetic txt_tokens are all-zeros and
+            # would render a degenerate sample.
+            if have_cache and len(files) > 0:
+                _qwen_run_sample(
+                    base, loader, lora, txt_tokens.copy(),
+                    cos_h.copy(), sin_h.copy(),
+                    norm_out_w, norm_out_b,
+                    sample_vae_dir, samples_dir, k, ctx,
+                )
+            else:
+                print("[QwenImage-lora] sample skipped step=", k,
+                      " (no cache; synthetic zero conditioning)")
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)

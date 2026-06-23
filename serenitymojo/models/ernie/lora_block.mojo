@@ -48,11 +48,11 @@ from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import gelu_exact
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_halfsplit_full
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa_nomask, sdpa
 from serenitymojo.ops.tensor_algebra import reshape_owned, reshape_in_place, mul, add, mul_scalar
 from serenitymojo.ops.norm_backward import rms_norm_backward, rms_norm_backward_dx
 from serenitymojo.ops.activation_backward import gelu_exact_backward
-from serenitymojo.ops.attention_backward import sdpa_backward
+from serenitymojo.ops.attention_backward import sdpa_backward, sdpa_backward_masked, SdpaGrads
 from serenitymojo.ops.elementwise_backward import modulate_backward
 from serenitymojo.ops.rope_struct_backward import (
     gate_residual_backward, rope_halfsplit_full_backward,
@@ -75,6 +75,57 @@ def _add_lists(a: List[Float32], b: List[Float32]) -> List[Float32]:
     for i in range(len(a)):
         o.append(a[i] + b[i])
     return o^
+
+
+# ── ERNIE text-pad attention mask (mirrors transformer_ernie_image.py:393-401) ─
+# OneTrainer's ErnieImageTransformer2DModel builds a per-key bool mask
+#   [ones(N_img), arange(Tmax) < text_lens]
+# (True=attend, False=mask out), broadcast over query rows and heads, so PADDED
+# TEXT KEYS contribute nothing to attention. Token order is IMAGE-first then
+# TEXT-second (S = N_IMG + N_TXT). Here `real_len` is the per-sample real token
+# count; key columns j in [N_IMG, N_IMG+real_len) stay (text), j in
+# [N_IMG+real_len, S) are padded text and get -1e4 (the additive form of the
+# bool mask). Image columns [0, N_IMG) are never masked. The mask is the SAME
+# for every query row and every head (no causality), so the host list is
+# heads*S*S floats: 0.0 where attend, -1e4 where padded text.
+#
+# Two consumers, two tensor shapes from the ONE host list (Tensor.from_host
+# casts F32->dtype): the forward `sdpa` wants [1,H,S,S] in q's compute dtype;
+# `sdpa_backward_masked` wants [H*S, S] F32. Built once per step in the stack
+# and threaded to every block (constant across the 36 blocks).
+def _ernie_text_pad_mask_host(
+    heads: Int, S: Int, n_img: Int, real_len: Int
+) -> List[Float32]:
+    var neg = Float32(-1.0e4)
+    var first_pad = n_img + real_len   # first padded-text key column
+    var data = List[Float32]()
+    for _hh in range(heads):
+        for _i in range(S):
+            for j in range(S):
+                if j >= first_pad:
+                    data.append(neg)           # padded text key: blocked
+                else:
+                    data.append(Float32(0.0))  # image + real text: attend
+    return data^
+
+
+def build_ernie_text_pad_mask_fwd(
+    heads: Int, S: Int, n_img: Int, real_len: Int,
+    dtype: STDtype, ctx: DeviceContext,
+) raises -> Tensor:
+    """Forward additive mask [1, H, S, S] in `dtype` (q's compute dtype) for
+    `sdpa`. Masks padded-text key columns [n_img+real_len, S)."""
+    var data = _ernie_text_pad_mask_host(heads, S, n_img, real_len)
+    return Tensor.from_host(data^, [1, heads, S, S], dtype, ctx)
+
+
+def build_ernie_text_pad_mask_bwd(
+    heads: Int, S: Int, n_img: Int, real_len: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    """Backward additive mask [H*S, S] F32 for `sdpa_backward_masked`. Same
+    masked columns as the forward mask (per-head, broadcast over B)."""
+    var data = _ernie_text_pad_mask_host(heads, S, n_img, real_len)
+    return Tensor.from_host(data^, [heads * S, S], STDtype.F32, ctx)
 
 
 # Adapter forward contribution on x [M,in] -> [M,out] (host list in/out).
@@ -429,6 +480,7 @@ def ernie_block_lora_forward_device_tensor[
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
+    text_pad_mask: Optional[TArc] = None,  # [1,H,S,S] additive, q dtype; None=full attn
 ) raises -> ErnieBlockForwardLoraTensor:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
 
@@ -458,7 +510,14 @@ def ernie_block_lora_forward_device_tensor[
     var q_rope = rope_halfsplit_full(q_rms, cos, sin, ctx)
     var k_rope = rope_halfsplit_full(k_rms, cos, sin, ctx)
 
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    # OneTrainer masks padded TEXT keys (transformer_ernie_image.py:393-421); the
+    # additive [1,H,S,S] mask makes those columns contribute ~0 to softmax. When
+    # absent (None) this is bit-identical to the previous unmasked path.
+    var att: Tensor
+    if text_pad_mask:
+        att = sdpa[1, S, H, Dh](q_rope, k_rope, v, text_pad_mask.value()[], scale, ctx)
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
     var att_flat = reshape_owned(att^, [S, D])
 
     var no_bias_o = Optional[Tensor](None)
@@ -749,6 +808,7 @@ def ernie_block_lora_backward_device_tensors[
     cos: Tensor, sin: Tensor,
     D: Int, F: Int, eps: Float32,
     ctx: DeviceContext,
+    text_pad_mask_f32: Optional[TArc] = None,  # [H*S,S] F32; None=unmasked SDPA bwd
 ) raises -> ErnieBlockLoraTensorBackward:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
 
@@ -803,9 +863,18 @@ def ernie_block_lora_backward_device_tensors[
     )
 
     reshape_in_place(pg_o.d_x, [1, S, H, Dh])
-    var sb = sdpa_backward[1, S, H, Dh](
-        saved.q_rope[], saved.k_rope[], saved.v[], pg_o.d_x, scale, ctx
-    )
+    # Same text-pad mask the forward applied (additive, after scale, before
+    # softmax — sdpa_backward_masked recomputes the forward with it). None=plain.
+    var sb: SdpaGrads
+    if text_pad_mask_f32:
+        sb = sdpa_backward_masked[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v[],
+            text_pad_mask_f32.value()[], pg_o.d_x, scale, ctx
+        )
+    else:
+        sb = sdpa_backward[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v[], pg_o.d_x, scale, ctx
+        )
     var d_q_rms = rope_halfsplit_full_backward(sb.d_q, cos, sin, ctx)
     var d_k_rms = rope_halfsplit_full_backward(sb.d_k, cos, sin, ctx)
 

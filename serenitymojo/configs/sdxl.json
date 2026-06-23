@@ -18,19 +18,25 @@
   "transformer_depth_output": [10, 10, 10, 2, 2, 2, 0, 0, 0],
   "time_embed_dim": 1280,
 
-  "learning_rate": 1e-4,
+  "learning_rate": 3e-4,
   "lora_rank": 16,
-  "lora_alpha": 16,
+  "lora_alpha": 1.0,
   "timestep_shift": 1.0,
   "max_grad_norm": 1.0,
   "max_steps": 3000,
   "save_every": 500,
   "sample_every": 250,
 
+  "lr_scheduler": "constant",
+  "lr_warmup_steps": 200,
+
   "beta_start": 0.00085,
   "beta_end": 0.012,
   "num_train_timesteps": 1000,
   "prediction_type": "epsilon",
 
-  "optimizer": { "eps": 1e-8, "weight_decay": 0.0, "beta1": 0.9, "beta2": 0.999 }
+  "text_encoder": { "train": false, "dropout_probability": 0.0 },
+  "text_encoder_2": { "train": false, "dropout_probability": 0.0 },
+
+  "optimizer": { "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
 }

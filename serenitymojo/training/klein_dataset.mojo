@@ -51,6 +51,18 @@ comptime MASK_KEY = "text_mask"
 # pipeline_z_image_controlnet.py:550-551).
 comptime CONTROL_KEY = "control_latent"
 
+# ── L2P (Z-Image pixel-space) cache keys ──────────────────────────────────────
+# The L2P precompute (EDv2 prepare_l2p.rs / ai-toolkit FakeVAE path) stores RAW
+# PIXELS + Qwen3 caption features, NOT VAE latents / padded text embeddings:
+#   pixel:     F32 [3, H, W]      RGB normalized to [-1, 1]   (rank-3, NO batch axis)
+#   cap_feats: F32 [1, seq, 2560] Qwen3 hidden states, seq VARIES per sample
+#                                 (already trimmed to valid tokens — NO text_mask)
+# These DELIBERATELY differ from LATENT_KEY/TEXT_KEY/MASK_KEY: the L2P reader
+# (L2PCache below) must NOT reuse KleinCache (which asserts latent rank-4 +
+# loads text_embedding/text_mask and would abort on the first peek).
+comptime PIXEL_KEY = "pixel"
+comptime CAP_FEATS_KEY = "cap_feats"
+
 
 # ── prepare: write one cache sample ───────────────────────────────────────────
 
@@ -291,3 +303,66 @@ def _sort_strings(mut xs: List[String]):
             xs[j + 1] = xs[j]
             j -= 1
         xs[j + 1] = key
+
+
+# ── L2P (Z-Image pixel-space) cache reader ────────────────────────────────────
+# Reads the {pixel, cap_feats} contract from prepare_l2p.rs / ai-toolkit, NOT
+# the {latent, text_embedding, text_mask} Klein contract. Separate struct so the
+# Klein reader's rank-4 latent assertion never runs on an L2P cache.
+
+
+@fieldwise_init
+struct L2PSample(Movable):
+    var pixel: Tensor       # [3, H, W]    F32, normalized to [-1, 1]
+    var cap_feats: Tensor   # [1, seq, 2560] F32 Qwen3 hidden (seq valid tokens)
+
+
+@fieldwise_init
+struct L2PBucketKey(Copyable, Movable):
+    var c: Int      # pixel channels (3)
+    var h: Int      # pixel H
+    var w: Int      # pixel W
+    var seq: Int    # cap_feats token length (VARIES per sample)
+
+
+struct L2PCache(Movable):
+    var files: List[String]   # absolute paths, sorted (reproducible order)
+    var dir: String
+
+    def __init__(out self, dir: String) raises:
+        var raw = listdir(dir)
+        var fs = List[String]()
+        for i in range(len(raw)):
+            if raw[i].endswith(".safetensors"):
+                fs.append(dir + String("/") + raw[i])
+        if len(fs) == 0:
+            raise Error(String("L2PCache: no .safetensors in ") + dir)
+        _sort_strings(fs)
+        self.files = fs^
+        self.dir = dir
+
+    def count(self) -> Int:
+        return len(self.files)
+
+    def peek_key(self, index: Int, ctx: DeviceContext) raises -> L2PBucketKey:
+        """Header-only peek -> (pixel_c, pixel_h, pixel_w, cap_seq). pixel is
+        rank-3 [3,H,W]; cap_feats is rank-3 [1,seq,2560]. NO mask key."""
+        var st = SafeTensors.open(self.files[index % len(self.files)])
+        var pi = st.tensor_info(String(PIXEL_KEY))
+        var ci = st.tensor_info(String(CAP_FEATS_KEY))
+        var ps = pi.shape.copy()
+        var cs = ci.shape.copy()
+        if len(ps) != 3:
+            raise Error("L2PCache.peek_key: pixel must be rank-3 [3,H,W]")
+        if len(cs) != 3:
+            raise Error("L2PCache.peek_key: cap_feats must be rank-3 [1,seq,2560]")
+        return L2PBucketKey(ps[0], ps[1], ps[2], cs[1])
+
+    def load(self, index: Int, ctx: DeviceContext) raises -> L2PSample:
+        """Load sample `index` (wrapped) -> (pixel [3,H,W], cap_feats [1,seq,2560])
+        on GPU at their stored dtype (F32)."""
+        var path = self.files[index % len(self.files)]
+        var st = SafeTensors.open(path)
+        var pixel = _load_tensor(st, String(PIXEL_KEY), ctx)
+        var cap = _load_tensor(st, String(CAP_FEATS_KEY), ctx)
+        return L2PSample(pixel^, cap^)

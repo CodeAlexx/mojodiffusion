@@ -84,7 +84,7 @@ MOJO_GATES: tuple[tuple[Path, str, str], ...] = (
         "opens qwen_train_ref_step000 and adapter dumps and validates the OneTrainer tensor contract",
     ),
     (
-        REPO / "serenitymojo/training/qwen_train_control_wiring_smoke.mojo",
+        REPO / "../serenity-trainer/smoke/qwen_train_control_wiring_smoke.mojo",
         "source-only",
         "validates config/sample/save/offload controls; does not consume the dump",
     ),
@@ -213,8 +213,8 @@ QWEN_TRAIN_SPEED_EVIDENCE_GROUPS = (
 
 TRAIN_SPEED_CLAIM_SCAN_FILES: tuple[Path, ...] = (
     REPO / "OT_MOJO_PORT_REMAINING.md",
-    REPO / "serenitymojo/training/train_qwenimage_real.mojo",
-    REPO / "serenitymojo/training/qwen_train_control_wiring_smoke.mojo",
+    REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_qwenimage_real.mojo",
+    REPO / "../serenity-trainer/smoke/qwen_train_control_wiring_smoke.mojo",
     REPO / "serenitymojo/training/onetrainer_product_run.mojo",
     REPO / "serenitymojo/training/onetrainer_product_run_smoke.mojo",
     REPO / "serenitymojo/models/qwenimage/parity/qwen_train_ref_artifact_smoke.mojo",

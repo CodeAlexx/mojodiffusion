@@ -16,7 +16,7 @@ from typing import Any
 
 
 REPO = Path(__file__).resolve().parents[1]
-TRAIN_LOOP = REPO / "serenitymojo/training/train_zimage_real.mojo"
+TRAIN_LOOP = REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_zimage_real.mojo"
 GENERATOR = REPO / "serenitymojo/pipeline/zimage_generate.mojo"
 SUPERVISOR = REPO / "serenitymojo/training/zimage_sample_supervisor.mojo"
 DEFAULT_BINARY = "/tmp/zimage_generate_prod"

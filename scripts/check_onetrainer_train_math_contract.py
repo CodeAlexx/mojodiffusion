@@ -44,7 +44,7 @@ TRAIN_CONFIG = REPO / "serenitymojo/training/train_config.mojo"
 TRAIN_LOOP_POLICY = REPO / "serenitymojo/training/onetrainer_train_loop_policy.mojo"
 UPDATE_CONSUMER_GATE = REPO / "scripts/check_chroma_sdxl_mojo_update_consumers.py"
 ZERO_LR_CONSUMER_GATE = REPO / "scripts/check_zero_lr_mojo_state_init_consumers.py"
-TRAIN_LOOPS = tuple(sorted((REPO / "serenitymojo/training").glob("train_*_real.mojo")))
+TRAIN_LOOPS = tuple(sorted((REPO / "../serenity-trainer/src/serenity_trainer/trainer").glob("train_*_real.mojo")))
 
 TARGET_TRAIN_LOOPS = {
     "train_qwenimage_real.mojo",

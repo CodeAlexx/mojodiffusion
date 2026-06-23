@@ -23,7 +23,7 @@ LORA_STACK = REPO / "serenitymojo/models/anima/anima_stack_lora.mojo"
 BLOCK = REPO / "serenitymojo/models/anima/block.mojo"
 LORA_BLOCK = REPO / "serenitymojo/models/anima/lora_block.mojo"
 
-TRAIN_FILES = tuple(sorted((REPO / "serenitymojo/training").glob("train_anima*.mojo")))
+TRAIN_FILES = tuple(sorted((REPO / "../serenity-trainer/src/serenity_trainer/trainer").glob("train_anima*.mojo")))
 PIPELINE_FILES = tuple(sorted((REPO / "serenitymojo/pipeline").glob("anima*.mojo")))
 MODEL_FILES = tuple(sorted((REPO / "serenitymojo/models/anima").glob("*.mojo")))
 

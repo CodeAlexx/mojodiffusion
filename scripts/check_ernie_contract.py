@@ -37,11 +37,11 @@ TRAIN_REF_ADAPTERS = TRAIN_REF_DIR / f"{TRAIN_REF_PREFIX}_step000_adapters.safet
 WEIGHTS = REPO / "serenitymojo/models/ernie/weights.mojo"
 STACK = REPO / "serenitymojo/models/ernie/ernie_stack.mojo"
 LORA_STACK = REPO / "serenitymojo/models/ernie/ernie_stack_lora.mojo"
-TRAIN = REPO / "serenitymojo/training/train_ernie_real.mojo"
+TRAIN = REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_ernie_real.mojo"
 
 MOJO_GATES: tuple[tuple[Path, str, str], ...] = (
     (
-        REPO / "serenitymojo/training/ernie_train_control_wiring_smoke.mojo",
+        REPO / "../serenity-trainer/smoke/ernie_train_control_wiring_smoke.mojo",
         "source-only",
         "validates Ernie config/sample/save/offload controls; does not replay the one-step dump",
     ),

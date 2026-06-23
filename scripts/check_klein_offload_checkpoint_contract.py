@@ -20,7 +20,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 ONETRAINER = Path("/home/alex/OneTrainer")
 
-TRAIN = REPO / "serenitymojo/training/train_klein_real.mojo"
+TRAIN = REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_klein_real.mojo"
 TRAIN_CONFIG = REPO / "serenitymojo/training/train_config.mojo"
 TRAIN_CONFIG_READER = REPO / "serenitymojo/io/train_config_reader.mojo"
 TRAIN_LOOP_POLICY = REPO / "serenitymojo/training/onetrainer_train_loop_policy.mojo"
@@ -32,7 +32,7 @@ PLAN_SMOKE = REPO / "serenitymojo/offload/plan_smoke.mojo"
 PLANNED_LOADER_SMOKE = REPO / "serenitymojo/offload/planned_loader_smoke.mojo"
 RESIDENCY_SMOKE = REPO / "serenitymojo/offload/residency_smoke.mojo"
 TURBO_SLOTS_SMOKE = REPO / "serenitymojo/offload/turbo_slots_smoke.mojo"
-KLEIN_CONTROL_SMOKE = REPO / "serenitymojo/training/klein_train_control_wiring_smoke.mojo"
+KLEIN_CONTROL_SMOKE = REPO / "../serenity-trainer/smoke/klein_train_control_wiring_smoke.mojo"
 KLEIN_CADENCE = REPO / "serenitymojo/training/train_klein_cadence.mojo"
 TRAIN_REF_SMOKE = REPO / "serenitymojo/models/klein/parity/klein_train_ref_artifact_smoke.mojo"
 ADAMW_STATE_INIT_MOJO_SMOKE = (

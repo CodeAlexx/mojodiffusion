@@ -58,7 +58,7 @@ TARGETS: tuple[LoopTarget, ...] = (
     LoopTarget(
         key="klein",
         label="Klein",
-        path=TRAINING / "train_klein_real.mojo",
+        path=REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_klein_real.mojo",
         cache_patterns=(
             PatternSpec(
                 "cache-derived flow-match target leaves device as host F32",
@@ -71,7 +71,7 @@ TARGETS: tuple[LoopTarget, ...] = (
     LoopTarget(
         key="chroma",
         label="Chroma",
-        path=TRAINING / "train_chroma_real.mojo",
+        path=REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_chroma_real.mojo",
         cache_patterns=(
             PatternSpec(
                 "cache tensor loader returns host F32 compute list",
@@ -88,7 +88,7 @@ TARGETS: tuple[LoopTarget, ...] = (
     LoopTarget(
         key="flux1",
         label="Flux.1",
-        path=TRAINING / "train_flux_real.mojo",
+        path=REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_flux_real.mojo",
         cache_patterns=(
             PatternSpec(
                 "cache tensor loader returns host F32 compute list",
@@ -101,7 +101,7 @@ TARGETS: tuple[LoopTarget, ...] = (
     LoopTarget(
         key="sd35",
         label="SD3.5",
-        path=TRAINING / "train_sd35_real.mojo",
+        path=REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_sd35_real.mojo",
         cache_patterns=(
             PatternSpec(
                 "cache tensor leaves device as host F32 during SD3.5 assembly",
@@ -121,7 +121,7 @@ TARGETS: tuple[LoopTarget, ...] = (
     LoopTarget(
         key="zimage",
         label="Z-Image",
-        path=TRAINING / "train_zimage_real.mojo",
+        path=REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_zimage_real.mojo",
         cache_patterns=(
             PatternSpec(
                 "cache tensors stage through host F32 step-math lists",

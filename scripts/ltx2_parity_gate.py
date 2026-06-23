@@ -599,7 +599,7 @@ GATES: tuple[Gate, ...] = (
                 "-lm",
                 "-Xlinker",
                 "-lcuda",
-                "serenitymojo/training/train_ltx2_real.mojo",
+                "/home/alex/serenity-trainer/src/serenity_trainer/trainer/train_ltx2_real.mojo",
                 "-o",
                 "/tmp/train_ltx2_real",
             ),

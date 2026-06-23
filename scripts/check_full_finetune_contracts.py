@@ -97,7 +97,7 @@ TARGETS: tuple[Target, ...] = (
         aliases=("qwen", "qwenimage", "qwen-image", "qwen_image", "qwen image"),
         setup_file="QwenFineTuneSetup.py",
         model_types=("QWEN",),
-        train_loops=(TRAINING_DIR / "train_qwenimage_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_qwenimage_real.mojo",),
     ),
     Target(
         key="flux1",
@@ -105,7 +105,7 @@ TARGETS: tuple[Target, ...] = (
         aliases=("flux", "flux1", "flux.1", "flux-dev", "flux-fill", "flux fill"),
         setup_file="FluxFineTuneSetup.py",
         model_types=("FLUX_DEV_1", "FLUX_FILL_DEV_1"),
-        train_loops=(TRAINING_DIR / "train_flux_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_flux_real.mojo",),
     ),
     Target(
         key="flux2",
@@ -113,7 +113,7 @@ TARGETS: tuple[Target, ...] = (
         aliases=("flux2", "flux-2", "flux_2", "klein", "klein9b", "klein-9b"),
         setup_file="Flux2FineTuneSetup.py",
         model_types=("FLUX_2",),
-        train_loops=(TRAINING_DIR / "train_klein_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_klein_real.mojo",),
     ),
     Target(
         key="zimage",
@@ -121,7 +121,7 @@ TARGETS: tuple[Target, ...] = (
         aliases=("zimage", "z-image", "z_image"),
         setup_file="ZImageFineTuneSetup.py",
         model_types=("Z_IMAGE",),
-        train_loops=(TRAINING_DIR / "train_zimage_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_zimage_real.mojo",),
     ),
     Target(
         key="chroma",
@@ -129,7 +129,7 @@ TARGETS: tuple[Target, ...] = (
         aliases=("chroma", "chroma1", "chroma-1", "chroma_1"),
         setup_file="ChromaFineTuneSetup.py",
         model_types=("CHROMA_1",),
-        train_loops=(TRAINING_DIR / "train_chroma_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_chroma_real.mojo",),
     ),
     Target(
         key="sdxl",
@@ -140,7 +140,7 @@ TARGETS: tuple[Target, ...] = (
             "STABLE_DIFFUSION_XL_10_BASE",
             "STABLE_DIFFUSION_XL_10_BASE_INPAINTING",
         ),
-        train_loops=(TRAINING_DIR / "train_sdxl_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_sdxl_real.mojo",),
     ),
     Target(
         key="sd35",
@@ -148,7 +148,7 @@ TARGETS: tuple[Target, ...] = (
         aliases=("sd35", "sd3.5", "sd3-5", "stable-diffusion-3.5"),
         setup_file="StableDiffusion3FineTuneSetup.py",
         model_types=("STABLE_DIFFUSION_35",),
-        train_loops=(TRAINING_DIR / "train_sd35_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_sd35_real.mojo",),
     ),
     Target(
         key="ernie",
@@ -156,7 +156,7 @@ TARGETS: tuple[Target, ...] = (
         aliases=("ernie", "ernie-image", "ernie_image"),
         setup_file="ErnieFineTuneSetup.py",
         model_types=("ERNIE",),
-        train_loops=(TRAINING_DIR / "train_ernie_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_ernie_real.mojo",),
     ),
     Target(
         key="anima",
@@ -164,7 +164,7 @@ TARGETS: tuple[Target, ...] = (
         aliases=("anima",),
         setup_file="AnimaFineTuneSetup.py",
         model_types=("ANIMA",),
-        train_loops=(TRAINING_DIR / "train_anima_real.mojo",),
+        train_loops=(REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_anima_real.mojo",),
         reference_root=ONETRAINER_ANIMA_REF,
     ),
 )

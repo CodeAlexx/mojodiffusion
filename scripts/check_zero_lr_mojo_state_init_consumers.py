@@ -50,7 +50,7 @@ SPECS: dict[str, ModelSpec] = {
         artifact_consumer=REPO
         / "serenitymojo/models/qwenimage/parity/qwen_train_ref_artifact_smoke.mojo",
         update_sources=(
-            REPO / "serenitymojo/training/train_qwenimage_real.mojo",
+            REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_qwenimage_real.mojo",
             REPO / "serenitymojo/models/qwenimage/qwenimage_stack_lora.mojo",
             REPO / "serenitymojo/training/train_step.mojo",
         ),
@@ -65,7 +65,7 @@ SPECS: dict[str, ModelSpec] = {
         artifact_consumer=REPO
         / "serenitymojo/models/ernie/parity/ernie_train_ref_artifact_smoke.mojo",
         update_sources=(
-            REPO / "serenitymojo/training/train_ernie_real.mojo",
+            REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_ernie_real.mojo",
             REPO / "serenitymojo/models/ernie/ernie_stack_lora.mojo",
             REPO / "serenitymojo/training/train_step.mojo",
         ),
@@ -80,7 +80,7 @@ SPECS: dict[str, ModelSpec] = {
         artifact_consumer=REPO
         / "serenitymojo/models/anima/parity/anima_train_step_ref_artifact_smoke.mojo",
         update_sources=(
-            REPO / "serenitymojo/training/train_anima_real.mojo",
+            REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_anima_real.mojo",
             REPO / "serenitymojo/models/anima/anima_stack_lora.mojo",
             REPO / "serenitymojo/training/train_step.mojo",
         ),

@@ -17,7 +17,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 WEIGHTS = REPO / "serenitymojo/models/qwenimage/weights.mojo"
 STACK = REPO / "serenitymojo/models/qwenimage/qwenimage_stack_lora.mojo"
-TRAIN = REPO / "serenitymojo/training/train_qwenimage_real.mojo"
+TRAIN = REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_qwenimage_real.mojo"
 SMOKE = REPO / "serenitymojo/models/qwenimage/parity/qwen_fp8_loader_smoke.mojo"
 
 

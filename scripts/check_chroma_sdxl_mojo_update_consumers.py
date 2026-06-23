@@ -56,9 +56,9 @@ SPECS: dict[str, ModelSpec] = {
         oracle_wrapper=REPO / "scripts/check_chroma_adapter_update_replay.py",
         artifact_consumer=REPO
         / "serenitymojo/models/chroma/parity/chroma_train_ref_artifact_smoke.mojo",
-        train_loop=REPO / "serenitymojo/training/train_chroma_real.mojo",
+        train_loop=REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_chroma_real.mojo",
         update_sources=(
-            REPO / "serenitymojo/training/train_chroma_real.mojo",
+            REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_chroma_real.mojo",
             REPO / "serenitymojo/models/flux/flux_stack_lora.mojo",
             REPO / "serenitymojo/training/train_step.mojo",
         ),
@@ -74,9 +74,9 @@ SPECS: dict[str, ModelSpec] = {
         oracle_wrapper=REPO / "scripts/check_sdxl_adapter_update_replay.py",
         artifact_consumer=REPO
         / "serenitymojo/models/sdxl/parity/sdxl_train_ref_artifact_smoke.mojo",
-        train_loop=REPO / "serenitymojo/training/train_sdxl_real.mojo",
+        train_loop=REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_sdxl_real.mojo",
         update_sources=(
-            REPO / "serenitymojo/training/train_sdxl_real.mojo",
+            REPO / "../serenity-trainer/src/serenity_trainer/trainer/train_sdxl_real.mojo",
             REPO / "serenitymojo/models/sdxl/sdxl_unet_stack_lora.mojo",
             REPO / "serenitymojo/training/train_step.mojo",
         ),

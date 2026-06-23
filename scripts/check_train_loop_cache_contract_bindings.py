@@ -117,15 +117,15 @@ class LoopReport:
 
 
 TARGETS: tuple[LoopTarget, ...] = (
-    LoopTarget("Qwen", TRAINING_DIR / "train_qwenimage_real.mojo"),
-    LoopTarget("Ernie", TRAINING_DIR / "train_ernie_real.mojo"),
-    LoopTarget("Anima", TRAINING_DIR / "train_anima_real.mojo"),
-    LoopTarget("Klein", TRAINING_DIR / "train_klein_real.mojo"),
-    LoopTarget("Z-Image", TRAINING_DIR / "train_zimage_real.mojo"),
-    LoopTarget("Chroma", TRAINING_DIR / "train_chroma_real.mojo"),
-    LoopTarget("Flux.1", TRAINING_DIR / "train_flux_real.mojo"),
-    LoopTarget("SD3.5", TRAINING_DIR / "train_sd35_real.mojo"),
-    LoopTarget("SDXL", TRAINING_DIR / "train_sdxl_real.mojo"),
+    LoopTarget("Qwen", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_qwenimage_real.mojo"),
+    LoopTarget("Ernie", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_ernie_real.mojo"),
+    LoopTarget("Anima", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_anima_real.mojo"),
+    LoopTarget("Klein", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_klein_real.mojo"),
+    LoopTarget("Z-Image", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_zimage_real.mojo"),
+    LoopTarget("Chroma", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_chroma_real.mojo"),
+    LoopTarget("Flux.1", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_flux_real.mojo"),
+    LoopTarget("SD3.5", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_sd35_real.mojo"),
+    LoopTarget("SDXL", REPO / "../serenity-trainer/src/serenity_trainer/trainer" / "train_sdxl_real.mojo"),
 )
 
 TARGET_ALIASES: dict[str, str] = {

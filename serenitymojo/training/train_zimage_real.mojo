@@ -23,8 +23,10 @@
 #   9. zimage_stack_lora_backward -> LoRA grads; grad_norm = L2; clip(1.0)
 #  10. zimage_lora_adamw_step_main_only; print shared progress display
 #
-# Recipe scalars (train_zimage.rs released-preset defaults):
-#   lr=3e-4, rank=16, alpha=1.0, timestep_shift=1.0, clip_grad_norm=1.0,
+# Recipe scalars (ALL read from the JSON config — NO hardcoded recipe, 2026-06-22):
+#   lr / lora_alpha / timestep_shift / max_grad_norm / seed come from TrainConfig.
+#   rank is comptime RANK (LoRA tensor shape) but the config value is authoritative
+#   and asserted equal (validate_zimage_train_config). Fixed Z-Image arch constants:
 #   VAE_SHIFT=0.1159, VAE_SCALE=0.3611, NUM_TRAIN_TIMESTEPS=1000.
 #
 # HARD DTYPE RULE (2026-06-02): Z-Image training is BF16/BP16 for base model
@@ -288,16 +290,28 @@ comptime NUM_CR = 2
 comptime MAIN_DEPTH = 30
 comptime OVERFIT_PROBE = False
 
-# ── recipe (train_zimage.rs released-preset) ─────────────────────────────────
+# ── recipe ───────────────────────────────────────────────────────────────────
+# CONFIG-BASED RULE (2026-06-22): all RUNTIME training scalars are read from the
+# JSON config (TrainConfig) — NO hardcoded recipe params. The previously-comptime
+# LR / ALPHA / TIMESTEP_SHIFT / SEED_BASE / CLIP_GRAD_NORM are now sourced from
+# train_cfg.{lr, lora_alpha, timestep_shift, seed, max_grad_norm}:
+#   - LR was already config-driven at the optimizer step (ot_lr_for_optimizer_step).
+#   - ALPHA flows into build_zimage_lora_set / load_state as a runtime scale arg.
+#   - TIMESTEP_SHIFT feeds sample_timestep_logit_normal per step.
+#   - SEED_BASE (formerly fixed 42) is the trainer's master seed; the three
+#     deterministic streams keep their distinct multipliers:
+#       sigma  : seed + step      noise: seed*7919 + step
+#       cap-drop: seed*31 + step  (inside caption_dropout_pick)
+#   - CLIP_GRAD_NORM feeds _clip per step.
+# RANK stays COMPTIME (a LoRA tensor-shape param into build_zimage_lora_set);
+# validate_zimage_train_config asserts cfg.lora_rank == RANK (config authoritative,
+# loud on mismatch — sdxl validate_* pattern). VAE_SHIFT/VAE_SCALE and
+# NUM_TRAIN_TIMESTEPS are fixed Z-Image arch constants (not user recipe), so they
+# remain comptime.
 comptime RANK = 16
-comptime ALPHA = Float32(1.0)
-comptime LR = Float32(3.0e-4)
-comptime TIMESTEP_SHIFT = Float32(1.0)
 comptime VAE_SHIFT = Float32(0.1159)
 comptime VAE_SCALE = Float32(0.3611)
 comptime NUM_TRAIN_TIMESTEPS = 1000
-comptime CLIP_GRAD_NORM = Float32(1.0)
-comptime SEED_BASE = UInt64(42)
 
 # T1.A loss levers (TIER1_PARITY_CAMPAIGN_2026-06-11.md): RUNTIME-dispatched
 # via training/levers.mojo levers_loss_grad off TrainConfig keys
@@ -467,21 +481,29 @@ def validate_zimage_train_config(cfg: TrainConfig) raises:
         raise Error(String("Z-Image config mlp_hidden ") + String(cfg.mlp_hidden) + String(" != F ") + String(F))
     if not _close_f32(Float32(cfg.rope_theta), ROPE_THETA):
         raise Error(String("Z-Image config rope_theta ") + String(cfg.rope_theta) + String(" != ") + String(ROPE_THETA))
+    # RANK is a comptime LoRA tensor-shape param; the config value is
+    # AUTHORITATIVE and must match the compiled shape (sdxl validate_* pattern).
     if cfg.lora_rank != RANK:
         raise Error(
             String("Z-Image trainer is compiled for lora_rank=")
             + String(RANK)
-            + String("; parsed ")
+            + String("; config lora_rank=")
             + String(cfg.lora_rank)
+            + String(" (RANK is a comptime shape; set the config to ")
+            + String(RANK)
+            + String(" or recompile with this rank)")
         )
-    if not _close_f32(cfg.lora_alpha, ALPHA):
-        raise Error("Z-Image trainer lora_alpha does not match compiled constant")
-    if not _close_f32(cfg.lr, LR, Float32(1.0e-9)):
-        raise Error("Z-Image trainer learning_rate does not match compiled constant")
-    if not _close_f32(cfg.timestep_shift, TIMESTEP_SHIFT):
-        raise Error("Z-Image trainer timestep_shift does not match compiled constant")
-    if not _close_f32(cfg.max_grad_norm, CLIP_GRAD_NORM):
-        raise Error("Z-Image trainer max_grad_norm does not match compiled constant")
+    # CONFIG-BASED: lora_alpha / learning_rate / timestep_shift / max_grad_norm
+    # are now RUNTIME scalars read straight from the config (NOT pinned to a
+    # compiled recipe). Range-validate only — fail loud on nonsense values.
+    if not (cfg.lora_alpha > Float32(0.0)):
+        raise Error("Z-Image trainer lora_alpha must be > 0")
+    if not (cfg.lr > Float32(0.0)) or cfg.lr > Float32(1.0e-2):
+        raise Error("Z-Image trainer learning_rate must be in (0, 1e-2]")
+    if not (cfg.timestep_shift > Float32(0.0)):
+        raise Error("Z-Image trainer timestep_shift must be > 0")
+    if cfg.max_grad_norm <= Float32(0.0):
+        raise Error("Z-Image trainer max_grad_norm must be > 0")
     # T1.C: zimage wires the levers optimizer dispatch (training/levers.mojo
     # T1.C section), so the supported non-AdamW optimizers (ADAFACTOR /
     # SCHEDULE_FREE_ADAMW) must pass the shared ADAMW-only loop-policy check:
@@ -1004,17 +1026,17 @@ def _train_one_step_bucket[
     if valid_cap <= 0 or valid_cap > CAP_LEN_B:
         raise Error("train_zimage_real: dispatched sample to wrong text bucket")
 
-    var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+    var sigma = sample_timestep_logit_normal(train_cfg.seed + step_seed, train_cfg.timestep_shift)
     # T1.D caption dropout (default-off p<=0 never draws): shared levers pick,
     # seed stream SEED_BASE*31+step_seed (distinct from sigma/noise streams).
-    var cap_drop = caption_dropout_pick(step_seed, SEED_BASE, train_cfg.caption_dropout_prob)
+    var cap_drop = caption_dropout_pick(step_seed, train_cfg.seed, train_cfg.caption_dropout_prob)
     var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
     if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
         sigma_idx = NUM_TRAIN_TIMESTEPS - 1
     var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
     var t_value = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
 
-    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + step_seed)
+    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, train_cfg.seed * UInt64(7919) + step_seed)
     var latent_inputs = _build_latent_step_inputs[LAT_H_B, LAT_W_B](
         s.latent, noise_lat, sig, ctx,
     )
@@ -1190,7 +1212,7 @@ def _train_one_step_bucket[
         )
     var t_bwd = perf_counter_ns()
 
-    var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
+    var gn_before = _clip(grads, train_cfg.max_grad_norm, TRAIN_ADAPTER_START, n_adapters)
     var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
     if levers_optimizer_active(train_cfg):
         # T1.C optimizer lever (default-off): host adafactor/schedule-free
@@ -1305,17 +1327,17 @@ def _train_one_step_bucket_capture[
     if valid_cap <= 0 or valid_cap > CAP_LEN_B:
         raise Error("train_zimage_real: dispatched sample to wrong text bucket")
 
-    var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
+    var sigma = sample_timestep_logit_normal(train_cfg.seed + step_seed, train_cfg.timestep_shift)
     # T1.D caption dropout (default-off p<=0 never draws): shared levers pick,
     # seed stream SEED_BASE*31+step_seed (distinct from sigma/noise streams).
-    var cap_drop = caption_dropout_pick(step_seed, SEED_BASE, train_cfg.caption_dropout_prob)
+    var cap_drop = caption_dropout_pick(step_seed, train_cfg.seed, train_cfg.caption_dropout_prob)
     var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
     if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
         sigma_idx = NUM_TRAIN_TIMESTEPS - 1
     var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
     var t_value = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
 
-    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + step_seed)
+    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, train_cfg.seed * UInt64(7919) + step_seed)
     var latent_inputs = _build_latent_step_inputs[LAT_H_B, LAT_W_B](
         s.latent, noise_lat, sig, ctx,
     )
@@ -1462,7 +1484,7 @@ def _train_one_step_bucket_capture[
         b.phase += 1
     cap_buckets[bidx] = b^
 
-    var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
+    var gn_before = _clip(grads, train_cfg.max_grad_norm, TRAIN_ADAPTER_START, n_adapters)
     var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
     if levers_optimizer_active(train_cfg):
         # T1.C optimizer lever (default-off): host step + resident dev_p
@@ -1568,15 +1590,15 @@ def _full_ft_step[
     if valid_cap <= 0 or valid_cap > CAP_LEN_B:
         raise Error("zimage full-FT: dispatched sample to wrong text bucket")
 
-    var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
-    var cap_drop = caption_dropout_pick(step_seed, SEED_BASE, train_cfg.caption_dropout_prob)
+    var sigma = sample_timestep_logit_normal(train_cfg.seed + step_seed, train_cfg.timestep_shift)
+    var cap_drop = caption_dropout_pick(step_seed, train_cfg.seed, train_cfg.caption_dropout_prob)
     var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
     if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
         sigma_idx = NUM_TRAIN_TIMESTEPS - 1
     var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
     var t_value = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
 
-    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + step_seed)
+    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, train_cfg.seed * UInt64(7919) + step_seed)
     var latent_inputs = _build_latent_step_inputs[LAT_H_B, LAT_W_B](
         s.latent, noise_lat, sig, ctx,
     )
@@ -1929,15 +1951,15 @@ def _cn_step[
         raise Error("zimage controlnet: dispatched sample to wrong text bucket")
 
     # prologue: byte-identical host math to _train_one_step_bucket
-    var sigma = sample_timestep_logit_normal(SEED_BASE + step_seed, TIMESTEP_SHIFT)
-    var cap_drop = caption_dropout_pick(step_seed, SEED_BASE, train_cfg.caption_dropout_prob)
+    var sigma = sample_timestep_logit_normal(train_cfg.seed + step_seed, train_cfg.timestep_shift)
+    var cap_drop = caption_dropout_pick(step_seed, train_cfg.seed, train_cfg.caption_dropout_prob)
     var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
     if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
         sigma_idx = NUM_TRAIN_TIMESTEPS - 1
     var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
     var t_value = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
 
-    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + step_seed)
+    var noise_lat = _host_noise(LAT_C * LAT_H_B * LAT_W_B, train_cfg.seed * UInt64(7919) + step_seed)
     var latent_inputs = _build_latent_step_inputs[LAT_H_B, LAT_W_B](
         s.latent, noise_lat, sig, ctx,
     )
@@ -2147,7 +2169,12 @@ def _zimage_controlnet_main(
     # LoRA ops unconditionally — unlike the full-FT hand-chain, it cannot take
     # the [1,1] zero-placeholder set) sees real shapes. Its adapter grads are
     # DISCARDED (nothing steps them; base + adapters frozen).
-    var frozen_lora = build_zimage_lora_set(NUM_NR, NUM_CR, MAIN_DEPTH, D, F, RANK, ALPHA)
+    # controlnet path: the frozen LoRA is a B==0 shape placeholder for the *_cn
+    # graph backward; rank is the fixed comptime shape and alpha is irrelevant
+    # (grads discarded). alpha read from config for uniformity (no hardcoded scalar).
+    var frozen_lora = build_zimage_lora_set(
+        NUM_NR, NUM_CR, MAIN_DEPTH, D, F, RANK, train_cfg.lora_alpha
+    )
     var zero_dev = zimage_lora_set_to_device(frozen_lora, ctx)
 
     var places = zimage_cn_places(train_cfg.controlnet_layers, MAIN_DEPTH)
@@ -2467,12 +2494,16 @@ def main() raises:
     var cap_pad_h = aux.cap_pad_token[].to_host(ctx)
     print("[load] learned x/cap pad tokens loaded")
 
-    # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
-    var lora = build_zimage_lora_set(NUM_NR, NUM_CR, MAIN_DEPTH, D, F, RANK, ALPHA)
+    # ── LoRA set (B=0 init -> identity at step 0). rank/alpha from config
+    # (lora_rank == comptime RANK, asserted by validate_zimage_train_config). ──
+    var lora = build_zimage_lora_set(
+        NUM_NR, NUM_CR, MAIN_DEPTH, D, F, train_cfg.lora_rank, train_cfg.lora_alpha
+    )
     if resume_state != String("") and resume_state != String("-"):
         print("[ZImage-lora] loading resume state:", resume_state)
         lora = load_zimage_lora_main_only_state(
-            NUM_NR, NUM_CR, MAIN_DEPTH, RANK, ALPHA, D, F, resume_state, ctx,
+            NUM_NR, NUM_CR, MAIN_DEPTH, train_cfg.lora_rank, train_cfg.lora_alpha,
+            D, F, resume_state, ctx,
         )
     var n_adapters = (NUM_NR + NUM_CR + MAIN_DEPTH) * ZIMAGE_SLOTS
     print("[lora] adapters:", TRAIN_ADAPTER_COUNT, "trainable main-layer adapters;",
@@ -2571,27 +2602,39 @@ def main() raises:
             var vc0 = _cache_valid_cap(cache, slot0, ctx)
             var vc1 = _cache_valid_cap(cache, slot1, ctx)
             var vc = vc0 if vc0 > vc1 else vc1
-            if key0.h == 64 and key0.w == 64:
-                if vc <= 224:
-                    var rb2a = _train_one_step_bucket_b2[64, 64, 224](
-                        k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
-                        nr_blocks, cr_blocks, main_blocks, lora, ema, opt_state, lev_opt, resident_dev, n_adapters,
-                        final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                        train_cfg, train_start, ctx, slab,
-                    )
-                    loss = rb2a.loss
-                elif vc <= 256:
-                    var rb2b = _train_one_step_bucket_b2[64, 64, 256](
-                        k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
-                        nr_blocks, cr_blocks, main_blocks, lora, ema, opt_state, lev_opt, resident_dev, n_adapters,
-                        final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
-                        train_cfg, train_start, ctx, slab,
-                    )
-                    loss = rb2b.loss
-                else:
-                    raise Error("train_zimage_real b2: caption too long for 256 bucket")
-            else:
-                raise Error("train_zimage_real b2: only the 64x64 bucket is wired")
+            # COMPTIME-GENERATED b2 dispatch over the SAME integer 512px/align-64
+            # ladder x cap-len {224, 256} as the batch-1 path below (mirrors the
+            # 2637-2657 loop; _train_one_step_bucket_b2 + its fwd/bwd are
+            # comptime-generic over [LAT_H, LAT_W, CAP] — N_IMG/N_TXT/S derive
+            # from the comptime shape, no 64-hardcode). The 64x64 arm reaches the
+            # identical [64,64,224]/[64,64,256] instantiations as before; non-64
+            # buckets (e.g. eri 72x56) now wire too. NOTE: the CUDA-graph capture
+            # is batch-1-only by design — every b2 bucket runs uncaptured here.
+            var b2_loss = Float32(0.0)
+            var b2_dispatched = False
+            comptime for bi in range(ZIMAGE_T2D_LADDER_LEN):
+                comptime X100_BI = ZIMAGE_T2D_LADDER_X100[bi]
+                comptime LH_BI = zimage_t2d_lat_h(X100_BI)
+                comptime LW_BI = zimage_t2d_lat_w(X100_BI)
+                if not b2_dispatched and key0.h == LH_BI and key0.w == LW_BI:
+                    b2_dispatched = True
+                    var b2_cap_done = False
+                    comptime for ci in range(ZIMAGE_T2D_N_CAPS):
+                        comptime CAP_CI = ZIMAGE_T2D_CAP_LENS[ci]
+                        if not b2_cap_done and vc <= CAP_CI:
+                            b2_cap_done = True
+                            var rb2 = _train_one_step_bucket_b2[LH_BI, LW_BI, CAP_CI](
+                                k, run_steps, slot0, slot1, seed_a, seed_b, cache, aux,
+                                nr_blocks, cr_blocks, main_blocks, lora, ema, opt_state, lev_opt, resident_dev, n_adapters,
+                                final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                                train_cfg, train_start, ctx, slab,
+                            )
+                            b2_loss = rb2.loss
+                    if not b2_cap_done:
+                        raise Error("train_zimage_real b2: caption too long for 256-token production bucket")
+            if not b2_dispatched:
+                raise Error("train_zimage_real b2: unsupported Z-Image production bucket")
+            loss = b2_loss
         else:
             # T2.D follow-up: COMPTIME-GENERATED dispatch over the integer
             # 512px/align-64 ladder x the cap-len set {224, 256} — 14 arms
@@ -2874,12 +2917,12 @@ def _train_one_step_bucket_b2[
     ):
         raise Error("train_zimage_real b2: sample in wrong text bucket")
 
-    var sigma0 = sample_timestep_logit_normal(SEED_BASE + seed0, TIMESTEP_SHIFT)
-    var sigma1 = sample_timestep_logit_normal(SEED_BASE + seed1, TIMESTEP_SHIFT)
+    var sigma0 = sample_timestep_logit_normal(train_cfg.seed + seed0, train_cfg.timestep_shift)
+    var sigma1 = sample_timestep_logit_normal(train_cfg.seed + seed1, train_cfg.timestep_shift)
     # T1.D caption dropout: B2 draws per sample with each sample's OWN step
     # seed (2k / 2k+1), same stream derivation as the B1 path.
-    var cap_drop0 = caption_dropout_pick(seed0, SEED_BASE, train_cfg.caption_dropout_prob)
-    var cap_drop1 = caption_dropout_pick(seed1, SEED_BASE, train_cfg.caption_dropout_prob)
+    var cap_drop0 = caption_dropout_pick(seed0, train_cfg.seed, train_cfg.caption_dropout_prob)
+    var cap_drop1 = caption_dropout_pick(seed1, train_cfg.seed, train_cfg.caption_dropout_prob)
     var sigma_idx0 = Int(sigma0 * Float32(NUM_TRAIN_TIMESTEPS))
     var sigma_idx1 = Int(sigma1 * Float32(NUM_TRAIN_TIMESTEPS))
     if sigma_idx0 > NUM_TRAIN_TIMESTEPS - 1:
@@ -2891,8 +2934,8 @@ def _train_one_step_bucket_b2[
     var t_value0 = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx0) / Float32(NUM_TRAIN_TIMESTEPS)
     var t_value1 = Float32(NUM_TRAIN_TIMESTEPS - sigma_idx1) / Float32(NUM_TRAIN_TIMESTEPS)
 
-    var noise0 = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + seed0)
-    var noise1 = _host_noise(LAT_C * LAT_H_B * LAT_W_B, SEED_BASE * UInt64(7919) + seed1)
+    var noise0 = _host_noise(LAT_C * LAT_H_B * LAT_W_B, train_cfg.seed * UInt64(7919) + seed0)
+    var noise1 = _host_noise(LAT_C * LAT_H_B * LAT_W_B, train_cfg.seed * UInt64(7919) + seed1)
     var li0 = _build_latent_step_inputs[LAT_H_B, LAT_W_B](s0.latent, noise0, sig0, ctx)
     var li1 = _build_latent_step_inputs[LAT_H_B, LAT_W_B](s1.latent, noise1, sig1, ctx)
 
@@ -3044,7 +3087,7 @@ def _train_one_step_bucket_b2[
         )
     var t_bwd = perf_counter_ns()
 
-    var gn_before = _clip(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, n_adapters)
+    var gn_before = _clip(grads, train_cfg.max_grad_norm, TRAIN_ADAPTER_START, n_adapters)
     var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
     if levers_optimizer_active(train_cfg):
         # T1.C optimizer lever (default-off): host step + resident dev_p sync

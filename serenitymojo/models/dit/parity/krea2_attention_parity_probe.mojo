@@ -68,7 +68,7 @@ def main() raises:
     # ── Run the attention op with the EXACT weights ──────────────────────────
     var y_out = krea2_attention[L, HEADS, KVHEADS, HEADDIM](
         x, wq, wk, wv, gate_w, wo, qnorm_scale, knorm_scale,
-        tables[0], tables[1], Optional[Tensor](None), ctx,
+        tables[0], tables[1], Optional[Tensor](None), Optional[Int](None), ctx,
     )
     var res = ParityHarness(0.999).compare(y_out, y_ref, ctx)
     print("krea2_attention parity:", res)

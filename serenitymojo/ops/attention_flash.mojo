@@ -264,6 +264,84 @@ def sdpa_flash_train_fwd_rect[
     return SdpaFlashFwd(o^, o_pad^, q_pad^, k_pad^, v_pad^, stats^)
 
 
+def sdpa_flash_fwd_padmask[
+    B: Int, S_BUF: Int, H: Int, Dh: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    real_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashFwd:
+    """cuDNN flash SDPA forward on a PRE-PADDED [B,S_BUF,H,Dh] BF16 buffer whose
+    only the first `real_len` sequence positions are real. cuDNN masks the
+    [real_len:S_BUF] pad rows internally via the real-length args it passes to the
+    shim (the SAME bidirectional key-padding mask `_mask(keep)` produces: pad KEYS
+    excluded from every query; pad QUERY rows attend to nothing). This is the
+    INFERENCE replacement for the explicit additive build_krea2_text_mask path at
+    krea2's main-block self-attention site A (the 1024² SDPA bottleneck).
+
+    REQUIRES S_BUF to be 128-aligned (krea2's LPAD is a 256-multiple → no extra
+    cuDNN padding/copies). q/k/v BF16 (cuDNN is bf16-only; this is the reference's
+    OWN backend, SDPBackend.CUDNN_ATTENTION). Returns SdpaFlashFwd; use `.o`
+    [B,S_BUF,H,Dh] (keep the struct alive — `.o` views `.o_pad`). Inference: the
+    bwd `stats` are present but unused. FAIL-LOUD on any nonzero shim rc."""
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 or v.dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_fwd_padmask: q/k/v must be BF16")
+    # S_BUF must be 128-aligned so the buffer == the cuDNN padded length and real_len
+    # is the only mask source (krea2's LPAD is always a 256-mult). RUNTIME-checked (not
+    # comptime) so callers that instantiate krea2_attention at a non-128 L for the
+    # TILED path — which never reaches this fn — still compile.
+    if (S_BUF % 128) != 0:
+        raise Error("sdpa_flash_fwd_padmask: S_BUF must be 128-aligned")
+    if real_len < 1 or real_len > S_BUF:
+        raise Error("sdpa_flash_fwd_padmask: real_len out of [1, S_BUF]")
+
+    # S_BUF is already 128-aligned -> _pad_seq is a no-op (S_PAD == S_BUF).
+    var q_pad = _pad_seq[B, S_BUF, S_BUF](q, H, Dh, ctx)
+    var k_pad = _pad_seq[B, S_BUF, S_BUF](k, H, Dh, ctx)
+    var v_pad = _pad_seq[B, S_BUF, S_BUF](v, H, Dh, ctx)
+
+    var o_buf = ctx.enqueue_create_buffer[DType.uint8](B * S_BUF * H * Dh * 2)
+    ctx.enqueue_memset[DType.uint8](o_buf, 0)
+    var o_shape: List[Int] = [B, S_BUF, H, Dh]
+    var o_pad = Tensor(o_buf^, o_shape^, STDtype.BF16)
+
+    var stats_buf = ctx.enqueue_create_buffer[DType.uint8](B * H * S_BUF * 4)
+    ctx.enqueue_memset[DType.uint8](stats_buf, 0)
+    var stats_shape: List[Int] = [B, H, S_BUF, 1]
+    var stats = Tensor(stats_buf^, stats_shape^, STDtype.F32)
+
+    var qs = _strides_bhnd(S_BUF, H, Dh)
+    var ks = _strides_bhnd(S_BUF, H, Dh)
+    var vs = _strides_bhnd(S_BUF, H, Dh)
+    var os_ = _strides_bhnd(S_BUF, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bf16_train_fwd", Int32](
+        _dev_ptr(q_pad), _dev_ptr(k_pad), _dev_ptr(v_pad),
+        _dev_ptr(o_pad), _dev_ptr(stats),
+        Int32(B), Int32(H), Int32(S_BUF), Int32(S_BUF), Int32(Dh),
+        scale,
+        qs, ks, vs, os_,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0),                          # causal = false
+        Int32(real_len), Int32(real_len),  # REAL lengths -> pad-row mask [real_len:S_BUF]
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_fwd_padmask: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S_BUF=" + String(S_BUF)
+            + " real_len=" + String(real_len)
+            + " H=" + String(H) + " Dh=" + String(Dh) + ")"
+        )
+
+    # o_pad IS the [B,S_BUF,H,Dh] output (S_BUF already aligned); the [real_len:S_BUF]
+    # rows are masked-out garbage the caller discards. Return o == o_pad view.
+    var o = _unpad_seq[B, S_BUF, S_BUF](o_pad, H, Dh, ctx)
+    return SdpaFlashFwd(o^, o_pad^, q_pad^, k_pad^, v_pad^, stats^)
+
+
 def sdpa_flash_backward[
     B: Int, S: Int, H: Int, Dh: Int
 ](

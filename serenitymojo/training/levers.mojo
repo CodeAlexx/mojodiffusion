@@ -231,9 +231,17 @@ from serenitymojo.training.adamw_schedulefree import (
 from serenitymojo.training.adamw8bit import (
     Adam8bitState, adam8bit_create_dynamic_map, adamw8bit_step,
 )
+from serenitymojo.training.automagic3 import (
+    Automagic3State, Automagic3Ctl,
+    automagic3_step_2d, automagic3_step_1d, automagic3_clamp_h,
+    automagic3_writeback_bf16_sr,
+    AUTOMAGIC3_DEFAULT_BETA2, AUTOMAGIC3_DEFAULT_EPS,
+    AUTOMAGIC3_DEFAULT_CLIP, AUTOMAGIC3_DEFAULT_H,
+)
 from serenitymojo.training.train_config import (
     TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
     TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_ADAMW_8BIT,
+    TRAIN_OPTIMIZER_AUTOMAGIC3,
 )
 
 # SimpleTuner "torch-adafactor" default_settings (optimizer_param.py:153-162)
@@ -269,12 +277,15 @@ def levers_optimizer_validate(cfg: TrainConfig, trainer_name: String) raises:
         return
     if cfg.optimizer == TRAIN_OPTIMIZER_ADAMW_8BIT:
         return
+    if cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
+        return
     raise Error(
         trainer_name
         + String(": optimizer tag ")
         + String(cfg.optimizer)
         + String(" has no levers dispatch; supported: ADAMW (default fused")
-        + String(" path), ADAMW_8BIT, ADAFACTOR, SCHEDULE_FREE_ADAMW")
+        + String(" path), ADAMW_8BIT, ADAFACTOR, SCHEDULE_FREE_ADAMW,")
+        + String(" AUTOMAGIC3")
     )
 
 
@@ -294,6 +305,8 @@ struct LeversOptimizerState(Movable):
     var a8: List[Adam8bitState]            # ADAMW_8BIT: [2*(end-start)]
     var a8_qmap_signed: List[Float32]      # ADAMW_8BIT: 256-entry m LUT
     var a8_qmap_unsigned: List[Float32]    # ADAMW_8BIT: 256-entry v LUT
+    var auto3: List[Automagic3State]       # AUTOMAGIC3: [2*(end-start)]
+    var auto3_ctl: Automagic3Ctl           # AUTOMAGIC3: optimizer-level shared lr
 
     def __init__(out self):
         self.initialized = False
@@ -306,6 +319,8 @@ struct LeversOptimizerState(Movable):
         self.a8 = List[Adam8bitState]()
         self.a8_qmap_signed = List[Float32]()
         self.a8_qmap_unsigned = List[Float32]()
+        self.auto3 = List[Automagic3State]()
+        self.auto3_ctl = Automagic3Ctl()
 
 
 def _levers_bf16_to_f32(p: List[BFloat16]) -> List[Float32]:
@@ -363,13 +378,31 @@ def _levers_optimizer_lazy_init(
         for i in range(start, end):
             st.a8.append(Adam8bitState(len(adapters[i].a)))
             st.a8.append(Adam8bitState(len(adapters[i].b)))
+    elif cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
+        # ai-toolkit Automagic3: HF-factored 2nd moment + sign-history vote.
+        # A is [rank, in_f], B is [out_f, rank] — both 2D factored. The shared
+        # adaptive lr is seeded ONCE from cfg.lr (the controller adapts away
+        # from it; step_lr is ignored). H = sign-history window (default 8).
+        var h = automagic3_clamp_h(AUTOMAGIC3_DEFAULT_H)
+        st.auto3_ctl.init_lr(Float64(cfg.lr))
+        # Seed the SR-dither RNG from cfg.seed (deterministic-given-config) so
+        # the bf16 stochastic-rounding writeback is reproducible run-to-run;
+        # mix a constant so it doesn't collide with other uses of cfg.seed.
+        st.auto3_ctl.seed_rng(cfg.seed ^ UInt64(0xA17031C3))
+        for i in range(start, end):
+            st.auto3.append(
+                Automagic3State(adapters[i].rank, adapters[i].in_f, h)
+            )
+            st.auto3.append(
+                Automagic3State(adapters[i].out_f, adapters[i].rank, h)
+            )
     else:
         raise Error(
             String("levers_optimizer_step: optimizer tag ")
             + String(cfg.optimizer)
             + String(" has no levers dispatch; supported: ADAMW (default")
             + String(" fused path), ADAMW_8BIT, ADAFACTOR,")
-            + String(" SCHEDULE_FREE_ADAMW")
+            + String(" SCHEDULE_FREE_ADAMW, AUTOMAGIC3")
         )
     st.kind = cfg.optimizer
     st.start = start
@@ -480,6 +513,43 @@ def levers_optimizer_step_host(
                 step_lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
             )
             _levers_writeback_bf16(adapters[i].b, pb)
+    elif cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
+        # ai-toolkit Automagic3 — the structural special case (landmine 3):
+        # ONE group-pooled adaptive lr. step_lr (the scheduler) is IGNORED;
+        # the controller self-adapts st.auto3_ctl.lr. Reset the per-step vote
+        # accumulators ONCE, run every A and B (each accumulates its
+        # |update|-weighted vote into the ctl and steps with the SHARED
+        # ctl.lr), then nudge the lr ONCE after the whole loop.
+        var beta2 = AUTOMAGIC3_DEFAULT_BETA2
+        if cfg.beta2 != Float32(0.0):
+            beta2 = Float64(cfg.beta2)
+        # automagic3 needs eps=1e-30 (NOT the AdamW cfg.eps=1e-8); keep the
+        # algorithm default — cfg.eps is the AdamW denom epsilon, wrong here.
+        var eps = AUTOMAGIC3_DEFAULT_EPS
+        var clip = AUTOMAGIC3_DEFAULT_CLIP
+        if cfg.optimizer_clip_threshold > Float32(0.0):
+            clip = Float64(cfg.optimizer_clip_threshold)
+        var wd = Float64(cfg.weight_decay)
+        st.auto3_ctl.reset_accum()
+        for i in range(start, end):
+            var idx = 2 * (i - start)
+            var pa = _levers_bf16_to_f32(adapters[i].a)
+            automagic3_step_2d(
+                pa, d_a[i], st.auto3[idx], beta2, eps, clip, wd, st.auto3_ctl
+            )
+            # STOCHASTIC ROUNDING writeback (NOT _levers_writeback_bf16's RNE):
+            # automagic3's reference mandates SR so sub-ULP updates at the small
+            # self-adapted lr keep moving the bf16 weight instead of stalling
+            # (B1). The dither stream lives in the ctl so it advances across the
+            # whole run.
+            automagic3_writeback_bf16_sr(adapters[i].a, pa, st.auto3_ctl.rng)
+            var pb = _levers_bf16_to_f32(adapters[i].b)
+            automagic3_step_2d(
+                pb, d_b[i], st.auto3[idx + 1], beta2, eps, clip, wd,
+                st.auto3_ctl,
+            )
+            automagic3_writeback_bf16_sr(adapters[i].b, pb, st.auto3_ctl.rng)
+        st.auto3_ctl.apply_vote()
     else:
         raise Error(
             String("levers_optimizer_step: optimizer tag ")

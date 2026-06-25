@@ -79,7 +79,7 @@ def main() raises:
         x, vec, mod_lin, prenorm_scale, postnorm_scale,
         wq, wk, wv, gate_w, wo, qnorm_scale, knorm_scale,
         mlp_gate_w, mlp_up_w, mlp_down_w,
-        tables[0], tables[1], Optional[Tensor](None), ctx,
+        tables[0], tables[1], Optional[Tensor](None), Optional[Int](None), ctx,
     )
     var res = ParityHarness(0.999).compare(y_out, y_ref, ctx)
     print("krea2_single_stream_block parity:", res)

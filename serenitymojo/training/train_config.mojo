@@ -72,6 +72,7 @@ comptime TRAIN_OPTIMIZER_PRODIGY = 5
 comptime TRAIN_OPTIMIZER_SGD = 6
 comptime TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW = 7
 comptime TRAIN_OPTIMIZER_ADAMW_8BIT = 8  # T2.A bnb block-wise 8-bit AdamW
+comptime TRAIN_OPTIMIZER_AUTOMAGIC3 = 9  # ai-toolkit adaptive (levers.mojo)
 
 comptime TRAIN_TIME_UNIT_EPOCH = 0
 comptime TRAIN_TIME_UNIT_STEP = 1
@@ -358,6 +359,7 @@ struct TrainConfig(Copyable, Movable):
     var train_modality: Int
     var lora_target_preset: Int
     var dataset_cache_dir: String
+    var dataset_path: String       # raw image+caption source dir (precache input)
     var require_cached_video_latents: Bool
     var require_cached_text_embeddings: Bool
     var require_cached_audio_latents: Bool
@@ -570,6 +572,7 @@ struct TrainConfig(Copyable, Movable):
             train_modality=TRAIN_MODALITY_VIDEO,
             lora_target_preset=LORA_TARGET_LEGACY_VIDEO_ATTN1,
             dataset_cache_dir=String(""),
+            dataset_path=String(""),
             require_cached_video_latents=False,
             require_cached_text_embeddings=False,
             require_cached_audio_latents=False,
@@ -664,6 +667,7 @@ struct TrainConfig(Copyable, Movable):
         enable_activation_offloading: Bool, layer_offload_fraction: Float64,
         adapter_algo: Int,
         train_modality: Int, lora_target_preset: Int, var dataset_cache_dir: String,
+        var dataset_path: String,
         require_cached_video_latents: Bool, require_cached_text_embeddings: Bool,
         require_cached_audio_latents: Bool, hot_loop_device_only: Bool,
         video_loss_weight: Float32, audio_loss_weight: Float32,
@@ -832,6 +836,7 @@ struct TrainConfig(Copyable, Movable):
         self.train_modality = train_modality
         self.lora_target_preset = lora_target_preset
         self.dataset_cache_dir = dataset_cache_dir^
+        self.dataset_path = dataset_path^
         self.require_cached_video_latents = require_cached_video_latents
         self.require_cached_text_embeddings = require_cached_text_embeddings
         self.require_cached_audio_latents = require_cached_audio_latents
@@ -931,6 +936,7 @@ struct TrainConfig(Copyable, Movable):
             or v == TRAIN_OPTIMIZER_SGD
             or v == TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW
             or v == TRAIN_OPTIMIZER_ADAMW_8BIT
+            or v == TRAIN_OPTIMIZER_AUTOMAGIC3
         )
 
     def optimizer_is_adamw(self) -> Bool:

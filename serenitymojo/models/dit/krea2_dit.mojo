@@ -52,11 +52,13 @@ from serenitymojo.ops.activations import swiglu as swiglu_op, sigmoid, gelu
 from serenitymojo.ops.tensor_algebra import (
     add, slice, reshape, mul, mul_scalar, transpose, concat, zeros_device,
 )
-from serenitymojo.ops.attention import sdpa_nomask, sdpa
+from serenitymojo.ops.attention import sdpa_nomask, sdpa, sdpa_tiled, sdpa_nomask_tiled
+from serenitymojo.ops.attention_flash import sdpa_flash_fwd_padmask, sdpa_flash_train_fwd
 from serenitymojo.ops.gqa_backward import repeat_kv_f32
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -632,7 +634,8 @@ def krea2_attention[L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int](
     knorm_scale: Tensor,   # [HEADDIM] F32  (QKNorm.knorm.scale)
     cos: Tensor,           # [L, HEADDIM/2]  per-token RoPE table (build_krea2_rope)
     sin: Tensor,           # [L, HEADDIM/2]
-    mask: Optional[Tensor],  # None, or additive [1, HEADS, L, L] (pad-to-256 mask)
+    mask: Optional[Tensor],  # None, or additive [1, HEADS, L, L] (tiled-path pad mask)
+    real_len: Optional[Int], # if set -> cuDNN flash padmask path (real seq len; L is the buffer)
     ctx: DeviceContext,
 ) raises -> Tensor:
     """Krea2 Attention forward (mmdit.py:212-228), b==1 inference.
@@ -701,28 +704,78 @@ def krea2_attention[L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int](
     var k_full = repeat_kv_f32(k_rot, L, kvheads, n_rep, headdim, ctx)  # F32 [1,L,heads,Dh]
     var v_full = repeat_kv_f32(vf, L, kvheads, n_rep, headdim, ctx)     # F32 [1,L,heads,Dh]
 
-    # 6) SDPA in F32 (Dh=128 -> math-mode). mask present -> masked path (additive
-    # [1,HEADS,L,L]); else sdpa_nomask. The mask must match q's dtype (F32 here).
+    # 6) SDPA. THREE paths (Dh=128):
+    #  (a) cuDNN FLASH (real_len set): tensor-core fused flash on bf16 q/k/v — the
+    #      reference's OWN backend (SDPBackend.CUDNN_ATTENTION). This is the 1024²
+    #      speedup (the tiled F32 SDPA was nsys-measured at 54% of GPU time). cuDNN
+    #      masks the [real_len:L] pad rows internally (replacing the additive mask).
+    #      bf16 q/k/v (RNE-cast the F32 carry): cuDNN's bf16 handles the near-one-hot
+    #      regime like the reference, so the F32 carry — a MATH-mode workaround — is
+    #      not needed here.
+    #  (b) TILED + mask (no real_len): online-softmax F32, additive pad mask.
+    #  (c) TILED nomask (no mask, no real_len): the per-op gates (chunk 3).
     var scale = Float32(1.0) / sqrt(Float32(headdim))
     var attn_f32: Tensor
-    if mask:
+    if real_len:
+        # cuDNN flash on bf16 q/k/v; mask the [real_len:L] pad rows via real_len.
+        var q_bf = torch_f32_to_bf16_rne(q_rot, ctx)      # [1,L,heads,Dh] bf16
+        var k_bf = torch_f32_to_bf16_rne(k_full, ctx)
+        var v_bf = torch_f32_to_bf16_rne(v_full, ctx)
+        var fwd = sdpa_flash_fwd_padmask[1, L, HEADS, HEADDIM](
+            q_bf, k_bf, v_bf, real_len.value(), scale, ctx
+        )
+        attn_f32 = cast_tensor(fwd.o, STDtype.F32, ctx)   # bf16 [1,L,heads,Dh] -> F32 for step 7
+    elif mask:
         var mask_f32 = cast_tensor(mask.value(), STDtype.F32, ctx)
-        attn_f32 = sdpa[1, L, HEADS, HEADDIM](q_rot, k_full, v_full, mask_f32, scale, ctx)
+        attn_f32 = sdpa_tiled[1, L, HEADS, HEADDIM](q_rot, k_full, v_full, mask_f32, scale, ctx)
     else:
-        attn_f32 = sdpa_nomask[1, L, HEADS, HEADDIM](q_rot, k_full, v_full, scale, ctx)
-    # 7) Merge heads, sigmoid-gate (on wo's INPUT), then wo. Keep the attention
-    # output in F32 through the gate-mul into wo's input: block-0's attn output
-    # reaches magnitude ~190 on the outlier channels (ch 2569/3389) where bf16
-    # storage resolution (~1.5) loses precision; staying F32 here matches the
-    # reference's internal precision more closely. wo's matmul accumulates F32
-    # regardless; the F32 input avoids the lossy bf16 round of the 190-mag value.
+        attn_f32 = sdpa_nomask_tiled[1, L, HEADS, HEADDIM](q_rot, k_full, v_full, scale, ctx)
+    # 7) Match torch's dtype flow EXACTLY, with torch's ROUND-TO-NEAREST-EVEN at
+    # every bf16 boundary. torch: F.sdpa accumulates F32 and casts to bf16 ONCE at
+    # its output; then `* sigmoid(gate)` (bf16) and `wo` (bf16 matmul, F32 accum)
+    # each produce a bf16 result. Mojo's NATIVE cast[bfloat16]() differs from torch
+    # RNE by up to one bf16 quantum — at the block-0 attn-output magnitude ~190 on
+    # the outlier channels ch2569/3389 (quantum ~1.5) that is the ~0.8%/element
+    # residual. We use torch_f32_to_bf16_rne at each bf16 store so the rounding
+    # MATCHES torch (we do NOT keep F32 past sdpa — that would over-precise vs the
+    # bf16 reference). For an F32 model (x.dtype F32) the RNE path is skipped.
     var merge_shape = List[Int]()
     merge_shape.append(1); merge_shape.append(L); merge_shape.append(features)
     var merged_f32 = reshape(attn_f32, merge_shape^, ctx)   # [1, L, features] F32
-    var g_f32 = cast_tensor(sigmoid(gate, ctx), STDtype.F32, ctx)  # sigmoid(gate) F32
-    var gated_f32 = mul(merged_f32, g_f32, ctx)            # F32 SDPA-out * sigmoid(gate)
-    var gated = cast_tensor(gated_f32, x.dtype(), ctx)     # back to activation dtype for wo
-    return linear(gated, wo, None, ctx)                    # [1, L, features]
+    var is_bf16 = x.dtype() == STDtype.BF16
+
+    # sdpa-output -> bf16 (RNE).
+    var attn: Tensor
+    if is_bf16:
+        attn = torch_f32_to_bf16_rne(merged_f32, ctx)
+    else:
+        attn = cast_tensor(merged_f32, x.dtype(), ctx)
+
+    # gate-mul: attn * sigmoid(gate) -> bf16 (RNE on the product store).
+    var g = sigmoid(gate, ctx)                              # bf16 sigmoid(gate)
+    var gated: Tensor
+    if is_bf16:
+        var gated_f32 = mul(
+            cast_tensor(attn, STDtype.F32, ctx),
+            cast_tensor(g, STDtype.F32, ctx),
+            ctx,
+        )                                                  # F32 product
+        gated = torch_f32_to_bf16_rne(gated_f32, ctx)      # RNE store
+    else:
+        gated = mul(attn, g, ctx)
+
+    # wo: bf16 matmul (F32 accum) -> bf16 (RNE on the output store). Run linear in
+    # F32 (same F32 accum; inputs are the already-rounded bf16 values upcast) and
+    # RNE-cast the result, so the output rounding matches torch.
+    if is_bf16:
+        var wo_f32 = linear(
+            cast_tensor(gated, STDtype.F32, ctx),
+            cast_tensor(wo, STDtype.F32, ctx),
+            None, ctx,
+        )                                                  # F32 matmul result
+        return torch_f32_to_bf16_rne(wo_f32, ctx)          # [1, L, features] bf16 RNE
+    else:
+        return linear(gated, wo, None, ctx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -766,7 +819,8 @@ def krea2_single_stream_block[L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int](
     qnorm_scale: Tensor, knorm_scale: Tensor,                        # attn QKNorm [128] F32
     mlp_gate_w: Tensor, mlp_up_w: Tensor, mlp_down_w: Tensor,        # SwiGLU
     cos: Tensor, sin: Tensor,                                        # rope table [L, headdim/2]
-    mask: Optional[Tensor],                                          # None or additive [1,HEADS,L,L]
+    mask: Optional[Tensor],                                          # None or additive [1,HEADS,L,L] (tiled path)
+    real_len: Optional[Int],                                         # if set -> cuDNN flash padmask path
     ctx: DeviceContext,
 ) raises -> Tensor:
     """Krea2 SingleStreamBlock forward (mmdit.py:328-337), b==1.
@@ -774,8 +828,9 @@ def krea2_single_stream_block[L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int](
     Composes chunk-2 (DoubleSharedModulation, RMSNorm, SwiGLU) + chunk-3
     (Attention). vec is the timestep-derived [1, 6*features] modulation vector;
     its 6 raw chunks gate the two AdaLN-Zero residual branches. mask: None, or the
-    additive [1,HEADS,L,L] pad-to-256 mask (the main-block forward path) routed
-    through krea2_attention's masked sdpa path. Returns [1, L, features].
+    additive [1,HEADS,L,L] pad-to-256 mask (tiled-path forward). real_len: if set,
+    the attention uses the cuDNN FLASH padmask path (the 1024² speedup) with cuDNN
+    masking the [real_len:L] pad rows. Returns [1, L, features].
     """
     comptime features = HEADS * HEADDIM   # 6144
 
@@ -792,7 +847,7 @@ def krea2_single_stream_block[L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int](
     var xn = krea2_rmsnorm(x, prenorm_scale, Float32(1.0e-5), ctx)        # [1,L,features]
     var xm = modulate(xn, prescale, preshift, ctx)                       # (1+prescale)*xn + preshift
     var a = krea2_attention[L, HEADS, KVHEADS, HEADDIM](
-        xm, wq, wk, wv, gate_w, wo, qnorm_scale, knorm_scale, cos, sin, mask, ctx
+        xm, wq, wk, wv, gate_w, wo, qnorm_scale, knorm_scale, cos, sin, mask, real_len, ctx
     )
     var x1 = residual_gate(x, pregate, a, ctx)                          # x + pregate*a
 
@@ -1190,23 +1245,47 @@ def krea2_text_fusion[LT: Int, NLAYERS: Int, HEADS: Int, HEADDIM: Int](
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+# ── checkpoint weight loaders (mixed-precision raw.safetensors → bf16 runtime) ─
+# The real Krea-2-Raw checkpoint is MIXED PRECISION on disk: block matmul weights
+# are BF16 but the embedders/heads/norms/mod (`first`, `tmlp/tproj/txtmlp`, `last`,
+# `projector`, every `.scale`, every `mod.lin`) are F32. The reference casts ALL
+# floating-point params to bf16 at load (krea2.py:190 `v.to("bf16")`), so the model
+# runs bf16 throughout — which is what chunks 1-7 gated against. We must do the same:
+#   _wb(...)  loads ANY float weight as BF16 (F32/F16->bf16; bf16 is a no-op) — the
+#             reference's `v.to(bf16)`. Used for every matmul weight + mod.lin + the
+#             linears/embedders (already bf16-loaded).
+#   _scale(...) loads a norm `.scale` as the bf16-ROUNDED value upcast to F32 — i.e.
+#             `bf16(scale).float()`, EXACTLY the reference's `self.scale.float()` on a
+#             now-bf16 scale (krea2_rmsnorm needs F32 and adds +1.0 in F32). On the
+#             bf16-saved gate oracles this equals the old from_view_as_f32; on the
+#             real F32-on-disk checkpoint it bf16-rounds first (the faithful value).
+def _wb(st: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_view_as_bf16(st.tensor_view(key), ctx)
+
+
+def _scale(st: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> Tensor:
+    return cast_tensor(Tensor.from_view_as_bf16(st.tensor_view(key), ctx), STDtype.F32, ctx)
+
+
 def _txtf_bundle(
     st: ShardedSafeTensors, prefix: String, ctx: DeviceContext
 ) raises -> Krea2TextFusionWeights:
-    """Load one TextFusionBlock bundle from the checkpoint (scales F32, proj bf16)."""
+    """Load one TextFusionBlock bundle from the checkpoint, ALL float params bf16
+    at runtime (= reference v.to(bf16)). Norm scales = bf16-rounded then F32 for
+    krea2_rmsnorm. `prefix` is the FULL key prefix (incl. any checkpoint prefix)."""
     return Krea2TextFusionWeights(
-        ArcPointer(Tensor.from_view_as_f32(st.tensor_view(prefix + ".prenorm.scale"), ctx)),
-        ArcPointer(Tensor.from_view_as_f32(st.tensor_view(prefix + ".postnorm.scale"), ctx)),
-        ArcPointer(Tensor.from_view(st.tensor_view(prefix + ".attn.wq.weight"), ctx)),
-        ArcPointer(Tensor.from_view(st.tensor_view(prefix + ".attn.wk.weight"), ctx)),
-        ArcPointer(Tensor.from_view(st.tensor_view(prefix + ".attn.wv.weight"), ctx)),
-        ArcPointer(Tensor.from_view(st.tensor_view(prefix + ".attn.gate.weight"), ctx)),
-        ArcPointer(Tensor.from_view(st.tensor_view(prefix + ".attn.wo.weight"), ctx)),
-        ArcPointer(Tensor.from_view_as_f32(st.tensor_view(prefix + ".attn.qknorm.qnorm.scale"), ctx)),
-        ArcPointer(Tensor.from_view_as_f32(st.tensor_view(prefix + ".attn.qknorm.knorm.scale"), ctx)),
-        ArcPointer(Tensor.from_view(st.tensor_view(prefix + ".mlp.gate.weight"), ctx)),
-        ArcPointer(Tensor.from_view(st.tensor_view(prefix + ".mlp.up.weight"), ctx)),
-        ArcPointer(Tensor.from_view(st.tensor_view(prefix + ".mlp.down.weight"), ctx)),
+        ArcPointer(_scale(st, prefix + ".prenorm.scale", ctx)),
+        ArcPointer(_scale(st, prefix + ".postnorm.scale", ctx)),
+        ArcPointer(_wb(st, prefix + ".attn.wq.weight", ctx)),
+        ArcPointer(_wb(st, prefix + ".attn.wk.weight", ctx)),
+        ArcPointer(_wb(st, prefix + ".attn.wv.weight", ctx)),
+        ArcPointer(_wb(st, prefix + ".attn.gate.weight", ctx)),
+        ArcPointer(_wb(st, prefix + ".attn.wo.weight", ctx)),
+        ArcPointer(_scale(st, prefix + ".attn.qknorm.qnorm.scale", ctx)),
+        ArcPointer(_scale(st, prefix + ".attn.qknorm.knorm.scale", ctx)),
+        ArcPointer(_wb(st, prefix + ".mlp.gate.weight", ctx)),
+        ArcPointer(_wb(st, prefix + ".mlp.up.weight", ctx)),
+        ArcPointer(_wb(st, prefix + ".mlp.down.weight", ctx)),
     )
 
 
@@ -1234,6 +1313,7 @@ def krea2_forward[
     t: Tensor,          # [1] f32 timestep
     pos: Tensor,        # [1, LFULL, 3] f32 (txt zeros + img grid ids)
     ctx: DeviceContext,
+    key_prefix: String = String("w."),
 ) raises -> Tensor:
     """Krea2 SingleStreamDiT.forward (mmdit.py:413-461), b==1 inference.
 
@@ -1243,6 +1323,14 @@ def krea2_forward[
     mask is all-ones at b==1 inference (no text pad); the ONLY masked positions are
     the pad-to-LPAD region, which the main blocks mask out via the additive
     [1,heads,LPAD,LPAD] mask. Returns the velocity on the image tokens [1, imglen, 64].
+
+    `key_prefix` is prepended to every checkpoint key. It defaults to "w." (the
+    parity-oracle dumps store weights as `w.<torch_key>`; see gen_krea2_*.py). The
+    real Krea-2 raw.safetensors stores the bare torch keys (`blocks.0.attn.wq.weight`,
+    `first.weight`, ...), so pipeline callers pass key_prefix="" against it. Block
+    streaming is implicit: each `_wb`/`_scale` load copies only the active block's
+    weights H2D (bf16) and frees them when the loop iteration ends, so the 28-block
+    real model never goes fully GPU-resident.
     """
     comptime FEATURES = 6144
     comptime HEADS = 48
@@ -1254,22 +1342,32 @@ def krea2_forward[
     comptime TDIM = 256
     var imglen = img.shape()[1]
 
-    # 1) img = first(img)  -> [1, imglen, FEATURES].
+    # WEIGHT DTYPE (the real raw.safetensors is MIXED precision): block matmul
+    # weights are bf16 on disk, but the embedders/heads/norms/mod (first/tmlp/tproj/
+    # txtmlp/last/projector, every .scale, every mod.lin) are F32. The ai-toolkit
+    # reference casts EVERY floating param to bf16 at load (krea2.py:190 `v.to(bf16)`)
+    # → the whole model runs bf16 (what chunks 1-7 gated against). We mirror it via
+    # the _wb / _scale loaders (defined above): _wb = every float weight/bias/mod.lin
+    # as bf16 (= v.to(bf16)); _scale = norm .scale bf16-ROUNDED then F32 (= reference
+    # bf16(scale).float(), consumed by the F32-internal krea2_rmsnorm). NO forward-
+    # path float weight is left at un-rounded F32. (On the bf16-saved gate oracles
+    # these loaders are value-identical to the old from_view*; on the real F32 disk
+    # they bf16-round first — the faithful runtime value. The F32 latent accumulator
+    # + F32 intra-attention q/k/v carry are ACTIVATIONS, unchanged.)
+
+    # 1) img = first(img)  -> [1, imglen, FEATURES]. img feed is bf16 -> bf16 head.
     var img_e = krea2_first(
-        img,
-        Tensor.from_view(st.tensor_view("w.first.weight"), ctx),
-        Tensor.from_view(st.tensor_view("w.first.bias"), ctx),
-        ctx,
+        img, _wb(st, key_prefix + "first.weight", ctx), _wb(st, key_prefix + "first.bias", ctx), ctx,
     )
 
     # 2) t = tmlp(temb(t, tdim))  -> [1, 1, FEATURES].
     var te = krea2_temb(t, TDIM, ctx, STDtype.BF16)   # [1, 256]
     var t_vec = krea2_tmlp(
         te,
-        Tensor.from_view(st.tensor_view("w.tmlp.0.weight"), ctx),
-        Tensor.from_view(st.tensor_view("w.tmlp.0.bias"), ctx),
-        Tensor.from_view(st.tensor_view("w.tmlp.2.weight"), ctx),
-        Tensor.from_view(st.tensor_view("w.tmlp.2.bias"), ctx),
+        _wb(st, key_prefix + "tmlp.0.weight", ctx),
+        _wb(st, key_prefix + "tmlp.0.bias", ctx),
+        _wb(st, key_prefix + "tmlp.2.weight", ctx),
+        _wb(st, key_prefix + "tmlp.2.bias", ctx),
         ctx,
     )
     var tshape = List[Int]()
@@ -1278,10 +1376,7 @@ def krea2_forward[
 
     # 3) tvec = tproj(t)  -> [1, 1, 6*FEATURES]  (the block modulation vector).
     var blk_vec = krea2_tproj(
-        t3,
-        Tensor.from_view(st.tensor_view("w.tproj.1.weight"), ctx),
-        Tensor.from_view(st.tensor_view("w.tproj.1.bias"), ctx),
-        ctx,
+        t3, _wb(st, key_prefix + "tproj.1.weight", ctx), _wb(st, key_prefix + "tproj.1.bias", ctx), ctx,
     )
     var bvshape = List[Int]()
     bvshape.append(1); bvshape.append(6 * FEATURES)
@@ -1289,44 +1384,57 @@ def krea2_forward[
 
     # 4-5) context = txtfusion(context, txtmask). At b==1 the txtmask is all-ones
     # (no caption padding) => refiner runs the no-op path (chunk-6: refiner mask=None).
-    var lw0 = _txtf_bundle(st, "w.txtfusion.layerwise_blocks.0", ctx)
-    var lw1 = _txtf_bundle(st, "w.txtfusion.layerwise_blocks.1", ctx)
-    var rf0 = _txtf_bundle(st, "w.txtfusion.refiner_blocks.0", ctx)
-    var rf1 = _txtf_bundle(st, "w.txtfusion.refiner_blocks.1", ctx)
+    var lw0 = _txtf_bundle(st, key_prefix + "txtfusion.layerwise_blocks.0", ctx)
+    var lw1 = _txtf_bundle(st, key_prefix + "txtfusion.layerwise_blocks.1", ctx)
+    var rf0 = _txtf_bundle(st, key_prefix + "txtfusion.refiner_blocks.0", ctx)
+    var rf1 = _txtf_bundle(st, key_prefix + "txtfusion.refiner_blocks.1", ctx)
     var ctx_fused = krea2_text_fusion[LT, NLAYERS_TXT, TXTHEADS, TXTHD](
         context, lw0, lw1,
-        Tensor.from_view(st.tensor_view("w.txtfusion.projector.weight"), ctx),
+        _wb(st, key_prefix + "txtfusion.projector.weight", ctx),
         rf0, rf1, Optional[Tensor](None), ctx,
     )                                                  # [1, LT, txtdim]
 
-    # 6) context = txtmlp(context)  -> [1, LT, FEATURES].
+    # 6) context = txtmlp(context)  -> [1, LT, FEATURES]. RMSNorm scale = bf16-rounded
+    # then F32 (= reference bf16(scale).float()); the rest bf16.
     var ctx_proj = krea2_txtmlp(
         ctx_fused,
-        Tensor.from_view_as_f32(st.tensor_view("w.txtmlp.0.scale"), ctx),
-        Tensor.from_view(st.tensor_view("w.txtmlp.1.weight"), ctx),
-        Tensor.from_view(st.tensor_view("w.txtmlp.1.bias"), ctx),
-        Tensor.from_view(st.tensor_view("w.txtmlp.3.weight"), ctx),
-        Tensor.from_view(st.tensor_view("w.txtmlp.3.bias"), ctx),
+        _scale(st, key_prefix + "txtmlp.0.scale", ctx),
+        _wb(st, key_prefix + "txtmlp.1.weight", ctx),
+        _wb(st, key_prefix + "txtmlp.1.bias", ctx),
+        _wb(st, key_prefix + "txtmlp.3.weight", ctx),
+        _wb(st, key_prefix + "txtmlp.3.bias", ctx),
         ctx,
     )
 
     # 7-8) combined = cat(context, img, dim=1)  -> [1, LFULL, FEATURES]  (context THEN img).
     var combined = concat(1, ctx, ctx_proj, img_e)     # [1, LFULL, FEATURES]
 
-    # 9) pad-to-LPAD: combined (zeros), pos (zeros), mask (False) on the seq axis.
+    # 9) pad-to-LPAD: combined (zeros), pos (zeros) on the seq axis.
     var combined_p = _pad_seq_zeros(combined, LFULL, LPAD, FEATURES, ctx)  # [1, LPAD, F]
 
-    # 10) main-block mask = _mask(padded keep). keep = ones[0:LFULL], zeros[LFULL:LPAD].
-    # build_krea2_text_mask wants keep [LPAD] F32. Build it host-side.
+    # 10) BLOCK-0-ONLY additive mask. Blocks >=1 use the cuDNN FLASH path (real_len=
+    # LFULL masks the [LFULL:LPAD] pad rows internally). BLOCK 0 stays on the TILED F32
+    # path: its QKNorm scale is ~52.9× (near-one-hot softmax) and MEASURED (7b
+    # spot-check) cuDNN bf16 diverges there — cos 0.9965 < the bf16-tap floor 0.9978,
+    # ch2569/3389 rel 8.0%/11.2% vs floor 4.5%/8.5% — because bf16-rounding q/k before
+    # the cuDNN call flips which key wins the sharp softmax. Blocks 1 & 19 cuDNN-match
+    # the tap AT floor (cos 0.99999/0.99998). So: block 0 tiled-F32 (faithful), 1..N-1
+    # cuDNN-flash (the 1024² speedup on 27/28 blocks). build_krea2_text_mask wants
+    # keep [LPAD] F32 = ones[0:LFULL], zeros[LFULL:LPAD].
     var keep_host = List[Float32]()
     for i in range(LPAD):
         keep_host.append(Float32(1.0) if i < LFULL else Float32(0.0))
     var keep_shape = List[Int]()
     keep_shape.append(LPAD)
     var keep = Tensor.from_host(keep_host^, keep_shape^, STDtype.F32, ctx)
-    var blk_mask = build_krea2_text_mask(keep, HEADS, LPAD, ctx, STDtype.BF16)  # [1,HEADS,LPAD,LPAD]
-    # Build the Optional ONCE (Tensor is move-only); pass it borrowed to every block.
-    var blk_mask_opt = Optional[Tensor](blk_mask^)
+    var blk0_mask = build_krea2_text_mask(keep, HEADS, LPAD, ctx, STDtype.BF16)  # [1,HEADS,LPAD,LPAD]
+    # Build the two Optionals ONCE (Tensor is move-only) and pass them BORROWED (the
+    # block's `mask`/`real_len` args are `read`): block 0 uses blk0_mask_opt + None;
+    # blocks >=1 use none_mask + LFULL. The unused one is just an empty/ignored Optional.
+    var blk0_mask_opt = Optional[Tensor](blk0_mask^)
+    var none_mask = Optional[Tensor](None)
+    var rl_none = Optional[Int](None)
+    var rl_full = Optional[Int](LFULL)
 
     # 11) freqs = posemb(pos): pad pos to LPAD (zeros), build the rope table [LPAD,64].
     var pos_flat_shape = List[Int]()
@@ -1345,39 +1453,47 @@ def krea2_forward[
     axes.append(32); axes.append(48); axes.append(48)
     var rope = build_krea2_rope(pos_pad, axes, Float32(1.0e3), ctx, STDtype.F32)  # ([LPAD,64], [LPAD,64])
 
-    # 12) N x SingleStreamBlock WITH the pad-to-LPAD mask. S = LPAD (comptime).
+    # 12) N x SingleStreamBlock. Block 0 = TILED F32 (additive mask, near-one-hot
+    # faithful); blocks 1..N-1 = cuDNN FLASH (real_len=LFULL pad-mask, the speedup).
     var x = combined_p^
     for li in range(NBLOCKS):
-        var p = String("w.blocks.") + String(li)
+        var p = key_prefix + "blocks." + String(li)
+        # Per-block path: block 0 -> (blk0_mask, None) tiled F32; else -> (None, LFULL)
+        # cuDNN flash. Pass the pre-built Optionals borrowed.
         x = krea2_single_stream_block[LPAD, HEADS, KVHEADS, HEADDIM](
             x,
             blk_vec2,
-            Tensor.from_view(st.tensor_view(p + ".mod.lin"), ctx),
-            Tensor.from_view_as_f32(st.tensor_view(p + ".prenorm.scale"), ctx),
-            Tensor.from_view_as_f32(st.tensor_view(p + ".postnorm.scale"), ctx),
-            Tensor.from_view(st.tensor_view(p + ".attn.wq.weight"), ctx),
-            Tensor.from_view(st.tensor_view(p + ".attn.wk.weight"), ctx),
-            Tensor.from_view(st.tensor_view(p + ".attn.wv.weight"), ctx),
-            Tensor.from_view(st.tensor_view(p + ".attn.gate.weight"), ctx),
-            Tensor.from_view(st.tensor_view(p + ".attn.wo.weight"), ctx),
-            Tensor.from_view_as_f32(st.tensor_view(p + ".attn.qknorm.qnorm.scale"), ctx),
-            Tensor.from_view_as_f32(st.tensor_view(p + ".attn.qknorm.knorm.scale"), ctx),
-            Tensor.from_view(st.tensor_view(p + ".mlp.gate.weight"), ctx),
-            Tensor.from_view(st.tensor_view(p + ".mlp.up.weight"), ctx),
-            Tensor.from_view(st.tensor_view(p + ".mlp.down.weight"), ctx),
+            # ALL float weights bf16 at runtime (reference v.to(bf16)): mod.lin bf16
+            # (ADDED to the bf16 mod vec); matmul weights bf16 (no-op if already bf16
+            # on disk); norm scales = bf16-rounded then F32 for the F32-internal RMSNorm.
+            _wb(st, p + ".mod.lin", ctx),
+            _scale(st, p + ".prenorm.scale", ctx),
+            _scale(st, p + ".postnorm.scale", ctx),
+            _wb(st, p + ".attn.wq.weight", ctx),
+            _wb(st, p + ".attn.wk.weight", ctx),
+            _wb(st, p + ".attn.wv.weight", ctx),
+            _wb(st, p + ".attn.gate.weight", ctx),
+            _wb(st, p + ".attn.wo.weight", ctx),
+            _scale(st, p + ".attn.qknorm.qnorm.scale", ctx),
+            _scale(st, p + ".attn.qknorm.knorm.scale", ctx),
+            _wb(st, p + ".mlp.gate.weight", ctx),
+            _wb(st, p + ".mlp.up.weight", ctx),
+            _wb(st, p + ".mlp.down.weight", ctx),
             rope[0], rope[1],
-            blk_mask_opt,
+            blk0_mask_opt if li == 0 else none_mask,
+            rl_none if li == 0 else rl_full,
             ctx,
         )
 
-    # 13) final = last_layer(combined, t)  (tvec = t3, the tmlp output).
+    # 13) final = last_layer(combined, t)  (tvec = t3, the tmlp output). ALL bf16:
+    # norm.scale bf16-rounded->F32, modulation.lin + linear weight/bias bf16.
     var final = krea2_last_layer(
         x,
         t3,
-        Tensor.from_view_as_f32(st.tensor_view("w.last.norm.scale"), ctx),
-        Tensor.from_view(st.tensor_view("w.last.modulation.lin"), ctx),
-        Tensor.from_view(st.tensor_view("w.last.linear.weight"), ctx),
-        Tensor.from_view(st.tensor_view("w.last.linear.bias"), ctx),
+        _scale(st, key_prefix + "last.norm.scale", ctx),
+        _wb(st, key_prefix + "last.modulation.lin", ctx),
+        _wb(st, key_prefix + "last.linear.weight", ctx),
+        _wb(st, key_prefix + "last.linear.bias", ctx),
         FEATURES,
         ctx,
     )                                                  # [1, LPAD, 64]

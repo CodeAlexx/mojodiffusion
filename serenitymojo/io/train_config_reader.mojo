@@ -50,6 +50,7 @@ from serenitymojo.training.train_config import (
     TRAIN_DTYPE_GGUF_A8_INT,
     TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
     TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_ADAMW_8BIT,
+    TRAIN_OPTIMIZER_AUTOMAGIC3,
     TRAIN_TIME_UNIT_EPOCH, TRAIN_TIME_UNIT_STEP, TRAIN_TIME_UNIT_SECOND,
     TRAIN_TIME_UNIT_MINUTE, TRAIN_TIME_UNIT_HOUR, TRAIN_TIME_UNIT_NEVER,
     TRAIN_TIME_UNIT_ALWAYS,
@@ -234,6 +235,12 @@ def _optimizer_int(s: String) raises -> Int:
         return TRAIN_OPTIMIZER_ADAFACTOR
     elif s == "SCHEDULE_FREE_ADAMW":
         return TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW
+    elif s == "AUTOMAGIC3" or s == "AUTOMAGIC_3" or s == "AUTOMAGIC-3":
+        # ai-toolkit Automagic3: HF-factored 2nd moment + sign-history
+        # exp(vote) adaptive lr; host-F32 via training/levers.mojo
+        # (training/automagic3.mojo), gated by
+        # training/parity/automagic3_parity_probe.mojo vs the Python oracle.
+        return TRAIN_OPTIMIZER_AUTOMAGIC3
     elif (
         s == "ADAM" or s == "ADAM_8BIT"
         or s == "CAME" or s == "CAME_8BIT"
@@ -245,12 +252,13 @@ def _optimizer_int(s: String) raises -> Int:
         raise Error(
             String("JSON config: optimizer '") + s
             + String("' is not implemented in the Mojo trainers; supported:")
-            + String(" ADAMW, ADAMW_8BIT, ADAFACTOR, SCHEDULE_FREE_ADAMW")
+            + String(" ADAMW, ADAMW_8BIT, ADAFACTOR, SCHEDULE_FREE_ADAMW,")
+            + String(" AUTOMAGIC3")
         )
     raise Error(
         String("JSON config: unknown Optimizer '") + s
         + String("'; supported: ADAMW, ADAMW_8BIT, ADAFACTOR,")
-        + String(" SCHEDULE_FREE_ADAMW")
+        + String(" SCHEDULE_FREE_ADAMW, AUTOMAGIC3")
     )
 
 
@@ -1150,6 +1158,10 @@ def read_model_config(json_path: String) raises -> TrainConfig:
             var sc = _read_scalar(cur)
             if sc.is_string:
                 cfg.dataset_cache_dir = sc.s
+        elif key == "dataset_path" or key == "dataset_dir":
+            var sc = _read_scalar(cur)
+            if sc.is_string:
+                cfg.dataset_path = sc.s
         elif key == "require_cached_video_latents" or key == "cache_video_latents":
             cfg.require_cached_video_latents = _read_scalar(cur).num != 0.0
         elif key == "require_cached_text_embeddings" or key == "cache_text_embeddings":

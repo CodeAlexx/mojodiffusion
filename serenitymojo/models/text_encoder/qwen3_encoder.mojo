@@ -51,6 +51,12 @@ from serenitymojo.ops.activations import swiglu
 
 comptime _DYN1 = Layout.row_major(-1)
 comptime _BLOCK = 256
+# Per-6-layer VRAM print in encode_layer_states (gated). Default False for
+# production; flip True to instrument a load/encode VRAM curve. NOTE (measured
+# 2026-06-24): in-process ctx.get_memory_info() is UNRELIABLE on this MAX build
+# (returns a static free==total and does not move on alloc) — trust EXTERNAL
+# nvidia-smi for real VRAM, not this print.
+comptime _QWEN3_VRAM_DEBUG = False
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -750,6 +756,15 @@ struct Qwen3Encoder:
             )
             # store a copy of the post-layer hidden state
             states.append(ArcPointer(_clone(hidden, ctx)))
+            comptime if _QWEN3_VRAM_DEBUG:
+                if i % 6 == 0 or i == n_run - 1:
+                    ctx.synchronize()
+                    var _mi = ctx.get_memory_info()
+                    print(
+                        "[qwen3-vram] after layer", i, ": free=",
+                        Int(Float64(_mi[0]) / 1048576.0), "MiB used=",
+                        Int(Float64(_mi[1] - _mi[0]) / 1048576.0), "MiB",
+                    )
         return states^
 
     def encode(

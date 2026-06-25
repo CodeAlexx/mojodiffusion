@@ -43,10 +43,12 @@ def _ideogram4_mrope_kernel[out_dtype: DType](
     elif m == 2 and d < sec_w:
         axis = 2
     var pos_val = rebind[Scalar[DType.float32]](pos[l * 3 + axis])
-    # inv_freq is stored BF16 in the real bf16 model (m.to(bf16) casts the buffer,
-    # forward upcasts to f32) — round to bf16 to match. At pos~65536 the bf16
-    # rounding of inv dominates (f32 inv gives cos-sim 0.71, bf16 gives 1.0).
-    var inv = exp((-Float32(d) / Float32(half)) * log_theta).cast[DType.bfloat16]().cast[DType.float32]()
+    # inv_freq precision: ai-toolkit (the PRODUCTION oracle) keeps inv_freq in F32 —
+    # its MRoPE buffer is NOT bf16-rounded. The prior ideogram4-ref oracle DID
+    # bf16-round it; matching that decorrelated MRoPE vs ai-toolkit at pos~65536
+    # (cos 0.71 → propagating to transformer_out 0.9986). Keep F32 inv_freq to match
+    # production (gate: full predict forward cos>=0.9998 vs ai-toolkit with f32 inv).
+    var inv = exp((-Float32(d) / Float32(half)) * log_theta)
     var angle_f32 = pos_val * inv
     # GPU has no F64 trig, but F64 arithmetic is fine: do an accurate range
     # reduction in F64 (Mojo F32 cos/sin is wrong for pos ~ 65536), then F32 trig

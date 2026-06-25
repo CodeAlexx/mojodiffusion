@@ -7,7 +7,7 @@ authoritative detail doc. Dated `HANDOFF_*` / `NEXT_SESSION_*` / `*_2026-*` file
 are HISTORICAL SNAPSHOTS — ignore unless archaeology is needed.
 
 Convention: update the **Active** section here each session (one line per item +
-link). Keep the depth in the linked doc, not here. Last updated: 2026-06-12.
+link). Keep the depth in the linked doc, not here. Last updated: 2026-06-25.
 
 ---
 
@@ -25,6 +25,7 @@ link). Keep the depth in the linked doc, not here. Last updated: 2026-06-12.
 | 8 | **serenity-trainer UI hardening — waves 1+2 SHIPPED 2026-06-12; wave 3 OPEN** | Wave 1 (f741b9f): terminal lifecycle fixed (kill-pgid never worked — measured; wrapper TERM trap + auto-close; silent gnome-terminal spawn failures now block+fail loud), sampler gallery actually refreshes (was loaded exactly once), per-frame O(n²) log re-read killed. Wave 2 (aa0e2cf): **klein UI launches now go to the REAL serenitymojo `train_klein_real`** (legacy KleinLiveTrainer was hardwired MSE/AdamW, zero levers — measured by grep+strings on the deployed binary); capability table = klein/zimage/hidream/ideogram4 consume levers, chroma/ernie/anima/sdxl/l2p consume NONE → LOUD pre-launch warning naming ignored keys; decorative widgets labeled [not wired] + gate-proven excluded from emission; Max Steps editable. 4/4 UI tests + runner seam gate ALL PASS. OPEN (wave 3): pause/sample-now command-file protocol no trainer reads yet; config LOAD (save-only today); clipboard FFI; rebuild klein runner post-T2.G. | serenity-trainer `docs/UI_AUDIT_2026-06-12.md` + commits f741b9f/aa0e2cf |
 
 | 9 | **Trainer driver separation → serenity-trainer (2026-06-23)** | DONE pending commit. All 13 `train_*_real` drivers build from `serenity-trainer` (skeptic-verified); 23 driver/smoke files `git rm`-ed from `serenitymojo/training` (STAGED, not committed); 16 `scripts/check_*` gates repointed + re-run clean (0 deleted-file refs); inference `zimage_generate` still links. zimage real-step proven; other 10 build-only (convergence/samplers NOT verified). | `../serenity-trainer/docs/TRAINER_DRIVER_SEPARATION.md` |
+| 10 | **Mojo ideogram4 training — ai-toolkit parity (2026-06-25)** | **Every per-component gate PASSES vs ai-toolkit** (prior gating was vs the INVALID ideogram4-ref): block fwd+bwd ≥0.99998 · full forward→velocity ≥0.99979 · MRoPE · VAE encode 0.99995 · Qwen3-VL encoder taps 0.99994 · step-math/recipe MATCH. **Found+FIXED a real bug**: MRoPE `inv_freq` bf16→f32 (`ideogram4_mrope.mojo:49`, KNOWN_ISSUES MJ-0815) — affects training+inference. PENDING before a real run reproduces ai-toolkit: P0 padding-mask leak + P0 caption JSON-wrap + P1 LR-default 4e-4→1e-4; L2P real-run gate needs the eri2 `--cache-dir`. | `serenitymojo/models/ideogram4/parity/IDEOGRAM4_AITOOLKIT_PARITY_LEDGER.md` |
 
 > Items 4–5 statuses are quoted from their docs/memory, not re-measured this session.
 

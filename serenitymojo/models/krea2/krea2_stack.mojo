@@ -465,6 +465,8 @@ def krea2_stack_lora_forward_streamed[
             cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx,
         )
         x = fwd.out.copy()
+        ctx.synchronize()   # async free discipline: reclaim this block's saved-acts (incl. ~2GB SDPA
+        # scores) + streamed weights before the next H2D — else the deferred frees accumulate -> OOM.
         # wbi drops here → its device weights free before the next block loads.
 
     var x_blocks_out = x.copy()
@@ -543,6 +545,8 @@ def krea2_stack_lora_backward_streamed[
         grads[base + 6] = bg.mlp_up_w.copy()
         grads[base + 7] = bg.mlp_down_w.copy()
         d_x = bg.d_x[].clone(ctx)
+        ctx.synchronize()   # async free discipline: reclaim this block's recompute-acts + backward
+        # grads + streamed weights before the next H2D — else the deferred frees accumulate -> OOM.
         bi -= 1
         # wbi drops here → device weights free before the next block loads.
 

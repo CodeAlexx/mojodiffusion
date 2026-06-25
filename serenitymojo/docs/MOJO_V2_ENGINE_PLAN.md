@@ -231,3 +231,28 @@ forward still owed. Detail: TIER2_PARITY_CAMPAIGN_2026-06-11.md.
 - flame reference: /home/alex/EriDiffusion/flame-core/{src/autograd_v2/,
   src/ring_alloc/, src/offload/, src/cuda_graph.rs, docs/RING_ALLOC_DESIGN.md,
   docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md}
+
+## Ideogram4 — rest-of-models rollout (2026-06-25, the 3rd wired trainer)
+
+Per the "all trainers MUST use autograd_v2" mandate, ideogram4 is now on the
+engine — same Klein-P6 coarse pattern (one composite node `OPK_IDEOGRAM4_BLOCK`
+per block, no slab/capture).
+- **Adapter:** `serenitymojo/autograd_v2/ideogram4_block_graph.mojo`
+  (`ideogram4_block_graph_backward`, calls `record_ideogram4_block` +
+  `execute_ideogram4`).
+- **Stack-graph backward:** `ideogram4_stack_lora_backward_graph`(`_resident`)
+  in serenity-trainer `models/ideogram4/block_stack_graph.mojo` (new file —
+  avoids the block→graph→block import cycle; mirrors klein). Same
+  conductor/scratch/slot-fan-in seam; each `_graph` fn owns a local
+  ScratchRingAllocator (ideogram4's hand-chain stack takes no scratch param).
+- **Trainer flag:** `IDEOGRAM4_V2_GRAPH` (default **True**) in serenity-trainer
+  `trainer/Ideogram4StackTrain.mojo`; comptime-if dispatch at the 3 backward
+  call sites (StackTrain + LoRATrainStep resident/non-resident). Hand-chain
+  stays in the `else` (C13).
+- **Gates (lead-run):** per-block bit gate
+  `autograd_v2/tests/ideogram4_block_parity` BIT-EQUAL (every grad
+  n_mismatch=0); **live-trainer 30-step anchor on the real eri2 cache:
+  ON(engine) vs OFF(hand-chain) loss BIT-IDENTICAL, max|diff|=0.0 over 30/30
+  steps**; real-run loss drops (smooth 0.7750→0.7599).
+- **Speed:** coarse stage-1 = engine 3.27 vs hand-chain 2.65 s/step (~+23%);
+  slab/capture is the owed speed follow-up (same status as Klein P6).

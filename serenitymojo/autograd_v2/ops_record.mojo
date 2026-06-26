@@ -1238,3 +1238,56 @@ def record_ideogram4_block[
     out_ids.append(out_t.id)
     _ = g.record(_OPK_I4R, edges^, saved^, meta^, scal^, out_ids)
     return TArc(out_t^)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4b krea2 COARSE record (krea2_block_graph.mojo). Records the block forward
+# as ONE composite node OPK_KREA2_SINGLE_BLOCK with a SINGLE tracked edge (the block
+# input x — the only inter-block dependency the engine routes; the 8 LoRA grads are
+# HOST lists captured out-of-band, NOT engine leaves). The bulky weights/adapters/
+# rope structs are NOT packed into Node.saved (13 weights + 8 adapters × {a,b,rank,
+# in_f,out_f,scale} is error-prone index gymnastics); apply_krea2/execute_krea2_block
+# take them as direct params (the execute_ideogram4 comptime-threading precedent,
+# generalized to runtime structs — same structs the oracle uses, bit-identical). The
+# record runs the forward only to MINT the block-output tensor id (acts discarded —
+# apply_krea2 RECOMPUTES from the saved x, the conductor's recompute-checkpoint
+# discipline). saved=[x]; saved_meta=[L]; scalars=[eps]; edges(1)=x.
+# ─────────────────────────────────────────────────────────────────────────────
+from serenitymojo.models.krea2.krea2_block import (
+    krea2_single_stream_block_lora as _k2r_fwd,
+    Krea2BlockWeights as _K2Wr,
+    Krea2BlockLora as _K2Lr,
+)
+from serenitymojo.autograd_v2.node import (
+    OPK_KREA2_SINGLE_BLOCK as _OPK_K2, Edge as _EdgeK2,
+)
+
+
+def record_krea2_single_block[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    mut g: Graph,
+    x: TArc, vec: Tensor,
+    w: _K2Wr, lora: _K2Lr,
+    cos: Tensor, sin: Tensor,
+    cos_q: Tensor, sin_q: Tensor, cos_k: Tensor, sin_k: Tensor,
+    eps: Float32, x_id: Int, ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+) raises -> TArc:
+    var fb = _k2r_fwd[L, HEADS, KVHEADS, HEADDIM](
+        x, vec, w, lora, cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+    )
+    var out_t = Tensor(fb.out[].buf.copy(), fb.out[].shape(), fb.out[].dtype())
+    out_t.set_id(g.fresh_tensor_id())
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    var edges = List[_EdgeK2]()
+    edges.append(g.edge_for(x_id))
+    var meta = List[Int]()
+    meta.append(L)
+    var scal = List[Float32]()
+    scal.append(eps)
+    var out_ids = List[Int]()
+    out_ids.append(out_t.id)
+    _ = g.record(_OPK_K2, edges^, saved^, meta^, scal^, out_ids)
+    return TArc(out_t^)

@@ -89,8 +89,10 @@ from serenitymojo.models.krea2.krea2_stack import (
     Krea2StackLora, Krea2StackForward, Krea2StackLoraGrads,
     Krea2StreamFinal, KREA2_SLOTS_PER_BLOCK,
     krea2_stack_lora_forward_streamed, krea2_stack_lora_backward_streamed,
+    krea2_stack_lora_backward_graph,
     Krea2ResidentFp8, build_krea2_resident_fp8,
 )
+from serenitymojo.scratch_ring import ScratchRingAllocator
 
 # ── frozen conditioning prefix (REUSE the inference krea2_forward pieces) ──────
 from serenitymojo.models.dit.krea2_dit import (
@@ -424,8 +426,17 @@ def _train_one_sample(
     # ── streaming stack backward (hand-chain default; v2 arm Phase 4b) ──────────
     var grads: Krea2StackLoraGrads
     comptime if KREA2_V2_GRAPH:
-        # Phase 4b: autograd_v2 engine arm (drop-in, same conductor loop + slots).
-        raise Error("KREA2_V2_GRAPH path is Phase 4b — not wired yet")
+        # Phase 4b: autograd_v2 engine arm (drop-in, SAME conductor loop + slots).
+        # The coarse per-block graph calls the WHOLE block backward oracle, so this
+        # is bit-identical to the streamed hand-chain ([[feedback_all_trainers_autograd_v2]]).
+        # The scratch ring is a no-op safety bracket for the coarse arm (the oracle
+        # manages its own transient device allocations); a small ring suffices.
+        var scratch_v2 = ScratchRingAllocator(ctx, 64 * 1024 * 1024, 2)
+        grads = krea2_stack_lora_backward_graph[LFULL, HEADS, KVHEADS, HEADDIM](
+            d_velocity, cond.blk_vec, cond.tmlp_out,
+            st, key_prefix, NBLOCKS, lora, fin, fwd,
+            cond.cos, cond.sin, EPS, ctx, scratch_v2, real_len, resident,
+        )
     else:
         grads = krea2_stack_lora_backward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
             d_velocity, cond.blk_vec, cond.tmlp_out,

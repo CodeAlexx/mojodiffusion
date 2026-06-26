@@ -66,6 +66,20 @@ comptime OPK_KLEIN_SGL_OUT = 18     # (x, att_flat, mlp) -> block out + out LoRA
 # block.mojo) -- bit-identical to the hand-chain. saved=[x,adaln,cos,sin,13 weights,
 # 12 lora a/b]; saved_meta=[rank]; scalars=[alpha]. Edges(14): x,adaln, a/b per slot.
 comptime OPK_IDEOGRAM4_BLOCK = 19
+# Phase 4b krea2 single-stream block, COARSE (krea2_block_graph.mojo). ONE composite
+# kind/block: apply_krea2 reboxes the saved block input/weights/adapters/rope/vec,
+# RECOMPUTES the forward (krea2_single_stream_block_lora, from the saved input only —
+# the conductor's recompute-checkpoint discipline), and calls the WHOLE
+# krea2_single_stream_block_lora_backward oracle (models/krea2/krea2_block.mojo) — so
+# every internal >=3-way fold (e.g. d_xm = add(add(bw_q,bw_k),add(bw_v,bw_g))) stays
+# INSIDE the oracle (C15 trivially satisfied at graph level; the block input x is the
+# ONLY tracked edge → its single contribution needs no fan-in fold). The 8 LoRA grad
+# pairs are HOST List[Float32] by the oracle's construction (the .to_host lives inside
+# klein_lora_bwd_device_resident_unfused) and CANNOT flow through the engine's
+# TArc-only edge/Dict machinery — so the krea2 driver (execute_krea2_block) returns
+# the WHOLE Krea2BlockGrads struct (d_x sunk through the engine LEAF for x; the host
+# LoRA lists captured out-of-band), NOT a Dict[Int,TArc]. One tracked edge (x).
+comptime OPK_KREA2_SINGLE_BLOCK = 20
 
 
 struct Edge(Copyable, Movable):

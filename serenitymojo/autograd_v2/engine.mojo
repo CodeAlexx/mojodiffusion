@@ -1353,3 +1353,200 @@ def execute_ideogram4[
     if fired != reachable:
         raise Error(String("execute_ideogram4: fired=") + String(fired) + " != reachable=" + String(reachable))
     return result^
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4b krea2 COARSE block adapter (krea2_block_graph.mojo).
+# apply_krea2 dispatches the single composite kind OPK_KREA2_SINGLE_BLOCK by
+# RECOMPUTING the forward from the saved block input x (the conductor's recompute-
+# checkpoint discipline) and calling the WHOLE krea2_single_stream_block_lora_backward
+# oracle (models/krea2/krea2_block.mojo) — bit-identical to the hand-chain stack
+# backward by construction (the gate target; re-derives NO block math). It returns the
+# WHOLE Krea2BlockGrads (d_x TArc + 8 HOST-list LoRA pairs), NOT a List[TArc]: the krea2
+# LoRA grads are host List[Float32] (the .to_host lives inside the oracle's lora bwd) and
+# cannot flow through the engine's TArc edge/Dict machinery, so they ride out-of-band.
+#
+# execute_krea2_block is execute_ideogram4's engine algorithm (dep-count BFS, InputBuffer
+# seed, ready-queue order, fired==reachable) specialized to the krea2 grad shape: the ONE
+# composite node feeds its d_x into the x LEAF (the engine genuinely routes the single
+# inter-block dependency, so the gate checks the engine path), and the host-list LoRA
+# grads are captured from the apply call and returned in the same Krea2BlockGrads struct.
+# The bulky weights/adapters/rope/vec structs are threaded as direct params (NOT packed
+# in Node.saved) — the same structs the oracle uses, bit-identical.
+#
+# No StepSlab and no CUDA capture for krea2 in Phase 4b (the slab+capture speed phases
+# come after; the conductor keeps the streamed loop's per-block ctx.synchronize seam,
+# C10). comptime [HEADS,KVHEADS,HEADDIM] buckets like the trainer; runtime L rides meta.
+# ─────────────────────────────────────────────────────────────────────────────
+from serenitymojo.autograd_v2.node import OPK_KREA2_SINGLE_BLOCK
+from serenitymojo.models.krea2.krea2_block import (
+    krea2_single_stream_block_lora as _k2_fwd,
+    krea2_single_stream_block_lora_backward as _k2_bwd,
+    Krea2BlockWeights as _K2W,
+    Krea2BlockLora as _K2L,
+    Krea2BlockGrads as _K2Grads,
+    Krea2LoraGrad,
+)
+
+
+def apply_krea2[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    node: Node, d_out: TArc,
+    vec: Tensor, w: _K2W, lora: _K2L,
+    cos: Tensor, sin: Tensor,
+    cos_q: Tensor, sin_q: Tensor, cos_k: Tensor, sin_k: Tensor,
+    eps: Float32, real_len: Optional[Int], ctx: DeviceContext,
+) raises -> _K2Grads:
+    """Recompute the krea2 block forward from the saved input, then call the WHOLE
+    krea2_single_stream_block_lora_backward oracle. Returns Krea2BlockGrads (d_x +
+    8 host-list LoRA pairs) — bit-identical to the hand-chain conductor's per-block
+    (recompute + block backward) pair (krea2_stack.mojo:724-732)."""
+    if node.kind != OPK_KREA2_SINGLE_BLOCK:
+        raise Error("apply_krea2: unexpected node kind")
+    # node.saved[0] is the block input x (the recompute checkpoint).
+    var rb = _k2_fwd[L, HEADS, KVHEADS, HEADDIM](
+        node.saved[0].copy(), vec, w, lora,
+        cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+    )
+    var bg = _k2_bwd[L, HEADS, KVHEADS, HEADDIM](
+        d_out[], vec, w, lora, rb.saved,
+        cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+    )
+    return bg^
+
+
+def execute_krea2_block[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    mut graph: Graph, root: Int, root_grad: TArc,
+    vec: Tensor, w: _K2W, lora: _K2L,
+    cos: Tensor, sin: Tensor,
+    cos_q: Tensor, sin_q: Tensor, cos_k: Tensor, sin_k: Tensor,
+    eps: Float32, real_len: Optional[Int], ctx: DeviceContext,
+) raises -> _K2Grads:
+    """execute_ideogram4's engine algorithm (dep-count BFS, slot-ordered buffers,
+    ready-queue order, fired==reachable invariant) for the krea2 graph: ONE composite
+    node + its x leaf. The composite node fires once (the seeded root), produces
+    Krea2BlockGrads; its d_x routes along the x edge into the LEAF (engine-driven, the
+    gate's d_x path); the host-list LoRA grads are captured and returned. Single root,
+    single tracked edge → the InputBuffer/seed/route machinery still runs, but no
+    multi-contribution fan-in arises (C15 trivial at graph level)."""
+    var n = len(graph.nodes)
+    if root < 0 or root >= n:
+        raise Error("execute_krea2_block: root out of range")
+
+    # ── Step 1: dep-count BFS over edges from the root (engine.rs:230-277).
+    var dep = List[Int]()
+    var seen = List[Bool]()
+    var in_queue = List[Bool]()
+    for _ in range(n):
+        dep.append(0)
+        seen.append(False)
+        in_queue.append(False)
+    var stack = List[Int]()
+    stack.append(root)
+    var reachable = 0
+    while len(stack) > 0:
+        var nid = stack.pop()
+        if seen[nid]:
+            continue
+        seen[nid] = True
+        reachable += 1
+        for i in range(len(graph.nodes[nid].edges)):
+            var child = graph.nodes[nid].edges[i].node_idx
+            if child >= 0:
+                dep[child] += 1
+                stack.append(child)
+
+    # ── Step 2: per-node InputBuffers + seed the root (engine.rs:282-393).
+    var buffers = List[InputBuffer]()
+    for i in range(n):
+        buffers.append(InputBuffer(graph.nodes[i].contrib_counts, root_grad.copy()))
+    buffers[root].add(0, buffers[root].seed_slot(0), root_grad.copy(), ctx)
+    var ready = List[Int]()
+    dep[root] += 1
+    _dec_and_maybe_enqueue(dep, ready, in_queue, root)
+
+    # ── Step 3: drive the queue (engine.rs:437-570). The composite node's LoRA
+    # grads are captured here (the only non-leaf node); the engine routes only its
+    # d_x edge.
+    var out_grads = _K2Grads(
+        root_grad.copy(),
+        Krea2LoraGrad(None, None), Krea2LoraGrad(None, None), Krea2LoraGrad(None, None),
+        Krea2LoraGrad(None, None), Krea2LoraGrad(None, None), Krea2LoraGrad(None, None),
+        Krea2LoraGrad(None, None), Krea2LoraGrad(None, None),
+    )
+    var captured = False
+    var d_x_result = TArc(Tensor(root_grad[].buf.copy(), root_grad[].shape(), root_grad[].dtype()))
+    var have_dx = False
+    var fired = 0
+    while len(ready) > 0:
+        var nid = _pop_best(ready, graph)
+        fired += 1
+        var num_in = graph.nodes[nid].num_inputs
+        var grads_in = List[TArc]()
+        for s in range(num_in):
+            if not buffers[nid].any_present(s):
+                raise Error(
+                    String("execute_krea2_block: node ") + String(nid)
+                    + " missing grad slot " + String(s)
+                )
+            grads_in.append(buffers[nid].materialize(s, ctx))
+
+        if graph.nodes[nid].kind == OPK_LEAF:
+            # The x leaf: the d_x carried here is the engine-routed block-input grad.
+            d_x_result = grads_in[0].copy()
+            have_dx = True
+            continue
+
+        if graph.nodes[nid].kind != OPK_KREA2_SINGLE_BLOCK:
+            raise Error(
+                String("execute_krea2_block: unexpected node kind ")
+                + String(graph.nodes[nid].kind)
+            )
+        if captured:
+            raise Error("execute_krea2_block: more than one composite node fired")
+        var bg = apply_krea2[L, HEADS, KVHEADS, HEADDIM](
+            graph.nodes[nid], grads_in[0],
+            vec, w, lora, cos, sin, cos_q, sin_q, cos_k, sin_k, eps, real_len, ctx,
+        )
+        # Stash the 8 host-list LoRA grads (out-of-band; not engine leaves).
+        out_grads = _K2Grads(
+            bg.d_x.copy(),
+            bg.wq.copy(), bg.wk.copy(), bg.wv.copy(), bg.gate_w.copy(),
+            bg.wo.copy(), bg.mlp_gate_w.copy(), bg.mlp_up_w.copy(), bg.mlp_down_w.copy(),
+        )
+        captured = True
+
+        # Route the composite node's single d_x edge (one grad per next_edge).
+        var n_edges = len(graph.nodes[nid].edges)
+        if n_edges != 1:
+            raise Error(
+                String("execute_krea2_block: composite node must have exactly one edge, got ")
+                + String(n_edges)
+            )
+        var child = graph.nodes[nid].edges[0].node_idx
+        if child >= 0:
+            var slot = graph.nodes[nid].edges[0].input_nr
+            var cslot = graph.nodes[nid].edges[0].contrib_slot
+            buffers[child].add(slot, cslot, bg.d_x.copy(), ctx)
+            _dec_and_maybe_enqueue(dep, ready, in_queue, child)
+
+    if fired != reachable:
+        raise Error(
+            String("execute_krea2_block: fired=") + String(fired)
+            + " != reachable=" + String(reachable)
+            + " (dep-count exactness violated)"
+        )
+    if not captured:
+        raise Error("execute_krea2_block: composite node never fired")
+    if not have_dx:
+        raise Error("execute_krea2_block: x leaf never sank d_x")
+    # The engine-routed d_x (from the leaf) is the authoritative block-input grad.
+    return _K2Grads(
+        d_x_result.copy(),
+        out_grads.wq.copy(), out_grads.wk.copy(), out_grads.wv.copy(), out_grads.gate_w.copy(),
+        out_grads.wo.copy(), out_grads.mlp_gate_w.copy(), out_grads.mlp_up_w.copy(),
+        out_grads.mlp_down_w.copy(),
+    )

@@ -71,6 +71,12 @@ from serenitymojo.models.krea2.krea2_block import (
     _add_scale_one,
 )
 
+# ── Phase 4b autograd_v2 engine arm (the COARSE per-block graph backward) ──────
+from serenitymojo.scratch_ring import ScratchRingAllocator
+from serenitymojo.autograd_v2.krea2_block_graph import (
+    krea2_single_stream_block_graph_backward,
+)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CARRIERS
@@ -742,6 +748,91 @@ def krea2_stack_lora_backward_streamed[
         d_x = bg.d_x[].clone(ctx)
         ctx.synchronize()   # async free discipline: reclaim this block's recompute-acts + backward
         # grads + streamed weights before the next H2D — else the deferred frees accumulate -> OOM.
+        bi -= 1
+        # wbi drops here → device weights free before the next block loads.
+
+    return Krea2StackLoraGrads(grads^, TArc(d_x^))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 4b — autograd_v2 ENGINE backward (the COARSE per-block graph arm)
+# ══════════════════════════════════════════════════════════════════════════════
+def krea2_stack_lora_backward_graph[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_velocity: Tensor,        # [1, imglen, out_ch] upstream grad on the image tokens
+    blk_vec: Tensor,           # [1, 6*features]  block modulation vec
+    tmlp_out: Tensor,          # [1, 1, features] final-layer tvec
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    fwd: Krea2StackForward,
+    cos: Tensor, sin: Tensor,  # [L, HEADDIM/2] per-token RoPE table (untiled)
+    eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackLoraGrads:
+    """autograd_v2 ENGINE replacement for krea2_stack_lora_backward_streamed
+    ([[feedback_all_trainers_autograd_v2]] mandate; Phase 4b). IDENTICAL conductor
+    loop (final-layer frozen bwd → walk N single-stream blocks deepest→shallowest,
+    RE-LOAD each block's frozen weights from the resident fp8 store / disk stream,
+    scatter 8 dA/dB, carry d_x, per-block ctx.synchronize() async-free seam) — but
+    each block's (recompute forward + block backward) pair is driven through the
+    per-block COARSE graph (krea2_single_stream_block_graph_backward), which records
+    ONE composite OPK_KREA2_SINGLE_BLOCK node and calls the WHOLE block backward
+    oracle via execute_krea2_block. Returns the SAME flat LoRA grads + d_combined the
+    streamed conductor returns, BIT-identical (the recompute is folded INTO the
+    coarse arm; the conductor no longer recomputes here). real_len/resident MUST
+    match the forward call (threaded into the re-run forward inside the arm AND the
+    flash-padmask block backward), exactly as the streamed path requires."""
+    comptime features = HEADS * HEADDIM
+
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var grads = List[Krea2LoraGrad]()
+    for _ in range(nblocks * KREA2_SLOTS_PER_BLOCK):
+        grads.append(Krea2LoraGrad(None, None))
+
+    # final-layer backward (frozen) → d into the last single-stream output. Identical
+    # to the streamed path (the engine arm covers ONLY the per-block stack; the
+    # final-layer chain is frozen and stays the hand-chain call).
+    var fin_w = fin.as_stack_weights()
+    var d_x = krea2_final_layer_backward[L, HEADS, HEADDIM](
+        d_velocity, fwd, tmlp_out, fin_w, eps, ctx,
+    )
+
+    var bi = nblocks - 1
+    while bi >= 0:
+        # fp8-resident: dequant from the resident store (NO disk). Else stream H2D.
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)  # H2D this block
+        # COARSE per-block graph: records ONE composite node from the SAVED input,
+        # recomputes the forward + calls the WHOLE block backward oracle inside the
+        # engine apply arm (bit-identical to the streamed conductor's recompute +
+        # block backward pair). d_out for this block is the carried d_x.
+        var bg = krea2_single_stream_block_graph_backward[L, HEADS, KVHEADS, HEADDIM](
+            TArc(Tensor(d_x.buf.copy(), d_x.shape(), d_x.dtype())),
+            fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, scratch, real_len,
+        )
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        grads[base + 0] = bg.wq.copy()
+        grads[base + 1] = bg.wk.copy()
+        grads[base + 2] = bg.wv.copy()
+        grads[base + 3] = bg.gate_w.copy()
+        grads[base + 4] = bg.wo.copy()
+        grads[base + 5] = bg.mlp_gate_w.copy()
+        grads[base + 6] = bg.mlp_up_w.copy()
+        grads[base + 7] = bg.mlp_down_w.copy()
+        d_x = bg.d_x[].clone(ctx)
+        ctx.synchronize()   # async free discipline (same seam as the streamed path)
         bi -= 1
         # wbi drops here → device weights free before the next block loads.
 

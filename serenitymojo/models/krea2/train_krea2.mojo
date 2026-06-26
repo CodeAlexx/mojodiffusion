@@ -57,6 +57,18 @@ from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer
 from std.sys import argv
+from std.time import perf_counter_ns
+
+
+# ── per-phase timing helper (KREA2_PHASE_TIMING): sync, then ms since `t0` ────
+def _phase_ms(name: String, t0: Int, ctx: DeviceContext) raises -> Int:
+    """ctx.synchronize() to drain the phase's async work, print ms since t0, return
+    the new t0. No-op cost when KREA2_PHASE_TIMING is False (the call sites are
+    comptime-guarded so this never runs in production)."""
+    ctx.synchronize()
+    var now = Int(perf_counter_ns())
+    print("  PHASE", name, "=", Float64(now - t0) / 1e6, "ms")
+    return now
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -76,7 +88,8 @@ from serenitymojo.training.lora_adamw_plain_fused import fused_lora_adamw_plain_
 # ── krea2 config + cache reader + LoRA set ────────────────────────────────────
 from serenitymojo.models.krea2.config import krea2_raw
 from serenitymojo.models.krea2.krea2_cache_reader import (
-    KreaTrainCache, krea2_patchify, krea2_build_pos,
+    KreaTrainCache, KreaTrainSample, krea2_patchify, krea2_build_pos,
+    KREA2_LATENT_CHANNELS, KREA2_TXT_LAYERS, KREA2_TXT_DIM,
 )
 from serenitymojo.models.klein.lora_adapter import make_lora_adapter
 from serenitymojo.models.klein.lora_block import (
@@ -120,10 +133,40 @@ comptime NBLOCKS = 28
 comptime EPS = Float32(1.0e-5)
 comptime THETA = Float32(1.0e3)
 
-# the giger 1024px cache: clean [1,16,128,128] → imglen=(128/2)*(128/2)=4096.
-comptime LH = 128
-comptime LW = 128
-comptime IMGLEN = (LH // 2) * (LW // 2)   # 4096
+# ── DIAGNOSTIC: 512px timing arm (KREA2_RES_512, default False) ──────────────
+# 1024px (default): clean [1,16,128,128] → IMGLEN=4096 → LFULL=4864 (L=4864).
+# 512px (diagnostic): clean [1,16,64,64] → IMGLEN=1024 → LFULL=1792 (L=1792).
+# Purpose: confirm the 1024px ~8s/step is the expected cost of the 2.7× longer
+# sequence (ai-toolkit trains krea2 at 512px). The step path is IDENTICAL; only
+# the shapes change. In 512 mode the trainer SYNTHESIZES the sample (random 64×64
+# latents) instead of reading the 128×128 giger cache — step TIME depends on the
+# shapes (L=1792), not the values (lead-approved synthetic for the wall-clock test).
+# Default False = the 1024px production arm, byte-untouched.
+comptime KREA2_RES_512 = False
+
+# ── DIAGNOSTIC: per-phase wall timing (KREA2_PHASE_TIMING, default False) ─────
+# ctx.synchronize() + perf_counter around each per-step phase to expose the split
+# of the L-INDEPENDENT fixed cost (the syncs perturb absolute time but EXPOSE the
+# per-phase ms — that's the goal). Prints "PHASE <name> = <ms>" per step. Pairs
+# with KREA2_RES_512=True (fixed cost is ~46% there, stands out). Default False =
+# production path NOT perturbed.
+comptime KREA2_PHASE_TIMING = False
+
+# ── PERF: GPU grad-norm + folded clip (KREA2_GPU_CLIP, default False) ─────────
+# The MEASURED fixed cost (~4s/step, L-independent, ~49% at 512px / ~24% at 1024px)
+# is the HOST `_clip_lists` (54M bounds-checked scalar `g[i][j]*=s` ops, runs every
+# step since grad_norm > max_norm) + the `_grads_to_lists` deep-copy. THIS path:
+# (1) computes the global L2 norm on GPU (on_device_global_norm — one kernel + a
+# 4-byte D2H, vs the host per-grad to_host + sum loop), (2) FOLDS the clip scale
+# into the GPU AdamW kernel (clip_scale param — a free per-element mul, NO standalone
+# 54M-element host pass). Value-class (NOT bit): the GPU tree-reduction norm differs
+# ~1e-4 from the host F64 sum → a slightly different clip scale s. Default False =
+# the host-clip path (byte-identical C13).
+comptime KREA2_GPU_CLIP = False
+
+comptime LH = 64 if KREA2_RES_512 else 128
+comptime LW = 64 if KREA2_RES_512 else 128
+comptime IMGLEN = (LH // 2) * (LW // 2)   # 1024 (512px) | 4096 (1024px)
 
 # ── LENGTH-BUCKET PAD (the multi-sample fit) ──────────────────────────────────
 # ALL samples pad to a COMMON text length LTMAX → one LFULL = LTMAX + IMGLEN size
@@ -402,6 +445,10 @@ def _train_one_sample(
         # T2.B fp8-quantized-resident base (cfg.quantized_resident=="fp8_e4m3").
         # None (default) = the per-step disk stream from `st` (C13 byte-identical).
 ) raises -> _StepOut:
+    var _pt = 0
+    comptime if KREA2_PHASE_TIMING:
+        ctx.synchronize(); _pt = Int(perf_counter_ns())
+
     # ── flow-match noise in LATENT space (before patchify; krea2.py order) ──────
     # x_t = (1-sigma)*clean + sigma*noise ; target = noise - clean  (krea2.py:403).
     var noise = _gaussian_like(clean, noise_seed, ctx)        # [1,16,LH,LW] F32
@@ -411,6 +458,8 @@ def _train_one_sample(
     var img = krea2_patchify[LH, LW](noised_lat, ctx)
     # target on the IMAGE tokens, patchified the same way → [1, IMGLEN, 64].
     var target_img = krea2_patchify[LH, LW](fm.target, ctx)
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("noise+patchify", _pt, ctx)
 
     # ── conditioning (frozen prefix) → combined / blk_vec / tmlp_out / rope ─────
     # Monomorphized on the BUCKET text length LTMAX (context is padded to LTMAX). The
@@ -422,6 +471,8 @@ def _train_one_sample(
     var cond = _build_conditioning[LTMAX, LFULL](
         cond_w, img, context, pos, t1, lt, ctx,
     )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("conditioning_fwd", _pt, ctx)
 
     # ── length-bucket flash-padmask: the valid contiguous prefix length. lt == LTMAX
     # → real_len == LFULL → the block's no-mask (full-attn) path (no extra masking).
@@ -433,6 +484,8 @@ def _train_one_sample(
         st, key_prefix, NBLOCKS, lora, fin,
         cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
     )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_forward", _pt, ctx)
 
     # ── flow-match MSE loss (levers; default MSE) on the image-token velocity ───
     var pred_h = fwd.velocity[].to_host(ctx)                  # [IMGLEN*64]
@@ -442,6 +495,8 @@ def _train_one_sample(
     var d_velocity = Tensor.from_host(
         lg.d_pred, [1, IMGLEN, OUT_CH], STDtype.F32, ctx,
     )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("loss+to_host", _pt, ctx)
 
     # ── streaming stack backward (hand-chain default; v2 arm Phase 4b) ──────────
     var grads: Krea2StackLoraGrads
@@ -491,7 +546,12 @@ def _train_one_sample(
                 cond.cos, cond.sin, EPS, ctx, real_len, resident,
             )
 
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_backward", _pt, ctx)
+
     var gn = _grad_norm(grads)
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("grad_norm", _pt, ctx)
     return _StepOut(grads^, loss, gn)
 
 
@@ -512,6 +572,30 @@ from serenitymojo.ops.random import randn
 
 def _gaussian_like(like: Tensor, seed: UInt64, ctx: DeviceContext) raises -> Tensor:
     return randn(like.shape(), seed, STDtype.F32, ctx)
+
+
+# DIAGNOSTIC (KREA2_RES_512): a SYNTHETIC sample at the comptime LH/LW dims — the
+# step TIME depends on the shapes (L=LFULL), not the values, so random latents are
+# fine for the wall-clock test (lead-approved). Shapes mirror sample_padded's output
+# (context already padded to LTMAX). text_len = LTMAX so real_len = LTMAX+IMGLEN =
+# LFULL (no pad tail) — the same flash path the 1024px arm runs, just shorter L.
+from serenitymojo.ops.cast import cast_tensor as _cast_t
+
+
+def _synthetic_sample(idx: Int, ctx: DeviceContext) raises -> KreaTrainSample:
+    var seed = UInt64(4242) + UInt64(idx)
+    var clean = randn(
+        [1, KREA2_LATENT_CHANNELS, LH, LW], seed, STDtype.F32, ctx
+    )
+    var img = randn([1, IMGLEN, 64], seed + 1, STDtype.F32, ctx)
+    var context = _cast_t(
+        randn([1, LTMAX, KREA2_TXT_LAYERS, KREA2_TXT_DIM], seed + 2, STDtype.F32, ctx),
+        STDtype.BF16, ctx,
+    )
+    var pos = krea2_build_pos[LH, LW](LTMAX, ctx)        # [1, LFULL, 3]
+    return KreaTrainSample(
+        TArc(clean^), TArc(img^), TArc(context^), TArc(pos^), LTMAX, idx,
+    )
 
 
 def _grad_norm(grads: Krea2StackLoraGrads) -> Float32:
@@ -717,7 +801,11 @@ def main() raises:
     for step in range(steps):
         var idx = order[step % n]   # LT-bucketed order kept (harmless; padding makes all
         # samples one LFULL size class — the real pool fragmentation fix).
-        var sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)  # context+pos padded to LTMAX
+        var sample: KreaTrainSample
+        comptime if KREA2_RES_512:
+            sample = _synthetic_sample(idx, ctx)   # diagnostic 512px timing arm
+        else:
+            sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)  # context+pos padded to LTMAX
         var lt = sample.text_len    # natural caption length (for the additive pad mask)
 
         # flow-match t (= blend coeff = model timestep) per step (seed + step stream).
@@ -726,8 +814,14 @@ def main() raises:
         )
         var noise_seed = seed_base * UInt64(7919) + UInt64(step)
 
+        var _ot = 0
+        comptime if KREA2_PHASE_TIMING:
+            ctx.synchronize(); _ot = Int(perf_counter_ns())
+
         # device LoRA set for THIS step (small; rebuilt from the host authoritative).
         var dev_lora = _host_to_device_lora(host_lora, ctx)
+        comptime if KREA2_PHASE_TIMING:
+            _ot = _phase_ms("host_to_device_lora", _ot, ctx)
 
         var so = _step_dispatch(
             st, key_prefix,
@@ -739,14 +833,28 @@ def main() raises:
         # extract flat grad lists, then global-norm clip (max_grad_norm).
         var gn = so.grad_norm
         var gl = _grads_to_lists(so.grads, n_adapters)
-        _clip_lists(gl, gn, cfg.max_grad_norm)
+        var clip_scale = Float32(1.0)
+        comptime if KREA2_GPU_CLIP:
+            # FOLD the clip into the AdamW kernel: compute the scale here, skip the
+            # 54M-element host _clip_lists, pass the scale to the optimizer (free GPU
+            # mul). (gn is the host grad_norm; a GPU on_device_global_norm follow-on
+            # would also kill the 62ms host norm loop — separate, smaller.)
+            if gn > cfg.max_grad_norm and gn > Float32(0.0):
+                clip_scale = cfg.max_grad_norm / gn
+        else:
+            _clip_lists(gl, gn, cfg.max_grad_norm)
+        comptime if KREA2_PHASE_TIMING:
+            _ot = _phase_ms("grads_to_lists+clip", _ot, ctx)
 
         # ── LoRA AdamW (default ADAMW; C13 flags-off). Fused plain step over the
         # full host set; mutates a/b + moments in place. ────────────────────────
         fused_lora_adamw_plain_step(
             host_lora, gl.d_a, gl.d_b, 0, n_adapters, step + 1,
             cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay, ctx,
+            clip_scale,
         )
+        comptime if KREA2_PHASE_TIMING:
+            _ot = _phase_ms("optimizer_adamw", _ot, ctx)
 
         print(step, "  ", idx, "  ", lt, "  ", sigma, "  ", so.loss, "  ", gn)
         ctx.synchronize()   # per-STEP async free discipline: reclaim this step's tensors

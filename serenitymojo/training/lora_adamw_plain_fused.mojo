@@ -8,7 +8,7 @@
 # WHY: the Z-Image product trainer's optim stage is the host scalar loop
 # (`_lora_adamw` → `_adamw_host_list`) over ~28M adapter elements — MEASURED
 # 2026-06-11 at 0.183-0.190 s of a 2.0-2.1 s step (TIMING lines, 5-step run,
-# alina_zimage 64x64 bucket). Same disease Klein had at 6.0 s (fixed 06-10).
+# zimage 64x64 bucket). Same disease Klein had at 6.0 s (fixed 06-10).
 #
 # Per-element math mirrored EXACTLY from `_adamw_host_list`
 # (training/train_step.mojo:242):
@@ -59,11 +59,13 @@ def _lora_adamw_plain_kernel(
     bc2: Float32,
     eps: Float32,
     weight_decay: Float32,
+    clip_scale: Float32,   # global-norm clip factor (1.0 = no clip); folded here so
+    # the clip is a free per-element GPU mul (no separate 54M-element host pass).
 ):
     var gid = Int(global_idx.x)
     if gid >= total:
         return
-    var gv = rebind[Scalar[DType.float32]](g[gid])
+    var gv = rebind[Scalar[DType.float32]](g[gid]) * clip_scale
     var mi = beta1 * rebind[Scalar[DType.float32]](m[gid]) + (
         Float32(1.0) - beta1
     ) * gv
@@ -94,6 +96,8 @@ def fused_lora_adamw_plain_step(
     eps: Float32,
     weight_decay: Float32,
     ctx: DeviceContext,
+    clip_scale: Float32 = Float32(1.0),   # global-norm clip factor folded into the
+    # kernel (default 1.0 = no clip = byte-identical to the pre-clip-param callers).
 ) raises:
     """One fused PLAIN-AdamW step over adapters[start:end] (A and B params).
     Mutates a/b (bf16 RNE writeback) and ma/va/mb/vb (plain F32 moments) in
@@ -220,7 +224,7 @@ def fused_lora_adamw_plain_step(
 
     var grid = (total + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_lora_adamw_plain_kernel, _lora_adamw_plain_kernel](
-        P, G, M, V, total, lr, beta1, beta2, bc1, bc2, eps, weight_decay,
+        P, G, M, V, total, lr, beta1, beta2, bc1, bc2, eps, weight_decay, clip_scale,
         grid_dim=grid, block_dim=_BLOCK,
     )
 

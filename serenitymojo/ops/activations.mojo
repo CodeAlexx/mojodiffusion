@@ -488,6 +488,106 @@ def swiglu(x_gate: Tensor, x_up: Tensor, ctx: DeviceContext) raises -> Tensor:
     return Tensor(out_buf^, x_gate.shape(), x_gate.dtype())
 
 
+# Packed SwiGLU kernels: gate_up is [.., 2F] laid out [gate(F) | up(F)] per row.
+# One thread per output element reads both halves directly (gate at base+c,
+# up at base+f+c) so callers skip the two channel slices (MJ-1006).
+def _swiglu_packed_kernel_f32(
+    gu: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n_out: Int,
+    f: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n_out:
+        var base = (i // f) * (2 * f)
+        var c = i % f
+        var gv = rebind[Scalar[DType.float32]](gu[base + c])
+        var uv = rebind[Scalar[DType.float32]](gu[base + f + c])
+        o[i] = rebind[o.element_type](_silu_f32(gv) * uv)
+
+
+def _swiglu_packed_kernel_bf16(
+    gu: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    n_out: Int,
+    f: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n_out:
+        var base = (i // f) * (2 * f)
+        var c = i % f
+        var gv = rebind[Scalar[DType.bfloat16]](gu[base + c]).cast[DType.float32]()
+        var uv = rebind[Scalar[DType.bfloat16]](gu[base + f + c]).cast[DType.float32]()
+        o[i] = rebind[o.element_type]((_silu_f32(gv) * uv).cast[DType.bfloat16]())
+
+
+def _swiglu_packed_kernel_f16(
+    gu: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    n_out: Int,
+    f: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n_out:
+        var base = (i // f) * (2 * f)
+        var c = i % f
+        var gv = rebind[Scalar[DType.float16]](gu[base + c]).cast[DType.float32]()
+        var uv = rebind[Scalar[DType.float16]](gu[base + f + c]).cast[DType.float32]()
+        o[i] = rebind[o.element_type]((_silu_f32(gv) * uv).cast[DType.float16]())
+
+
+def swiglu_packed(gate_up: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """SwiGLU of a packed [.., 2F] tensor ([gate|up] channel halves) -> [.., F].
+    Equivalent to swiglu(gate_up[..,:F], gate_up[..,F:2F]) but reads the packed
+    buffer directly, skipping the two channel slices + their buffers (MJ-1006)."""
+    var gushape = gate_up.shape()
+    var last = gushape[len(gushape) - 1]
+    if last % 2 != 0:
+        raise Error("swiglu_packed: last dim must be even (2F)")
+    var f = last // 2
+    var n_out = gate_up.numel() // 2
+    var dt = gate_up.dtype().to_mojo_dtype()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](gate_up.nbytes() // 2)
+    var gu_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](gate_up.numel()))
+    var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n_out))
+    var grid = (n_out + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var GU = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            gate_up.buf.unsafe_ptr().bitcast[Float32](), gu_rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), o_rl
+        )
+        ctx.enqueue_function[_swiglu_packed_kernel_f32, _swiglu_packed_kernel_f32](
+            GU, O, n_out, f, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var GU = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            gate_up.buf.unsafe_ptr().bitcast[BFloat16](), gu_rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
+        )
+        ctx.enqueue_function[_swiglu_packed_kernel_bf16, _swiglu_packed_kernel_bf16](
+            GU, O, n_out, f, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var GU = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            gate_up.buf.unsafe_ptr().bitcast[Float16](), gu_rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), o_rl
+        )
+        ctx.enqueue_function[_swiglu_packed_kernel_f16, _swiglu_packed_kernel_f16](
+            GU, O, n_out, f, grid_dim=grid, block_dim=_BLOCK
+        )
+    var out_shape = List[Int]()
+    for i in range(len(gushape) - 1):
+        out_shape.append(gushape[i])
+    out_shape.append(f)
+    return Tensor(out_buf^, out_shape^, gate_up.dtype())
+
+
 def swiglu_slab(
     x_gate: Tensor, x_up: Tensor, ctx: DeviceContext, mut slab: StepSlab
 ) raises -> Tensor:

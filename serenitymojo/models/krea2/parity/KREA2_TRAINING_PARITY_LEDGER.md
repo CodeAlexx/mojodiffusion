@@ -229,3 +229,23 @@ on 24GB; doesn't fit even alone. krea2's block (L=4864 D=6144 MLP=16384) >> zima
 **DECISION (user "Bank the 9×"):** the capture speed needs per-node slab freeing (engine-level
 change to the shared StepSlab) — filed MJ-0917. Banked at the bit-exact Phase 1 engine arm
 (KREA2_V2_GRAPH host-grad, Klein-style no-slab/capture) + the 9× (MJ-0828) as the shipped speed.
+
+## Speed campaign (2026-06-26) — host-bound REFUTED; ceiling is the GEMM backend
+
+User: "OneTrainer 2.xx / ai-toolkit 3.xx — 7s isn't the limit; host-bound, kill the to_host syncs."
+MEASURED outcome (RELIABILITY: every flag default-off, default byte-identical, gated experiments committed):
+
+- **COMPUTE-bound, not host-bound** — clean dmon (no nsys): mean SM 91.6%, GPU<50% only 5% of wall, mem-util ~0.
+- **to_host kill measured = NO win.** Built KREA2_DEVICE_LORA_GRAD (per-block batched D2H, 224->28 syncs, fits 24GB
+  at min-free 1075MB; loss bit-identical; committed 42a4d05). External-wall A/B (12 steps): HOST 141.83s vs DEVICE
+  143.52s = **-0.14s/step**. The 224 to_host bounces are NOT the bottleneck → host-bound REFUTED.
+- **ai-toolkit (the oracle) RECOMPUTES too** (gradient checkpointing, mmdit.py:446) + keeps grads on-device → recompute
+  isn't the gap; the to_host is real but ~0.3s.
+- **Kernel-family breakdown** (working pre-fix nsys minus the rms_norm-d_g bug): GEMM 63%, flash 22%, elementwise 9.4%,
+  bias 2.5%. Big mlp GEMM (4864x16384x6144) ~49% of peak (980 GFLOP/12.6ms) vs cuBLAS ~70%.
+- **RMS_NORM_VEC (Lever B6, committed b70f662, gated-off)**: vec2 loads only 1.05x — kernel is bandwidth-bound, NOT the
+  audit's 1.5-2x. LESSON: small ops are bandwidth-bound → fusion (fewer passes), not wider loads.
+
+**Conclusion:** the dominant ~3s lever is the **GEMM efficiency (49%->70%) = the MAX cutlass-config for krea2's shapes,
+below the trainer layer** (same ceiling the slab hit). Trainer-addressable ~5-6% via fusion (B4-B6 + bias-fusion).
+Shipped speed remains the 9x (rms_norm fix). Tooling: nsys post-fix conversion bugged, ncu ERR_NVGPUCTRPERM. KNOWN_ISSUES MJ-0829.

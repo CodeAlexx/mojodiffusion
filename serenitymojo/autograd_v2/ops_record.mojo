@@ -222,6 +222,11 @@ def sdpa_backward_dispatch(
         return SdpaGradArcs(
             arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
         )
+    if B == 1 and S == 2432 and H == 48 and Dh == 128:
+        var sb = sdpa_backward[1, 2432, 48, 128](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
     raise Error(
         String("sdpa_backward_dispatch: no comptime bucket for (B,S,H,Dh)=(")
         + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh)
@@ -520,6 +525,11 @@ def sdpa_backward_dispatch_slab(
         )
     if B == 1 and S == 4864 and H == 48 and Dh == 128:
         var sb = sdpa_backward_slab[1, 4864, 48, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 1 and S == 2432 and H == 48 and Dh == 128:
+        var sb = sdpa_backward_slab[1, 2432, 48, 128](q, k, v, d_out, scale, ctx, slab)
         return SdpaGradArcs(
             arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
         )
@@ -1287,9 +1297,11 @@ from serenitymojo.autograd_v2.node import (
 )
 # ── krea2 FINE-GRAINED record wrappers (this session). The 3 krea2-specific
 # kinds + record_mul (krea2 needs the OPK_MUL recorder zimage never recorded).
-from serenitymojo.ops.tensor_algebra import mul as _ta_mul_k2
-from serenitymojo.ops.activations import sigmoid as _act_sigmoid
-from serenitymojo.ops.gqa_backward import repeat_kv_f32 as _gqa_repeat_kv
+from serenitymojo.ops.tensor_algebra import mul as _ta_mul_k2, mul_slab as _ta_mul_k2_slab
+from serenitymojo.ops.activations import sigmoid as _act_sigmoid, sigmoid_slab as _act_sigmoid_slab
+from serenitymojo.ops.gqa_backward import (
+    repeat_kv_f32 as _gqa_repeat_kv, repeat_kv_f32_slab as _gqa_repeat_kv_slab,
+)
 from serenitymojo.models.krea2.krea2_block import (
     _linear_lora as _k2_linear_lora,
 )
@@ -1424,3 +1436,132 @@ def record_krea2_single_block[
     out_ids.append(out_t.id)
     _ = g.record(_OPK_K2, edges^, saved^, meta^, scal^, out_ids)
     return TArc(out_t^)
+
+
+# ── krea2 slab record variants (activation-checkpointing slab path, contract C8).
+# BYTE-IDENTICAL recording to the non-slab krea2 wrappers (same edges/saved/meta/
+# scalars, same C15 slots); only the forward op's allocation source is the slab.
+def record_add_slab(mut g: Graph, a: TArc, b: TArc, ctx: DeviceContext, mut slab: StepSlab) raises -> TArc:
+    """StepSlab variant of `record_add` — the OPK_ADD forward allocs from slab
+    (the backward arm is allocation-free)."""
+    var y = add_slab(a[], b[], ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(a[].id))
+    edges.append(g.edge_for(b[].id))
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_ADD, edges^, List[TArc](), List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_mul_slab(mut g: Graph, a: TArc, b: TArc, ctx: DeviceContext, mut slab: StepSlab) raises -> TArc:
+    """StepSlab variant of `record_mul`."""
+    var y = _ta_mul_k2_slab(a[], b[], ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(a[].id))
+    edges.append(g.edge_for(b[].id))
+    var saved = List[TArc]()
+    saved.append(a.copy())
+    saved.append(b.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(_OPK_MUL_K2, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_repeat_kv_slab(
+    mut g: Graph, x: TArc, L: Int, kvheads: Int, n_rep: Int, headdim: Int,
+    ctx: DeviceContext, mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab variant of `record_repeat_kv`."""
+    var y = _gqa_repeat_kv_slab(x[], L, kvheads, n_rep, headdim, ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var meta: List[Int] = [L, kvheads, n_rep, headdim]
+    var oids: List[Int] = [y.id]
+    _ = g.record(_OPK_REPEAT_KV, edges^, List[TArc](), meta^, List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_sigmoid_slab(mut g: Graph, x: TArc, ctx: DeviceContext, mut slab: StepSlab) raises -> TArc:
+    """StepSlab variant of `record_sigmoid`."""
+    var y = _act_sigmoid_slab(x[], ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(_OPK_SIGMOID, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_sdpa_nomask_slab[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    mut g: Graph, q: TArc, k: TArc, v: TArc, scale: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """ALWAYS-math (sdpa_nomask) StepSlab SDPA recorder — the krea2 no-pad math
+    slab arm. Unlike `record_sdpa_slab` it does NOT branch on ZIMAGE_SDPA_FLASH
+    (krea2's math gate is deterministic full attention). saved [q,k,v] → the
+    OPK_SDPA non-flash arm. Byte-identical recording to `record_sdpa` (non-slab)
+    except the forward allocs from slab."""
+    var y = sdpa_nomask_slab[B, S, H, Dh](q[], k[], v[], scale, ctx, slab)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(q[].id))
+    edges.append(g.edge_for(k[].id))
+    edges.append(g.edge_for(v[].id))
+    var saved = List[TArc]()
+    saved.append(q.copy())
+    saved.append(k.copy())
+    saved.append(v.copy())
+    var meta: List[Int] = [B, S, H, Dh]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_SDPA, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)
+
+
+def record_sdpa_flash_nopad_slab[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    mut g: Graph, q: TArc, k: TArc, v: TArc, scale: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """FLASH (cuDNN, no-pad full attention) StepSlab SDPA recorder — the krea2
+    PRODUCTION attn arm (O(L), no [B*H*S,S] scores; the math sdpa_nomask's O(L²)
+    scores are why the math attn segment is 13.4GB — flash removes them). Records
+    OPK_SDPA with the 8-tensor flash saved set (saved 0..2 = q/k/v placeholders,
+    3..7 = q_pad/k_pad/v_pad/o_pad/stats) → the existing OPK_SDPA flash arm
+    (len(saved)>=8 → sdpa_flash_backward_dispatch). The flash fwd allocs POOL (not
+    slab) — fine: we are NOT capturing (capture OFF); the slab is for the alloc-free
+    LINEAR ops. F32 acts→bf16→flash→F32 out (no-op in F32; the krea2 acts boundary).
+    flash dQ nondeterministic → grads are value-tolerance class (NOT bit), so this
+    arm is the TRAINER path; the bit gate uses record_sdpa_nomask_slab (math)."""
+    var q_bf = cast_tensor(q[], STDtype.BF16, ctx)
+    var k_bf = cast_tensor(k[], STDtype.BF16, ctx)
+    var v_bf = cast_tensor(v[], STDtype.BF16, ctx)
+    var ff = sdpa_flash_train_fwd[B, S, H, Dh](q_bf, k_bf, v_bf, scale, ctx)
+    var y = cast_tensor(ff.o, q[].dtype(), ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(q[].id))
+    edges.append(g.edge_for(k[].id))
+    edges.append(g.edge_for(v[].id))
+    var saved = List[TArc]()
+    saved.append(q.copy())
+    saved.append(k.copy())
+    saved.append(v.copy())
+    saved.append(TArc(Tensor(ff.q_pad.buf.copy(), ff.q_pad.shape(), ff.q_pad.dtype())))
+    saved.append(TArc(Tensor(ff.k_pad.buf.copy(), ff.k_pad.shape(), ff.k_pad.dtype())))
+    saved.append(TArc(Tensor(ff.v_pad.buf.copy(), ff.v_pad.shape(), ff.v_pad.dtype())))
+    saved.append(TArc(Tensor(ff.o_pad.buf.copy(), ff.o_pad.shape(), ff.o_pad.dtype())))
+    saved.append(TArc(Tensor(ff.stats.buf.copy(), ff.stats.shape(), ff.stats.dtype())))
+    var meta: List[Int] = [B, S, H, Dh]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_SDPA, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)

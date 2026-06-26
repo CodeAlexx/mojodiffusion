@@ -31,6 +31,7 @@ from serenitymojo.ops.random import randn
 from serenitymojo.ops.tensor_algebra import add_scalar, mul_scalar, zeros_device
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.scratch_ring import ScratchRingAllocator
+from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.models.dit.krea2_dit import _tile_rope_table
 from serenitymojo.models.klein.lora_adapter import make_lora_adapter
 from serenitymojo.models.klein.lora_block import (
@@ -43,6 +44,7 @@ from serenitymojo.models.krea2.krea2_block import (
 )
 from serenitymojo.autograd_v2.krea2_block_graph import (
     krea2_single_stream_block_graph_backward,
+    krea2_single_stream_block_graph_backward_seg,
 )
 
 comptime TArc = ArcPointer[Tensor]
@@ -229,3 +231,30 @@ def main() raises:
         print("KREA2 BLOCK PARITY PASS (engine == hand-chain, bit-equal)")
     else:
         raise Error(String("KREA2 BLOCK PARITY FAIL: total mismatches ") + String(total))
+
+    # ── SEGMENTED StepSlab arm (MATH, KREA2_SLAB_FLASH=False): the 2-segment
+    # checkpoint (mlp K=3 + attn) device-grad backward must ALSO == the hand-chain
+    # n_mismatch=0 — the math-exactness proof of the segmentation (recompute exact;
+    # the residual-seam composition = the whole-block backward). Carrier b → the
+    # returned grads are host lists (comparable via _cmp_pair). The slab outlives
+    # this block. (FLASH path is value-tolerance, not this bit gate — gate is math.)
+    print("── segmented slab arm (math) ──")
+    var slab = StepSlab(ctx, 8 * 1024 * 1024 * 1024)
+    var segb = krea2_single_stream_block_graph_backward_seg[L, HEADS, KVHEADS, HEADDIM](
+        _arc(d_out), _arc(x), vec, w, lora,
+        cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, slab, rl,
+    )
+    var ts = 0
+    ts += _diff_t("d_x", hand.d_x[], segb.d_x[], ctx)
+    ts += _cmp_pair("wq", hand.wq, segb.wq)
+    ts += _cmp_pair("wk", hand.wk, segb.wk)
+    ts += _cmp_pair("wv", hand.wv, segb.wv)
+    ts += _cmp_pair("gate_w", hand.gate_w, segb.gate_w)
+    ts += _cmp_pair("wo", hand.wo, segb.wo)
+    ts += _cmp_pair("mlp_gate_w", hand.mlp_gate_w, segb.mlp_gate_w)
+    ts += _cmp_pair("mlp_up_w", hand.mlp_up_w, segb.mlp_up_w)
+    ts += _cmp_pair("mlp_down_w", hand.mlp_down_w, segb.mlp_down_w)
+    if ts == 0:
+        print("KREA2 BLOCK PARITY (SEGMENTED SLAB) PASS (engine == hand-chain, bit-equal)")
+    else:
+        raise Error(String("KREA2 BLOCK PARITY (SEGMENTED SLAB) FAIL: total mismatches ") + String(ts))

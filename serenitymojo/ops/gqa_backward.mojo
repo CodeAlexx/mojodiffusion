@@ -21,6 +21,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 comptime _DYN1 = Layout.row_major(-1)
@@ -181,5 +182,107 @@ def repeat_kv_backward(
             _repeat_kv_bwd_kernel[DType.float16],
         ](DDST, DSRC, s, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
     # sync removed (single-stream ordering; was kernel-trailing host stall)
+    var sh = [1, s, h_kv, dh]
+    return Tensor(out_buf^, sh^, d_dst.dtype())
+
+
+# ── StepSlab variants (autograd_v2 capture path, contract C8) ────────────────
+# BYTE-IDENTICAL to repeat_kv_f32 / repeat_kv_backward except the output buffer
+# comes from slab.alloc — same kernels, same grid/launch, so the C14 bit-gates
+# hold. The n_rep==1 fast path also slab-allocs (a pool buffer there would break
+# capture's stable-pointer invariant).
+def repeat_kv_f32_slab(
+    x: Tensor, s: Int, h_kv: Int, n_rep: Int, dh: Int, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `repeat_kv_f32`."""
+    if n_rep == 1:
+        var dev0 = slab.alloc(x.nbytes())
+        ctx.enqueue_copy(dst_buf=dev0, src_buf=x.buf)
+        return Tensor(dev0^, x.shape(), x.dtype())
+    var h = h_kv * n_rep
+    var out_n = s * h * dh
+    var src_n = s * h_kv * dh
+    var out_buf = slab.alloc(out_n * x.dtype().byte_size())
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](src_n))
+    var out_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_n))
+    var grid = (out_n + _BLOCK - 1) // _BLOCK
+    var dt = x.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var SRC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        var DST = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), out_rl)
+        ctx.enqueue_function[
+            _repeat_kv_fwd_kernel[DType.float32],
+            _repeat_kv_fwd_kernel[DType.float32],
+        ](SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var SRC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        var DST = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), out_rl)
+        ctx.enqueue_function[
+            _repeat_kv_fwd_kernel[DType.bfloat16],
+            _repeat_kv_fwd_kernel[DType.bfloat16],
+        ](SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var SRC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        var DST = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), out_rl)
+        ctx.enqueue_function[
+            _repeat_kv_fwd_kernel[DType.float16],
+            _repeat_kv_fwd_kernel[DType.float16],
+        ](SRC, DST, s, h, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
+    var sh = [1, s, h, dh]
+    return Tensor(out_buf^, sh^, x.dtype())
+
+
+def repeat_kv_backward_slab(
+    d_dst: Tensor, s: Int, h_kv: Int, n_rep: Int, dh: Int, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `repeat_kv_backward`."""
+    if n_rep == 1:
+        var dev0 = slab.alloc(d_dst.nbytes())
+        ctx.enqueue_copy(dst_buf=dev0, src_buf=d_dst.buf)
+        return Tensor(dev0^, d_dst.shape(), d_dst.dtype())
+    var src_n = s * h_kv * dh
+    var dst_n = s * h_kv * n_rep * dh
+    if d_dst.numel() != dst_n:
+        raise Error("repeat_kv_backward_slab: d_dst numel mismatch")
+    var out_buf = slab.alloc(src_n * d_dst.dtype().byte_size())
+    var src_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](src_n))
+    var dst_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](dst_n))
+    var grid = (src_n + _BLOCK - 1) // _BLOCK
+    var dt = d_dst.dtype().to_mojo_dtype()
+    if dt == DType.float32:
+        var DDST = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            d_dst.buf.unsafe_ptr().bitcast[Float32](), dst_rl)
+        var DSRC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), src_rl)
+        ctx.enqueue_function[
+            _repeat_kv_bwd_kernel[DType.float32],
+            _repeat_kv_bwd_kernel[DType.float32],
+        ](DDST, DSRC, s, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var DDST = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            d_dst.buf.unsafe_ptr().bitcast[BFloat16](), dst_rl)
+        var DSRC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), src_rl)
+        ctx.enqueue_function[
+            _repeat_kv_bwd_kernel[DType.bfloat16],
+            _repeat_kv_bwd_kernel[DType.bfloat16],
+        ](DDST, DSRC, s, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var DDST = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            d_dst.buf.unsafe_ptr().bitcast[Float16](), dst_rl)
+        var DSRC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), src_rl)
+        ctx.enqueue_function[
+            _repeat_kv_bwd_kernel[DType.float16],
+            _repeat_kv_bwd_kernel[DType.float16],
+        ](DDST, DSRC, s, h_kv, dh, n_rep, grid_dim=grid, block_dim=_BLOCK)
     var sh = [1, s, h_kv, dh]
     return Tensor(out_buf^, sh^, d_dst.dtype())

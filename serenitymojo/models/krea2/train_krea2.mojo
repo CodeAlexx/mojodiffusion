@@ -89,10 +89,11 @@ from serenitymojo.models.krea2.krea2_stack import (
     Krea2StackLora, Krea2StackForward, Krea2StackLoraGrads,
     Krea2StreamFinal, KREA2_SLOTS_PER_BLOCK,
     krea2_stack_lora_forward_streamed, krea2_stack_lora_backward_streamed,
-    krea2_stack_lora_backward_graph,
+    krea2_stack_lora_backward_graph, krea2_stack_lora_backward_graph_slab,
     Krea2ResidentFp8, build_krea2_resident_fp8,
 )
 from serenitymojo.scratch_ring import ScratchRingAllocator
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 # ── frozen conditioning prefix (REUSE the inference krea2_forward pieces) ──────
 from serenitymojo.models.dit.krea2_dit import (
@@ -139,6 +140,14 @@ comptime LFULL = LTMAX + IMGLEN           # 4864 — the single comptime arm for
 # all-trainers-v2 mandate ([[feedback_all_trainers_autograd_v2]]) flips this in
 # Phase 4b once the per-block engine bit-gate lands; default-off stays byte-exact.
 comptime KREA2_V2_GRAPH = False
+# ── StepSlab segmented (engine+slab+FLASH) backward path. Requires KREA2_V2_GRAPH.
+# The 2-segment activation-checkpointed slab arm (alloc-free; per-segment slab peak
+# ~6.65GB fits the 12GB fp8 base on 24GB — the whole-block slab was 12.2GB). DEFAULT
+# FALSE (C13). When True, ALSO set krea2_block.mojo:KREA2_SLAB_FLASH=True so the attn
+# runs cuDNN flash (O(L)) — the math attn (O(L²) scores) is 13.4GB and does NOT fit;
+# flash grads are value-tolerance (NOT bit). The block bit gate keeps KREA2_SLAB_FLASH
+# False (math, bit-exact).
+comptime KREA2_V2_SLAB = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -426,17 +435,30 @@ def _train_one_sample(
     # ── streaming stack backward (hand-chain default; v2 arm Phase 4b) ──────────
     var grads: Krea2StackLoraGrads
     comptime if KREA2_V2_GRAPH:
-        # Phase 4b: autograd_v2 engine arm (drop-in, SAME conductor loop + slots).
-        # The coarse per-block graph calls the WHOLE block backward oracle, so this
-        # is bit-identical to the streamed hand-chain ([[feedback_all_trainers_autograd_v2]]).
-        # The scratch ring is a no-op safety bracket for the coarse arm (the oracle
-        # manages its own transient device allocations); a small ring suffices.
-        var scratch_v2 = ScratchRingAllocator(ctx, 64 * 1024 * 1024, 2)
-        grads = krea2_stack_lora_backward_graph[LFULL, HEADS, KVHEADS, HEADDIM](
-            d_velocity, cond.blk_vec, cond.tmlp_out,
-            st, key_prefix, NBLOCKS, lora, fin, fwd,
-            cond.cos, cond.sin, EPS, ctx, scratch_v2, real_len, resident,
-        )
+        comptime if KREA2_V2_SLAB:
+            # engine+slab+FLASH: the 2-segment activation-checkpointed slab backward
+            # (alloc-free; per-segment slab ~6.65GB fits the 12GB fp8 base on 24GB).
+            # ONE StepSlab allocated once + reset per block; attn = cuDNN flash
+            # (KREA2_SLAB_FLASH=True at build). 8GB slab (the worst segment 6.65GB +
+            # margin). NO capture (capture OFF — the speed is engine+slab+flash).
+            var slab = StepSlab(ctx, 8 * 1024 * 1024 * 1024)
+            grads = krea2_stack_lora_backward_graph_slab[LFULL, HEADS, KVHEADS, HEADDIM](
+                d_velocity, cond.blk_vec, cond.tmlp_out,
+                st, key_prefix, NBLOCKS, lora, fin, fwd,
+                cond.cos, cond.sin, EPS, ctx, slab, real_len, resident,
+            )
+        else:
+            # Phase 4b: autograd_v2 engine arm (drop-in, SAME conductor loop + slots).
+            # The coarse per-block graph calls the WHOLE block backward oracle, so this
+            # is bit-identical to the streamed hand-chain ([[feedback_all_trainers_autograd_v2]]).
+            # The scratch ring is a no-op safety bracket for the coarse arm (the oracle
+            # manages its own transient device allocations); a small ring suffices.
+            var scratch_v2 = ScratchRingAllocator(ctx, 64 * 1024 * 1024, 2)
+            grads = krea2_stack_lora_backward_graph[LFULL, HEADS, KVHEADS, HEADDIM](
+                d_velocity, cond.blk_vec, cond.tmlp_out,
+                st, key_prefix, NBLOCKS, lora, fin, fwd,
+                cond.cos, cond.sin, EPS, ctx, scratch_v2, real_len, resident,
+            )
     else:
         grads = krea2_stack_lora_backward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
             d_velocity, cond.blk_vec, cond.tmlp_out,

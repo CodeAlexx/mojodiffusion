@@ -45,6 +45,16 @@ from serenitymojo.io.dtype import STDtype
 
 comptime TArc = ArcPointer[Tensor]
 
+# autograd_v2 slab-block attn sdpa switch (krea2_block_graph.mojo slab recorder):
+# False = MATH sdpa_nomask (deterministic, the BIT GATE path — bit-exact vs the
+# hand-chain). True = cuDNN FLASH (O(L), the PRODUCTION/TRAINER path; flash dQ is
+# nondeterministic → value-tolerance grads, NOT bit). DEFAULT False so the block bit
+# gate proves the slab block math-exact; the trainer flips it for the flash fit/speed
+# path (the math O(L²) scores make the math attn 13.4GB — doesn't fit with the 12GB
+# fp8 base on 24GB; flash O(L) ~2.2GB fits). Only the slab recorder reads it; the
+# hand-chain is untouched.
+comptime KREA2_SLAB_FLASH = False
+
 # ── forward ops ──────────────────────────────────────────────────────────────
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm

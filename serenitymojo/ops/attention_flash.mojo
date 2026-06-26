@@ -741,6 +741,13 @@ def sdpa_flash_backward_dispatch(
     if B == 2 and S == 1280 and H == 30 and Dh == 128:
         return sdpa_flash_backward_raw[2, 1280, 30, 128](
             q_pad, k_pad, v_pad, o_pad, stats, d_out, scale, ctx)
+    # krea2 (H=48, Dh=128): trainer L=4864 + the L=2432 measurement bucket.
+    if B == 1 and S == 4864 and H == 48 and Dh == 128:
+        return sdpa_flash_backward_raw[1, 4864, 48, 128](
+            q_pad, k_pad, v_pad, o_pad, stats, d_out, scale, ctx)
+    if B == 1 and S == 2432 and H == 48 and Dh == 128:
+        return sdpa_flash_backward_raw[1, 2432, 48, 128](
+            q_pad, k_pad, v_pad, o_pad, stats, d_out, scale, ctx)
     raise Error(
         String("sdpa_flash_backward_dispatch: no bucket (B,S,H,Dh)=(")
         + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh) + ")"

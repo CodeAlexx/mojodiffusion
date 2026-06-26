@@ -42,8 +42,9 @@ from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
 # ── krea2 fine-grained backward arms (this session): the EXACT helpers the krea2
 # oracle (models/krea2/krea2_block.mojo) calls — repeat_kv_backward (GQA grouped
 # sum), sigmoid_backward (sg'=s(1-s)), _linear_bwd_dx (base + host-grad LoRA).
-from serenitymojo.ops.gqa_backward import repeat_kv_backward
-from serenitymojo.ops.activation_backward import sigmoid_backward
+from serenitymojo.ops.gqa_backward import repeat_kv_backward, repeat_kv_backward_slab
+from serenitymojo.ops.activation_backward import sigmoid_backward, sigmoid_backward_slab
+from serenitymojo.ops.tensor_algebra import mul_slab as _ta_mul_slab_eng
 
 # ── P6 Klein imports: the apply_klein arms call the Klein hand-chain's OWN
 # backward helpers / inline op sequence verbatim (file:line cited per arm).
@@ -252,10 +253,15 @@ def apply(node: Node, grads_in: List[TArc], ctx: DeviceContext) raises -> List[T
                 node.saved_meta[0], node.saved_meta[1],
                 node.saved_meta[2], node.saved_meta[3], ctx,
             )
+            # Cast dQ/dK/dV to the ACTS dtype (saved[0]=q's dtype), not hardcoded
+            # F32: zimage runs F32 acts (no-op) but krea2 runs bf16 — the downstream
+            # rope/repeat_kv/rms_norm backward read the bf16 saved q/k/v and raise on
+            # an F32 grad. saved[0] carries the original (pre-flash) q dtype.
+            var acts_dt = node.saved[0][].dtype()
             var outf = List[TArc]()
-            outf.append(TArc(cast_tensor_eng(fb.d_q, STDtypeEng.F32, ctx)))
-            outf.append(TArc(cast_tensor_eng(fb.d_k, STDtypeEng.F32, ctx)))
-            outf.append(TArc(cast_tensor_eng(fb.d_v, STDtypeEng.F32, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_q, acts_dt, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_k, acts_dt, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_v, acts_dt, ctx)))
             return outf^
         var sb = sdpa_backward_dispatch(
             node.saved[0][], node.saved[1][], node.saved[2][], g[],
@@ -583,10 +589,12 @@ def apply_slab(
                 node.saved_meta[0], node.saved_meta[1],
                 node.saved_meta[2], node.saved_meta[3], ctx,
             )
+            # acts-dtype cast (saved[0]=q), not hardcoded F32 — see the apply arm.
+            var acts_dt = node.saved[0][].dtype()
             var outf = List[TArc]()
-            outf.append(TArc(cast_tensor_eng(fb.d_q, STDtypeEng.F32, ctx)))
-            outf.append(TArc(cast_tensor_eng(fb.d_k, STDtypeEng.F32, ctx)))
-            outf.append(TArc(cast_tensor_eng(fb.d_v, STDtypeEng.F32, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_q, acts_dt, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_k, acts_dt, ctx)))
+            outf.append(TArc(cast_tensor_eng(fb.d_v, acts_dt, ctx)))
             return outf^
         var sb = sdpa_backward_dispatch_slab(
             node.saved[0][], node.saved[1][], node.saved[2][], g[],
@@ -618,6 +626,31 @@ def apply_slab(
             back_shape.append(node.saved_meta[i])
         var out = List[TArc]()
         out.append(arc_view_reshaped(g[], back_shape^))
+        return out^
+    # ── krea2 fine-grained kinds (activation-checkpointing slab path): slab
+    # siblings of the generic apply arms (same backward helpers, _slab variants).
+    elif node.kind == OPK_MUL:
+        # saved[0]=A, saved[1]=B; d_A = g*B, d_B = g*A.
+        var a = node.saved[0].copy()
+        var b = node.saved[1].copy()
+        var d_a = _ta_mul_slab_eng(g[], b[], ctx, slab)
+        var d_b = _ta_mul_slab_eng(g[], a[], ctx, slab)
+        var out = List[TArc]()
+        out.append(TArc(d_a^))
+        out.append(TArc(d_b^))
+        return out^
+    elif node.kind == OPK_REPEAT_KV:
+        var d_src = repeat_kv_backward_slab(
+            g[], node.saved_meta[0], node.saved_meta[1],
+            node.saved_meta[2], node.saved_meta[3], ctx, slab,
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_src^))
+        return out^
+    elif node.kind == OPK_SIGMOID:
+        var d_x = sigmoid_backward_slab(g[], node.saved[0][], ctx, slab)
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
         return out^
     elif node.kind == OPK_LEAF:
         raise Error("apply_slab: OPK_LEAF is sunk by the engine, never dispatched")

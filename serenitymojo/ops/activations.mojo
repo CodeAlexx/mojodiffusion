@@ -205,6 +205,39 @@ def sigmoid(x: Tensor, ctx: DeviceContext) raises -> Tensor:
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
+def sigmoid_slab(x: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Tensor:
+    """StepSlab variant of `sigmoid` (this file) — byte-identical (same kernel,
+    same grid); only the output buffer comes from slab.alloc (autograd_v2 capture
+    path, contract C8)."""
+    var dt = x.dtype().to_mojo_dtype()
+    var n = x.numel()
+    var out_buf = slab.alloc(x.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[_sigmoid_kernel_f32, _sigmoid_kernel_f32](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[_sigmoid_kernel_bf16, _sigmoid_kernel_bf16](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var X = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[_sigmoid_kernel_f16, _sigmoid_kernel_f16](
+            X, O, n, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
 # ── gelu (tanh-approx) ─────────────────────────────────────────────────────
 def _gelu_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],

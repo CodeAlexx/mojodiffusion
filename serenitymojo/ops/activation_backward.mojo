@@ -368,6 +368,11 @@ def sigmoid_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> 
     return _run(1, grad_out, x, ctx)
 
 
+def sigmoid_backward_slab(grad_out: Tensor, x: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Tensor:
+    """sigmoid backward (slab variant, autograd_v2 capture path C8): output from slab.alloc."""
+    return _run_slab(1, grad_out, x, ctx, slab)
+
+
 def tanh_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:
     """tanh backward: d_x = grad_out * (1 - tanh(x)^2)."""
     return _run(2, grad_out, x, ctx)

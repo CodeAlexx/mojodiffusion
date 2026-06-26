@@ -75,7 +75,9 @@ from serenitymojo.models.krea2.krea2_block import (
 from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.autograd_v2.krea2_block_graph import (
     krea2_single_stream_block_graph_backward,
+    krea2_single_stream_block_graph_backward_seg,
 )
+from serenitymojo.autograd_v2.step_slab import StepSlab
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -835,5 +837,77 @@ def krea2_stack_lora_backward_graph[
         ctx.synchronize()   # async free discipline (same seam as the streamed path)
         bi -= 1
         # wbi drops here → device weights free before the next block loads.
+
+    return Krea2StackLoraGrads(grads^, TArc(d_x^))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# StepSlab SEGMENTED engine backward — the alloc-free engine+slab+FLASH arm.
+# IDENTICAL conductor loop, but each block's backward is the 2-segment activation-
+# checkpointed slab recorder (krea2_single_stream_block_graph_backward_seg), which
+# bounds the per-block slab to ONE segment (~6.65GB, fits the 12GB fp8 base on 24GB
+# — the whole-block slab was 12.2GB, didn't fit). One StepSlab is allocated ONCE and
+# RESET per block (the segments rewind internally; reset returns it to base so every
+# block sees the identical allocation sequence). The returned grads are host lists
+# (carrier b: the segmented arm does the batched to_host) → the conductor scatters
+# them exactly as the graph arm does. Bit-identical to the hand-chain in MATH mode
+# (KREA2_SLAB_FLASH=False, the gate); FLASH (trainer) grads are value-tolerance.
+# ══════════════════════════════════════════════════════════════════════════════
+def krea2_stack_lora_backward_graph_slab[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_velocity: Tensor,
+    blk_vec: Tensor,
+    tmlp_out: Tensor,
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    fwd: Krea2StackForward,
+    cos: Tensor, sin: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackLoraGrads:
+    comptime features = HEADS * HEADDIM
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var grads = List[Krea2LoraGrad]()
+    for _ in range(nblocks * KREA2_SLOTS_PER_BLOCK):
+        grads.append(Krea2LoraGrad(None, None))
+
+    var fin_w = fin.as_stack_weights()
+    var d_x = krea2_final_layer_backward[L, HEADS, HEADDIM](
+        d_velocity, fwd, tmlp_out, fin_w, eps, ctx,
+    )
+
+    var bi = nblocks - 1
+    while bi >= 0:
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+        slab.reset()   # block starts from the slab base (segments rewind internally)
+        var bg = krea2_single_stream_block_graph_backward_seg[L, HEADS, KVHEADS, HEADDIM](
+            TArc(Tensor(d_x.buf.copy(), d_x.shape(), d_x.dtype())),
+            fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, slab, real_len,
+        )
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        grads[base + 0] = bg.wq.copy()
+        grads[base + 1] = bg.wk.copy()
+        grads[base + 2] = bg.wv.copy()
+        grads[base + 3] = bg.gate_w.copy()
+        grads[base + 4] = bg.wo.copy()
+        grads[base + 5] = bg.mlp_gate_w.copy()
+        grads[base + 6] = bg.mlp_up_w.copy()
+        grads[base + 7] = bg.mlp_down_w.copy()
+        d_x = bg.d_x[].clone(ctx)
+        ctx.synchronize()
+        bi -= 1
 
     return Krea2StackLoraGrads(grads^, TArc(d_x^))

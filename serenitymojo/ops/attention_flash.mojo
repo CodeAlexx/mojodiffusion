@@ -752,3 +752,21 @@ def sdpa_flash_backward_dispatch(
         String("sdpa_flash_backward_dispatch: no bucket (B,S,H,Dh)=(")
         + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh) + ")"
     )
+
+
+def sdpa_flash_backward_padmask_dispatch(
+    q_bf: TArc, k_bf: TArc, v_bf: TArc, o_bf: TArc, stats: TArc,
+    d_att: Tensor, real_len: Int, scale: Float32,
+    B: Int, S: Int, H: Int, Dh: Int,
+    ctx: DeviceContext,
+) raises -> SdpaFlashGrads:
+    """Runtime-dims → comptime-bucket dispatch for the flash-PADMASK backward (the
+    engine OPK_SDPA arm is shape-agnostic; same table discipline as
+    sdpa_flash_backward_dispatch). krea2 trainer bucket (1,4864,48,128)."""
+    if B == 1 and S == 4864 and H == 48 and Dh == 128:
+        return sdpa_flash_backward_padmask_f32[1, 4864, 48, 128](
+            q_bf, k_bf, v_bf, o_bf, stats, d_att, real_len, scale, ctx)
+    raise Error(
+        String("sdpa_flash_backward_padmask_dispatch: no bucket (B,S,H,Dh)=(")
+        + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh) + ")"
+    )

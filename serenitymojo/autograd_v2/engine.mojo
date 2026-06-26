@@ -79,6 +79,7 @@ from serenitymojo.models.klein.double_block import (
 )
 from serenitymojo.ops.attention_flash import (
     sdpa_flash_backward_f32, sdpa_flash_backward_dispatch,
+    sdpa_flash_backward_padmask_dispatch,
 )
 from serenitymojo.ops.cast import cast_tensor as cast_tensor_eng
 from serenitymojo.io.dtype import STDtype as STDtypeEng
@@ -243,6 +244,24 @@ def apply(node: Node, grads_in: List[TArc], ctx: DeviceContext) raises -> List[T
         return out^
     elif node.kind == OPK_SDPA:
         # saved [q_rope, k_rope, v]; meta [B, S, H, Dh]; scalars [scale].
+        if len(node.saved) >= 8 and len(node.scalars) >= 2:
+            # PADMASK flash recording (scalars[1]=real_len marker; saved 3..7 =
+            # q_bf/k_bf/v_bf/o_bf/stats). The padmask backward takes F32 d_att +
+            # real_len → F32 dQ/dK/dV → acts dtype (krea2 bf16). flash → value-tol.
+            var rl_p = Int(node.scalars[1])
+            var fbp = sdpa_flash_backward_padmask_dispatch(
+                node.saved[3].copy(), node.saved[4].copy(),
+                node.saved[5].copy(), node.saved[6].copy(),
+                node.saved[7].copy(), g[], rl_p, node.scalars[0],
+                node.saved_meta[0], node.saved_meta[1],
+                node.saved_meta[2], node.saved_meta[3], ctx,
+            )
+            var adt = node.saved[0][].dtype()
+            var outp = List[TArc]()
+            outp.append(TArc(cast_tensor_eng(fbp.d_q, adt, ctx)))
+            outp.append(TArc(cast_tensor_eng(fbp.d_k, adt, ctx)))
+            outp.append(TArc(cast_tensor_eng(fbp.d_v, adt, ctx)))
+            return outp^
         if len(node.saved) >= 8:
             # ZIMAGE_SDPA_FLASH recording (saved 3..7 = padded q/k/v/o+stats)
             var g_bf = cast_tensor_eng(g[], STDtypeEng.BF16, ctx)
@@ -579,6 +598,23 @@ def apply_slab(
         out.append(TArc(d_x^))
         return out^
     elif node.kind == OPK_SDPA:
+        if len(node.saved) >= 8 and len(node.scalars) >= 2:
+            # PADMASK flash (scalars[1]=real_len; saved 3..7 = q_bf/k_bf/v_bf/o_bf/
+            # stats) — the krea2 trainer attn arm. F32 d_att + real_len → acts dtype.
+            var rl_p = Int(node.scalars[1])
+            var fbp = sdpa_flash_backward_padmask_dispatch(
+                node.saved[3].copy(), node.saved[4].copy(),
+                node.saved[5].copy(), node.saved[6].copy(),
+                node.saved[7].copy(), g[], rl_p, node.scalars[0],
+                node.saved_meta[0], node.saved_meta[1],
+                node.saved_meta[2], node.saved_meta[3], ctx,
+            )
+            var adt = node.saved[0][].dtype()
+            var outp = List[TArc]()
+            outp.append(TArc(cast_tensor_eng(fbp.d_q, adt, ctx)))
+            outp.append(TArc(cast_tensor_eng(fbp.d_k, adt, ctx)))
+            outp.append(TArc(cast_tensor_eng(fbp.d_v, adt, ctx)))
+            return outp^
         if len(node.saved) >= 8:
             # ZIMAGE_SDPA_FLASH (pool allocs — capture must be off)
             var g_bf = cast_tensor_eng(g[], STDtypeEng.BF16, ctx)

@@ -86,6 +86,7 @@ from serenitymojo.autograd_v2.ops_record import (
     record_proj_lora_slab,
     record_sdpa_nomask_slab,
     record_sdpa_flash_nopad_slab,
+    record_sdpa_flash_padmask_slab,
 )
 from serenitymojo.models.krea2.krea2_block import (
     Krea2BlockWeights,
@@ -105,7 +106,10 @@ from serenitymojo.ops.elementwise import modulate as _modulate, residual_gate as
 from serenitymojo.ops.rope import rope_interleaved as _rope
 from serenitymojo.ops.gqa_backward import repeat_kv_f32 as _repeat_kv
 from serenitymojo.ops.attention import sdpa_nomask as _sdpa_nomask
-from serenitymojo.ops.attention_flash import sdpa_flash_train_fwd_f32 as _flash_fwd_f32
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd_f32 as _flash_fwd_f32,
+    sdpa_flash_train_fwd_padmask_f32 as _flash_fwd_padmask_f32,
+)
 from serenitymojo.ops.activations import sigmoid as _sigmoid
 from serenitymojo.ops.tensor_algebra import mul as _mul, reshape_owned as _reshape_owned
 
@@ -493,7 +497,7 @@ def _attn_segment_bwd[
     qnorm_w: TArc, knorm_w: TArc,
     w: Krea2BlockWeights, lora: Krea2BlockLora,
     cos_q: Tensor, sin_q: Tensor, cos_k: Tensor, sin_k: Tensor,
-    features: Int, eps: Float32, scale: Float32,
+    features: Int, eps: Float32, scale: Float32, real_len: Optional[Int],
     ctx: DeviceContext, mut slab: StepSlab,
 ) raises -> _PL5:
     """Segment A: record the attn branch from x (tracked leaf), execute_slab seeded
@@ -526,8 +530,17 @@ def _attn_segment_bwd[
     var v_full = record_repeat_kv_slab(g, v, L, KVHEADS, n_rep, HEADDIM, ctx, slab)
     var att: TArc
     comptime if KREA2_SLAB_FLASH:
-        att = record_sdpa_flash_nopad_slab[1, L, HEADS, HEADDIM](g, q_rope, k_full, v_full, scale, ctx, slab)
+        # PADMASK flash when real_len<L (the LT-padded trainer); no-pad flash at
+        # real_len==L/None (full attention). flash = value-tolerance grads.
+        if real_len and real_len.value() < L:
+            att = record_sdpa_flash_padmask_slab[1, L, HEADS, HEADDIM](
+                g, q_rope, k_full, v_full, real_len.value(), scale, ctx, slab)
+        else:
+            att = record_sdpa_flash_nopad_slab[1, L, HEADS, HEADDIM](g, q_rope, k_full, v_full, scale, ctx, slab)
     else:
+        # MATH bit gate is no-pad full-attn only; real_len<L needs flash.
+        if real_len and real_len.value() < L:
+            raise Error("krea2 segmented MATH attn: real_len<L needs flash (KREA2_SLAB_FLASH)")
         att = record_sdpa_nomask_slab[1, L, HEADS, HEADDIM](g, q_rope, k_full, v_full, scale, ctx, slab)
     var attn_flat = record_reshape(g, att, [1, L, features], ctx)
     var sg = record_sigmoid_slab(g, wg.y, ctx, slab)
@@ -553,7 +566,7 @@ def _recompute_x1_attn[
     qnorm_w: TArc, knorm_w: TArc,
     w: Krea2BlockWeights, lora: Krea2BlockLora,
     cos_q: Tensor, sin_q: Tensor, cos_k: Tensor, sin_k: Tensor,
-    features: Int, eps: Float32, scale: Float32,
+    features: Int, eps: Float32, scale: Float32, real_len: Optional[Int],
     ctx: DeviceContext,
 ) raises -> TArc:
     """No-grad ATTN-branch forward → x1, op-for-op with the oracle's attn section
@@ -582,9 +595,15 @@ def _recompute_x1_attn[
     var v_full = _repeat_kv(v, L, KVHEADS, n_rep, HEADDIM, ctx)
     var att: Tensor
     comptime if KREA2_SLAB_FLASH:
-        var ff = _flash_fwd_f32[1, L, HEADS, HEADDIM](q_rope, k_full, v_full, scale, ctx)
-        att = cast_tensor(ff.att, q_rope.dtype(), ctx)
+        if real_len and real_len.value() < L:
+            var ffp = _flash_fwd_padmask_f32[1, L, HEADS, HEADDIM](q_rope, k_full, v_full, real_len.value(), scale, ctx)
+            att = cast_tensor(ffp.att, q_rope.dtype(), ctx)
+        else:
+            var ff = _flash_fwd_f32[1, L, HEADS, HEADDIM](q_rope, k_full, v_full, scale, ctx)
+            att = cast_tensor(ff.att, q_rope.dtype(), ctx)
     else:
+        if real_len and real_len.value() < L:
+            raise Error("krea2 x1 recompute MATH attn: real_len<L needs flash")
         att = _sdpa_nomask[1, L, HEADS, HEADDIM](q_rope, k_full, v_full, scale, ctx)
     var attn_flat = _reshape_owned(att^, [1, L, features])
     var sg = _sigmoid(gate_pre, ctx)
@@ -617,8 +636,9 @@ def krea2_single_stream_block_graph_backward_seg[
     slab.mark/rewind bounds the slab to one segment (~6GB, fits). Math-exact vs the
     whole-block backward. Carrier b: device grads → batched to_host → host
     Krea2BlockGrads (hand-chain untouched)."""
-    if real_len and real_len.value() < L:
-        raise Error("krea2 segmented slab backward: real_len<L flash-padmask is a later phase")
+    # real_len<L = the LT-padded trainer (flash-padmask): allowed ONLY with FLASH
+    # (KREA2_SLAB_FLASH); the MATH bit gate is full-attn (real_len==L). The attn
+    # segment + x1 recompute dispatch padmask on real_len<L. mlp is pad-agnostic.
     comptime features = HEADS * HEADDIM
     var mlpdim = w.mlp_gate_w[].shape()[0]
     var scale = Float32(1.0) / sqrt(Float32(HEADDIM))
@@ -637,7 +657,7 @@ def krea2_single_stream_block_graph_backward_seg[
     # stack the mlp acts ~6GB on top of the segment slab). ────────────────────
     var x1 = _recompute_x1_attn[L, HEADS, KVHEADS, HEADDIM](
         x_in, prescale, preshift, pregate, prenorm_w, qnorm_w, knorm_w,
-        w, lora, cos_q, sin_q, cos_k, sin_k, features, eps, scale, ctx,
+        w, lora, cos_q, sin_q, cos_k, sin_k, features, eps, scale, real_len, ctx,
     )
 
     # ── Segment B (mlp): seeded d_out → d_x1 + 3 mlp device pairs ─────────────
@@ -654,7 +674,7 @@ def krea2_single_stream_block_graph_backward_seg[
     var gA = Graph()
     var sa = _attn_segment_bwd[L, HEADS, KVHEADS, HEADDIM](
         gA, x_in, sb.d_x1, prescale, preshift, pregate, prenorm_w, qnorm_w, knorm_w,
-        w, lora, cos_q, sin_q, cos_k, sin_k, features, eps, scale, ctx, slab,
+        w, lora, cos_q, sin_q, cos_k, sin_k, features, eps, scale, real_len, ctx, slab,
     )
     slab.rewind(mA)
 

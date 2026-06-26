@@ -41,6 +41,7 @@ from serenitymojo.ops.rope import rope_interleaved, rope_interleaved_slab
 from serenitymojo.ops.attention import sdpa_nomask, sdpa_nomask_slab
 from serenitymojo.ops.attention_flash import (
     sdpa_flash_train_fwd_f32, sdpa_flash_train_fwd,
+    sdpa_flash_train_fwd_padmask_f32,
 )
 from serenitymojo.models.zimage.lora_block import ZIMAGE_SDPA_FLASH
 from serenitymojo.io.dtype import STDtype
@@ -1562,6 +1563,45 @@ def record_sdpa_flash_nopad_slab[
     saved.append(TArc(Tensor(ff.stats.buf.copy(), ff.stats.shape(), ff.stats.dtype())))
     var meta: List[Int] = [B, S, H, Dh]
     var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(OPK_SDPA, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)
+
+
+def record_sdpa_flash_padmask_slab[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    mut g: Graph, q: TArc, k: TArc, v: TArc, real_len: Int, scale: Float32,
+    ctx: DeviceContext, mut slab: StepSlab,
+) raises -> TArc:
+    """cuDNN flash-PADMASK StepSlab SDPA recorder — the krea2 PRODUCTION attn arm
+    for the LT-padded trainer (real_len<L; cuDNN masks the [real_len:S] tail). O(L),
+    no scores. Records OPK_SDPA with the 8-tensor flash saved set (saved 0..2=q/k/v,
+    3..7 = q_bf/k_bf/v_bf/o_bf/stats — the _padmask_f32 variant) + scalars=[scale,
+    Float32(real_len)] (len 2 = the PADMASK marker the OPK_SDPA arm dispatches on →
+    sdpa_flash_backward_padmask_f32 with real_len). Flash dQ nondeterministic →
+    value-tolerance grads (NOT bit). flash allocs POOL (capture OFF)."""
+    var q_bf = cast_tensor(q[], STDtype.BF16, ctx)
+    var k_bf = cast_tensor(k[], STDtype.BF16, ctx)
+    var v_bf = cast_tensor(v[], STDtype.BF16, ctx)
+    var ff = sdpa_flash_train_fwd_padmask_f32[B, S, H, Dh](q_bf, k_bf, v_bf, real_len, scale, ctx)
+    var y = cast_tensor(ff.att, q[].dtype(), ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(q[].id))
+    edges.append(g.edge_for(k[].id))
+    edges.append(g.edge_for(v[].id))
+    var saved = List[TArc]()
+    saved.append(q.copy())
+    saved.append(k.copy())
+    saved.append(v.copy())
+    saved.append(ff.q_bf.copy())
+    saved.append(ff.k_bf.copy())
+    saved.append(ff.v_bf.copy())
+    saved.append(ff.o_bf.copy())
+    saved.append(ff.stats.copy())
+    var meta: List[Int] = [B, S, H, Dh]
+    var scalars: List[Float32] = [scale, Float32(real_len)]   # len 2 = PADMASK
     var oids: List[Int] = [y.id]
     _ = g.record(OPK_SDPA, edges^, saved^, meta^, scalars^, oids)
     return TArc(y^)

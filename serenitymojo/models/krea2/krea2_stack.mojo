@@ -61,7 +61,7 @@ from serenitymojo.models.dit.krea2_dit import (
 
 # ── reused backward arms (final-layer chain; all pre-built + gated elsewhere) ──
 from serenitymojo.ops.linalg_backward import linear_backward_dx
-from serenitymojo.ops.norm_backward import rms_norm_backward
+from serenitymojo.ops.norm_backward import rms_norm_backward, rms_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
 # ── Phase-1 block unit (the composed primitive) ───────────────────────────────
@@ -274,10 +274,11 @@ def krea2_final_layer_backward[
     # dtype (norm.mojo:173-174); mirror it here so rms_norm_backward runs the
     # all-bf16 path (go=mb.d_x bf16, x bf16, weight bf16) instead of the F32-acts
     # mixed path that would raise. F32 gate: cast is F32→F32 (no-op).
-    var rb = rms_norm_backward(
+    # FROZEN last.norm scale → d_x only (skip the O(cols²) discarded d_g kernel).
+    var rb_dx = rms_norm_backward_dx(
         mb.d_x, fwd.x_blocks_out[], cast_tensor(_add_scale_one(w.last_norm[], ctx), fwd.x_blocks_out[].dtype(), ctx), eps, ctx,
     )
-    var d_x_out = rb.d_x.clone(ctx)
+    var d_x_out = rb_dx.clone(ctx)
     return d_x_out^
 
 

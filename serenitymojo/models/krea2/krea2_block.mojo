@@ -65,7 +65,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linalg_backward import (
     linear_backward, linear_backward_dx, LinearGrads,
 )
-from serenitymojo.ops.norm_backward import rms_norm_backward, RmsNormBackward
+from serenitymojo.ops.norm_backward import rms_norm_backward, rms_norm_backward_dx, RmsNormBackward
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
 from serenitymojo.ops.attention_backward import sdpa_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
@@ -578,9 +578,11 @@ def krea2_single_stream_block_lora_backward[
     # (norm.mojo:173-174); mirror that here — cast (scale+1) to the act dtype so
     # rms_norm_backward runs the all-bf16 path (go/x/weight matched), not the
     # F32-acts-only mixed path. In the F32 gate this cast is F32→F32 (no-op).
-    var rb2 = rms_norm_backward(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
+    # FROZEN norm scale → d_x only (rms_norm_backward_dx skips the O(cols²) discarded
+    # d_g kernel that was 89% of the step; see norm_backward.mojo:374).
+    var rb2_dx = rms_norm_backward_dx(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
     # x1 feeds the residual (grg2.d_x) AND postnorm(x1) → SUM.
-    var d_x1 = add(grg2.d_x, rb2.d_x, ctx)
+    var d_x1 = add(grg2.d_x, rb2_dx, ctx)
 
     # ── ATTENTION branch backward: x1 = residual_gate(x, pregate, a) ──────────
     var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
@@ -653,12 +655,12 @@ def krea2_single_stream_block_lora_backward[
     # mixed-precision mirror as the rb2 call above: q_pre/k_pre are bf16 acts, the
     # qnorm/knorm scales are F32 → cast (scale+1) down to the act dtype so the
     # all-bf16 rms_norm_backward path runs (matches the bf16 forward QKNorm).
-    var rbq = rms_norm_backward(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
-    var rbk = rms_norm_backward(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
+    var rbq_dx = rms_norm_backward_dx(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
+    var rbk_dx = rms_norm_backward_dx(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
 
     # flatten BSHD grads back to [1,L,*] for the projection backward.
-    var d_q = reshape(rbq.d_x, [1, L, HEADS * HEADDIM], ctx)
-    var d_k = reshape(rbk.d_x, [1, L, KVHEADS * HEADDIM], ctx)
+    var d_q = reshape(rbq_dx, [1, L, HEADS * HEADDIM], ctx)
+    var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
     var d_v_flat = reshape(d_v, [1, L, KVHEADS * HEADDIM], ctx)
 
     # projections feed xm: q=wq(xm), k=wk(xm), v=wv(xm), gate=gate_w(xm).
@@ -679,10 +681,10 @@ def krea2_single_stream_block_lora_backward[
     # xn = prenorm(x) (weight=prenorm+1, FROZEN) → d_x via rms_norm_backward. Same
     # mixed-precision mirror: saved.x is the bf16 block input, prenorm scale is F32
     # → cast (scale+1) down to the act dtype for the all-bf16 path (matches fwd).
-    var rb1 = rms_norm_backward(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
+    var rb1_dx = rms_norm_backward_dx(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
 
     # x feeds: residual (grg1.d_x), prenorm(x) (rb1.d_x). SUM.
-    var d_x = add(grg1.d_x, rb1.d_x, ctx)
+    var d_x = add(grg1.d_x, rb1_dx, ctx)
 
     return Krea2BlockGrads(
         TArc(d_x^),

@@ -155,4 +155,26 @@ removing the last per-step disk read (was `_build_conditioning(st,...)` per step
 Files: models/krea2/{krea2_block,krea2_stack,krea2_cache_reader,train_krea2}.mojo;
 ops/attention_flash.mojo (padmask train fwd/bwd); configs/krea2.json (`quantized_resident`);
 parity/krea2_{mask_pad_gate,fp8_resident_gate}.mojo. KREA2_V2_GRAPH (Phase 4b autograd_v2) still
-the comptime seam (default False). OPEN: ~65s/step compute-speed; 4b engine wiring.
+the comptime seam (default False). OPEN: 4b engine wiring.
+
+## Phase 4a.2 — 9× speedup: frozen-norm d_x-only backward (2026-06-25, lead-verified)
+
+MEASURED the trainer at ~65s/step (GPU at 100% SM via `nvidia-smi dmon` — compute-bound, NOT
+sync-stalled). nsys kernel summary: ONE hand-rolled kernel `serenitymojo_ops_norm_backward`
+(rms_norm_backward's d_g kernel) = **89% of the step** (69.2s, 113 calls × ~612ms avg). Root cause:
+`_rms_bwd_dg_kernel` (norm_backward.mojo:123) is **O(rows×cols²)** — each col-thread recomputes the
+per-row RMS by summing x² over ALL cols (:137); ~1.8e14 ops for a 30M-element reduction. AND it's the
+FROZEN norm-scale gradient (prenorm/postnorm/qnorm/knorm/last.norm are NOT trained) — computed
+catastrophically slowly then DISCARDED. FIX: the 5 frozen-norm call sites now use the EXISTING
+`rms_norm_backward_dx` (norm_backward.mojo:374, d_x-only — its docstring already said frozen-weight
+paths should use it) instead of `rms_norm_backward`. RESULT (lead-run): **~65s → ~7s/step (~9×)**;
+nsys confirms rms_norm_backward GONE from the top kernels (now GEMMs ~53% tensor-core / cuDNN flash
+~12% / memory-ops ~10% — healthy/distributed). Block parity UNCHANGED cos≥0.99999999 (d_x identical;
+the discarded d_g never affected correctness). The matmuls were ALWAYS tensor-core (cutlass_80_tensorop
+/ ampere_s16816gemm) and the flash ALWAYS cuDNN — no GEMM/tensor-core issue.
+
+Files: krea2_block.mojo (rb1/rb2/rbq/rbk → rms_norm_backward_dx), krea2_stack.mojo (last.norm).
+OPEN toward ai-toolkit's ~3s/step (eager mode, no graph): the GEMMs are ~half full-RECOMPUTE
+(re-run fwd in bwd) — keep activations (fp8 freed ~12GB) to skip it; trim per-block memory-op
+overhead (the 1050-instance tensor_algebra kernel ~10%). The autograd_v2 graph is NOT needed —
+this is plain eager-kernel efficiency.

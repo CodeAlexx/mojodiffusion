@@ -534,6 +534,120 @@ def sdpa_flash_backward_f32[
     )
 
 
+# ─── F32-boundary padmask TRAINING flash (krea2 length-bucket pad) ────────────
+# krea2's SingleStreamBlock trains on F32 activations at a PADDED buffer length
+# S (= LFULL = LTMAX + IMGLEN, a 256-multiple → 128-aligned) where only the
+# first `real_len` text positions + the image tail are real and the text-pad
+# rows [real_len:LTMAX] must attend to nothing / be attended-to by nobody. These
+# are the F32 wrappers of sdpa_flash_train_fwd_f32 / sdpa_flash_backward_f32 that
+# pass `real_len` to the shim EXACTLY as sdpa_flash_fwd_padmask does (:327) so
+# cuDNN masks the [real_len:S] pad rows internally — NO materialized [B,H,S,S]
+# mask (the 4.5GB resident the sdpa_chunked path needs), NO materialized scores.
+#
+# NOTE on krea2's token layout vs cuDNN real_len: krea2 pads ONLY the TEXT
+# (token order [TXT(real)|TXT(pad)|IMG]); cuDNN's real_len masks the TAIL rows
+# [real_len:S]. They coincide ONLY if the pad sits at the sequence tail. The
+# krea2 block call passes real_len for the case where the WHOLE valid prefix is
+# [0:real_len] (text+image contiguous). See krea2_block for the layout contract
+# it threads (it pads text at the tail AFTER image when needed, or the caller
+# arranges [real|pad] so real_len = the real prefix length). FAIL-LOUD on rc.
+
+
+def sdpa_flash_train_fwd_padmask_f32[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    real_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashF32Fwd:
+    """F32 padmask flash train forward. q/k/v are [B,S,H,Dh] F32 on a 128-aligned
+    PADDED buffer; only the first `real_len` rows are real (cuDNN masks
+    [real_len:S] internally). Returns att (F32) + the bf16 saved set the padmask
+    backward consumes. S MUST be 128-aligned (no extra cuDNN padding)."""
+    comptime if (S % 128) != 0:
+        raise Error("sdpa_flash_train_fwd_padmask_f32: S must be 128-aligned")
+    if real_len < 1 or real_len > S:
+        raise Error("sdpa_flash_train_fwd_padmask_f32: real_len out of [1, S]")
+    var q_bf = cast_tensor(q, STDtype.BF16, ctx)
+    var k_bf = cast_tensor(k, STDtype.BF16, ctx)
+    var v_bf = cast_tensor(v, STDtype.BF16, ctx)
+    # S already 128-aligned → sdpa_flash_fwd_padmask's _pad_seq is a no-op; it
+    # passes real_len for the [real_len:S] tail mask and saves the stats.
+    var fwd = sdpa_flash_fwd_padmask[B, S, H, Dh](q_bf, k_bf, v_bf, real_len, scale, ctx)
+    var att = cast_tensor(fwd.o, STDtype.F32, ctx)
+    return SdpaFlashF32Fwd(
+        att^, TArc(q_bf^), TArc(k_bf^), TArc(v_bf^),
+        TArc(Tensor(fwd.o_pad.buf.copy(), fwd.o_pad.shape(), fwd.o_pad.dtype())),
+        TArc(Tensor(fwd.stats.buf.copy(), fwd.stats.shape(), fwd.stats.dtype())),
+    )
+
+
+def sdpa_flash_backward_padmask_f32[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q_bf: TArc, k_bf: TArc, v_bf: TArc, o_bf: TArc, stats: TArc,
+    d_att: Tensor,
+    real_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashGrads:
+    """F32 padmask flash backward: the F32 backward with `real_len` passed to the
+    shim so the bwd respects the SAME [real_len:S] pad masking the fwd used. d_att
+    F32 -> bf16; dQ/dK/dV bf16 -> F32. S MUST be 128-aligned."""
+    comptime if (S % 128) != 0:
+        raise Error("sdpa_flash_backward_padmask_f32: S must be 128-aligned")
+    if real_len < 1 or real_len > S:
+        raise Error("sdpa_flash_backward_padmask_f32: real_len out of [1, S]")
+    var do_bf = cast_tensor(d_att, STDtype.BF16, ctx)
+
+    var nbytes = B * S * H * Dh * 2
+    var dq_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dk_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dv_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var g_shape: List[Int] = [B, S, H, Dh]
+    var dq_bf = Tensor(dq_buf^, g_shape.copy(), STDtype.BF16)
+    var dk_bf = Tensor(dk_buf^, g_shape.copy(), STDtype.BF16)
+    var dv_bf = Tensor(dv_buf^, g_shape^, STDtype.BF16)
+
+    var qs = _strides_bhnd(S, H, Dh)
+    var ks = _strides_bhnd(S, H, Dh)
+    var vs = _strides_bhnd(S, H, Dh)
+    var os_ = _strides_bhnd(S, H, Dh)
+    var dos = _strides_bhnd(S, H, Dh)
+    var dqs = _strides_bhnd(S, H, Dh)
+    var dks = _strides_bhnd(S, H, Dh)
+    var dvs = _strides_bhnd(S, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bwd_bf16", Int32](
+        _dev_ptr(q_bf[]), _dev_ptr(k_bf[]), _dev_ptr(v_bf[]),
+        _dev_ptr(o_bf[]), _dev_ptr(do_bf), _dev_ptr(stats[]),
+        _dev_ptr(dq_bf), _dev_ptr(dk_bf), _dev_ptr(dv_bf),
+        Int32(B), Int32(H), Int32(S), Int32(S), Int32(Dh),
+        scale,
+        qs, ks, vs, os_, dos, dqs, dks, dvs,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0),
+        Int32(real_len), Int32(real_len),  # REAL lengths -> [real_len:S] pad mask
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    dos.free(); dqs.free(); dks.free(); dvs.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_backward_padmask_f32: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S=" + String(S)
+            + " real_len=" + String(real_len)
+            + " H=" + String(H) + " Dh=" + String(Dh) + ")"
+        )
+    return SdpaFlashGrads(
+        cast_tensor(dq_bf, STDtype.F32, ctx),
+        cast_tensor(dk_bf, STDtype.F32, ctx),
+        cast_tensor(dv_bf, STDtype.F32, ctx),
+    )
+
+
 # ─── zimage graph-path raw variants (bf16-native, padded shapes) ─────────────
 def sdpa_flash_backward_raw[
     B: Int, S: Int, H: Int, Dh: Int

@@ -104,3 +104,55 @@ Build (clean, exit 0):
 Run (LEAD runs the GPU 30-step smoke):
   LD_LIBRARY_PATH=.pixi/envs/default/lib:serenitymojo/ops/cshim/lib:$HOME/.local/lib/python3.12/site-packages/nvidia/cudnn/lib \
     /tmp/krea2_train /home/alex/trainings/krea2_giger_cache.safetensors 30
+
+## Phase 4a.1 — LT-bucketing + flash-padmask + fp8-resident (2026-06-25, lead-verified)
+
+Phase-4a's "exact-LFULL per-LT arm, NO pad" choice MEASURED to OOM: the MAX device pool keys
+each distinct-LT size-class and does NOT reuse larger blocks for smaller requests, so ≥3
+distinct LTs OOM regardless of order (lead-measured: a 1-LT run does 12 steps; the 4-LT giger
+cache OOMs at the 3rd distinct LT, even processed largest-first). Superseded by length-bucketing.
+
+**LT bucket pad+mask.** All samples pad to a common text length LTMAX=768 (smallest 128-multiple
+≥ the giger max LT 647) → ONE LFULL=4864 size-class → no fragmentation. The training block grew
+a masked-attention arm so pad tokens don't corrupt real ones. Gate
+`parity/krea2_mask_pad_gate.mojo`: real-token grads must be pad-length invariant.
+  - First impl (materialized [1,48,4864,4864] F32 mask + sdpa/sdpa_chunked): gate PASS cos≥0.99999,
+    but MEASURED too memory-heavy (4.5GB mask resident + 4.5GB bwd scores) → OOM ~step 12 even
+    with sdpa_chunked + a per-step ctx.synchronize. RETIRED.
+  - **flash-padmask (SHIPPED).** cuDNN flash with `real_len` (the [real_len:S] tail padmask)
+    replaces the materialized mask — NO 4.5GB mask, NO materialized scores. cuDNN's padmask is
+    PREFIX-validity (masks the tail), and krea2's pad sat in the middle, so the trainer reorders
+    the sequence to **[TXT_real | IMG | TXT_pad]** (valid prefix = LT+IMGLEN, pad at tail; RoPE-safe
+    — text positions zero, image grid moves with its tokens; velocity slice + final-layer scatter
+    are runtime). New ops `sdpa_flash_train_fwd_padmask_f32` / `sdpa_flash_backward_padmask_f32`
+    (ops/attention_flash.mojo, mirror sdpa_flash_fwd_padmask's real_len→shim). The block casts the
+    F32-flash att/grads to/from the bf16 acts dtype (block runs bf16 acts + F32 scales).
+
+**fp8-resident base + resident conditioning — ZERO per-step disk read.** MEASURED: the streaming
+stack re-read all 28 bf16 blocks H2D from the mmap'd checkpoint EVERY step (fwd + bwd recompute,
+~48GB/step at ~320MB/s = ~150s/step) — the FROZEN base must load ONCE. bf16-resident is 24GB
+(doesn't fit + working set); fp8-resident is ~12GB (fits). `cfg.quantized_resident=="fp8_e4m3"` →
+`build_krea2_resident_fp8` quantizes the 28×8 matmul weights ONCE (fp8_e4m3_rowscale +
+encode_perrow), holds fp8 bytes+scale resident; `_load_krea2_block_resident` dequants per block
+(fp8_e4m3_dequant_perrow_to_bf16) → same Krea2BlockWeights. `Krea2ResidentCond` holds the frozen
+conditioning weights (embedders + 4 txtfusion bundles + txtmlp) resident too (always-on, bf16),
+removing the last per-step disk read (was `_build_conditioning(st,...)` per step) + the vram creep.
+
+**Gates (lead re-run, this session):**
+  - masked-pad isolation (flash, value-tolerance — flash dQ nondeterministic): PASS, real-token
+    grads pad-length invariant cos≥0.9999989.
+  - fp8-resident round-trip (REAL block-0 weights): PASS, min cos 0.99965 (deq vs bf16; fp8 e4m3
+    lossy = the "different-trajectory numerics class").
+  - no-pad block parity (C13 regression): PASS cos≥0.99999999 — the bf16 no-pad path UNCHANGED
+    after the flash/fp8 changes (both gated: flash on `real_len` present & < L; fp8 on
+    `quantized_resident=="fp8_e4m3"`; default-off = the original sdpa_nomask / disk-stream paths).
+  - 4-sample multi-LT run (LTMAX=768, fp8+resident-cond): ZERO per-step disk, vram stable (creep
+    gone), ~150s → ~65s/step, loss resample-noisy but learning (fixed-σ overfit diagnostic earlier:
+    monotonic 0.106→0.092 / 12 steps). The remaining ~65s is COMPUTE (28-block fwd + backward-
+    RECOMPUTE at L=4864) + the per-block sync — NOT disk — a separate speed lever (relax the
+    per-block sync once headroom allows / save more acts / autograd_v2 4b).
+
+Files: models/krea2/{krea2_block,krea2_stack,krea2_cache_reader,train_krea2}.mojo;
+ops/attention_flash.mojo (padmask train fwd/bwd); configs/krea2.json (`quantized_resident`);
+parity/krea2_{mask_pad_gate,fp8_resident_gate}.mojo. KREA2_V2_GRAPH (Phase 4b autograd_v2) still
+the comptime seam (default False). OPEN: ~65s/step compute-speed; 4b engine wiring.

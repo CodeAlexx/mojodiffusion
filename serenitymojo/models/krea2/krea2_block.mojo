@@ -52,6 +52,9 @@ from serenitymojo.ops.activations import swiglu, sigmoid
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd_padmask_f32, sdpa_flash_backward_padmask_f32,
+)
 from serenitymojo.ops.gqa_backward import repeat_kv_f32, repeat_kv_backward
 from serenitymojo.ops.tensor_algebra import (
     reshape, reshape_owned, slice, concat, add, mul, mul_scalar, zeros_device,
@@ -64,7 +67,7 @@ from serenitymojo.ops.linalg_backward import (
 )
 from serenitymojo.ops.norm_backward import rms_norm_backward, RmsNormBackward
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
-from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
+from serenitymojo.ops.attention_backward import sdpa_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 from serenitymojo.ops.rope_struct_backward import (
     gate_residual_backward, GateResidualGrads, rope_backward,
@@ -214,6 +217,17 @@ struct Krea2BlockSaved(Copyable, Movable):
     # the rms-normed (pre-modulate) activations needed for modulate_backward
     var xn: TArc         # [1,L,features] prenorm(x)
     var xn2: TArc        # [1,L,features] postnorm(x1)
+    # ── flash-padmask saved set (Phase: length-bucket flash training) ──────────
+    # Present ONLY when the masked/padded SDPA ran the cuDNN flash-padmask path
+    # (real_len < L). The flash backward consumes the bf16 q/k/v/o + F32 stats
+    # WITHOUT recompute (= klein KLEIN_SDPA_FLASH tape pattern). On the no-pad
+    # (full-attn) path these are None and the backward uses sdpa_backward
+    # (BIT-IDENTICAL to the pre-flash block — the F32 parity gate guard).
+    var flash_q: Optional[TArc]   # [1,L,HEADS,Dh] bf16
+    var flash_k: Optional[TArc]   # [1,L,HEADS,Dh] bf16 (post-GQA k_full)
+    var flash_v: Optional[TArc]   # [1,L,HEADS,Dh] bf16 (post-GQA v_full)
+    var flash_o: Optional[TArc]   # [1,L,HEADS,Dh] bf16 padded SDPA output
+    var flash_stats: Optional[TArc]  # [1,HEADS,L,1] F32 softmax LSE
 
     def __init__(
         out self,
@@ -224,6 +238,11 @@ struct Krea2BlockSaved(Copyable, Movable):
         var a: TArc, var x1: TArc, var xm2: TArc,
         var mlp_gate: TArc, var mlp_up: TArc, var sw: TArc, var m: TArc,
         var xn: TArc, var xn2: TArc,
+        var flash_q: Optional[TArc] = Optional[TArc](None),
+        var flash_k: Optional[TArc] = Optional[TArc](None),
+        var flash_v: Optional[TArc] = Optional[TArc](None),
+        var flash_o: Optional[TArc] = Optional[TArc](None),
+        var flash_stats: Optional[TArc] = Optional[TArc](None),
     ):
         self.x = x^
         self.xm = xm^
@@ -247,6 +266,11 @@ struct Krea2BlockSaved(Copyable, Movable):
         self.m = m^
         self.xn = xn^
         self.xn2 = xn2^
+        self.flash_q = flash_q^
+        self.flash_k = flash_k^
+        self.flash_v = flash_v^
+        self.flash_o = flash_o^
+        self.flash_stats = flash_stats^
 
 
 struct Krea2BlockForward(Movable):
@@ -329,6 +353,14 @@ def krea2_single_stream_block_lora[
     cos_k: Tensor, sin_k: Tensor,   # [L*KVHEADS, HEADDIM/2] tiled for BSHD k
     eps: Float32,
     ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),  # length-bucket pad: the VALID
+        # contiguous-prefix length of the [0:real_len] real tokens; [real_len:L] is
+        # text-pad. None (or real_len == L) = full attention via sdpa_nomask
+        # (BIT-IDENTICAL to the pre-mask block — the F32 parity gate guard). Present
+        # & < L = cuDNN flash-padmask SDPA: cuDNN masks the [real_len:L] tail rows
+        # internally (NO materialized [1,H,L,L] mask, NO materialized scores). The
+        # token order MUST be [valid(0:real_len) | pad(real_len:L)] — see the
+        # trainer's [TXT_real | IMG | TXT_pad] reorder. real_len threads to bwd too.
 ) raises -> Krea2BlockForward:
     comptime features = HEADS * HEADDIM
     comptime n_rep = HEADS // KVHEADS
@@ -372,8 +404,39 @@ def krea2_single_stream_block_lora[
     var k_full = repeat_kv_f32(k_rope, L, KVHEADS, n_rep, HEADDIM, ctx)
     var v_full = repeat_kv_f32(v, L, KVHEADS, n_rep, HEADDIM, ctx)
 
-    # SDPA (no mask; full attention for the per-block gate).
-    var att = sdpa_nomask[1, L, HEADS, HEADDIM](q_rope, k_full, v_full, scale, ctx)
+    # SDPA. No pad (default, or real_len == L) = full attention (sdpa_nomask) — the
+    # per-block gate path, BIT-IDENTICAL to the pre-flash block. Length-bucket pad
+    # (real_len present & < L) = cuDNN flash-padmask SDPA: cuDNN masks the
+    # [real_len:L] tail rows internally (the token order is [valid | pad]); NO
+    # materialized [1,H,L,L] mask (the 4.5GB resident the old sdpa_chunked path
+    # needed), NO materialized [L,L] scores. The flash bf16 q/k/v/o + F32 stats go
+    # to the tape for the flash backward (no recompute, no re-cast).
+    var att: Tensor
+    var flash_q = Optional[TArc](None)
+    var flash_k = Optional[TArc](None)
+    var flash_v = Optional[TArc](None)
+    var flash_o = Optional[TArc](None)
+    var flash_stats = Optional[TArc](None)
+    var use_flash = real_len and real_len.value() < L
+    if use_flash:
+        var rl = real_len.value()
+        var ff = sdpa_flash_train_fwd_padmask_f32[1, L, HEADS, HEADDIM](
+            q_rope, k_full, v_full, rl, scale, ctx
+        )
+        # ff.att is F32 [1,L,HEADS,Dh] (pad-tail rows are masked-out garbage the
+        # downstream gate zeroes via the pad d_out). Cast it to the ACTS dtype
+        # (q_rope.dtype()) so it meets the bf16 residual/merge in production (krea2
+        # flows bf16 acts; only norm/mod SCALES are F32 — same mixed-precision the
+        # block already casts modulate/rms_norm for). NO-OP when acts are F32 (the
+        # parity gate runs F32 → bit-identical there). Save the bf16 set for bwd.
+        att = cast_tensor(ff.att, q_rope.dtype(), ctx)
+        flash_q = Optional[TArc](ff.q_bf.copy())
+        flash_k = Optional[TArc](ff.k_bf.copy())
+        flash_v = Optional[TArc](ff.v_bf.copy())
+        flash_o = Optional[TArc](ff.o_bf.copy())
+        flash_stats = Optional[TArc](ff.stats.copy())
+    else:
+        att = sdpa_nomask[1, L, HEADS, HEADDIM](q_rope, k_full, v_full, scale, ctx)
     var attn_flat = reshape_owned(att^, [1, L, features])
 
     # sigmoid gate + product, then wo.
@@ -403,6 +466,7 @@ def krea2_single_stream_block_lora[
         TArc(a^), TArc(x1^), TArc(xm2^),
         TArc(mg^), TArc(mu^), TArc(sw^), TArc(m^),
         TArc(xn^), TArc(xn2^),
+        flash_q^, flash_k^, flash_v^, flash_o^, flash_stats^,
     )
     return Krea2BlockForward(TArc(x2^), saved^)
 
@@ -451,6 +515,13 @@ def krea2_single_stream_block_lora_backward[
     cos_k: Tensor, sin_k: Tensor,
     eps: Float32,
     ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),  # MUST match the forward call:
+        # None (or real_len == L) = sdpa_backward (full attn, BIT-IDENTICAL to the
+        # pre-flash block). Present & < L = cuDNN flash-padmask backward, consuming
+        # the saved flash bf16 q/k/v/o + F32 stats (set in the forward), passing the
+        # SAME real_len so the bwd respects the same [real_len:L] pad masking.
+        # FAIL-LOUD if real_len < L but the saved tape has no flash set (fwd/bwd
+        # real_len mismatch).
 ) raises -> Krea2BlockGrads:
     comptime features = HEADS * HEADDIM
     comptime n_rep = HEADS // KVHEADS
@@ -528,19 +599,54 @@ def krea2_single_stream_block_lora_backward[
     # sg = sigmoid(gate_pre) → d_gate_pre = sigmoid_backward(d_sg, gate_pre)
     var d_gate_pre = sigmoid_backward(d_sg, saved.gate_pre[], ctx)
 
-    # attn_flat = reshape(sdpa(q_rope, k_full, v_full)) → sdpa backward.
+    # attn_flat = reshape(sdpa(q_rope, k_full, v_full)) → sdpa backward. Length-bucket
+    # pad (real_len present & < L): the cuDNN flash-padmask backward from the saved
+    # bf16 q/k/v/o + F32 stats (no recompute), passing the SAME real_len so the bwd
+    # respects the [real_len:L] pad masking. No pad: the math sdpa_backward
+    # (BIT-IDENTICAL to the pre-flash block). FLASH dQ is NONDETERMINISTIC run-to-run
+    # (cuDNN atomics on the dQ accumulation) → flash-path grads are value-tolerance,
+    # NOT bit-exact (see krea2_mask_pad_gate's documented tolerance).
     var d_att = reshape(d_attn_flat, [1, L, HEADS, HEADDIM], ctx)
-    var sb = sdpa_backward[1, L, HEADS, HEADDIM](
-        saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
-    )
-    # d_q_rope [1,L,HEADS,Dh] ; d_k_full [1,L,HEADS,Dh] ; d_v_full [1,L,HEADS,Dh]
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    var bwd_use_flash = real_len and real_len.value() < L
+    if bwd_use_flash:
+        if not saved.flash_stats:
+            raise Error(
+                "krea2 block bwd: real_len < L but saved tape has no flash set"
+                " (forward/backward real_len mismatch)"
+            )
+        var rl = real_len.value()
+        # acts dtype (bf16 in production, F32 in the parity gate). The _f32 flash
+        # bwd wants F32 d_att and returns F32 dQ/dK/dV → cast the (bf16) d_att UP to
+        # F32 in, then cast the F32 grads back DOWN to the acts dtype so the rope /
+        # repeat_kv backward arms (which read the acts-dtype saved q/k/v) are
+        # dtype-consistent. NO-OP when acts are F32 (gate stays bit-identical).
+        var acts_dt = saved.q_rope[].dtype()
+        var d_att_f32 = cast_tensor(d_att, STDtype.F32, ctx)
+        var fb = sdpa_flash_backward_padmask_f32[1, L, HEADS, HEADDIM](
+            saved.flash_q.value(), saved.flash_k.value(), saved.flash_v.value(),
+            saved.flash_o.value(), saved.flash_stats.value(), d_att_f32, rl, scale, ctx,
+        )
+        d_q_sb = cast_tensor(fb.d_q, acts_dt, ctx)
+        d_k_sb = cast_tensor(fb.d_k, acts_dt, ctx)
+        d_v_sb = cast_tensor(fb.d_v, acts_dt, ctx)
+    else:
+        var sb = sdpa_backward[1, L, HEADS, HEADDIM](
+            saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+    # d_q_sb [1,L,HEADS,Dh] ; d_k_sb [1,L,HEADS,Dh] ; d_v_sb [1,L,HEADS,Dh]
 
     # GQA backward: repeat_kv sum-reduce HEADS → KVHEADS for k and v.
-    var d_k_rope = repeat_kv_backward(sb.d_k, L, KVHEADS, n_rep, HEADDIM, ctx)
-    var d_v = repeat_kv_backward(sb.d_v, L, KVHEADS, n_rep, HEADDIM, ctx)
+    var d_k_rope = repeat_kv_backward(d_k_sb, L, KVHEADS, n_rep, HEADDIM, ctx)
+    var d_v = repeat_kv_backward(d_v_sb, L, KVHEADS, n_rep, HEADDIM, ctx)
 
     # RoPE backward (cos/sin non-learnable → only d_x).
-    var d_q_rms = rope_backward(sb.d_q, cos_q, sin_q, True, ctx)
+    var d_q_rms = rope_backward(d_q_sb, cos_q, sin_q, True, ctx)
     var d_k_rms = rope_backward(d_k_rope, cos_k, sin_k, True, ctx)
 
     # QKNorm backward (weight=qnorm/knorm+1, FROZEN) → d_q_pre, d_k_pre. Same

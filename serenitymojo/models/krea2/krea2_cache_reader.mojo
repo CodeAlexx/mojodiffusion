@@ -31,15 +31,23 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.gpu.host import DeviceContext
+from std.gpu import global_idx
 from std.memory import ArcPointer
+from std.utils.index import IndexList
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.tensor_algebra import reshape, permute
+from serenitymojo.ops.tensor_algebra import reshape, permute, zeros_device, concat
 
 comptime TArc = ArcPointer[Tensor]
+comptime _DYN1 = Layout.row_major(-1)
+comptime _MASK_BLOCK = 256
+comptime KREA2_MASK_NEG = Float32(-1.0e9)   # additive -inf for masked key columns
+comptime KREA2_HEADS = 48                    # krea2 single_mmdit_large_wide attn heads
 
 # Krea-2 latent / patch invariants (krea2_dit.mojo Krea2Config: channels=16, patch=2).
 comptime KREA2_LATENT_CHANNELS = 16
@@ -90,6 +98,64 @@ def krea2_build_pos[LH: Int, LW: Int](
             host.append(Float32(wi))         # axis 2 (w)
     var lfull = lt + imglen
     return Tensor.from_host(host^, [1, lfull, 3], STDtype.F32, ctx)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LENGTH-BUCKET PADDING — pad every sample to a COMMON text length LTMAX so the
+# device pool holds ONE size-class (the measured ≥3-distinct-LT OOM fix). Token
+# order is [TXT padded to LTMAX, IMG], so the padded region is the text key
+# columns [LT, LTMAX). The pad-mask is the additive score bias that keeps real
+# text + image from attending to those pad columns (the no-mask block would let
+# the zero pad tokens corrupt the real ones).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Additive pad-mask kernel: write KREA2_MASK_NEG into the [1,H,LFULL,LFULL] mask
+# at every (h, i, j) with LT <= j < LTMAX (real text + image queries i must not
+# attend to the text-pad key columns j). All other entries (incl. the pad ROWS
+# i in [LT,LTMAX), which softmax over a valid row of real columns and are dropped
+# downstream) are 0. One thread per masked element: total = H*LFULL*(LTMAX-LT).
+def _krea2_pad_mask_kernel(
+    mask: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # [H*LFULL*LFULL] flat
+    H: Int, lfull: Int, lt: Int, ltmax: Int,
+):
+    var idx = Int(global_idx.x)
+    var padcols = ltmax - lt
+    var total = H * lfull * padcols
+    if idx >= total:
+        return
+    var jc = idx % padcols          # 0..padcols-1  → key column lt+jc
+    var t = idx // padcols
+    var i = t % lfull               # query row
+    var h = t // lfull              # head
+    var j = lt + jc                 # masked key column in [lt, ltmax)
+    var flat = (h * lfull + i) * lfull + j
+    mask[flat] = KREA2_MASK_NEG
+
+
+# Build the additive pad mask [1, KREA2_HEADS, LFULL, LFULL] F32 for ONE sample
+# (LFULL = LTMAX + imglen). -inf on the text-pad key columns [LT, LTMAX); 0 else.
+# When LT == LTMAX (no padding) returns an all-zero mask (== full attention). The
+# SAME tensor is consumed by the masked forward sdpa ([1,H,L,L] additive) AND the
+# masked backward sdpa_backward_masked (reads it flat as [H*L, L]) — at B=1 the
+# layouts coincide. Built ONCE per sample, shared across all 28 blocks.
+def krea2_build_pad_mask(
+    lt: Int, ltmax: Int, imglen: Int, ctx: DeviceContext
+) raises -> Tensor:
+    var lfull = ltmax + imglen
+    var mask = zeros_device([1, KREA2_HEADS, lfull, lfull], STDtype.F32, ctx)
+    if ltmax <= lt:
+        return mask^               # no padding → all-zero (full attention)
+    var nflat = KREA2_HEADS * lfull * lfull
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](nflat))
+    var m = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+        mask.buf.unsafe_ptr().bitcast[Float32](), rl
+    )
+    var npad = KREA2_HEADS * lfull * (ltmax - lt)
+    var grid = (npad + _MASK_BLOCK - 1) // _MASK_BLOCK
+    ctx.enqueue_function[_krea2_pad_mask_kernel, _krea2_pad_mask_kernel](
+        m, KREA2_HEADS, lfull, lt, ltmax, grid_dim=grid, block_dim=_MASK_BLOCK
+    )
+    return mask^
 
 
 # ── one materialised training sample ──────────────────────────────────────────
@@ -182,6 +248,22 @@ struct KreaTrainCache(Movable):
     def len(self) -> Int:
         return len(self.clean_keys)
 
+    def text_len_at(self, index: Int, ctx: DeviceContext) raises -> Int:
+        """LT of sample `index` (the text_len.<i> scalar; CHEAP — no clean/context
+        load). Lets the trainer bucket samples by LT (process LARGEST first) so the
+        device memory pool allocates the max-size blocks once and the smaller steps
+        reuse them — avoiding the per-step LT-change fragmentation OOM."""
+        if len(self.text_len_keys) == self.len():
+            var tl = Tensor.from_view(
+                self.src.tensor_view(self.text_len_keys[index]), ctx
+            )
+            var tlh = tl.to_host(ctx)
+            if len(tlh) > 0:
+                return Int(tlh[0])
+        # legacy cache without text_len.<i>: fall back to the context view's seq len.
+        var c = Tensor.from_view(self.src.tensor_view(self.context_keys[index]), ctx)
+        return c.shape()[1]
+
     def uncond[LH: Int, LW: Int](self, ctx: DeviceContext) raises -> KreaUncondCond:
         """Caption-dropout: the cached empty-caption (uncond) conditioning
         (context + pos + LT). The dropout substitutes ONLY the conditioning — the
@@ -243,6 +325,44 @@ struct KreaTrainCache(Movable):
 
         return KreaTrainSample(
             TArc(clean^), TArc(img^), TArc(context^), TArc(pos^), lt, index
+        )
+
+    def sample_padded[LH: Int, LW: Int, LTMAX: Int](
+        self, index: Int, ctx: DeviceContext
+    ) raises -> KreaTrainSample:
+        """Length-bucketed sample: the real sample with context + pos PADDED to a
+        common text length LTMAX (so all samples are one LFULL = LTMAX + imglen size
+        — the device-pool size-class OOM fix). The natural caption length LT is kept
+        in `text_len` (the trainer builds the additive pad mask from LT vs LTMAX).
+        clean/img are unchanged (the velocity loss is on the image tokens, which are
+        sliced from [LTMAX : LTMAX+imglen] downstream). context rows [LT:LTMAX] are
+        ZERO (the pad mask blocks them); pos pad rows are ZERO (krea2_build_pos
+        already zeros all txt positions, so building pos at LTMAX is the correct
+        padded grid). Fail-loud if LT > LTMAX (bucket too small)."""
+        comptime gh = LH // KREA2_PATCH
+        comptime gw = LW // KREA2_PATCH
+        comptime imglen = gh * gw
+        var s = self.sample[LH, LW](index, ctx)              # real sample (LT)
+        var lt = s.text_len
+        if lt > LTMAX:
+            raise Error(
+                String("sample_padded: LT=") + String(lt) + " > LTMAX="
+                + String(LTMAX) + " (raise the bucket)"
+            )
+        # pad context [1,LT,12,2560] → [1,LTMAX,12,2560] with zero rows on [LT:LTMAX].
+        var ctx_padded: Tensor
+        if lt < LTMAX:
+            var pad = zeros_device(
+                [1, LTMAX - lt, KREA2_TXT_LAYERS, KREA2_TXT_DIM], STDtype.BF16, ctx
+            )
+            ctx_padded = concat(1, ctx, s.context[], pad)    # [1,LTMAX,12,2560]
+        else:
+            ctx_padded = s.context[].clone(ctx)
+        # pos at LTMAX (txt positions all-zero == the padded grid; img grid follows).
+        var pos = krea2_build_pos[LH, LW](LTMAX, ctx)        # [1,LTMAX+imglen,3] F32
+        return KreaTrainSample(
+            s.clean.copy(), s.img.copy(),
+            TArc(ctx_padded^), TArc(pos^), lt, index,
         )
 
 

@@ -16,14 +16,25 @@
 # frozen CONDITIONING prefix (embedders + 4-layer text-fusion + final-layer) is
 # also streamed/loaded once per step from the checkpoint.
 #
-# ── LT-PAD CHOICE (documented) ────────────────────────────────────────────────
-# The TRAINING block uses sdpa_nomask (full attention, NO mask) — it does NOT
-# support the inference pad-to-LPAD additive mask. Padding all samples to a
-# common LPAD would let the zero pad-rows corrupt the real tokens' attention
-# (divergent from inference, which masks them). So each sample runs at its EXACT
-# LFULL = LT + imglen (NO pad), comptime-monomorphized per distinct LT and
-# dispatched by a top-level `match`. The giger cache (4 samples, 1024px,
-# imglen=4096) has LT ∈ {458,627,647,558} → 4 monomorphizations.
+# ── LT-PAD CHOICE (length-bucket pad + cuDNN flash-padmask) ───────────────────
+# The MAX device pool keys each distinct-LT size-class and does NOT reuse larger
+# blocks for smaller requests → ≥3 distinct LTs OOM regardless of order (measured:
+# a 1-LT run does 12 steps; 3 distinct LTs OOM at step 2). FIX: pad EVERY sample
+# to a common bucket text length LTMAX so all steps allocate the SAME LFULL =
+# LTMAX + imglen size → one size-class, no fragmentation. The no-mask block would
+# let the pad tokens corrupt the real ones, so the block runs the cuDNN
+# FLASH-PADMASK SDPA arm: cuDNN masks the [real_len:LFULL] pad tail internally
+# (NO materialized [1,H,L,L] mask — the old additive-mask path needed 4.5GB
+# resident + 4.5GB bwd scores and OOM'd ~step 12; flash needs neither). cuDNN's
+# padmask validates a contiguous PREFIX [0:real_len] and masks the TAIL, so the
+# sequence is REORDERED to [TXT_real(0:lt) | IMG(lt:lt+imglen) | TXT_pad(tail)]
+# with real_len = lt + imglen (krea2 text positions are all-zero so moving image
+# before the pad changes no token's rotation — see _build_conditioning). ONE
+# comptime arm (LFULL) for ALL samples. The giger cache (4 samples, 1024px,
+# imglen=4096) has LT ∈ {458,558,627,647} (max 647) → LTMAX=768 (clean mult of
+# 256) buckets all four into LFULL=4864. Masked-pad isolation is gated by
+# parity/krea2_mask_pad_gate.mojo (real-token grads pad-length invariant; FLASH so
+# value-tolerance cos>=0.999, not bit-exact — flash dQ is nondeterministic).
 #
 # ── autograd_v2 SEAM (Phase 4b) ───────────────────────────────────────────────
 # KREA2_V2_GRAPH (comptime, DEFAULT FALSE) selects the backward path. False =
@@ -78,13 +89,14 @@ from serenitymojo.models.krea2.krea2_stack import (
     Krea2StackLora, Krea2StackForward, Krea2StackLoraGrads,
     Krea2StreamFinal, KREA2_SLOTS_PER_BLOCK,
     krea2_stack_lora_forward_streamed, krea2_stack_lora_backward_streamed,
+    Krea2ResidentFp8, build_krea2_resident_fp8,
 )
 
 # ── frozen conditioning prefix (REUSE the inference krea2_forward pieces) ──────
 from serenitymojo.models.dit.krea2_dit import (
     krea2_first, krea2_temb, krea2_tmlp, krea2_tproj, krea2_txtmlp,
     krea2_text_fusion, build_krea2_rope,
-    _wb, _scale, _txtf_bundle,
+    _wb, _scale, _txtf_bundle, Krea2TextFusionWeights,
 )
 
 comptime TArc = ArcPointer[Tensor]
@@ -109,6 +121,17 @@ comptime LH = 128
 comptime LW = 128
 comptime IMGLEN = (LH // 2) * (LW // 2)   # 4096
 
+# ── LENGTH-BUCKET PAD (the multi-sample fit) ──────────────────────────────────
+# ALL samples pad to a COMMON text length LTMAX → one LFULL = LTMAX + IMGLEN size
+# class, so the MAX device pool allocates ONE block size and every step reuses it
+# (the measured ≥3-distinct-LT OOM fix). LTMAX must be >= the dataset's max LT;
+# the giger cache's max LT is 647, so 768 (a clean multiple of 256, the reference's
+# pad granularity) buckets all 4 samples. The no-mask block would let the pad
+# tokens corrupt the real ones → the cuDNN flash-padmask block path (real_len =
+# lt + IMGLEN, pad masked as the tail) is REQUIRED here.
+comptime LTMAX = 768
+comptime LFULL = LTMAX + IMGLEN           # 4864 — the single comptime arm for ALL samples
+
 # ── autograd_v2 backward dispatch seam (Phase 4b adds the engine arm) ─────────
 # DEFAULT FALSE = hand-chain krea2_stack_lora_backward_streamed (this file). The
 # all-trainers-v2 mandate ([[feedback_all_trainers_autograd_v2]]) flips this in
@@ -117,12 +140,100 @@ comptime KREA2_V2_GRAPH = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# RESIDENT CONDITIONING WEIGHTS — load ONCE, bf16 (frozen, small vs the 12GB
+# blocks → NO fp8). The conditioning FORWARD still runs per step (per-sample
+# context), but it reads from THIS resident set instead of re-loading `st` every
+# step (the remaining per-step disk read after the fp8-resident blocks). Always-on
+# (numerically identical: same bf16 weights, just loaded once). Holds the embedder
+# weights (first/tmlp/tproj), the 4 text-fusion bundles + projector, and the txtmlp
+# weights — every tensor `_build_conditioning` previously pulled from `st`.
+# ══════════════════════════════════════════════════════════════════════════════
+struct Krea2ResidentCond(Copyable, Movable):
+    var first_w: TArc          # first.weight
+    var first_b: TArc          # first.bias
+    var tmlp0_w: TArc          # tmlp.0.weight
+    var tmlp0_b: TArc          # tmlp.0.bias
+    var tmlp2_w: TArc          # tmlp.2.weight
+    var tmlp2_b: TArc          # tmlp.2.bias
+    var tproj1_w: TArc         # tproj.1.weight
+    var tproj1_b: TArc         # tproj.1.bias
+    var lw0: Krea2TextFusionWeights   # txtfusion.layerwise_blocks.0
+    var lw1: Krea2TextFusionWeights   # txtfusion.layerwise_blocks.1
+    var rf0: Krea2TextFusionWeights   # txtfusion.refiner_blocks.0
+    var rf1: Krea2TextFusionWeights   # txtfusion.refiner_blocks.1
+    var projector_w: TArc      # txtfusion.projector.weight
+    var txtmlp0_scale: TArc    # txtmlp.0.scale (F32)
+    var txtmlp1_w: TArc        # txtmlp.1.weight
+    var txtmlp1_b: TArc        # txtmlp.1.bias
+    var txtmlp3_w: TArc        # txtmlp.3.weight
+    var txtmlp3_b: TArc        # txtmlp.3.bias
+
+    def __init__(
+        out self,
+        var first_w: TArc, var first_b: TArc,
+        var tmlp0_w: TArc, var tmlp0_b: TArc, var tmlp2_w: TArc, var tmlp2_b: TArc,
+        var tproj1_w: TArc, var tproj1_b: TArc,
+        var lw0: Krea2TextFusionWeights, var lw1: Krea2TextFusionWeights,
+        var rf0: Krea2TextFusionWeights, var rf1: Krea2TextFusionWeights,
+        var projector_w: TArc,
+        var txtmlp0_scale: TArc, var txtmlp1_w: TArc, var txtmlp1_b: TArc,
+        var txtmlp3_w: TArc, var txtmlp3_b: TArc,
+    ):
+        self.first_w = first_w^
+        self.first_b = first_b^
+        self.tmlp0_w = tmlp0_w^
+        self.tmlp0_b = tmlp0_b^
+        self.tmlp2_w = tmlp2_w^
+        self.tmlp2_b = tmlp2_b^
+        self.tproj1_w = tproj1_w^
+        self.tproj1_b = tproj1_b^
+        self.lw0 = lw0^
+        self.lw1 = lw1^
+        self.rf0 = rf0^
+        self.rf1 = rf1^
+        self.projector_w = projector_w^
+        self.txtmlp0_scale = txtmlp0_scale^
+        self.txtmlp1_w = txtmlp1_w^
+        self.txtmlp1_b = txtmlp1_b^
+        self.txtmlp3_w = txtmlp3_w^
+        self.txtmlp3_b = txtmlp3_b^
+
+
+# Load the conditioning weights ONCE (bf16, via the SAME _wb/_scale/_txtf_bundle
+# loaders the per-step path used → byte-identical values). Called once in main.
+def load_krea2_resident_cond(
+    st: ShardedSafeTensors, key_prefix: String, ctx: DeviceContext
+) raises -> Krea2ResidentCond:
+    return Krea2ResidentCond(
+        TArc(_wb(st, key_prefix + "first.weight", ctx)),
+        TArc(_wb(st, key_prefix + "first.bias", ctx)),
+        TArc(_wb(st, key_prefix + "tmlp.0.weight", ctx)),
+        TArc(_wb(st, key_prefix + "tmlp.0.bias", ctx)),
+        TArc(_wb(st, key_prefix + "tmlp.2.weight", ctx)),
+        TArc(_wb(st, key_prefix + "tmlp.2.bias", ctx)),
+        TArc(_wb(st, key_prefix + "tproj.1.weight", ctx)),
+        TArc(_wb(st, key_prefix + "tproj.1.bias", ctx)),
+        _txtf_bundle(st, key_prefix + "txtfusion.layerwise_blocks.0", ctx),
+        _txtf_bundle(st, key_prefix + "txtfusion.layerwise_blocks.1", ctx),
+        _txtf_bundle(st, key_prefix + "txtfusion.refiner_blocks.0", ctx),
+        _txtf_bundle(st, key_prefix + "txtfusion.refiner_blocks.1", ctx),
+        TArc(_wb(st, key_prefix + "txtfusion.projector.weight", ctx)),
+        TArc(_scale(st, key_prefix + "txtmlp.0.scale", ctx)),
+        TArc(_wb(st, key_prefix + "txtmlp.1.weight", ctx)),
+        TArc(_wb(st, key_prefix + "txtmlp.1.bias", ctx)),
+        TArc(_wb(st, key_prefix + "txtmlp.3.weight", ctx)),
+        TArc(_wb(st, key_prefix + "txtmlp.3.bias", ctx)),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CONDITIONING — the FROZEN krea2_forward prefix (steps 1-11) up to the block
 # stack: produce `combined [1,LFULL,F]`, `blk_vec`, `tmlp_out`, and the per-token
 # rope (cos,sin). `img` is the PATCHIFIED NOISED latent (caller noises in latent
 # space first). All weights stream from `st` (embedders + 4 text-fusion bundles
-# are small, loaded once). NO grad here (frozen); no pad (L == LFULL, no-mask
-# block path). Mirrors krea2_forward:1358-1454 exactly minus the pad/mask.
+# are small, loaded once). NO grad here (frozen). The length-bucket REORDER makes
+# combined = [TXT_real | IMG | TXT_pad] (valid prefix + pad tail for the cuDNN
+# flash-padmask). Mirrors krea2_forward:1358-1454 + the reorder.
 # ══════════════════════════════════════════════════════════════════════════════
 struct _Cond(Movable):
     var combined: TArc        # [1, LFULL, F]
@@ -143,69 +254,89 @@ struct _Cond(Movable):
 
 
 def _build_conditioning[LT: Int, LFULL: Int](
-    st: ShardedSafeTensors, key_prefix: String,
+    cond_w: Krea2ResidentCond,   # RESIDENT conditioning weights (loaded once; no
+        # per-step `st` read). Numerically identical to the old per-step `_wb`/
+        # `_scale`/`_txtf_bundle` loads — same bf16 weights, just loaded once.
     img: Tensor,            # [1, IMGLEN, 64] F32  PATCHIFIED noised latent
-    context: Tensor,        # [1, LT, 12, 2560] BF16
-    pos: Tensor,            # [1, LFULL, 3] F32 (txt zeros + img grid)
+    context: Tensor,        # [1, LT, 12, 2560] BF16   (LT == LTMAX bucket length)
+    pos: Tensor,            # [1, LFULL, 3] F32 (txt zeros [LTMAX] + img grid)
     t: Tensor,              # [1] F32 timestep (in [0,1])
+    real_text_len: Int,     # the natural caption length lt (<= LT==LTMAX). The
+        # length-bucket reorder makes the valid tokens a CONTIGUOUS PREFIX
+        # [TXT_real(0:lt) | IMG(lt:lt+IMGLEN)] with TXT_pad at the tail, so the
+        # cuDNN flash-padmask (tail-only) masks the pad. real_len = lt + IMGLEN.
     ctx: DeviceContext,
 ) raises -> _Cond:
     # 1) img = first(img) → [1, IMGLEN, F]. img is F32 → cast bf16 to match the bf16
     # `first` head (= reference v.to(bf16) on the head; img feed is bf16 in inference).
     var img_bf = cast_tensor(img, STDtype.BF16, ctx)
     var img_e = krea2_first(
-        img_bf, _wb(st, key_prefix + "first.weight", ctx),
-        _wb(st, key_prefix + "first.bias", ctx), ctx,
+        img_bf, cond_w.first_w[], cond_w.first_b[], ctx,
     )
 
     # 2) t = tmlp(temb(t)) → [1,1,F].
     var te = krea2_temb(t, TDIM, ctx, STDtype.BF16)            # [1, 256]
     var t_vec = krea2_tmlp(
         te,
-        _wb(st, key_prefix + "tmlp.0.weight", ctx),
-        _wb(st, key_prefix + "tmlp.0.bias", ctx),
-        _wb(st, key_prefix + "tmlp.2.weight", ctx),
-        _wb(st, key_prefix + "tmlp.2.bias", ctx),
+        cond_w.tmlp0_w[], cond_w.tmlp0_b[],
+        cond_w.tmlp2_w[], cond_w.tmlp2_b[],
         ctx,
     )
     var t3 = reshape(t_vec, [1, 1, FEATURES], ctx)            # [1,1,F] = tmlp_out
 
     # 3) blk_vec = tproj(t3) → [1, 6*F].
     var blk_vec = krea2_tproj(
-        t3, _wb(st, key_prefix + "tproj.1.weight", ctx),
-        _wb(st, key_prefix + "tproj.1.bias", ctx), ctx,
+        t3, cond_w.tproj1_w[], cond_w.tproj1_b[], ctx,
     )
     var blk_vec2 = reshape(blk_vec, [1, 6 * FEATURES], ctx)   # [1, 6*F]
 
     # 4-5) context = txtfusion(context) (b==1 → txtmask all-ones → refiner no-op).
-    var lw0 = _txtf_bundle(st, key_prefix + "txtfusion.layerwise_blocks.0", ctx)
-    var lw1 = _txtf_bundle(st, key_prefix + "txtfusion.layerwise_blocks.1", ctx)
-    var rf0 = _txtf_bundle(st, key_prefix + "txtfusion.refiner_blocks.0", ctx)
-    var rf1 = _txtf_bundle(st, key_prefix + "txtfusion.refiner_blocks.1", ctx)
     var ctx_fused = krea2_text_fusion[LT, NLAYERS_TXT, TXTHEADS, TXTHD](
-        context, lw0, lw1,
-        _wb(st, key_prefix + "txtfusion.projector.weight", ctx),
-        rf0, rf1, Optional[Tensor](None), ctx,
+        context, cond_w.lw0, cond_w.lw1,
+        cond_w.projector_w[],
+        cond_w.rf0, cond_w.rf1, Optional[Tensor](None), ctx,
     )                                                          # [1, LT, txtdim]
 
     # 6) context = txtmlp(context) → [1, LT, F].
     var ctx_proj = krea2_txtmlp(
         ctx_fused,
-        _scale(st, key_prefix + "txtmlp.0.scale", ctx),
-        _wb(st, key_prefix + "txtmlp.1.weight", ctx),
-        _wb(st, key_prefix + "txtmlp.1.bias", ctx),
-        _wb(st, key_prefix + "txtmlp.3.weight", ctx),
-        _wb(st, key_prefix + "txtmlp.3.bias", ctx),
+        cond_w.txtmlp0_scale[],
+        cond_w.txtmlp1_w[], cond_w.txtmlp1_b[],
+        cond_w.txtmlp3_w[], cond_w.txtmlp3_b[],
         ctx,
     )
 
-    # 7-8) combined = cat(context, img, dim=1) → [1, LFULL, F]. context THEN img.
-    var combined = concat(1, ctx, ctx_proj, img_e)             # [1, LFULL, F]
+    # 7-8) LENGTH-BUCKET REORDER → [TXT_real(0:lt) | IMG(lt:lt+IMGLEN) | TXT_pad(tail)].
+    # ctx_proj is [1,LTMAX,F] (real text [0:lt], pad text [lt:LTMAX]); img_e is
+    # [1,IMGLEN,F]. The cuDNN flash-padmask masks only the TAIL, so the valid tokens
+    # (real text + image) must be a contiguous PREFIX; the pad text moves to the
+    # tail. combined = cat(real_text, img, pad_text) → [1, LFULL, F].
+    var combined: Tensor
+    if real_text_len < LT:
+        var real_text = slice(ctx_proj, 1, 0, real_text_len, ctx)          # [1,lt,F]
+        var pad_text = slice(ctx_proj, 1, real_text_len, LT - real_text_len, ctx)  # [1,LTMAX-lt,F]
+        var head = concat(1, ctx, real_text, img_e)                        # [1,lt+IMGLEN,F]
+        combined = concat(1, ctx, head, pad_text)                          # [1,LFULL,F]
+    else:
+        # lt == LTMAX: no pad → the original [TXT | IMG] order (no-mask block path).
+        combined = concat(1, ctx, ctx_proj, img_e)                         # [1,LFULL,F]
 
-    # 9) NO pad (L == LFULL = LT + IMGLEN; the no-mask training block attends all).
+    # 9) flash-padmask: valid prefix = lt + IMGLEN; [real_len:LFULL] is masked pad.
 
-    # 10) rope table from pos [1,LFULL,3] → (cos,sin) each [LFULL, HEADDIM/2].
-    var pos_flat = reshape(pos, [LFULL * 3], ctx)
+    # 10) rope: pos [1,LFULL,3] is [txt_zeros(LTMAX) | img grid]. Reorder to match
+    # combined: [txt_real_zeros(lt) | img grid | txt_pad_zeros(LTMAX-lt)]. Text
+    # positions are ALL-ZERO (krea2_build_pos) so this reorder changes NO token's
+    # rotation — it only aligns the per-token table to the reordered sequence.
+    var pos_re: Tensor
+    if real_text_len < LT:
+        var pos_real = slice(pos, 1, 0, real_text_len, ctx)                # [1,lt,3]
+        var pos_img = slice(pos, 1, LT, LFULL - LT, ctx)                   # [1,IMGLEN,3]
+        var pos_pad = slice(pos, 1, real_text_len, LT - real_text_len, ctx)  # [1,LTMAX-lt,3]
+        var pos_head = concat(1, ctx, pos_real, pos_img)                   # [1,lt+IMGLEN,3]
+        pos_re = concat(1, ctx, pos_head, pos_pad)                         # [1,LFULL,3]
+    else:
+        pos_re = pos.clone(ctx)
+    var pos_flat = reshape(pos_re, [LFULL * 3], ctx)
     var axes = List[Int]()
     axes.append(32); axes.append(48); axes.append(48)
     var rope = build_krea2_rope(pos_flat, axes, THETA, ctx, STDtype.F32)
@@ -232,16 +363,22 @@ struct _StepOut(Movable):
         self.grad_norm = grad_norm
 
 
-def _train_one_sample[LT: Int, LFULL: Int](
+def _train_one_sample(
     st: ShardedSafeTensors, key_prefix: String,
     clean: Tensor,          # [1, 16, LH, LW] F32 normalized latent
-    context: Tensor,        # [1, LT, 12, 2560] BF16
-    pos: Tensor,            # [1, LFULL, 3] F32
+    context: Tensor,        # [1, LTMAX, 12, 2560] BF16  (PADDED to the bucket)
+    pos: Tensor,            # [1, LFULL, 3] F32          (padded grid)
+    lt: Int,                # natural caption length (for the additive pad mask)
     lora: Krea2StackLora, fin: Krea2StreamFinal,
+    cond_w: Krea2ResidentCond,   # RESIDENT conditioning weights (loaded once; the
+        # conditioning forward reads these instead of `st` every step).
     sigma: Float32,         # flow-match t (= blend coeff = model timestep), in [0,1]
     noise_seed: UInt64,
     cfg: TrainConfig,
     ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+        # T2.B fp8-quantized-resident base (cfg.quantized_resident=="fp8_e4m3").
+        # None (default) = the per-step disk stream from `st` (C13 byte-identical).
 ) raises -> _StepOut:
     # ── flow-match noise in LATENT space (before patchify; krea2.py order) ──────
     # x_t = (1-sigma)*clean + sigma*noise ; target = noise - clean  (krea2.py:403).
@@ -254,16 +391,25 @@ def _train_one_sample[LT: Int, LFULL: Int](
     var target_img = krea2_patchify[LH, LW](fm.target, ctx)
 
     # ── conditioning (frozen prefix) → combined / blk_vec / tmlp_out / rope ─────
+    # Monomorphized on the BUCKET text length LTMAX (context is padded to LTMAX). The
+    # LENGTH-BUCKET REORDER (in _build_conditioning) makes combined =
+    # [TXT_real(0:lt) | IMG(lt:lt+IMGLEN) | TXT_pad(tail)], so the valid tokens are a
+    # contiguous PREFIX of length lt+IMGLEN and the cuDNN flash-padmask masks the
+    # [lt+IMGLEN : LFULL] tail. Image tokens occupy [lt : lt+IMGLEN].
     var t1 = _t_scalar(sigma, ctx)                            # [1] F32 timestep
-    var cond = _build_conditioning[LT, LFULL](
-        st, key_prefix, img, context, pos, t1, ctx,
+    var cond = _build_conditioning[LTMAX, LFULL](
+        cond_w, img, context, pos, t1, lt, ctx,
     )
 
-    # ── streaming stack forward (txtlen = LT, imglen = IMGLEN) ──────────────────
+    # ── length-bucket flash-padmask: the valid contiguous prefix length. lt == LTMAX
+    # → real_len == LFULL → the block's no-mask (full-attn) path (no extra masking).
+    var real_len = Optional[Int](lt + IMGLEN)
+
+    # ── streaming stack forward (txtlen = lt, imglen = IMGLEN: image at [lt:lt+IMGLEN]) ─
     var fwd = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
         cond.combined, cond.blk_vec, cond.tmlp_out,
         st, key_prefix, NBLOCKS, lora, fin,
-        cond.cos, cond.sin, EPS, LT, IMGLEN, ctx,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
     )
 
     # ── flow-match MSE loss (levers; default MSE) on the image-token velocity ───
@@ -284,7 +430,7 @@ def _train_one_sample[LT: Int, LFULL: Int](
         grads = krea2_stack_lora_backward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
             d_velocity, cond.blk_vec, cond.tmlp_out,
             st, key_prefix, NBLOCKS, lora, fin, fwd,
-            cond.cos, cond.sin, EPS, ctx,
+            cond.cos, cond.sin, EPS, ctx, real_len, resident,
         )
 
     var gn = _grad_norm(grads)
@@ -402,34 +548,26 @@ struct _GradLists(Movable):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DRIVER — one step dispatched on the sample's LT (the comptime monomorphizations).
-# The giger cache has exactly these 4 (LT, LFULL) pairs. Returns the _StepOut.
+# DRIVER — one step. With length-bucket padding ALL samples are the SAME LFULL =
+# LTMAX + IMGLEN size class → ONE comptime arm (no per-LT monomorphization). The
+# real caption length `lt` is passed at runtime for the additive pad mask. Returns
+# the _StepOut.
 # ══════════════════════════════════════════════════════════════════════════════
 def _step_dispatch(
     st: ShardedSafeTensors, key_prefix: String,
     clean: Tensor, context: Tensor, pos: Tensor, lt: Int,
-    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    lora: Krea2StackLora, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
     sigma: Float32, noise_seed: UInt64, cfg: TrainConfig, ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
 ) raises -> _StepOut:
-    # comptime LT/LFULL arms — one monomorphization per distinct caption length in
-    # the giger cache. Add an arm here for any new LT (fail-loud otherwise).
-    if lt == 458:
-        return _train_one_sample[458, 458 + IMGLEN](
-            st, key_prefix, clean, context, pos, lora, fin, sigma, noise_seed, cfg, ctx)
-    elif lt == 558:
-        return _train_one_sample[558, 558 + IMGLEN](
-            st, key_prefix, clean, context, pos, lora, fin, sigma, noise_seed, cfg, ctx)
-    elif lt == 627:
-        return _train_one_sample[627, 627 + IMGLEN](
-            st, key_prefix, clean, context, pos, lora, fin, sigma, noise_seed, cfg, ctx)
-    elif lt == 647:
-        return _train_one_sample[647, 647 + IMGLEN](
-            st, key_prefix, clean, context, pos, lora, fin, sigma, noise_seed, cfg, ctx)
-    else:
+    if lt > LTMAX:
         raise Error(
-            String("train_krea2: no comptime LT arm for LT=") + String(lt)
-            + " (giger cache has {458,558,627,647}; add an arm for a new bucket)"
+            String("train_krea2: LT=") + String(lt) + " > LTMAX=" + String(LTMAX)
+            + " (raise LTMAX above the dataset's max caption length)"
         )
+    return _train_one_sample(
+        st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
+        sigma, noise_seed, cfg, ctx, resident)
 
 
 def main() raises:
@@ -447,6 +585,7 @@ def main() raises:
     print("cache=", cache_path, " steps=", steps)
     print("rank=", cfg.lora_rank, " alpha=", cfg.lora_alpha, " lr=", cfg.lr,
           " shift=", cfg.timestep_shift, " nblocks=", NBLOCKS,
+          " LTMAX=", LTMAX, " LFULL=", LFULL, " (length-bucket pad+mask)",
           " V2_GRAPH=", KREA2_V2_GRAPH)
 
     # ── open the cache + checkpoint; load the small frozen final-layer once ─────
@@ -456,19 +595,67 @@ def main() raises:
     var st = ShardedSafeTensors.open(cfg.checkpoint)
     var fin = Krea2StreamFinal.load(st, key_prefix, ctx)
 
+    # ── RESIDENT conditioning weights (load ONCE; frozen, small, bf16 — no fp8) ──
+    # The conditioning forward (embedders + 4 text-fusion bundles + txtmlp) reads
+    # from this resident set instead of re-loading `st` EVERY step (the remaining
+    # per-step disk read after the fp8-resident blocks). Always-on, numerically
+    # identical (same bf16 weights, just loaded once).
+    var cond_w = load_krea2_resident_cond(st, key_prefix, ctx)
+    print("resident conditioning weights loaded once (embedders + txtfusion + txtmlp).")
+
+    # ── T2.B fp8-quantized-resident base (gate on cfg.quantized_resident) ───────
+    # "fp8_e4m3" = quantize the 28 frozen blocks' 8 matmul weights ONCE to E4M3 +
+    # per-row F32 scale, hold resident (~12GB), dequant per block in the step → NO
+    # per-step disk re-read. "" / "OFF" (default, C13) = the per-step bf16 disk
+    # stream below stays UNTOUCHED (byte-identical to the pre-fp8 path).
+    var resident = Optional[Krea2ResidentFp8](None)
+    if cfg.quantized_resident == String("fp8_e4m3"):
+        print("fp8_e4m3 resident base: quantizing", NBLOCKS, "blocks ONCE at load ...")
+        resident = Optional[Krea2ResidentFp8](
+            build_krea2_resident_fp8(st, key_prefix, NBLOCKS, ctx)
+        )
+        print("fp8_e4m3 resident base: DONE (no per-step disk re-read in the step).")
+    else:
+        print("quantized_resident=", cfg.quantized_resident,
+              " (bf16 per-step disk stream — the C13 default path).")
+
     # ── host LoRA set (authoritative + AdamW moments) ───────────────────────────
     var host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
     var n_adapters = NBLOCKS * KREA2_SLOTS_PER_BLOCK
     print("host LoRA adapters=", len(host_lora), " (8 per block)")
+
+    # ── LT bucketing ────────────────────────────────────────────────────────────
+    # Process samples LARGEST-LT first so the device memory pool allocates the
+    # max-size blocks on step 0 and the smaller steps REUSE them — avoids the
+    # measured per-step LT-change fragmentation OOM (going from a smaller LT to a
+    # larger one needs new bigger blocks while the smaller ones are still pooled).
+    # Precompute LTs (cheap scalar reads), selection-sort the index order desc (n small).
+    var lts = List[Int]()
+    for i in range(n):
+        lts.append(cache.text_len_at(i, ctx))
+    var order = List[Int]()
+    for i in range(n):
+        order.append(i)
+    for a in range(n):
+        var mx = a
+        for b in range(a + 1, n):
+            if lts[order[b]] > lts[order[mx]]:
+                mx = b
+        if mx != a:
+            var t = order[a]
+            order[a] = order[mx]
+            order[mx] = t
+    print("LT-bucketed order (largest first): step0 = sample", order[0], "LT", lts[order[0]])
 
     var seed_base = cfg.seed
     print("")
     print("step  sample  LT   sigma     loss        grad_norm")
 
     for step in range(steps):
-        var idx = step % n
-        var sample = cache.sample[LH, LW](idx, ctx)
-        var lt = sample.text_len
+        var idx = order[step % n]   # LT-bucketed order kept (harmless; padding makes all
+        # samples one LFULL size class — the real pool fragmentation fix).
+        var sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)  # context+pos padded to LTMAX
+        var lt = sample.text_len    # natural caption length (for the additive pad mask)
 
         # flow-match t (= blend coeff = model timestep) per step (seed + step stream).
         var sigma = sample_timestep_logit_normal(
@@ -482,7 +669,8 @@ def main() raises:
         var so = _step_dispatch(
             st, key_prefix,
             sample.clean[], sample.context[], sample.pos[], lt,
-            dev_lora, fin, sigma, noise_seed, cfg, ctx,
+            dev_lora, fin, cond_w, sigma, noise_seed, cfg, ctx,
+            resident,
         )
 
         # extract flat grad lists, then global-norm clip (max_grad_norm).
@@ -498,6 +686,10 @@ def main() raises:
         )
 
         print(step, "  ", idx, "  ", lt, "  ", sigma, "  ", so.loss, "  ", gn)
+        ctx.synchronize()   # per-STEP async free discipline: reclaim this step's tensors
+        # (esp. the ~4.5GB pad mask + the padded sample + fwd/bwd acts) before the next
+        # step — else the deferred async frees creep up in the tight LTMAX headroom and
+        # OOM (~step 11). The per-block sync handles within-the-stack; this handles steps.
 
     print("")
     print("VERDICT: ran", steps, "steps. Lead checks loss DROPPING + grad_norm",

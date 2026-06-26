@@ -334,10 +334,8 @@ def krea2_single_stream_block_graph_backward_slab[
     execute_slab drives the backward, ONE batched to_host → host Krea2BlockGrads.
     attn sdpa = comptime KREA2_SLAB_FLASH (FLASH trainer / MATH bit gate). The
     returned grads are NON-slab (d_x cloned out; LoRA host lists), so the caller
-    rewinds the slab AFTER this returns. real_len < L (flash-padmask) is a later
-    phase (raise); full attention only here."""
-    if real_len and real_len.value() < L:
-        raise Error("krea2 slab block backward: real_len<L flash-padmask is a later phase")
+    rewinds the slab AFTER this returns. real_len<L = the LT-padded trainer
+    (flash-PADMASK); allowed with FLASH (the MATH bit gate is full-attn)."""
     comptime features = HEADS * HEADDIM
     comptime n_rep = HEADS // KVHEADS
     var mlpdim = w.mlp_gate_w[].shape()[0]
@@ -382,8 +380,15 @@ def krea2_single_stream_block_graph_backward_slab[
     var v_full = record_repeat_kv_slab(g, v, L, KVHEADS, n_rep, HEADDIM, ctx, slab)
     var att: TArc
     comptime if KREA2_SLAB_FLASH:
-        att = record_sdpa_flash_nopad_slab[1, L, HEADS, HEADDIM](g, q_rope, k_full, v_full, scale, ctx, slab)
+        # PADMASK flash when real_len<L (LT-padded trainer); no-pad flash at ==L.
+        if real_len and real_len.value() < L:
+            att = record_sdpa_flash_padmask_slab[1, L, HEADS, HEADDIM](
+                g, q_rope, k_full, v_full, real_len.value(), scale, ctx, slab)
+        else:
+            att = record_sdpa_flash_nopad_slab[1, L, HEADS, HEADDIM](g, q_rope, k_full, v_full, scale, ctx, slab)
     else:
+        if real_len and real_len.value() < L:
+            raise Error("krea2 whole-block MATH attn: real_len<L needs flash (KREA2_SLAB_FLASH)")
         att = record_sdpa_nomask_slab[1, L, HEADS, HEADDIM](g, q_rope, k_full, v_full, scale, ctx, slab)
     var attn_flat = record_reshape(g, att, [1, L, features], ctx)
     var sg = record_sigmoid_slab(g, wg.y, ctx, slab)

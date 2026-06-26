@@ -50,6 +50,22 @@ comptime _DYN1 = Layout.row_major(-1)
 comptime _TPB = 256  # threads per block (one block per row / group)
 comptime _BLOCK = 256
 
+# ── RMS_NORM_VEC (Lever B6, AUDIT_FUSION_SPEEDUP_PLAN_2026-05-30.md §B6) ──────
+# When True, rms_norm_backward_dx / rms_norm_backward_dx_slab dispatch the
+# width-2 SIMD-load fast path (`_rms_bwd_dx_kernel_vec[dtype]`) on the SAME-dtype
+# (non-mixed-weight) branch for even feature dims. DEFAULT False (contract C13):
+# the scalar `_rms_bwd_dx_kernel[dtype]` stays the byte-exact default and the vec
+# kernel is gated out entirely (the `comptime if RMS_NORM_VEC` guards never
+# reference it), so every existing parity gate is unaffected. The full
+# `rms_norm_backward` (d_x + d_g) and the mixed-dtype d_x path are untouched.
+#
+# Same ~1 ULP F32-regroup tradeoff as the forward (norm.mojo RMS_NORM_VEC): only
+# the two F32 reductions' load path changes from one element to a width-2 pair;
+# the tree reduction + the d_x epilogue formula are identical to the scalar
+# kernel. Gated by cos ≥ 0.99999 vs the scalar kernel (rms_norm_vec_parity.mojo).
+comptime RMS_NORM_VEC = False
+comptime _VW = 2  # SIMD vector width for the RMS_NORM_VEC load path
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # RMSNorm backward
@@ -117,6 +133,80 @@ def _rms_bwd_dx_kernel[dtype: DType](
         var out = gv * gov * inv - xv * inv3 * (sum_gwx / Float32(cols))
         dx[row, c] = rebind[dx.element_type](out.cast[dtype]())
         c += _TPB
+
+
+# d_x vec2 (RMS_NORM_VEC fast path): identical structure + math to
+# `_rms_bwd_dx_kernel` above (one block/row; two F32 tree reductions — sum(x²)
+# then sum(go*g*x) — then the d_x epilogue), the ONLY change being the load
+# path: each thread reads _VW=2 contiguous columns per iteration via a width-2
+# SIMD load over the row's flat pointer (x.ptr + row*cols), striding by _TPB*_VW.
+# Requires cols % _VW == 0 (the dispatcher guarantees it; else scalar fallback).
+def _rms_bwd_dx_kernel_vec[dtype: DType](
+    go: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    g: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
+    dx: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var xp = x.ptr + row * cols
+    var gop = go.ptr + row * cols
+    var dxp = dx.ptr + row * cols
+    var sh = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+
+    # sum(x^2)
+    var lsq: Float32 = 0.0
+    var c = tid * _VW
+    while c < cols:
+        var v = xp.load[width=_VW](c).cast[DType.float32]()
+        lsq += (v * v).reduce_add()
+        c += _TPB * _VW
+    sh[tid] = lsq
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            sh[tid] = sh[tid] + sh[tid + active]
+        barrier()
+        active //= 2
+    var inv = 1.0 / sqrt(sh[0] / Float32(cols) + eps)
+    barrier()
+
+    # sum(go*g*x)
+    var lgwx: Float32 = 0.0
+    c = tid * _VW
+    while c < cols:
+        var gov = gop.load[width=_VW](c).cast[DType.float32]()
+        var gv = g.ptr.load[width=_VW](c).cast[DType.float32]()
+        var xv = xp.load[width=_VW](c).cast[DType.float32]()
+        lgwx += (gov * gv * xv).reduce_add()
+        c += _TPB * _VW
+    sh[tid] = lgwx
+    barrier()
+    active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            sh[tid] = sh[tid] + sh[tid + active]
+        barrier()
+        active //= 2
+    var sum_gwx = sh[0]
+    barrier()
+
+    var inv3 = inv * inv * inv
+    c = tid * _VW
+    while c < cols:
+        var xv = xp.load[width=_VW](c).cast[DType.float32]()
+        var gv = g.ptr.load[width=_VW](c).cast[DType.float32]()
+        var gov = gop.load[width=_VW](c).cast[DType.float32]()
+        # epilogue arithmetic identical to the scalar _rms_bwd_dx_kernel
+        # (xv * inv3 * (sum_gwx/cols)); only the loads are vectorized.
+        var out = gv * gov * inv - xv * inv3 * (sum_gwx / Float32(cols))
+        dxp.store[width=_VW](c, out.cast[dtype]())
+        c += _TPB * _VW
 
 
 # d_g: one thread per column. d_g[c] = sum_rows( go[r,c]*x[r,c]*inv_rms[r] ).
@@ -426,6 +516,8 @@ def rms_norm_backward_dx(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 
+    # RMS_NORM_VEC fast path only when the flag is on AND D is _VW-even.
+    var use_vec = RMS_NORM_VEC and (d % _VW == 0)
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
@@ -436,9 +528,21 @@ def rms_norm_backward_dx(
             weight.buf.unsafe_ptr().bitcast[Float32](), g_rl)
         var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
-        ctx.enqueue_function[
-            _rms_bwd_dx_kernel[DType.float32], _rms_bwd_dx_kernel[DType.float32]
-        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel_vec[DType.float32],
+                    _rms_bwd_dx_kernel_vec[DType.float32],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel[DType.float32],
+                    _rms_bwd_dx_kernel[DType.float32],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        else:
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel[DType.float32], _rms_bwd_dx_kernel[DType.float32]
+            ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
     elif dt == DType.bfloat16:
         var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
@@ -448,9 +552,22 @@ def rms_norm_backward_dx(
             weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
         var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-        ctx.enqueue_function[
-            _rms_bwd_dx_kernel[DType.bfloat16], _rms_bwd_dx_kernel[DType.bfloat16]
-        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel_vec[DType.bfloat16],
+                    _rms_bwd_dx_kernel_vec[DType.bfloat16],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel[DType.bfloat16],
+                    _rms_bwd_dx_kernel[DType.bfloat16],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        else:
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel[DType.bfloat16],
+                _rms_bwd_dx_kernel[DType.bfloat16],
+            ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
     else:
         var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
@@ -460,9 +577,21 @@ def rms_norm_backward_dx(
             weight.buf.unsafe_ptr().bitcast[Float16](), g_rl)
         var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
-        ctx.enqueue_function[
-            _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
-        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel_vec[DType.float16],
+                    _rms_bwd_dx_kernel_vec[DType.float16],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel[DType.float16],
+                    _rms_bwd_dx_kernel[DType.float16],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        else:
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
+            ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     return Tensor(dx_buf^, xshape.copy(), x.dtype())
 
@@ -522,6 +651,8 @@ def rms_norm_backward_dx_slab(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 
+    # RMS_NORM_VEC fast path only when the flag is on AND D is _VW-even.
+    var use_vec = RMS_NORM_VEC and (d % _VW == 0)
     var dt = x.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
@@ -532,9 +663,21 @@ def rms_norm_backward_dx_slab(
             weight.buf.unsafe_ptr().bitcast[Float32](), g_rl)
         var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[Float32](), x_rl)
-        ctx.enqueue_function[
-            _rms_bwd_dx_kernel[DType.float32], _rms_bwd_dx_kernel[DType.float32]
-        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel_vec[DType.float32],
+                    _rms_bwd_dx_kernel_vec[DType.float32],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel[DType.float32],
+                    _rms_bwd_dx_kernel[DType.float32],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        else:
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel[DType.float32], _rms_bwd_dx_kernel[DType.float32]
+            ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
     elif dt == DType.bfloat16:
         var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
@@ -544,9 +687,22 @@ def rms_norm_backward_dx_slab(
             weight.buf.unsafe_ptr().bitcast[BFloat16](), g_rl)
         var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
-        ctx.enqueue_function[
-            _rms_bwd_dx_kernel[DType.bfloat16], _rms_bwd_dx_kernel[DType.bfloat16]
-        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel_vec[DType.bfloat16],
+                    _rms_bwd_dx_kernel_vec[DType.bfloat16],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel[DType.bfloat16],
+                    _rms_bwd_dx_kernel[DType.bfloat16],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        else:
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel[DType.bfloat16],
+                _rms_bwd_dx_kernel[DType.bfloat16],
+            ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
     else:
         var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
@@ -556,9 +712,21 @@ def rms_norm_backward_dx_slab(
             weight.buf.unsafe_ptr().bitcast[Float16](), g_rl)
         var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             dx_buf.unsafe_ptr().bitcast[Float16](), x_rl)
-        ctx.enqueue_function[
-            _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
-        ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel_vec[DType.float16],
+                    _rms_bwd_dx_kernel_vec[DType.float16],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[
+                    _rms_bwd_dx_kernel[DType.float16],
+                    _rms_bwd_dx_kernel[DType.float16],
+                ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        else:
+            ctx.enqueue_function[
+                _rms_bwd_dx_kernel[DType.float16], _rms_bwd_dx_kernel[DType.float16]
+            ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
     # P5-CAPTURE-SYNC-REMOVED (C9): single-stream ordering (TIER2 precedent,
     # ops/attention.mojo); no sync inside a captured region.
     return Tensor(dx_buf^, xshape.copy(), x.dtype())

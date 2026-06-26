@@ -43,6 +43,25 @@ comptime _DYN2 = Layout.row_major(-1, -1)
 comptime _DYN1 = Layout.row_major(-1)
 comptime _TPB = 256  # threads per block (one block per row)
 
+# ── RMS_NORM_VEC (Lever B6, AUDIT_FUSION_SPEEDUP_PLAN_2026-05-30.md §B6) ──────
+# When True, rms_norm / rms_norm_slab dispatch the width-2 SIMD-load fast path
+# (`_rms_norm_kernel_*_vec` below) for even feature dims; layer_norm/group_norm
+# are untouched. DEFAULT False (contract C13): the scalar one-element-strided
+# kernels above stay the byte-exact default and the vec kernels are not even
+# referenced (the `comptime if RMS_NORM_VEC` guards in the dispatchers gate them
+# out entirely), so every existing parity gate is unaffected.
+#
+# The vec path loads 2 contiguous columns per thread per iteration, halving the
+# load instruction count. This regroups the per-thread F32 sum of squares from
+#   ((local + x0²) + x1²)   →   (local + (x0² + x1²))
+# i.e. ~1 ULP off the scalar — NOT bit-exact. Gated by cos ≥ 0.99999 vs the
+# scalar kernel (serenitymojo/ops/tests/rms_norm_vec_parity.mojo). The F32 tree
+# reduction + the sqrt/scale epilogue are identical to the scalar kernels; only
+# the load path changes. Mirrors flame-core's `rms_norm_kernel` vec loads
+# (EriDiffusion/flame-core/cuda/cuda_ops.cu — `__nv_bfloat162`/vec pair loads).
+comptime RMS_NORM_VEC = False
+comptime _VW = 2  # SIMD vector width for the RMS_NORM_VEC load path
+
 
 def _rms_norm_kernel_f32(
     x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
@@ -149,6 +168,125 @@ def _rms_norm_kernel_f16(
         c += _TPB
 
 
+# ── RMSNorm FORWARD vec2 kernels (RMS_NORM_VEC fast path) ────────────────────
+# Identical structure to the scalar `_rms_norm_kernel_*` above (one block/row,
+# F32 tree reduction of sum(x²), F32 normalize/scale, store cast to storage
+# dtype) — the ONLY change is the load path: each thread reads `_VW`=2 contiguous
+# columns per iteration via a width-2 SIMD load over the row's flat pointer
+# (x.ptr + row*cols), striding by _TPB*_VW. Requires cols % _VW == 0 (guaranteed
+# by the dispatcher; else it falls back to the scalar kernel). The F32 reduction
+# tree and the sqrt/scale epilogue are byte-identical to the scalar kernels.
+def _rms_norm_kernel_f32_vec(
+    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var xp = x.ptr + row * cols
+    var op = o.ptr + row * cols
+    var shared = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var local: Float32 = 0.0
+    var c = tid * _VW
+    while c < cols:
+        var v = xp.load[width=_VW](c)
+        local += (v * v).reduce_add()
+        c += _TPB * _VW
+    shared[tid] = local
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            shared[tid] = shared[tid] + shared[tid + active]
+        barrier()
+        active //= 2
+    var inv = 1.0 / sqrt(shared[0] / Float32(cols) + eps)
+    c = tid * _VW
+    while c < cols:
+        var v = xp.load[width=_VW](c)
+        var gg = g.ptr.load[width=_VW](c)
+        op.store[width=_VW](c, v * inv * gg)
+        c += _TPB * _VW
+
+
+def _rms_norm_kernel_bf16_vec(
+    x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var xp = x.ptr + row * cols
+    var op = o.ptr + row * cols
+    var shared = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var local: Float32 = 0.0
+    var c = tid * _VW
+    while c < cols:
+        var v = xp.load[width=_VW](c).cast[DType.float32]()
+        local += (v * v).reduce_add()
+        c += _TPB * _VW
+    shared[tid] = local
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            shared[tid] = shared[tid] + shared[tid + active]
+        barrier()
+        active //= 2
+    var inv = 1.0 / sqrt(shared[0] / Float32(cols) + eps)
+    c = tid * _VW
+    while c < cols:
+        var v = xp.load[width=_VW](c).cast[DType.float32]()
+        var gg = g.ptr.load[width=_VW](c).cast[DType.float32]()
+        op.store[width=_VW](c, (v * inv * gg).cast[DType.bfloat16]())
+        c += _TPB * _VW
+
+
+def _rms_norm_kernel_f16_vec(
+    x: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
+    g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var xp = x.ptr + row * cols
+    var op = o.ptr + row * cols
+    var shared = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var local: Float32 = 0.0
+    var c = tid * _VW
+    while c < cols:
+        var v = xp.load[width=_VW](c).cast[DType.float32]()
+        local += (v * v).reduce_add()
+        c += _TPB * _VW
+    shared[tid] = local
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            shared[tid] = shared[tid] + shared[tid + active]
+        barrier()
+        active //= 2
+    var inv = 1.0 / sqrt(shared[0] / Float32(cols) + eps)
+    c = tid * _VW
+    while c < cols:
+        var v = xp.load[width=_VW](c).cast[DType.float32]()
+        var gg = g.ptr.load[width=_VW](c).cast[DType.float32]()
+        op.store[width=_VW](c, (v * inv * gg).cast[DType.float16]())
+        c += _TPB * _VW
+
+
 def rms_norm(
     x: Tensor, weight: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> Tensor:
@@ -184,6 +322,8 @@ def rms_norm(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 
+    # RMS_NORM_VEC fast path only when the flag is on AND D is _VW-even.
+    var use_vec = RMS_NORM_VEC and (d % _VW == 0)
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float32](), x_rl
@@ -194,9 +334,19 @@ def rms_norm(
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float32](), x_rl
         )
-        ctx.enqueue_function[_rms_norm_kernel_f32, _rms_norm_kernel_f32](
-            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
-        )
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_norm_kernel_f32_vec, _rms_norm_kernel_f32_vec
+                ](X, G, O, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[_rms_norm_kernel_f32, _rms_norm_kernel_f32](
+                    X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+                )
+        else:
+            ctx.enqueue_function[_rms_norm_kernel_f32, _rms_norm_kernel_f32](
+                X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+            )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
@@ -207,9 +357,19 @@ def rms_norm(
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
         )
-        ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
-            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
-        )
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_norm_kernel_bf16_vec, _rms_norm_kernel_bf16_vec
+                ](X, G, O, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
+                    X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+                )
+        else:
+            ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
+                X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+            )
     else:  # float16
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float16](), x_rl
@@ -220,9 +380,19 @@ def rms_norm(
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float16](), x_rl
         )
-        ctx.enqueue_function[_rms_norm_kernel_f16, _rms_norm_kernel_f16](
-            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
-        )
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_norm_kernel_f16_vec, _rms_norm_kernel_f16_vec
+                ](X, G, O, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[_rms_norm_kernel_f16, _rms_norm_kernel_f16](
+                    X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+                )
+        else:
+            ctx.enqueue_function[_rms_norm_kernel_f16, _rms_norm_kernel_f16](
+                X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+            )
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, xshape.copy(), x.dtype())
 
@@ -260,6 +430,8 @@ def rms_norm_slab(
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](d))
 
+    # RMS_NORM_VEC fast path only when the flag is on AND D is _VW-even.
+    var use_vec = RMS_NORM_VEC and (d % _VW == 0)
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float32](), x_rl
@@ -270,9 +442,19 @@ def rms_norm_slab(
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float32](), x_rl
         )
-        ctx.enqueue_function[_rms_norm_kernel_f32, _rms_norm_kernel_f32](
-            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
-        )
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_norm_kernel_f32_vec, _rms_norm_kernel_f32_vec
+                ](X, G, O, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[_rms_norm_kernel_f32, _rms_norm_kernel_f32](
+                    X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+                )
+        else:
+            ctx.enqueue_function[_rms_norm_kernel_f32, _rms_norm_kernel_f32](
+                X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+            )
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
@@ -283,9 +465,19 @@ def rms_norm_slab(
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
         )
-        ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
-            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
-        )
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_norm_kernel_bf16_vec, _rms_norm_kernel_bf16_vec
+                ](X, G, O, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
+                    X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+                )
+        else:
+            ctx.enqueue_function[_rms_norm_kernel_bf16, _rms_norm_kernel_bf16](
+                X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+            )
     else:  # float16
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float16](), x_rl
@@ -296,9 +488,19 @@ def rms_norm_slab(
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float16](), x_rl
         )
-        ctx.enqueue_function[_rms_norm_kernel_f16, _rms_norm_kernel_f16](
-            X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
-        )
+        comptime if RMS_NORM_VEC:
+            if use_vec:
+                ctx.enqueue_function[
+                    _rms_norm_kernel_f16_vec, _rms_norm_kernel_f16_vec
+                ](X, G, O, d, eps, grid_dim=rows, block_dim=_TPB)
+            else:
+                ctx.enqueue_function[_rms_norm_kernel_f16, _rms_norm_kernel_f16](
+                    X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+                )
+        else:
+            ctx.enqueue_function[_rms_norm_kernel_f16, _rms_norm_kernel_f16](
+                X, G, O, d, eps, grid_dim=rows, block_dim=_TPB
+            )
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, xshape.copy(), x.dtype())
 

@@ -80,6 +80,28 @@ comptime OPK_IDEOGRAM4_BLOCK = 19
 # the WHOLE Krea2BlockGrads struct (d_x sunk through the engine LEAF for x; the host
 # LoRA lists captured out-of-band), NOT a Dict[Int,TArc]. One tracked edge (x).
 comptime OPK_KREA2_SINGLE_BLOCK = 20
+# ── krea2 FINE-GRAINED block vocabulary (krea2_block_graph.mojo, this session).
+# The 3 ops the krea2 block needs that the zimage vocabulary lacks. Each arm
+# (engine.mojo) calls ONLY the existing parity-proven backward the krea2 oracle
+# (models/krea2/krea2_block.mojo) calls — NO new math (contract C2/C14).
+#  * OPK_REPEAT_KV: GQA k_full/v_full = repeat_kv_f32 (krea2 has KVHEADS<HEADS);
+#    backward = repeat_kv_backward (grouped sum-reduce, ops/gqa_backward.mojo).
+#    saved=[]; meta=[L, KVHEADS, n_rep, HEADDIM]; one input edge (the kv source).
+#  * OPK_SIGMOID: sg = sigmoid(gate_pre); backward = sigmoid_backward(g, gate_pre)
+#    (ops/activation_backward.mojo). saved=[gate_pre]; one input edge.
+#  * OPK_KREA2_PROJ_LORA: y = linear(x,W_frozen) + scale*(x@Aᵀ)@Bᵀ exactly like
+#    the oracle _linear_lora (krea2_block.mojo:112), but its backward calls the
+#    oracle's OWN _linear_bwd_dx (krea2_block.mojo:489) — base linear_backward_dx
+#    + klein_lora_bwd_device_resident_unfused, whose dA/dB are HOST List[Float32]
+#    (the .to_host lives inside that helper). HOST grads CANNOT flow through the
+#    engine's TArc-only leaf/Dict machinery, so the LoRA pair is captured
+#    OUT-OF-BAND (the krea2 fine-grained driver scatters it by lora_slot); only
+#    d_x routes through the single (x) engine edge. saved=[x, w, A, B];
+#    meta=[M, in_f, out_f, rank, lora_slot]; scalars=[scale]. lora_slot<0 = no
+#    adapter (base d_x only, nothing captured).
+comptime OPK_REPEAT_KV = 21
+comptime OPK_SIGMOID = 22
+comptime OPK_KREA2_PROJ_LORA = 23
 
 
 struct Edge(Copyable, Movable):

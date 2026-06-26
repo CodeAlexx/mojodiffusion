@@ -209,6 +209,19 @@ def sdpa_backward_dispatch(
         return SdpaGradArcs(
             arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
         )
+    # krea2 fine-grained buckets (H=48, Dh=128): the block gate's L=512 and the
+    # trainer's LFULL=4864 (train_krea2.mojo:135). sdpa_backward[1,L,48,128] is
+    # already instantiated via the krea2 hand-chain block backward.
+    if B == 1 and S == 512 and H == 48 and Dh == 128:
+        var sb = sdpa_backward[1, 512, 48, 128](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 1 and S == 4864 and H == 48 and Dh == 128:
+        var sb = sdpa_backward[1, 4864, 48, 128](q, k, v, d_out, scale, ctx)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
     raise Error(
         String("sdpa_backward_dispatch: no comptime bucket for (B,S,H,Dh)=(")
         + String(B) + "," + String(S) + "," + String(H) + "," + String(Dh)
@@ -496,6 +509,17 @@ def sdpa_backward_dispatch_slab(
         )
     if B == 2 and S == 1280 and H == 30 and Dh == 128:
         var sb = sdpa_backward_slab[2, 1280, 30, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    # krea2 fine-grained buckets (H=48, Dh=128): block gate L=512, trainer L=4864.
+    if B == 1 and S == 512 and H == 48 and Dh == 128:
+        var sb = sdpa_backward_slab[1, 512, 48, 128](q, k, v, d_out, scale, ctx, slab)
+        return SdpaGradArcs(
+            arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
+        )
+    if B == 1 and S == 4864 and H == 48 and Dh == 128:
+        var sb = sdpa_backward_slab[1, 4864, 48, 128](q, k, v, d_out, scale, ctx, slab)
         return SdpaGradArcs(
             arc_view(sb.d_q), arc_view(sb.d_k), arc_view(sb.d_v)
         )
@@ -1261,6 +1285,115 @@ from serenitymojo.models.krea2.krea2_block import (
 from serenitymojo.autograd_v2.node import (
     OPK_KREA2_SINGLE_BLOCK as _OPK_K2, Edge as _EdgeK2,
 )
+# ── krea2 FINE-GRAINED record wrappers (this session). The 3 krea2-specific
+# kinds + record_mul (krea2 needs the OPK_MUL recorder zimage never recorded).
+from serenitymojo.ops.tensor_algebra import mul as _ta_mul_k2
+from serenitymojo.ops.activations import sigmoid as _act_sigmoid
+from serenitymojo.ops.gqa_backward import repeat_kv_f32 as _gqa_repeat_kv
+from serenitymojo.models.krea2.krea2_block import (
+    _linear_lora as _k2_linear_lora,
+)
+from serenitymojo.models.klein.lora_block import LoraAdapterDevice as _K2LoraAdapter
+from serenitymojo.autograd_v2.node import (
+    OPK_MUL as _OPK_MUL_K2,
+    OPK_REPEAT_KV as _OPK_REPEAT_KV,
+    OPK_SIGMOID as _OPK_SIGMOID,
+    OPK_KREA2_PROJ_LORA as _OPK_K2_PROJ,
+)
+
+
+def record_mul(
+    mut g: Graph, a: TArc, b: TArc, ctx: DeviceContext
+) raises -> TArc:
+    """y = mul(a, b) (ops.tensor_algebra.mul — the krea2 gated = attn_flat * sg,
+    krea2_block.mojo:444). OPK_MUL apply: saved[0]=A, saved[1]=B; d_A = g*B,
+    d_B = g*A (the oracle's d_attn_flat=mul(d_gated,sg), d_sg=mul(d_gated,attn_flat),
+    :599-600). Edges [a, b]; saved [a, b]."""
+    var y = _ta_mul_k2(a[], b[], ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(a[].id))
+    edges.append(g.edge_for(b[].id))
+    var saved = List[TArc]()
+    saved.append(a.copy())
+    saved.append(b.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(_OPK_MUL_K2, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_repeat_kv(
+    mut g: Graph, x: TArc, L: Int, kvheads: Int, n_rep: Int, headdim: Int,
+    ctx: DeviceContext,
+) raises -> TArc:
+    """y = repeat_kv_f32(x, L, kvheads, n_rep, headdim) — GQA head-broadcast
+    (krea2_block.mojo:404-405 k_full/v_full). Backward arm (engine.apply) =
+    repeat_kv_backward (grouped sum-reduce, :647-648). x [1,L,kvheads,Dh] ->
+    [1,L,kvheads*n_rep,Dh]. Edges [x]; saved []; meta [L, kvheads, n_rep, Dh]."""
+    var y = _gqa_repeat_kv(x[], L, kvheads, n_rep, headdim, ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var meta: List[Int] = [L, kvheads, n_rep, headdim]
+    var oids: List[Int] = [y.id]
+    _ = g.record(_OPK_REPEAT_KV, edges^, List[TArc](), meta^, List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_sigmoid(
+    mut g: Graph, x: TArc, ctx: DeviceContext
+) raises -> TArc:
+    """sg = sigmoid(x) (krea2_block.mojo:443 sg = sigmoid(gate_pre)). Backward
+    arm = sigmoid_backward(g, x) (:602 d_gate_pre = sigmoid_backward(d_sg,
+    gate_pre)). Edges [x]; saved [x] (sigmoid_backward reads the PRE-activation
+    x, not sg — matches the oracle, which passes saved.gate_pre)."""
+    var y = _act_sigmoid(x[], ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    var oids: List[Int] = [y.id]
+    _ = g.record(_OPK_SIGMOID, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_krea2_proj_lora(
+    mut g: Graph, x: TArc, w: TArc, lo: Optional[_K2LoraAdapter],
+    M: Int, in_f: Int, out_f: Int, lora_slot: Int,
+    ctx: DeviceContext,
+) raises -> TArc:
+    """y = linear(x, W_frozen) + scale*(x@Aᵀ)@Bᵀ — the krea2 oracle _linear_lora
+    (krea2_block.mojo:112). Backward arm (engine.apply_krea2_fg) = the oracle's
+    OWN _linear_bwd_dx (:489): base linear_backward_dx + the unfused LoRA backward
+    whose dA/dB are HOST List[Float32]. d_x routes through the single (x) edge;
+    the host LoRA pair is captured OUT-OF-BAND by the krea2 driver, keyed by
+    `lora_slot` (0..7, or <0 when no adapter). The base weight W and the LoRA A/B
+    are FROZEN (no engine leaves — krea2 LoRA grads do not flow as TArc).
+    Edges [x]; saved [x, w] (+ [A, B] when an adapter is present, so the apply
+    arm can rebuild the LoraAdapterDevice); meta [M, in_f, out_f, rank, lora_slot];
+    scalars [scale]."""
+    var y = _k2_linear_lora(x[], w[], lo, M, ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))   # ONLY the input is tracked
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(w.copy())
+    var rank = 0
+    var scale = Float32(0.0)
+    var slot = -1
+    if lo:
+        saved.append(lo.value().a.copy())
+        saved.append(lo.value().b.copy())
+        rank = lo.value().rank
+        scale = lo.value().scale
+        slot = lora_slot
+    var meta: List[Int] = [M, in_f, out_f, rank, slot]
+    var scalars: List[Float32] = [scale]
+    var oids: List[Int] = [y.id]
+    _ = g.record(_OPK_K2_PROJ, edges^, saved^, meta^, scalars^, oids)
+    return TArc(y^)
 
 
 def record_krea2_single_block[

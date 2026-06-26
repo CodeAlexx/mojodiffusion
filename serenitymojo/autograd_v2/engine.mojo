@@ -39,6 +39,11 @@ from serenitymojo.ops.rope_struct_backward import (
 )
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, swiglu_backward_slab
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
+# ── krea2 fine-grained backward arms (this session): the EXACT helpers the krea2
+# oracle (models/krea2/krea2_block.mojo) calls — repeat_kv_backward (GQA grouped
+# sum), sigmoid_backward (sg'=s(1-s)), _linear_bwd_dx (base + host-grad LoRA).
+from serenitymojo.ops.gqa_backward import repeat_kv_backward
+from serenitymojo.ops.activation_backward import sigmoid_backward
 
 # ── P6 Klein imports: the apply_klein arms call the Klein hand-chain's OWN
 # backward helpers / inline op sequence verbatim (file:line cited per arm).
@@ -105,6 +110,8 @@ from serenitymojo.autograd_v2.node import (
     OPK_KLEIN_SGL_IN,
     OPK_KLEIN_SGL_SDPA,
     OPK_KLEIN_SGL_OUT,
+    OPK_REPEAT_KV,
+    OPK_SIGMOID,
     _raw_add,
     _raw_add_slab,
     _raw_mul,
@@ -286,6 +293,25 @@ def apply(node: Node, grads_in: List[TArc], ctx: DeviceContext) raises -> List[T
             back_shape.append(node.saved_meta[i])
         var out = List[TArc]()
         out.append(arc_view_reshaped(g[], back_shape^))
+        return out^
+    elif node.kind == OPK_REPEAT_KV:
+        # GQA repeat_kv backward (grouped sum-reduce HEADS->KVHEADS). meta
+        # [L, kvheads, n_rep, Dh]; the SAME repeat_kv_backward the krea2 oracle
+        # calls (krea2_block.mojo:647-648). One input edge (the kv source).
+        var d_src = repeat_kv_backward(
+            g[], node.saved_meta[0], node.saved_meta[1],
+            node.saved_meta[2], node.saved_meta[3], ctx,
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_src^))
+        return out^
+    elif node.kind == OPK_SIGMOID:
+        # sigmoid backward d_x = g * s*(1-s), s=sigmoid(x). saved[0] = the
+        # PRE-activation x (gate_pre), exactly the oracle's sigmoid_backward(
+        # d_sg, saved.gate_pre) call (krea2_block.mojo:602).
+        var d_x = sigmoid_backward(g[], node.saved[0][], ctx)
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
         return out^
     elif node.kind == OPK_LEAF:
         raise Error("apply: OPK_LEAF is sunk by the engine, never dispatched")
@@ -1386,6 +1412,11 @@ from serenitymojo.models.krea2.krea2_block import (
     Krea2BlockLora as _K2L,
     Krea2BlockGrads as _K2Grads,
     Krea2LoraGrad,
+    _linear_bwd_dx as _k2_linear_bwd_dx,
+)
+from serenitymojo.autograd_v2.node import (
+    OPK_KREA2_PROJ_LORA as _OPK_K2_PROJ_E,
+    OPK_MUL as _OPK_MUL_E,
 )
 
 
@@ -1549,4 +1580,180 @@ def execute_krea2_block[
         out_grads.wq.copy(), out_grads.wk.copy(), out_grads.wv.copy(), out_grads.gate_w.copy(),
         out_grads.wo.copy(), out_grads.mlp_gate_w.copy(), out_grads.mlp_up_w.copy(),
         out_grads.mlp_down_w.copy(),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# krea2 FINE-GRAINED block driver (krea2_block_graph.mojo, this session).
+# execute_krea2_fg is the SAME engine algorithm (dep-count BFS, slot-ordered
+# InputBuffers, ready-queue order, fired==reachable) as `execute`, with:
+#   * OPK_KREA2_PROJ_LORA handled INLINE: call the krea2 oracle's OWN
+#     _linear_bwd_dx (base linear_backward_dx + the unfused host-grad LoRA
+#     backward); the d_x routes through the engine's single (x) edge, the HOST
+#     Krea2LoraGrad pair is captured OUT-OF-BAND into `lora_slots[lora_slot]`
+#     (krea2 LoRA grads are host List[Float32] and cannot flow as TArc — see the
+#     OPK_KREA2_PROJ_LORA note in node.mojo).
+#   * every OTHER kind delegated to the generic `apply` (the device-tensor ops:
+#     ADD, MUL, RMS_NORM_DX, MODULATE, ROPE, SDPA, SWIGLU, RESIDUAL_GATE_DXDY,
+#     RESHAPE, REPEAT_KV, SIGMOID).
+# The driver returns the engine-routed d_x (from the x leaf) + the 8 captured
+# LoRA pairs in slot order [wq,wk,wv,gate_w,wo,mlp_gate_w,mlp_up_w,mlp_down_w].
+# comptime [HEADS,KVHEADS,HEADDIM] like the trainer; runtime L rides node meta.
+# No StepSlab / no capture (math-path phase; slab+capture are later phases).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+struct _LinBwdGrads(Movable):
+    """krea2 proj backward: d_x (engine edge) + the host LoRA pair + its slot."""
+    var d_x: TArc
+    var lora: Krea2LoraGrad
+    var slot: Int
+
+    def __init__(out self, var d_x: TArc, var lora: Krea2LoraGrad, slot: Int):
+        self.d_x = d_x^
+        self.lora = lora^
+        self.slot = slot
+
+
+def _krea2_proj_apply(
+    node: Node, grads_in: List[TArc], ctx: DeviceContext,
+) raises -> _LinBwdGrads:
+    """OPK_KREA2_PROJ_LORA backward = the oracle's _linear_bwd_dx (krea2_block.mojo
+    :489): base linear_backward_dx + (when an adapter is present) the unfused
+    host-grad LoRA backward. saved [x, w] (+ [A, B] if adapter);
+    meta [M, in_f, out_f, rank, lora_slot]; scalars [scale]. Returns d_x (engine
+    edge) + the host Krea2LoraGrad pair (out-of-band) + lora_slot."""
+    var M = node.saved_meta[0]
+    var in_f = node.saved_meta[1]
+    var out_f = node.saved_meta[2]
+    var rank = node.saved_meta[3]
+    var slot = node.saved_meta[4]
+    var scale = node.scalars[0]
+    var lo = Optional[LoraAdapterDevice](None)
+    if slot >= 0:
+        # rebuild the adapter from saved A/B (saved[2]=A, saved[3]=B).
+        lo = Optional[LoraAdapterDevice](LoraAdapterDevice(
+            node.saved[2].copy(), node.saved[3].copy(), rank, in_f, out_f, scale
+        ))
+    var lb = _k2_linear_bwd_dx(
+        grads_in[0][], node.saved[0][], node.saved[1][], lo, M, in_f, out_f, ctx
+    )
+    # arc_view the d_x (zero-copy buffer share) so `lb` stays whole for .lora.
+    var d_x_arc = arc_view(lb.d_x)
+    return _LinBwdGrads(d_x_arc^, lb.lora.copy(), slot)
+
+
+def execute_krea2_fg[
+    HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    mut graph: Graph, root_node: Int, root_grad: TArc, x_id: Int,
+    ctx: DeviceContext,
+) raises -> _K2Grads:
+    """Fine-grained krea2 backward driver. Returns Krea2BlockGrads (d_x from the
+    x leaf + 8 host LoRA pairs)."""
+    var n = len(graph.nodes)
+    if root_node < 0 or root_node >= n:
+        raise Error("execute_krea2_fg: root_node out of range")
+
+    # ── Step 1: dep-count BFS over edges from the root (engine.rs:230-277).
+    var dep = List[Int]()
+    var seen = List[Bool]()
+    var in_queue = List[Bool]()
+    for _ in range(n):
+        dep.append(0)
+        seen.append(False)
+        in_queue.append(False)
+    var stack = List[Int]()
+    stack.append(root_node)
+    var reachable = 0
+    while len(stack) > 0:
+        var nid = stack.pop()
+        if seen[nid]:
+            continue
+        seen[nid] = True
+        reachable += 1
+        for i in range(len(graph.nodes[nid].edges)):
+            var child = graph.nodes[nid].edges[i].node_idx
+            if child >= 0:
+                dep[child] += 1
+                stack.append(child)
+
+    # ── Step 2: per-node InputBuffers + seed the root (engine.rs:282-393).
+    var buffers = List[InputBuffer]()
+    for i in range(n):
+        buffers.append(InputBuffer(graph.nodes[i].contrib_counts, root_grad.copy()))
+    buffers[root_node].add(0, buffers[root_node].seed_slot(0), root_grad.copy(), ctx)
+    var ready = List[Int]()
+    dep[root_node] += 1
+    _dec_and_maybe_enqueue(dep, ready, in_queue, root_node)
+
+    # ── out-of-band LoRA grad sink (8 slots; krea2 LoRA grads are host lists).
+    var lora_slots = List[Krea2LoraGrad]()
+    for _ in range(8):
+        lora_slots.append(Krea2LoraGrad(None, None))
+
+    # ── Step 3: drive the queue (engine.rs:437-570).
+    var d_x_result = TArc(Tensor(root_grad[].buf.copy(), root_grad[].shape(), root_grad[].dtype()))
+    var have_dx = False
+    var fired = 0
+    while len(ready) > 0:
+        var nid = _pop_best(ready, graph)
+        fired += 1
+
+        var num_in = graph.nodes[nid].num_inputs
+        var grads_in = List[TArc]()
+        for s in range(num_in):
+            if not buffers[nid].any_present(s):
+                raise Error(
+                    String("execute_krea2_fg: node ") + String(nid)
+                    + " missing grad slot " + String(s)
+                )
+            grads_in.append(buffers[nid].materialize(s, ctx))
+
+        if graph.nodes[nid].kind == OPK_LEAF:
+            # The x leaf carries the engine-routed block-input grad.
+            d_x_result = grads_in[0].copy()
+            have_dx = True
+            continue
+
+        var out_grads = List[TArc]()
+        if graph.nodes[nid].kind == _OPK_K2_PROJ_E:
+            var pr = _krea2_proj_apply(graph.nodes[nid], grads_in, ctx)
+            if pr.slot >= 0:
+                lora_slots[pr.slot] = pr.lora.copy()
+            out_grads.append(pr.d_x.copy())   # ONE edge (x)
+        else:
+            out_grads = apply(graph.nodes[nid], grads_in, ctx)
+
+        var n_edges = len(graph.nodes[nid].edges)
+        if len(out_grads) != n_edges:
+            raise Error(
+                String("execute_krea2_fg: apply arity mismatch on node ")
+                + String(nid) + ": expected " + String(n_edges)
+                + " got " + String(len(out_grads))
+            )
+
+        for s in range(n_edges):
+            var child = graph.nodes[nid].edges[s].node_idx
+            if child < 0:
+                continue
+            var slot = graph.nodes[nid].edges[s].input_nr
+            var cslot = graph.nodes[nid].edges[s].contrib_slot
+            buffers[child].add(slot, cslot, out_grads[s].copy(), ctx)
+            _dec_and_maybe_enqueue(dep, ready, in_queue, child)
+
+    if fired != reachable:
+        raise Error(
+            String("execute_krea2_fg: fired=") + String(fired)
+            + " != reachable=" + String(reachable)
+            + " (dep-count exactness violated)"
+        )
+    if not have_dx:
+        raise Error("execute_krea2_fg: x leaf never sank d_x")
+
+    return _K2Grads(
+        d_x_result.copy(),
+        lora_slots[0].copy(), lora_slots[1].copy(), lora_slots[2].copy(),
+        lora_slots[3].copy(), lora_slots[4].copy(), lora_slots[5].copy(),
+        lora_slots[6].copy(), lora_slots[7].copy(),
     )

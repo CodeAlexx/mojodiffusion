@@ -178,3 +178,27 @@ OPEN toward ai-toolkit's ~3s/step (eager mode, no graph): the GEMMs are ~half fu
 (re-run fwd in bwd) — keep activations (fp8 freed ~12GB) to skip it; trim per-block memory-op
 overhead (the 1050-instance tensor_algebra kernel ~10%). The autograd_v2 graph is NOT needed —
 this is plain eager-kernel efficiency.
+
+## Toward ai-toolkit's ~3s/step — perf plan (scoped 2026-06-25, workstream A; user: "b then a")
+
+MEASURED after 4a.2 (~7s/step, GPU 100% SM compute-bound via `nvidia-smi dmon`): nsys =
+tensor-core GEMMs ~53% (cutlass_80_tensorop / ampere_s16816gemm — the big mlp GEMM runs at
+**~49% of the 3090 Ti's ~160 TFLOP/s bf16 peak** [980 GFLOP / 12.6ms ≈ 78 TFLOP/s], vs torch
+~65-70%), cuDNN flash ~12.5%, tensor_algebra memory-ops ~10% (1050 instances/step), one-time fp8
+quantize ~6%, + ~3200 small bias/cast kernels/step (torch FUSES these inline). So the remaining
+~7s→2-3s is the EAGER per-op efficiency gap to torch (op-by-op MAX kernels vs fused cuBLAS/cuDNN)
+— NOT a graph (ai-toolkit is eager 2-3s) and NOT a single bug like the rms_norm d_g.
+
+Levers (best-case ~3.5-4s combined; each substantial — this is sustained perf-engineering):
+  1. **Activation-offload to skip the full-recompute** (~2.5s, BIGGEST — workstream A starts here).
+     The backward RE-RUNS the whole forward per block (the 24GB-OOM discipline). ~25GB of acts
+     don't fit resident (fp8 base = 12GB), so skip = async D2H during fwd + H2D during bwd
+     (turbo_loader-style streams, overlapped with compute). [[reference_serenityflow_stagehand_offload]]
+     / offload/turbo_loader.mojo is the block-WEIGHT offload pattern to adapt for ACTS.
+  2. **Matmul-backend efficiency** (49%→~65%, ~1s) — the MAX `vendor.blas`/cutlass config for these
+     shapes; limited control, deep.
+  3. **Op-fusion** (~0.7s) — the F32 matmul-intermediate + per-matmul cast (linear.mojo:225) + the
+     bias kernels + redundant tensor_algebra copies/clones that torch fuses into the GEMM epilogue.
+
+DECISION (user "b then a"): banked the 4a.2 9× (minutes→~7s) as the milestone; workstream A
+(toward 2-3s) is the next, starting with lever 1 (the activation-offload). See KNOWN_ISSUES MJ-0829.

@@ -76,8 +76,10 @@ from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.autograd_v2.krea2_block_graph import (
     krea2_single_stream_block_graph_backward,
     krea2_single_stream_block_graph_backward_seg,
+    krea2_single_stream_block_graph_backward_slab,
 )
 from serenitymojo.autograd_v2.step_slab import StepSlab
+from serenitymojo.models.krea2.krea2_block import KREA2_SLAB_SEGMENTED
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -892,11 +894,21 @@ def krea2_stack_lora_backward_graph_slab[
         else:
             wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
         slab.reset()   # block starts from the slab base (segments rewind internally)
-        var bg = krea2_single_stream_block_graph_backward_seg[L, HEADS, KVHEADS, HEADDIM](
-            TArc(Tensor(d_x.buf.copy(), d_x.shape(), d_x.dtype())),
-            fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
-            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, slab, real_len,
-        )
+        # SEGMENTED (option 2, ~6.65GB/segment, fits) vs WHOLE-BLOCK (option 1,
+        # ~12.2GB, expected setup-OOM) — comptime-selected by KREA2_SLAB_SEGMENTED.
+        var bg: Krea2BlockGrads
+        comptime if KREA2_SLAB_SEGMENTED:
+            bg = krea2_single_stream_block_graph_backward_seg[L, HEADS, KVHEADS, HEADDIM](
+                TArc(Tensor(d_x.buf.copy(), d_x.shape(), d_x.dtype())),
+                fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
+                cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, slab, real_len,
+            )
+        else:
+            bg = krea2_single_stream_block_graph_backward_slab[L, HEADS, KVHEADS, HEADDIM](
+                TArc(Tensor(d_x.buf.copy(), d_x.shape(), d_x.dtype())),
+                fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
+                cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, slab, real_len,
+            )
         var base = bi * KREA2_SLOTS_PER_BLOCK
         grads[base + 0] = bg.wq.copy()
         grads[base + 1] = bg.wk.copy()

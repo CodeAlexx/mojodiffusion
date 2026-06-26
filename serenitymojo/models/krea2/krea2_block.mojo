@@ -55,6 +55,15 @@ comptime TArc = ArcPointer[Tensor]
 # hand-chain is untouched.
 comptime KREA2_SLAB_FLASH = False
 
+# autograd_v2 slab-conductor path: True = the SEGMENTED (2-segment activation
+# checkpoint) per-block backward (per-segment slab ~6.65GB, MEASURED to fit ~22GB/24GB
+# — the safe path). False = the WHOLE-BLOCK slab recorder (no segmentation; MEASURED
+# slab.peak_bytes = 12.23GB at L=4864 flash → 12GB fp8 + 12.2GB > 24GB, EXPECTED to
+# OOM at setup — kept selectable so the trainer run can confirm/refute the fit
+# directly, per the lead's "the trainer run IS the fit test"). DEFAULT True (the
+# fitting path); flip to False to test the whole-block path.
+comptime KREA2_SLAB_SEGMENTED = True
+
 # ── forward ops ──────────────────────────────────────────────────────────────
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.norm import rms_norm

@@ -255,6 +255,84 @@ def _ew_kernel_f16(
         o[idx] = rebind[o.element_type](rv.cast[DType.float16]())
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Contiguous fast-path for the NO-BROADCAST case (a.shape == b.shape == out).
+# Bit-identical to _ew_kernel_{f32,bf16,f16} above: same F32 math, same op-branch
+# (_OP_ADD/SUB/MUL/DIV), same cast-to-F32-then-cast-back. The ONLY difference is
+# that when neither operand broadcasts the source offsets equal the output flat
+# index exactly (aoff == boff == idx — the broadcast plan's strides are the
+# contiguous identity), so we skip the ~30-op-per-element index decode (6 mod +
+# 6 div building i0..i5, 12 mul + 10 add building aoff/boff). Memory-bound win.
+# ─────────────────────────────────────────────────────────────────────────────
+def _ew_contig_kernel_f32(
+    a: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    n: Int,
+    op: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var av = rebind[Scalar[DType.float32]](a[idx])
+        var bv = rebind[Scalar[DType.float32]](b[idx])
+        var rv: Float32
+        if op == _OP_ADD:
+            rv = av + bv
+        elif op == _OP_SUB:
+            rv = av - bv
+        elif op == _OP_MUL:
+            rv = av * bv
+        else:
+            rv = av / bv
+        o[idx] = rebind[o.element_type](rv)
+
+
+def _ew_contig_kernel_bf16(
+    a: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    n: Int,
+    op: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var av = rebind[Scalar[DType.bfloat16]](a[idx]).cast[DType.float32]()
+        var bv = rebind[Scalar[DType.bfloat16]](b[idx]).cast[DType.float32]()
+        var rv: Float32
+        if op == _OP_ADD:
+            rv = av + bv
+        elif op == _OP_SUB:
+            rv = av - bv
+        elif op == _OP_MUL:
+            rv = av * bv
+        else:
+            rv = av / bv
+        o[idx] = rebind[o.element_type](rv.cast[DType.bfloat16]())
+
+
+def _ew_contig_kernel_f16(
+    a: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    b: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    n: Int,
+    op: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < n:
+        var av = rebind[Scalar[DType.float16]](a[idx]).cast[DType.float32]()
+        var bv = rebind[Scalar[DType.float16]](b[idx]).cast[DType.float32]()
+        var rv: Float32
+        if op == _OP_ADD:
+            rv = av + bv
+        elif op == _OP_SUB:
+            rv = av - bv
+        elif op == _OP_MUL:
+            rv = av * bv
+        else:
+            rv = av / bv
+        o[idx] = rebind[o.element_type](rv.cast[DType.float16]())
+
+
 def _binary(a: Tensor, b: Tensor, op: Int, ctx: DeviceContext) raises -> Tensor:
     """Shared launcher for add/sub/mul/div tensor-tensor (broadcast)."""
     if a.dtype() != b.dtype():
@@ -283,6 +361,13 @@ def _binary(a: Tensor, b: Tensor, op: Int, ctx: DeviceContext) raises -> Tensor:
     var d = plan.out_dims
     var asx = plan.a_str
     var bsx = plan.b_str
+    # NO-BROADCAST fast-path: neither operand broadcasts iff both have exactly the
+    # output element count (a_n == n and b_n == n). In that case every padded dim
+    # matches the output dim, so the broadcast plan's strides ARE the contiguous
+    # identity → aoff == boff == idx, and the contig kernel is bit-identical to
+    # the generic one minus the index decode. A scalar (a_n == 1, n > 1) fails
+    # this test and correctly falls through to the generic else-branch.
+    var contig = a_n == n and b_n == n
 
     if dt == DType.float32:
         var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
@@ -294,13 +379,18 @@ def _binary(a: Tensor, b: Tensor, op: Int, ctx: DeviceContext) raises -> Tensor:
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float32](), o_rl
         )
-        ctx.enqueue_function[_ew_kernel_f32, _ew_kernel_f32](
-            A, B, O,
-            d[0], d[1], d[2], d[3], d[4], d[5],
-            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
-            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
-            n, op, grid_dim=grid, block_dim=_BLOCK,
-        )
+        if contig:
+            ctx.enqueue_function[_ew_contig_kernel_f32, _ew_contig_kernel_f32](
+                A, B, O, n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_ew_kernel_f32, _ew_kernel_f32](
+                A, B, O,
+                d[0], d[1], d[2], d[3], d[4], d[5],
+                asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+                bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+                n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
     elif dt == DType.bfloat16:
         var A = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
             a.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
@@ -311,13 +401,18 @@ def _binary(a: Tensor, b: Tensor, op: Int, ctx: DeviceContext) raises -> Tensor:
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
         )
-        ctx.enqueue_function[_ew_kernel_bf16, _ew_kernel_bf16](
-            A, B, O,
-            d[0], d[1], d[2], d[3], d[4], d[5],
-            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
-            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
-            n, op, grid_dim=grid, block_dim=_BLOCK,
-        )
+        if contig:
+            ctx.enqueue_function[_ew_contig_kernel_bf16, _ew_contig_kernel_bf16](
+                A, B, O, n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_ew_kernel_bf16, _ew_kernel_bf16](
+                A, B, O,
+                d[0], d[1], d[2], d[3], d[4], d[5],
+                asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+                bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+                n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
     else:
         var A = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
             a.buf.unsafe_ptr().bitcast[Float16](), a_rl
@@ -328,13 +423,18 @@ def _binary(a: Tensor, b: Tensor, op: Int, ctx: DeviceContext) raises -> Tensor:
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float16](), o_rl
         )
-        ctx.enqueue_function[_ew_kernel_f16, _ew_kernel_f16](
-            A, B, O,
-            d[0], d[1], d[2], d[3], d[4], d[5],
-            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
-            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
-            n, op, grid_dim=grid, block_dim=_BLOCK,
-        )
+        if contig:
+            ctx.enqueue_function[_ew_contig_kernel_f16, _ew_contig_kernel_f16](
+                A, B, O, n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_ew_kernel_f16, _ew_kernel_f16](
+                A, B, O,
+                d[0], d[1], d[2], d[3], d[4], d[5],
+                asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+                bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+                n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, plan.out_shape.copy(), a.dtype())
 
@@ -370,6 +470,10 @@ def _binary_slab(
     var d = plan.out_dims
     var asx = plan.a_str
     var bsx = plan.b_str
+    # NO-BROADCAST fast-path — see _binary (this file). a_n == n and b_n == n
+    # means neither operand broadcasts → aoff == boff == idx, bit-identical to the
+    # generic kernel; a scalar (a_n == 1, n > 1) falls through to the generic arm.
+    var contig = a_n == n and b_n == n
 
     if dt == DType.float32:
         var A = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
@@ -381,13 +485,18 @@ def _binary_slab(
         var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float32](), o_rl
         )
-        ctx.enqueue_function[_ew_kernel_f32, _ew_kernel_f32](
-            A, B, O,
-            d[0], d[1], d[2], d[3], d[4], d[5],
-            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
-            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
-            n, op, grid_dim=grid, block_dim=_BLOCK,
-        )
+        if contig:
+            ctx.enqueue_function[_ew_contig_kernel_f32, _ew_contig_kernel_f32](
+                A, B, O, n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_ew_kernel_f32, _ew_kernel_f32](
+                A, B, O,
+                d[0], d[1], d[2], d[3], d[4], d[5],
+                asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+                bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+                n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
     elif dt == DType.bfloat16:
         var A = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
             a.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
@@ -398,13 +507,18 @@ def _binary_slab(
         var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[BFloat16](), o_rl
         )
-        ctx.enqueue_function[_ew_kernel_bf16, _ew_kernel_bf16](
-            A, B, O,
-            d[0], d[1], d[2], d[3], d[4], d[5],
-            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
-            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
-            n, op, grid_dim=grid, block_dim=_BLOCK,
-        )
+        if contig:
+            ctx.enqueue_function[_ew_contig_kernel_bf16, _ew_contig_kernel_bf16](
+                A, B, O, n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_ew_kernel_bf16, _ew_kernel_bf16](
+                A, B, O,
+                d[0], d[1], d[2], d[3], d[4], d[5],
+                asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+                bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+                n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
     else:
         var A = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
             a.buf.unsafe_ptr().bitcast[Float16](), a_rl
@@ -415,13 +529,18 @@ def _binary_slab(
         var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float16](), o_rl
         )
-        ctx.enqueue_function[_ew_kernel_f16, _ew_kernel_f16](
-            A, B, O,
-            d[0], d[1], d[2], d[3], d[4], d[5],
-            asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
-            bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
-            n, op, grid_dim=grid, block_dim=_BLOCK,
-        )
+        if contig:
+            ctx.enqueue_function[_ew_contig_kernel_f16, _ew_contig_kernel_f16](
+                A, B, O, n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
+        else:
+            ctx.enqueue_function[_ew_kernel_f16, _ew_kernel_f16](
+                A, B, O,
+                d[0], d[1], d[2], d[3], d[4], d[5],
+                asx[0], asx[1], asx[2], asx[3], asx[4], asx[5],
+                bsx[0], bsx[1], bsx[2], bsx[3], bsx[4], bsx[5],
+                n, op, grid_dim=grid, block_dim=_BLOCK,
+            )
     # TIER2-SYNC-REMOVED: single-stream ordering; downstream .to_host() syncs.
     return Tensor(out_buf^, plan.out_shape.copy(), a.dtype())
 

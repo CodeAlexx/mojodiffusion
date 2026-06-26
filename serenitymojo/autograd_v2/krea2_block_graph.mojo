@@ -57,6 +57,7 @@ from serenitymojo.ops.tensor_algebra import zeros_device, reshape_owned
 from serenitymojo.autograd_v2.node import TArc, arc_view
 from serenitymojo.autograd_v2.graph import Graph
 from serenitymojo.autograd_v2.engine import execute_krea2_fg
+from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.autograd_v2.ops_record import (
     record_rms_norm_dx,
     record_modulate,
@@ -119,10 +120,16 @@ def krea2_single_stream_block_graph_backward[
     var postscale = mods[3]
     var postshift = mods[4]
     var postgate = mods[5]
-    var prenorm_w = TArc(_add_scale_one(w.prenorm_scale[], ctx))
-    var postnorm_w = TArc(_add_scale_one(w.postnorm_scale[], ctx))
-    var qnorm_w = TArc(_add_scale_one(w.qnorm_scale[], ctx))
-    var knorm_w = TArc(_add_scale_one(w.knorm_scale[], ctx))
+    # bf16 fix: the oracle casts (scale+1) to the activation dtype before the
+    # norm backward (krea2_block.mojo:684) — rms_norm_backward_dx RAISES on an
+    # F32 weight against bf16 acts. No-op in the F32 bit gate; required for the
+    # bf16 engine-arm path. (Whole-block slab/capture is blocked on 24GB — the
+    # fine-grained slab one-block peak measured ~20GB at L=4864; see ledger.)
+    var act_dt = x_in[].dtype()
+    var prenorm_w = TArc(cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), act_dt, ctx))
+    var postnorm_w = TArc(cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), act_dt, ctx))
+    var qnorm_w = TArc(cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), act_dt, ctx))
+    var knorm_w = TArc(cast_tensor(_add_scale_one(w.knorm_scale[], ctx), act_dt, ctx))
 
     # block input x: the ONE tracked leaf (its accumulated grad = the returned
     # d_x). Zero-copy re-box so the id stamp never mutates the shared saved arc.

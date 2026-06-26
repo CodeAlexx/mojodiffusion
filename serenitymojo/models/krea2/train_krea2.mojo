@@ -89,6 +89,7 @@ from serenitymojo.models.krea2.krea2_stack import (
     Krea2StackLora, Krea2StackForward, Krea2StackLoraGrads,
     Krea2StreamFinal, KREA2_SLOTS_PER_BLOCK,
     krea2_stack_lora_forward_streamed, krea2_stack_lora_backward_streamed,
+    krea2_stack_lora_backward_streamed_dev,
     krea2_stack_lora_backward_graph, krea2_stack_lora_backward_graph_slab,
     Krea2ResidentFp8, build_krea2_resident_fp8,
 )
@@ -148,6 +149,16 @@ comptime KREA2_V2_GRAPH = False
 # flash grads are value-tolerance (NOT bit). The block bit gate keeps KREA2_SLAB_FLASH
 # False (math, bit-exact).
 comptime KREA2_V2_SLAB = False
+
+# ── DEVICE-grad LoRA carrier (HAND-CHAIN path only; independent of V2_GRAPH). ──
+# False (DEFAULT, byte-identical) = the streamed hand-chain materializes each
+# adapter's dA/dB host-side inside the block backward (224 to_host syncs/step).
+# True = krea2_stack_lora_backward_streamed_dev keeps all dA/dB on DEVICE through
+# the whole stack backward and the trainer does ONE batched D2H per step (224
+# syncs → 1) — SAME GEMM math, so the loss is bit-identical (the gate). The device
+# grads free at step end after the batched D2H (leak guard). Only the `else`
+# (hand-chain) dispatch reads this; the V2_GRAPH/SLAB arms are unaffected.
+comptime KREA2_DEVICE_LORA_GRAD = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -460,11 +471,25 @@ def _train_one_sample(
                 cond.cos, cond.sin, EPS, ctx, scratch_v2, real_len, resident,
             )
     else:
-        grads = krea2_stack_lora_backward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
-            d_velocity, cond.blk_vec, cond.tmlp_out,
-            st, key_prefix, NBLOCKS, lora, fin, fwd,
-            cond.cos, cond.sin, EPS, ctx, real_len, resident,
-        )
+        comptime if KREA2_DEVICE_LORA_GRAD:
+            # HAND-CHAIN, device-grad carrier (option B): the per-block backward keeps
+            # its 8 LoRA dA/dB on DEVICE (no per-adapter to_host), then the stack
+            # backward batch-copies that ONE block's 8 grads to host under the single
+            # per-block fence and frees them before the next block → 28 syncs/step (vs
+            # 224), ≤8 device grads (~7.7MB) ever resident (vs 215MB holding all 224,
+            # which tipped the 24GB OOM). SAME GEMM math → loss bit-identical. Returns
+            # the host Krea2StackLoraGrads directly (no separate trainer-side D2H).
+            grads = krea2_stack_lora_backward_streamed_dev[LFULL, HEADS, KVHEADS, HEADDIM](
+                d_velocity, cond.blk_vec, cond.tmlp_out,
+                st, key_prefix, NBLOCKS, lora, fin, fwd,
+                cond.cos, cond.sin, EPS, ctx, real_len, resident,
+            )
+        else:
+            grads = krea2_stack_lora_backward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
+                d_velocity, cond.blk_vec, cond.tmlp_out,
+                st, key_prefix, NBLOCKS, lora, fin, fwd,
+                cond.cos, cond.sin, EPS, ctx, real_len, resident,
+            )
 
     var gn = _grad_norm(grads)
     return _StepOut(grads^, loss, gn)
@@ -578,6 +603,11 @@ struct _GradLists(Movable):
     def __init__(out self, var d_a: List[List[Float32]], var d_b: List[List[Float32]]):
         self.d_a = d_a^
         self.d_b = d_b^
+
+
+# (Option B moved the batched D2H INTO krea2_stack_lora_backward_streamed_dev —
+# per-block, under the single per-block fence — so the trainer no longer needs a
+# separate stack-wide D2H helper. See krea2_stack._block_grads_d2h_enqueue/decode.)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

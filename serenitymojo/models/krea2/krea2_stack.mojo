@@ -31,7 +31,7 @@
 # Mojo 1.0.0b1: `def` only; Tensor move-only (never in a collection); ArcPointer
 # [Tensor] is the Copyable device carrier; no-bias linear = linear(x,w,None,ctx).
 
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer
@@ -67,7 +67,9 @@ from serenitymojo.ops.elementwise_backward import modulate_backward
 # ── Phase-1 block unit (the composed primitive) ───────────────────────────────
 from serenitymojo.models.krea2.krea2_block import (
     Krea2BlockWeights, Krea2BlockLora, Krea2LoraGrad, Krea2BlockGrads,
+    Krea2LoraGradT, Krea2BlockGradsT,
     krea2_single_stream_block_lora, krea2_single_stream_block_lora_backward,
+    krea2_single_stream_block_lora_backward_dev,
     _add_scale_one,
 )
 
@@ -146,6 +148,19 @@ struct Krea2StackLoraGrads(Movable):
     var d_combined: TArc                  # [1,L,features] grad into the block-stack input
 
     def __init__(out self, var grads: List[Krea2LoraGrad], var d_combined: TArc):
+        self.grads = grads^
+        self.d_combined = d_combined^
+
+
+# DEVICE-grad sibling: the flat LoRA dA/dB stay on DEVICE (Krea2LoraGradT), so the
+# streamed conductor enqueues all block backward work with NO per-adapter to_host;
+# the trainer does ONE batched D2H over this list at the end of the step (224
+# syncs → 1). Same flat layout (len N*8, bi*8 + slot).
+struct Krea2StackLoraGradsT(Movable):
+    var grads: List[Krea2LoraGradT]       # len N*8, flat (bi*8 + slot), DEVICE
+    var d_combined: TArc                  # [1,L,features] grad into the block-stack input
+
+    def __init__(out self, var grads: List[Krea2LoraGradT], var d_combined: TArc):
         self.grads = grads^
         self.d_combined = d_combined^
 
@@ -754,6 +769,180 @@ def krea2_stack_lora_backward_streamed[
         # grads + streamed weights before the next H2D — else the deferred frees accumulate -> OOM.
         bi -= 1
         # wbi drops here → device weights free before the next block loads.
+
+    return Krea2StackLoraGrads(grads^, TArc(d_x^))
+
+
+# ── per-block batched-D2H staging (option B) ─────────────────────────────────
+# Holds ONE block's 8 dA/dB host buffers + metadata between the enqueue and the
+# decode (the single per-block fence sits in between). _PB = pair-of-bufs.
+struct _PBufs(Movable):
+    var buf: List[HostBuffer[DType.uint8]]   # 16 = 8 adapters × (d_a, d_b)
+    var n: List[Int]                          # numel each
+    var dt: List[STDtype]                     # dtype each
+    var present: List[Bool]                   # adapter slot has a grad
+
+    def __init__(out self, var buf: List[HostBuffer[DType.uint8]],
+                 var n: List[Int], var dt: List[STDtype], var present: List[Bool]):
+        self.buf = buf^
+        self.n = n^
+        self.dt = dt^
+        self.present = present^
+
+
+def _enq_one(
+    mut buf: List[HostBuffer[DType.uint8]], mut n: List[Int],
+    mut dt: List[STDtype], mut present: List[Bool],
+    g: Krea2LoraGradT, ctx: DeviceContext,
+) raises:
+    # d_a then d_b for one adapter; absent → a 1-byte placeholder (present=False).
+    if g.d_a:
+        var t = g.d_a.value()
+        var hb = ctx.enqueue_create_host_buffer[DType.uint8](t[].nbytes())
+        ctx.enqueue_copy(dst_buf=hb, src_buf=t[].buf)
+        buf.append(hb^); n.append(t[].numel()); dt.append(t[].dtype()); present.append(True)
+    else:
+        buf.append(ctx.enqueue_create_host_buffer[DType.uint8](1)); n.append(0); dt.append(STDtype.F32); present.append(False)
+    if g.d_b:
+        var t = g.d_b.value()
+        var hb = ctx.enqueue_create_host_buffer[DType.uint8](t[].nbytes())
+        ctx.enqueue_copy(dst_buf=hb, src_buf=t[].buf)
+        buf.append(hb^); n.append(t[].numel()); dt.append(t[].dtype()); present.append(True)
+    else:
+        buf.append(ctx.enqueue_create_host_buffer[DType.uint8](1)); n.append(0); dt.append(STDtype.F32); present.append(False)
+
+
+def _block_grads_d2h_enqueue(bg: Krea2BlockGradsT, ctx: DeviceContext) raises -> _PBufs:
+    """Enqueue this block's 8 dA/dB device→host copies (NO fence; the caller's single
+    per-block ctx.synchronize covers them). Order matches the Krea2BlockLora slot
+    order: wq wk wv gate wo mlp_gate mlp_up mlp_down."""
+    var buf = List[HostBuffer[DType.uint8]]()
+    var n = List[Int]()
+    var dt = List[STDtype]()
+    var present = List[Bool]()
+    _enq_one(buf, n, dt, present, bg.wq, ctx)
+    _enq_one(buf, n, dt, present, bg.wk, ctx)
+    _enq_one(buf, n, dt, present, bg.wv, ctx)
+    _enq_one(buf, n, dt, present, bg.gate_w, ctx)
+    _enq_one(buf, n, dt, present, bg.wo, ctx)
+    _enq_one(buf, n, dt, present, bg.mlp_gate_w, ctx)
+    _enq_one(buf, n, dt, present, bg.mlp_up_w, ctx)
+    _enq_one(buf, n, dt, present, bg.mlp_down_w, ctx)
+    return _PBufs(buf^, n^, dt^, present^)
+
+
+def _decode_buf_f32(buf: HostBuffer[DType.uint8], n: Int, dt: STDtype) raises -> List[Float32]:
+    var out = List[Float32]()
+    var mdt = dt.to_mojo_dtype()
+    if mdt == DType.float32:
+        var fp = buf.unsafe_ptr().bitcast[Float32]()
+        for i in range(n):
+            out.append(fp[i])
+    elif mdt == DType.bfloat16:
+        var bp = buf.unsafe_ptr().bitcast[BFloat16]()
+        for i in range(n):
+            out.append(bp[i].cast[DType.float32]())
+    else:
+        var hp = buf.unsafe_ptr().bitcast[Float16]()
+        for i in range(n):
+            out.append(hp[i].cast[DType.float32]())
+    return out^
+
+
+def _block_grads_decode_into(mut grads: List[Krea2LoraGrad], base: Int, dh: _PBufs) raises:
+    """Decode the 8 adapters' host buffers (already fenced) into grads[base..base+8].
+    Buffer layout: adapter k → buf[2k]=d_a, buf[2k+1]=d_b."""
+    for k in range(KREA2_SLOTS_PER_BLOCK):
+        var ia = 2 * k
+        var ib = 2 * k + 1
+        var da = Optional[List[Float32]](None)
+        var db = Optional[List[Float32]](None)
+        if dh.present[ia]:
+            da = Optional[List[Float32]](_decode_buf_f32(dh.buf[ia], dh.n[ia], dh.dt[ia]))
+        if dh.present[ib]:
+            db = Optional[List[Float32]](_decode_buf_f32(dh.buf[ib], dh.n[ib], dh.dt[ib]))
+        grads[base + k] = Krea2LoraGrad(da^, db^)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVICE-GRAD streamed backward (option B) — IDENTICAL conductor to
+# krea2_stack_lora_backward_streamed, but the per-block backward keeps its 8 LoRA
+# dA/dB on DEVICE (krea2_single_stream_block_lora_backward_dev → Krea2BlockGradsT),
+# then we batch-copy that ONE block's 8 grads to host under the single per-block
+# fence and decode into the host grad lists; the device `bg` drops at loop end so
+# ≤8 device grads (~7.7MB) are ever resident. 28 fences/step (vs hand-chain 224),
+# fits the 24GB edge (holding all 224 = 215MB tipped the OOM). Returns the SAME
+# host Krea2StackLoraGrads the hand-chain returns.
+# ══════════════════════════════════════════════════════════════════════════════
+def krea2_stack_lora_backward_streamed_dev[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_velocity: Tensor,        # [1, imglen, out_ch] upstream grad on the image tokens
+    blk_vec: Tensor,           # [1, 6*features]  block modulation vec
+    tmlp_out: Tensor,          # [1, 1, features] final-layer tvec
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    fwd: Krea2StackForward,
+    cos: Tensor, sin: Tensor,  # [L, HEADDIM/2] per-token RoPE table (untiled)
+    eps: Float32,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackLoraGrads:
+    """Device-grad streamed backward, PER-BLOCK batched D2H (option B). Same recompute
+    + block backward math as krea2_stack_lora_backward_streamed (bit-identical), but
+    the per-block backward keeps its 8 LoRA dA/dB on DEVICE (no per-adapter to_host),
+    then we batch-copy that ONE block's 8 grads to host under the SINGLE per-block
+    fence already present (the async-free seam), decode into the host grad lists, and
+    the device `bg` drops at loop end → those 8 device grads free before the next
+    block. So: 28 fences/step (1/block, vs the hand-chain's 224), and ≤8 device LoRA
+    grads (~7.7MB) ever resident (vs holding all 224 = 215MB). This fits the ~1GB
+    24GB-edge headroom where holding all 224 tipped the OOM. Returns the SAME host
+    Krea2StackLoraGrads the hand-chain returns. real_len/resident MUST match the
+    forward call (same contract as the streamed path)."""
+    comptime features = HEADS * HEADDIM
+
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var grads = List[Krea2LoraGrad]()
+    for _ in range(nblocks * KREA2_SLOTS_PER_BLOCK):
+        grads.append(Krea2LoraGrad(None, None))
+
+    var fin_w = fin.as_stack_weights()
+    var d_x = krea2_final_layer_backward[L, HEADS, HEADDIM](
+        d_velocity, fwd, tmlp_out, fin_w, eps, ctx,
+    )
+
+    var bi = nblocks - 1
+    while bi >= 0:
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+        var rb = krea2_single_stream_block_lora[L, HEADS, KVHEADS, HEADDIM](
+            fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var bg = krea2_single_stream_block_lora_backward_dev[L, HEADS, KVHEADS, HEADDIM](
+            d_x, blk_vec, wbi, lora.blocks[bi], rb.saved,
+            cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        # PER-BLOCK batched D2H: enqueue this block's 8 dA/dB copies (no fence yet),
+        # then the single block fence below covers them, then decode into host lists.
+        var dh = _block_grads_d2h_enqueue(bg, ctx)
+        d_x = bg.d_x[].clone(ctx)
+        ctx.synchronize()   # ONE fence/block: covers the 8 D2H copies above AND reclaims
+        # this block's recompute-acts + backward intermediates + streamed weights before
+        # the next H2D. The 8 device grads in `bg` drop at the end of this iteration.
+        # decode the now-resident host buffers into the 8 host grad slots.
+        _block_grads_decode_into(grads, base, dh)
+        bi -= 1
+        # bg drops here → the 8 device LoRA grads free; wbi drops → device weights free.
 
     return Krea2StackLoraGrads(grads^, TArc(d_x^))
 

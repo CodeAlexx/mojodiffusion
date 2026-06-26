@@ -98,7 +98,9 @@ from serenitymojo.models.klein.lora_block import (
     LoraAdapterDevice,
     klein_lora_fwd_device_resident_unfused,
     klein_lora_bwd_device_resident_unfused,
+    klein_lora_bwd_device_resident_tensors_unfused,
     KleinLoraDeviceGrads,
+    KleinLoraDeviceGradTensors,
 )
 
 
@@ -344,6 +346,53 @@ struct Krea2BlockGrads(Movable):
         self.mlp_down_w = mlp_down_w^
 
 
+# ── DEVICE-resident per-Linear LoRA grad pair (TArc; None when adapter absent) ─
+# Sibling of Krea2LoraGrad. The d_A/d_B stay on device (no per-adapter to_host),
+# so the streamed stack enqueues ALL block backward work first and the trainer
+# does ONE batched D2H at the end of the step (224 syncs → 1). Mirrors klein's
+# KleinLoraDeviceGradTensors discipline. The HOST Krea2LoraGrad above is the bit-
+# gate oracle and is left untouched; this is a parallel carrier behind the
+# trainer's KREA2_DEVICE_LORA_GRAD flag.
+struct Krea2LoraGradT(Copyable, Movable):
+    var d_a: Optional[TArc]
+    var d_b: Optional[TArc]
+
+    def __init__(
+        out self, var d_a: Optional[TArc], var d_b: Optional[TArc]
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+
+
+struct Krea2BlockGradsT(Movable):
+    var d_x: TArc                 # input grad [1,L,features]
+    var wq: Krea2LoraGradT
+    var wk: Krea2LoraGradT
+    var wv: Krea2LoraGradT
+    var gate_w: Krea2LoraGradT
+    var wo: Krea2LoraGradT
+    var mlp_gate_w: Krea2LoraGradT
+    var mlp_up_w: Krea2LoraGradT
+    var mlp_down_w: Krea2LoraGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var wq: Krea2LoraGradT, var wk: Krea2LoraGradT, var wv: Krea2LoraGradT,
+        var gate_w: Krea2LoraGradT, var wo: Krea2LoraGradT,
+        var mlp_gate_w: Krea2LoraGradT, var mlp_up_w: Krea2LoraGradT,
+        var mlp_down_w: Krea2LoraGradT,
+    ):
+        self.d_x = d_x^
+        self.wq = wq^
+        self.wk = wk^
+        self.wv = wv^
+        self.gate_w = gate_w^
+        self.wo = wo^
+        self.mlp_gate_w = mlp_gate_w^
+        self.mlp_up_w = mlp_up_w^
+        self.mlp_down_w = mlp_down_w^
+
+
 # ── modulation: out = vec + lin; chunk 6 along last dim → 6 raw [features] ────
 # (mmdit.py DoubleSharedModulation.forward). vec [1,6F], lin [6F]; b==1 so each
 # chunk is [features]; reshape to a clean [features] param for modulate/gate.
@@ -522,6 +571,39 @@ def _linear_bwd_dx(
         )
         return _LinBwd(d_x^, pair^)
     return _LinBwd(d_x^, Krea2LoraGrad(None, None))
+
+
+# ── DEVICE-grad sibling of _LinBwd / _linear_bwd_dx ──────────────────────────
+# Identical GEMM math, but the LoRA dA/dB stay on DEVICE (TArc) — no internal
+# to_host. klein_lora_bwd_device_resident_tensors_unfused is the SAME unfused
+# chain as klein_lora_bwd_device_resident_unfused minus the _to_host_pair_f32
+# fence, so the device-grad path is bit-identical to the host path (the trainer
+# proves this by the bit-identical loss gate).
+struct _LinBwdT(Movable):
+    var d_x: Tensor
+    var lora: Krea2LoraGradT
+
+    def __init__(out self, var d_x: Tensor, var lora: Krea2LoraGradT):
+        self.d_x = d_x^
+        self.lora = lora^
+
+
+def _linear_bwd_dx_dev(
+    d_y: Tensor, x: Tensor, w: Tensor, lo: Optional[LoraAdapterDevice],
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> _LinBwdT:
+    """Device-grad d_x for a LoRA Linear. Base W FROZEN (no d_w). LoRA dA/dB stay
+    on device (no per-adapter to_host) — the SAME GEMM math as _linear_bwd_dx."""
+    var d_x = linear_backward_dx(d_y, w, M, in_f, out_f, ctx)
+    if lo:
+        var g = klein_lora_bwd_device_resident_tensors_unfused(d_y, x, lo.value(), M, ctx)
+        d_x = add(d_x, g.d_x[], ctx)
+        var pair = Krea2LoraGradT(
+            Optional[TArc](g.d_a.copy()),
+            Optional[TArc](g.d_b.copy()),
+        )
+        return _LinBwdT(d_x^, pair^)
+    return _LinBwdT(d_x^, Krea2LoraGradT(None, None))
 
 
 def krea2_single_stream_block_lora_backward[
@@ -706,6 +788,142 @@ def krea2_single_stream_block_lora_backward[
     var d_x = add(grg1.d_x, rb1_dx, ctx)
 
     return Krea2BlockGrads(
+        TArc(d_x^),
+        g_wq^, g_wk^, g_wv^, g_gate^, g_wo^, g_mg^, g_mu^, g_down^,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVICE-GRAD BACKWARD — bit-identical math to krea2_single_stream_block_lora_backward
+# above, but the 8 LoRA dA/dB stay on DEVICE (_linear_bwd_dx_dev, no per-adapter
+# to_host). Returns Krea2BlockGradsT. The streamed stack collects these device
+# grads across all blocks and the trainer does ONE batched D2H per step (224
+# syncs → 1). The body is otherwise a verbatim clone of the host backward — keep
+# the two in lockstep if the block math changes.
+# ══════════════════════════════════════════════════════════════════════════════
+def krea2_single_stream_block_lora_backward_dev[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_out: Tensor,        # [1, L, features] upstream grad of the block output
+    vec: Tensor,          # [1, 6*features]  (for the raw mod chunks)
+    w: Krea2BlockWeights, lora: Krea2BlockLora, saved: Krea2BlockSaved,
+    cos_q: Tensor, sin_q: Tensor,
+    cos_k: Tensor, sin_k: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),  # MUST match the forward call
+        # (same contract as the host backward).
+) raises -> Krea2BlockGradsT:
+    comptime features = HEADS * HEADDIM
+    comptime n_rep = HEADS // KVHEADS
+    var mlpdim = saved.mlp_gate[].shape()[2]
+    var M = L
+    var scale = Float32(1.0) / sqrt(Float32(HEADDIM))
+
+    var mods = _mod6(vec, w.mod_lin[], features, ctx)
+    var prescale = mods[0]
+    var pregate = mods[2]
+    var postscale = mods[3]
+    var postgate = mods[5]
+
+    # ── MLP branch backward ──────────────────────────────────────────────────
+    var grg2 = gate_residual_backward(d_out, saved.x1[], postgate[], saved.m[], ctx, compute_gate_grad=False)
+    var d_m = grg2.d_y.clone(ctx)
+
+    var bw_down = _linear_bwd_dx_dev(
+        d_m, saved.sw[], w.mlp_down_w[], lora.mlp_down_w, M, mlpdim, features, ctx
+    )
+    var d_sw = bw_down.d_x.clone(ctx)
+    var g_down = bw_down.lora.copy()
+
+    var sgb = swiglu_backward(d_sw, saved.mlp_gate[], saved.mlp_up[], ctx)
+    var bw_mg = _linear_bwd_dx_dev(
+        sgb.d_gate, saved.xm2[], w.mlp_gate_w[], lora.mlp_gate_w, M, features, mlpdim, ctx
+    )
+    var bw_mu = _linear_bwd_dx_dev(
+        sgb.d_up, saved.xm2[], w.mlp_up_w[], lora.mlp_up_w, M, features, mlpdim, ctx
+    )
+    var g_mg = bw_mg.lora.copy()
+    var g_mu = bw_mu.lora.copy()
+    var d_xm2 = add(bw_mg.d_x, bw_mu.d_x, ctx)
+
+    var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
+    var rb2_dx = rms_norm_backward_dx(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
+    var d_x1 = add(grg2.d_x, rb2_dx, ctx)
+
+    # ── ATTENTION branch backward ────────────────────────────────────────────
+    var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
+    var d_a = grg1.d_y.clone(ctx)
+
+    var bw_wo = _linear_bwd_dx_dev(
+        d_a, saved.gated[], w.wo[], lora.wo, M, features, features, ctx
+    )
+    var d_gated = bw_wo.d_x.clone(ctx)
+    var g_wo = bw_wo.lora.copy()
+
+    var d_attn_flat = mul(d_gated, saved.sg[], ctx)
+    var d_sg = mul(d_gated, saved.attn_flat[], ctx)
+    var d_gate_pre = sigmoid_backward(d_sg, saved.gate_pre[], ctx)
+
+    var d_att = reshape(d_attn_flat, [1, L, HEADS, HEADDIM], ctx)
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    var bwd_use_flash = real_len and real_len.value() < L
+    if bwd_use_flash:
+        if not saved.flash_stats:
+            raise Error(
+                "krea2 block bwd (dev): real_len < L but saved tape has no flash set"
+                " (forward/backward real_len mismatch)"
+            )
+        var rl = real_len.value()
+        var acts_dt = saved.q_rope[].dtype()
+        var d_att_f32 = cast_tensor(d_att, STDtype.F32, ctx)
+        var fb = sdpa_flash_backward_padmask_f32[1, L, HEADS, HEADDIM](
+            saved.flash_q.value(), saved.flash_k.value(), saved.flash_v.value(),
+            saved.flash_o.value(), saved.flash_stats.value(), d_att_f32, rl, scale, ctx,
+        )
+        d_q_sb = cast_tensor(fb.d_q, acts_dt, ctx)
+        d_k_sb = cast_tensor(fb.d_k, acts_dt, ctx)
+        d_v_sb = cast_tensor(fb.d_v, acts_dt, ctx)
+    else:
+        var sb = sdpa_backward[1, L, HEADS, HEADDIM](
+            saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+
+    var d_k_rope = repeat_kv_backward(d_k_sb, L, KVHEADS, n_rep, HEADDIM, ctx)
+    var d_v = repeat_kv_backward(d_v_sb, L, KVHEADS, n_rep, HEADDIM, ctx)
+
+    var d_q_rms = rope_backward(d_q_sb, cos_q, sin_q, True, ctx)
+    var d_k_rms = rope_backward(d_k_rope, cos_k, sin_k, True, ctx)
+
+    var rbq_dx = rms_norm_backward_dx(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
+    var rbk_dx = rms_norm_backward_dx(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
+
+    var d_q = reshape(rbq_dx, [1, L, HEADS * HEADDIM], ctx)
+    var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
+    var d_v_flat = reshape(d_v, [1, L, KVHEADS * HEADDIM], ctx)
+
+    var bw_q = _linear_bwd_dx_dev(d_q, saved.xm[], w.wq[], lora.wq, M, features, HEADS * HEADDIM, ctx)
+    var bw_k = _linear_bwd_dx_dev(d_k, saved.xm[], w.wk[], lora.wk, M, features, KVHEADS * HEADDIM, ctx)
+    var bw_v = _linear_bwd_dx_dev(d_v_flat, saved.xm[], w.wv[], lora.wv, M, features, KVHEADS * HEADDIM, ctx)
+    var bw_g = _linear_bwd_dx_dev(d_gate_pre, saved.xm[], w.gate_w[], lora.gate_w, M, features, features, ctx)
+    var g_wq = bw_q.lora.copy()
+    var g_wk = bw_k.lora.copy()
+    var g_wv = bw_v.lora.copy()
+    var g_gate = bw_g.lora.copy()
+
+    var d_xm = add(add(bw_q.d_x, bw_k.d_x, ctx), add(bw_v.d_x, bw_g.d_x, ctx), ctx)
+
+    var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
+    var rb1_dx = rms_norm_backward_dx(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
+
+    var d_x = add(grg1.d_x, rb1_dx, ctx)
+
+    return Krea2BlockGradsT(
         TArc(d_x^),
         g_wq^, g_wk^, g_wv^, g_gate^, g_wo^, g_mg^, g_mu^, g_down^,
     )

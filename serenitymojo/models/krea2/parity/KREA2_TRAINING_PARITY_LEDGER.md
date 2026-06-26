@@ -202,3 +202,30 @@ Levers (best-case ~3.5-4s combined; each substantial — this is sustained perf-
 
 DECISION (user "b then a"): banked the 4a.2 9× (minutes→~7s) as the milestone; workstream A
 (toward 2-3s) is the next, starting with lever 1 (the activation-offload). See KNOWN_ISSUES MJ-0829.
+
+## autograd_v2 speed campaign (2026-06-26) — Phase 1 bit-exact; capture BLOCKED on 24GB
+
+User rejected banking at ~7s ("klein 2.2s, zimage faster, aim higher — not near top speeds").
+klein/zimage prove the MAX backend reaches top speed via autograd_v2 + slab + capture, so we
+pursued that path for krea2 (the all-trainers mandate). Outcome, gated at each step:
+
+- **Engine arm (coarse, OPK_KREA2_SINGLE_BLOCK)** — bit-exact vs hand-chain (n_mismatch=0,
+  d_x + 8 LoRA dA/dB), real-depth run loss bit-identical (step0 0.36731365), ~8s (+2%). Committed 3f64921.
+- **Phase 1 fine-grained arm** — re-recorded the block as slab-routable ops + 2 new kinds
+  (OPK_REPEAT_KV/OPK_SIGMOID for krea2's GQA + sigmoid attn-gate). C15 crux: d_xm is a BALANCED
+  tree add(add(q,k),add(v,g)) not a left-fold (krea2_fold_probe MEASURED 832k/3.1M F32 mismatches);
+  recorder forks xm into two zero-add pass-throughs. Bit gates PASS. Committed 0c554e6.
+- **bf16 fix** — recorder cast the 4 norm weights (scale+1) to act dtype (rms_norm_backward_dx
+  raises on F32-weight+bf16-acts; oracle casts at krea2_block.mojo:684). F32-gate-neutral. Committed d828c6f.
+- **Phase 2 (device-grad LoRA + StepSlab)** — bit-exact (both arms PASS) but REVERTED: device-grad
+  carrier leaked the default hand-chain path (watchdog killed at vram<400MB, no slab); True+slab
+  trainer OOM'd at setup.
+
+**WALL (measured, krea2_slab_peak.mojo, since reverted): the fine-grained slab one-block peak is
+~20GB at L=4864** (10.05GB at L=2432, 303 allocs, used==peak — bump-alloc rewinds only at the block
+boundary, holds the whole block's recompute + backward graph live). Can't co-fit the 12GB fp8 base
+on 24GB; doesn't fit even alone. krea2's block (L=4864 D=6144 MLP=16384) >> zimage's (S~1248 D=3840).
+
+**DECISION (user "Bank the 9×"):** the capture speed needs per-node slab freeing (engine-level
+change to the shared StepSlab) — filed MJ-0917. Banked at the bit-exact Phase 1 engine arm
+(KREA2_V2_GRAPH host-grad, Klein-style no-slab/capture) + the 9× (MJ-0828) as the shipped speed.

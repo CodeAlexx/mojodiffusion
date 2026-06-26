@@ -892,9 +892,60 @@ def _ln_bwd_dx_kernel[dtype: DType](
 
 
 # d_g, d_b: one thread per column, recompute per-row mean/inv_std.
+# Precompute LayerNorm per-row stats: mean[row] and inv_std[row], one block/row.
+# Lets _ln_bwd_param_kernel read them instead of recomputing mean+var once per
+# output column (MJ-0905: O(rows*cols^2) -> O(rows*cols)).
+def _ln_stats_kernel[dtype: DType](
+    x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    mean: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    inv: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var sh = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var ls: Float32 = 0.0
+    var c = tid
+    while c < cols:
+        ls += rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]()
+        c += _TPB
+    sh[tid] = ls
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            sh[tid] = sh[tid] + sh[tid + active]
+        barrier()
+        active //= 2
+    var m = sh[0] / Float32(cols)
+    barrier()
+    var lv: Float32 = 0.0
+    c = tid
+    while c < cols:
+        var dd = rebind[Scalar[dtype]](x[row, c]).cast[DType.float32]() - m
+        lv += dd * dd
+        c += _TPB
+    sh[tid] = lv
+    barrier()
+    active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            sh[tid] = sh[tid] + sh[tid + active]
+        barrier()
+        active //= 2
+    if tid == 0:
+        mean[row] = m
+        inv[row] = 1.0 / sqrt(sh[0] / Float32(cols) + eps)
+
+
 def _ln_bwd_param_kernel[dtype: DType](
     go: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
     x: LayoutTensor[dtype, _DYN2, MutAnyOrigin],
+    mean: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    inv: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
     dg: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     db: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     rows: Int,
@@ -907,16 +958,9 @@ def _ln_bwd_param_kernel[dtype: DType](
     var acc_g: Float32 = 0.0
     var acc_b: Float32 = 0.0
     for r in range(rows):
-        var s: Float32 = 0.0
-        for cc in range(cols):
-            s += rebind[Scalar[dtype]](x[r, cc]).cast[DType.float32]()
-        var mean = s / Float32(cols)
-        var vs: Float32 = 0.0
-        for cc in range(cols):
-            var dd = rebind[Scalar[dtype]](x[r, cc]).cast[DType.float32]() - mean
-            vs += dd * dd
-        var inv = 1.0 / sqrt(vs / Float32(cols) + eps)
-        var norm = (rebind[Scalar[dtype]](x[r, col]).cast[DType.float32]() - mean) * inv
+        var m = rebind[Scalar[DType.float32]](mean[r])
+        var invr = rebind[Scalar[DType.float32]](inv[r])
+        var norm = (rebind[Scalar[dtype]](x[r, col]).cast[DType.float32]() - m) * invr
         var gov = rebind[Scalar[dtype]](go[r, col]).cast[DType.float32]()
         acc_g += gov * norm
         acc_b += gov
@@ -988,9 +1032,20 @@ def layer_norm_backward(
         ctx.enqueue_function[
             _ln_bwd_dx_kernel[DType.float32], _ln_bwd_dx_kernel[DType.float32]
         ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        var ln_mean_buf = ctx.enqueue_create_buffer[DType.uint8](rows * 4)
+        var ln_inv_buf = ctx.enqueue_create_buffer[DType.uint8](rows * 4)
+        var LNMEAN = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            ln_mean_buf.unsafe_ptr().bitcast[Float32](),
+            RuntimeLayout[_DYN1].row_major(IndexList[1](rows)))
+        var LNINV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            ln_inv_buf.unsafe_ptr().bitcast[Float32](),
+            RuntimeLayout[_DYN1].row_major(IndexList[1](rows)))
+        ctx.enqueue_function[
+            _ln_stats_kernel[DType.float32], _ln_stats_kernel[DType.float32]
+        ](X, LNMEAN, LNINV, d, eps, grid_dim=rows, block_dim=_TPB)
         ctx.enqueue_function[
             _ln_bwd_param_kernel[DType.float32], _ln_bwd_param_kernel[DType.float32]
-        ](GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+        ](GO, X, LNMEAN, LNINV, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
     elif dt == DType.bfloat16:
         var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
@@ -1007,9 +1062,20 @@ def layer_norm_backward(
         ctx.enqueue_function[
             _ln_bwd_dx_kernel[DType.bfloat16], _ln_bwd_dx_kernel[DType.bfloat16]
         ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        var ln_mean_buf = ctx.enqueue_create_buffer[DType.uint8](rows * 4)
+        var ln_inv_buf = ctx.enqueue_create_buffer[DType.uint8](rows * 4)
+        var LNMEAN = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            ln_mean_buf.unsafe_ptr().bitcast[Float32](),
+            RuntimeLayout[_DYN1].row_major(IndexList[1](rows)))
+        var LNINV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            ln_inv_buf.unsafe_ptr().bitcast[Float32](),
+            RuntimeLayout[_DYN1].row_major(IndexList[1](rows)))
+        ctx.enqueue_function[
+            _ln_stats_kernel[DType.bfloat16], _ln_stats_kernel[DType.bfloat16]
+        ](X, LNMEAN, LNINV, d, eps, grid_dim=rows, block_dim=_TPB)
         ctx.enqueue_function[
             _ln_bwd_param_kernel[DType.bfloat16], _ln_bwd_param_kernel[DType.bfloat16]
-        ](GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+        ](GO, X, LNMEAN, LNINV, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
     else:
         var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             go.buf.unsafe_ptr().bitcast[Float16](), x_rl)
@@ -1026,9 +1092,20 @@ def layer_norm_backward(
         ctx.enqueue_function[
             _ln_bwd_dx_kernel[DType.float16], _ln_bwd_dx_kernel[DType.float16]
         ](GO, X, G, DX, d, eps, grid_dim=rows, block_dim=_TPB)
+        var ln_mean_buf = ctx.enqueue_create_buffer[DType.uint8](rows * 4)
+        var ln_inv_buf = ctx.enqueue_create_buffer[DType.uint8](rows * 4)
+        var LNMEAN = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            ln_mean_buf.unsafe_ptr().bitcast[Float32](),
+            RuntimeLayout[_DYN1].row_major(IndexList[1](rows)))
+        var LNINV = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            ln_inv_buf.unsafe_ptr().bitcast[Float32](),
+            RuntimeLayout[_DYN1].row_major(IndexList[1](rows)))
+        ctx.enqueue_function[
+            _ln_stats_kernel[DType.float16], _ln_stats_kernel[DType.float16]
+        ](X, LNMEAN, LNINV, d, eps, grid_dim=rows, block_dim=_TPB)
         ctx.enqueue_function[
             _ln_bwd_param_kernel[DType.float16], _ln_bwd_param_kernel[DType.float16]
-        ](GO, X, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
+        ](GO, X, LNMEAN, LNINV, DG, DB, rows, d, eps, grid_dim=dg_grid, block_dim=_BLOCK)
     # sync removed (single-stream ordering; was kernel-trailing host stall)
     return LayerNormBackward(
         Tensor(dx_buf^, xshape.copy(), x.dtype()),

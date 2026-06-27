@@ -16,10 +16,9 @@
 # Conv adapters are PRIMITIVE-ONLY by nature for Klein / Z-Image: those DiTs have
 # NO trained conv2d layers (all-attention + linear). This file is built for
 # parity-completeness with the LyCORIS conv path and is NOT integrated into the
-# Klein/Z-Image training stack. NOTE (T2.F skeptic, 2026-06-11): there is NO
-# adapter_algo id for LoCon — io/train_config_reader.mojo _adapter_algo_int
-# rejects "locon" (only lora|full|loha|dora|lokr|oft|boft exist), so this is a
-# primitive + save module only. Torch-lycoris parity + ecosystem-load gates:
+# Klein/Z-Image training stack. The reader now accepts network_algorithm="locon";
+# model loops must still fail loud or route only the linear-compatible path unless
+# they explicitly wire this conv primitive. Torch-lycoris parity + ecosystem-load gates:
 # training/tests/lycoris_family_parity.mojo + lycoris_family_load_check.py.
 #
 # ── Layout (host F32, row-major) — MATCHES ops/conv2d_backward.mojo EXACTLY ────

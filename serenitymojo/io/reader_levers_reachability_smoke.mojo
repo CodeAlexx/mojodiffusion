@@ -29,6 +29,8 @@ from serenitymojo.training.train_config import (
     TrainConfig,
     TRAIN_MODALITY_VIDEO, TRAIN_MODALITY_AV,
     LORA_TARGET_LEGACY_VIDEO_ATTN1, LORA_TARGET_LTX2_V2V,
+    TRAIN_ADAPTER_ALGO_FULL, TRAIN_ADAPTER_ALGO_LOCON,
+    TRAIN_ADAPTER_ALGO_LOHA, TRAIN_ADAPTER_ALGO_LOKR,
 )
 from std.memory import alloc
 
@@ -182,7 +184,7 @@ def _gate_all_set() raises:
     _close("video_loss_weight", c.video_loss_weight, Float32(1.0))
     _close("audio_loss_weight", c.audio_loss_weight, Float32(0.25))
     # Wave 2B — adapter algo (string -> int)
-    _eq("adapter_algo(full->1)", c.adapter_algo, 1)
+    _eq("adapter_algo(full->1)", c.adapter_algo, TRAIN_ADAPTER_ALGO_FULL)
     print("  gate (a) PASS — Wave 2 keys and AV cache contract keys reachable + mapped correctly")
 
 
@@ -258,6 +260,25 @@ def _gate_bogus_enum() raises:
     print("  gate (c) PASS — unknown enum string raises (fail-loud)")
 
 
+def _gate_adapter_aliases() raises:
+    print("--- gate (d): network_algorithm aliases map to adapter ids ---")
+    var locon_path = String("/tmp/reader_adapter_locon.json")
+    _write_file(locon_path, String("{") + _ARCH + ',"network_algorithm":"locon"}')
+    var locon = read_model_config(locon_path)
+    _eq("network_algorithm(locon->7)", locon.adapter_algo, TRAIN_ADAPTER_ALGO_LOCON)
+
+    var loha_path = String("/tmp/reader_adapter_loha.json")
+    _write_file(loha_path, String("{") + _ARCH + ',"adapter_algo":"LOHA"}')
+    var loha = read_model_config(loha_path)
+    _eq("adapter_algo(LOHA->2)", loha.adapter_algo, TRAIN_ADAPTER_ALGO_LOHA)
+
+    var lokr_path = String("/tmp/reader_adapter_lokr.json")
+    _write_file(lokr_path, String("{") + _ARCH + ',"network_algorithm":"lokr"}')
+    var lokr = read_model_config(lokr_path)
+    _eq("network_algorithm(lokr->4)", lokr.adapter_algo, TRAIN_ADAPTER_ALGO_LOKR)
+    print("  gate (d) PASS — lora/locon/loha/lokr aliases are reachable")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Parity-bitrot demo: a deliberately-wrong expected value MUST make the gate
 # raise (-> nonzero exit). Toggle SHOW_BITROT_DEMO to True to witness it fail.
@@ -277,8 +298,9 @@ def main() raises:
     _gate_all_set()
     _gate_none_set()
     _gate_bogus_enum()
+    _gate_adapter_aliases()
 
     comptime if SHOW_BITROT_DEMO:
         _bitrot_demo()  # raises -> process exits nonzero (bitrot guard proof)
 
-    print("reader_levers_reachability_smoke PASS (a+b+c green)")
+    print("reader_levers_reachability_smoke PASS (a+b+c+d green)")

@@ -55,6 +55,10 @@ from serenitymojo.training.train_config import (
     TRAIN_TIME_UNIT_MINUTE, TRAIN_TIME_UNIT_HOUR, TRAIN_TIME_UNIT_NEVER,
     TRAIN_TIME_UNIT_ALWAYS,
     EMA_MODE_OFF, EMA_MODE_GPU, EMA_MODE_CPU,
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOHA, TRAIN_ADAPTER_ALGO_DORA,
+    TRAIN_ADAPTER_ALGO_LOKR, TRAIN_ADAPTER_ALGO_OFT,
+    TRAIN_ADAPTER_ALGO_BOFT, TRAIN_ADAPTER_ALGO_LOCON,
 )
 
 
@@ -592,27 +596,27 @@ def _timestep_distribution_int(s: String) raises -> Int:
 
 
 def _adapter_algo_int(s: String) raises -> Int:
-    # 0 = plain LoRA, 1 = LyCORIS Full (full_adapter.mojo), 2 = LyCORIS LoHa
-    # (loha_adapter.mojo), 3 = DoRA (dora_adapter.mojo), 4 = LyCORIS LoKr
-    # (lokr_adapter.mojo), 5 = Diag-OFT (oft_adapter.mojo), 6 = BOFT
-    # (boft_adapter.mojo) — all gated by their *_smoke.mojo; stack-dispatch is a
-    # later integration wave (the trainer selector fails loud for 1..6).
-    if s == "lora":
-        return 0
-    elif s == "full":
-        return 1
-    elif s == "loha":
-        return 2
-    elif s == "dora":
-        return 3
-    elif s == "lokr":
-        return 4
-    elif s == "oft":
-        return 5
-    elif s == "boft":
-        return 6
+    # Keep these spellings aligned with ai-toolkit's network.type values plus
+    # Serenity's historical adapter_algo values.
+    if s == "lora" or s == "LORA":
+        return TRAIN_ADAPTER_ALGO_LORA
+    elif s == "locon" or s == "LOCON" or s == "lycoris" or s == "LYCORIS":
+        return TRAIN_ADAPTER_ALGO_LOCON
+    elif s == "full" or s == "FULL":
+        return TRAIN_ADAPTER_ALGO_FULL
+    elif s == "loha" or s == "LOHA":
+        return TRAIN_ADAPTER_ALGO_LOHA
+    elif s == "dora" or s == "DORA":
+        return TRAIN_ADAPTER_ALGO_DORA
+    elif s == "lokr" or s == "LOKR":
+        return TRAIN_ADAPTER_ALGO_LOKR
+    elif s == "oft" or s == "OFT":
+        return TRAIN_ADAPTER_ALGO_OFT
+    elif s == "boft" or s == "BOFT":
+        return TRAIN_ADAPTER_ALGO_BOFT
     raise Error(
-        String("JSON config: unknown algo '") + s + "' (expected lora|full|loha|dora|lokr|oft|boft)"
+        String("JSON config: unknown adapter algorithm '") + s
+        + "' (expected lora|locon|loha|lokr|full|dora|oft|boft)"
     )
 
 
@@ -1099,10 +1103,10 @@ def read_model_config(json_path: String) raises -> TrainConfig:
         elif key == "layer_offload_fraction":
             cfg.layer_offload_fraction = _read_scalar(cur).num
         # ── Wave 2B: adapter algo selector ──
-        elif key == "algo" or key == "adapter_algo":
+        elif key == "network_algorithm" or key == "algo" or key == "adapter_algo":
             var sc = _read_scalar(cur)
             if not sc.is_string:
-                raise Error("JSON config: algo must be a string")
+                raise Error("JSON config: network_algorithm/algo/adapter_algo must be a string")
             cfg.adapter_algo = _adapter_algo_int(sc.s)
         # ── T2.G LoKr knobs (SimpleTuner lycoris_config parity; algo=4 only) ──
         elif key == "lokr_factor":

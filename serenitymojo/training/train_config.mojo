@@ -93,6 +93,17 @@ comptime LOSS_FN_MSE = 0
 comptime LOSS_FN_HUBER = 1
 comptime LOSS_FN_SMOOTH_L1 = 2
 
+# Adapter algorithm selector. Preserve the historical numeric values because
+# older configs and tests already use them.
+comptime TRAIN_ADAPTER_ALGO_LORA = 0
+comptime TRAIN_ADAPTER_ALGO_FULL = 1
+comptime TRAIN_ADAPTER_ALGO_LOHA = 2
+comptime TRAIN_ADAPTER_ALGO_DORA = 3
+comptime TRAIN_ADAPTER_ALGO_LOKR = 4
+comptime TRAIN_ADAPTER_ALGO_OFT = 5
+comptime TRAIN_ADAPTER_ALGO_BOFT = 6
+comptime TRAIN_ADAPTER_ALGO_LOCON = 7
+
 
 struct TrainConfig(Copyable, Movable):
     # ── identity + paths ──
@@ -322,10 +333,10 @@ struct TrainConfig(Copyable, Movable):
     # ── adapter algo selector (Wave 2B item 2j; default-off == plain LoRA) ──
     # 0=plain LoRA (low-rank A/B), 1=LyCORIS Full (full-shape weight delta),
     # 2=LyCORIS LoHa (Hadamard of two rank-r products; loha_adapter.mojo),
-    # 3=DoRA (weight-decomposed LoRA: magnitude × normalized direction;
+    # 3=DoRA (weight-decomposed LoRA: magnitude x normalized direction;
     #   dora_adapter.mojo), 4=LyCORIS LoKr (Kronecker product delta;
-    #   lokr_adapter.mojo). 1..4 are primitives gated by their *_smoke.mojo and
-    #   fail loud in the Klein stack until the integration wave wires them.
+    #   lokr_adapter.mojo), 5=OFT, 6=BOFT, 7=LyCORIS LoCon
+    #   (linear LoRA-compatible path plus conv primitive).
     var adapter_algo: Int
 
     # ── T2.G LoKr knobs (adapter_algo==4; SimpleTuner lycoris_config parity) ──
@@ -568,7 +579,7 @@ struct TrainConfig(Copyable, Movable):
             enable_async_offloading=True,
             enable_activation_offloading=True,
             layer_offload_fraction=Float64(0.0),
-            adapter_algo=0,                      # plain LoRA (default-off)
+            adapter_algo=TRAIN_ADAPTER_ALGO_LORA,  # plain LoRA (default-off)
             train_modality=TRAIN_MODALITY_VIDEO,
             lora_target_preset=LORA_TARGET_LEGACY_VIDEO_ATTN1,
             dataset_cache_dir=String(""),

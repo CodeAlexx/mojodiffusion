@@ -481,6 +481,7 @@ def fused_lora_adamw_plain_step_resident(
     var grid = (state.total + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_lora_adamw_plain_kernel, _lora_adamw_plain_kernel](
         P, G, M, V, state.total, lr, beta1, beta2, bc1, bc2, eps, weight_decay,
+        Float32(1.0),
         grid_dim=grid, block_dim=_BLOCK,
     )
 

@@ -90,11 +90,14 @@ Build/run a gate: `cd /home/alex/mojodiffusion && rm -f serenitymojo.mojopkg && 
 
 ## B. Scope caveats (honest)
 
-- **LyCORIS adapters are PRIMITIVE-ONLY.** The `klein_stack_lora.mojo` fwd/bwd path is
-  hardwired to 2-factor A/B `KleinLoraSet`. None of LoHa/DoRA/LoKr/OFT/BOFT/LoCon-conv/
-  Tucker/Full is routed through the Klein stack — they are tested math + save format,
-  not trainable end-to-end. (Stack-dispatch integration was explicitly **out of scope**
-  per user instruction: "did not ask for lycoris in Klein, just port it.")
+- **LyCORIS production routing is intentionally narrow.** The primitive math/save
+  modules remain broader than the model-stack carriers. As of 2026-06-27, config
+  parsing accepts `network_algorithm`/`adapter_algo` aliases for LoCon, LoHa,
+  LoKr, Full, DoRA, OFT, and BOFT. Real trainers either take a proven route or
+  fail before checkpoint/GPU-heavy work: LoCon maps to the existing linear
+  LoRA-compatible down/up path, Klein carries the proven SimpleTuner-parity
+  LoKr end-to-end path, and LoHa/DoRA/OFT/BOFT/Full remain primitive/save-format
+  only until stack carriers are implemented.
 - **The schedulers (`dpmpp_2m`, `unipc`) are RECTIFIED-FLOW-ONLY.** They use
   `λ(σ)=log((1-σ)/σ)` with `α=1-σ`, assuming `σ ∈ [0,1]` (Klein/Z-Image/Chroma/Flux2
   flow-matching). They are **out of domain for k-diffusion epsilon models (SDXL/SD1.5),
@@ -142,6 +145,6 @@ into four files that ALSO contain codex's uncommitted work:
 `klein_stack_lora.mojo`. Per user decision these are **left in place** (the wiring is
 default-OFF; the user decides their fate). They are NOT reverted (codex's work is
 interleaved with no clean baseline) and are **not** considered part of the standalone
-tool port documented above. The `adapter_algo` selector in `train_klein_real.mojo`
-currently carries fail-loud guards for algo 1–6 (Full/LoHa/DoRA/LoKr/OFT/BOFT); these are
-parked, not a sanctioned integration.
+tool port documented above. Updated 2026-06-27: the selector is now sanctioned
+config/UI plumbing. Klein LoKr is the real trainable carrier; LoCon is accepted
+only as a linear LoRA-compatible path; other LyCORIS variants still fail loudly.

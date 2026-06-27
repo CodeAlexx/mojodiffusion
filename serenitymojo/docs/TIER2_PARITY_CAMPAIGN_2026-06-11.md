@@ -17,8 +17,8 @@ serenity-trainer UI.
 | T2.C | Full-rank finetune (zimage) — RE-SCOPED per Alex 2026-06-12: OneTrainer-contract item, NOT SimpleTuner parity. Oracle = full_finetune_contract.mojo / OneTrainer *FineTuneSetup | SHIPPED v1 gated (c789b6d): 5.31B params, 67-81 s/step, 15.8GB device peak; follow-ups in results |
 | T2.D | Dynamic aspect bucketing | SHIPPED + follow-up SHIPPED (comptime-generated 14-arm dispatch, landscape buckets live) |
 | T2.E | ControlNet (1 model) | GATED BLOCK (zimage; trainer data path = follow-up) |
-| T2.F | Lycoris LoCon/LoHa/Tucker/OFT | SHIPPED (verified primitives) |
-| T2.F-2 | Lycoris LoKr/BOFT/DoRA | SHIPPED (verified primitives — upstream gates run; lokr x3 variants + boft + dora all BIT-EXACT upstream loads) |
+| T2.F | Lycoris LoCon/LoHa/Tucker/OFT | SHIPPED (verified primitives; LoCon selector/linear route wired 2026-06-27) |
+| T2.F-2 | Lycoris LoKr/BOFT/DoRA | SHIPPED (verified primitives; LoKr Klein carrier live; unsupported model stacks fail loud) |
 | UI | Lever delivery (ideogram4 argv bridge, hidream runner) | SHIPPED (serenity-trainer eaa88f1) |
 | T2.G | SimpleTuner-LoKr full parity (Alex directive) | SHIPPED — LoKr e2e TRAINABLE on klein (adapter_algo=4), init_lokr_norm ported exactly, parity matrix in results |
 
@@ -99,9 +99,9 @@ DELETED; upstream pip is the only live reference).
 
 | family | trainable e2e? | fwd parity vs torch | save format | gaps |
 |---|---|---|---|---|
-| LoCon  | NO (no adapter_algo id; primitive only) | PASS cos=1-1e-14, norm_rel 2.4e-9 | PASS — keys == upstream, upstream loads it BIT-EXACT | not wired into any trainer |
+| LoCon  | LIMITED (adapter_algo=7; linear LoRA-compatible targets route through existing down/up carrier) | PASS cos=1-1e-14, norm_rel 2.4e-9 | PASS — keys == upstream, upstream loads it BIT-EXACT | conv LoCon primitive is gated but not threaded into conv-bearing model stacks |
 | Tucker | NO (no adapter_algo id; primitive only) | PASS cos=1-1.5e-14, norm_rel 3.7e-8 | PASS — keys == upstream (incl. lora_mid), BIT-EXACT load | not wired into any trainer |
-| LoHa   | NO (algo=2 raises in train_klein_real) | PASS cos=1.0, bit-exact | PASS after FIX — was `.hada_w1_a.weight` + transposed factors (ecosystem-unloadable); now upstream keys/orientation, BIT-EXACT load | stack integration tracked follow-up |
+| LoHa   | NO (adapter_algo=2 accepted by config/UI, real trainers fail loud) | PASS cos=1.0, bit-exact | PASS after FIX — was `.hada_w1_a.weight` + transposed factors (ecosystem-unloadable); now upstream keys/orientation, BIT-EXACT load | stack carrier integration tracked follow-up |
 | OFT    | NO (algo=5 raises in train_klein_real) | PASS cos=1-2.3e-15, norm_rel 2.2e-8 | PASS after FIX — was `.oft_blocks.weight` + wrong skew parametrization (2x Q); now `oft_blocks` = 0.5*S, BIT-EXACT load | alpha==constraint semantics; a1111-lyco zeroes OFT at alpha=0 (doc'd) |
 
 Bugs fixed (loha_save.mojo, oft_save.mojo): see file headers. Found + gated:
@@ -159,7 +159,7 @@ STILL PASS.
 
 | family | trainable e2e? | fwd parity vs torch | save format | gaps |
 |---|---|---|---|---|
-| LoKr | NO (algo=4 raises in train_klein_real) | PASS x3 variants (W1full+W2factored cos=1-1.7e-15 nr 3.7e-9; both-full cos=1.0 nr 1.2e-9 incl. forced-scale=1 quirk; both-factored cos=1-5.3e-15 nr 4.7e-9) | PASS — bare lokr_w1[_a/_b]/lokr_w2[_a/_b]+alpha keys == upstream, LokrModule loads all 3 BIT-EXACT | stack integration tracked follow-up; saved alpha is the USER alpha in both-full (upstream saves the forced lora_dim; harmless — every loader re-forces scale=1) |
+| LoKr | KLEIN ONLY (adapter_algo=4 trainable via T2.G; other model stacks fail loud) | PASS x3 variants (W1full+W2factored cos=1-1.7e-15 nr 3.7e-9; both-full cos=1.0 nr 1.2e-9 incl. forced-scale=1 quirk; both-factored cos=1-5.3e-15 nr 4.7e-9) | PASS — bare lokr_w1[_a/_b]/lokr_w2[_a/_b]+alpha keys == upstream, LokrModule loads all 3 BIT-EXACT | non-Klein stack integration tracked follow-up; saved alpha is the USER alpha in both-full (upstream saves the forced lora_dim; harmless — every loader re-forces scale=1) |
 | BOFT | NO (algo=6 raises in train_klein_real) | PASS (b=2,nb=4,boft_m=3, all stages nontrivially permuted: cos=1-4.8e-15, nr 7.6e-8) | PASS — oft_blocks 4D [m,nb,b,b] (the a1111/comfy BOFT-vs-OFT rank discriminator, upstream algo_check verified) + blocks=-0.5*S orientation fold, ButterflyOFTModule loads BIT-EXACT | alpha==constraint semantics (0 written), like OFT |
 | DoRA | NO (algo=3 raises in train_klein_real) | PASS (cos=1-2e-15, nr 4.7e-9; FULL-forward effective-weight replacement, eps=finfo(f32).eps) | PASS after 2 FIXES — keys were PEFT lora_A/lora_B hybrid (ecosystem-unloadable); now upstream-lycoris lora_down/lora_up + dora_scale + alpha, LoConModule(wd=True) loads BIT-EXACT | oracle choice DOCUMENTED: pip lycoris LoCon(wd=True) (= comfy kohya-DoRA keys), NOT PEFT lora_magnitude_vector; stack integration follow-up |
 
@@ -287,6 +287,14 @@ with BIT-EXACT reconstruction; klein flags-off anchors in-class
 BUG FOUND BY GATE: bf16 RNE writeback bit-froze w1=1.0 under the
 perturbed init (lr*update < half-ULP(1.0)) — fixed with the repo's
 canonical stochastic-rounding writeback; w1 measurably trains.
+
+2026-06-27 UI/config follow-up: `TrainConfig.adapter_algo` now has named
+constants for LoRA/Full/LoHa/DoRA/LoKr/OFT/BOFT/LoCon; the reader accepts
+`network_algorithm`, `adapter_algo`, or `algo`. The serenity-trainer UI emits
+both `network_algorithm` and `adapter_algo`. LTX2 remains LoRA-only. Model
+trainers either accept LoCon through the existing linear LoRA-compatible path
+or reject unsupported variants before checkpoint load; Klein remains the only
+LoKr end-to-end training carrier.
 
 FOLLOW-UPS: structured-kron GPU kernels (full_matrix at 9B full target
 set needs ~17GB dense carriers — preflight fails loud with bytes);

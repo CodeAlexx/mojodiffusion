@@ -358,8 +358,11 @@ Current Mojo pieces:
   runs a one-step 1024 smoke and writes `output/sdxl_one_step_1024.png`; the
   full Rust-quality schedule remains 30 steps.
 - `pipeline/sdxl_pipeline_full_smoke.mojo` is the long 30-step 1024
-  cached-embedding target. It writes `output/sdxl_30step_1024.png`; the first
-  run completed in `53:38.90` with nonblank RGB output.
+  cached-embedding target. It writes `output/sdxl_30step_1024.png`. The
+  2026-06-27 staged-denoise/tiled-VAE verification completed all 30 steps,
+  wrote a coherent 1024 astronaut-on-horse image, and passed visual health;
+  measured VRAM was ~7.1 GiB after denoise and ~14.0 GiB after decode on the
+  24 GB card.
 - `pipeline/sdxl_contract_smoke.mojo` validates UNet/VAE headers and validates
   cached embedding dtype/count/shape when the cache file is present. If it is
   absent, the smoke prints the expected artifact path and generator handoff.
@@ -411,7 +414,10 @@ Current FLUX.1-dev status (updated 2026-06-09 — RUN-VERIFIED):
   `output/flux1_cached_inputs.png`. The current path uses `sdpa_nomask` instead
   of materializing a zero additive mask. It stages the final packed latent to
   host, drops the DiT/text phase, then decodes in a fresh context with the 5x5
-  low-memory tiled VAE path; the old monolithic decode OOMed after denoise.
+  low-memory tiled VAE path; the old monolithic decode OOMed after denoise. The
+  2026-06-27 cached run wrote a coherent 1024 astronaut-on-horse desert image;
+  measured VRAM was ~6.2 GiB at denoise end and remained under the 24 GB card
+  during tiled decode.
 
 Remaining FLUX.1-dev blockers:
 

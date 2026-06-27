@@ -84,11 +84,16 @@ from serenitymojo.training.schedule import (
 )
 from serenitymojo.training.levers import levers_loss_grad
 from serenitymojo.training.lora_adamw_plain_fused import fused_lora_adamw_plain_step
+from serenitymojo.training.levers import (
+    levers_optimizer_active, levers_optimizer_step_host,
+    levers_optimizer_validate, LeversOptimizerState,
+)
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft
 from serenitymojo.io.ffi import sys_mkdirs
 
 # ── krea2 config + cache reader + LoRA set ────────────────────────────────────
 from serenitymojo.models.krea2.config import krea2_raw
+from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.models.krea2.krea2_cache_reader import (
     KreaTrainCache, KreaTrainSample, krea2_patchify, krea2_build_pos,
     KREA2_LATENT_CHANNELS, KREA2_TXT_LAYERS, KREA2_TXT_DIM,
@@ -785,12 +790,21 @@ def _step_dispatch(
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        raise Error("usage: train_krea2 <cache.safetensors> <steps>")
+        raise Error("usage: train_krea2 <cache.safetensors> <steps> [<config.json>]")
     var cache_path = String(args[1])
     var steps = Int(String(args[2]))
 
     var ctx = DeviceContext()
-    var cfg = krea2_raw()
+    # Optional 3rd arg = a config path (e.g. configs/krea2_boxjana.json); default =
+    # the giger krea2.json via krea2_raw(). Lets boxjana use its own config (steps/lr/
+    # optimizer/workspace) without touching the giger config.
+    var cfg: TrainConfig
+    if len(args) >= 4:
+        var cfg_path = String(args[3])
+        print("[krea2] config:", cfg_path)
+        cfg = read_model_config(cfg_path)
+    else:
+        cfg = krea2_raw()
     var key_prefix = String("")          # real raw.safetensors stores bare torch keys
 
     print("==== krea2 LoRA TRAINER (Phase 4a, streaming) ====")
@@ -835,6 +849,18 @@ def main() raises:
     var host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
     var n_adapters = NBLOCKS * KREA2_SLOTS_PER_BLOCK
     print("host LoRA adapters=", len(host_lora), " (8 per block)")
+
+    # ── optimizer: AdamW (default, fused) OR a levers optimizer (automagic3 etc.).
+    # levers_optimizer_active is False for ADAMW (C13: routes around levers). For
+    # AUTOMAGIC3 (boxjana), the levers path runs automagic3_step + its REQUIRED
+    # stochastic-rounding bf16 writeback (automagic3_writeback_bf16_sr). State is
+    # lazily inited on the first levers step (no alloc for the AdamW default).
+    var opt_state = LeversOptimizerState()
+    if levers_optimizer_active(cfg):
+        levers_optimizer_validate(cfg, String("krea2"))
+        print("[krea2] optimizer = LEVERS (optimizer tag", cfg.optimizer, ") — automagic3/etc.")
+    else:
+        print("[krea2] optimizer = fused AdamW (default)")
 
     # ── LT bucketing ────────────────────────────────────────────────────────────
     # Process samples LARGEST-LT first so the device memory pool allocates the
@@ -914,15 +940,24 @@ def main() raises:
         comptime if KREA2_PHASE_TIMING:
             _ot = _phase_ms("grads_to_lists+clip", _ot, ctx)
 
-        # ── LoRA AdamW (default ADAMW; C13 flags-off). Fused plain step over the
-        # full host set; mutates a/b + moments in place. ────────────────────────
-        fused_lora_adamw_plain_step(
-            host_lora, gl.d_a, gl.d_b, 0, n_adapters, step + 1,
-            cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay, ctx,
-            clip_scale,
-        )
+        # ── OPTIMIZER SEAM (C13): default AdamW (fused) OR the levers path
+        # (automagic3 etc.). levers_optimizer_step_host reads the already-host-clipped
+        # gl.d_a/d_b (clip ran above via _clip_lists in the default non-GPU-clip path)
+        # and does the automagic3 step + its stochastic-rounding bf16 writeback. The
+        # fused AdamW keeps the clip_scale fold. ─────────────────────────────────
+        if levers_optimizer_active(cfg):
+            levers_optimizer_step_host(
+                cfg, host_lora, gl.d_a, gl.d_b, step + 1, cfg.lr, 0, n_adapters,
+                opt_state,
+            )
+        else:
+            fused_lora_adamw_plain_step(
+                host_lora, gl.d_a, gl.d_b, 0, n_adapters, step + 1,
+                cfg.lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay, ctx,
+                clip_scale,
+            )
         comptime if KREA2_PHASE_TIMING:
-            _ot = _phase_ms("optimizer_adamw", _ot, ctx)
+            _ot = _phase_ms("optimizer", _ot, ctx)
 
         print(step, "  ", idx, "  ", lt, "  ", sigma, "  ", so.loss, "  ", gn)
         ctx.synchronize()   # per-STEP async free discipline: reclaim this step's tensors

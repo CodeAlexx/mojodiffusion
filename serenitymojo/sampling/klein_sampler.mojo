@@ -50,6 +50,7 @@ from serenitymojo.models.vae.klein_decoder import KleinVaeDecoder
 from serenitymojo.models.vae.klein_tiled_decode import klein_tiled_decode
 from serenitymojo.ops.tensor_algebra import (
     permute, reshape, reshape_owned, add, mul_scalar, concat, slice,
+    scalar_f32_device,
 )
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
@@ -279,7 +280,7 @@ def _denoise_lora_from_initial[
     progress_fd: Int32 = Int32(-1),
 ) raises -> Tensor:
     var st = SafeTensors.open(cfg.checkpoint)
-    var seed_ts = Tensor.from_host([Float32(500.0)], [1], STDtype.F32, ctx)
+    var seed_ts = scalar_f32_device(Float32(500.0), ctx)
     var seed_vec_silu = build_klein_vec_silu(st, seed_ts, cfg.timestep_dim, cfg.d_model, ctx)
     var base = load_klein_stack_base(st, seed_vec_silu, cfg.d_model, ctx)
     var mod_weights = load_klein_step_mod_weights(st, cfg.d_model, ctx)
@@ -407,7 +408,7 @@ def _denoise_lora_reference_from_initial[
     comptime assert S == N_TXT + N_COMBINED, "S must be text+target+reference"
 
     var st = SafeTensors.open(cfg.checkpoint)
-    var seed_ts = Tensor.from_host([Float32(500.0)], [1], STDtype.F32, ctx)
+    var seed_ts = scalar_f32_device(Float32(500.0), ctx)
     var seed_vec_silu = build_klein_vec_silu(st, seed_ts, cfg.timestep_dim, cfg.d_model, ctx)
     var base = load_klein_stack_base(st, seed_vec_silu, cfg.d_model, ctx)
     var mod_weights = load_klein_step_mod_weights(st, cfg.d_model, ctx)

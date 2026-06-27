@@ -635,6 +635,36 @@ def _ews_kernel_f16(
         o[i] = rebind[o.element_type](rv.cast[DType.float16]())
 
 
+def _fill_kernel_f32(
+    o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    value: Float32,
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        o[i] = rebind[o.element_type](value)
+
+
+def _fill_kernel_bf16(
+    o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    value: Float32,
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        o[i] = rebind[o.element_type](value.cast[DType.bfloat16]())
+
+
+def _fill_kernel_f16(
+    o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin],
+    value: Float32,
+    n: Int,
+):
+    var i = Int(global_idx.x)
+    if i < n:
+        o[i] = rebind[o.element_type](value.cast[DType.float16]())
+
+
 def _add_in_place_kernel[dtype: DType](
     dst: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
     src: LayoutTensor[dtype, _DYN1, MutAnyOrigin],
@@ -819,14 +849,98 @@ def add_scalar_slab(
     return _binary_scalar_slab(a, s, _OP_ADD, ctx, slab)
 
 
+def _numel_for_new_tensor(shape: List[Int], op_name: String) raises -> Int:
+    var n = 1
+    for i in range(len(shape)):
+        if shape[i] < 0:
+            raise Error(op_name + ": negative shape dimension")
+        n *= shape[i]
+    return n
+
+
+def _fill_into_buffer(
+    out_buf: DeviceBuffer[DType.uint8],
+    n: Int,
+    value: Float32,
+    dtype: STDtype,
+    ctx: DeviceContext,
+) raises:
+    if n == 0:
+        return
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    var dt = dtype.to_mojo_dtype()
+    if dt == DType.float32:
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_fill_kernel_f32, _fill_kernel_f32](
+            O, value, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    elif dt == DType.bfloat16:
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_fill_kernel_bf16, _fill_kernel_bf16](
+            O, value, n, grid_dim=grid, block_dim=_BLOCK
+        )
+    else:
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_fill_kernel_f16, _fill_kernel_f16](
+            O, value, n, grid_dim=grid, block_dim=_BLOCK
+        )
+
+
+def full_device(
+    var shape: List[Int], value: Float32, dtype: STDtype, ctx: DeviceContext
+) raises -> Tensor:
+    """Allocate a device Tensor filled by a GPU kernel, without host staging.
+
+    Use this for constants, masks, and scheduler/timestep tensors in inference
+    and validation sampler hot loops. It intentionally does not synchronize; the
+    next same-stream consumer observes the fill, and `.to_host()` remains the
+    explicit host boundary.
+    """
+    var n = _numel_for_new_tensor(shape, String("full_device"))
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
+    _fill_into_buffer(out_buf, n, value, dtype, ctx)
+    return Tensor(out_buf^, shape^, dtype)
+
+
+def full_device_slab(
+    var shape: List[Int],
+    value: Float32,
+    dtype: STDtype,
+    ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> Tensor:
+    """StepSlab variant of `full_device`; same fill kernel, slab allocation."""
+    var n = _numel_for_new_tensor(shape, String("full_device_slab"))
+    var out_buf = slab.alloc(n * dtype.byte_size())
+    _fill_into_buffer(out_buf, n, value, dtype, ctx)
+    return Tensor(out_buf^, shape^, dtype)
+
+
+def scalar_device(value: Float32, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
+    """One-element device Tensor filled without `Tensor.from_host([value])`."""
+    var shape = List[Int]()
+    shape.append(1)
+    return full_device(shape^, value, dtype, ctx)
+
+
+def scalar_f32_device(value: Float32, ctx: DeviceContext) raises -> Tensor:
+    """One-element F32 device Tensor for scheduler/timestep model inputs."""
+    return scalar_device(value, STDtype.F32, ctx)
+
+
 def zeros_device_slab(
     var shape: List[Int], dtype: STDtype, ctx: DeviceContext, mut slab: StepSlab
 ) raises -> Tensor:
     """StepSlab variant of `zeros_device` (this file :693) — same zero-fill, only
     the buffer comes from the slab (contract C8, Phase P4)."""
-    var n = 1
-    for i in range(len(shape)):
-        n *= shape[i]
+    var n = _numel_for_new_tensor(shape, String("zeros_device_slab"))
     var out_buf = slab.alloc(n * dtype.byte_size())
     out_buf.enqueue_fill(UInt8(0))
     return Tensor(out_buf^, shape^, dtype)
@@ -857,9 +971,7 @@ def zeros_device(
     var shape: List[Int], dtype: STDtype, ctx: DeviceContext
 ) raises -> Tensor:
     """Allocate a zero-filled device Tensor without staging a host List."""
-    var n = 1
-    for i in range(len(shape)):
-        n *= shape[i]
+    var n = _numel_for_new_tensor(shape, String("zeros_device"))
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](n * dtype.byte_size())
     out_buf.enqueue_fill(UInt8(0))
     return Tensor(out_buf^, shape^, dtype)

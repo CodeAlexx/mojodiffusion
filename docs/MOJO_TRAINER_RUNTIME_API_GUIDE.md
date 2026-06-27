@@ -29,6 +29,11 @@ numbers, but runtime prepare/train/sample code must stay Mojo.
 - Treat `to_host()` in a hot model loop as a performance bug unless the file is
   an explicit parity gate. Host-list block APIs are useful for proof; production
   loops need tensor-resident forward/backward paths.
+- Do not build timestep, guidance, mask, zero, or scalar constants in hot loops
+  with `Tensor.from_host([value], ...)`. `Tensor.from_host` synchronizes to make
+  the staged host buffer lifetime safe. Use `zeros_device`, `full_device`, or
+  `scalar_f32_device` from `ops/tensor_algebra.mojo` for runtime constants that
+  can be produced directly on the GPU.
 
 ## Z-Image LoRA Lessons - 2026-06-02
 
@@ -276,6 +281,7 @@ Decision table:
 | Need | Use |
 | --- | --- |
 | Tensor must survive across blocks, steps, or optimizer updates | Fresh `Tensor` / owned state |
+| Hot-loop scalar/constant/mask tensor | `scalar_f32_device`, `full_device`, or `zeros_device` |
 | Block-local temp, same stream, known frame lifetime | `ScratchRingAllocator` |
 | Large base weights cannot remain resident | Planned/turbo offloader |
 | Parity/debug host comparison | `to_host()` in parity-only code |

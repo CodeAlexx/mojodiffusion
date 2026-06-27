@@ -57,12 +57,9 @@ from serenitymojo.io.safetensors import SafeTensors
 comptime TArc = ArcPointer[Tensor]
 
 
-# ── F32 zero tensor with the same shape as `t` ───────────────────────────────
+# ── device-side zero tensors matching optimizer/training state shapes ───────
 def _zeros_like_f32(t: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var z = List[Float32]()
-    for _ in range(t.numel()):
-        z.append(Float32(0.0))
-    return Tensor.from_host(z^, t.shape(), STDtype.F32, ctx)
+    return zeros_device(t.shape(), STDtype.F32, ctx)
 
 
 def _zeros_like_bf16(t: Tensor, ctx: DeviceContext) raises -> Tensor:

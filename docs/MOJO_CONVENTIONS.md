@@ -54,6 +54,7 @@ wrong is a compile error, not a runtime bug.
 | `comptime` not `alias` | compile-time consts are `comptime X = ...` | `autograd.mojo:48-60` (`comptime TArc`, `comptime OP_ADD = 0`) |
 | `STDtype.F32` is a VALUE | NOT `STDtype.f32()` — it's an enum value, no call | handoff §4; `io/dtype.mojo` |
 | `from_host` arg order | `from_host(values, shape, dtype, ctx)` — **values first, ctx last** | handoff §4; `tensor.mojo` ctor block |
+| hot-loop constants | use `zeros_device`, `full_device`, or `scalar_f32_device`; do not use `Tensor.from_host([scalar])` in denoise/train loops | `ops/tensor_algebra.mojo` |
 | no-bias linear | `linear(x, w, Optional[Tensor](), ctx)` — pass an empty Optional for the bias | handoff §4 |
 | `ref` is a RESERVED WORD | never name a variable `ref` | handoff §4 |
 | `List.copy()` may be missing | write a small helper if a deep copy is needed | handoff §4 |
@@ -149,6 +150,13 @@ Every `Tensor` stores raw bytes in a `DeviceBuffer[DType.uint8]`
 `ops/reduce_backward.mojo` header: "device buffers are DType.uint8, bitcast to
 Float32 at the LayoutTensor boundary"). This keeps `Tensor` monomorphic — no
 dtype type-parameter threaded through every module.
+
+Use device-side construction for production constants. `Tensor.from_host` is a
+host upload path and synchronizes to protect the staged host buffer lifetime, so
+it is wrong inside sampler denoise loops for `[t]`, CFG constants, masks, and
+zero tensors. Use `zeros_device`, `full_device`, or `scalar_f32_device` from
+`ops/tensor_algebra.mojo`; those allocate the raw byte buffer and fill it on the
+GPU with same-stream ordering.
 
 ### F32 interior, storage dtype only at the edges
 Every `ops/*_backward.mojo` runs **F32 interior** (matmuls accumulate F32,

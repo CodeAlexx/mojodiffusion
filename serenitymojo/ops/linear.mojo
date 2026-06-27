@@ -184,11 +184,15 @@ def linear(
     weight: Tensor,
     bias: Optional[Tensor],
     ctx: DeviceContext,
+    transpose_b: Bool = True,
 ) raises -> Tensor:
-    """y = x @ weightᵀ + bias.
+    """y = x @ weightᵀ + bias  (transpose_b=True, the default), or
+       y = x @ weight  + bias  (transpose_b=False).
 
     x:      [..., in]            (any compute dtype; leading dims flattened to M)
-    weight: [out, in]            (PyTorch row-major; same dtype as x)
+    weight: [out, in]           when transpose_b=True (PyTorch row-major), or
+            [in, out]           when transpose_b=False (avoids a caller-side transpose;
+                                 e.g. conv im2col feeds the RSCF weight [K, Cout] directly)
     bias:   [out] or None        (same dtype as x)
     returns [..., out]           (x's dtype; F32-accumulated GEMM + bias add).
     """
@@ -199,8 +203,8 @@ def linear(
     if len(wshape) != 2:
         raise Error("linear: weight must be rank-2 [out, in]")
     var in_dim = xshape[len(xshape) - 1]
-    var out_dim = wshape[0]
-    var k = wshape[1]
+    var out_dim = wshape[0] if transpose_b else wshape[1]
+    var k = wshape[1] if transpose_b else wshape[0]
     if k != in_dim:
         raise Error(
             String("linear: weight in-dim ")
@@ -224,7 +228,8 @@ def linear(
     # GEMM into an F32 device buffer (C is M x out, row-major).
     var c_buf = ctx.enqueue_create_buffer[DType.uint8](m * out_dim * 4)
     var a_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, in_dim))
-    var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](out_dim, k))
+    # B physical layout = the weight's stored shape (works for both transpose modes).
+    var b_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](wshape[0], wshape[1]))
     var c_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         c_buf.unsafe_ptr().bitcast[Float32](), c_rl
@@ -237,7 +242,7 @@ def linear(
         var B = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             weight.buf.unsafe_ptr().bitcast[Float32](), b_rl
         )
-        matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
+        matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
     elif dt == DType.float32 and wdt == DType.bfloat16:
         var x_cast = cast_tensor(x, STDtype.BF16, ctx, False)
         var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
@@ -246,7 +251,7 @@ def linear(
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
         )
-        matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
+        matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
     elif dt == DType.float32 and wdt == DType.float16:
         var x_cast = cast_tensor(x, STDtype.F16, ctx, False)
         var A = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
@@ -255,7 +260,7 @@ def linear(
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             weight.buf.unsafe_ptr().bitcast[Float16](), b_rl
         )
-        matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
+        matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
     elif dt == DType.bfloat16:
         var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[BFloat16](), a_rl
@@ -263,7 +268,7 @@ def linear(
         var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             weight.buf.unsafe_ptr().bitcast[BFloat16](), b_rl
         )
-        matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
+        matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
     else:  # float16
         var A = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float16](), a_rl
@@ -271,7 +276,7 @@ def linear(
         var B = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             weight.buf.unsafe_ptr().bitcast[Float16](), b_rl
         )
-        matmul(ctx, C, A, B, transpose_b=True, c_row_major=True)
+        matmul(ctx, C, A, B, transpose_b=transpose_b, c_row_major=True)
 
     var out_shape = List[Int]()
     for i in range(len(xshape) - 1):

@@ -151,8 +151,10 @@ def conv2d_im2col[
     # sync removed (single-stream ordering; was kernel-trailing host stall)
 
     var col = Tensor(col_buf^, [M, K], x.dtype())          # [M, K]
-    var w2 = transpose(reshape(weight, [K, Cout], ctx), 0, 1, ctx)  # [Cout, K]
-    var y = linear(col, w2, bias, ctx)                     # [M, Cout] = col @ w2ᵀ + bias
+    # Feed the RSCF weight as [K, Cout] directly via transpose_b=False — avoids
+    # materializing a [Cout, K] copy that linear would only transpose back (MJ-0910).
+    var wk = reshape(weight, [K, Cout], ctx)               # [K, Cout] = [in, out]
+    var y = linear(col, wk, bias, ctx, transpose_b=False)  # [M, Cout] = col @ wk + bias
     return reshape(y, [N, Ho, Wo, Cout], ctx)
 
 

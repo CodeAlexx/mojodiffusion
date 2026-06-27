@@ -42,7 +42,9 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu import global_idx
+from std.gpu import global_idx, thread_idx, block_idx, barrier
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
@@ -102,12 +104,30 @@ def _colsum_kernel[dtype: DType](
     m: Int,
     out_dim: Int,
 ):
-    var j = Int(global_idx.x)
-    if j < out_dim:
-        var acc = Float32(0.0)
-        for i in range(m):
-            acc += rebind[Scalar[dtype]](grad_y[i, j]).cast[DType.float32]()
-        out_buf[j] = rebind[out_buf.element_type](acc.cast[dtype]())
+    # One block per output column; _BLOCK threads reduce over the m rows in a
+    # shared-memory tree (was one serial thread per column over all m — MJ-0912).
+    var j = Int(block_idx.x)
+    if j >= out_dim:
+        return
+    var tid = Int(thread_idx.x)
+    var sh = stack_allocation[
+        _BLOCK, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var acc = Float32(0.0)
+    var i = tid
+    while i < m:
+        acc += rebind[Scalar[dtype]](grad_y[i, j]).cast[DType.float32]()
+        i += _BLOCK
+    sh[tid] = acc
+    barrier()
+    var active = _BLOCK // 2
+    while active > 0:
+        if tid < active:
+            sh[tid] = sh[tid] + sh[tid + active]
+        barrier()
+        active //= 2
+    if tid == 0:
+        out_buf[j] = rebind[out_buf.element_type](sh[0].cast[dtype]())
 
 
 # ── d2d copy kernel (passthrough d_x for addbias) ────────────────────────────
@@ -255,7 +275,7 @@ def _colsum(grad_y: Tensor, m: Int, out_dim: Int, ctx: DeviceContext) raises -> 
         out_dim * grad_y.dtype().byte_size()
     )
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_dim))
-    var grid = (out_dim + _BLOCK - 1) // _BLOCK
+    var grid = out_dim  # one block per output column (MJ-0912 tree reduction)
     var dt = grad_y.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var gy = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
@@ -295,7 +315,7 @@ def _colsum_slab(
     var gy_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](m, out_dim))
     var out_buf = slab.alloc(out_dim * grad_y.dtype().byte_size())
     var o_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](out_dim))
-    var grid = (out_dim + _BLOCK - 1) // _BLOCK
+    var grid = out_dim  # one block per output column (MJ-0912 tree reduction)
     var dt = grad_y.dtype().to_mojo_dtype()
     if dt == DType.float32:
         var gy = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](

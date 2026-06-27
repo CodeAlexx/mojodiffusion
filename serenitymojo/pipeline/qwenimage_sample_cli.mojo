@@ -30,19 +30,17 @@
 #   HONORED at runtime:
 #     • prompt    — threaded through _encode_trimmed (runtime String, not comptime)
 #     • negative  — threaded through _encode_trimmed (runtime String, not comptime)
+#     • steps     — scheduler sigma table is built per request
+#     • cfg       — passed into CFG combine per step
+#     • seed      — passed into initial latent noise generation
 #
 #   FIXED at comptime (from qwenimage_pipeline_1024_multistep.mojo):
-#     • steps  = STEPS   (30)
-#     • cfg    = CFG     (4.0)
-#     • seed   = SEED    (UInt64(42))
 #     • width  = LW * 8  (1024, latent LW=128)
 #     • height = LH * 8  (1024, latent LH=128)
 #
 #   The Qwen-Image DiT attention shape is a comptime constant (N_IMG, N_TXT_KEPT,
-#   S_POS, S_NEG), so resolution changes require a recompile.  Steps/cfg/seed are
-#   also fixed in the denoise loop for the same reason (scheduler sigmas are
-#   comptime-derived).  When the runner gains runtime dispatch for these fields,
-#   remove them from the list above and thread from `req_prompt` below.
+#   S_POS, S_NEG), so resolution changes require a recompile.  Non-1024 sample
+#   requests fail loudly instead of silently running the wrong size.
 #
 # ──────────────────────────────────────────────────────────────────────────────
 # Generate path: REAL, not a stub.
@@ -74,6 +72,7 @@ from serenitymojo.models.text_encoder.qwen25vl_encoder import (
 )
 from serenitymojo.models.dit.qwenimage_dit import QwenImageDitOffloaded
 from serenitymojo.models.vae.qwenimage_tiled_decode import qwenimage_tiled_decode
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.layout import patchify, unpatchify
@@ -108,12 +107,6 @@ comptime S_NEG = N_IMG + N_TXT_KEPT
 comptime FRAME = 1
 comptime FH = LH // PATCH
 comptime FW = LW // PATCH
-
-# ── Sampler constants (comptime-fixed today; see header) ──
-comptime STEPS = 30
-comptime CFG = Float32(4.0)
-comptime SEED = UInt64(42)
-
 
 # ── Caption pair produced by the text encoder ──
 @fieldwise_init
@@ -206,28 +199,44 @@ def encode_captions_from_strings(
     return pos^.into_caps(neg^)
 
 
+def _trim_driver_pool(ctx: DeviceContext) raises:
+    var before = cu_mem_get_info()
+    ctx.synchronize()
+    cu_mempool_trim_current(0)
+    ctx.synchronize()
+    var after = cu_mem_get_info()
+    print(
+        "[vram] after text encode trim: used",
+        before.used_bytes() // (1024 * 1024), "->",
+        after.used_bytes() // (1024 * 1024), "MiB",
+        "free", after.free_bytes // (1024 * 1024), "MiB",
+    )
+
+
 # Build initial latent packed tensor.
-def initial_latent_packed(ctx: DeviceContext) raises -> Tensor:
+def initial_latent_packed(ctx: DeviceContext, seed: UInt64) raises -> Tensor:
     var nchw_shape = List[Int]()
     nchw_shape.append(1)
     nchw_shape.append(16)
     nchw_shape.append(LH)
     nchw_shape.append(LW)
-    var noise = randn(nchw_shape^, SEED, STDtype.BF16, ctx)
+    var noise = randn(nchw_shape^, seed, STDtype.BF16, ctx)
     return patchify(noise, PATCH, ctx)
 
 
-# CFG denoise loop (STEPS/CFG/SEED are comptime-fixed; see header).
-def denoise(caps: QwenCaps, ctx: DeviceContext) raises -> Tensor:
+# CFG denoise loop. Shape remains comptime-fixed; schedule/cfg/seed are runtime.
+def denoise(
+    caps: QwenCaps, steps: Int, cfg: Float32, seed: UInt64, ctx: DeviceContext
+) raises -> Tensor:
     print("[denoise] loading Qwen-Image MMDiT (block-streamed)")
     var model = QwenImageDitOffloaded.load(DIT_DIR, ctx)
-    var sched = Scheduler.qwen(STEPS, Float32(N_IMG))
+    var sched = Scheduler.qwen(steps, Float32(N_IMG))
     var sigmas = sched.sigmas()
-    print("[denoise]", STEPS, "steps, CFG", CFG, "seed", SEED)
+    print("[denoise]", steps, "steps, CFG", cfg, "seed", seed)
     print("  real_pos=", caps.real_pos, "real_neg=", caps.real_neg)
-    var x = initial_latent_packed(ctx)
-    for i in range(STEPS):
-        print("  step", i + 1, "/", STEPS, "sigma", sigmas[i], "->", sigmas[i + 1])
+    var x = initial_latent_packed(ctx, seed)
+    for i in range(steps):
+        print("  step", i + 1, "/", steps, "sigma", sigmas[i], "->", sigmas[i + 1])
         var preds = model.forward_cfg_mixed_text[
             N_IMG, N_TXT_KEPT, S_POS, N_TXT_KEPT, S_NEG
         ](
@@ -235,7 +244,7 @@ def denoise(caps: QwenCaps, ctx: DeviceContext) raises -> Tensor:
             caps.real_pos, caps.real_neg,
             FRAME, FH, FW, ctx,
         )
-        var pred = cfg_qwen(preds.pos, preds.neg, CFG, ctx)
+        var pred = cfg_qwen(preds.pos, preds.neg, cfg, ctx)
         x = sched.step(x, pred, i, ctx)
     return x^
 
@@ -253,23 +262,23 @@ def _select_prompt(sample_cfg: SamplePromptConfig, wanted: String) raises -> Sam
     raise Error(String("qwenimage_sample_cli: prompt id not found: ") + wanted)
 
 
-def _load_prompt_json(
-    path: String, wanted: String,
-    mut prompt: String, mut negative: String,
-) raises:
+def _load_prompt_json(path: String, wanted: String) raises -> SamplePrompt:
     var sample_cfg = read_sample_prompt_config(path)
     var p = _select_prompt(sample_cfg, wanted)
     if p.frames != 1:
         raise Error("qwenimage_sample_cli: only image prompts (frames=1) are supported")
-    prompt = p.prompt.copy()
-    negative = p.negative.copy()
-    # steps/cfg/seed/width/height are comptime-fixed today; log what the JSON
-    # requested so the caller knows what was ignored.
+    if p.width != LW * 8 or p.height != LH * 8:
+        raise Error(
+            String("qwenimage_sample_cli: this runner is compiled for 1024x1024, got ")
+            + String(p.width) + String("x") + String(p.height)
+        )
+    if p.steps <= 0:
+        raise Error("qwenimage_sample_cli: steps must be > 0")
     print(
-        "  [info] sample prompt requests steps=", p.steps, "cfg=", p.cfg,
+        "  [info] sample prompt honored: steps=", p.steps, "cfg=", p.cfg,
         "seed=", p.seed, "size=", p.width, "x", p.height,
-        "→ all ignored (comptime fixed); prompt + negative honored.",
     )
+    return p^
 
 
 # ── Main entry ──────────────────────────────────────────────────────────────
@@ -307,10 +316,10 @@ def main() raises:
     # argv[5]: output PNG
     var out_png = String(a[5])
 
-    # Load prompt + negative from the JSON.
-    var prompt = String("")
-    var negative = String("")
-    _load_prompt_json(prompts_json, prompt_id, prompt, negative)
+    # Load runtime sample request from the JSON.
+    var req_prompt = _load_prompt_json(prompts_json, prompt_id)
+    var prompt = req_prompt.prompt.copy()
+    var negative = req_prompt.negative.copy()
 
     print("=== Qwen-Image sample CLI ===")
     print("  prompts:", prompts_json, " id:", prompt_id)
@@ -324,9 +333,10 @@ def main() raises:
     # Encode runtime prompt + negative (the key difference from the standalone
     # runner — we are NOT using the PROMPT/NEGATIVE comptime constants).
     var caps = encode_captions_from_strings(prompt, negative, ctx)
+    _trim_driver_pool(ctx)
 
-    # Denoise (STEPS/CFG/SEED are comptime-fixed; see file header).
-    var tokens = denoise(caps, ctx)
+    # Denoise (shape is comptime-fixed; steps/cfg/seed come from sample JSON).
+    var tokens = denoise(caps, req_prompt.steps, req_prompt.cfg, req_prompt.seed, ctx)
 
     # VAE decode.
     print("[vae] unpack + tiled decode")

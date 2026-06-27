@@ -22,10 +22,11 @@
 # Residency model (24 GB GPU, one big model at a time):
 #   * The Qwen3 encoder (~16 GB for 9B / ~8 GB for 4B) is loaded -> used -> freed
 #     INSIDE the ENCODE tick (Movable-not-Copyable Qwen3Encoder drops at scope
-#     exit). Only the tiny pos/neg conditioning Tensors ([512,joint] BF16 ~12 MB
+#     exit in _encode_text_pair). The runtime then trims the CUDA pool before
+#     SAMPLE. Only the tiny pos/neg conditioning Tensors ([512,joint] BF16 ~12 MB
 #     each for 9B) survive into the SAMPLE tick — so the encoder and the Klein
-#     DiT NEVER co-reside, exactly like the SDXL/Qwen-Image backends free their
-#     encoders before the denoiser loads.
+#     DiT do not intentionally co-reside, exactly like the SDXL/Qwen-Image
+#     backends free their encoders before the denoiser loads.
 #   * klein_sample itself is STAGED internally: it loads the base stack + LoRA,
 #     denoises, FREES the stack (RAII on return from _denoise_lora) BEFORE the
 #     KleinVaeDecoder loads. Nothing is left resident across jobs here (the DiT
@@ -222,6 +223,41 @@ def _tokenize_512(tok: Qwen3Tokenizer, label: String, prompt: String) raises -> 
         ids.append(PAD_ID)
     print("[klein_runtime] ", label, " tokens ", len(ids_full), " -> ", SEQ)
     return ids^
+
+
+@fieldwise_init
+struct KleinTextPair(Movable):
+    var pos: Tensor
+    var neg: Tensor
+
+
+def _encode_text_pair(
+    variant: String, prompt: String, negative: String, joint: Int, ctx: DeviceContext
+) raises -> KleinTextPair:
+    """Load Qwen3, encode both captions, and return only the reshaped text
+    tensors. Keeping this in a helper makes the encoder lifetime end before the
+    caller trims the CUDA pool and starts Klein sampling."""
+    var qwen_dir = _qwen_dir_for_variant(variant)
+    var qwen_cfg = _qwen_cfg_for_variant(variant)
+    _require_file(String("Qwen3 tokenizer"), qwen_dir + String("/tokenizer.json"))
+
+    var tok = Qwen3Tokenizer(qwen_dir + String("/tokenizer.json"))
+    var enc = Qwen3Encoder.load(qwen_dir, qwen_cfg, ctx)
+
+    var pos_ids = _tokenize_512(tok, String("pos"), prompt)
+    var neg_ids = _tokenize_512(tok, String("neg"), negative)
+    # encode_klein -> [1, 512, joint]; reshape to [N_TXT, joint] (the shape
+    # klein_sample's pos_txt/neg_txt expect, exactly as klein_sample_cli's
+    # _load_pos_txt/_load_neg_txt do).
+    var pos_full = enc.encode_klein(pos_ids, ctx)
+    var neg_full = enc.encode_klein(neg_ids, ctx)
+
+    var txt_sh = List[Int]()
+    txt_sh.append(N_TXT)
+    txt_sh.append(joint)
+    var pos2 = reshape(pos_full, txt_sh.copy(), ctx)
+    var neg2 = reshape(neg_full, txt_sh.copy(), ctx)
+    return KleinTextPair(pos2^, neg2^)
 
 
 def _embed_genparams_in_png(path: String, params_json: String) raises:
@@ -451,41 +487,32 @@ struct KleinRuntimeBackend(GenBackend, Movable):
     def _encode(mut self) raises:
         """Qwen3 tokenize+encode of params.prompt AND params.negative INLINE.
         Encoder + tokenizer load -> encode_klein -> reshape to [N_TXT, joint] ->
-        encoder drops at scope exit (freed before the Klein DiT loads in SAMPLE).
+        encoder drops when _encode_text_pair returns, then the pool is trimmed
+        before the Klein DiT loads in SAMPLE.
         Mirrors klein9b_precache_sample_prompts._encode_one, but the embeddings
         land in device Tensors (kept in ArcPointers), not cap-cache .bin files."""
         var t0 = perf_counter_ns()
         self._record_vram()
         var joint = self.cfg[0][].joint_attention_dim
-        var qwen_dir = _qwen_dir_for_variant(self.variant)
-        var qwen_cfg = _qwen_cfg_for_variant(self.variant)
-        _require_file(String("Qwen3 tokenizer"), qwen_dir + String("/tokenizer.json"))
-
-        var tok = Qwen3Tokenizer(qwen_dir + String("/tokenizer.json"))
-        var enc = Qwen3Encoder.load(qwen_dir, qwen_cfg, self.ctx)
-
-        var pos_ids = _tokenize_512(tok, String("pos"), self.params.prompt)
-        var neg_ids = _tokenize_512(tok, String("neg"), self.params.negative)
-        # encode_klein -> [1, 512, joint]; reshape to [N_TXT, joint] (the shape
-        # klein_sample's pos_txt/neg_txt expect, exactly as klein_sample_cli's
-        # _load_pos_txt/_load_neg_txt do).
-        var pos_full = enc.encode_klein(pos_ids, self.ctx)
-        var neg_full = enc.encode_klein(neg_ids, self.ctx)
-
-        var txt_sh = List[Int]()
-        txt_sh.append(N_TXT)
-        txt_sh.append(joint)
-        var pos2 = reshape(pos_full, txt_sh.copy(), self.ctx)
-        var neg2 = reshape(neg_full, txt_sh.copy(), self.ctx)
+        var pair = _encode_text_pair(
+            self.variant, self.params.prompt, self.params.negative, joint, self.ctx
+        )
 
         self.pos_txt = List[ArcPointer[Tensor]]()
         self.neg_txt = List[ArcPointer[Tensor]]()
-        self.pos_txt.append(ArcPointer(pos2^))
-        self.neg_txt.append(ArcPointer(neg2^))
-        # tok/enc drop here (Movable-not-Copyable -> Qwen3 encoder weights freed).
+        self.pos_txt.append(ArcPointer(pair.pos^))
+        self.neg_txt.append(ArcPointer(pair.neg^))
+
+        var before = cu_mem_get_info()
+        self.ctx.synchronize()
+        cu_mempool_trim_current(0)
+        self.ctx.synchronize()
+        var after = cu_mem_get_info()
         self.encode_seconds = Float64(perf_counter_ns() - t0) / 1.0e9
         self._record_vram()
-        print("[klein_runtime] Qwen3 encode done; encoder freed before DiT load")
+        print("[klein_runtime] Qwen3 encode done; encoder freed before DiT load; used",
+              before.used_bytes() // (1024 * 1024), "->",
+              after.used_bytes() // (1024 * 1024), "MiB after trim")
 
     def _write_result_manifest(mut self, png_path: String) raises -> String:
         self._record_vram()

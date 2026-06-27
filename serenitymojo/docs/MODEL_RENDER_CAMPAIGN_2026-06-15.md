@@ -22,12 +22,12 @@ half; the backend half is per-model porting work.
 
 | Model | Real prompt encode today | Has backend | Fits 24 GB | Gap to render-in-UI | Effort |
 |---|---|---|---|---|---|
-| **qwen** | ✅ Qwen2.5-VL (measured) | ✅ qwenimage_backend | offload, **too slow** | WIRED (17f3e22); offloaded DiT >17 min/img — needs offload-perf | done(slow) |
+| **qwen** | ✅ Qwen2.5-VL (measured) | ✅ qwenimage_backend + sample CLI | offload, **too slow** | WIRED (17f3e22); sample CLI now honors steps/cfg/seed and trims after encode; offloaded DiT remains the perf blocker | done(slow) |
 | **sdxl** | ❌ cached CLIP embeds | ❌ | ✅ 4.8 GB (fast) | new backend wiring ported CLIP-L/G encode + worker | **M — best next** |
 | **flux-dev** | ✅ real CLIP+T5 (flux_sample_cli) | ❌ | ~23 GB tight | new backend wrapping flux_sample_cli encode/denoise + worker | M |
 | **sd3.5** | ❌ cached (encoders verified) | ❌ | ✅ 16 GB | encode-assembly fn (CLIP-L+CLIP-G+T5) + new backend + worker | L |
 | **anima** | ❌ cached (tokenizers unported) | ❌ | ✅ | port Qwen3/T5 tok + encode + new backend + worker | L |
-| **klein** | ❌ two-stage precache | klein_backend (cached) | ✅ | on-the-fly Qwen3 encode inside backend (no precache) + worker | L |
+| **klein** | ✅ inline Qwen3 encode | ✅ klein_backend + klein_runtime_backend | ✅ | runtime backend trims after Qwen3 encode before sampler load; quality/speed parity still experimental | done(experimental) |
 | **sensenova** | ✅ real Qwen3 (hardcoded prompt) | ❌ | ✅ 512² | fetch weight shards + JobParams.prompt + new backend + worker | L |
 | **ms-lens** | ❌ zeroed GPT-OSS features | ❌ | ✅ | port GPT-OSS encoder (hardest) + sample_cli + backend + worker | L |
 
@@ -43,7 +43,9 @@ half; the backend half is per-model porting work.
 
 **Wired but not UI-practical / blocked (committed honestly):**
 - **qwen** (17f3e22) — real Qwen2.5-VL encode + denoise run, but offloaded 54 GB DiT is
-  impractically slow on 24 GB (>17 min/img). Needs offload-perf.
+  impractically slow on 24 GB (>17 min/img). 2026-06-27 update: the sample CLI
+  now honors JSON steps/cfg/seed and trims the post-encoder CUDA pool, but the
+  remaining blocker is still DiT offload throughput.
 - **klein** (bff63cb) — real inline Qwen3 encode + all 20 steps run (~9.8 s/step) THEN
   monolithic 1024² decode OOMs. Fix: tile klein_sample's VAE decode.
 - **sensenova** (bff63cb) — compiles, real Qwen3 encode, pixel-space decode; WEIGHT SHARDS

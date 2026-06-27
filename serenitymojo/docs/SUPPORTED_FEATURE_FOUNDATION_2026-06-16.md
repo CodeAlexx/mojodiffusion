@@ -707,3 +707,9 @@ Klein still has two limits:
   rebuilt in this session because interactive Mojo builds are forbidden here.
   Existing Klein artifacts therefore have server-side result evidence but no
   worker sidecar until the capped worker build/install path runs.
+
+2026-06-27 update: `klein_runtime_backend.mojo` now scopes inline Qwen3 encoding
+through `_encode_text_pair`, keeps only the small pos/neg text tensors, and
+trims the CUDA pool before entering `klein_sample`. A capped product-daemon
+compile to `/tmp/serenity_daemon_qwen_klein_verify` passed; installed historical
+artifacts remain older evidence unless regenerated.

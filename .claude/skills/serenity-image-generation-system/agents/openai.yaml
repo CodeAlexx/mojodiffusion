@@ -1,0 +1,4 @@
+interface:
+  display_name: "Serenity Image Generation"
+  short_description: "Run and code Serenity Mojo image generation paths"
+  default_prompt: "Use $serenity-image-generation-system to run, debug, or extend a Serenity Mojo image-generation path."

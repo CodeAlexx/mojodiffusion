@@ -17,12 +17,12 @@ ln -sf "$CUDNN/lib/libcudnn.so.9" lib/cudnn_stubs/libcudnn.so
 
 g++ -shared -fPIC -std=c++17 -O2 \
   -I "$FRONTEND" -I "$CUDNN/include" -I "$CUDA_HOME/include" \
-  cudnn_sdpa.cpp cudnn_sdpa_bwd.cpp \
-  -L lib/cudnn_stubs -lcudnn -L "$CUDA_HOME/lib64" -lcudart -lnvrtc \
+  cudnn_sdpa.cpp cudnn_sdpa_bwd.cpp cublas_gemm.cpp \
+  -L lib/cudnn_stubs -lcudnn -L "$CUDA_HOME/lib64" -lcudart -lnvrtc -lcublas \
   -Wl,-rpath,"$CUDNN/lib" -Wl,-rpath,"$CUDA_HOME/lib64" \
   -Wno-deprecated-declarations -Wno-unused-parameter -Wno-unused-variable \
   -Wno-sign-compare -Wno-reorder \
   -o lib/libserenity_cudnn_sdpa.so
 
 echo "built: $(ls -la lib/libserenity_cudnn_sdpa.so)"
-nm -D lib/libserenity_cudnn_sdpa.so | grep flame_cudnn
+nm -D lib/libserenity_cudnn_sdpa.so | grep -E 'flame_cudnn|serenity_cublas'

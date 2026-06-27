@@ -149,7 +149,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         starting_jobs = job_count(base_url)
         report["starting_job_count"] = starting_jobs
         cases = [
-            ("qwen_image", "qwen-image-2512", ("qwen", "not runnable", "metadata/preflight-only")),
+            ("qwen_image_edit", "qwen-image-edit-2511", ("qwen", "not runnable")),
             ("ltx2_video", "ltx2-t2v-av", ("ltx", "not runnable")),
         ]
         all_prequeue = True

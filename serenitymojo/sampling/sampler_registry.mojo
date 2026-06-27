@@ -107,9 +107,11 @@ def sampler_backend_for_model(model_name: String, default_backend: String) -> St
         or m.find("z_image_l2p") >= 0
         or m.find("l2p") >= 0
         or m.find("ltx") >= 0
-        or m.find("qwen") >= 0
+        or (m.find("qwen") >= 0 and m.find("edit") >= 0)
     ):
         return String("disabled")
+    if m.find("qwen") >= 0:
+        return String("qwenimage")
     if m.find("ideogram") >= 0:
         return String("ideogram4")
     if m.find("sdxl") >= 0 or m.find("stable-diffusion-xl") >= 0 or m.find("animagine") >= 0:
@@ -269,6 +271,15 @@ def sampler_admission_for_backend(
             ),
         )
     if b == "qwenimage":
+        if normalized == "euler" or normalized == "flowmatch_euler":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("qwenimage_flowmatch_euler"),
+                String("backend executes the bounded Qwen-Image Euler/simple flow-match path"),
+            )
         return SamplerAdmission(
             False,
             b,
@@ -276,9 +287,9 @@ def sampler_admission_for_backend(
             normalized,
             String(""),
             String(
-                "Qwen-Image is metadata/preflight-only in this product slice; "
-                + "no sampler is admitted until artifact, timing, VRAM, and "
-                + "sampler evidence passes"
+                "Qwen-Image currently supports only euler/flowmatch_euler over "
+                + "its simple flow-match schedule; other Comfy sampler catalog "
+                + "names remain fail-loud until artifact evidence exists"
             ),
         )
     if b == "ideogram4":
@@ -457,17 +468,22 @@ def scheduler_admission_for_backend(
             ),
         )
     if b == "qwenimage":
+        if normalized == "simple":
+            return SamplerAdmission(
+                True,
+                b,
+                requested,
+                normalized,
+                String("qwenimage_simple_flowmatch"),
+                String("backend executes the bounded Qwen-Image simple flow-match schedule"),
+            )
         return SamplerAdmission(
             False,
             b,
             requested,
             normalized,
             String(""),
-            String(
-                "Qwen-Image is metadata/preflight-only in this product slice; "
-                + "no scheduler is admitted until artifact, timing, VRAM, and "
-                + "sampler evidence passes"
-            ),
+            String("Qwen-Image currently admits only the simple flow-match scheduler"),
         )
     if b == "ideogram4":
         if normalized == "ideogram_logitnormal":
@@ -669,14 +685,14 @@ def swarmui_sampler_registry_json() raises -> String:
         + '"flux2","ltxv","ltxv-image","flowmatch","flow_match","qwen"]'
     )
     var zimage_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler","dpmpp_2m","dpm++ 2m","uni_pc","uni_pc_bh2"]')
-    var qwen_supported_samplers = String("[]")
+    var qwen_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
     var ideogram_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
     var sdxl_supported_samplers = String('["euler"]')
     var anima_supported_samplers = String('["euler"]')
     var sd3_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
     var flux_supported_samplers = String('["euler","flowmatch_euler","flow_match_euler"]')
     var zimage_supported_schedulers = String('["simple","flowmatch","flow_match","sgm_uniform"]')
-    var qwen_supported_schedulers = String("[]")
+    var qwen_supported_schedulers = String('["simple","flowmatch","flow_match"]')
     var ideogram_supported_schedulers = String('["logitnormal","logit_normal","ideogram_logitnormal","ideogram4_logitnormal","simple","flowmatch","flow_match","simple_flowmatch"]')
     var sdxl_supported_schedulers = String('["normal"]')
     var anima_supported_schedulers = String('["normal"]')
@@ -705,12 +721,12 @@ def swarmui_sampler_registry_json() raises -> String:
     out += _backend_json(
         String("qwenimage"),
         String("qwenimage"),
-        String(""),
-        String(""),
+        String("qwenimage_flowmatch_euler"),
+        String("qwenimage_simple_flowmatch"),
         qwen_supported_samplers,
         qwen_supported_schedulers,
         String("[]"),
-        String("Qwen-Image is metadata/preflight-only in this product slice; generation is rejected before enqueue until artifact, timing, VRAM, and sampler gates pass."),
+        String("Qwen-Image daemon admits a bounded 1024x1024 txt2img route over Euler/simple flow-match; edit, LoRA, img2img, and broad sampler/scheduler aliases remain fail-loud."),
     )
     out += String(",\n    ")
     out += _backend_json(

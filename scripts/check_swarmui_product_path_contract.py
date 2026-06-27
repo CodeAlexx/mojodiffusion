@@ -284,11 +284,11 @@ def check_swarmui_audit_doc() -> list[Check]:
             label="SwarmUI sampler parity map exists",
             needles=[
                 "`accepted_sampler_parity` must remain false",
-                "Qwen generation is metadata/preflight-only",
+                "Qwen text-to-image is admitted only as a bounded 1024x1024 Euler/simple route",
                 "`/v1/samplers` support matrix",
             ],
             severity=P0,
-            acceptance="Sampler map names current sampler/scheduler blockers, implemented variation behavior, and Qwen preflight-only status.",
+            acceptance="Sampler map names current sampler/scheduler blockers, implemented variation behavior, and Qwen bounded-route status.",
         ),
         check_contains(
             WORKFLOW_MAP_DOC,
@@ -429,7 +429,7 @@ def check_specialized_surface_blockers() -> list[Check]:
                 "unsupported scheduler",
             ],
             severity=P0,
-            acceptance="Qwen helper code remains fail-loud locally, but product admission still rejects Qwen before enqueue.",
+            acceptance="Qwen backend remains fail-loud for unsupported controls while admitting the bounded txt2img route.",
         ),
         check_contains(
             IDEOGRAM4_BACKEND,
@@ -932,7 +932,7 @@ def check_model_gallery_surface() -> list[Check]:
             label="Qwen helper keeps PNG metadata writer",
             needles=["encode_png_with_text", "serenity.genparams.v1"],
             severity=P1,
-            acceptance="Qwen metadata writing remains available in helper code, but Qwen product generation is preflight-only.",
+            acceptance="Qwen bounded product generation writes reusable PNG metadata.",
         ),
         check_contains(
             IDEOGRAM4_BACKEND,

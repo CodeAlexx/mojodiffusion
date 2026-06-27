@@ -179,10 +179,11 @@ def _bias_cast_direct_kernel_f16(
         out_buf[row, col] = rebind[out_buf.element_type](v.cast[DType.float16]())
 
 
-def linear(
+def _linear_impl(
     x: Tensor,
     weight: Tensor,
-    bias: Optional[Tensor],
+    bias_tensor: Tensor,
+    has_bias: Bool,
     ctx: DeviceContext,
     transpose_b: Bool = True,
 ) raises -> Tensor:
@@ -283,8 +284,8 @@ def linear(
         out_shape.append(xshape[i])
     out_shape.append(out_dim)
 
-    var has_bias = 1 if bias else 0
-    if dt == DType.float32 and has_bias == 0:
+    var has_bias_i = 1 if has_bias else 0
+    if dt == DType.float32 and has_bias_i == 0:
         return Tensor(c_buf^, out_shape^, x.dtype())
 
     # Output buffer in x's dtype.
@@ -293,15 +294,15 @@ def linear(
 
     # Bias stays on device. No bias -> length-1 dummy + has_bias=0 using the
     # older F32-bias kernels. Biases are stored in the same dtype as weights.
-    var bias_count = out_dim if bias else 1
+    var bias_count = out_dim if has_bias else 1
     var bias_f32_buf = ctx.enqueue_create_buffer[DType.uint8](bias_count * 4)
-    if bias:
+    if has_bias:
         if mixed_base:
-            if bias.value().dtype() != weight.dtype():
+            if bias_tensor.dtype() != weight.dtype():
                 raise Error("linear: mixed F32 activation path requires bias dtype to match weight dtype")
-        elif bias.value().dtype() != x.dtype():
+        elif bias_tensor.dtype() != x.dtype():
             raise Error("linear: bias dtype mismatch")
-        var bshape = bias.value().shape()
+        var bshape = bias_tensor.shape()
         if len(bshape) != 1 or bshape[0] != out_dim:
             raise Error(
                 String("linear: bias shape mismatch, expected [")
@@ -324,10 +325,10 @@ def linear(
         var o_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float32](), c_out_rl
         )
-        if bias:
-            if bias.value().dtype() == STDtype.F32:
+        if has_bias:
+            if bias_tensor.dtype() == STDtype.F32:
                 var B = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-                    bias.value().buf.unsafe_ptr().bitcast[Float32](), bias_rl
+                    bias_tensor.buf.unsafe_ptr().bitcast[Float32](), bias_rl
                 )
                 ctx.enqueue_function[
                     _bias_cast_direct_kernel_f32, _bias_cast_direct_kernel_f32
@@ -335,9 +336,9 @@ def linear(
                     c_lt, B, o_lt, m, out_dim,
                     grid_dim=grid, block_dim=_BLOCK,
                 )
-            elif bias.value().dtype() == STDtype.BF16:
+            elif bias_tensor.dtype() == STDtype.BF16:
                 var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                    bias.value().buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
+                    bias_tensor.buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
                 )
                 ctx.enqueue_function[
                     _bias_cast_direct_kernel_f32_from_bf16,
@@ -348,7 +349,7 @@ def linear(
                 )
             else:
                 var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                    bias.value().buf.unsafe_ptr().bitcast[Float16](), bias_rl
+                    bias_tensor.buf.unsafe_ptr().bitcast[Float16](), bias_rl
                 )
                 ctx.enqueue_function[
                     _bias_cast_direct_kernel_f32_from_f16,
@@ -359,16 +360,16 @@ def linear(
                 )
         else:
             ctx.enqueue_function[_bias_cast_kernel_f32, _bias_cast_kernel_f32](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+                c_lt, bias_lt, o_lt, m, out_dim, has_bias_i,
                 grid_dim=grid, block_dim=_BLOCK,
             )
     elif dt == DType.bfloat16:
         var o_lt = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[BFloat16](), c_out_rl
         )
-        if bias:
+        if has_bias:
             var B = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
+                bias_tensor.buf.unsafe_ptr().bitcast[BFloat16](), bias_rl
             )
             ctx.enqueue_function[
                 _bias_cast_direct_kernel_bf16, _bias_cast_direct_kernel_bf16
@@ -378,16 +379,16 @@ def linear(
             )
         else:
             ctx.enqueue_function[_bias_cast_kernel_bf16, _bias_cast_kernel_bf16](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+                c_lt, bias_lt, o_lt, m, out_dim, has_bias_i,
                 grid_dim=grid, block_dim=_BLOCK,
             )
     else:  # float16
         var o_lt = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float16](), c_out_rl
         )
-        if bias:
+        if has_bias:
             var B = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
-                bias.value().buf.unsafe_ptr().bitcast[Float16](), bias_rl
+                bias_tensor.buf.unsafe_ptr().bitcast[Float16](), bias_rl
             )
             ctx.enqueue_function[
                 _bias_cast_direct_kernel_f16, _bias_cast_direct_kernel_f16
@@ -397,13 +398,50 @@ def linear(
             )
         else:
             ctx.enqueue_function[_bias_cast_kernel_f16, _bias_cast_kernel_f16](
-                c_lt, bias_lt, o_lt, m, out_dim, has_bias,
+                c_lt, bias_lt, o_lt, m, out_dim, has_bias_i,
                 grid_dim=grid, block_dim=_BLOCK,
             )
     # TIER2-SYNC-REMOVED: single-stream enqueue serializes kernel order; the
     # downstream .to_host()/optimizer barrier is the only required sync. Output is
     # a device buffer with no host-staging buffer to protect here.
     return Tensor(out_buf^, out_shape^, x.dtype())
+
+
+def linear(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    ctx: DeviceContext,
+    transpose_b: Bool = True,
+) raises -> Tensor:
+    """y = x @ weightᵀ + bias  (transpose_b=True, the default), or
+       y = x @ weight  + bias  (transpose_b=False).
+
+    x:      [..., in]            (any compute dtype; leading dims flattened to M)
+    weight: [out, in]           when transpose_b=True (PyTorch row-major), or
+            [in, out]           when transpose_b=False (avoids a caller-side transpose;
+                                 e.g. conv im2col feeds the RSCF weight [K, Cout] directly)
+    bias:   [out] or None        (same dtype as x)
+    returns [..., out]           (x's dtype; F32-accumulated GEMM + bias add).
+    """
+    if bias:
+        return _linear_impl(x, weight, bias.value(), True, ctx, transpose_b)
+    return _linear_impl(x, weight, weight, False, ctx, transpose_b)
+
+
+def linear_bias(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    ctx: DeviceContext,
+    transpose_b: Bool = True,
+) raises -> Tensor:
+    """`linear` with a required borrowed bias tensor.
+
+    This avoids cloning tiny bias tensors at hot call sites that already own the
+    block/shared weight object for the lifetime of the enqueued kernels.
+    """
+    return _linear_impl(x, weight, bias, True, ctx, transpose_b)
 
 
 def linear_slab(

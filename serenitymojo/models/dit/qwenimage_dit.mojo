@@ -56,17 +56,19 @@
 # *** CODE-ONLY: compile-verified; NOT executed (GPU wedged). ***
 
 from std.gpu.host import DeviceContext
+from std.ffi import external_call
 from std.math import sqrt, cos as fcos, sin as fsin, exp as fexp, log as flog, pow as fpow
-from std.memory import ArcPointer
+from std.memory import alloc, ArcPointer, UnsafePointer
+from std.builtin.type_aliases import MutExternalOrigin
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
-from serenitymojo.ops.linear import linear
-from serenitymojo.ops.norm import rms_norm, layer_norm
+from serenitymojo.ops.linear import linear, linear_bias
+from serenitymojo.ops.norm import rms_norm, layer_norm_no_affine
 from serenitymojo.ops.activations import silu, gelu
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa_qwen_keymask
+from serenitymojo.ops.attention import sdpa_qwen_flash_padmask
 from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import (
@@ -77,12 +79,61 @@ from serenitymojo.ops.tensor_algebra import (
     mul,
     add_scalar,
     zeros_device,
-    full_device,
     scalar_f32_device,
 )
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.offload.plan import build_qwenimage_block_plan, OffloadConfig
+
+
+comptime QWENIMAGE_RESIDENT_PIN_MAX_BYTES = 4 * 1024 * 1024 * 1024
+comptime QWENIMAGE_RESIDENT_PIN_RESERVE_BYTES = 10 * 1024 * 1024 * 1024
+comptime _EnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
+
+
+def _env_int_or_zero(name: String) -> Int:
+    var n = name.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = name.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var ret = external_call["getenv", _EnvPtr](_EnvPtr(unsafe_from_address=Int(buf)))
+    buf.free()
+    if Int(ret) == 0:
+        return 0
+    var out = 0
+    var i = 0
+    while ret[i] != UInt8(0):
+        var ch = ret[i]
+        if ch < UInt8(48) or ch > UInt8(57):
+            return 0
+        out = out * 10 + Int(ch - UInt8(48))
+        i += 1
+    return out
+
+
+def qwenimage_resident_pin_budget(free_bytes: Int) -> Int:
+    """Opt-in VRAM budget for pinning a Qwen block prefix.
+
+    The pinned prefix avoids repeated H2D copies for early transformer blocks,
+    but Qwen still needs a large cushion for 1024px CFG activations and tiled
+    decode. The feature is disabled unless `QWENIMAGE_PIN_RESIDENT_BYTES` is a
+    positive integer. If the card is already tight this returns zero and the
+    existing streaming path remains unchanged.
+    """
+    var requested = _env_int_or_zero(String("QWENIMAGE_PIN_RESIDENT_BYTES"))
+    if requested <= 0:
+        return 0
+    if free_bytes <= QWENIMAGE_RESIDENT_PIN_RESERVE_BYTES:
+        return 0
+    var available = free_bytes - QWENIMAGE_RESIDENT_PIN_RESERVE_BYTES
+    var budget = requested
+    if budget > QWENIMAGE_RESIDENT_PIN_MAX_BYTES:
+        budget = QWENIMAGE_RESIDENT_PIN_MAX_BYTES
+    if budget > available:
+        budget = available
+    return budget
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -380,18 +431,13 @@ struct QwenImageDit(Movable):
     def _has(self, name: String) -> Bool:
         return name in self.name_to_idx
 
-    # Clone a tiny weight (bias) into an owned Tensor so it can be passed as
-    # Optional[Tensor] (Tensor not Copyable -> can't pass a borrow directly).
-    def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
-        return x.clone(ctx)
-
     # Linear with bias borrowed from the weight store.
     def _linear_b(
         self, x: Tensor, w_key: String, b_key: String, ctx: DeviceContext
     ) raises -> Tensor:
         ref w = self._w(w_key)
         ref b = self._w(b_key)
-        return linear(x, w, Optional[Tensor](self._clone(b, ctx)), ctx)
+        return linear_bias(x, w, b, ctx)
 
     def _linear_nb(
         self, x: Tensor, w_key: String, ctx: DeviceContext
@@ -403,13 +449,7 @@ struct QwenImageDit(Movable):
     def _layer_norm_no_affine(
         self, x: Tensor, ctx: DeviceContext
     ) raises -> Tensor:
-        var dim = x.shape()[len(x.shape()) - 1]
-        var dtype = x.dtype()
-        var osh = List[Int]()
-        osh.append(dim)
-        var g = full_device(osh.copy(), Float32(1.0), dtype, ctx)
-        var z = zeros_device(osh^, dtype, ctx)
-        return layer_norm(x, g, z, self.config.eps, ctx)
+        return layer_norm_no_affine(x, self.config.eps, ctx)
 
     # AdaLN modulate over a [1, N, dim] tensor with [1, dim] scale/shift vectors:
     #   out = normed * (1 + scale) + shift
@@ -577,11 +617,10 @@ struct QwenImageDit(Movable):
         k = rope_interleaved(k, pe_cos, pe_sin, ctx)
 
         # ── joint attention with Qwen text-key padding mask ──
-        # Qwen lays tokens out [TXT padded to N_TXT, IMG]. The product path used
-        # to materialize [1,H,S,S] additive masks and call math SDPA; this
-        # online key-mask path preserves the same -1e4 pad-column bias without
-        # allocating a square mask or score slab.
-        var attn = sdpa_qwen_keymask[1, S, 24, 128, N_TXT](
+        # Product BF16 inference repacks Qwen's middle text-pad span into a
+        # cuDNN tail pad and runs flash SDPA; unsupported dtypes/shapes fall
+        # back to the online key-mask parity implementation.
+        var attn = sdpa_qwen_flash_padmask[1, S, 24, 128, N_TXT](
             q, k, v, real_txt_len, scale, ctx
         )  # [1, S, H, Dh]
 
@@ -734,7 +773,7 @@ struct QwenImageDit(Movable):
         q = rope_interleaved(q, pe_cos, pe_sin, ctx)
         k = rope_interleaved(k, pe_cos, pe_sin, ctx)
 
-        var attn = sdpa_qwen_keymask[1, S, 24, 128, N_TXT](
+        var attn = sdpa_qwen_flash_padmask[1, S, 24, 128, N_TXT](
             q, k, v, real_txt_len, scale, ctx
         )
         var txt_attn = slice(attn, 1, 0, N_TXT, ctx)
@@ -907,6 +946,13 @@ struct QwenImageDitOffloaded(Movable):
             name_to_idx[e.key] = len(weights)
             weights.append(e.value)
         return QwenImageDit(weights^, name_to_idx^, self.shared.config)
+
+    def pin_resident_blocks(
+        mut self, budget_bytes: Int, ctx: DeviceContext
+    ) raises -> Int:
+        if budget_bytes <= 0:
+            return 0
+        return self.loader.pin_residents(budget_bytes, ctx)
 
     def _prepare_img(
         self,

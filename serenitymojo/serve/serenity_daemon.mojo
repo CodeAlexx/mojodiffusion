@@ -590,12 +590,12 @@ def parse_generate(
     var default_height = 512
     if (
         sampler_backend == "zimage"
+        or sampler_backend == "qwenimage"
         or sampler_backend == "ideogram4"
         or sampler_backend == "flux2"
         or sampler_backend == "sdxl"
         or sampler_backend == "anima"
         or sampler_backend == "sd3"
-        or sampler_backend == "disabled"
     ):
         default_width = 1024
         default_height = 1024

@@ -3882,7 +3882,7 @@ def check_workflow_graph_product_report() -> Check:
     if completed_qwen_edit_cases:
         ignored_qwen_historical = True
     if ignored_qwen_historical:
-        detail += "; historical Qwen/Qwen-edit workflow entries ignored while Qwen is metadata/preflight-only"
+        detail += "; historical Qwen-Edit workflow entries ignored while the edit/image-conditioning route remains blocked"
     if ideogram4_evidence:
         detail += f"; Ideogram4 visual export completed {ideogram4_job.get('id')}"
     return Check(

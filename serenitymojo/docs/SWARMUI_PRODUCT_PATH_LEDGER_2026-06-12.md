@@ -68,10 +68,10 @@ models, Ideogram negative prompts, Flux multi-LoRA, workflow-lowered image
 conditioning fields, and workflow-lowered outpaint/LanPaint fields.
 
 `/v1/preflight` now also returns a per-request `capability_profile` with schema
-`serenity.capability_profile.v1`. The no-CUDA report records six green profile
-cases: Z-Image admitted, Qwen metadata/preflight-only, Klein/Flux2 blocked,
-Ideogram negative-prompt rejection with an admitted profile, and Z-Image raw
-ControlNet rejection with an admitted profile, plus Z-Image workflow
+`serenity.capability_profile.v1`. The no-CUDA report records green profile
+cases including Z-Image admitted, Qwen bounded txt2img admitted, Klein/Flux2
+blocked, Ideogram negative-prompt rejection with an admitted profile, and
+Z-Image raw ControlNet rejection with an admitted profile, plus Z-Image workflow
 unsupported-node rejection with an admitted profile and
 `rejection_stage:"workflow_lowering"`. This keeps tools from guessing which
 feature matrix applied to a rejected request.
@@ -99,13 +99,19 @@ SwarmUI-facing generation path.
 
 Current blockers:
 
-- 2026-06-12 update: Qwen-Image product forward no longer calls masked `sdpa`.
-  It routes through `sdpa_qwen_keymask`, an online-softmax key-mask path that
-  preserves Qwen's middle-of-sequence text padding semantics without allocating
-  `[B,H,S,S]` masks or F32 score slabs. This is statically and op-parity gated;
-  full Qwen generation is not admitted in this slice; current Rust and Mojo
-  product gates keep Qwen metadata/preflight-only until separate artifact,
-  timing, VRAM, quality, and sampler evidence passes.
+- 2026-06-27 update: Qwen-Image txt2img is product-admitted only for the bounded
+  1024x1024 Euler/simple route. The runtime now keeps CFG on-device, avoids
+  per-call bias clones in Qwen linear projections, uses the shared no-affine
+  LayerNorm path, repacks Qwen middle text padding into a cuDNN flash-SDPA tail
+  pad for BF16 product attention, and can opt into resident block pinning with
+  `QWENIMAGE_PIN_RESIDENT_BYTES`. `sdpa_qwen_keymask_parity.mojo` now gates the
+  flash repack/scatter helper against the existing keymask implementation on
+  semantic rows. The Qwen sample CLI now uses the same process-death principle
+  as the worker encoder path: a self-reexec `encode-child` writes BF16 caps and
+  exits before the parent loads DiT, with observed parent VRAM before DiT at
+  `1558 MiB` used / `22520 MiB` free for the one-step 1024px smoke. This is not
+  accepted speed parity, and Qwen-Image-Edit, LoRA, img2img, and broad
+  sampler/scheduler aliases still fail loud.
 - Z-Image source routing now uses the cuDNN flash helper for no-saved inference
   forwards and has current daemon artifact/timing/VRAM evidence. Speed and full
   sampler parity are still not accepted.
@@ -153,8 +159,8 @@ Acceptance evidence:
   video/A-V artifact gates, structured LTX2 runner stage timing manifests, and
   bounded Ideogram4 PNG metadata and prequeue fail-loud option markers.
   Product P0 and tracked P1 gates are ready.
-  Full SwarmUI all-level parity remains blocked by Qwen full generation,
-  full video parity beyond DEV-smoke artifacts, advanced workflow node families, sampler breadth,
+  Full SwarmUI all-level parity remains blocked by Qwen-Edit/wider Qwen sampler
+  coverage, full video parity beyond DEV-smoke artifacts, advanced workflow node families, sampler breadth,
   and Z-Image speed parity. `images=N` now
   emits indexed serial jobs, variation noise has a runtime artifact gate, and
   `/v1/samplers` exposes a pure-Mojo SwarmUI/Comfy sampler support registry.
@@ -231,9 +237,9 @@ Acceptance evidence:
   15 catalog schedulers, and support entries for `zimage`, `qwenimage`, and
   `ideogram4`.
   Refreshed evidence from the compiled stub daemon now shows Z-Image endpoint
-  support for `euler`, `flowmatch_euler`, `flow_match_euler`, `dpmpp_2m`,
-  `dpm++ 2m`, `uni_pc`, and `uni_pc_bh2`; Qwen remains inventory-only with no
-  admitted sampler or scheduler.
+	  support for `euler`, `flowmatch_euler`, `flow_match_euler`, `dpmpp_2m`,
+	  `dpm++ 2m`, `uni_pc`, and `uni_pc_bh2`; Qwen advertises the bounded
+	  `qwenimage_flowmatch_euler` / `qwenimage_simple_flowmatch` txt2img route.
   Ideogram4 exposes bounded `euler`/flow-match aliases that execute as
   `ideogram4_logitnormal_euler`, with `logitnormal`/`logit_normal`/
   `ideogram_logitnormal`/`ideogram4_logitnormal` scheduler aliases executing as
@@ -420,9 +426,9 @@ Current status:
 - The daemon exposes `/v1/generate`, `/v1/jobs`, `/v1/job/<id>`,
   `/v1/cancel/<id>`, `/v1/models`, `/v1/health`, and WebSocket progress.
 - Stub generation was smoke-tested with PNG metadata and `jobs.db` readback.
-- Real Z-Image daemon generation now has current GPU evidence. Full Qwen daemon
-  generation is explicitly metadata/preflight-only in this slice and is rejected
-  before enqueue until separate product gates pass.
+- Real Z-Image daemon generation now has current GPU evidence. Qwen daemon
+  txt2img is admitted only for bounded 1024x1024 Euler/simple; Qwen-Image-Edit,
+  LoRA, img2img, and wider sampler/scheduler controls remain fail-loud.
 - Z-Image flat `init_image`/`creativity` now has bounded runtime artifact
   evidence through the daemon. Full image-node/mask/inpaint graph parity remains
   unaccepted.
@@ -437,9 +443,9 @@ Required implementation:
 - Add a standard daemon smoke command or script that builds with the exact link
   flags and exercises health, model scan, generate, jobs, PNG metadata, and DB
   readback.
-- Add real-backend smoke mode for admitted image routes only. Qwen remains
-  metadata/preflight-only until a separate artifact, timing, VRAM, and sampler
-  gate admits it.
+- Add real-backend smoke mode for admitted image routes only. Qwen must stay
+  scoped to the bounded 1024x1024 Euler/simple gate until artifact, timing, VRAM,
+  quality, and sampler evidence justify widening it.
 - Exercise WebSocket progress and cancel against a real backend.
 - Keep process isolation as the default path for model switching after GPU VRAM
   reclaim is proven.
@@ -860,9 +866,9 @@ Acceptance evidence:
 - `python3 scripts/check_swarmui_product_path_contract.py --write-readiness
   output/checks/swarmui_product_path_readiness.json` reports
   `checks=90 passed=90 p0=0 p1=0 p2=0`. Product P0 and tracked P1 are ready.
-  Full SwarmUI all-level parity still remains blocked by Qwen full generation
-  (now explicitly metadata/preflight-only), full video parity beyond DEV-smoke
-  artifacts, advanced workflow node families, sampler breadth,
+  Full SwarmUI all-level parity still remains blocked by Qwen-Edit/wider Qwen
+  sampler coverage, full video parity beyond DEV-smoke artifacts, advanced
+  workflow node families, sampler breadth,
   and Z-Image speed parity.
 
 ## 2026-06-16 Worker Result Sidecars for Admitted Image Workers
@@ -960,8 +966,9 @@ Limits:
   Rust-server image families. It is not accepted full SwarmUI all-level parity.
 - The sidecars still record `accepted_sampler_parity:false` and
   `accepted_speed_parity:false` where applicable.
-- Qwen full generation, SD15, Chroma, ERNIE, full video, advanced workflow
-  surfaces, and broader sampler variants remain blocked or explicitly disabled.
+- Qwen-Edit, wider Qwen sampler coverage, SD15, Chroma, ERNIE, full video,
+  advanced workflow surfaces, and broader sampler variants remain blocked or
+  explicitly disabled.
 
 ## 2026-06-16 SDXL Conditioning Artifact Gate
 
@@ -1106,9 +1113,9 @@ their current bounded production routes.
 1. Harden the bounded real-backend image smokes into acceptance-grade paths:
    Z-Image still needs speed/quality parity, Ideogram4 needs multi-step proof
    and broader request-surface coverage beyond the bounded PNG metadata/gallery
-   and fail-loud option smokes, and Qwen remains metadata/preflight-only until
-   memory, artifact, timing, VRAM, quality, and sampler evidence says a full run
-   is safe.
+   and fail-loud option smokes, and Qwen must stay within the bounded 1024x1024
+   Euler/simple route until memory, artifact, timing, VRAM, quality, and sampler
+   evidence says wider execution is safe.
 2. Replace Z-Image's two serial CFG main-stack passes with a measured faster
    path before accepting image speed parity.
 3. Promote the bounded LTX2 daemon video runner beyond DEV-smoke by adding

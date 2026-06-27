@@ -32,7 +32,13 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.ops.tensor_algebra import add, sub, mul, div, mul_scalar
 from serenitymojo.io.dtype import STDtype
 from std.gpu.host import DeviceContext
+from std.gpu import thread_idx, block_idx, barrier
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation
+from std.utils.index import IndexList
 from std.math import exp, sqrt
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 
 # F32 machine epsilon — matches the Rust `f32::EPSILON` shift-skip guard.
@@ -123,6 +129,142 @@ comptime _QWEN_MAX_SHIFT: Float32 = 0.9
 comptime _QWEN_BASE_SEQ: Float32 = 256.0
 comptime _QWEN_MAX_SEQ: Float32 = 8192.0
 comptime _QWEN_SHIFT_TERMINAL: Float32 = 0.02
+comptime _DYN2 = Layout.row_major(-1, -1)
+comptime _CFG_TPB = 256
+
+
+def _cfg_qwen_kernel_f32(
+    cond: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    uncond: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    dst: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    dim: Int,
+    scale: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var s_cond = stack_allocation[
+        _CFG_TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var s_comb = stack_allocation[
+        _CFG_TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var cond_sum: Float32 = 0.0
+    var comb_sum: Float32 = 0.0
+    var c = tid
+    while c < dim:
+        var cv = rebind[Scalar[DType.float32]](cond[row, c])
+        var uv = rebind[Scalar[DType.float32]](uncond[row, c])
+        var comb = uv + scale * (cv - uv)
+        cond_sum += cv * cv
+        comb_sum += comb * comb
+        c += _CFG_TPB
+    s_cond[tid] = cond_sum
+    s_comb[tid] = comb_sum
+    barrier()
+    var active = _CFG_TPB // 2
+    while active > 0:
+        if tid < active:
+            s_cond[tid] = s_cond[tid] + s_cond[tid + active]
+            s_comb[tid] = s_comb[tid] + s_comb[tid + active]
+        barrier()
+        active //= 2
+    var ratio = sqrt(s_cond[0]) / sqrt(s_comb[0])
+    c = tid
+    while c < dim:
+        var cv = rebind[Scalar[DType.float32]](cond[row, c])
+        var uv = rebind[Scalar[DType.float32]](uncond[row, c])
+        dst[row, c] = rebind[dst.element_type]((uv + scale * (cv - uv)) * ratio)
+        c += _CFG_TPB
+
+
+def _cfg_qwen_kernel_bf16(
+    cond: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    uncond: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    dst: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    dim: Int,
+    scale: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var s_cond = stack_allocation[
+        _CFG_TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var s_comb = stack_allocation[
+        _CFG_TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var cond_sum: Float32 = 0.0
+    var comb_sum: Float32 = 0.0
+    var c = tid
+    while c < dim:
+        var cv = rebind[Scalar[DType.bfloat16]](cond[row, c]).cast[DType.float32]()
+        var uv = rebind[Scalar[DType.bfloat16]](uncond[row, c]).cast[DType.float32]()
+        var comb = uv + scale * (cv - uv)
+        cond_sum += cv * cv
+        comb_sum += comb * comb
+        c += _CFG_TPB
+    s_cond[tid] = cond_sum
+    s_comb[tid] = comb_sum
+    barrier()
+    var active = _CFG_TPB // 2
+    while active > 0:
+        if tid < active:
+            s_cond[tid] = s_cond[tid] + s_cond[tid + active]
+            s_comb[tid] = s_comb[tid] + s_comb[tid + active]
+        barrier()
+        active //= 2
+    var ratio = sqrt(s_cond[0]) / sqrt(s_comb[0])
+    c = tid
+    while c < dim:
+        var cv = rebind[Scalar[DType.bfloat16]](cond[row, c]).cast[DType.float32]()
+        var uv = rebind[Scalar[DType.bfloat16]](uncond[row, c]).cast[DType.float32]()
+        var res = (uv + scale * (cv - uv)) * ratio
+        dst[row, c] = rebind[dst.element_type](res.cast[DType.bfloat16]())
+        c += _CFG_TPB
+
+
+def _cfg_qwen_kernel_f16(
+    cond: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
+    uncond: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
+    dst: LayoutTensor[DType.float16, _DYN2, MutAnyOrigin],
+    dim: Int,
+    scale: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var s_cond = stack_allocation[
+        _CFG_TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var s_comb = stack_allocation[
+        _CFG_TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var cond_sum: Float32 = 0.0
+    var comb_sum: Float32 = 0.0
+    var c = tid
+    while c < dim:
+        var cv = rebind[Scalar[DType.float16]](cond[row, c]).cast[DType.float32]()
+        var uv = rebind[Scalar[DType.float16]](uncond[row, c]).cast[DType.float32]()
+        var comb = uv + scale * (cv - uv)
+        cond_sum += cv * cv
+        comb_sum += comb * comb
+        c += _CFG_TPB
+    s_cond[tid] = cond_sum
+    s_comb[tid] = comb_sum
+    barrier()
+    var active = _CFG_TPB // 2
+    while active > 0:
+        if tid < active:
+            s_cond[tid] = s_cond[tid] + s_cond[tid + active]
+            s_comb[tid] = s_comb[tid] + s_comb[tid + active]
+        barrier()
+        active //= 2
+    var ratio = sqrt(s_cond[0]) / sqrt(s_comb[0])
+    c = tid
+    while c < dim:
+        var cv = rebind[Scalar[DType.float16]](cond[row, c]).cast[DType.float32]()
+        var uv = rebind[Scalar[DType.float16]](uncond[row, c]).cast[DType.float32]()
+        var res = (uv + scale * (cv - uv)) * ratio
+        dst[row, c] = rebind[dst.element_type](res.cast[DType.float16]())
+        c += _CFG_TPB
 
 
 def qwen_mu(seq_len: Float32) -> Float32:
@@ -213,6 +355,74 @@ def cfg_qwen(
     # ratio[..., 0] = ||v_cond||_lastdim / ||comb||_lastdim, broadcast over dim.
     var ratio = _l2_ratio_lastdim(v_cond, comb, ctx)
     return mul(comb, ratio, ctx)
+
+
+def cfg_qwen_device(
+    v_cond: Tensor, v_uncond: Tensor, scale: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """Device-side Qwen-Image true-CFG combine + per-row norm rescale.
+
+    Same math as `cfg_qwen`, but the combine, last-dim L2 reductions, ratio,
+    and final multiply run in one kernel. This avoids the old full-prediction
+    host roundtrip in the Qwen inference hot loop.
+    """
+    if v_cond.dtype() != v_uncond.dtype():
+        raise Error("cfg_qwen_device: dtype mismatch")
+    var cs = v_cond.shape()
+    var us = v_uncond.shape()
+    if len(cs) == 0 or len(us) != len(cs):
+        raise Error("cfg_qwen_device: rank mismatch")
+    for i in range(len(cs)):
+        if cs[i] != us[i]:
+            raise Error("cfg_qwen_device: shape mismatch")
+    var dim = cs[len(cs) - 1]
+    var rows = 1
+    for i in range(len(cs) - 1):
+        rows *= cs[i]
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](v_cond.nbytes())
+    var rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, dim))
+    if v_cond.dtype() == STDtype.F32:
+        var C = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            v_cond.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var U = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            v_uncond.buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), rl
+        )
+        ctx.enqueue_function[_cfg_qwen_kernel_f32, _cfg_qwen_kernel_f32](
+            C, U, O, dim, scale, grid_dim=rows, block_dim=_CFG_TPB
+        )
+    elif v_cond.dtype() == STDtype.BF16:
+        var C = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            v_cond.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var U = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            v_uncond.buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), rl
+        )
+        ctx.enqueue_function[_cfg_qwen_kernel_bf16, _cfg_qwen_kernel_bf16](
+            C, U, O, dim, scale, grid_dim=rows, block_dim=_CFG_TPB
+        )
+    elif v_cond.dtype() == STDtype.F16:
+        var C = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            v_cond.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var U = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            v_uncond.buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float16](), rl
+        )
+        ctx.enqueue_function[_cfg_qwen_kernel_f16, _cfg_qwen_kernel_f16](
+            C, U, O, dim, scale, grid_dim=rows, block_dim=_CFG_TPB
+        )
+    else:
+        raise Error("cfg_qwen_device: expected F32/BF16/F16 tensors")
+    return Tensor(out_buf^, cs^, v_cond.dtype())
 
 
 def _l2_ratio_lastdim(

@@ -100,13 +100,21 @@
       "backend": "qwenimage",
       "model_family": "qwenimage",
       "accepted_sampler_parity": false,
-      "executed_sampler": "",
-      "executed_scheduler": "",
-      "supported_samplers": [],
-      "supported_schedulers": [],
+      "executed_sampler": "qwenimage_flowmatch_euler",
+      "executed_scheduler": "qwenimage_simple_flowmatch",
+      "supported_samplers": [
+        "euler",
+        "flowmatch_euler",
+        "flow_match_euler"
+      ],
+      "supported_schedulers": [
+        "simple",
+        "flowmatch",
+        "flow_match"
+      ],
       "blocked_samplers": [],
       "unsupported_policy": "fail_loud",
-      "reason": "Qwen-Image is metadata/preflight-only in this product slice; generation is rejected before enqueue until artifact, timing, VRAM, and sampler gates pass."
+      "reason": "Qwen-Image daemon admits a bounded 1024x1024 txt2img route over Euler/simple flow-match; edit, LoRA, img2img, and broad sampler/scheduler aliases remain fail-loud."
     },
     {
       "backend": "ideogram4",

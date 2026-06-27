@@ -13,14 +13,11 @@ def require(cond: Bool, msg: String) raises:
 
 def main() raises:
     var qwen = sampler_admission_for_backend(String("qwenimage"), String("euler"))
-    require(not qwen.supported, String("qwen euler should stay preflight-only"))
-    require(
-        qwen.reason.find("metadata/preflight-only") >= 0,
-        String("qwen sampler rejection should explain preflight-only status"),
-    )
+    require(qwen.supported, String("qwen euler should be admitted"))
+    require(qwen.executed == "qwenimage_flowmatch_euler", String("qwen execution key mismatch"))
 
     var qwen_sched = scheduler_admission_for_backend(String("qwenimage"), String("qwen_flowmatch"))
-    require(not qwen_sched.supported, String("qwen scheduler should stay preflight-only"))
+    require(qwen_sched.supported, String("qwen scheduler should be admitted"))
     require(qwen_sched.normalized == "simple", String("qwen scheduler alias should normalize to simple"))
 
     var sd3 = sampler_admission_for_backend(String("sd3"), String("flow_match_euler"))

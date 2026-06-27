@@ -4,6 +4,7 @@ use serenity_wire::JobParams;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum ModelFamily {
     ZImage,
+    QwenImage,
     Ideogram4,
     Sdxl,
     Anima,
@@ -17,6 +18,7 @@ impl ModelFamily {
     pub(crate) fn backend_key(self) -> &'static str {
         match self {
             ModelFamily::ZImage => "zimage",
+            ModelFamily::QwenImage => "qwenimage",
             ModelFamily::Ideogram4 => "ideogram4",
             ModelFamily::Sdxl => "sdxl",
             ModelFamily::Anima => "anima",
@@ -30,6 +32,7 @@ impl ModelFamily {
     pub(crate) fn worker_binary_name(self) -> &'static str {
         match self {
             ModelFamily::ZImage => "serenity_worker_zimage",
+            ModelFamily::QwenImage => "serenity_worker_qwenimage",
             ModelFamily::Ideogram4 => "serenity_worker_ideogram4",
             ModelFamily::Sdxl => "serenity_worker_sdxl",
             ModelFamily::Anima => "serenity_worker_anima",
@@ -57,13 +60,6 @@ fn blocked_model_info(normalized_model: &str) -> Option<BlockedModelInfo> {
             backend: "qwenimage_edit",
             production_status: "blocked",
             reason: "Qwen-Image-Edit is known to the runtime docs, but the Rust server path has no production edit/image-conditioning gate yet",
-        });
-    }
-    if m.contains("qwen") {
-        return Some(BlockedModelInfo {
-            backend: "qwenimage",
-            production_status: "metadata/preflight-only",
-            reason: "Qwen/Qwen-Image execution is metadata/preflight-only in serenity-server until a production artifact, timing, VRAM, and sampler gate passes",
         });
     }
     if m.contains("zimage_l2p")
@@ -151,6 +147,9 @@ pub(crate) fn model_family(model: &str) -> Result<ModelFamily, String> {
     if m.contains("ideogram") {
         return Ok(ModelFamily::Ideogram4);
     }
+    if m.contains("qwen") {
+        return Ok(ModelFamily::QwenImage);
+    }
     if m.contains("sdxl")
         || m.contains("sd_xl")
         || m.contains("sd-xl")
@@ -217,6 +216,7 @@ pub(crate) fn normalize_scheduler_name(name: &str) -> String {
 fn default_sampler_for_family(family: ModelFamily) -> &'static str {
     match family {
         ModelFamily::ZImage
+        | ModelFamily::QwenImage
         | ModelFamily::Ideogram4
         | ModelFamily::Sdxl
         | ModelFamily::Anima
@@ -230,6 +230,7 @@ fn default_sampler_for_family(family: ModelFamily) -> &'static str {
 fn default_scheduler_for_family(family: ModelFamily) -> &'static str {
     match family {
         ModelFamily::ZImage
+        | ModelFamily::QwenImage
         | ModelFamily::Sd3
         | ModelFamily::Flux
         | ModelFamily::Flux2
@@ -246,6 +247,7 @@ fn default_size_for_family(_family: ModelFamily) -> (i64, i64) {
 fn default_steps_for_family(family: ModelFamily) -> i64 {
     match family {
         ModelFamily::ZImage => 16,
+        ModelFamily::QwenImage => 20,
         ModelFamily::Ideogram4 => 20,
         ModelFamily::Sdxl | ModelFamily::Anima | ModelFamily::Flux => 20,
         ModelFamily::Sd3 => 28,
@@ -257,6 +259,7 @@ fn default_steps_for_family(family: ModelFamily) -> i64 {
 fn default_cfg_for_family(family: ModelFamily) -> f64 {
     match family {
         ModelFamily::ZImage => 5.0,
+        ModelFamily::QwenImage => 4.0,
         ModelFamily::Ideogram4 | ModelFamily::Sdxl => 7.0,
         ModelFamily::Anima | ModelFamily::Sd3 => 4.5,
         ModelFamily::Flux | ModelFamily::Flux2 | ModelFamily::Sensenova => 4.0,
@@ -308,7 +311,8 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             admitted_shapes,
             note: "current product worker admits compiled 512 and 1024 square shapes",
         },
-        ModelFamily::Ideogram4
+        ModelFamily::QwenImage
+        | ModelFamily::Ideogram4
         | ModelFamily::Sdxl
         | ModelFamily::Anima
         | ModelFamily::Sd3
@@ -351,7 +355,8 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
 fn production_sizes_for_family(family: ModelFamily) -> &'static [(i64, i64)] {
     match family {
         ModelFamily::ZImage => ZIMAGE_SIZES,
-        ModelFamily::Ideogram4
+        ModelFamily::QwenImage
+        | ModelFamily::Ideogram4
         | ModelFamily::Sdxl
         | ModelFamily::Anima
         | ModelFamily::Sd3
@@ -364,7 +369,9 @@ fn production_sizes_for_family(family: ModelFamily) -> &'static [(i64, i64)] {
 fn supported_samplers_for_family(family: ModelFamily) -> &'static [&'static str] {
     match family {
         ModelFamily::ZImage => SAMPLERS_ZIMAGE,
-        ModelFamily::Ideogram4 | ModelFamily::Sd3 | ModelFamily::Flux => SAMPLERS_EULER_FLOWMATCH,
+        ModelFamily::QwenImage | ModelFamily::Ideogram4 | ModelFamily::Sd3 | ModelFamily::Flux => {
+            SAMPLERS_EULER_FLOWMATCH
+        }
         ModelFamily::Flux2 | ModelFamily::Sensenova => SAMPLERS_EULER,
         ModelFamily::Sdxl | ModelFamily::Anima => SAMPLERS_EULER,
     }
@@ -375,9 +382,11 @@ fn supported_schedulers_for_family(family: ModelFamily) -> &'static [&'static st
         ModelFamily::ZImage => SCHEDULERS_ZIMAGE,
         ModelFamily::Ideogram4 => SCHEDULERS_IDEOGRAM4,
         ModelFamily::Sdxl | ModelFamily::Anima => SCHEDULERS_NORMAL,
-        ModelFamily::Sd3 | ModelFamily::Flux | ModelFamily::Flux2 | ModelFamily::Sensenova => {
-            SCHEDULERS_SIMPLE
-        }
+        ModelFamily::QwenImage
+        | ModelFamily::Sd3
+        | ModelFamily::Flux
+        | ModelFamily::Flux2
+        | ModelFamily::Sensenova => SCHEDULERS_SIMPLE,
     }
 }
 
@@ -392,7 +401,8 @@ fn lora_limit_for_family(family: ModelFamily) -> Option<usize> {
     match family {
         ModelFamily::ZImage => None,
         ModelFamily::Flux | ModelFamily::Flux2 => Some(1),
-        ModelFamily::Ideogram4
+        ModelFamily::QwenImage
+        | ModelFamily::Ideogram4
         | ModelFamily::Sdxl
         | ModelFamily::Anima
         | ModelFamily::Sd3
@@ -547,6 +557,56 @@ fn reject_variation(params: &JobParams, family: ModelFamily) -> Result<(), Strin
     } else {
         Ok(())
     }
+}
+
+fn reject_qwen_runtime_overrides(params: &JobParams) -> Result<(), String> {
+    if params.cfg_override >= 0.0 {
+        return Err("qwenimage: cfg_override is not supported yet".to_string());
+    }
+    if (params.cfg_override_start_percent - 0.0).abs() > f64::EPSILON
+        || (params.cfg_override_end_percent - 1.0).abs() > f64::EPSILON
+    {
+        return Err("qwenimage: cfg_override percent window is not supported yet".to_string());
+    }
+    if (params.sigma_shift - 3.0).abs() > f64::EPSILON {
+        return Err("qwenimage: sigma_shift override is not supported yet".to_string());
+    }
+    if (params.creativity - 0.5).abs() > f64::EPSILON {
+        return Err("qwenimage: creativity/partial denoise is not supported yet".to_string());
+    }
+    if !params.sample_caps_pos.trim().is_empty() || !params.sample_caps_neg.trim().is_empty() {
+        return Err(
+            "qwenimage: pre-encoded sample caps are not supported by the live Qwen text encoder path"
+                .to_string(),
+        );
+    }
+    if params.clip_skip > 0 {
+        return Err(
+            "qwenimage: advanced sampling parameter 'clip_skip' is not supported yet".to_string(),
+        );
+    }
+    if params.eta >= 0.0 {
+        return Err(
+            "qwenimage: advanced sampling parameter 'eta' is not supported yet".to_string(),
+        );
+    }
+    if params.sigma_min >= 0.0 {
+        return Err(
+            "qwenimage: advanced sampling parameter 'sigma_min' is not supported yet".to_string(),
+        );
+    }
+    if params.sigma_max >= 0.0 {
+        return Err(
+            "qwenimage: advanced sampling parameter 'sigma_max' is not supported yet".to_string(),
+        );
+    }
+    if params.restart_sampling {
+        return Err(
+            "qwenimage: advanced sampling parameter 'restart_sampling' is not supported yet"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_sampler_scheduler(
@@ -1068,6 +1128,9 @@ pub(crate) fn validate_generate_prequeue(
                 );
             }
         }
+        ModelFamily::QwenImage => {
+            reject_qwen_runtime_overrides(params)?;
+        }
         ModelFamily::Anima | ModelFamily::Sensenova => {
             reject_variation(params, family)?;
         }
@@ -1304,6 +1367,7 @@ pub(crate) fn capability_profile_for_model(model: &str) -> JsonValue {
 pub(crate) fn generate_capabilities_v1() -> JsonValue {
     let families = [
         ModelFamily::ZImage,
+        ModelFamily::QwenImage,
         ModelFamily::Ideogram4,
         ModelFamily::Sdxl,
         ModelFamily::Anima,
@@ -1341,12 +1405,6 @@ pub(crate) fn generate_capabilities_v1() -> JsonValue {
         },
         "backends": backends,
         "blocked_families": [
-            {
-                "backend": "qwenimage",
-                "production_status": "metadata/preflight-only",
-                "policy": "fail_loud",
-                "reason": "Qwen-Image generation is rejected before enqueue until artifact, timing, VRAM, and sampler gates pass."
-            },
             {
                 "backend": "zimage_l2p",
                 "production_status": "blocked",

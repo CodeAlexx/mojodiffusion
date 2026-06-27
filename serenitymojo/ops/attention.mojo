@@ -52,6 +52,7 @@ from nn.attention.gpu.mha import flash_attention
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.autograd_v2.step_slab import StepSlab
+from serenitymojo.ops.attention_flash import sdpa_flash_fwd_padmask
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -868,6 +869,155 @@ def _sdpa_qwen_keymask_online[dtype: DType](
     var dst_row = (b * S + i) * H + h
     for d in range(Dh):
         o[dst_row, d] = rebind[o.element_type]((acc[d] * inv).cast[dtype]())
+
+
+def _qwen_compact_textpad_bf16(
+    src: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    dst: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    B: Int,
+    S: Int,
+    H: Int,
+    Dh: Int,
+    n_txt: Int,
+    real_txt_len: Int,
+):
+    """Pack Qwen [real text, text pad, image] into cuDNN [real text, image, pad].
+
+    The cuDNN pad-mask path can mask only a tail pad. Qwen's text padding lives
+    in the middle of the joint sequence, so product inference compacts the real
+    text rows and image rows before flash SDPA, leaving the old keymask kernel as
+    the fallback/parity implementation.
+    """
+    var idx = Int(global_idx.x)
+    var total = B * S * H * Dh
+    if idx >= total:
+        return
+    var d = idx % Dh
+    var row = idx // Dh
+    var h = row % H
+    var tmp = row // H
+    var compact_s = tmp % S
+    var b = tmp // S
+    var real_total = real_txt_len + (S - n_txt)
+    if compact_s >= real_total:
+        return
+    var src_s = compact_s
+    if compact_s >= real_txt_len:
+        src_s = n_txt + (compact_s - real_txt_len)
+    var src_row = (b * S + src_s) * H + h
+    dst[row, d] = src[src_row, d]
+
+
+def _qwen_scatter_textpad_bf16(
+    src: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    dst: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    B: Int,
+    S: Int,
+    H: Int,
+    Dh: Int,
+    n_txt: Int,
+    real_txt_len: Int,
+):
+    """Scatter cuDNN [real text, image, pad] output back to Qwen token order."""
+    var idx = Int(global_idx.x)
+    var total = B * S * H * Dh
+    if idx >= total:
+        return
+    var d = idx % Dh
+    var dst_row = idx // Dh
+    var h = dst_row % H
+    var tmp = dst_row // H
+    var s = tmp % S
+    var b = tmp // S
+    var compact_s = s
+    if s >= real_txt_len and s < n_txt:
+        return
+    if s >= n_txt:
+        compact_s = real_txt_len + (s - n_txt)
+    var src_row = (b * S + compact_s) * H + h
+    dst[dst_row, d] = src[src_row, d]
+
+
+def _qwen_compact_flash_bf16[
+    B: Int, S: Int, H: Int, Dh: Int, N_TXT: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    real_txt_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var bytes = B * S * H * Dh * 2
+    var q_buf = ctx.enqueue_create_buffer[DType.uint8](bytes)
+    var k_buf = ctx.enqueue_create_buffer[DType.uint8](bytes)
+    var v_buf = ctx.enqueue_create_buffer[DType.uint8](bytes)
+    ctx.enqueue_memset[DType.uint8](q_buf, 0)
+    ctx.enqueue_memset[DType.uint8](k_buf, 0)
+    ctx.enqueue_memset[DType.uint8](v_buf, 0)
+
+    var shape = List[Int]()
+    shape.append(B)
+    shape.append(S)
+    shape.append(H)
+    shape.append(Dh)
+    var q_compact = Tensor(q_buf^, shape.copy(), STDtype.BF16)
+    var k_compact = Tensor(k_buf^, shape.copy(), STDtype.BF16)
+    var v_compact = Tensor(v_buf^, shape.copy(), STDtype.BF16)
+
+    comptime rows = B * S * H
+    var rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, Dh))
+    var q_src = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        q.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var k_src = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        k.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var v_src = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        v.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var q_dst = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        q_compact.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var k_dst = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        k_compact.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var v_dst = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        v_compact.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var elems = B * S * H * Dh
+    var grid = (elems + _BLOCK - 1) // _BLOCK
+    ctx.enqueue_function[
+        _qwen_compact_textpad_bf16, _qwen_compact_textpad_bf16
+    ](q_src, q_dst, B, S, H, Dh, N_TXT, real_txt_len, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _qwen_compact_textpad_bf16, _qwen_compact_textpad_bf16
+    ](k_src, k_dst, B, S, H, Dh, N_TXT, real_txt_len, grid_dim=grid, block_dim=_BLOCK)
+    ctx.enqueue_function[
+        _qwen_compact_textpad_bf16, _qwen_compact_textpad_bf16
+    ](v_src, v_dst, B, S, H, Dh, N_TXT, real_txt_len, grid_dim=grid, block_dim=_BLOCK)
+
+    var real_total = real_txt_len + (S - N_TXT)
+    var fwd = sdpa_flash_fwd_padmask[B, S, H, Dh](
+        q_compact, k_compact, v_compact, real_total, scale, ctx
+    )
+
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](bytes)
+    ctx.enqueue_memset[DType.uint8](out_buf, 0)
+    var out = Tensor(out_buf^, shape^, STDtype.BF16)
+    var flash_src = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        fwd.o.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    var out_dst = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+        out.buf.unsafe_ptr().bitcast[BFloat16](), rl
+    )
+    ctx.enqueue_function[
+        _qwen_scatter_textpad_bf16, _qwen_scatter_textpad_bf16
+    ](
+        flash_src, out_dst, B, S, H, Dh, N_TXT, real_txt_len,
+        grid_dim=grid, block_dim=_BLOCK,
+    )
+    return out^
 
 
 # Driver: gather BSHD->BHSD storage, run the streaming kernel, and write BSHD
@@ -1855,6 +2005,48 @@ def sdpa_qwen_keymask[
         return _sdpa_qwen_keymask_storage[
             B, S, H, Dh, N_TXT, DType.float16
         ](qs, ks, vs, real_txt_len, scale, ctx, q.dtype())
+
+
+def sdpa_qwen_flash_padmask[
+    B: Int, S: Int, H: Int, Dh: Int, N_TXT: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    real_txt_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Qwen product attention using cuDNN flash when text padding can be packed.
+
+    Qwen stores padded text in the middle of `[TXT_PAD, IMG]`; cuDNN's efficient
+    mask path handles tail padding. For BF16 aligned buffers this repacks to
+    `[TXT_REAL, IMG, PAD_TAIL]`, runs cuDNN flash SDPA, then scatters real rows
+    back to Qwen order. Unsupported dtypes/shapes use the existing online
+    key-mask kernel so training/parity callers keep the same behavior.
+    """
+    comptime if N_TXT > S:
+        raise Error("sdpa_qwen_flash_padmask: N_TXT must be <= S")
+    if real_txt_len < 0 or real_txt_len > N_TXT:
+        raise Error("sdpa_qwen_flash_padmask: real_txt_len out of range")
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 or v.dtype() != STDtype.BF16:
+        return sdpa_qwen_keymask[B, S, H, Dh, N_TXT](q, k, v, real_txt_len, scale, ctx)
+    if (S % 128) != 0:
+        return sdpa_qwen_keymask[B, S, H, Dh, N_TXT](q, k, v, real_txt_len, scale, ctx)
+    var qshape = q.shape()
+    if len(qshape) != 4:
+        raise Error("sdpa_qwen_flash_padmask: q must be rank-4 [B,S,H,Dh]")
+    if (
+        qshape[0] != B or qshape[1] != S or qshape[2] != H or qshape[3] != Dh
+    ):
+        raise Error(
+            "sdpa_qwen_flash_padmask: q shape does not match compile-time B/S/H/Dh"
+        )
+    if k.shape() != qshape or v.shape() != qshape:
+        raise Error("sdpa_qwen_flash_padmask: k/v shape mismatch")
+    return _qwen_compact_flash_bf16[B, S, H, Dh, N_TXT](
+        q, k, v, real_txt_len, scale, ctx
+    )
 
 
 def sdpa_cross_nomask[

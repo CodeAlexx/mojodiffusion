@@ -62,26 +62,43 @@
 
 from std.sys import argv
 from std.gpu.host import DeviceContext
+from std.memory import alloc, UnsafePointer
+from std.builtin.type_aliases import MutExternalOrigin
+from std.ffi import external_call
+from std.time import sleep
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.cap_cache import save_tensor_bin, load_tensor_bin
+from serenitymojo.io.ffi import (
+    BytePtr, sys_open, sys_pwrite, sys_pread, sys_close,
+    O_WRONLY, O_CREAT, O_TRUNC, O_RDONLY,
+)
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.text_encoder.qwen25vl_encoder import (
     Qwen25VLEncoder,
     Qwen25VLConfig,
 )
-from serenitymojo.models.dit.qwenimage_dit import QwenImageDitOffloaded
+from serenitymojo.models.dit.qwenimage_dit import (
+    QwenImageDitOffloaded,
+    qwenimage_resident_pin_budget,
+)
 from serenitymojo.models.vae.qwenimage_tiled_decode import qwenimage_tiled_decode
 from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.layout import patchify, unpatchify
 from serenitymojo.ops.tensor_algebra import slice
-from serenitymojo.sampling.flow_match import Scheduler, cfg_qwen
+from serenitymojo.sampling.flow_match import Scheduler, cfg_qwen_device
 from serenitymojo.image.png import save_png, ValueRange
 from serenitymojo.training.sample_prompt_config import (
     SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
 )
+from serenitymojo.serve.proc_ipc import (
+    build_argv, cstr, sys_execv, sys__exit, sys_waitpid, proc_kill_wait,
+    SELF_EXE, SIGKILL, WNOHANG,
+)
+from net.syscalls import sys_fork, errno_str
 
 # ── Model paths (comptime; override by editing this file or adding config support) ──
 comptime QWENIMAGE_DIR = "/home/alex/.serenity/models/checkpoints/qwen-image-2512"
@@ -96,6 +113,10 @@ comptime DROP_IDX = 34
 comptime N_TXT_KEPT = 512
 comptime N_ENC = N_TXT_KEPT + DROP_IDX   # 546
 comptime EXTRACT_LAYER = 27
+comptime _ENCODE_CHILD_TIMEOUT_S = 300.0
+comptime _ENCODE_POLL_S = 0.05
+comptime _ENCODE_CHILD_MIN_FREE_BYTES = Int(17400) * 1024 * 1024
+comptime _META_MAGIC = Int64(0x51494D4341505631)  # "QIMCAPV1"
 
 # ── Latent / DiT shape constants (comptime-fixed; see header for rationale) ──
 comptime LH = 128
@@ -124,6 +145,48 @@ struct EncodedCaption(Movable):
 
     def into_caps(deinit self, deinit neg: EncodedCaption) -> QwenCaps:
         return QwenCaps(self.hidden^, neg.hidden^, self.real_len, neg.real_len)
+
+
+def _getpid() -> Int:
+    return Int(external_call["getpid", Int32]())
+
+
+def _write_meta(path: String, real_pos: Int, real_neg: Int) raises:
+    var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    if fd < 0:
+        raise Error(String("qwenimage_sample_cli: meta open failed: ") + path)
+    var tmp = alloc[Int64](3)
+    tmp[0] = _META_MAGIC
+    tmp[1] = Int64(real_pos)
+    tmp[2] = Int64(real_neg)
+    var p = BytePtr(unsafe_from_address=Int(tmp))
+    var w = sys_pwrite(fd, p, 24, 0)
+    tmp.free()
+    _ = sys_close(fd)
+    if w != 24:
+        raise Error("qwenimage_sample_cli: short meta write")
+
+
+def _read_meta(path: String) raises -> List[Int]:
+    var fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0:
+        raise Error(String("qwenimage_sample_cli: meta open failed: ") + path)
+    var tmp = alloc[Int64](3)
+    var p = BytePtr(unsafe_from_address=Int(tmp))
+    var r = sys_pread(fd, p, 24, 0)
+    var magic = tmp[0]
+    var rp = Int(tmp[1])
+    var rn = Int(tmp[2])
+    tmp.free()
+    _ = sys_close(fd)
+    if r != 24:
+        raise Error("qwenimage_sample_cli: short meta read")
+    if magic != _META_MAGIC:
+        raise Error("qwenimage_sample_cli: bad meta magic")
+    var out = List[Int]()
+    out.append(rp)
+    out.append(rn)
+    return out^
 
 
 # ── Qwen chat template ──
@@ -199,6 +262,92 @@ def encode_captions_from_strings(
     return pos^.into_caps(neg^)
 
 
+def encode_child_run(prefix: String, prompt: String, negative: String) raises:
+    """Child process body for CLI caption encoding.
+
+    The parent must not keep the Qwen2.5-VL encoder in its CUDA pool before DiT
+    denoise. This child loads the encoder, writes BF16 caps, and exits so the OS
+    releases the encoder VRAM before the parent touches the transformer.
+    """
+    var ctx = DeviceContext()
+    var caps = encode_captions_from_strings(prompt, negative, ctx)
+    save_tensor_bin(caps.pos, prefix + String(".pos.bin"), ctx)
+    save_tensor_bin(caps.neg, prefix + String(".neg.bin"), ctx)
+    _write_meta(prefix + String(".meta"), caps.real_pos, caps.real_neg)
+    print(
+        "[qwenimage-sample-encode-child] wrote caps", prefix,
+        "real_pos=", caps.real_pos, "real_neg=", caps.real_neg,
+    )
+
+
+def encode_captions_subprocess_cli(
+    prompt: String, negative: String, ctx: DeviceContext
+) raises -> QwenCaps:
+    """Run Qwen2.5-VL in a child so the CLI parent starts DiT with free VRAM."""
+    var free_bytes = cu_mem_get_info().free_bytes
+    if free_bytes < _ENCODE_CHILD_MIN_FREE_BYTES:
+        raise Error(
+            String("qwenimage_sample_cli: encoder child preflight failed: free VRAM ")
+            + String(free_bytes // (1024 * 1024))
+            + String(" MiB < required ")
+            + String(_ENCODE_CHILD_MIN_FREE_BYTES // (1024 * 1024))
+            + String(" MiB")
+        )
+
+    var prefix = String("/tmp/qwenimage_sample_cli_caps_") + String(_getpid())
+    var pos_path = prefix + String(".pos.bin")
+    var neg_path = prefix + String(".neg.bin")
+    var meta_path = prefix + String(".meta")
+
+    var args = List[String]()
+    args.append(SELF_EXE)
+    args.append(String("encode-child"))
+    args.append(prefix)
+    args.append(prompt)
+    args.append(negative)
+    var argv_child = build_argv(args)
+    var path = cstr(SELF_EXE)
+
+    print("[text] fork encoder child for Qwen2.5-VL caps")
+    var pid = sys_fork()
+    if pid == 0:
+        _ = sys_execv(path, argv_child)
+        sys__exit(127)
+    if pid < 0:
+        raise Error(String("qwenimage_sample_cli: encoder child fork failed: ") + errno_str())
+
+    var st = alloc[Int32](1)
+    var stp = rebind[UnsafePointer[Int32, MutExternalOrigin]](st)
+    var waited = 0.0
+    var reaped = Int32(0)
+    while waited < _ENCODE_CHILD_TIMEOUT_S:
+        reaped = sys_waitpid(pid, stp, WNOHANG)
+        if reaped == pid:
+            break
+        if reaped < 0:
+            break
+        sleep(_ENCODE_POLL_S)
+        waited += _ENCODE_POLL_S
+    var status = Int(st[0])
+    st.free()
+
+    if reaped != pid:
+        proc_kill_wait(pid, SIGKILL)
+        raise Error("qwenimage_sample_cli: encoder child timed out or waitpid failed")
+    var exited_ok = (status & 0x7F) == 0 and ((status >> 8) & 0xFF) == 0
+    if not exited_ok:
+        raise Error(
+            String("qwenimage_sample_cli: encoder child abnormal exit status ")
+            + String(status)
+        )
+
+    var meta = _read_meta(meta_path)
+    var pos = load_tensor_bin(pos_path, ctx)
+    var neg = load_tensor_bin(neg_path, ctx)
+    print("[text] encoder child reaped; parent loaded BF16 caps only")
+    return QwenCaps(pos^, neg^, meta[0], meta[1])
+
+
 def _trim_driver_pool(ctx: DeviceContext) raises:
     var before = cu_mem_get_info()
     ctx.synchronize()
@@ -230,6 +379,14 @@ def denoise(
 ) raises -> Tensor:
     print("[denoise] loading Qwen-Image MMDiT (block-streamed)")
     var model = QwenImageDitOffloaded.load(DIT_DIR, ctx)
+    var free_info = cu_mem_get_info()
+    var resident_budget = qwenimage_resident_pin_budget(free_info.free_bytes)
+    var pinned_blocks = model.pin_resident_blocks(resident_budget, ctx)
+    print(
+        "[denoise] resident Qwen blocks pinned:", pinned_blocks,
+        "budget_bytes=", resident_budget,
+        "free_before_pin_mib=", free_info.free_bytes // (1024 * 1024),
+    )
     var sched = Scheduler.qwen(steps, Float32(N_IMG))
     var sigmas = sched.sigmas()
     print("[denoise]", steps, "steps, CFG", cfg, "seed", seed)
@@ -244,7 +401,7 @@ def denoise(
             caps.real_pos, caps.real_neg,
             FRAME, FH, FW, ctx,
         )
-        var pred = cfg_qwen(preds.pos, preds.neg, cfg, ctx)
+        var pred = cfg_qwen_device(preds.pos, preds.neg, cfg, ctx)
         x = sched.step(x, pred, i, ctx)
     return x^
 
@@ -255,9 +412,14 @@ def _select_prompt(sample_cfg: SamplePromptConfig, wanted: String) raises -> Sam
     if len(sample_cfg.prompts) == 0:
         raise Error("qwenimage_sample_cli: sample prompt JSON has no prompts")
     if wanted == String(""):
-        return sample_cfg.prompts[0].copy()
+        for i in range(len(sample_cfg.prompts)):
+            if sample_cfg.prompts[i].enabled:
+                return sample_cfg.prompts[i].copy()
+        raise Error("qwenimage_sample_cli: sample prompt JSON has no enabled prompts")
     for i in range(len(sample_cfg.prompts)):
         if sample_cfg.prompts[i].label == wanted:
+            if not sample_cfg.prompts[i].enabled:
+                raise Error(String("qwenimage_sample_cli: prompt is disabled: ") + wanted)
             return sample_cfg.prompts[i].copy()
     raise Error(String("qwenimage_sample_cli: prompt id not found: ") + wanted)
 
@@ -274,6 +436,16 @@ def _load_prompt_json(path: String, wanted: String) raises -> SamplePrompt:
         )
     if p.steps <= 0:
         raise Error("qwenimage_sample_cli: steps must be > 0")
+    if p.random_seed:
+        raise Error("qwenimage_sample_cli: random_seed is not supported; provide a fixed seed")
+    if p.noise_scheduler.byte_length() > 0:
+        raise Error("qwenimage_sample_cli: noise_scheduler override is not supported")
+    if p.sample_inpainting:
+        raise Error("qwenimage_sample_cli: sample_inpainting is not supported")
+    if p.base_image_path.byte_length() > 0 or p.mask_image_path.byte_length() > 0:
+        raise Error("qwenimage_sample_cli: base/mask image prompts are not supported")
+    if p.caps_pos.byte_length() > 0 or p.caps_neg.byte_length() > 0:
+        raise Error("qwenimage_sample_cli: precomputed caps are not supported by the live Qwen text encoder path")
     print(
         "  [info] sample prompt honored: steps=", p.steps, "cfg=", p.cfg,
         "seed=", p.seed, "size=", p.width, "x", p.height,
@@ -285,27 +457,38 @@ def _load_prompt_json(path: String, wanted: String) raises -> SamplePrompt:
 
 def main() raises:
     var a = argv()
-    if len(a) < 6:
+    if len(a) == 5 and String(a[1]) == String("encode-child"):
+        encode_child_run(String(a[2]), String(a[3]), String(a[4]))
+        return
+    if len(a) != 6:
         print(
             "usage: qwenimage_sample_cli <config.json> <lora|-> <sample_prompts.json>"
             " <prompt_id> <out.png>"
         )
-        print("  argv[1] config   — accepted, ignored (model dirs are comptime)")
-        print("  argv[2] lora     — accepted, ignored (no LoRA support yet)")
+        print("  argv[1] config   — must be '-' or /dev/null; model dirs are comptime")
+        print("  argv[2] lora     — must be '-' or base; no LoRA support yet")
         print("  argv[3] prompts  — serenity.sample_prompts.v1 JSON")
         print("  argv[4] id       — prompt label, or '' for first")
         print("  argv[5] out.png  — output image path")
         raise Error("qwenimage_sample_cli: need exactly 5 arguments")
 
-    # argv[1]: config — accepted, not used today.
-    var _config_path = String(a[1])
+    # argv[1]: config — no runtime model-dir override is wired yet.
+    var config_path = String(a[1])
+    if (
+        config_path != String("")
+        and config_path != String("-")
+        and config_path != String("/dev/null")
+    ):
+        raise Error(
+            "qwenimage_sample_cli: config path overrides are not supported yet; pass '-'"
+        )
 
-    # argv[2]: lora path or sentinel; accepted, not used today.
+    # argv[2]: lora path or sentinel; Qwen-Image LoRA is not wired yet.
     var lora_raw = String(a[2])
-    var _lora_path = String("")
     if lora_raw != String("-") and lora_raw != String("base") and lora_raw != String(""):
-        _lora_path = lora_raw
-        print("[lora] path provided but ignored (Qwen-Image LoRA not wired yet):", _lora_path)
+        raise Error(
+            "qwenimage_sample_cli: LoRA is not supported for Qwen-Image yet"
+        )
 
     # argv[3]: sample prompts JSON
     var prompts_json = String(a[3])
@@ -330,9 +513,9 @@ def main() raises:
 
     var ctx = DeviceContext()
 
-    # Encode runtime prompt + negative (the key difference from the standalone
-    # runner — we are NOT using the PROMPT/NEGATIVE comptime constants).
-    var caps = encode_captions_from_strings(prompt, negative, ctx)
+    # Encode runtime prompt + negative in a child process. Process exit is the
+    # reliable way to return Qwen2.5-VL encoder VRAM before DiT denoise.
+    var caps = encode_captions_subprocess_cli(prompt, negative, ctx)
     _trim_driver_pool(ctx)
 
     # Denoise (shape is comptime-fixed; steps/cfg/seed come from sample JSON).

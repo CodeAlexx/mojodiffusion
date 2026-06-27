@@ -2982,7 +2982,6 @@ mod endpoint_tests {
     fn worker_dispatch_rejects_blocked_model_families() {
         let current = PathBuf::from("/tmp/serenity-bin/serenity_worker_zimage");
         for model in [
-            "qwen-image",
             "qwen-image-edit",
             "klein-4b",
             "flux2-dev",
@@ -3057,6 +3056,7 @@ mod endpoint_tests {
     fn production_validator_admits_docs_verified_t2i_families() {
         let cases = [
             ("zimage", ModelFamily::ZImage),
+            ("qwen-image", ModelFamily::QwenImage),
             ("ideogram4", ModelFamily::Ideogram4),
             ("sdxl", ModelFamily::Sdxl),
             ("sd_xl_base_1.0", ModelFamily::Sdxl),
@@ -3151,7 +3151,7 @@ mod endpoint_tests {
         });
         assert!(validate_generate_prequeue(&params, 1.0)
             .unwrap_err()
-            .contains("metadata/preflight-only"));
+            .contains("LoRA"));
 
         params = valid_t2i_params("zimage");
         params.init_image = "/tmp/init.png".to_string();
@@ -3172,14 +3172,14 @@ mod endpoint_tests {
     }
 
     #[test]
-    fn preflight_report_blocks_qwen_but_exposes_block_budget() {
+    fn preflight_report_admits_qwen_and_exposes_block_budget() {
         let mut params = valid_t2i_params("qwen-image");
         params.out_dir = "/tmp/serenity_product_gallery".to_string();
         let report = generate_preflight_report(&params, 1.0);
         assert_eq!(report["schema"], "serenity.generate.preflight.v1");
-        assert_eq!(report["admitted"], false);
+        assert_eq!(report["admitted"], true);
         assert_eq!(report["same_gate_as_generate"], true);
-        assert_eq!(report["backend"], "");
+        assert_eq!(report["backend"], "qwenimage");
         assert_eq!(report["output_root"]["root_kind"], "ui_workflow_gallery");
         assert_eq!(
             report["output_root"]["root"],
@@ -3193,16 +3193,13 @@ mod endpoint_tests {
         assert_eq!(report["capability_profile"]["backend"], "qwenimage");
         assert_eq!(
             report["capability_profile"]["production_status"],
-            "metadata/preflight-only"
+            "admitted"
         );
         assert_eq!(
             report["capability_profile"]["features"]["text_to_image"]["supported"],
-            false
+            true
         );
-        assert!(report["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("metadata/preflight-only"));
+        assert_eq!(report["error"], "");
         assert_eq!(report["block_profile"]["block_count"], 60);
         assert_eq!(report["block_profile"]["tensor_count_hint"], 1920);
         assert_eq!(
@@ -3435,6 +3432,7 @@ mod endpoint_tests {
             "sdxl",
             "anima",
             "sd3",
+            "qwenimage",
             "flux2",
             "sensenova",
         ] {
@@ -3510,11 +3508,8 @@ mod endpoint_tests {
         let qwen_profile = capability_profile_for_model("qwen-image");
         assert_eq!(qwen_profile["schema"], "serenity.capability_profile.v1");
         assert_eq!(qwen_profile["backend"], "qwenimage");
-        assert_eq!(qwen_profile["production_status"], "metadata/preflight-only");
-        assert_eq!(
-            qwen_profile["features"]["text_to_image"]["supported"],
-            false
-        );
+        assert_eq!(qwen_profile["production_status"], "admitted");
+        assert_eq!(qwen_profile["features"]["text_to_image"]["supported"], true);
         assert_eq!(
             qwen_profile["features"]["image_to_image"]["policy"],
             "fail_loud"

@@ -7,9 +7,9 @@ binaries, submits real /v1/generate jobs, polls /v1/job/:id, and inspects the
 emitted PNG plus any worker result sidecar.
 
 Default mode runs a single bounded ZImage request. Use --admitted-image-set or
---all-admitted to expand coverage. Qwen is inventory/preflight-only until its
-production artifact/timing/VRAM gate passes. Use --strict-production to fail
-when a requested model only has a PNG artifact and no timing/VRAM manifest.
+--all-admitted to expand coverage. Qwen is admitted only for its bounded
+1024x1024 text-to-image worker route. Use --strict-production to fail when a
+requested model only has a PNG artifact and no timing/VRAM manifest.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ DEFAULT_REPORT = REPO / "output/checks/serenity_server_t2i_product_gate.json"
 GENPARAMS_KEY = "serenity.genparams.v1"
 TERMINAL_STATES = {"done", "failed", "cancelled", "interrupted"}
 
-ALL_ADMITTED = ["zimage", "sdxl", "anima", "sd3", "ideogram4", "flux2", "sensenova"]
+ALL_ADMITTED = ["zimage", "qwenimage", "sdxl", "anima", "sd3", "ideogram4", "flux2", "sensenova"]
 
 
 class GateError(RuntimeError):
@@ -430,9 +430,9 @@ def prequeue_rejection_cases() -> list[dict[str, Any]]:
             "expected_parts": ["ideogram4", "unsupported size", "1024x1024"],
         },
         {
-            "case": "qwen_disabled",
-            "body": {**base, "model": "qwenimage"},
-            "expected_parts": ["Qwen", "metadata/preflight-only"],
+            "case": "qwen_edit_blocked",
+            "body": {**base, "model": "qwen-image-edit-2511"},
+            "expected_parts": ["Qwen-Image-Edit", "production edit"],
         },
         {
             "case": "zimage_karras_scheduler",
@@ -1010,13 +1010,12 @@ def preflight_capability_profile_cases() -> list[dict[str, Any]]:
             "expected_workflow_source": "flat_params_adapter",
         },
         {
-            "case": "qwen_blocked_profile",
+            "case": "qwen_admitted_profile",
             "body": {**base, "model": "qwenimage"},
             "expected_backend": "qwenimage",
-            "expected_production_status": "metadata/preflight-only",
-            "text_to_image_supported": False,
-            "expected_error_parts": ["Qwen", "metadata/preflight-only"],
-            "disabled_features": ["image_to_image", "text_to_image"],
+            "expected_production_status": "admitted",
+            "text_to_image_supported": True,
+            "disabled_features": ["image_to_image", "lora", "controlnet", "vae_override"],
         },
         {
             "case": "klein9b_admitted_profile",

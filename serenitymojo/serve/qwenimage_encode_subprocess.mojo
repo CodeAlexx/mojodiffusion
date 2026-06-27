@@ -35,12 +35,10 @@
 # whether the encode ran in-process or in the child. real_pos/real_neg ride the
 # 24-byte meta sidecar.
 #
-# SAFETY / FALLBACK: QwenImageBackend is also constructed by hosts whose main()
-# does NOT route "encode-child". For those — and for ANY subprocess failure (fork
-# error, timeout, abnormal exit, unreadable caps) — encode_captions_subprocess
-# transparently falls back to the in-process encode_captions_from_strings.
-# Correctness is never sacrificed for the VRAM win; only the live
-# serenity_worker_qwenimage path gets the reclaim.
+# SAFETY / STRICTNESS: the server path raises on fork, timeout, abnormal exit, or
+# unreadable caps instead of falling back to in-process encode. Loading the
+# encoder in the parent defeats the VRAM/offload strategy, so production must
+# fail loud rather than silently fragment the worker.
 
 from std.memory import alloc, UnsafePointer
 from std.builtin.type_aliases import MutExternalOrigin
@@ -148,9 +146,9 @@ def encode_captions_subprocess(
     in ITS OWN process, blocking-reap it (VRAM released), then read back the BF16
     caps it wrote. The resident DiT offloader in THIS process is untouched: fork
     copies the fd table and the child execv's immediately, so this CUDA context is
-    never used in the child. Falls back to in-process
-    `encode_captions_from_strings` on any failure or on a host binary that does
-    not route `encode-child` (see module header)."""
+    never used in the child. Server inference is strict: child failure raises
+    instead of falling back to in-process encode, because parent-side encoder
+    load fragments the Qwen worker's CUDA pool around the resident offloader."""
     var prefix = String("/tmp/serenity_qwenimage_caps_") + String(_getpid())
     var pos_path = prefix + String(".pos.bin")
     var neg_path = prefix + String(".neg.bin")
@@ -159,13 +157,17 @@ def encode_captions_subprocess(
     # Pre-flight guard: skip a doomed fork (and its transient VRAM spike) when the
     # GPU's current free memory can't hold the ~16 GB encoder child. cu_mem_get_info
     # reports device-global free, which is exactly what the child's separate CUDA
-    # context will see. Below threshold → in-process encode (correct, just no win).
+    # context will see. Below threshold raises so production does not silently
+    # fragment the parent with an in-process encoder load.
     var free_bytes = cu_mem_get_info().free_bytes
     if free_bytes < _ENCODE_CHILD_MIN_FREE_BYTES:
-        print("[qwenimage] free VRAM", free_bytes // (1024 * 1024),
-              "MiB < encoder-child need", _ENCODE_CHILD_MIN_FREE_BYTES // (1024 * 1024),
-              "MiB → in-process encode (no fork)")
-        return encode_captions_from_strings(prompt, negative, ctx)
+        raise Error(
+            String("qwenimage encoder child preflight failed: free VRAM ")
+            + String(free_bytes // (1024 * 1024))
+            + String(" MiB < required ")
+            + String(_ENCODE_CHILD_MIN_FREE_BYTES // (1024 * 1024))
+            + String(" MiB")
+        )
 
     # argv + execv path built BEFORE fork (no allocation between fork and execv).
     var args = List[String]()
@@ -184,8 +186,7 @@ def encode_captions_subprocess(
         _ = sys_execv(path, argv)
         sys__exit(127)                     # execv failed
     if pid < 0:
-        print("[qwenimage] fork failed (", errno_str(), ") → in-process encode")
-        return encode_captions_from_strings(prompt, negative, ctx)
+        raise Error(String("qwenimage encoder child fork failed: ") + errno_str())
 
     # PARENT: bounded WNOHANG reap (hang backstop). Blocking-reap once it exits so
     # the OS has released the child's VRAM before we load the caps onto the GPU.
@@ -206,17 +207,17 @@ def encode_captions_subprocess(
 
     if reaped != pid:
         proc_kill_wait(pid, SIGKILL)
-        print("[qwenimage] encoder child timed out/errored → in-process encode")
-        return encode_captions_from_strings(prompt, negative, ctx)
+        raise Error("qwenimage encoder child timed out or waitpid failed")
 
     var exited_ok = (status & 0x7F) == 0 and ((status >> 8) & 0xFF) == 0
     if not exited_ok:
-        print("[qwenimage] encoder child abnormal exit (status", status,
-              ") → in-process encode")
-        return encode_captions_from_strings(prompt, negative, ctx)
+        raise Error(
+            String("qwenimage encoder child abnormal exit status ")
+            + String(status)
+        )
 
     # Success path: read the caps the child wrote. Any read failure (e.g. a host
-    # that exits 0 but never wrote the sidecar) → in-process fallback.
+    # that exits 0 but never wrote the sidecar) fails loud.
     try:
         var meta = _read_meta(meta_path)
         var pos = load_tensor_bin(pos_path, ctx)
@@ -224,5 +225,4 @@ def encode_captions_subprocess(
         print("[qwenimage] encoder child reaped → caps loaded (encoder VRAM reclaimed)")
         return QwenCaps(pos^, neg^, meta[0], meta[1])
     except e:
-        print("[qwenimage] caps read-back failed (", e, ") → in-process encode")
-        return encode_captions_from_strings(prompt, negative, ctx)
+        raise Error(String("qwenimage encoder caps read-back failed: ") + String(e))

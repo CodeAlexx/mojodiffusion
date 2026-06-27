@@ -10,7 +10,7 @@ from std.gpu.host import DeviceContext
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.parity import ParityHarness
 from serenitymojo.tensor import Tensor
-from serenitymojo.ops.attention import sdpa, sdpa_qwen_keymask
+from serenitymojo.ops.attention import sdpa, sdpa_qwen_keymask, sdpa_qwen_flash_padmask
 
 
 def _bshd(B: Int, S: Int, H: Int, Dh: Int) -> List[Int]:
@@ -68,6 +68,22 @@ def _qwen_full_mask(
                 var row_base = head_base + q * S
                 for k in range(real_txt_len, N_TXT):
                     out[row_base + k] = Float32(-1.0e4)
+    return out^
+
+
+def _semantic_qwen_rows(
+    data: List[Float32], B: Int, S: Int, H: Int, Dh: Int, N_TXT: Int, real_txt_len: Int
+) -> List[Float32]:
+    """Keep real text plus image-token rows, skipping unused padded text queries."""
+    var out = List[Float32]()
+    for b in range(B):
+        for s in range(S):
+            if s >= real_txt_len and s < N_TXT:
+                continue
+            for h in range(H):
+                var base = ((b * S + s) * H + h) * Dh
+                for d in range(Dh):
+                    out.append(data[base + d])
     return out^
 
 
@@ -161,7 +177,44 @@ def main() raises:
     print("qwen keymask no-pad f32 vs zero-mask sdpa:", r3)
     all_pass = all_pass and r3.passed
 
+    # Aligned BF16 product shape for the new cuDNN repack path. Padded text query
+    # rows are intentionally not compared: they are not keys in later attention
+    # and never contribute to the final image prediction.
+    comptime S_FLASH = 128
+    comptime H_FLASH = 2
+    comptime Dh_FLASH = 128
+    comptime N_TXT_FLASH = 32
+    var real_txt_len_flash = 19
+    var n_flash = B * S_FLASH * H_FLASH * Dh_FLASH
+    var scale_flash = Float32(1.0) / sqrt(Float32(Dh_FLASH))
+    var key_flash_ref = sdpa_qwen_keymask[B, S_FLASH, H_FLASH, Dh_FLASH, N_TXT_FLASH](
+        Tensor.from_host(_fill_q(n_flash), _bshd(B, S_FLASH, H_FLASH, Dh_FLASH), STDtype.BF16, ctx),
+        Tensor.from_host(_fill_k(n_flash), _bshd(B, S_FLASH, H_FLASH, Dh_FLASH), STDtype.BF16, ctx),
+        Tensor.from_host(_fill_v(n_flash), _bshd(B, S_FLASH, H_FLASH, Dh_FLASH), STDtype.BF16, ctx),
+        real_txt_len_flash,
+        scale_flash,
+        ctx,
+    )
+    var flash = sdpa_qwen_flash_padmask[B, S_FLASH, H_FLASH, Dh_FLASH, N_TXT_FLASH](
+        Tensor.from_host(_fill_q(n_flash), _bshd(B, S_FLASH, H_FLASH, Dh_FLASH), STDtype.BF16, ctx),
+        Tensor.from_host(_fill_k(n_flash), _bshd(B, S_FLASH, H_FLASH, Dh_FLASH), STDtype.BF16, ctx),
+        Tensor.from_host(_fill_v(n_flash), _bshd(B, S_FLASH, H_FLASH, Dh_FLASH), STDtype.BF16, ctx),
+        real_txt_len_flash,
+        scale_flash,
+        ctx,
+    )
+    var r4 = h.compare_host(
+        _semantic_qwen_rows(
+            flash.to_host(ctx), B, S_FLASH, H_FLASH, Dh_FLASH, N_TXT_FLASH, real_txt_len_flash
+        ),
+        _semantic_qwen_rows(
+            key_flash_ref.to_host(ctx), B, S_FLASH, H_FLASH, Dh_FLASH, N_TXT_FLASH, real_txt_len_flash
+        ),
+    )
+    print("qwen flash bf16 semantic rows vs keymask:", r4)
+    all_pass = all_pass and r4.passed
+
     if all_pass:
-        print("PASS: qwen keymask attention matches full-mask SDPA gates")
+        print("PASS: qwen keymask/flash attention matches parity gates")
     else:
         raise Error("sdpa_qwen_keymask_parity failed")

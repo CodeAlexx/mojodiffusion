@@ -59,6 +59,16 @@ def top_level_span(text: str, keyword: str, name: str) -> tuple[str, int]:
     return text[match.start() : end], start_line
 
 
+def optional_top_level_span(text: str, keyword: str, name: str) -> tuple[str, int] | None:
+    match = re.search(rf"^{keyword} {re.escape(name)}\b", text, flags=re.MULTILINE)
+    if not match:
+        return None
+    next_match = re.search(r"^def \w+\b|^struct \w+\b|^comptime \w+\b", text[match.end() :], flags=re.MULTILINE)
+    end = len(text) if next_match is None else match.end() + next_match.start()
+    start_line = text.count("\n", 0, match.start()) + 1
+    return text[match.start() : end], start_line
+
+
 def has(pattern: str, text: str) -> bool:
     return re.search(pattern, text, flags=re.DOTALL | re.MULTILINE) is not None
 
@@ -103,7 +113,10 @@ def add_boundary_hits(
         body = text
         start_line = 1
     else:
-        body, start_line = top_level_span(text, scope[0], scope[1])
+        span = optional_top_level_span(text, scope[0], scope[1])
+        if span is None:
+            return
+        body, start_line = span
 
     hits = 0
     for offset, raw_line in enumerate(body.splitlines()):

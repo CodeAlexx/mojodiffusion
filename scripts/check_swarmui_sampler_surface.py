@@ -362,37 +362,37 @@ def disabled_model_fail_loud_report_ready(path: Path) -> bool:
             return False
         if "not runnable" not in error:
             return False
-        if case_id == "qwen_image" and "metadata/preflight-only" not in error:
-            return False
         seen.add(case_id)
-    return {"qwen_image", "ltx2_video"}.issubset(seen)
+    return {"qwen_image_edit", "ltx2_video"}.issubset(seen)
 
 
-def server_qwen_prequeue_report_ready(path: Path) -> bool:
+def server_qwen_product_report_ready(path: Path) -> bool:
     report = read_json(path)
     summary = report.get("summary")
     if not isinstance(summary, dict) or summary.get("exit_ok") is not True:
         return False
-    prequeue = report.get("prequeue_rejections")
-    if not isinstance(prequeue, list):
+    preflight_profiles = report.get("preflight_capability_profiles")
+    if not isinstance(preflight_profiles, list):
         return False
-    qwen_seen = False
-    for item in prequeue:
-        if not isinstance(item, dict):
-            return False
-        if item.get("case") != "qwen_disabled":
+    profile_seen = False
+    for item in preflight_profiles:
+        if not isinstance(item, dict) or item.get("case") != "qwen_admitted_profile":
             continue
-        error = str(item.get("error") or "")
-        if item.get("ok") is not True:
+        profile = item.get("capability_profile")
+        if item.get("ok") is not True or item.get("http_status") != 200:
             return False
-        if item.get("http_status") != 400:
+        if not isinstance(profile, dict):
             return False
-        if item.get("job_count_before") != item.get("job_count_after"):
+        if profile.get("backend") != "qwenimage" or profile.get("production_status") != "admitted":
             return False
-        if "Qwen" not in error or "metadata/preflight-only" not in error:
+        features = profile.get("features")
+        if not isinstance(features, dict):
             return False
-        qwen_seen = True
-    if not qwen_seen:
+        text_to_image = features.get("text_to_image")
+        if not isinstance(text_to_image, dict) or text_to_image.get("supported") is not True:
+            return False
+        profile_seen = True
+    if not profile_seen:
         return False
     samplers = report.get("samplers")
     if not isinstance(samplers, dict) or samplers.get("http_status") != 200:
@@ -407,11 +407,12 @@ def server_qwen_prequeue_report_ready(path: Path) -> bool:
         if not isinstance(entry, dict) or entry.get("backend") != "qwenimage":
             continue
         return (
-            entry.get("supported_samplers") == []
-            and entry.get("supported_schedulers") == []
-            and entry.get("executed_sampler") == ""
-            and entry.get("executed_scheduler") == ""
-            and "metadata/preflight-only" in str(entry.get("reason") or "")
+            "euler" in list(entry.get("supported_samplers") or [])
+            and "flowmatch_euler" in list(entry.get("supported_samplers") or [])
+            and "simple" in list(entry.get("supported_schedulers") or [])
+            and entry.get("executed_sampler") == "qwenimage_flowmatch_euler"
+            and entry.get("executed_scheduler") == "qwenimage_simple_flowmatch"
+            and "bounded 1024x1024" in str(entry.get("reason") or "")
         )
     return False
 
@@ -490,7 +491,7 @@ def server_capabilities_report_ready(path: Path) -> bool:
     profile_cases = {str(item.get("case") or ""): item for item in preflight_profiles if isinstance(item, dict)}
     for case_name, backend, status in (
         ("zimage_admitted_profile", "zimage", "admitted"),
-        ("qwen_blocked_profile", "qwenimage", "metadata/preflight-only"),
+        ("qwen_admitted_profile", "qwenimage", "admitted"),
         ("klein9b_admitted_profile", "flux2", "admitted"),
         ("klein4b_blocked_profile", "flux2", "blocked"),
         ("ideogram_negative_prompt_profile", "ideogram4", "admitted"),
@@ -1039,7 +1040,7 @@ def mojo_markers() -> list[Marker]:
                     "variation_strength > 0.0",
                 ],
             ),
-            "Z-Image applies variation_seed/variation_strength to initial latent noise and records variation_applied in its manifest; Qwen variation helper wiring remains metadata/preflight-only, not product-admitted generation.",
+            "Z-Image and Qwen apply variation_seed/variation_strength to initial latent noise; accepted variation parity still requires artifact evidence per backend.",
             "Runtime acceptance still requires artifact evidence that variation changes the output payload.",
             severity="warning",
         )
@@ -1119,7 +1120,7 @@ def mojo_markers() -> list[Marker]:
     markers.append(
         marker(
             "Qwen backend subset",
-            "Qwen helper code remains quarantined from product admission",
+            "Qwen bounded txt2img route is product-admitted",
             qwen,
             has_all(
                 qwen_text,
@@ -1130,14 +1131,14 @@ def mojo_markers() -> list[Marker]:
                     "Scheduler.qwen(self.params.steps",
                     "self.params.seed",
                     "self.params.negative",
-                    "cfg_qwen",
+                    "cfg_qwen_device",
                     "sampler_admission_for_backend",
                     "scheduler_admission_for_backend",
                     "unsupported sampler",
                 ],
             ),
-            "Qwen helper code still has the model-specific schedule, CFG, negative prompt, and local fail-loud checks, but registry/server admission keeps generation metadata/preflight-only.",
-            "Do not treat helper-code presence as Qwen product readiness until separate artifact, timing, VRAM, quality, and workflow gates pass.",
+            "Qwen txt2img has a bounded 1024x1024 Euler/simple route with device CFG, negative prompt plumbing, and local fail-loud checks.",
+            "Do not treat the bounded route as full Qwen sampler parity until separate artifact, timing, VRAM, quality, and workflow gates pass.",
             severity="warning",
         )
     )
@@ -1251,23 +1252,23 @@ def mojo_markers() -> list[Marker]:
     )
     markers.append(
         marker(
-            "Qwen and video quarantine",
-            "Disabled model families fail loud before enqueue",
+            "Qwen edit and video quarantine",
+            "Qwen txt2img is bounded while edit/video families fail loud before enqueue",
             disabled_model_report,
             disabled_model_fail_loud_report_ready(disabled_model_report)
-            and server_qwen_prequeue_report_ready(server_prequeue_report)
+            and server_qwen_product_report_ready(server_prequeue_report)
             and has_all(
                 daemon_text + sampler_registry_text + dispatch_text,
                 [
                     'sampler_backend == "disabled"',
-                    "metadata/preflight-only",
+                    "qwenimage_flowmatch_euler",
                     "m.find(\"qwen\")",
-                    "Qwen/Qwen-Image/Qwen-Edit execution is disabled",
+                    "Qwen-Image-Edit execution is disabled",
                     "LTX/LTX2 execution is disabled",
                 ],
             ),
-            "Mojo daemon rejects Qwen/LTX-style known-disabled models with HTTP 501 before job fanout, and the Rust server rejects Qwen prequeue while publishing Qwen inventory as sampler-less metadata.",
-            "Keep Qwen/video parity blocked until separate artifact, timing, VRAM, quality, and workflow gates pass.",
+            "Mojo daemon admits bounded Qwen txt2img, rejects Qwen-Edit/LTX-style known-disabled models before job fanout, and publishes Qwen sampler inventory with narrow support.",
+            "Keep Qwen edit/video parity blocked until separate artifact, timing, VRAM, quality, and workflow gates pass.",
             severity="warning",
         )
     )
@@ -1311,15 +1312,17 @@ def mojo_markers() -> list[Marker]:
                 dispatch_text,
                 [
                     "KIND_ZIMAGE",
+                    "KIND_QWEN",
                     "KIND_IDEOGRAM4",
                     "KIND_KLEIN",
                     "KIND_SDXL",
                     "KIND_ANIMA",
                     "KleinBackend",
+                    "QwenImageBackend",
                     "SampleCliBackend(String(\"sdxl\"))",
                     "SampleCliBackend(String(\"anima\"))",
                     "_known_disabled_model_reason",
-                    "Qwen/Qwen-Image/Qwen-Edit execution is disabled",
+                    "Qwen-Image-Edit execution is disabled",
                     "SD3/SD3.5 execution is metadata-only",
                     "LTX/LTX2 execution is disabled",
                 ],
@@ -1556,7 +1559,7 @@ def surface_blockers() -> list[dict[str, str]]:
         {
             "id": "model_dispatch_coverage",
             "severity": "P1",
-            "blocker": "Standalone Mojo dispatch covers bounded Z-Image, Ideogram4, Flux2/Klein staged artifacts, and fixed SDXL/Anima sample-CLI wrappers. The Rust control plane also maps SD3/SD3.5 and Flux1-dev to per-kind Mojo workers with sampler inventory and fail-loud prequeue checks. A strict all-admitted Rust-server gate now has manifest-backed artifact, timing, and VRAM evidence for zimage, sdxl, anima, sd3, flux, and ideogram4, but SD15, Chroma, ERNIE, full LTX2/video, HiDream, SenseNova, full Qwen, and wider sampler variants remain missing or explicitly disabled.",
+            "blocker": "Standalone Mojo dispatch covers bounded Z-Image, Qwen txt2img, Ideogram4, Flux2/Klein staged artifacts, and fixed SDXL/Anima sample-CLI wrappers. The Rust control plane also maps SD3/SD3.5 and Flux1-dev to per-kind Mojo workers with sampler inventory and fail-loud prequeue checks. A strict all-admitted Rust-server gate needs current artifact, timing, and VRAM evidence for every admitted family; SD15, Chroma, ERNIE, full LTX2/video, HiDream, Qwen-Edit, and wider sampler variants remain missing or explicitly disabled.",
             "acceptance_gate": "Add or accept model routes only after each admitted model has manifest-backed artifact, timing, VRAM, metadata, sampler/scheduler, and failure-mode evidence.",
         },
         {
@@ -1568,8 +1571,8 @@ def surface_blockers() -> list[dict[str, str]]:
         {
             "id": "qwen_video_quarantine",
             "severity": "P0",
-            "blocker": "Full Qwen generation and video generation are not accepted sampler targets. Qwen/LTX-style disabled model requests now fail before enqueue instead of becoming accepted jobs, while video remains bounded DEV-smoke evidence only.",
-            "acceptance_gate": "Keep Qwen full-generation and video sampler parity blocked until separate product gates provide real artifacts and resource evidence.",
+            "blocker": "Qwen txt2img is accepted only for the bounded 1024x1024 Euler/simple route. Qwen-Edit and video-generation requests remain rejected before enqueue instead of becoming accepted jobs, while video remains bounded DEV-smoke evidence only.",
+            "acceptance_gate": "Keep Qwen-Edit, video sampler parity, and wider Qwen sampler aliases blocked until separate product gates provide real artifacts and resource evidence.",
         },
     ]
 

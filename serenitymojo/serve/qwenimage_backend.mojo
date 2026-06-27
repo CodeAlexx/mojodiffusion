@@ -50,12 +50,15 @@ from serenitymojo.models.text_encoder.qwen25vl_encoder import (
     Qwen25VLEncoder, Qwen25VLConfig,
 )
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
-from serenitymojo.models.dit.qwenimage_dit import QwenImageDitOffloaded
+from serenitymojo.models.dit.qwenimage_dit import (
+    QwenImageDitOffloaded,
+    qwenimage_resident_pin_budget,
+)
 from serenitymojo.models.vae.qwenimage_tiled_decode import qwenimage_tiled_decode
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.random import randn
 from serenitymojo.ops.layout import patchify, unpatchify
-from serenitymojo.sampling.flow_match import Scheduler, cfg_qwen
+from serenitymojo.sampling.flow_match import Scheduler, cfg_qwen_device
 from serenitymojo.sampling.sampler_registry import (
     sampler_admission_for_backend, scheduler_admission_for_backend,
 )
@@ -72,6 +75,7 @@ from serenitymojo.serve.backend import (
     reject_unsupported_inpaint_conditioning_params,
     reject_unsupported_qwen_edit_conditioning_params,
     reject_unsupported_conditioning_mask_params, reject_unsupported_lanpaint_params,
+    advanced_sampling_params_set,
 )
 
 comptime GENPARAMS_TEXT_KEY = "serenity.genparams.v1"
@@ -133,6 +137,32 @@ def _save_rgb_png_with_text(
     encode_png_with_text(img, path, kws, vals)
 
 
+def _reject_qwen_unsupported_runtime_params(params: JobParams) raises:
+    if params.cfg_override >= 0.0:
+        raise Error("qwenimage: cfg_override is not supported yet")
+    if (
+        params.cfg_override_start_percent != 0.0
+        or params.cfg_override_end_percent != 1.0
+    ):
+        raise Error("qwenimage: cfg_override percent window is not supported yet")
+    if params.sigma_shift != 3.0:
+        raise Error("qwenimage: sigma_shift override is not supported yet")
+    if params.creativity != 0.5:
+        raise Error("qwenimage: creativity/partial denoise is not supported yet")
+    if (
+        params.sample_caps_pos.byte_length() > 0
+        or params.sample_caps_neg.byte_length() > 0
+    ):
+        raise Error("qwenimage: pre-encoded sample caps are not supported by the live Qwen text encoder path")
+    var advanced = advanced_sampling_params_set(params)
+    if len(advanced) > 0:
+        raise Error(
+            String("qwenimage: advanced sampling parameter '")
+            + advanced[0]
+            + String("' is not supported yet")
+        )
+
+
 struct QwenImageBackend(GenBackend, Movable):
     var ctx: DeviceContext
 
@@ -192,6 +222,7 @@ struct QwenImageBackend(GenBackend, Movable):
         reject_unsupported_conditioning_mask_params(params, String("qwenimage"))
         reject_unsupported_mask_image_params(params, String("qwenimage"))
         reject_unsupported_lanpaint_params(params, String("qwenimage"))
+        _reject_qwen_unsupported_runtime_params(params)
         var sampler_admission = sampler_admission_for_backend(String("qwenimage"), params.sampler)
         if not sampler_admission.supported:
             raise Error(
@@ -274,6 +305,16 @@ struct QwenImageBackend(GenBackend, Movable):
         print("[qwenimage] loading Qwen-Image MMDiT offloader from", DIT_DIR)
         self.model = List[ArcPointer[QwenImageDitOffloaded]]()
         self.model.append(ArcPointer(QwenImageDitOffloaded.load(DIT_DIR, self.ctx)))
+        var free_info = cu_mem_get_info()
+        var resident_budget = qwenimage_resident_pin_budget(free_info.free_bytes)
+        var pinned_blocks = self.model[0][].pin_resident_blocks(
+            resident_budget, self.ctx
+        )
+        print(
+            "[qwenimage] resident block prefix pinned:", pinned_blocks,
+            "budget_bytes=", resident_budget,
+            "free_before_pin_mib=", free_info.free_bytes // (1024 * 1024),
+        )
         self.loaded = True
         _print_vram("after DiT offloader load (resident)")
 
@@ -316,7 +357,7 @@ struct QwenImageBackend(GenBackend, Movable):
             self.caps[0][].real_pos, self.caps[0][].real_neg,
             FRAME, FH, FW, self.ctx,
         )
-        var pred = cfg_qwen(preds.pos, preds.neg, self.cfg, self.ctx)
+        var pred = cfg_qwen_device(preds.pos, preds.neg, self.cfg, self.ctx)
         var x_new = self.sched[0][].step(self.latent[0][], pred, i, self.ctx)
         self.latent = List[ArcPointer[Tensor]]()
         self.latent.append(ArcPointer(x_new^))

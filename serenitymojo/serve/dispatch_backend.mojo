@@ -21,7 +21,7 @@
 #
 # MODEL → KIND mapping (by the /v1/models scan `name`):
 #   "" | "zimage_base" | <anything starting "zimage">  -> Z-Image (default)
-#   "qwen-image-2512" | <anything containing "qwen">    -> known, execution disabled
+#   "qwen-image-2512" | <anything containing "qwen">    -> Qwen-Image
 #   "ideogram-4-fp8" | <anything containing "ideogram"> -> Ideogram-4
 #   <anything containing "klein">                       -> Klein backend contract
 #                                                        adapter; fails loud until
@@ -57,8 +57,8 @@ comptime KIND_ANIMA = 6
 
 def _known_disabled_model_reason(model: String) -> String:
     var lo = model.lower()
-    if lo.find("qwen") >= 0:
-        return String("Qwen/Qwen-Image/Qwen-Edit execution is disabled for this slice; it may be scanned/imported as metadata only")
+    if lo.find("qwen") >= 0 and lo.find("edit") >= 0:
+        return String("Qwen-Image-Edit execution is disabled until the edit/image-conditioning backend is production-admitted")
     if lo.find("sd3") >= 0 or lo.find("sd35") >= 0 or lo.find("sd_3") >= 0 or lo.find("stable-diffusion-3") >= 0:
         return String("SD3/SD3.5 execution is metadata-only here; do not run SD3 Large, and SD3.5 Medium needs a medium-specific daemon CLI before execution")
     if lo.find("flux1") >= 0 or lo.find("flux-1") >= 0 or lo.find("flux_1") >= 0 or lo.find("flux2-dev") >= 0 or lo.find("flux-2-dev") >= 0 or lo.find("flux2_dev") >= 0:
@@ -104,6 +104,8 @@ def _kind_for_model(model: String) raises -> Int:
             String("known model '") + model + String("' is not runnable by this daemon slice: ")
             + disabled_reason
         )
+    if lo.find("qwen") >= 0:
+        return KIND_QWEN
     if lo.find("klein") >= 0:
         return KIND_KLEIN
     if lo.find("sdxl") >= 0 or lo.find("stable-diffusion-xl") >= 0 or lo.find("animagine") >= 0:

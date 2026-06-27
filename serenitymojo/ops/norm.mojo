@@ -659,6 +659,159 @@ def _layer_norm_kernel_f16(
         c += _TPB
 
 
+# ── Fused LayerNorm(no-affine) + modulate (MJ-1005) ──────────────────────────
+# out = (1 + scale) * ((x - mean) / std) + shift, one block per row. Equivalent
+# to modulate(layer_norm(x, ones, zeros, eps), scale, shift) in ONE kernel (no
+# intermediate normed buffer). scale/shift: [D] (all rows) or [B,D] (rows split
+# into B contiguous ranges), matching ops/elementwise.modulate. Inference-side:
+# training backward needs the pre-modulate norm, so keep layer_norm+modulate there.
+def _norm_modulate_kernel_f32(
+    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    shift: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    cols: Int,
+    rows_per_vec: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var s_sum = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var s_sqr = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var lsum: Float32 = 0.0
+    var lsqr: Float32 = 0.0
+    var c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.float32]](x[row, c])
+        lsum += v
+        lsqr += v * v
+        c += _TPB
+    s_sum[tid] = lsum
+    s_sqr[tid] = lsqr
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            s_sum[tid] = s_sum[tid] + s_sum[tid + active]
+            s_sqr[tid] = s_sqr[tid] + s_sqr[tid + active]
+        barrier()
+        active //= 2
+    var mean = s_sum[0] / Float32(cols)
+    var var_ = s_sqr[0] / Float32(cols) - mean * mean
+    var inv = 1.0 / sqrt(var_ + eps)
+    var voff = (row // rows_per_vec) * cols
+    c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.float32]](x[row, c])
+        var sc = rebind[Scalar[DType.float32]](scale[voff + c])
+        var sh = rebind[Scalar[DType.float32]](shift[voff + c])
+        o[row, c] = rebind[o.element_type]((1.0 + sc) * ((v - mean) * inv) + sh)
+        c += _TPB
+
+
+def _norm_modulate_kernel_bf16(
+    x: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    scale: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    shift: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],
+    o: LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin],
+    cols: Int,
+    rows_per_vec: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var s_sum = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var s_sqr = stack_allocation[
+        _TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var lsum: Float32 = 0.0
+    var lsqr: Float32 = 0.0
+    var c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.bfloat16]](x[row, c]).cast[DType.float32]()
+        lsum += v
+        lsqr += v * v
+        c += _TPB
+    s_sum[tid] = lsum
+    s_sqr[tid] = lsqr
+    barrier()
+    var active = _TPB // 2
+    while active > 0:
+        if tid < active:
+            s_sum[tid] = s_sum[tid] + s_sum[tid + active]
+            s_sqr[tid] = s_sqr[tid] + s_sqr[tid + active]
+        barrier()
+        active //= 2
+    var mean = s_sum[0] / Float32(cols)
+    var var_ = s_sqr[0] / Float32(cols) - mean * mean
+    var inv = 1.0 / sqrt(var_ + eps)
+    var voff = (row // rows_per_vec) * cols
+    c = tid
+    while c < cols:
+        var v = rebind[Scalar[DType.bfloat16]](x[row, c]).cast[DType.float32]()
+        var sc = rebind[Scalar[DType.bfloat16]](scale[voff + c]).cast[DType.float32]()
+        var sh = rebind[Scalar[DType.bfloat16]](shift[voff + c]).cast[DType.float32]()
+        o[row, c] = rebind[o.element_type](
+            ((1.0 + sc) * ((v - mean) * inv) + sh).cast[DType.bfloat16]()
+        )
+        c += _TPB
+
+
+def norm_modulate(
+    x: Tensor, scale: Tensor, shift: Tensor, eps: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """Fused no-affine LayerNorm + modulate: (1+scale)*((x-mean)/std)+shift.
+    == modulate(layer_norm(x, ones, zeros, eps), scale, shift), one kernel (MJ-1005).
+    scale/shift: [D] or [B,D]. F32/BF16 only. Inference-side (see note above)."""
+    var xshape = x.shape()
+    var d = xshape[len(xshape) - 1]
+    var rows = x.numel() // d
+    var sshape = scale.shape()
+    var nvec = 1
+    if len(sshape) == 2 and sshape[1] == d:
+        nvec = sshape[0]
+    elif len(sshape) != 1 or sshape[0] != d:
+        raise Error("norm_modulate: scale must be [D] or [B, D]")
+    if scale.dtype() != x.dtype() or shift.dtype() != x.dtype():
+        raise Error("norm_modulate: scale/shift dtype must match x")
+    var rows_per_vec = rows // nvec
+    var dt = x.dtype().to_mojo_dtype()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](scale.numel()))
+    if dt == DType.float32:
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[Float32](), s_rl)
+        var SH = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+            shift.buf.unsafe_ptr().bitcast[Float32](), s_rl)
+        var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[Float32](), x_rl)
+        ctx.enqueue_function[_norm_modulate_kernel_f32, _norm_modulate_kernel_f32](
+            X, SC, SH, O, d, rows_per_vec, eps, grid_dim=rows, block_dim=_TPB)
+    elif dt == DType.bfloat16:
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        var SC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            scale.buf.unsafe_ptr().bitcast[BFloat16](), s_rl)
+        var SH = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+            shift.buf.unsafe_ptr().bitcast[BFloat16](), s_rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl)
+        ctx.enqueue_function[_norm_modulate_kernel_bf16, _norm_modulate_kernel_bf16](
+            X, SC, SH, O, d, rows_per_vec, eps, grid_dim=rows, block_dim=_TPB)
+    else:
+        raise Error("norm_modulate: only F32/BF16 supported")
+    return Tensor(out_buf^, x.shape(), x.dtype())
+
+
 def layer_norm(
     x: Tensor, weight: Tensor, bias: Tensor, eps: Float32, ctx: DeviceContext
 ) raises -> Tensor:

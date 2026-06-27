@@ -819,6 +819,12 @@ syntactically valid PNG is not enough. This directly addresses the bad-output
 failure mode where an artifact has metadata but is blank, flat, stub-like, or
 obvious high-frequency noise.
 
+2026-06-27 update: the shared helper and Rust result manifest gate now also
+report top/bottom/left/right/quadrant region stats. They fail half-frame or
+quadrant corruption with very low color-bin counts or flat channel stddev,
+covering the Krea preview-style lower-half fill artifact that global image
+stats could miss.
+
 New files:
 
 - `scripts/visual_health.py`

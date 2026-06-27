@@ -280,8 +280,11 @@ evidence:
   worker.
 
 The API result document exposes the same signal at `/v1/job/:id/result` as
-`visual_health` (`serenity.visual_health.v1`). The rebuilt server reports
-`pass` for current coherent artifacts:
+`visual_health` (`serenity.visual_health.v1`). The visual-health block includes
+global stats plus top/bottom/left/right/quadrant region stats; the 2026-06-27
+guard rejects half-frame or quadrant flat-fill/channel-flat artifacts that can
+pass global dimensions and file-size checks. The rebuilt server reports `pass`
+for current coherent artifacts:
 
 - `job-0016`: 1024x1024 Z-Image, `avg_stddev:68.639`,
   `luminance_range:249.333`, `edge_energy:4.314`, `color_bins:1104`.

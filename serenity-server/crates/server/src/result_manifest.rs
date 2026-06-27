@@ -17,6 +17,10 @@ const VISUAL_MIN_AVG_STDDEV: f64 = 18.0;
 const VISUAL_MIN_LUMINANCE_RANGE: f64 = 55.0;
 const VISUAL_MIN_EDGE_ENERGY: f64 = 1.0;
 const VISUAL_MIN_COLOR_BINS: usize = 48;
+const VISUAL_MIN_REGION_GRAY_STDDEV: f64 = 8.0;
+const VISUAL_MIN_REGION_COLOR_BINS: usize = 16;
+const VISUAL_MIN_REGION_CHANNEL_STDDEV: f64 = 0.5;
+const VISUAL_REGION_CHANNEL_FLAT_MAX_COLOR_BINS: usize = 32;
 
 fn parse_manifest_json(s: &str) -> Value {
     if s.is_empty() {
@@ -34,6 +38,97 @@ fn manifest_pick(obj: &Value, key: &str) -> Value {
 
 fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
+}
+
+struct RegionStats {
+    name: &'static str,
+    gray_stddev: f64,
+    edge_energy: f64,
+    color_bins: usize,
+    rgb_stddev: [f64; 3],
+}
+
+fn region_stats(
+    img: &image::RgbImage,
+    name: &'static str,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) -> RegionStats {
+    let mut sums = [0.0_f64; 3];
+    let mut sums2 = [0.0_f64; 3];
+    let mut gray_sum = 0.0_f64;
+    let mut gray_sum2 = 0.0_f64;
+    let mut edge_sum = 0.0_f64;
+    let mut edge_count = 0.0_f64;
+    let mut color_bins = BTreeSet::<(u8, u8, u8)>::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = img.get_pixel(x, y).0;
+            let r = p[0] as f64;
+            let g = p[1] as f64;
+            let b = p[2] as f64;
+            sums[0] += r;
+            sums[1] += g;
+            sums[2] += b;
+            sums2[0] += r * r;
+            sums2[1] += g * g;
+            sums2[2] += b * b;
+            let gray = (r + g + b) / 3.0;
+            gray_sum += gray;
+            gray_sum2 += gray * gray;
+            color_bins.insert((p[0] >> 4, p[1] >> 4, p[2] >> 4));
+
+            if x > x0 {
+                let q = img.get_pixel(x - 1, y).0;
+                edge_sum += (i16::from(p[0]) - i16::from(q[0])).abs() as f64;
+                edge_sum += (i16::from(p[1]) - i16::from(q[1])).abs() as f64;
+                edge_sum += (i16::from(p[2]) - i16::from(q[2])).abs() as f64;
+                edge_count += 3.0;
+            }
+            if y > y0 {
+                let q = img.get_pixel(x, y - 1).0;
+                edge_sum += (i16::from(p[0]) - i16::from(q[0])).abs() as f64;
+                edge_sum += (i16::from(p[1]) - i16::from(q[1])).abs() as f64;
+                edge_sum += (i16::from(p[2]) - i16::from(q[2])).abs() as f64;
+                edge_count += 3.0;
+            }
+        }
+    }
+    let n = ((x1 - x0) as f64) * ((y1 - y0) as f64);
+    let mean = if n > 0.0 {
+        [sums[0] / n, sums[1] / n, sums[2] / n]
+    } else {
+        [0.0, 0.0, 0.0]
+    };
+    let rgb_stddev = if n > 0.0 {
+        [
+            (sums2[0] / n - mean[0] * mean[0]).max(0.0).sqrt(),
+            (sums2[1] / n - mean[1] * mean[1]).max(0.0).sqrt(),
+            (sums2[2] / n - mean[2] * mean[2]).max(0.0).sqrt(),
+        ]
+    } else {
+        [0.0, 0.0, 0.0]
+    };
+    let gray_mean = if n > 0.0 { gray_sum / n } else { 0.0 };
+    let gray_stddev = if n > 0.0 {
+        (gray_sum2 / n - gray_mean * gray_mean).max(0.0).sqrt()
+    } else {
+        0.0
+    };
+    let edge_energy = if edge_count > 0.0 {
+        edge_sum / edge_count
+    } else {
+        0.0
+    };
+    RegionStats {
+        name,
+        gray_stddev,
+        edge_energy,
+        color_bins: color_bins.len(),
+        rgb_stddev,
+    }
 }
 
 pub(crate) fn visual_health_for_output(output_path: &str, expected: Option<(u32, u32)>) -> Value {
@@ -122,6 +217,20 @@ pub(crate) fn visual_health_for_output(output_path: &str, expected: Option<(u32,
     } else {
         0.0
     };
+    let region_defs = [
+        ("top", 0, 0, width, height / 2),
+        ("bottom", 0, height / 2, width, height),
+        ("left", 0, 0, width / 2, height),
+        ("right", width / 2, 0, width, height),
+        ("top_left", 0, 0, width / 2, height / 2),
+        ("top_right", width / 2, 0, width, height / 2),
+        ("bottom_left", 0, height / 2, width / 2, height),
+        ("bottom_right", width / 2, height / 2, width, height),
+    ];
+    let regions = region_defs
+        .into_iter()
+        .map(|(name, x0, y0, x1, y1)| region_stats(&img, name, x0, y0, x1, y1))
+        .collect::<Vec<_>>();
 
     let mut failures = Vec::<String>::new();
     if let Some((expected_width, expected_height)) = expected {
@@ -143,6 +252,49 @@ pub(crate) fn visual_health_for_output(output_path: &str, expected: Option<(u32,
     if color_bins.len() < VISUAL_MIN_COLOR_BINS {
         failures.push(format!("low_color_bins:{}", color_bins.len()));
     }
+    for region in &regions {
+        let min_channel = region
+            .rgb_stddev
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        if region.gray_stddev < VISUAL_MIN_REGION_GRAY_STDDEV {
+            failures.push(format!(
+                "low_region_gray_stddev:{}:{:.3}",
+                region.name, region.gray_stddev
+            ));
+        }
+        if region.color_bins < VISUAL_MIN_REGION_COLOR_BINS {
+            failures.push(format!(
+                "low_region_color_bins:{}:{}",
+                region.name, region.color_bins
+            ));
+        }
+        if min_channel < VISUAL_MIN_REGION_CHANNEL_STDDEV
+            && region.color_bins <= VISUAL_REGION_CHANNEL_FLAT_MAX_COLOR_BINS
+        {
+            failures.push(format!(
+                "flat_region_channel:{}:{:.3}:color_bins:{}",
+                region.name, min_channel, region.color_bins
+            ));
+        }
+    }
+    let regions_json = regions
+        .iter()
+        .map(|region| {
+            json!({
+                "name": region.name,
+                "gray_stddev": round3(region.gray_stddev),
+                "edge_energy": round3(region.edge_energy),
+                "color_bins": region.color_bins,
+                "rgb_stddev": [
+                    round3(region.rgb_stddev[0]),
+                    round3(region.rgb_stddev[1]),
+                    round3(region.rgb_stddev[2]),
+                ],
+            })
+        })
+        .collect::<Vec<_>>();
 
     json!({
         "schema": "serenity.visual_health.v1",
@@ -157,14 +309,19 @@ pub(crate) fn visual_health_for_output(output_path: &str, expected: Option<(u32,
         "luminance_range": round3(luminance_range),
         "edge_energy": round3(edge_energy),
         "color_bins": color_bins.len(),
+        "regions": regions_json,
         "thresholds": {
             "min_avg_stddev": VISUAL_MIN_AVG_STDDEV,
             "min_luminance_range": VISUAL_MIN_LUMINANCE_RANGE,
             "min_edge_energy": VISUAL_MIN_EDGE_ENERGY,
             "min_color_bins": VISUAL_MIN_COLOR_BINS,
+            "min_region_gray_stddev": VISUAL_MIN_REGION_GRAY_STDDEV,
+            "min_region_color_bins": VISUAL_MIN_REGION_COLOR_BINS,
+            "min_region_channel_stddev": VISUAL_MIN_REGION_CHANNEL_STDDEV,
+            "region_channel_flat_max_color_bins": VISUAL_REGION_CHANNEL_FLAT_MAX_COLOR_BINS,
         },
         "failures": failures,
-        "note": "Heuristic guard against blank, flat, posterized, or placeholder-like PNG outputs; not a sampler-parity or aesthetic-quality score.",
+        "note": "Heuristic guard against blank, flat, posterized, half-frame/channel-flat, or placeholder-like PNG outputs; not a sampler-parity or aesthetic-quality score.",
     })
 }
 
@@ -643,6 +800,36 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .starts_with("wrong_dimensions")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn visual_health_flags_half_frame_channel_flat_corruption() {
+        let dir = temp_manifest_dir("visual_health_half_flat");
+        let path = dir.join("half_flat.png");
+        let mut img = image::RgbImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let pixel = if y < 32 {
+                    image::Rgb([
+                        ((x * 5 + y * 3) % 256) as u8,
+                        ((x * 7 + y * 11) % 256) as u8,
+                        ((x * 13 + y * 17) % 256) as u8,
+                    ])
+                } else {
+                    image::Rgb([(96 + (x % 4) * 8) as u8, (80 + (y % 4) * 8) as u8, 12])
+                };
+                img.put_pixel(x, y, pixel);
+            }
+        }
+        img.save(&path).unwrap();
+        let health = visual_health_for_output(&path.to_string_lossy(), Some((64, 64)));
+        assert_eq!(health["status"], "fail", "{health:#}");
+        let failures = health["failures"].as_array().unwrap();
+        assert!(failures.iter().any(|item| item
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("flat_region_channel:bottom")));
         fs::remove_dir_all(&dir).unwrap();
     }
 

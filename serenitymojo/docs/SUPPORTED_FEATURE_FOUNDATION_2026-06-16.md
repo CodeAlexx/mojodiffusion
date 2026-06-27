@@ -679,8 +679,11 @@ evidence and should remain fail-loud until that gate passes.
 The Rust result API now exposes the same contract as product data. Every
 `/v1/job/:id/result` response includes `visual_health` with schema
 `serenity.visual_health.v1`: dimensions, RGB stddev, luminance range, edge
-energy, color bins, thresholds, and explicit failure reasons. Future server
-result manifests also persist this block when a job completes. Live evidence:
+energy, color bins, region stats, thresholds, and explicit failure reasons.
+As of 2026-06-27 the gate rejects half-frame/quadrant flat-fill artifacts using
+regional color-bin and channel-stddev checks, not just global image stats.
+Future server result manifests also persist this block when a job completes.
+Live evidence:
 
 - `job-0016`: `visual_health.status:"pass"`, 1024x1024,
   `avg_stddev:68.639`, `luminance_range:249.333`, `edge_energy:4.314`,

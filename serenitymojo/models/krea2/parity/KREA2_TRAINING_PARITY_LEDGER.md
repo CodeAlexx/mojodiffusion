@@ -249,3 +249,16 @@ MEASURED outcome (RELIABILITY: every flag default-off, default byte-identical, g
 **Conclusion:** the dominant ~3s lever is the **GEMM efficiency (49%->70%) = the MAX cutlass-config for krea2's shapes,
 below the trainer layer** (same ceiling the slab hit). Trainer-addressable ~5-6% via fusion (B4-B6 + bias-fusion).
 Shipped speed remains the 9x (rms_norm fix). Tooling: nsys post-fix conversion bugged, ncu ERR_NVGPUCTRPERM. KNOWN_ISSUES MJ-0829.
+
+## LoRA SAVE — MJ-0805 fixed (2026-06-27, commit f3db441) — real training USABLE
+
+krea2 trained but never SAVED the LoRA (9 other stacks had save_lora_peft; krea2 didn't).
+Fixed: _krea2_lora_prefix + save_krea2_lora -> save_lora_peft over the 224 main-block
+adapters (28×8), periodic (cfg.save_every) + unconditional FINAL save; io/ffi sys_mkdirs
+(save dir create); krea2.json workspace_dir. PEFT prefixes derived from a REAL ai-toolkit
+krea2 LoRA (exact match diffusion_model.blocks.<bi>.attn.{wq,wk,wv,gate,wo}+.mlp.{gate,up,down}).
+LEAD-VERIFIED the written file: 448 tensors (224 A + 224 B), BF16, blocks 0..27, 8 slots,
+shapes correct (A[16,6144], wk B[1536,16], mlp.gate B[16384,16]) = valid re-loadable PEFT.
+Real 512px run: 20 steps, ~4.2s/step, no OOM, FINAL save wrote 224 pairs / 107MB.
+512px needs LTMAX=896 (70-sample giger captions reach 803, ×128-aligned); 1024px default
+keeps LTMAX=768 (4-sample subset ≤647). SCOPE: main-block only (txtfusion frozen-skip).

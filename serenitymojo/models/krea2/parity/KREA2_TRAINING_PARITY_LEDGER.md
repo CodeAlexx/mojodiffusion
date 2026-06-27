@@ -262,3 +262,16 @@ shapes correct (A[16,6144], wk B[1536,16], mlp.gate B[16384,16]) = valid re-load
 Real 512px run: 20 steps, ~4.2s/step, no OOM, FINAL save wrote 224 pairs / 107MB.
 512px needs LTMAX=896 (70-sample giger captions reach 803, ×128-aligned); 1024px default
 keeps LTMAX=768 (4-sample subset ≤647). SCOPE: main-block only (txtfusion frozen-skip).
+
+## LoRA INFERENCE — works + visibly shifts (2026-06-27, aa0d83e)
+
+The full round-trip: train→save→load→INFERENCE→visible shift. Fixes:
+- fp8-RESIDENT inference (build_krea2_resident_fp8 once before denoise, dequant per block): killed the
+  per-step 26GB disk re-stream (~85s/step antipattern Alex flagged) → ~28min → ~7.5min/image.
+- LoRA-apply overlay (_wb_lora, --lora): LoraSet (re-load-proven) W+=scale·(B@A) per block, never baked.
+- OOM fix (MJ-1019, krea2_dit:1618): per-block `if lora: ctx.synchronize()` — the LoRA overlay's per-block
+  transients (×8 mod ×28 blk ×2 fwd) piled within each forward → OOM step 17; the fence drains them.
+  Verified: image B 20 steps, vram FLAT 18.9↔22.7GB no creep.
+- MILESTONE (lead): A (no-LoRA) vs B (+512px LoRA) pixel diff mean_abs 1.66, 15% px changed = DIFFER.
+- STILL ~7.5min: inference attn = tiled math O(L²) at L=4864; flash-wire (real_len=L → cuDNN flash O(L))
+  in flight for ≤4min. perf-pass merged (035ab8a: d_g/_colsum/conv2d wins). boxjana 2000-step run queued.

@@ -552,10 +552,7 @@ struct SDXLUNet[LH: Int, LW: Int](Movable):
 
 # ── module-level helpers ──────────────────────────────────────────────────────
 def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-    ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-    ctx.synchronize()
-    return Tensor(dev^, x.shape(), x.dtype())
+    return x.clone(ctx)
 
 
 # Pop the last skip (LIFO) and return a fresh Tensor clone (the ArcPointer keeps

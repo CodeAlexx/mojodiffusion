@@ -477,10 +477,7 @@ struct HiDreamO1DiT[S: Int]:
         return name in self.name_to_idx
 
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
-        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
-        return Tensor(dev^, x.shape(), x.dtype())
+        return x.clone(ctx)
 
     # ── embedding gather: ids -> [1, seq, hidden] ────────────────────────────
     def _embed(self, ids: List[Int], ctx: DeviceContext) raises -> Tensor:
@@ -768,10 +765,7 @@ struct HiDreamO1Offloaded[S: Int](Movable):
         return self.shared[name][]
 
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
-        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
-        return Tensor(dev^, x.shape(), x.dtype())
+        return x.clone(ctx)
 
     def _embed(self, ids: List[Int], ctx: DeviceContext) raises -> Tensor:
         ref table = self._w(String("model.language_model.embed_tokens.weight"))
@@ -1051,10 +1045,7 @@ def _scatter_row(
     x: Tensor, repl: Tensor, idx: Int, s: Int, d: Int, ctx: DeviceContext
 ) raises -> Tensor:
     if idx < 0:
-        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
-        return Tensor(dev^, x.shape(), x.dtype())
+        return x.clone(ctx)
     # x is [1, s, d]; slice along dim 1.
     var repl3 = reshape(repl, _row_shape(d), ctx)  # [1, 1, d]
     if idx == 0:

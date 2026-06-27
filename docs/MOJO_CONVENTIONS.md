@@ -55,6 +55,7 @@ wrong is a compile error, not a runtime bug.
 | `STDtype.F32` is a VALUE | NOT `STDtype.f32()` — it's an enum value, no call | handoff §4; `io/dtype.mojo` |
 | `from_host` arg order | `from_host(values, shape, dtype, ctx)` — **values first, ctx last** | handoff §4; `tensor.mojo` ctor block |
 | hot-loop constants | use `zeros_device`, `full_device`, or `scalar_f32_device`; do not use `Tensor.from_host([scalar])` in denoise/train loops | `ops/tensor_algebra.mojo` |
+| device-to-device clone | use `Tensor.clone(ctx)`; do not open-code `enqueue_copy(...); ctx.synchronize()` for owned tensor clones | `tensor.mojo` |
 | no-bias linear | `linear(x, w, Optional[Tensor](), ctx)` — pass an empty Optional for the bias | handoff §4 |
 | `ref` is a RESERVED WORD | never name a variable `ref` | handoff §4 |
 | `List.copy()` may be missing | write a small helper if a deep copy is needed | handoff §4 |
@@ -157,6 +158,11 @@ it is wrong inside sampler denoise loops for `[t]`, CFG constants, masks, and
 zero tensors. Use `zeros_device`, `full_device`, or `scalar_f32_device` from
 `ops/tensor_algebra.mojo`; those allocate the raw byte buffer and fill it on the
 GPU with same-stream ordering.
+
+Use `Tensor.clone(ctx)` for device-to-device owned copies. It allocates a fresh
+device buffer and enqueues the copy on the current stream without synchronizing;
+later same-stream consumers observe the copy in order. Only synchronize when a
+host buffer lifetime or host read actually requires it.
 
 ### F32 interior, storage dtype only at the edges
 Every `ops/*_backward.mojo` runs **F32 interior** (matmuls accumulate F32,

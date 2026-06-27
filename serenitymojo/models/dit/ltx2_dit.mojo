@@ -395,10 +395,7 @@ struct LTX2BlockWeights(Movable):
         return self.weights[self.name_to_idx[name]][]
 
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
-        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
-        return Tensor(dev^, x.shape(), x.dtype())
+        return x.clone(ctx)
 
     def _linear_b(
         self, x: Tensor, w_key: String, b_key: String, ctx: DeviceContext
@@ -653,10 +650,7 @@ def ltx2_block_forward_video_only[B: Int, S: Int, N_TXT: Int](
 
 # D2D buffer clone for contexts reused across regular and NAG branches.
 def _clone_t(x: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-    ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-    ctx.synchronize()
-    return Tensor(dev^, x.shape(), x.dtype())
+    return x.clone(ctx)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1134,10 +1128,7 @@ struct LTX2AVBlockWeights(Movable):
         return out^
 
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
-        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
-        return Tensor(dev^, x.shape(), x.dtype())
+        return x.clone(ctx)
 
     def _linear_b(
         self, x: Tensor, w_key: String, b_key: String, ctx: DeviceContext

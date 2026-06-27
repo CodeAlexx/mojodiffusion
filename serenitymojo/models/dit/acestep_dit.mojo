@@ -142,10 +142,7 @@ def _repeat_kv(
 
 
 def _clone(t: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var dev = ctx.enqueue_create_buffer[DType.uint8](t.nbytes())
-    ctx.enqueue_copy(dst_buf=dev, src_buf=t.buf)
-    ctx.synchronize()
-    return Tensor(dev^, t.shape(), t.dtype())
+    return t.clone(ctx)
 
 
 def _w(

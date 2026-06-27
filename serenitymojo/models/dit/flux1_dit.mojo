@@ -552,10 +552,7 @@ def build_flux1_rope_tables[
 
 # ── deep-copy a weight Tensor (Movable-not-Copyable -> clone for owned bias) ──
 def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-    ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-    ctx.synchronize()
-    return Tensor(dev^, x.shape(), x.dtype())
+    return x.clone(ctx)
 
 
 # ── Offloaded FLUX.1 DiT (BlockLoader streams double/single blocks) ──────────

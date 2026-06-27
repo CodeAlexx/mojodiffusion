@@ -153,10 +153,7 @@ struct ChromaDitCache(Movable):
         return self.weights[idx][]
 
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
-        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
-        return Tensor(dev^, x.shape(), x.dtype())
+        return x.clone(ctx)
 
     def _linear_b(self, x: Tensor, w_key: String, b_key: String, ctx: DeviceContext) raises -> Tensor:
         ref w = self._w(w_key)

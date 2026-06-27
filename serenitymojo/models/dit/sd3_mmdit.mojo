@@ -147,10 +147,7 @@ def _load_weight_bf16(
 
 
 def _clone(x: Tensor, ctx: DeviceContext) raises -> Tensor:
-    var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-    ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-    ctx.synchronize()
-    return Tensor(dev^, x.shape(), x.dtype())
+    return x.clone(ctx)
 
 
 def _copy_selected_pos_bytes(

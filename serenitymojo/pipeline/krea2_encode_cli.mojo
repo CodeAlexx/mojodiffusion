@@ -37,6 +37,7 @@ from serenitymojo.models.text_encoder.krea2_qwen3vl_4b import (
     load_krea2_qwen3vl_4b,
     encode_krea2_stack,
 )
+from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder
 from serenitymojo.io.cap_cache import save_tensor_bin
 from serenitymojo.pipeline.krea2_paths import (
     KREA2_TE_DIR,
@@ -51,7 +52,7 @@ from serenitymojo.pipeline.krea2_paths import (
 
 
 def _encode_one(
-    enc_dir: String,
+    enc: Qwen3Encoder,
     tok: Qwen3Tokenizer,
     prompt: String,
     name: String,
@@ -60,7 +61,6 @@ def _encode_one(
 ) raises -> Int:
     """Tokenize PREFIX+prompt+SUFFIX, encode the 12-layer krea2 stack, dump it.
     Returns LT (= L_full - 34) so the caller can report it for the pipeline pins."""
-    var enc = load_krea2_qwen3vl_4b(enc_dir, ctx)
     var ids = tok.encode(KREA2_TPL_PREFIX + prompt + KREA2_TPL_SUFFIX)
     var stack = encode_krea2_stack(enc, ids, ctx)   # [1, LT, 12, 2560] bf16
     var sh = stack.shape()
@@ -91,13 +91,10 @@ def main() raises:
     print("[krea2-encode] prompt:", prompt)
     var tok = Qwen3Tokenizer(String(KREA2_TOK_JSON))
 
-    # Load TE ONCE; encode both. (Each _encode_one re-loads the encoder — but it is
-    # a function-local, dropped before the next; combined with process exit, peak is
-    # one TE load. Encoding both from one load would also work, but loading per call
-    # keeps each encoder strictly scoped; the dominant cost is the single ~8 GB load,
-    # and the process exits right after, so the pipeline never coexists with it.)
-    var lt_pos = _encode_one(String(KREA2_TE_DIR), tok, prompt, String("POS"), pos_out, ctx)
-    var lt_neg = _encode_one(String(KREA2_TE_DIR), tok, negative, String("NEG"), neg_out, ctx)
+    # Load TE once, encode both prompts, then exit so the OS releases the MAX pool.
+    var enc = load_krea2_qwen3vl_4b(String(KREA2_TE_DIR), ctx)
+    var lt_pos = _encode_one(enc, tok, prompt, String("POS"), pos_out, ctx)
+    var lt_neg = _encode_one(enc, tok, negative, String("NEG"), neg_out, ctx)
 
     print("[krea2-encode] DONE. LT_POS=", lt_pos, " LT_NEG=", lt_neg,
           " (pipeline comptime LT_POS/LT_NEG must equal these).")

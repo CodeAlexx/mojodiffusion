@@ -87,7 +87,10 @@ from serenitymojo.ops.elementwise_backward import (
     modulate_backward, modulate_backward_slab,
 )
 
-from serenitymojo.models.zimage.weights import ZImageBlockWeights
+from serenitymojo.models.zimage.weights import (
+    ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
+)
+from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.zimage.block import (
     ZImageModVecs, ZImageBlockGrads, ZImageRefinerGrads,
     zimage_block_forward, zimage_refiner_forward,
@@ -1412,6 +1415,84 @@ def zimage_stack_lora_predict_main_device_tensor[
         cap_cos, cap_sin, uni_cos, uni_sin,
         D, F, out_ch, eps, final_eps, ctx,
     )
+
+
+# ── STREAMING (offload) predict: loads each transformer block on demand ───────
+# Identical math + op sequence to zimage_stack_lora_predict_main_device_tensor,
+# but instead of consuming three resident List[ZImageBlockWeights] it loads ONE
+# block at a time from the on-disk sharded transformer (`st`), runs that block's
+# per-block forward, then lets the block drop (TArc refcount → device free) before
+# the next. Peak resident block weight = ONE block (~0.3 GB BF16) instead of the
+# whole ~13 GB stack, so a high-res sample render can co-exist with a trainer that
+# already holds all blocks + StepSlab + optimizer resident.
+#
+# The LoRA overlay (lora) and modulation/aux are still the trainer's LIVE device
+# objects (the LoRA currently being trained), so the streamed forward IS the
+# model+LoRA forward — only the BASE block weights are streamed (they are frozen,
+# so re-reading them from disk is byte-identical to the resident copy).
+#
+# Block prefixes match the diffusers transformer dir layout used by the resident
+# loader (zimage_generate / train load): noise_refiner.{i}, context_refiner.{i},
+# layers.{i}. num_nr/num_cr/num_main give the per-stream depths.
+def zimage_stack_lora_predict_main_streamed[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    st: ShardedSafeTensors,
+    x_seq: List[Float32], cap_seq: List[Float32],
+    num_nr: Int, num_cr: Int, num_main: Int,
+    nr_mod: List[ZImageModVecs], main_mod: List[ZImageModVecs],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    # ── noise refiner (modulated, frozen): stream each block, run, drop ──
+    var xs_arc = TArc(_t(x_seq, [N_IMG, D], ctx))
+    for i in range(num_nr):
+        var wb = load_zimage_block_weights_prefixed_mixed(
+            st, String("noise_refiner.") + String(i), ctx
+        )
+        var mv_dev = zimage_modvecs_to_device(nr_mod[i], D, ctx)
+        xs_arc = zimage_block_forward_device_moddev[H, Dh, N_IMG](
+            xs_arc.copy(), wb, mv_dev, x_cos, x_sin, D, F, eps, ctx,
+        )
+        # wb drops here (end of loop iteration) → its device tensors freed.
+
+    # ── context refiner (unmodulated, frozen): stream each block, run, drop ──
+    var cs_arc = TArc(_t(cap_seq, [N_TXT, D], ctx))
+    for i in range(num_cr):
+        var wb = load_zimage_block_weights_prefixed_mixed(
+            st, String("context_refiner.") + String(i), ctx
+        )
+        cs_arc = zimage_refiner_forward_device[H, Dh, N_TXT](
+            cs_arc.copy(), wb, cap_cos, cap_sin, D, F, eps, ctx,
+        )
+
+    # ── main stack (modulated + live LoRA overlay): stream each block ──
+    var x_arc = TArc(concat(0, ctx, xs_arc[], cs_arc[]))
+    for i in range(num_main):
+        var wb = load_zimage_block_weights_prefixed_mixed(
+            st, String("layers.") + String(i), ctx
+        )
+        var mv_dev = zimage_modvecs_to_device(main_mod[i], D, ctx)
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        x_arc = zimage_block_lora_predict_device_tensor_moddev[H, Dh, S](
+            x_arc.copy(), wb, mv_dev, bl, uni_cos, uni_sin, D, F, eps, ctx,
+        )
+
+    # ── final layer norm + modulate + projection (same as resident path) ──
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = modulate(
+        ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    return linear(x_out_t, final_lin_w, bias^, ctx)
 
 
 def zimage_stack_lora_predict_main_device[

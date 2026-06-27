@@ -10,7 +10,7 @@ from std.sys import argv
 from serenitymojo.io.ffi import sys_system, sys_open, sys_close, O_RDONLY
 
 
-comptime DEFAULT_REQUEST = "/home/alex/mojodiffusion/output/alina_zimage/sample_requests/step500_request.json"
+comptime DEFAULT_REQUEST = "/home/alex/mojodiffusion/output/zimage/sample_requests/step500_request.json"
 comptime DEFAULT_SAMPLER_BIN = "/tmp/zimage_generate_prod"
 
 

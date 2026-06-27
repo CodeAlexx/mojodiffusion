@@ -41,3 +41,4 @@ serenity-server/target/
 *PORT_PLAN*.md
 *RUST_STATE*.md
 *ARCH_INVENTORY*.md
+serenitymojo/models/**/parity/boogu_dumps/

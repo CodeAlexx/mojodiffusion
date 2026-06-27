@@ -183,6 +183,24 @@ def ot_cache_dir_from_train_config(cfg: TrainConfig, default_cache_dir: String) 
     return default_cache_dir.copy()
 
 
+def ot_stage_dir_from_train_config(cfg: TrainConfig, default_cache_dir: String) raises -> String:
+    """Precache staging dir, derived deterministically from the cache dir so the
+    stager and the prepare step agree without a separate config key:
+    `<cache_dir>_stage`. Used by the config-driven Mojo precache tools."""
+    var cache_dir = ot_cache_dir_from_train_config(cfg, default_cache_dir)
+    if cache_dir == String(""):
+        raise Error("ot_stage_dir_from_train_config: config has no cache_dir/dataset_cache_dir")
+    return cache_dir + String("_stage")
+
+
+def ot_dataset_path_from_train_config(cfg: TrainConfig) raises -> String:
+    """Raw image+caption source dir for precaching. Fail loud if the config
+    omits it — there is no hardcoded dataset fallback."""
+    if cfg.dataset_path == String(""):
+        raise Error("config has no dataset_path; precache requires a raw image source dir")
+    return cfg.dataset_path.copy()
+
+
 def ot_output_lora_path_from_train_config(
     cfg: TrainConfig, default_lora_dir: String, prefix: String, completed_step: Int,
 ) -> String:

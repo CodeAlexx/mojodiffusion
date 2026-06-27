@@ -25,7 +25,7 @@
 #   • VAE: scale=0.3611, shift=0.1159 (baked in decoder); PNG SIGNED [-1,1]
 #
 # Verified on 2026-06-02: three 1024 caption-based samples from
-# output/alina_zimage/zimage_lora_step2000.safetensors completed with the LoRA
+# output/zimage/zimage_lora_step2000.safetensors completed with the LoRA
 # overlay loaded (210 main adapters, alpha/rank=0.0625).
 #
 # Build:
@@ -56,6 +56,9 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
 from serenitymojo.models.vae.zimage_decoder import ZImageDecoder
+from serenitymojo.models.vae.zimage_tiled_decode import (
+    zimage_tiled_decode_with_decoder,
+)
 from serenitymojo.models.zimage.weights import (
     ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
 )
@@ -135,6 +138,13 @@ comptime PI = 6.283185307179586  # 2*pi
 # ── default demo config (preserves the original standalone main() image) ──
 comptime DEFAULT_HL = 128     # latent height = image_h / 8 (1024²)
 comptime DEFAULT_WL = 128
+# High-res latent grids (image = 8 * latent). Denoise uses cuDNN flash SDPA
+# (O(S) memory — no [H,S,S] score matrix), so the only remaining hi-res wall is
+# the VAE decode, handled with tiled decode for 1536/2048.
+comptime HL_1536 = 192        # 1536² → latent 192 (tiled decode, TILE=96)
+comptime WL_1536 = 192
+comptime HL_2048 = 256        # 2048² → latent 256 (tiled decode, TILE=128)
+comptime WL_2048 = 256
 comptime DEFAULT_STEPS = 30
 comptime DEFAULT_CFG = Float32(4.0)
 comptime DEFAULT_SEED = UInt64(42)
@@ -1044,10 +1054,57 @@ def _denoise[HL: Int, WL: Int](
     return ZImageDenoiseResult(x^, denoise_seconds)  # dit_c destroyed → weights freed before VAE load
 
 
+# ── one comptime latent grid: denoise (flash) + VAE decode ───────────────────
+# TILED selects the decode strategy at comptime:
+#   • TILED=False → whole-frame ZImageDecoder[HL,WL].decode (the verified 1024
+#     path; byte-for-byte preserved).
+#   • TILED=True  → zimage_tiled_decode_with_decoder with a half-size
+#     ZImageDecoder[HL//2,WL//2] (3×3 overlapping latent crops + feathered
+#     blend) so 1536/2048 decode within 24 GB. The DiT weights are freed when
+#     `_denoise` returns (its locals are destroyed), so the decode owns the GPU.
+def _run_grid[
+    HL: Int, WL: Int, TILED: Bool
+](
+    caps: CapFeatsFixed, steps: Int, cfg: Float32, seed: UInt64,
+    lora_path: String, lora_multiplier: Float32,
+    mut events: List[ZImageEvent], trace_denoise: Bool,
+    mut min_free: Int, total_vram: Int, text_encode_seconds: Float64,
+    ctx: DeviceContext,
+) raises -> ZImageGenerateResult:
+    var denoised = _denoise[HL, WL](
+        caps, steps, cfg, seed, lora_path, lora_multiplier, events,
+        trace_denoise, ctx,
+    )
+    min_free = _update_min_free(ctx, min_free)
+    var vae_t0 = perf_counter_ns()
+    var rgb: Tensor
+    comptime if TILED:
+        comptime TILE_H = HL // 2
+        comptime TILE_W = WL // 2
+        print("[vae] decoding latent → RGB (tiled 3×3, tile latent", TILE_H, "x", TILE_W, ")")
+        var dec = ZImageDecoder[TILE_H, TILE_W].load(VAE_DIR, ctx)
+        rgb = zimage_tiled_decode_with_decoder[HL, WL, TILE_H, TILE_W](
+            _cast(denoised.latent, STDtype.BF16, ctx), dec, ctx
+        )
+    else:
+        print("[vae] decoding latent → RGB")
+        var dec = ZImageDecoder[HL, WL].load(VAE_DIR, ctx)
+        rgb = dec.decode(_cast(denoised.latent, STDtype.BF16, ctx), ctx)
+    var vae_decode_seconds = Float64(perf_counter_ns() - vae_t0) / 1.0e9
+    min_free = _update_min_free(ctx, min_free)
+    events.append(ZImageEvent(ZEVENT_DONE, steps, steps, String("done")))
+    return ZImageGenerateResult(
+        rgb^, text_encode_seconds, denoised.denoise_seconds,
+        vae_decode_seconds, _peak_vram_mib(total_vram, min_free)
+    )
+
+
 # ── reusable generation entry (RUNTIME prompt) ──────────────────────────────
 # steps/cfg/seed honored at runtime; width/height drive the comptime latent
-# grid via the wrapper below. width/height must be one of the supported comptime
-# specializations (default 1024² → HL=WL=128). Returns decoded RGB [1,3,8HL,8WL].
+# grid via the dispatch below. width/height must be one of the supported comptime
+# specializations: 1024² (HL=WL=128, whole-frame decode), 1536² (HL=WL=192,
+# tiled decode), 2048² (HL=WL=256, tiled decode). Returns decoded RGB
+# [1,3,8HL,8WL].
 def zimage_generate(
     prompt: String, negative: String,
     steps: Int, cfg: Float32, seed: UInt64,
@@ -1062,38 +1119,37 @@ def zimage_generate(
     var caps = encode_captions_fixed(prompt, negative, ctx)
     var text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
     min_free = _update_min_free(ctx, min_free)
-    # Dispatch the comptime latent grid from runtime width/height. Only the
-    # verified 1024² grid is wired today; add cases as other sizes are verified.
+    # Dispatch the comptime latent grid from runtime width/height. Flash SDPA
+    # makes the denoise O(S) memory at every grid; the decode is whole-frame at
+    # 1024 (verified parity) and tiled at 1536/2048 (fits 24 GB).
     var hl = height // 8
     var wl = width // 8
     if hl == DEFAULT_HL and wl == DEFAULT_WL:
-        var denoised = _denoise[DEFAULT_HL, DEFAULT_WL](
+        return _run_grid[DEFAULT_HL, DEFAULT_WL, False](
             caps, steps, cfg, seed, lora_path, lora_multiplier, events,
-            trace_denoise, ctx,
+            trace_denoise, min_free, total_vram, text_encode_seconds, ctx,
         )
-        min_free = _update_min_free(ctx, min_free)
-        print("[vae] decoding latent → RGB")
-        var vae_t0 = perf_counter_ns()
-        var dec = ZImageDecoder[DEFAULT_HL, DEFAULT_WL].load(VAE_DIR, ctx)
-        var rgb = dec.decode(_cast(denoised.latent, STDtype.BF16, ctx), ctx)
-        var vae_decode_seconds = Float64(perf_counter_ns() - vae_t0) / 1.0e9
-        min_free = _update_min_free(ctx, min_free)
-        events.append(ZImageEvent(ZEVENT_DONE, steps, steps, String("done")))
-        return ZImageGenerateResult(
-            rgb^, text_encode_seconds, denoised.denoise_seconds,
-            vae_decode_seconds, _peak_vram_mib(total_vram, min_free)
+    if hl == HL_1536 and wl == WL_1536:
+        return _run_grid[HL_1536, WL_1536, True](
+            caps, steps, cfg, seed, lora_path, lora_multiplier, events,
+            trace_denoise, min_free, total_vram, text_encode_seconds, ctx,
+        )
+    if hl == HL_2048 and wl == WL_2048:
+        return _run_grid[HL_2048, WL_2048, True](
+            caps, steps, cfg, seed, lora_path, lora_multiplier, events,
+            trace_denoise, min_free, total_vram, text_encode_seconds, ctx,
         )
     events.append(
         ZImageEvent(
             ZEVENT_FAILED, 0, steps,
             String("unsupported size ") + String(width) + "x" + String(height)
-            + " (only 1024x1024 is wired; latent grid is comptime)",
+            + " (only 1024/1536/2048 square are wired; latent grid is comptime)",
         )
     )
     raise Error(
         String("zimage_generate: unsupported width/height ")
         + String(width) + "x" + String(height)
-        + " — only 1024x1024 (HL=WL=128) is comptime-specialized today."
+        + " — only 1024x1024, 1536x1536, 2048x2048 are comptime-specialized today."
     )
 
 

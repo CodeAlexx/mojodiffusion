@@ -66,6 +66,11 @@
 
 from std.gpu.host import DeviceContext
 from std.math import sqrt
+from std.collections import Optional
+from std.sys import argv
+from serenitymojo.lora import LoraSet
+from serenitymojo.models.krea2.krea2_stack import build_krea2_resident_fp8
+from serenitymojo.models.dit.krea2_dit import Krea2ResidentFp8
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -210,6 +215,22 @@ def main() raises:
     print("[krea2] T2I pipeline (DiT/VAE):", HEIGHT, "x", WIDTH, " steps=", STEPS,
           " cfg=", CFG_SCALE)
 
+    # ── --lora <path> [<mult>]: OVERLAY a trained LoRA on the streamed DiT weights
+    # (W += scale·BA per block, never baked). Omit → pristine base (image A). ────
+    var lora = Optional[LoraSet](None)
+    var lora_mult = Float32(1.0)
+    var out_png = String(OUT_PNG)
+    var args = argv()
+    for i in range(len(args)):
+        if args[i] == String("--lora") and i + 1 < len(args):
+            var lp = String(args[i + 1])
+            lora = Optional[LoraSet](LoraSet.load(lp))
+            out_png = String(OUT_PNG) + String(".lora.png")
+            print("[krea2] LoRA OVERLAY:", lp, " adapters=", lora.value().num_mappings(),
+                  " mult=", lora_mult)
+        if args[i] == String("--lora-mult") and i + 1 < len(args):
+            lora_mult = Float32(Float64(String(args[i + 1])))
+
     # ── 1) load the cond/uncond contexts dumped by the krea2_encode_cli child. ──
     # The TEXT ENCODER is NOT loaded here (its ~22 GB load would not leave room for
     # the streamed DiT — measured). Run krea2_encode_cli FIRST; it writes the two
@@ -230,8 +251,23 @@ def main() raises:
     print("[krea2] schedule seq =", seq, " steps =", len(ts) - 1, " ts[0]=", ts[0],
           " ts[-1]=", ts[len(ts) - 1])
 
-    # ── 5) open the streamed DiT checkpoint (bare keys). ─────────────────────
+    # ── 5) open the DiT checkpoint + build the fp8-RESIDENT base ONCE. ────────
+    # Quantize the 28 frozen blocks to fp8 resident (~12GB) at startup → every
+    # forward DEQUANTS the resident block (NO per-step disk read). Kills the
+    # repetitive-disk-read antipattern (was ~1100 block disk reads/image). Disable
+    # with --no-resident (falls back to the per-step disk stream).
     var st = ShardedSafeTensors.open(String(KREA2_RAW))
+    var resident = Optional[Krea2ResidentFp8](None)
+    var use_resident = True
+    for i in range(len(args)):
+        if args[i] == String("--no-resident"):
+            use_resident = False
+    if use_resident:
+        print("[krea2] building fp8-resident base (28 blocks, ~12GB, ONCE) ...")
+        resident = Optional[Krea2ResidentFp8](
+            build_krea2_resident_fp8(st, KREA2_RAW_KEY_PREFIX, NBLOCKS, ctx)
+        )
+        print("[krea2] fp8-resident base DONE — ZERO per-step disk reads.")
 
     # ── 6) Euler integration of the flow ODE with CFG. ───────────────────────
     for si in range(STEPS):
@@ -245,10 +281,12 @@ def main() raises:
         var img_tokens = torch_f32_to_bf16_rne(img_tokens_f32, ctx)  # bf16 feed
 
         var v_cond = krea2_forward[LFULL_POS, LPAD_POS, LT_POS, NBLOCKS](
-            st, img_tokens, ctx_pos, t_t, pos_p, ctx, KREA2_RAW_KEY_PREFIX
+            st, img_tokens, ctx_pos, t_t, pos_p, ctx, KREA2_RAW_KEY_PREFIX,
+            lora, lora_mult, resident,
         )                                                          # [1,imglen,64] bf16
         var v_uncond = krea2_forward[LFULL_NEG, LPAD_NEG, LT_NEG, NBLOCKS](
-            st, img_tokens, ctx_neg, t_t, pos_n, ctx, KREA2_RAW_KEY_PREFIX
+            st, img_tokens, ctx_neg, t_t, pos_n, ctx, KREA2_RAW_KEY_PREFIX,
+            lora, lora_mult, resident,
         )
         # CFG: v = v_cond + cfg*(v_cond - v_uncond)  (krea2_cfg), then to F32.
         var v_bf16 = krea2_cfg(v_cond, v_uncond, CFG_SCALE, ctx)
@@ -269,5 +307,5 @@ def main() raises:
     var image = dec.decode(latent_bf16, ctx)                       # [1,3,H,W] [-1,1]
 
     # ── 8) write PNG (signed [-1,1] -> uint8, == (img+1)*127.5). ─────────────
-    save_png(image, String(OUT_PNG), ctx, ValueRange.SIGNED)
-    print("[krea2] wrote", OUT_PNG)
+    save_png(image, out_png, ctx, ValueRange.SIGNED)
+    print("[krea2] wrote", out_png)

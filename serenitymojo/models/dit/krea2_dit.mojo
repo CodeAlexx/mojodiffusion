@@ -59,12 +59,49 @@ from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
+from serenitymojo.lora import LoraSet
+from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
 
 
 comptime _DYN1 = Layout.row_major(-1)
 comptime _DYN2 = Layout.row_major(-1, -1)
 comptime _BLOCK = 256
 comptime _MAX_AXES = 4  # global/h/w (+ optional 4th); bounded.
+
+
+# ── fp8-RESIDENT base store (MOVED here from krea2_stack.mojo to break the
+# krea2_stack→krea2_dit import cycle: krea2_forward needs the type, krea2_stack
+# already imports krea2_dit, so these structs live in the lower module). Pure data
+# holders (ArcPointer carriers). build_krea2_resident_fp8 stays in krea2_stack. ──
+struct Krea2BlockResidentFp8(Copyable, Movable):
+    var fp8: List[ArcPointer[Tensor]]    # len 8: E4M3 bytes [out,in] per matmul weight
+    var scale: List[ArcPointer[Tensor]]  # len 8: F32 per-output-row scale [out]
+    var qnorm_scale: ArcPointer[Tensor]  # F32 [HEADDIM]
+    var knorm_scale: ArcPointer[Tensor]  # F32 [HEADDIM]
+    var prenorm_scale: ArcPointer[Tensor]   # F32 [features]
+    var postnorm_scale: ArcPointer[Tensor]  # F32 [features]
+    var mod_lin: ArcPointer[Tensor]         # bf16 [6*features]
+
+    def __init__(
+        out self, var fp8: List[ArcPointer[Tensor]], var scale: List[ArcPointer[Tensor]],
+        var qnorm_scale: ArcPointer[Tensor], var knorm_scale: ArcPointer[Tensor],
+        var prenorm_scale: ArcPointer[Tensor], var postnorm_scale: ArcPointer[Tensor],
+        var mod_lin: ArcPointer[Tensor],
+    ):
+        self.fp8 = fp8^
+        self.scale = scale^
+        self.qnorm_scale = qnorm_scale^
+        self.knorm_scale = knorm_scale^
+        self.prenorm_scale = prenorm_scale^
+        self.postnorm_scale = postnorm_scale^
+        self.mod_lin = mod_lin^
+
+
+struct Krea2ResidentFp8(Copyable, Movable):
+    var blocks: List[Krea2BlockResidentFp8]   # len == nblocks
+
+    def __init__(out self, var blocks: List[Krea2BlockResidentFp8]):
+        self.blocks = blocks^
 
 
 # ── Krea2Config ──────────────────────────────────────────────────────────────
@@ -1263,6 +1300,80 @@ def _wb(st: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> Tenso
     return Tensor.from_view_as_bf16(st.tensor_view(key), ctx)
 
 
+# ── _wb + LoRA OVERLAY ([[feedback_lora_never_fused]]): load the bf16 base weight,
+# then if `lora` carries an adapter for `base_key`, ADD scale·(B@A) in-memory.
+# OVERLAY only — the saved checkpoint is NEVER modified; the delta is added to the
+# freshly-streamed per-block weight, freed when the block iteration ends. base_key
+# is the krea2 base weight key (e.g. blocks.0.attn.wq.weight); the LoraSet resolved
+# the PEFT prefix diffusion_model.blocks.0.attn.wq → blocks.0.attn.wq.weight at load.
+# Apply the LoRA overlay to an already-loaded base weight `w` (W += scale·BA when
+# the LoraSet has an adapter for base_key). Shared by the disk-stream (_wb_lora)
+# and the fp8-resident (_blk_w8) paths so the overlay math is identical either way.
+def _apply_lora(
+    var w: Tensor, base_key: String,
+    lora: Optional[LoraSet], multiplier: Float32, ctx: DeviceContext,
+) raises -> Tensor:
+    if not lora:
+        return w^
+    ref ls = lora.value()
+    for ref m in ls.mappings:
+        if m.base_key == base_key:
+            var scale = ls._module_scale(m, multiplier, ctx)
+            var delta = ls._compute_delta(m, scale, w.dtype(), ctx)  # [out,in] in w's dtype
+            return add(w, delta, ctx)
+    return w^
+
+
+def _wb_lora(
+    st: ShardedSafeTensors, key: String, base_key: String,
+    lora: Optional[LoraSet], multiplier: Float32, ctx: DeviceContext,
+) raises -> Tensor:
+    return _apply_lora(_wb(st, key, ctx), base_key, lora, multiplier, ctx)
+
+
+# ── per-block weight SOURCE helpers: fp8-resident dequant (NO disk) when `resident`
+# is present, else disk-stream. _blk_w8 = the k-th matmul weight (+ LoRA overlay);
+# _blk_scale = the k-th F32 norm scale (0=qnorm 1=knorm 2=prenorm 3=postnorm);
+# _blk_modlin = mod.lin. The resident tensors match the stream dtypes exactly
+# (matmul→bf16 dequant, scales→F32, mod_lin→bf16), so the no-LoRA result is the
+# fp8-quantized base (~0.99 cos vs the bf16-streamed base — the documented tradeoff).
+def _blk_w8(
+    resident: Optional[Krea2ResidentFp8], li: Int, k: Int,
+    st: ShardedSafeTensors, stream_key: String, base_key: String,
+    lora: Optional[LoraSet], multiplier: Float32, ctx: DeviceContext,
+) raises -> Tensor:
+    if resident:
+        ref b = resident.value().blocks[li]
+        var w = fp8_e4m3_dequant_perrow_to_bf16(b.fp8[k][], b.scale[k][], ctx)
+        return _apply_lora(w^, base_key, lora, multiplier, ctx)
+    return _wb_lora(st, stream_key, base_key, lora, multiplier, ctx)
+
+
+def _blk_scale(
+    resident: Optional[Krea2ResidentFp8], li: Int, k: Int,
+    st: ShardedSafeTensors, stream_key: String, ctx: DeviceContext,
+) raises -> Tensor:
+    if resident:
+        ref b = resident.value().blocks[li]
+        if k == 0:
+            return b.qnorm_scale[].clone(ctx)
+        elif k == 1:
+            return b.knorm_scale[].clone(ctx)
+        elif k == 2:
+            return b.prenorm_scale[].clone(ctx)
+        return b.postnorm_scale[].clone(ctx)
+    return _scale(st, stream_key, ctx)
+
+
+def _blk_modlin(
+    resident: Optional[Krea2ResidentFp8], li: Int,
+    st: ShardedSafeTensors, stream_key: String, ctx: DeviceContext,
+) raises -> Tensor:
+    if resident:
+        return resident.value().blocks[li].mod_lin[].clone(ctx)
+    return _wb(st, stream_key, ctx)
+
+
 def _scale(st: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> Tensor:
     return cast_tensor(Tensor.from_view_as_bf16(st.tensor_view(key), ctx), STDtype.F32, ctx)
 
@@ -1314,6 +1425,15 @@ def krea2_forward[
     pos: Tensor,        # [1, LFULL, 3] f32 (txt zeros + img grid ids)
     ctx: DeviceContext,
     key_prefix: String = String("w."),
+    lora: Optional[LoraSet] = Optional[LoraSet](None),  # OVERLAY: when present, each
+    # block's 8 LoRA-target weights get W += scale·(B@A) in-memory (never baked).
+    # base key = key_prefix+"blocks.<li>.<mod>.weight"; default None = pristine base.
+    lora_mult: Float32 = Float32(1.0),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+    # fp8-RESIDENT base: when present, the per-block weights are DEQUANTED from the
+    # ~12GB resident store (built ONCE) instead of re-streamed disk→GPU every forward
+    # → ZERO per-step disk reads (the user's no-repetitive-disk-read directive). The
+    # LoRA overlay applies ON TOP of the dequant'd weight. Default None = disk stream.
 ) raises -> Tensor:
     """Krea2 SingleStreamDiT.forward (mmdit.py:413-461), b==1 inference.
 
@@ -1458,32 +1578,45 @@ def krea2_forward[
     var x = combined_p^
     for li in range(NBLOCKS):
         var p = key_prefix + "blocks." + String(li)
-        # Per-block path: block 0 -> (blk0_mask, None) tiled F32; else -> (None, LFULL)
-        # cuDNN flash. Pass the pre-built Optionals borrowed.
+        # LoRA base-weight key root (bare, no key_prefix — the LoraSet resolved the
+        # PEFT prefix diffusion_model.blocks.<li>.<mod> → blocks.<li>.<mod>.weight).
+        var bk = String("blocks.") + String(li)
+        # Per-block weight SOURCE: fp8-resident dequant (NO disk) when `resident` is
+        # present, else disk-stream via _wb/_scale. Then the 8 matmul weights get the
+        # LoRA overlay (W += scale·BA) on top. The 5 small tensors (mod.lin + 4 norm
+        # scales) come from the same source. _blk_w8 returns the k-th matmul weight
+        # (k: 0=wq 1=wk 2=wv 3=gate 4=wo 5=mlp_gate 6=mlp_up 7=mlp_down).
         x = krea2_single_stream_block[LPAD, HEADS, KVHEADS, HEADDIM](
             x,
             blk_vec2,
-            # ALL float weights bf16 at runtime (reference v.to(bf16)): mod.lin bf16
-            # (ADDED to the bf16 mod vec); matmul weights bf16 (no-op if already bf16
-            # on disk); norm scales = bf16-rounded then F32 for the F32-internal RMSNorm.
-            _wb(st, p + ".mod.lin", ctx),
-            _scale(st, p + ".prenorm.scale", ctx),
-            _scale(st, p + ".postnorm.scale", ctx),
-            _wb(st, p + ".attn.wq.weight", ctx),
-            _wb(st, p + ".attn.wk.weight", ctx),
-            _wb(st, p + ".attn.wv.weight", ctx),
-            _wb(st, p + ".attn.gate.weight", ctx),
-            _wb(st, p + ".attn.wo.weight", ctx),
-            _scale(st, p + ".attn.qknorm.qnorm.scale", ctx),
-            _scale(st, p + ".attn.qknorm.knorm.scale", ctx),
-            _wb(st, p + ".mlp.gate.weight", ctx),
-            _wb(st, p + ".mlp.up.weight", ctx),
-            _wb(st, p + ".mlp.down.weight", ctx),
+            _blk_modlin(resident, li, st, p + ".mod.lin", ctx),
+            _blk_scale(resident, li, 2, st, p + ".prenorm.scale", ctx),   # 2=prenorm
+            _blk_scale(resident, li, 3, st, p + ".postnorm.scale", ctx),  # 3=postnorm
+            _blk_w8(resident, li, 0, st, p + ".attn.wq.weight", bk + ".attn.wq.weight", lora, lora_mult, ctx),
+            _blk_w8(resident, li, 1, st, p + ".attn.wk.weight", bk + ".attn.wk.weight", lora, lora_mult, ctx),
+            _blk_w8(resident, li, 2, st, p + ".attn.wv.weight", bk + ".attn.wv.weight", lora, lora_mult, ctx),
+            _blk_w8(resident, li, 3, st, p + ".attn.gate.weight", bk + ".attn.gate.weight", lora, lora_mult, ctx),
+            _blk_w8(resident, li, 4, st, p + ".attn.wo.weight", bk + ".attn.wo.weight", lora, lora_mult, ctx),
+            _blk_scale(resident, li, 0, st, p + ".attn.qknorm.qnorm.scale", ctx),  # 0=qnorm
+            _blk_scale(resident, li, 1, st, p + ".attn.qknorm.knorm.scale", ctx),  # 1=knorm
+            _blk_w8(resident, li, 5, st, p + ".mlp.gate.weight", bk + ".mlp.gate.weight", lora, lora_mult, ctx),
+            _blk_w8(resident, li, 6, st, p + ".mlp.up.weight", bk + ".mlp.up.weight", lora, lora_mult, ctx),
+            _blk_w8(resident, li, 7, st, p + ".mlp.down.weight", bk + ".mlp.down.weight", lora, lora_mult, ctx),
             rope[0], rope[1],
             blk0_mask_opt if li == 0 else none_mask,
             rl_none if li == 0 else rl_full,
             ctx,
         )
+        # LoRA-path per-block DRAIN: the overlay adds ~7 transient tensors/module
+        # (load A+B, transpose, B@A linear, mul_scalar, cast, add) × 8 modules/block.
+        # Without a per-block fence these deferred frees accumulate across all 28
+        # blocks × 2 forwards/step ON TOP of the 12GB fp8-resident base → OOM (~step
+        # 17, MEASURED). One sync/block reclaims them so peak = resident + ONE block's
+        # transients. Guarded by `if lora` so the no-LoRA path (A, already fits) is
+        # UNCHANGED. (resident-dequant transients alone don't tip it; the LoRA delta
+        # compute is the added pressure that needs the drain.)
+        if lora:
+            ctx.synchronize()
 
     # 13) final = last_layer(combined, t)  (tvec = t3, the tmlp output). ALL bf16:
     # norm.scale bf16-rounded->F32, modulation.lin + linear weight/bias bf16.

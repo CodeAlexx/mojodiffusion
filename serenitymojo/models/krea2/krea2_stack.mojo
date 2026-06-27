@@ -57,6 +57,7 @@ from serenitymojo.ops.tensor_algebra import (
 from serenitymojo.models.dit.krea2_dit import (
     krea2_last_layer, krea2_simple_modulation, _reshape_chunk_to_vec,
     _tile_rope_table,
+    Krea2BlockResidentFp8, Krea2ResidentFp8,   # resident-fp8 structs moved here (no cycle)
 )
 
 # ── reused backward arms (final-layer chain; all pre-built + gated elsewhere) ──
@@ -469,37 +470,9 @@ comptime KREA2_FP8_KEYS = 8
 
 # Per-block resident bundle: 8 (fp8 bytes, per-row F32 scale) pairs + the 5 small
 # resident tensors (qnorm/knorm/prenorm/postnorm F32, mod.lin bf16). Tensor is
-# move-only → the device carriers cross as TArc (Copyable), so a List of these is
-# fine (mirrors Krea2StackWeights holding TArc, not bare Tensor).
-struct Krea2BlockResidentFp8(Copyable, Movable):
-    var fp8: List[TArc]        # len 8: E4M3 bytes [out,in] per matmul weight
-    var scale: List[TArc]      # len 8: F32 per-output-row scale [out]
-    var qnorm_scale: TArc      # F32 [HEADDIM]   (bf16-rounded->F32, == _stream_scale)
-    var knorm_scale: TArc      # F32 [HEADDIM]
-    var prenorm_scale: TArc    # F32 [features]
-    var postnorm_scale: TArc   # F32 [features]
-    var mod_lin: TArc          # bf16 [6*features] (== _stream_wb)
-
-    def __init__(
-        out self, var fp8: List[TArc], var scale: List[TArc],
-        var qnorm_scale: TArc, var knorm_scale: TArc,
-        var prenorm_scale: TArc, var postnorm_scale: TArc, var mod_lin: TArc,
-    ):
-        self.fp8 = fp8^
-        self.scale = scale^
-        self.qnorm_scale = qnorm_scale^
-        self.knorm_scale = knorm_scale^
-        self.prenorm_scale = prenorm_scale^
-        self.postnorm_scale = postnorm_scale^
-        self.mod_lin = mod_lin^
-
-
-# Full resident store: all `nblocks` per-block bundles, quantized once at load.
-struct Krea2ResidentFp8(Copyable, Movable):
-    var blocks: List[Krea2BlockResidentFp8]   # len == nblocks
-
-    def __init__(out self, var blocks: List[Krea2BlockResidentFp8]):
-        self.blocks = blocks^
+# Krea2BlockResidentFp8 / Krea2ResidentFp8 MOVED to krea2_dit.mojo (the lower
+# module — krea2_stack imports krea2_dit, so the inference krea2_forward can take
+# the resident store WITHOUT a circular import). Re-imported at the top of this file.
 
 
 # Quantize one bf16 [out,in] matmul weight ONCE: rowscale → fp8 bytes. Returns

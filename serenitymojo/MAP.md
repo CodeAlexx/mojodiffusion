@@ -117,7 +117,7 @@ but unused by the Z-Image pipeline.
 - **Add a model**: new dir under `models/`. Pattern: a `comptime`-parameterized `struct` holding `List[ArcPointer[Tensor]]` + `Dict[String,Int]` name→idx, a `@staticmethod load(dir, ctx)` over `ShardedSafeTensors` + `Tensor.from_view`, a `_w(name)` borrow, and a `forward(...)` composed of `ops/*`. Compile-time params for any sequence/spatial size the comptime-shaped `sdpa`/`conv2d` need.
 - **Add a kernel**: as above — kernels are inline `def`s launched with `ctx.enqueue_function[knl, knl](...)`. There is no NVRTC-string path; kernels are real Mojo `def`s. Catalog in `docs/SERENITYMOJO_KERNELS.md`.
 - **Run a parity check**: `ParityHarness(cos_threshold=0.999).compare(t, reference_host_list, ctx)` reads the GPU `Tensor` back and computes cos + max-abs in F64. References are numpy/torch oracles produced offline under `*/parity/` (Python is DEV-ONLY; nothing here imports it at runtime).
-- **Build a pipeline**: compose `encode_caption → denoise → decode → save_png` (see `pipeline/zimage_pipeline.mojo`). Free each big model before loading the next by letting it fall out of scope (Movable-not-Copyable → drop frees VRAM).
+- **Build a pipeline**: compose `encode_caption → denoise → decode → save_png` (see `pipeline/zimage_pipeline.mojo`). Free each big model before loading the next by letting it fall out of scope (Movable-not-Copyable → drop frees VRAM). For 1024 LDM/FLUX-style VAE decodes, stage only the final latent across the denoise/decode boundary and use tiled decode; keeping a denoiser/offloader and a full-frame VAE live in one phase can OOM a 24 GB card.
 
 ## 4. Gotchas (project-wide invariants)
 

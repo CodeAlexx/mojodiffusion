@@ -5,12 +5,19 @@
 #
 # This bypasses Mojo CLIP/T5 placeholder token IDs and starts from the exact
 # cached `img_packed`, `t5_hidden`, and `clip_pooled` tensors used by Rust.
+#
+# The 1024 VAE decode is intentionally a separate DeviceContext phase. A prior
+# monolithic path completed all 20 denoise steps but OOMed when the full-frame
+# VAE loaded beside post-DiT allocator state. This smoke now host-stages only the
+# final packed latent, lets the DiT/text tensors drop, then uses the shared 5x5
+# low-memory tiled FLUX decode before writing the PNG.
 
 from std.gpu.host import DeviceContext
 
 from serenitymojo.image.png import ValueRange, save_png
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current, cu_mem_get_info
 from serenitymojo.models.dit.flux1_contract import (
     flux1_default_cached_inputs_path,
     validate_flux1_cached_inputs_header,
@@ -21,9 +28,9 @@ from serenitymojo.models.dit.flux1_dit import (
     Flux1Offloaded,
     build_flux1_rope_tables,
 )
-from serenitymojo.models.vae.ldm_decoder import load_flux1_ldm_decoder
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.tensor_algebra import add, mul_scalar, permute, reshape
+from serenitymojo.pipeline.flux_tiled_decode import flux_tiled_decode_5x5_lowmem
 from serenitymojo.registry.checkpoints import default_manifest_by_id
 from serenitymojo.sampling.flux1_dev import (
     build_flux1_packed_latent_plan,
@@ -124,18 +131,26 @@ def _stats(name: String, t: Tensor, ctx: DeviceContext) raises:
     )
 
 
-def main() raises:
-    var manifest = default_manifest_by_id(String("flux1_dev"))
-    validate_flux1_pipeline_contract(manifest)
-    var inputs_path = flux1_default_cached_inputs_path()
-    validate_flux1_cached_inputs_header(inputs_path)
-    var plan = build_flux1_packed_latent_plan(WIDTH, HEIGHT, N_TXT)
-    plan.validate_dev_1024_contract()
+def _print_vram(tag: String) raises:
+    var mem = cu_mem_get_info()
+    print("[vram]", tag, "used", mem.used_bytes() // (1024 * 1024), "MiB",
+          "free", mem.free_bytes // (1024 * 1024), "MiB")
 
+
+def _packed_shape() -> List[Int]:
+    var sh = List[Int]()
+    sh.append(1)
+    sh.append(N_IMG)
+    sh.append(AE_IN_CHANNELS * 4)
+    return sh^
+
+
+def denoise_cached(inputs_path: String, denoiser_path: String) raises -> List[Float32]:
+    # Return the final packed latent on host. This mirrors flux_sample_cli's
+    # staged loading. The DeviceContext is deliberately scoped to this function
+    # so all offloaded DiT/text allocations drop before the VAE phase starts.
     var ctx = DeviceContext()
-    print("=== FLUX.1 Dev cached-input smoke ===", HEIGHT, "x", WIDTH, STEPS, "steps")
-    print("[contract] cached inputs:", inputs_path)
-
+    _print_vram("flux denoise phase start")
     var inputs = ShardedSafeTensors.open(inputs_path)
     var img = _load_named(inputs, String("img_packed"), ctx)
     var txt = _to_bf16(_load_named(inputs, String("t5_hidden"), ctx), ctx)
@@ -143,7 +158,7 @@ def main() raises:
     _stats(String("img_packed_initial"), img, ctx)
 
     print("[dit] FLUX.1 offloaded DiT")
-    var model = Flux1Offloaded.load(manifest.denoiser_path, Flux1Config.dev(), ctx)
+    var model = Flux1Offloaded.load(denoiser_path, Flux1Config.dev(), ctx)
     var rope = build_flux1_rope_tables[N_IMG, N_TXT, 24, 128](
         IMG_H2, IMG_W2, ctx, STDtype.BF16
     )
@@ -178,11 +193,37 @@ def main() raises:
             _stats(String("pred_step_") + String(i + 1), pred, ctx)
 
     _stats(String("img_packed_denoised"), img, ctx)
-    print("[vae] unpack + decode")
-    var latent = _unpack_latent(img, ctx)
+    var packed_h = cast_tensor(img, STDtype.F32, ctx).to_host(ctx)
+    _print_vram("flux denoise phase end")
+    return packed_h^
+
+
+def main() raises:
+    var manifest = default_manifest_by_id(String("flux1_dev"))
+    validate_flux1_pipeline_contract(manifest)
+    var inputs_path = flux1_default_cached_inputs_path()
+    validate_flux1_cached_inputs_header(inputs_path)
+    var plan = build_flux1_packed_latent_plan(WIDTH, HEIGHT, N_TXT)
+    plan.validate_dev_1024_contract()
+
+    print("=== FLUX.1 Dev cached-input smoke ===", HEIGHT, "x", WIDTH, STEPS, "steps")
+    print("[contract] cached inputs:", inputs_path)
+
+    var packed_h = denoise_cached(inputs_path, manifest.denoiser_path.copy())
+    var ctx = DeviceContext()
+    ctx.synchronize()
+    cu_mempool_trim_current(0)
+    ctx.synchronize()
+
+    print("[vae] unpack + tiled decode (5x5 lowmem overlap+blend)")
+    _print_vram("flux decode phase start")
+    var packed = Tensor.from_host(packed_h, _packed_shape(), STDtype.F32, ctx)
+    var latent = _unpack_latent(packed, ctx)
     _stats(String("latent_unpacked"), latent, ctx)
-    var vae = load_flux1_ldm_decoder[LATENT_H, LATENT_W](manifest.vae_path, ctx)
-    var rgb = vae.decode(latent, ctx)
+    var rgb = flux_tiled_decode_5x5_lowmem[LATENT_H, LATENT_W](
+        latent, manifest.vae_path.copy(), ctx
+    )
     _stats(String("rgb"), rgb, ctx)
+    _print_vram("flux decode phase end")
     save_png(rgb, OUT, ctx, ValueRange.SIGNED)
     print("[done] saved", OUT)

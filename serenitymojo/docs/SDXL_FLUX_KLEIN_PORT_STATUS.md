@@ -409,7 +409,9 @@ Current FLUX.1-dev status (updated 2026-06-09 — RUN-VERIFIED):
 - `pipeline/flux1_pipeline_cached_smoke.mojo` uses the Rust-captured
   `flux1_inputs.safetensors` sidecar and produced a coherent 1024 PNG at
   `output/flux1_cached_inputs.png`. The current path uses `sdpa_nomask` instead
-  of materializing a zero additive mask.
+  of materializing a zero additive mask. It stages the final packed latent to
+  host, drops the DiT/text phase, then decodes in a fresh context with the 5x5
+  low-memory tiled VAE path; the old monolithic decode OOMed after denoise.
 
 Remaining FLUX.1-dev blockers:
 
@@ -417,8 +419,8 @@ Remaining FLUX.1-dev blockers:
 - ✅ all-white image — DONE (T5 fp16→bf16 fix).
 - F32 RoPE table/math parity decision versus the current BF16 table path,
 - memory lifetime cleanup around encoder/DiT/VAE scopes (staged loading + tiled
-  VAE are the current mitigations; a single-shot 1024² decode still OOMs the
-  post-DiT pool),
+  VAE are required mitigations; a single-shot 1024² decode still OOMs beside
+  post-DiT allocator residency),
 - borrowed-bias/per-call allocation cleanup in the FLUX DiT hot path,
 - Rust/Modular **quality** parity (the image is plausible but not yet diffed
   against a reference run; current evidence is "real coherent pixels", not parity),

@@ -164,6 +164,12 @@ inference paths plus HiDream, QwenImage, SenseNova, and Lance model loops.
 `scripts/check_planned_loader_overlap_contract.py` rejects the old no-context
 prefetch shape under the hot model roots.
 
+2026-06-27 status: `QwenImageDitOffloaded` now uses `TurboPlannedLoader`
+internally over `build_qwenimage_block_plan()` while preserving the public
+`QwenImageDitOffloaded.load(dir, ctx)` product API. Its single-branch, paired
+CFG, mixed-text CFG, and edit CFG loops all use the explicit-context turbo
+prefetch contract.
+
 ## Current Sites To Migrate
 
 - Klein now uses `PlannedBlockLoader` in

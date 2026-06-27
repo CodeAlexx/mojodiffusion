@@ -78,7 +78,7 @@ from serenitymojo.ops.tensor_algebra import (
     add_scalar,
 )
 from serenitymojo.offload.block_loader import Block
-from serenitymojo.offload.planned_loader import PlannedBlockLoader
+from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.offload.plan import build_qwenimage_block_plan, OffloadConfig
 
 
@@ -903,14 +903,14 @@ struct QwenImageCfgPreds(Movable):
 @fieldwise_init
 struct QwenImageDitOffloaded(Movable):
     var shared: QwenImageDit
-    var loader: PlannedBlockLoader
+    var loader: TurboPlannedLoader
 
     @staticmethod
     def load(dir: String, ctx: DeviceContext) raises -> QwenImageDitOffloaded:
         var shared = QwenImageDit.load_shared(dir, ctx)
         var plan = build_qwenimage_block_plan()
-        var loader = PlannedBlockLoader.open(
-            dir, plan^, OffloadConfig.synchronous_cfg_paired()
+        var loader = TurboPlannedLoader.open(
+            dir, plan^, OffloadConfig.synchronous_cfg_paired(), ctx
         )
         return QwenImageDitOffloaded(shared^, loader^)
 
@@ -1012,7 +1012,7 @@ struct QwenImageDitOffloaded(Movable):
         var rope = build_qwenimage_rope_tables(
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
-        self.loader.config = OffloadConfig.single_pass()
+        self.loader.set_config(OffloadConfig.single_pass())
         self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
             var handle = self.loader.await_block(i, ctx)
@@ -1058,7 +1058,7 @@ struct QwenImageDitOffloaded(Movable):
         var rope = build_qwenimage_rope_tables(
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
-        self.loader.config = OffloadConfig.synchronous_cfg_paired()
+        self.loader.set_config(OffloadConfig.synchronous_cfg_paired())
         self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
             var handle = self.loader.await_block(i, ctx)
@@ -1119,7 +1119,7 @@ struct QwenImageDitOffloaded(Movable):
         var rope_neg = build_qwenimage_rope_tables(
             frame, h_latent, w_latent, N_TXT_NEG, cfg.num_heads, cfg, dtype, ctx
         )
-        self.loader.config = OffloadConfig.synchronous_cfg_paired()
+        self.loader.set_config(OffloadConfig.synchronous_cfg_paired())
         self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
             var handle = self.loader.await_block(i, ctx)
@@ -1173,7 +1173,7 @@ struct QwenImageDitOffloaded(Movable):
         var rope = build_qwenimage_edit_rope_tables(
             frame, h_latent, w_latent, N_TXT, cfg.num_heads, cfg, dtype, ctx
         )
-        self.loader.config = OffloadConfig.synchronous_cfg_paired()
+        self.loader.set_config(OffloadConfig.synchronous_cfg_paired())
         self.loader.prefetch_with_ctx(0, ctx)
         for i in range(cfg.num_layers):
             var handle = self.loader.await_block(i, ctx)

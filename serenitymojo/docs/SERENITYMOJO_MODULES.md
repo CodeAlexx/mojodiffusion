@@ -740,7 +740,9 @@ FlowMatch schedule, `DROP_IDX=34`, and 1024 token geometry. No GPU tensor load.
 Qwen-Image MMDiT with both all-resident and block-streamed load paths.
 - `QwenImageDit.load_shared(dir, ctx)` keeps only non-block tensors resident.
 - `QwenImageDitOffloaded.load(dir, ctx)` uses `build_qwenimage_block_plan()` and
-  `PlannedBlockLoader` over `transformer_blocks.{0..59}`.
+  `TurboPlannedLoader` over `transformer_blocks.{0..59}`. The public type name
+  stayed the same, but the streamed path now stages the next block on the copy
+  stream with `prefetch_with_ctx`/`prefetch_next_with_ctx`.
 - `forward_cfg[N_IMG,N_TXT,S]` runs positive and negative branches while each
   streamed block is resident, avoiding duplicate block H2D loads for CFG.
 - `forward_edit_cfg[N_TARGET,N_REF,N_TXT,S]` runs the Qwen-Image-Edit

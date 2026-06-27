@@ -105,6 +105,44 @@ def sys_open(path: String, flags: Int32, mode: Int32 = 0) -> Int:
     return fd
 
 
+def sys_mkdir(path: String, mode: Int32 = 0o755) -> Int:
+    """mkdir(2) for a SINGLE path component. Returns 0 on success, -1 on error
+    (incl. EEXIST — callers that want mkdir -p semantics should ignore -1 and
+    proceed; the subsequent open() is the real success test). Same NUL-terminated
+    cstr copy as sys_open (String.unsafe_ptr() is not reliably NUL-terminated for
+    dynamically-built paths)."""
+    var n = path.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = path.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cstr = BytePtr(unsafe_from_address=Int(buf))
+    var rc = Int(external_call["mkdir", Int32](cstr, mode))
+    buf.free()
+    return rc
+
+
+def sys_mkdirs(path: String) -> Int:
+    """mkdir -p: create `path` and all missing parents. Walks the path creating
+    each prefix component (ignoring EEXIST). Returns 0 (best-effort — the caller's
+    open() is the authoritative success test). Linux '/' separators."""
+    var n = path.byte_length()
+    var src = path.as_bytes()
+    var acc = String("")
+    for i in range(n):
+        var c = src[i]
+        if c == ord("/"):
+            if len(acc) > 0:
+                _ = sys_mkdir(acc)   # ignore EEXIST / -1
+            acc += "/"
+        else:
+            acc += chr(Int(c))
+    if len(acc) > 0 and acc != String("/"):
+        _ = sys_mkdir(acc)
+    return 0
+
+
 def sys_system(command: String) -> Int:
     """system(3). Returns libc's raw status code, or -1 on error."""
     var n = command.byte_length()

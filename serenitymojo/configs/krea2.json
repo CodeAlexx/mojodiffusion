@@ -26,6 +26,7 @@
   "max_steps": 2000,
   "save_every": 500,
   "sample_every": 500,
+  "workspace_dir": "/home/alex/trainings/krea2_lora",
 
   "quantized_resident": "fp8_e4m3",
 

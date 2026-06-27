@@ -84,6 +84,8 @@ from serenitymojo.training.schedule import (
 )
 from serenitymojo.training.levers import levers_loss_grad
 from serenitymojo.training.lora_adamw_plain_fused import fused_lora_adamw_plain_step
+from serenitymojo.training.lora_save import NamedLora, save_lora_peft
+from serenitymojo.io.ffi import sys_mkdirs
 
 # ── krea2 config + cache reader + LoRA set ────────────────────────────────────
 from serenitymojo.models.krea2.config import krea2_raw
@@ -133,16 +135,23 @@ comptime NBLOCKS = 28
 comptime EPS = Float32(1.0e-5)
 comptime THETA = Float32(1.0e3)
 
-# ── DIAGNOSTIC: 512px timing arm (KREA2_RES_512, default False) ──────────────
+# ── 512px ARM (KREA2_RES_512, default False) ─────────────────────────────────
 # 1024px (default): clean [1,16,128,128] → IMGLEN=4096 → LFULL=4864 (L=4864).
-# 512px (diagnostic): clean [1,16,64,64] → IMGLEN=1024 → LFULL=1792 (L=1792).
-# Purpose: confirm the 1024px ~8s/step is the expected cost of the 2.7× longer
-# sequence (ai-toolkit trains krea2 at 512px). The step path is IDENTICAL; only
-# the shapes change. In 512 mode the trainer SYNTHESIZES the sample (random 64×64
-# latents) instead of reading the 128×128 giger cache — step TIME depends on the
-# shapes (L=1792), not the values (lead-approved synthetic for the wall-clock test).
-# Default False = the 1024px production arm, byte-untouched.
+# 512px (True):     clean [1,16,64,64]  → IMGLEN=1024 → LFULL=1792 (L=1792).
+# Just flips LH/LW=64 (everything else derives). KREA2_RES_512=True + SYNTH=False
+# = REAL 512px training: reads a 64×64-latent 512px cache via sample_padded (real
+# conditioning + pos). The 512px cache is built by re-staging the source images at
+# 512 (krea2_stage_images.py <dataset> <stage_512> 512) then prepare_cache <stage_512>
+# <cache_512> n 512. ai-toolkit trains krea2 at 512 → this is the matched-resolution
+# real-data run. Default False = the 1024px production arm, byte-untouched.
 comptime KREA2_RES_512 = False
+
+# ── DIAGNOSTIC sub-flag: synthesize the sample (KREA2_RES_512_SYNTH, default False).
+# True = random latents (the wall-clock TIMING diagnostic — step time depends on the
+# shapes L=LFULL, not the values; no cache needed). False = read the REAL cache.
+# Pairs with KREA2_RES_512: True+SYNTH=False = real 512px training; True+SYNTH=True =
+# the 512px timing diagnostic (the prior synthetic arm). Default False = real data.
+comptime KREA2_RES_512_SYNTH = False
 
 # ── DIAGNOSTIC: per-phase wall timing (KREA2_PHASE_TIMING, default False) ─────
 # ctx.synchronize() + perf_counter around each per-step phase to expose the split
@@ -644,6 +653,62 @@ def _build_host_lora(rank: Int, alpha: Float32) -> List[LoraAdapter]:
     return ad^
 
 
+# ── LoRA SAVE (MJ-0805): write the trained adapters as a RE-LOADABLE PEFT file ─
+# The PEFT module prefix MUST match the keys ai-toolkit/inference krea2 LoRAs LOAD
+# by — VERIFIED against a real ai-toolkit krea2 save (output/my_first_lora_v1/*.
+# safetensors): `diffusion_model.blocks.<bi>.attn.{wq,wk,wv,gate,wo}` and
+# `.mlp.{gate,up,down}`, with save_lora_peft appending `.lora_A.weight`[rank,in] /
+# `.lora_B.weight`[out,rank] (BF16). The slot order matches _build_host_lora
+# (0=wq 1=wk 2=wv 3=gate 4=wo 5=mlp_gate 6=mlp_up 7=mlp_down). NOTE: ai-toolkit
+# ALSO trains txtfusion layerwise/refiner blocks; the Mojo trainer is main-block
+# only (frozen-skip text-fusion, config.mojo), so this saves the 28×8=224 main-block
+# adapters — a main-block LoRA that re-loads (txtfusion keys simply absent).
+def _krea2_lora_prefix(bi: Int, slot: Int) raises -> String:
+    var b = String("diffusion_model.blocks.") + String(bi)
+    if slot == 0:
+        return b + ".attn.wq"
+    elif slot == 1:
+        return b + ".attn.wk"
+    elif slot == 2:
+        return b + ".attn.wv"
+    elif slot == 3:
+        return b + ".attn.gate"
+    elif slot == 4:
+        return b + ".attn.wo"
+    elif slot == 5:
+        return b + ".mlp.gate"
+    elif slot == 6:
+        return b + ".mlp.up"
+    elif slot == 7:
+        return b + ".mlp.down"
+    raise Error(String("_krea2_lora_prefix: bad slot ") + String(slot))
+
+
+# Build the LoRA output path from cfg (workspace_dir/<name>_krea2_lora_<step>.safetensors).
+# save_filename_prefix overrides <name> when set (mirrors the other trainers' naming).
+def _lora_save_path(cfg: TrainConfig, step: Int) raises -> String:
+    var stem = cfg.save_filename_prefix if cfg.save_filename_prefix != String("") else (cfg.name + String("_krea2_lora"))
+    return cfg.workspace_dir + String("/") + stem + String("_") + String(step) + String(".safetensors")
+
+
+def save_krea2_lora(
+    host_lora: List[LoraAdapter], path: String, ctx: DeviceContext
+) raises -> Int:
+    """Write the 28×8=224 trained krea2 LoRA adapters as a re-loadable PEFT
+    safetensors (diffusion_model.blocks.<bi>.<module>.lora_A/B.weight). Returns the
+    number of (A,B) pairs written. host_lora is the authoritative host copy
+    (flat, bi*8 + slot order). The caller must ensure the output dir exists (the
+    trainer mkdir -p's cfg.workspace_dir before calling)."""
+    var named = List[NamedLora]()
+    for bi in range(NBLOCKS):
+        for s in range(KREA2_SLOTS_PER_BLOCK):
+            named.append(NamedLora(
+                _krea2_lora_prefix(bi, s),
+                host_lora[bi * KREA2_SLOTS_PER_BLOCK + s].copy(),
+            ))
+    return save_lora_peft(named, path, ctx)
+
+
 # convert the host LoRA set → the device Krea2StackLora the streaming stack consumes.
 def _host_to_device_lora(
     host: List[LoraAdapter], ctx: DeviceContext
@@ -802,10 +867,13 @@ def main() raises:
         var idx = order[step % n]   # LT-bucketed order kept (harmless; padding makes all
         # samples one LFULL size class — the real pool fragmentation fix).
         var sample: KreaTrainSample
-        comptime if KREA2_RES_512:
-            sample = _synthetic_sample(idx, ctx)   # diagnostic 512px timing arm
+        comptime if KREA2_RES_512_SYNTH:
+            sample = _synthetic_sample(idx, ctx)   # diagnostic timing arm (random latents)
         else:
-            sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)  # context+pos padded to LTMAX
+            # REAL data: read the cache (LH/LW comptime → 1024px reads the 128×128 cache,
+            # 512px=True reads a 64×64-latent 512px cache). sample_padded gives real
+            # conditioning + pos padded to LTMAX.
+            sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
         var lt = sample.text_len    # natural caption length (for the additive pad mask)
 
         # flow-match t (= blend coeff = model timestep) per step (seed + step stream).
@@ -862,6 +930,20 @@ def main() raises:
         # step — else the deferred async frees creep up in the tight LTMAX headroom and
         # OOM (~step 11). The per-block sync handles within-the-stack; this handles steps.
 
+        # ── periodic LoRA save (MJ-0805) every cfg.save_every steps ─────────────
+        if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
+            _ = sys_mkdirs(cfg.workspace_dir)   # save_safetensors won't create dirs
+            var sp = _lora_save_path(cfg, step + 1)
+            var npairs = save_krea2_lora(host_lora, sp, ctx)
+            print("  [save] wrote", npairs, "LoRA pairs ->", sp)
+
+    # ── FINAL LoRA save (MJ-0805) — the trained LoRA, re-loadable PEFT ──────────
+    _ = sys_mkdirs(cfg.workspace_dir)
+    var final_path = _lora_save_path(cfg, steps)
+    var n_pairs = save_krea2_lora(host_lora, final_path, ctx)
+    print("")
+    print("[save] FINAL LoRA:", n_pairs, "pairs (", n_pairs * 2, "tensors) ->", final_path)
+
     print("")
     print("VERDICT: ran", steps, "steps. Lead checks loss DROPPING + grad_norm",
-          "nonzero + (fits, no OOM = streaming works).")
+          "nonzero + (fits, no OOM = streaming works) + LoRA SAVED (re-loadable PEFT).")

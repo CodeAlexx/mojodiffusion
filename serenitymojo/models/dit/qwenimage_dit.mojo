@@ -76,6 +76,9 @@ from serenitymojo.ops.tensor_algebra import (
     add,
     mul,
     add_scalar,
+    zeros_device,
+    full_device,
+    scalar_f32_device,
 )
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
@@ -380,10 +383,7 @@ struct QwenImageDit(Movable):
     # Clone a tiny weight (bias) into an owned Tensor so it can be passed as
     # Optional[Tensor] (Tensor not Copyable -> can't pass a borrow directly).
     def _clone(self, x: Tensor, ctx: DeviceContext) raises -> Tensor:
-        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
-        return Tensor(dev^, x.shape(), x.dtype())
+        return x.clone(ctx)
 
     # Linear with bias borrowed from the weight store.
     def _linear_b(
@@ -405,15 +405,10 @@ struct QwenImageDit(Movable):
     ) raises -> Tensor:
         var dim = x.shape()[len(x.shape()) - 1]
         var dtype = x.dtype()
-        var ones = List[Float32]()
-        var zeros = List[Float32]()
-        for _i in range(dim):
-            ones.append(Float32(1.0))
-            zeros.append(Float32(0.0))
         var osh = List[Int]()
         osh.append(dim)
-        var g = Tensor.from_host(ones, osh.copy(), dtype, ctx)
-        var z = Tensor.from_host(zeros, osh^, dtype, ctx)
+        var g = full_device(osh.copy(), Float32(1.0), dtype, ctx)
+        var z = zeros_device(osh^, dtype, ctx)
         return layer_norm(x, g, z, self.config.eps, ctx)
 
     # AdaLN modulate over a [1, N, dim] tensor with [1, dim] scale/shift vectors:
@@ -436,13 +431,11 @@ struct QwenImageDit(Movable):
     def _zeros_tokens(
         self, seq_len: Int, dim: Int, dtype: STDtype, ctx: DeviceContext
     ) raises -> Tensor:
-        var data = List[Float32]()
-        data.resize(seq_len * dim, Float32(0.0))
         var sh = List[Int]()
         sh.append(1)
         sh.append(seq_len)
         sh.append(dim)
-        return Tensor.from_host(data, sh^, dtype, ctx)
+        return zeros_device(sh^, dtype, ctx)
 
     def _mod_slice_pair(
         self,
@@ -817,11 +810,7 @@ struct QwenImageDit(Movable):
         var txt = self._linear_b(txt_normed, "txt_in.weight", "txt_in.bias", ctx)
 
         # ── time_text_embed: sinusoidal(t*1000, 256, cos-then-sin) -> MLP ──
-        var t_host = List[Float32]()
-        t_host.append(timestep * Float32(1000.0))
-        var t_sh = List[Int]()
-        t_sh.append(1)
-        var t_tensor = Tensor.from_host(t_host, t_sh^, STDtype.F32, ctx)
+        var t_tensor = scalar_f32_device(timestep * Float32(1000.0), ctx)
         # timestep_embedding computes angle = t * exp(-ln(max_period)*i/half),
         # cos-first-then-sin (matches diffusers flip_sin_to_cos=True). max_period
         # 10000. We pre-scaled t by 1000 to fold in diffusers scale=1000.
@@ -887,10 +876,7 @@ def _shape3(a: Int, b: Int, c: Int) -> List[Int]:
 # Cast a Tensor to a target dtype if it differs (uses ops/cast).
 def _cast_like(x: Tensor, dtype: STDtype, ctx: DeviceContext) raises -> Tensor:
     if x.dtype() == dtype:
-        var dev = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
-        ctx.enqueue_copy(dst_buf=dev, src_buf=x.buf)
-        ctx.synchronize()
-        return Tensor(dev^, x.shape(), x.dtype())
+        return x.clone(ctx)
     return cast_tensor(x, dtype, ctx)
 
 
@@ -951,11 +937,7 @@ struct QwenImageDitOffloaded(Movable):
         var cfg = self.shared.config
         var dim = cfg.inner_dim
         var dtype = self.shared._w(String("img_in.weight")).dtype()
-        var t_host = List[Float32]()
-        t_host.append(timestep * Float32(1000.0))
-        var t_sh = List[Int]()
-        t_sh.append(1)
-        var t_tensor = Tensor.from_host(t_host, t_sh^, STDtype.F32, ctx)
+        var t_tensor = scalar_f32_device(timestep * Float32(1000.0), ctx)
         var t_embed = timestep_embedding(
             t_tensor, cfg.timestep_dim, ctx, Float32(10000.0), dtype
         )

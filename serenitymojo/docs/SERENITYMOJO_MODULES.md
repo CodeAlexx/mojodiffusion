@@ -743,6 +743,9 @@ Qwen-Image MMDiT with both all-resident and block-streamed load paths.
   `TurboPlannedLoader` over `transformer_blocks.{0..59}`. The public type name
   stayed the same, but the streamed path now stages the next block on the copy
   stream with `prefetch_with_ctx`/`prefetch_next_with_ctx`.
+- Qwen hot-loop constants now use device constructors (`scalar_f32_device`,
+  `full_device`, `zeros_device`), and borrowed bias clones use `Tensor.clone`
+  without draining the stream.
 - `forward_cfg[N_IMG,N_TXT,S]` runs positive and negative branches while each
   streamed block is resident, avoiding duplicate block H2D loads for CFG.
 - `forward_edit_cfg[N_TARGET,N_REF,N_TXT,S]` runs the Qwen-Image-Edit

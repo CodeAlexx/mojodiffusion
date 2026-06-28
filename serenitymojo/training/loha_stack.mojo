@@ -18,6 +18,7 @@
 # ⇒ ΔW==0 (the LoHa zero-leg), exactly like the primitive.
 
 from std.collections import List
+from std.math import sqrt
 from std.gpu.host import DeviceContext
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.loha_adapter import (
@@ -331,3 +332,54 @@ def save_klein_loha(set: KleinLoHaSet, path: String, ctx: DeviceContext) raises 
             if set.sgl_active[flat]:
                 named.append(NamedLoHa(klein_lokr_prefix(False, bi, slot), set.sgl[flat].copy()))
     return save_loha_peft(named, path, ctx)
+
+
+# ── trainer-seam helpers (mirror lokr_stack: empty sentinel + grad norm/clip) ──
+def empty_klein_loha_set() -> KleinLoHaSet:
+    """Default-off placeholder (adapter_algo != 2)."""
+    return KleinLoHaSet(
+        List[LoHaAdapter](), List[Bool](), List[LoHaAdapter](), List[Bool](),
+        0, 0, 0,
+    )
+
+
+def _loha_grads_sqsum(g: LoHaGrads) -> Float64:
+    var s = Float64(0.0)
+    for j in range(len(g.d_w1a)):
+        s += Float64(g.d_w1a[j]) * Float64(g.d_w1a[j])
+    for j in range(len(g.d_w1b)):
+        s += Float64(g.d_w1b[j]) * Float64(g.d_w1b[j])
+    for j in range(len(g.d_w2a)):
+        s += Float64(g.d_w2a[j]) * Float64(g.d_w2a[j])
+    for j in range(len(g.d_w2b)):
+        s += Float64(g.d_w2b[j]) * Float64(g.d_w2b[j])
+    return s
+
+
+def klein_loha_grad_norm(g: KleinLoHaGrads) -> Float64:
+    var s = Float64(0.0)
+    for i in range(len(g.dbl)):
+        s += _loha_grads_sqsum(g.dbl[i])
+    for i in range(len(g.sgl)):
+        s += _loha_grads_sqsum(g.sgl[i])
+    return sqrt(s)
+
+
+def _loha_grads_scale(mut g: LoHaGrads, s: Float32):
+    for j in range(len(g.d_w1a)):
+        g.d_w1a[j] = g.d_w1a[j] * s
+    for j in range(len(g.d_w1b)):
+        g.d_w1b[j] = g.d_w1b[j] * s
+    for j in range(len(g.d_w2a)):
+        g.d_w2a[j] = g.d_w2a[j] * s
+    for j in range(len(g.d_w2b)):
+        g.d_w2b[j] = g.d_w2b[j] * s
+
+
+def klein_loha_clip_grads(mut g: KleinLoHaGrads, clip_scale: Float32):
+    if clip_scale == Float32(1.0):
+        return
+    for i in range(len(g.dbl)):
+        _loha_grads_scale(g.dbl[i], clip_scale)
+    for i in range(len(g.sgl)):
+        _loha_grads_scale(g.sgl[i], clip_scale)

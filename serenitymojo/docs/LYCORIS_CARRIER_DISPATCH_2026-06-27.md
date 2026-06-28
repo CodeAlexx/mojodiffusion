@@ -73,13 +73,24 @@ LyCORIS delta factors into a SMALL carrier (no stack/kernel change):
 - OFT: re-targeted to OneTrainer (5-term Neumann), fwd+bwd verified (MJ-1024).
 - BOFT: lycoris-3.4.0-only (no OneTrainer/ai-toolkit equivalent), already gated (MJ-1025).
 
+## CARRIER DISPATCH — ALL ACTIVE FAMILIES DONE
+- LoKr / LoHa: small-rank carriers (`r²`), proven e2e on real Klein-9B.
+- **DoRA / OFT (MJ-1026): trainable via the carrier as FULL materialized deltas**
+  (`a=I`, `b=W_eff−W`, `r_eff=in`) — they replace the effective weight but the stack's
+  additive `x@b^T` over the frozen `x@W^T` gives `x@W_effᵀ`. Gated:
+  `dora_carrier_parity` (fwd cos=0.99999980; d_A/d_B/d_m EXACT vs dora_backward),
+  `oft_carrier_parity` (fwd cos=0.99999977; d_vec cos=0.99999999999 vs oft_ot_backward).
+  Modules `dora_stack.mojo` / `oft_stack.mojo`. **VRAM LIMIT:** `r_eff=in` full delta →
+  preflight fails loud at klein scale (in=4096); usable at small models / targeted
+  subsets.
+- BOFT: SKIPPED (user decision MJ-1025 — no OneTrainer/ai-toolkit support, niche).
+
 ## OPEN (next, in order)
-1. **Multiplicative/renorm stack-hook mechanism** — the shared integration into the
-   model stack: pre-projection block rotation (OFT/BOFT) + per-column effective-weight
-   rescale (DoRA). NOT (a,b)-carrier compatible. The big architectural piece; design
-   deliberately. (LoKr/LoHa already train via the carrier.)
+1. **klein-scale DoRA/OFT** — a `W_eff`-substitution stack path (avoid the full-delta
+   carrier's `r_eff=in` VRAM) for production-scale DoRA/OFT. Deferred optimization;
+   the carrier proves the math + trains at small/subset scale today.
 2. **Production dispatch wiring** — `serenity-trainer` (its own lora_block, autograd_v2
    path); `adapter_algo` dispatch is wired into NO live trainer yet (the
-   `adapter_algo_policy` guard correctly fails loud). Wire LoKr/LoHa carrier + loosen
-   the guard once wired. Then replicate to other trainers (zimage…).
+   `adapter_algo_policy` guard correctly fails loud). Wire LoKr/LoHa/DoRA/OFT carrier +
+   loosen the guard once wired. Then replicate to other trainers (zimage…).
 3. (opt) trainable `scalar` surface for ai-toolkit training-trajectory parity.

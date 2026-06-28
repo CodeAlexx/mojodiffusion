@@ -102,6 +102,15 @@ from serenitymojo.models.klein.lora_adapter import make_lora_adapter
 from serenitymojo.models.klein.lora_block import (
     LoraAdapterDevice, lora_adapter_to_device,
 )
+# LoKr dispatch (adapter_algo==4): carrier set through the SAME streamed stack.
+from serenitymojo.training.train_config import TRAIN_ADAPTER_ALGO_LOKR
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
+from serenitymojo.models.krea2.krea2_lokr_stack import (
+    Krea2LoKrSet, empty_krea2_lokr_set, build_krea2_lokr_set,
+    krea2_lokr_carrier_lists, krea2_lokr_carrier_total_bytes,
+    krea2_lokr_chain_all, krea2_lokr_adamw_step, krea2_lokr_grad_norm,
+    krea2_lokr_zero_leg_l1, save_krea2_lokr,
+)
 
 # ── the streaming LoRA stack + carriers ───────────────────────────────────────
 from serenitymojo.models.krea2.krea2_block import Krea2BlockLora
@@ -846,8 +855,30 @@ def main() raises:
               " (bf16 per-step disk stream — the C13 default path).")
 
     # ── host LoRA set (authoritative + AdamW moments) ───────────────────────────
+    # LoKr (adapter_algo==4): the host_lora set is the (a,b) CARRIER of the LoKr
+    # masters (krea2_lokr_stack), re-materialized after every master AdamW step.
+    var lokr_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    if lokr_active and KREA2_DEVICE_LORA_GRAD:
+        raise Error("krea2 LoKr requires KREA2_DEVICE_LORA_GRAD=False (the carrier chain needs HOST dA/dB)")
     var host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
     var n_adapters = NBLOCKS * KREA2_SLOTS_PER_BLOCK
+    var lokr_masters = empty_krea2_lokr_set()
+    if lokr_active:
+        lokr_masters = build_krea2_lokr_set(
+            NBLOCKS, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM,
+            cfg.lora_rank, cfg.lora_alpha, cfg.lokr_factor,
+            cfg.lokr_decompose_both, cfg.lokr_full_matrix, cfg.lokr_targets,
+            UInt64(53) * 7 + 11,
+        )
+        var carrier_bytes = krea2_lokr_carrier_total_bytes(lokr_masters)
+        print("[krea2-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("krea2 LoKr: carrier set needs ") + String(carrier_bytes)
+                + " bytes (> budget). Use a small lokr_factor or restrict lokr_targets."
+            )
+        host_lora = krea2_lokr_carrier_lists(lokr_masters, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM)
+        print("[krea2-lokr] carrier set materialized:", len(host_lora), "adapters")
     print("host LoRA adapters=", len(host_lora), " (8 per block)")
 
     # ── optimizer: AdamW (default, fused) OR a levers optimizer (automagic3 etc.).
@@ -945,7 +976,19 @@ def main() raises:
         # gl.d_a/d_b (clip ran above via _clip_lists in the default non-GPU-clip path)
         # and does the automagic3 step + its stochastic-rounding bf16 writeback. The
         # fused AdamW keeps the clip_scale fold. ─────────────────────────────────
-        if levers_optimizer_active(cfg):
+        if lokr_active:
+            # chain carrier grads → LoKr master grads, host AdamW on masters,
+            # re-materialize carriers into host_lora for the next step.
+            var mg = krea2_lokr_chain_all(lokr_masters, gl.d_a, gl.d_b)
+            var mnorm = krea2_lokr_grad_norm(mg)
+            krea2_lokr_adamw_step(
+                lokr_masters, mg, step + 1, cfg.lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            host_lora = krea2_lokr_carrier_lists(lokr_masters, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM)
+            print("  [krea2-lokr] step=", step + 1, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", krea2_lokr_zero_leg_l1(lokr_masters))
+        elif levers_optimizer_active(cfg):
             levers_optimizer_step_host(
                 cfg, host_lora, gl.d_a, gl.d_b, step + 1, cfg.lr, 0, n_adapters,
                 opt_state,
@@ -969,13 +1012,21 @@ def main() raises:
         if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
             _ = sys_mkdirs(cfg.workspace_dir)   # save_safetensors won't create dirs
             var sp = _lora_save_path(cfg, step + 1)
-            var npairs = save_krea2_lora(host_lora, sp, ctx)
+            var npairs: Int
+            if lokr_active:
+                npairs = save_krea2_lokr(lokr_masters, sp, ctx)
+            else:
+                npairs = save_krea2_lora(host_lora, sp, ctx)
             print("  [save] wrote", npairs, "LoRA pairs ->", sp)
 
     # ── FINAL LoRA save (MJ-0805) — the trained LoRA, re-loadable PEFT ──────────
     _ = sys_mkdirs(cfg.workspace_dir)
     var final_path = _lora_save_path(cfg, steps)
-    var n_pairs = save_krea2_lora(host_lora, final_path, ctx)
+    var n_pairs: Int
+    if lokr_active:
+        n_pairs = save_krea2_lokr(lokr_masters, final_path, ctx)
+    else:
+        n_pairs = save_krea2_lora(host_lora, final_path, ctx)
     print("")
     print("[save] FINAL LoRA:", n_pairs, "pairs (", n_pairs * 2, "tensors) ->", final_path)
 

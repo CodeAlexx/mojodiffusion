@@ -68,6 +68,7 @@ from std.gpu.host import DeviceContext
 from std.math import sqrt
 from std.collections import Optional
 from std.sys import argv
+from std.time import perf_counter_ns
 from serenitymojo.lora import LoraSet
 from serenitymojo.models.krea2.krea2_stack import build_krea2_resident_fp8
 from serenitymojo.models.dit.krea2_dit import Krea2ResidentFp8
@@ -280,14 +281,21 @@ def main() raises:
         var img_tokens_f32 = _patchify(latent, ctx)               # [1,imglen,64] f32
         var img_tokens = torch_f32_to_bf16_rne(img_tokens_f32, ctx)  # bf16 feed
 
+        # TIMING: per-step phase split (one DiT forward vs the 2nd vs the rest).
+        # External-wall discipline: sync before each stamp so the delta is the phase's
+        # real GPU work (NOT the synced-timer artifact — these are coarse per-FORWARD
+        # boundaries, large enough that the drain mis-attribution is small relative).
+        ctx.synchronize(); var _f0 = Int(perf_counter_ns())
         var v_cond = krea2_forward[LFULL_POS, LPAD_POS, LT_POS, NBLOCKS](
             st, img_tokens, ctx_pos, t_t, pos_p, ctx, KREA2_RAW_KEY_PREFIX,
             lora, lora_mult, resident,
         )                                                          # [1,imglen,64] bf16
+        ctx.synchronize(); var _f1 = Int(perf_counter_ns())
         var v_uncond = krea2_forward[LFULL_NEG, LPAD_NEG, LT_NEG, NBLOCKS](
             st, img_tokens, ctx_neg, t_t, pos_n, ctx, KREA2_RAW_KEY_PREFIX,
             lora, lora_mult, resident,
         )
+        ctx.synchronize(); var _f2 = Int(perf_counter_ns())
         # CFG: v = v_cond + cfg*(v_cond - v_uncond)  (krea2_cfg), then to F32.
         var v_bf16 = krea2_cfg(v_cond, v_uncond, CFG_SCALE, ctx)
         var v_f32 = cast_tensor(v_bf16, STDtype.F32, ctx)          # [1,imglen,64] f32
@@ -295,16 +303,22 @@ def main() raises:
         # unpatch velocity tokens -> latent layout, Euler step in F32.
         var v_latent = _unpatch(v_f32, ctx)                        # [1,16,h8,w8] f32
         latent = krea2_euler_step(latent, v_latent, t_cur, t_prev, ctx)
-        print("[krea2] step", si, " t_cur=", t_cur, " t_prev=", t_prev)
+        ctx.synchronize(); var _f3 = Int(perf_counter_ns())
+        print("[krea2] step", si, " fwd_cond=", Float64(_f1 - _f0)/1e9, "s fwd_uncond=",
+              Float64(_f2 - _f1)/1e9, "s cfg+euler=", Float64(_f3 - _f2)/1e9,
+              "s STEP=", Float64(_f3 - _f0)/1e9, "s")
 
     # ── 7) VAE decode (decoder denorms latents_std/mean + clamps [-1,1] inside). ─
     print("[krea2] decoding latent -> image ...")
+    ctx.synchronize(); var _d0 = Int(perf_counter_ns())
     var dec = QwenImageVaeDecoder[LH, LW].load(String(KREA2_VAE_DIR), ctx)
     # The decoder's internal denorm multiplies the latent by bf16 latents_std/mean
     # (elementwise has no auto-cast). The reference's latent is bf16 at decode (model
     # output bf16); cast the F32 accumulator to bf16 before the decoder.
     var latent_bf16 = torch_f32_to_bf16_rne(latent, ctx)
     var image = dec.decode(latent_bf16, ctx)                       # [1,3,H,W] [-1,1]
+    ctx.synchronize(); var _d1 = Int(perf_counter_ns())
+    print("[krea2] VAE decode (load+decode) =", Float64(_d1 - _d0)/1e9, "s")
 
     # ── 8) write PNG (signed [-1,1] -> uint8, == (img+1)*127.5). ─────────────
     save_png(image, out_png, ctx, ValueRange.SIGNED)

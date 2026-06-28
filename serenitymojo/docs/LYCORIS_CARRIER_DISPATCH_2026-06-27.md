@@ -46,11 +46,19 @@ LyCORIS delta factors into a SMALL carrier (no stack/kernel change):
   lycoris; False=OneTrainer per-input via `_col_l2_norm` + axis-aware eff-weight/
   backward). `dora_onetrainer_parity.mojo` PASS: per-input Mojo == OneTrainer's OWN
   `DoRAModule.forward` cos=0.99999998 nrel=2.0e-4. lycoris path UNCHANGED (no regression).
-- **OFT** (MJ-1024, SCOPED): OneTrainer default = 5-term NEUMANN Cayley (non-orthogonal
-  truncation), NOT exact Cayley. Measured (OneTrainer's own `_cayley_batch`):
-  cos(Neumann,exact)=0.974@skew0.05 → 0.31@0.50; Neumann ‖RᵀR−I‖ 1e-4→60.9. The Mojo
-  exact-Cayley does NOT match OneTrainer. Re-target = port `R=I+2Q+2Q²+2Q³+Q⁴`
-  (Q=skew(weight), no 0.5, input-side) + a matching backward. Not yet built.
+- **OFT** (MJ-1024, FIXED fwd+bwd): OneTrainer default = 5-term NEUMANN Cayley
+  (non-orthogonal truncation), NOT exact Cayley (measured cos(Neumann,exact)=0.974
+  @skew0.05 → 0.31@0.50). New `training/oft_onetrainer.mojo` (distinct from the lycoris
+  exact-Cayley `oft_adapter.mojo`): `R=I+2Q+2Q²+2Q³+Q⁴`, Q=skew(vec) no-0.5, input-side
+  block rotation. `oft_onetrainer_parity.mojo` PASS (fwd cos=0.99999999999999 vs
+  OneTrainer's own OFTModule.forward); `oft_onetrainer_backward_fd.mojo` PASS (analytic
+  d_vec/d_x cos≥0.999999999 vs central-FD).
+- **BOFT** (MJ-1025, RESOLVED): OneTrainer has NO BOFT, and ai-toolkit's lycoris 1.8.3
+  has no oft/boft/dora either — BOFT exists ONLY in lycoris 3.4.0. So BOFT stays on its
+  only oracle (lycoris 3.4.0, already gated by `lycoris_family_parity.mojo`); no
+  re-target possible/needed.
+- **DoRA backward** also gated vs OneTrainer's autograd (detached norm): d_A cos=0.99998,
+  d_B cos=0.99999988, d_m cos=0.99999. DoRA primitive COMPLETE fwd+bwd vs OneTrainer.
 
 ## Files (this session)
 - `serenitymojo/training/loha_stack.mojo` — LoHa carrier + klein orchestration
@@ -59,14 +67,19 @@ LyCORIS delta factors into a SMALL carrier (no stack/kernel change):
 - `serenitymojo/training/tests/dora_onetrainer_parity.mojo` + `gen_dora_onetrainer_oracle.py`
 - `serenitymojo/models/klein/parity/klein_stack_{lokr,loha}_real_smoke.mojo`
 
+## PRIMITIVES — ALL DONE
+- Additive (LoKr/LoHa/LoCon): verified vs ai-toolkit 1.8.3, carrier dispatch e2e on klein.
+- DoRA: re-targeted to OneTrainer, fwd+bwd verified (MJ-1023).
+- OFT: re-targeted to OneTrainer (5-term Neumann), fwd+bwd verified (MJ-1024).
+- BOFT: lycoris-3.4.0-only (no OneTrainer/ai-toolkit equivalent), already gated (MJ-1025).
+
 ## OPEN (next, in order)
-1. **OFT/BOFT primitive rewrite** to OneTrainer 5-term Neumann + input-side + new
-   backward (MJ-1024). DoRA per-input BACKWARD FD-gate.
-2. **Multiplicative/renorm stack-hook mechanism** — the shared integration for
-   OFT/BOFT (pre-projection block rotation) + DoRA (per-column eff-weight rescale)
-   into the klein stack. The big architectural piece; design deliberately.
-3. **Production dispatch wiring** — `serenity-trainer` (its own lora_block, autograd_v2
+1. **Multiplicative/renorm stack-hook mechanism** — the shared integration into the
+   model stack: pre-projection block rotation (OFT/BOFT) + per-column effective-weight
+   rescale (DoRA). NOT (a,b)-carrier compatible. The big architectural piece; design
+   deliberately. (LoKr/LoHa already train via the carrier.)
+2. **Production dispatch wiring** — `serenity-trainer` (its own lora_block, autograd_v2
    path); `adapter_algo` dispatch is wired into NO live trainer yet (the
    `adapter_algo_policy` guard correctly fails loud). Wire LoKr/LoHa carrier + loosen
    the guard once wired. Then replicate to other trainers (zimage…).
-4. (opt) trainable `scalar` surface for ai-toolkit training-trajectory parity.
+3. (opt) trainable `scalar` surface for ai-toolkit training-trajectory parity.

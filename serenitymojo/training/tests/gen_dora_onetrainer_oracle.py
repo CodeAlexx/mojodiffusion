@@ -43,18 +43,28 @@ with torch.no_grad():
     m.dora_scale.mul_(1.1)                              # perturb magnitude (per-input [1,IN])
 m.eval()
 x = torch.sin(torch.arange(M * IN, dtype=torch.float32).reshape(M, IN) * 0.07)
-with torch.no_grad():
-    y = m.forward(x)                                    # OneTrainer's OWN DoRA forward [M,OUT]
+# Grad-enabled forward + backward with a FIXED d_y so OneTrainer's autograd gives
+# the detached-norm gradient the Mojo dora_backward must match (W frozen).
+lin.weight.requires_grad_(False)
+y = m.forward(x)                                        # OneTrainer's OWN DoRA forward [M,OUT]
+d_y = torch.sin(torch.arange(M * OUT, dtype=torch.float32).reshape(M, OUT) * 0.05) * 0.5
+m.lora_down.weight.grad = None; m.lora_up.weight.grad = None; m.dora_scale.grad = None
+y.backward(d_y)                                         # autograd through detached norm
 
 out = {
     "dora.A": m.lora_down.weight.detach().float().contiguous(),   # [R,IN]
     "dora.B": m.lora_up.weight.detach().float().contiguous(),     # [OUT,R]
     "dora.m_in": m.dora_scale.detach().float().reshape(IN).contiguous(),  # [IN] per-input
     "dora.W": lin.weight.detach().float().contiguous(),           # [OUT,IN]
-    "dora.x": x.contiguous(),                                     # [M,IN]
+    "dora.x": x.detach().contiguous(),                            # [M,IN]
     "dora.y": y.detach().float().contiguous(),                   # [M,OUT]
+    "dora.dy": d_y.contiguous(),                                  # [M,OUT] fixed upstream grad
+    "dora.dA": m.lora_down.weight.grad.detach().float().contiguous(),     # [R,IN]
+    "dora.dB": m.lora_up.weight.grad.detach().float().contiguous(),       # [OUT,R]
+    "dora.dm_in": m.dora_scale.grad.detach().float().reshape(IN).contiguous(),  # [IN]
     "dora.dims": torch.tensor([IN, OUT, R, M], dtype=torch.float32),
 }
 save_file(out, "/tmp/dora_ot_oracle.safetensors")
-print("WROTE /tmp/dora_ot_oracle.safetensors  (per-INPUT axis, alpha=2 rank=4 eps=0)")
-print("  m_in shape:", tuple(m.dora_scale.shape), " y L2:", float(y.float().norm()))
+print("WROTE /tmp/dora_ot_oracle.safetensors  (per-INPUT axis, alpha=2 rank=4 eps=0, +autograd grads)")
+print("  m_in shape:", tuple(m.dora_scale.shape), " y L2:", float(y.float().norm()),
+      " dA L2:", float(m.lora_down.weight.grad.norm()))

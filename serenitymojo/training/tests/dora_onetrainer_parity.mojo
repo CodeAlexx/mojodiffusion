@@ -15,7 +15,7 @@ from std.collections import List
 from std.math import sqrt
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.training.dora_adapter import DoRAAdapter, dora_forward
+from serenitymojo.training.dora_adapter import DoRAAdapter, dora_forward, dora_backward
 
 comptime ORACLE = "/tmp/dora_ot_oracle.safetensors"
 comptime COS_BAR = 0.999
@@ -91,7 +91,24 @@ def main() raises:
     var c = _cos(y_got, y_ref)
     var nr = _nrel(y_got, y_ref)
     print("  forward cos=", c, " nrel=", nr)
-    if c >= COS_BAR and nr <= NREL_BAR:
-        print("PASS — Mojo DoRA (per-INPUT, wd_on_out=False) reproduces OneTrainer DoRAModule.forward")
+    var fwd_ok = c >= COS_BAR and nr <= NREL_BAR
+
+    # ── BACKWARD vs OneTrainer autograd (detached norm) ──
+    var dy = _read_f32(st, "dora.dy")        # [M,OUT]
+    var dA = _read_f32(st, "dora.dA")        # [R,IN]
+    var dB = _read_f32(st, "dora.dB")        # [OUT,R]
+    var dm = _read_f32(st, "dora.dm_in")     # [IN]
+    var g = dora_backward(dy.copy(), x.copy(), W.copy(), d, M)
+    var ca = _cos(g.d_a, dA); var na = _nrel(g.d_a, dA)
+    var cb = _cos(g.d_b, dB); var nb = _nrel(g.d_b, dB)
+    var cm = _cos(g.d_m, dm); var nm = _nrel(g.d_m, dm)
+    print("  d_A cos=", ca, " nrel=", na)
+    print("  d_B cos=", cb, " nrel=", nb)
+    print("  d_m cos=", cm, " nrel=", nm)
+    var bwd_ok = (ca >= COS_BAR and na <= NREL_BAR and cb >= COS_BAR and nb <= NREL_BAR
+                  and cm >= COS_BAR and nm <= NREL_BAR)
+
+    if fwd_ok and bwd_ok:
+        print("PASS — Mojo DoRA (per-INPUT, wd_on_out=False) reproduces OneTrainer DoRAModule fwd + autograd bwd")
     else:
-        raise Error("FAIL: Mojo per-input DoRA does not match OneTrainer (cos/nrel above)")
+        raise Error("FAIL: Mojo per-input DoRA does not match OneTrainer (see cos/nrel above)")

@@ -145,6 +145,20 @@ def _row_l2_norm(w: List[Float32], out_f: Int, in_f: Int) -> List[Float32]:
     return n^
 
 
+# Per-input-COLUMN L2 norm of W:[out,in] along the OUTPUT axis (wd_on_out=FALSE,
+# the OneTrainer DoRAModule default decompose_output_axis=False). Returns [in] =
+# sqrt(Σ_o W[o,i]²). MJ-1023: OneTrainer's default DoRA magnitude is per-input.
+def _col_l2_norm(w: List[Float32], out_f: Int, in_f: Int) -> List[Float32]:
+    var n = List[Float32]()
+    for i in range(in_f):
+        var s = Float32(0.0)
+        for o in range(out_f):
+            var v = w[o * in_f + i]
+            s += v * v
+        n.append(sqrt(s))
+    return n^
+
+
 # ── the DoRA adapter (Linear) — lora_down/up + magnitude + AdamW moments ─────
 # Layout (PEFT/Klein): A == lora_down [rank,in], B == lora_up [out,rank],
 # magnitude m [out]. The FROZEN base weight W_orig:[out,in] is supplied to the
@@ -160,6 +174,8 @@ struct DoRAAdapter(Copyable, Movable):
     var alpha: Float32
     var scale: Float32            # alpha / rank
     var eps: Float32              # added to the (detached) norm before divide
+    var wd_on_out: Bool           # True = per-OUTPUT m[out] (lycoris wd_on_out);
+                                  # False = per-INPUT m[in] (OneTrainer default)
     # AdamW first/second moments, one pair per trainable tensor.
     var ma: List[Float32]
     var va: List[Float32]
@@ -175,6 +191,7 @@ struct DoRAAdapter(Copyable, Movable):
         var ma: List[Float32], var va: List[Float32],
         var mb: List[Float32], var vb: List[Float32],
         var mm: List[Float32], var vm: List[Float32],
+        wd_on_out: Bool = True,
     ):
         self.a = _f32_to_bf16_list(a)
         self.b = _f32_to_bf16_list(b)
@@ -185,6 +202,7 @@ struct DoRAAdapter(Copyable, Movable):
         self.alpha = alpha
         self.scale = (alpha / Float32(rank)) if rank > 0 else Float32(0.0)
         self.eps = eps
+        self.wd_on_out = wd_on_out
         self.ma = ma^
         self.va = va^
         self.mb = mb^
@@ -205,7 +223,7 @@ struct DoRAAdapter(Copyable, Movable):
 # identity-at-init and the m=‖W_orig‖ value are exact regardless of A's spread.
 def new_dora_adapter(
     w_orig: List[Float32], in_f: Int, out_f: Int, rank: Int, alpha: Float32,
-    seed: UInt64, eps: Float32 = Float32(1.0e-7),
+    seed: UInt64, eps: Float32 = Float32(1.0e-7), wd_on_out: Bool = True,
 ) raises -> DoRAAdapter:
     if len(w_orig) != out_f * in_f:
         raise Error(
@@ -214,13 +232,17 @@ def new_dora_adapter(
         )
     var a = _randn(rank * in_f, seed + 1, 0.02)   # lora_down small noise
     var b = _zeros(out_f * rank)                  # lora_up zero leaf
-    var m = _row_l2_norm(w_orig, out_f, in_f)     # magnitude = ‖W_orig‖₂ (per out)
+    # magnitude = ‖W_orig‖₂ along the axis: per-output [out] (wd_on_out) OR
+    # per-input [in] (OneTrainer default decompose_output_axis=False).
+    var m = _row_l2_norm(w_orig, out_f, in_f) if wd_on_out else _col_l2_norm(w_orig, out_f, in_f)
+    var mlen = out_f if wd_on_out else in_f
     return DoRAAdapter(
         a^, b^, m^,
         rank, in_f, out_f, alpha, eps,
         _zeros(rank * in_f), _zeros(rank * in_f),     # ma, va
         _zeros(out_f * rank), _zeros(out_f * rank),   # mb, vb
-        _zeros(out_f), _zeros(out_f),                 # mm, vm
+        _zeros(mlen), _zeros(mlen),                   # mm, vm
+        wd_on_out,
     )
 
 
@@ -257,16 +279,17 @@ def dora_effective_weight(w_orig: List[Float32], d: DoRAAdapter) raises -> DoRAE
     var wp = List[Float32]()
     for i in range(len(w_orig)):
         wp.append(w_orig[i] + dw[i])                       # WP = W_orig + ΔW
-    var norm = _row_l2_norm(wp, d.out_f, d.in_f)           # ‖WP[o,:]‖₂  (DETACHED)
+    # Detached per-axis norm. wd_on_out: den[out]=‖WP[o,:]‖, m[out].
+    # else (OneTrainer default): den[in]=‖WP[:,i]‖, m[in].
+    var norm = _row_l2_norm(wp, d.out_f, d.in_f) if d.wd_on_out else _col_l2_norm(wp, d.out_f, d.in_f)
     var den = List[Float32]()
+    for k in range(len(norm)):
+        den.append(norm[k] + d.eps)
+    var wp_dora = _zeros(d.out_f * d.in_f)
     for o in range(d.out_f):
-        den.append(norm[o] + d.eps)
-    var wp_dora = List[Float32]()
-    for o in range(d.out_f):
-        var mo = d.m[o]
-        var deno = den[o]
         for i in range(d.in_f):
-            wp_dora.append(mo * wp[o * d.in_f + i] / deno)
+            var k = o if d.wd_on_out else i               # magnitude/den index
+            wp_dora[o * d.in_f + i] = d.m[k] * wp[o * d.in_f + i] / den[k]
     return DoRAEff(wp_dora^, wp^, den^)
 
 
@@ -316,20 +339,17 @@ def dora_backward(d_y_h: List[Float32], x_h: List[Float32], w_orig: List[Float32
     #   WP_dora[o,i] = m[o] * WP[o,i] / den[o]
     #   d_m[o]   = Σ_i d_WPdora[o,i] * WP[o,i] / den[o]
     #   d_WP[o,i]= d_WPdora[o,i] * m[o] / den[o]
-    var d_m = _zeros(OUT)
-    var d_wp = List[Float32]()
-    for _ in range(OUT * IN):
-        d_wp.append(Float32(0.0))
+    # Axis-aware: k = o (per-output m[out]) or i (per-input m[in], OneTrainer).
+    var mlen = OUT if d.wd_on_out else IN
+    var d_m = _zeros(mlen)
+    var d_wp = _zeros(OUT * IN)
     for o in range(OUT):
-        var deno = eff.den[o]
-        var mo = d.m[o]
-        var acc = Float32(0.0)
         for i in range(IN):
             var idx = o * IN + i
+            var k = o if d.wd_on_out else i
             var g = d_wpdora[idx]
-            acc += g * eff.wp[idx] / deno
-            d_wp[idx] = g * mo / deno
-        d_m[o] = acc
+            d_m[k] = d_m[k] + g * eff.wp[idx] / eff.den[k]
+            d_wp[idx] = g * d.m[k] / eff.den[k]
 
     # ΔW = (B@A)*scale ; W_orig frozen → d_ΔW = d_WP. g = d_ΔW * scale.
     var g = d_wp.copy()

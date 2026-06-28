@@ -89,7 +89,7 @@ from serenitymojo.training.levers import (
     levers_optimizer_validate, LeversOptimizerState,
 )
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft
-from serenitymojo.io.ffi import sys_mkdirs
+from serenitymojo.io.ffi import sys_mkdirs, sys_remove
 
 # ── krea2 config + cache reader + LoRA set ────────────────────────────────────
 from serenitymojo.models.krea2.config import krea2_raw
@@ -109,7 +109,7 @@ from serenitymojo.models.krea2.krea2_lokr_stack import (
     Krea2LoKrSet, empty_krea2_lokr_set, build_krea2_lokr_set,
     krea2_lokr_carrier_lists, krea2_lokr_carrier_total_bytes,
     krea2_lokr_chain_all, krea2_lokr_adamw_step, krea2_lokr_grad_norm,
-    krea2_lokr_zero_leg_l1, save_krea2_lokr,
+    krea2_lokr_clip_grads, krea2_lokr_zero_leg_l1, save_krea2_lokr,
 )
 
 # ── the streaming LoRA stack + carriers ───────────────────────────────────────
@@ -158,7 +158,7 @@ comptime THETA = Float32(1.0e3)
 # 512 (krea2_stage_images.py <dataset> <stage_512> 512) then prepare_cache <stage_512>
 # <cache_512> n 512. ai-toolkit trains krea2 at 512 → this is the matched-resolution
 # real-data run. Default False = the 1024px production arm, byte-untouched.
-comptime KREA2_RES_512 = False
+comptime KREA2_RES_512 = True
 
 # ── DIAGNOSTIC sub-flag: synthesize the sample (KREA2_RES_512_SYNTH, default False).
 # True = random latents (the wall-clock TIMING diagnostic — step time depends on the
@@ -199,8 +199,22 @@ comptime IMGLEN = (LH // 2) * (LW // 2)   # 1024 (512px) | 4096 (1024px)
 # pad granularity) buckets all 4 samples. The no-mask block would let the pad
 # tokens corrupt the real ones → the cuDNN flash-padmask block path (real_len =
 # lt + IMGLEN, pad masked as the tail) is REQUIRED here.
-comptime LTMAX = 768
+# ── RESOLUTION + CAPTION-LENGTH are BUILD-TIME (the SDPA kernel is comptime-shaped) ──
+# KREA2_RES_512 (above) picks 512px(64×64 latent) vs 1024px(128×128); LTMAX is the
+# caption bucket length (must be >= the dataset's max caption token count — the loop
+# fails loud at L<the LT>LTMAX check> otherwise, and the cache reader fails loud on a
+# resolution/latent-shape mismatch). The CURRENT values are the eri2/ai-toolkit 512px
+# run (KREA2_RES_512=True, LTMAX=384 ≥ eri2's max LT 282). For 1024px/giger: set
+# KREA2_RES_512=False + LTMAX=768 and rebuild. (Runtime config-dispatch on cfg.resolution
+# is the documented follow-up — would parameterize main on [LH,LW,LTMAX].)
+comptime LTMAX = 384
 comptime LFULL = LTMAX + IMGLEN           # 4864 — the single comptime arm for ALL samples
+
+# Checkpoint retention (honors ai-toolkit max_step_saves_to_keep). Prune the periodic
+# save KREA2_KEEP_CHECKPOINTS back, keeping every KREA2_CKPT_MILESTONE-th + the final.
+# 0 = keep all (the pre-2026-06-28 behavior).
+comptime KREA2_KEEP_CHECKPOINTS = 8
+comptime KREA2_CKPT_MILESTONE = 500
 
 # ── autograd_v2 backward dispatch seam (Phase 4b adds the engine arm) ─────────
 # DEFAULT FALSE = hand-chain krea2_stack_lora_backward_streamed (this file). The
@@ -981,6 +995,8 @@ def main() raises:
             # re-materialize carriers into host_lora for the next step.
             var mg = krea2_lokr_chain_all(lokr_masters, gl.d_a, gl.d_b)
             var mnorm = krea2_lokr_grad_norm(mg)
+            if mnorm > Float64(cfg.max_grad_norm):
+                krea2_lokr_clip_grads(mg, cfg.max_grad_norm / Float32(mnorm))
             krea2_lokr_adamw_step(
                 lokr_masters, mg, step + 1, cfg.lr,
                 cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
@@ -1018,6 +1034,15 @@ def main() raises:
             else:
                 npairs = save_krea2_lora(host_lora, sp, ctx)
             print("  [save] wrote", npairs, "LoRA pairs ->", sp)
+            # Honor ai-toolkit's max_step_saves_to_keep: prune the checkpoint
+            # KREA2_KEEP_CHECKPOINTS saves back, keeping every KREA2_CKPT_MILESTONE-th
+            # as a milestone (and the final save is written separately). 0 = keep all.
+            comptime if KREA2_KEEP_CHECKPOINTS > 0:
+                var old_step = (step + 1) - KREA2_KEEP_CHECKPOINTS * cfg.save_every
+                if old_step > 0 and old_step % KREA2_CKPT_MILESTONE != 0:
+                    var op = _lora_save_path(cfg, old_step)
+                    if sys_remove(op) == 0:
+                        print("  [prune] removed old checkpoint ->", op)
 
     # ── FINAL LoRA save (MJ-0805) — the trained LoRA, re-loadable PEFT ──────────
     _ = sys_mkdirs(cfg.workspace_dir)

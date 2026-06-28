@@ -14,7 +14,7 @@ from serenitymojo.training.lokr_adapter import (
 )
 from serenitymojo.training.lokr_stack import (
     lokr_carrier_adapter, lokr_carrier_r_eff, lokr_chain_carrier_grads,
-    _inactive_carrier, _dummy_lokr, _empty_lokr_grads, _grads_sqsum,
+    _inactive_carrier, _dummy_lokr, _empty_lokr_grads, _grads_sqsum, _grads_scale,
 )
 from serenitymojo.training.lokr_save import NamedLoKr, save_lokr_peft
 
@@ -140,6 +140,13 @@ def krea2_lokr_grad_norm(grads: Krea2LoKrGrads) -> Float64:
     for i in range(len(grads.g)):
         s += _grads_sqsum(grads.g[i])
     return sqrt(s)
+
+
+def krea2_lokr_clip_grads(mut grads: Krea2LoKrGrads, clip_scale: Float32):
+    if clip_scale == Float32(1.0):
+        return
+    for i in range(len(grads.g)):
+        _grads_scale(grads.g[i], clip_scale)
 
 
 def krea2_lokr_adamw_step(

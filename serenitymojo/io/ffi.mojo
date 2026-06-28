@@ -123,6 +123,22 @@ def sys_mkdir(path: String, mode: Int32 = 0o755) -> Int:
     return rc
 
 
+def sys_remove(path: String) -> Int:
+    """remove(3) a single file. Returns 0 on success, -1 on error (e.g. ENOENT —
+    callers prune best-effort and ignore -1). Same NUL-terminated cstr copy as
+    sys_mkdir (String.unsafe_ptr() is not reliably NUL-terminated)."""
+    var n = path.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = path.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cstr = BytePtr(unsafe_from_address=Int(buf))
+    var rc = Int(external_call["remove", Int32](cstr))
+    buf.free()
+    return rc
+
+
 def sys_mkdirs(path: String) -> Int:
     """mkdir -p: create `path` and all missing parents. Walks the path creating
     each prefix component (ignoring EEXIST). Returns 0 (best-effort — the caller's

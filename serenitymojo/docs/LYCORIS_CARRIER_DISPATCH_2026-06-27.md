@@ -89,8 +89,12 @@ LyCORIS delta factors into a SMALL carrier (no stack/kernel change):
 1. **klein-scale DoRA/OFT** — a `W_eff`-substitution stack path (avoid the full-delta
    carrier's `r_eff=in` VRAM) for production-scale DoRA/OFT. Deferred optimization;
    the carrier proves the math + trains at small/subset scale today.
-2. **Production dispatch wiring** — `serenity-trainer` (its own lora_block, autograd_v2
-   path); `adapter_algo` dispatch is wired into NO live trainer yet (the
-   `adapter_algo_policy` guard correctly fails loud). Wire LoKr/LoHa/DoRA/OFT carrier +
-   loosen the guard once wired. Then replicate to other trainers (zimage…).
+2. **Production dispatch wiring** — `serenity-trainer/.../train_klein_real.mojo`. LoKr
+   was already wired (template); **LoHa now wired too** (MJ-1027, branch
+   `loha-live-dispatch`): `lokr_active`→`carrier_active` for the 5 shared touch-points +
+   LoHa guard/build/optim/save branches; builds clean `-O2`; autograd_v2 NOT on the
+   carrier path (forced hand-chain). OPEN: LoHa real-data train run (final confirm);
+   DoRA/OFT need new klein-set orchestration (`build_klein_dora_set` etc. + `w_orig`
+   sourcing, VRAM-bound) before wiring; zimage port (plan ready). The 9 non-klein
+   trainers keep `require_lora_or_locon_linear` until each gets a carrier path.
 3. (opt) trainable `scalar` surface for ai-toolkit training-trajectory parity.

@@ -102,23 +102,78 @@ from serenitymojo.models.klein.lora_adapter import make_lora_adapter
 from serenitymojo.models.klein.lora_block import (
     LoraAdapterDevice, lora_adapter_to_device,
 )
-# LoKr dispatch (adapter_algo==4): carrier set through the SAME streamed stack.
-from serenitymojo.training.train_config import TRAIN_ADAPTER_ALGO_LOKR
+# LyCORIS carrier dispatch: LoKr/LoHa use the SAME streamed stack through
+# materialized plain-LoRA carriers. DoRA/OFT use the direct streamed W_eff
+# block/stack path so Krea2 never materializes their dense full-delta carriers.
+from serenitymojo.training.train_config import (
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOCON,
+    TRAIN_ADAPTER_ALGO_LOHA, TRAIN_ADAPTER_ALGO_DORA,
+    TRAIN_ADAPTER_ALGO_LOKR, TRAIN_ADAPTER_ALGO_OFT,
+    TRAIN_ADAPTER_ALGO_BOFT,
+)
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.models.krea2.krea2_lokr_stack import (
     Krea2LoKrSet, empty_krea2_lokr_set, build_krea2_lokr_set,
     krea2_lokr_carrier_lists, krea2_lokr_carrier_total_bytes,
     krea2_lokr_chain_all, krea2_lokr_adamw_step, krea2_lokr_grad_norm,
     krea2_lokr_clip_grads, krea2_lokr_zero_leg_l1, save_krea2_lokr,
+    _krea2_slot_targeted,
+)
+from serenitymojo.models.krea2.krea2_loha_stack import (
+    Krea2LoHaSet, empty_krea2_loha_set, build_krea2_loha_set,
+    krea2_loha_carrier_lists, krea2_loha_carrier_total_bytes,
+    krea2_loha_chain_all, krea2_loha_adamw_step, krea2_loha_grad_norm,
+    krea2_loha_clip_grads, krea2_loha_zero_leg_l1, save_krea2_loha,
+)
+from serenitymojo.models.krea2.krea2_direct_lycoris_stack import (
+    KREA2_DIRECT_24_GIB,
+    krea2_direct_dense_carrier_bytes,
+    krea2_direct_dora_preflight,
+    krea2_direct_oft_preflight,
+    empty_krea2_direct_dora_set,
+    empty_krea2_direct_oft_set,
+    Krea2StackDirectDoRA,
+    Krea2StackDirectOFT,
+    krea2_direct_dora_append_block_weights,
+    krea2_direct_dora_blocks_to_device,
+    build_krea2_direct_oft_set,
+    krea2_direct_oft_blocks_to_device,
+    krea2_direct_dora_zero_grads,
+    krea2_direct_dora_scatter_slot_grad,
+    krea2_direct_dora_grad_norm,
+    krea2_direct_dora_clip_grads,
+    krea2_direct_dora_adamw_step,
+    krea2_direct_dora_zero_leg_l1,
+    krea2_direct_dora_trainable_bytes,
+    krea2_direct_oft_zero_grads,
+    krea2_direct_oft_scatter_slot_grad,
+    krea2_direct_oft_grad_norm,
+    krea2_direct_oft_clip_grads,
+    krea2_direct_oft_adamw_step,
+    krea2_direct_oft_vec_l1,
+    krea2_direct_oft_trainable_bytes,
+    save_krea2_direct_dora,
+    save_krea2_direct_oft,
+)
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.oft_onetrainer import OFTOTGrads
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectDoRAGrads, FlatDirectOFTSet, FlatDirectOFTGrads,
 )
 
 # ── the streaming LoRA stack + carriers ───────────────────────────────────────
-from serenitymojo.models.krea2.krea2_block import Krea2BlockLora
+from serenitymojo.models.krea2.krea2_block import Krea2BlockLora, Krea2BlockWeights
 from serenitymojo.models.krea2.krea2_stack import (
     Krea2StackLora, Krea2StackForward, Krea2StackLoraGrads,
+    Krea2StackDirectDoRAGradsT, Krea2StackDirectOFTGradsT,
     Krea2StreamFinal, KREA2_SLOTS_PER_BLOCK,
     krea2_stack_lora_forward_streamed, krea2_stack_lora_backward_streamed,
     krea2_stack_lora_backward_streamed_dev,
+    krea2_stack_dora_forward_streamed, krea2_stack_dora_backward_streamed_dev,
+    krea2_stack_oft_forward_streamed, krea2_stack_oft_backward_streamed_dev,
+    _load_krea2_block_streamed, _load_krea2_block_resident,
     krea2_stack_lora_backward_graph, krea2_stack_lora_backward_graph_slab,
     Krea2ResidentFp8, build_krea2_resident_fp8,
 )
@@ -465,6 +520,58 @@ struct _StepOut(Movable):
         self.grad_norm = grad_norm
 
 
+struct _StepOutDoRAHost(Movable):
+    var grads: FlatDirectDoRAGrads
+    var loss: Float32
+
+    def __init__(out self, var grads: FlatDirectDoRAGrads, loss: Float32):
+        self.grads = grads^
+        self.loss = loss
+
+
+struct _StepOutDoRA(Movable):
+    var grads: Krea2StackDirectDoRAGradsT
+    var loss: Float32
+
+    def __init__(out self, var grads: Krea2StackDirectDoRAGradsT, loss: Float32):
+        self.grads = grads^
+        self.loss = loss
+
+    def to_host(
+        deinit self, masters: FlatDirectDoRASet, targets: Int, ctx: DeviceContext,
+    ) raises -> _StepOutDoRAHost:
+        return _StepOutDoRAHost(
+            _direct_dora_grads_to_host(self.grads^, masters, targets, ctx),
+            self.loss,
+        )
+
+
+struct _StepOutOFTHost(Movable):
+    var grads: FlatDirectOFTGrads
+    var loss: Float32
+
+    def __init__(out self, var grads: FlatDirectOFTGrads, loss: Float32):
+        self.grads = grads^
+        self.loss = loss
+
+
+struct _StepOutOFT(Movable):
+    var grads: Krea2StackDirectOFTGradsT
+    var loss: Float32
+
+    def __init__(out self, var grads: Krea2StackDirectOFTGradsT, loss: Float32):
+        self.grads = grads^
+        self.loss = loss
+
+    def to_host(
+        deinit self, masters: FlatDirectOFTSet, targets: Int, ctx: DeviceContext,
+    ) raises -> _StepOutOFTHost:
+        return _StepOutOFTHost(
+            _direct_oft_grads_to_host(self.grads^, masters, targets, ctx),
+            self.loss,
+        )
+
+
 def _train_one_sample(
     st: ShardedSafeTensors, key_prefix: String,
     clean: Tensor,          # [1, 16, LH, LW] F32 normalized latent
@@ -592,6 +699,132 @@ def _train_one_sample(
     return _StepOut(grads^, loss, gn)
 
 
+def _train_one_sample_dora(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor,
+    context: Tensor,
+    pos: Tensor,
+    lt: Int,
+    dora: Krea2StackDirectDoRA, fin: Krea2StreamFinal,
+    cond_w: Krea2ResidentCond,
+    sigma: Float32,
+    noise_seed: UInt64,
+    cfg: TrainConfig,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutDoRA:
+    var _pt = 0
+    comptime if KREA2_PHASE_TIMING:
+        ctx.synchronize(); _pt = Int(perf_counter_ns())
+
+    var noise = _gaussian_like(clean, noise_seed, ctx)
+    var fm = flow_match_noise_target(clean, sigma, noise, ctx)
+    var noised_lat = fm.x_t.clone(ctx)
+    var img = krea2_patchify[LH, LW](noised_lat, ctx)
+    var target_img = krea2_patchify[LH, LW](fm.target, ctx)
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("noise+patchify", _pt, ctx)
+
+    var t1 = _t_scalar(sigma, ctx)
+    var cond = _build_conditioning[LTMAX, LFULL](
+        cond_w, img, context, pos, t1, lt, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("conditioning_fwd", _pt, ctx)
+
+    var real_len = Optional[Int](lt + IMGLEN)
+
+    var fwd = krea2_stack_dora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
+        cond.combined, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, dora, fin,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_forward", _pt, ctx)
+
+    var pred_h = fwd.velocity[].to_host(ctx)
+    var tgt_h = target_img.to_host(ctx)
+    var lg = levers_loss_grad(pred_h, tgt_h, sigma, cfg)
+    var d_velocity = Tensor.from_host(
+        lg.d_pred, [1, IMGLEN, OUT_CH], STDtype.F32, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("loss+to_host", _pt, ctx)
+
+    var grads = krea2_stack_dora_backward_streamed_dev[LFULL, HEADS, KVHEADS, HEADDIM](
+        d_velocity, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, dora, fin, fwd,
+        cond.cos, cond.sin, EPS, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_backward", _pt, ctx)
+
+    return _StepOutDoRA(grads^, lg.loss)
+
+
+def _train_one_sample_oft(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor,
+    context: Tensor,
+    pos: Tensor,
+    lt: Int,
+    oft: Krea2StackDirectOFT, fin: Krea2StreamFinal,
+    cond_w: Krea2ResidentCond,
+    sigma: Float32,
+    noise_seed: UInt64,
+    cfg: TrainConfig,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutOFT:
+    var _pt = 0
+    comptime if KREA2_PHASE_TIMING:
+        ctx.synchronize(); _pt = Int(perf_counter_ns())
+
+    var noise = _gaussian_like(clean, noise_seed, ctx)
+    var fm = flow_match_noise_target(clean, sigma, noise, ctx)
+    var noised_lat = fm.x_t.clone(ctx)
+    var img = krea2_patchify[LH, LW](noised_lat, ctx)
+    var target_img = krea2_patchify[LH, LW](fm.target, ctx)
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("noise+patchify", _pt, ctx)
+
+    var t1 = _t_scalar(sigma, ctx)
+    var cond = _build_conditioning[LTMAX, LFULL](
+        cond_w, img, context, pos, t1, lt, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("conditioning_fwd", _pt, ctx)
+
+    var real_len = Optional[Int](lt + IMGLEN)
+
+    var fwd = krea2_stack_oft_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
+        cond.combined, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, oft, fin,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_forward", _pt, ctx)
+
+    var pred_h = fwd.velocity[].to_host(ctx)
+    var tgt_h = target_img.to_host(ctx)
+    var lg = levers_loss_grad(pred_h, tgt_h, sigma, cfg)
+    var d_velocity = Tensor.from_host(
+        lg.d_pred, [1, IMGLEN, OUT_CH], STDtype.F32, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("loss+to_host", _pt, ctx)
+
+    var grads = krea2_stack_oft_backward_streamed_dev[LFULL, HEADS, KVHEADS, HEADDIM](
+        d_velocity, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, oft, fin, fwd,
+        cond.cos, cond.sin, EPS, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_backward", _pt, ctx)
+
+    return _StepOutOFT(grads^, lg.loss)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -712,6 +945,76 @@ def _krea2_lora_prefix(bi: Int, slot: Int) raises -> String:
     raise Error(String("_krea2_lora_prefix: bad slot ") + String(slot))
 
 
+def _krea2_train_targets(raw_targets: Int) raises -> Int:
+    if raw_targets == 1:
+        return 1
+    if raw_targets == 2 or raw_targets == 3:
+        return 2
+    raise Error("train_krea2: lokr_targets must be attn or all for Krea2")
+
+
+def _krea2_block_weight_host(
+    w: Krea2BlockWeights, slot: Int, ctx: DeviceContext,
+) raises -> List[Float32]:
+    if slot == 0:
+        return w.wq[].to_host(ctx)
+    if slot == 1:
+        return w.wk[].to_host(ctx)
+    if slot == 2:
+        return w.wv[].to_host(ctx)
+    if slot == 3:
+        return w.gate_w[].to_host(ctx)
+    if slot == 4:
+        return w.wo[].to_host(ctx)
+    if slot == 5:
+        return w.mlp_gate_w[].to_host(ctx)
+    if slot == 6:
+        return w.mlp_up_w[].to_host(ctx)
+    if slot == 7:
+        return w.mlp_down_w[].to_host(ctx)
+    raise Error(String("_krea2_block_weight_host: bad slot ") + String(slot))
+
+
+def _krea2_direct_dora_block_weights_host(
+    st: ShardedSafeTensors, key_prefix: String, bi: Int, targets: Int,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> List[List[Float32]]:
+    var wbi: Krea2BlockWeights
+    if resident:
+        wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+    else:
+        wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+    var out = List[List[Float32]]()
+    for slot in range(KREA2_SLOTS_PER_BLOCK):
+        if _krea2_slot_targeted(slot, targets):
+            out.append(_krea2_block_weight_host(wbi, slot, ctx))
+        else:
+            out.append(List[Float32]())
+    ctx.synchronize()
+    return out^
+
+
+def _build_krea2_direct_dora_set_streamed(
+    st: ShardedSafeTensors, key_prefix: String, rank: Int, alpha: Float32,
+    targets: Int, ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> FlatDirectDoRASet:
+    var set = empty_krea2_direct_dora_set()
+    var seed = UInt64(7000)
+    for bi in range(NBLOCKS):
+        var weights = _krea2_direct_dora_block_weights_host(
+            st, key_prefix, bi, targets, ctx, resident,
+        )
+        krea2_direct_dora_append_block_weights(
+            set, bi, weights^, FEATURES, MLPDIM, HEADS * HEADDIM,
+            KVHEADS * HEADDIM, rank, alpha, targets,
+            seed + UInt64(bi * KREA2_SLOTS_PER_BLOCK), False,
+        )
+        ctx.synchronize()
+    return set^
+
+
 # Build the LoRA output path from cfg (workspace_dir/<name>_krea2_lora_<step>.safetensors).
 # save_filename_prefix overrides <name> when set (mirrors the other trainers' naming).
 def _lora_save_path(cfg: TrainConfig, step: Int) raises -> String:
@@ -810,6 +1113,101 @@ def _step_dispatch(
         sigma, noise_seed, cfg, ctx, resident)
 
 
+def _step_dispatch_dora(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor, context: Tensor, pos: Tensor, lt: Int,
+    dora: Krea2StackDirectDoRA, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
+    sigma: Float32, noise_seed: UInt64, cfg: TrainConfig, ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutDoRA:
+    if lt > LTMAX:
+        raise Error(
+            String("train_krea2: LT=") + String(lt) + " > LTMAX=" + String(LTMAX)
+            + " (raise LTMAX above the dataset's max caption length)"
+        )
+    return _train_one_sample_dora(
+        st, key_prefix, clean, context, pos, lt, dora, fin, cond_w,
+        sigma, noise_seed, cfg, ctx, resident)
+
+
+def _step_dispatch_oft(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor, context: Tensor, pos: Tensor, lt: Int,
+    oft: Krea2StackDirectOFT, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
+    sigma: Float32, noise_seed: UInt64, cfg: TrainConfig, ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutOFT:
+    if lt > LTMAX:
+        raise Error(
+            String("train_krea2: LT=") + String(lt) + " > LTMAX=" + String(LTMAX)
+            + " (raise LTMAX above the dataset's max caption length)"
+        )
+    return _train_one_sample_oft(
+        st, key_prefix, clean, context, pos, lt, oft, fin, cond_w,
+        sigma, noise_seed, cfg, ctx, resident)
+
+
+def _direct_dora_grads_to_host(
+    var grads: Krea2StackDirectDoRAGradsT,
+    masters: FlatDirectDoRASet,
+    targets: Int,
+    ctx: DeviceContext,
+) raises -> FlatDirectDoRAGrads:
+    var out = krea2_direct_dora_zero_grads(masters)
+    var compact = 0
+    for bi in range(NBLOCKS):
+        for slot in range(KREA2_SLOTS_PER_BLOCK):
+            if not _krea2_slot_targeted(slot, targets):
+                continue
+            var idx = bi * KREA2_SLOTS_PER_BLOCK + slot
+            if idx >= len(grads.grads):
+                raise Error("_direct_dora_grads_to_host: direct grad list too short")
+            var g = grads.grads[idx].copy()
+            if not g.d_a:
+                raise Error(String("_direct_dora_grads_to_host: missing d_a at flat slot ") + String(idx))
+            if not g.d_b:
+                raise Error(String("_direct_dora_grads_to_host: missing d_b at flat slot ") + String(idx))
+            if not g.d_m:
+                raise Error(String("_direct_dora_grads_to_host: missing d_m at flat slot ") + String(idx))
+            var dg = DoRAGrads(
+                g.d_a.value()[].to_host(ctx),
+                g.d_b.value()[].to_host(ctx),
+                g.d_m.value()[].to_host(ctx),
+                List[Float32](),
+            )
+            krea2_direct_dora_scatter_slot_grad(out, compact, dg)
+            compact += 1
+    if compact != len(masters.ad):
+        raise Error("_direct_dora_grads_to_host: compact grad count mismatch")
+    return out^
+
+
+def _direct_oft_grads_to_host(
+    var grads: Krea2StackDirectOFTGradsT,
+    masters: FlatDirectOFTSet,
+    targets: Int,
+    ctx: DeviceContext,
+) raises -> FlatDirectOFTGrads:
+    var out = krea2_direct_oft_zero_grads(masters)
+    var compact = 0
+    for bi in range(NBLOCKS):
+        for slot in range(KREA2_SLOTS_PER_BLOCK):
+            if not _krea2_slot_targeted(slot, targets):
+                continue
+            var idx = bi * KREA2_SLOTS_PER_BLOCK + slot
+            if idx >= len(grads.grads):
+                raise Error("_direct_oft_grads_to_host: direct grad list too short")
+            var g = grads.grads[idx].copy()
+            if not g.d_vec:
+                raise Error(String("_direct_oft_grads_to_host: missing d_vec at flat slot ") + String(idx))
+            var og = OFTOTGrads(g.d_vec.value()[].to_host(ctx), List[Float32]())
+            krea2_direct_oft_scatter_slot_grad(out, compact, og)
+            compact += 1
+    if compact != len(masters.ad):
+        raise Error("_direct_oft_grads_to_host: compact grad count mismatch")
+    return out^
+
+
 def main() raises:
     var args = argv()
     if len(args) < 3:
@@ -869,22 +1267,76 @@ def main() raises:
               " (bf16 per-step disk stream — the C13 default path).")
 
     # ── host LoRA set (authoritative + AdamW moments) ───────────────────────────
-    # LoKr (adapter_algo==4): the host_lora set is the (a,b) CARRIER of the LoKr
-    # masters (krea2_lokr_stack), re-materialized after every master AdamW step.
+    # LoKr/LoHa: host_lora is the (a,b) CARRIER of the LyCORIS masters, then
+    # re-materialized after every master AdamW step.
     var lokr_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
-    if lokr_active and KREA2_DEVICE_LORA_GRAD:
-        raise Error("krea2 LoKr requires KREA2_DEVICE_LORA_GRAD=False (the carrier chain needs HOST dA/dB)")
-    var host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
+    var loha_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var dora_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var k2_targets = _krea2_train_targets(cfg.lokr_targets)
+    var carrier_active = lokr_active or loha_active
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[krea2-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif dora_active:
+        var dense_bytes = krea2_direct_dense_carrier_bytes(
+            NBLOCKS, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM,
+            k2_targets,
+        )
+        var direct_bytes = krea2_direct_dora_preflight(
+            NBLOCKS, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM,
+            cfg.lora_rank, k2_targets, KREA2_DIRECT_24_GIB, False,
+        )
+        print(
+            "[krea2-dora-direct] dense_carrier_bytes:", dense_bytes,
+            " direct_trainable_bytes:", direct_bytes,
+            " budget:", KREA2_DIRECT_24_GIB,
+        )
+    elif oft_active:
+        var dense_bytes = krea2_direct_dense_carrier_bytes(
+            NBLOCKS, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM,
+            k2_targets,
+        )
+        var direct_bytes = krea2_direct_oft_preflight(
+            NBLOCKS, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM,
+            4, k2_targets, KREA2_DIRECT_24_GIB,
+        )
+        print(
+            "[krea2-oft-direct] dense_carrier_bytes:", dense_bytes,
+            " direct_trainable_bytes:", direct_bytes,
+            " budget:", KREA2_DIRECT_24_GIB,
+        )
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("krea2 trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("krea2 trainer: full finetune is not wired in train_krea2; supported here: lora, locon, loha, lokr")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA and not carrier_active:
+        raise Error(
+            String("krea2 trainer: network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr")
+        )
+    if carrier_active and KREA2_DEVICE_LORA_GRAD:
+        raise Error("krea2 LyCORIS carriers require KREA2_DEVICE_LORA_GRAD=False (the carrier chain needs HOST dA/dB)")
+    if (carrier_active or dora_active or oft_active) and levers_optimizer_active(cfg):
+        raise Error("krea2 LyCORIS direct/carrier masters use host AdamW; levers optimizers are not wired")
+    var host_lora = List[LoraAdapter]()
+    if not dora_active and not oft_active:
+        host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
     var n_adapters = NBLOCKS * KREA2_SLOTS_PER_BLOCK
     var lokr_masters = empty_krea2_lokr_set()
+    var loha_masters = empty_krea2_loha_set()
+    var dora_masters = empty_krea2_direct_dora_set()
+    var oft_masters = empty_krea2_direct_oft_set()
     if lokr_active:
         lokr_masters = build_krea2_lokr_set(
             NBLOCKS, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM,
             cfg.lora_rank, cfg.lora_alpha, cfg.lokr_factor,
-            cfg.lokr_decompose_both, cfg.lokr_full_matrix, cfg.lokr_targets,
+            cfg.lokr_decompose_both, cfg.lokr_full_matrix, k2_targets,
             UInt64(53) * 7 + 11,
         )
-        var carrier_bytes = krea2_lokr_carrier_total_bytes(lokr_masters)
+        var carrier_bytes = krea2_lokr_carrier_total_bytes(
+            lokr_masters, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM
+        )
         print("[krea2-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
         if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
             raise Error(
@@ -893,7 +1345,40 @@ def main() raises:
             )
         host_lora = krea2_lokr_carrier_lists(lokr_masters, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM)
         print("[krea2-lokr] carrier set materialized:", len(host_lora), "adapters")
-    print("host LoRA adapters=", len(host_lora), " (8 per block)")
+    elif loha_active:
+        loha_masters = build_krea2_loha_set(
+            NBLOCKS, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM,
+            cfg.lora_rank, cfg.lora_alpha, k2_targets,
+            UInt64(53) * 11 + 17,
+        )
+        var loha_bytes = krea2_loha_carrier_total_bytes(
+            loha_masters, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM
+        )
+        print("[krea2-loha] carrier device bytes:", loha_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if loha_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("krea2 LoHa: carrier set needs ") + String(loha_bytes)
+                + " bytes (> budget). Reduce lora_rank or restrict lokr_targets."
+            )
+        host_lora = krea2_loha_carrier_lists(loha_masters, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM)
+        print("[krea2-loha] carrier set materialized:", len(host_lora), "adapters")
+    elif dora_active:
+        print("[krea2-dora-direct] initializing DoRA magnitudes from streamed runtime weights ...")
+        dora_masters = _build_krea2_direct_dora_set_streamed(
+            st, key_prefix, cfg.lora_rank, cfg.lora_alpha, k2_targets, ctx,
+            resident,
+        )
+        print("[krea2-dora-direct] trainable bytes:", krea2_direct_dora_trainable_bytes(dora_masters),
+              " slots:", len(dora_masters.ad))
+    elif oft_active:
+        oft_masters = build_krea2_direct_oft_set(
+            NBLOCKS, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM,
+            4, k2_targets,
+        )
+        print("[krea2-oft-direct] trainable bytes:", krea2_direct_oft_trainable_bytes(oft_masters),
+              " slots:", len(oft_masters.ad))
+    if not dora_active and not oft_active:
+        print("host LoRA adapters=", len(host_lora), " (8 per block)")
 
     # ── optimizer: AdamW (default, fused) OR a levers optimizer (automagic3 etc.).
     # levers_optimizer_active is False for ADAMW (C13: routes around levers). For
@@ -957,6 +1442,92 @@ def main() raises:
         comptime if KREA2_PHASE_TIMING:
             ctx.synchronize(); _ot = Int(perf_counter_ns())
 
+        if dora_active:
+            var dev_dora = krea2_direct_dora_blocks_to_device(
+                dora_masters, NBLOCKS, k2_targets, ctx,
+            )
+            comptime if KREA2_PHASE_TIMING:
+                _ot = _phase_ms("host_to_device_dora", _ot, ctx)
+
+            var so_dora = _step_dispatch_dora(
+                st, key_prefix,
+                sample.clean[], sample.context[], sample.pos[], lt,
+                dev_dora, fin, cond_w, sigma, noise_seed, cfg, ctx,
+                resident,
+            )
+            var so_dora_h = so_dora^.to_host(dora_masters, k2_targets, ctx)
+            var dnorm = krea2_direct_dora_grad_norm(so_dora_h.grads)
+            if dnorm > Float64(cfg.max_grad_norm):
+                krea2_direct_dora_clip_grads(so_dora_h.grads, cfg.max_grad_norm / Float32(dnorm))
+            krea2_direct_dora_adamw_step(
+                dora_masters, so_dora_h.grads, step + 1, cfg.lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            print("  [krea2-dora-direct] step=", step + 1,
+                  " master_grad_norm=", Float32(dnorm),
+                  " zero_leg_l1=", krea2_direct_dora_zero_leg_l1(dora_masters))
+            comptime if KREA2_PHASE_TIMING:
+                _ot = _phase_ms("direct_dora_optimizer", _ot, ctx)
+
+            print(step, "  ", idx, "  ", lt, "  ", sigma, "  ", so_dora_h.loss, "  ", Float32(dnorm))
+            ctx.synchronize()
+
+            if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
+                _ = sys_mkdirs(cfg.workspace_dir)
+                var sp = _lora_save_path(cfg, step + 1)
+                var nmods = save_krea2_direct_dora(dora_masters, sp, ctx)
+                print("  [save] wrote", nmods, "DoRA modules ->", sp)
+                comptime if KREA2_KEEP_CHECKPOINTS > 0:
+                    var old_step = (step + 1) - KREA2_KEEP_CHECKPOINTS * cfg.save_every
+                    if old_step > 0 and old_step % KREA2_CKPT_MILESTONE != 0:
+                        var op = _lora_save_path(cfg, old_step)
+                        if sys_remove(op) == 0:
+                            print("  [prune] removed old checkpoint ->", op)
+            continue
+
+        if oft_active:
+            var dev_oft = krea2_direct_oft_blocks_to_device(
+                oft_masters, NBLOCKS, k2_targets, ctx,
+            )
+            comptime if KREA2_PHASE_TIMING:
+                _ot = _phase_ms("host_to_device_oft", _ot, ctx)
+
+            var so_oft = _step_dispatch_oft(
+                st, key_prefix,
+                sample.clean[], sample.context[], sample.pos[], lt,
+                dev_oft, fin, cond_w, sigma, noise_seed, cfg, ctx,
+                resident,
+            )
+            var so_oft_h = so_oft^.to_host(oft_masters, k2_targets, ctx)
+            var onorm = krea2_direct_oft_grad_norm(so_oft_h.grads)
+            if onorm > Float64(cfg.max_grad_norm):
+                krea2_direct_oft_clip_grads(so_oft_h.grads, cfg.max_grad_norm / Float32(onorm))
+            krea2_direct_oft_adamw_step(
+                oft_masters, so_oft_h.grads, step + 1, cfg.lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            print("  [krea2-oft-direct] step=", step + 1,
+                  " master_grad_norm=", Float32(onorm),
+                  " vec_l1=", krea2_direct_oft_vec_l1(oft_masters))
+            comptime if KREA2_PHASE_TIMING:
+                _ot = _phase_ms("direct_oft_optimizer", _ot, ctx)
+
+            print(step, "  ", idx, "  ", lt, "  ", sigma, "  ", so_oft_h.loss, "  ", Float32(onorm))
+            ctx.synchronize()
+
+            if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
+                _ = sys_mkdirs(cfg.workspace_dir)
+                var sp = _lora_save_path(cfg, step + 1)
+                var nmods = save_krea2_direct_oft(oft_masters, sp, ctx)
+                print("  [save] wrote", nmods, "OFT modules ->", sp)
+                comptime if KREA2_KEEP_CHECKPOINTS > 0:
+                    var old_step = (step + 1) - KREA2_KEEP_CHECKPOINTS * cfg.save_every
+                    if old_step > 0 and old_step % KREA2_CKPT_MILESTONE != 0:
+                        var op = _lora_save_path(cfg, old_step)
+                        if sys_remove(op) == 0:
+                            print("  [prune] removed old checkpoint ->", op)
+            continue
+
         # device LoRA set for THIS step (small; rebuilt from the host authoritative).
         var dev_lora = _host_to_device_lora(host_lora, ctx)
         comptime if KREA2_PHASE_TIMING:
@@ -1004,6 +1575,20 @@ def main() raises:
             host_lora = krea2_lokr_carrier_lists(lokr_masters, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM)
             print("  [krea2-lokr] step=", step + 1, " master_grad_norm=", Float32(mnorm),
                   " zero_leg_l1=", krea2_lokr_zero_leg_l1(lokr_masters))
+        elif loha_active:
+            # chain carrier grads → LoHa master grads, host AdamW on masters,
+            # re-materialize carriers into host_lora for the next step.
+            var mg = krea2_loha_chain_all(loha_masters, gl.d_a, gl.d_b)
+            var mnorm = krea2_loha_grad_norm(mg)
+            if mnorm > Float64(cfg.max_grad_norm):
+                krea2_loha_clip_grads(mg, cfg.max_grad_norm / Float32(mnorm))
+            krea2_loha_adamw_step(
+                loha_masters, mg, step + 1, cfg.lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            host_lora = krea2_loha_carrier_lists(loha_masters, FEATURES, MLPDIM, HEADS * HEADDIM, KVHEADS * HEADDIM)
+            print("  [krea2-loha] step=", step + 1, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", krea2_loha_zero_leg_l1(loha_masters))
         elif levers_optimizer_active(cfg):
             levers_optimizer_step_host(
                 cfg, host_lora, gl.d_a, gl.d_b, step + 1, cfg.lr, 0, n_adapters,
@@ -1031,6 +1616,8 @@ def main() raises:
             var npairs: Int
             if lokr_active:
                 npairs = save_krea2_lokr(lokr_masters, sp, ctx)
+            elif loha_active:
+                npairs = save_krea2_loha(loha_masters, sp, ctx)
             else:
                 npairs = save_krea2_lora(host_lora, sp, ctx)
             print("  [save] wrote", npairs, "LoRA pairs ->", sp)
@@ -1050,10 +1637,21 @@ def main() raises:
     var n_pairs: Int
     if lokr_active:
         n_pairs = save_krea2_lokr(lokr_masters, final_path, ctx)
+    elif loha_active:
+        n_pairs = save_krea2_loha(loha_masters, final_path, ctx)
+    elif dora_active:
+        n_pairs = save_krea2_direct_dora(dora_masters, final_path, ctx)
+    elif oft_active:
+        n_pairs = save_krea2_direct_oft(oft_masters, final_path, ctx)
     else:
         n_pairs = save_krea2_lora(host_lora, final_path, ctx)
     print("")
-    print("[save] FINAL LoRA:", n_pairs, "pairs (", n_pairs * 2, "tensors) ->", final_path)
+    if dora_active:
+        print("[save] FINAL DoRA:", n_pairs, "modules ->", final_path)
+    elif oft_active:
+        print("[save] FINAL OFT:", n_pairs, "modules ->", final_path)
+    else:
+        print("[save] FINAL LoRA:", n_pairs, "pairs (", n_pairs * 2, "tensors) ->", final_path)
 
     print("")
     print("VERDICT: ran", steps, "steps. Lead checks loss DROPPING + grad_norm",

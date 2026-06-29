@@ -14,6 +14,7 @@
 from std.collections import List
 from std.math import sqrt
 from std.gpu.host import DeviceContext
+from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.dora_adapter import (
     DoRAAdapter, DoRAGrads, dora_effective_weight, new_dora_adapter, dora_adamw,
@@ -21,9 +22,9 @@ from serenitymojo.training.dora_adapter import (
 from serenitymojo.training.lokr_stack import (
     klein_lokr_slot_dims, _slot_targeted, _DBL_SLOTS, _SGL_SLOTS,
     LOKR_TGT_ALL, klein_lokr_prefix, _inactive_carrier,
-    LOKR_CARRIER_MAX_DEVICE_BYTES,
+    LOKR_CARRIER_MAX_DEVICE_BYTES, klein_lokr_base_weight_f32,
 )
-from serenitymojo.training.dora_save import NamedDoRA, save_dora_peft
+from serenitymojo.training.dora_save import NamedDoRA, save_dora_onetrainer
 
 
 def _zeros(n: Int) -> List[Float32]:
@@ -224,6 +225,55 @@ def build_klein_dora_set(
     return KleinDoRASet(dbl^, dbl_w^, dbl_active^, sgl^, sgl_w^, sgl_active^, num_double, num_single, rank)
 
 
+def build_klein_dora_set_from_checkpoint(
+    st: SafeTensors, num_double: Int, num_single: Int, D: Int, F: Int,
+    rank: Int, alpha: Float32, targets: Int, seed: UInt64,
+    wd_on_out: Bool = False,
+) raises -> KleinDoRASet:
+    if targets < 1 or targets > LOKR_TGT_ALL:
+        raise Error("build_klein_dora_set_from_checkpoint: targets must be 1(attn)|2(attn+ff)|3(all)")
+    var s = seed
+    var dbl = List[DoRAAdapter]()
+    var dbl_w = List[List[Float32]]()
+    var dbl_active = List[Bool]()
+    for bi in range(num_double):
+        for slot in range(_DBL_SLOTS):
+            if _slot_targeted(True, slot, targets):
+                var dims = klein_lokr_slot_dims(True, slot, D, F)
+                var w = klein_lokr_base_weight_f32(st, True, bi, slot, D, F)
+                if len(w) != dims[0] * dims[1]:
+                    raise Error("build_klein_dora_set_from_checkpoint: base weight numel mismatch")
+                dbl.append(new_dora_adapter(w.copy(), dims[0], dims[1], rank, alpha, s, Float32(1.0e-7), wd_on_out))
+                dbl_w.append(w^)
+                dbl_active.append(True)
+            else:
+                dbl.append(_dummy_dora())
+                var w1 = List[Float32](); w1.append(Float32(1.0))
+                dbl_w.append(w1^)
+                dbl_active.append(False)
+            s += 1
+    var sgl = List[DoRAAdapter]()
+    var sgl_w = List[List[Float32]]()
+    var sgl_active = List[Bool]()
+    for bi in range(num_single):
+        for slot in range(_SGL_SLOTS):
+            if _slot_targeted(False, slot, targets):
+                var dims = klein_lokr_slot_dims(False, slot, D, F)
+                var w = klein_lokr_base_weight_f32(st, False, bi, slot, D, F)
+                if len(w) != dims[0] * dims[1]:
+                    raise Error("build_klein_dora_set_from_checkpoint: single base weight numel mismatch")
+                sgl.append(new_dora_adapter(w.copy(), dims[0], dims[1], rank, alpha, s, Float32(1.0e-7), wd_on_out))
+                sgl_w.append(w^)
+                sgl_active.append(True)
+            else:
+                sgl.append(_dummy_dora())
+                var w1 = List[Float32](); w1.append(Float32(1.0))
+                sgl_w.append(w1^)
+                sgl_active.append(False)
+            s += 1
+    return KleinDoRASet(dbl^, dbl_w^, dbl_active^, sgl^, sgl_w^, sgl_active^, num_double, num_single, rank)
+
+
 def klein_dora_carrier_lists(
     set: KleinDoRASet, D: Int, F: Int
 ) raises -> Tuple[List[LoraAdapter], List[LoraAdapter]]:
@@ -318,6 +368,44 @@ def klein_dora_adamw_step(
             dora_adamw(set.sgl[i], grads.sgl[i], t, lr, beta1, beta2, eps, weight_decay)
 
 
+def _dora_grads_sqsum(g: DoRAGrads) -> Float64:
+    var s = Float64(0.0)
+    for j in range(len(g.d_a)):
+        s += Float64(g.d_a[j]) * Float64(g.d_a[j])
+    for j in range(len(g.d_b)):
+        s += Float64(g.d_b[j]) * Float64(g.d_b[j])
+    for j in range(len(g.d_m)):
+        s += Float64(g.d_m[j]) * Float64(g.d_m[j])
+    return s
+
+
+def klein_dora_grad_norm(g: KleinDoRAGrads) -> Float64:
+    var s = Float64(0.0)
+    for i in range(len(g.dbl)):
+        s += _dora_grads_sqsum(g.dbl[i])
+    for i in range(len(g.sgl)):
+        s += _dora_grads_sqsum(g.sgl[i])
+    return sqrt(s)
+
+
+def _dora_grads_scale(mut g: DoRAGrads, s: Float32):
+    for j in range(len(g.d_a)):
+        g.d_a[j] = g.d_a[j] * s
+    for j in range(len(g.d_b)):
+        g.d_b[j] = g.d_b[j] * s
+    for j in range(len(g.d_m)):
+        g.d_m[j] = g.d_m[j] * s
+
+
+def klein_dora_clip_grads(mut g: KleinDoRAGrads, clip_scale: Float32):
+    if clip_scale == Float32(1.0):
+        return
+    for i in range(len(g.dbl)):
+        _dora_grads_scale(g.dbl[i], clip_scale)
+    for i in range(len(g.sgl)):
+        _dora_grads_scale(g.sgl[i], clip_scale)
+
+
 # B (lora_up) is the DoRA zero-leg (0 at init; must be >0 after a real step).
 def klein_dora_zero_leg_l1(set: KleinDoRASet) -> Float64:
     var s = Float64(0.0)
@@ -350,4 +438,4 @@ def save_klein_dora(set: KleinDoRASet, path: String, ctx: DeviceContext) raises 
             var flat = bi * _SGL_SLOTS + slot
             if set.sgl_active[flat]:
                 named.append(NamedDoRA(klein_lokr_prefix(False, bi, slot), set.sgl[flat].copy()))
-    return save_dora_peft(named, path, ctx)
+    return save_dora_onetrainer(named, path, ctx)

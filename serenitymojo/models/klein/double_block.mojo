@@ -934,6 +934,15 @@ from serenitymojo.models.klein.single_block import (
     _klein_lora_bwd_dropout,
     _klein_lora_bwd_dropout_tensors,
 )
+from serenitymojo.models.klein.klein_direct_lycoris_stack import (
+    KleinStreamDirectDoRA, KleinDoubleDirectDoRA,
+    KleinStreamDirectOFT, KleinDoubleDirectOFT,
+    KleinDirectDoRAGradT, KleinDirectOFTGradT,
+    klein_direct_dora_projection_forward_optional,
+    klein_direct_dora_projection_backward_optional,
+    klein_direct_oft_projection_forward_optional,
+    klein_direct_oft_projection_backward_optional,
+)
 
 
 # Per-stream LoRA dropout salts for the 6 SEPARATE OneTrainer adapters
@@ -1513,6 +1522,752 @@ def double_block_lora_predict_device_resident_scratch[
         txt_x, txt_att, w.txt, txt_mod, lora.txt, N_TXT, D, F, eps, norm_ones, norm_zeros, ctx)
 
     return DoubleBlockDeviceOutput(ipost.out.copy(), tpost.out.copy())
+
+
+def _weight_rows(w: Tensor, row_start: Int, row_count: Int, ctx: DeviceContext) raises -> Tensor:
+    return slice(w, 0, row_start, row_count, ctx)
+
+
+def _stream_pre_direct_dora_resident[
+    H: Int, Dh: Int
+](
+    x: TArc, w: StreamWeights, mv: ModVecsDevice, ad: KleinStreamDirectDoRA,
+    N: Int, D: Int, eps: Float32, ones: Tensor, zeros: Tensor, ctx: DeviceContext,
+) raises -> _StreamPre:
+    var ln1 = layer_norm(x[], ones, zeros, eps, ctx)
+    var norm = modulate(ln1, mv.scale1[], mv.shift1[], ctx)
+    var wq = _weight_rows(w.wqkv[], 0, D, ctx)
+    var wk = _weight_rows(w.wqkv[], D, D, ctx)
+    var wv = _weight_rows(w.wqkv[], 2 * D, D, ctx)
+    var q_pre_flat = klein_direct_dora_projection_forward_optional(
+        norm, wq, ad.q, N, ctx,
+    )
+    var k_pre_flat = klein_direct_dora_projection_forward_optional(
+        norm, wk, ad.k, N, ctx,
+    )
+    var v_flat = klein_direct_dora_projection_forward_optional(
+        norm, wv, ad.v, N, ctx,
+    )
+    var q_pre = reshape_owned(q_pre_flat^, [1, N, H, Dh])
+    var k_pre = reshape_owned(k_pre_flat^, [1, N, H, Dh])
+    var v = reshape_owned(v_flat^, [1, N, H, Dh])
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    return _StreamPre(
+        TArc(ln1^), TArc(norm^), TArc(q_pre^), TArc(k_pre^),
+        TArc(q_rms^), TArc(k_rms^), TArc(v^),
+    )
+
+
+def _stream_post_direct_dora_resident(
+    x: TArc, att: TArc, w: StreamWeights, mv: ModVecsDevice,
+    ad: KleinStreamDirectDoRA, N: Int, D: Int, F: Int, eps: Float32,
+    ones: Tensor, zeros: Tensor, ctx: DeviceContext,
+) raises -> _StreamPost:
+    var out = klein_direct_dora_projection_forward_optional(
+        att[], w.wproj[], ad.out, N, ctx,
+    )
+    var attn_res = residual_gate(x[], mv.gate1[], out, ctx)
+    var ln2 = layer_norm(attn_res, ones, zeros, eps, ctx)
+    var mlp_in = modulate(ln2, mv.scale2[], mv.shift2[], ctx)
+    var gu = klein_direct_dora_projection_forward_optional(
+        mlp_in, w.wgu[], ad.ff_in, N, ctx,
+    )
+    var gate = slice(gu, 1, 0, F, ctx)
+    var up = slice(gu, 1, F, F, ctx)
+    var act = swiglu(gate, up, ctx)
+    var mlp = klein_direct_dora_projection_forward_optional(
+        act, w.wd[], ad.ff_out, N, ctx,
+    )
+    var final = residual_gate(attn_res, mv.gate2[], mlp, ctx)
+    return _StreamPost(
+        TArc(final^), TArc(attn_res^), TArc(ln2^), TArc(mlp_in^),
+        TArc(gu^), TArc(gate^), TArc(up^), TArc(act^),
+    )
+
+
+def _stream_pre_direct_oft_resident[
+    H: Int, Dh: Int
+](
+    x: TArc, w: StreamWeights, mv: ModVecsDevice, ad: KleinStreamDirectOFT,
+    N: Int, D: Int, eps: Float32, ones: Tensor, zeros: Tensor, ctx: DeviceContext,
+) raises -> _StreamPre:
+    var ln1 = layer_norm(x[], ones, zeros, eps, ctx)
+    var norm = modulate(ln1, mv.scale1[], mv.shift1[], ctx)
+    var wq = _weight_rows(w.wqkv[], 0, D, ctx)
+    var wk = _weight_rows(w.wqkv[], D, D, ctx)
+    var wv = _weight_rows(w.wqkv[], 2 * D, D, ctx)
+    var q_pre_flat = klein_direct_oft_projection_forward_optional(
+        norm, wq, ad.q, N, ctx,
+    )
+    var k_pre_flat = klein_direct_oft_projection_forward_optional(
+        norm, wk, ad.k, N, ctx,
+    )
+    var v_flat = klein_direct_oft_projection_forward_optional(
+        norm, wv, ad.v, N, ctx,
+    )
+    var q_pre = reshape_owned(q_pre_flat^, [1, N, H, Dh])
+    var k_pre = reshape_owned(k_pre_flat^, [1, N, H, Dh])
+    var v = reshape_owned(v_flat^, [1, N, H, Dh])
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    return _StreamPre(
+        TArc(ln1^), TArc(norm^), TArc(q_pre^), TArc(k_pre^),
+        TArc(q_rms^), TArc(k_rms^), TArc(v^),
+    )
+
+
+def _stream_post_direct_oft_resident(
+    x: TArc, att: TArc, w: StreamWeights, mv: ModVecsDevice,
+    ad: KleinStreamDirectOFT, N: Int, D: Int, F: Int, eps: Float32,
+    ones: Tensor, zeros: Tensor, ctx: DeviceContext,
+) raises -> _StreamPost:
+    var out = klein_direct_oft_projection_forward_optional(
+        att[], w.wproj[], ad.out, N, ctx,
+    )
+    var attn_res = residual_gate(x[], mv.gate1[], out, ctx)
+    var ln2 = layer_norm(attn_res, ones, zeros, eps, ctx)
+    var mlp_in = modulate(ln2, mv.scale2[], mv.shift2[], ctx)
+    var gu = klein_direct_oft_projection_forward_optional(
+        mlp_in, w.wgu[], ad.ff_in, N, ctx,
+    )
+    var gate = slice(gu, 1, 0, F, ctx)
+    var up = slice(gu, 1, F, F, ctx)
+    var act = swiglu(gate, up, ctx)
+    var mlp = klein_direct_oft_projection_forward_optional(
+        act, w.wd[], ad.ff_out, N, ctx,
+    )
+    var final = residual_gate(attn_res, mv.gate2[], mlp, ctx)
+    return _StreamPost(
+        TArc(final^), TArc(attn_res^), TArc(ln2^), TArc(mlp_in^),
+        TArc(gu^), TArc(gate^), TArc(up^), TArc(act^),
+    )
+
+
+def double_block_direct_dora_forward_device_resident_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_x: TArc, txt_x: TArc,
+    w: DoubleBlockWeights, img_mod: ModVecsDevice, txt_mod: ModVecsDevice,
+    dora: KleinDoubleDirectDoRA,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor, norm_zeros: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> DoubleBlockDeviceForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ip = _stream_pre_direct_dora_resident[H, Dh](
+        img_x, w.img, img_mod, dora.img, N_IMG, D, eps, norm_ones, norm_zeros, ctx,
+    )
+    var tp = _stream_pre_direct_dora_resident[H, Dh](
+        txt_x, w.txt, txt_mod, dora.txt, N_TXT, D, eps, norm_ones, norm_zeros, ctx,
+    )
+
+    var qk_mark = scratch.mark()
+    var q = concat2_scratch(1, ctx, scratch, tp.q_rms[], ip.q_rms[])
+    var k = concat2_scratch(1, ctx, scratch, tp.k_rms[], ip.k_rms[])
+    var v = concat(1, ctx, tp.v[], ip.v[])
+
+    var q_rope = rope_interleaved(q, cos, sin, ctx)
+    var k_rope = rope_interleaved(k, cos, sin, ctx)
+    scratch.rewind(qk_mark)
+    var att: Tensor
+    var flash_q = Optional[TArc](None)
+    var flash_k = Optional[TArc](None)
+    var flash_v = Optional[TArc](None)
+    var flash_o = Optional[TArc](None)
+    var flash_stats = Optional[TArc](None)
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        att = Tensor(ff.att.buf.copy(), ff.att.shape(), ff.att.dtype())
+        flash_q = Optional[TArc](ff.q_bf.copy())
+        flash_k = Optional[TArc](ff.k_bf.copy())
+        flash_v = Optional[TArc](ff.v_bf.copy())
+        flash_o = Optional[TArc](ff.o_bf.copy())
+        flash_stats = Optional[TArc](ff.stats.copy())
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+
+    var txt_att_4d = slice(att, 1, 0, N_TXT, ctx)
+    var img_att_4d = slice(att, 1, N_TXT, N_IMG, ctx)
+    var txt_att = TArc(reshape_owned(txt_att_4d^, [N_TXT, D]))
+    var img_att = TArc(reshape_owned(img_att_4d^, [N_IMG, D]))
+
+    var ipost = _stream_post_direct_dora_resident(
+        img_x, img_att, w.img, img_mod, dora.img, N_IMG, D, F, eps, norm_ones, norm_zeros, ctx)
+    var tpost = _stream_post_direct_dora_resident(
+        txt_x, txt_att, w.txt, txt_mod, dora.txt, N_TXT, D, F, eps, norm_ones, norm_zeros, ctx)
+
+    var img_saved = _make_saved(img_x, ip, img_att, ipost)
+    var txt_saved = _make_saved(txt_x, tp, txt_att, tpost)
+    var saved = DoubleBlockSaved(
+        img_saved^, txt_saved^, TArc(q_rope^), TArc(k_rope^), TArc(v^),
+        flash_q^, flash_k^, flash_v^, flash_o^, flash_stats^,
+    )
+
+    return DoubleBlockDeviceForward(ipost.out.copy(), tpost.out.copy(), saved^)
+
+
+def double_block_direct_oft_forward_device_resident_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_x: TArc, txt_x: TArc,
+    w: DoubleBlockWeights, img_mod: ModVecsDevice, txt_mod: ModVecsDevice,
+    oft: KleinDoubleDirectOFT,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor, norm_zeros: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> DoubleBlockDeviceForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ip = _stream_pre_direct_oft_resident[H, Dh](
+        img_x, w.img, img_mod, oft.img, N_IMG, D, eps, norm_ones, norm_zeros, ctx,
+    )
+    var tp = _stream_pre_direct_oft_resident[H, Dh](
+        txt_x, w.txt, txt_mod, oft.txt, N_TXT, D, eps, norm_ones, norm_zeros, ctx,
+    )
+
+    var qk_mark = scratch.mark()
+    var q = concat2_scratch(1, ctx, scratch, tp.q_rms[], ip.q_rms[])
+    var k = concat2_scratch(1, ctx, scratch, tp.k_rms[], ip.k_rms[])
+    var v = concat(1, ctx, tp.v[], ip.v[])
+
+    var q_rope = rope_interleaved(q, cos, sin, ctx)
+    var k_rope = rope_interleaved(k, cos, sin, ctx)
+    scratch.rewind(qk_mark)
+    var att: Tensor
+    var flash_q = Optional[TArc](None)
+    var flash_k = Optional[TArc](None)
+    var flash_v = Optional[TArc](None)
+    var flash_o = Optional[TArc](None)
+    var flash_stats = Optional[TArc](None)
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        att = Tensor(ff.att.buf.copy(), ff.att.shape(), ff.att.dtype())
+        flash_q = Optional[TArc](ff.q_bf.copy())
+        flash_k = Optional[TArc](ff.k_bf.copy())
+        flash_v = Optional[TArc](ff.v_bf.copy())
+        flash_o = Optional[TArc](ff.o_bf.copy())
+        flash_stats = Optional[TArc](ff.stats.copy())
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+
+    var txt_att_4d = slice(att, 1, 0, N_TXT, ctx)
+    var img_att_4d = slice(att, 1, N_TXT, N_IMG, ctx)
+    var txt_att = TArc(reshape_owned(txt_att_4d^, [N_TXT, D]))
+    var img_att = TArc(reshape_owned(img_att_4d^, [N_IMG, D]))
+
+    var ipost = _stream_post_direct_oft_resident(
+        img_x, img_att, w.img, img_mod, oft.img, N_IMG, D, F, eps, norm_ones, norm_zeros, ctx)
+    var tpost = _stream_post_direct_oft_resident(
+        txt_x, txt_att, w.txt, txt_mod, oft.txt, N_TXT, D, F, eps, norm_ones, norm_zeros, ctx)
+
+    var img_saved = _make_saved(img_x, ip, img_att, ipost)
+    var txt_saved = _make_saved(txt_x, tp, txt_att, tpost)
+    var saved = DoubleBlockSaved(
+        img_saved^, txt_saved^, TArc(q_rope^), TArc(k_rope^), TArc(v^),
+        flash_q^, flash_k^, flash_v^, flash_o^, flash_stats^,
+    )
+
+    return DoubleBlockDeviceForward(ipost.out.copy(), tpost.out.copy(), saved^)
+
+
+struct StreamDirectDoRAGradsT(Copyable, Movable):
+    var d_x: TArc
+    var q: KleinDirectDoRAGradT
+    var k: KleinDirectDoRAGradT
+    var v: KleinDirectDoRAGradT
+    var out: KleinDirectDoRAGradT
+    var ff_in: KleinDirectDoRAGradT
+    var ff_out: KleinDirectDoRAGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var q: KleinDirectDoRAGradT, var k: KleinDirectDoRAGradT,
+        var v: KleinDirectDoRAGradT, var out: KleinDirectDoRAGradT,
+        var ff_in: KleinDirectDoRAGradT, var ff_out: KleinDirectDoRAGradT,
+    ):
+        self.d_x = d_x^
+        self.q = q^
+        self.k = k^
+        self.v = v^
+        self.out = out^
+        self.ff_in = ff_in^
+        self.ff_out = ff_out^
+
+
+struct DoubleBlockDirectDoRAGradsT(Copyable, Movable):
+    var img: StreamDirectDoRAGradsT
+    var txt: StreamDirectDoRAGradsT
+
+    def __init__(
+        out self, var img: StreamDirectDoRAGradsT, var txt: StreamDirectDoRAGradsT,
+    ):
+        self.img = img^
+        self.txt = txt^
+
+
+struct StreamDirectOFTGradsT(Copyable, Movable):
+    var d_x: TArc
+    var q: KleinDirectOFTGradT
+    var k: KleinDirectOFTGradT
+    var v: KleinDirectOFTGradT
+    var out: KleinDirectOFTGradT
+    var ff_in: KleinDirectOFTGradT
+    var ff_out: KleinDirectOFTGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var q: KleinDirectOFTGradT, var k: KleinDirectOFTGradT,
+        var v: KleinDirectOFTGradT, var out: KleinDirectOFTGradT,
+        var ff_in: KleinDirectOFTGradT, var ff_out: KleinDirectOFTGradT,
+    ):
+        self.d_x = d_x^
+        self.q = q^
+        self.k = k^
+        self.v = v^
+        self.out = out^
+        self.ff_in = ff_in^
+        self.ff_out = ff_out^
+
+
+struct DoubleBlockDirectOFTGradsT(Copyable, Movable):
+    var img: StreamDirectOFTGradsT
+    var txt: StreamDirectOFTGradsT
+
+    def __init__(
+        out self, var img: StreamDirectOFTGradsT, var txt: StreamDirectOFTGradsT,
+    ):
+        self.img = img^
+        self.txt = txt^
+
+
+struct _StreamPostDirectDoRABack(Copyable, Movable):
+    var d_x: TArc
+    var d_att: TArc
+    var out: KleinDirectDoRAGradT
+    var ff_in: KleinDirectDoRAGradT
+    var ff_out: KleinDirectDoRAGradT
+
+    def __init__(
+        out self, var d_x: TArc, var d_att: TArc,
+        var out_g: KleinDirectDoRAGradT,
+        var ff_in: KleinDirectDoRAGradT, var ff_out: KleinDirectDoRAGradT,
+    ):
+        self.d_x = d_x^
+        self.d_att = d_att^
+        self.out = out_g^
+        self.ff_in = ff_in^
+        self.ff_out = ff_out^
+
+
+struct _StreamPreDirectDoRABack(Copyable, Movable):
+    var d_x: TArc
+    var q: KleinDirectDoRAGradT
+    var k: KleinDirectDoRAGradT
+    var v: KleinDirectDoRAGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var q: KleinDirectDoRAGradT, var k: KleinDirectDoRAGradT,
+        var v: KleinDirectDoRAGradT,
+    ):
+        self.d_x = d_x^
+        self.q = q^
+        self.k = k^
+        self.v = v^
+
+
+struct _StreamPostDirectOFTBack(Copyable, Movable):
+    var d_x: TArc
+    var d_att: TArc
+    var out: KleinDirectOFTGradT
+    var ff_in: KleinDirectOFTGradT
+    var ff_out: KleinDirectOFTGradT
+
+    def __init__(
+        out self, var d_x: TArc, var d_att: TArc,
+        var out_g: KleinDirectOFTGradT,
+        var ff_in: KleinDirectOFTGradT, var ff_out: KleinDirectOFTGradT,
+    ):
+        self.d_x = d_x^
+        self.d_att = d_att^
+        self.out = out_g^
+        self.ff_in = ff_in^
+        self.ff_out = ff_out^
+
+
+struct _StreamPreDirectOFTBack(Copyable, Movable):
+    var d_x: TArc
+    var q: KleinDirectOFTGradT
+    var k: KleinDirectOFTGradT
+    var v: KleinDirectOFTGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var q: KleinDirectOFTGradT, var k: KleinDirectOFTGradT,
+        var v: KleinDirectOFTGradT,
+    ):
+        self.d_x = d_x^
+        self.q = q^
+        self.k = k^
+        self.v = v^
+
+
+def _stream_post_backward_direct_dora_resident_scratch(
+    d_out: TArc, x: TArc, att: TArc,
+    w: StreamWeights, mv: ModVecsDevice, ad: KleinStreamDirectDoRA, sv: StreamSaved,
+    N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> _StreamPostDirectDoRABack:
+    var grg2: GateResidualGrads
+    if compute_aux_grads:
+        var mlp_y = klein_direct_dora_projection_forward_optional(
+            sv.act[], w.wd[], ad.ff_out, N, ctx,
+        )
+        grg2 = gate_residual_backward(
+            d_out[], sv.attn_res[], mv.gate2[], mlp_y, ctx
+        )
+    else:
+        grg2 = gate_residual_backward_dxdy(d_out[], mv.gate2[], ctx)
+
+    var post_mark = scratch.mark()
+    var bw_ff_out = klein_direct_dora_projection_backward_optional(
+        grg2.d_y, sv.act[], w.wd[], ad.ff_out, N, F, D, ctx,
+    )
+    var sgb = swiglu_backward(bw_ff_out.d_x, sv.gate[], sv.up[], ctx)
+    var d_gu = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
+    var bw_ff_in = klein_direct_dora_projection_backward_optional(
+        d_gu, sv.mlp_in[], w.wgu[], ad.ff_in, N, D, 2 * F, ctx,
+    )
+
+    var mb2 = modulate_backward(bw_ff_in.d_x, sv.ln2[], mv.scale2[], ctx, compute_aux_grads)
+    scratch.rewind(post_mark)
+    var d_attn_res_norm = layer_norm_backward_dx(mb2.d_x, sv.attn_res[], ones, eps, ctx)
+    var d_attn_res_total = TArc(add(grg2.d_x, d_attn_res_norm, ctx))
+
+    var grg1: GateResidualGrads
+    if compute_aux_grads:
+        var proj_out = klein_direct_dora_projection_forward_optional(
+            att[], w.wproj[], ad.out, N, ctx,
+        )
+        grg1 = gate_residual_backward(
+            d_attn_res_total[], x[], mv.gate1[], proj_out, ctx
+        )
+    else:
+        grg1 = gate_residual_backward_dxdy(d_attn_res_total[], mv.gate1[], ctx)
+
+    var bw_out = klein_direct_dora_projection_backward_optional(
+        grg1.d_y, att[], w.wproj[], ad.out, N, D, D, ctx,
+    )
+    return _StreamPostDirectDoRABack(
+        d_attn_res_total^, TArc(bw_out.d_x.clone(ctx)),
+        bw_out.dora.copy(), bw_ff_in.dora.copy(), bw_ff_out.dora.copy(),
+    )
+
+
+def _stream_pre_backward_direct_dora_resident_scratch[
+    H: Int, Dh: Int
+](
+    d_q_rms: Tensor, d_k_rms: Tensor, d_v_flat: Tensor,
+    w: StreamWeights, mv: ModVecsDevice, ad: KleinStreamDirectDoRA, sv: StreamSaved,
+    N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> _StreamPreDirectDoRABack:
+    var scratch_mark = scratch.mark()
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, sv.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, sv.k_pre[], w.k_norm[], eps, ctx)
+    var d_q_pre_flat = reshape_owned(d_q_pre^, [N, D])
+    var d_k_pre_flat = reshape_owned(d_k_pre^, [N, D])
+    var wq = _weight_rows(w.wqkv[], 0, D, ctx)
+    var wk = _weight_rows(w.wqkv[], D, D, ctx)
+    var wv = _weight_rows(w.wqkv[], 2 * D, D, ctx)
+    var bw_q = klein_direct_dora_projection_backward_optional(
+        d_q_pre_flat, sv.norm[], wq, ad.q, N, D, D, ctx,
+    )
+    var bw_k = klein_direct_dora_projection_backward_optional(
+        d_k_pre_flat, sv.norm[], wk, ad.k, N, D, D, ctx,
+    )
+    var bw_v = klein_direct_dora_projection_backward_optional(
+        d_v_flat, sv.norm[], wv, ad.v, N, D, D, ctx,
+    )
+    var d_norm_t = add(add(bw_q.d_x, bw_k.d_x, ctx), bw_v.d_x, ctx)
+    var mb1 = modulate_backward(d_norm_t, sv.ln1[], mv.scale1[], ctx, compute_aux_grads)
+    var d_x_norm_t = layer_norm_backward_dx(mb1.d_x, sv.x[], ones, eps, ctx)
+    var out = _StreamPreDirectDoRABack(
+        TArc(d_x_norm_t^), bw_q.dora.copy(), bw_k.dora.copy(), bw_v.dora.copy(),
+    )
+    scratch.rewind(scratch_mark)
+    return out^
+
+
+def _stream_post_backward_direct_oft_resident_scratch(
+    d_out: TArc, x: TArc, att: TArc,
+    w: StreamWeights, mv: ModVecsDevice, ad: KleinStreamDirectOFT, sv: StreamSaved,
+    N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> _StreamPostDirectOFTBack:
+    var grg2: GateResidualGrads
+    if compute_aux_grads:
+        var mlp_y = klein_direct_oft_projection_forward_optional(
+            sv.act[], w.wd[], ad.ff_out, N, ctx,
+        )
+        grg2 = gate_residual_backward(
+            d_out[], sv.attn_res[], mv.gate2[], mlp_y, ctx
+        )
+    else:
+        grg2 = gate_residual_backward_dxdy(d_out[], mv.gate2[], ctx)
+
+    var post_mark = scratch.mark()
+    var bw_ff_out = klein_direct_oft_projection_backward_optional(
+        grg2.d_y, sv.act[], w.wd[], ad.ff_out, N, F, D, ctx,
+    )
+    var sgb = swiglu_backward(bw_ff_out.d_x, sv.gate[], sv.up[], ctx)
+    var d_gu = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
+    var bw_ff_in = klein_direct_oft_projection_backward_optional(
+        d_gu, sv.mlp_in[], w.wgu[], ad.ff_in, N, D, 2 * F, ctx,
+    )
+
+    var mb2 = modulate_backward(bw_ff_in.d_x, sv.ln2[], mv.scale2[], ctx, compute_aux_grads)
+    scratch.rewind(post_mark)
+    var d_attn_res_norm = layer_norm_backward_dx(mb2.d_x, sv.attn_res[], ones, eps, ctx)
+    var d_attn_res_total = TArc(add(grg2.d_x, d_attn_res_norm, ctx))
+
+    var grg1: GateResidualGrads
+    if compute_aux_grads:
+        var proj_out = klein_direct_oft_projection_forward_optional(
+            att[], w.wproj[], ad.out, N, ctx,
+        )
+        grg1 = gate_residual_backward(
+            d_attn_res_total[], x[], mv.gate1[], proj_out, ctx
+        )
+    else:
+        grg1 = gate_residual_backward_dxdy(d_attn_res_total[], mv.gate1[], ctx)
+
+    var bw_out = klein_direct_oft_projection_backward_optional(
+        grg1.d_y, att[], w.wproj[], ad.out, N, D, D, ctx,
+    )
+    return _StreamPostDirectOFTBack(
+        d_attn_res_total^, TArc(bw_out.d_x.clone(ctx)),
+        bw_out.oft.copy(), bw_ff_in.oft.copy(), bw_ff_out.oft.copy(),
+    )
+
+
+def _stream_pre_backward_direct_oft_resident_scratch[
+    H: Int, Dh: Int
+](
+    d_q_rms: Tensor, d_k_rms: Tensor, d_v_flat: Tensor,
+    w: StreamWeights, mv: ModVecsDevice, ad: KleinStreamDirectOFT, sv: StreamSaved,
+    N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> _StreamPreDirectOFTBack:
+    var scratch_mark = scratch.mark()
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, sv.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, sv.k_pre[], w.k_norm[], eps, ctx)
+    var d_q_pre_flat = reshape_owned(d_q_pre^, [N, D])
+    var d_k_pre_flat = reshape_owned(d_k_pre^, [N, D])
+    var wq = _weight_rows(w.wqkv[], 0, D, ctx)
+    var wk = _weight_rows(w.wqkv[], D, D, ctx)
+    var wv = _weight_rows(w.wqkv[], 2 * D, D, ctx)
+    var bw_q = klein_direct_oft_projection_backward_optional(
+        d_q_pre_flat, sv.norm[], wq, ad.q, N, D, D, ctx,
+    )
+    var bw_k = klein_direct_oft_projection_backward_optional(
+        d_k_pre_flat, sv.norm[], wk, ad.k, N, D, D, ctx,
+    )
+    var bw_v = klein_direct_oft_projection_backward_optional(
+        d_v_flat, sv.norm[], wv, ad.v, N, D, D, ctx,
+    )
+    var d_norm_t = add(add(bw_q.d_x, bw_k.d_x, ctx), bw_v.d_x, ctx)
+    var mb1 = modulate_backward(d_norm_t, sv.ln1[], mv.scale1[], ctx, compute_aux_grads)
+    var d_x_norm_t = layer_norm_backward_dx(mb1.d_x, sv.x[], ones, eps, ctx)
+    var out = _StreamPreDirectOFTBack(
+        TArc(d_x_norm_t^), bw_q.oft.copy(), bw_k.oft.copy(), bw_v.oft.copy(),
+    )
+    scratch.rewind(scratch_mark)
+    return out^
+
+
+def double_block_direct_dora_backward_device_resident_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_io_t: TArc, d_to_t: TArc,
+    w: DoubleBlockWeights, img_mod: ModVecsDevice, txt_mod: ModVecsDevice,
+    dora: KleinDoubleDirectDoRA,
+    saved: DoubleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> DoubleBlockDirectDoRAGradsT:
+    var scratch_mark = scratch.mark()
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var ipb = _stream_post_backward_direct_dora_resident_scratch(
+        d_io_t, saved.img.x, saved.img.att, w.img, img_mod, dora.img, saved.img,
+        N_IMG, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
+    )
+    var tpb = _stream_post_backward_direct_dora_resident_scratch(
+        d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, dora.txt, saved.txt,
+        N_TXT, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
+    )
+
+    var d_tatt_4d = reshape(tpb.d_att[], [1, N_TXT, H, Dh], ctx)
+    var d_iatt_4d = reshape(ipb.d_att[], [1, N_IMG, H, Dh], ctx)
+    var d_att_joint = concat2_scratch(1, ctx, scratch, d_tatt_4d, d_iatt_4d)
+
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        if not saved.flash_stats:
+            raise Error("double direct DoRA bwd: missing flash tape")
+        var fb = sdpa_flash_backward_f32[1, S, H, Dh](
+            saved.flash_q.value(), saved.flash_k.value(),
+            saved.flash_v.value(), saved.flash_o.value(),
+            saved.flash_stats.value(), d_att_joint, scale, ctx,
+        )
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
+    else:
+        var sb = sdpa_backward_scratch[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v_joint[], d_att_joint, scale, ctx, scratch,
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+
+    var d_q_joint = rope_backward(d_q_sb, cos, sin, True, ctx)
+    var d_k_joint = rope_backward(d_k_sb, cos, sin, True, ctx)
+
+    var d_txt_q = slice_scratch(d_q_joint, 1, 0, N_TXT, ctx, scratch)
+    var d_img_q = slice_scratch(d_q_joint, 1, N_TXT, N_IMG, ctx, scratch)
+    var d_txt_k = slice_scratch(d_k_joint, 1, 0, N_TXT, ctx, scratch)
+    var d_img_k = slice_scratch(d_k_joint, 1, N_TXT, N_IMG, ctx, scratch)
+    var d_txt_v = slice_scratch(d_v_sb, 1, 0, N_TXT, ctx, scratch)
+    var d_img_v = slice_scratch(d_v_sb, 1, N_TXT, N_IMG, ctx, scratch)
+    reshape_in_place(d_img_v, [N_IMG, D])
+    reshape_in_place(d_txt_v, [N_TXT, D])
+
+    var iprb = _stream_pre_backward_direct_dora_resident_scratch[H, Dh](
+        d_img_q, d_img_k, d_img_v, w.img, img_mod, dora.img, saved.img,
+        N_IMG, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
+    )
+    var tprb = _stream_pre_backward_direct_dora_resident_scratch[H, Dh](
+        d_txt_q, d_txt_k, d_txt_v, w.txt, txt_mod, dora.txt, saved.txt,
+        N_TXT, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
+    )
+
+    var d_img_x_t = TArc(add(ipb.d_x[], iprb.d_x[], ctx))
+    var d_txt_x_t = TArc(add(tpb.d_x[], tprb.d_x[], ctx))
+    var img_grads = StreamDirectDoRAGradsT(
+        d_img_x_t^, iprb.q.copy(), iprb.k.copy(), iprb.v.copy(),
+        ipb.out.copy(), ipb.ff_in.copy(), ipb.ff_out.copy(),
+    )
+    var txt_grads = StreamDirectDoRAGradsT(
+        d_txt_x_t^, tprb.q.copy(), tprb.k.copy(), tprb.v.copy(),
+        tpb.out.copy(), tpb.ff_in.copy(), tpb.ff_out.copy(),
+    )
+    var out = DoubleBlockDirectDoRAGradsT(img_grads^, txt_grads^)
+    scratch.rewind(scratch_mark)
+    return out^
+
+
+def double_block_direct_oft_backward_device_resident_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_io_t: TArc, d_to_t: TArc,
+    w: DoubleBlockWeights, img_mod: ModVecsDevice, txt_mod: ModVecsDevice,
+    oft: KleinDoubleDirectOFT,
+    saved: DoubleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> DoubleBlockDirectOFTGradsT:
+    var scratch_mark = scratch.mark()
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var ipb = _stream_post_backward_direct_oft_resident_scratch(
+        d_io_t, saved.img.x, saved.img.att, w.img, img_mod, oft.img, saved.img,
+        N_IMG, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
+    )
+    var tpb = _stream_post_backward_direct_oft_resident_scratch(
+        d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, oft.txt, saved.txt,
+        N_TXT, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads,
+    )
+
+    var d_tatt_4d = reshape(tpb.d_att[], [1, N_TXT, H, Dh], ctx)
+    var d_iatt_4d = reshape(ipb.d_att[], [1, N_IMG, H, Dh], ctx)
+    var d_att_joint = concat2_scratch(1, ctx, scratch, d_tatt_4d, d_iatt_4d)
+
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        if not saved.flash_stats:
+            raise Error("double direct OFT bwd: missing flash tape")
+        var fb = sdpa_flash_backward_f32[1, S, H, Dh](
+            saved.flash_q.value(), saved.flash_k.value(),
+            saved.flash_v.value(), saved.flash_o.value(),
+            saved.flash_stats.value(), d_att_joint, scale, ctx,
+        )
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
+    else:
+        var sb = sdpa_backward_scratch[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v_joint[], d_att_joint, scale, ctx, scratch,
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+
+    var d_q_joint = rope_backward(d_q_sb, cos, sin, True, ctx)
+    var d_k_joint = rope_backward(d_k_sb, cos, sin, True, ctx)
+
+    var d_txt_q = slice_scratch(d_q_joint, 1, 0, N_TXT, ctx, scratch)
+    var d_img_q = slice_scratch(d_q_joint, 1, N_TXT, N_IMG, ctx, scratch)
+    var d_txt_k = slice_scratch(d_k_joint, 1, 0, N_TXT, ctx, scratch)
+    var d_img_k = slice_scratch(d_k_joint, 1, N_TXT, N_IMG, ctx, scratch)
+    var d_txt_v = slice_scratch(d_v_sb, 1, 0, N_TXT, ctx, scratch)
+    var d_img_v = slice_scratch(d_v_sb, 1, N_TXT, N_IMG, ctx, scratch)
+    reshape_in_place(d_img_v, [N_IMG, D])
+    reshape_in_place(d_txt_v, [N_TXT, D])
+
+    var iprb = _stream_pre_backward_direct_oft_resident_scratch[H, Dh](
+        d_img_q, d_img_k, d_img_v, w.img, img_mod, oft.img, saved.img,
+        N_IMG, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
+    )
+    var tprb = _stream_pre_backward_direct_oft_resident_scratch[H, Dh](
+        d_txt_q, d_txt_k, d_txt_v, w.txt, txt_mod, oft.txt, saved.txt,
+        N_TXT, D, eps, norm_ones, ctx, scratch, compute_aux_grads,
+    )
+
+    var d_img_x_t = TArc(add(ipb.d_x[], iprb.d_x[], ctx))
+    var d_txt_x_t = TArc(add(tpb.d_x[], tprb.d_x[], ctx))
+    var img_grads = StreamDirectOFTGradsT(
+        d_img_x_t^, iprb.q.copy(), iprb.k.copy(), iprb.v.copy(),
+        ipb.out.copy(), ipb.ff_in.copy(), ipb.ff_out.copy(),
+    )
+    var txt_grads = StreamDirectOFTGradsT(
+        d_txt_x_t^, tprb.q.copy(), tprb.k.copy(), tprb.v.copy(),
+        tpb.out.copy(), tpb.ff_in.copy(), tpb.ff_out.copy(),
+    )
+    var out = DoubleBlockDirectOFTGradsT(img_grads^, txt_grads^)
+    scratch.rewind(scratch_mark)
+    return out^
 
 
 def double_block_lora_forward_device[

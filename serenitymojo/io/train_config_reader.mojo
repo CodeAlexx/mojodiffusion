@@ -613,10 +613,13 @@ def _adapter_algo_int(s: String) raises -> Int:
     elif s == "oft" or s == "OFT":
         return TRAIN_ADAPTER_ALGO_OFT
     elif s == "boft" or s == "BOFT":
-        return TRAIN_ADAPTER_ALGO_BOFT
+        raise Error(
+            "JSON config: adapter algorithm 'boft' is intentionally unsupported; "
+            + "expected lora|locon|loha|lokr|full|dora|oft"
+        )
     raise Error(
         String("JSON config: unknown adapter algorithm '") + s
-        + "' (expected lora|locon|loha|lokr|full|dora|oft|boft)"
+        + "' (expected lora|locon|loha|lokr|full|dora|oft)"
     )
 
 

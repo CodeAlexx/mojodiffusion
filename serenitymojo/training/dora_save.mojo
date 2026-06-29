@@ -1,5 +1,9 @@
-# training/dora_save.mojo — save / reopen TRAINED DoRA adapters in the
-# UPSTREAM LyCORIS key convention (pip lycoris_lora 3.4.0, the T2.F oracle).
+# training/dora_save.mojo — save / reopen TRAINED DoRA adapters.
+#
+# Two on-disk shape conventions use the same key names:
+# - upstream LyCORIS/Kohya DoRA: output-axis `dora_scale` [out,1].
+# - OneTrainer default DoRA: input-axis `dora_scale` [1,in] when
+#   lora_decompose_output_axis=false.
 #
 # MEASURED upstream schema (lycoris/modules/locon.py LoConModule with
 # weight_decompose=True — upstream lycoris DoRA IS LoCon(wd=True); weight_list
@@ -27,6 +31,8 @@
 # - magnitude saved as [out,1] (wd_on_out=true convention; upstream dora_scale
 #   shape). `.magnitude_vector` is accepted on read as a legacy alias but NOT
 #   written.
+# - `save_dora_onetrainer` writes [out,1] for wd_on_out=true and [1,in] for the
+#   OneTrainer default wd_on_out=false.
 # - Plain LoRA (lora_save.mojo) deliberately OMITS `.alpha`; DoRA follows the
 #   LyCORIS convention and DOES carry `.alpha` (so scale=alpha/rank reconstructs).
 #
@@ -117,6 +123,46 @@ def save_dora_peft(
     return len(adapters)
 
 
+# OneTrainer uses the same key names as the LyCORIS save but preserves the DoRA
+# decomposition axis in `dora_scale` shape. Linear per-input default is [1,in].
+def save_dora_onetrainer(
+    adapters: List[NamedDoRA], path: String, ctx: DeviceContext
+) raises -> Int:
+    if len(adapters) == 0:
+        raise Error("save_dora_onetrainer: refusing to write an empty DoRA file")
+
+    var names = List[String]()
+    var tensors = List[ArcPointer[Tensor]]()
+
+    for ref nd in adapters:
+        var a = nd.adapter.copy()
+        var IN = a.in_f
+        var OUT = a.out_f
+        var R = a.rank
+        var mlen = OUT if a.wd_on_out else IN
+        if len(a.a) != R * IN:
+            raise Error(String("save_dora_onetrainer: lora_down numel ") + String(len(a.a)) + " != rank*in for '" + nd.prefix + "'")
+        if len(a.b) != OUT * R:
+            raise Error(String("save_dora_onetrainer: lora_up numel ") + String(len(a.b)) + " != out*rank for '" + nd.prefix + "'")
+        if len(a.m) != mlen:
+            raise Error(String("save_dora_onetrainer: magnitude numel ") + String(len(a.m)) + " != decomposition axis for '" + nd.prefix + "'")
+
+        names.append(nd.prefix + ".lora_down.weight")
+        tensors.append(ArcPointer(_bf16_2d(a.a.copy(), R, IN, ctx)))
+        names.append(nd.prefix + ".lora_up.weight")
+        tensors.append(ArcPointer(_bf16_2d(a.b.copy(), OUT, R, ctx)))
+        names.append(nd.prefix + ".dora_scale")
+        if a.wd_on_out:
+            tensors.append(ArcPointer(_f32_2d(a.m.copy(), OUT, 1, ctx)))
+        else:
+            tensors.append(ArcPointer(_f32_2d(a.m.copy(), 1, IN, ctx)))
+        names.append(nd.prefix + ".alpha")
+        tensors.append(ArcPointer(_f32_scalar(a.alpha, ctx)))
+
+    save_safetensors(names, tensors, path, ctx)
+    return len(adapters)
+
+
 # ── REOPEN: read one tensor by name to a host F32 list ───────────────────────
 def _read_f32(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List[Float32]:
     var info = st.tensor_info(name)
@@ -157,12 +203,14 @@ struct DoRAReadback(Copyable, Movable):
     var out_f: Int
     var rank: Int
     var alpha: Float32
+    var wd_on_out: Bool
 
 
 # Reopen one module's DoRA keys from `path`. Shapes from the header: lora_down
 # is [rank,in] so rank = a.shape[0], in = a.shape[1]; lora_up is [out,rank] so
 # out = b.shape[0]. The magnitude is read from `.dora_scale`, or `.magnitude_vector`
-# as a fallback legacy alias. Asserts all keys present.
+# as a fallback legacy alias. `wd_on_out` is inferred from magnitude shape:
+# [out,1]/[out] => output-axis, [1,in]/[in] => input-axis.
 def read_dora_module(prefix: String, path: String, ctx: DeviceContext) raises -> DoRAReadback:
     var st = SafeTensors.open(path)
 
@@ -185,17 +233,23 @@ def read_dora_module(prefix: String, path: String, ctx: DeviceContext) raises ->
         else:
             raise Error("read_dora_module: neither .dora_scale nor .magnitude_vector present for '" + prefix + "'")
     var im = st.tensor_info(mag_key)
-    # magnitude is [out,1] (or [out]); first dim must be OUT.
-    if im.shape[0] != OUT:
-        raise Error("read_dora_module: magnitude first dim != out")
-
     var a = _read_bf16(st, prefix + ".lora_down.weight", ctx)
     var b = _read_bf16(st, prefix + ".lora_up.weight", ctx)
     var m = _read_f32(st, mag_key, ctx)
-    if len(m) != OUT:
-        raise Error("read_dora_module: magnitude numel != out")
+    var wd_on_out: Bool
+    if len(m) == OUT and im.shape[0] == OUT:
+        wd_on_out = True
+    elif len(m) == IN:
+        if len(im.shape) == 1:
+            wd_on_out = False
+        elif im.shape[0] == 1:
+            wd_on_out = False
+        else:
+            raise Error("read_dora_module: input-axis magnitude shape must be [1,in] or [in]")
+    else:
+        raise Error("read_dora_module: magnitude numel does not match input or output axis")
     var alpha_h = _read_f32(st, prefix + ".alpha", ctx)
     if len(alpha_h) != 1:
         raise Error("read_dora_module: .alpha must be a 1-element tensor")
 
-    return DoRAReadback(a^, b^, m^, IN, OUT, R, alpha_h[0])
+    return DoRAReadback(a^, b^, m^, IN, OUT, R, alpha_h[0], wd_on_out)

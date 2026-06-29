@@ -58,11 +58,26 @@ from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.models.wan22.wan22_block import (
     WanModVecs, WanBlockWeights, WanSaved, WanBlockForward,
     WanBlockLora, WanBlockLoraGrads,
+    WanBlockDirectProjectionWeights, WanBlockDirectLycoris,
+    WanBlockDirectLycorisGrads, WanDirectProjectionGrad,
+    WAN_DIRECT_ALGO_DORA, WAN_DIRECT_ALGO_OFT,
     wan22_block_lora_forward, wan22_block_lora_backward,
+    wan22_block_direct_lycoris_forward, wan22_block_direct_lycoris_backward,
 )
 from serenitymojo.models.klein.lora_block import KleinLoraGrads
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.oft_onetrainer import OFTOTGrads
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectDoRAGrads, FlatDirectOFTSet, FlatDirectOFTGrads,
+)
+from serenitymojo.models.wan22.wan22_direct_lycoris_stack import (
+    empty_wan22_direct_dora_set, empty_wan22_direct_oft_set,
+    wan22_direct_dora_append_block_weights, build_wan22_direct_oft_set,
+    wan22_direct_dora_zero_grads, wan22_direct_dora_scatter_slot_grad,
+    wan22_direct_oft_zero_grads, wan22_direct_oft_scatter_slot_grad,
+)
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -247,6 +262,18 @@ def _wan_block_lora_for(lora: Wan22LoraSet, bi: Int) -> WanBlockLora:
     )
 
 
+def _wan_block_direct_dora_for(dora: FlatDirectDoRASet, bi: Int) -> WanBlockDirectLycoris:
+    return WanBlockDirectLycoris(
+        WAN_DIRECT_ALGO_DORA, dora.copy(), empty_wan22_direct_oft_set(), _block_base(bi),
+    )
+
+
+def _wan_block_direct_oft_for(oft: FlatDirectOFTSet, bi: Int) -> WanBlockDirectLycoris:
+    return WanBlockDirectLycoris(
+        WAN_DIRECT_ALGO_OFT, empty_wan22_direct_dora_set(), oft.copy(), _block_base(bi),
+    )
+
+
 # ── LoRA grad carrier ─────────────────────────────────────────────────────────
 struct Wan22LoraGradSet(Movable):
     var d_a: List[List[Float32]]   # [num_blocks*8][rank*dim]
@@ -266,6 +293,40 @@ struct Wan22LoraGradSet(Movable):
         self.d_x_tokens = d_x_tokens^
         self.d_context = d_context^
         self.nonfinite_lora_grads = nonfinite_lora_grads
+
+
+struct Wan22DirectDoRAGradSet(Movable):
+    var grads: FlatDirectDoRAGrads
+    var d_x_tokens: List[Float32]
+    var d_context: List[Float32]
+    var nonfinite_grads: Int
+
+    def __init__(
+        out self, var grads: FlatDirectDoRAGrads,
+        var d_x_tokens: List[Float32], var d_context: List[Float32],
+        nonfinite_grads: Int,
+    ):
+        self.grads = grads^
+        self.d_x_tokens = d_x_tokens^
+        self.d_context = d_context^
+        self.nonfinite_grads = nonfinite_grads
+
+
+struct Wan22DirectOFTGradSet(Movable):
+    var grads: FlatDirectOFTGrads
+    var d_x_tokens: List[Float32]
+    var d_context: List[Float32]
+    var nonfinite_grads: Int
+
+    def __init__(
+        out self, var grads: FlatDirectOFTGrads,
+        var d_x_tokens: List[Float32], var d_context: List[Float32],
+        nonfinite_grads: Int,
+    ):
+        self.grads = grads^
+        self.d_x_tokens = d_x_tokens^
+        self.d_context = d_context^
+        self.nonfinite_grads = nonfinite_grads
 
 
 # ── Forward tape ──────────────────────────────────────────────────────────────
@@ -445,6 +506,90 @@ def _wan22_block_weights_from_block(
     )
 
 
+def _wan22_direct_attention_weights_from_block(
+    block: Block, prefix: String, ctx: DeviceContext,
+) raises -> List[List[Float32]]:
+    var bp = prefix + "."
+    var out = List[List[Float32]]()
+    out.append(_block_f32(block, bp + String("self_attn.q.weight"), ctx))
+    out.append(_block_f32(block, bp + String("self_attn.k.weight"), ctx))
+    out.append(_block_f32(block, bp + String("self_attn.v.weight"), ctx))
+    out.append(_block_f32(block, bp + String("self_attn.o.weight"), ctx))
+    out.append(_block_f32(block, bp + String("cross_attn.q.weight"), ctx))
+    out.append(_block_f32(block, bp + String("cross_attn.k.weight"), ctx))
+    out.append(_block_f32(block, bp + String("cross_attn.v.weight"), ctx))
+    out.append(_block_f32(block, bp + String("cross_attn.o.weight"), ctx))
+    return out^
+
+
+def _wan22_direct_projection_weights_from_block(
+    block: Block, prefix: String, ctx: DeviceContext,
+) raises -> WanBlockDirectProjectionWeights:
+    var bp = prefix + "."
+    return WanBlockDirectProjectionWeights(
+        _block_f32(block, bp + String("self_attn.q.weight"), ctx),
+        _block_f32(block, bp + String("self_attn.k.weight"), ctx),
+        _block_f32(block, bp + String("self_attn.v.weight"), ctx),
+        _block_f32(block, bp + String("self_attn.o.weight"), ctx),
+        _block_f32(block, bp + String("self_attn.q.bias"), ctx),
+        _block_f32(block, bp + String("self_attn.k.bias"), ctx),
+        _block_f32(block, bp + String("self_attn.v.bias"), ctx),
+        _block_f32(block, bp + String("self_attn.o.bias"), ctx),
+        _block_f32(block, bp + String("cross_attn.q.weight"), ctx),
+        _block_f32(block, bp + String("cross_attn.k.weight"), ctx),
+        _block_f32(block, bp + String("cross_attn.v.weight"), ctx),
+        _block_f32(block, bp + String("cross_attn.o.weight"), ctx),
+        _block_f32(block, bp + String("cross_attn.q.bias"), ctx),
+        _block_f32(block, bp + String("cross_attn.k.bias"), ctx),
+        _block_f32(block, bp + String("cross_attn.v.bias"), ctx),
+        _block_f32(block, bp + String("cross_attn.o.bias"), ctx),
+    )
+
+
+def build_wan22_direct_dora_set_from_offload(
+    mut loader: TurboPlannedLoader, num_blocks: Int, dim: Int,
+    rank: Int, alpha: Float32, seed: UInt64, wd_on_out: Bool,
+    ctx: DeviceContext,
+) raises -> FlatDirectDoRASet:
+    var set = empty_wan22_direct_dora_set()
+    if num_blocks > 0:
+        loader.prefetch_with_ctx(0, ctx)
+    for bi in range(num_blocks):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var weights = _wan22_direct_attention_weights_from_block(handle.block, handle.prefix, ctx)
+        wan22_direct_dora_append_block_weights(
+            set, bi, weights^, dim, rank, alpha,
+            seed + UInt64(bi * WAN_SLOTS), wd_on_out,
+        )
+        loader.mark_active_block_done(ctx)
+    return set^
+
+
+def _scatter_dora_direct_grad(
+    mut grads: FlatDirectDoRAGrads, slot: Int, g: WanDirectProjectionGrad,
+) raises:
+    var dg = DoRAGrads(
+        g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), List[Float32](),
+    )
+    wan22_direct_dora_scatter_slot_grad(grads, slot, dg^)
+
+
+def _scatter_oft_direct_grad(
+    mut grads: FlatDirectOFTGrads, slot: Int, g: WanDirectProjectionGrad,
+) raises:
+    var og = OFTOTGrads(g.d_vec.copy(), List[Float32]())
+    wan22_direct_oft_scatter_slot_grad(grads, slot, og^)
+
+
+def _nonfinite_dora_projection(g: WanDirectProjectionGrad) -> Int:
+    return _nonfinite(g.d_a) + _nonfinite(g.d_b) + _nonfinite(g.d_m)
+
+
+def _nonfinite_oft_projection(g: WanDirectProjectionGrad) -> Int:
+    return _nonfinite(g.d_vec)
+
+
 # ── Text context embedding (frozen; T5 [TXT, text_dim] -> [TXT, dim]) ─────────
 def _embed_context(
     txt_tokens: List[Float32], TXT: Int, text_dim: Int, dim: Int,
@@ -573,6 +718,138 @@ def wan22_stack_lora_forward_offload[
     var head_shift = hmod[0].copy()
     var head_scale = hmod[1].copy()
 
+    var out = _head_forward(img, head_shift, head_scale, S, dim, out_ch, eps, base, ctx)
+
+    return Wan22StackForward(
+        out^, block_saved^, block_modvecs^,
+        img^, context_emb^,
+        e_head^, head_shift^, head_scale^,
+    )
+
+
+def wan22_stack_direct_dora_forward_offload[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    t_model: Float32,
+    base: Wan22StackBase,
+    mut loader: TurboPlannedLoader, dora: FlatDirectDoRASet,
+    cos: List[Float32], sin: List[Float32],
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
+    freq_dim: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22StackForward:
+    var num_blocks = len(dora.ad) // WAN_SLOTS
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+
+    var img = _embed_image(img_tokens, S, in_ch, dim, base, ctx)
+    var context_emb = _embed_context(txt_tokens, TXT, text_dim, dim, base, ctx)
+
+    var tfeats = _time_features(t_model, S, dim, freq_dim, base, ctx)
+    var e0_flat = tfeats[0].copy()
+    var e_head = tfeats[1].copy()
+
+    var block_saved = List[WanSaved]()
+    var block_modvecs = List[WanModVecs]()
+
+    for bi in range(num_blocks):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+
+        var bp = handle.prefix + "."
+        var mod_key = bp + String("modulation")
+        if not (mod_key in handle.block):
+            raise Error(String("wan22 block missing modulation: ") + mod_key)
+        var block_mod_t = cast_tensor(handle.block[mod_key][], STDtype.F32, ctx)
+        var block_mod_h = block_mod_t.to_host(ctx)
+
+        var mv = _block_modvecs(e0_flat, block_mod_h, bi, S, dim)
+        var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var direct_w = _wan22_direct_projection_weights_from_block(handle.block, handle.prefix, ctx)
+        var direct = _wan_block_direct_dora_for(dora, bi)
+        var fwd = wan22_block_direct_lycoris_forward[H, Dh, S, TXT](
+            img.copy(), context_emb.copy(), mv, w, direct_w, direct,
+            cos_t, sin_t, dim, ffn, eps, ctx,
+        )
+
+        block_saved.append(fwd.saved.copy())
+        block_modvecs.append(mv.copy())
+        img = fwd.x_out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var head_mod_h = base.head_mod[].to_host(ctx)
+    var hmod = _head_modvecs(head_mod_h, e_head, S, dim)
+    var head_shift = hmod[0].copy()
+    var head_scale = hmod[1].copy()
+    var out = _head_forward(img, head_shift, head_scale, S, dim, out_ch, eps, base, ctx)
+
+    return Wan22StackForward(
+        out^, block_saved^, block_modvecs^,
+        img^, context_emb^,
+        e_head^, head_shift^, head_scale^,
+    )
+
+
+def wan22_stack_direct_oft_forward_offload[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    t_model: Float32,
+    base: Wan22StackBase,
+    mut loader: TurboPlannedLoader, oft: FlatDirectOFTSet,
+    cos: List[Float32], sin: List[Float32],
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
+    freq_dim: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22StackForward:
+    var num_blocks = len(oft.ad) // WAN_SLOTS
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+
+    var img = _embed_image(img_tokens, S, in_ch, dim, base, ctx)
+    var context_emb = _embed_context(txt_tokens, TXT, text_dim, dim, base, ctx)
+
+    var tfeats = _time_features(t_model, S, dim, freq_dim, base, ctx)
+    var e0_flat = tfeats[0].copy()
+    var e_head = tfeats[1].copy()
+
+    var block_saved = List[WanSaved]()
+    var block_modvecs = List[WanModVecs]()
+
+    for bi in range(num_blocks):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+
+        var bp = handle.prefix + "."
+        var mod_key = bp + String("modulation")
+        if not (mod_key in handle.block):
+            raise Error(String("wan22 block missing modulation: ") + mod_key)
+        var block_mod_t = cast_tensor(handle.block[mod_key][], STDtype.F32, ctx)
+        var block_mod_h = block_mod_t.to_host(ctx)
+
+        var mv = _block_modvecs(e0_flat, block_mod_h, bi, S, dim)
+        var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var direct_w = _wan22_direct_projection_weights_from_block(handle.block, handle.prefix, ctx)
+        var direct = _wan_block_direct_oft_for(oft, bi)
+        var fwd = wan22_block_direct_lycoris_forward[H, Dh, S, TXT](
+            img.copy(), context_emb.copy(), mv, w, direct_w, direct,
+            cos_t, sin_t, dim, ffn, eps, ctx,
+        )
+
+        block_saved.append(fwd.saved.copy())
+        block_modvecs.append(mv.copy())
+        img = fwd.x_out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var head_mod_h = base.head_mod[].to_host(ctx)
+    var hmod = _head_modvecs(head_mod_h, e_head, S, dim)
+    var head_shift = hmod[0].copy()
+    var head_scale = hmod[1].copy()
     var out = _head_forward(img, head_shift, head_scale, S, dim, out_ch, eps, base, ctx)
 
     return Wan22StackForward(
@@ -725,6 +1002,230 @@ def wan22_stack_lora_backward_offload[
         d_img_tokens^, d_txt_tokens^,
         nonfinite,
     )
+
+
+def wan22_stack_direct_dora_backward_offload[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: Wan22StackBase,
+    mut loader: TurboPlannedLoader, dora: FlatDirectDoRASet,
+    cos: List[Float32], sin: List[Float32],
+    saved: Wan22StackForward,
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
+    freq_dim: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22DirectDoRAGradSet:
+    var num_blocks = len(dora.ad) // WAN_SLOTS
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.norm_backward import layer_norm_backward
+    from serenitymojo.ops.elementwise_backward import modulate_backward
+
+    var ones = List[Float32]()
+    for _ in range(dim):
+        ones.append(Float32(1.0))
+    var zeros = List[Float32]()
+    for _ in range(dim):
+        zeros.append(Float32(0.0))
+    var ln_x_img = layer_norm(
+        _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), _t(zeros^, [dim], ctx), eps, ctx,
+    ).to_host(ctx)
+    var scale_d = _t(saved.head_scale.copy(), [S, dim], ctx)
+    var shift_d = _t(saved.head_shift.copy(), [S, dim], ctx)
+    from serenitymojo.ops.tensor_algebra import add_scalar as _add_scalar
+    var sc1 = _add_scalar(scale_d, Float32(1.0), ctx)
+    var ln_x_t = _t(ln_x_img.copy(), [S, dim], ctx)
+    var modulated = mul(ln_x_t, sc1, ctx)
+    modulated = add(modulated, shift_d, ctx)
+    var lbh = linear_backward(
+        _t_like(d_out, [S, out_ch], base.hh_w[], ctx),
+        _cast_like(modulated, base.hh_w[], ctx), base.hh_w[],
+        S, dim, out_ch, ctx,
+    )
+    var d_modulated = lbh.d_x.to_host(ctx)
+    var mbh = modulate_backward(
+        _t(d_modulated, [S, dim], ctx), _t(ln_x_img^, [S, dim], ctx),
+        _t(saved.head_scale.copy(), [S, dim], ctx), ctx,
+    )
+    var d_ln_img = mbh.d_x.to_host(ctx)
+    var lnbh = layer_norm_backward(
+        _t(d_ln_img, [S, dim], ctx), _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), eps, ctx,
+    )
+    var d_x_img = lnbh.d_x.to_host(ctx)
+
+    var dora_grads = wan22_direct_dora_zero_grads(dora)
+    var nonfinite = 0
+
+    var bi = num_blocks - 1
+    while bi >= 0:
+        var block_idx = bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+
+        var mv = saved.block_modvecs[bi].copy()
+        var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var direct_w = _wan22_direct_projection_weights_from_block(handle.block, handle.prefix, ctx)
+        var direct = _wan_block_direct_dora_for(dora, bi)
+
+        var bg = wan22_block_direct_lycoris_backward[H, Dh, S, TXT](
+            d_x_img.copy(), mv, w, direct_w, direct, saved.block_saved[bi],
+            cos_t, sin_t, dim, ffn, eps, ctx,
+        )
+
+        d_x_img = bg.d_x.copy()
+        var bbase = _block_base(bi)
+        _scatter_dora_direct_grad(dora_grads, bbase + W_SA_Q, bg.sa_q)
+        _scatter_dora_direct_grad(dora_grads, bbase + W_SA_K, bg.sa_k)
+        _scatter_dora_direct_grad(dora_grads, bbase + W_SA_V, bg.sa_v)
+        _scatter_dora_direct_grad(dora_grads, bbase + W_SA_O, bg.sa_o)
+        _scatter_dora_direct_grad(dora_grads, bbase + W_CA_Q, bg.ca_q)
+        _scatter_dora_direct_grad(dora_grads, bbase + W_CA_K, bg.ca_k)
+        _scatter_dora_direct_grad(dora_grads, bbase + W_CA_V, bg.ca_v)
+        _scatter_dora_direct_grad(dora_grads, bbase + W_CA_O, bg.ca_o)
+
+        nonfinite += _nonfinite_dora_projection(bg.sa_q)
+        nonfinite += _nonfinite_dora_projection(bg.sa_k)
+        nonfinite += _nonfinite_dora_projection(bg.sa_v)
+        nonfinite += _nonfinite_dora_projection(bg.sa_o)
+        nonfinite += _nonfinite_dora_projection(bg.ca_q)
+        nonfinite += _nonfinite_dora_projection(bg.ca_k)
+        nonfinite += _nonfinite_dora_projection(bg.ca_v)
+        nonfinite += _nonfinite_dora_projection(bg.ca_o)
+
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    var lbi = linear_backward(
+        _t_like(d_x_img, [S, dim], base.pe_w[], ctx),
+        _t_like(img_tokens, [S, in_ch], base.pe_w[], ctx), base.pe_w[],
+        S, in_ch, dim, ctx,
+    )
+    var d_img_tokens = lbi.d_x.to_host(ctx)
+    var d_txt_tokens = _zeros_f32(TXT * text_dim)
+
+    return Wan22DirectDoRAGradSet(dora_grads^, d_img_tokens^, d_txt_tokens^, nonfinite)
+
+
+def wan22_stack_direct_oft_backward_offload[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: Wan22StackBase,
+    mut loader: TurboPlannedLoader, oft: FlatDirectOFTSet,
+    cos: List[Float32], sin: List[Float32],
+    saved: Wan22StackForward,
+    dim: Int, ffn: Int, in_ch: Int, text_dim: Int, out_ch: Int,
+    freq_dim: Int, eps: Float32, ctx: DeviceContext,
+) raises -> Wan22DirectOFTGradSet:
+    var num_blocks = len(oft.ad) // WAN_SLOTS
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.norm_backward import layer_norm_backward
+    from serenitymojo.ops.elementwise_backward import modulate_backward
+
+    var ones = List[Float32]()
+    for _ in range(dim):
+        ones.append(Float32(1.0))
+    var zeros = List[Float32]()
+    for _ in range(dim):
+        zeros.append(Float32(0.0))
+    var ln_x_img = layer_norm(
+        _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), _t(zeros^, [dim], ctx), eps, ctx,
+    ).to_host(ctx)
+    var scale_d = _t(saved.head_scale.copy(), [S, dim], ctx)
+    var shift_d = _t(saved.head_shift.copy(), [S, dim], ctx)
+    from serenitymojo.ops.tensor_algebra import add_scalar as _add_scalar
+    var sc1 = _add_scalar(scale_d, Float32(1.0), ctx)
+    var ln_x_t = _t(ln_x_img.copy(), [S, dim], ctx)
+    var modulated = mul(ln_x_t, sc1, ctx)
+    modulated = add(modulated, shift_d, ctx)
+    var lbh = linear_backward(
+        _t_like(d_out, [S, out_ch], base.hh_w[], ctx),
+        _cast_like(modulated, base.hh_w[], ctx), base.hh_w[],
+        S, dim, out_ch, ctx,
+    )
+    var d_modulated = lbh.d_x.to_host(ctx)
+    var mbh = modulate_backward(
+        _t(d_modulated, [S, dim], ctx), _t(ln_x_img^, [S, dim], ctx),
+        _t(saved.head_scale.copy(), [S, dim], ctx), ctx,
+    )
+    var d_ln_img = mbh.d_x.to_host(ctx)
+    var lnbh = layer_norm_backward(
+        _t(d_ln_img, [S, dim], ctx), _t(saved.x_img.copy(), [S, dim], ctx),
+        _t(ones.copy(), [dim], ctx), eps, ctx,
+    )
+    var d_x_img = lnbh.d_x.to_host(ctx)
+
+    var oft_grads = wan22_direct_oft_zero_grads(oft)
+    var nonfinite = 0
+
+    var bi = num_blocks - 1
+    while bi >= 0:
+        var block_idx = bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+
+        var mv = saved.block_modvecs[bi].copy()
+        var w = _wan22_block_weights_from_block(handle.block, handle.prefix, dim, ffn, Dh, ctx)
+        var direct_w = _wan22_direct_projection_weights_from_block(handle.block, handle.prefix, ctx)
+        var direct = _wan_block_direct_oft_for(oft, bi)
+
+        var bg = wan22_block_direct_lycoris_backward[H, Dh, S, TXT](
+            d_x_img.copy(), mv, w, direct_w, direct, saved.block_saved[bi],
+            cos_t, sin_t, dim, ffn, eps, ctx,
+        )
+
+        d_x_img = bg.d_x.copy()
+        var bbase = _block_base(bi)
+        _scatter_oft_direct_grad(oft_grads, bbase + W_SA_Q, bg.sa_q)
+        _scatter_oft_direct_grad(oft_grads, bbase + W_SA_K, bg.sa_k)
+        _scatter_oft_direct_grad(oft_grads, bbase + W_SA_V, bg.sa_v)
+        _scatter_oft_direct_grad(oft_grads, bbase + W_SA_O, bg.sa_o)
+        _scatter_oft_direct_grad(oft_grads, bbase + W_CA_Q, bg.ca_q)
+        _scatter_oft_direct_grad(oft_grads, bbase + W_CA_K, bg.ca_k)
+        _scatter_oft_direct_grad(oft_grads, bbase + W_CA_V, bg.ca_v)
+        _scatter_oft_direct_grad(oft_grads, bbase + W_CA_O, bg.ca_o)
+
+        nonfinite += _nonfinite_oft_projection(bg.sa_q)
+        nonfinite += _nonfinite_oft_projection(bg.sa_k)
+        nonfinite += _nonfinite_oft_projection(bg.sa_v)
+        nonfinite += _nonfinite_oft_projection(bg.sa_o)
+        nonfinite += _nonfinite_oft_projection(bg.ca_q)
+        nonfinite += _nonfinite_oft_projection(bg.ca_k)
+        nonfinite += _nonfinite_oft_projection(bg.ca_v)
+        nonfinite += _nonfinite_oft_projection(bg.ca_o)
+
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    var lbi = linear_backward(
+        _t_like(d_x_img, [S, dim], base.pe_w[], ctx),
+        _t_like(img_tokens, [S, in_ch], base.pe_w[], ctx), base.pe_w[],
+        S, in_ch, dim, ctx,
+    )
+    var d_img_tokens = lbi.d_x.to_host(ctx)
+    var d_txt_tokens = _zeros_f32(TXT * text_dim)
+
+    return Wan22DirectOFTGradSet(oft_grads^, d_img_tokens^, d_txt_tokens^, nonfinite)
 
 
 # ── AdamW step on all adapters ────────────────────────────────────────────────

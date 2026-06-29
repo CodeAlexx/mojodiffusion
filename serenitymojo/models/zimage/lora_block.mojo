@@ -56,6 +56,16 @@ from serenitymojo.autograd_v2.step_slab import StepSlab
 
 # REUSE the trainer's LoRA structs (the target authority).
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectOFTSet,
+)
+from serenitymojo.training.dora_substitution_device import (
+    dora_device_from_host, dora_substitution_forward_device,
+    dora_substitution_backward_device,
+)
+from serenitymojo.training.oft_onetrainer_device import (
+    oft_ot_rotate_b4, oft_ot_rotate_backward_b4,
+)
 
 # Forward + backward ops shared with the base block (Tenet 1: nothing new here).
 from serenitymojo.ops.norm import rms_norm, rms_norm_slab
@@ -655,6 +665,246 @@ def _proj_bwd_with_lora_device_tensors(
     return _ProjTensorGrads(summed^, lg.d_a.copy(), lg.d_b.copy())
 
 
+# ── Direct DoRA/OFT projection substitution for the production 7-slot path. ──
+comptime ZIMAGE_DIRECT_ALGO_DORA = 1
+comptime ZIMAGE_DIRECT_ALGO_OFT = 2
+comptime ZIMAGE_DIRECT_TGT_ATTN = 1
+comptime ZIMAGE_DIRECT_TGT_ALL = 2
+
+
+def _zimage_direct_slot_targeted(slot: Int, targets: Int) raises -> Bool:
+    if targets < ZIMAGE_DIRECT_TGT_ATTN or targets > ZIMAGE_DIRECT_TGT_ALL:
+        raise Error("ZImageBlockDirectLycoris: targets must be 1(attn)|2(all)")
+    var s = slot % ZIMAGE_SLOTS
+    if s == SLOT_Q or s == SLOT_K or s == SLOT_V or s == SLOT_O:
+        return targets >= ZIMAGE_DIRECT_TGT_ATTN
+    return targets >= ZIMAGE_DIRECT_TGT_ALL
+
+
+struct ZImageBlockDirectLycoris(Copyable, Movable):
+    var algo: Int
+    var dora: FlatDirectDoRASet
+    var oft: FlatDirectOFTSet
+    var q_slot: Int
+    var k_slot: Int
+    var v_slot: Int
+    var o_slot: Int
+    var w1_slot: Int
+    var w3_slot: Int
+    var w2_slot: Int
+
+    def __init__(
+        out self, algo: Int, var dora: FlatDirectDoRASet,
+        var oft: FlatDirectOFTSet, base_slot: Int, targets: Int,
+    ) raises:
+        var q = -1
+        var k = -1
+        var v = -1
+        var o = -1
+        var w1 = -1
+        var w3 = -1
+        var w2 = -1
+        var compact = base_slot
+        for slot in range(ZIMAGE_SLOTS):
+            if not _zimage_direct_slot_targeted(slot, targets):
+                continue
+            if slot == SLOT_Q:
+                q = compact
+            elif slot == SLOT_K:
+                k = compact
+            elif slot == SLOT_V:
+                v = compact
+            elif slot == SLOT_O:
+                o = compact
+            elif slot == SLOT_W1:
+                w1 = compact
+            elif slot == SLOT_W3:
+                w3 = compact
+            else:
+                w2 = compact
+            compact += 1
+        self.algo = algo
+        self.dora = dora^
+        self.oft = oft^
+        self.q_slot = q
+        self.k_slot = k
+        self.v_slot = v
+        self.o_slot = o
+        self.w1_slot = w1
+        self.w3_slot = w3
+        self.w2_slot = w2
+
+
+def _zimage_direct_flat_slot(direct: ZImageBlockDirectLycoris, slot: Int) raises -> Int:
+    if slot == SLOT_Q:
+        return direct.q_slot
+    if slot == SLOT_K:
+        return direct.k_slot
+    if slot == SLOT_V:
+        return direct.v_slot
+    if slot == SLOT_O:
+        return direct.o_slot
+    if slot == SLOT_W1:
+        return direct.w1_slot
+    if slot == SLOT_W3:
+        return direct.w3_slot
+    if slot == SLOT_W2:
+        return direct.w2_slot
+    raise Error("ZImageBlockDirectLycoris: bad direct slot")
+
+
+struct ZImageDirectProjectionGrad(Copyable, Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+    var d_m: List[Float32]
+    var d_vec: List[Float32]
+
+    def __init__(
+        out self, var d_a: List[Float32], var d_b: List[Float32],
+        var d_m: List[Float32], var d_vec: List[Float32],
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_m = d_m^
+        self.d_vec = d_vec^
+
+
+def _empty_direct_grad() -> ZImageDirectProjectionGrad:
+    return ZImageDirectProjectionGrad(
+        List[Float32](), List[Float32](), List[Float32](), List[Float32](),
+    )
+
+
+struct _ZImageDirectProjectionBack(Movable):
+    var d_x: TArc
+    var g: ZImageDirectProjectionGrad
+
+    def __init__(out self, var d_x: TArc, var g: ZImageDirectProjectionGrad):
+        self.d_x = d_x^
+        self.g = g^
+
+
+def _zimage_oft_vec_tensor(
+    set: FlatDirectOFTSet, slot: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    if slot < 0 or slot >= len(set.ad):
+        raise Error("ZImageBlockDirectLycoris OFT: slot out of range")
+    if not set.active[slot]:
+        raise Error("ZImageBlockDirectLycoris OFT: inactive slot")
+    ref sl = set.ad[slot]
+    if sl.b != 4:
+        raise Error("ZImageBlockDirectLycoris OFT: only block_size=4 is wired on GPU")
+    return Tensor.from_host(sl.vec.copy(), [sl.r, 6], STDtype.F32, ctx)
+
+
+def zimage_direct_projection_forward_device(
+    direct: ZImageBlockDirectLycoris, slot: Int,
+    x: Tensor, w_orig: Tensor,
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var flat_slot = _zimage_direct_flat_slot(direct, slot)
+    if flat_slot < 0:
+        return linear(x, w_orig, Optional[Tensor](None), ctx)
+    if direct.algo == ZIMAGE_DIRECT_ALGO_DORA:
+        if flat_slot >= len(direct.dora.ad):
+            raise Error("ZImageBlockDirectLycoris DoRA: slot out of range")
+        if not direct.dora.active[flat_slot]:
+            raise Error("ZImageBlockDirectLycoris DoRA: inactive slot")
+        if direct.dora.ad[flat_slot].in_f != in_f or direct.dora.ad[flat_slot].out_f != out_f:
+            raise Error("ZImageBlockDirectLycoris DoRA: slot shape mismatch")
+        var dev = dora_device_from_host(direct.dora.ad[flat_slot], ctx)
+        return dora_substitution_forward_device(x, w_orig, dev, ctx)
+    if direct.algo == ZIMAGE_DIRECT_ALGO_OFT:
+        if flat_slot >= len(direct.oft.ad):
+            raise Error("ZImageBlockDirectLycoris OFT: slot out of range")
+        if direct.oft.ad[flat_slot].in_f != in_f or direct.oft.ad[flat_slot].out_f != out_f:
+            raise Error("ZImageBlockDirectLycoris OFT: slot shape mismatch")
+        var vec = _zimage_oft_vec_tensor(direct.oft, flat_slot, ctx)
+        var x_rot = oft_ot_rotate_b4(x, vec, ctx)
+        return linear(x_rot, w_orig, Optional[Tensor](None), ctx)
+    raise Error("ZImageBlockDirectLycoris: unsupported direct algorithm")
+
+
+def zimage_direct_projection_backward_device(
+    direct: ZImageBlockDirectLycoris, slot: Int,
+    d_y: Tensor, x: Tensor, w_orig: Tensor,
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> _ZImageDirectProjectionBack:
+    var flat_slot = _zimage_direct_flat_slot(direct, slot)
+    if flat_slot < 0:
+        var dx = linear_backward_dx(d_y, w_orig, M, in_f, out_f, ctx)
+        return _ZImageDirectProjectionBack(TArc(dx^), _empty_direct_grad())
+    if direct.algo == ZIMAGE_DIRECT_ALGO_DORA:
+        if flat_slot >= len(direct.dora.ad):
+            raise Error("ZImageBlockDirectLycoris DoRA backward: slot out of range")
+        if not direct.dora.active[flat_slot]:
+            raise Error("ZImageBlockDirectLycoris DoRA backward: inactive slot")
+        if direct.dora.ad[flat_slot].in_f != in_f or direct.dora.ad[flat_slot].out_f != out_f:
+            raise Error("ZImageBlockDirectLycoris DoRA backward: slot shape mismatch")
+        var dev = dora_device_from_host(direct.dora.ad[flat_slot], ctx)
+        var g = dora_substitution_backward_device(d_y, x, w_orig, dev, ctx)
+        return _ZImageDirectProjectionBack(
+            TArc(g.d_x.clone(ctx)),
+            ZImageDirectProjectionGrad(
+                g.d_a.to_host(ctx), g.d_b.to_host(ctx), g.d_m.to_host(ctx),
+                List[Float32](),
+            ),
+        )
+    if direct.algo == ZIMAGE_DIRECT_ALGO_OFT:
+        if flat_slot >= len(direct.oft.ad):
+            raise Error("ZImageBlockDirectLycoris OFT backward: slot out of range")
+        if direct.oft.ad[flat_slot].in_f != in_f or direct.oft.ad[flat_slot].out_f != out_f:
+            raise Error("ZImageBlockDirectLycoris OFT backward: slot shape mismatch")
+        var vec = _zimage_oft_vec_tensor(direct.oft, flat_slot, ctx)
+        var d_x_rot = linear_backward_dx(d_y, w_orig, M, in_f, out_f, ctx)
+        if d_x_rot.dtype() != x.dtype():
+            d_x_rot = cast_tensor(d_x_rot^, x.dtype(), ctx)
+        if d_x_rot.shape() != x.shape():
+            d_x_rot = reshape_owned(d_x_rot^, x.shape())
+        var g = oft_ot_rotate_backward_b4(d_x_rot^, x, vec, ctx)
+        return _ZImageDirectProjectionBack(
+            TArc(g.d_x.clone(ctx)),
+            ZImageDirectProjectionGrad(
+                List[Float32](), List[Float32](), List[Float32](), g.d_vec.to_host(ctx),
+            ),
+        )
+    raise Error("ZImageBlockDirectLycoris: unsupported direct algorithm")
+
+
+struct ZImageBlockDirectGrads(Copyable, Movable):
+    var q: ZImageDirectProjectionGrad
+    var k: ZImageDirectProjectionGrad
+    var v: ZImageDirectProjectionGrad
+    var out_proj: ZImageDirectProjectionGrad
+    var w1: ZImageDirectProjectionGrad
+    var w3: ZImageDirectProjectionGrad
+    var w2: ZImageDirectProjectionGrad
+
+    def __init__(
+        out self,
+        var q: ZImageDirectProjectionGrad, var k: ZImageDirectProjectionGrad,
+        var v: ZImageDirectProjectionGrad, var out_g: ZImageDirectProjectionGrad,
+        var w1: ZImageDirectProjectionGrad, var w3: ZImageDirectProjectionGrad,
+        var w2: ZImageDirectProjectionGrad,
+    ):
+        self.q = q^
+        self.k = k^
+        self.v = v^
+        self.out_proj = out_g^
+        self.w1 = w1^
+        self.w3 = w3^
+        self.w2 = w2^
+
+
+struct ZImageBlockDirectTensorBackward(Copyable, Movable):
+    var d_x: TArc
+    var grads: ZImageBlockDirectGrads
+
+    def __init__(out self, var d_x: TArc, var grads: ZImageBlockDirectGrads):
+        self.d_x = d_x^
+        self.grads = grads^
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULATED block (noise refiners + main layers) — LoRA-aware fwd + bwd.
 # Mirrors zimage_block_forward/_backward EXACTLY (models/zimage/block.mojo), adding
@@ -1095,6 +1345,90 @@ def zimage_block_lora_forward_device_tensor[
     return ZImageBlockForwardLoraTensor(TArc(result^), saved^)
 
 
+def zimage_block_direct_lycoris_forward_device_tensor[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ZImageBlockWeights, mv: ZImageModVecs, direct: ZImageBlockDirectLycoris,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageBlockForwardLoraTensor:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var zeros = _zeros(D)
+
+    var xn1 = rms_norm(x_arc[], w.n1[], eps, ctx)
+    var xn1s = modulate(
+        xn1, _t(mv.scale_msa.copy(), [D], ctx), _t(zeros.copy(), [D], ctx), ctx
+    )
+
+    var q = zimage_direct_projection_forward_device(
+        direct, SLOT_Q, xn1s, w.wq[], S, D, D, ctx,
+    )
+    var k = zimage_direct_projection_forward_device(
+        direct, SLOT_K, xn1s, w.wk[], S, D, D, ctx,
+    )
+    var v_flat = zimage_direct_projection_forward_device(
+        direct, SLOT_V, xn1s, w.wv[], S, D, D, ctx,
+    )
+
+    var q_pre = reshape_owned(q^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var att_o = zimage_direct_projection_forward_device(
+        direct, SLOT_O, att_flat, w.wo[], S, D, D, ctx,
+    )
+
+    var attn_n2 = rms_norm(att_o, w.n2[], eps, ctx)
+    var gate_msa_raw = _t(mv.gate_msa.copy(), [D], ctx)
+    var gate_msa_t = tanh_op(gate_msa_raw, ctx)
+    var h = residual_gate(x_arc[], gate_msa_t, attn_n2, ctx)
+
+    var xfn1 = rms_norm(h, w.fn1[], eps, ctx)
+    var xfn1s = modulate(
+        xfn1, _t(mv.scale_mlp.copy(), [D], ctx), _t(zeros.copy(), [D], ctx), ctx
+    )
+
+    var g_pre = zimage_direct_projection_forward_device(
+        direct, SLOT_W1, xfn1s, w.w1[], S, D, F, ctx,
+    )
+    var u = zimage_direct_projection_forward_device(
+        direct, SLOT_W3, xfn1s, w.w3[], S, D, F, ctx,
+    )
+
+    var act = swiglu(g_pre, u, ctx)
+
+    var ff = zimage_direct_projection_forward_device(
+        direct, SLOT_W2, act, w.w2[], S, F, D, ctx,
+    )
+
+    var ff_n2 = rms_norm(ff, w.fn2[], eps, ctx)
+    var gate_mlp_raw = _t(mv.gate_mlp.copy(), [D], ctx)
+    var gate_mlp_t = tanh_op(gate_mlp_raw, ctx)
+    var result = residual_gate(h, gate_mlp_t, ff_n2, ctx)
+
+    var saved = ZImageBlockSaved(
+        x_arc.copy(), TArc(xn1^), TArc(xn1s^),
+        TArc(q_pre^), TArc(k_pre^), TArc(v^),
+        TArc(q_rms^), TArc(k_rms^), TArc(q_rope^), TArc(k_rope^),
+        TArc(att_flat^), TArc(att_o^),
+        TArc(gate_msa_t^), TArc(gate_msa_raw^), TArc(h^),
+        TArc(xfn1^), TArc(xfn1s^),
+        TArc(g_pre^), TArc(u^), TArc(act^), TArc(ff^),
+        TArc(gate_mlp_t^), TArc(gate_mlp_raw^),
+    )
+    return ZImageBlockForwardLoraTensor(TArc(result^), saved^)
+
+
 def zimage_block_lora_predict_device_tensor[
     H: Int, Dh: Int, S: Int
 ](
@@ -1434,6 +1768,89 @@ def zimage_block_lora_backward_device_tensors[
     d_b_slots.append(lb_w2.d_b.copy())
 
     return ZImageBlockLoraTensorBackward(TArc(d_x_t^), d_a_slots^, d_b_slots^)
+
+
+def zimage_block_direct_lycoris_backward_device_tensors[
+    H: Int, Dh: Int, S: Int
+](
+    d_out: Tensor,
+    w: ZImageBlockWeights, mv: ZImageModVecs, direct: ZImageBlockDirectLycoris,
+    saved: ZImageBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageBlockDirectTensorBackward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var ff_n2_y = rms_norm(saved.ff[], w.fn2[], eps, ctx)
+    var grg2 = gate_residual_backward(
+        d_out, saved.h[], saved.gate_mlp_t[], ff_n2_y, ctx
+    )
+
+    var d_ff = rms_norm_backward_dx(grg2.d_y, saved.ff[], w.fn2[], eps, ctx)
+    var lb_w2 = zimage_direct_projection_backward_device(
+        direct, SLOT_W2, d_ff, saved.act[], w.w2[], S, F, D, ctx,
+    )
+
+    var sg = swiglu_backward(lb_w2.d_x[], saved.g_pre[], saved.u[], ctx)
+
+    var lb_w1 = zimage_direct_projection_backward_device(
+        direct, SLOT_W1, sg.d_gate, saved.xfn1s[], w.w1[], S, D, F, ctx,
+    )
+    var lb_w3 = zimage_direct_projection_backward_device(
+        direct, SLOT_W3, sg.d_up, saved.xfn1s[], w.w3[], S, D, F, ctx,
+    )
+    var d_xfn1s = add(lb_w1.d_x[], lb_w3.d_x[], ctx)
+
+    var mb_mlp = modulate_backward(d_xfn1s, saved.xfn1[], _t(mv.scale_mlp.copy(), [D], ctx), ctx)
+    var d_h_norm = rms_norm_backward_dx(mb_mlp.d_x, saved.h[], w.fn1[], eps, ctx)
+    var d_h = add(grg2.d_x, d_h_norm, ctx)
+
+    var attn_n2_y = rms_norm(saved.att_o[], w.n2[], eps, ctx)
+    var grg1 = gate_residual_backward(
+        d_h, saved.x[], saved.gate_msa_t[], attn_n2_y, ctx
+    )
+
+    var d_att_o = rms_norm_backward_dx(grg1.d_y, saved.att_o[], w.n2[], eps, ctx)
+    var lb_o = zimage_direct_projection_backward_device(
+        direct, SLOT_O, d_att_o, saved.att_flat[], w.wo[], S, D, D, ctx,
+    )
+
+    var d_att_4d = lb_o.d_x[].clone(ctx)
+    reshape_in_place(d_att_4d, [1, S, H, Dh])
+    var sb = sdpa_backward[1, S, H, Dh](
+        saved.q_rope[], saved.k_rope[], saved.v[], d_att_4d, scale, ctx
+    )
+    var d_q_rms = rope_backward(sb.d_q, cos, sin, True, ctx)
+    var d_k_rms = rope_backward(sb.d_k, cos, sin, True, ctx)
+
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
+
+    reshape_in_place(d_q_pre, [S, D])
+    reshape_in_place(d_k_pre, [S, D])
+    reshape_in_place(sb.d_v, [S, D])
+
+    var lb_q = zimage_direct_projection_backward_device(
+        direct, SLOT_Q, d_q_pre, saved.xn1s[], w.wq[], S, D, D, ctx,
+    )
+    var lb_k = zimage_direct_projection_backward_device(
+        direct, SLOT_K, d_k_pre, saved.xn1s[], w.wk[], S, D, D, ctx,
+    )
+    var lb_v = zimage_direct_projection_backward_device(
+        direct, SLOT_V, sb.d_v, saved.xn1s[], w.wv[], S, D, D, ctx,
+    )
+    var d_xn1s = add(add(lb_q.d_x[], lb_k.d_x[], ctx), lb_v.d_x[], ctx)
+
+    var mb_sa = modulate_backward(d_xn1s, saved.xn1[], _t(mv.scale_msa.copy(), [D], ctx), ctx)
+    var d_x_norm = rms_norm_backward_dx(mb_sa.d_x, saved.x[], w.n1[], eps, ctx)
+
+    var d_x_t = add(grg1.d_x, d_x_norm, ctx)
+    var grads = ZImageBlockDirectGrads(
+        lb_q.g.copy(), lb_k.g.copy(), lb_v.g.copy(), lb_o.g.copy(),
+        lb_w1.g.copy(), lb_w3.g.copy(), lb_w2.g.copy(),
+    )
+    return ZImageBlockDirectTensorBackward(TArc(d_x_t^), grads^)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

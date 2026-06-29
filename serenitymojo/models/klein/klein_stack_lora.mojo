@@ -70,6 +70,12 @@ from serenitymojo.models.klein.double_block import (
     double_block_lora_predict_device_resident_scratch,
     double_block_lora_backward_device_resident_scratch,
     double_block_lora_backward_device_resident_scratch_tensors,
+    double_block_direct_dora_forward_device_resident_scratch,
+    double_block_direct_dora_backward_device_resident_scratch,
+    double_block_direct_oft_forward_device_resident_scratch,
+    double_block_direct_oft_backward_device_resident_scratch,
+    DoubleBlockDirectDoRAGradsT, DoubleBlockDirectOFTGradsT,
+    StreamDirectDoRAGradsT, StreamDirectOFTGradsT,
 )
 from serenitymojo.models.klein.single_block import (
     SingleBlockWeights, SingleModVecs, SingleModVecsDevice, single_modvecs_to_device,
@@ -86,7 +92,36 @@ from serenitymojo.models.klein.single_block import (
     single_block_lora_backward_device_resident,
     single_block_lora_backward_device_resident_scratch,
     single_block_lora_backward_device_resident_scratch_tensors,
+    single_block_direct_dora_forward_device_resident_scratch,
+    single_block_direct_dora_backward_device_resident_scratch,
+    single_block_direct_oft_forward_device_resident_scratch,
+    single_block_direct_oft_backward_device_resident_scratch,
+    SingleBlockDirectDoRAGradsT, SingleBlockDirectOFTGradsT,
 )
+from serenitymojo.models.klein.klein_direct_lycoris_stack import (
+    KleinStackDirectDoRA, KleinStackDirectOFT,
+    KleinDirectDoRAGradT, KleinDirectOFTGradT,
+    build_klein_direct_dora_set_from_checkpoint,
+    build_klein_direct_oft_set_from_checkpoint,
+    empty_klein_direct_dora_set, empty_klein_direct_oft_set,
+    klein_direct_dense_carrier_bytes,
+    klein_direct_dora_preflight, klein_direct_oft_preflight,
+    klein_direct_dora_blocks_to_device, klein_direct_oft_blocks_to_device,
+    klein_direct_dora_zero_grads, klein_direct_oft_zero_grads,
+    klein_direct_dora_scatter_slot_grad, klein_direct_oft_scatter_slot_grad,
+    klein_direct_dora_grad_norm, klein_direct_dora_clip_grads,
+    klein_direct_dora_adamw_step, klein_direct_dora_zero_leg_l1,
+    klein_direct_dora_trainable_bytes, save_klein_direct_dora,
+    klein_direct_oft_grad_norm, klein_direct_oft_clip_grads,
+    klein_direct_oft_adamw_step, klein_direct_oft_vec_l1,
+    klein_direct_oft_trainable_bytes, save_klein_direct_oft,
+)
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectDoRAGrads, FlatDirectOFTSet, FlatDirectOFTGrads,
+)
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.oft_onetrainer import OFTOTGrads
+from serenitymojo.training.lokr_stack import LOKR_TGT_ALL, _slot_targeted
 from serenitymojo.models.klein.klein_stack import (
     KleinStackBase, KleinStackForward,
     _add_lists, _zeros, _ones, _t, _linear_fwd, _linear_fwd_wdev,
@@ -476,6 +511,18 @@ def _single_weights_from_block(
     )
 
 
+def _single_weights_full_from_block(
+    block: Block, prefix: String, D: Int, F: Int, ctx: DeviceContext,
+) raises -> SingleBlockWeights:
+    return SingleBlockWeights(
+        _block_tensor_base(block, prefix + String(".linear1.weight")),
+        _block_tensor_base(block, prefix + String(".linear2.weight")),
+        _block_tensor_base(block, prefix + String(".norm.query_norm.scale")),
+        _block_tensor_base(block, prefix + String(".norm.key_norm.scale")),
+        D, F, ctx, True,
+    )
+
+
 def _concat6(
     a: List[Float32], b: List[Float32], c: List[Float32],
     d: List[Float32], e: List[Float32], f: List[Float32],
@@ -697,6 +744,615 @@ def klein_lora_tensor_grads_to_host(
         tg.d_img_in.copy(), tg.d_txt_in.copy(), tg.d_final_lin.copy(),
         tg.d_final_shift.copy(), tg.d_final_scale.copy(),
     )
+
+
+struct KleinStackDirectDoRAGradsT(Movable):
+    var grads: FlatDirectDoRAGrads
+    var d_img_tokens: List[Float32]
+    var d_txt_tokens: List[Float32]
+
+    def __init__(
+        out self, var grads: FlatDirectDoRAGrads,
+        var d_img_tokens: List[Float32], var d_txt_tokens: List[Float32],
+    ):
+        self.grads = grads^
+        self.d_img_tokens = d_img_tokens^
+        self.d_txt_tokens = d_txt_tokens^
+
+
+struct KleinStackDirectOFTGradsT(Movable):
+    var grads: FlatDirectOFTGrads
+    var d_img_tokens: List[Float32]
+    var d_txt_tokens: List[Float32]
+
+    def __init__(
+        out self, var grads: FlatDirectOFTGrads,
+        var d_img_tokens: List[Float32], var d_txt_tokens: List[Float32],
+    ):
+        self.grads = grads^
+        self.d_img_tokens = d_img_tokens^
+        self.d_txt_tokens = d_txt_tokens^
+
+
+def _klein_direct_slots_per_double(targets: Int) raises -> Int:
+    var n = 0
+    for slot in range(DBL_SLOTS):
+        if _slot_targeted(True, slot, targets):
+            n += 1
+    return n
+
+
+def _klein_direct_slots_per_single(targets: Int) raises -> Int:
+    var n = 0
+    for slot in range(SGL_SLOTS):
+        if _slot_targeted(False, slot, targets):
+            n += 1
+    return n
+
+
+def _klein_direct_double_base(bi: Int, targets: Int) raises -> Int:
+    return bi * _klein_direct_slots_per_double(targets)
+
+
+def _klein_direct_single_base(num_double: Int, bi: Int, targets: Int) raises -> Int:
+    return (
+        num_double * _klein_direct_slots_per_double(targets)
+        + bi * _klein_direct_slots_per_single(targets)
+    )
+
+
+def _klein_direct_expected_slots(
+    num_double: Int, num_single: Int, targets: Int,
+) raises -> Int:
+    return (
+        num_double * _klein_direct_slots_per_double(targets)
+        + num_single * _klein_direct_slots_per_single(targets)
+    )
+
+
+def _dora_grad_to_host(g: KleinDirectDoRAGradT, ctx: DeviceContext) raises -> DoRAGrads:
+    if not g.d_a or not g.d_b or not g.d_m:
+        raise Error("_dora_grad_to_host: missing direct DoRA grad tensor")
+    return DoRAGrads(
+        g.d_a.value()[].to_host(ctx),
+        g.d_b.value()[].to_host(ctx),
+        g.d_m.value()[].to_host(ctx),
+        List[Float32](),
+    )
+
+
+def _oft_grad_to_host(g: KleinDirectOFTGradT, ctx: DeviceContext) raises -> OFTOTGrads:
+    if not g.d_vec:
+        raise Error("_oft_grad_to_host: missing direct OFT grad tensor")
+    return OFTOTGrads(g.d_vec.value()[].to_host(ctx), List[Float32]())
+
+
+def _klein_dora_stream_grad(g: StreamDirectDoRAGradsT, slot: Int) -> KleinDirectDoRAGradT:
+    if slot == 0:
+        return g.q.copy()
+    if slot == 1:
+        return g.k.copy()
+    if slot == 2:
+        return g.v.copy()
+    if slot == 3:
+        return g.out.copy()
+    if slot == 4:
+        return g.ff_in.copy()
+    return g.ff_out.copy()
+
+
+def _klein_oft_stream_grad(g: StreamDirectOFTGradsT, slot: Int) -> KleinDirectOFTGradT:
+    if slot == 0:
+        return g.q.copy()
+    if slot == 1:
+        return g.k.copy()
+    if slot == 2:
+        return g.v.copy()
+    if slot == 3:
+        return g.out.copy()
+    if slot == 4:
+        return g.ff_in.copy()
+    return g.ff_out.copy()
+
+
+def _scatter_klein_dora_double(
+    mut grads: FlatDirectDoRAGrads, targets: Int, bi: Int,
+    bg: DoubleBlockDirectDoRAGradsT, ctx: DeviceContext,
+) raises:
+    var compact = _klein_direct_double_base(bi, targets)
+    for slot in range(DBL_SLOTS):
+        if not _slot_targeted(True, slot, targets):
+            continue
+        if slot < 6:
+            var hg = _dora_grad_to_host(_klein_dora_stream_grad(bg.img, slot), ctx)
+            klein_direct_dora_scatter_slot_grad(grads, compact, hg)
+        else:
+            var hg = _dora_grad_to_host(_klein_dora_stream_grad(bg.txt, slot - 6), ctx)
+            klein_direct_dora_scatter_slot_grad(grads, compact, hg)
+        compact += 1
+    if compact != _klein_direct_double_base(bi + 1, targets):
+        raise Error("_scatter_klein_dora_double: compact slot mismatch")
+
+
+def _scatter_klein_oft_double(
+    mut grads: FlatDirectOFTGrads, targets: Int, bi: Int,
+    bg: DoubleBlockDirectOFTGradsT, ctx: DeviceContext,
+) raises:
+    var compact = _klein_direct_double_base(bi, targets)
+    for slot in range(DBL_SLOTS):
+        if not _slot_targeted(True, slot, targets):
+            continue
+        if slot < 6:
+            var hg = _oft_grad_to_host(_klein_oft_stream_grad(bg.img, slot), ctx)
+            klein_direct_oft_scatter_slot_grad(grads, compact, hg)
+        else:
+            var hg = _oft_grad_to_host(_klein_oft_stream_grad(bg.txt, slot - 6), ctx)
+            klein_direct_oft_scatter_slot_grad(grads, compact, hg)
+        compact += 1
+    if compact != _klein_direct_double_base(bi + 1, targets):
+        raise Error("_scatter_klein_oft_double: compact slot mismatch")
+
+
+def _scatter_klein_dora_single(
+    mut grads: FlatDirectDoRAGrads, targets: Int, num_double: Int, bi: Int,
+    bg: SingleBlockDirectDoRAGradsT, ctx: DeviceContext,
+) raises:
+    var compact = _klein_direct_single_base(num_double, bi, targets)
+    if _slot_targeted(False, 0, targets):
+        var hg0 = _dora_grad_to_host(bg.qkv, ctx)
+        klein_direct_dora_scatter_slot_grad(grads, compact, hg0)
+        compact += 1
+    if _slot_targeted(False, 1, targets):
+        var hg1 = _dora_grad_to_host(bg.out, ctx)
+        klein_direct_dora_scatter_slot_grad(grads, compact, hg1)
+        compact += 1
+    if compact != _klein_direct_single_base(num_double, bi + 1, targets):
+        raise Error("_scatter_klein_dora_single: compact slot mismatch")
+
+
+def _scatter_klein_oft_single(
+    mut grads: FlatDirectOFTGrads, targets: Int, num_double: Int, bi: Int,
+    bg: SingleBlockDirectOFTGradsT, ctx: DeviceContext,
+) raises:
+    var compact = _klein_direct_single_base(num_double, bi, targets)
+    if _slot_targeted(False, 0, targets):
+        var hg0 = _oft_grad_to_host(bg.qkv, ctx)
+        klein_direct_oft_scatter_slot_grad(grads, compact, hg0)
+        compact += 1
+    if _slot_targeted(False, 1, targets):
+        var hg1 = _oft_grad_to_host(bg.out, ctx)
+        klein_direct_oft_scatter_slot_grad(grads, compact, hg1)
+        compact += 1
+    if compact != _klein_direct_single_base(num_double, bi + 1, targets):
+        raise Error("_scatter_klein_oft_single: compact slot mismatch")
+
+
+def klein_stack_direct_dora_forward_offload_turbo_moddev_rope_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens_t: TArc, txt_tokens_t: TArc,
+    base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    dora: FlatDirectDoRASet,
+    num_double: Int, num_single: Int, targets: Int,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> KleinStackForward:
+    if len(dora.ad) != _klein_direct_expected_slots(num_double, num_single, targets):
+        raise Error("klein_stack_direct_dora_forward: direct slot count mismatch")
+    var dora_dev = klein_direct_dora_blocks_to_device(
+        dora, num_double, num_single, targets, ctx,
+    )
+    loader.prefetch_with_ctx(0, ctx)
+
+    var no_bias = Optional[Tensor](None)
+    var img = TArc(linear(img_tokens_t[], base.img_in[], no_bias^, ctx))
+    var no_bias_txt = Optional[Tensor](None)
+    var txt = TArc(linear(txt_tokens_t[], base.txt_in[], no_bias_txt^, ctx))
+    var img_in_act = img.copy()
+    var txt_in_act = txt.copy()
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
+
+    var dbl_img_in = List[TArc]()
+    var dbl_txt_in = List[TArc]()
+    var dbl_saved = List[DoubleBlockSaved]()
+    for bi in range(num_double):
+        dbl_img_in.append(img.copy())
+        dbl_txt_in.append(txt.copy())
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var w = _double_weights_from_block(handle.block, handle.prefix, ctx)
+        var fwd = double_block_direct_dora_forward_device_resident_scratch[
+            H, Dh, N_IMG, N_TXT, S
+        ](
+            img, txt, w, img_mod_dev, txt_mod_dev, dora_dev.dbl[bi],
+            cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        if bi >= num_double - DBL_SAVE_TAIL:
+            dbl_saved.append(fwd.saved.copy())
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        loader.mark_active_block_done(ctx)
+    var x = TArc(concat(0, ctx, txt[], img[]))
+
+    var sgl_x_in = List[TArc]()
+    var sgl_saved = List[SingleBlockSaved]()
+    for bi in range(num_single):
+        sgl_x_in.append(x.copy())
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        loader.prefetch_next_with_ctx(block_idx, ctx)
+        var w: SingleBlockWeights
+        if targets == LOKR_TGT_ALL:
+            w = _single_weights_full_from_block(handle.block, handle.prefix, D, F, ctx)
+        else:
+            w = _single_weights_from_block(handle.block, handle.prefix, D, F, ctx)
+        var fwd = single_block_direct_dora_forward_device_resident_scratch[H, Dh, S](
+            x, w, single_mod_dev, dora_dev.sgl[bi], cos_t, sin_t, D, F, eps,
+            norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        if bi >= num_single - SGL_SAVE_TAIL:
+            sgl_saved.append(fwd.saved.copy())
+        x = fwd.out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var img_out = TArc(slice(x[], 0, N_TXT, N_IMG, ctx))
+    var ln_img_out = TArc(layer_norm(img_out[], norm_ones[], norm_zeros[], eps, ctx))
+    var normed = modulate(ln_img_out[], base.final_scale[], base.final_shift[], ctx)
+    var no_bias_out = Optional[Tensor](None)
+    var out = linear(normed, base.final_lin[], no_bias_out^, ctx).to_host(ctx)
+
+    return KleinStackForward(
+        out^, img_in_act^, txt_in_act^,
+        dbl_img_in^, dbl_txt_in^, sgl_x_in^,
+        dbl_saved^, sgl_saved^,
+        img_out^, ln_img_out^,
+    )
+
+
+def klein_stack_direct_oft_forward_offload_turbo_moddev_rope_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens_t: TArc, txt_tokens_t: TArc,
+    base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    oft: FlatDirectOFTSet,
+    num_double: Int, num_single: Int, targets: Int,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> KleinStackForward:
+    if len(oft.ad) != _klein_direct_expected_slots(num_double, num_single, targets):
+        raise Error("klein_stack_direct_oft_forward: direct slot count mismatch")
+    var oft_dev = klein_direct_oft_blocks_to_device(
+        oft, num_double, num_single, targets, ctx,
+    )
+    loader.prefetch_with_ctx(0, ctx)
+
+    var no_bias = Optional[Tensor](None)
+    var img = TArc(linear(img_tokens_t[], base.img_in[], no_bias^, ctx))
+    var no_bias_txt = Optional[Tensor](None)
+    var txt = TArc(linear(txt_tokens_t[], base.txt_in[], no_bias_txt^, ctx))
+    var img_in_act = img.copy()
+    var txt_in_act = txt.copy()
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
+
+    var dbl_img_in = List[TArc]()
+    var dbl_txt_in = List[TArc]()
+    var dbl_saved = List[DoubleBlockSaved]()
+    for bi in range(num_double):
+        dbl_img_in.append(img.copy())
+        dbl_txt_in.append(txt.copy())
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var w = _double_weights_from_block(handle.block, handle.prefix, ctx)
+        var fwd = double_block_direct_oft_forward_device_resident_scratch[
+            H, Dh, N_IMG, N_TXT, S
+        ](
+            img, txt, w, img_mod_dev, txt_mod_dev, oft_dev.dbl[bi],
+            cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        if bi >= num_double - DBL_SAVE_TAIL:
+            dbl_saved.append(fwd.saved.copy())
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        loader.mark_active_block_done(ctx)
+    var x = TArc(concat(0, ctx, txt[], img[]))
+
+    var sgl_x_in = List[TArc]()
+    var sgl_saved = List[SingleBlockSaved]()
+    for bi in range(num_single):
+        sgl_x_in.append(x.copy())
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        loader.prefetch_next_with_ctx(block_idx, ctx)
+        var w: SingleBlockWeights
+        if targets == LOKR_TGT_ALL:
+            w = _single_weights_full_from_block(handle.block, handle.prefix, D, F, ctx)
+        else:
+            w = _single_weights_from_block(handle.block, handle.prefix, D, F, ctx)
+        var fwd = single_block_direct_oft_forward_device_resident_scratch[H, Dh, S](
+            x, w, single_mod_dev, oft_dev.sgl[bi], cos_t, sin_t, D, F, eps,
+            norm_ones[], norm_zeros[], ctx, scratch,
+        )
+        if bi >= num_single - SGL_SAVE_TAIL:
+            sgl_saved.append(fwd.saved.copy())
+        x = fwd.out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var img_out = TArc(slice(x[], 0, N_TXT, N_IMG, ctx))
+    var ln_img_out = TArc(layer_norm(img_out[], norm_ones[], norm_zeros[], eps, ctx))
+    var normed = modulate(ln_img_out[], base.final_scale[], base.final_shift[], ctx)
+    var no_bias_out = Optional[Tensor](None)
+    var out = linear(normed, base.final_lin[], no_bias_out^, ctx).to_host(ctx)
+
+    return KleinStackForward(
+        out^, img_in_act^, txt_in_act^,
+        dbl_img_in^, dbl_txt_in^, sgl_x_in^,
+        dbl_saved^, sgl_saved^,
+        img_out^, ln_img_out^,
+    )
+
+
+def klein_stack_direct_dora_backward_offload_turbo_moddev_rope_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: TArc, txt_tokens: TArc,
+    base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    dora: FlatDirectDoRASet,
+    num_double: Int, num_single: Int, targets: Int,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
+    saved: KleinStackForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_input_grads: Bool = True,
+    compute_aux_grads: Bool = True,
+) raises -> KleinStackDirectDoRAGradsT:
+    if len(dora.ad) != _klein_direct_expected_slots(num_double, num_single, targets):
+        raise Error("klein_stack_direct_dora_backward: direct slot count mismatch")
+    var dora_dev = klein_direct_dora_blocks_to_device(
+        dora, num_double, num_single, targets, ctx,
+    )
+    var direct_grads = klein_direct_dora_zero_grads(dora)
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var d_normed_t = linear_backward_dx(
+        _t(d_out, [N_IMG, out_ch], ctx), base.final_lin[],
+        N_IMG, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        d_normed_t, saved.ln_img_out[], base.final_scale[], ctx, compute_aux_grads,
+    )
+    var d_img_out_t = layer_norm_backward_dx(
+        mbf.d_x, saved.img_out[], norm_ones[], eps, ctx,
+    )
+    var d_txt_zero = zeros_device([N_TXT, D], STDtype.F32, ctx)
+    var d_x = TArc(concat(0, ctx, d_txt_zero, d_img_out_t))
+
+    var bi = num_single - 1
+    var saved_single_start = num_single - len(saved.sgl_saved)
+    while bi >= 0:
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+        var w: SingleBlockWeights
+        if targets == LOKR_TGT_ALL:
+            w = _single_weights_full_from_block(handle.block, handle.prefix, D, F, ctx)
+        else:
+            w = _single_weights_from_block(handle.block, handle.prefix, D, F, ctx)
+        var block_saved: SingleBlockSaved
+        if bi >= saved_single_start:
+            block_saved = saved.sgl_saved[bi - saved_single_start].copy()
+        else:
+            var fwd = single_block_direct_dora_forward_device_resident_scratch[H, Dh, S](
+                saved.sgl_x_in[bi], w, single_mod_dev, dora_dev.sgl[bi],
+                cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+            )
+            block_saved = fwd.saved.copy()
+        var bg = single_block_direct_dora_backward_device_resident_scratch[H, Dh, S](
+            d_x, w, single_mod_dev, dora_dev.sgl[bi], block_saved,
+            cos_t, sin_t, D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
+        )
+        d_x = bg.d_x.copy()
+        _scatter_klein_dora_single(direct_grads, targets, num_double, bi, bg, ctx)
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    var d_txt_out = TArc(slice(d_x[], 0, 0, N_TXT, ctx))
+    var d_img_out2 = TArc(slice(d_x[], 0, N_TXT, N_IMG, ctx))
+    var di = num_double - 1
+    var saved_double_start = num_double - len(saved.dbl_saved)
+    var d_io = d_img_out2.copy()
+    var d_to = d_txt_out.copy()
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var w = _double_weights_from_block(handle.block, handle.prefix, ctx)
+        var block_saved: DoubleBlockSaved
+        if di >= saved_double_start:
+            block_saved = saved.dbl_saved[di - saved_double_start].copy()
+        else:
+            var fwd = double_block_direct_dora_forward_device_resident_scratch[
+                H, Dh, N_IMG, N_TXT, S
+            ](
+                saved.dbl_img_in[di], saved.dbl_txt_in[di],
+                w, img_mod_dev, txt_mod_dev, dora_dev.dbl[di],
+                cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+            )
+            block_saved = fwd.saved.copy()
+        var bg = double_block_direct_dora_backward_device_resident_scratch[
+            H, Dh, N_IMG, N_TXT, S
+        ](
+            d_io, d_to, w, img_mod_dev, txt_mod_dev, dora_dev.dbl[di], block_saved,
+            cos_t, sin_t, D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
+        )
+        d_io = bg.img.d_x.copy()
+        d_to = bg.txt.d_x.copy()
+        _scatter_klein_dora_double(direct_grads, targets, di, bg, ctx)
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    var d_img_tokens = List[Float32]()
+    var d_txt_tokens = List[Float32]()
+    if compute_input_grads:
+        var d_img_tokens_t = linear_backward_dx(
+            d_io[], base.img_in[], N_IMG, in_ch, D, ctx,
+        )
+        d_img_tokens = d_img_tokens_t.to_host(ctx)
+        var d_txt_tokens_t = linear_backward_dx(
+            d_to[], base.txt_in[], N_TXT, txt_ch, D, ctx,
+        )
+        d_txt_tokens = d_txt_tokens_t.to_host(ctx)
+
+    return KleinStackDirectDoRAGradsT(direct_grads^, d_img_tokens^, d_txt_tokens^)
+
+
+def klein_stack_direct_oft_backward_offload_turbo_moddev_rope_scratch[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: TArc, txt_tokens: TArc,
+    base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    oft: FlatDirectOFTSet,
+    num_double: Int, num_single: Int, targets: Int,
+    img_mod_dev: ModVecsDevice,
+    txt_mod_dev: ModVecsDevice,
+    single_mod_dev: SingleModVecsDevice,
+    cos_t: Tensor, sin_t: Tensor,
+    saved: KleinStackForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_input_grads: Bool = True,
+    compute_aux_grads: Bool = True,
+) raises -> KleinStackDirectOFTGradsT:
+    if len(oft.ad) != _klein_direct_expected_slots(num_double, num_single, targets):
+        raise Error("klein_stack_direct_oft_backward: direct slot count mismatch")
+    var oft_dev = klein_direct_oft_blocks_to_device(
+        oft, num_double, num_single, targets, ctx,
+    )
+    var direct_grads = klein_direct_oft_zero_grads(oft)
+    var norm_ones = TArc(_t(_ones(D), [D], ctx))
+    var norm_zeros = TArc(_t(_zeros(D), [D], ctx))
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var d_normed_t = linear_backward_dx(
+        _t(d_out, [N_IMG, out_ch], ctx), base.final_lin[],
+        N_IMG, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        d_normed_t, saved.ln_img_out[], base.final_scale[], ctx, compute_aux_grads,
+    )
+    var d_img_out_t = layer_norm_backward_dx(
+        mbf.d_x, saved.img_out[], norm_ones[], eps, ctx,
+    )
+    var d_txt_zero = zeros_device([N_TXT, D], STDtype.F32, ctx)
+    var d_x = TArc(concat(0, ctx, d_txt_zero, d_img_out_t))
+
+    var bi = num_single - 1
+    var saved_single_start = num_single - len(saved.sgl_saved)
+    while bi >= 0:
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+        var w: SingleBlockWeights
+        if targets == LOKR_TGT_ALL:
+            w = _single_weights_full_from_block(handle.block, handle.prefix, D, F, ctx)
+        else:
+            w = _single_weights_from_block(handle.block, handle.prefix, D, F, ctx)
+        var block_saved: SingleBlockSaved
+        if bi >= saved_single_start:
+            block_saved = saved.sgl_saved[bi - saved_single_start].copy()
+        else:
+            var fwd = single_block_direct_oft_forward_device_resident_scratch[H, Dh, S](
+                saved.sgl_x_in[bi], w, single_mod_dev, oft_dev.sgl[bi],
+                cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+            )
+            block_saved = fwd.saved.copy()
+        var bg = single_block_direct_oft_backward_device_resident_scratch[H, Dh, S](
+            d_x, w, single_mod_dev, oft_dev.sgl[bi], block_saved,
+            cos_t, sin_t, D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
+        )
+        d_x = bg.d_x.copy()
+        _scatter_klein_oft_single(direct_grads, targets, num_double, bi, bg, ctx)
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    var d_txt_out = TArc(slice(d_x[], 0, 0, N_TXT, ctx))
+    var d_img_out2 = TArc(slice(d_x[], 0, N_TXT, N_IMG, ctx))
+    var di = num_double - 1
+    var saved_double_start = num_double - len(saved.dbl_saved)
+    var d_io = d_img_out2.copy()
+    var d_to = d_txt_out.copy()
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var w = _double_weights_from_block(handle.block, handle.prefix, ctx)
+        var block_saved: DoubleBlockSaved
+        if di >= saved_double_start:
+            block_saved = saved.dbl_saved[di - saved_double_start].copy()
+        else:
+            var fwd = double_block_direct_oft_forward_device_resident_scratch[
+                H, Dh, N_IMG, N_TXT, S
+            ](
+                saved.dbl_img_in[di], saved.dbl_txt_in[di],
+                w, img_mod_dev, txt_mod_dev, oft_dev.dbl[di],
+                cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+            )
+            block_saved = fwd.saved.copy()
+        var bg = double_block_direct_oft_backward_device_resident_scratch[
+            H, Dh, N_IMG, N_TXT, S
+        ](
+            d_io, d_to, w, img_mod_dev, txt_mod_dev, oft_dev.dbl[di], block_saved,
+            cos_t, sin_t, D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
+        )
+        d_io = bg.img.d_x.copy()
+        d_to = bg.txt.d_x.copy()
+        _scatter_klein_oft_double(direct_grads, targets, di, bg, ctx)
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    var d_img_tokens = List[Float32]()
+    var d_txt_tokens = List[Float32]()
+    if compute_input_grads:
+        var d_img_tokens_t = linear_backward_dx(
+            d_io[], base.img_in[], N_IMG, in_ch, D, ctx,
+        )
+        d_img_tokens = d_img_tokens_t.to_host(ctx)
+        var d_txt_tokens_t = linear_backward_dx(
+            d_to[], base.txt_in[], N_TXT, txt_ch, D, ctx,
+        )
+        d_txt_tokens = d_txt_tokens_t.to_host(ctx)
+
+    return KleinStackDirectOFTGradsT(direct_grads^, d_img_tokens^, d_txt_tokens^)
 
 
 # ── FULL FORWARD WITH LoRA (checkpoint inputs only retained) ─────────────────

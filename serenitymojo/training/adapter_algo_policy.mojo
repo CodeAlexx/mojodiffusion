@@ -42,8 +42,8 @@ def require_lora_or_locon_linear(cfg: TrainConfig, trainer_name: String) raises:
 
     LoCon on linear projections is the same low-rank additive delta currently
     used by the model LoRA stacks; conv LoCon is only valid where a trainer wires
-    the conv primitive. LoHa and LoKr need model-stack carrier wiring, so this
-    helper rejects them before any large model allocation.
+    the conv primitive. LoKr/LoHa/DoRA/OFT need model-stack carrier wiring, so
+    this helper rejects them before any large model allocation.
     """
     if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LORA:
         return
@@ -57,8 +57,8 @@ def require_lora_or_locon_linear(cfg: TrainConfig, trainer_name: String) raises:
         trainer_name + String(" trainer: network_algorithm=")
         + adapter_algo_name(cfg.adapter_algo)
         + String(" is not wired end-to-end for this model. Supported here: lora, locon. ")
-        + String("LoKr is currently wired only where the trainer has a carrier path; ")
-        + String("LoHa has primitive/save parity but no full model-stack carrier in this trainer.")
+        + String("LoKr/LoHa/DoRA/OFT are allowed only where the trainer has a ")
+        + String("model-specific carrier path and 24 GB preflight.")
     )
 
 

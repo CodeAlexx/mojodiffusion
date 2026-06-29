@@ -1,0 +1,37 @@
+{
+  "model_type": "krea2",
+  "checkpoint": "/home/alex/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494/raw.safetensors",
+  "vae": "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots/75e0b4be04f60ec59a75f475837eced720f823b6/vae",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/krea2_samples.json",
+
+  "inner_dim": 6144,
+  "in_channels": 64,
+  "joint_attention_dim": 2560,
+  "out_channels": 64,
+  "num_double": 0,
+  "num_single": 28,
+  "num_heads": 48,
+  "head_dim": 128,
+  "mlp_hidden": 16384,
+  "timestep_dim": 256,
+  "rope_theta": 1000,
+
+  "learning_rate": 1e-4,
+  "learning_rate_scheduler": "constant",
+  "learning_rate_warmup_steps": 0,
+  "lora_rank": 16,
+  "lora_alpha": 16,
+  "network_algorithm": "dora",
+  "lokr_targets": 1,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 1,
+  "save_every": 1,
+  "sample_every": 0,
+  "workspace_dir": "/tmp/krea2_direct_dora_attn_rank16_smoke",
+  "save_filename_prefix": "krea2_direct_dora_attn_rank16_smoke",
+
+  "quantized_resident": "fp8_e4m3",
+
+  "optimizer": { "optimizer": "ADAMW", "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
+}

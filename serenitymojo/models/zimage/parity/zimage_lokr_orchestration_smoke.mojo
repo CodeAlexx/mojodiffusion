@@ -71,7 +71,7 @@ def main() raises:
         NR, CR, MAIN, D, F, RANK, ALPHA, -1, True, False, 2,
         UInt64(12345),
     )
-    var nbytes = zimage_lokr_carrier_total_bytes(masters)
+    var nbytes = zimage_lokr_carrier_total_bytes(masters, D, F)
     print("  built ZImageLoKrSet; carrier bytes:", nbytes)
 
     var carriers = zimage_lokr_carrier_lists(masters, D, F)

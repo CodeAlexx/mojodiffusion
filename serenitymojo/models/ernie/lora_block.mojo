@@ -61,6 +61,11 @@ from serenitymojo.models.ernie.weights import ErnieBlockWeights
 from serenitymojo.models.ernie.block import (
     ErnieModVecs, ErnieBlockSaved, ErnieBlockForward, ErnieBlockGrads,
 )
+from serenitymojo.models.zimage.lora_block import (
+    ZImageBlockDirectLycoris, ZImageBlockDirectGrads,
+    zimage_direct_projection_forward_device,
+    zimage_direct_projection_backward_device,
+)
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -68,6 +73,12 @@ comptime TArc = ArcPointer[Tensor]
 
 def _t(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_host(vals, shape^, STDtype.F32, ctx)
+
+
+def _t_as(
+    vals: List[Float32], var shape: List[Int], dtype: STDtype, ctx: DeviceContext
+) raises -> Tensor:
+    return Tensor.from_host(vals, shape^, dtype, ctx)
 
 
 def _add_lists(a: List[Float32], b: List[Float32]) -> List[Float32]:
@@ -487,7 +498,10 @@ def ernie_block_lora_forward_device_tensor[
     # --- self-attention sub-block ---
     var sa_norm = rms_norm(x_arc[], w.sa_norm[], eps, ctx)
     var sa_in = modulate(
-        sa_norm, _t(mv.scale_msa.copy(), [D], ctx), _t(mv.shift_msa.copy(), [D], ctx), ctx
+        sa_norm,
+        _t_as(mv.scale_msa.copy(), [D], sa_norm.dtype(), ctx),
+        _t_as(mv.shift_msa.copy(), [D], sa_norm.dtype(), ctx),
+        ctx,
     )
 
     var no_bias = Optional[Tensor](None)
@@ -919,3 +933,234 @@ def ernie_block_lora_backward_device_tensors[
         d_shift_mlp, d_scale_mlp, d_gate_mlp,
     )
     return ErnieBlockLoraTensorBackward(TArc(d_x^), d_a^, d_b^, shared^)
+
+
+# ── Direct DoRA/OFT block lowering ───────────────────────────────────────────
+# ERNIE and Z-Image share the same 7 projection slot topology. Reuse the shared
+# direct projection primitive so DoRA/OFT consumes W_orig at the projection call
+# site instead of materializing a full-delta LoRA carrier.
+def ernie_block_direct_lycoris_forward_device_tensor[
+    H: Int, Dh: Int, S: Int
+](
+    x_arc: TArc,
+    w: ErnieBlockWeights, mv: ErnieModVecs, direct: ZImageBlockDirectLycoris,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    text_pad_mask: Optional[TArc] = None,
+) raises -> ErnieBlockForwardLoraTensor:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var sa_norm = rms_norm(x_arc[], w.sa_norm[], eps, ctx)
+    var sa_in = modulate(
+        sa_norm,
+        _t_as(mv.scale_msa.copy(), [D], sa_norm.dtype(), ctx),
+        _t_as(mv.shift_msa.copy(), [D], sa_norm.dtype(), ctx),
+        ctx,
+    )
+
+    var q_f = zimage_direct_projection_forward_device(
+        direct, SLOT_Q, sa_in, w.wq[], S, D, D, ctx,
+    )
+    var k_f = zimage_direct_projection_forward_device(
+        direct, SLOT_K, sa_in, w.wk[], S, D, D, ctx,
+    )
+    var v_f = zimage_direct_projection_forward_device(
+        direct, SLOT_V, sa_in, w.wv[], S, D, D, ctx,
+    )
+
+    var q_pre = reshape_owned(q_f^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_f^, [1, S, H, Dh])
+    var v = reshape_owned(v_f^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    var q_rope = rope_halfsplit_full(q_rms, cos, sin, ctx)
+    var k_rope = rope_halfsplit_full(k_rms, cos, sin, ctx)
+
+    var att: Tensor
+    if text_pad_mask:
+        att = sdpa[1, S, H, Dh](q_rope, k_rope, v, text_pad_mask.value()[], scale, ctx)
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var att_out = zimage_direct_projection_forward_device(
+        direct, SLOT_O, att_flat, w.wo[], S, D, D, ctx,
+    )
+    var h = residual_gate(
+        x_arc[], _t_as(mv.gate_msa.copy(), [D], x_arc[].dtype(), ctx), att_out, ctx
+    )
+
+    var mlp_norm = rms_norm(h, w.mlp_norm[], eps, ctx)
+    var mlp_in = modulate(
+        mlp_norm,
+        _t_as(mv.scale_mlp.copy(), [D], mlp_norm.dtype(), ctx),
+        _t_as(mv.shift_mlp.copy(), [D], mlp_norm.dtype(), ctx),
+        ctx,
+    )
+
+    var gate_pre = zimage_direct_projection_forward_device(
+        direct, SLOT_GATE, mlp_in, w.wgate[], S, D, F, ctx,
+    )
+    var up = zimage_direct_projection_forward_device(
+        direct, SLOT_UP, mlp_in, w.wup[], S, D, F, ctx,
+    )
+    var gelu_gate = gelu_exact(gate_pre, ctx)
+    var activated = mul(gelu_gate, up, ctx)
+
+    var mlp_out = zimage_direct_projection_forward_device(
+        direct, SLOT_DOWN, activated, w.wdown[], S, F, D, ctx,
+    )
+    var result = residual_gate(
+        h, _t_as(mv.gate_mlp.copy(), [D], h.dtype(), ctx), mlp_out, ctx
+    )
+
+    var saved = ErnieBlockSaved(
+        x_arc.copy(), TArc(sa_norm^), TArc(sa_in^),
+        TArc(q_pre^), TArc(k_pre^), TArc(v^),
+        TArc(q_rms^), TArc(k_rms^), TArc(q_rope^), TArc(k_rope^),
+        TArc(att_flat^), TArc(h^), TArc(mlp_norm^), TArc(mlp_in^),
+        TArc(gate_pre^), TArc(gelu_gate^), TArc(up^), TArc(activated^),
+    )
+    return ErnieBlockForwardLoraTensor(TArc(result^), saved^)
+
+
+struct ErnieBlockDirectTensorBackward(Movable):
+    var d_x: TArc
+    var grads: ZImageBlockDirectGrads
+    var d_shared_mod: List[Float32]
+
+    def __init__(
+        out self, var d_x: TArc, var grads: ZImageBlockDirectGrads,
+        var d_shared_mod: List[Float32],
+    ):
+        self.d_x = d_x^
+        self.grads = grads^
+        self.d_shared_mod = d_shared_mod^
+
+
+def ernie_block_direct_lycoris_backward_device_tensors[
+    H: Int, Dh: Int, S: Int
+](
+    d_out: Tensor,
+    w: ErnieBlockWeights, mv: ErnieModVecs, direct: ZImageBlockDirectLycoris,
+    saved: ErnieBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+    text_pad_mask_f32: Optional[TArc] = None,
+) raises -> ErnieBlockDirectTensorBackward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var mlp_out_y = zimage_direct_projection_forward_device(
+        direct, SLOT_DOWN, saved.activated[], w.wdown[], S, F, D, ctx,
+    )
+    var grg2 = gate_residual_backward(
+        d_out,
+        saved.h[],
+        _t_as(mv.gate_mlp.copy(), [D], d_out.dtype(), ctx),
+        mlp_out_y,
+        ctx,
+    )
+    var d_gate_mlp = grg2.d_g.to_host(ctx)
+
+    var pg_down = zimage_direct_projection_backward_device(
+        direct, SLOT_DOWN, grg2.d_y, saved.activated[], w.wdown[], S, F, D, ctx,
+    )
+
+    var d_gelu_gate = mul(pg_down.d_x[], saved.up[], ctx)
+    var d_up = mul(pg_down.d_x[], saved.gelu_gate[], ctx)
+    var d_gate_pre = gelu_exact_backward(d_gelu_gate, saved.gate_pre[], ctx)
+
+    var pg_gate = zimage_direct_projection_backward_device(
+        direct, SLOT_GATE, d_gate_pre, saved.mlp_in[], w.wgate[], S, D, F, ctx,
+    )
+    var pg_up = zimage_direct_projection_backward_device(
+        direct, SLOT_UP, d_up, saved.mlp_in[], w.wup[], S, D, F, ctx,
+    )
+    var d_mlp_in = add(pg_gate.d_x[], pg_up.d_x[], ctx)
+
+    var mb_mlp = modulate_backward(
+        cast_tensor(d_mlp_in, saved.mlp_norm[].dtype(), ctx, False),
+        saved.mlp_norm[],
+        _t_as(mv.scale_mlp.copy(), [D], saved.mlp_norm[].dtype(), ctx),
+        ctx,
+    )
+    var d_scale_mlp = mb_mlp.d_scale.to_host(ctx)
+    var d_shift_mlp = mb_mlp.d_shift.to_host(ctx)
+    var mlp_norm_w = cast_tensor(w.mlp_norm[], mb_mlp.d_x.dtype(), ctx, False)
+    var d_mlp_norm_dx = rms_norm_backward_dx(mb_mlp.d_x, saved.h[], mlp_norm_w^, eps, ctx)
+    var d_h = add(grg2.d_x, d_mlp_norm_dx, ctx)
+
+    var att_out_y = zimage_direct_projection_forward_device(
+        direct, SLOT_O, saved.att_flat[], w.wo[], S, D, D, ctx,
+    )
+    var grg1 = gate_residual_backward(
+        d_h,
+        saved.x[],
+        _t_as(mv.gate_msa.copy(), [D], d_h.dtype(), ctx),
+        att_out_y,
+        ctx,
+    )
+    var d_gate_msa = grg1.d_g.to_host(ctx)
+
+    var pg_o = zimage_direct_projection_backward_device(
+        direct, SLOT_O, grg1.d_y, saved.att_flat[], w.wo[], S, D, D, ctx,
+    )
+
+    reshape_in_place(pg_o.d_x[], [1, S, H, Dh])
+    var sb: SdpaGrads
+    if text_pad_mask_f32:
+        sb = sdpa_backward_masked[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v[],
+            text_pad_mask_f32.value()[], pg_o.d_x[], scale, ctx,
+        )
+    else:
+        sb = sdpa_backward[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v[], pg_o.d_x[], scale, ctx,
+        )
+    var d_q_rms = rope_halfsplit_full_backward(sb.d_q, cos, sin, ctx)
+    var d_k_rms = rope_halfsplit_full_backward(sb.d_k, cos, sin, ctx)
+
+    var q_norm_w = cast_tensor(w.q_norm[], d_q_rms.dtype(), ctx, False)
+    var k_norm_w = cast_tensor(w.k_norm[], d_k_rms.dtype(), ctx, False)
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, saved.q_pre[], q_norm_w^, eps, ctx)
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, saved.k_pre[], k_norm_w^, eps, ctx)
+
+    reshape_in_place(d_q_pre, [S, D])
+    reshape_in_place(d_k_pre, [S, D])
+    reshape_in_place(sb.d_v, [S, D])
+
+    var pg_q = zimage_direct_projection_backward_device(
+        direct, SLOT_Q, d_q_pre, saved.sa_in[], w.wq[], S, D, D, ctx,
+    )
+    var pg_k = zimage_direct_projection_backward_device(
+        direct, SLOT_K, d_k_pre, saved.sa_in[], w.wk[], S, D, D, ctx,
+    )
+    var pg_v = zimage_direct_projection_backward_device(
+        direct, SLOT_V, sb.d_v, saved.sa_in[], w.wv[], S, D, D, ctx,
+    )
+    var d_sa_in = add(add(pg_q.d_x[], pg_k.d_x[], ctx), pg_v.d_x[], ctx)
+
+    var mb_sa = modulate_backward(
+        cast_tensor(d_sa_in, saved.sa_norm[].dtype(), ctx, False),
+        saved.sa_norm[],
+        _t_as(mv.scale_msa.copy(), [D], saved.sa_norm[].dtype(), ctx),
+        ctx,
+    )
+    var d_scale_msa = mb_sa.d_scale.to_host(ctx)
+    var d_shift_msa = mb_sa.d_shift.to_host(ctx)
+    var sa_norm_w = cast_tensor(w.sa_norm[], mb_sa.d_x.dtype(), ctx, False)
+    var d_sa_norm_dx = rms_norm_backward_dx(mb_sa.d_x, saved.x[], sa_norm_w^, eps, ctx)
+    var d_x = add(grg1.d_x, d_sa_norm_dx, ctx)
+
+    var grads = ZImageBlockDirectGrads(
+        pg_q.g.copy(), pg_k.g.copy(), pg_v.g.copy(), pg_o.g.copy(),
+        pg_gate.g.copy(), pg_up.g.copy(), pg_down.g.copy(),
+    )
+    var shared = _pack_mod6(
+        d_shift_msa, d_scale_msa, d_gate_msa,
+        d_shift_mlp, d_scale_mlp, d_gate_mlp,
+    )
+    return ErnieBlockDirectTensorBackward(TArc(d_x^), grads^, shared^)

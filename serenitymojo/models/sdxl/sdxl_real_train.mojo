@@ -306,7 +306,8 @@ def sdxl_real_forward[H: Int, W: Int](
     var x_f = _f32(x_nhwc, ctx)
     var context = _f32(context_in, ctx)
 
-    var ef = embed_forward[1, SDIM, TEMB, ADM](t, y, w.emb, ctx)
+    var y_emb = cast_tensor(y, w.emb.l0_w.dtype(), ctx)
+    var ef = embed_forward[1, SDIM, TEMB, ADM](t, y_emb, w.emb, ctx)
     var a_emb = _clone_emb_acts_f32(ef.acts, ctx)
     var emb = _f32(ef.emb, ctx)
 

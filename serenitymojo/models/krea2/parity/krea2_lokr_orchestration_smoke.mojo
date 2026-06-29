@@ -40,7 +40,7 @@ def main() raises:
     print("=== krea2 LoKr orchestration smoke (D=", D, " F=", F, " blocks=", NB, " slots=", nslots, ") ===")
 
     var masters = build_krea2_lokr_set(NB, D, F, qdim, kvdim, RANK, Float32(8.0), -1, True, False, 2, UInt64(12345))
-    print("  built Krea2LoKrSet; carrier bytes:", krea2_lokr_carrier_total_bytes(masters))
+    print("  built Krea2LoKrSet; carrier bytes:", krea2_lokr_carrier_total_bytes(masters, D, F, qdim, kvdim))
 
     var carriers = krea2_lokr_carrier_lists(masters, D, F, qdim, kvdim)
     if len(carriers) != nslots:

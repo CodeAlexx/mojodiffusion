@@ -23,7 +23,8 @@
 # Mojo 1.0.0b1: `def` not `fn`.
 
 from std.collections import List
-from std.memory import ArcPointer
+from std.memory import ArcPointer, alloc
+from std.ffi import external_call
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 from std.time import perf_counter_ns
@@ -61,22 +62,46 @@ from serenitymojo.sampling.base_sampler import tokens_to_packed_nchw, save_image
 from serenitymojo.training.progress_display import (
     print_sample_setup, print_sample_step, print_sample_saved,
 )
-from serenitymojo.serve.backend import StepResult
-from serenitymojo.serve.ipc_codec import encode_ev
-from serenitymojo.serve.proc_ipc import write_msg
+from serenitymojo.io.ffi import BytePtr
 
 comptime TArc = ArcPointer[Tensor]
 comptime SAMPLE_SCREEN_EVERY = 5
+comptime MSG_NOSIGNAL: Int32 = 0x4000  # Linux x86-64
+
+
+def _sys_send(fd: Int32, buf: BytePtr, count: Int, flags: Int32) -> Int:
+    return external_call["send", Int](fd, buf, count, flags)
+
+
+def _write_progress_msg(fd: Int32, line: String) raises:
+    var framed = line + String("\n")
+    var n = framed.byte_length()
+    var buf = alloc[UInt8](n)
+    var src = framed.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    var sent = 0
+    while sent < n:
+        var p = BytePtr(unsafe_from_address=Int(buf) + sent)
+        var w = _sys_send(fd, p, n - sent, MSG_NOSIGNAL)
+        if w <= 0:
+            buf.free()
+            raise Error("klein sampler progress send failed")
+        sent += w
+    buf.free()
 
 
 def _emit_server_progress(progress_fd: Int32, step: Int, total: Int) raises:
     if progress_fd < 0:
         return
-    var r = StepResult()
-    r.step = step
-    r.total = total
-    r.phase = String("sampling")
-    write_msg(progress_fd, encode_ev(r))
+    var line = (
+        String("{\"ev\":\"progress\",\"step\":")
+        + String(step)
+        + String(",\"total\":")
+        + String(total)
+        + String(",\"phase\":\"sampling\",\"preview\":\"\"}")
+    )
+    _write_progress_msg(progress_fd, line)
 
 
 # Klein rope host tables [S*H*(Dh//2)] — the layout klein_stack_lora_forward

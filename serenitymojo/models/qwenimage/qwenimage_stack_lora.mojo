@@ -48,6 +48,16 @@ from serenitymojo.models.qwenimage.qwenimage_block import (
     StreamLoraGrads, DoubleBlockLoraGrads,
     double_block_lora_forward, double_block_lora_backward,
     DoubleBlockLoraForward, DoubleBlockSaved,
+    QwenBlockDirectLycoris, QwenBlockDirectLycorisGrads,
+    QwenDirectProjectionGrad,
+    QWEN_DIRECT_ALGO_DORA, QWEN_DIRECT_ALGO_OFT,
+    QWEN_DIRECT_TGT_ATTN, QWEN_DIRECT_TGT_ALL,
+    QD_IMG_Q, QD_IMG_K, QD_IMG_V, QD_IMG_OUT,
+    QD_IMG_FF_UP, QD_IMG_FF_DOWN,
+    QD_TXT_Q, QD_TXT_K, QD_TXT_V, QD_TXT_OUT,
+    QD_TXT_FF_UP, QD_TXT_FF_DOWN,
+    double_block_direct_lycoris_forward,
+    double_block_direct_lycoris_backward,
     StreamWeights,
     _clone_t,
 )
@@ -55,6 +65,14 @@ from serenitymojo.models.qwenimage.qwenimage_stack import (
     QwenStackBase, QwenStackForward, QwenStackGrads,
     _zeros as _qstack_zeros, _ones as _qstack_ones, _t as _qstack_t,
     _linear_b,
+)
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.oft_onetrainer import OFTOTGrads
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectDoRAGrads,
+    FlatDirectOFTSet, FlatDirectOFTGrads,
+    empty_flat_direct_dora_set, empty_flat_direct_oft_set,
+    flat_direct_dora_append_from_weight,
 )
 
 
@@ -300,6 +318,340 @@ struct QwenLoraGradSet(Movable):
         self.d_img_tokens = d_img_tokens^
         self.d_txt_tokens = d_txt_tokens^
         self.nonfinite_lora_grads = nonfinite_lora_grads
+
+
+struct QwenDirectDoRAGradSet(Movable):
+    var grads: FlatDirectDoRAGrads
+    var d_img_tokens: List[Float32]
+    var d_txt_tokens: List[Float32]
+    var nonfinite_grads: Int
+
+    def __init__(
+        out self, var grads: FlatDirectDoRAGrads,
+        var d_img_tokens: List[Float32], var d_txt_tokens: List[Float32],
+        nonfinite_grads: Int,
+    ):
+        self.grads = grads^
+        self.d_img_tokens = d_img_tokens^
+        self.d_txt_tokens = d_txt_tokens^
+        self.nonfinite_grads = nonfinite_grads
+
+
+struct QwenDirectOFTGradSet(Movable):
+    var grads: FlatDirectOFTGrads
+    var d_img_tokens: List[Float32]
+    var d_txt_tokens: List[Float32]
+    var nonfinite_grads: Int
+
+    def __init__(
+        out self, var grads: FlatDirectOFTGrads,
+        var d_img_tokens: List[Float32], var d_txt_tokens: List[Float32],
+        nonfinite_grads: Int,
+    ):
+        self.grads = grads^
+        self.d_img_tokens = d_img_tokens^
+        self.d_txt_tokens = d_txt_tokens^
+        self.nonfinite_grads = nonfinite_grads
+
+
+def _qwen_direct_slot_targeted(slot: Int, targets: Int) raises -> Bool:
+    if targets < QWEN_DIRECT_TGT_ATTN or targets > QWEN_DIRECT_TGT_ALL:
+        raise Error("qwenimage_stack_lora direct: targets must be 1(attn)|2(all)")
+    if slot <= QD_IMG_OUT or (slot >= QD_TXT_Q and slot <= QD_TXT_OUT):
+        return targets >= QWEN_DIRECT_TGT_ATTN
+    return targets >= QWEN_DIRECT_TGT_ALL
+
+
+def _qwen_direct_slots_per_block(targets: Int) raises -> Int:
+    var n = 0
+    for slot in range(DBL_SLOTS):
+        if _qwen_direct_slot_targeted(slot, targets):
+            n += 1
+    return n
+
+
+def _qwen_direct_block_base(bi: Int, targets: Int) raises -> Int:
+    return bi * _qwen_direct_slots_per_block(targets)
+
+
+def _qwen_direct_prefix(block: Int, slot: Int) raises -> String:
+    var b = String("transformer.transformer_blocks.") + String(block)
+    if slot == QD_IMG_Q:
+        return b + String(".attn.to_q")
+    if slot == QD_IMG_K:
+        return b + String(".attn.to_k")
+    if slot == QD_IMG_V:
+        return b + String(".attn.to_v")
+    if slot == QD_IMG_OUT:
+        return b + String(".attn.to_out.0")
+    if slot == QD_IMG_FF_UP:
+        return b + String(".img_mlp.net.0.proj")
+    if slot == QD_IMG_FF_DOWN:
+        return b + String(".img_mlp.net.2")
+    if slot == QD_TXT_Q:
+        return b + String(".attn.add_q_proj")
+    if slot == QD_TXT_K:
+        return b + String(".attn.add_k_proj")
+    if slot == QD_TXT_V:
+        return b + String(".attn.add_v_proj")
+    if slot == QD_TXT_OUT:
+        return b + String(".attn.to_add_out")
+    if slot == QD_TXT_FF_UP:
+        return b + String(".txt_mlp.net.0.proj")
+    if slot == QD_TXT_FF_DOWN:
+        return b + String(".txt_mlp.net.2")
+    raise Error(String("_qwen_direct_prefix: bad slot ") + String(slot))
+
+
+def _append_qwen_direct_dora_stream(
+    mut set: FlatDirectDoRASet,
+    w: StreamWeights,
+    bi: Int,
+    slot_base: Int,
+    D: Int,
+    F: Int,
+    rank: Int,
+    alpha: Float32,
+    targets: Int,
+    seed: UInt64,
+    wd_on_out: Bool,
+    ctx: DeviceContext,
+) raises:
+    if _qwen_direct_slot_targeted(slot_base + 0, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wq[].to_host(ctx), D, D, rank, alpha,
+            _qwen_direct_prefix(bi, slot_base + 0),
+            seed + UInt64(slot_base + 0), wd_on_out,
+        )
+    if _qwen_direct_slot_targeted(slot_base + 1, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wk[].to_host(ctx), D, D, rank, alpha,
+            _qwen_direct_prefix(bi, slot_base + 1),
+            seed + UInt64(slot_base + 1), wd_on_out,
+        )
+    if _qwen_direct_slot_targeted(slot_base + 2, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wv[].to_host(ctx), D, D, rank, alpha,
+            _qwen_direct_prefix(bi, slot_base + 2),
+            seed + UInt64(slot_base + 2), wd_on_out,
+        )
+    if _qwen_direct_slot_targeted(slot_base + 3, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wout[].to_host(ctx), D, D, rank, alpha,
+            _qwen_direct_prefix(bi, slot_base + 3),
+            seed + UInt64(slot_base + 3), wd_on_out,
+        )
+    if _qwen_direct_slot_targeted(slot_base + 4, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wup[].to_host(ctx), D, F, rank, alpha,
+            _qwen_direct_prefix(bi, slot_base + 4),
+            seed + UInt64(slot_base + 4), wd_on_out,
+        )
+    if _qwen_direct_slot_targeted(slot_base + 5, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wdn[].to_host(ctx), F, D, rank, alpha,
+            _qwen_direct_prefix(bi, slot_base + 5),
+            seed + UInt64(slot_base + 5), wd_on_out,
+        )
+
+
+def build_qwen_direct_dora_set_from_offload(
+    mut loader: TurboPlannedLoader,
+    num_blocks: Int,
+    D: Int,
+    F: Int,
+    Dh: Int,
+    rank: Int,
+    alpha: Float32,
+    targets: Int,
+    seed: UInt64,
+    wd_on_out: Bool,
+    ctx: DeviceContext,
+) raises -> FlatDirectDoRASet:
+    if loader.block_count() < num_blocks:
+        raise Error("build_qwen_direct_dora_set_from_offload: loader depth too small")
+    var set = empty_flat_direct_dora_set()
+    if num_blocks > 0:
+        loader.prefetch_with_ctx(0, ctx)
+    for bi in range(num_blocks):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var w = _double_block_weights_from_block(
+            handle.block, handle.prefix, D, F, Dh, ctx
+        )
+        var block_seed = seed + UInt64(bi * DBL_SLOTS)
+        _append_qwen_direct_dora_stream(
+            set, w.img, bi, 0, D, F, rank, alpha, targets, block_seed, wd_on_out, ctx,
+        )
+        _append_qwen_direct_dora_stream(
+            set, w.txt, bi, QD_TXT_Q, D, F, rank, alpha, targets, block_seed, wd_on_out, ctx,
+        )
+        loader.mark_active_block_done(ctx)
+    if len(set.ad) != num_blocks * _qwen_direct_slots_per_block(targets):
+        raise Error("build_qwen_direct_dora_set_from_offload: direct slot count mismatch")
+    return set^
+
+
+def _qwen_block_direct_dora_for(
+    dora: FlatDirectDoRASet, bi: Int, targets: Int,
+) raises -> QwenBlockDirectLycoris:
+    return QwenBlockDirectLycoris(
+        QWEN_DIRECT_ALGO_DORA, dora.copy(), empty_flat_direct_oft_set(),
+        _qwen_direct_block_base(bi, targets), targets,
+    )
+
+
+def _qwen_block_direct_oft_for(
+    oft: FlatDirectOFTSet, bi: Int, targets: Int,
+) raises -> QwenBlockDirectLycoris:
+    return QwenBlockDirectLycoris(
+        QWEN_DIRECT_ALGO_OFT, empty_flat_direct_dora_set(), oft.copy(),
+        _qwen_direct_block_base(bi, targets), targets,
+    )
+
+
+def _qwen_direct_dora_zero_grads(set: FlatDirectDoRASet) -> FlatDirectDoRAGrads:
+    var out = List[DoRAGrads]()
+    for i in range(len(set.ad)):
+        ref d = set.ad[i]
+        out.append(DoRAGrads(
+            _zeros(len(d.a)), _zeros(len(d.b)), _zeros(len(d.m)), List[Float32](),
+        ))
+    return FlatDirectDoRAGrads(out^)
+
+
+def _qwen_direct_oft_zero_grads(set: FlatDirectOFTSet) -> FlatDirectOFTGrads:
+    var out = List[List[Float32]]()
+    for i in range(len(set.ad)):
+        out.append(_zeros(len(set.ad[i].vec)))
+    return FlatDirectOFTGrads(out^)
+
+
+def _scatter_qwen_dora_direct_grad(
+    mut grads: FlatDirectDoRAGrads, slot: Int, g: QwenDirectProjectionGrad,
+) raises:
+    if slot < 0 or slot >= len(grads.g):
+        raise Error("_scatter_qwen_dora_direct_grad: compact slot out of range")
+    var dg = DoRAGrads(
+        g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), List[Float32](),
+    )
+    grads.g[slot] = dg^
+
+
+def _scatter_qwen_oft_direct_grad(
+    mut grads: FlatDirectOFTGrads, slot: Int, g: QwenDirectProjectionGrad,
+) raises:
+    if slot < 0 or slot >= len(grads.d_vec):
+        raise Error("_scatter_qwen_oft_direct_grad: compact slot out of range")
+    grads.d_vec[slot] = g.d_vec.copy()
+
+
+def _nonfinite_qwen_dora_projection(g: QwenDirectProjectionGrad) -> Int:
+    return _nonfinite_check(g.d_a) + _nonfinite_check(g.d_b) + _nonfinite_check(g.d_m)
+
+
+def _nonfinite_qwen_oft_projection(g: QwenDirectProjectionGrad) -> Int:
+    return _nonfinite_check(g.d_vec)
+
+
+def _scatter_qwen_dora_stream_grads(
+    mut grads: FlatDirectDoRAGrads, targets: Int, bi: Int,
+    bg: QwenBlockDirectLycorisGrads,
+) raises:
+    var compact = _qwen_direct_block_base(bi, targets)
+    if _qwen_direct_slot_targeted(QD_IMG_Q, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.img.q); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_K, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.img.k); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_V, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.img.v); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_OUT, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.img.out_proj); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_FF_UP, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.img.ff_up); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_FF_DOWN, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.img.ff_down); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_Q, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.txt.q); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_K, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.txt.k); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_V, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.txt.v); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_OUT, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.txt.out_proj); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_FF_UP, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.txt.ff_up); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_FF_DOWN, targets):
+        _scatter_qwen_dora_direct_grad(grads, compact, bg.txt.ff_down); compact += 1
+    if compact != _qwen_direct_block_base(bi + 1, targets):
+        raise Error("_scatter_qwen_dora_stream_grads: compact count mismatch")
+
+
+def _scatter_qwen_oft_stream_grads(
+    mut grads: FlatDirectOFTGrads, targets: Int, bi: Int,
+    bg: QwenBlockDirectLycorisGrads,
+) raises:
+    var compact = _qwen_direct_block_base(bi, targets)
+    if _qwen_direct_slot_targeted(QD_IMG_Q, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.img.q); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_K, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.img.k); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_V, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.img.v); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_OUT, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.img.out_proj); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_FF_UP, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.img.ff_up); compact += 1
+    if _qwen_direct_slot_targeted(QD_IMG_FF_DOWN, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.img.ff_down); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_Q, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.txt.q); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_K, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.txt.k); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_V, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.txt.v); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_OUT, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.txt.out_proj); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_FF_UP, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.txt.ff_up); compact += 1
+    if _qwen_direct_slot_targeted(QD_TXT_FF_DOWN, targets):
+        _scatter_qwen_oft_direct_grad(grads, compact, bg.txt.ff_down); compact += 1
+    if compact != _qwen_direct_block_base(bi + 1, targets):
+        raise Error("_scatter_qwen_oft_stream_grads: compact count mismatch")
+
+
+def _nonfinite_qwen_dora_stream(bg: QwenBlockDirectLycorisGrads) -> Int:
+    return (
+        _nonfinite_qwen_dora_projection(bg.img.q)
+        + _nonfinite_qwen_dora_projection(bg.img.k)
+        + _nonfinite_qwen_dora_projection(bg.img.v)
+        + _nonfinite_qwen_dora_projection(bg.img.out_proj)
+        + _nonfinite_qwen_dora_projection(bg.img.ff_up)
+        + _nonfinite_qwen_dora_projection(bg.img.ff_down)
+        + _nonfinite_qwen_dora_projection(bg.txt.q)
+        + _nonfinite_qwen_dora_projection(bg.txt.k)
+        + _nonfinite_qwen_dora_projection(bg.txt.v)
+        + _nonfinite_qwen_dora_projection(bg.txt.out_proj)
+        + _nonfinite_qwen_dora_projection(bg.txt.ff_up)
+        + _nonfinite_qwen_dora_projection(bg.txt.ff_down)
+    )
+
+
+def _nonfinite_qwen_oft_stream(bg: QwenBlockDirectLycorisGrads) -> Int:
+    return (
+        _nonfinite_qwen_oft_projection(bg.img.q)
+        + _nonfinite_qwen_oft_projection(bg.img.k)
+        + _nonfinite_qwen_oft_projection(bg.img.v)
+        + _nonfinite_qwen_oft_projection(bg.img.out_proj)
+        + _nonfinite_qwen_oft_projection(bg.img.ff_up)
+        + _nonfinite_qwen_oft_projection(bg.img.ff_down)
+        + _nonfinite_qwen_oft_projection(bg.txt.q)
+        + _nonfinite_qwen_oft_projection(bg.txt.k)
+        + _nonfinite_qwen_oft_projection(bg.txt.v)
+        + _nonfinite_qwen_oft_projection(bg.txt.out_proj)
+        + _nonfinite_qwen_oft_projection(bg.txt.ff_up)
+        + _nonfinite_qwen_oft_projection(bg.txt.ff_down)
+    )
 
 
 # ── Qwen offload forward tape (checkpoint inputs + saved activations) ─────────
@@ -596,7 +948,7 @@ def qwenimage_stack_lora_forward_offload[
         var handle = loader.await_block(bi, ctx)
         loader.prefetch_next_with_ctx(bi, ctx)
         var bp = handle.prefix
-        var w = _double_block_weights_from_block(handle.block, bp + String("."), D, F, Dh, ctx)
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
         var img_mod = _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx)
         var txt_mod = _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx)
         var bl = double_lora_for(lora, bi)
@@ -727,7 +1079,7 @@ def qwenimage_stack_lora_backward_offload[
         if di > 0:
             loader.prefetch_with_ctx(di - 1, ctx)
         var bp = handle.prefix
-        var w = _double_block_weights_from_block(handle.block, bp + String("."), D, F, Dh, ctx)
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
         var img_mod = _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx)
         var txt_mod = _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx)
         var bl = double_lora_for(lora, di)
@@ -793,6 +1145,387 @@ def qwenimage_stack_lora_backward_offload[
     var d_txt_tokens = lbt.d_x.to_host(ctx)
 
     return QwenLoraGradSet(d_a_flat^, d_b_flat^, d_img_tokens^, d_txt_tokens^, nonfinite)
+
+
+def _qwen_direct_num_blocks(set_len: Int, targets: Int) raises -> Int:
+    var per_block = _qwen_direct_slots_per_block(targets)
+    if per_block <= 0:
+        raise Error("_qwen_direct_num_blocks: no active slots")
+    if set_len % per_block != 0:
+        raise Error("_qwen_direct_num_blocks: compact direct set length is not block-aligned")
+    return set_len // per_block
+
+
+def qwenimage_stack_direct_dora_forward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    silu_temb_h: List[Float32],
+    base: QwenOffloadBase,
+    mut loader: TurboPlannedLoader, dora: FlatDirectDoRASet,
+    targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> QwenOffloadForward:
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.elementwise import modulate
+
+    var num_double = _qwen_direct_num_blocks(len(dora.ad), targets)
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+
+    var img = _linear_b(img_tokens, base.stack.img_in_w[], base.stack.img_in_b[], N_IMG, in_ch, ctx)
+    var txt = _linear_b(txt_tokens, base.stack.txt_in_w[], base.stack.txt_in_b[], N_TXT, txt_ch, ctx)
+
+    var dbl_img_in = List[List[Float32]]()
+    var dbl_txt_in = List[List[Float32]]()
+    var dbl_saved = List[DoubleBlockSaved]()
+
+    for bi in range(num_double):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var bp = handle.prefix
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
+        var img_mod = _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx)
+        var txt_mod = _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx)
+        var direct = _qwen_block_direct_dora_for(dora, bi, targets)
+
+        dbl_img_in.append(img.copy())
+        dbl_txt_in.append(txt.copy())
+
+        var fwd = double_block_direct_lycoris_forward[H, Dh, N_IMG, N_TXT, S](
+            img.copy(), txt.copy(), w, img_mod, txt_mod, direct,
+            cos_t, sin_t, D, F, eps, ctx,
+        )
+        dbl_saved.append(fwd.saved.copy())
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var final_mods = _compute_final_modvecs(silu_temb_h, norm_out_w, norm_out_b, D, ctx)
+    var final_scale = final_mods[0].copy()
+    var final_shift = final_mods[1].copy()
+
+    var img_t = Tensor.from_host(img.copy(), [N_IMG, D], STDtype.BF16, ctx)
+    var ln_img_out_t = layer_norm(
+        img_t,
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        Tensor.from_host(_qstack_zeros(D), [D], STDtype.BF16, ctx),
+        eps, ctx,
+    )
+    var ln_img_out_h = ln_img_out_t.to_host(ctx)
+    var normed = modulate(
+        Tensor.from_host(ln_img_out_h.copy(), [N_IMG, D], STDtype.BF16, ctx),
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift.copy(), [D], STDtype.BF16, ctx),
+        ctx,
+    ).to_host(ctx)
+    var out = _linear_b(normed, base.stack.proj_out_w[], base.stack.proj_out_b[], N_IMG, D, ctx)
+
+    var img_arc = ArcPointer[Tensor](Tensor.from_host(img^, [N_IMG, D], STDtype.BF16, ctx))
+    var ln_arc = ArcPointer[Tensor](Tensor.from_host(ln_img_out_h^, [N_IMG, D], STDtype.BF16, ctx))
+
+    return QwenOffloadForward(
+        out^, dbl_img_in^, dbl_txt_in^, dbl_saved^,
+        img_arc^, ln_arc^, final_scale^, final_shift^,
+    )
+
+
+def qwenimage_stack_direct_oft_forward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    silu_temb_h: List[Float32],
+    base: QwenOffloadBase,
+    mut loader: TurboPlannedLoader, oft: FlatDirectOFTSet,
+    targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> QwenOffloadForward:
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.elementwise import modulate
+
+    var num_double = _qwen_direct_num_blocks(len(oft.ad), targets)
+
+    loader.prefetch_with_ctx(0, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+
+    var img = _linear_b(img_tokens, base.stack.img_in_w[], base.stack.img_in_b[], N_IMG, in_ch, ctx)
+    var txt = _linear_b(txt_tokens, base.stack.txt_in_w[], base.stack.txt_in_b[], N_TXT, txt_ch, ctx)
+
+    var dbl_img_in = List[List[Float32]]()
+    var dbl_txt_in = List[List[Float32]]()
+    var dbl_saved = List[DoubleBlockSaved]()
+
+    for bi in range(num_double):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var bp = handle.prefix
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
+        var img_mod = _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx)
+        var txt_mod = _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx)
+        var direct = _qwen_block_direct_oft_for(oft, bi, targets)
+
+        dbl_img_in.append(img.copy())
+        dbl_txt_in.append(txt.copy())
+
+        var fwd = double_block_direct_lycoris_forward[H, Dh, N_IMG, N_TXT, S](
+            img.copy(), txt.copy(), w, img_mod, txt_mod, direct,
+            cos_t, sin_t, D, F, eps, ctx,
+        )
+        dbl_saved.append(fwd.saved.copy())
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var final_mods = _compute_final_modvecs(silu_temb_h, norm_out_w, norm_out_b, D, ctx)
+    var final_scale = final_mods[0].copy()
+    var final_shift = final_mods[1].copy()
+
+    var img_t = Tensor.from_host(img.copy(), [N_IMG, D], STDtype.BF16, ctx)
+    var ln_img_out_t = layer_norm(
+        img_t,
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        Tensor.from_host(_qstack_zeros(D), [D], STDtype.BF16, ctx),
+        eps, ctx,
+    )
+    var ln_img_out_h = ln_img_out_t.to_host(ctx)
+    var normed = modulate(
+        Tensor.from_host(ln_img_out_h.copy(), [N_IMG, D], STDtype.BF16, ctx),
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift.copy(), [D], STDtype.BF16, ctx),
+        ctx,
+    ).to_host(ctx)
+    var out = _linear_b(normed, base.stack.proj_out_w[], base.stack.proj_out_b[], N_IMG, D, ctx)
+
+    var img_arc = ArcPointer[Tensor](Tensor.from_host(img^, [N_IMG, D], STDtype.BF16, ctx))
+    var ln_arc = ArcPointer[Tensor](Tensor.from_host(ln_img_out_h^, [N_IMG, D], STDtype.BF16, ctx))
+
+    return QwenOffloadForward(
+        out^, dbl_img_in^, dbl_txt_in^, dbl_saved^,
+        img_arc^, ln_arc^, final_scale^, final_shift^,
+    )
+
+
+def qwenimage_stack_direct_dora_backward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    silu_temb_h: List[Float32],
+    base: QwenOffloadBase,
+    mut loader: TurboPlannedLoader, dora: FlatDirectDoRASet,
+    targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
+    saved: QwenOffloadForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> QwenDirectDoRAGradSet:
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.elementwise import modulate
+    from serenitymojo.ops.norm_backward import layer_norm_backward
+    from serenitymojo.ops.elementwise_backward import modulate_backward
+
+    var num_double = _qwen_direct_num_blocks(len(dora.ad), targets)
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+
+    var dora_grads = _qwen_direct_dora_zero_grads(dora)
+    var nonfinite = 0
+
+    var final_scale = saved.final_scale.copy()
+    var final_shift = saved.final_shift.copy()
+
+    var normed = modulate(
+        saved.ln_img_out[],
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift.copy(), [D], STDtype.BF16, ctx),
+        ctx,
+    ).to_host(ctx)
+
+    var lbf = linear_backward(
+        Tensor.from_host(d_out, [N_IMG, out_ch], STDtype.BF16, ctx),
+        Tensor.from_host(normed, [N_IMG, D], STDtype.BF16, ctx),
+        base.stack.proj_out_w[],
+        N_IMG, D, out_ch, ctx,
+    )
+    var d_normed = lbf.d_x.to_host(ctx)
+
+    var mbf = modulate_backward(
+        Tensor.from_host(d_normed, [N_IMG, D], STDtype.BF16, ctx),
+        saved.ln_img_out[],
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        ctx,
+    )
+    var d_ln_img_out = mbf.d_x.to_host(ctx)
+
+    var lnbf = layer_norm_backward(
+        Tensor.from_host(d_ln_img_out, [N_IMG, D], STDtype.BF16, ctx),
+        saved.img_out[],
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        eps, ctx,
+    )
+    var d_img_out = lnbf.d_x.to_host(ctx)
+    var d_txt_out = _qstack_zeros(N_TXT * D)
+
+    var di = num_double - 1
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var bp = handle.prefix
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
+        var img_mod = _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx)
+        var txt_mod = _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx)
+        var direct = _qwen_block_direct_dora_for(dora, di, targets)
+
+        var bg = double_block_direct_lycoris_backward[H, Dh, N_IMG, N_TXT, S](
+            d_img_out.copy(), d_txt_out.copy(), w, img_mod, txt_mod,
+            direct, saved.dbl_saved[di], cos_t, sin_t, D, F, eps, ctx,
+        )
+        d_img_out = bg.img.d_x.copy()
+        d_txt_out = bg.txt.d_x.copy()
+        _scatter_qwen_dora_stream_grads(dora_grads, targets, di, bg)
+        nonfinite += _nonfinite_qwen_dora_stream(bg)
+
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    var lbi = linear_backward(
+        Tensor.from_host(d_img_out, [N_IMG, D], STDtype.BF16, ctx),
+        Tensor.from_host(img_tokens, [N_IMG, in_ch], STDtype.BF16, ctx),
+        base.stack.img_in_w[], N_IMG, in_ch, D, ctx,
+    )
+    var d_img_tokens = lbi.d_x.to_host(ctx)
+
+    var lbt = linear_backward(
+        Tensor.from_host(d_txt_out, [N_TXT, D], STDtype.BF16, ctx),
+        Tensor.from_host(txt_tokens, [N_TXT, txt_ch], STDtype.BF16, ctx),
+        base.stack.txt_in_w[], N_TXT, txt_ch, D, ctx,
+    )
+    var d_txt_tokens = lbt.d_x.to_host(ctx)
+
+    return QwenDirectDoRAGradSet(dora_grads^, d_img_tokens^, d_txt_tokens^, nonfinite)
+
+
+def qwenimage_stack_direct_oft_backward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    silu_temb_h: List[Float32],
+    base: QwenOffloadBase,
+    mut loader: TurboPlannedLoader, oft: FlatDirectOFTSet,
+    targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
+    saved: QwenOffloadForward,
+    D: Int, F: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> QwenDirectOFTGradSet:
+    from serenitymojo.ops.norm import layer_norm
+    from serenitymojo.ops.elementwise import modulate
+    from serenitymojo.ops.norm_backward import layer_norm_backward
+    from serenitymojo.ops.elementwise_backward import modulate_backward
+
+    var num_double = _qwen_direct_num_blocks(len(oft.ad), targets)
+
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.BF16, ctx)
+
+    var oft_grads = _qwen_direct_oft_zero_grads(oft)
+    var nonfinite = 0
+
+    var final_scale = saved.final_scale.copy()
+    var final_shift = saved.final_shift.copy()
+
+    var normed = modulate(
+        saved.ln_img_out[],
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        Tensor.from_host(final_shift.copy(), [D], STDtype.BF16, ctx),
+        ctx,
+    ).to_host(ctx)
+
+    var lbf = linear_backward(
+        Tensor.from_host(d_out, [N_IMG, out_ch], STDtype.BF16, ctx),
+        Tensor.from_host(normed, [N_IMG, D], STDtype.BF16, ctx),
+        base.stack.proj_out_w[],
+        N_IMG, D, out_ch, ctx,
+    )
+    var d_normed = lbf.d_x.to_host(ctx)
+
+    var mbf = modulate_backward(
+        Tensor.from_host(d_normed, [N_IMG, D], STDtype.BF16, ctx),
+        saved.ln_img_out[],
+        Tensor.from_host(final_scale.copy(), [D], STDtype.BF16, ctx),
+        ctx,
+    )
+    var d_ln_img_out = mbf.d_x.to_host(ctx)
+
+    var lnbf = layer_norm_backward(
+        Tensor.from_host(d_ln_img_out, [N_IMG, D], STDtype.BF16, ctx),
+        saved.img_out[],
+        Tensor.from_host(_qstack_ones(D), [D], STDtype.BF16, ctx),
+        eps, ctx,
+    )
+    var d_img_out = lnbf.d_x.to_host(ctx)
+    var d_txt_out = _qstack_zeros(N_TXT * D)
+
+    var di = num_double - 1
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var bp = handle.prefix
+        var w = _double_block_weights_from_block(handle.block, bp, D, F, Dh, ctx)
+        var img_mod = _modvecs_from_block(handle.block, bp, True, silu_temb_h, D, ctx)
+        var txt_mod = _modvecs_from_block(handle.block, bp, False, silu_temb_h, D, ctx)
+        var direct = _qwen_block_direct_oft_for(oft, di, targets)
+
+        var bg = double_block_direct_lycoris_backward[H, Dh, N_IMG, N_TXT, S](
+            d_img_out.copy(), d_txt_out.copy(), w, img_mod, txt_mod,
+            direct, saved.dbl_saved[di], cos_t, sin_t, D, F, eps, ctx,
+        )
+        d_img_out = bg.img.d_x.copy()
+        d_txt_out = bg.txt.d_x.copy()
+        _scatter_qwen_oft_stream_grads(oft_grads, targets, di, bg)
+        nonfinite += _nonfinite_qwen_oft_stream(bg)
+
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    var lbi = linear_backward(
+        Tensor.from_host(d_img_out, [N_IMG, D], STDtype.BF16, ctx),
+        Tensor.from_host(img_tokens, [N_IMG, in_ch], STDtype.BF16, ctx),
+        base.stack.img_in_w[], N_IMG, in_ch, D, ctx,
+    )
+    var d_img_tokens = lbi.d_x.to_host(ctx)
+
+    var lbt = linear_backward(
+        Tensor.from_host(d_txt_out, [N_TXT, D], STDtype.BF16, ctx),
+        Tensor.from_host(txt_tokens, [N_TXT, txt_ch], STDtype.BF16, ctx),
+        base.stack.txt_in_w[], N_TXT, txt_ch, D, ctx,
+    )
+    var d_txt_tokens = lbt.d_x.to_host(ctx)
+
+    return QwenDirectOFTGradSet(oft_grads^, d_img_tokens^, d_txt_tokens^, nonfinite)
 
 
 # ── AdamW step for the offload grad set ──────────────────────────────────────

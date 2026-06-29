@@ -69,9 +69,16 @@ from serenitymojo.ops.elementwise_backward import modulate_backward
 from serenitymojo.models.krea2.krea2_block import (
     Krea2BlockWeights, Krea2BlockLora, Krea2LoraGrad, Krea2BlockGrads,
     Krea2LoraGradT, Krea2BlockGradsT,
+    Krea2DirectDoRAGradT, Krea2DirectOFTGradT,
+    Krea2BlockDirectDoRAGradsT, Krea2BlockDirectOFTGradsT,
     krea2_single_stream_block_lora, krea2_single_stream_block_lora_backward,
     krea2_single_stream_block_lora_backward_dev,
+    krea2_single_stream_block_dora, krea2_single_stream_block_dora_backward_dev,
+    krea2_single_stream_block_oft, krea2_single_stream_block_oft_backward_dev,
     _add_scale_one,
+)
+from serenitymojo.models.krea2.krea2_direct_lycoris_stack import (
+    Krea2StackDirectDoRA, Krea2StackDirectOFT,
 )
 
 # ── Phase 4b autograd_v2 engine arm (the COARSE per-block graph backward) ──────
@@ -162,6 +169,28 @@ struct Krea2StackLoraGradsT(Movable):
     var d_combined: TArc                  # [1,L,features] grad into the block-stack input
 
     def __init__(out self, var grads: List[Krea2LoraGradT], var d_combined: TArc):
+        self.grads = grads^
+        self.d_combined = d_combined^
+
+
+struct Krea2StackDirectDoRAGradsT(Movable):
+    var grads: List[Krea2DirectDoRAGradT]  # len N*8, flat (bi*8 + slot), DEVICE
+    var d_combined: TArc
+
+    def __init__(
+        out self, var grads: List[Krea2DirectDoRAGradT], var d_combined: TArc,
+    ):
+        self.grads = grads^
+        self.d_combined = d_combined^
+
+
+struct Krea2StackDirectOFTGradsT(Movable):
+    var grads: List[Krea2DirectOFTGradT]  # len N*8, flat (bi*8 + slot), DEVICE
+    var d_combined: TArc
+
+    def __init__(
+        out self, var grads: List[Krea2DirectOFTGradT], var d_combined: TArc,
+    ):
         self.grads = grads^
         self.d_combined = d_combined^
 
@@ -667,6 +696,116 @@ def krea2_stack_lora_forward_streamed[
     )
 
 
+def krea2_stack_dora_forward_streamed[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    combined: TArc,
+    blk_vec: Tensor,
+    tmlp_out: Tensor,
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    dora: Krea2StackDirectDoRA, fin: Krea2StreamFinal,
+    cos: Tensor, sin: Tensor,
+    eps: Float32,
+    txtlen: Int, imglen: Int,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackForward:
+    """STREAMING single-stream stack forward with direct DoRA W_eff projections."""
+    comptime features = HEADS * HEADDIM
+
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var x = combined.copy()
+    var block_inputs = List[TArc]()
+    for bi in range(nblocks):
+        block_inputs.append(x.copy())
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+        var fwd = krea2_single_stream_block_dora[L, HEADS, KVHEADS, HEADDIM](
+            x, blk_vec, wbi, dora.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        x = fwd.out.copy()
+        ctx.synchronize()
+
+    var x_blocks_out = x.copy()
+    var last_xn = rms_norm(
+        x[], _add_scale_one(fin.last_norm[], ctx), eps, ctx,
+    )
+    var final = krea2_last_layer(
+        x[], tmlp_out, fin.last_norm[], fin.last_mod_lin[],
+        fin.last_lin_w[], fin.last_lin_b[], features, ctx,
+    )
+    var velocity = slice(final, 1, txtlen, imglen, ctx)
+
+    return Krea2StackForward(
+        TArc(velocity^), block_inputs^,
+        x_blocks_out^, TArc(last_xn^), txtlen, imglen,
+    )
+
+
+def krea2_stack_oft_forward_streamed[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    combined: TArc,
+    blk_vec: Tensor,
+    tmlp_out: Tensor,
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    oft: Krea2StackDirectOFT, fin: Krea2StreamFinal,
+    cos: Tensor, sin: Tensor,
+    eps: Float32,
+    txtlen: Int, imglen: Int,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackForward:
+    """STREAMING single-stream stack forward with direct OFT W_eff projections."""
+    comptime features = HEADS * HEADDIM
+
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var x = combined.copy()
+    var block_inputs = List[TArc]()
+    for bi in range(nblocks):
+        block_inputs.append(x.copy())
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+        var fwd = krea2_single_stream_block_oft[L, HEADS, KVHEADS, HEADDIM](
+            x, blk_vec, wbi, oft.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        x = fwd.out.copy()
+        ctx.synchronize()
+
+    var x_blocks_out = x.copy()
+    var last_xn = rms_norm(
+        x[], _add_scale_one(fin.last_norm[], ctx), eps, ctx,
+    )
+    var final = krea2_last_layer(
+        x[], tmlp_out, fin.last_norm[], fin.last_mod_lin[],
+        fin.last_lin_w[], fin.last_lin_b[], features, ctx,
+    )
+    var velocity = slice(final, 1, txtlen, imglen, ctx)
+
+    return Krea2StackForward(
+        TArc(velocity^), block_inputs^,
+        x_blocks_out^, TArc(last_xn^), txtlen, imglen,
+    )
+
+
 def krea2_stack_lora_backward_streamed[
     L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
 ](
@@ -918,6 +1057,132 @@ def krea2_stack_lora_backward_streamed_dev[
         # bg drops here → the 8 device LoRA grads free; wbi drops → device weights free.
 
     return Krea2StackLoraGrads(grads^, TArc(d_x^))
+
+
+def krea2_stack_dora_backward_streamed_dev[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_velocity: Tensor,
+    blk_vec: Tensor,
+    tmlp_out: Tensor,
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    dora: Krea2StackDirectDoRA, fin: Krea2StreamFinal,
+    fwd: Krea2StackForward,
+    cos: Tensor, sin: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackDirectDoRAGradsT:
+    """Device-grad streamed backward for direct DoRA Krea2 blocks."""
+    comptime features = HEADS * HEADDIM
+
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var grads = List[Krea2DirectDoRAGradT]()
+    for _ in range(nblocks * KREA2_SLOTS_PER_BLOCK):
+        grads.append(Krea2DirectDoRAGradT(None, None, None))
+
+    var fin_w = fin.as_stack_weights()
+    var d_x = krea2_final_layer_backward[L, HEADS, HEADDIM](
+        d_velocity, fwd, tmlp_out, fin_w, eps, ctx,
+    )
+
+    var bi = nblocks - 1
+    while bi >= 0:
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+        var rb = krea2_single_stream_block_dora[L, HEADS, KVHEADS, HEADDIM](
+            fwd.block_inputs[bi].copy(), blk_vec, wbi, dora.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var bg = krea2_single_stream_block_dora_backward_dev[L, HEADS, KVHEADS, HEADDIM](
+            d_x, blk_vec, wbi, dora.blocks[bi], rb.saved,
+            cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        grads[base + 0] = bg.wq.copy()
+        grads[base + 1] = bg.wk.copy()
+        grads[base + 2] = bg.wv.copy()
+        grads[base + 3] = bg.gate_w.copy()
+        grads[base + 4] = bg.wo.copy()
+        grads[base + 5] = bg.mlp_gate_w.copy()
+        grads[base + 6] = bg.mlp_up_w.copy()
+        grads[base + 7] = bg.mlp_down_w.copy()
+        d_x = bg.d_x[].clone(ctx)
+        ctx.synchronize()
+        bi -= 1
+
+    return Krea2StackDirectDoRAGradsT(grads^, TArc(d_x^))
+
+
+def krea2_stack_oft_backward_streamed_dev[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_velocity: Tensor,
+    blk_vec: Tensor,
+    tmlp_out: Tensor,
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    oft: Krea2StackDirectOFT, fin: Krea2StreamFinal,
+    fwd: Krea2StackForward,
+    cos: Tensor, sin: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackDirectOFTGradsT:
+    """Device-grad streamed backward for direct OFT Krea2 blocks."""
+    comptime features = HEADS * HEADDIM
+
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var grads = List[Krea2DirectOFTGradT]()
+    for _ in range(nblocks * KREA2_SLOTS_PER_BLOCK):
+        grads.append(Krea2DirectOFTGradT(None))
+
+    var fin_w = fin.as_stack_weights()
+    var d_x = krea2_final_layer_backward[L, HEADS, HEADDIM](
+        d_velocity, fwd, tmlp_out, fin_w, eps, ctx,
+    )
+
+    var bi = nblocks - 1
+    while bi >= 0:
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+        var rb = krea2_single_stream_block_oft[L, HEADS, KVHEADS, HEADDIM](
+            fwd.block_inputs[bi].copy(), blk_vec, wbi, oft.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var bg = krea2_single_stream_block_oft_backward_dev[L, HEADS, KVHEADS, HEADDIM](
+            d_x, blk_vec, wbi, oft.blocks[bi], rb.saved,
+            cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        grads[base + 0] = bg.wq.copy()
+        grads[base + 1] = bg.wk.copy()
+        grads[base + 2] = bg.wv.copy()
+        grads[base + 3] = bg.gate_w.copy()
+        grads[base + 4] = bg.wo.copy()
+        grads[base + 5] = bg.mlp_gate_w.copy()
+        grads[base + 6] = bg.mlp_up_w.copy()
+        grads[base + 7] = bg.mlp_down_w.copy()
+        d_x = bg.d_x[].clone(ctx)
+        ctx.synchronize()
+        bi -= 1
+
+    return Krea2StackDirectOFTGradsT(grads^, TArc(d_x^))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

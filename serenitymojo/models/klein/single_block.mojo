@@ -587,6 +587,14 @@ from serenitymojo.models.klein.lora_block import (
     KleinLoraDeviceGrads, KleinLoraDeviceGradTensors,
     klein_take_cols_device, klein_add_cols_device,
 )
+from serenitymojo.models.klein.klein_direct_lycoris_stack import (
+    KleinSingleDirectDoRA, KleinSingleDirectOFT,
+    KleinDirectDoRAGradT, KleinDirectOFTGradT,
+    klein_direct_dora_projection_forward_optional,
+    klein_direct_dora_projection_backward_optional,
+    klein_direct_oft_projection_forward_optional,
+    klein_direct_oft_projection_backward_optional,
+)
 
 
 struct LoraDropout(ImplicitlyCopyable, Movable):
@@ -1524,6 +1532,464 @@ def single_block_lora_backward_device_resident_scratch_tensors[
     var out = SingleBlockLoraDeviceGradTensors(
         TArc(d_x_t^), d_shift^, d_scale^, d_gate^,
         qkv_d_a^, qkv_d_b^, out_d_a^, out_d_b^,
+    )
+    scratch.rewind(scratch_mark)
+    return out^
+
+
+struct SingleBlockDirectDoRAGradsT(Copyable, Movable):
+    var d_x: TArc
+    var d_shift: List[Float32]
+    var d_scale: List[Float32]
+    var d_gate: List[Float32]
+    var qkv: KleinDirectDoRAGradT
+    var out: KleinDirectDoRAGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var d_shift: List[Float32], var d_scale: List[Float32], var d_gate: List[Float32],
+        var qkv: KleinDirectDoRAGradT, var out_g: KleinDirectDoRAGradT,
+    ):
+        self.d_x = d_x^
+        self.d_shift = d_shift^
+        self.d_scale = d_scale^
+        self.d_gate = d_gate^
+        self.qkv = qkv^
+        self.out = out_g^
+
+
+struct SingleBlockDirectOFTGradsT(Copyable, Movable):
+    var d_x: TArc
+    var d_shift: List[Float32]
+    var d_scale: List[Float32]
+    var d_gate: List[Float32]
+    var qkv: KleinDirectOFTGradT
+    var out: KleinDirectOFTGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var d_shift: List[Float32], var d_scale: List[Float32], var d_gate: List[Float32],
+        var qkv: KleinDirectOFTGradT, var out_g: KleinDirectOFTGradT,
+    ):
+        self.d_x = d_x^
+        self.d_shift = d_shift^
+        self.d_scale = d_scale^
+        self.d_gate = d_gate^
+        self.qkv = qkv^
+        self.out = out_g^
+
+
+def single_block_direct_dora_forward_device_resident_scratch[
+    H: Int, Dh: Int, S: Int
+](
+    x_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, dora: KleinSingleDirectDoRA,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor, norm_zeros: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> SingleBlockDeviceForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var ln_t = layer_norm(x_t[], norm_ones, norm_zeros, eps, ctx)
+    var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
+
+    var scratch_mark = scratch.mark()
+    var q_pre_flat: Tensor
+    var k_pre_flat: Tensor
+    var v_flat: Tensor
+    var gate_up: Tensor
+    if dora.qkv:
+        var fused = klein_direct_dora_projection_forward_optional(
+            norm_t, w.w1[], dora.qkv, S, ctx,
+        )
+        q_pre_flat = slice(fused, 1, 0, D, ctx)
+        k_pre_flat = slice(fused, 1, D, D, ctx)
+        v_flat = slice(fused, 1, 2 * D, D, ctx)
+        gate_up = slice(fused, 1, 3 * D, 2 * F, ctx)
+    else:
+        q_pre_flat = linear_rows(norm_t, w.w1[], 0, D, ctx)
+        k_pre_flat = linear_rows(norm_t, w.w1[], D, D, ctx)
+        v_flat = linear_rows(norm_t, w.w1[], 2 * D, D, ctx)
+        gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
+    var q_pre = reshape_owned(q_pre_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_pre_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+
+    var flash_q = Optional[TArc](None)
+    var flash_k = Optional[TArc](None)
+    var flash_v = Optional[TArc](None)
+    var flash_o = Optional[TArc](None)
+    var flash_stats = Optional[TArc](None)
+    var att_flat: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        var af_shape: List[Int] = [S, D]
+        att_flat = Tensor(ff.att.buf.copy(), af_shape^, STDtype.F32)
+        flash_q = Optional[TArc](ff.q_bf.copy())
+        flash_k = Optional[TArc](ff.k_bf.copy())
+        flash_v = Optional[TArc](ff.v_bf.copy())
+        flash_o = Optional[TArc](ff.o_bf.copy())
+        flash_stats = Optional[TArc](ff.stats.copy())
+    else:
+        var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        att_flat = reshape_owned(att^, [S, D])
+
+    var mlp_gate = slice(gate_up, 1, 0, F, ctx)
+    var mlp_up = slice(gate_up, 1, F, F, ctx)
+    var mlp = swiglu(mlp_gate, mlp_up, ctx)
+    scratch.rewind(scratch_mark)
+
+    var out_in_t = concat(1, ctx, att_flat, mlp)
+    var out_proj: Tensor
+    if dora.out:
+        out_proj = klein_direct_dora_projection_forward_optional(
+            out_in_t, w.w2[], dora.out, S, ctx,
+        )
+    else:
+        var proj_mark = scratch.mark()
+        out_proj = linear_two_inputs_scratch(
+            att_flat, mlp, w.w2_att[], w.w2_mlp[], ctx, scratch,
+        )
+        scratch.rewind(proj_mark)
+
+    var result = residual_gate(x_t[], mv.gate[], out_proj, ctx)
+    var saved = SingleBlockSaved(
+        x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
+        TArc(q_rms^), TArc(k_rms^), TArc(v^),
+        TArc(q_rope^), TArc(k_rope^), TArc(att_flat^),
+        TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in_t^),
+        flash_q^, flash_k^, flash_v^, flash_o^, flash_stats^,
+    )
+    return SingleBlockDeviceForward(TArc(result^), saved^)
+
+
+def single_block_direct_oft_forward_device_resident_scratch[
+    H: Int, Dh: Int, S: Int
+](
+    x_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, oft: KleinSingleDirectOFT,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor, norm_zeros: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+) raises -> SingleBlockDeviceForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var ln_t = layer_norm(x_t[], norm_ones, norm_zeros, eps, ctx)
+    var norm_t = modulate(ln_t, mv.scale[], mv.shift[], ctx)
+
+    var scratch_mark = scratch.mark()
+    var q_pre_flat: Tensor
+    var k_pre_flat: Tensor
+    var v_flat: Tensor
+    var gate_up: Tensor
+    if oft.qkv:
+        var fused = klein_direct_oft_projection_forward_optional(
+            norm_t, w.w1[], oft.qkv, S, ctx,
+        )
+        q_pre_flat = slice(fused, 1, 0, D, ctx)
+        k_pre_flat = slice(fused, 1, D, D, ctx)
+        v_flat = slice(fused, 1, 2 * D, D, ctx)
+        gate_up = slice(fused, 1, 3 * D, 2 * F, ctx)
+    else:
+        q_pre_flat = linear_rows(norm_t, w.w1[], 0, D, ctx)
+        k_pre_flat = linear_rows(norm_t, w.w1[], D, D, ctx)
+        v_flat = linear_rows(norm_t, w.w1[], 2 * D, D, ctx)
+        gate_up = linear_rows_scratch(norm_t, w.w1[], 3 * D, 2 * F, ctx, scratch)
+    var q_pre = reshape_owned(q_pre_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_pre_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+
+    var flash_q = Optional[TArc](None)
+    var flash_k = Optional[TArc](None)
+    var flash_v = Optional[TArc](None)
+    var flash_o = Optional[TArc](None)
+    var flash_stats = Optional[TArc](None)
+    var att_flat: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        var af_shape: List[Int] = [S, D]
+        att_flat = Tensor(ff.att.buf.copy(), af_shape^, STDtype.F32)
+        flash_q = Optional[TArc](ff.q_bf.copy())
+        flash_k = Optional[TArc](ff.k_bf.copy())
+        flash_v = Optional[TArc](ff.v_bf.copy())
+        flash_o = Optional[TArc](ff.o_bf.copy())
+        flash_stats = Optional[TArc](ff.stats.copy())
+    else:
+        var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        att_flat = reshape_owned(att^, [S, D])
+
+    var mlp_gate = slice(gate_up, 1, 0, F, ctx)
+    var mlp_up = slice(gate_up, 1, F, F, ctx)
+    var mlp = swiglu(mlp_gate, mlp_up, ctx)
+    scratch.rewind(scratch_mark)
+
+    var out_in_t = concat(1, ctx, att_flat, mlp)
+    var out_proj: Tensor
+    if oft.out:
+        out_proj = klein_direct_oft_projection_forward_optional(
+            out_in_t, w.w2[], oft.out, S, ctx,
+        )
+    else:
+        var proj_mark = scratch.mark()
+        out_proj = linear_two_inputs_scratch(
+            att_flat, mlp, w.w2_att[], w.w2_mlp[], ctx, scratch,
+        )
+        scratch.rewind(proj_mark)
+
+    var result = residual_gate(x_t[], mv.gate[], out_proj, ctx)
+    var saved = SingleBlockSaved(
+        x_t.copy(), TArc(ln_t^), TArc(norm_t^), TArc(q_pre^), TArc(k_pre^),
+        TArc(q_rms^), TArc(k_rms^), TArc(v^),
+        TArc(q_rope^), TArc(k_rope^), TArc(att_flat^),
+        TArc(mlp_gate^), TArc(mlp_up^), TArc(mlp^), TArc(out_in_t^),
+        flash_q^, flash_k^, flash_v^, flash_o^, flash_stats^,
+    )
+    return SingleBlockDeviceForward(TArc(result^), saved^)
+
+
+def single_block_direct_dora_backward_device_resident_scratch[
+    H: Int, Dh: Int, S: Int
+](
+    d_out_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, dora: KleinSingleDirectDoRA,
+    saved: SingleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> SingleBlockDirectDoRAGradsT:
+    var scratch_mark = scratch.mark()
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var grg: GateResidualGrads
+    var d_gate = List[Float32]()
+    if compute_aux_grads:
+        var out_y: Tensor
+        if dora.out:
+            out_y = klein_direct_dora_projection_forward_optional(
+                saved.out_in[], w.w2[], dora.out, S, ctx,
+            )
+        else:
+            out_y = linear_two_inputs_scratch(
+                saved.att_flat[], saved.mlp[], w.w2_att[], w.w2_mlp[], ctx, scratch,
+            )
+        grg = gate_residual_backward(d_out_t[], saved.x[], mv.gate[], out_y, ctx)
+        d_gate = grg.d_g.to_host(ctx)
+    else:
+        grg = gate_residual_backward_dxdy(d_out_t[], mv.gate[], ctx)
+
+    var out_grad = KleinDirectDoRAGradT(None, None, None)
+    var d_att: Tensor
+    var d_mlp: Tensor
+    if dora.out:
+        var bw_out = klein_direct_dora_projection_backward_optional(
+            grg.d_y, saved.out_in[], w.w2[], dora.out, S, D + F, D, ctx,
+        )
+        var d_out_in = bw_out.d_x.clone(ctx)
+        d_att = slice(d_out_in, 1, 0, D, ctx)
+        d_mlp = slice(d_out_in, 1, D, F, ctx)
+        out_grad = bw_out.dora.copy()
+    else:
+        d_att = linear_backward_dx_scratch(
+            grg.d_y, w.w2_att[], S, D, D, ctx, scratch,
+        )
+        d_mlp = linear_backward_dx_scratch(
+            grg.d_y, w.w2_mlp[], S, F, D, ctx, scratch,
+        )
+
+    reshape_in_place(d_att, [1, S, H, Dh])
+    var sgb = swiglu_backward(d_mlp, saved.mlp_gate[], saved.mlp_up[], ctx)
+    var d_gate_up = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
+
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        if not saved.flash_stats:
+            raise Error("single_block direct DoRA bwd: missing flash stats")
+        var fb = sdpa_flash_backward_f32[1, S, H, Dh](
+            saved.flash_q.value(), saved.flash_k.value(),
+            saved.flash_v.value(), saved.flash_o.value(),
+            saved.flash_stats.value(), d_att, scale, ctx,
+        )
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
+    else:
+        var sb = sdpa_backward_scratch[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx, scratch,
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+
+    var d_q_rms = rope_backward(d_q_sb, cos, sin, True, ctx)
+    var d_k_rms = rope_backward(d_k_sb, cos, sin, True, ctx)
+    var d_q_pre_t = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre_t = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
+    var d_q_pre_flat = reshape_owned(d_q_pre_t^, [S, D])
+    var d_k_pre_flat = reshape_owned(d_k_pre_t^, [S, D])
+    reshape_in_place(d_v_sb, [S, D])
+    var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, d_v_sb, True)
+    var d_fused = concat(1, ctx, d_qkv, d_gate_up)
+
+    var qkv_grad = KleinDirectDoRAGradT(None, None, None)
+    var d_norm_t: Tensor
+    if dora.qkv:
+        var bw_qkv = klein_direct_dora_projection_backward_optional(
+            d_fused, saved.norm[], w.w1[], dora.qkv, S, D, 3 * D + 2 * F, ctx,
+        )
+        d_norm_t = bw_qkv.d_x.clone(ctx)
+        qkv_grad = bw_qkv.dora.copy()
+    else:
+        d_norm_t = linear_backward_dx_split_scratch(
+            d_qkv, d_gate_up, w.w1[], S, D, 3 * D, 2 * F, ctx, scratch,
+        )
+
+    var mb = modulate_backward(d_norm_t, saved.ln[], mv.scale[], ctx, compute_aux_grads)
+    var d_scale = List[Float32]()
+    var d_shift = List[Float32]()
+    if compute_aux_grads:
+        d_scale = mb.d_scale.to_host(ctx)
+        d_shift = mb.d_shift.to_host(ctx)
+
+    var d_x_norm_t = layer_norm_backward_dx(mb.d_x, saved.x[], norm_ones, eps, ctx)
+    var d_x_t = add(grg.d_x, d_x_norm_t, ctx)
+    var out = SingleBlockDirectDoRAGradsT(
+        TArc(d_x_t^), d_shift^, d_scale^, d_gate^, qkv_grad^, out_grad^,
+    )
+    scratch.rewind(scratch_mark)
+    return out^
+
+
+def single_block_direct_oft_backward_device_resident_scratch[
+    H: Int, Dh: Int, S: Int
+](
+    d_out_t: TArc,
+    w: SingleBlockWeights, mv: SingleModVecsDevice, oft: KleinSingleDirectOFT,
+    saved: SingleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    norm_ones: Tensor,
+    ctx: DeviceContext,
+    mut scratch: ScratchRingAllocator,
+    compute_aux_grads: Bool = True,
+) raises -> SingleBlockDirectOFTGradsT:
+    var scratch_mark = scratch.mark()
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var grg: GateResidualGrads
+    var d_gate = List[Float32]()
+    if compute_aux_grads:
+        var out_y: Tensor
+        if oft.out:
+            out_y = klein_direct_oft_projection_forward_optional(
+                saved.out_in[], w.w2[], oft.out, S, ctx,
+            )
+        else:
+            out_y = linear_two_inputs_scratch(
+                saved.att_flat[], saved.mlp[], w.w2_att[], w.w2_mlp[], ctx, scratch,
+            )
+        grg = gate_residual_backward(d_out_t[], saved.x[], mv.gate[], out_y, ctx)
+        d_gate = grg.d_g.to_host(ctx)
+    else:
+        grg = gate_residual_backward_dxdy(d_out_t[], mv.gate[], ctx)
+
+    var out_grad = KleinDirectOFTGradT(None)
+    var d_att: Tensor
+    var d_mlp: Tensor
+    if oft.out:
+        var bw_out = klein_direct_oft_projection_backward_optional(
+            grg.d_y, saved.out_in[], w.w2[], oft.out, S, D + F, D, ctx,
+        )
+        var d_out_in = bw_out.d_x.clone(ctx)
+        d_att = slice(d_out_in, 1, 0, D, ctx)
+        d_mlp = slice(d_out_in, 1, D, F, ctx)
+        out_grad = bw_out.oft.copy()
+    else:
+        d_att = linear_backward_dx_scratch(
+            grg.d_y, w.w2_att[], S, D, D, ctx, scratch,
+        )
+        d_mlp = linear_backward_dx_scratch(
+            grg.d_y, w.w2_mlp[], S, F, D, ctx, scratch,
+        )
+
+    reshape_in_place(d_att, [1, S, H, Dh])
+    var sgb = swiglu_backward(d_mlp, saved.mlp_gate[], saved.mlp_up[], ctx)
+    var d_gate_up = concat2_scratch(1, ctx, scratch, sgb.d_gate, sgb.d_up)
+
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        if not saved.flash_stats:
+            raise Error("single_block direct OFT bwd: missing flash stats")
+        var fb = sdpa_flash_backward_f32[1, S, H, Dh](
+            saved.flash_q.value(), saved.flash_k.value(),
+            saved.flash_v.value(), saved.flash_o.value(),
+            saved.flash_stats.value(), d_att, scale, ctx,
+        )
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
+    else:
+        var sb = sdpa_backward_scratch[1, S, H, Dh](
+            saved.q_rope[], saved.k_rope[], saved.v[], d_att, scale, ctx, scratch,
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+
+    var d_q_rms = rope_backward(d_q_sb, cos, sin, True, ctx)
+    var d_k_rms = rope_backward(d_k_sb, cos, sin, True, ctx)
+    var d_q_pre_t = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre_t = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
+    var d_q_pre_flat = reshape_owned(d_q_pre_t^, [S, D])
+    var d_k_pre_flat = reshape_owned(d_k_pre_t^, [S, D])
+    reshape_in_place(d_v_sb, [S, D])
+    var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, d_v_sb, True)
+    var d_fused = concat(1, ctx, d_qkv, d_gate_up)
+
+    var qkv_grad = KleinDirectOFTGradT(None)
+    var d_norm_t: Tensor
+    if oft.qkv:
+        var bw_qkv = klein_direct_oft_projection_backward_optional(
+            d_fused, saved.norm[], w.w1[], oft.qkv, S, D, 3 * D + 2 * F, ctx,
+        )
+        d_norm_t = bw_qkv.d_x.clone(ctx)
+        qkv_grad = bw_qkv.oft.copy()
+    else:
+        d_norm_t = linear_backward_dx_split_scratch(
+            d_qkv, d_gate_up, w.w1[], S, D, 3 * D, 2 * F, ctx, scratch,
+        )
+
+    var mb = modulate_backward(d_norm_t, saved.ln[], mv.scale[], ctx, compute_aux_grads)
+    var d_scale = List[Float32]()
+    var d_shift = List[Float32]()
+    if compute_aux_grads:
+        d_scale = mb.d_scale.to_host(ctx)
+        d_shift = mb.d_shift.to_host(ctx)
+
+    var d_x_norm_t = layer_norm_backward_dx(mb.d_x, saved.x[], norm_ones, eps, ctx)
+    var d_x_t = add(grg.d_x, d_x_norm_t, ctx)
+    var out = SingleBlockDirectOFTGradsT(
+        TArc(d_x_t^), d_shift^, d_scale^, d_gate^, qkv_grad^, out_grad^,
     )
     scratch.rewind(scratch_mark)
     return out^

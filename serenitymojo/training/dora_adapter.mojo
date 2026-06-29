@@ -258,6 +258,16 @@ def dora_delta_weight(d: DoRAAdapter) raises -> List[Float32]:
     return dw^
 
 
+def _dora_delta_at(
+    a: List[Float32], b: List[Float32],
+    rank: Int, in_f: Int, o: Int, i: Int, scale: Float32,
+) -> Float32:
+    var acc = Float32(0.0)
+    for r in range(rank):
+        acc += b[o * rank + r] * a[r * in_f + i]
+    return acc * scale
+
+
 # ── the effective DoRA weight WP_dora = m * (WP / (‖WP‖.detach()+eps)) ────────
 # Returns (wp_dora:[out,in], den:[out]) — den is the (detached) per-row norm+eps,
 # returned so backward can reuse it without recompute. Mirrors apply_weight_decompose.
@@ -293,6 +303,66 @@ def dora_effective_weight(w_orig: List[Float32], d: DoRAAdapter) raises -> DoRAE
     return DoRAEff(wp_dora^, wp^, den^)
 
 
+def dora_substitution_denominators(w_orig: List[Float32], d: DoRAAdapter) raises -> List[Float32]:
+    """Detached DoRA denominator for a direct W_eff substitution path.
+
+    This is the non-carrier product direction: compute the per-axis norm of
+    W_orig + LoRA(A,B) without constructing the full `a=I` carrier. It is still a
+    host reference helper; model stacks should lower the same math into their
+    per-projection kernels.
+    """
+    if len(w_orig) != d.out_f * d.in_f:
+        raise Error("dora_substitution_denominators: w_orig numel mismatch")
+    var a = _bf16_to_f32_list(d.a)
+    var b = _bf16_to_f32_list(d.b)
+    var mlen = d.out_f if d.wd_on_out else d.in_f
+    var den = _zeros(mlen)
+    if d.wd_on_out:
+        for o in range(d.out_f):
+            var ss = Float32(0.0)
+            for i in range(d.in_f):
+                var wp = w_orig[o * d.in_f + i] + _dora_delta_at(
+                    a, b, d.rank, d.in_f, o, i, d.scale,
+                )
+                ss += wp * wp
+            den[o] = sqrt(ss) + d.eps
+    else:
+        for i in range(d.in_f):
+            var ss = Float32(0.0)
+            for o in range(d.out_f):
+                var wp = w_orig[o * d.in_f + i] + _dora_delta_at(
+                    a, b, d.rank, d.in_f, o, i, d.scale,
+                )
+                ss += wp * wp
+            den[i] = sqrt(ss) + d.eps
+    return den^
+
+
+def dora_substitution_forward(
+    x_h: List[Float32], w_orig: List[Float32], d: DoRAAdapter, M: Int,
+) raises -> List[Float32]:
+    """Forward for y = x @ W_eff^T without materializing a full-delta carrier."""
+    if len(x_h) != M * d.in_f:
+        raise Error("dora_substitution_forward: x numel mismatch")
+    if len(w_orig) != d.out_f * d.in_f:
+        raise Error("dora_substitution_forward: w_orig numel mismatch")
+    var a = _bf16_to_f32_list(d.a)
+    var b = _bf16_to_f32_list(d.b)
+    var den = dora_substitution_denominators(w_orig, d)
+    var y = _zeros(M * d.out_f)
+    for m in range(M):
+        for o in range(d.out_f):
+            var acc = Float32(0.0)
+            for i in range(d.in_f):
+                var k = o if d.wd_on_out else i
+                var wp = w_orig[o * d.in_f + i] + _dora_delta_at(
+                    a, b, d.rank, d.in_f, o, i, d.scale,
+                )
+                acc += x_h[m * d.in_f + i] * d.m[k] * wp / den[k]
+            y[m * d.out_f + o] = acc
+    return y^
+
+
 # ── forward: y = x @ WP_doraᵀ   x:[M,in] → [M,out] ───────────────────────────
 # Returns the FULL forward (DoRA replaces the effective weight; caller must NOT
 # add the base linear separately — dora.rs:56-60).
@@ -317,6 +387,55 @@ struct DoRAGrads(Copyable, Movable):
         self.d_b = d_b^
         self.d_m = d_m^
         self.d_x = d_x^
+
+
+def dora_substitution_backward(
+    d_y_h: List[Float32], x_h: List[Float32],
+    w_orig: List[Float32], d: DoRAAdapter, M: Int,
+) raises -> DoRAGrads:
+    """Backward for the direct W_eff substitution path.
+
+    This returns the same A/B/m/d_x gradients as `dora_backward`, but it avoids
+    the `a=I, b=W_eff-W` carrier and computes from per-linear x/d_y/W directly.
+    """
+    if len(d_y_h) != M * d.out_f:
+        raise Error("dora_substitution_backward: d_y numel mismatch")
+    if len(x_h) != M * d.in_f:
+        raise Error("dora_substitution_backward: x numel mismatch")
+    if len(w_orig) != d.out_f * d.in_f:
+        raise Error("dora_substitution_backward: w_orig numel mismatch")
+
+    var a = _bf16_to_f32_list(d.a)
+    var b = _bf16_to_f32_list(d.b)
+    var den = dora_substitution_denominators(w_orig, d)
+    var mlen = d.out_f if d.wd_on_out else d.in_f
+    var d_m = _zeros(mlen)
+    var d_wp = _zeros(d.out_f * d.in_f)
+    var d_x = _zeros(M * d.in_f)
+
+    for o in range(d.out_f):
+        for i in range(d.in_f):
+            var k = o if d.wd_on_out else i
+            var wp = w_orig[o * d.in_f + i] + _dora_delta_at(
+                a, b, d.rank, d.in_f, o, i, d.scale,
+            )
+            var d_wpdora = Float32(0.0)
+            for m in range(M):
+                d_wpdora += d_y_h[m * d.out_f + o] * x_h[m * d.in_f + i]
+            d_m[k] += d_wpdora * wp / den[k]
+            d_wp[o * d.in_f + i] = d_wpdora * d.m[k] / den[k]
+            var w_eff = d.m[k] * wp / den[k]
+            for m in range(M):
+                d_x[m * d.in_f + i] += d_y_h[m * d.out_f + o] * w_eff
+
+    var g = d_wp.copy()
+    for i in range(len(g)):
+        g[i] = g[i] * d.scale
+    var a_t = _transpose(a, d.rank, d.in_f)
+    var d_b = _matmul(g, d.out_f, d.in_f, a_t, d.in_f, d.rank)
+    var b_t = _transpose(b, d.out_f, d.rank)
+    var d_a = _matmul(b_t, d.rank, d.out_f, g, d.out_f, d.in_f)
+    return DoRAGrads(d_a^, d_b^, d_m^, d_x^)
 
 
 # Backward through y = x @ WP_doraᵀ with grad d_y:[M,out].

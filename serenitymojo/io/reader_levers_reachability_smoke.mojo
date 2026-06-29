@@ -30,7 +30,8 @@ from serenitymojo.training.train_config import (
     TRAIN_MODALITY_VIDEO, TRAIN_MODALITY_AV,
     LORA_TARGET_LEGACY_VIDEO_ATTN1, LORA_TARGET_LTX2_V2V,
     TRAIN_ADAPTER_ALGO_FULL, TRAIN_ADAPTER_ALGO_LOCON,
-    TRAIN_ADAPTER_ALGO_LOHA, TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_LOHA, TRAIN_ADAPTER_ALGO_DORA,
+    TRAIN_ADAPTER_ALGO_LOKR, TRAIN_ADAPTER_ALGO_OFT,
 )
 from std.memory import alloc
 
@@ -276,7 +277,29 @@ def _gate_adapter_aliases() raises:
     _write_file(lokr_path, String("{") + _ARCH + ',"network_algorithm":"lokr"}')
     var lokr = read_model_config(lokr_path)
     _eq("network_algorithm(lokr->4)", lokr.adapter_algo, TRAIN_ADAPTER_ALGO_LOKR)
-    print("  gate (d) PASS — lora/locon/loha/lokr aliases are reachable")
+
+    var dora_path = String("/tmp/reader_adapter_dora.json")
+    _write_file(dora_path, String("{") + _ARCH + ',"network_algorithm":"dora"}')
+    var dora = read_model_config(dora_path)
+    _eq("network_algorithm(dora->3)", dora.adapter_algo, TRAIN_ADAPTER_ALGO_DORA)
+
+    var oft_path = String("/tmp/reader_adapter_oft.json")
+    _write_file(oft_path, String("{") + _ARCH + ',"network_algorithm":"oft"}')
+    var oft = read_model_config(oft_path)
+    _eq("network_algorithm(oft->5)", oft.adapter_algo, TRAIN_ADAPTER_ALGO_OFT)
+
+    var boft_path = String("/tmp/reader_adapter_boft.json")
+    _write_file(boft_path, String("{") + _ARCH + ',"network_algorithm":"boft"}')
+    var boft_raised = False
+    try:
+        var boft = read_model_config(boft_path)
+        _ = boft.adapter_algo
+    except e:
+        boft_raised = True
+        print("  boft rejected as expected:", String(e))
+    if not boft_raised:
+        raise Error("gate (d) FAIL — boft did NOT raise")
+    print("  gate (d) PASS — lora/locon/loha/dora/lokr/oft aliases are reachable; boft is rejected")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

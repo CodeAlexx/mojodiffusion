@@ -738,6 +738,54 @@ def _stats_over_bf16_rows(
     return LokrOrgStats(sqrt(ss), mean, sqrt(varu))
 
 
+def _read_bf16_rows_f32(
+    st: SafeTensors, key: String, row0: Int, row1: Int
+) raises -> List[Float32]:
+    var info = st.tensor_info(key)
+    if info.dtype != STDtype.BF16:
+        raise Error(String("klein base weight: expected BF16 for ") + key)
+    if len(info.shape) != 2:
+        raise Error(String("klein base weight: expected 2D for ") + key)
+    var rows = info.shape[0]
+    var cols = info.shape[1]
+    if row1 > rows or row0 < 0 or row0 >= row1:
+        raise Error(String("klein base weight: bad row slice for ") + key)
+    var bytes = st.tensor_bytes(key)
+    var bp = bytes.unsafe_ptr().bitcast[BFloat16]()
+    var n = (row1 - row0) * cols
+    var base = row0 * cols
+    var out = List[Float32]()
+    for i in range(n):
+        out.append(bp[base + i].cast[DType.float32]())
+    return out^
+
+
+def klein_lokr_base_weight_f32(
+    st: SafeTensors, kind_double: Bool, block_idx: Int, slot: Int, D: Int, F: Int
+) raises -> List[Float32]:
+    """Read one frozen Klein projection weight as [out,in] F32 host values.
+
+    This mirrors klein_lokr_org_stats' key and fused-row mapping and is used by
+    full-delta carriers that need W_orig (DoRA/OFT). The checkpoint storage
+    boundary remains BF16; F32 here is host-side adapter math.
+    """
+    if kind_double:
+        var stream = String("img") if slot <= 5 else String("txt")
+        var s = slot if slot <= 5 else slot - 6
+        var b = String("double_blocks.") + String(block_idx) + "." + stream
+        if s <= 2:
+            return _read_bf16_rows_f32(st, b + "_attn.qkv.weight", s * D, (s + 1) * D)
+        if s == 3:
+            return _read_bf16_rows_f32(st, b + "_attn.proj.weight", 0, D)
+        if s == 4:
+            return _read_bf16_rows_f32(st, b + "_mlp.0.weight", 0, 2 * F)
+        return _read_bf16_rows_f32(st, b + "_mlp.2.weight", 0, D)
+    var sb = String("single_blocks.") + String(block_idx)
+    if slot == 0:
+        return _read_bf16_rows_f32(st, sb + ".linear1.weight", 0, 3 * D + 2 * F)
+    return _read_bf16_rows_f32(st, sb + ".linear2.weight", 0, D)
+
+
 def klein_lokr_org_stats(
     st: SafeTensors, kind_double: Bool, block_idx: Int, slot: Int, D: Int, F: Int
 ) raises -> LokrOrgStats:

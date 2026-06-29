@@ -64,7 +64,14 @@ from serenitymojo.models.ernie.lora_block import (
     ernie_lora_adapter_to_device,
     ernie_block_lora_forward, ernie_block_lora_backward,
     ernie_block_lora_forward_device_tensor, ernie_block_lora_backward_device_tensors,
+    ernie_block_direct_lycoris_forward_device_tensor,
+    ernie_block_direct_lycoris_backward_device_tensors,
     build_ernie_text_pad_mask_fwd, build_ernie_text_pad_mask_bwd,
+)
+from serenitymojo.models.zimage.lora_block import (
+    ZImageBlockDirectLycoris, ZImageDirectProjectionGrad,
+    ZImageBlockDirectGrads, ZIMAGE_DIRECT_ALGO_DORA,
+    ZIMAGE_DIRECT_ALGO_OFT,
 )
 from serenitymojo.models.ernie.ernie_stack import (
     ErnieStackForward, _zeros, _ones, _t, _linear_wdev, _linear_wdev_bias,
@@ -72,6 +79,12 @@ from serenitymojo.models.ernie.ernie_stack import (
 )
 
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectDoRAGrads,
+    FlatDirectOFTSet, FlatDirectOFTGrads,
+    empty_flat_direct_dora_set, empty_flat_direct_oft_set,
+)
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_onetrainer, load_lora_for_resume,
     save_lora_train_state, load_lora_train_state,
@@ -79,6 +92,16 @@ from serenitymojo.training.lora_save import (
 
 
 comptime TArc = ArcPointer[Tensor]
+
+
+def _t_bf16(vals: List[Float32], var shape: List[Int], ctx: DeviceContext) raises -> Tensor:
+    return Tensor.from_host(vals, shape^, STDtype.BF16, ctx)
+
+
+def _t_as(
+    vals: List[Float32], var shape: List[Int], dtype: STDtype, ctx: DeviceContext
+) raises -> Tensor:
+    return Tensor.from_host(vals, shape^, dtype, ctx)
 
 
 # ── adapter init (A small randn, B=0 — PEFT identity at step 0) ───────────────
@@ -327,6 +350,134 @@ def _ernie_tensor_grads_to_host(
         d_a_flat[flat] = _host_grad_slice(host, a_off[i], a_num[i])
         d_b_flat[flat] = _host_grad_slice(host, b_off[i], b_num[i])
     return _ErnieHostGradLists(d_a_flat^, d_b_flat^)
+
+
+def _ernie_direct_slots_per_block(targets: Int) raises -> Int:
+    if targets == 1:
+        return 4
+    if targets == 2:
+        return ERNIE_SLOTS
+    raise Error("ERNIE direct LyCORIS targets must be 1(attn) or 2(all)")
+
+
+def _ernie_direct_dora_for(
+    dora: FlatDirectDoRASet, bi: Int, targets: Int,
+) raises -> ZImageBlockDirectLycoris:
+    return ZImageBlockDirectLycoris(
+        ZIMAGE_DIRECT_ALGO_DORA, dora.copy(), empty_flat_direct_oft_set(),
+        bi * _ernie_direct_slots_per_block(targets), targets,
+    )
+
+
+def _ernie_direct_oft_for(
+    oft: FlatDirectOFTSet, bi: Int, targets: Int,
+) raises -> ZImageBlockDirectLycoris:
+    return ZImageBlockDirectLycoris(
+        ZIMAGE_DIRECT_ALGO_OFT, empty_flat_direct_dora_set(), oft.copy(),
+        bi * _ernie_direct_slots_per_block(targets), targets,
+    )
+
+
+def _ernie_empty_dora_grads_for(set: FlatDirectDoRASet, slot: Int) -> DoRAGrads:
+    ref ad = set.ad[slot]
+    return DoRAGrads(
+        _zeros(len(ad.a)), _zeros(len(ad.b)), _zeros(len(ad.m)), List[Float32](),
+    )
+
+
+def _ernie_direct_dora_zero_grads(set: FlatDirectDoRASet) -> FlatDirectDoRAGrads:
+    var out = List[DoRAGrads]()
+    for i in range(len(set.ad)):
+        out.append(_ernie_empty_dora_grads_for(set, i))
+    return FlatDirectDoRAGrads(out^)
+
+
+def _ernie_direct_oft_zero_grads(set: FlatDirectOFTSet) -> FlatDirectOFTGrads:
+    var out = List[List[Float32]]()
+    for i in range(len(set.ad)):
+        out.append(_zeros(len(set.ad[i].vec)))
+    return FlatDirectOFTGrads(out^)
+
+
+def _ernie_nonfinite(v: List[Float32]) -> Int:
+    var bad = 0
+    for i in range(len(v)):
+        var x = v[i]
+        if (x != x) or (x - x != Float32(0.0)):
+            bad += 1
+    return bad
+
+
+def _ernie_scatter_dora_slot(
+    mut grads: FlatDirectDoRAGrads, slot: Int, g: ZImageDirectProjectionGrad,
+) -> Int:
+    if slot < 0:
+        return 0
+    grads.g[slot] = DoRAGrads(
+        g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), List[Float32](),
+    )
+    return (
+        _ernie_nonfinite(g.d_a)
+        + _ernie_nonfinite(g.d_b)
+        + _ernie_nonfinite(g.d_m)
+    )
+
+
+def _ernie_scatter_oft_slot(
+    mut grads: FlatDirectOFTGrads, slot: Int, g: ZImageDirectProjectionGrad,
+) -> Int:
+    if slot < 0:
+        return 0
+    grads.d_vec[slot] = g.d_vec.copy()
+    return _ernie_nonfinite(g.d_vec)
+
+
+def _ernie_scatter_dora_block(
+    mut grads: FlatDirectDoRAGrads, direct: ZImageBlockDirectLycoris,
+    bg: ZImageBlockDirectGrads,
+) -> Int:
+    var bad = 0
+    bad += _ernie_scatter_dora_slot(grads, direct.q_slot, bg.q)
+    bad += _ernie_scatter_dora_slot(grads, direct.k_slot, bg.k)
+    bad += _ernie_scatter_dora_slot(grads, direct.v_slot, bg.v)
+    bad += _ernie_scatter_dora_slot(grads, direct.o_slot, bg.out_proj)
+    bad += _ernie_scatter_dora_slot(grads, direct.w1_slot, bg.w1)
+    bad += _ernie_scatter_dora_slot(grads, direct.w3_slot, bg.w3)
+    bad += _ernie_scatter_dora_slot(grads, direct.w2_slot, bg.w2)
+    return bad
+
+
+def _ernie_scatter_oft_block(
+    mut grads: FlatDirectOFTGrads, direct: ZImageBlockDirectLycoris,
+    bg: ZImageBlockDirectGrads,
+) -> Int:
+    var bad = 0
+    bad += _ernie_scatter_oft_slot(grads, direct.q_slot, bg.q)
+    bad += _ernie_scatter_oft_slot(grads, direct.k_slot, bg.k)
+    bad += _ernie_scatter_oft_slot(grads, direct.v_slot, bg.v)
+    bad += _ernie_scatter_oft_slot(grads, direct.o_slot, bg.out_proj)
+    bad += _ernie_scatter_oft_slot(grads, direct.w1_slot, bg.w1)
+    bad += _ernie_scatter_oft_slot(grads, direct.w3_slot, bg.w3)
+    bad += _ernie_scatter_oft_slot(grads, direct.w2_slot, bg.w2)
+    return bad
+
+
+struct ErnieDirectDoRABackward(Movable):
+    var grads: FlatDirectDoRAGrads
+    var nonfinite_grads: Int
+
+    def __init__(out self, var grads: FlatDirectDoRAGrads, nonfinite_grads: Int):
+        self.grads = grads^
+        self.nonfinite_grads = nonfinite_grads
+
+
+struct ErnieDirectOFTBackward(Movable):
+    var grads: FlatDirectOFTGrads
+    var nonfinite_grads: Int
+
+    def __init__(out self, var grads: FlatDirectOFTGrads, nonfinite_grads: Int):
+        self.grads = grads^
+        self.nonfinite_grads = nonfinite_grads
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -609,10 +760,10 @@ def ernie_stack_lora_forward_streamed_device[
 
     var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
     var img = linear(
-        _t(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+        _t_bf16(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
     )
     var no_txt_bias = Optional[Tensor](None)
-    var txt = linear(_t(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
+    var txt = linear(_t_bf16(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
     var x = concat(0, ctx, img, txt)
     var x_arc = TArc(x^)
 
@@ -627,10 +778,10 @@ def ernie_stack_lora_forward_streamed_device[
         x_arc = fwd.out.copy()
 
     var ln_x = layer_norm(
-        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+        x_arc[], _t_bf16(_ones(D), [D], ctx), _t_bf16(_zeros(D), [D], ctx), eps, ctx,
     )
     var x_out = modulate(
-        ln_x, _t(f_scale.copy(), [D], ctx), _t(f_shift.copy(), [D], ctx), ctx,
+        ln_x, _t_bf16(f_scale.copy(), [D], ctx), _t_bf16(f_shift.copy(), [D], ctx), ctx,
     )
     var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
     var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
@@ -657,10 +808,10 @@ def ernie_stack_lora_predict_streamed_device[
 
     var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
     var img = linear(
-        _t(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+        _t_bf16(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
     )
     var no_txt_bias = Optional[Tensor](None)
-    var txt = linear(_t(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
+    var txt = linear(_t_bf16(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
     var x = concat(0, ctx, img, txt)
     var x_arc = TArc(x^)
 
@@ -673,10 +824,10 @@ def ernie_stack_lora_predict_streamed_device[
         x_arc = fwd.out.copy()
 
     var ln_x = layer_norm(
-        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+        x_arc[], _t_bf16(_ones(D), [D], ctx), _t_bf16(_zeros(D), [D], ctx), eps, ctx,
     )
     var x_out = modulate(
-        ln_x, _t(f_scale.copy(), [D], ctx), _t(f_shift.copy(), [D], ctx), ctx,
+        ln_x, _t_bf16(f_scale.copy(), [D], ctx), _t_bf16(f_shift.copy(), [D], ctx), ctx,
     )
     var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
     var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
@@ -699,8 +850,8 @@ def ernie_stack_lora_backward_streamed_device[
 ) raises -> ErnieLoraGrads:
     var num_layers = lora.num_layers
 
-    var d_img = _t(d_out, [N_IMG, out_ch], ctx)
-    var d_txt = _t(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
+    var d_img = _t_bf16(d_out, [N_IMG, out_ch], ctx)
+    var d_txt = _t_bf16(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
     var d_patches = concat(0, ctx, d_img, d_txt)
 
     var d_x_out = linear_backward_dx(d_patches, base.final_lin_w[], S, D, out_ch, ctx)
@@ -770,10 +921,10 @@ def ernie_stack_lora_forward_resident_device[
 
     var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
     var img = linear(
-        _t(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+        _t_bf16(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
     )
     var no_txt_bias = Optional[Tensor](None)
-    var txt = linear(_t(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
+    var txt = linear(_t_bf16(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
     var x = concat(0, ctx, img, txt)
     var x_arc = TArc(x^)
 
@@ -798,10 +949,10 @@ def ernie_stack_lora_forward_resident_device[
         x_arc = fwd.out.copy()
 
     var ln_x = layer_norm(
-        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+        x_arc[], _t_bf16(_ones(D), [D], ctx), _t_bf16(_zeros(D), [D], ctx), eps, ctx,
     )
     var x_out = modulate(
-        ln_x, _t(f_scale.copy(), [D], ctx), _t(f_shift.copy(), [D], ctx), ctx,
+        ln_x, _t_bf16(f_scale.copy(), [D], ctx), _t_bf16(f_shift.copy(), [D], ctx), ctx,
     )
     var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
     var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
@@ -828,10 +979,10 @@ def ernie_stack_lora_predict_resident_device[
 
     var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
     var img = linear(
-        _t(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+        _t_bf16(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
     )
     var no_txt_bias = Optional[Tensor](None)
-    var txt = linear(_t(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
+    var txt = linear(_t_bf16(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[], no_txt_bias^, ctx)
     var x = concat(0, ctx, img, txt)
     var x_arc = TArc(x^)
 
@@ -843,10 +994,10 @@ def ernie_stack_lora_predict_resident_device[
         x_arc = fwd.out.copy()
 
     var ln_x = layer_norm(
-        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+        x_arc[], _t_bf16(_ones(D), [D], ctx), _t_bf16(_zeros(D), [D], ctx), eps, ctx,
     )
     var x_out = modulate(
-        ln_x, _t(f_scale.copy(), [D], ctx), _t(f_shift.copy(), [D], ctx), ctx,
+        ln_x, _t_bf16(f_scale.copy(), [D], ctx), _t_bf16(f_shift.copy(), [D], ctx), ctx,
     )
     var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
     var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
@@ -882,8 +1033,8 @@ def ernie_stack_lora_backward_resident_device[
             build_ernie_text_pad_mask_bwd(H, S, N_IMG, text_real_len, ctx)
         ))
 
-    var d_img = _t(d_out, [N_IMG, out_ch], ctx)
-    var d_txt = _t(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
+    var d_img = _t_bf16(d_out, [N_IMG, out_ch], ctx)
+    var d_txt = _t_bf16(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
     var d_patches = concat(0, ctx, d_img, d_txt)
 
     var d_x_out = linear_backward_dx(d_patches, base.final_lin_w[], S, D, out_ch, ctx)
@@ -945,6 +1096,256 @@ def ernie_stack_lora_backward_resident_device[
         d_shared_mod^, d_f_scale^, d_f_shift^, List[Float32](),
         nonfinite,
     )
+
+
+def ernie_stack_direct_dora_forward_resident_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, blocks: List[ErnieBlockWeights],
+    dora: FlatDirectDoRASet, targets: Int, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    text_real_len: Int = -1,
+) raises -> ErnieStackForward:
+    var num_layers = len(blocks)
+
+    var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
+    var img = linear(
+        _t_bf16(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+    )
+    var no_txt_bias = Optional[Tensor](None)
+    var txt = linear(
+        _t_bf16(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[],
+        no_txt_bias^, ctx,
+    )
+    var x = concat(0, ctx, img, txt)
+    var x_arc = TArc(x^)
+
+    var fwd_mask = Optional[TArc](None)
+    if text_real_len >= 0 and text_real_len < N_TXT:
+        fwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_fwd(H, S, N_IMG, text_real_len, x_arc[].dtype(), ctx)
+        ))
+
+    var blk_x_in = List[TArc]()
+    for bi in range(num_layers):
+        blk_x_in.append(x_arc.copy())
+        var direct = _ernie_direct_dora_for(dora, bi, targets)
+        var fwd = ernie_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), blocks[bi], mv, direct, cos, sin, D, F, eps, ctx,
+            fwd_mask.copy(),
+        )
+        x_arc = fwd.out.copy()
+
+    var ln_x = layer_norm(
+        x_arc[], _t_bf16(_ones(D), [D], ctx), _t_bf16(_zeros(D), [D], ctx), eps, ctx,
+    )
+    var x_out = modulate(
+        ln_x, _t_bf16(f_scale.copy(), [D], ctx),
+        _t_bf16(f_shift.copy(), [D], ctx), ctx,
+    )
+    var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
+    var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
+    var out_img = slice(patches, 0, 0, N_IMG, ctx).to_host(ctx)
+
+    return ErnieStackForward(
+        out_img^, List[Float32](), List[Float32](), blk_x_in^,
+        x_arc.copy(), TArc(ln_x^),
+    )
+
+
+def ernie_stack_direct_oft_forward_resident_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, blocks: List[ErnieBlockWeights],
+    oft: FlatDirectOFTSet, targets: Int, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    text_real_len: Int = -1,
+) raises -> ErnieStackForward:
+    var num_layers = len(blocks)
+
+    var img_bias = Optional[Tensor](base.patch_b[].clone(ctx))
+    var img = linear(
+        _t_bf16(img_tokens, [N_IMG, in_ch], ctx), base.patch_w[], img_bias^, ctx
+    )
+    var no_txt_bias = Optional[Tensor](None)
+    var txt = linear(
+        _t_bf16(txt_tokens, [N_TXT, text_in], ctx), base.text_proj[],
+        no_txt_bias^, ctx,
+    )
+    var x = concat(0, ctx, img, txt)
+    var x_arc = TArc(x^)
+
+    var fwd_mask = Optional[TArc](None)
+    if text_real_len >= 0 and text_real_len < N_TXT:
+        fwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_fwd(H, S, N_IMG, text_real_len, x_arc[].dtype(), ctx)
+        ))
+
+    var blk_x_in = List[TArc]()
+    for bi in range(num_layers):
+        blk_x_in.append(x_arc.copy())
+        var direct = _ernie_direct_oft_for(oft, bi, targets)
+        var fwd = ernie_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), blocks[bi], mv, direct, cos, sin, D, F, eps, ctx,
+            fwd_mask.copy(),
+        )
+        x_arc = fwd.out.copy()
+
+    var ln_x = layer_norm(
+        x_arc[], _t_bf16(_ones(D), [D], ctx), _t_bf16(_zeros(D), [D], ctx), eps, ctx,
+    )
+    var x_out = modulate(
+        ln_x, _t_bf16(f_scale.copy(), [D], ctx),
+        _t_bf16(f_shift.copy(), [D], ctx), ctx,
+    )
+    var final_bias = Optional[Tensor](base.final_lin_b[].clone(ctx))
+    var patches = linear(x_out, base.final_lin_w[], final_bias^, ctx)
+    var out_img = slice(patches, 0, 0, N_IMG, ctx).to_host(ctx)
+
+    return ErnieStackForward(
+        out_img^, List[Float32](), List[Float32](), blk_x_in^,
+        x_arc.copy(), TArc(ln_x^),
+    )
+
+
+def ernie_stack_direct_dora_backward_resident_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, blocks: List[ErnieBlockWeights],
+    dora: FlatDirectDoRASet, targets: Int, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    saved: ErnieStackForward,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    text_real_len: Int = -1,
+) raises -> ErnieDirectDoRABackward:
+    var num_layers = len(blocks)
+
+    var has_mask = text_real_len >= 0 and text_real_len < N_TXT
+    var fwd_mask = Optional[TArc](None)
+    var bwd_mask = Optional[TArc](None)
+    if has_mask:
+        bwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_bwd(H, S, N_IMG, text_real_len, ctx)
+        ))
+
+    var d_img = _t_bf16(d_out, [N_IMG, out_ch], ctx)
+    var d_txt = _t_bf16(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
+    var d_patches = concat(0, ctx, d_img, d_txt)
+
+    var d_x_out = linear_backward_dx(d_patches, base.final_lin_w[], S, D, out_ch, ctx)
+    var mbf = modulate_backward(
+        cast_tensor(d_x_out, saved.ln_x[].dtype(), ctx, False),
+        saved.ln_x[], _t_as(f_scale.copy(), [D], saved.ln_x[].dtype(), ctx), ctx,
+    )
+    var d_x_final = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t_as(_ones(D), [D], saved.x_final[].dtype(), ctx), eps, ctx,
+    )
+    var d_x_arc = TArc(d_x_final^)
+
+    var direct_grads = _ernie_direct_dora_zero_grads(dora)
+    var nonfinite = 0
+
+    if has_mask and num_layers > 0:
+        fwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_fwd(
+                H, S, N_IMG, text_real_len, saved.blk_x_in[0][].dtype(), ctx
+            )
+        ))
+
+    var bi = num_layers - 1
+    while bi >= 0:
+        var direct = _ernie_direct_dora_for(dora, bi, targets)
+        var refwd = ernie_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            saved.blk_x_in[bi].copy(), blocks[bi], mv, direct,
+            cos, sin, D, F, eps, ctx, fwd_mask.copy(),
+        )
+        var bg = ernie_block_direct_lycoris_backward_device_tensors[H, Dh, S](
+            d_x_arc[], blocks[bi], mv, direct, refwd.saved,
+            cos, sin, D, F, eps, ctx, bwd_mask.copy(),
+        )
+        d_x_arc = bg.d_x.copy()
+        nonfinite += _ernie_scatter_dora_block(direct_grads, direct, bg.grads)
+        bi -= 1
+
+    return ErnieDirectDoRABackward(direct_grads^, nonfinite)
+
+
+def ernie_stack_direct_oft_backward_resident_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ErnieStackBase, blocks: List[ErnieBlockWeights],
+    oft: FlatDirectOFTSet, targets: Int, mv: ErnieModVecs,
+    f_scale: List[Float32], f_shift: List[Float32],
+    cos: Tensor, sin: Tensor,
+    saved: ErnieStackForward,
+    D: Int, F: Int, in_ch: Int, text_in: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+    text_real_len: Int = -1,
+) raises -> ErnieDirectOFTBackward:
+    var num_layers = len(blocks)
+
+    var has_mask = text_real_len >= 0 and text_real_len < N_TXT
+    var fwd_mask = Optional[TArc](None)
+    var bwd_mask = Optional[TArc](None)
+    if has_mask:
+        bwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_bwd(H, S, N_IMG, text_real_len, ctx)
+        ))
+
+    var d_img = _t_bf16(d_out, [N_IMG, out_ch], ctx)
+    var d_txt = _t_bf16(_zeros(N_TXT * out_ch), [N_TXT, out_ch], ctx)
+    var d_patches = concat(0, ctx, d_img, d_txt)
+
+    var d_x_out = linear_backward_dx(d_patches, base.final_lin_w[], S, D, out_ch, ctx)
+    var mbf = modulate_backward(
+        cast_tensor(d_x_out, saved.ln_x[].dtype(), ctx, False),
+        saved.ln_x[], _t_as(f_scale.copy(), [D], saved.ln_x[].dtype(), ctx), ctx,
+    )
+    var d_x_final = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t_as(_ones(D), [D], saved.x_final[].dtype(), ctx), eps, ctx,
+    )
+    var d_x_arc = TArc(d_x_final^)
+
+    var direct_grads = _ernie_direct_oft_zero_grads(oft)
+    var nonfinite = 0
+
+    if has_mask and num_layers > 0:
+        fwd_mask = Optional[TArc](TArc(
+            build_ernie_text_pad_mask_fwd(
+                H, S, N_IMG, text_real_len, saved.blk_x_in[0][].dtype(), ctx
+            )
+        ))
+
+    var bi = num_layers - 1
+    while bi >= 0:
+        var direct = _ernie_direct_oft_for(oft, bi, targets)
+        var refwd = ernie_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            saved.blk_x_in[bi].copy(), blocks[bi], mv, direct,
+            cos, sin, D, F, eps, ctx, fwd_mask.copy(),
+        )
+        var bg = ernie_block_direct_lycoris_backward_device_tensors[H, Dh, S](
+            d_x_arc[], blocks[bi], mv, direct, refwd.saved,
+            cos, sin, D, F, eps, ctx, bwd_mask.copy(),
+        )
+        d_x_arc = bg.d_x.copy()
+        nonfinite += _ernie_scatter_oft_block(direct_grads, direct, bg.grads)
+        bi -= 1
+
+    return ErnieDirectOFTBackward(direct_grads^, nonfinite)
 
 
 # ── AdamW step on EVERY adapter (reuses the proven per-adapter _lora_adamw) ───

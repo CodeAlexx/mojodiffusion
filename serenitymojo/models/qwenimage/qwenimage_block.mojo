@@ -61,6 +61,7 @@ from std.math import sqrt
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 
 # ── forward ops (GPU) ────────────────────────────────────────────────────────
 from serenitymojo.ops.linear import linear
@@ -74,7 +75,7 @@ from serenitymojo.ops.tensor_algebra import (
 )
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
-from serenitymojo.ops.linalg_backward import linear_backward, LinearGrads
+from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx, LinearGrads
 from serenitymojo.ops.norm_backward import (
     rms_norm_backward, RmsNormBackward,
     layer_norm_backward, LayerNormBackward,
@@ -792,6 +793,16 @@ def double_block_backward[
 from serenitymojo.models.klein.lora_block import (
     LoraAdapter, klein_lora_fwd, klein_lora_bwd, KleinLoraGrads,
 )
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectOFTSet,
+)
+from serenitymojo.training.dora_substitution_device import (
+    dora_device_from_host, dora_substitution_forward_device,
+    dora_substitution_backward_device,
+)
+from serenitymojo.training.oft_onetrainer_device import (
+    oft_ot_rotate_b4, oft_ot_rotate_backward_b4,
+)
 
 
 # Optional LoRA adapters for one stream's six trained projections.
@@ -894,6 +905,634 @@ struct DoubleBlockLoraForward(Copyable, Movable):
 
 def _empty() -> List[Float32]:
     return List[Float32]()
+
+
+comptime QWEN_DIRECT_ALGO_DORA = 1
+comptime QWEN_DIRECT_ALGO_OFT = 2
+comptime QWEN_DIRECT_TGT_ATTN = 1
+comptime QWEN_DIRECT_TGT_ALL = 2
+comptime QD_IMG_Q = 0
+comptime QD_IMG_K = 1
+comptime QD_IMG_V = 2
+comptime QD_IMG_OUT = 3
+comptime QD_IMG_FF_UP = 4
+comptime QD_IMG_FF_DOWN = 5
+comptime QD_TXT_Q = 6
+comptime QD_TXT_K = 7
+comptime QD_TXT_V = 8
+comptime QD_TXT_OUT = 9
+comptime QD_TXT_FF_UP = 10
+comptime QD_TXT_FF_DOWN = 11
+
+
+def _qwen_direct_slot_targeted(slot: Int, targets: Int) raises -> Bool:
+    if targets < QWEN_DIRECT_TGT_ATTN or targets > QWEN_DIRECT_TGT_ALL:
+        raise Error("QwenBlockDirectLycoris: targets must be 1(attn)|2(all)")
+    var s = slot % 12
+    if s <= QD_IMG_OUT or (s >= QD_TXT_Q and s <= QD_TXT_OUT):
+        return targets >= QWEN_DIRECT_TGT_ATTN
+    return targets >= QWEN_DIRECT_TGT_ALL
+
+
+struct QwenBlockDirectLycoris(Copyable, Movable):
+    var algo: Int
+    var dora: FlatDirectDoRASet
+    var oft: FlatDirectOFTSet
+    var img_q_slot: Int
+    var img_k_slot: Int
+    var img_v_slot: Int
+    var img_out_slot: Int
+    var img_ff_up_slot: Int
+    var img_ff_down_slot: Int
+    var txt_q_slot: Int
+    var txt_k_slot: Int
+    var txt_v_slot: Int
+    var txt_out_slot: Int
+    var txt_ff_up_slot: Int
+    var txt_ff_down_slot: Int
+
+    def __init__(
+        out self, algo: Int, var dora: FlatDirectDoRASet,
+        var oft: FlatDirectOFTSet, base_slot: Int, targets: Int,
+    ) raises:
+        var img_q = -1
+        var img_k = -1
+        var img_v = -1
+        var img_out = -1
+        var img_ff_up = -1
+        var img_ff_down = -1
+        var txt_q = -1
+        var txt_k = -1
+        var txt_v = -1
+        var txt_out = -1
+        var txt_ff_up = -1
+        var txt_ff_down = -1
+        var compact = base_slot
+        for slot in range(12):
+            if not _qwen_direct_slot_targeted(slot, targets):
+                continue
+            if slot == QD_IMG_Q:
+                img_q = compact
+            elif slot == QD_IMG_K:
+                img_k = compact
+            elif slot == QD_IMG_V:
+                img_v = compact
+            elif slot == QD_IMG_OUT:
+                img_out = compact
+            elif slot == QD_IMG_FF_UP:
+                img_ff_up = compact
+            elif slot == QD_IMG_FF_DOWN:
+                img_ff_down = compact
+            elif slot == QD_TXT_Q:
+                txt_q = compact
+            elif slot == QD_TXT_K:
+                txt_k = compact
+            elif slot == QD_TXT_V:
+                txt_v = compact
+            elif slot == QD_TXT_OUT:
+                txt_out = compact
+            elif slot == QD_TXT_FF_UP:
+                txt_ff_up = compact
+            elif slot == QD_TXT_FF_DOWN:
+                txt_ff_down = compact
+            compact += 1
+        self.algo = algo
+        self.dora = dora^
+        self.oft = oft^
+        self.img_q_slot = img_q
+        self.img_k_slot = img_k
+        self.img_v_slot = img_v
+        self.img_out_slot = img_out
+        self.img_ff_up_slot = img_ff_up
+        self.img_ff_down_slot = img_ff_down
+        self.txt_q_slot = txt_q
+        self.txt_k_slot = txt_k
+        self.txt_v_slot = txt_v
+        self.txt_out_slot = txt_out
+        self.txt_ff_up_slot = txt_ff_up
+        self.txt_ff_down_slot = txt_ff_down
+
+
+def _qwen_direct_flat_slot(direct: QwenBlockDirectLycoris, slot: Int) raises -> Int:
+    if slot == QD_IMG_Q:
+        return direct.img_q_slot
+    if slot == QD_IMG_K:
+        return direct.img_k_slot
+    if slot == QD_IMG_V:
+        return direct.img_v_slot
+    if slot == QD_IMG_OUT:
+        return direct.img_out_slot
+    if slot == QD_IMG_FF_UP:
+        return direct.img_ff_up_slot
+    if slot == QD_IMG_FF_DOWN:
+        return direct.img_ff_down_slot
+    if slot == QD_TXT_Q:
+        return direct.txt_q_slot
+    if slot == QD_TXT_K:
+        return direct.txt_k_slot
+    if slot == QD_TXT_V:
+        return direct.txt_v_slot
+    if slot == QD_TXT_OUT:
+        return direct.txt_out_slot
+    if slot == QD_TXT_FF_UP:
+        return direct.txt_ff_up_slot
+    if slot == QD_TXT_FF_DOWN:
+        return direct.txt_ff_down_slot
+    raise Error("QwenBlockDirectLycoris: bad direct slot")
+
+
+struct QwenDirectProjectionGrad(Copyable, Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+    var d_m: List[Float32]
+    var d_vec: List[Float32]
+
+    def __init__(
+        out self, var d_a: List[Float32], var d_b: List[Float32],
+        var d_m: List[Float32], var d_vec: List[Float32],
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_m = d_m^
+        self.d_vec = d_vec^
+
+
+struct _QwenDirectProjectionGradDev(Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+    var d_m: List[Float32]
+    var d_vec: List[Float32]
+    var d_x: TArc
+
+    def __init__(
+        out self, var d_a: List[Float32], var d_b: List[Float32],
+        var d_m: List[Float32], var d_vec: List[Float32], var d_x: TArc,
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_m = d_m^
+        self.d_vec = d_vec^
+        self.d_x = d_x^
+
+
+def _qwen_direct_grad_public(g: _QwenDirectProjectionGradDev) -> QwenDirectProjectionGrad:
+    return QwenDirectProjectionGrad(
+        g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), g.d_vec.copy(),
+    )
+
+
+struct QwenStreamDirectLycorisGrads(Copyable, Movable):
+    var d_x: List[Float32]
+    var q: QwenDirectProjectionGrad
+    var k: QwenDirectProjectionGrad
+    var v: QwenDirectProjectionGrad
+    var out_proj: QwenDirectProjectionGrad
+    var ff_up: QwenDirectProjectionGrad
+    var ff_down: QwenDirectProjectionGrad
+
+    def __init__(
+        out self, var d_x: List[Float32],
+        var q: QwenDirectProjectionGrad, var k: QwenDirectProjectionGrad,
+        var v: QwenDirectProjectionGrad, var out_g: QwenDirectProjectionGrad,
+        var ff_up: QwenDirectProjectionGrad, var ff_down: QwenDirectProjectionGrad,
+    ):
+        self.d_x = d_x^
+        self.q = q^
+        self.k = k^
+        self.v = v^
+        self.out_proj = out_g^
+        self.ff_up = ff_up^
+        self.ff_down = ff_down^
+
+
+struct QwenBlockDirectLycorisGrads(Copyable, Movable):
+    var img: QwenStreamDirectLycorisGrads
+    var txt: QwenStreamDirectLycorisGrads
+
+    def __init__(
+        out self,
+        var img: QwenStreamDirectLycorisGrads,
+        var txt: QwenStreamDirectLycorisGrads,
+    ):
+        self.img = img^
+        self.txt = txt^
+
+
+struct DoubleBlockDirectLycorisForward(Copyable, Movable):
+    var img_out: List[Float32]
+    var txt_out: List[Float32]
+    var saved: DoubleBlockSaved
+
+    def __init__(
+        out self, var img_out: List[Float32], var txt_out: List[Float32],
+        var saved: DoubleBlockSaved,
+    ):
+        self.img_out = img_out^
+        self.txt_out = txt_out^
+        self.saved = saved^
+
+
+def _add_optional_bias(y: Tensor, bias: Tensor, ctx: DeviceContext) raises -> Tensor:
+    if bias.dtype() != y.dtype():
+        var bc = cast_tensor(bias, y.dtype(), ctx)
+        return add(y, bc, ctx)
+    return add(y, bias, ctx)
+
+
+def _qwen_oft_vec_tensor(
+    set: FlatDirectOFTSet, slot: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    if slot < 0 or slot >= len(set.ad):
+        raise Error("QwenBlockDirectLycoris OFT: slot out of range")
+    if not set.active[slot]:
+        raise Error("QwenBlockDirectLycoris OFT: inactive slot")
+    ref sl = set.ad[slot]
+    if sl.b != 4:
+        raise Error("QwenBlockDirectLycoris OFT: only block_size=4 is wired on GPU")
+    return Tensor.from_host(sl.vec.copy(), [sl.r, 6], STDtype.F32, ctx)
+
+
+def _direct_proj_fwd_device(
+    direct: QwenBlockDirectLycoris, slot: Int,
+    x: Tensor, w_orig: Tensor, bias: Tensor,
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var flat_slot = _qwen_direct_flat_slot(direct, slot)
+    if flat_slot < 0:
+        return linear(x, w_orig, Optional[Tensor](_clone_t(bias, ctx)), ctx)
+    if direct.algo == QWEN_DIRECT_ALGO_DORA:
+        if flat_slot >= len(direct.dora.ad):
+            raise Error("QwenBlockDirectLycoris DoRA: slot out of range")
+        if not direct.dora.active[flat_slot]:
+            raise Error("QwenBlockDirectLycoris DoRA: inactive slot")
+        if direct.dora.ad[flat_slot].in_f != in_f or direct.dora.ad[flat_slot].out_f != out_f:
+            raise Error("QwenBlockDirectLycoris DoRA: slot shape mismatch")
+        var dev = dora_device_from_host(direct.dora.ad[flat_slot], ctx)
+        var y = dora_substitution_forward_device(x, w_orig, dev, ctx)
+        return _add_optional_bias(y^, bias, ctx)
+    if direct.algo == QWEN_DIRECT_ALGO_OFT:
+        if flat_slot >= len(direct.oft.ad):
+            raise Error("QwenBlockDirectLycoris OFT: slot out of range")
+        if direct.oft.ad[flat_slot].in_f != in_f or direct.oft.ad[flat_slot].out_f != out_f:
+            raise Error("QwenBlockDirectLycoris OFT: slot shape mismatch")
+        var vec = _qwen_oft_vec_tensor(direct.oft, flat_slot, ctx)
+        var x_rot = oft_ot_rotate_b4(x, vec, ctx)
+        return linear(x_rot, w_orig, Optional[Tensor](_clone_t(bias, ctx)), ctx)
+    raise Error("QwenBlockDirectLycoris: unsupported direct algorithm")
+
+
+def _direct_proj_bwd_device(
+    direct: QwenBlockDirectLycoris, slot: Int,
+    d_y: Tensor, x: Tensor, w_orig: Tensor,
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> _QwenDirectProjectionGradDev:
+    var flat_slot = _qwen_direct_flat_slot(direct, slot)
+    if flat_slot < 0:
+        var dx = linear_backward_dx(d_y, w_orig, M, in_f, out_f, ctx)
+        return _QwenDirectProjectionGradDev(
+            _empty(), _empty(), _empty(), _empty(), TArc(dx^),
+        )
+    if direct.algo == QWEN_DIRECT_ALGO_DORA:
+        if flat_slot >= len(direct.dora.ad):
+            raise Error("QwenBlockDirectLycoris DoRA backward: slot out of range")
+        if not direct.dora.active[flat_slot]:
+            raise Error("QwenBlockDirectLycoris DoRA backward: inactive slot")
+        if direct.dora.ad[flat_slot].in_f != in_f or direct.dora.ad[flat_slot].out_f != out_f:
+            raise Error("QwenBlockDirectLycoris DoRA backward: slot shape mismatch")
+        var dev = dora_device_from_host(direct.dora.ad[flat_slot], ctx)
+        var g = dora_substitution_backward_device(d_y, x, w_orig, dev, ctx)
+        return _QwenDirectProjectionGradDev(
+            g.d_a.to_host(ctx), g.d_b.to_host(ctx), g.d_m.to_host(ctx),
+            _empty(), TArc(g.d_x.clone(ctx)),
+        )
+    if direct.algo == QWEN_DIRECT_ALGO_OFT:
+        if flat_slot >= len(direct.oft.ad):
+            raise Error("QwenBlockDirectLycoris OFT backward: slot out of range")
+        if direct.oft.ad[flat_slot].in_f != in_f or direct.oft.ad[flat_slot].out_f != out_f:
+            raise Error("QwenBlockDirectLycoris OFT backward: slot shape mismatch")
+        var vec = _qwen_oft_vec_tensor(direct.oft, flat_slot, ctx)
+        var d_x_rot = linear_backward_dx(d_y, w_orig, M, in_f, out_f, ctx)
+        if d_x_rot.dtype() != x.dtype():
+            d_x_rot = cast_tensor(d_x_rot^, x.dtype(), ctx)
+        if d_x_rot.shape() != x.shape():
+            d_x_rot = reshape_owned(d_x_rot^, x.shape())
+        var g = oft_ot_rotate_backward_b4(d_x_rot^, x, vec, ctx)
+        return _QwenDirectProjectionGradDev(
+            _empty(), _empty(), _empty(), g.d_vec.to_host(ctx), TArc(g.d_x.clone(ctx)),
+        )
+    raise Error("QwenBlockDirectLycoris: unsupported direct algorithm")
+
+
+def _stream_pre_direct[
+    H: Int, Dh: Int
+](
+    x: TArc, w: StreamWeights, mv: ModVecs, direct: QwenBlockDirectLycoris,
+    q_slot: Int, k_slot: Int, v_slot: Int,
+    N: Int, D: Int, eps: Float32, ones: Tensor, zeros: Tensor, ctx: DeviceContext,
+) raises -> _StreamPre:
+    var ln1 = layer_norm(x[], ones, zeros, eps, ctx)
+    var normed = modulate(
+        ln1, _t(mv.scale1.copy(), [D], ctx), _t(mv.shift1.copy(), [D], ctx), ctx
+    )
+    var q_flat = _direct_proj_fwd_device(
+        direct, q_slot, normed, w.wq[], w.bq[], N, D, D, ctx,
+    )
+    var k_flat = _direct_proj_fwd_device(
+        direct, k_slot, normed, w.wk[], w.bk[], N, D, D, ctx,
+    )
+    var v_flat = _direct_proj_fwd_device(
+        direct, v_slot, normed, w.wv[], w.bv[], N, D, D, ctx,
+    )
+    var q_pre = reshape_owned(q_flat^, [1, N, H, Dh])
+    var k_pre = reshape_owned(k_flat^, [1, N, H, Dh])
+    var v = reshape_owned(v_flat^, [1, N, H, Dh])
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+    return _StreamPre(
+        TArc(ln1^), TArc(normed^), TArc(q_pre^), TArc(k_pre^),
+        TArc(q_rms^), TArc(k_rms^), TArc(v^),
+    )
+
+
+def _stream_post_direct(
+    x: TArc, att: TArc, w: StreamWeights, mv: ModVecs,
+    direct: QwenBlockDirectLycoris, out_slot: Int, ff_up_slot: Int, ff_down_slot: Int,
+    N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, zeros: Tensor,
+    ctx: DeviceContext,
+) raises -> _StreamPost:
+    var out = _direct_proj_fwd_device(
+        direct, out_slot, att[], w.wout[], w.bout[], N, D, D, ctx,
+    )
+    var attn_res = residual_gate(x[], _t(mv.gate1.copy(), [D], ctx), out, ctx)
+    var ln2 = layer_norm(attn_res, ones, zeros, eps, ctx)
+    var ff_in = modulate(
+        ln2, _t(mv.scale2.copy(), [D], ctx), _t(mv.shift2.copy(), [D], ctx), ctx
+    )
+    var ff_up = _direct_proj_fwd_device(
+        direct, ff_up_slot, ff_in, w.wup[], w.bup[], N, D, F, ctx,
+    )
+    var ff_act = gelu(ff_up, ctx)
+    var ff_down = _direct_proj_fwd_device(
+        direct, ff_down_slot, ff_act, w.wdn[], w.bdn[], N, F, D, ctx,
+    )
+    var final = residual_gate(attn_res, _t(mv.gate2.copy(), [D], ctx), ff_down, ctx)
+    return _StreamPost(
+        TArc(final^), TArc(attn_res^), TArc(ln2^), TArc(ff_in^),
+        TArc(ff_up^), TArc(ff_act^),
+    )
+
+
+def double_block_direct_lycoris_forward[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img: List[Float32], txt: List[Float32],
+    w: DoubleBlockWeights, img_mod: ModVecs, txt_mod: ModVecs,
+    direct: QwenBlockDirectLycoris,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> DoubleBlockDirectLycorisForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t(_ones(D), [D], ctx)
+    var zeros_t = _t(_zeros(D), [D], ctx)
+
+    var img_x = _ta(img, [N_IMG, D], ctx)
+    var txt_x = _ta(txt, [N_TXT, D], ctx)
+
+    var ip = _stream_pre_direct[H, Dh](
+        img_x, w.img, img_mod, direct,
+        QD_IMG_Q, QD_IMG_K, QD_IMG_V,
+        N_IMG, D, eps, ones_t, zeros_t, ctx,
+    )
+    var tp = _stream_pre_direct[H, Dh](
+        txt_x, w.txt, txt_mod, direct,
+        QD_TXT_Q, QD_TXT_K, QD_TXT_V,
+        N_TXT, D, eps, ones_t, zeros_t, ctx,
+    )
+
+    var q = concat(1, ctx, tp.q_rms[], ip.q_rms[])
+    var k = concat(1, ctx, tp.k_rms[], ip.k_rms[])
+    var v = concat(1, ctx, tp.v[], ip.v[])
+
+    var q_rope = rope_interleaved(q, cos, sin, ctx)
+    var k_rope = rope_interleaved(k, cos, sin, ctx)
+    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+
+    var txt_att_4d = slice(att, 1, 0, N_TXT, ctx)
+    var img_att_4d = slice(att, 1, N_TXT, N_IMG, ctx)
+    var txt_att = TArc(reshape_owned(txt_att_4d^, [N_TXT, D]))
+    var img_att = TArc(reshape_owned(img_att_4d^, [N_IMG, D]))
+
+    var ipost = _stream_post_direct(
+        img_x, img_att, w.img, img_mod, direct,
+        QD_IMG_OUT, QD_IMG_FF_UP, QD_IMG_FF_DOWN,
+        N_IMG, D, F, eps, ones_t, zeros_t, ctx,
+    )
+    var tpost = _stream_post_direct(
+        txt_x, txt_att, w.txt, txt_mod, direct,
+        QD_TXT_OUT, QD_TXT_FF_UP, QD_TXT_FF_DOWN,
+        N_TXT, D, F, eps, ones_t, zeros_t, ctx,
+    )
+
+    var img_saved = _make_saved(img_x, ip, img_att, ipost)
+    var txt_saved = _make_saved(txt_x, tp, txt_att, tpost)
+    var saved = DoubleBlockSaved(
+        img_saved^, txt_saved^, TArc(q_rope^), TArc(k_rope^), TArc(v^)
+    )
+
+    var img_out = ipost.out[].to_host(ctx)
+    var txt_out = tpost.out[].to_host(ctx)
+    return DoubleBlockDirectLycorisForward(img_out^, txt_out^, saved^)
+
+
+struct _StreamPostBackDirect(Movable):
+    var d_x: TArc
+    var d_att: TArc
+    var out_g: _QwenDirectProjectionGradDev
+    var ff_up_g: _QwenDirectProjectionGradDev
+    var ff_down_g: _QwenDirectProjectionGradDev
+
+    def __init__(
+        out self, var d_x: TArc, var d_att: TArc,
+        var out_g: _QwenDirectProjectionGradDev,
+        var ff_up_g: _QwenDirectProjectionGradDev,
+        var ff_down_g: _QwenDirectProjectionGradDev,
+    ):
+        self.d_x = d_x^
+        self.d_att = d_att^
+        self.out_g = out_g^
+        self.ff_up_g = ff_up_g^
+        self.ff_down_g = ff_down_g^
+
+
+def _stream_post_backward_direct(
+    d_out: TArc, x: TArc, att: TArc,
+    w: StreamWeights, mv: ModVecs, direct: QwenBlockDirectLycoris,
+    sv: StreamSaved,
+    out_slot: Int, ff_up_slot: Int, ff_down_slot: Int,
+    N: Int, D: Int, F: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
+) raises -> _StreamPostBackDirect:
+    var ff_down = _direct_proj_fwd_device(
+        direct, ff_down_slot, sv.ff_act[], w.wdn[], w.bdn[], N, F, D, ctx,
+    )
+    var grg2 = gate_residual_backward(
+        d_out[], sv.attn_res[], _t(mv.gate2.copy(), [D], ctx), ff_down, ctx
+    )
+
+    var ff_down_g = _direct_proj_bwd_device(
+        direct, ff_down_slot, grg2.d_y, sv.ff_act[], w.wdn[], N, F, D, ctx,
+    )
+    var d_ff_up = gelu_backward(ff_down_g.d_x[], sv.ff_up[], ctx)
+
+    var ff_up_g = _direct_proj_bwd_device(
+        direct, ff_up_slot, d_ff_up, sv.ff_in[], w.wup[], N, D, F, ctx,
+    )
+
+    var mb2 = modulate_backward(ff_up_g.d_x[], sv.ln2[], _t(mv.scale2.copy(), [D], ctx), ctx)
+    var lnb2 = layer_norm_backward(mb2.d_x, sv.attn_res[], ones, eps, ctx)
+    var d_attn_res_total = TArc(add(grg2.d_x, lnb2.d_x, ctx))
+
+    var out_proj = _direct_proj_fwd_device(
+        direct, out_slot, att[], w.wout[], w.bout[], N, D, D, ctx,
+    )
+    var grg1 = gate_residual_backward(
+        d_attn_res_total[], x[], _t(mv.gate1.copy(), [D], ctx), out_proj, ctx
+    )
+    var out_g = _direct_proj_bwd_device(
+        direct, out_slot, grg1.d_y, att[], w.wout[], N, D, D, ctx,
+    )
+    return _StreamPostBackDirect(
+        TArc(grg1.d_x.clone(ctx)), out_g.d_x.copy(),
+        out_g^, ff_up_g^, ff_down_g^,
+    )
+
+
+struct _StreamPreBackDirect(Movable):
+    var d_x: TArc
+    var q_g: _QwenDirectProjectionGradDev
+    var k_g: _QwenDirectProjectionGradDev
+    var v_g: _QwenDirectProjectionGradDev
+
+    def __init__(
+        out self, var d_x: TArc,
+        var q_g: _QwenDirectProjectionGradDev,
+        var k_g: _QwenDirectProjectionGradDev,
+        var v_g: _QwenDirectProjectionGradDev,
+    ):
+        self.d_x = d_x^
+        self.q_g = q_g^
+        self.k_g = k_g^
+        self.v_g = v_g^
+
+
+def _stream_pre_backward_direct[
+    H: Int, Dh: Int
+](
+    d_q_rms: Tensor, d_k_rms: Tensor, d_v: Tensor,
+    w: StreamWeights, mv: ModVecs, direct: QwenBlockDirectLycoris,
+    sv: StreamSaved, q_slot: Int, k_slot: Int, v_slot: Int,
+    N: Int, D: Int, eps: Float32, ones: Tensor, ctx: DeviceContext,
+) raises -> _StreamPreBackDirect:
+    var rb_q = rms_norm_backward(d_q_rms, sv.q_pre[], w.q_norm[], eps, ctx)
+    var rb_k = rms_norm_backward(d_k_rms, sv.k_pre[], w.k_norm[], eps, ctx)
+
+    reshape_in_place(rb_q.d_x, [N, D])
+    reshape_in_place(rb_k.d_x, [N, D])
+    var d_v_flat = reshape(d_v, [N, D], ctx)
+
+    var q_g = _direct_proj_bwd_device(
+        direct, q_slot, rb_q.d_x, sv.normed[], w.wq[], N, D, D, ctx,
+    )
+    var k_g = _direct_proj_bwd_device(
+        direct, k_slot, rb_k.d_x, sv.normed[], w.wk[], N, D, D, ctx,
+    )
+    var v_g = _direct_proj_bwd_device(
+        direct, v_slot, d_v_flat, sv.normed[], w.wv[], N, D, D, ctx,
+    )
+    var d_normed = TArc(add(add(q_g.d_x[], k_g.d_x[], ctx), v_g.d_x[], ctx))
+
+    var mb1 = modulate_backward(d_normed[], sv.ln1[], _t(mv.scale1.copy(), [D], ctx), ctx)
+    var lnb1 = layer_norm_backward(mb1.d_x, sv.x[], ones, eps, ctx)
+    return _StreamPreBackDirect(
+        TArc(lnb1.d_x.clone(ctx)), q_g^, k_g^, v_g^,
+    )
+
+
+def double_block_direct_lycoris_backward[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_img_out: List[Float32], d_txt_out: List[Float32],
+    w: DoubleBlockWeights, img_mod: ModVecs, txt_mod: ModVecs,
+    direct: QwenBlockDirectLycoris, saved: DoubleBlockSaved,
+    cos: Tensor, sin: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> QwenBlockDirectLycorisGrads:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t(_ones(D), [D], ctx)
+
+    var d_io_t = _ta(d_img_out, [N_IMG, D], ctx)
+    var d_to_t = _ta(d_txt_out, [N_TXT, D], ctx)
+
+    var ipb = _stream_post_backward_direct(
+        d_io_t, saved.img.x, saved.img.att, w.img, img_mod, direct, saved.img,
+        QD_IMG_OUT, QD_IMG_FF_UP, QD_IMG_FF_DOWN,
+        N_IMG, D, F, eps, ones_t, ctx,
+    )
+    var tpb = _stream_post_backward_direct(
+        d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, direct, saved.txt,
+        QD_TXT_OUT, QD_TXT_FF_UP, QD_TXT_FF_DOWN,
+        N_TXT, D, F, eps, ones_t, ctx,
+    )
+
+    # Qwen concatenates txt first in forward, so rebuild the joint grad in the
+    # same order after reshaping the direct per-stream device grads.
+    var d_tatt_4d = reshape(tpb.d_att[], [1, N_TXT, H, Dh], ctx)
+    var d_iatt_4d = reshape(ipb.d_att[], [1, N_IMG, H, Dh], ctx)
+    var d_att_joint = concat(1, ctx, d_tatt_4d, d_iatt_4d)
+
+    var sb = sdpa_backward[1, S, H, Dh](
+        saved.q_rope[], saved.k_rope[], saved.v_joint[], d_att_joint, scale, ctx,
+    )
+    var d_q_joint = rope_backward(sb.d_q, cos, sin, True, ctx)
+    var d_k_joint = rope_backward(sb.d_k, cos, sin, True, ctx)
+    var cq = cat_backward(d_q_joint, N_TXT, N_IMG, 1, ctx)
+    var ck = cat_backward(d_k_joint, N_TXT, N_IMG, 1, ctx)
+    var cv = cat_backward(sb.d_v, N_TXT, N_IMG, 1, ctx)
+
+    var iprb = _stream_pre_backward_direct[H, Dh](
+        cq.d_1, ck.d_1, cv.d_1, w.img, img_mod, direct, saved.img,
+        QD_IMG_Q, QD_IMG_K, QD_IMG_V, N_IMG, D, eps, ones_t, ctx,
+    )
+    var tprb = _stream_pre_backward_direct[H, Dh](
+        cq.d_0, ck.d_0, cv.d_0, w.txt, txt_mod, direct, saved.txt,
+        QD_TXT_Q, QD_TXT_K, QD_TXT_V, N_TXT, D, eps, ones_t, ctx,
+    )
+
+    var d_img_t = add(ipb.d_x[], iprb.d_x[], ctx)
+    var d_txt_t = add(tpb.d_x[], tprb.d_x[], ctx)
+    var d_img_x = d_img_t.to_host(ctx)
+    var d_txt_x = d_txt_t.to_host(ctx)
+
+    var img = QwenStreamDirectLycorisGrads(
+        d_img_x^,
+        _qwen_direct_grad_public(iprb.q_g^),
+        _qwen_direct_grad_public(iprb.k_g^),
+        _qwen_direct_grad_public(iprb.v_g^),
+        _qwen_direct_grad_public(ipb.out_g^),
+        _qwen_direct_grad_public(ipb.ff_up_g^),
+        _qwen_direct_grad_public(ipb.ff_down_g^),
+    )
+    var txt = QwenStreamDirectLycorisGrads(
+        d_txt_x^,
+        _qwen_direct_grad_public(tprb.q_g^),
+        _qwen_direct_grad_public(tprb.k_g^),
+        _qwen_direct_grad_public(tprb.v_g^),
+        _qwen_direct_grad_public(tpb.out_g^),
+        _qwen_direct_grad_public(tpb.ff_up_g^),
+        _qwen_direct_grad_public(tpb.ff_down_g^),
+    )
+    return QwenBlockDirectLycorisGrads(img^, txt^)
 
 
 # Add the LoRA contribution of a projection (on host input x_h [M,in]) into a

@@ -102,6 +102,17 @@ from serenitymojo.models.klein.lora_block import (
     KleinLoraDeviceGrads,
     KleinLoraDeviceGradTensors,
 )
+from serenitymojo.training.dora_substitution_device import (
+    DoRAAdapterDevice, DoRADeviceGrads,
+)
+from serenitymojo.training.oft_onetrainer_device import OFTOTDeviceGrads
+from serenitymojo.models.krea2.krea2_direct_lycoris_stack import (
+    Krea2BlockDirectDoRA, Krea2BlockDirectOFT, Krea2DirectOFTDeviceSlot,
+    krea2_direct_dora_projection_forward_resident,
+    krea2_direct_dora_projection_backward_resident,
+    krea2_direct_oft_projection_forward_resident,
+    krea2_direct_oft_projection_backward_resident,
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -539,6 +550,204 @@ def krea2_single_stream_block_lora[
     return Krea2BlockForward(TArc(x2^), saved^)
 
 
+def krea2_single_stream_block_dora[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    x_t: TArc,
+    vec: Tensor,
+    w: Krea2BlockWeights, dora: Krea2BlockDirectDoRA,
+    cos: Tensor, sin: Tensor,
+    cos_q: Tensor, sin_q: Tensor,
+    cos_k: Tensor, sin_k: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+) raises -> Krea2BlockForward:
+    """Krea2 SingleStreamBlock forward with direct DoRA W_eff projection hooks."""
+    comptime features = HEADS * HEADDIM
+    comptime n_rep = HEADS // KVHEADS
+    var M = L
+    var scale = Float32(1.0) / sqrt(Float32(HEADDIM))
+
+    var mods = _mod6(vec, w.mod_lin[], features, ctx)
+    var prescale = mods[0]
+    var preshift = mods[1]
+    var pregate = mods[2]
+    var postscale = mods[3]
+    var postshift = mods[4]
+    var postgate = mods[5]
+
+    var xn = rms_norm(x_t[], _add_scale_one(w.prenorm_scale[], ctx), eps, ctx)
+    var xm = modulate(xn, prescale[], preshift[], ctx)
+
+    var q = krea2_block_direct_dora_projection_forward(xm, w.wq[], dora.wq, M, ctx)
+    var k = krea2_block_direct_dora_projection_forward(xm, w.wk[], dora.wk, M, ctx)
+    var v_lin = krea2_block_direct_dora_projection_forward(xm, w.wv[], dora.wv, M, ctx)
+    var gate_pre = krea2_block_direct_dora_projection_forward(xm, w.gate_w[], dora.gate_w, M, ctx)
+
+    var q_pre = reshape_owned(q^, [1, L, HEADS, HEADDIM])
+    var k_pre = reshape_owned(k^, [1, L, KVHEADS, HEADDIM])
+    var v = reshape_owned(v_lin^, [1, L, KVHEADS, HEADDIM])
+
+    var q_rms = rms_norm(q_pre, _add_scale_one(w.qnorm_scale[], ctx), eps, ctx)
+    var k_rms = rms_norm(k_pre, _add_scale_one(w.knorm_scale[], ctx), eps, ctx)
+
+    var q_rope = rope_interleaved(q_rms, cos_q, sin_q, ctx)
+    var k_rope = rope_interleaved(k_rms, cos_k, sin_k, ctx)
+
+    var k_full = repeat_kv_f32(k_rope, L, KVHEADS, n_rep, HEADDIM, ctx)
+    var v_full = repeat_kv_f32(v, L, KVHEADS, n_rep, HEADDIM, ctx)
+
+    var att: Tensor
+    var flash_q = Optional[TArc](None)
+    var flash_k = Optional[TArc](None)
+    var flash_v = Optional[TArc](None)
+    var flash_o = Optional[TArc](None)
+    var flash_stats = Optional[TArc](None)
+    var use_flash = real_len and real_len.value() < L
+    if use_flash:
+        var rl = real_len.value()
+        var ff = sdpa_flash_train_fwd_padmask_f32[1, L, HEADS, HEADDIM](
+            q_rope, k_full, v_full, rl, scale, ctx
+        )
+        att = cast_tensor(ff.att, q_rope.dtype(), ctx)
+        flash_q = Optional[TArc](ff.q_bf.copy())
+        flash_k = Optional[TArc](ff.k_bf.copy())
+        flash_v = Optional[TArc](ff.v_bf.copy())
+        flash_o = Optional[TArc](ff.o_bf.copy())
+        flash_stats = Optional[TArc](ff.stats.copy())
+    else:
+        att = sdpa_nomask[1, L, HEADS, HEADDIM](q_rope, k_full, v_full, scale, ctx)
+    var attn_flat = reshape_owned(att^, [1, L, features])
+
+    var sg = sigmoid(gate_pre, ctx)
+    var gated = mul(attn_flat, sg, ctx)
+    var a = krea2_block_direct_dora_projection_forward(gated, w.wo[], dora.wo, M, ctx)
+
+    var x1 = residual_gate(x_t[], pregate[], a, ctx)
+
+    var xn2 = rms_norm(x1, _add_scale_one(w.postnorm_scale[], ctx), eps, ctx)
+    var xm2 = modulate(xn2, postscale[], postshift[], ctx)
+
+    var mg = krea2_block_direct_dora_projection_forward(xm2, w.mlp_gate_w[], dora.mlp_gate_w, M, ctx)
+    var mu = krea2_block_direct_dora_projection_forward(xm2, w.mlp_up_w[], dora.mlp_up_w, M, ctx)
+    var sw = swiglu(mg, mu, ctx)
+    var m = krea2_block_direct_dora_projection_forward(sw, w.mlp_down_w[], dora.mlp_down_w, M, ctx)
+
+    var x2 = residual_gate(x1, postgate[], m, ctx)
+
+    var saved = Krea2BlockSaved(
+        x_t.copy(), TArc(xm^),
+        TArc(q_pre^), TArc(k_pre^), TArc(v^),
+        TArc(q_rope^), TArc(k_rope^), TArc(k_full^), TArc(v_full^),
+        TArc(attn_flat^), TArc(gate_pre^), TArc(sg^), TArc(gated^),
+        TArc(a^), TArc(x1^), TArc(xm2^),
+        TArc(mg^), TArc(mu^), TArc(sw^), TArc(m^),
+        TArc(xn^), TArc(xn2^),
+        flash_q^, flash_k^, flash_v^, flash_o^, flash_stats^,
+    )
+    return Krea2BlockForward(TArc(x2^), saved^)
+
+
+def krea2_single_stream_block_oft[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    x_t: TArc,
+    vec: Tensor,
+    w: Krea2BlockWeights, oft: Krea2BlockDirectOFT,
+    cos: Tensor, sin: Tensor,
+    cos_q: Tensor, sin_q: Tensor,
+    cos_k: Tensor, sin_k: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+) raises -> Krea2BlockForward:
+    """Krea2 SingleStreamBlock forward with direct OFT projection hooks."""
+    comptime features = HEADS * HEADDIM
+    comptime n_rep = HEADS // KVHEADS
+    var M = L
+    var scale = Float32(1.0) / sqrt(Float32(HEADDIM))
+
+    var mods = _mod6(vec, w.mod_lin[], features, ctx)
+    var prescale = mods[0]
+    var preshift = mods[1]
+    var pregate = mods[2]
+    var postscale = mods[3]
+    var postshift = mods[4]
+    var postgate = mods[5]
+
+    var xn = rms_norm(x_t[], _add_scale_one(w.prenorm_scale[], ctx), eps, ctx)
+    var xm = modulate(xn, prescale[], preshift[], ctx)
+
+    var q = krea2_block_direct_oft_projection_forward(xm, w.wq[], oft.wq, M, ctx)
+    var k = krea2_block_direct_oft_projection_forward(xm, w.wk[], oft.wk, M, ctx)
+    var v_lin = krea2_block_direct_oft_projection_forward(xm, w.wv[], oft.wv, M, ctx)
+    var gate_pre = krea2_block_direct_oft_projection_forward(xm, w.gate_w[], oft.gate_w, M, ctx)
+
+    var q_pre = reshape_owned(q^, [1, L, HEADS, HEADDIM])
+    var k_pre = reshape_owned(k^, [1, L, KVHEADS, HEADDIM])
+    var v = reshape_owned(v_lin^, [1, L, KVHEADS, HEADDIM])
+
+    var q_rms = rms_norm(q_pre, _add_scale_one(w.qnorm_scale[], ctx), eps, ctx)
+    var k_rms = rms_norm(k_pre, _add_scale_one(w.knorm_scale[], ctx), eps, ctx)
+
+    var q_rope = rope_interleaved(q_rms, cos_q, sin_q, ctx)
+    var k_rope = rope_interleaved(k_rms, cos_k, sin_k, ctx)
+
+    var k_full = repeat_kv_f32(k_rope, L, KVHEADS, n_rep, HEADDIM, ctx)
+    var v_full = repeat_kv_f32(v, L, KVHEADS, n_rep, HEADDIM, ctx)
+
+    var att: Tensor
+    var flash_q = Optional[TArc](None)
+    var flash_k = Optional[TArc](None)
+    var flash_v = Optional[TArc](None)
+    var flash_o = Optional[TArc](None)
+    var flash_stats = Optional[TArc](None)
+    var use_flash = real_len and real_len.value() < L
+    if use_flash:
+        var rl = real_len.value()
+        var ff = sdpa_flash_train_fwd_padmask_f32[1, L, HEADS, HEADDIM](
+            q_rope, k_full, v_full, rl, scale, ctx
+        )
+        att = cast_tensor(ff.att, q_rope.dtype(), ctx)
+        flash_q = Optional[TArc](ff.q_bf.copy())
+        flash_k = Optional[TArc](ff.k_bf.copy())
+        flash_v = Optional[TArc](ff.v_bf.copy())
+        flash_o = Optional[TArc](ff.o_bf.copy())
+        flash_stats = Optional[TArc](ff.stats.copy())
+    else:
+        att = sdpa_nomask[1, L, HEADS, HEADDIM](q_rope, k_full, v_full, scale, ctx)
+    var attn_flat = reshape_owned(att^, [1, L, features])
+
+    var sg = sigmoid(gate_pre, ctx)
+    var gated = mul(attn_flat, sg, ctx)
+    var a = krea2_block_direct_oft_projection_forward(gated, w.wo[], oft.wo, M, ctx)
+
+    var x1 = residual_gate(x_t[], pregate[], a, ctx)
+
+    var xn2 = rms_norm(x1, _add_scale_one(w.postnorm_scale[], ctx), eps, ctx)
+    var xm2 = modulate(xn2, postscale[], postshift[], ctx)
+
+    var mg = krea2_block_direct_oft_projection_forward(xm2, w.mlp_gate_w[], oft.mlp_gate_w, M, ctx)
+    var mu = krea2_block_direct_oft_projection_forward(xm2, w.mlp_up_w[], oft.mlp_up_w, M, ctx)
+    var sw = swiglu(mg, mu, ctx)
+    var m = krea2_block_direct_oft_projection_forward(sw, w.mlp_down_w[], oft.mlp_down_w, M, ctx)
+
+    var x2 = residual_gate(x1, postgate[], m, ctx)
+
+    var saved = Krea2BlockSaved(
+        x_t.copy(), TArc(xm^),
+        TArc(q_pre^), TArc(k_pre^), TArc(v^),
+        TArc(q_rope^), TArc(k_rope^), TArc(k_full^), TArc(v_full^),
+        TArc(attn_flat^), TArc(gate_pre^), TArc(sg^), TArc(gated^),
+        TArc(a^), TArc(x1^), TArc(xm2^),
+        TArc(mg^), TArc(mu^), TArc(sw^), TArc(m^),
+        TArc(xn^), TArc(xn2^),
+        flash_q^, flash_k^, flash_v^, flash_o^, flash_stats^,
+    )
+    return Krea2BlockForward(TArc(x2^), saved^)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKWARD (hand-chained) — exact reverse of the forward graph above
 # ══════════════════════════════════════════════════════════════════════════════
@@ -604,6 +813,174 @@ def _linear_bwd_dx_dev(
         )
         return _LinBwdT(d_x^, pair^)
     return _LinBwdT(d_x^, Krea2LoraGradT(None, None))
+
+
+struct Krea2DirectDoRAGradT(Copyable, Movable):
+    var d_a: Optional[TArc]
+    var d_b: Optional[TArc]
+    var d_m: Optional[TArc]
+
+    def __init__(
+        out self, var d_a: Optional[TArc], var d_b: Optional[TArc],
+        var d_m: Optional[TArc],
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_m = d_m^
+
+
+struct Krea2DirectOFTGradT(Copyable, Movable):
+    var d_vec: Optional[TArc]
+
+    def __init__(out self, var d_vec: Optional[TArc]):
+        self.d_vec = d_vec^
+
+
+struct Krea2BlockDirectDoRAGradsT(Movable):
+    var d_x: TArc
+    var wq: Krea2DirectDoRAGradT
+    var wk: Krea2DirectDoRAGradT
+    var wv: Krea2DirectDoRAGradT
+    var gate_w: Krea2DirectDoRAGradT
+    var wo: Krea2DirectDoRAGradT
+    var mlp_gate_w: Krea2DirectDoRAGradT
+    var mlp_up_w: Krea2DirectDoRAGradT
+    var mlp_down_w: Krea2DirectDoRAGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var wq: Krea2DirectDoRAGradT, var wk: Krea2DirectDoRAGradT,
+        var wv: Krea2DirectDoRAGradT, var gate_w: Krea2DirectDoRAGradT,
+        var wo: Krea2DirectDoRAGradT,
+        var mlp_gate_w: Krea2DirectDoRAGradT,
+        var mlp_up_w: Krea2DirectDoRAGradT,
+        var mlp_down_w: Krea2DirectDoRAGradT,
+    ):
+        self.d_x = d_x^
+        self.wq = wq^
+        self.wk = wk^
+        self.wv = wv^
+        self.gate_w = gate_w^
+        self.wo = wo^
+        self.mlp_gate_w = mlp_gate_w^
+        self.mlp_up_w = mlp_up_w^
+        self.mlp_down_w = mlp_down_w^
+
+
+struct Krea2BlockDirectOFTGradsT(Movable):
+    var d_x: TArc
+    var wq: Krea2DirectOFTGradT
+    var wk: Krea2DirectOFTGradT
+    var wv: Krea2DirectOFTGradT
+    var gate_w: Krea2DirectOFTGradT
+    var wo: Krea2DirectOFTGradT
+    var mlp_gate_w: Krea2DirectOFTGradT
+    var mlp_up_w: Krea2DirectOFTGradT
+    var mlp_down_w: Krea2DirectOFTGradT
+
+    def __init__(
+        out self, var d_x: TArc,
+        var wq: Krea2DirectOFTGradT, var wk: Krea2DirectOFTGradT,
+        var wv: Krea2DirectOFTGradT, var gate_w: Krea2DirectOFTGradT,
+        var wo: Krea2DirectOFTGradT,
+        var mlp_gate_w: Krea2DirectOFTGradT,
+        var mlp_up_w: Krea2DirectOFTGradT,
+        var mlp_down_w: Krea2DirectOFTGradT,
+    ):
+        self.d_x = d_x^
+        self.wq = wq^
+        self.wk = wk^
+        self.wv = wv^
+        self.gate_w = gate_w^
+        self.wo = wo^
+        self.mlp_gate_w = mlp_gate_w^
+        self.mlp_up_w = mlp_up_w^
+        self.mlp_down_w = mlp_down_w^
+
+
+struct _DirectDoRALinBwdT(Movable):
+    var d_x: Tensor
+    var dora: Krea2DirectDoRAGradT
+
+    def __init__(out self, var d_x: Tensor, var dora: Krea2DirectDoRAGradT):
+        self.d_x = d_x^
+        self.dora = dora^
+
+
+struct _DirectOFTLinBwdT(Movable):
+    var d_x: Tensor
+    var oft: Krea2DirectOFTGradT
+
+    def __init__(out self, var d_x: Tensor, var oft: Krea2DirectOFTGradT):
+        self.d_x = d_x^
+        self.oft = oft^
+
+
+def krea2_block_direct_dora_projection_forward(
+    x: Tensor, w: Tensor, ad: Optional[DoRAAdapterDevice],
+    M: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    """Direct DoRA projection hook for Krea2 block lowering.
+
+    Present adapter path returns x @ W_eff^T. It is not an additive LoRA delta.
+    """
+    if ad:
+        return krea2_direct_dora_projection_forward_resident(ad.value(), x, w, M, ctx)
+    var nb = _no_bias()
+    return linear(x, w, nb^, ctx)
+
+
+def krea2_block_direct_dora_projection_backward_dev(
+    d_y: Tensor, x: Tensor, w: Tensor, ad: Optional[DoRAAdapterDevice],
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> _DirectDoRALinBwdT:
+    """Direct DoRA projection backward hook for Krea2 block lowering.
+
+    Present adapter path returns the full W_eff d_x from the DoRA primitive. Do
+    not add a separate frozen-W base d_x.
+    """
+    if ad:
+        var g = krea2_direct_dora_projection_backward_resident(
+            ad.value(), d_y, x, w, M, ctx,
+        )
+        return _DirectDoRALinBwdT(
+            g.d_x.clone(ctx),
+            Krea2DirectDoRAGradT(
+                Optional[TArc](TArc(g.d_a.clone(ctx))),
+                Optional[TArc](TArc(g.d_b.clone(ctx))),
+                Optional[TArc](TArc(g.d_m.clone(ctx))),
+            ),
+        )
+    var d_x = linear_backward_dx(d_y, w, M, in_f, out_f, ctx)
+    return _DirectDoRALinBwdT(d_x^, Krea2DirectDoRAGradT(None, None, None))
+
+
+def krea2_block_direct_oft_projection_forward(
+    x: Tensor, w: Tensor, ad: Optional[Krea2DirectOFTDeviceSlot],
+    M: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    """Direct OFT projection hook for Krea2 block lowering."""
+    if ad:
+        return krea2_direct_oft_projection_forward_resident(ad.value(), x, w, M, ctx)
+    var nb = _no_bias()
+    return linear(x, w, nb^, ctx)
+
+
+def krea2_block_direct_oft_projection_backward_dev(
+    d_y: Tensor, x: Tensor, w: Tensor, ad: Optional[Krea2DirectOFTDeviceSlot],
+    M: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> _DirectOFTLinBwdT:
+    """Direct OFT projection backward hook for Krea2 block lowering."""
+    if ad:
+        var g = krea2_direct_oft_projection_backward_resident(
+            ad.value(), d_y, x, w, M, ctx,
+        )
+        return _DirectOFTLinBwdT(
+            g.d_x.clone(ctx),
+            Krea2DirectOFTGradT(Optional[TArc](TArc(g.d_vec.clone(ctx)))),
+        )
+    var d_x = linear_backward_dx(d_y, w, M, in_f, out_f, ctx)
+    return _DirectOFTLinBwdT(d_x^, Krea2DirectOFTGradT(None))
 
 
 def krea2_single_stream_block_lora_backward[
@@ -924,6 +1301,285 @@ def krea2_single_stream_block_lora_backward_dev[
     var d_x = add(grg1.d_x, rb1_dx, ctx)
 
     return Krea2BlockGradsT(
+        TArc(d_x^),
+        g_wq^, g_wk^, g_wv^, g_gate^, g_wo^, g_mg^, g_mu^, g_down^,
+    )
+
+
+# Direct DoRA device-grad backward. This is the same block chain as the LoRA
+# device-grad backward above, but each projection backward is full W_eff
+# substitution: when a direct adapter is present, the helper returns the full
+# d_x and DoRA d_A/d_B/d_m. Base W is frozen.
+def krea2_single_stream_block_dora_backward_dev[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_out: Tensor,
+    vec: Tensor,
+    w: Krea2BlockWeights, dora: Krea2BlockDirectDoRA, saved: Krea2BlockSaved,
+    cos_q: Tensor, sin_q: Tensor,
+    cos_k: Tensor, sin_k: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+) raises -> Krea2BlockDirectDoRAGradsT:
+    comptime features = HEADS * HEADDIM
+    comptime n_rep = HEADS // KVHEADS
+    var mlpdim = saved.mlp_gate[].shape()[2]
+    var M = L
+    var scale = Float32(1.0) / sqrt(Float32(HEADDIM))
+
+    var mods = _mod6(vec, w.mod_lin[], features, ctx)
+    var prescale = mods[0]
+    var pregate = mods[2]
+    var postscale = mods[3]
+    var postgate = mods[5]
+
+    var grg2 = gate_residual_backward(d_out, saved.x1[], postgate[], saved.m[], ctx, compute_gate_grad=False)
+    var d_m = grg2.d_y.clone(ctx)
+
+    var bw_down = krea2_block_direct_dora_projection_backward_dev(
+        d_m, saved.sw[], w.mlp_down_w[], dora.mlp_down_w,
+        M, mlpdim, features, ctx,
+    )
+    var d_sw = bw_down.d_x.clone(ctx)
+    var g_down = bw_down.dora.copy()
+
+    var sgb = swiglu_backward(d_sw, saved.mlp_gate[], saved.mlp_up[], ctx)
+    var bw_mg = krea2_block_direct_dora_projection_backward_dev(
+        sgb.d_gate, saved.xm2[], w.mlp_gate_w[], dora.mlp_gate_w,
+        M, features, mlpdim, ctx,
+    )
+    var bw_mu = krea2_block_direct_dora_projection_backward_dev(
+        sgb.d_up, saved.xm2[], w.mlp_up_w[], dora.mlp_up_w,
+        M, features, mlpdim, ctx,
+    )
+    var g_mg = bw_mg.dora.copy()
+    var g_mu = bw_mu.dora.copy()
+    var d_xm2 = add(bw_mg.d_x, bw_mu.d_x, ctx)
+
+    var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
+    var rb2_dx = rms_norm_backward_dx(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
+    var d_x1 = add(grg2.d_x, rb2_dx, ctx)
+
+    var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
+    var d_a = grg1.d_y.clone(ctx)
+
+    var bw_wo = krea2_block_direct_dora_projection_backward_dev(
+        d_a, saved.gated[], w.wo[], dora.wo, M, features, features, ctx
+    )
+    var d_gated = bw_wo.d_x.clone(ctx)
+    var g_wo = bw_wo.dora.copy()
+
+    var d_attn_flat = mul(d_gated, saved.sg[], ctx)
+    var d_sg = mul(d_gated, saved.attn_flat[], ctx)
+    var d_gate_pre = sigmoid_backward(d_sg, saved.gate_pre[], ctx)
+
+    var d_att = reshape(d_attn_flat, [1, L, HEADS, HEADDIM], ctx)
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    var bwd_use_flash = real_len and real_len.value() < L
+    if bwd_use_flash:
+        if not saved.flash_stats:
+            raise Error(
+                "krea2 direct DoRA bwd: real_len < L but saved tape has no flash set"
+                " (forward/backward real_len mismatch)"
+            )
+        var rl = real_len.value()
+        var acts_dt = saved.q_rope[].dtype()
+        var d_att_f32 = cast_tensor(d_att, STDtype.F32, ctx)
+        var fb = sdpa_flash_backward_padmask_f32[1, L, HEADS, HEADDIM](
+            saved.flash_q.value(), saved.flash_k.value(), saved.flash_v.value(),
+            saved.flash_o.value(), saved.flash_stats.value(), d_att_f32, rl, scale, ctx,
+        )
+        d_q_sb = cast_tensor(fb.d_q, acts_dt, ctx)
+        d_k_sb = cast_tensor(fb.d_k, acts_dt, ctx)
+        d_v_sb = cast_tensor(fb.d_v, acts_dt, ctx)
+    else:
+        var sb = sdpa_backward[1, L, HEADS, HEADDIM](
+            saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+
+    var d_k_rope = repeat_kv_backward(d_k_sb, L, KVHEADS, n_rep, HEADDIM, ctx)
+    var d_v = repeat_kv_backward(d_v_sb, L, KVHEADS, n_rep, HEADDIM, ctx)
+
+    var d_q_rms = rope_backward(d_q_sb, cos_q, sin_q, True, ctx)
+    var d_k_rms = rope_backward(d_k_rope, cos_k, sin_k, True, ctx)
+
+    var rbq_dx = rms_norm_backward_dx(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
+    var rbk_dx = rms_norm_backward_dx(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
+
+    var d_q = reshape(rbq_dx, [1, L, HEADS * HEADDIM], ctx)
+    var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
+    var d_v_flat = reshape(d_v, [1, L, KVHEADS * HEADDIM], ctx)
+
+    var bw_q = krea2_block_direct_dora_projection_backward_dev(
+        d_q, saved.xm[], w.wq[], dora.wq, M, features, HEADS * HEADDIM, ctx,
+    )
+    var bw_k = krea2_block_direct_dora_projection_backward_dev(
+        d_k, saved.xm[], w.wk[], dora.wk, M, features, KVHEADS * HEADDIM, ctx,
+    )
+    var bw_v = krea2_block_direct_dora_projection_backward_dev(
+        d_v_flat, saved.xm[], w.wv[], dora.wv, M, features, KVHEADS * HEADDIM, ctx,
+    )
+    var bw_g = krea2_block_direct_dora_projection_backward_dev(
+        d_gate_pre, saved.xm[], w.gate_w[], dora.gate_w, M, features, features, ctx,
+    )
+    var g_wq = bw_q.dora.copy()
+    var g_wk = bw_k.dora.copy()
+    var g_wv = bw_v.dora.copy()
+    var g_gate = bw_g.dora.copy()
+
+    var d_xm = add(add(bw_q.d_x, bw_k.d_x, ctx), add(bw_v.d_x, bw_g.d_x, ctx), ctx)
+
+    var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
+    var rb1_dx = rms_norm_backward_dx(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
+
+    var d_x = add(grg1.d_x, rb1_dx, ctx)
+
+    return Krea2BlockDirectDoRAGradsT(
+        TArc(d_x^),
+        g_wq^, g_wk^, g_wv^, g_gate^, g_wo^, g_mg^, g_mu^, g_down^,
+    )
+
+
+# Direct OFT device-grad backward. Same chain as the LoRA device-grad backward,
+# but each projection consumes the current frozen W_orig plus resident OFT vec
+# and returns direct d_vec/d_x without a dense full-delta carrier.
+def krea2_single_stream_block_oft_backward_dev[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_out: Tensor,
+    vec: Tensor,
+    w: Krea2BlockWeights, oft: Krea2BlockDirectOFT, saved: Krea2BlockSaved,
+    cos_q: Tensor, sin_q: Tensor,
+    cos_k: Tensor, sin_k: Tensor,
+    eps: Float32,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+) raises -> Krea2BlockDirectOFTGradsT:
+    comptime features = HEADS * HEADDIM
+    comptime n_rep = HEADS // KVHEADS
+    var mlpdim = saved.mlp_gate[].shape()[2]
+    var M = L
+    var scale = Float32(1.0) / sqrt(Float32(HEADDIM))
+
+    var mods = _mod6(vec, w.mod_lin[], features, ctx)
+    var prescale = mods[0]
+    var pregate = mods[2]
+    var postscale = mods[3]
+    var postgate = mods[5]
+
+    var grg2 = gate_residual_backward(d_out, saved.x1[], postgate[], saved.m[], ctx, compute_gate_grad=False)
+    var d_m = grg2.d_y.clone(ctx)
+
+    var bw_down = krea2_block_direct_oft_projection_backward_dev(
+        d_m, saved.sw[], w.mlp_down_w[], oft.mlp_down_w,
+        M, mlpdim, features, ctx,
+    )
+    var d_sw = bw_down.d_x.clone(ctx)
+    var g_down = bw_down.oft.copy()
+
+    var sgb = swiglu_backward(d_sw, saved.mlp_gate[], saved.mlp_up[], ctx)
+    var bw_mg = krea2_block_direct_oft_projection_backward_dev(
+        sgb.d_gate, saved.xm2[], w.mlp_gate_w[], oft.mlp_gate_w,
+        M, features, mlpdim, ctx,
+    )
+    var bw_mu = krea2_block_direct_oft_projection_backward_dev(
+        sgb.d_up, saved.xm2[], w.mlp_up_w[], oft.mlp_up_w,
+        M, features, mlpdim, ctx,
+    )
+    var g_mg = bw_mg.oft.copy()
+    var g_mu = bw_mu.oft.copy()
+    var d_xm2 = add(bw_mg.d_x, bw_mu.d_x, ctx)
+
+    var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
+    var rb2_dx = rms_norm_backward_dx(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
+    var d_x1 = add(grg2.d_x, rb2_dx, ctx)
+
+    var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
+    var d_a = grg1.d_y.clone(ctx)
+
+    var bw_wo = krea2_block_direct_oft_projection_backward_dev(
+        d_a, saved.gated[], w.wo[], oft.wo, M, features, features, ctx
+    )
+    var d_gated = bw_wo.d_x.clone(ctx)
+    var g_wo = bw_wo.oft.copy()
+
+    var d_attn_flat = mul(d_gated, saved.sg[], ctx)
+    var d_sg = mul(d_gated, saved.attn_flat[], ctx)
+    var d_gate_pre = sigmoid_backward(d_sg, saved.gate_pre[], ctx)
+
+    var d_att = reshape(d_attn_flat, [1, L, HEADS, HEADDIM], ctx)
+    var d_q_sb: Tensor
+    var d_k_sb: Tensor
+    var d_v_sb: Tensor
+    var bwd_use_flash = real_len and real_len.value() < L
+    if bwd_use_flash:
+        if not saved.flash_stats:
+            raise Error(
+                "krea2 direct OFT bwd: real_len < L but saved tape has no flash set"
+                " (forward/backward real_len mismatch)"
+            )
+        var rl = real_len.value()
+        var acts_dt = saved.q_rope[].dtype()
+        var d_att_f32 = cast_tensor(d_att, STDtype.F32, ctx)
+        var fb = sdpa_flash_backward_padmask_f32[1, L, HEADS, HEADDIM](
+            saved.flash_q.value(), saved.flash_k.value(), saved.flash_v.value(),
+            saved.flash_o.value(), saved.flash_stats.value(), d_att_f32, rl, scale, ctx,
+        )
+        d_q_sb = cast_tensor(fb.d_q, acts_dt, ctx)
+        d_k_sb = cast_tensor(fb.d_k, acts_dt, ctx)
+        d_v_sb = cast_tensor(fb.d_v, acts_dt, ctx)
+    else:
+        var sb = sdpa_backward[1, L, HEADS, HEADDIM](
+            saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
+        )
+        d_q_sb = Tensor(sb.d_q.buf.copy(), sb.d_q.shape(), sb.d_q.dtype())
+        d_k_sb = Tensor(sb.d_k.buf.copy(), sb.d_k.shape(), sb.d_k.dtype())
+        d_v_sb = Tensor(sb.d_v.buf.copy(), sb.d_v.shape(), sb.d_v.dtype())
+
+    var d_k_rope = repeat_kv_backward(d_k_sb, L, KVHEADS, n_rep, HEADDIM, ctx)
+    var d_v = repeat_kv_backward(d_v_sb, L, KVHEADS, n_rep, HEADDIM, ctx)
+
+    var d_q_rms = rope_backward(d_q_sb, cos_q, sin_q, True, ctx)
+    var d_k_rms = rope_backward(d_k_rope, cos_k, sin_k, True, ctx)
+
+    var rbq_dx = rms_norm_backward_dx(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
+    var rbk_dx = rms_norm_backward_dx(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
+
+    var d_q = reshape(rbq_dx, [1, L, HEADS * HEADDIM], ctx)
+    var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
+    var d_v_flat = reshape(d_v, [1, L, KVHEADS * HEADDIM], ctx)
+
+    var bw_q = krea2_block_direct_oft_projection_backward_dev(
+        d_q, saved.xm[], w.wq[], oft.wq, M, features, HEADS * HEADDIM, ctx,
+    )
+    var bw_k = krea2_block_direct_oft_projection_backward_dev(
+        d_k, saved.xm[], w.wk[], oft.wk, M, features, KVHEADS * HEADDIM, ctx,
+    )
+    var bw_v = krea2_block_direct_oft_projection_backward_dev(
+        d_v_flat, saved.xm[], w.wv[], oft.wv, M, features, KVHEADS * HEADDIM, ctx,
+    )
+    var bw_g = krea2_block_direct_oft_projection_backward_dev(
+        d_gate_pre, saved.xm[], w.gate_w[], oft.gate_w, M, features, features, ctx,
+    )
+    var g_wq = bw_q.oft.copy()
+    var g_wk = bw_k.oft.copy()
+    var g_wv = bw_v.oft.copy()
+    var g_gate = bw_g.oft.copy()
+
+    var d_xm = add(add(bw_q.d_x, bw_k.d_x, ctx), add(bw_v.d_x, bw_g.d_x, ctx), ctx)
+
+    var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
+    var rb1_dx = rms_norm_backward_dx(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
+
+    var d_x = add(grg1.d_x, rb1_dx, ctx)
+
+    return Krea2BlockDirectOFTGradsT(
         TArc(d_x^),
         g_wq^, g_wk^, g_wv^, g_gate^, g_wo^, g_mg^, g_mu^, g_down^,
     )

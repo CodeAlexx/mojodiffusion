@@ -69,16 +69,35 @@ from serenitymojo.models.chroma.chroma_block import (
     chroma_single_block_lora_forward, chroma_single_block_lora_backward,
     DBL_STREAM_SLOTS, SGL_SLOTS,
     D_SQ, D_SK, D_SV, D_PROJ, D_MLP0, D_MLP2,
-    S_SQ, S_SK, S_SV, S_PMLP,
+    S_SQ, S_SK, S_SV, S_PMLP, S_L2,
 )
 
 # Reuse the proven Flux LoRA carrier + optimizer. Chroma save/load is owned in
 # this file because OneTrainer Chroma has its own target inventory and filters.
 from serenitymojo.models.flux.flux_stack_lora import (
     FluxLoraSet, FluxLoraGradSet,
+    FluxDirectDoRAGradSet, FluxDirectOFTGradSet,
     build_flux_lora_set, total_adapters,
     flux_lora_adamw_step,
     _dbl_base, _sgl_base, _double_lora_for, _single_lora_for,
+    _flux_direct_dbl_slot_targeted, _flux_direct_sgl_slot_targeted,
+    _flux_direct_expected_slots,
+    _flux_direct_dora_zero_grads, _flux_direct_oft_zero_grads,
+    _flux_direct_dora_double_for, _flux_direct_oft_double_for,
+    _flux_direct_dora_single_for, _flux_direct_oft_single_for,
+    _scatter_flux_dora_double, _scatter_flux_oft_double,
+    _scatter_flux_dora_single, _scatter_flux_oft_single,
+    _nonfinite_flux_direct_double, _nonfinite_flux_direct_single,
+)
+from serenitymojo.models.flux.lora_block import (
+    FLUX_DIRECT_ALGO_DORA, FLUX_DIRECT_ALGO_OFT,
+    double_block_direct_lycoris_forward, double_block_direct_lycoris_backward,
+    single_block_direct_lycoris_forward, single_block_direct_lycoris_backward,
+)
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectOFTSet,
+    empty_flat_direct_dora_set, empty_flat_direct_oft_set,
+    flat_direct_dora_append_from_weight, flat_direct_oft_append,
 )
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.lora_save import (
@@ -597,6 +616,203 @@ def _chroma_single_from_block(
     )
 
 
+def _block_weight_host(block: Block, key: String, ctx: DeviceContext) raises -> List[Float32]:
+    return _block_tensor(block, key)[].to_host(ctx)
+
+
+def _chroma_dbl_stream_local_name(stream_img: Bool, slot: Int) -> String:
+    if stream_img:
+        if slot == D_SQ:
+            return String("attn.to_q")
+        if slot == D_SK:
+            return String("attn.to_k")
+        if slot == D_SV:
+            return String("attn.to_v")
+        if slot == D_PROJ:
+            return String("attn.to_out.0")
+        if slot == D_MLP0:
+            return String("ff.net.0.proj")
+        return String("ff.net.2")
+    if slot == D_SQ:
+        return String("attn.add_q_proj")
+    if slot == D_SK:
+        return String("attn.add_k_proj")
+    if slot == D_SV:
+        return String("attn.add_v_proj")
+    if slot == D_PROJ:
+        return String("attn.to_add_out")
+    if slot == D_MLP0:
+        return String("ff_context.net.0.proj")
+    return String("ff_context.net.2")
+
+
+def _append_chroma_direct_dora_weight(
+    mut set: FlatDirectDoRASet, block: Block, key: String, prefix: String,
+    in_f: Int, out_f: Int, rank: Int, alpha: Float32, seed: UInt64,
+    wd_on_out: Bool, ctx: DeviceContext,
+) raises:
+    var w = _block_weight_host(block, key + String(".weight"), ctx)
+    flat_direct_dora_append_from_weight(
+        set, w^, in_f, out_f, rank, alpha, prefix, seed, wd_on_out,
+    )
+
+
+def _append_chroma_direct_dora_stream(
+    mut set: FlatDirectDoRASet, block: Block, bp: String,
+    bi: Int, stream_img: Bool, targets: Int,
+    D: Int, Fmlp: Int, rank: Int, alpha: Float32, seed: UInt64,
+    wd_on_out: Bool, ctx: DeviceContext,
+) raises:
+    var stream_off = 0 if stream_img else DBL_STREAM_SLOTS
+    if _flux_direct_dbl_slot_targeted(stream_off + D_SQ, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, bp + _chroma_dbl_stream_local_name(stream_img, D_SQ),
+            _chroma_dbl_stream_prefix(bi, stream_img, D_SQ), D, D, rank, alpha,
+            seed + UInt64(bi * (2 * DBL_STREAM_SLOTS) + stream_off + D_SQ), wd_on_out, ctx,
+        )
+    if _flux_direct_dbl_slot_targeted(stream_off + D_SK, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, bp + _chroma_dbl_stream_local_name(stream_img, D_SK),
+            _chroma_dbl_stream_prefix(bi, stream_img, D_SK), D, D, rank, alpha,
+            seed + UInt64(bi * (2 * DBL_STREAM_SLOTS) + stream_off + D_SK), wd_on_out, ctx,
+        )
+    if _flux_direct_dbl_slot_targeted(stream_off + D_SV, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, bp + _chroma_dbl_stream_local_name(stream_img, D_SV),
+            _chroma_dbl_stream_prefix(bi, stream_img, D_SV), D, D, rank, alpha,
+            seed + UInt64(bi * (2 * DBL_STREAM_SLOTS) + stream_off + D_SV), wd_on_out, ctx,
+        )
+    if _flux_direct_dbl_slot_targeted(stream_off + D_PROJ, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, bp + _chroma_dbl_stream_local_name(stream_img, D_PROJ),
+            _chroma_dbl_stream_prefix(bi, stream_img, D_PROJ), D, D, rank, alpha,
+            seed + UInt64(bi * (2 * DBL_STREAM_SLOTS) + stream_off + D_PROJ), wd_on_out, ctx,
+        )
+    if _flux_direct_dbl_slot_targeted(stream_off + D_MLP0, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, bp + _chroma_dbl_stream_local_name(stream_img, D_MLP0),
+            _chroma_dbl_stream_prefix(bi, stream_img, D_MLP0), D, Fmlp, rank, alpha,
+            seed + UInt64(bi * (2 * DBL_STREAM_SLOTS) + stream_off + D_MLP0), wd_on_out, ctx,
+        )
+    if _flux_direct_dbl_slot_targeted(stream_off + D_MLP2, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, bp + _chroma_dbl_stream_local_name(stream_img, D_MLP2),
+            _chroma_dbl_stream_prefix(bi, stream_img, D_MLP2), Fmlp, D, rank, alpha,
+            seed + UInt64(bi * (2 * DBL_STREAM_SLOTS) + stream_off + D_MLP2), wd_on_out, ctx,
+        )
+
+
+def _append_chroma_direct_dora_single(
+    mut set: FlatDirectDoRASet, block: Block, sp: String,
+    num_double: Int, bi: Int, targets: Int,
+    D: Int, Fmlp: Int, rank: Int, alpha: Float32, seed: UInt64,
+    wd_on_out: Bool, ctx: DeviceContext,
+) raises:
+    var base = num_double * (2 * DBL_STREAM_SLOTS) + bi * SGL_SLOTS
+    if _flux_direct_sgl_slot_targeted(S_SQ, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, sp + String("attn.to_q"), _chroma_sgl_prefix(bi, S_SQ),
+            D, D, rank, alpha, seed + UInt64(base + S_SQ), wd_on_out, ctx,
+        )
+    if _flux_direct_sgl_slot_targeted(S_SK, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, sp + String("attn.to_k"), _chroma_sgl_prefix(bi, S_SK),
+            D, D, rank, alpha, seed + UInt64(base + S_SK), wd_on_out, ctx,
+        )
+    if _flux_direct_sgl_slot_targeted(S_SV, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, sp + String("attn.to_v"), _chroma_sgl_prefix(bi, S_SV),
+            D, D, rank, alpha, seed + UInt64(base + S_SV), wd_on_out, ctx,
+        )
+    if _flux_direct_sgl_slot_targeted(S_PMLP, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, sp + String("proj_mlp"), _chroma_sgl_prefix(bi, S_PMLP),
+            D, Fmlp, rank, alpha, seed + UInt64(base + S_PMLP), wd_on_out, ctx,
+        )
+    if _flux_direct_sgl_slot_targeted(S_L2, targets):
+        _append_chroma_direct_dora_weight(
+            set, block, sp + String("proj_out"), _chroma_sgl_prefix(bi, S_L2),
+            D + Fmlp, D, rank, alpha, seed + UInt64(base + S_L2), wd_on_out, ctx,
+        )
+
+
+def build_chroma_direct_dora_set_from_offload(
+    mut loader: TurboPlannedLoader,
+    num_double: Int, num_single: Int,
+    D: Int, Fmlp: Int,
+    rank: Int, alpha: Float32, targets: Int, seed: UInt64,
+    wd_on_out: Bool, ctx: DeviceContext,
+) raises -> FlatDirectDoRASet:
+    if loader.block_count() < num_double + num_single:
+        raise Error("build_chroma_direct_dora_set_from_offload: loader depth too small")
+    var set = empty_flat_direct_dora_set()
+    if num_double + num_single > 0:
+        loader.prefetch_with_ctx(0, ctx)
+    for bi in range(num_double):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var bp = handle.prefix + String(".")
+        _append_chroma_direct_dora_stream(
+            set, handle.block, bp, bi, True, targets,
+            D, Fmlp, rank, alpha, seed, wd_on_out, ctx,
+        )
+        _append_chroma_direct_dora_stream(
+            set, handle.block, bp, bi, False, targets,
+            D, Fmlp, rank, alpha, seed, wd_on_out, ctx,
+        )
+        loader.mark_active_block_done(ctx)
+    for bi in range(num_single):
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        loader.prefetch_next_with_ctx(block_idx, ctx)
+        _append_chroma_direct_dora_single(
+            set, handle.block, handle.prefix + String("."),
+            num_double, bi, targets, D, Fmlp, rank, alpha, seed, wd_on_out, ctx,
+        )
+        loader.mark_active_block_done(ctx)
+    if len(set.ad) != _flux_direct_expected_slots(num_double, num_single, targets):
+        raise Error("build_chroma_direct_dora_set_from_offload: direct slot count mismatch")
+    return set^
+
+
+def build_chroma_direct_oft_set_for_stack(
+    num_double: Int, num_single: Int,
+    D: Int, Fmlp: Int, block_size: Int, targets: Int,
+) raises -> FlatDirectOFTSet:
+    var set = empty_flat_direct_oft_set()
+    for bi in range(num_double):
+        for slot in range(DBL_STREAM_SLOTS):
+            if _flux_direct_dbl_slot_targeted(slot, targets):
+                if slot == D_MLP0:
+                    flat_direct_oft_append(set, D, Fmlp, block_size, _chroma_dbl_stream_prefix(bi, True, slot))
+                elif slot == D_MLP2:
+                    flat_direct_oft_append(set, Fmlp, D, block_size, _chroma_dbl_stream_prefix(bi, True, slot))
+                else:
+                    flat_direct_oft_append(set, D, D, block_size, _chroma_dbl_stream_prefix(bi, True, slot))
+        for slot in range(DBL_STREAM_SLOTS):
+            if _flux_direct_dbl_slot_targeted(DBL_STREAM_SLOTS + slot, targets):
+                if slot == D_MLP0:
+                    flat_direct_oft_append(set, D, Fmlp, block_size, _chroma_dbl_stream_prefix(bi, False, slot))
+                elif slot == D_MLP2:
+                    flat_direct_oft_append(set, Fmlp, D, block_size, _chroma_dbl_stream_prefix(bi, False, slot))
+                else:
+                    flat_direct_oft_append(set, D, D, block_size, _chroma_dbl_stream_prefix(bi, False, slot))
+    for bi in range(num_single):
+        if _flux_direct_sgl_slot_targeted(S_SQ, targets):
+            flat_direct_oft_append(set, D, D, block_size, _chroma_sgl_prefix(bi, S_SQ))
+        if _flux_direct_sgl_slot_targeted(S_SK, targets):
+            flat_direct_oft_append(set, D, D, block_size, _chroma_sgl_prefix(bi, S_SK))
+        if _flux_direct_sgl_slot_targeted(S_SV, targets):
+            flat_direct_oft_append(set, D, D, block_size, _chroma_sgl_prefix(bi, S_SV))
+        if _flux_direct_sgl_slot_targeted(S_PMLP, targets):
+            flat_direct_oft_append(set, D, Fmlp, block_size, _chroma_sgl_prefix(bi, S_PMLP))
+        if _flux_direct_sgl_slot_targeted(S_L2, targets):
+            flat_direct_oft_append(set, D + Fmlp, D, block_size, _chroma_sgl_prefix(bi, S_L2))
+    if len(set.ad) != _flux_direct_expected_slots(num_double, num_single, targets):
+        raise Error("build_chroma_direct_oft_set_for_stack: direct slot count mismatch")
+    return set^
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # FULL FORWARD WITH LoRA, BLOCK-SWAP OFFLOAD.
 #   Inputs: img_tokens [N_IMG,in_ch], txt_tokens [N_TXT,txt_ch], the per-step
@@ -704,6 +920,152 @@ def chroma_stack_lora_forward_offload[
         dbl_img_mod^, dbl_txt_mod^, sgl_mod_flat^,
         TArc(_t(img_out^, [N_IMG, D], ctx)), TArc(_t(ln_img_out^, [N_IMG, D], ctx)),
         final_shift^, final_scale^,
+    )
+
+
+def _chroma_stack_direct_forward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    pooled: List[Float32], mod_index: Int,
+    base: ChromaStackBase,
+    mut loader: TurboPlannedLoader,
+    dora: FlatDirectDoRASet, oft: FlatDirectOFTSet, algo: Int,
+    num_double: Int, num_single: Int, targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    D: Int, Fmlp: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ChromaStackForward:
+    loader.prefetch_with_ctx(0, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+
+    var bi_img = Optional[Tensor](base.x_embedder_b[].clone(ctx))
+    var img = linear(
+        _t_like(img_tokens.copy(), [N_IMG, in_ch], base.x_embedder_w[], ctx),
+        base.x_embedder_w[], bi_img, ctx,
+    ).to_host(ctx)
+    var bi_txt = Optional[Tensor](base.context_embedder_b[].clone(ctx))
+    var txt = linear(
+        _t_like(txt_tokens.copy(), [N_TXT, txt_ch], base.context_embedder_w[], ctx),
+        base.context_embedder_w[], bi_txt, ctx,
+    ).to_host(ctx)
+
+    var dbl_img_mod = List[List[Float32]]()
+    var dbl_txt_mod = List[List[Float32]]()
+    var dbl_saved = List[ChromaDoubleBlockSaved]()
+    for bi in range(num_double):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var w = _chroma_double_from_block(handle.block, handle.prefix + String("."), D, Fmlp, Dh, ctx)
+        var im_flat = _dbl_img_mod_flat(pooled, bi, num_double, num_single, D)
+        var tm_flat = _dbl_txt_mod_flat(pooled, bi, num_double, num_single, D)
+        var im = _modvecs_from_flat6(im_flat, D)
+        var tm = _modvecs_from_flat6(tm_flat, D)
+        var direct = _flux_direct_dora_double_for(dora, bi, targets) if algo == FLUX_DIRECT_ALGO_DORA else _flux_direct_oft_double_for(oft, bi, targets)
+        var fwd = double_block_direct_lycoris_forward[H, Dh, N_IMG, N_TXT, S](
+            img.copy(), txt.copy(), w, im, tm, direct, cos_t, sin_t, D, Fmlp, eps, ctx,
+        )
+        dbl_saved.append(fwd.saved.copy())
+        dbl_img_mod.append(im_flat^)
+        dbl_txt_mod.append(tm_flat^)
+        img = fwd.img_out.copy()
+        txt = fwd.txt_out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var x = _concat_seq(txt, img)
+
+    var sgl_mod_flat = List[List[Float32]]()
+    var sgl_saved = List[ChromaSingleBlockSaved]()
+    for bi in range(num_single):
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        loader.prefetch_next_with_ctx(block_idx, ctx)
+        var w = _chroma_single_from_block(handle.block, handle.prefix + String("."), D, Fmlp, Dh, ctx)
+        var sm_flat = _sgl_mod_flat(pooled, bi, D)
+        var sm = _single_modvecs_from_flat3(sm_flat, D)
+        var direct = _flux_direct_dora_single_for(dora, num_double, bi, targets) if algo == FLUX_DIRECT_ALGO_DORA else _flux_direct_oft_single_for(oft, num_double, bi, targets)
+        var fwd = single_block_direct_lycoris_forward[H, Dh, S](
+            x.copy(), w, sm, direct, cos_t, sin_t, D, Fmlp, eps, ctx,
+        )
+        sgl_saved.append(fwd.saved.copy())
+        sgl_mod_flat.append(sm_flat^)
+        x = fwd.out.copy()
+        loader.mark_active_block_done(ctx)
+
+    var parts = _split_seq(x, N_TXT, N_IMG, D)
+    var img_out = parts[1].copy()
+
+    var ss = _final_shift_scale(pooled, mod_index, D)
+    var final_shift = ss[0].copy()
+    var final_scale = ss[1].copy()
+
+    var ln_img_out = layer_norm(
+        _t(img_out.copy(), [N_IMG, D], ctx),
+        _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), eps, ctx,
+    ).to_host(ctx)
+    var normed = modulate(
+        _t(ln_img_out.copy(), [N_IMG, D], ctx),
+        _t(final_scale.copy(), [D], ctx), _t(final_shift.copy(), [D], ctx), ctx,
+    ).to_host(ctx)
+    var pb = Optional[Tensor](base.proj_out_b[].clone(ctx))
+    var out = linear(
+        _t_like(normed, [N_IMG, D], base.proj_out_w[], ctx),
+        base.proj_out_w[], pb, ctx,
+    ).to_host(ctx)
+
+    return ChromaStackForward(
+        out^, dbl_saved^, sgl_saved^,
+        dbl_img_mod^, dbl_txt_mod^, sgl_mod_flat^,
+        TArc(_t(img_out^, [N_IMG, D], ctx)), TArc(_t(ln_img_out^, [N_IMG, D], ctx)),
+        final_shift^, final_scale^,
+    )
+
+
+def chroma_stack_direct_dora_forward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    pooled: List[Float32], mod_index: Int,
+    base: ChromaStackBase,
+    mut loader: TurboPlannedLoader, dora: FlatDirectDoRASet,
+    num_double: Int, num_single: Int, targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    D: Int, Fmlp: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ChromaStackForward:
+    var expected = _flux_direct_expected_slots(num_double, num_single, targets)
+    if len(dora.ad) != expected:
+        raise Error("chroma_stack_direct_dora_forward_offload: direct slot count mismatch")
+    return _chroma_stack_direct_forward_offload[H, Dh, N_IMG, N_TXT, S](
+        img_tokens, txt_tokens, pooled, mod_index, base, loader,
+        dora, empty_flat_direct_oft_set(),
+        FLUX_DIRECT_ALGO_DORA, num_double, num_single, targets, cos, sin,
+        D, Fmlp, in_ch, txt_ch, out_ch, eps, ctx,
+    )
+
+
+def chroma_stack_direct_oft_forward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    pooled: List[Float32], mod_index: Int,
+    base: ChromaStackBase,
+    mut loader: TurboPlannedLoader, oft: FlatDirectOFTSet,
+    num_double: Int, num_single: Int, targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    D: Int, Fmlp: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ChromaStackForward:
+    var expected = _flux_direct_expected_slots(num_double, num_single, targets)
+    if len(oft.ad) != expected:
+        raise Error("chroma_stack_direct_oft_forward_offload: direct slot count mismatch")
+    return _chroma_stack_direct_forward_offload[H, Dh, N_IMG, N_TXT, S](
+        img_tokens, txt_tokens, pooled, mod_index, base, loader,
+        empty_flat_direct_dora_set(),
+        oft, FLUX_DIRECT_ALGO_OFT, num_double, num_single, targets, cos, sin,
+        D, Fmlp, in_ch, txt_ch, out_ch, eps, ctx,
     )
 
 
@@ -837,4 +1199,214 @@ def chroma_stack_lora_backward_offload[
         d_img_tokens^, d_txt_tokens^, _zeros(D),
         _zeros(1), _zeros(1), _zeros(1),
         nonfinite,
+    )
+
+
+def chroma_stack_direct_dora_backward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ChromaStackBase,
+    mut loader: TurboPlannedLoader, dora: FlatDirectDoRASet,
+    num_double: Int, num_single: Int, targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    saved: ChromaStackForward,
+    D: Int, Fmlp: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> FluxDirectDoRAGradSet:
+    var expected = _flux_direct_expected_slots(num_double, num_single, targets)
+    if len(dora.ad) != expected:
+        raise Error("chroma_stack_direct_dora_backward_offload: direct slot count mismatch")
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var dora_grads = _flux_direct_dora_zero_grads(dora)
+    var nonfinite = 0
+
+    var normed = modulate(
+        saved.ln_img_out[],
+        _t(saved.final_scale.copy(), [D], ctx), _t(saved.final_shift.copy(), [D], ctx), ctx,
+    ).to_host(ctx)
+    var lbf = linear_backward(
+        _t_like(d_out, [N_IMG, out_ch], base.proj_out_w[], ctx),
+        _t_like(normed, [N_IMG, D], base.proj_out_w[], ctx), base.proj_out_w[],
+        N_IMG, D, out_ch, ctx,
+    )
+    var d_normed = lbf.d_x.to_host(ctx)
+    var mbf = modulate_backward(
+        _t(d_normed, [N_IMG, D], ctx), saved.ln_img_out[],
+        _t(saved.final_scale.copy(), [D], ctx), ctx,
+    )
+    var d_ln_img_out = mbf.d_x.to_host(ctx)
+    var lnbf = layer_norm_backward(
+        _t(d_ln_img_out, [N_IMG, D], ctx), saved.img_out[], _t(_ones(D), [D], ctx), eps, ctx,
+    )
+    var d_x = _concat_seq(_zeros(N_TXT * D), lnbf.d_x.to_host(ctx))
+
+    var bi = num_single - 1
+    while bi >= 0:
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+        var w = _chroma_single_from_block(handle.block, handle.prefix + String("."), D, Fmlp, Dh, ctx)
+        var sm = _single_modvecs_from_flat3(saved.sgl_mod_flat[bi].copy(), D)
+        var direct = _flux_direct_dora_single_for(dora, num_double, bi, targets)
+        var bg = single_block_direct_lycoris_backward[H, Dh, S](
+            d_x.copy(), w, sm, direct, saved.sgl_saved[bi], cos_t, sin_t, D, Fmlp, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        _scatter_flux_dora_single(dora_grads, targets, num_double, bi, bg)
+        nonfinite += _nonfinite_flux_direct_single(bg)
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    var seam = _split_seq(d_x, N_TXT, N_IMG, D)
+    var d_to = seam[0].copy()
+    var d_io = seam[1].copy()
+
+    var di = num_double - 1
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var w = _chroma_double_from_block(handle.block, handle.prefix + String("."), D, Fmlp, Dh, ctx)
+        var im = _modvecs_from_flat6(saved.dbl_img_mod[di].copy(), D)
+        var tm = _modvecs_from_flat6(saved.dbl_txt_mod[di].copy(), D)
+        var direct = _flux_direct_dora_double_for(dora, di, targets)
+        var bg = double_block_direct_lycoris_backward[H, Dh, N_IMG, N_TXT, S](
+            d_io.copy(), d_to.copy(), w, im, tm, direct, saved.dbl_saved[di],
+            cos_t, sin_t, D, Fmlp, eps, ctx,
+        )
+        d_io = bg.img.d_x.copy()
+        d_to = bg.txt.d_x.copy()
+        _scatter_flux_dora_double(dora_grads, targets, di, bg)
+        nonfinite += _nonfinite_flux_direct_double(bg)
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    var lbi = linear_backward(
+        _t_like(d_io, [N_IMG, D], base.x_embedder_w[], ctx),
+        _t_like(img_tokens, [N_IMG, in_ch], base.x_embedder_w[], ctx), base.x_embedder_w[],
+        N_IMG, in_ch, D, ctx,
+    )
+    var d_img_tokens = lbi.d_x.to_host(ctx)
+    var lbt = linear_backward(
+        _t_like(d_to, [N_TXT, D], base.context_embedder_w[], ctx),
+        _t_like(txt_tokens, [N_TXT, txt_ch], base.context_embedder_w[], ctx), base.context_embedder_w[],
+        N_TXT, txt_ch, D, ctx,
+    )
+    var d_txt_tokens = lbt.d_x.to_host(ctx)
+
+    return FluxDirectDoRAGradSet(
+        dora_grads^, d_img_tokens^, d_txt_tokens^, _zeros(D),
+        _zeros(1), _zeros(1), _zeros(1), nonfinite,
+    )
+
+
+def chroma_stack_direct_oft_backward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    img_tokens: List[Float32], txt_tokens: List[Float32],
+    base: ChromaStackBase,
+    mut loader: TurboPlannedLoader, oft: FlatDirectOFTSet,
+    num_double: Int, num_single: Int, targets: Int,
+    cos: List[Float32], sin: List[Float32],
+    saved: ChromaStackForward,
+    D: Int, Fmlp: Int, in_ch: Int, txt_ch: Int, out_ch: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> FluxDirectOFTGradSet:
+    var expected = _flux_direct_expected_slots(num_double, num_single, targets)
+    if len(oft.ad) != expected:
+        raise Error("chroma_stack_direct_oft_backward_offload: direct slot count mismatch")
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+
+    var cos_t = Tensor.from_host(cos.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var sin_t = Tensor.from_host(sin.copy(), [S * H, Dh // 2], STDtype.F32, ctx)
+    var oft_grads = _flux_direct_oft_zero_grads(oft)
+    var nonfinite = 0
+
+    var normed = modulate(
+        saved.ln_img_out[],
+        _t(saved.final_scale.copy(), [D], ctx), _t(saved.final_shift.copy(), [D], ctx), ctx,
+    ).to_host(ctx)
+    var lbf = linear_backward(
+        _t_like(d_out, [N_IMG, out_ch], base.proj_out_w[], ctx),
+        _t_like(normed, [N_IMG, D], base.proj_out_w[], ctx), base.proj_out_w[],
+        N_IMG, D, out_ch, ctx,
+    )
+    var d_normed = lbf.d_x.to_host(ctx)
+    var mbf = modulate_backward(
+        _t(d_normed, [N_IMG, D], ctx), saved.ln_img_out[],
+        _t(saved.final_scale.copy(), [D], ctx), ctx,
+    )
+    var d_ln_img_out = mbf.d_x.to_host(ctx)
+    var lnbf = layer_norm_backward(
+        _t(d_ln_img_out, [N_IMG, D], ctx), saved.img_out[], _t(_ones(D), [D], ctx), eps, ctx,
+    )
+    var d_x = _concat_seq(_zeros(N_TXT * D), lnbf.d_x.to_host(ctx))
+
+    var bi = num_single - 1
+    while bi >= 0:
+        var block_idx = num_double + bi
+        var handle = loader.await_block(block_idx, ctx)
+        if block_idx > 0:
+            loader.prefetch_with_ctx(block_idx - 1, ctx)
+        var w = _chroma_single_from_block(handle.block, handle.prefix + String("."), D, Fmlp, Dh, ctx)
+        var sm = _single_modvecs_from_flat3(saved.sgl_mod_flat[bi].copy(), D)
+        var direct = _flux_direct_oft_single_for(oft, num_double, bi, targets)
+        var bg = single_block_direct_lycoris_backward[H, Dh, S](
+            d_x.copy(), w, sm, direct, saved.sgl_saved[bi], cos_t, sin_t, D, Fmlp, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        _scatter_flux_oft_single(oft_grads, targets, num_double, bi, bg)
+        nonfinite += _nonfinite_flux_direct_single(bg)
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    var seam = _split_seq(d_x, N_TXT, N_IMG, D)
+    var d_to = seam[0].copy()
+    var d_io = seam[1].copy()
+
+    var di = num_double - 1
+    while di >= 0:
+        var handle = loader.await_block(di, ctx)
+        if di > 0:
+            loader.prefetch_with_ctx(di - 1, ctx)
+        var w = _chroma_double_from_block(handle.block, handle.prefix + String("."), D, Fmlp, Dh, ctx)
+        var im = _modvecs_from_flat6(saved.dbl_img_mod[di].copy(), D)
+        var tm = _modvecs_from_flat6(saved.dbl_txt_mod[di].copy(), D)
+        var direct = _flux_direct_oft_double_for(oft, di, targets)
+        var bg = double_block_direct_lycoris_backward[H, Dh, N_IMG, N_TXT, S](
+            d_io.copy(), d_to.copy(), w, im, tm, direct, saved.dbl_saved[di],
+            cos_t, sin_t, D, Fmlp, eps, ctx,
+        )
+        d_io = bg.img.d_x.copy()
+        d_to = bg.txt.d_x.copy()
+        _scatter_flux_oft_double(oft_grads, targets, di, bg)
+        nonfinite += _nonfinite_flux_direct_double(bg)
+        loader.mark_active_block_done(ctx)
+        di -= 1
+
+    var lbi = linear_backward(
+        _t_like(d_io, [N_IMG, D], base.x_embedder_w[], ctx),
+        _t_like(img_tokens, [N_IMG, in_ch], base.x_embedder_w[], ctx), base.x_embedder_w[],
+        N_IMG, in_ch, D, ctx,
+    )
+    var d_img_tokens = lbi.d_x.to_host(ctx)
+    var lbt = linear_backward(
+        _t_like(d_to, [N_TXT, D], base.context_embedder_w[], ctx),
+        _t_like(txt_tokens, [N_TXT, txt_ch], base.context_embedder_w[], ctx), base.context_embedder_w[],
+        N_TXT, txt_ch, D, ctx,
+    )
+    var d_txt_tokens = lbt.d_x.to_host(ctx)
+
+    return FluxDirectOFTGradSet(
+        oft_grads^, d_img_tokens^, d_txt_tokens^, _zeros(D),
+        _zeros(1), _zeros(1), _zeros(1), nonfinite,
     )

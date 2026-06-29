@@ -43,8 +43,21 @@ from serenitymojo.ops.attention_backward import sdpa_backward_masked
 from serenitymojo.ops.tensor_algebra import reshape, add
 from serenitymojo.models.zimage.lora_block import (
     ZImageLoraAdapterDevice,
+    ZImageBlockDirectLycoris,
+    ZImageBlockDirectGrads,
+    ZImageBlockDirectTensorBackward,
+    ZImageDirectProjectionGrad,
+    SLOT_Q,
+    SLOT_K,
+    SLOT_V,
+    SLOT_O,
+    SLOT_W1,
+    SLOT_W3,
+    SLOT_W2,
     zimage_lora_apply_device,
     zimage_lora_bwd_device_resident_tensors,
+    zimage_direct_projection_forward_device,
+    zimage_direct_projection_backward_device,
 )
 from serenitymojo.ops.attention import sdpa
 from serenitymojo.models.dit.hidream_o1 import _repeat_kv
@@ -255,6 +268,82 @@ def hidream_o1_block_lora_forward[
     return HiDreamO1BlockForward(out^, saved^)
 
 
+def hidream_o1_block_direct_lycoris_forward[
+    S: Int, H: Int, HKV: Int, Dh: Int
+](
+    hidden_in: TArc,
+    w: HiDreamO1BlockWeights,
+    direct: ZImageBlockDirectLycoris,
+    cos_q: Tensor, sin_q: Tensor,
+    cos_k: Tensor, sin_k: Tensor,
+    mask: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> HiDreamO1BlockForward:
+    """HiDream block forward with direct DoRA/OFT W_eff substitution.
+
+    Slot order stays q,k,v,o,gate,up,down; the direct projection helper takes
+    explicit dimensions, so HiDream's GQA k/v output width can differ from q/o.
+    """
+    comptime n_rep = H // HKV
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var normed_t = rms_norm(hidden_in[], w.in_ln[], eps, ctx)
+    var normed = TArc(normed_t^)
+
+    var q_flat = zimage_direct_projection_forward_device(
+        direct, SLOT_Q, normed[], w.qw[], S, D, H * Dh, ctx,
+    )
+    var k_flat = zimage_direct_projection_forward_device(
+        direct, SLOT_K, normed[], w.kw[], S, D, HKV * Dh, ctx,
+    )
+    var v_flat = zimage_direct_projection_forward_device(
+        direct, SLOT_V, normed[], w.vw[], S, D, HKV * Dh, ctx,
+    )
+
+    var q4 = reshape(q_flat, [1, S, H, Dh], ctx)
+    var k4 = reshape(k_flat, [1, S, HKV, Dh], ctx)
+    var v4 = reshape(v_flat, [1, S, HKV, Dh], ctx)
+    var q_pre = TArc(q4^)
+    var k_pre = TArc(k4^)
+    var v = TArc(v4^)
+
+    var q_rms = TArc(rms_norm(q_pre[], w.q_norm[], eps, ctx))
+    var k_rms = TArc(rms_norm(k_pre[], w.k_norm[], eps, ctx))
+
+    var q_rope = TArc(rope_halfsplit(q_rms[], cos_q, sin_q, ctx))
+    var k_rope = TArc(rope_halfsplit(k_rms[], cos_k, sin_k, ctx))
+
+    var k_rep = TArc(_repeat_kv(k_rope[], S, HKV, n_rep, Dh, ctx))
+    var v_rep = TArc(_repeat_kv(v[], S, HKV, n_rep, Dh, ctx))
+
+    var attn = sdpa[1, S, H, Dh](q_rope[], k_rep[], v_rep[], mask, scale, ctx)
+    var attn_flat_t = reshape(attn, [1, S, H * Dh], ctx)
+    var attn_flat = TArc(attn_flat_t^)
+
+    var attn_out = zimage_direct_projection_forward_device(
+        direct, SLOT_O, attn_flat[], w.ow[], S, H * Dh, D, ctx,
+    )
+    var hidden2 = TArc(add(hidden_in[], attn_out, ctx))
+
+    var normed2 = TArc(rms_norm(hidden2[], w.post_ln[], eps, ctx))
+    var gate_pre = TArc(zimage_direct_projection_forward_device(
+        direct, SLOT_W1, normed2[], w.gw[], S, D, F, ctx))
+    var up_pre = TArc(zimage_direct_projection_forward_device(
+        direct, SLOT_W3, normed2[], w.uw[], S, D, F, ctx))
+    var act = TArc(swiglu(gate_pre[], up_pre[], ctx))
+    var mlp_out = zimage_direct_projection_forward_device(
+        direct, SLOT_W2, act[], w.dw[], S, F, D, ctx)
+    var out = TArc(add(hidden2[], mlp_out, ctx))
+
+    var saved = HiDreamO1BlockSaved(
+        hidden_in.copy(), normed^, q_pre^, k_pre^, v^, q_rms^, k_rms^,
+        q_rope^, k_rope^, k_rep^, v_rep^, attn_flat^, hidden2^, normed2^,
+        gate_pre^, up_pre^, act^,
+    )
+    return HiDreamO1BlockForward(out^, saved^)
+
+
 struct HiDreamO1BlockGrads(Movable):
     """d_hidden + per-slot adapter grads (slot order q,k,v,o,gate,up,down;
     entries None for untrained slots — mirrors HiDreamO1BlockLora)."""
@@ -393,3 +482,68 @@ def hidream_o1_block_lora_backward[
     var d_hidden = add(d_hidden2, d_h_norm, ctx)
 
     return HiDreamO1BlockGrads(TArc(d_hidden^), d_a^, d_b^)
+
+
+def hidream_o1_block_direct_lycoris_backward[
+    S: Int, H: Int, HKV: Int, Dh: Int
+](
+    d_out: Tensor,
+    w: HiDreamO1BlockWeights,
+    direct: ZImageBlockDirectLycoris,
+    saved: HiDreamO1BlockSaved,
+    cos_q: Tensor, sin_q: Tensor,
+    cos_k: Tensor, sin_k: Tensor,
+    mask_f32: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageBlockDirectTensorBackward:
+    comptime n_rep = H // HKV
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var lb_down = zimage_direct_projection_backward_device(
+        direct, SLOT_W2, d_out, saved.act[], w.dw[], S, F, D, ctx)
+    var sg = swiglu_backward(lb_down.d_x[], saved.gate_pre[], saved.up_pre[], ctx)
+    var lb_gate = zimage_direct_projection_backward_device(
+        direct, SLOT_W1, sg.d_gate, saved.normed2[], w.gw[], S, D, F, ctx)
+    var lb_up = zimage_direct_projection_backward_device(
+        direct, SLOT_W3, sg.d_up, saved.normed2[], w.uw[], S, D, F, ctx)
+    var d_normed2 = add(lb_gate.d_x[], lb_up.d_x[], ctx)
+    var d_h2_norm = rms_norm_backward_dx(d_normed2, saved.hidden2[], w.post_ln[], eps, ctx)
+    var d_hidden2 = add(d_out, d_h2_norm, ctx)
+
+    var lb_o = zimage_direct_projection_backward_device(
+        direct, SLOT_O, d_hidden2, saved.attn_flat[], w.ow[], S, H * Dh, D, ctx)
+    var d_attn4 = reshape(lb_o.d_x[], [1, S, H, Dh], ctx)
+
+    var sb = sdpa_backward_masked[1, S, H, Dh](
+        saved.q_rope[], saved.k_rep[], saved.v_rep[], mask_f32, d_attn4, scale, ctx)
+
+    var d_k_rope = repeat_kv_backward(sb.d_k, S, HKV, n_rep, Dh, ctx)
+    var d_v4 = repeat_kv_backward(sb.d_v, S, HKV, n_rep, Dh, ctx)
+
+    var d_q_rms = rope_backward(sb.d_q, cos_q, sin_q, False, ctx)
+    var d_k_rms = rope_backward(d_k_rope, cos_k, sin_k, False, ctx)
+
+    var d_q_pre = rms_norm_backward_dx(d_q_rms, saved.q_pre[], w.q_norm[], eps, ctx)
+    var d_k_pre = rms_norm_backward_dx(d_k_rms, saved.k_pre[], w.k_norm[], eps, ctx)
+
+    var d_q_flat = reshape(d_q_pre, [1, S, H * Dh], ctx)
+    var d_k_flat = reshape(d_k_pre, [1, S, HKV * Dh], ctx)
+    var d_v_flat = reshape(d_v4, [1, S, HKV * Dh], ctx)
+
+    var lb_q = zimage_direct_projection_backward_device(
+        direct, SLOT_Q, d_q_flat, saved.normed[], w.qw[], S, D, H * Dh, ctx)
+    var lb_k = zimage_direct_projection_backward_device(
+        direct, SLOT_K, d_k_flat, saved.normed[], w.kw[], S, D, HKV * Dh, ctx)
+    var lb_v = zimage_direct_projection_backward_device(
+        direct, SLOT_V, d_v_flat, saved.normed[], w.vw[], S, D, HKV * Dh, ctx)
+
+    var d_normed = add(add(lb_q.d_x[], lb_k.d_x[], ctx), lb_v.d_x[], ctx)
+    var d_h_norm = rms_norm_backward_dx(d_normed, saved.hidden[], w.in_ln[], eps, ctx)
+    var d_hidden = add(d_hidden2, d_h_norm, ctx)
+
+    var grads = ZImageBlockDirectGrads(
+        lb_q.g.copy(), lb_k.g.copy(), lb_v.g.copy(), lb_o.g.copy(),
+        lb_gate.g.copy(), lb_up.g.copy(), lb_down.g.copy(),
+    )
+    return ZImageBlockDirectTensorBackward(TArc(d_hidden^), grads^)

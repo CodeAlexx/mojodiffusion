@@ -1,0 +1,19 @@
+{
+  "model_type": "wan22",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/wan2.2_t2v_low_noise_14b_fp16.safetensors",
+  "network_algorithm": "dora",
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "learning_rate": 0.0001,
+  "max_steps": 1,
+  "save_every": 0,
+  "sample_every": 0,
+  "seed": 42,
+  "cache_dir": "/home/alex/datasets/wan22_cache",
+  "optimizer": {
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999
+  }
+}

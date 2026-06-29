@@ -12,6 +12,12 @@
 
 from std.collections import List
 from std.math import sqrt
+from std.memory import ArcPointer
+from std.gpu.host import DeviceContext
+from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.oft_onetrainer import (
     oft_ot_skew, oft_ot_neumann_r, _neumann_backward,
@@ -19,6 +25,7 @@ from serenitymojo.training.oft_onetrainer import (
 from serenitymojo.training.lokr_stack import (
     klein_lokr_slot_dims, _slot_targeted, _DBL_SLOTS, _SGL_SLOTS,
     LOKR_TGT_ALL, LOKR_CARRIER_MAX_DEVICE_BYTES,
+    klein_lokr_prefix, klein_lokr_base_weight_f32,
 )
 
 
@@ -183,6 +190,10 @@ def _dummy_oft_slot() -> OFTSlot:
     return OFTSlot(_zeros(1), _zeros(1), 1, 1, 1, 1, _zeros(1), _zeros(1))
 
 
+def empty_klein_oft_set() -> KleinOFTSet:
+    return KleinOFTSet(List[OFTSlot](), List[Bool](), List[OFTSlot](), List[Bool](), 0, 0)
+
+
 def _make_oft_slot(in_f: Int, out_f: Int, block_size: Int, seed: UInt64) raises -> OFTSlot:
     if in_f % block_size != 0:
         raise Error(String("OFT: in_f ") + String(in_f) + " not divisible by block_size " + String(block_size))
@@ -194,6 +205,21 @@ def _make_oft_slot(in_f: Int, out_f: Int, block_size: Int, seed: UInt64) raises 
         _oft_synth_w(out_f, in_f, seed),
         in_f, out_f, b, r,
         _zeros(r * ne), _zeros(r * ne),       # m, v
+    )
+
+
+def _make_oft_slot_with_w(var w: List[Float32], in_f: Int, out_f: Int, block_size: Int) raises -> OFTSlot:
+    if in_f % block_size != 0:
+        raise Error(String("OFT: in_f ") + String(in_f) + " not divisible by block_size " + String(block_size))
+    if len(w) != out_f * in_f:
+        raise Error("OFT: base weight numel mismatch")
+    var b = block_size
+    var r = in_f // b
+    var ne = b * (b - 1) // 2
+    return OFTSlot(
+        _zeros(r * ne), w^,
+        in_f, out_f, b, r,
+        _zeros(r * ne), _zeros(r * ne),
     )
 
 
@@ -228,6 +254,39 @@ def build_klein_oft_set(
                 sgl.append(_dummy_oft_slot())
                 sgl_active.append(False)
             s += 1
+    return KleinOFTSet(dbl^, dbl_active^, sgl^, sgl_active^, num_double, num_single)
+
+
+def build_klein_oft_set_from_checkpoint(
+    st: SafeTensors, num_double: Int, num_single: Int, D: Int, F: Int,
+    block_size: Int, targets: Int,
+) raises -> KleinOFTSet:
+    if targets < 1 or targets > LOKR_TGT_ALL:
+        raise Error("build_klein_oft_set_from_checkpoint: targets must be 1(attn)|2(attn+ff)|3(all)")
+    var dbl = List[OFTSlot]()
+    var dbl_active = List[Bool]()
+    for bi in range(num_double):
+        for slot in range(_DBL_SLOTS):
+            if _slot_targeted(True, slot, targets):
+                var dims = klein_lokr_slot_dims(True, slot, D, F)
+                var w = klein_lokr_base_weight_f32(st, True, bi, slot, D, F)
+                dbl.append(_make_oft_slot_with_w(w^, dims[0], dims[1], block_size))
+                dbl_active.append(True)
+            else:
+                dbl.append(_dummy_oft_slot())
+                dbl_active.append(False)
+    var sgl = List[OFTSlot]()
+    var sgl_active = List[Bool]()
+    for bi in range(num_single):
+        for slot in range(_SGL_SLOTS):
+            if _slot_targeted(False, slot, targets):
+                var dims = klein_lokr_slot_dims(False, slot, D, F)
+                var w = klein_lokr_base_weight_f32(st, False, bi, slot, D, F)
+                sgl.append(_make_oft_slot_with_w(w^, dims[0], dims[1], block_size))
+                sgl_active.append(True)
+            else:
+                sgl.append(_dummy_oft_slot())
+                sgl_active.append(False)
     return KleinOFTSet(dbl^, dbl_active^, sgl^, sgl_active^, num_double, num_single)
 
 
@@ -331,6 +390,36 @@ def klein_oft_adamw_step(
                            t, lr, beta1, beta2, eps, weight_decay)
 
 
+def _oft_vec_sqsum(g: List[Float32]) -> Float64:
+    var s = Float64(0.0)
+    for i in range(len(g)):
+        s += Float64(g[i]) * Float64(g[i])
+    return s
+
+
+def klein_oft_grad_norm(g: KleinOFTGrads) -> Float64:
+    var s = Float64(0.0)
+    for i in range(len(g.dbl)):
+        s += _oft_vec_sqsum(g.dbl[i])
+    for i in range(len(g.sgl)):
+        s += _oft_vec_sqsum(g.sgl[i])
+    return sqrt(s)
+
+
+def _oft_vec_scale(mut g: List[Float32], scale: Float32):
+    for i in range(len(g)):
+        g[i] = g[i] * scale
+
+
+def klein_oft_clip_grads(mut g: KleinOFTGrads, clip_scale: Float32):
+    if clip_scale == Float32(1.0):
+        return
+    for i in range(len(g.dbl)):
+        _oft_vec_scale(g.dbl[i], clip_scale)
+    for i in range(len(g.sgl)):
+        _oft_vec_scale(g.sgl[i], clip_scale)
+
+
 # vec starts EXACTLY 0 (R=I); must be >0 after a real step.
 def klein_oft_vec_l1(set: KleinOFTSet) -> Float64:
     var s = Float64(0.0)
@@ -349,3 +438,44 @@ def klein_oft_vec_l1(set: KleinOFTSet) -> Float64:
             var x = Float64(sl.vec[j])
             s += x if x >= 0.0 else -x
     return s
+
+
+def _f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+    var sh = List[Int]()
+    sh.append(rows)
+    sh.append(cols)
+    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+
+
+def save_klein_oft(set: KleinOFTSet, path: String, ctx: DeviceContext) raises -> Int:
+    """Save OneTrainer-format OFT modules as <prefix>.oft_R.weight.
+
+    OneTrainer's OFTModule owns OFTRotationModule.weight with shape
+    [in_features / block_size, block_size * (block_size - 1) / 2]. This is not
+    the older LyCORIS oft_blocks square format.
+    """
+    var names = List[String]()
+    var tensors = List[ArcPointer[Tensor]]()
+    var nmods = 0
+    for bi in range(set.num_double):
+        for slot in range(_DBL_SLOTS):
+            var flat = bi * _DBL_SLOTS + slot
+            if set.dbl_active[flat]:
+                ref sl = set.dbl[flat]
+                var ne = sl.b * (sl.b - 1) // 2
+                names.append(klein_lokr_prefix(True, bi, slot) + ".oft_R.weight")
+                tensors.append(ArcPointer(_f32_2d(sl.vec.copy(), sl.r, ne, ctx)))
+                nmods += 1
+    for bi in range(set.num_single):
+        for slot in range(_SGL_SLOTS):
+            var flat = bi * _SGL_SLOTS + slot
+            if set.sgl_active[flat]:
+                ref sl = set.sgl[flat]
+                var ne = sl.b * (sl.b - 1) // 2
+                names.append(klein_lokr_prefix(False, bi, slot) + ".oft_R.weight")
+                tensors.append(ArcPointer(_f32_2d(sl.vec.copy(), sl.r, ne, ctx)))
+                nmods += 1
+    if nmods == 0:
+        raise Error("save_klein_oft: refusing to write an empty OFT file")
+    save_safetensors(names, tensors, path, ctx)
+    return nmods

@@ -64,7 +64,9 @@ from serenitymojo.ops.tensor_algebra import (
 )
 
 # ── backward arms (GPU; all pre-built + gated) ───────────────────────────────
-from serenitymojo.ops.linalg_backward import linear_backward, LinearGrads
+from serenitymojo.ops.linalg_backward import (
+    linear_backward, linear_backward_dx, LinearGrads,
+)
 from serenitymojo.ops.norm_backward import (
     rms_norm_backward, RmsNormBackward,
     layer_norm_backward, layer_norm_backward_dx, LayerNormBackward,
@@ -230,8 +232,8 @@ struct WanModVecs(Copyable, Movable):
 
 
 # ── block trainable weights (DEVICE-RESIDENT TArc, uploaded ONCE) ─────────────
-#   self_attn q/k/v/o: [dim,dim] + bias [dim] ; norm_q/norm_k [head_dim]
-#   cross_attn q/k/v/o: [dim,dim] + bias [dim] ; norm_q/norm_k [head_dim]
+#   self_attn q/k/v/o: [dim,dim] + bias [dim] ; norm_q/norm_k [dim]
+#   cross_attn q/k/v/o: [dim,dim] + bias [dim] ; norm_q/norm_k [dim]
 #   norm3 weight/bias [dim]  (affine LN)
 #   ffn.0: [ffn,dim] + bias [ffn] ; ffn.2: [dim,ffn] + bias [dim]
 struct WanBlockWeights(Copyable, Movable):
@@ -287,8 +289,8 @@ struct WanBlockWeights(Copyable, Movable):
         self.sa_bk = TArc(Tensor.from_host(sa_bk^, [dim], STDtype.BF16, ctx))
         self.sa_bv = TArc(Tensor.from_host(sa_bv^, [dim], STDtype.BF16, ctx))
         self.sa_bo = TArc(Tensor.from_host(sa_bo^, [dim], STDtype.BF16, ctx))
-        self.sa_qn = TArc(Tensor.from_host(sa_qn^, [hd], STDtype.BF16, ctx))
-        self.sa_kn = TArc(Tensor.from_host(sa_kn^, [hd], STDtype.BF16, ctx))
+        self.sa_qn = TArc(Tensor.from_host(sa_qn^, [dim], STDtype.BF16, ctx))
+        self.sa_kn = TArc(Tensor.from_host(sa_kn^, [dim], STDtype.BF16, ctx))
         self.ca_wq = TArc(Tensor.from_host(ca_wq^, [dim, dim], STDtype.BF16, ctx))
         self.ca_wk = TArc(Tensor.from_host(ca_wk^, [dim, dim], STDtype.BF16, ctx))
         self.ca_wv = TArc(Tensor.from_host(ca_wv^, [dim, dim], STDtype.BF16, ctx))
@@ -297,8 +299,8 @@ struct WanBlockWeights(Copyable, Movable):
         self.ca_bk = TArc(Tensor.from_host(ca_bk^, [dim], STDtype.BF16, ctx))
         self.ca_bv = TArc(Tensor.from_host(ca_bv^, [dim], STDtype.BF16, ctx))
         self.ca_bo = TArc(Tensor.from_host(ca_bo^, [dim], STDtype.BF16, ctx))
-        self.ca_qn = TArc(Tensor.from_host(ca_qn^, [hd], STDtype.BF16, ctx))
-        self.ca_kn = TArc(Tensor.from_host(ca_kn^, [hd], STDtype.BF16, ctx))
+        self.ca_qn = TArc(Tensor.from_host(ca_qn^, [dim], STDtype.BF16, ctx))
+        self.ca_kn = TArc(Tensor.from_host(ca_kn^, [dim], STDtype.BF16, ctx))
         self.n3_w = TArc(Tensor.from_host(n3_w^, [dim], STDtype.BF16, ctx))
         self.n3_b = TArc(Tensor.from_host(n3_b^, [dim], STDtype.BF16, ctx))
         self.ffn0_w = TArc(Tensor.from_host(ffn0_w^, [ffn, dim], STDtype.BF16, ctx))
@@ -448,11 +450,13 @@ def wan22_block_forward[
     var q_flat = linear(sa_mp.o[], w.sa_wq[], Optional[Tensor](_clone_t(w.sa_bq[], ctx)), ctx)
     var k_flat = linear(sa_mp.o[], w.sa_wk[], Optional[Tensor](_clone_t(w.sa_bk[], ctx)), ctx)
     var v_flat = linear(sa_mp.o[], w.sa_wv[], Optional[Tensor](_clone_t(w.sa_bv[], ctx)), ctx)
+    var q_rms_flat = rms_norm(q_flat, w.sa_qn[], eps, ctx)
+    var k_rms_flat = rms_norm(k_flat, w.sa_kn[], eps, ctx)
     var q_pre = _to_bshd(q_flat^, S, H, Dh, ctx)
     var k_pre = _to_bshd(k_flat^, S, H, Dh, ctx)
     var v4 = _to_bshd(v_flat^, S, H, Dh, ctx)
-    var q_rms = rms_norm(q_pre, w.sa_qn[], eps, ctx)
-    var k_rms = rms_norm(k_pre, w.sa_kn[], eps, ctx)
+    var q_rms = _to_bshd(q_rms_flat^, S, H, Dh, ctx)
+    var k_rms = _to_bshd(k_rms_flat^, S, H, Dh, ctx)
     var cos_e = _expand_rope_per_head(cos16, S, H, Dh // 2, ctx)
     var sin_e = _expand_rope_per_head(sin16, S, H, Dh // 2, ctx)
     var q_rope = rope_interleaved(q_rms, cos_e, sin_e, ctx)
@@ -467,11 +471,13 @@ def wan22_block_forward[
     var caq_flat = linear(n3, w.ca_wq[], Optional[Tensor](_clone_t(w.ca_bq[], ctx)), ctx)
     var cak_flat = linear(context[], w.ca_wk[], Optional[Tensor](_clone_t(w.ca_bk[], ctx)), ctx)
     var cav_flat = linear(context[], w.ca_wv[], Optional[Tensor](_clone_t(w.ca_bv[], ctx)), ctx)
+    var caq_rms_flat = rms_norm(caq_flat, w.ca_qn[], eps, ctx)
+    var cak_rms_flat = rms_norm(cak_flat, w.ca_kn[], eps, ctx)
     var caq_pre = _to_bshd(caq_flat^, S, H, Dh, ctx)
     var cak_pre = reshape(cak_flat^, [1, TXT, H, Dh], ctx)
     var cav4 = reshape(cav_flat^, [1, TXT, H, Dh], ctx)
-    var caq_rms = rms_norm(caq_pre, w.ca_qn[], eps, ctx)
-    var cak_rms = rms_norm(cak_pre, w.ca_kn[], eps, ctx)
+    var caq_rms = _to_bshd(caq_rms_flat^, S, H, Dh, ctx)
+    var cak_rms = reshape(cak_rms_flat^, [1, TXT, H, Dh], ctx)
     var ca_att4 = _cross_attention[S, TXT, H, Dh](caq_rms, cak_rms, cav4, scale, ctx)
     var ca_att = _from_bshd(ca_att4^, S, dim, ctx)
     var ca_out = linear(ca_att, w.ca_wo[], Optional[Tensor](_clone_t(w.ca_bo[], ctx)), ctx)
@@ -708,25 +714,23 @@ def wan22_block_backward[
     var csb = sdpa_backward_rect[1, S, TXT, H, Dh](
         sv_ca_q_rms, sv_ca_k_rms, sv_ca_v, d_ca_att, scale, ctx,
     )
-    # caq_rms = rms_norm(caq_pre, ca_qn)
-    var sv_ca_q_pre = _tbf16(saved.ca_q_pre.copy(), [1, S, H, Dh], ctx)
-    var rb_caq = rms_norm_backward(csb.d_q, sv_ca_q_pre, w.ca_qn[], eps, ctx)
+    # caq_rms = rms_norm(caq_pre_flat, ca_qn) before head reshape.
+    var d_caq_rms_flat = reshape(csb.d_q, [S, dim], ctx)
+    var sv_ca_q_pre = _tbf16(saved.ca_q_pre.copy(), [S, dim], ctx)
+    var rb_caq = rms_norm_backward(d_caq_rms_flat, sv_ca_q_pre, w.ca_qn[], eps, ctx)
     var d_ca_qn = rb_caq.d_g.to_host(ctx)
-    var sv_ca_k_pre = _tbf16(saved.ca_k_pre.copy(), [1, TXT, H, Dh], ctx)
-    var rb_cak = rms_norm_backward(csb.d_k, sv_ca_k_pre, w.ca_kn[], eps, ctx)
+    var d_cak_rms_flat = reshape(csb.d_k, [TXT, dim], ctx)
+    var sv_ca_k_pre = _tbf16(saved.ca_k_pre.copy(), [TXT, dim], ctx)
+    var rb_cak = rms_norm_backward(d_cak_rms_flat, sv_ca_k_pre, w.ca_kn[], eps, ctx)
     var d_ca_kn = rb_cak.d_g.to_host(ctx)
-
-    # reshape [1,S,H,Dh]->[S,dim], [1,TXT,H,Dh]->[TXT,dim] (byte no-ops)
-    var d_caq_flat = reshape(rb_caq.d_x, [S, dim], ctx)
-    var d_cak_flat = reshape(rb_cak.d_x, [TXT, dim], ctx)
     var d_cav_flat = reshape(csb.d_v, [TXT, dim], ctx)
 
     # caq = linear(n3, ca_wq, ca_bq) ; cak = linear(context, ca_wk, ca_bk) ;
     # cav = linear(context, ca_wv, ca_bv)
     var sv_ca_n3 = _tbf16(saved.ca_n3.copy(), [S, dim], ctx)
     var sv_context = _tbf16(saved.context.copy(), [TXT, dim], ctx)
-    var lb_caq = linear_backward(d_caq_flat, sv_ca_n3, w.ca_wq[], S, dim, dim, ctx)
-    var lb_cak = linear_backward(d_cak_flat, sv_context, w.ca_wk[], TXT, dim, dim, ctx)
+    var lb_caq = linear_backward(rb_caq.d_x, sv_ca_n3, w.ca_wq[], S, dim, dim, ctx)
+    var lb_cak = linear_backward(rb_cak.d_x, sv_context, w.ca_wk[], TXT, dim, dim, ctx)
     var lb_cav = linear_backward(d_cav_flat, sv_context, w.ca_wv[], TXT, dim, dim, ctx)
     var d_ca_wq = lb_caq.d_w.to_host(ctx)
     var d_ca_bq = lb_caq.d_b.to_host(ctx)
@@ -775,22 +779,23 @@ def wan22_block_backward[
     var ssb_dk_f32 = cast_tensor(ssb.d_k, STDtype.F32, ctx)
     var d_q_rms = rope_backward(ssb_dq_f32, cos_e, sin_e, True, ctx)
     var d_k_rms = rope_backward(ssb_dk_f32, cos_e, sin_e, True, ctx)
-    # q_rms = rms_norm(q_pre, sa_qn) ; k_rms = rms_norm(k_pre, sa_kn)
-    var sv_sa_q_pre = _tbf16(saved.sa_q_pre.copy(), [1, S, H, Dh], ctx)
-    var rb_saq = rms_norm_backward(d_q_rms, sv_sa_q_pre, w.sa_qn[], eps, ctx)
+    # q_rms = rms_norm(q_pre_flat, sa_qn) before head reshape.
+    var d_q_rms_b = cast_tensor(d_q_rms, STDtype.BF16, ctx)
+    var d_q_rms_flat = reshape(d_q_rms_b, [S, dim], ctx)
+    var sv_sa_q_pre = _tbf16(saved.sa_q_pre.copy(), [S, dim], ctx)
+    var rb_saq = rms_norm_backward(d_q_rms_flat, sv_sa_q_pre, w.sa_qn[], eps, ctx)
     var d_sa_qn = rb_saq.d_g.to_host(ctx)
-    var sv_sa_k_pre = _tbf16(saved.sa_k_pre.copy(), [1, S, H, Dh], ctx)
-    var rb_sak = rms_norm_backward(d_k_rms, sv_sa_k_pre, w.sa_kn[], eps, ctx)
+    var d_k_rms_b = cast_tensor(d_k_rms, STDtype.BF16, ctx)
+    var d_k_rms_flat = reshape(d_k_rms_b, [S, dim], ctx)
+    var sv_sa_k_pre = _tbf16(saved.sa_k_pre.copy(), [S, dim], ctx)
+    var rb_sak = rms_norm_backward(d_k_rms_flat, sv_sa_k_pre, w.sa_kn[], eps, ctx)
     var d_sa_kn = rb_sak.d_g.to_host(ctx)
-
-    var d_saq_flat = reshape(rb_saq.d_x, [S, dim], ctx)
-    var d_sak_flat = reshape(rb_sak.d_x, [S, dim], ctx)
     var d_sav_flat = reshape(ssb.d_v, [S, dim], ctx)
 
     # q/k/v = linear(sa_in, sa_w{q,k,v}, sa_b{q,k,v}) — all on the SAME sa_in
     var sv_sa_in = _tbf16(saved.sa_in.copy(), [S, dim], ctx)
-    var lb_saq = linear_backward(d_saq_flat, sv_sa_in, w.sa_wq[], S, dim, dim, ctx)
-    var lb_sak = linear_backward(d_sak_flat, sv_sa_in, w.sa_wk[], S, dim, dim, ctx)
+    var lb_saq = linear_backward(rb_saq.d_x, sv_sa_in, w.sa_wq[], S, dim, dim, ctx)
+    var lb_sak = linear_backward(rb_sak.d_x, sv_sa_in, w.sa_wk[], S, dim, dim, ctx)
     var lb_sav = linear_backward(d_sav_flat, sv_sa_in, w.sa_wv[], S, dim, dim, ctx)
     var d_sa_wq = lb_saq.d_w.to_host(ctx)
     var d_sa_bq = lb_saq.d_b.to_host(ctx)
@@ -845,6 +850,29 @@ def wan22_block_backward[
 from serenitymojo.models.klein.lora_block import (
     LoraAdapter, klein_lora_fwd, klein_lora_bwd, KleinLoraGrads,
 )
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.oft_onetrainer import OFTOTGrads
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectOFTSet,
+    flat_direct_dora_forward_slot, flat_direct_dora_backward_slot,
+    flat_direct_oft_forward_slot, flat_direct_oft_backward_slot,
+)
+from serenitymojo.training.dora_substitution_device import (
+    dora_device_from_host, dora_substitution_forward_device,
+    dora_substitution_backward_device,
+)
+
+
+comptime WAN_DIRECT_ALGO_DORA = 1
+comptime WAN_DIRECT_ALGO_OFT = 2
+comptime WDIR_SA_Q = 0
+comptime WDIR_SA_K = 1
+comptime WDIR_SA_V = 2
+comptime WDIR_SA_O = 3
+comptime WDIR_CA_Q = 4
+comptime WDIR_CA_K = 5
+comptime WDIR_CA_V = 6
+comptime WDIR_CA_O = 7
 
 
 # Optional LoRA adapters for the block's 8 trained attention projections.
@@ -959,6 +987,252 @@ def _lora_bwd_opt(
     return klein_lora_bwd(d_y_h, x_h, lo.value(), M, ctx)
 
 
+# Host-side frozen W_orig/bias for the eight direct DoRA/OFT attention
+# projections. The base WanBlockWeights keeps BF16 device tensors for frozen
+# non-adapter math; this struct is streamed only when direct W_eff substitution
+# is active.
+struct WanBlockDirectProjectionWeights(Copyable, Movable):
+    var sa_wq: List[Float32]
+    var sa_wk: List[Float32]
+    var sa_wv: List[Float32]
+    var sa_wo: List[Float32]
+    var sa_bq: List[Float32]
+    var sa_bk: List[Float32]
+    var sa_bv: List[Float32]
+    var sa_bo: List[Float32]
+    var ca_wq: List[Float32]
+    var ca_wk: List[Float32]
+    var ca_wv: List[Float32]
+    var ca_wo: List[Float32]
+    var ca_bq: List[Float32]
+    var ca_bk: List[Float32]
+    var ca_bv: List[Float32]
+    var ca_bo: List[Float32]
+
+    def __init__(
+        out self,
+        var sa_wq: List[Float32], var sa_wk: List[Float32],
+        var sa_wv: List[Float32], var sa_wo: List[Float32],
+        var sa_bq: List[Float32], var sa_bk: List[Float32],
+        var sa_bv: List[Float32], var sa_bo: List[Float32],
+        var ca_wq: List[Float32], var ca_wk: List[Float32],
+        var ca_wv: List[Float32], var ca_wo: List[Float32],
+        var ca_bq: List[Float32], var ca_bk: List[Float32],
+        var ca_bv: List[Float32], var ca_bo: List[Float32],
+    ):
+        self.sa_wq = sa_wq^
+        self.sa_wk = sa_wk^
+        self.sa_wv = sa_wv^
+        self.sa_wo = sa_wo^
+        self.sa_bq = sa_bq^
+        self.sa_bk = sa_bk^
+        self.sa_bv = sa_bv^
+        self.sa_bo = sa_bo^
+        self.ca_wq = ca_wq^
+        self.ca_wk = ca_wk^
+        self.ca_wv = ca_wv^
+        self.ca_wo = ca_wo^
+        self.ca_bq = ca_bq^
+        self.ca_bk = ca_bk^
+        self.ca_bv = ca_bv^
+        self.ca_bo = ca_bo^
+
+
+struct WanBlockDirectLycoris(Copyable, Movable):
+    var algo: Int
+    var dora: FlatDirectDoRASet
+    var oft: FlatDirectOFTSet
+    var base_slot: Int
+
+    def __init__(
+        out self, algo: Int, var dora: FlatDirectDoRASet,
+        var oft: FlatDirectOFTSet, base_slot: Int,
+    ):
+        self.algo = algo
+        self.dora = dora^
+        self.oft = oft^
+        self.base_slot = base_slot
+
+
+struct WanDirectProjectionGrad(Copyable, Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+    var d_m: List[Float32]
+    var d_vec: List[Float32]
+    var d_x: List[Float32]
+
+    def __init__(
+        out self, var d_a: List[Float32], var d_b: List[Float32],
+        var d_m: List[Float32], var d_vec: List[Float32],
+        var d_x: List[Float32],
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_m = d_m^
+        self.d_vec = d_vec^
+        self.d_x = d_x^
+
+
+struct WanDirectProjectionGradDev(Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+    var d_m: List[Float32]
+    var d_vec: List[Float32]
+    var d_x: TArc
+
+    def __init__(
+        out self, var d_a: List[Float32], var d_b: List[Float32],
+        var d_m: List[Float32], var d_vec: List[Float32], var d_x: TArc,
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_m = d_m^
+        self.d_vec = d_vec^
+        self.d_x = d_x^
+
+
+def _direct_grad_dev_to_public(g: WanDirectProjectionGradDev) -> WanDirectProjectionGrad:
+    return WanDirectProjectionGrad(
+        g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), g.d_vec.copy(), List[Float32](),
+    )
+
+
+struct WanBlockDirectLycorisGrads(Copyable, Movable):
+    var d_x: List[Float32]
+    var d_context: List[Float32]
+    var sa_q: WanDirectProjectionGrad
+    var sa_k: WanDirectProjectionGrad
+    var sa_v: WanDirectProjectionGrad
+    var sa_o: WanDirectProjectionGrad
+    var ca_q: WanDirectProjectionGrad
+    var ca_k: WanDirectProjectionGrad
+    var ca_v: WanDirectProjectionGrad
+    var ca_o: WanDirectProjectionGrad
+
+    def __init__(
+        out self, var d_x: List[Float32], var d_context: List[Float32],
+        var sa_q: WanDirectProjectionGrad, var sa_k: WanDirectProjectionGrad,
+        var sa_v: WanDirectProjectionGrad, var sa_o: WanDirectProjectionGrad,
+        var ca_q: WanDirectProjectionGrad, var ca_k: WanDirectProjectionGrad,
+        var ca_v: WanDirectProjectionGrad, var ca_o: WanDirectProjectionGrad,
+    ):
+        self.d_x = d_x^
+        self.d_context = d_context^
+        self.sa_q = sa_q^
+        self.sa_k = sa_k^
+        self.sa_v = sa_v^
+        self.sa_o = sa_o^
+        self.ca_q = ca_q^
+        self.ca_k = ca_k^
+        self.ca_v = ca_v^
+        self.ca_o = ca_o^
+
+
+def _add_bias_inplace(mut y: List[Float32], bias: List[Float32], M: Int, dim: Int) raises:
+    if len(y) != M * dim:
+        raise Error("_add_bias_inplace: y numel mismatch")
+    if len(bias) != dim:
+        raise Error("_add_bias_inplace: bias numel mismatch")
+    for m in range(M):
+        for d in range(dim):
+            y[m * dim + d] += bias[d]
+
+
+def _direct_proj_fwd_tensor(
+    direct: WanBlockDirectLycoris, slot: Int,
+    x_h: List[Float32], w_orig: List[Float32], bias: List[Float32],
+    M: Int, dim: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var flat_slot = direct.base_slot + slot
+    if direct.algo == WAN_DIRECT_ALGO_DORA:
+        var y = flat_direct_dora_forward_slot(direct.dora, flat_slot, x_h, w_orig, M)
+        _add_bias_inplace(y, bias, M, dim)
+        return Tensor.from_host(y^, [M, dim], STDtype.BF16, ctx)
+    elif direct.algo == WAN_DIRECT_ALGO_OFT:
+        var y = flat_direct_oft_forward_slot(direct.oft, flat_slot, x_h, w_orig, M)
+        _add_bias_inplace(y, bias, M, dim)
+        return Tensor.from_host(y^, [M, dim], STDtype.BF16, ctx)
+    else:
+        raise Error("WanBlockDirectLycoris: unsupported direct algorithm")
+
+
+def _direct_proj_fwd_tensor_device(
+    direct: WanBlockDirectLycoris, slot: Int,
+    x: Tensor, w_orig_t: Tensor, bias_t: Tensor,
+    w_orig_h: List[Float32], bias_h: List[Float32],
+    M: Int, dim: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var flat_slot = direct.base_slot + slot
+    if direct.algo == WAN_DIRECT_ALGO_DORA:
+        if flat_slot < 0 or flat_slot >= len(direct.dora.ad):
+            raise Error("WanBlockDirectLycoris DoRA: slot out of range")
+        if not direct.dora.active[flat_slot]:
+            raise Error("WanBlockDirectLycoris DoRA: inactive slot")
+        var dev = dora_device_from_host(direct.dora.ad[flat_slot], ctx)
+        var y = dora_substitution_forward_device(x, w_orig_t, dev, ctx)
+        if bias_t.dtype() != y.dtype():
+            var bc = cast_tensor(bias_t, y.dtype(), ctx)
+            return add(y, bc, ctx)
+        return add(y, bias_t, ctx)
+    elif direct.algo == WAN_DIRECT_ALGO_OFT:
+        var x_h = x.to_host(ctx)
+        return _direct_proj_fwd_tensor(
+            direct, slot, x_h^, w_orig_h, bias_h, M, dim, ctx,
+        )
+    else:
+        raise Error("WanBlockDirectLycoris: unsupported direct algorithm")
+
+
+def _direct_proj_bwd(
+    direct: WanBlockDirectLycoris, slot: Int,
+    d_y_h: List[Float32], x_h: List[Float32], w_orig: List[Float32],
+    M: Int,
+) raises -> WanDirectProjectionGrad:
+    var flat_slot = direct.base_slot + slot
+    if direct.algo == WAN_DIRECT_ALGO_DORA:
+        var g = flat_direct_dora_backward_slot(direct.dora, flat_slot, d_y_h, x_h, w_orig, M)
+        return WanDirectProjectionGrad(
+            g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), List[Float32](), g.d_x.copy(),
+        )
+    if direct.algo == WAN_DIRECT_ALGO_OFT:
+        var g = flat_direct_oft_backward_slot(direct.oft, flat_slot, d_y_h, x_h, w_orig, M)
+        return WanDirectProjectionGrad(
+            List[Float32](), List[Float32](), List[Float32](), g.d_vec.copy(), g.d_x.copy(),
+        )
+    raise Error("WanBlockDirectLycoris: unsupported direct algorithm")
+
+
+def _direct_proj_bwd_device(
+    direct: WanBlockDirectLycoris, slot: Int,
+    d_y: Tensor, x: Tensor, w_orig_t: Tensor, w_orig_h: List[Float32],
+    M: Int, ctx: DeviceContext,
+) raises -> WanDirectProjectionGradDev:
+    var flat_slot = direct.base_slot + slot
+    if direct.algo == WAN_DIRECT_ALGO_DORA:
+        if flat_slot < 0 or flat_slot >= len(direct.dora.ad):
+            raise Error("WanBlockDirectLycoris DoRA backward: slot out of range")
+        if not direct.dora.active[flat_slot]:
+            raise Error("WanBlockDirectLycoris DoRA backward: inactive slot")
+        var dev = dora_device_from_host(direct.dora.ad[flat_slot], ctx)
+        var g = dora_substitution_backward_device(d_y, x, w_orig_t, dev, ctx)
+        return WanDirectProjectionGradDev(
+            g.d_a.to_host(ctx), g.d_b.to_host(ctx), g.d_m.to_host(ctx),
+            List[Float32](), TArc(g.d_x.clone(ctx)),
+        )
+    if direct.algo == WAN_DIRECT_ALGO_OFT:
+        var d_y_h = d_y.to_host(ctx)
+        var x_h = x.to_host(ctx)
+        var g = flat_direct_oft_backward_slot(
+            direct.oft, flat_slot, d_y_h^, x_h^, w_orig_h, M,
+        )
+        var d_x = Tensor.from_host(g.d_x.copy(), x.shape(), x.dtype(), ctx)
+        return WanDirectProjectionGradDev(
+            List[Float32](), List[Float32](), List[Float32](),
+            g.d_vec.copy(), TArc(d_x^),
+        )
+    raise Error("WanBlockDirectLycoris: unsupported direct algorithm")
+
+
 # ── FORWARD of one Wan2.2 block WITH LoRA ─────────────────────────────────────
 # Identical to wan22_block_forward but adds LoRA deltas at the 8 attention
 # projections. Saves the SAME WanSaved (the base saved activations) — but note
@@ -998,11 +1272,13 @@ def wan22_block_lora_forward[
     var q_flat = _add_lora_delta(q_base, sa_in_h, lora.sa_q, S, ctx)
     var k_flat = _add_lora_delta(k_base, sa_in_h, lora.sa_k, S, ctx)
     var v_flat = _add_lora_delta(v_base, sa_in_h, lora.sa_v, S, ctx)
+    var q_rms_flat = rms_norm(q_flat, w.sa_qn[], eps, ctx)
+    var k_rms_flat = rms_norm(k_flat, w.sa_kn[], eps, ctx)
     var q_pre = _to_bshd(q_flat^, S, H, Dh, ctx)
     var k_pre = _to_bshd(k_flat^, S, H, Dh, ctx)
     var v4 = _to_bshd(v_flat^, S, H, Dh, ctx)
-    var q_rms = rms_norm(q_pre, w.sa_qn[], eps, ctx)
-    var k_rms = rms_norm(k_pre, w.sa_kn[], eps, ctx)
+    var q_rms = _to_bshd(q_rms_flat^, S, H, Dh, ctx)
+    var k_rms = _to_bshd(k_rms_flat^, S, H, Dh, ctx)
     var cos_e = _expand_rope_per_head(cos16, S, H, Dh // 2, ctx)
     var sin_e = _expand_rope_per_head(sin16, S, H, Dh // 2, ctx)
     var q_rope = rope_interleaved(q_rms, cos_e, sin_e, ctx)
@@ -1023,11 +1299,13 @@ def wan22_block_lora_forward[
     var caq_flat = _add_lora_delta(caq_base, n3_h, lora.ca_q, S, ctx)
     var cak_flat = _add_lora_delta(cak_base, context_host, lora.ca_k, TXT, ctx)
     var cav_flat = _add_lora_delta(cav_base, context_host, lora.ca_v, TXT, ctx)
+    var caq_rms_flat = rms_norm(caq_flat, w.ca_qn[], eps, ctx)
+    var cak_rms_flat = rms_norm(cak_flat, w.ca_kn[], eps, ctx)
     var caq_pre = _to_bshd(caq_flat^, S, H, Dh, ctx)
     var cak_pre = reshape(cak_flat^, [1, TXT, H, Dh], ctx)
     var cav4 = reshape(cav_flat^, [1, TXT, H, Dh], ctx)
-    var caq_rms = rms_norm(caq_pre, w.ca_qn[], eps, ctx)
-    var cak_rms = rms_norm(cak_pre, w.ca_kn[], eps, ctx)
+    var caq_rms = _to_bshd(caq_rms_flat^, S, H, Dh, ctx)
+    var cak_rms = reshape(cak_rms_flat^, [1, TXT, H, Dh], ctx)
     var ca_att4 = _cross_attention[S, TXT, H, Dh](caq_rms, cak_rms, cav4, scale, ctx)
     var ca_att = _from_bshd(ca_att4^, S, dim, ctx)
     var ca_att_h = ca_att.to_host(ctx)
@@ -1137,21 +1415,21 @@ def wan22_block_lora_backward[
     var csb = sdpa_backward_rect[1, S, TXT, H, Dh](
         lsv_ca_q_rms, lsv_ca_k_rms, lsv_ca_v, d_ca_att4, scale, ctx,
     )
-    var lsv_ca_q_pre = _tbf16(saved.ca_q_pre.copy(), [1, S, H, Dh], ctx)
-    var rb_caq = rms_norm_backward(csb.d_q, lsv_ca_q_pre, w.ca_qn[], eps, ctx)
+    var d_caq_rms_flat = reshape(csb.d_q, [S, dim], ctx)
+    var lsv_ca_q_pre = _tbf16(saved.ca_q_pre.copy(), [S, dim], ctx)
+    var rb_caq = rms_norm_backward(d_caq_rms_flat, lsv_ca_q_pre, w.ca_qn[], eps, ctx)
     var d_ca_qn = rb_caq.d_g.to_host(ctx)
-    var lsv_ca_k_pre = _tbf16(saved.ca_k_pre.copy(), [1, TXT, H, Dh], ctx)
-    var rb_cak = rms_norm_backward(csb.d_k, lsv_ca_k_pre, w.ca_kn[], eps, ctx)
+    var d_cak_rms_flat = reshape(csb.d_k, [TXT, dim], ctx)
+    var lsv_ca_k_pre = _tbf16(saved.ca_k_pre.copy(), [TXT, dim], ctx)
+    var rb_cak = rms_norm_backward(d_cak_rms_flat, lsv_ca_k_pre, w.ca_kn[], eps, ctx)
     var d_ca_kn = rb_cak.d_g.to_host(ctx)
-    var d_caq_flat = reshape(rb_caq.d_x, [S, dim], ctx)
-    var d_cak_flat = reshape(rb_cak.d_x, [TXT, dim], ctx)
     var d_cav_flat = reshape(csb.d_v, [TXT, dim], ctx)
-    var d_caq_h = d_caq_flat.to_host(ctx)
-    var d_cak_h = d_cak_flat.to_host(ctx)
+    var d_caq_h = rb_caq.d_x.to_host(ctx)
+    var d_cak_h = rb_cak.d_x.to_host(ctx)
     var d_cav_h = d_cav_flat.to_host(ctx)
 
-    var lb_caq = linear_backward(d_caq_flat, sv_lora_ca_n3, w.ca_wq[], S, dim, dim, ctx)
-    var lb_cak = linear_backward(d_cak_flat, sv_lora_context, w.ca_wk[], TXT, dim, dim, ctx)
+    var lb_caq = linear_backward(rb_caq.d_x, sv_lora_ca_n3, w.ca_wq[], S, dim, dim, ctx)
+    var lb_cak = linear_backward(rb_cak.d_x, sv_lora_context, w.ca_wk[], TXT, dim, dim, ctx)
     var lb_cav = linear_backward(d_cav_flat, sv_lora_context, w.ca_wv[], TXT, dim, dim, ctx)
     var d_ca_wq = lb_caq.d_w.to_host(ctx)
     var d_ca_bq = lb_caq.d_b.to_host(ctx)
@@ -1202,21 +1480,23 @@ def wan22_block_lora_backward[
     var ssb_dk_f32 = cast_tensor(ssb.d_k, STDtype.F32, ctx)
     var d_q_rms = rope_backward(ssb_dq_f32, cos_e, sin_e, True, ctx)
     var d_k_rms = rope_backward(ssb_dk_f32, cos_e, sin_e, True, ctx)
-    var lsv_sa_q_pre = _tbf16(saved.sa_q_pre.copy(), [1, S, H, Dh], ctx)
-    var rb_saq = rms_norm_backward(d_q_rms, lsv_sa_q_pre, w.sa_qn[], eps, ctx)
+    var d_q_rms_b = cast_tensor(d_q_rms, STDtype.BF16, ctx)
+    var d_q_rms_flat = reshape(d_q_rms_b, [S, dim], ctx)
+    var lsv_sa_q_pre = _tbf16(saved.sa_q_pre.copy(), [S, dim], ctx)
+    var rb_saq = rms_norm_backward(d_q_rms_flat, lsv_sa_q_pre, w.sa_qn[], eps, ctx)
     var d_sa_qn = rb_saq.d_g.to_host(ctx)
-    var lsv_sa_k_pre = _tbf16(saved.sa_k_pre.copy(), [1, S, H, Dh], ctx)
-    var rb_sak = rms_norm_backward(d_k_rms, lsv_sa_k_pre, w.sa_kn[], eps, ctx)
+    var d_k_rms_b = cast_tensor(d_k_rms, STDtype.BF16, ctx)
+    var d_k_rms_flat = reshape(d_k_rms_b, [S, dim], ctx)
+    var lsv_sa_k_pre = _tbf16(saved.sa_k_pre.copy(), [S, dim], ctx)
+    var rb_sak = rms_norm_backward(d_k_rms_flat, lsv_sa_k_pre, w.sa_kn[], eps, ctx)
     var d_sa_kn = rb_sak.d_g.to_host(ctx)
-    var d_saq_flat = reshape(rb_saq.d_x, [S, dim], ctx)
-    var d_sak_flat = reshape(rb_sak.d_x, [S, dim], ctx)
     var d_sav_flat = reshape(ssb.d_v, [S, dim], ctx)
-    var d_saq_h = d_saq_flat.to_host(ctx)
-    var d_sak_h = d_sak_flat.to_host(ctx)
+    var d_saq_h = rb_saq.d_x.to_host(ctx)
+    var d_sak_h = rb_sak.d_x.to_host(ctx)
     var d_sav_h = d_sav_flat.to_host(ctx)
 
-    var lb_saq = linear_backward(d_saq_flat, sv_lora_sa_in, w.sa_wq[], S, dim, dim, ctx)
-    var lb_sak = linear_backward(d_sak_flat, sv_lora_sa_in, w.sa_wk[], S, dim, dim, ctx)
+    var lb_saq = linear_backward(rb_saq.d_x, sv_lora_sa_in, w.sa_wq[], S, dim, dim, ctx)
+    var lb_sak = linear_backward(rb_sak.d_x, sv_lora_sa_in, w.sa_wk[], S, dim, dim, ctx)
     var lb_sav = linear_backward(d_sav_flat, sv_lora_sa_in, w.sa_wv[], S, dim, dim, ctx)
     var d_sa_wq = lb_saq.d_w.to_host(ctx)
     var d_sa_bq = lb_saq.d_b.to_host(ctx)
@@ -1269,4 +1549,279 @@ def wan22_block_lora_backward[
         ca_k_g.d_a.copy(), ca_k_g.d_b.copy(),
         ca_v_g.d_a.copy(), ca_v_g.d_b.copy(),
         ca_o_g.d_a.copy(), ca_o_g.d_b.copy(),
+    )
+
+
+# ── FORWARD of one Wan2.2 block WITH DIRECT DoRA/OFT ─────────────────────────
+# This is the 24 GB-safe non-carrier path for DoRA/OFT. Each adapted projection
+# replaces the full effective weight (`x @ W_eff.T + bias`) from the streamed
+# W_orig instead of materializing a dense full-delta carrier.
+def wan22_block_direct_lycoris_forward[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    x_h: List[Float32], context_h: List[Float32], mv: WanModVecs,
+    w: WanBlockWeights, direct_w: WanBlockDirectProjectionWeights,
+    direct: WanBlockDirectLycoris, cos: Tensor, sin: Tensor,
+    dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> WanBlockForward:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t16(_ones(dim), [dim], ctx)
+    var zeros_t = _t16(_zeros(dim), [dim], ctx)
+
+    var x = _ta16(x_h, [S, dim], ctx)
+    var context = _ta16(context_h, [TXT, dim], ctx)
+
+    var shift_sa = _t16(mv.shift_sa.copy(), [S, dim], ctx)
+    var scale_sa = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var gate_sa = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var shift_ffn = _t16(mv.shift_ffn.copy(), [S, dim], ctx)
+    var scale_ffn = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var gate_ffn = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+
+    var cos16 = cast_tensor(cos, STDtype.BF16, ctx)
+    var sin16 = cast_tensor(sin, STDtype.BF16, ctx)
+
+    # ── self-attention (direct DoRA/OFT on q/k/v/o) ──
+    var sa_mp = wan_mod_pre(x[], scale_sa, shift_sa, ones_t, zeros_t, eps, ctx)
+    var q_flat = _direct_proj_fwd_tensor_device(
+        direct, WDIR_SA_Q, sa_mp.o[], w.sa_wq[], w.sa_bq[],
+        direct_w.sa_wq, direct_w.sa_bq, S, dim, ctx,
+    )
+    var k_flat = _direct_proj_fwd_tensor_device(
+        direct, WDIR_SA_K, sa_mp.o[], w.sa_wk[], w.sa_bk[],
+        direct_w.sa_wk, direct_w.sa_bk, S, dim, ctx,
+    )
+    var v_flat = _direct_proj_fwd_tensor_device(
+        direct, WDIR_SA_V, sa_mp.o[], w.sa_wv[], w.sa_bv[],
+        direct_w.sa_wv, direct_w.sa_bv, S, dim, ctx,
+    )
+    var q_rms_flat = rms_norm(q_flat, w.sa_qn[], eps, ctx)
+    var k_rms_flat = rms_norm(k_flat, w.sa_kn[], eps, ctx)
+    var q_pre = _to_bshd(q_flat^, S, H, Dh, ctx)
+    var k_pre = _to_bshd(k_flat^, S, H, Dh, ctx)
+    var v4 = _to_bshd(v_flat^, S, H, Dh, ctx)
+    var q_rms = _to_bshd(q_rms_flat^, S, H, Dh, ctx)
+    var k_rms = _to_bshd(k_rms_flat^, S, H, Dh, ctx)
+    var cos_e = _expand_rope_per_head(cos16, S, H, Dh // 2, ctx)
+    var sin_e = _expand_rope_per_head(sin16, S, H, Dh // 2, ctx)
+    var q_rope = rope_interleaved(q_rms, cos_e, sin_e, ctx)
+    var k_rope = rope_interleaved(k_rms, cos_e, sin_e, ctx)
+    var att4 = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v4, scale, ctx)
+    var sa_att = _from_bshd(att4^, S, dim, ctx)
+    var sa_out = _direct_proj_fwd_tensor_device(
+        direct, WDIR_SA_O, sa_att, w.sa_wo[], w.sa_bo[],
+        direct_w.sa_wo, direct_w.sa_bo, S, dim, ctx,
+    )
+    var x_sa = wan_gated_residual(x[], sa_out, gate_sa, ctx)
+
+    # ── cross-attention (direct DoRA/OFT on q/k/v/o) ──
+    var n3 = layer_norm(x_sa, w.n3_w[], w.n3_b[], eps, ctx)
+    var caq_flat = _direct_proj_fwd_tensor_device(
+        direct, WDIR_CA_Q, n3, w.ca_wq[], w.ca_bq[],
+        direct_w.ca_wq, direct_w.ca_bq, S, dim, ctx,
+    )
+    var cak_flat = _direct_proj_fwd_tensor_device(
+        direct, WDIR_CA_K, context[], w.ca_wk[], w.ca_bk[],
+        direct_w.ca_wk, direct_w.ca_bk, TXT, dim, ctx,
+    )
+    var cav_flat = _direct_proj_fwd_tensor_device(
+        direct, WDIR_CA_V, context[], w.ca_wv[], w.ca_bv[],
+        direct_w.ca_wv, direct_w.ca_bv, TXT, dim, ctx,
+    )
+    var caq_rms_flat = rms_norm(caq_flat, w.ca_qn[], eps, ctx)
+    var cak_rms_flat = rms_norm(cak_flat, w.ca_kn[], eps, ctx)
+    var caq_pre = _to_bshd(caq_flat^, S, H, Dh, ctx)
+    var cak_pre = reshape(cak_flat^, [1, TXT, H, Dh], ctx)
+    var cav4 = reshape(cav_flat^, [1, TXT, H, Dh], ctx)
+    var caq_rms = _to_bshd(caq_rms_flat^, S, H, Dh, ctx)
+    var cak_rms = reshape(cak_rms_flat^, [1, TXT, H, Dh], ctx)
+    var ca_att4 = _cross_attention[S, TXT, H, Dh](caq_rms, cak_rms, cav4, scale, ctx)
+    var ca_att = _from_bshd(ca_att4^, S, dim, ctx)
+    var ca_out = _direct_proj_fwd_tensor_device(
+        direct, WDIR_CA_O, ca_att, w.ca_wo[], w.ca_bo[],
+        direct_w.ca_wo, direct_w.ca_bo, S, dim, ctx,
+    )
+    var x_ca = add(x_sa, ca_out, ctx)
+
+    # ── FFN (no adapter) ──
+    var ffn_mp = wan_mod_pre(x_ca, scale_ffn, shift_ffn, ones_t, zeros_t, eps, ctx)
+    var ffn_h = linear(ffn_mp.o[], w.ffn0_w[], Optional[Tensor](_clone_t(w.ffn0_b[], ctx)), ctx)
+    var ffn_act = gelu(ffn_h, ctx)
+    var ffn_out = linear(ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
+    var x_final = wan_gated_residual(x_ca, ffn_out, gate_ffn, ctx)
+
+    var x_out = x_final.to_host(ctx)
+    var saved = WanSaved(
+        x[].to_host_bf16(ctx),
+        sa_mp.ln[].to_host_bf16(ctx), sa_mp.o[].to_host_bf16(ctx),
+        q_pre.to_host_bf16(ctx), k_pre.to_host_bf16(ctx),
+        v4.to_host_bf16(ctx), q_rope.to_host_bf16(ctx), k_rope.to_host_bf16(ctx),
+        sa_att.to_host_bf16(ctx), x_sa.to_host_bf16(ctx),
+        n3.to_host_bf16(ctx), caq_pre.to_host_bf16(ctx), cak_pre.to_host_bf16(ctx),
+        caq_rms.to_host_bf16(ctx), cak_rms.to_host_bf16(ctx),
+        cav4.to_host_bf16(ctx), ca_att.to_host_bf16(ctx),
+        context[].to_host_bf16(ctx), x_ca.to_host_bf16(ctx),
+        ffn_mp.ln[].to_host_bf16(ctx), ffn_mp.o[].to_host_bf16(ctx),
+        ffn_h.to_host_bf16(ctx), ffn_act.to_host_bf16(ctx),
+    )
+    return WanBlockForward(x_out^, saved^)
+
+
+# ── BACKWARD of one Wan2.2 block WITH DIRECT DoRA/OFT ────────────────────────
+def wan22_block_direct_lycoris_backward[
+    H: Int, Dh: Int, S: Int, TXT: Int
+](
+    d_out_h: List[Float32], mv: WanModVecs, w: WanBlockWeights,
+    direct_w: WanBlockDirectProjectionWeights, direct: WanBlockDirectLycoris,
+    saved: WanSaved, cos: Tensor, sin: Tensor,
+    dim: Int, ffn: Int, eps: Float32, ctx: DeviceContext,
+) raises -> WanBlockDirectLycorisGrads:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+    var ones_t = _t16(_ones(dim), [dim], ctx)
+    var cos_e = _expand_rope_per_head(cos, S, H, Dh // 2, ctx)
+    var sin_e = _expand_rope_per_head(sin, S, H, Dh // 2, ctx)
+
+    var sv_direct_sa_in = _tbf16(saved.sa_in.copy(), [S, dim], ctx)
+    var sv_direct_sa_att = _tbf16(saved.sa_att.copy(), [S, dim], ctx)
+    var sv_direct_ca_n3 = _tbf16(saved.ca_n3.copy(), [S, dim], ctx)
+    var sv_direct_context = _tbf16(saved.context.copy(), [TXT, dim], ctx)
+    var sv_direct_ca_att = _tbf16(saved.ca_att.copy(), [S, dim], ctx)
+
+    var d_out = _ta16(d_out_h, [S, dim], ctx)
+
+    # ════════════════ FFN backward (no adapter) ════════════════
+    var gate_ffn_t = _t16(mv.gate_ffn.copy(), [S, dim], ctx)
+    var lsv_ffn_act = _tbf16(saved.ffn_act.copy(), [S, ffn], ctx)
+    var ffn_out_rc = linear(lsv_ffn_act, w.ffn2_w[], Optional[Tensor](_clone_t(w.ffn2_b[], ctx)), ctx)
+    var gb_ffn2 = wan_gate_residual_backward(d_out[], ffn_out_rc, gate_ffn_t, ctx)
+    var d_x_ca_resid = TArc(gb_ffn2.d_x.clone(ctx))
+    var lb_ffn2 = linear_backward(gb_ffn2.d_y, lsv_ffn_act, w.ffn2_w[], S, ffn, dim, ctx)
+    var lsv_ffn_h = _tbf16(saved.ffn_h.copy(), [S, ffn], ctx)
+    var d_ffn_h = gelu_backward(lb_ffn2.d_x, lsv_ffn_h, ctx)
+    var lsv_ffn_in = _tbf16(saved.ffn_in.copy(), [S, dim], ctx)
+    var lb_ffn0 = linear_backward(d_ffn_h, lsv_ffn_in, w.ffn0_w[], S, dim, ffn, ctx)
+    var scale_ffn_t = _t16(mv.scale_ffn.copy(), [S, dim], ctx)
+    var lsv_ffn_ln = _tbf16(saved.ffn_ln.copy(), [S, dim], ctx)
+    var mb_ffn = wan_modulate_backward(lb_ffn0.d_x, lsv_ffn_ln, scale_ffn_t, ctx)
+    var lsv_x_ca = _tbf16(saved.x_ca.copy(), [S, dim], ctx)
+    var lnb_ffn = layer_norm_backward_dx(mb_ffn.d_ln, lsv_x_ca, ones_t, eps, ctx)
+    var d_x_ca = TArc(add(d_x_ca_resid[], lnb_ffn, ctx))
+
+    # ════════════════ Cross-attention backward (direct q/k/v/o) ══════════════
+    var ca_o_g = _direct_proj_bwd_device(
+        direct, WDIR_CA_O, d_x_ca[], sv_direct_ca_att, w.ca_wo[],
+        direct_w.ca_wo, S, ctx,
+    )
+    var d_ca_att4 = reshape(ca_o_g.d_x[], [1, S, H, Dh], ctx)
+
+    var lsv_ca_q_rms = _tbf16(saved.ca_q_rms.copy(), [1, S, H, Dh], ctx)
+    var lsv_ca_k_rms = _tbf16(saved.ca_k_rms.copy(), [1, TXT, H, Dh], ctx)
+    var lsv_ca_v = _tbf16(saved.ca_v.copy(), [1, TXT, H, Dh], ctx)
+    var csb = sdpa_backward_rect[1, S, TXT, H, Dh](
+        lsv_ca_q_rms, lsv_ca_k_rms, lsv_ca_v, d_ca_att4, scale, ctx,
+    )
+    var csb_dq_b = cast_tensor(csb.d_q, STDtype.BF16, ctx)
+    var d_caq_rms_flat = reshape(csb_dq_b, [S, dim], ctx)
+    var lsv_ca_q_pre = _tbf16(saved.ca_q_pre.copy(), [S, dim], ctx)
+    var csb_dk_b = cast_tensor(csb.d_k, STDtype.BF16, ctx)
+    var d_cak_rms_flat = reshape(csb_dk_b, [TXT, dim], ctx)
+    var rb_caq = rms_norm_backward(d_caq_rms_flat, lsv_ca_q_pre, w.ca_qn[], eps, ctx)
+    var lsv_ca_k_pre = _tbf16(saved.ca_k_pre.copy(), [TXT, dim], ctx)
+    var rb_cak = rms_norm_backward(d_cak_rms_flat, lsv_ca_k_pre, w.ca_kn[], eps, ctx)
+    var d_cav_flat = reshape(csb.d_v, [TXT, dim], ctx)
+
+    var ca_q_g = _direct_proj_bwd_device(
+        direct, WDIR_CA_Q, rb_caq.d_x, sv_direct_ca_n3, w.ca_wq[],
+        direct_w.ca_wq, S, ctx,
+    )
+    var ca_k_g = _direct_proj_bwd_device(
+        direct, WDIR_CA_K, rb_cak.d_x, sv_direct_context, w.ca_wk[],
+        direct_w.ca_wk, TXT, ctx,
+    )
+    var ca_v_g = _direct_proj_bwd_device(
+        direct, WDIR_CA_V, d_cav_flat, sv_direct_context, w.ca_wv[],
+        direct_w.ca_wv, TXT, ctx,
+    )
+    var d_n3_in = ca_q_g.d_x[].clone(ctx)
+    var d_context_t = TArc(add(
+        ca_k_g.d_x[],
+        ca_v_g.d_x[],
+        ctx,
+    ))
+
+    var lsv_x_sa = _tbf16(saved.x_sa.copy(), [S, dim], ctx)
+    var lnb_n3 = layer_norm_backward(d_n3_in, lsv_x_sa, w.n3_w[], eps, ctx)
+    var d_x_sa = TArc(add(lnb_n3.d_x, d_x_ca[], ctx))
+
+    # ════════════════ Self-attention backward (direct q/k/v/o) ═══════════════
+    var gate_sa_t = _t16(mv.gate_sa.copy(), [S, dim], ctx)
+    var sa_out_rc = _direct_proj_fwd_tensor_device(
+        direct, WDIR_SA_O, sv_direct_sa_att, w.sa_wo[], w.sa_bo[],
+        direct_w.sa_wo, direct_w.sa_bo, S, dim, ctx,
+    )
+    var gb_sa = wan_gate_residual_backward(d_x_sa[], sa_out_rc, gate_sa_t, ctx)
+    var d_x_resid = TArc(gb_sa.d_x.clone(ctx))
+    var sa_o_g = _direct_proj_bwd_device(
+        direct, WDIR_SA_O, gb_sa.d_y, sv_direct_sa_att, w.sa_wo[],
+        direct_w.sa_wo, S, ctx,
+    )
+    var d_sa_att4 = reshape(sa_o_g.d_x[], [1, S, H, Dh], ctx)
+
+    var lsv_sa_q_rope = _tbf16(saved.sa_q_rope.copy(), [1, S, H, Dh], ctx)
+    var lsv_sa_k_rope = _tbf16(saved.sa_k_rope.copy(), [1, S, H, Dh], ctx)
+    var lsv_sa_v = _tbf16(saved.sa_v.copy(), [1, S, H, Dh], ctx)
+    var ssb = sdpa_backward[1, S, H, Dh](
+        lsv_sa_q_rope, lsv_sa_k_rope, lsv_sa_v, d_sa_att4, scale, ctx,
+    )
+    var ssb_dq_f32 = cast_tensor(ssb.d_q, STDtype.F32, ctx)
+    var ssb_dk_f32 = cast_tensor(ssb.d_k, STDtype.F32, ctx)
+    var d_q_rms = rope_backward(ssb_dq_f32, cos_e, sin_e, True, ctx)
+    var d_k_rms = rope_backward(ssb_dk_f32, cos_e, sin_e, True, ctx)
+    var d_q_rms_b = cast_tensor(d_q_rms, STDtype.BF16, ctx)
+    var d_q_rms_flat = reshape(d_q_rms_b, [S, dim], ctx)
+    var lsv_sa_q_pre = _tbf16(saved.sa_q_pre.copy(), [S, dim], ctx)
+    var rb_saq = rms_norm_backward(d_q_rms_flat, lsv_sa_q_pre, w.sa_qn[], eps, ctx)
+    var d_k_rms_b = cast_tensor(d_k_rms, STDtype.BF16, ctx)
+    var d_k_rms_flat = reshape(d_k_rms_b, [S, dim], ctx)
+    var lsv_sa_k_pre = _tbf16(saved.sa_k_pre.copy(), [S, dim], ctx)
+    var rb_sak = rms_norm_backward(d_k_rms_flat, lsv_sa_k_pre, w.sa_kn[], eps, ctx)
+    var d_sav_flat = reshape(ssb.d_v, [S, dim], ctx)
+
+    var sa_q_g = _direct_proj_bwd_device(
+        direct, WDIR_SA_Q, rb_saq.d_x, sv_direct_sa_in, w.sa_wq[],
+        direct_w.sa_wq, S, ctx,
+    )
+    var sa_k_g = _direct_proj_bwd_device(
+        direct, WDIR_SA_K, rb_sak.d_x, sv_direct_sa_in, w.sa_wk[],
+        direct_w.sa_wk, S, ctx,
+    )
+    var sa_v_g = _direct_proj_bwd_device(
+        direct, WDIR_SA_V, d_sav_flat, sv_direct_sa_in, w.sa_wv[],
+        direct_w.sa_wv, S, ctx,
+    )
+    var d_sa_in = TArc(add(
+        add(sa_q_g.d_x[], sa_k_g.d_x[], ctx),
+        sa_v_g.d_x[],
+        ctx,
+    ))
+
+    var scale_sa_t = _t16(mv.scale_sa.copy(), [S, dim], ctx)
+    var lsv_sa_ln = _tbf16(saved.sa_ln.copy(), [S, dim], ctx)
+    var mb_sa = wan_modulate_backward(d_sa_in[], lsv_sa_ln, scale_sa_t, ctx)
+    var lsv_x = _tbf16(saved.x.copy(), [S, dim], ctx)
+    var lnb_sa = layer_norm_backward_dx(mb_sa.d_ln, lsv_x, ones_t, eps, ctx)
+    var d_x = add(lnb_sa, d_x_resid[], ctx)
+    var d_x_h = d_x.to_host(ctx)
+    var d_context_h = d_context_t[].to_host(ctx)
+
+    return WanBlockDirectLycorisGrads(
+        d_x_h^, d_context_h^,
+        _direct_grad_dev_to_public(sa_q_g^),
+        _direct_grad_dev_to_public(sa_k_g^),
+        _direct_grad_dev_to_public(sa_v_g^),
+        _direct_grad_dev_to_public(sa_o_g^),
+        _direct_grad_dev_to_public(ca_q_g^),
+        _direct_grad_dev_to_public(ca_k_g^),
+        _direct_grad_dev_to_public(ca_v_g^),
+        _direct_grad_dev_to_public(ca_o_g^),
     )

@@ -39,6 +39,7 @@ from std.math import sqrt
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.tensor_algebra import reshape
@@ -55,12 +56,33 @@ from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.models.sd35.sd35_block import (
     JointBlockWeights, StreamWeights, ModVecs, JointBlockForward,
     StreamSaved, sd35_joint_block_forward, sd35_joint_block_backward,
+    SD35BlockDirectLycoris, SD35DirectProjectionGrad,
+    SD35JointBlockDirectGrads,
+    SD35_DIRECT_ALGO_DORA, SD35_DIRECT_ALGO_OFT,
+    sd35_joint_block_direct_lycoris_forward,
+    sd35_joint_block_direct_lycoris_backward,
     Attn2Weights, DualBlockForward, DualXSaved,
     sd35_dual_joint_block_forward, sd35_dual_joint_block_backward,
     CtxPreForward, CtxPreSaved,
     sd35_context_preonly_forward, sd35_context_preonly_backward,
+    sd35_context_preonly_direct_lycoris_forward,
+    sd35_context_preonly_direct_lycoris_backward,
 )
 from serenitymojo.training.train_step import LoraAdapter, LoraGrads, _lora_adamw
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.dora_save import NamedDoRA, save_dora_onetrainer
+from serenitymojo.training.oft_onetrainer import OFTOTGrads
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectDoRAGrads, FlatDirectOFTSet, FlatDirectOFTGrads,
+    empty_flat_direct_dora_set, empty_flat_direct_oft_set,
+    flat_direct_dora_append_from_weight, flat_direct_oft_append,
+    flat_direct_dora_grad_norm, flat_direct_dora_clip_grads,
+    flat_direct_dora_adamw_step, flat_direct_dora_zero_leg_l1,
+    flat_direct_dora_trainable_bytes,
+    flat_direct_oft_grad_norm, flat_direct_oft_clip_grads,
+    flat_direct_oft_adamw_step, flat_direct_oft_vec_l1,
+    flat_direct_oft_trainable_bytes,
+)
 from serenitymojo.training.lora_save import (
     NamedLora,
     save_lora_peft,
@@ -275,6 +297,454 @@ def save_sd35_lora(lora: SD35LoraSet, path: String, ctx: DeviceContext) raises -
 
 def save_sd35_lora_state(lora: SD35LoraSet, path: String, ctx: DeviceContext) raises -> Int:
     return save_lora_train_state(_sd35_named_loras(lora), path, ctx)
+
+
+# ── Direct DoRA/OFT metadata and optimizer/save helpers ─────────────────────
+comptime SD35_DIRECT_24_GIB = 24 * 1024 * 1024 * 1024
+
+
+struct SD35DirectDoRAGradSet(Movable):
+    var grads: FlatDirectDoRAGrads
+    var nonfinite_grads: Int
+
+    def __init__(out self, var grads: FlatDirectDoRAGrads, nonfinite_grads: Int):
+        self.grads = grads^
+        self.nonfinite_grads = nonfinite_grads
+
+
+struct SD35DirectOFTGradSet(Movable):
+    var grads: FlatDirectOFTGrads
+    var nonfinite_grads: Int
+
+    def __init__(out self, var grads: FlatDirectOFTGrads, nonfinite_grads: Int):
+        self.grads = grads^
+        self.nonfinite_grads = nonfinite_grads
+
+
+def empty_sd35_direct_dora_set() -> FlatDirectDoRASet:
+    return empty_flat_direct_dora_set()
+
+
+def empty_sd35_direct_oft_set() -> FlatDirectOFTSet:
+    return empty_flat_direct_oft_set()
+
+
+def _sd35_direct_slot_is_attn(slot: Int) -> Bool:
+    var s = slot % SLOTS_PER_BLOCK
+    return (
+        s == SLOT_CTX_QKV or s == SLOT_CTX_PROJ
+        or s == SLOT_X_QKV or s == SLOT_X_PROJ
+    )
+
+
+def _sd35_direct_slot_targeted(slot: Int, targets: Int) raises -> Bool:
+    if targets < 1 or targets > 3:
+        raise Error("SD35 direct LyCORIS: targets must be 1(attn)|2(all)|3(all)")
+    if _sd35_direct_slot_is_attn(slot):
+        return targets >= 1
+    return targets >= 2
+
+
+def _sd35_direct_slot_exists_in_block(bi: Int, depth: Int, slot: Int) -> Bool:
+    # SD3.5 Large's final joint block is context_pre_only: context qkv exists,
+    # but context proj/fc1/fc2 do not exist in the checkpoint or forward graph.
+    if bi != depth - 1:
+        return True
+    var s = slot % SLOTS_PER_BLOCK
+    return (
+        s != SLOT_CTX_PROJ
+        and s != SLOT_CTX_FC1
+        and s != SLOT_CTX_FC2
+    )
+
+
+def _sd35_direct_slot_targeted_in_block(
+    bi: Int, depth: Int, slot: Int, targets: Int,
+) raises -> Bool:
+    if not _sd35_direct_slot_exists_in_block(bi, depth, slot):
+        return False
+    return _sd35_direct_slot_targeted(slot, targets)
+
+
+def _sd35_direct_slot_dims(slot: Int, D: Int, MLP: Int) raises -> Tuple[Int, Int]:
+    var s = slot % SLOTS_PER_BLOCK
+    if s == SLOT_CTX_QKV or s == SLOT_X_QKV:
+        return (D, 3 * D)
+    if s == SLOT_CTX_FC1 or s == SLOT_X_FC1:
+        return (D, MLP)
+    if s == SLOT_CTX_FC2 or s == SLOT_X_FC2:
+        return (MLP, D)
+    return (D, D)
+
+
+def _sd35_direct_prefix(bi: Int, slot: Int) -> String:
+    var bp = String("transformer.joint_blocks.") + String(bi)
+    if slot == SLOT_CTX_QKV:
+        return bp + String(".context_block.attn.qkv")
+    if slot == SLOT_CTX_PROJ:
+        return bp + String(".context_block.attn.proj")
+    if slot == SLOT_CTX_FC1:
+        return bp + String(".context_block.mlp.fc1")
+    if slot == SLOT_CTX_FC2:
+        return bp + String(".context_block.mlp.fc2")
+    if slot == SLOT_X_QKV:
+        return bp + String(".x_block.attn.qkv")
+    if slot == SLOT_X_PROJ:
+        return bp + String(".x_block.attn.proj")
+    if slot == SLOT_X_FC1:
+        return bp + String(".x_block.mlp.fc1")
+    return bp + String(".x_block.mlp.fc2")
+
+
+def _sd35_direct_slots_per_block(bi: Int, depth: Int, targets: Int) raises -> Int:
+    var n = 0
+    for slot in range(SLOTS_PER_BLOCK):
+        if _sd35_direct_slot_targeted_in_block(bi, depth, slot, targets):
+            n += 1
+    return n
+
+
+def _sd35_direct_expected_slots(depth: Int, targets: Int) raises -> Int:
+    var n = 0
+    for bi in range(depth):
+        n += _sd35_direct_slots_per_block(bi, depth, targets)
+    return n
+
+
+def _sd35_direct_block_base(bi: Int, targets: Int) raises -> Int:
+    raise Error("_sd35_direct_block_base: use depth-aware overload")
+
+
+def _sd35_direct_block_base(bi: Int, depth: Int, targets: Int) raises -> Int:
+    var n = 0
+    for bj in range(bi):
+        n += _sd35_direct_slots_per_block(bj, depth, targets)
+    return n
+
+
+def sd35_direct_dense_carrier_bytes(
+    depth: Int, D: Int, MLP: Int, targets: Int,
+) raises -> Int:
+    var elems = 0
+    for bi in range(depth):
+        for slot in range(SLOTS_PER_BLOCK):
+            if not _sd35_direct_slot_targeted_in_block(bi, depth, slot, targets):
+                continue
+            var dims = _sd35_direct_slot_dims(slot, D, MLP)
+            elems += dims[0] * dims[0] + dims[1] * dims[0]
+    return elems * 2
+
+
+def sd35_direct_dora_trainable_bytes_estimate(
+    depth: Int, D: Int, MLP: Int, rank: Int, targets: Int,
+    wd_on_out: Bool = False,
+) raises -> Int:
+    var total = 0
+    for bi in range(depth):
+        for slot in range(SLOTS_PER_BLOCK):
+            if not _sd35_direct_slot_targeted_in_block(bi, depth, slot, targets):
+                continue
+            var dims = _sd35_direct_slot_dims(slot, D, MLP)
+            var in_f = dims[0]
+            var out_f = dims[1]
+            var mlen = out_f if wd_on_out else in_f
+            var bf16_elems = rank * in_f + out_f * rank
+            var f32_elems = mlen + (2 * rank * in_f) + (2 * out_f * rank) + (2 * mlen)
+            total += bf16_elems * 2 + f32_elems * 4
+    return total
+
+
+def sd35_direct_oft_trainable_bytes_estimate(
+    depth: Int, D: Int, MLP: Int, block_size: Int, targets: Int,
+) raises -> Int:
+    var total = 0
+    for bi in range(depth):
+        for slot in range(SLOTS_PER_BLOCK):
+            if not _sd35_direct_slot_targeted_in_block(bi, depth, slot, targets):
+                continue
+            var dims = _sd35_direct_slot_dims(slot, D, MLP)
+            var in_f = dims[0]
+            if in_f % block_size != 0:
+                raise Error("sd35_direct_oft_trainable_bytes_estimate: in_f not divisible by block_size")
+            var r = in_f // block_size
+            var ne = block_size * (block_size - 1) // 2
+            total += 3 * r * ne * 4
+    return total
+
+
+def sd35_direct_dora_preflight(
+    depth: Int, D: Int, MLP: Int, rank: Int, targets: Int,
+    budget_bytes: Int, wd_on_out: Bool = False,
+) raises -> Int:
+    var direct = sd35_direct_dora_trainable_bytes_estimate(
+        depth, D, MLP, rank, targets, wd_on_out,
+    )
+    if direct > budget_bytes:
+        raise Error(
+            String("SD3.5 direct DoRA trainable state needs ") + String(direct)
+            + String(" bytes (> budget ") + String(budget_bytes) + String(")")
+        )
+    return direct
+
+
+def sd35_direct_oft_preflight(
+    depth: Int, D: Int, MLP: Int, block_size: Int, targets: Int,
+    budget_bytes: Int,
+) raises -> Int:
+    var direct = sd35_direct_oft_trainable_bytes_estimate(
+        depth, D, MLP, block_size, targets,
+    )
+    if direct > budget_bytes:
+        raise Error(
+            String("SD3.5 direct OFT trainable state needs ") + String(direct)
+            + String(" bytes (> budget ") + String(budget_bytes) + String(")")
+        )
+    return direct
+
+
+def _sd35_direct_block_for_dora(
+    dora: FlatDirectDoRASet, bi: Int, depth: Int, targets: Int,
+) raises -> SD35BlockDirectLycoris:
+    return SD35BlockDirectLycoris(
+        SD35_DIRECT_ALGO_DORA, dora.copy(), empty_flat_direct_oft_set(),
+        _sd35_direct_block_base(bi, depth, targets), targets, bi == depth - 1,
+    )
+
+
+def _sd35_direct_block_for_oft(
+    oft: FlatDirectOFTSet, bi: Int, depth: Int, targets: Int,
+) raises -> SD35BlockDirectLycoris:
+    return SD35BlockDirectLycoris(
+        SD35_DIRECT_ALGO_OFT, empty_flat_direct_dora_set(), oft.copy(),
+        _sd35_direct_block_base(bi, depth, targets), targets, bi == depth - 1,
+    )
+
+
+def _append_sd35_direct_dora_stream(
+    mut set: FlatDirectDoRASet, w: StreamWeights, bi: Int, slot_base: Int,
+    depth: Int, D: Int, MLP: Int, rank: Int, alpha: Float32, targets: Int,
+    seed: UInt64, wd_on_out: Bool,
+) raises:
+    if _sd35_direct_slot_targeted_in_block(bi, depth, slot_base + SLOT_CTX_QKV, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wqkv.copy(), D, 3 * D, rank, alpha,
+            _sd35_direct_prefix(bi, slot_base + SLOT_CTX_QKV), seed + UInt64(slot_base + SLOT_CTX_QKV), wd_on_out,
+        )
+    if _sd35_direct_slot_targeted_in_block(bi, depth, slot_base + SLOT_CTX_PROJ, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wproj.copy(), D, D, rank, alpha,
+            _sd35_direct_prefix(bi, slot_base + SLOT_CTX_PROJ), seed + UInt64(slot_base + SLOT_CTX_PROJ), wd_on_out,
+        )
+    if _sd35_direct_slot_targeted_in_block(bi, depth, slot_base + SLOT_CTX_FC1, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wfc1.copy(), D, MLP, rank, alpha,
+            _sd35_direct_prefix(bi, slot_base + SLOT_CTX_FC1), seed + UInt64(slot_base + SLOT_CTX_FC1), wd_on_out,
+        )
+    if _sd35_direct_slot_targeted_in_block(bi, depth, slot_base + SLOT_CTX_FC2, targets):
+        flat_direct_dora_append_from_weight(
+            set, w.wfc2.copy(), MLP, D, rank, alpha,
+            _sd35_direct_prefix(bi, slot_base + SLOT_CTX_FC2), seed + UInt64(slot_base + SLOT_CTX_FC2), wd_on_out,
+        )
+
+
+def build_sd35_direct_dora_set_from_offload(
+    mut loader: TurboPlannedLoader,
+    depth: Int, D: Int, MLP: Int, Dh: Int,
+    rank: Int, alpha: Float32, targets: Int, seed: UInt64,
+    wd_on_out: Bool, ctx: DeviceContext,
+) raises -> FlatDirectDoRASet:
+    if loader.block_count() < depth:
+        raise Error("build_sd35_direct_dora_set_from_offload: loader depth too small")
+    var set = empty_flat_direct_dora_set()
+    if depth > 0:
+        loader.prefetch_with_ctx(0, ctx)
+    for bi in range(depth):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var pfx = handle.prefix + String(".")
+        var block_seed = seed + UInt64(bi * SLOTS_PER_BLOCK)
+        if bi == depth - 1:
+            var cqw = _ctx_preonly_qkv_from_block(handle.block, pfx + String("context_block."), ctx)
+            if _sd35_direct_slot_targeted_in_block(bi, depth, SLOT_CTX_QKV, targets):
+                flat_direct_dora_append_from_weight(
+                    set, cqw[0].copy(), D, 3 * D, rank, alpha,
+                    _sd35_direct_prefix(bi, SLOT_CTX_QKV),
+                    block_seed + UInt64(SLOT_CTX_QKV), wd_on_out,
+                )
+            var xw = _stream_weights_from_block(handle.block, pfx + String("x_block."), D, MLP, Dh, ctx)
+            _append_sd35_direct_dora_stream(
+                set, xw, bi, SLOT_X_QKV, depth, D, MLP, rank, alpha, targets, block_seed, wd_on_out,
+            )
+        else:
+            var bwr = _joint_weights_from_block(handle.block, pfx, D, MLP, Dh, ctx)
+            _append_sd35_direct_dora_stream(
+                set, bwr.w.ctxw, bi, 0, depth, D, MLP, rank, alpha, targets, block_seed, wd_on_out,
+            )
+            _append_sd35_direct_dora_stream(
+                set, bwr.w.xw, bi, SLOT_X_QKV, depth, D, MLP, rank, alpha, targets, block_seed, wd_on_out,
+            )
+        loader.mark_active_block_done(ctx)
+    if len(set.ad) != _sd35_direct_expected_slots(depth, targets):
+        raise Error("build_sd35_direct_dora_set_from_offload: direct slot count mismatch")
+    return set^
+
+
+def build_sd35_direct_oft_set_for_stack(
+    depth: Int, D: Int, MLP: Int, block_size: Int, targets: Int,
+) raises -> FlatDirectOFTSet:
+    var set = empty_flat_direct_oft_set()
+    for bi in range(depth):
+        for slot in range(SLOTS_PER_BLOCK):
+            if not _sd35_direct_slot_targeted_in_block(bi, depth, slot, targets):
+                continue
+            var dims = _sd35_direct_slot_dims(slot, D, MLP)
+            flat_direct_oft_append(
+                set, dims[0], dims[1], block_size,
+                _sd35_direct_prefix(bi, slot),
+            )
+    if len(set.ad) != _sd35_direct_expected_slots(depth, targets):
+        raise Error("build_sd35_direct_oft_set_for_stack: direct slot count mismatch")
+    return set^
+
+
+def _sd35_direct_dora_zero_grads(set: FlatDirectDoRASet) -> FlatDirectDoRAGrads:
+    var out = List[DoRAGrads]()
+    for i in range(len(set.ad)):
+        ref d = set.ad[i]
+        out.append(DoRAGrads(
+            _zeros(len(d.a)), _zeros(len(d.b)), _zeros(len(d.m)), List[Float32](),
+        ))
+    return FlatDirectDoRAGrads(out^)
+
+
+def _sd35_direct_oft_zero_grads(set: FlatDirectOFTSet) -> FlatDirectOFTGrads:
+    var out = List[List[Float32]]()
+    for i in range(len(set.ad)):
+        out.append(_zeros(len(set.ad[i].vec)))
+    return FlatDirectOFTGrads(out^)
+
+
+def _sd35_scatter_dora(
+    mut grads: FlatDirectDoRAGrads, slot: Int, g: SD35DirectProjectionGrad,
+) raises:
+    if slot < 0:
+        return
+    if slot >= len(grads.g):
+        raise Error("_sd35_scatter_dora: slot out of range")
+    grads.g[slot] = DoRAGrads(g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), List[Float32]())
+
+
+def _sd35_scatter_oft(
+    mut grads: FlatDirectOFTGrads, slot: Int, g: SD35DirectProjectionGrad,
+) raises:
+    if slot < 0:
+        return
+    if slot >= len(grads.d_vec):
+        raise Error("_sd35_scatter_oft: slot out of range")
+    grads.d_vec[slot] = g.d_vec.copy()
+
+
+def _sd35_nonfinite_direct(g: SD35DirectProjectionGrad) -> Int:
+    return (
+        _nonfinite_count(g.d_a) + _nonfinite_count(g.d_b)
+        + _nonfinite_count(g.d_m) + _nonfinite_count(g.d_vec)
+    )
+
+
+def _sd35_nonfinite_block(g: SD35JointBlockDirectGrads) -> Int:
+    return (
+        _sd35_nonfinite_direct(g.ctx_g.qkv)
+        + _sd35_nonfinite_direct(g.ctx_g.proj)
+        + _sd35_nonfinite_direct(g.ctx_g.fc1)
+        + _sd35_nonfinite_direct(g.ctx_g.fc2)
+        + _sd35_nonfinite_direct(g.x_g.qkv)
+        + _sd35_nonfinite_direct(g.x_g.proj)
+        + _sd35_nonfinite_direct(g.x_g.fc1)
+        + _sd35_nonfinite_direct(g.x_g.fc2)
+    )
+
+
+def sd35_direct_dora_grad_norm(g: FlatDirectDoRAGrads) -> Float64:
+    return flat_direct_dora_grad_norm(g)
+
+
+def sd35_direct_dora_clip_grads(mut g: FlatDirectDoRAGrads, clip_scale: Float32):
+    flat_direct_dora_clip_grads(g, clip_scale)
+
+
+def sd35_direct_dora_adamw_step(
+    mut set: FlatDirectDoRASet, g: FlatDirectDoRAGrads, t: Int, lr: Float32,
+    beta1: Float32, beta2: Float32, eps: Float32, weight_decay: Float32,
+) raises:
+    flat_direct_dora_adamw_step(set, g, t, lr, beta1, beta2, eps, weight_decay)
+
+
+def sd35_direct_dora_zero_leg_l1(set: FlatDirectDoRASet) -> Float64:
+    return flat_direct_dora_zero_leg_l1(set)
+
+
+def sd35_direct_dora_trainable_bytes(set: FlatDirectDoRASet) -> Int:
+    return flat_direct_dora_trainable_bytes(set)
+
+
+def sd35_direct_oft_grad_norm(g: FlatDirectOFTGrads) -> Float64:
+    return flat_direct_oft_grad_norm(g)
+
+
+def sd35_direct_oft_clip_grads(mut g: FlatDirectOFTGrads, clip_scale: Float32):
+    flat_direct_oft_clip_grads(g, clip_scale)
+
+
+def sd35_direct_oft_adamw_step(
+    mut set: FlatDirectOFTSet, g: FlatDirectOFTGrads, t: Int, lr: Float32,
+    beta1: Float32, beta2: Float32, eps: Float32, weight_decay: Float32,
+) raises:
+    flat_direct_oft_adamw_step(set, g, t, lr, beta1, beta2, eps, weight_decay)
+
+
+def sd35_direct_oft_vec_l1(set: FlatDirectOFTSet) -> Float64:
+    return flat_direct_oft_vec_l1(set)
+
+
+def sd35_direct_oft_trainable_bytes(set: FlatDirectOFTSet) -> Int:
+    return flat_direct_oft_trainable_bytes(set)
+
+
+def _sd35_f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+    var sh = List[Int]()
+    sh.append(rows)
+    sh.append(cols)
+    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+
+
+def save_sd35_direct_dora(
+    set: FlatDirectDoRASet, path: String, ctx: DeviceContext,
+) raises -> Int:
+    var named = List[NamedDoRA]()
+    for i in range(len(set.ad)):
+        if set.active[i]:
+            named.append(NamedDoRA(set.prefix[i].copy(), set.ad[i].copy()))
+    return save_dora_onetrainer(named, path, ctx)
+
+
+def save_sd35_direct_oft(
+    set: FlatDirectOFTSet, path: String, ctx: DeviceContext,
+) raises -> Int:
+    var names = List[String]()
+    var tensors = List[ArcPointer[Tensor]]()
+    var nmods = 0
+    for i in range(len(set.ad)):
+        if not set.active[i]:
+            continue
+        ref sl = set.ad[i]
+        var ne = sl.b * (sl.b - 1) // 2
+        names.append(set.prefix[i].copy() + String(".oft_R.weight"))
+        tensors.append(ArcPointer(_sd35_f32_2d(sl.vec.copy(), sl.r, ne, ctx)))
+        nmods += 1
+    if nmods == 0:
+        raise Error("save_sd35_direct_oft: refusing to write an empty OFT file")
+    save_safetensors(names, tensors, path, ctx)
+    return nmods
 
 
 # ── Host utility helpers (mirrors chroma_stack_lora / flux_stack) ─────────────
@@ -925,6 +1395,130 @@ def sd35_stack_lora_forward_offload[
     return SD35StackForward(out^, blocks^, c^, x_proj^, ctx_proj^, final_ada_flat^, pre_final_x^)
 
 
+def _sd35_stack_direct_forward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_CTX: Int, S: Int
+](
+    noisy_h: List[Float32],
+    text_h: List[Float32],
+    pooled_h: List[Float32],
+    sigma: Float32,
+    base: SD35StackBase,
+    mut loader: TurboPlannedLoader,
+    dora: FlatDirectDoRASet, oft: FlatDirectOFTSet, algo: Int,
+    depth: Int, targets: Int,
+    D: Int, MLP: Int, IN_CH: Int, CTX_CH: Int, OUT_CH: Int,
+    TIMESTEP_DIM: Int, POOLED_DIM: Int,
+    eps: Float32, qk_eps: Float32,
+    ctx: DeviceContext,
+) raises -> SD35StackForward:
+    loader.prefetch_with_ctx(0, ctx)
+
+    var c = _build_conditioning(base, sigma, pooled_h, D, TIMESTEP_DIM, POOLED_DIM, ctx)
+    var x_proj = _x_embed(noisy_h.copy(), base, N_IMG, IN_CH, D, ctx)
+    x_proj = _add_pos_embed(x_proj^, base, N_IMG, D, ctx)
+    var ctx_proj = _ctx_embed(text_h.copy(), base, N_CTX, CTX_CH, D, ctx)
+
+    var x = x_proj.copy()
+    var context = ctx_proj.copy()
+    var blocks = List[BlockSaved]()
+    var scale = Float32(1.0) / Float32(8.0)
+
+    for bi in range(depth):
+        var handle = loader.await_block(bi, ctx)
+        loader.prefetch_next_with_ctx(bi, ctx)
+        var pfx = handle.prefix + String(".")
+        var direct = _sd35_direct_block_for_dora(dora, bi, depth, targets) if algo == SD35_DIRECT_ALGO_DORA else _sd35_direct_block_for_oft(oft, bi, depth, targets)
+        if bi == depth - 1:
+            var xw = _stream_weights_from_block(handle.block, pfx + String("x_block."), D, MLP, Dh, ctx)
+            var x_ada_w = _block_host_f32(handle.block, pfx + String("x_block.adaLN_modulation.1.weight"), ctx)
+            var x_ada_b = _block_host_f32(handle.block, pfx + String("x_block.adaLN_modulation.1.bias"), ctx)
+            var x_smr = _compute_stream_modvecs(c.copy(), x_ada_w^, x_ada_b^, D, ctx)
+            var cqw = _ctx_preonly_qkv_from_block(handle.block, pfx + String("context_block."), ctx)
+            var c_ada_w = _block_host_f32(handle.block, pfx + String("context_block.adaLN_modulation.1.weight"), ctx)
+            var c_ada_b = _block_host_f32(handle.block, pfx + String("context_block.adaLN_modulation.1.bias"), ctx)
+            var cmod = _compute_ctx_continuous_mod(c.copy(), c_ada_w^, c_ada_b^, D, ctx)
+            var cpfwd = sd35_context_preonly_direct_lycoris_forward[1, S, H, Dh](
+                context.copy(), x.copy(), cqw[0].copy(), cqw[1].copy(), cqw[2].copy(), cqw[3].copy(),
+                cmod[1].copy(), cmod[2].copy(), xw, x_smr.mv.copy(), direct,
+                N_CTX, N_IMG, D, MLP, eps, qk_eps, scale, ctx,
+            )
+            x = cpfwd.x_out.copy()
+            blocks.append(BlockSaved(False, True, _empty_joint_fwd(), _empty_dual_fwd(), cpfwd^, cmod[0].copy(), x_smr.flat.copy()))
+            loader.mark_active_block_done(ctx)
+            continue
+        var bwr = _joint_weights_from_block(handle.block, pfx, D, MLP, Dh, ctx)
+        var w = bwr.w.copy()
+        var ctx_smr = _compute_stream_modvecs(c.copy(), bwr.ctx_ada_w.copy(), bwr.ctx_ada_b.copy(), D, ctx)
+        var x_smr = _compute_stream_modvecs(c.copy(), bwr.x_ada_w.copy(), bwr.x_ada_b.copy(), D, ctx)
+        var fwd = sd35_joint_block_direct_lycoris_forward[1, S, H, Dh](
+            context.copy(), x.copy(), w, ctx_smr.mv.copy(), x_smr.mv.copy(),
+            direct, N_CTX, N_IMG, D, MLP, eps, qk_eps, scale, ctx,
+        )
+        context = fwd.ctx_out.copy()
+        x = fwd.x_out.copy()
+        blocks.append(BlockSaved(False, False, fwd^, _empty_dual_fwd(), _empty_ctxpre_fwd(), ctx_smr.flat.copy(), x_smr.flat.copy()))
+        loader.mark_active_block_done(ctx)
+
+    var fl = _final_layer(x, c.copy(), base, N_IMG, D, OUT_CH, eps, ctx)
+    var out = fl.out.copy()
+    var final_ada_flat = fl.ada_flat.copy()
+    var pre_final_x = fl.pre_x.copy()
+
+    return SD35StackForward(out^, blocks^, c^, x_proj^, ctx_proj^, final_ada_flat^, pre_final_x^)
+
+
+def sd35_stack_direct_dora_forward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_CTX: Int, S: Int
+](
+    noisy_h: List[Float32],
+    text_h: List[Float32],
+    pooled_h: List[Float32],
+    sigma: Float32,
+    base: SD35StackBase,
+    mut loader: TurboPlannedLoader,
+    dora: FlatDirectDoRASet,
+    depth: Int, targets: Int,
+    D: Int, MLP: Int, IN_CH: Int, CTX_CH: Int, OUT_CH: Int,
+    TIMESTEP_DIM: Int, POOLED_DIM: Int,
+    eps: Float32, qk_eps: Float32,
+    ctx: DeviceContext,
+) raises -> SD35StackForward:
+    if len(dora.ad) != _sd35_direct_expected_slots(depth, targets):
+        raise Error("sd35_stack_direct_dora_forward_offload: direct slot count mismatch")
+    return _sd35_stack_direct_forward_offload[H, Dh, N_IMG, N_CTX, S](
+        noisy_h, text_h, pooled_h, sigma, base, loader,
+        dora, empty_flat_direct_oft_set(), SD35_DIRECT_ALGO_DORA,
+        depth, targets, D, MLP, IN_CH, CTX_CH, OUT_CH, TIMESTEP_DIM,
+        POOLED_DIM, eps, qk_eps, ctx,
+    )
+
+
+def sd35_stack_direct_oft_forward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_CTX: Int, S: Int
+](
+    noisy_h: List[Float32],
+    text_h: List[Float32],
+    pooled_h: List[Float32],
+    sigma: Float32,
+    base: SD35StackBase,
+    mut loader: TurboPlannedLoader,
+    oft: FlatDirectOFTSet,
+    depth: Int, targets: Int,
+    D: Int, MLP: Int, IN_CH: Int, CTX_CH: Int, OUT_CH: Int,
+    TIMESTEP_DIM: Int, POOLED_DIM: Int,
+    eps: Float32, qk_eps: Float32,
+    ctx: DeviceContext,
+) raises -> SD35StackForward:
+    if len(oft.ad) != _sd35_direct_expected_slots(depth, targets):
+        raise Error("sd35_stack_direct_oft_forward_offload: direct slot count mismatch")
+    return _sd35_stack_direct_forward_offload[H, Dh, N_IMG, N_CTX, S](
+        noisy_h, text_h, pooled_h, sigma, base, loader,
+        empty_flat_direct_dora_set(), oft, SD35_DIRECT_ALGO_OFT,
+        depth, targets, D, MLP, IN_CH, CTX_CH, OUT_CH, TIMESTEP_DIM,
+        POOLED_DIM, eps, qk_eps, ctx,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FULL BACKWARD WITH LoRA, BLOCK-SWAP OFFLOAD (REVERSE block stream).
 #   Collects LoRA d_A/d_B from all 8 slots per block.
@@ -1111,6 +1705,243 @@ def sd35_stack_lora_backward_offload[
         bi -= 1
 
     return SD35LoraGradSet(d_a_flat^, d_b_flat^, nonfinite)
+
+
+def _sd35_scatter_dora_block(
+    mut grads: FlatDirectDoRAGrads, direct: SD35BlockDirectLycoris,
+    g: SD35JointBlockDirectGrads,
+) raises:
+    _sd35_scatter_dora(grads, direct.ctx_qkv_slot, g.ctx_g.qkv)
+    _sd35_scatter_dora(grads, direct.ctx_proj_slot, g.ctx_g.proj)
+    _sd35_scatter_dora(grads, direct.ctx_fc1_slot, g.ctx_g.fc1)
+    _sd35_scatter_dora(grads, direct.ctx_fc2_slot, g.ctx_g.fc2)
+    _sd35_scatter_dora(grads, direct.x_qkv_slot, g.x_g.qkv)
+    _sd35_scatter_dora(grads, direct.x_proj_slot, g.x_g.proj)
+    _sd35_scatter_dora(grads, direct.x_fc1_slot, g.x_g.fc1)
+    _sd35_scatter_dora(grads, direct.x_fc2_slot, g.x_g.fc2)
+
+
+def _sd35_scatter_oft_block(
+    mut grads: FlatDirectOFTGrads, direct: SD35BlockDirectLycoris,
+    g: SD35JointBlockDirectGrads,
+) raises:
+    _sd35_scatter_oft(grads, direct.ctx_qkv_slot, g.ctx_g.qkv)
+    _sd35_scatter_oft(grads, direct.ctx_proj_slot, g.ctx_g.proj)
+    _sd35_scatter_oft(grads, direct.ctx_fc1_slot, g.ctx_g.fc1)
+    _sd35_scatter_oft(grads, direct.ctx_fc2_slot, g.ctx_g.fc2)
+    _sd35_scatter_oft(grads, direct.x_qkv_slot, g.x_g.qkv)
+    _sd35_scatter_oft(grads, direct.x_proj_slot, g.x_g.proj)
+    _sd35_scatter_oft(grads, direct.x_fc1_slot, g.x_g.fc1)
+    _sd35_scatter_oft(grads, direct.x_fc2_slot, g.x_g.fc2)
+
+
+def sd35_stack_direct_dora_backward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_CTX: Int, S: Int
+](
+    d_out: List[Float32],
+    noisy_h: List[Float32],
+    text_h: List[Float32],
+    base: SD35StackBase,
+    mut loader: TurboPlannedLoader,
+    dora: FlatDirectDoRASet,
+    saved: SD35StackForward,
+    depth: Int, targets: Int,
+    D: Int, MLP: Int, IN_CH: Int, CTX_CH: Int, OUT_CH: Int,
+    TIMESTEP_DIM: Int, POOLED_DIM: Int,
+    eps: Float32, qk_eps: Float32,
+    ctx: DeviceContext,
+) raises -> SD35DirectDoRAGradSet:
+    if len(dora.ad) != _sd35_direct_expected_slots(depth, targets):
+        raise Error("sd35_stack_direct_dora_backward_offload: direct slot count mismatch")
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+    var dora_grads = _sd35_direct_dora_zero_grads(dora)
+    var nonfinite = 0
+
+    var final_dtype = base.fl_lin_w[].dtype()
+    var d_x_mod = linear_backward_dx(
+        _t_as(d_out, [N_IMG, OUT_CH], final_dtype, ctx),
+        base.fl_lin_w[],
+        N_IMG, D, OUT_CH, ctx,
+    ).to_host(ctx)
+
+    var scale_final = List[Float32]()
+    for i in range(D):
+        scale_final.append(saved.final_ada_flat[D + i])
+    var mb_fl = modulate_backward(
+        _t_as(d_x_mod, [N_IMG, D], final_dtype, ctx),
+        _t_as(_layer_norm_x(saved.pre_final_x.copy(), N_IMG, D, eps, final_dtype, ctx), [N_IMG, D], final_dtype, ctx),
+        _t_as(scale_final^, [D], final_dtype, ctx), ctx,
+    )
+    var d_ln_x = mb_fl.d_x^.to_host(ctx)
+    var lnb_fl = layer_norm_backward(
+        _t_as(d_ln_x, [N_IMG, D], final_dtype, ctx),
+        _t_as(saved.pre_final_x.copy(), [N_IMG, D], final_dtype, ctx),
+        _t_as(_ones_list(D), [D], final_dtype, ctx),
+        eps, ctx,
+    )
+    var d_x = lnb_fl.d_x^.to_host(ctx)
+    var d_ctx = _zeros_list(N_CTX * D)
+
+    var bi = depth - 1
+    while bi >= 0:
+        var handle = loader.await_block(bi, ctx)
+        if bi > 0:
+            loader.prefetch_with_ctx(bi - 1, ctx)
+        var pfx = handle.prefix + String(".")
+        var direct = _sd35_direct_block_for_dora(dora, bi, depth, targets)
+        if bi == depth - 1:
+            var xw = _stream_weights_from_block(handle.block, pfx + String("x_block."), D, MLP, Dh, ctx)
+            var x_mv = _chunk6(saved.blocks[bi].x_ada_flat.copy(), D)
+            var cqw = _ctx_preonly_qkv_from_block(handle.block, pfx + String("context_block."), ctx)
+            var ctx_scale = List[Float32]()
+            for cc in range(D):
+                ctx_scale.append(saved.blocks[bi].ctx_ada_flat[D + cc])
+            var bg = sd35_context_preonly_direct_lycoris_backward[1, S, H, Dh](
+                d_x.copy(), cqw[0].copy(), cqw[2].copy(), cqw[3].copy(), ctx_scale^,
+                xw, x_mv.copy(), direct, saved.blocks[bi].ctxpre_fwd,
+                N_CTX, N_IMG, D, MLP, eps, qk_eps, Float32(1.0) / Float32(8.0), ctx,
+            )
+            d_x = bg.d_x.copy()
+            d_ctx = bg.d_ctx.copy()
+            _sd35_scatter_dora_block(dora_grads, direct, bg)
+            nonfinite += _sd35_nonfinite_block(bg)
+            loader.mark_active_block_done(ctx)
+            bi -= 1
+            continue
+        var bwr = _joint_weights_from_block(handle.block, pfx, D, MLP, Dh, ctx)
+        var w = bwr.w.copy()
+        var ctx_mv = _chunk6(saved.blocks[bi].ctx_ada_flat.copy(), D)
+        var x_mv = _chunk6(saved.blocks[bi].x_ada_flat.copy(), D)
+        var bg = sd35_joint_block_direct_lycoris_backward[1, S, H, Dh](
+            d_ctx.copy(), d_x.copy(), w, ctx_mv.copy(), x_mv.copy(),
+            direct, saved.blocks[bi].fwd,
+            N_CTX, N_IMG, D, MLP, eps, qk_eps, Float32(1.0) / Float32(8.0), ctx,
+        )
+        d_x = bg.d_x.copy()
+        d_ctx = bg.d_ctx.copy()
+        _sd35_scatter_dora_block(dora_grads, direct, bg)
+        nonfinite += _sd35_nonfinite_block(bg)
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    # Exercise frozen input-projection backwards; grads are intentionally discarded.
+    _ = linear_backward_dx(
+        _t_as(d_x, [N_IMG, D], base.xe_w[].dtype(), ctx),
+        reshape(base.xe_w[], [D, IN_CH], ctx),
+        N_IMG, IN_CH, D, ctx,
+    )
+    _ = linear_backward_dx(
+        _t_as(d_ctx, [N_CTX, D], base.ce_w[].dtype(), ctx),
+        base.ce_w[],
+        N_CTX, CTX_CH, D, ctx,
+    )
+
+    return SD35DirectDoRAGradSet(dora_grads^, nonfinite)
+
+
+def sd35_stack_direct_oft_backward_offload[
+    H: Int, Dh: Int, N_IMG: Int, N_CTX: Int, S: Int
+](
+    d_out: List[Float32],
+    noisy_h: List[Float32],
+    text_h: List[Float32],
+    base: SD35StackBase,
+    mut loader: TurboPlannedLoader,
+    oft: FlatDirectOFTSet,
+    saved: SD35StackForward,
+    depth: Int, targets: Int,
+    D: Int, MLP: Int, IN_CH: Int, CTX_CH: Int, OUT_CH: Int,
+    TIMESTEP_DIM: Int, POOLED_DIM: Int,
+    eps: Float32, qk_eps: Float32,
+    ctx: DeviceContext,
+) raises -> SD35DirectOFTGradSet:
+    if len(oft.ad) != _sd35_direct_expected_slots(depth, targets):
+        raise Error("sd35_stack_direct_oft_backward_offload: direct slot count mismatch")
+    if loader.block_count() > 0:
+        loader.prefetch_with_ctx(loader.block_count() - 1, ctx)
+    var oft_grads = _sd35_direct_oft_zero_grads(oft)
+    var nonfinite = 0
+
+    var final_dtype = base.fl_lin_w[].dtype()
+    var d_x_mod = linear_backward_dx(
+        _t_as(d_out, [N_IMG, OUT_CH], final_dtype, ctx),
+        base.fl_lin_w[],
+        N_IMG, D, OUT_CH, ctx,
+    ).to_host(ctx)
+
+    var scale_final = List[Float32]()
+    for i in range(D):
+        scale_final.append(saved.final_ada_flat[D + i])
+    var mb_fl = modulate_backward(
+        _t_as(d_x_mod, [N_IMG, D], final_dtype, ctx),
+        _t_as(_layer_norm_x(saved.pre_final_x.copy(), N_IMG, D, eps, final_dtype, ctx), [N_IMG, D], final_dtype, ctx),
+        _t_as(scale_final^, [D], final_dtype, ctx), ctx,
+    )
+    var d_ln_x = mb_fl.d_x^.to_host(ctx)
+    var lnb_fl = layer_norm_backward(
+        _t_as(d_ln_x, [N_IMG, D], final_dtype, ctx),
+        _t_as(saved.pre_final_x.copy(), [N_IMG, D], final_dtype, ctx),
+        _t_as(_ones_list(D), [D], final_dtype, ctx),
+        eps, ctx,
+    )
+    var d_x = lnb_fl.d_x^.to_host(ctx)
+    var d_ctx = _zeros_list(N_CTX * D)
+
+    var bi = depth - 1
+    while bi >= 0:
+        var handle = loader.await_block(bi, ctx)
+        if bi > 0:
+            loader.prefetch_with_ctx(bi - 1, ctx)
+        var pfx = handle.prefix + String(".")
+        var direct = _sd35_direct_block_for_oft(oft, bi, depth, targets)
+        if bi == depth - 1:
+            var xw = _stream_weights_from_block(handle.block, pfx + String("x_block."), D, MLP, Dh, ctx)
+            var x_mv = _chunk6(saved.blocks[bi].x_ada_flat.copy(), D)
+            var cqw = _ctx_preonly_qkv_from_block(handle.block, pfx + String("context_block."), ctx)
+            var ctx_scale = List[Float32]()
+            for cc in range(D):
+                ctx_scale.append(saved.blocks[bi].ctx_ada_flat[D + cc])
+            var bg = sd35_context_preonly_direct_lycoris_backward[1, S, H, Dh](
+                d_x.copy(), cqw[0].copy(), cqw[2].copy(), cqw[3].copy(), ctx_scale^,
+                xw, x_mv.copy(), direct, saved.blocks[bi].ctxpre_fwd,
+                N_CTX, N_IMG, D, MLP, eps, qk_eps, Float32(1.0) / Float32(8.0), ctx,
+            )
+            d_x = bg.d_x.copy()
+            d_ctx = bg.d_ctx.copy()
+            _sd35_scatter_oft_block(oft_grads, direct, bg)
+            nonfinite += _sd35_nonfinite_block(bg)
+            loader.mark_active_block_done(ctx)
+            bi -= 1
+            continue
+        var bwr = _joint_weights_from_block(handle.block, pfx, D, MLP, Dh, ctx)
+        var w = bwr.w.copy()
+        var ctx_mv = _chunk6(saved.blocks[bi].ctx_ada_flat.copy(), D)
+        var x_mv = _chunk6(saved.blocks[bi].x_ada_flat.copy(), D)
+        var bg = sd35_joint_block_direct_lycoris_backward[1, S, H, Dh](
+            d_ctx.copy(), d_x.copy(), w, ctx_mv.copy(), x_mv.copy(),
+            direct, saved.blocks[bi].fwd,
+            N_CTX, N_IMG, D, MLP, eps, qk_eps, Float32(1.0) / Float32(8.0), ctx,
+        )
+        d_x = bg.d_x.copy()
+        d_ctx = bg.d_ctx.copy()
+        _sd35_scatter_oft_block(oft_grads, direct, bg)
+        nonfinite += _sd35_nonfinite_block(bg)
+        loader.mark_active_block_done(ctx)
+        bi -= 1
+
+    _ = linear_backward_dx(
+        _t_as(d_x, [N_IMG, D], base.xe_w[].dtype(), ctx),
+        reshape(base.xe_w[], [D, IN_CH], ctx),
+        N_IMG, IN_CH, D, ctx,
+    )
+    _ = linear_backward_dx(
+        _t_as(d_ctx, [N_CTX, D], base.ce_w[].dtype(), ctx),
+        base.ce_w[],
+        N_CTX, CTX_CH, D, ctx,
+    )
+
+    return SD35DirectOFTGradSet(oft_grads^, nonfinite)
 
 
 # ── Helpers for backward ──────────────────────────────────────────────────────

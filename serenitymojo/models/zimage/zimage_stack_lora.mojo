@@ -98,12 +98,17 @@ from serenitymojo.models.zimage.block import (
 from serenitymojo.models.zimage.lora_block import (
     ZImageBlockFullFTBackward, zimage_block_backward_device_tensors_fullft,
     ZImageBlockLora, ZImageBlockLoraDevice, ZImageBlockLoraGrads,
+    ZImageBlockDirectLycoris, ZImageBlockDirectGrads,
+    ZImageDirectProjectionGrad,
+    ZIMAGE_DIRECT_ALGO_DORA, ZIMAGE_DIRECT_ALGO_OFT,
     ZImageModVecsDevice, zimage_modvecs_to_device,
     ZImageLoraAdapterDevice, zimage_lora_adapter_to_device, ZIMAGE_SLOTS,
     SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_W1, SLOT_W3, SLOT_W2,
     zimage_block_lora_forward, zimage_block_lora_backward,
     zimage_block_lora_forward_device, zimage_block_lora_backward_device,
     zimage_block_lora_forward_device_tensor, zimage_block_lora_backward_device_tensors,
+    zimage_block_direct_lycoris_forward_device_tensor,
+    zimage_block_direct_lycoris_backward_device_tensors,
     zimage_block_lora_forward_device_tensor_batch,
     zimage_block_lora_backward_device_tensors_batch,
     zimage_modvecs_pack2_to_device,
@@ -137,6 +142,21 @@ from serenitymojo.training.lora_save import (
     NamedLora, save_lora_peft, load_lora_for_resume,
     save_lora_train_state, load_lora_train_state, _read_f32,
 )
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.dora_save import NamedDoRA, save_dora_onetrainer
+from serenitymojo.training.oft_onetrainer import OFTOTGrads
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectDoRAGrads, FlatDirectOFTSet, FlatDirectOFTGrads,
+    empty_flat_direct_dora_set, empty_flat_direct_oft_set,
+    flat_direct_dora_append_from_weight, flat_direct_oft_append,
+    flat_direct_dora_grad_norm, flat_direct_dora_clip_grads,
+    flat_direct_dora_adamw_step, flat_direct_dora_zero_leg_l1,
+    flat_direct_dora_trainable_bytes,
+    flat_direct_oft_grad_norm, flat_direct_oft_clip_grads,
+    flat_direct_oft_adamw_step, flat_direct_oft_vec_l1,
+    flat_direct_oft_trainable_bytes,
+)
+from serenitymojo.io.safetensors_writer import save_safetensors
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -562,6 +582,380 @@ def _zimage_tensor_grads_to_host(
     return _ZImageHostGradLists(d_a_flat^, d_b_flat^)
 
 
+# ── Direct DoRA/OFT state for main-layer Z-Image/L2P training ───────────────
+comptime ZIMAGE_DIRECT_24_GIB = 24 * 1024 * 1024 * 1024
+
+
+struct ZImageDirectDoRAGradSet(Movable):
+    var grads: FlatDirectDoRAGrads
+    var nonfinite_grads: Int
+
+    def __init__(out self, var grads: FlatDirectDoRAGrads, nonfinite_grads: Int):
+        self.grads = grads^
+        self.nonfinite_grads = nonfinite_grads
+
+
+struct ZImageDirectOFTGradSet(Movable):
+    var grads: FlatDirectOFTGrads
+    var nonfinite_grads: Int
+
+    def __init__(out self, var grads: FlatDirectOFTGrads, nonfinite_grads: Int):
+        self.grads = grads^
+        self.nonfinite_grads = nonfinite_grads
+
+
+def empty_zimage_direct_dora_set() -> FlatDirectDoRASet:
+    return empty_flat_direct_dora_set()
+
+
+def empty_zimage_direct_oft_set() -> FlatDirectOFTSet:
+    return empty_flat_direct_oft_set()
+
+
+def _zimage_direct_slot_targeted(slot: Int, targets: Int) raises -> Bool:
+    if targets < 1 or targets > 2:
+        raise Error("Z-Image direct LyCORIS: targets must be 1(attn)|2(all)")
+    var s = slot % ZIMAGE_SLOTS
+    if s == SLOT_Q or s == SLOT_K or s == SLOT_V or s == SLOT_O:
+        return targets >= 1
+    return targets >= 2
+
+
+def _zimage_direct_slots_per_block(targets: Int) raises -> Int:
+    var n = 0
+    for slot in range(ZIMAGE_SLOTS):
+        if _zimage_direct_slot_targeted(slot, targets):
+            n += 1
+    return n
+
+
+def _zimage_direct_expected_slots(num_main: Int, targets: Int) raises -> Int:
+    return num_main * _zimage_direct_slots_per_block(targets)
+
+
+def _zimage_direct_block_base(bi: Int, targets: Int) raises -> Int:
+    return bi * _zimage_direct_slots_per_block(targets)
+
+
+def _zimage_direct_prefix_main(bi: Int, slot: Int) -> String:
+    return String("layers.") + String(bi) + _slot_suffix(slot)
+
+
+def zimage_direct_dense_carrier_bytes(
+    num_main: Int, D: Int, F: Int, targets: Int,
+) raises -> Int:
+    var elems = 0
+    for _bi in range(num_main):
+        for slot in range(ZIMAGE_SLOTS):
+            if not _zimage_direct_slot_targeted(slot, targets):
+                continue
+            var in_f = _slot_in(slot, D, F)
+            var out_f = _slot_out(slot, D, F)
+            elems += in_f * in_f + out_f * in_f
+    return elems * 2
+
+
+def zimage_direct_dora_trainable_bytes_estimate(
+    num_main: Int, D: Int, F: Int, rank: Int, targets: Int,
+    wd_on_out: Bool = False,
+) raises -> Int:
+    var total = 0
+    for _bi in range(num_main):
+        for slot in range(ZIMAGE_SLOTS):
+            if not _zimage_direct_slot_targeted(slot, targets):
+                continue
+            var in_f = _slot_in(slot, D, F)
+            var out_f = _slot_out(slot, D, F)
+            var mlen = out_f if wd_on_out else in_f
+            var bf16_elems = rank * in_f + out_f * rank
+            var f32_elems = mlen + (2 * rank * in_f) + (2 * out_f * rank) + (2 * mlen)
+            total += bf16_elems * 2 + f32_elems * 4
+    return total
+
+
+def zimage_direct_oft_trainable_bytes_estimate(
+    num_main: Int, D: Int, F: Int, block_size: Int, targets: Int,
+) raises -> Int:
+    var total = 0
+    for _bi in range(num_main):
+        for slot in range(ZIMAGE_SLOTS):
+            if not _zimage_direct_slot_targeted(slot, targets):
+                continue
+            var in_f = _slot_in(slot, D, F)
+            if in_f % block_size != 0:
+                raise Error("zimage_direct_oft_trainable_bytes_estimate: in_f not divisible by block_size")
+            var r = in_f // block_size
+            var ne = block_size * (block_size - 1) // 2
+            total += 3 * r * ne * 4
+    return total
+
+
+def zimage_direct_dora_preflight(
+    num_main: Int, D: Int, F: Int, rank: Int, targets: Int,
+    budget_bytes: Int, wd_on_out: Bool = False,
+) raises -> Int:
+    var direct = zimage_direct_dora_trainable_bytes_estimate(
+        num_main, D, F, rank, targets, wd_on_out,
+    )
+    if direct > budget_bytes:
+        raise Error(
+            String("Z-Image direct DoRA trainable state needs ") + String(direct)
+            + String(" bytes (> budget ") + String(budget_bytes) + String(")")
+        )
+    return direct
+
+
+def zimage_direct_oft_preflight(
+    num_main: Int, D: Int, F: Int, block_size: Int, targets: Int,
+    budget_bytes: Int,
+) raises -> Int:
+    var direct = zimage_direct_oft_trainable_bytes_estimate(
+        num_main, D, F, block_size, targets,
+    )
+    if direct > budget_bytes:
+        raise Error(
+            String("Z-Image direct OFT trainable state needs ") + String(direct)
+            + String(" bytes (> budget ") + String(budget_bytes) + String(")")
+        )
+    return direct
+
+
+def _zimage_block_weights_for_slot(w: ZImageBlockWeights, slot: Int, ctx: DeviceContext) raises -> List[Float32]:
+    if slot == SLOT_Q:
+        return w.wq[].to_host(ctx)
+    if slot == SLOT_K:
+        return w.wk[].to_host(ctx)
+    if slot == SLOT_V:
+        return w.wv[].to_host(ctx)
+    if slot == SLOT_O:
+        return w.wo[].to_host(ctx)
+    if slot == SLOT_W1:
+        return w.w1[].to_host(ctx)
+    if slot == SLOT_W3:
+        return w.w3[].to_host(ctx)
+    if slot == SLOT_W2:
+        return w.w2[].to_host(ctx)
+    raise Error("Z-Image direct: bad slot")
+
+
+def build_zimage_direct_dora_set_from_main_blocks(
+    main_blocks: List[ZImageBlockWeights], D: Int, F: Int,
+    rank: Int, alpha: Float32, targets: Int, seed: UInt64,
+    wd_on_out: Bool, ctx: DeviceContext,
+) raises -> FlatDirectDoRASet:
+    var set = empty_flat_direct_dora_set()
+    for bi in range(len(main_blocks)):
+        var block_seed = seed + UInt64(bi * ZIMAGE_SLOTS)
+        for slot in range(ZIMAGE_SLOTS):
+            if not _zimage_direct_slot_targeted(slot, targets):
+                continue
+            var in_f = _slot_in(slot, D, F)
+            var out_f = _slot_out(slot, D, F)
+            var w_h = _zimage_block_weights_for_slot(main_blocks[bi], slot, ctx)
+            flat_direct_dora_append_from_weight(
+                set, w_h^, in_f, out_f, rank, alpha,
+                _zimage_direct_prefix_main(bi, slot), block_seed + UInt64(slot),
+                wd_on_out,
+            )
+    if len(set.ad) != _zimage_direct_expected_slots(len(main_blocks), targets):
+        raise Error("build_zimage_direct_dora_set_from_main_blocks: direct slot count mismatch")
+    return set^
+
+
+def build_zimage_direct_oft_set_for_main_blocks(
+    num_main: Int, D: Int, F: Int, block_size: Int, targets: Int,
+) raises -> FlatDirectOFTSet:
+    var set = empty_flat_direct_oft_set()
+    for bi in range(num_main):
+        for slot in range(ZIMAGE_SLOTS):
+            if not _zimage_direct_slot_targeted(slot, targets):
+                continue
+            flat_direct_oft_append(
+                set, _slot_in(slot, D, F), _slot_out(slot, D, F), block_size,
+                _zimage_direct_prefix_main(bi, slot),
+            )
+    if len(set.ad) != _zimage_direct_expected_slots(num_main, targets):
+        raise Error("build_zimage_direct_oft_set_for_main_blocks: direct slot count mismatch")
+    return set^
+
+
+def _zimage_direct_block_for_dora(
+    dora: FlatDirectDoRASet, bi: Int, targets: Int,
+) raises -> ZImageBlockDirectLycoris:
+    return ZImageBlockDirectLycoris(
+        ZIMAGE_DIRECT_ALGO_DORA, dora.copy(), empty_flat_direct_oft_set(),
+        _zimage_direct_block_base(bi, targets), targets,
+    )
+
+
+def _zimage_direct_block_for_oft(
+    oft: FlatDirectOFTSet, bi: Int, targets: Int,
+) raises -> ZImageBlockDirectLycoris:
+    return ZImageBlockDirectLycoris(
+        ZIMAGE_DIRECT_ALGO_OFT, empty_flat_direct_dora_set(), oft.copy(),
+        _zimage_direct_block_base(bi, targets), targets,
+    )
+
+
+def _zimage_direct_dora_zero_grads(set: FlatDirectDoRASet) -> FlatDirectDoRAGrads:
+    var out = List[DoRAGrads]()
+    for i in range(len(set.ad)):
+        ref d = set.ad[i]
+        out.append(DoRAGrads(
+            _zeros(len(d.a)), _zeros(len(d.b)), _zeros(len(d.m)), List[Float32](),
+        ))
+    return FlatDirectDoRAGrads(out^)
+
+
+def _zimage_direct_oft_zero_grads(set: FlatDirectOFTSet) -> FlatDirectOFTGrads:
+    var out = List[List[Float32]]()
+    for i in range(len(set.ad)):
+        out.append(_zeros(len(set.ad[i].vec)))
+    return FlatDirectOFTGrads(out^)
+
+
+def _zimage_scatter_dora(
+    mut grads: FlatDirectDoRAGrads, slot: Int, g: ZImageDirectProjectionGrad,
+) raises:
+    if slot < 0:
+        return
+    if slot >= len(grads.g):
+        raise Error("_zimage_scatter_dora: slot out of range")
+    grads.g[slot] = DoRAGrads(g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), List[Float32]())
+
+
+def _zimage_scatter_oft(
+    mut grads: FlatDirectOFTGrads, slot: Int, g: ZImageDirectProjectionGrad,
+) raises:
+    if slot < 0:
+        return
+    if slot >= len(grads.d_vec):
+        raise Error("_zimage_scatter_oft: slot out of range")
+    grads.d_vec[slot] = g.d_vec.copy()
+
+
+def _zimage_nonfinite_direct(g: ZImageDirectProjectionGrad) -> Int:
+    return _nonfinite(g.d_a) + _nonfinite(g.d_b) + _nonfinite(g.d_m) + _nonfinite(g.d_vec)
+
+
+def _zimage_nonfinite_direct_block(g: ZImageBlockDirectGrads) -> Int:
+    return (
+        _zimage_nonfinite_direct(g.q) + _zimage_nonfinite_direct(g.k)
+        + _zimage_nonfinite_direct(g.v) + _zimage_nonfinite_direct(g.out_proj)
+        + _zimage_nonfinite_direct(g.w1) + _zimage_nonfinite_direct(g.w3)
+        + _zimage_nonfinite_direct(g.w2)
+    )
+
+
+def _zimage_scatter_dora_block(
+    mut grads: FlatDirectDoRAGrads, direct: ZImageBlockDirectLycoris,
+    g: ZImageBlockDirectGrads,
+) raises:
+    _zimage_scatter_dora(grads, direct.q_slot, g.q)
+    _zimage_scatter_dora(grads, direct.k_slot, g.k)
+    _zimage_scatter_dora(grads, direct.v_slot, g.v)
+    _zimage_scatter_dora(grads, direct.o_slot, g.out_proj)
+    _zimage_scatter_dora(grads, direct.w1_slot, g.w1)
+    _zimage_scatter_dora(grads, direct.w3_slot, g.w3)
+    _zimage_scatter_dora(grads, direct.w2_slot, g.w2)
+
+
+def _zimage_scatter_oft_block(
+    mut grads: FlatDirectOFTGrads, direct: ZImageBlockDirectLycoris,
+    g: ZImageBlockDirectGrads,
+) raises:
+    _zimage_scatter_oft(grads, direct.q_slot, g.q)
+    _zimage_scatter_oft(grads, direct.k_slot, g.k)
+    _zimage_scatter_oft(grads, direct.v_slot, g.v)
+    _zimage_scatter_oft(grads, direct.o_slot, g.out_proj)
+    _zimage_scatter_oft(grads, direct.w1_slot, g.w1)
+    _zimage_scatter_oft(grads, direct.w3_slot, g.w3)
+    _zimage_scatter_oft(grads, direct.w2_slot, g.w2)
+
+
+def zimage_direct_dora_grad_norm(g: FlatDirectDoRAGrads) -> Float64:
+    return flat_direct_dora_grad_norm(g)
+
+
+def zimage_direct_dora_clip_grads(mut g: FlatDirectDoRAGrads, clip_scale: Float32):
+    flat_direct_dora_clip_grads(g, clip_scale)
+
+
+def zimage_direct_dora_adamw_step(
+    mut set: FlatDirectDoRASet, g: FlatDirectDoRAGrads, t: Int, lr: Float32,
+    beta1: Float32, beta2: Float32, eps: Float32, weight_decay: Float32,
+) raises:
+    flat_direct_dora_adamw_step(set, g, t, lr, beta1, beta2, eps, weight_decay)
+
+
+def zimage_direct_dora_zero_leg_l1(set: FlatDirectDoRASet) -> Float64:
+    return flat_direct_dora_zero_leg_l1(set)
+
+
+def zimage_direct_dora_trainable_bytes(set: FlatDirectDoRASet) -> Int:
+    return flat_direct_dora_trainable_bytes(set)
+
+
+def zimage_direct_oft_grad_norm(g: FlatDirectOFTGrads) -> Float64:
+    return flat_direct_oft_grad_norm(g)
+
+
+def zimage_direct_oft_clip_grads(mut g: FlatDirectOFTGrads, clip_scale: Float32):
+    flat_direct_oft_clip_grads(g, clip_scale)
+
+
+def zimage_direct_oft_adamw_step(
+    mut set: FlatDirectOFTSet, g: FlatDirectOFTGrads, t: Int, lr: Float32,
+    beta1: Float32, beta2: Float32, eps: Float32, weight_decay: Float32,
+) raises:
+    flat_direct_oft_adamw_step(set, g, t, lr, beta1, beta2, eps, weight_decay)
+
+
+def zimage_direct_oft_vec_l1(set: FlatDirectOFTSet) -> Float64:
+    return flat_direct_oft_vec_l1(set)
+
+
+def zimage_direct_oft_trainable_bytes(set: FlatDirectOFTSet) -> Int:
+    return flat_direct_oft_trainable_bytes(set)
+
+
+def _zimage_f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+    var sh = List[Int]()
+    sh.append(rows)
+    sh.append(cols)
+    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+
+
+def save_zimage_direct_dora(
+    set: FlatDirectDoRASet, path: String, ctx: DeviceContext,
+) raises -> Int:
+    var named = List[NamedDoRA]()
+    for i in range(len(set.ad)):
+        if set.active[i]:
+            named.append(NamedDoRA(set.prefix[i].copy(), set.ad[i].copy()))
+    return save_dora_onetrainer(named, path, ctx)
+
+
+def save_zimage_direct_oft(
+    set: FlatDirectOFTSet, path: String, ctx: DeviceContext,
+) raises -> Int:
+    var names = List[String]()
+    var tensors = List[ArcPointer[Tensor]]()
+    var nmods = 0
+    for i in range(len(set.ad)):
+        if not set.active[i]:
+            continue
+        ref sl = set.ad[i]
+        var ne = sl.b * (sl.b - 1) // 2
+        names.append(set.prefix[i].copy() + String(".oft_R.weight"))
+        tensors.append(ArcPointer(_zimage_f32_2d(sl.vec.copy(), sl.r, ne, ctx)))
+        nmods += 1
+    if nmods == 0:
+        raise Error("save_zimage_direct_oft: refusing to write an empty OFT file")
+    save_safetensors(names, tensors, path, ctx)
+    return nmods
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RESIDENT LoRA stack (small depth, for the COMPOSITION parity gate). Mirrors
 # zimage_stack_forward/backward exactly, swapping per-block calls for LoRA ones.
@@ -818,6 +1212,140 @@ def zimage_stack_lora_forward_main_device[
         var bl = _block_lora_dev_for(lora, lora.main_base() + i)
         var fwd = zimage_block_lora_forward_device_tensor[H, Dh, S](
             x_arc.copy(), main_blocks[i], main_mod[i], bl, uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
+
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = vec_modulate(
+        ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+    var parts = _split_img_cap(patches, N_IMG, N_TXT, out_ch)
+    var out = parts[0].copy()
+
+    return ZImageStackForward(
+        out^, x_seq.copy(), cap_seq.copy(),
+        nr_x_in^, cr_x_in^, main_x_in^,
+        x_arc.copy(), TArc(ln_t^),
+    )
+
+
+def zimage_stack_direct_dora_forward_main_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    x_seq: List[Float32], cap_seq: List[Float32],
+    nr_blocks: List[ZImageBlockWeights], nr_mod: List[ZImageModVecs],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    dora: FlatDirectDoRASet, targets: Int,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageStackForward:
+    var num_nr = len(nr_blocks)
+    var num_cr = len(cr_blocks)
+    var num_main = len(main_blocks)
+
+    var nr_x_in = List[TArc]()
+    var xs = x_seq.copy()
+    for i in range(num_nr):
+        var fwd = zimage_block_forward[H, Dh, N_IMG](
+            xs.copy(), nr_blocks[i], nr_mod[i], x_cos, x_sin, D, F, eps, ctx,
+        )
+        xs = fwd.out.copy()
+
+    var cr_x_in = List[TArc]()
+    var cs = cap_seq.copy()
+    for i in range(num_cr):
+        var fwd = zimage_refiner_forward[H, Dh, N_TXT](
+            cs.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
+        )
+        cs = fwd.out.copy()
+
+    var x = _concat_img_cap(xs, cs)
+    var x_arc = TArc(_t(x^, [S, D], ctx))
+
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var direct = _zimage_direct_block_for_dora(dora, i, targets)
+        var fwd = zimage_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod[i], direct,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
+
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = vec_modulate(
+        ln_t, _t(f_scale.copy(), [D], ctx), _t(_zeros(D), [D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+    var parts = _split_img_cap(patches, N_IMG, N_TXT, out_ch)
+    var out = parts[0].copy()
+
+    return ZImageStackForward(
+        out^, x_seq.copy(), cap_seq.copy(),
+        nr_x_in^, cr_x_in^, main_x_in^,
+        x_arc.copy(), TArc(ln_t^),
+    )
+
+
+def zimage_stack_direct_oft_forward_main_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    x_seq: List[Float32], cap_seq: List[Float32],
+    nr_blocks: List[ZImageBlockWeights], nr_mod: List[ZImageModVecs],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    oft: FlatDirectOFTSet, targets: Int,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageStackForward:
+    var num_nr = len(nr_blocks)
+    var num_cr = len(cr_blocks)
+    var num_main = len(main_blocks)
+
+    var nr_x_in = List[TArc]()
+    var xs = x_seq.copy()
+    for i in range(num_nr):
+        var fwd = zimage_block_forward[H, Dh, N_IMG](
+            xs.copy(), nr_blocks[i], nr_mod[i], x_cos, x_sin, D, F, eps, ctx,
+        )
+        xs = fwd.out.copy()
+
+    var cr_x_in = List[TArc]()
+    var cs = cap_seq.copy()
+    for i in range(num_cr):
+        var fwd = zimage_refiner_forward[H, Dh, N_TXT](
+            cs.copy(), cr_blocks[i], cap_cos, cap_sin, D, F, eps, ctx,
+        )
+        cs = fwd.out.copy()
+
+    var x = _concat_img_cap(xs, cs)
+    var x_arc = TArc(_t(x^, [S, D], ctx))
+
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var direct = _zimage_direct_block_for_oft(oft, i, targets)
+        var fwd = zimage_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod[i], direct,
+            uni_cos, uni_sin, D, F, eps, ctx,
         )
         main_x_in.append(fwd.saved.x.copy())
         x_arc = fwd.out.copy()
@@ -1670,6 +2198,174 @@ def zimage_stack_lora_backward_main_device_nofinal[
         empty_fs^, empty_fl^,
         nonfinite,
     )
+
+
+def zimage_stack_direct_dora_backward_main_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    dora: FlatDirectDoRASet, targets: Int,
+    f_scale: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageDirectDoRAGradSet:
+    var num_main = len(main_blocks)
+    if len(dora.ad) != _zimage_direct_expected_slots(num_main, targets):
+        raise Error("zimage_stack_direct_dora_backward_main_device: direct slot count mismatch")
+
+    var d_patches = _concat_img_cap(d_out, _zeros(N_TXT * out_ch))
+    var final_dx = linear_backward_dx(
+        _t(d_patches, [S, out_ch], ctx), final_lin_w, S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var dora_grads = _zimage_direct_dora_zero_grads(dora)
+    var nonfinite = 0
+    var bi = num_main - 1
+    while bi >= 0:
+        var direct = _zimage_direct_block_for_dora(dora, bi, targets)
+        var refwd = zimage_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod[bi], direct,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        var bg = zimage_block_direct_lycoris_backward_device_tensors[H, Dh, S](
+            d_x[], main_blocks[bi], main_mod[bi], direct, refwd.saved,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        _zimage_scatter_dora_block(dora_grads, direct, bg.grads)
+        nonfinite += _zimage_nonfinite_direct_block(bg.grads)
+        bi -= 1
+    return ZImageDirectDoRAGradSet(dora_grads^, nonfinite)
+
+
+def zimage_stack_direct_oft_backward_main_device[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out: List[Float32],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    oft: FlatDirectOFTSet, targets: Int,
+    f_scale: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageDirectOFTGradSet:
+    var num_main = len(main_blocks)
+    if len(oft.ad) != _zimage_direct_expected_slots(num_main, targets):
+        raise Error("zimage_stack_direct_oft_backward_main_device: direct slot count mismatch")
+
+    var d_patches = _concat_img_cap(d_out, _zeros(N_TXT * out_ch))
+    var final_dx = linear_backward_dx(
+        _t(d_patches, [S, out_ch], ctx), final_lin_w, S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale.copy(), [D], ctx), ctx,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var oft_grads = _zimage_direct_oft_zero_grads(oft)
+    var nonfinite = 0
+    var bi = num_main - 1
+    while bi >= 0:
+        var direct = _zimage_direct_block_for_oft(oft, bi, targets)
+        var refwd = zimage_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod[bi], direct,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        var bg = zimage_block_direct_lycoris_backward_device_tensors[H, Dh, S](
+            d_x[], main_blocks[bi], main_mod[bi], direct, refwd.saved,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        _zimage_scatter_oft_block(oft_grads, direct, bg.grads)
+        nonfinite += _zimage_nonfinite_direct_block(bg.grads)
+        bi -= 1
+    return ZImageDirectOFTGradSet(oft_grads^, nonfinite)
+
+
+def zimage_stack_direct_dora_backward_main_device_nofinal[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_x_full: List[Float32],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    dora: FlatDirectDoRASet, targets: Int,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageDirectDoRAGradSet:
+    var num_main = len(main_blocks)
+    if len(dora.ad) != _zimage_direct_expected_slots(num_main, targets):
+        raise Error("zimage_stack_direct_dora_backward_main_device_nofinal: direct slot count mismatch")
+    var d_x = TArc(_t(d_x_full.copy(), [S, D], ctx))
+    var dora_grads = _zimage_direct_dora_zero_grads(dora)
+    var nonfinite = 0
+    var bi = num_main - 1
+    while bi >= 0:
+        var direct = _zimage_direct_block_for_dora(dora, bi, targets)
+        var refwd = zimage_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod[bi], direct,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        var bg = zimage_block_direct_lycoris_backward_device_tensors[H, Dh, S](
+            d_x[], main_blocks[bi], main_mod[bi], direct, refwd.saved,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        _zimage_scatter_dora_block(dora_grads, direct, bg.grads)
+        nonfinite += _zimage_nonfinite_direct_block(bg.grads)
+        bi -= 1
+    return ZImageDirectDoRAGradSet(dora_grads^, nonfinite)
+
+
+def zimage_stack_direct_oft_backward_main_device_nofinal[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_x_full: List[Float32],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    oft: FlatDirectOFTSet, targets: Int,
+    uni_cos: Tensor, uni_sin: Tensor,
+    saved: ZImageStackForward,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageDirectOFTGradSet:
+    var num_main = len(main_blocks)
+    if len(oft.ad) != _zimage_direct_expected_slots(num_main, targets):
+        raise Error("zimage_stack_direct_oft_backward_main_device_nofinal: direct slot count mismatch")
+    var d_x = TArc(_t(d_x_full.copy(), [S, D], ctx))
+    var oft_grads = _zimage_direct_oft_zero_grads(oft)
+    var nonfinite = 0
+    var bi = num_main - 1
+    while bi >= 0:
+        var direct = _zimage_direct_block_for_oft(oft, bi, targets)
+        var refwd = zimage_block_direct_lycoris_forward_device_tensor[H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod[bi], direct,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        var bg = zimage_block_direct_lycoris_backward_device_tensors[H, Dh, S](
+            d_x[], main_blocks[bi], main_mod[bi], direct, refwd.saved,
+            uni_cos, uni_sin, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        _zimage_scatter_oft_block(oft_grads, direct, bg.grads)
+        nonfinite += _zimage_nonfinite_direct_block(bg.grads)
+        bi -= 1
+    return ZImageDirectOFTGradSet(oft_grads^, nonfinite)
 
 
 # ── AdamW step on EVERY adapter (reuses the proven per-adapter _lora_adamw) ───

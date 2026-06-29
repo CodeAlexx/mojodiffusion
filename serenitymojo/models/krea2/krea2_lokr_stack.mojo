@@ -103,14 +103,17 @@ def krea2_lokr_carrier_lists(
     return out^
 
 
-def krea2_lokr_carrier_total_bytes(set: Krea2LoKrSet) raises -> Int:
+def krea2_lokr_carrier_total_bytes(
+    set: Krea2LoKrSet, D: Int, F: Int, qdim: Int, kvdim: Int
+) raises -> Int:
     var elems = 0
     for i in range(len(set.ad)):
         if set.active[i]:
             var r = lokr_carrier_r_eff(set.ad[i])
             elems += r * set.ad[i].in_f + set.ad[i].out_f * r
         else:
-            elems += set.ad[i].in_f + set.ad[i].out_f
+            var dims = krea2_lokr_slot_dims(i % KREA2_SLOTS, D, F, qdim, kvdim)
+            elems += dims[0] + dims[1]
     return elems * 2
 
 

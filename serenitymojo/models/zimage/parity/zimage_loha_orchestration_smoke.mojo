@@ -48,7 +48,7 @@ def main() raises:
           " blocks=", total_blocks, " slots=", nslots, ") ===")
 
     var masters = build_zimage_loha_set(NR, CR, MAIN, D, F, RANK, ALPHA, 2, UInt64(12345))
-    print("  built ZImageLoHaSet; carrier bytes:", zimage_loha_carrier_total_bytes(masters))
+    print("  built ZImageLoHaSet; carrier bytes:", zimage_loha_carrier_total_bytes(masters, D, F))
 
     var carriers = zimage_loha_carrier_lists(masters, D, F)
     if len(carriers) != nslots:

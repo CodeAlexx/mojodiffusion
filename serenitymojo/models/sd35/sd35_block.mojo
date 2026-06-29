@@ -72,6 +72,16 @@ from serenitymojo.ops.activation_backward import gelu_backward
 from serenitymojo.ops.attention_backward import sdpa_backward, SdpaGrads
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 from serenitymojo.training.train_step import LoraAdapter
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectOFTSet,
+)
+from serenitymojo.training.dora_substitution_device import (
+    dora_device_from_host, dora_substitution_forward_device,
+    dora_substitution_backward_device,
+)
+from serenitymojo.training.oft_onetrainer_device import (
+    oft_ot_rotate_b4, oft_ot_rotate_backward_b4,
+)
 
 
 # ── host helpers (the by-hand grad threading; NO tape) ──────────────────────
@@ -496,6 +506,289 @@ struct JointBlockGrads(Copyable, Movable):
         self.x_d_qkv = x_d_qkv^
 
 
+# ── Direct DoRA/OFT projection substitution ─────────────────────────────────
+comptime SD35_DIRECT_ALGO_DORA = 1
+comptime SD35_DIRECT_ALGO_OFT = 2
+comptime SD35_DIRECT_TGT_ATTN = 1
+comptime SD35_DIRECT_TGT_ALL = 2
+
+comptime SD35_DIRECT_CTX_QKV = 0
+comptime SD35_DIRECT_CTX_PROJ = 1
+comptime SD35_DIRECT_CTX_FC1 = 2
+comptime SD35_DIRECT_CTX_FC2 = 3
+comptime SD35_DIRECT_X_QKV = 4
+comptime SD35_DIRECT_X_PROJ = 5
+comptime SD35_DIRECT_X_FC1 = 6
+comptime SD35_DIRECT_X_FC2 = 7
+
+
+def _empty_f32() -> List[Float32]:
+    return List[Float32]()
+
+
+def _sd35_direct_slot_is_attn(slot: Int) -> Bool:
+    var s = slot % 8
+    return (
+        s == SD35_DIRECT_CTX_QKV or s == SD35_DIRECT_CTX_PROJ
+        or s == SD35_DIRECT_X_QKV or s == SD35_DIRECT_X_PROJ
+    )
+
+
+def _sd35_direct_slot_targeted(slot: Int, targets: Int) raises -> Bool:
+    if targets < SD35_DIRECT_TGT_ATTN or targets > 3:
+        raise Error("SD35BlockDirectLycoris: targets must be 1(attn)|2(all)|3(all)")
+    if _sd35_direct_slot_is_attn(slot):
+        return targets >= SD35_DIRECT_TGT_ATTN
+    return targets >= SD35_DIRECT_TGT_ALL
+
+
+def _sd35_direct_slot_exists(slot: Int, last_ctx_preonly: Bool) -> Bool:
+    if not last_ctx_preonly:
+        return True
+    var s = slot % 8
+    return (
+        s != SD35_DIRECT_CTX_PROJ
+        and s != SD35_DIRECT_CTX_FC1
+        and s != SD35_DIRECT_CTX_FC2
+    )
+
+
+def _sd35_direct_slot_targeted_for_block(
+    slot: Int, targets: Int, last_ctx_preonly: Bool,
+) raises -> Bool:
+    if not _sd35_direct_slot_exists(slot, last_ctx_preonly):
+        return False
+    return _sd35_direct_slot_targeted(slot, targets)
+
+
+struct SD35BlockDirectLycoris(Copyable, Movable):
+    var algo: Int
+    var dora: FlatDirectDoRASet
+    var oft: FlatDirectOFTSet
+    var ctx_qkv_slot: Int
+    var ctx_proj_slot: Int
+    var ctx_fc1_slot: Int
+    var ctx_fc2_slot: Int
+    var x_qkv_slot: Int
+    var x_proj_slot: Int
+    var x_fc1_slot: Int
+    var x_fc2_slot: Int
+
+    def __init__(
+        out self, algo: Int, var dora: FlatDirectDoRASet,
+        var oft: FlatDirectOFTSet, base_slot: Int, targets: Int,
+        last_ctx_preonly: Bool = False,
+    ) raises:
+        var cq = -1
+        var cp = -1
+        var cf1 = -1
+        var cf2 = -1
+        var xq = -1
+        var xp = -1
+        var xf1 = -1
+        var xf2 = -1
+        var compact = base_slot
+        for slot in range(8):
+            if not _sd35_direct_slot_targeted_for_block(
+                slot, targets, last_ctx_preonly,
+            ):
+                continue
+            if slot == SD35_DIRECT_CTX_QKV:
+                cq = compact
+            elif slot == SD35_DIRECT_CTX_PROJ:
+                cp = compact
+            elif slot == SD35_DIRECT_CTX_FC1:
+                cf1 = compact
+            elif slot == SD35_DIRECT_CTX_FC2:
+                cf2 = compact
+            elif slot == SD35_DIRECT_X_QKV:
+                xq = compact
+            elif slot == SD35_DIRECT_X_PROJ:
+                xp = compact
+            elif slot == SD35_DIRECT_X_FC1:
+                xf1 = compact
+            else:
+                xf2 = compact
+            compact += 1
+        self.algo = algo
+        self.dora = dora^
+        self.oft = oft^
+        self.ctx_qkv_slot = cq
+        self.ctx_proj_slot = cp
+        self.ctx_fc1_slot = cf1
+        self.ctx_fc2_slot = cf2
+        self.x_qkv_slot = xq
+        self.x_proj_slot = xp
+        self.x_fc1_slot = xf1
+        self.x_fc2_slot = xf2
+
+
+struct SD35DirectProjectionGrad(Copyable, Movable):
+    var d_a: List[Float32]
+    var d_b: List[Float32]
+    var d_m: List[Float32]
+    var d_vec: List[Float32]
+
+    def __init__(
+        out self, var d_a: List[Float32], var d_b: List[Float32],
+        var d_m: List[Float32], var d_vec: List[Float32],
+    ):
+        self.d_a = d_a^
+        self.d_b = d_b^
+        self.d_m = d_m^
+        self.d_vec = d_vec^
+
+
+def _empty_direct_grad() -> SD35DirectProjectionGrad:
+    return SD35DirectProjectionGrad(_empty_f32(), _empty_f32(), _empty_f32(), _empty_f32())
+
+
+struct _SD35DirectProjectionBack(Movable):
+    var d_x: List[Float32]
+    var g: SD35DirectProjectionGrad
+
+    def __init__(out self, var d_x: List[Float32], var g: SD35DirectProjectionGrad):
+        self.d_x = d_x^
+        self.g = g^
+
+
+def _sd35_oft_vec_tensor(
+    set: FlatDirectOFTSet, slot: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    if slot < 0 or slot >= len(set.ad):
+        raise Error("SD35BlockDirectLycoris OFT: slot out of range")
+    if not set.active[slot]:
+        raise Error("SD35BlockDirectLycoris OFT: inactive slot")
+    ref sl = set.ad[slot]
+    if sl.b != 4:
+        raise Error("SD35BlockDirectLycoris OFT: only block_size=4 is wired on GPU")
+    return Tensor.from_host(sl.vec.copy(), [sl.r, 6], STDtype.F32, ctx)
+
+
+def _add_bias_host(
+    var y: List[Float32], b: List[Float32], rows: Int, out_f: Int,
+) raises -> List[Float32]:
+    if len(y) != rows * out_f or len(b) != out_f:
+        raise Error("_add_bias_host: shape mismatch")
+    for r in range(rows):
+        for o in range(out_f):
+            y[r * out_f + o] = y[r * out_f + o] + b[o]
+    return y^
+
+
+def _direct_proj_fwd_host(
+    direct: SD35BlockDirectLycoris, slot: Int,
+    x_h: List[Float32], w_h: List[Float32], b_h: List[Float32],
+    rows: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> List[Float32]:
+    if slot < 0:
+        return _linear_fwd(x_h, w_h, b_h, rows, in_f, out_f, ctx)
+    var x = Tensor.from_host(x_h.copy(), [rows, in_f], STDtype.F32, ctx)
+    var w = Tensor.from_host(w_h.copy(), [out_f, in_f], STDtype.F32, ctx)
+    if direct.algo == SD35_DIRECT_ALGO_DORA:
+        if slot >= len(direct.dora.ad):
+            raise Error("SD35BlockDirectLycoris DoRA: slot out of range")
+        if not direct.dora.active[slot]:
+            raise Error("SD35BlockDirectLycoris DoRA: inactive slot")
+        if direct.dora.ad[slot].in_f != in_f or direct.dora.ad[slot].out_f != out_f:
+            raise Error("SD35BlockDirectLycoris DoRA: slot shape mismatch")
+        var dev = dora_device_from_host(direct.dora.ad[slot], ctx)
+        var y = dora_substitution_forward_device(x, w, dev, ctx).to_host(ctx)
+        return _add_bias_host(y^, b_h, rows, out_f)
+    if direct.algo == SD35_DIRECT_ALGO_OFT:
+        if slot >= len(direct.oft.ad):
+            raise Error("SD35BlockDirectLycoris OFT: slot out of range")
+        if direct.oft.ad[slot].in_f != in_f or direct.oft.ad[slot].out_f != out_f:
+            raise Error("SD35BlockDirectLycoris OFT: slot shape mismatch")
+        var vec = _sd35_oft_vec_tensor(direct.oft, slot, ctx)
+        var x_rot = oft_ot_rotate_b4(x, vec, ctx)
+        return linear(
+            x_rot, w, Optional[Tensor](Tensor.from_host(b_h.copy(), [out_f], STDtype.F32, ctx)), ctx,
+        ).to_host(ctx)
+    raise Error("SD35BlockDirectLycoris: unsupported direct algorithm")
+
+
+def _direct_proj_bwd_host(
+    direct: SD35BlockDirectLycoris, slot: Int,
+    d_y_h: List[Float32], x_h: List[Float32], w_h: List[Float32],
+    rows: Int, in_f: Int, out_f: Int, ctx: DeviceContext,
+) raises -> _SD35DirectProjectionBack:
+    var d_y = Tensor.from_host(d_y_h.copy(), [rows, out_f], STDtype.F32, ctx)
+    var x = Tensor.from_host(x_h.copy(), [rows, in_f], STDtype.F32, ctx)
+    var w = Tensor.from_host(w_h.copy(), [out_f, in_f], STDtype.F32, ctx)
+    if slot < 0:
+        var lb = linear_backward(d_y, x, w, rows, in_f, out_f, ctx)
+        var dx = lb.d_x^.to_host(ctx)
+        return _SD35DirectProjectionBack(dx^, _empty_direct_grad())
+    if direct.algo == SD35_DIRECT_ALGO_DORA:
+        if slot >= len(direct.dora.ad):
+            raise Error("SD35BlockDirectLycoris DoRA backward: slot out of range")
+        if not direct.dora.active[slot]:
+            raise Error("SD35BlockDirectLycoris DoRA backward: inactive slot")
+        if direct.dora.ad[slot].in_f != in_f or direct.dora.ad[slot].out_f != out_f:
+            raise Error("SD35BlockDirectLycoris DoRA backward: slot shape mismatch")
+        var dev = dora_device_from_host(direct.dora.ad[slot], ctx)
+        var g = dora_substitution_backward_device(d_y, x, w, dev, ctx)
+        var dx = g.d_x.to_host(ctx)
+        return _SD35DirectProjectionBack(
+            dx^,
+            SD35DirectProjectionGrad(
+                g.d_a.to_host(ctx), g.d_b.to_host(ctx), g.d_m.to_host(ctx), _empty_f32(),
+            ),
+        )
+    if direct.algo == SD35_DIRECT_ALGO_OFT:
+        if slot >= len(direct.oft.ad):
+            raise Error("SD35BlockDirectLycoris OFT backward: slot out of range")
+        if direct.oft.ad[slot].in_f != in_f or direct.oft.ad[slot].out_f != out_f:
+            raise Error("SD35BlockDirectLycoris OFT backward: slot shape mismatch")
+        var vec = _sd35_oft_vec_tensor(direct.oft, slot, ctx)
+        var lb = linear_backward(d_y, x.clone(ctx), w, rows, in_f, out_f, ctx)
+        var g = oft_ot_rotate_backward_b4(lb.d_x^, x, vec, ctx)
+        var dx = g.d_x.to_host(ctx)
+        return _SD35DirectProjectionBack(
+            dx^,
+            SD35DirectProjectionGrad(
+                _empty_f32(), _empty_f32(), _empty_f32(), g.d_vec.to_host(ctx),
+            ),
+        )
+    raise Error("SD35BlockDirectLycoris: unsupported direct algorithm")
+
+
+struct SD35StreamDirectGrads(Copyable, Movable):
+    var d_x: List[Float32]
+    var qkv: SD35DirectProjectionGrad
+    var proj: SD35DirectProjectionGrad
+    var fc1: SD35DirectProjectionGrad
+    var fc2: SD35DirectProjectionGrad
+
+    def __init__(
+        out self, var d_x: List[Float32],
+        var qkv: SD35DirectProjectionGrad, var proj: SD35DirectProjectionGrad,
+        var fc1: SD35DirectProjectionGrad, var fc2: SD35DirectProjectionGrad,
+    ):
+        self.d_x = d_x^
+        self.qkv = qkv^
+        self.proj = proj^
+        self.fc1 = fc1^
+        self.fc2 = fc2^
+
+
+struct SD35JointBlockDirectGrads(Copyable, Movable):
+    var d_ctx: List[Float32]
+    var d_x: List[Float32]
+    var ctx_g: SD35StreamDirectGrads
+    var x_g: SD35StreamDirectGrads
+
+    def __init__(
+        out self, var d_ctx: List[Float32], var d_x: List[Float32],
+        var ctx_g: SD35StreamDirectGrads, var x_g: SD35StreamDirectGrads,
+    ):
+        self.d_ctx = d_ctx^
+        self.d_x = d_x^
+        self.ctx_g = ctx_g^
+        self.x_g = x_g^
+
+
 # ── per-stream PRE-attention forward (returns q_rms,k_rms,v + saved pre) ──────
 # Produces q,k,v [1,N,H,Dh] for joint attention.
 struct _StreamPre(Copyable, Movable):
@@ -606,6 +899,56 @@ def _stream_post(
     return _StreamPost(att.copy(), proj^, attn_res^, ln2^, mlp_in^, h1^, hg^, mlp^, out^)
 
 
+def _stream_pre_direct(
+    s: List[Float32], w: StreamWeights, m: ModVecs,
+    direct: SD35BlockDirectLycoris, qkv_slot: Int,
+    N: Int, D: Int, H: Int, Dh: Int, eps: Float32, qk_eps: Float32,
+    ctx: DeviceContext,
+) raises -> _StreamPre:
+    var ln1 = _layer_norm_fwd(s, N, D, eps, ctx)
+    var norm = _modulate_fwd(ln1, m.scale_msa, m.shift_msa, N, D)
+    var qkv = _direct_proj_fwd_host(
+        direct, qkv_slot, norm.copy(), w.wqkv, w.bqkv, N, D, 3 * D, ctx,
+    )
+    var q_pre = List[Float32]()
+    var k_pre = List[Float32]()
+    var v = List[Float32]()
+    for r in range(N):
+        var base = r * 3 * D
+        for c in range(D):
+            q_pre.append(qkv[base + c])
+        for c in range(D):
+            k_pre.append(qkv[base + D + c])
+        for c in range(D):
+            v.append(qkv[base + 2 * D + c])
+    var q_rms = _rms_qk_fwd(q_pre, w.q_norm, N, H, Dh, qk_eps, ctx)
+    var k_rms = _rms_qk_fwd(k_pre, w.k_norm, N, H, Dh, qk_eps, ctx)
+    return _StreamPre(ln1^, norm^, q_pre^, k_pre^, q_rms^, k_rms^, v^)
+
+
+def _stream_post_direct(
+    s: List[Float32], att: List[Float32], w: StreamWeights, m: ModVecs,
+    direct: SD35BlockDirectLycoris,
+    proj_slot: Int, fc1_slot: Int, fc2_slot: Int,
+    N: Int, D: Int, MLP: Int, eps: Float32, ctx: DeviceContext,
+) raises -> _StreamPost:
+    var proj = _direct_proj_fwd_host(
+        direct, proj_slot, att.copy(), w.wproj, w.bproj, N, D, D, ctx,
+    )
+    var attn_res = _gated_residual_fwd(s, m.gate_msa, proj, N, D)
+    var ln2 = _layer_norm_fwd(attn_res, N, D, eps, ctx)
+    var mlp_in = _modulate_fwd(ln2, m.scale_mlp, m.shift_mlp, N, D)
+    var h1 = _direct_proj_fwd_host(
+        direct, fc1_slot, mlp_in.copy(), w.wfc1, w.bfc1, N, D, MLP, ctx,
+    )
+    var hg = _gelu_fwd(h1, N, MLP, ctx)
+    var mlp = _direct_proj_fwd_host(
+        direct, fc2_slot, hg.copy(), w.wfc2, w.bfc2, N, MLP, D, ctx,
+    )
+    var out = _gated_residual_fwd(attn_res, m.gate_mlp, mlp, N, D)
+    return _StreamPost(att.copy(), proj^, attn_res^, ln2^, mlp_in^, h1^, hg^, mlp^, out^)
+
+
 # Compute a stream's `norm` = modulate(layer_norm(s), scale_msa, shift_msa) [N,D].
 # Exposed so a LoRA caller can build the qkv-lora delta from the SAME input.
 def sd35_stream_norm(
@@ -680,6 +1023,70 @@ def sd35_joint_block_forward[
     var xpost = _stream_post(
         x, x_att, w.xw, x_mod, N_IMG, D, MLP, eps, ctx,
         x_proj_lora, x_fc1_lora, x_fc2_lora,
+    )
+
+    var ctx_saved = StreamSaved(
+        context.copy(), cp.ln1.copy(), cp.norm.copy(), cp.q_pre.copy(), cp.k_pre.copy(), cp.v.copy(),
+        cpost.att.copy(), cpost.attn_res.copy(), cpost.ln2.copy(), cpost.mlp_in.copy(),
+        cpost.h1.copy(), cpost.hg.copy(), cpost.proj.copy(), cpost.mlp.copy(),
+    )
+    var x_saved = StreamSaved(
+        x.copy(), xp.ln1.copy(), xp.norm.copy(), xp.q_pre.copy(), xp.k_pre.copy(), xp.v.copy(),
+        xpost.att.copy(), xpost.attn_res.copy(), xpost.ln2.copy(), xpost.mlp_in.copy(),
+        xpost.h1.copy(), xpost.hg.copy(), xpost.proj.copy(), xpost.mlp.copy(),
+    )
+    return JointBlockForward(cpost.out.copy(), xpost.out.copy(), ctx_saved^, x_saved^)
+
+
+def sd35_joint_block_direct_lycoris_forward[
+    Bp: Int, Sp: Int, Hp: Int, Dhp: Int
+](
+    context: List[Float32],
+    x: List[Float32],
+    w: JointBlockWeights,
+    ctx_mod: ModVecs, x_mod: ModVecs,
+    direct: SD35BlockDirectLycoris,
+    N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
+    eps: Float32, qk_eps: Float32, scale: Float32,
+    ctx: DeviceContext,
+) raises -> JointBlockForward:
+    var H = Hp
+    var Dh = Dhp
+    var cp = _stream_pre_direct(
+        context, w.ctxw, ctx_mod, direct, direct.ctx_qkv_slot,
+        N_CTX, D, H, Dh, eps, qk_eps, ctx,
+    )
+    var xp = _stream_pre_direct(
+        x, w.xw, x_mod, direct, direct.x_qkv_slot,
+        N_IMG, D, H, Dh, eps, qk_eps, ctx,
+    )
+
+    var HDh = H * Dh
+    var joint_q = List[Float32]()
+    var joint_k = List[Float32]()
+    var joint_v = List[Float32]()
+    for i in range(N_CTX * HDh):
+        joint_q.append(cp.q_rms[i]); joint_k.append(cp.k_rms[i]); joint_v.append(cp.v[i])
+    for i in range(N_IMG * HDh):
+        joint_q.append(xp.q_rms[i]); joint_k.append(xp.k_rms[i]); joint_v.append(xp.v[i])
+    var att_joint = _sdpa_fwd[Bp, Sp, Hp, Dhp](joint_q, joint_k, joint_v, scale, ctx)
+
+    var ctx_att = List[Float32]()
+    var x_att = List[Float32]()
+    for i in range(N_CTX * HDh):
+        ctx_att.append(att_joint[i])
+    for i in range(N_IMG * HDh):
+        x_att.append(att_joint[N_CTX * HDh + i])
+
+    var cpost = _stream_post_direct(
+        context, ctx_att, w.ctxw, ctx_mod, direct,
+        direct.ctx_proj_slot, direct.ctx_fc1_slot, direct.ctx_fc2_slot,
+        N_CTX, D, MLP, eps, ctx,
+    )
+    var xpost = _stream_post_direct(
+        x, x_att, w.xw, x_mod, direct,
+        direct.x_proj_slot, direct.x_fc1_slot, direct.x_fc2_slot,
+        N_IMG, D, MLP, eps, ctx,
     )
 
     var ctx_saved = StreamSaved(
@@ -926,6 +1333,71 @@ def _stream_post_backward(
     )
 
 
+struct _StreamPostBackDirect(Copyable, Movable):
+    var d_s: List[Float32]
+    var d_att: List[Float32]
+    var proj: SD35DirectProjectionGrad
+    var fc1: SD35DirectProjectionGrad
+    var fc2: SD35DirectProjectionGrad
+
+    def __init__(
+        out self, var d_s: List[Float32], var d_att: List[Float32],
+        var proj: SD35DirectProjectionGrad,
+        var fc1: SD35DirectProjectionGrad,
+        var fc2: SD35DirectProjectionGrad,
+    ):
+        self.d_s = d_s^
+        self.d_att = d_att^
+        self.proj = proj^
+        self.fc1 = fc1^
+        self.fc2 = fc2^
+
+
+def _stream_post_backward_direct(
+    d_out: List[Float32], sv: StreamSaved, w: StreamWeights, m: ModVecs,
+    direct: SD35BlockDirectLycoris,
+    proj_slot: Int, fc1_slot: Int, fc2_slot: Int,
+    N: Int, D: Int, MLP: Int, eps: Float32, ctx: DeviceContext,
+) raises -> _StreamPostBackDirect:
+    var grb2 = _gated_residual_backward(d_out, m.gate_mlp, sv.mlp, N, D)
+    var d_attn_res = grb2.d_s.copy()
+    var d_mlp = grb2.d_y.copy()
+
+    var fc2b = _direct_proj_bwd_host(
+        direct, fc2_slot, d_mlp.copy(), sv.hg.copy(), w.wfc2,
+        N, MLP, D, ctx,
+    )
+    var d_h1 = gelu_backward(
+        Tensor.from_host(fc2b.d_x.copy(), [N, MLP], STDtype.F32, ctx),
+        Tensor.from_host(sv.h1, [N, MLP], STDtype.F32, ctx),
+        ctx,
+    ).to_host(ctx)
+
+    var fc1b = _direct_proj_bwd_host(
+        direct, fc1_slot, d_h1, sv.mlp_in.copy(), w.wfc1,
+        N, D, MLP, ctx,
+    )
+
+    var mb2 = _modulate_backward_host(fc1b.d_x.copy(), sv.ln2, m.scale_mlp, N, D, ctx)
+    var d_ln2 = mb2.d_x.copy()
+
+    var d_attn_res_ln = _layer_norm_backward_dx(d_ln2, sv.attn_res, N, D, eps, ctx)
+    d_attn_res = _add_lists(d_attn_res, d_attn_res_ln)
+
+    var grb1 = _gated_residual_backward(d_attn_res, m.gate_msa, sv.proj, N, D)
+    var d_s = grb1.d_s.copy()
+    var d_proj = grb1.d_y.copy()
+
+    var projb = _direct_proj_bwd_host(
+        direct, proj_slot, d_proj.copy(), sv.att.copy(), w.wproj,
+        N, D, D, ctx,
+    )
+
+    return _StreamPostBackDirect(
+        d_s^, projb.d_x.copy(), projb.g.copy(), fc1b.g.copy(), fc2b.g.copy(),
+    )
+
+
 # ── per-stream PRE-attention backward ────────────────────────────────────────
 # Given d_q_rms,d_k_rms,d_v (each [1,N,H,Dh]) from the joint sdpa split, plus the
 # residual-path d_s_partial, produce d_input + pre-attn weight/mod grads.
@@ -1024,6 +1496,62 @@ def _stream_pre_backward(
         d_input^, d_wqkv^, d_bqkv^, d_qnorm^, d_knorm^, d_shift_msa^, d_scale_msa^,
         d_qkv^, qkv_lora_d_a^, qkv_lora_d_b^,
     )
+
+
+struct _StreamPreBackDirect(Copyable, Movable):
+    var d_input: List[Float32]
+    var qkv: SD35DirectProjectionGrad
+
+    def __init__(
+        out self, var d_input: List[Float32], var qkv: SD35DirectProjectionGrad,
+    ):
+        self.d_input = d_input^
+        self.qkv = qkv^
+
+
+def _stream_pre_backward_direct(
+    d_q_rms: List[Float32], d_k_rms: List[Float32], d_v: List[Float32],
+    d_s_partial: List[Float32],
+    sv: StreamSaved, w: StreamWeights, m: ModVecs,
+    direct: SD35BlockDirectLycoris, qkv_slot: Int,
+    N: Int, D: Int, H: Int, Dh: Int, eps: Float32, qk_eps: Float32,
+    ctx: DeviceContext,
+) raises -> _StreamPreBackDirect:
+    var rb_q = rms_norm_backward(
+        Tensor.from_host(d_q_rms, [N * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.q_pre, [N * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(w.q_norm, [Dh], STDtype.F32, ctx),
+        qk_eps, ctx,
+    )
+    var d_q_pre = rb_q.d_x^.to_host(ctx)
+    var rb_k = rms_norm_backward(
+        Tensor.from_host(d_k_rms, [N * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.k_pre, [N * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(w.k_norm, [Dh], STDtype.F32, ctx),
+        qk_eps, ctx,
+    )
+    var d_k_pre = rb_k.d_x^.to_host(ctx)
+
+    var d_qkv = List[Float32]()
+    for r in range(N):
+        for c in range(D):
+            d_qkv.append(d_q_pre[r * D + c])
+        for c in range(D):
+            d_qkv.append(d_k_pre[r * D + c])
+        for c in range(D):
+            d_qkv.append(d_v[r * D + c])
+
+    var qkvb = _direct_proj_bwd_host(
+        direct, qkv_slot, d_qkv, sv.norm.copy(), w.wqkv,
+        N, D, 3 * D, ctx,
+    )
+
+    var mb1 = _modulate_backward_host(qkvb.d_x.copy(), sv.ln1, m.scale_msa, N, D, ctx)
+    var d_ln1 = mb1.d_x.copy()
+    var d_s_norm = _layer_norm_backward_dx(d_ln1, sv.s, N, D, eps, ctx)
+    var d_input = _add_lists(d_s_partial, d_s_norm)
+
+    return _StreamPreBackDirect(d_input^, qkvb.g.copy())
 
 
 # ── BACKWARD of ONE SD3.5 joint block ────────────────────────────────────────
@@ -1142,6 +1670,90 @@ def sd35_joint_block_backward[
     return JointBlockGrads(
         cprb.d_input.copy(), xprb.d_input.copy(), ctx_g^, x_g^, ctx_lora^, x_lora^,
         cprb.d_qkv.copy(), xprb.d_qkv.copy()
+    )
+
+
+def sd35_joint_block_direct_lycoris_backward[
+    Bp: Int, Sp: Int, Hp: Int, Dhp: Int
+](
+    d_ctx_out: List[Float32], d_x_out: List[Float32],
+    w: JointBlockWeights, ctx_mod: ModVecs, x_mod: ModVecs,
+    direct: SD35BlockDirectLycoris,
+    fwd: JointBlockForward,
+    N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
+    eps: Float32, qk_eps: Float32, scale: Float32,
+    ctx: DeviceContext,
+) raises -> SD35JointBlockDirectGrads:
+    var H = Hp
+    var Dh = Dhp
+    var HDh = H * Dh
+
+    var cpb = _stream_post_backward_direct(
+        d_ctx_out, fwd.ctx_saved, w.ctxw, ctx_mod, direct,
+        direct.ctx_proj_slot, direct.ctx_fc1_slot, direct.ctx_fc2_slot,
+        N_CTX, D, MLP, eps, ctx,
+    )
+    var xpb = _stream_post_backward_direct(
+        d_x_out, fwd.x_saved, w.xw, x_mod, direct,
+        direct.x_proj_slot, direct.x_fc1_slot, direct.x_fc2_slot,
+        N_IMG, D, MLP, eps, ctx,
+    )
+
+    var d_att_joint = List[Float32]()
+    for i in range(N_CTX * HDh):
+        d_att_joint.append(cpb.d_att[i])
+    for i in range(N_IMG * HDh):
+        d_att_joint.append(xpb.d_att[i])
+
+    var joint_q = List[Float32]()
+    var joint_k = List[Float32]()
+    var joint_v = List[Float32]()
+    var ctx_q_rms = _rms_qk_fwd(fwd.ctx_saved.q_pre, w.ctxw.q_norm, N_CTX, H, Dh, qk_eps, ctx)
+    var ctx_k_rms = _rms_qk_fwd(fwd.ctx_saved.k_pre, w.ctxw.k_norm, N_CTX, H, Dh, qk_eps, ctx)
+    var x_q_rms = _rms_qk_fwd(fwd.x_saved.q_pre, w.xw.q_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var x_k_rms = _rms_qk_fwd(fwd.x_saved.k_pre, w.xw.k_norm, N_IMG, H, Dh, qk_eps, ctx)
+    for i in range(N_CTX * HDh):
+        joint_q.append(ctx_q_rms[i]); joint_k.append(ctx_k_rms[i]); joint_v.append(fwd.ctx_saved.v[i])
+    for i in range(N_IMG * HDh):
+        joint_q.append(x_q_rms[i]); joint_k.append(x_k_rms[i]); joint_v.append(fwd.x_saved.v[i])
+
+    var sb = sdpa_backward[Bp, Sp, Hp, Dhp](
+        Tensor.from_host(joint_q, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(joint_k, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(joint_v, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(d_att_joint, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        scale, ctx,
+    )
+    var sg = _sdpa_grads_to_host(sb^, ctx)
+
+    var ctx_dq = List[Float32](); var ctx_dk = List[Float32](); var ctx_dv = List[Float32]()
+    var x_dq = List[Float32](); var x_dk = List[Float32](); var x_dv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        ctx_dq.append(sg.d_q[i]); ctx_dk.append(sg.d_k[i]); ctx_dv.append(sg.d_v[i])
+    for i in range(N_IMG * HDh):
+        x_dq.append(sg.d_q[N_CTX * HDh + i]); x_dk.append(sg.d_k[N_CTX * HDh + i]); x_dv.append(sg.d_v[N_CTX * HDh + i])
+
+    var cprb = _stream_pre_backward_direct(
+        ctx_dq, ctx_dk, ctx_dv, cpb.d_s, fwd.ctx_saved, w.ctxw, ctx_mod,
+        direct, direct.ctx_qkv_slot,
+        N_CTX, D, H, Dh, eps, qk_eps, ctx,
+    )
+    var xprb = _stream_pre_backward_direct(
+        x_dq, x_dk, x_dv, xpb.d_s, fwd.x_saved, w.xw, x_mod,
+        direct, direct.x_qkv_slot,
+        N_IMG, D, H, Dh, eps, qk_eps, ctx,
+    )
+
+    var ctx_g = SD35StreamDirectGrads(
+        cprb.d_input.copy(),
+        cprb.qkv.copy(), cpb.proj.copy(), cpb.fc1.copy(), cpb.fc2.copy(),
+    )
+    var x_g = SD35StreamDirectGrads(
+        xprb.d_input.copy(),
+        xprb.qkv.copy(), xpb.proj.copy(), xpb.fc1.copy(), xpb.fc2.copy(),
+    )
+    return SD35JointBlockDirectGrads(
+        cprb.d_input.copy(), xprb.d_input.copy(), ctx_g^, x_g^,
     )
 
 
@@ -1750,6 +2362,72 @@ def sd35_context_preonly_forward[
     return CtxPreForward(xpost.out.copy(), saved^)
 
 
+def sd35_context_preonly_direct_lycoris_forward[
+    Bp: Int, Sp: Int, Hp: Int, Dhp: Int
+](
+    context: List[Float32], x: List[Float32],
+    ctx_qkv_w: List[Float32], ctx_qkv_b: List[Float32],
+    ctx_qnorm: List[Float32], ctx_knorm: List[Float32],
+    ctx_scale: List[Float32], ctx_shift: List[Float32],
+    xw: StreamWeights, x_mod: ModVecs,
+    direct: SD35BlockDirectLycoris,
+    N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
+    eps: Float32, qk_eps: Float32, scale: Float32,
+    ctx: DeviceContext,
+) raises -> CtxPreForward:
+    var H = Hp
+    var Dh = Dhp
+    var HDh = H * Dh
+
+    var ctx_ln = _layer_norm_fwd(context, N_CTX, D, eps, ctx)
+    var ctx_norm = _modulate_fwd(ctx_ln, ctx_scale, ctx_shift, N_CTX, D)
+    var ctx_qkv = _direct_proj_fwd_host(
+        direct, direct.ctx_qkv_slot, ctx_norm.copy(), ctx_qkv_w, ctx_qkv_b,
+        N_CTX, D, 3 * D, ctx,
+    )
+    var cs = _split_qkv3(ctx_qkv, N_CTX, D)
+    var ctx_q_pre = cs[0].copy()
+    var ctx_k_pre = cs[1].copy()
+    var ctx_v = cs[2].copy()
+    var ctx_q_rms = _rms_qk_fwd(ctx_q_pre, ctx_qnorm, N_CTX, H, Dh, qk_eps, ctx)
+    var ctx_k_rms = _rms_qk_fwd(ctx_k_pre, ctx_knorm, N_CTX, H, Dh, qk_eps, ctx)
+
+    var xp = _stream_pre_direct(
+        x, xw, x_mod, direct, direct.x_qkv_slot,
+        N_IMG, D, H, Dh, eps, qk_eps, ctx,
+    )
+
+    var jq = List[Float32]()
+    var jk = List[Float32]()
+    var jv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        jq.append(ctx_q_rms[i])
+        jk.append(ctx_k_rms[i])
+        jv.append(ctx_v[i])
+    for i in range(N_IMG * HDh):
+        jq.append(xp.q_rms[i])
+        jk.append(xp.k_rms[i])
+        jv.append(xp.v[i])
+    var att = _sdpa_fwd[Bp, Sp, Hp, Dhp](jq, jk, jv, scale, ctx)
+    var x_att = List[Float32]()
+    for i in range(N_IMG * HDh):
+        x_att.append(att[N_CTX * HDh + i])
+
+    var xpost = _stream_post_direct(
+        x, x_att, xw, x_mod, direct,
+        direct.x_proj_slot, direct.x_fc1_slot, direct.x_fc2_slot,
+        N_IMG, D, MLP, eps, ctx,
+    )
+
+    var x_saved = StreamSaved(
+        x.copy(), xp.ln1.copy(), xp.norm.copy(), xp.q_pre.copy(), xp.k_pre.copy(), xp.v.copy(),
+        xpost.att.copy(), xpost.attn_res.copy(), xpost.ln2.copy(), xpost.mlp_in.copy(),
+        xpost.h1.copy(), xpost.hg.copy(), xpost.proj.copy(), xpost.mlp.copy(),
+    )
+    var saved = CtxPreSaved(context.copy(), ctx_ln^, ctx_norm^, ctx_q_pre^, ctx_k_pre^, ctx_v^, x_saved^)
+    return CtxPreForward(xpost.out.copy(), saved^)
+
+
 def sd35_context_preonly_backward[
     Bp: Int, Sp: Int, Hp: Int, Dhp: Int
 ](
@@ -1863,4 +2541,121 @@ def sd35_context_preonly_backward[
     return CtxPreGrads(
         xprb.d_input.copy(), d_context^, x_g^, x_lora^,
         ctx_qkv_lora_d_a^, ctx_qkv_lora_d_b^, d_ctx_qnorm^, d_ctx_knorm^,
+    )
+
+
+def sd35_context_preonly_direct_lycoris_backward[
+    Bp: Int, Sp: Int, Hp: Int, Dhp: Int
+](
+    d_x_out: List[Float32],
+    ctx_qkv_w: List[Float32], ctx_qnorm: List[Float32], ctx_knorm: List[Float32],
+    ctx_scale: List[Float32],
+    xw: StreamWeights, x_mod: ModVecs,
+    direct: SD35BlockDirectLycoris,
+    fwd: CtxPreForward,
+    N_CTX: Int, N_IMG: Int, D: Int, MLP: Int,
+    eps: Float32, qk_eps: Float32, scale: Float32,
+    ctx: DeviceContext,
+) raises -> SD35JointBlockDirectGrads:
+    var H = Hp
+    var Dh = Dhp
+    var HDh = H * Dh
+    var sv = fwd.saved.copy()
+
+    var xpb = _stream_post_backward_direct(
+        d_x_out, sv.x_saved, xw, x_mod, direct,
+        direct.x_proj_slot, direct.x_fc1_slot, direct.x_fc2_slot,
+        N_IMG, D, MLP, eps, ctx,
+    )
+
+    var d_att_joint = List[Float32]()
+    for _ in range(N_CTX * HDh):
+        d_att_joint.append(Float32(0.0))
+    for i in range(N_IMG * HDh):
+        d_att_joint.append(xpb.d_att[i])
+
+    var ctx_q_rms = _rms_qk_fwd(sv.ctx_q_pre, ctx_qnorm, N_CTX, H, Dh, qk_eps, ctx)
+    var ctx_k_rms = _rms_qk_fwd(sv.ctx_k_pre, ctx_knorm, N_CTX, H, Dh, qk_eps, ctx)
+    var x_q_rms = _rms_qk_fwd(sv.x_saved.q_pre, xw.q_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var x_k_rms = _rms_qk_fwd(sv.x_saved.k_pre, xw.k_norm, N_IMG, H, Dh, qk_eps, ctx)
+    var jq = List[Float32]()
+    var jk = List[Float32]()
+    var jv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        jq.append(ctx_q_rms[i])
+        jk.append(ctx_k_rms[i])
+        jv.append(sv.ctx_v[i])
+    for i in range(N_IMG * HDh):
+        jq.append(x_q_rms[i])
+        jk.append(x_k_rms[i])
+        jv.append(sv.x_saved.v[i])
+
+    var sb = sdpa_backward[Bp, Sp, Hp, Dhp](
+        Tensor.from_host(jq, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(jk, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(jv, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        Tensor.from_host(d_att_joint, [Bp, Sp, Hp, Dhp], STDtype.F32, ctx),
+        scale, ctx,
+    )
+    var sg = _sdpa_grads_to_host(sb^, ctx)
+
+    var ctx_dq = List[Float32]()
+    var ctx_dk = List[Float32]()
+    var ctx_dv = List[Float32]()
+    var x_dq = List[Float32]()
+    var x_dk = List[Float32]()
+    var x_dv = List[Float32]()
+    for i in range(N_CTX * HDh):
+        ctx_dq.append(sg.d_q[i])
+        ctx_dk.append(sg.d_k[i])
+        ctx_dv.append(sg.d_v[i])
+    for i in range(N_IMG * HDh):
+        x_dq.append(sg.d_q[N_CTX * HDh + i])
+        x_dk.append(sg.d_k[N_CTX * HDh + i])
+        x_dv.append(sg.d_v[N_CTX * HDh + i])
+
+    var xprb = _stream_pre_backward_direct(
+        x_dq, x_dk, x_dv, xpb.d_s, sv.x_saved, xw, x_mod,
+        direct, direct.x_qkv_slot,
+        N_IMG, D, H, Dh, eps, qk_eps, ctx,
+    )
+
+    var rb_cq = rms_norm_backward(
+        Tensor.from_host(ctx_dq, [N_CTX * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.ctx_q_pre, [N_CTX * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(ctx_qnorm, [Dh], STDtype.F32, ctx), qk_eps, ctx,
+    )
+    var d_ctx_q_pre = rb_cq.d_x^.to_host(ctx)
+    var rb_ck = rms_norm_backward(
+        Tensor.from_host(ctx_dk, [N_CTX * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(sv.ctx_k_pre, [N_CTX * H, Dh], STDtype.F32, ctx),
+        Tensor.from_host(ctx_knorm, [Dh], STDtype.F32, ctx), qk_eps, ctx,
+    )
+    var d_ctx_k_pre = rb_ck.d_x^.to_host(ctx)
+    var d_ctx_qkv = List[Float32]()
+    for r in range(N_CTX):
+        for c in range(D):
+            d_ctx_qkv.append(d_ctx_q_pre[r * D + c])
+        for c in range(D):
+            d_ctx_qkv.append(d_ctx_k_pre[r * D + c])
+        for c in range(D):
+            d_ctx_qkv.append(ctx_dv[r * D + c])
+
+    var qkvb = _direct_proj_bwd_host(
+        direct, direct.ctx_qkv_slot, d_ctx_qkv, sv.ctx_norm.copy(), ctx_qkv_w,
+        N_CTX, D, 3 * D, ctx,
+    )
+    var mb_c = _modulate_backward_host(qkvb.d_x.copy(), sv.ctx_ln, ctx_scale, N_CTX, D, ctx)
+    var d_context = _layer_norm_backward_dx(mb_c.d_x, sv.ctx_input, N_CTX, D, eps, ctx)
+
+    var ctx_g = SD35StreamDirectGrads(
+        d_context.copy(), qkvb.g.copy(),
+        _empty_direct_grad(), _empty_direct_grad(), _empty_direct_grad(),
+    )
+    var x_g = SD35StreamDirectGrads(
+        xprb.d_input.copy(),
+        xprb.qkv.copy(), xpb.proj.copy(), xpb.fc1.copy(), xpb.fc2.copy(),
+    )
+    return SD35JointBlockDirectGrads(
+        d_context^, xprb.d_input.copy(), ctx_g^, x_g^,
     )

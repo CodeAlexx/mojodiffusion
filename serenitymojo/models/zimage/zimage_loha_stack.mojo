@@ -13,7 +13,7 @@ from serenitymojo.training.loha_adapter import (
 )
 from serenitymojo.training.loha_stack import (
     loha_carrier_adapter, loha_carrier_r_eff, loha_chain_carrier_grads,
-    _dummy_loha, _empty_loha_grads, _loha_grads_sqsum,
+    _dummy_loha, _empty_loha_grads, _loha_grads_sqsum, _loha_grads_scale,
 )
 from serenitymojo.training.lokr_stack import _inactive_carrier
 from serenitymojo.training.loha_save import NamedLoHa, save_loha_peft
@@ -86,14 +86,15 @@ def zimage_loha_carrier_lists(set: ZImageLoHaSet, D: Int, F: Int) raises -> List
     return out^
 
 
-def zimage_loha_carrier_total_bytes(set: ZImageLoHaSet) -> Int:
+def zimage_loha_carrier_total_bytes(set: ZImageLoHaSet, D: Int, F: Int) -> Int:
     var elems = 0
     for i in range(len(set.ad)):
         if set.active[i]:
             var r = loha_carrier_r_eff(set.ad[i])
             elems += r * set.ad[i].in_f + set.ad[i].out_f * r
         else:
-            elems += set.ad[i].in_f + set.ad[i].out_f
+            var dims = zimage_lokr_slot_dims(i % ZIMAGE_SLOTS, D, F)
+            elems += dims[0] + dims[1]
     return elems * 2
 
 
@@ -123,6 +124,13 @@ def zimage_loha_grad_norm(grads: ZImageLoHaGrads) -> Float64:
     for i in range(len(grads.g)):
         s += _loha_grads_sqsum(grads.g[i])
     return sqrt(s)
+
+
+def zimage_loha_clip_grads(mut grads: ZImageLoHaGrads, clip_scale: Float32):
+    if clip_scale == Float32(1.0):
+        return
+    for i in range(len(grads.g)):
+        _loha_grads_scale(grads.g[i], clip_scale)
 
 
 def zimage_loha_adamw_step(

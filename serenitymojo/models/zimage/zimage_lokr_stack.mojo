@@ -16,6 +16,7 @@ from serenitymojo.training.lokr_adapter import (
 from serenitymojo.training.lokr_stack import (
     lokr_carrier_adapter, lokr_carrier_r_eff, lokr_chain_carrier_grads,
     _inactive_carrier, _dummy_lokr, _empty_lokr_grads, _grads_sqsum,
+    _grads_scale,
 )
 from serenitymojo.training.lokr_save import NamedLoKr, save_lokr_peft
 from serenitymojo.models.zimage.lora_block import (
@@ -104,14 +105,15 @@ def zimage_lokr_carrier_lists(set: ZImageLoKrSet, D: Int, F: Int) raises -> List
     return out^
 
 
-def zimage_lokr_carrier_total_bytes(set: ZImageLoKrSet) raises -> Int:
+def zimage_lokr_carrier_total_bytes(set: ZImageLoKrSet, D: Int, F: Int) raises -> Int:
     var elems = 0
     for i in range(len(set.ad)):
         if set.active[i]:
             var r = lokr_carrier_r_eff(set.ad[i])
             elems += r * set.ad[i].in_f + set.ad[i].out_f * r
         else:
-            elems += set.ad[i].in_f + set.ad[i].out_f
+            var dims = zimage_lokr_slot_dims(i % ZIMAGE_SLOTS, D, F)
+            elems += dims[0] + dims[1]
     return elems * 2
 
 
@@ -141,6 +143,13 @@ def zimage_lokr_grad_norm(grads: ZImageLoKrGrads) -> Float64:
     for i in range(len(grads.g)):
         s += _grads_sqsum(grads.g[i])
     return sqrt(s)
+
+
+def zimage_lokr_clip_grads(mut grads: ZImageLoKrGrads, clip_scale: Float32):
+    if clip_scale == Float32(1.0):
+        return
+    for i in range(len(grads.g)):
+        _grads_scale(grads.g[i], clip_scale)
 
 
 def zimage_lokr_adamw_step(

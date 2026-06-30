@@ -334,8 +334,15 @@ The full round-trip: train→save→load→INFERENCE→visible shift. Fixes:
 - ORACLE GATE `automagic3_device_parity` PASS: device vs host (== ai-toolkit) over 12 steps —
   param rel ~1.2e-7, row/col-var rel ~1.5-2.2e-7, lr-trajectory max rel **4.9e-10**. (Device SR
   property itself gated separately by `automagic3_sr_parity_gate`.)
-- MEASURED post-port: eri2 automagic3 smoke **~5.5 s/step** (down from 14; near AdamW's 4.3 — the
-  ~1.2 s gap is the host SR writeback + the F64 D2H, a future device-SR optimization).
+- MEASURED post-port: eri2 automagic3 smoke **~5.5 s/step** (down from 14; near AdamW's 4.3).
+- DEVICE SR (2026-06-30): moved the bf16 SR writeback onto the kernel (phase 7b: same
+  sr_truncate bit-trick, splitmix64 over a per-(elem,step) counter — unbiased, RNG-independent
+  per the SR gate). Drops the 216 MB F32 D2H + the host SR loop → a 27 MB bf16 D2H. MEASURED
+  **~5.5 → ~4.8 s/step** (now ~0.5 s from AdamW). Parity gate unchanged PASS (F32 master is
+  untouched by phase 7b); smoke loss bit-matches the host-SR run (training trajectory identical).
+  Remaining ~0.5 s vs AdamW = the kernel's serial thread-0 reductions (rmean/RMS/vote) on the
+  1M-element MLP matrices — parallelizing those (F64 tree-reduce, still within the bar) is the
+  next lever.
 
 ### Standard training output (was a bare numeric dump)
 - `train_krea2` printed a bare `print(step, idx, lt, sigma, loss, gn)` instead of the shared

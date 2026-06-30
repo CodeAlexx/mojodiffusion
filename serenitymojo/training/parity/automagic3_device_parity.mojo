@@ -105,6 +105,7 @@ def main() raises:
     var hfill_dev = ctx.enqueue_create_buffer[DType.int32](2)
     var gnum_dev = ctx.enqueue_create_buffer[DType.float64](1)
     var gden_dev = ctx.enqueue_create_buffer[DType.float64](1)
+    var pb_dev = ctx.enqueue_create_buffer[DType.bfloat16](NP)
 
     # upload initial params (p0 ++ p1), zero state, descriptors
     var ph = ctx.enqueue_create_host_buffer[DType.float32](NP)
@@ -134,6 +135,7 @@ def main() raises:
     var HFILL = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](hfill_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](2)))
     var GNUM = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](gnum_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](1)))
     var GDEN = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](gden_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](1)))
+    var PB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](pb_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](NP)))
 
     var dev_lr = start_lr
     var dev_lr_traj = List[Float64]()
@@ -148,9 +150,10 @@ def main() raises:
         gnum_dev.enqueue_fill(Float64(0.0))
         gden_dev.enqueue_fill(Float64(0.0))
         ctx.enqueue_function[automagic3_factored_kernel, automagic3_factored_kernel](
-            P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN,
+            P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN, PB,
             Float32(beta2), Float32(1.0 - beta2), Float32(eps), Float32(clip),
             Float32(dev_lr), Float32(wd),
+            s, UInt64(0x5EED_A3D0),
             grid_dim=2, block_dim=256,
         )
         ctx.enqueue_copy(dst_buf=num_h, src_buf=gnum_dev)

@@ -79,12 +79,15 @@ def automagic3_factored_kernel(
     hist_fill: LayoutTensor[DType.int32, _DYN1, MutAnyOrigin], # per matrix
     group_num: LayoutTensor[DType.float64, _DYN1, MutAnyOrigin], # 1 elt (group)
     group_den: LayoutTensor[DType.float64, _DYN1, MutAnyOrigin], # 1 elt
+    pb: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin],       # bf16 a/b out (device SR)
     beta2: Float32,
     one_minus_b2: Float32,
     eps: Float32,
     clip: Float32,
     lr: Float32,
     weight_decay: Float32,
+    step: Int,
+    seed: UInt64,
 ):
     var m = Int(block_idx.x)
     var base = m * 6
@@ -217,13 +220,29 @@ def automagic3_factored_kernel(
             _ = Atomic[DType.float64].fetch_add(group_den.ptr, mden)
     barrier()
 
-    # ── phase 7: decoupled WD + param update (f32 master; lr host-adapted) ──
+    # ── phase 7: decoupled WD + param update (f32 master) + device SR -> bf16 ──
     var k3 = tid
     while k3 < numel:
         var u = rebind[Scalar[DType.float32]](upd[goff + k3])
         if weight_decay != Float32(0.0):
             u = u + weight_decay * rebind[Scalar[DType.float32]](p[goff + k3])
-        p[goff + k3] = rebind[Scalar[DType.float32]](p[goff + k3]) - lr * u
+        var new_p = rebind[Scalar[DType.float32]](p[goff + k3]) - lr * u
+        p[goff + k3] = new_p
+        # device stochastic-rounding bf16 writeback: same bit-trick as
+        # sr_truncate_f32_to_bits (add a uniform [0,2^16) into the dropped 16
+        # mantissa bits, mask, narrow). splitmix64 over a per-(elem,step) counter
+        # gives a decorrelated uniform; unbiased (SR property is RNG-independent,
+        # gated by automagic3_sr_parity_gate). low 16 zeroed -> BFloat16() exact.
+        var cnt = UInt64(goff + k3) + UInt64(step) * UInt64(0x9E3779B97F4A7C15) + seed
+        cnt = cnt + UInt64(0x9E3779B97F4A7C15)
+        var z = cnt
+        z = (z ^ (z >> 30)) * UInt64(0xBF58476D1CE4E5B9)
+        z = (z ^ (z >> 27)) * UInt64(0x94D049BB133111EB)
+        z = z ^ (z >> 31)
+        var rnd = UInt32(z >> 32) & UInt32(0x0000FFFF)
+        var asi = new_p.to_bits[DType.uint32]() + rnd
+        asi = asi & UInt32(0xFFFF0000)
+        pb[goff + k3] = BFloat16(Float32(from_bits=asi))
         k3 += nt
 
 
@@ -261,6 +280,8 @@ struct Automagic3DeviceState(Movable):
     var hfill_dev: DeviceBuffer[DType.int32]
     var gnum_dev: DeviceBuffer[DType.float64]
     var gden_dev: DeviceBuffer[DType.float64]
+    var pb_dev: DeviceBuffer[DType.bfloat16]   # bf16 a/b (device-SR output)
+    var step: Int
 
     def __init__(out self, ctx: DeviceContext) raises:
         self.inited = False
@@ -279,6 +300,8 @@ struct Automagic3DeviceState(Movable):
         self.hfill_dev = ctx.enqueue_create_buffer[DType.int32](1)
         self.gnum_dev = ctx.enqueue_create_buffer[DType.float64](1)
         self.gden_dev = ctx.enqueue_create_buffer[DType.float64](1)
+        self.pb_dev = ctx.enqueue_create_buffer[DType.bfloat16](1)
+        self.step = 0
 
 
 def _dynf(p: UnsafePointer[Float32, MutAnyOrigin], n: Int) -> LayoutTensor[DType.float32, _DYN1, MutAnyOrigin]:
@@ -325,6 +348,7 @@ def automagic3_device_step(
         state.dsc_dev = ctx.enqueue_create_buffer[DType.int32](nmat * 6)
         state.hidx_dev = ctx.enqueue_create_buffer[DType.int32](nmat)
         state.hfill_dev = ctx.enqueue_create_buffer[DType.int32](nmat)
+        state.pb_dev = ctx.enqueue_create_buffer[DType.bfloat16](np)
         # pack F32 master (bf16 a/b -> f32) + descriptors host-side
         var ph = ctx.enqueue_create_host_buffer[DType.float32](np)
         var dh = ctx.enqueue_create_host_buffer[DType.int32](nmat * 6)
@@ -376,22 +400,25 @@ def automagic3_device_step(
     var HFILL = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](state.hfill_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)))
     var GNUM = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](state.gnum_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](1)))
     var GDEN = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](state.gden_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](1)))
+    var PB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](state.pb_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](state.np)))
 
     ctx.enqueue_function[automagic3_factored_kernel, automagic3_factored_kernel](
-        P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN,
+        P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN, PB,
         Float32(beta2), Float32(1.0 - beta2), Float32(eps), Float32(clip),
         Float32(state.lr), Float32(weight_decay),
+        state.step, UInt64(0x5EED_A3D0),
         grid_dim=state.nmat, block_dim=256,
     )
+    state.step += 1
 
     # ── read group vote -> host apply_vote -> new lr ──
     var num_h = ctx.enqueue_create_host_buffer[DType.float64](1)
     var den_h = ctx.enqueue_create_host_buffer[DType.float64](1)
     ctx.enqueue_copy(dst_buf=num_h, src_buf=state.gnum_dev)
     ctx.enqueue_copy(dst_buf=den_h, src_buf=state.gden_dev)
-    # download F32 master for the SR writeback
-    var pres = ctx.enqueue_create_host_buffer[DType.float32](state.np)
-    ctx.enqueue_copy(dst_buf=pres, src_buf=state.p_dev)
+    # download the device-SR bf16 a/b (half the bytes; NO host SR pass / no F32 D2H)
+    var pbres = ctx.enqueue_create_host_buffer[DType.bfloat16](state.np)
+    ctx.enqueue_copy(dst_buf=pbres, src_buf=state.pb_dev)
     ctx.synchronize()
     var gn = num_h.unsafe_ptr()[0]
     var gd = den_h.unsafe_ptr()[0]
@@ -406,19 +433,15 @@ def automagic3_device_step(
         elif nl > AUTOMAGIC3_LR_MAX: nl = AUTOMAGIC3_LR_MAX
         state.lr = nl
 
-    # ── SR bf16 writeback (verified host fn) from the F32 master ──
-    var pp2 = pres.unsafe_ptr()
+    # ── copy the device-SR bf16 a/b into host_lora (kernel already did the SR) ──
+    var pbp = pbres.unsafe_ptr()
     var off2 = 0
     for i in range(na):
         var na_e = len(adapters[i].a)
-        var seg_a = List[Float32](capacity=na_e)
-        for e in range(na_e): seg_a.append(pp2[off2 + e])
-        automagic3_writeback_bf16_sr(adapters[i].a, seg_a, state.rng)
+        for e in range(na_e): adapters[i].a[e] = pbp[off2 + e]
         off2 += na_e
         var nb_e = len(adapters[i].b)
-        var seg_b = List[Float32](capacity=nb_e)
-        for e in range(nb_e): seg_b.append(pp2[off2 + e])
-        automagic3_writeback_bf16_sr(adapters[i].b, seg_b, state.rng)
+        for e in range(nb_e): adapters[i].b[e] = pbp[off2 + e]
         off2 += nb_e
 
     return Float32(state.lr)

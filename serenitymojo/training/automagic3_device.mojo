@@ -102,6 +102,7 @@ def automagic3_factored_kernel(
     var nt = Int(block_dim.x)
 
     var sh = stack_allocation[2, Scalar[DType.float64], address_space=AddressSpace.SHARED]()
+    var shr = stack_allocation[256, Scalar[DType.float64], address_space=AddressSpace.SHARED]()  # tree-reduce scratch (TPB)
 
     # ── phase 1: sanitize grad into g scratch (reuse g in place), EMA row/col ──
     var i = tid
@@ -135,12 +136,22 @@ def automagic3_factored_kernel(
         cc += nt
     barrier()
 
-    # ── phase 2: thread 0 computes rmean = mean(row_var) (serial f64) ──
+    # ── phase 2: rmean = mean(row_var) over rows (parallel block reduce, f64) ──
+    var rsl = Float64(0.0)
+    var rr0 = tid
+    while rr0 < rows:
+        rsl += Float64(rebind[Scalar[DType.float32]](row_var[roff + rr0]))
+        rr0 += nt
+    shr[tid] = rsl
+    barrier()
+    var act2 = nt // 2
+    while act2 > 0:
+        if tid < act2:
+            shr[tid] = shr[tid] + shr[tid + act2]
+        barrier()
+        act2 //= 2
     if tid == 0:
-        var rsum = Float64(0.0)
-        for rr in range(rows):
-            rsum += Float64(rebind[Scalar[DType.float32]](row_var[roff + rr]))
-        sh[0] = rsum / Float64(rows)
+        sh[0] = shr[0] / Float64(rows)
     barrier()
     var rmean = Float32(sh[0])
 
@@ -156,13 +167,23 @@ def automagic3_factored_kernel(
         j += nt
     barrier()
 
-    # ── phase 4: thread 0 RMS = sqrt(mean(update^2)) -> inv_scale ──
+    # ── phase 4: RMS = sqrt(mean(update^2)) over numel (parallel block reduce) ──
+    var usl = Float64(0.0)
+    var k0 = tid
+    while k0 < numel:
+        var uv = Float64(rebind[Scalar[DType.float32]](upd[goff + k0]))
+        usl += uv * uv
+        k0 += nt
+    shr[tid] = usl
+    barrier()
+    var act4 = nt // 2
+    while act4 > 0:
+        if tid < act4:
+            shr[tid] = shr[tid] + shr[tid + act4]
+        barrier()
+        act4 //= 2
     if tid == 0:
-        var usq = Float64(0.0)
-        for k in range(numel):
-            var uv = Float64(rebind[Scalar[DType.float32]](upd[goff + k]))
-            usq += uv * uv
-        var u_rms = Float64(sqrt(Float32(usq / Float64(numel))))  # F32 sqrt (GPU has no F64 sqrt)
+        var u_rms = Float64(sqrt(Float32(shr[0] / Float64(numel))))  # F32 sqrt (GPU has no F64 sqrt)
         var scale_div = u_rms / Float64(clip)
         if scale_div < 1.0:
             scale_div = 1.0
@@ -185,40 +206,68 @@ def automagic3_factored_kernel(
         k2 += nt
     barrier()
 
-    # ── phase 6: ring bookkeeping + vote (thread 0; serial, into group atomics) ──
+    # ── phase 6: ring bookkeeping (thread 0) + PARALLEL vote (block reduce) ──
+    # `plane` (= hist_idx[m], read in phase 5) and fill are uniform across the
+    # block, so every thread takes the same branch — no divergent-barrier hang.
+    var fill6 = Int(hist_fill[m]) + 1
+    if fill6 > _A3_H:
+        fill6 = _A3_H
+    var newidx = (plane + 1) % _A3_H
+    barrier()   # all threads read hist_fill before thread 0 overwrites it
     if tid == 0:
-        var fill = Int(hist_fill[m]) + 1
-        if fill > _A3_H:
-            fill = _A3_H
-        hist_fill[m] = Int32(fill)
-        var newidx = (plane + 1) % _A3_H
+        hist_fill[m] = Int32(fill6)
         hist_idx[m] = Int32(newidx)
-        if fill == _A3_H:
-            var start_plane = newidx   # oldest after advance (== host hist_idx)
-            var mnum = Float64(0.0)
-            var mden = Float64(0.0)
-            for e in range(numel):
-                var s1 = 0
-                var flips = 0
-                var prev = False
-                for kk in range(_A3_H):
-                    var b = sign_ring[soff + ((start_plane + kk) % _A3_H) * numel + e] != UInt8(0)
-                    if b:
-                        s1 += 1
-                    if kk > 0 and (b != prev):
-                        flips += 1
-                    prev = b
-                var w = Float64(rebind[Scalar[DType.float32]](upd[goff + e]))
-                if w < 0.0:
-                    w = -w
-                if s1 == _A3_H or s1 == 0:
-                    mnum += w
-                elif flips == (_A3_H - 1):
-                    mnum -= w
-                mden += w
-            _ = Atomic[DType.float64].fetch_add(group_num.ptr, mnum)
-            _ = Atomic[DType.float64].fetch_add(group_den.ptr, mden)
-    barrier()
+    if fill6 == _A3_H:
+        var start_plane = newidx   # oldest after advance (== host hist_idx)
+        var mnum = Float64(0.0)
+        var mden = Float64(0.0)
+        var e0 = tid
+        while e0 < numel:
+            var s1 = 0
+            var flips = 0
+            var prev = False
+            for kk in range(_A3_H):
+                var b = sign_ring[soff + ((start_plane + kk) % _A3_H) * numel + e0] != UInt8(0)
+                if b:
+                    s1 += 1
+                if kk > 0 and (b != prev):
+                    flips += 1
+                prev = b
+            var w = Float64(rebind[Scalar[DType.float32]](upd[goff + e0]))
+            if w < 0.0:
+                w = -w
+            if s1 == _A3_H or s1 == 0:
+                mnum += w
+            elif flips == (_A3_H - 1):
+                mnum -= w
+            mden += w
+            e0 += nt
+        # block-reduce mnum -> group_num atomic
+        shr[tid] = mnum
+        barrier()
+        var actn = nt // 2
+        while actn > 0:
+            if tid < actn:
+                shr[tid] = shr[tid] + shr[tid + actn]
+            barrier()
+            actn //= 2
+        if tid == 0:
+            _ = Atomic[DType.float64].fetch_add(group_num.ptr, shr[0])
+        barrier()
+        # block-reduce mden -> group_den atomic
+        shr[tid] = mden
+        barrier()
+        var actd = nt // 2
+        while actd > 0:
+            if tid < actd:
+                shr[tid] = shr[tid] + shr[tid + actd]
+            barrier()
+            actd //= 2
+        if tid == 0:
+            _ = Atomic[DType.float64].fetch_add(group_den.ptr, shr[0])
+        barrier()
+    else:
+        barrier()
 
     # ── phase 7: decoupled WD + param update (f32 master) + device SR -> bf16 ──
     var k3 = tid

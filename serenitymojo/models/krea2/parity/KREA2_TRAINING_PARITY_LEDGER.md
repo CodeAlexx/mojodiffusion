@@ -341,8 +341,18 @@ The full round-trip: train→save→load→INFERENCE→visible shift. Fixes:
   **~5.5 → ~4.8 s/step** (now ~0.5 s from AdamW). Parity gate unchanged PASS (F32 master is
   untouched by phase 7b); smoke loss bit-matches the host-SR run (training trajectory identical).
   Remaining ~0.5 s vs AdamW = the kernel's serial thread-0 reductions (rmean/RMS/vote) on the
-  1M-element MLP matrices — parallelizing those (F64 tree-reduce, still within the bar) is the
-  next lever.
+  1M-element MLP matrices.
+- PARALLEL REDUCTIONS (2026-06-30): rewrote phases 2/4/6 (rmean / RMS / sign-vote) as F64
+  block tree-reductions instead of serial thread-0 loops. Parity unchanged PASS (F64 order
+  drift ~1e-15, far under the 1e-4 bar); smoke loss bit-matches. MEASURED **~4.8 → ~4.7 s/step**
+  (optimizer now ~0.4 s vs AdamW 4.3). Small — the serial reductions were a minor slice (the
+  phase-timer's 717 ms "optimizer" was sync-inflated; the real A/B optimizer cost is ~0.4 s).
+- PHASE-TIMING MEASUREMENT (KREA2_PHASE_TIMING, reverted after): the dominant per-step cost is
+  `stack_forward`+`stack_backward` (the DiT GEMMs, ~3 s of GPU compute), NOT the optimizer.
+  ai-toolkit's ~3.3 s/it beats us because its torch GEMMs hit higher % of peak; ours run ~49%
+  of peak for krea2's 4864×16384×6144 shapes — the MAX matmul/cutlass-config ceiling BELOW the
+  trainer (MJ-0829). Even a free optimizer leaves us ~4.2 s (> ai-toolkit's total). So the
+  remaining ~1.4 s gap is the matmul backend, not the (now near-optimal) optimizer.
 
 ### Standard training output (was a bare numeric dump)
 - `train_krea2` printed a bare `print(step, idx, lt, sigma, loss, gn)` instead of the shared

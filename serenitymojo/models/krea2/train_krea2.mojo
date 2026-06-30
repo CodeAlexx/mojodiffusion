@@ -90,6 +90,8 @@ from serenitymojo.training.levers import (
 )
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft, save_lora_train_state, load_lora_train_state, load_lora_for_resume
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.automagic3_device import automagic3_device_step, Automagic3DeviceState
+from serenitymojo.training.train_config import TRAIN_OPTIMIZER_AUTOMAGIC3
 from serenitymojo.io.ffi import sys_mkdirs, sys_remove
 from serenitymojo.training.sample_prompt_config import (
     SamplePromptConfig, read_sample_prompt_config,
@@ -1723,6 +1725,7 @@ def main() raises:
     # stochastic-rounding bf16 writeback (automagic3_writeback_bf16_sr). State is
     # lazily inited on the first levers step (no alloc for the AdamW default).
     var opt_state = LeversOptimizerState()
+    var a3_dev = Automagic3DeviceState(ctx)   # GPU automagic3 (lazy-built on 1st step)
     if levers_optimizer_active(cfg):
         levers_optimizer_validate(cfg, String("krea2"))
         print("[krea2] optimizer = LEVERS (optimizer tag", cfg.optimizer, ") — automagic3/etc.")
@@ -1937,10 +1940,19 @@ def main() raises:
             print("  [krea2-loha] step=", step + 1, " master_grad_norm=", Float32(mnorm),
                   " zero_leg_l1=", krea2_loha_zero_leg_l1(loha_masters))
         elif levers_optimizer_active(cfg):
-            levers_optimizer_step_host(
-                cfg, host_lora, gl.d_a, gl.d_b, step + 1, cfg.lr, 0, n_adapters,
-                opt_state,
-            )
+            if cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
+                # GPU automagic3 — device math (oracle-gated == host == ai-toolkit),
+                # SR bf16 writeback via the verified host fn. lr self-adapts in a3_dev.
+                _ = automagic3_device_step(
+                    a3_dev, host_lora, gl.d_a, gl.d_b,
+                    Float64(cfg.lr), Float64(0.999), Float64(1.0e-30),
+                    Float64(1.0), Float64(cfg.weight_decay), ctx,
+                )
+            else:
+                levers_optimizer_step_host(
+                    cfg, host_lora, gl.d_a, gl.d_b, step + 1, cfg.lr, 0, n_adapters,
+                    opt_state,
+                )
         else:
             fused_lora_adamw_plain_step(
                 host_lora, gl.d_a, gl.d_b, 0, n_adapters, step + 1,
@@ -1962,7 +1974,7 @@ def main() raises:
 
         # ── inline sampler: sample the just-updated live LoRA, no save/reload.
         if sample_enabled and (step + 1) % sample_every == 0:
-            _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
+            _krea2_run_inline_samples[LH, LW, LTMAX, LFULL](
                 cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
                 step + 1, ctx, resident,
             )

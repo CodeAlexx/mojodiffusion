@@ -26,7 +26,7 @@
   "max_grad_norm": 1.0,
   "max_steps": 2000,
   "save_every": 500,
-  "sample_every": 999999,
+  "sample_every": 500,
   "workspace_dir": "/home/alex/trainings/krea2_eri2_automagic3",
   "save_filename_prefix": "eri2_krea2_a3",
 

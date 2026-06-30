@@ -317,3 +317,35 @@ The full round-trip: train→save→load→INFERENCE→visible shift. Fixes:
   at step 2", step output started at 2 with the same loss as the scratch run (trajectory continues).
 - eri2 continuation: WARM-started from `eri2_krea2_1000` (predates the fix, no moments) at step 1000 →
   running to 2000; checkpoints from 1500 on carry full `.state` for exact future resume.
+
+## GPU automagic3 + standard output + sampler cfg (2026-06-29)
+
+### automagic3 was CPU — ported to GPU (oracle-gated)
+- MEASURED: switching the eri2 LoRA to `optimizer: AUTOMAGIC3` made it **14 s/step** vs AdamW
+  **4.3 s/step** — same model/data, only the optimizer changed. ROOT CAUSE (read the code, not
+  inferred): the levers path (`levers_optimizer_step_host` → `automagic3_step_2d`) runs the WHOLE
+  optimizer on the CPU as `List[Float32]` loops over ~54M LoRA elements/step (factored row/col EMA,
+  RMS, H-plane sign ring, group vote, SR writeback). ai-toolkit's automagic3 is a torch optimizer =
+  GPU. The fused AdamW had a GPU kernel; automagic3 never got one. NOT inherent — an incomplete port.
+- FIX: `training/automagic3_device.mojo` — factored-2D automagic3 as a GPU kernel (one block per
+  matrix; F64 reductions; sign ring + group-vote atomics on device; F32 master + state device-resident),
+  with the verified host SR writeback (`automagic3_writeback_bf16_sr`). Wired into `train_krea2` for
+  the AUTOMAGIC3 optimizer tag.
+- ORACLE GATE `automagic3_device_parity` PASS: device vs host (== ai-toolkit) over 12 steps —
+  param rel ~1.2e-7, row/col-var rel ~1.5-2.2e-7, lr-trajectory max rel **4.9e-10**. (Device SR
+  property itself gated separately by `automagic3_sr_parity_gate`.)
+- MEASURED post-port: eri2 automagic3 smoke **~5.5 s/step** (down from 14; near AdamW's 4.3 — the
+  ~1.2 s gap is the host SR writeback + the F64 D2H, a future device-SR optimization).
+
+### Standard training output (was a bare numeric dump)
+- `train_krea2` printed a bare `print(step, idx, lt, sigma, loss, gn)` instead of the shared
+  `print_trainer_progress` block (training/progress_display.mojo) every other trainer uses. Wired
+  `print_trainer_progress` into all 3 optimizer paths + per-step/cumulative wall timers →
+  `[krea2] step N/total | epoch | loss | grad_norm | s/step | elapsed | ETA`.
+
+### Inline sampler: cfg 6 over-guides → use cfg 1.0
+- MEASURED at the identical untrained step-2 state: inline 512 at **cfg 6.0 → flat/degenerate**;
+  **cfg 1.0 → coherent** image. So the flat inline samples were cfg-6 over-guidance, NOT undertraining.
+  The inline (during-training) sampler runs at the train res (512, comptime LH/LW) and is set to cfg 1.0
+  (the first eri2 run's coherent setting; also skips the uncond forward → faster). The 1024 inline arm
+  stays geometry-broken (corner-confined) — render 1024 via the pipeline (cfg 6 there IS coherent).

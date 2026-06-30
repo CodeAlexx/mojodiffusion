@@ -89,6 +89,7 @@ from serenitymojo.training.levers import (
     levers_optimizer_validate, LeversOptimizerState,
 )
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft, save_lora_train_state, load_lora_train_state, load_lora_for_resume
+from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.io.ffi import sys_mkdirs, sys_remove
 from serenitymojo.training.sample_prompt_config import (
     SamplePromptConfig, read_sample_prompt_config,
@@ -1755,7 +1756,9 @@ def main() raises:
     print("")
     print("step  sample  LT   sigma     loss        grad_norm")
 
+    var t0 = perf_counter_ns()   # training start — elapsed/ETA for print_trainer_progress
     for step in range(start_step, steps):
+        var step_t0 = perf_counter_ns()   # per-step wall clock (standard progress line)
         var idx = order[step % n]   # LT-bucketed order kept (harmless; padding makes all
         # samples one LFULL size class — the real pool fragmentation fix).
         var sample: KreaTrainSample
@@ -1805,7 +1808,11 @@ def main() raises:
             comptime if KREA2_PHASE_TIMING:
                 _ot = _phase_ms("direct_dora_optimizer", _ot, ctx)
 
-            print(step, "  ", idx, "  ", lt, "  ", sigma, "  ", so_dora_h.loss, "  ", Float32(dnorm))
+            var _sn = perf_counter_ns()
+            print_trainer_progress(
+                String("krea2"), step + 1, steps, n, so_dora_h.loss, Float64(dnorm),
+                Float64(_sn - step_t0) / 1.0e9, 0.0, Float64(_sn - t0) / 1.0e9,
+            )
             ctx.synchronize()
 
             if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
@@ -1848,7 +1855,11 @@ def main() raises:
             comptime if KREA2_PHASE_TIMING:
                 _ot = _phase_ms("direct_oft_optimizer", _ot, ctx)
 
-            print(step, "  ", idx, "  ", lt, "  ", sigma, "  ", so_oft_h.loss, "  ", Float32(onorm))
+            var _sn = perf_counter_ns()
+            print_trainer_progress(
+                String("krea2"), step + 1, steps, n, so_oft_h.loss, Float64(onorm),
+                Float64(_sn - step_t0) / 1.0e9, 0.0, Float64(_sn - t0) / 1.0e9,
+            )
             ctx.synchronize()
 
             if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
@@ -1939,7 +1950,11 @@ def main() raises:
         comptime if KREA2_PHASE_TIMING:
             _ot = _phase_ms("optimizer", _ot, ctx)
 
-        print(step, "  ", idx, "  ", lt, "  ", sigma, "  ", so.loss, "  ", gn)
+        var _sn = perf_counter_ns()
+        print_trainer_progress(
+            String("krea2"), step + 1, steps, n, so.loss, Float64(gn),
+            Float64(_sn - step_t0) / 1.0e9, 0.0, Float64(_sn - t0) / 1.0e9,
+        )
         ctx.synchronize()   # per-STEP async free discipline: reclaim this step's tensors
         # (esp. the ~4.5GB pad mask + the padded sample + fwd/bwd acts) before the next
         # step — else the deferred async frees creep up in the tight LTMAX headroom and

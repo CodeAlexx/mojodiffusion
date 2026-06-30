@@ -353,6 +353,17 @@ The full round-trip: train→save→load→INFERENCE→visible shift. Fixes:
   of peak for krea2's 4864×16384×6144 shapes — the MAX matmul/cutlass-config ceiling BELOW the
   trainer (MJ-0829). Even a free optimizer leaves us ~4.2 s (> ai-toolkit's total). So the
   remaining ~1.4 s gap is the matmul backend, not the (now near-optimal) optimizer.
+- MATMUL BACKEND = DEAD END (2026-06-30, MEASURED, refutes the "49% peak" claim).
+  Ran `ops/tests/cublas_vs_max_gemm.mojo` on krea2's exact MLP shapes (4864×6144×16384 and
+  4864×16384×6144): **MAX vendor.blas matmul 79.7 TFLOP/s vs cuBLAS gemmEx 79.1 TFLOP/s, speedup
+  0.99×, cos 1.0**. Both are ~99% of the 3090 Ti's bf16/**F32-accumulate** tensor peak (~80
+  TFLOP/s). The earlier "MAX 49% of peak / cuBLAS 70%" was measuring against the **FP16-accumulate**
+  peak (~160 TFLOP/s) — at krea2's F32-accumulate precision the GEMM is ALREADY MAXED. So there is
+  NO matmul-backend win (cuBLAS == MAX). The only way the GEMM goes faster is **lower-precision
+  accumulate (FP16/TF32, ~2× throughput)** — a PRECISION tradeoff, not a backend swap, and the
+  likely reason ai-toolkit hits ~3.3 s (HYPOTHESIS: it accumulates in FP16/TF32; we use F32 for
+  parity). Remaining non-GEMM levers if precision is held: op-fusion of the ~3200 small
+  elementwise/bias/cast ops (the eager-vs-torch.compile gap) and the flash-attention path.
 
 ### Standard training output (was a bare numeric dump)
 - `train_krea2` printed a bare `print(step, idx, lt, sigma, loss, gn)` instead of the shared

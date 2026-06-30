@@ -74,7 +74,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.tensor_algebra import reshape, concat, slice
+from serenitymojo.ops.tensor_algebra import reshape, concat, slice, permute, zeros_device
 
 # ── shared training pipeline (REUSE) ──────────────────────────────────────────
 from serenitymojo.training.train_config import TrainConfig
@@ -88,8 +88,18 @@ from serenitymojo.training.levers import (
     levers_optimizer_active, levers_optimizer_step_host,
     levers_optimizer_validate, LeversOptimizerState,
 )
-from serenitymojo.training.lora_save import NamedLora, save_lora_peft
+from serenitymojo.training.lora_save import NamedLora, save_lora_peft, save_lora_train_state, load_lora_train_state, load_lora_for_resume
 from serenitymojo.io.ffi import sys_mkdirs, sys_remove
+from serenitymojo.training.sample_prompt_config import (
+    SamplePromptConfig, read_sample_prompt_config,
+)
+from serenitymojo.io.cap_cache import load_tensor_bin
+from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
+from serenitymojo.models.vae.qwenimage_decoder import QwenImageVaeDecoder
+from serenitymojo.sampling.krea2_sampler import (
+    krea2_packed_seq_len, krea2_timesteps, krea2_cfg, krea2_euler_step,
+)
+from serenitymojo.image.png import save_png, ValueRange
 
 # ── krea2 config + cache reader + LoRA set ────────────────────────────────────
 from serenitymojo.models.krea2.config import krea2_raw
@@ -264,6 +274,15 @@ comptime IMGLEN = (LH // 2) * (LW // 2)   # 1024 (512px) | 4096 (1024px)
 # is the documented follow-up — would parameterize main on [LH,LW,LTMAX].)
 comptime LTMAX = 384
 comptime LFULL = LTMAX + IMGLEN           # 4864 — the single comptime arm for ALL samples
+
+# ── INLINE-SAMPLE resolution arm (independent of train res) ───────────────────
+# The inline sampler generates its OWN fresh latent (randn[1,16,LH_S,LW_S]) and is
+# NOT tied to the training-cache latent shape, so we can sample at 1024 while
+# training at 512. LH_S/LW_S = 128 → 1024px; LFULL_S = LTMAX + (128//2)^2 = 4480.
+comptime LH_S = 128
+comptime LW_S = 128
+comptime IMGLEN_S = (LH_S // 2) * (LW_S // 2)   # 4096 (1024px sample)
+comptime LFULL_S = LTMAX + IMGLEN_S             # 4480
 
 # Checkpoint retention (honors ai-toolkit max_step_saves_to_keep). Prune the periodic
 # save KREA2_KEEP_CHECKPOINTS back, keeping every KREA2_CKPT_MILESTONE-th + the final.
@@ -1040,6 +1059,50 @@ def save_krea2_lora(
     return save_lora_peft(named, path, ctx)
 
 
+def save_krea2_lora_state(
+    host_lora: List[LoraAdapter], path: String, ctx: DeviceContext
+) raises -> Int:
+    """Write the trainer-only RESUME state (A/B + AdamW moments) for the 224
+    plain-LoRA adapters, in the SAME block×slot order as save_krea2_lora. Separate
+    from the PEFT file (inference-only) — this carries adam_m/adam_v so a resumed
+    run does not zero the optimizer moments. Loaded by load_lora_train_state."""
+    var named = List[NamedLora]()
+    for bi in range(NBLOCKS):
+        for s in range(KREA2_SLOTS_PER_BLOCK):
+            named.append(NamedLora(
+                _krea2_lora_prefix(bi, s),
+                host_lora[bi * KREA2_SLOTS_PER_BLOCK + s].copy(),
+            ))
+    return save_lora_train_state(named, path, ctx)
+
+
+def _krea2_lora_resume(
+    host_lora: List[LoraAdapter], scale: Float32, path: String, ctx: DeviceContext
+) raises -> List[LoraAdapter]:
+    """Reload the 224 plain-LoRA adapters from a checkpoint for resume. Prefers the
+    `.state` file (FULL resume: A/B + AdamW moments); falls back to a plain PEFT
+    file (WARM start: A/B only, moments zeroed). Returns a fresh host_lora in
+    block×slot order. The caller offsets the step counter to the saved step."""
+    var prefixes = List[String]()
+    for bi in range(NBLOCKS):
+        for s in range(KREA2_SLOTS_PER_BLOCK):
+            prefixes.append(_krea2_lora_prefix(bi, s))
+    var loaded: List[NamedLora]
+    try:
+        loaded = load_lora_train_state(prefixes, scale, path, ctx)
+        print("[krea2-resume] FULL resume (A/B + AdamW moments) from", path)
+    except:
+        loaded = load_lora_for_resume(prefixes, scale, path, ctx)
+        print("[krea2-resume] WARM start (A/B only, moments zeroed) from", path)
+    var out = List[LoraAdapter]()
+    for ref nl in loaded:
+        out.append(nl.adapter.copy())
+    if len(out) != len(host_lora):
+        raise Error(String("_krea2_lora_resume: adapter count ") + String(len(out))
+            + " != expected " + String(len(host_lora)))
+    return out^
+
+
 # convert the host LoRA set → the device Krea2StackLora the streaming stack consumes.
 def _host_to_device_lora(
     host: List[LoraAdapter], ctx: DeviceContext
@@ -1147,6 +1210,242 @@ def _step_dispatch_oft(
         sigma, noise_seed, cfg, ctx, resident)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# INLINE SAMPLER — resident Krea2 base + live LoRA, no save/reload round-trip.
+# ══════════════════════════════════════════════════════════════════════════════
+struct _Krea2InlineCond(Copyable, Movable):
+    var context: TArc      # [1, LTMAX, 12, 2560] BF16
+    var pos: TArc          # [1, LTMAX+imglen, 3] F32
+    var text_len: Int      # natural LT before padding
+
+    def __init__(out self, var context: TArc, var pos: TArc, text_len: Int):
+        self.context = context^
+        self.pos = pos^
+        self.text_len = text_len
+
+
+def _krea2_pad_context_to_ltmax[LTMAX: Int](
+    context: Tensor, lt: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var sh = context.shape()
+    if (
+        len(sh) != 4 or sh[0] != 1
+        or sh[2] != KREA2_TXT_LAYERS or sh[3] != KREA2_TXT_DIM
+    ):
+        raise Error("krea2 inline sampler: expected context [1, LT, 12, 2560]")
+    if lt > LTMAX:
+        raise Error(
+            String("krea2 inline sampler: LT=") + String(lt)
+            + " > LTMAX=" + String(LTMAX)
+            + " (raise the compiled Krea2 LTMAX bucket)"
+        )
+    var ctx_bf = cast_tensor(context, STDtype.BF16, ctx)
+    if lt == LTMAX:
+        return ctx_bf^
+    var pad = zeros_device(
+        [1, LTMAX - lt, KREA2_TXT_LAYERS, KREA2_TXT_DIM], STDtype.BF16, ctx
+    )
+    return concat(1, ctx, ctx_bf, pad)
+
+
+def _krea2_inline_cond_from_context[LH: Int, LW: Int, LTMAX: Int](
+    var context: Tensor, ctx: DeviceContext,
+) raises -> _Krea2InlineCond:
+    var sh = context.shape()
+    if (
+        len(sh) != 4 or sh[0] != 1
+        or sh[2] != KREA2_TXT_LAYERS or sh[3] != KREA2_TXT_DIM
+    ):
+        raise Error("krea2 inline sampler: expected context [1, LT, 12, 2560]")
+    var lt = sh[1]
+    var padded = _krea2_pad_context_to_ltmax[LTMAX](context^, lt, ctx)
+    var pos = krea2_build_pos[LH, LW](LTMAX, ctx)
+    return _Krea2InlineCond(TArc(padded^), TArc(pos^), lt)
+
+
+def _krea2_inline_cond_from_bin[LH: Int, LW: Int, LTMAX: Int](
+    path: String, ctx: DeviceContext,
+) raises -> _Krea2InlineCond:
+    if path == String(""):
+        raise Error("krea2 inline sampler: empty context cap path")
+    var context = load_tensor_bin(path, ctx)
+    return _krea2_inline_cond_from_context[LH, LW, LTMAX](context^, ctx)
+
+
+def _krea2_inline_cond_from_cache[LH: Int, LW: Int, LTMAX: Int](
+    read cache: KreaTrainCache, sample_index: Int, ctx: DeviceContext,
+) raises -> _Krea2InlineCond:
+    # Read ONLY the cached caption context (res-independent); build pos at the
+    # SAMPLE geometry [LH,LW]. Must NOT go through cache.sample_padded[LH,LW] —
+    # that reads+validates the clean latent at [1,16,LH,LW], which mismatches when
+    # the inline sample res (LH_S=128/1024px) differs from the train cache res
+    # (64/512px). The context tensor is [1,LT,12,2560] regardless of image res.
+    var context = cast_tensor(
+        Tensor.from_view(cache.src.tensor_view(cache.context_keys[sample_index]), ctx),
+        STDtype.BF16, ctx,
+    )
+    return _krea2_inline_cond_from_context[LH, LW, LTMAX](context^, ctx)
+
+
+def _krea2_inline_uncond_from_cache[LH: Int, LW: Int, LTMAX: Int](
+    read cache: KreaTrainCache, ctx: DeviceContext,
+) raises -> _Krea2InlineCond:
+    var u = cache.uncond[LH, LW](ctx)
+    var padded = _krea2_pad_context_to_ltmax[LTMAX](u.context[], u.text_len, ctx)
+    var pos = krea2_build_pos[LH, LW](LTMAX, ctx)
+    return _Krea2InlineCond(TArc(padded^), TArc(pos^), u.text_len)
+
+
+def _krea2_unpatch[LH: Int, LW: Int](tokens: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """Inverse patchify: [1,imglen,64] -> [1,16,LH,LW]."""
+    comptime gh = LH // 2
+    comptime gw = LW // 2
+    var x6 = reshape(tokens, [1, gh, gw, 16, 2, 2], ctx)
+    var xp = permute(x6, [0, 3, 1, 4, 2, 5], ctx)
+    return reshape(xp, [1, 16, gh * 2, gw * 2], ctx)
+
+
+def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: Int](
+    st: ShardedSafeTensors,
+    key_prefix: String,
+    cond_w: Krea2ResidentCond,
+    fin: Krea2StreamFinal,
+    lora: Krea2StackLora,
+    cond: _Krea2InlineCond,
+    uncond: _Krea2InlineCond,
+    sample_steps: Int,
+    cfg_scale: Float32,
+    seed: UInt64,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Tensor:
+    comptime imglen = (LH // 2) * (LW // 2)
+    comptime assert LFULL_SAMPLE == LTMAX + imglen, "Krea2 sample LFULL mismatch"
+    if sample_steps < 1:
+        raise Error("krea2 inline sampler: sample steps must be >= 1")
+
+    var latent = randn([1, 16, LH, LW], seed, STDtype.F32, ctx)
+    var seq = krea2_packed_seq_len(LH * 8, LW * 8)
+    var ts = krea2_timesteps(seq, sample_steps)
+    print("[krea2-sample-inline] steps=", sample_steps, " cfg=", cfg_scale,
+          " seed=", seed, " LT(cond)=", cond.text_len, " LT(uncond)=", uncond.text_len)
+
+    for si in range(sample_steps):
+        var t_cur = ts[si]
+        var t_prev = ts[si + 1]
+        var img_tokens = krea2_patchify[LH, LW](latent, ctx)
+        var t_t = _t_scalar(t_cur, ctx)
+
+        var c = _build_conditioning[LTMAX, LFULL_SAMPLE](
+            cond_w, img_tokens, cond.context[], cond.pos[], t_t, cond.text_len, ctx,
+        )
+        var real_len_c = Optional[Int](cond.text_len + imglen)
+        var pred_c = krea2_stack_lora_forward_streamed[
+            LFULL_SAMPLE, HEADS, KVHEADS, HEADDIM
+        ](
+            c.combined, c.blk_vec, c.tmlp_out,
+            st, key_prefix, NBLOCKS, lora, fin,
+            c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident,
+        )
+
+        var v_f32: Tensor
+        if cfg_scale == Float32(1.0):
+            v_f32 = cast_tensor(pred_c.velocity[], STDtype.F32, ctx)
+        else:
+            var u = _build_conditioning[LTMAX, LFULL_SAMPLE](
+                cond_w, img_tokens, uncond.context[], uncond.pos[], t_t,
+                uncond.text_len, ctx,
+            )
+            var real_len_u = Optional[Int](uncond.text_len + imglen)
+            var pred_u = krea2_stack_lora_forward_streamed[
+                LFULL_SAMPLE, HEADS, KVHEADS, HEADDIM
+            ](
+                u.combined, u.blk_vec, u.tmlp_out,
+                st, key_prefix, NBLOCKS, lora, fin,
+                u.cos, u.sin, EPS, uncond.text_len, imglen, ctx,
+                real_len_u, resident,
+            )
+            var vc_f32 = cast_tensor(pred_c.velocity[], STDtype.F32, ctx)
+            var vu_f32 = cast_tensor(pred_u.velocity[], STDtype.F32, ctx)
+            v_f32 = krea2_cfg(vc_f32, vu_f32, cfg_scale, ctx)
+
+        var v_latent = _krea2_unpatch[LH, LW](v_f32, ctx)
+        latent = krea2_euler_step(latent, v_latent, t_cur, t_prev, ctx)
+        ctx.synchronize()
+        if si == 0 or si + 1 == sample_steps or (si + 1) % 5 == 0:
+            print("[krea2-sample-inline] step", si + 1, "/", sample_steps,
+                  " t=", t_cur)
+    return latent^
+
+
+def _krea2_decode_latent_to_png[LH: Int, LW: Int](
+    latent: Tensor, vae_dir: String, out_png: String, ctx: DeviceContext,
+) raises:
+    print("[krea2-sample-inline] decoding ->", out_png)
+    var dec = QwenImageVaeDecoder[LH, LW].load(vae_dir, ctx)
+    var latent_bf16 = torch_f32_to_bf16_rne(latent, ctx)
+    var img = dec.decode(latent_bf16, ctx)
+    save_png(img, out_png, ctx, ValueRange.SIGNED)
+
+
+def _krea2_run_inline_samples[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: Int](
+    read cache: KreaTrainCache,
+    st: ShardedSafeTensors,
+    key_prefix: String,
+    cond_w: Krea2ResidentCond,
+    fin: Krea2StreamFinal,
+    host_lora: List[LoraAdapter],
+    train_cfg: TrainConfig,
+    sample_cfg: SamplePromptConfig,
+    completed_step: Int,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises:
+    var samples_dir = train_cfg.workspace_dir + String("/samples")
+    _ = sys_mkdirs(samples_dir)
+    var lora_dev = _host_to_device_lora(host_lora, ctx)
+    for pi in range(len(sample_cfg.prompts)):
+        var prompt = sample_cfg.prompts[pi].copy()
+        if not prompt.enabled:
+            continue
+        var cond: _Krea2InlineCond
+        if prompt.caps_pos.byte_length() > 0:
+            cond = _krea2_inline_cond_from_bin[LH, LW, LTMAX](prompt.caps_pos, ctx)
+        else:
+            cond = _krea2_inline_cond_from_cache[LH, LW, LTMAX](
+                cache, pi % cache.len(), ctx,
+            )
+
+        var guidance = prompt.cfg
+        var uncond = cond.copy()
+        if guidance != Float32(1.0):
+            if prompt.caps_neg.byte_length() > 0:
+                uncond = _krea2_inline_cond_from_bin[LH, LW, LTMAX](
+                    prompt.caps_neg, ctx,
+                )
+            elif cache.context_uncond_key.byte_length() > 0:
+                uncond = _krea2_inline_uncond_from_cache[LH, LW, LTMAX](cache, ctx)
+            else:
+                raise Error(
+                    "krea2 inline sampler: cfg != 1.0 requires caps.negative "
+                    + "or a training cache prepared with --uncond"
+                )
+
+        var latent = _krea2_sample_resident_latent[
+            LH, LW, LTMAX, LFULL_SAMPLE
+        ](
+            st, key_prefix, cond_w, fin, lora_dev, cond, uncond,
+            prompt.steps, guidance, prompt.seed + UInt64(completed_step * 1000 + pi),
+            ctx, resident,
+        )
+        var out_png = (
+            samples_dir + String("/step_") + String(completed_step)
+            + String("_") + String(pi) + String(".png")
+        )
+        _krea2_decode_latent_to_png[LH, LW](latent, train_cfg.vae, out_png, ctx)
+        print("[krea2-sample-inline] wrote", out_png)
+
+
 def _direct_dora_grads_to_host(
     var grads: Krea2StackDirectDoRAGradsT,
     masters: FlatDirectDoRASet,
@@ -1214,6 +1513,14 @@ def main() raises:
         raise Error("usage: train_krea2 <cache.safetensors> <steps> [<config.json>]")
     var cache_path = String(args[1])
     var steps = Int(String(args[2]))
+    # Optional resume: args[4] = checkpoint path (.state for FULL resume incl AdamW
+    # moments, or a plain PEFT file for WARM start), args[5] = step to resume AT.
+    var resume_path = String("")
+    var start_step = 0
+    if len(args) >= 5:
+        resume_path = String(args[4])
+    if len(args) >= 6:
+        start_step = Int(String(args[5]))
 
     var ctx = DeviceContext()
     # Optional 3rd arg = a config path (e.g. configs/krea2_boxjana.json); default =
@@ -1322,6 +1629,12 @@ def main() raises:
     var host_lora = List[LoraAdapter]()
     if not dora_active and not oft_active:
         host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
+    # RESUME (plain LoRA only): overwrite the B=0-init host_lora with the saved
+    # A/B (+ AdamW moments if the .state file is present) and continue at start_step.
+    if resume_path != String("") and not dora_active and not oft_active and not carrier_active:
+        var resume_scale = cfg.lora_alpha / Float32(cfg.lora_rank)
+        host_lora = _krea2_lora_resume(host_lora, resume_scale, resume_path, ctx)
+        print("[krea2-resume] reloaded", len(host_lora), "adapters; resuming at step", start_step, "/", steps)
     var n_adapters = NBLOCKS * KREA2_SLOTS_PER_BLOCK
     var lokr_masters = empty_krea2_lokr_set()
     var loha_masters = empty_krea2_loha_set()
@@ -1380,6 +1693,29 @@ def main() raises:
     if not dora_active and not oft_active:
         print("host LoRA adapters=", len(host_lora), " (8 per block)")
 
+    # ── inline sample-during-training ──────────────────────────────────────────
+    # Uses the live in-memory LoRA carrier (plain LoRA/LoCon/LoKr/LoHa) and the
+    # resident/streamed base already opened above. Direct DoRA/OFT have their own
+    # W_eff carriers and are not represented by Krea2StackLora, so fail loud if a
+    # config asks for inline sampling there.
+    var sample_cfg = SamplePromptConfig()
+    var sample_every = cfg.sample_every
+    var sample_enabled = sample_every > 0
+    if sample_enabled:
+        if dora_active or oft_active:
+            raise Error(
+                "krea2 inline sampler currently supports LoRA/LoCon/LoKr/LoHa "
+                + "carriers; set sample_every=0 for direct DoRA/OFT runs"
+            )
+        if cfg.validation_prompts_file == String(""):
+            raise Error("krea2 inline sampler requires validation_prompts_file")
+        sample_cfg = read_sample_prompt_config(cfg.validation_prompts_file)
+        print(
+            "[krea2-sample-inline] enabled every", sample_every,
+            "steps; prompts=", len(sample_cfg.prompts),
+            " file=", cfg.validation_prompts_file,
+        )
+
     # ── optimizer: AdamW (default, fused) OR a levers optimizer (automagic3 etc.).
     # levers_optimizer_active is False for ADAMW (C13: routes around levers). For
     # AUTOMAGIC3 (boxjana), the levers path runs automagic3_step + its REQUIRED
@@ -1419,7 +1755,7 @@ def main() raises:
     print("")
     print("step  sample  LT   sigma     loss        grad_norm")
 
-    for step in range(steps):
+    for step in range(start_step, steps):
         var idx = order[step % n]   # LT-bucketed order kept (harmless; padding makes all
         # samples one LFULL size class — the real pool fragmentation fix).
         var sample: KreaTrainSample
@@ -1609,6 +1945,14 @@ def main() raises:
         # step — else the deferred async frees creep up in the tight LTMAX headroom and
         # OOM (~step 11). The per-block sync handles within-the-stack; this handles steps.
 
+        # ── inline sampler: sample the just-updated live LoRA, no save/reload.
+        if sample_enabled and (step + 1) % sample_every == 0:
+            _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
+                cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
+                step + 1, ctx, resident,
+            )
+            ctx.synchronize()
+
         # ── periodic LoRA save (MJ-0805) every cfg.save_every steps ─────────────
         if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
             _ = sys_mkdirs(cfg.workspace_dir)   # save_safetensors won't create dirs
@@ -1620,6 +1964,8 @@ def main() raises:
                 npairs = save_krea2_loha(loha_masters, sp, ctx)
             else:
                 npairs = save_krea2_lora(host_lora, sp, ctx)
+                # FULL-resume sidecar: A/B + AdamW moments (load with args[4]=<sp>.state).
+                _ = save_krea2_lora_state(host_lora, sp + String(".state"), ctx)
             print("  [save] wrote", npairs, "LoRA pairs ->", sp)
             # Honor ai-toolkit's max_step_saves_to_keep: prune the checkpoint
             # KREA2_KEEP_CHECKPOINTS saves back, keeping every KREA2_CKPT_MILESTONE-th

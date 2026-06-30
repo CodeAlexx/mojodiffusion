@@ -275,3 +275,45 @@ The full round-trip: train→save→load→INFERENCE→visible shift. Fixes:
 - MILESTONE (lead): A (no-LoRA) vs B (+512px LoRA) pixel diff mean_abs 1.66, 15% px changed = DIFFER.
 - STILL ~7.5min: inference attn = tiled math O(L²) at L=4864; flash-wire (real_len=L → cuDNN flash O(L))
   in flight for ≤4min. perf-pass merged (035ab8a: d_g/_colsum/conv2d wins). boxjana 2000-step run queued.
+
+## 1024 RENDER + FULL RESUME (2026-06-29)
+
+### 1024 cfg-6 LoRA render on 24GB — the OOM fix is an ENV VAR, not code
+- MEASURED: `krea2_pipeline` resident fp8 (12GB) + 1024 cfg-6 (TWO forwards, tiled-math
+  block-0 O(L²)) OOMs at **step 1** (step 0 fits). NOT pool fragmentation
+  (`FLAME_ALLOC_POOL=0` still OOMs). The per-block `if lora: synchronize()` drain (MJ-1019)
+  is active but insufficient — the peak, not accumulation, is the issue.
+- FIX (MEASURED, runs all 20 steps, vram flat, NO disk reads): **`MODULAR_DEVICE_CONTEXT_SYNC_MODE=true`**
+  — forces every deferred async free to complete before the next alloc → resident 1024 cfg-6 FITS.
+  ~17s/step + 91s VAE decode ≈ 6.5min. The "block-0 tiled-F32 attn is the hog" HYPOTHESIS was
+  DISPROVEN: SYNC_MODE alone (no code change) fixed it. ai-toolkit avoids the OOM via PyTorch
+  flash-SDPA everywhere (O(L), F32-accurate online softmax); the Mojo inference is flash for
+  blocks 1-27 but block 0 stays tiled-F32 — still fits once SYNC_MODE drains the frees.
+- Render recipe (proven, VISIBLE trained likeness at 1024):
+  1. `krea2_encode_cli "<vrtlEri2 prompt>" ""` → prints LT_POS/LT_NEG, writes output/krea2_ctx_{pos,neg}.bin
+  2. set `krea2_pipeline.mojo` comptime `LT_POS`=<measured>, `CFG_SCALE`, HEIGHT/WIDTH=1024; build -O2 + cshim
+  3. `MODULAR_DEVICE_CONTEXT_SYNC_MODE=true <bin> --lora <eri2_krea2_NNNN.safetensors>` → output/...png.lora.png
+- cfg>1 REQUIRES a negative: re-stage the cache with `stage_dir/uncond.txt` (empty) so
+  `krea2_prepare_cache` writes `context_uncond [1,LTu,12,2560]` (the eri2 cache had none → cfg6 raised).
+
+### Inline 1024 sampler — BROKEN (geometry); use the pipeline for 1024
+- Added a separate inline sample-res arm (`LH_S=LW_S=128`, `LFULL_S=4480`) + decoupled the
+  cond-from-cache read (read `context.<i>` directly, NOT `sample_padded[LH,LW]` which validates the
+  512 clean latent → "latent shape mismatch [1,16,128,128]"). It RUNS at 1024 + cfg6, no OOM.
+- BUT the output is DEGENERATE: structure confined to a top corner, rest flat color (pos/grid
+  geometry bug at 128×128). MEASURED at step 500 with a trained LoRA → not an undertraining artifact.
+  KNOWN ISSUE: inline 1024 unusable; 512 inline is coherent; render 1024 via the pipeline above.
+
+### FULL LoRA RESUME (krea2) — wired + smoke-proven
+- The save/load-state fns existed in `training/lora_save.mojo` (`save_lora_train_state` writes
+  A/B + `adam_m`/`adam_v`; `load_lora_train_state` reads them; `load_lora_for_resume` = A/B-only warm).
+  The krea2 trainer never called them — now wired:
+  - `save_krea2_lora_state()` writes a `<ckpt>.state` sidecar (A/B + AdamW moments, block×slot order)
+    at every plain-LoRA save.
+  - argv extended: `train_krea2 <cache> <steps> <config> [<resume_ckpt>] [<start_step>]`.
+    `.state` path → FULL resume (moments); plain PEFT path → WARM start (moments zeroed). Step loop
+    runs `range(start_step, steps)`.
+- SMOKE PASS: 2-step run saved `.state` (2.1GB, F32 moments); resume logged "FULL resume … resuming
+  at step 2", step output started at 2 with the same loss as the scratch run (trajectory continues).
+- eri2 continuation: WARM-started from `eri2_krea2_1000` (predates the fix, no moments) at step 1000 →
+  running to 2000; checkpoints from 1500 on carry full `.state` for exact future resume.

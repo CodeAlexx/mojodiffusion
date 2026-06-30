@@ -514,3 +514,31 @@ The trained adapter has NOT yet been sample-verified — see follow-up #1.
 - Config: `serenitymojo/configs/krea2_eri2.json`. Cache: `/home/alex/eri2_stage_512/`.
 - Output: `/home/alex/trainings/krea2_eri2_lora/`. Ledger: MJ-1030, MJ-1031 (eng-knowledge).
 - Parity ledger: `serenitymojo/models/krea2/parity/KREA2_TRAINING_PARITY_LEDGER.md`.
+
+## 2026-06-29 — 1024 render + FULL resume (details in the parity ledger)
+
+### Render a 1024 cfg-6 image from a trained LoRA (resident, NO disk reads)
+The OOM on 24GB is fixed by an ENV VAR, not code — `MODULAR_DEVICE_CONTEXT_SYNC_MODE=true`
+drains deferred async frees so resident fp8 (12GB) + 1024 cfg-6 (2 forwards) fits (~6.5min).
+```
+# 1) encode the prompt (loads the ~22GB TE; prints LT_POS/LT_NEG):
+LD_LIBRARY_PATH=$LIBS /tmp/krea2_encode_cli "vrtlEri2, <prompt>" ""
+# 2) set krea2_pipeline.mojo comptime LT_POS=<measured>, CFG_SCALE, HEIGHT/WIDTH=1024; build -O2 + cshim
+# 3) render with the LoRA + the env var:
+MODULAR_DEVICE_CONTEXT_SYNC_MODE=true LD_LIBRARY_PATH=$LIBS \
+  /tmp/krea2_pipeline_1024 --lora /home/alex/trainings/krea2_eri2_lora/eri2_krea2_NNNN.safetensors
+# -> output/krea2_prompt2_1024.png.lora.png  (full-canvas, trained likeness)
+```
+- cfg>1 needs a negative: cache must have `context_uncond` — re-stage with `stage_dir/uncond.txt` (empty)
+  then `krea2_prepare`. The eri2 uncond cache is `/home/alex/eri2_stage_512/cache_uncond.safetensors`.
+- The INLINE 1024 sampler is geometry-broken (corner-confined) — use this pipeline path for 1024.
+
+### FULL LoRA resume (save AdamW moments + continue at step N)
+Every plain-LoRA save now writes a `<ckpt>.state` sidecar (A/B + `adam_m`/`adam_v`). To continue:
+```
+train_krea2 <cache> <steps> <config> <resume_ckpt> <start_step>
+#   <resume_ckpt> = <ckpt>.state  -> FULL resume (moments restored)
+#   <resume_ckpt> = plain PEFT    -> WARM start (moments zeroed; for pre-2026-06-29 ckpts)
+```
+Smoke-proven (resume at step 2 matches the scratch trajectory). Checkpoints predating
+2026-06-29 (e.g. `eri2_krea2_1000`) have no `.state` → warm-start only.

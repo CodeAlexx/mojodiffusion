@@ -113,7 +113,7 @@ comptime LH = HEIGHT // 8      # 128
 comptime LW = WIDTH // 8       # 128
 comptime IMGLEN = (LH // 2) * (LW // 2)   # 4096 (gh*gw)
 comptime STEPS = 20
-comptime CFG_SCALE = Float32(4.5)
+comptime CFG_SCALE = Float32(6.0)
 comptime SEED = UInt64(88888)
 comptime OUT_PNG = "/home/alex/mojodiffusion/output/krea2_prompt2_1024.png"
 
@@ -121,7 +121,7 @@ comptime OUT_PNG = "/home/alex/mojodiffusion/output/krea2_prompt2_1024.png"
 # context's LT differs). Default prompts (krea2_paths): the astronaut prompt ->
 # L_full=53, LT_POS=19 ; the empty negative -> L_full=39, LT_NEG=5. The encode
 # child (krea2_encode_cli) prints the measured LT to update these for a new prompt.
-comptime LT_POS = 114          # prompt 2 v2 (subject-focused prose), measured by krea2_encode_cli
+comptime LT_POS = 31           # vrtlEri2 garden-portrait prompt, measured by krea2_encode_cli
 comptime LT_NEG = 5
 comptime LFULL_POS = LT_POS + IMGLEN   # 492 + 4096 = 4588
 comptime LFULL_NEG = LT_NEG + IMGLEN   # 5   + 4096 = 4101

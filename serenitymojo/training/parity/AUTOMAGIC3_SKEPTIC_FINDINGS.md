@@ -18,7 +18,20 @@ what the oracle does NOT exercise, plus one documentation lie.
 
 ## BLOCKER
 
-### B1 — bf16 LoRA params get plain RNE writeback; the reference's STOCHASTIC ROUNDING (its documented improvement #4) is silently dropped → the weight effectively does not learn at LoRA lr.
+### B1 — RESOLVED + ORACLE-GATED (2026-06-29)
+The SR writeback was implemented (`automagic3_writeback_bf16_sr` / `sr_truncate_f32_to_bits`
+in automagic3.mojo, wired via levers + the krea2 trainer's `levers_optimizer_step_host`)
+and is now oracle-tested. Gate: `automagic3_sr_parity_gate.mojo` (Mojo) vs
+`gen_sr_oracle.py` (ai-toolkit `Automagic3._sr_truncate`). SR is random, so parity is
+DISTRIBUTIONAL: at fixed fractional positions between two bf16 grid points, the Mojo P(round-up)
+matches the analytic fraction and ai-toolkit's oracle within MC error (N=2e6), and the mean is
+UNBIASED (|bias| ~1e-6). Measured P(up) @ frac 0.10/0.25/0.50/0.75/0.90: Mojo
+0.100/0.250/0.500/0.750/0.900 == oracle 0.100/0.250/0.500/0.750/0.900. The algorithm is
+bit-identical (add uniform [0,2^16) into dropped mantissa bits → mask → narrow); only the RNG
+source differs. **automagic3 on bf16 LoRA now learns correctly — the B1 failure mode is fixed
+and verified.** Original finding (kept for history):
+
+### B1 (original) — bf16 LoRA params get plain RNE writeback; the reference's STOCHASTIC ROUNDING (its documented improvement #4) is silently dropped → the weight effectively does not learn at LoRA lr.
 
 This is the load-bearing one. The port header (automagic3.mojo:48-49, 552-553)
 and the Rust note both claim *"our LoRA params are F32 / F32 writeback only"*.

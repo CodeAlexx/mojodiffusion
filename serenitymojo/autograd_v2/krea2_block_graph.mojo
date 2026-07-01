@@ -39,7 +39,7 @@
 #    compute_gate_grad=False), the oracle's call).
 #
 # Frozen (untracked, id 0 -> null edges, C7): base weights wq/wk/wv/gate/wo/
-# mlp_*, the rms scales (scale+1), cos/sin tables, the 6 mod chunks, the zero
+# mlp_*, the raw rms scales, cos/sin tables, the 6 mod chunks, the zero
 # fork tensor, and the 8 LoRA A/B (krea2 LoRA grads ride out-of-band, not leaves).
 #
 # real_len = None / == L (FULL attention, math sdpa_nomask, DETERMINISTIC) is the
@@ -51,7 +51,6 @@ from std.gpu.host import DeviceContext
 from std.collections import Optional, Dict
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
-from serenitymojo.io.dtype import STDtype
 from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.ops.tensor_algebra import zeros_device, zeros_device_slab, reshape_owned
 from serenitymojo.autograd_v2.node import TArc, arc_view
@@ -62,7 +61,7 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
 from serenitymojo.models.klein.lora_block import LoraAdapterDevice
 from serenitymojo.autograd_v2.ops_record import (
-    record_rms_norm_dx,
+    record_krea2_rms_norm_dx,
     record_modulate,
     record_rope,
     record_sdpa,
@@ -74,7 +73,7 @@ from serenitymojo.autograd_v2.ops_record import (
     record_repeat_kv,
     record_sigmoid,
     record_krea2_proj_lora,
-    record_rms_norm_dx_slab,
+    record_krea2_rms_norm_dx_slab,
     record_modulate_slab,
     record_rope_slab,
     record_swiglu_slab,
@@ -94,14 +93,13 @@ from serenitymojo.models.krea2.krea2_block import (
     Krea2BlockGrads,
     Krea2LoraGrad,
     _mod6,
-    _add_scale_one,
     _linear_lora as _k2_linear_lora,
     krea2_single_stream_block_lora as _k2_fwd,
+    krea2_rmsnorm as _krea2_rmsnorm,
 )
 # attn-only x1 recompute ops (no-grad; bounds the recompute to the attn branch so
 # its acts free before the segments run — the whole-block forward would stack ~6GB
 # of mlp acts on top of the segment slab).
-from serenitymojo.ops.norm import rms_norm as _rms_norm
 from serenitymojo.ops.elementwise import modulate as _modulate, residual_gate as _residual_gate
 from serenitymojo.ops.rope import rope_interleaved as _rope
 from serenitymojo.ops.gqa_backward import repeat_kv_f32 as _repeat_kv
@@ -160,16 +158,12 @@ def krea2_single_stream_block_graph_backward[
     var postscale = mods[3]
     var postshift = mods[4]
     var postgate = mods[5]
-    # bf16 fix: the oracle casts (scale+1) to the activation dtype before the
-    # norm backward (krea2_block.mojo:684) — rms_norm_backward_dx RAISES on an
-    # F32 weight against bf16 acts. No-op in the F32 bit gate; required for the
-    # bf16 engine-arm path. (Whole-block slab/capture is blocked on 24GB — the
-    # fine-grained slab one-block peak measured ~20GB at L=4864; see ledger.)
-    var act_dt = x_in[].dtype()
-    var prenorm_w = TArc(cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), act_dt, ctx))
-    var postnorm_w = TArc(cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), act_dt, ctx))
-    var qnorm_w = TArc(cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), act_dt, ctx))
-    var knorm_w = TArc(cast_tensor(_add_scale_one(w.knorm_scale[], ctx), act_dt, ctx))
+    # Krea2 RMSNorm records RAW checkpoint scale. The +1 reparam happens inside
+    # krea2_rmsnorm / krea2_rmsnorm_backward_dx in F32, matching OneTrainer.
+    var prenorm_w = w.prenorm_scale.copy()
+    var postnorm_w = w.postnorm_scale.copy()
+    var qnorm_w = w.qnorm_scale.copy()
+    var knorm_w = w.knorm_scale.copy()
 
     # block input x: the ONE tracked leaf (its accumulated grad = the returned
     # d_x). Zero-copy re-box so the id stamp never mutates the shared saved arc.
@@ -181,7 +175,7 @@ def krea2_single_stream_block_graph_backward[
 
     # ── ATTENTION branch (krea2_block.mojo:379-448) ──────────────────────────
     # xm = modulate((1+prenorm)*x, prescale, preshift)
-    var xn = record_rms_norm_dx(g, x, prenorm_w, eps, ctx)
+    var xn = record_krea2_rms_norm_dx(g, x, prenorm_w, eps, ctx)
     var xm = record_modulate(g, xn, prescale, preshift, 0, ctx)
 
     # C15 balanced-tree fork for the 4-way d_xm (see file header): xm_a feeds
@@ -203,9 +197,9 @@ def krea2_single_stream_block_graph_backward[
     var k_pre = record_reshape(g, k, [1, L, KVHEADS, HEADDIM], ctx)
     var v = record_reshape(g, v_lin, [1, L, KVHEADS, HEADDIM], ctx)
 
-    # QKNorm over HEADDIM (weight = scale+1, FROZEN); v untouched.
-    var q_rms = record_rms_norm_dx(g, q_pre, qnorm_w, eps, ctx)
-    var k_rms = record_rms_norm_dx(g, k_pre, knorm_w, eps, ctx)
+    # QKNorm over HEADDIM (raw scale, FROZEN); v untouched.
+    var q_rms = record_krea2_rms_norm_dx(g, q_pre, qnorm_w, eps, ctx)
+    var k_rms = record_krea2_rms_norm_dx(g, k_pre, knorm_w, eps, ctx)
 
     # RoPE on q,k (per-head tiled tables, frozen).
     var cos_q_a = arc_view(cos_q)
@@ -232,7 +226,7 @@ def krea2_single_stream_block_graph_backward[
     var x1 = record_residual_gate(g, x, pregate, a, ctx)
 
     # ── MLP branch (krea2_block.mojo:450-459) ────────────────────────────────
-    var xn2 = record_rms_norm_dx(g, x1, postnorm_w, eps, ctx)
+    var xn2 = record_krea2_rms_norm_dx(g, x1, postnorm_w, eps, ctx)
     var xm2 = record_modulate(g, xn2, postscale, postshift, 0, ctx)
 
     # mlp gate/up (slots 5=mlp_gate 6=mlp_up); swiglu; down (slot 7).
@@ -346,11 +340,10 @@ def krea2_single_stream_block_graph_backward_slab[
     var mods = _mod6(vec, w.mod_lin[], features, ctx)
     var prescale = mods[0]; var preshift = mods[1]; var pregate = mods[2]
     var postscale = mods[3]; var postshift = mods[4]; var postgate = mods[5]
-    var act_dt = x_in[].dtype()
-    var prenorm_w = TArc(cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), act_dt, ctx))
-    var postnorm_w = TArc(cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), act_dt, ctx))
-    var qnorm_w = TArc(cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), act_dt, ctx))
-    var knorm_w = TArc(cast_tensor(_add_scale_one(w.knorm_scale[], ctx), act_dt, ctx))
+    var prenorm_w = w.prenorm_scale.copy()
+    var postnorm_w = w.postnorm_scale.copy()
+    var qnorm_w = w.qnorm_scale.copy()
+    var knorm_w = w.knorm_scale.copy()
 
     var x_t = Tensor(x_in[].buf.copy(), x_in[].shape(), x_in[].dtype())
     x_t.set_id(g.fresh_tensor_id())
@@ -359,7 +352,7 @@ def krea2_single_stream_block_graph_backward_slab[
     var x = TArc(x_t^)
 
     # ── ATTENTION branch ─────────────────────────────────────────────────────
-    var xn = record_rms_norm_dx_slab(g, x, prenorm_w, eps, ctx, slab)
+    var xn = record_krea2_rms_norm_dx_slab(g, x, prenorm_w, eps, ctx, slab)
     var xm = record_modulate_slab(g, xn, prescale, preshift, 0, ctx, slab)
     # C15 balanced-tree fork for the 4-way d_xm: xm_a→{wq,wk}, xm_b→{wv,gate}.
     var zf = TArc(zeros_device_slab(xm[].shape(), xm[].dtype(), ctx, slab))
@@ -372,8 +365,8 @@ def krea2_single_stream_block_graph_backward_slab[
     var q_pre = record_reshape(g, wq.y, [1, L, HEADS, HEADDIM], ctx)
     var k_pre = record_reshape(g, wk.y, [1, L, KVHEADS, HEADDIM], ctx)
     var v = record_reshape(g, wv.y, [1, L, KVHEADS, HEADDIM], ctx)
-    var q_rms = record_rms_norm_dx_slab(g, q_pre, qnorm_w, eps, ctx, slab)
-    var k_rms = record_rms_norm_dx_slab(g, k_pre, knorm_w, eps, ctx, slab)
+    var q_rms = record_krea2_rms_norm_dx_slab(g, q_pre, qnorm_w, eps, ctx, slab)
+    var k_rms = record_krea2_rms_norm_dx_slab(g, k_pre, knorm_w, eps, ctx, slab)
     var q_rope = record_rope_slab(g, q_rms, arc_view(cos_q), arc_view(sin_q), ctx, slab)
     var k_rope = record_rope_slab(g, k_rms, arc_view(cos_k), arc_view(sin_k), ctx, slab)
     var k_full = record_repeat_kv_slab(g, k_rope, L, KVHEADS, n_rep, HEADDIM, ctx, slab)
@@ -397,7 +390,7 @@ def krea2_single_stream_block_graph_backward_slab[
     var x1 = record_residual_gate_slab(g, x, pregate, wo.y, ctx, slab)
 
     # ── MLP branch ───────────────────────────────────────────────────────────
-    var xn2 = record_rms_norm_dx_slab(g, x1, postnorm_w, eps, ctx, slab)
+    var xn2 = record_krea2_rms_norm_dx_slab(g, x1, postnorm_w, eps, ctx, slab)
     var xm2 = record_modulate_slab(g, xn2, postscale, postshift, 0, ctx, slab)
     var mg = _proj_sl(g, xm2, w.mlp_gate_w, lora.mlp_gate_w, M, features, mlpdim, ctx, slab)
     var mu = _proj_sl(g, xm2, w.mlp_up_w, lora.mlp_up_w, M, features, mlpdim, ctx, slab)
@@ -452,7 +445,7 @@ def _mlp_segment_bwd(
     _ = g.leaf(x1_id)
     var x1b = TArc(x1_t^)
     var M = L
-    var xn2 = record_rms_norm_dx_slab(g, x1b, postnorm_w, eps, ctx, slab)
+    var xn2 = record_krea2_rms_norm_dx_slab(g, x1b, postnorm_w, eps, ctx, slab)
     var xm2 = record_modulate_slab(g, xn2, postscale, postshift, 0, ctx, slab)
     var mg = _proj_sl(g, xm2, w.mlp_gate_w, lora.mlp_gate_w, M, features, mlpdim, ctx, slab)
     var mu = _proj_sl(g, xm2, w.mlp_up_w, lora.mlp_up_w, M, features, mlpdim, ctx, slab)
@@ -515,7 +508,7 @@ def _attn_segment_bwd[
     var x_id = x_t.id
     _ = g.leaf(x_id)
     var xb = TArc(x_t^)
-    var xn = record_rms_norm_dx_slab(g, xb, prenorm_w, eps, ctx, slab)
+    var xn = record_krea2_rms_norm_dx_slab(g, xb, prenorm_w, eps, ctx, slab)
     var xm = record_modulate_slab(g, xn, prescale, preshift, 0, ctx, slab)
     var zf = TArc(zeros_device_slab(xm[].shape(), xm[].dtype(), ctx, slab))
     var xm_a = record_add_slab(g, xm, zf, ctx, slab)
@@ -527,8 +520,8 @@ def _attn_segment_bwd[
     var q_pre = record_reshape(g, wq.y, [1, L, HEADS, HEADDIM], ctx)
     var k_pre = record_reshape(g, wk.y, [1, L, KVHEADS, HEADDIM], ctx)
     var v = record_reshape(g, wv.y, [1, L, KVHEADS, HEADDIM], ctx)
-    var q_rms = record_rms_norm_dx_slab(g, q_pre, qnorm_w, eps, ctx, slab)
-    var k_rms = record_rms_norm_dx_slab(g, k_pre, knorm_w, eps, ctx, slab)
+    var q_rms = record_krea2_rms_norm_dx_slab(g, q_pre, qnorm_w, eps, ctx, slab)
+    var k_rms = record_krea2_rms_norm_dx_slab(g, k_pre, knorm_w, eps, ctx, slab)
     var q_rope = record_rope_slab(g, q_rms, arc_view(cos_q), arc_view(sin_q), ctx, slab)
     var k_rope = record_rope_slab(g, k_rms, arc_view(cos_k), arc_view(sin_k), ctx, slab)
     var k_full = record_repeat_kv_slab(g, k_rope, L, KVHEADS, n_rep, HEADDIM, ctx, slab)
@@ -580,10 +573,10 @@ def _recompute_x1_attn[
     recompute footprint doesn't stack on the segment slab. attn sdpa = comptime
     KREA2_SLAB_FLASH (flash trainer / math gate) — MUST match the segment recorder
     so the recomputed x1 == the forward x1 the backward differentiates. The norm
-    weights are the SAME act-dtype-cast (scale+1) the recorder uses."""
+    weights are the SAME raw Krea2 scale tensors the recorder uses."""
     comptime n_rep = HEADS // KVHEADS
     var M = L
-    var xn = _rms_norm(x[], prenorm_w[], eps, ctx)
+    var xn = _krea2_rmsnorm(x[], prenorm_w[], eps, ctx)
     var xm = _modulate(xn, prescale[], preshift[], ctx)
     var q = _k2_linear_lora(xm, w.wq[], lora.wq, M, ctx)
     var k = _k2_linear_lora(xm, w.wk[], lora.wk, M, ctx)
@@ -592,8 +585,8 @@ def _recompute_x1_attn[
     var q_pre = _reshape_owned(q^, [1, L, HEADS, HEADDIM])
     var k_pre = _reshape_owned(k^, [1, L, KVHEADS, HEADDIM])
     var v = _reshape_owned(v_lin^, [1, L, KVHEADS, HEADDIM])
-    var q_rms = _rms_norm(q_pre, qnorm_w[], eps, ctx)
-    var k_rms = _rms_norm(k_pre, knorm_w[], eps, ctx)
+    var q_rms = _krea2_rmsnorm(q_pre, qnorm_w[], eps, ctx)
+    var k_rms = _krea2_rmsnorm(k_pre, knorm_w[], eps, ctx)
     var q_rope = _rope(q_rms, cos_q, sin_q, ctx)
     var k_rope = _rope(k_rms, cos_k, sin_k, ctx)
     var k_full = _repeat_kv(k_rope, L, KVHEADS, n_rep, HEADDIM, ctx)
@@ -647,15 +640,13 @@ def krea2_single_stream_block_graph_backward_seg[
     comptime features = HEADS * HEADDIM
     var mlpdim = w.mlp_gate_w[].shape()[0]
     var scale = Float32(1.0) / sqrt(Float32(HEADDIM))
-    var act_dt = x_in[].dtype()
-
     var mods = _mod6(vec, w.mod_lin[], features, ctx)
     var prescale = mods[0]; var preshift = mods[1]; var pregate = mods[2]
     var postscale = mods[3]; var postshift = mods[4]; var postgate = mods[5]
-    var prenorm_w = TArc(cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), act_dt, ctx))
-    var postnorm_w = TArc(cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), act_dt, ctx))
-    var qnorm_w = TArc(cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), act_dt, ctx))
-    var knorm_w = TArc(cast_tensor(_add_scale_one(w.knorm_scale[], ctx), act_dt, ctx))
+    var prenorm_w = w.prenorm_scale.copy()
+    var postnorm_w = w.postnorm_scale.copy()
+    var qnorm_w = w.qnorm_scale.copy()
+    var knorm_w = w.knorm_scale.copy()
 
     # ── recompute x1 (no-grad ATTN-ONLY forward; acts free on helper return,
     # bounding the recompute to the attn branch — the whole-block forward would

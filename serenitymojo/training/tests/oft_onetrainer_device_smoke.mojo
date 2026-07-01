@@ -97,6 +97,7 @@ def main() raises:
 
     var x_dev = Tensor.from_host(x.copy(), [M, IN], STDtype.F32, ctx)
     var vec_dev = Tensor.from_host(vec.copy(), [r, ne], STDtype.F32, ctx)
+    var vec_bf16 = Tensor.from_host(vec.copy(), [r, ne], STDtype.BF16, ctx)
     var rot = oft_ot_rotate_b4(x_dev, vec_dev, ctx)
     var rot_h = rot.to_host(ctx)
     var rot_ref = oft_ot_forward(x.copy(), vec.copy(), W.copy(), M, IN, IN, b, r)
@@ -109,9 +110,17 @@ def main() raises:
     _require_close(String("f32 backward d_vec"), grads.d_vec.to_host(ctx), host_grads.d_vec, NREL_BAR)
 
     var x_bf16 = Tensor.from_host(x.copy(), [M, IN], STDtype.BF16, ctx)
-    var rot_bf16 = oft_ot_rotate_b4(x_bf16, vec_dev, ctx)
+    var rot_bf16 = oft_ot_rotate_b4(x_bf16, vec_bf16, ctx)
     if rot_bf16.dtype() != STDtype.BF16:
         raise Error("FAIL: BF16 rotation did not preserve storage dtype")
     _require_close(String("bf16 forward rotate"), rot_bf16.to_host(ctx), rot_ref, BF16_NREL_BAR)
 
-    print("PASS -- device OneTrainer-OFT block-size-4 forward/backward matches host oracle")
+    var grads_bf16_vec = oft_ot_rotate_backward_b4(
+        dxr_dev, Tensor.from_host(x.copy(), [M, IN], STDtype.F32, ctx), vec_bf16, ctx,
+    )
+    if grads_bf16_vec.d_vec.dtype() != STDtype.F32:
+        raise Error("FAIL: OFT d_vec compute gradient did not stay F32")
+    _require_close(String("bf16 vec backward d_x"), grads_bf16_vec.d_x.to_host(ctx), host_grads.d_x, BF16_NREL_BAR)
+    _require_close(String("bf16 vec backward d_vec"), grads_bf16_vec.d_vec.to_host(ctx), host_grads.d_vec, BF16_NREL_BAR)
+
+    print("PASS -- device OneTrainer-OFT block-size-4 forward/backward matches host oracle with F32 or BF16 vec storage")

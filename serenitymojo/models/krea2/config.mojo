@@ -28,15 +28,19 @@
 #   network (LoRASpecialNetwork, lora_special.py:338-405) wraps every nn.Linear
 #   (LINEAR_MODULES, lora_special.py:29) found UNDER a SingleStreamDiT-class
 #   module whose dotted name contains "blocks" (transformer_only filter,
-#   get_transformer_block_names()=["blocks"], krea2.py:492-493). That is the
-#   8 per-block Linears:
+#   get_transformer_block_names()=["blocks"], krea2.py:492-493). That includes
+#   the 28 main `diffusion_model.blocks.*` blocks and also the text-fusion
+#   `txtfusion.layerwise_blocks.*` / `txtfusion.refiner_blocks.*` modules.
+#   The main single-stream block has 8 Linears:
 #       attn.wq  attn.wk  attn.wv  attn.gate  attn.wo
 #       mlp.gate  mlp.up  mlp.down
 #   NOTE: `mod.lin` is a torch.nn.Parameter (DoubleSharedModulation.lin,
 #   mmdit.py:125), NOT an nn.Linear, so ai-toolkit does NOT LoRA-wrap it. The
-#   prenorm/postnorm/qknorm scales are also non-Linear → frozen. So per block:
-#   8 LoRA adapters (NOT 9 — the brief's "mod_lin" target is not what the oracle
-#   produces; flagged in the handoff).
+#   prenorm/postnorm/qknorm scales are also non-Linear → frozen. So each wrapped
+#   block contributes 8 LoRA adapters (NOT 9 — the brief's "mod_lin" target is
+#   not what the oracle produces; flagged in the handoff). The current Mojo
+#   product trainer wires only the 28 main blocks; the missing text-fusion LoRA
+#   surface is tracked by scripts/check_krea2_trainable_surface.py.
 #
 #   rank/alpha: NetworkConfig defaults rank=4, alpha=1.0 (config_modules.py:180-
 #   183); scale = alpha/rank (lora_special.py:116). The shipped krea2.json pins

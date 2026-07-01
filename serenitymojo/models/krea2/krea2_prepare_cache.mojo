@@ -6,7 +6,7 @@
 # the GATED Mojo encoders (QwenImageVaeEncoder, Qwen3Tokenizer + encode_krea2_stack)
 # into the indexed safetensors training cache the KreaCacheReader streams:
 #
-#   clean.<i>     [1, 16, LH, LW]      F32   normalized VAE latent (ai-toolkit batch.latents)
+#   clean.<i>     [1, 16, LH, LW]      BF16  normalized VAE latent (ai-toolkit boundary)
 #   context.<i>   [1, LT, 12, 2560]    BF16  Qwen3-VL-4B 12-layer stack (== krea2_forward `context`)
 #   text_len.<i>  [1]                  F32   LT (caption natural token count - DROP_IDX)
 #   (optional)    context_uncond [1,LTu,12,2560] BF16 + text_len_uncond [1] F32
@@ -164,7 +164,7 @@ def main() raises:
     var tensors = List[TArc]()
 
     for i in range(n):
-        # ── image -> deterministic MEAN latent [1,16,LH,LW] -> normalized F32 ──
+        # ── image -> deterministic MEAN latent [1,16,LH,LW] -> normalized BF16 ──
         # The VAE encoder is loaded per bucket (here a single square SIZE). Loading
         # it once outside the loop would be ideal, but the comptime IH/IW pin forces a
         # compile-time arm; we branch on SIZE and load the matching encoder once.
@@ -193,10 +193,11 @@ def main() raises:
                 String("[krea2-prepare] unsupported SIZE ") + String(size)
                 + " (add a comptime QwenImageVaeEncoder arm for it)"
             )
-        # encode_mean returns BF16 (BF16 VAE weights); the cache stores the F32
-        # normalized latent + mean/std are F32 → upcast before normalize.
+        # encode_mean returns BF16 (BF16 VAE weights). Normalize with F32 math, then
+        # store the cache boundary as BF16, matching the product trainer path.
         var lat_f32 = cast_tensor(lat_mean, STDtype.F32, ctx)
-        var clean = _normalize_latent(lat_f32, mean_ch, std_ch, ctx)  # F32 normalized
+        var clean_f32 = _normalize_latent(lat_f32, mean_ch, std_ch, ctx)
+        var clean = cast_tensor(clean_f32, STDtype.BF16, ctx)
 
         # ── caption -> 12-layer Qwen3-VL stack [1,LT,12,2560] BF16 ──
         var prompt = _read_text(stage_dir + "/prompt." + String(i) + ".txt")

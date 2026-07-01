@@ -5,7 +5,7 @@
 # W_orig + DoRA(A,B,m) without materializing a dense LoRA carrier or a full
 # W_eff tensor. Denominators are detached exactly like the host reference.
 #
-# First production slice: A/B storage is BF16, magnitude/den/grads are F32, and
+# First production slice: A/B/magnitude storage is BF16, den/grads are F32, and
 # x/d_y/d_x preserve their storage dtype. F32 is used only inside compute.
 
 from std.collections import List, Optional
@@ -98,11 +98,16 @@ def dora_device_from_host(d: DoRAAdapter, ctx: DeviceContext) raises -> DoRAAdap
     var a = Tensor.from_host(_bf16_to_f32_list(d.a), [d.rank, d.in_f], STDtype.BF16, ctx)
     var b = Tensor.from_host(_bf16_to_f32_list(d.b), [d.out_f, d.rank], STDtype.BF16, ctx)
     var mlen = d.out_f if d.wd_on_out else d.in_f
-    var m = Tensor.from_host(d.m.copy(), [mlen], STDtype.F32, ctx)
+    var m = Tensor.from_host(d.m.copy(), [mlen], STDtype.BF16, ctx)
     return DoRAAdapterDevice(
         TArc(a^), TArc(b^), TArc(m^), d.rank, d.in_f, d.out_f,
         d.alpha, d.scale, d.eps, d.wd_on_out, _bf16_all_zero(d.b),
     )
+
+
+def _m_f32_for_compute(d: DoRAAdapterDevice, ctx: DeviceContext) raises -> Tensor:
+    # Resident DoRA magnitude stays BF16; kernels consume a transient F32 view.
+    return cast_tensor(d.m[], STDtype.F32, ctx, False)
 
 
 @always_inline
@@ -447,8 +452,8 @@ def _rows_and_in(x: Tensor, expected_in: Int, name: String) raises -> List[Int]:
 def _validate_dora_device(d: DoRAAdapterDevice, name: String) raises:
     if d.a[].dtype() != STDtype.BF16 or d.b[].dtype() != STDtype.BF16:
         raise Error(name + String(": A/B storage must be BF16"))
-    if d.m[].dtype() != STDtype.F32:
-        raise Error(name + String(": magnitude storage must be F32"))
+    if d.m[].dtype() != STDtype.BF16:
+        raise Error(name + String(": magnitude storage must be BF16"))
     if d.a[].shape() != [d.rank, d.in_f]:
         raise Error(name + String(": A shape mismatch"))
     if d.b[].shape() != [d.out_f, d.rank]:
@@ -566,7 +571,7 @@ def _matmul_f32_to_f32(
 
 
 def _launch_scale_input_cols_bf16(
-    x: Tensor, d: DoRAAdapterDevice, den: Tensor,
+    x: Tensor, d: DoRAAdapterDevice, m_f32: Tensor, den: Tensor,
     out_buf: DeviceBuffer[DType.uint8], rows: Int, ctx: DeviceContext,
 ) raises:
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d.in_f))
@@ -575,7 +580,7 @@ def _launch_scale_input_cols_bf16(
         x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
     )
     var M = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        d.m[].buf.unsafe_ptr().bitcast[Float32](), m_rl
+        m_f32.buf.unsafe_ptr().bitcast[Float32](), m_rl
     )
     var DEN = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         den.buf.unsafe_ptr().bitcast[Float32](), m_rl
@@ -613,7 +618,7 @@ def _launch_finish_forward_bf16(
 
 
 def _launch_g_from_dwp_per_input(
-    dwp: Tensor, d: DoRAAdapterDevice, den: Tensor,
+    dwp: Tensor, d: DoRAAdapterDevice, m_f32: Tensor, den: Tensor,
     g_buf: DeviceBuffer[DType.uint8], ctx: DeviceContext,
 ) raises:
     var oi_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](d.out_f, d.in_f))
@@ -622,7 +627,7 @@ def _launch_g_from_dwp_per_input(
         dwp.buf.unsafe_ptr().bitcast[Float32](), oi_rl
     )
     var M = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        d.m[].buf.unsafe_ptr().bitcast[Float32](), m_rl
+        m_f32.buf.unsafe_ptr().bitcast[Float32](), m_rl
     )
     var DEN = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         den.buf.unsafe_ptr().bitcast[Float32](), m_rl
@@ -674,8 +679,8 @@ def _launch_dm_from_dwp_per_input[wdt: DType](
 
 
 def _launch_finish_dx_bf16(
-    base_dx: Tensor, low_dx: Tensor, d: DoRAAdapterDevice, den: Tensor,
-    dx_buf: DeviceBuffer[DType.uint8], rows: Int, has_low: Int,
+    base_dx: Tensor, low_dx: Tensor, d: DoRAAdapterDevice, m_f32: Tensor,
+    den: Tensor, dx_buf: DeviceBuffer[DType.uint8], rows: Int, has_low: Int,
     ctx: DeviceContext,
 ) raises:
     var mi_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, d.in_f))
@@ -687,7 +692,7 @@ def _launch_finish_dx_bf16(
         low_dx.buf.unsafe_ptr().bitcast[Float32](), mi_rl
     )
     var M = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        d.m[].buf.unsafe_ptr().bitcast[Float32](), m_rl
+        m_f32.buf.unsafe_ptr().bitcast[Float32](), m_rl
     )
     var DEN = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         den.buf.unsafe_ptr().bitcast[Float32](), m_rl
@@ -761,9 +766,10 @@ def dora_substitution_denominators_device(
     var mlen = d.out_f if d.wd_on_out else d.in_f
     var den_buf = ctx.enqueue_create_buffer[DType.uint8](mlen * 4)
     if d.delta_zero:
+        var m_f32 = _m_f32_for_compute(d, ctx)
         var m_rl0 = RuntimeLayout[_DYN2].row_major(IndexList[2](1, mlen))
         var M0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-            d.m[].buf.unsafe_ptr().bitcast[Float32](), m_rl0
+            m_f32.buf.unsafe_ptr().bitcast[Float32](), m_rl0
         )
         var DEN0 = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             den_buf.unsafe_ptr().bitcast[Float32](), m_rl0
@@ -796,8 +802,9 @@ def _dora_forward_per_input_bf16_fast(
     x: Tensor, w_orig: Tensor, d: DoRAAdapterDevice, den: Tensor,
     rows: Int, ctx: DeviceContext,
 ) raises -> Tensor:
+    var m_f32 = _m_f32_for_compute(d, ctx)
     var xs_buf = ctx.enqueue_create_buffer[DType.uint8](rows * d.in_f * STDtype.BF16.byte_size())
-    _launch_scale_input_cols_bf16(x, d, den, xs_buf, rows, ctx)
+    _launch_scale_input_cols_bf16(x, d, m_f32, den, xs_buf, rows, ctx)
     var xs = Tensor(xs_buf^, _shape2(rows, d.in_f), STDtype.BF16)
     var base = _matmul_bf16_to_f32(
         xs, w_orig, rows, d.out_f, d.in_f, ctx, False, True,
@@ -831,6 +838,7 @@ def _dora_backward_per_input_bf16_fast(
     d_y: Tensor, x: Tensor, w_orig: Tensor, d: DoRAAdapterDevice,
     den: Tensor, rows: Int, ctx: DeviceContext,
 ) raises -> DoRADeviceGrads:
+    var m_f32 = _m_f32_for_compute(d, ctx)
     var base_dx = _matmul_bf16_to_f32(
         d_y, w_orig, rows, d.in_f, d.out_f, ctx, False, False,
     )
@@ -838,7 +846,7 @@ def _dora_backward_per_input_bf16_fast(
         d_y, x, d.out_f, d.in_f, rows, ctx, True, False,
     )
     var g_buf = ctx.enqueue_create_buffer[DType.uint8](d.out_f * d.in_f * 4)
-    _launch_g_from_dwp_per_input(dwp, d, den, g_buf, ctx)
+    _launch_g_from_dwp_per_input(dwp, d, m_f32, den, g_buf, ctx)
     var g = Tensor(g_buf^, _shape2(d.out_f, d.in_f), STDtype.F32)
 
     var dm_buf = ctx.enqueue_create_buffer[DType.uint8](d.in_f * 4)
@@ -857,7 +865,7 @@ def _dora_backward_per_input_bf16_fast(
         var dx_buf = ctx.enqueue_create_buffer[DType.uint8](
             rows * d.in_f * STDtype.BF16.byte_size()
         )
-        _launch_finish_dx_bf16(base_dx, base_dx, d, den, dx_buf, rows, 0, ctx)
+        _launch_finish_dx_bf16(base_dx, base_dx, d, m_f32, den, dx_buf, rows, 0, ctx)
         return DoRADeviceGrads(
             d_a^,
             d_b^,
@@ -879,7 +887,7 @@ def _dora_backward_per_input_bf16_fast(
         var dx_buf = ctx.enqueue_create_buffer[DType.uint8](
             rows * d.in_f * STDtype.BF16.byte_size()
         )
-        _launch_finish_dx_bf16(base_dx, low_dx, d, den, dx_buf, rows, 1, ctx)
+        _launch_finish_dx_bf16(base_dx, low_dx, d, m_f32, den, dx_buf, rows, 1, ctx)
         return DoRADeviceGrads(
             d_a^,
             d_b^,
@@ -892,6 +900,7 @@ def _dora_backward_per_input_bf16_zero_fast(
     d_y: Tensor, x: Tensor, w_orig: Tensor, d: DoRAAdapterDevice,
     den: Tensor, rows: Int, ctx: DeviceContext,
 ) raises -> DoRADeviceGrads:
+    var m_f32 = _m_f32_for_compute(d, ctx)
     var base_dx = _matmul_bf16_to_f32(
         d_y, w_orig, rows, d.in_f, d.out_f, ctx, False, False,
     )
@@ -899,7 +908,7 @@ def _dora_backward_per_input_bf16_zero_fast(
     var xs_buf = ctx.enqueue_create_buffer[DType.uint8](
         rows * d.in_f * STDtype.BF16.byte_size()
     )
-    _launch_scale_input_cols_bf16(x, d, den, xs_buf, rows, ctx)
+    _launch_scale_input_cols_bf16(x, d, m_f32, den, xs_buf, rows, ctx)
     var xs = Tensor(xs_buf^, _shape2(rows, d.in_f), STDtype.BF16)
     var t = _matmul_bf16_to_f32(
         xs, d.a[], rows, d.rank, d.in_f, ctx, False, True,
@@ -919,7 +928,7 @@ def _dora_backward_per_input_bf16_zero_fast(
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](
         rows * d.in_f * STDtype.BF16.byte_size()
     )
-    _launch_finish_dx_bf16(base_dx, base_dx, d, den, dx_buf, rows, 0, ctx)
+    _launch_finish_dx_bf16(base_dx, base_dx, d, m_f32, den, dx_buf, rows, 0, ctx)
     return DoRADeviceGrads(
         Tensor(da_buf^, _shape2(d.rank, d.in_f), STDtype.F32),
         d_b^,
@@ -930,7 +939,7 @@ def _dora_backward_per_input_bf16_zero_fast(
 
 def _launch_forward[xdt: DType, wdt: DType](
     ctx: DeviceContext,
-    x: Tensor, w: Tensor, d: DoRAAdapterDevice, den: Tensor,
+    x: Tensor, w: Tensor, d: DoRAAdapterDevice, m_f32: Tensor, den: Tensor,
     out_buf: DeviceBuffer[DType.uint8],
     rows: Int, mlen: Int,
 ) raises:
@@ -939,7 +948,7 @@ def _launch_forward[xdt: DType, wdt: DType](
     var W = LayoutTensor[wdt, _DYN2, MutAnyOrigin](w.buf.unsafe_ptr().bitcast[Scalar[wdt]](), all_rl[1])
     var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](d.a[].buf.unsafe_ptr().bitcast[BFloat16](), all_rl[2])
     var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](d.b[].buf.unsafe_ptr().bitcast[BFloat16](), all_rl[3])
-    var M = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](d.m[].buf.unsafe_ptr().bitcast[Float32](), all_rl[4])
+    var M = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](m_f32.buf.unsafe_ptr().bitcast[Float32](), all_rl[4])
     var DEN = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](den.buf.unsafe_ptr().bitcast[Float32](), all_rl[4])
     var Y = LayoutTensor[xdt, _DYN2, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Scalar[xdt]](), all_rl[5])
     var total = rows * d.out_f
@@ -986,18 +995,19 @@ def dora_substitution_forward_device(
     var out_shape = x.shape()
     out_shape[len(out_shape) - 1] = d.out_f
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](rows * d.out_f * x.dtype().byte_size())
+    var m_f32 = _m_f32_for_compute(d, ctx)
     var xdt = x.dtype().to_mojo_dtype()
     var wdt = w_orig.dtype().to_mojo_dtype()
     if xdt == DType.float32 and wdt == DType.float32:
-        _launch_forward[DType.float32, DType.float32](ctx, x, w_orig, d, den, out_buf, rows, mlen)
+        _launch_forward[DType.float32, DType.float32](ctx, x, w_orig, d, m_f32, den, out_buf, rows, mlen)
     elif xdt == DType.float32 and wdt == DType.bfloat16:
-        _launch_forward[DType.float32, DType.bfloat16](ctx, x, w_orig, d, den, out_buf, rows, mlen)
+        _launch_forward[DType.float32, DType.bfloat16](ctx, x, w_orig, d, m_f32, den, out_buf, rows, mlen)
     elif xdt == DType.float32 and wdt == DType.float16:
-        _launch_forward[DType.float32, DType.float16](ctx, x, w_orig, d, den, out_buf, rows, mlen)
+        _launch_forward[DType.float32, DType.float16](ctx, x, w_orig, d, m_f32, den, out_buf, rows, mlen)
     elif xdt == DType.bfloat16 and wdt == DType.bfloat16:
-        _launch_forward[DType.bfloat16, DType.bfloat16](ctx, x, w_orig, d, den, out_buf, rows, mlen)
+        _launch_forward[DType.bfloat16, DType.bfloat16](ctx, x, w_orig, d, m_f32, den, out_buf, rows, mlen)
     elif xdt == DType.float16 and wdt == DType.float16:
-        _launch_forward[DType.float16, DType.float16](ctx, x, w_orig, d, den, out_buf, rows, mlen)
+        _launch_forward[DType.float16, DType.float16](ctx, x, w_orig, d, m_f32, den, out_buf, rows, mlen)
     else:
         raise Error("dora_substitution_forward_device: unsupported x/w dtype pair")
     return Tensor(out_buf^, out_shape^, x.dtype())
@@ -1005,7 +1015,7 @@ def dora_substitution_forward_device(
 
 def _launch_backward[xdt: DType, wdt: DType](
     ctx: DeviceContext,
-    d_y: Tensor, x: Tensor, w: Tensor, d: DoRAAdapterDevice, den: Tensor,
+    d_y: Tensor, x: Tensor, w: Tensor, d: DoRAAdapterDevice, m_f32: Tensor, den: Tensor,
     da_buf: DeviceBuffer[DType.uint8],
     db_buf: DeviceBuffer[DType.uint8],
     dm_buf: DeviceBuffer[DType.uint8],
@@ -1017,7 +1027,7 @@ def _launch_backward[xdt: DType, wdt: DType](
     var W = LayoutTensor[wdt, _DYN2, MutAnyOrigin](w.buf.unsafe_ptr().bitcast[Scalar[wdt]](), all_rl[1])
     var A = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](d.a[].buf.unsafe_ptr().bitcast[BFloat16](), all_rl[2])
     var B = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](d.b[].buf.unsafe_ptr().bitcast[BFloat16](), all_rl[3])
-    var M = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](d.m[].buf.unsafe_ptr().bitcast[Float32](), all_rl[4])
+    var M = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](m_f32.buf.unsafe_ptr().bitcast[Float32](), all_rl[4])
     var DEN = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](den.buf.unsafe_ptr().bitcast[Float32](), all_rl[4])
     var GY = LayoutTensor[xdt, _DYN2, MutAnyOrigin](d_y.buf.unsafe_ptr().bitcast[Scalar[xdt]](), all_rl[5])
     var DA = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](da_buf.unsafe_ptr().bitcast[Float32](), all_rl[2])
@@ -1077,18 +1087,19 @@ def dora_substitution_backward_device(
     var db_buf = ctx.enqueue_create_buffer[DType.uint8](d.out_f * d.rank * 4)
     var dm_buf = ctx.enqueue_create_buffer[DType.uint8](mlen * 4)
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](rows * d.in_f * x.dtype().byte_size())
+    var m_f32 = _m_f32_for_compute(d, ctx)
     var xdt = x.dtype().to_mojo_dtype()
     var wdt = w_orig.dtype().to_mojo_dtype()
     if xdt == DType.float32 and wdt == DType.float32:
-        _launch_backward[DType.float32, DType.float32](ctx, d_y, x, w_orig, d, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
+        _launch_backward[DType.float32, DType.float32](ctx, d_y, x, w_orig, d, m_f32, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
     elif xdt == DType.float32 and wdt == DType.bfloat16:
-        _launch_backward[DType.float32, DType.bfloat16](ctx, d_y, x, w_orig, d, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
+        _launch_backward[DType.float32, DType.bfloat16](ctx, d_y, x, w_orig, d, m_f32, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
     elif xdt == DType.float32 and wdt == DType.float16:
-        _launch_backward[DType.float32, DType.float16](ctx, d_y, x, w_orig, d, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
+        _launch_backward[DType.float32, DType.float16](ctx, d_y, x, w_orig, d, m_f32, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
     elif xdt == DType.bfloat16 and wdt == DType.bfloat16:
-        _launch_backward[DType.bfloat16, DType.bfloat16](ctx, d_y, x, w_orig, d, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
+        _launch_backward[DType.bfloat16, DType.bfloat16](ctx, d_y, x, w_orig, d, m_f32, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
     elif xdt == DType.float16 and wdt == DType.float16:
-        _launch_backward[DType.float16, DType.float16](ctx, d_y, x, w_orig, d, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
+        _launch_backward[DType.float16, DType.float16](ctx, d_y, x, w_orig, d, m_f32, den, da_buf, db_buf, dm_buf, dx_buf, rows, mlen)
     else:
         raise Error("dora_substitution_backward_device: unsupported x/w dtype pair")
     return DoRADeviceGrads(

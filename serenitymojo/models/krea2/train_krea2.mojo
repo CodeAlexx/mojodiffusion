@@ -54,9 +54,11 @@
 
 from std.gpu.host import DeviceContext
 from std.collections import List, Optional
+from std.builtin.dtype import DType
 from std.math import sqrt
 from std.memory import ArcPointer
 from std.sys import argv
+from std.sys.defines import get_defined_int
 from std.time import perf_counter_ns
 
 
@@ -74,7 +76,11 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.linear import linear
+from serenitymojo.ops.activations import gelu
 from serenitymojo.ops.tensor_algebra import reshape, concat, slice, permute, zeros_device
+from serenitymojo.ops.linalg_backward import linear_backward_dx
+from serenitymojo.ops.activation_backward import gelu_backward
 
 # ── shared training pipeline (REUSE) ──────────────────────────────────────────
 from serenitymojo.training.train_config import TrainConfig
@@ -82,16 +88,41 @@ from serenitymojo.training.train_step import LoraAdapter
 from serenitymojo.training.schedule import (
     sample_timestep_logit_normal, flow_match_noise_target,
 )
-from serenitymojo.training.levers import levers_loss_grad
-from serenitymojo.training.lora_adamw_plain_fused import fused_lora_adamw_plain_step
+from serenitymojo.training.levers import levers_loss_active, levers_loss_grad
+from serenitymojo.training.device_loss import device_mse_loss_grad
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState,
+    fused_lora_adamw_plain_step,
+    lora_adamw_plain_device_state_init,
+    lora_adamw_plain_device_state_sync_moments,
+    lora_adamw_plain_device_state_sync_params,
+    lora_adamw_plain_preloaded_shared_abi_train_step,
+)
+from serenitymojo.training.training_arena import TrainingArena
 from serenitymojo.training.levers import (
     levers_optimizer_active, levers_optimizer_step_host,
     levers_optimizer_validate, LeversOptimizerState,
 )
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft, save_lora_train_state, load_lora_train_state, load_lora_for_resume
 from serenitymojo.training.progress_display import print_trainer_progress
-from serenitymojo.training.automagic3_device import automagic3_device_step, Automagic3DeviceState
-from serenitymojo.training.train_config import TRAIN_OPTIMIZER_AUTOMAGIC3
+from serenitymojo.training.automagic3_device import (
+    automagic3_device_step_result,
+    Automagic3DeviceState,
+)
+from serenitymojo.training.train_config import (
+    TRAIN_OPTIMIZER_ADAMW,
+    TRAIN_OPTIMIZER_ADAFACTOR,
+    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
+    TRAIN_OPTIMIZER_ADAMW_8BIT,
+    TRAIN_OPTIMIZER_AUTOMAGIC3,
+)
+from serenitymojo.training.perf_record import (
+    PERF_FAST_PATH_HOST_GRAD_COMPAT,
+    PERF_LANE_MOJO_CURRENT,
+    TrainingPerfRecord,
+    emit_training_perf_record,
+    empty_training_phase_timings,
+)
 from serenitymojo.io.ffi import sys_mkdirs, sys_remove
 from serenitymojo.training.sample_prompt_config import (
     SamplePromptConfig, read_sample_prompt_config,
@@ -181,9 +212,11 @@ from serenitymojo.models.krea2.krea2_block import Krea2BlockLora, Krea2BlockWeig
 from serenitymojo.models.krea2.krea2_stack import (
     Krea2StackLora, Krea2StackForward, Krea2StackLoraGrads,
     Krea2StackDirectDoRAGradsT, Krea2StackDirectOFTGradsT,
+    Krea2StackDeviceGradWrite,
     Krea2StreamFinal, KREA2_SLOTS_PER_BLOCK,
     krea2_stack_lora_forward_streamed, krea2_stack_lora_backward_streamed,
     krea2_stack_lora_backward_streamed_dev,
+    krea2_stack_lora_backward_streamed_adamw_device_grads,
     krea2_stack_dora_forward_streamed, krea2_stack_dora_backward_streamed_dev,
     krea2_stack_oft_forward_streamed, krea2_stack_oft_backward_streamed_dev,
     _load_krea2_block_streamed, _load_krea2_block_resident,
@@ -197,7 +230,16 @@ from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.models.dit.krea2_dit import (
     krea2_first, krea2_temb, krea2_tmlp, krea2_tproj, krea2_txtmlp,
     krea2_text_fusion, build_krea2_rope,
+    krea2_rmsnorm, krea2_rmsnorm_backward_dx,
     _wb, _scale, _txtf_bundle, Krea2TextFusionWeights,
+)
+from serenitymojo.models.krea2.krea2_text_fusion_lora import (
+    Krea2TextFusionLora,
+    Krea2TextFusionForward,
+    Krea2TextFusionBackwardDeviceGrads,
+    krea2_text_fusion_lora_forward,
+    krea2_text_fusion_lora_backward_dev,
+    krea2_text_fusion_grads_to_adamw_state,
 )
 
 comptime TArc = ArcPointer[Tensor]
@@ -214,6 +256,12 @@ comptime TXTHD = 128                 # txtdim/txtheads = 2560/20
 comptime NLAYERS_TXT = 12
 comptime TDIM = 256
 comptime NBLOCKS = 28
+comptime KREA2_TXTFUSION_BLOCKS = 4
+comptime KREA2_TXTFUSION_MLPDIM = 6912
+comptime KREA2_MAIN_ADAPTERS = NBLOCKS * KREA2_SLOTS_PER_BLOCK
+comptime KREA2_TXTFUSION_ADAPTERS = KREA2_TXTFUSION_BLOCKS * KREA2_SLOTS_PER_BLOCK
+comptime KREA2_FULL_SURFACE_ADAPTERS = KREA2_MAIN_ADAPTERS + KREA2_TXTFUSION_ADAPTERS
+comptime KREA2_TXTFUSION_LORA = get_defined_int["KREA2_TXTFUSION_LORA", 0]() != 0
 comptime EPS = Float32(1.0e-5)
 comptime THETA = Float32(1.0e3)
 
@@ -271,11 +319,14 @@ comptime IMGLEN = (LH // 2) * (LW // 2)   # 1024 (512px) | 4096 (1024px)
 # KREA2_RES_512 (above) picks 512px(64×64 latent) vs 1024px(128×128); LTMAX is the
 # caption bucket length (must be >= the dataset's max caption token count — the loop
 # fails loud at L<the LT>LTMAX check> otherwise, and the cache reader fails loud on a
-# resolution/latent-shape mismatch). The CURRENT values are the eri2/ai-toolkit 512px
-# run (KREA2_RES_512=True, LTMAX=384 ≥ eri2's max LT 282). For 1024px/giger: set
-# KREA2_RES_512=False + LTMAX=768 and rebuild. (Runtime config-dispatch on cfg.resolution
-# is the documented follow-up — would parameterize main on [LH,LW,LTMAX].)
-comptime LTMAX = 384
+# resolution/latent-shape mismatch). The default values are the eri2/ai-toolkit
+# 512px run (KREA2_RES_512=True, LTMAX=384 >= eri2's max LT 282). The separate
+# 512px giger real-cache smoke uses `mojo build -DKREA2_LTMAX=896` so it does not
+# change the reproducible synthetic-devicegrad default. For 1024px/giger: set
+# KREA2_RES_512=False + KREA2_LTMAX=768 and rebuild. (Runtime config-dispatch on
+# cfg.resolution is the documented follow-up — would parameterize main on
+# [LH,LW,LTMAX].)
+comptime LTMAX = get_defined_int["KREA2_LTMAX", 384]()
 comptime LFULL = LTMAX + IMGLEN           # 4864 — the single comptime arm for ALL samples
 
 # ── INLINE-SAMPLE resolution arm (independent of train res) ───────────────────
@@ -310,12 +361,168 @@ comptime KREA2_V2_SLAB = False
 # ── DEVICE-grad LoRA carrier (HAND-CHAIN path only; independent of V2_GRAPH). ──
 # False (DEFAULT, byte-identical) = the streamed hand-chain materializes each
 # adapter's dA/dB host-side inside the block backward (224 to_host syncs/step).
-# True = krea2_stack_lora_backward_streamed_dev keeps all dA/dB on DEVICE through
-# the whole stack backward and the trainer does ONE batched D2H per step (224
-# syncs → 1) — SAME GEMM math, so the loss is bit-identical (the gate). The device
-# grads free at step end after the batched D2H (leak guard). Only the `else`
-# (hand-chain) dispatch reads this; the V2_GRAPH/SLAB arms are unaffected.
+# True = krea2_stack_lora_backward_streamed_dev keeps each block's dA/dB on
+# DEVICE until a per-block batched D2H under the existing streaming fence
+# (224 syncs -> 28). The krea2devicegrad smoke uses the newer sibling path
+# krea2_stack_lora_backward_streamed_adamw_device_grads, which copies each
+# block's transient device grads D2D into shared AdamW state instead of decoding
+# host grad lists. Only the `else` (hand-chain) dispatch reads this flag; the
+# V2_GRAPH/SLAB arms are unaffected.
 comptime KREA2_DEVICE_LORA_GRAD = False
+
+
+def _krea2_update_min_free(ctx: DeviceContext, min_free: Int) raises -> Int:
+    var mem = ctx.get_memory_info()
+    var free_now = Int(mem[0])
+    if min_free <= 0 or free_now < min_free:
+        return free_now
+    return min_free
+
+
+def _krea2_optimizer_name(cfg: TrainConfig) -> String:
+    if cfg.optimizer == TRAIN_OPTIMIZER_ADAMW:
+        return String("AdamW")
+    if cfg.optimizer == TRAIN_OPTIMIZER_ADAFACTOR:
+        return String("Adafactor")
+    if cfg.optimizer == TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW:
+        return String("ScheduleFreeAdamW")
+    if cfg.optimizer == TRAIN_OPTIMIZER_ADAMW_8BIT:
+        return String("AdamW8bit")
+    if cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
+        return String("Automagic3")
+    return String("optimizer_") + String(cfg.optimizer)
+
+
+def _krea2_is_device_grad_smoke_arg(arg: String) -> Bool:
+    return arg == String("krea2devicegrad")
+
+
+def _krea2_string_ends_with(s: String, suffix: String) -> Bool:
+    var n = s.byte_length()
+    var m = suffix.byte_length()
+    if m > n:
+        return False
+    var sb = s.as_bytes()
+    var tb = suffix.as_bytes()
+    for i in range(m):
+        if sb[n - m + i] != tb[i]:
+            return False
+    return True
+
+
+def _krea2_hash_update(h: UInt64, s: String) -> UInt64:
+    # Stable scorecard grouping key, not a cryptographic hash.
+    var out = h
+    var bytes = s.as_bytes()
+    for i in range(s.byte_length()):
+        out = ((out * UInt64(131)) + UInt64(bytes[i])) % UInt64(1000000007)
+    return out
+
+
+def _krea2_perf_config_hash(cfg: TrainConfig, cache_path: String, steps: Int) -> String:
+    var h = UInt64(2166136261) % UInt64(1000000007)
+    h = _krea2_hash_update(h, cfg.name)
+    h = _krea2_hash_update(h, cfg.checkpoint)
+    h = _krea2_hash_update(h, cache_path)
+    h = _krea2_hash_update(h, String(cfg.lora_rank))
+    h = _krea2_hash_update(h, String(cfg.lora_alpha))
+    h = _krea2_hash_update(h, String(cfg.lr))
+    h = _krea2_hash_update(h, String(cfg.optimizer))
+    h = _krea2_hash_update(h, String(cfg.adapter_algo))
+    h = _krea2_hash_update(h, String(LH * 8))
+    h = _krea2_hash_update(h, String(LTMAX))
+    h = _krea2_hash_update(h, String(steps))
+    return String("krea2-h") + String(Int(h))
+
+
+def _krea2_perf_flags(
+    cfg: TrainConfig, sample_enabled: Bool, device_grad_smoke: Bool,
+) -> String:
+    var flags = String("strict")
+    if levers_loss_active(cfg):
+        flags += String(",host-loss-levers")
+    else:
+        flags += String(",device-mse-loss")
+    comptime if KREA2_GPU_CLIP:
+        flags += String(",gpu-clip-folded")
+    else:
+        flags += String(",host-clip")
+    comptime if KREA2_DEVICE_LORA_GRAD:
+        flags += String(",device-lora-grad-staging")
+    else:
+        flags += String(",host-grad-compat")
+    flags += String(",visible-transfer-counts")
+    flags += String(",ltmax-") + String(LTMAX)
+    comptime if KREA2_PHASE_TIMING:
+        flags += String(",phase-timing-stdout")
+    comptime if KREA2_RES_512_SYNTH:
+        flags += String(",synthetic-cache")
+    else:
+        flags += String(",real-cache")
+    if cfg.quantized_resident == String("fp8_e4m3"):
+        flags += String(",fp8-resident-base")
+    else:
+        flags += String(",bf16-streamed-base")
+    if sample_enabled:
+        flags += String(",inline-samples")
+    if device_grad_smoke:
+        flags += String(",krea2devicegrad-smoke,preloaded-device-grads,streaming-sync-counts")
+    comptime if KREA2_TXTFUSION_LORA:
+        flags += String(",txtfusion-lora-opt-in")
+    flags += String(",adapter-") + adapter_algo_name(cfg.adapter_algo)
+    return flags^
+
+
+def _krea2_emit_perf_record(
+    cfg: TrainConfig,
+    cache_path: String,
+    steps: Int,
+    start_step: Int,
+    measured_loop_seconds: Float64,
+    total_vram_bytes: Int,
+    min_free_bytes: Int,
+    visible_sync_count: Int,
+    visible_host_device_transfer_count: Int,
+    visible_full_tensor_readback_count: Int,
+    final_save_seconds: Float64,
+    sample_enabled: Bool,
+    device_grad_smoke: Bool,
+) raises:
+    var measured_steps = steps - start_step
+    if measured_steps <= 0:
+        print("[training-perf-json] skipped: measured_steps <= 0")
+        return
+    var peak_vram = 0
+    if total_vram_bytes > 0 and min_free_bytes > 0 and total_vram_bytes > min_free_bytes:
+        peak_vram = total_vram_bytes - min_free_bytes
+    var full_tensor_readbacks = visible_full_tensor_readback_count
+    if full_tensor_readbacks == 0:
+        full_tensor_readbacks = measured_steps
+    var phases = empty_training_phase_timings()
+    phases.save_seconds = final_save_seconds
+    var rec = TrainingPerfRecord(
+        String("krea2"),
+        PERF_LANE_MOJO_CURRENT,
+        _krea2_perf_config_hash(cfg, cache_path, steps),
+        String("BF16_BASE_BF16_LORA_F32_OPT"),
+        cfg.lora_rank,
+        cfg.batch_size,
+        String(LH * 8),
+        _krea2_optimizer_name(cfg),
+        _krea2_perf_flags(cfg, sample_enabled, device_grad_smoke),
+        0,
+        measured_steps,
+        measured_loop_seconds / Float64(measured_steps),
+        phases^,
+        peak_vram,
+        visible_host_device_transfer_count,
+        full_tensor_readbacks,
+        visible_sync_count,
+        PERF_FAST_PATH_HOST_GRAD_COMPAT,
+        String("krea2-stack-direct"),
+        String(""),
+    )
+    emit_training_perf_record(rec)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -432,11 +639,45 @@ struct _Cond(Movable):
         self.sin = sin^
 
 
+struct _CondTxtFusion(Movable):
+    var combined: TArc        # [1, LFULL, F]
+    var blk_vec: Tensor       # [1, 6*F]
+    var tmlp_out: Tensor      # [1, 1, F]
+    var cos: Tensor           # [LFULL, HEADDIM/2]
+    var sin: Tensor           # [LFULL, HEADDIM/2]
+    var txt_fwd: Krea2TextFusionForward
+    var txtmlp_in: TArc       # [1, LT, KREA2_TXT_DIM] txtfusion output
+    var txtmlp_norm: TArc     # [1, LT, KREA2_TXT_DIM] RMSNorm output
+    var txtmlp_h: TArc        # [1, LT, FEATURES] pre-GELU
+
+    def __init__(
+        out self,
+        var combined: TArc,
+        var blk_vec: Tensor,
+        var tmlp_out: Tensor,
+        var cos: Tensor,
+        var sin: Tensor,
+        var txt_fwd: Krea2TextFusionForward,
+        var txtmlp_in: TArc,
+        var txtmlp_norm: TArc,
+        var txtmlp_h: TArc,
+    ):
+        self.combined = combined^
+        self.blk_vec = blk_vec^
+        self.tmlp_out = tmlp_out^
+        self.cos = cos^
+        self.sin = sin^
+        self.txt_fwd = txt_fwd^
+        self.txtmlp_in = txtmlp_in^
+        self.txtmlp_norm = txtmlp_norm^
+        self.txtmlp_h = txtmlp_h^
+
+
 def _build_conditioning[LT: Int, LFULL: Int](
     cond_w: Krea2ResidentCond,   # RESIDENT conditioning weights (loaded once; no
         # per-step `st` read). Numerically identical to the old per-step `_wb`/
         # `_scale`/`_txtf_bundle` loads — same bf16 weights, just loaded once.
-    img: Tensor,            # [1, IMGLEN, 64] F32  PATCHIFIED noised latent
+    img: Tensor,            # [1, IMGLEN, 64] BF16 PATCHIFIED noised latent
     context: Tensor,        # [1, LT, 12, 2560] BF16   (LT == LTMAX bucket length)
     pos: Tensor,            # [1, LFULL, 3] F32 (txt zeros [LTMAX] + img grid)
     t: Tensor,              # [1] F32 timestep (in [0,1])
@@ -446,8 +687,8 @@ def _build_conditioning[LT: Int, LFULL: Int](
         # cuDNN flash-padmask (tail-only) masks the pad. real_len = lt + IMGLEN.
     ctx: DeviceContext,
 ) raises -> _Cond:
-    # 1) img = first(img) → [1, IMGLEN, F]. img is F32 → cast bf16 to match the bf16
-    # `first` head (= reference v.to(bf16) on the head; img feed is bf16 in inference).
+    # 1) img = first(img) → [1, IMGLEN, F]. Keep the token boundary BF16; the cast is
+    # a compatibility no-op for current caches and handles any older F32 cache input.
     var img_bf = cast_tensor(img, STDtype.BF16, ctx)
     var img_e = krea2_first(
         img_bf, cond_w.first_w[], cond_w.first_b[], ctx,
@@ -525,6 +766,174 @@ def _build_conditioning[LT: Int, LFULL: Int](
     return _Cond(TArc(combined^), blk_vec2^, t3^, rcos^, rsin^)
 
 
+def _reorder_pos_for_combined[LT: Int, LFULL: Int](
+    pos: Tensor,
+    real_text_len: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var pos_re: Tensor
+    if real_text_len < LT:
+        var pos_real = slice(pos, 1, 0, real_text_len, ctx)
+        var pos_img = slice(pos, 1, LT, LFULL - LT, ctx)
+        var pos_pad = slice(pos, 1, real_text_len, LT - real_text_len, ctx)
+        var pos_head = concat(1, ctx, pos_real, pos_img)
+        pos_re = concat(1, ctx, pos_head, pos_pad)
+    else:
+        pos_re = pos.clone(ctx)
+    return pos_re^
+
+
+def _build_conditioning_txtfusion_lora[LT: Int, LFULL: Int](
+    cond_w: Krea2ResidentCond,
+    img: Tensor,
+    context: Tensor,
+    pos: Tensor,
+    t: Tensor,
+    real_text_len: Int,
+    txt_lora: Krea2TextFusionLora,
+    ctx: DeviceContext,
+) raises -> _CondTxtFusion:
+    var img_bf = cast_tensor(img, STDtype.BF16, ctx)
+    var img_e = krea2_first(
+        img_bf, cond_w.first_w[], cond_w.first_b[], ctx,
+    )
+
+    var te = krea2_temb(t, TDIM, ctx, STDtype.BF16)
+    var t_vec = krea2_tmlp(
+        te,
+        cond_w.tmlp0_w[], cond_w.tmlp0_b[],
+        cond_w.tmlp2_w[], cond_w.tmlp2_b[],
+        ctx,
+    )
+    var t3 = reshape(t_vec, [1, 1, FEATURES], ctx)
+
+    var blk_vec = krea2_tproj(
+        t3, cond_w.tproj1_w[], cond_w.tproj1_b[], ctx,
+    )
+    var blk_vec2 = reshape(blk_vec, [1, 6 * FEATURES], ctx)
+
+    var txt_fwd = krea2_text_fusion_lora_forward[LT, NLAYERS_TXT, TXTHEADS, TXTHD](
+        context, cond_w.lw0, cond_w.lw1,
+        cond_w.projector_w[],
+        cond_w.rf0, cond_w.rf1,
+        txt_lora, Optional[Tensor](None), ctx,
+    )
+    var txtmlp_in = txt_fwd.out.copy()
+    var txtmlp_norm = krea2_rmsnorm(
+        txtmlp_in[], cond_w.txtmlp0_scale[], EPS, ctx,
+    )
+    var txtmlp_h = linear(
+        txtmlp_norm, cond_w.txtmlp1_w[],
+        Optional[Tensor](cond_w.txtmlp1_b[].clone(ctx)), ctx,
+    )
+    var txtmlp_hg = gelu(txtmlp_h, ctx)
+    var ctx_proj = linear(
+        txtmlp_hg, cond_w.txtmlp3_w[],
+        Optional[Tensor](cond_w.txtmlp3_b[].clone(ctx)), ctx,
+    )
+
+    var combined: Tensor
+    if real_text_len < LT:
+        var real_text = slice(ctx_proj, 1, 0, real_text_len, ctx)
+        var pad_text = slice(ctx_proj, 1, real_text_len, LT - real_text_len, ctx)
+        var head = concat(1, ctx, real_text, img_e)
+        combined = concat(1, ctx, head, pad_text)
+    else:
+        combined = concat(1, ctx, ctx_proj, img_e)
+
+    var pos_re = _reorder_pos_for_combined[LT, LFULL](pos, real_text_len, ctx)
+    var pos_flat = reshape(pos_re, [LFULL * 3], ctx)
+    var axes = List[Int]()
+    axes.append(32); axes.append(48); axes.append(48)
+    var rope = build_krea2_rope(pos_flat, axes, THETA, ctx, STDtype.F32)
+    var rcos = rope[0].clone(ctx)
+    var rsin = rope[1].clone(ctx)
+
+    return _CondTxtFusion(
+        TArc(combined^), blk_vec2^, t3^, rcos^, rsin^,
+        txt_fwd^, txtmlp_in^, TArc(txtmlp_norm^), TArc(txtmlp_h^),
+    )
+
+
+def _combined_text_grad[LT: Int, LFULL: Int](
+    d_combined: Tensor,
+    real_text_len: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if real_text_len >= LT:
+        return slice(d_combined, 1, 0, LT, ctx)
+    if real_text_len <= 0:
+        return slice(d_combined, 1, IMGLEN, LT, ctx)
+    var d_real = slice(d_combined, 1, 0, real_text_len, ctx)
+    var d_pad = slice(
+        d_combined, 1, real_text_len + IMGLEN, LT - real_text_len, ctx
+    )
+    return concat(1, ctx, d_real, d_pad)
+
+
+def _txtmlp_backward_dx[LT: Int](
+    d_ctx_proj_in: Tensor,
+    cond_w: Krea2ResidentCond,
+    cond: _CondTxtFusion,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var d_ctx_proj: Tensor
+    if d_ctx_proj_in.dtype() == cond.txtmlp_h[].dtype():
+        d_ctx_proj = Tensor(
+            d_ctx_proj_in.buf.copy(), d_ctx_proj_in.shape(), d_ctx_proj_in.dtype()
+        )
+    else:
+        d_ctx_proj = cast_tensor(d_ctx_proj_in, cond.txtmlp_h[].dtype(), ctx)
+    var d_hg = linear_backward_dx(
+        d_ctx_proj, cond_w.txtmlp3_w[], LT, FEATURES, FEATURES, ctx,
+    )
+    var d_hg3 = reshape(d_hg, [1, LT, FEATURES], ctx)
+    var d_h = gelu_backward(d_hg3, cond.txtmlp_h[], ctx)
+    var d_norm = linear_backward_dx(
+        d_h, cond_w.txtmlp1_w[], LT, KREA2_TXT_DIM, FEATURES, ctx,
+    )
+    var d_norm3 = reshape(d_norm, [1, LT, KREA2_TXT_DIM], ctx)
+    return krea2_rmsnorm_backward_dx(
+        d_norm3,
+        cond.txtmlp_in[],
+        cond_w.txtmlp0_scale[],
+        EPS,
+        ctx,
+    )
+
+
+def _preload_txtfusion_grads_from_combined[
+    LT: Int, LFULL: Int
+](
+    d_combined: Tensor,
+    cond_w: Krea2ResidentCond,
+    cond: _CondTxtFusion,
+    txt_lora: Krea2TextFusionLora,
+    real_text_len: Int,
+    mut adamw_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+) raises -> Int:
+    comptime assert LFULL - LT == IMGLEN, "Krea2 txtfusion grad bridge image length mismatch"
+    var d_ctx_proj = _combined_text_grad[LT, LFULL](d_combined, real_text_len, ctx)
+    var d_ctx_fused = _txtmlp_backward_dx[LT](d_ctx_proj, cond_w, cond, ctx)
+    var txt_grads = krea2_text_fusion_lora_backward_dev[
+        LT, NLAYERS_TXT, TXTHEADS, TXTHD
+    ](
+        d_ctx_fused, cond.txt_fwd,
+        cond_w.lw0, cond_w.lw1, cond_w.projector_w[],
+        cond_w.rf0, cond_w.rf1,
+        txt_lora, Optional[Tensor](None), ctx,
+    )
+    var copied = krea2_text_fusion_grads_to_adamw_state(
+        txt_grads, KREA2_MAIN_ADAPTERS, adamw_state, ctx
+    )
+    # The copied tensors include F32 casts only for AdamW's grad buffer. Keep
+    # them alive until this fence completes the D2D copies into dev_g.
+    ctx.synchronize()
+    _ = len(copied.grads)
+    return copied.grad_count
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ONE TRAINING SAMPLE — comptime-monomorphized on (LT, LFULL). Noises the clean
 # latent in LATENT space, patchifies, builds conditioning, runs the streaming
@@ -540,6 +949,19 @@ struct _StepOut(Movable):
         self.grads = grads^
         self.loss = loss
         self.grad_norm = grad_norm
+
+
+struct _StepOutAdamWDeviceGrads(Movable):
+    var loss: Float32
+    var grad_count: Int
+    var streaming_sync_count: Int
+
+    def __init__(
+        out self, loss: Float32, grad_count: Int, streaming_sync_count: Int
+    ):
+        self.loss = loss
+        self.grad_count = grad_count
+        self.streaming_sync_count = streaming_sync_count
 
 
 struct _StepOutDoRAHost(Movable):
@@ -594,9 +1016,50 @@ struct _StepOutOFT(Movable):
         )
 
 
+struct _VelocityLoss(Movable):
+    var loss: Float32
+    var d_velocity: Tensor
+
+    def __init__(out self, loss: Float32, var d_velocity: Tensor):
+        self.loss = loss
+        self.d_velocity = d_velocity^
+
+    def take_d_velocity(deinit self) -> Tensor:
+        return self.d_velocity^
+
+
+def _velocity_loss(
+    pred: Tensor,
+    target: Tensor,
+    sigma: Float32,
+    cfg: TrainConfig,
+    ctx: DeviceContext,
+) raises -> _VelocityLoss:
+    if not levers_loss_active(cfg):
+        if pred.dtype() == target.dtype():
+            var dev = device_mse_loss_grad(pred, target, pred.dtype(), ctx)
+            var loss = dev.loss
+            return _VelocityLoss(loss, dev^.take_d_pred())
+        # Keep the loss-root gradient in the model prediction boundary dtype.
+        # device_mse_loss_grad casts elements to F32 inside the kernel for MSE and
+        # reduction, then stores d_pred in the requested dtype.
+        var target_pred_dtype = cast_tensor(target, pred.dtype(), ctx)
+        var dev = device_mse_loss_grad(pred, target_pred_dtype, pred.dtype(), ctx)
+        var loss = dev.loss
+        return _VelocityLoss(loss, dev^.take_d_pred())
+
+    # Non-default loss levers (Huber, smooth-L1, flow min-SNR) keep the existing
+    # host semantics until their weighted device kernels are ported and gated.
+    var pred_h = pred.to_host(ctx)
+    var tgt_h = target.to_host(ctx)
+    var lg = levers_loss_grad(pred_h, tgt_h, sigma, cfg)
+    var d_velocity = Tensor.from_host(lg.d_pred, pred.shape(), pred.dtype(), ctx)
+    return _VelocityLoss(lg.loss, d_velocity^)
+
+
 def _train_one_sample(
     st: ShardedSafeTensors, key_prefix: String,
-    clean: Tensor,          # [1, 16, LH, LW] F32 normalized latent
+    clean: Tensor,          # [1, 16, LH, LW] BF16 normalized latent
     context: Tensor,        # [1, LTMAX, 12, 2560] BF16  (PADDED to the bucket)
     pos: Tensor,            # [1, LFULL, 3] F32          (padded grid)
     lt: Int,                # natural caption length (for the additive pad mask)
@@ -617,7 +1080,7 @@ def _train_one_sample(
 
     # ── flow-match noise in LATENT space (before patchify; krea2.py order) ──────
     # x_t = (1-sigma)*clean + sigma*noise ; target = noise - clean  (krea2.py:403).
-    var noise = _gaussian_like(clean, noise_seed, ctx)        # [1,16,LH,LW] F32
+    var noise = _gaussian_like(clean, noise_seed, ctx)        # [1,16,LH,LW] clean dtype
     var fm = flow_match_noise_target(clean, sigma, noise, ctx)
     var noised_lat = fm.x_t.clone(ctx)                        # [1,16,LH,LW]
     # patchify the NOISED latent → img [1, IMGLEN, 64] (== krea2_forward.img).
@@ -653,16 +1116,13 @@ def _train_one_sample(
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_forward", _pt, ctx)
 
-    # ── flow-match MSE loss (levers; default MSE) on the image-token velocity ───
-    var pred_h = fwd.velocity[].to_host(ctx)                  # [IMGLEN*64]
-    var tgt_h = target_img.to_host(ctx)
-    var lg = levers_loss_grad(pred_h, tgt_h, sigma, cfg)
-    var loss = lg.loss
-    var d_velocity = Tensor.from_host(
-        lg.d_pred, [1, IMGLEN, OUT_CH], STDtype.F32, ctx,
-    )
+    # ── flow-match MSE loss on image-token velocity. Default MSE stays on device;
+    # non-default loss levers fall back to the existing host implementation.
+    var vloss = _velocity_loss(fwd.velocity[], target_img, sigma, cfg, ctx)
+    var loss = vloss.loss
+    var d_velocity = vloss^.take_d_velocity()
     comptime if KREA2_PHASE_TIMING:
-        _pt = _phase_ms("loss+to_host", _pt, ctx)
+        _pt = _phase_ms("loss", _pt, ctx)
 
     # ── streaming stack backward (hand-chain default; v2 arm Phase 4b) ──────────
     var grads: Krea2StackLoraGrads
@@ -671,13 +1131,21 @@ def _train_one_sample(
             # engine+slab+FLASH: the 2-segment activation-checkpointed slab backward
             # (alloc-free; per-segment slab ~6.65GB fits the 12GB fp8 base on 24GB).
             # ONE StepSlab allocated once + reset per block; attn = cuDNN flash
-            # (KREA2_SLAB_FLASH=True at build). 8GB slab (the worst segment 6.65GB +
-            # margin). NO capture (capture OFF — the speed is engine+slab+flash).
-            var slab = StepSlab(ctx, 8 * 1024 * 1024 * 1024)
+            # (KREA2_SLAB_FLASH=True at build). LFULL-SIZED slab: the 2-segment peak is
+            # linear in LFULL — MEASURED 1.92GB @ LFULL=1408 (512px) = 1.46MB/token, which
+            # matches the design 6.65GB @ LFULL=4864 (1024px). Size = LFULL*1.6MB/token
+            # (~9% margin) so it's correct at BOTH resolutions and frees ~4GB at 512px vs
+            # the old fixed 8GB → fits alongside the device-automagic3 state (keep automagic3).
+            # NO capture (capture OFF — the speed is engine+slab+flash).
+            var slab = StepSlab(ctx, LFULL * 1_600_000)
             grads = krea2_stack_lora_backward_graph_slab[LFULL, HEADS, KVHEADS, HEADDIM](
                 d_velocity, cond.blk_vec, cond.tmlp_out,
                 st, key_prefix, NBLOCKS, lora, fin, fwd,
                 cond.cos, cond.sin, EPS, ctx, slab, real_len, resident,
+            )
+            print(
+                "[krea2-slab] segment peak_bytes =", slab.peak_bytes(),
+                " capacity =", slab.capacity_bytes(),
             )
         else:
             # Phase 4b: autograd_v2 engine arm (drop-in, SAME conductor loop + slots).
@@ -719,6 +1187,151 @@ def _train_one_sample(
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("grad_norm", _pt, ctx)
     return _StepOut(grads^, loss, gn)
+
+
+def _train_one_sample_adamw_device_grads(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor,
+    context: Tensor,
+    pos: Tensor,
+    lt: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    cond_w: Krea2ResidentCond,
+    sigma: Float32,
+    noise_seed: UInt64,
+    cfg: TrainConfig,
+    mut adamw_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutAdamWDeviceGrads:
+    var _pt = 0
+    comptime if KREA2_PHASE_TIMING:
+        ctx.synchronize(); _pt = Int(perf_counter_ns())
+
+    var noise = _gaussian_like(clean, noise_seed, ctx)
+    var fm = flow_match_noise_target(clean, sigma, noise, ctx)
+    var noised_lat = fm.x_t.clone(ctx)
+    var img = krea2_patchify[LH, LW](noised_lat, ctx)
+    var target_img = krea2_patchify[LH, LW](fm.target, ctx)
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("noise+patchify", _pt, ctx)
+
+    var t1 = _t_scalar(sigma, ctx)
+    var cond = _build_conditioning[LTMAX, LFULL](
+        cond_w, img, context, pos, t1, lt, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("conditioning_fwd", _pt, ctx)
+
+    var real_len = Optional[Int](lt + IMGLEN)
+    var fwd = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
+        cond.combined, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_forward", _pt, ctx)
+
+    var vloss = _velocity_loss(fwd.velocity[], target_img, sigma, cfg, ctx)
+    var loss = vloss.loss
+    var d_velocity = vloss^.take_d_velocity()
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("loss", _pt, ctx)
+
+    comptime if KREA2_V2_GRAPH:
+        raise Error(
+            "krea2devicegrad smoke requires KREA2_V2_GRAPH=False; "
+            + "the preloaded AdamW grad buffer is wired to the streamed hand-chain"
+        )
+
+    var wrote = krea2_stack_lora_backward_streamed_adamw_device_grads[
+        LFULL, HEADS, KVHEADS, HEADDIM
+    ](
+        d_velocity, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin, fwd,
+        cond.cos, cond.sin, EPS, adamw_state, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_backward_device_grads", _pt, ctx)
+    return _StepOutAdamWDeviceGrads(
+        loss, wrote.grad_count, wrote.streaming_sync_count
+    )
+
+
+def _train_one_sample_adamw_device_grads_full_surface(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor,
+    context: Tensor,
+    pos: Tensor,
+    lt: Int,
+    lora: Krea2StackLora,
+    txt_lora: Krea2TextFusionLora,
+    fin: Krea2StreamFinal,
+    cond_w: Krea2ResidentCond,
+    sigma: Float32,
+    noise_seed: UInt64,
+    cfg: TrainConfig,
+    mut adamw_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutAdamWDeviceGrads:
+    var _pt = 0
+    comptime if KREA2_PHASE_TIMING:
+        ctx.synchronize(); _pt = Int(perf_counter_ns())
+
+    var noise = _gaussian_like(clean, noise_seed, ctx)
+    var fm = flow_match_noise_target(clean, sigma, noise, ctx)
+    var noised_lat = fm.x_t.clone(ctx)
+    var img = krea2_patchify[LH, LW](noised_lat, ctx)
+    var target_img = krea2_patchify[LH, LW](fm.target, ctx)
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("noise+patchify", _pt, ctx)
+
+    var t1 = _t_scalar(sigma, ctx)
+    var cond = _build_conditioning_txtfusion_lora[LTMAX, LFULL](
+        cond_w, img, context, pos, t1, lt, txt_lora, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("conditioning_txtfusion_lora_fwd", _pt, ctx)
+
+    var real_len = Optional[Int](lt + IMGLEN)
+    var fwd = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
+        cond.combined, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_forward", _pt, ctx)
+
+    var vloss = _velocity_loss(fwd.velocity[], target_img, sigma, cfg, ctx)
+    var loss = vloss.loss
+    var d_velocity = vloss^.take_d_velocity()
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("loss", _pt, ctx)
+
+    comptime if KREA2_V2_GRAPH:
+        raise Error(
+            "krea2devicegrad txtfusion full-surface requires KREA2_V2_GRAPH=False; "
+            + "the preloaded AdamW grad buffer is wired to the streamed hand-chain"
+        )
+
+    var wrote = krea2_stack_lora_backward_streamed_adamw_device_grads[
+        LFULL, HEADS, KVHEADS, HEADDIM
+    ](
+        d_velocity, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin, fwd,
+        cond.cos, cond.sin, EPS, adamw_state, ctx, real_len, resident,
+    )
+    var txt_grad_count = _preload_txtfusion_grads_from_combined[
+        LTMAX, LFULL
+    ](
+        wrote.d_combined[], cond_w, cond, txt_lora, lt, adamw_state, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack+txtfusion_backward_device_grads", _pt, ctx)
+    return _StepOutAdamWDeviceGrads(
+        loss, wrote.grad_count + txt_grad_count, wrote.streaming_sync_count + 1
+    )
 
 
 def _train_one_sample_dora(
@@ -764,14 +1377,11 @@ def _train_one_sample_dora(
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_forward", _pt, ctx)
 
-    var pred_h = fwd.velocity[].to_host(ctx)
-    var tgt_h = target_img.to_host(ctx)
-    var lg = levers_loss_grad(pred_h, tgt_h, sigma, cfg)
-    var d_velocity = Tensor.from_host(
-        lg.d_pred, [1, IMGLEN, OUT_CH], STDtype.F32, ctx,
-    )
+    var vloss = _velocity_loss(fwd.velocity[], target_img, sigma, cfg, ctx)
+    var loss = vloss.loss
+    var d_velocity = vloss^.take_d_velocity()
     comptime if KREA2_PHASE_TIMING:
-        _pt = _phase_ms("loss+to_host", _pt, ctx)
+        _pt = _phase_ms("loss", _pt, ctx)
 
     var grads = krea2_stack_dora_backward_streamed_dev[LFULL, HEADS, KVHEADS, HEADDIM](
         d_velocity, cond.blk_vec, cond.tmlp_out,
@@ -781,7 +1391,7 @@ def _train_one_sample_dora(
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_backward", _pt, ctx)
 
-    return _StepOutDoRA(grads^, lg.loss)
+    return _StepOutDoRA(grads^, loss)
 
 
 def _train_one_sample_oft(
@@ -827,14 +1437,11 @@ def _train_one_sample_oft(
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_forward", _pt, ctx)
 
-    var pred_h = fwd.velocity[].to_host(ctx)
-    var tgt_h = target_img.to_host(ctx)
-    var lg = levers_loss_grad(pred_h, tgt_h, sigma, cfg)
-    var d_velocity = Tensor.from_host(
-        lg.d_pred, [1, IMGLEN, OUT_CH], STDtype.F32, ctx,
-    )
+    var vloss = _velocity_loss(fwd.velocity[], target_img, sigma, cfg, ctx)
+    var loss = vloss.loss
+    var d_velocity = vloss^.take_d_velocity()
     comptime if KREA2_PHASE_TIMING:
-        _pt = _phase_ms("loss+to_host", _pt, ctx)
+        _pt = _phase_ms("loss", _pt, ctx)
 
     var grads = krea2_stack_oft_backward_streamed_dev[LFULL, HEADS, KVHEADS, HEADDIM](
         d_velocity, cond.blk_vec, cond.tmlp_out,
@@ -844,7 +1451,7 @@ def _train_one_sample_oft(
     comptime if KREA2_PHASE_TIMING:
         _pt = _phase_ms("stack_backward", _pt, ctx)
 
-    return _StepOutOFT(grads^, lg.loss)
+    return _StepOutOFT(grads^, loss)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -863,7 +1470,7 @@ from serenitymojo.ops.random import randn
 
 
 def _gaussian_like(like: Tensor, seed: UInt64, ctx: DeviceContext) raises -> Tensor:
-    return randn(like.shape(), seed, STDtype.F32, ctx)
+    return randn(like.shape(), seed, like.dtype(), ctx)
 
 
 # DIAGNOSTIC (KREA2_RES_512): a SYNTHETIC sample at the comptime LH/LW dims — the
@@ -877,9 +1484,9 @@ from serenitymojo.ops.cast import cast_tensor as _cast_t
 def _synthetic_sample(idx: Int, ctx: DeviceContext) raises -> KreaTrainSample:
     var seed = UInt64(4242) + UInt64(idx)
     var clean = randn(
-        [1, KREA2_LATENT_CHANNELS, LH, LW], seed, STDtype.F32, ctx
+        [1, KREA2_LATENT_CHANNELS, LH, LW], seed, STDtype.BF16, ctx
     )
-    var img = randn([1, IMGLEN, 64], seed + 1, STDtype.F32, ctx)
+    var img = randn([1, IMGLEN, 64], seed + 1, STDtype.BF16, ctx)
     var context = _cast_t(
         randn([1, LTMAX, KREA2_TXT_LAYERS, KREA2_TXT_DIM], seed + 2, STDtype.F32, ctx),
         STDtype.BF16, ctx,
@@ -921,18 +1528,61 @@ def _clip_lists(mut gl: _GradLists, gn: Float32, max_norm: Float32):
 # ── LoRA set: host List[LoraAdapter] (authoritative + AdamW moments) ──────────
 # 8 adapters per block, order matches Krea2BlockLora: wq wk wv gate wo
 # mlp_gate mlp_up mlp_down. in/out from the krea2 dims.
+def _append_krea2_lora_block_surface(
+    mut ad: List[LoraAdapter],
+    rank: Int,
+    alpha: Float32,
+    in_f: Int,
+    q_out: Int,
+    kv_out: Int,
+    mlpdim: Int,
+    seed: UInt64,
+) -> UInt64:
+    var s = seed
+    ad.append(make_lora_adapter(rank, alpha, in_f, q_out, s)); s += 1      # wq
+    ad.append(make_lora_adapter(rank, alpha, in_f, kv_out, s)); s += 1     # wk
+    ad.append(make_lora_adapter(rank, alpha, in_f, kv_out, s)); s += 1     # wv
+    ad.append(make_lora_adapter(rank, alpha, in_f, in_f, s)); s += 1       # gate
+    ad.append(make_lora_adapter(rank, alpha, in_f, in_f, s)); s += 1       # wo
+    ad.append(make_lora_adapter(rank, alpha, in_f, mlpdim, s)); s += 1     # mlp_gate
+    ad.append(make_lora_adapter(rank, alpha, in_f, mlpdim, s)); s += 1     # mlp_up
+    ad.append(make_lora_adapter(rank, alpha, mlpdim, in_f, s)); s += 1     # mlp_down
+    return s
+
+
 def _build_host_lora(rank: Int, alpha: Float32) -> List[LoraAdapter]:
     var ad = List[LoraAdapter]()
     var seed = UInt64(7000)
     for _ in range(NBLOCKS):
-        ad.append(make_lora_adapter(rank, alpha, FEATURES, HEADS * HEADDIM, seed)); seed += 1     # wq
-        ad.append(make_lora_adapter(rank, alpha, FEATURES, KVHEADS * HEADDIM, seed)); seed += 1   # wk
-        ad.append(make_lora_adapter(rank, alpha, FEATURES, KVHEADS * HEADDIM, seed)); seed += 1   # wv
-        ad.append(make_lora_adapter(rank, alpha, FEATURES, FEATURES, seed)); seed += 1            # gate
-        ad.append(make_lora_adapter(rank, alpha, FEATURES, FEATURES, seed)); seed += 1            # wo
-        ad.append(make_lora_adapter(rank, alpha, FEATURES, MLPDIM, seed)); seed += 1              # mlp_gate
-        ad.append(make_lora_adapter(rank, alpha, FEATURES, MLPDIM, seed)); seed += 1              # mlp_up
-        ad.append(make_lora_adapter(rank, alpha, MLPDIM, FEATURES, seed)); seed += 1              # mlp_down
+        seed = _append_krea2_lora_block_surface(
+            ad, rank, alpha, FEATURES, HEADS * HEADDIM,
+            KVHEADS * HEADDIM, MLPDIM, seed,
+        )
+    return ad^
+
+
+def _build_host_lora_full_surface(rank: Int, alpha: Float32) raises -> List[LoraAdapter]:
+    """Build ai-toolkit's full Krea2 LoRA surface in optimizer order.
+
+    The first 224 adapters are the current main-block product path. The final
+    32 adapters are txtfusion layerwise/refiner blocks and stay BF16 at device
+    and save boundaries. Their gradients are preloaded into AdamW at indices
+    224..255 by the opt-in full-surface device-grad path.
+    """
+    var ad = _build_host_lora(rank, alpha)
+    var seed = UInt64(7000 + KREA2_MAIN_ADAPTERS)
+    for _ in range(KREA2_TXTFUSION_BLOCKS):
+        seed = _append_krea2_lora_block_surface(
+            ad, rank, alpha, KREA2_TXT_DIM, KREA2_TXT_DIM,
+            KREA2_TXT_DIM, KREA2_TXTFUSION_MLPDIM, seed,
+        )
+    if len(ad) != KREA2_FULL_SURFACE_ADAPTERS:
+        raise Error(
+            String("_build_host_lora_full_surface: adapter count ")
+            + String(len(ad))
+            + String(" != ")
+            + String(KREA2_FULL_SURFACE_ADAPTERS)
+        )
     return ad^
 
 
@@ -943,9 +1593,11 @@ def _build_host_lora(rank: Int, alpha: Float32) -> List[LoraAdapter]:
 # `.mlp.{gate,up,down}`, with save_lora_peft appending `.lora_A.weight`[rank,in] /
 # `.lora_B.weight`[out,rank] (BF16). The slot order matches _build_host_lora
 # (0=wq 1=wk 2=wv 3=gate 4=wo 5=mlp_gate 6=mlp_up 7=mlp_down). NOTE: ai-toolkit
-# ALSO trains txtfusion layerwise/refiner blocks; the Mojo trainer is main-block
-# only (frozen-skip text-fusion, config.mojo), so this saves the 28×8=224 main-block
-# adapters — a main-block LoRA that re-loads (txtfusion keys simply absent).
+# ALSO trains/saves txtfusion layerwise/refiner blocks because their names contain
+# "blocks". This default PEFT save writes the 28x8=224 main-block adapters.
+# The opt-in KREA2_TXTFUSION_LORA path uses the full-surface save/resume helpers
+# for the 256-adapter surface; that surface smoke is not a full ai-toolkit
+# numeric oracle.
 def _krea2_lora_prefix(bi: Int, slot: Int) raises -> String:
     var b = String("diffusion_model.blocks.") + String(bi)
     if slot == 0:
@@ -965,6 +1617,52 @@ def _krea2_lora_prefix(bi: Int, slot: Int) raises -> String:
     elif slot == 7:
         return b + ".mlp.down"
     raise Error(String("_krea2_lora_prefix: bad slot ") + String(slot))
+
+
+def _krea2_txtfusion_lora_prefix(ti: Int, slot: Int) raises -> String:
+    var b: String
+    if ti == 0:
+        b = String("diffusion_model.txtfusion.layerwise_blocks.0")
+    elif ti == 1:
+        b = String("diffusion_model.txtfusion.layerwise_blocks.1")
+    elif ti == 2:
+        b = String("diffusion_model.txtfusion.refiner_blocks.0")
+    elif ti == 3:
+        b = String("diffusion_model.txtfusion.refiner_blocks.1")
+    else:
+        raise Error(String("_krea2_txtfusion_lora_prefix: bad txtfusion block ") + String(ti))
+    if slot == 0:
+        return b + ".attn.wq"
+    elif slot == 1:
+        return b + ".attn.wk"
+    elif slot == 2:
+        return b + ".attn.wv"
+    elif slot == 3:
+        return b + ".attn.gate"
+    elif slot == 4:
+        return b + ".attn.wo"
+    elif slot == 5:
+        return b + ".mlp.gate"
+    elif slot == 6:
+        return b + ".mlp.up"
+    elif slot == 7:
+        return b + ".mlp.down"
+    raise Error(String("_krea2_txtfusion_lora_prefix: bad slot ") + String(slot))
+
+
+def _krea2_full_surface_lora_prefix(adapter_idx: Int) raises -> String:
+    if adapter_idx < 0 or adapter_idx >= KREA2_FULL_SURFACE_ADAPTERS:
+        raise Error(String("_krea2_full_surface_lora_prefix: bad adapter ") + String(adapter_idx))
+    if adapter_idx < KREA2_MAIN_ADAPTERS:
+        return _krea2_lora_prefix(
+            adapter_idx // KREA2_SLOTS_PER_BLOCK,
+            adapter_idx % KREA2_SLOTS_PER_BLOCK,
+        )
+    var rel = adapter_idx - KREA2_MAIN_ADAPTERS
+    return _krea2_txtfusion_lora_prefix(
+        rel // KREA2_SLOTS_PER_BLOCK,
+        rel % KREA2_SLOTS_PER_BLOCK,
+    )
 
 
 def _krea2_train_targets(raw_targets: Int) raises -> Int:
@@ -1062,6 +1760,30 @@ def save_krea2_lora(
     return save_lora_peft(named, path, ctx)
 
 
+def save_krea2_lora_full_surface(
+    host_lora: List[LoraAdapter], path: String, ctx: DeviceContext
+) raises -> Int:
+    """Write main-block plus txtfusion LoRA adapters in the 256-slot order.
+
+    The first 224 entries preserve the existing product key order. Entries
+    224..255 append ai-toolkit-style txtfusion layerwise/refiner modules.
+    """
+    if len(host_lora) != KREA2_FULL_SURFACE_ADAPTERS:
+        raise Error(
+            String("save_krea2_lora_full_surface: adapter count ")
+            + String(len(host_lora))
+            + String(" != ")
+            + String(KREA2_FULL_SURFACE_ADAPTERS)
+        )
+    var named = List[NamedLora]()
+    for i in range(KREA2_FULL_SURFACE_ADAPTERS):
+        named.append(NamedLora(
+            _krea2_full_surface_lora_prefix(i),
+            host_lora[i].copy(),
+        ))
+    return save_lora_peft(named, path, ctx)
+
+
 def save_krea2_lora_state(
     host_lora: List[LoraAdapter], path: String, ctx: DeviceContext
 ) raises -> Int:
@@ -1076,6 +1798,25 @@ def save_krea2_lora_state(
                 _krea2_lora_prefix(bi, s),
                 host_lora[bi * KREA2_SLOTS_PER_BLOCK + s].copy(),
             ))
+    return save_lora_train_state(named, path, ctx)
+
+
+def save_krea2_lora_state_full_surface(
+    host_lora: List[LoraAdapter], path: String, ctx: DeviceContext
+) raises -> Int:
+    if len(host_lora) != KREA2_FULL_SURFACE_ADAPTERS:
+        raise Error(
+            String("save_krea2_lora_state_full_surface: adapter count ")
+            + String(len(host_lora))
+            + String(" != ")
+            + String(KREA2_FULL_SURFACE_ADAPTERS)
+        )
+    var named = List[NamedLora]()
+    for i in range(KREA2_FULL_SURFACE_ADAPTERS):
+        named.append(NamedLora(
+            _krea2_full_surface_lora_prefix(i),
+            host_lora[i].copy(),
+        ))
     return save_lora_train_state(named, path, ctx)
 
 
@@ -1106,6 +1847,49 @@ def _krea2_lora_resume(
     return out^
 
 
+def _krea2_lora_resume_full_surface(
+    host_lora: List[LoraAdapter], scale: Float32, path: String, ctx: DeviceContext
+) raises -> List[LoraAdapter]:
+    """Reload the 256-adapter full Krea2 surface for opt-in txtfusion runs.
+
+    The state file carries BF16 LoRA params plus F32 AdamW moments. A plain PEFT
+    file is accepted as a warm start, with optimizer moments left at zero when
+    the device AdamW state is initialized.
+    """
+    if len(host_lora) != KREA2_FULL_SURFACE_ADAPTERS:
+        raise Error(
+            String("_krea2_lora_resume_full_surface: host adapter count ")
+            + String(len(host_lora))
+            + String(" != ")
+            + String(KREA2_FULL_SURFACE_ADAPTERS)
+        )
+    var prefixes = List[String]()
+    for i in range(KREA2_FULL_SURFACE_ADAPTERS):
+        prefixes.append(_krea2_full_surface_lora_prefix(i))
+    var loaded: List[NamedLora]
+    if _krea2_string_ends_with(path, String(".state")):
+        loaded = load_lora_train_state(prefixes, scale, path, ctx)
+        print("[krea2-resume] FULL full-surface resume (A/B + AdamW moments) from", path)
+    else:
+        try:
+            loaded = load_lora_train_state(prefixes, scale, path, ctx)
+            print("[krea2-resume] FULL full-surface resume (A/B + AdamW moments) from", path)
+        except:
+            loaded = load_lora_for_resume(prefixes, scale, path, ctx)
+            print("[krea2-resume] WARM full-surface start (A/B only, moments zeroed) from", path)
+    var out = List[LoraAdapter]()
+    for ref nl in loaded:
+        out.append(nl.adapter.copy())
+    if len(out) != KREA2_FULL_SURFACE_ADAPTERS:
+        raise Error(
+            String("_krea2_lora_resume_full_surface: adapter count ")
+            + String(len(out))
+            + String(" != ")
+            + String(KREA2_FULL_SURFACE_ADAPTERS)
+        )
+    return out^
+
+
 # convert the host LoRA set → the device Krea2StackLora the streaming stack consumes.
 def _host_to_device_lora(
     host: List[LoraAdapter], ctx: DeviceContext
@@ -1124,6 +1908,89 @@ def _host_to_device_lora(
             Optional[LoraAdapterDevice](lora_adapter_to_device(host[base + 7], ctx)),
         ))
     return Krea2StackLora(blocks^)
+
+
+def _resident_lora_adapter(
+    lo: LoraAdapter,
+    state: LoraAdamWPlainDeviceState,
+    adapter_idx: Int,
+) raises -> LoraAdapterDevice:
+    var n_a = len(lo.a)
+    var n_b = len(lo.b)
+    var a_off = state.elem_offset(adapter_idx, False)
+    var b_off = state.elem_offset(adapter_idx, True)
+    return LoraAdapterDevice(
+        TArc(Tensor(
+            state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+            [lo.rank, lo.in_f], STDtype.BF16,
+        )),
+        TArc(Tensor(
+            state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+            [lo.out_f, lo.rank], STDtype.BF16,
+        )),
+        lo.rank, lo.in_f, lo.out_f, lo.scale,
+    )
+
+
+def _host_to_device_lora_resident(
+    host: List[LoraAdapter],
+    state: LoraAdamWPlainDeviceState,
+) raises -> Krea2StackLora:
+    """Build Krea2 LoRA device views from resident AdamW dev_p.
+
+    `state` must outlive the returned stack. The AdamW kernel updates dev_p in
+    place, so these views automatically see the next step's weights.
+    """
+    if state.start != 0 or state.end != len(host):
+        raise Error("_host_to_device_lora_resident: state must cover all Krea2 adapters")
+    var blocks = List[Krea2BlockLora]()
+    for bi in range(NBLOCKS):
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        blocks.append(Krea2BlockLora(
+            Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 0], state, base + 0)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 1], state, base + 1)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 2], state, base + 2)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 3], state, base + 3)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 4], state, base + 4)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 5], state, base + 5)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 6], state, base + 6)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 7], state, base + 7)),
+        ))
+    return Krea2StackLora(blocks^)
+
+
+def _resident_krea2_block_lora(
+    host: List[LoraAdapter],
+    state: LoraAdamWPlainDeviceState,
+    base: Int,
+) raises -> Krea2BlockLora:
+    return Krea2BlockLora(
+        Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 0], state, base + 0)),
+        Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 1], state, base + 1)),
+        Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 2], state, base + 2)),
+        Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 3], state, base + 3)),
+        Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 4], state, base + 4)),
+        Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 5], state, base + 5)),
+        Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 6], state, base + 6)),
+        Optional[LoraAdapterDevice](_resident_lora_adapter(host[base + 7], state, base + 7)),
+    )
+
+
+def _host_to_device_txtfusion_lora_resident(
+    host: List[LoraAdapter],
+    state: LoraAdamWPlainDeviceState,
+) raises -> Krea2TextFusionLora:
+    """Build txtfusion LoRA views from AdamW's BF16 resident dev_p storage."""
+    if state.start != 0 or state.end != len(host):
+        raise Error("_host_to_device_txtfusion_lora_resident: state must cover all Krea2 adapters")
+    if len(host) != KREA2_FULL_SURFACE_ADAPTERS:
+        raise Error("_host_to_device_txtfusion_lora_resident: expected 256 full-surface adapters")
+    return Krea2TextFusionLora(
+        _resident_krea2_block_lora(host, state, KREA2_MAIN_ADAPTERS + 0),
+        _resident_krea2_block_lora(host, state, KREA2_MAIN_ADAPTERS + 8),
+        _resident_krea2_block_lora(host, state, KREA2_MAIN_ADAPTERS + 16),
+        _resident_krea2_block_lora(host, state, KREA2_MAIN_ADAPTERS + 24),
+    )
 
 
 # scatter the flat Krea2StackLoraGrads → parallel d_a/d_b lists for the fused AdamW
@@ -1177,6 +2044,45 @@ def _step_dispatch(
     return _train_one_sample(
         st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
         sigma, noise_seed, cfg, ctx, resident)
+
+
+def _step_dispatch_adamw_device_grads(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor, context: Tensor, pos: Tensor, lt: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
+    sigma: Float32, noise_seed: UInt64, cfg: TrainConfig,
+    mut adamw_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutAdamWDeviceGrads:
+    if lt > LTMAX:
+        raise Error(
+            String("train_krea2: LT=") + String(lt) + " > LTMAX=" + String(LTMAX)
+            + " (raise LTMAX above the dataset's max caption length)"
+        )
+    return _train_one_sample_adamw_device_grads(
+        st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
+        sigma, noise_seed, cfg, adamw_state, ctx, resident)
+
+
+def _step_dispatch_adamw_device_grads_full_surface(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor, context: Tensor, pos: Tensor, lt: Int,
+    lora: Krea2StackLora, txt_lora: Krea2TextFusionLora,
+    fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
+    sigma: Float32, noise_seed: UInt64, cfg: TrainConfig,
+    mut adamw_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutAdamWDeviceGrads:
+    if lt > LTMAX:
+        raise Error(
+            String("train_krea2: LT=") + String(lt) + " > LTMAX=" + String(LTMAX)
+            + " (raise LTMAX above the dataset's max caption length)"
+        )
+    return _train_one_sample_adamw_device_grads_full_surface(
+        st, key_prefix, clean, context, pos, lt, lora, txt_lora, fin, cond_w,
+        sigma, noise_seed, cfg, adamw_state, ctx, resident)
 
 
 def _step_dispatch_dora(
@@ -1327,7 +2233,7 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
     if sample_steps < 1:
         raise Error("krea2 inline sampler: sample steps must be >= 1")
 
-    var latent = randn([1, 16, LH, LW], seed, STDtype.F32, ctx)
+    var latent = randn([1, 16, LH, LW], seed, STDtype.BF16, ctx)
     var seq = krea2_packed_seq_len(LH * 8, LW * 8)
     var ts = krea2_timesteps(seq, sample_steps)
     print("[krea2-sample-inline] steps=", sample_steps, " cfg=", cfg_scale,
@@ -1351,9 +2257,9 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
             c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident,
         )
 
-        var v_f32: Tensor
+        var v: Tensor
         if cfg_scale == Float32(1.0):
-            v_f32 = cast_tensor(pred_c.velocity[], STDtype.F32, ctx)
+            v = pred_c.velocity[].clone(ctx)
         else:
             var u = _build_conditioning[LTMAX, LFULL_SAMPLE](
                 cond_w, img_tokens, uncond.context[], uncond.pos[], t_t,
@@ -1368,11 +2274,9 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
                 u.cos, u.sin, EPS, uncond.text_len, imglen, ctx,
                 real_len_u, resident,
             )
-            var vc_f32 = cast_tensor(pred_c.velocity[], STDtype.F32, ctx)
-            var vu_f32 = cast_tensor(pred_u.velocity[], STDtype.F32, ctx)
-            v_f32 = krea2_cfg(vc_f32, vu_f32, cfg_scale, ctx)
+            v = krea2_cfg(pred_c.velocity[], pred_u.velocity[], cfg_scale, ctx)
 
-        var v_latent = _krea2_unpatch[LH, LW](v_f32, ctx)
+        var v_latent = _krea2_unpatch[LH, LW](v, ctx)
         latent = krea2_euler_step(latent, v_latent, t_cur, t_prev, ctx)
         ctx.synchronize()
         if si == 0 or si + 1 == sample_steps or (si + 1) % 5 == 0:
@@ -1513,29 +2417,80 @@ def _direct_oft_grads_to_host(
 def main() raises:
     var args = argv()
     if len(args) < 3:
-        raise Error("usage: train_krea2 <cache.safetensors> <steps> [<config.json>]")
+        raise Error(
+            "usage: train_krea2 <cache.safetensors> <steps> [<config.json>] "
+            + "[<resume_or_state>] [<start_step>] [krea2devicegrad]"
+        )
     var cache_path = String(args[1])
     var steps = Int(String(args[2]))
+    var krea2_device_grad_smoke = False
+    for ai in range(1, len(args)):
+        if _krea2_is_device_grad_smoke_arg(String(args[ai])):
+            krea2_device_grad_smoke = True
+
     # Optional resume: args[4] = checkpoint path (.state for FULL resume incl AdamW
     # moments, or a plain PEFT file for WARM start), args[5] = step to resume AT.
     var resume_path = String("")
     var start_step = 0
-    if len(args) >= 5:
+    if len(args) >= 5 and not _krea2_is_device_grad_smoke_arg(String(args[4])):
         resume_path = String(args[4])
-    if len(args) >= 6:
+    if len(args) >= 6 and not _krea2_is_device_grad_smoke_arg(String(args[5])):
         start_step = Int(String(args[5]))
 
-    var ctx = DeviceContext()
     # Optional 3rd arg = a config path (e.g. configs/krea2_boxjana.json); default =
     # the giger krea2.json via krea2_raw(). Lets boxjana use its own config (steps/lr/
     # optimizer/workspace) without touching the giger config.
     var cfg: TrainConfig
-    if len(args) >= 4:
+    if len(args) >= 4 and not _krea2_is_device_grad_smoke_arg(String(args[3])):
         var cfg_path = String(args[3])
         print("[krea2] config:", cfg_path)
         cfg = read_model_config(cfg_path)
     else:
         cfg = krea2_raw()
+    if krea2_device_grad_smoke:
+        if steps <= 0:
+            raise Error("krea2devicegrad smoke requires steps > 0")
+        comptime if KREA2_TXTFUSION_LORA:
+            if resume_path == String("") and start_step != 0:
+                raise Error("krea2devicegrad txtfusion smoke requires start_step=0 without resume")
+            if resume_path != String("") and (start_step <= 0 or start_step >= steps):
+                raise Error("krea2devicegrad txtfusion resume smoke requires 0 < start_step < steps")
+        else:
+            if start_step != 0:
+                raise Error("krea2devicegrad smoke requires start_step=0")
+            if resume_path != String(""):
+                raise Error("krea2devicegrad smoke does not support resume")
+        if cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA and cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LOCON:
+            raise Error("krea2devicegrad smoke requires plain LoRA/LoCon adapters")
+        if cfg.optimizer != TRAIN_OPTIMIZER_ADAMW or levers_optimizer_active(cfg):
+            raise Error("krea2devicegrad smoke requires AdamW, not optimizer levers")
+        if levers_loss_active(cfg):
+            raise Error("krea2devicegrad smoke requires default MSE loss levers disabled")
+        if cfg.sample_every > 0:
+            raise Error("krea2devicegrad smoke requires sampling disabled")
+        if cfg.save_every > 0:
+            raise Error("krea2devicegrad smoke requires periodic save disabled")
+        comptime if KREA2_V2_GRAPH:
+            raise Error("krea2devicegrad smoke requires KREA2_V2_GRAPH=False")
+        comptime if KREA2_RES_512:
+            comptime if LTMAX != 384 and LTMAX != 896:
+                raise Error(
+                    "krea2devicegrad 512px build requires KREA2_LTMAX=384 "
+                    + "or KREA2_LTMAX=896"
+                )
+        else:
+            comptime if LTMAX != 768:
+                raise Error(
+                    "krea2devicegrad 1024px build requires KREA2_LTMAX=768"
+                )
+
+    var ctx = DeviceContext()
+    var perf_mem0 = ctx.get_memory_info()
+    var perf_min_free = Int(perf_mem0[0])
+    var perf_total_vram = Int(perf_mem0[1])
+    var perf_visible_sync_count = 0
+    var perf_visible_transfer_count = 0
+    var perf_visible_full_tensor_readback_count = 0
     var key_prefix = String("")          # real raw.safetensors stores bare torch keys
 
     print("==== krea2 LoRA TRAINER (Phase 4a, streaming) ====")
@@ -1544,6 +2499,11 @@ def main() raises:
           " shift=", cfg.timestep_shift, " nblocks=", NBLOCKS,
           " LTMAX=", LTMAX, " LFULL=", LFULL, " (length-bucket pad+mask)",
           " V2_GRAPH=", KREA2_V2_GRAPH)
+    if krea2_device_grad_smoke:
+        print(
+            "[KREA2_DEVICE_GRAD_SMOKE] enabled: streamed backward writes",
+            "preloaded device grads into shared AdamW; host grad lists disabled",
+        )
 
     # ── open the cache + checkpoint; load the small frozen final-layer once ─────
     var cache = KreaTrainCache.open(cache_path)
@@ -1551,6 +2511,7 @@ def main() raises:
     print("cache samples=", n)
     var st = ShardedSafeTensors.open(cfg.checkpoint)
     var fin = Krea2StreamFinal.load(st, key_prefix, ctx)
+    perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
 
     # ── RESIDENT conditioning weights (load ONCE; frozen, small, bf16 — no fp8) ──
     # The conditioning forward (embedders + 4 text-fusion bundles + txtmlp) reads
@@ -1558,6 +2519,7 @@ def main() raises:
     # per-step disk read after the fp8-resident blocks). Always-on, numerically
     # identical (same bf16 weights, just loaded once).
     var cond_w = load_krea2_resident_cond(st, key_prefix, ctx)
+    perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
     print("resident conditioning weights loaded once (embedders + txtfusion + txtmlp).")
 
     # ── T2.B fp8-quantized-resident base (gate on cfg.quantized_resident) ───────
@@ -1571,6 +2533,7 @@ def main() raises:
         resident = Optional[Krea2ResidentFp8](
             build_krea2_resident_fp8(st, key_prefix, NBLOCKS, ctx)
         )
+        perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
         print("fp8_e4m3 resident base: DONE (no per-step disk re-read in the step).")
     else:
         print("quantized_resident=", cfg.quantized_resident,
@@ -1629,16 +2592,33 @@ def main() raises:
         raise Error("krea2 LyCORIS carriers require KREA2_DEVICE_LORA_GRAD=False (the carrier chain needs HOST dA/dB)")
     if (carrier_active or dora_active or oft_active) and levers_optimizer_active(cfg):
         raise Error("krea2 LyCORIS direct/carrier masters use host AdamW; levers optimizers are not wired")
+    comptime if KREA2_TXTFUSION_LORA:
+        if not krea2_device_grad_smoke:
+            raise Error("KREA2_TXTFUSION_LORA currently requires the krea2devicegrad fast path")
+        if carrier_active or dora_active or oft_active:
+            raise Error("KREA2_TXTFUSION_LORA is wired only for plain LoRA/LoCon")
+        if cfg.sample_every > 0:
+            raise Error("KREA2_TXTFUSION_LORA sampling is blocked until txtfusion LoRA conditioning is wired into the inline sampler")
     var host_lora = List[LoraAdapter]()
     if not dora_active and not oft_active:
-        host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
+        comptime if KREA2_TXTFUSION_LORA:
+            host_lora = _build_host_lora_full_surface(cfg.lora_rank, cfg.lora_alpha)
+        else:
+            host_lora = _build_host_lora(cfg.lora_rank, cfg.lora_alpha)
     # RESUME (plain LoRA only): overwrite the B=0-init host_lora with the saved
     # A/B (+ AdamW moments if the .state file is present) and continue at start_step.
     if resume_path != String("") and not dora_active and not oft_active and not carrier_active:
         var resume_scale = cfg.lora_alpha / Float32(cfg.lora_rank)
-        host_lora = _krea2_lora_resume(host_lora, resume_scale, resume_path, ctx)
+        comptime if KREA2_TXTFUSION_LORA:
+            host_lora = _krea2_lora_resume_full_surface(
+                host_lora, resume_scale, resume_path, ctx
+            )
+        else:
+            host_lora = _krea2_lora_resume(host_lora, resume_scale, resume_path, ctx)
         print("[krea2-resume] reloaded", len(host_lora), "adapters; resuming at step", start_step, "/", steps)
-    var n_adapters = NBLOCKS * KREA2_SLOTS_PER_BLOCK
+    var n_adapters = KREA2_MAIN_ADAPTERS
+    comptime if KREA2_TXTFUSION_LORA:
+        n_adapters = KREA2_FULL_SURFACE_ADAPTERS
     var lokr_masters = empty_krea2_lokr_set()
     var loha_masters = empty_krea2_loha_set()
     var dora_masters = empty_krea2_direct_dora_set()
@@ -1760,7 +2740,125 @@ def main() raises:
     print("step  sample  LT   sigma     loss        grad_norm")
 
     var t0 = perf_counter_ns()   # training start — elapsed/ETA for print_trainer_progress
-    for step in range(start_step, steps):
+    var standard_loop_start = start_step
+    if krea2_device_grad_smoke:
+        print(
+            "[KREA2_DEVICE_GRAD_SMOKE] live dev_p mode: building resident",
+            "LoRA views once; per-step host LoRA upload disabled",
+        )
+        var adamw_device_state = lora_adamw_plain_device_state_init(
+            host_lora, 0, n_adapters, ctx
+        )
+        var resident_dev_lora = _host_to_device_lora_resident(
+            host_lora, adamw_device_state
+        )
+        var adamw_shared_arena = TrainingArena(ctx, 8192, 1)
+        perf_visible_transfer_count += 3
+        perf_visible_sync_count += 1
+        perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
+
+        for step in range(start_step, steps):
+            var step_t0 = perf_counter_ns()
+            var idx = order[step % n]
+            var sample: KreaTrainSample
+            comptime if KREA2_RES_512_SYNTH:
+                sample = _synthetic_sample(idx, ctx)
+            else:
+                sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
+            var lt = sample.text_len
+            var sigma = sample_timestep_logit_normal(
+                seed_base + UInt64(step), cfg.timestep_shift,
+            )
+            var noise_seed = seed_base * UInt64(7919) + UInt64(step)
+
+            var _ot_dev = 0
+            comptime if KREA2_PHASE_TIMING:
+                ctx.synchronize(); _ot_dev = Int(perf_counter_ns())
+
+            var so_dev: _StepOutAdamWDeviceGrads
+            comptime if KREA2_TXTFUSION_LORA:
+                var resident_txt_lora = _host_to_device_txtfusion_lora_resident(
+                    host_lora, adamw_device_state
+                )
+                so_dev = _step_dispatch_adamw_device_grads_full_surface(
+                    st, key_prefix,
+                    sample.clean[], sample.context[], sample.pos[], lt,
+                    resident_dev_lora, resident_txt_lora, fin, cond_w,
+                    sigma, noise_seed, cfg, adamw_device_state, ctx, resident,
+                )
+            else:
+                so_dev = _step_dispatch_adamw_device_grads(
+                    st, key_prefix,
+                    sample.clean[], sample.context[], sample.pos[], lt,
+                    resident_dev_lora, fin, cond_w, sigma, noise_seed, cfg,
+                    adamw_device_state, ctx, resident,
+                )
+            if so_dev.grad_count != n_adapters:
+                raise Error(
+                    String("krea2devicegrad smoke expected ")
+                    + String(n_adapters)
+                    + String(" device grad pairs, got ")
+                    + String(so_dev.grad_count)
+            )
+            perf_visible_sync_count += so_dev.streaming_sync_count
+            var adamw_arena_before = adamw_shared_arena.stats()
+            var adamw_result = lora_adamw_plain_preloaded_shared_abi_train_step(
+                adamw_device_state,
+                so_dev.loss,
+                step + 1,
+                cfg.lr,
+                cfg.beta1,
+                cfg.beta2,
+                cfg.eps,
+                cfg.weight_decay,
+                adamw_shared_arena,
+                ctx,
+                cfg.max_grad_norm,
+            )
+            var adamw_arena_after = adamw_shared_arena.stats()
+            perf_visible_transfer_count += (
+                adamw_arena_after.host_device_transfer_count
+                - adamw_arena_before.host_device_transfer_count
+            )
+            perf_visible_sync_count += (
+                adamw_arena_after.sync_count - adamw_arena_before.sync_count
+            )
+            var gn_dev = adamw_result.grad_norm
+            print(
+                "[KREA2_DEVICE_GRAD_SMOKE] AdamW consumed preloaded device grads",
+                "through shared DeviceTrainableSet/DeviceGradSet without host grad lists; live_dev_p=True grad_pairs=",
+                so_dev.grad_count,
+                " streaming_syncs=",
+                so_dev.streaming_sync_count,
+            )
+            comptime if KREA2_PHASE_TIMING:
+                _ot_dev = _phase_ms("device_grad_optimizer", _ot_dev, ctx)
+
+            var _sn_dev = perf_counter_ns()
+            print_trainer_progress(
+                String("krea2"), step + 1, steps, n, so_dev.loss, Float64(gn_dev),
+                Float64(_sn_dev - step_t0) / 1.0e9, 0.0,
+                Float64(_sn_dev - t0) / 1.0e9,
+            )
+            ctx.synchronize()
+            perf_visible_sync_count += 1
+            perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
+
+        lora_adamw_plain_device_state_sync_params(adamw_device_state, host_lora, ctx)
+        perf_visible_transfer_count += 1
+        perf_visible_sync_count += 1
+        comptime if KREA2_TXTFUSION_LORA:
+            lora_adamw_plain_device_state_sync_moments(
+                adamw_device_state, host_lora, ctx
+            )
+            perf_visible_transfer_count += 2
+            perf_visible_sync_count += 2
+            print("[KREA2_DEVICE_GRAD_SMOKE] synced F32 AdamW moments once for full-surface resume state")
+        perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
+        print("[KREA2_DEVICE_GRAD_SMOKE] synced live dev_p params once for final save")
+        standard_loop_start = steps
+
+    for step in range(standard_loop_start, steps):
         var step_t0 = perf_counter_ns()   # per-step wall clock (standard progress line)
         var idx = order[step % n]   # LT-bucketed order kept (harmless; padding makes all
         # samples one LFULL size class — the real pool fragmentation fix).
@@ -1798,6 +2896,7 @@ def main() raises:
                 resident,
             )
             var so_dora_h = so_dora^.to_host(dora_masters, k2_targets, ctx)
+            perf_visible_transfer_count += len(dora_masters.ad)
             var dnorm = krea2_direct_dora_grad_norm(so_dora_h.grads)
             if dnorm > Float64(cfg.max_grad_norm):
                 krea2_direct_dora_clip_grads(so_dora_h.grads, cfg.max_grad_norm / Float32(dnorm))
@@ -1817,6 +2916,8 @@ def main() raises:
                 Float64(_sn - step_t0) / 1.0e9, 0.0, Float64(_sn - t0) / 1.0e9,
             )
             ctx.synchronize()
+            perf_visible_sync_count += 1
+            perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
 
             if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
                 _ = sys_mkdirs(cfg.workspace_dir)
@@ -1845,6 +2946,7 @@ def main() raises:
                 resident,
             )
             var so_oft_h = so_oft^.to_host(oft_masters, k2_targets, ctx)
+            perf_visible_transfer_count += len(oft_masters.ad)
             var onorm = krea2_direct_oft_grad_norm(so_oft_h.grads)
             if onorm > Float64(cfg.max_grad_norm):
                 krea2_direct_oft_clip_grads(so_oft_h.grads, cfg.max_grad_norm / Float32(onorm))
@@ -1864,6 +2966,8 @@ def main() raises:
                 Float64(_sn - step_t0) / 1.0e9, 0.0, Float64(_sn - t0) / 1.0e9,
             )
             ctx.synchronize()
+            perf_visible_sync_count += 1
+            perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
 
             if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
                 _ = sys_mkdirs(cfg.workspace_dir)
@@ -1880,6 +2984,7 @@ def main() raises:
 
         # device LoRA set for THIS step (small; rebuilt from the host authoritative).
         var dev_lora = _host_to_device_lora(host_lora, ctx)
+        perf_visible_transfer_count += n_adapters
         comptime if KREA2_PHASE_TIMING:
             _ot = _phase_ms("host_to_device_lora", _ot, ctx)
 
@@ -1893,6 +2998,8 @@ def main() raises:
         # extract flat grad lists, then global-norm clip (max_grad_norm).
         var gn = so.grad_norm
         var gl = _grads_to_lists(so.grads, n_adapters)
+        perf_visible_transfer_count += n_adapters
+        perf_visible_full_tensor_readback_count += 1
         var clip_scale = Float32(1.0)
         comptime if KREA2_GPU_CLIP:
             # FOLD the clip into the AdamW kernel: compute the scale here, skip the
@@ -1941,13 +3048,21 @@ def main() raises:
                   " zero_leg_l1=", krea2_loha_zero_leg_l1(loha_masters))
         elif levers_optimizer_active(cfg):
             if cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
-                # GPU automagic3 — device math (oracle-gated == host == ai-toolkit),
-                # SR bf16 writeback via the verified host fn. lr self-adapts in a3_dev.
-                _ = automagic3_device_step(
+                # GPU Automagic3 math is wrapped as host-grad-compatible: grads
+                # are still host lists, and bf16 params are mirrored back for
+                # the next forward/save path, so this is not device-fast.
+                var a3_result = automagic3_device_step_result(
                     a3_dev, host_lora, gl.d_a, gl.d_b,
+                    so.loss, gn,
                     Float64(cfg.lr), Float64(0.999), Float64(1.0e-30),
                     Float64(1.0), Float64(cfg.weight_decay), ctx,
                 )
+                perf_visible_sync_count += a3_result.sync_count
+                perf_visible_transfer_count += (
+                    a3_result.scalar_readback_count
+                    + a3_result.full_tensor_readback_count
+                )
+                perf_visible_full_tensor_readback_count += a3_result.full_tensor_readback_count
             else:
                 levers_optimizer_step_host(
                     cfg, host_lora, gl.d_a, gl.d_b, step + 1, cfg.lr, 0, n_adapters,
@@ -1968,6 +3083,8 @@ def main() raises:
             Float64(_sn - step_t0) / 1.0e9, 0.0, Float64(_sn - t0) / 1.0e9,
         )
         ctx.synchronize()   # per-STEP async free discipline: reclaim this step's tensors
+        perf_visible_sync_count += 1
+        perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
         # (esp. the ~4.5GB pad mask + the padded sample + fwd/bwd acts) before the next
         # step — else the deferred async frees creep up in the tight LTMAX headroom and
         # OOM (~step 11). The per-block sync handles within-the-stack; this handles steps.
@@ -1979,6 +3096,8 @@ def main() raises:
                 step + 1, ctx, resident,
             )
             ctx.synchronize()
+            perf_visible_sync_count += 1
+            perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
 
         # ── periodic LoRA save (MJ-0805) every cfg.save_every steps ─────────────
         if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
@@ -1990,9 +3109,13 @@ def main() raises:
             elif loha_active:
                 npairs = save_krea2_loha(loha_masters, sp, ctx)
             else:
-                npairs = save_krea2_lora(host_lora, sp, ctx)
-                # FULL-resume sidecar: A/B + AdamW moments (load with args[4]=<sp>.state).
-                _ = save_krea2_lora_state(host_lora, sp + String(".state"), ctx)
+                comptime if KREA2_TXTFUSION_LORA:
+                    npairs = save_krea2_lora_full_surface(host_lora, sp, ctx)
+                    _ = save_krea2_lora_state_full_surface(host_lora, sp + String(".state"), ctx)
+                else:
+                    npairs = save_krea2_lora(host_lora, sp, ctx)
+                    # FULL-resume sidecar: A/B + AdamW moments (load with args[4]=<sp>.state).
+                    _ = save_krea2_lora_state(host_lora, sp + String(".state"), ctx)
             print("  [save] wrote", npairs, "LoRA pairs ->", sp)
             # Honor ai-toolkit's max_step_saves_to_keep: prune the checkpoint
             # KREA2_KEEP_CHECKPOINTS saves back, keeping every KREA2_CKPT_MILESTONE-th
@@ -2004,7 +3127,10 @@ def main() raises:
                     if sys_remove(op) == 0:
                         print("  [prune] removed old checkpoint ->", op)
 
+    var train_loop_end_ns = perf_counter_ns()
+
     # ── FINAL LoRA save (MJ-0805) — the trained LoRA, re-loadable PEFT ──────────
+    var final_save_t0 = perf_counter_ns()
     _ = sys_mkdirs(cfg.workspace_dir)
     var final_path = _lora_save_path(cfg, steps)
     var n_pairs: Int
@@ -2017,7 +3143,20 @@ def main() raises:
     elif oft_active:
         n_pairs = save_krea2_direct_oft(oft_masters, final_path, ctx)
     else:
-        n_pairs = save_krea2_lora(host_lora, final_path, ctx)
+        comptime if KREA2_TXTFUSION_LORA:
+            n_pairs = save_krea2_lora_full_surface(host_lora, final_path, ctx)
+            if krea2_device_grad_smoke:
+                _ = save_krea2_lora_state_full_surface(
+                    host_lora, final_path + String(".state"), ctx
+                )
+                print(
+                    "[KREA2_DEVICE_GRAD_SMOKE] wrote full-surface resume state ->",
+                    final_path + String(".state"),
+                )
+        else:
+            n_pairs = save_krea2_lora(host_lora, final_path, ctx)
+    var final_save_seconds = Float64(perf_counter_ns() - final_save_t0) / 1.0e9
+    perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
     print("")
     if dora_active:
         print("[save] FINAL DoRA:", n_pairs, "modules ->", final_path)
@@ -2025,6 +3164,22 @@ def main() raises:
         print("[save] FINAL OFT:", n_pairs, "modules ->", final_path)
     else:
         print("[save] FINAL LoRA:", n_pairs, "pairs (", n_pairs * 2, "tensors) ->", final_path)
+
+    _krea2_emit_perf_record(
+        cfg,
+        cache_path,
+        steps,
+        start_step,
+        Float64(train_loop_end_ns - t0) / 1.0e9,
+        perf_total_vram,
+        perf_min_free,
+        perf_visible_sync_count,
+        perf_visible_transfer_count,
+        perf_visible_full_tensor_readback_count,
+        final_save_seconds,
+        sample_enabled,
+        krea2_device_grad_smoke,
+    )
 
     print("")
     print("VERDICT: ran", steps, "steps. Lead checks loss DROPPING + grad_norm",

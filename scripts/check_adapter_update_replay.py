@@ -33,6 +33,12 @@ from safetensors import safe_open
 
 PARITY = Path("/home/alex/onetrainer-mojo/parity")
 PHASES = ("adapter_before", "adapter_pre", "adapter_post", "adapter_after")
+EXTRA_PHASES = (
+    "adapter_pre_clip",
+    "adapter_post_clip",
+    "adapter_pre_clip_grad",
+    "adapter_post_clip_grad",
+)
 
 DEFAULT_META = {
     "qwen": PARITY / "qwen_train_ref_meta.json",
@@ -40,6 +46,7 @@ DEFAULT_META = {
     "anima": PARITY / "anima_train_ref_meta.json",
     "chroma": PARITY / "chroma_train_ref_meta.json",
     "sdxl": PARITY / "sdxl_train_ref_meta.json",
+    "zimage": Path("/home/alex/serenity-trainer/parity/zimage_train_ref_meta.json"),
 }
 
 
@@ -104,8 +111,8 @@ def split_key(key: str) -> tuple[str, str]:
     if "." not in key:
         fail(f"adapter key has no phase prefix: {key}")
     phase, name = key.split(".", 1)
-    if phase not in PHASES:
-        fail(f"unexpected phase {phase!r}; expected {PHASES}")
+    if phase not in PHASES and phase not in EXTRA_PHASES:
+        fail(f"unexpected phase {phase!r}; expected {PHASES + EXTRA_PHASES}")
     return phase, name
 
 
@@ -221,7 +228,8 @@ def inspect(args: argparse.Namespace) -> dict[str, Any]:
         keys = list(handle.keys())
         for key in keys:
             phase, name = split_key(key)
-            phase_names[phase].add(name)
+            if phase in PHASES:
+                phase_names[phase].add(name)
 
         phase_counts = {phase: len(phase_names[phase]) for phase in PHASES}
         for phase in PHASES:
@@ -378,7 +386,7 @@ def main() -> int:
             "[adapter-update-replay] BLOCKED update-bearing adapter oracle is missing: "
             "validated dump has zero adapter_after - adapter_post delta. Use this "
             "artifact only for zero-lr state-init/gradient replay, or capture a "
-            "later OneTrainer step with lr_before > 0 for nonzero update parity.",
+            "later OneTrainer step with lr_before > 0 for a nonzero update oracle.",
             file=sys.stderr,
         )
         return 2

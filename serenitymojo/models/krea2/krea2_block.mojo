@@ -28,10 +28,10 @@
 # (We REUSE LoraAdapterDevice + the klein_lora unfused fwd/bwd — they are
 # model-agnostic LoRA-on-one-Linear primitives.)
 #
-# This unit runs ALL math in F32 (the activations enter F32; the parity gate
-# compares F32 device vs an F64 torch oracle at cos>=0.999). The production
-# trainer's bf16 boundary handling lives in the inference port; the per-block
-# autograd gate proves the chain rule, so F32 is the right precision here.
+# Historical parity gates also exercise F32 oracle tensors, but product training
+# preserves BF16/F16/FP8 storage boundaries. This block may use F32 internally for
+# reductions, score math, and optimizer-bound gradients; it must return/store
+# model activations and LoRA params in their boundary dtype.
 #
 # Mojo 1.0.0b1: `def` only; Tensor move-only (Movable structs, no Tensor in a
 # collection); no-bias linear = linear(x, w, Optional[Tensor](None), ctx).
@@ -66,13 +66,12 @@ comptime KREA2_SLAB_SEGMENTED = True
 
 # ── forward ops ──────────────────────────────────────────────────────────────
 from serenitymojo.ops.linear import linear
-from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import swiglu, sigmoid
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
 from serenitymojo.ops.attention_flash import (
-    sdpa_flash_train_fwd_padmask_f32, sdpa_flash_backward_padmask_f32,
+    sdpa_flash_train_fwd_padmask_bf16, sdpa_flash_backward_padmask_bf16,
 )
 from serenitymojo.ops.gqa_backward import repeat_kv_f32, repeat_kv_backward
 from serenitymojo.ops.tensor_algebra import (
@@ -84,14 +83,17 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linalg_backward import (
     linear_backward, linear_backward_dx, LinearGrads,
 )
-from serenitymojo.ops.norm_backward import rms_norm_backward, rms_norm_backward_dx, RmsNormBackward
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
 from serenitymojo.ops.attention_backward import sdpa_backward
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 from serenitymojo.ops.rope_struct_backward import (
     gate_residual_backward, GateResidualGrads, rope_backward,
 )
-from serenitymojo.ops.activation_backward import sigmoid_backward
+from serenitymojo.ops.activation_backward import sigmoid_backward_from_output
+from serenitymojo.models.dit.krea2_dit import (
+    krea2_rmsnorm,
+    krea2_rmsnorm_backward_dx,
+)
 
 # ── LoRA primitive (model-agnostic LoRA-on-one-Linear) ───────────────────────
 from serenitymojo.models.klein.lora_block import (
@@ -122,11 +124,12 @@ def _no_bias() -> Optional[Tensor]:
 
 def _add_scale_one(scale: Tensor, ctx: DeviceContext) raises -> Tensor:
     """RMSNorm weight reparam: weight = scale + 1.0 (mmdit.py:175). scale is the
-    raw [D] F32 parameter; we materialize (scale+1) as the rms_norm weight. The
-    [1] one broadcasts against the [D]/[Dh] scale."""
+    raw [D] parameter in the checkpoint/storage dtype; we materialize
+    (scale+1) as the rms_norm weight without forcing an F32 storage boundary.
+    The [1] one broadcasts against the [D]/[Dh] scale."""
     var o = List[Float32]()
     o.append(Float32(1.0))
-    var one = Tensor.from_host(o^, [1], STDtype.F32, ctx)
+    var one = Tensor.from_host(o^, [1], scale.dtype(), ctx)
     return add(scale, one, ctx)
 
 
@@ -359,11 +362,10 @@ struct Krea2BlockGrads(Movable):
 
 # ── DEVICE-resident per-Linear LoRA grad pair (TArc; None when adapter absent) ─
 # Sibling of Krea2LoraGrad. The d_A/d_B stay on device (no per-adapter to_host),
-# so the streamed stack enqueues ALL block backward work first and the trainer
-# does ONE batched D2H at the end of the step (224 syncs → 1). Mirrors klein's
-# KleinLoraDeviceGradTensors discipline. The HOST Krea2LoraGrad above is the bit-
-# gate oracle and is left untouched; this is a parallel carrier behind the
-# trainer's KREA2_DEVICE_LORA_GRAD flag.
+# and the streamed stack either copies a block's 8 pairs to host under the
+# per-block streaming fence or copies them D2D into shared AdamW state in the
+# krea2devicegrad path. The HOST Krea2LoraGrad above is the bit-gate oracle and
+# is left untouched.
 struct Krea2LoraGradT(Copyable, Movable):
     var d_a: Optional[TArc]
     var d_b: Optional[TArc]
@@ -457,7 +459,7 @@ def krea2_single_stream_block_lora[
 
     # ── ATTENTION branch ─────────────────────────────────────────────────────
     # xm = (1+prescale)*prenorm(x) + preshift
-    var xn = rms_norm(x_t[], _add_scale_one(w.prenorm_scale[], ctx), eps, ctx)
+    var xn = krea2_rmsnorm(x_t[], w.prenorm_scale[], eps, ctx)
     var xm = modulate(xn, prescale[], preshift[], ctx)          # [1,L,features]
 
     # projections (+ LoRA). xm is [1,L,features]; linear treats leading dims as rows.
@@ -472,8 +474,8 @@ def krea2_single_stream_block_lora[
     var v = reshape_owned(v_lin^, [1, L, KVHEADS, HEADDIM])
 
     # QKNorm over HEADDIM (weight = scale+1); v untouched.
-    var q_rms = rms_norm(q_pre, _add_scale_one(w.qnorm_scale[], ctx), eps, ctx)
-    var k_rms = rms_norm(k_pre, _add_scale_one(w.knorm_scale[], ctx), eps, ctx)
+    var q_rms = krea2_rmsnorm(q_pre, w.qnorm_scale[], eps, ctx)
+    var k_rms = krea2_rmsnorm(k_pre, w.knorm_scale[], eps, ctx)
 
     # RoPE on q,k (per-head tiled tables).
     var q_rope = rope_interleaved(q_rms, cos_q, sin_q, ctx)
@@ -499,16 +501,12 @@ def krea2_single_stream_block_lora[
     var use_flash = real_len and real_len.value() < L
     if use_flash:
         var rl = real_len.value()
-        var ff = sdpa_flash_train_fwd_padmask_f32[1, L, HEADS, HEADDIM](
+        var ff = sdpa_flash_train_fwd_padmask_bf16[1, L, HEADS, HEADDIM](
             q_rope, k_full, v_full, rl, scale, ctx
         )
-        # ff.att is F32 [1,L,HEADS,Dh] (pad-tail rows are masked-out garbage the
-        # downstream gate zeroes via the pad d_out). Cast it to the ACTS dtype
-        # (q_rope.dtype()) so it meets the bf16 residual/merge in production (krea2
-        # flows bf16 acts; only norm/mod SCALES are F32 — same mixed-precision the
-        # block already casts modulate/rms_norm for). NO-OP when acts are F32 (the
-        # parity gate runs F32 → bit-identical there). Save the bf16 set for bwd.
-        att = cast_tensor(ff.att, q_rope.dtype(), ctx)
+        # ff.att is BF16 [1,L,HEADS,Dh] (pad-tail rows are masked-out garbage the
+        # downstream gate zeroes via the pad d_out). Save the BF16 set for bwd.
+        att = Tensor(ff.att.buf.copy(), ff.att.shape(), ff.att.dtype())
         flash_q = Optional[TArc](ff.q_bf.copy())
         flash_k = Optional[TArc](ff.k_bf.copy())
         flash_v = Optional[TArc](ff.v_bf.copy())
@@ -527,7 +525,7 @@ def krea2_single_stream_block_lora[
     var x1 = residual_gate(x_t[], pregate[], a, ctx)
 
     # ── MLP branch ───────────────────────────────────────────────────────────
-    var xn2 = rms_norm(x1, _add_scale_one(w.postnorm_scale[], ctx), eps, ctx)
+    var xn2 = krea2_rmsnorm(x1, w.postnorm_scale[], eps, ctx)
     var xm2 = modulate(xn2, postscale[], postshift[], ctx)     # [1,L,features]
 
     var mg = _linear_lora(xm2, w.mlp_gate_w[], lora.mlp_gate_w, M, ctx)  # [1,L,mlpdim]
@@ -577,7 +575,7 @@ def krea2_single_stream_block_dora[
     var postshift = mods[4]
     var postgate = mods[5]
 
-    var xn = rms_norm(x_t[], _add_scale_one(w.prenorm_scale[], ctx), eps, ctx)
+    var xn = krea2_rmsnorm(x_t[], w.prenorm_scale[], eps, ctx)
     var xm = modulate(xn, prescale[], preshift[], ctx)
 
     var q = krea2_block_direct_dora_projection_forward(xm, w.wq[], dora.wq, M, ctx)
@@ -589,8 +587,8 @@ def krea2_single_stream_block_dora[
     var k_pre = reshape_owned(k^, [1, L, KVHEADS, HEADDIM])
     var v = reshape_owned(v_lin^, [1, L, KVHEADS, HEADDIM])
 
-    var q_rms = rms_norm(q_pre, _add_scale_one(w.qnorm_scale[], ctx), eps, ctx)
-    var k_rms = rms_norm(k_pre, _add_scale_one(w.knorm_scale[], ctx), eps, ctx)
+    var q_rms = krea2_rmsnorm(q_pre, w.qnorm_scale[], eps, ctx)
+    var k_rms = krea2_rmsnorm(k_pre, w.knorm_scale[], eps, ctx)
 
     var q_rope = rope_interleaved(q_rms, cos_q, sin_q, ctx)
     var k_rope = rope_interleaved(k_rms, cos_k, sin_k, ctx)
@@ -607,10 +605,10 @@ def krea2_single_stream_block_dora[
     var use_flash = real_len and real_len.value() < L
     if use_flash:
         var rl = real_len.value()
-        var ff = sdpa_flash_train_fwd_padmask_f32[1, L, HEADS, HEADDIM](
+        var ff = sdpa_flash_train_fwd_padmask_bf16[1, L, HEADS, HEADDIM](
             q_rope, k_full, v_full, rl, scale, ctx
         )
-        att = cast_tensor(ff.att, q_rope.dtype(), ctx)
+        att = Tensor(ff.att.buf.copy(), ff.att.shape(), ff.att.dtype())
         flash_q = Optional[TArc](ff.q_bf.copy())
         flash_k = Optional[TArc](ff.k_bf.copy())
         flash_v = Optional[TArc](ff.v_bf.copy())
@@ -626,7 +624,7 @@ def krea2_single_stream_block_dora[
 
     var x1 = residual_gate(x_t[], pregate[], a, ctx)
 
-    var xn2 = rms_norm(x1, _add_scale_one(w.postnorm_scale[], ctx), eps, ctx)
+    var xn2 = krea2_rmsnorm(x1, w.postnorm_scale[], eps, ctx)
     var xm2 = modulate(xn2, postscale[], postshift[], ctx)
 
     var mg = krea2_block_direct_dora_projection_forward(xm2, w.mlp_gate_w[], dora.mlp_gate_w, M, ctx)
@@ -676,7 +674,7 @@ def krea2_single_stream_block_oft[
     var postshift = mods[4]
     var postgate = mods[5]
 
-    var xn = rms_norm(x_t[], _add_scale_one(w.prenorm_scale[], ctx), eps, ctx)
+    var xn = krea2_rmsnorm(x_t[], w.prenorm_scale[], eps, ctx)
     var xm = modulate(xn, prescale[], preshift[], ctx)
 
     var q = krea2_block_direct_oft_projection_forward(xm, w.wq[], oft.wq, M, ctx)
@@ -688,8 +686,8 @@ def krea2_single_stream_block_oft[
     var k_pre = reshape_owned(k^, [1, L, KVHEADS, HEADDIM])
     var v = reshape_owned(v_lin^, [1, L, KVHEADS, HEADDIM])
 
-    var q_rms = rms_norm(q_pre, _add_scale_one(w.qnorm_scale[], ctx), eps, ctx)
-    var k_rms = rms_norm(k_pre, _add_scale_one(w.knorm_scale[], ctx), eps, ctx)
+    var q_rms = krea2_rmsnorm(q_pre, w.qnorm_scale[], eps, ctx)
+    var k_rms = krea2_rmsnorm(k_pre, w.knorm_scale[], eps, ctx)
 
     var q_rope = rope_interleaved(q_rms, cos_q, sin_q, ctx)
     var k_rope = rope_interleaved(k_rms, cos_k, sin_k, ctx)
@@ -706,10 +704,10 @@ def krea2_single_stream_block_oft[
     var use_flash = real_len and real_len.value() < L
     if use_flash:
         var rl = real_len.value()
-        var ff = sdpa_flash_train_fwd_padmask_f32[1, L, HEADS, HEADDIM](
+        var ff = sdpa_flash_train_fwd_padmask_bf16[1, L, HEADS, HEADDIM](
             q_rope, k_full, v_full, rl, scale, ctx
         )
-        att = cast_tensor(ff.att, q_rope.dtype(), ctx)
+        att = Tensor(ff.att.buf.copy(), ff.att.shape(), ff.att.dtype())
         flash_q = Optional[TArc](ff.q_bf.copy())
         flash_k = Optional[TArc](ff.k_bf.copy())
         flash_v = Optional[TArc](ff.v_bf.copy())
@@ -725,7 +723,7 @@ def krea2_single_stream_block_oft[
 
     var x1 = residual_gate(x_t[], pregate[], a, ctx)
 
-    var xn2 = rms_norm(x1, _add_scale_one(w.postnorm_scale[], ctx), eps, ctx)
+    var xn2 = krea2_rmsnorm(x1, w.postnorm_scale[], eps, ctx)
     var xm2 = modulate(xn2, postscale[], postshift[], ctx)
 
     var mg = krea2_block_direct_oft_projection_forward(xm2, w.mlp_gate_w[], oft.mlp_gate_w, M, ctx)
@@ -1058,7 +1056,7 @@ def krea2_single_stream_block_lora_backward[
     # F32-acts-only mixed path. In the F32 gate this cast is F32→F32 (no-op).
     # FROZEN norm scale → d_x only (rms_norm_backward_dx skips the O(cols²) discarded
     # d_g kernel that was 89% of the step; see norm_backward.mojo:374).
-    var rb2_dx = rms_norm_backward_dx(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
+    var rb2_dx = krea2_rmsnorm_backward_dx(mb2.d_x, saved.x1[], w.postnorm_scale[], eps, ctx)
     # x1 feeds the residual (grg2.d_x) AND postnorm(x1) → SUM.
     var d_x1 = add(grg2.d_x, rb2_dx, ctx)
 
@@ -1076,8 +1074,8 @@ def krea2_single_stream_block_lora_backward[
     # gated = attn_flat * sg  → d_attn_flat = d_gated*sg ; d_sg = d_gated*attn_flat
     var d_attn_flat = mul(d_gated, saved.sg[], ctx)
     var d_sg = mul(d_gated, saved.attn_flat[], ctx)
-    # sg = sigmoid(gate_pre) → d_gate_pre = sigmoid_backward(d_sg, gate_pre)
-    var d_gate_pre = sigmoid_backward(d_sg, saved.gate_pre[], ctx)
+    # Differentiate from the saved sigmoid output; PyTorch autograd saves y.
+    var d_gate_pre = sigmoid_backward_from_output(d_sg, saved.sg[], ctx)
 
     # attn_flat = reshape(sdpa(q_rope, k_full, v_full)) → sdpa backward. Length-bucket
     # pad (real_len present & < L): the cuDNN flash-padmask backward from the saved
@@ -1098,20 +1096,15 @@ def krea2_single_stream_block_lora_backward[
                 " (forward/backward real_len mismatch)"
             )
         var rl = real_len.value()
-        # acts dtype (bf16 in production, F32 in the parity gate). The _f32 flash
-        # bwd wants F32 d_att and returns F32 dQ/dK/dV → cast the (bf16) d_att UP to
-        # F32 in, then cast the F32 grads back DOWN to the acts dtype so the rope /
-        # repeat_kv backward arms (which read the acts-dtype saved q/k/v) are
-        # dtype-consistent. NO-OP when acts are F32 (gate stays bit-identical).
-        var acts_dt = saved.q_rope[].dtype()
-        var d_att_f32 = cast_tensor(d_att, STDtype.F32, ctx)
-        var fb = sdpa_flash_backward_padmask_f32[1, L, HEADS, HEADDIM](
+        # BF16 flash bwd consumes BF16 d_att and returns BF16 dQ/dK/dV. F32 stays
+        # inside cuDNN stats/score math, not at the model/activation boundary.
+        var fb = sdpa_flash_backward_padmask_bf16[1, L, HEADS, HEADDIM](
             saved.flash_q.value(), saved.flash_k.value(), saved.flash_v.value(),
-            saved.flash_o.value(), saved.flash_stats.value(), d_att_f32, rl, scale, ctx,
+            saved.flash_o.value(), saved.flash_stats.value(), d_att, rl, scale, ctx,
         )
-        d_q_sb = cast_tensor(fb.d_q, acts_dt, ctx)
-        d_k_sb = cast_tensor(fb.d_k, acts_dt, ctx)
-        d_v_sb = cast_tensor(fb.d_v, acts_dt, ctx)
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
     else:
         var sb = sdpa_backward[1, L, HEADS, HEADDIM](
             saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
@@ -1133,8 +1126,8 @@ def krea2_single_stream_block_lora_backward[
     # mixed-precision mirror as the rb2 call above: q_pre/k_pre are bf16 acts, the
     # qnorm/knorm scales are F32 → cast (scale+1) down to the act dtype so the
     # all-bf16 rms_norm_backward path runs (matches the bf16 forward QKNorm).
-    var rbq_dx = rms_norm_backward_dx(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
-    var rbk_dx = rms_norm_backward_dx(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
+    var rbq_dx = krea2_rmsnorm_backward_dx(d_q_rms, saved.q_pre[], w.qnorm_scale[], eps, ctx)
+    var rbk_dx = krea2_rmsnorm_backward_dx(d_k_rms, saved.k_pre[], w.knorm_scale[], eps, ctx)
 
     # flatten BSHD grads back to [1,L,*] for the projection backward.
     var d_q = reshape(rbq_dx, [1, L, HEADS * HEADDIM], ctx)
@@ -1159,7 +1152,7 @@ def krea2_single_stream_block_lora_backward[
     # xn = prenorm(x) (weight=prenorm+1, FROZEN) → d_x via rms_norm_backward. Same
     # mixed-precision mirror: saved.x is the bf16 block input, prenorm scale is F32
     # → cast (scale+1) down to the act dtype for the all-bf16 path (matches fwd).
-    var rb1_dx = rms_norm_backward_dx(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
+    var rb1_dx = krea2_rmsnorm_backward_dx(mb1.d_x, saved.x[], w.prenorm_scale[], eps, ctx)
 
     # x feeds: residual (grg1.d_x), prenorm(x) (rb1.d_x). SUM.
     var d_x = add(grg1.d_x, rb1_dx, ctx)
@@ -1173,10 +1166,10 @@ def krea2_single_stream_block_lora_backward[
 # ══════════════════════════════════════════════════════════════════════════════
 # DEVICE-GRAD BACKWARD — bit-identical math to krea2_single_stream_block_lora_backward
 # above, but the 8 LoRA dA/dB stay on DEVICE (_linear_bwd_dx_dev, no per-adapter
-# to_host). Returns Krea2BlockGradsT. The streamed stack collects these device
-# grads across all blocks and the trainer does ONE batched D2H per step (224
-# syncs → 1). The body is otherwise a verbatim clone of the host backward — keep
-# the two in lockstep if the block math changes.
+# to_host). Returns Krea2BlockGradsT. The streamed stack consumes those transient
+# grads block-by-block: either per-block D2H for host-list compatibility or D2D
+# preload into AdamW state. The body is otherwise a verbatim clone of the host
+# backward — keep the two in lockstep if the block math changes.
 # ══════════════════════════════════════════════════════════════════════════════
 def krea2_single_stream_block_lora_backward_dev[
     L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
@@ -1225,7 +1218,7 @@ def krea2_single_stream_block_lora_backward_dev[
     var d_xm2 = add(bw_mg.d_x, bw_mu.d_x, ctx)
 
     var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
-    var rb2_dx = rms_norm_backward_dx(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
+    var rb2_dx = krea2_rmsnorm_backward_dx(mb2.d_x, saved.x1[], w.postnorm_scale[], eps, ctx)
     var d_x1 = add(grg2.d_x, rb2_dx, ctx)
 
     # ── ATTENTION branch backward ────────────────────────────────────────────
@@ -1240,7 +1233,7 @@ def krea2_single_stream_block_lora_backward_dev[
 
     var d_attn_flat = mul(d_gated, saved.sg[], ctx)
     var d_sg = mul(d_gated, saved.attn_flat[], ctx)
-    var d_gate_pre = sigmoid_backward(d_sg, saved.gate_pre[], ctx)
+    var d_gate_pre = sigmoid_backward_from_output(d_sg, saved.sg[], ctx)
 
     var d_att = reshape(d_attn_flat, [1, L, HEADS, HEADDIM], ctx)
     var d_q_sb: Tensor
@@ -1254,15 +1247,13 @@ def krea2_single_stream_block_lora_backward_dev[
                 " (forward/backward real_len mismatch)"
             )
         var rl = real_len.value()
-        var acts_dt = saved.q_rope[].dtype()
-        var d_att_f32 = cast_tensor(d_att, STDtype.F32, ctx)
-        var fb = sdpa_flash_backward_padmask_f32[1, L, HEADS, HEADDIM](
+        var fb = sdpa_flash_backward_padmask_bf16[1, L, HEADS, HEADDIM](
             saved.flash_q.value(), saved.flash_k.value(), saved.flash_v.value(),
-            saved.flash_o.value(), saved.flash_stats.value(), d_att_f32, rl, scale, ctx,
+            saved.flash_o.value(), saved.flash_stats.value(), d_att, rl, scale, ctx,
         )
-        d_q_sb = cast_tensor(fb.d_q, acts_dt, ctx)
-        d_k_sb = cast_tensor(fb.d_k, acts_dt, ctx)
-        d_v_sb = cast_tensor(fb.d_v, acts_dt, ctx)
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
     else:
         var sb = sdpa_backward[1, L, HEADS, HEADDIM](
             saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
@@ -1277,8 +1268,8 @@ def krea2_single_stream_block_lora_backward_dev[
     var d_q_rms = rope_backward(d_q_sb, cos_q, sin_q, True, ctx)
     var d_k_rms = rope_backward(d_k_rope, cos_k, sin_k, True, ctx)
 
-    var rbq_dx = rms_norm_backward_dx(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
-    var rbk_dx = rms_norm_backward_dx(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
+    var rbq_dx = krea2_rmsnorm_backward_dx(d_q_rms, saved.q_pre[], w.qnorm_scale[], eps, ctx)
+    var rbk_dx = krea2_rmsnorm_backward_dx(d_k_rms, saved.k_pre[], w.knorm_scale[], eps, ctx)
 
     var d_q = reshape(rbq_dx, [1, L, HEADS * HEADDIM], ctx)
     var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
@@ -1296,7 +1287,7 @@ def krea2_single_stream_block_lora_backward_dev[
     var d_xm = add(add(bw_q.d_x, bw_k.d_x, ctx), add(bw_v.d_x, bw_g.d_x, ctx), ctx)
 
     var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
-    var rb1_dx = rms_norm_backward_dx(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
+    var rb1_dx = krea2_rmsnorm_backward_dx(mb1.d_x, saved.x[], w.prenorm_scale[], eps, ctx)
 
     var d_x = add(grg1.d_x, rb1_dx, ctx)
 
@@ -1358,7 +1349,7 @@ def krea2_single_stream_block_dora_backward_dev[
     var d_xm2 = add(bw_mg.d_x, bw_mu.d_x, ctx)
 
     var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
-    var rb2_dx = rms_norm_backward_dx(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
+    var rb2_dx = krea2_rmsnorm_backward_dx(mb2.d_x, saved.x1[], w.postnorm_scale[], eps, ctx)
     var d_x1 = add(grg2.d_x, rb2_dx, ctx)
 
     var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
@@ -1372,7 +1363,7 @@ def krea2_single_stream_block_dora_backward_dev[
 
     var d_attn_flat = mul(d_gated, saved.sg[], ctx)
     var d_sg = mul(d_gated, saved.attn_flat[], ctx)
-    var d_gate_pre = sigmoid_backward(d_sg, saved.gate_pre[], ctx)
+    var d_gate_pre = sigmoid_backward_from_output(d_sg, saved.sg[], ctx)
 
     var d_att = reshape(d_attn_flat, [1, L, HEADS, HEADDIM], ctx)
     var d_q_sb: Tensor
@@ -1386,15 +1377,13 @@ def krea2_single_stream_block_dora_backward_dev[
                 " (forward/backward real_len mismatch)"
             )
         var rl = real_len.value()
-        var acts_dt = saved.q_rope[].dtype()
-        var d_att_f32 = cast_tensor(d_att, STDtype.F32, ctx)
-        var fb = sdpa_flash_backward_padmask_f32[1, L, HEADS, HEADDIM](
+        var fb = sdpa_flash_backward_padmask_bf16[1, L, HEADS, HEADDIM](
             saved.flash_q.value(), saved.flash_k.value(), saved.flash_v.value(),
-            saved.flash_o.value(), saved.flash_stats.value(), d_att_f32, rl, scale, ctx,
+            saved.flash_o.value(), saved.flash_stats.value(), d_att, rl, scale, ctx,
         )
-        d_q_sb = cast_tensor(fb.d_q, acts_dt, ctx)
-        d_k_sb = cast_tensor(fb.d_k, acts_dt, ctx)
-        d_v_sb = cast_tensor(fb.d_v, acts_dt, ctx)
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
     else:
         var sb = sdpa_backward[1, L, HEADS, HEADDIM](
             saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
@@ -1409,8 +1398,8 @@ def krea2_single_stream_block_dora_backward_dev[
     var d_q_rms = rope_backward(d_q_sb, cos_q, sin_q, True, ctx)
     var d_k_rms = rope_backward(d_k_rope, cos_k, sin_k, True, ctx)
 
-    var rbq_dx = rms_norm_backward_dx(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
-    var rbk_dx = rms_norm_backward_dx(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
+    var rbq_dx = krea2_rmsnorm_backward_dx(d_q_rms, saved.q_pre[], w.qnorm_scale[], eps, ctx)
+    var rbk_dx = krea2_rmsnorm_backward_dx(d_k_rms, saved.k_pre[], w.knorm_scale[], eps, ctx)
 
     var d_q = reshape(rbq_dx, [1, L, HEADS * HEADDIM], ctx)
     var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
@@ -1436,7 +1425,7 @@ def krea2_single_stream_block_dora_backward_dev[
     var d_xm = add(add(bw_q.d_x, bw_k.d_x, ctx), add(bw_v.d_x, bw_g.d_x, ctx), ctx)
 
     var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
-    var rb1_dx = rms_norm_backward_dx(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
+    var rb1_dx = krea2_rmsnorm_backward_dx(mb1.d_x, saved.x[], w.prenorm_scale[], eps, ctx)
 
     var d_x = add(grg1.d_x, rb1_dx, ctx)
 
@@ -1497,7 +1486,7 @@ def krea2_single_stream_block_oft_backward_dev[
     var d_xm2 = add(bw_mg.d_x, bw_mu.d_x, ctx)
 
     var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
-    var rb2_dx = rms_norm_backward_dx(mb2.d_x, saved.x1[], cast_tensor(_add_scale_one(w.postnorm_scale[], ctx), saved.x1[].dtype(), ctx), eps, ctx)
+    var rb2_dx = krea2_rmsnorm_backward_dx(mb2.d_x, saved.x1[], w.postnorm_scale[], eps, ctx)
     var d_x1 = add(grg2.d_x, rb2_dx, ctx)
 
     var grg1 = gate_residual_backward(d_x1, saved.x[], pregate[], saved.a[], ctx, compute_gate_grad=False)
@@ -1511,7 +1500,7 @@ def krea2_single_stream_block_oft_backward_dev[
 
     var d_attn_flat = mul(d_gated, saved.sg[], ctx)
     var d_sg = mul(d_gated, saved.attn_flat[], ctx)
-    var d_gate_pre = sigmoid_backward(d_sg, saved.gate_pre[], ctx)
+    var d_gate_pre = sigmoid_backward_from_output(d_sg, saved.sg[], ctx)
 
     var d_att = reshape(d_attn_flat, [1, L, HEADS, HEADDIM], ctx)
     var d_q_sb: Tensor
@@ -1525,15 +1514,13 @@ def krea2_single_stream_block_oft_backward_dev[
                 " (forward/backward real_len mismatch)"
             )
         var rl = real_len.value()
-        var acts_dt = saved.q_rope[].dtype()
-        var d_att_f32 = cast_tensor(d_att, STDtype.F32, ctx)
-        var fb = sdpa_flash_backward_padmask_f32[1, L, HEADS, HEADDIM](
+        var fb = sdpa_flash_backward_padmask_bf16[1, L, HEADS, HEADDIM](
             saved.flash_q.value(), saved.flash_k.value(), saved.flash_v.value(),
-            saved.flash_o.value(), saved.flash_stats.value(), d_att_f32, rl, scale, ctx,
+            saved.flash_o.value(), saved.flash_stats.value(), d_att, rl, scale, ctx,
         )
-        d_q_sb = cast_tensor(fb.d_q, acts_dt, ctx)
-        d_k_sb = cast_tensor(fb.d_k, acts_dt, ctx)
-        d_v_sb = cast_tensor(fb.d_v, acts_dt, ctx)
+        d_q_sb = Tensor(fb.d_q.buf.copy(), fb.d_q.shape(), fb.d_q.dtype())
+        d_k_sb = Tensor(fb.d_k.buf.copy(), fb.d_k.shape(), fb.d_k.dtype())
+        d_v_sb = Tensor(fb.d_v.buf.copy(), fb.d_v.shape(), fb.d_v.dtype())
     else:
         var sb = sdpa_backward[1, L, HEADS, HEADDIM](
             saved.q_rope[], saved.k_full[], saved.v_full[], d_att, scale, ctx
@@ -1548,8 +1535,8 @@ def krea2_single_stream_block_oft_backward_dev[
     var d_q_rms = rope_backward(d_q_sb, cos_q, sin_q, True, ctx)
     var d_k_rms = rope_backward(d_k_rope, cos_k, sin_k, True, ctx)
 
-    var rbq_dx = rms_norm_backward_dx(d_q_rms, saved.q_pre[], cast_tensor(_add_scale_one(w.qnorm_scale[], ctx), saved.q_pre[].dtype(), ctx), eps, ctx)
-    var rbk_dx = rms_norm_backward_dx(d_k_rms, saved.k_pre[], cast_tensor(_add_scale_one(w.knorm_scale[], ctx), saved.k_pre[].dtype(), ctx), eps, ctx)
+    var rbq_dx = krea2_rmsnorm_backward_dx(d_q_rms, saved.q_pre[], w.qnorm_scale[], eps, ctx)
+    var rbk_dx = krea2_rmsnorm_backward_dx(d_k_rms, saved.k_pre[], w.knorm_scale[], eps, ctx)
 
     var d_q = reshape(rbq_dx, [1, L, HEADS * HEADDIM], ctx)
     var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
@@ -1575,7 +1562,7 @@ def krea2_single_stream_block_oft_backward_dev[
     var d_xm = add(add(bw_q.d_x, bw_k.d_x, ctx), add(bw_v.d_x, bw_g.d_x, ctx), ctx)
 
     var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
-    var rb1_dx = rms_norm_backward_dx(mb1.d_x, saved.x[], cast_tensor(_add_scale_one(w.prenorm_scale[], ctx), saved.x[].dtype(), ctx), eps, ctx)
+    var rb1_dx = krea2_rmsnorm_backward_dx(mb1.d_x, saved.x[], w.prenorm_scale[], eps, ctx)
 
     var d_x = add(grg1.d_x, rb1_dx, ctx)
 

@@ -74,7 +74,7 @@ from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.attention import sdpa, sdpa_nomask
 from serenitymojo.ops.unary import tanh_op
 from serenitymojo.ops.tensor_algebra import reshape_owned, reshape_in_place, add
 
@@ -643,6 +643,77 @@ def zimage_refiner_forward[
 
     var ff_n2 = rms_norm(ff, w.fn2[], eps, ctx)
     var result = add(h, ff_n2, ctx).to_host(ctx)    # PLAIN residual (no gate)
+
+    var saved = ZImageRefinerSaved(
+        TArc(x_t^), TArc(xn1^),
+        TArc(q_pre^), TArc(k_pre^), TArc(v^),
+        TArc(q_rms^), TArc(k_rms^), TArc(q_rope^), TArc(k_rope^),
+        TArc(att_flat^), TArc(att_o^), TArc(h^),
+        TArc(xfn1^), TArc(g_pre^), TArc(u^), TArc(act^), TArc(ff^),
+    )
+    return ZImageRefinerForward(result^, saved^)
+
+
+def zimage_refiner_forward_masked[
+    H: Int, Dh: Int, S: Int
+](
+    x: List[Float32],
+    w: ZImageBlockWeights,
+    cos: Tensor, sin: Tensor,
+    attn_mask: Tensor,
+    D: Int, F: Int, eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageRefinerForward:
+    """Context-refiner forward with a per-sample additive key mask.
+
+    This is for strict OneTrainer replay when caption rows are padded to a shared
+    batch length. The refiner is frozen for main-LoRA selected-gradient replay,
+    so only forward masking is needed in that gate.
+    """
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var x_t = _t(x, [S, D], ctx)
+
+    var xn1 = rms_norm(x_t, w.n1[], eps, ctx)
+
+    var no_bias = Optional[Tensor](None)
+    var q_flat = linear(xn1, w.wq[], no_bias^, ctx)
+    var no_bias_k = Optional[Tensor](None)
+    var k_flat = linear(xn1, w.wk[], no_bias_k^, ctx)
+    var no_bias_v = Optional[Tensor](None)
+    var v_flat = linear(xn1, w.wv[], no_bias_v^, ctx)
+
+    var q_pre = reshape_owned(q_flat^, [1, S, H, Dh])
+    var k_pre = reshape_owned(k_flat^, [1, S, H, Dh])
+    var v = reshape_owned(v_flat^, [1, S, H, Dh])
+
+    var q_rms = rms_norm(q_pre, w.q_norm[], eps, ctx)
+    var k_rms = rms_norm(k_pre, w.k_norm[], eps, ctx)
+
+    var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
+    var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
+
+    var att = sdpa[1, S, H, Dh](q_rope, k_rope, v, attn_mask, scale, ctx)
+    var att_flat = reshape_owned(att^, [S, D])
+
+    var no_bias_o = Optional[Tensor](None)
+    var att_o = linear(att_flat, w.wo[], no_bias_o^, ctx)
+
+    var attn_n2 = rms_norm(att_o, w.n2[], eps, ctx)
+    var h = add(x_t, attn_n2, ctx)
+
+    var xfn1 = rms_norm(h, w.fn1[], eps, ctx)
+
+    var no_bias_g = Optional[Tensor](None)
+    var g_pre = linear(xfn1, w.w1[], no_bias_g^, ctx)
+    var no_bias_u = Optional[Tensor](None)
+    var u = linear(xfn1, w.w3[], no_bias_u^, ctx)
+    var act = swiglu(g_pre, u, ctx)
+    var no_bias_d = Optional[Tensor](None)
+    var ff = linear(act, w.w2[], no_bias_d^, ctx)
+
+    var ff_n2 = rms_norm(ff, w.fn2[], eps, ctx)
+    var result = add(h, ff_n2, ctx).to_host(ctx)
 
     var saved = ZImageRefinerSaved(
         TArc(x_t^), TArc(xn1^),

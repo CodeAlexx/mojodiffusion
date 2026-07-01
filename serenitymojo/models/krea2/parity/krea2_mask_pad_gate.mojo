@@ -73,7 +73,7 @@ comptime LB = 384                             # run-B buffer (128-aligned, pad [
 
 # ── random device tensor ───────────────────────────────────────────────────────
 def _rand(var shape: List[Int], seed: UInt64, ctx: DeviceContext) raises -> Tensor:
-    return randn(shape^, seed, STDtype.F32, ctx)
+    return randn(shape^, seed, STDtype.BF16, ctx)
 
 
 def _shape1(a: Int) -> List[Int]:
@@ -115,7 +115,7 @@ def _tile_table(
                     # fixed per-(image-token,channel) angle, identical in both buffers.
                     var ang = Float32(0.013) * Float32(k + 1) * Float32(c + 1)
                     out.append(mcos(ang) if is_cos else msin(ang))
-    return Tensor.from_host(out^, _shape2(L * heads, HALF), STDtype.F32, ctx)
+    return Tensor.from_host(out^, _shape2(L * heads, HALF), STDtype.BF16, ctx)
 
 
 # weights + lora shared by BOTH runs (same seeds → identical params).
@@ -243,15 +243,15 @@ def _run_flash[L: Int](
     ctx: DeviceContext,
 ) raises -> _Run:
     var x_h = _scatter(real_x_h, L, False)                    # pad-tail = garbage
-    var x = Tensor.from_host(x_h, _shape3(1, L, FEATURES), STDtype.F32, ctx)
+    var x = Tensor.from_host(x_h, _shape3(1, L, FEATURES), STDtype.BF16, ctx)
     var dout_h = _scatter(real_dout_h, L, True)               # pad-tail d_out = ZERO
-    var dout = Tensor.from_host(dout_h, _shape3(1, L, FEATURES), STDtype.F32, ctx)
+    var dout = Tensor.from_host(dout_h, _shape3(1, L, FEATURES), STDtype.BF16, ctx)
 
     var cos_q = _tile_table(L, HEADS, True, ctx)
     var sin_q = _tile_table(L, HEADS, False, ctx)
     var cos_k = _tile_table(L, KVHEADS, True, ctx)
     var sin_k = _tile_table(L, KVHEADS, False, ctx)
-    var cos0 = Tensor.from_host(_zeros(L * HALF), _shape2(L, HALF), STDtype.F32, ctx)
+    var cos0 = Tensor.from_host(_zeros(L * HALF), _shape2(L, HALF), STDtype.BF16, ctx)
     var sin0 = cos0.clone(ctx)
 
     var rl = Optional[Int](REAL)             # the valid contiguous prefix length

@@ -1305,6 +1305,7 @@ from serenitymojo.ops.gqa_backward import (
 )
 from serenitymojo.models.krea2.krea2_block import (
     _linear_lora as _k2_linear_lora,
+    krea2_rmsnorm as _k2_rmsnorm,
 )
 from serenitymojo.models.klein.lora_block import LoraAdapterDevice as _K2LoraAdapter
 from serenitymojo.autograd_v2.node import (
@@ -1312,6 +1313,7 @@ from serenitymojo.autograd_v2.node import (
     OPK_REPEAT_KV as _OPK_REPEAT_KV,
     OPK_SIGMOID as _OPK_SIGMOID,
     OPK_KREA2_PROJ_LORA as _OPK_K2_PROJ,
+    OPK_KREA2_RMS_NORM_DX as _OPK_K2_RMS_NORM,
 )
 
 
@@ -1368,6 +1370,27 @@ def record_sigmoid(
     saved.append(x.copy())
     var oids: List[Int] = [y.id]
     _ = g.record(_OPK_SIGMOID, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_krea2_rms_norm_dx(
+    mut g: Graph, x: TArc, raw_scale: TArc, eps: Float32, ctx: DeviceContext
+) raises -> TArc:
+    """Krea2 RMSNorm with RAW checkpoint scale. Unlike generic RMSNorm, this
+    records scale before the +1 reparam; forward/backward call Krea2 kernels
+    that do scale.float()+1.0 internally and return x/go storage dtype."""
+    var y = _k2_rmsnorm(x[], raw_scale[], eps, ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(raw_scale.copy())
+    var scalars: List[Float32] = [eps]
+    var oids: List[Int] = [y.id]
+    _ = g.record(
+        _OPK_K2_RMS_NORM, edges^, saved^, List[Int](), scalars^, oids
+    )
     return TArc(y^)
 
 
@@ -1495,6 +1518,28 @@ def record_sigmoid_slab(mut g: Graph, x: TArc, ctx: DeviceContext, mut slab: Ste
     saved.append(x.copy())
     var oids: List[Int] = [y.id]
     _ = g.record(_OPK_SIGMOID, edges^, saved^, List[Int](), List[Float32](), oids)
+    return TArc(y^)
+
+
+def record_krea2_rms_norm_dx_slab(
+    mut g: Graph, x: TArc, raw_scale: TArc, eps: Float32, ctx: DeviceContext,
+    mut slab: StepSlab,
+) raises -> TArc:
+    """StepSlab execution variant of `record_krea2_rms_norm_dx`. Krea2 exposes
+    the raw-scale kernel without a slab allocator today, so allocation remains
+    pool-backed while the graph kind/backward semantics are slab-routed."""
+    var y = _k2_rmsnorm(x[], raw_scale[], eps, ctx)
+    y.set_id(g.fresh_tensor_id())
+    var edges = List[Edge]()
+    edges.append(g.edge_for(x[].id))
+    var saved = List[TArc]()
+    saved.append(x.copy())
+    saved.append(raw_scale.copy())
+    var scalars: List[Float32] = [eps]
+    var oids: List[Int] = [y.id]
+    _ = g.record(
+        _OPK_K2_RMS_NORM, edges^, saved^, List[Int](), scalars^, oids
+    )
     return TArc(y^)
 
 

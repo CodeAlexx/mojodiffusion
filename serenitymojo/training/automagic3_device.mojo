@@ -28,6 +28,7 @@ from std.gpu.memory import AddressSpace
 from std.atomic import Atomic
 from std.math import sqrt, exp
 from std.memory import stack_allocation
+from std.time import perf_counter_ns
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
@@ -308,6 +309,11 @@ from serenitymojo.training.automagic3 import (
     Automagic3Rng, automagic3_writeback_bf16_sr,
     AUTOMAGIC3_DEFAULT_LR, AUTOMAGIC3_LR_MIN, AUTOMAGIC3_LR_MAX,
 )
+from serenitymojo.training.device_train_step import TrainStepDeviceResult
+from serenitymojo.training.perf_record import (
+    PERF_FAST_PATH_HOST_GRAD_COMPAT,
+    TrainingPhaseTimings,
+)
 
 
 struct Automagic3DeviceState(Movable):
@@ -494,3 +500,65 @@ def automagic3_device_step(
         off2 += nb_e
 
     return Float32(state.lr)
+
+
+def automagic3_device_step_result(
+    mut state: Automagic3DeviceState,
+    mut adapters: List[LoraAdapter],
+    d_a: List[List[Float32]],
+    d_b: List[List[Float32]],
+    loss: Float32,
+    grad_norm: Float32,
+    start_lr: Float64,
+    beta2: Float64,
+    eps: Float64,
+    clip: Float64,
+    weight_decay: Float64,
+    ctx: DeviceContext,
+) raises -> TrainStepDeviceResult:
+    """Host-grad-compatible Automagic3 device optimizer step.
+
+    Grad lists are still host-resident compatibility inputs, and the step reads
+    the bf16 param mirror back for the next forward/save path. The result is
+    therefore deliberately not a device-fast claim even though the optimizer
+    math runs in the GPU kernel.
+    """
+    var t0 = perf_counter_ns()
+    var lr_now = automagic3_device_step(
+        state,
+        adapters,
+        d_a,
+        d_b,
+        start_lr,
+        beta2,
+        eps,
+        clip,
+        weight_decay,
+        ctx,
+    )
+    var t1 = perf_counter_ns()
+    var phases = TrainingPhaseTimings(
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        Float64(t1 - t0) / 1.0e9,
+        0.0,
+        0.0,
+    )
+    var result = TrainStepDeviceResult(
+        loss,
+        grad_norm,
+        Float32(1.0),
+        phases^,
+        2,
+        1,  # full_tensor_readback_count: bf16 param mirror for next forward/save
+        1,
+        0,
+        PERF_FAST_PATH_HOST_GRAD_COMPAT,
+        String("device-automagic3-host-grad-compat"),
+        String("automagic3_lr=") + String(lr_now),
+    )
+    result.validate()
+    return result^

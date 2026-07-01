@@ -53,12 +53,10 @@ from serenitymojo.ops.tensor_algebra import (
     add, slice, reshape, mul, mul_scalar, transpose, concat, zeros_device,
 )
 from serenitymojo.ops.attention import sdpa_nomask, sdpa, sdpa_tiled, sdpa_nomask_tiled
-from serenitymojo.ops.attention_flash import sdpa_flash_fwd_padmask, sdpa_flash_train_fwd
+from serenitymojo.ops.attention_flash import sdpa_flash_fwd_padmask
 from serenitymojo.ops.gqa_backward import repeat_kv_f32
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.embeddings import timestep_embedding
-from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.torch_bf16 import torch_f32_to_bf16_rne
 from serenitymojo.lora import LoraSet
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
 
@@ -76,10 +74,10 @@ comptime _MAX_AXES = 4  # global/h/w (+ optional 4th); bounded.
 struct Krea2BlockResidentFp8(Copyable, Movable):
     var fp8: List[ArcPointer[Tensor]]    # len 8: E4M3 bytes [out,in] per matmul weight
     var scale: List[ArcPointer[Tensor]]  # len 8: F32 per-output-row scale [out]
-    var qnorm_scale: ArcPointer[Tensor]  # F32 [HEADDIM]
-    var knorm_scale: ArcPointer[Tensor]  # F32 [HEADDIM]
-    var prenorm_scale: ArcPointer[Tensor]   # F32 [features]
-    var postnorm_scale: ArcPointer[Tensor]  # F32 [features]
+    var qnorm_scale: ArcPointer[Tensor]  # raw checkpoint dtype [HEADDIM]
+    var knorm_scale: ArcPointer[Tensor]  # raw checkpoint dtype [HEADDIM]
+    var prenorm_scale: ArcPointer[Tensor]   # raw checkpoint dtype [features]
+    var postnorm_scale: ArcPointer[Tensor]  # raw checkpoint dtype [features]
     var mod_lin: ArcPointer[Tensor]         # bf16 [6*features]
 
     def __init__(
@@ -369,18 +367,18 @@ def apply_krea2_rope(
 #   t = F.rms_norm(t, (features,), eps=1e-5, weight=scale.float() + 1.0)
 #   return t.to(dtype)                                       # F32 -> bf16
 # i.e. the rms reduction AND the weight multiply are F32, the weight is the
-# F32 reparam (scale + 1.0), and bf16 is touched ONLY at the x-read upcast and
-# the final store. ops/norm.rms_norm is NOT reused: its bf16 path reads the
-# WEIGHT as bf16 (bf16-rounds scale+1 before the multiply) and applies the raw
-# weight (no +1 reparam). We hand-roll an F32-internal kernel that keeps the
-# scale F32 and adds 1.0 in F32 inside the multiply. x is read as its storage
-# dtype and upcast to F32 (lossless for bf16: bf16 is a truncated F32, == .float()).
+# F32 reparam (scale.float() + 1.0), and bf16 is touched ONLY at the x-read
+# upcast and final store. ops/norm.rms_norm is NOT reused: its bf16 path reads a
+# materialized WEIGHT as bf16 (bf16-rounds scale+1 before the multiply) and
+# applies the raw weight (no +1 reparam). We hand-roll F32-internal kernels that
+# cast scale to F32 inside the op and add 1.0 in F32 inside the multiply.
+# x is read as its storage dtype and upcast to F32.
 comptime _RMS_TPB = 256  # threads per block (one block per row)
 
 
-def _krea2_rmsnorm_kernel[x_dtype: DType](
+def _krea2_rmsnorm_kernel[x_dtype: DType, scale_dtype: DType](
     x: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
-    scale: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin],  # F32 scale (NOT scale+1)
+    scale: LayoutTensor[scale_dtype, _DYN1, MutAnyOrigin],  # raw scale (NOT scale+1)
     o: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
     cols: Int,
     eps: Float32,
@@ -410,7 +408,7 @@ def _krea2_rmsnorm_kernel[x_dtype: DType](
     while c < cols:
         var v = rebind[Scalar[x_dtype]](x[row, c]).cast[DType.float32]()
         # weight = scale + 1.0, kept F32 (the reference's scale.float() + 1.0).
-        var w = rebind[Scalar[DType.float32]](scale[c]) + Float32(1.0)
+        var w = rebind[Scalar[scale_dtype]](scale[c]).cast[DType.float32]() + Float32(1.0)
         o[row, c] = rebind[o.element_type]((v * inv * w).cast[x_dtype]())
         c += _RMS_TPB
 
@@ -421,8 +419,8 @@ def krea2_rmsnorm(
     """Krea2 RMSNorm (mmdit.py:163-177). F32-internal; weight = scale + 1.0.
 
     x:     [..., features]  (storage dtype; read upcast to F32 == x.float()).
-    scale: [features]       F32 (the zeros-init Parameter; weight is scale+1.0,
-           added in F32 inside the kernel — pass the RAW scale, not scale+1).
+    scale: [features]       storage dtype. The raw scale is cast to F32 inside
+           the op; weight is scale.float()+1.0, added in F32 inside the kernel.
     eps:   1e-5.
     returns [..., features] in x's dtype (F32 math, cast only at store).
     """
@@ -430,8 +428,6 @@ def krea2_rmsnorm(
     if len(xshape) < 1:
         raise Error("krea2_rmsnorm: x must have rank >= 1")
     var cols = xshape[len(xshape) - 1]
-    if scale.dtype() != STDtype.F32:
-        raise Error("krea2_rmsnorm: scale must be F32 (F32 weight reparam)")
     if scale.numel() != cols:
         raise Error("krea2_rmsnorm: scale numel must equal features")
     var rows = 1
@@ -439,12 +435,16 @@ def krea2_rmsnorm(
         rows *= xshape[i]
 
     var dt = x.dtype().to_mojo_dtype()
+    var sdt = scale.dtype().to_mojo_dtype()
+    if (
+        sdt != DType.float32
+        and sdt != DType.bfloat16
+        and sdt != DType.float16
+    ):
+        raise Error("krea2_rmsnorm: scale dtype must be F32/BF16/F16")
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
     var g_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
-    var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
-        scale.buf.unsafe_ptr().bitcast[Float32](), g_rl
-    )
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float32](), x_rl
@@ -452,10 +452,30 @@ def krea2_rmsnorm(
         var O = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float32](), x_rl
         )
-        ctx.enqueue_function[
-            _krea2_rmsnorm_kernel[DType.float32],
-            _krea2_rmsnorm_kernel[DType.float32],
-        ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        if sdt == DType.float32:
+            var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float32](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.float32, DType.float32],
+                _krea2_rmsnorm_kernel[DType.float32, DType.float32],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        elif sdt == DType.bfloat16:
+            var SC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.float32, DType.bfloat16],
+                _krea2_rmsnorm_kernel[DType.float32, DType.bfloat16],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        else:
+            var SC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float16](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.float32, DType.float16],
+                _krea2_rmsnorm_kernel[DType.float32, DType.float16],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
     elif dt == DType.bfloat16:
         var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
@@ -463,10 +483,30 @@ def krea2_rmsnorm(
         var O = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
         )
-        ctx.enqueue_function[
-            _krea2_rmsnorm_kernel[DType.bfloat16],
-            _krea2_rmsnorm_kernel[DType.bfloat16],
-        ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        if sdt == DType.float32:
+            var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float32](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.bfloat16, DType.float32],
+                _krea2_rmsnorm_kernel[DType.bfloat16, DType.float32],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        elif sdt == DType.bfloat16:
+            var SC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.bfloat16, DType.bfloat16],
+                _krea2_rmsnorm_kernel[DType.bfloat16, DType.bfloat16],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        else:
+            var SC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float16](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.bfloat16, DType.float16],
+                _krea2_rmsnorm_kernel[DType.bfloat16, DType.float16],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
     else:
         var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             x.buf.unsafe_ptr().bitcast[Float16](), x_rl
@@ -474,12 +514,227 @@ def krea2_rmsnorm(
         var O = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
             out_buf.unsafe_ptr().bitcast[Float16](), x_rl
         )
-        ctx.enqueue_function[
-            _krea2_rmsnorm_kernel[DType.float16],
-            _krea2_rmsnorm_kernel[DType.float16],
-        ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        if sdt == DType.float32:
+            var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float32](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.float16, DType.float32],
+                _krea2_rmsnorm_kernel[DType.float16, DType.float32],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        elif sdt == DType.bfloat16:
+            var SC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[BFloat16](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.float16, DType.bfloat16],
+                _krea2_rmsnorm_kernel[DType.float16, DType.bfloat16],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        else:
+            var SC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float16](), g_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_kernel[DType.float16, DType.float16],
+                _krea2_rmsnorm_kernel[DType.float16, DType.float16],
+            ](X, SC, O, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
     # No trailing sync (single-stream ordering; downstream .to_host() syncs).
     return Tensor(out_buf^, x.shape(), x.dtype())
+
+
+def _krea2_rmsnorm_bwd_dx_kernel[x_dtype: DType, scale_dtype: DType](
+    go: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    x: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    scale: LayoutTensor[scale_dtype, _DYN1, MutAnyOrigin],
+    dx: LayoutTensor[x_dtype, _DYN2, MutAnyOrigin],
+    cols: Int,
+    eps: Float32,
+):
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var shared = stack_allocation[
+        _RMS_TPB, Scalar[DType.float32], address_space=AddressSpace.SHARED
+    ]()
+    var local: Float32 = 0.0
+    var c = tid
+    while c < cols:
+        var v = rebind[Scalar[x_dtype]](x[row, c]).cast[DType.float32]()
+        local += v * v
+        c += _RMS_TPB
+    shared[tid] = local
+    barrier()
+    var active = _RMS_TPB // 2
+    while active > 0:
+        if tid < active:
+            shared[tid] = shared[tid] + shared[tid + active]
+        barrier()
+        active //= 2
+    var inv = 1.0 / sqrt(shared[0] / Float32(cols) + eps)
+    barrier()
+
+    var lgwx: Float32 = 0.0
+    c = tid
+    while c < cols:
+        var gov = rebind[Scalar[x_dtype]](go[row, c]).cast[DType.float32]()
+        var xv = rebind[Scalar[x_dtype]](x[row, c]).cast[DType.float32]()
+        var w = rebind[Scalar[scale_dtype]](scale[c]).cast[DType.float32]() + Float32(1.0)
+        lgwx += gov * w * xv
+        c += _RMS_TPB
+    shared[tid] = lgwx
+    barrier()
+    active = _RMS_TPB // 2
+    while active > 0:
+        if tid < active:
+            shared[tid] = shared[tid] + shared[tid + active]
+        barrier()
+        active //= 2
+    var sum_gwx = shared[0]
+    barrier()
+
+    var inv3 = inv * inv * inv
+    c = tid
+    while c < cols:
+        var xv = rebind[Scalar[x_dtype]](x[row, c]).cast[DType.float32]()
+        var gov = rebind[Scalar[x_dtype]](go[row, c]).cast[DType.float32]()
+        var w = rebind[Scalar[scale_dtype]](scale[c]).cast[DType.float32]() + Float32(1.0)
+        var out = w * gov * inv - xv * inv3 * (sum_gwx / Float32(cols))
+        dx[row, c] = rebind[dx.element_type](out.cast[x_dtype]())
+        c += _RMS_TPB
+
+
+def krea2_rmsnorm_backward_dx(
+    go: Tensor, x: Tensor, scale: Tensor, eps: Float32, ctx: DeviceContext
+) raises -> Tensor:
+    """Backward d_x for Krea2 RMSNorm's F32-internal scale.float()+1 contract.
+
+    go/x keep their storage dtype at tensor boundaries. The raw scale tensor may
+    be BF16/F16/F32; it is cast to F32 internally before adding 1.0.
+    """
+    if x.dtype() != go.dtype():
+        raise Error("krea2_rmsnorm_backward_dx: go/x dtype mismatch")
+    var xshape = x.shape()
+    if len(xshape) < 1:
+        raise Error("krea2_rmsnorm_backward_dx: x must have rank >= 1")
+    var cols = xshape[len(xshape) - 1]
+    if scale.numel() != cols:
+        raise Error("krea2_rmsnorm_backward_dx: scale numel must equal features")
+    var rows = 1
+    for i in range(len(xshape) - 1):
+        rows *= xshape[i]
+    var dx_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
+    var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, cols))
+    var s_rl = RuntimeLayout[_DYN1].row_major(IndexList[1](cols))
+    var dt = x.dtype().to_mojo_dtype()
+    var sdt = scale.dtype().to_mojo_dtype()
+    if (
+        sdt != DType.float32
+        and sdt != DType.bfloat16
+        and sdt != DType.float16
+    ):
+        raise Error("krea2_rmsnorm_backward_dx: scale dtype must be F32/BF16/F16")
+    if dt == DType.float32:
+        var GO = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        var DX = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float32](), x_rl
+        )
+        if sdt == DType.float32:
+            var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float32, DType.float32],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float32, DType.float32],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        elif sdt == DType.bfloat16:
+            var SC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[BFloat16](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float32, DType.bfloat16],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float32, DType.bfloat16],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        else:
+            var SC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float16](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float32, DType.float16],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float32, DType.float16],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+    elif dt == DType.bfloat16:
+        var GO = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var X = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        var DX = LayoutTensor[DType.bfloat16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[BFloat16](), x_rl
+        )
+        if sdt == DType.float32:
+            var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.bfloat16, DType.float32],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.bfloat16, DType.float32],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        elif sdt == DType.bfloat16:
+            var SC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[BFloat16](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.bfloat16, DType.bfloat16],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.bfloat16, DType.bfloat16],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        else:
+            var SC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float16](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.bfloat16, DType.float16],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.bfloat16, DType.float16],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+    else:
+        var GO = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            go.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var X = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            x.buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        var DX = LayoutTensor[DType.float16, _DYN2, MutAnyOrigin](
+            dx_buf.unsafe_ptr().bitcast[Float16](), x_rl
+        )
+        if sdt == DType.float32:
+            var SC = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float32](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float16, DType.float32],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float16, DType.float32],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        elif sdt == DType.bfloat16:
+            var SC = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[BFloat16](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float16, DType.bfloat16],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float16, DType.bfloat16],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+        else:
+            var SC = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](
+                scale.buf.unsafe_ptr().bitcast[Float16](), s_rl
+            )
+            ctx.enqueue_function[
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float16, DType.float16],
+                _krea2_rmsnorm_bwd_dx_kernel[DType.float16, DType.float16],
+            ](GO, X, SC, DX, cols, eps, grid_dim=rows, block_dim=_RMS_TPB)
+    return Tensor(dx_buf^, xshape^, x.dtype())
 
 
 def krea2_swiglu_mlpdim(features: Int, multiplier: Int) -> Int:
@@ -667,8 +922,8 @@ def krea2_attention[L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int](
     wv: Tensor,            # [KVHEADS*HEADDIM, features] = [1536, 6144]
     gate_w: Tensor,        # [features, features]        = [6144, 6144]
     wo: Tensor,            # [features, features]        = [6144, 6144]
-    qnorm_scale: Tensor,   # [HEADDIM] F32  (QKNorm.qnorm.scale)
-    knorm_scale: Tensor,   # [HEADDIM] F32  (QKNorm.knorm.scale)
+    qnorm_scale: Tensor,   # [HEADDIM] raw checkpoint dtype (QKNorm.qnorm.scale)
+    knorm_scale: Tensor,   # [HEADDIM] raw checkpoint dtype (QKNorm.knorm.scale)
     cos: Tensor,           # [L, HEADDIM/2]  per-token RoPE table (build_krea2_rope)
     sin: Tensor,           # [L, HEADDIM/2]
     mask: Optional[Tensor],  # None, or additive [1, HEADS, L, L] (tiled-path pad mask)
@@ -713,106 +968,56 @@ def krea2_attention[L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int](
     v_shape.append(1); v_shape.append(L); v_shape.append(kvheads); v_shape.append(headdim)
     v = reshape(v, v_shape^, ctx)
 
-    # 3) QKNorm over headdim (krea2_rmsnorm, F32-internal, weight=scale+1). v untouched.
-    # KEEP q/k/v IN F32 from here through SDPA. The reference's QKNorm scale can be
-    # large (block-0 reaches scale+1 = 52.9×), driving q/k to magnitude ~600 and
-    # attention scores to ~3e4 (near-one-hot softmax). bf16-storing q/k there loses
-    # ~2-5 absolute per element, which flips the near-one-hot winner and diverges
-    # (block-0 attn cos 0.73). torch is robust because F.sdpa upcasts; keeping q/k/v
-    # F32 (matches "F32 between intra-block ops") removes the bf16-rounding source
-    # — VERIFIED: F32 q/k/v -> F32 sdpa matches torch's bf16 sdpa_out at cos 0.99999.
-    var qf = cast_tensor(q, STDtype.F32, ctx)
-    var kf = cast_tensor(k, STDtype.F32, ctx)
-    var vf = cast_tensor(v, STDtype.F32, ctx)
-    qf = krea2_rmsnorm(qf, qnorm_scale, Float32(1.0e-5), ctx)
-    kf = krea2_rmsnorm(kf, knorm_scale, Float32(1.0e-5), ctx)
+    # 3) QKNorm over headdim. krea2_rmsnorm uses F32 internal reduction/scale math
+    # and returns the input storage dtype; q/k/v remain BF16 at the block boundary.
+    q = krea2_rmsnorm(q, qnorm_scale, Float32(1.0e-5), ctx)
+    k = krea2_rmsnorm(k, knorm_scale, Float32(1.0e-5), ctx)
 
-    # 4) RoPE on q,k (F32). Both share the per-token table, but q has `heads` heads
+    # 4) RoPE on q,k. Both share the per-token table, but q has `heads` heads
     # and k has `kvheads`, so each gets its own per-head BSHD tiling. rope_interleaved
     # applies the exact ropeapply 2x2 form (chunk-1 verified).
     var cos_q = _tile_rope_table(cos, L, heads, half, ctx)
     var sin_q = _tile_rope_table(sin, L, heads, half, ctx)
     var cos_k = _tile_rope_table(cos, L, kvheads, half, ctx)
     var sin_k = _tile_rope_table(sin, L, kvheads, half, ctx)
-    var q_rot = rope_interleaved(qf, cos_q, sin_q, ctx)   # F32
-    var k_rot = rope_interleaved(kf, cos_k, sin_k, ctx)   # F32
+    var q_rot = rope_interleaved(q, cos_q, sin_q, ctx)
+    var k_rot = rope_interleaved(k, cos_k, sin_k, ctx)
 
-    # 5) GQA: repeat_kv k,v from kvheads -> heads (BSHD [1,L,kvheads,Dh]), F32.
-    var k_full = repeat_kv_f32(k_rot, L, kvheads, n_rep, headdim, ctx)  # F32 [1,L,heads,Dh]
-    var v_full = repeat_kv_f32(vf, L, kvheads, n_rep, headdim, ctx)     # F32 [1,L,heads,Dh]
+    # 5) GQA: repeat_kv k,v from kvheads -> heads (BSHD [1,L,kvheads,Dh]).
+    # The helper name is historical; it preserves the input dtype.
+    var k_full = repeat_kv_f32(k_rot, L, kvheads, n_rep, headdim, ctx)
+    var v_full = repeat_kv_f32(v, L, kvheads, n_rep, headdim, ctx)
 
     # 6) SDPA. THREE paths (Dh=128):
     #  (a) cuDNN FLASH (real_len set): tensor-core fused flash on bf16 q/k/v — the
     #      reference's OWN backend (SDPBackend.CUDNN_ATTENTION). This is the 1024²
     #      speedup (the tiled F32 SDPA was nsys-measured at 54% of GPU time). cuDNN
     #      masks the [real_len:L] pad rows internally (replacing the additive mask).
-    #      bf16 q/k/v (RNE-cast the F32 carry): cuDNN's bf16 handles the near-one-hot
-    #      regime like the reference, so the F32 carry — a MATH-mode workaround — is
-    #      not needed here.
-    #  (b) TILED + mask (no real_len): online-softmax F32, additive pad mask.
+    #      BF16 q/k/v match the reference storage boundary; cuDNN uses F32-scale
+    #      attention math internally.
+    #  (b) TILED + mask (no real_len): online-softmax F32 math, additive pad mask.
     #  (c) TILED nomask (no mask, no real_len): the per-op gates (chunk 3).
     var scale = Float32(1.0) / sqrt(Float32(headdim))
-    var attn_f32: Tensor
+    var attn: Tensor
     if real_len:
-        # cuDNN flash on bf16 q/k/v; mask the [real_len:L] pad rows via real_len.
-        var q_bf = torch_f32_to_bf16_rne(q_rot, ctx)      # [1,L,heads,Dh] bf16
-        var k_bf = torch_f32_to_bf16_rne(k_full, ctx)
-        var v_bf = torch_f32_to_bf16_rne(v_full, ctx)
+        # cuDNN flash on BF16 q/k/v; mask the [real_len:L] pad rows via real_len.
         var fwd = sdpa_flash_fwd_padmask[1, L, HEADS, HEADDIM](
-            q_bf, k_bf, v_bf, real_len.value(), scale, ctx
+            q_rot, k_full, v_full, real_len.value(), scale, ctx
         )
-        attn_f32 = cast_tensor(fwd.o, STDtype.F32, ctx)   # bf16 [1,L,heads,Dh] -> F32 for step 7
+        attn = fwd.o
     elif mask:
-        var mask_f32 = cast_tensor(mask.value(), STDtype.F32, ctx)
-        attn_f32 = sdpa_tiled[1, L, HEADS, HEADDIM](q_rot, k_full, v_full, mask_f32, scale, ctx)
+        attn = sdpa_tiled[1, L, HEADS, HEADDIM](q_rot, k_full, v_full, mask.value(), scale, ctx)
     else:
-        attn_f32 = sdpa_nomask_tiled[1, L, HEADS, HEADDIM](q_rot, k_full, v_full, scale, ctx)
-    # 7) Match torch's dtype flow EXACTLY, with torch's ROUND-TO-NEAREST-EVEN at
-    # every bf16 boundary. torch: F.sdpa accumulates F32 and casts to bf16 ONCE at
-    # its output; then `* sigmoid(gate)` (bf16) and `wo` (bf16 matmul, F32 accum)
-    # each produce a bf16 result. Mojo's NATIVE cast[bfloat16]() differs from torch
-    # RNE by up to one bf16 quantum — at the block-0 attn-output magnitude ~190 on
-    # the outlier channels ch2569/3389 (quantum ~1.5) that is the ~0.8%/element
-    # residual. We use torch_f32_to_bf16_rne at each bf16 store so the rounding
-    # MATCHES torch (we do NOT keep F32 past sdpa — that would over-precise vs the
-    # bf16 reference). For an F32 model (x.dtype F32) the RNE path is skipped.
+        attn = sdpa_nomask_tiled[1, L, HEADS, HEADDIM](q_rot, k_full, v_full, scale, ctx)
+
+    # 7) Match the BF16 product flow: SDPA stores the q/k/v dtype, gate multiply
+    # stores that dtype, and wo uses BF16 inputs/weights with F32 GEMM accumulation.
     var merge_shape = List[Int]()
     merge_shape.append(1); merge_shape.append(L); merge_shape.append(features)
-    var merged_f32 = reshape(attn_f32, merge_shape^, ctx)   # [1, L, features] F32
-    var is_bf16 = x.dtype() == STDtype.BF16
-
-    # sdpa-output -> bf16 (RNE).
-    var attn: Tensor
-    if is_bf16:
-        attn = torch_f32_to_bf16_rne(merged_f32, ctx)
-    else:
-        attn = cast_tensor(merged_f32, x.dtype(), ctx)
-
-    # gate-mul: attn * sigmoid(gate) -> bf16 (RNE on the product store).
-    var g = sigmoid(gate, ctx)                              # bf16 sigmoid(gate)
-    var gated: Tensor
-    if is_bf16:
-        var gated_f32 = mul(
-            cast_tensor(attn, STDtype.F32, ctx),
-            cast_tensor(g, STDtype.F32, ctx),
-            ctx,
-        )                                                  # F32 product
-        gated = torch_f32_to_bf16_rne(gated_f32, ctx)      # RNE store
-    else:
-        gated = mul(attn, g, ctx)
-
-    # wo: bf16 matmul (F32 accum) -> bf16 (RNE on the output store). Run linear in
-    # F32 (same F32 accum; inputs are the already-rounded bf16 values upcast) and
-    # RNE-cast the result, so the output rounding matches torch.
-    if is_bf16:
-        var wo_f32 = linear(
-            cast_tensor(gated, STDtype.F32, ctx),
-            cast_tensor(wo, STDtype.F32, ctx),
-            None, ctx,
-        )                                                  # F32 matmul result
-        return torch_f32_to_bf16_rne(wo_f32, ctx)          # [1, L, features] bf16 RNE
-    else:
-        return linear(gated, wo, None, ctx)
+    var merged = reshape(attn, merge_shape^, ctx)
+    var g = sigmoid(gate, ctx)
+    var gated = mul(merged, g, ctx)
+    return linear(gated, wo, None, ctx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1291,11 +1496,8 @@ def krea2_text_fusion[LT: Int, NLAYERS: Int, HEADS: Int, HEADDIM: Int](
 #   _wb(...)  loads ANY float weight as BF16 (F32/F16->bf16; bf16 is a no-op) — the
 #             reference's `v.to(bf16)`. Used for every matmul weight + mod.lin + the
 #             linears/embedders (already bf16-loaded).
-#   _scale(...) loads a norm `.scale` as the bf16-ROUNDED value upcast to F32 — i.e.
-#             `bf16(scale).float()`, EXACTLY the reference's `self.scale.float()` on a
-#             now-bf16 scale (krea2_rmsnorm needs F32 and adds +1.0 in F32). On the
-#             bf16-saved gate oracles this equals the old from_view_as_f32; on the
-#             real F32-on-disk checkpoint it bf16-rounds first (the faithful value).
+#   _scale(...) loads a norm `.scale` as BF16 storage. krea2_rmsnorm casts scale to
+#             F32 internally and applies the reference `self.scale.float() + 1.0`.
 def _wb(st: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> Tensor:
     return Tensor.from_view_as_bf16(st.tensor_view(key), ctx)
 
@@ -1375,15 +1577,16 @@ def _blk_modlin(
 
 
 def _scale(st: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> Tensor:
-    return cast_tensor(Tensor.from_view_as_bf16(st.tensor_view(key), ctx), STDtype.F32, ctx)
+    return Tensor.from_view_as_bf16(st.tensor_view(key), ctx)
 
 
 def _txtf_bundle(
     st: ShardedSafeTensors, prefix: String, ctx: DeviceContext
 ) raises -> Krea2TextFusionWeights:
     """Load one TextFusionBlock bundle from the checkpoint, ALL float params bf16
-    at runtime (= reference v.to(bf16)). Norm scales = bf16-rounded then F32 for
-    krea2_rmsnorm. `prefix` is the FULL key prefix (incl. any checkpoint prefix)."""
+    at runtime (= reference v.to(bf16)). Norm scales stay BF16 at tensor
+    boundaries; krea2_rmsnorm casts internally for reference scale.float()+1
+    compute. `prefix` is the FULL key prefix (incl. any checkpoint prefix)."""
     return Krea2TextFusionWeights(
         ArcPointer(_scale(st, prefix + ".prenorm.scale", ctx)),
         ArcPointer(_scale(st, prefix + ".postnorm.scale", ctx)),
@@ -1618,8 +1821,9 @@ def krea2_forward[
         if lora:
             ctx.synchronize()
 
-    # 13) final = last_layer(combined, t)  (tvec = t3, the tmlp output). ALL bf16:
-    # norm.scale bf16-rounded->F32, modulation.lin + linear weight/bias bf16.
+    # 13) final = last_layer(combined, t)  (tvec = t3, the tmlp output).
+    # Norm scale stays raw checkpoint dtype at the boundary; krea2_rmsnorm casts it
+    # internally for scale.float()+1 and returns x dtype.
     var final = krea2_last_layer(
         x,
         t3,

@@ -86,6 +86,11 @@ KREA2_MMDIT_CONFIG = dict(
 RANK = 8
 ALPHA = 16.0
 LSCALE = ALPHA / RANK  # 2.0
+ADAMW_LR = 1.0e-3
+ADAMW_BETA1 = 0.9
+ADAMW_BETA2 = 0.999
+ADAMW_EPS = 1.0e-8
+ADAMW_WEIGHT_DECAY = 0.01
 # The 8 LoRA-wrapped Linears per single-stream block + their (in, out) features.
 # (mmdit.py SingleStreamBlock: attn.{wq,wk,wv,gate,wo}, mlp.{gate,up,down}.)
 FEATURES = KREA2_MMDIT_CONFIG["features"]            # 6144
@@ -258,6 +263,44 @@ def main() -> None:
         ).reshape_as(velocity) * 0.05
         (velocity * d_velocity).sum().backward()
 
+    # ── one AdamW update over the reduced-depth block LoRA tensors ─────────────
+    # This is a bounded optimizer replay oracle: the existing `blk*.A/B` dump
+    # below remains the pre-update tensor used for fwd/bwd parity, while the
+    # `kadamw.*` keys capture before/grad/after/state for the shared device ABI.
+    adamw_names = []
+    adamw_params = []
+    for bi in range(NBLOCKS):
+        for (slot, _path) in SLOT_PATHS:
+            A, Bp = loras[(bi, slot)]
+            adamw_names.append(f"blk{bi}.{slot}.A")
+            adamw_params.append(A)
+            adamw_names.append(f"blk{bi}.{slot}.B")
+            adamw_params.append(Bp)
+    adamw_before = {name: p.detach().clone() for name, p in zip(adamw_names, adamw_params)}
+    adamw_grad = {
+        name: p.grad.detach().clone()
+        for name, p in zip(adamw_names, adamw_params)
+    }
+    opt = torch.optim.AdamW(
+        adamw_params,
+        lr=ADAMW_LR,
+        betas=(ADAMW_BETA1, ADAMW_BETA2),
+        eps=ADAMW_EPS,
+        weight_decay=ADAMW_WEIGHT_DECAY,
+        foreach=False,
+        fused=False,
+    )
+    opt.step()
+    adamw_after = {name: p.detach().clone() for name, p in zip(adamw_names, adamw_params)}
+    adamw_exp_avg = {
+        name: opt.state[p]["exp_avg"].detach().clone()
+        for name, p in zip(adamw_names, adamw_params)
+    }
+    adamw_exp_avg_sq = {
+        name: opt.state[p]["exp_avg_sq"].detach().clone()
+        for name, p in zip(adamw_names, adamw_params)
+    }
+
     # ── dump everything the Mojo gate reconstructs ──────────────────────────────
     out = {}
 
@@ -286,10 +329,18 @@ def main() -> None:
         # per-block LoRA A/B (inputs) + grads (the deliverable)
         for (slot, _path) in SLOT_PATHS:
             A, Bp = loras[(bi, slot)]
-            put(f"blk{bi}.{slot}.A", A)
-            put(f"blk{bi}.{slot}.B", Bp)
-            put(f"kref.blk{bi}.{slot}.dA", A.grad)
-            put(f"kref.blk{bi}.{slot}.dB", Bp.grad)
+            a_name = f"blk{bi}.{slot}.A"
+            b_name = f"blk{bi}.{slot}.B"
+            put(a_name, adamw_before[a_name])
+            put(b_name, adamw_before[b_name])
+            put(f"kref.blk{bi}.{slot}.dA", adamw_grad[a_name])
+            put(f"kref.blk{bi}.{slot}.dB", adamw_grad[b_name])
+            for pname in (a_name, b_name):
+                put(f"kadamw.{pname}.before", adamw_before[pname])
+                put(f"kadamw.{pname}.grad", adamw_grad[pname])
+                put(f"kadamw.{pname}.after", adamw_after[pname])
+                put(f"kadamw.{pname}.exp_avg", adamw_exp_avg[pname])
+                put(f"kadamw.{pname}.exp_avg_sq", adamw_exp_avg_sq[pname])
 
     # final-layer (last) frozen weights
     put("last.norm", model.last.norm.scale)
@@ -303,9 +354,26 @@ def main() -> None:
     out["meta_lfull"] = torch.tensor([L_FULL], dtype=torch.int32)
     out["meta_nblocks"] = torch.tensor([NBLOCKS], dtype=torch.int32)
     out["meta_mlpdim"] = torch.tensor([MLPDIM], dtype=torch.int32)
+    out["meta_adamw_tensor_count"] = torch.tensor([len(adamw_names)], dtype=torch.int32)
+    out["meta_adamw_step"] = torch.tensor([1], dtype=torch.int32)
+    out["meta_adamw_lr"] = torch.tensor([ADAMW_LR], dtype=torch.float32)
+    out["meta_adamw_beta1"] = torch.tensor([ADAMW_BETA1], dtype=torch.float32)
+    out["meta_adamw_beta2"] = torch.tensor([ADAMW_BETA2], dtype=torch.float32)
+    out["meta_adamw_eps"] = torch.tensor([ADAMW_EPS], dtype=torch.float32)
+    out["meta_adamw_weight_decay"] = torch.tensor([ADAMW_WEIGHT_DECAY], dtype=torch.float32)
 
     save_file(out, OUT)
-    print(f"forward velocity mean={float(velocity.mean()):.6f} std={float(velocity.std()):.6f}", flush=True)
+    print(
+        f"forward velocity mean={float(velocity.detach().mean()):.6f} "
+        f"std={float(velocity.detach().std()):.6f}",
+        flush=True,
+    )
+    print(
+        "adamw update tensors="
+        f"{len(adamw_names)} lr={ADAMW_LR} betas=({ADAMW_BETA1},{ADAMW_BETA2}) "
+        f"eps={ADAMW_EPS} weight_decay={ADAMW_WEIGHT_DECAY}",
+        flush=True,
+    )
     print(f"OK dumped {len(out)} tensors -> {OUT}  ({os.path.getsize(OUT)/1e6:.1f} MB)", flush=True)
 
 

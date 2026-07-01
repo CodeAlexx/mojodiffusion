@@ -296,10 +296,18 @@ def _swiglu_bwd_kernel[dtype: DType](
         var x = rebind[Scalar[dtype]](gate[i]).cast[DType.float32]()
         var u = rebind[Scalar[dtype]](up[i]).cast[DType.float32]()
         var sig = _sigmoid_f32(x)
-        var silu_x = x * sig
         var dsilu = sig + x * sig * (1.0 - sig)
-        d_up[i] = rebind[d_up.element_type]((g * silu_x).cast[dtype]())
-        d_gate[i] = rebind[d_gate.element_type]((g * dsilu * u).cast[dtype]())
+        comptime if dtype == DType.bfloat16:
+            # Match PyTorch BF16 graph order for F.silu(gate) * up:
+            # silu(gate) and grad_out*up are BF16 tensors before the next op.
+            var silu_x = (x * sig).cast[DType.bfloat16]().cast[DType.float32]()
+            var d_silu = (g * u).cast[DType.bfloat16]().cast[DType.float32]()
+            d_up[i] = rebind[d_up.element_type]((g * silu_x).cast[dtype]())
+            d_gate[i] = rebind[d_gate.element_type]((d_silu * dsilu).cast[dtype]())
+        else:
+            var silu_x = x * sig
+            d_up[i] = rebind[d_up.element_type]((g * silu_x).cast[dtype]())
+            d_gate[i] = rebind[d_gate.element_type]((g * dsilu * u).cast[dtype]())
 
 
 def swiglu_backward(

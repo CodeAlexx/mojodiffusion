@@ -11,22 +11,24 @@ Use in this order:
 1. `.claude/skills/ot-mojo-model-intake/SKILL.md`
 2. `.claude/skills/mojo-model-runtime-port/SKILL.md`
 3. `.claude/skills/serenity-image-generation-system/SKILL.md`
-4. `.claude/skills/ot-mojo-training-port/SKILL.md`
-5. `.claude/skills/ot-mojo-sampler-port/SKILL.md`
-6. `.claude/skills/ot-mojo-parity-gates/SKILL.md`
-7. `.claude/skills/ot-mojo-production-use/SKILL.md`
-8. `.claude/skills/ot-mojo-agent-handoff/SKILL.md`
+4. `.claude/skills/mojo-shared-code-import/SKILL.md`
+5. `.claude/skills/ot-mojo-training-port/SKILL.md`
+6. `.claude/skills/ot-mojo-sampler-port/SKILL.md`
+7. `.claude/skills/ot-mojo-parity-gates/SKILL.md`
+8. `.claude/skills/ot-mojo-production-use/SKILL.md`
+9. `.claude/skills/ot-mojo-agent-handoff/SKILL.md`
 
 Codex mirror:
 
 1. `.codex/skills/ot-mojo-model-intake/SKILL.md`
 2. `.codex/skills/mojo-model-runtime-port/SKILL.md`
 3. `.codex/skills/serenity-image-generation-system/SKILL.md`
-4. `.codex/skills/ot-mojo-training-port/SKILL.md`
-5. `.codex/skills/ot-mojo-sampler-port/SKILL.md`
-6. `.codex/skills/ot-mojo-parity-gates/SKILL.md`
-7. `.codex/skills/ot-mojo-production-use/SKILL.md`
-8. `.codex/skills/ot-mojo-agent-handoff/SKILL.md`
+4. `.codex/skills/mojo-shared-code-import/SKILL.md`
+5. `.codex/skills/ot-mojo-training-port/SKILL.md`
+6. `.codex/skills/ot-mojo-sampler-port/SKILL.md`
+7. `.codex/skills/ot-mojo-parity-gates/SKILL.md`
+8. `.codex/skills/ot-mojo-production-use/SKILL.md`
+9. `.codex/skills/ot-mojo-agent-handoff/SKILL.md`
 
 Core rule: OneTrainer is the reference. Mojo product code must stay
 Mojo-native. Python is allowed for oracle dumps, static guards, measurement
@@ -39,6 +41,9 @@ offload, LoRA target, and artifact contracts instead of carrying a second stack.
 Use `serenity-image-generation-system` for the concrete image-generation product
 path: direct sample CLIs, Rust `/v1/generate`, Mojo workers, missing-weight
 preflight, artifact inspection, speed/VRAM triage, and new backend coding.
+Use `mojo-shared-code-import` whenever a task adds shared Mojo modules, moves
+model-specific code into `serenitymojo/ops` or `serenitymojo/training`, wires new
+imports across trainers, or creates reusable ABI surfaces.
 
 Before claiming a model is ready, run the parity/readiness gates and report the
 actual evidence level: compile, smoke, artifact consumer, loss bridge,

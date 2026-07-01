@@ -1,0 +1,149 @@
+{
+  "command": [
+    "pixi",
+    "run",
+    "mojo",
+    "run",
+    "-D",
+    "ZIMAGE_SELECTED_REPLAY_MAIN_DEPTH=30",
+    "-I",
+    ".",
+    "serenitymojo/models/zimage/parity/zimage_train_ref_selected_grad_replay.mojo"
+  ],
+  "created_at": "2026-07-01T02:42:37.640220+00:00",
+  "elapsed_seconds": 14.446727985981852,
+  "evidence_level": "external observed VRAM plus full-depth all-trainable grad replay; not product-loop parity and not strict BF16 activation storage",
+  "external_vram": {
+    "baseline_used_mib": 1293,
+    "external_peak_vram_delta_bytes": 22567452672,
+    "external_peak_vram_delta_mib": 21522,
+    "gpu_index": null,
+    "peak_used_mib": 22815,
+    "poll_seconds": 0.05,
+    "sample_count": 203,
+    "sampler": "nvidia-smi",
+    "samples_tail": [
+      {
+        "t_rel_seconds": 13.194013,
+        "used_mib": 22815
+      },
+      {
+        "t_rel_seconds": 13.262603,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 13.33085,
+        "used_mib": 22815
+      },
+      {
+        "t_rel_seconds": 13.399066,
+        "used_mib": 22815
+      },
+      {
+        "t_rel_seconds": 13.467859,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 13.536486,
+        "used_mib": 22815
+      },
+      {
+        "t_rel_seconds": 13.605634,
+        "used_mib": 22815
+      },
+      {
+        "t_rel_seconds": 13.674248,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 13.742384,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 13.81094,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 13.879561,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 13.947829,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 14.016195,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 14.084269,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 14.152439,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 14.22096,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 14.289342,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 14.357589,
+        "used_mib": 22171
+      },
+      {
+        "t_rel_seconds": 14.425392,
+        "used_mib": 1293
+      },
+      {
+        "t_rel_seconds": 14.476842,
+        "used_mib": 1293
+      }
+    ]
+  },
+  "mojo": {
+    "all_trainable_grad_max_abs": 3.6748774618899915e-06,
+    "all_trainable_grad_numel": 35020800,
+    "all_trainable_grad_tensors": 420,
+    "all_trainable_grad_tol": 1e-05,
+    "observed_vram_mib_lower_bound": 1479.42333984375,
+    "pass_marker": true,
+    "selected_layer0_grad_max_abs": 8.392975701099203e-07,
+    "stdout_tail": [
+      "Included from /home/alex/mojodiffusion/serenitymojo/models/zimage/parity/zimage_train_ref_selected_grad_replay.mojo:26:",
+      "Included from /home/alex/mojodiffusion/./serenitymojo/models/zimage/real_weights.mojo:43:",
+      "/home/alex/mojodiffusion/./serenitymojo/ops/norm.mojo:326:32: warning: unreachable code on right side of 'False and ...'",
+      "    var use_vec = RMS_NORM_VEC and (d % _VW == 0)",
+      "                               ^",
+      "Included from /home/alex/mojodiffusion/serenitymojo/models/zimage/parity/zimage_train_ref_selected_grad_replay.mojo:47:",
+      "Included from /home/alex/mojodiffusion/./serenitymojo/models/zimage/zimage_stack_lora.mojo:83:",
+      "/home/alex/mojodiffusion/./serenitymojo/ops/norm_backward.mojo:573:32: warning: unreachable code on right side of 'False and ...'",
+      "    var use_vec = RMS_NORM_VEC and (d % _VW == 0)",
+      "                               ^",
+      "Included from /home/alex/mojodiffusion/serenitymojo/models/zimage/parity/zimage_train_ref_selected_grad_replay.mojo:26:",
+      "Included from /home/alex/mojodiffusion/./serenitymojo/models/zimage/real_weights.mojo:47:",
+      "Included from /home/alex/mojodiffusion/./serenitymojo/models/zimage/block.mojo:77:",
+      "/home/alex/mojodiffusion/./serenitymojo/ops/attention.mojo:261:1: warning: 'fn' is deprecated, use 'def' instead",
+      "fn _cast_buf_to_f32[dtype: DType](",
+      "^~",
+      "def",
+      "[zimage-selected-grad-replay] preflight PASS step_tensors= 42  adapter_tensors= 3360  selected_layer= 0  selected_tensors= 14  selected_numel= 1167360",
+      "[zimage-selected-grad-replay] exact_ot_geometry img_rows= 1024  cap_valid=( 145 , 127 ) cap_padded=( 160 , 128 ) max_cap= 160  seq=( 1184 , 1152 ) max_seq= 1184  sample1_masked_cap_rows= 32  sample1_masked_unified_rows= 32",
+      "[zimage-selected-grad-replay] bf16_ingest PASS step_boundary=BF16  adapter_dump_dtype=F32 adapter_device_boundary=BF16  selected_layer= 0  adapter_device_tensors= 14  replay_scale= 0.0625",
+      "[zimage-selected-grad-replay] base_block_ingest PASS checkpoint_boundary=BF16  transformer_tensors= 521  selected_layer= 0  base_block_device_tensors=13  stream_prereq=single_block_load",
+      "[zimage-selected-grad-replay] full_selected_grad_replay PASS  evidence=full-depth-all-trainable-grad-replay  step_boundary=BF16 checkpoint_boundary=BF16  streamed_refiner_blocks=4 streamed_main_blocks= 30  streamed_b2_selected_replay_blocks= 30  streamed_b2_selected_replay_no_resident_main_blocks=true  prepared_main_mod_b2= 30  depth_define=ZIMAGE_SELECTED_REPLAY_MAIN_DEPTH  cap_attn_len=( 160 , 128 ) main_attn_len=( 1184 , 1152 ) x_rope_per_sample=true  all_trainable_grad_tensors= 420  all_trainable_grad_numel= 35020800  all_trainable_grad_max_abs= 3.6748774618899915e-06  selected_layer0_grad_max_abs= 8.392975701099203e-07  all_trainable_grad_tol= 1e-05  activation_carrier_dtype=F32 not_strict_BF16_step_storage  observed_vram_mib_lower_bound= 1479.42333984375  streamed_b2_selected_replay_peak_vram_bytes_missing=true",
+      "[zimage-selected-grad-replay] streamed_bridge_required  forward=zimage_stack_lora_forward_main_device_b2_masked_streamed  backward=zimage_stack_lora_backward_main_device_b2_masked_streamed  resident_masked_b2_accepted=false  activation_carrier_dtype=F32 not_strict_BF16_step_storage  adapter_param_boundary=BF16 adapter_grad_boundary=F32_optimizer_or_host_compare_only",
+      "[zimage-selected-grad-replay] BLOCKED missing=streamed_b2_selected_replay_peak_vram_bytes; full streamed all-trainable grad comparison passed, but VRAM evidence is only an in-process lower-bound sample, not a true peak monitor"
+    ]
+  },
+  "pass": true,
+  "problems": [],
+  "returncode": 0,
+  "schema": "serenity.zimage.selected_grad_replay.external_vram.v1",
+  "streamed_b2_selected_replay_peak_vram_bytes": 22567452672,
+  "timed_out": false
+}

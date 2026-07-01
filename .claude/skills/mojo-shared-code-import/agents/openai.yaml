@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mojo Shared Code Import"
+  short_description: "Add shared Mojo code safely"
+  default_prompt: "Use $mojo-shared-code-import to add or import shared Mojo runtime/training code safely."

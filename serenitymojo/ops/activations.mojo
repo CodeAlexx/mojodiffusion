@@ -418,7 +418,10 @@ def _swiglu_kernel_bf16(
     if i < n:
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
         var uv = rebind[Scalar[DType.bfloat16]](u[i]).cast[DType.float32]()
-        o[i] = rebind[o.element_type]((_silu_f32(gv) * uv).cast[DType.bfloat16]())
+        # PyTorch BF16 `F.silu(gate) * up` rounds the SiLU result before the
+        # multiply. Match that storage-dtype boundary while keeping scalar math F32.
+        var silu_g = _silu_f32(gv).cast[DType.bfloat16]().cast[DType.float32]()
+        o[i] = rebind[o.element_type]((silu_g * uv).cast[DType.bfloat16]())
 
 
 def _swiglu_kernel_f16(
@@ -518,7 +521,9 @@ def _swiglu_packed_kernel_bf16(
         var c = i % f
         var gv = rebind[Scalar[DType.bfloat16]](gu[base + c]).cast[DType.float32]()
         var uv = rebind[Scalar[DType.bfloat16]](gu[base + f + c]).cast[DType.float32]()
-        o[i] = rebind[o.element_type]((_silu_f32(gv) * uv).cast[DType.bfloat16]())
+        # Match PyTorch BF16 `F.silu(gate) * up`: round SiLU before multiply.
+        var silu_g = _silu_f32(gv).cast[DType.bfloat16]().cast[DType.float32]()
+        o[i] = rebind[o.element_type]((silu_g * uv).cast[DType.bfloat16]())
 
 
 def _swiglu_packed_kernel_f16(

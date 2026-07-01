@@ -45,6 +45,9 @@ from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
 from serenitymojo.ops.gqa_backward import repeat_kv_backward, repeat_kv_backward_slab
 from serenitymojo.ops.activation_backward import sigmoid_backward, sigmoid_backward_slab
 from serenitymojo.ops.tensor_algebra import mul_slab as _ta_mul_slab_eng
+from serenitymojo.models.krea2.krea2_block import (
+    krea2_rmsnorm_backward_dx as _k2_rmsnorm_backward_dx,
+)
 
 # ── P6 Klein imports: the apply_klein arms call the Klein hand-chain's OWN
 # backward helpers / inline op sequence verbatim (file:line cited per arm).
@@ -114,6 +117,7 @@ from serenitymojo.autograd_v2.node import (
     OPK_KLEIN_SGL_OUT,
     OPK_REPEAT_KV,
     OPK_SIGMOID,
+    OPK_KREA2_RMS_NORM_DX,
     _raw_add,
     _raw_add_slab,
     _raw_mul,
@@ -216,6 +220,15 @@ def apply(node: Node, grads_in: List[TArc], ctx: DeviceContext) raises -> List[T
         # saved [x, weight]; scalars [eps]; weight frozen -> dx-only arm
         # (ops/norm_backward.mojo:373).
         var d_x = rms_norm_backward_dx(
+            g[], node.saved[0][], node.saved[1][], node.scalars[0], ctx
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_KREA2_RMS_NORM_DX:
+        # saved [x, raw_scale]; scalars [eps]. Krea2 RMSNorm computes
+        # raw_scale.float()+1.0 internally and returns x/go storage dtype.
+        var d_x = _k2_rmsnorm_backward_dx(
             g[], node.saved[0][], node.saved[1][], node.scalars[0], ctx
         )
         var out = List[TArc]()
@@ -576,6 +589,15 @@ def apply_slab(
     elif node.kind == OPK_RMS_NORM_DX:
         var d_x = rms_norm_backward_dx_slab(
             g[], node.saved[0][], node.saved[1][], node.scalars[0], ctx, slab
+        )
+        var out = List[TArc]()
+        out.append(TArc(d_x^))
+        return out^
+    elif node.kind == OPK_KREA2_RMS_NORM_DX:
+        # Krea2 currently exposes a non-slab allocation helper only; this arm is
+        # still the required slab-execution dispatch for raw-scale semantics.
+        var d_x = _k2_rmsnorm_backward_dx(
+            g[], node.saved[0][], node.saved[1][], node.scalars[0], ctx
         )
         var out = List[TArc]()
         out.append(TArc(d_x^))

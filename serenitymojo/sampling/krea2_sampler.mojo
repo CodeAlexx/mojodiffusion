@@ -152,9 +152,11 @@ def krea2_euler_step(
 ) raises -> Tensor:
     """Krea-2 Euler update (pipeline.py:254): latents + (t_prev - t_cur)*v.
 
-    `latents` and `v` must be the SAME dtype (F32 accumulator path). t descends
-    1 -> 0 across the schedule so (t_prev - t_cur) < 0 — the latent walks from
-    noise (t=1) to clean (t=0). Returns the next latent in `latents`' dtype.
+    `latents` and `v` must be the SAME dtype. Elementwise kernels may use F32
+    scalar math internally, but the latent carrier stays in `latents.dtype()`.
+    t descends 1 -> 0 across the schedule so (t_prev - t_cur) < 0 — the latent
+    walks from noise (t=1) to clean (t=0). Returns the next latent in
+    `latents`' dtype.
     """
     var dt = t_prev - t_cur
     var step = mul_scalar(v, dt, ctx)              # (t_prev - t_cur) * v

@@ -18,17 +18,23 @@ precision: block matmul weights bf16, embedders/heads/norms/mod F32.
 
 ## LoRA scope (ai-toolkit-faithful — VERIFIED against lora_special.py, NOT assumed)
 `target_lora_modules=["SingleStreamDiT"]` → LoRASpecialNetwork wraps **only nn.Linear**
-under the single-stream blocks = **8 adapters/block**: wq wk wv gate wo mlp_gate mlp_up
-mlp_down. `mod.lin` is a torch.nn.Parameter (NOT nn.Linear) → NOT wrapped/frozen;
-norms/qknorm frozen. (My initial brief said 9 incl mod.lin — WRONG; the builder
-followed the oracle. Don't train mod.lin unless deliberately superset-ing ai-toolkit.)
+under `SingleStreamDiT` modules whose dotted names contain `"blocks"`. That includes
+the 28 main `diffusion_model.blocks.*` blocks and the text-fusion
+`txtfusion.layerwise_blocks.*` / `txtfusion.refiner_blocks.*` modules. Each wrapped
+block contributes **8 adapters**: wq wk wv gate wo mlp_gate mlp_up mlp_down.
+`mod.lin` is a torch.nn.Parameter (NOT nn.Linear) → NOT wrapped/frozen; norms/qknorm
+frozen. (My initial brief said 9 incl mod.lin — WRONG; the builder followed the
+oracle. Don't train mod.lin unless deliberately superset-ing ai-toolkit.) The current
+Mojo product trainer wires only the 28 main blocks; the missing 4 text-fusion blocks
+are tracked by `scripts/check_krea2_trainable_surface.py`.
 
-## Architecture → LoRA backward path (scopes the stack phase)
+## Current Mojo architecture → LoRA backward path (scopes the stack phase)
 Forward: `first(img) → text-fusion blocks (12-layer context) → single-stream ×28 → final`.
-LoRA is ONLY on the single-stream blocks (after the text-fusion). So the LoRA backward =
-**final-layer bwd (frozen, d_x only) → single-stream bwd ×28 → STOP**. The text-fusion
-blocks + embedders are BEFORE the single-stream → frozen-skip (no LoRA, d_x not needed).
-**No text-fusion backward needed** for LoRA training.
+The implemented Mojo stack currently wires LoRA only on the 28 main single-stream blocks
+(after text-fusion). So the current Mojo backward is **final-layer bwd (frozen, d_x only)
+→ single-stream bwd ×28 → STOP**. That is a bounded main-block path, not ai-toolkit exact
+surface parity: ai-toolkit also trains/saves 4 text-fusion blocks, which requires text-fusion
+LoRA forward/backward plus optimizer/save wiring.
 
 ## Plan (revised — 4 phases)
 | Phase | Deliverable | Gate | Status |
@@ -261,7 +267,10 @@ LEAD-VERIFIED the written file: 448 tensors (224 A + 224 B), BF16, blocks 0..27,
 shapes correct (A[16,6144], wk B[1536,16], mlp.gate B[16384,16]) = valid re-loadable PEFT.
 Real 512px run: 20 steps, ~4.2s/step, no OOM, FINAL save wrote 224 pairs / 107MB.
 512px needs LTMAX=896 (70-sample giger captions reach 803, ×128-aligned); 1024px default
-keeps LTMAX=768 (4-sample subset ≤647). SCOPE: main-block only (txtfusion frozen-skip).
+keeps LTMAX=768 (4-sample subset ≤647). SCOPE: main-block only. Current surface gate:
+the rank-32 real-cache smoke writes 448 BF16 main-block tensors with `shape_mismatch=0`
+against ai-toolkit common keys, but exact ai-toolkit parity remains blocked by the 64
+missing BF16 `diffusion_model.txtfusion.*` tensors.
 
 ## LoRA INFERENCE — works + visibly shifts (2026-06-27, aa0d83e)
 

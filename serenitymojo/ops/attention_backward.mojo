@@ -185,6 +185,24 @@ def _add_mask_rows_f32(
         )
 
 
+# ── add a full batched additive attention mask to F32 scores in place ────────
+# scores [B*H*S, S]; mask [B*H*S, S] F32. This is required for training batches
+# where each sample has a different valid sequence length after padding.
+def _add_batched_mask_rows_f32(
+    x: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    m: LayoutTensor[DType.float32, _DYN2, MutAnyOrigin],
+    s: Int, rows: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < rows * s:
+        var r = idx // s
+        var c = idx % s
+        x[r, c] = rebind[x.element_type](
+            rebind[Scalar[DType.float32]](x[r, c])
+            + rebind[Scalar[DType.float32]](m[r, c])
+        )
+
+
 # ── softmax over last dim, in place on F32 scores [BH*S, S] ──────────────────
 # One block per row; shared-memory tree reductions in F32. Identical to the
 # forward's _softmax_rows_f32 (attention.mojo) — the recompute must match the
@@ -577,10 +595,11 @@ def sdpa_backward_masked[
     """sdpa_backward SIBLING with an ADDITIVE attention mask (HiDream-O1
     prefix-causal training, 2026-06-11). Identical decomposed recompute with
     the mask added to scores AFTER scale, BEFORE softmax — exactly the
-    forward's order (models/dit/hidream_o1.mojo _sdpa_s). mask_f32: F32
-    [H*S, S] rows (per-head, broadcast over B; constant — no grad). bf16
-    inputs take this same F32 interior path (gathers convert) instead of the
-    rect fallback — the mask insert point only exists here."""
+    forward's order (models/dit/hidream_o1.mojo _sdpa_s). mask_f32 may be
+    legacy F32 [H*S, S] rows (per-head, broadcast over B) or full batched F32
+    [B,H,S,S]/[B*H*S,S] rows. The mask is constant — no grad. bf16 inputs take
+    this same F32 interior path (gathers convert) instead of the rect fallback
+    — the mask insert point only exists here."""
     if mask_f32.dtype().to_mojo_dtype() != DType.float32:
         raise Error("sdpa_backward_masked: mask must be F32")
     # bf16/f16 inputs: cast to F32 up front (the gather helpers are F32-only
@@ -608,6 +627,22 @@ def sdpa_backward_masked[
     var qshape = q.shape()
     if len(qshape) != 4 or qshape[0] != B or qshape[1] != S or qshape[2] != H or qshape[3] != Dh:
         raise Error("sdpa_backward_masked: q shape != compile-time [B,S,H,Dh]")
+    var mshape = mask_f32.shape()
+    var mask_is_batched: Bool
+    if len(mshape) == 2:
+        if mshape[0] == H * S and mshape[1] == S:
+            mask_is_batched = False
+        elif mshape[0] == B * H * S and mshape[1] == S:
+            mask_is_batched = True
+        else:
+            raise Error("sdpa_backward_masked: mask shape must be [H*S,S], [B*H*S,S], or [B,H,S,S]")
+    elif len(mshape) == 4:
+        if mshape[0] == B and mshape[1] == H and mshape[2] == S and mshape[3] == S:
+            mask_is_batched = True
+        else:
+            raise Error("sdpa_backward_masked: mask shape must be [B,H,S,S]")
+    else:
+        raise Error("sdpa_backward_masked: mask rank must be 2 or 4")
     var out_dt = orig_dt
     comptime BH = B * H
     comptime src_rows = B * S * H
@@ -651,13 +686,21 @@ def sdpa_backward_masked[
     var smgrid = (nsm + _BLOCK - 1) // _BLOCK
     ctx.enqueue_function[_scale_f32, _scale_f32](
         attn_full, scale, sm_rows, S, grid_dim=smgrid, block_dim=_BLOCK)
-    # additive mask (constant): scores += mask[h], the forward's exact order.
-    var mask_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](H * S, S))
-    var mask_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        mask_f32.buf.unsafe_ptr().bitcast[Float32](), mask_rl
-    )
-    ctx.enqueue_function[_add_mask_rows_f32, _add_mask_rows_f32](
-        attn_full, mask_lt, H, S, sm_rows, grid_dim=smgrid, block_dim=_BLOCK)
+    # additive mask (constant): scores += mask, the forward's exact order.
+    if mask_is_batched:
+        var mask_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](B * H * S, S))
+        var mask_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            mask_f32.buf.unsafe_ptr().bitcast[Float32](), mask_rl
+        )
+        ctx.enqueue_function[_add_batched_mask_rows_f32, _add_batched_mask_rows_f32](
+            attn_full, mask_lt, S, sm_rows, grid_dim=smgrid, block_dim=_BLOCK)
+    else:
+        var mask_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](H * S, S))
+        var mask_lt = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
+            mask_f32.buf.unsafe_ptr().bitcast[Float32](), mask_rl
+        )
+        ctx.enqueue_function[_add_mask_rows_f32, _add_mask_rows_f32](
+            attn_full, mask_lt, H, S, sm_rows, grid_dim=smgrid, block_dim=_BLOCK)
     ctx.enqueue_function[_softmax_rows_f32, _softmax_rows_f32](
         attn_full, S, grid_dim=sm_rows, block_dim=_TPB)
 
@@ -714,6 +757,37 @@ def sdpa_backward_masked[
     var dv_full = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](dvptr, bhsd_rl)
     var dv_t = _scatter_to_tensor(dv_full, B, S, H, Dh, out_dt, src_rl, ctx)
     return SdpaGrads(dq_t^, dk_t^, dv_t^)
+
+
+def sdpa_backward_masked_batched[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask_f32: Tensor,
+    d_out: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaGrads:
+    """Named entry point for full per-sample additive masks.
+
+    Accepts F32 [B,H,S,S] or flattened [B*H*S,S] masks. The implementation
+    shares the masked backward path so legacy [H*S,S] broadcast behavior stays
+    identical.
+    """
+    var mshape = mask_f32.shape()
+    if len(mshape) == 2:
+        if mshape[0] != B * H * S or mshape[1] != S:
+            raise Error("sdpa_backward_masked_batched: mask shape must be [B*H*S,S] or [B,H,S,S]")
+    elif len(mshape) == 4:
+        if mshape[0] != B or mshape[1] != H or mshape[2] != S or mshape[3] != S:
+            raise Error("sdpa_backward_masked_batched: mask shape must be [B,H,S,S]")
+    else:
+        raise Error("sdpa_backward_masked_batched: mask rank must be 2 or 4")
+    return sdpa_backward_masked[B, S, H, Dh](
+        q, k, v, mask_f32, d_out, scale, ctx,
+    )
 
 
 # ── decomposed RECTANGULAR SDPA backward (S_q != S_kv, any Dh) ───────────────

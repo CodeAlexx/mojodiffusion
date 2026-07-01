@@ -264,6 +264,120 @@ def sdpa_flash_train_fwd_rect[
     return SdpaFlashFwd(o^, o_pad^, q_pad^, k_pad^, v_pad^, stats^)
 
 
+def sdpa_flash_train_fwd_native[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashFwd:
+    """cuDNN flash SDPA training forward at the native sequence length.
+
+    This is for short no-mask oracle matching, where the PyTorch reference calls
+    cuDNN on S directly. Long trainer paths should keep using the padded/aligned
+    wrappers unless native cuDNN backward has been proven for that shape.
+    """
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 or v.dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_train_fwd_native: q/k/v must be BF16")
+    var o_buf = ctx.enqueue_create_buffer[DType.uint8](B * S * H * Dh * 2)
+    ctx.enqueue_memset[DType.uint8](o_buf, 0)
+    var o_shape: List[Int] = [B, S, H, Dh]
+    var o = Tensor(o_buf^, o_shape^, STDtype.BF16)
+
+    var stats_buf = ctx.enqueue_create_buffer[DType.uint8](B * H * S * 4)
+    ctx.enqueue_memset[DType.uint8](stats_buf, 0)
+    var stats_shape: List[Int] = [B, H, S, 1]
+    var stats = Tensor(stats_buf^, stats_shape^, STDtype.F32)
+
+    var qs = _strides_bhnd(S, H, Dh)
+    var ks = _strides_bhnd(S, H, Dh)
+    var vs = _strides_bhnd(S, H, Dh)
+    var os_ = _strides_bhnd(S, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bf16_train_fwd", Int32](
+        _dev_ptr(q), _dev_ptr(k), _dev_ptr(v),
+        _dev_ptr(o), _dev_ptr(stats),
+        Int32(B), Int32(H), Int32(S), Int32(S), Int32(Dh),
+        scale,
+        qs, ks, vs, os_,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0),
+        Int32(S), Int32(S),
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_train_fwd_native: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S=" + String(S)
+            + " H=" + String(H) + " Dh=" + String(Dh) + ")"
+        )
+    return SdpaFlashFwd(
+        Tensor(o.buf.copy(), o.shape(), o.dtype()),
+        o^,
+        Tensor(q.buf.copy(), q.shape(), q.dtype()),
+        Tensor(k.buf.copy(), k.shape(), k.dtype()),
+        Tensor(v.buf.copy(), v.shape(), v.dtype()),
+        stats^,
+    )
+
+
+def sdpa_flash_backward_native[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    fwd: SdpaFlashFwd,
+    d_out: Tensor,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashGrads:
+    """cuDNN flash SDPA backward at the native sequence length."""
+    if d_out.dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_backward_native: d_out must be BF16")
+    var nbytes = B * S * H * Dh * 2
+    var dq_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dk_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dv_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    ctx.enqueue_memset[DType.uint8](dq_buf, 0)
+    ctx.enqueue_memset[DType.uint8](dk_buf, 0)
+    ctx.enqueue_memset[DType.uint8](dv_buf, 0)
+    var g_shape: List[Int] = [B, S, H, Dh]
+    var dq = Tensor(dq_buf^, g_shape.copy(), STDtype.BF16)
+    var dk = Tensor(dk_buf^, g_shape.copy(), STDtype.BF16)
+    var dv = Tensor(dv_buf^, g_shape^, STDtype.BF16)
+
+    var qs = _strides_bhnd(S, H, Dh)
+    var ks = _strides_bhnd(S, H, Dh)
+    var vs = _strides_bhnd(S, H, Dh)
+    var os_ = _strides_bhnd(S, H, Dh)
+    var dos = _strides_bhnd(S, H, Dh)
+    var dqs = _strides_bhnd(S, H, Dh)
+    var dks = _strides_bhnd(S, H, Dh)
+    var dvs = _strides_bhnd(S, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bwd_bf16", Int32](
+        _dev_ptr(fwd.q_pad), _dev_ptr(fwd.k_pad), _dev_ptr(fwd.v_pad),
+        _dev_ptr(fwd.o_pad), _dev_ptr(d_out), _dev_ptr(fwd.stats),
+        _dev_ptr(dq), _dev_ptr(dk), _dev_ptr(dv),
+        Int32(B), Int32(H), Int32(S), Int32(S), Int32(Dh),
+        scale,
+        qs, ks, vs, os_, dos, dqs, dks, dvs,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0),
+        Int32(S), Int32(S),
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    dos.free(); dqs.free(); dks.free(); dvs.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_backward_native: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S=" + String(S)
+            + " H=" + String(H) + " Dh=" + String(Dh) + ")"
+        )
+    return SdpaFlashGrads(dq^, dk^, dv^)
+
+
 def sdpa_flash_fwd_padmask[
     B: Int, S_BUF: Int, H: Int, Dh: Int
 ](
@@ -454,6 +568,27 @@ struct SdpaFlashF32Fwd(Movable):
         self.stats = stats^
 
 
+struct SdpaFlashBF16Fwd(Movable):
+    var att: Tensor      # [B,S,H,Dh] BF16 — product boundary output
+    var q_bf: TArc
+    var k_bf: TArc
+    var v_bf: TArc
+    var o_bf: TArc
+    var stats: TArc     # [B,H,S,1] F32 LSE stats for cuDNN backward
+
+    def __init__(
+        out self,
+        var att: Tensor, var q_bf: TArc, var k_bf: TArc, var v_bf: TArc,
+        var o_bf: TArc, var stats: TArc,
+    ):
+        self.att = att^
+        self.q_bf = q_bf^
+        self.k_bf = k_bf^
+        self.v_bf = v_bf^
+        self.o_bf = o_bf^
+        self.stats = stats^
+
+
 def sdpa_flash_train_fwd_f32[
     B: Int, S: Int, H: Int, Dh: Int
 ](
@@ -534,15 +669,11 @@ def sdpa_flash_backward_f32[
     )
 
 
-# ─── F32-boundary padmask TRAINING flash (krea2 length-bucket pad) ────────────
-# krea2's SingleStreamBlock trains on F32 activations at a PADDED buffer length
-# S (= LFULL = LTMAX + IMGLEN, a 256-multiple → 128-aligned) where only the
-# first `real_len` text positions + the image tail are real and the text-pad
-# rows [real_len:LTMAX] must attend to nothing / be attended-to by nobody. These
-# are the F32 wrappers of sdpa_flash_train_fwd_f32 / sdpa_flash_backward_f32 that
-# pass `real_len` to the shim EXACTLY as sdpa_flash_fwd_padmask does (:327) so
-# cuDNN masks the [real_len:S] pad rows internally — NO materialized [B,H,S,S]
-# mask (the 4.5GB resident the sdpa_chunked path needs), NO materialized scores.
+# ─── BF16-boundary padmask TRAINING flash (krea2 length-bucket pad) ───────────
+# Product Krea2 tensors stay BF16 at the attention boundary. These wrappers pass
+# `real_len` to the shim EXACTLY as sdpa_flash_fwd_padmask does, so cuDNN masks
+# the [real_len:S] pad rows internally: no materialized [B,H,S,S] mask, no
+# materialized scores. F32 is retained only for the cuDNN softmax/LSE stats.
 #
 # NOTE on krea2's token layout vs cuDNN real_len: krea2 pads ONLY the TEXT
 # (token order [TXT(real)|TXT(pad)|IMG]); cuDNN's real_len masks the TAIL rows
@@ -551,6 +682,103 @@ def sdpa_flash_backward_f32[
 # [0:real_len] (text+image contiguous). See krea2_block for the layout contract
 # it threads (it pads text at the tail AFTER image when needed, or the caller
 # arranges [real|pad] so real_len = the real prefix length). FAIL-LOUD on rc.
+
+
+def sdpa_flash_train_fwd_padmask_bf16[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q: Tensor, k: Tensor, v: Tensor,
+    real_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashBF16Fwd:
+    """BF16 padmask flash train forward. q/k/v/o stay BF16 at the boundary;
+    stats stay F32 for cuDNN backward."""
+    comptime if (S % 128) != 0:
+        raise Error("sdpa_flash_train_fwd_padmask_bf16: S must be 128-aligned")
+    if q.dtype() != STDtype.BF16 or k.dtype() != STDtype.BF16 or v.dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_train_fwd_padmask_bf16: q/k/v must be BF16")
+    if real_len < 1 or real_len > S:
+        raise Error("sdpa_flash_train_fwd_padmask_bf16: real_len out of [1, S]")
+    var fwd = sdpa_flash_fwd_padmask[B, S, H, Dh](q, k, v, real_len, scale, ctx)
+    return SdpaFlashBF16Fwd(
+        Tensor(fwd.o.buf.copy(), fwd.o.shape(), fwd.o.dtype()),
+        TArc(Tensor(fwd.q_pad.buf.copy(), fwd.q_pad.shape(), fwd.q_pad.dtype())),
+        TArc(Tensor(fwd.k_pad.buf.copy(), fwd.k_pad.shape(), fwd.k_pad.dtype())),
+        TArc(Tensor(fwd.v_pad.buf.copy(), fwd.v_pad.shape(), fwd.v_pad.dtype())),
+        TArc(Tensor(fwd.o_pad.buf.copy(), fwd.o_pad.shape(), fwd.o_pad.dtype())),
+        TArc(Tensor(fwd.stats.buf.copy(), fwd.stats.shape(), fwd.stats.dtype())),
+    )
+
+
+def sdpa_flash_backward_padmask_bf16[
+    B: Int, S: Int, H: Int, Dh: Int
+](
+    q_bf: TArc, k_bf: TArc, v_bf: TArc, o_bf: TArc, stats: TArc,
+    d_out: Tensor,
+    real_len: Int,
+    scale: Float32,
+    ctx: DeviceContext,
+) raises -> SdpaFlashGrads:
+    """BF16 padmask flash backward. q/k/v/o/d_out and dQ/dK/dV stay BF16 at the
+    boundary; stats are the saved F32 cuDNN LSE tensor."""
+    comptime if (S % 128) != 0:
+        raise Error("sdpa_flash_backward_padmask_bf16: S must be 128-aligned")
+    if real_len < 1 or real_len > S:
+        raise Error("sdpa_flash_backward_padmask_bf16: real_len out of [1, S]")
+    if d_out.dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_backward_padmask_bf16: d_out must be BF16")
+    if q_bf[].dtype() != STDtype.BF16 or k_bf[].dtype() != STDtype.BF16 or v_bf[].dtype() != STDtype.BF16 or o_bf[].dtype() != STDtype.BF16:
+        raise Error("sdpa_flash_backward_padmask_bf16: q/k/v/o must be BF16")
+    if stats[].dtype() != STDtype.F32:
+        raise Error("sdpa_flash_backward_padmask_bf16: stats must be F32")
+
+    var nbytes = B * S * H * Dh * 2
+    var dq_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dk_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var dv_buf = ctx.enqueue_create_buffer[DType.uint8](nbytes)
+    var g_shape: List[Int] = [B, S, H, Dh]
+    var dq_bf = Tensor(dq_buf^, g_shape.copy(), STDtype.BF16)
+    var dk_bf = Tensor(dk_buf^, g_shape.copy(), STDtype.BF16)
+    var dv_bf = Tensor(dv_buf^, g_shape^, STDtype.BF16)
+
+    var qs = _strides_bhnd(S, H, Dh)
+    var ks = _strides_bhnd(S, H, Dh)
+    var vs = _strides_bhnd(S, H, Dh)
+    var os_ = _strides_bhnd(S, H, Dh)
+    var dos = _strides_bhnd(S, H, Dh)
+    var dqs = _strides_bhnd(S, H, Dh)
+    var dks = _strides_bhnd(S, H, Dh)
+    var dvs = _strides_bhnd(S, H, Dh)
+    var stream = CUDA(ctx.stream())
+    var rc = Int(external_call["flame_cudnn_sdpa_bwd_bf16", Int32](
+        _dev_ptr(q_bf[]), _dev_ptr(k_bf[]), _dev_ptr(v_bf[]),
+        _dev_ptr(o_bf[]), _dev_ptr(d_out), _dev_ptr(stats[]),
+        _dev_ptr(dq_bf), _dev_ptr(dk_bf), _dev_ptr(dv_bf),
+        Int32(B), Int32(H), Int32(S), Int32(S), Int32(Dh),
+        scale,
+        qs, ks, vs, os_, dos, dqs, dks, dvs,
+        Int64(0), Int64(0), Int64(0), Int64(0), Int64(0),
+        Int64(0), Int64(0), Int64(0), Int64(0),
+        Int32(0),
+        Int32(real_len), Int32(real_len),  # REAL lengths -> [real_len:S] pad mask
+        stream,
+    ))
+    qs.free(); ks.free(); vs.free(); os_.free()
+    dos.free(); dqs.free(); dks.free(); dvs.free()
+    if rc != 0:
+        raise Error(
+            String("sdpa_flash_backward_padmask_bf16: shim rc=") + String(rc)
+            + " (B=" + String(B) + " S=" + String(S)
+            + " real_len=" + String(real_len)
+            + " H=" + String(H) + " Dh=" + String(Dh) + ")"
+        )
+    return SdpaFlashGrads(dq_bf^, dk_bf^, dv_bf^)
+
+
+# ─── F32-boundary padmask TRAINING flash (legacy F32 graph paths) ─────────────
+# F32 callers can still use the same cuDNN BF16 shim by casting at the explicit
+# wrapper boundary. Krea2 product code must use the BF16 pad-mask wrappers above.
 
 
 def sdpa_flash_train_fwd_padmask_f32[
@@ -762,9 +990,13 @@ def sdpa_flash_backward_padmask_dispatch(
 ) raises -> SdpaFlashGrads:
     """Runtime-dims → comptime-bucket dispatch for the flash-PADMASK backward (the
     engine OPK_SDPA arm is shape-agnostic; same table discipline as
-    sdpa_flash_backward_dispatch). krea2 trainer bucket (1,4864,48,128)."""
+    sdpa_flash_backward_dispatch). BF16 Krea2 trainer bucket (1,4864,48,128)."""
     if B == 1 and S == 4864 and H == 48 and Dh == 128:
-        return sdpa_flash_backward_padmask_f32[1, 4864, 48, 128](
+        return sdpa_flash_backward_padmask_bf16[1, 4864, 48, 128](
+            q_bf, k_bf, v_bf, o_bf, stats, d_att, real_len, scale, ctx)
+    # krea2 512px LFULL=1408 (11*128) trainer bucket (V2_SLAB+FLASH path).
+    if B == 1 and S == 1408 and H == 48 and Dh == 128:
+        return sdpa_flash_backward_padmask_bf16[1, 1408, 48, 128](
             q_bf, k_bf, v_bf, o_bf, stats, d_att, real_len, scale, ctx)
     raise Error(
         String("sdpa_flash_backward_padmask_dispatch: no bucket (B,S,H,Dh)=(")

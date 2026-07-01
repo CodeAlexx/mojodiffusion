@@ -9,17 +9,20 @@
 # the ideogram4 stack template (serenitymojo/models/ideogram4/block.mojo:
 # ideogram4_stack_lora_forward/backward) loop-for-loop.
 #
-# ── SCOPE (LoRA backward path — from the architecture) ────────────────────────
+# ── SCOPE (current Mojo LoRA backward path) ───────────────────────────────────
 # Krea2 forward: first(img) → text-fusion (12-layer ctx) → single-stream ×N →
-# last. LoRA lives ONLY on the N single-stream blocks. So the LoRA backward is:
+# last. This stack currently wires LoRA only on the N main single-stream blocks.
+# So the LoRA backward implemented here is:
 #   d_velocity → final-layer bwd (FROZEN, d_x only) → single-stream block bwd ×N
 #   (Phase-1's backward: LoRA dA/dB + d_x carry) → STOP.
 # The text-fusion blocks + first/embedders are BEFORE the single-stream blocks →
-# frozen-skip (no LoRA there; their d_x is not needed). NO text-fusion backward.
+# frozen-skip in this file. ai-toolkit output also contains text-fusion LoRA
+# under `diffusion_model.txtfusion.*`; that is a known product-parity blocker,
+# not an architectural exclusion.
 #
-# Because the whole gated span runs F32 (Phase-1's discipline; the per-block gate
-# proves the chain rule at cos≥0.999), this stack carries F32 activations and the
-# parity gate (krea2_stack_parity.mojo) compares vs an F32 ai-toolkit oracle.
+# The historical per-block gates used F32 oracle tensors, but the product trainer
+# preserves BF16/F16/FP8 storage boundaries. F32 is limited to compute internals,
+# reductions, optimizer grads/moments, scalar stats, and oracle/debug artifacts.
 #
 # ── full-recompute discipline (ideogram4/klein pattern) ──────────────────────
 # The forward saves ONLY each block's INPUT (a [1,L,features] clone), not its
@@ -44,25 +47,24 @@ from serenitymojo.io.sharded import ShardedSafeTensors
 # (models/ideogram4/block.mojo::_resident_fp8_weight).
 from serenitymojo.ops.fp8_quant import fp8_e4m3_rowscale, fp8_e4m3_encode_perrow
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
+from serenitymojo.ops.cast import cast_tensor
 
 comptime TArc = ArcPointer[Tensor]
 
 # ── reused forward ops (final layer = krea2_dit's last; tiling = krea2_dit) ────
 from serenitymojo.ops.linear import linear
-from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.elementwise import modulate
 from serenitymojo.ops.tensor_algebra import (
     reshape, slice, concat, add, zeros_device,
 )
 from serenitymojo.models.dit.krea2_dit import (
     krea2_last_layer, krea2_simple_modulation, _reshape_chunk_to_vec,
-    _tile_rope_table,
+    _tile_rope_table, krea2_rmsnorm, krea2_rmsnorm_backward_dx,
     Krea2BlockResidentFp8, Krea2ResidentFp8,   # resident-fp8 structs moved here (no cycle)
 )
 
 # ── reused backward arms (final-layer chain; all pre-built + gated elsewhere) ──
 from serenitymojo.ops.linalg_backward import linear_backward_dx
-from serenitymojo.ops.norm_backward import rms_norm_backward, rms_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
 # ── Phase-1 block unit (the composed primitive) ───────────────────────────────
@@ -75,7 +77,6 @@ from serenitymojo.models.krea2.krea2_block import (
     krea2_single_stream_block_lora_backward_dev,
     krea2_single_stream_block_dora, krea2_single_stream_block_dora_backward_dev,
     krea2_single_stream_block_oft, krea2_single_stream_block_oft_backward_dev,
-    _add_scale_one,
 )
 from serenitymojo.models.krea2.krea2_direct_lycoris_stack import (
     Krea2StackDirectDoRA, Krea2StackDirectOFT,
@@ -90,6 +91,10 @@ from serenitymojo.autograd_v2.krea2_block_graph import (
 )
 from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.models.krea2.krea2_block import KREA2_SLAB_SEGMENTED
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState,
+    lora_adamw_plain_device_state_copy_device_grad_pair,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -102,7 +107,7 @@ from serenitymojo.models.krea2.krea2_block import KREA2_SLAB_SEGMENTED
 struct Krea2StackWeights(Copyable, Movable):
     var blocks: List[Krea2BlockWeights]   # len == N
     # final-layer (last) frozen params.
-    var last_norm: TArc        # [features] F32  (last.norm.scale)
+    var last_norm: TArc        # [features] raw checkpoint dtype (last.norm.scale)
     var last_mod_lin: TArc     # [2, features]   (last.modulation.lin)
     var last_lin_w: TArc       # [out_ch, features]  ([64, 6144])
     var last_lin_b: TArc       # [out_ch]            ([64])
@@ -131,7 +136,7 @@ struct Krea2StackForward(Movable):
     var block_inputs: List[TArc]          # len N: each block's [1,L,features] input
     # final-layer acts needed for its backward (cheap, kept; NOT recomputed).
     var x_blocks_out: TArc                # [1,L,features] last single-stream output
-    var last_xn: TArc                     # [1,L,features] rms_norm(x_blocks_out)
+    var last_xn: TArc                     # [1,L,features] krea2_rmsnorm(x_blocks_out)
     var txtlen: Int                       # slice offset for the image tokens
     var imglen: Int
 
@@ -160,10 +165,10 @@ struct Krea2StackLoraGrads(Movable):
         self.d_combined = d_combined^
 
 
-# DEVICE-grad sibling: the flat LoRA dA/dB stay on DEVICE (Krea2LoraGradT), so the
-# streamed conductor enqueues all block backward work with NO per-adapter to_host;
-# the trainer does ONE batched D2H over this list at the end of the step (224
-# syncs → 1). Same flat layout (len N*8, bi*8 + slot).
+# DEVICE-grad sibling: flat LoRA dA/dB stay on DEVICE as Krea2LoraGradT. The
+# streamed_dev path copies one block's 8 pairs to host under the existing
+# per-block streaming fence; the AdamW-preload path copies those pairs D2D into
+# shared optimizer state instead. Same flat layout (len N*8, bi*8 + slot).
 struct Krea2StackLoraGradsT(Movable):
     var grads: List[Krea2LoraGradT]       # len N*8, flat (bi*8 + slot), DEVICE
     var d_combined: TArc                  # [1,L,features] grad into the block-stack input
@@ -171,6 +176,26 @@ struct Krea2StackLoraGradsT(Movable):
     def __init__(out self, var grads: List[Krea2LoraGradT], var d_combined: TArc):
         self.grads = grads^
         self.d_combined = d_combined^
+
+
+struct Krea2StackDeviceGradWrite(Movable):
+    var d_combined: TArc
+    var grad_count: Int
+    var streaming_sync_count: Int
+
+    def __init__(
+        out self, var d_combined: TArc, grad_count: Int, streaming_sync_count: Int
+    ):
+        self.d_combined = d_combined^
+        self.grad_count = grad_count
+        self.streaming_sync_count = streaming_sync_count
+
+
+struct Krea2GradCopyKeepalive(Movable):
+    var grads: List[TArc]
+
+    def __init__(out self, var grads: List[TArc]):
+        self.grads = grads^
 
 
 struct Krea2StackDirectDoRAGradsT(Movable):
@@ -243,12 +268,11 @@ def krea2_stack_lora_forward[
 
     var x_blocks_out = x.copy()                                 # last single-stream output
 
-    # final = last_layer(x, tmlp_out): (1+scale)*rms_norm(x) + shift → linear.
-    # We need rms_norm(x) saved for the final-layer backward (modulate_backward
+    # final = last_layer(x, tmlp_out): krea2_rmsnorm applies (scale.float()+1)
+    # inside the op and returns x dtype; modulate + linear keep product boundaries.
+    # We need the normed x saved for the final-layer backward (modulate_backward
     # needs the pre-modulate normed acts).
-    var last_xn = rms_norm(
-        x[], _add_scale_one(w.last_norm[], ctx), eps, ctx,
-    )                                                          # [1,L,features]
+    var last_xn = krea2_rmsnorm(x[], w.last_norm[], eps, ctx)  # [1,L,features]
     var final = krea2_last_layer(
         x[], tmlp_out, w.last_norm[], w.last_mod_lin[],
         w.last_lin_w[], w.last_lin_b[], features, ctx,
@@ -279,12 +303,12 @@ def krea2_final_layer_backward[
     """Backward of krea2_last_layer (FROZEN — base weights not trained; we want only
     d_x into the single-stream stack output). Exact reverse of:
         scale,shift = SimpleModulation(tmlp_out, last.modulation.lin)
-        xn          = rms_norm(x, last.norm.scale + 1)
+        xn          = krea2_rmsnorm(x, last.norm.scale)
         xm          = (1+scale)*xn + shift
         velocity    = Linear(xm)[:, txtlen:txtlen+imglen]
 
     Steps: scatter d_velocity into a full [1,L,out_ch] (zeros on txt+pad rows) →
-    linear_backward_dx → modulate_backward (drop param grads) → rms_norm_backward."""
+    linear_backward_dx → modulate_backward (drop param grads) → krea2_rmsnorm_backward_dx."""
     comptime features = HEADS * HEADDIM
     var out_ch = w.last_lin_w[].shape()[0]
     var L_full = fwd.x_blocks_out[].shape()[1]
@@ -296,15 +320,15 @@ def krea2_final_layer_backward[
     var tail = L_full - fwd.txtlen - fwd.imglen
     var d_final2: Tensor
     if head > 0 and tail > 0:
-        var zh = zeros_device([1, head, out_ch], STDtype.F32, ctx)
-        var zt = zeros_device([1, tail, out_ch], STDtype.F32, ctx)
+        var zh = zeros_device([1, head, out_ch], d_velocity.dtype(), ctx)
+        var zt = zeros_device([1, tail, out_ch], d_velocity.dtype(), ctx)
         var part = concat(1, ctx, zh, d_velocity)
         d_final2 = concat(1, ctx, part, zt)
     elif head > 0:
-        var zh = zeros_device([1, head, out_ch], STDtype.F32, ctx)
+        var zh = zeros_device([1, head, out_ch], d_velocity.dtype(), ctx)
         d_final2 = concat(1, ctx, zh, d_velocity)
     elif tail > 0:
-        var zt = zeros_device([1, tail, out_ch], STDtype.F32, ctx)
+        var zt = zeros_device([1, tail, out_ch], d_velocity.dtype(), ctx)
         d_final2 = concat(1, ctx, d_velocity, zt)
     else:
         d_final2 = d_velocity.clone(ctx)
@@ -318,20 +342,14 @@ def krea2_final_layer_backward[
     # scale = SimpleModulation(tmlp_out).scale, reshaped [features].
     var mods = krea2_simple_modulation(tmlp_out, w.last_mod_lin[], ctx)  # (scale,shift) [1,1,features]
     var scale = _reshape_chunk_to_vec(mods[0], features, ctx)            # [features]
-    # Mixed precision: cast grad-in + scale to the (F32) acts dtype so
-    # modulate_backward is dtype-consistent (the fwd modulate was F32 here).
+    # Keep modulate_backward dtype-consistent with the saved normed activation.
     var mb = modulate_backward(cast_tensor(d_xm3, fwd.last_xn[].dtype(), ctx), fwd.last_xn[], cast_tensor(scale, fwd.last_xn[].dtype(), ctx), ctx, compute_param_grads=False)
 
-    # 4) xn = rms_norm(x, last.norm+1) (FROZEN weight) → d_x. (clone out of the
-    # Movable RmsNormBackward to avoid a partial-move of its d_x field.)
-    # Mixed precision: x_blocks_out (last single-stream output) is bf16, last.norm
-    # scale is F32. The forward last-layer rms_norm casts the scale down to the act
-    # dtype (norm.mojo:173-174); mirror it here so rms_norm_backward runs the
-    # all-bf16 path (go=mb.d_x bf16, x bf16, weight bf16) instead of the F32-acts
-    # mixed path that would raise. F32 gate: cast is F32→F32 (no-op).
-    # FROZEN last.norm scale → d_x only (skip the O(cols²) discarded d_g kernel).
-    var rb_dx = rms_norm_backward_dx(
-        mb.d_x, fwd.x_blocks_out[], cast_tensor(_add_scale_one(w.last_norm[], ctx), fwd.x_blocks_out[].dtype(), ctx), eps, ctx,
+    # 4) xn = krea2_rmsnorm(x, last.norm.scale) (FROZEN weight) → d_x.
+    # krea2_rmsnorm_backward_dx casts the raw scale to F32 inside the op for
+    # scale.float()+1 math and returns d_x in x dtype.
+    var rb_dx = krea2_rmsnorm_backward_dx(
+        mb.d_x, fwd.x_blocks_out[], w.last_norm[], eps, ctx,
     )
     var d_x_out = rb_dx.clone(ctx)
     return d_x_out^
@@ -421,8 +439,8 @@ def krea2_stack_lora_backward[
 # The frozen final-layer (`last.*`) params are small and loaded ONCE by the
 # caller into Krea2StreamFinal (passed to both fwd + bwd). Only the 28 per-block
 # bundles stream. Block weights mirror krea2_forward's per-block load EXACTLY:
-# matmul weights bf16 (= reference v.to(bf16)); norm/mod scales bf16-rounded then
-# F32 (= reference bf16(scale).float()), consumed by the F32-internal rms_norm.
+# matmul weights bf16 (= reference v.to(bf16)); norm scales stay bf16 at tensor
+# boundaries and krea2_rmsnorm casts internally for scale.float()+1.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # bf16-resident matmul weight (real disk dtype; bf16-round if F32/F16 on disk).
@@ -430,15 +448,12 @@ def _stream_wb(st: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -
     return TArc(Tensor.from_view_as_bf16(st.tensor_view(key), ctx))
 
 
-# norm/mod scale: bf16-rounded then upcast F32 (= reference bf16(scale).float();
-# krea2_rmsnorm/modulate need F32 and add +1.0 in F32 via _add_scale_one).
-from serenitymojo.ops.cast import cast_tensor
+# norm scale: bf16 checkpoint storage. Krea2 RMSNorm casts scale to
+# F32 internally for reference scale.float()+1 compute.
 
 
 def _stream_scale(st: ShardedSafeTensors, key: String, ctx: DeviceContext) raises -> TArc:
-    return TArc(cast_tensor(
-        Tensor.from_view_as_bf16(st.tensor_view(key), ctx), STDtype.F32, ctx
-    ))
+    return TArc(Tensor.from_view_as_bf16(st.tensor_view(key), ctx))
 
 
 def _load_krea2_block_streamed(
@@ -446,7 +461,8 @@ def _load_krea2_block_streamed(
 ) raises -> Krea2BlockWeights:
     """Load block `bi`'s FROZEN weights H2D for one fwd/bwd iteration (caller frees
     by dropping the returned struct at loop end). Keys == krea2_forward's per-block
-    load (krea2_dit.mojo:1469-1481). Matmul weights bf16, norm/mod scales bf16->F32."""
+    load (krea2_dit.mojo:1469-1481). Matmul weights and norm scales keep bf16
+    storage boundaries."""
     var p = key_prefix + "blocks." + String(bi) + "."
     return Krea2BlockWeights(
         _stream_wb(st, p + "attn.wq.weight", ctx),
@@ -594,7 +610,7 @@ def _load_krea2_block_resident(
 
 # Small one-time frozen `last.*` params (loaded ONCE by the caller; not streamed).
 struct Krea2StreamFinal(Copyable, Movable):
-    var last_norm: TArc        # [features] F32  (last.norm.scale, bf16-rounded->F32)
+    var last_norm: TArc        # [features] raw checkpoint dtype (last.norm.scale)
     var last_mod_lin: TArc     # [2, features]   bf16 (last.modulation.lin)
     var last_lin_w: TArc       # [out_ch, features] bf16
     var last_lin_b: TArc       # [out_ch] bf16
@@ -681,9 +697,7 @@ def krea2_stack_lora_forward_streamed[
 
     var x_blocks_out = x.copy()
 
-    var last_xn = rms_norm(
-        x[], _add_scale_one(fin.last_norm[], ctx), eps, ctx,
-    )
+    var last_xn = krea2_rmsnorm(x[], fin.last_norm[], eps, ctx)
     var final = krea2_last_layer(
         x[], tmlp_out, fin.last_norm[], fin.last_mod_lin[],
         fin.last_lin_w[], fin.last_lin_b[], features, ctx,
@@ -736,9 +750,7 @@ def krea2_stack_dora_forward_streamed[
         ctx.synchronize()
 
     var x_blocks_out = x.copy()
-    var last_xn = rms_norm(
-        x[], _add_scale_one(fin.last_norm[], ctx), eps, ctx,
-    )
+    var last_xn = krea2_rmsnorm(x[], fin.last_norm[], eps, ctx)
     var final = krea2_last_layer(
         x[], tmlp_out, fin.last_norm[], fin.last_mod_lin[],
         fin.last_lin_w[], fin.last_lin_b[], features, ctx,
@@ -791,9 +803,7 @@ def krea2_stack_oft_forward_streamed[
         ctx.synchronize()
 
     var x_blocks_out = x.copy()
-    var last_xn = rms_norm(
-        x[], _add_scale_one(fin.last_norm[], ctx), eps, ctx,
-    )
+    var last_xn = krea2_rmsnorm(x[], fin.last_norm[], eps, ctx)
     var final = krea2_last_layer(
         x[], tmlp_out, fin.last_norm[], fin.last_mod_lin[],
         fin.last_lin_w[], fin.last_lin_b[], features, ctx,
@@ -976,6 +986,61 @@ def _block_grads_decode_into(mut grads: List[Krea2LoraGrad], base: Int, dh: _PBu
         grads[base + k] = Krea2LoraGrad(da^, db^)
 
 
+def _copy_krea2_grad_to_adamw_state(
+    mut state: LoraAdamWPlainDeviceState,
+    adapter_idx: Int,
+    g: Krea2LoraGradT,
+    mut keepalive: List[TArc],
+    ctx: DeviceContext,
+) raises:
+    if not g.d_a:
+        raise Error(
+            "krea2_stack_lora_backward_streamed_adamw_device_grads: missing dA at adapter "
+            + String(adapter_idx)
+        )
+    if not g.d_b:
+        raise Error(
+            "krea2_stack_lora_backward_streamed_adamw_device_grads: missing dB at adapter "
+            + String(adapter_idx)
+        )
+    var d_a = _krea2_device_grad_for_adamw_state(state, g.d_a.value(), keepalive, ctx)
+    var d_b = _krea2_device_grad_for_adamw_state(state, g.d_b.value(), keepalive, ctx)
+    lora_adamw_plain_device_state_copy_device_grad_pair(state, adapter_idx, d_a, d_b, ctx)
+
+
+def _krea2_device_grad_for_adamw_state(
+    state: LoraAdamWPlainDeviceState,
+    t: TArc,
+    mut keepalive: List[TArc],
+    ctx: DeviceContext,
+) raises -> TArc:
+    if t[].dtype() == state.grad_dtype:
+        return t.copy()
+    # The resident optimizer state defines grad storage. Krea2/ai-toolkit keeps
+    # LoRA grads BF16; old F32-state callers still get an explicit cast here.
+    var tg = TArc(cast_tensor(t[], state.grad_dtype, ctx))
+    keepalive.append(tg.copy())
+    return tg^
+
+
+def _copy_krea2_block_grads_to_adamw_state(
+    bg: Krea2BlockGradsT,
+    base: Int,
+    mut state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+) raises -> Krea2GradCopyKeepalive:
+    var keepalive = List[TArc]()
+    _copy_krea2_grad_to_adamw_state(state, base + 0, bg.wq, keepalive, ctx)
+    _copy_krea2_grad_to_adamw_state(state, base + 1, bg.wk, keepalive, ctx)
+    _copy_krea2_grad_to_adamw_state(state, base + 2, bg.wv, keepalive, ctx)
+    _copy_krea2_grad_to_adamw_state(state, base + 3, bg.gate_w, keepalive, ctx)
+    _copy_krea2_grad_to_adamw_state(state, base + 4, bg.wo, keepalive, ctx)
+    _copy_krea2_grad_to_adamw_state(state, base + 5, bg.mlp_gate_w, keepalive, ctx)
+    _copy_krea2_grad_to_adamw_state(state, base + 6, bg.mlp_up_w, keepalive, ctx)
+    _copy_krea2_grad_to_adamw_state(state, base + 7, bg.mlp_down_w, keepalive, ctx)
+    return Krea2GradCopyKeepalive(keepalive^)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DEVICE-GRAD streamed backward (option B) — IDENTICAL conductor to
 # krea2_stack_lora_backward_streamed, but the per-block backward keeps its 8 LoRA
@@ -1057,6 +1122,73 @@ def krea2_stack_lora_backward_streamed_dev[
         # bg drops here → the 8 device LoRA grads free; wbi drops → device weights free.
 
     return Krea2StackLoraGrads(grads^, TArc(d_x^))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVICE-GRAD → RESIDENT ADAMW G BUFFER
+#
+# Same streamed hand-chain as krea2_stack_lora_backward_streamed_dev, but each
+# block's transient Krea2LoraGradT is copied D2D into opt_state.dev_g instead of
+# decoding to host Krea2StackLoraGrads. The caller runs
+# fused_lora_adamw_plain_step_resident_preloaded_grads after this returns.
+# ══════════════════════════════════════════════════════════════════════════════
+def krea2_stack_lora_backward_streamed_adamw_device_grads[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_velocity: Tensor,
+    blk_vec: Tensor,
+    tmlp_out: Tensor,
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    fwd: Krea2StackForward,
+    cos: Tensor, sin: Tensor,
+    eps: Float32,
+    mut opt_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackDeviceGradWrite:
+    comptime features = HEADS * HEADDIM
+
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var fin_w = fin.as_stack_weights()
+    var d_x = krea2_final_layer_backward[L, HEADS, HEADDIM](
+        d_velocity, fwd, tmlp_out, fin_w, eps, ctx,
+    )
+
+    var grad_count = 0
+    var streaming_sync_count = 0
+    var bi = nblocks - 1
+    while bi >= 0:
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+        var rb = krea2_single_stream_block_lora[L, HEADS, KVHEADS, HEADDIM](
+            fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var bg = krea2_single_stream_block_lora_backward_dev[L, HEADS, KVHEADS, HEADDIM](
+            d_x, blk_vec, wbi, lora.blocks[bi], rb.saved,
+            cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        var grad_keepalive = _copy_krea2_block_grads_to_adamw_state(
+            bg, base, opt_state, ctx
+        )
+        grad_count += KREA2_SLOTS_PER_BLOCK
+        d_x = bg.d_x[].clone(ctx)
+        ctx.synchronize()   # preserve the streaming async-free discipline per block
+        streaming_sync_count += 1
+        _ = len(grad_keepalive.grads)
+        bi -= 1
+
+    return Krea2StackDeviceGradWrite(TArc(d_x^), grad_count, streaming_sync_count)
 
 
 def krea2_stack_dora_backward_streamed_dev[

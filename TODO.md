@@ -7,7 +7,7 @@ authoritative detail doc. Dated `HANDOFF_*` / `NEXT_SESSION_*` / `*_2026-*` file
 are HISTORICAL SNAPSHOTS — ignore unless archaeology is needed.
 
 Convention: update the **Active** section here each session (one line per item +
-link). Keep the depth in the linked doc, not here. Last updated: 2026-06-27.
+link). Keep the depth in the linked doc, not here. Last updated: 2026-07-01.
 
 ---
 
@@ -15,6 +15,7 @@ link). Keep the depth in the linked doc, not here. Last updated: 2026-06-27.
 
 | # | Workstream | State | Authoritative doc |
 |---|-----------|-------|-------------------|
+| S | **Cross-model trainer speed → ≤3.x s/step (ai-toolkit parity, OneTrainer structure)** | 2026-07-01: krea2-512 eri2/automagic3 baseline MEASURED 4.9s/step sync (18.2GB, valid PEFT); async OOMs (23.8GB MAX double-reserve). nsys: GEMM 67% (at peak, F32-accum == ai-toolkit), ~41,600 launches/step, **unbatched per-adapter LoRA = the tiny-GEMM/launch explosion**. FP16-accum (Lever A) REFUTED as ai-toolkit's method (it's F32-accum, eager, cuDNN, no torch.compile) → PARKED. Slab+flash arm (V2_SLAB) parity-faithful but SLOWER (5.7s) + cross-step leak + async-blocked. FIXED 2 real bugs: missing flash bucket (1,1408,48,128) + LFULL-sized slab (was fixed-8GB). **NEXT: batch the LoRA GEMMs in the hand-chain** (wq/wk/wv/gate share xm; mlp_gate/up share xm2 → grouped down-GEMM, bit-exact, block-oracle-gated). | `HANDOFF_2026-07-01_krea2_cross_model_speed.md` + `CROSS_MODEL_SPEED_PLAN_2026-07-01.md` |
 | P | **serenitymojo perf pass** (branch `perf-pass`, NOT merged into krea2) | 6 op-level wins implemented + op/model-gated (conv transpose · RMS+LN d_g O(n²)→O(n) · _colsum tree reduction · swiglu_packed · norm_modulate). Plus ledger corrections (sync=use-after-free, fusion=inference-only, ideogram double-fwd=gradient-checkpointing, MJ-1017 optimizer false-red). Integration tier (fused-AdamW/flash/trim/capture) blocked behind trainer scaffolding (MJ-0804/0805). | `PERF_PASS_2026-06-26.md` + cross-stack ledger `/home/alex/eng-knowledge` (`recall tag=perf`) |
 | 1 | **LTX2 inference → trainer** (video+audio, production quality) | PAUSED (GPU handed back). Inference recipe/conditioning gap reproduces in the OFFICIAL pipeline; resume plan staged. | `serenitymojo/docs/LTX2_TODO.md` |
 | 2 | **Phase-5 process-isolation-per-model** (daemon) | CPU scaffold DONE + CPU e2e PASS (spawn/IPC/switch/cancel). ONE deferred GPU run: real zimage/qwen children → confirm kill reclaims VRAM + zimage↔qwen no longer OOMs. Not daemon-default until then. | `../serenityUI/PHASE5_PROCESS_ISOLATION_DESIGN.md` |

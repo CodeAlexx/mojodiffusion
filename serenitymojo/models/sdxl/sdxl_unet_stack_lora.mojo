@@ -712,7 +712,7 @@ def sdxl_lora_adamw_step(
 # prefixes `lora_te1` / `lora_te2`. This Mojo module currently implements the
 # SpatialTransformer BasicTransformerBlock linears only. The helpers below make
 # that bounded surface explicit: implemented ST linears save as OT raw keys,
-# while the still-missing conv/resnet/add-embedding/proj_in/proj_out/TE targets
+# while the still-missing conv/resnet/add-embedding/TE targets
 # are listed and fail before an incomplete TE-enabled file can be written.
 #
 # The trainer still passes local LDM SpatialTransformer prefixes

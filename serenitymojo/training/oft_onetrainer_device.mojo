@@ -6,8 +6,8 @@
 # where block size is fixed to 4 and
 #   R = I + 2Q + 2Q^2 + 2Q^3 + Q^4.
 #
-# Boundary contract: x and d_x keep their original storage dtype. All rotation
-# math and OFT trainable gradients use F32 internally.
+# Boundary contract: x, d_x, and adapter vectors keep their storage dtype at the
+# call boundary. Rotation math and OFT trainable gradients use F32 internally.
 
 from std.collections import List
 from std.gpu.host import DeviceContext
@@ -18,6 +18,7 @@ from layout import Layout, LayoutTensor
 from layout.runtime_layout import RuntimeLayout
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
 
 
 comptime _DYN2 = Layout.row_major(-1, -1)
@@ -351,8 +352,9 @@ def _shape_rows_in(x: Tensor, name: String) raises -> List[Int]:
 
 
 def _validate_vec_b4(vec: Tensor, r: Int, name: String) raises -> List[Int]:
-    if vec.dtype() != STDtype.F32:
-        raise Error(name + String(": OFT vec must be F32"))
+    var vdt = vec.dtype().to_mojo_dtype()
+    if vdt != DType.float32 and vdt != DType.bfloat16 and vdt != DType.float16:
+        raise Error(name + String(": OFT vec dtype must be F32/BF16/F16"))
     var vshape = vec.shape()
     if len(vshape) == 1:
         if vshape[0] != r * _B4_NE:
@@ -378,6 +380,9 @@ def oft_ot_rotate_b4(x: Tensor, vec: Tensor, ctx: DeviceContext) raises -> Tenso
     var dt = x.dtype().to_mojo_dtype()
     if dt != DType.float32 and dt != DType.bfloat16 and dt != DType.float16:
         raise Error("oft_ot_rotate_b4: unsupported x dtype")
+    # Keep the adapter vector boundary BF16/F16/F32 as supplied; the polynomial
+    # rotation evaluates from a transient F32 compute view.
+    var vec_f32 = cast_tensor(vec, STDtype.F32, ctx, False)
 
     var out_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     var x_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](rows, in_f))
@@ -386,7 +391,7 @@ def oft_ot_rotate_b4(x: Tensor, vec: Tensor, ctx: DeviceContext) raises -> Tenso
     var grid = (total + _BLOCK - 1) // _BLOCK
 
     var V = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        vec.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        vec_f32.buf.unsafe_ptr().bitcast[Float32](), v_rl
     )
     if dt == DType.float32:
         var X = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
@@ -437,6 +442,9 @@ def oft_ot_rotate_backward_b4(
     var dt = x.dtype().to_mojo_dtype()
     if dt != DType.float32 and dt != DType.bfloat16 and dt != DType.float16:
         raise Error("oft_ot_rotate_backward_b4: unsupported x dtype")
+    # Adapter vectors may be BF16 at the product boundary; OFT derivative math is
+    # accumulated in F32 inside this helper.
+    var vec_f32 = cast_tensor(vec, STDtype.F32, ctx, False)
 
     var dx_buf = ctx.enqueue_create_buffer[DType.uint8](x.nbytes())
     var drg_buf = ctx.enqueue_create_buffer[DType.uint8](r * 16 * 4)
@@ -447,7 +455,7 @@ def oft_ot_rotate_backward_b4(
     var v_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](v2[0], v2[1]))
     var drg_rl = RuntimeLayout[_DYN2].row_major(IndexList[2](r, 16))
     var V = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
-        vec.buf.unsafe_ptr().bitcast[Float32](), v_rl
+        vec_f32.buf.unsafe_ptr().bitcast[Float32](), v_rl
     )
     var DRG = LayoutTensor[DType.float32, _DYN2, MutAnyOrigin](
         drg_buf.unsafe_ptr().bitcast[Float32](), drg_rl

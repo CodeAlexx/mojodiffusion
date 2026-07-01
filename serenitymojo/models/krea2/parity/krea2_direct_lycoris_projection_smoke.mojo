@@ -95,6 +95,27 @@ def _add_bias(var y: List[Float32], bias: List[Float32], M: Int, out_f: Int) rai
     return y^
 
 
+def _dora_delta_zero_dm_per_input(
+    d_y: List[Float32], x: List[Float32], w: List[Float32], m_resident: List[Float32],
+    M: Int, in_f: Int, out_f: Int, eps: Float32,
+) raises -> List[Float32]:
+    if len(d_y) != M * out_f or len(x) != M * in_f or len(w) != out_f * in_f:
+        raise Error("test _dora_delta_zero_dm_per_input: shape mismatch")
+    if len(m_resident) != in_f:
+        raise Error("test _dora_delta_zero_dm_per_input: m shape mismatch")
+    var out = List[Float32]()
+    for i in range(in_f):
+        var acc = Float32(0.0)
+        var den = m_resident[i] + eps
+        for o in range(out_f):
+            var d_wpdora = Float32(0.0)
+            for row in range(M):
+                d_wpdora += d_y[row * out_f + o] * x[row * in_f + i]
+            acc += d_wpdora * w[o * in_f + i] / den
+        out.append(acc)
+    return out^
+
+
 def _cos(a: List[Float32], b: List[Float32]) raises -> Float64:
     if len(a) != len(b):
         raise Error("cos: len mismatch")
@@ -289,6 +310,18 @@ def _check_streaming_append_and_projection(ctx: DeviceContext) raises:
     _check(String("stream dora rectangular d_B"), dg.d_b, dg_ref.d_b)
     _check(String("stream dora rectangular d_x"), dg.d_x, dg_ref.d_x)
 
+    var dora_dev_slots = krea2_direct_dora_set_to_device(dora, ctx)
+    if len(dora_dev_slots.slots) != active_slots:
+        raise Error("krea2 direct smoke: resident DoRA slot count mismatch")
+    if dora_dev_slots.slots[compact_slot].m[].dtype() != STDtype.BF16:
+        raise Error("krea2 direct smoke: resident DoRA magnitude must be BF16")
+    var dora_dev_ref = dora.ad[compact_slot].copy()
+    dora_dev_ref.m = dora_dev_slots.slots[compact_slot].m[].to_host(ctx)
+    var dm_dev_ref = _dora_delta_zero_dm_per_input(
+        d_y.copy(), x.copy(), W.copy(), dora_dev_ref.m.copy(),
+        M, dims[0], dims[1], dora_dev_ref.eps,
+    )
+
     var xd_dev = Tensor.from_host(x.copy(), [M, dims[0]], STDtype.F32, ctx)
     var wd_dev = Tensor.from_host(W.copy(), [dims[1], dims[0]], STDtype.F32, ctx)
     var bd_dev = Tensor.from_host(bias.copy(), [dims[1]], STDtype.F32, ctx)
@@ -305,12 +338,9 @@ def _check_streaming_append_and_projection(ctx: DeviceContext) raises:
     )
     _check(String("stream dora device d_A"), dg_dev.d_a.to_host(ctx), dg_ref.d_a)
     _check(String("stream dora device d_B"), dg_dev.d_b.to_host(ctx), dg_ref.d_b)
-    _check(String("stream dora device d_m"), dg_dev.d_m.to_host(ctx), dg_ref.d_m)
+    _check(String("stream dora device d_m"), dg_dev.d_m.to_host(ctx), dm_dev_ref)
     _check(String("stream dora device d_x"), dg_dev.d_x.to_host(ctx), dg_ref.d_x)
 
-    var dora_dev_slots = krea2_direct_dora_set_to_device(dora, ctx)
-    if len(dora_dev_slots.slots) != active_slots:
-        raise Error("krea2 direct smoke: resident DoRA slot count mismatch")
     var xdr = Tensor.from_host(x.copy(), [M, dims[0]], STDtype.F32, ctx)
     var wdr = Tensor.from_host(W.copy(), [dims[1], dims[0]], STDtype.F32, ctx)
     var bdr = Tensor.from_host(bias.copy(), [dims[1]], STDtype.F32, ctx)
@@ -326,7 +356,7 @@ def _check_streaming_append_and_projection(ctx: DeviceContext) raises:
     )
     _check(String("stream dora resident d_A"), dg_res.d_a.to_host(ctx), dg_ref.d_a)
     _check(String("stream dora resident d_B"), dg_res.d_b.to_host(ctx), dg_ref.d_b)
-    _check(String("stream dora resident d_m"), dg_res.d_m.to_host(ctx), dg_ref.d_m)
+    _check(String("stream dora resident d_m"), dg_res.d_m.to_host(ctx), dm_dev_ref)
     _check(String("stream dora resident d_x"), dg_res.d_x.to_host(ctx), dg_ref.d_x)
 
     var dora_blocks = krea2_direct_dora_blocks_to_device(dora, blocks, targets, ctx)
@@ -351,7 +381,7 @@ def _check_streaming_append_and_projection(ctx: DeviceContext) raises:
         raise Error("krea2 direct smoke: resident DoRA block-hook missing grads")
     _check(String("stream dora block-hook d_A"), dg_blk.dora.d_a.value()[].to_host(ctx), dg_ref.d_a)
     _check(String("stream dora block-hook d_B"), dg_blk.dora.d_b.value()[].to_host(ctx), dg_ref.d_b)
-    _check(String("stream dora block-hook d_m"), dg_blk.dora.d_m.value()[].to_host(ctx), dg_ref.d_m)
+    _check(String("stream dora block-hook d_m"), dg_blk.dora.d_m.value()[].to_host(ctx), dm_dev_ref)
     _check(String("stream dora block-hook d_x"), dg_blk.d_x.to_host(ctx), dg_ref.d_x)
 
     var all_dg = krea2_direct_dora_zero_grads(dora)
@@ -396,13 +426,29 @@ def _check_streaming_append_and_projection(ctx: DeviceContext) raises:
     _check(String("stream oft rectangular d_vec"), og.d_vec, og_ref.d_vec)
     _check(String("stream oft rectangular d_x"), og.d_x, og_ref.d_x)
 
+    var oft_dev_slots = krea2_direct_oft_set_to_device(oft, ctx)
+    if len(oft_dev_slots.slots) != active_slots:
+        raise Error("krea2 direct smoke: resident OFT slot count mismatch")
+    if oft_dev_slots.slots[compact_slot].vec[].dtype() != STDtype.BF16:
+        raise Error("krea2 direct smoke: resident OFT vec must be BF16")
+    var oft_vec_dev_ref = oft_dev_slots.slots[compact_slot].vec[].to_host(ctx)
+    var yo_dev_ref_nobias = oft_ot_forward(
+        x.copy(), oft_vec_dev_ref.copy(), W.copy(),
+        M, dims[0], dims[1], block_size, dims[0] // block_size,
+    )
+    var yo_dev_ref = _add_bias(yo_dev_ref_nobias.copy(), bias.copy(), M, dims[1])
+    var og_dev_ref = oft_ot_backward(
+        d_y.copy(), x.copy(), oft_vec_dev_ref.copy(), W.copy(),
+        M, dims[0], dims[1], block_size, dims[0] // block_size,
+    )
+
     var x_dev = Tensor.from_host(x.copy(), [M, dims[0]], STDtype.F32, ctx)
     var w_dev = Tensor.from_host(W.copy(), [dims[1], dims[0]], STDtype.F32, ctx)
     var bias_dev = Tensor.from_host(bias.copy(), [dims[1]], STDtype.F32, ctx)
     var yo_dev = krea2_direct_oft_projection_forward_device(
         oft, compact_slot, x_dev, w_dev, M, ctx, Optional[Tensor](bias_dev^),
     )
-    _check(String("stream oft device projection+bias"), yo_dev.to_host(ctx), yo_ref)
+    _check(String("stream oft device projection+bias"), yo_dev.to_host(ctx), yo_dev_ref)
 
     var x_dev_b = Tensor.from_host(x.copy(), [M, dims[0]], STDtype.F32, ctx)
     var w_dev_b = Tensor.from_host(W.copy(), [dims[1], dims[0]], STDtype.F32, ctx)
@@ -410,27 +456,24 @@ def _check_streaming_append_and_projection(ctx: DeviceContext) raises:
     var og_dev = krea2_direct_oft_projection_backward_device(
         oft, compact_slot, dy_dev, x_dev_b, w_dev_b, M, ctx,
     )
-    _check(String("stream oft device d_vec"), og_dev.d_vec.to_host(ctx), og_ref.d_vec)
-    _check(String("stream oft device d_x"), og_dev.d_x.to_host(ctx), og_ref.d_x)
+    _check(String("stream oft device d_vec"), og_dev.d_vec.to_host(ctx), og_dev_ref.d_vec)
+    _check(String("stream oft device d_x"), og_dev.d_x.to_host(ctx), og_dev_ref.d_x)
 
-    var oft_dev_slots = krea2_direct_oft_set_to_device(oft, ctx)
-    if len(oft_dev_slots.slots) != active_slots:
-        raise Error("krea2 direct smoke: resident OFT slot count mismatch")
     var xor = Tensor.from_host(x.copy(), [M, dims[0]], STDtype.F32, ctx)
     var wor = Tensor.from_host(W.copy(), [dims[1], dims[0]], STDtype.F32, ctx)
     var bor = Tensor.from_host(bias.copy(), [dims[1]], STDtype.F32, ctx)
     var yo_res = krea2_direct_oft_projection_forward_resident(
         oft_dev_slots.slots[compact_slot], xor, wor, M, ctx, Optional[Tensor](bor^),
     )
-    _check(String("stream oft resident projection+bias"), yo_res.to_host(ctx), yo_ref)
+    _check(String("stream oft resident projection+bias"), yo_res.to_host(ctx), yo_dev_ref)
     var xor_b = Tensor.from_host(x.copy(), [M, dims[0]], STDtype.F32, ctx)
     var wor_b = Tensor.from_host(W.copy(), [dims[1], dims[0]], STDtype.F32, ctx)
     var dyor = Tensor.from_host(d_y.copy(), [M, dims[1]], STDtype.F32, ctx)
     var og_res = krea2_direct_oft_projection_backward_resident(
         oft_dev_slots.slots[compact_slot], dyor, xor_b, wor_b, M, ctx,
     )
-    _check(String("stream oft resident d_vec"), og_res.d_vec.to_host(ctx), og_ref.d_vec)
-    _check(String("stream oft resident d_x"), og_res.d_x.to_host(ctx), og_ref.d_x)
+    _check(String("stream oft resident d_vec"), og_res.d_vec.to_host(ctx), og_dev_ref.d_vec)
+    _check(String("stream oft resident d_x"), og_res.d_x.to_host(ctx), og_dev_ref.d_x)
 
     var oft_blocks = krea2_direct_oft_blocks_to_device(oft, blocks, targets, ctx)
     if len(oft_blocks.blocks) != blocks:
@@ -442,7 +485,7 @@ def _check_streaming_append_and_projection(ctx: DeviceContext) raises:
     var yo_blk = krea2_block_direct_oft_projection_forward(
         xob, wob, oft_blocks.blocks[0].mlp_up_w, M, ctx,
     )
-    _check(String("stream oft block-hook projection"), yo_blk.to_host(ctx), yo_ref_nobias)
+    _check(String("stream oft block-hook projection"), yo_blk.to_host(ctx), yo_dev_ref_nobias)
     var xob_b = Tensor.from_host(x.copy(), [M, dims[0]], STDtype.F32, ctx)
     var wob_b = Tensor.from_host(W.copy(), [dims[1], dims[0]], STDtype.F32, ctx)
     var dyob = Tensor.from_host(d_y.copy(), [M, dims[1]], STDtype.F32, ctx)
@@ -452,8 +495,8 @@ def _check_streaming_append_and_projection(ctx: DeviceContext) raises:
     )
     if not og_blk.oft.d_vec:
         raise Error("krea2 direct smoke: resident OFT block-hook missing grad")
-    _check(String("stream oft block-hook d_vec"), og_blk.oft.d_vec.value()[].to_host(ctx), og_ref.d_vec)
-    _check(String("stream oft block-hook d_x"), og_blk.d_x.to_host(ctx), og_ref.d_x)
+    _check(String("stream oft block-hook d_vec"), og_blk.oft.d_vec.value()[].to_host(ctx), og_dev_ref.d_vec)
+    _check(String("stream oft block-hook d_x"), og_blk.d_x.to_host(ctx), og_dev_ref.d_x)
 
     var all_og = krea2_direct_oft_zero_grads(oft)
     krea2_direct_oft_scatter_slot_grad(all_og, compact_slot, og)

@@ -93,7 +93,7 @@ from serenitymojo.models.zimage.weights import (
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.zimage.block import (
     ZImageModVecs, ZImageBlockGrads, ZImageRefinerGrads,
-    zimage_block_forward, zimage_refiner_forward,
+    zimage_block_forward, zimage_refiner_forward, zimage_refiner_forward_masked,
 )
 from serenitymojo.models.zimage.lora_block import (
     ZImageBlockFullFTBackward, zimage_block_backward_device_tensors_fullft,
@@ -111,6 +111,8 @@ from serenitymojo.models.zimage.lora_block import (
     zimage_block_direct_lycoris_backward_device_tensors,
     zimage_block_lora_forward_device_tensor_batch,
     zimage_block_lora_backward_device_tensors_batch,
+    zimage_block_lora_forward_device_tensor_batch_masked,
+    zimage_block_lora_backward_device_tensors_batch_masked,
     zimage_modvecs_pack2_to_device,
     zimage_block_lora_predict_device_tensor,
     zimage_block_lora_predict_device_tensor_moddev,
@@ -136,8 +138,14 @@ from serenitymojo.training.lora_adamw_plain_fused import (
     fused_lora_adamw_plain_step,
     LoraAdamWPlainDeviceState, lora_adamw_plain_device_state_init,
     fused_lora_adamw_plain_step_resident,
+    fused_lora_adamw_plain_step_resident_device_grads,
+    lora_adamw_plain_device_state_copy_device_grad_pair,
+    lora_adamw_plain_preloaded_shared_abi_train_step,
     lora_adamw_plain_device_state_sync_moments,
 )
+from serenitymojo.training.device_train_step import TrainStepDeviceResult
+from serenitymojo.training.device_loss import device_mse_loss_grad_into_scratch
+from serenitymojo.training.training_arena import TrainingArena
 from serenitymojo.training.lora_save import (
     NamedLora, save_lora_peft, load_lora_for_resume,
     save_lora_train_state, load_lora_train_state, _read_f32,
@@ -161,7 +169,63 @@ from serenitymojo.io.safetensors_writer import save_safetensors
 
 comptime TArc = ArcPointer[Tensor]
 comptime _ZIMG_DYN1 = Layout.row_major(-1)
+comptime _ZIMG_DYN2 = Layout.row_major(-1, -1)
 comptime _ZIMG_BLOCK = 256
+
+
+def _zimage_fill_key_tail_mask_f32(
+    mask: LayoutTensor[DType.float32, _ZIMG_DYN2, MutAnyOrigin],
+    seq_len: Int,
+    heads: Int,
+    valid0: Int,
+    valid1: Int,
+    rows: Int,
+):
+    var idx = Int(global_idx.x)
+    if idx < rows * seq_len:
+        var row = idx // seq_len
+        var col = idx % seq_len
+        var batch = row // (heads * seq_len)
+        var valid = valid0
+        if batch == 1:
+            valid = valid1
+        if col >= valid:
+            mask[row, col] = rebind[mask.element_type](Float32(-10000.0))
+        else:
+            mask[row, col] = rebind[mask.element_type](Float32(0.0))
+
+
+def zimage_key_tail_mask_f32[
+    B: Int, H: Int, S: Int
+](
+    valid0: Int,
+    valid1: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Build an additive F32 [B,H,S,S] key-tail mask on device.
+
+    Valid lengths include semantic pad-token rows that OneTrainer lets attend.
+    Rows beyond the per-sample valid length are batch-padding keys and receive a
+    large negative bias.
+    """
+    if valid0 < 0 or valid0 > S or valid1 < 0 or valid1 > S:
+        raise Error("zimage_key_tail_mask_f32: valid length outside sequence")
+    comptime rows = B * H * S
+    var buf = ctx.enqueue_create_buffer[DType.uint8](rows * S * 4)
+    var rl = RuntimeLayout[_ZIMG_DYN2].row_major(IndexList[2](rows, S))
+    var lt = LayoutTensor[DType.float32, _ZIMG_DYN2, MutAnyOrigin](
+        buf.unsafe_ptr().bitcast[Float32](), rl
+    )
+    var grid = (rows * S + _ZIMG_BLOCK - 1) // _ZIMG_BLOCK
+    ctx.enqueue_function[_zimage_fill_key_tail_mask_f32, _zimage_fill_key_tail_mask_f32](
+        lt, S, H, valid0, valid1, rows, grid_dim=grid, block_dim=_ZIMG_BLOCK,
+    )
+    var shape = List[Int]()
+    shape.append(B)
+    shape.append(H)
+    shape.append(S)
+    shape.append(S)
+    return Tensor(buf^, shape^, STDtype.F32)
 
 
 def _zimage_patch_rows_to_nchw_f32(
@@ -515,6 +579,19 @@ struct _ZImageHostGradLists(Copyable, Movable):
         self.d_b = d_b^
 
 
+struct ZImageStackDeviceGradWrite(Movable):
+    var d_x: TArc
+    var grad_count: Int
+    var streaming_sync_count: Int
+
+    def __init__(
+        out self, var d_x: TArc, grad_count: Int, streaming_sync_count: Int
+    ):
+        self.d_x = d_x^
+        self.grad_count = grad_count
+        self.streaming_sync_count = streaming_sync_count
+
+
 def _host_grad_slice_to_list(
     host: HostBuffer[DType.uint8], offset: Int, numel: Int
 ) -> List[Float32]:
@@ -531,6 +608,20 @@ def _grad_arc_f32(t: TArc, ctx: DeviceContext) raises -> TArc:
     # Host AdamW stores master params and moments as F32; device grads may be BF16.
     var t32 = cast_tensor(t[], STDtype.F32, ctx)
     return TArc(t32^)
+
+
+def _zimage_device_grad_f32(
+    t: TArc,
+    mut keepalive: List[TArc],
+    ctx: DeviceContext,
+) raises -> TArc:
+    if t[].dtype() == STDtype.F32:
+        keepalive.append(t.copy())
+        return t.copy()
+    # Optimizer grads are the documented F32 boundary; LoRA params stay BF16.
+    var t32 = TArc(cast_tensor(t[], STDtype.F32, ctx))
+    keepalive.append(t32.copy())
+    return t32^
 
 
 def _zimage_tensor_grads_to_host(
@@ -2994,6 +3085,541 @@ def zimage_stack_lora_backward_main_device_b2[
     )
 
 
+def zimage_stack_lora_forward_main_device_b2_masked[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    x_seq0: List[Float32], cap_seq0: List[Float32],
+    x_seq1: List[Float32], cap_seq1: List[Float32],
+    cap_attn_len0: Int, cap_attn_len1: Int,
+    main_attn_len0: Int, main_attn_len1: Int,
+    nr_blocks: List[ZImageBlockWeights],
+    nr_mod0: List[ZImageModVecs], nr_mod1: List[ZImageModVecs],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_b2: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale2: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos0: Tensor, cap_sin0: Tensor,
+    cap_cos1: Tensor, cap_sin1: Tensor,
+    uni_cos2: Tensor, uni_sin2: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageStackForwardB2:
+    var num_nr = len(nr_blocks)
+    var num_cr = len(cr_blocks)
+    var num_main = len(main_blocks)
+
+    var cap_mask0 = zimage_key_tail_mask_f32[1, H, N_TXT](
+        cap_attn_len0, cap_attn_len0, ctx,
+    )
+    var cap_mask1 = zimage_key_tail_mask_f32[1, H, N_TXT](
+        cap_attn_len1, cap_attn_len1, ctx,
+    )
+    var main_mask = zimage_key_tail_mask_f32[2, H, S](
+        main_attn_len0, main_attn_len1, ctx,
+    )
+
+    var xs0 = x_seq0.copy()
+    var xs1 = x_seq1.copy()
+    for i in range(num_nr):
+        var f0 = zimage_block_forward[H, Dh, N_IMG](
+            xs0.copy(), nr_blocks[i], nr_mod0[i], x_cos, x_sin, D, F, eps, ctx,
+        )
+        xs0 = f0.out.copy()
+        var f1 = zimage_block_forward[H, Dh, N_IMG](
+            xs1.copy(), nr_blocks[i], nr_mod1[i], x_cos, x_sin, D, F, eps, ctx,
+        )
+        xs1 = f1.out.copy()
+    var cs0 = cap_seq0.copy()
+    var cs1 = cap_seq1.copy()
+    for i in range(num_cr):
+        var f0 = zimage_refiner_forward_masked[H, Dh, N_TXT](
+            cs0.copy(), cr_blocks[i], cap_cos0, cap_sin0, cap_mask0, D, F, eps, ctx,
+        )
+        cs0 = f0.out.copy()
+        var f1 = zimage_refiner_forward_masked[H, Dh, N_TXT](
+            cs1.copy(), cr_blocks[i], cap_cos1, cap_sin1, cap_mask1, D, F, eps, ctx,
+        )
+        cs1 = f1.out.copy()
+
+    var x = _concat_img_cap(xs0, cs0)
+    var x1 = _concat_img_cap(xs1, cs1)
+    for i in range(len(x1)):
+        x.append(x1[i])
+    var x_arc = TArc(_t(x^, [2 * S, D], ctx))
+
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        var fwd = zimage_block_lora_forward_device_tensor_batch_masked[2, H, Dh, S](
+            x_arc.copy(), main_blocks[i], main_mod_b2[i], bl,
+            uni_cos2, uni_sin2, main_mask, D, F, eps, ctx,
+        )
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
+
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = modulate(
+        ln_t, _t(f_scale2.copy(), [2, D], ctx), _t(_zeros(2 * D), [2, D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+
+    var out0 = List[Float32]()
+    for i in range(N_IMG * out_ch):
+        out0.append(patches[i])
+    var out1 = List[Float32]()
+    var base1 = S * out_ch
+    for i in range(N_IMG * out_ch):
+        out1.append(patches[base1 + i])
+
+    return ZImageStackForwardB2(
+        out0^, out1^, main_x_in^, x_arc.copy(), TArc(ln_t^),
+    )
+
+
+def zimage_stack_lora_backward_main_device_b2_masked[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    d_out0: List[Float32], d_out1: List[Float32],
+    main_attn_len0: Int, main_attn_len1: Int,
+    main_blocks: List[ZImageBlockWeights],
+    main_mod_b2: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale2: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos2: Tensor, uni_sin2: Tensor,
+    saved: ZImageStackForwardB2,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageLoraGrads:
+    var num_main = len(main_blocks)
+    var num_blocks = lora.num_blocks()
+    var main_mask = zimage_key_tail_mask_f32[2, H, S](
+        main_attn_len0, main_attn_len1, ctx,
+    )
+
+    var d_patches = d_out0.copy()
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+    for i in range(len(d_out1)):
+        d_patches.append(d_out1[i])
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+
+    var final_dx = linear_backward_dx(
+        _t(d_patches^, [2 * S, out_ch], ctx), final_lin_w, 2 * S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale2.copy(), [2, D], ctx), ctx,
+        compute_param_grads=False,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_main - 1
+    while bi >= 0:
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var refwd = zimage_block_lora_forward_device_tensor_batch_masked[2, H, Dh, S](
+            saved.main_x_in[bi].copy(), main_blocks[bi], main_mod_b2[bi], bl,
+            uni_cos2, uni_sin2, main_mask, D, F, eps, ctx,
+        )
+        var bg = zimage_block_lora_backward_device_tensors_batch_masked[2, H, Dh, S](
+            d_x[], main_blocks[bi], main_mod_b2[bi], bl, refwd.saved,
+            uni_cos2, uni_sin2, main_mask, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    var host_grads = _zimage_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_blocks * ZIMAGE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    var empty_x = List[Float32]()
+    var empty_cap = List[Float32]()
+    var empty_nr = List[List[Float32]]()
+    var empty_main = List[List[Float32]]()
+    return ZImageLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        empty_x^, empty_cap^,
+        empty_nr^, empty_main^,
+        _zeros(D), List[Float32](),
+        nonfinite,
+    )
+
+
+def zimage_stack_lora_forward_main_device_b2_masked_streamed[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    st: ShardedSafeTensors,
+    x_seq0: List[Float32], cap_seq0: List[Float32],
+    x_seq1: List[Float32], cap_seq1: List[Float32],
+    cap_attn_len0: Int, cap_attn_len1: Int,
+    main_attn_len0: Int, main_attn_len1: Int,
+    num_nr: Int, num_cr: Int, num_main: Int,
+    nr_mod0: List[ZImageModVecs], nr_mod1: List[ZImageModVecs],
+    main_mod_b2: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale2: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_cos0: Tensor, x_sin0: Tensor,
+    x_cos1: Tensor, x_sin1: Tensor,
+    cap_cos0: Tensor, cap_sin0: Tensor,
+    cap_cos1: Tensor, cap_sin1: Tensor,
+    uni_cos2: Tensor, uni_sin2: Tensor,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageStackForwardB2:
+    """Masked B=2 forward that streams frozen base block weights on demand.
+
+    This mirrors `zimage_stack_lora_forward_main_device_b2_masked`, but loads one
+    base block at a time from `st`. Checkpoint tensors keep their storage dtype
+    through `load_zimage_block_weights_prefixed_mixed`; the current stack still
+    uses the established host List[Float32] activation carrier.
+    checkpoint_boundary=BF16 step_input_boundary=BF16
+    activation_carrier_dtype=F32 not_strict_BF16_step_storage
+    adapter_param_boundary=BF16 adapter_grad_boundary=F32_optimizer_or_host_compare_only
+    """
+    if num_nr < 0 or num_cr < 0 or num_main < 0:
+        raise Error("zimage streamed masked B2 forward: negative stream depth")
+    if len(nr_mod0) < num_nr or len(nr_mod1) < num_nr:
+        raise Error("zimage streamed masked B2 forward: missing noise-refiner modvecs")
+    if len(main_mod_b2) < num_main:
+        raise Error("zimage streamed masked B2 forward: missing main modvecs")
+    if num_main != lora.num_main:
+        raise Error("zimage streamed masked B2 forward: num_main must match LoRA main depth")
+    if lora.main_base() + num_main > lora.num_blocks():
+        raise Error("zimage streamed masked B2 forward: LoRA main segment out of range")
+
+    var cap_mask0 = zimage_key_tail_mask_f32[1, H, N_TXT](
+        cap_attn_len0, cap_attn_len0, ctx,
+    )
+    var cap_mask1 = zimage_key_tail_mask_f32[1, H, N_TXT](
+        cap_attn_len1, cap_attn_len1, ctx,
+    )
+    var main_mask = zimage_key_tail_mask_f32[2, H, S](
+        main_attn_len0, main_attn_len1, ctx,
+    )
+
+    var xs0 = x_seq0.copy()
+    var xs1 = x_seq1.copy()
+    for i in range(num_nr):
+        var wb = load_zimage_block_weights_prefixed_mixed(
+            st, String("noise_refiner.") + String(i), ctx,
+        )
+        var f0 = zimage_block_forward[H, Dh, N_IMG](
+            xs0.copy(), wb, nr_mod0[i], x_cos0, x_sin0, D, F, eps, ctx,
+        )
+        xs0 = f0.out.copy()
+        var f1 = zimage_block_forward[H, Dh, N_IMG](
+            xs1.copy(), wb, nr_mod1[i], x_cos1, x_sin1, D, F, eps, ctx,
+        )
+        xs1 = f1.out.copy()
+
+    var cs0 = cap_seq0.copy()
+    var cs1 = cap_seq1.copy()
+    for i in range(num_cr):
+        var wb = load_zimage_block_weights_prefixed_mixed(
+            st, String("context_refiner.") + String(i), ctx,
+        )
+        var f0 = zimage_refiner_forward_masked[H, Dh, N_TXT](
+            cs0.copy(), wb, cap_cos0, cap_sin0, cap_mask0, D, F, eps, ctx,
+        )
+        cs0 = f0.out.copy()
+        var f1 = zimage_refiner_forward_masked[H, Dh, N_TXT](
+            cs1.copy(), wb, cap_cos1, cap_sin1, cap_mask1, D, F, eps, ctx,
+        )
+        cs1 = f1.out.copy()
+
+    var x = _concat_img_cap(xs0, cs0)
+    var x1 = _concat_img_cap(xs1, cs1)
+    for i in range(len(x1)):
+        x.append(x1[i])
+    var x_arc = TArc(_t(x^, [2 * S, D], ctx))
+
+    var main_x_in = List[TArc]()
+    for i in range(num_main):
+        var wb = load_zimage_block_weights_prefixed_mixed(
+            st, String("layers.") + String(i), ctx,
+        )
+        var bl = _block_lora_dev_for(lora, lora.main_base() + i)
+        var fwd = zimage_block_lora_forward_device_tensor_batch_masked[2, H, Dh, S](
+            x_arc.copy(), wb, main_mod_b2[i], bl,
+            uni_cos2, uni_sin2, main_mask, D, F, eps, ctx,
+        )
+        main_x_in.append(fwd.saved.x.copy())
+        x_arc = fwd.out.copy()
+
+    var ln_t = layer_norm(
+        x_arc[], _t(_ones(D), [D], ctx), _t(_zeros(D), [D], ctx), final_eps, ctx,
+    )
+    var x_out_t = modulate(
+        ln_t, _t(f_scale2.copy(), [2, D], ctx), _t(_zeros(2 * D), [2, D], ctx), ctx,
+    )
+    var bias = Optional[Tensor](final_lin_b.clone(ctx))
+    var patches = linear(x_out_t, final_lin_w, bias^, ctx).to_host(ctx)
+
+    var out0 = List[Float32]()
+    for i in range(N_IMG * out_ch):
+        out0.append(patches[i])
+    var out1 = List[Float32]()
+    var base1 = S * out_ch
+    for i in range(N_IMG * out_ch):
+        out1.append(patches[base1 + i])
+
+    return ZImageStackForwardB2(
+        out0^, out1^, main_x_in^, x_arc.copy(), TArc(ln_t^),
+    )
+
+
+def zimage_stack_lora_backward_main_device_b2_masked_streamed[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    st: ShardedSafeTensors,
+    d_out0: List[Float32], d_out1: List[Float32],
+    main_attn_len0: Int, main_attn_len1: Int,
+    num_main: Int,
+    main_mod_b2: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale2: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos2: Tensor, uni_sin2: Tensor,
+    saved: ZImageStackForwardB2,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    ctx: DeviceContext,
+) raises -> ZImageLoraGrads:
+    """Masked B=2 backward that reloads one frozen main block at a time.
+
+    The saved activation list comes from the streamed forward. Base block
+    weights are streamed in reverse order for recompute/backward, avoiding a
+    resident full-stack base-weight list.
+    """
+    if num_main < 0:
+        raise Error("zimage streamed masked B2 backward: negative main depth")
+    if len(main_mod_b2) < num_main:
+        raise Error("zimage streamed masked B2 backward: missing main modvecs")
+    if len(saved.main_x_in) < num_main:
+        raise Error("zimage streamed masked B2 backward: missing saved main inputs")
+    if num_main != lora.num_main:
+        raise Error("zimage streamed masked B2 backward: num_main must match LoRA main depth")
+    if lora.main_base() + num_main > lora.num_blocks():
+        raise Error("zimage streamed masked B2 backward: LoRA main segment out of range")
+
+    var num_blocks = lora.num_blocks()
+    var main_mask = zimage_key_tail_mask_f32[2, H, S](
+        main_attn_len0, main_attn_len1, ctx,
+    )
+
+    var d_patches = d_out0.copy()
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+    for i in range(len(d_out1)):
+        d_patches.append(d_out1[i])
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+
+    var final_dx = linear_backward_dx(
+        _t(d_patches^, [2 * S, out_ch], ctx), final_lin_w, 2 * S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale2.copy(), [2, D], ctx), ctx,
+        compute_param_grads=False,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var grad_indices = List[Int]()
+    var d_a_t = List[TArc]()
+    var d_b_t = List[TArc]()
+
+    var bi = num_main - 1
+    while bi >= 0:
+        var wb = load_zimage_block_weights_prefixed_mixed(
+            st, String("layers.") + String(bi), ctx,
+        )
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var refwd = zimage_block_lora_forward_device_tensor_batch_masked[2, H, Dh, S](
+            saved.main_x_in[bi].copy(), wb, main_mod_b2[bi], bl,
+            uni_cos2, uni_sin2, main_mask, D, F, eps, ctx,
+        )
+        var bg = zimage_block_lora_backward_device_tensors_batch_masked[2, H, Dh, S](
+            d_x[], wb, main_mod_b2[bi], bl, refwd.saved,
+            uni_cos2, uni_sin2, main_mask, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            grad_indices.append(base_idx + s)
+            d_a_t.append(bg.d_a[s].copy())
+            d_b_t.append(bg.d_b[s].copy())
+        bi -= 1
+
+    var host_grads = _zimage_tensor_grads_to_host(
+        grad_indices, d_a_t, d_b_t, num_blocks * ZIMAGE_SLOTS, ctx,
+    )
+    var nonfinite = 0
+    for i in range(len(grad_indices)):
+        var idx = grad_indices[i]
+        nonfinite += _nonfinite(host_grads.d_a[idx]) + _nonfinite(host_grads.d_b[idx])
+
+    var empty_x = List[Float32]()
+    var empty_cap = List[Float32]()
+    var empty_nr = List[List[Float32]]()
+    var empty_main = List[List[Float32]]()
+    return ZImageLoraGrads(
+        host_grads.d_a.copy(), host_grads.d_b.copy(),
+        empty_x^, empty_cap^,
+        empty_nr^, empty_main^,
+        _zeros(D), List[Float32](),
+        nonfinite,
+    )
+
+
+def zimage_stack_lora_backward_main_device_b2_masked_streamed_adamw_device_grads[
+    H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    st: ShardedSafeTensors,
+    d_out0: List[Float32], d_out1: List[Float32],
+    main_attn_len0: Int, main_attn_len1: Int,
+    num_main: Int,
+    main_mod_b2: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale2: List[Float32],
+    final_lin_w: Tensor,
+    uni_cos2: Tensor, uni_sin2: Tensor,
+    saved: ZImageStackForwardB2,
+    D: Int, F: Int, out_ch: Int, eps: Float32, final_eps: Float32,
+    mut opt_state: LoraAdamWPlainDeviceState,
+    ctx: DeviceContext,
+) raises -> ZImageStackDeviceGradWrite:
+    """B=2 streamed backward that preloads AdamW's flat device grad buffer.
+
+    This is a migration sibling of
+    `zimage_stack_lora_backward_main_device_b2_masked_streamed`: the final
+    loss/root gradient is still host-provided here, but per-block LoRA dA/dB
+    never become host `List[Float32]`. Each transient device grad is copied
+    into `opt_state.dev_g`, then the caller can run
+    `lora_adamw_plain_preloaded_shared_abi_train_step`.
+    """
+    if num_main < 0:
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: negative main depth"
+        )
+    if len(main_mod_b2) < num_main:
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: missing main modvecs"
+        )
+    if len(saved.main_x_in) < num_main:
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: missing saved main inputs"
+        )
+    if num_main != lora.num_main:
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: num_main must match LoRA main depth"
+        )
+    if lora.main_base() + num_main > lora.num_blocks():
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: LoRA main segment out of range"
+        )
+
+    var start = lora.main_base() * ZIMAGE_SLOTS
+    var end = lora.num_blocks() * ZIMAGE_SLOTS
+    if opt_state.start != start or opt_state.end != end:
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: optimizer state range mismatch"
+        )
+    if opt_state.end > len(lora.ad):
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: optimizer state exceeds LoRA adapters"
+        )
+
+    var main_mask = zimage_key_tail_mask_f32[2, H, S](
+        main_attn_len0, main_attn_len1, ctx,
+    )
+
+    var d_patches = d_out0.copy()
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+    for i in range(len(d_out1)):
+        d_patches.append(d_out1[i])
+    for _i in range(N_TXT * out_ch):
+        d_patches.append(Float32(0.0))
+
+    var final_dx = linear_backward_dx(
+        _t(d_patches^, [2 * S, out_ch], ctx), final_lin_w, 2 * S, D, out_ch, ctx,
+    )
+    var mbf = modulate_backward(
+        final_dx, saved.ln_x[], _t(f_scale2.copy(), [2, D], ctx), ctx,
+        compute_param_grads=False,
+    )
+    var d_x_t = layer_norm_backward_dx(
+        mbf.d_x, saved.x_final[], _t(_ones(D), [D], ctx), final_eps, ctx,
+    )
+    var d_x = TArc(d_x_t^)
+
+    var grad_count = 0
+    var streaming_sync_count = 0
+    var bi = num_main - 1
+    while bi >= 0:
+        var wb = load_zimage_block_weights_prefixed_mixed(
+            st, String("layers.") + String(bi), ctx,
+        )
+        var bl = _block_lora_dev_for(lora, lora.main_base() + bi)
+        var refwd = zimage_block_lora_forward_device_tensor_batch_masked[2, H, Dh, S](
+            saved.main_x_in[bi].copy(), wb, main_mod_b2[bi], bl,
+            uni_cos2, uni_sin2, main_mask, D, F, eps, ctx,
+        )
+        var bg = zimage_block_lora_backward_device_tensors_batch_masked[2, H, Dh, S](
+            d_x[], wb, main_mod_b2[bi], bl, refwd.saved,
+            uni_cos2, uni_sin2, main_mask, D, F, eps, ctx,
+        )
+        d_x = bg.d_x.copy()
+        var grad_keepalive = List[TArc]()
+        var base_idx = (lora.main_base() + bi) * ZIMAGE_SLOTS
+        for s in range(ZIMAGE_SLOTS):
+            var d_a = _zimage_device_grad_f32(bg.d_a[s].copy(), grad_keepalive, ctx)
+            var d_b = _zimage_device_grad_f32(bg.d_b[s].copy(), grad_keepalive, ctx)
+            lora_adamw_plain_device_state_copy_device_grad_pair(
+                opt_state, base_idx + s, d_a, d_b, ctx
+            )
+            grad_count += 1
+        ctx.synchronize()   # preserve the streaming async-free discipline per block
+        streaming_sync_count += 1
+        _ = len(grad_keepalive)
+        bi -= 1
+
+    if grad_count != opt_state.end - opt_state.start:
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: incomplete optimizer grad write"
+        )
+    if streaming_sync_count != num_main:
+        raise Error(
+            "zimage streamed masked B2 device-grad backward: streaming sync count mismatch"
+        )
+    return ZImageStackDeviceGradWrite(d_x^, grad_count, streaming_sync_count)
+
+
 def zimage_stack_lora_backward_main_device_b2_graph[
     H: Int, Dh: Int, N_IMG: Int, N_TXT: Int, S: Int
 ](
@@ -3173,8 +3799,9 @@ struct ZImageStepIO(Copyable, Movable):
     var rope_cap_sin: TArc
     var rope_uni_cos: TArc
     var rope_uni_sin: TArc
-    # d_loss root (separate small buffer, written after the host loss)
+    # d_loss root (separate fixed buffers for capture-compatible device loss)
     var d_patches: TArc         # [S, out_ch] F32 (cap rows stay zero)
+    var loss_scratch: TArc      # [1] F32 device reduction scratch
     # output carriers
     var d_f_scale: TArc         # [D] F32
     var grad_a: List[TArc]      # lazy (warmup): bwd visit order
@@ -3201,7 +3828,7 @@ struct ZImageStepIO(Copyable, Movable):
         var rope_x_cos: TArc, var rope_x_sin: TArc,
         var rope_cap_cos: TArc, var rope_cap_sin: TArc,
         var rope_uni_cos: TArc, var rope_uni_sin: TArc,
-        var d_patches: TArc, var d_f_scale: TArc,
+        var d_patches: TArc, var loss_scratch: TArc, var d_f_scale: TArc,
         var x_chain: List[TArc], var nr_ping: List[TArc],
         var cr_ping: List[TArc], var final_bias: TArc,
     ):
@@ -3238,6 +3865,7 @@ struct ZImageStepIO(Copyable, Movable):
         self.rope_uni_cos = rope_uni_cos^
         self.rope_uni_sin = rope_uni_sin^
         self.d_patches = d_patches^
+        self.loss_scratch = loss_scratch^
         self.d_f_scale = d_f_scale^
         self.grad_a = List[TArc]()
         self.grad_b = List[TArc]()
@@ -3344,6 +3972,7 @@ def zimage_step_io_init(
         dp[i] = Float32(0.0)
     ctx.enqueue_copy(dst_buf=d_patches[].buf, src_buf=dp_host)
     ctx.synchronize()
+    var loss_scratch = _io_fresh([1], ctx)
 
     var d_f_scale = _io_fresh([d], ctx)
 
@@ -3367,7 +3996,7 @@ def zimage_step_io_init(
         x_t^, cap^, mv_main^, mv_nr^, ones^, zeros^, f_scale^,
         rope_x_cos^, rope_x_sin^, rope_cap_cos^, rope_cap_sin^,
         rope_uni_cos^, rope_uni_sin^,
-        d_patches^, d_f_scale^,
+        d_patches^, loss_scratch^, d_f_scale^,
         x_chain^, nr_ping^, cr_ping^, final_bias^,
     )
 
@@ -3450,6 +4079,103 @@ def zimage_step_io_write_d_patches(
     var dst = io.d_patches[].buf.create_sub_buffer[DType.uint8](0, n * 4)
     ctx.enqueue_copy(dst_buf=dst, src_buf=host)
     ctx.synchronize()
+
+
+@fieldwise_init
+struct ZImageDeviceLossResult(Copyable, Movable, Writable):
+    var loss: Float32
+    var scalar_readback_count: Int
+    var full_tensor_readback_count: Int
+    var sync_count: Int
+    var backend: String
+
+
+def zimage_step_io_write_mse_d_patches(
+    io: ZImageStepIO, patches: Tensor, target_image: Tensor, ctx: DeviceContext
+) raises -> ZImageDeviceLossResult:
+    """Device MSE for v5 step roots.
+
+    Computes loss over the image rows of `patches` only, writes d_loss directly
+    into the fixed io.d_patches image rows, and leaves the cap-row tail at the
+    zeros established by zimage_step_io_init. This replaces the old host
+    pred/target -> List[Float32] -> zimage_step_io_write_d_patches path for the
+    capture-compatible v5 surface.
+    """
+    if patches.dtype() != STDtype.F32 or target_image.dtype() != STDtype.F32:
+        raise Error("zimage_step_io_write_mse_d_patches: expected F32 tensors")
+    var n = io.n_img * io.out_ch
+    if patches.numel() != io.s_total * io.out_ch:
+        raise Error("zimage_step_io_write_mse_d_patches: patches numel mismatch")
+    if target_image.numel() != n:
+        raise Error("zimage_step_io_write_mse_d_patches: target numel mismatch")
+
+    var pred_view = Tensor(
+        patches.buf.create_sub_buffer[DType.uint8](0, n * 4),
+        [io.n_img, io.out_ch],
+        STDtype.F32,
+    )
+    var target_view = Tensor(
+        target_image.buf.create_sub_buffer[DType.uint8](0, n * 4),
+        [io.n_img, io.out_ch],
+        STDtype.F32,
+    )
+    var grad_view = Tensor(
+        io.d_patches[].buf.create_sub_buffer[DType.uint8](0, n * 4),
+        [io.n_img, io.out_ch],
+        STDtype.F32,
+    )
+    var dev = device_mse_loss_grad_into_scratch(
+        pred_view, target_view, grad_view, io.loss_scratch[], ctx
+    )
+    return ZImageDeviceLossResult(
+        dev.loss,
+        dev.scalar_readback_count,
+        dev.full_tensor_readback_count,
+        dev.sync_count,
+        dev.backend.copy(),
+    )
+
+
+def zimage_step_io_write_flow_mse_d_patches(
+    io: ZImageStepIO, patches: Tensor, neg_target_image: Tensor, ctx: DeviceContext
+) raises -> ZImageDeviceLossResult:
+    """Device flow MSE root for raw Z-Image velocity patches.
+
+    The product loss is MSE(-raw_velocity, target). Passing `-target` into the
+    generic MSE kernel gives the same loss, and its d_pred is already the
+    desired d_raw_velocity. `neg_target_image` contains only real image-token
+    values, so padded image rows and cap rows remain at the StepIO zero root.
+    """
+    if patches.dtype() != STDtype.F32 or neg_target_image.dtype() != STDtype.F32:
+        raise Error("zimage_step_io_write_flow_mse_d_patches: expected F32 tensors")
+    if patches.numel() != io.s_total * io.out_ch:
+        raise Error("zimage_step_io_write_flow_mse_d_patches: patches numel mismatch")
+    var n = neg_target_image.numel()
+    if n <= 0 or n > io.n_img * io.out_ch:
+        raise Error("zimage_step_io_write_flow_mse_d_patches: target numel mismatch")
+    if n % io.out_ch != 0:
+        raise Error("zimage_step_io_write_flow_mse_d_patches: target rows are not channel-aligned")
+
+    var pred_view = Tensor(
+        patches.buf.create_sub_buffer[DType.uint8](0, n * 4),
+        neg_target_image.shape(),
+        STDtype.F32,
+    )
+    var grad_view = Tensor(
+        io.d_patches[].buf.create_sub_buffer[DType.uint8](0, n * 4),
+        neg_target_image.shape(),
+        STDtype.F32,
+    )
+    var dev = device_mse_loss_grad_into_scratch(
+        pred_view, neg_target_image, grad_view, io.loss_scratch[], ctx
+    )
+    return ZImageDeviceLossResult(
+        dev.loss,
+        dev.scalar_readback_count,
+        dev.full_tensor_readback_count,
+        dev.sync_count,
+        dev.backend.copy(),
+    )
 
 
 def _io_copy_out_persistent(
@@ -3570,7 +4296,9 @@ def zimage_stack_lora_backward_main_device_v5[
     launch with the grads batch), (c) the per-block d_x + 14 adapter-grad
     copy-outs landing in the persistent grads region (lazy-created on the
     warmup step). NO from_host/to_host/sync inside (C9). The caller resets
-    `slab` before calling. Grads are read via zimage_step_io_read_grads."""
+    `slab` before calling. AdamW fast paths should consume io.grad_a/io.grad_b
+    with zimage_lora_adamw_step_main_only_device_grads; zimage_step_io_read_grads
+    is the host compatibility/debug reader."""
     var num_main = len(main_blocks)
 
     # ── final-layer prologue (slab; values identical to the _v4 prologue) ──
@@ -3638,6 +4366,145 @@ def zimage_step_io_read_grads(
         d_f_scale^, d_final_lin^,
         nonfinite,
     )
+
+
+def zimage_lora_adamw_step_main_only_device_grads(
+    mut set: ZImageLoraSet,
+    mut state: LoraAdamWPlainDeviceState,
+    io: ZImageStepIO,
+    t: Int,
+    lr: Float32,
+    ctx: DeviceContext,
+    beta1: Float32 = Float32(0.9),
+    beta2: Float32 = Float32(0.999),
+    eps: Float32 = Float32(1.0e-8),
+    weight_decay: Float32 = Float32(0.01),
+    clip_scale: Float32 = Float32(1.0),
+    sync_params_to_host: Bool = True,
+    max_grad_norm: Float32 = Float32(0.0),
+) raises -> Float32:
+    """AdamW over OneTrainer-trainable main adapters from v5 device grads.
+
+    This is the device-resident sibling of zimage_step_io_read_grads plus
+    zimage_lora_adamw_step_main_only: persistent io.grad_a/io.grad_b tensors are
+    copied device-to-device into the resident optimizer grad buffer, then the
+    shared AdamW kernel updates state.dev_p/state.dev_m/state.dev_v in place.
+    """
+    var start = set.main_base() * ZIMAGE_SLOTS
+    var end = set.num_blocks() * ZIMAGE_SLOTS
+    if state.start != start or state.end != end:
+        raise Error(
+            "zimage_lora_adamw_step_main_only_device_grads: optimizer state range mismatch"
+        )
+    return fused_lora_adamw_plain_step_resident_device_grads(
+        state,
+        set.ad,
+        io.grad_indices,
+        io.grad_a,
+        io.grad_b,
+        t,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        weight_decay,
+        ctx,
+        clip_scale,
+        sync_params_to_host,
+        max_grad_norm,
+    )
+
+
+def zimage_lora_adamw_train_step_main_only_device_grads_shared_abi(
+    mut set: ZImageLoraSet,
+    mut state: LoraAdamWPlainDeviceState,
+    io: ZImageStepIO,
+    loss: Float32,
+    t: Int,
+    lr: Float32,
+    mut arena: TrainingArena,
+    ctx: DeviceContext,
+    beta1: Float32 = Float32(0.9),
+    beta2: Float32 = Float32(0.999),
+    eps: Float32 = Float32(1.0e-8),
+    weight_decay: Float32 = Float32(0.01),
+    clip_scale: Float32 = Float32(1.0),
+    sync_params_to_host: Bool = False,
+    max_grad_norm: Float32 = Float32(0.0),
+) raises -> TrainStepDeviceResult:
+    """ZImage v5 StepIO grads through the shared device train-step ABI.
+
+    The v5 backward leaves each adapter dA/dB in persistent F32 StepIO device
+    buffers. This helper copies those buffers into the resident flat F32 grad
+    buffer, then updates the live BF16 flat param buffer plus F32 AdamW moments
+    via DeviceTrainableSet/DeviceGradSet/TrainStepDeviceResult.
+    """
+    var start = set.main_base() * ZIMAGE_SLOTS
+    var end = set.num_blocks() * ZIMAGE_SLOTS
+    if state.start != start or state.end != end:
+        raise Error(
+            "zimage_lora_adamw_train_step_main_only_device_grads_shared_abi: optimizer state range mismatch"
+        )
+    if state.end > len(set.ad):
+        raise Error(
+            "zimage_lora_adamw_train_step_main_only_device_grads_shared_abi: state range exceeds adapters"
+        )
+    if clip_scale != Float32(1.0):
+        raise Error(
+            "zimage_lora_adamw_train_step_main_only_device_grads_shared_abi: external clip_scale is not supported; use max_grad_norm"
+        )
+    if sync_params_to_host:
+        raise Error(
+            "zimage_lora_adamw_train_step_main_only_device_grads_shared_abi: per-step host param sync would invalidate device-fast ABI accounting"
+        )
+    if len(io.grad_indices) != len(io.grad_a) or len(io.grad_indices) != len(io.grad_b):
+        raise Error(
+            "zimage_lora_adamw_train_step_main_only_device_grads_shared_abi: grad list length mismatch"
+        )
+
+    var seen = List[Int]()
+    for _ in range(state.end - state.start):
+        seen.append(0)
+
+    for i in range(len(io.grad_indices)):
+        var flat = io.grad_indices[i]
+        if flat < state.start or flat >= state.end:
+            raise Error(
+                "zimage_lora_adamw_train_step_main_only_device_grads_shared_abi: grad index outside optimizer range "
+                + String(flat)
+            )
+        var local = flat - state.start
+        if seen[local] != 0:
+            raise Error(
+                "zimage_lora_adamw_train_step_main_only_device_grads_shared_abi: duplicate grad index "
+                + String(flat)
+            )
+        seen[local] = 1
+        lora_adamw_plain_device_state_copy_device_grad_pair(
+            state, flat, io.grad_a[i], io.grad_b[i], ctx
+        )
+
+    for i in range(len(seen)):
+        if seen[i] == 0:
+            raise Error(
+                "zimage_lora_adamw_train_step_main_only_device_grads_shared_abi: missing device grad for adapter "
+                + String(state.start + i)
+            )
+
+    var result = lora_adamw_plain_preloaded_shared_abi_train_step(
+        state,
+        loss,
+        t,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        weight_decay,
+        arena,
+        ctx,
+        max_grad_norm,
+    )
+    return result^
 
 
 # ══════════════════════════════════════════════════════════════════════════════

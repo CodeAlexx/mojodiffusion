@@ -3,7 +3,7 @@
 
 This is a CPU/no-CUDA support gate. It delegates current-step tensor payload
 validation to ``check_adapter_update_replay`` and adds an explicit inventory of
-the later OneTrainer step required to prove nonzero AdamW/update parity.
+the later OneTrainer step required to prove a nonzero AdamW/update oracle.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ EXPECTED_OPTIMIZER_KEYS = ("exp_avg", "exp_avg_sq", "step")
 EXPECTED_TRAINABLE_PARAMS = {
     "ernie": 504,
     "anima": 560,
+    "zimage": 420,
 }
 
 
@@ -62,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Write a no-CUDA JSON readiness/template artifact for the required "
-            "later positive-lr dump. This is not parity evidence."
+            "later positive-lr dump. This is not Mojo optimizer/backward parity."
         ),
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON summary.")
@@ -103,11 +104,16 @@ def path_info(path: Path) -> dict[str, Any]:
     }
 
 
+def parity_dir_for(model: str) -> Path:
+    return DEFAULT_META[model].parent
+
+
 def expected_step_paths(model: str, step_index: int) -> dict[str, Path]:
     suffix = f"step{step_index:03d}"
+    parity_dir = parity_dir_for(model)
     return {
-        "step_safetensors": PARITY / f"{model}_train_ref_{suffix}.safetensors",
-        "adapter_safetensors": PARITY / f"{model}_train_ref_{suffix}_adapters.safetensors",
+        "step_safetensors": parity_dir / f"{model}_train_ref_{suffix}.safetensors",
+        "adapter_safetensors": parity_dir / f"{model}_train_ref_{suffix}_adapters.safetensors",
     }
 
 
@@ -172,7 +178,7 @@ def summarize_meta_steps(meta: dict[str, Any]) -> list[dict[str, Any]]:
 def discover_files(model: str) -> list[dict[str, Any]]:
     step_re = re.compile(rf"{re.escape(model)}_train_ref_step(\d+)(?:_adapters)?\.safetensors$")
     discovered: dict[int, dict[str, Any]] = {}
-    for path in sorted(PARITY.glob(f"{model}_train_ref_step*.safetensors")):
+    for path in sorted(parity_dir_for(model).glob(f"{model}_train_ref_step*.safetensors")):
         match = step_re.match(path.name)
         if match is None:
             continue
@@ -412,8 +418,13 @@ def build_readiness(
     meta_steps = summarize_meta_steps(meta)
     discovered = discover_files(model)
     required = required_update_artifacts(model, meta, meta_path)
-    blockers = list(required["missing"])
-    candidates = [step for step in meta_steps if step["update_bearing_candidate"]]
+    candidates = [
+        step
+        for step in meta_steps
+        if int(step["index"]) == EXPECTED_NEXT_STEP_INDEX
+        and step["update_bearing_candidate"]
+    ]
+    candidate_blockers: list[str] = []
     verified_update: dict[str, Any] | None = None
 
     for candidate in candidates:
@@ -429,7 +440,7 @@ def build_readiness(
                 )
             )
         except Exception as exc:
-            blockers.append(
+            candidate_blockers.append(
                 f"candidate step {candidate['index']} failed update replay: {exc}"
             )
             continue
@@ -451,16 +462,23 @@ def build_readiness(
             }
             break
 
+    blockers = list(required["missing"])
+    blockers.extend(candidate_blockers)
     if not candidates:
         blockers.append(
-            f"no {model} meta step has lr_before > 0.0 with existing safetensors and adapter dump"
+            f"expected {model} step {EXPECTED_NEXT_STEP_INDEX} is not an "
+            "update-bearing candidate with lr_before > 0.0 and existing "
+            "safetensors plus adapter dump"
         )
     if verified_update is None:
-        blockers.append(f"no verified nonzero {model} adapter_after - adapter_post delta")
+        blockers.append(
+            f"no verified nonzero {model} adapter_after - adapter_post delta "
+            f"for step {EXPECTED_NEXT_STEP_INDEX}"
+        )
 
     return {
         "model": model,
-        "parity_dir": str(PARITY),
+        "parity_dir": str(parity_dir_for(model)),
         "meta": str(meta_path),
         "meta_steps": meta_steps,
         "discovered_files": discovered,
@@ -522,7 +540,10 @@ def positive_lr_dump_template(
         },
         "verification_commands": [
             f"python3 scripts/check_{model}_adapter_update_replay.py",
-            f"python3 scripts/check_{model}_adapter_update_replay.py --require-update-bearing",
+            (
+                f"python3 scripts/check_{model}_adapter_update_replay.py "
+                "--step-index 1 --expect-update yes --require-update-bearing"
+            ),
             (
                 "python3 scripts/check_adapter_update_replay.py "
                 f"{model} --step-index 1 --expect-update yes --require-update-bearing"
@@ -530,7 +551,7 @@ def positive_lr_dump_template(
         ],
         "note": (
             "This file is a capture/readiness template only. It must not be used "
-            "as update-bearing parity evidence until the referenced step001 "
+            "as update-bearing OneTrainer oracle evidence until the referenced step001 "
             "artifacts exist and the strict verification command passes."
         ),
     }
@@ -576,7 +597,10 @@ def main() -> int:
         print_current_report(current_report)
         print_readiness(readiness)
 
-    if args.require_update_bearing and readiness["verified_update_bearing_step"] is None:
+    missing_required = readiness["required_update_artifacts"]["missing"]
+    if args.require_update_bearing and (
+        readiness["verified_update_bearing_step"] is None or missing_required
+    ):
         print(f"[{model}-adapter-update] BLOCKED update-bearing {model} dump is missing")
         return 2
 

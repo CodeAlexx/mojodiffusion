@@ -82,8 +82,6 @@ EXPLICIT_UNSUPPORTED = (
     "lora_unet_*_resnets_*_conv2",
     "lora_unet_*_resnets_*_conv_shortcut",
     "lora_unet_*_samplers_*_conv",
-    "lora_unet_*_attentions_*_proj_in",
-    "lora_unet_*_attentions_*_proj_out",
     "lora_unet_conv_norm_out",
     "lora_unet_conv_out",
     "lora_te1",

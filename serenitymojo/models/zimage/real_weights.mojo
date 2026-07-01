@@ -344,11 +344,9 @@ def build_rope(
 # scheme below is byte-exact OneTrainer. For a SHORTER caption in the same
 # bucket (cap_padded < cap_len) the rows [cap_padded, cap_len) are OneTrainer's
 # BATCH-PADDING rows, which OneTrainer attention-MASKS out of the unified
-# sequence. The current Mojo stack forward has no per-token attention mask, so
-# those extra rows still attend; positionally they are left at (0,0,0) here, but
-# EXACT parity for cap_padded < cap_len additionally needs the forward to mask
-# rows [cap_padded, cap_len). That masking is a kernel-level change (out of
-# scope for this builder) and is the remaining known gap for short captions.
+# sequence. The non-graph masked B=2 stack consumes the valid cap/unified lengths
+# and masks those rows out; the no-mask product B=2 and graph/slab paths still
+# exclude this short-caption parity case.
 def build_positions(
     n_img: Int, ht: Int, wt: Int, cap_len: Int, valid_cap: Int
 ) -> Tuple[List[List[Int]], List[List[Int]]]:

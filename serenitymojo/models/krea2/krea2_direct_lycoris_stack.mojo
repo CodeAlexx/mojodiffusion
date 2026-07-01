@@ -176,6 +176,13 @@ def _f32_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext)
     return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
 
 
+def _bf16_2d(var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext) raises -> Tensor:
+    var sh = List[Int]()
+    sh.append(rows)
+    sh.append(cols)
+    return Tensor.from_host(values^, sh^, STDtype.BF16, ctx)
+
+
 def _validate_targets(targets: Int) raises:
     if targets < K2LOKR_TGT_ATTN or targets > K2LOKR_TGT_ALL:
         raise Error("krea2 direct LyCORIS: targets must be 1(attn)|2(all)")
@@ -548,7 +555,7 @@ def _krea2_oft_vec_tensor(set: FlatDirectOFTSet, slot: Int, ctx: DeviceContext) 
     ref sl = set.ad[slot]
     if sl.b != 4:
         raise Error("krea2_direct_oft_device: only block_size=4 is wired on GPU")
-    return _f32_2d(sl.vec.copy(), sl.r, 6, ctx)
+    return _bf16_2d(sl.vec.copy(), sl.r, 6, ctx)
 
 
 def _krea2_check_oft_projection_tensors(
@@ -696,8 +703,8 @@ def _krea2_check_oft_projection_resident(
 ) raises:
     if slot_dev.b != 4:
         raise Error("krea2_direct_oft_resident: only block_size=4 is wired on GPU")
-    if slot_dev.vec[].dtype() != STDtype.F32:
-        raise Error("krea2_direct_oft_resident: vec storage must be F32")
+    if slot_dev.vec[].dtype() != STDtype.BF16:
+        raise Error("krea2_direct_oft_resident: vec storage must be BF16")
     if slot_dev.vec[].shape() != [slot_dev.r, 6]:
         raise Error("krea2_direct_oft_resident: vec shape mismatch")
     var xshape = x.shape()
@@ -862,7 +869,7 @@ def save_krea2_direct_oft(
         ref sl = set.ad[i]
         var ne = sl.b * (sl.b - 1) // 2
         names.append(set.prefix[i].copy() + String(".oft_R.weight"))
-        tensors.append(ArcPointer(_f32_2d(sl.vec.copy(), sl.r, ne, ctx)))
+        tensors.append(ArcPointer(_bf16_2d(sl.vec.copy(), sl.r, ne, ctx)))
         nmods += 1
     if nmods == 0:
         raise Error("save_krea2_direct_oft: refusing to write an empty OFT file")

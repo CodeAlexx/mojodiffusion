@@ -55,6 +55,11 @@ def _sigmoid_deriv(x: Float32) -> Float32:
 
 
 @always_inline
+def _sigmoid_deriv_from_output(y: Float32) -> Float32:
+    return y * (1.0 - y)
+
+
+@always_inline
 def _tanh_deriv(x: Float32) -> Float32:
     var t = tanh(x)
     return 1.0 - t * t
@@ -105,6 +110,12 @@ def _sigmoid_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: Lay
         o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _sigmoid_deriv(rebind[Scalar[DType.float32]](x[i])))
 
 
+def _sigmoid_out_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
+    var i = Int(global_idx.x)
+    if i < n:
+        o[i] = rebind[o.element_type](rebind[Scalar[DType.float32]](g[i]) * _sigmoid_deriv_from_output(rebind[Scalar[DType.float32]](y[i])))
+
+
 def _tanh_bwd_f32(g: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float32, _DYN1, MutAnyOrigin], n: Int):
     var i = Int(global_idx.x)
     if i < n:
@@ -138,6 +149,14 @@ def _sigmoid_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: L
         var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
         var xv = rebind[Scalar[DType.bfloat16]](x[i]).cast[DType.float32]()
         o[i] = rebind[o.element_type]((gv * _sigmoid_deriv(xv)).cast[DType.bfloat16]())
+
+
+def _sigmoid_out_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
+    var i = Int(global_idx.x)
+    if i < n:
+        var gv = rebind[Scalar[DType.bfloat16]](g[i]).cast[DType.float32]()
+        var yv = rebind[Scalar[DType.bfloat16]](y[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type]((gv * _sigmoid_deriv_from_output(yv)).cast[DType.bfloat16]())
 
 
 def _tanh_bwd_bf16(g: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin], n: Int):
@@ -179,6 +198,14 @@ def _sigmoid_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: Lay
         var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
         var xv = rebind[Scalar[DType.float16]](x[i]).cast[DType.float32]()
         o[i] = rebind[o.element_type]((gv * _sigmoid_deriv(xv)).cast[DType.float16]())
+
+
+def _sigmoid_out_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], y: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
+    var i = Int(global_idx.x)
+    if i < n:
+        var gv = rebind[Scalar[DType.float16]](g[i]).cast[DType.float32]()
+        var yv = rebind[Scalar[DType.float16]](y[i]).cast[DType.float32]()
+        o[i] = rebind[o.element_type]((gv * _sigmoid_deriv_from_output(yv)).cast[DType.float16]())
 
 
 def _tanh_bwd_f16(g: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], x: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], o: LayoutTensor[DType.float16, _DYN1, MutAnyOrigin], n: Int):
@@ -357,6 +384,34 @@ def _run_slab(arm: Int, grad_out: Tensor, x: Tensor, ctx: DeviceContext, mut sla
     return Tensor(out_buf^, x.shape(), x.dtype())
 
 
+def _run_sigmoid_from_output(grad_out: Tensor, y: Tensor, ctx: DeviceContext) raises -> Tensor:
+    if grad_out.dtype() != y.dtype():
+        raise Error("sigmoid_backward_from_output: grad_out/y dtype mismatch")
+    if grad_out.numel() != y.numel():
+        raise Error("sigmoid_backward_from_output: grad_out/y numel mismatch")
+    var dt = y.dtype().to_mojo_dtype()
+    var n = y.numel()
+    var out_buf = ctx.enqueue_create_buffer[DType.uint8](y.nbytes())
+    var rl = RuntimeLayout[_DYN1].row_major(IndexList[1](n))
+    var grid = (n + _BLOCK - 1) // _BLOCK
+    if dt == DType.float32:
+        var G = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var Y = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](y.buf.unsafe_ptr().bitcast[Float32](), rl)
+        var O = LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float32](), rl)
+        ctx.enqueue_function[_sigmoid_out_bwd_f32, _sigmoid_out_bwd_f32](G, Y, O, n, grid_dim=grid, block_dim=_BLOCK)
+    elif dt == DType.bfloat16:
+        var G = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var Y = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](y.buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        var O = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[BFloat16](), rl)
+        ctx.enqueue_function[_sigmoid_out_bwd_bf16, _sigmoid_out_bwd_bf16](G, Y, O, n, grid_dim=grid, block_dim=_BLOCK)
+    else:
+        var G = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](grad_out.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var Y = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](y.buf.unsafe_ptr().bitcast[Float16](), rl)
+        var O = LayoutTensor[DType.float16, _DYN1, MutAnyOrigin](out_buf.unsafe_ptr().bitcast[Float16](), rl)
+        ctx.enqueue_function[_sigmoid_out_bwd_f16, _sigmoid_out_bwd_f16](G, Y, O, n, grid_dim=grid, block_dim=_BLOCK)
+    return Tensor(out_buf^, y.shape(), y.dtype())
+
+
 # ── public entry points: d_x = grad_out * f'(x) ──────────────────────────────
 def relu_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:
     """relu backward: d_x = grad_out * (1 if x>0 else 0)."""
@@ -366,6 +421,11 @@ def relu_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Ten
 def sigmoid_backward(grad_out: Tensor, x: Tensor, ctx: DeviceContext) raises -> Tensor:
     """sigmoid backward: d_x = grad_out * s*(1-s), s=sigmoid(x)."""
     return _run(1, grad_out, x, ctx)
+
+
+def sigmoid_backward_from_output(grad_out: Tensor, y: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """sigmoid backward from saved y=sigmoid(x): d_x = grad_out * y*(1-y)."""
+    return _run_sigmoid_from_output(grad_out, y, ctx)
 
 
 def sigmoid_backward_slab(grad_out: Tensor, x: Tensor, ctx: DeviceContext, mut slab: StepSlab) raises -> Tensor:

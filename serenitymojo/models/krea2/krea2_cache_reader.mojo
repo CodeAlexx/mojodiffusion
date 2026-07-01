@@ -5,8 +5,8 @@
 # (models/dit/krea2_dit.mojo krea2_forward) + the stack LoRA forward
 # (models/krea2/krea2_stack.mojo) consume — with zero glue for Phase 4 (the trainer):
 #
-#   clean   [1, 16, LH, LW]   F32   normalized VAE latent (ai-toolkit batch.latents)
-#   img     [1, imglen, 64]   F32   PATCHIFIED clean (the krea2_forward `img` input)
+#   clean   [1, 16, LH, LW]   BF16  normalized VAE latent (ai-toolkit BF16 boundary)
+#   img     [1, imglen, 64]   BF16  PATCHIFIED clean (the krea2_forward `img` input)
 #   context [1, LT, 12, 2560] BF16  Qwen3-VL-4B 12-layer stack (`context`)
 #   pos     [1, LFULL, 3]     F32   txt zeros [LT,3] + img grid [imglen,3] (`pos`)
 #   text_len Int                    LT (natural caption length, == LFULL - imglen)
@@ -160,8 +160,8 @@ def krea2_build_pad_mask(
 
 # ── one materialised training sample ──────────────────────────────────────────
 struct KreaTrainSample(Copyable, Movable):
-    var clean: TArc        # [1,16,LH,LW]    F32  normalized latent (for trainer noising)
-    var img: TArc          # [1,imglen,64]   F32  patchified clean (noise-free convenience)
+    var clean: TArc        # [1,16,LH,LW]    BF16 normalized latent (for trainer noising)
+    var img: TArc          # [1,imglen,64]   BF16 patchified clean (noise-free convenience)
     var context: TArc      # [1,LT,12,2560]  BF16 Qwen3-VL stack
     var pos: TArc          # [1,LFULL,3]     F32  txt zeros + img grid
     var text_len: Int      #                      LT (natural caption length)
@@ -294,7 +294,7 @@ struct KreaTrainCache(Movable):
 
         var clean = cast_tensor(
             Tensor.from_view(self.src.tensor_view(self.clean_keys[index]), ctx),
-            STDtype.F32, ctx,
+            STDtype.BF16, ctx,
         )
         _validate_clean_shape[LH, LW](clean)
 
@@ -320,7 +320,7 @@ struct KreaTrainCache(Movable):
                         + "=" + String(cached_lt) + " != context LT=" + String(lt)
                     )
 
-        var img = krea2_patchify[LH, LW](clean, ctx)         # [1,imglen,64] F32
+        var img = krea2_patchify[LH, LW](clean, ctx)         # [1,imglen,64] BF16
         var pos = krea2_build_pos[LH, LW](lt, ctx)           # [1,LT+imglen,3] F32
 
         return KreaTrainSample(

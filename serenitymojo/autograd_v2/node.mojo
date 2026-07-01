@@ -99,9 +99,14 @@ comptime OPK_KREA2_SINGLE_BLOCK = 20
 #    d_x routes through the single (x) engine edge. saved=[x, w, A, B];
 #    meta=[M, in_f, out_f, rank, lora_slot]; scalars=[scale]. lora_slot<0 = no
 #    adapter (base d_x only, nothing captured).
+#  * OPK_KREA2_RMS_NORM_DX: Krea2 RMSNorm with RAW checkpoint scale. Forward and
+#    backward call the Krea2-specific kernels whose contract is
+#    scale.float()+1.0 inside the op, returning x/go storage dtype at tensor
+#    boundaries. saved=[x, raw_scale]; scalars=[eps]; one input edge (x).
 comptime OPK_REPEAT_KV = 21
 comptime OPK_SIGMOID = 22
 comptime OPK_KREA2_PROJ_LORA = 23
+comptime OPK_KREA2_RMS_NORM_DX = 24
 
 
 struct Edge(Copyable, Movable):

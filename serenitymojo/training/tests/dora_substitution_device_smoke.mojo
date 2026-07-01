@@ -36,6 +36,13 @@ def _zeros(n: Int) -> List[Float32]:
     return out^
 
 
+def _bf16_round(var values: List[Float32]) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(len(values)):
+        out.append(values[i].cast[DType.bfloat16]().cast[DType.float32]())
+    return out^
+
+
 def _randn(n: Int, seed: UInt64, scale: Float32, bias: Float32) -> List[Float32]:
     var out = List[Float32]()
     var state = seed
@@ -106,13 +113,21 @@ def _case(ctx: DeviceContext, label: String, wd_on_out: Bool, dtype: STDtype) ra
         _zeros(OUT * R), _zeros(OUT * R),
         _zeros(mlen), _zeros(mlen), wd_on_out,
     )
+    var d_ref = DoRAAdapter(
+        A.copy(), B.copy(), _bf16_round(mag.copy()), R, IN, OUT, alpha, Float32(0.0),
+        _zeros(R * IN), _zeros(R * IN),
+        _zeros(OUT * R), _zeros(OUT * R),
+        _zeros(mlen), _zeros(mlen), wd_on_out,
+    )
 
     print("[dora-device] ", label, " dtype=", dtype.name())
     var dev = dora_device_from_host(d, ctx)
+    if dev.m[].dtype() != STDtype.BF16:
+        raise Error("dora-device: resident magnitude must be BF16")
     var x_dev = Tensor.from_host(x.copy(), [M, IN], dtype, ctx)
     var w_dev = Tensor.from_host(W.copy(), [OUT, IN], dtype, ctx)
     var y = dora_substitution_forward_device(x_dev, w_dev, dev, ctx)
-    var y_ref = dora_substitution_forward(x.copy(), W.copy(), d, M)
+    var y_ref = dora_substitution_forward(x.copy(), W.copy(), d_ref, M)
     var bar = BF16_NREL_BAR if dtype != STDtype.F32 else NREL_BAR
     var cbar = BF16_COS_BAR if dtype != STDtype.F32 else COS_BAR
     _check(label + String(" forward"), y.to_host(ctx), y_ref, bar, cbar)
@@ -122,7 +137,7 @@ def _case(ctx: DeviceContext, label: String, wd_on_out: Bool, dtype: STDtype) ra
     var w_dev_b = Tensor.from_host(W.copy(), [OUT, IN], dtype, ctx)
     var dy_dev = Tensor.from_host(d_y.copy(), [M, OUT], dtype, ctx)
     var g = dora_substitution_backward_device(dy_dev, x_dev_b, w_dev_b, dev_b, ctx)
-    var g_ref = dora_substitution_backward(d_y.copy(), x.copy(), W.copy(), d, M)
+    var g_ref = dora_substitution_backward(d_y.copy(), x.copy(), W.copy(), d_ref, M)
     _check(label + String(" d_A"), g.d_a.to_host(ctx), g_ref.d_a, bar, cbar)
     _check(label + String(" d_B"), g.d_b.to_host(ctx), g_ref.d_b, bar, cbar)
     _check(label + String(" d_m"), g.d_m.to_host(ctx), g_ref.d_m, bar, cbar)
@@ -140,13 +155,17 @@ def _case_delta_zero_bf16_init(ctx: DeviceContext) raises:
     var d = new_dora_adapter(
         W.copy(), IN, OUT, R, alpha, UInt64(123), Float32(1.0e-7), False,
     )
+    var d_ref = d.copy()
+    d_ref.m = _bf16_round(d.m.copy())
 
     print("[dora-device] OneTrainer BF16 delta-zero init shortcut")
     var dev = dora_device_from_host(d, ctx)
+    if dev.m[].dtype() != STDtype.BF16:
+        raise Error("dora-device: resident delta-zero magnitude must be BF16")
     var x_dev = Tensor.from_host(x.copy(), [M, IN], STDtype.BF16, ctx)
     var w_dev = Tensor.from_host(W.copy(), [OUT, IN], STDtype.BF16, ctx)
     var y = dora_substitution_forward_device(x_dev, w_dev, dev, ctx)
-    var y_ref = dora_substitution_forward(x.copy(), W.copy(), d, M)
+    var y_ref = dora_substitution_forward(x.copy(), W.copy(), d_ref, M)
     _check(
         String("OneTrainer BF16 delta-zero init forward"),
         y.to_host(ctx), y_ref, BF16_NREL_BAR, BF16_COS_BAR,

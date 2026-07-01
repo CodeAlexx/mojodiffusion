@@ -6,15 +6,17 @@ tricks. Anchored to the existing `TRAINER_SPEED_ROADMAP_2026-06-30.md` substrate
 
 Latest result: the missing krea2-512 second was an Automagic3 dispatch bug, not a
 numerics/oracle issue. The A3 path now has a true preloaded-device-grad route for
-plain LoRA/LoCon and measures **2.7 s/step steady** on the same real eri2 smoke.
+plain LoRA/LoCon and measures **2.721972 s/step over 100 real eri2 steps**.
 
 ## Measured baseline (krea2 512px rank-64 automagic3 fp8-resident, this session)
 - **Sync mode: 4.9 s/step steady, peak 18.2 GB — VERIFIED WORKING** (block LoRA
   parity cos ~11 nines vs torch-generated fixture; saves valid 224-pair PEFT).
-- **Current plain LoRA/LoCon Automagic3 device path: 3.1 / 2.7 / 2.7 / 2.7 s/step**
-  on the same 4-step sync smoke, peak 18.23 GB, valid PEFT. Perf JSON:
+- **Current plain LoRA/LoCon Automagic3 device path: 2.721972 s/step over 100 steps**
+  on the same real eri2 cache, peak 18.23 GB, valid PEFT. Perf JSON:
   `fast_path_kind="device"`, `full_tensor_readback_count=0`,
-  `enabled_flags` includes `a3-device-preloaded-grads`.
+  `host_device_transfer_count=403`, `sync_count=3100`, `enabled_flags` includes
+  `a3-device-preloaded-grads`. Loss first10 avg **0.1234** -> last10 avg **0.0728**;
+  step100 loss **0.0673**, grad_norm **0.0059**.
 - **Async mode: OOM — peak 23.8 GB** (nvidia-smi poll) vs 24.5 GB card. Async is
   faster but the ~5.6 GB within-step transient wall forces the slower sync path.
 - ai-toolkit reference ~3.3 s/step. Ledger: COMPUTE-bound (SM 91.6%); GEMM 63%
@@ -70,7 +72,8 @@ plain LoRA/LoCon and measures **2.7 s/step steady** on the same real eri2 smoke.
 
 ## Earlier ceiling analysis (superseded for plain LoRA/LoCon A3)
 - This ceiling applied to the pre-fix host-grad-compatible A3 route. Do not use it to
-  predict the current preloaded-device-grad path, which measures 2.7 s/step steady.
+  predict the current preloaded-device-grad path, which measures 2.721972 s/step over
+  100 real eri2 steps.
 - GEMM 63% + flash 22% = **85% of the old host-compatible step was at hardware peak**
   (cuBLAS==MAX==ai-toolkit F32-accum). Only ~12% looked fusible, so the earlier B+C+D
   estimate floored at ~3.8-4.0 s before the A3 dispatch bug was found.
@@ -186,13 +189,20 @@ tensor_algebra 4.6 + misc). Halving it ≈ 4.9→~4.4 s sync / ~4.2→~3.7 s asy
   - `automagic3_device_preloaded_step_result` runs global grad norm/clip and the A3
     update on device, with no host grad lists and no full param readback.
   - Host LoRA sync is deferred to save/sample boundaries; the final save syncs once.
-- Evidence, same real eri2 512px rank-64 A3 smoke:
+- Evidence, same real eri2 512px rank-64 A3 path:
   - step log: **3.1 / 2.7 / 2.7 / 2.7 s/step**.
   - every step prints `[KREA2_A3_DEVICE_FAST] ... backend=device-automagic3-preloaded-grads`.
   - perf JSON: `fast_path_kind="device"`, `full_tensor_readback_count=0`,
     `host_device_transfer_count=19`, `sync_count=124`, peak `18228696576` bytes,
     `enabled_flags` includes `a3-device-preloaded-grads`.
   - final PEFT save: `/tmp/krea2_a3_sptest/a3_smoke_4.safetensors`.
+- 100-step confirmation after push:
+  - perf JSON `measured_steps=100`, `total_seconds_per_step=2.7219720360500004`,
+    `host_device_transfer_count=403`, `sync_count=3100`,
+    `full_tensor_readback_count=0`, peak `18228696576`.
+  - loss first10 avg **0.1234** -> last10 avg **0.0728**; step100
+    loss **0.0673**, grad_norm **0.0059**.
+  - final PEFT save: `/tmp/krea2_a3_sptest/a3_smoke_100.safetensors`.
 - Scope/limits: enabled for Automagic3 + plain LoRA/LoCon under the streamed hand-chain.
   It intentionally stays off for carrier/DoRA/OFT/txtfusion surfaces until those paths
   get their own device-grad buffer contract.

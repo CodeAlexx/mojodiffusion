@@ -106,6 +106,9 @@ from serenitymojo.training.levers import (
 from serenitymojo.training.lora_save import NamedLora, save_lora_peft, save_lora_train_state, load_lora_train_state, load_lora_for_resume
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.automagic3_device import (
+    automagic3_device_preloaded_step_result,
+    automagic3_device_state_init_from_adapters,
+    automagic3_device_state_sync_params,
     automagic3_device_step_result,
     Automagic3DeviceState,
 )
@@ -117,6 +120,7 @@ from serenitymojo.training.train_config import (
     TRAIN_OPTIMIZER_AUTOMAGIC3,
 )
 from serenitymojo.training.perf_record import (
+    PERF_FAST_PATH_DEVICE,
     PERF_FAST_PATH_HOST_GRAD_COMPAT,
     PERF_LANE_MOJO_CURRENT,
     TrainingPerfRecord,
@@ -217,6 +221,7 @@ from serenitymojo.models.krea2.krea2_stack import (
     krea2_stack_lora_forward_streamed, krea2_stack_lora_backward_streamed,
     krea2_stack_lora_backward_streamed_dev,
     krea2_stack_lora_backward_streamed_adamw_device_grads,
+    krea2_stack_lora_backward_streamed_automagic3_device_grads,
     krea2_stack_dora_forward_streamed, krea2_stack_dora_backward_streamed_dev,
     krea2_stack_oft_forward_streamed, krea2_stack_oft_backward_streamed_dev,
     _load_krea2_block_streamed, _load_krea2_block_resident,
@@ -437,6 +442,7 @@ def _krea2_perf_config_hash(cfg: TrainConfig, cache_path: String, steps: Int) ->
 
 def _krea2_perf_flags(
     cfg: TrainConfig, sample_enabled: Bool, device_grad_smoke: Bool,
+    a3_device_fast: Bool,
 ) -> String:
     var flags = String("strict")
     if levers_loss_active(cfg):
@@ -447,10 +453,13 @@ def _krea2_perf_flags(
         flags += String(",gpu-clip-folded")
     else:
         flags += String(",host-clip")
-    comptime if KREA2_DEVICE_LORA_GRAD:
-        flags += String(",device-lora-grad-staging")
+    if a3_device_fast:
+        flags += String(",a3-device-preloaded-grads")
     else:
-        flags += String(",host-grad-compat")
+        comptime if KREA2_DEVICE_LORA_GRAD:
+            flags += String(",device-lora-grad-staging")
+        else:
+            flags += String(",host-grad-compat")
     flags += String(",visible-transfer-counts")
     flags += String(",ltmax-") + String(LTMAX)
     comptime if KREA2_PHASE_TIMING:
@@ -484,9 +493,11 @@ def _krea2_emit_perf_record(
     visible_sync_count: Int,
     visible_host_device_transfer_count: Int,
     visible_full_tensor_readback_count: Int,
+    fast_path_kind: Int,
     final_save_seconds: Float64,
     sample_enabled: Bool,
     device_grad_smoke: Bool,
+    a3_device_fast: Bool,
 ) raises:
     var measured_steps = steps - start_step
     if measured_steps <= 0:
@@ -496,7 +507,7 @@ def _krea2_emit_perf_record(
     if total_vram_bytes > 0 and min_free_bytes > 0 and total_vram_bytes > min_free_bytes:
         peak_vram = total_vram_bytes - min_free_bytes
     var full_tensor_readbacks = visible_full_tensor_readback_count
-    if full_tensor_readbacks == 0:
+    if full_tensor_readbacks == 0 and fast_path_kind != PERF_FAST_PATH_DEVICE:
         full_tensor_readbacks = measured_steps
     var phases = empty_training_phase_timings()
     phases.save_seconds = final_save_seconds
@@ -509,7 +520,7 @@ def _krea2_emit_perf_record(
         cfg.batch_size,
         String(LH * 8),
         _krea2_optimizer_name(cfg),
-        _krea2_perf_flags(cfg, sample_enabled, device_grad_smoke),
+        _krea2_perf_flags(cfg, sample_enabled, device_grad_smoke, a3_device_fast),
         0,
         measured_steps,
         measured_loop_seconds / Float64(measured_steps),
@@ -518,7 +529,7 @@ def _krea2_emit_perf_record(
         visible_host_device_transfer_count,
         full_tensor_readbacks,
         visible_sync_count,
-        PERF_FAST_PATH_HOST_GRAD_COMPAT,
+        fast_path_kind,
         String("krea2-stack-direct"),
         String(""),
     )
@@ -1258,6 +1269,75 @@ def _train_one_sample_adamw_device_grads(
     )
 
 
+def _train_one_sample_automagic3_device_grads(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor,
+    context: Tensor,
+    pos: Tensor,
+    lt: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    cond_w: Krea2ResidentCond,
+    sigma: Float32,
+    noise_seed: UInt64,
+    cfg: TrainConfig,
+    mut a3_state: Automagic3DeviceState,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutAdamWDeviceGrads:
+    var _pt = 0
+    comptime if KREA2_PHASE_TIMING:
+        ctx.synchronize(); _pt = Int(perf_counter_ns())
+
+    var noise = _gaussian_like(clean, noise_seed, ctx)
+    var fm = flow_match_noise_target(clean, sigma, noise, ctx)
+    var noised_lat = fm.x_t.clone(ctx)
+    var img = krea2_patchify[LH, LW](noised_lat, ctx)
+    var target_img = krea2_patchify[LH, LW](fm.target, ctx)
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("noise+patchify", _pt, ctx)
+
+    var t1 = _t_scalar(sigma, ctx)
+    var cond = _build_conditioning[LTMAX, LFULL](
+        cond_w, img, context, pos, t1, lt, ctx,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("conditioning_fwd", _pt, ctx)
+
+    var real_len = Optional[Int](lt + IMGLEN)
+    var fwd = krea2_stack_lora_forward_streamed[LFULL, HEADS, KVHEADS, HEADDIM](
+        cond.combined, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin,
+        cond.cos, cond.sin, EPS, lt, IMGLEN, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_forward", _pt, ctx)
+
+    var vloss = _velocity_loss(fwd.velocity[], target_img, sigma, cfg, ctx)
+    var loss = vloss.loss
+    var d_velocity = vloss^.take_d_velocity()
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("loss", _pt, ctx)
+
+    comptime if KREA2_V2_GRAPH:
+        raise Error(
+            "krea2 Automagic3 device-grad path requires KREA2_V2_GRAPH=False; "
+            + "the preloaded A3 grad buffer is wired to the streamed hand-chain"
+        )
+
+    var wrote = krea2_stack_lora_backward_streamed_automagic3_device_grads[
+        LFULL, HEADS, KVHEADS, HEADDIM
+    ](
+        d_velocity, cond.blk_vec, cond.tmlp_out,
+        st, key_prefix, NBLOCKS, lora, fin, fwd,
+        cond.cos, cond.sin, EPS, a3_state, ctx, real_len, resident,
+    )
+    comptime if KREA2_PHASE_TIMING:
+        _pt = _phase_ms("stack_backward_a3_device_grads", _pt, ctx)
+    return _StepOutAdamWDeviceGrads(
+        loss, wrote.grad_count, wrote.streaming_sync_count
+    )
+
+
 def _train_one_sample_adamw_device_grads_full_surface(
     st: ShardedSafeTensors, key_prefix: String,
     clean: Tensor,
@@ -1959,6 +2039,53 @@ def _host_to_device_lora_resident(
     return Krea2StackLora(blocks^)
 
 
+def _resident_lora_adapter_a3(
+    lo: LoraAdapter,
+    state: Automagic3DeviceState,
+    adapter_idx: Int,
+) raises -> LoraAdapterDevice:
+    var n_a = len(lo.a)
+    var n_b = len(lo.b)
+    var a_off = state.elem_offset(adapter_idx, False)
+    var b_off = state.elem_offset(adapter_idx, True)
+    return LoraAdapterDevice(
+        TArc(Tensor(
+            state.pb_dev.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+            [lo.rank, lo.in_f], STDtype.BF16,
+        )),
+        TArc(Tensor(
+            state.pb_dev.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+            [lo.out_f, lo.rank], STDtype.BF16,
+        )),
+        lo.rank, lo.in_f, lo.out_f, lo.scale,
+    )
+
+
+def _host_to_device_lora_resident_a3(
+    host: List[LoraAdapter],
+    state: Automagic3DeviceState,
+) raises -> Krea2StackLora:
+    """Build Krea2 LoRA device views from Automagic3's live BF16 param mirror."""
+    if not state.inited:
+        raise Error("_host_to_device_lora_resident_a3: state is not initialized")
+    if len(state.seg_len) != 2 * len(host):
+        raise Error("_host_to_device_lora_resident_a3: state must cover all Krea2 adapters")
+    var blocks = List[Krea2BlockLora]()
+    for bi in range(NBLOCKS):
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        blocks.append(Krea2BlockLora(
+            Optional[LoraAdapterDevice](_resident_lora_adapter_a3(host[base + 0], state, base + 0)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter_a3(host[base + 1], state, base + 1)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter_a3(host[base + 2], state, base + 2)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter_a3(host[base + 3], state, base + 3)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter_a3(host[base + 4], state, base + 4)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter_a3(host[base + 5], state, base + 5)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter_a3(host[base + 6], state, base + 6)),
+            Optional[LoraAdapterDevice](_resident_lora_adapter_a3(host[base + 7], state, base + 7)),
+        ))
+    return Krea2StackLora(blocks^)
+
+
 def _resident_krea2_block_lora(
     host: List[LoraAdapter],
     state: LoraAdamWPlainDeviceState,
@@ -2063,6 +2190,25 @@ def _step_dispatch_adamw_device_grads(
     return _train_one_sample_adamw_device_grads(
         st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
         sigma, noise_seed, cfg, adamw_state, ctx, resident)
+
+
+def _step_dispatch_automagic3_device_grads(
+    st: ShardedSafeTensors, key_prefix: String,
+    clean: Tensor, context: Tensor, pos: Tensor, lt: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal, cond_w: Krea2ResidentCond,
+    sigma: Float32, noise_seed: UInt64, cfg: TrainConfig,
+    mut a3_state: Automagic3DeviceState,
+    ctx: DeviceContext,
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> _StepOutAdamWDeviceGrads:
+    if lt > LTMAX:
+        raise Error(
+            String("train_krea2: LT=") + String(lt) + " > LTMAX=" + String(LTMAX)
+            + " (raise LTMAX above the dataset's max caption length)"
+        )
+    return _train_one_sample_automagic3_device_grads(
+        st, key_prefix, clean, context, pos, lt, lora, fin, cond_w,
+        sigma, noise_seed, cfg, a3_state, ctx, resident)
 
 
 def _step_dispatch_adamw_device_grads_full_surface(
@@ -2491,6 +2637,7 @@ def main() raises:
     var perf_visible_sync_count = 0
     var perf_visible_transfer_count = 0
     var perf_visible_full_tensor_readback_count = 0
+    var perf_fast_path_kind = PERF_FAST_PATH_HOST_GRAD_COMPAT
     var key_prefix = String("")          # real raw.safetensors stores bare torch keys
 
     print("==== krea2 LoRA TRAINER (Phase 4a, streaming) ====")
@@ -2741,6 +2888,17 @@ def main() raises:
 
     var t0 = perf_counter_ns()   # training start — elapsed/ETA for print_trainer_progress
     var standard_loop_start = start_step
+    var a3_device_fast_active = (
+        cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3
+        and levers_optimizer_active(cfg)
+        and not krea2_device_grad_smoke
+        and not carrier_active
+        and not dora_active
+        and not oft_active
+        and (cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LORA or cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON)
+    )
+    comptime if KREA2_TXTFUSION_LORA:
+        a3_device_fast_active = False
     if krea2_device_grad_smoke:
         print(
             "[KREA2_DEVICE_GRAD_SMOKE] live dev_p mode: building resident",
@@ -2856,6 +3014,125 @@ def main() raises:
             print("[KREA2_DEVICE_GRAD_SMOKE] synced F32 AdamW moments once for full-surface resume state")
         perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
         print("[KREA2_DEVICE_GRAD_SMOKE] synced live dev_p params once for final save")
+        standard_loop_start = steps
+
+    if a3_device_fast_active and standard_loop_start < steps:
+        print(
+            "[KREA2_A3_DEVICE_FAST] enabled: streamed backward writes",
+            "preloaded device grads into Automagic3; host grad lists disabled",
+        )
+        automagic3_device_state_init_from_adapters(
+            a3_dev, host_lora, Float64(cfg.lr), ctx
+        )
+        var resident_a3_lora = _host_to_device_lora_resident_a3(host_lora, a3_dev)
+        perf_visible_transfer_count += 3
+        perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
+        perf_fast_path_kind = PERF_FAST_PATH_DEVICE
+
+        for step in range(start_step, steps):
+            var step_t0 = perf_counter_ns()
+            var idx = order[step % n]
+            var sample: KreaTrainSample
+            comptime if KREA2_RES_512_SYNTH:
+                sample = _synthetic_sample(idx, ctx)
+            else:
+                sample = cache.sample_padded[LH, LW, LTMAX](idx, ctx)
+            var lt = sample.text_len
+            var sigma = sample_timestep_logit_normal(
+                seed_base + UInt64(step), cfg.timestep_shift,
+            )
+            var noise_seed = seed_base * UInt64(7919) + UInt64(step)
+
+            var _ot_a3 = 0
+            comptime if KREA2_PHASE_TIMING:
+                ctx.synchronize(); _ot_a3 = Int(perf_counter_ns())
+
+            var so_dev = _step_dispatch_automagic3_device_grads(
+                st, key_prefix,
+                sample.clean[], sample.context[], sample.pos[], lt,
+                resident_a3_lora, fin, cond_w, sigma, noise_seed, cfg,
+                a3_dev, ctx, resident,
+            )
+            if so_dev.grad_count != n_adapters:
+                raise Error(
+                    String("krea2 Automagic3 device-fast expected ")
+                    + String(n_adapters)
+                    + String(" device grad pairs, got ")
+                    + String(so_dev.grad_count)
+                )
+            perf_visible_sync_count += so_dev.streaming_sync_count
+            var a3_result = automagic3_device_preloaded_step_result(
+                a3_dev,
+                so_dev.loss,
+                Float64(0.999),
+                Float64(1.0e-30),
+                Float64(1.0),
+                Float64(cfg.weight_decay),
+                cfg.max_grad_norm,
+                ctx,
+            )
+            perf_visible_sync_count += a3_result.sync_count
+            perf_visible_transfer_count += (
+                a3_result.scalar_readback_count
+                + a3_result.full_tensor_readback_count
+            )
+            perf_visible_full_tensor_readback_count += a3_result.full_tensor_readback_count
+            var gn_a3 = a3_result.grad_norm
+            print(
+                "[KREA2_A3_DEVICE_FAST] Automagic3 consumed preloaded device grads",
+                "without host grad lists; grad_pairs=",
+                so_dev.grad_count,
+                " streaming_syncs=",
+                so_dev.streaming_sync_count,
+                " backend=",
+                a3_result.optimizer_backend,
+            )
+            comptime if KREA2_PHASE_TIMING:
+                _ot_a3 = _phase_ms("a3_device_fast_optimizer", _ot_a3, ctx)
+
+            var _sn_a3 = perf_counter_ns()
+            print_trainer_progress(
+                String("krea2"), step + 1, steps, n, so_dev.loss, Float64(gn_a3),
+                Float64(_sn_a3 - step_t0) / 1.0e9, 0.0,
+                Float64(_sn_a3 - t0) / 1.0e9,
+            )
+            ctx.synchronize()
+            perf_visible_sync_count += 1
+            perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
+
+            var needs_host_sync = (
+                (sample_enabled and (step + 1) % sample_every == 0)
+                or (cfg.save_every > 0 and (step + 1) % cfg.save_every == 0)
+            )
+            if needs_host_sync:
+                automagic3_device_state_sync_params(a3_dev, host_lora, ctx)
+                perf_visible_transfer_count += 1
+                perf_visible_sync_count += 1
+                perf_visible_full_tensor_readback_count += 1
+                perf_fast_path_kind = PERF_FAST_PATH_HOST_GRAD_COMPAT
+
+            if sample_enabled and (step + 1) % sample_every == 0:
+                _krea2_run_inline_samples[LH, LW, LTMAX, LFULL](
+                    cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
+                    step + 1, ctx, resident,
+                )
+                ctx.synchronize()
+                perf_visible_sync_count += 1
+                perf_min_free = _krea2_update_min_free(ctx, perf_min_free)
+
+            if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
+                _ = sys_mkdirs(cfg.workspace_dir)
+                var sp = _lora_save_path(cfg, step + 1)
+                var npairs = save_krea2_lora(host_lora, sp, ctx)
+                _ = save_krea2_lora_state(host_lora, sp + String(".state"), ctx)
+                print("  [save] wrote", npairs, "LoRA pairs ->", sp)
+                comptime if KREA2_KEEP_CHECKPOINTS > 0:
+                    var old_step = (step + 1) - KREA2_KEEP_CHECKPOINTS * cfg.save_every
+                    if old_step > 0 and old_step % KREA2_CKPT_MILESTONE != 0:
+                        var op = _lora_save_path(cfg, old_step)
+                        if sys_remove(op) == 0:
+                            print("  [prune] removed old checkpoint ->", op)
+
         standard_loop_start = steps
 
     for step in range(standard_loop_start, steps):
@@ -3134,6 +3411,9 @@ def main() raises:
     _ = sys_mkdirs(cfg.workspace_dir)
     var final_path = _lora_save_path(cfg, steps)
     var n_pairs: Int
+    if a3_device_fast_active:
+        automagic3_device_state_sync_params(a3_dev, host_lora, ctx)
+        print("[KREA2_A3_DEVICE_FAST] synced live Automagic3 params once for final save")
     if lokr_active:
         n_pairs = save_krea2_lokr(lokr_masters, final_path, ctx)
     elif loha_active:
@@ -3176,9 +3456,11 @@ def main() raises:
         perf_visible_sync_count,
         perf_visible_transfer_count,
         perf_visible_full_tensor_readback_count,
+        perf_fast_path_kind,
         final_save_seconds,
         sample_enabled,
         krea2_device_grad_smoke,
+        a3_device_fast_active,
     )
 
     print("")

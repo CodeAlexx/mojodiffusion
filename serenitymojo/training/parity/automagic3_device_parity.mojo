@@ -152,7 +152,7 @@ def main() raises:
         ctx.enqueue_function[automagic3_factored_kernel, automagic3_factored_kernel](
             P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN, PB,
             Float32(beta2), Float32(1.0 - beta2), Float32(eps), Float32(clip),
-            Float32(dev_lr), Float32(wd),
+            Float32(dev_lr), Float32(wd), Float32(1.0),
             s, UInt64(0x5EED_A3D0),
             grid_dim=2, block_dim=256,
         )

@@ -95,6 +95,10 @@ from serenitymojo.training.lora_adamw_plain_fused import (
     LoraAdamWPlainDeviceState,
     lora_adamw_plain_device_state_copy_device_grad_pair,
 )
+from serenitymojo.training.automagic3_device import (
+    Automagic3DeviceState,
+    automagic3_device_state_copy_device_grad_pair,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1008,6 +1012,28 @@ def _copy_krea2_grad_to_adamw_state(
     lora_adamw_plain_device_state_copy_device_grad_pair(state, adapter_idx, d_a, d_b, ctx)
 
 
+def _copy_krea2_grad_to_a3_state(
+    mut state: Automagic3DeviceState,
+    adapter_idx: Int,
+    g: Krea2LoraGradT,
+    mut keepalive: List[TArc],
+    ctx: DeviceContext,
+) raises:
+    if not g.d_a:
+        raise Error(
+            "krea2_stack_lora_backward_streamed_automagic3_device_grads: missing dA at adapter "
+            + String(adapter_idx)
+        )
+    if not g.d_b:
+        raise Error(
+            "krea2_stack_lora_backward_streamed_automagic3_device_grads: missing dB at adapter "
+            + String(adapter_idx)
+        )
+    automagic3_device_state_copy_device_grad_pair(
+        state, adapter_idx, g.d_a.value(), g.d_b.value(), keepalive, ctx
+    )
+
+
 def _krea2_device_grad_for_adamw_state(
     state: LoraAdamWPlainDeviceState,
     t: TArc,
@@ -1038,6 +1064,24 @@ def _copy_krea2_block_grads_to_adamw_state(
     _copy_krea2_grad_to_adamw_state(state, base + 5, bg.mlp_gate_w, keepalive, ctx)
     _copy_krea2_grad_to_adamw_state(state, base + 6, bg.mlp_up_w, keepalive, ctx)
     _copy_krea2_grad_to_adamw_state(state, base + 7, bg.mlp_down_w, keepalive, ctx)
+    return Krea2GradCopyKeepalive(keepalive^)
+
+
+def _copy_krea2_block_grads_to_a3_state(
+    bg: Krea2BlockGradsT,
+    base: Int,
+    mut state: Automagic3DeviceState,
+    ctx: DeviceContext,
+) raises -> Krea2GradCopyKeepalive:
+    var keepalive = List[TArc]()
+    _copy_krea2_grad_to_a3_state(state, base + 0, bg.wq, keepalive, ctx)
+    _copy_krea2_grad_to_a3_state(state, base + 1, bg.wk, keepalive, ctx)
+    _copy_krea2_grad_to_a3_state(state, base + 2, bg.wv, keepalive, ctx)
+    _copy_krea2_grad_to_a3_state(state, base + 3, bg.gate_w, keepalive, ctx)
+    _copy_krea2_grad_to_a3_state(state, base + 4, bg.wo, keepalive, ctx)
+    _copy_krea2_grad_to_a3_state(state, base + 5, bg.mlp_gate_w, keepalive, ctx)
+    _copy_krea2_grad_to_a3_state(state, base + 6, bg.mlp_up_w, keepalive, ctx)
+    _copy_krea2_grad_to_a3_state(state, base + 7, bg.mlp_down_w, keepalive, ctx)
     return Krea2GradCopyKeepalive(keepalive^)
 
 
@@ -1184,6 +1228,65 @@ def krea2_stack_lora_backward_streamed_adamw_device_grads[
         grad_count += KREA2_SLOTS_PER_BLOCK
         d_x = bg.d_x[].clone(ctx)
         ctx.synchronize()   # preserve the streaming async-free discipline per block
+        streaming_sync_count += 1
+        _ = len(grad_keepalive.grads)
+        bi -= 1
+
+    return Krea2StackDeviceGradWrite(TArc(d_x^), grad_count, streaming_sync_count)
+
+
+def krea2_stack_lora_backward_streamed_automagic3_device_grads[
+    L: Int, HEADS: Int, KVHEADS: Int, HEADDIM: Int
+](
+    d_velocity: Tensor,
+    blk_vec: Tensor,
+    tmlp_out: Tensor,
+    st: ShardedSafeTensors, key_prefix: String, nblocks: Int,
+    lora: Krea2StackLora, fin: Krea2StreamFinal,
+    fwd: Krea2StackForward,
+    cos: Tensor, sin: Tensor,
+    eps: Float32,
+    mut opt_state: Automagic3DeviceState,
+    ctx: DeviceContext,
+    real_len: Optional[Int] = Optional[Int](None),
+    resident: Optional[Krea2ResidentFp8] = Optional[Krea2ResidentFp8](None),
+) raises -> Krea2StackDeviceGradWrite:
+    comptime features = HEADS * HEADDIM
+
+    var cos_q = _tile_rope_table(cos, L, HEADS, HEADDIM // 2, ctx)
+    var sin_q = _tile_rope_table(sin, L, HEADS, HEADDIM // 2, ctx)
+    var cos_k = _tile_rope_table(cos, L, KVHEADS, HEADDIM // 2, ctx)
+    var sin_k = _tile_rope_table(sin, L, KVHEADS, HEADDIM // 2, ctx)
+
+    var fin_w = fin.as_stack_weights()
+    var d_x = krea2_final_layer_backward[L, HEADS, HEADDIM](
+        d_velocity, fwd, tmlp_out, fin_w, eps, ctx,
+    )
+
+    var grad_count = 0
+    var streaming_sync_count = 0
+    var bi = nblocks - 1
+    while bi >= 0:
+        var wbi: Krea2BlockWeights
+        if resident:
+            wbi = _load_krea2_block_resident(resident.value(), bi, ctx)
+        else:
+            wbi = _load_krea2_block_streamed(st, bi, key_prefix, ctx)
+        var rb = krea2_single_stream_block_lora[L, HEADS, KVHEADS, HEADDIM](
+            fwd.block_inputs[bi].copy(), blk_vec, wbi, lora.blocks[bi],
+            cos, sin, cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var bg = krea2_single_stream_block_lora_backward_dev[L, HEADS, KVHEADS, HEADDIM](
+            d_x, blk_vec, wbi, lora.blocks[bi], rb.saved,
+            cos_q, sin_q, cos_k, sin_k, eps, ctx, real_len,
+        )
+        var base = bi * KREA2_SLOTS_PER_BLOCK
+        var grad_keepalive = _copy_krea2_block_grads_to_a3_state(
+            bg, base, opt_state, ctx
+        )
+        grad_count += KREA2_SLOTS_PER_BLOCK
+        d_x = bg.d_x[].clone(ctx)
+        ctx.synchronize()
         streaming_sync_count += 1
         _ = len(grad_keepalive.grads)
         bi -= 1

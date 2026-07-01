@@ -27,7 +27,7 @@ from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
 from std.atomic import Atomic
 from std.math import sqrt, exp
-from std.memory import stack_allocation
+from std.memory import ArcPointer, stack_allocation
 from std.time import perf_counter_ns
 from std.utils.index import IndexList
 from layout import Layout, LayoutTensor
@@ -87,6 +87,7 @@ def automagic3_factored_kernel(
     clip: Float32,
     lr: Float32,
     weight_decay: Float32,
+    grad_scale: Float32,
     step: Int,
     seed: UInt64,
 ):
@@ -108,7 +109,7 @@ def automagic3_factored_kernel(
     # ── phase 1: sanitize grad into g scratch (reuse g in place), EMA row/col ──
     var i = tid
     while i < numel:
-        var gv = rebind[Scalar[DType.float32]](g[goff + i])
+        var gv = rebind[Scalar[DType.float32]](g[goff + i]) * grad_scale
         if gv != gv or gv > Float32(3.0e38) or gv < Float32(-3.0e38):
             g[goff + i] = Float32(0.0)
         i += nt
@@ -310,10 +311,18 @@ from serenitymojo.training.automagic3 import (
     AUTOMAGIC3_DEFAULT_LR, AUTOMAGIC3_LR_MIN, AUTOMAGIC3_LR_MAX,
 )
 from serenitymojo.training.device_train_step import TrainStepDeviceResult
+from serenitymojo.training.on_device_global_norm import on_device_grad_stats
 from serenitymojo.training.perf_record import (
+    PERF_FAST_PATH_DEVICE,
     PERF_FAST_PATH_HOST_GRAD_COMPAT,
     TrainingPhaseTimings,
 )
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.tensor import Tensor
+
+
+comptime TArc = ArcPointer[Tensor]
 
 
 struct Automagic3DeviceState(Movable):
@@ -335,7 +344,8 @@ struct Automagic3DeviceState(Movable):
     var hfill_dev: DeviceBuffer[DType.int32]
     var gnum_dev: DeviceBuffer[DType.float64]
     var gden_dev: DeviceBuffer[DType.float64]
-    var pb_dev: DeviceBuffer[DType.bfloat16]   # bf16 a/b (device-SR output)
+    var pb_dev: DeviceBuffer[DType.uint8]      # raw BF16 a/b bytes (device-SR output)
+    var seg_len: List[Int]                     # A,B element counts per adapter
     var step: Int
 
     def __init__(out self, ctx: DeviceContext) raises:
@@ -355,12 +365,270 @@ struct Automagic3DeviceState(Movable):
         self.hfill_dev = ctx.enqueue_create_buffer[DType.int32](1)
         self.gnum_dev = ctx.enqueue_create_buffer[DType.float64](1)
         self.gden_dev = ctx.enqueue_create_buffer[DType.float64](1)
-        self.pb_dev = ctx.enqueue_create_buffer[DType.bfloat16](1)
+        self.pb_dev = ctx.enqueue_create_buffer[DType.uint8](2)
+        self.seg_len = List[Int]()
         self.step = 0
+
+    def elem_offset(self, adapter_idx: Int, b_side: Bool) -> Int:
+        var off = 0
+        for i in range(adapter_idx):
+            off += self.seg_len[2 * i]
+            off += self.seg_len[2 * i + 1]
+        if b_side:
+            off += self.seg_len[2 * adapter_idx]
+        return off
 
 
 def _dynf(p: UnsafePointer[Float32, MutAnyOrigin], n: Int) -> LayoutTensor[DType.float32, _DYN1, MutAnyOrigin]:
     return LayoutTensor[DType.float32, _DYN1, MutAnyOrigin](p, RuntimeLayout[_DYN1].row_major(IndexList[1](n)))
+
+
+def automagic3_device_state_init_from_adapters(
+    mut state: Automagic3DeviceState,
+    adapters: List[LoraAdapter],
+    start_lr: Float64,
+    ctx: DeviceContext,
+) raises:
+    """Initialize persistent A3 state and BF16 device param mirror from host LoRA."""
+    if state.inited:
+        return
+    var na = len(adapters)
+    if na == 0:
+        raise Error("automagic3_device_state_init_from_adapters: empty adapter set")
+    var nmat = 2 * na
+    var np = 0
+    var nr = 0
+    var ncv = 0
+    var seg_len = List[Int]()
+    for i in range(na):
+        var n_a = len(adapters[i].a)
+        var n_b = len(adapters[i].b)
+        seg_len.append(n_a)
+        seg_len.append(n_b)
+        np += n_a + n_b
+        nr += adapters[i].rank + adapters[i].out_f
+        ncv += adapters[i].in_f + adapters[i].rank
+    state.nmat = nmat
+    state.np = np
+    state.nr = nr
+    state.ncv = ncv
+    state.lr = start_lr
+    state.seg_len = seg_len^
+    state.p_dev = ctx.enqueue_create_buffer[DType.float32](np)
+    state.g_dev = ctx.enqueue_create_buffer[DType.float32](np)
+    state.u_dev = ctx.enqueue_create_buffer[DType.float32](np)
+    state.rv_dev = ctx.enqueue_create_buffer[DType.float32](nr)
+    state.cv_dev = ctx.enqueue_create_buffer[DType.float32](ncv)
+    state.sr_dev = ctx.enqueue_create_buffer[DType.uint8](_A3_H * np)
+    state.dsc_dev = ctx.enqueue_create_buffer[DType.int32](nmat * 6)
+    state.hidx_dev = ctx.enqueue_create_buffer[DType.int32](nmat)
+    state.hfill_dev = ctx.enqueue_create_buffer[DType.int32](nmat)
+    state.pb_dev = ctx.enqueue_create_buffer[DType.uint8](np * 2)
+
+    var ph = ctx.enqueue_create_host_buffer[DType.float32](np)
+    var pbh = ctx.enqueue_create_host_buffer[DType.uint8](np * 2)
+    var dh = ctx.enqueue_create_host_buffer[DType.int32](nmat * 6)
+    var pp = ph.unsafe_ptr()
+    var pbp = pbh.unsafe_ptr().bitcast[BFloat16]()
+    var dp = dh.unsafe_ptr()
+    var goff = 0
+    var roff = 0
+    var coff = 0
+    var soff = 0
+    var mi = 0
+    for i in range(na):
+        var na_e = len(adapters[i].a)
+        for e in range(na_e):
+            var v = adapters[i].a[e]
+            pp[goff + e] = Float32(v)
+            pbp[goff + e] = v
+        dp[mi * 6 + 0] = Int32(adapters[i].rank)
+        dp[mi * 6 + 1] = Int32(adapters[i].in_f)
+        dp[mi * 6 + 2] = Int32(goff)
+        dp[mi * 6 + 3] = Int32(roff)
+        dp[mi * 6 + 4] = Int32(coff)
+        dp[mi * 6 + 5] = Int32(soff)
+        goff += na_e
+        roff += adapters[i].rank
+        coff += adapters[i].in_f
+        soff += _A3_H * na_e
+        mi += 1
+
+        var nb_e = len(adapters[i].b)
+        for e in range(nb_e):
+            var v = adapters[i].b[e]
+            pp[goff + e] = Float32(v)
+            pbp[goff + e] = v
+        dp[mi * 6 + 0] = Int32(adapters[i].out_f)
+        dp[mi * 6 + 1] = Int32(adapters[i].rank)
+        dp[mi * 6 + 2] = Int32(goff)
+        dp[mi * 6 + 3] = Int32(roff)
+        dp[mi * 6 + 4] = Int32(coff)
+        dp[mi * 6 + 5] = Int32(soff)
+        goff += nb_e
+        roff += adapters[i].out_f
+        coff += adapters[i].rank
+        soff += _A3_H * nb_e
+        mi += 1
+    ctx.enqueue_copy(dst_buf=state.p_dev, src_buf=ph)
+    ctx.enqueue_copy(dst_buf=state.pb_dev, src_buf=pbh)
+    ctx.enqueue_copy(dst_buf=state.dsc_dev, src_buf=dh)
+    state.rv_dev.enqueue_fill(Float32(0.0))
+    state.cv_dev.enqueue_fill(Float32(0.0))
+    state.sr_dev.enqueue_fill(UInt8(0))
+    state.hidx_dev.enqueue_fill(Int32(0))
+    state.hfill_dev.enqueue_fill(Int32(0))
+    state.inited = True
+
+
+def _a3_grad_as_f32(
+    t: TArc, mut keepalive: List[TArc], ctx: DeviceContext
+) raises -> TArc:
+    if t[].dtype() == STDtype.F32:
+        return t.copy()
+    var tc = TArc(cast_tensor(t[], STDtype.F32, ctx))
+    keepalive.append(tc.copy())
+    return tc^
+
+
+def automagic3_device_state_copy_device_grad_pair(
+    mut state: Automagic3DeviceState,
+    adapter_idx: Int,
+    d_a: TArc,
+    d_b: TArc,
+    mut keepalive: List[TArc],
+    ctx: DeviceContext,
+) raises:
+    """Copy one transient device dA/dB pair into A3's persistent flat grad buffer."""
+    if not state.inited:
+        raise Error("automagic3_device_state_copy_device_grad_pair: state is not initialized")
+    if adapter_idx < 0 or adapter_idx * 2 + 1 >= len(state.seg_len):
+        raise Error(
+            "automagic3_device_state_copy_device_grad_pair: adapter index outside state "
+            + String(adapter_idx)
+        )
+    var n_a = state.seg_len[2 * adapter_idx]
+    var n_b = state.seg_len[2 * adapter_idx + 1]
+    var da = _a3_grad_as_f32(d_a, keepalive, ctx)
+    var db = _a3_grad_as_f32(d_b, keepalive, ctx)
+    if da[].numel() != n_a or db[].numel() != n_b:
+        raise Error(
+            "automagic3_device_state_copy_device_grad_pair: grad numel mismatch at "
+            + String(adapter_idx)
+        )
+    var a_off = state.elem_offset(adapter_idx, False)
+    var b_off = state.elem_offset(adapter_idx, True)
+    var dst_a = state.g_dev.create_sub_buffer[DType.float32](a_off, n_a)
+    var dst_b = state.g_dev.create_sub_buffer[DType.float32](b_off, n_b)
+    var src_a = da[].buf.create_sub_buffer[DType.float32](0, n_a)
+    var src_b = db[].buf.create_sub_buffer[DType.float32](0, n_b)
+    ctx.enqueue_copy(dst_buf=dst_a, src_buf=src_a)
+    ctx.enqueue_copy(dst_buf=dst_b, src_buf=src_b)
+
+
+def _automagic3_device_step_preloaded(
+    mut state: Automagic3DeviceState,
+    beta2: Float64,
+    eps: Float64,
+    clip: Float64,
+    weight_decay: Float64,
+    grad_scale: Float32,
+    ctx: DeviceContext,
+) raises -> Float32:
+    if not state.inited:
+        raise Error("_automagic3_device_step_preloaded: state is not initialized")
+    state.gnum_dev.enqueue_fill(Float64(0.0))
+    state.gden_dev.enqueue_fill(Float64(0.0))
+
+    var P = _dynf(state.p_dev.unsafe_ptr(), state.np)
+    var G = _dynf(state.g_dev.unsafe_ptr(), state.np)
+    var U = _dynf(state.u_dev.unsafe_ptr(), state.np)
+    var RV = _dynf(state.rv_dev.unsafe_ptr(), state.nr)
+    var CV = _dynf(state.cv_dev.unsafe_ptr(), state.ncv)
+    var SR = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](
+        state.sr_dev.unsafe_ptr(),
+        RuntimeLayout[_DYN1].row_major(IndexList[1](_A3_H * state.np)),
+    )
+    var DSC = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        state.dsc_dev.unsafe_ptr(),
+        RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat * 6)),
+    )
+    var HIDX = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        state.hidx_dev.unsafe_ptr(),
+        RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)),
+    )
+    var HFILL = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](
+        state.hfill_dev.unsafe_ptr(),
+        RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)),
+    )
+    var GNUM = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](
+        state.gnum_dev.unsafe_ptr(),
+        RuntimeLayout[_DYN1].row_major(IndexList[1](1)),
+    )
+    var GDEN = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](
+        state.gden_dev.unsafe_ptr(),
+        RuntimeLayout[_DYN1].row_major(IndexList[1](1)),
+    )
+    var PB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](
+        state.pb_dev.unsafe_ptr().bitcast[BFloat16](),
+        RuntimeLayout[_DYN1].row_major(IndexList[1](state.np)),
+    )
+
+    ctx.enqueue_function[automagic3_factored_kernel, automagic3_factored_kernel](
+        P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN, PB,
+        Float32(beta2), Float32(1.0 - beta2), Float32(eps), Float32(clip),
+        Float32(state.lr), Float32(weight_decay), grad_scale,
+        state.step, UInt64(0x5EED_A3D0),
+        grid_dim=state.nmat, block_dim=256,
+    )
+    state.step += 1
+
+    var num_h = ctx.enqueue_create_host_buffer[DType.float64](1)
+    var den_h = ctx.enqueue_create_host_buffer[DType.float64](1)
+    ctx.enqueue_copy(dst_buf=num_h, src_buf=state.gnum_dev)
+    ctx.enqueue_copy(dst_buf=den_h, src_buf=state.gden_dev)
+    ctx.synchronize()
+    var gn = num_h.unsafe_ptr()[0]
+    var gd = den_h.unsafe_ptr()[0]
+    if gd > 0.0:
+        var den = gd
+        if den < 1.0e-30:
+            den = 1.0e-30
+        var sig = gn / den
+        if sig > 1.0:
+            sig = 1.0
+        elif sig < -1.0:
+            sig = -1.0
+        var nl = state.lr * exp(sig)
+        if nl < AUTOMAGIC3_LR_MIN:
+            nl = AUTOMAGIC3_LR_MIN
+        elif nl > AUTOMAGIC3_LR_MAX:
+            nl = AUTOMAGIC3_LR_MAX
+        state.lr = nl
+    return Float32(state.lr)
+
+
+def automagic3_device_state_sync_params(
+    state: Automagic3DeviceState,
+    mut adapters: List[LoraAdapter],
+    ctx: DeviceContext,
+) raises:
+    if not state.inited:
+        raise Error("automagic3_device_state_sync_params: state is not initialized")
+    var pbres = ctx.enqueue_create_host_buffer[DType.uint8](state.np * 2)
+    ctx.enqueue_copy(dst_buf=pbres, src_buf=state.pb_dev)
+    ctx.synchronize()
+    var pbp = pbres.unsafe_ptr().bitcast[BFloat16]()
+    var off = 0
+    for i in range(len(adapters)):
+        var n_a = len(adapters[i].a)
+        for e in range(n_a):
+            adapters[i].a[e] = pbp[off + e]
+        off += n_a
+        var n_b = len(adapters[i].b)
+        for e in range(n_b):
+            adapters[i].b[e] = pbp[off + e]
+        off += n_b
 
 
 def automagic3_device_step(
@@ -381,55 +649,7 @@ def automagic3_device_step(
     var na = len(adapters)
     if na == 0:
         return Float32(state.lr)
-
-    # ── lazy init: pack F32 master + descriptors, size + zero device state ──
-    if not state.inited:
-        var nmat = 2 * na
-        var np = 0
-        var nr = 0
-        var ncv = 0
-        for i in range(na):
-            np += len(adapters[i].a) + len(adapters[i].b)
-            nr += adapters[i].rank + adapters[i].out_f   # A rows=rank, B rows=out_f
-            ncv += adapters[i].in_f + adapters[i].rank   # A cols=in_f, B cols=rank
-        state.nmat = nmat; state.np = np; state.nr = nr; state.ncv = ncv
-        state.lr = start_lr
-        state.p_dev = ctx.enqueue_create_buffer[DType.float32](np)
-        state.g_dev = ctx.enqueue_create_buffer[DType.float32](np)
-        state.u_dev = ctx.enqueue_create_buffer[DType.float32](np)
-        state.rv_dev = ctx.enqueue_create_buffer[DType.float32](nr)
-        state.cv_dev = ctx.enqueue_create_buffer[DType.float32](ncv)
-        state.sr_dev = ctx.enqueue_create_buffer[DType.uint8](_A3_H * np)
-        state.dsc_dev = ctx.enqueue_create_buffer[DType.int32](nmat * 6)
-        state.hidx_dev = ctx.enqueue_create_buffer[DType.int32](nmat)
-        state.hfill_dev = ctx.enqueue_create_buffer[DType.int32](nmat)
-        state.pb_dev = ctx.enqueue_create_buffer[DType.bfloat16](np)
-        # pack F32 master (bf16 a/b -> f32) + descriptors host-side
-        var ph = ctx.enqueue_create_host_buffer[DType.float32](np)
-        var dh = ctx.enqueue_create_host_buffer[DType.int32](nmat * 6)
-        var pp = ph.unsafe_ptr()
-        var dp = dh.unsafe_ptr()
-        var goff = 0; var roff = 0; var coff = 0; var soff = 0; var mi = 0
-        for i in range(na):
-            # matrix 2i = A[rank,in], 2i+1 = B[out,rank]
-            var na_e = len(adapters[i].a)
-            for e in range(na_e): pp[goff + e] = Float32(adapters[i].a[e])
-            dp[mi*6+0]=Int32(adapters[i].rank); dp[mi*6+1]=Int32(adapters[i].in_f)
-            dp[mi*6+2]=Int32(goff); dp[mi*6+3]=Int32(roff); dp[mi*6+4]=Int32(coff); dp[mi*6+5]=Int32(soff)
-            goff += na_e; roff += adapters[i].rank; coff += adapters[i].in_f; soff += _A3_H*na_e; mi += 1
-            var nb_e = len(adapters[i].b)
-            for e in range(nb_e): pp[goff + e] = Float32(adapters[i].b[e])
-            dp[mi*6+0]=Int32(adapters[i].out_f); dp[mi*6+1]=Int32(adapters[i].rank)
-            dp[mi*6+2]=Int32(goff); dp[mi*6+3]=Int32(roff); dp[mi*6+4]=Int32(coff); dp[mi*6+5]=Int32(soff)
-            goff += nb_e; roff += adapters[i].out_f; coff += adapters[i].rank; soff += _A3_H*nb_e; mi += 1
-        ctx.enqueue_copy(dst_buf=state.p_dev, src_buf=ph)
-        ctx.enqueue_copy(dst_buf=state.dsc_dev, src_buf=dh)
-        state.rv_dev.enqueue_fill(Float32(0.0))
-        state.cv_dev.enqueue_fill(Float32(0.0))
-        state.sr_dev.enqueue_fill(UInt8(0))
-        state.hidx_dev.enqueue_fill(Int32(0))
-        state.hfill_dev.enqueue_fill(Int32(0))
-        state.inited = True
+    automagic3_device_state_init_from_adapters(state, adapters, start_lr, ctx)
 
     # ── upload grads (matrix order: A then B per adapter) ──
     var gh = ctx.enqueue_create_host_buffer[DType.float32](state.np)
@@ -441,65 +661,69 @@ def automagic3_device_step(
         for e in range(len(d_b[i])): gp[off + e] = d_b[i][e]
         off += len(d_b[i])
     ctx.enqueue_copy(dst_buf=state.g_dev, src_buf=gh)
-    state.gnum_dev.enqueue_fill(Float64(0.0))
-    state.gden_dev.enqueue_fill(Float64(0.0))
-
-    var P = _dynf(state.p_dev.unsafe_ptr(), state.np)
-    var G = _dynf(state.g_dev.unsafe_ptr(), state.np)
-    var U = _dynf(state.u_dev.unsafe_ptr(), state.np)
-    var RV = _dynf(state.rv_dev.unsafe_ptr(), state.nr)
-    var CV = _dynf(state.cv_dev.unsafe_ptr(), state.ncv)
-    var SR = LayoutTensor[DType.uint8, _DYN1, MutAnyOrigin](state.sr_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](_A3_H * state.np)))
-    var DSC = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](state.dsc_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat * 6)))
-    var HIDX = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](state.hidx_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)))
-    var HFILL = LayoutTensor[DType.int32, _DYN1, MutAnyOrigin](state.hfill_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](state.nmat)))
-    var GNUM = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](state.gnum_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](1)))
-    var GDEN = LayoutTensor[DType.float64, _DYN1, MutAnyOrigin](state.gden_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](1)))
-    var PB = LayoutTensor[DType.bfloat16, _DYN1, MutAnyOrigin](state.pb_dev.unsafe_ptr(), RuntimeLayout[_DYN1].row_major(IndexList[1](state.np)))
-
-    ctx.enqueue_function[automagic3_factored_kernel, automagic3_factored_kernel](
-        P, G, U, RV, CV, SR, DSC, HIDX, HFILL, GNUM, GDEN, PB,
-        Float32(beta2), Float32(1.0 - beta2), Float32(eps), Float32(clip),
-        Float32(state.lr), Float32(weight_decay),
-        state.step, UInt64(0x5EED_A3D0),
-        grid_dim=state.nmat, block_dim=256,
+    var lr_now = _automagic3_device_step_preloaded(
+        state, beta2, eps, clip, weight_decay, Float32(1.0), ctx,
     )
-    state.step += 1
+    automagic3_device_state_sync_params(state, adapters, ctx)
+    return lr_now
 
-    # ── read group vote -> host apply_vote -> new lr ──
-    var num_h = ctx.enqueue_create_host_buffer[DType.float64](1)
-    var den_h = ctx.enqueue_create_host_buffer[DType.float64](1)
-    ctx.enqueue_copy(dst_buf=num_h, src_buf=state.gnum_dev)
-    ctx.enqueue_copy(dst_buf=den_h, src_buf=state.gden_dev)
-    # download the device-SR bf16 a/b (half the bytes; NO host SR pass / no F32 D2H)
-    var pbres = ctx.enqueue_create_host_buffer[DType.bfloat16](state.np)
-    ctx.enqueue_copy(dst_buf=pbres, src_buf=state.pb_dev)
-    ctx.synchronize()
-    var gn = num_h.unsafe_ptr()[0]
-    var gd = den_h.unsafe_ptr()[0]
-    if gd > 0.0:
-        var den = gd
-        if den < 1.0e-30: den = 1.0e-30
-        var sig = gn / den
-        if sig > 1.0: sig = 1.0
-        elif sig < -1.0: sig = -1.0
-        var nl = state.lr * exp(sig)
-        if nl < AUTOMAGIC3_LR_MIN: nl = AUTOMAGIC3_LR_MIN
-        elif nl > AUTOMAGIC3_LR_MAX: nl = AUTOMAGIC3_LR_MAX
-        state.lr = nl
 
-    # ── copy the device-SR bf16 a/b into host_lora (kernel already did the SR) ──
-    var pbp = pbres.unsafe_ptr()
-    var off2 = 0
-    for i in range(na):
-        var na_e = len(adapters[i].a)
-        for e in range(na_e): adapters[i].a[e] = pbp[off2 + e]
-        off2 += na_e
-        var nb_e = len(adapters[i].b)
-        for e in range(nb_e): adapters[i].b[e] = pbp[off2 + e]
-        off2 += nb_e
-
-    return Float32(state.lr)
+def automagic3_device_preloaded_step_result(
+    mut state: Automagic3DeviceState,
+    loss: Float32,
+    beta2: Float64,
+    eps: Float64,
+    clip: Float64,
+    weight_decay: Float64,
+    max_grad_norm: Float32,
+    ctx: DeviceContext,
+) raises -> TrainStepDeviceResult:
+    """Device-fast Automagic3 over state.g_dev already filled with F32 grads."""
+    if not state.inited:
+        raise Error("automagic3_device_preloaded_step_result: state is not initialized")
+    var t0 = perf_counter_ns()
+    var sh: List[Int] = [state.np]
+    var stat_grads = List[TArc]()
+    stat_grads.append(TArc(Tensor(
+        state.g_dev.create_sub_buffer[DType.uint8](0, state.np * 4),
+        sh.copy(),
+        STDtype.F32,
+    )))
+    var stats = on_device_grad_stats(stat_grads, ctx)
+    if stats.nonfinite_count != 0:
+        raise Error("automagic3_device_preloaded_step_result: nonfinite device grads")
+    var grad_scale = Float32(1.0)
+    if max_grad_norm > Float32(0.0) and stats.grad_norm > max_grad_norm:
+        grad_scale = max_grad_norm / stats.grad_norm
+    var lr_now = _automagic3_device_step_preloaded(
+        state, beta2, eps, clip, weight_decay, grad_scale, ctx,
+    )
+    var t1 = perf_counter_ns()
+    var phases = TrainingPhaseTimings(
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        Float64(t1 - t0) / 1.0e9,
+        0.0,
+        0.0,
+    )
+    var result = TrainStepDeviceResult(
+        loss,
+        stats.grad_norm,
+        grad_scale,
+        phases^,
+        stats.scalar_readback_count + 2,
+        0,
+        stats.sync_count + 1,
+        stats.nonfinite_count,
+        PERF_FAST_PATH_DEVICE,
+        String("device-automagic3-preloaded-grads"),
+        String("automagic3_lr=") + String(lr_now),
+    )
+    result.validate()
+    return result^
 
 
 def automagic3_device_step_result(

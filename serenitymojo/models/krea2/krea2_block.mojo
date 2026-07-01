@@ -64,6 +64,11 @@ comptime KREA2_SLAB_FLASH = False
 # fitting path); flip to False to test the whole-block path.
 comptime KREA2_SLAB_SEGMENTED = True
 
+# Hand-chain LoRA launch reduction: batch the shared-input LoRA down-projection
+# GEMMs for groups that all see the same x. Enabled for krea2 after the torch
+# block fixture stayed at 11-nines and the 512px sync smoke improved 4.8-4.9 -> 4.7 s/step.
+comptime KREA2_BATCH_LORA_GROUPS = True
+
 # ── forward ops ──────────────────────────────────────────────────────────────
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import swiglu, sigmoid
@@ -81,7 +86,7 @@ from serenitymojo.ops.cast import cast_tensor
 
 # ── backward arms (all pre-built + gated elsewhere) ──────────────────────────
 from serenitymojo.ops.linalg_backward import (
-    linear_backward, linear_backward_dx, LinearGrads,
+    linear_backward_dx, linear_backward_dw,
 )
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward, SwigluGrads
 from serenitymojo.ops.attention_backward import sdpa_backward
@@ -154,6 +159,13 @@ def _linear_lora(
     if d:
         y = add(y, d.value(), ctx)
     return y^
+
+
+def _tensor_to_host_f32_local(t: Tensor, ctx: DeviceContext) raises -> List[Float32]:
+    if t.dtype() == STDtype.F32:
+        return t.to_host(ctx)
+    var t32 = cast_tensor(t, STDtype.F32, ctx)
+    return t32.to_host(ctx)
 
 
 # ── trainable weights (FROZEN base + per-Linear LoRA adapters) ───────────────
@@ -463,10 +475,59 @@ def krea2_single_stream_block_lora[
     var xm = modulate(xn, prescale[], preshift[], ctx)          # [1,L,features]
 
     # projections (+ LoRA). xm is [1,L,features]; linear treats leading dims as rows.
-    var q = _linear_lora(xm, w.wq[], lora.wq, M, ctx)           # [1,L,HEADS*HEADDIM]
-    var k = _linear_lora(xm, w.wk[], lora.wk, M, ctx)           # [1,L,KVHEADS*HEADDIM]
-    var v_lin = _linear_lora(xm, w.wv[], lora.wv, M, ctx)       # [1,L,KVHEADS*HEADDIM]
-    var gate_pre = _linear_lora(xm, w.gate_w[], lora.gate_w, M, ctx)  # [1,L,features]
+    var nb_q_base = _no_bias()
+    var q = linear(xm, w.wq[], nb_q_base^, ctx)           # [1,L,HEADS*HEADDIM]
+    var nb_k_base = _no_bias()
+    var k = linear(xm, w.wk[], nb_k_base^, ctx)           # [1,L,KVHEADS*HEADDIM]
+    var nb_v_base = _no_bias()
+    var v_lin = linear(xm, w.wv[], nb_v_base^, ctx)       # [1,L,KVHEADS*HEADDIM]
+    var nb_g_base = _no_bias()
+    var gate_pre = linear(xm, w.gate_w[], nb_g_base^, ctx)  # [1,L,features]
+    var qkvg_grouped = False
+    comptime if KREA2_BATCH_LORA_GROUPS:
+        if lora.wq:
+            if lora.wk:
+                if lora.wv:
+                    if lora.gate_w:
+                        var lq = lora.wq.value().copy()
+                        var lk = lora.wk.value().copy()
+                        var lv = lora.wv.value().copy()
+                        var lg = lora.gate_w.value().copy()
+                        if (
+                            lq.rank == lk.rank and lq.rank == lv.rank and lq.rank == lg.rank
+                            and lq.in_f == lk.in_f and lq.in_f == lv.in_f and lq.in_f == lg.in_f
+                        ):
+                            var a_stack = concat(0, ctx, lq.a[], lk.a[], lv.a[], lg.a[])
+                            var nb_a = _no_bias()
+                            var t_stack = linear(xm, a_stack, nb_a^, ctx)
+                            var last_dim = len(t_stack.shape()) - 1
+                            var tq = slice(t_stack, last_dim, 0, lq.rank, ctx)
+                            var tk = slice(t_stack, last_dim, lq.rank, lk.rank, ctx)
+                            var tv = slice(t_stack, last_dim, 2 * lq.rank, lv.rank, ctx)
+                            var tg = slice(t_stack, last_dim, 3 * lq.rank, lg.rank, ctx)
+
+                            var nb_bq = _no_bias()
+                            q = add(q, mul_scalar(linear(tq, lq.b[], nb_bq^, ctx), lq.scale, ctx), ctx)
+                            var nb_bk = _no_bias()
+                            k = add(k, mul_scalar(linear(tk, lk.b[], nb_bk^, ctx), lk.scale, ctx), ctx)
+                            var nb_bv = _no_bias()
+                            v_lin = add(v_lin, mul_scalar(linear(tv, lv.b[], nb_bv^, ctx), lv.scale, ctx), ctx)
+                            var nb_bg = _no_bias()
+                            gate_pre = add(gate_pre, mul_scalar(linear(tg, lg.b[], nb_bg^, ctx), lg.scale, ctx), ctx)
+                            qkvg_grouped = True
+    if not qkvg_grouped:
+        var dq = _lora_fwd(xm, lora.wq, M, ctx)
+        if dq:
+            q = add(q, dq.value(), ctx)
+        var dk = _lora_fwd(xm, lora.wk, M, ctx)
+        if dk:
+            k = add(k, dk.value(), ctx)
+        var dv = _lora_fwd(xm, lora.wv, M, ctx)
+        if dv:
+            v_lin = add(v_lin, dv.value(), ctx)
+        var dg = _lora_fwd(xm, lora.gate_w, M, ctx)
+        if dg:
+            gate_pre = add(gate_pre, dg.value(), ctx)
 
     # reshape BSHD.
     var q_pre = reshape_owned(q^, [1, L, HEADS, HEADDIM])
@@ -528,8 +589,36 @@ def krea2_single_stream_block_lora[
     var xn2 = krea2_rmsnorm(x1, w.postnorm_scale[], eps, ctx)
     var xm2 = modulate(xn2, postscale[], postshift[], ctx)     # [1,L,features]
 
-    var mg = _linear_lora(xm2, w.mlp_gate_w[], lora.mlp_gate_w, M, ctx)  # [1,L,mlpdim]
-    var mu = _linear_lora(xm2, w.mlp_up_w[], lora.mlp_up_w, M, ctx)      # [1,L,mlpdim]
+    var nb_mg_base = _no_bias()
+    var mg = linear(xm2, w.mlp_gate_w[], nb_mg_base^, ctx)  # [1,L,mlpdim]
+    var nb_mu_base = _no_bias()
+    var mu = linear(xm2, w.mlp_up_w[], nb_mu_base^, ctx)  # [1,L,mlpdim]
+    var mlp_grouped = False
+    comptime if KREA2_BATCH_LORA_GROUPS:
+        if lora.mlp_gate_w:
+            if lora.mlp_up_w:
+                var lmg = lora.mlp_gate_w.value().copy()
+                var lmu = lora.mlp_up_w.value().copy()
+                if lmg.rank == lmu.rank and lmg.in_f == lmu.in_f:
+                    var a_stack = concat(0, ctx, lmg.a[], lmu.a[])
+                    var nb_a = _no_bias()
+                    var t_stack = linear(xm2, a_stack, nb_a^, ctx)
+                    var last_dim = len(t_stack.shape()) - 1
+                    var tmg = slice(t_stack, last_dim, 0, lmg.rank, ctx)
+                    var tmu = slice(t_stack, last_dim, lmg.rank, lmu.rank, ctx)
+
+                    var nb_bmg = _no_bias()
+                    mg = add(mg, mul_scalar(linear(tmg, lmg.b[], nb_bmg^, ctx), lmg.scale, ctx), ctx)
+                    var nb_bmu = _no_bias()
+                    mu = add(mu, mul_scalar(linear(tmu, lmu.b[], nb_bmu^, ctx), lmu.scale, ctx), ctx)
+                    mlp_grouped = True
+    if not mlp_grouped:
+        var dmg = _lora_fwd(xm2, lora.mlp_gate_w, M, ctx)
+        if dmg:
+            mg = add(mg, dmg.value(), ctx)
+        var dmu = _lora_fwd(xm2, lora.mlp_up_w, M, ctx)
+        if dmu:
+            mu = add(mu, dmu.value(), ctx)
     var sw = swiglu(mg, mu, ctx)                                # silu(mg)*mu [1,L,mlpdim]
     var m = _linear_lora(sw, w.mlp_down_w[], lora.mlp_down_w, M, ctx)    # [1,L,features]
 
@@ -813,6 +902,406 @@ def _linear_bwd_dx_dev(
     return _LinBwdT(d_x^, Krea2LoraGradT(None, None))
 
 
+struct _LinBwdGroup2(Movable):
+    var d_x: Tensor
+    var g0: Krea2LoraGrad
+    var g1: Krea2LoraGrad
+
+    def __init__(
+        out self, var d_x: Tensor, var g0: Krea2LoraGrad, var g1: Krea2LoraGrad
+    ):
+        self.d_x = d_x^
+        self.g0 = g0^
+        self.g1 = g1^
+
+
+struct _LinBwdGroup4(Movable):
+    var d_x: Tensor
+    var g0: Krea2LoraGrad
+    var g1: Krea2LoraGrad
+    var g2: Krea2LoraGrad
+    var g3: Krea2LoraGrad
+
+    def __init__(
+        out self, var d_x: Tensor,
+        var g0: Krea2LoraGrad, var g1: Krea2LoraGrad,
+        var g2: Krea2LoraGrad, var g3: Krea2LoraGrad,
+    ):
+        self.d_x = d_x^
+        self.g0 = g0^
+        self.g1 = g1^
+        self.g2 = g2^
+        self.g3 = g3^
+
+
+struct _LinBwdGroup2T(Movable):
+    var d_x: Tensor
+    var g0: Krea2LoraGradT
+    var g1: Krea2LoraGradT
+
+    def __init__(
+        out self, var d_x: Tensor, var g0: Krea2LoraGradT, var g1: Krea2LoraGradT
+    ):
+        self.d_x = d_x^
+        self.g0 = g0^
+        self.g1 = g1^
+
+
+struct _LinBwdGroup4T(Movable):
+    var d_x: Tensor
+    var g0: Krea2LoraGradT
+    var g1: Krea2LoraGradT
+    var g2: Krea2LoraGradT
+    var g3: Krea2LoraGradT
+
+    def __init__(
+        out self, var d_x: Tensor,
+        var g0: Krea2LoraGradT, var g1: Krea2LoraGradT,
+        var g2: Krea2LoraGradT, var g3: Krea2LoraGradT,
+    ):
+        self.d_x = d_x^
+        self.g0 = g0^
+        self.g1 = g1^
+        self.g2 = g2^
+        self.g3 = g3^
+
+
+def _linear_bwd_dx_group2(
+    d0: Tensor, d1: Tensor, x: Tensor,
+    w0: Tensor, lo0: Optional[LoraAdapterDevice], out0: Int,
+    w1: Tensor, lo1: Optional[LoraAdapterDevice], out1: Int,
+    M: Int, in_f: Int, ctx: DeviceContext,
+) raises -> _LinBwdGroup2:
+    comptime if not KREA2_BATCH_LORA_GROUPS:
+        var b0 = _linear_bwd_dx(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var d_x = add(b0.d_x, b1.d_x, ctx)
+        return _LinBwdGroup2(d_x^, g0^, g1^)
+    if not lo0 or not lo1:
+        var b0 = _linear_bwd_dx(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var d_x = add(b0.d_x, b1.d_x, ctx)
+        return _LinBwdGroup2(d_x^, g0^, g1^)
+
+    var l0 = lo0.value().copy()
+    var l1 = lo1.value().copy()
+    if l0.rank != l1.rank or l0.in_f != l1.in_f:
+        var b0 = _linear_bwd_dx(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var d_x = add(b0.d_x, b1.d_x, ctx)
+        return _LinBwdGroup2(d_x^, g0^, g1^)
+
+    var dx0 = linear_backward_dx(d0, w0, M, in_f, out0, ctx)
+    var dx1 = linear_backward_dx(d1, w1, M, in_f, out1, ctx)
+    var dx_base = add(dx0, dx1, ctx)
+
+    var a_stack = concat(0, ctx, l0.a[], l1.a[])
+    var nb = _no_bias()
+    var t_stack = linear(x, a_stack, nb^, ctx)
+    var last_dim = len(t_stack.shape()) - 1
+    var t0 = slice(t_stack, last_dim, 0, l0.rank, ctx)
+    var t1 = slice(t_stack, last_dim, l0.rank, l1.rank, ctx)
+
+    var ddy0 = mul_scalar(d0, l0.scale, ctx)
+    var dt0 = linear_backward_dx(ddy0, l0.b[], M, l0.rank, out0, ctx)
+    var db0 = linear_backward_dw(ddy0, t0, M, l0.rank, out0, ctx)
+    var ddy1 = mul_scalar(d1, l1.scale, ctx)
+    var dt1 = linear_backward_dx(ddy1, l1.b[], M, l1.rank, out1, ctx)
+    var db1 = linear_backward_dw(ddy1, t1, M, l1.rank, out1, ctx)
+
+    var dt_stack = concat(1, ctx, dt0, dt1)
+    var dx_lora = linear_backward_dx(dt_stack, a_stack, M, in_f, 2 * l0.rank, ctx)
+    var da_stack = linear_backward_dw(dt_stack, x, M, in_f, 2 * l0.rank, ctx)
+    var da0 = slice(da_stack, 0, 0, l0.rank, ctx)
+    var da1 = slice(da_stack, 0, l0.rank, l1.rank, ctx)
+    var d_x = add(dx_base, dx_lora, ctx)
+
+    return _LinBwdGroup2(
+        d_x^,
+        Krea2LoraGrad(
+            Optional[List[Float32]](_tensor_to_host_f32_local(da0, ctx)),
+            Optional[List[Float32]](_tensor_to_host_f32_local(db0, ctx)),
+        ),
+        Krea2LoraGrad(
+            Optional[List[Float32]](_tensor_to_host_f32_local(da1, ctx)),
+            Optional[List[Float32]](_tensor_to_host_f32_local(db1, ctx)),
+        ),
+    )
+
+
+def _linear_bwd_dx_group4(
+    d0: Tensor, d1: Tensor, d2: Tensor, d3: Tensor, x: Tensor,
+    w0: Tensor, lo0: Optional[LoraAdapterDevice], out0: Int,
+    w1: Tensor, lo1: Optional[LoraAdapterDevice], out1: Int,
+    w2: Tensor, lo2: Optional[LoraAdapterDevice], out2: Int,
+    w3: Tensor, lo3: Optional[LoraAdapterDevice], out3: Int,
+    M: Int, in_f: Int, ctx: DeviceContext,
+) raises -> _LinBwdGroup4:
+    comptime if not KREA2_BATCH_LORA_GROUPS:
+        var b0 = _linear_bwd_dx(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var b2 = _linear_bwd_dx(d2, x, w2, lo2, M, in_f, out2, ctx)
+        var b3 = _linear_bwd_dx(d3, x, w3, lo3, M, in_f, out3, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var g2 = b2.lora.copy()
+        var g3 = b3.lora.copy()
+        var d_x = add(add(b0.d_x, b1.d_x, ctx), add(b2.d_x, b3.d_x, ctx), ctx)
+        return _LinBwdGroup4(d_x^, g0^, g1^, g2^, g3^)
+    if not lo0 or not lo1 or not lo2 or not lo3:
+        var b0 = _linear_bwd_dx(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var b2 = _linear_bwd_dx(d2, x, w2, lo2, M, in_f, out2, ctx)
+        var b3 = _linear_bwd_dx(d3, x, w3, lo3, M, in_f, out3, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var g2 = b2.lora.copy()
+        var g3 = b3.lora.copy()
+        var d_x = add(add(b0.d_x, b1.d_x, ctx), add(b2.d_x, b3.d_x, ctx), ctx)
+        return _LinBwdGroup4(d_x^, g0^, g1^, g2^, g3^)
+
+    var l0 = lo0.value().copy()
+    var l1 = lo1.value().copy()
+    var l2 = lo2.value().copy()
+    var l3 = lo3.value().copy()
+    if (
+        l0.rank != l1.rank or l0.rank != l2.rank or l0.rank != l3.rank
+        or l0.in_f != l1.in_f or l0.in_f != l2.in_f or l0.in_f != l3.in_f
+    ):
+        var b0 = _linear_bwd_dx(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var b2 = _linear_bwd_dx(d2, x, w2, lo2, M, in_f, out2, ctx)
+        var b3 = _linear_bwd_dx(d3, x, w3, lo3, M, in_f, out3, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var g2 = b2.lora.copy()
+        var g3 = b3.lora.copy()
+        var d_x = add(add(b0.d_x, b1.d_x, ctx), add(b2.d_x, b3.d_x, ctx), ctx)
+        return _LinBwdGroup4(d_x^, g0^, g1^, g2^, g3^)
+
+    var dx0 = linear_backward_dx(d0, w0, M, in_f, out0, ctx)
+    var dx1 = linear_backward_dx(d1, w1, M, in_f, out1, ctx)
+    var dx2 = linear_backward_dx(d2, w2, M, in_f, out2, ctx)
+    var dx3 = linear_backward_dx(d3, w3, M, in_f, out3, ctx)
+    var dx_base = add(add(dx0, dx1, ctx), add(dx2, dx3, ctx), ctx)
+
+    var a_stack = concat(0, ctx, l0.a[], l1.a[], l2.a[], l3.a[])
+    var nb = _no_bias()
+    var t_stack = linear(x, a_stack, nb^, ctx)
+    var last_dim = len(t_stack.shape()) - 1
+    var t0 = slice(t_stack, last_dim, 0, l0.rank, ctx)
+    var t1 = slice(t_stack, last_dim, l0.rank, l1.rank, ctx)
+    var t2 = slice(t_stack, last_dim, 2 * l0.rank, l2.rank, ctx)
+    var t3 = slice(t_stack, last_dim, 3 * l0.rank, l3.rank, ctx)
+
+    var ddy0 = mul_scalar(d0, l0.scale, ctx)
+    var dt0 = linear_backward_dx(ddy0, l0.b[], M, l0.rank, out0, ctx)
+    var db0 = linear_backward_dw(ddy0, t0, M, l0.rank, out0, ctx)
+    var ddy1 = mul_scalar(d1, l1.scale, ctx)
+    var dt1 = linear_backward_dx(ddy1, l1.b[], M, l1.rank, out1, ctx)
+    var db1 = linear_backward_dw(ddy1, t1, M, l1.rank, out1, ctx)
+    var ddy2 = mul_scalar(d2, l2.scale, ctx)
+    var dt2 = linear_backward_dx(ddy2, l2.b[], M, l2.rank, out2, ctx)
+    var db2 = linear_backward_dw(ddy2, t2, M, l2.rank, out2, ctx)
+    var ddy3 = mul_scalar(d3, l3.scale, ctx)
+    var dt3 = linear_backward_dx(ddy3, l3.b[], M, l3.rank, out3, ctx)
+    var db3 = linear_backward_dw(ddy3, t3, M, l3.rank, out3, ctx)
+
+    var dt_stack = concat(1, ctx, dt0, dt1, dt2, dt3)
+    var dx_lora = linear_backward_dx(dt_stack, a_stack, M, in_f, 4 * l0.rank, ctx)
+    var da_stack = linear_backward_dw(dt_stack, x, M, in_f, 4 * l0.rank, ctx)
+    var da0 = slice(da_stack, 0, 0, l0.rank, ctx)
+    var da1 = slice(da_stack, 0, l0.rank, l1.rank, ctx)
+    var da2 = slice(da_stack, 0, 2 * l0.rank, l2.rank, ctx)
+    var da3 = slice(da_stack, 0, 3 * l0.rank, l3.rank, ctx)
+    var d_x = add(dx_base, dx_lora, ctx)
+
+    return _LinBwdGroup4(
+        d_x^,
+        Krea2LoraGrad(
+            Optional[List[Float32]](_tensor_to_host_f32_local(da0, ctx)),
+            Optional[List[Float32]](_tensor_to_host_f32_local(db0, ctx)),
+        ),
+        Krea2LoraGrad(
+            Optional[List[Float32]](_tensor_to_host_f32_local(da1, ctx)),
+            Optional[List[Float32]](_tensor_to_host_f32_local(db1, ctx)),
+        ),
+        Krea2LoraGrad(
+            Optional[List[Float32]](_tensor_to_host_f32_local(da2, ctx)),
+            Optional[List[Float32]](_tensor_to_host_f32_local(db2, ctx)),
+        ),
+        Krea2LoraGrad(
+            Optional[List[Float32]](_tensor_to_host_f32_local(da3, ctx)),
+            Optional[List[Float32]](_tensor_to_host_f32_local(db3, ctx)),
+        ),
+    )
+
+
+def _linear_bwd_dx_group2_dev(
+    d0: Tensor, d1: Tensor, x: Tensor,
+    w0: Tensor, lo0: Optional[LoraAdapterDevice], out0: Int,
+    w1: Tensor, lo1: Optional[LoraAdapterDevice], out1: Int,
+    M: Int, in_f: Int, ctx: DeviceContext,
+) raises -> _LinBwdGroup2T:
+    comptime if not KREA2_BATCH_LORA_GROUPS:
+        var b0 = _linear_bwd_dx_dev(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx_dev(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var d_x = add(b0.d_x, b1.d_x, ctx)
+        return _LinBwdGroup2T(d_x^, g0^, g1^)
+    if not lo0 or not lo1:
+        var b0 = _linear_bwd_dx_dev(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx_dev(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var d_x = add(b0.d_x, b1.d_x, ctx)
+        return _LinBwdGroup2T(d_x^, g0^, g1^)
+
+    var l0 = lo0.value().copy()
+    var l1 = lo1.value().copy()
+    if l0.rank != l1.rank or l0.in_f != l1.in_f:
+        var b0 = _linear_bwd_dx_dev(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx_dev(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var d_x = add(b0.d_x, b1.d_x, ctx)
+        return _LinBwdGroup2T(d_x^, g0^, g1^)
+
+    var dx0 = linear_backward_dx(d0, w0, M, in_f, out0, ctx)
+    var dx1 = linear_backward_dx(d1, w1, M, in_f, out1, ctx)
+    var dx_base = add(dx0, dx1, ctx)
+
+    var a_stack = concat(0, ctx, l0.a[], l1.a[])
+    var nb = _no_bias()
+    var t_stack = linear(x, a_stack, nb^, ctx)
+    var last_dim = len(t_stack.shape()) - 1
+    var t0 = slice(t_stack, last_dim, 0, l0.rank, ctx)
+    var t1 = slice(t_stack, last_dim, l0.rank, l1.rank, ctx)
+
+    var ddy0 = mul_scalar(d0, l0.scale, ctx)
+    var dt0 = linear_backward_dx(ddy0, l0.b[], M, l0.rank, out0, ctx)
+    var db0 = linear_backward_dw(ddy0, t0, M, l0.rank, out0, ctx)
+    var ddy1 = mul_scalar(d1, l1.scale, ctx)
+    var dt1 = linear_backward_dx(ddy1, l1.b[], M, l1.rank, out1, ctx)
+    var db1 = linear_backward_dw(ddy1, t1, M, l1.rank, out1, ctx)
+
+    var dt_stack = concat(1, ctx, dt0, dt1)
+    var dx_lora = linear_backward_dx(dt_stack, a_stack, M, in_f, 2 * l0.rank, ctx)
+    var da_stack = linear_backward_dw(dt_stack, x, M, in_f, 2 * l0.rank, ctx)
+    var da0 = slice(da_stack, 0, 0, l0.rank, ctx)
+    var da1 = slice(da_stack, 0, l0.rank, l1.rank, ctx)
+    var d_x = add(dx_base, dx_lora, ctx)
+
+    return _LinBwdGroup2T(
+        d_x^,
+        Krea2LoraGradT(Optional[TArc](TArc(da0^)), Optional[TArc](TArc(db0^))),
+        Krea2LoraGradT(Optional[TArc](TArc(da1^)), Optional[TArc](TArc(db1^))),
+    )
+
+
+def _linear_bwd_dx_group4_dev(
+    d0: Tensor, d1: Tensor, d2: Tensor, d3: Tensor, x: Tensor,
+    w0: Tensor, lo0: Optional[LoraAdapterDevice], out0: Int,
+    w1: Tensor, lo1: Optional[LoraAdapterDevice], out1: Int,
+    w2: Tensor, lo2: Optional[LoraAdapterDevice], out2: Int,
+    w3: Tensor, lo3: Optional[LoraAdapterDevice], out3: Int,
+    M: Int, in_f: Int, ctx: DeviceContext,
+) raises -> _LinBwdGroup4T:
+    comptime if not KREA2_BATCH_LORA_GROUPS:
+        var b0 = _linear_bwd_dx_dev(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx_dev(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var b2 = _linear_bwd_dx_dev(d2, x, w2, lo2, M, in_f, out2, ctx)
+        var b3 = _linear_bwd_dx_dev(d3, x, w3, lo3, M, in_f, out3, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var g2 = b2.lora.copy()
+        var g3 = b3.lora.copy()
+        var d_x = add(add(b0.d_x, b1.d_x, ctx), add(b2.d_x, b3.d_x, ctx), ctx)
+        return _LinBwdGroup4T(d_x^, g0^, g1^, g2^, g3^)
+    if not lo0 or not lo1 or not lo2 or not lo3:
+        var b0 = _linear_bwd_dx_dev(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx_dev(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var b2 = _linear_bwd_dx_dev(d2, x, w2, lo2, M, in_f, out2, ctx)
+        var b3 = _linear_bwd_dx_dev(d3, x, w3, lo3, M, in_f, out3, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var g2 = b2.lora.copy()
+        var g3 = b3.lora.copy()
+        var d_x = add(add(b0.d_x, b1.d_x, ctx), add(b2.d_x, b3.d_x, ctx), ctx)
+        return _LinBwdGroup4T(d_x^, g0^, g1^, g2^, g3^)
+
+    var l0 = lo0.value().copy()
+    var l1 = lo1.value().copy()
+    var l2 = lo2.value().copy()
+    var l3 = lo3.value().copy()
+    if (
+        l0.rank != l1.rank or l0.rank != l2.rank or l0.rank != l3.rank
+        or l0.in_f != l1.in_f or l0.in_f != l2.in_f or l0.in_f != l3.in_f
+    ):
+        var b0 = _linear_bwd_dx_dev(d0, x, w0, lo0, M, in_f, out0, ctx)
+        var b1 = _linear_bwd_dx_dev(d1, x, w1, lo1, M, in_f, out1, ctx)
+        var b2 = _linear_bwd_dx_dev(d2, x, w2, lo2, M, in_f, out2, ctx)
+        var b3 = _linear_bwd_dx_dev(d3, x, w3, lo3, M, in_f, out3, ctx)
+        var g0 = b0.lora.copy()
+        var g1 = b1.lora.copy()
+        var g2 = b2.lora.copy()
+        var g3 = b3.lora.copy()
+        var d_x = add(add(b0.d_x, b1.d_x, ctx), add(b2.d_x, b3.d_x, ctx), ctx)
+        return _LinBwdGroup4T(d_x^, g0^, g1^, g2^, g3^)
+
+    var dx0 = linear_backward_dx(d0, w0, M, in_f, out0, ctx)
+    var dx1 = linear_backward_dx(d1, w1, M, in_f, out1, ctx)
+    var dx2 = linear_backward_dx(d2, w2, M, in_f, out2, ctx)
+    var dx3 = linear_backward_dx(d3, w3, M, in_f, out3, ctx)
+    var dx_base = add(add(dx0, dx1, ctx), add(dx2, dx3, ctx), ctx)
+
+    var a_stack = concat(0, ctx, l0.a[], l1.a[], l2.a[], l3.a[])
+    var nb = _no_bias()
+    var t_stack = linear(x, a_stack, nb^, ctx)
+    var last_dim = len(t_stack.shape()) - 1
+    var t0 = slice(t_stack, last_dim, 0, l0.rank, ctx)
+    var t1 = slice(t_stack, last_dim, l0.rank, l1.rank, ctx)
+    var t2 = slice(t_stack, last_dim, 2 * l0.rank, l2.rank, ctx)
+    var t3 = slice(t_stack, last_dim, 3 * l0.rank, l3.rank, ctx)
+
+    var ddy0 = mul_scalar(d0, l0.scale, ctx)
+    var dt0 = linear_backward_dx(ddy0, l0.b[], M, l0.rank, out0, ctx)
+    var db0 = linear_backward_dw(ddy0, t0, M, l0.rank, out0, ctx)
+    var ddy1 = mul_scalar(d1, l1.scale, ctx)
+    var dt1 = linear_backward_dx(ddy1, l1.b[], M, l1.rank, out1, ctx)
+    var db1 = linear_backward_dw(ddy1, t1, M, l1.rank, out1, ctx)
+    var ddy2 = mul_scalar(d2, l2.scale, ctx)
+    var dt2 = linear_backward_dx(ddy2, l2.b[], M, l2.rank, out2, ctx)
+    var db2 = linear_backward_dw(ddy2, t2, M, l2.rank, out2, ctx)
+    var ddy3 = mul_scalar(d3, l3.scale, ctx)
+    var dt3 = linear_backward_dx(ddy3, l3.b[], M, l3.rank, out3, ctx)
+    var db3 = linear_backward_dw(ddy3, t3, M, l3.rank, out3, ctx)
+
+    var dt_stack = concat(1, ctx, dt0, dt1, dt2, dt3)
+    var dx_lora = linear_backward_dx(dt_stack, a_stack, M, in_f, 4 * l0.rank, ctx)
+    var da_stack = linear_backward_dw(dt_stack, x, M, in_f, 4 * l0.rank, ctx)
+    var da0 = slice(da_stack, 0, 0, l0.rank, ctx)
+    var da1 = slice(da_stack, 0, l0.rank, l1.rank, ctx)
+    var da2 = slice(da_stack, 0, 2 * l0.rank, l2.rank, ctx)
+    var da3 = slice(da_stack, 0, 3 * l0.rank, l3.rank, ctx)
+    var d_x = add(dx_base, dx_lora, ctx)
+
+    return _LinBwdGroup4T(
+        d_x^,
+        Krea2LoraGradT(Optional[TArc](TArc(da0^)), Optional[TArc](TArc(db0^))),
+        Krea2LoraGradT(Optional[TArc](TArc(da1^)), Optional[TArc](TArc(db1^))),
+        Krea2LoraGradT(Optional[TArc](TArc(da2^)), Optional[TArc](TArc(db2^))),
+        Krea2LoraGradT(Optional[TArc](TArc(da3^)), Optional[TArc](TArc(db3^))),
+    )
+
+
 struct Krea2DirectDoRAGradT(Copyable, Movable):
     var d_a: Optional[TArc]
     var d_b: Optional[TArc]
@@ -1029,16 +1518,16 @@ def krea2_single_stream_block_lora_backward[
 
     # sw = swiglu(mlp_gate, mlp_up) → d_mlp_gate, d_mlp_up
     var sgb = swiglu_backward(d_sw, saved.mlp_gate[], saved.mlp_up[], ctx)
-    # mlp_gate = mlp_gate_w(xm2) ; mlp_up = mlp_up_w(xm2)  → both feed xm2
-    var bw_mg = _linear_bwd_dx(
-        sgb.d_gate, saved.xm2[], w.mlp_gate_w[], lora.mlp_gate_w, M, features, mlpdim, ctx
+    # mlp_gate/mlp_up share xm2, so their LoRA down-projection can batch.
+    var bw_mlp = _linear_bwd_dx_group2(
+        sgb.d_gate, sgb.d_up, saved.xm2[],
+        w.mlp_gate_w[], lora.mlp_gate_w, mlpdim,
+        w.mlp_up_w[], lora.mlp_up_w, mlpdim,
+        M, features, ctx,
     )
-    var bw_mu = _linear_bwd_dx(
-        sgb.d_up, saved.xm2[], w.mlp_up_w[], lora.mlp_up_w, M, features, mlpdim, ctx
-    )
-    var g_mg = bw_mg.lora.copy()
-    var g_mu = bw_mu.lora.copy()
-    var d_xm2 = add(bw_mg.d_x, bw_mu.d_x, ctx)             # [1,L,features]
+    var g_mg = bw_mlp.g0.copy()
+    var g_mu = bw_mlp.g1.copy()
+    var d_xm2 = bw_mlp.d_x.clone(ctx)             # [1,L,features]
 
     # xm2 = modulate(xn2, postscale, postshift) → d_xn2 (drop d_scale/d_shift)
     # modulate_backward requires scale to match the (bf16) acts dtype — the F32-scale
@@ -1134,18 +1623,20 @@ def krea2_single_stream_block_lora_backward[
     var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
     var d_v_flat = reshape(d_v, [1, L, KVHEADS * HEADDIM], ctx)
 
-    # projections feed xm: q=wq(xm), k=wk(xm), v=wv(xm), gate=gate_w(xm).
-    var bw_q = _linear_bwd_dx(d_q, saved.xm[], w.wq[], lora.wq, M, features, HEADS * HEADDIM, ctx)
-    var bw_k = _linear_bwd_dx(d_k, saved.xm[], w.wk[], lora.wk, M, features, KVHEADS * HEADDIM, ctx)
-    var bw_v = _linear_bwd_dx(d_v_flat, saved.xm[], w.wv[], lora.wv, M, features, KVHEADS * HEADDIM, ctx)
-    var bw_g = _linear_bwd_dx(d_gate_pre, saved.xm[], w.gate_w[], lora.gate_w, M, features, features, ctx)
-    var g_wq = bw_q.lora.copy()
-    var g_wk = bw_k.lora.copy()
-    var g_wv = bw_v.lora.copy()
-    var g_gate = bw_g.lora.copy()
-
-    # sum the four projection input-grads into d_xm.
-    var d_xm = add(add(bw_q.d_x, bw_k.d_x, ctx), add(bw_v.d_x, bw_g.d_x, ctx), ctx)
+    # q/k/v/gate share xm, so their LoRA down-projection can batch.
+    var bw_qkvg = _linear_bwd_dx_group4(
+        d_q, d_k, d_v_flat, d_gate_pre, saved.xm[],
+        w.wq[], lora.wq, HEADS * HEADDIM,
+        w.wk[], lora.wk, KVHEADS * HEADDIM,
+        w.wv[], lora.wv, KVHEADS * HEADDIM,
+        w.gate_w[], lora.gate_w, features,
+        M, features, ctx,
+    )
+    var g_wq = bw_qkvg.g0.copy()
+    var g_wk = bw_qkvg.g1.copy()
+    var g_wv = bw_qkvg.g2.copy()
+    var g_gate = bw_qkvg.g3.copy()
+    var d_xm = bw_qkvg.d_x.clone(ctx)
 
     # xm = modulate(xn, prescale, preshift) → d_xn (drop param grads).
     var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
@@ -1207,15 +1698,15 @@ def krea2_single_stream_block_lora_backward_dev[
     var g_down = bw_down.lora.copy()
 
     var sgb = swiglu_backward(d_sw, saved.mlp_gate[], saved.mlp_up[], ctx)
-    var bw_mg = _linear_bwd_dx_dev(
-        sgb.d_gate, saved.xm2[], w.mlp_gate_w[], lora.mlp_gate_w, M, features, mlpdim, ctx
+    var bw_mlp = _linear_bwd_dx_group2_dev(
+        sgb.d_gate, sgb.d_up, saved.xm2[],
+        w.mlp_gate_w[], lora.mlp_gate_w, mlpdim,
+        w.mlp_up_w[], lora.mlp_up_w, mlpdim,
+        M, features, ctx,
     )
-    var bw_mu = _linear_bwd_dx_dev(
-        sgb.d_up, saved.xm2[], w.mlp_up_w[], lora.mlp_up_w, M, features, mlpdim, ctx
-    )
-    var g_mg = bw_mg.lora.copy()
-    var g_mu = bw_mu.lora.copy()
-    var d_xm2 = add(bw_mg.d_x, bw_mu.d_x, ctx)
+    var g_mg = bw_mlp.g0.copy()
+    var g_mu = bw_mlp.g1.copy()
+    var d_xm2 = bw_mlp.d_x.clone(ctx)
 
     var mb2 = modulate_backward(cast_tensor(d_xm2, saved.xn2[].dtype(), ctx), saved.xn2[], cast_tensor(postscale[], saved.xn2[].dtype(), ctx), ctx, compute_param_grads=False)
     var rb2_dx = krea2_rmsnorm_backward_dx(mb2.d_x, saved.x1[], w.postnorm_scale[], eps, ctx)
@@ -1275,16 +1766,20 @@ def krea2_single_stream_block_lora_backward_dev[
     var d_k = reshape(rbk_dx, [1, L, KVHEADS * HEADDIM], ctx)
     var d_v_flat = reshape(d_v, [1, L, KVHEADS * HEADDIM], ctx)
 
-    var bw_q = _linear_bwd_dx_dev(d_q, saved.xm[], w.wq[], lora.wq, M, features, HEADS * HEADDIM, ctx)
-    var bw_k = _linear_bwd_dx_dev(d_k, saved.xm[], w.wk[], lora.wk, M, features, KVHEADS * HEADDIM, ctx)
-    var bw_v = _linear_bwd_dx_dev(d_v_flat, saved.xm[], w.wv[], lora.wv, M, features, KVHEADS * HEADDIM, ctx)
-    var bw_g = _linear_bwd_dx_dev(d_gate_pre, saved.xm[], w.gate_w[], lora.gate_w, M, features, features, ctx)
-    var g_wq = bw_q.lora.copy()
-    var g_wk = bw_k.lora.copy()
-    var g_wv = bw_v.lora.copy()
-    var g_gate = bw_g.lora.copy()
+    var bw_qkvg = _linear_bwd_dx_group4_dev(
+        d_q, d_k, d_v_flat, d_gate_pre, saved.xm[],
+        w.wq[], lora.wq, HEADS * HEADDIM,
+        w.wk[], lora.wk, KVHEADS * HEADDIM,
+        w.wv[], lora.wv, KVHEADS * HEADDIM,
+        w.gate_w[], lora.gate_w, features,
+        M, features, ctx,
+    )
+    var g_wq = bw_qkvg.g0.copy()
+    var g_wk = bw_qkvg.g1.copy()
+    var g_wv = bw_qkvg.g2.copy()
+    var g_gate = bw_qkvg.g3.copy()
 
-    var d_xm = add(add(bw_q.d_x, bw_k.d_x, ctx), add(bw_v.d_x, bw_g.d_x, ctx), ctx)
+    var d_xm = bw_qkvg.d_x.clone(ctx)
 
     var mb1 = modulate_backward(cast_tensor(d_xm, saved.xn[].dtype(), ctx), saved.xn[], cast_tensor(prescale[], saved.xn[].dtype(), ctx), ctx, compute_param_grads=False)
     var rb1_dx = krea2_rmsnorm_backward_dx(mb1.d_x, saved.x[], w.prenorm_scale[], eps, ctx)

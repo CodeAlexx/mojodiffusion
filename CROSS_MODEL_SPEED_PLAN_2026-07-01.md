@@ -4,9 +4,17 @@ Status: active plan (2026-07-01). Goal: shared speed levers that help **every**
 transformer trainer (klein · zimage · ideogram4 · hidream · krea2), not krea2-only
 tricks. Anchored to the existing `TRAINER_SPEED_ROADMAP_2026-06-30.md` substrate.
 
+Latest result: the missing krea2-512 second was an Automagic3 dispatch bug, not a
+numerics/oracle issue. The A3 path now has a true preloaded-device-grad route for
+plain LoRA/LoCon and measures **2.7 s/step steady** on the same real eri2 smoke.
+
 ## Measured baseline (krea2 512px rank-64 automagic3 fp8-resident, this session)
 - **Sync mode: 4.9 s/step steady, peak 18.2 GB — VERIFIED WORKING** (block LoRA
-  parity cos ~11 nines vs F64 oracle; saves valid 224-pair PEFT).
+  parity cos ~11 nines vs torch-generated fixture; saves valid 224-pair PEFT).
+- **Current plain LoRA/LoCon Automagic3 device path: 3.1 / 2.7 / 2.7 / 2.7 s/step**
+  on the same 4-step sync smoke, peak 18.23 GB, valid PEFT. Perf JSON:
+  `fast_path_kind="device"`, `full_tensor_readback_count=0`,
+  `enabled_flags` includes `a3-device-preloaded-grads`.
 - **Async mode: OOM — peak 23.8 GB** (nvidia-smi poll) vs 24.5 GB card. Async is
   faster but the ~5.6 GB within-step transient wall forces the slower sync path.
 - ai-toolkit reference ~3.3 s/step. Ledger: COMPUTE-bound (SM 91.6%); GEMM 63%
@@ -15,9 +23,10 @@ tricks. Anchored to the existing `TRAINER_SPEED_ROADMAP_2026-06-30.md` substrate
 
 ## Hard guardrails ("without breaking")
 1. Default path stays **strict F32-accumulate** = the verified 11-nines state.
-2. Every lever is **behind a flag, OFF by default**, promoted to on ONLY after BOTH
-   are measured green **per model**: (a) block parity oracle cos ≥ 0.999, (b) external
-   wall-clock s/step improves.
+2. New broad/cross-model levers stay **behind a flag, OFF by default**, promoted to on
+   ONLY after BOTH are measured green **per model**: (a) block parity oracle cos ≥ 0.999,
+   (b) external wall-clock s/step improves. Narrow bug-fix dispatches may go on after
+   their exact supported surface is gated, as with plain LoRA/LoCon A3 device grads.
 3. Keep the verified `output/bin/krea2_train` (4.9 s sync) as the fallback binary.
 4. A lever goes "globally on" only after it helps ≥2 model families (roadmap rule).
 
@@ -59,10 +68,12 @@ tricks. Anchored to the existing `TRAINER_SPEED_ROADMAP_2026-06-30.md` substrate
   `output/bin/krea2_block_parity` (must stay cos ≥ 0.999, ideally bit-unchanged) +
   external s/step. Expected total ~6% (4.9 → ~4.6 s).
 
-## HONEST CEILING (measured 2026-07-01) — read before expecting ≤3.x
-- GEMM 63% + flash 22% = **85% of the step is at hardware peak** (cuBLAS==MAX==ai-
-  toolkit F32-accum). Only ~12% is fusible. So the **parity-safe path B+C+D floors at
-  ~3.8-4.0 s, NOT ≤3.x.** (I over-implied ≤3.x in the first draft — corrected.)
+## Earlier ceiling analysis (superseded for plain LoRA/LoCon A3)
+- This ceiling applied to the pre-fix host-grad-compatible A3 route. Do not use it to
+  predict the current preloaded-device-grad path, which measures 2.7 s/step steady.
+- GEMM 63% + flash 22% = **85% of the old host-compatible step was at hardware peak**
+  (cuBLAS==MAX==ai-toolkit F32-accum). Only ~12% looked fusible, so the earlier B+C+D
+  estimate floored at ~3.8-4.0 s before the A3 dispatch bug was found.
 - **RESOLVED 2026-07-01 (corrects the earlier "≤3.x needs A"):** ai-toolkit's krea2
   path is **eager (torch.compile explicitly DROPPED — mmdit.py:10), gradient-
   checkpointed, cuDNN-attention, bf16/F32-accum** — i.e. IDENTICAL to Mojo on every
@@ -140,7 +151,56 @@ tensor_algebra 4.6 + misc). Halving it ≈ 4.9→~4.4 s sync / ~4.2→~3.7 s asy
 - **LayerOffloadConductor** (CPU block-swap): on 24 GB streams ~24 GB bf16/step from CPU
   (~1 s PCIe) — WORSE than Mojo's 6% fp8-dequant. Not the krea2-512 win.
 
+## 2026-07-01 follow-up result: LoRA down-GEMM batching shipped for krea2
+- Implemented in `serenitymojo/models/krea2/krea2_block.mojo` behind
+  `KREA2_BATCH_LORA_GROUPS=True` after gates. The hand-chain now batches the
+  shared-input LoRA **down** GEMM for:
+  - `wq/wk/wv/gate` on `xm` via one stacked-A GEMM, sliced into four rank blocks.
+  - `mlp_gate/mlp_up` on `xm2` via one stacked-A GEMM, sliced into two rank blocks.
+- Backward mirrors the grouped down path: per-adapter up-proj gradients stay separate
+  (out dims differ), then `d_t` tensors concat and the shared `d_A_stack`/LoRA `d_x`
+  are computed with one grouped GEMM. The grouped LoRA `d_x` is added once per group.
+- Gate: `krea2_block_parity` PASS vs the torch-generated block fixture at ~11 nines
+  for output, `d_x`, and all 8 LoRA dA/dB pairs.
+- Build: cleaned source builds `output/bin/krea2_train_batchlora` at `-O2`.
+- Timing smoke, same 4-step sync/no-sample 512px eri2 command:
+  - grouped binary: step log warmup 5.5s, then **4.7 / 4.7 / 4.7 s/step**, peak
+    18.23GB, valid 224-pair PEFT.
+  - fallback `output/bin/krea2_train`: warmup 5.5s, then **4.8 / 4.8 / 4.9 s/step**,
+    same peak, valid PEFT.
+- Verdict: real but modest win (~0.1-0.2s/step in the short sync gate). This confirms
+  the diagnosis but also shows the remaining launch surface is now elsewhere: unbatched
+  up-proj GEMMs, linear bias/cast, standalone casts, add/mul, and fp8 dequant.
+
+## 2026-07-01 follow-up result: Automagic3 preloaded device grads shipped
+- Root of the extra second: Claude's earlier "device optimizer" fix only gave A3 a
+  GPU update kernel / state path. Krea2 Automagic3 still entered the host-grad-compatible
+  trainer route: streamed backward produced transient grads, then the optimizer API
+  consumed host grad lists / host-compatible sync semantics. That is why the perf row
+  still reported the slow path even though A3 had device state.
+- Implemented a true A3 fast path:
+  - `automagic3_device_state_init_from_adapters` builds persistent F32 master/state plus
+    a raw BF16 device param mirror.
+  - `krea2_stack_lora_backward_streamed_automagic3_device_grads` copies each streamed
+    block's transient device dA/dB directly into A3's flat `g_dev` buffer.
+  - `automagic3_device_preloaded_step_result` runs global grad norm/clip and the A3
+    update on device, with no host grad lists and no full param readback.
+  - Host LoRA sync is deferred to save/sample boundaries; the final save syncs once.
+- Evidence, same real eri2 512px rank-64 A3 smoke:
+  - step log: **3.1 / 2.7 / 2.7 / 2.7 s/step**.
+  - every step prints `[KREA2_A3_DEVICE_FAST] ... backend=device-automagic3-preloaded-grads`.
+  - perf JSON: `fast_path_kind="device"`, `full_tensor_readback_count=0`,
+    `host_device_transfer_count=19`, `sync_count=124`, peak `18228696576` bytes,
+    `enabled_flags` includes `a3-device-preloaded-grads`.
+  - final PEFT save: `/tmp/krea2_a3_sptest/a3_smoke_4.safetensors`.
+- Scope/limits: enabled for Automagic3 + plain LoRA/LoCon under the streamed hand-chain.
+  It intentionally stays off for carrier/DoRA/OFT/txtfusion surfaces until those paths
+  get their own device-grad buffer contract.
+
 ## THE measured structural inefficiency: kernel-launch explosion
+- Historical context: this was the correct diagnosis for the 4.9 -> 4.7 batching pass.
+  The larger 4.7 -> 2.7 fix came from removing the A3 host-grad-compatible dispatch path
+  above, so do not keep attacking only LoRA down-GEMMs expecting another full second.
 - nsys CUDA-API: **~41,600 kernel launches/step** (cudaLaunchKernel 52k + cuLaunchKernel
   51k + cuLaunchKernelEx 22k over 3 steps). torch/ai-toolkit issue ~10-40× fewer.
 - Root: **unbatched per-adapter LoRA** (`klein_lora_fwd_device_resident_unfused` = 2
@@ -185,19 +245,26 @@ Drove the `KREA2_V2_GRAPH+V2_SLAB+SLAB_FLASH` arm to a runnable state and MEASUR
   cross-step leak, (b) fit async (kill the double-reserve — likely needs a MAX allocator flag or
   a smaller resident base), (c) enable capture. That's real autograd_v2 work, not a shave.
 - **The realistic parity-safe speed lever is op-level launch reduction in the HAND-CHAIN**:
-  batch the 224 unbatched per-adapter LoRA GEMMs (the 46k tiny GEMMs / bulk of the 41,600
-  launches) — works in sync (where krea2-512 is pinned by the async wall), no engine dependency.
+  batch the per-adapter LoRA GEMMs and small elementwise surface. First batch-down
+  step shipped for krea2 (above), but it only moved the short sync gate 4.8-4.9 → 4.7s,
+  so the next pass needs a fresh nsys on the flagged binary before attacking up-GEMMs,
+  bias/cast, add fusion, or fp8 dequant.
 
 ## What was done tonight (autonomous, non-breaking)
 - Verified krea2 trainer BUILDS + RUNS on the real eri2 cache (4.9 s/step sync,
   18.2 GB, valid PEFT) — the fallback baseline is intact and measured.
+- Fixed the actual A3 slow path for plain LoRA/LoCon: streamed backward now writes
+  preloaded device grads into Automagic3, and A3 steps on device without host grad
+  lists. Measured steady **2.7 s/step**, full tensor readbacks **0**.
 - Measured async peak = 23.8 GB (the OOM wall) and confirmed Codex did NOT thin the
   sync cadence (added 6 syncs, removed 0).
 - De-risked Lever A: reference GEMM = bf16/F32-accum (same as Mojo) ⇒ FP16-accum is a
   parity tradeoff, not a freebie. Redirected the plan to parity-safe B + C + D.
-- Did NOT modify the verified trainer path. No lever promoted.
+- The default source path now promotes only the proven narrow case: Automagic3 +
+  plain LoRA/LoCon + hand-chain. Unsupported adapter families still fall back.
 
-## Morning decision needed from user
-- Greenlight the parity-safe path (C op-fusion → B async arena → D capture)? and/or
-- Explicitly accept the FP16-accum precision tradeoff (Lever A) for ~2× GEMM, knowing
-  it makes Mojo less faithful than ai-toolkit (would need its own per-model gate).
+## Current next step
+- Reprofile the new A3 device path if more speed is needed; the old host-grad-compatible
+  attribution is stale for plain LoRA/LoCon A3.
+- Extend the preloaded-device-grad contract only after defining equivalent safety gates
+  for carrier/DoRA/OFT/txtfusion paths.

@@ -2,7 +2,7 @@
   "model_type": "krea2",
   "checkpoint": "/home/alex/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494/raw.safetensors",
   "vae": "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots/75e0b4be04f60ec59a75f475837eced720f823b6/vae",
-  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/krea2_inline_sampler_smoke_samples.json",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/krea2_retro_anime_inline_samples.json",
 
   "inner_dim": 6144,
   "in_channels": 64,
@@ -16,20 +16,20 @@
   "timestep_dim": 256,
   "rope_theta": 1000,
 
-  "learning_rate": 1e-4,
-  "lora_rank": 64,
-  "lora_alpha": 64,
+  "learning_rate": 0.0,
+  "lora_rank": 32,
+  "lora_alpha": 32,
   "network_algorithm": "lora",
   "timestep_shift": 1.0,
   "max_grad_norm": 1.0,
   "max_steps": 1,
   "save_every": 0,
   "sample_every": 1,
-  "workspace_dir": "/home/alex/mojodiffusion/output/krea2_inline_samples/smoke",
-  "save_filename_prefix": "krea2_inline_sampler_smoke",
+  "workspace_dir": "/home/alex/mojodiffusion/output/krea2_inline_samples/retro_anime_inline",
+  "save_filename_prefix": "retro_anime_inline",
 
   "quantized_resident": "fp8_e4m3",
   "loss_fn": "mse",
 
-  "optimizer": { "optimizer": "ADAMW", "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
+  "optimizer": { "optimizer": "ADAMW", "eps": 1e-8, "weight_decay": 0.0, "beta1": 0.9, "beta2": 0.999 }
 }

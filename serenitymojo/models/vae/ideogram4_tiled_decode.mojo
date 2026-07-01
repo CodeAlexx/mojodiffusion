@@ -50,6 +50,25 @@ def _blend3(t0: Tensor, t1: Tensor, t2: Tensor, dim: Int, ctx: DeviceContext) ra
     return concat(dim, ctx, a, b, c, d)
 
 
+def _blend5(
+    t0: Tensor, t1: Tensor, t2: Tensor, t3: Tensor, t4: Tensor,
+    dim: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var t = t0.shape()[dim]
+    var s = (t * 3) // 4
+    var ov = t - s
+    var a = slice(t0, dim, 0, s, ctx)
+    var b = _xfade(slice(t0, dim, s, ov, ctx), slice(t1, dim, 0, ov, ctx), dim, ctx)
+    var c = slice(t1, dim, ov, s - ov, ctx)
+    var d = _xfade(slice(t1, dim, s, ov, ctx), slice(t2, dim, 0, ov, ctx), dim, ctx)
+    var e = slice(t2, dim, ov, s - ov, ctx)
+    var f = _xfade(slice(t2, dim, s, ov, ctx), slice(t3, dim, 0, ov, ctx), dim, ctx)
+    var g = slice(t3, dim, ov, s - ov, ctx)
+    var h = _xfade(slice(t3, dim, s, ov, ctx), slice(t4, dim, 0, ov, ctx), dim, ctx)
+    var i = slice(t4, dim, ov, t - ov, ctx)
+    return concat(dim, ctx, a, b, c, d, e, f, g, h, i)
+
+
 def ideogram4_tiled_decode_with_decoder[
     LATENT_H: Int, LATENT_W: Int, TILE_H: Int, TILE_W: Int
 ](
@@ -89,3 +108,57 @@ def ideogram4_tiled_decode[
     return ideogram4_tiled_decode_with_decoder[
         LATENT_H, LATENT_W, TILE_H, TILE_W
     ](latent, dec, ctx)
+
+
+def ideogram4_tiled_decode_5x5_lowmem[
+    LATENT_H: Int, LATENT_W: Int
+](latent: Tensor, vae_path: String, ctx: DeviceContext) raises -> Tensor:
+    comptime assert LATENT_H % 4 == 0, "latent height must be divisible by 4"
+    comptime assert LATENT_W % 4 == 0, "latent width must be divisible by 4"
+    comptime TILE_H = LATENT_H // 4
+    comptime TILE_W = LATENT_W // 4
+    var dec = load_ideogram4_vae_decoder[TILE_H, TILE_W](vae_path, ctx)
+    var stride_h = (TILE_H * 3) // 4
+    var stride_w = (TILE_W * 3) // 4
+
+    var r = slice(latent, 2, 0, TILE_H, ctx)
+    var a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var b = cast_tensor(dec.decode(slice(r, 3, stride_w, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var c = cast_tensor(dec.decode(slice(r, 3, stride_w * 2, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var d = cast_tensor(dec.decode(slice(r, 3, stride_w * 3, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var e = cast_tensor(dec.decode(slice(r, 3, stride_w * 4, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var row0 = _blend5(a, b, c, d, e, 3, ctx)
+
+    r = slice(latent, 2, stride_h, TILE_H, ctx)
+    a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    b = cast_tensor(dec.decode(slice(r, 3, stride_w, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    c = cast_tensor(dec.decode(slice(r, 3, stride_w * 2, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    d = cast_tensor(dec.decode(slice(r, 3, stride_w * 3, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    e = cast_tensor(dec.decode(slice(r, 3, stride_w * 4, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var row1 = _blend5(a, b, c, d, e, 3, ctx)
+
+    r = slice(latent, 2, stride_h * 2, TILE_H, ctx)
+    a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    b = cast_tensor(dec.decode(slice(r, 3, stride_w, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    c = cast_tensor(dec.decode(slice(r, 3, stride_w * 2, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    d = cast_tensor(dec.decode(slice(r, 3, stride_w * 3, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    e = cast_tensor(dec.decode(slice(r, 3, stride_w * 4, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var row2 = _blend5(a, b, c, d, e, 3, ctx)
+
+    r = slice(latent, 2, stride_h * 3, TILE_H, ctx)
+    a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    b = cast_tensor(dec.decode(slice(r, 3, stride_w, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    c = cast_tensor(dec.decode(slice(r, 3, stride_w * 2, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    d = cast_tensor(dec.decode(slice(r, 3, stride_w * 3, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    e = cast_tensor(dec.decode(slice(r, 3, stride_w * 4, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var row3 = _blend5(a, b, c, d, e, 3, ctx)
+
+    r = slice(latent, 2, stride_h * 4, TILE_H, ctx)
+    a = cast_tensor(dec.decode(slice(r, 3, 0, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    b = cast_tensor(dec.decode(slice(r, 3, stride_w, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    c = cast_tensor(dec.decode(slice(r, 3, stride_w * 2, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    d = cast_tensor(dec.decode(slice(r, 3, stride_w * 3, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    e = cast_tensor(dec.decode(slice(r, 3, stride_w * 4, TILE_W, ctx), ctx), STDtype.F32, ctx)
+    var row4 = _blend5(a, b, c, d, e, 3, ctx)
+
+    return _blend5(row0, row1, row2, row3, row4, 2, ctx)

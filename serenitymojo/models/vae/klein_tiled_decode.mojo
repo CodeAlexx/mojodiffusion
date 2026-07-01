@@ -112,15 +112,77 @@ def klein_tiled_decode_with_decoder[
     return _blend3(row0, row1, row2, 2, ctx)
 
 
+def klein_tiled_decode_nested_2x[
+    LATENT_H: Int, LATENT_W: Int, OUTER_H: Int, OUTER_W: Int,
+    INNER_H: Int, INNER_W: Int,
+](
+    latent: Tensor, dec: KleinVaeDecoder[INNER_H, INNER_W], ctx: DeviceContext
+) raises -> Tensor:
+    comptime assert OUTER_H == LATENT_H // 2, "outer tile height must be half latent height"
+    comptime assert OUTER_W == LATENT_W // 2, "outer tile width must be half latent width"
+    comptime assert INNER_H == OUTER_H // 2, "inner tile height must be half outer height"
+    comptime assert INNER_W == OUTER_W // 2, "inner tile width must be half outer width"
+    var half = OUTER_H // 2
+    # 2K decode cannot use monolithic 1024px VAE crops while the trainer is
+    # resident. Decode each outer crop through the 512px tile path, then apply
+    # the same 3x3 feathered blend at the outer grid.
+    var r = slice(latent, 2, 0, OUTER_H, ctx)
+    var a = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, 0, OUTER_W, ctx), dec, ctx)
+    var b = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, half, OUTER_W, ctx), dec, ctx)
+    var c = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, OUTER_W, OUTER_W, ctx), dec, ctx)
+    var row0 = _blend3(a, b, c, 3, ctx)
+
+    r = slice(latent, 2, half, OUTER_H, ctx)
+    a = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, 0, OUTER_W, ctx), dec, ctx)
+    b = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, half, OUTER_W, ctx), dec, ctx)
+    c = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, OUTER_W, OUTER_W, ctx), dec, ctx)
+    var row1 = _blend3(a, b, c, 3, ctx)
+
+    r = slice(latent, 2, OUTER_H, OUTER_H, ctx)
+    a = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, 0, OUTER_W, ctx), dec, ctx)
+    b = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, half, OUTER_W, ctx), dec, ctx)
+    c = klein_tiled_decode_with_decoder[
+        OUTER_H, OUTER_W, INNER_H, INNER_W
+    ](slice(r, 3, OUTER_W, OUTER_W, ctx), dec, ctx)
+    var row2 = _blend3(a, b, c, 3, ctx)
+    return _blend3(row0, row1, row2, 2, ctx)
+
+
 # Convenience: load the TILE-shaped KleinVaeDecoder and tiled-decode a packed
 # latent. `vae_path` is the same file cfg.vae the monolithic
 # KleinVaeDecoder[LH,LW].load consumes.
 def klein_tiled_decode[
     LATENT_H: Int, LATENT_W: Int
 ](latent: Tensor, vae_path: String, ctx: DeviceContext) raises -> Tensor:
-    comptime TILE_H = LATENT_H // 2
-    comptime TILE_W = LATENT_W // 2
-    var dec = KleinVaeDecoder[TILE_H, TILE_W].load(vae_path, ctx)
-    return klein_tiled_decode_with_decoder[
-        LATENT_H, LATENT_W, TILE_H, TILE_W
-    ](latent, dec, ctx)
+    comptime if LATENT_H >= 128 or LATENT_W >= 128:
+        comptime OUTER_H = LATENT_H // 2
+        comptime OUTER_W = LATENT_W // 2
+        comptime INNER_H = OUTER_H // 2
+        comptime INNER_W = OUTER_W // 2
+        var dec = KleinVaeDecoder[INNER_H, INNER_W].load(vae_path, ctx)
+        return klein_tiled_decode_nested_2x[
+            LATENT_H, LATENT_W, OUTER_H, OUTER_W, INNER_H, INNER_W
+        ](latent, dec, ctx)
+    else:
+        comptime TILE_H = LATENT_H // 2
+        comptime TILE_W = LATENT_W // 2
+        var dec = KleinVaeDecoder[TILE_H, TILE_W].load(vae_path, ctx)
+        return klein_tiled_decode_with_decoder[
+            LATENT_H, LATENT_W, TILE_H, TILE_W
+        ](latent, dec, ctx)

@@ -2345,10 +2345,16 @@ def _krea2_inline_cond_from_cache[LH: Int, LW: Int, LTMAX: Int](
 def _krea2_inline_uncond_from_cache[LH: Int, LW: Int, LTMAX: Int](
     read cache: KreaTrainCache, ctx: DeviceContext,
 ) raises -> _Krea2InlineCond:
-    var u = cache.uncond[LH, LW](ctx)
-    var padded = _krea2_pad_context_to_ltmax[LTMAX](u.context[], u.text_len, ctx)
-    var pos = krea2_build_pos[LH, LW](LTMAX, ctx)
-    return _Krea2InlineCond(TArc(padded^), TArc(pos^), u.text_len)
+    if cache.context_uncond_key.byte_length() == 0:
+        raise Error(
+            "krea2 inline sampler: cfg != 1.0 requires a training cache "
+            + "prepared with --uncond"
+        )
+    var context = cast_tensor(
+        Tensor.from_view(cache.src.tensor_view(cache.context_uncond_key), ctx),
+        STDtype.BF16, ctx,
+    )
+    return _krea2_inline_cond_from_context[LH, LW, LTMAX](context^, ctx)
 
 
 def _krea2_unpatch[LH: Int, LW: Int](tokens: Tensor, ctx: DeviceContext) raises -> Tensor:
@@ -2379,7 +2385,9 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
     if sample_steps < 1:
         raise Error("krea2 inline sampler: sample steps must be >= 1")
 
-    var latent = randn([1, 16, LH, LW], seed, STDtype.BF16, ctx)
+    # Match the standalone Krea2 pipeline/reference: the latent accumulator stays
+    # F32; only the model feed is BF16-rounded each step.
+    var latent = randn([1, 16, LH, LW], seed, STDtype.F32, ctx)
     var seq = krea2_packed_seq_len(LH * 8, LW * 8)
     var ts = krea2_timesteps(seq, sample_steps)
     print("[krea2-sample-inline] steps=", sample_steps, " cfg=", cfg_scale,
@@ -2388,7 +2396,8 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
     for si in range(sample_steps):
         var t_cur = ts[si]
         var t_prev = ts[si + 1]
-        var img_tokens = krea2_patchify[LH, LW](latent, ctx)
+        var img_tokens_f32 = krea2_patchify[LH, LW](latent, ctx)
+        var img_tokens = torch_f32_to_bf16_rne(img_tokens_f32, ctx)
         var t_t = _t_scalar(t_cur, ctx)
 
         var c = _build_conditioning[LTMAX, LFULL_SAMPLE](
@@ -2403,9 +2412,9 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
             c.cos, c.sin, EPS, cond.text_len, imglen, ctx, real_len_c, resident,
         )
 
-        var v: Tensor
+        var v_bf16: Tensor
         if cfg_scale == Float32(1.0):
-            v = pred_c.velocity[].clone(ctx)
+            v_bf16 = pred_c.velocity[].clone(ctx)
         else:
             var u = _build_conditioning[LTMAX, LFULL_SAMPLE](
                 cond_w, img_tokens, uncond.context[], uncond.pos[], t_t,
@@ -2420,9 +2429,10 @@ def _krea2_sample_resident_latent[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: In
                 u.cos, u.sin, EPS, uncond.text_len, imglen, ctx,
                 real_len_u, resident,
             )
-            v = krea2_cfg(pred_c.velocity[], pred_u.velocity[], cfg_scale, ctx)
+            v_bf16 = krea2_cfg(pred_c.velocity[], pred_u.velocity[], cfg_scale, ctx)
 
-        var v_latent = _krea2_unpatch[LH, LW](v, ctx)
+        var v_f32 = cast_tensor(v_bf16, STDtype.F32, ctx)
+        var v_latent = _krea2_unpatch[LH, LW](v_f32, ctx)
         latent = krea2_euler_step(latent, v_latent, t_cur, t_prev, ctx)
         ctx.synchronize()
         if si == 0 or si + 1 == sample_steps or (si + 1) % 5 == 0:
@@ -2461,6 +2471,23 @@ def _krea2_run_inline_samples[LH: Int, LW: Int, LTMAX: Int, LFULL_SAMPLE: Int](
         var prompt = sample_cfg.prompts[pi].copy()
         if not prompt.enabled:
             continue
+        if prompt.frames != 1:
+            raise Error("krea2 inline sampler: only single-frame image samples are supported")
+        if prompt.width != LW * 8 or prompt.height != LH * 8:
+            raise Error(
+                String("krea2 inline sampler: prompt ") + String(pi)
+                + " requests " + String(prompt.width) + "x" + String(prompt.height)
+                + " but this binary samples " + String(LW * 8) + "x" + String(LH * 8)
+                + "; rebuild the Krea2 inline sample arm for that resolution"
+            )
+        if prompt.random_seed:
+            raise Error("krea2 inline sampler: random_seed is not supported; provide an explicit seed")
+        if (
+            prompt.sample_inpainting
+            or prompt.base_image_path.byte_length() > 0
+            or prompt.mask_image_path.byte_length() > 0
+        ):
+            raise Error("krea2 inline sampler: init image/inpaint/mask sampling is not supported")
         var cond: _Krea2InlineCond
         if prompt.caps_pos.byte_length() > 0:
             cond = _krea2_inline_cond_from_bin[LH, LW, LTMAX](prompt.caps_pos, ctx)
@@ -3112,7 +3139,7 @@ def main() raises:
                 perf_fast_path_kind = PERF_FAST_PATH_HOST_GRAD_COMPAT
 
             if sample_enabled and (step + 1) % sample_every == 0:
-                _krea2_run_inline_samples[LH, LW, LTMAX, LFULL](
+                _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
                     cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
                     step + 1, ctx, resident,
                 )
@@ -3368,7 +3395,7 @@ def main() raises:
 
         # ── inline sampler: sample the just-updated live LoRA, no save/reload.
         if sample_enabled and (step + 1) % sample_every == 0:
-            _krea2_run_inline_samples[LH, LW, LTMAX, LFULL](
+            _krea2_run_inline_samples[LH_S, LW_S, LTMAX, LFULL_S](
                 cache, st, key_prefix, cond_w, fin, host_lora, cfg, sample_cfg,
                 step + 1, ctx, resident,
             )

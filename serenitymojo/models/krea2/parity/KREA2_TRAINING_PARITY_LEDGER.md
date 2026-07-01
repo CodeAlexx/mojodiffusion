@@ -305,13 +305,23 @@ The full round-trip: train→save→load→INFERENCE→visible shift. Fixes:
 - cfg>1 REQUIRES a negative: re-stage the cache with `stage_dir/uncond.txt` (empty) so
   `krea2_prepare_cache` writes `context_uncond [1,LTu,12,2560]` (the eri2 cache had none → cfg6 raised).
 
-### Inline 1024 sampler — BROKEN (geometry); use the pipeline for 1024
-- Added a separate inline sample-res arm (`LH_S=LW_S=128`, `LFULL_S=4480`) + decoupled the
-  cond-from-cache read (read `context.<i>` directly, NOT `sample_padded[LH,LW]` which validates the
-  512 clean latent → "latent shape mismatch [1,16,128,128]"). It RUNS at 1024 + cfg6, no OOM.
-- BUT the output is DEGENERATE: structure confined to a top corner, rest flat color (pos/grid
-  geometry bug at 128×128). MEASURED at step 500 with a trained LoRA → not an undertraining artifact.
-  KNOWN ISSUE: inline 1024 unusable; 512 inline is coherent; render 1024 via the pipeline above.
+### Inline 1024 sampler — FIXED (2026-07-01)
+- ROOT CAUSE of the old corner-confined 1024 output: the trainer declared a dedicated sample arm
+  (`LH_S=LW_S=128`, `LFULL_S=4480`) but both sample call sites still instantiated the train-res arm
+  (`LH/LW/LFULL`), and the denoise latent accumulator stayed BF16 across Euler steps. The standalone
+  Krea2 pipeline keeps the latent accumulator F32 and BF16-rounds only the model feed; the inline
+  sampler now does the same.
+- Also fixed the cfg>1 conditioning path to read `context_uncond` directly from the cache instead of
+  routing through geometry-coupled `cache.uncond[LH,LW]`. Unsupported inline prompt surfaces now fail
+  loud: non-1-frame, resolution mismatch for the compiled sample arm, `random_seed`, init image,
+  inpaint, and mask.
+- Evidence: `krea2_sampler_smoke.mojo` PASS (256/1024/512x768 schedules); `train_krea2` build PASS;
+  1024 inline smoke wrote `/tmp/krea2_inline_sampler_smoke/samples/step_1_0.png` (1024 RGB,
+  full-frame, no corner confinement); Retro Anime Krea2 LoRA warm-start validation wrote
+  `/tmp/krea2_retro_anime_inline/samples/step_1_0.png` and was copied to
+  `output/krea2_inline_samples/krea2_retro_anime_inline_step_1_0.png` (1024 RGB, full-frame anime
+  result) with cfg=3.5, LT_POS=61, LT_NEG=5, peak VRAM 13.49GB. Note: `output/` is gitignored, so
+  the PNG is a durable local workspace artifact, not a committed source asset.
 
 ### FULL LoRA RESUME (krea2) — wired + smoke-proven
 - The save/load-state fns existed in `training/lora_save.mojo` (`save_lora_train_state` writes
@@ -380,9 +390,9 @@ The full round-trip: train→save→load→INFERENCE→visible shift. Fixes:
   `print_trainer_progress` into all 3 optimizer paths + per-step/cumulative wall timers →
   `[krea2] step N/total | epoch | loss | grad_norm | s/step | elapsed | ETA`.
 
-### Inline sampler: cfg 6 over-guides → use cfg 1.0
+### Inline sampler cfg note
 - MEASURED at the identical untrained step-2 state: inline 512 at **cfg 6.0 → flat/degenerate**;
   **cfg 1.0 → coherent** image. So the flat inline samples were cfg-6 over-guidance, NOT undertraining.
-  The inline (during-training) sampler runs at the train res (512, comptime LH/LW) and is set to cfg 1.0
-  (the first eri2 run's coherent setting; also skips the uncond forward → faster). The 1024 inline arm
-  stays geometry-broken (corner-confined) — render 1024 via the pipeline (cfg 6 there IS coherent).
+  For caches without `context_uncond`, keep inline validation at cfg=1.0. For cfg>1, provide a
+  `context_uncond` tensor (for example by staging with empty `uncond.txt` or by using encoded
+  positive/negative prompt caps). The 1024 geometry bug is fixed as of 2026-07-01.

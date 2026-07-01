@@ -65,7 +65,10 @@ comptime IDEOGRAM4_SDPA_FLASH = False
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward
 from serenitymojo.ops.shape_backward import broadcast_backward
 from serenitymojo.ops.rope_struct_backward import rope_halfsplit_full_backward
-from serenitymojo.models.dit.ideogram4_dit import apply_rope_ideogram
+from serenitymojo.models.dit.ideogram4_dit import (
+    apply_rope_ideogram,
+    ideogram4_sdpa_product_fwd,
+)
 from serenitymojo.models.dit.ideogram4_resident import Ideogram4Weights
 
 from serenitymojo.models.ideogram4.lora_module import LoraAdapter, make_lora_adapter
@@ -303,6 +306,16 @@ def _lora_linear_fwd(
     var up = linear(down, ad.b, None, ctx)
     var y = add(base, mul_scalar(up, ad.scale(), ctx), ctx)
     return _LoraFwd(y^, down^)
+
+
+def _lora_linear_eval(
+    x: Tensor, base_w: Tensor, ad: LoraAdapter, bias: Optional[Tensor],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var base = linear(x, base_w, bias, ctx)
+    var down = linear(x, ad.a, None, ctx)
+    var up = linear(down, ad.b, None, ctx)
+    return add(base, mul_scalar(up, ad.scale(), ctx), ctx)
 
 
 struct _LoraBwd(Movable):
@@ -600,6 +613,67 @@ def ideogram4_block_lora_forward[
     return Ideogram4BlockOut(out^, acts^)
 
 
+def ideogram4_block_lora_forward_nosave[
+    S: Int, Hidden: Int, Heads: Int, Dh: Int, FF: Int, Adaln: Int,
+](
+    x: Tensor,
+    adaln_input: Tensor,
+    cosf: Tensor,
+    sinf: Tensor,
+    w: Ideogram4BlockWeights,
+    loras: List[LArc],
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var scale = Float32(1.0) / sqrt(Float32(Dh))
+
+    var mod = _lora_linear_eval(
+        adaln_input,
+        w.adaln_w,
+        loras[I4_SLOT_ADALN][],
+        Optional[Tensor](w.adaln_b.clone(ctx)),
+        ctx,
+    )
+    var mod_axis = len(mod.shape()) - 1
+    var scale_msa = add_scalar(
+        slice(mod, mod_axis, 0 * Hidden, Hidden, ctx), Float32(1.0), ctx
+    )
+    var gate_msa = tanh_op(slice(mod, mod_axis, 1 * Hidden, Hidden, ctx), ctx)
+    var scale_mlp = add_scalar(
+        slice(mod, mod_axis, 2 * Hidden, Hidden, ctx), Float32(1.0), ctx
+    )
+    var gate_mlp = tanh_op(slice(mod, mod_axis, 3 * Hidden, Hidden, ctx), ctx)
+
+    var an1 = rms_norm(x, w.attn_norm1, I4_EPS, ctx)
+    var attn_in = mul(an1, scale_msa, ctx)
+
+    var qkv = _lora_linear_eval(attn_in, w.qkv_w, loras[I4_SLOT_QKV][], None, ctx)
+    var qkv5 = reshape(qkv, _shape5(1, S, 3, Heads, Dh), ctx)
+    var q = reshape(slice(qkv5, 2, 0, 1, ctx), _shape4(1, S, Heads, Dh), ctx)
+    var k = reshape(slice(qkv5, 2, 1, 1, ctx), _shape4(1, S, Heads, Dh), ctx)
+    var v = reshape(slice(qkv5, 2, 2, 1, ctx), _shape4(1, S, Heads, Dh), ctx)
+    var q_norm = rms_norm(q, w.norm_q, I4_EPS, ctx)
+    var k_norm = rms_norm(k, w.norm_k, I4_EPS, ctx)
+    var q_rope = apply_rope_ideogram(q_norm, cosf, sinf, ctx)
+    var k_rope = apply_rope_ideogram(k_norm, cosf, sinf, ctx)
+    var attn4 = ideogram4_sdpa_product_fwd[1, S, Heads, Dh](
+        q_rope, k_rope, v, scale, ctx
+    )
+    var attn_flat = reshape(attn4, _shape2(S, Hidden), ctx)
+
+    var attn_out = _lora_linear_eval(attn_flat, w.o_w, loras[I4_SLOT_O][], None, ctx)
+    var attn_n2 = rms_norm(attn_out, w.attn_norm2, I4_EPS, ctx)
+    var x_mid = add(x, mul(gate_msa, attn_n2, ctx), ctx)
+
+    var fn1 = rms_norm(x_mid, w.ffn_norm1, I4_EPS, ctx)
+    var mlp_in = mul(fn1, scale_mlp, ctx)
+    var ff_g = _lora_linear_eval(mlp_in, w.w1, loras[I4_SLOT_W1][], None, ctx)
+    var ff_u = _lora_linear_eval(mlp_in, w.w3, loras[I4_SLOT_W3][], None, ctx)
+    var ff_act = swiglu(ff_g, ff_u, ctx)
+    var ff_out = _lora_linear_eval(ff_act, w.w2, loras[I4_SLOT_W2][], None, ctx)
+    var ff_n2 = rms_norm(ff_out, w.ffn_norm2, I4_EPS, ctx)
+    return add(x_mid, mul(gate_mlp, ff_n2, ctx), ctx)
+
+
 struct Ideogram4BlockLoraGrads(Movable):
     var d_a: List[TArc]
     var d_b: List[TArc]
@@ -831,6 +905,27 @@ def ideogram4_stack_lora_forward_resident[
         )
         x = out^.take_out()
     return Ideogram4StackForward(x^, saved^)
+
+
+def ideogram4_stack_lora_forward_resident_nosave[
+    S: Int, Hidden: Int, Heads: Int, Dh: Int, FF: Int, Adaln: Int,
+](
+    x_in: Tensor,
+    adaln_input: Tensor,
+    cosf: Tensor,
+    sinf: Tensor,
+    rw: Ideogram4Weights,
+    loras: Ideogram4LoraSet,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var x = _clone(x_in, ctx)
+    for layer in range(loras.n_layers):
+        var w = load_ideogram4_block_weights_resident(rw, layer, ctx)
+        var bl = _loras_for_block(loras, layer)
+        x = ideogram4_block_lora_forward_nosave[S, Hidden, Heads, Dh, FF, Adaln](
+            x, adaln_input, cosf, sinf, w^, bl, ctx
+        )
+    return x^
 
 
 struct Ideogram4StackLoraGrads(Movable):

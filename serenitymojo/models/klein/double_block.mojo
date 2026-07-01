@@ -1509,7 +1509,12 @@ def double_block_lora_predict_device_resident_scratch[
     var q_rope = rope_interleaved(q, cos, sin, ctx)
     var k_rope = rope_interleaved(k, cos, sin, ctx)
     scratch.rewind(qk_mark)
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        att = Tensor(ff.att.buf.copy(), ff.att.shape(), ff.att.dtype())
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
 
     var txt_att_4d = slice(att, 1, 0, N_TXT, ctx)
     var img_att_4d = slice(att, 1, N_TXT, N_IMG, ctx)

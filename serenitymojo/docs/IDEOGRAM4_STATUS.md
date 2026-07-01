@@ -110,6 +110,8 @@ switch — the Ideogram model only ever consumes the JSON. Pure-Mojo equivalent:
 - `models/text_encoder/ideogram_qwen3vl.mojo` — Qwen3-VL 13-tap encoder (adapts Qwen3Encoder).
 - `models/text_encoder/qwen3_magic.mojo` — greedy LM decode (magic prompt).
 - `models/vae/ldm_decoder.mojo` — `+load_ideogram4_vae_decoder` (z=32 factory).
+- `models/vae/ideogram4_tiled_decode.mojo` — 3x3 tiled decode plus 5x5 low-memory
+  decode used by 2048 inline training samples.
 - `ops/fp8.mojo` — `+fp8_e4m3_dequant_perrow_to_bf16`, `+load_fp8_dequant`.
 - `ops/fp8_gemm.mojo` — fused tiled fp8 GEMM (reference, unused by hot path).
 - `sampling/ideogram4_schedule.mojo` — logit-normal (Acklam ndtri) + step intervals.
@@ -195,3 +197,23 @@ PROMPT-driven (`medium=painting`), not an inference bug. Daemon build 0 errors.
 **F16 LoRA save (flame-core 493b27f, in EriDiffusion-v2):** `save_tensors_safetensors`
 hardcoded dtype="F32" → F16/BF16 LoRAs saved at 2× size; now dtype-aware. `train_ideogram`
 LoRA now F16 105MB (was 211MB), matching the ai-toolkit reference size.
+
+## Addendum 2026-07-01 — 2048 inline trainer sampler
+
+The serenity-trainer Ideogram4 inline sampler now accepts JSON sample prompts and
+supports `sample_resolution` 512, 1024, and 2048. For 2048, the sampler uses the
+resident LoRA no-save stack plus the forward-only cuDNN SDPA product path for
+the transformer, then decodes with `ideogram4_tiled_decode_5x5_lowmem` to avoid
+the full-frame/3x3 VAE activation peak.
+
+Measured run:
+- Command target: `Ideogram4LiveTrainer` with one train step, 20 sample steps,
+  CFG 7.0, seed `20260701`, external LoRA
+  `/home/alex/Downloads/furry enhancerideogramV1.94realistic.safetensors`.
+- Output PNG:
+  `/home/alex/mojodiffusion/output/ideogram4_inline_samples_2k_inline/samples/step_1_0.png`.
+- Artifact: 2048x2048 RGB PNG, 13 MB, visually inspected.
+- Loss/grad: loss `0.7676716`, grad norm `246.01508`.
+- Runtime: `485.7009262230713 s/step` including the full 20-step 2048 sample.
+- Build task: serenity-trainer `ideogram4-live-trainer-build` now links the
+  CUDA/cshim/rpath flags required by the sampler flash path.

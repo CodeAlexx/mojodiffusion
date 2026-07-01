@@ -89,6 +89,7 @@ from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
 from serenitymojo.ops.attention import sdpa_nomask
+from serenitymojo.ops.cast import cast_tensor
 # cuDNN flash SDPA (approved numerics change 2026-06-11, memory
 # sdpa-flash-signoff): the PRODUCTION resident-scratch recompute+backward
 # pair runs attention through cuDNN flash with F32<->bf16 boundary casts
@@ -923,6 +924,8 @@ def single_block_lora_forward_device_resident_scratch[
     var mlp_gate = slice(gate_up, 1, 0, F, ctx)
     var mlp_up = slice(gate_up, 1, F, F, ctx)
     var mlp = swiglu(mlp_gate, mlp_up, ctx)
+    if att_flat.dtype() != mlp.dtype():
+        att_flat = cast_tensor(att_flat, mlp.dtype(), ctx)
     scratch.rewind(scratch_mark)
 
     var out_in_t = concat(1, ctx, att_flat, mlp)
@@ -987,12 +990,20 @@ def single_block_lora_predict_device_resident_scratch[
 
     var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
     var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
-    var att_flat = reshape_owned(att^, [S, D])
+    var att_flat: Tensor
+    comptime if KLEIN_SDPA_FLASH:
+        var ff = sdpa_flash_train_fwd_f32[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        var af_shape: List[Int] = [S, D]
+        att_flat = Tensor(ff.att.buf.copy(), af_shape^, STDtype.F32)
+    else:
+        var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+        att_flat = reshape_owned(att^, [S, D])
 
     var mlp_gate = slice(gate_up, 1, 0, F, ctx)
     var mlp_up = slice(gate_up, 1, F, F, ctx)
     var mlp = swiglu(mlp_gate, mlp_up, ctx)
+    if att_flat.dtype() != mlp.dtype():
+        att_flat = cast_tensor(att_flat, mlp.dtype(), ctx)
     scratch.rewind(scratch_mark)
 
     var proj_mark = scratch.mark()

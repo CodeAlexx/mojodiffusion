@@ -207,14 +207,36 @@ def klein_sample_resident_latent[
                 d_model, mlp_hidden, in_ch, joint, out_ch, eps, ctx, scratch_fwd,
             )
         else:
-            var preds = klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
-                H, Dh, N_IMG, N_TXT, S
-            ](
-                TArc(x.clone(ctx)), pos_t, neg_t, base,
-                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
-                d_model, mlp_hidden, in_ch, joint, out_ch, eps, ctx, scratch_fwd,
-            )
-            v_dev = flux2_cfg(preds.pos, preds.neg, cfg_scale, ctx)
+            comptime if S > 8192:
+                # 2K grids cannot keep positive and negative branch activations
+                # alive together on 24 GB cards. Run CFG sequentially and keep
+                # only the final velocity tensors for the GPU-side combine.
+                var pred_pos = klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[
+                    H, Dh, N_IMG, N_TXT, S
+                ](
+                    TArc(x.clone(ctx)), pos_t, base,
+                    loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+                    d_model, mlp_hidden, in_ch, joint, out_ch, eps, ctx, scratch_fwd,
+                )
+                ctx.synchronize()
+                scratch_fwd.reset()
+                var pred_neg = klein_stack_lora_predict_device_offload_turbo_moddev_rope_scratch[
+                    H, Dh, N_IMG, N_TXT, S
+                ](
+                    TArc(x.clone(ctx)), neg_t, base,
+                    loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+                    d_model, mlp_hidden, in_ch, joint, out_ch, eps, ctx, scratch_fwd,
+                )
+                v_dev = flux2_cfg(pred_pos, pred_neg, cfg_scale, ctx)
+            else:
+                var preds = klein_stack_lora_predict_cfg_offload_turbo_moddev_rope_scratch[
+                    H, Dh, N_IMG, N_TXT, S
+                ](
+                    TArc(x.clone(ctx)), pos_t, neg_t, base,
+                    loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+                    d_model, mlp_hidden, in_ch, joint, out_ch, eps, ctx, scratch_fwd,
+                )
+                v_dev = flux2_cfg(preds.pos, preds.neg, cfg_scale, ctx)
 
         # direct-velocity Euler: x = x + dt*v (dt<0 walks down the schedule).
         x = add(x, mul_scalar(v_dev, dt, ctx), ctx)

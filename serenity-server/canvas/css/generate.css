@@ -1,0 +1,2037 @@
+/**
+ * Generate Tab — SerenityFlow Phase 2
+ * Three-column layout: controls | preview | gallery
+ * SerenityFlow visual overhaul
+ */
+
+/* ── Layout ── */
+.gen-layout {
+    display: flex;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    position: relative;
+}
+
+/* ── Left Panel — Controls ── */
+.gen-left {
+    width: 380px;
+    min-width: 380px;
+    background: var(--shell-bg-surface);
+    border-right: 1px solid var(--shell-border);
+    padding: 12px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    transition: margin-left 250ms ease, opacity 200ms ease;
+}
+.gen-left.gen-panel-hidden {
+    margin-left: -380px;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* Sections inside left panel */
+.gen-section + .gen-section {
+    border-top: 1px solid var(--shell-border);
+    padding-top: 4px;
+}
+
+.gen-label {
+    display: block;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+}
+
+/* Prompt label row with icon buttons */
+.gen-prompt-label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+.gen-prompt-label-row .gen-label {
+    margin-bottom: 0;
+}
+.gen-prompt-label-actions {
+    display: flex;
+    gap: 4px;
+}
+.gen-prompt-label-btn {
+    width: 24px;
+    height: 20px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 4px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-family: monospace;
+    font-weight: 600;
+    transition: all 150ms ease;
+    position: relative;
+}
+.gen-prompt-label-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-prompt-label-btn .gen-tooltip {
+    display: none;
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 11px;
+    white-space: nowrap;
+    color: var(--shell-text);
+    font-family: var(--shell-font);
+    font-weight: 400;
+    z-index: 20;
+    pointer-events: none;
+    margin-bottom: 4px;
+}
+.gen-prompt-label-btn:hover .gen-tooltip {
+    display: block;
+}
+
+/* Model picker */
+.gen-select {
+    width: 100%;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    color: var(--shell-text);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-family: var(--shell-font);
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b6b80' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    cursor: pointer;
+}
+.gen-select:focus {
+    outline: none;
+    border-color: var(--shell-accent);
+}
+
+/* Model row with action buttons */
+.gen-model-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.gen-model-row .gen-select {
+    flex: 1;
+    min-width: 0;
+}
+.gen-model-action-btn {
+    width: 32px;
+    height: 32px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: all 150ms ease;
+}
+.gen-model-action-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-model-action-btn svg {
+    width: 14px;
+    height: 14px;
+}
+
+/* Textareas */
+.gen-textarea {
+    width: 100%;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    padding: 12px;
+    color: var(--shell-text);
+    font-size: 13px;
+    font-family: var(--shell-font);
+    resize: none;
+    transition: border-color 150ms ease;
+    box-sizing: border-box;
+}
+.gen-textarea:focus {
+    outline: none;
+    border-color: var(--shell-accent);
+}
+.gen-textarea::placeholder {
+    color: var(--shell-text-muted);
+}
+
+/* Negative prompt disclosure */
+.gen-disclosure {
+    cursor: pointer;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.gen-disclosure:hover {
+    color: var(--shell-text);
+}
+.gen-disclosure-arrow {
+    display: inline-block;
+    transition: transform 300ms ease;
+    font-size: 10px;
+}
+.gen-disclosure.open .gen-disclosure-arrow {
+    transform: rotate(90deg);
+}
+.gen-neg-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 300ms ease;
+}
+.gen-neg-body.open {
+    max-height: 200px;
+}
+
+/* ── Image Section ── */
+
+/* Aspect row: dropdown + swap + lock + optimal + preview box */
+.gen-aspect-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+.gen-aspect-row .gen-select {
+    flex: 1;
+    min-width: 0;
+}
+.gen-aspect-action {
+    width: 30px;
+    height: 30px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: all 150ms ease;
+}
+.gen-aspect-action:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-aspect-action.active {
+    background: var(--shell-accent);
+    border-color: var(--shell-accent);
+    color: #fff;
+}
+.gen-aspect-action svg {
+    width: 14px;
+    height: 14px;
+    pointer-events: none;
+}
+
+/* Aspect preview box */
+.gen-aspect-preview-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    margin-bottom: 10px;
+}
+.gen-aspect-preview {
+    border: 1px solid var(--shell-border);
+    border-radius: 4px;
+    background: var(--shell-bg-panel);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    color: var(--shell-text-muted);
+    transition: all 200ms ease;
+}
+
+/* Image section with preview layout */
+.gen-image-content {
+    display: flex;
+    gap: 12px;
+}
+.gen-image-controls {
+    flex: 1;
+    min-width: 0;
+}
+.gen-image-preview-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    padding-top: 4px;
+}
+
+/* Aspect lock (legacy) */
+.gen-lock-row {
+    display: flex;
+    justify-content: center;
+    margin-top: 4px;
+}
+.gen-aspect-lock {
+    width: 28px;
+    height: 28px;
+    border: 1px solid var(--shell-border);
+    background: var(--shell-bg-panel);
+    border-radius: 8px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 150ms ease;
+}
+.gen-aspect-lock:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-aspect-lock.active {
+    background: var(--shell-accent);
+    border-color: var(--shell-accent);
+    color: #fff;
+}
+.gen-aspect-lock svg {
+    pointer-events: none;
+}
+
+/* Custom resolution inputs */
+.gen-custom-res {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+.gen-res-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+}
+.gen-res-label {
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    min-width: 14px;
+}
+.gen-res-row .gen-number-input {
+    flex: 1;
+    width: auto;
+    text-align: center;
+}
+
+/* Accordion */
+.gen-accordion-header {
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 4px 0;
+}
+.gen-accordion-header:hover {
+    color: var(--shell-text);
+}
+.gen-accordion-arrow {
+    transition: transform 250ms ease;
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+}
+.gen-accordion-arrow i {
+    width: 14px;
+    height: 14px;
+}
+.gen-accordion-header.closed .gen-accordion-arrow {
+    transform: rotate(-90deg);
+}
+.gen-accordion-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow: hidden;
+    transition: max-height 300ms ease, opacity 200ms ease;
+    max-height: 1200px;
+    opacity: 1;
+}
+.gen-accordion-body.closed {
+    max-height: 0;
+    opacity: 0;
+    padding: 0;
+}
+
+/* Section header with model badge */
+.gen-section-header-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+}
+.gen-model-badge {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    color: #fff;
+    background: var(--shell-bg-hover);
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Settings rows */
+.gen-setting-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.gen-setting-row .gen-label {
+    min-width: 52px;
+    margin-bottom: 0;
+    flex-shrink: 0;
+}
+.gen-number-input {
+    width: 56px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    color: var(--shell-text);
+    border-radius: 8px;
+    padding: 6px 8px;
+    font-size: 13px;
+    font-family: var(--shell-font);
+    text-align: center;
+}
+.gen-number-input:focus {
+    outline: none;
+    border-color: var(--shell-accent);
+}
+
+/* Slider — custom styled */
+.gen-range {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    background: var(--shell-border);
+    border-radius: 3px;
+    outline: none;
+    cursor: pointer;
+}
+.gen-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--shell-accent);
+    border: 2px solid var(--shell-bg-surface);
+    cursor: pointer;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    transition: transform 100ms ease;
+}
+.gen-range::-webkit-slider-thumb:hover {
+    transform: scale(1.15);
+}
+.gen-range::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--shell-accent);
+    border: 2px solid var(--shell-bg-surface);
+    cursor: pointer;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+}
+
+/* Seed row */
+.gen-seed-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.gen-seed-row .gen-number-input {
+    flex: 1;
+    text-align: left;
+}
+.gen-seed-shuffle {
+    width: 32px;
+    height: 32px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+.gen-seed-shuffle:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-seed-shuffle svg {
+    width: 16px;
+    height: 16px;
+}
+
+/* Top actions — generate button + progress */
+.gen-top-actions {
+    margin-bottom: 4px;
+}
+.gen-top-actions .gen-left-progress {
+    position: relative;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    height: 6px;
+    margin-top: 8px;
+    background: var(--shell-border);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.gen-top-actions .gen-left-progress .gen-progress-bar {
+    height: 100%;
+    border-radius: 3px;
+}
+.gen-left-progress-label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--shell-text);
+    text-align: center;
+    margin-top: 6px;
+    min-height: 18px;
+}
+
+/* Generate button */
+.gen-btn {
+    width: 100%;
+    height: 44px;
+    background: var(--shell-accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    transition: background 150ms ease, transform 150ms ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+.gen-btn:hover {
+    background: var(--shell-accent-hover);
+}
+.gen-btn:active {
+    transform: scale(0.98);
+}
+.gen-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.85;
+}
+.gen-btn i, .gen-btn svg {
+    width: 18px;
+    height: 18px;
+}
+@keyframes gen-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+.gen-btn.generating {
+    animation: gen-pulse 1s infinite;
+}
+
+/* ── Top Toolbar ── */
+.gen-top-toolbar {
+    width: 100%;
+    height: 38px;
+    background: var(--shell-bg-surface);
+    border-bottom: 1px solid var(--shell-border);
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
+    gap: 2px;
+    flex-shrink: 0;
+    z-index: 5;
+}
+.gen-toolbar-btn {
+    width: 30px;
+    height: 28px;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 120ms ease;
+    flex-shrink: 0;
+}
+.gen-toolbar-btn:hover {
+    background: var(--shell-bg-hover);
+    color: var(--shell-text);
+}
+.gen-toolbar-btn.active {
+    background: var(--shell-bg-hover);
+    color: var(--shell-accent);
+}
+.gen-toolbar-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+.gen-toolbar-btn svg, .gen-toolbar-btn i {
+    width: 16px;
+    height: 16px;
+}
+.gen-toolbar-generate {
+    background: var(--shell-accent);
+    color: #fff;
+    padding: 0 12px;
+    width: auto;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--shell-font);
+    gap: 4px;
+    border-radius: 6px;
+}
+.gen-toolbar-generate:hover {
+    background: var(--shell-accent-hover);
+    color: #fff;
+}
+.gen-toolbar-generate i, .gen-toolbar-generate svg {
+    width: 14px;
+    height: 14px;
+}
+.gen-toolbar-sep {
+    width: 1px;
+    height: 20px;
+    background: var(--shell-border);
+    margin: 0 4px;
+    flex-shrink: 0;
+}
+.gen-toolbar-batch {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+.gen-toolbar-batch-input {
+    width: 28px;
+    height: 24px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 4px;
+    color: var(--shell-text);
+    font-size: 12px;
+    font-family: var(--shell-font);
+    text-align: center;
+    padding: 0;
+}
+.gen-toolbar-batch-input:focus {
+    outline: none;
+    border-color: var(--shell-accent);
+}
+.gen-toolbar-batch-spin {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+.gen-toolbar-batch-spin button {
+    width: 16px;
+    height: 12px;
+    background: transparent;
+    border: none;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 8px;
+    padding: 0;
+    line-height: 1;
+}
+.gen-toolbar-batch-spin button:hover {
+    color: var(--shell-text);
+}
+.gen-toolbar-spacer {
+    flex: 1;
+}
+
+/* ── Center Panel — Preview ── */
+.gen-center {
+    flex: 1;
+    background: var(--shell-bg-base);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    position: relative;
+    min-width: 0;
+}
+.gen-center-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    position: relative;
+    min-height: 0;
+}
+
+/* Empty state */
+.gen-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    color: var(--shell-text-muted);
+    user-select: none;
+}
+.gen-empty svg {
+    width: 64px;
+    height: 64px;
+    opacity: 0.3;
+    stroke: var(--shell-text-muted);
+}
+.gen-empty-text {
+    font-size: 14px;
+}
+
+/* Image display */
+@keyframes gen-fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+.gen-preview-img {
+    max-width: calc(100% - 32px);
+    max-height: calc(100vh - var(--shell-topbar-height) - 180px);
+    object-fit: contain;
+    border-radius: 8px;
+    animation: gen-fadeIn 300ms ease;
+}
+.gen-preview-img.gen-preview-live {
+    opacity: 0.9;
+    max-height: calc(100vh - var(--shell-topbar-height) - 180px);
+    image-rendering: auto;
+}
+
+/* Video display */
+.gen-preview-video {
+    max-width: calc(100% - 32px);
+    max-height: calc(100vh - var(--shell-topbar-height) - 136px);
+    object-fit: contain;
+    border-radius: 8px;
+    animation: gen-fadeIn 300ms ease;
+}
+
+/* Action bar */
+.gen-action-bar {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+.gen-action-btn {
+    width: 36px;
+    height: 36px;
+    background: var(--shell-bg-surface);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.gen-action-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-action-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.gen-action-btn svg {
+    width: 18px;
+    height: 18px;
+}
+
+/* Progress bar */
+.gen-progress {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: transparent;
+    overflow: hidden;
+}
+.gen-progress-bar {
+    height: 100%;
+    width: 0%;
+    background: var(--shell-accent);
+    transition: width 200ms ease;
+}
+@keyframes gen-shimmer {
+    from { background-position: -200% 0; }
+    to { background-position: 200% 0; }
+}
+.gen-progress.active .gen-progress-bar {
+    background: linear-gradient(90deg,
+        var(--shell-accent) 0%,
+        var(--shell-accent-hover) 50%,
+        var(--shell-accent) 100%);
+    background-size: 200% 100%;
+    animation: gen-shimmer 1.5s linear infinite;
+}
+.gen-progress-label {
+    position: absolute;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    display: none;
+}
+.gen-progress-label.visible {
+    display: block;
+}
+
+/* Error banner */
+.gen-error-banner {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--shell-error);
+    color: #1a1a24;
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    z-index: 10;
+    opacity: 0;
+    transition: opacity 200ms ease;
+    pointer-events: none;
+    max-width: 80%;
+    text-align: center;
+}
+.gen-error-banner.visible {
+    opacity: 1;
+}
+
+/* WS reconnect indicator */
+.gen-ws-indicator {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--shell-warn);
+    opacity: 0;
+    transition: opacity 200ms ease;
+}
+.gen-ws-indicator.visible {
+    opacity: 1;
+}
+.gen-ws-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--shell-warn);
+}
+
+/* ── Right Panel — Gallery ── */
+.gen-right {
+    width: 280px;
+    min-width: 280px;
+    background: var(--shell-bg-surface);
+    border-left: 1px solid var(--shell-border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transition: margin-right 250ms ease, opacity 200ms ease;
+}
+.gen-right.gen-panel-hidden {
+    margin-right: -280px;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* Gallery tab switcher */
+.gen-gallery-tabs {
+    display: flex;
+    align-items: center;
+    border-bottom: 1px solid var(--shell-border);
+    padding: 0;
+}
+.gen-gallery-tab {
+    flex: 1;
+    padding: 8px 12px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    transition: all 150ms ease;
+}
+.gen-gallery-tab:hover {
+    color: var(--shell-text);
+}
+.gen-gallery-tab.active {
+    color: var(--shell-accent);
+    border-bottom-color: var(--shell-accent);
+}
+.gen-gallery-close-btn {
+    width: 30px;
+    height: 30px;
+    background: transparent;
+    border: none;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    border-radius: 6px;
+    margin-right: 4px;
+}
+.gen-gallery-close-btn:hover {
+    background: var(--shell-bg-hover);
+    color: var(--shell-text);
+}
+.gen-gallery-close-btn svg, .gen-gallery-close-btn i {
+    width: 14px;
+    height: 14px;
+}
+
+/* Gallery tab content */
+.gen-gallery-tab-content {
+    display: none;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+}
+.gen-gallery-tab-content.active {
+    display: flex;
+}
+
+/* Layers placeholder */
+.gen-layers-placeholder {
+    padding: 24px 16px;
+    text-align: center;
+    color: var(--shell-text-muted);
+    font-size: 13px;
+}
+
+/* Boards section */
+.gen-boards-section {
+    border-bottom: 1px solid var(--shell-border);
+}
+.gen-boards-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    cursor: pointer;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    user-select: none;
+}
+.gen-boards-header:hover {
+    color: var(--shell-text);
+}
+.gen-boards-header .gen-accordion-arrow {
+    transition: transform 250ms ease;
+}
+.gen-boards-header.closed .gen-accordion-arrow {
+    transform: rotate(180deg);
+}
+.gen-boards-body {
+    overflow: hidden;
+    transition: max-height 250ms ease;
+    max-height: 200px;
+}
+.gen-boards-body.closed {
+    max-height: 0;
+}
+.gen-board-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    font-size: 12px;
+    color: var(--shell-text);
+    cursor: pointer;
+}
+.gen-board-item:hover {
+    background: var(--shell-bg-hover);
+}
+.gen-board-icon {
+    margin-right: 6px;
+}
+.gen-board-badge {
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    background: var(--shell-accent);
+    color: #fff;
+    text-transform: uppercase;
+}
+
+/* Sub-tabs bar */
+.gen-gallery-subtabs {
+    display: flex;
+    align-items: center;
+    padding: 4px 8px;
+    gap: 4px;
+    border-bottom: 1px solid var(--shell-border);
+}
+.gen-gallery-subtab {
+    padding: 4px 10px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    transition: all 120ms ease;
+}
+.gen-gallery-subtab:hover {
+    background: var(--shell-bg-hover);
+    color: var(--shell-text);
+}
+.gen-gallery-subtab.active {
+    background: var(--shell-bg-hover);
+    color: var(--shell-accent);
+}
+.gen-gallery-subtab-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: auto;
+}
+.gen-gallery-subtab-btn {
+    width: 26px;
+    height: 24px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 120ms ease;
+}
+.gen-gallery-subtab-btn:hover {
+    background: var(--shell-bg-hover);
+    color: var(--shell-text);
+}
+.gen-gallery-subtab-btn svg, .gen-gallery-subtab-btn i {
+    width: 14px;
+    height: 14px;
+}
+.gen-gallery-search {
+    width: 0;
+    padding: 0;
+    background: var(--shell-bg-panel);
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--shell-text);
+    font-size: 11px;
+    font-family: var(--shell-font);
+    transition: all 200ms ease;
+    opacity: 0;
+}
+.gen-gallery-search.open {
+    width: 100px;
+    padding: 3px 8px;
+    border-color: var(--shell-border);
+    opacity: 1;
+    margin-left: 4px;
+}
+.gen-gallery-search:focus {
+    outline: none;
+    border-color: var(--shell-accent);
+}
+
+.gen-gallery-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--shell-border);
+}
+.gen-gallery-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--shell-text);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.gen-gallery-clear {
+    background: none;
+    border: none;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    cursor: pointer;
+    font-family: var(--shell-font);
+}
+.gen-gallery-clear:hover {
+    color: var(--shell-text);
+}
+
+.gen-gallery-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-auto-rows: max-content;
+    gap: 6px;
+    padding: 8px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+    align-content: start;
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+    scrollbar-color: var(--shell-text-muted) transparent;
+}
+
+.gen-gallery-grid::-webkit-scrollbar {
+    width: 8px;
+}
+.gen-gallery-grid::-webkit-scrollbar-track {
+    background: transparent;
+}
+.gen-gallery-grid::-webkit-scrollbar-thumb {
+    background: var(--shell-text-muted);
+    border: 2px solid transparent;
+    border-radius: 8px;
+    background-clip: padding-box;
+}
+.gen-gallery-grid::-webkit-scrollbar-thumb:hover {
+    background: var(--shell-text);
+    background-clip: padding-box;
+}
+
+.gen-thumb-wrap {
+    position: relative;
+    aspect-ratio: 1;
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: pointer;
+    border: 2px solid transparent;
+}
+.gen-thumb-wrap.active {
+    border-color: var(--shell-accent);
+}
+.gen-thumb-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.gen-thumb-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 150ms ease;
+}
+.gen-thumb-wrap:hover .gen-thumb-overlay {
+    opacity: 1;
+}
+.gen-thumb-overlay svg {
+    width: 24px;
+    height: 24px;
+    stroke: #fff;
+}
+
+/* Gallery pagination */
+.gen-gallery-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px;
+    border-top: 1px solid var(--shell-border);
+    font-size: 11px;
+    color: var(--shell-text-muted);
+}
+
+/* Gallery assets placeholder */
+.gen-assets-placeholder {
+    padding: 24px 16px;
+    text-align: center;
+    color: var(--shell-text-muted);
+    font-size: 13px;
+}
+
+/* Model warning inline */
+.gen-model-warning {
+    color: var(--shell-warn);
+    font-size: 12px;
+    padding: 6px 0;
+    display: none;
+}
+.gen-model-warning.visible {
+    display: block;
+}
+
+/* Video gallery thumbnails */
+.gen-thumb-video {
+    position: relative;
+}
+.gen-thumb-play {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.3);
+    pointer-events: none;
+    border-radius: 4px;
+}
+.gen-thumb-video:hover .gen-thumb-play {
+    background: rgba(0, 0, 0, 0.5);
+}
+
+/* Duration hint */
+.gen-duration-hint {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    text-align: center;
+    margin-top: 2px;
+}
+
+/* Token counter */
+.gen-token-count {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    text-align: right;
+    margin-top: 4px;
+}
+
+/* LoRA section */
+.gen-lora-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+.gen-lora-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+}
+.gen-lora-name {
+    font-size: 11px;
+    color: var(--shell-text);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gen-lora-strength {
+    width: 60px !important;
+    flex: none !important;
+}
+.gen-lora-val {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    min-width: 32px;
+    text-align: right;
+}
+.gen-lora-val-input {
+    width: 52px !important;
+    font-size: 11px;
+    padding: 3px 4px;
+    text-align: right;
+    flex: none !important;
+}
+.gen-lora-toggle {
+    width: 28px;
+    height: 16px;
+    flex-shrink: 0;
+}
+.gen-lora-toggle::after {
+    width: 12px;
+    height: 12px;
+}
+.gen-lora-toggle.on::after {
+    transform: translateX(12px);
+}
+.gen-lora-disabled {
+    opacity: 0.45;
+}
+.gen-lora-disabled .gen-lora-strength,
+.gen-lora-disabled .gen-lora-val-input {
+    pointer-events: none;
+}
+.gen-lora-remove {
+    width: 20px;
+    height: 20px;
+    border: none;
+    background: none;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+.gen-lora-remove:hover {
+    color: var(--shell-error);
+    background: var(--shell-bg-hover);
+}
+.gen-lora-add-btn {
+    width: 100%;
+    padding: 6px;
+    border: 1px dashed var(--shell-border);
+    background: transparent;
+    border-radius: 8px;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    transition: all 150ms ease;
+}
+.gen-lora-add-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+
+/* LoRA concepts dropdown */
+.gen-lora-dropdown {
+    width: 100%;
+    padding: 6px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b6b80' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+}
+.gen-lora-dropdown:focus {
+    outline: none;
+    border-color: var(--shell-accent);
+}
+
+/* Batch */
+.gen-batch-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.gen-batch-hint {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+}
+
+/* Dimension slider rows */
+.gen-dim-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.gen-dim-label {
+    min-width: 42px;
+    font-size: 12px;
+    color: var(--shell-text-muted);
+}
+
+/* Seed styling */
+.gen-seed-btn {
+    width: 32px;
+    height: 32px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    flex-shrink: 0;
+}
+.gen-seed-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-seed-random-label {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    margin-left: auto;
+}
+
+/* Toggle switch — pill style */
+.gen-toggle {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    border: none;
+    background: var(--shell-border);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 200ms ease;
+    flex-shrink: 0;
+    padding: 0;
+}
+.gen-toggle::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--shell-text-muted);
+    transition: transform 200ms ease, background 200ms ease;
+}
+.gen-toggle.on {
+    background: var(--shell-accent);
+}
+.gen-toggle.on::after {
+    transform: translateX(16px);
+    background: #fff;
+}
+
+/* Arch badge */
+.gen-arch-badge {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    color: #fff;
+    background: #6b7280;
+    margin-left: auto;
+    margin-right: 8px;
+}
+.gen-arch-badge[data-arch="flux"] { background: #6c6af5; }
+.gen-arch-badge[data-arch="sdxl"] { background: #3b82f6; }
+.gen-arch-badge[data-arch="sd3"] { background: #8b5cf6; }
+.gen-arch-badge[data-arch="sd15"] { background: #6b7280; }
+.gen-arch-badge[data-arch="ltxv"] { background: #10b981; }
+.gen-arch-badge[data-arch="wan"] { background: #f59e0b; }
+.gen-arch-badge[data-arch="klein"] { background: #ec4899; }
+
+/* ── Floating Side Toolbar ── */
+.gen-floating-toolbar {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 15;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 6px;
+    background: var(--shell-bg-surface);
+    border: 1px solid var(--shell-border);
+    border-left: none;
+    border-radius: 0 10px 10px 0;
+    box-shadow: 2px 2px 8px rgba(0,0,0,0.15);
+}
+.gen-float-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: 1px solid var(--shell-border);
+    background: var(--shell-bg-panel);
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 150ms ease;
+}
+.gen-float-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-float-btn svg, .gen-float-btn i {
+    width: 16px;
+    height: 16px;
+}
+.gen-float-btn.gen-float-generate {
+    background: var(--shell-accent);
+    border-color: var(--shell-accent);
+    color: #fff;
+}
+.gen-float-btn.gen-float-generate:hover {
+    background: var(--shell-accent-hover);
+    border-color: var(--shell-accent-hover);
+}
+.gen-float-btn.gen-float-cancel {
+    /* Default state */
+}
+.gen-float-btn.gen-float-cancel:hover {
+    background: var(--shell-error);
+    border-color: var(--shell-error);
+    color: #fff;
+}
+.gen-float-btn.gen-float-delete:hover {
+    background: var(--shell-error);
+    border-color: var(--shell-error);
+    color: #fff;
+}
+
+/* ── Seamless axis toggles ── */
+.gen-seamless-btn {
+    width: 32px;
+    height: 26px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 4px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-weight: 700;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    transition: all 150ms ease;
+}
+.gen-seamless-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-seamless-btn.on {
+    background: var(--shell-accent);
+    border-color: var(--shell-accent);
+    color: #fff;
+}
+
+/* ── Drag-and-drop overlay ── */
+.gen-drag-over {
+    outline: 2px dashed var(--shell-accent);
+    outline-offset: -2px;
+    background: rgba(108, 106, 245, 0.08);
+}
+
+/* ── Stub / Placeholder sections ── */
+.gen-stub-content {
+    padding: 12px;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    font-style: italic;
+}
+.gen-stub-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    opacity: 0.5;
+}
+.gen-stub-control .gen-label {
+    margin-bottom: 0;
+}
+.gen-stub-control .gen-select,
+.gen-stub-control .gen-number-input {
+    pointer-events: none;
+}
+
+/* Section divider */
+.gen-section-divider {
+    height: 1px;
+    background: var(--shell-border);
+    margin: 4px 0;
+}
+
+/* Advanced Options disclosure */
+.gen-adv-disclosure {
+    cursor: pointer;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0;
+    margin-top: 4px;
+}
+.gen-adv-disclosure:hover {
+    color: var(--shell-text);
+}
+.gen-adv-disclosure i {
+    width: 12px;
+    height: 12px;
+    transition: transform 250ms ease;
+}
+.gen-adv-disclosure.open i {
+    transform: rotate(90deg);
+}
+.gen-adv-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 300ms ease;
+}
+.gen-adv-body.open {
+    max-height: 600px;
+}
+
+/* Aspect grid (legacy - keeping for fallback) */
+.gen-aspect-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 6px;
+}
+.gen-aspect-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 8px 4px;
+    border: 1px solid var(--shell-border);
+    background: var(--shell-bg-panel);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: border-color 150ms ease, background 150ms ease;
+}
+.gen-aspect-btn:hover {
+    border-color: var(--shell-text-muted);
+}
+.gen-aspect-btn.active {
+    border: 2px solid var(--shell-accent);
+    background: rgba(108, 106, 245, 0.12);
+}
+.gen-aspect-btn svg {
+    stroke: var(--shell-text-muted);
+}
+.gen-aspect-btn.active svg {
+    stroke: var(--shell-accent);
+}
+.gen-aspect-label {
+    font-size: 10px;
+    color: var(--shell-text-muted);
+}
+.gen-aspect-btn.active .gen-aspect-label {
+    color: var(--shell-text);
+}
+
+/* ── Star overlay on thumbnails ── */
+.gen-thumb-star {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 22px;
+    height: 22px;
+    border: none;
+    background: rgba(0, 0, 0, 0.5);
+    border-radius: 50%;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    line-height: 1;
+    z-index: 5;
+    opacity: 0;
+    transition: opacity 150ms ease, color 150ms ease;
+    padding: 0;
+}
+.gen-thumb-wrap:hover .gen-thumb-star,
+.gen-thumb-star.starred {
+    opacity: 1;
+}
+.gen-thumb-star.starred {
+    color: #f59e0b;
+}
+
+/* ── Multi-select highlight ── */
+.gen-thumb-wrap.gen-selected {
+    border-color: var(--shell-accent);
+    box-shadow: 0 0 0 1px var(--shell-accent);
+}
+
+/* ── Selection count badge ── */
+.gen-selection-badge {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    background: var(--shell-accent);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 12px;
+    z-index: 10;
+    pointer-events: none;
+    display: none;
+}
+.gen-selection-badge.visible {
+    display: block;
+}
+
+/* ── Context menu ── */
+.gen-context-menu {
+    position: fixed;
+    background: #1e1e2e;
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    z-index: 1000;
+    min-width: 180px;
+    padding: 4px 0;
+    display: none;
+    font-size: 12px;
+    font-family: var(--shell-font);
+}
+.gen-context-menu.visible {
+    display: block;
+}
+.gen-context-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 14px;
+    color: var(--shell-text);
+    cursor: pointer;
+    transition: background 100ms ease;
+    border: none;
+    background: none;
+    width: 100%;
+    font-size: 12px;
+    font-family: var(--shell-font);
+    text-align: left;
+}
+.gen-context-item:hover {
+    background: var(--shell-bg-hover);
+}
+.gen-context-item.destructive {
+    color: var(--shell-error);
+}
+.gen-context-sep {
+    height: 1px;
+    background: var(--shell-border);
+    margin: 4px 0;
+}
+
+/* ── Gallery search clear button ── */
+.gen-gallery-search-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+.gen-gallery-search-clear {
+    position: absolute;
+    right: 4px;
+    width: 14px;
+    height: 14px;
+    border: none;
+    background: none;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+}
+.gen-gallery-search-clear.visible {
+    display: flex;
+}
+
+/* ── Gallery settings popover ── */
+.gen-gallery-popover {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    background: #1e1e2e;
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    z-index: 100;
+    min-width: 200px;
+    padding: 10px 12px;
+    display: none;
+    font-size: 12px;
+    font-family: var(--shell-font);
+}
+.gen-gallery-popover.visible {
+    display: block;
+}
+.gen-popover-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 5px 0;
+}
+.gen-popover-label {
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+}
+.gen-popover-slider {
+    flex: 1;
+    max-width: 80px;
+}
+
+/* ── Pagination controls ── */
+.gen-gallery-pagination button {
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 4px;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    font-size: 11px;
+    font-family: var(--shell-font);
+    padding: 3px 8px;
+    transition: all 120ms ease;
+}
+.gen-gallery-pagination button:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-gallery-pagination button:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
+/* ── Image metadata panel ── */
+.gen-metadata-panel {
+    width: auto;
+    max-width: calc(100% - 64px);
+    margin-top: 4px;
+    background: var(--shell-bg-surface);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    overflow: hidden;
+    display: none;
+}
+.gen-metadata-panel.visible {
+    display: block;
+}
+.gen-metadata-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+}
+.gen-metadata-summary:hover {
+    background: var(--shell-bg-hover);
+}
+.gen-metadata-key {
+    color: var(--shell-text-muted);
+    font-weight: 600;
+}
+.gen-metadata-val {
+    color: var(--shell-text);
+}
+.gen-metadata-full {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 250ms ease;
+    padding: 0 12px;
+}
+.gen-metadata-full.open {
+    max-height: 300px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--shell-border);
+}
+
+/* ── Bulk action bar ── */
+.gen-bulk-bar {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border-top: 1px solid var(--shell-border);
+    background: var(--shell-bg-surface);
+    flex-shrink: 0;
+}
+.gen-bulk-bar.visible {
+    display: flex;
+}
+.gen-bulk-btn {
+    padding: 4px 10px;
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    background: var(--shell-bg-panel);
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    transition: all 120ms ease;
+    white-space: nowrap;
+}
+.gen-bulk-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.gen-bulk-btn.destructive:hover {
+    border-color: var(--shell-error);
+    color: var(--shell-error);
+}
+
+/* ── Gallery grid wrapper for relative positioning ── */
+.gen-gallery-grid-wrap {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+#gen-images-content {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    flex-direction: column;
+}
+
+/* ── Style preset preview ── */
+.gen-style-preview {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    margin-top: 4px;
+    padding: 6px 8px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    line-height: 1.4;
+    word-break: break-word;
+    max-height: 60px;
+    overflow-y: auto;
+}
+
+/* ── Searchable Model Picker ── */
+.gen-model-picker-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+}
+.gen-model-search-input {
+    width: 100%;
+    cursor: text;
+    text-overflow: ellipsis;
+}
+.gen-model-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: 300px;
+    overflow-y: auto;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+    z-index: 100;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+.gen-model-dropdown-list {
+    padding: 4px 0;
+}
+.gen-model-dropdown-group {
+    padding: 6px 10px 3px;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--shell-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.gen-model-dropdown-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: background 100ms ease;
+}
+.gen-model-dropdown-item:hover {
+    background: var(--shell-bg-hover);
+}
+.gen-model-dropdown-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--shell-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gen-model-dropdown-item .gen-arch-badge {
+    font-size: 9px;
+    padding: 1px 6px;
+    margin-left: auto;
+    margin-right: 0;
+    flex-shrink: 0;
+}
+.gen-model-dropdown-empty {
+    padding: 12px;
+    text-align: center;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+}

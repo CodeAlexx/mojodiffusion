@@ -1,0 +1,11 @@
+{
+  "vae_shift": 0.1159,
+  "vae_scale": 0.3611,
+  "num_train_timesteps": 1000,
+  "base_image_seq_len": 256,
+  "max_image_seq_len": 4096,
+  "base_shift": 0.5,
+  "max_shift": 1.15,
+  "calc_shift_72x56": 1.872532263934993,
+  "det_timestep": 499
+}

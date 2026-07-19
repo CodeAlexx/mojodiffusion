@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "producer": "scripts/sdxl_dump_train_ref.py",
+  "created_unix": 1780690190.746474,
+  "reference_policy": {
+    "reference": "Serenity only",
+    "dry_run_numeric_parity": false,
+    "dry_run_note": "Dry-run/blocker artifacts are structural evidence only; they do not load SDXL weights, run a train step, or claim numeric parity.",
+    "non_dry_run_device": "cuda",
+    "cpu_pytorch_numeric_parity": false
+  },
+  "dry_run": true,
+  "one_step_dump_produced": false,
+  "numeric_parity_status": "none",
+  "numeric_parity_claimed": false,
+  "dry_run_checks_are_structural_only": true,
+  "numeric_parity_note": "CPU PyTorch and dry-run artifacts are structural only. SDXL loss/grad/speed parity requires Serenity CUDA reference tensors.",
+  "training_method_scope": {
+    "LORA": "in scope when Serenity registers loader/setup/data-loader paths",
+    "FINE_TUNE": "in scope when Serenity registers loader/setup/data-loader paths",
+    "EMBEDDING": "not in scope for this SDXL train-reference scaffold",
+    "FINE_TUNE_VAE": "not in scope for this SDXL train-reference scaffold"
+  },
+  "full_finetune_gate": {
+    "scope": "separate full-weight gate",
+    "adapter_safetensors": "LoRA-only; never full-finetune weights",
+    "note": "Serenity SDXL FINE_TUNE registrations are tracked here as train-reference scope, but full-weight save/load/resume parity is a separate gate."
+  },
+  "serenity_registration_status": {
+    "LORA": {
+      "in_scope": true,
+      "model_type": "STABLE_DIFFUSION_XL_10_BASE",
+      "model_loader_registered": true,
+      "model_setup_registered": true,
+      "data_loader_registered": true,
+      "data_loader_registration": "model_only",
+      "model_saver_registered": true,
+      "source_paths": {
+        "model_loader": [
+          "/home/alex/Serenity/modules/modelLoader/StableDiffusionXLLoRAModelLoader.py"
+        ],
+        "model_setup": [
+          "/home/alex/Serenity/modules/modelSetup/StableDiffusionXLLoRASetup.py"
+        ],
+        "data_loader": [
+          "/home/alex/Serenity/modules/dataLoader/StableDiffusionXLBaseDataLoader.py"
+        ],
+        "model_saver": [
+          "/home/alex/Serenity/modules/modelSaver/StableDiffusionXLLoRAModelSaver.py"
+        ]
+      }
+    },
+    "FINE_TUNE": {
+      "in_scope": true,
+      "model_type": "STABLE_DIFFUSION_XL_10_BASE",
+      "model_loader_registered": true,
+      "model_setup_registered": true,
+      "data_loader_registered": true,
+      "data_loader_registration": "model_only",
+      "model_saver_registered": true,
+      "source_paths": {
+        "model_loader": [
+          "/home/alex/Serenity/modules/modelLoader/StableDiffusionXLFineTuneModelLoader.py",
+          "/home/alex/Serenity/modules/modelLoader/GenericFineTuneModelLoader.py"
+        ],
+        "model_setup": [
+          "/home/alex/Serenity/modules/modelSetup/StableDiffusionXLFineTuneSetup.py"
+        ],
+        "data_loader": [
+          "/home/alex/Serenity/modules/dataLoader/StableDiffusionXLBaseDataLoader.py"
+        ],
+        "model_saver": [
+          "/home/alex/Serenity/modules/modelSaver/StableDiffusionXLFineTuneModelSaver.py",
+          "/home/alex/Serenity/modules/modelSaver/GenericFineTuneModelSaver.py"
+        ]
+      },
+      "full_weight_gate": {
+        "scope": "separate full-weight gate",
+        "adapter_safetensors": "LoRA-only; never full-finetune weights",
+        "note": "Serenity SDXL FINE_TUNE registrations are tracked here as train-reference scope, but full-weight save/load/resume parity is a separate gate."
+      }
+    }
+  },
+  "serenity": "/home/alex/Serenity",
+  "config": "/home/alex/Serenity/configs/sdxl_100step_baseline.json",
+  "out_dir": "/home/alex/serenity-trainer/parity",
+  "prefix": "sdxl_train_ref",
+  "max_steps": 1,
+  "baseline_steps": 100,
+  "torch": "2.9.1+cu128",
+  "cuda_available": true,
+  "cuda_device_count": 1,
+  "cuda_probe": {
+    "available": true,
+    "device_count": 1,
+    "error": null,
+    "warnings": []
+  },
+  "train_device": "cuda",
+  "temp_device": "cpu",
+  "model_type": "STABLE_DIFFUSION_XL_10_BASE",
+  "training_method": "LORA",
+  "model_names": {
+    "base_model": "/home/alex/.serenity/models/checkpoints/sd_xl_base_1.0.safetensors",
+    "vae_model": "",
+    "lora_model": "",
+    "include_text_encoder": true,
+    "include_text_encoder_2": true
+  },
+  "baseline": {
+    "required_steps": 100,
+    "output_model_destination": "/home/alex/Serenity/output/sdxl_100step_baseline/lora_last.safetensors",
+    "output_model_exists": true,
+    "output_model_size_bytes": 99193644,
+    "metrics_path": "/home/alex/Serenity/output/sdxl_100step_baseline/metrics.json",
+    "metrics_exists": true,
+    "metrics_error": null,
+    "metrics_status": "completed",
+    "requested_steps": 100,
+    "global_steps_seen": 100,
+    "complete": true
+  },
+  "cache": {
+    "enabled": true,
+    "cache_dir": "/home/alex/Serenity/workspace-cache/sdxl_100step_baseline",
+    "present": true,
+    "text_cache_required": true,
+    "image": {
+      "path": "/home/alex/Serenity/workspace-cache/sdxl_100step_baseline/image",
+      "exists": true,
+      "file_count_bounded": 238
+    },
+    "text": {
+      "path": "/home/alex/Serenity/workspace-cache/sdxl_100step_baseline/text",
+      "exists": true,
+      "file_count_bounded": 238
+    }
+  },
+  "allow_cache_build": false,
+  "local_model": {
+    "base_model": "/home/alex/.serenity/models/checkpoints/sd_xl_base_1.0.safetensors",
+    "vae_model": "",
+    "lora_model": "",
+    "include_text_encoders": {
+      "text_encoder_1": true,
+      "text_encoder_2": true
+    },
+    "exists": true,
+    "kind": "single_file",
+    "suffix": ".safetensors",
+    "size_bytes": 6938078334,
+    "safetensors": {
+      "inspectable": true,
+      "key_count": 2515,
+      "unet_key_count": 1680,
+      "vae_key_count": 248,
+      "text_encoder_1_key_count": 197,
+      "text_encoder_2_key_count": 390,
+      "text_encoder_key_count": 587,
+      "sample_keys": [
+        "conditioner.embedders.0.transformer.text_model.embeddings.position_embedding.weight",
+        "conditioner.embedders.0.transformer.text_model.embeddings.position_ids",
+        "conditioner.embedders.0.transformer.text_model.embeddings.token_embedding.weight",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.layer_norm1.bias",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.layer_norm1.weight",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.layer_norm2.bias",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.layer_norm2.weight",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.mlp.fc1.bias",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.mlp.fc1.weight",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.mlp.fc2.bias",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.mlp.fc2.weight",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.self_attn.k_proj.bias",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.self_attn.k_proj.weight",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.self_attn.out_proj.bias",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.self_attn.out_proj.weight",
+        "conditioner.embedders.0.transformer.text_model.encoder.layers.0.self_attn.q_proj.bias"
+      ]
+    }
+  },
+  "blockers": [],
+  "structured_blockers": [],
+  "blocked": false,
+  "train_dtype": "BFLOAT_16",
+  "fallback_train_dtype": "BFLOAT_16",
+  "weight_dtypes": {
+    "train_dtype": "BFLOAT_16",
+    "fallback_train_dtype": "BFLOAT_16",
+    "unet": "FLOAT_16",
+    "prior": "FLOAT_32",
+    "transformer": "FLOAT_32",
+    "text_encoder": "FLOAT_16",
+    "text_encoder_2": "FLOAT_16",
+    "text_encoder_3": "FLOAT_32",
+    "text_encoder_4": "FLOAT_32",
+    "vae": "FLOAT_32",
+    "effnet_encoder": "FLOAT_32",
+    "decoder": "FLOAT_32",
+    "decoder_text_encoder": "FLOAT_32",
+    "decoder_vqgan": "FLOAT_32",
+    "lora": "FLOAT_32",
+    "embedding": "FLOAT_32"
+  },
+  "lora_weight_dtype": "FLOAT_32",
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "layer_filter": "",
+  "layer_filter_preset": "full",
+  "reference_files_inspected": [
+    "/home/alex/Serenity/modules/modelLoader/StableDiffusionXLLoRAModelLoader.py",
+    "/home/alex/Serenity/modules/modelLoader/StableDiffusionXLFineTuneModelLoader.py",
+    "/home/alex/Serenity/modules/modelLoader/GenericFineTuneModelLoader.py",
+    "/home/alex/Serenity/modules/modelSetup/BaseStableDiffusionXLSetup.py",
+    "/home/alex/Serenity/modules/modelSetup/StableDiffusionXLLoRASetup.py",
+    "/home/alex/Serenity/modules/modelSetup/StableDiffusionXLFineTuneSetup.py",
+    "/home/alex/Serenity/modules/dataLoader/StableDiffusionXLBaseDataLoader.py",
+    "/home/alex/Serenity/modules/modelSaver/StableDiffusionXLLoRAModelSaver.py",
+    "/home/alex/Serenity/modules/modelSaver/StableDiffusionXLFineTuneModelSaver.py",
+    "/home/alex/Serenity/modules/modelSaver/GenericFineTuneModelSaver.py",
+    "/home/alex/Serenity/training_presets/#sdxl 1.0 LoRA.json",
+    "/home/alex/Serenity/training_presets/#sdxl 1.0.json",
+    "/home/alex/Serenity/configs/sdxl_100step_baseline.json"
+  ],
+  "blocker_artifact": "/home/alex/serenity-trainer/parity/sdxl_train_ref_blockers.json"
+}

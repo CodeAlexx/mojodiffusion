@@ -1,0 +1,377 @@
+/* queue.css — Queue tab: current job, pending, history */
+
+.queue-layout {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    font-family: var(--shell-font);
+}
+
+.queue-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--shell-border);
+    background: var(--shell-bg-surface);
+    flex-shrink: 0;
+}
+.queue-header-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--shell-text);
+}
+.queue-header-actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+.queue-clear-btn {
+    padding: 4px 12px;
+    border: 1px solid var(--shell-border);
+    background: var(--shell-bg-panel);
+    border-radius: 6px;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    font-family: var(--shell-font);
+    cursor: pointer;
+}
+.queue-clear-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.queue-pause-btn {
+    padding: 4px 12px;
+    border: 1px solid var(--shell-border);
+    background: var(--shell-bg-panel);
+    border-radius: 6px;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    transition: border-color 150ms, color 150ms, background 150ms;
+}
+.queue-pause-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+.queue-pause-btn.paused {
+    border-color: var(--shell-warn);
+    color: var(--shell-warn);
+    background: rgba(246, 173, 85, 0.08);
+}
+
+/* Queue statistics bar */
+.queue-stats {
+    display: flex;
+    gap: 12px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--shell-border);
+    background: var(--shell-bg-base);
+    flex-shrink: 0;
+}
+.queue-stat {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 0;
+}
+.queue-stat.pending { color: var(--shell-warn); }
+.queue-stat.running { color: var(--shell-accent); }
+.queue-stat.completed { color: var(--shell-success); }
+.queue-stat.failed { color: var(--shell-error); }
+
+.queue-sections {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.queue-section-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--shell-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 8px;
+}
+
+.queue-empty-state {
+    color: var(--shell-text-muted);
+    font-size: 13px;
+    padding: 16px;
+    text-align: center;
+}
+
+/* Current job card */
+.queue-job-card {
+    display: flex;
+    gap: 12px;
+    padding: 12px;
+    background: var(--shell-bg-surface);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    align-items: flex-start;
+}
+.queue-job-card.current {
+    border-color: var(--shell-accent);
+    border-width: 1px;
+    box-shadow: 0 0 8px rgba(108, 106, 245, 0.15);
+}
+.queue-thumb {
+    width: 64px;
+    height: 64px;
+    border-radius: 6px;
+    object-fit: cover;
+    flex-shrink: 0;
+}
+.queue-thumb-placeholder {
+    width: 64px;
+    height: 64px;
+    border-radius: 6px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    flex-shrink: 0;
+}
+.queue-job-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.queue-job-model {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--shell-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.queue-job-prompt {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.queue-progress-wrap {
+    margin-top: 2px;
+}
+.queue-progress-bar {
+    height: 4px;
+    background: var(--shell-bg-panel);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.queue-progress-fill {
+    height: 100%;
+    background: var(--shell-accent);
+    border-radius: 2px;
+    transition: width 200ms ease;
+}
+.queue-progress-text {
+    font-size: 10px;
+    color: var(--shell-text-muted);
+    margin-top: 2px;
+}
+.queue-cancel-btn {
+    padding: 6px 12px;
+    border: 1px solid var(--shell-error);
+    background: transparent;
+    border-radius: 6px;
+    color: var(--shell-error);
+    font-size: 11px;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    flex-shrink: 0;
+    align-self: center;
+}
+.queue-cancel-btn:hover {
+    background: var(--shell-error);
+    color: #1a1a24;
+}
+
+/* Pending */
+.queue-pending-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--shell-bg-surface);
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    margin-bottom: 4px;
+}
+.queue-pending-num {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    font-weight: 600;
+    min-width: 24px;
+}
+.queue-pending-prompt {
+    flex: 1;
+    font-size: 12px;
+    color: var(--shell-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+.queue-pending-batch {
+    font-size: 10px;
+    color: var(--shell-accent);
+    background: rgba(108, 106, 245, 0.12);
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+.queue-pending-remove {
+    padding: 3px 8px;
+    border: 1px solid var(--shell-border);
+    background: var(--shell-bg-panel);
+    border-radius: 4px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-family: var(--shell-font);
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.queue-pending-remove:hover {
+    border-color: var(--shell-error);
+    color: var(--shell-error);
+}
+
+/* History */
+.queue-history-entry {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    cursor: pointer;
+}
+.queue-history-entry:hover { background: var(--shell-bg-hover); }
+.queue-status-icon {
+    font-size: 14px;
+    width: 20px;
+    text-align: center;
+    flex-shrink: 0;
+}
+.queue-history-entry.success .queue-status-icon { color: var(--shell-success); }
+.queue-history-entry.error .queue-status-icon { color: var(--shell-error); }
+.queue-thumb-sm {
+    width: 36px;
+    height: 36px;
+    border-radius: 4px;
+    object-fit: cover;
+    flex-shrink: 0;
+}
+.queue-history-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.queue-history-filename {
+    font-size: 12px;
+    color: var(--shell-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.queue-history-batch {
+    font-size: 10px;
+    color: var(--shell-accent);
+}
+.queue-history-error {
+    font-size: 11px;
+    color: var(--shell-error);
+}
+.queue-history-time {
+    font-size: 11px;
+    color: var(--shell-text-muted);
+    flex-shrink: 0;
+}
+.queue-history-actions {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+}
+.queue-action-btn {
+    padding: 3px 8px;
+    border: 1px solid var(--shell-border);
+    background: var(--shell-bg-panel);
+    border-radius: 4px;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-family: var(--shell-font);
+    cursor: pointer;
+}
+.queue-action-btn:hover {
+    border-color: var(--shell-text-muted);
+    color: var(--shell-text);
+}
+
+/* History item wrapper for expandable details */
+.queue-history-item {
+    border-bottom: 1px solid var(--shell-border);
+}
+.queue-history-item:last-child { border-bottom: none; }
+
+/* Expanded details panel */
+.queue-history-details {
+    padding: 8px 10px 10px 38px;
+    background: var(--shell-bg-base);
+    border-top: 1px solid var(--shell-border);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.queue-detail-row {
+    display: flex;
+    gap: 8px;
+    font-size: 11px;
+    line-height: 1.4;
+}
+.queue-detail-label {
+    color: var(--shell-text-muted);
+    flex-shrink: 0;
+    min-width: 70px;
+    font-weight: 600;
+}
+.queue-detail-value {
+    color: var(--shell-text);
+    word-break: break-word;
+}
+
+/* Retry button */
+.queue-retry-btn {
+    border-color: var(--shell-warn) !important;
+    color: var(--shell-warn) !important;
+}
+.queue-retry-btn:hover {
+    background: var(--shell-warn) !important;
+    color: #1a1a24 !important;
+}
+
+/* Queue badge on icon rail */
+#queue-rail-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 16px;
+    height: 16px;
+    background: var(--shell-accent);
+    color: #fff;
+    border-radius: 50%;
+    font-size: 9px;
+    font-weight: 700;
+    display: none;
+    align-items: center;
+    justify-content: center;
+}

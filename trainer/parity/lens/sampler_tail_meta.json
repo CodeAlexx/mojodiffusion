@@ -1,0 +1,28 @@
+{
+  "seed": 4242,
+  "h_lat": 8,
+  "w_lat": 8,
+  "n_latent_channels": 32,
+  "packed_shape": [
+    1,
+    64,
+    128
+  ],
+  "vae_in_shape": [
+    1,
+    32,
+    16,
+    16
+  ],
+  "image_shape": [
+    1,
+    3,
+    128,
+    128
+  ],
+  "image_mean": -0.08037327975034714,
+  "image_std": 0.3150213062763214,
+  "image_min": -0.9032606482505798,
+  "image_max": 0.9987167119979858,
+  "tail_order": "unpack -> unscale -> unpatchify -> vae.decode (LensSampler.py:139-147)"
+}

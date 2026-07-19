@@ -1,0 +1,341 @@
+{
+  "schema_version": 1,
+  "producer": "scripts/anima_dump_train_ref.py",
+  "created_unix": 1780674074.7802277,
+  "serenity": "/home/alex/Serenity-anima-ref",
+  "config": "/home/alex/Serenity-anima-ref/configs/anima_100step_baseline.json",
+  "out_dir": "/home/alex/serenity-trainer/parity",
+  "prefix": "anima_train_ref",
+  "max_steps": 1,
+  "require_baseline_steps": 100,
+  "torch": "2.10.0+cu128",
+  "cuda_available": true,
+  "cuda_device_count": 1,
+  "train_device": "cuda",
+  "temp_device": "cpu",
+  "model_type": "ANIMA",
+  "training_method": "LORA",
+  "model_names": {
+    "base_model": "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c",
+    "transformer_model": "",
+    "vae_model": "",
+    "lora_model": ""
+  },
+  "baseline": {
+    "required_steps": 100,
+    "baseline_dir": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline",
+    "metrics": {
+      "path": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline/metrics.json",
+      "exists": true,
+      "size_bytes": 84940,
+      "sha256": "fe0d11efc41b9a13084d6082b26467e1631bc52f4a7db25893e005f29da50877",
+      "summary": {
+        "path": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline/metrics.json",
+        "exists": true,
+        "status": "completed",
+        "requested_steps": 100,
+        "global_steps_seen": 100,
+        "started_at": "2026-06-05T06:35:36-0700",
+        "completed_at": "2026-06-05T06:38:13-0700",
+        "progress_event_count": 100,
+        "first_progress_event": {
+          "t": 1780666579.9783664,
+          "global_step": 1,
+          "epoch": 0,
+          "epoch_step": 1,
+          "max_step": 57,
+          "max_epoch": 100
+        },
+        "last_progress_event": {
+          "t": 1780666692.7708492,
+          "global_step": 100,
+          "epoch": 1,
+          "epoch_step": 43,
+          "max_step": 57,
+          "max_epoch": 100
+        },
+        "torch_cuda_max_allocated_mib": 3276,
+        "torch_cuda_max_reserved_mib": 3446,
+        "loss_count": 100,
+        "grad_norm_count": 0,
+        "last_loss": {
+          "t": 1780666692.7667153,
+          "tag": "loss/train_step",
+          "value": 0.11681108921766281,
+          "global_step": 99
+        },
+        "last_smooth_loss": {
+          "t": 1780666692.7668602,
+          "tag": "smooth_loss/train_step",
+          "value": 0.10128431539982564,
+          "global_step": 99
+        },
+        "last_grad_norm": null,
+        "overall_wall_seconds": 157.02188550002757,
+        "train_wall_seconds": 143.62678067098022,
+        "mean_step_seconds_excluding_first": 1.1393180163635994,
+        "min_step_seconds_excluding_first": 0.9277381069841795,
+        "max_step_seconds_excluding_first": 11.306571204011561,
+        "mean_gpu_util_percent_sampled": 77.68789808917198,
+        "peak_gpu_memory_used_mib_sampled": 5441,
+        "cache_dir": "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline",
+        "workspace_dir": "/home/alex/Serenity-anima-ref/workspace/anima_100step_baseline",
+        "output_model_destination": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline/lora.safetensors"
+      }
+    },
+    "metrics_with_grad": {
+      "path": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline/metrics_with_grad.json",
+      "exists": true,
+      "size_bytes": 95939,
+      "sha256": "afd8cc90bdfa29abb39d3f350b7f6997d11f85053c4992e7bc6835840900c73d",
+      "summary": {
+        "path": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline/metrics_with_grad.json",
+        "exists": true,
+        "status": "completed",
+        "requested_steps": 100,
+        "global_steps_seen": 100,
+        "started_at": "2026-06-05T06:39:22-0700",
+        "completed_at": "2026-06-05T06:41:38-0700",
+        "progress_event_count": 100,
+        "first_progress_event": {
+          "t": 1780666790.3307757,
+          "global_step": 1,
+          "epoch": 0,
+          "epoch_step": 1,
+          "max_step": 57,
+          "max_epoch": 100
+        },
+        "last_progress_event": {
+          "t": 1780666898.484033,
+          "global_step": 100,
+          "epoch": 1,
+          "epoch_step": 43,
+          "max_step": 57,
+          "max_epoch": 100
+        },
+        "torch_cuda_max_allocated_mib": 3276,
+        "torch_cuda_max_reserved_mib": 3446,
+        "loss_count": 100,
+        "grad_norm_count": 100,
+        "last_loss": {
+          "t": 1780666898.4799614,
+          "tag": "loss/train_step",
+          "value": 0.11683385074138641,
+          "global_step": 99
+        },
+        "last_smooth_loss": {
+          "t": 1780666898.4801087,
+          "tag": "smooth_loss/train_step",
+          "value": 0.10126834750175476,
+          "global_step": 99
+        },
+        "last_grad_norm": {
+          "t": 1780666898.4451952,
+          "tag": "grad_norm",
+          "value": 0.0030804856214672327,
+          "global_step": 99
+        },
+        "overall_wall_seconds": 135.88007396800094,
+        "train_wall_seconds": 130.9273821839888,
+        "mean_step_seconds_excluding_first": 1.0924571535151424,
+        "min_step_seconds_excluding_first": 0.9320262139954139,
+        "max_step_seconds_excluding_first": 6.304523999016965,
+        "mean_gpu_util_percent_sampled": 89.41911764705883,
+        "peak_gpu_memory_used_mib_sampled": 5351,
+        "cache_dir": "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline",
+        "workspace_dir": "/home/alex/Serenity-anima-ref/workspace/anima_100step_baseline",
+        "output_model_destination": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline/lora.safetensors"
+      }
+    },
+    "lora": {
+      "path": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline/lora.safetensors",
+      "exists": true,
+      "size_bytes": 45983120,
+      "sha256": "ba1640c41776a2818c02291ed2491a74c456e3148e15634d02672b7b9dcc4f16",
+      "safetensors": {
+        "inspectable": true,
+        "key_count": 840,
+        "dtype_counts": {
+          "bfloat16": 840
+        },
+        "transformer_lora_key_count": 840,
+        "sample_keys": [
+          "transformer.transformer_blocks.0.attn1.to_k.alpha",
+          "transformer.transformer_blocks.0.attn1.to_k.lora_down.weight",
+          "transformer.transformer_blocks.0.attn1.to_k.lora_up.weight",
+          "transformer.transformer_blocks.0.attn1.to_out.0.alpha",
+          "transformer.transformer_blocks.0.attn1.to_out.0.lora_down.weight",
+          "transformer.transformer_blocks.0.attn1.to_out.0.lora_up.weight",
+          "transformer.transformer_blocks.0.attn1.to_q.alpha",
+          "transformer.transformer_blocks.0.attn1.to_q.lora_down.weight",
+          "transformer.transformer_blocks.0.attn1.to_q.lora_up.weight",
+          "transformer.transformer_blocks.0.attn1.to_v.alpha",
+          "transformer.transformer_blocks.0.attn1.to_v.lora_down.weight",
+          "transformer.transformer_blocks.0.attn1.to_v.lora_up.weight",
+          "transformer.transformer_blocks.0.attn2.to_k.alpha",
+          "transformer.transformer_blocks.0.attn2.to_k.lora_down.weight",
+          "transformer.transformer_blocks.0.attn2.to_k.lora_up.weight",
+          "transformer.transformer_blocks.0.attn2.to_out.0.alpha"
+        ],
+        "sample_shapes": {
+          "transformer.transformer_blocks.0.attn1.to_k.alpha": [],
+          "transformer.transformer_blocks.0.attn1.to_k.lora_down.weight": [
+            16,
+            2048
+          ],
+          "transformer.transformer_blocks.0.attn1.to_k.lora_up.weight": [
+            2048,
+            16
+          ],
+          "transformer.transformer_blocks.0.attn1.to_out.0.alpha": [],
+          "transformer.transformer_blocks.0.attn1.to_out.0.lora_down.weight": [
+            16,
+            2048
+          ],
+          "transformer.transformer_blocks.0.attn1.to_out.0.lora_up.weight": [
+            2048,
+            16
+          ],
+          "transformer.transformer_blocks.0.attn1.to_q.alpha": [],
+          "transformer.transformer_blocks.0.attn1.to_q.lora_down.weight": [
+            16,
+            2048
+          ],
+          "transformer.transformer_blocks.0.attn1.to_q.lora_up.weight": [
+            2048,
+            16
+          ],
+          "transformer.transformer_blocks.0.attn1.to_v.alpha": [],
+          "transformer.transformer_blocks.0.attn1.to_v.lora_down.weight": [
+            16,
+            2048
+          ],
+          "transformer.transformer_blocks.0.attn1.to_v.lora_up.weight": [
+            2048,
+            16
+          ]
+        }
+      }
+    }
+  },
+  "cache": {
+    "enabled": true,
+    "cache_dir": "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline",
+    "present": true,
+    "image": {
+      "path": "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image",
+      "exists": true,
+      "file_count_bounded": 238,
+      "sample_files": [
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image/68195ed29535f14bccece084699d6710ab998ffc1529ae52e5dd8a3313624ca4/variation-0/4.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image/68195ed29535f14bccece084699d6710ab998ffc1529ae52e5dd8a3313624ca4/variation-0/34.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image/68195ed29535f14bccece084699d6710ab998ffc1529ae52e5dd8a3313624ca4/variation-0/48.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image/68195ed29535f14bccece084699d6710ab998ffc1529ae52e5dd8a3313624ca4/variation-0/3.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image/68195ed29535f14bccece084699d6710ab998ffc1529ae52e5dd8a3313624ca4/variation-0/64.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image/68195ed29535f14bccece084699d6710ab998ffc1529ae52e5dd8a3313624ca4/variation-0/114.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image/68195ed29535f14bccece084699d6710ab998ffc1529ae52e5dd8a3313624ca4/variation-0/68.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/image/68195ed29535f14bccece084699d6710ab998ffc1529ae52e5dd8a3313624ca4/variation-0/89.pt"
+      ]
+    },
+    "text": {
+      "path": "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text",
+      "exists": true,
+      "file_count_bounded": 238,
+      "sample_files": [
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text/e9194f120a1e698c573a5935d17decb26f8d2bb9e25769e089ec6c06187d0361/variation-0/4.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text/e9194f120a1e698c573a5935d17decb26f8d2bb9e25769e089ec6c06187d0361/variation-0/34.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text/e9194f120a1e698c573a5935d17decb26f8d2bb9e25769e089ec6c06187d0361/variation-0/48.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text/e9194f120a1e698c573a5935d17decb26f8d2bb9e25769e089ec6c06187d0361/variation-0/3.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text/e9194f120a1e698c573a5935d17decb26f8d2bb9e25769e089ec6c06187d0361/variation-0/64.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text/e9194f120a1e698c573a5935d17decb26f8d2bb9e25769e089ec6c06187d0361/variation-0/114.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text/e9194f120a1e698c573a5935d17decb26f8d2bb9e25769e089ec6c06187d0361/variation-0/68.pt",
+        "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline/text/e9194f120a1e698c573a5935d17decb26f8d2bb9e25769e089ec6c06187d0361/variation-0/89.pt"
+      ]
+    }
+  },
+  "allow_cache_build": false,
+  "local_model": {
+    "base_model": "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c",
+    "transformer_model": "",
+    "vae_model": "",
+    "lora_model": "",
+    "base_exists": true,
+    "kind": "diffusers_dir",
+    "has_modular_model_index": true,
+    "subfolders": {
+      "tokenizer": true,
+      "t5_tokenizer": true,
+      "text_encoder": true,
+      "text_conditioner": true,
+      "transformer": true,
+      "vae": true,
+      "scheduler": true
+    },
+    "file_count_bounded": 18,
+    "sample_files": [
+      "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c/modular_model_index.json",
+      "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c/README.md",
+      "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c/LICENSE.md",
+      "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c/.gitattributes",
+      "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c/vae/diffusion_pytorch_model.safetensors",
+      "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c/vae/config.json",
+      "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c/tokenizer/tokenizer.json",
+      "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c/tokenizer/tokenizer_config.json"
+    ],
+    "overrides": {
+      "transformer_model": {
+        "configured": false
+      },
+      "vae_model": {
+        "configured": false
+      }
+    }
+  },
+  "concepts": {
+    "concept_file_name": "/home/alex/Serenity/training_concepts/eri2_concepts.json",
+    "concept_file_exists": true,
+    "concept_file_error": null,
+    "concept_count": 1,
+    "concepts": [
+      {
+        "name": "eri2",
+        "enabled": true,
+        "path": "/home/alex/eri2",
+        "path_exists": true,
+        "file_count_bounded": 2596,
+        "source": "concept_file_name"
+      }
+    ]
+  },
+  "blockers": [],
+  "structured_blockers": [],
+  "blocked": false,
+  "train_dtype": "BFLOAT_16",
+  "fallback_train_dtype": "BFLOAT_16",
+  "weight_dtypes": {
+    "train_dtype": "BFLOAT_16",
+    "fallback_train_dtype": "BFLOAT_16",
+    "unet": "FLOAT_32",
+    "prior": "FLOAT_32",
+    "transformer": "INT_W8A8",
+    "text_encoder": "FLOAT_8",
+    "text_encoder_2": "FLOAT_32",
+    "text_encoder_3": "FLOAT_32",
+    "text_encoder_4": "FLOAT_32",
+    "vae": "FLOAT_32",
+    "effnet_encoder": "FLOAT_32",
+    "decoder": "FLOAT_32",
+    "decoder_text_encoder": "FLOAT_32",
+    "decoder_vqgan": "FLOAT_32",
+    "lora": "FLOAT_32",
+    "embedding": "FLOAT_32"
+  },
+  "lora_weight_dtype": "FLOAT_32",
+  "lora_rank": 16,
+  "lora_alpha": 1.0,
+  "layer_filter": "attn1,attn2,ff",
+  "layer_filter_preset": "attn-mlp",
+  "timestep_distribution": "LOGIT_NORMAL",
+  "dynamic_timestep_shifting": false,
+  "blocker_artifact": "/home/alex/serenity-trainer/parity/anima_train_ref_blockers.json"
+}

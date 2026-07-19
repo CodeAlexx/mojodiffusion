@@ -1,0 +1,47 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "save_before_sample": true,
+    "precache_required": true,
+    "enforce_min_image_size": true,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 30,
+    "cfg": 5.0,
+    "seed": 42,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "eri2_park_chess",
+      "prompt": "vrtlEri2, playing chess at a quiet park table, soft natural daylight, relaxed posture, greenery in the background, calm candid portrait atmosphere, shallow depth of field",
+      "seed": 42,
+      "caps": {
+        "positive": "/home/alex/mojodiffusion/output/krea2_lokr_eri2_3000/caps/prompt_0_pos.bin",
+        "negative": "/home/alex/mojodiffusion/output/krea2_lokr_eri2_3000/caps/prompt_0_neg.bin"
+      }
+    },
+    {
+      "id": "eri2_cafe_coffee",
+      "prompt": "vrtlEri2, holding a coffee cup in a beanie, sitting at a cafe, smiling softly, warm window light, cozy indoor background, natural portrait composition",
+      "seed": 43,
+      "caps": {
+        "positive": "/home/alex/mojodiffusion/output/krea2_lokr_eri2_3000/caps/prompt_1_pos.bin",
+        "negative": "/home/alex/mojodiffusion/output/krea2_lokr_eri2_3000/caps/prompt_1_neg.bin"
+      }
+    },
+    {
+      "id": "eri2_nightclub_dj",
+      "prompt": "vrtlEri2, DJ at a night club with fisheye lens, smoke machine, laser lights, holding a martini, energetic nightlife atmosphere, cinematic flash photography",
+      "seed": 44,
+      "caps": {
+        "positive": "/home/alex/mojodiffusion/output/krea2_lokr_eri2_3000/caps/prompt_2_pos.bin",
+        "negative": "/home/alex/mojodiffusion/output/krea2_lokr_eri2_3000/caps/prompt_2_neg.bin"
+      }
+    }
+  ]
+}

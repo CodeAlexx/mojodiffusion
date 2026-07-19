@@ -1,0 +1,18 @@
+{
+  "model_type": "ltx2",
+  "learning_rate": 0.0001,
+  "lora_rank": 32,
+  "lora_alpha": 32.0,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 100,
+  "save_every": 0,
+  "sample_every": 0,
+  "optimizer": {
+    "eps": 1e-08,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999
+  },
+  "_anchor_doc": "Flags-off anchors, VIDEO arm (576tok disney cache, seed 42, rank32/alpha32, lr 1e-4). RE-BASELINED 2026-07-16 late to the bf16-STACK-DEFAULT era (LTX2_FAST semantics default-ON after the band gate PASSED n=100 vs musubi oracle; video fast FITS 24GB at ~8.5 s/step, ~20% vs F32 10.8): steps 1-4 loss = 0.4605/0.2299/0.2223/0.2620, grad_norm 0.0343/0.0075/0.0161/0.0074, step1 sigma 0.82385314 sample 59. C13 gates the flags-off path == this NEW default. ERA NOTES: (1) the PRE-bf16-default era (F32 stack, now the LTX2_F32_STACK=1 escape hatch) was 0.4602/0.2296/0.2224/0.2616 (grad_norm 0.0348/0.0074/0.0128/0.0071) \u2014 STILL gates the F32 escape path; (2) further back, the PRE-rope-fix (MJ-1109) F32 era was 0.4560/0.2272/0.2194/0.2596. Same seed-driven sigma/sample streams across eras; only the compute class moves the low decimals."
+}

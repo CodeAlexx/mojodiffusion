@@ -1,0 +1,23 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "save_before_sample": true,
+    "precache_required": false,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 1,
+    "cfg": 1.0,
+    "seed": 42,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "qwen_fast_1024",
+      "prompt": "high-resolution portrait, daylight, natural background"
+    }
+  ]
+}

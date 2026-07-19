@@ -1,0 +1,13 @@
+{
+  "crop_start": 140,
+  "prompt_post": 607,
+  "neg_post": 234,
+  "prompt_true_len": 747,
+  "neg_true_len": 374,
+  "H": 576,
+  "W": 320,
+  "LH": 72,
+  "LW": 40,
+  "GH": 36,
+  "GW": 20
+}

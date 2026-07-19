@@ -1,0 +1,31 @@
+{
+  "producer": "scripts/ernie_dump_train_ref.py",
+  "schema_version": 1,
+  "blocked": false,
+  "structured_blockers": [],
+  "dry_run": {
+    "producer": "scripts/ernie_dump_train_ref.py",
+    "serenity": "/home/alex/Serenity",
+    "config": "/home/alex/Serenity/configs/ernie_eri2_100step_baseline.json",
+    "out_dir": "/home/alex/serenity-trainer/parity",
+    "prefix": "ernie_train_ref",
+    "max_steps": 1,
+    "torch": "2.9.1+cu128",
+    "cuda_available": false,
+    "cuda_device_count": 0,
+    "cuda_note": "Captured from sandbox dry-run; sandbox blocks NVML, so CUDA availability is not numeric parity evidence. Real train/loss/grad/speed parity must run on the Serenity GPU path.",
+    "train_device": "cpu",
+    "train_device_note": "The config JSON does not set CUDA; real Ernie dump/parity must pass --train-device cuda --temp-device cpu or use an equivalent CUDA config.",
+    "temp_device": "cpu",
+    "model_type": "ERNIE",
+    "training_method": "LORA",
+    "cache_dir": "/home/alex/Serenity/workspace-cache/ernie_eri2_100step_baseline",
+    "cache_present": true,
+    "allow_cache_build": false,
+    "base_model_name": "/home/alex/models/ERNIE-Image",
+    "train_dtype": "BFLOAT_16",
+    "lora_weight_dtype": "FLOAT_32",
+    "layer_filter": "self_attention,mlp",
+    "layer_filter_preset": "attn-mlp"
+  }
+}

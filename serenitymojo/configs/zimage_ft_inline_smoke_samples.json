@@ -1,0 +1,25 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 2,
+    "sample_at_start": false,
+    "save_before_sample": false,
+    "precache_required": false,
+    "enforce_min_image_size": false,
+    "width": 448,
+    "height": 576,
+    "frames": 1,
+    "fps": 24,
+    "steps": 8,
+    "cfg": 1.0,
+    "seed": 991,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "ft_cached_caption_smoke",
+      "prompt": "zimage full-FT inline sampler smoke using a cached training caption (448x576 = the 72x56 training bucket)",
+      "seed": 991
+    }
+  ]
+}

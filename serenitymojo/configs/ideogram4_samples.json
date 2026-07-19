@@ -1,0 +1,31 @@
+{
+ "schema": "serenity.sample_prompts.v1",
+ "_comment": "ideogram4 encodes each prompt LIVE (Qwen3-VL) and REQUIRES a structured JSON caption string (ideogram4_encode_sample_prompt rejects plain text). No caps: precache_required=false. width/height are cosmetic here; the inline sampler uses its argv sample_resolution.",
+ "defaults": {
+  "sample_every": 500,
+  "sample_at_start": false,
+  "save_before_sample": false,
+  "precache_required": false,
+  "enforce_min_image_size": false,
+  "width": 1024,
+  "height": 1024,
+  "frames": 1,
+  "fps": 24,
+  "steps": 8,
+  "cfg": 7.0,
+  "seed": 42,
+  "negative": ""
+ },
+ "prompts": [
+  {
+   "id": "ideogram4_garden_portrait",
+   "prompt": "{\"high_level_description\":\"A portrait photograph of a woman in a sunlit garden.\",\"style_description\":{\"aesthetics\":\"clean natural portrait photography\",\"lighting\":\"soft natural daylight\",\"photo\":\"outdoor photograph\",\"medium\":\"photograph\",\"color_palette\":[\"#8BC34A\",\"#F5F5DC\",\"#FFFFFF\"]},\"compositional_deconstruction\":{\"background\":\"lush green garden with soft bokeh\",\"elements\":[{\"type\":\"obj\",\"bbox\":[360,200,680,940],\"desc\":\"a woman with long hair wearing a light summer dress\",\"color_palette\":[\"#F5F5DC\",\"#C0A080\"]}]}}",
+   "seed": 42
+  },
+  {
+   "id": "ideogram4_city_dusk",
+   "prompt": "{\"high_level_description\":\"A cinematic photograph of a man on a city street at dusk.\",\"style_description\":{\"aesthetics\":\"moody cinematic street photography\",\"lighting\":\"warm dusk light with neon accents\",\"photo\":\"street photograph\",\"medium\":\"photograph\",\"color_palette\":[\"#1A237E\",\"#FF7043\",\"#212121\"]},\"compositional_deconstruction\":{\"background\":\"blurred city street with glowing signage\",\"elements\":[{\"type\":\"obj\",\"bbox\":[400,180,700,960],\"desc\":\"a man in a dark coat standing on the sidewalk\",\"color_palette\":[\"#212121\",\"#FF7043\"]}]}}",
+   "seed": 43
+  }
+ ]
+}

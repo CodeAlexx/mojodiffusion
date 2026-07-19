@@ -1,0 +1,81 @@
+{
+  "seed": 1234,
+  "timestep": 250,
+  "t_model": 0.75,
+  "t_model_formula": "(1000 - timestep) / 1000",
+  "device": "cuda",
+  "compute_dtype": "bfloat16",
+  "model_dir": "/home/alex/.serenity/models/zimage_base/transformer",
+  "velocity_convention": "RAW transformer .sample (stacked over output_list, squeezed dim=2). predicted_flow = -velocity is applied OUTSIDE the transformer and is NOT baked into zi_fwd_velocity.bin.",
+  "text_encoder_output_structure": {
+    "description": "Serenity passes `cap_feats` (the 3rd positional arg to ZImageTransformer2DModel.forward) as a Python list with one entry per batch sample. Each entry is a 2-D tensor [caption_len, feat_dim]. This is ZImageModel.encode_text's `embeddings_list` = the Qwen3 hidden_states[-2] masked per-sample. omni_mode is False because x[0] and cap_feats[0] are Tensors, not lists.",
+    "python_type": "list[torch.Tensor]",
+    "num_entries": 1,
+    "entry_shape": [
+      64,
+      2560
+    ],
+    "entry_dtype": "bfloat16"
+  },
+  "x_input_structure": {
+    "description": "First positional arg `x`: list of image tensors, one per sample, each [C, F, H, W]. Built by latent.unsqueeze(2).unbind(dim=0).",
+    "python_type": "list[torch.Tensor]",
+    "num_entries": 1,
+    "entry_shape": [
+      16,
+      1,
+      16,
+      16
+    ],
+    "entry_dtype": "bfloat16"
+  },
+  "files": {
+    "zi_fwd_latent.bin": {
+      "shape": [
+        1,
+        16,
+        16,
+        16
+      ],
+      "dtype": "float32",
+      "order": "row-major (C)",
+      "bytes": 16384,
+      "note": "Latent as [1,16,16,16] (F=1 squeezed). The [1,16,1,16,16] tensor fed to transformer is this reshaped."
+    },
+    "zi_fwd_cap.bin": {
+      "shape": [
+        64,
+        2560
+      ],
+      "dtype": "float32",
+      "order": "row-major (C)",
+      "bytes": 655360,
+      "note": "Caption hidden states fed as cap_feats[0]."
+    },
+    "zi_fwd_velocity.bin": {
+      "shape": [
+        1,
+        16,
+        16,
+        16
+      ],
+      "dtype": "float32",
+      "order": "row-major (C)",
+      "bytes": 16384,
+      "note": "RAW transformer .sample. predicted = -velocity (separate)."
+    }
+  },
+  "velocity_stats": {
+    "shape": [
+      1,
+      16,
+      16,
+      16
+    ],
+    "mean": -0.023316487669944763,
+    "std": 1.6583610773086548,
+    "min": -6.0625,
+    "max": 6.125,
+    "nonfinite": 0
+  }
+}

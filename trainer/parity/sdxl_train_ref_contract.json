@@ -1,0 +1,100 @@
+{
+  "name": "sdxl_train_ref",
+  "purpose": "Serenity SDXL cached-data train parity dump contract for predict -> loss -> backward -> optimizer gates.",
+  "producer_script": "/home/alex/serenity-trainer/scripts/sdxl_dump_train_ref.py",
+  "reference_repo": "/home/alex/Serenity",
+  "default_config": "/home/alex/Serenity/configs/sdxl_100step_baseline.json",
+  "default_reference_baseline": {
+    "required_steps": 100,
+    "output_model_destination": "/home/alex/Serenity/output/sdxl_100step_baseline/lora_last.safetensors",
+    "metrics": "/home/alex/Serenity/output/sdxl_100step_baseline/metrics.json"
+  },
+  "parity_policy": {
+    "claimed_by_dry_run": false,
+    "reference": "Serenity only",
+    "cpu_pytorch_dry_runs": "structural/config/cache/source checks only; never numeric parity",
+    "non_dry_run_device": "cuda",
+    "full_finetune_scope": "In scope when Serenity registers the SDXL fine-tune loader, setup, data-loader, and saver paths; adapter safetensors remain LoRA-only, and full-weight save/load/resume parity is a separate gate."
+  },
+  "training_method_scope": {
+    "LORA": "in scope when Serenity registers loader/setup/data-loader paths",
+    "FINE_TUNE": "in scope when Serenity registers loader/setup/data-loader paths",
+    "EMBEDDING": "not in scope for this SDXL train-reference scaffold",
+    "FINE_TUNE_VAE": "not in scope for this SDXL train-reference scaffold"
+  },
+  "reference_files_inspected": [
+    "/home/alex/Serenity/modules/modelLoader/StableDiffusionXLLoRAModelLoader.py",
+    "/home/alex/Serenity/modules/modelLoader/StableDiffusionXLFineTuneModelLoader.py",
+    "/home/alex/Serenity/modules/modelLoader/GenericFineTuneModelLoader.py",
+    "/home/alex/Serenity/modules/modelSetup/BaseStableDiffusionXLSetup.py",
+    "/home/alex/Serenity/modules/modelSetup/StableDiffusionXLFineTuneSetup.py",
+    "/home/alex/Serenity/modules/modelSetup/StableDiffusionXLLoRASetup.py",
+    "/home/alex/Serenity/modules/modelSetup/StableDiffusionXLEmbeddingSetup.py",
+    "/home/alex/Serenity/modules/dataLoader/StableDiffusionXLBaseDataLoader.py",
+    "/home/alex/Serenity/modules/modelSaver/StableDiffusionXLLoRAModelSaver.py",
+    "/home/alex/Serenity/modules/modelSaver/StableDiffusionXLFineTuneModelSaver.py",
+    "/home/alex/Serenity/modules/modelSaver/GenericFineTuneModelSaver.py",
+    "/home/alex/Serenity/training_presets/#sdxl 1.0 LoRA.json",
+    "/home/alex/Serenity/training_presets/#sdxl 1.0.json",
+    "/home/alex/Serenity/configs/sdxl_100step_baseline.json"
+  ],
+  "default_outputs": {
+    "run_metadata": "parity/sdxl_train_ref_meta.json",
+    "step_tensors": "parity/sdxl_train_ref_step000.safetensors",
+    "adapter_tensors": "parity/sdxl_train_ref_step000_adapters.safetensors",
+    "dry_run_blockers": "parity/sdxl_train_ref_blockers.json"
+  },
+  "serenity_reference_contract": {
+    "setup": "BaseStableDiffusionXLSetup.predict encodes or consumes cached CLIP-L/CLIP-G states, concatenates text encoder hidden states, scales latent_image by VAE scaling_factor, samples discrete timestep/noise from train_progress-derived batch_seed, calls UNet with added_cond_kwargs text_embeds and time_ids, and returns epsilon or v_prediction target data.",
+    "loss": "BaseStableDiffusionXLSetup.calculate_loss delegates to Serenity diffusion loss mixin and mean-reduces the loss tensor.",
+    "data_loader": "StableDiffusionXLBaseDataLoader caches latent_image, original_resolution, crop_offset, crop_resolution, image_path, prompt_1/2, tokens_1/2, frozen text_encoder_1_hidden_state, text_encoder_2_hidden_state, text_encoder_2_pooled_state, concept fields, and optional mask or conditioning latents.",
+    "default_training": "Local sdxl_100step_baseline uses STABLE_DIFFUSION_XL_10_BASE/LORA, batch_size 1, resolution 1024, seed 42, AdamW constant LR 1e-4, gradient_accumulation_steps 1, clip_grad_norm 1.0, UNet LoRA rank/alpha 16, frozen text encoders, train dtype BFLOAT_16, UNet/text weights FLOAT_16, VAE FLOAT_32."
+  },
+  "step_safetensors_keys": {
+    "cached_batch": "batch.* tensors exactly as Serenity data_loader yields them, including latent_image, tokens_1/2, cached text_encoder hidden/pooled states, resolution/crop fields, loss_weight, concept_type, and optional latent_mask or latent_conditioning_image.",
+    "trace": "trace.* tensors captured from Serenity BaseStableDiffusionXLSetup.predict, StableDiffusionXLModel.encode_text, combine_text_encoder_output, and UNet2DConditionModel.forward. Expected keys include cached/text outputs, combined_text_encoder_output, combined_pooled_text_encoder_2_output, scaled_latent_image, latent_noise, scaled_noisy_latent_image, latent_input, unet_timestep, encoder_hidden_states, added_cond_text_embeds, added_cond_time_ids, and predicted_latent_noise.",
+    "outputs": "output.timestep, output.predicted, output.target, optional output.prior_target, output.loss_pre_scale, and output.loss_for_backward."
+  },
+  "adapter_safetensors_keys": {
+    "policy": "LoRA-only. FINE_TUNE configs must not dump full-weight params through adapter_safetensors; full-finetune save/load/resume parity is a separate full-weight gate.",
+    "initial": "adapter_initial.* trainable SDXL LoRA tensors when --adapter-dump initial is used.",
+    "step": "adapter_before.*, adapter_pre.*, adapter_post.*, and adapter_after.* trainable SDXL LoRA tensors when named trainable params are exposed.",
+    "step-with-grads": "adapter_before.*, adapter_pre.*, adapter_pre_clip.*, adapter_pre_clip_grad.*, adapter_post.*, adapter_post_clip.*, adapter_post_clip_grad.*, and adapter_after.* trainable SDXL LoRA tensors/gradients.",
+    "full_finetune": "not emitted by this adapter dump path"
+  },
+  "dry_run_contract": {
+    "required_reports": [
+      "reference_policy with reference=Serenity only and dry_run_numeric_parity=false",
+      "dry_run=true, numeric_parity_status=none, numeric_parity_claimed=false, and dry_run_checks_are_structural_only=true",
+      "model_type and training_method",
+      "train_device and temp_device",
+      "Serenity registration status for LORA and FINE_TUNE using source paths",
+      "100-step baseline output and metrics status",
+      "base/vae/lora model names and text encoder include flags",
+      "cache directory, image cache status, and text cache status using recursive file counts",
+      "single-file or diffusers-dir local model status",
+      "structured_blockers with stable id, category, message, and details"
+    ],
+    "required_blockers_when_missing": [
+      "cuda_train_device_not_configured",
+      "cuda_unavailable_in_current_process",
+      "missing_100step_baseline",
+      "missing_required_cache",
+      "missing_base_model_path",
+      "missing_single_file_sdxl_keys",
+      "missing_diffusers_sdxl_folders"
+    ]
+  },
+  "bounded_run_notes": [
+    "The script is single-process only and enforces --max-steps 1.",
+    "Dry-run does not load the SDXL model, writes parity/sdxl_train_ref_blockers.json, and is structural only.",
+    "Dry-run/blocker artifacts set numeric_parity_claimed=false and never claim numeric parity.",
+    "Non-dry-run refuses CPU train_device because CPU PyTorch is not numeric parity evidence.",
+    "By default it requires the existing 100-step baseline artifact, existing image/text caches, and local weights.",
+    "It imports Serenity from /home/alex/Serenity and chdirs there before importing modules.util.create because Serenity factory.import_dir uses cwd-relative module paths.",
+    "It preserves tensor storage dtype in safetensors dumps; scalar stats in JSON are computed in float32 where needed.",
+    "SDXL adapter safetensors are LoRA-only; FINE_TUNE full-weight parity requires a separate full-weight gate.",
+    "It does not call GenericTrainer.end(), so it does not perform Serenity final model saves.",
+    "It does not edit Serenity source, SDXL LoRA files, SDXL sampler files, or Mojo runtime files."
+  ]
+}

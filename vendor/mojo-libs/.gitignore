@@ -1,0 +1,18 @@
+# build artifacts
+*.o
+*.so
+*.mojopkg
+/build/
+# compiled example binaries
+mojohttp
+mojohttps
+mojoh2
+mojoh2tls
+mojoget
+mojo_http_server
+snapshot/snapshot
+screen/screen
+# editor/OS
+.DS_Store
+__pycache__/
+*.pyc

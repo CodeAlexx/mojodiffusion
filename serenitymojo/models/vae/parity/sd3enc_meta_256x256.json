@@ -1,0 +1,25 @@
+{
+  "img_shape": [
+    1,
+    3,
+    256,
+    256
+  ],
+  "moments_shape_nhwc": [
+    1,
+    32,
+    32,
+    32
+  ],
+  "mode_shape_nchw": [
+    1,
+    16,
+    32,
+    32
+  ],
+  "dtype": "bf16-on-gpu, dumped as f32",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/stablediffusion35_medium.safetensors",
+  "embedded_vae": "first_stage_model (via from_single_file)",
+  "unscaled": true,
+  "latent_channels": 16
+}

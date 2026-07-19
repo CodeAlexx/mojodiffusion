@@ -1,0 +1,9 @@
+{
+  "timestep": 499,
+  "sigma": 0.5,
+  "t_model": 0.501,
+  "cap_len": 224,
+  "H": 72,
+  "W": 56,
+  "SERENITY_loss": 0.4691533148288727
+}

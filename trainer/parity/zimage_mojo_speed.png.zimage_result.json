@@ -1,0 +1,31 @@
+{
+  "schema":"serenity.zimage.sample_result.v1",
+  "model":"zimage",
+  "accepted_sampler_parity":false,
+  "accepted_speed_parity":false,
+  "run_identity":{
+    "prompt":"A close-up portrait of a woman with long curly dark hair, soft natural lighting, blurred background, intimate atmosphere, sharp focus on her face.",
+    "seed":42,
+    "resolution":{"width":1024,"height":1024},
+    "steps":28,
+    "guidance":3.5,
+    "dtype":"bf16"
+  },
+  "mojo":{
+    "prompt":"A close-up portrait of a woman with long curly dark hair, soft natural lighting, blurred background, intimate atmosphere, sharp focus on her face.",
+    "seed":42,
+    "resolution":{"width":1024,"height":1024},
+    "steps":28,
+    "guidance":3.5,
+    "dtype":"bf16",
+    "text_encode_seconds":33.874484788,
+    "denoise_seconds":145.787464897,
+    "denoise_seconds_per_step":5.206695174892857,
+    "vae_decode_seconds":1.809631493,
+    "peak_vram_mib":0,
+    "artifact_paths":["/home/alex/serenity-trainer/parity/zimage_mojo_speed.png","/home/alex/serenity-trainer/parity/zimage_mojo_speed.png.zimage_result.json"]
+  },
+  "lora_path":"",
+  "output_png":"/home/alex/serenity-trainer/parity/zimage_mojo_speed.png",
+  "note":"Mojo-side sample result only; peak_vram_mib is not measured here and speed parity is not accepted without paired Serenity evidence."
+}

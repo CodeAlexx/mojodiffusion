@@ -1,0 +1,36 @@
+{
+  "model_type": "ernie_image",
+  "checkpoint": "/home/alex/models/ERNIE-Image/transformer",
+  "vae": "/home/alex/models/ERNIE-Image/vae/diffusion_pytorch_model.safetensors",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/ernie_image_samples.json",
+
+  "inner_dim": 4096,
+  "in_channels": 128,
+  "joint_attention_dim": 3072,
+  "out_channels": 128,
+  "num_double": 0,
+  "num_single": 36,
+  "num_heads": 32,
+  "head_dim": 128,
+  "mlp_hidden": 12288,
+  "timestep_dim": 4096,
+  "rope_theta": 256,
+  "rope_axes_dim": [32, 48, 48],
+
+  "learning_rate": 3e-4,
+  "learning_rate_scheduler": "constant",
+  "learning_rate_warmup_steps": 0,
+  "lora_rank": 16,
+  "lora_alpha": 16,
+  "network_algorithm": "oft",
+  "lokr_targets": 2,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 1,
+  "save_every": 1,
+  "sample_every": 0,
+  "workspace_dir": "/tmp/ernie_direct_oft_smoke",
+  "save_filename_prefix": "ernie_direct_oft_smoke",
+
+  "optimizer": { "optimizer": "ADAMW", "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
+}

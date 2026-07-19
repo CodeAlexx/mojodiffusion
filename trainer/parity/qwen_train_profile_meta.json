@@ -1,0 +1,157 @@
+{
+  "producer": "scripts/qwen_dump_train_ref.py",
+  "created_unix": 1780670947.404491,
+  "elapsed_seconds": 465.4570777180197,
+  "serenity": "/home/alex/Serenity",
+  "config_path": "/home/alex/Serenity/configs/qwen_100step_baseline.json",
+  "out_dir": "/home/alex/serenity-trainer/parity",
+  "prefix": "qwen_train_profile",
+  "max_steps": 1,
+  "adapter_dump": "none",
+  "profile_only": true,
+  "initial_adapter_safetensors": null,
+  "torch": "2.9.1+cu128",
+  "cuda": {
+    "available": true,
+    "device_count": 1,
+    "current_device": 0,
+    "device_name": "NVIDIA GeForce RTX 3090 Ti"
+  },
+  "runtime_config": {
+    "model_type": "QWEN",
+    "training_method": "LORA",
+    "train_device": "cuda",
+    "temp_device": "cpu",
+    "train_dtype": "BFLOAT_16",
+    "base_model_name": "/home/alex/.serenity/models/checkpoints/qwen-image-2512",
+    "cache_dir": "/home/alex/Serenity/workspace-cache/qwen_100step_baseline",
+    "batch_size": 2,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 0.0003,
+    "learning_rate_scheduler": "CONSTANT",
+    "optimizer": "ADAMW",
+    "clip_grad_norm": 1.0,
+    "timestep_distribution": "LOGIT_NORMAL",
+    "dynamic_timestep_shifting": false,
+    "text_encoder_sequence_length": 512,
+    "lora_rank": 16,
+    "lora_alpha": 1.0,
+    "lora_weight_dtype": "FLOAT_32",
+    "layer_filter": "attn,img_mlp,txt_mlp",
+    "layer_filter_preset": "attn-mlp"
+  },
+  "trainable_parameters": {
+    "count": 1440,
+    "numel": 106168320,
+    "names": [],
+    "stats": {}
+  },
+  "steps": [
+    {
+      "step_index": 0,
+      "global_step": 0,
+      "epoch": 0,
+      "epoch_step": 0,
+      "loss_pre_scale": 0.08948630839586258,
+      "loss_for_backward": 0.08948630839586258,
+      "grad_norm_pre_clip": 0.0001474922028137371,
+      "grad_norm_no_clip": 0.0001474922028137371,
+      "lr_before": [
+        0.0
+      ],
+      "lr_after": [
+        1.4999999999999998e-06
+      ],
+      "optimizer_before": {
+        "class": "AdamW",
+        "param_groups": [
+          {
+            "index": 0,
+            "name": "transformer",
+            "lr": 0.0,
+            "initial_lr": 0.0003,
+            "weight_decay": 0.01,
+            "betas": [
+              0.9,
+              0.999
+            ],
+            "eps": 1e-08,
+            "foreach": false,
+            "fused": false,
+            "param_count": 1440,
+            "param_numel": 106168320
+          }
+        ],
+        "state": {
+          "parameter_entries": 0,
+          "tensor_count": 0,
+          "tensor_numel": 0,
+          "keys": [],
+          "sample_steps": []
+        }
+      },
+      "optimizer_after": {
+        "class": "AdamW",
+        "param_groups": [
+          {
+            "index": 0,
+            "name": "transformer",
+            "lr": 1.4999999999999998e-06,
+            "initial_lr": 0.0003,
+            "weight_decay": 0.01,
+            "betas": [
+              0.9,
+              0.999
+            ],
+            "eps": 1e-08,
+            "foreach": false,
+            "fused": false,
+            "param_count": 1440,
+            "param_numel": 106168320
+          }
+        ],
+        "state": {
+          "parameter_entries": 1440,
+          "tensor_count": 4320,
+          "tensor_numel": 212338080,
+          "keys": [
+            "exp_avg",
+            "exp_avg_sq",
+            "step"
+          ],
+          "sample_steps": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "safetensors": null,
+      "adapter_safetensors": null,
+      "timing": {
+        "load_setup_seconds": 295.3092309619824,
+        "cache_epoch_start_seconds": 153.70464057300705,
+        "predict_seconds": 12.852268689981429,
+        "loss_seconds": 0.07328749500447884,
+        "backward_seconds": 2.742950047017075,
+        "reduce_grads_seconds": 8.439994417130947e-06,
+        "grad_norm_seconds": 0.0927998459956143,
+        "clip_grad_norm_seconds": 0.15045188699150458,
+        "optimizer_update_seconds": 0.4419737099960912
+      }
+    }
+  ]
+}

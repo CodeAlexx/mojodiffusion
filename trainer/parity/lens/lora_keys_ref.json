@@ -1,0 +1,4329 @@
+{
+  "naming": "PEFT transformer.<...>.lora_down.weight/.lora_up.weight/.alpha (LoRAModule.py:563)",
+  "rank": 16,
+  "alpha": 16.0,
+  "n_adapters": 480,
+  "n_keys": 1440,
+  "keys": {
+    "transformer.transformer_blocks.0.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.0.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.0.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.0.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.0.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.0.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.0.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.0.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.0.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.0.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.0.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.0.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.0.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.0.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.0.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.0.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.0.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.0.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.0.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.0.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.0.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.0.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.0.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.0.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.0.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.0.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.0.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.0.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.0.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.0.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.1.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.1.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.1.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.1.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.1.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.1.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.1.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.1.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.1.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.1.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.1.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.1.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.1.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.1.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.1.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.1.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.1.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.1.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.1.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.1.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.1.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.1.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.1.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.1.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.1.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.1.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.1.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.1.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.1.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.1.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.2.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.2.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.2.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.2.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.2.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.2.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.2.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.2.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.2.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.2.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.2.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.2.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.2.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.2.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.2.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.2.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.2.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.2.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.2.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.2.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.2.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.2.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.2.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.2.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.2.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.2.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.2.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.2.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.2.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.2.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.3.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.3.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.3.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.3.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.3.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.3.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.3.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.3.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.3.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.3.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.3.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.3.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.3.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.3.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.3.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.3.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.3.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.3.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.3.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.3.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.3.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.3.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.3.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.3.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.3.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.3.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.3.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.3.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.3.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.3.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.4.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.4.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.4.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.4.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.4.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.4.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.4.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.4.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.4.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.4.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.4.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.4.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.4.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.4.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.4.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.4.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.4.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.4.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.4.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.4.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.4.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.4.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.4.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.4.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.4.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.4.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.4.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.4.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.4.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.4.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.5.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.5.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.5.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.5.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.5.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.5.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.5.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.5.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.5.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.5.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.5.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.5.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.5.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.5.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.5.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.5.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.5.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.5.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.5.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.5.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.5.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.5.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.5.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.5.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.5.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.5.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.5.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.5.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.5.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.5.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.6.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.6.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.6.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.6.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.6.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.6.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.6.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.6.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.6.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.6.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.6.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.6.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.6.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.6.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.6.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.6.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.6.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.6.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.6.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.6.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.6.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.6.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.6.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.6.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.6.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.6.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.6.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.6.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.6.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.6.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.7.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.7.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.7.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.7.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.7.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.7.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.7.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.7.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.7.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.7.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.7.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.7.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.7.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.7.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.7.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.7.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.7.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.7.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.7.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.7.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.7.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.7.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.7.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.7.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.7.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.7.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.7.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.7.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.7.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.7.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.8.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.8.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.8.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.8.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.8.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.8.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.8.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.8.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.8.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.8.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.8.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.8.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.8.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.8.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.8.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.8.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.8.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.8.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.8.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.8.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.8.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.8.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.8.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.8.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.8.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.8.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.8.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.8.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.8.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.8.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.9.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.9.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.9.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.9.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.9.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.9.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.9.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.9.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.9.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.9.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.9.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.9.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.9.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.9.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.9.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.9.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.9.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.9.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.9.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.9.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.9.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.9.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.9.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.9.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.9.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.9.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.9.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.9.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.9.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.9.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.10.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.10.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.10.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.10.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.10.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.10.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.10.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.10.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.10.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.10.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.10.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.10.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.10.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.10.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.10.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.10.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.10.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.10.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.10.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.10.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.10.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.10.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.10.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.10.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.10.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.10.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.10.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.10.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.10.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.10.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.11.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.11.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.11.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.11.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.11.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.11.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.11.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.11.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.11.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.11.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.11.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.11.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.11.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.11.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.11.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.11.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.11.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.11.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.11.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.11.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.11.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.11.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.11.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.11.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.11.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.11.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.11.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.11.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.11.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.11.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.12.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.12.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.12.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.12.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.12.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.12.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.12.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.12.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.12.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.12.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.12.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.12.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.12.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.12.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.12.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.12.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.12.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.12.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.12.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.12.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.12.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.12.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.12.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.12.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.12.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.12.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.12.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.12.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.12.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.12.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.13.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.13.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.13.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.13.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.13.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.13.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.13.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.13.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.13.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.13.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.13.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.13.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.13.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.13.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.13.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.13.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.13.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.13.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.13.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.13.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.13.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.13.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.13.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.13.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.13.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.13.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.13.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.13.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.13.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.13.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.14.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.14.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.14.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.14.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.14.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.14.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.14.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.14.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.14.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.14.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.14.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.14.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.14.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.14.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.14.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.14.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.14.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.14.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.14.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.14.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.14.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.14.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.14.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.14.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.14.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.14.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.14.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.14.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.14.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.14.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.15.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.15.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.15.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.15.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.15.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.15.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.15.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.15.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.15.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.15.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.15.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.15.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.15.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.15.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.15.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.15.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.15.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.15.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.15.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.15.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.15.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.15.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.15.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.15.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.15.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.15.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.15.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.15.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.15.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.15.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.16.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.16.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.16.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.16.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.16.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.16.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.16.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.16.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.16.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.16.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.16.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.16.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.16.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.16.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.16.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.16.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.16.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.16.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.16.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.16.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.16.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.16.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.16.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.16.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.16.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.16.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.16.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.16.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.16.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.16.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.17.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.17.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.17.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.17.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.17.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.17.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.17.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.17.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.17.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.17.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.17.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.17.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.17.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.17.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.17.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.17.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.17.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.17.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.17.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.17.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.17.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.17.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.17.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.17.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.17.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.17.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.17.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.17.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.17.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.17.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.18.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.18.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.18.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.18.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.18.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.18.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.18.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.18.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.18.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.18.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.18.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.18.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.18.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.18.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.18.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.18.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.18.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.18.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.18.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.18.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.18.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.18.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.18.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.18.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.18.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.18.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.18.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.18.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.18.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.18.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.19.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.19.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.19.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.19.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.19.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.19.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.19.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.19.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.19.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.19.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.19.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.19.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.19.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.19.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.19.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.19.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.19.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.19.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.19.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.19.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.19.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.19.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.19.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.19.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.19.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.19.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.19.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.19.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.19.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.19.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.20.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.20.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.20.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.20.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.20.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.20.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.20.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.20.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.20.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.20.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.20.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.20.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.20.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.20.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.20.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.20.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.20.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.20.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.20.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.20.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.20.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.20.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.20.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.20.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.20.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.20.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.20.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.20.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.20.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.20.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.21.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.21.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.21.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.21.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.21.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.21.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.21.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.21.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.21.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.21.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.21.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.21.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.21.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.21.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.21.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.21.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.21.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.21.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.21.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.21.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.21.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.21.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.21.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.21.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.21.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.21.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.21.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.21.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.21.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.21.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.22.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.22.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.22.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.22.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.22.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.22.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.22.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.22.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.22.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.22.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.22.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.22.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.22.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.22.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.22.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.22.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.22.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.22.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.22.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.22.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.22.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.22.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.22.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.22.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.22.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.22.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.22.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.22.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.22.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.22.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.23.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.23.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.23.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.23.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.23.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.23.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.23.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.23.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.23.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.23.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.23.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.23.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.23.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.23.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.23.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.23.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.23.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.23.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.23.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.23.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.23.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.23.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.23.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.23.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.23.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.23.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.23.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.23.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.23.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.23.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.24.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.24.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.24.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.24.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.24.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.24.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.24.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.24.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.24.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.24.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.24.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.24.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.24.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.24.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.24.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.24.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.24.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.24.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.24.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.24.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.24.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.24.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.24.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.24.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.24.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.24.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.24.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.24.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.24.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.24.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.25.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.25.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.25.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.25.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.25.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.25.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.25.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.25.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.25.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.25.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.25.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.25.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.25.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.25.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.25.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.25.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.25.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.25.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.25.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.25.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.25.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.25.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.25.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.25.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.25.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.25.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.25.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.25.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.25.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.25.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.26.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.26.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.26.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.26.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.26.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.26.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.26.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.26.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.26.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.26.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.26.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.26.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.26.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.26.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.26.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.26.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.26.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.26.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.26.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.26.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.26.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.26.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.26.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.26.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.26.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.26.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.26.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.26.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.26.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.26.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.27.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.27.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.27.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.27.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.27.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.27.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.27.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.27.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.27.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.27.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.27.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.27.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.27.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.27.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.27.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.27.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.27.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.27.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.27.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.27.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.27.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.27.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.27.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.27.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.27.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.27.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.27.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.27.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.27.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.27.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.28.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.28.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.28.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.28.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.28.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.28.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.28.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.28.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.28.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.28.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.28.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.28.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.28.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.28.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.28.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.28.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.28.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.28.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.28.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.28.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.28.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.28.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.28.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.28.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.28.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.28.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.28.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.28.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.28.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.28.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.29.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.29.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.29.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.29.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.29.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.29.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.29.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.29.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.29.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.29.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.29.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.29.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.29.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.29.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.29.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.29.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.29.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.29.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.29.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.29.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.29.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.29.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.29.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.29.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.29.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.29.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.29.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.29.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.29.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.29.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.30.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.30.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.30.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.30.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.30.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.30.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.30.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.30.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.30.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.30.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.30.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.30.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.30.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.30.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.30.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.30.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.30.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.30.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.30.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.30.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.30.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.30.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.30.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.30.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.30.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.30.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.30.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.30.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.30.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.30.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.31.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.31.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.31.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.31.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.31.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.31.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.31.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.31.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.31.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.31.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.31.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.31.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.31.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.31.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.31.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.31.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.31.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.31.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.31.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.31.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.31.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.31.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.31.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.31.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.31.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.31.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.31.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.31.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.31.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.31.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.32.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.32.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.32.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.32.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.32.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.32.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.32.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.32.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.32.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.32.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.32.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.32.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.32.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.32.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.32.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.32.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.32.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.32.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.32.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.32.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.32.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.32.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.32.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.32.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.32.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.32.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.32.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.32.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.32.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.32.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.33.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.33.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.33.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.33.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.33.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.33.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.33.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.33.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.33.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.33.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.33.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.33.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.33.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.33.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.33.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.33.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.33.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.33.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.33.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.33.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.33.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.33.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.33.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.33.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.33.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.33.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.33.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.33.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.33.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.33.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.34.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.34.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.34.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.34.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.34.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.34.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.34.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.34.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.34.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.34.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.34.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.34.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.34.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.34.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.34.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.34.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.34.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.34.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.34.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.34.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.34.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.34.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.34.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.34.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.34.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.34.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.34.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.34.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.34.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.34.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.35.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.35.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.35.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.35.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.35.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.35.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.35.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.35.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.35.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.35.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.35.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.35.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.35.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.35.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.35.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.35.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.35.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.35.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.35.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.35.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.35.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.35.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.35.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.35.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.35.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.35.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.35.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.35.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.35.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.35.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.36.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.36.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.36.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.36.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.36.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.36.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.36.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.36.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.36.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.36.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.36.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.36.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.36.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.36.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.36.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.36.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.36.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.36.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.36.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.36.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.36.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.36.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.36.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.36.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.36.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.36.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.36.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.36.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.36.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.36.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.37.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.37.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.37.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.37.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.37.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.37.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.37.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.37.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.37.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.37.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.37.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.37.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.37.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.37.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.37.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.37.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.37.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.37.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.37.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.37.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.37.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.37.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.37.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.37.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.37.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.37.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.37.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.37.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.37.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.37.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.38.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.38.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.38.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.38.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.38.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.38.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.38.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.38.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.38.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.38.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.38.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.38.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.38.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.38.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.38.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.38.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.38.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.38.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.38.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.38.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.38.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.38.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.38.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.38.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.38.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.38.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.38.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.38.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.38.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.38.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.39.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.39.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.39.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.39.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.39.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.39.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.39.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.39.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.39.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.39.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.39.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.39.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.39.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.39.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.39.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.39.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.39.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.39.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.39.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.39.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.39.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.39.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.39.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.39.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.39.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.39.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.39.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.39.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.39.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.39.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.40.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.40.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.40.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.40.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.40.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.40.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.40.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.40.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.40.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.40.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.40.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.40.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.40.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.40.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.40.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.40.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.40.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.40.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.40.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.40.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.40.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.40.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.40.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.40.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.40.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.40.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.40.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.40.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.40.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.40.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.41.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.41.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.41.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.41.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.41.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.41.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.41.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.41.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.41.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.41.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.41.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.41.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.41.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.41.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.41.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.41.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.41.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.41.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.41.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.41.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.41.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.41.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.41.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.41.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.41.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.41.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.41.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.41.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.41.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.41.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.42.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.42.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.42.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.42.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.42.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.42.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.42.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.42.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.42.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.42.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.42.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.42.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.42.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.42.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.42.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.42.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.42.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.42.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.42.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.42.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.42.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.42.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.42.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.42.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.42.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.42.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.42.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.42.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.42.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.42.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.43.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.43.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.43.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.43.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.43.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.43.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.43.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.43.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.43.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.43.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.43.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.43.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.43.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.43.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.43.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.43.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.43.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.43.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.43.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.43.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.43.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.43.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.43.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.43.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.43.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.43.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.43.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.43.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.43.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.43.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.44.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.44.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.44.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.44.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.44.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.44.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.44.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.44.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.44.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.44.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.44.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.44.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.44.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.44.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.44.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.44.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.44.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.44.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.44.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.44.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.44.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.44.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.44.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.44.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.44.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.44.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.44.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.44.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.44.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.44.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.45.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.45.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.45.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.45.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.45.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.45.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.45.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.45.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.45.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.45.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.45.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.45.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.45.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.45.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.45.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.45.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.45.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.45.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.45.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.45.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.45.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.45.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.45.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.45.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.45.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.45.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.45.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.45.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.45.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.45.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.46.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.46.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.46.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.46.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.46.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.46.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.46.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.46.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.46.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.46.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.46.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.46.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.46.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.46.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.46.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.46.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.46.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.46.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.46.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.46.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.46.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.46.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.46.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.46.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.46.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.46.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.46.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.46.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.46.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.46.txt_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.47.attn.img_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.47.attn.img_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.47.attn.img_qkv.alpha": [],
+    "transformer.transformer_blocks.47.attn.txt_qkv.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.47.attn.txt_qkv.lora_up.weight": [
+      4608,
+      16
+    ],
+    "transformer.transformer_blocks.47.attn.txt_qkv.alpha": [],
+    "transformer.transformer_blocks.47.attn.to_out.0.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.47.attn.to_out.0.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.47.attn.to_out.0.alpha": [],
+    "transformer.transformer_blocks.47.attn.to_add_out.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.47.attn.to_add_out.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.47.attn.to_add_out.alpha": [],
+    "transformer.transformer_blocks.47.img_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.47.img_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.47.img_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.47.img_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.47.img_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.47.img_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.47.img_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.47.img_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.47.img_mlp.w3.alpha": [],
+    "transformer.transformer_blocks.47.txt_mlp.w1.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.47.txt_mlp.w1.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.47.txt_mlp.w1.alpha": [],
+    "transformer.transformer_blocks.47.txt_mlp.w2.lora_down.weight": [
+      16,
+      4096
+    ],
+    "transformer.transformer_blocks.47.txt_mlp.w2.lora_up.weight": [
+      1536,
+      16
+    ],
+    "transformer.transformer_blocks.47.txt_mlp.w2.alpha": [],
+    "transformer.transformer_blocks.47.txt_mlp.w3.lora_down.weight": [
+      16,
+      1536
+    ],
+    "transformer.transformer_blocks.47.txt_mlp.w3.lora_up.weight": [
+      4096,
+      16
+    ],
+    "transformer.transformer_blocks.47.txt_mlp.w3.alpha": []
+  }
+}

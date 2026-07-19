@@ -1,0 +1,303 @@
+/* shell.css — Global layout, icon rail, topbar, design tokens */
+/* Loaded AFTER canvas.css so overrides take precedence */
+
+/* Shell tokens (namespaced to avoid canvas.css collision) */
+:root {
+    --shell-bg-base:       #0f0f13;
+    --shell-bg-surface:    #1a1a24;
+    --shell-bg-panel:      #1f1f2e;
+    --shell-bg-hover:      #252538;
+    --shell-accent:        #6c6af5;
+    --shell-accent-hover:  #8583ff;
+    --shell-text:          #e8e8f0;
+    --shell-text-muted:    #6b6b80;
+    --shell-border:        #2a2a3a;
+    --shell-success:       #48bb78;
+    --shell-error:         #fc8181;
+    --shell-warn:          #f6ad55;
+    --shell-rail-width:    52px;
+    --shell-topbar-height: 44px;
+    --shell-font:          'Inter', system-ui, sans-serif;
+}
+
+/* Body: column flex for topbar + app-body */
+body {
+    display: flex;
+    flex-direction: column;
+    background: var(--shell-bg-base);
+    width: 100%;  /* override canvas.css 100vw which ignores scrollbar width */
+}
+
+/* ===== Top Bar ===== */
+#topbar {
+    height: var(--shell-topbar-height);
+    min-height: var(--shell-topbar-height);
+    background: var(--shell-bg-surface);
+    border-bottom: 1px solid var(--shell-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    z-index: 200;
+    position: relative;
+}
+
+.topbar-left,
+.topbar-center,
+.topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.topbar-icon-btn {
+    background: none;
+    border: none;
+    color: var(--shell-text-muted, #888);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    opacity: 0.6;
+    transition: opacity 0.15s;
+}
+.topbar-icon-btn:hover {
+    opacity: 1;
+    background: rgba(255,255,255,0.08);
+}
+
+.topbar-center {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.model-badge {
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 12px;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--shell-text-muted);
+    user-select: none;
+}
+
+.queue-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+}
+
+.queue-dot.idle    { background: var(--shell-success); }
+.queue-dot.running { background: var(--shell-warn); }
+
+.queue-label {
+    font-size: 12px;
+    color: var(--shell-text-muted);
+}
+
+/* ===== App Body (rail + content) ===== */
+#app-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+}
+
+/* ===== Icon Rail ===== */
+#icon-rail {
+    width: var(--shell-rail-width);
+    min-width: var(--shell-rail-width);
+    background: var(--shell-bg-surface);
+    border-right: 1px solid var(--shell-border);
+    display: flex;
+    flex-direction: column;
+    padding: 8px 0;
+    z-index: 200;
+}
+
+.rail-top {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+
+.rail-bottom {
+    margin-top: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-bottom: 8px;
+}
+
+.nav-btn {
+    width: 40px;
+    height: 40px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    transition: background 150ms ease, color 150ms ease;
+    padding: 0;
+    font-family: var(--shell-font);
+}
+
+.nav-btn:hover {
+    background: var(--shell-bg-hover);
+    color: var(--shell-text);
+}
+
+.nav-btn.active {
+    background: var(--shell-accent);
+    color: #fff;
+}
+
+.nav-btn svg {
+    width: 20px;
+    height: 20px;
+    pointer-events: none;
+}
+
+/* ===== Tooltips ===== */
+.nav-btn .tooltip {
+    position: absolute;
+    left: calc(100% + 12px);
+    top: 50%;
+    transform: translateY(-50%);
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    color: var(--shell-text);
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 150ms ease;
+    z-index: 300;
+}
+
+.nav-btn:hover .tooltip {
+    opacity: 1;
+}
+
+/* ===== Content Area ===== */
+#content-area {
+    flex: 1;
+    min-width: 0;
+    position: relative;
+    background: var(--shell-bg-base);
+}
+
+/* ===== Tab Panels ===== */
+.tab-panel {
+    position: absolute;
+    inset: 0;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.placeholder {
+    margin: auto;
+    color: var(--shell-text-muted);
+    font-size: 14px;
+    user-select: none;
+}
+
+/* ===== Workflows Panel Overrides ===== */
+/* Override canvas.css #main height — now relative to panel, not viewport */
+#panel-workflows #main {
+    height: auto;
+    flex: 1;
+    min-height: 0;
+}
+
+/* ===== Server Console ===== */
+#sf-console {
+    position: fixed;
+    bottom: 0;
+    left: var(--shell-rail-width);
+    right: 0;
+    height: 240px;
+    background: #0a0a12;
+    border-top: 1px solid var(--shell-border);
+    z-index: 400;
+    display: flex;
+    flex-direction: column;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 11px;
+}
+
+#sf-console-header {
+    display: flex;
+    align-items: center;
+    padding: 4px 12px;
+    background: var(--shell-bg-surface);
+    border-bottom: 1px solid var(--shell-border);
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+#sf-console-header span {
+    flex: 1;
+    color: var(--shell-text-muted);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+#sf-console-header button {
+    background: none;
+    border: none;
+    color: var(--shell-text-muted);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+#sf-console-header button:hover {
+    background: var(--shell-bg-hover);
+    color: var(--shell-text);
+}
+
+#sf-console-log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 12px;
+    line-height: 1.5;
+    scrollbar-width: thin;
+}
+
+#sf-console-log .log-line {
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+#sf-console-log .log-ts {
+    color: #555;
+    margin-right: 8px;
+}
+
+#sf-console-log .log-type {
+    font-weight: 600;
+    margin-right: 6px;
+}
+
+.log-type-status { color: #48bb78; }
+.log-type-executing { color: #6c6af5; }
+.log-type-progress { color: #f6ad55; }
+.log-type-executed { color: #48bb78; }
+.log-type-execution_start { color: #6c6af5; }
+.log-type-execution_success { color: #48bb78; }
+.log-type-execution_error { color: #fc8181; }
+.log-type-error { color: #fc8181; }
+.log-type-connected { color: #48bb78; }
+.log-type-disconnected { color: #fc8181; }
+.log-type-default { color: #9898b0; }

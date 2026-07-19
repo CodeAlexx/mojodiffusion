@@ -1,0 +1,24 @@
+{
+  "accepted_sampler_parity": false,
+  "accepted_speed_parity": false,
+  "direct_base": true,
+  "dry_run": false,
+  "elapsed_seconds": 225.13363201200264,
+  "gpu_memory_baseline_mib": 1183,
+  "output_png": "/home/alex/serenity-trainer/parity/zimage_mojo_speed.png",
+  "peak_vram_mib": 22238,
+  "request": "direct-base",
+  "request_blockers": [],
+  "request_valid": true,
+  "result_manifest": "/home/alex/serenity-trainer/parity/zimage_mojo_speed.png.zimage_result.json",
+  "returncode": 0,
+  "run_command": [
+    "/tmp/zimage_generate_prod",
+    "base",
+    "/home/alex/serenity-trainer/parity/zimage_mojo_speed.png",
+    "/home/alex/Serenity/training_samples/eri2_5prompts_1024.json",
+    "p1"
+  ],
+  "sampler_bin": "/tmp/zimage_generate_prod",
+  "schema": "serenity.zimage.sample_supervisor.v1"
+}

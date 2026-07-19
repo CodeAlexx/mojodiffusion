@@ -1,0 +1,7 @@
+HL=32
+WL=32
+CAPLEN=173
+img_tokens=256
+img_padded=256
+cap_padded=192
+unified=448

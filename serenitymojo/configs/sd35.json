@@ -1,0 +1,44 @@
+{
+  "model_type": "STABLE_DIFFUSION_35",
+  "base_model_name": "models/sd3.5/transformer.safetensors",
+  "vae": "models/sd3.5/transformer.safetensors",
+  "validation_prompts_file": "serenitymojo/configs/sample_prompts.example.json",
+
+  "inner_dim": 2432,
+  "in_channels": 64,
+  "joint_attention_dim": 4096,
+  "out_channels": 64,
+  "num_double": 38,
+  "num_single": 0,
+  "num_heads": 38,
+  "head_dim": 64,
+  "mlp_hidden": 9728,
+  "timestep_dim": 256,
+
+  "learning_rate": 1e-4,
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 2000,
+  "save_every": 500,
+  "sample_every": 500,
+
+  "training_method": "LORA",
+  "train_dtype": "BFLOAT_16",
+  "output_dtype": "BFLOAT_16",
+  "gradient_checkpointing": "ON",
+  "cache_dir": "output/sd35_train/cache/data",
+  "output_model_destination": "output/sd35_train/checkpoints/sd35_lora_last.safetensors",
+
+  "optimizer": {
+    "optimizer": "ADAMW",
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "fused": false,
+    "fused_back_pass": false,
+    "stochastic_rounding": false
+  }
+}

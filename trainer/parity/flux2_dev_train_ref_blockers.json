@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "producer": "scripts/flux2_dev_dump_train_ref.py",
+  "dry_run": true,
+  "one_step_dump_produced": false,
+  "numeric_parity_status": "none",
+  "numeric_parity_note": "Dry-run/config checks are structural only. There is no Flux2 dev numeric parity until Serenity CUDA reference tensors exist.",
+  "dry_run_checks_are_structural_only": true,
+  "serenity": "/home/alex/Serenity",
+  "config": "/home/alex/Serenity/configs/flux2_dev_100step_baseline.json",
+  "config_exists": false,
+  "config_error": null,
+  "out_dir": "/home/alex/serenity-trainer/parity",
+  "prefix": "flux2_dev_train_ref",
+  "max_steps": 1,
+  "torch": "2.9.1+cu128",
+  "cuda_available": false,
+  "cuda_device_count": 0,
+  "train_device": null,
+  "temp_device": null,
+  "model_type": null,
+  "training_method": null,
+  "cache": null,
+  "local_model": null,
+  "local_partial_flux2_dev_transformer_config": {
+    "path": "/home/alex/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-dev/snapshots/26afe3a78bb242c0a8bb181dcc8937bb16e5c66c/transformer/config.json",
+    "exists": true,
+    "num_attention_heads": 48,
+    "num_layers": 8,
+    "num_single_layers": 48,
+    "joint_attention_dim": 15360,
+    "serenity_trainer_is_dev_condition": "transformer.config.num_attention_heads == 48",
+    "structural_dev_hint": true,
+    "scope": "partial transformer config only; no model_index, scheduler, VAE, tokenizer, text_encoder, cache, train config, baseline, or numeric parity"
+  },
+  "reference_tensors": {
+    "required_for_numeric_parity": [
+      "flux2_dev_train_ref_meta.json",
+      "flux2_dev_train_ref_step000.safetensors",
+      "flux2_dev_train_ref_step000_adapters.safetensors"
+    ],
+    "files": {
+      "flux2_dev_train_ref_meta.json": {
+        "path": "/home/alex/serenity-trainer/parity/flux2_dev_train_ref_meta.json",
+        "exists": false
+      },
+      "flux2_dev_train_ref_step000.safetensors": {
+        "path": "/home/alex/serenity-trainer/parity/flux2_dev_train_ref_step000.safetensors",
+        "exists": false
+      },
+      "flux2_dev_train_ref_step000_adapters.safetensors": {
+        "path": "/home/alex/serenity-trainer/parity/flux2_dev_train_ref_step000_adapters.safetensors",
+        "exists": false
+      }
+    },
+    "complete": false,
+    "numeric_parity_status": "none",
+    "note": "Dry-run/config checks are structural only. There is no Flux2 dev numeric parity until Serenity CUDA reference tensors exist."
+  },
+  "structured_blockers": [
+    {
+      "id": "missing_flux2_dev_reference_config",
+      "category": "config",
+      "message": "No Flux2 dev Serenity train config exists at the default path.",
+      "details": {
+        "path": "/home/alex/Serenity/configs/flux2_dev_100step_baseline.json",
+        "expected_action": "Create a real Serenity Flux2 dev CUDA config before numeric parity."
+      }
+    },
+    {
+      "id": "cuda_unavailable_in_current_process",
+      "category": "cuda_reference",
+      "message": "Current process does not report CUDA; dry-run remains structural only.",
+      "details": {
+        "cuda_available": false,
+        "cuda_device_count": 0
+      }
+    },
+    {
+      "id": "missing_serenity_cuda_reference_tensors",
+      "category": "numeric_parity",
+      "message": "Dry-run/config checks are structural only. There is no Flux2 dev numeric parity until Serenity CUDA reference tensors exist.",
+      "details": {
+        "required_for_numeric_parity": [
+          "flux2_dev_train_ref_meta.json",
+          "flux2_dev_train_ref_step000.safetensors",
+          "flux2_dev_train_ref_step000_adapters.safetensors"
+        ],
+        "complete": false,
+        "numeric_parity_status": "none"
+      }
+    }
+  ],
+  "blocked": true
+}

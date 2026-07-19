@@ -1,0 +1,130 @@
+{
+  "seed": 1234,
+  "timestep": 250,
+  "t_model": 0.25,
+  "t_model_formula": "timestep / 1000 (BaseFlux2Setup.py:144)",
+  "sigma": 0.251,
+  "sigma_formula": "(timestep + 1) / 1000  (FlowMatch discrete; fixed RNG-free)",
+  "guidance_scale": 1.0,
+  "guidance_embeds": false,
+  "device": "cuda",
+  "compute_dtype": "bfloat16",
+  "transformer_dir": "/home/alex/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-9B/snapshots/32773329fbe7e81a90ef971740e8ba4b0364ecf3/transformer",
+  "vae_dir": "/home/alex/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-9B/snapshots/32773329fbe7e81a90ef971740e8ba4b0364ecf3/vae",
+  "batch_norm_eps": 0.0001,
+  "HL_img": 32,
+  "WL_img": 32,
+  "HL_patch": 16,
+  "WL_patch": 16,
+  "LATENT_CH": 32,
+  "IN_CH": 128,
+  "N_IMG": 256,
+  "NTXT": 48,
+  "txt_dim": 12288,
+  "velocity_convention": "diffusers Flux2 transformer .sample, unpacked (unpack_latents) then unpatchified (unpatchify_latents) -> reference trainer model_output_data['predicted'] shape [1,32,32,32]. Flux2 does NOT negate the model output (unlike Z-Image): velocity is the raw predicted flow.",
+  "input_assembly": {
+    "description": "BaseFlux2Setup.predict order: patchify_latents(latent.float) -> scale_latents (VAE bn) -> noise*sigma + scaled*(1-sigma) -> pack_latents -> transformer(hidden_states=packed, timestep/1000, encoder_hidden_states=txt, txt_ids, img_ids, guidance=None) -> unpack_latents -> unpatchify_latents.",
+    "img_ids": "prepare_latent_image_ids on [1,128,16,16] -> [1,256,4]",
+    "txt_ids": "prepare_text_ids on [1,NTXT,12288] -> [1,NTXT,4]",
+    "guidance": "None (guidance_embeds=False)"
+  },
+  "files": {
+    "klein_fwd.safetensors": {
+      "latent": {
+        "shape": [
+          1,
+          32,
+          32,
+          32
+        ],
+        "dtype": "float32",
+        "note": "raw VAE mean latent (pre-patchify/scale); = Flux2LoRASpec.latent"
+      },
+      "txt": {
+        "shape": [
+          48,
+          12288
+        ],
+        "dtype": "float32",
+        "note": "text hidden states fed as encoder_hidden_states[0]"
+      },
+      "velocity": {
+        "shape": [
+          1,
+          32,
+          32,
+          32
+        ],
+        "dtype": "float32",
+        "note": "transformer output, unpacked+unpatchified (reference trainer 'predicted')"
+      },
+      "velocity_packed": {
+        "shape": [
+          1,
+          256,
+          128
+        ],
+        "dtype": "float32",
+        "note": "RAW transformer .sample BEFORE unpack/unpatchify; byte-identical to klein_inference_forward output (packed [N_IMG,128]); compare the smoke against THIS"
+      },
+      "noise": {
+        "shape": [
+          1,
+          32,
+          32,
+          32
+        ],
+        "dtype": "float32",
+        "note": "raw noise (pre-patchify); patchify+combine on Mojo side"
+      },
+      "scaled_noisy_patched": {
+        "shape": [
+          1,
+          128,
+          16,
+          16
+        ],
+        "dtype": "float32",
+        "note": "RNG-free transformer image input BEFORE pack_latents; feed this to bypass torch RNG entirely"
+      },
+      "flow_target": {
+        "shape": [
+          1,
+          32,
+          32,
+          32
+        ],
+        "dtype": "float32",
+        "note": "unpatchified flow target (noise - scaled_latent)"
+      },
+      "bn_mean": {
+        "shape": [
+          128
+        ],
+        "dtype": "float32",
+        "note": "VAE bn.running_mean for scale_latents"
+      },
+      "bn_var": {
+        "shape": [
+          128
+        ],
+        "dtype": "float32",
+        "note": "VAE bn.running_var for scale_latents (eps=1e-4)"
+      }
+    }
+  },
+  "velocity_stats": {
+    "shape": [
+      1,
+      32,
+      32,
+      32
+    ],
+    "mean": -0.011065073311328888,
+    "std": 0.45624563097953796,
+    "min": -2.328125,
+    "max": 1.8203125,
+    "nonfinite": 0,
+    "raw_mse_vs_flow_target": 1.532597541809082
+  }
+}

@@ -1,0 +1,244 @@
+{"dtype": "BF16", "fnv1a64": 15329864874268555858, "name": "decoder.conv_in.bias", "offset": 0, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 13183303825883384703, "name": "decoder.conv_in.weight", "offset": 1024, "shape": [512, 16, 3, 3], "size": 147456}
+{"dtype": "BF16", "fnv1a64": 11850984563522255838, "name": "decoder.conv_norm_out.bias", "offset": 148480, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 8376193415361804960, "name": "decoder.conv_norm_out.weight", "offset": 148736, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 1708618464915163849, "name": "decoder.conv_out.bias", "offset": 148992, "shape": [3], "size": 6}
+{"dtype": "BF16", "fnv1a64": 13328965520378577261, "name": "decoder.conv_out.weight", "offset": 148998, "shape": [3, 128, 3, 3], "size": 6912}
+{"dtype": "BF16", "fnv1a64": 18025879645455623845, "name": "decoder.mid_block.attentions.0.group_norm.bias", "offset": 155910, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 11137538261932598427, "name": "decoder.mid_block.attentions.0.group_norm.weight", "offset": 156934, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 14914279201077721400, "name": "decoder.mid_block.attentions.0.to_k.bias", "offset": 157958, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 961072382991653809, "name": "decoder.mid_block.attentions.0.to_k.weight", "offset": 158982, "shape": [512, 512], "size": 524288}
+{"dtype": "BF16", "fnv1a64": 12904686191759520656, "name": "decoder.mid_block.attentions.0.to_out.0.bias", "offset": 683270, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 12180465358856065674, "name": "decoder.mid_block.attentions.0.to_out.0.weight", "offset": 684294, "shape": [512, 512], "size": 524288}
+{"dtype": "BF16", "fnv1a64": 2669467157887705913, "name": "decoder.mid_block.attentions.0.to_q.bias", "offset": 1208582, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 3201992426188882095, "name": "decoder.mid_block.attentions.0.to_q.weight", "offset": 1209606, "shape": [512, 512], "size": 524288}
+{"dtype": "BF16", "fnv1a64": 17066887480838741162, "name": "decoder.mid_block.attentions.0.to_v.bias", "offset": 1733894, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 15221627859060462603, "name": "decoder.mid_block.attentions.0.to_v.weight", "offset": 1734918, "shape": [512, 512], "size": 524288}
+{"dtype": "BF16", "fnv1a64": 16947014364874147976, "name": "decoder.mid_block.resnets.0.conv1.bias", "offset": 2259206, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16654519838444960041, "name": "decoder.mid_block.resnets.0.conv1.weight", "offset": 2260230, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 9106000697092447055, "name": "decoder.mid_block.resnets.0.conv2.bias", "offset": 6978822, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2498859118440607441, "name": "decoder.mid_block.resnets.0.conv2.weight", "offset": 6979846, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 10064680719772133023, "name": "decoder.mid_block.resnets.0.norm1.bias", "offset": 11698438, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 6987272509609884035, "name": "decoder.mid_block.resnets.0.norm1.weight", "offset": 11699462, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2628939373740461075, "name": "decoder.mid_block.resnets.0.norm2.bias", "offset": 11700486, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 9426325380346688427, "name": "decoder.mid_block.resnets.0.norm2.weight", "offset": 11701510, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16707213636823077047, "name": "decoder.mid_block.resnets.1.conv1.bias", "offset": 11702534, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 6729991376362881102, "name": "decoder.mid_block.resnets.1.conv1.weight", "offset": 11703558, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 910553813841689613, "name": "decoder.mid_block.resnets.1.conv2.bias", "offset": 16422150, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 533402404393721791, "name": "decoder.mid_block.resnets.1.conv2.weight", "offset": 16423174, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 15369088837579639831, "name": "decoder.mid_block.resnets.1.norm1.bias", "offset": 21141766, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 12690450681755356056, "name": "decoder.mid_block.resnets.1.norm1.weight", "offset": 21142790, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5096564599170094693, "name": "decoder.mid_block.resnets.1.norm2.bias", "offset": 21143814, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 15857312217419303880, "name": "decoder.mid_block.resnets.1.norm2.weight", "offset": 21144838, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 79860043885069979, "name": "decoder.up_blocks.0.resnets.0.conv1.bias", "offset": 21145862, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 8274193320053558624, "name": "decoder.up_blocks.0.resnets.0.conv1.weight", "offset": 21146886, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 3162842442139334717, "name": "decoder.up_blocks.0.resnets.0.conv2.bias", "offset": 25865478, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 6184789754233344263, "name": "decoder.up_blocks.0.resnets.0.conv2.weight", "offset": 25866502, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 10622243324704515939, "name": "decoder.up_blocks.0.resnets.0.norm1.bias", "offset": 30585094, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2092524123955398681, "name": "decoder.up_blocks.0.resnets.0.norm1.weight", "offset": 30586118, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 17968541251039645920, "name": "decoder.up_blocks.0.resnets.0.norm2.bias", "offset": 30587142, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 8658954647896161782, "name": "decoder.up_blocks.0.resnets.0.norm2.weight", "offset": 30588166, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 15743106548427481063, "name": "decoder.up_blocks.0.resnets.1.conv1.bias", "offset": 30589190, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 1831667982769151679, "name": "decoder.up_blocks.0.resnets.1.conv1.weight", "offset": 30590214, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 15838897200996442429, "name": "decoder.up_blocks.0.resnets.1.conv2.bias", "offset": 35308806, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 17798239065635263336, "name": "decoder.up_blocks.0.resnets.1.conv2.weight", "offset": 35309830, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 6874165303712543640, "name": "decoder.up_blocks.0.resnets.1.norm1.bias", "offset": 40028422, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 4044865704769196060, "name": "decoder.up_blocks.0.resnets.1.norm1.weight", "offset": 40029446, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 12448480226908618532, "name": "decoder.up_blocks.0.resnets.1.norm2.bias", "offset": 40030470, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 6080882314480347650, "name": "decoder.up_blocks.0.resnets.1.norm2.weight", "offset": 40031494, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 15402090866457573945, "name": "decoder.up_blocks.0.resnets.2.conv1.bias", "offset": 40032518, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16232438656397822483, "name": "decoder.up_blocks.0.resnets.2.conv1.weight", "offset": 40033542, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 4682322938721083072, "name": "decoder.up_blocks.0.resnets.2.conv2.bias", "offset": 44752134, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 4247846930369691079, "name": "decoder.up_blocks.0.resnets.2.conv2.weight", "offset": 44753158, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 12981275398053940706, "name": "decoder.up_blocks.0.resnets.2.norm1.bias", "offset": 49471750, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 10635631988146567347, "name": "decoder.up_blocks.0.resnets.2.norm1.weight", "offset": 49472774, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 6399681517056242590, "name": "decoder.up_blocks.0.resnets.2.norm2.bias", "offset": 49473798, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 7436788170891160209, "name": "decoder.up_blocks.0.resnets.2.norm2.weight", "offset": 49474822, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 10580252794096087917, "name": "decoder.up_blocks.0.upsamplers.0.conv.bias", "offset": 49475846, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 3484564575561122953, "name": "decoder.up_blocks.0.upsamplers.0.conv.weight", "offset": 49476870, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 10009185810784169291, "name": "decoder.up_blocks.1.resnets.0.conv1.bias", "offset": 54195462, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5599698169584534597, "name": "decoder.up_blocks.1.resnets.0.conv1.weight", "offset": 54196486, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 3800378181625461855, "name": "decoder.up_blocks.1.resnets.0.conv2.bias", "offset": 58915078, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 8990650248433641378, "name": "decoder.up_blocks.1.resnets.0.conv2.weight", "offset": 58916102, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 15962288596672234981, "name": "decoder.up_blocks.1.resnets.0.norm1.bias", "offset": 63634694, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 12636959835471576682, "name": "decoder.up_blocks.1.resnets.0.norm1.weight", "offset": 63635718, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 6861092716768918053, "name": "decoder.up_blocks.1.resnets.0.norm2.bias", "offset": 63636742, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 8625139173562130740, "name": "decoder.up_blocks.1.resnets.0.norm2.weight", "offset": 63637766, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16299498607545823885, "name": "decoder.up_blocks.1.resnets.1.conv1.bias", "offset": 63638790, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5773659783374758904, "name": "decoder.up_blocks.1.resnets.1.conv1.weight", "offset": 63639814, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 7516760349022176683, "name": "decoder.up_blocks.1.resnets.1.conv2.bias", "offset": 68358406, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 13921491461434426255, "name": "decoder.up_blocks.1.resnets.1.conv2.weight", "offset": 68359430, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 742121673785782020, "name": "decoder.up_blocks.1.resnets.1.norm1.bias", "offset": 73078022, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 13902647133270504165, "name": "decoder.up_blocks.1.resnets.1.norm1.weight", "offset": 73079046, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5376007479330925864, "name": "decoder.up_blocks.1.resnets.1.norm2.bias", "offset": 73080070, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 18247037001457329212, "name": "decoder.up_blocks.1.resnets.1.norm2.weight", "offset": 73081094, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 11777146740662913245, "name": "decoder.up_blocks.1.resnets.2.conv1.bias", "offset": 73082118, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2668174030093757252, "name": "decoder.up_blocks.1.resnets.2.conv1.weight", "offset": 73083142, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 2702635914325705722, "name": "decoder.up_blocks.1.resnets.2.conv2.bias", "offset": 77801734, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5323123453916737744, "name": "decoder.up_blocks.1.resnets.2.conv2.weight", "offset": 77802758, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 2142451994616823116, "name": "decoder.up_blocks.1.resnets.2.norm1.bias", "offset": 82521350, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 10710637391543165258, "name": "decoder.up_blocks.1.resnets.2.norm1.weight", "offset": 82522374, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 9773644511015654120, "name": "decoder.up_blocks.1.resnets.2.norm2.bias", "offset": 82523398, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 7565907182626674606, "name": "decoder.up_blocks.1.resnets.2.norm2.weight", "offset": 82524422, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2691881325706022361, "name": "decoder.up_blocks.1.upsamplers.0.conv.bias", "offset": 82525446, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 7889878227383630011, "name": "decoder.up_blocks.1.upsamplers.0.conv.weight", "offset": 82526470, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 8747808771822046712, "name": "decoder.up_blocks.2.resnets.0.conv1.bias", "offset": 87245062, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 2845540882863680003, "name": "decoder.up_blocks.2.resnets.0.conv1.weight", "offset": 87245574, "shape": [256, 512, 3, 3], "size": 2359296}
+{"dtype": "BF16", "fnv1a64": 18266407919596599133, "name": "decoder.up_blocks.2.resnets.0.conv2.bias", "offset": 89604870, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 16397367214717425258, "name": "decoder.up_blocks.2.resnets.0.conv2.weight", "offset": 89605382, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 14284632071494311425, "name": "decoder.up_blocks.2.resnets.0.conv_shortcut.bias", "offset": 90785030, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 9550479054728610631, "name": "decoder.up_blocks.2.resnets.0.conv_shortcut.weight", "offset": 90785542, "shape": [256, 512, 1, 1], "size": 262144}
+{"dtype": "BF16", "fnv1a64": 8829450582802561979, "name": "decoder.up_blocks.2.resnets.0.norm1.bias", "offset": 91047686, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16837148994771062838, "name": "decoder.up_blocks.2.resnets.0.norm1.weight", "offset": 91048710, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5679839634417134353, "name": "decoder.up_blocks.2.resnets.0.norm2.bias", "offset": 91049734, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 14026819209167128011, "name": "decoder.up_blocks.2.resnets.0.norm2.weight", "offset": 91050246, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 6557338493379236180, "name": "decoder.up_blocks.2.resnets.1.conv1.bias", "offset": 91050758, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 1360891886693117330, "name": "decoder.up_blocks.2.resnets.1.conv1.weight", "offset": 91051270, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 5397401201034179724, "name": "decoder.up_blocks.2.resnets.1.conv2.bias", "offset": 92230918, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 11681028059119005549, "name": "decoder.up_blocks.2.resnets.1.conv2.weight", "offset": 92231430, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 13855402407887183957, "name": "decoder.up_blocks.2.resnets.1.norm1.bias", "offset": 93411078, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 14576998727537180340, "name": "decoder.up_blocks.2.resnets.1.norm1.weight", "offset": 93411590, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 10304521350031289049, "name": "decoder.up_blocks.2.resnets.1.norm2.bias", "offset": 93412102, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 11903644735028075052, "name": "decoder.up_blocks.2.resnets.1.norm2.weight", "offset": 93412614, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 7857807939711162229, "name": "decoder.up_blocks.2.resnets.2.conv1.bias", "offset": 93413126, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 14739025116003894389, "name": "decoder.up_blocks.2.resnets.2.conv1.weight", "offset": 93413638, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 14786766158738735135, "name": "decoder.up_blocks.2.resnets.2.conv2.bias", "offset": 94593286, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 3975968892743033519, "name": "decoder.up_blocks.2.resnets.2.conv2.weight", "offset": 94593798, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 16996164032681354858, "name": "decoder.up_blocks.2.resnets.2.norm1.bias", "offset": 95773446, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 4488847981516383146, "name": "decoder.up_blocks.2.resnets.2.norm1.weight", "offset": 95773958, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 15879708946208492632, "name": "decoder.up_blocks.2.resnets.2.norm2.bias", "offset": 95774470, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 6021410961635735012, "name": "decoder.up_blocks.2.resnets.2.norm2.weight", "offset": 95774982, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 11500790194386045633, "name": "decoder.up_blocks.2.upsamplers.0.conv.bias", "offset": 95775494, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 3459834245082702541, "name": "decoder.up_blocks.2.upsamplers.0.conv.weight", "offset": 95776006, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 13089467414340671841, "name": "decoder.up_blocks.3.resnets.0.conv1.bias", "offset": 96955654, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 9635575165959814616, "name": "decoder.up_blocks.3.resnets.0.conv1.weight", "offset": 96955910, "shape": [128, 256, 3, 3], "size": 589824}
+{"dtype": "BF16", "fnv1a64": 7586334385990733259, "name": "decoder.up_blocks.3.resnets.0.conv2.bias", "offset": 97545734, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 17478319837042792277, "name": "decoder.up_blocks.3.resnets.0.conv2.weight", "offset": 97545990, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 16391952217646024316, "name": "decoder.up_blocks.3.resnets.0.conv_shortcut.bias", "offset": 97840902, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 4034361486022514845, "name": "decoder.up_blocks.3.resnets.0.conv_shortcut.weight", "offset": 97841158, "shape": [128, 256, 1, 1], "size": 65536}
+{"dtype": "BF16", "fnv1a64": 3618865603023646892, "name": "decoder.up_blocks.3.resnets.0.norm1.bias", "offset": 97906694, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 940258558374228488, "name": "decoder.up_blocks.3.resnets.0.norm1.weight", "offset": 97907206, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 4040149850980330055, "name": "decoder.up_blocks.3.resnets.0.norm2.bias", "offset": 97907718, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 7277422706998500680, "name": "decoder.up_blocks.3.resnets.0.norm2.weight", "offset": 97907974, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 14586043828429753692, "name": "decoder.up_blocks.3.resnets.1.conv1.bias", "offset": 97908230, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 8548205876602298468, "name": "decoder.up_blocks.3.resnets.1.conv1.weight", "offset": 97908486, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 7726826284848546024, "name": "decoder.up_blocks.3.resnets.1.conv2.bias", "offset": 98203398, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 14341243160791241598, "name": "decoder.up_blocks.3.resnets.1.conv2.weight", "offset": 98203654, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 13141472332056106111, "name": "decoder.up_blocks.3.resnets.1.norm1.bias", "offset": 98498566, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 2543353254561181209, "name": "decoder.up_blocks.3.resnets.1.norm1.weight", "offset": 98498822, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 1373029387082698306, "name": "decoder.up_blocks.3.resnets.1.norm2.bias", "offset": 98499078, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 15340025730434437342, "name": "decoder.up_blocks.3.resnets.1.norm2.weight", "offset": 98499334, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 435048251846223482, "name": "decoder.up_blocks.3.resnets.2.conv1.bias", "offset": 98499590, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 16083082730909257042, "name": "decoder.up_blocks.3.resnets.2.conv1.weight", "offset": 98499846, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 5792462005901006574, "name": "decoder.up_blocks.3.resnets.2.conv2.bias", "offset": 98794758, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 8590392741802213945, "name": "decoder.up_blocks.3.resnets.2.conv2.weight", "offset": 98795014, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 1662497039090843799, "name": "decoder.up_blocks.3.resnets.2.norm1.bias", "offset": 99089926, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 13440825397053167487, "name": "decoder.up_blocks.3.resnets.2.norm1.weight", "offset": 99090182, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 15772878451636429666, "name": "decoder.up_blocks.3.resnets.2.norm2.bias", "offset": 99090438, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 9307382921544638218, "name": "decoder.up_blocks.3.resnets.2.norm2.weight", "offset": 99090694, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 14584871393737099328, "name": "encoder.conv_in.bias", "offset": 99090950, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 12840435548774465141, "name": "encoder.conv_in.weight", "offset": 99091206, "shape": [128, 3, 3, 3], "size": 6912}
+{"dtype": "BF16", "fnv1a64": 7536441362966037562, "name": "encoder.conv_norm_out.bias", "offset": 99098118, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 4134959446010624655, "name": "encoder.conv_norm_out.weight", "offset": 99099142, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 4218704959498778311, "name": "encoder.conv_out.bias", "offset": 99100166, "shape": [32], "size": 64}
+{"dtype": "BF16", "fnv1a64": 11122927697063054978, "name": "encoder.conv_out.weight", "offset": 99100230, "shape": [32, 512, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 363039503679641345, "name": "encoder.down_blocks.0.downsamplers.0.conv.bias", "offset": 99395142, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 15758448256445431131, "name": "encoder.down_blocks.0.downsamplers.0.conv.weight", "offset": 99395398, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 16919097769091226235, "name": "encoder.down_blocks.0.resnets.0.conv1.bias", "offset": 99690310, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 12481169006524855555, "name": "encoder.down_blocks.0.resnets.0.conv1.weight", "offset": 99690566, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 2384127442818255348, "name": "encoder.down_blocks.0.resnets.0.conv2.bias", "offset": 99985478, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 6718029099213123694, "name": "encoder.down_blocks.0.resnets.0.conv2.weight", "offset": 99985734, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 15566409202886949501, "name": "encoder.down_blocks.0.resnets.0.norm1.bias", "offset": 100280646, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 16920814062740619655, "name": "encoder.down_blocks.0.resnets.0.norm1.weight", "offset": 100280902, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 5377852909989482568, "name": "encoder.down_blocks.0.resnets.0.norm2.bias", "offset": 100281158, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 11974876350204044008, "name": "encoder.down_blocks.0.resnets.0.norm2.weight", "offset": 100281414, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 12435834499881064845, "name": "encoder.down_blocks.0.resnets.1.conv1.bias", "offset": 100281670, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 4958152358369161252, "name": "encoder.down_blocks.0.resnets.1.conv1.weight", "offset": 100281926, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 17626708049204693191, "name": "encoder.down_blocks.0.resnets.1.conv2.bias", "offset": 100576838, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 8181085857206152084, "name": "encoder.down_blocks.0.resnets.1.conv2.weight", "offset": 100577094, "shape": [128, 128, 3, 3], "size": 294912}
+{"dtype": "BF16", "fnv1a64": 10667683660519133024, "name": "encoder.down_blocks.0.resnets.1.norm1.bias", "offset": 100872006, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 14486125921927813478, "name": "encoder.down_blocks.0.resnets.1.norm1.weight", "offset": 100872262, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 10965864887199637441, "name": "encoder.down_blocks.0.resnets.1.norm2.bias", "offset": 100872518, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 3299783351856788837, "name": "encoder.down_blocks.0.resnets.1.norm2.weight", "offset": 100872774, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 1992097400479672584, "name": "encoder.down_blocks.1.downsamplers.0.conv.bias", "offset": 100873030, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 7928105908332376379, "name": "encoder.down_blocks.1.downsamplers.0.conv.weight", "offset": 100873542, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 3302600655714588663, "name": "encoder.down_blocks.1.resnets.0.conv1.bias", "offset": 102053190, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 4315718721826854620, "name": "encoder.down_blocks.1.resnets.0.conv1.weight", "offset": 102053702, "shape": [256, 128, 3, 3], "size": 589824}
+{"dtype": "BF16", "fnv1a64": 8165923163619110062, "name": "encoder.down_blocks.1.resnets.0.conv2.bias", "offset": 102643526, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 17128335370501256871, "name": "encoder.down_blocks.1.resnets.0.conv2.weight", "offset": 102644038, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 12349052866851706957, "name": "encoder.down_blocks.1.resnets.0.conv_shortcut.bias", "offset": 103823686, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 14184515192056625162, "name": "encoder.down_blocks.1.resnets.0.conv_shortcut.weight", "offset": 103824198, "shape": [256, 128, 1, 1], "size": 65536}
+{"dtype": "BF16", "fnv1a64": 6980432568277741856, "name": "encoder.down_blocks.1.resnets.0.norm1.bias", "offset": 103889734, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 2628358294471502474, "name": "encoder.down_blocks.1.resnets.0.norm1.weight", "offset": 103889990, "shape": [128], "size": 256}
+{"dtype": "BF16", "fnv1a64": 1478705473762262527, "name": "encoder.down_blocks.1.resnets.0.norm2.bias", "offset": 103890246, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 15956857910915011399, "name": "encoder.down_blocks.1.resnets.0.norm2.weight", "offset": 103890758, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 8820814248488870320, "name": "encoder.down_blocks.1.resnets.1.conv1.bias", "offset": 103891270, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 1390472104378225240, "name": "encoder.down_blocks.1.resnets.1.conv1.weight", "offset": 103891782, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 145053916502320882, "name": "encoder.down_blocks.1.resnets.1.conv2.bias", "offset": 105071430, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 10015840473653415154, "name": "encoder.down_blocks.1.resnets.1.conv2.weight", "offset": 105071942, "shape": [256, 256, 3, 3], "size": 1179648}
+{"dtype": "BF16", "fnv1a64": 14942059410137060195, "name": "encoder.down_blocks.1.resnets.1.norm1.bias", "offset": 106251590, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 12396594829343069621, "name": "encoder.down_blocks.1.resnets.1.norm1.weight", "offset": 106252102, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 16000969595643132291, "name": "encoder.down_blocks.1.resnets.1.norm2.bias", "offset": 106252614, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 4234679243897004591, "name": "encoder.down_blocks.1.resnets.1.norm2.weight", "offset": 106253126, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 6388563132908877976, "name": "encoder.down_blocks.2.downsamplers.0.conv.bias", "offset": 106253638, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 7090761315688495921, "name": "encoder.down_blocks.2.downsamplers.0.conv.weight", "offset": 106254662, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 867284564401180686, "name": "encoder.down_blocks.2.resnets.0.conv1.bias", "offset": 110973254, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 18054027690751244480, "name": "encoder.down_blocks.2.resnets.0.conv1.weight", "offset": 110974278, "shape": [512, 256, 3, 3], "size": 2359296}
+{"dtype": "BF16", "fnv1a64": 16646973282352824668, "name": "encoder.down_blocks.2.resnets.0.conv2.bias", "offset": 113333574, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 15390650845875229651, "name": "encoder.down_blocks.2.resnets.0.conv2.weight", "offset": 113334598, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 3939188497455868725, "name": "encoder.down_blocks.2.resnets.0.conv_shortcut.bias", "offset": 118053190, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5510140658955674264, "name": "encoder.down_blocks.2.resnets.0.conv_shortcut.weight", "offset": 118054214, "shape": [512, 256, 1, 1], "size": 262144}
+{"dtype": "BF16", "fnv1a64": 5877261429517397394, "name": "encoder.down_blocks.2.resnets.0.norm1.bias", "offset": 118316358, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 3287362969849448616, "name": "encoder.down_blocks.2.resnets.0.norm1.weight", "offset": 118316870, "shape": [256], "size": 512}
+{"dtype": "BF16", "fnv1a64": 11452143944668861263, "name": "encoder.down_blocks.2.resnets.0.norm2.bias", "offset": 118317382, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2731535604329455529, "name": "encoder.down_blocks.2.resnets.0.norm2.weight", "offset": 118318406, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 6206906995274257679, "name": "encoder.down_blocks.2.resnets.1.conv1.bias", "offset": 118319430, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16171154440770883539, "name": "encoder.down_blocks.2.resnets.1.conv1.weight", "offset": 118320454, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 13951369621206657463, "name": "encoder.down_blocks.2.resnets.1.conv2.bias", "offset": 123039046, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 13192829820942374308, "name": "encoder.down_blocks.2.resnets.1.conv2.weight", "offset": 123040070, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 14960229425741832187, "name": "encoder.down_blocks.2.resnets.1.norm1.bias", "offset": 127758662, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 4690220542803754977, "name": "encoder.down_blocks.2.resnets.1.norm1.weight", "offset": 127759686, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 10183568426401782937, "name": "encoder.down_blocks.2.resnets.1.norm2.bias", "offset": 127760710, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 14627172824873462846, "name": "encoder.down_blocks.2.resnets.1.norm2.weight", "offset": 127761734, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 13930064375879075038, "name": "encoder.down_blocks.3.resnets.0.conv1.bias", "offset": 127762758, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 17030167135569814230, "name": "encoder.down_blocks.3.resnets.0.conv1.weight", "offset": 127763782, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 15995590340393679291, "name": "encoder.down_blocks.3.resnets.0.conv2.bias", "offset": 132482374, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16406499817303906869, "name": "encoder.down_blocks.3.resnets.0.conv2.weight", "offset": 132483398, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 873468100694375747, "name": "encoder.down_blocks.3.resnets.0.norm1.bias", "offset": 137201990, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 7969808385216202466, "name": "encoder.down_blocks.3.resnets.0.norm1.weight", "offset": 137203014, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 11820071112980469393, "name": "encoder.down_blocks.3.resnets.0.norm2.bias", "offset": 137204038, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16728297592239662866, "name": "encoder.down_blocks.3.resnets.0.norm2.weight", "offset": 137205062, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 9435279332543554654, "name": "encoder.down_blocks.3.resnets.1.conv1.bias", "offset": 137206086, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5237343423953390288, "name": "encoder.down_blocks.3.resnets.1.conv1.weight", "offset": 137207110, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 12555995022414834122, "name": "encoder.down_blocks.3.resnets.1.conv2.bias", "offset": 141925702, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 6060343056668796456, "name": "encoder.down_blocks.3.resnets.1.conv2.weight", "offset": 141926726, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 2152578034879855135, "name": "encoder.down_blocks.3.resnets.1.norm1.bias", "offset": 146645318, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 11017326738736388086, "name": "encoder.down_blocks.3.resnets.1.norm1.weight", "offset": 146646342, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5983696236059312107, "name": "encoder.down_blocks.3.resnets.1.norm2.bias", "offset": 146647366, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 245520339945004905, "name": "encoder.down_blocks.3.resnets.1.norm2.weight", "offset": 146648390, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 11854038882917369658, "name": "encoder.mid_block.attentions.0.group_norm.bias", "offset": 146649414, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 12559174364328486192, "name": "encoder.mid_block.attentions.0.group_norm.weight", "offset": 146650438, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 16553916303993510669, "name": "encoder.mid_block.attentions.0.to_k.bias", "offset": 146651462, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 5187184060294355726, "name": "encoder.mid_block.attentions.0.to_k.weight", "offset": 146652486, "shape": [512, 512], "size": 524288}
+{"dtype": "BF16", "fnv1a64": 14923763013394141008, "name": "encoder.mid_block.attentions.0.to_out.0.bias", "offset": 147176774, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 1524536815285616357, "name": "encoder.mid_block.attentions.0.to_out.0.weight", "offset": 147177798, "shape": [512, 512], "size": 524288}
+{"dtype": "BF16", "fnv1a64": 2681954730668853665, "name": "encoder.mid_block.attentions.0.to_q.bias", "offset": 147702086, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 13103312142787127609, "name": "encoder.mid_block.attentions.0.to_q.weight", "offset": 147703110, "shape": [512, 512], "size": 524288}
+{"dtype": "BF16", "fnv1a64": 18319553848971117114, "name": "encoder.mid_block.attentions.0.to_v.bias", "offset": 148227398, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 8214843003791142245, "name": "encoder.mid_block.attentions.0.to_v.weight", "offset": 148228422, "shape": [512, 512], "size": 524288}
+{"dtype": "BF16", "fnv1a64": 1470966941704059841, "name": "encoder.mid_block.resnets.0.conv1.bias", "offset": 148752710, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 15976229309698398084, "name": "encoder.mid_block.resnets.0.conv1.weight", "offset": 148753734, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 855573600399127062, "name": "encoder.mid_block.resnets.0.conv2.bias", "offset": 153472326, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 12817536928479660105, "name": "encoder.mid_block.resnets.0.conv2.weight", "offset": 153473350, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 14479749725820026664, "name": "encoder.mid_block.resnets.0.norm1.bias", "offset": 158191942, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 17504774698969165435, "name": "encoder.mid_block.resnets.0.norm1.weight", "offset": 158192966, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 9122527633095446896, "name": "encoder.mid_block.resnets.0.norm2.bias", "offset": 158193990, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 13982561708620045656, "name": "encoder.mid_block.resnets.0.norm2.weight", "offset": 158195014, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 4155814005907208648, "name": "encoder.mid_block.resnets.1.conv1.bias", "offset": 158196038, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2445081405368026814, "name": "encoder.mid_block.resnets.1.conv1.weight", "offset": 158197062, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 7486912226044886958, "name": "encoder.mid_block.resnets.1.conv2.bias", "offset": 162915654, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 10318426732000742653, "name": "encoder.mid_block.resnets.1.conv2.weight", "offset": 162916678, "shape": [512, 512, 3, 3], "size": 4718592}
+{"dtype": "BF16", "fnv1a64": 2625734974199536972, "name": "encoder.mid_block.resnets.1.norm1.bias", "offset": 167635270, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 11930490591110574498, "name": "encoder.mid_block.resnets.1.norm1.weight", "offset": 167636294, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2588575309957259775, "name": "encoder.mid_block.resnets.1.norm2.bias", "offset": 167637318, "shape": [512], "size": 1024}
+{"dtype": "BF16", "fnv1a64": 2752320196111080737, "name": "encoder.mid_block.resnets.1.norm2.weight", "offset": 167638342, "shape": [512], "size": 1024}

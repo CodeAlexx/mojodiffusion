@@ -1,0 +1,388 @@
+{
+  "schema_version": 1,
+  "producer": "scripts/chroma_dump_train_ref.py",
+  "created_unix": 1780679803.8500624,
+  "dry_run": true,
+  "one_step_dump_produced": false,
+  "serenity": "/home/alex/Serenity",
+  "config": "/home/alex/Serenity/configs/chroma_100step_baseline.json",
+  "config_exists": true,
+  "config_error": null,
+  "out_dir": "/home/alex/serenity-trainer/parity",
+  "prefix": "chroma_train_ref",
+  "max_steps": 1,
+  "required_baseline_steps": 100,
+  "torch": "2.9.1+cu128",
+  "cuda_available": true,
+  "cuda_device_count": 1,
+  "train_device": "cuda",
+  "temp_device": "cpu",
+  "model_type": "CHROMA_1",
+  "training_method": "LORA",
+  "model_names": {
+    "base_model": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0",
+    "vae_model": "",
+    "lora_model": "",
+    "include_text_encoder": true
+  },
+  "baseline": {
+    "required_steps": 100,
+    "baseline_dir": "/home/alex/Serenity/output/chroma_100step_baseline",
+    "metrics": {
+      "path": "/home/alex/Serenity/output/chroma_100step_baseline/metrics.json",
+      "exists": true,
+      "size_bytes": 137974,
+      "sha256": "949be88115a6d992a9b582d6b3f0aacc7ce8a534bc67ffa618f654eab53792de",
+      "summary": {
+        "path": "/home/alex/Serenity/output/chroma_100step_baseline/metrics.json",
+        "exists": true,
+        "status": "completed",
+        "requested_steps": 100,
+        "global_steps_seen": 100,
+        "progress_event_count": 100,
+        "first_progress_event": {
+          "t": 1780679267.0988514,
+          "global_step": 1,
+          "epoch": 0,
+          "epoch_step": 1,
+          "max_step": 57,
+          "max_epoch": 2
+        },
+        "last_progress_event": {
+          "t": 1780679584.7735794,
+          "global_step": 100,
+          "epoch": 1,
+          "epoch_step": 43,
+          "max_step": 57,
+          "max_epoch": 2
+        },
+        "loss_count": 100,
+        "grad_norm_count": 100,
+        "last_loss": {
+          "t": 1780679584.7688916,
+          "tag": "loss/train_step",
+          "value": 0.3658050298690796,
+          "global_step": 99
+        },
+        "last_smooth_loss": {
+          "t": 1780679584.76902,
+          "tag": "smooth_loss/train_step",
+          "value": 0.4213832823932175,
+          "global_step": 99
+        },
+        "last_grad_norm": {
+          "t": 1780679584.7347775,
+          "tag": "grad_norm",
+          "value": 0.001406678231433034,
+          "global_step": 99
+        },
+        "overall_wall_seconds": 530.8950363920012,
+        "train_wall_seconds": 458.9736567950167,
+        "mean_step_seconds_excluding_first": 3.2088356397171727,
+        "min_step_seconds_excluding_first": 2.755967059987597,
+        "max_step_seconds_excluding_first": 6.3993451290007215,
+        "torch_cuda_max_allocated_mib": 7024,
+        "torch_cuda_max_reserved_mib": 7400,
+        "cache_dir": "/home/alex/Serenity/workspace-cache/chroma_100step_baseline",
+        "workspace_dir": "/home/alex/Serenity/workspace/chroma_100step_baseline",
+        "output_model_destination": "/home/alex/Serenity/output/chroma_100step_baseline/lora.safetensors"
+      }
+    },
+    "metrics_with_grad": {
+      "path": "/home/alex/Serenity/output/chroma_100step_baseline/metrics_with_grad.json",
+      "exists": false,
+      "summary": {
+        "path": "/home/alex/Serenity/output/chroma_100step_baseline/metrics_with_grad.json",
+        "exists": false
+      }
+    },
+    "model_artifacts": [
+      {
+        "path": "/home/alex/Serenity/output/chroma_100step_baseline/lora.safetensors",
+        "exists": true,
+        "size_bytes": 71099704,
+        "sha256": "4ca79c690e2bf40bae2369eebefcb5fc11432671107915ad79dc72752dfdeced",
+        "safetensors": {
+          "inspectable": true,
+          "key_count": 912,
+          "dtype_counts": {
+            "bfloat16": 912
+          },
+          "transformer_lora_key_count": 608,
+          "text_encoder_lora_key_count": 0,
+          "sample_keys": [
+            "lora_transformer_single_transformer_blocks_0_attn_to_k.alpha",
+            "lora_transformer_single_transformer_blocks_0_attn_to_k.lora_down.weight",
+            "lora_transformer_single_transformer_blocks_0_attn_to_k.lora_up.weight",
+            "lora_transformer_single_transformer_blocks_0_attn_to_q.alpha",
+            "lora_transformer_single_transformer_blocks_0_attn_to_q.lora_down.weight",
+            "lora_transformer_single_transformer_blocks_0_attn_to_q.lora_up.weight",
+            "lora_transformer_single_transformer_blocks_0_attn_to_v.alpha",
+            "lora_transformer_single_transformer_blocks_0_attn_to_v.lora_down.weight",
+            "lora_transformer_single_transformer_blocks_0_attn_to_v.lora_up.weight",
+            "lora_transformer_single_transformer_blocks_10_attn_to_k.alpha",
+            "lora_transformer_single_transformer_blocks_10_attn_to_k.lora_down.weight",
+            "lora_transformer_single_transformer_blocks_10_attn_to_k.lora_up.weight",
+            "lora_transformer_single_transformer_blocks_10_attn_to_q.alpha",
+            "lora_transformer_single_transformer_blocks_10_attn_to_q.lora_down.weight",
+            "lora_transformer_single_transformer_blocks_10_attn_to_q.lora_up.weight",
+            "lora_transformer_single_transformer_blocks_10_attn_to_v.alpha"
+          ],
+          "sample_shapes": {
+            "lora_transformer_single_transformer_blocks_0_attn_to_k.alpha": [],
+            "lora_transformer_single_transformer_blocks_0_attn_to_k.lora_down.weight": [
+              16,
+              3072
+            ],
+            "lora_transformer_single_transformer_blocks_0_attn_to_k.lora_up.weight": [
+              3072,
+              16
+            ],
+            "lora_transformer_single_transformer_blocks_0_attn_to_q.alpha": [],
+            "lora_transformer_single_transformer_blocks_0_attn_to_q.lora_down.weight": [
+              16,
+              3072
+            ],
+            "lora_transformer_single_transformer_blocks_0_attn_to_q.lora_up.weight": [
+              3072,
+              16
+            ],
+            "lora_transformer_single_transformer_blocks_0_attn_to_v.alpha": [],
+            "lora_transformer_single_transformer_blocks_0_attn_to_v.lora_down.weight": [
+              16,
+              3072
+            ],
+            "lora_transformer_single_transformer_blocks_0_attn_to_v.lora_up.weight": [
+              3072,
+              16
+            ],
+            "lora_transformer_single_transformer_blocks_10_attn_to_k.alpha": [],
+            "lora_transformer_single_transformer_blocks_10_attn_to_k.lora_down.weight": [
+              16,
+              3072
+            ],
+            "lora_transformer_single_transformer_blocks_10_attn_to_k.lora_up.weight": [
+              3072,
+              16
+            ]
+          }
+        }
+      },
+      {
+        "path": "/home/alex/Serenity/output/chroma_100step_baseline/lora_last.safetensors",
+        "exists": false
+      },
+      {
+        "path": "/home/alex/Serenity/output/chroma_100step_baseline/model.safetensors",
+        "exists": false
+      }
+    ],
+    "complete": true
+  },
+  "cache": {
+    "enabled": true,
+    "cache_dir": "/home/alex/Serenity/workspace-cache/chroma_100step_baseline",
+    "present": true,
+    "text_cache_required": true,
+    "image": {
+      "path": "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image",
+      "exists": true,
+      "file_count_bounded": 119,
+      "sample_files": [
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image/362496e93deadf06538226c902db4c7ee0d249a51de321d7295a1d517002d162/variation-0/4.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image/362496e93deadf06538226c902db4c7ee0d249a51de321d7295a1d517002d162/variation-0/34.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image/362496e93deadf06538226c902db4c7ee0d249a51de321d7295a1d517002d162/variation-0/48.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image/362496e93deadf06538226c902db4c7ee0d249a51de321d7295a1d517002d162/variation-0/3.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image/362496e93deadf06538226c902db4c7ee0d249a51de321d7295a1d517002d162/variation-0/64.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image/362496e93deadf06538226c902db4c7ee0d249a51de321d7295a1d517002d162/variation-0/114.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image/362496e93deadf06538226c902db4c7ee0d249a51de321d7295a1d517002d162/variation-0/68.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/image/362496e93deadf06538226c902db4c7ee0d249a51de321d7295a1d517002d162/variation-0/89.pt"
+      ]
+    },
+    "text": {
+      "path": "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text",
+      "exists": true,
+      "file_count_bounded": 119,
+      "sample_files": [
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text/327c5906280786b0bd3a6bbd02d8d20d54aa2bc47dc927f0abd826859be867da/variation-0/4.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text/327c5906280786b0bd3a6bbd02d8d20d54aa2bc47dc927f0abd826859be867da/variation-0/34.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text/327c5906280786b0bd3a6bbd02d8d20d54aa2bc47dc927f0abd826859be867da/variation-0/48.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text/327c5906280786b0bd3a6bbd02d8d20d54aa2bc47dc927f0abd826859be867da/variation-0/3.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text/327c5906280786b0bd3a6bbd02d8d20d54aa2bc47dc927f0abd826859be867da/variation-0/64.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text/327c5906280786b0bd3a6bbd02d8d20d54aa2bc47dc927f0abd826859be867da/variation-0/114.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text/327c5906280786b0bd3a6bbd02d8d20d54aa2bc47dc927f0abd826859be867da/variation-0/68.pt",
+        "/home/alex/Serenity/workspace-cache/chroma_100step_baseline/text/327c5906280786b0bd3a6bbd02d8d20d54aa2bc47dc927f0abd826859be867da/variation-0/89.pt"
+      ]
+    }
+  },
+  "allow_cache_build": false,
+  "local_model": {
+    "model_names": {
+      "base_model": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0",
+      "vae_model": "",
+      "lora_model": "",
+      "include_text_encoder": true
+    },
+    "base_model": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0",
+    "is_local_ref": true,
+    "hf_cache": {
+      "model_id": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0",
+      "applicable": false
+    },
+    "kind": "diffusers_dir",
+    "base_exists": true,
+    "has_model_index_json": false,
+    "has_modular_model_index_json": false,
+    "required_subfolders": [
+      "tokenizer",
+      "text_encoder",
+      "transformer",
+      "vae",
+      "scheduler"
+    ],
+    "required_paths": {
+      "tokenizer": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/tokenizer",
+      "text_encoder": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/text_encoder",
+      "transformer": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/transformer",
+      "vae": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/vae",
+      "scheduler": "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/scheduler"
+    },
+    "subfolders": {
+      "tokenizer": true,
+      "text_encoder": true,
+      "transformer": true,
+      "vae": true,
+      "scheduler": true
+    },
+    "file_count_bounded": 15,
+    "sample_files": [
+      "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/vae/diffusion_pytorch_model.safetensors",
+      "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/vae/config.json",
+      "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/tokenizer/tokenizer_config.json",
+      "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/tokenizer/spiece.model",
+      "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/tokenizer/added_tokens.json",
+      "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/tokenizer/special_tokens_map.json",
+      "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/scheduler/scheduler_config.json",
+      "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/transformer/config.json"
+    ],
+    "overrides": {
+      "vae_model": {
+        "configured": false
+      },
+      "lora_model": {
+        "configured": false
+      }
+    }
+  },
+  "data": {
+    "available": true,
+    "concept_file_name": "/home/alex/Serenity/training_concepts/eri2_concepts.json",
+    "concept_file_exists": true,
+    "concept_file_error": null,
+    "concept_count": 1,
+    "concepts": [
+      {
+        "name": "eri2",
+        "enabled": true,
+        "path": "/home/alex/eri2",
+        "path_exists": true,
+        "file_count_bounded": 2596,
+        "source": "concept_file_name"
+      }
+    ]
+  },
+  "preset_candidates": [
+    {
+      "path": "/home/alex/Serenity/training_presets/#chroma LoRA 8GB.json",
+      "exists": true,
+      "size_bytes": 890,
+      "sha256": "d30eb1d51d1bef231f067fdec949c83580bf5f88cb6145ba6760f6a198de4dc4",
+      "model_type": "CHROMA_1",
+      "training_method": "LORA",
+      "base_model_name": "lodestones/Chroma1-HD"
+    },
+    {
+      "path": "/home/alex/Serenity/training_presets/#chroma LoRA 16GB.json",
+      "exists": true,
+      "size_bytes": 779,
+      "sha256": "75061f959e8513c476075831141f570407059a08076d64bfaa5a38cd98f4bf6c",
+      "model_type": "CHROMA_1",
+      "training_method": "LORA",
+      "base_model_name": "lodestones/Chroma1-HD"
+    },
+    {
+      "path": "/home/alex/Serenity/training_presets/#chroma LoRA 24GB.json",
+      "exists": true,
+      "size_bytes": 781,
+      "sha256": "0f87425c7181e9898a4e6407321f2328a75039eaf3086a4566547b51e74d79e6",
+      "model_type": "CHROMA_1",
+      "training_method": "LORA",
+      "base_model_name": "lodestones/Chroma1-HD"
+    },
+    {
+      "path": "/home/alex/Serenity/training_presets/#chroma Finetune 8GB.json",
+      "exists": true,
+      "size_bytes": 1352,
+      "sha256": "5d24e287fe002ef8db09518d3ff0d5bd5db97fc5133c29e88c23cae41c961f09",
+      "model_type": "CHROMA_1",
+      "training_method": "FINE_TUNE",
+      "base_model_name": "lodestones/Chroma1-HD"
+    },
+    {
+      "path": "/home/alex/Serenity/training_presets/#chroma Finetune 16GB.json",
+      "exists": true,
+      "size_bytes": 1351,
+      "sha256": "227d433ce564aa987a23c4541cfc674c974e3dc83d0d46d83e9ce632ca9d85f9",
+      "model_type": "CHROMA_1",
+      "training_method": "FINE_TUNE",
+      "base_model_name": "lodestones/Chroma1-HD"
+    },
+    {
+      "path": "/home/alex/Serenity/training_presets/#chroma Finetune 24GB.json",
+      "exists": true,
+      "size_bytes": 1240,
+      "sha256": "756c6e8b9d4631a286f63d6cadf032c686dc2e3beeb6b0a7a3a115694f0d57c1",
+      "model_type": "CHROMA_1",
+      "training_method": "FINE_TUNE",
+      "base_model_name": "lodestones/Chroma1-HD"
+    }
+  ],
+  "blockers": [],
+  "structured_blockers": [],
+  "blocked": false,
+  "reference_files_inspected": [
+    "/home/alex/Serenity/modules/modelSetup/ChromaLoRASetup.py",
+    "/home/alex/Serenity/modules/modelSetup/ChromaFineTuneSetup.py",
+    "/home/alex/Serenity/modules/modelSetup/BaseChromaSetup.py",
+    "/home/alex/Serenity/modules/dataLoader/ChromaBaseDataLoader.py",
+    "/home/alex/Serenity/modules/model/ChromaModel.py",
+    "/home/alex/Serenity/modules/modelSampler/ChromaSampler.py"
+  ],
+  "train_dtype": "BFLOAT_16",
+  "fallback_train_dtype": "BFLOAT_16",
+  "weight_dtypes": {
+    "train_dtype": "BFLOAT_16",
+    "fallback_train_dtype": "BFLOAT_16",
+    "unet": "FLOAT_32",
+    "prior": "FLOAT_32",
+    "transformer": "BFLOAT_16",
+    "text_encoder": "BFLOAT_16",
+    "text_encoder_2": "FLOAT_32",
+    "text_encoder_3": "FLOAT_32",
+    "text_encoder_4": "FLOAT_32",
+    "vae": "FLOAT_32",
+    "effnet_encoder": "FLOAT_32",
+    "decoder": "FLOAT_32",
+    "decoder_text_encoder": "FLOAT_32",
+    "decoder_vqgan": "FLOAT_32",
+    "lora": "FLOAT_32",
+    "embedding": "FLOAT_32"
+  },
+  "lora_weight_dtype": "FLOAT_32",
+  "lora_rank": 16,
+  "lora_alpha": 1.0,
+  "layer_filter": "attn,ff.net",
+  "layer_filter_preset": "attn-mlp",
+  "blocker_artifact": "/home/alex/serenity-trainer/parity/chroma_train_ref_blockers.json",
+  "meta_artifact": "/home/alex/serenity-trainer/parity/chroma_train_ref_meta.json"
+}

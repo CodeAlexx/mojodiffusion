@@ -1,0 +1,46 @@
+{
+  "rope.cos": {
+    "shape": [
+      1,
+      1141,
+      128
+    ],
+    "dtype": "torch.float32"
+  },
+  "rope.sin": {
+    "shape": [
+      1,
+      1141,
+      128
+    ],
+    "dtype": "torch.float32"
+  },
+  "rope.inv_freq": {
+    "shape": [
+      64
+    ],
+    "dtype": "torch.float32"
+  },
+  "rope.attention_scaling": {
+    "shape": [
+      1
+    ],
+    "dtype": "torch.float32"
+  },
+  "rope.llama4_scale": {
+    "shape": [
+      1,
+      1141
+    ],
+    "dtype": "torch.float32"
+  },
+  "rope.positions": {
+    "shape": [
+      1,
+      1141
+    ],
+    "dtype": "torch.float32"
+  },
+  "attention_scaling_value": 1.0,
+  "rope_type": "yarn"
+}

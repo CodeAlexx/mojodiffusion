@@ -1,0 +1,39 @@
+{
+ "schema": "serenity.sample_prompts.v1",
+ "_comment": "SDXL caps-based inline sampling. SDXL conditioning is MULTI-tensor, so caps.positive is a CACHE-ENTRY-SHAPED safetensors carrying THREE keys: 'text_embedding' [1,77,2048] (CLIP-L|CLIP-G hidden) + 'pooled' [1,1280] (CLIP-G pooled) + 'time_ids' [1,6] (SDXL micro-cond). The trainer rebuilds the ADM y=[pooled|sin_embed(time_ids)] itself (do NOT stage a sidecar 'y'). Produce via the sdxl cache precache / CLIP-L+G encode. caps.negative is REQUIRED by the parser but UNUSED (the SDXL sampler builds its CFG uncond as zeros). width/height = the binary's native 128px preview (enforce_min_image_size false because <1024).",
+ "defaults": {
+  "sample_every": 500,
+  "sample_at_start": true,
+  "save_before_sample": true,
+  "precache_required": true,
+  "enforce_min_image_size": false,
+  "width": 128,
+  "height": 128,
+  "frames": 1,
+  "fps": 24,
+  "steps": 30,
+  "cfg": 7.5,
+  "seed": 42,
+  "negative": ""
+ },
+ "prompts": [
+  {
+   "id": "sdxl_garden_portrait",
+   "prompt": "a portrait photograph of a woman with long hair in a sunlit garden, soft natural lighting, high detail",
+   "seed": 42,
+   "caps": {
+    "positive": "/home/alex/mojodiffusion/output/sample_caps/sdxl/garden_portrait_pos.safetensors",
+    "negative": "/home/alex/mojodiffusion/output/sample_caps/sdxl/garden_portrait_neg.safetensors"
+   }
+  },
+  {
+   "id": "sdxl_city_dusk",
+   "prompt": "a cinematic photograph of a man in a dark coat on a city street at dusk, dramatic lighting, sharp focus",
+   "seed": 43,
+   "caps": {
+    "positive": "/home/alex/mojodiffusion/output/sample_caps/sdxl/city_dusk_pos.safetensors",
+    "negative": "/home/alex/mojodiffusion/output/sample_caps/sdxl/city_dusk_neg.safetensors"
+   }
+  }
+ ]
+}

@@ -1,0 +1,45 @@
+{
+  "accepted_speed_parity": false,
+  "measurement": {
+    "command": [
+      "/home/alex/Serenity/venv/bin/python",
+      "scripts/run_zimage_serenity_sample_speed.py",
+      "--sample-file",
+      "/home/alex/Serenity/training_samples/eri2_5prompts_1024.json",
+      "--sample-id",
+      "p1",
+      "--output-png",
+      "/home/alex/serenity-trainer/parity/zimage_serenity_speed.png",
+      "--speed-json",
+      "/home/alex/serenity-trainer/parity/zimage_serenity_speed.json",
+      "--poll-seconds",
+      "0.25"
+    ],
+    "elapsed_seconds": 80.87828569998965,
+    "gpu_memory_baseline_mib": 1092,
+    "peak_vram_mib": 14340,
+    "source": "Serenity ZImageSampler logic via scripts/run_zimage_serenity_sample_speed.py"
+  },
+  "serenity": {
+    "artifact_paths": [
+      "/home/alex/serenity-trainer/parity/zimage_serenity_speed.png",
+      "/home/alex/serenity-trainer/parity/zimage_serenity_speed.json"
+    ],
+    "denoise_seconds": 60.03221411899722,
+    "denoise_seconds_per_step": 2.1440076471070433,
+    "dtype": "bf16",
+    "guidance": 3.5,
+    "peak_vram_mib": 14340,
+    "prompt": "A close-up portrait of a woman with long curly dark hair, soft natural lighting, blurred background, intimate atmosphere, sharp focus on her face.",
+    "resolution": {
+      "height": 1024,
+      "width": 1024
+    },
+    "seed": 42,
+    "steps": 28,
+    "text_encode_seconds": 6.23822177699185,
+    "vae_decode_seconds": 1.062839799997164
+  },
+  "schema": "serenity.zimage.serenity_sampler_speed.v1",
+  "speed_parity_claim": "not claimed"
+}

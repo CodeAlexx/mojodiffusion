@@ -1,0 +1,30 @@
+{
+  "model_type": "sdxl",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/sdxl_unet_bf16.safetensors",
+  "vae": "/home/alex/madebyollin_sdxl-vae-fp16-fix/sdxl_vae.safetensors",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json",
+
+  "in_channels": 4,
+  "out_channels": 4,
+  "context_dim": 2048,
+  "adm_in_channels": 2816,
+
+  "learning_rate": 3e-4,
+  "learning_rate_scheduler": "constant",
+  "learning_rate_warmup_steps": 0,
+  "lora_rank": 16,
+  "lora_alpha": 1.0,
+  "network_algorithm": "dora",
+  "lokr_targets": 1,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 1,
+  "save_every": 1,
+  "sample_every": 0,
+  "workspace_dir": "/tmp/sdxl_direct_dora_attn_rank16_smoke",
+  "output_model_destination": "/tmp/sdxl_direct_dora_attn_rank16_smoke/adapter.safetensors",
+  "save_filename_prefix": "sdxl_direct_dora_attn_rank16_smoke",
+  "dataset_cache_dir": "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_sdxl_512_smoke",
+
+  "optimizer": { "optimizer": "ADAMW", "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
+}

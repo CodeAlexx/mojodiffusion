@@ -1,0 +1,7 @@
+{
+  "network_algorithm": "lokr",
+  "lokr_factor": 4,
+  "lokr_decompose_both": 0,
+  "lokr_full_matrix": 0,
+  "lokr_targets": "attn"
+}

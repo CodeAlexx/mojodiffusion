@@ -1,0 +1,3 @@
+H2=4 W2=4 N_IMG=16 N_TXT=16 S=32
+t_raw=0.5 guidance_raw=3.5 (probe must feed *1000)
+pred_shape=[1, 16, 64] mean=-0.087826 std=0.422011

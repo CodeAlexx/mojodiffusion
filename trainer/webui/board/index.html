@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SerenityBoard</title>
+    <script>window.__v = Date.now();</script>
+    <script src="/board/board_boot.js"></script>
+    <link rel="stylesheet" href="/board/style.css">
+    <style>
+        #chart-grid { grid-template-columns: 1fr !important; }
+    </style>
+    <script src="/board/vendor/echarts.min.js"></script>
+    <script src="/board/vendor/echarts-gl.min.js"></script>
+    <script src="/board/echarts-theme.js"></script>
+</head>
+<body>
+    <!-- Header / Nav -->
+    <header id="header">
+        <div class="header-left">
+            <button id="sidebar-toggle" class="icon-btn" title="Toggle sidebar">
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
+                    <rect y="3" width="20" height="2" rx="1"/>
+                    <rect y="9" width="20" height="2" rx="1"/>
+                    <rect y="15" width="20" height="2" rx="1"/>
+                </svg>
+            </button>
+            <h1 class="logo">SerenityBoard</h1>
+        </div>
+        <div class="toolbar">
+            <div class="toolbar-group">
+                <label for="smoothing-slider">Smoothing</label>
+                <input type="range" id="smoothing-slider" min="0" max="0.999" step="0.001" value="0.95">
+                <span id="smoothing-value">0.95</span>
+            </div>
+            <div class="toolbar-group">
+                <label for="xaxis-mode">X-Axis</label>
+                <select id="xaxis-mode">
+                    <option value="step" selected>Step</option>
+                    <option value="wall_time">Wall Time</option>
+                    <option value="relative">Relative</option>
+                </select>
+            </div>
+            <div class="toolbar-group">
+                <button id="reset-axes" class="toolbar-btn" type="button">Reset Axes</button>
+            </div>
+            <div class="toolbar-group">
+                <button id="export-scalars" class="toolbar-btn" type="button" title="Export visible scalars as CSV">Export</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main layout -->
+    <div id="layout">
+        <!-- Sidebar -->
+        <aside id="sidebar">
+            <section class="sidebar-section">
+                <h2 class="sidebar-heading">Runs</h2>
+                <div id="run-list" class="checkbox-list">
+                    <div class="placeholder">Loading runs...</div>
+                </div>
+            </section>
+            <section id="run-notes-section" class="sidebar-section" style="display: none;">
+                <h2 class="sidebar-heading run-notes-heading">
+                    <span class="run-notes-toggle">Notes</span>
+                    <span id="run-notes-saved" class="run-notes-saved"></span>
+                </h2>
+                <div id="run-notes-body">
+                    <textarea id="run-notes-textarea" class="run-notes-textarea"
+                        placeholder="Add notes about this run..." rows="3"></textarea>
+                </div>
+            </section>
+            <section class="sidebar-section">
+                <h2 class="sidebar-heading">Tags</h2>
+                <div class="tag-filter-input">
+                    <input type="text" id="tag-filter" placeholder="Filter tags...">
+                </div>
+                <div id="tag-list" class="checkbox-list">
+                    <div class="placeholder">Select a run first</div>
+                </div>
+            </section>
+        </aside>
+
+        <!-- Chart area -->
+        <main id="chart-area">
+            <!-- Tab bar -->
+            <div id="tab-bar">
+                <button class="tab-btn active" data-tab="scalars">Scalars</button>
+                <button class="tab-btn" data-tab="histograms">Histograms</button>
+                <button class="tab-btn" data-tab="hparams">HParams</button>
+                <button class="tab-btn" data-tab="traces">Traces</button>
+                <button class="tab-btn" data-tab="eval">Eval</button>
+                <button class="tab-btn" data-tab="artifacts">Artifacts</button>
+                <button class="tab-btn" data-tab="pr-curves">PR Curves</button>
+                <button class="tab-btn" data-tab="audio">Audio</button>
+                <button class="tab-btn" data-tab="projector">Projector</button>
+                <button class="tab-btn" data-tab="lora">LoRA</button>
+            </div>
+
+            <!-- Scalars panel (existing chart grid) -->
+            <div id="panel-scalars" class="tab-panel active">
+                <div id="chart-grid">
+                    <div class="empty-state">
+                        <p>Select runs and tags to view charts</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Histograms panel -->
+            <div id="panel-histograms" class="tab-panel" style="display: none;">
+                <div id="histogram-grid">
+                    <div class="empty-state">
+                        <p>Select runs and tensor tags to view histograms</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- HParams panel -->
+            <div id="panel-hparams" class="tab-panel" style="display: none;">
+                <div id="hparams-container">
+                    <div class="empty-state">
+                        <p>Select runs to compare hyperparameters</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Traces panel -->
+            <div id="panel-traces" class="tab-panel" style="display: none;">
+                <div id="traces-container">
+                    <div class="empty-state">
+                        <p>Select runs to view trace timeline</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Eval panel -->
+            <div id="panel-eval" class="tab-panel" style="display: none;">
+                <div id="eval-container">
+                    <div class="empty-state">
+                        <p>Select runs to view evaluation results</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Artifacts panel -->
+            <div id="panel-artifacts" class="tab-panel" style="display: none;">
+                <div id="artifacts-container">
+                    <div class="empty-state">
+                        <p>Select runs to view artifacts</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- PR Curves panel -->
+            <div id="panel-pr-curves" class="tab-panel" style="display: none;">
+                <div id="pr-curves-container">
+                    <div class="empty-state">
+                        <p>Select runs to view precision-recall curves</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Audio panel -->
+            <div id="panel-audio" class="tab-panel" style="display: none;">
+                <div id="audio-container">
+                    <div class="empty-state">
+                        <p>Select runs to view audio clips</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Projector panel -->
+            <div id="panel-projector" class="tab-panel" style="display: none;">
+                <div id="projector-container">
+                    <div id="projector-controls">
+                        <select id="projector-run-select"><option value="">Select run...</option></select>
+                        <select id="projector-tag-select"><option value="">Select tag...</option></select>
+                        <select id="projector-step-select"><option value="">Select step...</option></select>
+                        <select id="projector-method">
+                            <option value="pca" selected>PCA</option>
+                        </select>
+                        <select id="projector-color-by"><option value="">Color by...</option></select>
+                        <button id="projector-load-btn" class="toolbar-btn">Load</button>
+                    </div>
+                    <div id="projector-plot" style="width: 100%; height: calc(100vh - 200px);"></div>
+                    <div id="projector-status"></div>
+                </div>
+            </div>
+            <!-- LoRA Compare panel -->
+            <div id="panel-lora" class="tab-panel" style="display: none;">
+                <div id="lora-container">
+                    <div class="lora-toolbar">
+                        <div class="lora-file-inputs">
+                            <div class="lora-file-group">
+                                <label>LoRA 1:</label>
+                                <input type="text" id="lora-path-1" placeholder="Path to .safetensors file" class="lora-path-input">
+                                <input type="file" id="lora-file-1" accept=".safetensors" style="display:none">
+                                <button class="toolbar-btn" onclick="document.getElementById('lora-file-1').click()">Browse</button>
+                            </div>
+                            <div class="lora-file-group">
+                                <label>LoRA 2 (optional):</label>
+                                <input type="text" id="lora-path-2" placeholder="Path to .safetensors file (compare)" class="lora-path-input">
+                                <input type="file" id="lora-file-2" accept=".safetensors" style="display:none">
+                                <button class="toolbar-btn" onclick="document.getElementById('lora-file-2').click()">Browse</button>
+                            </div>
+                        </div>
+                        <div class="lora-actions">
+                            <button id="lora-analyze-btn" class="toolbar-btn toolbar-btn-primary">Analyze</button>
+                            <button id="lora-export-csv-btn" class="toolbar-btn" style="display:none">Export CSV</button>
+                        </div>
+                    </div>
+                    <div id="lora-summary" style="display:none;"></div>
+                    <div id="lora-diagnostics" style="display:none;"></div>
+                    <div id="lora-table-container">
+                        <div class="empty-state">
+                            <p>Select a LoRA file to analyze, or two files to compare</p>
+                        </div>
+                    </div>
+                    <div id="lora-charts" style="display:none;">
+                        <div id="lora-chart-a-spectral" style="width:100%;height:300px;"></div>
+                        <div id="lora-chart-b-spectral" style="width:100%;height:300px;"></div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Status bar -->
+    <footer id="status-bar">
+        <span id="connection-status" class="status-indicator status-disconnected">
+            <span class="status-dot"></span>
+            <span class="status-text">Disconnected</span>
+        </span>
+        <span id="data-status"></span>
+    </footer>
+
+    <script>
+        (function() {
+            var bust = '?v=' + window.__v;
+            function addScript(src) {
+                var s = document.createElement('script');
+                s.src = src + bust;
+                s.async = false;
+                document.body.appendChild(s);
+            }
+            addScript('/board/charts.js');
+            addScript('/board/live.js');
+            addScript('/board/app.js');
+            addScript('/board/projector.js');
+            addScript('/board/lora.js');
+        })();
+    </script>
+</body>
+</html>

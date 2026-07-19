@@ -1,0 +1,36 @@
+{
+  "schema": "serenity.model-defaults.v1",
+  "model_type": "chroma",
+  "checkpoint": "serenity-models/checkpoints/chroma1-hd/transformer",
+  "vae": "serenity-models/vaes/ae.safetensors",
+  "t5_encoder": "serenity-models/text_encoders/t5xxl_fp16.safetensors",
+  "t5_tokenizer": "serenity-models/text_encoders/t5xxl_fp16.tokenizer.json",
+  "validation_prompts_file": "serenitymojo/configs/sample_prompts.example.json",
+
+  "inner_dim": 3072,
+  "in_channels": 64,
+  "joint_attention_dim": 4096,
+  "out_channels": 64,
+  "num_double": 19,
+  "num_single": 38,
+  "num_heads": 24,
+  "head_dim": 128,
+  "mlp_hidden": 12288,
+  "timestep_dim": 256,
+  "rope_theta": 10000,
+
+  "training_method": "LORA",
+  "resolution": "512",
+  "batch_size": 1,
+  "learning_rate": 1e-4,
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "quantized_resident": "fp8_e4m3",
+  "timestep_shift": 1.15,
+  "max_grad_norm": 1.0,
+  "max_steps": 2000,
+  "save_every": 500,
+  "sample_every": 500,
+
+  "optimizer": { "eps": 1e-8, "weight_decay": 0.01, "beta1": 0.9, "beta2": 0.999 }
+}

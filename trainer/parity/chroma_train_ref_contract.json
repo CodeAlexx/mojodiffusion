@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "name": "chroma_train_ref",
+  "purpose": "Serenity Chroma cached-data train parity dump contract for predict -> loss -> backward_lora_or_trainable -> optimizer gates.",
+  "producer_script": "/home/alex/serenity-trainer/scripts/chroma_dump_train_ref.py",
+  "reference_policy": {
+    "only_reference": "/home/alex/Serenity",
+    "external_references_used": false
+  },
+  "reference_files_inspected": [
+    "/home/alex/Serenity/modules/modelSetup/ChromaLoRASetup.py",
+    "/home/alex/Serenity/modules/modelSetup/ChromaFineTuneSetup.py",
+    "/home/alex/Serenity/modules/modelSetup/BaseChromaSetup.py",
+    "/home/alex/Serenity/modules/dataLoader/ChromaBaseDataLoader.py",
+    "/home/alex/Serenity/modules/model/ChromaModel.py",
+    "/home/alex/Serenity/modules/modelSampler/ChromaSampler.py"
+  ],
+  "source_line_anchors": {
+    "BaseChromaSetup.predict": "/home/alex/Serenity/modules/modelSetup/BaseChromaSetup.py:158",
+    "ChromaBaseDataLoader.cache_output_names": "/home/alex/Serenity/modules/dataLoader/ChromaBaseDataLoader.py:58",
+    "ChromaModel.encode_text": "/home/alex/Serenity/modules/model/ChromaModel.py:156",
+    "ChromaModel.prepare_pack_unpack": "/home/alex/Serenity/modules/model/ChromaModel.py:232",
+    "ChromaSampler.no_grad_sampling": "/home/alex/Serenity/modules/modelSampler/ChromaSampler.py:36"
+  },
+  "default_config": "/home/alex/Serenity/configs/chroma_100step_baseline.json",
+  "default_reference_baseline": {
+    "required_steps": 100,
+    "baseline_dir": "/home/alex/Serenity/output/chroma_100step_baseline",
+    "cache_dir": "/home/alex/Serenity/workspace-cache/chroma_100step_baseline",
+    "remote_preset_base_model": "lodestones/Chroma1-HD"
+  },
+  "preset_candidates": [
+    "/home/alex/Serenity/training_presets/#chroma LoRA 8GB.json",
+    "/home/alex/Serenity/training_presets/#chroma LoRA 16GB.json",
+    "/home/alex/Serenity/training_presets/#chroma LoRA 24GB.json",
+    "/home/alex/Serenity/training_presets/#chroma Finetune 8GB.json",
+    "/home/alex/Serenity/training_presets/#chroma Finetune 16GB.json",
+    "/home/alex/Serenity/training_presets/#chroma Finetune 24GB.json"
+  ],
+  "default_outputs": {
+    "run_metadata": "parity/chroma_train_ref_meta.json",
+    "step_tensors": "parity/chroma_train_ref_step000.safetensors",
+    "adapter_tensors": "parity/chroma_train_ref_step000_adapters.safetensors",
+    "dry_run_blockers": "parity/chroma_train_ref_blockers.json",
+    "contract": "parity/chroma_train_ref_contract.json"
+  },
+  "serenity_reference_contract": {
+    "setup": "BaseChromaSetup.predict derives batch_seed from train_progress, encodes or consumes cached T5 hidden states, applies VAE (latent_image - shift_factor) * scaling_factor, samples noise and discrete timestep, adds noise returning sigma, prepares txt/img ids and optional combined attention_mask, packs latents, calls ChromaTransformer2DModel.forward, unpacks predicted flow, and targets latent_noise - scaled_latent_image.",
+    "loss": "BaseChromaSetup.calculate_loss delegates to Serenity _flow_matching_losses(..., sigmas=model.noise_scheduler.sigmas).mean().",
+    "data_loader": "ChromaBaseDataLoader caches latent_image plus image metadata; when the text encoder is frozen it also caches tokens, tokens_mask, and text_encoder_hidden_state, then pads masked tokens on output.",
+    "sampler_boundary": "ChromaSampler samples under torch.no_grad(); this reference producer is training-only and does not claim sampler parity."
+  },
+  "step_safetensors_keys": {
+    "cached_batch": "batch.* tensors exactly as Serenity data_loader yields them, including latent_image, tokens, tokens_mask, optional text_encoder_hidden_state, loss_weight, concept_type, image metadata, and optional latent_mask.",
+    "trace": "trace.* tensors captured from BaseChromaSetup.predict, ChromaModel.encode_text, prepare_latent_image_ids, pack_latents, unpack_latents, and ChromaTransformer2DModel.forward. Expected keys include text_encoder_output, text_attention_mask, scaled_latent_image, latent_noise, scaled_noisy_latent_image, sigma, latent_input, packed_latent_input, image_ids, text_ids, transformer_hidden_states, transformer_timestep, encoder_hidden_states, attention_mask, packed_predicted_flow, predicted_flow, and flow.",
+    "outputs": "output.timestep, output.predicted, output.target, optional output.prior_target, output.loss_pre_scale, and output.loss_for_backward."
+  },
+  "adapter_safetensors_keys": {
+    "initial": "adapter_initial.* trainable Chroma LoRA tensors when --adapter-dump initial is used.",
+    "step": "adapter_before.*, adapter_pre.*, adapter_post.*, and adapter_after.* trainable Chroma LoRA tensors.",
+    "step-with-grads": "adapter_before.*, adapter_pre.*, adapter_pre_clip.*, adapter_pre_clip_grad.*, adapter_post.*, adapter_post_clip.*, adapter_post_clip_grad.*, and adapter_after.* trainable Chroma LoRA tensors/gradients."
+  },
+  "dry_run_contract": {
+    "required_reports": [
+      "config path and config load error if missing",
+      "model_type and training_method when config loads",
+      "train_device and temp_device",
+      "100-step baseline metrics and output artifact status",
+      "cache directory, image cache status, and text cache status",
+      "local Chroma diffusers snapshot status and exact missing folders",
+      "configured concept file and enabled concept paths",
+      "structured_blockers with stable id, category, message, and details"
+    ],
+    "required_blockers_when_missing": [
+      "missing_chroma_reference_config",
+      "missing_100_step_metrics",
+      "missing_100_step_model_artifact",
+      "missing_required_cache",
+      "remote_base_model_ref or missing_base_model_path",
+      "missing_diffusers_chroma_folders"
+    ]
+  },
+  "bounded_run_notes": [
+    "The script is single-process only and enforces --max-steps 1.",
+    "Dry-run does not load Chroma weights.",
+    "By default it requires a completed local 100-step baseline, existing image/text caches, and local diffusers weights.",
+    "Pass --allow-cache-build only when local data and local text encoder weights are present.",
+    "It imports Serenity from /home/alex/Serenity and chdirs there before importing modules.util.create because factory.import_dir uses cwd-relative module paths.",
+    "It preserves tensor storage dtype in safetensors dumps; scalar stats in JSON are computed in float32 where needed.",
+    "It does not call GenericTrainer.end(), so it does not perform Serenity final model saves.",
+    "It does not edit Serenity source or Mojo runtime files."
+  ]
+}

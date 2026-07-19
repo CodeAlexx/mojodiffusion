@@ -1,0 +1,32 @@
+{
+  "_comment": "flux FULL-FT inline-sampling cadence smoke (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #5). Based on flux_full_ft.json — same recipe/streams so the resume-gate reference stream holds (4 steps: sigmas 0.502/0.237/0.421/0.396, step-1 loss 0.6851147) — with sample_every=0: the training-unchanged baseline (OFF/OFF2 wobble-envelope runs).",
+  "model_type": "flux",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/flux1-dev.safetensors",
+  "vae": "/home/alex/.serenity/models/vaes/ae.safetensors",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json",
+  "cache_dir": "/home/alex/mojodiffusion/output/cache/boxjana_flux_512",
+  "inner_dim": 3072,
+  "in_channels": 64,
+  "joint_attention_dim": 4096,
+  "out_channels": 64,
+  "num_double": 19,
+  "num_single": 38,
+  "num_heads": 24,
+  "head_dim": 128,
+  "mlp_hidden": 12288,
+  "timestep_dim": 256,
+  "rope_theta": 10000,
+  "resolution": "512",
+  "learning_rate": 1e-5,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 4,
+  "save_every": 0,
+  "sample_every": 0,
+  "optimizer": {
+    "eps": 1e-08,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999
+  }
+}

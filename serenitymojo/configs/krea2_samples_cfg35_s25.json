@@ -1,0 +1,36 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "save_before_sample": false,
+    "precache_required": false,
+    "enforce_min_image_size": false,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 25,
+    "cfg": 3.5,
+    "seed": 88888,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "cached_caption_0",
+      "prompt": "Krea2 inline sampler validation using cached training caption 0",
+      "seed": 88888,
+      "caps": {
+        "negative": "/home/alex/eri2_stage_512/uncond_caps_neg.bin"
+      }
+    },
+    {
+      "id": "cached_caption_1",
+      "prompt": "Krea2 inline sampler validation using cached training caption 1",
+      "seed": 88889,
+      "caps": {
+        "negative": "/home/alex/eri2_stage_512/uncond_caps_neg.bin"
+      }
+    }
+  ]
+}

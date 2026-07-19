@@ -1,0 +1,14 @@
+SECTION	DEFAULT
+KV	DEFAULT	shared	base
+KV	DEFAULT	timeout	30
+SECTION	server
+KV	server	Host	localhost
+KV	server	Port	8080
+KV	server	empty	
+KV	server	KeyWithSpace	v1
+KV	server	padded	trimmed value
+KV	server	colonkey	novalue_sep
+SECTION	db
+KV	db	url	postgres://x
+KV	db	shared	override
+KV	db	nums	1,2,3

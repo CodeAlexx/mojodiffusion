@@ -1,0 +1,18 @@
+{
+  "oracle": "ai-toolkit",
+  "H": 256,
+  "W": 256,
+  "ae_ch": 32,
+  "patch": 2,
+  "gh": 16,
+  "gw": 16,
+  "vae_dtype": "bfloat16",
+  "norm_dtype_prod": "bfloat16",
+  "norm_dtype_f32variant": "float32",
+  "moments_std": 1.7772995233535767,
+  "mean_std": 1.3955048322677612,
+  "latents_std_prod": 0.8320164680480957,
+  "latents_std_f32norm": 0.8321903944015503,
+  "img_seed": 7,
+  "uses_self_bn": false
+}

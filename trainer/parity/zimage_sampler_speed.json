@@ -1,0 +1,57 @@
+{
+  "accepted_speed_parity": false,
+  "mojo": {
+    "artifact_paths": [
+      "/home/alex/serenity-trainer/parity/zimage_mojo_speed.png",
+      "/home/alex/serenity-trainer/parity/zimage_mojo_speed.png.zimage_result.json"
+    ],
+    "denoise_seconds": 145.787464897,
+    "denoise_seconds_per_step": 5.206695174892857,
+    "dtype": "bf16",
+    "guidance": 3.5,
+    "peak_vram_mib": 22238,
+    "prompt": "A close-up portrait of a woman with long curly dark hair, soft natural lighting, blurred background, intimate atmosphere, sharp focus on her face.",
+    "resolution": {
+      "height": 1024,
+      "width": 1024
+    },
+    "seed": 42,
+    "steps": 28,
+    "text_encode_seconds": 33.874484788,
+    "vae_decode_seconds": 1.809631493
+  },
+  "note": "Mojo-side supervisor evidence only unless paired Serenity fields are supplied and strict-speed passes.",
+  "serenity": {
+    "artifact_paths": [
+      "/home/alex/serenity-trainer/parity/zimage_serenity_speed.png",
+      "/home/alex/serenity-trainer/parity/zimage_serenity_speed.json"
+    ],
+    "denoise_seconds": 60.03221411899722,
+    "denoise_seconds_per_step": 2.1440076471070433,
+    "dtype": "bf16",
+    "guidance": 3.5,
+    "peak_vram_mib": 14340,
+    "prompt": "A close-up portrait of a woman with long curly dark hair, soft natural lighting, blurred background, intimate atmosphere, sharp focus on her face.",
+    "resolution": {
+      "height": 1024,
+      "width": 1024
+    },
+    "seed": 42,
+    "steps": 28,
+    "text_encode_seconds": 6.23822177699185,
+    "vae_decode_seconds": 1.062839799997164
+  },
+  "run_identity": {
+    "dtype": "bf16",
+    "guidance": 3.5,
+    "prompt": "A close-up portrait of a woman with long curly dark hair, soft natural lighting, blurred background, intimate atmosphere, sharp focus on her face.",
+    "resolution": {
+      "height": 1024,
+      "width": 1024
+    },
+    "seed": 42,
+    "steps": 28
+  },
+  "schema": "serenity.zimage.sampler_speed.v1",
+  "speed_parity_claim": "not claimed"
+}

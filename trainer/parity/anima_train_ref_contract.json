@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "name": "anima_train_ref",
+  "producer": "scripts/anima_dump_train_ref.py",
+  "reference_policy": {
+    "only_reference": "/home/alex/Serenity-anima-ref",
+    "external_references_used": false,
+    "notes": "The contract is derived only from the local Serenity Anima reference repo, its config, local cache, and local output artifacts."
+  },
+  "reference_sources": {
+    "model_setup": [
+      "/home/alex/Serenity-anima-ref/modules/modelSetup/BaseAnimaSetup.py",
+      "/home/alex/Serenity-anima-ref/modules/modelSetup/AnimaLoRASetup.py",
+      "/home/alex/Serenity-anima-ref/modules/modelSetup/AnimaFineTuneSetup.py"
+    ],
+    "model": "/home/alex/Serenity-anima-ref/modules/model/AnimaModel.py",
+    "data_loader": "/home/alex/Serenity-anima-ref/modules/dataLoader/AnimaBaseDataLoader.py",
+    "loader": "/home/alex/Serenity-anima-ref/modules/modelLoader/AnimaModelLoader.py",
+    "presets": [
+      "/home/alex/Serenity-anima-ref/training_presets/#anima LoRA.json",
+      "/home/alex/Serenity-anima-ref/training_presets/#anima Finetune.json"
+    ],
+    "baseline_config": "/home/alex/Serenity-anima-ref/configs/anima_100step_baseline.json"
+  },
+  "baseline_config_contract": {
+    "model_type": "ANIMA",
+    "training_method": "LORA",
+    "resolution": "512",
+    "batch_size": 2,
+    "learning_rate": 0.00003,
+    "train_dtype": "BFLOAT_16",
+    "fallback_train_dtype": "BFLOAT_16",
+    "output_dtype": "BFLOAT_16",
+    "transformer_weight_dtype": "INT_W8A8",
+    "text_encoder_weight_dtype": "FLOAT_8",
+    "vae_weight_dtype": "FLOAT_32",
+    "layer_filter": "attn1,attn2,ff",
+    "layer_filter_preset": "attn-mlp",
+    "timestep_distribution": "LOGIT_NORMAL",
+    "latent_caching": true,
+    "gradient_checkpointing": "CPU_OFFLOADED",
+    "enable_async_offloading": true,
+    "enable_activation_offloading": true,
+    "compile_for_reference_dump": false,
+    "seed": 42
+  },
+  "one_step_dump_contract": {
+    "max_steps": 1,
+    "long_training_allowed": false,
+    "mojo_build_allowed": false,
+    "cache_build_default": false,
+    "normal_outputs_if_run_by_main_loop": [
+      "parity/anima_train_ref_meta.json",
+      "parity/anima_train_ref_step000.safetensors",
+      "parity/anima_train_ref_step000_adapters.safetensors"
+    ],
+    "captured_tensors": [
+      "batch.*",
+      "trace.encode_text.tokens",
+      "trace.encode_text.tokens_mask",
+      "trace.encode_text.cached_hidden_state",
+      "trace.text_encoder_output",
+      "trace.latent_image_before_scale",
+      "trace.scaled_latent_image",
+      "trace.latent_noise",
+      "trace.scaled_noisy_latent_image",
+      "trace.sigma",
+      "trace.transformer_hidden_states",
+      "trace.transformer_timestep",
+      "trace.encoder_hidden_states",
+      "trace.padding_mask",
+      "trace.predicted_flow",
+      "trace.flow",
+      "output.timestep",
+      "output.predicted",
+      "output.target",
+      "output.loss_pre_scale",
+      "output.loss_for_backward"
+    ]
+  },
+  "dry_run_contract": {
+    "command": "python3 scripts/anima_dump_train_ref.py --dry-run",
+    "artifact": "parity/anima_train_ref_blockers.json",
+    "structured_blocker_categories": [
+      "registration",
+      "baseline",
+      "cache",
+      "weights",
+      "data"
+    ],
+    "must_block_if_missing": [
+      "Serenity model/setup/data loader registration",
+      "completed 100-step metrics.json",
+      "completed 100-step metrics_with_grad.json",
+      "100-step lora.safetensors",
+      "latent/text caches when --allow-cache-build is not set",
+      "local Anima diffusers base model snapshot",
+      "configured concept file and enabled concept paths"
+    ]
+  },
+  "local_baseline_evidence": {
+    "output_dir": "/home/alex/Serenity-anima-ref/output/anima_100step_baseline",
+    "metrics_json": {
+      "sha256": "fe0d11efc41b9a13084d6082b26467e1631bc52f4a7db25893e005f29da50877",
+      "status": "completed",
+      "requested_steps": 100,
+      "global_steps_seen": 100,
+      "progress_event_count": 100,
+      "started_at": "2026-06-05T06:35:36-0700",
+      "completed_at": "2026-06-05T06:38:13-0700",
+      "torch_cuda_max_allocated_mib": 3276,
+      "torch_cuda_max_reserved_mib": 3446
+    },
+    "metrics_with_grad_json": {
+      "sha256": "afd8cc90bdfa29abb39d3f350b7f6997d11f85053c4992e7bc6835840900c73d",
+      "status": "completed",
+      "requested_steps": 100,
+      "global_steps_seen": 100,
+      "loss_count": 100,
+      "grad_norm_count": 100,
+      "last_loss": 0.11683385074138641,
+      "last_smooth_loss": 0.10126834750175476,
+      "last_grad_norm": 0.0030804856214672327,
+      "overall_wall_seconds": 135.88007396800094,
+      "train_wall_seconds": 130.9273821839888,
+      "mean_step_seconds_excluding_first": 1.0924571535151424,
+      "peak_gpu_memory_used_mib_sampled": 5351,
+      "torch_cuda_max_allocated_mib": 3276,
+      "torch_cuda_max_reserved_mib": 3446
+    },
+    "lora_safetensors": {
+      "sha256": "ba1640c41776a2818c02291ed2491a74c456e3148e15634d02672b7b9dcc4f16",
+      "size_bytes": 45983120,
+      "key_count": 840,
+      "dtype_counts": {
+        "bfloat16": 840
+      },
+      "sample_key_prefix": "transformer.transformer_blocks.0.attn1.to_k"
+    }
+  },
+  "local_cache_evidence": {
+    "cache_dir": "/home/alex/Serenity-anima-ref/workspace-cache/anima_100step_baseline",
+    "image_file_count": 238,
+    "text_file_count": 238
+  },
+  "local_data_evidence": {
+    "concept_file_name": "/home/alex/Serenity/training_concepts/eri2_concepts.json",
+    "enabled_concept_path": "/home/alex/eri2",
+    "enabled_concept_file_count_bounded": 2596
+  },
+  "local_weight_evidence": {
+    "base_model_name": "/home/alex/.cache/huggingface/hub/models--circlestone-labs--Anima-Base-v1.0-Diffusers/snapshots/073c3a9db359c31ad0e8aa268d15775473c2176c",
+    "kind": "diffusers_dir",
+    "required_subfolders": [
+      "tokenizer",
+      "t5_tokenizer",
+      "text_encoder",
+      "text_conditioner",
+      "transformer",
+      "vae",
+      "scheduler"
+    ],
+    "file_count_following_symlinks": 18,
+    "du_following_symlinks": "5.3G"
+  },
+  "known_gaps": [
+    "This slice does not claim Mojo train parity; no Mojo build or gate was run.",
+    "The agent did not run the one-step GPU dump; main loop owns builds/runs/gates.",
+    "The present artifact is a blocker/contract/dry-run slice plus local baseline evidence."
+  ]
+}

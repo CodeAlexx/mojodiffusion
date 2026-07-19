@@ -1,0 +1,38 @@
+{
+ "schema": "serenity.sample_prompts.v1",
+ "defaults": {
+  "sample_every": 500,
+  "sample_at_start": false,
+  "save_before_sample": false,
+  "precache_required": false,
+  "enforce_min_image_size": false,
+  "width": 1024,
+  "height": 1024,
+  "frames": 1,
+  "fps": 24,
+  "steps": 30,
+  "cfg": 3.5,
+  "seed": 88888,
+  "negative": ""
+ },
+ "prompts": [
+  {
+   "id": "bincond_s111",
+   "prompt": "x",
+   "seed": 111,
+   "caps": {
+    "positive": "/home/alex/eri2_stage_512/incond_pos.bin",
+    "negative": "/home/alex/eri2_stage_512/incond_neg.bin"
+   }
+  },
+  {
+   "id": "bincond_s555",
+   "prompt": "x",
+   "seed": 555,
+   "caps": {
+    "positive": "/home/alex/eri2_stage_512/incond_pos.bin",
+    "negative": "/home/alex/eri2_stage_512/incond_neg.bin"
+   }
+  }
+ ]
+}

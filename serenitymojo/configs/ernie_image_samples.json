@@ -1,0 +1,36 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "save_before_sample": true,
+    "precache_required": true,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 1,
+    "cfg": 4.0,
+    "seed": 42,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "boxjana_studio_cocktail",
+      "prompt": "box1jana, a high-resolution studio portrait, ornate chair, cocktail, studio lighting",
+      "caps": {
+        "positive": "/home/alex/mojodiffusion/serenitymojo/output/ernie_prompt_caps/boxjana_studio_cocktail_pos.safetensors",
+        "negative": "/home/alex/mojodiffusion/serenitymojo/output/ernie_prompt_caps/boxjana_studio_cocktail_neg.safetensors"
+      }
+    },
+    {
+      "id": "boxjana_beach_sunset",
+      "prompt": "box1jana standing on a beach at sunset, ocean waves, warm cinematic light",
+      "seed": 43,
+      "caps": {
+        "positive": "/home/alex/mojodiffusion/serenitymojo/output/ernie_prompt_caps/boxjana_beach_sunset_pos.safetensors",
+        "negative": "/home/alex/mojodiffusion/serenitymojo/output/ernie_prompt_caps/boxjana_beach_sunset_neg.safetensors"
+      }
+    }
+  ]
+}

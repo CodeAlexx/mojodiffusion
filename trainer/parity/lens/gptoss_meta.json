@@ -1,0 +1,86 @@
+{
+  "seed": 20260607,
+  "seq_len": 160,
+  "selected_layers": [
+    5,
+    11,
+    17,
+    23
+  ],
+  "hidden": 2880,
+  "vocab_size": 201088,
+  "sliding_window": 128,
+  "num_layers": 24,
+  "layer_types": [
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention",
+    "sliding_attention",
+    "full_attention"
+  ],
+  "per_layer": [
+    {
+      "layer": 5,
+      "shape": [
+        1,
+        160,
+        2880
+      ],
+      "mean": 0.11102525144815445,
+      "std": 8.356053352355957,
+      "absmax": 222.0
+    },
+    {
+      "layer": 11,
+      "shape": [
+        1,
+        160,
+        2880
+      ],
+      "mean": 0.14938800036907196,
+      "std": 65.10932159423828,
+      "absmax": 41216.0
+    },
+    {
+      "layer": 17,
+      "shape": [
+        1,
+        160,
+        2880
+      ],
+      "mean": -1.7231196165084839,
+      "std": 111.31222534179688,
+      "absmax": 2304.0
+    },
+    {
+      "layer": 23,
+      "shape": [
+        1,
+        160,
+        2880
+      ],
+      "mean": 1.0033462047576904,
+      "std": 1207.9256591796875,
+      "absmax": 24832.0
+    }
+  ]
+}

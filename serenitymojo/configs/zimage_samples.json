@@ -1,0 +1,39 @@
+{
+ "schema": "serenity.sample_prompts.v1",
+ "_comment": "caps.positive/caps.negative are PLACEHOLDER paths — zimage inline sampling reads PRE-ENCODED cap bins, not live text. Point these at real encoded bins (or run the standalone sampler) before enabling inline sampling.",
+ "defaults": {
+  "sample_every": 500,
+  "sample_at_start": true,
+  "save_before_sample": true,
+  "precache_required": true,
+  "enforce_min_image_size": true,
+  "width": 1024,
+  "height": 1024,
+  "frames": 1,
+  "fps": 24,
+  "steps": 20,
+  "cfg": 4.0,
+  "seed": 42,
+  "negative": ""
+ },
+ "prompts": [
+  {
+   "id": "zimage_garden_portrait",
+   "prompt": "a portrait photograph of a woman with long hair in a sunlit garden, soft natural lighting, high detail",
+   "seed": 42,
+   "caps": {
+    "positive": "/home/alex/mojodiffusion/output/sample_caps/zimage/garden_portrait_pos.bin",
+    "negative": "/home/alex/mojodiffusion/output/sample_caps/zimage/garden_portrait_neg.bin"
+   }
+  },
+  {
+   "id": "zimage_city_dusk",
+   "prompt": "a cinematic photograph of a man in a dark coat on a city street at dusk, dramatic lighting, sharp focus",
+   "seed": 43,
+   "caps": {
+    "positive": "/home/alex/mojodiffusion/output/sample_caps/zimage/city_dusk_pos.bin",
+    "negative": "/home/alex/mojodiffusion/output/sample_caps/zimage/city_dusk_neg.bin"
+   }
+  }
+ ]
+}

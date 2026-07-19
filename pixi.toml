@@ -1,0 +1,45 @@
+[workspace]
+authors = ["CodeAlexx <codealex@example.com>"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+name = "mojodiffusion"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[dependencies]
+max = ">=26.3.0,<26.4"
+rust = ">=1.85"
+libjpeg-turbo = ">=3.1.4.1,<4"
+libpng = ">=1.6.58,<2"
+sqlite = ">=3.45,<4"
+pkg-config = ">=0.29,<1"
+make = ">=4.4,<5"
+cudnn = ">=9,<10"
+cuda-cudart-dev = ">=12.8,<14"
+cuda-driver-dev = ">=12.8,<14"
+cuda-nvrtc-dev = ">=12.8,<14"
+libcublas-dev = ">=12.8,<14"
+patchelf = ">=0.17,<0.18"
+
+[tasks]
+setup = "bash scripts/setup.sh"
+repository-check = "bash scripts/check_repository_contract.sh"
+build-cshim = "bash serenitymojo/ops/cshim/build.sh"
+build-krea-stage = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib -Xlinker -lm -Xlinker -lpng16 -Xlinker -lturbojpeg serenitymojo/pipeline/zimage_stage.mojo -o output/bin/serenity_image_dataset_stage"
+build-inference-stub = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib -Xlinker -lm serenitymojo/serve/serenity_worker_stub.mojo -o output/bin/serenity_worker_stub"
+build-inference = { cmd = "bash scripts/verify_renamed_entrypoints.sh production-inference && bash scripts/fix_mojo_runpath.sh output/bin/serenity_sd3_conditioning output/bin/klein_precache_sample_prompts output/bin/klein_sample_cli", depends-on = ["build-cshim", "build-sd3-conditioning", "build-klein-precache", "build-klein-sampler"] }
+build-sd3-conditioning = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/serve/sd3_conditioning_cache.mojo -o output/bin/serenity_sd3_conditioning"
+build-klein-precache = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib serenitymojo/pipeline/klein9b_precache_sample_prompts.mojo -o output/bin/klein_precache_sample_prompts"
+build-klein-sampler = { cmd = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/sampling/klein_sample_cli.mojo -o output/bin/klein_sample_cli", depends-on = ["build-cshim"] }
+build-krea-cache = { cmd = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/models/krea2/krea2_prepare_cache.mojo -o output/bin/serenity_krea2_prepare_cache", depends-on = ["build-cshim"] }
+build-anima-cache = { cmd = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/models/anima/anima_prepare_cache.mojo -o output/bin/serenity_anima_prepare_cache", depends-on = ["build-cshim"] }
+build-anima-trainer = { cmd = "mkdir -p output/bin && bash scripts/verify_renamed_entrypoints.sh trainer-anima", depends-on = ["build-cshim"] }
+build-chroma-cache = { cmd = "mkdir -p output/bin && mojo build --optimization-level 2 -I . -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/models/chroma/chroma_prepare_cache.mojo -o output/bin/serenity_chroma_prepare_cache", depends-on = ["build-cshim"] }
+build-chroma-trainer = { cmd = "mkdir -p output/bin && bash scripts/verify_renamed_entrypoints.sh trainer-chroma", depends-on = ["build-cshim"] }
+build-krea-trainer = { cmd = "mkdir -p output/bin && mojo build --optimization-level 2 -D KREA2_RESIDENT_BLOCKS=22 -I . -I trainer/src -I vendor/mojo-libs -Xlinker -lm -Xlinker -ldl -Xlinker -L$CONDA_PREFIX/targets/x86_64-linux/lib/stubs -Xlinker -lcuda -Xlinker -L$CONDA_PREFIX/lib -Xlinker -rpath-link -Xlinker $CONDA_PREFIX/lib -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker \\$ORIGIN/../../.pixi/envs/default/lib:\\$ORIGIN/../../serenitymojo/ops/cshim/lib serenitymojo/models/krea2/train_krea2.mojo -o output/bin/serenity_krea2_live_trainer", depends-on = ["build-cshim"] }
+build-trainer = { cmd = "cargo build --release --manifest-path trainer/webui/Cargo.toml --bins && bash scripts/fix_mojo_runpath.sh output/bin/serenity_image_dataset_stage output/bin/serenity_krea2_prepare_cache output/bin/serenity_krea2_live_trainer output/bin/serenity_anima_prepare_cache output/bin/serenity_anima_live_trainer output/bin/serenity_chroma_prepare_cache output/bin/serenity_chroma_live_trainer", depends-on = ["setup", "build-krea-stage", "build-krea-cache", "build-krea-trainer", "build-anima-cache", "build-anima-trainer", "build-chroma-cache", "build-chroma-trainer"] }
+build-krea = { cmd = "cargo build --release --manifest-path trainer/webui/Cargo.toml --bins", depends-on = ["setup", "build-krea-stage", "build-krea-cache", "build-krea-trainer"] }
+check-trainer-web = "cargo test --manifest-path trainer/webui/Cargo.toml"
+check-server = "cargo test --manifest-path serenity-server/Cargo.toml --workspace"
+check = { cmd = "cargo test --manifest-path trainer/webui/Cargo.toml && cargo test --manifest-path serenity-server/Cargo.toml --workspace", depends-on = ["repository-check"] }
+trainer = { cmd = "cargo run --release --manifest-path trainer/webui/Cargo.toml --bin serenity-web-trainer", depends-on = ["build-trainer"] }
+verify-renamed-entrypoints = { cmd = "bash scripts/verify_renamed_entrypoints.sh", depends-on = ["build-cshim"] }

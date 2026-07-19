@@ -1,0 +1,28 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "save_before_sample": true,
+    "precache_required": true,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 30,
+    "cfg": 4.5,
+    "seed": 42,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "anima_alina_garden",
+      "prompt": "alverone , a high-resolution photograph featuring a young caucasian woman with long blonde hair, wearing a casual white sundress, standing in a sunlit garden, soft natural lighting, professional photography",
+      "seed": 42,
+      "caps": {
+        "positive": "/home/alex/mojodiffusion/output/anima_gap2/anima_context_mojo.safetensors",
+        "negative": "/home/alex/mojodiffusion/output/giger3_prompts/uncond.safetensors"
+      }
+    }
+  ]
+}

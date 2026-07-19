@@ -1,0 +1,20 @@
+{
+  "H": 480,
+  "W": 832,
+  "num_steps": 40,
+  "guidance": 5.0,
+  "shift": 3.0,
+  "seed": 12345,
+  "prompt": "{\"comprehensive_description\": \"A single glossy red apple rests at the center of a warm-toned wooden table, photographed as a crisp photorealistic studio still life. The apple's smooth waxy skin shows deep crimson and scarlet tones with subtle yellow-green mottling near its short brown stem, catching a bright specular highlight from a soft key light above. It sits on the horizontal planks of a rustic oak table whose visible grain runs left to right, lit by clean studio lighting that casts a soft contact shadow beneath the fruit against a smoothly graded neutral background.\", \"camera_info\": {\"color\": \"Warm\", \"frame_size\": \"Close Up\", \"shot_type_angle\": \"Eye level\", \"lens_size\": \"Medium\", \"composition\": \"Center\", \"lighting\": \"Soft light\", \"lighting_type\": \"Artificial light\"}, \"world_knowledge\": [], \"prominent_elements\": [{\"name\": \"red apple\", \"description\": \"A single ripe red apple, the dominant subject, with a rounded body and a short woody stem at the top.\", \"location\": \"center of the frame, resting on the table surface\", \"relative_size\": \"dominant\", \"shape_and_color\": \"rounded spherical form in deep red and crimson with faint yellow-green flecks\", \"texture\": \"smooth, waxy, glossy\", \"appearance_details\": \"bright specular highlight on the upper left, a small brown stem, faint natural mottling on the skin\", \"relationship\": \"sits on top of the wooden table, casting a soft shadow onto its surface\", \"orientation\": \"upright with the stem pointing up\"}, {\"name\": \"wooden table\", \"description\": \"A rustic oak tabletop that fills the lower portion of the frame and supports the apple.\", \"location\": \"lower half of the frame, extending horizontally\", \"relative_size\": \"large\", \"shape_and_color\": \"flat horizontal surface in warm honey-brown tones\", \"texture\": \"matte wood with visible grain\", \"appearance_details\": \"natural wood grain lines running left to right, subtle knots and color variation\", \"relationship\": \"supports the red apple and receives its soft contact shadow\", \"orientation\": \"horizontal\"}]}",
+  "L_cond": 457,
+  "L_uncond": 155,
+  "depth": 24,
+  "n_video": 1560,
+  "lh": 60,
+  "lw": 104,
+  "sf_S": 72,
+  "sf_GT": 1,
+  "sf_GH": 8,
+  "sf_GW": 8,
+  "sf_TEXT_LEN": 8
+}

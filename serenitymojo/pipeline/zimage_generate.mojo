@@ -1,0 +1,1293 @@
+# zimage_generate.mojo — reusable Z-Image text→image entry (RUNTIME prompt).
+#
+# Same public stages as zimage_pipeline.mojo:
+#   tokenizer → Qwen3-4B encoder (layer-34 penultimate) → CFG denoise loop
+#   (dual Mojo Z-Image stack forward + rectified-flow Euler) → Z-Image VAE decode.
+#
+# LoRA behavior is AI Toolkit-style FORWARD OVERLAY, not a weight merge:
+#   base projection forward + lora_up(lora_down(x)) * multiplier * alpha/rank.
+# Do not swap this back to `LoraSet.merge_into_indexed`; the production trainer
+# saves main-layer PEFT/PERT adapters and sampling must exercise that same path.
+#
+# Runtime prompts use fixed CAPLEN_MAX padding. We encode at ENC_SEQ=512 (Qwen3
+# is causal), slice to CAPLEN_MAX, and replace rows [real_caplen, CAPLEN_MAX)
+# with the learned cap_pad_token. RoPE pad rows follow the trainer convention:
+# cap pad positions are (0,0,0).
+#
+# EVERY OTHER NUMERIC CONVENTION IS BYTE-FOR-BYTE PRESERVED (see header of
+# zimage_pipeline.mojo + docs/ZIMAGE_DENOISE_SIGN_CONVENTION.md):
+#   • timestep = (1 - sigma) (DiT ×1000 internally)
+#   • CFG code-form pred_raw = vu + cfg*(vc - vu), then negate before scheduler:
+#       noise_pred = -(vu + cfg*(vc - vu))
+#   • Euler: x += (sigma_next - sigma) * noise_pred  (latent kept F32)
+#   • sigmas: Comfy ModelSamplingDiscreteFlow simple scheduler, shift=3.0 default
+#   • encoder: layer-34, cap fed rank-2 [caplen, 2560]
+#   • VAE: scale=0.3611, shift=0.1159 (baked in decoder); PNG SIGNED [-1,1]
+#
+# Verified on 2026-06-02: three 1024 caption-based samples from
+# output/zimage/zimage_lora_step2000.safetensors completed with the LoRA
+# overlay loaded (210 main adapters, alpha/rank=0.0625).
+#
+# Build:
+#   cd /home/alex/mojodiffusion && pixi run mojo build -I . \
+#     serenitymojo/pipeline/zimage_generate.mojo -o /tmp/zimage_generate_check \
+#     -Xlinker -lm -Xlinker -lcuda \
+#     -Xlinker -Lserenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa
+#
+# Runtime:
+#   /tmp/zimage_generate_check [lora_path|base] [out_png] [seed] [prompt]
+#   /tmp/zimage_generate_check [lora_path|base] [out_png] [sample_prompts.json] [prompt_id]
+
+from std.sys import argv
+from std.gpu.host import DeviceContext
+from std.math import sqrt, log, cos
+from std.memory import alloc
+from std.time import perf_counter_ns
+
+from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.ffi import (
+    sys_open, sys_close, sys_pwrite, BytePtr,
+    O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC,
+)
+from serenitymojo.io.json_header import _Cursor, _parse_string, _skip_value
+from serenitymojo.io.train_config_reader import _read_file_bytes, _read_scalar
+from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
+from serenitymojo.models.text_encoder.qwen3_encoder import Qwen3Encoder, Qwen3Config
+from serenitymojo.models.vae.zimage_decoder import ZImageDecoder
+from serenitymojo.models.vae.zimage_tiled_decode import (
+    zimage_tiled_decode_with_decoder,
+)
+from serenitymojo.models.zimage.weights import (
+    ZImageBlockWeights, load_zimage_block_weights_prefixed_mixed,
+)
+from serenitymojo.models.zimage.block import ZImageModVecs
+from serenitymojo.models.zimage.zimage_stack_lora import (
+    ZImageLoraDeviceSet, load_zimage_lora_main_only_resume,
+    build_zimage_zero_lora_device_set, zimage_lora_set_to_device,
+    zimage_refine_x_seq, zimage_stack_lora_predict_main_device_tensor,
+    zimage_stack_lora_predict_main_from_refined_device_tensor,
+    zimage_stack_lora_predict_main_from_refined_moddev_tensor,
+    zimage_unpatchify_image_rows_channel_minor,
+)
+from serenitymojo.models.zimage.lora_block import (
+    ZImageModVecsDevice, zimage_modvecs_to_device,
+)
+from serenitymojo.models.zimage.real_weights import (
+    ZImageRealAux, load_zimage_real_aux, build_adaln, build_block_modvecs,
+    build_f_scale, build_cap_seq, build_x_seq, build_rope, build_positions,
+)
+from serenitymojo.ops.tensor_algebra import reshape, permute, mul_scalar, add, sub, slice
+from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.training.sample_prompt_config import (
+    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+)
+from serenitymojo.training.progress_display import print_sample_step, print_sample_saved
+from serenitymojo.sampling.zimage_sampler_contract import (
+    zimage_comfy_simple_sigmas_with_shift,
+)
+
+
+# ── shared verified checkpoint snapshot (DiT + VAE parity used this exact one) ──
+comptime ZROOT = "/home/alex/.serenity/models/zimage_base"
+comptime TRANSFORMER = "/home/alex/.serenity/models/zimage_base/transformer"
+comptime TEXT_ENCODER = ZROOT + "/text_encoder"
+comptime VAE_DIR = ZROOT + "/vae"
+comptime TOK_JSON = ZROOT + "/tokenizer/tokenizer.json"
+
+# ── Z-Image transformer constants shared with train_zimage_real.mojo ─────────
+comptime H = 30
+comptime Dh = 128
+comptime D = H * Dh
+comptime F = 10240
+comptime CAP_DIM = 2560
+comptime ADALN_DIM = 256
+comptime T_SCALE = Float32(1000.0)
+comptime ROPE_THETA = Float32(256.0)
+comptime AXIS0 = 32
+comptime AXIS1 = 48
+comptime AXIS2 = 48
+comptime EPS = Float32(1e-5)
+comptime FINAL_EPS = Float32(1e-6)
+comptime LAT_C = 16
+comptime OUT_CH = 64
+comptime PATCH = 2
+comptime NUM_NR = 2
+comptime NUM_CR = 2
+comptime MAIN_DEPTH = 30
+comptime RANK = 16
+comptime ALPHA = Float32(1.0)
+
+# ── fixed-caption + encoder constants ──
+comptime HIDDEN = 2560
+comptime ENC_SEQ = 512        # encoder runs at this supported sdpa seq, sliced to CAPLEN_MAX
+comptime CAPLEN_MAX = 256     # comptime cap buffer (mult of 32). build_positions now
+                              # follows SerenityTrainer/diffusers exactly: caption rows
+                              # [0,cap_padded) get sequential RoPE positions (cap_padded =
+                              # real_caplen rounded up to 32) and the image offset is
+                              # cap_padded+1, NOT CAPLEN_MAX+1. When real_caplen rounds to
+                              # CAPLEN_MAX (the verified-parity prompts) cap_padded==CAPLEN_MAX
+                              # so positions are unchanged; shorter prompts now match diffusers.
+comptime PAD_ID = 151643      # Qwen pad token (prepare_l2p PAD_TOKEN_ID); right-pad, causal-masked
+comptime EXTRACT_LAYER = 34   # Qwen3-4B penultimate (Z-Image canonical)
+comptime ZIMAGE_DEFAULT_SIGMA_SHIFT = Float32(3.0) # SwarmUI/Comfy ZImage sampling_settings shift
+comptime ZIMAGE_COMFY_TIMESTEPS = 1000
+comptime PI = 6.283185307179586  # 2*pi
+
+# ── default demo config (preserves the original standalone main() image) ──
+comptime DEFAULT_HL = 128     # latent height = image_h / 8 (1024²)
+comptime DEFAULT_WL = 128
+# High-res latent grids (image = 8 * latent). Denoise uses cuDNN flash SDPA
+# (O(S) memory — no [H,S,S] score matrix), so the only remaining hi-res wall is
+# the VAE decode, handled with tiled decode for 1536/2048.
+comptime HL_1536 = 192        # 1536² → latent 192 (tiled decode, TILE=96)
+comptime WL_1536 = 192
+comptime HL_2048 = 256        # 2048² → latent 256 (tiled decode, TILE=128)
+comptime WL_2048 = 256
+comptime DEFAULT_STEPS = 30
+comptime DEFAULT_CFG = Float32(4.0)
+comptime DEFAULT_SEED = UInt64(42)
+comptime OUT = "/home/alex/mojodiffusion/output/zimage_generate_1024.png"
+comptime DEFAULT_PROMPT = (
+    "alverone, a high-resolution photograph featuring a young caucasian woman"
+    " with long, straight, platinum blonde hair and fair skin, standing in a"
+    " cobblestone courtyard in a pink sleeveless dress with a fantasy castle in"
+    " the background, overcast sky, casual relaxed atmosphere"
+)
+comptime DEFAULT_TRACE_DENOISE_STATS = False
+comptime SAMPLE_REQUEST_SCHEMA = "serenity.zimage.sample_request.v1"
+comptime SAMPLE_REQUEST_MODE = "split_process_after_train_memory_release"
+
+
+# ── progress event (drained by the caller; mirrors the m8 mock tick model) ──
+comptime ZEVENT_STARTED = 0
+comptime ZEVENT_STEP = 1
+comptime ZEVENT_DONE = 2
+comptime ZEVENT_FAILED = 3
+
+
+@fieldwise_init
+struct ZImageEvent(Copyable, Movable):
+    """Progress event emitted by zimage_generate. The caller drains `events`
+    after each call (or, when driven step-by-step, between steps)."""
+
+    var kind: Int      # ZEVENT_STARTED | ZEVENT_STEP | ZEVENT_DONE | ZEVENT_FAILED
+    var step: Int      # current step (1-based) for ZEVENT_STEP, else 0
+    var total: Int     # total steps
+    var message: String
+
+
+@fieldwise_init
+struct ZImageSampleRequest(Copyable, Movable):
+    var lora_path: String
+    var state_path: String
+    var sample_file: String
+    var output_png: String
+    var result_manifest: String
+    var completed_step: Int
+    # ── T1.F validation adapter sweep (SimpleTuner --validation_adapter_config
+    # analogue). OPTIONAL request fields; absent → both lists empty → current
+    # single-render behavior, byte-for-byte. When present, the sampler renders
+    # the normal trained-LoRA image first, then one extra image per sweep
+    # adapter (plus a no-adapter "base" comparison image), each with an
+    # adapter-tagged filename. sweep_strengths[i] multiplies LoRA alpha for
+    # sweep_loras[i] (SimpleTuner validation_adapter_strength); empty → all 1.0.
+    var sweep_loras: List[String]
+    var sweep_strengths: List[Float32]
+
+
+@fieldwise_init
+struct ZImageDenoiseResult(Movable):
+    var latent: Tensor
+    var denoise_seconds: Float64
+
+
+@fieldwise_init
+struct ZImageGenerateResult(Movable):
+    var rgb: Tensor
+    var text_encode_seconds: Float64
+    var denoise_seconds: Float64
+    var vae_decode_seconds: Float64
+    var peak_vram_mib: Float64
+
+
+# ── fixed-padded caption pair (real_caplen tracked) ──
+@fieldwise_init
+struct CapFeatsFixed(Movable):
+    var cond: Tensor      # [CAPLEN_MAX, HIDDEN]
+    var uncond: Tensor    # [CAPLEN_MAX, HIDDEN]
+    var real_cond: Int    # true cond token count (≤ CAPLEN_MAX)
+    var real_uncond: Int  # true uncond token count (≤ CAPLEN_MAX)
+
+
+# ── one encoded caption (fixed buffer + true token count) ──
+@fieldwise_init
+struct EncodedCap(Movable):
+    var feats: Tensor   # [CAPLEN_MAX, HIDDEN]
+    var real_len: Int   # true token count (≤ CAPLEN_MAX)
+
+    # Consume self + uncond into the final pair in ONE expression so neither
+    # struct is read after a partial `^`-move (mirrors qwenimage EncodedCaption
+    # .into_caps; `deinit` is valid here because the args are Self type).
+    def into_pair(deinit self, deinit uncond: EncodedCap) -> CapFeatsFixed:
+        return CapFeatsFixed(self.feats^, uncond.feats^, self.real_len, uncond.real_len)
+
+
+# splitmix64 → uniform [0,1). Self-contained, deterministic. (verbatim)
+def _u01(mut state: UInt64) -> Float64:
+    state = state + 0x9E3779B97F4A7C15
+    var z = state
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    z = z ^ (z >> 31)
+    return Float64(z >> 11) * (1.0 / 9007199254740992.0)
+
+
+# seeded Gaussian noise on host (Box-Muller); seed is now a runtime param. (verbatim math)
+def gaussian_noise(n: Int, seed: UInt64) raises -> List[Float32]:
+    var state = seed
+    var out = List[Float32]()
+    var i = 0
+    while i < n:
+        var u1 = _u01(state)
+        var u2 = _u01(state)
+        if u1 < 1e-12:
+            u1 = 1e-12
+        var r = sqrt(-2.0 * log(u1))
+        out.append(Float32(r * cos(PI * u2)))
+        if i + 1 < n:
+            out.append(Float32(r * cos(PI * u2 + 1.5707963267948966)))  # +pi/2 → sin
+        i += 2
+    return out^
+
+
+# Host round-trip dtype cast (to_host→F32, from_host→target). (verbatim)
+def _cast(t: Tensor, dt: STDtype, ctx: DeviceContext) raises -> Tensor:
+    var hh = t.to_host(ctx)
+    return Tensor.from_host(hh, t.shape(), dt, ctx)
+
+
+def _stats(name: String, t: Tensor, ctx: DeviceContext) raises:
+    var h = t.to_host(ctx)
+    var n = len(h)
+    if n == 0:
+        return
+    var s = 0.0
+    var s2 = 0.0
+    var amax = 0.0
+    for i in range(n):
+        var v = Float64(h[i])
+        s += v
+        s2 += v * v
+        var av = v if v >= 0.0 else -v
+        if av > amax:
+            amax = av
+    var mean = s / Float64(n)
+    var var_ = s2 / Float64(n) - mean * mean
+    if var_ < 0.0:
+        var_ = 0.0
+    print(
+        "  [stat]", name, "mean=", Float32(mean), "std=", Float32(sqrt(var_)),
+        "absmax=", Float32(amax), "n=", n,
+    )
+
+
+def _unified_positions(x_pos: List[List[Int]], cap_pos: List[List[Int]]) -> List[List[Int]]:
+    var uni_pos = List[List[Int]]()
+    for i in range(len(x_pos)):
+        uni_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos)):
+        uni_pos.append(cap_pos[i].copy())
+    return uni_pos^
+
+
+def _cap_seq_with_pad(
+    aux: ZImageRealAux, cap_feats: Tensor, real_caplen: Int,
+    cap_pad_h: List[Float32], ctx: DeviceContext,
+) raises -> List[Float32]:
+    var cap_f32 = _cast(cap_feats, STDtype.F32, ctx)
+    var cap_seq = build_cap_seq(aux, cap_f32, EPS, ctx)
+    var real_len = real_caplen
+    if real_len < 0:
+        real_len = 0
+    if real_len > CAPLEN_MAX:
+        real_len = CAPLEN_MAX
+    for r in range(real_len, CAPLEN_MAX):
+        for c in range(D):
+            cap_seq[r * D + c] = cap_pad_h[c]
+    return cap_seq^
+
+
+def _unpatchify_patch_list[HL: Int, WL: Int](
+    patches: List[Float32], ctx: DeviceContext
+) raises -> Tensor:
+    comptime HT = HL // PATCH
+    comptime WT = WL // PATCH
+    comptime N_IMG_REAL = HT * WT
+    comptime REAL_PATCH_VALUES = N_IMG_REAL * OUT_CH
+    if len(patches) < REAL_PATCH_VALUES:
+        raise Error("zimage_generate: predicted patch list is shorter than the real image grid")
+    var real_vals = List[Float32]()
+    for i in range(REAL_PATCH_VALUES):
+        real_vals.append(patches[i])
+    var seq = Tensor.from_host(real_vals^, [N_IMG_REAL, OUT_CH], STDtype.F32, ctx)
+    var v = reshape(seq, [HT, WT, PATCH, PATCH, LAT_C], ctx)
+    var perm = List[Int]()
+    perm.append(4); perm.append(0); perm.append(2); perm.append(1); perm.append(3)
+    var p = permute(v, perm^, ctx)
+    return reshape(p, [1, LAT_C, HL, WL], ctx)
+
+
+def _latent_velocity_overlay[
+    HL: Int, WL: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    latent: Tensor, cap_seq: List[Float32],
+    nr_blocks: List[ZImageBlockWeights], nr_mod: List[ZImageModVecs],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecs],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    aux: ZImageRealAux,
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_pad_h: List[Float32],
+    x_cos: Tensor, x_sin: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    comptime HT = HL // PATCH
+    comptime WT = WL // PATCH
+    comptime N_IMG_REAL = HT * WT
+    comptime IMG_PAD = N_IMG - N_IMG_REAL
+
+    var x_seq = build_x_seq(aux, latent, LAT_C, HL, WL, PATCH, ctx)
+    for _pad in range(IMG_PAD):
+        for c in range(D):
+            x_seq.append(x_pad_h[c])
+
+    var patches = zimage_stack_lora_predict_main_device_tensor[H, Dh, N_IMG, N_TXT, S](
+        x_seq.copy(), cap_seq.copy(),
+        nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora,
+        f_scale.copy(), final_lin_w, final_lin_b,
+        x_cos, x_sin, cap_cos, cap_sin, uni_cos, uni_sin,
+        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+    )
+    return zimage_unpatchify_image_rows_channel_minor(
+        patches^, LAT_C, HL, WL, PATCH, ctx
+    )
+
+
+def _latent_velocity_overlay_from_refined[
+    HL: Int, WL: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    xs: List[Float32], cap_seq: List[Float32],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights], main_mod: List[ZImageModVecsDevice],
+    lora: ZImageLoraDeviceSet,
+    f_scale: List[Float32],
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    cap_cos: Tensor, cap_sin: Tensor,
+    uni_cos: Tensor, uni_sin: Tensor,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var patches = zimage_stack_lora_predict_main_from_refined_moddev_tensor[H, Dh, N_IMG, N_TXT, S](
+        xs.copy(), cap_seq.copy(),
+        cr_blocks, main_blocks, main_mod, lora,
+        f_scale.copy(), final_lin_w, final_lin_b,
+        cap_cos, cap_sin, uni_cos, uni_sin,
+        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+    )
+    return zimage_unpatchify_image_rows_channel_minor(
+        patches^, LAT_C, HL, WL, PATCH, ctx
+    )
+
+
+def _trace_stage(label: String, t0: UInt, ctx: DeviceContext) raises -> UInt:
+    # Trace mode deliberately synchronizes so the printed stage timings are real.
+    ctx.synchronize()
+    var now = perf_counter_ns()
+    print("[trace][zimage]", label, Float64(now - t0) / 1.0e9, "s")
+    return now
+
+
+def _cfg_pred_overlay[
+    HL: Int, WL: Int, N_IMG: Int, N_TXT: Int, S: Int
+](
+    latent: Tensor, t: Float32, cfg: Float32,
+    cap_seq_cond: List[Float32], cap_seq_uncond: List[Float32],
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    lora: ZImageLoraDeviceSet,
+    aux: ZImageRealAux,
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_pad_h: List[Float32],
+    x_cos_cond: Tensor, x_sin_cond: Tensor,
+    cap_cos_cond: Tensor, cap_sin_cond: Tensor,
+    uni_cos_cond: Tensor, uni_sin_cond: Tensor,
+    x_cos_uncond: Tensor, x_sin_uncond: Tensor,
+    cap_cos_uncond: Tensor, cap_sin_uncond: Tensor,
+    uni_cos_uncond: Tensor, uni_sin_uncond: Tensor,
+    trace: Bool,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var trace_t0 = perf_counter_ns()
+    var adaln = build_adaln(aux, t, ADALN_DIM, T_SCALE, ctx)
+    var nr_mod = List[ZImageModVecs]()
+    for j in range(NUM_NR):
+        nr_mod.append(build_block_modvecs(aux.nr_mod_w[j][], aux.nr_mod_b[j][], adaln, D, ctx))
+    var main_mod = List[ZImageModVecs]()
+    for j in range(MAIN_DEPTH):
+        main_mod.append(build_block_modvecs(aux.main_mod_w[j][], aux.main_mod_b[j][], adaln, D, ctx))
+    var main_mod_dev = List[ZImageModVecsDevice]()
+    for j in range(MAIN_DEPTH):
+        main_mod_dev.append(zimage_modvecs_to_device(main_mod[j], D, ctx))
+    var f_scale = build_f_scale(aux, adaln, D, ctx)
+    if trace:
+        trace_t0 = _trace_stage("adaln_mods", trace_t0, ctx)
+
+    comptime HT = HL // PATCH
+    comptime WT = WL // PATCH
+    comptime N_IMG_REAL = HT * WT
+    comptime IMG_PAD = N_IMG - N_IMG_REAL
+    var x_seq = build_x_seq(aux, latent, LAT_C, HL, WL, PATCH, ctx)
+    for _pad in range(IMG_PAD):
+        for c in range(D):
+            x_seq.append(x_pad_h[c])
+    var xs = zimage_refine_x_seq[H, Dh, N_IMG](
+        x_seq^, nr_blocks, nr_mod, x_cos_cond, x_sin_cond, D, F, EPS, ctx,
+    )
+    if trace:
+        trace_t0 = _trace_stage("noise_refiner", trace_t0, ctx)
+
+    var cfg_delta = cfg - Float32(1.0)
+    if cfg_delta < Float32(0.0):
+        cfg_delta = -cfg_delta
+    if cfg_delta <= Float32(1.0e-6):
+        var vc = _latent_velocity_overlay_from_refined[HL, WL, N_IMG, N_TXT, S](
+            xs.copy(), cap_seq_cond,
+            cr_blocks, main_blocks, main_mod_dev.copy(), lora,
+            f_scale.copy(), final_lin_w, final_lin_b,
+            cap_cos_cond, cap_sin_cond, uni_cos_cond, uni_sin_cond, ctx,
+        )
+        if trace:
+            trace_t0 = _trace_stage("main_cond", trace_t0, ctx)
+            _stats("v_cond", vc, ctx)
+        return mul_scalar(vc, -1.0, ctx)
+
+    var vc = _latent_velocity_overlay_from_refined[HL, WL, N_IMG, N_TXT, S](
+        xs.copy(), cap_seq_cond,
+        cr_blocks, main_blocks, main_mod_dev.copy(), lora,
+        f_scale.copy(), final_lin_w, final_lin_b,
+        cap_cos_cond, cap_sin_cond, uni_cos_cond, uni_sin_cond, ctx,
+    )
+    if trace:
+        trace_t0 = _trace_stage("main_cond", trace_t0, ctx)
+    var vu = _latent_velocity_overlay_from_refined[HL, WL, N_IMG, N_TXT, S](
+        xs^, cap_seq_uncond,
+        cr_blocks, main_blocks, main_mod_dev.copy(), lora,
+        f_scale.copy(), final_lin_w, final_lin_b,
+        cap_cos_uncond, cap_sin_uncond, uni_cos_uncond, uni_sin_uncond, ctx,
+    )
+    if trace:
+        trace_t0 = _trace_stage("main_uncond", trace_t0, ctx)
+        _stats("v_cond", vc, ctx)
+        _stats("v_uncond", vu, ctx)
+
+    var pred = add(vu, mul_scalar(sub(vc, vu, ctx), cfg, ctx), ctx)
+    if trace:
+        _ = _trace_stage("cfg_combine", trace_t0, ctx)
+    return mul_scalar(pred, -1.0, ctx)
+
+
+def _parse_nonnegative_int(s: String) raises -> Int:
+    var out = 0
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        var ch = bs[i]
+        if ch < 0x30 or ch > 0x39:
+            raise Error(String("expected integer, got ") + s)
+        out = out * 10 + Int(ch - 0x30)
+    return out
+
+
+def _json_string(mut cur: _Cursor, field: String) raises -> String:
+    var sc = _read_scalar(cur)
+    if not sc.is_string:
+        raise Error(String("zimage_generate request: ") + field + String(" must be a string"))
+    return sc.s.copy()
+
+
+def _path_exists(path: String) -> Bool:
+    if path == String(""):
+        return False
+    var fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0:
+        return False
+    _ = sys_close(fd)
+    return True
+
+
+def _require_file(label: String, path: String) raises:
+    if not _path_exists(path):
+        raise Error(String("zimage_generate: missing ") + label + String(": ") + path)
+
+
+def _byte_string(c: UInt8) raises -> String:
+    var b = List[UInt8]()
+    b.append(c)
+    return String(from_utf8=b)
+
+
+def _json_escape(s: String) raises -> String:
+    var out = String("")
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        var ch = bs[i]
+        if ch == 0x22:
+            out += String("\\\"")
+        elif ch == 0x5C:
+            out += String("\\\\")
+        elif ch == 0x0A:
+            out += String("\\n")
+        elif ch == 0x0D:
+            out += String("\\r")
+        elif ch == 0x09:
+            out += String("\\t")
+        else:
+            out += _byte_string(ch)
+    return out^
+
+
+def _write_text_file(path: String, content: String) raises:
+    var fd = sys_open(path, O_CREAT | O_WRONLY | O_TRUNC, Int32(0o644))
+    if fd < 0:
+        raise Error(String("zimage_generate: cannot create ") + path)
+    var n = content.byte_length()
+    var buf = alloc[UInt8](n if n > 0 else 1)
+    var src = content.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    var wrote = sys_pwrite(fd, BytePtr(unsafe_from_address=Int(buf)), n, 0)
+    buf.free()
+    _ = sys_close(fd)
+    if wrote != n:
+        raise Error(String("zimage_generate: short write to ") + path)
+
+
+def _json_string_array(mut cur: _Cursor, field: String) raises -> List[String]:
+    """Parse a flat JSON array of strings (sweep_loras)."""
+    var out = List[String]()
+    cur.skip_ws()
+    if cur.peek() != 0x5B:  # '['
+        raise Error(String("zimage_generate request: ") + field + String(" must be an array"))
+    cur.advance()
+    cur.skip_ws()
+    if cur.peek() == 0x5D:  # ']' — empty array
+        cur.advance()
+        return out^
+    while True:
+        out.append(_parse_string(cur))
+        cur.skip_ws()
+        var ch = cur.peek()
+        if ch == 0x2C:  # ','
+            cur.advance()
+            continue
+        if ch == 0x5D:  # ']'
+            cur.advance()
+            break
+        raise Error(String("zimage_generate request: expected ',' or ']' in ") + field)
+    return out^
+
+
+def _json_number_array(mut cur: _Cursor, field: String) raises -> List[Float32]:
+    """Parse a flat JSON array of numbers (sweep_strengths)."""
+    var out = List[Float32]()
+    cur.skip_ws()
+    if cur.peek() != 0x5B:  # '['
+        raise Error(String("zimage_generate request: ") + field + String(" must be an array"))
+    cur.advance()
+    cur.skip_ws()
+    if cur.peek() == 0x5D:  # ']' — empty array
+        cur.advance()
+        return out^
+    while True:
+        var sc = _read_scalar(cur)
+        if sc.is_string:
+            raise Error(String("zimage_generate request: ") + field + String(" must contain numbers"))
+        out.append(Float32(sc.num))
+        cur.skip_ws()
+        var ch = cur.peek()
+        if ch == 0x2C:  # ','
+            cur.advance()
+            continue
+        if ch == 0x5D:  # ']'
+            cur.advance()
+            break
+        raise Error(String("zimage_generate request: expected ',' or ']' in ") + field)
+    return out^
+
+
+# ── T1.F sweep plan (pure CPU logic; unit-gated by zimage_sweep_request_smoke) ──
+@fieldwise_init
+struct ZImageSweepItem(Copyable, Movable):
+    """One extra validation render: which adapter, at what strength, where."""
+
+    var label: String           # adapter-stem slug ("base" = no adapter)
+    var lora_path: String       # "" → zero-LoRA base render
+    var strength: Float32       # multiplies LoRA alpha (alpha*strength)/rank
+    var output_png: String
+    var result_manifest: String
+
+
+def _adapter_label(path: String) raises -> String:
+    """basename minus extension, slugified to [a-z0-9_] (SimpleTuner _slugify
+    of _stem_from_path)."""
+    var bs = path.as_bytes()
+    var n = path.byte_length()
+    var start = 0
+    for i in range(n):
+        if bs[i] == 0x2F:  # '/'
+            start = i + 1
+    var end = n
+    for i in range(start, n):
+        if bs[i] == 0x2E:  # '.' — keep last-dot stem
+            end = i
+    if end <= start:
+        end = n
+    var out = List[UInt8]()
+    for i in range(start, end):
+        var c = bs[i]
+        if (c >= 0x30 and c <= 0x39) or (c >= 0x61 and c <= 0x7A):
+            out.append(c)
+        elif c >= 0x41 and c <= 0x5A:  # A-Z → a-z
+            out.append(c + 32)
+        else:
+            out.append(0x5F)  # '_'
+    if len(out) == 0:
+        return String("adapter")
+    return String(from_utf8=out)
+
+
+def _sweep_output_path(base_png: String, label: String) raises -> String:
+    """step{N}_sample.png + label → step{N}_sample_{label}.png."""
+    var n = base_png.byte_length()
+    var cut = n
+    if base_png.endswith(String(".png")):
+        cut = n - 4
+    var bs = base_png.as_bytes()
+    var head = List[UInt8]()
+    for i in range(cut):
+        head.append(bs[i])
+    return String(from_utf8=head) + String("_") + label + String(".png")
+
+
+def _label_in(labels: List[String], wanted: String) -> Bool:
+    for i in range(len(labels)):
+        if labels[i] == wanted:
+            return True
+    return False
+
+
+def build_zimage_sweep_plan(req: ZImageSampleRequest) raises -> List[ZImageSweepItem]:
+    """Adapter sweep render plan. Empty when the request has no sweep fields
+    (current behavior preserved). Otherwise: a no-adapter "base" comparison
+    item first (SimpleTuner comparison-mode base run), then one item per sweep
+    adapter; label collisions deduplicate with _2/_3 suffixes (SimpleTuner
+    seen_slugs)."""
+    var plan = List[ZImageSweepItem]()
+    if len(req.sweep_loras) == 0:
+        return plan^
+    var seen = List[String]()
+    var base_png = _sweep_output_path(req.output_png, String("base"))
+    plan.append(ZImageSweepItem(
+        String("base"), String(""), Float32(1.0),
+        base_png.copy(), base_png + String(".zimage_result.json"),
+    ))
+    seen.append(String("base"))
+    for i in range(len(req.sweep_loras)):
+        var label = _adapter_label(req.sweep_loras[i])
+        var candidate = label.copy()
+        var counter = 2
+        while _label_in(seen, candidate):
+            candidate = label + String("_") + String(counter)
+            counter += 1
+        seen.append(candidate.copy())
+        var strength = Float32(1.0)
+        if i < len(req.sweep_strengths):
+            strength = req.sweep_strengths[i]
+        var png = _sweep_output_path(req.output_png, candidate)
+        plan.append(ZImageSweepItem(
+            candidate^, req.sweep_loras[i].copy(), strength,
+            png.copy(), png + String(".zimage_result.json"),
+        ))
+    return plan^
+
+
+def _load_zimage_sample_request(path: String) raises -> ZImageSampleRequest:
+    var bytes = _read_file_bytes(path)
+    var cur = _Cursor(bytes^)
+    var schema = String("")
+    var model = String("")
+    var mode = String("")
+    var lora_path = String("")
+    var state_path = String("")
+    var sample_file = String("")
+    var output_png = String("")
+    var result_manifest = String("")
+    var completed_step = -1
+    var sweep_loras = List[String]()
+    var sweep_strengths = List[Float32]()
+
+    cur.expect(0x7B)
+    cur.skip_ws()
+    if cur.peek() == 0x7D:
+        raise Error(String("zimage_generate request is empty: ") + path)
+    while True:
+        var key = _parse_string(cur)
+        cur.expect(0x3A)
+        if key == String("schema"):
+            schema = _json_string(cur, key)
+        elif key == String("model"):
+            model = _json_string(cur, key)
+        elif key == String("sampler_mode"):
+            mode = _json_string(cur, key)
+        elif key == String("completed_step"):
+            completed_step = Int(_read_scalar(cur).num)
+        elif key == String("lora_path"):
+            lora_path = _json_string(cur, key)
+        elif key == String("state_path"):
+            state_path = _json_string(cur, key)
+        elif key == String("sample_file"):
+            sample_file = _json_string(cur, key)
+        elif key == String("output_png"):
+            output_png = _json_string(cur, key)
+        elif key == String("result_manifest"):
+            result_manifest = _json_string(cur, key)
+        elif key == String("sweep_loras"):
+            sweep_loras = _json_string_array(cur, key)
+        elif key == String("sweep_strengths"):
+            sweep_strengths = _json_number_array(cur, key)
+        else:
+            _skip_value(cur)
+        cur.skip_ws()
+        var ch = cur.peek()
+        if ch == 0x2C:
+            cur.advance()
+            continue
+        if ch == 0x7D:
+            cur.advance()
+            break
+        raise Error("zimage_generate request: expected ',' or '}'")
+
+    if schema != String(SAMPLE_REQUEST_SCHEMA):
+        raise Error(String("zimage_generate request schema mismatch: ") + schema)
+    if model != String("zimage"):
+        raise Error(String("zimage_generate request model mismatch: ") + model)
+    if mode != String(SAMPLE_REQUEST_MODE):
+        raise Error(String("zimage_generate request sampler_mode mismatch: ") + mode)
+    if completed_step < 0:
+        raise Error("zimage_generate request completed_step must be non-negative")
+    if lora_path == String("") or state_path == String("") or sample_file == String("") or output_png == String(""):
+        raise Error("zimage_generate request missing lora_path/state_path/sample_file/output_png")
+    if result_manifest == String(""):
+        result_manifest = output_png + String(".zimage_result.json")
+    _require_file(String("request LoRA"), lora_path)
+    _require_file(String("request optimizer state sidecar"), state_path)
+    _require_file(String("request sample prompt JSON"), sample_file)
+    # ── optional T1.F sweep fields ──
+    if len(sweep_strengths) > 0 and len(sweep_strengths) != len(sweep_loras):
+        raise Error(
+            "zimage_generate request: sweep_strengths length must match sweep_loras"
+        )
+    for i in range(len(sweep_strengths)):
+        if not (sweep_strengths[i] > Float32(0.0)):
+            raise Error("zimage_generate request: sweep strength must be > 0")
+    for i in range(len(sweep_loras)):
+        _require_file(String("request sweep LoRA"), sweep_loras[i])
+    return ZImageSampleRequest(
+        lora_path^, state_path^, sample_file^, output_png^, result_manifest^,
+        completed_step, sweep_loras^, sweep_strengths^,
+    )
+
+
+def _write_zimage_result_manifest(
+    path: String,
+    prompt: String,
+    seed: UInt64,
+    width: Int,
+    height: Int,
+    steps: Int,
+    cfg: Float32,
+    lora_path: String,
+    output_png: String,
+    result: ZImageGenerateResult,
+) raises:
+    var denoise_per_step = Float64(0.0)
+    if steps > 0:
+        denoise_per_step = result.denoise_seconds / Float64(steps)
+    var content = String("{\n")
+    content += String('  "schema":"serenity.zimage.sample_result.v1",\n')
+    content += String('  "model":"zimage",\n')
+    content += String('  "accepted_sampler_parity":false,\n')
+    content += String('  "accepted_speed_parity":false,\n')
+    content += String('  "run_identity":{\n')
+    content += String('    "prompt":"') + _json_escape(prompt) + String('",\n')
+    content += String('    "seed":') + String(seed) + String(",\n")
+    content += String('    "resolution":{"width":') + String(width) + String(',"height":') + String(height) + String("},\n")
+    content += String('    "steps":') + String(steps) + String(",\n")
+    content += String('    "guidance":') + String(cfg) + String(",\n")
+    content += String('    "dtype":"bf16"\n')
+    content += String("  },\n")
+    content += String('  "mojo":{\n')
+    content += String('    "prompt":"') + _json_escape(prompt) + String('",\n')
+    content += String('    "seed":') + String(seed) + String(",\n")
+    content += String('    "resolution":{"width":') + String(width) + String(',"height":') + String(height) + String("},\n")
+    content += String('    "steps":') + String(steps) + String(",\n")
+    content += String('    "guidance":') + String(cfg) + String(",\n")
+    content += String('    "dtype":"bf16",\n')
+    content += String('    "text_encode_seconds":') + String(result.text_encode_seconds) + String(",\n")
+    content += String('    "denoise_seconds":') + String(result.denoise_seconds) + String(",\n")
+    content += String('    "denoise_seconds_per_step":') + String(denoise_per_step) + String(",\n")
+    content += String('    "vae_decode_seconds":') + String(result.vae_decode_seconds) + String(",\n")
+    content += String('    "peak_vram_mib":') + String(result.peak_vram_mib) + String(",\n")
+    content += String('    "artifact_paths":["') + _json_escape(output_png) + String('","') + _json_escape(path) + String('"]\n')
+    content += String("  },\n")
+    content += String('  "lora_path":"') + _json_escape(lora_path) + String('",\n')
+    content += String('  "output_png":"') + _json_escape(output_png) + String('",\n')
+    content += String('  "note":"Mojo-side sample result; peak_vram_mib is sampled in-process from the active DeviceContext and speed parity is not accepted without paired SerenityTrainer evidence."\n')
+    content += String("}\n")
+    _write_text_file(path, content)
+
+
+def _update_min_free(ctx: DeviceContext, min_free: Int) raises -> Int:
+    var mem = ctx.get_memory_info()
+    var free_now = Int(mem[0])
+    if free_now < min_free:
+        return free_now
+    return min_free
+
+
+def _peak_vram_mib(total_vram: Int, min_free: Int) -> Float64:
+    return Float64(total_vram - min_free) / 1048576.0
+
+
+# ── one prompt → templated tokens → layer-34 cap_feats [CAPLEN_MAX, HIDDEN] ──
+# Returns the fixed-size [CAPLEN_MAX, HIDDEN] feature buffer plus the TRUE token
+# count. Trailing rows [real_caplen, CAPLEN_MAX) hold encoder outputs of PAD
+# tokens; they are inert in the causal encoder for the first real_caplen rows,
+# and the NextDiT overwrites them with the learned cap_pad_token (real_len=
+# real_caplen), so they do not influence the velocity for the real tokens.
+def _encode_text_fixed(
+    tok: Qwen3Tokenizer, enc: Qwen3Encoder, prompt: String, ctx: DeviceContext
+) raises -> EncodedCap:
+    var templated = (
+        String("<|im_start|>user\n") + prompt + "<|im_end|>\n<|im_start|>assistant\n"
+    )
+    var ids_full = tok.encode(templated)
+    var real_caplen = len(ids_full)
+    if real_caplen > CAPLEN_MAX:
+        # Truncate + log instead of crashing (spec requirement).
+        print(
+            "  [warn] prompt tokenized to", real_caplen, "tokens > CAPLEN_MAX=",
+            CAPLEN_MAX, "→ truncating. Raise CAPLEN_MAX or shorten the prompt.",
+        )
+        real_caplen = CAPLEN_MAX
+    # Pad to ENC_SEQ with PAD_ID; encode at the supported sdpa seq, slice the
+    # leading CAPLEN_MAX rows (causal → first real_caplen are exact). (verbatim
+    # encode-at-512-and-slice approach; only the slice length differs: CAPLEN_MAX
+    # vs the old exact caplen.)
+    var ids = List[Int](capacity=ENC_SEQ)
+    for i in range(real_caplen):
+        ids.append(ids_full[i])
+    for _ in range(ENC_SEQ - real_caplen):
+        ids.append(PAD_ID)
+    var cf = enc.encode(ids, EXTRACT_LAYER, ctx)        # [1, ENC_SEQ, HIDDEN]
+    var cf_fixed = slice(cf, 1, 0, CAPLEN_MAX, ctx)     # [1, CAPLEN_MAX, HIDDEN]
+    var rank2 = reshape(cf_fixed, [CAPLEN_MAX, HIDDEN], ctx)  # rank-2 for DiT
+    return EncodedCap(rank2^, real_caplen)
+
+
+# ── encode cond + uncond in ONE encoder session; encoder freed on return ──
+def encode_captions_fixed(
+    prompt: String, negative: String, ctx: DeviceContext
+) raises -> CapFeatsFixed:
+    var tok = Qwen3Tokenizer(TOK_JSON)
+    # P2: load only weights the extract-at-EXTRACT_LAYER encode uses (skips
+    # layers > EXTRACT_LAYER + lm_head, ~1 GB) — the forward stops at EXTRACT_LAYER.
+    var enc = Qwen3Encoder.load(TEXT_ENCODER, Qwen3Config.zimage(), ctx, max_layer=EXTRACT_LAYER)
+    print("[text] encoding cond + uncond at fixed CAPLEN_MAX=", CAPLEN_MAX, "layer", EXTRACT_LAYER)
+    var cond = _encode_text_fixed(tok, enc, prompt, ctx)
+    var uncond = _encode_text_fixed(tok, enc, negative, ctx)
+    print("  real cond tokens=", cond.real_len, " real uncond tokens=", uncond.real_len)
+    return cond^.into_pair(uncond^)  # enc + tok freed
+
+
+# ── Comfy Z-Image simple sigmas. Returns a `steps+1`-length list.
+# Comfy path:
+#   supported_models.ZImage.sampling_settings = {multiplier: 1.0, shift: 3.0}
+#   ModelSamplingDiscreteFlow.set_parameters(timesteps=1000)
+#   samplers.simple_scheduler(model_sampling, steps)
+def _build_sigmas_with_shift(steps: Int, sigma_shift: Float32) raises -> List[Float32]:
+    return zimage_comfy_simple_sigmas_with_shift(steps, sigma_shift)
+
+
+def _build_sigmas(steps: Int) raises -> List[Float32]:
+    return _build_sigmas_with_shift(steps, ZIMAGE_DEFAULT_SIGMA_SHIFT)
+
+
+# ── CFG denoise: dual DiT forward + diffusers CFG + scheduler sign flip ──
+# CAPLEN comptime param is CAPLEN_MAX for BOTH cond and uncond (fixed padding);
+# the runtime real_cond/real_uncond drive the cap_pad_token substitution.
+def _denoise[HL: Int, WL: Int](
+    caps: CapFeatsFixed, steps: Int, cfg: Float32, seed: UInt64,
+    lora_path: String, lora_multiplier: Float32,
+    mut events: List[ZImageEvent], trace_denoise: Bool, ctx: DeviceContext,
+) raises -> ZImageDenoiseResult:
+    comptime HT = HL // PATCH
+    comptime WT = WL // PATCH
+    comptime N_IMG_REAL = HT * WT
+    comptime IMG_PAD = (32 - (N_IMG_REAL % 32)) % 32
+    comptime N_IMG = N_IMG_REAL + IMG_PAD
+    comptime N_TXT = CAPLEN_MAX
+    comptime S = N_IMG + N_TXT
+
+    print("[denoise] loading Mojo Z-Image stack", HL, "x", WL, "(CAPLEN_MAX", CAPLEN_MAX, ")")
+    var st = ShardedSafeTensors.open(String(TRANSFORMER))
+    var aux = load_zimage_real_aux(st, NUM_NR, MAIN_DEPTH, ctx)
+    var nr_blocks = List[ZImageBlockWeights]()
+    for i in range(NUM_NR):
+        nr_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("noise_refiner.") + String(i), ctx))
+    var cr_blocks = List[ZImageBlockWeights]()
+    for i in range(NUM_CR):
+        cr_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("context_refiner.") + String(i), ctx))
+    var main_blocks = List[ZImageBlockWeights]()
+    for i in range(MAIN_DEPTH):
+        main_blocks.append(load_zimage_block_weights_prefixed_mixed(st, String("layers.") + String(i), ctx))
+    var final_lin_w = aux.final_lin_w[].clone(ctx)
+    var final_lin_b = aux.final_lin_b[].clone(ctx)
+    var x_pad_h = aux.x_pad_token[].to_host(ctx)
+    var cap_pad_h = aux.cap_pad_token[].to_host(ctx)
+
+    var lora_dev: ZImageLoraDeviceSet
+    if lora_path.byte_length() > 0:
+        var lora_alpha = ALPHA * lora_multiplier
+        print("[lora] loading", lora_path)
+        var lora = load_zimage_lora_main_only_resume(
+            NUM_NR, NUM_CR, MAIN_DEPTH, RANK, lora_alpha, D, F, lora_path, ctx,
+        )
+        lora_dev = zimage_lora_set_to_device(lora, ctx)
+        print("[lora] overlay loaded", MAIN_DEPTH * 7, "main-layer adapters; scale alpha/rank =", lora_alpha / Float32(RANK))
+    else:
+        print("[lora] base mode: zero LoRA overlay")
+        lora_dev = build_zimage_zero_lora_device_set(NUM_NR, NUM_CR, MAIN_DEPTH, ctx)
+
+    var cap_seq_cond = _cap_seq_with_pad(aux, caps.cond, caps.real_cond, cap_pad_h, ctx)
+    var cap_seq_uncond = _cap_seq_with_pad(aux, caps.uncond, caps.real_uncond, cap_pad_h, ctx)
+
+    var pos_cond = build_positions(N_IMG, HT, WT, CAPLEN_MAX, caps.real_cond)
+    var x_pos_cond = pos_cond[0].copy()
+    var cap_pos_cond = pos_cond[1].copy()
+    var uni_pos_cond = _unified_positions(x_pos_cond, cap_pos_cond)
+    var xr_cond = build_rope(x_pos_cond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var x_cos_cond = xr_cond[0].copy(); var x_sin_cond = xr_cond[1].copy()
+    var cr_cond = build_rope(cap_pos_cond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cap_cos_cond = cr_cond[0].copy(); var cap_sin_cond = cr_cond[1].copy()
+    var ur_cond = build_rope(uni_pos_cond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var uni_cos_cond = ur_cond[0].copy(); var uni_sin_cond = ur_cond[1].copy()
+
+    var pos_uncond = build_positions(N_IMG, HT, WT, CAPLEN_MAX, caps.real_uncond)
+    var x_pos_uncond = pos_uncond[0].copy()
+    var cap_pos_uncond = pos_uncond[1].copy()
+    var uni_pos_uncond = _unified_positions(x_pos_uncond, cap_pos_uncond)
+    var xr_uncond = build_rope(x_pos_uncond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var x_cos_uncond = xr_uncond[0].copy(); var x_sin_uncond = xr_uncond[1].copy()
+    var cr_uncond = build_rope(cap_pos_uncond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cap_cos_uncond = cr_uncond[0].copy(); var cap_sin_uncond = cr_uncond[1].copy()
+    var ur_uncond = build_rope(uni_pos_uncond, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var uni_cos_uncond = ur_uncond[0].copy(); var uni_sin_uncond = ur_uncond[1].copy()
+
+    var noise = gaussian_noise(16 * HL * WL, seed)
+    var nshape = [1, 16, HL, WL]
+    # Keep the latent boundary BF16; scheduler arithmetic below casts locally.
+    var x = Tensor.from_host(noise, nshape^, STDtype.BF16, ctx)
+
+    var sigmas = _build_sigmas(steps)
+    print("[denoise]", steps, "steps, shift", ZIMAGE_DEFAULT_SIGMA_SHIFT, "CFG", cfg, "seed", seed)
+    var trace_stats = trace_denoise
+    if trace_stats:
+        _stats("init_noise", x, ctx)
+    events.append(ZImageEvent(ZEVENT_STARTED, 0, steps, String("started")))
+    var denoise_t0 = perf_counter_ns()
+    for i in range(steps):
+        var step_t0 = perf_counter_ns()
+        var t = 1.0 - sigmas[i]  # DiT timestep convention (= 1 - sigma)
+        # Diffusers CFG (code form, F32): pred_raw = vc + cfg*(vc - vu);
+        # pipeline_z_image.py negates before FlowMatchEulerDiscreteScheduler.step.
+        var pred = _cfg_pred_overlay[HL, WL, N_IMG, N_TXT, S](
+            x, t, cfg, cap_seq_cond, cap_seq_uncond,
+            nr_blocks, cr_blocks, main_blocks, lora_dev,
+            aux, final_lin_w, final_lin_b, x_pad_h,
+            x_cos_cond[], x_sin_cond[], cap_cos_cond[], cap_sin_cond[],
+            uni_cos_cond[], uni_sin_cond[],
+            x_cos_uncond[], x_sin_uncond[], cap_cos_uncond[], cap_sin_uncond[],
+            uni_cos_uncond[], uni_sin_uncond[],
+            trace_stats and i == 0, ctx,
+        )
+        var dt = sigmas[i + 1] - sigmas[i]
+        var sched_t0 = perf_counter_ns()
+        var x_compute = _cast(x, STDtype.F32, ctx)
+        x = _cast(add(x_compute, mul_scalar(pred, dt, ctx), ctx), STDtype.BF16, ctx)
+        if trace_stats and i == 0:
+            _ = _trace_stage("scheduler_update", sched_t0, ctx)
+        events.append(ZImageEvent(ZEVENT_STEP, i + 1, steps, String("denoise")))
+        if (i + 1) % 10 == 0 or i == steps - 1:
+            var secs = Float64(perf_counter_ns() - step_t0) / 1.0e9
+            var rate = Float64(0.0)
+            if secs > 0.0:
+                rate = Float64(1.0) / secs
+            print_sample_step(String("ZImage-sample"), i + 1, steps, sigmas[i], secs, rate)
+    var denoise_seconds = Float64(perf_counter_ns() - denoise_t0) / 1.0e9
+    if trace_stats:
+        _stats("final_latent", x, ctx)
+    return ZImageDenoiseResult(x^, denoise_seconds)  # dit_c destroyed → weights freed before VAE load
+
+
+# ── one comptime latent grid: denoise (flash) + VAE decode ───────────────────
+# TILED selects the decode strategy at comptime:
+#   • TILED=False → whole-frame ZImageDecoder[HL,WL].decode (the verified 1024
+#     path; byte-for-byte preserved).
+#   • TILED=True  → zimage_tiled_decode_with_decoder with a half-size
+#     ZImageDecoder[HL//2,WL//2] (3×3 overlapping latent crops + feathered
+#     blend) so 1536/2048 decode within 24 GB. The DiT weights are freed when
+#     `_denoise` returns (its locals are destroyed), so the decode owns the GPU.
+def _run_grid[
+    HL: Int, WL: Int, TILED: Bool
+](
+    caps: CapFeatsFixed, steps: Int, cfg: Float32, seed: UInt64,
+    lora_path: String, lora_multiplier: Float32,
+    mut events: List[ZImageEvent], trace_denoise: Bool,
+    mut min_free: Int, total_vram: Int, text_encode_seconds: Float64,
+    ctx: DeviceContext,
+) raises -> ZImageGenerateResult:
+    var denoised = _denoise[HL, WL](
+        caps, steps, cfg, seed, lora_path, lora_multiplier, events,
+        trace_denoise, ctx,
+    )
+    min_free = _update_min_free(ctx, min_free)
+    var vae_t0 = perf_counter_ns()
+    var rgb: Tensor
+    comptime if TILED:
+        comptime TILE_H = HL // 2
+        comptime TILE_W = WL // 2
+        print("[vae] decoding latent → RGB (tiled 3×3, tile latent", TILE_H, "x", TILE_W, ")")
+        var dec = ZImageDecoder[TILE_H, TILE_W].load(VAE_DIR, ctx)
+        rgb = zimage_tiled_decode_with_decoder[HL, WL, TILE_H, TILE_W](
+            _cast(denoised.latent, STDtype.BF16, ctx), dec, ctx
+        )
+    else:
+        print("[vae] decoding latent → RGB")
+        var dec = ZImageDecoder[HL, WL].load(VAE_DIR, ctx)
+        rgb = dec.decode(_cast(denoised.latent, STDtype.BF16, ctx), ctx)
+    var vae_decode_seconds = Float64(perf_counter_ns() - vae_t0) / 1.0e9
+    min_free = _update_min_free(ctx, min_free)
+    events.append(ZImageEvent(ZEVENT_DONE, steps, steps, String("done")))
+    return ZImageGenerateResult(
+        rgb^, text_encode_seconds, denoised.denoise_seconds,
+        vae_decode_seconds, _peak_vram_mib(total_vram, min_free)
+    )
+
+
+# ── reusable generation entry (RUNTIME prompt) ──────────────────────────────
+# steps/cfg/seed honored at runtime; width/height drive the comptime latent
+# grid via the dispatch below. width/height must be one of the supported comptime
+# specializations: 1024² (HL=WL=128, whole-frame decode), 1536² (HL=WL=192,
+# tiled decode), 2048² (HL=WL=256, tiled decode). Returns decoded RGB
+# [1,3,8HL,8WL].
+def zimage_generate(
+    prompt: String, negative: String,
+    steps: Int, cfg: Float32, seed: UInt64,
+    width: Int, height: Int,
+    lora_path: String, lora_multiplier: Float32,
+    mut events: List[ZImageEvent], trace_denoise: Bool, ctx: DeviceContext,
+) raises -> ZImageGenerateResult:
+    var mem0 = ctx.get_memory_info()
+    var total_vram = Int(mem0[1])
+    var min_free = Int(mem0[0])
+    var encode_t0 = perf_counter_ns()
+    var caps = encode_captions_fixed(prompt, negative, ctx)
+    var text_encode_seconds = Float64(perf_counter_ns() - encode_t0) / 1.0e9
+    min_free = _update_min_free(ctx, min_free)
+    # Dispatch the comptime latent grid from runtime width/height. Flash SDPA
+    # makes the denoise O(S) memory at every grid; the decode is whole-frame at
+    # 1024 (verified parity) and tiled at 1536/2048 (fits 24 GB).
+    var hl = height // 8
+    var wl = width // 8
+    if hl == DEFAULT_HL and wl == DEFAULT_WL:
+        return _run_grid[DEFAULT_HL, DEFAULT_WL, False](
+            caps, steps, cfg, seed, lora_path, lora_multiplier, events,
+            trace_denoise, min_free, total_vram, text_encode_seconds, ctx,
+        )
+    if hl == HL_1536 and wl == WL_1536:
+        return _run_grid[HL_1536, WL_1536, True](
+            caps, steps, cfg, seed, lora_path, lora_multiplier, events,
+            trace_denoise, min_free, total_vram, text_encode_seconds, ctx,
+        )
+    if hl == HL_2048 and wl == WL_2048:
+        return _run_grid[HL_2048, WL_2048, True](
+            caps, steps, cfg, seed, lora_path, lora_multiplier, events,
+            trace_denoise, min_free, total_vram, text_encode_seconds, ctx,
+        )
+    events.append(
+        ZImageEvent(
+            ZEVENT_FAILED, 0, steps,
+            String("unsupported size ") + String(width) + "x" + String(height)
+            + " (only 1024/1536/2048 square are wired; latent grid is comptime)",
+        )
+    )
+    raise Error(
+        String("zimage_generate: unsupported width/height ")
+        + String(width) + "x" + String(height)
+        + " — only 1024x1024, 1536x1536, 2048x2048 are comptime-specialized today."
+    )
+
+
+def _select_prompt(sample_cfg: SamplePromptConfig, wanted: String) raises -> SamplePrompt:
+    if len(sample_cfg.prompts) == 0:
+        raise Error("zimage_generate: sample prompt JSON has no prompts")
+    if wanted == String(""):
+        return sample_cfg.prompts[0].copy()
+    for i in range(len(sample_cfg.prompts)):
+        if sample_cfg.prompts[i].label == wanted:
+            return sample_cfg.prompts[i].copy()
+    raise Error(String("zimage_generate: prompt id not found: ") + wanted)
+
+
+def _load_prompt_json(
+    path: String, wanted: String,
+    mut prompt: String, mut negative: String,
+    mut steps: Int, mut cfg: Float32, mut seed: UInt64,
+    mut width: Int, mut height: Int,
+) raises:
+    var sample_cfg = read_sample_prompt_config(path)
+    var p = _select_prompt(sample_cfg, wanted)
+    if p.frames != 1:
+        raise Error("zimage_generate: only image prompts are supported")
+    prompt = p.prompt.copy()
+    negative = p.negative.copy()
+    steps = p.steps
+    cfg = p.cfg
+    seed = p.seed
+    width = p.width
+    height = p.height
+
+
+def _is_trace_denoise_arg(s: String) -> Bool:
+    return s == String("--trace-denoise")
+
+
+# ── standalone demo: drives zimage_generate with the original constants so the
+# existing single-image path still works (compile + behavior preserved). ──
+def main() raises:
+    print("=== Z-Image generate (runtime prompt, fixed-padded caption) — 1024x1024 ===")
+    var a = argv()
+    var lora_path = String("")
+    var out_path = String(OUT)
+    var seed = DEFAULT_SEED
+    var prompt = String(DEFAULT_PROMPT)
+    var negative = String("")
+    var steps = DEFAULT_STEPS
+    var cfg = DEFAULT_CFG
+    var width = 1024
+    var height = 1024
+    var result_manifest = String("")
+    var trace_denoise = DEFAULT_TRACE_DENOISE_STATS
+    for arg_i in range(1, len(a)):
+        if _is_trace_denoise_arg(String(a[arg_i])):
+            trace_denoise = True
+    var sweep_plan = List[ZImageSweepItem]()
+    if len(a) >= 2 and String(a[1]) == String("--request"):
+        if len(a) < 3:
+            raise Error("zimage_generate: --request requires a request JSON path")
+        var req = _load_zimage_sample_request(String(a[2]))
+        lora_path = req.lora_path.copy()
+        out_path = req.output_png.copy()
+        result_manifest = req.result_manifest.copy()
+        sweep_plan = build_zimage_sweep_plan(req)
+        var wanted_req = String("")
+        if len(a) >= 4 and not _is_trace_denoise_arg(String(a[3])):
+            wanted_req = String(a[3])
+        _load_prompt_json(req.sample_file, wanted_req, prompt, negative, steps, cfg, seed, width, height)
+        print(
+            "[request] completed_step=", req.completed_step,
+            " sample_file=", req.sample_file,
+            " state=", req.state_path,
+        )
+    elif len(a) >= 2:
+        var arg_lora = String(a[1])
+        if arg_lora != String("base") and arg_lora != String("none") and arg_lora != String(""):
+            lora_path = arg_lora
+        if len(a) >= 3:
+            out_path = String(a[2])
+        if len(a) >= 4 and String(a[3]).endswith(".json"):
+            var wanted = String("")
+            if len(a) >= 5 and not _is_trace_denoise_arg(String(a[4])):
+                wanted = String(a[4])
+            _load_prompt_json(String(a[3]), wanted, prompt, negative, steps, cfg, seed, width, height)
+        elif len(a) >= 4:
+            seed = UInt64(_parse_nonnegative_int(String(a[3])))
+            if len(a) >= 5 and String(a[4]).endswith(".json"):
+                var wanted2 = String("")
+                if len(a) >= 6 and not _is_trace_denoise_arg(String(a[5])):
+                    wanted2 = String(a[5])
+                _load_prompt_json(String(a[4]), wanted2, prompt, negative, steps, cfg, seed, width, height)
+            elif len(a) >= 5 and not _is_trace_denoise_arg(String(a[4])):
+                prompt = String(a[4])
+    if result_manifest == String(""):
+        result_manifest = out_path + String(".zimage_result.json")
+    print("[prompt]", prompt)
+    var ctx = DeviceContext()
+    var events = List[ZImageEvent]()
+    var generated = zimage_generate(
+        prompt, negative,
+        steps, cfg, seed,
+        width, height, lora_path, Float32(1.0), events, trace_denoise, ctx,
+    )
+    var rs = generated.rgb.shape()
+    print("[vae] image:", rs[0], rs[1], rs[2], rs[3], " events:", len(events))
+    save_png(generated.rgb, out_path, ctx, ValueRange.SIGNED)
+    print_sample_saved(String("ZImage-sample"), out_path)
+    _write_zimage_result_manifest(
+        result_manifest, prompt, seed, width, height, steps, cfg,
+        lora_path, out_path, generated,
+    )
+    print("[manifest] saved:", result_manifest)
+    # ── T1.F validation adapter sweep: extra comparison renders, same
+    # prompt/seed/steps/cfg as the trained-LoRA render above. Each
+    # zimage_generate call loads its own LoRA overlay (or the zero overlay for
+    # "base") and frees the full stack on return — the load→render→unload cycle
+    # is the call boundary itself, so the trained-LoRA render is untouched. ──
+    for i in range(len(sweep_plan)):
+        var item = sweep_plan[i].copy()
+        print(
+            "[sweep]", i + 1, "/", len(sweep_plan),
+            " adapter=", item.label,
+            " strength=", item.strength,
+            " lora=", item.lora_path if item.lora_path != String("") else String("(base)"),
+        )
+        var sweep_events = List[ZImageEvent]()
+        var sweep_generated = zimage_generate(
+            prompt, negative,
+            steps, cfg, seed,
+            width, height, item.lora_path, item.strength, sweep_events,
+            trace_denoise, ctx,
+        )
+        save_png(sweep_generated.rgb, item.output_png, ctx, ValueRange.SIGNED)
+        print_sample_saved(String("ZImage-sweep-") + item.label, item.output_png)
+        _write_zimage_result_manifest(
+            item.result_manifest, prompt, seed, width, height, steps, cfg,
+            item.lora_path, item.output_png, sweep_generated,
+        )
+        print("[sweep] manifest saved:", item.result_manifest)
+    print("[done] saved:", out_path)

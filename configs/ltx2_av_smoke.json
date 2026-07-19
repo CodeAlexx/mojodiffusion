@@ -1,0 +1,5 @@
+{
+  "video_loss_weight": 1.0,
+  "audio_loss_weight": 1.0,
+  "use_audio_length_mask": true
+}

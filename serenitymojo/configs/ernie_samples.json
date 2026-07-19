@@ -1,0 +1,30 @@
+{
+ "schema": "serenity.sample_prompts.v1",
+ "defaults": {
+  "sample_every": 500,
+  "sample_at_start": false,
+  "save_before_sample": false,
+  "precache_required": false,
+  "enforce_min_image_size": false,
+  "width": 1024,
+  "height": 1024,
+  "frames": 1,
+  "fps": 24,
+  "steps": 20,
+  "cfg": 4.0,
+  "seed": 42,
+  "negative": ""
+ },
+ "prompts": [
+  {
+   "id": "ernie_garden_portrait",
+   "prompt": "a portrait photograph of a woman with long hair in a sunlit garden, soft natural lighting, high detail",
+   "seed": 42
+  },
+  {
+   "id": "ernie_city_dusk",
+   "prompt": "a cinematic photograph of a man in a dark coat on a city street at dusk, dramatic lighting, sharp focus",
+   "seed": 43
+  }
+ ]
+}

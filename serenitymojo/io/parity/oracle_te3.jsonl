@@ -1,0 +1,5 @@
+{"dtype": "BF16", "fnv1a64": 16188082682015647771, "name": "model.layers.35.input_layernorm.weight", "offset": 0, "shape": [2560], "size": 5120}
+{"dtype": "BF16", "fnv1a64": 10219504220407026486, "name": "model.layers.35.mlp.down_proj.weight", "offset": 5120, "shape": [2560, 9728], "size": 49807360}
+{"dtype": "BF16", "fnv1a64": 2542812847288986439, "name": "model.layers.35.mlp.up_proj.weight", "offset": 49812480, "shape": [9728, 2560], "size": 49807360}
+{"dtype": "BF16", "fnv1a64": 15922381978111491238, "name": "model.layers.35.post_attention_layernorm.weight", "offset": 99619840, "shape": [2560], "size": 5120}
+{"dtype": "BF16", "fnv1a64": 8403087402334911462, "name": "model.norm.weight", "offset": 99624960, "shape": [2560], "size": 5120}

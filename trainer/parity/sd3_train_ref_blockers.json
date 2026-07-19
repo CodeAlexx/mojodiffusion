@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "producer": "scripts/sd3_dump_train_ref.py",
+  "created_unix": 1780689813.1543775,
+  "reference_policy": {
+    "reference": "Serenity only",
+    "dry_run_numeric_parity": false,
+    "dry_run_note": "Dry-run/blocker artifacts are structural evidence only; they do not load SD3 weights, run a train step, or claim numeric parity.",
+    "non_dry_run_device": "cuda",
+    "cpu_pytorch_numeric_parity": false
+  },
+  "dry_run": true,
+  "one_step_dump_produced": false,
+  "numeric_parity_status": "none",
+  "numeric_parity_claimed": false,
+  "dry_run_checks_are_structural_only": true,
+  "numeric_parity_note": "CPU PyTorch is not numeric parity evidence. SD3 loss/grad/speed parity requires Serenity CUDA reference tensors.",
+  "training_method_scope": {
+    "LORA": "in scope when Serenity registers loader/setup/data-loader paths",
+    "FINE_TUNE": "in scope when Serenity registers loader/setup/data-loader paths",
+    "EMBEDDING": "not in scope for this SD3 train-reference scaffold",
+    "FINE_TUNE_VAE": "not in scope for this SD3 train-reference scaffold"
+  },
+  "serenity_registration_status": {
+    "LORA": {
+      "in_scope": true,
+      "model_loader_registered": true,
+      "model_setup_registered": true,
+      "data_loader_registered": false,
+      "data_loader_registration": null
+    },
+    "FINE_TUNE": {
+      "in_scope": true,
+      "model_loader_registered": true,
+      "model_setup_registered": true,
+      "data_loader_registered": false,
+      "data_loader_registration": null
+    }
+  },
+  "serenity": "/home/alex/Serenity",
+  "config": "/home/alex/Serenity/configs/sd35m_100step_baseline.json",
+  "out_dir": "/home/alex/serenity-trainer/parity",
+  "prefix": "sd3_train_ref",
+  "max_steps": 1,
+  "torch": "2.9.1+cu128",
+  "cuda_available": true,
+  "cuda_device_count": 1,
+  "train_device": "cuda",
+  "temp_device": "cpu",
+  "model_type": "STABLE_DIFFUSION_3",
+  "training_method": "LORA",
+  "model_names": {
+    "base_model": "/home/alex/.serenity/models/checkpoints/stablediffusion35_medium.safetensors",
+    "vae_model": "",
+    "lora_model": "",
+    "include_text_encoder": true,
+    "include_text_encoder_2": true,
+    "include_text_encoder_3": true
+  },
+  "cache": {
+    "enabled": true,
+    "cache_dir": "/home/alex/Serenity/workspace-cache/sd35m_100step_baseline",
+    "present": false,
+    "image": {
+      "path": "/home/alex/Serenity/workspace-cache/sd35m_100step_baseline/image",
+      "exists": false,
+      "file_count_bounded": 0
+    },
+    "text": {
+      "path": "/home/alex/Serenity/workspace-cache/sd35m_100step_baseline/text",
+      "exists": false,
+      "file_count_bounded": 0
+    }
+  },
+  "allow_cache_build": false,
+  "local_model": {
+    "base_model": "/home/alex/.serenity/models/checkpoints/stablediffusion35_medium.safetensors",
+    "vae_model": "",
+    "lora_model": "",
+    "include_text_encoders": {
+      "text_encoder_1": true,
+      "text_encoder_2": true,
+      "text_encoder_3": true
+    },
+    "exists": true,
+    "kind": "single_file",
+    "suffix": ".safetensors",
+    "safetensors": {
+      "inspectable": true,
+      "key_count": 909,
+      "diffusion_key_count": 665,
+      "vae_key_count": 244,
+      "text_encoder_key_count": 0,
+      "sample_keys": [
+        "first_stage_model.decoder.conv_in.bias",
+        "first_stage_model.decoder.conv_in.weight",
+        "first_stage_model.decoder.conv_out.bias",
+        "first_stage_model.decoder.conv_out.weight",
+        "first_stage_model.decoder.mid.attn_1.k.bias",
+        "first_stage_model.decoder.mid.attn_1.k.weight",
+        "first_stage_model.decoder.mid.attn_1.norm.bias",
+        "first_stage_model.decoder.mid.attn_1.norm.weight",
+        "first_stage_model.decoder.mid.attn_1.proj_out.bias",
+        "first_stage_model.decoder.mid.attn_1.proj_out.weight",
+        "first_stage_model.decoder.mid.attn_1.q.bias",
+        "first_stage_model.decoder.mid.attn_1.q.weight",
+        "first_stage_model.decoder.mid.attn_1.v.bias",
+        "first_stage_model.decoder.mid.attn_1.v.weight",
+        "first_stage_model.decoder.mid.block_1.conv1.bias",
+        "first_stage_model.decoder.mid.block_1.conv1.weight"
+      ]
+    }
+  },
+  "blockers": [
+    "No Serenity data loader registered for STABLE_DIFFUSION_3.",
+    "Required latent/text cache is missing or empty (image files=0, text files=0).",
+    "Single-file checkpoint has no inspectable CLIP/T5 text encoder keys; use a full local diffusers snapshot or an existing text cache before producing a CUDA numeric reference. Dry-run remains structural only and is not numeric parity evidence."
+  ],
+  "structured_blockers": [
+    {
+      "id": "missing_data_loader_registration",
+      "category": "registration",
+      "message": "No Serenity data loader registered for STABLE_DIFFUSION_3.",
+      "details": {
+        "model_type": "STABLE_DIFFUSION_3",
+        "training_method": "LORA"
+      }
+    },
+    {
+      "id": "missing_required_cache",
+      "category": "cache",
+      "message": "Required latent/text cache is missing or empty (image files=0, text files=0).",
+      "details": {
+        "enabled": true,
+        "cache_dir": "/home/alex/Serenity/workspace-cache/sd35m_100step_baseline",
+        "present": false,
+        "image": {
+          "path": "/home/alex/Serenity/workspace-cache/sd35m_100step_baseline/image",
+          "exists": false,
+          "file_count_bounded": 0
+        },
+        "text": {
+          "path": "/home/alex/Serenity/workspace-cache/sd35m_100step_baseline/text",
+          "exists": false,
+          "file_count_bounded": 0
+        }
+      }
+    },
+    {
+      "id": "missing_single_file_text_encoder_keys",
+      "category": "weights",
+      "message": "Single-file checkpoint has no inspectable CLIP/T5 text encoder keys; use a full local diffusers snapshot or an existing text cache before producing a CUDA numeric reference. Dry-run remains structural only and is not numeric parity evidence.",
+      "details": {
+        "base_model": "/home/alex/.serenity/models/checkpoints/stablediffusion35_medium.safetensors",
+        "safetensors": {
+          "inspectable": true,
+          "key_count": 909,
+          "diffusion_key_count": 665,
+          "vae_key_count": 244,
+          "text_encoder_key_count": 0,
+          "sample_keys": [
+            "first_stage_model.decoder.conv_in.bias",
+            "first_stage_model.decoder.conv_in.weight",
+            "first_stage_model.decoder.conv_out.bias",
+            "first_stage_model.decoder.conv_out.weight",
+            "first_stage_model.decoder.mid.attn_1.k.bias",
+            "first_stage_model.decoder.mid.attn_1.k.weight",
+            "first_stage_model.decoder.mid.attn_1.norm.bias",
+            "first_stage_model.decoder.mid.attn_1.norm.weight",
+            "first_stage_model.decoder.mid.attn_1.proj_out.bias",
+            "first_stage_model.decoder.mid.attn_1.proj_out.weight",
+            "first_stage_model.decoder.mid.attn_1.q.bias",
+            "first_stage_model.decoder.mid.attn_1.q.weight",
+            "first_stage_model.decoder.mid.attn_1.v.bias",
+            "first_stage_model.decoder.mid.attn_1.v.weight",
+            "first_stage_model.decoder.mid.block_1.conv1.bias",
+            "first_stage_model.decoder.mid.block_1.conv1.weight"
+          ]
+        },
+        "include_text_encoders": {
+          "text_encoder_1": true,
+          "text_encoder_2": true,
+          "text_encoder_3": true
+        }
+      }
+    }
+  ],
+  "blocked": true,
+  "train_dtype": "BFLOAT_16",
+  "fallback_train_dtype": "BFLOAT_16",
+  "weight_dtypes": {
+    "train_dtype": "BFLOAT_16",
+    "fallback_train_dtype": "BFLOAT_16",
+    "unet": "FLOAT_32",
+    "prior": "FLOAT_32",
+    "transformer": "FLOAT_16",
+    "text_encoder": "FLOAT_16",
+    "text_encoder_2": "FLOAT_16",
+    "text_encoder_3": "FLOAT_16",
+    "text_encoder_4": "FLOAT_32",
+    "vae": "FLOAT_32",
+    "effnet_encoder": "FLOAT_32",
+    "decoder": "FLOAT_32",
+    "decoder_text_encoder": "FLOAT_32",
+    "decoder_vqgan": "FLOAT_32",
+    "lora": "FLOAT_32",
+    "embedding": "FLOAT_32"
+  },
+  "lora_weight_dtype": "FLOAT_32",
+  "layer_filter": "",
+  "layer_filter_preset": "full",
+  "blocker_artifact": "/home/alex/serenity-trainer/parity/sd3_train_ref_blockers.json"
+}

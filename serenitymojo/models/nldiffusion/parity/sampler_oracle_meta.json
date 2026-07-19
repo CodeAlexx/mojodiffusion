@@ -1,0 +1,54 @@
+{
+  "num_transfer": {
+    "shape": [
+      64
+    ],
+    "note": "per-step token budget, sum=4096"
+  },
+  "sch_temps_linear": {
+    "shape": [
+      64
+    ],
+    "note": "linear temp schedule"
+  },
+  "unmask_order": {
+    "shape": [
+      4096
+    ],
+    "note": "stratified order len=4096"
+  },
+  "gen_predictor_argmax": {
+    "shape": [
+      128
+    ],
+    "note": "argmax token id per row of gen_predictor.out[128]"
+  },
+  "cfg_cond": {
+    "shape": [
+      4,
+      16
+    ],
+    "note": ""
+  },
+  "cfg_uncond": {
+    "shape": [
+      4,
+      16
+    ],
+    "note": ""
+  },
+  "cfg_combined": {
+    "shape": [
+      4,
+      16
+    ],
+    "note": "(1+gs)cond-gs*uncond, gs=5"
+  },
+  "config": {
+    "n_tokens": 4096,
+    "n_steps": 64,
+    "shift": 5,
+    "min_temp": 0.01,
+    "gs": 5.0
+  }
+}

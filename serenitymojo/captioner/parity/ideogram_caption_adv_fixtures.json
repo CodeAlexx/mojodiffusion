@@ -1,0 +1,584 @@
+{
+ "digest_caption_string": [
+  {
+   "in": "{\"high_level_description\":\"\\u0000\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0000\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0001\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0001\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0002\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0002\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0003\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0003\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0004\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0004\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0005\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0005\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0006\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0006\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0007\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0007\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0008\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\b\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0009\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\t\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u000a\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\n\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u000b\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u000b\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u000c\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\f\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u000d\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\r\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u000e\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u000e\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u000f\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u000f\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0010\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0010\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0011\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0011\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0012\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0012\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0013\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0013\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0014\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0014\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0015\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0015\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0016\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0016\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0017\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0017\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0018\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0018\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0019\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0019\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u001a\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u001a\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u001b\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u001b\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u001c\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u001c\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u001d\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u001d\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u001e\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u001e\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u001f\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u001f\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"a\\u0000b\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"a\\u0000b\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\u007f\u0080\u00a0\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\u007f\u0080\u00a0\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"caf\u00e9 \u65e5\u672c\u8a9e \ud83c\udfa8 \u03a9\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"caf\u00e9 \u65e5\u672c\u8a9e \ud83c\udfa8 \u03a9\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\ud83c\\udfa8\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\ud83c\udfa8\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"\\u00e9\\u65e5\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"\u00e9\u65e5\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"he said \\\"hi\\\"\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"he said \\\"hi\\\"\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"C:\\\\path\\\\to\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"C:\\\\path\\\\to\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"first\",\"high_level_description\":\"second\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"second\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":{\"background\":\"b1\",\"background\":\"b2\",\"elements\":[]}}",
+   "out": "{\"compositional_deconstruction\":{\"background\":\"b2\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"zzz\":\"a\",\"zzz\":\"b\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]},\"zzz\":\"b\"}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[1e2,2e2,3e2,4e2],\"desc\":\"d\"}]}}",
+   "out": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[100.0,200.0,300.0,400.0],\"desc\":\"d\"}]}}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[1E2,2e+2,3.0,4],\"desc\":\"d\"}]}}",
+   "out": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[100.0,200.0,3.0,4],\"desc\":\"d\"}]}}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[100.0,200.0,300.0,400.0],\"desc\":\"d\"}]}}",
+   "out": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[100.0,200.0,300.0,400.0],\"desc\":\"d\"}]}}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[100.5,200,300,400],\"desc\":\"d\"}]}}",
+   "out": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[100.5,200,300,400],\"desc\":\"d\"}]}}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[-1.5,2,3,4],\"desc\":\"d\"}]}}",
+   "out": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[{\"type\":\"obj\",\"bbox\":[-1.5,2,3,4],\"desc\":\"d\"}]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":1.5e3,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]},\"extra\":1500.0}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":1e10,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]},\"extra\":10000000000.0}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":-0.0,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]},\"extra\":-0.0}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":42.0,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]},\"extra\":42.0}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":123456789012345678901234567890,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]},\"extra\":123456789012345678901234567890}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":[1,[2,3],{\"a\":\"b\"}],\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]},\"extra\":[1,[2,3],{\"a\":\"b\"}]}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":01,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"extra\":01,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":5.,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"extra\":5.,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":.5,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"extra\":.5,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"extra\":+5,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"extra\":+5,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":x,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":x,\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{'compositional_deconstruction':{'background':'b','elements':[]}}",
+   "out": "{'compositional_deconstruction':{'background':'b','elements':[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[],}}",
+   "out": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[],}}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[1,2,]}}",
+   "out": "{\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[1,2,]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"a\tb\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"a\tb\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"a\nb\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"a\nb\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}"
+  },
+  {
+   "in": "",
+   "out": ""
+  },
+  {
+   "in": "   ",
+   "out": "   "
+  },
+  {
+   "in": "\t {\"foo\":\"bar\"}",
+   "out": "\t {\"foo\":\"bar\"}"
+  },
+  {
+   "in": "   {not json",
+   "out": "   {not json"
+  },
+  {
+   "in": "{}",
+   "out": "{}"
+  },
+  {
+   "in": "[1,2,3]",
+   "out": "[1,2,3]"
+  },
+  {
+   "in": "{\"foo\":\"bar\"}",
+   "out": "{\"foo\":\"bar\"}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":\"notadict\"}",
+   "out": "{\"compositional_deconstruction\":\"notadict\"}"
+  },
+  {
+   "in": "{\"compositional_deconstruction\":null}",
+   "out": "{\"compositional_deconstruction\":null}"
+  },
+  {
+   "in": "vrtlEri2, plain prose passes through unchanged.",
+   "out": "vrtlEri2, plain prose passes through unchanged."
+  },
+  {
+   "in": "{\"aspect_ratio\":\"1:1\",\"high_level_description\":\"A red apple.\",\"style_description\":{\"aesthetics\":\"clean\",\"lighting\":\"soft\",\"photo\":\"shot\",\"medium\":\"Illustration.\",\"color_palette\":[\"#f00\",\"#FFFFFF\",\"#f00\"]},\"compositional_deconstruction\":{\"background\":\"white\",\"elements\":[{\"type\":\"obj\",\"color_palette\":[\"#ff0000\"],\"desc\":\"apple\",\"bbox\":[100,200,300,400]}]}}",
+   "out": "{\"high_level_description\":\"A red apple.\",\"style_description\":{\"aesthetics\":\"clean\",\"lighting\":\"soft\",\"medium\":\"illustration\",\"art_style\":\"shot\",\"color_palette\":[\"#FF0000\",\"#FFFFFF\"]},\"compositional_deconstruction\":{\"background\":\"white\",\"elements\":[{\"type\":\"obj\",\"bbox\":[100,200,300,400],\"desc\":\"apple\",\"color_palette\":[\"#FF0000\"]}]}}"
+  },
+  {
+   "in": "{\"high_level_description\":\"x\",\"weird\\tkey\":\"v\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]}}",
+   "out": "{\"high_level_description\":\"x\",\"compositional_deconstruction\":{\"background\":\"b\",\"elements\":[]},\"weird\\tkey\":\"v\"}"
+  }
+ ],
+ "swap_bbox_xy_in_text": [
+  {
+   "in": "{\"bbox\":[200,100,400,300]} x {\"bbox\": [5, 6, 1, 2]}",
+   "out": "{\"bbox\":[100,200,300,400]} x {\"bbox\":[2,1,6,5]}"
+  },
+  {
+   "in": "no bbox",
+   "out": "no bbox"
+  },
+  {
+   "in": "{\"bbox\":[0,0,1000,1000]}",
+   "out": "{\"bbox\":[0,0,1000,1000]}"
+  },
+  {
+   "in": "{\"bbox\":[-5,2000,3,4]}",
+   "out": "{\"bbox\":[4,0,1000,3]}"
+  },
+  {
+   "in": "{\"bbox\":[0.5,1.5,2.5,3.5]}",
+   "out": "{\"bbox\":[2,0,4,2]}"
+  },
+  {
+   "in": "{\"bbox\":[-0.5,-1.5,0.5,1.5]}",
+   "out": "{\"bbox\":[0,0,2,0]}"
+  },
+  {
+   "in": "{\"bbox\":[999.5,1000.5,0.5,2.5]}",
+   "out": "{\"bbox\":[2,0,1000,1000]}"
+  },
+  {
+   "in": "{\"bbox\":[100.0,200.0,300.0,400.0]}",
+   "out": "{\"bbox\":[200,100,400,300]}"
+  },
+  {
+   "in": "{\"bbox\":[1000.9,0.1,500.5,500.5]}",
+   "out": "{\"bbox\":[0,500,500,1000]}"
+  },
+  {
+   "in": "{\"bbox\":[1e2,2,3,4]}",
+   "out": "{\"bbox\":[1e2,2,3,4]}"
+  },
+  {
+   "in": "{\"bbox\":[1.5e3,2,3,4]}",
+   "out": "{\"bbox\":[1.5e3,2,3,4]}"
+  },
+  {
+   "in": "{\"bbox\":[+5,2,3,4]}",
+   "out": "{\"bbox\":[+5,2,3,4]}"
+  },
+  {
+   "in": "{\"bbox\":[1,2,3,4,5]}",
+   "out": "{\"bbox\":[1,2,3,4,5]}"
+  },
+  {
+   "in": "{ \"bbox\" : [1,2,3,4] }",
+   "out": "{ \"bbox\":[2,1,4,3] }"
+  },
+  {
+   "in": "{\"bbox\":[ 1 , 2 , 3 , 4 ]}",
+   "out": "{\"bbox\":[2,1,4,3]}"
+  },
+  {
+   "in": "\"bbox\":[1.0,2.0,3.0,4.0]",
+   "out": "\"bbox\":[2,1,4,3]"
+  },
+  {
+   "in": "{\"bbox\":[01,2,3,4]}",
+   "out": "{\"bbox\":[2,1,4,3]}"
+  }
+ ],
+ "canon_medium": [
+  {
+   "in": "Illustration.",
+   "out": "illustration"
+  },
+  {
+   "in": "3D Render",
+   "out": "3d_render"
+  },
+  {
+   "in": "photograph",
+   "out": "photograph"
+  },
+  {
+   "in": "PAINTING ",
+   "out": "painting"
+  },
+  {
+   "in": "Graphic Design",
+   "out": "graphic_design"
+  },
+  {
+   "in": "weird-medium",
+   "out": "weird-medium"
+  },
+  {
+   "in": "",
+   "out": ""
+  },
+  {
+   "in": "  Photo.  ",
+   "out": "photograph"
+  },
+  {
+   "in": "3D-RENDER",
+   "out": "3d_render"
+  },
+  {
+   "in": "graphic",
+   "out": "graphic_design"
+  },
+  {
+   "in": "Render",
+   "out": "3d_render"
+  },
+  {
+   "in": "...",
+   "out": "..."
+  },
+  {
+   "in": "PHOTOGRAPH...",
+   "out": "photograph"
+  },
+  {
+   "in": "  3d render  ",
+   "out": "3d_render"
+  },
+  {
+   "in": "photo.",
+   "out": "photograph"
+  },
+  {
+   "in": ".photo",
+   "out": ".photo"
+  },
+  {
+   "in": "PaInTiNg.",
+   "out": "painting"
+  },
+  {
+   "in": "  ",
+   "out": ""
+  },
+  {
+   "in": "x.y.",
+   "out": "x.y."
+  }
+ ],
+ "normalize_hex": [
+  {
+   "in": "#f00",
+   "out": "#FF0000"
+  },
+  {
+   "in": "#FFFFFF",
+   "out": "#FFFFFF"
+  },
+  {
+   "in": "#abc",
+   "out": "#AABBCC"
+  },
+  {
+   "in": "#GGGGGG",
+   "out": null
+  },
+  {
+   "in": "red",
+   "out": null
+  },
+  {
+   "in": "#1234567",
+   "out": null
+  },
+  {
+   "in": "",
+   "out": null
+  },
+  {
+   "in": "#FfF",
+   "out": "#FFFFFF"
+  },
+  {
+   "in": "#abcdef",
+   "out": "#ABCDEF"
+  },
+  {
+   "in": "  #fff  ",
+   "out": "#FFFFFF"
+  },
+  {
+   "in": "#ABC123",
+   "out": "#ABC123"
+  },
+  {
+   "in": "#12g",
+   "out": null
+  },
+  {
+   "in": "#1234",
+   "out": null
+  },
+  {
+   "in": "#fffffff",
+   "out": null
+  },
+  {
+   "in": "fff",
+   "out": null
+  },
+  {
+   "in": "#",
+   "out": null
+  },
+  {
+   "in": "#fF0",
+   "out": "#FFFF00"
+  },
+  {
+   "in": "##fff",
+   "out": null
+  },
+  {
+   "in": "#56566640",
+   "out": null
+  }
+ ],
+ "is_ideogram_caption_str": [
+  {
+   "in": "vrtlEri2, prose",
+   "out": false
+  },
+  {
+   "in": "",
+   "out": false
+  },
+  {
+   "in": "   ",
+   "out": false
+  },
+  {
+   "in": "{not really json",
+   "out": false
+  },
+  {
+   "in": "{\"foo\":\"bar\"}",
+   "out": false
+  },
+  {
+   "in": "{\"compositional_deconstruction\":{}}",
+   "out": true
+  },
+  {
+   "in": "{\"compositional_deconstruction\":[]}",
+   "out": false
+  },
+  {
+   "in": "   {\"compositional_deconstruction\":{\"x\":1}}  ",
+   "out": true
+  },
+  {
+   "in": "{\"compositional_deconstruction\":null}",
+   "out": false
+  },
+  {
+   "in": "{}",
+   "out": false
+  },
+  {
+   "in": "[1]",
+   "out": false
+  },
+  {
+   "in": "{ \"compositional_deconstruction\" : { } }",
+   "out": true
+  }
+ ]
+}

@@ -1,0 +1,262 @@
+{
+ "_comment": "serenity web trainer preset table \u2014 transcribed from UI_MAP_2026-07-05 \u00a73 (trainer_ui_apply_model_preset) with the \u00a78 debt FIXED: every row is COMPLETE (run naming per row, no cross-preset leaks); klein workspace corrected to where train_klein_real actually writes; wired=false rows return 501 at launch, honestly.",
+ "presets": [
+  {
+   "id": "krea2",
+   "label": "Krea 2 Raw",
+   "backend": "krea2",
+   "wired": true,
+   "argv_shape": "krea2",
+   "binary": "target/serenity_krea2_live_trainer",
+   "base_config": "target/serenity_krea2_train_config.json",
+   "run_name": "krea2_lora",
+   "save_filename_prefix": "krea2",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 64,
+    "lora_alpha": 64.0,
+    "timestep_shift": 1.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 500,
+    "quantized_resident": "fp8_e4m3"
+   }
+  },
+  {
+   "id": "klein9b",
+   "label": "Klein 9B",
+   "backend": "klein",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "target/serenity_klein_live_trainer",
+   "base_config": "target/serenity_klein_train_config.json",
+   "run_name": "klein9b_lora",
+   "save_filename_prefix": "klein9b",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 1.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 500,
+    "quantized_resident": "streamed_base_opt_in"
+   }
+  },
+  {
+   "id": "chroma",
+   "label": "Chroma1 HD",
+   "backend": "chroma",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "target/serenity_chroma_live_trainer",
+   "base_config": "target/serenity_chroma_train_config.json",
+   "run_name": "chroma_lora",
+   "save_filename_prefix": "chroma",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 1.15,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 0,
+    "quantized_resident": "fp8_e4m3"
+   }
+  },
+  {
+   "id": "ernie",
+   "label": "Ernie Image",
+   "backend": "ernie",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "target/serenity_ernie_live_trainer",
+   "base_config": "target/serenity_ernie_train_config.json",
+   "run_name": "ernie_lora",
+   "save_filename_prefix": "ernie",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 1.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 0,
+    "quantized_resident": "OFF"
+   }
+  },
+  {
+   "id": "anima",
+   "label": "Anima",
+   "backend": "anima",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "target/serenity_anima_live_trainer",
+   "base_config": "target/serenity_anima_train_config.json",
+   "run_name": "anima_lora",
+   "save_filename_prefix": "anima",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 1.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 500,
+    "quantized_resident": "OFF"
+   }
+  },
+  {
+   "id": "zimage",
+   "label": "Z-Image",
+   "backend": "zimage",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "target/serenity_zimage_live_trainer",
+   "base_config": "target/serenity_zimage_train_config.json",
+   "run_name": "zimage_lora",
+   "save_filename_prefix": "zimage",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 1.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 0,
+    "quantized_resident": "OFF"
+   }
+  },
+  {
+   "id": "l2p",
+   "label": "Z-Image L2P",
+   "backend": "l2p",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "target/serenity_l2p_live_trainer",
+   "base_config": "target/serenity_l2p_train_config.json",
+   "run_name": "l2p_lora",
+   "save_filename_prefix": "l2p",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 1.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 0,
+    "quantized_resident": "OFF"
+   }
+  },
+  {
+   "id": "hidream",
+   "label": "HiDream O1",
+   "backend": "hidream",
+   "wired": true,
+   "argv_shape": "hidream",
+   "binary": "target/serenity_hidream_live_trainer",
+   "base_config": "",
+   "run_name": "hidream_lora",
+   "save_filename_prefix": "hidream",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 3.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 0,
+    "quantized_resident": "OFF"
+   },
+   "_unwired_note": "WIRED (shape 3) \u2014 dry-run verified; not yet run-gated on GPU"
+  },
+  {
+   "id": "ideogram4",
+   "label": "Ideogram4 FP8",
+   "backend": "ideogram4",
+   "wired": true,
+   "argv_shape": "ideogram4",
+   "binary": "target/serenity_ideogram4_live_trainer",
+   "base_config": "",
+   "run_name": "ideogram4_lora",
+   "save_filename_prefix": "ideogram4",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 1.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 0,
+    "quantized_resident": "fp8_e4m3"
+   },
+   "_unwired_note": "WIRED (18-arg shape 4) \u2014 dry-run verified; not yet run-gated on GPU"
+  },
+  {
+   "id": "sdxl",
+   "label": "SDXL 1.0",
+   "backend": "sdxl",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "target/serenity_sdxl_live_trainer",
+   "base_config": "serenitymojo/configs/sdxl.json",
+   "run_name": "sdxl_lora",
+   "save_filename_prefix": "sdxl",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 1.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 0,
+    "quantized_resident": "OFF"
+   },
+   "_unwired_note": "FROZEN by user mandate 2026-07-04 (no sdxl work) \u2014 row kept for completeness",
+   "_sampling_note": "inline sampler is a 128x128 comptime binary; 1024 validation renders FAIL LOUD \u2014 sample_every=0 until the sampler arm is rebuilt (unfreeze 2026-07-06)"
+  },
+  {
+   "id": "sd35",
+   "label": "SD 3.5",
+   "backend": "sd35",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "target/serenity_sd35_live_trainer",
+   "base_config": "serenitymojo/configs/sd35.json",
+   "run_name": "sd35",
+   "save_filename_prefix": "sd35",
+   "recipe": {
+    "quantized_resident": "fp8_e4m3",
+    "sample_every": 0
+   },
+   "_unwired_note": "FROZEN by user mandate \u2014 fail-loud route, matches Mojo UI behavior (UI_MAP \u00a78.7)",
+   "_note": "sd3.5-LARGE device stack (MJ-1069 closed 2026-07-06): fp8-resident, ~7.8s/step at 1024^2, flash attention; inline sampler not yet wired for Large -> sample_every=0"
+  },
+  {
+   "id": "ltx2",
+   "label": "LTX-2 AV",
+   "backend": "ltx2",
+   "wired": false,
+   "argv_shape": "none",
+   "binary": "",
+   "base_config": "",
+   "run_name": "ltx2",
+   "save_filename_prefix": "ltx2",
+   "recipe": {},
+   "_unwired_note": "no live trainer runner wired (matches Mojo UI)"
+  },
+  {
+   "id": "wan22",
+   "label": "Wan2.2 T2V 14B",
+   "backend": "wan22",
+   "wired": false,
+   "argv_shape": "none",
+   "binary": "",
+   "base_config": "",
+   "run_name": "wan22",
+   "save_filename_prefix": "wan22",
+   "recipe": {},
+   "_unwired_note": "no live trainer runner wired (matches Mojo UI)"
+  }
+ ]
+}

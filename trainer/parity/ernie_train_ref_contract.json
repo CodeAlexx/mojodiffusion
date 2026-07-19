@@ -1,0 +1,30 @@
+{
+  "producer": "scripts/ernie_dump_train_ref.py",
+  "schema_version": 1,
+  "reference_sources": [
+    "/home/alex/Serenity/modules/model/ErnieModel.py",
+    "/home/alex/Serenity/modules/dataLoader/ErnieBaseDataLoader.py",
+    "/home/alex/Serenity/modules/modelSetup/BaseErnieSetup.py",
+    "/home/alex/Serenity/modules/modelSetup/ErnieLoRASetup.py",
+    "/home/alex/Serenity/modules/modelSetup/ErnieFineTuneSetup.py",
+    "/home/alex/Serenity/modules/modelSampler/ErnieSampler.py",
+    "/home/alex/Serenity/modules/modelLoader/ErnieModelLoader.py",
+    "/home/alex/Serenity/modules/modelSaver/ErnieLoRAModelSaver.py",
+    "/home/alex/Serenity/modules/modelSaver/ErnieFineTuneModelSaver.py"
+  ],
+  "required_tensors": [
+    "output.predicted",
+    "output.target",
+    "output.loss_pre_scale",
+    "output.loss_for_backward",
+    "trace.scaled_latent_image",
+    "trace.latent_noise",
+    "trace.scaled_noisy_latent_image",
+    "trace.sigma",
+    "trace.transformer_hidden_states",
+    "trace.transformer_timestep",
+    "trace.encoder_hidden_states",
+    "trace.packed_predicted_flow",
+    "trace.flow"
+  ]
+}

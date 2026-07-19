@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "name": "flux2_dev_train_ref",
+  "purpose": "Serenity Flux2 dev cached-data train-reference scaffold for predict -> loss -> backward_lora -> optimizer parity gates.",
+  "producer_script": "/home/alex/serenity-trainer/scripts/flux2_dev_dump_train_ref.py",
+  "reference_policy": {
+    "only_reference": "/home/alex/Serenity",
+    "external_references_used": false,
+    "cpu_pytorch_dry_runs": "structural/import/config/cache checks only; never numeric parity"
+  },
+  "numeric_parity_policy": {
+    "status": "none_until_cuda_reference_tensors_exist",
+    "note": "Dry-run/config checks are structural only. There is no Flux2 dev numeric parity until Serenity CUDA reference tensors exist.",
+    "required_files": [
+      "flux2_dev_train_ref_meta.json",
+      "flux2_dev_train_ref_step000.safetensors",
+      "flux2_dev_train_ref_step000_adapters.safetensors"
+    ],
+    "forbidden_claims": [
+      "CPU PyTorch numeric parity",
+      "dry-run numeric parity",
+      "Flux2 Klein tensors standing in for Flux2 dev tensors"
+    ]
+  },
+  "reference_files_inspected": [
+    "/home/alex/Serenity/modules/model/Flux2Model.py",
+    "/home/alex/Serenity/modules/modelLoader/Flux2ModelLoader.py",
+    "/home/alex/Serenity/modules/dataLoader/Flux2BaseDataLoader.py",
+    "/home/alex/Serenity/modules/modelSetup/BaseFlux2Setup.py",
+    "/home/alex/Serenity/modules/modelSetup/Flux2LoRASetup.py",
+    "/home/alex/Serenity/modules/modelSetup/Flux2FineTuneSetup.py",
+    "/home/alex/Serenity/modules/modelSampler/Flux2Sampler.py",
+    "/home/alex/Serenity/modules/modelSaver/Flux2LoRAModelSaver.py",
+    "/home/alex/Serenity/modules/modelSaver/Flux2FineTuneModelSaver.py"
+  ],
+  "source_line_anchors": {
+    "Flux2Model.is_dev": "/home/alex/Serenity/modules/model/Flux2Model.py:232",
+    "Flux2Model.encode_text_dev_branch": "/home/alex/Serenity/modules/model/Flux2Model.py:179",
+    "Flux2ModelLoader.dev_branch": "/home/alex/Serenity/modules/modelLoader/Flux2ModelLoader.py:100",
+    "Flux2BaseDataLoader.dev_branch": "/home/alex/Serenity/modules/dataLoader/Flux2BaseDataLoader.py:42",
+    "BaseFlux2Setup.predict": "/home/alex/Serenity/modules/modelSetup/BaseFlux2Setup.py:82",
+    "Flux2LoRASetup.setup_model": "/home/alex/Serenity/modules/modelSetup/Flux2LoRASetup.py:52",
+    "Flux2Sampler.__sample_base": "/home/alex/Serenity/modules/modelSampler/Flux2Sampler.py:39",
+    "Flux2Sampler.sample": "/home/alex/Serenity/modules/modelSampler/Flux2Sampler.py:163"
+  },
+  "variant_contract": {
+    "model_type": "FLUX_2",
+    "training_method": "LORA",
+    "dev_detection": "Serenity Flux2Model.is_dev() returns True iff model.transformer.config.num_attention_heads == 48.",
+    "dev_text_path": "PixtralProcessor tokenizer plus Mistral3 hidden states.",
+    "klein_text_path": "Qwen tokenizer/Qwen3 hidden states; not valid for Flux2 dev parity."
+  },
+  "default_config": "/home/alex/Serenity/configs/flux2_dev_100step_baseline.json",
+  "local_partial_flux2_dev_transformer_config": {
+    "path": "/home/alex/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-dev/snapshots/26afe3a78bb242c0a8bb181dcc8937bb16e5c66c/transformer/config.json",
+    "exists": true,
+    "num_attention_heads": 48,
+    "num_layers": 8,
+    "num_single_layers": 48,
+    "joint_attention_dim": 15360,
+    "serenity_trainer_is_dev_condition": "transformer.config.num_attention_heads == 48",
+    "structural_dev_hint": true,
+    "scope": "partial transformer config only; no model_index, scheduler, VAE, tokenizer, text_encoder, cache, train config, baseline, or numeric parity"
+  },
+  "preset_candidates": [
+    "/home/alex/Serenity/training_presets/#flux2 LoRA 8GB.json",
+    "/home/alex/Serenity/training_presets/#flux2 LoRA 16GB.json",
+    "/home/alex/Serenity/training_presets/#flux2 Finetune 16GB.json",
+    "/home/alex/Serenity/training_presets/#flux2 Finetune 24GB.json"
+  ],
+  "default_outputs": {
+    "run_metadata": "parity/flux2_dev_train_ref_meta.json",
+    "step_tensors": "parity/flux2_dev_train_ref_step000.safetensors",
+    "adapter_tensors": "parity/flux2_dev_train_ref_step000_adapters.safetensors",
+    "dry_run_blockers": "parity/flux2_dev_train_ref_blockers.json",
+    "contract": "parity/flux2_dev_train_ref_contract.json"
+  },
+  "step_safetensors_keys": {
+    "cached_batch": "batch.* tensors exactly as Serenity Flux2BaseDataLoader yields them, including latent_image, tokens, tokens_mask, text_encoder_hidden_state, loss_weight, concept_type, and image metadata.",
+    "trace": "trace.* tensors from BaseFlux2Setup.predict and Flux2Model helpers: scaled_latent_image, latent_noise, scaled_noisy_latent_image, sigma, packed_latent_input, transformer_timestep, guidance, encoder_hidden_states, text_ids, image_ids, packed_predicted_flow, predicted_flow, and flow.",
+    "outputs": "output.timestep, output.predicted, output.target, optional prior_target, output.loss_pre_scale, and output.loss_for_backward."
+  },
+  "bounded_run_notes": [
+    "The current scaffold is dry-run/contract first and does not claim tensor parity.",
+    "A future tensor-producing run must use Serenity from /home/alex/Serenity on CUDA.",
+    "The runtime model must satisfy model.is_dev() after Serenity loads the transformer.",
+    "Existing Klein train-reference tensors are not acceptable Flux2 dev substitutes.",
+    "Dry-run writes blockers and contract JSON without loading Flux2 dev model weights."
+  ]
+}

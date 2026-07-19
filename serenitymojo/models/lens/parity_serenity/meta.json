@@ -1,0 +1,50 @@
+{
+  "seed": 1234,
+  "s_img_h": 8,
+  "s_img_w": 8,
+  "s_img_tokens": 64,
+  "s_txt": 16,
+  "img_shapes": [
+    [
+      1,
+      8,
+      8
+    ]
+  ],
+  "config": {
+    "patch_size": 2,
+    "in_channels": 128,
+    "out_channels": 32,
+    "num_layers": 48,
+    "attention_head_dim": 64,
+    "num_attention_heads": 24,
+    "inner_dim": 1536,
+    "enc_hidden_dim": 2880,
+    "axes_dims_rope": [
+      8,
+      28,
+      28
+    ],
+    "gate_mlp": true,
+    "rms_norm": true,
+    "multi_layer_encoder_feature": true,
+    "selected_layer_index": [
+      5,
+      11,
+      17,
+      23
+    ],
+    "_class_name": "LensTransformer2DModel",
+    "_diffusers_version": "0.37.1",
+    "_name_or_path": "/home/alex/.serenity/models/microsoft_lens"
+  },
+  "out_shape": [
+    1,
+    64,
+    128
+  ],
+  "out_mean": -0.06543871015310287,
+  "out_std": 1.7215126752853394,
+  "out_absmax": 7.333669662475586,
+  "batch_norm_eps": 0.0001
+}

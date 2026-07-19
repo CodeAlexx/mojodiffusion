@@ -1,0 +1,37 @@
+{
+ "schema": "serenity.sample_prompts.v1",
+ "defaults": {
+  "sample_every": 500,
+  "sample_at_start": true,
+  "save_before_sample": true,
+  "precache_required": true,
+  "width": 1024,
+  "height": 1024,
+  "frames": 1,
+  "fps": 24,
+  "steps": 20,
+  "cfg": 4.5,
+  "seed": 42,
+  "negative": ""
+ },
+ "prompts": [
+  {
+   "id": "anima_eri2_wall",
+   "prompt": "vrtlEri2, The image depicts a person with long, dark hair, standing against a textured, light-colored wall. The lighting is soft and diffused, creating a moody and atmospheric effect. The person's hair falls over their shoulders, and they are positioned in a way that obscures their upper body, leaving only the lower part of their torso visible. The background features the shadow of a tree, adding a natural element to the the scene. The overall mood of the image is serene and contemplative, with the soft lighting and the shadow of the tree creating a sense of depth and tranquility.",
+   "seed": 42,
+   "caps": {
+    "positive": "/home/alex/mojodiffusion/output/anima_eri2_caps/context_pos0.safetensors",
+    "negative": "/home/alex/mojodiffusion/output/anima_eri2_caps/context_neg.safetensors"
+   }
+  },
+  {
+   "id": "anima_eri2_bench",
+   "prompt": "vrtlEri2, The image depicts a woman sitting on a white surface, possibly a bench or a low wall. She is wearing a white lace bra with intricate floral designs. Her hair is dark and curly, cascading over her shoulders. She is holding her left arm with her right hand, her hand resting on her knee. She is wearing a delicate gold bracelet on her left wrist. The background features a blurred white wall and some green foliage, suggesting an outdoor setting. The lighting is soft and natural, creating a serene and intimate atmosphere. The overall mood of the image is calm and elegant, with a focus on the woman's relaxed posture and the delicate details of her lace bra.",
+   "seed": 43,
+   "caps": {
+    "positive": "/home/alex/mojodiffusion/output/anima_eri2_caps/context_pos1.safetensors",
+    "negative": "/home/alex/mojodiffusion/output/anima_eri2_caps/context_neg.safetensors"
+   }
+  }
+ ]
+}

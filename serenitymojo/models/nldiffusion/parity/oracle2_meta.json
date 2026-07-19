@@ -1,0 +1,13 @@
+{
+  "n_steps": 64,
+  "gs": 0.0,
+  "policy": "argmax+stratified",
+  "prompt": "A red apple on a wooden table, studio lighting, photorealistic",
+  "gen_time_s": 63.14418840408325,
+  "sec_per_step": 0.9866279438138008,
+  "token_grid": [
+    1,
+    4096
+  ],
+  "n_unique_tokens": 1468
+}

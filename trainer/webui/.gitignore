@@ -1,0 +1,6 @@
+target/
+Cargo.lock
+board.db*
+ui_state.json
+runs_history.jsonl
+active_run.json

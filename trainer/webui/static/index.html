@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Serenity Trainer</title>
+  <style>
+    :root { color-scheme: dark; font: 15px/1.45 Inter, system-ui, sans-serif; background:#101115; color:#edf0f7 }
+    * { box-sizing:border-box }
+    body { margin:0; min-height:100vh; background:radial-gradient(circle at 15% -10%,#342659 0,transparent 38%),#101115 }
+    header { display:flex; align-items:center; justify-content:space-between; padding:18px 28px; border-bottom:1px solid #2c2e37; background:#121319d9; position:sticky; top:0 }
+    h1 { margin:0; font-size:19px; letter-spacing:.02em }
+    nav button { border:0; background:transparent; color:#aeb4c2; padding:8px 12px; cursor:pointer }
+    nav button.active { color:#fff; border-bottom:2px solid #9b7cff }
+    main { max-width:1180px; margin:0 auto; padding:28px }
+    section { display:none } section.active { display:block }
+    .grid { display:grid; grid-template-columns:minmax(320px,430px) 1fr; gap:22px }
+    .card { background:#191b22e8; border:1px solid #30323d; border-radius:14px; padding:20px; box-shadow:0 16px 50px #0004 }
+    h2 { margin:0 0 18px; font-size:16px }
+    label { display:block; margin:13px 0 5px; color:#bfc4d1; font-size:13px }
+    input,select,textarea { width:100%; border:1px solid #3b3e4b; background:#111218; color:#f3f4fa; border-radius:8px; padding:10px 11px }
+    .pair { display:grid; grid-template-columns:1fr 1fr; gap:12px }
+    button.primary { width:100%; margin-top:18px; padding:11px; border:0; border-radius:9px; background:#8b6df5; color:white; font-weight:700; cursor:pointer }
+    button.primary:disabled { opacity:.45 }
+    .actions { display:flex; gap:9px; margin:10px 0 }
+    .actions button { border:1px solid #454958; background:#232630; color:#edf0f7; border-radius:8px; padding:8px 12px; cursor:pointer }
+    .actions button.danger { border-color:#7f3d4a; color:#ffacb6 }
+    .run { display:grid; grid-template-columns:1fr auto; gap:6px 12px; padding:13px 0; border-bottom:1px solid #2b2d36; cursor:pointer }
+    .run:last-child { border:0 }
+    .run small { color:#949aaa }
+    .state { align-self:start; border-radius:999px; padding:3px 9px; background:#292c37; font-size:12px }
+    .state.completed { color:#80e7b1 }.state.failed { color:#ff8e9c }.state.training,.state.caching { color:#b9a8ff }
+    pre { min-height:520px; max-height:70vh; overflow:auto; white-space:pre-wrap; word-break:break-word; background:#0b0c10; border:1px solid #292b34; border-radius:10px; padding:15px; color:#d8dce7 }
+    .muted { color:#8f95a5 }.error { color:#ff8e9c; margin-top:12px }
+    .readiness { min-height:38px; margin-top:7px; font-size:12px; color:#a9afbd }
+    @media(max-width:850px){.grid{grid-template-columns:1fr}main{padding:16px}}
+  </style>
+</head>
+<body>
+  <header><h1>Serenity Trainer</h1><nav><button class="active" data-view="trainer">Trainer</button><button data-view="logs">Logs</button></nav></header>
+  <main>
+    <section id="trainer" class="active">
+      <div class="grid">
+        <form id="run-form" class="card">
+          <h2>New training run</h2>
+          <label for="model">Model</label>
+          <select id="model"><option value="krea2">Krea 2 Raw</option><option value="anima">Anima</option><option value="chroma">Chroma1 HD</option></select>
+          <div id="model-readiness" class="readiness">Loading trainer readiness…</div>
+          <label for="dataset">Image + caption dataset</label>
+          <input id="dataset" required placeholder="/path/to/dataset">
+          <label for="output-name">Output name</label>
+          <input id="output-name" required value="krea_lora" pattern="[A-Za-z0-9_-]+">
+          <div class="pair">
+            <div><label for="steps">Steps</label><input id="steps" type="number" min="1" max="1000000" value="2000"></div>
+          <div><label for="resolution">Resolution</label><select id="resolution"><option>512</option></select></div>
+          </div>
+          <div class="pair">
+            <div><label for="rank">LoRA rank</label><input id="rank" type="number" min="1" value="16"></div>
+            <div><label for="learning-rate">Learning rate</label><input id="learning-rate" type="number" step="0.000001" value="0.0001"></div>
+          </div>
+          <div class="pair">
+            <div><label for="save-every">Save every</label><input id="save-every" type="number" min="1" value="500"></div>
+            <div><label for="sample-every">Sample every</label><input id="sample-every" type="number" min="0" value="500"></div>
+          </div>
+          <label for="resume">Resume state (optional)</label>
+          <input id="resume" list="resume-states" placeholder="Select a state from a prior run">
+          <datalist id="resume-states"></datalist>
+          <label><input id="only-cache" type="checkbox" style="width:auto"> Prepare cache only</label>
+          <button class="primary" type="submit">Start run</button>
+          <div id="form-message" class="muted"></div>
+        </form>
+        <div class="card"><h2>Runs</h2><div id="runs" class="muted">No runs yet.</div></div>
+      </div>
+    </section>
+    <section id="logs">
+      <div class="card"><h2 id="log-title">Run logs</h2><div id="log-status" class="muted">Select a run from the Trainer screen.</div><div class="actions"><button id="cancel-run" class="danger" disabled>Cancel</button><button id="restart-run" disabled>Restart</button></div><pre id="log-output"></pre></div>
+    </section>
+  </main>
+  <script>
+    const views=[...document.querySelectorAll('section')], tabs=[...document.querySelectorAll('nav button')];
+    let selectedRun=null,runsById=new Map(),modelsById=new Map();
+    function showView(id){views.forEach(v=>v.classList.toggle('active',v.id===id));tabs.forEach(t=>t.classList.toggle('active',t.dataset.view===id));}
+    tabs.forEach(t=>t.onclick=()=>showView(t.dataset.view));
+    function showModelReadiness(){const model=modelsById.get(document.querySelector('#model').value);document.querySelector('#model-readiness').textContent=model?`${model.readiness} · ${model.reason}`:'Readiness unavailable';}
+    async function loadModels(){
+      const data=await fetch('/api/models').then(r=>r.json()).catch(()=>({models:[]}));
+      if(!data.models.length){showModelReadiness();return;}
+      modelsById=new Map(data.models.map(model=>[model.id,model]));
+      document.querySelector('#model').innerHTML=data.models.map(model=>`<option value="${model.id}" ${model.admitted?'':'disabled'}>${model.label}${model.admitted?'':' — not ready'}</option>`).join('');
+      showModelReadiness();
+    }
+    async function refreshRuns(){
+      const data=await fetch('/api/runs').then(r=>r.json()).catch(()=>({runs:[]}));
+      runsById=new Map(data.runs.map(run=>[run.run_id,run]));
+      const states=data.runs.flatMap(run=>run.resume_states||[]);document.querySelector('#resume-states').innerHTML=states.map(path=>`<option value="${path}">`).join('');
+      const root=document.querySelector('#runs');
+      if(!data.runs.length){root.innerHTML='<span class="muted">No runs yet.</span>';return;}
+      root.innerHTML=data.runs.map(r=>`<div class="run" data-id="${r.run_id}"><div><strong>${r.run_id}</strong><br><small>${r.stage||''} · ${r.message||''}</small></div><span class="state ${r.state}">${r.state}</span></div>`).join('');
+      root.querySelectorAll('.run').forEach(row=>row.onclick=()=>openLog(row.dataset.id));
+    }
+    function updateRunActions(){const run=runsById.get(selectedRun),active=run&&['created','validating','caching','cache-ready','training'].includes(run.state);document.querySelector('#cancel-run').disabled=!active;document.querySelector('#restart-run').disabled=!run||active;document.querySelector('#log-status').textContent=run?`${run.state} · ${run.stage||''} · ${run.message||''}`:'Run status unavailable';}
+    async function openLog(id){selectedRun=id;document.querySelector('#log-title').textContent=`Logs · ${id}`;showView('logs');updateRunActions();await refreshLog();}
+    async function refreshLog(){if(!selectedRun)return;const text=await fetch(`/api/runs/${encodeURIComponent(selectedRun)}/log`).then(r=>r.text()).catch(e=>String(e));const out=document.querySelector('#log-output');out.textContent=text;out.scrollTop=out.scrollHeight;}
+    document.querySelector('#run-form').onsubmit=async event=>{
+      event.preventDefault();const button=event.submitter,message=document.querySelector('#form-message');button.disabled=true;message.textContent='Creating durable run…';
+      const body={model:document.querySelector('#model').value,dataset:document.querySelector('#dataset').value,output_name:document.querySelector('#output-name').value,resume:document.querySelector('#resume').value||null,only_cache:document.querySelector('#only-cache').checked,recipe:{max_steps:+document.querySelector('#steps').value,resolution:document.querySelector('#resolution').value,lora_rank:+document.querySelector('#rank').value,lora_alpha:+document.querySelector('#rank').value,learning_rate:+document.querySelector('#learning-rate').value,save_every:+document.querySelector('#save-every').value,sample_every:+document.querySelector('#sample-every').value}};
+      try{const response=await fetch('/api/runs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const data=await response.json();message.textContent=data.message||`Run ${data.run_id} created`;selectedRun=data.run_id;await refreshRuns();await openLog(data.run_id);}catch(error){message.textContent=String(error);message.className='error';}finally{button.disabled=false;}
+    };
+    document.querySelector('#cancel-run').onclick=async()=>{if(!selectedRun)return;await fetch(`/api/runs/${encodeURIComponent(selectedRun)}/cancel`,{method:'POST'});await refreshRuns();updateRunActions();await refreshLog();};
+    document.querySelector('#restart-run').onclick=async()=>{if(!selectedRun)return;await fetch(`/api/runs/${encodeURIComponent(selectedRun)}/restart`,{method:'POST'});await refreshRuns();updateRunActions();await refreshLog();};
+    document.querySelector('#model').onchange=event=>{document.querySelector('#output-name').value=`${event.target.value}_lora`;showModelReadiness();};
+    loadModels();refreshRuns();setInterval(async()=>{await refreshRuns();updateRunActions();await refreshLog();},1500);
+  </script>
+</body>
+</html>

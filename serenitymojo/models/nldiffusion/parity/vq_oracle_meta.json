@@ -1,0 +1,49 @@
+{
+  "vqdec.ids": {
+    "shape": [
+      1,
+      256
+    ],
+    "dtype": "torch.float32",
+    "note": "input token ids [1,256]"
+  },
+  "vqdec.codebook_entry": {
+    "shape": [
+      1,
+      256,
+      256
+    ],
+    "dtype": "torch.float32",
+    "note": "[1,256,256] embed gather"
+  },
+  "vqdec.z": {
+    "shape": [
+      1,
+      256,
+      16,
+      16
+    ],
+    "dtype": "torch.float32",
+    "note": "[1,256,16,16] pre-decode"
+  },
+  "vqdec.decoded_raw": {
+    "shape": [
+      1,
+      3,
+      256,
+      256
+    ],
+    "dtype": "torch.float32",
+    "note": "[1,3,256,256] decoder out"
+  },
+  "vqdec.decoded_clamped": {
+    "shape": [
+      1,
+      3,
+      256,
+      256
+    ],
+    "dtype": "torch.float32",
+    "note": "clamped[-1,1]"
+  }
+}

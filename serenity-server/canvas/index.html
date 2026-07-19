@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SerenityFlow</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%237c5cff'/%3E%3Ctext x='8' y='11.5' font-size='9' text-anchor='middle' fill='white' font-family='sans-serif'%3ES%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="css/canvas.css">
+    <link rel="stylesheet" href="css/shell.css">
+    <link rel="stylesheet" href="css/generate.css">
+    <link rel="stylesheet" href="css/workflows.css">
+    <link rel="stylesheet" href="css/canvas-tab.css">
+    <link rel="stylesheet" href="css/queue.css">
+    <link rel="stylesheet" href="css/models.css">
+    <link rel="stylesheet" href="css/settings.css">
+    <link rel="stylesheet" href="css/video-edit.css">
+    <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+    <!-- Global Top Bar -->
+    <div id="topbar">
+        <div class="topbar-left">
+            <div class="model-badge">No model loaded</div>
+        </div>
+        <div class="topbar-center">
+
+        </div>
+        <div class="topbar-right">
+            <span class="queue-dot idle"></span>
+            <span class="queue-label">Idle</span>
+            <button id="topbar-refresh" class="topbar-icon-btn" title="Reload UI (Ctrl+Shift+R)" onclick="location.reload(true)">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/></svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- App Body (rail + content) -->
+    <div id="app-body">
+        <!-- Icon Rail -->
+        <nav id="icon-rail">
+            <div class="rail-top">
+                <button class="nav-btn" data-tab="generate" title="Generate">
+                    <i data-lucide="wand-2"></i>
+                    <div class="tooltip">Generate</div>
+                </button>
+                <button class="nav-btn" data-tab="canvas" title="Canvas">
+                    <i data-lucide="layers"></i>
+                    <div class="tooltip">Canvas</div>
+                </button>
+                <button class="nav-btn" data-tab="workflows" title="Workflows">
+                    <i data-lucide="share-2"></i>
+                    <div class="tooltip">Workflows</div>
+                </button>
+                <button class="nav-btn" data-tab="video-edit" title="Video Edit">
+                    <i data-lucide="film"></i>
+                    <div class="tooltip">Video Edit</div>
+                </button>
+                <button class="nav-btn" data-tab="models" title="Models">
+                    <i data-lucide="box"></i>
+                    <div class="tooltip">Models</div>
+                </button>
+                <button class="nav-btn" data-tab="queue" title="Queue" style="position:relative">
+                    <i data-lucide="list-ordered"></i>
+                    <span id="queue-rail-badge"></span>
+                    <div class="tooltip">Queue</div>
+                </button>
+            </div>
+            <div class="rail-bottom">
+                <button class="nav-btn" data-tab="settings" title="Settings">
+                    <i data-lucide="settings"></i>
+                    <div class="tooltip">Settings</div>
+                </button>
+            </div>
+        </nav>
+
+
+        <!-- Content Area (Advanced Mode) -->
+        <div id="content-area">
+            <!-- Tab Panels -->
+            <div class="tab-panel" id="panel-generate" style="display: none">
+                <div class="placeholder">Generate</div>
+            </div>
+            <div class="tab-panel" id="panel-canvas" style="display: none">
+                <div class="placeholder">Canvas</div>
+            </div>
+
+            <!-- Workflows panel starts visible so Konva gets correct container dimensions on init.
+                 shell.js switches to the saved/default tab after app.js DOMContentLoaded completes. -->
+            <div class="tab-panel" id="panel-workflows" style="display: flex">
+                <!-- ===== Existing Graph Editor (preserved from original index.html) ===== -->
+
+                <!-- Toolbar -->
+                <div id="toolbar">
+                    <div class="toolbar-left">
+                        <i data-lucide="folder-open" class="wf-toolbar-icon"></i>
+                        <input type="text" id="workflow-name" class="wf-name-input" placeholder="Untitled Workflow" value="">
+                    </div>
+                    <div class="toolbar-center"></div>
+                    <div class="toolbar-right">
+                        <div class="wf-templates-wrap">
+                            <button id="btn-templates" class="wf-btn-ghost" title="Templates">
+                                <i data-lucide="layout-template" class="wf-btn-icon"></i>
+                                <span>Templates</span>
+                            </button>
+                            <div id="templates-dropdown" class="wf-templates-dropdown hidden">
+                                <div id="templates-list"></div>
+                            </div>
+                        </div>
+                        <button id="btn-load" class="wf-btn-ghost" title="Load Workflow (Ctrl+O)">
+                            <i data-lucide="folder-open" class="wf-btn-icon"></i>
+                            <span>Load</span>
+                        </button>
+                        <button id="btn-save" class="wf-btn-ghost" title="Save Workflow (Ctrl+S)">
+                            <i data-lucide="save" class="wf-btn-icon"></i>
+                            <span>Save</span>
+                        </button>
+                        <button id="btn-interrupt" class="wf-btn-ghost wf-btn-stop" title="Stop" disabled>
+                            <i data-lucide="square" class="wf-btn-icon"></i>
+                            <span>Stop</span>
+                        </button>
+                        <button id="btn-queue" class="wf-btn-queue" title="Queue Prompt (Ctrl+Enter)">
+                            <i data-lucide="play" class="wf-btn-icon"></i>
+                            <span>Generate</span>
+                        </button>
+                        <span id="status-indicator" class="status-idle">&#9679;</span>
+                        <span id="queue-count">0</span>
+                    </div>
+                </div>
+
+                <!-- Main layout -->
+                <div id="main">
+                    <!-- Sidebar: hidden, kept for SFSidebar data loading -->
+                    <div id="sidebar" style="display:none">
+                        <input type="text" id="node-search" placeholder="Search nodes..." autocomplete="off">
+                        <div id="node-list"></div>
+                    </div>
+
+                    <!-- Canvas container -->
+                    <div id="canvas-container">
+                        <div class="canvas-hint" id="canvas-hint">
+                            Right-click or double-click to add nodes<br>
+                            <kbd>Ctrl+Enter</kbd> Queue &nbsp; <kbd>Space</kbd> Quick Queue &nbsp; <kbd>Ctrl+S</kbd> Save
+                        </div>
+                    </div>
+
+                    <!-- Properties panel -->
+                    <div id="properties-panel" class="hidden">
+                        <div id="properties-header">
+                            <span id="properties-title">Properties</span>
+                            <button id="properties-close">&times;</button>
+                        </div>
+                        <div id="properties-content"></div>
+                    </div>
+
+                    <!-- Preview panel -->
+                    <div id="preview-panel" class="hidden">
+                        <div id="preview-header">
+                            <span>Preview</span>
+                            <button id="preview-close">&times;</button>
+                        </div>
+                        <div id="preview-content"></div>
+                    </div>
+                </div>
+
+                <!-- Context menu -->
+                <div id="context-menu" class="hidden">
+                    <div id="context-menu-items"></div>
+                </div>
+
+                <!-- File input (hidden) -->
+                <input type="file" id="file-input" accept=".json" style="display:none">
+            </div>
+
+            <div class="tab-panel" id="panel-video-edit" style="display: none">
+            </div>
+
+            <div class="tab-panel" id="panel-models" style="display: none">
+                <div class="placeholder">Models</div>
+            </div>
+            <div class="tab-panel" id="panel-queue" style="display: none">
+                <div class="placeholder">Queue</div>
+            </div>
+            <div class="tab-panel" id="panel-settings" style="display: none">
+                <div class="placeholder">Settings</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Server Console (toggle with backtick key) -->
+    <div id="sf-console" style="display:none">
+        <div id="sf-console-header">
+            <span>Server Console</span>
+            <button id="sf-console-clear" title="Clear">Clear</button>
+            <button id="sf-console-close" title="Close">&times;</button>
+        </div>
+        <div id="sf-console-log"></div>
+    </div>
+
+
+    <!-- Canvas floating preview panel -->
+    <div id="canvas-preview-panel" style="display:none">
+        <div id="canvas-preview-header">
+            <span>Preview</span>
+            <button id="canvas-preview-close">&times;</button>
+        </div>
+        <div id="canvas-preview-body"></div>
+        <div id="canvas-preview-actions">
+            <button id="canvas-preview-accept" class="cv-preview-accept">Accept &rarr; Canvas</button>
+            <button id="canvas-preview-discard" class="cv-preview-discard">Discard</button>
+            <button id="canvas-preview-download" class="cv-preview-download">&darr;</button>
+        </div>
+    </div>
+
+    <!-- Floating node search panel (right-click / double-click to add nodes) -->
+    <div id="node-search-panel">
+        <input type="text" id="node-search-input" placeholder="Search nodes..." autocomplete="off">
+        <div id="node-search-results"></div>
+    </div>
+
+    <!-- Shared WebSocket (must load before everything) -->
+    <script src="js/ws.js"></script>
+
+    <!-- Konva.js (local) -->
+    <script src="js/konva.min.js"></script>
+
+    <!-- App modules (order matters) -->
+    <script src="js/types.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/canvas.js"></script>
+    <script src="js/port.js"></script>
+    <script src="js/widget.js"></script>
+    <script src="js/node.js"></script>
+    <script src="js/connection.js"></script>
+    <script src="js/selection.js"></script>
+    <script src="js/sidebar.js"></script>
+    <script src="js/properties.js"></script>
+    <script src="js/toolbar.js"></script>
+    <script src="js/workflow.js"></script>
+    <script src="js/preview.js"></script>
+    <script src="js/history.js"></script>
+
+    <!-- Graph editor entry point (must load before shell.js for correct DOMContentLoaded order) -->
+    <script src="js/app.js"></script>
+
+    <!-- Model utilities and workflow builder (shared by Generate + Canvas tabs) -->
+    <script src="js/model-utils.js"></script>
+    <script src="js/workflow-builder.js"></script>
+
+    <!-- Settings (persistence layer must load before shell.js) -->
+    <script src="js/settings.js"></script>
+
+    <!-- Generate tab -->
+    <script src="js/generate.js"></script>
+
+    <!-- Canvas tab: layer types, tools, SAM, video, compositor must load before canvas-tab -->
+    <script src="js/layer-types.js"></script>
+    <script src="js/canvas-tools.js"></script>
+    <script src="js/canvas-sam.js"></script>
+    <script src="js/canvas-video.js"></script>
+    <script src="js/canvas-compositor.js"></script>
+    <script src="js/canvas-staging.js"></script>
+    <script src="js/canvas-preprocess.js"></script>
+    <script src="js/canvas-refimages.js"></script>
+    <script src="js/canvas-statusbar.js"></script>
+    <script src="js/canvas-tab.js"></script>
+
+    <!-- Simple mode -->
+
+    <!-- Queue tab -->
+    <script src="js/queue.js"></script>
+
+    <!-- Models tab -->
+    <script src="js/models.js"></script>
+
+    <!-- Video Edit tab -->
+    <script src="js/video-edit.js"></script>
+
+    <!-- Shell navigation (runs after app.js init, switches to saved tab) -->
+    <script src="js/shell.js"></script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+{
+  "name": "klein_train_ref",
+  "purpose": "Serenity Klein/Flux2 cached-data train parity dump contract for predict -> loss -> backward_lora -> AdamW gates.",
+  "producer_script": "/home/alex/serenity-trainer/scripts/klein_dump_train_ref.py",
+  "reference_repo": "/home/alex/Serenity",
+  "default_config": "/home/alex/Serenity/configs/AB50_klein9b_serenity.json",
+  "default_outputs": {
+    "run_metadata": "parity/klein_train_ref_meta.json",
+    "step_tensors": "parity/klein_train_ref_step000.safetensors",
+    "adapter_tensors": "parity/klein_train_ref_step000_adapters.safetensors"
+  },
+  "step_safetensors_keys": {
+    "cached_batch": "batch.* tensors exactly as Serenity data_loader yields them, including latent_image, tokens, tokens_mask, text_encoder_hidden_state, loss_weight, concept_type, and optional latent_mask.",
+    "trace": "trace.* tensors captured from Serenity BaseFlux2Setup.predict and transformer.forward, including scaled_latent_image, latent_noise, scaled_noisy_latent_image, sigma, packed_latent_input, transformer_timestep, encoder_hidden_states, text_ids, image_ids, packed_predicted_flow, predicted_flow, and flow.",
+    "outputs": "output.timestep, output.predicted, output.target, optional output.prior_target, output.loss_pre_scale, and output.loss_for_backward."
+  },
+  "adapter_safetensors_keys": {
+    "step": "adapter_before.* and adapter_after.* trainable LoRA tensors.",
+    "step-with-grads": "adapter_before.*, adapter_pre_clip_grad.*, adapter_post_clip_grad.*, and adapter_after.* trainable LoRA tensors/gradients."
+  },
+  "bounded_run_notes": [
+    "The script is single-process only and refuses fused_back_pass and schedule-free optimizer modes.",
+    "By default it requires existing image/text caches and does not rebuild them. Pass --allow-cache-build to let Serenity create missing caches.",
+    "It does not call GenericTrainer.end(), so it does not perform Serenity final model saves.",
+    "It does not edit Serenity source or Mojo runtime files."
+  ]
+}

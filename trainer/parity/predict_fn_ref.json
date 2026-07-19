@@ -1,0 +1,16 @@
+{
+  "logitnormal_n-1.0": 268.941421,
+  "logitnormal_n+0.0": 500.0,
+  "logitnormal_n+0.5": 622.459331,
+  "logitnormal_n+1.5": 817.574476,
+  "calc_shift_56x72": 1.872532,
+  "calc_shift_64x64": 1.877611,
+  "sigma_t499": 0.5,
+  "sigma_t250": 0.251,
+  "sigma_t0": 0.001,
+  "scale_latents_1.0": 0.318359375,
+  "det_timestep": 499,
+  "min_t": 0,
+  "max_t": 1000,
+  "num_t": 1000
+}

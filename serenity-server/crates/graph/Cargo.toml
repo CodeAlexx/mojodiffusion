@@ -1,0 +1,17 @@
+# Serenity workflow graph lowering — Rust port of serenitymojo/serve/workflow_graph.mojo.
+# Replaces the Mojo ~30 parallel List side-tables with a single typed value store,
+# and the "[501] " string sentinel with a structured GraphError.
+[package]
+name = "serenity-graph"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+# preserve_order: the Comfy-API importer iterates the prompt graph in JSON
+# insertion order, and the typed executor's worklist processes nodes in array
+# order. Without preserve_order serde_json would re-sort object keys (BTreeMap),
+# changing the first-writer-wins outcome for `_set_if_missing` keys and breaking
+# byte-parity with the Mojo oracle. Match the oracle's ordered traversal.
+serde_json = { workspace = true, features = ["preserve_order"] }

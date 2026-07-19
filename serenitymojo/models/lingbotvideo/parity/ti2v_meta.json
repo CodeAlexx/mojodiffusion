@@ -1,0 +1,10 @@
+{
+  "grid_t": 1,
+  "grid_h": 56,
+  "grid_w": 32,
+  "vision_seq": 1792,
+  "crop_start": 140,
+  "L_cond_post": 1057,
+  "n_image_tokens": 448,
+  "L_uncond_post": 234
+}

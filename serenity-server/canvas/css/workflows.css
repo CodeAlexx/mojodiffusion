@@ -1,0 +1,284 @@
+/* workflows.css — Toolbar restyle for Workflows tab (Phase 3) */
+/* Uses shell design tokens from shell.css */
+
+/* ===== Toolbar Override ===== */
+#toolbar {
+    height: 44px;
+    background: var(--shell-bg-surface);
+    border-bottom: 1px solid var(--shell-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    gap: 8px;
+    z-index: 100;
+    position: relative;
+}
+
+/* ===== Workflow Name Input ===== */
+.wf-toolbar-icon {
+    width: 14px;
+    height: 14px;
+    color: var(--shell-text-muted);
+    flex-shrink: 0;
+}
+
+.wf-name-input {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid transparent;
+    color: var(--shell-text);
+    font-size: 13px;
+    font-family: var(--shell-font);
+    padding: 2px 4px;
+    outline: none;
+    min-width: 100px;
+    max-width: 250px;
+    transition: border-color 150ms ease;
+}
+
+.wf-name-input:focus {
+    border-bottom-color: var(--shell-accent);
+}
+
+.wf-name-input::placeholder {
+    color: var(--shell-text-muted);
+}
+
+/* ===== Ghost Buttons ===== */
+.wf-btn-ghost {
+    background: transparent;
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: var(--shell-text-muted);
+    font-size: 12px;
+    font-family: var(--shell-font);
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+    white-space: nowrap;
+}
+
+.wf-btn-ghost:hover {
+    background: var(--shell-bg-hover);
+    color: var(--shell-text);
+    border-color: var(--shell-border);
+}
+
+.wf-btn-ghost:active {
+    transform: scale(0.97);
+}
+
+.wf-btn-icon {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+}
+
+/* ===== Stop Button ===== */
+.wf-btn-stop .wf-btn-icon {
+    color: var(--shell-error);
+}
+
+.wf-btn-stop:hover {
+    background: rgba(252, 129, 129, 0.1);
+    border-color: var(--shell-error);
+}
+
+.wf-btn-stop:disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+/* ===== Queue Button (Filled Accent) ===== */
+.wf-btn-queue {
+    background: var(--shell-accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-family: var(--shell-font);
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    transition: background 150ms ease, opacity 150ms ease;
+    white-space: nowrap;
+}
+
+.wf-btn-queue:hover {
+    background: var(--shell-accent-hover);
+}
+
+.wf-btn-queue:active {
+    transform: scale(0.97);
+}
+
+.wf-btn-queue .wf-btn-icon {
+    color: #fff;
+}
+
+.wf-btn-queue.running {
+    animation: pulse-queue 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-queue {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+/* ===== Templates Dropdown ===== */
+.wf-templates-wrap {
+    position: relative;
+}
+
+.wf-templates-dropdown {
+    position: absolute;
+    top: 44px;
+    right: 0;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 8px;
+    padding: 6px;
+    min-width: 220px;
+    max-height: 70vh;
+    overflow-y: auto;
+    z-index: 150;
+    box-shadow: var(--shadow-lg);
+}
+
+.wf-templates-dropdown.hidden {
+    display: none;
+}
+
+.wf-template-item {
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: var(--shell-text);
+    cursor: pointer;
+    transition: background 100ms ease;
+}
+
+.wf-template-item:hover {
+    background: var(--shell-bg-hover);
+}
+
+.wf-template-empty {
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--shell-text-muted);
+    font-style: italic;
+}
+
+/* ===== Remove old toolbar button styles that conflict ===== */
+/* Override canvas.css #toolbar button with more specificity */
+#toolbar .wf-btn-ghost,
+#toolbar .wf-btn-queue {
+    /* Reset canvas.css defaults */
+    background: initial;
+    padding: initial;
+    border-radius: initial;
+}
+
+/* Re-apply correct styles after reset */
+#toolbar .wf-btn-ghost {
+    background: transparent;
+    border: 1px solid var(--shell-border);
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+
+#toolbar .wf-btn-queue {
+    background: var(--shell-accent);
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+}
+
+#toolbar .wf-btn-queue.running {
+    animation: pulse-queue 1.5s ease-in-out infinite;
+}
+
+/* ===== Hide Sidebar & Toggle ===== */
+#sidebar,
+#sidebar-toggle {
+    display: none !important;
+}
+
+/* ===== Floating Node Search Panel ===== */
+#node-search-panel {
+    position: fixed;
+    width: 260px;
+    max-height: 400px;
+    background: var(--shell-bg-panel);
+    border: 1px solid var(--shell-border);
+    border-radius: 10px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    z-index: 1000;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#node-search-panel.visible {
+    display: flex;
+}
+
+#node-search-input {
+    width: 100%;
+    background: var(--shell-bg-surface);
+    border: none;
+    border-bottom: 1px solid var(--shell-border);
+    padding: 10px 12px;
+    color: var(--shell-text);
+    font-size: 13px;
+    font-family: var(--shell-font);
+    outline: none;
+}
+
+#node-search-input::placeholder {
+    color: var(--shell-text-muted);
+}
+
+#node-search-results {
+    max-height: 340px;
+    overflow-y: auto;
+    padding: 4px 0;
+}
+
+.node-search-result {
+    padding: 8px 12px;
+    font-size: 13px;
+    color: var(--shell-text);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    transition: background 100ms ease;
+}
+
+.node-search-result:hover {
+    background: var(--shell-bg-hover);
+}
+
+.node-search-category {
+    font-size: 10px;
+    color: var(--shell-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.node-search-empty {
+    padding: 12px;
+    font-size: 12px;
+    color: var(--shell-text-muted);
+    text-align: center;
+    font-style: italic;
+}

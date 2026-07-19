@@ -1,0 +1,30 @@
+{
+ "schema": "serenity.sample_prompts.v1",
+ "defaults": {
+  "sample_every": 500,
+  "sample_at_start": false,
+  "save_before_sample": false,
+  "precache_required": false,
+  "enforce_min_image_size": false,
+  "width": 1024,
+  "height": 1024,
+  "frames": 1,
+  "fps": 24,
+  "steps": 30,
+  "cfg": 1.0,
+  "seed": 88888,
+  "negative": ""
+ },
+ "prompts": [
+  {
+   "id": "cfg1_s111",
+   "prompt": "cached caption 0",
+   "seed": 111
+  },
+  {
+   "id": "cfg1_s555",
+   "prompt": "cached caption 4",
+   "seed": 555
+  }
+ ]
+}

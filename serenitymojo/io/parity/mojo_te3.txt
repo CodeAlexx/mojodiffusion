@@ -1,0 +1,7 @@
+#TENSORS 5
+#DATASEG 99630080
+model.layers.35.input_layernorm.weight | BF16 | [2560] | 0 | 5120 | 16188082682015647771
+model.layers.35.mlp.down_proj.weight | BF16 | [2560,9728] | 5120 | 49807360 | 10219504220407026486
+model.layers.35.mlp.up_proj.weight | BF16 | [9728,2560] | 49812480 | 49807360 | 2542812847288986439
+model.layers.35.post_attention_layernorm.weight | BF16 | [2560] | 99619840 | 5120 | 15922381978111491238
+model.norm.weight | BF16 | [2560] | 99624960 | 5120 | 8403087402334911462

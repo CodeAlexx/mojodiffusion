@@ -1,0 +1,32 @@
+{
+  "_comment": "flux FULL FINETUNE smoke config (-D FLUX_FULL_FT=1 arm of train_flux_real.mojo). CHECKPOINT NOTE: flux1-dev.safetensors is a symlink to flux1-schnell.safetensors — SCHNELL weights under the dev name (23.8GB all-BF16 BFL keys; no guidance_in — the FT arm auto-detects and feeds no guidance vec). cache_dir is the DERIVED boxjana flux cache (chroma latent/t5 verbatim + real Mojo CLIP-L clip_pool; pipeline/flux_cache_from_chroma.mojo).",
+  "model_type": "flux",
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/flux1-dev.safetensors",
+  "vae": "/home/alex/.serenity/models/vaes/ae.safetensors",
+  "validation_prompts_file": "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json",
+  "cache_dir": "/home/alex/mojodiffusion/output/cache/boxjana_flux_512",
+  "inner_dim": 3072,
+  "in_channels": 64,
+  "joint_attention_dim": 4096,
+  "out_channels": 64,
+  "num_double": 19,
+  "num_single": 38,
+  "num_heads": 24,
+  "head_dim": 128,
+  "mlp_hidden": 12288,
+  "timestep_dim": 256,
+  "rope_theta": 10000,
+  "resolution": "512",
+  "learning_rate": 1e-5,
+  "timestep_shift": 1.0,
+  "max_grad_norm": 1.0,
+  "max_steps": 2000,
+  "save_every": 500,
+  "sample_every": 500,
+  "optimizer": {
+    "eps": 1e-08,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999
+  }
+}

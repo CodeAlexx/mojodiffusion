@@ -1,0 +1,28 @@
+# serenitymojo.sampling — diffusion scheduler and sampler glue.
+#
+# Phase A/B foundation. Schedulers own the noise->latent schedule + per-step
+# update around a DiT (the DiT predicts velocity; the scheduler does the rest).
+#
+# Modules:
+#   sampler_registry — SwarmUI/Comfy sampler/scheduler catalog, backend support
+#                      matrix, and fail-loud product admission helpers.
+#   flow_match  — Z-Image rectified-flow Euler scheduler and Qwen-Image helpers.
+#   sdxl_euler  — SDXL EulerDiscreteScheduler scalar setup plus GPU CFG/update.
+#   sd15_euler  — SD1.5 EulerDiscreteScheduler wrapper around the same schedule.
+#   flux2_klein — shared FLUX.2 dev/Klein dynamic-mu/fixed-shift schedules plus
+#                 GPU CFG/update helpers.
+#   flux1_dev   — FLUX.1-dev BFL time-shift schedule and packed-latent plan.
+#   sd3_flow_match — SD3 shifted-flow schedule plus textbook CFG/update helpers.
+#   lens_flowmatch — Microsoft Lens N-sigma dynamic FlowMatch scalar schedule.
+#   lance_t2v   — Lance shifted-flow schedule, CFG, renorm, and Euler update.
+#   ernie_sampling — ERNIE fixed-shift FlowMatch schedule plus CFG/update helpers.
+#   anima_sampling — Anima linear FlowMatch schedule plus CFG/update helpers.
+#   ltx2_sampling — LTX2 distilled creator schedules, PyTorch-eager BF16 noiser
+#                   handoff, and Euler/res2s scheduler helpers.
+from serenitymojo.sampling.ltx2_sampling import (
+    LTX2Scheduler,
+    build_ltx2_distilled_sigma_schedule,
+    ltx2_creator_noiser_from_noise,
+    ltx2_distilled_sigmas,
+    ltx2_stage2_distilled_sigmas,
+)

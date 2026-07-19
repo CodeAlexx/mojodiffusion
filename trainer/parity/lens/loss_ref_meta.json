@@ -1,0 +1,17 @@
+{
+  "loss": 0.508089542388916,
+  "timestep": 499,
+  "sigma": 0.5,
+  "seed": 7777,
+  "H_packed": 32,
+  "W_packed": 32,
+  "S_txt": 201,
+  "latent_shape": [
+    1,
+    32,
+    64,
+    64
+  ],
+  "img": "trainer/parity/lens/gen/lens_mojo.png",
+  "note": "BaseLensSetup.predict, deterministic t=499, real-image latent + real caption"
+}

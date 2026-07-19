@@ -1,0 +1,472 @@
+{
+ "b_extract_json_adv": [
+  {
+   "in": "```json\n{\"high_level_description\":\"fenced+trailing brace\",\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}\n```\nnote: use } sparingly",
+   "out": {
+    "high_level_description": "fenced+trailing brace",
+    "compositional_deconstruction": {
+     "background": "x",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "```\n{\"high_level_description\":\"bare fence + trailing brace\",\"compositional_deconstruction\":{\"x\":1}}\n```\ntrailing }",
+   "out": {
+    "high_level_description": "bare fence + trailing brace",
+    "compositional_deconstruction": {
+     "x": 1
+    }
+   }
+  },
+  {
+   "in": "```JSON\n{\"compositional_deconstruction\":{\"x\":1}}\n```",
+   "out": {
+    "compositional_deconstruction": {
+     "x": 1
+    }
+   }
+  },
+  {
+   "in": "```json\n{\"compositional_deconstruction\":{\"first\":1}}\n```\n```json\n{\"compositional_deconstruction\":{\"second\":2}}\n```",
+   "out": {
+    "compositional_deconstruction": {
+     "first": 1
+    }
+   }
+  },
+  {
+   "in": "```json   \n\n  {\"compositional_deconstruction\":{\"ws\":1}}\n```",
+   "out": {
+    "compositional_deconstruction": {
+     "ws": 1
+    }
+   }
+  },
+  {
+   "in": "```json\n{\"compositional_deconstruction\":{\"unterminated\":1}}",
+   "out": {
+    "compositional_deconstruction": {
+     "unterminated": 1
+    }
+   }
+  },
+  {
+   "in": "prefix } then {\"compositional_deconstruction\":{\"y\":2}} done",
+   "out": {
+    "compositional_deconstruction": {
+     "y": 2
+    }
+   }
+  }
+ ],
+ "c_extract_json_adv": [
+  {
+   "in": "```json\n{\"high_level_description\":\"fenced+trailing brace\",\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}\n```\nnote: use } sparingly",
+   "out": {
+    "high_level_description": "fenced+trailing brace",
+    "compositional_deconstruction": {
+     "background": "x",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "```\n{\"high_level_description\":\"bare fence + trailing brace\",\"compositional_deconstruction\":{\"x\":1}}\n```\ntrailing }",
+   "out": {
+    "high_level_description": "bare fence + trailing brace",
+    "compositional_deconstruction": {
+     "x": 1
+    }
+   }
+  },
+  {
+   "in": "```JSON\n{\"compositional_deconstruction\":{\"x\":1}}\n```",
+   "out": {
+    "compositional_deconstruction": {
+     "x": 1
+    }
+   }
+  },
+  {
+   "in": "```json\n{\"compositional_deconstruction\":{\"first\":1}}\n```\n```json\n{\"compositional_deconstruction\":{\"second\":2}}\n```",
+   "out": {
+    "compositional_deconstruction": {
+     "first": 1
+    }
+   }
+  },
+  {
+   "in": "```json   \n\n  {\"compositional_deconstruction\":{\"ws\":1}}\n```",
+   "out": {
+    "compositional_deconstruction": {
+     "ws": 1
+    }
+   }
+  },
+  {
+   "in": "```json\n{\"compositional_deconstruction\":{\"unterminated\":1}}",
+   "out": {
+    "compositional_deconstruction": {
+     "unterminated": 1
+    }
+   }
+  },
+  {
+   "in": "prefix } then {\"compositional_deconstruction\":{\"y\":2}} done",
+   "out": {
+    "compositional_deconstruction": {
+     "y": 2
+    }
+   }
+  }
+ ],
+ "b_full_glue_adv": [
+  {
+   "in": "```json\n{\"high_level_description\":\"A\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[{\"type\":\"obj\",\"bbox\":[200,100,400,300],\"desc\":\"d\"}]}}\n```\nthanks! }",
+   "out": "{\n  \"high_level_description\": \"A\",\n  \"compositional_deconstruction\": {\n    \"background\": \"bg\",\n    \"elements\": [\n      {\n        \"type\": \"obj\",\n        \"bbox\": [\n          100,\n          200,\n          300,\n          400\n        ],\n        \"desc\": \"d\"\n      }\n    ]\n  }\n}"
+  }
+ ],
+ "c_full_glue_adv": [
+  {
+   "in": "```json\n{\"high_level_description\":\"A\",\"compositional_deconstruction\":{\"background\":\"bg\",\"elements\":[{\"type\":\"obj\",\"bbox\":[200,100,400,300],\"desc\":\"d\"}]}}\n```\nthanks! }",
+   "out": "{\"high_level_description\": \"A\", \"compositional_deconstruction\": {\"background\": \"bg\", \"elements\": [{\"type\": \"obj\", \"bbox\": [200, 100, 400, 300], \"desc\": \"d\"}]}}"
+  }
+ ],
+ "b_convert_bbox_coerce": [
+  {
+   "in": [
+    "100",
+    "200",
+    "400",
+    "800"
+   ],
+   "out": [
+    200,
+    100,
+    800,
+    400
+   ]
+  },
+  {
+   "in": [
+    "10.5",
+    "20.5",
+    "300.5",
+    "400.5"
+   ],
+   "out": [
+    20,
+    10,
+    400,
+    300
+   ]
+  },
+  {
+   "in": [
+    false,
+    false,
+    true,
+    true
+   ],
+   "out": [
+    0,
+    0,
+    1,
+    1
+   ]
+  },
+  {
+   "in": [
+    false,
+    100,
+    true,
+    800
+   ],
+   "out": [
+    100,
+    0,
+    800,
+    1
+   ]
+  },
+  {
+   "in": [
+    100,
+    "200",
+    400,
+    "800"
+   ],
+   "out": [
+    200,
+    100,
+    800,
+    400
+   ]
+  },
+  {
+   "in": [
+    "1e2",
+    "2e2",
+    "3e2",
+    "8e2"
+   ],
+   "out": [
+    200,
+    100,
+    800,
+    300
+   ]
+  },
+  {
+   "in": [
+    true,
+    true,
+    false,
+    false
+   ],
+   "out": [
+    0,
+    0,
+    1,
+    1
+   ]
+  },
+  {
+   "in": [
+    "abc",
+    200,
+    400,
+    800
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    null,
+    200,
+    400,
+    800
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    [
+     1
+    ],
+    200,
+    400,
+    800
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    {
+     "a": 1
+    },
+    200,
+    400,
+    800
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    "  100  ",
+    "200",
+    "400",
+    "800"
+   ],
+   "out": [
+    200,
+    100,
+    800,
+    400
+   ]
+  },
+  {
+   "in": [
+    "-50",
+    "50",
+    "1200",
+    "900"
+   ],
+   "out": [
+    50,
+    0,
+    900,
+    1000
+   ]
+  }
+ ],
+ "c_sanitize_bbox_coerce": [
+  {
+   "in": [
+    "100",
+    "200",
+    "400",
+    "800"
+   ],
+   "out": [
+    100,
+    200,
+    400,
+    800
+   ]
+  },
+  {
+   "in": [
+    "10.5",
+    "20.5",
+    "300.5",
+    "400.5"
+   ],
+   "out": [
+    10,
+    20,
+    300,
+    400
+   ]
+  },
+  {
+   "in": [
+    false,
+    false,
+    true,
+    true
+   ],
+   "out": [
+    0,
+    0,
+    1,
+    1
+   ]
+  },
+  {
+   "in": [
+    false,
+    100,
+    true,
+    800
+   ],
+   "out": [
+    0,
+    100,
+    1,
+    800
+   ]
+  },
+  {
+   "in": [
+    100,
+    "200",
+    400,
+    "800"
+   ],
+   "out": [
+    100,
+    200,
+    400,
+    800
+   ]
+  },
+  {
+   "in": [
+    "1e2",
+    "2e2",
+    "3e2",
+    "8e2"
+   ],
+   "out": [
+    100,
+    200,
+    300,
+    800
+   ]
+  },
+  {
+   "in": [
+    true,
+    true,
+    false,
+    false
+   ],
+   "out": [
+    0,
+    0,
+    1,
+    1
+   ]
+  },
+  {
+   "in": [
+    "abc",
+    200,
+    400,
+    800
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    null,
+    200,
+    400,
+    800
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    [
+     1
+    ],
+    200,
+    400,
+    800
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    {
+     "a": 1
+    },
+    200,
+    400,
+    800
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    "  100  ",
+    "200",
+    "400",
+    "800"
+   ],
+   "out": [
+    100,
+    200,
+    400,
+    800
+   ]
+  },
+  {
+   "in": [
+    "-50",
+    "50",
+    "1200",
+    "900"
+   ],
+   "out": [
+    0,
+    50,
+    1000,
+    900
+   ]
+  }
+ ]
+}

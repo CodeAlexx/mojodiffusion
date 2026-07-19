@@ -1,0 +1,29 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "save_before_sample": true,
+    "precache_required": false,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 20,
+    "cfg": 4.0,
+    "seed": 42,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "alina_garden",
+      "prompt": "alverone , a high-resolution photograph featuring a young caucasian woman with long blonde hair, wearing a casual white sundress, standing in a sunlit garden, soft natural lighting, professional photography",
+      "seed": 42
+    },
+    {
+      "id": "alina_evening",
+      "prompt": "alverone , a high-resolution photograph featuring a young caucasian woman with long blonde hair, wearing a black evening dress, in an elegant indoor setting, dramatic studio lighting, professional photography",
+      "seed": 43
+    }
+  ]
+}

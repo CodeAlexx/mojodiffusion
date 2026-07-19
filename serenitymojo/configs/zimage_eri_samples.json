@@ -1,0 +1,34 @@
+{
+  "schema": "serenity.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "save_before_sample": true,
+    "precache_required": false,
+    "width": 1024,
+    "height": 1024,
+    "frames": 1,
+    "fps": 24,
+    "steps": 20,
+    "cfg": 3.5,
+    "seed": 42,
+    "negative": ""
+  },
+  "prompts": [
+    {
+      "id": "eri_headshot",
+      "prompt": "vrtlEri2, a head shot",
+      "seed": 42
+    },
+    {
+      "id": "eri_beach",
+      "prompt": "vrtlEri2, a lady walking on the beach in a bikini looking at the viewer",
+      "seed": 43
+    },
+    {
+      "id": "eri_concert",
+      "prompt": "vrtlEri2, a lady in a party dress at a concert",
+      "seed": 44
+    }
+  ]
+}

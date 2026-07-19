@@ -1,0 +1,4 @@
+prompt=a red apple on a wooden table
+S=512 hidden_shape=[1, 512, 4096]
+first12_ids=[3, 9, 1131, 8947, 30, 3, 9, 5726, 953, 1, 0, 0]
+mean=0.000468 std=0.132182

@@ -53,8 +53,8 @@
 #
 # The finite seven-shape ~1 MP core is compiled: each arm specializes latent
 # geometry, image-token count, joint-attention length, rectangular RoPE, and
-# VAE decode. Product admission remains fail-loud 1024-only: measured
-# rectangular denoise is about 24x slower than square on the 16GB product GPU.
+# VAE decode. Product admission follows this exact finite ladder. Rectangular
+# denoise remains slower than square on the 16GB product GPU.
 #
 # LoRA: NOT supported (Chroma has no LoRA hook in the Mojo stack yet) — fail
 # loud. img2img: NOT supported — fail loud.

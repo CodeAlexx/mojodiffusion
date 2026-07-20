@@ -296,9 +296,20 @@ pub(crate) fn default_cfg_for_model(model: &str, family: ModelFamily) -> f64 {
     }
 }
 
-// 1024 is compiled in the worker but is not a 16GB product shape: measured
-// jobs 0125/0126 completed denoise then OOMed in both whole and tiled decode.
-const ZIMAGE_SIZES: &[(i64, i64)] = &[(512, 512)];
+// Z-Image supports the proven 512 square path plus the shared seven-shape 1MP
+// ladder. The backend evicts resident DiT blocks when decode headroom is low,
+// then dispatches the exact finite specializations below. Keep this synchronized
+// with zimage_backend.mojo and DEFAULT_ASPECT_LADDER_X100.
+const ZIMAGE_SIZES: &[(i64, i64)] = &[
+    (512, 512),
+    (1024, 1024),
+    (1152, 896),
+    (896, 1152),
+    (1344, 768),
+    (768, 1344),
+    (1280, 832),
+    (832, 1280),
+];
 // Klein's Mojo worker has finite comptime specializations for 512 square plus
 // the same parity-gated 1024px-area ladder used by the image backends. Keep
 // this explicit list synchronized with klein_runtime_backend.mojo; product
@@ -310,6 +321,8 @@ const KLEIN_SIZES: &[(i64, i64)] = &[
     (896, 1152),
     (1344, 768),
     (768, 1344),
+    (1280, 832),
+    (832, 1280),
 ];
 const SENSENOVA_SIZES: &[(i64, i64)] = &[(512, 512), (1024, 1024)];
 // Exact 1024px-area ladder compiled by the Krea and Qwen image workers. Krea
@@ -325,17 +338,6 @@ const IMAGE_1024_ASPECT_SIZES: &[(i64, i64)] = &[
     (1280, 832),
     (832, 1280),
 ];
-// Runtime-gated SDXL subset. The 4:3 pair completed sequentially in one worker
-// at ~14.1 GiB. The compiled 3:2 pair remains hidden after 1280x832 OOMed at
-// decode as the third persistent-worker job.
-const SDXL_SIZES: &[(i64, i64)] = &[
-    (1024, 1024),
-    (1152, 896),
-    (896, 1152),
-    (1344, 768),
-    (768, 1344),
-];
-const SIZE_1024: &[(i64, i64)] = &[(1024, 1024)];
 const SAMPLERS_EULER: &[&str] = &["euler"];
 const SAMPLERS_EULER_FLOWMATCH: &[&str] = &["euler", "flowmatch_euler"];
 const SAMPLERS_ZIMAGE: &[&str] = &[
@@ -372,13 +374,13 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
         ModelFamily::ZImage => ResolutionPolicy {
             mode: "shape_dispatch",
             min_width: 512,
-            max_width: 512,
+            max_width: 1344,
             min_height: 512,
-            max_height: 512,
-            multiple: 512,
-            square_only: true,
+            max_height: 1344,
+            multiple: 64,
+            square_only: false,
             admitted_shapes,
-            note: "512x512 is the measured 16GB product shape; compiled 1024x1024 currently OOMs during VAE decode",
+            note: "Z-Image dispatches 512x512 plus the compiled seven-shape 1MP ladder; low-headroom decode evicts resident DiT blocks before VAE allocation",
         },
         ModelFamily::QwenImage => ResolutionPolicy {
             mode: "shape_dispatch",
@@ -391,7 +393,12 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             admitted_shapes,
             note: "Qwen-Image worker dispatches the compiled 1024px-area image aspect ladder",
         },
-        ModelFamily::Sdxl => ResolutionPolicy {
+        ModelFamily::Sdxl
+        | ModelFamily::Anima
+        | ModelFamily::Sd3
+        | ModelFamily::Flux
+        | ModelFamily::Krea2
+        | ModelFamily::Chroma => ResolutionPolicy {
             mode: "shape_dispatch",
             min_width: 768,
             max_width: 1344,
@@ -400,9 +407,9 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             multiple: 64,
             square_only: false,
             admitted_shapes,
-            note: "SDXL admits the five runtime-gated square/4:3/16:9 shapes; the compiled 3:2 pair remains hidden after persistent-worker decode OOM",
+            note: "This worker dispatches the compiled seven-shape 1MP image aspect ladder",
         },
-        ModelFamily::Flux => ResolutionPolicy {
+        ModelFamily::Ideogram4 => ResolutionPolicy {
             mode: "shape_dispatch",
             min_width: 768,
             max_width: 1344,
@@ -411,40 +418,7 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             multiple: 64,
             square_only: false,
             admitted_shapes,
-            note: "Flux.1 admits the five runtime-gated square/4:3/16:9 shapes; the compiled 3:2 pair remains hidden after persistent-worker decode OOM",
-        },
-        ModelFamily::Anima => ResolutionPolicy {
-            mode: "shape_dispatch",
-            min_width: 768,
-            max_width: 1344,
-            min_height: 768,
-            max_height: 1344,
-            multiple: 64,
-            square_only: false,
-            admitted_shapes,
-            note: "Anima admits the oracle-gated seven-shape ladder after four sequential product artifacts covered both token-count classes and orientations at <=14.7 GiB",
-        },
-        ModelFamily::Ideogram4 | ModelFamily::Sd3 | ModelFamily::Chroma => ResolutionPolicy {
-            mode: "single_product_shape",
-            min_width: 1024,
-            max_width: 1024,
-            min_height: 1024,
-            max_height: 1024,
-            multiple: 1024,
-            square_only: true,
-            admitted_shapes,
-            note: "rectangular worker arms remain hidden after their model-specific runtime or artifact gate failed",
-        },
-        ModelFamily::Krea2 => ResolutionPolicy {
-            mode: "shape_dispatch",
-            min_width: 768,
-            max_width: 1344,
-            min_height: 768,
-            max_height: 1344,
-            multiple: 64,
-            square_only: false,
-            admitted_shapes,
-            note: "Krea-2 inference reuses the parity-gated trainer/cache 1024px-area aspect ladder",
+            note: "Ideogram4 dispatches the compiled seven-shape 1MP image aspect ladder",
         },
         ModelFamily::Flux2 => ResolutionPolicy {
             mode: "shape_dispatch",
@@ -455,7 +429,7 @@ fn resolution_policy_for_family(family: ModelFamily) -> ResolutionPolicy {
             multiple: 64,
             square_only: false,
             admitted_shapes,
-            note: "Klein 9B admits 512 square plus the runtime-gated square/4:3/16:9 ladder; the compiled 3:2 pair remains hidden pending real persistent-worker artifacts",
+            note: "Klein 9B dispatches 512x512 plus the compiled seven-shape 1MP image aspect ladder",
         },
         ModelFamily::Sensenova => ResolutionPolicy {
             mode: "shape_dispatch",
@@ -475,10 +449,10 @@ fn production_sizes_for_family(family: ModelFamily) -> &'static [(i64, i64)] {
     match family {
         ModelFamily::ZImage => ZIMAGE_SIZES,
         ModelFamily::QwenImage => IMAGE_1024_ASPECT_SIZES,
-        ModelFamily::Sdxl => SDXL_SIZES,
+        ModelFamily::Sdxl => IMAGE_1024_ASPECT_SIZES,
         ModelFamily::Anima => IMAGE_1024_ASPECT_SIZES,
-        ModelFamily::Ideogram4 | ModelFamily::Sd3 | ModelFamily::Chroma => SIZE_1024,
-        ModelFamily::Flux => SDXL_SIZES,
+        ModelFamily::Ideogram4 | ModelFamily::Sd3 | ModelFamily::Chroma => IMAGE_1024_ASPECT_SIZES,
+        ModelFamily::Flux => IMAGE_1024_ASPECT_SIZES,
         ModelFamily::Flux2 => KLEIN_SIZES,
         ModelFamily::Sensenova => SENSENOVA_SIZES,
         ModelFamily::Krea2 => IMAGE_1024_ASPECT_SIZES,
@@ -1682,24 +1656,82 @@ mod tests {
         let zimage = capability_for_family(ModelFamily::ZImage);
         assert_eq!(
             production_sizes_for_family(ModelFamily::ZImage),
-            [(512, 512)]
+            [
+                (512, 512),
+                (1024, 1024),
+                (1152, 896),
+                (896, 1152),
+                (1344, 768),
+                (768, 1344),
+                (1280, 832),
+                (832, 1280),
+            ]
         );
-        assert_eq!(zimage["limits"]["sizes"].as_array().unwrap().len(), 1);
-        assert_eq!(zimage["limits"]["resolution"]["max_width"], 512);
+        assert_eq!(zimage["limits"]["sizes"].as_array().unwrap().len(), 8);
+        assert_eq!(zimage["limits"]["resolution"]["max_width"], 1344);
+        assert_eq!(zimage["limits"]["resolution"]["square_only"], false);
 
-        assert_eq!(production_sizes_for_family(ModelFamily::Sdxl), SDXL_SIZES);
-        assert_eq!(production_sizes_for_family(ModelFamily::Flux), SDXL_SIZES);
         for family in [
+            ModelFamily::QwenImage,
+            ModelFamily::Sdxl,
+            ModelFamily::Anima,
             ModelFamily::Ideogram4,
             ModelFamily::Sd3,
+            ModelFamily::Flux,
+            ModelFamily::Krea2,
             ModelFamily::Chroma,
         ] {
-            assert_eq!(production_sizes_for_family(family), [(1024, 1024)]);
+            assert_eq!(production_sizes_for_family(family), expected);
         }
-        assert_eq!(production_sizes_for_family(ModelFamily::Anima), expected);
         let sdxl = capability_for_family(ModelFamily::Sdxl);
         assert_eq!(sdxl["limits"]["resolution"]["mode"], "shape_dispatch");
-        assert_eq!(sdxl["limits"]["sizes"].as_array().unwrap().len(), 5);
+        assert_eq!(sdxl["limits"]["sizes"].as_array().unwrap().len(), 7);
+        assert_eq!(production_sizes_for_family(ModelFamily::Flux2).len(), 8);
+    }
+
+    #[test]
+    fn canvas_image_sizes_are_server_capability_driven() {
+        let model_utils = include_str!("../../../canvas/js/model-utils.js");
+        let generate = include_str!("../../../canvas/js/generate.js");
+        let simple = include_str!("../../../canvas/js/simple.js");
+
+        assert!(model_utils.contains("fetch('/v1/capabilities'"));
+        assert!(model_utils.contains("function aspectsForArch(capabilities, arch)"));
+        assert!(generate.contains("ModelUtils.aspectsForArch(state.capabilities, arch)"));
+        assert!(simple.contains("ModelUtils.aspectsForArch(state.capabilities, state.arch)"));
+
+        for mapping in [
+            "zimage: 'zimage'",
+            "qwen: 'qwenimage'",
+            "ideogram4: 'ideogram4'",
+            "sdxl: 'sdxl'",
+            "anima: 'anima'",
+            "sd3: 'sd3'",
+            "flux: 'flux'",
+            "klein: 'flux2'",
+            "sensenova: 'sensenova'",
+            "krea2: 'krea2'",
+            "chroma: 'chroma'",
+        ] {
+            assert!(
+                model_utils.contains(mapping),
+                "missing browser mapping {mapping}"
+            );
+        }
+
+        for stale_table in [
+            "image1024AspectLadder",
+            "sdxlRuntimeAspects",
+            "var imageAspects",
+            "IMAGE_RESOLUTIONS",
+        ] {
+            assert!(!generate.contains(stale_table), "{stale_table} in Generate");
+            assert!(!simple.contains(stale_table), "{stale_table} in Simple");
+            assert!(
+                !model_utils.contains(stale_table),
+                "{stale_table} in model-utils"
+            );
+        }
     }
 
     #[test]

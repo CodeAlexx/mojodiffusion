@@ -27,7 +27,8 @@ var SimpleMode = (function () {
         fps: 24,
         activeStyle: 'none',
         quality: 'balanced',
-        duration: 'medium'
+        duration: 'medium',
+        capabilities: null
     };
     var els = {
         model: null,
@@ -90,13 +91,6 @@ var SimpleMode = (function () {
         medium: { frames: 97, fps: 24 },
         long: { frames: 129, fps: 24 }
     };
-    var imageAspects = [
-        { label: '1:1', w: 1024, h: 1024, vw: 16, vh: 16 },
-        { label: '4:3', w: 1152, h: 896, vw: 18, vh: 14 },
-        { label: '16:9', w: 1344, h: 768, vw: 20, vh: 11 },
-        { label: '3:4', w: 896, h: 1152, vw: 14, vh: 18 },
-        { label: '9:16', w: 768, h: 1344, vw: 11, vh: 20 }
-    ];
     var videoAspects = [
         { label: '1:1', w: 768, h: 768, vw: 16, vh: 16 },
         { label: '4:3', w: 768, h: 576, vw: 18, vh: 14 },
@@ -114,7 +108,9 @@ var SimpleMode = (function () {
             return [{ label: '832×480', w: 832, h: 480, vw: 26, vh: 15 }];
         if (state.arch === 'bernini')
             return [{ label: '848×480', w: 848, h: 480, vw: 53, vh: 30 }];
-        return isVideoModel() ? videoAspects : imageAspects;
+        if (isVideoModel())
+            return videoAspects;
+        return ModelUtils.aspectsForArch(state.capabilities, state.arch);
     }
     function getActiveStylePresets() {
         return isVideoModel() ? videoStylePresets : imageStylePresets;
@@ -793,8 +789,10 @@ var SimpleMode = (function () {
     }
     // ── Model Loading ──
     function loadModels() {
-        ModelUtils.fetchAllModels()
-            .then(function (models) {
+        Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities()])
+            .then(function (loaded) {
+            var models = loaded[0];
+            state.capabilities = loaded[1];
             if (!models.length)
                 throw new Error('empty');
             if (!els.model)

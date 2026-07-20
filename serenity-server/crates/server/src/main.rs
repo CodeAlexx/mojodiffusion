@@ -3609,16 +3609,18 @@ mod endpoint_tests {
             ("sd_xl_base_1.0", ModelFamily::Sdxl),
             ("anima", ModelFamily::Anima),
             ("sd3.5-large", ModelFamily::Sd3),
+            ("flux1-dev", ModelFamily::Flux),
             ("klein-9b", ModelFamily::Flux2),
             ("sensenova-u1", ModelFamily::Sensenova),
             ("krea2", ModelFamily::Krea2),
+            ("chroma", ModelFamily::Chroma),
         ];
 
         for (model, family) in cases {
             let mut params = valid_t2i_params(model);
-            if family == ModelFamily::ZImage {
-                params.width = 512;
-                params.height = 512;
+            if family != ModelFamily::Sensenova {
+                params.width = 1152;
+                params.height = 896;
             }
             assert_eq!(validate_generate_prequeue(&params, 1.0).unwrap(), family);
         }

@@ -47,6 +47,7 @@ var GenerateTab = (function () {
         modelPickerOpen: false,
         modelSearchQuery: '',
         allModels: [],
+        capabilities: null,
         // Phase 2: gallery enhancements
         selectedImages: [],
         lastSelectedIndex: -1,
@@ -90,18 +91,6 @@ var GenerateTab = (function () {
         return Math.max(9, Math.round(seconds * fps) + 1);
     }
     // ── Aspect ratio definitions ──
-    var imageAspects = [
-        { label: 'Free', w: 0, h: 0, vw: 16, vh: 16 },
-        { label: '1:1', w: 1024, h: 1024, vw: 16, vh: 16 },
-        { label: '4:3', w: 1152, h: 896, vw: 18, vh: 14 },
-        { label: '3:2', w: 1152, h: 768, vw: 18, vh: 12 },
-        { label: '16:9', w: 1344, h: 768, vw: 20, vh: 11 },
-        { label: '21:9', w: 1344, h: 576, vw: 21, vh: 9 },
-        { label: '3:4', w: 896, h: 1152, vw: 14, vh: 18 },
-        { label: '2:3', w: 768, h: 1152, vw: 12, vh: 18 },
-        { label: '9:16', w: 768, h: 1344, vw: 11, vh: 20 },
-        { label: '9:21', w: 576, h: 1344, vw: 9, vh: 21 }
-    ];
     var videoAspects = [
         { label: 'Free', w: 0, h: 0, vw: 16, vh: 16 },
         { label: '1:1', w: 768, h: 768, vw: 16, vh: 16 },
@@ -137,18 +126,6 @@ var GenerateTab = (function () {
         { value: 'euler', label: 'Euler' },
         { value: 'uni_pc', label: 'UniPC (Wan)' }
     ];
-    // Exact finite product shapes compiled and oracle-gated by the Mojo image
-    // workers. This is not an arbitrary width/height range.
-    var image1024AspectLadder = [
-        { label: '1:1 · 1024×1024', w: 1024, h: 1024, vw: 16, vh: 16 },
-        { label: '4:3 · 1152×896', w: 1152, h: 896, vw: 18, vh: 14 },
-        { label: '3:4 · 896×1152', w: 896, h: 1152, vw: 14, vh: 18 },
-        { label: '16:9 · 1344×768', w: 1344, h: 768, vw: 21, vh: 12 },
-        { label: '9:16 · 768×1344', w: 768, h: 1344, vw: 12, vh: 21 },
-        { label: '3:2 · 1280×832', w: 1280, h: 832, vw: 20, vh: 13 },
-        { label: '2:3 · 832×1280', w: 832, h: 1280, vw: 13, vh: 20 }
-    ];
-    var sdxlRuntimeAspects = image1024AspectLadder.slice(0, 5);
     function getActiveAspects() {
         var arch = ModelUtils.detectArchFromFilename(state.model);
         if (arch === 'ltxv')
@@ -157,21 +134,7 @@ var GenerateTab = (function () {
             return [{ label: '832×480', w: 832, h: 480, vw: 26, vh: 15 }];
         if (arch === 'bernini')
             return [{ label: '848×480', w: 848, h: 480, vw: 53, vh: 30 }];
-        if (arch === 'krea2' || arch === 'qwen' || arch === 'anima')
-            return image1024AspectLadder;
-        if (arch === 'sdxl' || arch === 'flux')
-            return sdxlRuntimeAspects;
-        if (arch === 'zimage')
-            return [{ label: '512×512', w: 512, h: 512, vw: 16, vh: 16 }];
-        if (arch === 'klein')
-            return [{ label: '512×512', w: 512, h: 512, vw: 16, vh: 16 }]
-                .concat(sdxlRuntimeAspects);
-        if (arch === 'sensenova')
-            return [
-                { label: '512×512', w: 512, h: 512, vw: 16, vh: 16 },
-                { label: '1024×1024', w: 1024, h: 1024, vw: 16, vh: 16 }
-            ];
-        return [{ label: '1024×1024', w: 1024, h: 1024, vw: 16, vh: 16 }];
+        return ModelUtils.aspectsForArch(state.capabilities, arch);
     }
     function buildAspectOptions() {
         var aspects = getActiveAspects();
@@ -1509,8 +1472,10 @@ var GenerateTab = (function () {
     }
     // ── Model Loading ──
     function loadModels() {
-        ModelUtils.fetchAllModels()
-            .then(function (models) {
+        Promise.all([ModelUtils.fetchAllModels(), ModelUtils.loadCapabilities()])
+            .then(function (loaded) {
+            var models = loaded[0];
+            state.capabilities = loaded[1];
             if (!models.length)
                 throw new Error('empty');
             state.allModels = models;
@@ -1546,7 +1511,7 @@ var GenerateTab = (function () {
                 els.modelSearch.value = '';
                 els.modelSearch.placeholder = 'No models found';
             }
-            els.modelWarn.textContent = 'Could not load models \u2014 is the server running?';
+            els.modelWarn.textContent = 'Could not load models or server capabilities';
             els.modelWarn.classList.add('visible');
         });
     }

@@ -6,10 +6,9 @@
 #   the Ideogram logit-normal schedule or the Comfy simple AuraFlow schedule ->
 #   latent denorm -> Ideogram VAE decode.
 #
-# Current product limits are intentionally narrow and fail-loud:
-#   * txt2img only; seven 1024-area core shapes are compiled. Rust product
-#     admission remains 1024-only after repeated rectangular artifacts emitted
-#     the model's gray safety-filter slate. FlowEdit is also 1024-only.
+# Current product limits are explicit and fail-loud:
+#   * txt2img uses the seven compiled 1024-area core shapes. FlowEdit remains
+#     1024-only and has its own request gate.
 #   * no negative prompt, LoRA, init image, variation, or non-Ideogram schedulers
 #   * fixed 1024 token text window so the DiT sequence is compile-time static
 #

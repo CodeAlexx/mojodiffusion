@@ -6,6 +6,7 @@
 var ModelUtils = (function () {
     'use strict';
     var objectInfoCache = null;
+    var capabilitiesCache = null;
     function loadObjectInfo() {
         if (objectInfoCache)
             return Promise.resolve(objectInfoCache);
@@ -90,14 +91,6 @@ var ModelUtils = (function () {
         var arch = detectArchFromFilename(filename);
         return arch === 'ltxv' || arch === 'wan' || arch === 'bernini';
     }
-    // Standard image resolutions (1024-based, snap to 64)
-    var IMAGE_RESOLUTIONS = [
-        { label: '1:1', width: 1024, height: 1024 },
-        { label: '4:3', width: 1152, height: 896 },
-        { label: '16:9', width: 1344, height: 768 },
-        { label: '3:4', width: 896, height: 1152 },
-        { label: '9:16', width: 768, height: 1344 }
-    ];
     // Standard video resolutions (smaller, snap to 32 for video VAE)
     var VIDEO_RESOLUTIONS = [
         { label: '1:1', width: 512, height: 512 },
@@ -187,21 +180,79 @@ var ModelUtils = (function () {
             return models;
         });
     }
+    function loadCapabilities() {
+        if (capabilitiesCache)
+            return Promise.resolve(capabilitiesCache);
+        return fetch('/v1/capabilities', { cache: 'no-store' })
+            .then(function (resp) {
+            if (!resp.ok)
+                throw new Error('capabilities HTTP ' + resp.status);
+            return resp.json();
+        })
+            .then(function (data) {
+            if (!data || data.schema !== 'serenity.capabilities.v1' || !Array.isArray(data.backends))
+                throw new Error('invalid Serenity capability document');
+            capabilitiesCache = data;
+            return data;
+        });
+    }
+    function backendForArch(arch) {
+        var byArch = {
+            zimage: 'zimage',
+            qwen: 'qwenimage',
+            ideogram4: 'ideogram4',
+            sdxl: 'sdxl',
+            anima: 'anima',
+            sd3: 'sd3',
+            flux: 'flux',
+            klein: 'flux2',
+            sensenova: 'sensenova',
+            krea2: 'krea2',
+            chroma: 'chroma'
+        };
+        return byArch[arch] || '';
+    }
+    function aspectsForArch(capabilities, arch) {
+        var backend = backendForArch(arch);
+        if (!backend || !capabilities || !Array.isArray(capabilities.backends))
+            return [];
+        var profile = capabilities.backends.find(function (entry) {
+            return entry && entry.backend === backend;
+        });
+        var sizes = profile && profile.limits && profile.limits.sizes;
+        if (!Array.isArray(sizes))
+            return [];
+        return sizes.map(function (size) {
+            var width = Number(size.width);
+            var height = Number(size.height);
+            if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0)
+                throw new Error('invalid capability size for ' + backend);
+            return {
+                label: width + '×' + height,
+                w: width,
+                h: height,
+                vw: width / 64,
+                vh: height / 64
+            };
+        });
+    }
     function clearCache() {
         objectInfoCache = null;
+        capabilitiesCache = null;
         localStorage.removeItem('sf-object-info-etag');
         localStorage.removeItem('sf-object-info-data');
     }
     return {
         detectArchFromFilename: detectArchFromFilename,
         isVideoModel: isVideoModel,
-        IMAGE_RESOLUTIONS: IMAGE_RESOLUTIONS,
         VIDEO_RESOLUTIONS: VIDEO_RESOLUTIONS,
         snapTo64: snapTo64,
         snapTo32: snapTo32,
         clampDimension: clampDimension,
         clampVideoDimension: clampVideoDimension,
         fetchAllModels: fetchAllModels,
+        loadCapabilities: loadCapabilities,
+        aspectsForArch: aspectsForArch,
         loadObjectInfo: loadObjectInfo,
         clearCache: clearCache
     };

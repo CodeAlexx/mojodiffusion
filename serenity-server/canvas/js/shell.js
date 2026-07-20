@@ -185,26 +185,12 @@ function setupWorkflowExecution() {
     });
     SerenityWS.on('execution_success', function () {
         setWorkflowRunning(false);
-        // Clear node highlights after 3s
-        setTimeout(function () {
-            if (typeof sfCanvas !== 'undefined' && sfCanvas) {
-                sfCanvas.nodes.forEach(function (n) {
-                    n.setExecutionState(null);
-                });
-            }
-        }, 3000);
     });
     SerenityWS.on('execution_error', function () {
         setWorkflowRunning(false);
     });
-    // Status-based fallback (when execution finishes without explicit success event)
-    SerenityWS.on('status', function (data) {
-        if (!data || !data.status)
-            return;
-        var qr = data.status.exec_info ? data.status.exec_info.queue_remaining : 0;
-        if (qr === 0) {
-            setWorkflowRunning(false);
-        }
+    SerenityWS.on('execution_interrupted', function () {
+        setWorkflowRunning(false);
     });
 }
 /**
@@ -340,6 +326,7 @@ function setupTemplatesDropdown() {
                 .then(function (data) {
                 if (typeof loadWorkflow !== 'undefined' && typeof sfCanvas !== 'undefined') {
                     loadWorkflow(sfCanvas, data, sfCanvas.nodeInfo);
+                    sfCanvas.autoLayout();
                 }
             })
                 .catch(function (err) {

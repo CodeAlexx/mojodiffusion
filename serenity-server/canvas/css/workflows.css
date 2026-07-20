@@ -15,6 +15,69 @@
     position: relative;
 }
 
+#toolbar .toolbar-center {
+    flex: 1 1 auto;
+    justify-content: center;
+    min-width: 180px;
+}
+
+/* Persistent workflow execution status. This remains visible through model
+   loading, denoise, decode, completion, and failures. */
+.wf-status-line {
+    --wf-status-color: var(--shell-text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-width: 260px;
+    max-width: min(520px, 42vw);
+    padding: 6px 14px;
+    border: 1px solid color-mix(in srgb, var(--wf-status-color) 55%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--wf-status-color) 12%, var(--shell-bg-panel));
+    color: var(--shell-text);
+    font-size: 12px;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    box-shadow: 0 0 12px color-mix(in srgb, var(--wf-status-color) 24%, transparent);
+}
+
+.wf-status-dot {
+    width: 9px;
+    height: 9px;
+    flex: 0 0 9px;
+    border-radius: 50%;
+    background: var(--wf-status-color);
+    box-shadow: 0 0 9px var(--wf-status-color);
+}
+
+.wf-status-line.is-loading { --wf-status-color: #ffd166; }
+.wf-status-line.is-running { --wf-status-color: #59c7ff; }
+.wf-status-line.is-output { --wf-status-color: #c98cff; }
+.wf-status-line.is-complete { --wf-status-color: #2ee98f; }
+.wf-status-line.is-error { --wf-status-color: #ff496a; }
+.wf-status-line.is-loading .wf-status-dot,
+.wf-status-line.is-running .wf-status-dot,
+.wf-status-line.is-output .wf-status-dot {
+    animation: wf-status-pulse 1s ease-in-out infinite;
+}
+
+@keyframes wf-status-pulse {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.35); opacity: 0.58; }
+}
+
+@media (max-width: 1180px) {
+    .wf-status-line {
+        min-width: 150px;
+        max-width: 28vw;
+        padding-inline: 10px;
+    }
+}
+
 /* ===== Workflow Name Input ===== */
 .wf-toolbar-icon {
     width: 14px;

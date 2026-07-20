@@ -228,7 +228,7 @@ function loadComfyUIGraph(canvas, graphData, nodeInfo) {
     console.log('[workflow] Created', connCount, 'connections');
     canvas.nodeLayer.batchDraw();
     canvas.connectionLayer.batchDraw();
-    canvas.centerView();
+    canvas.fitView(true);
     // Update topbar model badge from the primary loader node
     _updateModelBadgeFromWorkflow(allNodes);
 }
@@ -274,6 +274,10 @@ function deserializeWorkflow(canvas, prompt, nodePositions, nodeInfo) {
     canvas.connections = [];
     if (!prompt || typeof prompt !== 'object')
         return;
+    const hasSavedPositions = !!nodePositions && Object.keys(nodePositions).some(function (id) {
+        const entry = nodePositions[id];
+        return entry && Array.isArray(entry.pos) && entry.pos.length >= 2;
+    });
     let x = 100, y = 100;
     const idMap = {};
     for (const [origId, nodeData] of Object.entries(prompt)) {
@@ -281,7 +285,7 @@ function deserializeWorkflow(canvas, prompt, nodePositions, nodeInfo) {
             continue;
         const info = nodeInfo ? (nodeInfo[nodeData.class_type] || {}) : {};
         let posX = x, posY = y;
-        if (nodePositions && nodePositions[origId]) {
+        if (hasSavedPositions && nodePositions[origId]) {
             const pos = nodePositions[origId].pos;
             if (pos) {
                 posX = pos[0];
@@ -313,7 +317,7 @@ function deserializeWorkflow(canvas, prompt, nodePositions, nodeInfo) {
         if (nodePositions && nodePositions[origId] && nodePositions[origId].collapsed) {
             node.toggleCollapse();
         }
-        if (!nodePositions || !nodePositions[origId]) {
+        if (!hasSavedPositions) {
             y += 200;
             if (y > 1200) {
                 y = 100;
@@ -341,7 +345,14 @@ function deserializeWorkflow(canvas, prompt, nodePositions, nodeInfo) {
             }
         }
     }
-    canvas.centerView();
+    if (!hasSavedPositions && canvas.autoLayout) {
+        canvas.autoLayout();
+    }
+    else {
+        // Saved coordinates define the arrangement, not the zoom level. Fit
+        // the whole graph so wide workflows remain visible after loading.
+        canvas.fitView(true);
+    }
     // Update topbar model badge from the workflow
     _updateModelBadgeFromPrompt(prompt);
 }

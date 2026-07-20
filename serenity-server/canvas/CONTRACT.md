@@ -31,6 +31,23 @@ compatibility unless a separately reviewed contract migration changes them.
   as missing; the browser must not require an external assistant to create it.
 - User-selected output roots and run identifiers are treated as data from the
   server. The browser does not construct developer-machine filesystem paths.
+- Prompt editors expose a practical multiline viewport and remain vertically
+  resizable so longer prompts can be edited without relying on horizontal
+  scrolling or a single-line-height control.
+
+## Workflow canvas behavior
+
+- Templates without an intentional saved layout are arranged as a
+  left-to-right execution graph and fitted to the available viewport. Loading a
+  workflow with saved coordinates preserves that arrangement while still
+  fitting the complete graph on screen.
+- Workflow execution status remains visible in the workflow header throughout
+  submission, model and conditioning load, sampling progress, output decode and
+  save, completion, interruption, and failure. Progress and completion state
+  are driven by server job events rather than browser timers.
+- The active execution path uses a persistent, high-contrast state: amber for
+  active nodes and connections, green for completed work, and red for failures.
+  Completion coloring remains until the next workflow execution begins.
 
 ## Verification
 

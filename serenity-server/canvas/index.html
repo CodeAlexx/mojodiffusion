@@ -95,7 +95,12 @@
                         <i data-lucide="folder-open" class="wf-toolbar-icon"></i>
                         <input type="text" id="workflow-name" class="wf-name-input" placeholder="Untitled Workflow" value="">
                     </div>
-                    <div class="toolbar-center"></div>
+                    <div class="toolbar-center">
+                        <div id="workflow-status-line" class="wf-status-line is-idle" role="status" aria-live="polite">
+                            <span class="wf-status-dot" aria-hidden="true"></span>
+                            <span id="workflow-status-text">Ready</span>
+                        </div>
+                    </div>
                     <div class="toolbar-right">
                         <div class="wf-templates-wrap">
                             <button id="btn-templates" class="wf-btn-ghost" title="Templates">

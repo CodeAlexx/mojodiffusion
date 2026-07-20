@@ -11,6 +11,8 @@ class SFConnection {
         this.targetSlot = targetSlot;
         this.canvas = canvas;
         const srcType = this._getSourceType();
+        this._baseColor = getTypeColor(srcType);
+        this._executionState = null;
         this.line = new Konva.Shape({
             sceneFunc: (context, shape) => {
                 const src = this._getSourcePos();
@@ -21,8 +23,9 @@ class SFConnection {
                 context.bezierCurveTo(src.x + dx, src.y, tgt.x - dx, tgt.y, tgt.x, tgt.y);
                 context.fillStrokeShape(shape);
             },
-            stroke: getTypeColor(srcType),
+            stroke: this._baseColor,
             strokeWidth: 2,
+            opacity: 0.78,
             hitStrokeWidth: 10,
             listening: true,
         });
@@ -56,8 +59,7 @@ class SFConnection {
      */
     setAnimated(animated) {
         if (animated) {
-            this.line.dash([8, 4]);
-            this.line.strokeWidth(2.5);
+            this.line.dash([12, 6]);
             if (!this._dashAnim) {
                 this._dashAnim = new Konva.Animation((frame) => {
                     var offset = (frame.time / 40) % 12;
@@ -73,9 +75,46 @@ class SFConnection {
             }
             this.line.dash([]);
             this.line.dashOffset(0);
-            this.line.strokeWidth(2);
             this.update();
         }
+    }
+    /** Strong execution coloring so the live path is obvious at a glance. */
+    setExecutionState(state) {
+        this._executionState = state || null;
+        this.setAnimated(state === 'executing');
+        switch (state) {
+            case 'executing':
+                this.line.stroke('#ffd166');
+                this.line.strokeWidth(5);
+                this.line.opacity(1);
+                this.line.shadowColor('#ffb000');
+                this.line.shadowBlur(14);
+                this.line.shadowOpacity(0.95);
+                break;
+            case 'executed':
+                this.line.stroke('#2ee98f');
+                this.line.strokeWidth(3.5);
+                this.line.opacity(0.95);
+                this.line.shadowColor('#19c97a');
+                this.line.shadowBlur(7);
+                this.line.shadowOpacity(0.65);
+                break;
+            case 'error':
+                this.line.stroke('#ff496a');
+                this.line.strokeWidth(5);
+                this.line.opacity(1);
+                this.line.shadowColor('#ff234f');
+                this.line.shadowBlur(14);
+                this.line.shadowOpacity(0.95);
+                break;
+            default:
+                this.line.stroke(this._baseColor);
+                this.line.strokeWidth(2);
+                this.line.opacity(0.78);
+                this.line.shadowBlur(0);
+                this.line.shadowOpacity(0);
+        }
+        this.update();
     }
     _watchDrag() {
         const srcNode = this.canvas.nodes.get(this.sourceNode);

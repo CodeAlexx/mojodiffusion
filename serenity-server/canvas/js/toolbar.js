@@ -12,12 +12,17 @@ class SFToolbar {
         this.loadBtn = document.getElementById('btn-load');
         this.statusIndicator = document.getElementById('status-indicator');
         this.queueCount = document.getElementById('queue-count');
+        this.workflowStatusLine = document.getElementById('workflow-status-line');
+        this.workflowStatusText = document.getElementById('workflow-status-text');
         this.fileInput = document.getElementById('file-input');
         this._badgeContainer = null; // lazy-created div for status badges
         this._badges = new Map(); // nodeId -> badge element
         this._notes = []; // {element, id}
         this._nextNoteId = 1;
         this._isRunning = false;
+        this._activePromptId = null;
+        this._awaitingPrompt = false;
+        this._executionPhase = 'idle';
         this._setupButtons();
         this._setupKeyboard();
         this._setupApiEvents();
@@ -27,7 +32,10 @@ class SFToolbar {
     }
     _setupButtons() {
         this.queueBtn.addEventListener('click', () => this._queuePrompt());
-        this.interruptBtn.addEventListener('click', () => this.api.interrupt());
+        this.interruptBtn.addEventListener('click', () => {
+            this._setWorkflowStatus('loading', 'Stopping workflow…');
+            this.api.interrupt();
+        });
         this.saveBtn.addEventListener('click', () => this._saveWorkflow());
         this.loadBtn.addEventListener('click', () => this.fileInput.click());
         this.fileInput.addEventListener('change', (e) => {
@@ -73,54 +81,58 @@ class SFToolbar {
     _setupApiEvents() {
         this.api.on('connected', () => {
             this._setStatus('idle');
+            if (!this._activePromptId && !this._awaitingPrompt)
+                this._setWorkflowStatus('idle', 'Ready');
         });
         this.api.on('disconnected', () => {
             this._setStatus('error');
+            this._setWorkflowStatus('error', 'Disconnected from generation server');
         });
         this.api.on('status', (data) => {
             if (data && data.status) {
                 const qr = data.status.exec_info ? data.status.exec_info.queue_remaining : 0;
                 this.queueCount.textContent = String(qr);
-                const wasRunning = this._isRunning;
                 this._isRunning = qr > 0;
                 this._setStatus(qr > 0 ? 'running' : 'idle');
-                // Start edge animation when execution begins
-                if (this._isRunning && !wasRunning) {
-                    this._setEdgesAnimated(true);
-                }
-                // Stop edge animation when queue drains
-                if (!this._isRunning && wasRunning) {
-                    this._setEdgesAnimated(false);
-                }
             }
         });
+        this.api.on('execution_start', (data) => {
+            if (!this._acceptJobEvent(data))
+                return;
+            this._setRunControls(true);
+            this._setStatus('running');
+            this._setWorkflowStatus('loading', 'Loading model and conditioning…');
+            this._applyWorkflowPhase('loading');
+        });
         this.api.on('executing', (data) => {
+            if (!this._acceptJobEvent(data))
+                return;
             if (data && data.node) {
-                // Highlight executing node, clear previous executing badges
-                this.canvas.nodes.forEach((n, id) => {
-                    if (n._executionState === 'executing') {
-                        n.setExecutionState(null);
-                        this._updateBadge(id, null);
-                    }
-                });
                 const node = this.canvas.nodes.get(data.node);
                 if (node) {
+                    const phase = this._nodePhase(node);
+                    this._applyWorkflowPhase(phase);
                     node.setExecutionState('executing');
                     this._updateBadge(data.node, 'executing');
+                    const label = node.info.display_name || node.nodeType;
+                    if (phase === 'sampling')
+                        this._setWorkflowStatus('running', 'Sampling · ' + label);
+                    else if (phase === 'output')
+                        this._setWorkflowStatus('output', 'Decoding and saving · ' + label);
+                    else
+                        this._setWorkflowStatus('loading', 'Loading · ' + label);
                 }
             }
             else if (data && data.node === null) {
-                // Execution finished
-                this.canvas.nodes.forEach((n, id) => {
-                    if (n._executionState === 'executing') {
-                        n.setExecutionState('executed');
-                        this._updateBadge(id, 'completed');
-                    }
-                });
-                this._setEdgesAnimated(false);
+                this._setWorkflowStatus('output', 'Decoding and saving output…');
+                this._applyWorkflowPhase('output');
             }
         });
         this.api.on('executed', (data) => {
+            if (!this._acceptJobEvent(data))
+                return;
+            this._setWorkflowStatus('output', 'Output written · finalizing…');
+            this._applyWorkflowPhase('output');
             if (data && data.node) {
                 const node = this.canvas.nodes.get(data.node);
                 if (node)
@@ -144,20 +156,57 @@ class SFToolbar {
                 }
             }
         });
+        this.api.on('execution_success', (data) => {
+            if (!this._acceptJobEvent(data))
+                return;
+            this._awaitingPrompt = false;
+            this._isRunning = false;
+            this._setRunControls(false);
+            this._setStatus('done');
+            this._setWorkflowStatus('complete', 'Complete · output ready');
+            this._applyWorkflowPhase('complete');
+        });
         this.api.on('execution_error', (data) => {
+            if (!this._acceptJobEvent(data))
+                return;
             if (data && data.node_id) {
                 const node = this.canvas.nodes.get(data.node_id);
                 if (node)
                     node.setExecutionState('error');
                 this._updateBadge(data.node_id, 'error');
             }
+            this._awaitingPrompt = false;
+            this._isRunning = false;
+            this._setRunControls(false);
+            this._setStatus('error');
+            this._setWorkflowStatus('error', 'Failed · ' + (data.exception_message || 'unknown error'));
+            this._applyWorkflowPhase('error');
             this._setEdgesAnimated(false);
             this._toast('Execution error: ' + (data.exception_message || 'unknown'), 'error');
         });
         this.api.on('progress', (data) => {
-            if (data && data.node) {
-                // Could show progress bar on node in the future
+            if (!this._acceptJobEvent(data))
+                return;
+            const value = Number(data && data.value != null ? data.value : 0);
+            const max = Number(data && data.max != null ? data.max : 0);
+            if (max > 0 && value >= max) {
+                this._setWorkflowStatus('output', 'Denoise complete · decoding and saving…');
+                this._applyWorkflowPhase('output');
             }
+            else {
+                this._setWorkflowStatus('running', 'Sampling · Step ' + value + ' / ' + max);
+                this._applyWorkflowPhase('sampling');
+            }
+        });
+        this.api.on('execution_interrupted', (data) => {
+            if (!this._acceptJobEvent(data))
+                return;
+            this._awaitingPrompt = false;
+            this._isRunning = false;
+            this._setRunControls(false);
+            this._setStatus('error');
+            this._setWorkflowStatus('error', 'Stopped');
+            this._applyWorkflowPhase('error');
         });
     }
     async _queuePrompt() {
@@ -166,10 +215,17 @@ class SFToolbar {
             this._toast('No nodes to execute', 'error');
             return;
         }
+        this._activePromptId = null;
+        this._awaitingPrompt = true;
+        this._clearBadges();
+        this._setRunControls(true);
+        this._setStatus('running');
+        this._setWorkflowStatus('loading', 'Submitting workflow…');
+        this._applyWorkflowPhase('loading');
         try {
             const result = await this.api.queuePrompt(prompt);
             if (result.error) {
-                this._toast('Queue error: ' + result.error, 'error');
+                throw new Error(result.error);
             }
             if (result.video_result) {
                 const video = result.video_result;
@@ -182,10 +238,25 @@ class SFToolbar {
                     throw new Error('video completed without an MP4 URL');
                 if (sfPreview)
                     sfPreview.showVideo(src);
+                this._awaitingPrompt = false;
+                this._setRunControls(false);
+                this._setStatus('done');
+                this._setWorkflowStatus('complete', 'Complete · video ready');
+                this._applyWorkflowPhase('complete');
                 this._toast('Video complete', 'success');
+            }
+            else {
+                this._activePromptId = result.prompt_id || this._activePromptId;
+                this._awaitingPrompt = false;
+                this._setWorkflowStatus('loading', 'Loading model and conditioning…');
             }
         }
         catch (e) {
+            this._awaitingPrompt = false;
+            this._setRunControls(false);
+            this._setStatus('error');
+            this._setWorkflowStatus('error', 'Queue failed · ' + (e instanceof Error ? e.message : String(e)));
+            this._applyWorkflowPhase('error');
             this._toast('Failed to queue: ' + (e instanceof Error ? e.message : String(e)), 'error');
         }
     }
@@ -231,6 +302,7 @@ class SFToolbar {
                 throw new Error('HTTP ' + r.status);
             const data = await r.json();
             loadWorkflow(this.canvas, data, this.canvas.nodeInfo);
+            this.canvas.autoLayout();
             this._toast('Workflow loaded', 'success');
         }
         catch (err) {
@@ -240,6 +312,86 @@ class SFToolbar {
     _setStatus(status) {
         const el = this.statusIndicator;
         el.className = 'status-' + status;
+    }
+    _setWorkflowStatus(kind, text) {
+        this._executionPhase = kind || 'idle';
+        if (this.workflowStatusLine)
+            this.workflowStatusLine.className = 'wf-status-line is-' + this._executionPhase;
+        if (this.workflowStatusText)
+            this.workflowStatusText.textContent = text || 'Ready';
+    }
+    _setRunControls(running) {
+        const label = this.queueBtn ? this.queueBtn.querySelector('span') : null;
+        if (label)
+            label.textContent = running ? 'Running...' : 'Generate';
+        if (this.queueBtn)
+            this.queueBtn.classList.toggle('running', running);
+        if (this.interruptBtn)
+            this.interruptBtn.disabled = !running;
+    }
+    _acceptJobEvent(data) {
+        if (!this._activePromptId && !this._awaitingPrompt)
+            return false;
+        const promptId = data && data.prompt_id ? String(data.prompt_id) : '';
+        if (this._activePromptId && promptId && promptId !== this._activePromptId)
+            return false;
+        if (!this._activePromptId && promptId)
+            this._activePromptId = promptId;
+        return true;
+    }
+    _nodePhase(node) {
+        const type = node ? String(node.nodeType || '').toLowerCase() : '';
+        if (type.includes('sampler') || type.includes('flowedit') || type.includes('denoise'))
+            return 'sampling';
+        if (type.includes('decode') || type.includes('save') || type.includes('preview') ||
+            type.includes('upscale') || type.includes('video combine'))
+            return 'output';
+        return 'loading';
+    }
+    _applyWorkflowPhase(phase) {
+        const states = new Map();
+        this.canvas.nodes.forEach((node, id) => {
+            const nodePhase = this._nodePhase(node);
+            let state = null;
+            if (phase === 'loading') {
+                state = nodePhase === 'loading' ? 'executing' : null;
+            }
+            else if (phase === 'sampling') {
+                state = nodePhase === 'loading' ? 'executed' :
+                    (nodePhase === 'sampling' ? 'executing' : null);
+            }
+            else if (phase === 'output') {
+                state = nodePhase === 'output' ? 'executing' : 'executed';
+            }
+            else if (phase === 'complete') {
+                state = 'executed';
+            }
+            else if (phase === 'error') {
+                state = node._executionState === 'executing' ? 'error' : node._executionState;
+            }
+            states.set(id, state);
+            if (node._executionState !== state)
+                node.setExecutionState(state);
+        });
+        this.canvas.connections.forEach((conn) => {
+            const sourceState = states.get(conn.sourceNode);
+            const targetState = states.get(conn.targetNode);
+            let state = null;
+            if (sourceState === 'error' || targetState === 'error')
+                state = 'error';
+            else if (targetState === 'executing')
+                state = 'executing';
+            else if (sourceState === 'executed' && targetState === 'executed')
+                state = 'executed';
+            if (conn.setExecutionState)
+                conn.setExecutionState(state);
+        });
+        this.canvas.nodeLayer.batchDraw();
+        this.canvas.connectionLayer.batchDraw();
+    }
+    _clearBadges() {
+        this._badges.forEach(function (badge) { badge.remove(); });
+        this._badges.clear();
     }
     _toast(msg, variant) {
         const existing = document.querySelector('.toast');
@@ -323,13 +475,6 @@ class SFToolbar {
         container.appendChild(badge);
         this._badges.set(nodeId, badge);
         this._positionBadge(nodeId, badge);
-        // Fade completed badges after 2s
-        if (state === 'completed') {
-            setTimeout(function () {
-                badge.style.opacity = '0';
-                setTimeout(function () { badge.remove(); }, 300);
-            }, 2000);
-        }
     }
     _positionBadge(nodeId, badge) {
         var node = this.canvas.nodes.get(nodeId);

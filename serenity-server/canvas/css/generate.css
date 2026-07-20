@@ -169,9 +169,19 @@
     color: var(--shell-text);
     font-size: 13px;
     font-family: var(--shell-font);
-    resize: none;
+    line-height: 1.45;
+    resize: vertical;
+    overflow-y: auto;
     transition: border-color 150ms ease;
     box-sizing: border-box;
+}
+#gen-prompt {
+    min-height: 112px;
+    max-height: 360px;
+}
+#gen-neg-prompt {
+    min-height: 72px;
+    max-height: 240px;
 }
 .gen-textarea:focus {
     outline: none;

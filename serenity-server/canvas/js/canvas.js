@@ -414,7 +414,9 @@ class SFCanvas {
         const bh = maxY - minY + pad * 2;
         const sw = this.stage.width();
         const sh = this.stage.height();
-        const newScale = Math.min(sw / bw, sh / bh, 2);
+        // Do not blow small workflows up to 2x. A slightly enlarged cap keeps
+        // node text readable while preserving the graph's spatial context.
+        const newScale = Math.max(0.12, Math.min(sw / bw, sh / bh, 1.15));
         const cx = (minX + maxX) / 2;
         const cy = (minY + maxY) / 2;
         const newX = sw / 2 - cx * newScale;
@@ -613,8 +615,8 @@ class SFCanvas {
         const assignLayer = (id, depth, stack) => {
             if (stack.has(id))
                 return; // cycle detected — break
-            const cur = layers.get(id) || 0;
-            if (depth <= cur)
+            const cur = layers.get(id);
+            if (cur !== undefined && depth <= cur)
                 return; // already visited at equal or greater depth
             layers.set(id, depth);
             stack.add(id);
@@ -636,15 +638,45 @@ class SFCanvas {
                 layerGroups.set(layer, []);
             layerGroups.get(layer).push(id);
         });
-        // Position nodes
-        const hGap = 80;
-        const vGap = 40;
+        // Position nodes as a landscape, left-to-right execution graph. Keep
+        // independent inputs vertically grouped and center every column around
+        // the tallest one so templates do not turn into portrait strips.
+        const hGap = 100;
+        const vGap = 44;
         let xPos = 0;
         const sortedLayers = [...layerGroups.keys()].sort((a, b) => a - b);
+        const nodePriority = (id) => {
+            const node = this.nodes.get(id);
+            const type = node ? node.nodeType.toLowerCase() : '';
+            if (type.includes('unetloader') || type.includes('checkpointloader')) return 0;
+            if (type.includes('cliploader')) return 1;
+            if (type.includes('vaeloader')) return 2;
+            if (type.includes('loraloader')) return 3;
+            if (type.includes('textencode') || type.includes('conditioning')) return 4;
+            if (type.includes('latent')) return 5;
+            if (type.includes('sampler')) return 6;
+            if (type.includes('decode')) return 7;
+            if (type.includes('save') || type.includes('preview')) return 8;
+            return 9;
+        };
+        const columnHeights = new Map();
+        sortedLayers.forEach(layerIdx => {
+            const nodeIds = layerGroups.get(layerIdx);
+            nodeIds.sort((a, b) => nodePriority(a) - nodePriority(b));
+            let height = 0;
+            nodeIds.forEach(id => {
+                const node = this.nodes.get(id);
+                if (node)
+                    height += node.height;
+            });
+            height += Math.max(0, nodeIds.length - 1) * vGap;
+            columnHeights.set(layerIdx, height);
+        });
+        const maxColumnHeight = Math.max(...columnHeights.values());
         sortedLayers.forEach(layerIdx => {
             const nodeIds = layerGroups.get(layerIdx);
             let maxW = 0;
-            let yPos = 0;
+            let yPos = (maxColumnHeight - columnHeights.get(layerIdx)) / 2;
             nodeIds.forEach((id) => {
                 const node = this.nodes.get(id);
                 if (!node)
@@ -658,6 +690,7 @@ class SFCanvas {
             });
             xPos += maxW + hGap;
         });
+        this.connections.forEach(conn => conn.update());
         this.nodeLayer.batchDraw();
         this.connectionLayer.batchDraw();
         this.fitView(true);

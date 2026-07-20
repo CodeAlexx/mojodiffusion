@@ -186,29 +186,39 @@ class SFNode {
         this._executionState = state;
         if (!this._execBorder)
             return;
+        this._execBorder.dash([]);
+        this._execBorder.opacity(1);
         switch (state) {
             case 'executing':
-                this._execBorder.stroke('#ffaa00');
+                this._execBorder.stroke('#ffd166');
+                this._execBorder.strokeWidth(5);
+                this._execBorder.dash([12, 5]);
+                this._execBorder.shadowColor('#ffb000');
+                this._execBorder.shadowBlur(20);
+                this._execBorder.shadowOpacity(1);
                 this._execBorder.visible(true);
                 break;
             case 'executed':
-                this._execBorder.stroke('#4aff4a');
+                this._execBorder.stroke('#2ee98f');
+                this._execBorder.strokeWidth(4);
+                this._execBorder.shadowColor('#19c97a');
+                this._execBorder.shadowBlur(12);
+                this._execBorder.shadowOpacity(0.85);
                 this._execBorder.visible(true);
-                // Auto-hide after 2s
-                setTimeout(() => {
-                    if (this._executionState === 'executed') {
-                        this._execBorder.visible(false);
-                        this._executionState = null;
-                        this.canvas.nodeLayer.batchDraw();
-                    }
-                }, 2000);
                 break;
             case 'error':
-                this._execBorder.stroke('#ff4a4a');
+                this._execBorder.stroke('#ff496a');
+                this._execBorder.strokeWidth(5);
+                this._execBorder.shadowColor('#ff234f');
+                this._execBorder.shadowBlur(20);
+                this._execBorder.shadowOpacity(1);
                 this._execBorder.visible(true);
                 break;
             default:
                 this._execBorder.visible(false);
+                this._execBorder.strokeWidth(4);
+                this._execBorder.shadowBlur(0);
+                this._execBorder.shadowOpacity(0);
         }
         this.canvas.nodeLayer.batchDraw();
     }
@@ -310,9 +320,9 @@ class SFNode {
         this.group.add(this._selectionBorder);
         // --- Execution highlight border ---
         this._execBorder = new Konva.Rect({
-            x: -2, y: -2,
-            width: w + 4, height: this.height + 4,
-            stroke: 'transparent', strokeWidth: 2, cornerRadius: 5,
+            x: -3, y: -3,
+            width: w + 6, height: this.height + 6,
+            stroke: 'transparent', strokeWidth: 4, cornerRadius: 6,
             visible: false, listening: false,
         });
         this.group.add(this._execBorder);
